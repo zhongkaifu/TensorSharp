@@ -1,0 +1,124 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TestRun id="28f14c37-c259-46e9-8277-60dce9e51945" name="@Zhongkais-MacBook-Pro 2026-09-16 10:22:51" xmlns="http://microsoft.com/schemas/VisualStudio/TeamTest/2010">
+  <Times creation="2026-09-16T10:22:51.3597380-07:00" queuing="2026-09-16T10:22:51.3597380-07:00" start="2026-09-16T10:22:50.7323320-07:00" finish="2026-09-16T10:22:51.3620110-07:00" />
+  <TestSettings name="default" id="467ab091-dcfe-4f52-b6ef-fbfe50bb9de3">
+    <Deployment runDeploymentRoot="_Zhongkais-MacBook-Pro_2026-09-16_10_22_51" />
+  </TestSettings>
+  <Results>
+    <UnitTestResult executionId="24a37757-a2e2-4fce-89c8-11f7617307fd" testId="d7ae0da4-feb7-ab0a-f656-37f0da54095a" testName="InferenceWeb.Tests.Qwen4ExpRetainedCacheTests.SharedPrefixChunking_MatchesWholePromptForEachDistinctSuffix" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0699904" startTime="2026-09-16T10:22:51.2404700-07:00" endTime="2026-09-16T10:22:51.3149200-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Failed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="24a37757-a2e2-4fce-89c8-11f7617307fd">
+      <Output>
+        <StdOut>native /Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/libGgmlOps.dylib sha256=4b5e555bea079f6dcf7036e60d7514692b96a37d3d21d0e7619ae1e219e57e2d; backend=GgmlCpu
+native /Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/libGgmlOps.dylib sha256=4b5e555bea079f6dcf7036e60d7514692b96a37d3d21d0e7619ae1e219e57e2d; backend=GgmlCpu
+suffix=151 chunked=249 whole=249 maxdiff=0.31553268 rawkeys_equal=True first_rawdiff=-1</StdOut>
+        <ErrorInfo>
+          <Message>Assert.Equal() Failure: Collections differ
+           ↓ (pos 0)
+Expected: [-0.241294086, -0.837764263, -2.06821895, -1.69480085, 3.23790216, ···]
+Actual:   [-0.219035327, -0.759133101, -2.15435433, -1.65444136, 3.12091899, ···]
+           ↑ (pos 0)</Message>
+          <StackTrace>   at InferenceWeb.Tests.Qwen4ExpRetainedCacheTests.SharedPrefixChunking_MatchesWholePromptForEachDistinctSuffix() in /Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/Qwen4ExpRetainedCacheTests.cs:line 369
+   at System.Reflection.MethodBaseInvoker.InterpretedInvoke_Method(Object obj, IntPtr* args)
+   at System.Reflection.MethodBaseInvoker.InvokeWithNoArgs(Object obj, BindingFlags invokeAttr)</StackTrace>
+        </ErrorInfo>
+      </Output>
+    </UnitTestResult>
+  </Results>
+  <TestDefinitions>
+    <UnitTest name="InferenceWeb.Tests.Qwen4ExpRetainedCacheTests.SharedPrefixChunking_MatchesWholePromptForEachDistinctSuffix" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="d7ae0da4-feb7-ab0a-f656-37f0da54095a">
+      <Execution id="24a37757-a2e2-4fce-89c8-11f7617307fd" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Qwen4ExpRetainedCacheTests" name="SharedPrefixChunking_MatchesWholePromptForEachDistinctSuffix" />
+    </UnitTest>
+  </TestDefinitions>
+  <TestEntries>
+    <TestEntry testId="d7ae0da4-feb7-ab0a-f656-37f0da54095a" executionId="24a37757-a2e2-4fce-89c8-11f7617307fd" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+  </TestEntries>
+  <TestLists>
+    <TestList name="Results Not in a List" id="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestList name="All Loaded Results" id="19431567-8539-422a-85d7-44ee4e166bda" />
+  </TestLists>
+  <ResultSummary outcome="Failed">
+    <Counters total="1" executed="1" passed="0" failed="1" error="0" timeout="0" aborted="0" inconclusive="0" passedButRunAborted="0" notRunnable="0" notExecuted="0" disconnected="0" warning="0" completed="0" inProgress="0" pending="0" />
+    <Output>
+      <StdOut>[xUnit.net 00:00:00.00] xUnit.net VSTest Adapter v3.1.4+50e68bbb8b (64-bit .NET 10.0.10)
+[xUnit.net 00:00:00.05]   Discovering: InferenceWeb.Tests
+[xUnit.net 00:00:00.33]   Discovered:  InferenceWeb.Tests
+[xUnit.net 00:00:00.34]   Starting:    InferenceWeb.Tests
+Backend: GgmlCpu
+Model: qwen4exp, Layers=2, Hidden=8, Heads=4, KVHeads=2, HeadDim=8, Vocab=260
+  hyper-connections: count=4 lowRank=3 (residual is 32 wide)
+  experts=4 used=2 ff=6 sharedFf=5
+  GDN layers=1/2, QSA indexer heads=1 dim=8 topK=8
+  PLE: layers=[0] ngram=2 heads=1 headDim=8
+Loading model weights... done (57 F32 tensors, 24 quantized tensors)
+  Quantized: 0 MB (0 MB file-backed), F32: 0 MB
+Context length: using GGUF metadata qwen4exp.context_length=1024.
+  Qwen4Exp shared MTP ready: block=2, features=32, draftCompression=0, privateKV=F16, device=0, mappedBytes=10336.
+Backend: GgmlCpu
+Model: qwen4exp, Layers=2, Hidden=8, Heads=4, KVHeads=2, HeadDim=8, Vocab=260
+  hyper-connections: count=4 lowRank=3 (residual is 32 wide)
+  experts=4 used=2 ff=6 sharedFf=5
+  GDN layers=1/2, QSA indexer heads=1 dim=8 topK=8
+  PLE: layers=[0] ngram=2 heads=1 headDim=8
+Loading model weights... done (57 F32 tensors, 24 quantized tensors)
+  Quantized: 0 MB (0 MB file-backed), F32: 0 MB
+Context length: using GGUF metadata qwen4exp.context_length=1024.
+  Qwen4Exp shared MTP ready: block=2, features=32, draftCompression=0, privateKV=F16, device=0, mappedBytes=10336.
+[qsa-probe] T=16 pos=0 probe0: -0.0738525391 0.657287598 0.409057617 1.08056641 1.38269043 -0.0448608398 -2.39587402 0.674316406 -1.61740112 1.31692505 -3.02267456 0.917724609 -0.608520508 -1.59655762 -3.89941406 0.492736816 -0.907455444 -1.14654541 -0.965759277 0.584014893
+[qsa-probe] T=16 pos=0 probe1: -0.101220168 0.785155296 0.569479108 1.67463446 0.373144716 -0.0519949459 -1.69020438 0.461286753 -0.938431919 0.665954471 -1.78142738 0.602094114 1.37193036 -0.90301156 2.13287592 0.263732255 -0.534414887 -0.588495255 -0.577715218 0.388905495
+[qsa-probe] T=16 pos=0 probe2: -0.176643863 1.31877971 -0.284203082 0.00325681944 -0.561965346 0.117055304 0.963281572 0.830831826 0.354354173 -0.505189121 1.09685922 -1.8901608 -1.68556571 1.14041841 0.143058434 1.17300236 -0.782721043 -1.14383996 -0.237668514 -0.51561296
+[qsa-probe] T=16 pos=0 probe3: 0.94226253 1.54017282 2.12190509 0 0 0 0 0.0823116004 0.452170402 5.11716604 2.34334135 0 0 0 0 0.136160731 0 1.63958144 0 0
+[qsa-probe] T=16 pos=0 probe4: 12 6 2 5 10 4 9 8 0 4 5 6 7 2 9 10 0 1 3 8
+[q4e-probe] scores ne=[16,16,4] l2=8.662977058e+01 amax=6.815367e+00@211 head=-3.521386e-01 -2.727454e+00 -3.351852e+00
+[attn-tail] T=16 pos=0 scores: 3.1524291 2.00886798 -2.30338287 -3.08888888 5.78577137 1.44927239 3.28102684 3.53094244 0.482338905 -1.95252037 2.85795522 -5.550704 -1.95265079 0.615557909 0.918937027 -0.17271556 -4.35506439 2.22995543 -4.10112667 -3.43781471
+[q4e-probe] probs ne=[16,16,4] l2=4.442732876e+00 amax=1.000000e+00@0 head=1.000000e+00 0.000000e+00 0.000000e+00
+[attn-tail] T=16 pos=0 probs: 0.111177899 0.0742042735 0.0161546972 0 0.325206786 0.0701950192 0.13414219 0.146534204 0.0498697609 0.0210850015 0.115505949 0.00590861868 0.021084033 0.0522748269 0.0581936054 0 0 0 0 0
+[q4e-probe] attn ne=[8,4,16] l2=2.395658706e+01 amax=4.238281e+00@22 head=-3.650391e+00 -3.725586e-01 1.026161e+00
+[attn-tail] T=16 pos=0 attn: -1.43063462 -0.0632971972 1.65969098 -1.56697118 0.934628904 0.519003928 -0.805674016 -0.327883154 1.04097664 -1.40506089 1.21495378 0.837106407 -0.100974686 -0.0896436125 -0.716216683 0.972381949 0.793820024 0.394539177 -1.56215477 0.0732363239
+[q4e-trace] span 0..2 T=16 pos=0: 0:4.2530e+01 1:6.1672e+01 2:6.0405e+01 3:9.3807e+01
+[qsa-probe] T=4 pos=16 probe0: -1.61740112 1.31692505 -3.02267456 0.917724609 -0.608520508 -1.59655762 -3.89941406 0.492736816 -0.907455444 -1.14654541 -0.965759277 0.584014893 3.2109375 1.12902832 -0.129272461 1.59692383 -0.407409668 2.99121094 -3.78662109 2.55310059
+[qsa-probe] T=4 pos=16 probe1: -0.938431919 0.665954471 -1.78142738 0.602094114 1.37193036 -0.90301156 2.13287592 0.263732255 -0.534414887 -0.588495255 -0.577715218 0.388905495 1.12930512 0.338207692 -0.787324846 0.829346895 -0.168569848 1.07868361 -1.59144676 1.19449246
+[qsa-probe] T=4 pos=16 probe2: 0.23508808 0.904927492 0.0716201141 -0.720227063 0.361479312 0.56512475 0.423853546 2.07575655 0.0529726744 1.31733274 -0.425614446 -0.358327955 -0.10133101 0.502383232 0.501252294 1.85961437 0.178846076 1.49704111 -0.673216581 -0.297527432
+[qsa-probe] T=4 pos=16 probe3: 0 0 0 4.42916393 0.369706035 0.397861123 2.54339695 0.84901756 0 2.43122911 1.52114773 2.464926 1.71664679 0.740056157 3.64854002 1.62501454 2.67176676 1.79593742 0.263510138 3.50377274
+[qsa-probe] T=4 pos=16 probe4: 18 5 6 4 7 10 9 11 8 16 17 19 18 6 5 4 7 10 9 11
+[q4e-probe] scores ne=[20,4,4] l2=2.212753681e+01 amax=6.292093e+00@19 head=0.000000e+00 0.000000e+00 0.000000e+00
+[attn-tail] T=4 pos=16 scores: 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 -2.07415009 -0.379377753 1.35708284 2.85191798
+[q4e-probe] probs ne=[20,4,4] l2=1.314540898e+00 amax=3.410374e-01@136 head=0.000000e+00 0.000000e+00 0.000000e+00
+[attn-tail] T=4 pos=16 probs: 0 0 0 0 0.0786689743 0.0786689743 0.0786689743 0.0786689743 0 0.0786689743 0.0786689743 0.0786689743 0 0 0 0 0.0377855189 0.0687941462 0.127109632 0.215627879
+[q4e-probe] attn ne=[8,4,4] l2=4.560344090e+00 amax=1.140158e+00@110 head=-3.104485e-01 -2.602584e-01 3.164322e-01
+[attn-tail] T=4 pos=16 attn: -0.193915918 0.713279366 1.1401577 -0.467560083 -0.28506726 0.516832948 -0.230526924 0.617904782 0.59066689 0.501059353 -0.731072426 0.169368148 -0.366035104 0.572309494 -0.541695118 0.178134114 0.442462713 0.130776107 -0.0948458463 0.759499431
+[q4e-trace] span 0..2 T=4 pos=16: 0:1.9696e+01 1:5.7572e+01 2:5.7348e+01 3:7.3618e+01
+[qsa-probe] T=20 pos=0 probe0: -1.61740112 1.31692505 -3.02267456 0.917724609 -0.608520508 -1.59655762 -3.89941406 0.492736816 -0.907455444 -1.14654541 -0.965759277 0.584014893 3.2109375 1.12902832 -0.129272461 1.59692383 -0.407409668 2.99121094 -3.78662109 2.55310059
+[qsa-probe] T=20 pos=0 probe1: -0.938431919 0.665954471 -1.78142738 0.602094114 1.37193036 -0.90301156 2.13287592 0.263732255 -0.534414887 -0.588495255 -0.577715218 0.388905495 1.12930512 0.338207692 -0.787324846 0.829346895 -0.168569848 1.07868361 -1.59144676 1.19449246
+[qsa-probe] T=20 pos=0 probe2: 0.23508808 0.904927492 0.0716201141 -0.720227063 0.361479312 0.56512475 0.423853546 2.07575655 0.0529726744 1.31733274 -0.425614446 -0.358327955 -0.10133101 0.502383232 0.501252294 1.85961437 0.178846076 1.49704111 -0.673216581 -0.297527432
+[qsa-probe] T=20 pos=0 probe3: 0 0 0 4.42916393 0.369706035 0.397861123 2.54339695 0.84901756 0 2.43122911 1.52114773 2.464926 1.71664679 0.740056157 3.64854002 1.62501454 2.67176676 1.79593742 0.263510138 3.50377274
+[qsa-probe] T=20 pos=0 probe4: 18 5 6 4 7 10 9 11 8 16 17 19 18 6 5 4 7 10 9 11
+[q4e-probe] scores ne=[20,20,4] l2=1.099664553e+02 amax=6.815367e+00@263 head=-3.521386e-01 -2.727454e+00 2.882798e+00
+[attn-tail] T=20 pos=0 scores: -0.785540283 0.00924819708 -2.83196878 1.47508717 1.12808752 2.77586508 3.53915215 1.28330553 0.137307897 2.3968699 -4.44540024 -2.18186164 -5.01453209 0.492371798 -2.85674262 -1.77178884 -2.07415009 -0.379377753 1.35708284 2.85191798
+[q4e-probe] probs ne=[20,20,4] l2=4.719811576e+00 amax=1.000000e+00@0 head=1.000000e+00 0.000000e+00 0.000000e+00
+[attn-tail] T=20 pos=0 probs: 0 0 0 0 0.0830484629 0.148710534 0.194778785 0.0877333581 0 0.130061418 0.0115755936 0.0257692132 0 0 0 0 0.0267694779 0.0487378016 0.0900519267 0.152763441
+[q4e-probe] attn ne=[8,4,20] l2=2.628599219e+01 amax=4.238281e+00@22 head=-3.650391e+00 -3.725586e-01 1.026161e+00
+[attn-tail] T=20 pos=0 attn: -0.77699244 0.7289536 1.96916473 -1.2749536 -0.142339543 0.69961226 -0.887928188 0.561109662 1.36195529 0.40559715 -0.964966476 0.837358475 -0.422927737 0.858193278 -1.69720602 -0.0721379742 1.35943019 -0.0839316845 -0.323068202 1.74996173
+[q4e-trace] span 0..2 T=20 pos=0: 0:4.6869e+01 1:8.4368e+01 2:8.3188e+01 3:1.1821e+02
+[xUnit.net 00:00:00.42]       Assert.Equal() Failure: Collections differ
+[xUnit.net 00:00:00.42]                  ↓ (pos 0)
+[xUnit.net 00:00:00.42]       Expected: [-0.241294086, -0.837764263, -2.06821895, -1.69480085, 3.23790216, ···]
+[xUnit.net 00:00:00.42]       Actual:   [-0.219035327, -0.759133101, -2.15435433, -1.65444136, 3.12091899, ···]
+[xUnit.net 00:00:00.42]                  ↑ (pos 0)
+[xUnit.net 00:00:00.42]       Stack Trace:
+[xUnit.net 00:00:00.42]         /Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/Qwen4ExpRetainedCacheTests.cs(369,0): at InferenceWeb.Tests.Qwen4ExpRetainedCacheTests.SharedPrefixChunking_MatchesWholePromptForEachDistinctSuffix()
+[xUnit.net 00:00:00.42]            at System.Reflection.MethodBaseInvoker.InterpretedInvoke_Method(Object obj, IntPtr* args)
+[xUnit.net 00:00:00.42]            at System.Reflection.MethodBaseInvoker.InvokeWithNoArgs(Object obj, BindingFlags invokeAttr)
+[xUnit.net 00:00:00.42]       Output:
+[xUnit.net 00:00:00.42]         native /Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/libGgmlOps.dylib sha256=4b5e555bea079f6dcf7036e60d7514692b96a37d3d21d0e7619ae1e219e57e2d; backend=GgmlCpu
+[xUnit.net 00:00:00.42]         native /Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/libGgmlOps.dylib sha256=4b5e555bea079f6dcf7036e60d7514692b96a37d3d21d0e7619ae1e219e57e2d; backend=GgmlCpu
+[xUnit.net 00:00:00.42]         suffix=151 chunked=249 whole=249 maxdiff=0.31553268 rawkeys_equal=True first_rawdiff=-1
+[xUnit.net 00:00:00.43]   Finished:    InferenceWeb.Tests
+</StdOut>
+    </Output>
+    <RunInfos>
+      <RunInfo computerName="Zhongkais-MacBook-Pro" outcome="Error" timestamp="2026-09-16T10:22:51.3159390-07:00">
+        <Text>[xUnit.net 00:00:00.42]     InferenceWeb.Tests.Qwen4ExpRetainedCacheTests.SharedPrefixChunking_MatchesWholePromptForEachDistinctSuffix [FAIL]</Text>
+      </RunInfo>
+    </RunInfos>
+  </ResultSummary>
+</TestRun>

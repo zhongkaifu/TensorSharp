@@ -1,0 +1,650 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TestRun id="4941d9a3-d120-4af2-868d-fb83a1b95182" name="@Zhongkais-MacBook-Pro 2026-09-16 10:12:02" xmlns="http://microsoft.com/schemas/VisualStudio/TeamTest/2010">
+  <Times creation="2026-09-16T10:12:02.9659600-07:00" queuing="2026-09-16T10:12:02.9659600-07:00" start="2026-09-16T10:12:02.1947680-07:00" finish="2026-09-16T10:12:05.7600180-07:00" />
+  <TestSettings name="default" id="c5a64488-171f-414f-9a20-eabeb0e5cd2c">
+    <Deployment runDeploymentRoot="_Zhongkais-MacBook-Pro_2026-09-16_10_12_02" />
+  </TestSettings>
+  <Results>
+    <UnitTestResult executionId="4775574d-e41a-4b2d-b3d1-05c7635b2090" testId="7228d1c4-52be-c2ba-5477-b64b38b62de3" testName="InferenceWeb.Tests.Qwen4ExpRetainedCacheTests.Checkpoint_MissingAuthoritativeRecurrentEntryDoesNotPublishStaleHostState" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0193249" startTime="2026-09-16T10:12:03.8295510-07:00" endTime="2026-09-16T10:12:03.8488610-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="4775574d-e41a-4b2d-b3d1-05c7635b2090">
+      <Output>
+        <StdOut>native /Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/libGgmlOps.dylib sha256=2ef5df1601135d00456647192ae9c2ee0a975898f7f1f3f1a17708b730e1343b; backend=GgmlCpu</StdOut>
+      </Output>
+    </UnitTestResult>
+    <UnitTestResult executionId="9904918b-a4d8-4874-849c-fe89bdeb54af" testId="a48ac43c-89b1-165a-d18a-567704db559e" testName="InferenceWeb.Tests.Qwen4ExpQsaHistoryTests.CausalCoordinateOrderIsTimeThenHeightThenWidth" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0000701" startTime="2026-09-16T10:12:02.9539560-07:00" endTime="2026-09-16T10:12:02.9539740-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="9904918b-a4d8-4874-849c-fe89bdeb54af" />
+    <UnitTestResult executionId="67a00e26-c07a-40e1-a8b7-f98db12bce12" testId="547cff3a-33c6-43b4-f77f-5b30b5f83984" testName="InferenceWeb.Tests.Qwen4ExpMtpStateTests.MetadataRestore_RejectsOtherHolderOrResetBeforeChangingItsHistory(reset: False)" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0000749" startTime="2026-09-16T10:12:02.9549990-07:00" endTime="2026-09-16T10:12:02.9550140-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="67a00e26-c07a-40e1-a8b7-f98db12bce12" />
+    <UnitTestResult executionId="4ae33980-88ca-4d81-8b63-d0c0f39e456f" testId="a6d14924-7b09-7aa2-5e71-452bcbefd78a" testName="InferenceWeb.Tests.Qwen4ExpMtpStateTests.MetadataSnapshot_CopiesPleHistoryAndRestoresSameOwnerWithoutRewindingEarly" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0001132" startTime="2026-09-16T10:12:02.9550990-07:00" endTime="2026-09-16T10:12:02.9551150-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="4ae33980-88ca-4d81-8b63-d0c0f39e456f" />
+    <UnitTestResult executionId="98ec34a3-4410-4d9b-b08d-96452980b3e9" testId="41ad05ca-7f68-e546-4997-d0be25831aa4" testName="InferenceWeb.Tests.Qwen4ExpMtpIntegrationTests.QsaMediaHistory_HolderReleaseAndRewindPreserveOtherRawCache" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0831930" startTime="2026-09-16T10:12:05.3989390-07:00" endTime="2026-09-16T10:12:05.4821040-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="98ec34a3-4410-4d9b-b08d-96452980b3e9">
+      <Output>
+        <StdOut>fixture target.gguf sha256=f6d57de601159214dbd7d18a4d779bdbdda17860059a34625834652e6dc05e07
+fixture head.gguf sha256=b7c93fea8db74d2cdfa360ed54f3c6c862f450a2adcd21282af971701f0544e3
+native /Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/libGgmlOps.dylib sha256=2ef5df1601135d00456647192ae9c2ee0a975898f7f1f3f1a17708b730e1343b; backend=GgmlCpu
+native /Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/libGgmlOps.dylib sha256=2ef5df1601135d00456647192ae9c2ee0a975898f7f1f3f1a17708b730e1343b; backend=GgmlCpu
+QSA ranked THW history, exact live raw-key bytes, wrong-owner refusal, branch rewind, A release/B continuation passed.</StdOut>
+      </Output>
+    </UnitTestResult>
+    <UnitTestResult executionId="8714183f-89a8-462f-8dcd-abc1a137c756" testId="7ec0e6f7-93ec-a33d-5227-1a02a52c4983" testName="InferenceWeb.Tests.Qwen4ExpRetainedCacheTests.DraftHead_SpeculationEngagesOnAReboundHolder_AndMatchesPlainGreedy" computerName="Zhongkais-MacBook-Pro" duration="00:00:01.0391919" startTime="2026-09-16T10:12:03.8489930-07:00" endTime="2026-09-16T10:12:04.8855060-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="8714183f-89a8-462f-8dcd-abc1a137c756">
+      <Output>
+        <StdOut>native /Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/libGgmlOps.dylib sha256=2ef5df1601135d00456647192ae9c2ee0a975898f7f1f3f1a17708b730e1343b; backend=GgmlCpu
+native /Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/libGgmlOps.dylib sha256=2ef5df1601135d00456647192ae9c2ee0a975898f7f1f3f1a17708b730e1343b; backend=GgmlCpu
+turn1=90,226,224,119,119,74,213,155 turn2=200,230,29,38,42,155,162,230,162,254,230,248 drafted=44 accepted=2 verify=16 rollback=16 plain=0</StdOut>
+      </Output>
+    </UnitTestResult>
+    <UnitTestResult executionId="b5057c93-6b7d-404f-8cd4-4a8287f53dd2" testId="996adb2e-621e-df7d-9692-fa287c42648b" testName="InferenceWeb.Tests.Qwen4ExpRetainedCachePolicyTests.DiscardAndTrim_FreeConversationsAndKeepCheckpoints" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0002605" startTime="2026-09-16T10:12:02.9434860-07:00" endTime="2026-09-16T10:12:02.9437340-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="b5057c93-6b7d-404f-8cd4-4a8287f53dd2" />
+    <UnitTestResult executionId="a32301b5-1ae3-46fc-8122-7cd9e60ab306" testId="d6183be4-c383-dec1-0ff1-5e6ab799a2e3" testName="InferenceWeb.Tests.Qwen4ExpRetainedCacheTests.ReleasedConversation_RebindsAfterAnotherRequest_BitExact_WithQsaHistory" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0881053" startTime="2026-09-16T10:12:03.7407240-07:00" endTime="2026-09-16T10:12:03.8280790-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="a32301b5-1ae3-46fc-8122-7cd9e60ab306">
+      <Output>
+        <StdOut>native /Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/libGgmlOps.dylib sha256=2ef5df1601135d00456647192ae9c2ee0a975898f7f1f3f1a17708b730e1343b; backend=GgmlCpu
+native /Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/libGgmlOps.dylib sha256=2ef5df1601135d00456647192ae9c2ee0a975898f7f1f3f1a17708b730e1343b; backend=GgmlCpu
+A-&gt;B-&gt;A rebind: retained 18 tokens, 3 continuation steps bit-exact, QSA history 18 cells carried.</StdOut>
+      </Output>
+    </UnitTestResult>
+    <UnitTestResult executionId="f4338fa0-adf4-469d-b7c5-e075dbb2c619" testId="68a763e7-77ed-03a2-0341-5b8f13384b6c" testName="InferenceWeb.Tests.Qwen4ExpRetainedCachePolicyTests.ZeroBudget_DeclinesWithoutTouchingRetainedHolders" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0000472" startTime="2026-09-16T10:12:02.9434330-07:00" endTime="2026-09-16T10:12:02.9434500-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="f4338fa0-adf4-469d-b7c5-e075dbb2c619" />
+    <UnitTestResult executionId="bcd0ab2a-859c-4d6e-a64f-8f001fe41b5c" testId="bb324b30-f22b-329a-ec4b-b4350d6db2be" testName="InferenceWeb.Tests.Qwen4ExpRetainedCacheTests.RetentionBudget_EvictsTheOldestConversation_AndZeroDeclines" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0714608" startTime="2026-09-16T10:12:04.9889900-07:00" endTime="2026-09-16T10:12:05.0607020-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Failed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="bcd0ab2a-859c-4d6e-a64f-8f001fe41b5c">
+      <Output>
+        <StdOut>native /Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/libGgmlOps.dylib sha256=2ef5df1601135d00456647192ae9c2ee0a975898f7f1f3f1a17708b730e1343b; backend=GgmlCpu</StdOut>
+        <ErrorInfo>
+          <Message>unexpected retention capacity 91</Message>
+          <StackTrace>   at InferenceWeb.Tests.Qwen4ExpRetainedCacheTests.RetentionBudget_EvictsTheOldestConversation_AndZeroDeclines() in /Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/Qwen4ExpRetainedCacheTests.cs:line 296
+   at System.RuntimeMethodHandle.InvokeMethod(ObjectHandleOnStack target, Void** arguments, ObjectHandleOnStack sig, BOOL isConstructor, ObjectHandleOnStack result)
+   at System.RuntimeMethodHandle.InvokeMethod(ObjectHandleOnStack target, Void** arguments, ObjectHandleOnStack sig, BOOL isConstructor, ObjectHandleOnStack result)
+   at System.Reflection.MethodBaseInvoker.InterpretedInvoke_Method(Object obj, IntPtr* args)
+   at System.Reflection.RuntimeMethodInfo.Invoke(Object obj, BindingFlags invokeAttr, Binder binder, Object[] parameters, CultureInfo culture)</StackTrace>
+        </ErrorInfo>
+      </Output>
+    </UnitTestResult>
+    <UnitTestResult executionId="77f08d10-712e-4698-8c77-79b28a098ed8" testId="0a6c7551-043b-590b-e08d-9a576d17c8ff" testName="InferenceWeb.Tests.Qwen4ExpQsaHistoryTests.InvalidWriteNeverModifiesAnyHistoryCell(kind: 2)" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0000039" startTime="2026-09-16T10:12:02.9537480-07:00" endTime="2026-09-16T10:12:02.9537670-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="77f08d10-712e-4698-8c77-79b28a098ed8" />
+    <UnitTestResult executionId="c425e84d-4e9d-4a8f-b68b-653e1e255ca8" testId="e3b19859-d26a-a389-6a6e-59e83996ba3d" testName="InferenceWeb.Tests.Qwen4ExpMtpIntegrationTests.DraftPrivateState_FollowsHolderAndReleasePreservesOtherConversation" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0587253" startTime="2026-09-16T10:12:05.6122580-07:00" endTime="2026-09-16T10:12:05.6699180-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="c425e84d-4e9d-4a8f-b68b-653e1e255ca8">
+      <Output>
+        <StdOut>fixture target.gguf sha256=f6d57de601159214dbd7d18a4d779bdbdda17860059a34625834652e6dc05e07
+fixture head.gguf sha256=b7c93fea8db74d2cdfa360ed54f3c6c862f450a2adcd21282af971701f0544e3
+native /Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/libGgmlOps.dylib sha256=2ef5df1601135d00456647192ae9c2ee0a975898f7f1f3f1a17708b730e1343b; backend=GgmlCpu</StdOut>
+      </Output>
+    </UnitTestResult>
+    <UnitTestResult executionId="67c27a1b-09c6-488c-8f08-b004fc4df483" testId="deb8c1ef-ea70-ef3b-f17f-96ca4576653a" testName="InferenceWeb.Tests.Qwen4ExpQsaHistoryTests.InvalidWriteNeverModifiesAnyHistoryCell(kind: 4)" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0004722" startTime="2026-09-16T10:12:02.9444280-07:00" endTime="2026-09-16T10:12:02.9448100-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="67c27a1b-09c6-488c-8f08-b004fc4df483" />
+    <UnitTestResult executionId="deeab61a-8322-4534-9ba5-f6e3f2cee149" testId="e6ad26da-d7a0-9737-becc-4d0882a66b9f" testName="InferenceWeb.Tests.Qwen4ExpMtpStateTests.MetadataRestore_RejectsOtherHolderOrResetBeforeChangingItsHistory(reset: True)" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0002464" startTime="2026-09-16T10:12:02.9549580-07:00" endTime="2026-09-16T10:12:02.9549730-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="deeab61a-8322-4534-9ba5-f6e3f2cee149" />
+    <UnitTestResult executionId="ea09b673-ec84-4819-a750-a368c1b9633d" testId="45abfbe8-d4d5-b13f-0fed-164e7db5a118" testName="InferenceWeb.Tests.Qwen4ExpMtpIntegrationTests.DisposingDraftHead_PreservesBorrowedTargetOutputAndRetry" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0756487" startTime="2026-09-16T10:12:05.1138500-07:00" endTime="2026-09-16T10:12:05.1895200-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="ea09b673-ec84-4819-a750-a368c1b9633d">
+      <Output>
+        <StdOut>fixture target.gguf sha256=f6d57de601159214dbd7d18a4d779bdbdda17860059a34625834652e6dc05e07
+fixture head.gguf sha256=b7c93fea8db74d2cdfa360ed54f3c6c862f450a2adcd21282af971701f0544e3
+native /Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/libGgmlOps.dylib sha256=2ef5df1601135d00456647192ae9c2ee0a975898f7f1f3f1a17708b730e1343b; backend=GgmlCpu</StdOut>
+      </Output>
+    </UnitTestResult>
+    <UnitTestResult executionId="c3fb4fbb-723a-4fd8-aa14-edf4a195d3bb" testId="7a195627-cf45-57dc-cbed-d26e4116ec24" testName="InferenceWeb.Tests.Qwen4ExpQsaHistoryTests.TextMediaAndDelayedTextPreserveCompleteHistoryAndCallerCoordinates" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0009630" startTime="2026-09-16T10:12:02.9540170-07:00" endTime="2026-09-16T10:12:02.9540320-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="c3fb4fbb-723a-4fd8-aa14-edf4a195d3bb" />
+    <UnitTestResult executionId="5a969bd9-77e6-4a2b-9b36-926093268c18" testId="abdabf26-8e36-8b4d-25da-6f4c290ceb4c" testName="InferenceWeb.Tests.Qwen4ExpQsaHistoryTests.InvalidWriteNeverModifiesAnyHistoryCell(kind: 5)" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0000048" startTime="2026-09-16T10:12:02.9538010-07:00" endTime="2026-09-16T10:12:02.9538180-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="5a969bd9-77e6-4a2b-9b36-926093268c18" />
+    <UnitTestResult executionId="b1a3e398-6574-49a2-901b-cac9c2be04fc" testId="44c17d59-fd95-c91d-5ecf-d71865250aff" testName="InferenceWeb.Tests.Qwen4ExpMtpStateTests.Rewind_RequiresCompletedNativeRestoreAndExactCapturedPositionOnce" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0004543" startTime="2026-09-16T10:12:02.9549030-07:00" endTime="2026-09-16T10:12:02.9549190-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="b1a3e398-6574-49a2-901b-cac9c2be04fc" />
+    <UnitTestResult executionId="3dba3b52-6c84-43f3-93f3-9c0ee7d49704" testId="06c9675d-2bba-d857-47be-3fe7e6ab6c99" testName="InferenceWeb.Tests.Qwen4ExpMtpStateTests.Rewind_RejectsChangedHolderEvenAtSamePosition" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0000744" startTime="2026-09-16T10:12:02.9550490-07:00" endTime="2026-09-16T10:12:02.9550640-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="3dba3b52-6c84-43f3-93f3-9c0ee7d49704" />
+    <UnitTestResult executionId="1fcb5532-34b8-4e78-aa6b-e9d5eb5dfc5c" testId="4eaec189-f42b-7c1e-7042-2825c57c3119" testName="InferenceWeb.Tests.Qwen4ExpQsaHistoryTests.InvalidWriteNeverModifiesAnyHistoryCell(kind: 0)" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0000059" startTime="2026-09-16T10:12:02.9448980-07:00" endTime="2026-09-16T10:12:02.9449140-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="1fcb5532-34b8-4e78-aa6b-e9d5eb5dfc5c" />
+    <UnitTestResult executionId="33c102e3-54b1-46e2-9e0b-c81ebd62e516" testId="4a54363d-32c7-d97e-e8b7-94bd8756cf1e" testName="InferenceWeb.Tests.Qwen4ExpMtpIntegrationTests.HistoricalMediaPositions_DelayedDraftCatchUpMatchesImmediateChunkSchedule" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0317122" startTime="2026-09-16T10:12:05.6967710-07:00" endTime="2026-09-16T10:12:05.7285660-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="33c102e3-54b1-46e2-9e0b-c81ebd62e516">
+      <Output>
+        <StdOut>fixture target.gguf sha256=f6d57de601159214dbd7d18a4d779bdbdda17860059a34625834652e6dc05e07
+fixture head.gguf sha256=b7c93fea8db74d2cdfa360ed54f3c6c862f450a2adcd21282af971701f0544e3
+native /Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/libGgmlOps.dylib sha256=2ef5df1601135d00456647192ae9c2ee0a975898f7f1f3f1a17708b730e1343b; backend=GgmlCpu</StdOut>
+      </Output>
+    </UnitTestResult>
+    <UnitTestResult executionId="78a1203b-8a8c-4917-8ad1-9256c65476bd" testId="e5988db4-4058-db4c-35d9-7e8af6eaa38f" testName="InferenceWeb.Tests.Qwen4ExpRetainedCachePolicyTests.Eviction_DropsOldestConversationsFirst_NeverACheckpoint_AndDeclinesWhenNothingFits" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0056839" startTime="2026-09-16T10:12:02.9396050-07:00" endTime="2026-09-16T10:12:02.9425790-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="78a1203b-8a8c-4917-8ad1-9256c65476bd" />
+    <UnitTestResult executionId="d4c374ed-adcc-4831-8673-26be3ecdabdf" testId="43abf8ed-1d77-0dbb-6177-54d0e35e0257" testName="InferenceWeb.Tests.Qwen4ExpQsaHistoryTests.InvalidWriteNeverModifiesAnyHistoryCell(kind: 1)" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0000045" startTime="2026-09-16T10:12:02.9536340-07:00" endTime="2026-09-16T10:12:02.9536530-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="d4c374ed-adcc-4831-8673-26be3ecdabdf" />
+    <UnitTestResult executionId="473ff139-0cbf-4757-92b4-afddf95c737b" testId="ce2c1f73-897a-1021-02bc-a7b0e421a60f" testName="InferenceWeb.Tests.Qwen4ExpMtpIntegrationTests.TargetSnapshot_RestoresGdnPleAndRejectsWrongHolderWithoutMutation" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0926813" startTime="2026-09-16T10:12:05.1896200-07:00" endTime="2026-09-16T10:12:05.2822570-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="473ff139-0cbf-4757-92b4-afddf95c737b">
+      <Output>
+        <StdOut>fixture target.gguf sha256=f6d57de601159214dbd7d18a4d779bdbdda17860059a34625834652e6dc05e07
+fixture head.gguf sha256=b7c93fea8db74d2cdfa360ed54f3c6c862f450a2adcd21282af971701f0544e3
+native /Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/libGgmlOps.dylib sha256=2ef5df1601135d00456647192ae9c2ee0a975898f7f1f3f1a17708b730e1343b; backend=GgmlCpu</StdOut>
+      </Output>
+    </UnitTestResult>
+    <UnitTestResult executionId="22fd16ba-0b0f-434c-b0a4-dde6a86464f9" testId="85b99f4c-836a-0756-0d13-80ec03aaf4bb" testName="InferenceWeb.Tests.Qwen4ExpMtpIntegrationTests.LearnedHead_DraftVerifyRollbackGreedyMatchesPlainWithEngagement" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.1165235" startTime="2026-09-16T10:12:05.2823540-07:00" endTime="2026-09-16T10:12:05.3988380-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="22fd16ba-0b0f-434c-b0a4-dde6a86464f9">
+      <Output>
+        <StdOut>fixture target.gguf sha256=f6d57de601159214dbd7d18a4d779bdbdda17860059a34625834652e6dc05e07
+fixture head.gguf sha256=b7c93fea8db74d2cdfa360ed54f3c6c862f450a2adcd21282af971701f0544e3
+native /Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/libGgmlOps.dylib sha256=2ef5df1601135d00456647192ae9c2ee0a975898f7f1f3f1a17708b730e1343b; backend=GgmlCpu
+plain=215,162,90,224,236,29,29,155,155,162,38,98,111,29,184,119 speculative=215,162,90,224,236,29,29,155,155,162,38,98,111,29,184,119 drafted=42 accepted=0 verify=15 rollback=15 plainSteps=0 parked=0</StdOut>
+      </Output>
+    </UnitTestResult>
+    <UnitTestResult executionId="c5618796-b1cb-4080-9407-6c28618d6893" testId="d6f0da76-a583-6455-ca73-6fdd0d9c3fda" testName="InferenceWeb.Tests.Qwen4ExpQsaHistoryTests.InvalidWriteNeverModifiesAnyHistoryCell(kind: 3)" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0000545" startTime="2026-09-16T10:12:02.9448460-07:00" endTime="2026-09-16T10:12:02.9448690-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="c5618796-b1cb-4080-9407-6c28618d6893" />
+    <UnitTestResult executionId="c695fae0-279e-4af7-a381-e35f223b32f2" testId="b0bae7a6-ad4f-539c-8578-df23238233ce" testName="InferenceWeb.Tests.Qwen4ExpQsaHistoryTests.InvalidWriteNeverModifiesAnyHistoryCell(kind: 6)" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0000046" startTime="2026-09-16T10:12:02.9536930-07:00" endTime="2026-09-16T10:12:02.9537160-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="c695fae0-279e-4af7-a381-e35f223b32f2" />
+    <UnitTestResult executionId="9dcb6429-1eed-4033-a956-11f5a1d314b8" testId="273ec361-109e-18eb-a90e-20dfe610e2af" testName="InferenceWeb.Tests.Qwen4ExpVideoForwardTests.TwoTemporalPairs_ForwardWithIncreasingTimeReachQsaHistoryAndChangeLogits" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0832310" startTime="2026-09-16T10:12:02.9551730-07:00" endTime="2026-09-16T10:12:03.0344390-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="9dcb6429-1eed-4033-a956-11f5a1d314b8">
+      <Output>
+        <StdOut>backend=GgmlCpu
+video pairs at T=2,6; last text T=9; gap=4; max |two-flat| = 0.41464353</StdOut>
+      </Output>
+    </UnitTestResult>
+    <UnitTestResult executionId="973bd36d-68e6-4a1a-95c6-65d5fb2978f2" testId="9edc401c-8eb6-196f-89e9-a64166bf6524" testName="InferenceWeb.Tests.Qwen4ExpMtpIntegrationTests.DraftHead_F16CacheCatchUpReplayAndTargetIndependence" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0265801" startTime="2026-09-16T10:12:05.6700230-07:00" endTime="2026-09-16T10:12:05.6965780-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="973bd36d-68e6-4a1a-95c6-65d5fb2978f2">
+      <Output>
+        <StdOut>fixture target.gguf sha256=f6d57de601159214dbd7d18a4d779bdbdda17860059a34625834652e6dc05e07
+fixture head.gguf sha256=b7c93fea8db74d2cdfa360ed54f3c6c862f450a2adcd21282af971701f0544e3
+native /Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/libGgmlOps.dylib sha256=2ef5df1601135d00456647192ae9c2ee0a975898f7f1f3f1a17708b730e1343b; backend=GgmlCpu</StdOut>
+      </Output>
+    </UnitTestResult>
+    <UnitTestResult executionId="1411b2df-7392-4583-8744-c2bdef86f75c" testId="55596965-a99d-9678-95d2-3e708cb52143" testName="InferenceWeb.Tests.Qwen4ExpQsaHistoryTests.OtherOwnerOrResetCannotRewindItsHistory(reset: True)" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0000952" startTime="2026-09-16T10:12:02.9539050-07:00" endTime="2026-09-16T10:12:02.9539200-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="1411b2df-7392-4583-8744-c2bdef86f75c" />
+    <UnitTestResult executionId="83a4ba45-d2d5-44a8-b943-507ee0d600ee" testId="29f6a28b-1f52-c7a1-874d-b1a9ffe68e57" testName="InferenceWeb.Tests.Qwen4ExpRetainedCacheTests.Engine_FollowUpReusesRetainedHolder_AndNewChatsCloneTheCheckpoint" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.6970344" startTime="2026-09-16T10:12:03.0347300-07:00" endTime="2026-09-16T10:12:03.7384490-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Failed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="83a4ba45-d2d5-44a8-b943-507ee0d600ee">
+      <Output>
+        <StdOut>native /Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/libGgmlOps.dylib sha256=2ef5df1601135d00456647192ae9c2ee0a975898f7f1f3f1a17708b730e1343b; backend=GgmlCpu
+native /Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/libGgmlOps.dylib sha256=2ef5df1601135d00456647192ae9c2ee0a975898f7f1f3f1a17708b730e1343b; backend=GgmlCpu
+A1 out=18,200,74,249,250,224 A2 reused=20 of 23 out=200,200,29,126,19,249
+chat-1 out=249,228,64,235,14,43 chat-2 reused=16 out=115,227,227,29,115,124 chat-3 reused=16 out=119,227,233,213,213,230</StdOut>
+        <ErrorInfo>
+          <Message>Assert.Equal() Failure: Collections differ
+           ↓ (pos 0)
+Expected: [169, 224, 226, 119, 44, ···]
+Actual:   [119, 227, 233, 213, 213, ···]
+           ↑ (pos 0)</Message>
+          <StackTrace>   at InferenceWeb.Tests.Qwen4ExpRetainedCacheTests.Engine_FollowUpReusesRetainedHolder_AndNewChatsCloneTheCheckpoint() in /Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/Qwen4ExpRetainedCacheTests.cs:line 419
+--- End of stack trace from previous location ---</StackTrace>
+        </ErrorInfo>
+      </Output>
+    </UnitTestResult>
+    <UnitTestResult executionId="e06720fb-3447-4efa-8254-c377d4f78fad" testId="28d444f2-4206-300b-00db-a9f71f196dce" testName="InferenceWeb.Tests.Qwen4ExpMtpIntegrationTests.QsaFirstPromptAndReset_GrowBeforeForwardWithoutExportingInvalidatedState" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0525810" startTime="2026-09-16T10:12:05.0613650-07:00" endTime="2026-09-16T10:12:05.1137470-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="e06720fb-3447-4efa-8254-c377d4f78fad">
+      <Output>
+        <StdOut>fixture target.gguf sha256=f6d57de601159214dbd7d18a4d779bdbdda17860059a34625834652e6dc05e07
+fixture head.gguf sha256=b7c93fea8db74d2cdfa360ed54f3c6c862f450a2adcd21282af971701f0544e3
+native /Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/libGgmlOps.dylib sha256=2ef5df1601135d00456647192ae9c2ee0a975898f7f1f3f1a17708b730e1343b; backend=GgmlCpu
+native /Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/libGgmlOps.dylib sha256=2ef5df1601135d00456647192ae9c2ee0a975898f7f1f3f1a17708b730e1343b; backend=GgmlCpu
+QSA first/reset prompt growth 8-&gt;16-&gt;32: all logits and raw-key bytes match pre-grown references.</StdOut>
+      </Output>
+    </UnitTestResult>
+    <UnitTestResult executionId="78e9af88-18a2-4b57-b4f6-732ed0a39d1b" testId="a9e1e1db-ad1c-e213-c8d2-3ebd6df4c448" testName="InferenceWeb.Tests.Qwen4ExpQsaHistoryTests.HolderSwitchRestoresItsOwnCompleteHistoryAndSpecRewindReplacesOnlyTail" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0006575" startTime="2026-09-16T10:12:02.9547920-07:00" endTime="2026-09-16T10:12:02.9548120-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="78e9af88-18a2-4b57-b4f6-732ed0a39d1b" />
+    <UnitTestResult executionId="e2401047-2020-43bf-8244-0a4300da50c2" testId="618a54c3-966b-a1b5-471b-468934d8c14f" testName="InferenceWeb.Tests.Qwen4ExpQsaHistoryTests.InvalidWriteNeverModifiesAnyHistoryCell(kind: 7)" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0000047" startTime="2026-09-16T10:12:02.9535090-07:00" endTime="2026-09-16T10:12:02.9535410-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="e2401047-2020-43bf-8244-0a4300da50c2" />
+    <UnitTestResult executionId="b47185fd-7f7d-4b26-8c8d-6c0371bf5361" testId="9857e3cc-458b-85df-3b94-22a7dc331b18" testName="InferenceWeb.Tests.Qwen4ExpRetainedCachePolicyTests.HalfSpareClamp_EvictsEvenUnderAGenerousConfiguredBudget" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0007397" startTime="2026-09-16T10:12:02.9427910-07:00" endTime="2026-09-16T10:12:02.9433260-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="b47185fd-7f7d-4b26-8c8d-6c0371bf5361" />
+    <UnitTestResult executionId="e695e2f6-583b-46f8-b11d-718538bfc4fc" testId="bcf351c4-8a6a-4752-99b8-7550a8e7142d" testName="InferenceWeb.Tests.Qwen4ExpRetainedCacheTests.SharedPrefixCheckpoint_ClonesEqualColdPrefill_AndTheSourceIsUntouched" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.1033120" startTime="2026-09-16T10:12:04.8856550-07:00" endTime="2026-09-16T10:12:04.9888820-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="e695e2f6-583b-46f8-b11d-718538bfc4fc">
+      <Output>
+        <StdOut>native /Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/libGgmlOps.dylib sha256=2ef5df1601135d00456647192ae9c2ee0a975898f7f1f3f1a17708b730e1343b; backend=GgmlCpu
+native /Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/libGgmlOps.dylib sha256=2ef5df1601135d00456647192ae9c2ee0a975898f7f1f3f1a17708b730e1343b; backend=GgmlCpu
+checkpoint of 16 tokens cloned twice; clones equal a cold prefill for 3 steps, draft-head state cloned, source unchanged.</StdOut>
+      </Output>
+    </UnitTestResult>
+    <UnitTestResult executionId="1c749d3a-fc1d-41c8-b43a-1098a6ba407f" testId="a0c5d962-615d-a885-c709-5b4b048f177c" testName="InferenceWeb.Tests.Qwen4ExpRetainedCachePolicyTests.Qwen4Exp_AdvertisesExactPrefixReuseOnly" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0010066" startTime="2026-09-16T10:12:02.9340890-07:00" endTime="2026-09-16T10:12:02.9367920-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="1c749d3a-fc1d-41c8-b43a-1098a6ba407f" />
+    <UnitTestResult executionId="1004f109-fe90-4f54-9d1f-4a7adededa18" testId="aa6335df-fc8b-eca9-7e32-1fdc98f9e201" testName="InferenceWeb.Tests.Qwen4ExpMtpIntegrationTests.QsaRawCache_GrowthPreservesBytesAndRollbackReplaysAllLogits" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.1289416" startTime="2026-09-16T10:12:05.4822010-07:00" endTime="2026-09-16T10:12:05.6121870-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="1004f109-fe90-4f54-9d1f-4a7adededa18">
+      <Output>
+        <StdOut>fixture target.gguf sha256=f6d57de601159214dbd7d18a4d779bdbdda17860059a34625834652e6dc05e07
+fixture head.gguf sha256=b7c93fea8db74d2cdfa360ed54f3c6c862f450a2adcd21282af971701f0544e3
+native /Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/libGgmlOps.dylib sha256=2ef5df1601135d00456647192ae9c2ee0a975898f7f1f3f1a17708b730e1343b; backend=GgmlCpu
+native /Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/libGgmlOps.dylib sha256=2ef5df1601135d00456647192ae9c2ee0a975898f7f1f3f1a17708b730e1343b; backend=GgmlCpu
+QSA raw cache: capacities 8-&gt;16-&gt;32, prefix bytes 80-&gt;192-&gt;272; all-logit branch exact.</StdOut>
+      </Output>
+    </UnitTestResult>
+    <UnitTestResult executionId="3dc00d5b-49e0-4a03-8991-e0c6589dd260" testId="a7576db1-22db-4660-5e57-8005371ce3df" testName="InferenceWeb.Tests.Qwen4ExpQsaHistoryTests.OtherOwnerOrResetCannotRewindItsHistory(reset: False)" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0031386" startTime="2026-09-16T10:12:02.9538610-07:00" endTime="2026-09-16T10:12:02.9538770-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="3dc00d5b-49e0-4a03-8991-e0c6589dd260" />
+    <UnitTestResult executionId="18191fc7-a7ba-4d9d-a3df-0fa4fa93cab3" testId="9677078a-191f-35de-4c28-cf6e818fbecf" testName="InferenceWeb.Tests.Qwen4ExpRetainedCachePolicyTests.Budget_IncludesRetainedBytes_ClampsToHalfSpare_AndZeroDeclines" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0000578" startTime="2026-09-16T10:12:02.9433740-07:00" endTime="2026-09-16T10:12:02.9433910-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="18191fc7-a7ba-4d9d-a3df-0fa4fa93cab3" />
+  </Results>
+  <TestDefinitions>
+    <UnitTest name="InferenceWeb.Tests.Qwen4ExpMtpIntegrationTests.LearnedHead_DraftVerifyRollbackGreedyMatchesPlainWithEngagement" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="85b99f4c-836a-0756-0d13-80ec03aaf4bb">
+      <Execution id="22fd16ba-0b0f-434c-b0a4-dde6a86464f9" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Qwen4ExpMtpIntegrationTests" name="LearnedHead_DraftVerifyRollbackGreedyMatchesPlainWithEngagement" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Qwen4ExpQsaHistoryTests.InvalidWriteNeverModifiesAnyHistoryCell(kind: 3)" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="d6f0da76-a583-6455-ca73-6fdd0d9c3fda">
+      <Execution id="c5618796-b1cb-4080-9407-6c28618d6893" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Qwen4ExpQsaHistoryTests" name="InvalidWriteNeverModifiesAnyHistoryCell" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Qwen4ExpRetainedCachePolicyTests.HalfSpareClamp_EvictsEvenUnderAGenerousConfiguredBudget" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="9857e3cc-458b-85df-3b94-22a7dc331b18">
+      <Execution id="b47185fd-7f7d-4b26-8c8d-6c0371bf5361" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Qwen4ExpRetainedCachePolicyTests" name="HalfSpareClamp_EvictsEvenUnderAGenerousConfiguredBudget" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Qwen4ExpQsaHistoryTests.InvalidWriteNeverModifiesAnyHistoryCell(kind: 0)" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="4eaec189-f42b-7c1e-7042-2825c57c3119">
+      <Execution id="1fcb5532-34b8-4e78-aa6b-e9d5eb5dfc5c" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Qwen4ExpQsaHistoryTests" name="InvalidWriteNeverModifiesAnyHistoryCell" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Qwen4ExpQsaHistoryTests.InvalidWriteNeverModifiesAnyHistoryCell(kind: 5)" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="abdabf26-8e36-8b4d-25da-6f4c290ceb4c">
+      <Execution id="5a969bd9-77e6-4a2b-9b36-926093268c18" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Qwen4ExpQsaHistoryTests" name="InvalidWriteNeverModifiesAnyHistoryCell" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Qwen4ExpMtpStateTests.Rewind_RequiresCompletedNativeRestoreAndExactCapturedPositionOnce" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="44c17d59-fd95-c91d-5ecf-d71865250aff">
+      <Execution id="b1a3e398-6574-49a2-901b-cac9c2be04fc" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Qwen4ExpMtpStateTests" name="Rewind_RequiresCompletedNativeRestoreAndExactCapturedPositionOnce" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Qwen4ExpMtpStateTests.MetadataRestore_RejectsOtherHolderOrResetBeforeChangingItsHistory(reset: False)" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="547cff3a-33c6-43b4-f77f-5b30b5f83984">
+      <Execution id="67a00e26-c07a-40e1-a8b7-f98db12bce12" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Qwen4ExpMtpStateTests" name="MetadataRestore_RejectsOtherHolderOrResetBeforeChangingItsHistory" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Qwen4ExpMtpIntegrationTests.TargetSnapshot_RestoresGdnPleAndRejectsWrongHolderWithoutMutation" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="ce2c1f73-897a-1021-02bc-a7b0e421a60f">
+      <Execution id="473ff139-0cbf-4757-92b4-afddf95c737b" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Qwen4ExpMtpIntegrationTests" name="TargetSnapshot_RestoresGdnPleAndRejectsWrongHolderWithoutMutation" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Qwen4ExpQsaHistoryTests.InvalidWriteNeverModifiesAnyHistoryCell(kind: 1)" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="43abf8ed-1d77-0dbb-6177-54d0e35e0257">
+      <Execution id="d4c374ed-adcc-4831-8673-26be3ecdabdf" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Qwen4ExpQsaHistoryTests" name="InvalidWriteNeverModifiesAnyHistoryCell" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Qwen4ExpQsaHistoryTests.InvalidWriteNeverModifiesAnyHistoryCell(kind: 4)" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="deb8c1ef-ea70-ef3b-f17f-96ca4576653a">
+      <Execution id="67c27a1b-09c6-488c-8f08-b004fc4df483" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Qwen4ExpQsaHistoryTests" name="InvalidWriteNeverModifiesAnyHistoryCell" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Qwen4ExpMtpStateTests.MetadataRestore_RejectsOtherHolderOrResetBeforeChangingItsHistory(reset: True)" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="e6ad26da-d7a0-9737-becc-4d0882a66b9f">
+      <Execution id="deeab61a-8322-4534-9ba5-f6e3f2cee149" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Qwen4ExpMtpStateTests" name="MetadataRestore_RejectsOtherHolderOrResetBeforeChangingItsHistory" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Qwen4ExpRetainedCachePolicyTests.ZeroBudget_DeclinesWithoutTouchingRetainedHolders" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="68a763e7-77ed-03a2-0341-5b8f13384b6c">
+      <Execution id="f4338fa0-adf4-469d-b7c5-e075dbb2c619" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Qwen4ExpRetainedCachePolicyTests" name="ZeroBudget_DeclinesWithoutTouchingRetainedHolders" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Qwen4ExpMtpIntegrationTests.QsaMediaHistory_HolderReleaseAndRewindPreserveOtherRawCache" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="41ad05ca-7f68-e546-4997-d0be25831aa4">
+      <Execution id="98ec34a3-4410-4d9b-b08d-96452980b3e9" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Qwen4ExpMtpIntegrationTests" name="QsaMediaHistory_HolderReleaseAndRewindPreserveOtherRawCache" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Qwen4ExpMtpIntegrationTests.DraftHead_F16CacheCatchUpReplayAndTargetIndependence" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="9edc401c-8eb6-196f-89e9-a64166bf6524">
+      <Execution id="973bd36d-68e6-4a1a-95c6-65d5fb2978f2" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Qwen4ExpMtpIntegrationTests" name="DraftHead_F16CacheCatchUpReplayAndTargetIndependence" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Qwen4ExpRetainedCachePolicyTests.DiscardAndTrim_FreeConversationsAndKeepCheckpoints" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="996adb2e-621e-df7d-9692-fa287c42648b">
+      <Execution id="b5057c93-6b7d-404f-8cd4-4a8287f53dd2" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Qwen4ExpRetainedCachePolicyTests" name="DiscardAndTrim_FreeConversationsAndKeepCheckpoints" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Qwen4ExpRetainedCacheTests.SharedPrefixCheckpoint_ClonesEqualColdPrefill_AndTheSourceIsUntouched" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="bcf351c4-8a6a-4752-99b8-7550a8e7142d">
+      <Execution id="e695e2f6-583b-46f8-b11d-718538bfc4fc" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Qwen4ExpRetainedCacheTests" name="SharedPrefixCheckpoint_ClonesEqualColdPrefill_AndTheSourceIsUntouched" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Qwen4ExpRetainedCachePolicyTests.Qwen4Exp_AdvertisesExactPrefixReuseOnly" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="a0c5d962-615d-a885-c709-5b4b048f177c">
+      <Execution id="1c749d3a-fc1d-41c8-b43a-1098a6ba407f" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Qwen4ExpRetainedCachePolicyTests" name="Qwen4Exp_AdvertisesExactPrefixReuseOnly" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Qwen4ExpRetainedCacheTests.RetentionBudget_EvictsTheOldestConversation_AndZeroDeclines" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="bb324b30-f22b-329a-ec4b-b4350d6db2be">
+      <Execution id="bcd0ab2a-859c-4d6e-a64f-8f001fe41b5c" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Qwen4ExpRetainedCacheTests" name="RetentionBudget_EvictsTheOldestConversation_AndZeroDeclines" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Qwen4ExpRetainedCacheTests.DraftHead_SpeculationEngagesOnAReboundHolder_AndMatchesPlainGreedy" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="7ec0e6f7-93ec-a33d-5227-1a02a52c4983">
+      <Execution id="8714183f-89a8-462f-8dcd-abc1a137c756" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Qwen4ExpRetainedCacheTests" name="DraftHead_SpeculationEngagesOnAReboundHolder_AndMatchesPlainGreedy" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Qwen4ExpMtpIntegrationTests.QsaFirstPromptAndReset_GrowBeforeForwardWithoutExportingInvalidatedState" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="28d444f2-4206-300b-00db-a9f71f196dce">
+      <Execution id="e06720fb-3447-4efa-8254-c377d4f78fad" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Qwen4ExpMtpIntegrationTests" name="QsaFirstPromptAndReset_GrowBeforeForwardWithoutExportingInvalidatedState" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Qwen4ExpQsaHistoryTests.TextMediaAndDelayedTextPreserveCompleteHistoryAndCallerCoordinates" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="7a195627-cf45-57dc-cbed-d26e4116ec24">
+      <Execution id="c3fb4fbb-723a-4fd8-aa14-edf4a195d3bb" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Qwen4ExpQsaHistoryTests" name="TextMediaAndDelayedTextPreserveCompleteHistoryAndCallerCoordinates" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Qwen4ExpQsaHistoryTests.OtherOwnerOrResetCannotRewindItsHistory(reset: True)" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="55596965-a99d-9678-95d2-3e708cb52143">
+      <Execution id="1411b2df-7392-4583-8744-c2bdef86f75c" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Qwen4ExpQsaHistoryTests" name="OtherOwnerOrResetCannotRewindItsHistory" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Qwen4ExpRetainedCacheTests.Engine_FollowUpReusesRetainedHolder_AndNewChatsCloneTheCheckpoint" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="29f6a28b-1f52-c7a1-874d-b1a9ffe68e57">
+      <Execution id="83a4ba45-d2d5-44a8-b943-507ee0d600ee" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Qwen4ExpRetainedCacheTests" name="Engine_FollowUpReusesRetainedHolder_AndNewChatsCloneTheCheckpoint" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Qwen4ExpMtpIntegrationTests.HistoricalMediaPositions_DelayedDraftCatchUpMatchesImmediateChunkSchedule" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="4a54363d-32c7-d97e-e8b7-94bd8756cf1e">
+      <Execution id="33c102e3-54b1-46e2-9e0b-c81ebd62e516" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Qwen4ExpMtpIntegrationTests" name="HistoricalMediaPositions_DelayedDraftCatchUpMatchesImmediateChunkSchedule" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Qwen4ExpRetainedCachePolicyTests.Budget_IncludesRetainedBytes_ClampsToHalfSpare_AndZeroDeclines" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="9677078a-191f-35de-4c28-cf6e818fbecf">
+      <Execution id="18191fc7-a7ba-4d9d-a3df-0fa4fa93cab3" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Qwen4ExpRetainedCachePolicyTests" name="Budget_IncludesRetainedBytes_ClampsToHalfSpare_AndZeroDeclines" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Qwen4ExpMtpStateTests.Rewind_RejectsChangedHolderEvenAtSamePosition" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="06c9675d-2bba-d857-47be-3fe7e6ab6c99">
+      <Execution id="3dba3b52-6c84-43f3-93f3-9c0ee7d49704" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Qwen4ExpMtpStateTests" name="Rewind_RejectsChangedHolderEvenAtSamePosition" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Qwen4ExpRetainedCacheTests.Checkpoint_MissingAuthoritativeRecurrentEntryDoesNotPublishStaleHostState" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="7228d1c4-52be-c2ba-5477-b64b38b62de3">
+      <Execution id="4775574d-e41a-4b2d-b3d1-05c7635b2090" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Qwen4ExpRetainedCacheTests" name="Checkpoint_MissingAuthoritativeRecurrentEntryDoesNotPublishStaleHostState" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Qwen4ExpQsaHistoryTests.CausalCoordinateOrderIsTimeThenHeightThenWidth" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="a48ac43c-89b1-165a-d18a-567704db559e">
+      <Execution id="9904918b-a4d8-4874-849c-fe89bdeb54af" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Qwen4ExpQsaHistoryTests" name="CausalCoordinateOrderIsTimeThenHeightThenWidth" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Qwen4ExpRetainedCachePolicyTests.Eviction_DropsOldestConversationsFirst_NeverACheckpoint_AndDeclinesWhenNothingFits" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="e5988db4-4058-db4c-35d9-7e8af6eaa38f">
+      <Execution id="78a1203b-8a8c-4917-8ad1-9256c65476bd" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Qwen4ExpRetainedCachePolicyTests" name="Eviction_DropsOldestConversationsFirst_NeverACheckpoint_AndDeclinesWhenNothingFits" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Qwen4ExpRetainedCacheTests.ReleasedConversation_RebindsAfterAnotherRequest_BitExact_WithQsaHistory" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="d6183be4-c383-dec1-0ff1-5e6ab799a2e3">
+      <Execution id="a32301b5-1ae3-46fc-8122-7cd9e60ab306" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Qwen4ExpRetainedCacheTests" name="ReleasedConversation_RebindsAfterAnotherRequest_BitExact_WithQsaHistory" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Qwen4ExpVideoForwardTests.TwoTemporalPairs_ForwardWithIncreasingTimeReachQsaHistoryAndChangeLogits" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="273ec361-109e-18eb-a90e-20dfe610e2af">
+      <Execution id="9dcb6429-1eed-4033-a956-11f5a1d314b8" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Qwen4ExpVideoForwardTests" name="TwoTemporalPairs_ForwardWithIncreasingTimeReachQsaHistoryAndChangeLogits" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Qwen4ExpMtpStateTests.MetadataSnapshot_CopiesPleHistoryAndRestoresSameOwnerWithoutRewindingEarly" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="a6d14924-7b09-7aa2-5e71-452bcbefd78a">
+      <Execution id="4ae33980-88ca-4d81-8b63-d0c0f39e456f" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Qwen4ExpMtpStateTests" name="MetadataSnapshot_CopiesPleHistoryAndRestoresSameOwnerWithoutRewindingEarly" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Qwen4ExpMtpIntegrationTests.DisposingDraftHead_PreservesBorrowedTargetOutputAndRetry" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="45abfbe8-d4d5-b13f-0fed-164e7db5a118">
+      <Execution id="ea09b673-ec84-4819-a750-a368c1b9633d" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Qwen4ExpMtpIntegrationTests" name="DisposingDraftHead_PreservesBorrowedTargetOutputAndRetry" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Qwen4ExpQsaHistoryTests.InvalidWriteNeverModifiesAnyHistoryCell(kind: 2)" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="0a6c7551-043b-590b-e08d-9a576d17c8ff">
+      <Execution id="77f08d10-712e-4698-8c77-79b28a098ed8" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Qwen4ExpQsaHistoryTests" name="InvalidWriteNeverModifiesAnyHistoryCell" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Qwen4ExpQsaHistoryTests.HolderSwitchRestoresItsOwnCompleteHistoryAndSpecRewindReplacesOnlyTail" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="a9e1e1db-ad1c-e213-c8d2-3ebd6df4c448">
+      <Execution id="78e9af88-18a2-4b57-b4f6-732ed0a39d1b" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Qwen4ExpQsaHistoryTests" name="HolderSwitchRestoresItsOwnCompleteHistoryAndSpecRewindReplacesOnlyTail" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Qwen4ExpQsaHistoryTests.InvalidWriteNeverModifiesAnyHistoryCell(kind: 7)" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="618a54c3-966b-a1b5-471b-468934d8c14f">
+      <Execution id="e2401047-2020-43bf-8244-0a4300da50c2" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Qwen4ExpQsaHistoryTests" name="InvalidWriteNeverModifiesAnyHistoryCell" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Qwen4ExpQsaHistoryTests.InvalidWriteNeverModifiesAnyHistoryCell(kind: 6)" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="b0bae7a6-ad4f-539c-8578-df23238233ce">
+      <Execution id="c695fae0-279e-4af7-a381-e35f223b32f2" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Qwen4ExpQsaHistoryTests" name="InvalidWriteNeverModifiesAnyHistoryCell" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Qwen4ExpQsaHistoryTests.OtherOwnerOrResetCannotRewindItsHistory(reset: False)" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="a7576db1-22db-4660-5e57-8005371ce3df">
+      <Execution id="3dc00d5b-49e0-4a03-8991-e0c6589dd260" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Qwen4ExpQsaHistoryTests" name="OtherOwnerOrResetCannotRewindItsHistory" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Qwen4ExpMtpIntegrationTests.DraftPrivateState_FollowsHolderAndReleasePreservesOtherConversation" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="e3b19859-d26a-a389-6a6e-59e83996ba3d">
+      <Execution id="c425e84d-4e9d-4a8f-b68b-653e1e255ca8" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Qwen4ExpMtpIntegrationTests" name="DraftPrivateState_FollowsHolderAndReleasePreservesOtherConversation" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Qwen4ExpMtpIntegrationTests.QsaRawCache_GrowthPreservesBytesAndRollbackReplaysAllLogits" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="aa6335df-fc8b-eca9-7e32-1fdc98f9e201">
+      <Execution id="1004f109-fe90-4f54-9d1f-4a7adededa18" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Qwen4ExpMtpIntegrationTests" name="QsaRawCache_GrowthPreservesBytesAndRollbackReplaysAllLogits" />
+    </UnitTest>
+  </TestDefinitions>
+  <TestEntries>
+    <TestEntry testId="7228d1c4-52be-c2ba-5477-b64b38b62de3" executionId="4775574d-e41a-4b2d-b3d1-05c7635b2090" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="a48ac43c-89b1-165a-d18a-567704db559e" executionId="9904918b-a4d8-4874-849c-fe89bdeb54af" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="547cff3a-33c6-43b4-f77f-5b30b5f83984" executionId="67a00e26-c07a-40e1-a8b7-f98db12bce12" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="a6d14924-7b09-7aa2-5e71-452bcbefd78a" executionId="4ae33980-88ca-4d81-8b63-d0c0f39e456f" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="41ad05ca-7f68-e546-4997-d0be25831aa4" executionId="98ec34a3-4410-4d9b-b08d-96452980b3e9" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="7ec0e6f7-93ec-a33d-5227-1a02a52c4983" executionId="8714183f-89a8-462f-8dcd-abc1a137c756" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="996adb2e-621e-df7d-9692-fa287c42648b" executionId="b5057c93-6b7d-404f-8cd4-4a8287f53dd2" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="d6183be4-c383-dec1-0ff1-5e6ab799a2e3" executionId="a32301b5-1ae3-46fc-8122-7cd9e60ab306" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="68a763e7-77ed-03a2-0341-5b8f13384b6c" executionId="f4338fa0-adf4-469d-b7c5-e075dbb2c619" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="bb324b30-f22b-329a-ec4b-b4350d6db2be" executionId="bcd0ab2a-859c-4d6e-a64f-8f001fe41b5c" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="0a6c7551-043b-590b-e08d-9a576d17c8ff" executionId="77f08d10-712e-4698-8c77-79b28a098ed8" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="e3b19859-d26a-a389-6a6e-59e83996ba3d" executionId="c425e84d-4e9d-4a8f-b68b-653e1e255ca8" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="deb8c1ef-ea70-ef3b-f17f-96ca4576653a" executionId="67c27a1b-09c6-488c-8f08-b004fc4df483" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="e6ad26da-d7a0-9737-becc-4d0882a66b9f" executionId="deeab61a-8322-4534-9ba5-f6e3f2cee149" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="45abfbe8-d4d5-b13f-0fed-164e7db5a118" executionId="ea09b673-ec84-4819-a750-a368c1b9633d" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="7a195627-cf45-57dc-cbed-d26e4116ec24" executionId="c3fb4fbb-723a-4fd8-aa14-edf4a195d3bb" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="abdabf26-8e36-8b4d-25da-6f4c290ceb4c" executionId="5a969bd9-77e6-4a2b-9b36-926093268c18" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="44c17d59-fd95-c91d-5ecf-d71865250aff" executionId="b1a3e398-6574-49a2-901b-cac9c2be04fc" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="06c9675d-2bba-d857-47be-3fe7e6ab6c99" executionId="3dba3b52-6c84-43f3-93f3-9c0ee7d49704" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="4eaec189-f42b-7c1e-7042-2825c57c3119" executionId="1fcb5532-34b8-4e78-aa6b-e9d5eb5dfc5c" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="4a54363d-32c7-d97e-e8b7-94bd8756cf1e" executionId="33c102e3-54b1-46e2-9e0b-c81ebd62e516" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="e5988db4-4058-db4c-35d9-7e8af6eaa38f" executionId="78a1203b-8a8c-4917-8ad1-9256c65476bd" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="43abf8ed-1d77-0dbb-6177-54d0e35e0257" executionId="d4c374ed-adcc-4831-8673-26be3ecdabdf" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="ce2c1f73-897a-1021-02bc-a7b0e421a60f" executionId="473ff139-0cbf-4757-92b4-afddf95c737b" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="85b99f4c-836a-0756-0d13-80ec03aaf4bb" executionId="22fd16ba-0b0f-434c-b0a4-dde6a86464f9" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="d6f0da76-a583-6455-ca73-6fdd0d9c3fda" executionId="c5618796-b1cb-4080-9407-6c28618d6893" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="b0bae7a6-ad4f-539c-8578-df23238233ce" executionId="c695fae0-279e-4af7-a381-e35f223b32f2" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="273ec361-109e-18eb-a90e-20dfe610e2af" executionId="9dcb6429-1eed-4033-a956-11f5a1d314b8" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="9edc401c-8eb6-196f-89e9-a64166bf6524" executionId="973bd36d-68e6-4a1a-95c6-65d5fb2978f2" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="55596965-a99d-9678-95d2-3e708cb52143" executionId="1411b2df-7392-4583-8744-c2bdef86f75c" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="29f6a28b-1f52-c7a1-874d-b1a9ffe68e57" executionId="83a4ba45-d2d5-44a8-b943-507ee0d600ee" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="28d444f2-4206-300b-00db-a9f71f196dce" executionId="e06720fb-3447-4efa-8254-c377d4f78fad" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="a9e1e1db-ad1c-e213-c8d2-3ebd6df4c448" executionId="78e9af88-18a2-4b57-b4f6-732ed0a39d1b" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="618a54c3-966b-a1b5-471b-468934d8c14f" executionId="e2401047-2020-43bf-8244-0a4300da50c2" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="9857e3cc-458b-85df-3b94-22a7dc331b18" executionId="b47185fd-7f7d-4b26-8c8d-6c0371bf5361" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="bcf351c4-8a6a-4752-99b8-7550a8e7142d" executionId="e695e2f6-583b-46f8-b11d-718538bfc4fc" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="a0c5d962-615d-a885-c709-5b4b048f177c" executionId="1c749d3a-fc1d-41c8-b43a-1098a6ba407f" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="aa6335df-fc8b-eca9-7e32-1fdc98f9e201" executionId="1004f109-fe90-4f54-9d1f-4a7adededa18" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="a7576db1-22db-4660-5e57-8005371ce3df" executionId="3dc00d5b-49e0-4a03-8991-e0c6589dd260" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="9677078a-191f-35de-4c28-cf6e818fbecf" executionId="18191fc7-a7ba-4d9d-a3df-0fa4fa93cab3" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+  </TestEntries>
+  <TestLists>
+    <TestList name="Results Not in a List" id="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestList name="All Loaded Results" id="19431567-8539-422a-85d7-44ee4e166bda" />
+  </TestLists>
+  <ResultSummary outcome="Failed">
+    <Counters total="40" executed="40" passed="38" failed="2" error="0" timeout="0" aborted="0" inconclusive="0" passedButRunAborted="0" notRunnable="0" notExecuted="0" disconnected="0" warning="0" completed="0" inProgress="0" pending="0" />
+    <Output>
+      <StdOut>[xUnit.net 00:00:00.00] xUnit.net VSTest Adapter v3.1.4+50e68bbb8b (64-bit .NET 10.0.10)
+[xUnit.net 00:00:00.06]   Discovering: InferenceWeb.Tests
+[xUnit.net 00:00:00.56]   Discovered:  InferenceWeb.Tests
+[xUnit.net 00:00:00.58]   Starting:    InferenceWeb.Tests
+[q4e retained] evicting older (0.0 MB) for test
+[q4e retained] evicting newer (0.0 MB) for test
+[q4e retained] declined test: 0.0 MB does not fit the retention budget (TS_Q4E_RETAINED_CACHE_MB=0 MB, retained 0.0 MB, headroom 8796093022208 MB); that request re-prefills. Reported once.
+[q4e retained] evicting first (0.0 MB) for test
+[q4e retained] declined test: 0.0 MB does not fit the retention budget (TS_Q4E_RETAINED_CACHE_MB=0 MB, retained 0.0 MB, headroom 8796093022208 MB); that request re-prefills. Reported once.
+[memory] Qwen4Exp: freed 1 retained conversation holder(s)
+Backend: GgmlCpu
+Model: qwen4exp, Layers=2, Hidden=8, Heads=4, KVHeads=2, HeadDim=8, Vocab=260
+  hyper-connections: count=4 lowRank=3 (residual is 32 wide)
+  experts=4 used=2 ff=6 sharedFf=5
+  GDN layers=1/2, QSA indexer heads=1 dim=8 topK=8
+  PLE: layers=[0] ngram=2 heads=1 headDim=8
+Loading model weights... done (57 F32 tensors, 24 quantized tensors)
+  Quantized: 0 MB (0 MB file-backed), F32: 0 MB
+Context length: using GGUF metadata qwen4exp.context_length=1024.
+  Qwen4Exp shared MTP ready: block=2, features=32, draftCompression=0, privateKV=F16, device=0, mappedBytes=10336.
+Backend: GgmlCpu
+Model: qwen4exp, Layers=2, Hidden=8, Heads=4, KVHeads=2, HeadDim=8, Vocab=260
+  hyper-connections: count=4 lowRank=3 (residual is 32 wide)
+  experts=4 used=2 ff=6 sharedFf=5
+  GDN layers=1/2, QSA indexer heads=1 dim=8 topK=8
+  PLE: layers=[0] ngram=2 heads=1 headDim=8
+Loading model weights... done (57 F32 tensors, 24 quantized tensors)
+  Quantized: 0 MB (0 MB file-backed), F32: 0 MB
+Context length: using GGUF metadata qwen4exp.context_length=1024.
+  Qwen4Exp shared MTP ready: block=2, features=32, draftCompression=0, privateKV=F16, device=0, mappedBytes=10336.
+Backend: GgmlCpu
+Model: qwen4exp, Layers=2, Hidden=8, Heads=4, KVHeads=2, HeadDim=8, Vocab=260
+  hyper-connections: count=4 lowRank=3 (residual is 32 wide)
+  experts=4 used=2 ff=6 sharedFf=5
+  GDN layers=1/2, QSA indexer heads=1 dim=8 topK=8
+  PLE: layers=[0] ngram=2 heads=1 headDim=8
+Loading model weights... done (57 F32 tensors, 24 quantized tensors)
+  Quantized: 0 MB (0 MB file-backed), F32: 0 MB
+Context length: using GGUF metadata qwen4exp.context_length=1024.
+  Qwen4Exp shared MTP ready: block=2, features=32, draftCompression=0, privateKV=F16, device=0, mappedBytes=10336.
+[xUnit.net 00:00:01.39]       Assert.Equal() Failure: Collections differ
+[xUnit.net 00:00:01.39]                  ↓ (pos 0)
+[xUnit.net 00:00:01.39]       Expected: [169, 224, 226, 119, 44, ···]
+[xUnit.net 00:00:01.39]       Actual:   [119, 227, 233, 213, 213, ···]
+[xUnit.net 00:00:01.39]                  ↑ (pos 0)
+Backend: GgmlCpu
+[xUnit.net 00:00:01.39]       Stack Trace:
+[xUnit.net 00:00:01.39]         /Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/Qwen4ExpRetainedCacheTests.cs(419,0): at InferenceWeb.Tests.Qwen4ExpRetainedCacheTests.Engine_FollowUpReusesRetainedHolder_AndNewChatsCloneTheCheckpoint()
+[xUnit.net 00:00:01.39]         --- End of stack trace from previous location ---
+[xUnit.net 00:00:01.39]       Output:
+[xUnit.net 00:00:01.39]         native /Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/libGgmlOps.dylib sha256=2ef5df1601135d00456647192ae9c2ee0a975898f7f1f3f1a17708b730e1343b; backend=GgmlCpu
+[xUnit.net 00:00:01.39]         native /Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/libGgmlOps.dylib sha256=2ef5df1601135d00456647192ae9c2ee0a975898f7f1f3f1a17708b730e1343b; backend=GgmlCpu
+[xUnit.net 00:00:01.39]         A1 out=18,200,74,249,250,224 A2 reused=20 of 23 out=200,200,29,126,19,249
+Model: qwen4exp, Layers=2, Hidden=8, Heads=4, KVHeads=2, HeadDim=8, Vocab=260
+[xUnit.net 00:00:01.39]         chat-1 out=249,228,64,235,14,43 chat-2 reused=16 out=115,227,227,29,115,124 chat-3 reused=16 out=119,227,233,213,213,230
+  hyper-connections: count=4 lowRank=3 (residual is 32 wide)
+  experts=4 used=2 ff=6 sharedFf=5
+  GDN layers=1/2, QSA indexer heads=1 dim=8 topK=8
+  PLE: layers=[0] ngram=2 heads=1 headDim=8
+Loading model weights... done (57 F32 tensors, 24 quantized tensors)
+  Quantized: 0 MB (0 MB file-backed), F32: 0 MB
+Context length: using GGUF metadata qwen4exp.context_length=1024.
+  Qwen4Exp shared MTP ready: block=2, features=32, draftCompression=0, privateKV=F16, device=0, mappedBytes=10336.
+Backend: GgmlCpu
+Model: qwen4exp, Layers=2, Hidden=8, Heads=4, KVHeads=2, HeadDim=8, Vocab=260
+  hyper-connections: count=4 lowRank=3 (residual is 32 wide)
+  experts=4 used=2 ff=6 sharedFf=5
+  GDN layers=1/2, QSA indexer heads=1 dim=8 topK=8
+  PLE: layers=[0] ngram=2 heads=1 headDim=8
+Loading model weights... done (57 F32 tensors, 24 quantized tensors)
+  Quantized: 0 MB (0 MB file-backed), F32: 0 MB
+Context length: using GGUF metadata qwen4exp.context_length=1024.
+  Qwen4Exp shared MTP ready: block=2, features=32, draftCompression=0, privateKV=F16, device=0, mappedBytes=10336.
+Backend: GgmlCpu
+Model: qwen4exp, Layers=2, Hidden=8, Heads=4, KVHeads=2, HeadDim=8, Vocab=260
+  hyper-connections: count=4 lowRank=3 (residual is 32 wide)
+  experts=4 used=2 ff=6 sharedFf=5
+  GDN layers=1/2, QSA indexer heads=1 dim=8 topK=8
+  PLE: layers=[0] ngram=2 heads=1 headDim=8
+Loading model weights... done (57 F32 tensors, 24 quantized tensors)
+  Quantized: 0 MB (0 MB file-backed), F32: 0 MB
+Context length: using GGUF metadata qwen4exp.context_length=1024.
+  Qwen4Exp shared MTP ready: block=2, features=32, draftCompression=0, privateKV=F16, device=0, mappedBytes=10336.
+Backend: GgmlCpu
+Model: qwen4exp, Layers=2, Hidden=8, Heads=4, KVHeads=2, HeadDim=8, Vocab=260
+  hyper-connections: count=4 lowRank=3 (residual is 32 wide)
+  experts=4 used=2 ff=6 sharedFf=5
+  GDN layers=1/2, QSA indexer heads=1 dim=8 topK=8
+  PLE: layers=[0] ngram=2 heads=1 headDim=8
+Loading model weights... done (57 F32 tensors, 24 quantized tensors)
+  Quantized: 0 MB (0 MB file-backed), F32: 0 MB
+Context length: using GGUF metadata qwen4exp.context_length=1024.
+  Qwen4Exp shared MTP ready: block=2, features=32, draftCompression=0, privateKV=F16, device=0, mappedBytes=10336.
+Backend: GgmlCpu
+Model: qwen4exp, Layers=2, Hidden=8, Heads=4, KVHeads=2, HeadDim=8, Vocab=260
+  hyper-connections: count=4 lowRank=3 (residual is 32 wide)
+  experts=4 used=2 ff=6 sharedFf=5
+  GDN layers=1/2, QSA indexer heads=1 dim=8 topK=8
+  PLE: layers=[0] ngram=2 heads=1 headDim=8
+Loading model weights... done (57 F32 tensors, 24 quantized tensors)
+  Quantized: 0 MB (0 MB file-backed), F32: 0 MB
+Context length: using GGUF metadata qwen4exp.context_length=1024.
+  Qwen4Exp shared MTP ready: block=2, features=32, draftCompression=0, privateKV=F16, device=0, mappedBytes=10336.
+Backend: GgmlCpu
+Model: qwen4exp, Layers=2, Hidden=8, Heads=4, KVHeads=2, HeadDim=8, Vocab=260
+  hyper-connections: count=4 lowRank=3 (residual is 32 wide)
+  experts=4 used=2 ff=6 sharedFf=5
+  GDN layers=1/2, QSA indexer heads=1 dim=8 topK=8
+  PLE: layers=[0] ngram=2 heads=1 headDim=8
+Loading model weights... done (57 F32 tensors, 24 quantized tensors)
+  Quantized: 0 MB (0 MB file-backed), F32: 0 MB
+Context length: using GGUF metadata qwen4exp.context_length=1024.
+  Qwen4Exp shared MTP ready: block=2, features=32, draftCompression=0, privateKV=F16, device=0, mappedBytes=10336.
+Backend: GgmlCpu
+Model: qwen4exp, Layers=2, Hidden=8, Heads=4, KVHeads=2, HeadDim=8, Vocab=260
+  hyper-connections: count=4 lowRank=3 (residual is 32 wide)
+  experts=4 used=2 ff=6 sharedFf=5
+  GDN layers=1/2, QSA indexer heads=1 dim=8 topK=8
+  PLE: layers=[0] ngram=2 heads=1 headDim=8
+Loading model weights... done (57 F32 tensors, 24 quantized tensors)
+  Quantized: 0 MB (0 MB file-backed), F32: 0 MB
+Context length: using GGUF metadata qwen4exp.context_length=1024.
+  Qwen4Exp shared MTP ready: block=2, features=32, draftCompression=0, privateKV=F16, device=0, mappedBytes=10336.
+Backend: GgmlCpu
+Model: qwen4exp, Layers=2, Hidden=8, Heads=4, KVHeads=2, HeadDim=8, Vocab=260
+  hyper-connections: count=4 lowRank=3 (residual is 32 wide)
+  experts=4 used=2 ff=6 sharedFf=5
+  GDN layers=1/2, QSA indexer heads=1 dim=8 topK=8
+  PLE: layers=[0] ngram=2 heads=1 headDim=8
+Loading model weights... done (57 F32 tensors, 24 quantized tensors)
+  Quantized: 0 MB (0 MB file-backed), F32: 0 MB
+Context length: using GGUF metadata qwen4exp.context_length=1024.
+  Qwen4Exp shared MTP ready: block=2, features=32, draftCompression=0, privateKV=F16, device=0, mappedBytes=10336.
+[xUnit.net 00:00:02.71]       unexpected retention capacity 91
+[xUnit.net 00:00:02.71]       Stack Trace:
+[xUnit.net 00:00:02.71]         /Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/Qwen4ExpRetainedCacheTests.cs(296,0): at InferenceWeb.Tests.Qwen4ExpRetainedCacheTests.RetentionBudget_EvictsTheOldestConversation_AndZeroDeclines()
+[xUnit.net 00:00:02.71]            at System.RuntimeMethodHandle.InvokeMethod(ObjectHandleOnStack target, Void** arguments, ObjectHandleOnStack sig, BOOL isConstructor, ObjectHandleOnStack result)
+[xUnit.net 00:00:02.71]            at System.RuntimeMethodHandle.InvokeMethod(ObjectHandleOnStack target, Void** arguments, ObjectHandleOnStack sig, BOOL isConstructor, ObjectHandleOnStack result)
+[xUnit.net 00:00:02.71]            at System.Reflection.MethodBaseInvoker.InterpretedInvoke_Method(Object obj, IntPtr* args)
+[xUnit.net 00:00:02.71]            at System.Reflection.RuntimeMethodInfo.Invoke(Object obj, BindingFlags invokeAttr, Binder binder, Object[] parameters, CultureInfo culture)
+[xUnit.net 00:00:02.71]       Output:
+[xUnit.net 00:00:02.71]         native /Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/libGgmlOps.dylib sha256=2ef5df1601135d00456647192ae9c2ee0a975898f7f1f3f1a17708b730e1343b; backend=GgmlCpu
+Backend: GgmlCpu
+Model: qwen4exp, Layers=2, Hidden=8, Heads=4, KVHeads=2, HeadDim=8, Vocab=260
+  hyper-connections: count=4 lowRank=3 (residual is 32 wide)
+  experts=4 used=2 ff=6 sharedFf=5
+  GDN layers=1/2, QSA indexer heads=1 dim=8 topK=8
+  PLE: layers=[0] ngram=2 heads=1 headDim=8
+Loading model weights... done (57 F32 tensors, 24 quantized tensors)
+  Quantized: 0 MB (0 MB file-backed), F32: 0 MB
+Context length: using GGUF metadata qwen4exp.context_length=1024.
+  Qwen4Exp shared MTP ready: block=2, features=32, draftCompression=0, privateKV=F16, device=0, mappedBytes=10336.
+Backend: GgmlCpu
+Model: qwen4exp, Layers=2, Hidden=8, Heads=4, KVHeads=2, HeadDim=8, Vocab=260
+  hyper-connections: count=4 lowRank=3 (residual is 32 wide)
+  experts=4 used=2 ff=6 sharedFf=5
+  GDN layers=1/2, QSA indexer heads=1 dim=8 topK=8
+  PLE: layers=[0] ngram=2 heads=1 headDim=8
+Loading model weights... done (57 F32 tensors, 24 quantized tensors)
+  Quantized: 0 MB (0 MB file-backed), F32: 0 MB
+Context length: using GGUF metadata qwen4exp.context_length=1024.
+  Qwen4Exp shared MTP ready: block=2, features=32, draftCompression=0, privateKV=F16, device=0, mappedBytes=10336.
+Backend: GgmlCpu
+Model: qwen4exp, Layers=2, Hidden=8, Heads=4, KVHeads=2, HeadDim=8, Vocab=260
+  hyper-connections: count=4 lowRank=3 (residual is 32 wide)
+  experts=4 used=2 ff=6 sharedFf=5
+  GDN layers=1/2, QSA indexer heads=1 dim=8 topK=8
+  PLE: layers=[0] ngram=2 heads=1 headDim=8
+Loading model weights... done (57 F32 tensors, 24 quantized tensors)
+  Quantized: 0 MB (0 MB file-backed), F32: 0 MB
+Context length: using GGUF metadata qwen4exp.context_length=1024.
+  Qwen4Exp shared MTP ready: block=2, features=32, draftCompression=0, privateKV=F16, device=0, mappedBytes=10336.
+Backend: GgmlCpu
+Model: qwen4exp, Layers=2, Hidden=8, Heads=4, KVHeads=2, HeadDim=8, Vocab=260
+  hyper-connections: count=4 lowRank=3 (residual is 32 wide)
+  experts=4 used=2 ff=6 sharedFf=5
+  GDN layers=1/2, QSA indexer heads=1 dim=8 topK=8
+  PLE: layers=[0] ngram=2 heads=1 headDim=8
+Loading model weights... done (57 F32 tensors, 24 quantized tensors)
+  Quantized: 0 MB (0 MB file-backed), F32: 0 MB
+Context length: using GGUF metadata qwen4exp.context_length=1024.
+  Qwen4Exp shared MTP ready: block=2, features=32, draftCompression=0, privateKV=F16, device=0, mappedBytes=10336.
+Backend: GgmlCpu
+Model: qwen4exp, Layers=2, Hidden=8, Heads=4, KVHeads=2, HeadDim=8, Vocab=260
+  hyper-connections: count=4 lowRank=3 (residual is 32 wide)
+  experts=4 used=2 ff=6 sharedFf=5
+  GDN layers=1/2, QSA indexer heads=1 dim=8 topK=8
+  PLE: layers=[0] ngram=2 heads=1 headDim=8
+Loading model weights... done (57 F32 tensors, 24 quantized tensors)
+  Quantized: 0 MB (0 MB file-backed), F32: 0 MB
+Context length: using GGUF metadata qwen4exp.context_length=1024.
+  Qwen4Exp shared MTP ready: block=2, features=32, draftCompression=0, privateKV=F16, device=0, mappedBytes=10336.
+Backend: GgmlCpu
+Model: qwen4exp, Layers=2, Hidden=8, Heads=4, KVHeads=2, HeadDim=8, Vocab=260
+  hyper-connections: count=4 lowRank=3 (residual is 32 wide)
+  experts=4 used=2 ff=6 sharedFf=5
+  GDN layers=1/2, QSA indexer heads=1 dim=8 topK=8
+  PLE: layers=[0] ngram=2 heads=1 headDim=8
+Loading model weights... done (57 F32 tensors, 24 quantized tensors)
+  Quantized: 0 MB (0 MB file-backed), F32: 0 MB
+Context length: using GGUF metadata qwen4exp.context_length=1024.
+  Qwen4Exp shared MTP ready: block=2, features=32, draftCompression=0, privateKV=F16, device=0, mappedBytes=10336.
+Backend: GgmlCpu
+Model: qwen4exp, Layers=2, Hidden=8, Heads=4, KVHeads=2, HeadDim=8, Vocab=260
+  hyper-connections: count=4 lowRank=3 (residual is 32 wide)
+  experts=4 used=2 ff=6 sharedFf=5
+  GDN layers=1/2, QSA indexer heads=1 dim=8 topK=8
+  PLE: layers=[0] ngram=2 heads=1 headDim=8
+Loading model weights... done (57 F32 tensors, 24 quantized tensors)
+  Quantized: 0 MB (0 MB file-backed), F32: 0 MB
+Context length: using GGUF metadata qwen4exp.context_length=1024.
+  Qwen4Exp shared MTP ready: block=2, features=32, draftCompression=0, privateKV=F16, device=0, mappedBytes=10336.
+Backend: GgmlCpu
+Model: qwen4exp, Layers=2, Hidden=8, Heads=4, KVHeads=2, HeadDim=8, Vocab=260
+  hyper-connections: count=4 lowRank=3 (residual is 32 wide)
+  experts=4 used=2 ff=6 sharedFf=5
+  GDN layers=1/2, QSA indexer heads=1 dim=8 topK=8
+  PLE: layers=[0] ngram=2 heads=1 headDim=8
+Loading model weights... done (57 F32 tensors, 24 quantized tensors)
+  Quantized: 0 MB (0 MB file-backed), F32: 0 MB
+Context length: using GGUF metadata qwen4exp.context_length=1024.
+  Qwen4Exp shared MTP ready: block=2, features=32, draftCompression=0, privateKV=F16, device=0, mappedBytes=10336.
+Backend: GgmlCpu
+Model: qwen4exp, Layers=2, Hidden=8, Heads=4, KVHeads=2, HeadDim=8, Vocab=260
+  hyper-connections: count=4 lowRank=3 (residual is 32 wide)
+  experts=4 used=2 ff=6 sharedFf=5
+  GDN layers=1/2, QSA indexer heads=1 dim=8 topK=8
+  PLE: layers=[0] ngram=2 heads=1 headDim=8
+Loading model weights... done (57 F32 tensors, 24 quantized tensors)
+  Quantized: 0 MB (0 MB file-backed), F32: 0 MB
+Context length: using GGUF metadata qwen4exp.context_length=1024.
+  Qwen4Exp shared MTP ready: block=2, features=32, draftCompression=0, privateKV=F16, device=0, mappedBytes=10336.
+Backend: GgmlCpu
+Model: qwen4exp, Layers=2, Hidden=8, Heads=4, KVHeads=2, HeadDim=8, Vocab=260
+  hyper-connections: count=4 lowRank=3 (residual is 32 wide)
+  experts=4 used=2 ff=6 sharedFf=5
+  GDN layers=1/2, QSA indexer heads=1 dim=8 topK=8
+  PLE: layers=[0] ngram=2 heads=1 headDim=8
+Loading model weights... done (57 F32 tensors, 24 quantized tensors)
+  Quantized: 0 MB (0 MB file-backed), F32: 0 MB
+Context length: using GGUF metadata qwen4exp.context_length=1024.
+  Qwen4Exp shared MTP ready: block=2, features=32, draftCompression=0, privateKV=F16, device=0, mappedBytes=10336.
+Backend: GgmlCpu
+Model: qwen4exp, Layers=2, Hidden=8, Heads=4, KVHeads=2, HeadDim=8, Vocab=260
+  hyper-connections: count=4 lowRank=3 (residual is 32 wide)
+  experts=4 used=2 ff=6 sharedFf=5
+  GDN layers=1/2, QSA indexer heads=1 dim=8 topK=8
+  PLE: layers=[0] ngram=2 heads=1 headDim=8
+Loading model weights... done (57 F32 tensors, 24 quantized tensors)
+  Quantized: 0 MB (0 MB file-backed), F32: 0 MB
+Context length: using GGUF metadata qwen4exp.context_length=1024.
+  Qwen4Exp shared MTP ready: block=2, features=32, draftCompression=0, privateKV=F16, device=0, mappedBytes=10336.
+Backend: GgmlCpu
+Model: qwen4exp, Layers=2, Hidden=8, Heads=4, KVHeads=2, HeadDim=8, Vocab=260
+  hyper-connections: count=4 lowRank=3 (residual is 32 wide)
+  experts=4 used=2 ff=6 sharedFf=5
+  GDN layers=1/2, QSA indexer heads=1 dim=8 topK=8
+  PLE: layers=[0] ngram=2 heads=1 headDim=8
+Loading model weights... done (57 F32 tensors, 24 quantized tensors)
+  Quantized: 0 MB (0 MB file-backed), F32: 0 MB
+Context length: using GGUF metadata qwen4exp.context_length=1024.
+  Qwen4Exp shared MTP ready: block=2, features=32, draftCompression=0, privateKV=F16, device=0, mappedBytes=10336.
+[xUnit.net 00:00:03.38]   Finished:    InferenceWeb.Tests
+</StdOut>
+    </Output>
+    <RunInfos>
+      <RunInfo computerName="Zhongkais-MacBook-Pro" outcome="Error" timestamp="2026-09-16T10:12:03.7395350-07:00">
+        <Text>[xUnit.net 00:00:01.39]     InferenceWeb.Tests.Qwen4ExpRetainedCacheTests.Engine_FollowUpReusesRetainedHolder_AndNewChatsCloneTheCheckpoint [FAIL]</Text>
+      </RunInfo>
+      <RunInfo computerName="Zhongkais-MacBook-Pro" outcome="Error" timestamp="2026-09-16T10:12:05.0610130-07:00">
+        <Text>[xUnit.net 00:00:02.71]     InferenceWeb.Tests.Qwen4ExpRetainedCacheTests.RetentionBudget_EvictsTheOldestConversation_AndZeroDeclines [FAIL]</Text>
+      </RunInfo>
+    </RunInfos>
+  </ResultSummary>
+</TestRun>

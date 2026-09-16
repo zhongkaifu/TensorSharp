@@ -57,6 +57,41 @@ public sealed class OpenAIToolChoiceValidationTests : IDisposable
         }
     }
 
+    public static IEnumerable<object[]> MalformedPolicies()
+    {
+        foreach (string architecture in new[] { "qwen4exp", "deepseek41", "unknown-test-architecture" })
+        foreach (bool stream in new[] { false, true })
+        foreach (string policy in new[]
+        {
+            "\"tool_choice\":null", "\"tool_choice\":true", "\"tool_choice\":[]",
+            "\"tool_choice\":\"sometimes\"", "\"tool_choice\":{}",
+            "\"tool_choice\":{\"type\":\"function\",\"function\":{\"name\":\"\"}}",
+            "\"tool_choice\":{\"type\":\"function\",\"function\":{\"name\":3}}",
+            "\"tool_choice\":{\"type\":\"other\",\"function\":{\"name\":\"get_weather\"}}",
+            "\"parallel_tool_calls\":\"false\"", "\"parallel_tool_calls\":null",
+            "\"tool_choice\":\"none\",\"parallel_tool_calls\":1",
+        }) yield return new object[] { architecture, stream, policy };
+    }
+
+    [Theory]
+    [MemberData(nameof(MalformedPolicies))]
+    public async Task MalformedPolicy_Returns400BeforeAdmission(string architecture, bool stream, string policy)
+    {
+        var (context, queue, service, runner) = await Invoke(architecture, stream, null, WeatherTools + "," + policy);
+        using (service)
+        {
+            Assert.Null(service.Model);
+            Assert.Equal(0, queue.TotalProcessed);
+            Assert.Equal(0, runner.ExecuteCalls);
+            Assert.Equal(StatusCodes.Status400BadRequest, context.Response.StatusCode);
+            Assert.StartsWith("application/json", context.Response.ContentType);
+            string response = await Response(context);
+            using var parsed = JsonDocument.Parse(response);
+            Assert.Equal("invalid_request_error", parsed.RootElement.GetProperty("error").GetProperty("type").GetString());
+            Assert.DoesNotContain("data:", response);
+        }
+    }
+
     [Theory]
     [InlineData(false, "required")]
     [InlineData(true, "required")]

@@ -75,13 +75,13 @@ def initialize_fixture_backend(dll, requested, report):
     The owned executor allocates and computes on active_backend directly; it has
     no CPU scheduler fallback. IsBackendAvailable rejects a different backend.
     """
-    backend_type = {"CPU": 2, "CUDA": 3}[requested]
+    backend_type = {"Metal": 1, "CPU": 2, "CUDA": 3}[requested]
     init = dll.TSGgml_IsBackendAvailable; init.argtypes = [I]; init.restype = I
     error = dll.TSGgml_GetLastError; error.argtypes = []; error.restype = C.c_char_p
     report["backend"] = dict(requested=requested, native_type=backend_type)
     if init(backend_type) != 1:
         reason = (error() or b"Backend initialization failed").decode(errors="replace")
-        if requested == "CUDA": raise BackendUnavailable(reason)
+        if requested in ("CUDA", "Metal"): raise BackendUnavailable(reason)
         raise RuntimeError(reason)
     select = dll.TSGgml_SetActiveDevice; select.argtypes = [I]; select.restype = I
     current = dll.TSGgml_GetActiveDevice; current.argtypes = []; current.restype = I
@@ -129,7 +129,13 @@ def rotary(x, positions, n_rot, base, scale):
 class Fixture:
     H, HC, LOW, HD, NH, NK, FF, SH, EXP, USED, VOCAB = 8, 4, 3, 8, 4, 2, 6, 5, 4, 2, 13
 
-    def __init__(self, sample, seed=701, capacity=512, kv_alignment=4):
+    def __init__(self, sample, seed=701, capacity=512, kv_alignment=4, attention_head_dim=8, attention_heads=4):
+        if attention_head_dim not in (8, 64, 256):
+            raise ValueError("Unsupported synthetic attention head dimension")
+        self.HD = attention_head_dim
+        if attention_heads not in (4, 24):
+            raise ValueError("Unsupported synthetic attention head count")
+        self.NH = attention_heads
         self.arrays = {}
         self.rng = np.random.default_rng(seed)
         self.eps = float(np.float32(sample["epsilon"]))
@@ -278,7 +284,7 @@ def main():
     parser.add_argument("--library", type=Path, required=True)
     parser.add_argument("--sample", type=Path, required=True)
     parser.add_argument("--report", type=Path, required=True)
-    parser.add_argument("--backend", choices=("CPU", "CUDA"), default="CPU")
+    parser.add_argument("--backend", choices=("CPU", "CUDA", "Metal"), default="CPU")
     parser.add_argument("--capacity", type=int, choices=(32, 512), default=512,
                         help="32 covers the shared binder's <4096-byte cache boundary; 512 covers larger buffers")
     parser.add_argument("--kv-alignment", type=int, choices=(4, 64), default=4,

@@ -1,0 +1,169 @@
+{
+  "id": "qwen38-video-times-r1",
+  "model": "/workspace/models/qwen38/UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf",
+  "backend": "ggml_cuda",
+  "port": 5135,
+  "expected_native_sha256": "7eaf98656edcd043884f3eb776bed68abbee29f5cb446e237bfa16afa5598af7",
+  "telemetry": true,
+  "before_suites": [],
+  "before_suites_quiet_seconds": 0,
+  "artifact_inventory": {
+    "weights": [
+      {
+        "path": "/workspace/models/qwen38/UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf",
+        "bytes": 10946624,
+        "manifest": "/workspace/tensorsharp-no-patch-20260915/logs/catalog/qwen38.json",
+        "repository": "unsloth/Qwen3.8-Flash-Next-GGUF",
+        "revision": "38bb39ee97821de2c9009abb7e93950eec396e66",
+        "size": 10946624,
+        "download_verified_sha256": "a4f3b21e77353999829f2f767e9ac21ce9c71d29a74f2cc9eda48c9bf23c8b86",
+        "publisher_digest_kind": "lfs-sha256"
+      },
+      {
+        "path": "/workspace/models/qwen38/UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00002-of-00003.gguf",
+        "bytes": 49979779296,
+        "manifest": "/workspace/tensorsharp-no-patch-20260915/logs/catalog/qwen38.json",
+        "repository": "unsloth/Qwen3.8-Flash-Next-GGUF",
+        "revision": "38bb39ee97821de2c9009abb7e93950eec396e66",
+        "size": 49979779296,
+        "download_verified_sha256": "2e3bf1ee7d2a04e261e9f342a2d968f696cce5941d082b0e434deb9b1edc12c6",
+        "publisher_digest_kind": "lfs-sha256"
+      },
+      {
+        "path": "/workspace/models/qwen38/UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00003-of-00003.gguf",
+        "bytes": 28878402944,
+        "manifest": "/workspace/tensorsharp-no-patch-20260915/logs/catalog/qwen38.json",
+        "repository": "unsloth/Qwen3.8-Flash-Next-GGUF",
+        "revision": "38bb39ee97821de2c9009abb7e93950eec396e66",
+        "size": 28878402944,
+        "download_verified_sha256": "ec8c106759fdf4f463039c34c0707718d7d8908d53d892bd4f002e71620803f9",
+        "publisher_digest_kind": "lfs-sha256"
+      }
+    ],
+    "companions": [
+      {
+        "path": "/workspace/models/qwen38/mmproj-BF16.gguf",
+        "bytes": 907542944,
+        "manifest": "/workspace/tensorsharp-no-patch-20260915/logs/catalog/qwen38.json",
+        "repository": "unsloth/Qwen3.8-Flash-Next-GGUF",
+        "revision": "38bb39ee97821de2c9009abb7e93950eec396e66",
+        "size": 907542944,
+        "download_verified_sha256": "2e788f8c511d8093c7b43cb87b2fd7e14228340318057f8fb20c86df2efe2355",
+        "publisher_digest_kind": "lfs-sha256"
+      }
+    ]
+  },
+  "env": {
+    "CUDA_VISIBLE_DEVICES": "0,1,5",
+    "MAX_CONTEXT": "65536",
+    "KV_CACHE_DTYPE": "f16",
+    "TS_SCHED_MAX_RUNNING_SEQS": "4",
+    "TS_SCHED_MAX_BATCHED_TOKENS": "4096",
+    "TS_SCHED_PREFILL_CHUNK": "512",
+    "BENCH_CONFIG": "/workspace/ts-codex-20260916-r4/http-r1/harness/benchmarks/engine_comparison/benchmark_config.json",
+    "ASPNETCORE_URLS": "http://127.0.0.1:5135",
+    "PYTHONDONTWRITEBYTECODE": "1",
+    "TS_SPEC": "0"
+  },
+  "extra_args": [
+    "--no-skills",
+    "--tp",
+    "3",
+    "--mmproj",
+    "/workspace/models/qwen38/mmproj-BF16.gguf",
+    "--draft-model",
+    "/workspace/models/qwen38/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf",
+    "--urls",
+    "http://127.0.0.1:5135"
+  ],
+  "suites": [
+    [
+      "{python}",
+      "{repo}/eng/validation/qwen38_mtp_followup/http_contract.py",
+      "--model",
+      "{model_id}",
+      "--url",
+      "{url}",
+      "--execute",
+      "--output",
+      "{output}/http32"
+    ],
+    [
+      "{python}",
+      "{repo}/eng/validation/qwen38_mtp_followup/http_extra.py",
+      "--case",
+      "video2-history",
+      "--model",
+      "{model_id}",
+      "--url",
+      "{url}",
+      "--execute",
+      "--video",
+      "/workspace/tensorsharp-no-patch-20260915/media-fixtures/ordered-cards.mp4",
+      "--output",
+      "{output}/video-stream"
+    ],
+    [
+      "{python}",
+      "{repo}/eng/validation/qwen38_mtp_followup/http_extra.py",
+      "--case",
+      "video2-history",
+      "--model",
+      "{model_id}",
+      "--url",
+      "{url}",
+      "--execute",
+      "--video",
+      "/workspace/tensorsharp-no-patch-20260915/media-fixtures/ordered-cards.mp4",
+      "--output",
+      "{output}/video-blocking",
+      "--blocking"
+    ],
+    [
+      "{python}",
+      "{repo}/eng/validation/qwen38_mtp_followup/http_extra.py",
+      "--case",
+      "counted-long62k",
+      "--model",
+      "Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf",
+      "--url",
+      "{url}",
+      "--execute",
+      "--request",
+      "/workspace/ts-codex-20260916-r4/http-r1/counted-long/request.json",
+      "--request-sha256",
+      "d4eb4e22e67241bf21fa2235df0d3dd614f1726391ed7daa71a68b9824c26336",
+      "--count",
+      "/workspace/ts-codex-20260916-r4/http-r1/counted-long/verified/count.json",
+      "--count-sha256",
+      "b1131322c8c2d3e753a97e8c8082e0f9ea60399786d3e24fc0e8c1f277ba171f",
+      "--output",
+      "{output}/counted-long62k"
+    ]
+  ],
+  "scope_note": "Separate corrective replay. Original failed video timestamps and misconfigured counted-long launcher remain failed. All original content/type assertions and exact counted wire body retained.",
+  "expected_harness_sha256": {
+    "benchmarks/engine_comparison/benchmark_config.json": "5e7a023f8c1cf529a824e5dba68b693d5bfd89dfd2c7cabd3051e4cfe13df464",
+    "benchmarks/engine_comparison/config.py": "8e4c330d53c1ab1e9666fc347cd561ac938eca22f209e91b81dbe3382ec155a6",
+    "benchmarks/engine_comparison/engines.py": "d0c7b8dbacf70d6a663d39a51a6fa5e77cd36714d70591f8dc0e8ae9fe304ea6",
+    "benchmarks/engine_comparison/scenarios.py": "eedb1dd22a925200143c4cb6a80f81aa33fad6c0e98b91e1a02c5c48f85c9971",
+    "benchmarks/engine_comparison/validate_deepseek41_media.py": "d8194c61506cdcb9e1ce433e529e63d23491c917f786affbcea34043d7886824",
+    "benchmarks/engine_comparison/validate_deepseek41_tools.py": "6ab0e806dcea4448bd4751382ed81dd1d5f6ead0c29fa503b8030040022f5129",
+    "benchmarks/engine_comparison/validate_inference.py": "90fb8c6e3716ea8b0e4682f53058d2850e2f43f11e651fe1b99732cca7836915",
+    "eng/validation/qwen38_mtp_followup/bind_plan.py": "38527dd0eb3f66deb0915855efba3de26cac78133020c9e1a964b6edb10b21a4",
+    "eng/validation/qwen38_mtp_followup/compare.py": "056c675e12077d3de291c6483d2374364388ac46fd452edb8e69a4ee7519419d",
+    "eng/validation/qwen38_mtp_followup/http_contract.py": "8a38b3d17ee9925ddade541ffa4ef1ca2e01eeb9e3b14c1ccb9e74a1819d92bd",
+    "eng/validation/qwen38_mtp_followup/http_extra.py": "07cc769a5419bab555aa9cd2bf56243a5fb27aef9190ebf7821411ab4acb23ee",
+    "eng/validation/qwen38_mtp_followup/prepare.py": "eefc9db7b5d094d7c19413e15143c0f3379930db00120362b0b27725f1669757",
+    "eng/validation/qwen38_mtp_followup/prepare_long.py": "1aee5289889c8beaa8f8fcc45e368024143e0c2dcc83b2c228a88c51ac660b98",
+    "eng/validation/qwen38_mtp_followup/prepare_package.py": "893c043d4d85ad5dc2ffb2fde74658f04a870fc9a1b31b7924536c0976ef9638",
+    "eng/validation/qwen38_mtp_followup/test_followup.py": "2edc0ab02eface18206b5288be1874fb19b19b6994d99b12d35072ad7fa95a54",
+    "eng/validation/release_application_identity.py": "be8ed3baa31fb3bcba046fdddfabbdbc962b53ce176d2cd859a946b89d4a9ccb",
+    "eng/validation/run-release-profile.py": "8368f377f05fd6b084ce5ebf02c7e7e406c46f236f97132d16952dc3a71fb41a",
+    "eng/validation/run-remote-agent-over-ssh.py": "5ffa3a77f6f1c6023799173cd0a2ab6e33a1792cf4e98540efba29fb0e11ae7f",
+    "eng/validation/sample-release-telemetry.py": "5a6de6a167b8df340a7704dd6c6c19c6746d945feb3943368c5aa4a7030a7e6c",
+    "eng/validation/stage-release-comparison-apps.py": "d3c66440372d6863eba6aa781f3bf625ae4fbfa6164ce09167901b22d57dc967"
+  },
+  "release_qualified": false,
+  "performance_qualified": false
+}

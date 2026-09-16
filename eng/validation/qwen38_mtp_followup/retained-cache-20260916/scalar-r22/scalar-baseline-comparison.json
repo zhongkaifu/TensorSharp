@@ -1,0 +1,16 @@
+[
+  {
+    "prefix": 4,
+    "baseline_sha256": "e0a7fc45277c7c848fb640dad229bcd687fdd9f779af7aeb7f1ae38524d2cd58",
+    "candidate_sha256": "e0a7fc45277c7c848fb640dad229bcd687fdd9f779af7aeb7f1ae38524d2cd58",
+    "exact": true,
+    "max_abs": 0.0
+  },
+  {
+    "prefix": 16,
+    "baseline_sha256": "a49c3de2d5ba6d70f8c814fef6f6c94b133871ff56f385657f513874f1a4de8d",
+    "candidate_sha256": "a49c3de2d5ba6d70f8c814fef6f6c94b133871ff56f385657f513874f1a4de8d",
+    "exact": true,
+    "max_abs": 0.0
+  }
+]

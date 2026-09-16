@@ -1,0 +1,7 @@
+VSTest version 18.7.0 (x64)
+
+Starting test execution, please wait...
+A total of 1 test files matched the specified pattern.
+Results File: /workspace/ts-glm5spec-r4-derived-r2/results/_d71188ba1e2e_2026-09-16_18_28_26_net10.0.trx
+
+Passed!  - Failed:     0, Passed:    26, Skipped:     0, Total:    26, Duration: 1 s - InferenceWeb.Tests.dll (net10.0)

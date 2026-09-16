@@ -1,0 +1,39 @@
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 45498 MiB):
+  Device 0: NVIDIA A40, compute capability 8.6, VMM: yes, VRAM: 45498 MiB
+[dsv4] compute devices initialized: 1 GPU(s)
+[dsv4]   compute device 0: backend=CUDA0, device=CUDA0 (NVIDIA A40)
+[dsv4] auxiliary CPU worker pool: threads=2, persistent=yes
+[dsv4] VRAM reserve: 2048 MiB per device (indexer 0 x1.25 + activations 0 + 2048 headroom)
+[dsv4] routed-expert CPU offload: 0 of 5 layer(s); 5 layer(s) on GPUs
+[dsv4] DSpark drafter on device 0: 3 stage(s), block_size=5, markov_rank=32, target_layers=[1..4], noise_token=250
+[dsv41] Engram lookup: GPU-resident tables, gathered in-graph (no host reads)
+[dsv4] loaded 0.0 GiB across 1 GPU(s) in 0.4s (0.08 GiB/s, 16 load threads; n_ctx=1024, ring=256, csa_rows=768, hca_rows=1280)
+[dsv4]   device 0: layers 0..4 (5), 44.1 GiB free after load
+[dsv4] fused ops: on
+[dsv4] hyper-connection ops: native
+[dsv4] flash attention: on
+[dsv4] V4.1 CUDA precision: TensorSharp F32 matmul; attention=TensorSharp F32 (streaming decode, tiled prefill)
+[dsv4] compute devices initialized: 1 GPU(s)
+[dsv4]   compute device 0: backend=CUDA0, device=CUDA0 (NVIDIA A40)
+[dsv4] auxiliary CPU worker pool: threads=2, persistent=yes
+[dsv4] VRAM reserve: 2048 MiB per device (indexer 0 x1.25 + activations 0 + 2048 headroom)
+[dsv4] routed-expert CPU offload: 0 of 5 layer(s); 5 layer(s) on GPUs
+[dsv4] DSpark drafter on device 0: 3 stage(s), block_size=5, markov_rank=32, target_layers=[1..4], noise_token=250
+[dsv41] Engram lookup: GPU-resident tables, gathered in-graph (no host reads)
+[dsv4] loaded 0.0 GiB across 1 GPU(s) in 0.0s (1.31 GiB/s, 16 load threads; n_ctx=1024, ring=256, csa_rows=768, hca_rows=1280)
+[dsv4]   device 0: layers 0..4 (5), 44.1 GiB free after load
+[dsv4] fused ops: on
+[dsv4] hyper-connection ops: native
+[dsv4] flash attention: on
+[dsv4] V4.1 CUDA precision: TensorSharp F32 matmul; attention=TensorSharp F32 (streaming decode, tiled prefill)
+layer 0: 0.15s, hidden RMS=1.101187
+layer 1: 0.22s, hidden RMS=1.552704
+layer 2: 0.11s, hidden RMS=1.855896
+layer 3: 0.18s, hidden RMS=2.086213
+layer 4: 0.13s, hidden RMS=2.33794
+layer 0: 0.11s, hidden RMS=1.121458
+layer 1: 0.22s, hidden RMS=1.472917
+layer 2: 0.12s, hidden RMS=1.87111
+layer 3: 0.15s, hidden RMS=2.132516
+layer 4: 0.14s, hidden RMS=2.413454
+{"status": "passed", "release_qualified": false, "finished_at_unix": 1789584016.5513504, "checks": 12, "passed": 12}

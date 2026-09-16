@@ -1,0 +1,17 @@
+{
+  "cpu-checkpoint-shape": {
+    "exit_code": 0,
+    "command": [
+      "/tmp/ts-numerical-build/GgmlOpsDsv41TpTest",
+      "--checkpoint-shape"
+    ],
+    "binary_sha256": "4fbd6ba73cd7d3a8c20ca191bd2a9b15e3afd29d3be8d03d39f8eb8a0a12d31c"
+  },
+  "cpu-f32-precision": {
+    "exit_code": 0,
+    "command": [
+      "/tmp/ts-numerical-build/GgmlOpsMatmulPrecisionCpuTest"
+    ],
+    "binary_sha256": "04751a5439c095ec68f14d3aea01996d647fe77ba1b5842eb56e94ee126e1e81"
+  }
+}

@@ -431,9 +431,9 @@ namespace TensorSharp.AgentHost.Skills
         /// two halves are decided in different places: the protocol table says whether the
         /// renderer writes declarations, while <see cref="OutputParserFactory"/> decides
         /// what parses the answer. They can disagree. An architecture with no
-        /// <c>CreateOutputParser</c> - <c>qwen4exp</c>, or any family with no table entry
-        /// at all - gets <see cref="PassthroughOutputParser"/>, which hands back every byte
-        /// as content and never extracts a call.
+        /// <c>CreateOutputParser</c> - any family with no table entry at all - gets
+        /// <see cref="PassthroughOutputParser"/>, which hands back every byte as content
+        /// and never extracts a call.
         /// </para>
         /// <para>
         /// Declaring <c>skills_read</c> to such a model is strictly worse than staying

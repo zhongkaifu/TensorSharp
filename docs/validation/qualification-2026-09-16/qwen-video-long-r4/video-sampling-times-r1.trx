@@ -1,0 +1,698 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TestRun id="f793d130-2804-4b6f-8a14-54348d9c2f8e" name="@Zhongkais-MacBook-Pro 2026-09-16 11:00:48" xmlns="http://microsoft.com/schemas/VisualStudio/TeamTest/2010">
+  <Times creation="2026-09-16T11:00:48.6495630-07:00" queuing="2026-09-16T11:00:48.6495630-07:00" start="2026-09-16T11:00:47.2826840-07:00" finish="2026-09-16T11:00:49.6262040-07:00" />
+  <TestSettings name="default" id="993b1655-98e2-4f27-8e89-2fbe3ba152a0">
+    <Deployment runDeploymentRoot="_Zhongkais-MacBook-Pro_2026-09-16_11_00_48" />
+  </TestSettings>
+  <Results>
+    <UnitTestResult executionId="4d31b7de-8095-41a7-bd45-0b2ad3867f6e" testId="e9e5896f-10cc-63fe-0015-56dbfc6c9e6d" testName="InferenceWeb.Tests.VideoFrameExtractionTests.MaxFramesCapsTheResultAndStillNumbersContiguously" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.1840919" startTime="2026-09-16T11:00:49.1266900-07:00" endTime="2026-09-16T11:00:49.3107590-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="4d31b7de-8095-41a7-bd45-0b2ad3867f6e" />
+    <UnitTestResult executionId="81efb88b-1ebe-460e-81d9-c9255e1afbc4" testId="d567548b-d1e7-d1a7-4151-2124a517955e" testName="InferenceWeb.Tests.VideoFrameExtractionTests.PrefixIsSanitizedSoFramesCannotEscapeTheDirectory" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0524249" startTime="2026-09-16T11:00:48.5689980-07:00" endTime="2026-09-16T11:00:48.6213710-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="81efb88b-1ebe-460e-81d9-c9255e1afbc4" />
+    <UnitTestResult executionId="02011994-130c-4ab1-b67a-7a11783640d6" testId="fcbb319c-a388-1994-b501-10acbb144859" testName="InferenceWeb.Tests.QwenVLVideoEncoderTests.VideoResize_FitsTheWholeClipAgainstTheSharedBudget" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0012819" startTime="2026-09-16T11:00:48.1782600-07:00" endTime="2026-09-16T11:00:48.1795000-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="02011994-130c-4ab1-b67a-7a11783640d6" />
+    <UnitTestResult executionId="2b4b02f5-7770-4b5a-93ff-6171e1d00288" testId="90a96bba-4691-2e9b-470b-4b67c5533d33" testName="InferenceWeb.Tests.VideoFrameExtractionTests.SteppingAndSeekingSelectTheSameFrames" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.1588756" startTime="2026-09-16T11:00:48.4100110-07:00" endTime="2026-09-16T11:00:48.5688860-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="2b4b02f5-7770-4b5a-93ff-6171e1d00288" />
+    <UnitTestResult executionId="ed353ef7-6a3d-483d-8d15-075b5c663bc3" testId="901d5f43-4d90-77d2-35f1-2fef61cdee37" testName="InferenceWeb.Tests.VideoFrameExtractionTests.ConsecutiveFramesComeFromDifferentPointsInTheClip" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.1157084" startTime="2026-09-16T11:00:48.7455770-07:00" endTime="2026-09-16T11:00:48.8611820-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="ed353ef7-6a3d-483d-8d15-075b5c663bc3" />
+    <UnitTestResult executionId="72ced2f8-69dd-4eed-83be-8ae19a4d1190" testId="2ab31b04-5cb1-45c4-6420-3b68f40f45a3" testName="InferenceWeb.Tests.VideoFrameExtractionTests.EveryFrameIsAValidOpaquePngAtSourceResolution" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.1239311" startTime="2026-09-16T11:00:48.6311620-07:00" endTime="2026-09-16T11:00:48.7453910-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="72ced2f8-69dd-4eed-83be-8ae19a4d1190" />
+    <UnitTestResult executionId="860235ab-7a7d-4f25-ba11-68dc1ae0c725" testId="5700189e-4cc2-4512-e201-e76fb95a8942" testName="InferenceWeb.Tests.Qwen4ExpVideoRequestTests.LegacyFramesWithoutTimes_StayStillImagesForQwen" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0002207" startTime="2026-09-16T11:00:49.6030500-07:00" endTime="2026-09-16T11:00:49.6032250-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="860235ab-7a7d-4f25-ba11-68dc1ae0c725" />
+    <UnitTestResult executionId="16deb629-16aa-4b57-8bb9-c83d9805462a" testId="300cc8e9-929b-ca1c-319f-c88aa17a5ac7" testName="InferenceWeb.Tests.Qwen4ExpVideoRequestTests.OpenAiVideo_IsAcceptedForQwen4ExpAndRendersTimedPairsOncePerClip" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0066915" startTime="2026-09-16T11:00:49.5966460-07:00" endTime="2026-09-16T11:00:49.6029780-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="16deb629-16aa-4b57-8bb9-c83d9805462a" />
+    <UnitTestResult executionId="56c742de-c50a-4a9c-823d-e0fac896a46c" testId="dc5ad914-2681-47f4-8602-072b2c0ae236" testName="InferenceWeb.Tests.Qwen4ExpVideoRequestTests.Layout_RejectsNegativeOrNonFiniteFrameTimes" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0002014" startTime="2026-09-16T11:00:49.6049480-07:00" endTime="2026-09-16T11:00:49.6051280-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="56c742de-c50a-4a9c-823d-e0fac896a46c" />
+    <UnitTestResult executionId="78f9417b-f89c-4f41-bc52-f6eff1fcbb1a" testId="4aa077aa-1720-ba83-63e4-dcce8942c164" testName="InferenceWeb.Tests.Qwen4ExpVideoRequestTests.TimeLabels_UseOneDecimalWithTiesToEven(seconds: 1, expected: &quot;1.0&quot;)" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0000779" startTime="2026-09-16T11:00:49.5937640-07:00" endTime="2026-09-16T11:00:49.5938270-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="78f9417b-f89c-4f41-bc52-f6eff1fcbb1a" />
+    <UnitTestResult executionId="42014737-07dd-49fd-93f9-0fad1f1eb059" testId="128b6adf-d929-f145-877d-57f1e5a0ac1c" testName="InferenceWeb.Tests.Qwen4ExpVideoRequestTests.TimeLabels_UseOneDecimalWithTiesToEven(seconds: 0.75, expected: &quot;0.8&quot;)" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0000784" startTime="2026-09-16T11:00:49.5938540-07:00" endTime="2026-09-16T11:00:49.5939140-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="42014737-07dd-49fd-93f9-0fad1f1eb059" />
+    <UnitTestResult executionId="b5e2376a-9f77-4b24-9c14-8391dc1691ca" testId="92def982-66c0-ed03-62f0-e5fa21748bdd" testName="InferenceWeb.Tests.Qwen4ExpVideoRequestTests.PromptLayout_RefusesAPlaceholderOfTheWrongKindAndReportsMissingOnes" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0003193" startTime="2026-09-16T11:00:49.5958010-07:00" endTime="2026-09-16T11:00:49.5960790-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="b5e2376a-9f77-4b24-9c14-8391dc1691ca" />
+    <UnitTestResult executionId="2b69554a-2921-4724-a506-add4dd1f94a1" testId="f36037c6-c5b3-6d8f-529c-b55287d97da0" testName="InferenceWeb.Tests.VideoFrameExtractionTests.FramesLandInTheRequestedDirectoryUnderTheRequestedPrefix" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.1069449" startTime="2026-09-16T11:00:49.0196720-07:00" endTime="2026-09-16T11:00:49.1265930-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="2b69554a-2921-4724-a506-add4dd1f94a1" />
+    <UnitTestResult executionId="b328de32-0876-4f8e-9933-1a40d03aa52e" testId="195f4a49-4c5c-a7ab-e061-a673cf38fc81" testName="InferenceWeb.Tests.Qwen4ExpVideoRequestTests.Layout_OddClipRepeatsLastFrameAndNonIncreasingTimeStartsNewClip" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0002326" startTime="2026-09-16T11:00:49.6047030-07:00" endTime="2026-09-16T11:00:49.6049110-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="b328de32-0876-4f8e-9933-1a40d03aa52e" />
+    <UnitTestResult executionId="f3bfde92-13e6-4d02-8413-56460a5a4df4" testId="6a7d0ca6-ffb6-e4a3-e79e-c7ac4acef9ef" testName="InferenceWeb.Tests.QwenVLVideoEncoderTests.TemporalPair_RejectsMalformedFrameBuffersBeforeUnsafePatchReads" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0015536" startTime="2026-09-16T11:00:48.1731670-07:00" endTime="2026-09-16T11:00:48.1745220-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="f3bfde92-13e6-4d02-8413-56460a5a4df4" />
+    <UnitTestResult executionId="67989d22-9753-4280-bd08-c03e21259495" testId="6f7e87c7-ab99-d4ff-ccbf-b11f053a2055" testName="InferenceWeb.Tests.QwenVLVideoEncoderTests.TemporalPair_MergesBothFramesInOrderAndADuplicatedFrameEqualsTheStillPath" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0022602" startTime="2026-09-16T11:00:48.1745820-07:00" endTime="2026-09-16T11:00:48.1768000-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="67989d22-9753-4280-bd08-c03e21259495" />
+    <UnitTestResult executionId="a6d638fb-911c-4c0e-ac83-ad592e07c243" testId="7412b9f8-0a57-d075-c786-d1ef0afd765a" testName="InferenceWeb.Tests.Qwen4ExpVideoRequestTests.TwoVideoParts_StayTwoClipsAndKeepTheirOwnTimeOrder" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0008808" startTime="2026-09-16T11:00:49.6037990-07:00" endTime="2026-09-16T11:00:49.6046620-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="a6d638fb-911c-4c0e-ac83-ad592e07c243" />
+    <UnitTestResult executionId="add79afa-df97-4e56-85b6-0d1672aed586" testId="90d7d8fa-895c-e88a-e513-211541c27062" testName="InferenceWeb.Tests.Qwen4ExpVideoRequestTests.PromptLayout_ImageAndVideoSpansExpandTheirOwnPadTokens" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0001657" startTime="2026-09-16T11:00:49.5961260-07:00" endTime="2026-09-16T11:00:49.5962620-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="add79afa-df97-4e56-85b6-0d1672aed586" />
+    <UnitTestResult executionId="6ebbb178-cf3a-400a-ae44-60c30a84963f" testId="95c0fc43-1ef7-a1ce-7146-0aad412c5d2e" testName="InferenceWeb.Tests.VideoFrameExtractionTests.ExtractedFrames_FeedTheVisionImageProcessor" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.1248068" startTime="2026-09-16T11:00:49.4447580-07:00" endTime="2026-09-16T11:00:49.5688340-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="6ebbb178-cf3a-400a-ae44-60c30a84963f" />
+    <UnitTestResult executionId="23b268b6-8308-4db7-a24b-596d7a7e42f0" testId="83b1d6a4-ace0-3daf-8459-b633b914a4b9" testName="InferenceWeb.Tests.Qwen4ExpVideoRequestTests.Qwen35_StillRefusesVideoUrlRatherThanSilentlyDroppingIt" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0017940" startTime="2026-09-16T11:00:49.5939500-07:00" endTime="2026-09-16T11:00:49.5957330-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="23b268b6-8308-4db7-a24b-596d7a7e42f0" />
+    <UnitTestResult executionId="8cd32ffe-99a0-4a78-9127-15a037da4249" testId="51dea081-1b99-aee9-3c68-84f5bbecfe18" testName="InferenceWeb.Tests.Qwen4ExpVideoRequestTests.TimeLabels_UseOneDecimalWithTiesToEven(seconds: 2.3490000000000002, expected: &quot;2.3&quot;)" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0001748" startTime="2026-09-16T11:00:49.5935770-07:00" endTime="2026-09-16T11:00:49.5937360-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="8cd32ffe-99a0-4a78-9127-15a037da4249" />
+    <UnitTestResult executionId="32296d70-ee6f-4c52-b8bb-03112b0f3cfb" testId="a613b9c5-2546-102a-b508-a5ad5bb9fb1a" testName="InferenceWeb.Tests.QwenVLVideoEncoderTests.VideoCache_ReencodesWhenOlderFrameChangesWithoutChangingPairSizeOrLatestTimestamp" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0128568" startTime="2026-09-16T11:00:48.1629310-07:00" endTime="2026-09-16T11:00:48.1729350-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="32296d70-ee6f-4c52-b8bb-03112b0f3cfb" />
+    <UnitTestResult executionId="20baa6f7-a763-44af-a5da-ec5750d2b7e9" testId="ab560a4b-c938-487a-4f99-0542b053edc0" testName="InferenceWeb.Tests.VideoFrameExtractionTests.FrameNamesReturnedByUpload_ResolveToRealFilesUnderTheUploadRoot" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.1311402" startTime="2026-09-16T11:00:49.3127970-07:00" endTime="2026-09-16T11:00:49.4439340-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="20baa6f7-a763-44af-a5da-ec5750d2b7e9" />
+    <UnitTestResult executionId="ae397649-aaf1-4369-8636-3b1c942311a7" testId="7d8e678e-1000-c23a-f2ae-6352d25632d2" testName="InferenceWeb.Tests.VideoFrameExtractionTests.OutputDirectoryIsCreatedWhenMissing" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0527862" startTime="2026-09-16T11:00:48.9668080-07:00" endTime="2026-09-16T11:00:49.0195670-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="ae397649-aaf1-4369-8636-3b1c942311a7" />
+    <UnitTestResult executionId="d43df0e5-a994-4bc0-9c4c-0fc6cdc31329" testId="7e393695-c85e-dfd5-e4f0-fad6980b3616" testName="InferenceWeb.Tests.Qwen4ExpVideoRequestTests.PromptLayout_ConsecutivePairsGetIncreasingTemporalIdsAndTextResumesAfterTheClip" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0005186" startTime="2026-09-16T11:00:49.6032690-07:00" endTime="2026-09-16T11:00:49.6037620-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="d43df0e5-a994-4bc0-9c4c-0fc6cdc31329" />
+    <UnitTestResult executionId="743445a7-c6c7-4dc4-a69e-ee0b114e562d" testId="1dca6aff-6432-1ced-2736-a2c339bc2021" testName="InferenceWeb.Tests.VideoFrameExtractionTests.AllIntraFootageExtractsToo" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0241343" startTime="2026-09-16T11:00:49.5689420-07:00" endTime="2026-09-16T11:00:49.5930440-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="743445a7-c6c7-4dc4-a69e-ee0b114e562d" />
+    <UnitTestResult executionId="9d287e4b-fbae-4edf-a23c-d95ab6545bd8" testId="5db8f9ce-e79c-97d1-a781-634451cb753f" testName="InferenceWeb.Tests.QwenVLVideoEncoderTests.Injector_RefusesVideoWhenTheTokenizerHasNoVideoPad" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0013473" startTime="2026-09-16T11:00:48.1768550-07:00" endTime="2026-09-16T11:00:48.1781940-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="9d287e4b-fbae-4edf-a23c-d95ab6545bd8" />
+    <UnitTestResult executionId="7ad2041f-88c3-4799-8d4b-e91bf6c7071f" testId="853e7566-49e3-80c9-2d86-e2f4294480fd" testName="InferenceWeb.Tests.Qwen4ExpVideoRequestTests.TimeLabels_UseOneDecimalWithTiesToEven(seconds: 0.25, expected: &quot;0.2&quot;)" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0002683" startTime="2026-09-16T11:00:49.5932670-07:00" endTime="2026-09-16T11:00:49.5935440-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="7ad2041f-88c3-4799-8d4b-e91bf6c7071f" />
+    <UnitTestResult executionId="d7b18882-1e08-42d0-b29d-13eef073e849" testId="a693247c-b3ba-6d60-66a3-19da734112bc" testName="InferenceWeb.Tests.QwenVLVideoEncoderTests.Injector_ExpandsVideoPairsWithIncreasingTemporalIdsAndInjectsEachPair" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0779678" startTime="2026-09-16T11:00:48.0800650-07:00" endTime="2026-09-16T11:00:48.1599360-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="d7b18882-1e08-42d0-b29d-13eef073e849" />
+    <UnitTestResult executionId="2dac2b8e-d265-4aca-b935-04a2db486dfa" testId="bac418a3-b902-60be-0170-232b88d705dc" testName="InferenceWeb.Tests.VideoFrameExtractionTests.NonVideoInputThrowsAndWritesNothing" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0019219" startTime="2026-09-16T11:00:49.3108510-07:00" endTime="2026-09-16T11:00:49.3127390-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="2dac2b8e-d265-4aca-b935-04a2db486dfa" />
+    <UnitTestResult executionId="3faf4464-664e-4e7b-80b4-9ede93c98fab" testId="db1263ef-ecea-bbad-1df2-f07e426dd09b" testName="InferenceWeb.Tests.VideoFrameExtractionTests.TwoClipsInOneDirectoryDoNotCollide" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.2296613" startTime="2026-09-16T11:00:48.1802900-07:00" endTime="2026-09-16T11:00:48.4098940-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="3faf4464-664e-4e7b-80b4-9ede93c98fab" />
+    <UnitTestResult executionId="4feb87c5-bd8b-41a4-bf16-571dc4d40357" testId="77f8d904-9613-8afb-9b4b-378e9ace8be3" testName="InferenceWeb.Tests.VideoFrameExtractionTests.DefaultOverloadStillWritesFrameNNNNIntoAFreshTempDirectory" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.1049532" startTime="2026-09-16T11:00:48.8617640-07:00" endTime="2026-09-16T11:00:48.9667050-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="4feb87c5-bd8b-41a4-bf16-571dc4d40357" />
+    <UnitTestResult executionId="59d8a351-53d2-433a-85ed-d785a63083e0" testId="ca45da2f-7967-62ce-f798-7392dd627b4b" testName="InferenceWeb.Tests.VideoFrameExtractionTests.NullOrEmptyArgumentsAreRejected" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0004681" startTime="2026-09-16T11:00:48.8612700-07:00" endTime="2026-09-16T11:00:48.8617030-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="59d8a351-53d2-433a-85ed-d785a63083e0" />
+  </Results>
+  <TestDefinitions>
+    <UnitTest name="InferenceWeb.Tests.Qwen4ExpVideoRequestTests.TwoVideoParts_StayTwoClipsAndKeepTheirOwnTimeOrder" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="7412b9f8-0a57-d075-c786-d1ef0afd765a">
+      <Execution id="a6d638fb-911c-4c0e-ac83-ad592e07c243" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Qwen4ExpVideoRequestTests" name="TwoVideoParts_StayTwoClipsAndKeepTheirOwnTimeOrder" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.QwenVLVideoEncoderTests.TemporalPair_RejectsMalformedFrameBuffersBeforeUnsafePatchReads" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="6a7d0ca6-ffb6-e4a3-e79e-c7ac4acef9ef">
+      <Execution id="f3bfde92-13e6-4d02-8413-56460a5a4df4" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.QwenVLVideoEncoderTests" name="TemporalPair_RejectsMalformedFrameBuffersBeforeUnsafePatchReads" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.VideoFrameExtractionTests.AllIntraFootageExtractsToo" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="1dca6aff-6432-1ced-2736-a2c339bc2021">
+      <Execution id="743445a7-c6c7-4dc4-a69e-ee0b114e562d" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.VideoFrameExtractionTests" name="AllIntraFootageExtractsToo" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.VideoFrameExtractionTests.NullOrEmptyArgumentsAreRejected" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="ca45da2f-7967-62ce-f798-7392dd627b4b">
+      <Execution id="59d8a351-53d2-433a-85ed-d785a63083e0" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.VideoFrameExtractionTests" name="NullOrEmptyArgumentsAreRejected" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.VideoFrameExtractionTests.SteppingAndSeekingSelectTheSameFrames" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="90a96bba-4691-2e9b-470b-4b67c5533d33">
+      <Execution id="2b4b02f5-7770-4b5a-93ff-6171e1d00288" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.VideoFrameExtractionTests" name="SteppingAndSeekingSelectTheSameFrames" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Qwen4ExpVideoRequestTests.LegacyFramesWithoutTimes_StayStillImagesForQwen" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="5700189e-4cc2-4512-e201-e76fb95a8942">
+      <Execution id="860235ab-7a7d-4f25-ba11-68dc1ae0c725" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Qwen4ExpVideoRequestTests" name="LegacyFramesWithoutTimes_StayStillImagesForQwen" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Qwen4ExpVideoRequestTests.TimeLabels_UseOneDecimalWithTiesToEven(seconds: 1, expected: &quot;1.0&quot;)" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="4aa077aa-1720-ba83-63e4-dcce8942c164">
+      <Execution id="78f9417b-f89c-4f41-bc52-f6eff1fcbb1a" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Qwen4ExpVideoRequestTests" name="TimeLabels_UseOneDecimalWithTiesToEven" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.VideoFrameExtractionTests.FramesLandInTheRequestedDirectoryUnderTheRequestedPrefix" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="f36037c6-c5b3-6d8f-529c-b55287d97da0">
+      <Execution id="2b69554a-2921-4724-a506-add4dd1f94a1" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.VideoFrameExtractionTests" name="FramesLandInTheRequestedDirectoryUnderTheRequestedPrefix" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.VideoFrameExtractionTests.DefaultOverloadStillWritesFrameNNNNIntoAFreshTempDirectory" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="77f8d904-9613-8afb-9b4b-378e9ace8be3">
+      <Execution id="4feb87c5-bd8b-41a4-bf16-571dc4d40357" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.VideoFrameExtractionTests" name="DefaultOverloadStillWritesFrameNNNNIntoAFreshTempDirectory" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Qwen4ExpVideoRequestTests.PromptLayout_ImageAndVideoSpansExpandTheirOwnPadTokens" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="90d7d8fa-895c-e88a-e513-211541c27062">
+      <Execution id="add79afa-df97-4e56-85b6-0d1672aed586" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Qwen4ExpVideoRequestTests" name="PromptLayout_ImageAndVideoSpansExpandTheirOwnPadTokens" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.VideoFrameExtractionTests.ConsecutiveFramesComeFromDifferentPointsInTheClip" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="901d5f43-4d90-77d2-35f1-2fef61cdee37">
+      <Execution id="ed353ef7-6a3d-483d-8d15-075b5c663bc3" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.VideoFrameExtractionTests" name="ConsecutiveFramesComeFromDifferentPointsInTheClip" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.QwenVLVideoEncoderTests.Injector_RefusesVideoWhenTheTokenizerHasNoVideoPad" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="5db8f9ce-e79c-97d1-a781-634451cb753f">
+      <Execution id="9d287e4b-fbae-4edf-a23c-d95ab6545bd8" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.QwenVLVideoEncoderTests" name="Injector_RefusesVideoWhenTheTokenizerHasNoVideoPad" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.VideoFrameExtractionTests.FrameNamesReturnedByUpload_ResolveToRealFilesUnderTheUploadRoot" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="ab560a4b-c938-487a-4f99-0542b053edc0">
+      <Execution id="20baa6f7-a763-44af-a5da-ec5750d2b7e9" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.VideoFrameExtractionTests" name="FrameNamesReturnedByUpload_ResolveToRealFilesUnderTheUploadRoot" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.QwenVLVideoEncoderTests.Injector_ExpandsVideoPairsWithIncreasingTemporalIdsAndInjectsEachPair" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="a693247c-b3ba-6d60-66a3-19da734112bc">
+      <Execution id="d7b18882-1e08-42d0-b29d-13eef073e849" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.QwenVLVideoEncoderTests" name="Injector_ExpandsVideoPairsWithIncreasingTemporalIdsAndInjectsEachPair" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.QwenVLVideoEncoderTests.TemporalPair_MergesBothFramesInOrderAndADuplicatedFrameEqualsTheStillPath" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="6f7e87c7-ab99-d4ff-ccbf-b11f053a2055">
+      <Execution id="67989d22-9753-4280-bd08-c03e21259495" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.QwenVLVideoEncoderTests" name="TemporalPair_MergesBothFramesInOrderAndADuplicatedFrameEqualsTheStillPath" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Qwen4ExpVideoRequestTests.PromptLayout_ConsecutivePairsGetIncreasingTemporalIdsAndTextResumesAfterTheClip" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="7e393695-c85e-dfd5-e4f0-fad6980b3616">
+      <Execution id="d43df0e5-a994-4bc0-9c4c-0fc6cdc31329" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Qwen4ExpVideoRequestTests" name="PromptLayout_ConsecutivePairsGetIncreasingTemporalIdsAndTextResumesAfterTheClip" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.VideoFrameExtractionTests.ExtractedFrames_FeedTheVisionImageProcessor" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="95c0fc43-1ef7-a1ce-7146-0aad412c5d2e">
+      <Execution id="6ebbb178-cf3a-400a-ae44-60c30a84963f" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.VideoFrameExtractionTests" name="ExtractedFrames_FeedTheVisionImageProcessor" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.QwenVLVideoEncoderTests.VideoCache_ReencodesWhenOlderFrameChangesWithoutChangingPairSizeOrLatestTimestamp" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="a613b9c5-2546-102a-b508-a5ad5bb9fb1a">
+      <Execution id="32296d70-ee6f-4c52-b8bb-03112b0f3cfb" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.QwenVLVideoEncoderTests" name="VideoCache_ReencodesWhenOlderFrameChangesWithoutChangingPairSizeOrLatestTimestamp" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.VideoFrameExtractionTests.NonVideoInputThrowsAndWritesNothing" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="bac418a3-b902-60be-0170-232b88d705dc">
+      <Execution id="2dac2b8e-d265-4aca-b935-04a2db486dfa" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.VideoFrameExtractionTests" name="NonVideoInputThrowsAndWritesNothing" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Qwen4ExpVideoRequestTests.TimeLabels_UseOneDecimalWithTiesToEven(seconds: 0.75, expected: &quot;0.8&quot;)" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="128b6adf-d929-f145-877d-57f1e5a0ac1c">
+      <Execution id="42014737-07dd-49fd-93f9-0fad1f1eb059" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Qwen4ExpVideoRequestTests" name="TimeLabels_UseOneDecimalWithTiesToEven" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.VideoFrameExtractionTests.TwoClipsInOneDirectoryDoNotCollide" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="db1263ef-ecea-bbad-1df2-f07e426dd09b">
+      <Execution id="3faf4464-664e-4e7b-80b4-9ede93c98fab" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.VideoFrameExtractionTests" name="TwoClipsInOneDirectoryDoNotCollide" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.VideoFrameExtractionTests.OutputDirectoryIsCreatedWhenMissing" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="7d8e678e-1000-c23a-f2ae-6352d25632d2">
+      <Execution id="ae397649-aaf1-4369-8636-3b1c942311a7" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.VideoFrameExtractionTests" name="OutputDirectoryIsCreatedWhenMissing" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.VideoFrameExtractionTests.EveryFrameIsAValidOpaquePngAtSourceResolution" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="2ab31b04-5cb1-45c4-6420-3b68f40f45a3">
+      <Execution id="72ced2f8-69dd-4eed-83be-8ae19a4d1190" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.VideoFrameExtractionTests" name="EveryFrameIsAValidOpaquePngAtSourceResolution" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.QwenVLVideoEncoderTests.VideoResize_FitsTheWholeClipAgainstTheSharedBudget" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="fcbb319c-a388-1994-b501-10acbb144859">
+      <Execution id="02011994-130c-4ab1-b67a-7a11783640d6" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.QwenVLVideoEncoderTests" name="VideoResize_FitsTheWholeClipAgainstTheSharedBudget" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Qwen4ExpVideoRequestTests.Layout_OddClipRepeatsLastFrameAndNonIncreasingTimeStartsNewClip" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="195f4a49-4c5c-a7ab-e061-a673cf38fc81">
+      <Execution id="b328de32-0876-4f8e-9933-1a40d03aa52e" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Qwen4ExpVideoRequestTests" name="Layout_OddClipRepeatsLastFrameAndNonIncreasingTimeStartsNewClip" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Qwen4ExpVideoRequestTests.Qwen35_StillRefusesVideoUrlRatherThanSilentlyDroppingIt" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="83b1d6a4-ace0-3daf-8459-b633b914a4b9">
+      <Execution id="23b268b6-8308-4db7-a24b-596d7a7e42f0" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Qwen4ExpVideoRequestTests" name="Qwen35_StillRefusesVideoUrlRatherThanSilentlyDroppingIt" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Qwen4ExpVideoRequestTests.TimeLabels_UseOneDecimalWithTiesToEven(seconds: 2.3490000000000002, expected: &quot;2.3&quot;)" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="51dea081-1b99-aee9-3c68-84f5bbecfe18">
+      <Execution id="8cd32ffe-99a0-4a78-9127-15a037da4249" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Qwen4ExpVideoRequestTests" name="TimeLabels_UseOneDecimalWithTiesToEven" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.VideoFrameExtractionTests.MaxFramesCapsTheResultAndStillNumbersContiguously" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="e9e5896f-10cc-63fe-0015-56dbfc6c9e6d">
+      <Execution id="4d31b7de-8095-41a7-bd45-0b2ad3867f6e" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.VideoFrameExtractionTests" name="MaxFramesCapsTheResultAndStillNumbersContiguously" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Qwen4ExpVideoRequestTests.PromptLayout_RefusesAPlaceholderOfTheWrongKindAndReportsMissingOnes" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="92def982-66c0-ed03-62f0-e5fa21748bdd">
+      <Execution id="b5e2376a-9f77-4b24-9c14-8391dc1691ca" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Qwen4ExpVideoRequestTests" name="PromptLayout_RefusesAPlaceholderOfTheWrongKindAndReportsMissingOnes" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Qwen4ExpVideoRequestTests.TimeLabels_UseOneDecimalWithTiesToEven(seconds: 0.25, expected: &quot;0.2&quot;)" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="853e7566-49e3-80c9-2d86-e2f4294480fd">
+      <Execution id="7ad2041f-88c3-4799-8d4b-e91bf6c7071f" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Qwen4ExpVideoRequestTests" name="TimeLabels_UseOneDecimalWithTiesToEven" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Qwen4ExpVideoRequestTests.Layout_RejectsNegativeOrNonFiniteFrameTimes" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="dc5ad914-2681-47f4-8602-072b2c0ae236">
+      <Execution id="56c742de-c50a-4a9c-823d-e0fac896a46c" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Qwen4ExpVideoRequestTests" name="Layout_RejectsNegativeOrNonFiniteFrameTimes" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.VideoFrameExtractionTests.PrefixIsSanitizedSoFramesCannotEscapeTheDirectory" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="d567548b-d1e7-d1a7-4151-2124a517955e">
+      <Execution id="81efb88b-1ebe-460e-81d9-c9255e1afbc4" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.VideoFrameExtractionTests" name="PrefixIsSanitizedSoFramesCannotEscapeTheDirectory" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Qwen4ExpVideoRequestTests.OpenAiVideo_IsAcceptedForQwen4ExpAndRendersTimedPairsOncePerClip" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="300cc8e9-929b-ca1c-319f-c88aa17a5ac7">
+      <Execution id="16deb629-16aa-4b57-8bb9-c83d9805462a" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Qwen4ExpVideoRequestTests" name="OpenAiVideo_IsAcceptedForQwen4ExpAndRendersTimedPairsOncePerClip" />
+    </UnitTest>
+  </TestDefinitions>
+  <TestEntries>
+    <TestEntry testId="e9e5896f-10cc-63fe-0015-56dbfc6c9e6d" executionId="4d31b7de-8095-41a7-bd45-0b2ad3867f6e" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="d567548b-d1e7-d1a7-4151-2124a517955e" executionId="81efb88b-1ebe-460e-81d9-c9255e1afbc4" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="fcbb319c-a388-1994-b501-10acbb144859" executionId="02011994-130c-4ab1-b67a-7a11783640d6" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="90a96bba-4691-2e9b-470b-4b67c5533d33" executionId="2b4b02f5-7770-4b5a-93ff-6171e1d00288" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="901d5f43-4d90-77d2-35f1-2fef61cdee37" executionId="ed353ef7-6a3d-483d-8d15-075b5c663bc3" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="2ab31b04-5cb1-45c4-6420-3b68f40f45a3" executionId="72ced2f8-69dd-4eed-83be-8ae19a4d1190" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="5700189e-4cc2-4512-e201-e76fb95a8942" executionId="860235ab-7a7d-4f25-ba11-68dc1ae0c725" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="300cc8e9-929b-ca1c-319f-c88aa17a5ac7" executionId="16deb629-16aa-4b57-8bb9-c83d9805462a" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="dc5ad914-2681-47f4-8602-072b2c0ae236" executionId="56c742de-c50a-4a9c-823d-e0fac896a46c" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="4aa077aa-1720-ba83-63e4-dcce8942c164" executionId="78f9417b-f89c-4f41-bc52-f6eff1fcbb1a" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="128b6adf-d929-f145-877d-57f1e5a0ac1c" executionId="42014737-07dd-49fd-93f9-0fad1f1eb059" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="92def982-66c0-ed03-62f0-e5fa21748bdd" executionId="b5e2376a-9f77-4b24-9c14-8391dc1691ca" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="f36037c6-c5b3-6d8f-529c-b55287d97da0" executionId="2b69554a-2921-4724-a506-add4dd1f94a1" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="195f4a49-4c5c-a7ab-e061-a673cf38fc81" executionId="b328de32-0876-4f8e-9933-1a40d03aa52e" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="6a7d0ca6-ffb6-e4a3-e79e-c7ac4acef9ef" executionId="f3bfde92-13e6-4d02-8413-56460a5a4df4" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="6f7e87c7-ab99-d4ff-ccbf-b11f053a2055" executionId="67989d22-9753-4280-bd08-c03e21259495" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="7412b9f8-0a57-d075-c786-d1ef0afd765a" executionId="a6d638fb-911c-4c0e-ac83-ad592e07c243" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="90d7d8fa-895c-e88a-e513-211541c27062" executionId="add79afa-df97-4e56-85b6-0d1672aed586" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="95c0fc43-1ef7-a1ce-7146-0aad412c5d2e" executionId="6ebbb178-cf3a-400a-ae44-60c30a84963f" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="83b1d6a4-ace0-3daf-8459-b633b914a4b9" executionId="23b268b6-8308-4db7-a24b-596d7a7e42f0" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="51dea081-1b99-aee9-3c68-84f5bbecfe18" executionId="8cd32ffe-99a0-4a78-9127-15a037da4249" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="a613b9c5-2546-102a-b508-a5ad5bb9fb1a" executionId="32296d70-ee6f-4c52-b8bb-03112b0f3cfb" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="ab560a4b-c938-487a-4f99-0542b053edc0" executionId="20baa6f7-a763-44af-a5da-ec5750d2b7e9" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="7d8e678e-1000-c23a-f2ae-6352d25632d2" executionId="ae397649-aaf1-4369-8636-3b1c942311a7" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="7e393695-c85e-dfd5-e4f0-fad6980b3616" executionId="d43df0e5-a994-4bc0-9c4c-0fc6cdc31329" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="1dca6aff-6432-1ced-2736-a2c339bc2021" executionId="743445a7-c6c7-4dc4-a69e-ee0b114e562d" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="5db8f9ce-e79c-97d1-a781-634451cb753f" executionId="9d287e4b-fbae-4edf-a23c-d95ab6545bd8" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="853e7566-49e3-80c9-2d86-e2f4294480fd" executionId="7ad2041f-88c3-4799-8d4b-e91bf6c7071f" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="a693247c-b3ba-6d60-66a3-19da734112bc" executionId="d7b18882-1e08-42d0-b29d-13eef073e849" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="bac418a3-b902-60be-0170-232b88d705dc" executionId="2dac2b8e-d265-4aca-b935-04a2db486dfa" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="db1263ef-ecea-bbad-1df2-f07e426dd09b" executionId="3faf4464-664e-4e7b-80b4-9ede93c98fab" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="77f8d904-9613-8afb-9b4b-378e9ace8be3" executionId="4feb87c5-bd8b-41a4-bf16-571dc4d40357" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="ca45da2f-7967-62ce-f798-7392dd627b4b" executionId="59d8a351-53d2-433a-85ed-d785a63083e0" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+  </TestEntries>
+  <TestLists>
+    <TestList name="Results Not in a List" id="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestList name="All Loaded Results" id="19431567-8539-422a-85d7-44ee4e166bda" />
+  </TestLists>
+  <ResultSummary outcome="Completed">
+    <Counters total="33" executed="33" passed="33" failed="0" error="0" timeout="0" aborted="0" inconclusive="0" passedButRunAborted="0" notRunnable="0" notExecuted="0" disconnected="0" warning="0" completed="0" inProgress="0" pending="0" />
+    <Output>
+      <StdOut>[xUnit.net 00:00:00.00] xUnit.net VSTest Adapter v3.1.4+50e68bbb8b (64-bit .NET 10.0.10)
+[xUnit.net 00:00:00.05]   Discovering: InferenceWeb.Tests
+[xUnit.net 00:00:00.60]   Discovered:  InferenceWeb.Tests
+[xUnit.net 00:00:00.62]   Starting:    InferenceWeb.Tests
+Qwen3.5 Vision encoder: imageSize=32, patchSize=16, hidden=8, intermediate=16, heads=2, blocks=1, projDim=8, mergeSize=2, gridPerSide=2, ropeTheta=10000
+Loading vision encoder weights... done (22 tensors)
+  Vision encoder block 1/1... done
+  Vision encode: 12 ms total (patchEmbed 6 ms, blocks 5 ms, proj 0 ms), 16 patches -&gt; 4 tokens
+  Vision encoder block 1/1... done
+  Vision encode: 0 ms total (patchEmbed 0 ms, blocks 0 ms, proj 0 ms), 16 patches -&gt; 4 tokens
+  Vision encoder block 1/1... done
+  Vision encode: 0 ms total (patchEmbed 0 ms, blocks 0 ms, proj 0 ms), 16 patches -&gt; 4 tokens
+  Vision encoder block 1/1... done
+  Vision encode: 0 ms total (patchEmbed 0 ms, blocks 0 ms, proj 0 ms), 16 patches -&gt; 4 tokens
+Qwen3.5 Vision encoder: imageSize=32, patchSize=16, hidden=8, intermediate=16, heads=2, blocks=1, projDim=8, mergeSize=2, gridPerSide=2, ropeTheta=10000
+Loading vision encoder weights... done (22 tensors)
+  Vision encoder block 1/1... done
+  Vision encode: 1 ms total (patchEmbed 1 ms, blocks 0 ms, proj 0 ms), 16 patches -&gt; 4 tokens
+  Vision encoder block 1/1... done
+  Vision encode: 0 ms total (patchEmbed 0 ms, blocks 0 ms, proj 0 ms), 16 patches -&gt; 4 tokens
+Qwen3.5 Vision encoder: imageSize=32, patchSize=16, hidden=8, intermediate=16, heads=2, blocks=1, projDim=8, mergeSize=2, gridPerSide=2, ropeTheta=10000
+Loading vision encoder weights... done (22 tensors)
+  Vision encoder block 1/1... done
+  Vision encode: 1 ms total (patchEmbed 0 ms, blocks 0 ms, proj 0 ms), 16 patches -&gt; 4 tokens
+Qwen3.5 Vision encoder: imageSize=32, patchSize=16, hidden=8, intermediate=16, heads=2, blocks=1, projDim=8, mergeSize=2, gridPerSide=2, ropeTheta=10000
+Loading vision encoder weights... done (22 tensors)
+  Vision encoder block 1/1... done
+  Vision encode: 0 ms total (patchEmbed 0 ms, blocks 0 ms, proj 0 ms), 16 patches -&gt; 4 tokens
+  Vision encoder block 1/1... done
+  Vision encode: 1 ms total (patchEmbed 0 ms, blocks 0 ms, proj 0 ms), 16 patches -&gt; 4 tokens
+  Vision encoder block 1/1... done
+  Vision encode: 0 ms total (patchEmbed 0 ms, blocks 0 ms, proj 0 ms), 16 patches -&gt; 4 tokens
+  Vision encoder block 1/1... done
+  Vision encode: 0 ms total (patchEmbed 0 ms, blocks 0 ms, proj 0 ms), 16 patches -&gt; 4 tokens
+Qwen3.5 Vision encoder: imageSize=32, patchSize=16, hidden=8, intermediate=16, heads=2, blocks=1, projDim=8, mergeSize=2, gridPerSide=2, ropeTheta=10000
+Loading vision encoder weights... done (22 tensors)
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: Couldn't read video stream from file "/var/folders/54/3hgkdrxn62vg0_r6mfdp9xl40000gn/T/ts-video-frames-4c25108c851d4dc1806b543dd1eb9514/notavideo.mp4"
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+OpenCV: AVF: waiting to write video data.
+[ WARN:0@1.749] global cap.cpp:781 open VIDEOIO(CV_IMAGES): raised OpenCV exception:
+OpenCV(4.11.0) /Users/runner/work/opencvsharp-mini-runtime/opencvsharp-mini-runtime/opencv/modules/videoio/src/cap_images.cpp:415: error: (-215:Assertion failed) !filename_pattern.empty() in function 'CvVideoWriter_Images'
+Warning: the prompt renders 0 Qwen-VL vision placeholder(s) for 1 attachment span(s); the remaining span(s) are not injected.
+[xUnit.net 00:00:02.15]   Finished:    InferenceWeb.Tests
+</StdOut>
+    </Output>
+  </ResultSummary>
+</TestRun>

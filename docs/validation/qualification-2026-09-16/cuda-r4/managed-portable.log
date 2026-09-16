@@ -1,0 +1,27 @@
+Test run for /workspace/ts-codex-20260916-r4/repo/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll (.NETCoreApp,Version=v10.0)
+A total of 1 test files matched the specified pattern.
+[xUnit.net 00:00:08.90]     InferenceWeb.Tests.PrefixCheckpointOwnershipTests.GemmaThrowingPostCommitTrace_DoesNotReportFailureOrLosePublishedOwner [SKIP]
+  Skipped InferenceWeb.Tests.PrefixCheckpointOwnershipTests.GemmaThrowingPostCommitTrace_DoesNotReportFailureOrLosePublishedOwner [1 ms]
+[xUnit.net 00:00:13.51]     InferenceWeb.Tests.DeepSeekTeacherTokenExportFixture.ExportPinned113RequestsMetadataOnly [SKIP]
+  Skipped InferenceWeb.Tests.DeepSeekTeacherTokenExportFixture.ExportPinned113RequestsMetadataOnly [1 ms]
+[xUnit.net 00:01:22.75]     InferenceWeb.Tests.Glm5NextNativeSnapshotBoundaryTests.CaptureAndPartialRestoreExceptionsAreContainedAndResetRecovers [SKIP]
+  Skipped InferenceWeb.Tests.Glm5NextNativeSnapshotBoundaryTests.CaptureAndPartialRestoreExceptionsAreContainedAndResetRecovers [1 ms]
+[xUnit.net 00:02:01.25]     InferenceWeb.Tests.DeepSeekTeacherTokenExporterTests.All113PinnedBodiesTraverseProductionPreprocessingWithSyntheticTokenizer [SKIP]
+  Skipped InferenceWeb.Tests.DeepSeekTeacherTokenExporterTests.All113PinnedBodiesTraverseProductionPreprocessingWithSyntheticTokenizer [1 ms]
+[xUnit.net 00:02:01.59]     InferenceWeb.Tests.TensorAgentMauiProjectTests.Head_RetainsBonsaiNativeEntryPointsInRelease [FAIL]
+  Failed InferenceWeb.Tests.TensorAgentMauiProjectTests.Head_RetainsBonsaiNativeEntryPointsInRelease [258 ms]
+  Error Message:
+   Assert.Equal() Failure: Collections differ
+                                                               ↓ (pos 129)
+Expected: [···, "TSGgml_GlmSlotFree", "TSGgml_GlmSpecForward", "TSGgml_GlmTestKdaSnapshotFault", "TSGgml_GlmVisionEncoderF32", "TSGgml_GlmVocabSize", ···]
+Actual:   [···, "TSGgml_GlmSlotFree", "TSGgml_GlmSpecForward", "TSGgml_GlmVisionEncoderF32", "TSGgml_GlmVocabSize", "TSGgml_GptOssAttentionLayerPrefill", ···]
+                                                               ↑ (pos 129)
+  Stack Trace:
+     at InferenceWeb.Tests.TensorAgentMauiProjectTests.Head_RetainsBonsaiNativeEntryPointsInRelease() in /workspace/ts-codex-20260916-r4/repo/InferenceWeb.Tests/TensorAgentMauiProjectTests.cs:line 221
+   at System.RuntimeMethodHandle.InvokeMethod(ObjectHandleOnStack target, Void** arguments, ObjectHandleOnStack sig, BOOL isConstructor, ObjectHandleOnStack result)
+   at System.RuntimeMethodHandle.InvokeMethod(ObjectHandleOnStack target, Void** arguments, ObjectHandleOnStack sig, BOOL isConstructor, ObjectHandleOnStack result)
+   at System.Reflection.MethodBaseInvoker.InterpretedInvoke_Method(Object obj, IntPtr* args)
+   at System.Reflection.MethodBaseInvoker.InvokeWithNoArgs(Object obj, BindingFlags invokeAttr)
+Results File: /workspace/ts-codex-20260916-r4/results/build1/portable/portable.trx
+
+Failed!  - Failed:     1, Passed:  4288, Skipped:     4, Total:  4293, Duration: 2 m 4 s - InferenceWeb.Tests.dll (net10.0)

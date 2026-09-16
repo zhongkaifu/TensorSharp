@@ -1,0 +1,9 @@
+Test project /tmp/tensorsharp-boundary-20260916/build
+    Start 11: deepseek41-dspark-ring-guards
+1/2 Test #11: deepseek41-dspark-ring-guards ....   Passed    0.45 sec
+    Start 16: attention-exception-boundary
+2/2 Test #16: attention-exception-boundary .....   Passed    0.14 sec
+
+100% tests passed out of 2
+
+Total Test time (real) =   0.59 sec

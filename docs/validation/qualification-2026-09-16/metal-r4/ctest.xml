@@ -1,0 +1,252 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="(empty)"
+	tests="18"
+	failures="2"
+	disabled="0"
+	skipped="0"
+	hostname=""
+	time="6"
+	timestamp="2026-09-16T10:40:03"
+	>
+	<testcase name="qwen4exp-qsa-position-plan" classname="qwen4exp-qsa-position-plan" time="0.174185" status="run">
+		<properties/>
+		<system-out>PASS 253504 independent QSA plan checks; no model/native/GPU execution
+</system-out>
+	</testcase>
+	<testcase name="deepseek41-engram-parallel-io" classname="deepseek41-engram-parallel-io" time="0.552541" status="run">
+		<properties/>
+		<system-out>Simulated blocked reads: rows=24 threads=1 peak=1 elapsed_ms=72.19
+Simulated blocked reads: rows=24 threads=16 peak=16 elapsed_ms=6.05
+Simulated blocked reads: rows=72 threads=1 peak=1 elapsed_ms=214.68
+Simulated blocked reads: rows=72 threads=16 peak=16 elapsed_ms=13.78
+Engram 1/3/257-token serial/parallel/warm, invalid rows, lifecycle, concurrent submission and exception tests passed
+</system-out>
+	</testcase>
+	<testcase name="deepseek41-engram-mapped-advice" classname="deepseek41-engram-mapped-advice" time="0.10755" status="run">
+		<properties/>
+		<system-out>Non-Linux: range/policy checks complete; OS advice explicitly unsupported
+Passed 47 mapped Engram advice checks
+</system-out>
+	</testcase>
+	<testcase name="deepseek41-tp-worker-lifetime" classname="deepseek41-tp-worker-lifetime" time="0.108536" status="run">
+		<properties/>
+		<system-out>Passed 72 TP worker lifetime checks
+</system-out>
+	</testcase>
+	<testcase name="deepseek41-moe-tensor-parallel" classname="deepseek41-moe-tensor-parallel" time="0.575165" status="fail">
+		<failure message="Failed"/>
+		<properties/>
+		<system-out>Fixture gate=f32 up=f32 down=f32 embedding=16 hidden=18 experts=8 top_k=6
+Scalar F32 oracle ranks=2 shared_output=0 passed
+Scalar F32 oracle ranks=2 shared_output=1 passed
+f32/f32 ranks=2 layer=0 tokens=1 max_abs=2.91038e-11 rel_l2=1.13135e-07
+f32/f32 ranks=2 layer=1 tokens=1 max_abs=2.91038e-11 rel_l2=8.88755e-08
+f32/f32 ranks=2 layer=0 tokens=5 max_abs=2.91038e-11 rel_l2=1.05927e-07
+f32/f32 ranks=2 layer=1 tokens=5 max_abs=4.36557e-11 rel_l2=1.02129e-07
+f32/f32 ranks=2 layer=0 tokens=16 max_abs=3.63798e-11 rel_l2=1.047e-07
+f32/f32 ranks=2 layer=1 tokens=16 max_abs=4.36557e-11 rel_l2=1.04532e-07
+f32/f32 ranks=2 layer=0 tokens=1 max_abs=2.91038e-11 rel_l2=1.13135e-07
+f32/f32 ranks=2 layer=1 tokens=1 max_abs=2.91038e-11 rel_l2=8.88755e-08
+Scalar F32 oracle ranks=4 shared_output=0 passed
+Scalar F32 oracle ranks=4 shared_output=1 passed
+f32/f32 ranks=4 layer=0 tokens=1 max_abs=2.91038e-11 rel_l2=9.88507e-08
+f32/f32 ranks=4 layer=1 tokens=1 max_abs=2.91038e-11 rel_l2=1.1136e-07
+f32/f32 ranks=4 layer=0 tokens=5 max_abs=4.36557e-11 rel_l2=1.02137e-07
+f32/f32 ranks=4 layer=1 tokens=5 max_abs=2.91038e-11 rel_l2=1.06399e-07
+f32/f32 ranks=4 layer=0 tokens=16 max_abs=4.36557e-11 rel_l2=9.95528e-08
+f32/f32 ranks=4 layer=1 tokens=16 max_abs=2.91038e-11 rel_l2=1.0194e-07
+f32/f32 ranks=4 layer=0 tokens=1 max_abs=2.91038e-11 rel_l2=9.88507e-08
+f32/f32 ranks=4 layer=1 tokens=1 max_abs=2.91038e-11 rel_l2=1.1136e-07
+Scalar F32 oracle ranks=7 shared_output=0 passed
+Scalar F32 oracle ranks=7 shared_output=1 passed
+f32/f32 ranks=7 layer=0 tokens=1 max_abs=2.91038e-11 rel_l2=1.19097e-07
+f32/f32 ranks=7 layer=1 tokens=1 max_abs=2.91038e-11 rel_l2=1.16561e-07
+f32/f32 ranks=7 layer=6 tokens=1 max_abs=2.91038e-11 rel_l2=1.00003e-07
+f32/f32 ranks=7 layer=0 tokens=5 max_abs=4.36557e-11 rel_l2=1.13981e-07
+f32/f32 ranks=7 layer=1 tokens=5 max_abs=4.36557e-11 rel_l2=1.18975e-07
+f32/f32 ranks=7 layer=6 tokens=5 max_abs=4.36557e-11 rel_l2=1.24311e-07
+f32/f32 ranks=7 layer=0 tokens=16 max_abs=5.82077e-11 rel_l2=1.21614e-07
+f32/f32 ranks=7 layer=1 tokens=16 max_abs=5.82077e-11 rel_l2=1.20727e-07
+f32/f32 ranks=7 layer=6 tokens=16 max_abs=5.82077e-11 rel_l2=1.27806e-07
+f32/f32 ranks=7 layer=0 tokens=1 max_abs=2.91038e-11 rel_l2=1.19097e-07
+f32/f32 ranks=7 layer=1 tokens=1 max_abs=2.91038e-11 rel_l2=1.16561e-07
+f32/f32 ranks=7 layer=6 tokens=1 max_abs=2.91038e-11 rel_l2=1.00003e-07
+Scalar F32 oracle ranks=8 shared_output=0 passed
+Scalar F32 oracle ranks=8 shared_output=1 passed
+f32/f32 ranks=8 layer=0 tokens=1 max_abs=2.91038e-11 rel_l2=1.13267e-07
+f32/f32 ranks=8 layer=1 tokens=1 max_abs=2.91038e-11 rel_l2=9.90018e-08
+f32/f32 ranks=8 layer=0 tokens=5 max_abs=4.36557e-11 rel_l2=1.30703e-07
+f32/f32 ranks=8 layer=1 tokens=5 max_abs=4.36557e-11 rel_l2=1.20912e-07
+f32/f32 ranks=8 layer=0 tokens=16 max_abs=5.82077e-11 rel_l2=1.28111e-07
+f32/f32 ranks=8 layer=1 tokens=16 max_abs=5.82077e-11 rel_l2=1.25187e-07
+f32/f32 ranks=8 layer=0 tokens=1 max_abs=2.91038e-11 rel_l2=1.13267e-07
+f32/f32 ranks=8 layer=1 tokens=1 max_abs=2.91038e-11 rel_l2=9.90018e-08
+Fixture gate=bf16 up=bf16 down=bf16 embedding=256 hidden=2304 experts=8 top_k=6
+bf16/bf16 ranks=2 layer=0 tokens=1 max_abs=3.63798e-11 rel_l2=8.21603e-08
+bf16/bf16 ranks=2 layer=1 tokens=1 max_abs=3.63798e-11 rel_l2=8.21603e-08
+bf16/bf16 ranks=2 layer=0 tokens=5 max_abs=5.82077e-11 rel_l2=8.09258e-08
+bf16/bf16 ranks=2 layer=1 tokens=5 max_abs=5.82077e-11 rel_l2=8.09258e-08
+bf16/bf16 ranks=2 layer=0 tokens=16 max_abs=5.82077e-11 rel_l2=8.10585e-08
+bf16/bf16 ranks=2 layer=1 tokens=16 max_abs=5.82077e-11 rel_l2=8.10585e-08
+bf16/bf16 ranks=2 layer=0 tokens=1 max_abs=3.63798e-11 rel_l2=8.21603e-08
+bf16/bf16 ranks=2 layer=1 tokens=1 max_abs=3.63798e-11 rel_l2=8.21603e-08
+bf16/bf16 ranks=4 layer=0 tokens=1 max_abs=3.63798e-11 rel_l2=9.33027e-08
+bf16/bf16 ranks=4 layer=1 tokens=1 max_abs=3.63798e-11 rel_l2=9.33027e-08
+bf16/bf16 ranks=4 layer=0 tokens=5 max_abs=5.82077e-11 rel_l2=8.53401e-08
+bf16/bf16 ranks=4 layer=1 tokens=5 max_abs=5.82077e-11 rel_l2=8.53401e-08
+bf16/bf16 ranks=4 layer=0 tokens=16 max_abs=5.82077e-11 rel_l2=8.59743e-08
+bf16/bf16 ranks=4 layer=1 tokens=16 max_abs=5.82077e-11 rel_l2=8.59743e-08
+bf16/bf16 ranks=4 layer=0 tokens=1 max_abs=3.63798e-11 rel_l2=9.33027e-08
+bf16/bf16 ranks=4 layer=1 tokens=1 max_abs=3.63798e-11 rel_l2=9.33027e-08
+bf16/bf16 ranks=7 layer=0 tokens=1 max_abs=3.63798e-11 rel_l2=9.44026e-08
+bf16/bf16 ranks=7 layer=1 tokens=1 max_abs=3.63798e-11 rel_l2=9.81795e-08
+bf16/bf16 ranks=7 layer=6 tokens=1 max_abs=4.36557e-11 rel_l2=9.88451e-08
+bf16/bf16 ranks=7 layer=0 tokens=5 max_abs=5.82077e-11 rel_l2=9.50606e-08
+bf16/bf16 ranks=7 layer=1 tokens=5 max_abs=4.36557e-11 rel_l2=9.46399e-08
+bf16/bf16 ranks=7 layer=6 tokens=5 max_abs=5.82077e-11 rel_l2=9.46712e-08
+bf16/bf16 ranks=7 layer=0 tokens=16 max_abs=5.82077e-11 rel_l2=9.44264e-08
+bf16/bf16 ranks=7 layer=1 tokens=16 max_abs=5.82077e-11 rel_l2=9.49265e-08
+bf16/bf16 ranks=7 layer=6 tokens=16 max_abs=5.82077e-11 rel_l2=9.34212e-08
+bf16/bf16 ranks=7 layer=0 tokens=1 max_abs=3.63798e-11 rel_l2=9.44026e-08
+bf16/bf16 ranks=7 layer=1 tokens=1 max_abs=3.63798e-11 rel_l2=9.81795e-08
+bf16/bf16 ranks=7 layer=6 tokens=1 max_abs=4.36557e-11 rel_l2=9.88451e-08
+bf16/bf16 ranks=8 layer=0 tokens=1 max_abs=4.36557e-11 rel_l2=1.05119e-07
+bf16/bf16 ranks=8 layer=1 tokens=1 max_abs=3.27418e-11 rel_l2=1.00015e-07
+bf16/bf16 ranks=8 layer=0 tokens=5 max_abs=5.82077e-11 rel_l2=9.52591e-08
+bf16/bf16 ranks=8 layer=1 tokens=5 max_abs=5.82077e-11 rel_l2=9.52889e-08
+bf16/bf16 ranks=8 layer=0 tokens=16 max_abs=5.82077e-11 rel_l2=9.46918e-08
+bf16/bf16 ranks=8 layer=1 tokens=16 max_abs=5.82077e-11 rel_l2=9.40979e-08
+bf16/bf16 ranks=8 layer=0 tokens=1 max_abs=4.36557e-11 rel_l2=1.05119e-07
+bf16/bf16 ranks=8 layer=1 tokens=1 max_abs=3.27418e-11 rel_l2=1.00015e-07
+Fixture gate=f16 up=f16 down=f16 embedding=256 hidden=2304 experts=8 top_k=6
+f16/f16 ranks=2 layer=0 tokens=1 max_abs=2.32743e-07 rel_l2=0.000511463
+TP relative error exceeds the full-weight reference tolerance
+</system-out>
+	</testcase>
+	<testcase name="deepseek41-tp-failure-recovery" classname="deepseek41-tp-failure-recovery" time="0.00606329" status="run">
+		<properties/>
+		<system-out>Passed 63 TP failure lifecycle checks
+</system-out>
+	</testcase>
+	<testcase name="scheduler-seventeen-backends" classname="scheduler-seventeen-backends" time="0.134998" status="run">
+		<properties/>
+		<system-out>17-backend scheduler creation, allocation and computation passed
+</system-out>
+	</testcase>
+	<testcase name="scheduler-allocation-failure-recovery" classname="scheduler-allocation-failure-recovery" time="0.138269" status="run">
+		<properties/>
+		<system-out>ggml_gallocr_reserve_n_impl: failed to allocate TensorSharpAllocationFailureFixture buffer of size 256
+ggml_gallocr_reserve_n_impl: failed to allocate TensorSharpAllocationFailureFixture buffer of size 256
+ggml_gallocr_reserve_n_impl: failed to allocate TensorSharpAllocationFailureFixture buffer of size 256
+ggml_gallocr_reserve_n_impl: failed to allocate TensorSharpAllocationFailureFixture buffer of size 512
+Cross-device failure rank=0 kind=null
+Failure helper returned false rank=0 kind=null
+Failed graph destroyed rank=0 kind=null
+Cross-device failure rank=1 kind=null
+Failure helper returned false rank=1 kind=null
+Failed graph destroyed rank=1 kind=null
+Cross-device failure rank=0 kind=bad_alloc
+Failure helper returned false rank=0 kind=bad_alloc
+Failed graph destroyed rank=0 kind=bad_alloc
+Cross-device failure rank=1 kind=bad_alloc
+Failure helper returned false rank=1 kind=bad_alloc
+Failed graph destroyed rank=1 kind=bad_alloc
+Incompatible CPU devices: reserve rewrites sources; null/bad_alloc failures restor...
+[This part of the test output was removed since it exceeds the threshold of 1024 bytes.]
+</system-out>
+	</testcase>
+	<testcase name="deepseek41-compact-raw-gather" classname="deepseek41-compact-raw-gather" time="0.150047" status="run">
+		<properties/>
+		<system-out>Passed 16384 independent window/mask comparisons, 5 invalid-window guards, 34 bit-exact paired gathers
+</system-out>
+	</testcase>
+	<testcase name="deepseek41-truncate-guards" classname="deepseek41-truncate-guards" time="0.298157" status="run">
+		<properties/>
+		<system-out>dsv41 truncate guards: 4633 allowed rewinds verified against the ring simulation, 7955 refused, 3576 sound rewinds confirmed allowed
+</system-out>
+	</testcase>
+	<testcase name="deepseek41-dspark-ring-guards" classname="deepseek41-dspark-ring-guards" time="0.443424" status="run">
+		<properties/>
+		<system-out>PASS: DSpark guard/ring contract checks=281727 branches=24680 refused=1680
+Scope: direct production rewind predicate plus independent ring simulation; no model/CUDA/cache tensor execution.
+</system-out>
+	</testcase>
+	<testcase name="deepseek41-retention-budget" classname="deepseek41-retention-budget" time="0.113355" status="run">
+		<properties/>
+		<system-out>13 retention budget/overflow checks passed
+</system-out>
+	</testcase>
+	<testcase name="deepseek41-activation-quant-candidates" classname="deepseek41-activation-quant-candidates" time="0.122592" status="run">
+		<properties/>
+		<system-out>DeepSeek V4.1 FP8/FP4/BF16 quantization and candidate-mask tests passed
+</system-out>
+	</testcase>
+	<testcase name="cpu-explicit-f32-matmul" classname="cpu-explicit-f32-matmul" time="0.41865" status="run">
+		<properties/>
+		<system-out>CPU COLUMN_INVARIANCE MUL_MAT weights=f32 inner=4096 rows=96 widths=1..8 bit_identical
+CPU COLUMN_INVARIANCE MUL_MAT weights=f16 inner=4096 rows=96 widths=1..8 bit_identical
+CPU COLUMN_INVARIANCE MUL_MAT_ID weights=f32 inner=4096 rows=96 widths=1..8 bit_identical
+CPU COLUMN_INVARIANCE MUL_MAT_ID weights=f16 inner=4096 rows=96 widths=1..8 bit_identical
+CPU MUL_MAT nt=1 weights=f32 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=0 convert=0 precision=default pipeline=0 max_abs=8.9297484e-07 rel_l2=1.0262291e-07 mean_us=48.5 max_abs=4.8195417e-07 rel_l2=7.3925479e-08
+CPU MUL_MAT nt=1 weights=f32 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=0 convert=0 precision=F32 pipeline=0 max_abs=5.8330407e-07 rel_l2=8.4087161e-08 mean_us=50.0 max_abs=5.5847122e-07 rel_l2=7.0717635e-08
+CPU MUL_MAT nt=1 weights=f16 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=0 convert=0 precision=default pipeline=0 max_abs=0.0031175607 rel_l2=0.00049903368 mean_us=45.8 max_...
+[This part of the test output was removed since it exceeds the threshold of 1024 bytes.]
+</system-out>
+	</testcase>
+	<testcase name="cpu-explicit-f32-attention" classname="cpu-explicit-f32-attention" time="1.83355" status="run">
+		<properties/>
+		<system-out>CPU QUERY_INVARIANCE head=64 keys=300 heads=64 widths=1..8 bit_identical
+CPU COMPACTION_GUARDS mask=f32 exact_capacity=16 overflow_capacity=17 exceptional=nan,+inf repeats=3 passed
+CPU COMPACTION_GUARDS mask=f16 exact_capacity=16 overflow_capacity=17 exceptional=nan,+inf repeats=3 passed
+CPU COMPACTION_GUARDS mask=bf16 exact_capacity=16 overflow_capacity=17 exceptional=nan,+inf repeats=3 passed
+CPU F32_ATTN head=64 value_head=33 queries=5 keys=15 heads=8/2 batches=4/2 mask=1:f32/2/2 sink=1 padded=1 stride0=1 alias=0 pattern=0 sparse_capacity=1 k_type=f32 v_type=f32 v_heads=4 v_batches=1 max_abs=9.9793315e-09 rel_l2=3.3443921e-08 mean_us=126.0 max_abs=6.8803146e-09 rel_l2=3.1938473e-08
+CPU F32_ATTN head=64 value_head=33 queries=5 keys=15 heads=8/2 batches=4/2 mask=1:f32/2/2 sink=0 padded=1 stride0=1 alias=0 pattern=0 sparse_capacity=16 k_type=bf16 v_type=f32 v_heads=4 v_batches=1 max_abs=1.0121569e-08 rel_l2=1.9307397e-08 mean_us=126.2 max_abs=1.131325e-08 rel_l2=2.3662702e-08
+CPU F32_ATTN head=64 value_head=3...
+[This part of the test output was removed since it exceeds the threshold of 1024 bytes.]
+</system-out>
+	</testcase>
+	<testcase name="attention-exception-boundary" classname="attention-exception-boundary" time="0.14263" status="run">
+		<properties/>
+		<system-out>attention exception boundary: before=1 caught=1 injected=1 unwound=1 changed_input=1
+</system-out>
+	</testcase>
+	<testcase name="cpu-q8-f32-projection" classname="cpu-q8-f32-projection" time="0.886791" status="run">
+		<properties/>
+		<system-out>Q8/F32 K=96 M=65 N=1 padded=0 interleaved=0 transposed=0 pipeline=0 pattern=0 revision=0 max=1.03842467e-07 relL2=2.87805963e-08 failures=0
+Q8/F32 K=96 M=65 N=1 padded=0 interleaved=0 transposed=0 pipeline=0 pattern=0 revision=1 max=4.49363142e-08 relL2=1.92488723e-08 failures=0
+Q8/F32 K=96 M=63 N=1 padded=1 interleaved=1 transposed=0 pipeline=0 pattern=0 revision=0 max=1.03842467e-07 relL2=2.92254668e-08 failures=0
+Q8/F32 K=96 M=63 N=1 padded=1 interleaved=1 transposed=0 pipeline=0 pattern=0 revision=1 max=4.49363142e-08 relL2=1.96243658e-08 failures=0
+Q8/F32 K=96 M=65 N=4 padded=0 interleaved=0 transposed=0 pipeline=0 pattern=0 revision=0 max=4.61470336e-07 relL2=2.41618327e-08 failures=0
+Q8/F32 K=96 M=65 N=4 padded=0 interleaved=0 transposed=0 pipeline=0 pattern=0 revision=1 max=2.02795491e-07 relL2=2.39039077e-08 failures=0
+Q8/F32 K=96 M=63 N=4 padded=1 interleaved=1 transposed=0 pipeline=0 pattern=0 revision=0 max=4.61470336e-07 relL2=2.4115506e-08 failures=0
+Q8/F32 K=96 M=63 N=4 padded=1 interleaved=1 t...
+[This part of the test output was removed since it exceeds the threshold of 1024 bytes.]
+</system-out>
+	</testcase>
+	<testcase name="attention-allocation" classname="attention-allocation" time="0.325313" status="fail">
+		<failure message="Failed"/>
+		<properties/>
+		<system-out>ggml_metal_init: allocating
+ggml_metal_init: picking default device: (null)
+ggml_metal_init: error: failed to create command queue
+ggml_backend_metal_init: error: failed to allocate context
+CPU f16 q=1 kv=65 retained=0 late_view=0 slots=1 bytes=11424 -&gt; 7360
+CPU f16 q=1 kv=128 retained=1 late_view=0 slots=2 bytes=11520 -&gt; 8480
+CPU f16 q=1 kv=129 retained=0 late_view=1 slots=2 bytes=12576 -&gt; 9536
+CPU f16 q=32 kv=129 retained=0 late_view=0 slots=1 bytes=368704 -&gt; 237664
+CPU f16 q=1 kv=4096 retained=0 late_view=0 slots=1 bytes=41984 -&gt; 26656
+CPU f32 q=1 kv=65 retained=0 late_view=0 slots=1 bytes=11424 -&gt; 7360
+CPU f32 q=1 kv=128 retained=1 late_view=0 slots=2 bytes=11520 -&gt; 8480
+CPU f32 q=1 kv=129 retained=0 late_view=1 slots=2 bytes=12576 -&gt; 9536
+CPU f32 q=32 kv=129 retained=0 late_view=0 slots=1 bytes=368704 -&gt; 237664
+CPU f32 q=1 kv=4096 retained=0 late_view=0 slots=1 bytes=41984 -&gt; 26656
+CPU q8_0 q=1 kv=65 retained=0 late_view=0 slots=1 bytes=11424 -&gt; 7360
+CPU q8_0 q=1 kv=128 retained=1 late_view=0 slots=2 bytes=11520 -&gt; 8480
+CPU q8_0 q=1 kv=129 retained=0 late_view=1 slots=2 bytes=12576 -&gt; 9536
+CPU q8_0 q=32 kv=129 retained=0 late_view=0 slots=1 bytes=368704 -&gt; 237664
+CPU q8_0 q=1 kv=4096 retained=0 late_view=0 slots=1 bytes=41984 -&gt; 26656
+CPU f16 q=1 kv=65 retained=0 late_view=0 slots=1 bytes=144544 -&gt; 73920
+Metal backend initialization failed.
+</system-out>
+	</testcase>
+</testsuite>

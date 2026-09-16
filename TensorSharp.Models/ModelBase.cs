@@ -1156,6 +1156,11 @@ namespace TensorSharp.Models
             }
 
             var merges = gguf.GetStringArray("tokenizer.ggml.merges");
+            if (merges == null)
+                throw new System.IO.InvalidDataException(
+                    "GGUF tokenizer metadata is incomplete: tokenizer.ggml.model=" + tokenizerModel +
+                    " is a BPE vocabulary but the file carries no tokenizer.ggml.merges array. " +
+                    "Re-convert the checkpoint (or, for a synthetic fixture, add an empty merges array).");
             // tokenizer.ggml.model=gemma4 is an SPM-style BPE vocabulary,
             // not a unigram SentencePiece vocabulary.  It does not need a
             // tokenizer.ggml.pre entry: the model name selects its raw

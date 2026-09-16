@@ -148,7 +148,8 @@ namespace TensorSharp.Models
         {
             lock (_nativeSync)
             {
-                GgmlGlmNative.Reset(_native);
+                if (!GgmlGlmNative.ResetChecked(_native))
+                    throw new InvalidOperationException("glm-dsa native reset failed; slot remains unusable.");
                 _cacheSeqLen = 0;
             }
         }

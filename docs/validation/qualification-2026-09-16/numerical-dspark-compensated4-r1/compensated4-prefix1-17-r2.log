@@ -1,0 +1,327 @@
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 45498 MiB):
+  Device 0: NVIDIA A40, compute capability 8.6, VMM: yes, VRAM: 45498 MiB
+[dsv4] compute devices initialized: 1 GPU(s)
+[dsv4]   compute device 0: backend=CUDA0, device=CUDA0 (NVIDIA A40)
+[dsv4] auxiliary CPU worker pool: threads=2, persistent=yes
+[dsv4] VRAM reserve: 2048 MiB per device (indexer 0 x1.25 + activations 0 + 2048 headroom)
+[dsv4] routed-expert CPU offload: 0 of 5 layer(s); 5 layer(s) on GPUs
+[dsv4] DSpark drafter on device 0: 3 stage(s), block_size=5, markov_rank=32, target_layers=[1..4], noise_token=250
+[dsv41] Engram lookup: GPU-resident tables, gathered in-graph (no host reads)
+[dsv4] loaded 0.0 GiB across 1 GPU(s) in 0.7s (0.05 GiB/s, 16 load threads; n_ctx=1024, ring=256, csa_rows=768, hca_rows=1280)
+[dsv4]   device 0: layers 0..4 (5), 44.1 GiB free after load
+[dsv4] fused ops: on
+[dsv4] hyper-connection ops: native
+[dsv4] flash attention: on
+[dsv4] V4.1 CUDA precision: TensorSharp F32 matmul; attention=TensorSharp F32 (streaming decode, tiled prefill)
+[dsv4] compute devices initialized: 1 GPU(s)
+[dsv4]   compute device 0: backend=CUDA0, device=CUDA0 (NVIDIA A40)
+[dsv4] auxiliary CPU worker pool: threads=2, persistent=yes
+[dsv4] VRAM reserve: 2048 MiB per device (indexer 0 x1.25 + activations 0 + 2048 headroom)
+[dsv4] routed-expert CPU offload: 0 of 5 layer(s); 5 layer(s) on GPUs
+[dsv4] DSpark drafter on device 0: 3 stage(s), block_size=5, markov_rank=32, target_layers=[1..4], noise_token=250
+[dsv41] Engram lookup: GPU-resident tables, gathered in-graph (no host reads)
+[dsv4] loaded 0.0 GiB across 1 GPU(s) in 0.0s (2.06 GiB/s, 16 load threads; n_ctx=1024, ring=256, csa_rows=768, hca_rows=1280)
+[dsv4]   device 0: layers 0..4 (5), 44.1 GiB free after load
+[dsv4] fused ops: on
+[dsv4] hyper-connection ops: native
+[dsv4] flash attention: on
+[dsv4] V4.1 CUDA precision: TensorSharp F32 matmul; attention=TensorSharp F32 (streaming decode, tiled prefill)
+layer 0: 0.01s, hidden RMS=1.133843
+layer 1: 0.01s, hidden RMS=1.578293
+layer 2: 0.01s, hidden RMS=1.772224
+layer 3: 0.01s, hidden RMS=2.014633
+layer 4: 0.01s, hidden RMS=2.369257
+layer 0: 0.01s, hidden RMS=1.119719
+layer 1: 0.01s, hidden RMS=1.625242
+layer 2: 0.01s, hidden RMS=1.996298
+layer 3: 0.01s, hidden RMS=2.184911
+layer 4: 0.01s, hidden RMS=2.511904
+layer 0: 0.01s, hidden RMS=1.10172
+layer 1: 0.01s, hidden RMS=1.578429
+layer 2: 0.01s, hidden RMS=1.834715
+layer 3: 0.01s, hidden RMS=2.080236
+layer 4: 0.01s, hidden RMS=2.370464
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+layer 0: 0.01s, hidden RMS=1.056103
+layer 1: 0.01s, hidden RMS=1.425109
+layer 2: 0.01s, hidden RMS=1.751566
+layer 3: 0.01s, hidden RMS=1.990914
+layer 4: 0.01s, hidden RMS=2.242439
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+layer 0: 0.01s, hidden RMS=1.096707
+layer 1: 0.01s, hidden RMS=1.568003
+layer 2: 0.01s, hidden RMS=1.838178
+layer 3: 0.01s, hidden RMS=2.075147
+layer 4: 0.01s, hidden RMS=2.364798
+layer 0: 0.01s, hidden RMS=1.12326
+layer 1: 0.02s, hidden RMS=1.496527
+layer 2: 0.01s, hidden RMS=1.817624
+layer 3: 0.02s, hidden RMS=2.07086
+layer 4: 0.01s, hidden RMS=2.245164
+layer 0: 0.01s, hidden RMS=1.072542
+layer 1: 0.02s, hidden RMS=1.563514
+layer 2: 0.01s, hidden RMS=1.840737
+layer 3: 0.01s, hidden RMS=2.07877
+layer 4: 0.01s, hidden RMS=2.335891
+layer 0: 0.01s, hidden RMS=1.092941
+layer 1: 0.01s, hidden RMS=1.457869
+layer 2: 0.01s, hidden RMS=1.810156
+layer 3: 0.01s, hidden RMS=2.078396
+layer 4: 0.01s, hidden RMS=2.286591
+layer 0: 0.01s, hidden RMS=1.101187
+layer 1: 0.01s, hidden RMS=1.552704
+layer 2: 0.01s, hidden RMS=1.855896
+layer 3: 0.01s, hidden RMS=2.086213
+layer 4: 0.01s, hidden RMS=2.33794
+layer 0: 0.01s, hidden RMS=1.121458
+layer 1: 0.01s, hidden RMS=1.472917
+layer 2: 0.01s, hidden RMS=1.87111
+layer 3: 0.01s, hidden RMS=2.132516
+layer 4: 0.01s, hidden RMS=2.413454
+layer 0: 0.01s, hidden RMS=1.101408
+layer 1: 0.01s, hidden RMS=1.552643
+layer 2: 0.01s, hidden RMS=1.881564
+layer 3: 0.01s, hidden RMS=2.100221
+layer 4: 0.01s, hidden RMS=2.332191
+layer 0: 0.01s, hidden RMS=1.049985
+layer 1: 0.01s, hidden RMS=1.432825
+layer 2: 0.01s, hidden RMS=1.764822
+layer 3: 0.01s, hidden RMS=2.002341
+layer 4: 0.01s, hidden RMS=2.258998
+layer 0: 0.01s, hidden RMS=1.083577
+layer 1: 0.01s, hidden RMS=1.524139
+layer 2: 0.01s, hidden RMS=1.83916
+layer 3: 0.01s, hidden RMS=2.069185
+layer 4: 0.01s, hidden RMS=2.298739
+layer 0: 0.01s, hidden RMS=1.081928
+layer 1: 0.01s, hidden RMS=1.497583
+layer 2: 0.01s, hidden RMS=1.880227
+layer 3: 0.01s, hidden RMS=2.1114
+layer 4: 0.01s, hidden RMS=2.376554
+layer 0: 0.01s, hidden RMS=1.086659
+layer 1: 0.01s, hidden RMS=1.511697
+layer 2: 0.01s, hidden RMS=1.826424
+layer 3: 0.01s, hidden RMS=2.057924
+layer 4: 0.01s, hidden RMS=2.287014
+layer 0: 0.01s, hidden RMS=0.9393596
+layer 1: 0.01s, hidden RMS=1.441111
+layer 2: 0.01s, hidden RMS=1.806965
+layer 3: 0.01s, hidden RMS=2.105732
+layer 4: 0.01s, hidden RMS=2.316114
+layer 0: 0.01s, hidden RMS=1.08307
+layer 1: 0.01s, hidden RMS=1.515416
+layer 2: 0.01s, hidden RMS=1.831977
+layer 3: 0.01s, hidden RMS=2.067843
+layer 4: 0.01s, hidden RMS=2.281867
+layer 0: 0.01s, hidden RMS=0.9699965
+layer 1: 0.01s, hidden RMS=1.397073
+layer 2: 0.01s, hidden RMS=1.771859
+layer 3: 0.01s, hidden RMS=2.000837
+layer 4: 0.01s, hidden RMS=2.260038
+layer 0: 0.01s, hidden RMS=1.082489
+layer 1: 0.01s, hidden RMS=1.497848
+layer 2: 0.01s, hidden RMS=1.818034
+layer 3: 0.01s, hidden RMS=2.050725
+layer 4: 0.01s, hidden RMS=2.272575
+layer 0: 0.01s, hidden RMS=1.100529
+layer 1: 0.01s, hidden RMS=1.507764
+layer 2: 0.01s, hidden RMS=1.817204
+layer 3: 0.01s, hidden RMS=2.0603
+layer 4: 0.01s, hidden RMS=2.357341
+layer 0: 0.01s, hidden RMS=1.071557
+layer 1: 0.01s, hidden RMS=1.486143
+layer 2: 0.01s, hidden RMS=1.803135
+layer 3: 0.01s, hidden RMS=2.030168
+layer 4: 0.01s, hidden RMS=2.261781
+layer 0: 0.01s, hidden RMS=1.061746
+layer 1: 0.01s, hidden RMS=1.456651
+layer 2: 0.01s, hidden RMS=1.783187
+layer 3: 0.01s, hidden RMS=1.971272
+layer 4: 0.01s, hidden RMS=2.30788
+layer 0: 0.01s, hidden RMS=1.081833
+layer 1: 0.02s, hidden RMS=1.493653
+layer 2: 0.01s, hidden RMS=1.820104
+layer 3: 0.01s, hidden RMS=2.046105
+layer 4: 0.01s, hidden RMS=2.283011
+layer 0: 0.01s, hidden RMS=1.053408
+layer 1: 0.01s, hidden RMS=1.485894
+layer 2: 0.01s, hidden RMS=1.784948
+layer 3: 0.01s, hidden RMS=2.069893
+layer 4: 0.01s, hidden RMS=2.275914
+layer 0: 0.01s, hidden RMS=1.073571
+layer 1: 0.02s, hidden RMS=1.496082
+layer 2: 0.01s, hidden RMS=1.824569
+layer 3: 0.01s, hidden RMS=2.05051
+layer 4: 0.01s, hidden RMS=2.289765
+layer 0: 0.01s, hidden RMS=1.035367
+layer 1: 0.01s, hidden RMS=1.456741
+layer 2: 0.01s, hidden RMS=1.794066
+layer 3: 0.01s, hidden RMS=1.977879
+layer 4: 0.01s, hidden RMS=2.185896
+layer 0: 0.01s, hidden RMS=1.07109
+layer 1: 0.01s, hidden RMS=1.48159
+layer 2: 0.01s, hidden RMS=1.811853
+layer 3: 0.01s, hidden RMS=2.034724
+layer 4: 0.01s, hidden RMS=2.276737
+layer 0: 0.01s, hidden RMS=1.08859
+layer 1: 0.01s, hidden RMS=1.564646
+layer 2: 0.01s, hidden RMS=1.965449
+layer 3: 0.01s, hidden RMS=2.175136
+layer 4: 0.01s, hidden RMS=2.373159
+layer 0: 0.01s, hidden RMS=1.069773
+layer 1: 0.01s, hidden RMS=1.477458
+layer 2: 0.01s, hidden RMS=1.809802
+layer 3: 0.01s, hidden RMS=2.036476
+layer 4: 0.01s, hidden RMS=2.281724
+layer 0: 0.01s, hidden RMS=1.039405
+layer 1: 0.01s, hidden RMS=1.434164
+layer 2: 0.01s, hidden RMS=1.809554
+layer 3: 0.01s, hidden RMS=2.041408
+layer 4: 0.01s, hidden RMS=2.249734
+layer 0: 0.01s, hidden RMS=1.068742
+layer 1: 0.01s, hidden RMS=1.476598
+layer 2: 0.01s, hidden RMS=1.803221
+layer 3: 0.01s, hidden RMS=2.034067
+layer 4: 0.01s, hidden RMS=2.27609
+layer 0: 0.01s, hidden RMS=1.081108
+layer 1: 0.01s, hidden RMS=1.502626
+layer 2: 0.01s, hidden RMS=1.874824
+layer 3: 0.01s, hidden RMS=2.119832
+layer 4: 0.01s, hidden RMS=2.377736
+layer 0: 0.01s, hidden RMS=1.071394
+layer 1: 0.01s, hidden RMS=1.4748
+layer 2: 0.01s, hidden RMS=1.800508
+layer 3: 0.01s, hidden RMS=2.033466
+layer 4: 0.01s, hidden RMS=2.271426
+layer 0: 0.01s, hidden RMS=1.008693
+layer 1: 0.01s, hidden RMS=1.389579
+layer 2: 0.01s, hidden RMS=1.769133
+layer 3: 0.01s, hidden RMS=2.00322
+layer 4: 0.01s, hidden RMS=2.19985
+{"status": "failed", "release_qualified": false, "finished_at_unix": 1789586656.9503345, "checks": 71, "passed": 70}
+Traceback (most recent call last):
+  File "/workspace/ts-codex-20260916-r3/repo/eng/tests/dsv41-dspark-inference.py", line 357, in <module>
+    main()
+  File "/workspace/ts-codex-20260916-r3/repo/eng/tests/dsv41-dspark-inference.py", line 262, in main
+    raise AssertionError(f"{len(report['failed_checks'])} numerical comparisons failed")
+AssertionError: 1 numerical comparisons failed

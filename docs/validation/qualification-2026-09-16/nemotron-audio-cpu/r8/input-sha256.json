@@ -1,0 +1,7 @@
+{
+  "InferenceWeb.Tests/NemotronAudioEncoderTests.cs": "3ad8d9c62c4682b034138513fec841e4ab545d50888c52907bf23db5bf4a4740",
+  "InferenceWeb.Tests/NemotronAudioInjectorTests.cs": "19128349ed7ebabd4c579b77246ed2b7c0d3f53ebd8a40a2d79488e6499d6984",
+  "InferenceWeb.Tests/NemotronAudioInputTests.cs": "f663c40561a299613e6ad95e9f88d3c558853850f0d165f5566eb5b0e6c9d711",
+  "InferenceWeb.Tests/Fixtures/NemotronAudio/reference.json": "8fc2aa8a8cdeac7ea944c6b2dce668b8c9a12ffe267c68eeae12f4d52effa568",
+  "InferenceWeb.Tests/Fixtures/NemotronAudio/reference128.json": "821b7711868ec976b2738cf69350117899c79b754ac71f54136ec7e201badb9a"
+}

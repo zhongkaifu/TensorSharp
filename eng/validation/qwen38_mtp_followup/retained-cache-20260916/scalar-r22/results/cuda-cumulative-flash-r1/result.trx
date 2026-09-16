@@ -1,0 +1,176 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TestRun id="aea8ee10-9416-42e3-8a17-ca87bdeff0fe" name="@d71188ba1e2e 2026-09-16 19:01:46" xmlns="http://microsoft.com/schemas/VisualStudio/TeamTest/2010">
+  <Times creation="2026-09-16T19:01:46.4541283+00:00" queuing="2026-09-16T19:01:46.4541286+00:00" start="2026-09-16T19:01:41.5502426+00:00" finish="2026-09-16T19:01:46.4813578+00:00" />
+  <TestSettings name="default" id="315d1b2e-33b4-4f41-b5e1-a1e8ceb04bd8">
+    <Deployment runDeploymentRoot="_d71188ba1e2e_2026-09-16_19_01_46" />
+  </TestSettings>
+  <Results>
+    <UnitTestResult executionId="41de6cae-643a-4eef-bfb2-c73dba90558d" testId="a5da0595-b047-134e-f903-9938d380c8de" testName="InferenceWeb.Tests.Qwen4ExpRetainedCacheTests.RepeatedTargetBlocks_MatchScalarTeacherForcingAtEveryCommittedRow" computerName="d71188ba1e2e" duration="00:00:01.8886668" startTime="2026-09-16T19:01:44.2832318+00:00" endTime="2026-09-16T19:01:46.1591105+00:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Failed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="41de6cae-643a-4eef-bfb2-c73dba90558d">
+      <Output>
+        <StdOut>native /workspace/ts-qwen-scalar-columns-r22/tests/bin/Release/net10.0/libGgmlOps.so sha256=5ee5168b8b682c16d0100a24c8f80de56e762c325d4058541c39f78f9036ba7d; backend=GgmlCuda
+native /workspace/ts-qwen-scalar-columns-r22/tests/bin/Release/net10.0/libGgmlOps.so sha256=5ee5168b8b682c16d0100a24c8f80de56e762c325d4058541c39f78f9036ba7d; backend=GgmlCuda
+committed prefix=4 width=1 rows=32 changed=0 argmax_changed=0 max_abs=0
+state=gdn_conv max_abs=0 changed=0/256
+state=gdn_delta max_abs=0 changed=0/2048
+state=ple_conv max_abs=0 changed=0/128
+state=_kCache max_abs=0 changed=0/18432
+state=_vCache max_abs=0 changed=0/18432
+committed prefix=4 width=2 rows=32 changed=10 argmax_changed=0 max_abs=1.430511474609375E-06
+state=gdn_conv max_abs=0 changed=0/256
+state=gdn_delta max_abs=0 changed=0/2048
+state=ple_conv max_abs=0 changed=0/128
+state=_kCache max_abs=7.62939453125E-06 changed=1/18432
+state=_vCache max_abs=0.00048828125 changed=1/18432
+committed prefix=4 width=3 rows=32 changed=14 argmax_changed=0 max_abs=0.00024807453155517578
+state=gdn_conv max_abs=0 changed=0/256
+state=gdn_delta max_abs=0 changed=0/2048
+state=ple_conv max_abs=0 changed=0/128
+state=_kCache max_abs=7.62939453125E-06 changed=3/18432
+state=_vCache max_abs=0.00048828125 changed=3/18432
+committed prefix=4 width=4 rows=32 changed=5 argmax_changed=0 max_abs=1.430511474609375E-06
+state=gdn_conv max_abs=0 changed=0/256
+state=gdn_delta max_abs=0 changed=0/2048
+state=ple_conv max_abs=0 changed=0/128
+state=_kCache max_abs=7.62939453125E-06 changed=1/18432
+state=_vCache max_abs=0.00048828125 changed=1/18432
+committed prefix=16 width=1 rows=32 changed=0 argmax_changed=0 max_abs=0
+state=gdn_conv max_abs=0 changed=0/256
+state=gdn_delta max_abs=0 changed=0/2048
+state=ple_conv max_abs=0 changed=0/128
+state=_kCache max_abs=0 changed=0/24576
+state=_vCache max_abs=0 changed=0/24576
+committed prefix=16 width=2 rows=32 changed=23 argmax_changed=0 max_abs=0.0033991336822509766
+state=gdn_conv max_abs=0 changed=0/256
+state=gdn_delta max_abs=0 changed=0/2048
+state=ple_conv max_abs=0 changed=0/128
+state=_kCache max_abs=0 changed=0/24576
+state=_vCache max_abs=0.00048828125 changed=4/24576
+committed prefix=16 width=3 rows=32 changed=11 argmax_changed=0 max_abs=4.0113925933837891E-05
+state=gdn_conv max_abs=0 changed=0/256
+state=gdn_delta max_abs=0 changed=0/2048
+state=ple_conv max_abs=0 changed=0/128
+state=_kCache max_abs=1.1920928955078125E-07 changed=1/24576
+state=_vCache max_abs=0 changed=0/24576
+committed prefix=16 width=4 rows=32 changed=17 argmax_changed=0 max_abs=0.0033991336822509766
+state=gdn_conv max_abs=0 changed=0/256
+state=gdn_delta max_abs=0 changed=0/2048
+state=ple_conv max_abs=0 changed=0/128
+state=_kCache max_abs=0 changed=0/24576
+state=_vCache max_abs=0.00048828125 changed=1/24576</StdOut>
+        <ErrorInfo>
+          <Message>prefix=4 width=2 changed_rows=10 max_abs=1.430511474609375E-06; prefix=4 width=3 changed_rows=14 max_abs=0.00024807453155517578; prefix=4 width=4 changed_rows=5 max_abs=1.430511474609375E-06; prefix=16 width=2 changed_rows=23 max_abs=0.0033991336822509766; prefix=16 width=3 changed_rows=11 max_abs=4.0113925933837891E-05; prefix=16 width=4 changed_rows=17 max_abs=0.0033991336822509766</Message>
+          <StackTrace>   at InferenceWeb.Tests.Qwen4ExpRetainedCacheTests.RepeatedTargetBlocks_MatchScalarTeacherForcingAtEveryCommittedRow() in /workspace/ts-qwen-committed-r20/tests/Qwen4ExpRetainedCacheTests.cs:line 536
+   at System.Reflection.MethodBaseInvoker.InterpretedInvoke_Method(Object obj, IntPtr* args)
+   at System.Reflection.MethodBaseInvoker.InvokeWithNoArgs(Object obj, BindingFlags invokeAttr)</StackTrace>
+        </ErrorInfo>
+      </Output>
+    </UnitTestResult>
+  </Results>
+  <TestDefinitions>
+    <UnitTest name="InferenceWeb.Tests.Qwen4ExpRetainedCacheTests.RepeatedTargetBlocks_MatchScalarTeacherForcingAtEveryCommittedRow" storage="/workspace/ts-qwen-scalar-columns-r22/tests/bin/release/net10.0/inferenceweb.tests.dll" id="a5da0595-b047-134e-f903-9938d380c8de">
+      <Execution id="41de6cae-643a-4eef-bfb2-c73dba90558d" />
+      <TestMethod codeBase="/workspace/ts-qwen-scalar-columns-r22/tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Qwen4ExpRetainedCacheTests" name="RepeatedTargetBlocks_MatchScalarTeacherForcingAtEveryCommittedRow" />
+    </UnitTest>
+  </TestDefinitions>
+  <TestEntries>
+    <TestEntry testId="a5da0595-b047-134e-f903-9938d380c8de" executionId="41de6cae-643a-4eef-bfb2-c73dba90558d" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+  </TestEntries>
+  <TestLists>
+    <TestList name="Results Not in a List" id="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestList name="All Loaded Results" id="19431567-8539-422a-85d7-44ee4e166bda" />
+  </TestLists>
+  <ResultSummary outcome="Failed">
+    <Counters total="1" executed="1" passed="0" failed="1" error="0" timeout="0" aborted="0" inconclusive="0" passedButRunAborted="0" notRunnable="0" notExecuted="0" disconnected="0" warning="0" completed="0" inProgress="0" pending="0" />
+    <Output>
+      <StdOut>[xUnit.net 00:00:00.00] xUnit.net VSTest Adapter v3.1.4+50e68bbb8b (64-bit .NET 10.0.12)
+[xUnit.net 00:00:00.42]   Discovering: InferenceWeb.Tests
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 45498 MiB):
+  Device 0: NVIDIA A40, compute capability 8.6, VMM: yes, VRAM: 45498 MiB
+[xUnit.net 00:00:01.55]   Discovered:  InferenceWeb.Tests
+[xUnit.net 00:00:01.59]   Starting:    InferenceWeb.Tests
+Backend: GgmlCuda
+Model: qwen4exp, Layers=2, Hidden=8, Heads=4, KVHeads=2, HeadDim=256, Vocab=260
+  hyper-connections: count=4 lowRank=3 (residual is 32 wide)
+  experts=4 used=2 ff=6 sharedFf=5
+  GDN layers=1/2, QSA indexer heads=1 dim=256 topK=8
+  PLE: layers=[0] ngram=2 heads=1 headDim=8
+Loading model weights... done (57 F32 tensors, 24 quantized tensors)
+  Quantized: 0 MB (0 MB file-backed), F32: 0 MB
+Context length: using GGUF metadata qwen4exp.context_length=1024.
+  Qwen4Exp shared MTP ready: block=2, features=32, draftCompression=0, privateKV=F16, device=0, mappedBytes=139296.
+Backend: GgmlCuda
+Model: qwen4exp, Layers=2, Hidden=8, Heads=4, KVHeads=2, HeadDim=256, Vocab=260
+  hyper-connections: count=4 lowRank=3 (residual is 32 wide)
+  experts=4 used=2 ff=6 sharedFf=5
+  GDN layers=1/2, QSA indexer heads=1 dim=256 topK=8
+  PLE: layers=[0] ngram=2 heads=1 headDim=8
+Loading model weights... done (57 F32 tensors, 24 quantized tensors)
+  Quantized: 0 MB (0 MB file-backed), F32: 0 MB
+Context length: using GGUF metadata qwen4exp.context_length=1024.
+  Qwen4Exp shared MTP ready: block=2, features=32, draftCompression=0, privateKV=F16, device=0, mappedBytes=139296.
+[xUnit.net 00:00:03.54]       prefix=4 width=2 changed_rows=10 max_abs=1.430511474609375E-06; prefix=4 width=3 changed_rows=14 max_abs=0.00024807453155517578; prefix=4 width=4 changed_rows=5 max_abs=1.430511474609375E-06; prefix=16 width=2 changed_rows=23 max_abs=0.0033991336822509766; prefix=16 width=3 changed_rows=11 max_abs=4.0113925933837891E-05; prefix=16 width=4 changed_rows=17 max_abs=0.0033991336822509766
+[xUnit.net 00:00:03.54]       Stack Trace:
+[xUnit.net 00:00:03.54]         /workspace/ts-qwen-committed-r20/tests/Qwen4ExpRetainedCacheTests.cs(536,0): at InferenceWeb.Tests.Qwen4ExpRetainedCacheTests.RepeatedTargetBlocks_MatchScalarTeacherForcingAtEveryCommittedRow()
+[xUnit.net 00:00:03.54]            at System.Reflection.MethodBaseInvoker.InterpretedInvoke_Method(Object obj, IntPtr* args)
+[xUnit.net 00:00:03.54]            at System.Reflection.MethodBaseInvoker.InvokeWithNoArgs(Object obj, BindingFlags invokeAttr)
+[xUnit.net 00:00:03.55]       Output:
+[xUnit.net 00:00:03.55]         native /workspace/ts-qwen-scalar-columns-r22/tests/bin/Release/net10.0/libGgmlOps.so sha256=5ee5168b8b682c16d0100a24c8f80de56e762c325d4058541c39f78f9036ba7d; backend=GgmlCuda
+[xUnit.net 00:00:03.55]         native /workspace/ts-qwen-scalar-columns-r22/tests/bin/Release/net10.0/libGgmlOps.so sha256=5ee5168b8b682c16d0100a24c8f80de56e762c325d4058541c39f78f9036ba7d; backend=GgmlCuda
+[xUnit.net 00:00:03.55]         committed prefix=4 width=1 rows=32 changed=0 argmax_changed=0 max_abs=0
+[xUnit.net 00:00:03.55]         state=gdn_conv max_abs=0 changed=0/256
+[xUnit.net 00:00:03.55]         state=gdn_delta max_abs=0 changed=0/2048
+[xUnit.net 00:00:03.55]         state=ple_conv max_abs=0 changed=0/128
+[xUnit.net 00:00:03.55]         state=_kCache max_abs=0 changed=0/18432
+[xUnit.net 00:00:03.55]         state=_vCache max_abs=0 changed=0/18432
+[xUnit.net 00:00:03.55]         committed prefix=4 width=2 rows=32 changed=10 argmax_changed=0 max_abs=1.430511474609375E-06
+[xUnit.net 00:00:03.55]         state=gdn_conv max_abs=0 changed=0/256
+[xUnit.net 00:00:03.55]         state=gdn_delta max_abs=0 changed=0/2048
+[xUnit.net 00:00:03.55]         state=ple_conv max_abs=0 changed=0/128
+[xUnit.net 00:00:03.55]         state=_kCache max_abs=7.62939453125E-06 changed=1/18432
+[xUnit.net 00:00:03.55]         state=_vCache max_abs=0.00048828125 changed=1/18432
+[xUnit.net 00:00:03.55]         committed prefix=4 width=3 rows=32 changed=14 argmax_changed=0 max_abs=0.00024807453155517578
+[xUnit.net 00:00:03.55]         state=gdn_conv max_abs=0 changed=0/256
+[xUnit.net 00:00:03.55]         state=gdn_delta max_abs=0 changed=0/2048
+[xUnit.net 00:00:03.55]         state=ple_conv max_abs=0 changed=0/128
+[xUnit.net 00:00:03.55]         state=_kCache max_abs=7.62939453125E-06 changed=3/18432
+[xUnit.net 00:00:03.55]         state=_vCache max_abs=0.00048828125 changed=3/18432
+[xUnit.net 00:00:03.55]         committed prefix=4 width=4 rows=32 changed=5 argmax_changed=0 max_abs=1.430511474609375E-06
+[xUnit.net 00:00:03.55]         state=gdn_conv max_abs=0 changed=0/256
+[xUnit.net 00:00:03.55]         state=gdn_delta max_abs=0 changed=0/2048
+[xUnit.net 00:00:03.55]         state=ple_conv max_abs=0 changed=0/128
+[xUnit.net 00:00:03.55]         state=_kCache max_abs=7.62939453125E-06 changed=1/18432
+[xUnit.net 00:00:03.55]         state=_vCache max_abs=0.00048828125 changed=1/18432
+[xUnit.net 00:00:03.55]         committed prefix=16 width=1 rows=32 changed=0 argmax_changed=0 max_abs=0
+[xUnit.net 00:00:03.55]         state=gdn_conv max_abs=0 changed=0/256
+[xUnit.net 00:00:03.55]         state=gdn_delta max_abs=0 changed=0/2048
+[xUnit.net 00:00:03.55]         state=ple_conv max_abs=0 changed=0/128
+[xUnit.net 00:00:03.55]         state=_kCache max_abs=0 changed=0/24576
+[xUnit.net 00:00:03.55]         state=_vCache max_abs=0 changed=0/24576
+[xUnit.net 00:00:03.55]         committed prefix=16 width=2 rows=32 changed=23 argmax_changed=0 max_abs=0.0033991336822509766
+[xUnit.net 00:00:03.55]         state=gdn_conv max_abs=0 changed=0/256
+[xUnit.net 00:00:03.55]         state=gdn_delta max_abs=0 changed=0/2048
+[xUnit.net 00:00:03.55]         state=ple_conv max_abs=0 changed=0/128
+[xUnit.net 00:00:03.55]         state=_kCache max_abs=0 changed=0/24576
+[xUnit.net 00:00:03.55]         state=_vCache max_abs=0.00048828125 changed=4/24576
+[xUnit.net 00:00:03.55]         committed prefix=16 width=3 rows=32 changed=11 argmax_changed=0 max_abs=4.0113925933837891E-05
+[xUnit.net 00:00:03.55]         state=gdn_conv max_abs=0 changed=0/256
+[xUnit.net 00:00:03.55]         state=gdn_delta max_abs=0 changed=0/2048
+[xUnit.net 00:00:03.55]         state=ple_conv max_abs=0 changed=0/128
+[xUnit.net 00:00:03.55]         state=_kCache max_abs=1.1920928955078125E-07 changed=1/24576
+[xUnit.net 00:00:03.55]         state=_vCache max_abs=0 changed=0/24576
+[xUnit.net 00:00:03.55]         committed prefix=16 width=4 rows=32 changed=17 argmax_changed=0 max_abs=0.0033991336822509766
+[xUnit.net 00:00:03.55]         state=gdn_conv max_abs=0 changed=0/256
+[xUnit.net 00:00:03.55]         state=gdn_delta max_abs=0 changed=0/2048
+[xUnit.net 00:00:03.55]         state=ple_conv max_abs=0 changed=0/128
+[xUnit.net 00:00:03.55]         state=_kCache max_abs=0 changed=0/24576
+[xUnit.net 00:00:03.55]         state=_vCache max_abs=0.00048828125 changed=1/24576
+[xUnit.net 00:00:03.59]   Finished:    InferenceWeb.Tests
+</StdOut>
+    </Output>
+    <RunInfos>
+      <RunInfo computerName="d71188ba1e2e" outcome="Error" timestamp="2026-09-16T19:01:46.1691893+00:00">
+        <Text>[xUnit.net 00:00:03.54]     InferenceWeb.Tests.Qwen4ExpRetainedCacheTests.RepeatedTargetBlocks_MatchScalarTeacherForcingAtEveryCommittedRow [FAIL]</Text>
+      </RunInfo>
+    </RunInfos>
+  </ResultSummary>
+</TestRun>

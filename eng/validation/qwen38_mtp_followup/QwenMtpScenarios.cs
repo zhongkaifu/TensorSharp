@@ -26,8 +26,7 @@ internal sealed partial class Bench
         string tier = Environment.GetEnvironmentVariable("QWEN_MTP_TIER");
         if (mode is not ("plain" or "mtp") || tier is not ("dense" or "long-qsa-unqualified"))
             throw new InvalidOperationException("Explicit mode plain|mtp and tier dense|long-qsa-unqualified required");
-        if (model.Config.Architecture != "qwen4exp" || model is not IDraftHead { HasDraftHead: true } head
-            || !head.DraftHeadKind.ToString().Equals("mtp", StringComparison.OrdinalIgnoreCase))
+        if (model is not Qwen4ExpModel { HasDraftHead: true, DraftHeadKind: DraftHeadKind.PerToken } head)
             throw new InvalidOperationException("The real shared learned MTP head must attach in BOTH modes; fallback is a failure");
         if (options.Warmup != 0 || options.MeasurePasses != 1 || options.Out == null || options.Scenarios.Count != 1)
             throw new InvalidOperationException("Owner schedules separate warmed process pairs; use --warmup 0 --measure-passes 1 --scenarios qwen-mtp --out");
@@ -61,7 +60,8 @@ internal sealed partial class Bench
         RecordInput(id, prompt, maxNew, media);
         var row = await RunAsync(engine, "qwen-mtp", id, prompt, maxNew, config ?? SamplingConfig.Greedy,
             expectBatched: true, sharedPrefix: shared, requestId: id);
-        if (row.Tokens.Count == 0 || row.Finish is not ("eos" or "length"))
+        if (row.Tokens.Count == 0 || row.Finish is not ("eos" or "max_tokens")
+            || (row.Finish == "max_tokens" && row.Tokens.Count != maxNew))
         { Failures++; Note(row, "FAIL: missing visible tokens or incomplete/error finish"); }
         return row;
     }
@@ -156,7 +156,8 @@ internal sealed partial class Bench
             { Tokens = r.Tokens, TokenTimesMs = r.TokenTimesMs, StartedUnixMilliseconds = r.StartedUnixMilliseconds,
                 RequestTimelines = new() { ToTimeline(r) }, ConcurrentDecode = aggregate };
             Add(row);
-            if (r.Error != null || r.Tokens.Count == 0 || r.Finish is not ("eos" or "length")) Failures++;
+            if (r.Error != null || r.Tokens.Count == 0 || r.Finish is not ("eos" or "max_tokens")
+                || (r.Finish == "max_tokens" && r.Tokens.Count != 192)) Failures++;
         }
         await MtpRequest(engine, "after-parallel4", Render(Corpus.MinimalSystemPrompt, "Explain a linked list in two sentences."), 96);
     }

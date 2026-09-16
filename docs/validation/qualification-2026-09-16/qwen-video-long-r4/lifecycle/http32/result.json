@@ -1,0 +1,765 @@
+{
+  "status": "passed",
+  "release_qualified": false,
+  "passed": 32,
+  "total": 32,
+  "cases": [
+    {
+      "id": "required-absent-blocking",
+      "status": "passed",
+      "started_unix": 1789583041.661471,
+      "body_sha256": "a9dfcab3b4e480e13d93a74cd10675993483cd9a6101176642e4e6cec8e1b7a4",
+      "http_status": 400,
+      "content_type": "application/json; charset=utf-8",
+      "response_sha256": "13e06d4ddf957533d2d8fa2d5417d61922852ea7f2e8768ce2414187e50e8c61",
+      "parsed": {
+        "api_rejected_before_stream": true,
+        "zero_native_inference_proven": false,
+        "qualification": "HTTP proves rejection/no emitted completion; independent adapter unit tests prove zero queue admissions"
+      },
+      "wall_seconds": 0.18989253044128418
+    },
+    {
+      "id": "required-absent-stream",
+      "status": "passed",
+      "started_unix": 1789583041.8610933,
+      "body_sha256": "2f863be2dbfc09012d95541b9bf8d24e233470766ccc623e9af575f51c370b46",
+      "http_status": 400,
+      "content_type": "application/json; charset=utf-8",
+      "response_sha256": "13e06d4ddf957533d2d8fa2d5417d61922852ea7f2e8768ce2414187e50e8c61",
+      "parsed": {
+        "api_rejected_before_stream": true,
+        "zero_native_inference_proven": false,
+        "qualification": "HTTP proves rejection/no emitted completion; independent adapter unit tests prove zero queue admissions"
+      },
+      "wall_seconds": 0.010226249694824219
+    },
+    {
+      "id": "required-empty-blocking",
+      "status": "passed",
+      "started_unix": 1789583041.8855505,
+      "body_sha256": "04c5dd5fe3eadde8356e94ba8b8b8d0556d0957fadf695c5483a4f75d892998a",
+      "http_status": 400,
+      "content_type": "application/json; charset=utf-8",
+      "response_sha256": "13e06d4ddf957533d2d8fa2d5417d61922852ea7f2e8768ce2414187e50e8c61",
+      "parsed": {
+        "api_rejected_before_stream": true,
+        "zero_native_inference_proven": false,
+        "qualification": "HTTP proves rejection/no emitted completion; independent adapter unit tests prove zero queue admissions"
+      },
+      "wall_seconds": 0.011501073837280273
+    },
+    {
+      "id": "required-empty-stream",
+      "status": "passed",
+      "started_unix": 1789583041.9216628,
+      "body_sha256": "261fa0d2f8dce5e19565dff753b3b5a087a9099ea7d963e3ba1a1b0638058af3",
+      "http_status": 400,
+      "content_type": "application/json; charset=utf-8",
+      "response_sha256": "13e06d4ddf957533d2d8fa2d5417d61922852ea7f2e8768ce2414187e50e8c61",
+      "parsed": {
+        "api_rejected_before_stream": true,
+        "zero_native_inference_proven": false,
+        "qualification": "HTTP proves rejection/no emitted completion; independent adapter unit tests prove zero queue admissions"
+      },
+      "wall_seconds": 0.009502649307250977
+    },
+    {
+      "id": "named-absent-blocking",
+      "status": "passed",
+      "started_unix": 1789583041.9460945,
+      "body_sha256": "c65820957c46e58dde7713a52fbf4cb5212e40d11919ce9946ea3e59dbb76a59",
+      "http_status": 400,
+      "content_type": "application/json; charset=utf-8",
+      "response_sha256": "13e06d4ddf957533d2d8fa2d5417d61922852ea7f2e8768ce2414187e50e8c61",
+      "parsed": {
+        "api_rejected_before_stream": true,
+        "zero_native_inference_proven": false,
+        "qualification": "HTTP proves rejection/no emitted completion; independent adapter unit tests prove zero queue admissions"
+      },
+      "wall_seconds": 0.008782625198364258
+    },
+    {
+      "id": "named-absent-stream",
+      "status": "passed",
+      "started_unix": 1789583041.96951,
+      "body_sha256": "a5c028e13a438ad73dbd9dd175fcfbeafbdbae870d874ada29dfecb11c1f2fb1",
+      "http_status": 400,
+      "content_type": "application/json; charset=utf-8",
+      "response_sha256": "13e06d4ddf957533d2d8fa2d5417d61922852ea7f2e8768ce2414187e50e8c61",
+      "parsed": {
+        "api_rejected_before_stream": true,
+        "zero_native_inference_proven": false,
+        "qualification": "HTTP proves rejection/no emitted completion; independent adapter unit tests prove zero queue admissions"
+      },
+      "wall_seconds": 0.009582996368408203
+    },
+    {
+      "id": "named-empty-blocking",
+      "status": "passed",
+      "started_unix": 1789583041.9883018,
+      "body_sha256": "05ed91e4a4554d5fab0d9652101b5acac7a29c57ce9276992ca0312dd590e3fd",
+      "http_status": 400,
+      "content_type": "application/json; charset=utf-8",
+      "response_sha256": "13e06d4ddf957533d2d8fa2d5417d61922852ea7f2e8768ce2414187e50e8c61",
+      "parsed": {
+        "api_rejected_before_stream": true,
+        "zero_native_inference_proven": false,
+        "qualification": "HTTP proves rejection/no emitted completion; independent adapter unit tests prove zero queue admissions"
+      },
+      "wall_seconds": 0.006841421127319336
+    },
+    {
+      "id": "named-empty-stream",
+      "status": "passed",
+      "started_unix": 1789583042.0150592,
+      "body_sha256": "b8192684400817444b985116e88991f16f4cdfb71a0f919625fe70772f399322",
+      "http_status": 400,
+      "content_type": "application/json; charset=utf-8",
+      "response_sha256": "13e06d4ddf957533d2d8fa2d5417d61922852ea7f2e8768ce2414187e50e8c61",
+      "parsed": {
+        "api_rejected_before_stream": true,
+        "zero_native_inference_proven": false,
+        "qualification": "HTTP proves rejection/no emitted completion; independent adapter unit tests prove zero queue admissions"
+      },
+      "wall_seconds": 0.00892019271850586
+    },
+    {
+      "id": "named-undeclared-blocking",
+      "status": "passed",
+      "started_unix": 1789583042.0367036,
+      "body_sha256": "1b44b77ae90479201df9b01c94abc048c80e7e720de86e27f565b80c38ef5651",
+      "http_status": 400,
+      "content_type": "application/json; charset=utf-8",
+      "response_sha256": "fdcd10d2773d8b0278e0a016b85747d5be4314973bb62f59b7d4a8eeceb8f20a",
+      "parsed": {
+        "api_rejected_before_stream": true,
+        "zero_native_inference_proven": false,
+        "qualification": "HTTP proves rejection/no emitted completion; independent adapter unit tests prove zero queue admissions"
+      },
+      "wall_seconds": 0.014528989791870117
+    },
+    {
+      "id": "named-undeclared-stream",
+      "status": "passed",
+      "started_unix": 1789583042.0635238,
+      "body_sha256": "788080de6b3a2eab7462e048b6fee4260addb463aecb3c5bedabe4d75b40a8f3",
+      "http_status": 400,
+      "content_type": "application/json; charset=utf-8",
+      "response_sha256": "fdcd10d2773d8b0278e0a016b85747d5be4314973bb62f59b7d4a8eeceb8f20a",
+      "parsed": {
+        "api_rejected_before_stream": true,
+        "zero_native_inference_proven": false,
+        "qualification": "HTTP proves rejection/no emitted completion; independent adapter unit tests prove zero queue admissions"
+      },
+      "wall_seconds": 0.00737762451171875
+    },
+    {
+      "id": "named-case-mismatch-blocking",
+      "status": "passed",
+      "started_unix": 1789583042.08196,
+      "body_sha256": "583d4292f40405e641f657d1eb769a1b278af2f91e021ae921272b1e06252938",
+      "http_status": 400,
+      "content_type": "application/json; charset=utf-8",
+      "response_sha256": "9210bccd1455e14db1a8103d5f653297ec7689a81a678bc9b47f5187a1c8e6d0",
+      "parsed": {
+        "api_rejected_before_stream": true,
+        "zero_native_inference_proven": false,
+        "qualification": "HTTP proves rejection/no emitted completion; independent adapter unit tests prove zero queue admissions"
+      },
+      "wall_seconds": 0.007368564605712891
+    },
+    {
+      "id": "named-case-mismatch-stream",
+      "status": "passed",
+      "started_unix": 1789583042.1091812,
+      "body_sha256": "d9bf4f1aff65141444fed1e6de46045d4b8fe0470282365ee0405eb7d3b165b6",
+      "http_status": 400,
+      "content_type": "application/json; charset=utf-8",
+      "response_sha256": "9210bccd1455e14db1a8103d5f653297ec7689a81a678bc9b47f5187a1c8e6d0",
+      "parsed": {
+        "api_rejected_before_stream": true,
+        "zero_native_inference_proven": false,
+        "qualification": "HTTP proves rejection/no emitted completion; independent adapter unit tests prove zero queue admissions"
+      },
+      "wall_seconds": 0.009048700332641602
+    },
+    {
+      "id": "required-empty-serial-blocking",
+      "status": "passed",
+      "started_unix": 1789583042.1338549,
+      "body_sha256": "1e7807355c7b4aea19c2b369747b0198d4725549c760c648d1dde84c52bdd222",
+      "http_status": 400,
+      "content_type": "application/json; charset=utf-8",
+      "response_sha256": "13e06d4ddf957533d2d8fa2d5417d61922852ea7f2e8768ce2414187e50e8c61",
+      "parsed": {
+        "api_rejected_before_stream": true,
+        "zero_native_inference_proven": false,
+        "qualification": "HTTP proves rejection/no emitted completion; independent adapter unit tests prove zero queue admissions"
+      },
+      "wall_seconds": 0.0073740482330322266
+    },
+    {
+      "id": "required-empty-serial-stream",
+      "status": "passed",
+      "started_unix": 1789583042.1524334,
+      "body_sha256": "637302495d513be184ed32b1c17daddde4aabbfbb0e3b5bef9496ea0e7520c52",
+      "http_status": 400,
+      "content_type": "application/json; charset=utf-8",
+      "response_sha256": "13e06d4ddf957533d2d8fa2d5417d61922852ea7f2e8768ce2414187e50e8c61",
+      "parsed": {
+        "api_rejected_before_stream": true,
+        "zero_native_inference_proven": false,
+        "qualification": "HTTP proves rejection/no emitted completion; independent adapter unit tests prove zero queue admissions"
+      },
+      "wall_seconds": 0.0068852901458740234
+    },
+    {
+      "id": "named-undeclared-serial-blocking",
+      "status": "passed",
+      "started_unix": 1789583042.1710026,
+      "body_sha256": "e0dd9caf24a36897f72bf306430e356d774918cb348972cb6847802698a05c38",
+      "http_status": 400,
+      "content_type": "application/json; charset=utf-8",
+      "response_sha256": "fdcd10d2773d8b0278e0a016b85747d5be4314973bb62f59b7d4a8eeceb8f20a",
+      "parsed": {
+        "api_rejected_before_stream": true,
+        "zero_native_inference_proven": false,
+        "qualification": "HTTP proves rejection/no emitted completion; independent adapter unit tests prove zero queue admissions"
+      },
+      "wall_seconds": 0.016051769256591797
+    },
+    {
+      "id": "named-undeclared-serial-stream",
+      "status": "passed",
+      "started_unix": 1789583042.2076826,
+      "body_sha256": "c5b640c5f2fb7edaf9d80a58f347e90b48d2de4a6b1a4ba4fa007ac9b025d253",
+      "http_status": 400,
+      "content_type": "application/json; charset=utf-8",
+      "response_sha256": "fdcd10d2773d8b0278e0a016b85747d5be4314973bb62f59b7d4a8eeceb8f20a",
+      "parsed": {
+        "api_rejected_before_stream": true,
+        "zero_native_inference_proven": false,
+        "qualification": "HTTP proves rejection/no emitted completion; independent adapter unit tests prove zero queue admissions"
+      },
+      "wall_seconds": 0.008897066116333008
+    },
+    {
+      "id": "required-offered-blocking",
+      "status": "passed",
+      "started_unix": 1789583042.2312574,
+      "body_sha256": "ef2cf4fccf121496e26ea96ad4231c64c23d8cceb4c510d0d9fdb3f3025571ff",
+      "http_status": 200,
+      "content_type": "",
+      "response_sha256": "7fa7fc9c7d965d68f9e75a01c54e395a834daf24aa108f1cc420c8e476317ec5",
+      "parsed": {
+        "message": {
+          "role": "assistant",
+          "content": "",
+          "tool_calls": [
+            {
+              "id": "call_d8c03470aa0740a1bb4",
+              "type": "function",
+              "function": {
+                "name": "get_weather",
+                "arguments": "{\"city\":\"Paris\"}"
+              }
+            }
+          ]
+        },
+        "finish": "tool_calls",
+        "usage": {
+          "prompt_tokens": 280,
+          "completion_tokens": 26,
+          "total_tokens": 306,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "done": true
+      },
+      "wall_seconds": 1.0850422382354736
+    },
+    {
+      "id": "required-offered-stream",
+      "status": "passed",
+      "started_unix": 1789583043.331149,
+      "body_sha256": "a964d0542e4512ef7531e02e29876f1cc72343fd7fde38eaf609e33d0c9628b0",
+      "http_status": 200,
+      "content_type": "text/event-stream",
+      "response_sha256": "969c9da6e80bb1df35827d29e1d79cd92cd063ca1aee3a005db9d93e2f7510da",
+      "parsed": {
+        "message": {
+          "role": "assistant",
+          "content": "\n\n",
+          "tool_calls": [
+            {
+              "id": "call_f017ad66f6294957b48",
+              "type": "function",
+              "function": {
+                "name": "get_weather",
+                "arguments": "{\"city\":\"Paris\"}"
+              }
+            }
+          ]
+        },
+        "finish": "tool_calls",
+        "usage": {
+          "prompt_tokens": 280,
+          "completion_tokens": 26,
+          "total_tokens": 306,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "done": true
+      },
+      "wall_seconds": 1.0240368843078613
+    },
+    {
+      "id": "named-offered-blocking",
+      "status": "passed",
+      "started_unix": 1789583044.3687677,
+      "body_sha256": "930c0e326707e8ff51df4f714194021083d70ba5c4c38218350a4c9040e6dab5",
+      "http_status": 200,
+      "content_type": "",
+      "response_sha256": "82ac5cbfa954eebe45a1013c02e64f23fe3c3ef3340e17a34daa0e1facb54982",
+      "parsed": {
+        "message": {
+          "role": "assistant",
+          "content": "",
+          "tool_calls": [
+            {
+              "id": "call_2e4a054620524d3d993",
+              "type": "function",
+              "function": {
+                "name": "get_weather",
+                "arguments": "{\"city\":\"Paris\"}"
+              }
+            }
+          ]
+        },
+        "finish": "tool_calls",
+        "usage": {
+          "prompt_tokens": 280,
+          "completion_tokens": 26,
+          "total_tokens": 306,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "done": true
+      },
+      "wall_seconds": 0.9701023101806641
+    },
+    {
+      "id": "named-offered-stream",
+      "status": "passed",
+      "started_unix": 1789583045.3585656,
+      "body_sha256": "0eb3826acc36e17f8945bf715287c8e28d60d18e4b1b613f94f6a080e6d3f365",
+      "http_status": 200,
+      "content_type": "text/event-stream",
+      "response_sha256": "32d61f2b080076868329dee7a8e54e02d9bcfef643117c1b3656f72ba91e021c",
+      "parsed": {
+        "message": {
+          "role": "assistant",
+          "content": "\n\n",
+          "tool_calls": [
+            {
+              "id": "call_c7f26d538dc1475c97a",
+              "type": "function",
+              "function": {
+                "name": "get_weather",
+                "arguments": "{\"city\":\"Paris\"}"
+              }
+            }
+          ]
+        },
+        "finish": "tool_calls",
+        "usage": {
+          "prompt_tokens": 280,
+          "completion_tokens": 26,
+          "total_tokens": 306,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "done": true
+      },
+      "wall_seconds": 0.9346213340759277
+    },
+    {
+      "id": "none-offered-blocking",
+      "status": "passed",
+      "started_unix": 1789583046.3136744,
+      "body_sha256": "db5d36a0dfda73f1fda124072ceddf41cac790da2782559e199dd29e448c5841",
+      "http_status": 200,
+      "content_type": "",
+      "response_sha256": "d8b0dae91314f963dbc00c598e74b9c8f111b9e9ab0ee4abcad008267e7b2488",
+      "parsed": {
+        "message": {
+          "role": "assistant",
+          "content": "\n\napple"
+        },
+        "finish": "stop",
+        "usage": {
+          "prompt_tokens": 25,
+          "completion_tokens": 2,
+          "total_tokens": 27,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "done": true
+      },
+      "wall_seconds": 0.31548047065734863
+    },
+    {
+      "id": "none-offered-stream",
+      "status": "passed",
+      "started_unix": 1789583046.642702,
+      "body_sha256": "f18dcd537bf9bc38cfa11c695714424cb9f9f13917ee5386e74fbd2251c3ecb0",
+      "http_status": 200,
+      "content_type": "text/event-stream",
+      "response_sha256": "17e99c080853d1ac73c1076298b2b83659dd49eb5e872e9c1e33798853e3d315",
+      "parsed": {
+        "message": {
+          "role": "assistant",
+          "content": "\n\napple"
+        },
+        "finish": "stop",
+        "usage": {
+          "prompt_tokens": 25,
+          "completion_tokens": 2,
+          "total_tokens": 27,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "done": true
+      },
+      "wall_seconds": 0.2906773090362549
+    },
+    {
+      "id": "auto-offered-blocking",
+      "status": "passed",
+      "started_unix": 1789583046.9498959,
+      "body_sha256": "d7442f1746d9cbd3ae3a2fb23d85efe118d18345dc3656136988c053fceb14d8",
+      "http_status": 200,
+      "content_type": "",
+      "response_sha256": "a5f5caf6972a423b236f0211333d9e91af9d961b809f0c37eb7826f9fc074879",
+      "parsed": {
+        "message": {
+          "role": "assistant",
+          "content": "",
+          "tool_calls": [
+            {
+              "id": "call_3cfbecf2a90641258b7",
+              "type": "function",
+              "function": {
+                "name": "get_weather",
+                "arguments": "{\"city\":\"Paris\"}"
+              }
+            }
+          ]
+        },
+        "finish": "tool_calls",
+        "usage": {
+          "prompt_tokens": 280,
+          "completion_tokens": 26,
+          "total_tokens": 306,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "done": true
+      },
+      "wall_seconds": 0.921532154083252
+    },
+    {
+      "id": "auto-offered-stream",
+      "status": "passed",
+      "started_unix": 1789583047.8865445,
+      "body_sha256": "290d6da81af67d9cc2f075667dc1764807b9fd0e9d2339dedb8b491d0f3953c2",
+      "http_status": 200,
+      "content_type": "text/event-stream",
+      "response_sha256": "ae189ffe3c63c289cf764809140150f0f6aff645612375ebba150dd90bbd561c",
+      "parsed": {
+        "message": {
+          "role": "assistant",
+          "content": "\n\n",
+          "tool_calls": [
+            {
+              "id": "call_3180920ab8fc4525a7f",
+              "type": "function",
+              "function": {
+                "name": "get_weather",
+                "arguments": "{\"city\":\"Paris\"}"
+              }
+            }
+          ]
+        },
+        "finish": "tool_calls",
+        "usage": {
+          "prompt_tokens": 280,
+          "completion_tokens": 26,
+          "total_tokens": 306,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "done": true
+      },
+      "wall_seconds": 0.8802211284637451
+    },
+    {
+      "id": "choice-absent-offered-blocking",
+      "status": "passed",
+      "started_unix": 1789583048.7793353,
+      "body_sha256": "df769ef6508a14a17ac1c3e3e84e411041b05ad1161902b5e2b1b830799bd8c2",
+      "http_status": 200,
+      "content_type": "",
+      "response_sha256": "ad69bf43aba5224b569c25e97d1453116e0232f66bb0f8ef6796f121d41655d4",
+      "parsed": {
+        "message": {
+          "role": "assistant",
+          "content": "",
+          "tool_calls": [
+            {
+              "id": "call_4ac2c25625fd450b8e9",
+              "type": "function",
+              "function": {
+                "name": "get_weather",
+                "arguments": "{\"city\":\"Paris\"}"
+              }
+            }
+          ]
+        },
+        "finish": "tool_calls",
+        "usage": {
+          "prompt_tokens": 280,
+          "completion_tokens": 26,
+          "total_tokens": 306,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "done": true
+      },
+      "wall_seconds": 0.9336585998535156
+    },
+    {
+      "id": "choice-absent-offered-stream",
+      "status": "passed",
+      "started_unix": 1789583049.726714,
+      "body_sha256": "45ccc0553e951146e6681a42bbba65801ff0f6b665f1b1ea53b101c70ee1d3e3",
+      "http_status": 200,
+      "content_type": "text/event-stream",
+      "response_sha256": "589624b1867293a0e31ee7779ecb6323cbec4bda1702e643f3678e804259bdd1",
+      "parsed": {
+        "message": {
+          "role": "assistant",
+          "content": "\n\n",
+          "tool_calls": [
+            {
+              "id": "call_651c7b005c144f80a8a",
+              "type": "function",
+              "function": {
+                "name": "get_weather",
+                "arguments": "{\"city\":\"Paris\"}"
+              }
+            }
+          ]
+        },
+        "finish": "tool_calls",
+        "usage": {
+          "prompt_tokens": 280,
+          "completion_tokens": 26,
+          "total_tokens": 306,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "done": true
+      },
+      "wall_seconds": 0.9130380153656006
+    },
+    {
+      "id": "none-no-tools-blocking",
+      "status": "passed",
+      "started_unix": 1789583050.6522868,
+      "body_sha256": "09eafc85f04c5d225ba8be62d997276c1196c78846dbec6644ba7c52902c3cdc",
+      "http_status": 200,
+      "content_type": "",
+      "response_sha256": "bd38e7c146c19d8d1e1eab793902e1b61d372d570cba5e9c3587c62615355c06",
+      "parsed": {
+        "message": {
+          "role": "assistant",
+          "content": "\n\napple"
+        },
+        "finish": "stop",
+        "usage": {
+          "prompt_tokens": 25,
+          "completion_tokens": 2,
+          "total_tokens": 27,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "done": true
+      },
+      "wall_seconds": 0.3721811771392822
+    },
+    {
+      "id": "none-no-tools-stream",
+      "status": "passed",
+      "started_unix": 1789583051.039417,
+      "body_sha256": "3ceb456612d4a0c5bdb69305de0fe7db9577e58ecf0f3c928ab6c2ae72f4708f",
+      "http_status": 200,
+      "content_type": "text/event-stream",
+      "response_sha256": "22c4928dc44a770ec56ddbd8a9566d91979c0bc5f7a46639e388657511aede72",
+      "parsed": {
+        "message": {
+          "role": "assistant",
+          "content": "\n\napple"
+        },
+        "finish": "stop",
+        "usage": {
+          "prompt_tokens": 25,
+          "completion_tokens": 2,
+          "total_tokens": 27,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "done": true
+      },
+      "wall_seconds": 0.32921743392944336
+    },
+    {
+      "id": "auto-no-tools-blocking",
+      "status": "passed",
+      "started_unix": 1789583051.38618,
+      "body_sha256": "6815643525669cae19cb965eb76a303890db00e49a1c2d2be41512ed4c1f3748",
+      "http_status": 200,
+      "content_type": "",
+      "response_sha256": "371be155befe4845de29b089488fd2ae00908b2bdacb6961e1264945e8d5bbe9",
+      "parsed": {
+        "message": {
+          "role": "assistant",
+          "content": "\n\napple"
+        },
+        "finish": "stop",
+        "usage": {
+          "prompt_tokens": 25,
+          "completion_tokens": 2,
+          "total_tokens": 27,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "done": true
+      },
+      "wall_seconds": 0.33939433097839355
+    },
+    {
+      "id": "auto-no-tools-stream",
+      "status": "passed",
+      "started_unix": 1789583051.7388709,
+      "body_sha256": "e551a8c088bb324df6884d21644804d5376734390a3e1700da5f578e0320dff0",
+      "http_status": 200,
+      "content_type": "text/event-stream",
+      "response_sha256": "13552f673b1f69290477869da746bcb1cf56ecc84349d0a3244f18d108d930ea",
+      "parsed": {
+        "message": {
+          "role": "assistant",
+          "content": "\n\napple"
+        },
+        "finish": "stop",
+        "usage": {
+          "prompt_tokens": 25,
+          "completion_tokens": 2,
+          "total_tokens": 27,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "done": true
+      },
+      "wall_seconds": 0.3935537338256836
+    },
+    {
+      "id": "required-offered-serial-blocking",
+      "status": "passed",
+      "started_unix": 1789583052.1592984,
+      "body_sha256": "a7f6b9f2ba918181f4b93e072b67840f80159d845c0bd325dea047e3d39c60c6",
+      "http_status": 200,
+      "content_type": "",
+      "response_sha256": "5b3a5bf87bcd59db2fa2b973789ac1e5498e465f71903bb79313ba50e8a6fe6b",
+      "parsed": {
+        "message": {
+          "role": "assistant",
+          "content": "",
+          "tool_calls": [
+            {
+              "id": "call_d3791795c48c469291b",
+              "type": "function",
+              "function": {
+                "name": "get_weather",
+                "arguments": "{\"city\":\"Paris\"}"
+              }
+            }
+          ]
+        },
+        "finish": "tool_calls",
+        "usage": {
+          "prompt_tokens": 280,
+          "completion_tokens": 26,
+          "total_tokens": 306,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "done": true
+      },
+      "wall_seconds": 0.9687585830688477
+    },
+    {
+      "id": "required-offered-serial-stream",
+      "status": "passed",
+      "started_unix": 1789583053.1531868,
+      "body_sha256": "cb34e5d450cea4a841bfccdf86d337ed0d1d5d36396a5040e778df2d09dd7832",
+      "http_status": 200,
+      "content_type": "text/event-stream",
+      "response_sha256": "05955f737bba19edb14e472b20b92cd7733c5ab6073d58406188319def323112",
+      "parsed": {
+        "message": {
+          "role": "assistant",
+          "content": "\n\n",
+          "tool_calls": [
+            {
+              "id": "call_e6a3968e8c9d4a37acc",
+              "type": "function",
+              "function": {
+                "name": "get_weather",
+                "arguments": "{\"city\":\"Paris\"}"
+              }
+            }
+          ]
+        },
+        "finish": "tool_calls",
+        "usage": {
+          "prompt_tokens": 280,
+          "completion_tokens": 26,
+          "total_tokens": 306,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "done": true
+      },
+      "wall_seconds": 0.9609506130218506
+    }
+  ],
+  "scope": "Actual OpenAI parser/tool-choice contract. No tools are executed; sandbox/skills are a separate 46-case campaign."
+}

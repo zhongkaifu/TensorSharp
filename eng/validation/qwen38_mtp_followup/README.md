@@ -27,7 +27,12 @@ equality, exact prompt-token/budget equality, per-request verify engagement,
 accepted proposals, exercised rollback, and actual shared/retained reuse. A
 missing head, fallback, zero engagement, unexercised rollback, missing telemetry,
 failed process, or identity drift fails its gate. No truncated-prefix comparison
-or numerical tolerance is used. The original **5%** latency, throughput, and
+or numerical tolerance is used. The current comparator additionally checks each
+mode's complete measured prompts, budgets, output tokens and finish reasons
+across all three repeats. Two modes drifting together cannot pass this gate,
+and concurrent timelines must carry the matching request ID. Previously frozen
+packages retain their original comparators; this change needs a new package.
+The original **5%** latency, throughput, and
 memory gates remain unchanged; extra MTP memory is not waived. Both variants
 attach the same head. Memory peaks are sampled, with the requested one-second
 resolution recorded separately from allocator-level peak measurements.
@@ -52,17 +57,29 @@ unrun. For the pinned three-frame clip, `fps=1,max_frames=2` samples frame indic
 two static images (frames 0 and 1) with explicit text ordering. Passing that path
 does not establish video support.
 
-The current Qwen4Exp model also does not implement retained cache/checkpoint
+The frozen pre-QSA Qwen4Exp model does not implement retained cache/checkpoint
 cloning and advertises no KV truncation support. The A→B→A fixture deliberately
 records actual reuse and keeps a zero-reuse coverage failure; its shared system
 length alone does not prove a clone. Existing active per-sequence holder tests
 exercise a different lifetime and cannot substitute for this retained path.
+The current working source adds exact retained-holder reuse and checkpoint
+cloning, with independent synthetic CPU and physical two-GPU layer-split proofs.
+Those edits require a new source/application binding and trained-model replay;
+the frozen run's gap and true tensor-parallel limitation remain explicit.
+The [retained-cache review](retained-cache-20260916/README.md) records the
+separate exact CPU source/native identities, two additional fixes and 41 passing
+synthetic checks, including the original failures retained for comparison.
 
 ## Preparation and binding
 
 `prepare.py` extracts only the benchmark C# files from the exact frozen source
-archive, checks every original digest, and makes three explicit consumer changes:
-partial `Bench`, a private scenario entry, and mandatory real-head checks.
+archive, checks every original digest, and makes explicit consumer changes:
+partial `Bench`, a private scenario entry, mandatory real-head checks, and (for
+older benchmark snapshots) passing the draft path to the model constructor.
+That constructor argument is required before multi-device placement. The head
+guard checks the actual Qwen model and `DraftHeadKind.PerToken`. Scheduler rows
+use `max_tokens` for a token-budget finish; those rows must contain the complete
+requested output budget. HTTP's `length` spelling is not used in scheduler rows.
 `QwenMtpScenarios.cs` supplies the new paths. No production project reference or
 native build is triggered by its direct-DLL project.
 

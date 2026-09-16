@@ -3,6 +3,7 @@
 #include "ggml_ops_attention_precision.h"
 #include "ggml_ops_matmul_precision.h"
 #include "ggml_ops_dsv4_fused.h"
+#include "ggml_ops_precision_policy.h"
 #include <algorithm>
 #include <cmath>
 #include <climits>
@@ -200,7 +201,16 @@ static ggml_tensor * attention_impl(ggml_context * ctx, ggml_tensor * q, ggml_te
     if (sinks)
         GGML_ASSERT(sinks->type == GGML_TYPE_F32 && ggml_nelements(sinks) == q->ne[2] && ggml_is_vector(sinks));
     GGML_ASSERT(capacity >= 0 && capacity < INT_MAX && k->ne[1] <= INT_MAX);
-    if (capacity == 0 && q->ne[1] > 4)
+    // Decode-class query counts stay on the split-key online-softmax path
+    // below, whose per-query arithmetic is independent of the other queries
+    // in the launch. The tiled SGEMM path rounds differently, and V4.1
+    // quantizes attention outputs into its caches: a speculative verify
+    // (block_size + 1 queries) must produce for each token exactly what the
+    // single-query decode step would have, or a rewind to the accepted prefix
+    // leaves cache rows that a plain decode would not have written (this
+    // showed up as DSpark confidence diverging after Rewind on CUDA while the
+    // batch-invariant CPU path matched). See the policy header.
+    if (capacity == 0 && q->ne[1] > TSG_PRECISION_DECODE_COLUMNS)
         return tiled_attention(ctx, q, k, v, mask, sinks, scale);
     ggml_tensor * compact = nullptr;
     if (capacity > 0) {
@@ -214,8 +224,11 @@ static ggml_tensor * attention_impl(ggml_context * ctx, ggml_tensor * q, ggml_te
     }
     // Bound scratch independently of context length, with enough split-key
     // parallelism for decode and fewer partitions when queries fill the GPU.
+    // Decode-class query counts always partition the keys the same way: the
+    // partition decides the online-softmax merge order, so it may depend on
+    // the key extent but never on how many queries or heads share the launch.
     const int64_t query_rows = q->ne[1] * q->ne[2] * q->ne[3];
-    const int max_splits = query_rows >= 512 ? 1 : q->ne[1] <= 4 ? 16 : 4;
+    const int max_splits = q->ne[1] <= TSG_PRECISION_DECODE_COLUMNS ? 16 : query_rows >= 512 ? 1 : 4;
     const int64_t extent = capacity > 0 ? std::min<int64_t>(capacity, k->ne[1]) : k->ne[1];
     const int64_t chunk = std::max<int64_t>(128, ((extent + max_splits - 1) / max_splits + 15) / 16 * 16);
     const int64_t splits = (extent + chunk - 1) / chunk;

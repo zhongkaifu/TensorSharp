@@ -1,0 +1,7 @@
+Traceback (most recent call last):
+  File "/workspace/ts-codex-20260916-r4/http-r1/harness/eng/validation/qwen38_mtp_followup/http_extra.py", line 114, in <module>
+    raise SystemExit(main())
+                     ^^^^^^
+  File "/workspace/ts-codex-20260916-r4/http-r1/harness/eng/validation/qwen38_mtp_followup/http_extra.py", line 66, in main
+    raise ValueError('Counted original wire body must stay exact, including model and stream')
+ValueError: Counted original wire body must stay exact, including model and stream

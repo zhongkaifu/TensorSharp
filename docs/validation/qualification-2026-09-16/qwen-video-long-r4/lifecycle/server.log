@@ -1,0 +1,648 @@
+
+  ████████╗███████╗███╗   ██╗███████╗ ██████╗ ██████╗ ███████╗██╗  ██╗ █████╗ ██████╗ ██████╗ 
+  ╚══██╔══╝██╔════╝████╗  ██║██╔════╝██╔═══██╗██╔══██╗██╔════╝██║  ██║██╔══██╗██╔══██╗██╔══██╗
+     ██║   █████╗  ██╔██╗ ██║███████╗██║   ██║██████╔╝███████╗███████║███████║██████╔╝██████╔╝
+     ██║   ██╔══╝  ██║╚██╗██║╚════██║██║   ██║██╔══██╗╚════██║██╔══██║██╔══██║██╔══██╗██╔═══╝ 
+     ██║   ███████╗██║ ╚████║███████║╚██████╔╝██║  ██║███████║██║  ██║██║  ██║██║  ██║██║     
+     ╚═╝   ╚══════╝╚═╝  ╚═══╝╚══════╝ ╚═════╝ ╚═╝  ╚═╝╚══════╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝
+
+                           Open-Source Deep Learning / AI C# Library
+                           https://github.com/zhongkaifu/TensorSharp
+
+info: TensorSharp.Server.Host.Startup[1030]
+      Logging initialized: minimumLevel=Information fileLogging=True logDir=/workspace/ts-codex-20260916-r4/video-timestamps-r1/app/logs
+info: TensorSharp.Server.Host.Startup[1010]
+      Speculative decoding configured via CLI: enabled=True algorithm=auto maxDraft=8 pMin=auto (per algorithm) draftModel=mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf (engages for solo sequences)
+info: TensorSharp.Server.Host.Startup[1010]
+      Tensor parallelism configured via CLI: degree=3 nodeId=(single-node) peers=(none)
+info: TensorSharp.Server.Host.Startup[1010]
+      Agent skills disabled (--no-skills / TS_NO_SKILLS): /v1/skills and /api/skills are not mapped
+info: TensorSharp.Server.Host.Startup[1010]
+      Prefix cache: keeping shared-prefix checkpoints in /workspace/ts-codex-20260916-r4/video-timestamps-r1/app/prefix-cache/Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003-5ddf6be0 (0 bytes already there). Turn it off with --no-prefix-cache; move it with TENSORSHARP_PREFIX_CACHE_DIR.
+info: TensorSharp.Server.ModelService[1400]
+      Loading model Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf (mmproj=mmproj-BF16.gguf, backend=ggml_cuda, fullPath=/workspace/models/qwen38/UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf, mmprojPath=/workspace/models/qwen38/mmproj-BF16.gguf)
+  Multi-GPU: 3 GPUs by LAYER SPLIT (each GPU holds a contiguous run of whole layers), not tensor parallelism - this architecture shards no weights. Same mode llama.cpp uses for it. This raises capacity; it is not expected to raise decode speed.
+ggml_cuda_init: found 3 CUDA devices (Total VRAM: 136494 MiB):
+  Device 0: NVIDIA A40, compute capability 8.6, VMM: yes, VRAM: 45498 MiB
+  Device 1: NVIDIA A40, compute capability 8.6, VMM: yes, VRAM: 45498 MiB
+  Device 2: NVIDIA A40, compute capability 8.6, VMM: yes, VRAM: 45498 MiB
+[GGML] multi-device (layer split): 3 device(s), no collectives
+Backend: GgmlCuda
+Model: qwen4exp, Layers=48, Hidden=2560, Heads=24, KVHeads=2, HeadDim=256, Vocab=248320
+  hyper-connections: count=4 lowRank=320 (residual is 10240 wide)
+  experts=512 used=10 ff=640 sharedFf=640
+  GDN layers=36/48, QSA indexer heads=4 dim=128 topK=2048
+  PLE: layers=[1] ngram=3 heads=16 headDim=160
+  Prefaulted GGUF page cache: 46.5 GiB with 16 read streams in 1.1s (42.33 GiB/s)
+Loading model weights... done (557 F32 tensors, 74251 quantized tensors)
+  Quantized: 74905 MB (74905 MB file-backed), F32: 298 MB
+  Layer split across 3 GPUs: gpu0=16 layers/16201 MB, gpu1=17 layers/16570 MB, gpu2=15 layers/17610 MB
+  Device-resident quantized weights: 3073 MB across 521 tensors
+Context length: using MAX_CONTEXT=65536; model declares qwen4exp.context_length=262144.
+  Qwen4Exp shared MTP ready: block=48, features=10240, draftCompression=0, privateKV=F16, device=2, mappedBytes=2772343808.
+Qwen3.5 Vision encoder: imageSize=768, patchSize=16, hidden=1152, intermediate=4304, heads=16, blocks=27, projDim=2560, mergeSize=2, gridPerSide=48, ropeTheta=10000
+Loading vision encoder weights... done (334 tensors)
+info: TensorSharp.Server.ModelService[0]
+      Loaded draft head mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf (HasDraftHead=True)
+info: TensorSharp.Server.ModelService[1401]
+      Loaded model Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf (architecture=qwen4exp, backend=ggml_cuda, modelBytes=10946624, mmproj=mmproj-BF16.gguf, mmprojBytes=907542944) in 7327.9 ms
+info: TensorSharp.Server.Host.Startup[1401]
+      Startup model loaded: Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf architecture=qwen4exp backend=ggml_cuda mmproj=mmproj-BF16.gguf
+  Warming up kernels (decode + prefill)...
+    Decode warmup: 7016.3 ms
+    Prefill warmup (2048 tokens): starting...
+    Prefill warmup (2048 tokens): completed in 1669.2 ms
+info: TensorSharp.Server.Host.Startup[1010]
+      Kernel warmup completed in 8817.2 ms
+info: TensorSharp.Server.SessionManager[1300]
+      Created chat session 73cfa9f5440443dea50fdb760a8bfe22 (total sessions=2)
+info: TensorSharp.Server.Host.Startup[1010]
+      Preparing the shared prompt before opening the port. The first launch after a prompt, skills or model change pays for it here instead of on the first message.
+info: TensorSharp.Server.ModelService[0]
+      InferenceEngine[qwen4exp] execution capability report:
+      batched paged attention: unavailable (model opt-out or unsupported layer/KV format)
+      per-sequence fused concurrent decode: available (+ token-batched fused decode)
+      N=1 single-sequence fused fast path: unavailable (no linear->paged KV migration)
+      Speculative decoding: available (algorithm=auto, trunk=linear)
+      KV snapshot/swap fallback: unavailable (no block snapshot; per-seq swaps force re-prefill)
+      retained fused-cache continuation: on (budget=4)
+info: TensorSharp.Server.ModelService[0]
+      InferenceEngine constructed for fingerprint  (blocks=256, blockSize=256, kvCapacityTokens=65536, maxBatched=4096, config=environment)
+info: TensorSharp.Server.ModelService[1500]
+      chat.start arch=qwen4exp maxTokens=1 thinking=False tools=0 messages(user=1,assistant=0,system=0) attachments(image=0,audio=0,textFile=0) uploads=[] sampling(temp=0.8,topK=40,topP=0.9,minP=0,repeatPenalty=1.1,repeatLastN=64,presencePenalty=0,frequencyPenalty=0,seed=-1,stop=(none)) userInput="hi" fullInput=[{"role":"user","content":"hi","contentChars":2}]
+[ChatTemplate] Jinja2 rendering succeeded for 'qwen4exp', prompt length=69
+info: TensorSharp.Server.ModelService[0]
+      No prompt reuse for chat-646af3a9d56a4e3ba8b350ec31c49c79: all 12 prompt token(s) re-prefill. Live KV cache: no live cache resident (reset, batched step, or first request). Retained state: nothing retained yet (no finished request's holder and no shared-prefix checkpoint). Pooled blocks: unavailable for this model (its K/V cannot be restored into another sequence).
+info: TensorSharp.Server.ModelService[0]
+      BatchExecutor execution plan: SpeculativePerSequence
+info: TensorSharp.Server.ModelService[1501]
+      chat.complete tokens=1 promptTokens=12 kvReused=0 kvReusePercent=0.0 ttftMs=348 elapsedMs=354.8 tokensPerSec=2.81 finishReason=max_tokens assistantOutput="\n\n"
+info: TensorSharp.Server.Host.Startup[1010]
+      Prefix cache (thinking off): warmed in 0.5 s: the prompt every chat starts with is in the cache
+info: TensorSharp.Server.ModelService[1500]
+      chat.start arch=qwen4exp maxTokens=1 thinking=True tools=0 messages(user=1,assistant=0,system=0) attachments(image=0,audio=0,textFile=0) uploads=[] sampling(temp=0.8,topK=40,topP=0.9,minP=0,repeatPenalty=1.1,repeatLastN=64,presencePenalty=0,frequencyPenalty=0,seed=-1,stop=(none)) userInput="hi" fullInput=[{"role":"user","content":"hi","contentChars":2}]
+[ChatTemplate] Jinja2 rendering succeeded for 'qwen4exp', prompt length=296
+info: TensorSharp.Server.ModelService[0]
+      No prompt reuse for chat-861bbd17dc13477492f9fa5ebe92fb39: all 52 prompt token(s) re-prefill. Live KV cache: prompt diverges from the live cache at token 1 of 13 and this model cannot rewind its KV state (recurrent layers have no reverse). Retained state: nothing retained yet (no finished request's holder and no shared-prefix checkpoint). Pooled blocks: unavailable for this model (its K/V cannot be restored into another sequence).
+info: TensorSharp.Server.ModelService[1501]
+      chat.complete tokens=1 promptTokens=52 kvReused=0 kvReusePercent=0.0 ttftMs=358 elapsedMs=362.1 tokensPerSec=2.76 finishReason=max_tokens assistantOutput="\n"
+info: TensorSharp.Server.Host.Startup[1010]
+      Prefix cache (thinking on): warmed in 0.4 s: the prompt every chat starts with is in the cache
+info: TensorSharp.Server.SessionManager[1301]
+      Removed chat session 73cfa9f5440443dea50fdb760a8bfe22 (remaining sessions=1)
+info: TensorSharp.Server.Host.Startup[1020]
+      Supported backends: cuda, ggml_cuda, ggml_cpu, cpu
+info: TensorSharp.Server.Host.Startup[1010]
+      Server configuration: hostedModel=/workspace/models/qwen38/UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf hostedMmProj=/workspace/models/qwen38/mmproj-BF16.gguf defaultMaxTokens=20000 videoFrames=model-default videoFps=model-default videoSize=model-default videoSteps=model-default videoMode=auto videoSampleFps=1 videoMaxFrames=0 listen=http://0.0.0.0:5135
+info: TensorSharp.Server.Host.Startup[1010]
+      Default sampling: temperature=0.8 topK=40 topP=0.9 minP=0 repeatPenalty=1.1 repeatLastN=64 presencePenalty=0 frequencyPenalty=0 seed=-1 stopSequences=(none)
+info: TensorSharp.Server.Host.Startup[1010]
+      Sampling precedence: config (nothing pinned — every request keeps full control)
+info: TensorSharp.Server.Host.Startup[1000]
+      Starting TensorSharp.Server on http://0.0.0.0:5135
+info: TensorSharp.Server.Host.Startup[1010]
+      Endpoint: GET  /                          - Web UI (index.html)
+info: TensorSharp.Server.Host.Startup[1010]
+      Endpoint: GET  /health                    - Health check
+info: TensorSharp.Server.Host.Startup[1010]
+      Endpoint: GET  /api/tags                  - List hosted models (Ollama)
+info: TensorSharp.Server.Host.Startup[1010]
+      Endpoint: POST /api/show                  - Show model details (Ollama)
+info: TensorSharp.Server.Host.Startup[1010]
+      Endpoint: POST /api/generate              - Generate text (Ollama)
+info: TensorSharp.Server.Host.Startup[1010]
+      Endpoint: POST /api/chat/ollama           - Chat completion (Ollama)
+info: TensorSharp.Server.Host.Startup[1010]
+      Endpoint: POST /v1/chat/completions       - Chat completion (OpenAI)
+info: TensorSharp.Server.Host.Startup[1010]
+      Endpoint: GET  /v1/models                 - List hosted models (OpenAI)
+info: TensorSharp.Server.Host.Startup[1010]
+      Endpoint: POST /api/chat                  - Chat (Web UI SSE)
+info: TensorSharp.Server.Host.Startup[1010]
+      Endpoint: POST /api/models/load           - Reload hosted model (Web UI)
+info: TensorSharp.Server.Host.Startup[1010]
+      Endpoint: GET  /api/models                - Show hosted model state (Web UI)
+info: Microsoft.Hosting.Lifetime[14]
+      Now listening on: http://0.0.0.0:5135
+info: Microsoft.Hosting.Lifetime[0]
+      Application started. Press Ctrl+C to shut down.
+info: Microsoft.Hosting.Lifetime[0]
+      Hosting environment: Production
+info: Microsoft.Hosting.Lifetime[0]
+      Content root path: /workspace/ts-codex-20260916-r4/http-r1/harness
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1100]
+      HTTP GET /v1/models from 127.0.0.1 (content-type=, content-length=(none))
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1101]
+      HTTP GET /v1/models -> 200 in 16.2 ms (response content-type=application/json; charset=utf-8)
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1100]
+      HTTP GET /v1/models from 127.0.0.1 (content-type=, content-length=(none))
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1101]
+      HTTP GET /v1/models -> 200 in 4.7 ms (response content-type=application/json; charset=utf-8)
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1100]
+      HTTP GET /v1/models from 127.0.0.1 (content-type=, content-length=(none))
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1101]
+      HTTP GET /v1/models -> 200 in 0.4 ms (response content-type=application/json; charset=utf-8)
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1100]
+      HTTP POST /v1/chat/completions from 127.0.0.1 (content-type=application/json, content-length=268)
+info: TensorSharp.Server.OpenAI.ChatCompletions[1500]
+      /v1/chat/completions request: id=chatcmpl-f605f6930a084a8b9033c model=Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003 stream=False maxTokens=256 messages=1 tools=0 skills=0 thinking=False userInput="Call get_weather for Paris. Do not invent its result."
+warn: TensorSharp.Server.Logging.RequestLoggingMiddleware[1103]
+      HTTP POST /v1/chat/completions -> 400 in 43.7 ms (response content-type=application/json; charset=utf-8)
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1100]
+      HTTP POST /v1/chat/completions from 127.0.0.1 (content-type=application/json, content-length=307)
+info: TensorSharp.Server.OpenAI.ChatCompletions[1500]
+      /v1/chat/completions request: id=chatcmpl-19366ed27f354d0f96fe0 model=Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003 stream=True maxTokens=256 messages=1 tools=0 skills=0 thinking=False userInput="Call get_weather for Paris. Do not invent its result."
+warn: TensorSharp.Server.Logging.RequestLoggingMiddleware[1103]
+      HTTP POST /v1/chat/completions -> 400 in 1.4 ms (response content-type=application/json; charset=utf-8)
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1100]
+      HTTP POST /v1/chat/completions from 127.0.0.1 (content-type=application/json, content-length=279)
+info: TensorSharp.Server.OpenAI.ChatCompletions[1500]
+      /v1/chat/completions request: id=chatcmpl-fe76771df19344678dadc model=Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003 stream=False maxTokens=256 messages=1 tools=0 skills=0 thinking=False userInput="Call get_weather for Paris. Do not invent its result."
+warn: TensorSharp.Server.Logging.RequestLoggingMiddleware[1103]
+      HTTP POST /v1/chat/completions -> 400 in 1.2 ms (response content-type=application/json; charset=utf-8)
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1100]
+      HTTP POST /v1/chat/completions from 127.0.0.1 (content-type=application/json, content-length=318)
+info: TensorSharp.Server.OpenAI.ChatCompletions[1500]
+      /v1/chat/completions request: id=chatcmpl-a07c0e3dd8ce48a2965c9 model=Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003 stream=True maxTokens=256 messages=1 tools=0 skills=0 thinking=False userInput="Call get_weather for Paris. Do not invent its result."
+warn: TensorSharp.Server.Logging.RequestLoggingMiddleware[1103]
+      HTTP POST /v1/chat/completions -> 400 in 0.7 ms (response content-type=application/json; charset=utf-8)
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1100]
+      HTTP POST /v1/chat/completions from 127.0.0.1 (content-type=application/json, content-length=311)
+info: TensorSharp.Server.OpenAI.ChatCompletions[1500]
+      /v1/chat/completions request: id=chatcmpl-b75725a9e9534b4487f62 model=Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003 stream=False maxTokens=256 messages=1 tools=0 skills=0 thinking=False userInput="Call get_weather for Paris. Do not invent its result."
+warn: TensorSharp.Server.Logging.RequestLoggingMiddleware[1103]
+      HTTP POST /v1/chat/completions -> 400 in 0.5 ms (response content-type=application/json; charset=utf-8)
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1100]
+      HTTP POST /v1/chat/completions from 127.0.0.1 (content-type=application/json, content-length=350)
+info: TensorSharp.Server.OpenAI.ChatCompletions[1500]
+      /v1/chat/completions request: id=chatcmpl-337a1ed3e263453e9b17b model=Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003 stream=True maxTokens=256 messages=1 tools=0 skills=0 thinking=False userInput="Call get_weather for Paris. Do not invent its result."
+warn: TensorSharp.Server.Logging.RequestLoggingMiddleware[1103]
+      HTTP POST /v1/chat/completions -> 400 in 0.6 ms (response content-type=application/json; charset=utf-8)
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1100]
+      HTTP POST /v1/chat/completions from 127.0.0.1 (content-type=application/json, content-length=322)
+info: TensorSharp.Server.OpenAI.ChatCompletions[1500]
+      /v1/chat/completions request: id=chatcmpl-066bad7970e24cdbb3e16 model=Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003 stream=False maxTokens=256 messages=1 tools=0 skills=0 thinking=False userInput="Call get_weather for Paris. Do not invent its result."
+warn: TensorSharp.Server.Logging.RequestLoggingMiddleware[1103]
+      HTTP POST /v1/chat/completions -> 400 in 0.6 ms (response content-type=application/json; charset=utf-8)
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1100]
+      HTTP POST /v1/chat/completions from 127.0.0.1 (content-type=application/json, content-length=361)
+info: TensorSharp.Server.OpenAI.ChatCompletions[1500]
+      /v1/chat/completions request: id=chatcmpl-c0e857c041c041db8a207 model=Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003 stream=True maxTokens=256 messages=1 tools=0 skills=0 thinking=False userInput="Call get_weather for Paris. Do not invent its result."
+warn: TensorSharp.Server.Logging.RequestLoggingMiddleware[1103]
+      HTTP POST /v1/chat/completions -> 400 in 0.6 ms (response content-type=application/json; charset=utf-8)
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1100]
+      HTTP POST /v1/chat/completions from 127.0.0.1 (content-type=application/json, content-length=547)
+info: TensorSharp.Server.OpenAI.ChatCompletions[1500]
+      /v1/chat/completions request: id=chatcmpl-3726bf38e00a42a198ea6 model=Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003 stream=False maxTokens=256 messages=1 tools=1 skills=0 thinking=False userInput="Call get_weather for Paris. Do not invent its result."
+warn: TensorSharp.Server.Logging.RequestLoggingMiddleware[1103]
+      HTTP POST /v1/chat/completions -> 400 in 5.7 ms (response content-type=application/json; charset=utf-8)
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1100]
+      HTTP POST /v1/chat/completions from 127.0.0.1 (content-type=application/json, content-length=586)
+info: TensorSharp.Server.OpenAI.ChatCompletions[1500]
+      /v1/chat/completions request: id=chatcmpl-8b0f365c1c4342bab6ad9 model=Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003 stream=True maxTokens=256 messages=1 tools=1 skills=0 thinking=False userInput="Call get_weather for Paris. Do not invent its result."
+warn: TensorSharp.Server.Logging.RequestLoggingMiddleware[1103]
+      HTTP POST /v1/chat/completions -> 400 in 0.6 ms (response content-type=application/json; charset=utf-8)
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1100]
+      HTTP POST /v1/chat/completions from 127.0.0.1 (content-type=application/json, content-length=535)
+info: TensorSharp.Server.OpenAI.ChatCompletions[1500]
+      /v1/chat/completions request: id=chatcmpl-b470e0bac8cf4996be3a4 model=Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003 stream=False maxTokens=256 messages=1 tools=1 skills=0 thinking=False userInput="Call get_weather for Paris. Do not invent its result."
+warn: TensorSharp.Server.Logging.RequestLoggingMiddleware[1103]
+      HTTP POST /v1/chat/completions -> 400 in 0.6 ms (response content-type=application/json; charset=utf-8)
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1100]
+      HTTP POST /v1/chat/completions from 127.0.0.1 (content-type=application/json, content-length=574)
+info: TensorSharp.Server.OpenAI.ChatCompletions[1500]
+      /v1/chat/completions request: id=chatcmpl-3270496958ba4b20a4266 model=Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003 stream=True maxTokens=256 messages=1 tools=1 skills=0 thinking=False userInput="Call get_weather for Paris. Do not invent its result."
+warn: TensorSharp.Server.Logging.RequestLoggingMiddleware[1103]
+      HTTP POST /v1/chat/completions -> 400 in 0.7 ms (response content-type=application/json; charset=utf-8)
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1100]
+      HTTP POST /v1/chat/completions from 127.0.0.1 (content-type=application/json, content-length=307)
+info: TensorSharp.Server.OpenAI.ChatCompletions[1500]
+      /v1/chat/completions request: id=chatcmpl-c6693bebf44c4c41973b1 model=Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003 stream=False maxTokens=256 messages=1 tools=0 skills=0 thinking=False userInput="Call get_weather for Paris. Do not invent its result."
+warn: TensorSharp.Server.Logging.RequestLoggingMiddleware[1103]
+      HTTP POST /v1/chat/completions -> 400 in 0.6 ms (response content-type=application/json; charset=utf-8)
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1100]
+      HTTP POST /v1/chat/completions from 127.0.0.1 (content-type=application/json, content-length=346)
+info: TensorSharp.Server.OpenAI.ChatCompletions[1500]
+      /v1/chat/completions request: id=chatcmpl-f6ed56b6db724929968c7 model=Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003 stream=True maxTokens=256 messages=1 tools=0 skills=0 thinking=False userInput="Call get_weather for Paris. Do not invent its result."
+warn: TensorSharp.Server.Logging.RequestLoggingMiddleware[1103]
+      HTTP POST /v1/chat/completions -> 400 in 0.5 ms (response content-type=application/json; charset=utf-8)
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1100]
+      HTTP POST /v1/chat/completions from 127.0.0.1 (content-type=application/json, content-length=575)
+info: TensorSharp.Server.OpenAI.ChatCompletions[1500]
+      /v1/chat/completions request: id=chatcmpl-50f4f6cb8210442aaa5fd model=Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003 stream=False maxTokens=256 messages=1 tools=1 skills=0 thinking=False userInput="Call get_weather for Paris. Do not invent its result."
+warn: TensorSharp.Server.Logging.RequestLoggingMiddleware[1103]
+      HTTP POST /v1/chat/completions -> 400 in 0.7 ms (response content-type=application/json; charset=utf-8)
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1100]
+      HTTP POST /v1/chat/completions from 127.0.0.1 (content-type=application/json, content-length=614)
+info: TensorSharp.Server.OpenAI.ChatCompletions[1500]
+      /v1/chat/completions request: id=chatcmpl-0f4a64338be84f7b8dd81 model=Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003 stream=True maxTokens=256 messages=1 tools=1 skills=0 thinking=False userInput="Call get_weather for Paris. Do not invent its result."
+warn: TensorSharp.Server.Logging.RequestLoggingMiddleware[1103]
+      HTTP POST /v1/chat/completions -> 400 in 0.7 ms (response content-type=application/json; charset=utf-8)
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1100]
+      HTTP POST /v1/chat/completions from 127.0.0.1 (content-type=application/json, content-length=492)
+info: TensorSharp.Server.OpenAI.ChatCompletions[1500]
+      /v1/chat/completions request: id=chatcmpl-dc255821c7f14b6fb4671 model=Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003 stream=False maxTokens=256 messages=1 tools=1 skills=0 thinking=False userInput="Call get_weather for Paris. Do not invent its result."
+info: TensorSharp.Server.ModelService[1500]
+      chat.start arch=qwen4exp maxTokens=256 thinking=False tools=1 messages(user=1,assistant=0,system=0) attachments(image=0,audio=0,textFile=0) uploads=[] sampling(temp=0,topK=1,topP=1,minP=0,repeatPenalty=1.1,repeatLastN=64,presencePenalty=0,frequencyPenalty=0,seed=42,stop=(none)) userInput="Call get_weather for Paris. Do not invent its result." fullInput=[{"role":"user","content":"Call get_weather for Paris. Do not invent its result.","contentChars":53}]
+[ChatTemplate] Jinja2 rendering succeeded for 'qwen4exp', prompt length=1237
+[ChatTemplate] Jinja2 rendering succeeded for 'qwen4exp', prompt length=1116
+info: TensorSharp.Server.ModelService[0]
+      No prompt reuse for chat-6f0d1bef04cd437a83caac5a1d7e2c3f: all 280 prompt token(s) re-prefill. Live KV cache: prompt diverges from the live cache at token 3 of 53 and this model cannot rewind its KV state (recurrent layers have no reverse). Retained state: nothing retained yet (no finished request's holder and no shared-prefix checkpoint). Pooled blocks: unavailable for this model (its K/V cannot be restored into another sequence).
+info: TensorSharp.Server.ModelService[0]
+      Speculative decoding armed for chat-6f0d1bef04cd437a83caac5a1d7e2c3f (algorithm=per-token, maxDraft=3, pMin=0.15, trunk=linear)
+info: TensorSharp.Server.ModelService[0]
+      Speculative decoding stats for chat-6f0d1bef04cd437a83caac5a1d7e2c3f: drafted=21 accepted=20 acceptance=95 % verifySteps=7 plainSteps=0 rollbacks=1 | phaseMs draft=86 verify=283 snapshot=14 rollback=46 catchUp=0 plain=0 | governor plain=0.0ms/tok spec=14.2ms/tok wins=0 losses=0 parked=0
+info: TensorSharp.Server.ModelService[1501]
+      chat.complete tokens=26 promptTokens=280 kvReused=0 kvReusePercent=0.0 ttftMs=669 elapsedMs=998.9 tokensPerSec=26.03 finishReason=eos assistantOutput="\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>"
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1101]
+      HTTP POST /v1/chat/completions -> 200 in 1073.9 ms (response content-type=(none))
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1100]
+      HTTP POST /v1/chat/completions from 127.0.0.1 (content-type=application/json, content-length=531)
+info: TensorSharp.Server.OpenAI.ChatCompletions[1500]
+      /v1/chat/completions request: id=chatcmpl-9f6db84c94444fca85e27 model=Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003 stream=True maxTokens=256 messages=1 tools=1 skills=0 thinking=False userInput="Call get_weather for Paris. Do not invent its result."
+info: TensorSharp.Server.ModelService[1500]
+      chat.start arch=qwen4exp maxTokens=256 thinking=False tools=1 messages(user=1,assistant=0,system=0) attachments(image=0,audio=0,textFile=0) uploads=[] sampling(temp=0,topK=1,topP=1,minP=0,repeatPenalty=1.1,repeatLastN=64,presencePenalty=0,frequencyPenalty=0,seed=42,stop=(none)) userInput="Call get_weather for Paris. Do not invent its result." fullInput=[{"role":"user","content":"Call get_weather for Paris. Do not invent its result.","contentChars":53}]
+[ChatTemplate] Jinja2 rendering succeeded for 'qwen4exp', prompt length=1237
+info: TensorSharp.Server.ModelService[0]
+      No prompt reuse for chat-4d6c24a1f9024d89972ef8ed5ad4b1bb: all 280 prompt token(s) re-prefill. Live KV cache: prompt (280 tokens) has no new suffix past the matched prefix (280) and this model cannot rewind its KV state to re-forward the last token. Retained state: nothing retained yet (no finished request's holder and no shared-prefix checkpoint). Pooled blocks: unavailable for this model (its K/V cannot be restored into another sequence).
+info: TensorSharp.Server.ModelService[0]
+      Speculative decoding armed for chat-4d6c24a1f9024d89972ef8ed5ad4b1bb (algorithm=per-token, maxDraft=3, pMin=0.15, trunk=linear)
+info: TensorSharp.Server.ModelService[0]
+      Speculative decoding stats for chat-4d6c24a1f9024d89972ef8ed5ad4b1bb: drafted=21 accepted=20 acceptance=95 % verifySteps=7 plainSteps=0 rollbacks=1 | phaseMs draft=96 verify=252 snapshot=10 rollback=41 catchUp=0 plain=0 | governor plain=0.0ms/tok spec=14.3ms/tok wins=0 losses=0 parked=0
+info: TensorSharp.Server.ModelService[1501]
+      chat.complete tokens=26 promptTokens=280 kvReused=0 kvReusePercent=0.0 ttftMs=637 elapsedMs=981.6 tokensPerSec=26.49 finishReason=eos assistantOutput="\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>"
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1101]
+      HTTP POST /v1/chat/completions -> 200 in 1007.7 ms (response content-type=text/event-stream)
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1100]
+      HTTP POST /v1/chat/completions from 127.0.0.1 (content-type=application/json, content-length=535)
+info: TensorSharp.Server.OpenAI.ChatCompletions[1500]
+      /v1/chat/completions request: id=chatcmpl-faf5dd38b3ef422da283f model=Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003 stream=False maxTokens=256 messages=1 tools=1 skills=0 thinking=False userInput="Call get_weather for Paris. Do not invent its result."
+info: TensorSharp.Server.ModelService[1500]
+      chat.start arch=qwen4exp maxTokens=256 thinking=False tools=1 messages(user=1,assistant=0,system=0) attachments(image=0,audio=0,textFile=0) uploads=[] sampling(temp=0,topK=1,topP=1,minP=0,repeatPenalty=1.1,repeatLastN=64,presencePenalty=0,frequencyPenalty=0,seed=42,stop=(none)) userInput="Call get_weather for Paris. Do not invent its result." fullInput=[{"role":"user","content":"Call get_weather for Paris. Do not invent its result.","contentChars":53}]
+[ChatTemplate] Jinja2 rendering succeeded for 'qwen4exp', prompt length=1237
+info: TensorSharp.Server.ModelService[0]
+      No prompt reuse for chat-5a5c5d15e67d44bb94c05d1af2ea3fc0: all 280 prompt token(s) re-prefill. Live KV cache: prompt (280 tokens) has no new suffix past the matched prefix (280) and this model cannot rewind its KV state to re-forward the last token. Retained state: nothing retained yet (no finished request's holder and no shared-prefix checkpoint). Pooled blocks: unavailable for this model (its K/V cannot be restored into another sequence).
+info: TensorSharp.Server.ModelService[0]
+      Speculative decoding armed for chat-5a5c5d15e67d44bb94c05d1af2ea3fc0 (algorithm=per-token, maxDraft=3, pMin=0.15, trunk=linear)
+info: TensorSharp.Server.ModelService[0]
+      Speculative decoding stats for chat-5a5c5d15e67d44bb94c05d1af2ea3fc0: drafted=21 accepted=20 acceptance=95 % verifySteps=7 plainSteps=0 rollbacks=1 | phaseMs draft=73 verify=249 snapshot=10 rollback=56 catchUp=0 plain=0 | governor plain=0.0ms/tok spec=13.8ms/tok wins=0 losses=0 parked=0
+info: TensorSharp.Server.ModelService[1501]
+      chat.complete tokens=26 promptTokens=280 kvReused=0 kvReusePercent=0.0 ttftMs=634 elapsedMs=952.6 tokensPerSec=27.29 finishReason=eos assistantOutput="\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>"
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1101]
+      HTTP POST /v1/chat/completions -> 200 in 960.2 ms (response content-type=(none))
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1100]
+      HTTP POST /v1/chat/completions from 127.0.0.1 (content-type=application/json, content-length=574)
+info: TensorSharp.Server.OpenAI.ChatCompletions[1500]
+      /v1/chat/completions request: id=chatcmpl-f269889e83f14b5b8e154 model=Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003 stream=True maxTokens=256 messages=1 tools=1 skills=0 thinking=False userInput="Call get_weather for Paris. Do not invent its result."
+info: TensorSharp.Server.ModelService[1500]
+      chat.start arch=qwen4exp maxTokens=256 thinking=False tools=1 messages(user=1,assistant=0,system=0) attachments(image=0,audio=0,textFile=0) uploads=[] sampling(temp=0,topK=1,topP=1,minP=0,repeatPenalty=1.1,repeatLastN=64,presencePenalty=0,frequencyPenalty=0,seed=42,stop=(none)) userInput="Call get_weather for Paris. Do not invent its result." fullInput=[{"role":"user","content":"Call get_weather for Paris. Do not invent its result.","contentChars":53}]
+[ChatTemplate] Jinja2 rendering succeeded for 'qwen4exp', prompt length=1237
+info: TensorSharp.Server.ModelService[0]
+      No prompt reuse for chat-2ef7524e22e84c89876481e30044aa81: all 280 prompt token(s) re-prefill. Live KV cache: prompt (280 tokens) has no new suffix past the matched prefix (280) and this model cannot rewind its KV state to re-forward the last token. Retained state: nothing retained yet (no finished request's holder and no shared-prefix checkpoint). Pooled blocks: unavailable for this model (its K/V cannot be restored into another sequence).
+info: TensorSharp.Server.ModelService[0]
+      Speculative decoding armed for chat-2ef7524e22e84c89876481e30044aa81 (algorithm=per-token, maxDraft=3, pMin=0.15, trunk=linear)
+info: TensorSharp.Server.ModelService[0]
+      Speculative decoding stats for chat-2ef7524e22e84c89876481e30044aa81: drafted=21 accepted=20 acceptance=95 % verifySteps=7 plainSteps=0 rollbacks=1 | phaseMs draft=73 verify=249 snapshot=10 rollback=37 catchUp=0 plain=0 | governor plain=0.0ms/tok spec=12.6ms/tok wins=0 losses=0 parked=0
+info: TensorSharp.Server.ModelService[1501]
+      chat.complete tokens=26 promptTokens=280 kvReused=0 kvReusePercent=0.0 ttftMs=631 elapsedMs=922.8 tokensPerSec=28.17 finishReason=eos assistantOutput="\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>"
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1101]
+      HTTP POST /v1/chat/completions -> 200 in 926.9 ms (response content-type=text/event-stream)
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1100]
+      HTTP POST /v1/chat/completions from 127.0.0.1 (content-type=application/json, content-length=494)
+info: TensorSharp.Server.OpenAI.ChatCompletions[1500]
+      /v1/chat/completions request: id=chatcmpl-1d3ba4a923874cb09c383 model=Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003 stream=False maxTokens=256 messages=1 tools=0 skills=0 thinking=False userInput="Reply with only the single word apple. Do not use any tool."
+info: TensorSharp.Server.ModelService[1500]
+      chat.start arch=qwen4exp maxTokens=256 thinking=False tools=0 messages(user=1,assistant=0,system=0) attachments(image=0,audio=0,textFile=0) uploads=[] sampling(temp=0,topK=1,topP=1,minP=0,repeatPenalty=1.1,repeatLastN=64,presencePenalty=0,frequencyPenalty=0,seed=42,stop=(none)) userInput="Reply with only the single word apple. Do not use any tool." fullInput=[{"role":"user","content":"Reply with only the single word apple. Do not use any tool.","contentChars":59}]
+[ChatTemplate] Jinja2 rendering succeeded for 'qwen4exp', prompt length=126
+info: TensorSharp.Server.ModelService[0]
+      No prompt reuse for chat-fdc8904b82b64adb99d0d94ed933a93d: all 25 prompt token(s) re-prefill. Live KV cache: prompt diverges from the live cache at token 1 of 307 and this model cannot rewind its KV state (recurrent layers have no reverse). Retained state: nothing retained yet (no finished request's holder and no shared-prefix checkpoint). Pooled blocks: unavailable for this model (its K/V cannot be restored into another sequence).
+info: TensorSharp.Server.ModelService[0]
+      Speculative decoding armed for chat-fdc8904b82b64adb99d0d94ed933a93d (algorithm=per-token, maxDraft=3, pMin=0.15, trunk=linear)
+info: TensorSharp.Server.ModelService[0]
+      Speculative decoding stats for chat-fdc8904b82b64adb99d0d94ed933a93d: drafted=3 accepted=2 acceptance=67 % verifySteps=1 plainSteps=0 rollbacks=1 | phaseMs draft=12 verify=42 snapshot=4 rollback=36 catchUp=0 plain=0 | governor plain=0.0ms/tok spec=12.6ms/tok wins=0 losses=0 parked=0
+info: TensorSharp.Server.ModelService[1501]
+      chat.complete tokens=2 promptTokens=25 kvReused=0 kvReusePercent=0.0 ttftMs=291 elapsedMs=291.9 tokensPerSec=6.85 finishReason=eos assistantOutput="\n\napple"
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1101]
+      HTTP POST /v1/chat/completions -> 200 in 297.9 ms (response content-type=(none))
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1100]
+      HTTP POST /v1/chat/completions from 127.0.0.1 (content-type=application/json, content-length=533)
+info: TensorSharp.Server.OpenAI.ChatCompletions[1500]
+      /v1/chat/completions request: id=chatcmpl-cca39586055641dcbc5cc model=Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003 stream=True maxTokens=256 messages=1 tools=0 skills=0 thinking=False userInput="Reply with only the single word apple. Do not use any tool."
+info: TensorSharp.Server.ModelService[1500]
+      chat.start arch=qwen4exp maxTokens=256 thinking=False tools=0 messages(user=1,assistant=0,system=0) attachments(image=0,audio=0,textFile=0) uploads=[] sampling(temp=0,topK=1,topP=1,minP=0,repeatPenalty=1.1,repeatLastN=64,presencePenalty=0,frequencyPenalty=0,seed=42,stop=(none)) userInput="Reply with only the single word apple. Do not use any tool." fullInput=[{"role":"user","content":"Reply with only the single word apple. Do not use any tool.","contentChars":59}]
+[ChatTemplate] Jinja2 rendering succeeded for 'qwen4exp', prompt length=126
+info: TensorSharp.Server.ModelService[0]
+      No prompt reuse for chat-b36e061bd5964c9694c3b4c61e77c0d6: all 25 prompt token(s) re-prefill. Live KV cache: prompt (25 tokens) has no new suffix past the matched prefix (25) and this model cannot rewind its KV state to re-forward the last token. Retained state: nothing retained yet (no finished request's holder and no shared-prefix checkpoint). Pooled blocks: unavailable for this model (its K/V cannot be restored into another sequence).
+info: TensorSharp.Server.ModelService[0]
+      Speculative decoding armed for chat-b36e061bd5964c9694c3b4c61e77c0d6 (algorithm=per-token, maxDraft=3, pMin=0.15, trunk=linear)
+info: TensorSharp.Server.ModelService[0]
+      Speculative decoding stats for chat-b36e061bd5964c9694c3b4c61e77c0d6: drafted=3 accepted=2 acceptance=67 % verifySteps=1 plainSteps=0 rollbacks=1 | phaseMs draft=11 verify=39 snapshot=4 rollback=36 catchUp=0 plain=0 | governor plain=0.0ms/tok spec=12.6ms/tok wins=0 losses=0 parked=0
+info: TensorSharp.Server.ModelService[1501]
+      chat.complete tokens=2 promptTokens=25 kvReused=0 kvReusePercent=0.0 ttftMs=279 elapsedMs=280.2 tokensPerSec=7.14 finishReason=eos assistantOutput="\n\napple"
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1101]
+      HTTP POST /v1/chat/completions -> 200 in 283.8 ms (response content-type=text/event-stream)
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1100]
+      HTTP POST /v1/chat/completions from 127.0.0.1 (content-type=application/json, content-length=488)
+info: TensorSharp.Server.OpenAI.ChatCompletions[1500]
+      /v1/chat/completions request: id=chatcmpl-d7b4bf42ea5548dbbbc76 model=Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003 stream=False maxTokens=256 messages=1 tools=1 skills=0 thinking=False userInput="Call get_weather for Paris. Do not invent its result."
+info: TensorSharp.Server.ModelService[1500]
+      chat.start arch=qwen4exp maxTokens=256 thinking=False tools=1 messages(user=1,assistant=0,system=0) attachments(image=0,audio=0,textFile=0) uploads=[] sampling(temp=0,topK=1,topP=1,minP=0,repeatPenalty=1.1,repeatLastN=64,presencePenalty=0,frequencyPenalty=0,seed=42,stop=(none)) userInput="Call get_weather for Paris. Do not invent its result." fullInput=[{"role":"user","content":"Call get_weather for Paris. Do not invent its result.","contentChars":53}]
+[ChatTemplate] Jinja2 rendering succeeded for 'qwen4exp', prompt length=1237
+info: TensorSharp.Server.ModelService[0]
+      No prompt reuse for chat-95c1d89a1d4c48f2a4eb896d3ec77c2a: all 280 prompt token(s) re-prefill. Live KV cache: prompt diverges from the live cache at token 1 of 28 and this model cannot rewind its KV state (recurrent layers have no reverse). Retained state: nothing retained yet (no finished request's holder and no shared-prefix checkpoint). Pooled blocks: unavailable for this model (its K/V cannot be restored into another sequence).
+info: TensorSharp.Server.ModelService[0]
+      Speculative decoding armed for chat-95c1d89a1d4c48f2a4eb896d3ec77c2a (algorithm=per-token, maxDraft=3, pMin=0.15, trunk=linear)
+info: TensorSharp.Server.ModelService[0]
+      Speculative decoding stats for chat-95c1d89a1d4c48f2a4eb896d3ec77c2a: drafted=21 accepted=20 acceptance=95 % verifySteps=7 plainSteps=0 rollbacks=1 | phaseMs draft=82 verify=233 snapshot=9 rollback=36 catchUp=0 plain=0 | governor plain=0.0ms/tok spec=12.9ms/tok wins=0 losses=0 parked=0
+info: TensorSharp.Server.ModelService[1501]
+      chat.complete tokens=26 promptTokens=280 kvReused=0 kvReusePercent=0.0 ttftMs=612 elapsedMs=909.6 tokensPerSec=28.58 finishReason=eos assistantOutput="\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>"
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1101]
+      HTTP POST /v1/chat/completions -> 200 in 913.7 ms (response content-type=(none))
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1100]
+      HTTP POST /v1/chat/completions from 127.0.0.1 (content-type=application/json, content-length=527)
+info: TensorSharp.Server.OpenAI.ChatCompletions[1500]
+      /v1/chat/completions request: id=chatcmpl-9b873822aeda4040a355e model=Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003 stream=True maxTokens=256 messages=1 tools=1 skills=0 thinking=False userInput="Call get_weather for Paris. Do not invent its result."
+info: TensorSharp.Server.ModelService[1500]
+      chat.start arch=qwen4exp maxTokens=256 thinking=False tools=1 messages(user=1,assistant=0,system=0) attachments(image=0,audio=0,textFile=0) uploads=[] sampling(temp=0,topK=1,topP=1,minP=0,repeatPenalty=1.1,repeatLastN=64,presencePenalty=0,frequencyPenalty=0,seed=42,stop=(none)) userInput="Call get_weather for Paris. Do not invent its result." fullInput=[{"role":"user","content":"Call get_weather for Paris. Do not invent its result.","contentChars":53}]
+[ChatTemplate] Jinja2 rendering succeeded for 'qwen4exp', prompt length=1237
+info: TensorSharp.Server.ModelService[0]
+      No prompt reuse for chat-efb332c965a44204b8345b0590fdd197: all 280 prompt token(s) re-prefill. Live KV cache: prompt (280 tokens) has no new suffix past the matched prefix (280) and this model cannot rewind its KV state to re-forward the last token. Retained state: nothing retained yet (no finished request's holder and no shared-prefix checkpoint). Pooled blocks: unavailable for this model (its K/V cannot be restored into another sequence).
+info: TensorSharp.Server.ModelService[0]
+      Speculative decoding armed for chat-efb332c965a44204b8345b0590fdd197 (algorithm=per-token, maxDraft=3, pMin=0.15, trunk=linear)
+info: TensorSharp.Server.ModelService[0]
+      Speculative decoding stats for chat-efb332c965a44204b8345b0590fdd197: drafted=21 accepted=20 acceptance=95 % verifySteps=7 plainSteps=0 rollbacks=1 | phaseMs draft=60 verify=232 snapshot=9 rollback=36 catchUp=0 plain=0 | governor plain=0.0ms/tok spec=11.9ms/tok wins=0 losses=0 parked=0
+info: TensorSharp.Server.ModelService[1501]
+      chat.complete tokens=26 promptTokens=280 kvReused=0 kvReusePercent=0.0 ttftMs=593 elapsedMs=869.4 tokensPerSec=29.90 finishReason=eos assistantOutput="\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>"
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1101]
+      HTTP POST /v1/chat/completions -> 200 in 873.2 ms (response content-type=text/event-stream)
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1100]
+      HTTP POST /v1/chat/completions from 127.0.0.1 (content-type=application/json, content-length=467)
+info: TensorSharp.Server.OpenAI.ChatCompletions[1500]
+      /v1/chat/completions request: id=chatcmpl-b1c18d2d97a24528ac622 model=Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003 stream=False maxTokens=256 messages=1 tools=1 skills=0 thinking=False userInput="Call get_weather for Paris. Do not invent its result."
+info: TensorSharp.Server.ModelService[1500]
+      chat.start arch=qwen4exp maxTokens=256 thinking=False tools=1 messages(user=1,assistant=0,system=0) attachments(image=0,audio=0,textFile=0) uploads=[] sampling(temp=0,topK=1,topP=1,minP=0,repeatPenalty=1.1,repeatLastN=64,presencePenalty=0,frequencyPenalty=0,seed=42,stop=(none)) userInput="Call get_weather for Paris. Do not invent its result." fullInput=[{"role":"user","content":"Call get_weather for Paris. Do not invent its result.","contentChars":53}]
+[ChatTemplate] Jinja2 rendering succeeded for 'qwen4exp', prompt length=1237
+info: TensorSharp.Server.ModelService[0]
+      No prompt reuse for chat-df28a05088aa4534ac81fa877020fb0d: all 280 prompt token(s) re-prefill. Live KV cache: prompt (280 tokens) has no new suffix past the matched prefix (280) and this model cannot rewind its KV state to re-forward the last token. Retained state: nothing retained yet (no finished request's holder and no shared-prefix checkpoint). Pooled blocks: unavailable for this model (its K/V cannot be restored into another sequence).
+info: TensorSharp.Server.ModelService[0]
+      Speculative decoding armed for chat-df28a05088aa4534ac81fa877020fb0d (algorithm=per-token, maxDraft=3, pMin=0.15, trunk=linear)
+info: TensorSharp.Server.ModelService[0]
+      Speculative decoding stats for chat-df28a05088aa4534ac81fa877020fb0d: drafted=21 accepted=20 acceptance=95 % verifySteps=7 plainSteps=0 rollbacks=1 | phaseMs draft=82 verify=235 snapshot=10 rollback=38 catchUp=0 plain=0 | governor plain=0.0ms/tok spec=12.6ms/tok wins=0 losses=0 parked=0
+info: TensorSharp.Server.ModelService[1501]
+      chat.complete tokens=26 promptTokens=280 kvReused=0 kvReusePercent=0.0 ttftMs=631 elapsedMs=920.7 tokensPerSec=28.24 finishReason=eos assistantOutput="\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>"
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1101]
+      HTTP POST /v1/chat/completions -> 200 in 925.0 ms (response content-type=(none))
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1100]
+      HTTP POST /v1/chat/completions from 127.0.0.1 (content-type=application/json, content-length=506)
+info: TensorSharp.Server.OpenAI.ChatCompletions[1500]
+      /v1/chat/completions request: id=chatcmpl-f575a0cdcfdc46aab3745 model=Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003 stream=True maxTokens=256 messages=1 tools=1 skills=0 thinking=False userInput="Call get_weather for Paris. Do not invent its result."
+info: TensorSharp.Server.ModelService[1500]
+      chat.start arch=qwen4exp maxTokens=256 thinking=False tools=1 messages(user=1,assistant=0,system=0) attachments(image=0,audio=0,textFile=0) uploads=[] sampling(temp=0,topK=1,topP=1,minP=0,repeatPenalty=1.1,repeatLastN=64,presencePenalty=0,frequencyPenalty=0,seed=42,stop=(none)) userInput="Call get_weather for Paris. Do not invent its result." fullInput=[{"role":"user","content":"Call get_weather for Paris. Do not invent its result.","contentChars":53}]
+[ChatTemplate] Jinja2 rendering succeeded for 'qwen4exp', prompt length=1237
+info: TensorSharp.Server.ModelService[0]
+      No prompt reuse for chat-523549aeb65547ef86079dddfa27726e: all 280 prompt token(s) re-prefill. Live KV cache: prompt (280 tokens) has no new suffix past the matched prefix (280) and this model cannot rewind its KV state to re-forward the last token. Retained state: nothing retained yet (no finished request's holder and no shared-prefix checkpoint). Pooled blocks: unavailable for this model (its K/V cannot be restored into another sequence).
+info: TensorSharp.Server.ModelService[0]
+      Speculative decoding armed for chat-523549aeb65547ef86079dddfa27726e (algorithm=per-token, maxDraft=3, pMin=0.15, trunk=linear)
+info: TensorSharp.Server.ModelService[0]
+      Speculative decoding stats for chat-523549aeb65547ef86079dddfa27726e: drafted=21 accepted=20 acceptance=95 % verifySteps=7 plainSteps=0 rollbacks=1 | phaseMs draft=60 verify=229 snapshot=10 rollback=36 catchUp=0 plain=0 | governor plain=0.0ms/tok spec=11.8ms/tok wins=0 losses=0 parked=0
+info: TensorSharp.Server.ModelService[1501]
+      chat.complete tokens=26 promptTokens=280 kvReused=0 kvReusePercent=0.0 ttftMs=629 elapsedMs=902.7 tokensPerSec=28.80 finishReason=eos assistantOutput="\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>"
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1101]
+      HTTP POST /v1/chat/completions -> 200 in 906.9 ms (response content-type=text/event-stream)
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1100]
+      HTTP POST /v1/chat/completions from 127.0.0.1 (content-type=application/json, content-length=270)
+info: TensorSharp.Server.OpenAI.ChatCompletions[1500]
+      /v1/chat/completions request: id=chatcmpl-9725cec1edb84a14a3b11 model=Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003 stream=False maxTokens=256 messages=1 tools=0 skills=0 thinking=False userInput="Reply with only the single word apple. Do not use any tool."
+info: TensorSharp.Server.ModelService[1500]
+      chat.start arch=qwen4exp maxTokens=256 thinking=False tools=0 messages(user=1,assistant=0,system=0) attachments(image=0,audio=0,textFile=0) uploads=[] sampling(temp=0,topK=1,topP=1,minP=0,repeatPenalty=1.1,repeatLastN=64,presencePenalty=0,frequencyPenalty=0,seed=42,stop=(none)) userInput="Reply with only the single word apple. Do not use any tool." fullInput=[{"role":"user","content":"Reply with only the single word apple. Do not use any tool.","contentChars":59}]
+[ChatTemplate] Jinja2 rendering succeeded for 'qwen4exp', prompt length=126
+info: TensorSharp.Server.ModelService[0]
+      No prompt reuse for chat-4c550c7431ed483db19eb86ef2646218: all 25 prompt token(s) re-prefill. Live KV cache: prompt diverges from the live cache at token 1 of 307 and this model cannot rewind its KV state (recurrent layers have no reverse). Retained state: nothing retained yet (no finished request's holder and no shared-prefix checkpoint). Pooled blocks: unavailable for this model (its K/V cannot be restored into another sequence).
+info: TensorSharp.Server.ModelService[0]
+      Speculative decoding armed for chat-4c550c7431ed483db19eb86ef2646218 (algorithm=per-token, maxDraft=3, pMin=0.15, trunk=linear)
+info: TensorSharp.Server.ModelService[0]
+      Speculative decoding stats for chat-4c550c7431ed483db19eb86ef2646218: drafted=3 accepted=2 acceptance=67 % verifySteps=1 plainSteps=0 rollbacks=1 | phaseMs draft=10 verify=40 snapshot=4 rollback=39 catchUp=0 plain=0 | governor plain=0.0ms/tok spec=11.8ms/tok wins=0 losses=0 parked=0
+info: TensorSharp.Server.ModelService[1501]
+      chat.complete tokens=2 promptTokens=25 kvReused=0 kvReusePercent=0.0 ttftMs=358 elapsedMs=359.0 tokensPerSec=5.57 finishReason=eos assistantOutput="\n\napple"
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1101]
+      HTTP POST /v1/chat/completions -> 200 in 363.0 ms (response content-type=(none))
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1100]
+      HTTP POST /v1/chat/completions from 127.0.0.1 (content-type=application/json, content-length=309)
+info: TensorSharp.Server.OpenAI.ChatCompletions[1500]
+      /v1/chat/completions request: id=chatcmpl-299e20c018334d908fc43 model=Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003 stream=True maxTokens=256 messages=1 tools=0 skills=0 thinking=False userInput="Reply with only the single word apple. Do not use any tool."
+info: TensorSharp.Server.ModelService[1500]
+      chat.start arch=qwen4exp maxTokens=256 thinking=False tools=0 messages(user=1,assistant=0,system=0) attachments(image=0,audio=0,textFile=0) uploads=[] sampling(temp=0,topK=1,topP=1,minP=0,repeatPenalty=1.1,repeatLastN=64,presencePenalty=0,frequencyPenalty=0,seed=42,stop=(none)) userInput="Reply with only the single word apple. Do not use any tool." fullInput=[{"role":"user","content":"Reply with only the single word apple. Do not use any tool.","contentChars":59}]
+[ChatTemplate] Jinja2 rendering succeeded for 'qwen4exp', prompt length=126
+info: TensorSharp.Server.ModelService[0]
+      No prompt reuse for chat-4b07b0c742a04031b3c3180ead2f4576: all 25 prompt token(s) re-prefill. Live KV cache: prompt (25 tokens) has no new suffix past the matched prefix (25) and this model cannot rewind its KV state to re-forward the last token. Retained state: nothing retained yet (no finished request's holder and no shared-prefix checkpoint). Pooled blocks: unavailable for this model (its K/V cannot be restored into another sequence).
+info: TensorSharp.Server.ModelService[0]
+      Speculative decoding armed for chat-4b07b0c742a04031b3c3180ead2f4576 (algorithm=per-token, maxDraft=3, pMin=0.15, trunk=linear)
+info: TensorSharp.Server.ModelService[0]
+      Speculative decoding stats for chat-4b07b0c742a04031b3c3180ead2f4576: drafted=3 accepted=2 acceptance=67 % verifySteps=1 plainSteps=0 rollbacks=1 | phaseMs draft=11 verify=39 snapshot=5 rollback=37 catchUp=0 plain=0 | governor plain=0.0ms/tok spec=11.8ms/tok wins=0 losses=0 parked=0
+info: TensorSharp.Server.ModelService[1501]
+      chat.complete tokens=2 promptTokens=25 kvReused=0 kvReusePercent=0.0 ttftMs=316 elapsedMs=317.0 tokensPerSec=6.31 finishReason=eos assistantOutput="\n\napple"
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1101]
+      HTTP POST /v1/chat/completions -> 200 in 320.5 ms (response content-type=text/event-stream)
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1100]
+      HTTP POST /v1/chat/completions from 127.0.0.1 (content-type=application/json, content-length=270)
+info: TensorSharp.Server.OpenAI.ChatCompletions[1500]
+      /v1/chat/completions request: id=chatcmpl-14c83db6518541759fc89 model=Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003 stream=False maxTokens=256 messages=1 tools=0 skills=0 thinking=False userInput="Reply with only the single word apple. Do not use any tool."
+info: TensorSharp.Server.ModelService[1500]
+      chat.start arch=qwen4exp maxTokens=256 thinking=False tools=0 messages(user=1,assistant=0,system=0) attachments(image=0,audio=0,textFile=0) uploads=[] sampling(temp=0,topK=1,topP=1,minP=0,repeatPenalty=1.1,repeatLastN=64,presencePenalty=0,frequencyPenalty=0,seed=42,stop=(none)) userInput="Reply with only the single word apple. Do not use any tool." fullInput=[{"role":"user","content":"Reply with only the single word apple. Do not use any tool.","contentChars":59}]
+[ChatTemplate] Jinja2 rendering succeeded for 'qwen4exp', prompt length=126
+info: TensorSharp.Server.ModelService[0]
+      No prompt reuse for chat-ee81f8601457426c8c77096ed5b254a7: all 25 prompt token(s) re-prefill. Live KV cache: prompt (25 tokens) has no new suffix past the matched prefix (25) and this model cannot rewind its KV state to re-forward the last token. Retained state: nothing retained yet (no finished request's holder and no shared-prefix checkpoint). Pooled blocks: unavailable for this model (its K/V cannot be restored into another sequence).
+info: TensorSharp.Server.ModelService[0]
+      Speculative decoding armed for chat-ee81f8601457426c8c77096ed5b254a7 (algorithm=per-token, maxDraft=3, pMin=0.15, trunk=linear)
+info: TensorSharp.Server.ModelService[0]
+      Speculative decoding stats for chat-ee81f8601457426c8c77096ed5b254a7: drafted=3 accepted=2 acceptance=67 % verifySteps=1 plainSteps=0 rollbacks=1 | phaseMs draft=11 verify=42 snapshot=5 rollback=61 catchUp=0 plain=0 | governor plain=0.0ms/tok spec=11.8ms/tok wins=0 losses=0 parked=0
+info: TensorSharp.Server.ModelService[1501]
+      chat.complete tokens=2 promptTokens=25 kvReused=0 kvReusePercent=0.0 ttftMs=327 elapsedMs=327.3 tokensPerSec=6.11 finishReason=eos assistantOutput="\n\napple"
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1101]
+      HTTP POST /v1/chat/completions -> 200 in 330.8 ms (response content-type=(none))
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1100]
+      HTTP POST /v1/chat/completions from 127.0.0.1 (content-type=application/json, content-length=309)
+info: TensorSharp.Server.OpenAI.ChatCompletions[1500]
+      /v1/chat/completions request: id=chatcmpl-4293f8200208424280391 model=Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003 stream=True maxTokens=256 messages=1 tools=0 skills=0 thinking=False userInput="Reply with only the single word apple. Do not use any tool."
+info: TensorSharp.Server.ModelService[1500]
+      chat.start arch=qwen4exp maxTokens=256 thinking=False tools=0 messages(user=1,assistant=0,system=0) attachments(image=0,audio=0,textFile=0) uploads=[] sampling(temp=0,topK=1,topP=1,minP=0,repeatPenalty=1.1,repeatLastN=64,presencePenalty=0,frequencyPenalty=0,seed=42,stop=(none)) userInput="Reply with only the single word apple. Do not use any tool." fullInput=[{"role":"user","content":"Reply with only the single word apple. Do not use any tool.","contentChars":59}]
+[ChatTemplate] Jinja2 rendering succeeded for 'qwen4exp', prompt length=126
+info: TensorSharp.Server.ModelService[0]
+      No prompt reuse for chat-f63d7a797271470996ec18d60140b967: all 25 prompt token(s) re-prefill. Live KV cache: prompt (25 tokens) has no new suffix past the matched prefix (25) and this model cannot rewind its KV state to re-forward the last token. Retained state: nothing retained yet (no finished request's holder and no shared-prefix checkpoint). Pooled blocks: unavailable for this model (its K/V cannot be restored into another sequence).
+info: TensorSharp.Server.ModelService[0]
+      Speculative decoding armed for chat-f63d7a797271470996ec18d60140b967 (algorithm=per-token, maxDraft=3, pMin=0.15, trunk=linear)
+info: TensorSharp.Server.ModelService[0]
+      Speculative decoding stats for chat-f63d7a797271470996ec18d60140b967: drafted=3 accepted=2 acceptance=67 % verifySteps=1 plainSteps=0 rollbacks=1 | phaseMs draft=11 verify=42 snapshot=17 rollback=36 catchUp=0 plain=0 | governor plain=0.0ms/tok spec=11.8ms/tok wins=0 losses=0 parked=0
+info: TensorSharp.Server.ModelService[1501]
+      chat.complete tokens=2 promptTokens=25 kvReused=0 kvReusePercent=0.0 ttftMs=377 elapsedMs=378.1 tokensPerSec=5.29 finishReason=eos assistantOutput="\n\napple"
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1101]
+      HTTP POST /v1/chat/completions -> 200 in 380.9 ms (response content-type=text/event-stream)
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1100]
+      HTTP POST /v1/chat/completions from 127.0.0.1 (content-type=application/json, content-length=520)
+info: TensorSharp.Server.OpenAI.ChatCompletions[1500]
+      /v1/chat/completions request: id=chatcmpl-2d3b9097597b43ce9f366 model=Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003 stream=False maxTokens=256 messages=1 tools=1 skills=0 thinking=False userInput="Call get_weather for Paris. Do not invent its result."
+info: TensorSharp.Server.ModelService[1500]
+      chat.start arch=qwen4exp maxTokens=256 thinking=False tools=1 messages(user=1,assistant=0,system=0) attachments(image=0,audio=0,textFile=0) uploads=[] sampling(temp=0,topK=1,topP=1,minP=0,repeatPenalty=1.1,repeatLastN=64,presencePenalty=0,frequencyPenalty=0,seed=42,stop=(none)) userInput="Call get_weather for Paris. Do not invent its result." fullInput=[{"role":"user","content":"Call get_weather for Paris. Do not invent its result.","contentChars":53}]
+[ChatTemplate] Jinja2 rendering succeeded for 'qwen4exp', prompt length=1237
+info: TensorSharp.Server.ModelService[0]
+      No prompt reuse for chat-b710f0a64c654cb89d913df4f6c99807: all 280 prompt token(s) re-prefill. Live KV cache: prompt diverges from the live cache at token 1 of 28 and this model cannot rewind its KV state (recurrent layers have no reverse). Retained state: nothing retained yet (no finished request's holder and no shared-prefix checkpoint). Pooled blocks: unavailable for this model (its K/V cannot be restored into another sequence).
+info: TensorSharp.Server.ModelService[0]
+      Speculative decoding armed for chat-b710f0a64c654cb89d913df4f6c99807 (algorithm=per-token, maxDraft=3, pMin=0.15, trunk=linear)
+info: TensorSharp.Server.ModelService[0]
+      Speculative decoding stats for chat-b710f0a64c654cb89d913df4f6c99807: drafted=21 accepted=20 acceptance=95 % verifySteps=7 plainSteps=0 rollbacks=1 | phaseMs draft=101 verify=221 snapshot=11 rollback=46 catchUp=0 plain=0 | governor plain=0.0ms/tok spec=13.6ms/tok wins=0 losses=0 parked=0
+info: TensorSharp.Server.ModelService[1501]
+      chat.complete tokens=26 promptTokens=280 kvReused=0 kvReusePercent=0.0 ttftMs=641 elapsedMs=954.0 tokensPerSec=27.25 finishReason=eos assistantOutput="\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>"
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1101]
+      HTTP POST /v1/chat/completions -> 200 in 957.8 ms (response content-type=(none))
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1100]
+      HTTP POST /v1/chat/completions from 127.0.0.1 (content-type=application/json, content-length=559)
+info: TensorSharp.Server.OpenAI.ChatCompletions[1500]
+      /v1/chat/completions request: id=chatcmpl-599f12f76c1f49da84067 model=Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003 stream=True maxTokens=256 messages=1 tools=1 skills=0 thinking=False userInput="Call get_weather for Paris. Do not invent its result."
+info: TensorSharp.Server.ModelService[1500]
+      chat.start arch=qwen4exp maxTokens=256 thinking=False tools=1 messages(user=1,assistant=0,system=0) attachments(image=0,audio=0,textFile=0) uploads=[] sampling(temp=0,topK=1,topP=1,minP=0,repeatPenalty=1.1,repeatLastN=64,presencePenalty=0,frequencyPenalty=0,seed=42,stop=(none)) userInput="Call get_weather for Paris. Do not invent its result." fullInput=[{"role":"user","content":"Call get_weather for Paris. Do not invent its result.","contentChars":53}]
+[ChatTemplate] Jinja2 rendering succeeded for 'qwen4exp', prompt length=1237
+info: TensorSharp.Server.ModelService[0]
+      No prompt reuse for chat-8721195dabdc435790615c46ef33a7cf: all 280 prompt token(s) re-prefill. Live KV cache: prompt (280 tokens) has no new suffix past the matched prefix (280) and this model cannot rewind its KV state to re-forward the last token. Retained state: nothing retained yet (no finished request's holder and no shared-prefix checkpoint). Pooled blocks: unavailable for this model (its K/V cannot be restored into another sequence).
+info: TensorSharp.Server.ModelService[0]
+      Speculative decoding armed for chat-8721195dabdc435790615c46ef33a7cf (algorithm=per-token, maxDraft=3, pMin=0.15, trunk=linear)
+info: TensorSharp.Server.ModelService[0]
+      Speculative decoding stats for chat-8721195dabdc435790615c46ef33a7cf: drafted=21 accepted=20 acceptance=95 % verifySteps=7 plainSteps=0 rollbacks=1 | phaseMs draft=64 verify=234 snapshot=11 rollback=39 catchUp=0 plain=0 | governor plain=0.0ms/tok spec=12.1ms/tok wins=0 losses=0 parked=0
+info: TensorSharp.Server.ModelService[1501]
+      chat.complete tokens=26 promptTokens=280 kvReused=0 kvReusePercent=0.0 ttftMs=641 elapsedMs=920.0 tokensPerSec=28.26 finishReason=eos assistantOutput="\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>"
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1101]
+      HTTP POST /v1/chat/completions -> 200 in 953.5 ms (response content-type=text/event-stream)
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1100]
+      HTTP GET /v1/models from 127.0.0.1 (content-type=, content-length=(none))
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1101]
+      HTTP GET /v1/models -> 200 in 0.3 ms (response content-type=application/json; charset=utf-8)
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1100]
+      HTTP GET /v1/models from 127.0.0.1 (content-type=, content-length=(none))
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1101]
+      HTTP GET /v1/models -> 200 in 0.2 ms (response content-type=application/json; charset=utf-8)
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1100]
+      HTTP GET /v1/models from 127.0.0.1 (content-type=, content-length=(none))
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1101]
+      HTTP GET /v1/models -> 200 in 0.2 ms (response content-type=application/json; charset=utf-8)
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1100]
+      HTTP POST /v1/chat/completions from 127.0.0.1 (content-type=application/json, content-length=9909)
+info: TensorSharp.Server.OpenAI.ChatCompletions[1500]
+      /v1/chat/completions request: id=chatcmpl-5a8403d34b5f436faa505 model=Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003 stream=True maxTokens=256 messages=1 tools=0 skills=0 thinking=False userInput="Read the numbers on both sampled video frames in chronological order. Return only JSON with codes as an array of two strings."
+info: TensorSharp.Server.ModelService[1500]
+      chat.start arch=qwen4exp maxTokens=256 thinking=False tools=0 messages(user=1,assistant=0,system=1) attachments(image=2,audio=0,textFile=0) uploads=[{"path":"/workspace/ts-codex-20260916-r4/video-timestamps-r1/app/uploads/b6af9238be1f468292de1164ed4eb032_0001.png","name":"b6af9238be1f468292de1164ed4eb032_0001.png","mediaType":"video_frame"},{"path":"/workspace/ts-codex-20260916-r4/video-timestamps-r1/app/uploads/b6af9238be1f468292de1164ed4eb032_0002.png","name":"b6af9238be1f468292de1164ed4eb032_0002.png","mediaType":"video_frame"}] sampling(temp=0,topK=1,topP=1,minP=0,repeatPenalty=1.1,repeatLastN=64,presencePenalty=0,frequencyPenalty=0,seed=42,stop=(none)) userInput="Read the numbers on both sampled video frames in chronological order. Return only JSON with codes as an array of two strings." fullInput=[{"role":"system","content":"You must answer with valid JSON. Return exactly one JSON object and nothing else. Do not include Markdown code fences, explanations, or extra text before or after the JSON.","contentChars":172},{"role":"user","content":"Read the numbers on both sampled video frames in chronological order. Return only JSON with codes as an array of two strings.","contentChars":125,"images":["/workspace/ts-codex-20260916-r4/video-timestamps-r1/app/uploads/b6af9238be1f468292de1164ed4eb032_0001.png","/workspace/ts-codex-20260916-r4/video-timestamps-r1/app/uploads/b6af9238be1f468292de1164ed4eb032_0002.png"],"isVideo":true}]
+[ChatTemplate] Jinja2 rendering succeeded for 'qwen4exp', prompt length=514
+ done
+  Vision encode: 1874 ms total (patchEmbed 85 ms, blocks 337 ms, proj 1430 ms), 1200 patches -> 300 tokens
+[ChatTemplate] Jinja2 rendering succeeded for 'qwen4exp', prompt length=201
+info: TensorSharp.Server.ModelService[0]
+      No prompt reuse for chat-54886545096c4c3aab6db57ccfc4743e: all 399 prompt token(s) re-prefill. Live KV cache: the request media fingerprint differs from the live cache. Retained state: nothing retained yet (no finished request's holder and no shared-prefix checkpoint). Pooled blocks: unavailable for this model (its K/V cannot be restored into another sequence).
+info: TensorSharp.Server.ModelService[0]
+      BatchExecutor execution plan: PerSequence; rejected: SpeculativePerSequence: pending multimodal embeddings need Forward's inject hook; BatchedPaged: all scheduled sequences have pending multimodal embeddings and the model lacks batched multimodal support
+info: TensorSharp.Server.ModelService[1501]
+      chat.complete tokens=11 promptTokens=399 kvReused=0 kvReusePercent=0.0 ttftMs=724 elapsedMs=1255.3 tokensPerSec=8.76 finishReason=eos assistantOutput="{"codes": ["17", "86"]}"
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1101]
+      HTTP POST /v1/chat/completions -> 200 in 3954.6 ms (response content-type=text/event-stream)
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1100]
+      HTTP POST /v1/chat/completions from 127.0.0.1 (content-type=application/json, content-length=10128)
+info: TensorSharp.Server.OpenAI.ChatCompletions[1500]
+      /v1/chat/completions request: id=chatcmpl-6bd411cb06c541c1a02d5 model=Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003 stream=True maxTokens=256 messages=3 tools=0 skills=0 thinking=False userInput="Using the same video history and its frame timestamps, at what second does 86 appear? Return only JSON with second as a number."
+info: TensorSharp.Server.ModelService[1500]
+      chat.start arch=qwen4exp maxTokens=256 thinking=False tools=0 messages(user=2,assistant=1,system=1) attachments(image=2,audio=0,textFile=0) uploads=[] sampling(temp=0,topK=1,topP=1,minP=0,repeatPenalty=1.1,repeatLastN=64,presencePenalty=0,frequencyPenalty=0,seed=42,stop=(none)) userInput="Using the same video history and its frame timestamps, at what second does 86 appear? Return only JSON with second as a number." fullInput=[{"role":"system","content":"You must answer with valid JSON. Return exactly one JSON object and nothing else. Do not include Markdown code fences, explanations, or extra text before or after the JSON.","contentChars":172},{"role":"user","content":"Read the numbers on both sampled video frames in chronological order. Return only JSON with codes as an array of two strings.","contentChars":125,"images":["/workspace/ts-codex-20260916-r4/video-timestamps-r1/app/uploads/15fce304d04d443b873830c21fc9fc44_0001.png","/workspace/ts-codex-20260916-r4/video-timestamps-r1/app/uploads/15fce304d04d443b873830c21fc9fc44_0002.png"],"isVideo":true},{"role":"assistant","content":"{\"codes\": [\"17\", \"86\"]}","contentChars":23},{"role":"user","content":"Using the same video history and its frame timestamps, at what second does 86 appear? Return only JSON with second as a number.","contentChars":127}]
+[ChatTemplate] Jinja2 rendering succeeded for 'qwen4exp', prompt length=728
+ done
+  Vision encode: 424 ms total (patchEmbed 18 ms, blocks 90 ms, proj 307 ms), 1200 patches -> 300 tokens
+info: TensorSharp.Server.ModelService[0]
+      No prompt reuse for chat-fc106c37ba5e42c7b035df5cce5ad5d8: all 451 prompt token(s) re-prefill. Live KV cache: the request media fingerprint differs from the live cache. Retained state: nothing retained yet (no finished request's holder and no shared-prefix checkpoint). Pooled blocks: unavailable for this model (its K/V cannot be restored into another sequence).
+info: TensorSharp.Server.ModelService[1501]
+      chat.complete tokens=6 promptTokens=451 kvReused=0 kvReusePercent=0.0 ttftMs=735 elapsedMs=877.7 tokensPerSec=6.84 finishReason=eos assistantOutput="{"second": 2}"
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1101]
+      HTTP POST /v1/chat/completions -> 200 in 1578.6 ms (response content-type=text/event-stream)
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1100]
+      HTTP GET /v1/models from 127.0.0.1 (content-type=, content-length=(none))
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1101]
+      HTTP GET /v1/models -> 200 in 0.2 ms (response content-type=application/json; charset=utf-8)
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1100]
+      HTTP GET /v1/models from 127.0.0.1 (content-type=, content-length=(none))
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1101]
+      HTTP GET /v1/models -> 200 in 0.3 ms (response content-type=application/json; charset=utf-8)
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1100]
+      HTTP GET /v1/models from 127.0.0.1 (content-type=, content-length=(none))
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1101]
+      HTTP GET /v1/models -> 200 in 0.2 ms (response content-type=application/json; charset=utf-8)
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1100]
+      HTTP POST /v1/chat/completions from 127.0.0.1 (content-type=application/json, content-length=9870)
+info: TensorSharp.Server.OpenAI.ChatCompletions[1500]
+      /v1/chat/completions request: id=chatcmpl-96d991f2b81d4792aae2b model=Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003 stream=False maxTokens=256 messages=1 tools=0 skills=0 thinking=False userInput="Read the numbers on both sampled video frames in chronological order. Return only JSON with codes as an array of two strings."
+info: TensorSharp.Server.ModelService[1500]
+      chat.start arch=qwen4exp maxTokens=256 thinking=False tools=0 messages(user=1,assistant=0,system=1) attachments(image=2,audio=0,textFile=0) uploads=[{"path":"/workspace/ts-codex-20260916-r4/video-timestamps-r1/app/uploads/20da8b353b36409d8d36286037592250_0001.png","name":"20da8b353b36409d8d36286037592250_0001.png","mediaType":"video_frame"},{"path":"/workspace/ts-codex-20260916-r4/video-timestamps-r1/app/uploads/20da8b353b36409d8d36286037592250_0002.png","name":"20da8b353b36409d8d36286037592250_0002.png","mediaType":"video_frame"}] sampling(temp=0,topK=1,topP=1,minP=0,repeatPenalty=1.1,repeatLastN=64,presencePenalty=0,frequencyPenalty=0,seed=42,stop=(none)) userInput="Read the numbers on both sampled video frames in chronological order. Return only JSON with codes as an array of two strings." fullInput=[{"role":"system","content":"You must answer with valid JSON. Return exactly one JSON object and nothing else. Do not include Markdown code fences, explanations, or extra text before or after the JSON.","contentChars":172},{"role":"user","content":"Read the numbers on both sampled video frames in chronological order. Return only JSON with codes as an array of two strings.","contentChars":125,"images":["/workspace/ts-codex-20260916-r4/video-timestamps-r1/app/uploads/20da8b353b36409d8d36286037592250_0001.png","/workspace/ts-codex-20260916-r4/video-timestamps-r1/app/uploads/20da8b353b36409d8d36286037592250_0002.png"],"isVideo":true}]
+[ChatTemplate] Jinja2 rendering succeeded for 'qwen4exp', prompt length=514
+ done
+  Vision encode: 418 ms total (patchEmbed 20 ms, blocks 86 ms, proj 305 ms), 1200 patches -> 300 tokens
+info: TensorSharp.Server.ModelService[0]
+      No prompt reuse for chat-75236914a7c948e0a2a9f17130674bd9: all 399 prompt token(s) re-prefill. Live KV cache: the request media fingerprint differs from the live cache. Retained state: nothing retained yet (no finished request's holder and no shared-prefix checkpoint). Pooled blocks: unavailable for this model (its K/V cannot be restored into another sequence).
+info: TensorSharp.Server.ModelService[1501]
+      chat.complete tokens=11 promptTokens=399 kvReused=0 kvReusePercent=0.0 ttftMs=678 elapsedMs=912.1 tokensPerSec=12.06 finishReason=eos assistantOutput="{"codes": ["17", "86"]}"
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1101]
+      HTTP POST /v1/chat/completions -> 200 in 1593.9 ms (response content-type=(none))
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1100]
+      HTTP POST /v1/chat/completions from 127.0.0.1 (content-type=application/json, content-length=10087)
+info: TensorSharp.Server.OpenAI.ChatCompletions[1500]
+      /v1/chat/completions request: id=chatcmpl-cfa87fcc622a4f0a93c97 model=Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003 stream=False maxTokens=256 messages=3 tools=0 skills=0 thinking=False userInput="Using the same video history and its frame timestamps, at what second does 86 appear? Return only JSON with second as a number."
+info: TensorSharp.Server.ModelService[1500]
+      chat.start arch=qwen4exp maxTokens=256 thinking=False tools=0 messages(user=2,assistant=1,system=1) attachments(image=2,audio=0,textFile=0) uploads=[] sampling(temp=0,topK=1,topP=1,minP=0,repeatPenalty=1.1,repeatLastN=64,presencePenalty=0,frequencyPenalty=0,seed=42,stop=(none)) userInput="Using the same video history and its frame timestamps, at what second does 86 appear? Return only JSON with second as a number." fullInput=[{"role":"system","content":"You must answer with valid JSON. Return exactly one JSON object and nothing else. Do not include Markdown code fences, explanations, or extra text before or after the JSON.","contentChars":172},{"role":"user","content":"Read the numbers on both sampled video frames in chronological order. Return only JSON with codes as an array of two strings.","contentChars":125,"images":["/workspace/ts-codex-20260916-r4/video-timestamps-r1/app/uploads/d7ccefb43b8d45bfb3ba29066298280f_0001.png","/workspace/ts-codex-20260916-r4/video-timestamps-r1/app/uploads/d7ccefb43b8d45bfb3ba29066298280f_0002.png"],"isVideo":true},{"role":"assistant","content":"{\"codes\":[\"17\",\"86\"]}","contentChars":21},{"role":"user","content":"Using the same video history and its frame timestamps, at what second does 86 appear? Return only JSON with second as a number.","contentChars":127}]
+[ChatTemplate] Jinja2 rendering succeeded for 'qwen4exp', prompt length=728
+ done
+  Vision encode: 454 ms total (patchEmbed 30 ms, blocks 87 ms, proj 329 ms), 1200 patches -> 300 tokens
+info: TensorSharp.Server.ModelService[0]
+      No prompt reuse for chat-dad479d8184343beafa17dbee4cf9a76: all 451 prompt token(s) re-prefill. Live KV cache: the request media fingerprint differs from the live cache. Retained state: nothing retained yet (no finished request's holder and no shared-prefix checkpoint). Pooled blocks: unavailable for this model (its K/V cannot be restored into another sequence).
+info: TensorSharp.Server.ModelService[1501]
+      chat.complete tokens=6 promptTokens=451 kvReused=0 kvReusePercent=0.0 ttftMs=740 elapsedMs=880.0 tokensPerSec=6.82 finishReason=eos assistantOutput="{"second": 2}"
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1101]
+      HTTP POST /v1/chat/completions -> 200 in 1487.4 ms (response content-type=(none))
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1100]
+      HTTP GET /v1/models from 127.0.0.1 (content-type=, content-length=(none))
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1101]
+      HTTP GET /v1/models -> 200 in 0.2 ms (response content-type=application/json; charset=utf-8)
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1100]
+      HTTP GET /v1/models from 127.0.0.1 (content-type=, content-length=(none))
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1101]
+      HTTP GET /v1/models -> 200 in 0.2 ms (response content-type=application/json; charset=utf-8)
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1100]
+      HTTP GET /v1/models from 127.0.0.1 (content-type=, content-length=(none))
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1101]
+      HTTP GET /v1/models -> 200 in 0.2 ms (response content-type=application/json; charset=utf-8)
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1100]
+      HTTP POST /v1/chat/completions from 127.0.0.1 (content-type=application/json, content-length=292719)
+info: TensorSharp.Server.OpenAI.ChatCompletions[1500]
+      /v1/chat/completions request: id=chatcmpl-1dbc64e7ecf24254b0863 model=Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf stream=True maxTokens=256 messages=1 tools=0 skills=0 thinking=False userInput="[validation qwen38-mtp-new-counted-long62k-r1]\nThe quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown...(+291839 chars)"
+info: TensorSharp.Server.ModelService[1500]
+      chat.start arch=qwen4exp maxTokens=256 thinking=False tools=0 messages(user=1,assistant=0,system=0) attachments(image=0,audio=0,textFile=0) uploads=[] sampling(temp=0,topK=0,topP=1,minP=0,repeatPenalty=1,repeatLastN=64,presencePenalty=0,frequencyPenalty=0,seed=42,stop=(none)) userInput="[validation qwen38-mtp-new-counted-long62k-r1]\nThe quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown...(+18 chars)" fullInput=[{"role":"user","content":"[validation qwen38-mtp-new-counted-long62k-r1]\nThe quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown fox jumps over the lazy dog. The quick brown...(+291839 chars)","contentChars":292351,"contentTruncated":true}]
+[ChatTemplate] Jinja2 rendering succeeded for 'qwen4exp', prompt length=292418
+info: TensorSharp.Server.ModelService[0]
+      No prompt reuse for chat-e98d53fc3ac645f4815ada867e0c1daf: all 65065 prompt token(s) re-prefill. Live KV cache: the request media fingerprint differs from the live cache. Retained state: nothing retained yet (no finished request's holder and no shared-prefix checkpoint). Pooled blocks: unavailable for this model (its K/V cannot be restored into another sequence).
+info: TensorSharp.Server.ModelService[0]
+      BatchExecutor execution plan: SpeculativePerSequence
+info: TensorSharp.Server.ModelService[0]
+      Speculative decoding armed for chat-e98d53fc3ac645f4815ada867e0c1daf (algorithm=per-token, maxDraft=3, pMin=0.15, trunk=linear)
+info: TensorSharp.Server.ModelService[0]
+      Speculative decoding stats for chat-e98d53fc3ac645f4815ada867e0c1daf: drafted=33 accepted=33 acceptance=100 % verifySteps=11 plainSteps=5 rollbacks=0 | phaseMs draft=697 verify=932 snapshot=25 rollback=0 catchUp=0 plain=367 | governor plain=63.1ms/tok spec=22.7ms/tok wins=1 losses=0 parked=0
+info: TensorSharp.Server.ModelService[1501]
+      chat.complete tokens=48 promptTokens=65065 kvReused=0 kvReusePercent=0.0 ttftMs=84756 elapsedMs=86044.4 tokensPerSec=0.56 finishReason=eos assistantOutput="\n\n{\n  "ALPHA": "silver-4821",\n  "BETA": "amber-7392",\n  "GAMMA": "violet-1605"\n}"
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1101]
+      HTTP POST /v1/chat/completions -> 200 in 86144.2 ms (response content-type=text/event-stream)
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1100]
+      HTTP GET /v1/models from 127.0.0.1 (content-type=, content-length=(none))
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1101]
+      HTTP GET /v1/models -> 200 in 0.3 ms (response content-type=application/json; charset=utf-8)
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1100]
+      HTTP GET /v1/models from 127.0.0.1 (content-type=, content-length=(none))
+info: TensorSharp.Server.Logging.RequestLoggingMiddleware[1101]
+      HTTP GET /v1/models -> 200 in 0.2 ms (response content-type=application/json; charset=utf-8)
+info: Microsoft.Hosting.Lifetime[0]
+      Application is shutting down...
+/workspace/ts-codex-20260916-r4/repo/ExternalProjects/ggml/src/ggml-backend.cpp:426: GGML_ASSERT(backend) failed
+/workspace/ts-codex-20260916-r4/video-timestamps-r1/app/libGgmlOps.so(+0x13198cb)[0x70f2ae7198cb]
+/workspace/ts-codex-20260916-r4/video-timestamps-r1/app/libGgmlOps.so(ggml_print_backtrace+0x21c)[0x70f2ae719d4c]
+/workspace/ts-codex-20260916-r4/video-timestamps-r1/app/libGgmlOps.so(ggml_abort+0x15b)[0x70f2ae719f2b]
+/workspace/ts-codex-20260916-r4/video-timestamps-r1/app/libGgmlOps.so(+0x133275b)[0x70f2ae73275b]
+/workspace/ts-codex-20260916-r4/video-timestamps-r1/app/libGgmlOps.so(TSGgml_Qwen4ExpMtpFree+0xaf)[0x70f2ad5cd93f]
+[0x72291b56b1bc]

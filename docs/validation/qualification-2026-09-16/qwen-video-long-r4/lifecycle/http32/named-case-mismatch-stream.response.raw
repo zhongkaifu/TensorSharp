@@ -1,0 +1,1 @@
+{"error":{"message":"The named tool_choice function 'Get_Weather' is not declared in tools.","type":"invalid_request_error"}}

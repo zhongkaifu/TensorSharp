@@ -1,0 +1,65 @@
+{
+  "recorded_at_utc": "2026-09-16T16:40:34.998289+00:00",
+  "git_commit": "8aae2f058abf58a93d01a71da4122b2daee17c56",
+  "upstream_revision": "456172ec733a135778adcd32d00e576a58232e45",
+  "upstream_status": "",
+  "platform": "macOS-27.0-arm64-arm-64bit",
+  "machine": "arm64",
+  "compiler": "Apple clang version 21.0.0 (clang-2100.3.34.2)\nTarget: arm64-apple-darwin27.0.0\nThread model: posix\nInstalledDir: /Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin",
+  "build_type": "Release",
+  "backends": [
+    "CPU"
+  ],
+  "build_directory": "/tmp/tensorsharp-boundary-20260916/build",
+  "test_hooks": true,
+  "source_sha256": {
+    "TensorSharp.GGML.Native/CMakeLists.txt": "bab8a27386aee19dd98114dc2a16bdb09a1f55abbaea5a9f8566d5ba39229c02",
+    "TensorSharp.GGML.Native/ggml_ops_deepseek4.cpp": "1335f465c5fd64d28cad94b8050d63bf42ebfbba85fae6cbbbbefdc49d543383",
+    "TensorSharp.GGML.Native/tests/dsv41_dspark_ring_test.cpp": "25a45501b93bcc2aa13cec10081deed365ae2773589d9795b59d38728bb16d7c",
+    "TensorSharp.GGML.Native/tests/attention_exception_boundary_test.cpp": "fad733278c3ef34de83b174c5cbb97f8aead08fba08664964a227501745c7a84",
+    "TensorSharp.GGML.Native/ggml_ops_attention_precision.cpp": "7d38d15c68a4973744d8eb3dc346ca19da4a91d1669e78de4e058b1fe1f8763a",
+    "TensorSharp.GGML.Native/ggml_ops_attention_precision.h": "a564d5ae0d16ca1d3a3509171c89671886727dad756aba95136d68339e138c31",
+    "TensorSharp.GGML.Native/dsv41_dspark.h": "784c5fd2188ce2f67f472f7f5fb072e589199d9171b3126eeb99987a2026b106",
+    "eng/tests/dsv4-execution-boundary.py": "4b1baa1f0350fc7ef41a3cb128c5228e96cc9aa8f46e6e2d9812b2c5a151ee65"
+  },
+  "artifact_sha256": {
+    "/tmp/tensorsharp-boundary-20260916/build/libGgmlOps.dylib": "2ef5df1601135d00456647192ae9c2ee0a975898f7f1f3f1a17708b730e1343b",
+    "/tmp/tensorsharp-boundary-20260916/build/CMakeFiles/GgmlOps.dir/ggml_ops_deepseek4.cpp.o": "31a61f4eabaf4b91a4d7ffacd05ae224d8c8ec56b0f0de25a45712797ab9d053",
+    "/tmp/tensorsharp-boundary-20260916/build/GgmlOpsDsv41DsparkRingTest": "ab63e9f26ea8b9cdd341a37e60ea19406a325c00eb1e639223fb1c37159b6533",
+    "/tmp/tensorsharp-boundary-20260916/build/GgmlOpsAttentionExceptionBoundaryTest": "69c7352508248b971ce8ad87af2bfc6a4520bf00cc7f3bb526224a77e109d6c2",
+    "/tmp/tensorsharp-boundary-20260916/build.log": "9b3c40283c8fa5211ca6d6504e0459a3b037a4e61990eb0989e025cce8840abc",
+    "/tmp/tensorsharp-boundary-20260916/build/CMakeCache.txt": "37b733f944266c16f5f44b2be1e1c4048d8a92a8b66bba7a273442059ec5dedb"
+  },
+  "record_sha256": {
+    "execution-boundary.log": "90df94691e3bba1361126747240af1d15fb7a10a6d33bba95642f6af9492a257",
+    "ctest-detail.log": "ea651ceed060ab9eb78a9de12f4e2147436a06ee59b904b296640a623a12d3ac",
+    "configure.log": "6e3c783e4e17fc0a2b847c1751da7162d274d07d6cd7cf4ee953c7842e2fd8f5",
+    "ctest.log": "a835de87492d8f13eec63685a875091ea278b1121c7f3f0bcdff30b8cdc8b1a9",
+    "execution-boundary.json": "4c7cffe879614360e7bc663b924fd8e327a14cf2c91d178558b0f6c7ba35a6a5",
+    "compile-evidence.log": "c0e26b0b049cb1615b1292bf8cb4f07514ed6855937469f5b4709dd1346ca81a"
+  },
+  "results": {
+    "c_abi_boundary": {
+      "passed": 32,
+      "total": 32,
+      "original_expectations": 30,
+      "added_head_present_refusals": 2
+    },
+    "ctest": {
+      "passed": 2,
+      "total": 2
+    },
+    "dspark_ring": {
+      "checks": 281727,
+      "branches": 24680,
+      "refused": 1680
+    }
+  },
+  "limitations": [
+    "No trained checkpoint inference",
+    "No CUDA or Metal execution",
+    "No physical multi-device feature transfer",
+    "No benchmark or performance-regression measurement",
+    "No final combined tree release qualification"
+  ]
+}

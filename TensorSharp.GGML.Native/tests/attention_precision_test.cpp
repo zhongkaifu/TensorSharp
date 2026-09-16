@@ -1,6 +1,7 @@
 // Copyright (c) Zhongkai Fu. All rights reserved.
 // Licensed under the BSD-3-Clause license in the repository root.
 #include "ggml_ops_attention_precision.h"
+#include "ggml_ops_precision_policy.h"
 #include "ggml-alloc.h"
 #include "precision_test_utils.h"
 #ifdef TSG_GGML_USE_CUDA
@@ -301,8 +302,77 @@ static void check_compaction_guards(ggml_backend_t allocator, ggml_backend_t bac
     ggml_free(ctx);
 }
 
+// A query of a decode-class launch must be bit-identical to the same query
+// computed alone: a V4.1 speculative verify (block_size + 1 queries) commits
+// quantized cache rows that single-token decode would otherwise have written.
+// 64 heads make the widest launch cross the 512-row mark and 300 keys span
+// several key partitions, so neither may change the per-query arithmetic.
+static void check_query_invariance(ggml_backend_t allocator, ggml_backend_t backend)
+{
+    const int head = 64, keys = 300, heads = 64;
+    const int widest = int(TSG_PRECISION_DECODE_COLUMNS);
+    std::vector<float> reference;
+    for (int queries = widest; queries >= 1; --queries)
+    {
+        auto * ctx = ggml_init({4 * 1024 * 1024, nullptr, true});
+        require(ctx != nullptr, "Cannot create query invariance context");
+        input_tensor q(ctx, GGML_TYPE_F32, {head, queries, heads, 1});
+        input_tensor k(ctx, GGML_TYPE_F16, {head, keys, 1, 1});
+        input_tensor v(ctx, GGML_TYPE_F16, {head, keys, 1, 1});
+        input_tensor mask(ctx, GGML_TYPE_F16, {keys, queries, 1, 1});
+        input_tensor sink(ctx, GGML_TYPE_F32, {heads, 1, 1, 1});
+        auto * output = tsg_attention_f32(ctx, q.tensor, k.tensor, v.tensor, mask.tensor, sink.tensor, 1.0f / 8.0f);
+        require(output != nullptr, "Cannot create query invariance graph");
+        auto * graph = ggml_new_graph(ctx);
+        ggml_build_forward_expand(graph, output);
+        auto * buffer = ggml_backend_alloc_ctx_tensors(ctx, allocator);
+        require(buffer != nullptr, "Query invariance allocation failed");
+        std::mt19937 shared_random(50311);
+        std::uniform_real_distribution<float> uniform(-0.5f, 0.5f);
+        for (float & value : k.values) value = uniform(shared_random);
+        for (float & value : v.values) value = uniform(shared_random);
+        for (int h = 0; h < heads; ++h) sink.values[h] = float(h % 5) - 2.0f;
+        const float negative_infinity = -std::numeric_limits<float>::infinity();
+        // Query j carries the same data and sees the same keys in every launch.
+        for (int query = 0; query < queries; ++query)
+        {
+            std::mt19937 query_random(2000 + query);
+            for (int h = 0; h < heads; ++h) for (int x = 0; x < head; ++x)
+                q.values[q.logical(x, query, h, 0)] = uniform(query_random);
+            for (int key = 0; key < keys; ++key)
+            {
+                const bool visible = key < 130 + 20 * query && (key + query) % 9 != 0;
+                mask.values[mask.logical(key, query, 0, 0)] = visible ? -0.125f * ((key + query) % 5) : negative_infinity;
+            }
+        }
+        q.upload(); k.upload(); v.upload(); mask.upload(); sink.upload();
+        require(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS, "Query invariance compute failed");
+        std::vector<float> result(ggml_nelements(output));
+        ggml_backend_tensor_get(output, result.data(), 0, result.size() * sizeof(float));
+        for (float value : result) require(std::isfinite(value), "Query invariance produced a non-finite value");
+        // Output is [Dv, H, N, B]: the first `queries` query slabs are comparable.
+        const size_t per_query = size_t(head) * heads;
+        if (queries == widest) reference = result;
+        else
+        {
+            size_t differing = 0;
+            for (size_t i = 0; i < per_query * size_t(queries); ++i)
+                differing += std::memcmp(&result[i], &reference[i], sizeof(float)) != 0;
+            if (differing)
+                std::fprintf(stderr, "%s queries=%d differs from queries=%d in %zu of %zu outputs\n",
+                    ggml_backend_name(backend), queries, widest, differing, per_query * size_t(queries));
+            require(differing == 0, "A decode-class query must not depend on the other queries in its launch");
+        }
+        ggml_backend_buffer_free(buffer);
+        ggml_free(ctx);
+    }
+    std::printf("%s QUERY_INVARIANCE head=%d keys=%d heads=%d widths=1..%d bit_identical\n",
+        ggml_backend_name(backend), head, keys, heads, widest);
+}
+
 static void run(ggml_backend_t allocator, ggml_backend_t backend)
 {
+    check_query_invariance(allocator, backend);
     for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16})
         check_compaction_guards(allocator, backend, type);
     for (int keys : {15, 16, 17, 255, 256, 257})

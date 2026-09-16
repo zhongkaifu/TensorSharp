@@ -5,7 +5,7 @@
 //
 // TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
 //
-// Nemotron-H's multimodal contract. Its audio path is built during the main model load, so it is an audio SINK without an IAudioEncoderLoader.
+// Nemotron-H's multimodal contract. Audio weights are an optional companion.
 using System.Collections.Generic;
 
 using TensorSharp.Models.Architecture;
@@ -13,7 +13,7 @@ using TensorSharp.Runtime;
 
 namespace TensorSharp.Models
 {
-    public partial class NemotronModel : IVisionCapableModel, IAudioCapableModel, IMultimodalPromptExpander
+    public partial class NemotronModel : IVisionCapableModel, IAudioCapableModel, IAudioEncoderLoader, IMultimodalPromptExpander
     {
         bool IVisionCapableModel.IsVisionEncoderLoaded => VisionEncoder != null;
 

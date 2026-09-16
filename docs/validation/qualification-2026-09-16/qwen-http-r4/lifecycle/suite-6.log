@@ -1,0 +1,3 @@
+long_8k c1 repeat0: 1/1 passed; 7.81s
+long_32k c1 repeat0: 1/1 passed; 35.97s
+long_64k c1 repeat0: 0/1 passed; 0.15s

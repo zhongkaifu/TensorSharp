@@ -1,0 +1,30 @@
+  AdvUtils -> /Users/zhongkaifu/work/TensorSharp/AdvUtils/bin/AdvUtils.dll
+  TensorSharp.Runtime -> /Users/zhongkaifu/work/TensorSharp/TensorSharp.Runtime/bin/TensorSharp.Runtime.dll
+  TensorSharp.AgentHost -> /Users/zhongkaifu/work/TensorSharp/TensorSharp.AgentHost/bin/TensorSharp.AgentHost.dll
+  TensorSharp.Core -> /Users/zhongkaifu/work/TensorSharp/TensorSharp.Core/bin/TensorSharp.Core.dll
+  TensorSharp.Backends.GGML -> /Users/zhongkaifu/work/TensorSharp/TensorSharp.Backends.GGML/bin/TensorSharp.Backends.GGML.dll
+  WARNING: TensorSharp CUDA kernels were not compiled because nvcc was not found. The CUDA backend will keep CPU fallbacks for PTX-backed ops.
+  TensorSharp.Backends.Cuda -> /Users/zhongkaifu/work/TensorSharp/TensorSharp.Backends.Cuda/bin/TensorSharp.Backends.Cuda.dll
+  TensorSharp.Backends.MLX -> /Users/zhongkaifu/work/TensorSharp/TensorSharp.Backends.MLX/bin/TensorSharp.Backends.MLX.dll
+  TensorSharp.Models -> /Users/zhongkaifu/work/TensorSharp/TensorSharp.Models/bin/TensorSharp.Models.dll
+  TensorSharp.Runtime.Logging -> /Users/zhongkaifu/work/TensorSharp/TensorSharp.Runtime.Logging/bin/TensorSharp.Runtime.Logging.dll
+  TensorSharp.Chat -> /Users/zhongkaifu/work/TensorSharp/TensorSharp.Chat/bin/TensorSharp.Chat.dll
+  TensorSharp.Distributed -> /Users/zhongkaifu/work/TensorSharp/TensorSharp.Distributed/bin/TensorSharp.Distributed.dll
+  TensorSharp.Server -> /Users/zhongkaifu/work/TensorSharp/TensorSharp.Server/bin/TensorSharp.Server.dll
+  TensorSharp.Server.Host -> /Users/zhongkaifu/work/TensorSharp/TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll
+  TensorSharp.Cli -> /Users/zhongkaifu/work/TensorSharp/TensorSharp.Cli/bin/TensorSharp.Cli.dll
+  InferenceWeb.Tests -> /Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll
+Test run for /Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll (.NETCoreApp,Version=v10.0)
+A total of 1 test files matched the specified pattern.
+System.Net.Sockets.SocketException (13): Permission denied
+   at System.Net.Sockets.Socket.UpdateStatusAfterSocketErrorAndThrowException(SocketError error, Boolean disconnectOnFailure, String callerName)
+   at System.Net.Sockets.Socket.DoBind(EndPoint endPointSnapshot, SocketAddress socketAddress)
+   at System.Net.Sockets.Socket.Bind(EndPoint localEP)
+   at System.Net.Sockets.TcpListener.Start(Int32 backlog)
+   at Microsoft.VisualStudio.TestPlatform.CommunicationUtilities.SocketServer.Start(String endPoint) in /_/src/vstest/src/Microsoft.TestPlatform.CommunicationUtilities/SocketServer.cs:line 65
+   at Microsoft.VisualStudio.TestPlatform.CommunicationUtilities.TestRequestSender.InitializeCommunication() in /_/src/vstest/src/Microsoft.TestPlatform.CommunicationUtilities/TestRequestSender.cs:line 168
+   at Microsoft.VisualStudio.TestPlatform.CrossPlatEngine.Client.ProxyOperationManager.SetupChannel(IEnumerable`1 sources, String runSettings) in /_/src/vstest/src/Microsoft.TestPlatform.CrossPlatEngine/Client/ProxyOperationManager.cs:line 207
+   at Microsoft.VisualStudio.TestPlatform.CrossPlatEngine.Client.ProxyExecutionManager.InitializeTestRun(TestRunCriteria testRunCriteria, IInternalTestRunEventsHandler eventHandler) in /_/src/vstest/src/Microsoft.TestPlatform.CrossPlatEngine/Client/ProxyExecutionManager.cs:line 184
+
+Test Run Aborted.
+Results File: /tmp/tensorsharp-glm5spec-results/glm5next-cpu.trx

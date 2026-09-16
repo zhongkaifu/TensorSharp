@@ -1,0 +1,12 @@
+  Determining projects to restore...
+  Restored /workspace/ts-glm5spec-r4-derived-r2/Derived.csproj (in 111 ms).
+/workspace/ts-glm5spec-r4-derived-r2/GgmlBackendTestInitializer.cs(44,6): warning CA2255: The 'ModuleInitializer' attribute is only intended to be used in application code or advanced source generator scenarios (https://learn.microsoft.com/dotnet/fundamentals/code-analysis/quality-rules/ca2255) [/workspace/ts-glm5spec-r4-derived-r2/Derived.csproj]
+  Derived -> /workspace/ts-glm5spec-r4-derived-r2/build/InferenceWeb.Tests.dll
+
+Build succeeded.
+
+/workspace/ts-glm5spec-r4-derived-r2/GgmlBackendTestInitializer.cs(44,6): warning CA2255: The 'ModuleInitializer' attribute is only intended to be used in application code or advanced source generator scenarios (https://learn.microsoft.com/dotnet/fundamentals/code-analysis/quality-rules/ca2255) [/workspace/ts-glm5spec-r4-derived-r2/Derived.csproj]
+    1 Warning(s)
+    0 Error(s)
+
+Time Elapsed 00:00:06.87

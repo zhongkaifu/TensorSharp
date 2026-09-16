@@ -1,0 +1,9 @@
+Test project /tmp/ts-numerical-build
+    Start 14: cpu-explicit-f32-matmul
+1/2 Test #14: cpu-explicit-f32-matmul ..........   Passed    0.41 sec
+    Start 15: cpu-explicit-f32-attention
+2/2 Test #15: cpu-explicit-f32-attention .......   Passed    1.90 sec
+
+100% tests passed out of 2
+
+Total Test time (real) =   2.32 sec

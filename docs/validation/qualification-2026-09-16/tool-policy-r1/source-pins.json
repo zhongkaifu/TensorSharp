@@ -1,0 +1,7 @@
+{
+  "files": {
+    "TensorSharp.Server/ProtocolAdapters/OpenAIChatAdapter.ToolChoice.cs": "cec8fc68cea59ffb9982f1dc7000435741b28c0858f0058d89e5996419531cf4",
+    "InferenceWeb.Tests/OpenAIToolChoiceValidationTests.cs": "29dc164a43c50e3a1b1b3c9630295c64e9f11388a20d92a3ad2a319403c5f4e8"
+  },
+  "scope": "Focused managed adapter validation only; model/tool-choice generation enforcement remains unqualified."
+}

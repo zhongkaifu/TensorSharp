@@ -1,0 +1,23 @@
+{
+  "started_utc": "2026-09-16T17:40:39.479751+00:00",
+  "passed": false,
+  "scope": "synthetic production QSA builder arithmetic only",
+  "gate": {
+    "atol": 2e-05,
+    "rtol": 2e-05,
+    "mask": "exact cutoff membership/cardinality; unspecified ties"
+  },
+  "native_path": "/private/tmp/tensorsharp-r4-metal/build/libGgmlOps.dylib",
+  "native_sha256": "b1ed8e429e1408cb5372807f09c21cf6b46c9bca41a5259ea4715d8b92b3c1f4",
+  "script_sha256": "c0cf0c39300279a740928309ad3a0404a6c432f80a896f9149c5abb85c0f19f3",
+  "cases": [],
+  "abi": [],
+  "helper_sha256": "999dc167567d9ef902c5e661b32999cda1f2f0429ce07115badb5ff0eaf96525",
+  "backend": {
+    "requested": "Metal",
+    "native_type": 1
+  },
+  "exception": "Traceback (most recent call last):\n  File \"/Users/zhongkaifu/work/TensorSharp/eng/tests/qwen4exp-qsa.py\", line 255, in main\n    helper.initialize_fixture_backend(dll, args.backend, report)\n  File \"/Users/zhongkaifu/work/TensorSharp/eng/tests/qwen4exp-mtp-operator.py\", line 84, in initialize_fixture_backend\n    if requested in (\"CUDA\", \"Metal\"): raise BackendUnavailable(reason)\nq4e_operator_helpers.BackendUnavailable: ggml-metal backend initialization failed. ggml: ggml_metal_init: error: failed to create command queue | ggml_backend_metal_init: error: failed to allocate context\n",
+  "finished_utc": "2026-09-16T17:40:39.824154+00:00",
+  "exit_code": 77
+}

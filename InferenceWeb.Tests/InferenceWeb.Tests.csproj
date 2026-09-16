@@ -23,6 +23,9 @@
   </ItemGroup>
   <ItemGroup>
     <Using Include="Xunit" />
+    <EmbeddedResource Include="Fixtures/NemotronAudio/reference.json" />
+    <EmbeddedResource Include="Fixtures/NemotronAudio/reference128.json" />
+    <EmbeddedResource Include="Fixtures/NemotronAudio/frontend_reference.json" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\AdvUtils\AdvUtils.csproj" />

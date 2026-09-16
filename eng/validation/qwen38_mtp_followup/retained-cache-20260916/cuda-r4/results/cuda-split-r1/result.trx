@@ -1,0 +1,69 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TestRun id="6b64253d-eb74-438d-a36f-9e8cb63809cd" name="@d71188ba1e2e 2026-09-16 17:45:43" xmlns="http://microsoft.com/schemas/VisualStudio/TeamTest/2010">
+  <Times creation="2026-09-16T17:45:43.5149663+00:00" queuing="2026-09-16T17:45:43.5149665+00:00" start="2026-09-16T17:45:39.4415314+00:00" finish="2026-09-16T17:45:43.5409181+00:00" />
+  <TestSettings name="default" id="36091621-0b8b-43fa-96aa-cd90b8f22367">
+    <Deployment runDeploymentRoot="_d71188ba1e2e_2026-09-16_17_45_43" />
+  </TestSettings>
+  <Results>
+    <UnitTestResult executionId="4e1f74c1-4d3f-44d1-a3e8-b0d33841e950" testId="4e76885b-d7af-a925-a33a-8fc765fddbb1" testName="InferenceWeb.Tests.Qwen4ExpRetainedCacheTests.LayerSplitCandidate_CloneCorePreservesAllDeviceStateAndFullLogits" computerName="d71188ba1e2e" duration="00:00:01.3950078" startTime="2026-09-16T17:45:41.8937102+00:00" endTime="2026-09-16T17:45:43.2534488+00:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="4e1f74c1-4d3f-44d1-a3e8-b0d33841e950">
+      <Output>
+        <StdOut>native /workspace/ts-qwen-retained-r4/tests/bin/Release/net10.0/libGgmlOps.so sha256=7eaf98656edcd043884f3eb776bed68abbee29f5cb446e237bfa16afa5598af7; backend=GgmlCuda
+native /workspace/ts-qwen-retained-r4/tests/bin/Release/net10.0/libGgmlOps.so sha256=7eaf98656edcd043884f3eb776bed68abbee29f5cb446e237bfa16afa5598af7; backend=GgmlCuda
+Physical two-device clone core: GDN/PLE rank0, QSA/MTP rank1; A/B/A independent head and full-logit cold parity.</StdOut>
+      </Output>
+    </UnitTestResult>
+  </Results>
+  <TestDefinitions>
+    <UnitTest name="InferenceWeb.Tests.Qwen4ExpRetainedCacheTests.LayerSplitCandidate_CloneCorePreservesAllDeviceStateAndFullLogits" storage="/workspace/ts-qwen-retained-r4/tests/bin/release/net10.0/inferenceweb.tests.dll" id="4e76885b-d7af-a925-a33a-8fc765fddbb1">
+      <Execution id="4e1f74c1-4d3f-44d1-a3e8-b0d33841e950" />
+      <TestMethod codeBase="/workspace/ts-qwen-retained-r4/tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Qwen4ExpRetainedCacheTests" name="LayerSplitCandidate_CloneCorePreservesAllDeviceStateAndFullLogits" />
+    </UnitTest>
+  </TestDefinitions>
+  <TestEntries>
+    <TestEntry testId="4e76885b-d7af-a925-a33a-8fc765fddbb1" executionId="4e1f74c1-4d3f-44d1-a3e8-b0d33841e950" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+  </TestEntries>
+  <TestLists>
+    <TestList name="Results Not in a List" id="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestList name="All Loaded Results" id="19431567-8539-422a-85d7-44ee4e166bda" />
+  </TestLists>
+  <ResultSummary outcome="Completed">
+    <Counters total="1" executed="1" passed="1" failed="0" error="0" timeout="0" aborted="0" inconclusive="0" passedButRunAborted="0" notRunnable="0" notExecuted="0" disconnected="0" warning="0" completed="0" inProgress="0" pending="0" />
+    <Output>
+      <StdOut>[xUnit.net 00:00:00.00] xUnit.net VSTest Adapter v3.1.4+50e68bbb8b (64-bit .NET 10.0.12)
+[xUnit.net 00:00:00.30]   Discovering: InferenceWeb.Tests
+ggml_cuda_init: found 2 CUDA devices (Total VRAM: 90996 MiB):
+  Device 0: NVIDIA A40, compute capability 8.6, VMM: yes, VRAM: 45498 MiB
+  Device 1: NVIDIA A40, compute capability 8.6, VMM: yes, VRAM: 45498 MiB
+[xUnit.net 00:00:01.61]   Discovered:  InferenceWeb.Tests
+[xUnit.net 00:00:01.64]   Starting:    InferenceWeb.Tests
+[GGML] multi-device (layer split): 2 device(s), no collectives
+Backend: GgmlCuda
+Model: qwen4exp, Layers=2, Hidden=8, Heads=4, KVHeads=2, HeadDim=8, Vocab=260
+  hyper-connections: count=4 lowRank=3 (residual is 32 wide)
+  experts=4 used=2 ff=6 sharedFf=5
+  GDN layers=1/2, QSA indexer heads=1 dim=8 topK=8
+  PLE: layers=[0] ngram=2 heads=1 headDim=8
+Loading model weights... done (57 F32 tensors, 24 quantized tensors)
+  Quantized: 0 MB (0 MB file-backed), F32: 0 MB
+  Layer split: honouring TS_Q4E_LAYER_SPLIT=1,1
+  Layer split across 2 GPUs: gpu0=1 layers/0 MB, gpu1=1 layers/0 MB
+Context length: using GGUF metadata qwen4exp.context_length=1024.
+  Qwen4Exp shared MTP ready: block=2, features=32, draftCompression=0, privateKV=F16, device=1, mappedBytes=10336.
+[GGML] multi-device (layer split): 2 device(s), no collectives
+Backend: GgmlCuda
+Model: qwen4exp, Layers=2, Hidden=8, Heads=4, KVHeads=2, HeadDim=8, Vocab=260
+  hyper-connections: count=4 lowRank=3 (residual is 32 wide)
+  experts=4 used=2 ff=6 sharedFf=5
+  GDN layers=1/2, QSA indexer heads=1 dim=8 topK=8
+  PLE: layers=[0] ngram=2 heads=1 headDim=8
+Loading model weights... done (57 F32 tensors, 24 quantized tensors)
+  Quantized: 0 MB (0 MB file-backed), F32: 0 MB
+  Layer split: honouring TS_Q4E_LAYER_SPLIT=1,1
+  Layer split across 2 GPUs: gpu0=1 layers/0 MB, gpu1=1 layers/0 MB
+Context length: using GGUF metadata qwen4exp.context_length=1024.
+  Qwen4Exp shared MTP ready: block=2, features=32, draftCompression=0, privateKV=F16, device=1, mappedBytes=10336.
+[xUnit.net 00:00:03.10]   Finished:    InferenceWeb.Tests
+</StdOut>
+    </Output>
+  </ResultSummary>
+</TestRun>

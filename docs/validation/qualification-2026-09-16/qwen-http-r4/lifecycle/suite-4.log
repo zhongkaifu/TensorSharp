@@ -1,0 +1,16 @@
+short c1 repeat0: 1/1 passed; 0.29s
+short c4 repeat0: 4/4 passed; 5.09s
+short_zh c1 repeat0: 1/1 passed; 0.69s
+short_zh c4 repeat0: 4/4 passed; 4.85s
+json c1 repeat0: 1/1 passed; 1.20s
+json c4 repeat0: 4/4 passed; 6.66s
+json_schema c1 repeat0: 1/1 passed; 1.45s
+json_schema c4 repeat0: 4/4 passed; 7.93s
+json_unicode c1 repeat0: 1/1 passed; 1.36s
+json_unicode c4 repeat0: 4/4 passed; 7.42s
+multi_turn c1 repeat0: 1/1 passed; 1.26s
+multi_turn c4 repeat0: 4/4 passed; 11.30s
+tool_round_trip c1 repeat0: 1/1 passed; 2.55s
+tool_round_trip c4 repeat0: 4/4 passed; 16.47s
+agentic c1 repeat0: 0/1 passed; 3.74s
+agentic c4 repeat0: 2/4 passed; 28.95s

@@ -1,0 +1,88 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TestRun id="c330de2a-2582-4589-a9a4-0dab9bb873aa" name="@Zhongkais-MacBook-Pro 2026-09-16 10:18:15" xmlns="http://microsoft.com/schemas/VisualStudio/TeamTest/2010">
+  <Times creation="2026-09-16T10:18:15.5677030-07:00" queuing="2026-09-16T10:18:15.5677030-07:00" start="2026-09-16T10:18:14.6589110-07:00" finish="2026-09-16T10:18:15.5700150-07:00" />
+  <TestSettings name="default" id="4f31e85d-7562-4eeb-afb5-3929fa450473">
+    <Deployment runDeploymentRoot="_Zhongkais-MacBook-Pro_2026-09-16_10_18_15" />
+  </TestSettings>
+  <Results>
+    <UnitTestResult executionId="1af133db-da45-4443-95c7-f8c4e3e3ce54" testId="d7ae0da4-feb7-ab0a-f656-37f0da54095a" testName="InferenceWeb.Tests.Qwen4ExpRetainedCacheTests.SharedPrefixChunking_MatchesWholePromptForEachDistinctSuffix" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.1949206" startTime="2026-09-16T10:18:15.3200640-07:00" endTime="2026-09-16T10:18:15.5197760-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Failed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="1af133db-da45-4443-95c7-f8c4e3e3ce54">
+      <Output>
+        <StdOut>native /Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/libGgmlOps.dylib sha256=2fc0af8b2428c258c27998f24d8118ce3644978715708798b7b64232bfe852a5; backend=GgmlCpu
+native /Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/libGgmlOps.dylib sha256=2fc0af8b2428c258c27998f24d8118ce3644978715708798b7b64232bfe852a5; backend=GgmlCpu
+suffix=151 chunked=249 whole=249 maxdiff=0.31553268 rawkeys_equal=True first_rawdiff=-1</StdOut>
+        <ErrorInfo>
+          <Message>Assert.Equal() Failure: Collections differ
+           ↓ (pos 0)
+Expected: [-0.241294086, -0.837764263, -2.06821895, -1.69480085, 3.23790216, ···]
+Actual:   [-0.219035327, -0.759133101, -2.15435433, -1.65444136, 3.12091899, ···]
+           ↑ (pos 0)</Message>
+          <StackTrace>   at InferenceWeb.Tests.Qwen4ExpRetainedCacheTests.SharedPrefixChunking_MatchesWholePromptForEachDistinctSuffix() in /Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/Qwen4ExpRetainedCacheTests.cs:line 369
+   at System.Reflection.MethodBaseInvoker.InterpretedInvoke_Method(Object obj, IntPtr* args)
+   at System.Reflection.MethodBaseInvoker.InvokeWithNoArgs(Object obj, BindingFlags invokeAttr)</StackTrace>
+        </ErrorInfo>
+      </Output>
+    </UnitTestResult>
+  </Results>
+  <TestDefinitions>
+    <UnitTest name="InferenceWeb.Tests.Qwen4ExpRetainedCacheTests.SharedPrefixChunking_MatchesWholePromptForEachDistinctSuffix" storage="/users/zhongkaifu/work/tensorsharp/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="d7ae0da4-feb7-ab0a-f656-37f0da54095a">
+      <Execution id="1af133db-da45-4443-95c7-f8c4e3e3ce54" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Qwen4ExpRetainedCacheTests" name="SharedPrefixChunking_MatchesWholePromptForEachDistinctSuffix" />
+    </UnitTest>
+  </TestDefinitions>
+  <TestEntries>
+    <TestEntry testId="d7ae0da4-feb7-ab0a-f656-37f0da54095a" executionId="1af133db-da45-4443-95c7-f8c4e3e3ce54" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+  </TestEntries>
+  <TestLists>
+    <TestList name="Results Not in a List" id="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestList name="All Loaded Results" id="19431567-8539-422a-85d7-44ee4e166bda" />
+  </TestLists>
+  <ResultSummary outcome="Failed">
+    <Counters total="1" executed="1" passed="0" failed="1" error="0" timeout="0" aborted="0" inconclusive="0" passedButRunAborted="0" notRunnable="0" notExecuted="0" disconnected="0" warning="0" completed="0" inProgress="0" pending="0" />
+    <Output>
+      <StdOut>[xUnit.net 00:00:00.00] xUnit.net VSTest Adapter v3.1.4+50e68bbb8b (64-bit .NET 10.0.10)
+[xUnit.net 00:00:00.06]   Discovering: InferenceWeb.Tests
+[xUnit.net 00:00:00.48]   Discovered:  InferenceWeb.Tests
+[xUnit.net 00:00:00.49]   Starting:    InferenceWeb.Tests
+Backend: GgmlCpu
+Model: qwen4exp, Layers=2, Hidden=8, Heads=4, KVHeads=2, HeadDim=8, Vocab=260
+  hyper-connections: count=4 lowRank=3 (residual is 32 wide)
+  experts=4 used=2 ff=6 sharedFf=5
+  GDN layers=1/2, QSA indexer heads=1 dim=8 topK=8
+  PLE: layers=[0] ngram=2 heads=1 headDim=8
+Loading model weights... done (57 F32 tensors, 24 quantized tensors)
+  Quantized: 0 MB (0 MB file-backed), F32: 0 MB
+Context length: using GGUF metadata qwen4exp.context_length=1024.
+  Qwen4Exp shared MTP ready: block=2, features=32, draftCompression=0, privateKV=F16, device=0, mappedBytes=10336.
+Backend: GgmlCpu
+Model: qwen4exp, Layers=2, Hidden=8, Heads=4, KVHeads=2, HeadDim=8, Vocab=260
+  hyper-connections: count=4 lowRank=3 (residual is 32 wide)
+  experts=4 used=2 ff=6 sharedFf=5
+  GDN layers=1/2, QSA indexer heads=1 dim=8 topK=8
+  PLE: layers=[0] ngram=2 heads=1 headDim=8
+Loading model weights... done (57 F32 tensors, 24 quantized tensors)
+  Quantized: 0 MB (0 MB file-backed), F32: 0 MB
+Context length: using GGUF metadata qwen4exp.context_length=1024.
+  Qwen4Exp shared MTP ready: block=2, features=32, draftCompression=0, privateKV=F16, device=0, mappedBytes=10336.
+[xUnit.net 00:00:00.70]       Assert.Equal() Failure: Collections differ
+[xUnit.net 00:00:00.70]                  ↓ (pos 0)
+[xUnit.net 00:00:00.70]       Expected: [-0.241294086, -0.837764263, -2.06821895, -1.69480085, 3.23790216, ···]
+[xUnit.net 00:00:00.70]       Actual:   [-0.219035327, -0.759133101, -2.15435433, -1.65444136, 3.12091899, ···]
+[xUnit.net 00:00:00.70]                  ↑ (pos 0)
+[xUnit.net 00:00:00.70]       Stack Trace:
+[xUnit.net 00:00:00.70]         /Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/Qwen4ExpRetainedCacheTests.cs(369,0): at InferenceWeb.Tests.Qwen4ExpRetainedCacheTests.SharedPrefixChunking_MatchesWholePromptForEachDistinctSuffix()
+[xUnit.net 00:00:00.70]            at System.Reflection.MethodBaseInvoker.InterpretedInvoke_Method(Object obj, IntPtr* args)
+[xUnit.net 00:00:00.70]            at System.Reflection.MethodBaseInvoker.InvokeWithNoArgs(Object obj, BindingFlags invokeAttr)
+[xUnit.net 00:00:00.70]       Output:
+[xUnit.net 00:00:00.70]         native /Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/libGgmlOps.dylib sha256=2fc0af8b2428c258c27998f24d8118ce3644978715708798b7b64232bfe852a5; backend=GgmlCpu
+[xUnit.net 00:00:00.70]         native /Users/zhongkaifu/work/TensorSharp/InferenceWeb.Tests/bin/Release/net10.0/libGgmlOps.dylib sha256=2fc0af8b2428c258c27998f24d8118ce3644978715708798b7b64232bfe852a5; backend=GgmlCpu
+[xUnit.net 00:00:00.70]         suffix=151 chunked=249 whole=249 maxdiff=0.31553268 rawkeys_equal=True first_rawdiff=-1
+[xUnit.net 00:00:00.70]   Finished:    InferenceWeb.Tests
+</StdOut>
+    </Output>
+    <RunInfos>
+      <RunInfo computerName="Zhongkais-MacBook-Pro" outcome="Error" timestamp="2026-09-16T10:18:15.5209430-07:00">
+        <Text>[xUnit.net 00:00:00.70]     InferenceWeb.Tests.Qwen4ExpRetainedCacheTests.SharedPrefixChunking_MatchesWholePromptForEachDistinctSuffix [FAIL]</Text>
+      </RunInfo>
+    </RunInfos>
+  </ResultSummary>
+</TestRun>

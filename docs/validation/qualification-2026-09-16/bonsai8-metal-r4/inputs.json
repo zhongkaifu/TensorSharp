@@ -1,0 +1,25 @@
+{
+  "checkpoint": "/Users/zhongkaifu/work/models/Bonsai/Bonsai-8B-Q1_0.gguf",
+  "checkpoint_sha256": "284a335aa3fb2ced3b1b01fcb40b08aa783e3b70832767f0dd2e3fdfa134bd54",
+  "size": 1158654496,
+  "mtime_ns": 1788744620585668603,
+  "source_parent": "f7431257148bd5168c0f80e3049b36fc5228c19a8d47448e09e60ff7eb43eb28",
+  "test_source_sha256": "1ccc6bb8632261f87625a5a97dc6cc8151a69622ede11273661f6700bac410e3",
+  "assemblies": {
+    "/private/tmp/tensorsharp-r4-metal/managed-repo/InferenceWeb.Tests/bin/Release/net10.0/TensorSharp.Backends.GGML.dll": "0e457b4032e525b652588558dfdae2cdee9eacfd92d80e76d3eb56bdcd43c448",
+    "/private/tmp/tensorsharp-r4-metal/managed-repo/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll": "95c0cb6f81d863df6e057fa905943bc9a5e120a6b65b1b4f0c49cafd5ca15d55",
+    "/private/tmp/tensorsharp-r4-metal/managed-repo/InferenceWeb.Tests/bin/Release/net10.0/TensorSharp.Distributed.dll": "24df356f109e3710d1f27587442126f017912624fe0f98f8b420c2c23040a4d9",
+    "/private/tmp/tensorsharp-r4-metal/managed-repo/InferenceWeb.Tests/bin/Release/net10.0/TensorSharp.Server.Host.dll": "4ebb5c1ff5cf918eb95129e0bfdc7f05050abf27934eed79f6895a9fbe8c556a",
+    "/private/tmp/tensorsharp-r4-metal/managed-repo/InferenceWeb.Tests/bin/Release/net10.0/TensorSharp.Cli.dll": "0cdba6d5963a3f7b08c1f9c45a2634628cd8492a2610dcf11e3797632baa26e4",
+    "/private/tmp/tensorsharp-r4-metal/managed-repo/InferenceWeb.Tests/bin/Release/net10.0/TensorSharp.Models.dll": "e99a96f31c877eac19921119bea13992ff3d40f84ec17cb9b47a7063a5be823c",
+    "/private/tmp/tensorsharp-r4-metal/managed-repo/InferenceWeb.Tests/bin/Release/net10.0/TensorSharp.Backends.MLX.dll": "946b778a0b5396c1f15259213539a45c392f03ab9b02bef54ee6db38047ba5c1",
+    "/private/tmp/tensorsharp-r4-metal/managed-repo/InferenceWeb.Tests/bin/Release/net10.0/TensorSharp.Backends.Cuda.dll": "7f1e299241bc5460f269d2f4cd061fc1b17931c130e9e2b087cf5cd4916bcba3",
+    "/private/tmp/tensorsharp-r4-metal/managed-repo/InferenceWeb.Tests/bin/Release/net10.0/TensorSharp.AgentHost.dll": "0732c3c7c42c19c8006303d0b5a4a4954aa4245aa119cec7fbc2f1e7667d7da8",
+    "/private/tmp/tensorsharp-r4-metal/managed-repo/InferenceWeb.Tests/bin/Release/net10.0/TensorSharp.Runtime.dll": "1954b013e0dd9d35fd479c5edfe0804f9a15bc19d88f3ec5a0b3b315b01d1d0a",
+    "/private/tmp/tensorsharp-r4-metal/managed-repo/InferenceWeb.Tests/bin/Release/net10.0/TensorSharp.Core.dll": "f845d1be514de262e3fbcb9de97ce8a0025102db30ae03584b01127492b758cb",
+    "/private/tmp/tensorsharp-r4-metal/managed-repo/InferenceWeb.Tests/bin/Release/net10.0/TensorSharp.Server.dll": "f550cfcc3b49bc35e419b22d5f3ba0221f705b2a032bd6d400792b927dfdac05",
+    "/private/tmp/tensorsharp-r4-metal/managed-repo/InferenceWeb.Tests/bin/Release/net10.0/TensorSharp.Chat.dll": "f9cff24da8bd11e34894f4e3819b267b0da1cb40327dcd3f360112e89fdb29c0",
+    "/private/tmp/tensorsharp-r4-metal/managed-repo/InferenceWeb.Tests/bin/Release/net10.0/TensorSharp.Runtime.Logging.dll": "327b05eb9861c54658c293b8592b61a5135d56e9d04a7f3ff7fe68069eb1a127"
+  },
+  "native_sha256": "b1ed8e429e1408cb5372807f09c21cf6b46c9bca41a5259ea4715d8b92b3c1f4"
+}

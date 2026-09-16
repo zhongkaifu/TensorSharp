@@ -1,0 +1,71 @@
+{
+  "platform": "macOS arm64 CPU-only Release",
+  "git_head": "8aae2f058abf58a93d01a71da4122b2daee17c56",
+  "upstream_revision": "456172ec733a135778adcd32d00e576a58232e45",
+  "upstream_status_after": "",
+  "sources": {
+    "TensorSharp.GGML.Native/CMakeLists.txt": "4f14e009932b3585143db8b8af1c63d3d8ab74e4c7acc27454d3fb12a090d16d",
+    "TensorSharp.GGML.Native/ggml_ops_glm_dsa.cpp": "417e077b873494546ce240cf0dff3d49889aec4c55d646f814d6a8045bb48f2e",
+    "TensorSharp.Backends.GGML/GgmlGlmNative.cs": "581dcd9472d0a1c484f75cbdcd3977f968a265a1d0c9fdab1d38ae95fd27122b",
+    "TensorSharp.Models/Models/GlmDsa/GlmDsaModel.cs": "14507d47cdb2d7c635334856fbeef7136e91042a11d0ff71fe03ca20e9e8a906",
+    "TensorSharp.Models/Models/GlmDsa/GlmDsaModel.Speculative.cs": "ed8c86156476202bf264de06a9399fc73e1da9077b00880d48015e8ffa9c521a",
+    "TensorSharp.Models/Models/GlmDsa/GlmDsaModel.Glm5NextSpeculative.cs": "c7e0f6a40605fc0d95ad71d40367cd53618c11ab5e92bbd8b6fb051f2f168245",
+    "TensorSharp.Models/Models/GlmDsa/GlmDsaModel.Native.cs": "7b5158c5e83ec18c060a376949209649b1b48494933bdd36292daa6971180ac7",
+    "TensorSharp.Models/Models/GlmDsa/GlmDsaModel.PerSeqCache.cs": "2763539eeaeba692875f1477cbc0d3a56f561a434bcd92741c061f42229724e0",
+    "TensorAgent/src/TensorAgent.Maui/GgmlExportedSymbols.targets": "cb4c40370dafa022f95b7786d83528bbef3400d7a400a8fb1281689ded64eedf",
+    "InferenceWeb.Tests/GlmDsaSyntheticModelBuilder.cs": "8dc15bf7299bad2336e765a10349a9f10fe32ac89e7b575d91bfb90cf5bd9f74",
+    "InferenceWeb.Tests/Glm5NextSpeculationEligibilityTests.cs": "74bf967e4875b1096e9740bee6af383ddf0510e04f7d9f99891043eb328e2c67",
+    "InferenceWeb.Tests/Glm5NextSpeculativeRollbackTests.cs": "d0e2c5a388c35e6cb9a6ebaf5c063b6905e732e8e94cc9cb54b9c8a595009cbd",
+    "InferenceWeb.Tests/Glm5NextNativeSnapshotBoundaryTests.cs": "a8a79fac09db8090f40c22b5681dfa3d0e65eb093a7d5e67408c6d7bffaa8194",
+    "InferenceWeb.Tests/GlmNativeCudaFact.cs": "d26bbeb5cacabab957149be2866b527b0253253c1fe3fd34f94dcabf13068ae6",
+    "InferenceWeb.Tests/GatedFacts.cs": "1cbfe262a92753071d8f4adbb7d5b0dfbe3918016e3752def61cb7ea290e2867",
+    "InferenceWeb.Tests/NativeGgmlIdentityTests.cs": "5a1da45983ba302329816056c35a7e288de991f8dc406d3c55aa645c9e0e6e01"
+  },
+  "artifacts": {
+    "/tmp/tensorsharp-glm5spec-build/libGgmlOps.dylib": "9ae18f5d1fe201ce4ef4f30397969060c2ea60c5957d456dd1d3dd31712df442",
+    "/tmp/tensorsharp-glm5spec-build/CMakeFiles/GgmlOps.dir/ggml_ops_glm_dsa.cpp.o": "77c2b81a5c7260282afaf13d52ccf808d9ee23ea50c1766c2cbffbdf7b8f980d",
+    "/tmp/tensorsharp-glm5spec-build/CMakeCache.txt": "dfab4d7cdd1bc0b3bc859ba9e907f7512a6615509f86104adff5656be3609d11",
+    "InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll": "e82dbf1f2206e58ff2747255740944c4399bb3101190c812107e88b25087bcf5",
+    "InferenceWeb.Tests/bin/Release/net10.0/TensorSharp.Models.dll": "6a1475c36a7e5b12dd6d3c1f2f1530fc03e21b2a1b47e3c6a5eb691317307fea",
+    "InferenceWeb.Tests/bin/Release/net10.0/TensorSharp.Backends.GGML.dll": "5fc8a0fdd4a00b8b7801651feef90a40685dfa807144bdeedb1219d3f85d132d",
+    "InferenceWeb.Tests/bin/Release/net10.0/libGgmlOps.dylib": "2fc0af8b2428c258c27998f24d8118ce3644978715708798b7b64232bfe852a5"
+  },
+  "records": {
+    "legacy-boundary32.log": "90df94691e3bba1361126747240af1d15fb7a10a6d33bba95642f6af9492a257",
+    "configure.log": "f51c185a9ed30dbae5977989514e311c6cc48d54181b99270774476c2aad4559",
+    "legacy-boundary32.json": "1c045bcb8be1ba9b20d0866147ef97468ed1021ab96b07485a2bc1d0e1707466",
+    "native-build.log.gz": "96994cf1e6acd37ff249e95c25adefc2f33ce90e7a6db363dd15f3c57aff2ce6",
+    "glm5next-cpu.trx": "b8b18595053c737aa8f55a4e5a642da0ca4df9759535fe3ab0afcf1c5482b5e4",
+    "aborted-managed.log": "9d6f1880723e255c2e093aee870f601e12b2976c87bbab39256e8bf0a661b572",
+    "aborted-run.trx": "b274ea89478632f2b9b1cafd0964d1d6a8e12a8cff071680bdf32411f963db3b"
+  },
+  "managed_counts": {
+    "total": "23",
+    "executed": "20",
+    "passed": "20",
+    "failed": "0",
+    "error": "0",
+    "timeout": "0",
+    "aborted": "0",
+    "inconclusive": "0",
+    "passedButRunAborted": "0",
+    "notRunnable": "0",
+    "notExecuted": "0",
+    "disconnected": "0",
+    "warning": "0",
+    "completed": "0",
+    "inProgress": "0",
+    "pending": "0"
+  },
+  "legacy_boundary_passed": 32,
+  "legacy_boundary_total": 32,
+  "release_qualified": false,
+  "limitations": [
+    "Three CUDA cases visibly skipped; no GPU inference in this run",
+    "No trained checkpoint, acceptance-rate, memory or performance qualification",
+    "CPU tensor parallel test oversubscribes one host backend, not physical GPU TP",
+    "All rollback numerical model fixtures use KDA layers; mixed KDA/MLA trained-checkpoint verification remains pending",
+    "Initial VSTest run aborted because sandbox blocked its local communication socket; direct approved retry completed",
+    "Earlier exception-boundary CPU record retains its recorded hashes; its original temporary build path was later rebuilt and is no longer that earlier binary"
+  ]
+}

@@ -97,6 +97,20 @@ namespace TensorSharp.GGML
         private static extern unsafe int TSGgml_GlmMtpCatchUp(IntPtr handle, int* tokens, int nTokens,
             float* hRows, int startPos);
 
+        // ---- glm5next KDA recurrent-state snapshot (speculative rollback) ----
+
+        [DllImport(DllName, CallingConvention = Conv)]
+        private static extern int TSGgml_GlmKdaStateApiVersion();
+
+        [DllImport(DllName, CallingConvention = Conv)]
+        private static extern int TSGgml_GlmKdaStateCapture(IntPtr handle);
+
+        [DllImport(DllName, CallingConvention = Conv)]
+        private static extern int TSGgml_GlmKdaStateRestore(IntPtr handle);
+
+        [DllImport(DllName, CallingConvention = Conv)]
+        private static extern int TSGgml_GlmResetChecked(IntPtr handle);
+
         /// <param name="nGpu">GPUs to spread the layers over; 0 = every visible device.</param>
         /// <param name="nCpuMoe">Leading layers whose routed experts stay in system RAM;
         /// <see cref="CpuMoeAuto"/> offloads the fewest that make the model fit.</param>
@@ -220,6 +234,42 @@ namespace TensorSharp.GGML
             fixed (float* h = hRows)
             {
                 return TSGgml_GlmMtpCatchUp(handle, t, tokens.Length, h, startPos) != 0;
+            }
+        }
+
+        // ---- glm5next KDA recurrent-state snapshot (speculative rollback) ----
+
+        /// <summary>True when the loaded native library exports the KDA snapshot
+        /// API. A library that predates it still loads and runs glm5next, but
+        /// cannot undo a partially rejected speculative window, so the model
+        /// declines speculation on it instead of failing mid-verify.</summary>
+        public static bool KdaStateApiAvailable()
+        {
+            try { return TSGgml_GlmKdaStateApiVersion() >= 1; }
+            catch (EntryPointNotFoundException) { return false; }
+            catch (DllNotFoundException) { return false; }
+        }
+
+        /// <summary>Copy the active slot's KDA recurrent state (every rank and
+        /// layer, device-to-device) into the executor's snapshot arena and record
+        /// the slot's position. Taken right before a speculative verify batch.</summary>
+        public static bool KdaStateCapture(IntPtr handle) => TSGgml_GlmKdaStateCapture(handle) != 0;
+
+        /// <summary>Copy the snapshot back into the active slot and rewind it to the
+        /// captured position. Returns that position, or -1 when no usable snapshot
+        /// exists for the active slot (never taken, taken of another slot, or
+        /// invalidated by a reset / free).</summary>
+        public static int KdaStateRestore(IntPtr handle) => TSGgml_GlmKdaStateRestore(handle);
+
+        public static bool ResetChecked(IntPtr handle)
+        {
+            try { return TSGgml_GlmResetChecked(handle) != 0; }
+            catch (EntryPointNotFoundException)
+            {
+                // Older libraries cannot arm KDA speculation. Preserve their
+                // existing ordinary reset contract without requiring a rebuild.
+                Reset(handle);
+                return true;
             }
         }
     }

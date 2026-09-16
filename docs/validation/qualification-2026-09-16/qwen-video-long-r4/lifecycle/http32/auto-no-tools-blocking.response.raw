@@ -1,0 +1,1 @@
+{"id":"chatcmpl-14c83db6518541759fc89","object":"chat.completion","created":1789583051,"model":"Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf","choices":[{"index":0,"message":{"role":"assistant","content":"\n\napple"},"finish_reason":"stop"}],"usage":{"prompt_tokens":25,"completion_tokens":2,"total_tokens":27,"prompt_tokens_details":{"cached_tokens":0}}}

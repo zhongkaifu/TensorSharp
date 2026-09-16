@@ -1247,6 +1247,33 @@ public class ServerOptionsBuilderTests : IDisposable
     }
 
     [Fact]
+    public void Build_UploadDirectoryCanLiveOutsideApplication()
+    {
+        string application = Path.Combine(_baseDir, "application");
+        string uploads = Path.Combine(_baseDir, "runtime-media");
+        Directory.CreateDirectory(application);
+        _env.Set("TENSORSHARP_UPLOAD_DIR", uploads);
+
+        var options = ServerOptionsBuilder.Build(Array.Empty<string>(), application);
+
+        Assert.Equal(uploads, options.UploadDirectory);
+        Assert.True(Directory.Exists(uploads));
+        Assert.False(Directory.Exists(Path.Combine(application, "uploads")));
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("  ")]
+    public void Build_BlankUploadDirectoryKeepsApplicationDefault(string? configured)
+    {
+        _env.Set("TENSORSHARP_UPLOAD_DIR", configured);
+        var options = ServerOptionsBuilder.Build(Array.Empty<string>(), _baseDir);
+        Assert.Equal(Path.Combine(_baseDir, "uploads"), options.UploadDirectory);
+        Assert.True(Directory.Exists(options.UploadDirectory));
+    }
+
+    [Fact]
     public void Build_UploadFlags_ResolveToBytesAndTimeSpan()
     {
         var options = ServerOptionsBuilder.Build(

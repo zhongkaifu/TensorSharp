@@ -1,0 +1,27 @@
+  Multi-GPU: 3 GPUs by LAYER SPLIT (each GPU holds a contiguous run of whole layers), not tensor parallelism - this architecture shards no weights. Same mode llama.cpp uses for it. This raises capacity; it is not expected to raise decode speed.
+ggml_cuda_init: found 3 CUDA devices (Total VRAM: 136494 MiB):
+  Device 0: NVIDIA A40, compute capability 8.6, VMM: yes, VRAM: 45498 MiB
+  Device 1: NVIDIA A40, compute capability 8.6, VMM: yes, VRAM: 45498 MiB
+  Device 2: NVIDIA A40, compute capability 8.6, VMM: yes, VRAM: 45498 MiB
+[GGML] multi-device (layer split): 3 device(s), no collectives
+Backend: GgmlCuda
+Model: qwen4exp, Layers=48, Hidden=2560, Heads=24, KVHeads=2, HeadDim=256, Vocab=248320
+  hyper-connections: count=4 lowRank=320 (residual is 10240 wide)
+  experts=512 used=10 ff=640 sharedFf=640
+  GDN layers=36/48, QSA indexer heads=4 dim=128 topK=2048
+  PLE: layers=[1] ngram=3 heads=16 headDim=160
+  Prefaulted GGUF page cache: 46.5 GiB with 16 read streams in 1.1s (41.73 GiB/s)
+Loading model weights... done (557 F32 tensors, 74251 quantized tensors)
+  Quantized: 74905 MB (74905 MB file-backed), F32: 298 MB
+  Layer split across 3 GPUs: gpu0=16 layers/16201 MB, gpu1=17 layers/16570 MB, gpu2=15 layers/17610 MB
+  Device-resident quantized weights: 3073 MB across 521 tensors
+Context length: using MAX_CONTEXT=65536; model declares qwen4exp.context_length=262144.
+  Qwen4Exp shared MTP ready: block=48, features=10240, draftCompression=0, privateKV=F16, device=2, mappedBytes=2772343808.
+json width=1 unequal=0/90 argmax_changes=0 max_abs=0
+json width=2 unequal=90/90 argmax_changes=1 max_abs=2.53569961
+json width=3 unequal=90/90 argmax_changes=1 max_abs=2.53569961
+json width=4 unequal=90/90 argmax_changes=2 max_abs=2.70457411
+retained-A width=1 unequal=0/31 argmax_changes=0 max_abs=0
+retained-A width=2 unequal=31/31 argmax_changes=1 max_abs=2.94209397
+retained-A width=3 unequal=31/31 argmax_changes=1 max_abs=2.94209397
+retained-A width=4 unequal=31/31 argmax_changes=1 max_abs=3.14730513

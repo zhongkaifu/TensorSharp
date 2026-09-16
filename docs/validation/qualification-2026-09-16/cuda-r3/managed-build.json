@@ -1,0 +1,18 @@
+{
+  "status": "passed",
+  "managed_assemblies": {
+    "TensorSharp.AgentHost.dll": "f9165a540dfe65e1883b7118f0d27f913090eec0a89a333d59c49feade07a64c",
+    "TensorSharp.Backends.Cuda.dll": "ab3f2ac984c7322149062ab6446024f68954f8b6574c6d284a99c72011a019f1",
+    "TensorSharp.Backends.GGML.dll": "4f718a5e456ffb013c51f0634b0a1c2353a2462f69c018800b0735c08be0540a",
+    "TensorSharp.Backends.MLX.dll": "bafbdb2be6b1c6abdbec806e6d6567ddd7c17b55f941660e0cf7aa5d30354996",
+    "TensorSharp.Chat.dll": "183fc5d904ba3b2c70a15774e3cd3b75003bc89783766b5bb995cfe571bc0307",
+    "TensorSharp.Core.dll": "e11296d8efad82b888dc6745bd0ff33b9c56e248e15de3e02bb8d2ca78aaa723",
+    "TensorSharp.Distributed.dll": "794f3ca3072b9fffe0193dc76712dc43c0bec9060e8ea9c5827c49a19682723f",
+    "TensorSharp.Models.dll": "87cda1ce95b735756c6fa116debd90b456e427f36b2993f12e0ff678506da593",
+    "TensorSharp.Runtime.Logging.dll": "8f6af8fab910e693f853988dc0d1423838268f905e74974a951616551ea3aef1",
+    "TensorSharp.Runtime.dll": "7ddd58f50c0cd85a70ddef369f9824f14417e7ba5ecf4c60bac6c5c777286fd8",
+    "TensorSharp.Server.Host.dll": "7b32705f506e5065e4ce8d9a655be788ca3edb4ad3421db668957b12b877382a",
+    "TensorSharp.Server.dll": "63b39aa350abe920a38964685771bc4316cb6bb0a9c7b5106e7f9c9430b9f14d"
+  },
+  "source_manifest_sha256": "649305ac55cf9a325ff82159db287f3c01d95498f4fab82cc22a498912123205"
+}

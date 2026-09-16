@@ -1,0 +1,9 @@
+  Determining projects to restore...
+  Restored /workspace/ts-codex-20260916-r4/history-probe-r1/source/Probe.csproj (in 207 ms).
+  Probe -> /workspace/ts-codex-20260916-r4/history-probe-r1/build/QwenHistoryProbe.dll
+
+Build succeeded.
+    0 Warning(s)
+    0 Error(s)
+
+Time Elapsed 00:00:08.52

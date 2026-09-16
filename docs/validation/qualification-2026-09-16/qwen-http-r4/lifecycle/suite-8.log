@@ -1,0 +1,14 @@
+required c1 r0: 1/1 passed
+required c4 r0: 4/4 passed
+named c1 r0: 1/1 passed
+named c4 r0: 4/4 passed
+none_history c1 r0: 1/1 passed
+none_history c4 r0: 4/4 passed
+single_call c1 r0: 1/1 passed
+single_call c4 r0: 4/4 passed
+two_calls c1 r0: 0/1 passed
+two_calls c4 r0: 2/4 passed
+required_thinking c1 r0: 1/1 passed
+named_thinking c1 r0: 1/1 passed
+invalid_required c1 r0: 1/1 passed
+invalid_named c1 r0: 1/1 passed

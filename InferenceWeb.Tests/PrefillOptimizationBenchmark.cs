@@ -698,26 +698,42 @@ public class PrefillOptimizationBenchmark
         }
     }
 
-    private static void NeoXRoPE_Parallel(float[] data, int seqLen, int numHeads, int headDim,
+    private static unsafe void NeoXRoPE_Parallel(float[] data, int seqLen, int numHeads, int headDim,
         float[] cosTab, float[] sinTab, int ropeHalf)
     {
-        System.Threading.Tasks.Parallel.For(0, seqLen, s =>
-        {
-            int tableOff = s * ropeHalf;
-            for (int h = 0; h < numHeads; h++)
+        fixed (float* pointer = data)
+            NeoXRopeCpu.Apply(pointer, seqLen, numHeads, headDim, cosTab, sinTab, ropeHalf);
+    }
+
+    [Theory]
+    [InlineData(1, 1, 6, 3)]
+    [InlineData(31, 3, 20, 7)]
+    [InlineData(64, 16, 256, 128)]
+    [InlineData(65, 16, 266, 129)]
+    [InlineData(1024, 16, 256, 128)]
+    public void CpuNeoXRoPE_MatchesScalarIncludingPartialRowsAndRotaryTail(
+        int seqLen, int heads, int dimension, int rotaryHalf)
+    {
+        var random = new Random(76);
+        var original = Enumerable.Range(0, seqLen * heads * dimension)
+            .Select(_ => (float)(random.NextDouble() * 2 - 1)).ToArray();
+        var expected = (float[])original.Clone();
+        var actual = (float[])original.Clone();
+        var cos = new float[seqLen * rotaryHalf];
+        var sin = new float[cos.Length];
+        for (int s = 0; s < seqLen; s++)
+            for (int j = 0; j < rotaryHalf; j++)
             {
-                int baseIdx = (s * numHeads + h) * headDim;
-                for (int j = 0; j < ropeHalf; j++)
-                {
-                    float cos = cosTab[tableOff + j];
-                    float sin = sinTab[tableOff + j];
-                    float x0 = data[baseIdx + j];
-                    float x1 = data[baseIdx + j + ropeHalf];
-                    data[baseIdx + j] = x0 * cos - x1 * sin;
-                    data[baseIdx + j + ropeHalf] = x0 * sin + x1 * cos;
-                }
+                float angle = (s + 71) / MathF.Pow(10000, (float)j / rotaryHalf);
+                cos[s * rotaryHalf + j] = MathF.Cos(angle);
+                sin[s * rotaryHalf + j] = MathF.Sin(angle);
             }
-        });
+        NeoXRoPE_Serial(expected, seqLen, heads, dimension, cos, sin, rotaryHalf);
+        NeoXRoPE_Parallel(actual, seqLen, heads, dimension, cos, sin, rotaryHalf);
+        float maxDifference = 0;
+        for (int i = 0; i < actual.Length; i++)
+            maxDifference = MathF.Max(maxDifference, MathF.Abs(expected[i] - actual[i]));
+        Assert.True(maxDifference <= 1e-6f, $"Scalar rotation max difference: {maxDifference:R}");
     }
 
     // ---------------------------------------------------------------

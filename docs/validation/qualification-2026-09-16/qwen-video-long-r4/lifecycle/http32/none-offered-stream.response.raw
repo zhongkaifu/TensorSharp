@@ -1,0 +1,8 @@
+data: {"id":"chatcmpl-cca39586055641dcbc5cc","object":"chat.completion.chunk","created":1789583046,"model":"Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf","choices":[{"index":0,"delta":{"role":null,"content":"\n\n"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-cca39586055641dcbc5cc","object":"chat.completion.chunk","created":1789583046,"model":"Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf","choices":[{"index":0,"delta":{"role":null,"content":"apple"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-cca39586055641dcbc5cc","object":"chat.completion.chunk","created":1789583046,"model":"Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf","choices":[{"index":0,"delta":{"role":null,"content":null},"finish_reason":"stop"}],"usage":{"prompt_tokens":25,"completion_tokens":2,"total_tokens":27,"prompt_tokens_details":{"cached_tokens":0}}}
+
+data: [DONE]
+

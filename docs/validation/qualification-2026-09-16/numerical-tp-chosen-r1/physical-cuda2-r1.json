@@ -1,0 +1,27 @@
+{
+  "started_utc": "2026-09-16T19:08:35.126925+00:00",
+  "physical_gpus": [
+    0,
+    6
+  ],
+  "free_mib_before": {
+    "0": 11802,
+    "1": 6068,
+    "2": 10264,
+    "3": 12336,
+    "4": 25200,
+    "5": 11628,
+    "6": 45498
+  },
+  "binary_sha256": "a95f2a72ea4e84331bca8c5dcf7ad226bcadcd1f54282d33a4723d112ae4d9f8",
+  "shared_load": true,
+  "performance_qualified": false,
+  "command": [
+    "/workspace/ts-tp-chosen-prototype-20260916/integrated-test",
+    "--cuda",
+    "2",
+    "--checkpoint-shape"
+  ],
+  "exit_code": 0,
+  "finished_utc": "2026-09-16T19:09:29.417607+00:00"
+}

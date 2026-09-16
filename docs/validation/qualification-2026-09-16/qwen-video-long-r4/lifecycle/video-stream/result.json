@@ -1,0 +1,89 @@
+{
+  "status": "passed",
+  "release_qualified": false,
+  "case": "video2-history",
+  "sampling": {
+    "indices": [
+      0,
+      2
+    ],
+    "seconds": [
+      0,
+      2
+    ]
+  },
+  "expected": [
+    {
+      "codes": [
+        "17",
+        "86"
+      ]
+    },
+    {
+      "second": 2
+    }
+  ],
+  "turns": [
+    {
+      "turn": 0,
+      "status": "passed",
+      "request_sha256": "c5b72b5cbe8da45ef0f48a3240a571d84f93a8f33271548f528544a25b602c88",
+      "expected": {
+        "codes": [
+          "17",
+          "86"
+        ]
+      },
+      "started_unix": 1789583055.9603052,
+      "http_status": 200,
+      "response_sha256": "c08165a99ed41b60950f50bc5ea048860dcad1bf6e9747d95bebd0f6e4091f61",
+      "parsed": {
+        "message": {
+          "role": "assistant",
+          "content": "{\"codes\": [\"17\", \"86\"]}"
+        },
+        "finish": "stop",
+        "usage": {
+          "prompt_tokens": 399,
+          "completion_tokens": 11,
+          "total_tokens": 410,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "done": true
+      },
+      "wall_seconds": 4.0088419914245605
+    },
+    {
+      "turn": 1,
+      "status": "passed",
+      "request_sha256": "d41f72733f3feee0eeed0384d089972c2f6fc81b0a8b7da1f03a49a70c6dc008",
+      "expected": {
+        "second": 2
+      },
+      "started_unix": 1789583059.9767392,
+      "http_status": 200,
+      "response_sha256": "4499d42d31d877b52758a794ff9445938977f8d38175aa4d53e6f9a1d1f8a0bc",
+      "parsed": {
+        "message": {
+          "role": "assistant",
+          "content": "{\"second\": 2}"
+        },
+        "finish": "stop",
+        "usage": {
+          "prompt_tokens": 451,
+          "completion_tokens": 6,
+          "total_tokens": 457,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "done": true
+      },
+      "wall_seconds": 1.5938177108764648
+    }
+  ],
+  "scope": "Actual OpenAI request. Video rejection is a runtime gap, not passed media coverage; long case is new and QSA-unqualified.",
+  "unrun_turns": 0
+}

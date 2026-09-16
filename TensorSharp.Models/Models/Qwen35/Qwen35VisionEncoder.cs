@@ -63,6 +63,15 @@ namespace TensorSharp.Models
         public int PatchSize => _patchSize;
         public int SpatialMergeSize => _spatialMergeSize;
 
+        /// <summary>
+        /// Frames the patch embedding merges into one temporal patch: 2 when the
+        /// projector ships the second conv slice (<c>v.patch_embd.weight.1</c>), as
+        /// every Qwen-VL tower does, else 1. A still image fills both slices with
+        /// itself (the combined weight); a video pair fills them with consecutive
+        /// frames through <see cref="Encode(float[], float[], int, int)"/>.
+        /// </summary>
+        public int TemporalPatchSize => _weights.ContainsKey("v.patch_embd.weight.1") ? 2 : 1;
+
         public Qwen35VisionEncoder(string mmProjPath, IAllocator allocator)
         {
             _allocator = allocator;
@@ -147,8 +156,42 @@ namespace TensorSharp.Models
         /// Input: pixelValues float array in channel-first [C, H, W], resized dimensions.
         /// Output: Tensor of shape [numMergedTokens, projectionDim].
         /// </summary>
-        public unsafe Tensor Encode(float[] pixelValues, int resizedH, int resizedW)
+        public Tensor Encode(float[] pixelValues, int resizedH, int resizedW)
+            => EncodeCore(pixelValues, null, resizedH, resizedW);
+
+        /// <summary>
+        /// Encode one temporal patch of a video: two consecutive sampled frames, both
+        /// channel-first [C, H, W] at the same resized size, merged by the patch
+        /// embedding's two temporal conv slices exactly as the Qwen-VL processor stacks
+        /// them (frame order matters: the first frame meets <c>v.patch_embd.weight</c>,
+        /// the second <c>v.patch_embd.weight.1</c>). Everything after the patch
+        /// embedding is the still-image path, which is the reference behaviour: the
+        /// tower attends within one temporal patch only. Output:
+        /// [numMergedTokens, projectionDim], the same token count as one still frame.
+        /// </summary>
+        public Tensor Encode(float[] firstFrame, float[] secondFrame, int resizedH, int resizedW)
         {
+            ArgumentNullException.ThrowIfNull(firstFrame);
+            ArgumentNullException.ThrowIfNull(secondFrame);
+            if (TemporalPatchSize != 2)
+                throw new NotSupportedException(
+                    "This vision projector has no second temporal patch slice (v.patch_embd.weight.1), " +
+                    "so it cannot merge a pair of video frames.");
+            if (firstFrame.Length != secondFrame.Length)
+                throw new ArgumentException("Both frames of a temporal patch must have the same resized size.");
+            return EncodeCore(firstFrame, secondFrame, resizedH, resizedW);
+        }
+
+        private unsafe Tensor EncodeCore(float[] pixelValues, float[] secondFrame, int resizedH, int resizedW)
+        {
+            ArgumentNullException.ThrowIfNull(pixelValues);
+            int factor = checked(_patchSize * _spatialMergeSize);
+            if (resizedH <= 0 || resizedW <= 0 || resizedH % factor != 0 || resizedW % factor != 0)
+                throw new ArgumentException($"Vision dimensions must be positive multiples of {factor}.");
+            long expectedPixels = checked(3L * resizedH * resizedW);
+            if (pixelValues.LongLength != expectedPixels ||
+                (secondFrame != null && secondFrame.LongLength != expectedPixels))
+                throw new ArgumentException("Each frame must contain exactly 3 * height * width channel-first values.");
             long encodeStart = Stopwatch.GetTimestamp();
             int gridH = resizedH / _patchSize;
             int gridW = resizedW / _patchSize;
@@ -164,7 +207,7 @@ namespace TensorSharp.Models
             //    embedding below is built in the same order, so the sum is exactly
             //    the raster pipeline's result with its rows permuted.
             long t0 = Stopwatch.GetTimestamp();
-            var blockOrdered = PatchEmbed(pixelValues, resizedH, resizedW, gridH, gridW);
+            var blockOrdered = PatchEmbed(pixelValues, secondFrame, resizedH, resizedW, gridH, gridW);
             long patchEmbedTicks = Stopwatch.GetTimestamp() - t0;
             Trace("patchEmbed", blockOrdered);
 
@@ -272,28 +315,37 @@ namespace TensorSharp.Models
         /// <see cref="GetOrCreateBlockOrder"/>) rather than raster order, so the
         /// encoder never needs a separate reorder pass over the embedded patches.
         /// </summary>
-        private unsafe Tensor PatchEmbed(float[] pixelValues, int imgH, int imgW, int gridH, int gridW)
+        private unsafe Tensor PatchEmbed(float[] pixelValues, float[] secondFrame, int imgH, int imgW, int gridH, int gridW)
         {
             int numPatches = gridH * gridW;
             int C = 3;
             int P = _patchSize;
             int patchStride = C * P * P;
+            // A video pair is one im2col row of BOTH frames' patches side by side
+            // ([frame0 C*P*P | frame1 C*P*P]) against the two temporal conv slices
+            // concatenated the same way, which is conv3d with kernel (2, P, P) over
+            // the stacked frames. A still image keeps the summed (combined) slice.
+            int frames = secondFrame != null ? 2 : 1;
+            int rowStride = frames * patchStride;
 
-            string wName = _weights.ContainsKey("v.patch_embd.combined")
-                ? "v.patch_embd.combined" : "v.patch_embd.weight";
-            var convWeight = _weights[wName];
+            string wName = secondFrame != null
+                ? "v.patch_embd.temporal"
+                : _weights.ContainsKey("v.patch_embd.combined") ? "v.patch_embd.combined" : "v.patch_embd.weight";
+            Tensor convWeight = secondFrame != null
+                ? GetOrCreateTemporalPatchWeight(patchStride)
+                : _weights[wName];
             // convWeight shape (post-load reverse): [hiddenSize, C, P, P]. We view it as a
             // 2D matrix [hiddenSize, patchStride] for the matmul. This relies on the weight
             // being stored row-major in C * P * P element order per output channel, which is
             // how PyTorch / GGUF lay out conv2d weights.
             string biasName = "v.patch_embd.bias";
 
-            Tensor weightView2D = GetOrCreatePatchEmbedWeight2D(convWeight, wName, patchStride);
+            Tensor weightView2D = GetOrCreatePatchEmbedWeight2D(convWeight, wName, rowStride);
             Tensor weightT = GetOrCreatePatchEmbedTransposed(weightView2D, wName);
 
-            // Build im2col matrix [numPatches, patchStride] in parallel.
+            // Build im2col matrix [numPatches, rowStride] in parallel.
             int[] blockOrder = GetOrCreateBlockOrder(gridH, gridW);
-            var im2col = new Tensor(_allocator, DType.Float32, numPatches, patchStride);
+            var im2col = new Tensor(_allocator, DType.Float32, numPatches, rowStride);
             using (var staging = new HostStaging(im2col, _cudaDirect))
             {
                 float* im2colPtr = staging.Ptr;
@@ -301,13 +353,14 @@ namespace TensorSharp.Models
                 // Capture pointer locally since pixelValues is a managed array - we pin once
                 // via fixed at the top so the inner Parallel.For lambda can share the address.
                 fixed (float* pixSrc = pixelValues)
+                fixed (float* pixSrc2 = secondFrame)
                 fixed (int* orderSrc = blockOrder)
                 {
                     long pixSrcL = (long)pixSrc;
+                    long pixSrc2L = (long)pixSrc2;
                     long orderSrcL = (long)orderSrc;
                     Parallel.For(0, gridH, brow =>
                     {
-                        float* pixSrcLocal = (float*)pixSrcL;
                         int* order = (int*)orderSrcL;
                         for (int col = 0; col < gridW; col++)
                         {
@@ -317,21 +370,26 @@ namespace TensorSharp.Models
                             int rasterIdx = order[destIdx];
                             int py = rasterIdx / gridW;
                             int px = rasterIdx - py * gridW;
-                            float* outRow = im2colPtr + (long)destIdx * patchStride;
+                            float* outRow = im2colPtr + (long)destIdx * rowStride;
                             int yBase = py * P;
                             int xBase = px * P;
 
-                            for (int c = 0; c < C; c++)
+                            for (int f = 0; f < frames; f++)
                             {
-                                long imgChannelOffset = (long)c * imgH * imgW;
-                                long outChannelOffset = (long)c * P * P;
-                                for (int ky = 0; ky < P; ky++)
+                                float* pixSrcLocal = (float*)(f == 0 ? pixSrcL : pixSrc2L);
+                                float* frameRow = outRow + (long)f * patchStride;
+                                for (int c = 0; c < C; c++)
                                 {
-                                    int imgY = yBase + ky;
-                                    long srcOffset = imgChannelOffset + (long)imgY * imgW + xBase;
-                                    long dstOffset = outChannelOffset + (long)ky * P;
-                                    Buffer.MemoryCopy(pixSrcLocal + srcOffset, outRow + dstOffset,
-                                        P * sizeof(float), P * sizeof(float));
+                                    long imgChannelOffset = (long)c * imgH * imgW;
+                                    long outChannelOffset = (long)c * P * P;
+                                    for (int ky = 0; ky < P; ky++)
+                                    {
+                                        int imgY = yBase + ky;
+                                        long srcOffset = imgChannelOffset + (long)imgY * imgW + xBase;
+                                        long dstOffset = outChannelOffset + (long)ky * P;
+                                        Buffer.MemoryCopy(pixSrcLocal + srcOffset, frameRow + dstOffset,
+                                            P * sizeof(float), P * sizeof(float));
+                                    }
                                 }
                             }
                         }
@@ -391,6 +449,33 @@ namespace TensorSharp.Models
                     _tensor.ElementCount() * sizeof(float));
                 _handle.Free();
             }
+        }
+
+        /// <summary>
+        /// The two temporal conv slices side by side as one [hiddenSize, 2 * C * P * P]
+        /// matrix, the weight a video pair's im2col row multiplies. Built once.
+        /// </summary>
+        private Tensor GetOrCreateTemporalPatchWeight(int patchStride)
+        {
+            const string key = "v.patch_embd.temporal";
+            if (_weights.TryGetValue(key, out var cached))
+                return cached;
+
+            var w0 = _weights["v.patch_embd.weight"];
+            var w1 = _weights["v.patch_embd.weight.1"];
+            int outDim = (int)w0.Sizes[0];
+            float[] a = w0.GetElementsAsFloat(outDim * patchStride);
+            float[] b = w1.GetElementsAsFloat(outDim * patchStride);
+            float[] rows = new float[(long)outDim * 2 * patchStride];
+            for (int o = 0; o < outDim; o++)
+            {
+                Array.Copy(a, (long)o * patchStride, rows, (long)o * 2 * patchStride, patchStride);
+                Array.Copy(b, (long)o * patchStride, rows, (long)o * 2 * patchStride + patchStride, patchStride);
+            }
+            var temporal = new Tensor(_allocator, DType.Float32, outDim, 2 * patchStride);
+            temporal.SetElementsAsFloat(rows);
+            _weights[key] = temporal;
+            return temporal;
         }
 
         private Tensor GetOrCreatePatchEmbedWeight2D(Tensor convWeight, string weightName, int patchStride)
@@ -1280,4 +1365,3 @@ namespace TensorSharp.Models
         }
     }
 }
-

@@ -74,7 +74,7 @@ internal static class Program
         // join the model at construction; only Gemma 4's assistant head attaches after.
         if (o.DraftModel != null)
             Environment.SetEnvironmentVariable(SpeculationEnvVars.DraftModel, o.DraftModel);
-        using ModelBase model = ModelBase.Create(o.Model, backend);
+        using ModelBase model = ModelBase.Create(o.Model, backend, draftModelPath: o.DraftModel);
         if (o.DraftModel != null && !SpeculativeDraftHeadLoader.TryAttachConfiguredDraftHead(model, out string err))
             Console.Error.WriteLine($"[agent-turn-bench] draft head NOT attached: {err}");
         if (o.MmProj != null)

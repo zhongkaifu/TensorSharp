@@ -1,6 +1,7 @@
 // Copyright (c) Zhongkai Fu. All rights reserved.
 // Licensed under the BSD-3-Clause license in the repository root.
 #include "ggml_ops_matmul_precision.h"
+#include "ggml_ops_precision_policy.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #ifdef TSG_GGML_USE_CUDA
@@ -152,8 +153,72 @@ static void check(ggml_backend_t allocator, ggml_backend_t backend, const test_c
     ggml_free(ctx);
 }
 
+// A column of a decode-class launch must be bit-identical to the same column
+// computed alone: V4.1 quantizes these outputs into its caches, and a
+// speculative verify (block_size + 1 columns) stands in for single-token
+// decode steps. The widest decode-class launch is the reference; every
+// narrower prefix of the same columns must reproduce it exactly.
+static void check_column_invariance(ggml_backend_t allocator, ggml_backend_t backend, ggml_type weights, bool indexed)
+{
+    const int inner = 4096, rows = 96, experts = 4, used = 2;
+    const int widest = int(TSG_PRECISION_DECODE_COLUMNS);
+    std::vector<float> reference;
+    for (int tokens = widest; tokens >= 1; --tokens)
+    {
+        auto * ctx = ggml_init({4 * 1024 * 1024, nullptr, true});
+        require(ctx != nullptr, "Cannot create column invariance context");
+        input_tensor a(ctx, weights, {inner, rows, indexed ? experts : 1, 1});
+        input_tensor b(ctx, GGML_TYPE_F32, indexed ? std::array<int64_t, 4>{inner, 1, tokens, 1}
+                                                   : std::array<int64_t, 4>{inner, tokens, 1, 1});
+        input_tensor ids(ctx, GGML_TYPE_I32, {indexed ? used : 1, indexed ? tokens : 1, 1, 1});
+        auto * output = indexed ? tsg_matmul_id_f32(ctx, a.tensor, b.tensor, ids.tensor)
+                                : tsg_matmul_f32(ctx, a.tensor, b.tensor);
+        require(output != nullptr && output->op == GGML_OP_CUSTOM, "Column invariance needs the owned matmul");
+        auto * graph = ggml_new_graph(ctx);
+        ggml_build_forward_expand(graph, output);
+        auto * buffer = ggml_backend_alloc_ctx_tensors(ctx, allocator);
+        require(buffer != nullptr, "Column invariance allocation failed");
+        std::mt19937 weight_random(77031);
+        std::uniform_real_distribution<float> uniform(-1.0f, 1.0f);
+        for (float & value : a.values) value = uniform(weight_random);
+        // Column j carries the same data in every launch, whatever its width.
+        for (int column = 0; column < tokens; ++column)
+        {
+            std::mt19937 column_random(1000 + column);
+            for (int k = 0; k < inner; ++k)
+                b.values[indexed ? b.logical(k, 0, column, 0) : b.logical(k, column, 0, 0)] = uniform(column_random);
+            for (int e = 0; e < used && indexed; ++e) ids.values[ids.logical(e, column, 0, 0)] = float((column + e) % experts);
+        }
+        a.upload(); b.upload(); ids.upload();
+        require(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS, "Column invariance compute failed");
+        std::vector<float> result(ggml_nelements(output));
+        ggml_backend_tensor_get(output, result.data(), 0, result.size() * sizeof(float));
+        for (float value : result) require(std::isfinite(value), "Column invariance produced a non-finite value");
+        const size_t per_column = size_t(rows) * (indexed ? used : 1);
+        if (tokens == widest) reference = result;
+        else
+        {
+            size_t differing = 0;
+            for (size_t i = 0; i < per_column * size_t(tokens); ++i)
+                differing += std::memcmp(&result[i], &reference[i], sizeof(float)) != 0;
+            if (differing)
+                std::fprintf(stderr, "%s columns=%d differs from columns=%d in %zu of %zu outputs (weights=%s indexed=%d)\n",
+                    ggml_backend_name(backend), tokens, widest, differing, per_column * size_t(tokens),
+                    ggml_type_name(weights), indexed);
+            require(differing == 0, "A decode-class column must not depend on the other columns in its launch");
+        }
+        a.check_unchanged(); b.check_unchanged(); ids.check_unchanged();
+        ggml_backend_buffer_free(buffer);
+        ggml_free(ctx);
+    }
+    std::printf("%s COLUMN_INVARIANCE %s weights=%s inner=%d rows=%d widths=1..%d bit_identical\n", ggml_backend_name(backend),
+        indexed ? "MUL_MAT_ID" : "MUL_MAT", ggml_type_name(weights), inner, rows, widest);
+}
+
 static void run(ggml_backend_t allocator, ggml_backend_t backend)
 {
+    for (bool indexed : {false, true}) for (ggml_type weights : {GGML_TYPE_F32, GGML_TYPE_F16})
+        check_column_invariance(allocator, backend, weights, indexed);
     for (bool indexed : {false, true}) for (int tokens : {1, 4, 5, 16, 31})
     for (ggml_type weights : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16})
     for (bool precise : {false, true})

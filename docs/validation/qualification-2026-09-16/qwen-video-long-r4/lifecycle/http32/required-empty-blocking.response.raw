@@ -1,0 +1,1 @@
+{"error":{"message":"tool_choice requires at least one client-declared function.","type":"invalid_request_error"}}

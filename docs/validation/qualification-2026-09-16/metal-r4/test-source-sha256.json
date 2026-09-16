@@ -1,0 +1,5 @@
+{
+  "eng/tests/qwen4exp-mtp-operator.py": "999dc167567d9ef902c5e661b32999cda1f2f0429ce07115badb5ff0eaf96525",
+  "eng/tests/qwen4exp-qsa.py": "c0cf0c39300279a740928309ad3a0404a6c432f80a896f9149c5abb85c0f19f3",
+  "eng/tests/qwen4exp-target-snapshot.py": "8b80d9d61da9ef5bdc77bb8882ed2524332f246f27abca290a21b8c83c916bb5"
+}

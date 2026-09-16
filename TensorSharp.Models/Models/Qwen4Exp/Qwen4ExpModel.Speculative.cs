@@ -50,6 +50,7 @@ namespace TensorSharp.Models
             internal int PleNextPosition;
             internal int MropeGap;
             internal int[] PleHistory;
+            internal bool DeviceStateAuthoritative;
         }
 
         private object ActiveSpecOwner => (object)_gdnConvStateT ?? _kCache;
@@ -62,6 +63,7 @@ namespace TensorSharp.Models
             PleNextPosition = _pleNextPos,
             MropeGap = _mropeCacheGap,
             PleHistory = _pleHistory?.ToArray() ?? Array.Empty<int>(),
+            DeviceStateAuthoritative = _deviceStateAuthoritative,
         };
 
         private void ValidateSpecMetadata(SpecMetadata metadata)
@@ -80,6 +82,7 @@ namespace TensorSharp.Models
             _pleHistory.AddRange(metadata.PleHistory);
             _pleNextPos = metadata.PleNextPosition;
             _mropeCacheGap = metadata.MropeGap;
+            _deviceStateAuthoritative = metadata.DeviceStateAuthoritative;
         }
 
         private unsafe void CopySpecLastLogits(int tokenCount)

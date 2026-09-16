@@ -151,9 +151,8 @@ public sealed class DeepSeek41DsparkIntegrationTests(ITestOutputHelper output)
         var model = new DeepSeek4Model(target, BackendType.GgmlCpu, draftModelPath: draft);
         try
         {
-            var native = Process.GetCurrentProcess().Modules.Cast<ProcessModule>()
-                .Single(m => string.Equals(Path.GetFileName(m.FileName), "GgmlOps.dll", StringComparison.OrdinalIgnoreCase));
-            CheckHash(native.FileName, Environment.GetEnvironmentVariable("TS_TEST_DSV41_DSPARK_NATIVE_SHA256")!);
+            string native = TestGates.MappedNativeGgmlOpsPath();
+            CheckHash(native, Environment.GetEnvironmentVariable("TS_TEST_DSV41_DSPARK_NATIVE_SHA256")!);
             Assert.True(model.HasDraftHead);
             Assert.Equal(DraftHeadKind.Block, model.DraftHeadKind);
             Assert.Equal(5, model.DraftBlockSize);

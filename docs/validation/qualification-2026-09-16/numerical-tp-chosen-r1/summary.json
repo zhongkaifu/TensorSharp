@@ -1,0 +1,189 @@
+{
+  "integrated": true,
+  "release_qualified": false,
+  "performance_qualified": false,
+  "physical_gpu": 6,
+  "original_oracle": "unchanged full-weight ggml CUDA",
+  "original_tolerances": {
+    "max_abs": 2e-06,
+    "relative_l2": 1e-05
+  },
+  "memcheck_errors": 0,
+  "projection_moe_comparisons": 36,
+  "scratch_lifecycle_steps": 13,
+  "real_cuda_oom_recovery": true,
+  "pairs": 60,
+  "other_gpu_campaigns_active": true,
+  "benchmark_cases": [
+    {
+      "type": "q2_K",
+      "ranks": 2,
+      "rows": 1024,
+      "tokens": 16,
+      "before_median_ms": 0.3022435,
+      "after_median_ms": 0.307821,
+      "ratio": 1.0184536640159343
+    },
+    {
+      "type": "q2_K",
+      "ranks": 2,
+      "rows": 1024,
+      "tokens": 65,
+      "before_median_ms": 0.859765,
+      "after_median_ms": 0.8535415,
+      "ratio": 0.9927613941018766
+    },
+    {
+      "type": "q2_K",
+      "ranks": 2,
+      "rows": 1024,
+      "tokens": 129,
+      "before_median_ms": 1.5438,
+      "after_median_ms": 1.550432,
+      "ratio": 1.0042958932504211
+    },
+    {
+      "type": "q2_K",
+      "ranks": 7,
+      "rows": 256,
+      "tokens": 16,
+      "before_median_ms": 0.2021975,
+      "after_median_ms": 0.27062549999999996,
+      "ratio": 1.338421592749663
+    },
+    {
+      "type": "q2_K",
+      "ranks": 7,
+      "rows": 256,
+      "tokens": 65,
+      "before_median_ms": 0.626557,
+      "after_median_ms": 0.768302,
+      "ratio": 1.226228419760692
+    },
+    {
+      "type": "q2_K",
+      "ranks": 7,
+      "rows": 256,
+      "tokens": 129,
+      "before_median_ms": 1.0508644999999999,
+      "after_median_ms": 1.3659919999999999,
+      "ratio": 1.2998745318735194
+    },
+    {
+      "type": "q2_K",
+      "ranks": 8,
+      "rows": 256,
+      "tokens": 16,
+      "before_median_ms": 0.187838,
+      "after_median_ms": 0.25574850000000005,
+      "ratio": 1.3615376015502723
+    },
+    {
+      "type": "q2_K",
+      "ranks": 8,
+      "rows": 256,
+      "tokens": 65,
+      "before_median_ms": 0.6286849999999999,
+      "after_median_ms": 0.772883,
+      "ratio": 1.229364467101967
+    },
+    {
+      "type": "q2_K",
+      "ranks": 8,
+      "rows": 256,
+      "tokens": 129,
+      "before_median_ms": 1.0481034999999999,
+      "after_median_ms": 1.360954,
+      "ratio": 1.2984919905333778
+    },
+    {
+      "type": "q4_K",
+      "ranks": 2,
+      "rows": 1024,
+      "tokens": 16,
+      "before_median_ms": 0.35754050000000004,
+      "after_median_ms": 0.350819,
+      "ratio": 0.9812007311059865
+    },
+    {
+      "type": "q4_K",
+      "ranks": 2,
+      "rows": 1024,
+      "tokens": 65,
+      "before_median_ms": 0.7834855000000001,
+      "after_median_ms": 0.7902065,
+      "ratio": 1.0085783336130663
+    },
+    {
+      "type": "q4_K",
+      "ranks": 2,
+      "rows": 1024,
+      "tokens": 129,
+      "before_median_ms": 1.3592555,
+      "after_median_ms": 1.375261,
+      "ratio": 1.0117751960540164
+    },
+    {
+      "type": "q4_K",
+      "ranks": 7,
+      "rows": 256,
+      "tokens": 16,
+      "before_median_ms": 0.21537499999999998,
+      "after_median_ms": 0.256183,
+      "ratio": 1.1894741729541498
+    },
+    {
+      "type": "q4_K",
+      "ranks": 7,
+      "rows": 256,
+      "tokens": 65,
+      "before_median_ms": 0.586529,
+      "after_median_ms": 0.6766505,
+      "ratio": 1.1536522490789034
+    },
+    {
+      "type": "q4_K",
+      "ranks": 7,
+      "rows": 256,
+      "tokens": 129,
+      "before_median_ms": 0.988183,
+      "after_median_ms": 1.1889465000000001,
+      "ratio": 1.2031642924438086
+    },
+    {
+      "type": "q4_K",
+      "ranks": 8,
+      "rows": 256,
+      "tokens": 16,
+      "before_median_ms": 0.214027,
+      "after_median_ms": 0.253197,
+      "ratio": 1.1830142925892528
+    },
+    {
+      "type": "q4_K",
+      "ranks": 8,
+      "rows": 256,
+      "tokens": 65,
+      "before_median_ms": 0.5927085,
+      "after_median_ms": 0.6884625,
+      "ratio": 1.1615532761888854
+    },
+    {
+      "type": "q4_K",
+      "ranks": 8,
+      "rows": 256,
+      "tokens": 129,
+      "before_median_ms": 0.9896290000000001,
+      "after_median_ms": 1.1925165,
+      "ratio": 1.2050136970521275
+    }
+  ],
+  "default_fusion_exit_code": 0,
+  "default_graphs_exit_code": 0,
+  "physical_two_gpu_comparisons": 16,
+  "physical_two_gpu_exit_code": 0,
+  "physical_two_gpu_devices": [
+    0,
+    6
+  ]
+}

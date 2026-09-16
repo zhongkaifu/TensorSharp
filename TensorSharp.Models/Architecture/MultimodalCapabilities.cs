@@ -56,10 +56,9 @@ namespace TensorSharp.Models.Architecture
     }
 
     /// <summary>
-    /// A model whose audio tower is loaded from the same mmproj GGUF as its vision
-    /// tower. Separate from <see cref="IAudioCapableModel"/> because some
-    /// architectures (Nemotron) build their audio path during the main model load and
-    /// have nothing to load from the projector file.
+    /// A model with an optional audio tower loaded from a projector file or an
+    /// architecture-specific companion. Separate from <see cref="IAudioCapableModel"/>
+    /// so audio sinks can also receive embeddings from an externally managed encoder.
     /// </summary>
     public interface IAudioEncoderLoader
     {

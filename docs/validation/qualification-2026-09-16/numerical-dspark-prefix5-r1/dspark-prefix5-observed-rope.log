@@ -1,0 +1,42 @@
+{
+  "native_features_main_error": {
+    "native": 4.336771128555725e-07,
+    "oracle": 1.8953482396134912e-06
+  },
+  "native_features_longdouble_main_kv": {
+    "prequant": "0.42089877512528521715",
+    "bf16": 0.421875,
+    "cache": 0.4375
+  },
+  "oracle_features_main_error": {
+    "native": 1.938788665405166e-06,
+    "oracle": 4.322713631219402e-07
+  },
+  "oracle_features_longdouble_main_kv": {
+    "prequant": "0.42089831121062696117",
+    "bf16": 0.419921875,
+    "cache": 0.40625
+  },
+  "native_main_longdouble_kv": {
+    "prequant": "0.42089873139388024048",
+    "bf16": 0.421875,
+    "cache": 0.4375
+  },
+  "oracle_main_longdouble_kv": {
+    "prequant": "0.4208983612798093421",
+    "bf16": 0.419921875,
+    "cache": 0.40625
+  },
+  "recorded_native": {
+    "prequant": "0.42089877",
+    "bf16": 0.421875,
+    "cache": 0.4375
+  },
+  "recorded_oracle": {
+    "prequant": "0.4208983",
+    "bf16": 0.419921875,
+    "cache": 0.40625
+  },
+  "max_features_abs": 4.172325134277344e-06,
+  "max_main_abs": 1.9669532775878906e-06
+}

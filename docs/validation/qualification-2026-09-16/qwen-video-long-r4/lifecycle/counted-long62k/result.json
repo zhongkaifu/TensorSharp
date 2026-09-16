@@ -1,0 +1,50 @@
+{
+  "status": "passed",
+  "release_qualified": false,
+  "case": "counted-long62k",
+  "sampling": {
+    "actual_prompt_tokens": 65065,
+    "qsa_qualified": false
+  },
+  "expected": [
+    {
+      "ALPHA": "silver-4821",
+      "BETA": "amber-7392",
+      "GAMMA": "violet-1605"
+    }
+  ],
+  "turns": [
+    {
+      "turn": 0,
+      "status": "passed",
+      "request_sha256": "d4eb4e22e67241bf21fa2235df0d3dd614f1726391ed7daa71a68b9824c26336",
+      "expected": {
+        "ALPHA": "silver-4821",
+        "BETA": "amber-7392",
+        "GAMMA": "violet-1605"
+      },
+      "started_unix": 1789583068.5593245,
+      "http_status": 200,
+      "response_sha256": "47b6b5e608848ace57a8147fe2da2d261350a45f750f8302d8c83ef632b4f600",
+      "parsed": {
+        "message": {
+          "role": "assistant",
+          "content": "\n\n{\n  \"ALPHA\": \"silver-4821\",\n  \"BETA\": \"amber-7392\",\n  \"GAMMA\": \"violet-1605\"\n}"
+        },
+        "finish": "stop",
+        "usage": {
+          "prompt_tokens": 65065,
+          "completion_tokens": 48,
+          "total_tokens": 65113,
+          "prompt_tokens_details": {
+            "cached_tokens": 0
+          }
+        },
+        "done": true
+      },
+      "wall_seconds": 86.22336888313293
+    }
+  ],
+  "scope": "Actual OpenAI request. Video rejection is a runtime gap, not passed media coverage; long case is new and QSA-unqualified.",
+  "unrun_turns": 0
+}

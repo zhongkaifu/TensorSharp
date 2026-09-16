@@ -1,0 +1,12 @@
+  Determining projects to restore...
+  Restored /workspace/ts-nemotron-audio-derived-r6/Derived.csproj (in 139 ms).
+/workspace/ts-nemotron-audio-derived-r6/GgmlBackendTestInitializer.cs(44,6): warning CA2255: The 'ModuleInitializer' attribute is only intended to be used in application code or advanced source generator scenarios (https://learn.microsoft.com/dotnet/fundamentals/code-analysis/quality-rules/ca2255) [/workspace/ts-nemotron-audio-derived-r6/Derived.csproj]
+  Derived -> /workspace/ts-nemotron-audio-derived-r6/build/InferenceWeb.Tests.dll
+
+Build succeeded.
+
+/workspace/ts-nemotron-audio-derived-r6/GgmlBackendTestInitializer.cs(44,6): warning CA2255: The 'ModuleInitializer' attribute is only intended to be used in application code or advanced source generator scenarios (https://learn.microsoft.com/dotnet/fundamentals/code-analysis/quality-rules/ca2255) [/workspace/ts-nemotron-audio-derived-r6/Derived.csproj]
+    1 Warning(s)
+    0 Error(s)
+
+Time Elapsed 00:00:10.93

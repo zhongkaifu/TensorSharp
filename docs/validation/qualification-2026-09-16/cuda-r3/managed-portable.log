@@ -1,0 +1,75 @@
+Test run for /workspace/ts-codex-20260916-r3/repo/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll (.NETCoreApp,Version=v10.0)
+A total of 1 test files matched the specified pattern.
+[xUnit.net 00:00:38.14]     InferenceWeb.Tests.PrefixCheckpointOwnershipTests.GemmaThrowingPostCommitTrace_DoesNotReportFailureOrLosePublishedOwner [SKIP]
+  Skipped InferenceWeb.Tests.PrefixCheckpointOwnershipTests.GemmaThrowingPostCommitTrace_DoesNotReportFailureOrLosePublishedOwner [1 ms]
+[xUnit.net 00:01:29.64]     InferenceWeb.Tests.MultimodalPreparationIsolationTests.NestedPreparation_RestoresOuterRequestAfterCompletionOrFailure(fail: False) [FAIL]
+[xUnit.net 00:01:29.65]     InferenceWeb.Tests.MultimodalPreparationIsolationTests.NestedPreparation_RestoresOuterRequestAfterCompletionOrFailure(fail: True) [FAIL]
+[xUnit.net 00:01:29.65]     InferenceWeb.Tests.MultimodalPreparationIsolationTests.InterleavedEncoders_DeliverEachRequestsOwnEmbeddingRows(vision: True) [FAIL]
+[xUnit.net 00:01:29.65]     InferenceWeb.Tests.MultimodalPreparationIsolationTests.InterleavedEncoders_DeliverEachRequestsOwnEmbeddingRows(vision: False) [FAIL]
+  Failed InferenceWeb.Tests.MultimodalPreparationIsolationTests.NestedPreparation_RestoresOuterRequestAfterCompletionOrFailure(fail: False) [1 ms]
+  Error Message:
+   System.MissingMethodException : Constructor on type 'TensorSharp.Models.ModelMultimodalInjector+CachedEmbedding' not found.
+  Stack Trace:
+     at System.RuntimeType.CreateInstanceImpl(BindingFlags bindingAttr, Binder binder, Object[] args, CultureInfo culture)
+   at InferenceWeb.Tests.MultimodalPreparationIsolationTests.AppendPrepared(ModelMultimodalInjector injector, Tensor tensor, Boolean vision) in /workspace/ts-codex-20260916-r3/repo/InferenceWeb.Tests/MultimodalPreparationIsolationTests.cs:line 91
+   at InferenceWeb.Tests.MultimodalPreparationIsolationTests.<>c__DisplayClass1_0.<NestedPreparation_RestoresOuterRequestAfterCompletionOrFailure>b__0(ModelMultimodalInjector active, List`1 messages, List`1 tokens) in /workspace/ts-codex-20260916-r3/repo/InferenceWeb.Tests/MultimodalPreparationIsolationTests.cs:line 70
+   at InferenceWeb.Tests.MultimodalPreparationIsolationTests.ProbeModel.TensorSharp.Models.Architecture.IMultimodalPromptExpander.ExpandMultimodalPrompt(ModelMultimodalInjector injector, List`1 history, List`1 tokens) in /workspace/ts-codex-20260916-r3/repo/InferenceWeb.Tests/MultimodalPreparationIsolationTests.cs:line 109
+   at TensorSharp.Models.ModelMultimodalInjector.ProcessPromptTokens(List`1 history, List`1 inputTokens, String requestId) in /workspace/ts-codex-20260916-r3/repo/TensorSharp.Models/ModelMultimodalInjector.cs:line 169
+   at InferenceWeb.Tests.MultimodalPreparationIsolationTests.NestedPreparation_RestoresOuterRequestAfterCompletionOrFailure(Boolean fail) in /workspace/ts-codex-20260916-r3/repo/InferenceWeb.Tests/MultimodalPreparationIsolationTests.cs:line 76
+   at System.RuntimeMethodHandle.InvokeMethod(ObjectHandleOnStack target, Void** arguments, ObjectHandleOnStack sig, BOOL isConstructor, ObjectHandleOnStack result)
+   at System.Reflection.MethodBaseInvoker.InvokeDirectByRefWithFewArgs(Object obj, Span`1 copyOfArgs, BindingFlags invokeAttr)
+  Failed InferenceWeb.Tests.MultimodalPreparationIsolationTests.NestedPreparation_RestoresOuterRequestAfterCompletionOrFailure(fail: True) [< 1 ms]
+  Error Message:
+   System.MissingMethodException : Constructor on type 'TensorSharp.Models.ModelMultimodalInjector+CachedEmbedding' not found.
+  Stack Trace:
+     at System.RuntimeType.CreateInstanceImpl(BindingFlags bindingAttr, Binder binder, Object[] args, CultureInfo culture)
+   at InferenceWeb.Tests.MultimodalPreparationIsolationTests.AppendPrepared(ModelMultimodalInjector injector, Tensor tensor, Boolean vision) in /workspace/ts-codex-20260916-r3/repo/InferenceWeb.Tests/MultimodalPreparationIsolationTests.cs:line 91
+   at InferenceWeb.Tests.MultimodalPreparationIsolationTests.<>c__DisplayClass1_0.<NestedPreparation_RestoresOuterRequestAfterCompletionOrFailure>b__0(ModelMultimodalInjector active, List`1 messages, List`1 tokens) in /workspace/ts-codex-20260916-r3/repo/InferenceWeb.Tests/MultimodalPreparationIsolationTests.cs:line 70
+   at InferenceWeb.Tests.MultimodalPreparationIsolationTests.ProbeModel.TensorSharp.Models.Architecture.IMultimodalPromptExpander.ExpandMultimodalPrompt(ModelMultimodalInjector injector, List`1 history, List`1 tokens) in /workspace/ts-codex-20260916-r3/repo/InferenceWeb.Tests/MultimodalPreparationIsolationTests.cs:line 109
+   at TensorSharp.Models.ModelMultimodalInjector.ProcessPromptTokens(List`1 history, List`1 inputTokens, String requestId) in /workspace/ts-codex-20260916-r3/repo/TensorSharp.Models/ModelMultimodalInjector.cs:line 169
+   at InferenceWeb.Tests.MultimodalPreparationIsolationTests.NestedPreparation_RestoresOuterRequestAfterCompletionOrFailure(Boolean fail) in /workspace/ts-codex-20260916-r3/repo/InferenceWeb.Tests/MultimodalPreparationIsolationTests.cs:line 76
+   at InvokeStub_MultimodalPreparationIsolationTests.NestedPreparation_RestoresOuterRequestAfterCompletionOrFailure(Object, Span`1)
+   at System.Reflection.MethodBaseInvoker.InvokeWithOneArg(Object obj, BindingFlags invokeAttr, Binder binder, Object[] parameters, CultureInfo culture)
+  Failed InferenceWeb.Tests.MultimodalPreparationIsolationTests.InterleavedEncoders_DeliverEachRequestsOwnEmbeddingRows(vision: True) [3 ms]
+  Error Message:
+   System.MissingMethodException : Constructor on type 'TensorSharp.Models.ModelMultimodalInjector+CachedEmbedding' not found.
+  Stack Trace:
+     at System.RuntimeType.CreateInstanceImpl(BindingFlags bindingAttr, Binder binder, Object[] args, CultureInfo culture)
+   at InferenceWeb.Tests.MultimodalPreparationIsolationTests.AppendPrepared(ModelMultimodalInjector injector, Tensor tensor, Boolean vision) in /workspace/ts-codex-20260916-r3/repo/InferenceWeb.Tests/MultimodalPreparationIsolationTests.cs:line 91
+   at InferenceWeb.Tests.MultimodalPreparationIsolationTests.<>c__DisplayClass0_0.<InterleavedEncoders_DeliverEachRequestsOwnEmbeddingRows>b__0(ModelMultimodalInjector active, List`1 history, List`1 tokens) in /workspace/ts-codex-20260916-r3/repo/InferenceWeb.Tests/MultimodalPreparationIsolationTests.cs:line 32
+   at InferenceWeb.Tests.MultimodalPreparationIsolationTests.ProbeModel.TensorSharp.Models.Architecture.IMultimodalPromptExpander.ExpandMultimodalPrompt(ModelMultimodalInjector injector, List`1 history, List`1 tokens) in /workspace/ts-codex-20260916-r3/repo/InferenceWeb.Tests/MultimodalPreparationIsolationTests.cs:line 109
+   at TensorSharp.Models.ModelMultimodalInjector.ProcessPromptTokens(List`1 history, List`1 inputTokens, String requestId) in /workspace/ts-codex-20260916-r3/repo/TensorSharp.Models/ModelMultimodalInjector.cs:line 169
+   at InferenceWeb.Tests.MultimodalPreparationIsolationTests.<>c__DisplayClass0_0.<InterleavedEncoders_DeliverEachRequestsOwnEmbeddingRows>b__1() in /workspace/ts-codex-20260916-r3/repo/InferenceWeb.Tests/MultimodalPreparationIsolationTests.cs:line 37
+   at System.Threading.Tasks.Task`1.InnerInvoke()
+   at System.Threading.ExecutionContext.RunFromThreadPoolDispatchLoop(Thread threadPoolThread, ExecutionContext executionContext, ContextCallback callback, Object state)
+--- End of stack trace from previous location ---
+   at System.Threading.ExecutionContext.RunFromThreadPoolDispatchLoop(Thread threadPoolThread, ExecutionContext executionContext, ContextCallback callback, Object state)
+   at System.Threading.Tasks.Task.ExecuteWithThreadLocal(Task& currentTaskSlot, Thread threadPoolThread)
+--- End of stack trace from previous location ---
+   at InferenceWeb.Tests.MultimodalPreparationIsolationTests.InterleavedEncoders_DeliverEachRequestsOwnEmbeddingRows(Boolean vision) in /workspace/ts-codex-20260916-r3/repo/InferenceWeb.Tests/MultimodalPreparationIsolationTests.cs:line 36
+--- End of stack trace from previous location ---
+  Failed InferenceWeb.Tests.MultimodalPreparationIsolationTests.InterleavedEncoders_DeliverEachRequestsOwnEmbeddingRows(vision: False) [1 ms]
+  Error Message:
+   System.MissingMethodException : Constructor on type 'TensorSharp.Models.ModelMultimodalInjector+CachedEmbedding' not found.
+  Stack Trace:
+     at System.RuntimeType.CreateInstanceImpl(BindingFlags bindingAttr, Binder binder, Object[] args, CultureInfo culture)
+   at InferenceWeb.Tests.MultimodalPreparationIsolationTests.AppendPrepared(ModelMultimodalInjector injector, Tensor tensor, Boolean vision) in /workspace/ts-codex-20260916-r3/repo/InferenceWeb.Tests/MultimodalPreparationIsolationTests.cs:line 91
+   at InferenceWeb.Tests.MultimodalPreparationIsolationTests.<>c__DisplayClass0_0.<InterleavedEncoders_DeliverEachRequestsOwnEmbeddingRows>b__0(ModelMultimodalInjector active, List`1 history, List`1 tokens) in /workspace/ts-codex-20260916-r3/repo/InferenceWeb.Tests/MultimodalPreparationIsolationTests.cs:line 32
+   at InferenceWeb.Tests.MultimodalPreparationIsolationTests.ProbeModel.TensorSharp.Models.Architecture.IMultimodalPromptExpander.ExpandMultimodalPrompt(ModelMultimodalInjector injector, List`1 history, List`1 tokens) in /workspace/ts-codex-20260916-r3/repo/InferenceWeb.Tests/MultimodalPreparationIsolationTests.cs:line 109
+   at TensorSharp.Models.ModelMultimodalInjector.ProcessPromptTokens(List`1 history, List`1 inputTokens, String requestId) in /workspace/ts-codex-20260916-r3/repo/TensorSharp.Models/ModelMultimodalInjector.cs:line 169
+   at InferenceWeb.Tests.MultimodalPreparationIsolationTests.<>c__DisplayClass0_0.<InterleavedEncoders_DeliverEachRequestsOwnEmbeddingRows>b__1() in /workspace/ts-codex-20260916-r3/repo/InferenceWeb.Tests/MultimodalPreparationIsolationTests.cs:line 37
+   at System.Threading.Tasks.Task`1.InnerInvoke()
+   at System.Threading.ExecutionContext.RunFromThreadPoolDispatchLoop(Thread threadPoolThread, ExecutionContext executionContext, ContextCallback callback, Object state)
+--- End of stack trace from previous location ---
+   at System.Threading.ExecutionContext.RunFromThreadPoolDispatchLoop(Thread threadPoolThread, ExecutionContext executionContext, ContextCallback callback, Object state)
+   at System.Threading.Tasks.Task.ExecuteWithThreadLocal(Task& currentTaskSlot, Thread threadPoolThread)
+--- End of stack trace from previous location ---
+   at InferenceWeb.Tests.MultimodalPreparationIsolationTests.InterleavedEncoders_DeliverEachRequestsOwnEmbeddingRows(Boolean vision) in /workspace/ts-codex-20260916-r3/repo/InferenceWeb.Tests/MultimodalPreparationIsolationTests.cs:line 36
+--- End of stack trace from previous location ---
+[xUnit.net 00:01:32.24]     InferenceWeb.Tests.DeepSeekTeacherTokenExporterTests.All113PinnedBodiesTraverseProductionPreprocessingWithSyntheticTokenizer [SKIP]
+  Skipped InferenceWeb.Tests.DeepSeekTeacherTokenExporterTests.All113PinnedBodiesTraverseProductionPreprocessingWithSyntheticTokenizer [1 ms]
+[xUnit.net 00:01:37.24]     InferenceWeb.Tests.DeepSeekTeacherTokenExportFixture.ExportPinned113RequestsMetadataOnly [SKIP]
+  Skipped InferenceWeb.Tests.DeepSeekTeacherTokenExportFixture.ExportPinned113RequestsMetadataOnly [1 ms]
+Results File: /workspace/ts-codex-20260916-r3/results/build1/portable/portable.trx
+
+Failed!  - Failed:     4, Passed:  4265, Skipped:     3, Total:  4272, Duration: 2 m 6 s - InferenceWeb.Tests.dll (net10.0)

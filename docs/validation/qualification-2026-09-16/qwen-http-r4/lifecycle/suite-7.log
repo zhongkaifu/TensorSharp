@@ -1,0 +1,12 @@
+decode c1 repeat0: 1/1 passed; 12.14s
+decode c1 repeat1: 1/1 passed; 12.10s
+decode c1 repeat2: 1/1 passed; 11.49s
+decode c4 repeat0: 4/4 passed; 45.08s
+decode c4 repeat1: 4/4 passed; 45.08s
+decode c4 repeat2: 3/4 passed; 45.17s
+decode_8k c1 repeat0: 1/1 passed; 22.13s
+decode_8k c1 repeat1: 1/1 passed; 22.58s
+decode_8k c1 repeat2: 1/1 passed; 20.89s
+decode_8k c4 repeat0: 4/4 passed; 86.90s
+decode_8k c4 repeat1: 4/4 passed; 86.66s
+decode_8k c4 repeat2: 4/4 passed; 85.70s

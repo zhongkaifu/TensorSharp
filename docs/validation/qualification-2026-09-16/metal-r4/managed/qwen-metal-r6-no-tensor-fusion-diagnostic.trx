@@ -1,0 +1,111 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TestRun id="edde1796-9a32-4e51-a1b6-7510d8e462ae" name="@Zhongkais-MacBook-Pro 2026-09-16 10:52:02" xmlns="http://microsoft.com/schemas/VisualStudio/TeamTest/2010">
+  <Times creation="2026-09-16T10:52:02.7441390-07:00" queuing="2026-09-16T10:52:02.7441390-07:00" start="2026-09-16T10:51:50.0938670-07:00" finish="2026-09-16T10:52:02.7461120-07:00" />
+  <TestSettings name="default" id="d8818389-cfed-4d98-be1b-179e7527961d">
+    <Deployment runDeploymentRoot="_Zhongkais-MacBook-Pro_2026-09-16_10_52_02" />
+  </TestSettings>
+  <Results>
+    <UnitTestResult executionId="31d3cd46-1953-4f3e-a998-7f82adcce13b" testId="d7ae0da4-feb7-ab0a-f656-37f0da54095a" testName="InferenceWeb.Tests.Qwen4ExpRetainedCacheTests.SharedPrefixChunking_MatchesWholePromptForEachDistinctSuffix" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.1157435" startTime="2026-09-16T10:52:02.5945370-07:00" endTime="2026-09-16T10:52:02.7043300-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Failed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="31d3cd46-1953-4f3e-a998-7f82adcce13b">
+      <Output>
+        <StdOut>native /private/tmp/tensorsharp-r4-metal/managed-repo/InferenceWeb.Tests/bin/Release/net10.0/libGgmlOps.dylib sha256=b1ed8e429e1408cb5372807f09c21cf6b46c9bca41a5259ea4715d8b92b3c1f4; backend=GgmlMetal
+native /private/tmp/tensorsharp-r4-metal/managed-repo/InferenceWeb.Tests/bin/Release/net10.0/libGgmlOps.dylib sha256=b1ed8e429e1408cb5372807f09c21cf6b46c9bca41a5259ea4715d8b92b3c1f4; backend=GgmlMetal
+preGrow=False suffix=151 chunked=249 whole=249
+raw-key max abs=0.001953125; logit max abs=0.0014123916625976562</StdOut>
+        <ErrorInfo>
+          <Message>Assert.Equal() Failure: Collections differ
+                        ↓ (pos 258)
+Expected: [···, 69, 70, 120, 56, 17, ···]
+Actual:   [···, 69, 70, 118, 56, 15, ···]
+                        ↑ (pos 258)</Message>
+          <StackTrace>   at InferenceWeb.Tests.Qwen4ExpRetainedCacheTests.SharedPrefixChunking_MatchesWholePromptForEachDistinctSuffix() in /private/tmp/tensorsharp-r4-metal/managed-repo/InferenceWeb.Tests/Qwen4ExpRetainedCacheTests.cs:line 516
+   at System.Reflection.MethodBaseInvoker.InterpretedInvoke_Method(Object obj, IntPtr* args)
+   at System.Reflection.MethodBaseInvoker.InvokeWithNoArgs(Object obj, BindingFlags invokeAttr)</StackTrace>
+        </ErrorInfo>
+      </Output>
+    </UnitTestResult>
+  </Results>
+  <TestDefinitions>
+    <UnitTest name="InferenceWeb.Tests.Qwen4ExpRetainedCacheTests.SharedPrefixChunking_MatchesWholePromptForEachDistinctSuffix" storage="/private/tmp/tensorsharp-r4-metal/managed-repo/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="d7ae0da4-feb7-ab0a-f656-37f0da54095a">
+      <Execution id="31d3cd46-1953-4f3e-a998-7f82adcce13b" />
+      <TestMethod codeBase="/private/tmp/tensorsharp-r4-metal/managed-repo/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Qwen4ExpRetainedCacheTests" name="SharedPrefixChunking_MatchesWholePromptForEachDistinctSuffix" />
+    </UnitTest>
+  </TestDefinitions>
+  <TestEntries>
+    <TestEntry testId="d7ae0da4-feb7-ab0a-f656-37f0da54095a" executionId="31d3cd46-1953-4f3e-a998-7f82adcce13b" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+  </TestEntries>
+  <TestLists>
+    <TestList name="Results Not in a List" id="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestList name="All Loaded Results" id="19431567-8539-422a-85d7-44ee4e166bda" />
+  </TestLists>
+  <ResultSummary outcome="Failed">
+    <Counters total="1" executed="1" passed="0" failed="1" error="0" timeout="0" aborted="0" inconclusive="0" passedButRunAborted="0" notRunnable="0" notExecuted="0" disconnected="0" warning="0" completed="0" inProgress="0" pending="0" />
+    <Output>
+      <StdOut>[xUnit.net 00:00:00.00] xUnit.net VSTest Adapter v3.1.4+50e68bbb8b (64-bit .NET 10.0.10)
+[xUnit.net 00:00:00.05]   Discovering: InferenceWeb.Tests
+ggml_metal_library_init: using embedded metal library
+tensorsharp: default Metal language version raised from 3.2 to 4.0 (host executable records an old SDK; set TENSORSHARP_METAL_MSL_DEFAULT=off to disable)
+ggml_metal_library_compile_all: loaded 20 libraries from embedded data in 11.997 sec (max single = 11.996 sec)
+ggml_metal_rsets_init: creating a residency set collection (keep_alive = 180 s)
+ggml_metal_device_init: GPU name:   MTL0 (Apple M5 Pro)
+ggml_metal_device_init: GPU family: MTLGPUFamilyApple10  (1010)
+ggml_metal_device_init: GPU family: MTLGPUFamilyCommon3 (3003)
+ggml_metal_device_init: GPU family: MTLGPUFamilyMetal4  (5002)
+ggml_metal_device_init: simdgroup reduction   = true
+ggml_metal_device_init: simdgroup matrix mul. = true
+ggml_metal_device_init: has unified memory    = true
+ggml_metal_device_init: has bfloat            = true
+ggml_metal_device_init: has tensor            = false
+ggml_metal_device_init: use residency sets    = true
+ggml_metal_device_init: use shared buffers    = true
+ggml_metal_device_init: recommendedMaxWorkingSetSize  = 40200.90 MB
+ggml_metal_init: allocating
+ggml_metal_init: picking default device: Apple M5 Pro
+ggml_metal_init: use fusion         = false
+ggml_metal_init: use concurrency    = true
+ggml_metal_init: use graph optimize = true
+[xUnit.net 00:00:12.32]   Discovered:  InferenceWeb.Tests
+[xUnit.net 00:00:12.33]   Starting:    InferenceWeb.Tests
+Backend: GgmlMetal
+Model: qwen4exp, Layers=2, Hidden=8, Heads=4, KVHeads=2, HeadDim=8, Vocab=260
+  hyper-connections: count=4 lowRank=3 (residual is 32 wide)
+  experts=4 used=2 ff=6 sharedFf=5
+  GDN layers=1/2, QSA indexer heads=1 dim=8 topK=8
+  PLE: layers=[0] ngram=2 heads=1 headDim=8
+Loading model weights... done (57 F32 tensors, 24 quantized tensors)
+  Quantized: 0 MB (0 MB file-backed), F32: 0 MB
+Context length: using GGUF metadata qwen4exp.context_length=1024.
+  Qwen4Exp shared MTP ready: block=2, features=32, draftCompression=0, privateKV=F16, device=0, mappedBytes=10336.
+Backend: GgmlMetal
+Model: qwen4exp, Layers=2, Hidden=8, Heads=4, KVHeads=2, HeadDim=8, Vocab=260
+  hyper-connections: count=4 lowRank=3 (residual is 32 wide)
+  experts=4 used=2 ff=6 sharedFf=5
+  GDN layers=1/2, QSA indexer heads=1 dim=8 topK=8
+  PLE: layers=[0] ngram=2 heads=1 headDim=8
+Loading model weights... done (57 F32 tensors, 24 quantized tensors)
+  Quantized: 0 MB (0 MB file-backed), F32: 0 MB
+Context length: using GGUF metadata qwen4exp.context_length=1024.
+  Qwen4Exp shared MTP ready: block=2, features=32, draftCompression=0, privateKV=F16, device=0, mappedBytes=10336.
+[xUnit.net 00:00:12.46]       Assert.Equal() Failure: Collections differ
+[xUnit.net 00:00:12.46]                               ↓ (pos 258)
+[xUnit.net 00:00:12.46]       Expected: [···, 69, 70, 120, 56, 17, ···]
+[xUnit.net 00:00:12.46]       Actual:   [···, 69, 70, 118, 56, 15, ···]
+[xUnit.net 00:00:12.46]                               ↑ (pos 258)
+[xUnit.net 00:00:12.46]       Stack Trace:
+[xUnit.net 00:00:12.46]         /private/tmp/tensorsharp-r4-metal/managed-repo/InferenceWeb.Tests/Qwen4ExpRetainedCacheTests.cs(516,0): at InferenceWeb.Tests.Qwen4ExpRetainedCacheTests.SharedPrefixChunking_MatchesWholePromptForEachDistinctSuffix()
+[xUnit.net 00:00:12.46]            at System.Reflection.MethodBaseInvoker.InterpretedInvoke_Method(Object obj, IntPtr* args)
+[xUnit.net 00:00:12.46]            at System.Reflection.MethodBaseInvoker.InvokeWithNoArgs(Object obj, BindingFlags invokeAttr)
+[xUnit.net 00:00:12.46]       Output:
+[xUnit.net 00:00:12.46]         native /private/tmp/tensorsharp-r4-metal/managed-repo/InferenceWeb.Tests/bin/Release/net10.0/libGgmlOps.dylib sha256=b1ed8e429e1408cb5372807f09c21cf6b46c9bca41a5259ea4715d8b92b3c1f4; backend=GgmlMetal
+[xUnit.net 00:00:12.46]         native /private/tmp/tensorsharp-r4-metal/managed-repo/InferenceWeb.Tests/bin/Release/net10.0/libGgmlOps.dylib sha256=b1ed8e429e1408cb5372807f09c21cf6b46c9bca41a5259ea4715d8b92b3c1f4; backend=GgmlMetal
+[xUnit.net 00:00:12.46]         preGrow=False suffix=151 chunked=249 whole=249
+[xUnit.net 00:00:12.46]         raw-key max abs=0.001953125; logit max abs=0.0014123916625976562
+[xUnit.net 00:00:12.46]   Finished:    InferenceWeb.Tests
+</StdOut>
+    </Output>
+    <RunInfos>
+      <RunInfo computerName="Zhongkais-MacBook-Pro" outcome="Error" timestamp="2026-09-16T10:52:02.7054390-07:00">
+        <Text>[xUnit.net 00:00:12.46]     InferenceWeb.Tests.Qwen4ExpRetainedCacheTests.SharedPrefixChunking_MatchesWholePromptForEachDistinctSuffix [FAIL]</Text>
+      </RunInfo>
+    </RunInfos>
+  </ResultSummary>
+</TestRun>

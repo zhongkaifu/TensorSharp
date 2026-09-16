@@ -1,0 +1,6725 @@
+{
+  "started_utc": "2026-09-16T17:40:58.942741+00:00",
+  "passed": true,
+  "scope": "synthetic production QSA builder arithmetic only",
+  "gate": {
+    "atol": 2e-05,
+    "rtol": 2e-05,
+    "mask": "exact cutoff membership/cardinality; unspecified ties"
+  },
+  "native_path": "/private/tmp/tensorsharp-r4-metal/build/libGgmlOps.dylib",
+  "native_sha256": "b1ed8e429e1408cb5372807f09c21cf6b46c9bca41a5259ea4715d8b92b3c1f4",
+  "script_sha256": "c0cf0c39300279a740928309ad3a0404a6c432f80a896f9149c5abb85c0f19f3",
+  "cases": [
+    {
+      "name": "float32-00-text-L16-T16-R4",
+      "return_code": 1,
+      "native_error": "",
+      "stages": {
+        "pooled": {
+          "passed": true,
+          "max_abs": 1.1920928955078125e-07,
+          "rel_l2": 9.847882074301787e-08,
+          "worst_index": [
+            4,
+            11
+          ],
+          "actual": -0.32076066732406616,
+          "expected": -0.3207605481147766
+        },
+        "keys": {
+          "passed": true,
+          "max_abs": 5.116312875586004e-07,
+          "rel_l2": 1.1529447675744948e-07,
+          "worst_index": [
+            3,
+            2
+          ],
+          "actual": -1.9210013151168823,
+          "expected": -1.9210018267481699
+        },
+        "queries": {
+          "passed": true,
+          "max_abs": 4.56685707916904e-07,
+          "rel_l2": 8.885070329252018e-08,
+          "worst_index": [
+            8,
+            2,
+            5
+          ],
+          "actual": 2.2985668182373047,
+          "expected": 2.2985672749230126
+        },
+        "scores": {
+          "passed": true,
+          "max_abs": 2.0510874669810164e-06,
+          "rel_l2": 1.1426208053388482e-07,
+          "worst_index": [
+            10,
+            0
+          ],
+          "actual": 4.500445365905762,
+          "expected": 4.500447416993229
+        }
+      },
+      "mask": {
+        "passed": true,
+        "queries": [
+          {
+            "passed": true,
+            "selected": [
+              0
+            ],
+            "required": [],
+            "allowed": [
+              0
+            ],
+            "cutoff": 1000000000.0,
+            "boundary_tied": false
+          },
+          {
+            "passed": true,
+            "selected": [
+              0,
+              1
+            ],
+            "required": [],
+            "allowed": [
+              0,
+              1
+            ],
+            "cutoff": 1000000000.0,
+            "boundary_tied": false
+          },
+          {
+            "passed": true,
+            "selected": [
+              0,
+              1,
+              2
+            ],
+            "required": [],
+            "allowed": [
+              0,
+              1,
+              2
+            ],
+            "cutoff": 1000000000.0,
+            "boundary_tied": false
+          },
+          {
+            "passed": true,
+            "selected": [
+              0,
+              1,
+              2,
+              3
+            ],
+            "required": [],
+            "allowed": [
+              0,
+              1,
+              2,
+              3
+            ],
+            "cutoff": 4.278057098388672,
+            "boundary_tied": false
+          },
+          {
+            "passed": true,
+            "selected": [
+              0,
+              1,
+              2,
+              3,
+              4
+            ],
+            "required": [
+              4
+            ],
+            "allowed": [
+              0,
+              1,
+              2,
+              3,
+              4
+            ],
+            "cutoff": 0.0,
+            "boundary_tied": false
+          },
+          {
+            "passed": true,
+            "selected": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5
+            ],
+            "required": [
+              4,
+              5
+            ],
+            "allowed": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5
+            ],
+            "cutoff": 4.366764545440674,
+            "boundary_tied": false
+          },
+          {
+            "passed": true,
+            "selected": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6
+            ],
+            "required": [
+              4,
+              5,
+              6
+            ],
+            "allowed": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6
+            ],
+            "cutoff": 4.361881256103516,
+            "boundary_tied": false
+          },
+          {
+            "passed": true,
+            "selected": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7
+            ],
+            "required": [
+              0,
+              1,
+              2,
+              3
+            ],
+            "allowed": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7
+            ],
+            "cutoff": 1.8974300622940063,
+            "boundary_tied": false
+          },
+          {
+            "passed": true,
+            "selected": [
+              0,
+              1,
+              2,
+              4,
+              5,
+              6,
+              7,
+              8
+            ],
+            "required": [
+              4,
+              5,
+              6,
+              7,
+              8
+            ],
+            "allowed": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7,
+              8
+            ],
+            "cutoff": 3.3810551166534424,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              0,
+              1,
+              4,
+              5,
+              6,
+              7,
+              8,
+              9
+            ],
+            "required": [
+              4,
+              5,
+              6,
+              7,
+              8,
+              9
+            ],
+            "allowed": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7,
+              8,
+              9
+            ],
+            "cutoff": 1.7124617099761963,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              8,
+              9,
+              10
+            ],
+            "required": [
+              0,
+              1,
+              2,
+              3,
+              8,
+              9,
+              10
+            ],
+            "allowed": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7,
+              8,
+              9,
+              10
+            ],
+            "cutoff": 4.187906742095947,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7
+            ],
+            "required": [
+              4,
+              5,
+              6,
+              7
+            ],
+            "allowed": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7
+            ],
+            "cutoff": 4.71184778213501,
+            "boundary_tied": false
+          },
+          {
+            "passed": true,
+            "selected": [
+              0,
+              1,
+              2,
+              8,
+              9,
+              10,
+              11,
+              12
+            ],
+            "required": [
+              8,
+              9,
+              10,
+              11,
+              12
+            ],
+            "allowed": [
+              0,
+              1,
+              2,
+              3,
+              8,
+              9,
+              10,
+              11,
+              12
+            ],
+            "cutoff": 3.8719193935394287,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              4,
+              5,
+              6,
+              7,
+              8,
+              9,
+              12,
+              13
+            ],
+            "required": [
+              4,
+              5,
+              6,
+              7,
+              12,
+              13
+            ],
+            "allowed": [
+              4,
+              5,
+              6,
+              7,
+              8,
+              9,
+              10,
+              11,
+              12,
+              13
+            ],
+            "cutoff": 6.689154624938965,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              4,
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14
+            ],
+            "required": [
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14
+            ],
+            "allowed": [
+              4,
+              5,
+              6,
+              7,
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14
+            ],
+            "cutoff": 7.707990646362305,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              0,
+              1,
+              2,
+              3,
+              12,
+              13,
+              14,
+              15
+            ],
+            "required": [
+              12,
+              13,
+              14,
+              15
+            ],
+            "allowed": [
+              0,
+              1,
+              2,
+              3,
+              12,
+              13,
+              14,
+              15
+            ],
+            "cutoff": 2.853875160217285,
+            "boundary_tied": false
+          }
+        ]
+      },
+      "inputs_unchanged": true,
+      "wrong_math_controls": {
+        "wrong_pool_max": 0.9972150438272649,
+        "wrong_relu_max": 10.814701016648751
+      },
+      "passed": true,
+      "data": {
+        "path": "float32-00-text-L16-T16-R4.npz",
+        "sha256": "5518421a4c26515220058d7f676feea32a4318251594fb8ea1be233e800ce398"
+      }
+    },
+    {
+      "name": "float32-01-text-L17-T1-R4",
+      "return_code": 1,
+      "native_error": "",
+      "stages": {
+        "pooled": {
+          "passed": true,
+          "max_abs": 2.0489096641540527e-08,
+          "rel_l2": 1.759374842079723e-08,
+          "worst_index": [
+            0,
+            11
+          ],
+          "actual": 0.19775621592998505,
+          "expected": 0.1977562364190817
+        },
+        "keys": {
+          "passed": true,
+          "max_abs": 3.211944825665114e-07,
+          "rel_l2": 8.834575756088393e-08,
+          "worst_index": [
+            3,
+            5
+          ],
+          "actual": -1.7379450798034668,
+          "expected": -1.7379454009979494
+        },
+        "queries": {
+          "passed": true,
+          "max_abs": 5.49350894551992e-07,
+          "rel_l2": 1.6278129398025896e-07,
+          "worst_index": [
+            0,
+            1,
+            3
+          ],
+          "actual": -2.2542707920074463,
+          "expected": -2.2542702426565517
+        },
+        "scores": {
+          "passed": true,
+          "max_abs": 1.6720543740689209e-06,
+          "rel_l2": 1.3783779249573374e-07,
+          "worst_index": [
+            0,
+            3
+          ],
+          "actual": 5.3268208503723145,
+          "expected": 5.3268225224266885
+        }
+      },
+      "mask": {
+        "passed": true,
+        "queries": [
+          {
+            "passed": true,
+            "selected": [
+              4,
+              5,
+              6,
+              7,
+              12,
+              13,
+              14,
+              16
+            ],
+            "required": [
+              4,
+              5,
+              6,
+              7,
+              16
+            ],
+            "allowed": [
+              4,
+              5,
+              6,
+              7,
+              12,
+              13,
+              14,
+              15,
+              16
+            ],
+            "cutoff": 5.326822757720947,
+            "boundary_tied": true
+          }
+        ]
+      },
+      "inputs_unchanged": true,
+      "wrong_math_controls": {
+        "wrong_pool_max": 1.9818988574987664,
+        "wrong_relu_max": 5.3268225224266885
+      },
+      "passed": true,
+      "data": {
+        "path": "float32-01-text-L17-T1-R4.npz",
+        "sha256": "1a629185c4aafd4cbcb2ca0e9972b6b0f6119708a95c8de37eac7fa15ad8b3b2"
+      }
+    },
+    {
+      "name": "float32-02-text-L18-T3-R4",
+      "return_code": 1,
+      "native_error": "",
+      "stages": {
+        "pooled": {
+          "passed": true,
+          "max_abs": 2.9802322387695312e-08,
+          "rel_l2": 2.1517755706374616e-08,
+          "worst_index": [
+            1,
+            0
+          ],
+          "actual": 0.37513071298599243,
+          "expected": 0.37513068318367004
+        },
+        "keys": {
+          "passed": true,
+          "max_abs": 2.351950625367749e-07,
+          "rel_l2": 6.186052217432229e-08,
+          "worst_index": [
+            1,
+            0
+          ],
+          "actual": -1.5464462041854858,
+          "expected": -1.5464459689904233
+        },
+        "queries": {
+          "passed": true,
+          "max_abs": 4.361112222461827e-07,
+          "rel_l2": 1.137897399819909e-07,
+          "worst_index": [
+            0,
+            0,
+            0
+          ],
+          "actual": 2.176666021347046,
+          "expected": 2.176666457458268
+        },
+        "scores": {
+          "passed": true,
+          "max_abs": 9.642438172363654e-07,
+          "rel_l2": 1.0211285750968861e-07,
+          "worst_index": [
+            2,
+            1
+          ],
+          "actual": 3.8660433292388916,
+          "expected": 3.866044293482709
+        }
+      },
+      "mask": {
+        "passed": true,
+        "queries": [
+          {
+            "passed": true,
+            "selected": [
+              4,
+              5,
+              6,
+              7,
+              8,
+              9,
+              10,
+              11
+            ],
+            "required": [
+              8,
+              9,
+              10,
+              11
+            ],
+            "allowed": [
+              4,
+              5,
+              6,
+              7,
+              8,
+              9,
+              10,
+              11
+            ],
+            "cutoff": 2.752674102783203,
+            "boundary_tied": false
+          },
+          {
+            "passed": true,
+            "selected": [
+              0,
+              1,
+              2,
+              4,
+              5,
+              6,
+              7,
+              16
+            ],
+            "required": [
+              4,
+              5,
+              6,
+              7,
+              16
+            ],
+            "allowed": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7,
+              16
+            ],
+            "cutoff": 3.3729066848754883,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              4,
+              5,
+              12,
+              13,
+              14,
+              15,
+              16,
+              17
+            ],
+            "required": [
+              12,
+              13,
+              14,
+              15,
+              16,
+              17
+            ],
+            "allowed": [
+              4,
+              5,
+              6,
+              7,
+              12,
+              13,
+              14,
+              15,
+              16,
+              17
+            ],
+            "cutoff": 3.866044282913208,
+            "boundary_tied": true
+          }
+        ]
+      },
+      "inputs_unchanged": true,
+      "wrong_math_controls": {
+        "wrong_pool_max": 1.1468936785489932,
+        "wrong_relu_max": 3.866044293482709
+      },
+      "passed": true,
+      "data": {
+        "path": "float32-02-text-L18-T3-R4.npz",
+        "sha256": "2fd9f2bcede5ffb0a10bbdf129e17ce7986e5be7bc384b84e6e532670119c8eb"
+      }
+    },
+    {
+      "name": "float32-03-text-L19-T4-R4",
+      "return_code": 1,
+      "native_error": "",
+      "stages": {
+        "pooled": {
+          "passed": true,
+          "max_abs": 4.470348358154297e-08,
+          "rel_l2": 3.122508780416214e-08,
+          "worst_index": [
+            0,
+            9
+          ],
+          "actual": -0.5675263404846191,
+          "expected": -0.5675262957811356
+        },
+        "keys": {
+          "passed": true,
+          "max_abs": 2.0784524662476045e-07,
+          "rel_l2": 6.181509618966412e-08,
+          "worst_index": [
+            3,
+            11
+          ],
+          "actual": -0.25774767994880676,
+          "expected": -0.25774747210356014
+        },
+        "queries": {
+          "passed": true,
+          "max_abs": 4.6950619636554336e-07,
+          "rel_l2": 1.1371856798270362e-07,
+          "worst_index": [
+            3,
+            2,
+            5
+          ],
+          "actual": 1.8704960346221924,
+          "expected": 1.8704965041283887
+        },
+        "scores": {
+          "passed": true,
+          "max_abs": 8.324800147008204e-07,
+          "rel_l2": 8.753964731920613e-08,
+          "worst_index": [
+            2,
+            4
+          ],
+          "actual": 3.399979591369629,
+          "expected": 3.399978758889614
+        }
+      },
+      "mask": {
+        "passed": true,
+        "queries": [
+          {
+            "passed": true,
+            "selected": [
+              4,
+              5,
+              6,
+              7,
+              8,
+              9,
+              10,
+              11
+            ],
+            "required": [
+              4,
+              5,
+              6,
+              7
+            ],
+            "allowed": [
+              4,
+              5,
+              6,
+              7,
+              8,
+              9,
+              10,
+              11
+            ],
+            "cutoff": 3.317960500717163,
+            "boundary_tied": false
+          },
+          {
+            "passed": true,
+            "selected": [
+              0,
+              1,
+              2,
+              12,
+              13,
+              14,
+              15,
+              16
+            ],
+            "required": [
+              12,
+              13,
+              14,
+              15,
+              16
+            ],
+            "allowed": [
+              0,
+              1,
+              2,
+              3,
+              12,
+              13,
+              14,
+              15,
+              16
+            ],
+            "cutoff": 3.5100419521331787,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              4,
+              5,
+              6,
+              7,
+              12,
+              13,
+              16,
+              17
+            ],
+            "required": [
+              4,
+              5,
+              6,
+              7,
+              16,
+              17
+            ],
+            "allowed": [
+              4,
+              5,
+              6,
+              7,
+              12,
+              13,
+              14,
+              15,
+              16,
+              17
+            ],
+            "cutoff": 2.301687717437744,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              0,
+              1,
+              2,
+              3,
+              12,
+              16,
+              17,
+              18
+            ],
+            "required": [
+              0,
+              1,
+              2,
+              3,
+              16,
+              17,
+              18
+            ],
+            "allowed": [
+              0,
+              1,
+              2,
+              3,
+              12,
+              13,
+              14,
+              15,
+              16,
+              17,
+              18
+            ],
+            "cutoff": 6.035003185272217,
+            "boundary_tied": true
+          }
+        ]
+      },
+      "inputs_unchanged": true,
+      "wrong_math_controls": {
+        "wrong_pool_max": 1.46625791272473,
+        "wrong_relu_max": 3.8574578709546508
+      },
+      "passed": true,
+      "data": {
+        "path": "float32-03-text-L19-T4-R4.npz",
+        "sha256": "d4bf4aa4675a6c9661772a6126c8894dcfed4cccd6f501e8430e7a5cabcc1a16"
+      }
+    },
+    {
+      "name": "float32-04-text-L20-T4-R4",
+      "return_code": 1,
+      "native_error": "",
+      "stages": {
+        "pooled": {
+          "passed": true,
+          "max_abs": 4.0978193283081055e-08,
+          "rel_l2": 4.77436848248395e-08,
+          "worst_index": [
+            4,
+            8
+          ],
+          "actual": -0.15323157608509064,
+          "expected": -0.15323161706328392
+        },
+        "keys": {
+          "passed": true,
+          "max_abs": 2.6219414550610054e-07,
+          "rel_l2": 8.476847047124192e-08,
+          "worst_index": [
+            2,
+            7
+          ],
+          "actual": -2.0415360927581787,
+          "expected": -2.041535830564033
+        },
+        "queries": {
+          "passed": true,
+          "max_abs": 6.01208307138279e-07,
+          "rel_l2": 1.1725607841992405e-07,
+          "worst_index": [
+            1,
+            0,
+            7
+          ],
+          "actual": -2.8773205280303955,
+          "expected": -2.8773199268220884
+        },
+        "scores": {
+          "passed": true,
+          "max_abs": 1.1968596216327398e-06,
+          "rel_l2": 1.2729556306696548e-07,
+          "worst_index": [
+            3,
+            0
+          ],
+          "actual": 2.6259193420410156,
+          "expected": 2.625918145181394
+        }
+      },
+      "mask": {
+        "passed": true,
+        "queries": [
+          {
+            "passed": true,
+            "selected": [
+              0,
+              1,
+              2,
+              12,
+              13,
+              14,
+              15,
+              16
+            ],
+            "required": [
+              12,
+              13,
+              14,
+              15,
+              16
+            ],
+            "allowed": [
+              0,
+              1,
+              2,
+              3,
+              12,
+              13,
+              14,
+              15,
+              16
+            ],
+            "cutoff": 5.554029941558838,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              0,
+              1,
+              12,
+              13,
+              14,
+              15,
+              16,
+              17
+            ],
+            "required": [
+              12,
+              13,
+              14,
+              15,
+              16,
+              17
+            ],
+            "allowed": [
+              0,
+              1,
+              2,
+              3,
+              12,
+              13,
+              14,
+              15,
+              16,
+              17
+            ],
+            "cutoff": 6.2345428466796875,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              8,
+              9,
+              10,
+              11,
+              12,
+              16,
+              17,
+              18
+            ],
+            "required": [
+              8,
+              9,
+              10,
+              11,
+              16,
+              17,
+              18
+            ],
+            "allowed": [
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14,
+              15,
+              16,
+              17,
+              18
+            ],
+            "cutoff": 5.425134658813477,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              8,
+              9,
+              10,
+              11,
+              16,
+              17,
+              18,
+              19
+            ],
+            "required": [
+              8,
+              9,
+              10,
+              11
+            ],
+            "allowed": [
+              8,
+              9,
+              10,
+              11,
+              16,
+              17,
+              18,
+              19
+            ],
+            "cutoff": 6.328976631164551,
+            "boundary_tied": false
+          }
+        ]
+      },
+      "inputs_unchanged": true,
+      "wrong_math_controls": {
+        "wrong_pool_max": 1.3912041780213606,
+        "wrong_relu_max": 6.328976395057267
+      },
+      "passed": true,
+      "data": {
+        "path": "float32-04-text-L20-T4-R4.npz",
+        "sha256": "4556fb31b19921b10d3b368f5486a92e9dc5c18075d263c628518532a008e1cf"
+      }
+    },
+    {
+      "name": "float32-05-offset-L19-T5-R4",
+      "return_code": 1,
+      "native_error": "",
+      "stages": {
+        "pooled": {
+          "passed": true,
+          "max_abs": 4.842877388000488e-08,
+          "rel_l2": 3.1255020778480914e-08,
+          "worst_index": [
+            3,
+            2
+          ],
+          "actual": -0.22109058499336243,
+          "expected": -0.22109053656458855
+        },
+        "keys": {
+          "passed": true,
+          "max_abs": 5.092292012509603e-07,
+          "rel_l2": 1.3560597475431303e-07,
+          "worst_index": [
+            2,
+            1
+          ],
+          "actual": 0.4688263535499573,
+          "expected": 0.4688268627791585
+        },
+        "queries": {
+          "passed": true,
+          "max_abs": 1.7510500677220264e-06,
+          "rel_l2": 3.304500154612608e-07,
+          "worst_index": [
+            0,
+            2,
+            1
+          ],
+          "actual": -0.774064838886261,
+          "expected": -0.7740665899363287
+        },
+        "scores": {
+          "passed": true,
+          "max_abs": 2.4225893611173888e-06,
+          "rel_l2": 3.3032950614019155e-07,
+          "worst_index": [
+            1,
+            0
+          ],
+          "actual": 5.196793079376221,
+          "expected": 5.196795501965582
+        }
+      },
+      "mask": {
+        "passed": true,
+        "queries": [
+          {
+            "passed": true,
+            "selected": [
+              0,
+              1,
+              2,
+              4,
+              7,
+              8,
+              9,
+              10
+            ],
+            "required": [
+              0,
+              1,
+              2,
+              7,
+              8,
+              9,
+              10
+            ],
+            "allowed": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7,
+              8,
+              9,
+              10
+            ],
+            "cutoff": 5.487555980682373,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              15
+            ],
+            "required": [
+              0,
+              1,
+              2,
+              15
+            ],
+            "allowed": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              15
+            ],
+            "cutoff": 5.196795463562012,
+            "boundary_tied": false
+          },
+          {
+            "passed": true,
+            "selected": [
+              0,
+              1,
+              2,
+              8,
+              9,
+              10,
+              15,
+              16
+            ],
+            "required": [
+              0,
+              1,
+              2,
+              15,
+              16
+            ],
+            "allowed": [
+              0,
+              1,
+              2,
+              7,
+              8,
+              9,
+              10,
+              15,
+              16
+            ],
+            "cutoff": 4.06268310546875,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              0,
+              1,
+              2,
+              8,
+              9,
+              15,
+              16,
+              17
+            ],
+            "required": [
+              0,
+              1,
+              2,
+              15,
+              16,
+              17
+            ],
+            "allowed": [
+              0,
+              1,
+              2,
+              7,
+              8,
+              9,
+              10,
+              15,
+              16,
+              17
+            ],
+            "cutoff": 5.907388210296631,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              0,
+              1,
+              2,
+              11,
+              12,
+              13,
+              14,
+              15
+            ],
+            "required": [
+              0,
+              1,
+              2,
+              11,
+              12,
+              13,
+              14
+            ],
+            "allowed": [
+              0,
+              1,
+              2,
+              11,
+              12,
+              13,
+              14,
+              15,
+              16,
+              17,
+              18
+            ],
+            "cutoff": 4.792291641235352,
+            "boundary_tied": true
+          }
+        ]
+      },
+      "inputs_unchanged": true,
+      "wrong_math_controls": {
+        "wrong_pool_max": 1.4841624300554344,
+        "wrong_relu_max": 6.540667328042181
+      },
+      "passed": true,
+      "data": {
+        "path": "float32-05-offset-L19-T5-R4.npz",
+        "sha256": "4662a84f757071152dd095c634755e83dd7776ff542d60625cef48457437f386"
+      }
+    },
+    {
+      "name": "float32-06-media-L23-T7-R4",
+      "return_code": 1,
+      "native_error": "",
+      "stages": {
+        "pooled": {
+          "passed": true,
+          "max_abs": 5.21540641784668e-08,
+          "rel_l2": 4.189396495368139e-08,
+          "worst_index": [
+            4,
+            1
+          ],
+          "actual": -0.5963906049728394,
+          "expected": -0.5963906571269035
+        },
+        "keys": {
+          "passed": true,
+          "max_abs": 3.9998265988216986e-07,
+          "rel_l2": 7.089114618889112e-08,
+          "worst_index": [
+            1,
+            6
+          ],
+          "actual": 2.0594754219055176,
+          "expected": 2.0594750219228577
+        },
+        "queries": {
+          "passed": true,
+          "max_abs": 5.284263533411604e-07,
+          "rel_l2": 8.589902710716243e-08,
+          "worst_index": [
+            6,
+            2,
+            4
+          ],
+          "actual": 2.183973550796509,
+          "expected": 2.183974079222862
+        },
+        "scores": {
+          "passed": true,
+          "max_abs": 2.2147264076011197e-06,
+          "rel_l2": 1.0343558007872539e-07,
+          "worst_index": [
+            3,
+            1
+          ],
+          "actual": 20.570945739746094,
+          "expected": 20.570943525019686
+        }
+      },
+      "mask": {
+        "passed": true,
+        "queries": [
+          {
+            "passed": true,
+            "selected": [
+              0,
+              1,
+              2,
+              4,
+              11,
+              12,
+              16,
+              18
+            ],
+            "required": [
+              0,
+              1,
+              2,
+              4,
+              16,
+              18
+            ],
+            "allowed": [
+              0,
+              1,
+              2,
+              4,
+              11,
+              12,
+              14,
+              15,
+              16,
+              18
+            ],
+            "cutoff": 5.408954620361328,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              3,
+              5,
+              6,
+              8,
+              16,
+              17,
+              18,
+              19
+            ],
+            "required": [
+              3,
+              5,
+              6,
+              8
+            ],
+            "allowed": [
+              3,
+              5,
+              6,
+              8,
+              16,
+              17,
+              18,
+              19
+            ],
+            "cutoff": 4.578092575073242,
+            "boundary_tied": false
+          },
+          {
+            "passed": true,
+            "selected": [
+              0,
+              1,
+              2,
+              11,
+              12,
+              14,
+              15,
+              18
+            ],
+            "required": [
+              11,
+              12,
+              14,
+              15,
+              18
+            ],
+            "allowed": [
+              0,
+              1,
+              2,
+              4,
+              11,
+              12,
+              14,
+              15,
+              18
+            ],
+            "cutoff": 2.840733528137207,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              3,
+              5,
+              6,
+              8,
+              10,
+              16,
+              18,
+              19
+            ],
+            "required": [
+              3,
+              5,
+              6,
+              8,
+              16,
+              18,
+              19
+            ],
+            "allowed": [
+              3,
+              5,
+              6,
+              7,
+              8,
+              9,
+              10,
+              13,
+              16,
+              18,
+              19
+            ],
+            "cutoff": 10.40091323852539,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              8,
+              20
+            ],
+            "required": [
+              3,
+              5,
+              6,
+              8,
+              20
+            ],
+            "allowed": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              8,
+              20
+            ],
+            "cutoff": 9.137961387634277,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              3,
+              7,
+              8,
+              9,
+              10,
+              13,
+              20,
+              21
+            ],
+            "required": [
+              7,
+              9,
+              10,
+              13,
+              20,
+              21
+            ],
+            "allowed": [
+              3,
+              5,
+              6,
+              7,
+              8,
+              9,
+              10,
+              13,
+              20,
+              21
+            ],
+            "cutoff": 8.868752479553223,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              0,
+              11,
+              12,
+              14,
+              15,
+              20,
+              21,
+              22
+            ],
+            "required": [
+              11,
+              12,
+              14,
+              15,
+              20,
+              21,
+              22
+            ],
+            "allowed": [
+              0,
+              1,
+              2,
+              4,
+              11,
+              12,
+              14,
+              15,
+              20,
+              21,
+              22
+            ],
+            "cutoff": 8.403639793395996,
+            "boundary_tied": true
+          }
+        ]
+      },
+      "inputs_unchanged": true,
+      "wrong_math_controls": {
+        "wrong_pool_max": 1.5184517527988022,
+        "wrong_relu_max": 7.830585342488643
+      },
+      "passed": true,
+      "data": {
+        "path": "float32-06-media-L23-T7-R4.npz",
+        "sha256": "7ff94d3dae77ad9c0a90d1f0bd317ad20d8ef650f6e1b7760e06eed47347ed8a"
+      }
+    },
+    {
+      "name": "float32-07-text-L37-T9-R2",
+      "return_code": 1,
+      "native_error": "",
+      "stages": {
+        "pooled": {
+          "passed": true,
+          "max_abs": 1.043081283569336e-07,
+          "rel_l2": 5.104310013605953e-08,
+          "worst_index": [
+            17,
+            7
+          ],
+          "actual": -0.01473759114742279,
+          "expected": -0.014737695455551147
+        },
+        "keys": {
+          "passed": true,
+          "max_abs": 4.086445129711236e-07,
+          "rel_l2": 8.941882449389698e-08,
+          "worst_index": [
+            17,
+            7
+          ],
+          "actual": -0.026345573365688324,
+          "expected": -0.026345982010201295
+        },
+        "queries": {
+          "passed": true,
+          "max_abs": 6.510293564243597e-07,
+          "rel_l2": 1.2562572337144302e-07,
+          "worst_index": [
+            7,
+            0,
+            5
+          ],
+          "actual": 0.906256914138794,
+          "expected": 0.9062562631094375
+        },
+        "scores": {
+          "passed": true,
+          "max_abs": 2.6507246211338042e-06,
+          "rel_l2": 1.157542362965428e-07,
+          "worst_index": [
+            7,
+            4
+          ],
+          "actual": 6.221731662750244,
+          "expected": 6.221734313474865
+        }
+      },
+      "mask": {
+        "passed": true,
+        "queries": [
+          {
+            "passed": true,
+            "selected": [
+              4,
+              10,
+              11,
+              28
+            ],
+            "required": [
+              10,
+              11,
+              28
+            ],
+            "allowed": [
+              4,
+              5,
+              10,
+              11,
+              28
+            ],
+            "cutoff": 6.934202671051025,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              20,
+              21,
+              26,
+              27
+            ],
+            "required": [
+              20,
+              21
+            ],
+            "allowed": [
+              20,
+              21,
+              26,
+              27
+            ],
+            "cutoff": 6.822134017944336,
+            "boundary_tied": false
+          },
+          {
+            "passed": true,
+            "selected": [
+              12,
+              24,
+              25,
+              30
+            ],
+            "required": [
+              24,
+              25,
+              30
+            ],
+            "allowed": [
+              12,
+              13,
+              24,
+              25,
+              30
+            ],
+            "cutoff": 6.742699146270752,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              0,
+              1,
+              12,
+              13
+            ],
+            "required": [
+              0,
+              1
+            ],
+            "allowed": [
+              0,
+              1,
+              12,
+              13
+            ],
+            "cutoff": 8.273838996887207,
+            "boundary_tied": false
+          },
+          {
+            "passed": true,
+            "selected": [
+              12,
+              20,
+              21,
+              32
+            ],
+            "required": [
+              20,
+              21,
+              32
+            ],
+            "allowed": [
+              12,
+              13,
+              20,
+              21,
+              32
+            ],
+            "cutoff": 6.5110883712768555,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              18,
+              19,
+              26,
+              27
+            ],
+            "required": [
+              26,
+              27
+            ],
+            "allowed": [
+              18,
+              19,
+              26,
+              27
+            ],
+            "cutoff": 6.588537216186523,
+            "boundary_tied": false
+          },
+          {
+            "passed": true,
+            "selected": [
+              20,
+              21,
+              26,
+              34
+            ],
+            "required": [
+              20,
+              21,
+              34
+            ],
+            "allowed": [
+              20,
+              21,
+              26,
+              27,
+              34
+            ],
+            "cutoff": 8.55544376373291,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              18,
+              19,
+              34,
+              35
+            ],
+            "required": [
+              34,
+              35
+            ],
+            "allowed": [
+              18,
+              19,
+              34,
+              35
+            ],
+            "cutoff": 11.021689414978027,
+            "boundary_tied": false
+          },
+          {
+            "passed": true,
+            "selected": [
+              28,
+              30,
+              31,
+              36
+            ],
+            "required": [
+              30,
+              31,
+              36
+            ],
+            "allowed": [
+              28,
+              29,
+              30,
+              31,
+              36
+            ],
+            "cutoff": 7.312713146209717,
+            "boundary_tied": true
+          }
+        ]
+      },
+      "inputs_unchanged": true,
+      "wrong_math_controls": {
+        "wrong_pool_max": 1.4866608130200694,
+        "wrong_relu_max": 6.896858249754963
+      },
+      "passed": true,
+      "data": {
+        "path": "float32-07-text-L37-T9-R2.npz",
+        "sha256": "c42efc1f965be65ae2d70fc095b719d6bf0bc96fc1ffed24e44bec3268c22177"
+      }
+    },
+    {
+      "name": "float32-08-text-L97-T33-R4",
+      "return_code": 1,
+      "native_error": "",
+      "stages": {
+        "pooled": {
+          "passed": true,
+          "max_abs": 8.195638656616211e-08,
+          "rel_l2": 5.487370181387119e-08,
+          "worst_index": [
+            17,
+            3
+          ],
+          "actual": 1.010399580001831,
+          "expected": 1.0103994980454445
+        },
+        "keys": {
+          "passed": true,
+          "max_abs": 1.929056055782752e-06,
+          "rel_l2": 1.899555897125073e-07,
+          "worst_index": [
+            20,
+            5
+          ],
+          "actual": -0.04242866113781929,
+          "expected": -0.04242673208176351
+        },
+        "queries": {
+          "passed": true,
+          "max_abs": 2.704703297246036e-06,
+          "rel_l2": 2.799323949810832e-07,
+          "worst_index": [
+            19,
+            1,
+            1
+          ],
+          "actual": 0.09634868800640106,
+          "expected": 0.09634598330310382
+        },
+        "scores": {
+          "passed": true,
+          "max_abs": 5.570939325849622e-06,
+          "rel_l2": 1.7422321206322967e-07,
+          "worst_index": [
+            14,
+            20
+          ],
+          "actual": 3.251823663711548,
+          "expected": 3.251818092772222
+        }
+      },
+      "mask": {
+        "passed": true,
+        "queries": [
+          {
+            "passed": true,
+            "selected": [
+              36,
+              37,
+              38,
+              39,
+              40,
+              41,
+              42,
+              64
+            ],
+            "required": [
+              36,
+              37,
+              38,
+              39,
+              64
+            ],
+            "allowed": [
+              36,
+              37,
+              38,
+              39,
+              40,
+              41,
+              42,
+              43,
+              64
+            ],
+            "cutoff": 9.633523941040039,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              28,
+              29,
+              30,
+              31,
+              36,
+              37,
+              64,
+              65
+            ],
+            "required": [
+              28,
+              29,
+              30,
+              31,
+              64,
+              65
+            ],
+            "allowed": [
+              28,
+              29,
+              30,
+              31,
+              36,
+              37,
+              38,
+              39,
+              64,
+              65
+            ],
+            "cutoff": 8.206984519958496,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              32,
+              56,
+              57,
+              58,
+              59,
+              64,
+              65,
+              66
+            ],
+            "required": [
+              56,
+              57,
+              58,
+              59,
+              64,
+              65,
+              66
+            ],
+            "allowed": [
+              32,
+              33,
+              34,
+              35,
+              56,
+              57,
+              58,
+              59,
+              64,
+              65,
+              66
+            ],
+            "cutoff": 10.005876541137695,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              4,
+              5,
+              6,
+              7,
+              28,
+              29,
+              30,
+              31
+            ],
+            "required": [
+              4,
+              5,
+              6,
+              7
+            ],
+            "allowed": [
+              4,
+              5,
+              6,
+              7,
+              28,
+              29,
+              30,
+              31
+            ],
+            "cutoff": 10.487659454345703,
+            "boundary_tied": false
+          },
+          {
+            "passed": true,
+            "selected": [
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14,
+              68
+            ],
+            "required": [
+              8,
+              9,
+              10,
+              11,
+              68
+            ],
+            "allowed": [
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14,
+              15,
+              68
+            ],
+            "cutoff": 10.810866355895996,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              0,
+              1,
+              2,
+              3,
+              28,
+              29,
+              68,
+              69
+            ],
+            "required": [
+              0,
+              1,
+              2,
+              3,
+              68,
+              69
+            ],
+            "allowed": [
+              0,
+              1,
+              2,
+              3,
+              28,
+              29,
+              30,
+              31,
+              68,
+              69
+            ],
+            "cutoff": 6.936792850494385,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              16,
+              17,
+              18,
+              19,
+              40,
+              68,
+              69,
+              70
+            ],
+            "required": [
+              16,
+              17,
+              18,
+              19,
+              68,
+              69,
+              70
+            ],
+            "allowed": [
+              16,
+              17,
+              18,
+              19,
+              40,
+              41,
+              42,
+              43,
+              68,
+              69,
+              70
+            ],
+            "cutoff": 9.371549606323242,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              8,
+              9,
+              10,
+              11,
+              52,
+              53,
+              54,
+              55
+            ],
+            "required": [
+              52,
+              53,
+              54,
+              55
+            ],
+            "allowed": [
+              8,
+              9,
+              10,
+              11,
+              52,
+              53,
+              54,
+              55
+            ],
+            "cutoff": 7.660273551940918,
+            "boundary_tied": false
+          },
+          {
+            "passed": true,
+            "selected": [
+              16,
+              17,
+              18,
+              44,
+              45,
+              46,
+              47,
+              72
+            ],
+            "required": [
+              44,
+              45,
+              46,
+              47,
+              72
+            ],
+            "allowed": [
+              16,
+              17,
+              18,
+              19,
+              44,
+              45,
+              46,
+              47,
+              72
+            ],
+            "cutoff": 5.532958030700684,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              20,
+              21,
+              28,
+              29,
+              30,
+              31,
+              72,
+              73
+            ],
+            "required": [
+              28,
+              29,
+              30,
+              31,
+              72,
+              73
+            ],
+            "allowed": [
+              20,
+              21,
+              22,
+              23,
+              28,
+              29,
+              30,
+              31,
+              72,
+              73
+            ],
+            "cutoff": 10.901229858398438,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              8,
+              9,
+              10,
+              11,
+              52,
+              72,
+              73,
+              74
+            ],
+            "required": [
+              8,
+              9,
+              10,
+              11,
+              72,
+              73,
+              74
+            ],
+            "allowed": [
+              8,
+              9,
+              10,
+              11,
+              52,
+              53,
+              54,
+              55,
+              72,
+              73,
+              74
+            ],
+            "cutoff": 12.354072570800781,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              60,
+              61,
+              62,
+              63,
+              64,
+              65,
+              66,
+              67
+            ],
+            "required": [
+              64,
+              65,
+              66,
+              67
+            ],
+            "allowed": [
+              60,
+              61,
+              62,
+              63,
+              64,
+              65,
+              66,
+              67
+            ],
+            "cutoff": 9.719655990600586,
+            "boundary_tied": false
+          },
+          {
+            "passed": true,
+            "selected": [
+              20,
+              21,
+              22,
+              23,
+              52,
+              53,
+              54,
+              76
+            ],
+            "required": [
+              20,
+              21,
+              22,
+              23,
+              76
+            ],
+            "allowed": [
+              20,
+              21,
+              22,
+              23,
+              52,
+              53,
+              54,
+              55,
+              76
+            ],
+            "cutoff": 5.9748430252075195,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              76,
+              77
+            ],
+            "required": [
+              8,
+              9,
+              10,
+              11,
+              76,
+              77
+            ],
+            "allowed": [
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14,
+              15,
+              76,
+              77
+            ],
+            "cutoff": 11.85301399230957,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              4,
+              28,
+              29,
+              30,
+              31,
+              76,
+              77,
+              78
+            ],
+            "required": [
+              28,
+              29,
+              30,
+              31,
+              76,
+              77,
+              78
+            ],
+            "allowed": [
+              4,
+              5,
+              6,
+              7,
+              28,
+              29,
+              30,
+              31,
+              76,
+              77,
+              78
+            ],
+            "cutoff": 9.452563285827637,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              52,
+              53,
+              54,
+              55,
+              72,
+              73,
+              74,
+              75
+            ],
+            "required": [
+              52,
+              53,
+              54,
+              55
+            ],
+            "allowed": [
+              52,
+              53,
+              54,
+              55,
+              72,
+              73,
+              74,
+              75
+            ],
+            "cutoff": 10.26932144165039,
+            "boundary_tied": false
+          },
+          {
+            "passed": true,
+            "selected": [
+              52,
+              53,
+              54,
+              76,
+              77,
+              78,
+              79,
+              80
+            ],
+            "required": [
+              76,
+              77,
+              78,
+              79,
+              80
+            ],
+            "allowed": [
+              52,
+              53,
+              54,
+              55,
+              76,
+              77,
+              78,
+              79,
+              80
+            ],
+            "cutoff": 8.438023567199707,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              28,
+              29,
+              30,
+              31,
+              72,
+              73,
+              80,
+              81
+            ],
+            "required": [
+              28,
+              29,
+              30,
+              31,
+              80,
+              81
+            ],
+            "allowed": [
+              28,
+              29,
+              30,
+              31,
+              72,
+              73,
+              74,
+              75,
+              80,
+              81
+            ],
+            "cutoff": 9.340533256530762,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              36,
+              76,
+              77,
+              78,
+              79,
+              80,
+              81,
+              82
+            ],
+            "required": [
+              76,
+              77,
+              78,
+              79,
+              80,
+              81,
+              82
+            ],
+            "allowed": [
+              36,
+              37,
+              38,
+              39,
+              76,
+              77,
+              78,
+              79,
+              80,
+              81,
+              82
+            ],
+            "cutoff": 10.352461814880371,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              24,
+              25,
+              26,
+              27,
+              36,
+              37,
+              38,
+              39
+            ],
+            "required": [
+              24,
+              25,
+              26,
+              27
+            ],
+            "allowed": [
+              24,
+              25,
+              26,
+              27,
+              36,
+              37,
+              38,
+              39
+            ],
+            "cutoff": 15.486082077026367,
+            "boundary_tied": false
+          },
+          {
+            "passed": true,
+            "selected": [
+              44,
+              45,
+              46,
+              47,
+              72,
+              73,
+              74,
+              84
+            ],
+            "required": [
+              44,
+              45,
+              46,
+              47,
+              84
+            ],
+            "allowed": [
+              44,
+              45,
+              46,
+              47,
+              72,
+              73,
+              74,
+              75,
+              84
+            ],
+            "cutoff": 10.228978157043457,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              4,
+              5,
+              32,
+              33,
+              34,
+              35,
+              84,
+              85
+            ],
+            "required": [
+              32,
+              33,
+              34,
+              35,
+              84,
+              85
+            ],
+            "allowed": [
+              4,
+              5,
+              6,
+              7,
+              32,
+              33,
+              34,
+              35,
+              84,
+              85
+            ],
+            "cutoff": 9.14074993133545,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              28,
+              29,
+              30,
+              31,
+              68,
+              84,
+              85,
+              86
+            ],
+            "required": [
+              28,
+              29,
+              30,
+              31,
+              84,
+              85,
+              86
+            ],
+            "allowed": [
+              28,
+              29,
+              30,
+              31,
+              68,
+              69,
+              70,
+              71,
+              84,
+              85,
+              86
+            ],
+            "cutoff": 10.538126945495605,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              28,
+              29,
+              30,
+              31,
+              60,
+              61,
+              62,
+              63
+            ],
+            "required": [
+              60,
+              61,
+              62,
+              63
+            ],
+            "allowed": [
+              28,
+              29,
+              30,
+              31,
+              60,
+              61,
+              62,
+              63
+            ],
+            "cutoff": 7.7410888671875,
+            "boundary_tied": false
+          },
+          {
+            "passed": true,
+            "selected": [
+              20,
+              21,
+              22,
+              52,
+              53,
+              54,
+              55,
+              88
+            ],
+            "required": [
+              52,
+              53,
+              54,
+              55,
+              88
+            ],
+            "allowed": [
+              20,
+              21,
+              22,
+              23,
+              52,
+              53,
+              54,
+              55,
+              88
+            ],
+            "cutoff": 7.871006011962891,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              24,
+              25,
+              84,
+              85,
+              86,
+              87,
+              88,
+              89
+            ],
+            "required": [
+              84,
+              85,
+              86,
+              87,
+              88,
+              89
+            ],
+            "allowed": [
+              24,
+              25,
+              26,
+              27,
+              84,
+              85,
+              86,
+              87,
+              88,
+              89
+            ],
+            "cutoff": 9.291594505310059,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              64,
+              65,
+              66,
+              67,
+              76,
+              88,
+              89,
+              90
+            ],
+            "required": [
+              64,
+              65,
+              66,
+              67,
+              88,
+              89,
+              90
+            ],
+            "allowed": [
+              64,
+              65,
+              66,
+              67,
+              76,
+              77,
+              78,
+              79,
+              88,
+              89,
+              90
+            ],
+            "cutoff": 11.09992504119873,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              20,
+              21,
+              22,
+              23,
+              68,
+              69,
+              70,
+              71
+            ],
+            "required": [
+              20,
+              21,
+              22,
+              23
+            ],
+            "allowed": [
+              20,
+              21,
+              22,
+              23,
+              68,
+              69,
+              70,
+              71
+            ],
+            "cutoff": 8.51153564453125,
+            "boundary_tied": false
+          },
+          {
+            "passed": true,
+            "selected": [
+              28,
+              29,
+              30,
+              31,
+              36,
+              37,
+              38,
+              92
+            ],
+            "required": [
+              28,
+              29,
+              30,
+              31,
+              92
+            ],
+            "allowed": [
+              28,
+              29,
+              30,
+              31,
+              36,
+              37,
+              38,
+              39,
+              92
+            ],
+            "cutoff": 8.593768119812012,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              8,
+              9,
+              10,
+              11,
+              28,
+              29,
+              92,
+              93
+            ],
+            "required": [
+              8,
+              9,
+              10,
+              11,
+              92,
+              93
+            ],
+            "allowed": [
+              8,
+              9,
+              10,
+              11,
+              28,
+              29,
+              30,
+              31,
+              92,
+              93
+            ],
+            "cutoff": 8.657711029052734,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              76,
+              88,
+              89,
+              90,
+              91,
+              92,
+              93,
+              94
+            ],
+            "required": [
+              88,
+              89,
+              90,
+              91,
+              92,
+              93,
+              94
+            ],
+            "allowed": [
+              76,
+              77,
+              78,
+              79,
+              88,
+              89,
+              90,
+              91,
+              92,
+              93,
+              94
+            ],
+            "cutoff": 11.011895179748535,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              44,
+              45,
+              46,
+              47,
+              68,
+              69,
+              70,
+              71
+            ],
+            "required": [
+              44,
+              45,
+              46,
+              47
+            ],
+            "allowed": [
+              44,
+              45,
+              46,
+              47,
+              68,
+              69,
+              70,
+              71
+            ],
+            "cutoff": 9.956722259521484,
+            "boundary_tied": false
+          },
+          {
+            "passed": true,
+            "selected": [
+              16,
+              17,
+              18,
+              24,
+              25,
+              26,
+              27,
+              96
+            ],
+            "required": [
+              24,
+              25,
+              26,
+              27,
+              96
+            ],
+            "allowed": [
+              16,
+              17,
+              18,
+              19,
+              24,
+              25,
+              26,
+              27,
+              96
+            ],
+            "cutoff": 10.282313346862793,
+            "boundary_tied": true
+          }
+        ]
+      },
+      "inputs_unchanged": true,
+      "wrong_math_controls": {
+        "wrong_pool_max": 1.977117107509169,
+        "wrong_relu_max": 9.444238103203965
+      },
+      "passed": true,
+      "data": {
+        "path": "float32-08-text-L97-T33-R4.npz",
+        "sha256": "6c4c9098d15d2cd2ef88b42f10ad2df9e86b51c172ebc08870df37b9a7112c0a"
+      }
+    },
+    {
+      "name": "float32-09-text-L3-T2-R4",
+      "return_code": 1,
+      "native_error": "",
+      "stages": {
+        "pooled": {
+          "passed": true,
+          "max_abs": 0.0,
+          "rel_l2": 0.0,
+          "worst_index": [
+            0,
+            0
+          ],
+          "actual": -0.11338767409324646,
+          "expected": -0.11338767409324646
+        },
+        "keys": {
+          "passed": true,
+          "max_abs": 2.8071819313524315e-08,
+          "rel_l2": 1.438186421217964e-08,
+          "worst_index": [
+            0,
+            10
+          ],
+          "actual": 1.331992745399475,
+          "expected": 1.3319927734712944
+        },
+        "queries": {
+          "passed": true,
+          "max_abs": 2.1552432860616477e-07,
+          "rel_l2": 7.686854382402296e-08,
+          "worst_index": [
+            0,
+            0,
+            9
+          ],
+          "actual": 2.6236555576324463,
+          "expected": 2.623655773156775
+        },
+        "scores": {
+          "passed": true,
+          "max_abs": 0.0,
+          "rel_l2": 0.0,
+          "worst_index": [
+            0,
+            0
+          ],
+          "actual": 0.0,
+          "expected": 0.0
+        }
+      },
+      "mask": {
+        "passed": true,
+        "queries": [
+          {
+            "passed": true,
+            "selected": [
+              0,
+              1
+            ],
+            "required": [],
+            "allowed": [
+              0,
+              1
+            ],
+            "cutoff": 1000000000.0,
+            "boundary_tied": false
+          },
+          {
+            "passed": true,
+            "selected": [
+              0,
+              1,
+              2
+            ],
+            "required": [],
+            "allowed": [
+              0,
+              1,
+              2
+            ],
+            "cutoff": 1000000000.0,
+            "boundary_tied": false
+          }
+        ]
+      },
+      "inputs_unchanged": true,
+      "wrong_math_controls": {
+        "wrong_pool_max": 0.0,
+        "wrong_relu_max": 0.0
+      },
+      "passed": true,
+      "data": {
+        "path": "float32-09-text-L3-T2-R4.npz",
+        "sha256": "90c5c80242976e31688449fc52bd094d911f92ff6a13d47d8e057dedef35ad6b"
+      }
+    },
+    {
+      "name": "float16-00-text-L16-T16-R4",
+      "return_code": 1,
+      "native_error": "",
+      "stages": {
+        "pooled": {
+          "passed": true,
+          "max_abs": 0.0,
+          "rel_l2": 0.0,
+          "worst_index": [
+            0,
+            0
+          ],
+          "actual": 0.0466156005859375,
+          "expected": 0.0466156005859375
+        },
+        "keys": {
+          "passed": true,
+          "max_abs": 1.9966288844486257e-07,
+          "rel_l2": 4.8313555970938884e-08,
+          "worst_index": [
+            3,
+            2
+          ],
+          "actual": 1.6316701173782349,
+          "expected": 1.6316703170411233
+        },
+        "queries": {
+          "passed": true,
+          "max_abs": 5.182454245744594e-07,
+          "rel_l2": 9.853133681388995e-08,
+          "worst_index": [
+            11,
+            1,
+            1
+          ],
+          "actual": 0.45669692754745483,
+          "expected": 0.45669640930203026
+        },
+        "scores": {
+          "passed": true,
+          "max_abs": 2.3423395507649047e-06,
+          "rel_l2": 9.81677155109265e-08,
+          "worst_index": [
+            1,
+            2
+          ],
+          "actual": 8.351308822631836,
+          "expected": 8.351306480292285
+        }
+      },
+      "mask": {
+        "passed": true,
+        "queries": [
+          {
+            "passed": true,
+            "selected": [
+              0
+            ],
+            "required": [],
+            "allowed": [
+              0
+            ],
+            "cutoff": 1000000000.0,
+            "boundary_tied": false
+          },
+          {
+            "passed": true,
+            "selected": [
+              0,
+              1
+            ],
+            "required": [],
+            "allowed": [
+              0,
+              1
+            ],
+            "cutoff": 1000000000.0,
+            "boundary_tied": false
+          },
+          {
+            "passed": true,
+            "selected": [
+              0,
+              1,
+              2
+            ],
+            "required": [],
+            "allowed": [
+              0,
+              1,
+              2
+            ],
+            "cutoff": 1000000000.0,
+            "boundary_tied": false
+          },
+          {
+            "passed": true,
+            "selected": [
+              0,
+              1,
+              2,
+              3
+            ],
+            "required": [],
+            "allowed": [
+              0,
+              1,
+              2,
+              3
+            ],
+            "cutoff": 12.553020477294922,
+            "boundary_tied": false
+          },
+          {
+            "passed": true,
+            "selected": [
+              0,
+              1,
+              2,
+              3,
+              4
+            ],
+            "required": [
+              4
+            ],
+            "allowed": [
+              0,
+              1,
+              2,
+              3,
+              4
+            ],
+            "cutoff": 1.9628877639770508,
+            "boundary_tied": false
+          },
+          {
+            "passed": true,
+            "selected": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5
+            ],
+            "required": [
+              4,
+              5
+            ],
+            "allowed": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5
+            ],
+            "cutoff": 9.346420288085938,
+            "boundary_tied": false
+          },
+          {
+            "passed": true,
+            "selected": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6
+            ],
+            "required": [
+              4,
+              5,
+              6
+            ],
+            "allowed": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6
+            ],
+            "cutoff": 4.270992279052734,
+            "boundary_tied": false
+          },
+          {
+            "passed": true,
+            "selected": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7
+            ],
+            "required": [
+              4,
+              5,
+              6,
+              7
+            ],
+            "allowed": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7
+            ],
+            "cutoff": 1.746764063835144,
+            "boundary_tied": false
+          },
+          {
+            "passed": true,
+            "selected": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              8
+            ],
+            "required": [
+              0,
+              1,
+              2,
+              3,
+              8
+            ],
+            "allowed": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7,
+              8
+            ],
+            "cutoff": 2.805060863494873,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              0,
+              1,
+              4,
+              5,
+              6,
+              7,
+              8,
+              9
+            ],
+            "required": [
+              4,
+              5,
+              6,
+              7,
+              8,
+              9
+            ],
+            "allowed": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7,
+              8,
+              9
+            ],
+            "cutoff": 0.7010620832443237,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              0,
+              4,
+              5,
+              6,
+              7,
+              8,
+              9,
+              10
+            ],
+            "required": [
+              4,
+              5,
+              6,
+              7,
+              8,
+              9,
+              10
+            ],
+            "allowed": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7,
+              8,
+              9,
+              10
+            ],
+            "cutoff": 0.03315131366252899,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              4,
+              5,
+              6,
+              7,
+              8,
+              9,
+              10,
+              11
+            ],
+            "required": [
+              4,
+              5,
+              6,
+              7
+            ],
+            "allowed": [
+              4,
+              5,
+              6,
+              7,
+              8,
+              9,
+              10,
+              11
+            ],
+            "cutoff": 1.274027705192566,
+            "boundary_tied": false
+          },
+          {
+            "passed": true,
+            "selected": [
+              4,
+              5,
+              6,
+              8,
+              9,
+              10,
+              11,
+              12
+            ],
+            "required": [
+              8,
+              9,
+              10,
+              11,
+              12
+            ],
+            "allowed": [
+              4,
+              5,
+              6,
+              7,
+              8,
+              9,
+              10,
+              11,
+              12
+            ],
+            "cutoff": 8.703951835632324,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              12,
+              13
+            ],
+            "required": [
+              0,
+              1,
+              2,
+              3,
+              12,
+              13
+            ],
+            "allowed": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7,
+              12,
+              13
+            ],
+            "cutoff": 7.544209003448486,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              4,
+              5,
+              6,
+              7,
+              8,
+              12,
+              13,
+              14
+            ],
+            "required": [
+              4,
+              5,
+              6,
+              7,
+              12,
+              13,
+              14
+            ],
+            "allowed": [
+              4,
+              5,
+              6,
+              7,
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14
+            ],
+            "cutoff": 0.36845359206199646,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              4,
+              5,
+              6,
+              7,
+              12,
+              13,
+              14,
+              15
+            ],
+            "required": [
+              4,
+              5,
+              6,
+              7
+            ],
+            "allowed": [
+              4,
+              5,
+              6,
+              7,
+              12,
+              13,
+              14,
+              15
+            ],
+            "cutoff": 3.5697848796844482,
+            "boundary_tied": false
+          }
+        ]
+      },
+      "inputs_unchanged": true,
+      "wrong_math_controls": {
+        "wrong_pool_max": 2.112383732439979,
+        "wrong_relu_max": 7.309255718742115
+      },
+      "passed": true,
+      "data": {
+        "path": "float16-00-text-L16-T16-R4.npz",
+        "sha256": "2559980922f9a186f71b1f37be01c66dd68f86287762c049eec64f171b61f7e1"
+      }
+    },
+    {
+      "name": "float16-01-text-L17-T1-R4",
+      "return_code": 1,
+      "native_error": "",
+      "stages": {
+        "pooled": {
+          "passed": true,
+          "max_abs": 0.0,
+          "rel_l2": 0.0,
+          "worst_index": [
+            0,
+            0
+          ],
+          "actual": 0.26740264892578125,
+          "expected": 0.26740264892578125
+        },
+        "keys": {
+          "passed": true,
+          "max_abs": 1.7301802923697096e-07,
+          "rel_l2": 6.000383742208192e-08,
+          "worst_index": [
+            2,
+            3
+          ],
+          "actual": -1.2250044345855713,
+          "expected": -1.2250046076036005
+        },
+        "queries": {
+          "passed": true,
+          "max_abs": 3.247394371186374e-07,
+          "rel_l2": 1.1281543182406108e-07,
+          "worst_index": [
+            0,
+            0,
+            4
+          ],
+          "actual": 2.0530381202697754,
+          "expected": 2.0530377955303383
+        },
+        "scores": {
+          "passed": true,
+          "max_abs": 4.7611036535499807e-07,
+          "rel_l2": 5.844019617773899e-08,
+          "worst_index": [
+            0,
+            1
+          ],
+          "actual": 8.954219818115234,
+          "expected": 8.9542202942256
+        }
+      },
+      "mask": {
+        "passed": true,
+        "queries": [
+          {
+            "passed": true,
+            "selected": [
+              0,
+              1,
+              2,
+              4,
+              5,
+              6,
+              7,
+              16
+            ],
+            "required": [
+              4,
+              5,
+              6,
+              7,
+              16
+            ],
+            "allowed": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7,
+              16
+            ],
+            "cutoff": 5.716476917266846,
+            "boundary_tied": true
+          }
+        ]
+      },
+      "inputs_unchanged": true,
+      "wrong_math_controls": {
+        "wrong_pool_max": 1.588452338724984,
+        "wrong_relu_max": 2.5476744815238743
+      },
+      "passed": true,
+      "data": {
+        "path": "float16-01-text-L17-T1-R4.npz",
+        "sha256": "4daf709fe522f4da81487733715252408b867982f56f48bf25b0fc5f0eb1c41b"
+      }
+    },
+    {
+      "name": "float16-02-text-L18-T3-R4",
+      "return_code": 1,
+      "native_error": "",
+      "stages": {
+        "pooled": {
+          "passed": true,
+          "max_abs": 0.0,
+          "rel_l2": 0.0,
+          "worst_index": [
+            0,
+            0
+          ],
+          "actual": 0.24551010131835938,
+          "expected": 0.24551010131835938
+        },
+        "keys": {
+          "passed": true,
+          "max_abs": 2.2788639508775077e-07,
+          "rel_l2": 5.176563231763065e-08,
+          "worst_index": [
+            2,
+            5
+          ],
+          "actual": -2.4709062576293945,
+          "expected": -2.4709064855157896
+        },
+        "queries": {
+          "passed": true,
+          "max_abs": 2.870339024241275e-07,
+          "rel_l2": 9.266878284756172e-08,
+          "worst_index": [
+            2,
+            0,
+            4
+          ],
+          "actual": -2.1754770278930664,
+          "expected": -2.175477314926969
+        },
+        "scores": {
+          "passed": true,
+          "max_abs": 9.695641605134142e-07,
+          "rel_l2": 1.0301045914594201e-07,
+          "worst_index": [
+            1,
+            0
+          ],
+          "actual": 4.3139424324035645,
+          "expected": 4.313941462839404
+        }
+      },
+      "mask": {
+        "passed": true,
+        "queries": [
+          {
+            "passed": true,
+            "selected": [
+              4,
+              5,
+              6,
+              7,
+              12,
+              13,
+              14,
+              15
+            ],
+            "required": [
+              12,
+              13,
+              14,
+              15
+            ],
+            "allowed": [
+              4,
+              5,
+              6,
+              7,
+              12,
+              13,
+              14,
+              15
+            ],
+            "cutoff": 4.068984031677246,
+            "boundary_tied": false
+          },
+          {
+            "passed": true,
+            "selected": [
+              0,
+              1,
+              2,
+              8,
+              9,
+              10,
+              11,
+              16
+            ],
+            "required": [
+              8,
+              9,
+              10,
+              11,
+              16
+            ],
+            "allowed": [
+              0,
+              1,
+              2,
+              3,
+              8,
+              9,
+              10,
+              11,
+              16
+            ],
+            "cutoff": 4.313941478729248,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              0,
+              1,
+              4,
+              5,
+              6,
+              7,
+              16,
+              17
+            ],
+            "required": [
+              4,
+              5,
+              6,
+              7,
+              16,
+              17
+            ],
+            "allowed": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7,
+              16,
+              17
+            ],
+            "cutoff": 3.605090618133545,
+            "boundary_tied": true
+          }
+        ]
+      },
+      "inputs_unchanged": true,
+      "wrong_math_controls": {
+        "wrong_pool_max": 1.143592444507018,
+        "wrong_relu_max": 4.590421856550483
+      },
+      "passed": true,
+      "data": {
+        "path": "float16-02-text-L18-T3-R4.npz",
+        "sha256": "c026780fec154c8442c103489fdacf65538fe0f1c94befc3128918a85970c630"
+      }
+    },
+    {
+      "name": "float16-03-text-L19-T4-R4",
+      "return_code": 1,
+      "native_error": "",
+      "stages": {
+        "pooled": {
+          "passed": true,
+          "max_abs": 0.0,
+          "rel_l2": 0.0,
+          "worst_index": [
+            0,
+            0
+          ],
+          "actual": 0.0340576171875,
+          "expected": 0.0340576171875
+        },
+        "keys": {
+          "passed": true,
+          "max_abs": 2.5928268465591486e-07,
+          "rel_l2": 7.937636219853416e-08,
+          "worst_index": [
+            4,
+            3
+          ],
+          "actual": -2.363051414489746,
+          "expected": -2.3630516737724307
+        },
+        "queries": {
+          "passed": true,
+          "max_abs": 5.592646052932082e-07,
+          "rel_l2": 1.0469213088470163e-07,
+          "worst_index": [
+            1,
+            0,
+            2
+          ],
+          "actual": -2.1218883991241455,
+          "expected": -2.12188783985954
+        },
+        "scores": {
+          "passed": true,
+          "max_abs": 9.765860715660324e-07,
+          "rel_l2": 8.031403006645322e-08,
+          "worst_index": [
+            3,
+            0
+          ],
+          "actual": 7.500248432159424,
+          "expected": 7.500249408745495
+        }
+      },
+      "mask": {
+        "passed": true,
+        "queries": [
+          {
+            "passed": true,
+            "selected": [
+              0,
+              1,
+              2,
+              3,
+              12,
+              13,
+              14,
+              15
+            ],
+            "required": [
+              12,
+              13,
+              14,
+              15
+            ],
+            "allowed": [
+              0,
+              1,
+              2,
+              3,
+              12,
+              13,
+              14,
+              15
+            ],
+            "cutoff": 4.64042329788208,
+            "boundary_tied": false
+          },
+          {
+            "passed": true,
+            "selected": [
+              0,
+              1,
+              2,
+              3,
+              8,
+              9,
+              10,
+              16
+            ],
+            "required": [
+              0,
+              1,
+              2,
+              3,
+              16
+            ],
+            "allowed": [
+              0,
+              1,
+              2,
+              3,
+              8,
+              9,
+              10,
+              11,
+              16
+            ],
+            "cutoff": 5.325615882873535,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              8,
+              9,
+              12,
+              13,
+              14,
+              15,
+              16,
+              17
+            ],
+            "required": [
+              12,
+              13,
+              14,
+              15,
+              16,
+              17
+            ],
+            "allowed": [
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14,
+              15,
+              16,
+              17
+            ],
+            "cutoff": 3.925119161605835,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              0,
+              8,
+              9,
+              10,
+              11,
+              16,
+              17,
+              18
+            ],
+            "required": [
+              8,
+              9,
+              10,
+              11,
+              16,
+              17,
+              18
+            ],
+            "allowed": [
+              0,
+              1,
+              2,
+              3,
+              8,
+              9,
+              10,
+              11,
+              16,
+              17,
+              18
+            ],
+            "cutoff": 7.50024938583374,
+            "boundary_tied": true
+          }
+        ]
+      },
+      "inputs_unchanged": true,
+      "wrong_math_controls": {
+        "wrong_pool_max": 1.0532972027110532,
+        "wrong_relu_max": 7.500249408745495
+      },
+      "passed": true,
+      "data": {
+        "path": "float16-03-text-L19-T4-R4.npz",
+        "sha256": "12c0e70f6d100983caae72dbcac2447cf4d855577544d27cfe05b796e28bb392"
+      }
+    },
+    {
+      "name": "float16-04-text-L20-T4-R4",
+      "return_code": 1,
+      "native_error": "",
+      "stages": {
+        "pooled": {
+          "passed": true,
+          "max_abs": 0.0,
+          "rel_l2": 0.0,
+          "worst_index": [
+            0,
+            0
+          ],
+          "actual": 0.5349273681640625,
+          "expected": 0.5349273681640625
+        },
+        "keys": {
+          "passed": true,
+          "max_abs": 2.377307275480689e-07,
+          "rel_l2": 6.420580345933734e-08,
+          "worst_index": [
+            3,
+            6
+          ],
+          "actual": 1.559152364730835,
+          "expected": 1.5591526024615625
+        },
+        "queries": {
+          "passed": true,
+          "max_abs": 3.7031844546397963e-07,
+          "rel_l2": 9.080920202734492e-08,
+          "worst_index": [
+            3,
+            0,
+            1
+          ],
+          "actual": 0.6921826601028442,
+          "expected": 0.6921830304212897
+        },
+        "scores": {
+          "passed": true,
+          "max_abs": 7.396353147726131e-07,
+          "rel_l2": 9.478367145611087e-08,
+          "worst_index": [
+            3,
+            5
+          ],
+          "actual": 7.100802898406982,
+          "expected": 7.100802158771668
+        }
+      },
+      "mask": {
+        "passed": true,
+        "queries": [
+          {
+            "passed": true,
+            "selected": [
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14,
+              16
+            ],
+            "required": [
+              8,
+              9,
+              10,
+              11,
+              16
+            ],
+            "allowed": [
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14,
+              15,
+              16
+            ],
+            "cutoff": 3.054826498031616,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              4,
+              5,
+              8,
+              9,
+              10,
+              11,
+              16,
+              17
+            ],
+            "required": [
+              8,
+              9,
+              10,
+              11,
+              16,
+              17
+            ],
+            "allowed": [
+              4,
+              5,
+              6,
+              7,
+              8,
+              9,
+              10,
+              11,
+              16,
+              17
+            ],
+            "cutoff": 2.235478401184082,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              4,
+              5,
+              6,
+              7,
+              8,
+              16,
+              17,
+              18
+            ],
+            "required": [
+              4,
+              5,
+              6,
+              7,
+              16,
+              17,
+              18
+            ],
+            "allowed": [
+              4,
+              5,
+              6,
+              7,
+              8,
+              9,
+              10,
+              11,
+              16,
+              17,
+              18
+            ],
+            "cutoff": 1.9914495944976807,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              8,
+              9,
+              10,
+              11,
+              16,
+              17,
+              18,
+              19
+            ],
+            "required": [
+              8,
+              9,
+              10,
+              11
+            ],
+            "allowed": [
+              8,
+              9,
+              10,
+              11,
+              16,
+              17,
+              18,
+              19
+            ],
+            "cutoff": 5.2231926918029785,
+            "boundary_tied": false
+          }
+        ]
+      },
+      "inputs_unchanged": true,
+      "wrong_math_controls": {
+        "wrong_pool_max": 1.4840131847749276,
+        "wrong_relu_max": 7.100802158771668
+      },
+      "passed": true,
+      "data": {
+        "path": "float16-04-text-L20-T4-R4.npz",
+        "sha256": "04ece9bee22b526e0868d6dc0dc89ff5b7ea24d6eb752eb949140d5122a23a13"
+      }
+    },
+    {
+      "name": "float16-05-offset-L19-T5-R4",
+      "return_code": 1,
+      "native_error": "",
+      "stages": {
+        "pooled": {
+          "passed": true,
+          "max_abs": 0.0,
+          "rel_l2": 0.0,
+          "worst_index": [
+            0,
+            0
+          ],
+          "actual": -0.1377105712890625,
+          "expected": -0.1377105712890625
+        },
+        "keys": {
+          "passed": true,
+          "max_abs": 6.13000202154268e-07,
+          "rel_l2": 1.5050750791436243e-07,
+          "worst_index": [
+            3,
+            1
+          ],
+          "actual": 0.5443778038024902,
+          "expected": 0.5443784168026924
+        },
+        "queries": {
+          "passed": true,
+          "max_abs": 2.4982562780717643e-06,
+          "rel_l2": 3.7381070698415345e-07,
+          "worst_index": [
+            4,
+            1,
+            1
+          ],
+          "actual": -0.8128830194473267,
+          "expected": -0.8128855177036047
+        },
+        "scores": {
+          "passed": true,
+          "max_abs": 4.929185539737091e-06,
+          "rel_l2": 3.1419817171756203e-07,
+          "worst_index": [
+            0,
+            4
+          ],
+          "actual": 6.978706359863281,
+          "expected": 6.9787014306777415
+        }
+      },
+      "mask": {
+        "passed": true,
+        "queries": [
+          {
+            "passed": true,
+            "selected": [
+              0,
+              1,
+              2,
+              3,
+              11,
+              12,
+              13,
+              14
+            ],
+            "required": [
+              0,
+              1,
+              2,
+              11,
+              12,
+              13,
+              14
+            ],
+            "allowed": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7,
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14
+            ],
+            "cutoff": 0.0,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              15
+            ],
+            "required": [
+              0,
+              1,
+              2,
+              15
+            ],
+            "allowed": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              15
+            ],
+            "cutoff": 3.4535794258117676,
+            "boundary_tied": false
+          },
+          {
+            "passed": true,
+            "selected": [
+              0,
+              1,
+              2,
+              4,
+              5,
+              6,
+              15,
+              16
+            ],
+            "required": [
+              0,
+              1,
+              2,
+              15,
+              16
+            ],
+            "allowed": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              15,
+              16
+            ],
+            "cutoff": 7.237746238708496,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              0,
+              1,
+              2,
+              8,
+              9,
+              15,
+              16,
+              17
+            ],
+            "required": [
+              0,
+              1,
+              2,
+              15,
+              16,
+              17
+            ],
+            "allowed": [
+              0,
+              1,
+              2,
+              7,
+              8,
+              9,
+              10,
+              15,
+              16,
+              17
+            ],
+            "cutoff": 3.8845996856689453,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              0,
+              1,
+              2,
+              4,
+              15,
+              16,
+              17,
+              18
+            ],
+            "required": [
+              0,
+              1,
+              2,
+              15,
+              16,
+              17,
+              18
+            ],
+            "allowed": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              15,
+              16,
+              17,
+              18
+            ],
+            "cutoff": 4.191045761108398,
+            "boundary_tied": true
+          }
+        ]
+      },
+      "inputs_unchanged": true,
+      "wrong_math_controls": {
+        "wrong_pool_max": 1.3180756262069528,
+        "wrong_relu_max": 7.6524515625175695
+      },
+      "passed": true,
+      "data": {
+        "path": "float16-05-offset-L19-T5-R4.npz",
+        "sha256": "48e96d8513504ef46d264f65f4b3198ccf094a83886eed889d37445bd5a57183"
+      }
+    },
+    {
+      "name": "float16-06-media-L23-T7-R4",
+      "return_code": 1,
+      "native_error": "",
+      "stages": {
+        "pooled": {
+          "passed": true,
+          "max_abs": 0.0,
+          "rel_l2": 0.0,
+          "worst_index": [
+            0,
+            0
+          ],
+          "actual": -0.0902099609375,
+          "expected": -0.0902099609375
+        },
+        "keys": {
+          "passed": true,
+          "max_abs": 3.6586341600752803e-07,
+          "rel_l2": 7.429607888811353e-08,
+          "worst_index": [
+            2,
+            6
+          ],
+          "actual": 2.743441104888916,
+          "expected": 2.743441470752332
+        },
+        "queries": {
+          "passed": true,
+          "max_abs": 3.385228739549717e-07,
+          "rel_l2": 9.56396123095577e-08,
+          "worst_index": [
+            3,
+            1,
+            3
+          ],
+          "actual": 1.2245314121246338,
+          "expected": 1.2245310736017598
+        },
+        "scores": {
+          "passed": true,
+          "max_abs": 1.7179251265986295e-06,
+          "rel_l2": 1.1416434845152018e-07,
+          "worst_index": [
+            6,
+            4
+          ],
+          "actual": 12.415781021118164,
+          "expected": 12.41578273904329
+        }
+      },
+      "mask": {
+        "passed": true,
+        "queries": [
+          {
+            "passed": true,
+            "selected": [
+              0,
+              1,
+              2,
+              4,
+              5,
+              6,
+              16,
+              18
+            ],
+            "required": [
+              0,
+              1,
+              2,
+              4,
+              16,
+              18
+            ],
+            "allowed": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              8,
+              16,
+              18
+            ],
+            "cutoff": 2.48830246925354,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              7,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14,
+              15
+            ],
+            "required": [
+              7,
+              9,
+              10,
+              13
+            ],
+            "allowed": [
+              7,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14,
+              15
+            ],
+            "cutoff": 7.262031078338623,
+            "boundary_tied": false
+          },
+          {
+            "passed": true,
+            "selected": [
+              0,
+              1,
+              2,
+              4,
+              7,
+              9,
+              10,
+              18
+            ],
+            "required": [
+              0,
+              1,
+              2,
+              4,
+              18
+            ],
+            "allowed": [
+              0,
+              1,
+              2,
+              4,
+              7,
+              9,
+              10,
+              13,
+              18
+            ],
+            "cutoff": 5.177496910095215,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              3,
+              11,
+              12,
+              14,
+              15,
+              16,
+              18,
+              19
+            ],
+            "required": [
+              11,
+              12,
+              14,
+              15,
+              16,
+              18,
+              19
+            ],
+            "allowed": [
+              3,
+              5,
+              6,
+              8,
+              11,
+              12,
+              14,
+              15,
+              16,
+              18,
+              19
+            ],
+            "cutoff": 0.8178055286407471,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              7,
+              9,
+              10,
+              13,
+              16,
+              17,
+              18,
+              20
+            ],
+            "required": [
+              7,
+              9,
+              10,
+              13,
+              20
+            ],
+            "allowed": [
+              7,
+              9,
+              10,
+              13,
+              16,
+              17,
+              18,
+              19,
+              20
+            ],
+            "cutoff": 6.941957473754883,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              0,
+              4,
+              7,
+              9,
+              10,
+              13,
+              20,
+              21
+            ],
+            "required": [
+              7,
+              9,
+              10,
+              13,
+              20,
+              21
+            ],
+            "allowed": [
+              0,
+              1,
+              2,
+              4,
+              7,
+              9,
+              10,
+              13,
+              20,
+              21
+            ],
+            "cutoff": 4.218589782714844,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              0,
+              16,
+              17,
+              18,
+              19,
+              20,
+              21,
+              22
+            ],
+            "required": [
+              16,
+              17,
+              18,
+              19,
+              20,
+              21,
+              22
+            ],
+            "allowed": [
+              0,
+              1,
+              2,
+              4,
+              16,
+              17,
+              18,
+              19,
+              20,
+              21,
+              22
+            ],
+            "cutoff": 10.24231243133545,
+            "boundary_tied": true
+          }
+        ]
+      },
+      "inputs_unchanged": true,
+      "wrong_math_controls": {
+        "wrong_pool_max": 1.514529017457014,
+        "wrong_relu_max": 5.203102961626696
+      },
+      "passed": true,
+      "data": {
+        "path": "float16-06-media-L23-T7-R4.npz",
+        "sha256": "424d70514c9e68b1050a73274e72efdd80b71a7ace81c28b9ba264b3c0070107"
+      }
+    },
+    {
+      "name": "float16-07-text-L37-T9-R2",
+      "return_code": 1,
+      "native_error": "",
+      "stages": {
+        "pooled": {
+          "passed": true,
+          "max_abs": 0.0,
+          "rel_l2": 0.0,
+          "worst_index": [
+            0,
+            0
+          ],
+          "actual": 0.22564697265625,
+          "expected": 0.22564697265625
+        },
+        "keys": {
+          "passed": true,
+          "max_abs": 7.416548541971935e-07,
+          "rel_l2": 8.489944113014121e-08,
+          "worst_index": [
+            10,
+            5
+          ],
+          "actual": 1.3641644716262817,
+          "expected": 1.364165213281136
+        },
+        "queries": {
+          "passed": true,
+          "max_abs": 8.258620882717338e-07,
+          "rel_l2": 1.2634025003452592e-07,
+          "worst_index": [
+            7,
+            0,
+            5
+          ],
+          "actual": 1.0207724571228027,
+          "expected": 1.020773282984891
+        },
+        "scores": {
+          "passed": true,
+          "max_abs": 4.723291070263258e-06,
+          "rel_l2": 1.36600173722748e-07,
+          "worst_index": [
+            4,
+            9
+          ],
+          "actual": 20.222681045532227,
+          "expected": 20.222676322241156
+        }
+      },
+      "mask": {
+        "passed": true,
+        "queries": [
+          {
+            "passed": true,
+            "selected": [
+              14,
+              15,
+              18,
+              28
+            ],
+            "required": [
+              14,
+              15,
+              28
+            ],
+            "allowed": [
+              14,
+              15,
+              18,
+              19,
+              28
+            ],
+            "cutoff": 6.727334022521973,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              0,
+              1,
+              16,
+              17
+            ],
+            "required": [
+              0,
+              1
+            ],
+            "allowed": [
+              0,
+              1,
+              16,
+              17
+            ],
+            "cutoff": 9.227457046508789,
+            "boundary_tied": false
+          },
+          {
+            "passed": true,
+            "selected": [
+              6,
+              7,
+              8,
+              30
+            ],
+            "required": [
+              6,
+              7,
+              30
+            ],
+            "allowed": [
+              6,
+              7,
+              8,
+              9,
+              30
+            ],
+            "cutoff": 11.412871360778809,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              6,
+              7,
+              24,
+              25
+            ],
+            "required": [
+              24,
+              25
+            ],
+            "allowed": [
+              6,
+              7,
+              24,
+              25
+            ],
+            "cutoff": 10.87070369720459,
+            "boundary_tied": false
+          },
+          {
+            "passed": true,
+            "selected": [
+              8,
+              18,
+              19,
+              32
+            ],
+            "required": [
+              18,
+              19,
+              32
+            ],
+            "allowed": [
+              8,
+              9,
+              18,
+              19,
+              32
+            ],
+            "cutoff": 19.65845489501953,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              26,
+              27,
+              30,
+              31
+            ],
+            "required": [
+              30,
+              31
+            ],
+            "allowed": [
+              26,
+              27,
+              30,
+              31
+            ],
+            "cutoff": 13.29983139038086,
+            "boundary_tied": false
+          },
+          {
+            "passed": true,
+            "selected": [
+              12,
+              13,
+              28,
+              34
+            ],
+            "required": [
+              12,
+              13,
+              34
+            ],
+            "allowed": [
+              12,
+              13,
+              28,
+              29,
+              34
+            ],
+            "cutoff": 14.553223609924316,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              12,
+              13,
+              20,
+              21
+            ],
+            "required": [
+              12,
+              13
+            ],
+            "allowed": [
+              12,
+              13,
+              20,
+              21
+            ],
+            "cutoff": 16.1010799407959,
+            "boundary_tied": false
+          },
+          {
+            "passed": true,
+            "selected": [
+              6,
+              10,
+              11,
+              36
+            ],
+            "required": [
+              10,
+              11,
+              36
+            ],
+            "allowed": [
+              6,
+              7,
+              10,
+              11,
+              36
+            ],
+            "cutoff": 12.493474960327148,
+            "boundary_tied": true
+          }
+        ]
+      },
+      "inputs_unchanged": true,
+      "wrong_math_controls": {
+        "wrong_pool_max": 1.169812856594575,
+        "wrong_relu_max": 9.347517664082755
+      },
+      "passed": true,
+      "data": {
+        "path": "float16-07-text-L37-T9-R2.npz",
+        "sha256": "082b89f9ab28b08be365efa971ca6c82bfb2bd097bbdd91716e0932ce6f4a18c"
+      }
+    },
+    {
+      "name": "float16-08-text-L97-T33-R4",
+      "return_code": 1,
+      "native_error": "",
+      "stages": {
+        "pooled": {
+          "passed": true,
+          "max_abs": 0.0,
+          "rel_l2": 0.0,
+          "worst_index": [
+            0,
+            0
+          ],
+          "actual": -0.18121337890625,
+          "expected": -0.18121337890625
+        },
+        "keys": {
+          "passed": true,
+          "max_abs": 1.4605267951162126e-06,
+          "rel_l2": 1.7956957326980517e-07,
+          "worst_index": [
+            22,
+            5
+          ],
+          "actual": -0.4786970019340515,
+          "expected": -0.4786955414072564
+        },
+        "queries": {
+          "passed": true,
+          "max_abs": 1.767174433675578e-06,
+          "rel_l2": 2.0872627523051838e-07,
+          "worst_index": [
+            31,
+            2,
+            5
+          ],
+          "actual": -1.157028079032898,
+          "expected": -1.1570298462073316
+        },
+        "scores": {
+          "passed": true,
+          "max_abs": 5.116416807116053e-06,
+          "rel_l2": 1.7310165314076144e-07,
+          "worst_index": [
+            16,
+            7
+          ],
+          "actual": 2.819204330444336,
+          "expected": 2.819199214027529
+        }
+      },
+      "mask": {
+        "passed": true,
+        "queries": [
+          {
+            "passed": true,
+            "selected": [
+              8,
+              9,
+              10,
+              56,
+              57,
+              58,
+              59,
+              64
+            ],
+            "required": [
+              56,
+              57,
+              58,
+              59,
+              64
+            ],
+            "allowed": [
+              8,
+              9,
+              10,
+              11,
+              56,
+              57,
+              58,
+              59,
+              64
+            ],
+            "cutoff": 10.440567970275879,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              0,
+              1,
+              4,
+              5,
+              6,
+              7,
+              64,
+              65
+            ],
+            "required": [
+              4,
+              5,
+              6,
+              7,
+              64,
+              65
+            ],
+            "allowed": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7,
+              64,
+              65
+            ],
+            "cutoff": 6.970704078674316,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              28,
+              29,
+              30,
+              31,
+              36,
+              64,
+              65,
+              66
+            ],
+            "required": [
+              28,
+              29,
+              30,
+              31,
+              64,
+              65,
+              66
+            ],
+            "allowed": [
+              28,
+              29,
+              30,
+              31,
+              36,
+              37,
+              38,
+              39,
+              64,
+              65,
+              66
+            ],
+            "cutoff": 9.073479652404785,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              0,
+              1,
+              2,
+              3,
+              52,
+              53,
+              54,
+              55
+            ],
+            "required": [
+              0,
+              1,
+              2,
+              3
+            ],
+            "allowed": [
+              0,
+              1,
+              2,
+              3,
+              52,
+              53,
+              54,
+              55
+            ],
+            "cutoff": 6.933879852294922,
+            "boundary_tied": false
+          },
+          {
+            "passed": true,
+            "selected": [
+              20,
+              21,
+              22,
+              44,
+              45,
+              46,
+              47,
+              68
+            ],
+            "required": [
+              44,
+              45,
+              46,
+              47,
+              68
+            ],
+            "allowed": [
+              20,
+              21,
+              22,
+              23,
+              44,
+              45,
+              46,
+              47,
+              68
+            ],
+            "cutoff": 14.999665260314941,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              28,
+              29,
+              30,
+              31,
+              36,
+              37,
+              68,
+              69
+            ],
+            "required": [
+              28,
+              29,
+              30,
+              31,
+              68,
+              69
+            ],
+            "allowed": [
+              28,
+              29,
+              30,
+              31,
+              36,
+              37,
+              38,
+              39,
+              68,
+              69
+            ],
+            "cutoff": 10.771330833435059,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              0,
+              52,
+              53,
+              54,
+              55,
+              68,
+              69,
+              70
+            ],
+            "required": [
+              52,
+              53,
+              54,
+              55,
+              68,
+              69,
+              70
+            ],
+            "allowed": [
+              0,
+              1,
+              2,
+              3,
+              52,
+              53,
+              54,
+              55,
+              68,
+              69,
+              70
+            ],
+            "cutoff": 11.748506546020508,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              8,
+              9,
+              10,
+              11,
+              32,
+              33,
+              34,
+              35
+            ],
+            "required": [
+              8,
+              9,
+              10,
+              11
+            ],
+            "allowed": [
+              8,
+              9,
+              10,
+              11,
+              32,
+              33,
+              34,
+              35
+            ],
+            "cutoff": 11.49355411529541,
+            "boundary_tied": false
+          },
+          {
+            "passed": true,
+            "selected": [
+              32,
+              33,
+              34,
+              56,
+              57,
+              58,
+              59,
+              72
+            ],
+            "required": [
+              56,
+              57,
+              58,
+              59,
+              72
+            ],
+            "allowed": [
+              32,
+              33,
+              34,
+              35,
+              56,
+              57,
+              58,
+              59,
+              72
+            ],
+            "cutoff": 7.15214729309082,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              16,
+              17,
+              60,
+              61,
+              62,
+              63,
+              72,
+              73
+            ],
+            "required": [
+              60,
+              61,
+              62,
+              63,
+              72,
+              73
+            ],
+            "allowed": [
+              16,
+              17,
+              18,
+              19,
+              60,
+              61,
+              62,
+              63,
+              72,
+              73
+            ],
+            "cutoff": 7.930638313293457,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              8,
+              9,
+              10,
+              11,
+              40,
+              72,
+              73,
+              74
+            ],
+            "required": [
+              8,
+              9,
+              10,
+              11,
+              72,
+              73,
+              74
+            ],
+            "allowed": [
+              8,
+              9,
+              10,
+              11,
+              40,
+              41,
+              42,
+              43,
+              72,
+              73,
+              74
+            ],
+            "cutoff": 7.564831733703613,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              64,
+              65,
+              66,
+              67,
+              72,
+              73,
+              74,
+              75
+            ],
+            "required": [
+              72,
+              73,
+              74,
+              75
+            ],
+            "allowed": [
+              64,
+              65,
+              66,
+              67,
+              72,
+              73,
+              74,
+              75
+            ],
+            "cutoff": 8.399337768554688,
+            "boundary_tied": false
+          },
+          {
+            "passed": true,
+            "selected": [
+              40,
+              41,
+              42,
+              43,
+              44,
+              45,
+              46,
+              76
+            ],
+            "required": [
+              40,
+              41,
+              42,
+              43,
+              76
+            ],
+            "allowed": [
+              40,
+              41,
+              42,
+              43,
+              44,
+              45,
+              46,
+              47,
+              76
+            ],
+            "cutoff": 7.926920413970947,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              28,
+              29,
+              52,
+              53,
+              54,
+              55,
+              76,
+              77
+            ],
+            "required": [
+              52,
+              53,
+              54,
+              55,
+              76,
+              77
+            ],
+            "allowed": [
+              28,
+              29,
+              30,
+              31,
+              52,
+              53,
+              54,
+              55,
+              76,
+              77
+            ],
+            "cutoff": 10.335564613342285,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              0,
+              1,
+              2,
+              3,
+              72,
+              76,
+              77,
+              78
+            ],
+            "required": [
+              0,
+              1,
+              2,
+              3,
+              76,
+              77,
+              78
+            ],
+            "allowed": [
+              0,
+              1,
+              2,
+              3,
+              72,
+              73,
+              74,
+              75,
+              76,
+              77,
+              78
+            ],
+            "cutoff": 11.280990600585938,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              40,
+              41,
+              42,
+              43,
+              44,
+              45,
+              46,
+              47
+            ],
+            "required": [
+              44,
+              45,
+              46,
+              47
+            ],
+            "allowed": [
+              40,
+              41,
+              42,
+              43,
+              44,
+              45,
+              46,
+              47
+            ],
+            "cutoff": 9.407125473022461,
+            "boundary_tied": false
+          },
+          {
+            "passed": true,
+            "selected": [
+              44,
+              45,
+              46,
+              48,
+              49,
+              50,
+              51,
+              80
+            ],
+            "required": [
+              48,
+              49,
+              50,
+              51,
+              80
+            ],
+            "allowed": [
+              44,
+              45,
+              46,
+              47,
+              48,
+              49,
+              50,
+              51,
+              80
+            ],
+            "cutoff": 7.345980167388916,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              12,
+              13,
+              52,
+              53,
+              54,
+              55,
+              80,
+              81
+            ],
+            "required": [
+              52,
+              53,
+              54,
+              55,
+              80,
+              81
+            ],
+            "allowed": [
+              12,
+              13,
+              14,
+              15,
+              52,
+              53,
+              54,
+              55,
+              80,
+              81
+            ],
+            "cutoff": 7.470419883728027,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              4,
+              5,
+              6,
+              7,
+              52,
+              80,
+              81,
+              82
+            ],
+            "required": [
+              4,
+              5,
+              6,
+              7,
+              80,
+              81,
+              82
+            ],
+            "allowed": [
+              4,
+              5,
+              6,
+              7,
+              52,
+              53,
+              54,
+              55,
+              80,
+              81,
+              82
+            ],
+            "cutoff": 7.168074131011963,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              28,
+              29,
+              30,
+              31,
+              52,
+              53,
+              54,
+              55
+            ],
+            "required": [
+              28,
+              29,
+              30,
+              31
+            ],
+            "allowed": [
+              28,
+              29,
+              30,
+              31,
+              52,
+              53,
+              54,
+              55
+            ],
+            "cutoff": 8.57710075378418,
+            "boundary_tied": false
+          },
+          {
+            "passed": true,
+            "selected": [
+              44,
+              45,
+              46,
+              52,
+              53,
+              54,
+              55,
+              84
+            ],
+            "required": [
+              52,
+              53,
+              54,
+              55,
+              84
+            ],
+            "allowed": [
+              44,
+              45,
+              46,
+              47,
+              52,
+              53,
+              54,
+              55,
+              84
+            ],
+            "cutoff": 9.760011672973633,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              52,
+              53,
+              80,
+              81,
+              82,
+              83,
+              84,
+              85
+            ],
+            "required": [
+              80,
+              81,
+              82,
+              83,
+              84,
+              85
+            ],
+            "allowed": [
+              52,
+              53,
+              54,
+              55,
+              80,
+              81,
+              82,
+              83,
+              84,
+              85
+            ],
+            "cutoff": 9.234395027160645,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              36,
+              37,
+              38,
+              39,
+              76,
+              84,
+              85,
+              86
+            ],
+            "required": [
+              36,
+              37,
+              38,
+              39,
+              84,
+              85,
+              86
+            ],
+            "allowed": [
+              36,
+              37,
+              38,
+              39,
+              76,
+              77,
+              78,
+              79,
+              84,
+              85,
+              86
+            ],
+            "cutoff": 13.281794548034668,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              36,
+              37,
+              38,
+              39,
+              72,
+              73,
+              74,
+              75
+            ],
+            "required": [
+              36,
+              37,
+              38,
+              39
+            ],
+            "allowed": [
+              36,
+              37,
+              38,
+              39,
+              72,
+              73,
+              74,
+              75
+            ],
+            "cutoff": 11.489790916442871,
+            "boundary_tied": false
+          },
+          {
+            "passed": true,
+            "selected": [
+              0,
+              1,
+              2,
+              48,
+              49,
+              50,
+              51,
+              88
+            ],
+            "required": [
+              48,
+              49,
+              50,
+              51,
+              88
+            ],
+            "allowed": [
+              0,
+              1,
+              2,
+              3,
+              48,
+              49,
+              50,
+              51,
+              88
+            ],
+            "cutoff": 9.38037395477295,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              60,
+              61,
+              76,
+              77,
+              78,
+              79,
+              88,
+              89
+            ],
+            "required": [
+              76,
+              77,
+              78,
+              79,
+              88,
+              89
+            ],
+            "allowed": [
+              60,
+              61,
+              62,
+              63,
+              76,
+              77,
+              78,
+              79,
+              88,
+              89
+            ],
+            "cutoff": 11.604411125183105,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              12,
+              36,
+              37,
+              38,
+              39,
+              88,
+              89,
+              90
+            ],
+            "required": [
+              36,
+              37,
+              38,
+              39,
+              88,
+              89,
+              90
+            ],
+            "allowed": [
+              12,
+              13,
+              14,
+              15,
+              36,
+              37,
+              38,
+              39,
+              88,
+              89,
+              90
+            ],
+            "cutoff": 10.958581924438477,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              4,
+              5,
+              6,
+              7,
+              36,
+              37,
+              38,
+              39
+            ],
+            "required": [
+              36,
+              37,
+              38,
+              39
+            ],
+            "allowed": [
+              4,
+              5,
+              6,
+              7,
+              36,
+              37,
+              38,
+              39
+            ],
+            "cutoff": 14.783005714416504,
+            "boundary_tied": false
+          },
+          {
+            "passed": true,
+            "selected": [
+              64,
+              65,
+              66,
+              67,
+              88,
+              89,
+              90,
+              92
+            ],
+            "required": [
+              64,
+              65,
+              66,
+              67,
+              92
+            ],
+            "allowed": [
+              64,
+              65,
+              66,
+              67,
+              88,
+              89,
+              90,
+              91,
+              92
+            ],
+            "cutoff": 13.105958938598633,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              16,
+              17,
+              52,
+              53,
+              54,
+              55,
+              92,
+              93
+            ],
+            "required": [
+              52,
+              53,
+              54,
+              55,
+              92,
+              93
+            ],
+            "allowed": [
+              16,
+              17,
+              18,
+              19,
+              52,
+              53,
+              54,
+              55,
+              92,
+              93
+            ],
+            "cutoff": 9.806258201599121,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              12,
+              13,
+              14,
+              15,
+              76,
+              92,
+              93,
+              94
+            ],
+            "required": [
+              12,
+              13,
+              14,
+              15,
+              92,
+              93,
+              94
+            ],
+            "allowed": [
+              12,
+              13,
+              14,
+              15,
+              76,
+              77,
+              78,
+              79,
+              92,
+              93,
+              94
+            ],
+            "cutoff": 7.292879581451416,
+            "boundary_tied": true
+          },
+          {
+            "passed": true,
+            "selected": [
+              0,
+              1,
+              2,
+              3,
+              8,
+              9,
+              10,
+              11
+            ],
+            "required": [
+              8,
+              9,
+              10,
+              11
+            ],
+            "allowed": [
+              0,
+              1,
+              2,
+              3,
+              8,
+              9,
+              10,
+              11
+            ],
+            "cutoff": 12.68622875213623,
+            "boundary_tied": false
+          },
+          {
+            "passed": true,
+            "selected": [
+              80,
+              81,
+              82,
+              83,
+              92,
+              93,
+              94,
+              96
+            ],
+            "required": [
+              80,
+              81,
+              82,
+              83,
+              96
+            ],
+            "allowed": [
+              80,
+              81,
+              82,
+              83,
+              92,
+              93,
+              94,
+              95,
+              96
+            ],
+            "cutoff": 13.198060035705566,
+            "boundary_tied": true
+          }
+        ]
+      },
+      "inputs_unchanged": true,
+      "wrong_math_controls": {
+        "wrong_pool_max": 2.2873522292640294,
+        "wrong_relu_max": 9.67177224473227
+      },
+      "passed": true,
+      "data": {
+        "path": "float16-08-text-L97-T33-R4.npz",
+        "sha256": "13b297f5c499565df30aba460ef30bb53360efee62c3281bd9d3b949ca18a598"
+      }
+    },
+    {
+      "name": "float16-09-text-L3-T2-R4",
+      "return_code": 1,
+      "native_error": "",
+      "stages": {
+        "pooled": {
+          "passed": true,
+          "max_abs": 0.0,
+          "rel_l2": 0.0,
+          "worst_index": [
+            0,
+            0
+          ],
+          "actual": -0.5751953125,
+          "expected": -0.5751953125
+        },
+        "keys": {
+          "passed": true,
+          "max_abs": 7.766240472939501e-08,
+          "rel_l2": 3.835934046768567e-08,
+          "worst_index": [
+            0,
+            0
+          ],
+          "actual": -0.9603400826454163,
+          "expected": -0.9603400049830115
+        },
+        "queries": {
+          "passed": true,
+          "max_abs": 4.5249648827905276e-07,
+          "rel_l2": 1.1495443532036047e-07,
+          "worst_index": [
+            1,
+            0,
+            6
+          ],
+          "actual": -1.7687910795211792,
+          "expected": -1.768790627024691
+        },
+        "scores": {
+          "passed": true,
+          "max_abs": 5.180633585455396e-07,
+          "rel_l2": 1.6402929493473713e-06,
+          "worst_index": [
+            0,
+            0
+          ],
+          "actual": 0.3158353567123413,
+          "expected": 0.31583587477569985
+        }
+      },
+      "mask": {
+        "passed": true,
+        "queries": [
+          {
+            "passed": true,
+            "selected": [
+              0,
+              1
+            ],
+            "required": [],
+            "allowed": [
+              0,
+              1
+            ],
+            "cutoff": 1000000000.0,
+            "boundary_tied": false
+          },
+          {
+            "passed": true,
+            "selected": [
+              0,
+              1,
+              2
+            ],
+            "required": [],
+            "allowed": [
+              0,
+              1,
+              2
+            ],
+            "cutoff": 1000000000.0,
+            "boundary_tied": false
+          }
+        ]
+      },
+      "inputs_unchanged": true,
+      "wrong_math_controls": {
+        "wrong_pool_max": 0.0,
+        "wrong_relu_max": 0.26427803121439286
+      },
+      "passed": true,
+      "data": {
+        "path": "float16-09-text-L3-T2-R4.npz",
+        "sha256": "d0655fc7aca01f6a707377acf91c52b2037f2ef9e38119dc1fe227c077d20878"
+      }
+    }
+  ],
+  "abi": [
+    {
+      "name": "short_k_bytes",
+      "passed": true,
+      "return_code": 0,
+      "error": "qwen4exp QSA test: invalid shape/storage"
+    },
+    {
+      "name": "short_q_bytes",
+      "passed": true,
+      "return_code": 0,
+      "error": "qwen4exp QSA test: invalid shape/storage"
+    },
+    {
+      "name": "short_cache_bytes",
+      "passed": true,
+      "return_code": 0,
+      "error": "qwen4exp QSA test: invalid shape/storage"
+    },
+    {
+      "name": "bad_cache_type",
+      "passed": true,
+      "return_code": 0,
+      "error": "qwen4exp QSA test: invalid shape/storage"
+    },
+    {
+      "name": "bad_k_type",
+      "passed": true,
+      "return_code": 0,
+      "error": "qwen4exp QSA test: invalid shape/storage"
+    },
+    {
+      "name": "null_cache",
+      "passed": true,
+      "return_code": 0,
+      "error": "qwen4exp QSA test: invalid shape/storage"
+    },
+    {
+      "name": "null_k",
+      "passed": true,
+      "return_code": 0,
+      "error": "qwen4exp QSA test: invalid shape/storage"
+    },
+    {
+      "name": "null_q",
+      "passed": true,
+      "return_code": 0,
+      "error": "qwen4exp QSA test: invalid shape/storage"
+    },
+    {
+      "name": "null_k_norm",
+      "passed": true,
+      "return_code": 0,
+      "error": "qwen4exp QSA test: invalid shape/storage"
+    },
+    {
+      "name": "null_q_norm",
+      "passed": true,
+      "return_code": 0,
+      "error": "qwen4exp QSA test: invalid shape/storage"
+    },
+    {
+      "name": "zero_heads",
+      "passed": true,
+      "return_code": 0,
+      "error": "qwen4exp QSA test: invalid shape/storage"
+    },
+    {
+      "name": "zero_ratio",
+      "passed": true,
+      "return_code": 0,
+      "error": "qwen4exp QSA test: invalid shape/storage"
+    },
+    {
+      "name": "large_ratio",
+      "passed": true,
+      "return_code": 0,
+      "error": "qwen4exp QSA test: invalid shape/storage"
+    },
+    {
+      "name": "zero_topk",
+      "passed": true,
+      "return_code": 0,
+      "error": "qwen4exp QSA test: invalid shape/storage"
+    },
+    {
+      "name": "nonsparse_probe",
+      "passed": true,
+      "return_code": 0,
+      "error": "qwen4exp QSA test: invalid shape/storage"
+    },
+    {
+      "name": "bad_start",
+      "passed": true,
+      "return_code": 0,
+      "error": "qwen4exp QSA: invalid position plan"
+    },
+    {
+      "name": "padded_below_live",
+      "passed": true,
+      "return_code": 0,
+      "error": "qwen4exp QSA: invalid position plan"
+    },
+    {
+      "name": "odd_rotary",
+      "passed": true,
+      "return_code": 0,
+      "error": "qwen4exp QSA test: invalid shape/storage"
+    },
+    {
+      "name": "zero_epsilon",
+      "passed": true,
+      "return_code": 0,
+      "error": "qwen4exp QSA test: invalid shape/storage"
+    },
+    {
+      "name": "nan_base",
+      "passed": true,
+      "return_code": 0,
+      "error": "qwen4exp QSA test: invalid shape/storage"
+    },
+    {
+      "name": "negative_scale",
+      "passed": true,
+      "return_code": 0,
+      "error": "qwen4exp QSA test: invalid shape/storage"
+    }
+  ],
+  "helper_sha256": "999dc167567d9ef902c5e661b32999cda1f2f0429ce07115badb5ff0eaf96525",
+  "backend": {
+    "requested": "Metal",
+    "native_type": 1,
+    "initialized": true,
+    "active_rank": 0,
+    "device_description": "Apple M5 Pro",
+    "execution": "single active backend; no scheduler fallback"
+  },
+  "recovery": {
+    "return_code": 1,
+    "score": {
+      "passed": true,
+      "max_abs": 2.660654088160186e-07,
+      "rel_l2": 5.127741268144253e-08,
+      "worst_index": [
+        0,
+        4
+      ],
+      "actual": 1.3746793270111084,
+      "expected": 1.3746790609456996
+    }
+  },
+  "wrong_math_detected": true,
+  "finished_utc": "2026-09-16T17:41:12.100429+00:00",
+  "exit_code": 0
+}

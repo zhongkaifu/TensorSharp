@@ -1,0 +1,24 @@
+{
+  "native_sha256": "337d7e8b22867568a84974822e7353096a7d95a56a103e6d296a48e38699d0e3",
+  "backend": "GgmlCpu",
+  "initial_kv_tokens": 8,
+  "fixture": "/tmp/tensorsharp-current-fixtures/qwen4exp-qsa",
+  "ggml_revision": "456172ec733a135778adcd32d00e576a58232e45",
+  "ggml_status": "",
+  "source_hashes": {
+    "TensorSharp.GGML.Native/ggml_ops_qwen4exp.cpp": "48d65ebb773b242eba9f613855eadb9386d3979bdc6ed5c53237560b4dc5c183",
+    "TensorSharp.Models/Models/Qwen4Exp/Qwen4ExpModel.Forward.cs": "829b667f740474aee654fe101de7e5d5a003fd0b36747fdeb88a5f53875a000f",
+    "TensorSharp.Models/Models/Qwen4Exp/Qwen4ExpModel.PerSeqCache.cs": "e2826c257333687d02a18b66d217481a92429da0f57a420c544b82b462979412",
+    "TensorSharp.Models/Models/Qwen4Exp/Qwen4ExpModel.RetainedCache.cs": "3b1de594f15d4cbb0c21c39b619be5ee2623da18e2a3602dc9419e3ec80059a4",
+    "TensorSharp.Models/Models/Qwen4Exp/Qwen4ExpModel.Mtp.cs": "a476a8f724760875b34bcad009b94b4990c685a3c2cddcc40e0b8a3201130359",
+    "TensorSharp.Models/Models/Qwen4Exp/Qwen4ExpModel.Speculative.cs": "6a8d023142a5124f3f4c1eb57cc1dddd912b45da95065d77e4e30523d337bd1b",
+    "InferenceWeb.Tests/Qwen4ExpRetainedCacheTests.cs": "116b70a94b616a7934e65832c6dc78f1caa1df84cfe0279bc985d3b71d2c4acb",
+    "InferenceWeb.Tests/Qwen4ExpRetainedCachePolicyTests.cs": "61eca0a77cb4a6424b0243ac22aef531286a84a06231b72ea5bc1663979d0d53",
+    "InferenceWeb.Tests/Qwen4ExpMtpIntegrationTests.cs": "f9f9749042fc33e7426e93bba77065beab11f8eb9528e4282e80e88e5a2a2ca5",
+    "InferenceWeb.Tests/Qwen4ExpVideoForwardTests.cs": "6fc317808886de3f8cf6f64ec63c2e319f6001da7505879c53631fa183c74f65"
+  },
+  "test_result": "results/qwen-retained-growth-r11.trx",
+  "passed": 41,
+  "failed": 0,
+  "skipped": 0
+}

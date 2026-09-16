@@ -1,0 +1,116 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TestRun id="1252ad16-bd3e-49e1-b2ea-bbec55bc2cce" name="@d71188ba1e2e 2026-09-16 18:09:27" xmlns="http://microsoft.com/schemas/VisualStudio/TeamTest/2010">
+  <Times creation="2026-09-16T18:09:27.7581172+00:00" queuing="2026-09-16T18:09:27.7581174+00:00" start="2026-09-16T18:09:24.3673788+00:00" finish="2026-09-16T18:09:27.7837421+00:00" />
+  <TestSettings name="default" id="19d8c39b-30e9-4281-af04-54a3a5ac6a99">
+    <Deployment runDeploymentRoot="_d71188ba1e2e_2026-09-16_18_09_27" />
+  </TestSettings>
+  <Results>
+    <UnitTestResult executionId="5b6dada5-46eb-40f1-8fcc-155b4bde6f04" testId="c1504937-c7cd-8f15-2d2b-53b25cba1691" testName="InferenceWeb.Tests.Qwen4ExpRetainedCacheTests.TeacherForcedTargetVerify_MatchesSingleTokenFullVocabularyForDenseAndSparsePrefixes" computerName="d71188ba1e2e" duration="00:00:01.1328657" startTime="2026-09-16T18:09:26.3231762+00:00" endTime="2026-09-16T18:09:27.4763835+00:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Failed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="5b6dada5-46eb-40f1-8fcc-155b4bde6f04">
+      <Output>
+        <StdOut>native /workspace/ts-qwen-target-precision-r11/tests/bin/Release/net10.0/libGgmlOps.so sha256=caba5e47c2afa819a07fa075fa3a4c6fd2885ea284d6f765f82c2d12f3d2a8c0; backend=GgmlCuda
+native /workspace/ts-qwen-target-precision-r11/tests/bin/Release/net10.0/libGgmlOps.so sha256=caba5e47c2afa819a07fa075fa3a4c6fd2885ea284d6f765f82c2d12f3d2a8c0; backend=GgmlCuda
+teacher prefix=4 row=0 max_abs=0.00046062469482421875 plain=227 verify=227
+teacher prefix=4 row=1 max_abs=0.00016689300537109375 plain=228 verify=228
+teacher prefix=4 row=2 max_abs=0.00019550323486328125 plain=249 verify=249
+teacher prefix=4 row=3 max_abs=0.00031936168670654297 plain=29 verify=29
+state=gdn_conv max_abs=0 changed=0/256
+state=gdn_delta max_abs=0 changed=0/2048
+state=ple_conv max_abs=0 changed=0/128
+state=_kCache max_abs=0 changed=0/128
+state=_vCache max_abs=0 changed=0/128
+teacher prefix=16 row=0 max_abs=0.0024946928024291992 plain=227 verify=227
+teacher prefix=16 row=1 max_abs=0.00014317035675048828 plain=228 verify=228
+teacher prefix=16 row=2 max_abs=0.00018280744552612305 plain=249 verify=249
+teacher prefix=16 row=3 max_abs=0.00023555755615234375 plain=29 verify=29
+state=gdn_conv max_abs=0 changed=0/256
+state=gdn_delta max_abs=0 changed=0/2048
+state=ple_conv max_abs=0 changed=0/128
+state=_kCache max_abs=0 changed=0/320
+state=_vCache max_abs=0 changed=0/320</StdOut>
+        <ErrorInfo>
+          <Message>prefix=4 row=0 max_abs=0.00046062469482421875; prefix=4 row=1 max_abs=0.00016689300537109375; prefix=4 row=2 max_abs=0.00019550323486328125; prefix=4 row=3 max_abs=0.00031936168670654297; prefix=16 row=0 max_abs=0.0024946928024291992; prefix=16 row=1 max_abs=0.00014317035675048828; prefix=16 row=2 max_abs=0.00018280744552612305; prefix=16 row=3 max_abs=0.00023555755615234375</Message>
+          <StackTrace>   at InferenceWeb.Tests.Qwen4ExpRetainedCacheTests.TeacherForcedTargetVerify_MatchesSingleTokenFullVocabularyForDenseAndSparsePrefixes() in /workspace/ts-qwen-teacher-r9/tests/Qwen4ExpRetainedCacheTests.cs:line 486
+   at System.Reflection.MethodBaseInvoker.InterpretedInvoke_Method(Object obj, IntPtr* args)
+   at System.Reflection.MethodBaseInvoker.InvokeWithNoArgs(Object obj, BindingFlags invokeAttr)</StackTrace>
+        </ErrorInfo>
+      </Output>
+    </UnitTestResult>
+  </Results>
+  <TestDefinitions>
+    <UnitTest name="InferenceWeb.Tests.Qwen4ExpRetainedCacheTests.TeacherForcedTargetVerify_MatchesSingleTokenFullVocabularyForDenseAndSparsePrefixes" storage="/workspace/ts-qwen-target-precision-r11/tests/bin/release/net10.0/inferenceweb.tests.dll" id="c1504937-c7cd-8f15-2d2b-53b25cba1691">
+      <Execution id="5b6dada5-46eb-40f1-8fcc-155b4bde6f04" />
+      <TestMethod codeBase="/workspace/ts-qwen-target-precision-r11/tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Qwen4ExpRetainedCacheTests" name="TeacherForcedTargetVerify_MatchesSingleTokenFullVocabularyForDenseAndSparsePrefixes" />
+    </UnitTest>
+  </TestDefinitions>
+  <TestEntries>
+    <TestEntry testId="c1504937-c7cd-8f15-2d2b-53b25cba1691" executionId="5b6dada5-46eb-40f1-8fcc-155b4bde6f04" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+  </TestEntries>
+  <TestLists>
+    <TestList name="Results Not in a List" id="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestList name="All Loaded Results" id="19431567-8539-422a-85d7-44ee4e166bda" />
+  </TestLists>
+  <ResultSummary outcome="Failed">
+    <Counters total="1" executed="1" passed="0" failed="1" error="0" timeout="0" aborted="0" inconclusive="0" passedButRunAborted="0" notRunnable="0" notExecuted="0" disconnected="0" warning="0" completed="0" inProgress="0" pending="0" />
+    <Output>
+      <StdOut>[xUnit.net 00:00:00.00] xUnit.net VSTest Adapter v3.1.4+50e68bbb8b (64-bit .NET 10.0.12)
+[xUnit.net 00:00:00.33]   Discovering: InferenceWeb.Tests
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 45498 MiB):
+  Device 0: NVIDIA A40, compute capability 8.6, VMM: yes, VRAM: 45498 MiB
+[xUnit.net 00:00:01.15]   Discovered:  InferenceWeb.Tests
+[xUnit.net 00:00:01.18]   Starting:    InferenceWeb.Tests
+Backend: GgmlCuda
+Model: qwen4exp, Layers=2, Hidden=8, Heads=4, KVHeads=2, HeadDim=8, Vocab=260
+  hyper-connections: count=4 lowRank=3 (residual is 32 wide)
+  experts=4 used=2 ff=6 sharedFf=5
+  GDN layers=1/2, QSA indexer heads=1 dim=8 topK=8
+  PLE: layers=[0] ngram=2 heads=1 headDim=8
+Loading model weights... done (57 F32 tensors, 24 quantized tensors)
+  Quantized: 0 MB (0 MB file-backed), F32: 0 MB
+Context length: using GGUF metadata qwen4exp.context_length=1024.
+  Qwen4Exp shared MTP ready: block=2, features=32, draftCompression=0, privateKV=F16, device=0, mappedBytes=10336.
+Backend: GgmlCuda
+Model: qwen4exp, Layers=2, Hidden=8, Heads=4, KVHeads=2, HeadDim=8, Vocab=260
+  hyper-connections: count=4 lowRank=3 (residual is 32 wide)
+  experts=4 used=2 ff=6 sharedFf=5
+  GDN layers=1/2, QSA indexer heads=1 dim=8 topK=8
+  PLE: layers=[0] ngram=2 heads=1 headDim=8
+Loading model weights... done (57 F32 tensors, 24 quantized tensors)
+  Quantized: 0 MB (0 MB file-backed), F32: 0 MB
+Context length: using GGUF metadata qwen4exp.context_length=1024.
+  Qwen4Exp shared MTP ready: block=2, features=32, draftCompression=0, privateKV=F16, device=0, mappedBytes=10336.
+[xUnit.net 00:00:02.37]       prefix=4 row=0 max_abs=0.00046062469482421875; prefix=4 row=1 max_abs=0.00016689300537109375; prefix=4 row=2 max_abs=0.00019550323486328125; prefix=4 row=3 max_abs=0.00031936168670654297; prefix=16 row=0 max_abs=0.0024946928024291992; prefix=16 row=1 max_abs=0.00014317035675048828; prefix=16 row=2 max_abs=0.00018280744552612305; prefix=16 row=3 max_abs=0.00023555755615234375
+[xUnit.net 00:00:02.37]       Stack Trace:
+[xUnit.net 00:00:02.37]         /workspace/ts-qwen-teacher-r9/tests/Qwen4ExpRetainedCacheTests.cs(486,0): at InferenceWeb.Tests.Qwen4ExpRetainedCacheTests.TeacherForcedTargetVerify_MatchesSingleTokenFullVocabularyForDenseAndSparsePrefixes()
+[xUnit.net 00:00:02.37]            at System.Reflection.MethodBaseInvoker.InterpretedInvoke_Method(Object obj, IntPtr* args)
+[xUnit.net 00:00:02.37]            at System.Reflection.MethodBaseInvoker.InvokeWithNoArgs(Object obj, BindingFlags invokeAttr)
+[xUnit.net 00:00:02.37]       Output:
+[xUnit.net 00:00:02.37]         native /workspace/ts-qwen-target-precision-r11/tests/bin/Release/net10.0/libGgmlOps.so sha256=caba5e47c2afa819a07fa075fa3a4c6fd2885ea284d6f765f82c2d12f3d2a8c0; backend=GgmlCuda
+[xUnit.net 00:00:02.37]         native /workspace/ts-qwen-target-precision-r11/tests/bin/Release/net10.0/libGgmlOps.so sha256=caba5e47c2afa819a07fa075fa3a4c6fd2885ea284d6f765f82c2d12f3d2a8c0; backend=GgmlCuda
+[xUnit.net 00:00:02.37]         teacher prefix=4 row=0 max_abs=0.00046062469482421875 plain=227 verify=227
+[xUnit.net 00:00:02.37]         teacher prefix=4 row=1 max_abs=0.00016689300537109375 plain=228 verify=228
+[xUnit.net 00:00:02.37]         teacher prefix=4 row=2 max_abs=0.00019550323486328125 plain=249 verify=249
+[xUnit.net 00:00:02.37]         teacher prefix=4 row=3 max_abs=0.00031936168670654297 plain=29 verify=29
+[xUnit.net 00:00:02.37]         state=gdn_conv max_abs=0 changed=0/256
+[xUnit.net 00:00:02.37]         state=gdn_delta max_abs=0 changed=0/2048
+[xUnit.net 00:00:02.37]         state=ple_conv max_abs=0 changed=0/128
+[xUnit.net 00:00:02.37]         state=_kCache max_abs=0 changed=0/128
+[xUnit.net 00:00:02.37]         state=_vCache max_abs=0 changed=0/128
+[xUnit.net 00:00:02.37]         teacher prefix=16 row=0 max_abs=0.0024946928024291992 plain=227 verify=227
+[xUnit.net 00:00:02.37]         teacher prefix=16 row=1 max_abs=0.00014317035675048828 plain=228 verify=228
+[xUnit.net 00:00:02.37]         teacher prefix=16 row=2 max_abs=0.00018280744552612305 plain=249 verify=249
+[xUnit.net 00:00:02.37]         teacher prefix=16 row=3 max_abs=0.00023555755615234375 plain=29 verify=29
+[xUnit.net 00:00:02.37]         state=gdn_conv max_abs=0 changed=0/256
+[xUnit.net 00:00:02.37]         state=gdn_delta max_abs=0 changed=0/2048
+[xUnit.net 00:00:02.37]         state=ple_conv max_abs=0 changed=0/128
+[xUnit.net 00:00:02.37]         state=_kCache max_abs=0 changed=0/320
+[xUnit.net 00:00:02.37]         state=_vCache max_abs=0 changed=0/320
+[xUnit.net 00:00:02.41]   Finished:    InferenceWeb.Tests
+</StdOut>
+    </Output>
+    <RunInfos>
+      <RunInfo computerName="d71188ba1e2e" outcome="Error" timestamp="2026-09-16T18:09:27.4853204+00:00">
+        <Text>[xUnit.net 00:00:02.36]     InferenceWeb.Tests.Qwen4ExpRetainedCacheTests.TeacherForcedTargetVerify_MatchesSingleTokenFullVocabularyForDenseAndSparsePrefixes [FAIL]</Text>
+      </RunInfo>
+    </RunInfos>
+  </ResultSummary>
+</TestRun>
