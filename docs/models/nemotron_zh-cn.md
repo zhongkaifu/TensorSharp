@@ -360,7 +360,7 @@ blk.{L}.ffn_down_shexp.weight
 
 - **Per-layer 派发表**（`_layerPrefixes`、`_layerWeightNames`）避免热循环里的字符串拼接。
 - **MoE prefill** 仍然 per token 迭代。每 token 用批量 MoE GPU kernel（`MoEExpertsForward`），所以一次派发跑完所有被选 expert，但 token 循环还是托管 C# —— 见下方优化机会。
-- **Attention prefill** 走标准托管循环。Nemotron-H 还没有融合 prefill attention kernel，因为 attention 层没有 RoPE，得分张量也比较小（不需要 SWA 窗口的 machinery）。
+- **Attention prefill** 在有界工作集内让每个 prompt chunk 与已驻留的 K/V 做注意力。GGML 后端且 cache 为 F32 / F16 时走融合 prefill kernel（`GgmlBasicOps.FusedPrefillAttention` / `FusedPrefillAttentionF16KV`），它直接读取分组 cache，得分张量较大时切换到 `ggml_flash_attn_ext`。其他情况（非 GGML 后端、块量化 cache）按 query 子块计算，使单个 `[heads, rows, context]` 得分张量不超过 `TS_NEMOTRON_ATTN_SCORE_BUDGET_MB`（默认 1024）。此前每层都物化整个 `[heads, chunk, context]` 得分张量：8B 上 32k prompt 深处的 4,096 token chunk 向 ggml-cuda 申请 37 GB（47B 在 8k 时 12.5 GB），所有长请求都以 HTTP 500 失败。同一份代码也服务 `nemotron_h_moe`（Nemotron 3.5、Nemotron 3 Nano Omni）。
 - **Mamba2 prefill** 顺序处理 token（按 `seqLen` 循环）跑 SSM scan；分块并行扫描在优化清单上。
 - **多模态 prefill** 支持按 prompt chunk 切片已准备好的图像 / 音频 embedding span，因此长图像 prompt 不再必须作为一个超大的 forward pass 执行。
 - **多模态 warmup** 在加载 Nemotron `mmproj` 的服务器启动阶段运行一次小的视觉编码和 image-token prefill，把 Metal pipeline 初始化从第一个真实图像请求前移；设置 `TS_NEMOTRON_MULTIMODAL_WARMUP=0` 可关闭。
@@ -437,6 +437,8 @@ Nemotron-H 是所有批处理移植里最复杂的，因为它结合了**三种�
 
 槽位在首次访问时分配，序列在引擎中被回收时释放。
 
+**驻留在设备上的递归状态。** 原生单 token Mamba2 decode kernel 在 token 之间把每个序列的 conv/SSM 状态留在设备上（每层每 token 下载约 2 MB 的代价超过 kernel 省下的时间），所以 decode 之后 host 数组是过期的。所有读取 host 状态的地方都会先通过 `TSGgml_NemotronMamba2DecodeReadState`（`SyncMamba2HostState`）把设备状态拷回：继续同一序列的托管 / 原生多 token forward、按块 KV 快照、第二个请求到达时把单序列 owner 迁移进槽位池、原生批处理步，以及投机解码快照。此前它们读到的都是第一个 decode token 之前的状态，因此并发请求（会在按序列路径和批处理路径之间交接序列）的贪心输出与单独服务同一请求时不同——8B 在并发 4 时出现 `101`、`1000000...` 以及重复循环。旧的单序列路径使用独立的 decode cache 槽位（`LegacyMamba2Slot`），批处理序列占用 slot 0 时不会再覆盖它的设备状态。若原生库早于该导出函数，decode kernel 会改为每个 token 下载状态（结果正确、速度较慢），并在 stderr 提示一次。
+
 **原生批处理 Mamba2 步内核** —— `TSGgml_NemotronMamba2BatchedStepF32`
 （[`ggml_ops_mamba2.cpp`](../../TensorSharp.GGML.Native/ggml_ops_mamba2.cpp)）
 —— 通过 `TS_NEMOTRON_MAMBA2_BATCHED_NATIVE=1` 控制。使用 NEON SIMD + GCD
@@ -461,6 +463,8 @@ Nemotron-H 是所有批处理移植里最复杂的，因为它结合了**三种�
 
 - 文本 prompt 上与旧路径**100% 贪心一致**
   （[`NemotronBatchedCorrectnessTests`](../../InferenceWeb.Tests/NemotronBatchedCorrectnessTests.cs)）。
+- 一起服务的请求（同时到达，以及在第一个请求已在 decode 时加入）与单独服务每个请求得到相同的贪心 token；decode 之后继续同一序列的多 token forward 与从头 prefill 一致
+  （[`NemotronHServingRegressionTests`](../../InferenceWeb.Tests/NemotronHServingRegressionTests.cs)，需要 `TS_TEST_NEMOTRON_H_DIR` 与 `TS_TEST_GGML_BACKEND=cuda|metal`）。
 - 多模态 prompt 的正确性已被结构性验证（在移除多模态预检拒绝后纯文本仍
   100%），但缺少本地 audio/image fixture 用于端到端验证。
 
@@ -485,7 +489,9 @@ GgmlMetal、进程内 legacy-vs-batched 切换；详见
 ## 12. 输出解析器与聊天模板
 
 - `ChatMlOutputParser` 解析 `<think> ... </think>` 思维链与 `<tool_call>{...}</tool_call>` 工具调用。
-- 聊天模板使用 ChatML 格式（`<|im_start|>` / `<|im_end|>`）。多模态占位符包括 `<image>`（之后展开为 `<img>` + N 个 token + `</img>`）与 `<so_embedding>`（音频）。
+- 同一架构名下有两种轮次格式，由 GGUF 内嵌的 `tokenizer.chat_template` 决定渲染哪一种（`ChatTemplate.IsNemotronHReasoningTemplate`）：
+  - **Nemotron-H 8B/47B Reasoning-128K** 训练时使用 `<SPECIAL_10>System\n{system}\n<SPECIAL_11>User\n{user}\n<SPECIAL_11>Assistant\n`（EOS 为 `<SPECIAL_11>`）。推理开关是 system prompt 中的 `{'reasoning': True}` / `{'reasoning': False}`，生成提示随之打开（`<think>\n`）或关闭（`<think></think>`）推理块。`RenderNemotronHReasoning` 根据请求的 `think` 标志加入该标记，除非 system prompt 已经带有。官方模板没有工具语法，因此工具以 JSON `<tool_call>` 约定声明在 system prompt 中，工具结果作为包裹在 `<tool_response>` 中的 user 轮次返回。这些 checkpoint 过去被当作 ChatML 渲染：模型把 `<|im_start|>` 当普通文本，回答里出现 `</think>`、自编的 `<|im_start|>user` 轮次和 `<unk>` 循环。
+  - **Nemotron 3 Nano / Omni**（以及其他所有 `nemotron_h*` 模板）使用 ChatML（`<|im_start|>` / `<|im_end|>`）。多模态占位符包括 `<image>`（之后展开为 `<img>` + N 个 token + `</img>`）与 `<so_embedding>`（音频）。
 
 ## 13. 优化机会
 

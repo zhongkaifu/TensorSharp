@@ -128,6 +128,7 @@ namespace TensorSharp.Models
         private Tensor[][] _nemoSlotMamba2NativeDecodeProjected;  // [layer][slot]
         private Tensor[][] _nemoSlotMamba2NativeDecodeHidden;     // [layer][slot]
         private bool[][]   _nemoSlotMamba2NativeDecodeStateInitialized; // [layer][slot]
+        private bool[][]   _nemoSlotMamba2HostStateStale;             // [layer][slot] — see _mamba2HostStateStale
         private int _nemoMambaSlotCapacity;       // current allocated slot pool size (per layer)
 
         // Per-request Mamba2 slot allocator. RequestId → slot index.
@@ -208,6 +209,7 @@ namespace TensorSharp.Models
                 _nemoSlotMamba2NativeDecodeProjected = new Tensor[numLayers][];
                 _nemoSlotMamba2NativeDecodeHidden = new Tensor[numLayers][];
                 _nemoSlotMamba2NativeDecodeStateInitialized = new bool[numLayers][];
+                _nemoSlotMamba2HostStateStale = new bool[numLayers][];
             }
             if (_nemoPagedKvDimPerLayer == null || _nemoPagedKvDimPerLayer.Length != numLayers)
             {
@@ -254,6 +256,7 @@ namespace TensorSharp.Models
             Tensor[][] oldNdProj = _nemoSlotMamba2NativeDecodeProjected;
             Tensor[][] oldNdHidden = _nemoSlotMamba2NativeDecodeHidden;
             bool[][] oldNdInit = _nemoSlotMamba2NativeDecodeStateInitialized;
+            bool[][] oldHostStale = _nemoSlotMamba2HostStateStale;
             int oldCapacity = _nemoMambaSlotCapacity;
 
             // Outer arrays already sized to numLayers by EnsureNemoLayerOuterArrays;
@@ -268,6 +271,7 @@ namespace TensorSharp.Models
                 var newNdProj = new Tensor[targetCapacity];
                 var newNdHidden = new Tensor[targetCapacity];
                 var newNdInit = new bool[targetCapacity];
+                var newHostStale = new bool[targetCapacity];
 
                 if (oldConvBuf != null && oldConvBuf[l] != null && oldCapacity > 0)
                 {
@@ -278,6 +282,7 @@ namespace TensorSharp.Models
                     Array.Copy(oldNdProj[l],   0, newNdProj,   0, copy);
                     Array.Copy(oldNdHidden[l], 0, newNdHidden, 0, copy);
                     Array.Copy(oldNdInit[l],   0, newNdInit,   0, copy);
+                    Array.Copy(oldHostStale[l], 0, newHostStale, 0, copy);
                 }
 
                 _nemoSlotConvBuf[l] = newConvBuf;
@@ -286,6 +291,7 @@ namespace TensorSharp.Models
                 _nemoSlotMamba2NativeDecodeProjected[l] = newNdProj;
                 _nemoSlotMamba2NativeDecodeHidden[l] = newNdHidden;
                 _nemoSlotMamba2NativeDecodeStateInitialized[l] = newNdInit;
+                _nemoSlotMamba2HostStateStale[l] = newHostStale;
             }
 
             _nemoMambaSlotCapacity = targetCapacity;
@@ -389,6 +395,7 @@ namespace TensorSharp.Models
                 Array.Clear(_nemoSlotConvBuf[layer][slot], 0, _nemoSlotConvBuf[layer][slot].Length);
                 Array.Clear(_nemoSlotSsmState[layer][slot], 0, _nemoSlotSsmState[layer][slot].Length);
                 _nemoSlotMamba2NativeDecodeStateInitialized[layer][slot] = false;
+                _nemoSlotMamba2HostStateStale[layer][slot] = false;
                 _nemoSlotInit[layer][slot] = true;
             }
 
@@ -554,6 +561,10 @@ namespace TensorSharp.Models
             // so the net effect is the correct legacy state in the slot.
             EnsureNemoSlotAllocated(layer, slot);
 
+            // The legacy owner may have decoded natively since its host arrays were
+            // last written; copy what the device actually holds.
+            SyncMamba2HostState(layer, LegacyMamba2Slot);
+
             float[] srcConv = _convState[layer];
             float[] srcSsm = _ssmState[layer];
             float[] dstConv = _nemoSlotConvBuf[layer][slot];
@@ -573,6 +584,7 @@ namespace TensorSharp.Models
             // previous tenant). Force a re-sync from the host arrays we just
             // populated. Matches the refresh pattern in TryInjectKVBlock.
             _nemoSlotMamba2NativeDecodeStateInitialized[layer][slot] = false;
+            _nemoSlotMamba2HostStateStale[layer][slot] = false;
         }
 
         private static unsafe bool TryReadCacheAsF32(Tensor cache, int totalElems, out float[] flat)
@@ -959,6 +971,7 @@ namespace TensorSharp.Models
             Tensor  origNdProj     = hasNativeDecodeShadow ? _mamba2NativeDecodeProjected[layer] : null;
             Tensor  origNdHidden   = hasNativeDecodeShadow ? _mamba2NativeDecodeHidden[layer] : null;
             bool    origNdInit     = hasNativeDecodeShadow && _mamba2NativeDecodeStateInitialized[layer];
+            bool    origHostStale  = hasNativeDecodeShadow && _mamba2HostStateStale[layer];
             int     savedCacheLen  = _cacheSeqLen;
 
             // Pre-allocate the batched output on the backend's allocator
@@ -994,6 +1007,7 @@ namespace TensorSharp.Models
                         _mamba2NativeDecodeHidden[layer]        = _nemoSlotMamba2NativeDecodeHidden[layer][slot];
                         _mamba2NativeDecodeStateInitialized[layer] =
                             _nemoSlotMamba2NativeDecodeStateInitialized[layer][slot];
+                        _mamba2HostStateStale[layer] = _nemoSlotMamba2HostStateStale[layer][slot];
                     }
                     _cacheSeqLen = seq.NumComputedTokens;
 
@@ -1014,6 +1028,7 @@ namespace TensorSharp.Models
                         // field) into the per-slot store.
                         _nemoSlotMamba2NativeDecodeStateInitialized[layer][slot] =
                             _mamba2NativeDecodeStateInitialized[layer];
+                        _nemoSlotMamba2HostStateStale[layer][slot] = _mamba2HostStateStale[layer];
                     }
 
                     using Tensor dst = batchedOutTensor.Narrow(0, seqStart, seqLen);
@@ -1029,6 +1044,7 @@ namespace TensorSharp.Models
                     _mamba2NativeDecodeProjected[layer]            = origNdProj;
                     _mamba2NativeDecodeHidden[layer]               = origNdHidden;
                     _mamba2NativeDecodeStateInitialized[layer]     = origNdInit;
+                    _mamba2HostStateStale[layer]                   = origHostStale;
                 }
                 _cacheSeqLen                                   = savedCacheLen;
             }
@@ -1106,6 +1122,16 @@ namespace TensorSharp.Models
 
                     float[] convBuf = _nemoSlotConvBuf[layer][slot];
                     float[] ssmBuf  = _nemoSlotSsmState[layer][slot];
+                    if (_nemoSlotMamba2HostStateStale[layer][slot])
+                    {
+                        // A per-sequence native decode left this slot's newest state on
+                        // the device; this kernel reads and advances the host copy, after
+                        // which the device copy is the stale one.
+                        GgmlBasicOps.NemotronMamba2DecodeReadState(
+                            NativeMamba2DecodeStateKey(layer, slot), convBuf, ssmBuf);
+                        _nemoSlotMamba2HostStateStale[layer][slot] = false;
+                    }
+                    _nemoSlotMamba2NativeDecodeStateInitialized[layer][slot] = false;
                     convHandles[s] = GCHandle.Alloc(convBuf, GCHandleType.Pinned);
                     ssmHandles[s]  = GCHandle.Alloc(ssmBuf,  GCHandleType.Pinned);
 

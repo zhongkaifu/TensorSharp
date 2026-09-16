@@ -229,6 +229,10 @@ namespace
         bool hidden_out_zero_copy = false;
         bool weights_uploaded = false;
         bool state_initialized = false;
+        // Order of the last graph compute across all entries, so a state read for
+        // a key that has several entries (Metal zero-copy bindings key on the host
+        // pointers too) picks the one that ran most recently.
+        std::uint64_t compute_serial = 0;
 
         std::mutex compute_mutex;
 
@@ -247,6 +251,8 @@ namespace
                        std::unique_ptr<Mamba2PrefillCacheEntry>,
                        Mamba2PrefillCacheKeyHash,
                        Mamba2PrefillCacheKeyEq> g_mamba2_prefill_cache;
+
+    std::atomic<std::uint64_t> g_mamba2_decode_compute_serial{0};
 
     std::mutex g_mamba2_decode_cache_mutex;
     std::unordered_map<Mamba2DecodeCacheKey,
@@ -1104,6 +1110,7 @@ TSG_EXPORT int TSGgml_NemotronMamba2DecodeF32(
                 set_last_error("NemotronMamba2Decode: graph compute failed.");
                 return 0;
             }
+            entry->compute_serial = ++g_mamba2_decode_compute_serial;
 
             if (download_state)
             {
@@ -1131,6 +1138,79 @@ TSG_EXPORT int TSGgml_NemotronMamba2DecodeF32(
     catch (...)
     {
         set_last_error("Unknown error in NemotronMamba2Decode.");
+        return 0;
+    }
+}
+
+// Copy the device-resident conv/SSM state of the decode-cache entry for
+// `state_key` back into the caller's host arrays.
+//
+// The decode kernel keeps the recurrent state on the device between tokens
+// (download_state = 0) because draining it every token costs more than the
+// kernel saves. Anything that later reads the host arrays - a multi-token
+// prefill continuing the same sequence, a per-block KV snapshot, a migration
+// into the batched slot pool - would otherwise read the state as it was
+// before the first decoded token and silently corrupt the sequence. Callers
+// drain once, at that hand-off, instead.
+//
+// Returns 1 when the state was copied, -1 when no initialized entry exists for
+// the key (the host arrays are already authoritative), 0 on error.
+TSG_EXPORT int TSGgml_NemotronMamba2DecodeReadState(
+    std::uint64_t state_key,
+    void* conv_state_data,
+    int conv_state_elements,
+    void* ssm_state_data,
+    int ssm_state_elements)
+{
+    try
+    {
+        if (state_key == 0 || ssm_state_data == nullptr || ssm_state_elements <= 0 || conv_state_elements < 0
+            || (conv_state_elements > 0 && conv_state_data == nullptr))
+        {
+            set_last_error("NemotronMamba2DecodeReadState: invalid arguments.");
+            return 0;
+        }
+
+        const std::size_t conv_bytes = static_cast<std::size_t>(conv_state_elements) * sizeof(float);
+        const std::size_t ssm_bytes = static_cast<std::size_t>(ssm_state_elements) * sizeof(float);
+
+        Mamba2DecodeCacheEntry* entry = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(g_mamba2_decode_cache_mutex);
+            for (auto& kv : g_mamba2_decode_cache)
+            {
+                Mamba2DecodeCacheEntry* candidate = kv.second.get();
+                if (kv.first.state_key != state_key || !candidate->state_initialized)
+                    continue;
+                if (candidate->ssm_state_bytes != ssm_bytes || candidate->conv_state_bytes != conv_bytes)
+                    continue;
+                if (entry == nullptr || candidate->compute_serial > entry->compute_serial)
+                    entry = candidate;
+            }
+        }
+
+        if (entry == nullptr)
+        {
+            clear_last_error();
+            return -1;
+        }
+
+        std::lock_guard<std::mutex> entry_lk(entry->compute_mutex);
+        tsg::sync_backend(g_backend);
+        if (conv_bytes > 0)
+            ggml_backend_tensor_get(entry->conv_state_storage, conv_state_data, 0, conv_bytes);
+        ggml_backend_tensor_get(entry->ssm_state_storage, ssm_state_data, 0, ssm_bytes);
+        clear_last_error();
+        return 1;
+    }
+    catch (const std::exception& ex)
+    {
+        set_last_error(ex.what());
+        return 0;
+    }
+    catch (...)
+    {
+        set_last_error("Unknown error in NemotronMamba2DecodeReadState.");
         return 0;
     }
 }

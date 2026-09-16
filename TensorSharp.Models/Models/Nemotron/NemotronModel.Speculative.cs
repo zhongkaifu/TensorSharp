@@ -385,6 +385,7 @@ namespace TensorSharp.Models
             {
                 if (_layerTypes[l] != LayerType.Mamba2)
                     continue;
+                SyncMamba2HostState(l, LegacyMamba2Slot);
                 float[] c = _convState[l], s = _ssmState[l];
                 if (c == null || s == null)
                     continue;
@@ -416,6 +417,8 @@ namespace TensorSharp.Models
             }
             if (_mamba2NativeDecodeStateInitialized != null)
                 Array.Clear(_mamba2NativeDecodeStateInitialized);
+            if (_mamba2HostStateStale != null)
+                Array.Clear(_mamba2HostStateStale);
         }
 
         /// <summary>

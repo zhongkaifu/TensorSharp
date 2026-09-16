@@ -504,10 +504,19 @@ when a GPU backend is selected.
   MoE GPU kernel (`MoEExpertsForward`) so all selected experts run in a
   single dispatch per token, but the token loop is still managed C# — see
   the optimization opportunities below.
-- **Attention prefill** uses the standard managed loop. There is no fused
-  prefill attention kernel for Nemotron-H yet because the score tensor is
-  small (no SWA window machinery is needed since attention layers have no
-  RoPE).
+- **Attention prefill** attends each prompt chunk against the resident K/V
+  in a bounded working set. On GGML backends with an F32 or F16 cache it
+  runs the fused prefill kernel (`GgmlBasicOps.FusedPrefillAttention` /
+  `FusedPrefillAttentionF16KV`), which reads the grouped cache directly and
+  switches to `ggml_flash_attn_ext` once the score tensor would be large.
+  Every other case (non-GGML backends, block-quantized caches) attends in
+  query sub-chunks sized so one `[heads, rows, context]` score tensor stays
+  under `TS_NEMOTRON_ATTN_SCORE_BUDGET_MB` (default 1024). This used to
+  materialize the whole `[heads, chunk, context]` score tensor per layer:
+  a 4,096-token chunk deep into a 32k prompt asked ggml-cuda for 37 GB on
+  the 8B (12.5 GB at 8k on the 47B) and every long request failed with
+  HTTP 500. The same code serves `nemotron_h_moe` (Nemotron 3.5, Nemotron 3
+  Nano Omni).
 - **Mamba2 prefill** processes tokens **sequentially** (loop over `seqLen`)
   through the SSM scan; chunked parallel scanning is on the optimization
   list.
@@ -610,6 +619,25 @@ block id** (matching vLLM's `state_indices_tensor`):
 Slots are allocated lazily on first touch and freed when the engine
 retires the sequence.
 
+**Device-resident recurrent state.** The native single-token Mamba2 decode
+kernel keeps each sequence's conv/SSM state on the device between tokens
+(downloading ~2 MB per layer per token would cost more than the kernel
+saves), so after a decode step the host arrays are stale. Every host reader
+drains first through `TSGgml_NemotronMamba2DecodeReadState`
+(`SyncMamba2HostState`): the managed/native multi-token forward that
+continues a sequence, the per-block KV snapshot, the migration of the
+single-sequence owner into the slot pool when a second request arrives, the
+native batched step, and the speculative snapshot. Before this, all of them
+read the state from before the first decoded token, so concurrent requests
+(which hand sequences between the per-sequence and batched paths) produced
+different greedy output from the same requests served alone - on the 8B at
+concurrency 4 answers such as `101`, `1000000...` and repetition loops. The
+legacy single-sequence path uses its own decode-cache slot
+(`LegacyMamba2Slot`), so a batched sequence on slot 0 can no longer overwrite
+its device state. A native library that predates the export makes the
+decode kernel download its state every token instead (correct, slower) and
+says so once on stderr.
+
 A **native batched Mamba2 step kernel** —
 `TSGgml_NemotronMamba2BatchedStepF32`
 ([`ggml_ops_mamba2.cpp`](../../TensorSharp.GGML.Native/ggml_ops_mamba2.cpp))
@@ -639,6 +667,12 @@ active (i.e. unless `TS_NEMOTRON_BATCHED=0` is set).
 
 - **100% greedy match** vs legacy on text-only prompts
   ([`NemotronBatchedCorrectnessTests`](../../InferenceWeb.Tests/NemotronBatchedCorrectnessTests.cs)).
+- Requests served together (all at once, and joining while the first one
+  is already decoding) produce the same greedy tokens as each request
+  served alone, and a multi-token forward that continues a sequence after
+  decode matches prefilling it from scratch
+  ([`NemotronHServingRegressionTests`](../../InferenceWeb.Tests/NemotronHServingRegressionTests.cs),
+  needs `TS_TEST_NEMOTRON_H_DIR` and `TS_TEST_GGML_BACKEND=cuda|metal`).
 - Multimodal-prompt correctness is structurally validated (text-only
   stays 100% after removing the multimodal pre-flight rejection) but
   lacks a local audio/image fixture for end-to-end verification.
@@ -667,9 +701,26 @@ the path. Now exposed as a method getter (same pattern as Qwen 3.5).
 
 - `ChatMlOutputParser` parses `<think> ... </think>` for chain-of-thought
   reasoning and `<tool_call>{...}</tool_call>` for tool calls.
-- Chat template uses the ChatML format (`<|im_start|>` /
-  `<|im_end|>`). Multimodal placeholders include `<image>` (later expanded
-  into `<img>` + N + `</img>`) and `<so_embedding>` (audio).
+- Two turn formats ship under the same architecture name, and the GGUF's
+  embedded `tokenizer.chat_template` decides which one is rendered
+  (`ChatTemplate.IsNemotronHReasoningTemplate`):
+  - **Nemotron-H 8B/47B Reasoning-128K** were trained on
+    `<SPECIAL_10>System\n{system}\n<SPECIAL_11>User\n{user}\n<SPECIAL_11>Assistant\n`
+    (EOS is `<SPECIAL_11>`). Reasoning is switched by
+    `{'reasoning': True}` / `{'reasoning': False}` in the system prompt, and
+    the generation prompt then opens (`<think>\n`) or closes
+    (`<think></think>`) the reasoning block. `RenderNemotronHReasoning` adds
+    the marker from the request's `think` flag unless the system prompt
+    already carries one. The shipped template has no tool syntax, so tools
+    are declared in the system prompt with the JSON `<tool_call>`
+    convention and tool results come back as a user turn wrapped in
+    `<tool_response>`. These checkpoints used to be rendered as ChatML: the
+    model saw `<|im_start|>` as plain text and answered with `</think>`,
+    invented `<|im_start|>user` turns and `<unk>` loops.
+  - **Nemotron 3 Nano / Omni** (and every other `nemotron_h*` template) use
+    ChatML (`<|im_start|>` / `<|im_end|>`). Multimodal placeholders include
+    `<image>` (later expanded into `<img>` + N + `</img>`) and
+    `<so_embedding>` (audio).
 
 ## 13. Optimization opportunities
 
