@@ -112,7 +112,8 @@ namespace TensorSharp.Models
             {
                 int nThreads = ParseEnvInt("TS_DSV4_THREADS", Math.Min(Environment.ProcessorCount, 32));
                 int nGpu = ParseEnvInt("TS_DSV4_NGPU", tpDegree > 1 ? tpDegree : 0); // 0 = all visible GPUs
-                string dspark = _backend == BackendType.GgmlCuda ? ResolveDsparkPath(draftModelPath) : null;
+                string dspark = backend == BackendType.GgmlCuda || (isV41 && backend == BackendType.GgmlCpu)
+                    ? ResolveDsparkPath(draftModelPath) : null;
                 if (dspark == null)
                     WarnDsparkUnavailable(draftModelPath, backend);
 
@@ -340,7 +341,10 @@ namespace TensorSharp.Models
                 else if (_cpuExec != null)
                     _cpuExec.Reset();
                 else if (_handle != IntPtr.Zero)
-                    GgmlDeepSeek4Native.Reset(_handle);
+                {
+                    if (!GgmlDeepSeek4Native.ResetChecked(_handle))
+                        throw new InvalidOperationException("DSV4 native cache reset failed; cache remains unusable.");
+                }
             }
         }
 

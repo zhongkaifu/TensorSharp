@@ -1588,6 +1588,54 @@ struct TSGgmlQwen4ExpHeadArgs
     int vocab;
 };
 
+struct TSGgmlQwen4ExpMtpConfig
+{
+    void* enorm;
+    void* hnorm;
+    void* eh_proj;
+    long long eh_bytes;
+    int eh_type;
+    int n_embd, hc, hc_low_rank;
+    int head_dim, n_head, n_head_kv, n_rot;
+    int n_expert, n_expert_used, n_ff, n_ff_sh;
+    int capacity, device;
+    float eps, rope_base, rope_scale, attn_scale;
+    int rope_sections[4];
+};
+
+// Additive QSA descriptor. Existing attention/span descriptor ABIs stay intact.
+struct TSGgmlQwen4ExpQsaArgs
+{
+    void* k_proj;
+    void* q_proj;
+    void* k_norm;
+    void* q_norm;
+    void* cache;
+    long long k_bytes, q_bytes, cache_bytes;
+    int k_type, q_type, cache_type;
+    int head_dim, heads, ratio, top_k;
+    int rope_sections[4];
+};
+
+struct Q4eQsaInputs
+{
+    int ratio = 0;
+    ggml_tensor* cell_blocks = nullptr;
+    ggml_tensor* block_cells = nullptr;
+    ggml_tensor* block_positions = nullptr;
+    ggml_tensor* query_positions = nullptr;
+    ggml_tensor* bias = nullptr;
+};
+
+struct Q4eQsaGraph
+{
+    const TSGgmlQwen4ExpQsaArgs* args = nullptr;
+    const Q4eQsaInputs* inputs = nullptr;
+    ggml_tensor* cache = nullptr;
+    // Optional test-only outputs, never retained by production graphs.
+    std::vector<ggml_tensor*>* probes = nullptr;
+};
+
 // A weight binding resolved through the resident cache, remembered so a
 // REPLAY can re-resolve it. The cache can move or re-create a device copy
 // (large allocations elsewhere churn it), and a persisted graph would keep
@@ -1703,7 +1751,9 @@ ggml_tensor* q4e_nodes_attn(
     std::vector<ggml_tensor*>* kv_out = nullptr,
     std::vector<ggml_tensor*>* probe = nullptr,
     const std::int32_t* mrope_sections = nullptr,
-    Q4eAttnArenaIO* arena = nullptr);
+    Q4eAttnArenaIO* arena = nullptr,
+    ggml_tensor* owned_k = nullptr, ggml_tensor* owned_v = nullptr,
+    const Q4eQsaGraph* qsa = nullptr);
 
 // PLE half. `conv_hist` is the persistent history - [hc_dim, hist] for the
 // span (n_streams == 1), a [hc_dim, hist, n_streams] arena view for the arena

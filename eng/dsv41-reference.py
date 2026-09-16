@@ -40,7 +40,9 @@ class GgufWeights:
 
     def rows(self, name, row_ids):
         tensor = self.tensors[name]
-        row_count = math.prod(tensor.shape[1:]) or 1
+        # Some NumPy versions promote Python-int * np.uint64 to float64.
+        # Keep dimensions as Python integers so reshape receives an integer.
+        row_count = math.prod(int(dimension) for dimension in tensor.shape[1:]) or 1
         raw = tensor.data.reshape(row_count, -1)[row_ids]
         raw = np.ascontiguousarray(raw)
         # Whole matrix blocks avoid the generic converter's Python loop over

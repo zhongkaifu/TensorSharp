@@ -78,7 +78,8 @@ namespace TensorSharp.Runtime
         /// </summary>
         public List<string>? AttachmentNames { get; set; }
         /// <summary>
-        /// True if ImagePaths represent video frames (inserts &lt;|video&gt; before frame &lt;|image&gt; tokens).
+        /// True when the message contains sampled video frames. ImageTimestamps
+        /// distinguishes timed frames from still images in mixed messages.
         /// </summary>
         public bool IsVideo { get; set; }
         /// <summary>
@@ -661,7 +662,12 @@ namespace TensorSharp.Runtime
                     var jinja = new Jinja2Template(effectiveTemplate);
                     var context = BuildJinja2Context(
                         preprocessed, addGenerationPrompt, tools, enableThinking, architecture);
-                    string result = jinja.Render(context).TrimEnd();
+                    string result = jinja.Render(context);
+                    // Gemma's generation boundary is part of its published template:
+                    // preserve its newline and any channel prefix exactly. Adding an
+                    // empty thought block can make E4B continue unmarked reasoning.
+                    if (architecture != "gemma4" || !addGenerationPrompt)
+                        result = result.TrimEnd();
                     if (result.Length > 0)
                     {
                         // Defensive correctness guard: a lightweight Jinja engine that
@@ -681,16 +687,7 @@ namespace TensorSharp.Runtime
                         else
                         {
                             result = StripReasoningEndSentinel(result);
-                            if (architecture == "gemma4")
-                            {
-                                if (addGenerationPrompt)
-                                {
-                                    result = enableThinking
-                                        ? EnsureGemma4ThinkingPromptNewline(result)
-                                        : EnsureGemma4ThinkingBlock(result);
-                                }
-                            }
-                            else if (IsQwen35Family(architecture) && addGenerationPrompt)
+                            if (IsQwen35Family(architecture) && addGenerationPrompt)
                                 result = enableThinking
                                     ? EnsureQwen35ThinkOpen(result)
                                     : EnsureQwen35ThinkClosed(result);
@@ -1369,14 +1366,18 @@ namespace TensorSharp.Runtime
             bool passReasoning =
                 ChatProtocolRegistry.For(architecture)?.RendersAssistantReasoning ?? false;
 
+            BuildJinjaToolIds(messages, out string[][] callIds, out string?[] resultIds);
             var msgList = new List<object>();
-            foreach (var m in messages)
+            for (int messageIndex = 0; messageIndex < messages.Count; messageIndex++)
             {
+                ChatMessage m = messages[messageIndex];
                 var dict = new Dictionary<string, object>
                 {
                     ["role"] = m.Role ?? "",
                     ["content"] = m.Content ?? ""
                 };
+                if (resultIds[messageIndex] != null)
+                    dict["tool_call_id"] = resultIds[messageIndex]!;
                 if (passReasoning
                     && m.Role == "assistant"
                     && m.ToolCalls is { Count: > 0 }
@@ -1408,10 +1409,12 @@ namespace TensorSharp.Runtime
                 if (m.ToolCalls != null && m.ToolCalls.Count > 0)
                 {
                     var tcList = new List<object>();
-                    foreach (var tc in m.ToolCalls)
+                    for (int callIndex = 0; callIndex < m.ToolCalls.Count; callIndex++)
                     {
+                        ToolCall tc = m.ToolCalls[callIndex];
                         tcList.Add(new Dictionary<string, object>
                         {
+                            ["id"] = callIds[messageIndex][callIndex],
                             ["function"] = new Dictionary<string, object>
                             {
                                 ["name"] = tc.Name,
@@ -1457,6 +1460,61 @@ namespace TensorSharp.Runtime
             }
 
             return ctx;
+        }
+
+        private static void BuildJinjaToolIds(
+            List<ChatMessage> messages, out string[][] callIds, out string?[] resultIds)
+        {
+            callIds = new string[messages.Count][];
+            resultIds = new string?[messages.Count];
+            var usedIds = new HashSet<string>(StringComparer.Ordinal);
+            foreach (ChatMessage message in messages)
+            {
+                if (!string.IsNullOrEmpty(message.ToolCallId)) usedIds.Add(message.ToolCallId);
+                if (message.ToolCalls != null)
+                    foreach (ToolCall call in message.ToolCalls)
+                        if (!string.IsNullOrEmpty(call.Id)) usedIds.Add(call.Id);
+            }
+
+            int nextId = 0;
+            string NewRenderId()
+            {
+                string id;
+                do { id = "__tensorsharp_render_call_" + nextId++; }
+                while (!usedIds.Add(id));
+                return id;
+            }
+
+            for (int i = 0; i < messages.Count; i++)
+            {
+                ChatMessage message = messages[i];
+                if (!string.IsNullOrEmpty(message.ToolCallId)) resultIds[i] = message.ToolCallId;
+                if (message.ToolCalls is not { Count: > 0 }) continue;
+
+                var ids = new string[message.ToolCalls.Count];
+                for (int c = 0; c < ids.Length; c++)
+                    ids[c] = string.IsNullOrEmpty(message.ToolCalls[c].Id)
+                        ? NewRenderId() : message.ToolCalls[c].Id!;
+                callIds[i] = ids;
+
+                // Legacy local tool loops have no wire IDs and return results in
+                // call order. Give their render context an explicit association:
+                // canonical Gemma compares IDs, and two missing IDs compare equal,
+                // incorrectly naming every result after the last function.
+                // Reserve explicit results first; they may arrive out of order.
+                int end = i + 1;
+                var explicitResults = new HashSet<string>(StringComparer.Ordinal);
+                while (end < messages.Count && messages[end].Role == "tool")
+                {
+                    if (!string.IsNullOrEmpty(messages[end].ToolCallId))
+                        explicitResults.Add(messages[end].ToolCallId!);
+                    end++;
+                }
+                var unclaimed = new Queue<string>(ids.Where(id => !explicitResults.Contains(id)));
+                for (int r = i + 1; r < end; r++)
+                    if (string.IsNullOrEmpty(messages[r].ToolCallId))
+                        resultIds[r] = unclaimed.Count > 0 ? unclaimed.Dequeue() : NewRenderId();
+            }
         }
 
         /// <summary>
@@ -1853,18 +1911,7 @@ namespace TensorSharp.Runtime
                 }
                 else
                 {
-                    if (msg.ImagePaths != null)
-                    {
-                        if (msg.IsVideo)
-                            sb.Append("<|video>");
-                        foreach (var _ in msg.ImagePaths)
-                            sb.Append("<|image>");
-                    }
-                    if (msg.AudioPaths != null)
-                    {
-                        foreach (var _ in msg.AudioPaths)
-                            sb.Append("<|audio>");
-                    }
+                    AppendGemma4MediaPlaceholders(msg, sb);
                     sb.Append(msg.Content?.Trim() ?? "");
                 }
                 sb.Append("<turn|>\n");
@@ -1872,10 +1919,33 @@ namespace TensorSharp.Runtime
             if (addGenerationPrompt)
             {
                 sb.Append("<|turn>model\n");
-                if (!enableThinking)
-                    sb.Append("<|channel>thought\n<channel|>");
             }
             return sb.ToString();
+        }
+
+        internal static void AppendGemma4MediaPlaceholders(ChatMessage message, StringBuilder text)
+        {
+            bool timed = message.ImagePaths != null && message.ImageTimestamps?.Count == message.ImagePaths.Count;
+            // Legacy UI histories may contain frames without source timestamps.
+            // Preserve that framing without inventing frame times.
+            if (message.IsVideo && message.ImagePaths != null && !timed) text.Append("<|video>");
+            if (message.ImagePaths != null)
+                for (int i = 0; i < message.ImagePaths.Count; ++i)
+                {
+                    if (timed && message.ImageTimestamps![i] is double time)
+                    {
+                        if (!double.IsFinite(time) || time < 0)
+                            throw new ArgumentOutOfRangeException(nameof(message.ImageTimestamps));
+                        // Gemma4Processor uses integer-truncated mm:ss source times.
+                        if (i > 0) text.Append(' ');
+                        text.Append(Math.Floor(time / 60).ToString("00", System.Globalization.CultureInfo.InvariantCulture))
+                            .Append(':').Append(Math.Floor(time % 60).ToString("00", System.Globalization.CultureInfo.InvariantCulture))
+                            .Append(' ');
+                    }
+                    text.Append("<|image>");
+                }
+            if (message.AudioPaths != null)
+                foreach (var _ in message.AudioPaths) text.Append("<|audio>");
         }
 
         private static string RenderGemma4ToolDeclaration(ToolFunction tool)
@@ -2016,39 +2086,6 @@ namespace TensorSharp.Runtime
                 return sb2.ToString();
             }
             return value?.ToString() ?? "null";
-        }
-
-        /// <summary>
-        /// Ensure the Gemma 4 prompt ends with an empty thinking block when thinking
-        /// is disabled. The GGUF Jinja2 template may not produce it, but the model
-        /// expects it to skip the thinking phase and generate content directly.
-        /// </summary>
-        private static string EnsureGemma4ThinkingBlock(string result)
-        {
-            const string emptyThinkBlock = "<|channel>thought\n<channel|>";
-            if (!result.EndsWith(emptyThinkBlock))
-            {
-                if (!result.EndsWith("\n"))
-                    result += "\n";
-                result += emptyThinkBlock;
-            }
-            return result;
-        }
-
-        /// <summary>
-        /// Restore the newline after Gemma 4's open model turn when thinking is
-        /// enabled. The embedded template ends in <c>&lt;|turn&gt;model\n</c>,
-        /// but the generic Jinja result cleanup trims that newline. Gemma 4
-        /// treats the newline as part of the generation prompt; omitting it can
-        /// drive the model into repetitive garbage instead of its reasoning
-        /// channel.
-        /// </summary>
-        private static string EnsureGemma4ThinkingPromptNewline(string result)
-        {
-            const string openModelTurn = "<|turn>model";
-            if (result.EndsWith(openModelTurn, StringComparison.Ordinal))
-                result += "\n";
-            return result;
         }
 
         /// <summary>

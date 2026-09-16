@@ -2341,6 +2341,13 @@ namespace TensorSharp.Models
         /// <summary>See <see cref="IModelArchitecture.KVCacheTruncationGranularity"/>.</summary>
         public virtual int KVCacheTruncationGranularity => 1;
 
+        /// <summary>See <see cref="IModelArchitecture.CanTruncateKVCache"/>.</summary>
+        public virtual bool CanTruncateKVCache(int cachedTokenCount, int targetTokenCount)
+            => targetTokenCount >= 0 && targetTokenCount <= cachedTokenCount
+                && (targetTokenCount == cachedTokenCount
+                    || (SupportsKVCacheTruncation
+                        && targetTokenCount % Math.Max(1, KVCacheTruncationGranularity) == 0));
+
         protected virtual void TruncateKVCacheCore(int tokenCount)
         {
             Console.WriteLine($"[KV cache] Truncating from {_cacheSeqLen} to {tokenCount}");

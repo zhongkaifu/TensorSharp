@@ -125,45 +125,52 @@ def main():
         compare("partial_graph_recovery_oracle", output, targets[1])
         for vision in (False, True):
             stream, target = streams[int(vision)], targets[int(vision)]
-            for stage in (("engram", "compute", "tp-rank") if args.tp else ("engram", "compute")):
-                for position in (0, 3):
-                    name = f"{'vision' if vision else 'text'}_{stage}_position{position}"
-                    check(name + "_prepare_other", slot_select(handle, healthy) == 0)
-                    reset(handle)
-                    status, _ = call(slice_stream(stream, 0, 1), vision)
-                    check(name + "_other_prefix", status == 0 and past(handle) == 1)
-                    check("select_failed_slot", slot_select(handle, 0) == 0)
-                    reset(handle)
-                    os.environ["TS_DSV41_TEST_FAIL_STAGE"] = stage
-                    os.environ["TS_DSV41_TEST_FAIL_POSITION"] = str(position)
-                    status, _ = call(stream, vision)
-                    check(name + "_injected_failure", status < 0,
-                          note="If this fails, ensure the native library was built with test hooks enabled")
-                    check(name + "_committed_prefix", past(handle) == position)
-                    os.environ.pop("TS_DSV41_TEST_FAIL_STAGE")
-                    os.environ.pop("TS_DSV41_TEST_FAIL_POSITION")
-                    # Both APIs must keep rejecting after the transient hook
-                    # disappears; moving only the logical position cannot heal
-                    # a partially written compressed/raw cache.
-                    for use_visual in (False, True):
-                        status, _ = call(streams[int(use_visual)], use_visual)
-                        check(name + f"_sticky_{use_visual}", status < 0 and past(handle) == position)
-                    check(name + "_rewind_rejected", rewind(handle, 0) == 0 and past(handle) == position)
-                    scratch = np.empty(vocab, dtype=np.float32)
-                    check(name + "_speculative_rejected", speculative(handle, text_ids.ctypes.data, 1,
-                          scratch.ctypes.data) == 0 and past(handle) == position)
-                    check(name + "_still_failed_after_rewind", call(stream, vision)[0] < 0)
-                    check(name + "_select_other", slot_select(handle, healthy) == 0)
-                    check(name + "_other_prefix_preserved", past(handle) == 1)
-                    status, output = call(slice_stream(stream, 1, len(stream[0])), vision)
-                    check(name + "_other_slot_healthy", status == 0)
-                    compare(name + "_other_slot_oracle", output, target)
-                    check(name + "_select_original", slot_select(handle, 0) == 0)
-                    reset(handle)
-                    check(name + "_reset_position", past(handle) == 0)
-                    status, output = call(stream, vision)
-                    check(name + "_reset_recovered", status == 0)
-                    compare(name + "_reset_oracle", output, target)
+            stages = ("engram", "compute", "tp-rank") if args.tp else ("engram", "compute")
+            faults = [(stage, position, "runtime_error") for stage in stages for position in (0, 3)]
+            # Checkpointing runs after every microbatch has advanced n_past.
+            # Both exception classes must be contained there too, and resetting
+            # must restore the same independent model result afterward.
+            faults += [("checkpoint", len(stream[0]), kind) for kind in ("bad_alloc", "unknown")]
+            for stage, position, kind in faults:
+                name = f"{'vision' if vision else 'text'}_{stage}_{kind}_position{position}"
+                check(name + "_prepare_other", slot_select(handle, healthy) == 0)
+                reset(handle)
+                status, _ = call(slice_stream(stream, 0, 1), vision)
+                check(name + "_other_prefix", status == 0 and past(handle) == 1)
+                check("select_failed_slot", slot_select(handle, 0) == 0)
+                reset(handle)
+                os.environ["TS_DSV41_TEST_FAIL_STAGE"] = stage
+                os.environ["TS_DSV41_TEST_FAIL_POSITION"] = str(position)
+                os.environ["TS_DSV41_TEST_FAIL_KIND"] = kind
+                status, _ = call(stream, vision)
+                check(name + "_injected_failure", status < 0,
+                      note="If this fails, ensure the native library was built with test hooks enabled")
+                check(name + "_committed_prefix", past(handle) == position)
+                os.environ.pop("TS_DSV41_TEST_FAIL_STAGE")
+                os.environ.pop("TS_DSV41_TEST_FAIL_POSITION")
+                os.environ.pop("TS_DSV41_TEST_FAIL_KIND")
+                # Both APIs must keep rejecting after the transient hook
+                # disappears; moving only the logical position cannot heal
+                # a partially written compressed/raw cache.
+                for use_visual in (False, True):
+                    status, _ = call(streams[int(use_visual)], use_visual)
+                    check(name + f"_sticky_{use_visual}", status < 0 and past(handle) == position)
+                check(name + "_rewind_rejected", rewind(handle, 0) == 0 and past(handle) == position)
+                scratch = np.empty(vocab, dtype=np.float32)
+                check(name + "_speculative_rejected", speculative(handle, text_ids.ctypes.data, 1,
+                      scratch.ctypes.data) == 0 and past(handle) == position)
+                check(name + "_still_failed_after_rewind", call(stream, vision)[0] < 0)
+                check(name + "_select_other", slot_select(handle, healthy) == 0)
+                check(name + "_other_prefix_preserved", past(handle) == 1)
+                status, output = call(slice_stream(stream, 1, len(stream[0])), vision)
+                check(name + "_other_slot_healthy", status == 0)
+                compare(name + "_other_slot_oracle", output, target)
+                check(name + "_select_original", slot_select(handle, 0) == 0)
+                reset(handle)
+                check(name + "_reset_position", past(handle) == 0)
+                status, output = call(stream, vision)
+                check(name + "_reset_recovered", status == 0)
+                compare(name + "_reset_oracle", output, target)
         # Input validation errors must not poison an otherwise healthy slot.
         reset(handle)
         bad_ids = np.array([vocab], dtype=np.int32)
@@ -180,7 +187,7 @@ def main():
         compare("validation_errors_preserve_fresh_state", output, targets[0])
         check("free_other_slot", slot_free(handle, healthy) == 0)
     finally:
-        for key in ("TS_DSV41_TEST_FAIL_STAGE", "TS_DSV41_TEST_FAIL_POSITION"):
+        for key in ("TS_DSV41_TEST_FAIL_STAGE", "TS_DSV41_TEST_FAIL_POSITION", "TS_DSV41_TEST_FAIL_KIND"):
             os.environ.pop(key, None)
         if encoder:
             vision_free(encoder)

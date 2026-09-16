@@ -155,7 +155,12 @@ namespace TensorSharp.Models
         /// the runtime cost governor in SpeculativeExecution still measures it and
         /// parks drafting if a particular prompt/context makes it a loss.
         /// </summary>
-        public bool SpeculationProfitable => true;
+        // The native constructor returns before ParseGlm5NextConfig initializes
+        // _g5n, so use the checkpoint architecture for BOTH execution backends.
+        // KDA needs a recurrent-state snapshot/restore implementation before a
+        // rejected n-gram tail can be undone. Declining the learned NextN head
+        // alone does not prevent the weight-free n-gram algorithm from arming.
+        public bool SpeculationProfitable => Config.Architecture != "glm5next";
 
         /// <summary>
         /// The verify batch writes MLA rows (and, on the trunk, indexer keys) for
@@ -164,7 +169,14 @@ namespace TensorSharp.Models
         /// the position rewound. On a long context that removes the dominant
         /// rollback cost — a whole extra trunk forward.
         /// </summary>
-        public bool SpecVerifyPersistsAcceptedKv => true;
+        public bool SpecVerifyPersistsAcceptedKv => Config.Architecture != "glm5next";
+
+        private void RequireSpeculativeCacheSupport()
+        {
+            if (Config.Architecture == "glm5next")
+                throw new NotSupportedException(
+                    "GLM-5.3-Flash speculative decoding needs KDA recurrent-state rollback, which is not implemented. Use standard decoding.");
+        }
 
         /// <summary>
         /// The trunk re-reads the routed experts once per micro-batch, so a
@@ -203,6 +215,7 @@ namespace TensorSharp.Models
         {
             if (length < 0)
                 throw new ArgumentOutOfRangeException(nameof(length));
+            RequireSpeculativeCacheSupport();
             if (UsesNativeExecutor)
             {
                 RewindNative(length);
@@ -222,6 +235,7 @@ namespace TensorSharp.Models
             ArgumentNullException.ThrowIfNull(tokens);
             if (tokens.Length == 0)
                 throw new ArgumentException("At least one token is required.", nameof(tokens));
+            RequireSpeculativeCacheSupport();
 
             if (UsesNativeExecutor)
             {

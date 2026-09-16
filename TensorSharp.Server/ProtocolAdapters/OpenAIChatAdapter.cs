@@ -215,15 +215,17 @@ public sealed partial class OpenAIChatAdapter
 
         var effectiveTools = skillPlan?.Tools ?? openaiTools;
         TensorSharp.Runtime.Grammar.DeepSeek41ToolGrammar? toolGrammar = null;
-        if (IsDeepSeek41(_svc.Architecture))
+        try
         {
-            try { toolGrammar = PrepareDeepSeek41ToolGrammar(body, openaiTools, effectiveTools, responseFormat); }
-            catch (Exception ex) when (ex is NotSupportedException or JsonException or ArgumentException)
-            {
-                ctx.Response.StatusCode = 400;
-                await ctx.Response.WriteAsJsonAsync(new { error = new { message = ex.Message, type = "invalid_request_error" } }).ConfigureAwait(false);
-                return;
-            }
+            ValidateClientToolChoice(body, openaiTools);
+            if (IsDeepSeek41(_svc.Architecture))
+                toolGrammar = PrepareDeepSeek41ToolGrammar(body, openaiTools, effectiveTools, responseFormat);
+        }
+        catch (Exception ex) when (ex is NotSupportedException or JsonException or ArgumentException)
+        {
+            ctx.Response.StatusCode = 400;
+            await ctx.Response.WriteAsJsonAsync(new { error = new { message = ex.Message, type = "invalid_request_error" } }).ConfigureAwait(false);
+            return;
         }
         var inferenceMessages = StructuredOutputPrompt.Apply(messages, responseFormat);
         if (skillPlan != null)
@@ -539,6 +541,11 @@ public sealed partial class OpenAIChatAdapter
             string piece = update.Piece;
             if (!update.Done)
             {
+                if (update.RawGenerationSuffix != null)
+                {
+                    parser?.SetGenerationPromptSuffix(update.RawGenerationSuffix);
+                    if (string.IsNullOrEmpty(piece)) continue;
+                }
                 if (update.IsParsed)
                 {
                     // Pre-separated by the skills loop (see SkillChatLoop): content,
@@ -700,6 +707,7 @@ public sealed partial class OpenAIChatAdapter
         {
             var structParser = OutputParserFactory.Create(_svc.Architecture);
             structParser.Init(openaiThink, openaiTools);
+            structParser.SetGenerationPromptSuffix(update.RawGenerationSuffix);
             var parsed = structParser.Add(rawContent, true);
             rawContent = parsed.Content ?? "";
         }

@@ -40,6 +40,9 @@ namespace TensorSharp.Models
             public Tensor[] K;
             public Tensor[] V;
             public Tensor[] IdxK;
+            public Qwen4ExpQsaArgs[] QsaArgs;
+            public int[] QsaPositions;
+            public int QsaPositionCount;
             public int KvCapacity;
             public int CacheSeqLen;
             public bool KvHostStale;
@@ -55,6 +58,7 @@ namespace TensorSharp.Models
             public List<int> PleHistory;
             public int PleNextPos;
             public int MropeCacheGap;
+            public bool SpecStateFailed;
             // Pinned descriptor arrays. Their addresses are the native graph
             // signature, so per-holder arrays select per-holder graphs.
             public Qwen4ExpAttnArgs[] AttnArgs;
@@ -112,6 +116,7 @@ namespace TensorSharp.Models
             K = _kCache,
             V = _vCache,
             IdxK = _idxKCache,
+            QsaArgs = _qsaArgs, QsaPositions = _qsaPositions, QsaPositionCount = _qsaPositionCount,
             KvCapacity = _kvCacheCapacity,
             CacheSeqLen = _cacheSeqLen,
             KvHostStale = _kvCacheHostStale,
@@ -123,6 +128,7 @@ namespace TensorSharp.Models
             PleHistory = _pleHistory,
             PleNextPos = _pleNextPos,
             MropeCacheGap = _mropeCacheGap,
+            SpecStateFailed = _specStateFailed,
             AttnArgs = _attnArgs,
             GdnArgs = _gdnArgs,
             PleArgs = _pleArgs,
@@ -134,6 +140,7 @@ namespace TensorSharp.Models
             _kCache = h.K;
             _vCache = h.V;
             _idxKCache = h.IdxK;
+            _qsaArgs = h.QsaArgs; _qsaPositions = h.QsaPositions; _qsaPositionCount = h.QsaPositionCount;
             _kvCacheCapacity = h.KvCapacity;
             _cacheSeqLen = h.CacheSeqLen;
             _kvCacheHostStale = h.KvHostStale;
@@ -145,6 +152,7 @@ namespace TensorSharp.Models
             _pleHistory = h.PleHistory;
             _pleNextPos = h.PleNextPos;
             _mropeCacheGap = h.MropeCacheGap;
+            _specStateFailed = h.SpecStateFailed;
             // Null args are lazily rebuilt by Ensure*Args from THIS holder's
             // tensors, which is what keys the native graphs per holder.
             _attnArgs = h.AttnArgs;
@@ -184,8 +192,8 @@ namespace TensorSharp.Models
                 InitializeCacheTensor(v[l]);
                 if (UsesQsa(l))
                 {
-                    idx[l] = new Tensor(_allocator, DType.Float32, 1, cap, _indexerHeadDim);
-                    InitializeCacheTensor(idx[l]);
+                    idx[l] = new Tensor(_allocator, kvDtype, 1, cap, _indexerHeadDim);
+                    InitializeQsaCache(idx[l]);
                 }
             }
 
@@ -303,6 +311,9 @@ namespace TensorSharp.Models
         private unsafe IntPtr[] HolderStateKeys(Qwen4ExpKvCacheHolder holder)
         {
             var keys = new List<IntPtr>();
+            if (holder.IdxK != null)
+                foreach (var t in holder.IdxK)
+                    if (t != null) keys.Add(TensorComputePrimitives.GetStoragePointer(t));
             if (holder.GdnConvStateT != null)
                 foreach (var t in holder.GdnConvStateT)
                     if (t != null) keys.Add((IntPtr)GetFloatPtr(t));
@@ -314,6 +325,9 @@ namespace TensorSharp.Models
         private void DisposeHolder(Qwen4ExpKvCacheHolder holder)
         {
             if (holder == null) return;
+            ReleaseMtpState(holder.GdnConvStateT);
+            if (ReferenceEquals(_specSnapshotOwner, holder.GdnConvStateT))
+                ReleaseSpecSnapshot();
 
             // Free the native device-state entries FIRST (that also drops every
             // cached graph, so nothing baked can reference the buffers below);

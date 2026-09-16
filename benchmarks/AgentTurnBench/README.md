@@ -19,13 +19,15 @@ stream is compared against plain greedy token for token.
 | `json` | grammar-constrained JSON, plain vs n-gram |
 | `conc` | N concurrent requests on one engine, then a solo request after them |
 
-`--spec-engine ngram|auto` enables speculation on every engine the bench builds
-(the way a server with the setting on runs), so the `conc` rows measure
+`--spec-engine ngram|auto` enables speculation on ordinary scenario engines.
+The explicitly labeled plain controls in `spec`, `json`, `newchat` and `image`
+always disable it, so they remain independent comparison controls. The `conc` rows measure
 concurrency WITH speculation: the planner keeps a multi-sequence step plain and
 the interesting cost is the transitions. `--conc-stagger <ms>` spaces the
 submissions of a concurrent round so later requests arrive while earlier ones
 already decode (and speculate); `--conc 1,2,4` includes a solo round as the
-reference.
+reference. Concurrent rows aggregate the actual per-request speculative counters;
+zero counters do not establish speculative engagement.
 
 ```
 dotnet build benchmarks/AgentTurnBench -c Release
@@ -46,6 +48,9 @@ it adds a diagnostic synchronization and should be disabled for throughput compa
 The run fails when any multi-token input took more prefill steps
 than `ceil(fresh / chunk) + 2`, or when a grammar-constrained answer the model
 finished is not valid JSON.
+Plain/speculative stream mismatches remain visible in the notes and require
+investigation; they do not fail this batching check. A `PASS` line alone is not
+evidence of identical speculative outputs.
 
 Compare runs made with the same model, arguments, and environment:
 
@@ -75,6 +80,23 @@ decode-rate exception only when every corresponding median token delivery and
 median `TotalMs` is no later. Every repeat must contain a complete, valid timeline;
 older results and concurrent aggregates retain the strict throughput check. Raw
 metric changes remain visible, and prefill/TTFT checks still apply.
+
+For a speculative mismatch, `--spec-diagnostic --spec-new 96 --out diagnostic.json`
+replays the same `spec` prompt through the public model and speculative trunk.
+It records the actual verify/rollback windows, full-distribution errors, and the
+top-two logit margins until the first greedy mismatch. The two mismatching logit
+rows are also saved as `.plain_logits.f32` and `.spec_logits.f32` beside the JSON.
+This diagnostic disables timing-based draft parking to make proposal windows
+repeatable; its timings and outputs do not replace the scheduler benchmark.
+
+For a longer measurement window, use `--warmup 3 --measure-passes 20` with a
+focused scenario list such as `--scenarios long,tool`. The model loads once;
+each pass repeats the same scenario and cache-reset behavior. Every measured
+pass is retained as `<out>.measureN.json`, with process CPU time, allocation
+and GC collection deltas in `<out>.series.json`. The default one-pass output
+format is unchanged. Summarize within each process before comparing independent
+process runs: passes in the same process share runtime and device state and
+must not be counted as independent process repeats.
 
 ## What it measured (2026-09-09, Apple M5 Pro, ggml_metal, chunk 1024)
 

@@ -389,10 +389,33 @@ public struct Gemma4MoELayerDecodeArgs
         public int Vocab;
     }
 
+    [StructLayout(LayoutKind.Sequential)]
+    public struct Qwen4ExpMtpConfig
+    {
+        public IntPtr Enorm, Hnorm, EhProj;
+        public long EhBytes;
+        public int EhType;
+        public int Hidden, Hc, HcLowRank;
+        public int HeadDim, Heads, KvHeads, RotaryDim;
+        public int Experts, UsedExperts, ExpertFf, SharedFf;
+        public int Capacity, Device;
+        public float Eps, RopeBase, RopeScale, AttnScale;
+        public int RopeSection0, RopeSection1, RopeSection2, RopeSection3;
+    }
+
     /// <summary>
     /// Mirrors TSGgmlQwen4ExpAttnArgs in ggml_ops_qwen4exp.cpp - the full-attention
     /// half of a qwen4exp layer. Pointers first, then int64, then int32.
     /// </summary>
+    [StructLayout(LayoutKind.Sequential)]
+    public struct Qwen4ExpQsaArgs
+    {
+        public IntPtr KProj, QProj, KNorm, QNorm, Cache;
+        public long KBytes, QBytes, CacheBytes;
+        public int KType, QType, CacheType, HeadDim, Heads, Ratio, TopK;
+        public int Section0, Section1, Section2, Section3;
+    }
+
     [StructLayout(LayoutKind.Sequential)]
     public struct Qwen4ExpAttnArgs
     {
@@ -4201,6 +4224,41 @@ internal enum GgmlIndexReductionOp
         [LibraryImport(DllName)]
         internal static unsafe partial void TSGgml_Qwen4ExpReleaseSeqState(IntPtr* keys, int n);
 
+        [LibraryImport(DllName)]
+        internal static partial int TSGgml_Qwen4ExpSpecApiVersion();
+
+        [LibraryImport(DllName)]
+        internal static partial IntPtr TSGgml_Qwen4ExpMtpCreate(ref Qwen4ExpMtpConfig config,
+            ref Qwen4ExpAttnArgs attn, ref Qwen4ExpFfnArgs ffn, ref Qwen4ExpHeadArgs head);
+        [LibraryImport(DllName)]
+        internal static partial int TSGgml_Qwen4ExpMtpForward(IntPtr handle,
+            IntPtr embedding, IntPtr previous, int count, int position, int ropePosition,
+            IntPtr mrope3, IntPtr hiddenOut, IntPtr logitsOut);
+        [LibraryImport(DllName)]
+        internal static partial void TSGgml_Qwen4ExpMtpFree(IntPtr handle);
+        [LibraryImport(DllName)]
+        internal static partial int TSGgml_Qwen4ExpMtpCopyKv(IntPtr handle, IntPtr k, IntPtr v, long bytes);
+
+        [LibraryImport(DllName)]
+        private static unsafe partial IntPtr TSGgml_Qwen4ExpStateSnapshotCreate(
+            IntPtr* keys, int* devices, int count, IntPtr attn, IntPtr gdn, IntPtr ple);
+        [LibraryImport(DllName)]
+        internal static partial int TSGgml_Qwen4ExpStateSnapshotCapture(IntPtr handle);
+        [LibraryImport(DllName)]
+        internal static partial int TSGgml_Qwen4ExpStateSnapshotRestore(IntPtr handle);
+        [LibraryImport(DllName)]
+        internal static partial void TSGgml_Qwen4ExpStateSnapshotFree(IntPtr handle);
+
+        internal static unsafe IntPtr Qwen4ExpStateSnapshotCreate(
+            IntPtr[] keys, int[] devices, IntPtr attn, IntPtr gdn, IntPtr ple)
+        {
+            if (keys == null || devices == null || keys.Length != devices.Length)
+                throw new ArgumentException("Snapshot keys and devices must have equal lengths.");
+            fixed (IntPtr* kp = keys)
+            fixed (int* dp = devices)
+                return TSGgml_Qwen4ExpStateSnapshotCreate(kp, dp, keys.Length, attn, gdn, ple);
+        }
+
         /// <summary>Re-arm the one-time seed upload for one recurrent-state entry
         /// (keyed by its host seed pointer); the next graph build re-uploads from
         /// the host copy. Used after the managed reset zeroes that copy.</summary>
@@ -4286,6 +4344,34 @@ internal enum GgmlIndexReductionOp
             IntPtr mropePos, IntPtr mropeSections, int ropePosition,
             int device);
 
+        [LibraryImport(DllName)]
+        private static partial int TSGgml_Qwen4ExpTokenSpanEx(
+            IntPtr ffn, IntPtr gdn, IntPtr attn, IntPtr kinds,
+            int layerBegin, int layerEnd, IntPtr resData, IntPtr maskData,
+            int nEmbd, int hc, int hcLowRank, int nTokens,
+            int headKDim, int headVDim, int nKHeads, int nVHeads, int dConv,
+            int headDim, int nHead, int nHeadKv, int kvCapacity, int nKv, int position,
+            int nRot, float ropeBase, float ropeFreqScale, float attnScale,
+            int nExpert, int nExpertUsed, int nFf, int nFfSh,
+            float eps, int cacheSlot, int firstFfnOnly, IntPtr head, IntPtr logitsOut,
+            IntPtr ple, int pleLayer, IntPtr pleEmb,
+            IntPtr mropePos, IntPtr mropeSections, int ropePosition, int device,
+            IntPtr hiddenOut, int logitsRows);
+
+        [LibraryImport(DllName)]
+        private static partial int TSGgml_Qwen4ExpTokenSpanQsa(
+            IntPtr ffn, IntPtr gdn, IntPtr attn, IntPtr kinds,
+            int layerBegin, int layerEnd, IntPtr resData, IntPtr maskData,
+            int nEmbd, int hc, int hcLowRank, int nTokens,
+            int headKDim, int headVDim, int nKHeads, int nVHeads, int dConv,
+            int headDim, int nHead, int nHeadKv, int kvCapacity, int nKv, int position,
+            int nRot, float ropeBase, float ropeFreqScale, float attnScale,
+            int nExpert, int nExpertUsed, int nFf, int nFfSh,
+            float eps, int cacheSlot, int firstFfnOnly, IntPtr head, IntPtr logitsOut,
+            IntPtr ple, int pleLayer, IntPtr pleEmb,
+            IntPtr mropePos, IntPtr mropeSections, int ropePosition, int device,
+            IntPtr hiddenOut, int logitsRows, IntPtr qsa, IntPtr qsaPositions, int qsaPositionCount);
+
         public static bool Qwen4ExpTokenSpan(
             IntPtr ffn, IntPtr gdn, IntPtr attn, IntPtr kinds,
             int layerBegin, int layerEnd,
@@ -4298,8 +4384,28 @@ internal enum GgmlIndexReductionOp
             float eps, int cacheSlot, bool firstFfnOnly,
             IntPtr head, IntPtr logitsOut,
             IntPtr ple, int pleLayer, IntPtr pleEmb,
-            IntPtr mropePos, IntPtr mropeSections, int ropePosition, int device)
+            IntPtr mropePos, IntPtr mropeSections, int ropePosition, int device,
+            IntPtr hiddenOut = default, int logitsRows = 1,
+            IntPtr qsa = default, IntPtr qsaPositions = default, int qsaPositionCount = 0)
         {
+            if (qsa != IntPtr.Zero)
+                return TSGgml_Qwen4ExpTokenSpanQsa(ffn, gdn, attn, kinds, layerBegin, layerEnd,
+                    resData, maskData, nEmbd, hc, hcLowRank, nTokens,
+                    headKDim, headVDim, nKHeads, nVHeads, dConv,
+                    headDim, nHead, nHeadKv, kvCapacity, nKv, position,
+                    nRot, ropeBase, ropeFreqScale, attnScale,
+                    nExpert, nExpertUsed, nFf, nFfSh, eps, cacheSlot,
+                    firstFfnOnly ? 1 : 0, head, logitsOut, ple, pleLayer, pleEmb,
+                    mropePos, mropeSections, ropePosition, device, hiddenOut, logitsRows, qsa, qsaPositions, qsaPositionCount) != 0;
+            if (hiddenOut != IntPtr.Zero || logitsRows != 1)
+                return TSGgml_Qwen4ExpTokenSpanEx(ffn, gdn, attn, kinds, layerBegin, layerEnd,
+                    resData, maskData, nEmbd, hc, hcLowRank, nTokens,
+                    headKDim, headVDim, nKHeads, nVHeads, dConv,
+                    headDim, nHead, nHeadKv, kvCapacity, nKv, position,
+                    nRot, ropeBase, ropeFreqScale, attnScale,
+                    nExpert, nExpertUsed, nFf, nFfSh, eps, cacheSlot,
+                    firstFfnOnly ? 1 : 0, head, logitsOut, ple, pleLayer, pleEmb,
+                    mropePos, mropeSections, ropePosition, device, hiddenOut, logitsRows) != 0;
             return TSGgml_Qwen4ExpTokenSpan(ffn, gdn, attn, kinds, layerBegin, layerEnd,
                 resData, maskData, nEmbd, hc, hcLowRank, nTokens,
                 headKDim, headVDim, nKHeads, nVHeads, dConv,
@@ -4309,6 +4415,11 @@ internal enum GgmlIndexReductionOp
                 firstFfnOnly ? 1 : 0, head, logitsOut, ple, pleLayer, pleEmb,
                 mropePos, mropeSections, ropePosition, device) != 0;
         }
+
+        [LibraryImport(DllName)]
+        private static partial int TSGgml_Qwen4ExpCopyQsaCache(IntPtr key, IntPtr destination, long bytes, int device);
+        public static bool Qwen4ExpCopyQsaCache(IntPtr key, IntPtr destination, long bytes, int device)
+            => TSGgml_Qwen4ExpCopyQsaCache(key, destination, bytes, device) != 0;
 
         [LibraryImport(DllName)]
         private static partial int TSGgml_Qwen4ExpResUpload(IntPtr data, long bytes);

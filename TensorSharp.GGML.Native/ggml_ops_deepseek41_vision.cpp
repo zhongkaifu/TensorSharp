@@ -4,6 +4,7 @@
 #include "ggml_ops_internal.h"
 #include "gguf.h"
 #include "ggml_ops_dsv4_fused.h"
+#include "ggml_ops_matmul_precision.h"
 
 #include <cctype>
 #include <filesystem>
@@ -58,6 +59,7 @@ std::vector<float> read_vector(std::ifstream & input, const gguf_context * file,
 struct encoder::implementation {
     metadata meta;
     ggml_backend_t backend = nullptr;
+    ggml_backend_t cuda_backend = nullptr;
     ggml_context * weights_ctx = nullptr;
     ggml_backend_buffer_t weights_buffer = nullptr;
     std::map<std::string, ggml_tensor *> weights;
@@ -83,6 +85,7 @@ struct encoder::implementation {
         if (weights_buffer) ggml_backend_buffer_free(weights_buffer);
         if (weights_ctx) ggml_free(weights_ctx);
         if (backend) ggml_backend_free(backend);
+        if (cuda_backend) ggml_backend_free(cuda_backend);
     }
 
     ggml_tensor * weight(const std::string & name, int64_t ne0, int64_t ne1 = 1) {
@@ -121,6 +124,18 @@ struct encoder::implementation {
     ggml_tensor * f32(ggml_context * ctx, ggml_tensor * value) const {
         return value->type == GGML_TYPE_F32 ? value : ggml_cast(ctx, value, GGML_TYPE_F32);
     }
+    void precise(ggml_context * ctx, ggml_tensor * value) const {
+        const bool cpu_needs_conversion = ggml_backend_is_cpu(backend) &&
+            (value->src[0]->type != GGML_TYPE_F32 || value->src[1]->type != GGML_TYPE_F32);
+        if (cuda_backend || cpu_needs_conversion) tsg_matmul_require_f32(ctx, value);
+        else {
+            // CPU F32/F32 keeps its native batching/reduction order. Other
+            // GPU backends retain their existing public precision contract;
+            // direct execution has no CPU scheduler for their custom nodes.
+            ggml_prec_set_acc(value, GGML_PREC_F32);
+            ggml_prec_set_src(value, GGML_PREC_F32, 1);
+        }
+    }
     ggml_tensor * linear(ggml_context * ctx, ggml_tensor * value, const std::string & prefix,
                          int input, int output, bool bias) {
         auto * matrix = weight(prefix + ".weight", input, output);
@@ -131,14 +146,14 @@ struct encoder::implementation {
         // path so bias is added before the single BF16 rounding, without an
         // unnecessary conversion of both inputs to F32/TF32 GEMM. Other
         // backends retain explicit F32 until their output precision is tested.
-        native_bf16_gemm = tsg_dsv4_cuda_supports_native_bf16(backend);
+        native_bf16_gemm = tsg_dsv4_cuda_supports_native_bf16(cuda_backend ? cuda_backend : backend);
 #endif
         if (const char * setting = std::getenv("TS_DSV41_VISION_BF16_GEMM"))
             native_bf16_gemm = native_bf16_gemm && std::atoi(setting) != 0;
         if (matrix->type != GGML_TYPE_BF16 || !native_bf16_gemm)
             ggml_prec_set_acc(result, GGML_PREC_F32);
         // Synthetic F32 fixtures also protect against TF32 source truncation.
-        if (matrix->type == GGML_TYPE_F32) ggml_prec_set_src(result, GGML_PREC_F32, 1);
+        if (matrix->type == GGML_TYPE_F32) precise(ctx, result);
         if (bias) result = ggml_add(ctx, result, f32(ctx, weight(prefix + ".bias", output)));
         return round(ctx, result);
     }
@@ -210,13 +225,11 @@ struct encoder::implementation {
             }
             if (!attention) {
                 auto * scores = ggml_mul_mat(ctx, k, q);
-                ggml_prec_set_acc(scores, GGML_PREC_F32);
-                ggml_prec_set_src(scores, GGML_PREC_F32, 1);
+                precise(ctx, scores);
                 scores = ggml_soft_max_ext(ctx, scores, nullptr, 1.0f / std::sqrt(float(head)), 0.0f);
                 auto * vt = ggml_cont(ctx, ggml_transpose(ctx, v));
                 auto * out = ggml_mul_mat(ctx, vt, scores);
-                ggml_prec_set_acc(out, GGML_PREC_F32);
-                ggml_prec_set_src(out, GGML_PREC_F32, 1);
+                precise(ctx, out);
                 attention = ggml_cont_2d(ctx, ggml_permute(ctx, out, 0, 2, 1, 3), dim, n);
             }
             attention = round(ctx, attention);
@@ -333,6 +346,12 @@ std::shared_ptr<encoder> encoder::load(const std::string & path, const std::stri
         }
     }
     require(state.backend != nullptr, "requested backend device is unavailable");
+#if defined(TSG_GGML_USE_CUDA)
+    if (auto * wrapped = tsg_dsv4_fused_backend_init(state.backend)) {
+        state.cuda_backend = state.backend;
+        state.backend = wrapped;
+    }
+#endif
     state.weights_ctx = ggml_init({size_t(gguf_get_n_tensors(file) + 1) * ggml_tensor_overhead() + 4096, nullptr, true});
     require(state.weights_ctx != nullptr, "cannot allocate weight metadata");
     for (int64_t i = 0; i < gguf_get_n_tensors(file); ++i) {

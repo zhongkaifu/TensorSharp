@@ -150,6 +150,7 @@ if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
         set(CMAKE_CUDA_ARCHITECTURES "native" CACHE STRING "" FORCE)
     endif()
     enable_language(CUDA)
+    find_package(CUDAToolkit REQUIRED)
     set(CMAKE_CUDA_STANDARD 17)
     set(CMAKE_CUDA_STANDARD_REQUIRED ON)
     set(GGML_CUDA ON CACHE BOOL "" FORCE)
@@ -204,9 +205,8 @@ endif()
 # inner binary dir exceeds ~137 characters ("CL.exe could not be run:
 # DirectoryNotFoundException ... cmTC_*.tlog"). Every character saved here buys
 # headroom for repos cloned into deeper paths.
-if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
-    include("${CMAKE_CURRENT_SOURCE_DIR}/../eng/ggml-patches/apply.cmake")
-endif()
+# Consume upstream sources unchanged. Architecture-specific kernels and
+# precision requirements belong to TensorSharp's own native implementation.
 add_subdirectory("${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml" g)
 
 # Eight CUDA devices each have a companion backend for architecture-specific
@@ -250,7 +250,10 @@ endif()
 set(TSG_GGMLOPS_SOURCES
     ggml_ops_core.cpp
     ggml_ops_attention_alloc.cpp
+    ggml_ops_attention_precision.cpp
     ggml_ops_matmul.cpp
+    ggml_ops_matmul_precision.cpp
+    ggml_ops_q8_precision.cpp
     ggml_ops_elementwise.cpp
     ggml_ops_norm_attn.cpp
     ggml_ops_training.cpp
@@ -263,6 +266,7 @@ set(TSG_GGMLOPS_SOURCES
     ggml_ops_gptoss_batched.cpp
     ggml_ops_qwen35_batched_arena.cpp
     ggml_ops_qwen4exp.cpp
+    ggml_ops_qwen4exp_mtp.cpp
     ggml_ops_qwen4exp_arena.cpp
     ggml_ops_gptoss_prefill.cpp
     ggml_ops_qwen35_decode.cpp
@@ -304,6 +308,9 @@ if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
     list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_diffusion_sample.cu)
     list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_mask.cu)
     list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_dsv4_fused.cu)
+    list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_matmul_precision.cu)
+    list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_attention_precision.cu)
+    list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_q8_precision.cu)
     list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_tp_probe.cu)
     list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_host_pin.cu)
     # Wan / Qwen-Image VAE convolutions on cuDNN (see tsg_cuda_cudnn_conv.cu).
@@ -379,6 +386,7 @@ endif()
 
 if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
     target_compile_definitions(GgmlOps PRIVATE TSG_GGML_USE_CUDA=1)
+    target_link_libraries(GgmlOps PRIVATE CUDA::cublas)
     if (TSG_HAVE_CUDNN)
         target_include_directories(GgmlOps PRIVATE ${TSG_CUDNN_INCLUDE_DIR})
         # Deliberately NOT linked -- resolved with LoadLibrary/dlopen at run time.
@@ -390,7 +398,17 @@ if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
     endif()
     # Fast intrinsic transcendentals (tanhf/expf) for the diffusion sampler kernel — the accurate
     # library tanhf is ~100x slower on-device and the sampler only needs FP-reduction-level accuracy.
-    target_compile_options(GgmlOps PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math>)
+    # Scope fast math to the existing kernels: precision attention needs the
+    # normal expf implementation as well as F32 subnormals and IEEE division.
+    foreach(TSG_CUDA_SOURCE IN LISTS TSG_GGMLOPS_SOURCES)
+        if (TSG_CUDA_SOURCE MATCHES "\\.cu$" AND
+            NOT TSG_CUDA_SOURCE MATCHES "ggml_ops_(matmul|attention|q8)_precision\\.cu$")
+            set_property(SOURCE ${TSG_CUDA_SOURCE} APPEND PROPERTY COMPILE_OPTIONS --use_fast_math)
+        endif()
+    endforeach()
+    set_source_files_properties(ggml_ops_matmul_precision.cu ggml_ops_attention_precision.cu
+        ggml_ops_q8_precision.cu PROPERTIES
+        COMPILE_OPTIONS "--ftz=false;--prec-div=true;--prec-sqrt=true")
 endif()
 target_include_directories(GgmlOps PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/include"
@@ -415,6 +433,14 @@ set_target_properties(GgmlOps PROPERTIES
 )
 
 if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
+    set_property(SOURCE ggml_ops_qwen4exp.cpp APPEND PROPERTY COMPILE_DEFINITIONS TSG_GGML_TEST_HOOKS)
+    add_executable(GgmlOpsQwen4ExpQsaPlanTest tests/qwen4exp_qsa_plan_test.cpp)
+    target_include_directories(GgmlOpsQwen4ExpQsaPlanTest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    if (MSVC)
+        target_compile_options(GgmlOpsQwen4ExpQsaPlanTest PRIVATE /O2 /EHsc)
+    endif()
+    add_test(NAME qwen4exp-qsa-position-plan COMMAND GgmlOpsQwen4ExpQsaPlanTest)
+    set_tests_properties(qwen4exp-qsa-position-plan PROPERTIES TIMEOUT 30)
     set_property(SOURCE ggml_ops_deepseek4.cpp APPEND PROPERTY COMPILE_DEFINITIONS TSG_GGML_TEST_HOOKS)
     set_property(SOURCE ggml_ops_deepseek41_tp.cpp APPEND PROPERTY COMPILE_DEFINITIONS TSG_GGML_TEST_HOOKS)
     enable_testing()
@@ -428,7 +454,14 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
         target_link_libraries(GgmlOpsDsv41EngramIoBench PRIVATE Threads::Threads)
         # Run explicitly with a scratch directory on the filesystem being measured.
     endif()
-    add_executable(GgmlOpsDsv41TpTest tests/dsv41_tp_test.cpp ggml_ops_deepseek41_tp.cpp)
+    add_executable(GgmlOpsDsv41WorkersTest tests/dsv41_workers_test.cpp)
+    target_include_directories(GgmlOpsDsv41WorkersTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    target_link_libraries(GgmlOpsDsv41WorkersTest PRIVATE Threads::Threads)
+    add_test(NAME deepseek41-tp-worker-lifetime COMMAND GgmlOpsDsv41WorkersTest)
+    set_tests_properties(deepseek41-tp-worker-lifetime PROPERTIES TIMEOUT 30)
+
+    add_executable(GgmlOpsDsv41TpTest tests/dsv41_tp_test.cpp ggml_ops_deepseek41_tp.cpp
+        ggml_ops_matmul_precision.cpp)
     target_compile_definitions(GgmlOpsDsv41TpTest PRIVATE TSG_GGML_TEST_HOOKS)
     target_include_directories(GgmlOpsDsv41TpTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
     target_link_libraries(GgmlOpsDsv41TpTest PRIVATE ggml-cpu ggml-base Threads::Threads)
@@ -436,10 +469,14 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
     add_test(NAME deepseek41-tp-failure-recovery COMMAND GgmlOpsDsv41TpTest --failure-only)
     if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA AND NOT WIN32)
         target_compile_definitions(GgmlOpsDsv41TpTest PRIVATE TSG_GGML_USE_CUDA=1)
-        target_link_libraries(GgmlOpsDsv41TpTest PRIVATE ggml-cuda)
+        target_sources(GgmlOpsDsv41TpTest PRIVATE ggml_ops_dsv4_fused.cu ggml_ops_matmul_precision.cu
+            ggml_ops_attention_precision.cu ggml_ops_q8_precision.cu)
+        target_include_directories(GgmlOpsDsv41TpTest PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/src")
+        target_link_libraries(GgmlOpsDsv41TpTest PRIVATE ggml-cuda CUDA::cublas)
         # Multi-device tests are explicit: a one-GPU CI lane must not claim
         # that its skipped multi-device checks established tensor parallelism.
-        foreach(TP_RANKS 2 4 8)
+        foreach(TP_RANKS 2 4 7 8)
             add_test(NAME deepseek41-moe-tensor-parallel-cuda-${TP_RANKS}
                      COMMAND GgmlOpsDsv41TpTest --cuda ${TP_RANKS})
             set_tests_properties(deepseek41-moe-tensor-parallel-cuda-${TP_RANKS}
@@ -452,6 +489,20 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
     target_link_libraries(GgmlOpsSchedulerCapacityTest PRIVATE ggml-cpu ggml-base)
     add_test(NAME scheduler-seventeen-backends COMMAND GgmlOpsSchedulerCapacityTest)
 
+    add_executable(GgmlOpsSchedulerAllocTest tests/scheduler_alloc_test.cpp)
+    target_include_directories(GgmlOpsSchedulerAllocTest PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/src")
+    target_link_libraries(GgmlOpsSchedulerAllocTest PRIVATE ggml-cpu ggml-base)
+    add_test(NAME scheduler-allocation-failure-recovery COMMAND GgmlOpsSchedulerAllocTest)
+    if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
+        add_executable(GgmlOpsCudaSchedulerAllocTest tests/cuda_scheduler_alloc_test.cpp)
+        target_include_directories(GgmlOpsCudaSchedulerAllocTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+        target_link_libraries(GgmlOpsCudaSchedulerAllocTest PRIVATE ggml-cuda ggml-cpu ggml-base CUDA::cudart)
+        add_test(NAME cuda-scheduler-allocation-failure-recovery COMMAND GgmlOpsCudaSchedulerAllocTest)
+        set_tests_properties(cuda-scheduler-allocation-failure-recovery
+            PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 120)
+    endif()
+
     add_executable(GgmlOpsDsv41RawGatherTest
         tests/dsv41_raw_gather_test.cpp ggml_ops_dsv4_fused_cpu.cpp)
     target_include_directories(GgmlOpsDsv41RawGatherTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
@@ -461,6 +512,12 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
     add_executable(GgmlOpsDsv41TruncateTest tests/dsv41_truncate_test.cpp)
     target_include_directories(GgmlOpsDsv41TruncateTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
     add_test(NAME deepseek41-truncate-guards COMMAND GgmlOpsDsv41TruncateTest)
+    add_executable(GgmlOpsDsv41DsparkRingTest tests/dsv41_dspark_ring_test.cpp)
+    target_include_directories(GgmlOpsDsv41DsparkRingTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME deepseek41-dspark-ring-guards COMMAND GgmlOpsDsv41DsparkRingTest)
+    add_executable(GgmlOpsDsv41RetentionTest tests/dsv41_retention_test.cpp)
+    target_include_directories(GgmlOpsDsv41RetentionTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME deepseek41-retention-budget COMMAND GgmlOpsDsv41RetentionTest)
 
     add_executable(GgmlOpsDsv41QuantTest
         tests/dsv41_quant_test.cpp ggml_ops_dsv4_fused_cpu.cpp)
@@ -474,10 +531,6 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
         target_link_libraries(GgmlOpsDsv41SparseFaTest PRIVATE ggml-cuda ggml-base Threads::Threads)
         add_test(NAME deepseek41-sparse-flash-attention-cuda COMMAND GgmlOpsDsv41SparseFaTest)
         set_tests_properties(deepseek41-sparse-flash-attention-cuda PROPERTIES SKIP_RETURN_CODE 77)
-        add_executable(GgmlOpsCudaMatmulPrecisionTest tests/cuda_matmul_precision_test.cpp)
-        target_link_libraries(GgmlOpsCudaMatmulPrecisionTest PRIVATE ggml-cuda ggml-base)
-        add_test(NAME cuda-explicit-f32-matmul COMMAND GgmlOpsCudaMatmulPrecisionTest)
-        set_tests_properties(cuda-explicit-f32-matmul PROPERTIES SKIP_RETURN_CODE 77)
         add_executable(GgmlOpsDsv41QuantCudaTest tests/dsv41_quant_test.cpp)
         target_compile_definitions(GgmlOpsDsv41QuantCudaTest PRIVATE TSG_GGML_USE_CUDA=1)
         target_include_directories(GgmlOpsDsv41QuantCudaTest PRIVATE
@@ -494,6 +547,77 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
             "${CMAKE_CURRENT_SOURCE_DIR}"
             "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/include")
         target_link_libraries(GgmlOpsDsv41CompactGatherBench PRIVATE GgmlOps ggml-cuda ggml-cpu)
+    endif()
+
+    # Compile the owned implementation into each precision test so Windows
+    # exercises the same code without depending on DLL re-export details.
+    add_executable(GgmlOpsMatmulPrecisionCpuTest tests/cuda_matmul_precision_test.cpp
+        ggml_ops_matmul_precision.cpp)
+    target_include_directories(GgmlOpsMatmulPrecisionCpuTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    target_link_libraries(GgmlOpsMatmulPrecisionCpuTest PRIVATE ggml-cpu ggml-base)
+    add_test(NAME cpu-explicit-f32-matmul COMMAND GgmlOpsMatmulPrecisionCpuTest)
+    add_executable(GgmlOpsAttentionPrecisionCpuTest tests/attention_precision_test.cpp
+        ggml_ops_attention_precision.cpp ggml_ops_matmul_precision.cpp)
+    target_include_directories(GgmlOpsAttentionPrecisionCpuTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    target_link_libraries(GgmlOpsAttentionPrecisionCpuTest PRIVATE ggml-cpu ggml-base)
+    add_test(NAME cpu-explicit-f32-attention COMMAND GgmlOpsAttentionPrecisionCpuTest)
+    add_executable(GgmlOpsAttentionExceptionBoundaryTest tests/attention_exception_boundary_test.cpp
+        ggml_ops_attention_precision.cpp ggml_ops_matmul_precision.cpp)
+    target_include_directories(GgmlOpsAttentionExceptionBoundaryTest PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/include"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/src")
+    target_link_libraries(GgmlOpsAttentionExceptionBoundaryTest PRIVATE ggml-cpu ggml-base)
+    if (MSVC)
+        target_compile_options(GgmlOpsAttentionExceptionBoundaryTest PRIVATE /O2 /EHsc)
+    endif()
+    add_test(NAME attention-exception-boundary COMMAND GgmlOpsAttentionExceptionBoundaryTest)
+    set_tests_properties(attention-exception-boundary PROPERTIES TIMEOUT 30)
+    add_executable(GgmlOpsQ8PrecisionCpuTest tests/q8_precision_test.cpp ggml_ops_q8_precision.cpp)
+    target_include_directories(GgmlOpsQ8PrecisionCpuTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    target_link_libraries(GgmlOpsQ8PrecisionCpuTest PRIVATE ggml-cpu ggml-base)
+    add_test(NAME cpu-q8-f32-projection COMMAND GgmlOpsQ8PrecisionCpuTest)
+    if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
+        add_executable(GgmlOpsCudaMatmulPrecisionTest tests/cuda_matmul_precision_test.cpp
+            ggml_ops_matmul_precision.cpp ggml_ops_matmul_precision.cu ggml_ops_dsv4_fused.cu
+            ggml_ops_attention_precision.cu ggml_ops_q8_precision.cu)
+        target_compile_definitions(GgmlOpsCudaMatmulPrecisionTest PRIVATE TSG_GGML_USE_CUDA=1)
+        target_include_directories(GgmlOpsCudaMatmulPrecisionTest PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/src")
+        target_link_libraries(GgmlOpsCudaMatmulPrecisionTest PRIVATE ggml-cuda ggml-cpu ggml-base CUDA::cublas)
+        add_test(NAME cuda-explicit-f32-matmul COMMAND GgmlOpsCudaMatmulPrecisionTest)
+        set_tests_properties(cuda-explicit-f32-matmul PROPERTIES SKIP_RETURN_CODE 77)
+        add_executable(GgmlOpsCudaAttentionPrecisionTest tests/attention_precision_test.cpp
+            ggml_ops_attention_precision.cpp ggml_ops_attention_precision.cu
+            ggml_ops_matmul_precision.cpp ggml_ops_matmul_precision.cu ggml_ops_dsv4_fused.cu
+            ggml_ops_q8_precision.cu)
+        target_compile_definitions(GgmlOpsCudaAttentionPrecisionTest PRIVATE TSG_GGML_USE_CUDA=1)
+        target_include_directories(GgmlOpsCudaAttentionPrecisionTest PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/src")
+        target_link_libraries(GgmlOpsCudaAttentionPrecisionTest PRIVATE ggml-cuda ggml-cpu ggml-base CUDA::cublas)
+        add_test(NAME cuda-explicit-f32-attention COMMAND GgmlOpsCudaAttentionPrecisionTest)
+        set_tests_properties(cuda-explicit-f32-attention PROPERTIES SKIP_RETURN_CODE 77)
+        add_executable(GgmlOpsCudaQ8PrecisionTest tests/q8_precision_test.cpp
+            ggml_ops_q8_precision.cpp ggml_ops_q8_precision.cu ggml_ops_matmul_precision.cu
+            ggml_ops_attention_precision.cu ggml_ops_dsv4_fused.cu)
+        target_compile_definitions(GgmlOpsCudaQ8PrecisionTest PRIVATE TSG_GGML_USE_CUDA=1)
+        target_include_directories(GgmlOpsCudaQ8PrecisionTest PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/src")
+        target_link_libraries(GgmlOpsCudaQ8PrecisionTest PRIVATE ggml-cuda ggml-cpu ggml-base CUDA::cublas)
+        add_test(NAME cuda-q8-f32-projection COMMAND GgmlOpsCudaQ8PrecisionTest)
+        set_tests_properties(cuda-q8-f32-projection PROPERTIES SKIP_RETURN_CODE 77)
+        # Explicit performance control: includes transient conversion costs,
+        # independent sampled numerical checks and a scratch-reuse guard.
+        # Never register benchmarks in the automatic correctness CTest lane.
+        add_executable(GgmlOpsQ8ProjectionBench tests/q8_projection_bench.cpp
+            ggml_ops_q8_precision.cpp ggml_ops_q8_precision.cu
+            ggml_ops_matmul_precision.cpp ggml_ops_matmul_precision.cu
+            ggml_ops_attention_precision.cu ggml_ops_dsv4_fused.cu)
+        target_compile_definitions(GgmlOpsQ8ProjectionBench PRIVATE TSG_GGML_USE_CUDA=1)
+        target_include_directories(GgmlOpsQ8ProjectionBench PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/src")
+        target_link_libraries(GgmlOpsQ8ProjectionBench PRIVATE ggml-cuda ggml-cpu ggml-base CUDA::cublas)
+
     endif()
 
     add_executable(GgmlOpsAttentionAllocTest

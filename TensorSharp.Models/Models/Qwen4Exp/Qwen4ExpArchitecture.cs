@@ -17,7 +17,7 @@ namespace TensorSharp.Models
             Id = Qwen4ExpModel.ArchitectureId,
             DisplayName = "Qwen3.8-Flash-Next",
             Aliases = new[] { Qwen4ExpModel.ArchitectureId },
-            Factory = c => new Qwen4ExpModel(c.GgufPath, c.Backend, c.TpDegree, c.TpGroup, c.LayerSplitDegree),
+            Factory = c => new Qwen4ExpModel(c.GgufPath, c.Backend, c.TpDegree, c.TpGroup, c.LayerSplitDegree, c.DraftModelPath),
             ProjectorFileHints = new[] { "*mmproj*.gguf" },
 
             // Not tensor-parallel: none of its weights are sharded, and its decode is one

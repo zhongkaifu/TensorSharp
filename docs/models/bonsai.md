@@ -22,19 +22,24 @@ GatedDeltaNet recurrent layers.
 
 ## Exact local artifacts
 
-These are sideload artifacts, not download recommendations. Their GGUF metadata
-contains neither a publisher/source repository URL nor a license. TensorSharp
-therefore pins the exact local bytes and does not invent either value; verify
-that you have the right to use a file before importing it.
+Their GGUF metadata contains neither a publisher/source repository URL nor a
+license. On 2026-09-16, the publisher's Hugging Face file records were verified
+to match both exact hashes below: [Bonsai 8B](https://huggingface.co/prism-ml/Bonsai-8B-gguf/blob/48516770dd04643643e9f9019a2a349cf26c5dbd/Bonsai-8B-Q1_0.gguf)
+and [Bonsai 27B](https://huggingface.co/prism-ml/Bonsai-27B-gguf/blob/f10afb355f104535e3e3e98cf7ab7795c72bd292/Bonsai-27B-Q1_0.gguf).
+Both publisher cards declare Apache-2.0. This provenance comes from the publisher
+records; it does not change the embedded GGUF metadata or qualify a new runtime.
 
 | File | Exact bytes | SHA-256 | Tensor mix |
 |---|---:|---|---|
 | `Bonsai-8B-Q1_0.gguf` | 1,158,654,496 | `284a335aa3fb2ced3b1b01fcb40b08aa783e3b70832767f0dd2e3fdfa134bd54` | 254 Q1_0 + 145 F32 tensors |
 | `Bonsai-27B-Q1_0.gguf` | 3,803,452,480 | `17ef842e47450caeb8eaa3ebfbbab5d2f2278b62b79be107985fb69a2f819aa0` | 498 Q1_0 + 353 F32 tensors |
 
-Verify a copy before use:
+Download the pinned files and verify them before use:
 
 ```bash
+hf download prism-ml/Bonsai-8B-gguf Bonsai-8B-Q1_0.gguf --revision 48516770dd04643643e9f9019a2a349cf26c5dbd --local-dir ./bonsai
+hf download prism-ml/Bonsai-27B-gguf Bonsai-27B-Q1_0.gguf --revision f10afb355f104535e3e3e98cf7ab7795c72bd292 --local-dir ./bonsai
+cd bonsai
 shasum -a 256 Bonsai-8B-Q1_0.gguf Bonsai-27B-Q1_0.gguf
 ```
 

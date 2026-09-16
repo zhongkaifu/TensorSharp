@@ -45,9 +45,8 @@ namespace TensorSharp.Models
     /// The MoE is conventional apart from its size: 512 experts, top 10, plus a gated
     /// shared expert.
     ///
-    /// This is the correctness-first managed path. Text only: the vision tower and
-    /// MTP block are not wired up yet, and IMRoPE degenerates to NEOX RoPE when every
-    /// position component is equal, which is the case for text.
+    /// The GGML token span carries recurrent state, QSA and multi-axis rotary
+    /// positions. A separate shared-weight MTP executor uses the target streams.
     /// </summary>
     public partial class Qwen4ExpModel : ModelBase
     {
@@ -96,35 +95,46 @@ namespace TensorSharp.Models
         private float _attnScale;
 
         public Qwen4ExpModel(string ggufPath, BackendType backend, int tpDegree = 1,
-            ITensorParallelGroup tpGroup = null, int layerSplitDegree = 1)
+            ITensorParallelGroup tpGroup = null, int layerSplitDegree = 1, string draftGgufPath = null)
             : base(ggufPath, backend, tpDegree, tpGroup, layerSplitDegree)
         {
             Config = new ModelConfig { Architecture = ArchitectureId };
             ParseBaseConfig();
             ParseQwen4ExpConfig();
             ParseTokenizer();
+            try
+            {
+                if (!string.IsNullOrWhiteSpace(draftGgufPath))
+                    LoadMtpDraftWeights(draftGgufPath);
 
-            Console.WriteLine($"Model: {ArchitectureId}, Layers={Config.NumLayers}, Hidden={Config.HiddenSize}, " +
-                $"Heads={Config.NumHeads}, KVHeads={Config.NumKVHeads}, HeadDim={Config.HeadDim}, Vocab={Config.VocabSize}");
-            Console.WriteLine($"  hyper-connections: count={_hc} lowRank={_hcLowRank} (residual is {_hcDim} wide)");
-            Console.WriteLine($"  experts={_numExperts} used={_numExpertsUsed} ff={_expertFf} sharedFf={_sharedFf}");
-            Console.WriteLine($"  GDN layers={CountTrue(_isRecurrent)}/{Config.NumLayers}, " +
-                $"QSA indexer heads={_indexerHeads} dim={_indexerHeadDim} topK={_indexerTopK}");
-            if (_pleHeads > 0)
-                Console.WriteLine($"  PLE: layers=[{string.Join(",", PleLayerList())}] ngram={_pleNgram} " +
-                    $"heads={_pleHeads} headDim={_pleHeadDim}");
+                Console.WriteLine($"Model: {ArchitectureId}, Layers={Config.NumLayers}, Hidden={Config.HiddenSize}, " +
+                    $"Heads={Config.NumHeads}, KVHeads={Config.NumKVHeads}, HeadDim={Config.HeadDim}, Vocab={Config.VocabSize}");
+                Console.WriteLine($"  hyper-connections: count={_hc} lowRank={_hcLowRank} (residual is {_hcDim} wide)");
+                Console.WriteLine($"  experts={_numExperts} used={_numExpertsUsed} ff={_expertFf} sharedFf={_sharedFf}");
+                Console.WriteLine($"  GDN layers={CountTrue(_isRecurrent)}/{Config.NumLayers}, " +
+                    $"QSA indexer heads={_indexerHeads} dim={_indexerHeadDim} topK={_indexerTopK}");
+                if (_pleHeads > 0)
+                    Console.WriteLine($"  PLE: layers=[{string.Join(",", PleLayerList())}] ngram={_pleNgram} " +
+                        $"heads={_pleHeads} headDim={_pleHeadDim}");
 
-            LoadWeights();
-            VerifyQwen4ExpTensors();
-            // The layer -> GPU map has to exist BEFORE the preload: that is what
-            // decides which device each weight is uploaded to, and the preload frees
-            // the host copy immediately afterwards so there is no second chance.
-            BuildLayerDeviceMap();
-            PrepareCudaQuantizedWeightsForInference();
+                LoadWeights();
+                VerifyQwen4ExpTensors();
+                // The layer -> GPU map has to exist BEFORE the preload: that is what
+                // decides which device each weight is uploaded to, and the preload frees
+                // the host copy immediately afterwards so there is no second chance.
+                BuildLayerDeviceMap();
+                PrepareCudaQuantizedWeightsForInference();
 
-            int maxContextLength = ResolveConfiguredContextLength();
-            int initialCacheLength = ResolveInitialCacheAllocationLength(maxContextLength);
-            InitCaches(initialCacheLength, maxContextLength);
+                int maxContextLength = ResolveConfiguredContextLength();
+                int initialCacheLength = ResolveInitialCacheAllocationLength(maxContextLength);
+                InitCaches(initialCacheLength, maxContextLength);
+                FinalizeMtpHead();
+            }
+            catch
+            {
+                DisposeMtpHead();
+                throw;
+            }
         }
 
         // ---- layer split ------------------------------------------------------
@@ -157,7 +167,7 @@ namespace TensorSharp.Models
 
             long[] layerBytes = new long[n];
             long sharedBytes = 0;   // rides on device 0 (embedding, PLE gather source, vision)
-            long headBytes = 0;     // rides on the LAST device (final mixer + LM head)
+            long headBytes = _mtpResidentBytes; // final mixer + LM head + optional shared MTP
             foreach (var kv in _quantWeights)
             {
                 // Only weights that actually take VRAM count. per_layer_token_embd is

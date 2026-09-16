@@ -1625,8 +1625,8 @@ namespace TensorSharp.Cli
 
                 string rawOutput = sb.ToString();
 
-                var parser = OutputParserFactory.Create(arch);
-                parser.Init(enableThinking, null);
+                var parser = CliOutputParser.Create(arch, enableThinking, null,
+                    model.Tokenizer, inputTokens);
                 var parsed = parser.Add(rawOutput, true);
                 string content = parsed.Content ?? "";
                 string thinking = parsed.Thinking ?? "";
@@ -2579,8 +2579,8 @@ namespace TensorSharp.Cli
                     cfg.PresencePenalty, cfg.FrequencyPenalty, cfg.Seed);
             }
 
-            var parser = OutputParserFactory.Create(model.Config.Architecture);
-            parser.Init(enableThinking, tools);
+            var parser = CliOutputParser.Create(model.Config.Architecture, enableThinking, tools,
+                model.Tokenizer, inputTokens);
             bool useParser = enableThinking || (tools != null && tools.Count > 0) || parser.AlwaysRequired;
             bool showThinking = enableThinking || parser.AlwaysRequired;
             if (useParser)
@@ -2774,8 +2774,8 @@ namespace TensorSharp.Cli
             SamplingConfig sampling, bool enableThinking, List<ToolFunction> tools, bool silent,
             Action<ParsedOutput> onParsed = null)
         {
-            var parser = OutputParserFactory.Create(model.Config.Architecture);
-            parser.Init(enableThinking, tools);
+            var parser = CliOutputParser.Create(model.Config.Architecture, enableThinking, tools,
+                model.Tokenizer, inputTokens);
             bool useParser = enableThinking || (tools != null && tools.Count > 0) || parser.AlwaysRequired;
             bool showThinking = enableThinking || parser.AlwaysRequired;
 
@@ -3556,8 +3556,8 @@ namespace TensorSharp.Cli
                     turn + 1, inputTokens.Count, prefillMs[turn], generatedTokens.Count, appliedPlan);
 
                 // Append the assistant turn so subsequent renders include it.
-                var parser = OutputParserFactory.Create(arch);
-                parser.Init(enableThinking, null);
+                var parser = CliOutputParser.Create(arch, enableThinking, null,
+                    model.Tokenizer, inputTokens);
                 var parsed = parser.Add(sb.ToString(), true);
                 history.Add(new ChatMessage
                 {

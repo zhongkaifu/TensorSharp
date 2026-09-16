@@ -286,7 +286,7 @@ namespace TensorSharp.AgentHost.Skills
                         // choice on the chat path.
                         SkillTools.DescribeUnknownTool(
                             unknownCall.Name, tools, ReachableSkillIds(context)),
-                        unknownCall.Name));
+                        unknownCall.Name, unknownCall.Id));
                 }
 
                 int executed = 0;
@@ -299,8 +299,8 @@ namespace TensorSharp.AgentHost.Skills
                         working.Add(BuildResultMessage(options,
                             $"Error: too many tool calls in one turn; only the first "
                             + $"{options.MaxCallsPerRound.ToString(CultureInfo.InvariantCulture)} were answered. "
-                            + "Ask for one file at a time."));
-                        break;
+                            + "Ask for one file at a time.", call.Name, call.Id));
+                        continue;
                     }
 
                     SkillToolResult result = SkillTools.Execute(call, context);
@@ -313,7 +313,7 @@ namespace TensorSharp.AgentHost.Skills
                     invocations.Add(invocation);
                     options.OnInvocation?.Invoke(invocation);
 
-                    working.Add(BuildResultMessage(options, result.Content ?? string.Empty, call.Name));
+                    working.Add(BuildResultMessage(options, result.Content ?? string.Empty, call.Name, call.Id));
                 }
 
                 // A caller tool was requested alongside the skill work. Only the client
@@ -406,10 +406,14 @@ namespace TensorSharp.AgentHost.Skills
         /// working on that family and appearing to work while doing nothing.
         /// </para>
         /// </summary>
-        private static ChatMessage BuildResultMessage(SkillAgentLoopOptions options, string content, string? tool = null)
+        private static ChatMessage BuildResultMessage(SkillAgentLoopOptions options, string content, string? tool = null, string? toolCallId = null)
         {
+            // Round-limit guidance is not a result for any outstanding call. A
+            // standalone tool message would be invalid on an OpenAI transport.
+            if (tool == null && toolCallId == null)
+                return new ChatMessage { Role = "user", Content = content };
             if (options.ToolResultsAreRendered)
-                return new ChatMessage { Role = "tool", Content = content };
+                return new ChatMessage { Role = "tool", Content = content, ToolCallId = toolCallId };
 
             string prefix = tool == null
                 ? "Result of the skill lookup you requested:"

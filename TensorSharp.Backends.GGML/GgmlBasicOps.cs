@@ -3133,7 +3133,8 @@ namespace TensorSharp.GGML
             int ropePosition = -1,
             // GPU this span's layers live on (layer split). -1 / 0 = the current
             // rank, which is the only rank on a single-GPU run.
-            int device = 0)
+            int device = 0, IntPtr hiddenOut = default, int logitsRows = 1,
+            IntPtr qsa = default, IntPtr qsaPositions = default, int qsaPositionCount = 0)
         {
             return GgmlNative.Qwen4ExpTokenSpan(ffn, gdn, attn, kinds, layerBegin, layerEnd,
                 resData, maskData, nEmbd, hc, hcLowRank, nTokens,
@@ -3142,8 +3143,11 @@ namespace TensorSharp.GGML
                 nRot, ropeBase, ropeFreqScale, attnScale,
                 nExpert, nExpertUsed, nFf, nFfSh, eps, cacheSlot, firstFfnOnly,
                 head, logitsOut, ple, pleLayer, pleEmb, mropePos, mropeSections, ropePosition,
-                device);
+                device, hiddenOut, logitsRows, qsa, qsaPositions, qsaPositionCount);
         }
+
+        public static bool Qwen4ExpCopyQsaCache(IntPtr key, IntPtr destination, long bytes, int device)
+            => GgmlNative.Qwen4ExpCopyQsaCache(key, destination, bytes, device);
 
         public static void Qwen4ExpResetFfnCache() => GgmlNative.Qwen4ExpResetFfnCache();
 
@@ -3152,6 +3156,38 @@ namespace TensorSharp.GGML
         public static void Qwen4ExpReleaseAllSeqState() => GgmlNative.Qwen4ExpReleaseAllSeqState();
 
         public static void Qwen4ExpReleaseSeqState(IntPtr[] keys) => GgmlNative.Qwen4ExpReleaseSeqState(keys);
+
+        public static IntPtr Qwen4ExpStateSnapshotCreate(IntPtr[] keys, int[] devices,
+            IntPtr attn, IntPtr gdn, IntPtr ple)
+            => GgmlNative.Qwen4ExpStateSnapshotCreate(keys, devices, attn, gdn, ple);
+        public static bool Qwen4ExpSpecApiAvailable()
+        {
+            try { return GgmlNative.TSGgml_Qwen4ExpSpecApiVersion() >= 1; }
+            catch (EntryPointNotFoundException) { return false; }
+            catch (DllNotFoundException) { return false; }
+        }
+        public static bool Qwen4ExpQsaApiAvailable()
+        {
+            try { return GgmlNative.TSGgml_Qwen4ExpSpecApiVersion() >= 2; }
+            catch (EntryPointNotFoundException) { return false; }
+            catch (DllNotFoundException) { return false; }
+        }
+        public static bool Qwen4ExpStateSnapshotCapture(IntPtr handle)
+            => GgmlNative.TSGgml_Qwen4ExpStateSnapshotCapture(handle) != 0;
+        public static IntPtr Qwen4ExpMtpCreate(ref Qwen4ExpMtpConfig config,
+            ref Qwen4ExpAttnArgs attn, ref Qwen4ExpFfnArgs ffn, ref Qwen4ExpHeadArgs head)
+            => GgmlNative.TSGgml_Qwen4ExpMtpCreate(ref config, ref attn, ref ffn, ref head);
+        public static bool Qwen4ExpMtpForward(IntPtr handle, IntPtr embedding, IntPtr previous,
+            int count, int position, int ropePosition, IntPtr mrope3, IntPtr hiddenOut, IntPtr logitsOut)
+            => GgmlNative.TSGgml_Qwen4ExpMtpForward(handle, embedding, previous,
+                count, position, ropePosition, mrope3, hiddenOut, logitsOut) != 0;
+        public static void Qwen4ExpMtpFree(IntPtr handle) => GgmlNative.TSGgml_Qwen4ExpMtpFree(handle);
+        public static bool Qwen4ExpMtpCopyKv(IntPtr handle, IntPtr k, IntPtr v, long bytes)
+            => GgmlNative.TSGgml_Qwen4ExpMtpCopyKv(handle, k, v, bytes) != 0;
+        public static bool Qwen4ExpStateSnapshotRestore(IntPtr handle)
+            => GgmlNative.TSGgml_Qwen4ExpStateSnapshotRestore(handle) != 0;
+        public static void Qwen4ExpStateSnapshotFree(IntPtr handle)
+            => GgmlNative.TSGgml_Qwen4ExpStateSnapshotFree(handle);
 
         public static void GatedDeltaNetChunked(
             Tensor q, Tensor k, Tensor v, Tensor z,

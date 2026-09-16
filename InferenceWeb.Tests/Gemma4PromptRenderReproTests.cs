@@ -100,8 +100,10 @@ public class Gemma4PromptRenderReproTests
         Assert.Contains("<|turn>user", rendered);
     }
 
-    [Fact]
-    public void RenderFromGguf_RestoresGemma4ThinkingPromptNewline()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void RenderFromGguf_RestoresGemma4PromptNewline(bool thinking)
     {
         const string template =
             "<|turn>user\n{{ messages[0]['content'] }}<turn|>\n" +
@@ -113,7 +115,7 @@ public class Gemma4PromptRenderReproTests
             history,
             addGenerationPrompt: true,
             architecture: "gemma4",
-            enableThinking: true);
+            enableThinking: thinking);
 
         Assert.EndsWith("<|turn>model\n", rendered);
 
@@ -125,10 +127,30 @@ public class Gemma4PromptRenderReproTests
             history,
             architecture: "gemma4",
             addGenerationPrompt: true,
-            enableThinking: true);
+            enableThinking: thinking);
         int newlineId = tokenizer.LookupToken("\n");
         Assert.Equal(newlineId, tokens[^1]);
         Assert.NotEqual(newlineId, tokens[^2]);
+    }
+
+    [Fact]
+    public void HardcodedGemma4_ThinkingDisabled_LeavesTheModelTurnOpen()
+    {
+        var history = new List<ChatMessage> { new() { Role = "user", Content = "hello" } };
+        string rendered = ChatTemplate.RenderGemma4(history, enableThinking: false);
+        Assert.EndsWith("<|turn>model\n", rendered);
+        Assert.DoesNotContain("<|channel>", rendered);
+    }
+
+    [Fact]
+    public void RenderFromGguf_PreservesPublisherSuppliedChannelBlock()
+    {
+        const string template = "<|turn>user\n{{ messages[0]['content'] }}<turn|>\n" +
+            "<|turn>model\n<|channel>thought\n<channel|>";
+        var history = new List<ChatMessage> { new() { Role = "user", Content = "hello" } };
+        string rendered = ChatTemplate.RenderFromGgufTemplate(
+            template, history, architecture: "gemma4", enableThinking: false);
+        Assert.EndsWith("<|turn>model\n<|channel>thought\n<channel|>", rendered);
     }
 
     [Fact]

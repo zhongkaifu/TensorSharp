@@ -398,6 +398,7 @@ public sealed class OpenAIResponsesAdapter
             (enableThinking || (tools != null && tools.Count > 0) || OutputParserFactory.IsAlwaysRequired(_svc.Architecture));
 
         IOutputParser? parser = null;
+        string? generationSuffix = null;
         if (useParser)
         {
             parser = OutputParserFactory.Create(_svc.Architecture);
@@ -440,6 +441,12 @@ public sealed class OpenAIResponsesAdapter
         {
             if (!update.Done)
             {
+                if (update.RawGenerationSuffix != null)
+                {
+                    generationSuffix = update.RawGenerationSuffix;
+                    parser?.SetGenerationPromptSuffix(generationSuffix);
+                    if (string.IsNullOrEmpty(update.Piece)) continue;
+                }
                 if (update.IsParsed)
                 {
                     // Pre-separated by the skills loop: the tool markup our parser
@@ -491,7 +498,15 @@ public sealed class OpenAIResponsesAdapter
 
         if (bufferForStructured)
         {
-            var normalized = StructuredOutputValidator.NormalizeOutput(buffer!.ToString(), responseFormat);
+            string raw = buffer!.ToString();
+            if (!sawParsedUpdate && generationSuffix != null)
+            {
+                var structuredParser = OutputParserFactory.Create(_svc.Architecture);
+                structuredParser.Init(enableThinking, tools);
+                structuredParser.SetGenerationPromptSuffix(generationSuffix);
+                raw = structuredParser.Add(raw, true).Content;
+            }
+            var normalized = StructuredOutputValidator.NormalizeOutput(raw, responseFormat);
             if (!normalized.IsValid)
             {
                 await SseWriter.WriteNamedEventAsync(ctx.Response, "response.failed",

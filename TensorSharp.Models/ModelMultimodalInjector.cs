@@ -10,6 +10,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Threading;
 using TensorSharp;
 using TensorSharp.Models.Architecture;
 
@@ -19,6 +20,7 @@ namespace TensorSharp.Models
     {
         private readonly ModelBase _model;
         private readonly Dictionary<string, CachedEmbedding> _visionCache = new(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, CachedEmbedding> _videoFrameCache = new(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, CachedEmbedding> _audioCache = new(StringComparer.OrdinalIgnoreCase);
 
         // Per-request buckets. "" is the default bucket used by direct
@@ -40,17 +42,18 @@ namespace TensorSharp.Models
         // means the request is text-only and standard scalar RoPE is fine.
         private readonly Dictionary<string, int[]> _mropePositionsByRequest = new();
 
-        // "Live view" into the bucket for the request currently being processed
-        // by ProcessPromptTokens. The model-specific Process*History helpers
-        // append to these. Reset to the default bucket between requests.
-        private List<PreparedEmbeddingSpan> _preparedVisionEmbeddings;
-        private List<PreparedEmbeddingSpan> _preparedAudioEmbeddings;
-        // RequestId currently being processed. Set at ProcessPromptTokens entry
-        // so the model-specific Process*History helpers (which don't take a
-        // requestId arg) can attach per-request state like the MRoPE position
-        // table to the right bucket. Single-threaded under the chat pipeline's
-        // GpuComputeLock so no races.
-        private string _currentRequestId;
+        // Encoders yield GpuComputeLock between blocks. Another request can
+        // prepare its prompt during that yield, so a shared "current request"
+        // would attach the first encoder's result to the second request. Keep
+        // this synchronous expansion's context local to its execution flow.
+        private readonly AsyncLocal<PreparationContext> _preparation = new();
+        private sealed record PreparationContext(string RequestId,
+            List<PreparedEmbeddingSpan> Vision, List<PreparedEmbeddingSpan> Audio);
+        private List<PreparedEmbeddingSpan> _preparedVisionEmbeddings =>
+            _preparation.Value?.Vision ?? GetOrCreateBucket(_visionByRequest, "");
+        private List<PreparedEmbeddingSpan> _preparedAudioEmbeddings =>
+            _preparation.Value?.Audio ?? GetOrCreateBucket(_audioByRequest, "");
+        private string _currentRequestId => _preparation.Value?.RequestId ?? "";
 
         private sealed class CachedEmbedding : IDisposable
         {
@@ -113,8 +116,6 @@ namespace TensorSharp.Models
         public ModelMultimodalInjector(ModelBase model)
         {
             _model = model;
-            _preparedVisionEmbeddings = GetOrCreateBucket(_visionByRequest, "");
-            _preparedAudioEmbeddings = GetOrCreateBucket(_audioByRequest, "");
         }
 
         private static string NormalizeRequestId(string requestId) => requestId ?? "";
@@ -145,19 +146,24 @@ namespace TensorSharp.Models
         public List<int> ProcessPromptTokens(List<ChatMessage> history, List<int> inputTokens, string requestId = null)
         {
             string key = NormalizeRequestId(requestId);
-            _preparedVisionEmbeddings = GetOrCreateBucket(_visionByRequest, key);
-            _preparedAudioEmbeddings = GetOrCreateBucket(_audioByRequest, key);
-            _currentRequestId = key;
-
-            _preparedVisionEmbeddings.Clear();
-            _preparedAudioEmbeddings.Clear();
-
-            if (history == null || history.Count == 0 || inputTokens == null || inputTokens.Count == 0)
-                return inputTokens;
-
-            return _model is IMultimodalPromptExpander expander
-                ? expander.ExpandMultimodalPrompt(this, history, inputTokens)
-                : inputTokens;
+            var previous = _preparation.Value;
+            var current = new PreparationContext(key,
+                GetOrCreateBucket(_visionByRequest, key), GetOrCreateBucket(_audioByRequest, key));
+            _preparation.Value = current;
+            try
+            {
+                current.Vision.Clear();
+                current.Audio.Clear();
+                if (history == null || history.Count == 0 || inputTokens == null || inputTokens.Count == 0)
+                    return inputTokens;
+                return _model is IMultimodalPromptExpander expander
+                    ? expander.ExpandMultimodalPrompt(this, history, inputTokens)
+                    : inputTokens;
+            }
+            finally
+            {
+                _preparation.Value = previous;
+            }
         }
 
         public int ClampReusablePrefix(int reusablePrefixTokenCount, string requestId = null)
@@ -314,15 +320,25 @@ namespace TensorSharp.Models
                         imageStd: model.VisionEncoder.ImageStd)
                     : new Gemma4ImageProcessor())
                 : null;
+            var videoProcessor = model.VisionEncoder != null
+                ? new Gemma4ImageProcessor(minTokens: Gemma4ImageProcessor.VideoSoftTokens,
+                    maxTokens: Gemma4ImageProcessor.VideoSoftTokens,
+                    imageMean: model.VisionEncoder.IsUnified ? model.VisionEncoder.ImageMean : null,
+                    imageStd: model.VisionEncoder.IsUnified ? model.VisionEncoder.ImageStd : null)
+                : null;
             int searchFrom = 0;
 
             foreach (var message in history)
             {
                 if (message.ImagePaths != null && model.VisionEncoder != null)
                 {
-                    foreach (var imagePath in message.ImagePaths)
+                    for (int imageIndex = 0; imageIndex < message.ImagePaths.Count; ++imageIndex)
                     {
-                        CachedEmbedding cached = GetOrCreateGemma4VisionEmbedding(model, imageProcessor, imagePath);
+                        string imagePath = message.ImagePaths[imageIndex];
+                        bool videoFrame = message.IsVideo && (message.ImageTimestamps?.Count != message.ImagePaths.Count
+                            || message.ImageTimestamps[imageIndex].HasValue);
+                        CachedEmbedding cached = GetOrCreateGemma4VisionEmbedding(model,
+                            videoFrame ? videoProcessor : imageProcessor, imagePath, videoFrame);
                         int tokenPosition = FindTokenPosition(inputTokens, imageStartId, searchFrom);
 
                         if (tokenPosition >= 0)
@@ -743,9 +759,9 @@ namespace TensorSharp.Models
         private CachedEmbedding GetOrCreateGemma4VisionEmbedding(
             Gemma4Model model,
             Gemma4ImageProcessor processor,
-            string imagePath)
+            string imagePath, bool videoFrame)
         {
-            return GetOrCreateCachedEmbedding(_visionCache, imagePath, fullPath =>
+            return GetOrCreateCachedEmbedding(videoFrame ? _videoFrameCache : _visionCache, imagePath, fullPath =>
             {
                 var (pixels, imageWidth, imageHeight) = processor.ProcessImage(fullPath);
                 Tensor embeddings = model.VisionEncoder.Encode(pixels, imageWidth, imageHeight);
@@ -1192,6 +1208,10 @@ namespace TensorSharp.Models
             foreach (var cached in _visionCache.Values)
                 cached.Dispose();
             _visionCache.Clear();
+
+            foreach (var cached in _videoFrameCache.Values)
+                cached.Dispose();
+            _videoFrameCache.Clear();
 
             foreach (var cached in _audioCache.Values)
                 cached.Dispose();

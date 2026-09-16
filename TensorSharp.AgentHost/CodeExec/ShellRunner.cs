@@ -2326,10 +2326,9 @@ namespace TensorSharp.AgentHost.CodeExec
                 "codeexec.edited path={Path} rung={Rung} freshness={Freshness} matches={Matches} all={All}",
                 request.Path, match.Rung, seen.Freshness, match.Count, request.ReplaceAll);
 
-            return new CodeExecResult(
-                true,
+            return CompleteFileMutation(
                 DescribeEdit(request, match, seen, changedLine, restyled, workspace, from),
-                Array.Empty<CodeArtifact>(), string.Empty);
+                workspace, full);
         }
 
         /// <summary>Create a file, or replace one whole.</summary>
@@ -2452,7 +2451,24 @@ namespace TensorSharp.AgentHost.CodeExec
                         + "recoverable from here.");
             }
 
-            return new CodeExecResult(true, sb.ToString(), Array.Empty<CodeArtifact>(), string.Empty);
+            return CompleteFileMutation(sb.ToString(), workspace, full);
+        }
+
+        private CodeExecResult CompleteFileMutation(string content, SessionWorkspace workspace, string fullPath)
+        {
+            if (_artifacts == null)
+                return new CodeExecResult(true, content, Array.Empty<CodeArtifact>(), string.Empty);
+
+            // File tools must publish their own outputs. A later shell invocation
+            // snapshots these files as existing inputs and will not capture them.
+            // Reuse the patch path's filtering, limits, and retained copies, with
+            // only this mutation's target eligible for publication.
+            var sb = new StringBuilder(content);
+            IReadOnlyList<CodeArtifact> artifacts = CaptureArtifacts(
+                workspace, PatchSnapshot(workspace, new[] { fullPath }), out IReadOnlyList<string> skipped);
+            AppendArtifacts(sb, artifacts, skipped);
+            return new CodeExecResult(true, sb.ToString(), artifacts,
+                artifacts.Count > 0 ? artifacts[0].RunId : string.Empty);
         }
 
         // ---- what the file tools say -----------------------------------------

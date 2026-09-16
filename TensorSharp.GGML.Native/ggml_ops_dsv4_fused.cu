@@ -33,6 +33,9 @@
 // ---------------------------------------------------------------------------
 
 #include "ggml_ops_dsv4_fused.h"
+#include "ggml_ops_matmul_precision.h"
+#include "ggml_ops_attention_precision.h"
+#include "ggml_ops_q8_precision.h"
 #include "dsv41_quant.h"
 
 #include "ggml-impl.h"
@@ -821,6 +824,7 @@ struct tsg_dsv4_backend_ctx
     char name[32] = {};
     char desc[64] = {};
     ggml_backend_dev_t cuda_dev = nullptr;
+    tsg_matmul_cuda_state * matmul = nullptr;
 };
 
 static const tsg_dsv4_fused_desc * tsg_dsv4_node_desc(const ggml_tensor * node)
@@ -850,6 +854,7 @@ static void tsg_dsv4_backend_free(ggml_backend_t backend)
 {
     // The device record is this backend's own (see tsg_dsv4_fused_backend_init)
     // and shares the context, so free it here and only here.
+    tsg_matmul_cuda_free(((tsg_dsv4_backend_ctx *) backend->context)->matmul);
     delete backend->device;
     delete (tsg_dsv4_backend_ctx *) backend->context;
     delete backend;
@@ -916,8 +921,11 @@ static void tsg_dsv4_backend_event_wait(ggml_backend_t backend, ggml_backend_eve
 static void tsg_dsv4_backend_synchronize(ggml_backend_t backend)
 {
     auto * c = (tsg_dsv4_backend_ctx *) backend->context;
-    cudaSetDevice(c->device);
-    cudaStreamSynchronize(tsg_dsv4_backend_stream(c));
+    CUDA_CHECK(cudaSetDevice(c->device));
+    // A successful submission does not guarantee successful execution. Surface
+    // asynchronous kernel errors here instead of losing them until a later
+    // peer copy or request touches this CUDA context.
+    CUDA_CHECK(cudaStreamSynchronize(tsg_dsv4_backend_stream(c)));
 }
 
 // Submission diagnostics (TS_DSV4_PERF>=3). Plain relaxed atomics: they are
@@ -953,7 +961,7 @@ tsg_dsv4_fused_counters tsg_dsv4_fused_counters_read()
 static enum ggml_status tsg_dsv4_backend_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph)
 {
     auto * c = (tsg_dsv4_backend_ctx *) backend->context;
-    cudaSetDevice(c->device);
+    CUDA_CHECK(cudaSetDevice(c->device));
     cudaStream_t stream = tsg_dsv4_backend_stream(c);
     static const bool stats = []() { const char * e = getenv("TS_DSV4_PERF"); return e && atoi(e) >= 3; }();
     const auto submit_t0 = std::chrono::steady_clock::now();
@@ -1003,14 +1011,25 @@ static enum ggml_status tsg_dsv4_backend_graph_compute(ggml_backend_t backend, g
             // Whatever we already launched is still in flight on this stream.
             // Drain it before returning, so the caller's error handling does
             // not race kernels that are still reading the graph's tensors.
-            cudaStreamSynchronize(stream);
+            CUDA_CHECK(cudaStreamSynchronize(stream));
             return status;
         }
         if (stats) tsg_dsv4_stat_fused.fetch_add(1, std::memory_order_relaxed);
-        tsg_dsv4_fused_launch(d, node, stream);
+        if (d->kind == TSG_MATMUL_F32 || d->kind == TSG_MATMUL_ID_F32)
+            tsg_matmul_cuda_compute(c->matmul, node);
+        else if (d->kind == TSG_MATMUL_Q8_F32)
+            tsg_matmul_q8_cuda_compute(node, c->cuda_backend);
+        else if (d->kind == TSG_ATTN_F32_PARTIAL || d->kind == TSG_ATTN_F32_FINISH ||
+                 d->kind == TSG_ATTN_F32_SOFTMAX || d->kind == TSG_ATTN_MASK_COMPACT)
+            tsg_attention_cuda_compute(node, c->cuda_backend);
+        else
+        {
+            tsg_dsv4_fused_launch(d, node, stream);
+            CUDA_CHECK(cudaGetLastError());
+        }
     }
     const enum ggml_status status = flush(cgraph->n_nodes);
-    if (status != GGML_STATUS_SUCCESS) cudaStreamSynchronize(stream);
+    if (status != GGML_STATUS_SUCCESS) CUDA_CHECK(cudaStreamSynchronize(stream));
     if (stats)
     {
         tsg_dsv4_stat_calls.fetch_add(1, std::memory_order_relaxed);
@@ -1166,6 +1185,7 @@ ggml_backend_t tsg_dsv4_fused_backend_init(ggml_backend_t cuda_backend)
     ctx->cuda_backend = cuda_backend;
     ctx->cuda_dev = ggml_backend_get_device(cuda_backend);
     ctx->cuda_buft = ggml_backend_get_default_buffer_type(cuda_backend);
+    ctx->matmul = tsg_matmul_cuda_init(cuda_backend);
     snprintf(ctx->name, sizeof(ctx->name), "TSDSV4-%d", ctx->device);
     snprintf(ctx->desc, sizeof(ctx->desc), "TensorSharp DSV4 fused ops (CUDA%d)", ctx->device);
 

@@ -75,6 +75,20 @@ namespace TensorSharp.Models
                 return false;
             }
 
+            if (model is Qwen4ExpModel qwen4Exp)
+            {
+                try
+                {
+                    qwen4Exp.LoadMtpDraftWeights(draftPath);
+                    return qwen4Exp.HasDraftHead;
+                }
+                catch (Exception ex)
+                {
+                    error = $"Failed to load Qwen4Exp shared MTP head '{Path.GetFileName(draftPath)}': {ex.Message}";
+                    return false;
+                }
+            }
+
             // A DFlash / DFlash2 drafter is architecture-agnostic on this side: any
             // target that can tap the residuals its encoder reads can host one, and
             // the file says which it is. --draft-model may already have attached it

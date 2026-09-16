@@ -11,9 +11,8 @@
 #   TENSORSHARP_GGML_GIT_REF   branch/tag/commit      (default: master, the ggml default branch)
 #   TENSORSHARP_GGML_NO_UPDATE if set to 1/ON/true and a checkout or complete
 #                              source copy exists, use what is on disk.
-# Fetching leaves upstream sources unchanged. The CUDA native CMake configure
-# applies the reviewed source-precision fix from eng/ggml-patches; model-specific
-# behavior remains in TensorSharp.GGML.Native.
+# Fetching and building leave upstream sources unchanged. Model-specific
+# behavior and precision kernels live in TensorSharp.GGML.Native.
 $ErrorActionPreference = "Stop"
 
 $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path

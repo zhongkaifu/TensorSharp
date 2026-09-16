@@ -19,12 +19,14 @@ namespace InferenceWeb.Tests
 #pragma warning disable RS0030
         private static readonly Lazy<bool> CudaAvailable = new(() =>
         {
+            if (Environment.GetEnvironmentVariable("TS_TEACHER_TOKEN_EXPORT") == "1") return false;
             try { return TensorSharp.Cuda.CudaBackend.IsAvailable(); }
             catch { return false; }
         });
 
         private static readonly Lazy<bool> MlxAvailable = new(() =>
         {
+            if (Environment.GetEnvironmentVariable("TS_TEACHER_TOKEN_EXPORT") == "1") return false;
             try { return TensorSharp.MLX.MlxBackend.IsAvailable(); }
             catch { return false; }
         });
@@ -41,6 +43,7 @@ namespace InferenceWeb.Tests
         // without every encoder; probe once by actually writing a tiny clip.
         private static readonly Lazy<bool> VideoWritable = new(() =>
         {
+            if (Environment.GetEnvironmentVariable("TS_TEACHER_TOKEN_EXPORT") == "1") return false;
             string dir = Path.Combine(Path.GetTempPath(), "ts-video-gate-" + Guid.NewGuid().ToString("N"));
             try { return VideoFixture.TryWrite(Path.Combine(dir, "probe.mp4"), frames: 4) != null; }
             catch { return false; }

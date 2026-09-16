@@ -1,0 +1,31 @@
+{
+  "id": "deepseek41-q4km-layer7-cpumoe12-f16",
+  "model": "/workspace/models/DeepSeek-V4.1-Flash-Q4_K_M/DeepSeek-V4.1-Flash-Q4_K_M-00001-of-00011.gguf",
+  "backend": "ggml_cuda",
+  "port": 5100,
+  "extra_args": ["--tp", "7", "--n-cpu-moe", "12", "--cpu-moe-threads", "32", "--mmproj", "/workspace/models/DeepSeek-V4.1-Flash-Q4_K_M/deepseek41.vision.gguf", "--no-skills"],
+  "env": {
+    "CUDA_VISIBLE_DEVICES": "0,1,2,3,4,5,6",
+    "MAX_CONTEXT": "65536",
+    "TS_DSV4_UBATCH": "512",
+    "TS_DSV41_TP": "0",
+    "TS_DSV41_ENGRAM_WARM": "1",
+    "TS_DSV41_SPARSE_FA": "1",
+    "TS_DSV41_COMPACT_RAW_GATHER": "0",
+    "TS_CPU_MOE_THREADS": "32",
+    "TS_SCHED_MAX_RUNNING_SEQS": "4",
+    "TS_SCHED_MAX_BATCHED_TOKENS": "4096",
+    "TS_SCHED_PREFILL_CHUNK": "512",
+    "TS_SCHED_SOLO_PREFILL_CHUNK": "8192",
+    "KV_CACHE_DTYPE": "f16"
+  },
+  "suites": [
+    ["{python}", "{repo}/benchmarks/engine_comparison/validate_inference.py", "--url", "{url}", "--engine", "tensorsharp", "--model", "{model_id}", "--weights-id", "58d8ac86298fdf85a2440defee08b1abcad32e45-Q4_K_M", "--profile", "layer7-cpumoe12-f16", "--scenarios", "short,short_zh,json,json_schema,json_unicode,multi_turn,tool_round_trip,agentic", "--concurrency", "1,4", "--repeats", "1", "--output", "{output}/quality.json"],
+    ["{python}", "{repo}/benchmarks/engine_comparison/validate_inference.py", "--url", "{url}", "--engine", "tensorsharp", "--model", "{model_id}", "--weights-id", "58d8ac86298fdf85a2440defee08b1abcad32e45-Q4_K_M", "--profile", "layer7-cpumoe12-f16", "--scenarios", "long_8k,long_32k,long_64k", "--concurrency", "1", "--repeats", "1", "--timeout", "1800", "--output", "{output}/long-context.json"],
+    ["{python}", "{repo}/benchmarks/engine_comparison/validate_inference.py", "--url", "{url}", "--engine", "tensorsharp", "--model", "{model_id}", "--weights-id", "58d8ac86298fdf85a2440defee08b1abcad32e45-Q4_K_M", "--profile", "layer7-cpumoe12-f16", "--scenarios", "decode,decode_8k", "--concurrency", "1,4", "--repeats", "3", "--output", "{output}/decode-benchmark.json"],
+    ["{python}", "{repo}/benchmarks/engine_comparison/validate_deepseek41_tools.py", "--url", "{url}", "--model", "{model_id}", "--weights-id", "58d8ac86298fdf85a2440defee08b1abcad32e45-Q4_K_M", "--profile", "layer7-cpumoe12-f16", "--concurrency", "1,4", "--output", "{output}/tool-policies.json"],
+    ["{python}", "{repo}/benchmarks/engine_comparison/validate_deepseek41_media.py", "--url", "{url}", "--model", "{model_id}", "--weights-id", "58d8ac86298fdf85a2440defee08b1abcad32e45-Q4_K_M", "--companion-sha256", "e7b0debed15706dd2f065879fa62a54f49e5c0472a54fa33d5ff40957f167e0c", "--profile", "layer7-cpumoe12-f16", "--fixtures", "/workspace/tensorsharp-no-patch-20260915/media-fixtures", "--concurrency", "1,4", "--output", "{output}/media.json"],
+    ["{python}", "{repo}/benchmarks/engine_comparison/validate_deepseek41_image_inputs.py", "--base-url", "{url}", "--model", "{model_id}", "--host-manifest", "{output}/profile.json", "--output", "{output}/invalid-images.json"],
+    ["{python}", "{repo}/benchmarks/engine_comparison/validate_deepseek41_audio_inputs.py", "--base-url", "{url}", "--model", "{model_id}", "--host-manifest", "{output}/profile.json", "--output", "{output}/audio-rejection.json"]
+  ]
+}

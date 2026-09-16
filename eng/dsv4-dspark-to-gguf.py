@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Convert DeepSeek V4's DSpark support module (the `mtp.*` tensors of a
-DeepSeek-V4-Flash checkpoint) into the standalone drafter GGUF TensorSharp
-loads with --draft-model.
+"""Convert DeepSeek V4/V4.1 DSpark support tensors into a standalone GGUF.
+
+V4.1 uses a distinct architecture tag: converting its tensors does not make
+an older V4-only runtime compatible with its delayed mHC computation.
 
 The drafter is three DSV4 blocks (compress_ratio 0) plus a Markov head and a
 confidence head; the target model supplies the token embedding and the LM head,
@@ -16,15 +17,15 @@ Quantization: the routed experts are already stored as FP4 (E2M1) with per-32
 E8M0 scales, which is exactly GGUF's MXFP4 block layout up to the nibble order,
 so `--expert-type mxfp4` repacks them losslessly. `--expert-type q2_k` trades
 accuracy for ~40% of the size when the drafter has to share a GPU with the
-target's layers. Everything else (FP8 E4M3 with 128x128 E8M0 block scales) is
+target's layers. Everything else (FP8 E4M3 with checkpoint-defined block scales) is
 dequantized to F32 and stored as Q8_0, except norms/gates which stay F32.
 """
 
 import argparse
 import json
 import os
+import re
 import struct
-import sys
 
 import numpy as np
 
@@ -65,6 +66,13 @@ class GgufWriter:
         self.kv.append((key, KV_ARRAY, (KV_INT32, [int(v) for v in values])))
 
     def add_tensor(self, name, dims, ggml_type, payload):
+        block, size = {GGML_F32: (1, 4), GGML_F16: (1, 2), GGML_BF16: (1, 2),
+                       GGML_Q8_0: (32, 34), GGML_Q2_K: (256, 84), GGML_MXFP4: (32, 17)}[ggml_type]
+        if not dims or any(type(d) is not int or d <= 0 for d in dims) or dims[0] % block:
+            raise ValueError(f"{name}: invalid dimensions {dims} for GGML type {ggml_type}")
+        expected = int(np.prod(dims)) // block * size
+        if len(payload) != expected:
+            raise ValueError(f"{name}: payload has {len(payload)} bytes, expected {expected}")
         self.tensors.append((name, list(dims), int(ggml_type), payload))
 
     @staticmethod
@@ -125,11 +133,14 @@ class GgufWriter:
 class SafeTensors:
     """Lazy multi-shard safetensors reader (mmap per shard)."""
 
-    def __init__(self, checkpoint_dir):
+    def __init__(self, checkpoint_dir, fp8_block_shape=(128, 128)):
         index_path = os.path.join(checkpoint_dir, "model.safetensors.index.json")
         with open(index_path, "r", encoding="utf-8") as f:
             self.weight_map = json.load(f)["weight_map"]
         self.dir = checkpoint_dir
+        self.fp8_block_shape = tuple(fp8_block_shape)
+        if len(self.fp8_block_shape) != 2 or any(type(n) is not int or n <= 0 for n in self.fp8_block_shape):
+            raise ValueError("FP8 weight_block_size must contain two positive integers")
         self._shards = {}
 
     def _shard(self, filename):
@@ -179,7 +190,7 @@ def fp8_e4m3_lut():
 def dequant_block_scaled(st, name):
     """Dequantize `name` to float32, applying its `.scale` sibling if present.
 
-    FP8 E4M3 weights carry per-[128,128]-block E8M0 (or F32) scales; BF16/F32
+    FP8 E4M3 weights carry per-block E8M0 (or F32) scales; BF16/F32
     tensors are returned as-is.
     """
     buf, dtype, shape = st.raw(name)
@@ -194,7 +205,7 @@ def dequant_block_scaled(st, name):
     w = fp8_e4m3_lut()[np.frombuffer(buf, dtype=np.uint8)].reshape(shape)
     scale_name = name.rsplit(".", 1)[0] + ".scale"
     if not st.has(scale_name):
-        return w
+        raise ValueError(f"{name}: FP8 tensor has no block scales")
 
     sbuf, sdtype, sshape = st.raw(scale_name)
     if sdtype == "F8_E8M0":
@@ -205,10 +216,12 @@ def dequant_block_scaled(st, name):
         raise ValueError(f"{scale_name}: unexpected scale dtype {sdtype}")
     s = s.reshape(sshape)
 
-    # Block scales cover ceil(dim/block) tiles per axis.
+    # Use the checkpoint's block size: inferring it from the number of scales
+    # shifts every tile boundary when the final tile is partial.
     rows, cols = shape
-    br = (rows + s.shape[0] - 1) // s.shape[0]
-    bc = (cols + s.shape[1] - 1) // s.shape[1]
+    br, bc = st.fp8_block_shape
+    if list(sshape) != [(rows + br - 1) // br, (cols + bc - 1) // bc]:
+        raise ValueError(f"{scale_name}: scale shape {sshape} does not cover {shape} with blocks {[br, bc]}")
     s_full = np.repeat(np.repeat(s, br, axis=0), bc, axis=1)[:rows, :cols]
     return (w * s_full).astype(np.float32)
 
@@ -329,6 +342,47 @@ def repack_mxfp4(packed, scales, rows, cols):
 # conversion
 # ---------------------------------------------------------------------------
 
+def resolve_dspark_config(raw_config, weight_map):
+    """Validate draft metadata/index before reading any model tensor payload."""
+    cfg = dict(raw_config.get("text_config", raw_config))
+    is_v41 = raw_config.get("model_type") == "deepseek_v41" or cfg.get("model_type") == "deepseek_v41_text"
+    cfg["dspark_target_architecture"] = "deepseek41" if is_v41 else "deepseek4"
+    for key in ("dspark_block_size", "dspark_markov_rank", "dspark_noise_token_id"):
+        value = cfg.get(key)
+        minimum = 0 if key == "dspark_noise_token_id" else 1
+        if type(value) is not int or value < minimum:
+            raise ValueError(f"config has no valid {key}: this checkpoint has no usable DSpark module")
+    layers = cfg.get("dspark_target_layer_ids")
+    if (not isinstance(layers, list) or not layers or
+            any(type(n) is not int or n < 0 for n in layers) or layers != sorted(set(layers))):
+        raise ValueError("dspark_target_layer_ids must be nonempty, unique and increasing")
+    if "num_hidden_layers" in cfg and layers[-1] >= cfg["num_hidden_layers"]:
+        raise ValueError("DSpark target layer is outside the target model")
+    if "vocab_size" in cfg and cfg["dspark_noise_token_id"] >= cfg["vocab_size"]:
+        raise ValueError("DSpark noise token is outside the target vocabulary")
+    stages = sorted(int(m.group(1)) for k in weight_map
+                    if (m := re.fullmatch(r"mtp\.(\d+)\.attn_norm\.weight", k)))
+    if not stages or stages != list(range(len(stages))):
+        raise ValueError("checkpoint must contain contiguous mtp stages starting at zero")
+    if cfg.get("num_nextn_predict_layers", len(stages)) != len(stages):
+        raise ValueError("DSpark stage count differs from num_nextn_predict_layers")
+    count = cfg.get("dspark_n_routed_experts", cfg.get("n_routed_experts"))
+    if type(count) is not int or count <= 0:
+        raise ValueError("DSpark routed expert count must be a positive integer")
+    active = cfg.get("dspark_num_experts_per_tok", cfg.get("num_experts_per_tok"))
+    if active is not None and (type(active) is not int or not 0 < active <= count):
+        raise ValueError("DSpark active expert count is outside the routed expert count")
+    cfg["n_routed_experts"] = count
+    cfg["num_experts_per_tok"] = active
+    for stage in stages:
+        for projection in ("w1", "w2", "w3"):
+            pattern = rf"mtp\.{stage}\.ffn\.experts\.(\d+)\.{projection}\.weight"
+            actual = sorted(int(m.group(1)) for k in weight_map if (m := re.fullmatch(pattern, k)))
+            if actual != list(range(count)):
+                raise ValueError(f"mtp.{stage}.{projection}: expert IDs differ from configured count {count}")
+    return cfg, len(stages)
+
+
 def stage_tensors(st, writer, stage, cfg, expert_type, log):
     src = f"mtp.{stage}."
     dst = f"mtp.{stage}."
@@ -361,6 +415,8 @@ def stage_tensors(st, writer, stage, cfg, expert_type, log):
     f32("hc_ffn_base", "hc_ffn_base.weight")
     f32("ffn.gate.weight", "ffn_gate_inp.weight")
     f32("ffn.gate.bias", "exp_probs_b.bias")
+    if st.has(src + "ffn.gate.bias_vl"):
+        f32("ffn.gate.bias_vl", "exp_probs_b_vl.bias")
     q8("ffn.shared_experts.w1.weight", "ffn_gate_shexp.weight")
     q8("ffn.shared_experts.w2.weight", "ffn_down_shexp.weight")
     q8("ffn.shared_experts.w3.weight", "ffn_up_shexp.weight")
@@ -369,6 +425,7 @@ def stage_tensors(st, writer, stage, cfg, expert_type, log):
     for w_src, w_dst in (("w1", "ffn_gate_exps.weight"), ("w3", "ffn_up_exps.weight"), ("w2", "ffn_down_exps.weight")):
         chunks = []
         rows = cols = None
+        stored_type = stored_shape = None
         for e in range(n_experts):
             name = f"{src}ffn.experts.{e}.{w_src}.weight"
             buf, dtype, shape = st.raw(name)
@@ -378,10 +435,12 @@ def stage_tensors(st, writer, stage, cfg, expert_type, log):
                 cols = half * 2
                 packed = np.frombuffer(buf, dtype=np.uint8).reshape(rows, half)
                 sbuf, sdtype, sshape = st.raw(f"{src}ffn.experts.{e}.{w_src}.scale")
-                assert sdtype == "F8_E8M0", sdtype
+                if sdtype != "F8_E8M0" or cols % 32 or list(sshape) != [rows, cols // 32]:
+                    raise ValueError(f"{name}: invalid FP4 scales {sdtype} {sshape}")
                 scales = np.frombuffer(sbuf, dtype=np.uint8).reshape(sshape)
                 if expert_type == "mxfp4":
                     chunks.append(repack_mxfp4(packed, scales, rows, cols))
+                    ttype = GGML_MXFP4
                 else:
                     lut = np.array([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
                                     -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0], dtype=np.float32)
@@ -393,13 +452,17 @@ def stage_tensors(st, writer, stage, cfg, expert_type, log):
                     s = np.exp2(scales.astype(np.float32) - 127.0)
                     vals *= np.repeat(s, 32, axis=1)
                     chunks.append(quantize_q2_k(vals))
+                    ttype = GGML_Q2_K
             else:
                 v = dequant_block_scaled(st, name)
                 rows, cols = v.shape
                 chunks.append(quantize_q2_k(v) if expert_type == "q2_k" else quantize_q8_0(v))
-        ttype = GGML_MXFP4 if expert_type == "mxfp4" else GGML_Q2_K
-        writer.add_tensor(dst + w_dst, [cols, rows, n_experts], ttype, b"".join(chunks))
-        log(f"  {dst}{w_dst}: [{cols}, {rows}, {n_experts}] {expert_type}")
+                ttype = GGML_Q2_K if expert_type == "q2_k" else GGML_Q8_0
+            if stored_type is not None and (ttype != stored_type or (rows, cols) != stored_shape):
+                raise ValueError(f"{name}: experts in one GGUF tensor must have the same shape and encoding")
+            stored_type, stored_shape = ttype, (rows, cols)
+        writer.add_tensor(dst + w_dst, [cols, rows, n_experts], stored_type, b"".join(chunks))
+        log(f"  {dst}{w_dst}: [{cols}, {rows}, {n_experts}] GGML type {stored_type}")
 
 
 def main():
@@ -410,15 +473,10 @@ def main():
     args = ap.parse_args()
 
     with open(os.path.join(args.checkpoint, "config.json"), "r", encoding="utf-8") as f:
-        cfg = json.load(f)
-    for key in ("dspark_block_size", "dspark_noise_token_id", "dspark_target_layer_ids", "dspark_markov_rank"):
-        if key not in cfg:
-            sys.exit(f"{args.checkpoint}/config.json has no {key}: this checkpoint ships no DSpark module")
-
-    st = SafeTensors(args.checkpoint)
-    n_stages = sum(1 for k in st.weight_map if k.startswith("mtp.") and k.endswith(".attn_norm.weight"))
-    if n_stages == 0:
-        sys.exit("checkpoint has no mtp.* tensors")
+        raw_config = json.load(f)
+    block_shape = raw_config.get("quantization_config", {}).get("weight_block_size", [128, 128])
+    st = SafeTensors(args.checkpoint, block_shape)
+    cfg, n_stages = resolve_dspark_config(raw_config, st.weight_map)
 
     def log(msg):
         print(msg, flush=True)
@@ -428,7 +486,11 @@ def main():
         f"experts={args.expert_type}")
 
     w = GgufWriter(args.out)
-    w.add_string("general.architecture", "deepseek4-dspark")
+    w.add_string("general.architecture", cfg["dspark_target_architecture"] + "-dspark")
+    w.add_string("dspark.target_architecture", cfg["dspark_target_architecture"])
+    w.add_uint32("dspark.expert_count", cfg["n_routed_experts"])
+    if cfg["num_experts_per_tok"] is not None:
+        w.add_uint32("dspark.expert_used_count", cfg["num_experts_per_tok"])
     w.add_string("general.name", os.path.basename(os.path.normpath(args.checkpoint)) + " DSpark")
     w.add_uint32("general.alignment", ALIGNMENT)
     w.add_uint32("dspark.n_layers", n_stages)
@@ -448,13 +510,17 @@ def main():
     mp = dequant_block_scaled(st, "mtp.0.main_proj.weight")
     w.add_tensor("mtp.0.main_proj.weight", [mp.shape[1], mp.shape[0]], GGML_Q8_0, quantize_q8_0(mp))
 
-    for src, dst, ttype in (
+    head_tensors = [
         (f"mtp.{last}.norm.weight", f"mtp.{last}.norm.weight", GGML_F32),
+        (f"mtp.{last}.confidence_head.proj.weight", f"mtp.{last}.confidence_head.proj.weight", GGML_F32),
+    ]
+    if cfg["dspark_target_architecture"] == "deepseek4":
+        head_tensors.extend([
         (f"mtp.{last}.hc_head_fn", f"mtp.{last}.hc_head_fn.weight", GGML_F32),
         (f"mtp.{last}.hc_head_scale", f"mtp.{last}.hc_head_scale.weight", GGML_F32),
         (f"mtp.{last}.hc_head_base", f"mtp.{last}.hc_head_base.weight", GGML_F32),
-        (f"mtp.{last}.confidence_head.proj.weight", f"mtp.{last}.confidence_head.proj.weight", GGML_F32),
-    ):
+        ])
+    for src, dst, ttype in head_tensors:
         v = dequant_block_scaled(st, src).astype(np.float32)
         dims = list(reversed(v.shape)) if v.ndim > 1 else [v.shape[0]]
         w.add_tensor(dst, dims, ttype, np.ascontiguousarray(v).tobytes())
@@ -462,10 +528,13 @@ def main():
     # The Markov head is gathered per token (w1) and used as a matmul (w2); both
     # are vocab-sized, so w1 stays BF16 (cheap to dequantize once at load) and
     # w2 is quantized like the other projections.
-    w1 = dequant_block_scaled(st, f"mtp.{last}.markov_head.markov_w1.weight").astype(np.float32)
+    v41 = cfg["dspark_target_architecture"] == "deepseek41"
+    w1_name = "embed" if v41 else "markov_w1"
+    w2_name = "head" if v41 else "markov_w2"
+    w1 = dequant_block_scaled(st, f"mtp.{last}.markov_head.{w1_name}.weight").astype(np.float32)
     w1_bf16 = (w1.view(np.uint32) >> 16).astype(np.uint16)
     w.add_tensor(f"mtp.{last}.markov_head.markov_w1.weight", [w1.shape[1], w1.shape[0]], GGML_BF16, w1_bf16.tobytes())
-    w2 = dequant_block_scaled(st, f"mtp.{last}.markov_head.markov_w2.weight")
+    w2 = dequant_block_scaled(st, f"mtp.{last}.markov_head.{w2_name}.weight")
     w.add_tensor(f"mtp.{last}.markov_head.markov_w2.weight", [w2.shape[1], w2.shape[0]], GGML_Q8_0, quantize_q8_0(w2))
 
     log(f"writing {args.out} ({len(w.tensors)} tensors)")

@@ -24,7 +24,6 @@ namespace TensorSharp.Models
         // Scratch, sized on first use.
         private float[] _gdnConvOut, _gdnQ, _gdnK, _gdnV, _gdnQx, _gdnKx, _gdnDelta, _gdnCore;
 
-        private bool _qsaBudgetWarned;
 
         /// <summary>
         /// Gated DeltaNet, the same recurrence Qwen 3.5 runs, with two differences
@@ -360,7 +359,6 @@ namespace TensorSharp.Models
 
         private void EnsureGdnScratch()
         {
-            if (_gdnConvOut != null) return;
             // The fused kernel updates the recurrent state in place, so it lives in a
             // Tensor rather than the float[] the per-token loop used. A holder
             // swap may have installed pre-seeded tensors whose addresses key the
@@ -373,6 +371,10 @@ namespace TensorSharp.Models
                 _gdnStateT[l] = new Tensor(_allocator, DType.Float32, _numVHeads, _headVDim, _headKDim);
                 Ops.Fill(_gdnStateT[l], 0f);
             }
+            // These belong to the active holder. Shared scratch may already exist
+            // when restoring the primary holder before its first forward.
+            _gdnConvWriteIdx ??= new int[Config.NumLayers];
+            if (_gdnConvOut != null) return;
             int keyDim = _headKDim * _numKHeads;
             int valueDim = _headVDim * _numVHeads;
             _gdnConvOut = new float[_convDim];
@@ -383,7 +385,6 @@ namespace TensorSharp.Models
             _gdnKx = new float[(long)_numVHeads * _headKDim];
             _gdnDelta = new float[_headVDim];
             _gdnCore = new float[_headVDim];
-            _gdnConvWriteIdx = new int[Config.NumLayers];
         }
 
         private unsafe void EnsureGdnConvWeights(int il)
@@ -405,10 +406,8 @@ namespace TensorSharp.Models
         /// Full attention: a joint Q|gate projection (per head, interleaved), Q/K RMS
         /// norm, partial IMRoPE, then a sigmoid gate on the attention output.
         ///
-        /// QSA is not applied yet. It does not have to be below its budget: the indexer
-        /// keeps <c>indexer_top_k + compress_ratio - 1</c> cells, so at or under that
-        /// many cached tokens the selection is every cell and the result is exactly
-        /// dense. Past it this warns once rather than silently drifting.
+        /// This per-operation fallback is for dense configurations. QSA runs in
+        /// the token span, which also owns its persistent raw indexer cache.
         /// </summary>
         private unsafe Tensor AttentionLayer(Tensor cur, int il, int seqLen, int startPos)
         {
@@ -596,35 +595,7 @@ namespace TensorSharp.Models
             InvalidateTensorDeviceCache(data);
         }
 
-        /// <summary>
-        /// Say once, per model, that the context has passed the size at which the
-        /// (unimplemented) sparse-attention indexer would start selecting rather
-        /// than keeping every cell. Every path runs dense attention either way, so
-        /// this is a note about reference fidelity, not a behaviour switch.
-        ///
-        /// It lives on the common forward entry point deliberately. It used to be
-        /// printed from the op-by-op AttentionLayer, which the fused paths reached
-        /// only by DECLINING the whole token - so printing the warning cost a
-        /// mid-sequence path switch that reset the GDN and PLE recurrent state and
-        /// wrecked the generation. A diagnostic must never be the reason a code
-        /// path is taken.
-        /// </summary>
-        private void WarnIfQsaBudgetExceeded(int totalLen)
-        {
-            if (_qsaBudgetWarned || _compressRatios == null) return;
-            for (int il = 0; il < Config.NumLayers; il++)
-            {
-                if (!UsesQsa(il)) continue;
-                int budget = _indexerTopK + _compressRatios[il] - 1;
-                if (totalLen <= budget) continue;
-                _qsaBudgetWarned = true;
-                Console.WriteLine(
-                    $"[qwen4exp] context {totalLen} exceeds the QSA budget " +
-                    $"({_indexerTopK} + {_compressRatios[il]} - 1); running dense attention. " +
-                    "Output stays close but is no longer bit-exact against the reference.");
-                return;
-            }
-        }
+
 
         /// <summary>
         /// Partial rotary over the first <c>rope.dimension_count</c> of each head.

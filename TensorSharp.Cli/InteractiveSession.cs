@@ -1640,8 +1640,8 @@ namespace TensorSharp.Cli
 
             // Streaming output parser so we strip <think> blocks from the live
             // console output (they're surfaced separately when --think is on).
-            var parser = OutputParserFactory.Create(arch);
-            parser.Init(_enableThinking, _tools);
+            var parser = CliOutputParser.Create(arch, _enableThinking, _tools,
+                _model.Tokenizer, inputTokens);
             bool useParser = _enableThinking || (_tools != null && _tools.Count > 0) || parser.AlwaysRequired;
             bool showThinking = _enableThinking || parser.AlwaysRequired;
 

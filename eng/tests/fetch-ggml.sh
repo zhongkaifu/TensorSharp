@@ -90,10 +90,11 @@ assert_clean_checkout "${WORKSPACE}" "${SECOND_COMMIT}" 'branch update stays cle
 
 # NO_UPDATE must neither fetch a new commit nor rewrite origin, even with an
 # unavailable requested URL. Exercise the documented spellings.
+ORIGINAL_ORIGIN="$(git -C "${WORKSPACE}/ExternalProjects/ggml" remote get-url origin)"
 for truthy in 1 ON true; do
     run_fetch "${WORKSPACE}" fixture-v1 "${truthy}" "${TEST_ROOT}/missing-origin"
     assert_clean_checkout "${WORKSPACE}" "${SECOND_COMMIT}" "no-update ${truthy} preserves checkout"
-    [[ "$(git -C "${WORKSPACE}/ExternalProjects/ggml" remote get-url origin)" == "${UPSTREAM}" ]] \
+    [[ "$(git -C "${WORKSPACE}/ExternalProjects/ggml" remote get-url origin)" == "${ORIGINAL_ORIGIN}" ]] \
         || fail "no-update ${truthy}: origin was rewritten"
 done
 

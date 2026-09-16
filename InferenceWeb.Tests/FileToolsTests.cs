@@ -97,6 +97,73 @@ public class FileToolsTests : IDisposable
 
     private static string Numbered(int line) => NumberedListing.Prefix(line);
 
+    [Theory]
+    [InlineData("create")]
+    [InlineData("edit")]
+    [InlineData("overwrite")]
+    public void AFileMutation_PublishesOnlyItsOutput_WithDownloadableBytes(string operation)
+    {
+        var store = new CodeArtifactStore(Path.Combine(_base, "artifacts"));
+        using var runner = new ShellRunner(new CodeExecOptions
+        {
+            Enabled = true,
+            Sandbox = SkillSandboxMode.Off,
+            ArtifactUriPrefix = "/api/code/artifacts",
+        }, null, store);
+        Write("untouched.txt", "not an output\n");
+        if (operation != "create")
+            Write("reports/result.json", "{\"sum\":702}\n");
+
+        CodeExecResult result = operation == "edit"
+            ? runner.EditFile(new ShellTools.EditRequest("reports/result.json", "702", "703", false), _workspace)
+            : runner.WriteFile(new ShellTools.WriteRequest("reports/result.json", "{\"sum\":703}\n")
+                { Overwrite = operation == "overwrite" }, _workspace);
+
+        Assert.True(result.Ok, result.Content);
+        CodeArtifact artifact = Assert.Single(result.Artifacts);
+        Assert.Equal("reports/result.json", artifact.Path);
+        Assert.Equal(result.RunId, artifact.RunId);
+        Assert.Equal($"/api/code/artifacts/{artifact.RunId}/reports/result.json", artifact.Pointer);
+        Assert.Contains($"[reports/result.json]({artifact.Pointer})", result.Content, StringComparison.Ordinal);
+        Assert.DoesNotContain("untouched.txt", result.Content, StringComparison.Ordinal);
+        Assert.True(store.TryResolve(artifact.RunId, artifact.Path, out string? captured, out _));
+        Assert.Equal("{\"sum\":703}\n", File.ReadAllText(captured!));
+
+        // The download is a retained copy, independent of later workspace edits.
+        Write("reports/result.json", "later\n");
+        Assert.Equal("{\"sum\":703}\n", File.ReadAllText(captured!));
+    }
+
+    [Fact]
+    public void ReadsRefusalsAndIdenticalWrites_DoNotRepublishExistingFiles()
+    {
+        var store = new CodeArtifactStore(Path.Combine(_base, "artifacts"));
+        using var runner = new ShellRunner(new CodeExecOptions { Enabled = true }, null, store);
+        Write("result.json", "{}\n");
+
+        Assert.Empty(runner.ReadFile(new ShellTools.ReadRequest("result.json", 0, 0), _workspace).Artifacts);
+        Assert.Empty(runner.WriteFile(new ShellTools.WriteRequest("result.json", "{}\n") { Overwrite = false }, _workspace).Artifacts);
+        CodeExecResult refused = runner.WriteFile(new ShellTools.WriteRequest("result.json", "different") { Overwrite = false }, _workspace);
+        Assert.False(refused.Ok);
+        Assert.Empty(refused.Artifacts);
+        Assert.Empty(runner.EditFile(new ShellTools.EditRequest("result.json", "missing", "new", false), _workspace).Artifacts);
+    }
+
+    [Fact]
+    public void AFileMutation_ReportsArtifactLimitsWithoutLosingItsSuccessfulWrite()
+    {
+        var store = new CodeArtifactStore(Path.Combine(_base, "artifacts"),
+            new CodeArtifactLimits { MaxFileBytes = 2 });
+        using var runner = new ShellRunner(new CodeExecOptions { Enabled = true }, null, store);
+
+        CodeExecResult result = runner.WriteFile(new ShellTools.WriteRequest("result.txt", "too large"), _workspace);
+
+        Assert.True(result.Ok, result.Content);
+        Assert.Equal("too large", Read("result.txt"));
+        Assert.Empty(result.Artifacts);
+        Assert.Contains("per-file limit", result.Content, StringComparison.Ordinal);
+    }
+
     // ---- read_file ---------------------------------------------------------
 
     [Fact]

@@ -41,7 +41,8 @@ namespace TensorSharp.Models
         // Native slot serving the single-stream (N==1) path. Slot 0 at load;
         // replaced when AdoptPrimaryCacheToFused hands slot 0 to a request.
         private int _primarySlot;
-        // Request whose slot is currently active, or null when the primary is.
+        // Request whose slot is currently active, or null for primary/retained selection.
+        // _selectedRetainedKey distinguishes a selected retained slot from primary.
         private string _activeSlotKey;
         // Set when a mid-step chunked batched call failed once (see
         // TryForwardBatchedFusedDecode); large batches then decline outright.
@@ -49,6 +50,61 @@ namespace TensorSharp.Models
         // Set when the 16-wide native graph failed to build once; batched
         // steps then run as 8-wide windows (see TryForwardBatchedFusedDecode).
         private bool _batchedWideSpanFailed;
+
+        // The release path deliberately has no allocation operation. A request
+        // can finish because the device is full, including after adopting the
+        // primary slot; releasing it must not first allocate another full cache.
+        internal interface INativeSlotRelease
+        {
+            bool Reset();
+            bool Select(int slot);
+            bool Free(int slot);
+        }
+
+        private readonly struct NativeSlotRelease : INativeSlotRelease
+        {
+            private readonly IntPtr _native;
+            public NativeSlotRelease(IntPtr native) => _native = native;
+            public bool Reset() => GgmlDeepSeek4Native.ResetChecked(_native);
+            public bool Select(int slot) => GgmlDeepSeek4Native.SetActiveSlot(_native, slot);
+            public bool Free(int slot) => GgmlDeepSeek4Native.SlotFree(_native, slot);
+        }
+
+        // Constrained value-type dispatch avoids allocating delegates or an
+        // adapter object on release. Tests supply a capacity-limited slot store
+        // to exercise this same ownership transition without loading a model.
+        internal static void ReleaseNativeSequence<TNative>(Dictionary<string, int> requests,
+            string requestId, ref int primarySlot, ref string activeRequest, TNative native)
+            where TNative : INativeSlotRelease
+        {
+            if (requests == null || string.IsNullOrEmpty(requestId) ||
+                !requests.TryGetValue(requestId, out int slot)) return;
+
+            if (string.Equals(activeRequest, requestId, StringComparison.Ordinal))
+            {
+                if (primarySlot < 0)
+                {
+                    // The adopted primary belongs to a completed request now.
+                    // Reclaim it in place. Failed native Reset also discards its
+                    // captured graph arenas; successful resets preserve reuse.
+                    if (!native.Reset())
+                        throw new InvalidOperationException("DSV4 native reset failed; request still owns the unusable slot.");
+                    primarySlot = slot;
+                    activeRequest = null;
+                    requests.Remove(requestId);
+                    return;
+                }
+                if (!native.Select(primarySlot))
+                    throw new InvalidOperationException($"DSV4 primary slot {primarySlot} missing during sequence release.");
+                activeRequest = null;
+            }
+
+            // Forget ownership only after native destruction succeeds. If a
+            // switch/free is refused, a later release can retry the same slot.
+            if (!native.Free(slot))
+                throw new InvalidOperationException($"DSV4 slot {slot} could not be freed during sequence release.");
+            requests.Remove(requestId);
+        }
 
 
         /// <summary>The batched paged forward has no DSV4 implementation (the
@@ -93,17 +149,30 @@ namespace TensorSharp.Models
                 bool fresh = false;
                 if (!_slotByRequest.TryGetValue(requestId, out int slot))
                 {
-                    slot = GgmlDeepSeek4Native.SlotAlloc(_handle);
+                    // Reserve dictionary storage before changing native ownership.
+                    _slotByRequest.EnsureCapacity(_slotByRequest.Count + 1);
+                    if (SupportsRetainedFusedCache && _primarySlot < 0) ReclaimRetainedPrimary();
+                    bool takeEmptyPrimary = SupportsRetainedFusedCache && _primarySlot >= 0
+                        && GgmlDeepSeek4Native.SlotStatus(_handle, _primarySlot, out int head, out _, out bool healthy)
+                        && healthy && head == 0;
+                    slot = takeEmptyPrimary ? _primarySlot : GgmlDeepSeek4Native.SlotAlloc(_handle);
                     if (slot < 0)
                         throw new InvalidOperationException(
                             "DSV4 sequence-slot allocation failed (device memory exhausted?).");
-                    _slotByRequest[requestId] = slot;
+                    try { _slotByRequest.Add(requestId, slot); }
+                    catch
+                    {
+                        if (!takeEmptyPrimary) GgmlDeepSeek4Native.SlotFree(_handle, slot);
+                        throw;
+                    }
+                    if (takeEmptyPrimary) _primarySlot = -1;
                     fresh = true;
                 }
 
                 if (!GgmlDeepSeek4Native.SetActiveSlot(_handle, slot))
                     throw new InvalidOperationException($"DSV4 slot {slot} missing for request {requestId}.");
                 _activeSlotKey = requestId;
+                _selectedRetainedKey = null;
                 return fresh;
             }
         }
@@ -118,7 +187,8 @@ namespace TensorSharp.Models
             {
                 if (_handle == IntPtr.Zero) return;
                 _slotByRequest ??= new Dictionary<string, int>(StringComparer.Ordinal);
-                if (_activeSlotKey != null) return;   // a request slot is already checked out
+                if (_activeSlotKey != null || _selectedRetainedKey != null || _primarySlot < 0) return;
+                // A selected retained holder is never an adoptable primary.
                 if (_slotByRequest.ContainsKey(requestId)) return;
 
                 _slotByRequest[requestId] = _primarySlot;
@@ -133,7 +203,8 @@ namespace TensorSharp.Models
         {
             lock (_sync)
             {
-                if (_handle == IntPtr.Zero || _activeSlotKey == null) return;
+                if (_handle == IntPtr.Zero || (_activeSlotKey == null && _selectedRetainedKey == null)) return;
+                if (_primarySlot < 0) ReclaimRetainedPrimary();
                 if (_primarySlot < 0)
                 {
                     _primarySlot = GgmlDeepSeek4Native.SlotAlloc(_handle);
@@ -141,8 +212,10 @@ namespace TensorSharp.Models
                         throw new InvalidOperationException(
                             "DSV4 primary-slot allocation failed (device memory exhausted?).");
                 }
-                GgmlDeepSeek4Native.SetActiveSlot(_handle, _primarySlot);
+                if (!GgmlDeepSeek4Native.SetActiveSlot(_handle, _primarySlot))
+                    throw new InvalidOperationException($"DSV4 primary slot {_primarySlot} could not be selected.");
                 _activeSlotKey = null;
+                _selectedRetainedKey = null;
             }
         }
 
@@ -159,7 +232,7 @@ namespace TensorSharp.Models
         {
             lock (_sync)
             {
-                if (_handle == IntPtr.Zero || _slotByRequest == null) return false;
+                if (_handle == IntPtr.Zero || _slotByRequest == null || HasDraftHead) return false;
                 int n = requestIds.Count;
                 if (n < 2) return false;
 
@@ -243,29 +316,16 @@ namespace TensorSharp.Models
             }
         }
 
-        /// <summary>Free a finished/aborted request's slot (its caches and any
-        /// graphs captured against them).</summary>
+        /// <summary>Release a finished/aborted request's slot. Reclaim an adopted
+        /// primary in place when no spare primary exists; otherwise free its
+        /// caches and captured graphs.</summary>
         public void OnSequenceReleased(string requestId)
         {
             lock (_sync)
             {
-                if (_handle == IntPtr.Zero
-                    || _slotByRequest == null
-                    || string.IsNullOrEmpty(requestId)
-                    || !_slotByRequest.TryGetValue(requestId, out int slot))
-                {
-                    return;
-                }
-
-                if (string.Equals(_activeSlotKey, requestId, StringComparison.Ordinal))
-                {
-                    // The released slot is active; reinstate the primary first
-                    // (the native side refuses to free the active slot).
-                    RestorePrimaryCache();
-                }
-
-                _slotByRequest.Remove(requestId);
-                GgmlDeepSeek4Native.SlotFree(_handle, slot);
+                if (_handle == IntPtr.Zero) return;
+                ReleaseNativeSequence(_slotByRequest, requestId, ref _primarySlot, ref _activeSlotKey,
+                    new NativeSlotRelease(_handle));
             }
         }
     }

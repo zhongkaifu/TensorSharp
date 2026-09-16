@@ -9,16 +9,24 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 #include "ggml_ops_internal.h"
 #include "ggml-impl.h"
+#include "ggml_ops_qwen4exp_qsa.h"
+#include "ggml_ops_matmul_precision.h"
+#include "ggml_ops_dsv4_fused.h"
+#ifdef TSG_GGML_USE_CUDA
+#include "ggml-cuda.h"
+#endif
 #include <cstdlib>
 #include <cstdio>
 
 #include <cmath>
 #include <cstring>
 #include <cstdint>
+#include <type_traits>
 #include <vector>
 #include <unordered_map>
 
 using namespace tsg;
+#include "ggml_ops_qwen4exp_qsa.inc"
 
 // ============================================================================
 // Qwen3.8-Flash-Next (qwen4exp) fused layers.
@@ -76,7 +84,12 @@ namespace
         const void* sig3 = nullptr;
         const void* sig4 = nullptr;      // head descriptor, or null
         const void* sig5 = nullptr;      // PLE descriptor, or null
+        const void* qsa_sig = nullptr;
+        std::vector<Q4eQsaInputs> qsa_inputs;
+        ggml_backend_t precise_backend = nullptr;
         ggml_tensor* logits = nullptr;
+        int logits_rows = 1;
+        bool export_hidden = false;
         ggml_tensor* ple_emb_in = nullptr;
         int layer_begin = -1;
         int layer_end = -1;
@@ -120,13 +133,15 @@ namespace
         // Drop the graph but KEEP the recurrent state: a shape change does this.
         void reset_graph()
         {
+            if (precise_backend) { ggml_backend_synchronize(precise_backend); ggml_backend_free(precise_backend); precise_backend = nullptr; }
+            qsa_sig = nullptr; qsa_inputs.clear();
             if (alloc) { ggml_gallocr_free(alloc); alloc = nullptr; }
             if (ctx) { ggml_free(ctx); ctx = nullptr; }
             graph = nullptr; res_in = nullptr; res_out = nullptr;
             conv_in = conv_out = ssm_in = ssm_out = nullptr;
             valid = false; n_tokens = 0; hc_dim = 0; sig = nullptr; res_resident = -1;
             sig2 = nullptr; sig3 = nullptr; sig4 = nullptr; sig5 = nullptr;
-            logits = nullptr; ple_emb_in = nullptr;
+            logits = nullptr; logits_rows = 1; export_hidden = false; ple_emb_in = nullptr;
             layer_begin = -1; layer_end = -1; kv_capacity = -1; first_ffn_only = 0;
             use_mrope = 0;
             mask = nullptr; pos = nullptr; kv_idx = nullptr; n_kv = -1;
@@ -923,7 +938,7 @@ ggml_tensor* q4e_nodes_attn(
     std::vector<ggml_tensor*>* kv_out,
     std::vector<ggml_tensor*>* probe,
     const int32_t* mrope_sections,
-    Q4eAttnArenaIO* arena)
+    Q4eAttnArenaIO* arena, ggml_tensor* owned_k, ggml_tensor* owned_v, const Q4eQsaGraph* qsa)
 {
     const int hc_dim = hc * n_embd;
     const int q_dim = head_dim * n_head;
@@ -944,8 +959,10 @@ ggml_tensor* q4e_nodes_attn(
     ggml_tensor* v_cache  = nullptr;
     if (arena == nullptr)
     {
-        k_cache = ggml_new_tensor_3d(ctx, (ggml_type)a->kv_type, head_dim, kv_capacity, n_head_kv);
-        v_cache = ggml_new_tensor_3d(ctx, (ggml_type)a->kv_type, head_dim, kv_capacity, n_head_kv);
+        k_cache = owned_k != nullptr ? owned_k
+            : ggml_new_tensor_3d(ctx, (ggml_type)a->kv_type, head_dim, kv_capacity, n_head_kv);
+        v_cache = owned_v != nullptr ? owned_v
+            : ggml_new_tensor_3d(ctx, (ggml_type)a->kv_type, head_dim, kv_capacity, n_head_kv);
     }
 
     // ---- hyper-connection mixer ----
@@ -962,6 +979,10 @@ ggml_tensor* q4e_nodes_attn(
                 ggml_row_size(gated->type, n_embd) * hc, ggml_row_size(gated->type, n_embd) * c));
     mixed = ggml_scale(ctx, mixed, 1.0f / (float)hc);
     ggml_tensor* inject = ggml_mul_mat(ctx, w_inject, xn);
+
+    if (qsa != nullptr)
+        mask = q4e_nodes_qsa_mask(ctx, graph, bnd, *qsa, mixed, mask, kv_idx,
+            n_embd, T, n_kv_pad, n_rot, rope_base, rope_freq_scale, eps);
 
     // ---- q | gate, interleaved per head ----
     ggml_tensor* qg = ggml_mul_mat(ctx, wq, mixed);                 // [q_dim*2, T]
@@ -1094,8 +1115,10 @@ ggml_tensor* q4e_nodes_attn(
     // the graph rather than a weights binding. (Arena mode owns no cache pair.)
     if (arena == nullptr)
     {
-        bnd.add(k_cache, a->k_cache, (std::size_t)a->kv_bytes, GGML_BACKEND_BUFFER_USAGE_ANY);
-        bnd.add(v_cache, a->v_cache, (std::size_t)a->kv_bytes, GGML_BACKEND_BUFFER_USAGE_ANY);
+        if (owned_k == nullptr)
+            bnd.add(k_cache, a->k_cache, (std::size_t)a->kv_bytes, GGML_BACKEND_BUFFER_USAGE_ANY);
+        if (owned_v == nullptr)
+            bnd.add(v_cache, a->v_cache, (std::size_t)a->kv_bytes, GGML_BACKEND_BUFFER_USAGE_ANY);
         if (kv_out != nullptr) { kv_out->push_back(k_cache); kv_out->push_back(v_cache); }
     }
 
@@ -1763,7 +1786,7 @@ TSG_EXPORT int TSGgml_Qwen4ExpAttnBlock(
 // TSGgmlQwen4ExpPleArgs / TSGgmlQwen4ExpHeadArgs live in ggml_ops_internal.h
 // (shared with the arena kernel).
 
-TSG_EXPORT int TSGgml_Qwen4ExpTokenSpan(
+static int q4e_token_span_impl(
     const TSGgmlQwen4ExpFfnArgs* ffn,
     const TSGgmlQwen4ExpGdnArgs* gdn,
     const TSGgmlQwen4ExpAttnArgs* attn,
@@ -1780,7 +1803,8 @@ TSG_EXPORT int TSGgml_Qwen4ExpTokenSpan(
     const TSGgmlQwen4ExpHeadArgs* head, void* logits_out,
     const TSGgmlQwen4ExpPleArgs* ple, int ple_layer, const void* ple_emb,
     const int* mrope_pos, const int* mrope_sections, int rope_position,
-    int device)
+    int device, void* hidden_out, int logits_rows,
+    const TSGgmlQwen4ExpQsaArgs* qsa, const int32_t* qsa_positions, int qsa_position_count)
 {
     try
     {
@@ -1789,6 +1813,13 @@ TSG_EXPORT int TSGgml_Qwen4ExpTokenSpan(
             || layer_end > kQwen4ExpMaxSlots)
         {
             set_last_error("qwen4exp token span: bad args.");
+            return 0;
+        }
+        if (n_tokens <= 0 || n_embd <= 0 || hc <= 0
+            || (logits_rows != 1 && logits_rows != n_tokens)
+            || (hidden_out != nullptr && head == nullptr))
+        {
+            set_last_error("qwen4exp token span: invalid speculative output shape.");
             return 0;
         }
         // LAYER SPLIT: run this span's layers on their own GPU. Everything the
@@ -1852,6 +1883,57 @@ TSG_EXPORT int TSGgml_Qwen4ExpTokenSpan(
             n_kv_pad = q4e_pad_kv(n_kv, kv_capacity, use_flash);
         }
         const std::size_t mask_bytes = (std::size_t)n_kv_pad * T * sizeof(uint16_t);
+        std::map<int, Q4eQsaPlan> qsa_plans;
+        if (qsa != nullptr)
+        {
+            if (!qsa_positions || n_kv <= 0 || T > n_kv || qsa_position_count != n_kv || position < 0 || position > n_kv - T)
+                throw std::invalid_argument("qwen4exp QSA: incomplete position history");
+            for (int il = layer_begin; il < layer_end; ++il)
+            {
+                const auto& a = qsa[il];
+                if (!a.ratio) continue;
+                if (kinds[il] != 0 || first_ffn_only || a.ratio < 1 || a.ratio > 64
+                    || a.top_k <= 0 || a.top_k > INT32_MAX - a.ratio || a.head_dim < n_rot || a.head_dim > 4096
+                    || a.heads <= 0 || a.heads > 1024 || n_rot <= 0
+                    || !std::isfinite(eps) || eps <= 0 || !std::isfinite(rope_base) || rope_base <= 0
+                    || !std::isfinite(rope_freq_scale) || rope_freq_scale <= 0
+                    || !a.k_proj || !a.q_proj || !a.k_norm || !a.q_norm || !a.cache
+                    || (a.cache_type != GGML_TYPE_F32 && a.cache_type != GGML_TYPE_F16))
+                    throw std::invalid_argument("qwen4exp QSA: invalid descriptor");
+                auto matrix_valid = [&](int type, long long bytes, int64_t rows) {
+                    if (type < 0 || type >= GGML_TYPE_COUNT || bytes <= 0 || rows <= 0) return false;
+                    const auto* tr = ggml_get_type_traits((ggml_type)type);
+                    if (!tr->type_size || !tr->blck_size || n_embd % tr->blck_size
+                        || (type != GGML_TYPE_F32 && type != GGML_TYPE_F16 && type != GGML_TYPE_BF16
+                            && !(tr->is_quantized && tr->to_float))) return false;
+                    return (uint64_t)bytes == (uint64_t)(n_embd / tr->blck_size) * tr->type_size * rows;
+                };
+                if (!matrix_valid(a.k_type, a.k_bytes, a.head_dim)
+                    || !matrix_valid(a.q_type, a.q_bytes, (int64_t)a.head_dim * a.heads)
+                    || a.cache_bytes != (int64_t)ggml_row_size((ggml_type)a.cache_type, a.head_dim) * kv_capacity)
+                    throw std::invalid_argument("qwen4exp QSA: invalid storage size/type");
+                int64_t section_sum = 0;
+                for (int section : a.rope_sections) { if (section < 0) throw std::invalid_argument("qwen4exp QSA: negative rotary section"); section_sum += section; }
+                if (section_sum <= 0 || section_sum > n_rot || n_rot % 2)
+                    throw std::invalid_argument("qwen4exp QSA: invalid rotary sections");
+                if (!qsa_plans.count(a.ratio))
+                    qsa_plans.emplace(a.ratio, q4e_qsa_plan(qsa_positions, n_kv, n_kv_pad, position, T, a.ratio));
+            }
+        }
+        auto upload_qsa = [&](const std::vector<Q4eQsaInputs>& inputs) {
+            for (const auto& in : inputs)
+            {
+                const auto& plan = qsa_plans.at(in.ratio);
+                auto put = [](ggml_tensor* t, const auto& values) {
+                    // Selection inputs are unused below the sparse width; no buffer then.
+                    if (t && t->buffer) ggml_backend_tensor_set(t, values.data(), 0, values.size() * sizeof(values[0]));
+                };
+                put(in.cell_blocks, plan.cell_blocks); put(in.block_cells, plan.block_cells);
+                put(in.block_positions, plan.block_positions); put(in.query_positions, plan.query_positions);
+                put(in.bias, plan.bias);
+            }
+        };
+
 
         Qwen4ExpFfnCache* slot = (cache_slot >= 0 && cache_slot < kQwen4ExpSpanSlots)
             ? &g_q4e_span[cache_slot] : nullptr;
@@ -1869,10 +1951,13 @@ TSG_EXPORT int TSGgml_Qwen4ExpTokenSpan(
             && slot->n_tokens == T && slot->hc_dim == hc_dim
             && slot->sig == (const void*)ffn && slot->sig2 == (const void*)gdn
             && slot->sig3 == (const void*)attn
+            && slot->qsa_sig == (const void*)qsa
             && slot->layer_begin == layer_begin && slot->layer_end == layer_end
             && slot->kv_capacity == kv_capacity && slot->n_kv == n_kv_pad
             && slot->first_ffn_only == first_ffn_only
             && slot->sig4 == (const void*)head
+            && slot->logits_rows == logits_rows
+            && slot->export_hidden == (hidden_out != nullptr)
             && slot->sig5 == (const void*)(has_ple ? ple : nullptr)
             && slot->use_mrope == (use_mrope ? 1 : 0))
         {
@@ -1885,6 +1970,7 @@ TSG_EXPORT int TSGgml_Qwen4ExpTokenSpan(
             for (std::size_t i = 0; i < slot->span_pos.size(); ++i)
                 q4e_set_attn_indices(slot->span_pos[i], slot->span_kvidx[i], T, position,
                         use_mrope ? (const int32_t*)mrope_pos : nullptr, rope_position);
+            upload_qsa(slot->qsa_inputs);
             q4e_note(3, false);
             if (q4e_span_trace() && !slot->span_copies.empty() && T == 1)
             {
@@ -1903,7 +1989,7 @@ TSG_EXPORT int TSGgml_Qwen4ExpTokenSpan(
                 }
                 fprintf(stderr, "%c", 10);
             }
-            if (graph_compute_profiled(g_backend, slot->graph, kQwen4ExpSpanKernel) != GGML_STATUS_SUCCESS)
+            if (graph_compute_profiled(slot->precise_backend ? slot->precise_backend : g_backend, slot->graph, kQwen4ExpSpanKernel) != GGML_STATUS_SUCCESS)
             {
                 slot->reset_graph();
                 set_last_error("qwen4exp token span: replay failed.");
@@ -1911,10 +1997,14 @@ TSG_EXPORT int TSGgml_Qwen4ExpTokenSpan(
             }
             if (slot->logits != nullptr)
             {
+                if (!slot->span_copies.empty())
+                    tsg::sync_backend(g_backend);
                 for (const auto& c : slot->span_copies)
                     ggml_backend_tensor_copy(c.first, c.second);
                 ggml_backend_tensor_get(slot->logits, logits_out, 0,
-                        (std::size_t)head->vocab * sizeof(float));
+                        (std::size_t)head->vocab * logits_rows * sizeof(float));
+                if (hidden_out != nullptr)
+                    ggml_backend_tensor_get(slot->res_out, hidden_out, 0, res_bytes);
                 q4e_trace_state(slot, "replay", position);
                 return 1;
             }
@@ -1945,6 +2035,9 @@ TSG_EXPORT int TSGgml_Qwen4ExpTokenSpan(
         ip.no_alloc = true;
         ggml_context* ctx = ggml_init(ip);
         if (ctx == nullptr) { set_last_error("qwen4exp token span: ggml_init failed."); return 0; }
+        // Keep local ownership until the complete graph is published below.
+        // Binder/vector/state setup can throw after ggml_init or allocation.
+        std::unique_ptr<ggml_context, decltype(&ggml_free)> owned_ctx(ctx, ggml_free);
 
         ggml_tensor* res_in = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc_dim, T);
         ggml_set_input(res_in);
@@ -1980,6 +2073,28 @@ TSG_EXPORT int TSGgml_Qwen4ExpTokenSpan(
         if (q4e_graph_uid_enabled()) graph->uid = q4e_next_graph_uid();
 
         Q4eBinder binder{ggml_backend_get_device(g_backend)};
+        slot->qsa_inputs.reserve(qsa_plans.size());
+        for (const auto& item : qsa_plans)
+        {
+            Q4eQsaInputs in;
+            in.ratio = item.first;
+            const int blocks = (n_kv_pad + in.ratio - 1) / in.ratio;
+            in.cell_blocks = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_kv_pad);
+            in.block_cells = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, (int64_t)in.ratio * blocks);
+            in.block_positions = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, (int64_t)4 * blocks);
+            in.query_positions = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, (int64_t)4 * T);
+            in.bias = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, blocks, T);
+            for (auto* t : {in.cell_blocks, in.block_cells, in.block_positions, in.query_positions, in.bias}) ggml_set_input(t);
+            slot->qsa_inputs.push_back(in);
+        }
+#ifdef TSG_GGML_USE_CUDA
+        if (!qsa_plans.empty() && ggml_backend_is_cuda(g_backend))
+        {
+            slot->precise_backend = tsg_dsv4_fused_backend_init(g_backend);
+            if (!slot->precise_backend) throw std::runtime_error("qwen4exp QSA: precise backend creation failed");
+        }
+#endif
+
 
         const std::size_t conv_dim = (std::size_t)(head_k_dim * n_k_heads) * 2
                                    + (std::size_t)(head_v_dim * n_v_heads);
@@ -2091,6 +2206,24 @@ TSG_EXPORT int TSGgml_Qwen4ExpTokenSpan(
                 // ---- attention half (expands its own KV write first) ----
                 bool fa_here = use_flash && (attn_seen < q4e_span_fa_max());
                 ++attn_seen;
+                Q4eQsaGraph qsa_graph;
+                if (qsa != nullptr && qsa[il].ratio > 0)
+                {
+                    const auto& a = qsa[il];
+                    qsa_graph.args = &a;
+                    for (const auto& in : slot->qsa_inputs) if (in.ratio == a.ratio) qsa_graph.inputs = &in;
+                    auto* state = q4e_seq_state(a.cache, (size_t)a.cache_bytes);
+                    if (!state) throw std::runtime_error("qwen4exp QSA: cache allocation failed");
+                    qsa_graph.cache = ggml_new_tensor_2d(ctx, (ggml_type)a.cache_type, a.head_dim, kv_capacity);
+                    ggml_set_input(qsa_graph.cache);
+                    if (ggml_backend_tensor_alloc(state->buf, qsa_graph.cache, ggml_backend_buffer_get_base(state->buf)) != GGML_STATUS_SUCCESS)
+                        throw std::runtime_error("qwen4exp QSA: cache binding failed");
+                    if (!state->ready)
+                    {
+                        binder.upload_list.push_back({qsa_graph.cache, a.cache, (size_t)a.cache_bytes});
+                        seeded_states.push_back(state);
+                    }
+                }
                 res = q4e_nodes_attn(ctx, graph, binder, &attn[il], res,
                         mask, pos, kv_idx,
                         n_embd, hc, hc_low_rank, T,
@@ -2098,7 +2231,8 @@ TSG_EXPORT int TSGgml_Qwen4ExpTokenSpan(
                         n_rot, rope_base, rope_freq_scale, attn_scale, eps, fa_here,
                         &kv_tensors,
                         (q4e_span_trace() && attn_seen == 1 && T == 1) ? &probe_nodes : nullptr,
-                        use_mrope ? (const int32_t*)mrope_sections : nullptr);
+                        use_mrope ? (const int32_t*)mrope_sections : nullptr, nullptr, nullptr, nullptr,
+                        qsa_graph.args ? &qsa_graph : nullptr);
                 ggml_build_forward_expand(graph, res);
             }
             if (q4e_span_trace()) { ggml_set_output(res); trace_res.push_back(res); }
@@ -2113,7 +2247,6 @@ TSG_EXPORT int TSGgml_Qwen4ExpTokenSpan(
 
         if (failed)
         {
-            ggml_free(ctx);
             set_last_error(std::string("qwen4exp token span: ") + (fail_what ? fail_what : "build") + " failed.");
             return 0;
         }
@@ -2123,13 +2256,16 @@ TSG_EXPORT int TSGgml_Qwen4ExpTokenSpan(
         ggml_tensor* logits = nullptr;
         if (head != nullptr)
         {
-            // ---- final mixer on the LAST token only, then the LM head ----
-            // (q4e_nodes_head, shared with the arena kernel, which runs it
-            // with T = n_slots since every slot's token is "last".)
-            ggml_tensor* last = ggml_view_2d(ctx, res_out, hc_dim, 1,
-                    res_out->nb[1], (std::size_t)(T - 1) * res_out->nb[1]);
-            logits = q4e_nodes_head(ctx, binder, head, ggml_cont(ctx, last),
-                    n_embd, hc, hc_low_rank, 1, eps);
+            // Verification needs all rows. Ordinary decode/prefill retains its
+            // original last-row head and does not keep the wide residual alive.
+            ggml_tensor* head_input = res_out;
+            if (logits_rows == 1)
+                head_input = ggml_cont(ctx, ggml_view_2d(ctx, res_out, hc_dim, 1,
+                        res_out->nb[1], (std::size_t)(T - 1) * res_out->nb[1]));
+            logits = q4e_nodes_head(ctx, binder, head, head_input,
+                    n_embd, hc, hc_low_rank, logits_rows, eps);
+            if (hidden_out != nullptr)
+                ggml_set_output(res_out);
             ggml_set_output(logits);
             ggml_build_forward_expand(graph, logits);
         }
@@ -2140,10 +2276,10 @@ TSG_EXPORT int TSGgml_Qwen4ExpTokenSpan(
 
         const double t_pregal = q4e_phase_log() ? q4e_now_ms() : 0.0;
         ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(g_backend));
+        std::unique_ptr<std::remove_pointer_t<ggml_gallocr_t>, decltype(&ggml_gallocr_free)>
+            owned_alloc(alloc, ggml_gallocr_free);
         if (alloc == nullptr || !ggml_gallocr_alloc_graph(alloc, graph))
         {
-            if (alloc) ggml_gallocr_free(alloc);
-            ggml_free(ctx);
             set_last_error("qwen4exp token span: failed to allocate graph tensors.");
             return 0;
         }
@@ -2174,11 +2310,11 @@ TSG_EXPORT int TSGgml_Qwen4ExpTokenSpan(
             q4e_set_attn_indices(slot->span_pos[i], slot->span_kvidx[i], T, position,
                     use_mrope ? (const int32_t*)mrope_pos : nullptr, rope_position);
 
+        upload_qsa(slot->qsa_inputs);
         const double t_up = q4e_phase_log() ? q4e_now_ms() : 0.0;
         q4e_note(3, true);
-        if (graph_compute_profiled(g_backend, graph, kQwen4ExpSpanKernel) != GGML_STATUS_SUCCESS)
+        if (graph_compute_profiled(slot->precise_backend ? slot->precise_backend : g_backend, graph, kQwen4ExpSpanKernel) != GGML_STATUS_SUCCESS)
         {
-            ggml_gallocr_free(alloc); ggml_free(ctx);
             set_last_error("qwen4exp token span: graph compute failed.");
             return 0;
         }
@@ -2197,7 +2333,12 @@ TSG_EXPORT int TSGgml_Qwen4ExpTokenSpan(
         for (const auto& c : slot->span_copies)
             ggml_backend_tensor_copy(c.first, c.second);
         if (logits != nullptr)
-            ggml_backend_tensor_get(logits, logits_out, 0, (std::size_t)head->vocab * sizeof(float));
+        {
+            ggml_backend_tensor_get(logits, logits_out, 0,
+                    (std::size_t)head->vocab * logits_rows * sizeof(float));
+            if (hidden_out != nullptr)
+                ggml_backend_tensor_get(res_out, hidden_out, 0, res_bytes);
+        }
         else
             ggml_backend_tensor_get(res_out, res_data, 0, res_bytes);
         q4e_trace_probe(slot, "build", position);
@@ -2270,11 +2411,13 @@ TSG_EXPORT int TSGgml_Qwen4ExpTokenSpan(
             fprintf(stderr, "\n");
         }
 
-        slot->ctx = ctx; slot->graph = graph; slot->alloc = alloc;
+        slot->ctx = owned_ctx.release(); slot->graph = graph; slot->alloc = owned_alloc.release();
         slot->res_in = res_in; slot->res_out = res_out;
         slot->n_tokens = T; slot->hc_dim = hc_dim;
         slot->sig = (const void*)ffn; slot->sig2 = (const void*)gdn; slot->sig3 = (const void*)attn;
+        slot->qsa_sig = (const void*)qsa;
         slot->sig4 = (const void*)head; slot->logits = logits;
+        slot->logits_rows = logits_rows; slot->export_hidden = hidden_out != nullptr;
         slot->sig5 = (const void*)(has_ple ? ple : nullptr);
         slot->ple_emb_in = ple_emb_in;
         slot->layer_begin = layer_begin; slot->layer_end = layer_end;
@@ -2290,6 +2433,73 @@ TSG_EXPORT int TSGgml_Qwen4ExpTokenSpan(
     { set_last_error(std::string("qwen4exp token span: ") + e.what()); return 0; }
     catch (...)
     { set_last_error("qwen4exp token span: unknown error."); return 0; }
+}
+
+// The original export keeps its ABI and last-row behavior. Speculation uses
+// the versioned export so old applications never pass an uninitialized tail.
+#define Q4E_SPAN_PARAMETERS \
+    const TSGgmlQwen4ExpFfnArgs* ffn, const TSGgmlQwen4ExpGdnArgs* gdn, \
+    const TSGgmlQwen4ExpAttnArgs* attn, const unsigned char* kinds, \
+    int layer_begin, int layer_end, void* res_data, const void* mask_data, \
+    int n_embd, int hc, int hc_low_rank, int n_tokens, \
+    int head_k_dim, int head_v_dim, int n_k_heads, int n_v_heads, int d_conv, \
+    int head_dim, int n_head, int n_head_kv, int kv_capacity, int n_kv, int position, \
+    int n_rot, float rope_base, float rope_freq_scale, float attn_scale, \
+    int n_expert, int n_expert_used, int n_ff, int n_ff_sh, \
+    float eps, int cache_slot, int first_ffn_only, \
+    const TSGgmlQwen4ExpHeadArgs* head, void* logits_out, \
+    const TSGgmlQwen4ExpPleArgs* ple, int ple_layer, const void* ple_emb, \
+    const int* mrope_pos, const int* mrope_sections, int rope_position, int device
+#define Q4E_SPAN_ARGUMENTS \
+    ffn, gdn, attn, kinds, layer_begin, layer_end, res_data, mask_data, \
+    n_embd, hc, hc_low_rank, n_tokens, head_k_dim, head_v_dim, n_k_heads, n_v_heads, d_conv, \
+    head_dim, n_head, n_head_kv, kv_capacity, n_kv, position, \
+    n_rot, rope_base, rope_freq_scale, attn_scale, n_expert, n_expert_used, n_ff, n_ff_sh, \
+    eps, cache_slot, first_ffn_only, head, logits_out, ple, ple_layer, ple_emb, \
+    mrope_pos, mrope_sections, rope_position, device
+
+TSG_EXPORT int TSGgml_Qwen4ExpTokenSpan(Q4E_SPAN_PARAMETERS)
+{
+    return q4e_token_span_impl(Q4E_SPAN_ARGUMENTS, nullptr, 1, nullptr, nullptr, 0);
+}
+
+TSG_EXPORT int TSGgml_Qwen4ExpTokenSpanEx(
+    Q4E_SPAN_PARAMETERS, void* hidden_out, int logits_rows)
+{
+    return q4e_token_span_impl(Q4E_SPAN_ARGUMENTS, hidden_out, logits_rows, nullptr, nullptr, 0);
+}
+TSG_EXPORT int TSGgml_Qwen4ExpTokenSpanQsa(
+    Q4E_SPAN_PARAMETERS, void* hidden_out, int logits_rows,
+    const TSGgmlQwen4ExpQsaArgs* qsa, const int32_t* positions, int position_count)
+{
+    return q4e_token_span_impl(Q4E_SPAN_ARGUMENTS, hidden_out, logits_rows, qsa, positions, position_count);
+}
+#undef Q4E_SPAN_ARGUMENTS
+#undef Q4E_SPAN_PARAMETERS
+
+// Copy the authoritative indexer cache before managed growth. The source key
+// stays owned until ReleaseSeqState drops every graph which can reference it.
+TSG_EXPORT int TSGgml_Qwen4ExpCopyQsaCache(const void* key, void* destination, long long bytes, int device)
+{
+    try
+    {
+        if (!key || !destination || bytes <= 0) throw std::invalid_argument("qwen4exp QSA: invalid cache copy");
+        tsg::ScopedRank rank(q4e_resolve_device(device));
+        auto* state = q4e_seq_state_find(key);
+        if (!state || !state->ready || state->bytes != (size_t)bytes)
+            throw std::invalid_argument("qwen4exp QSA: missing or mismatched cache copy source");
+        ggml_init_params params{ggml_tensor_overhead() * 4, nullptr, true};
+        std::unique_ptr<ggml_context, decltype(&ggml_free)> ctx(ggml_init(params), ggml_free);
+        if (!ctx) throw std::bad_alloc();
+        auto* tensor = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_I8, bytes);
+        if (ggml_backend_tensor_alloc(state->buf, tensor, ggml_backend_buffer_get_base(state->buf)) != GGML_STATUS_SUCCESS)
+            throw std::runtime_error("qwen4exp QSA: cache copy binding failed");
+        tsg::sync_backend(g_backend);
+        ggml_backend_tensor_get(tensor, destination, 0, (size_t)bytes);
+        return 1;
+    }
+    catch (const std::exception& e) { set_last_error(e.what()); return 0; }
+    catch (...) { set_last_error("qwen4exp QSA: cache copy failed"); return 0; }
 }
 
 // Copy the residual to / from the device-resident buffer. The op-by-op attention
@@ -2444,4 +2654,187 @@ TSG_EXPORT void TSGgml_Qwen4ExpReleaseSeqState(const void* const* keys, int n)
     }
     if (freed)
         TSGgml_Qwen4ExpResetFfnCache();
+}
+
+namespace
+{
+    struct Q4eStateSnapshotEntry
+    {
+        const void* key = nullptr;
+        int device = 0;
+        ggml_backend_buffer_t source = nullptr;
+        ggml_backend_buffer_t saved = nullptr;
+        ggml_context* ctx = nullptr;
+        ggml_tensor* live_tensor = nullptr;
+        ggml_tensor* saved_tensor = nullptr;
+        std::size_t bytes = 0;
+        bool ready = false;
+
+        ~Q4eStateSnapshotEntry()
+        {
+            if (saved) ggml_backend_buffer_free(saved);
+            if (ctx) ggml_free(ctx);
+        }
+
+        void prepare(std::size_t required)
+        {
+            if (bytes == required && saved != nullptr) return;
+            if (saved) { ggml_backend_buffer_free(saved); saved = nullptr; }
+            if (ctx) { ggml_free(ctx); ctx = nullptr; }
+            bytes = 0;
+            if (required == 0 || required % sizeof(float) != 0)
+                throw std::runtime_error("qwen4exp state snapshot: invalid state byte count");
+            ggml_init_params ip{};
+            ip.mem_size = 2 * ggml_tensor_overhead();
+            ip.no_alloc = true;
+            ctx = ggml_init(ip);
+            if (ctx == nullptr) throw std::bad_alloc();
+            live_tensor = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, required / sizeof(float));
+            saved_tensor = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, required / sizeof(float));
+            auto buft = ggml_backend_get_default_buffer_type(g_backend);
+            saved = ggml_backend_buft_alloc_buffer(buft,
+                    ggml_backend_buft_get_alloc_size(buft, saved_tensor));
+            if (saved == nullptr) throw std::bad_alloc();
+            if (ggml_backend_tensor_alloc(saved, saved_tensor,
+                    ggml_backend_buffer_get_base(saved)) != GGML_STATUS_SUCCESS)
+                throw std::runtime_error("qwen4exp state snapshot: saved buffer binding failed");
+            bytes = required;
+        }
+
+        void bind_live(ggml_backend_buffer_t buffer)
+        {
+            // Metadata only; this tensor does not own the source allocation.
+            // A snapshot never outlives its managed holder, and restore checks
+            // the exact allocation identity before binding or writing it.
+            live_tensor->buffer = nullptr;
+            live_tensor->data = nullptr;
+            live_tensor->extra = nullptr;
+            if (ggml_backend_tensor_alloc(buffer, live_tensor,
+                    ggml_backend_buffer_get_base(buffer)) != GGML_STATUS_SUCCESS)
+                throw std::runtime_error("qwen4exp state snapshot: live buffer binding failed");
+        }
+    };
+
+    struct Q4eStateSnapshot
+    {
+        std::vector<std::unique_ptr<Q4eStateSnapshotEntry>> entries;
+        const void* attn_base = nullptr;
+        const void* gdn_base = nullptr;
+        const void* ple_base = nullptr;
+        bool captured = false;
+    };
+}
+
+TSG_EXPORT void* TSGgml_Qwen4ExpStateSnapshotCreate(
+    const void* const* keys, const int* devices, int count,
+    const void* attn_base, const void* gdn_base, const void* ple_base)
+{
+    try
+    {
+        set_last_error("");
+        if (count < 0 || count > kQwen4ExpMaxSlots + 1
+            || (count != 0 && (keys == nullptr || devices == nullptr)))
+            throw std::invalid_argument("qwen4exp state snapshot: invalid keys");
+        auto snapshot = std::make_unique<Q4eStateSnapshot>();
+        snapshot->entries.reserve(count);
+        snapshot->attn_base = attn_base;
+        snapshot->gdn_base = gdn_base;
+        snapshot->ple_base = ple_base;
+        const int device_count = tsg::g_device_count.load(std::memory_order_acquire);
+        for (int i = 0; i < count; ++i)
+        {
+            if (keys[i] == nullptr || devices[i] < 0 || devices[i] >= device_count)
+                throw std::invalid_argument("qwen4exp state snapshot: invalid key/device");
+            auto entry = std::make_unique<Q4eStateSnapshotEntry>();
+            entry->key = keys[i];
+            entry->device = devices[i];
+            snapshot->entries.push_back(std::move(entry));
+        }
+        return snapshot.release();
+    }
+    catch (const std::exception& e) { set_last_error(e.what()); return nullptr; }
+    catch (...) { set_last_error("qwen4exp state snapshot: creation failed"); return nullptr; }
+}
+
+TSG_EXPORT int TSGgml_Qwen4ExpSpecApiVersion()
+{
+    return 2; // v1 snapshot/MTP; v2 adds QSA span and authoritative indexer export.
+}
+
+TSG_EXPORT int TSGgml_Qwen4ExpStateSnapshotCapture(void* handle)
+{
+    auto* snapshot = static_cast<Q4eStateSnapshot*>(handle);
+    if (snapshot == nullptr) { set_last_error("qwen4exp state snapshot: null handle"); return 0; }
+    snapshot->captured = false;
+    try
+    {
+        set_last_error("");
+        for (auto& entry : snapshot->entries)
+        {
+            tsg::ScopedRank rank(entry->device);
+            if (!ensure_backend()) return 0;
+            // Batched decode may own the latest state until its slot is flushed.
+            tsg_q4earena::on_external_touch(entry->key);
+            auto* live = q4e_seq_state_find(entry->key);
+            entry->source = live != nullptr ? live->buf : nullptr;
+            entry->ready = live != nullptr && live->ready;
+            if (!entry->ready) continue; // the unchanged host seed remains authoritative
+            entry->prepare(live->bytes);
+            entry->bind_live(live->buf);
+            tsg::sync_backend(g_backend);
+            ggml_backend_tensor_copy(entry->live_tensor, entry->saved_tensor);
+        }
+        snapshot->captured = true;
+        return 1;
+    }
+    catch (const std::exception& e) { set_last_error(e.what()); return 0; }
+    catch (...) { set_last_error("qwen4exp state snapshot: capture failed"); return 0; }
+}
+
+TSG_EXPORT int TSGgml_Qwen4ExpStateSnapshotRestore(void* handle)
+{
+    auto* snapshot = static_cast<Q4eStateSnapshot*>(handle);
+    if (snapshot == nullptr || !snapshot->captured)
+    { set_last_error("qwen4exp state snapshot: no completed capture"); return 0; }
+    try
+    {
+        set_last_error("");
+        // Validate every allocation before changing any state. A freed/replaced
+        // holder is never silently recreated from a stale snapshot.
+        for (auto& entry : snapshot->entries)
+        {
+            tsg::ScopedRank rank(entry->device);
+            auto* live = q4e_seq_state_find(entry->key);
+            if (entry->ready && (live == nullptr || live->buf != entry->source
+                    || live->bytes != entry->bytes))
+                throw std::runtime_error("qwen4exp state snapshot: holder allocation changed");
+        }
+        bool reseed = false;
+        for (auto& entry : snapshot->entries)
+        {
+            tsg::ScopedRank rank(entry->device);
+            tsg_q4earena::on_external_touch(entry->key);
+            auto* live = q4e_seq_state_find(entry->key);
+            if (!entry->ready)
+            {
+                if (live != nullptr) { live->ready = false; reseed = true; }
+                continue;
+            }
+            entry->bind_live(live->buf);
+            tsg::sync_backend(g_backend);
+            ggml_backend_tensor_copy(entry->saved_tensor, entry->live_tensor);
+            live->ready = true;
+        }
+        if (reseed)
+            q4e_drop_holder_graphs(snapshot->attn_base, snapshot->gdn_base, snapshot->ple_base);
+        return 1;
+    }
+    catch (const std::exception& e) { set_last_error(e.what()); return 0; }
+    catch (...) { set_last_error("qwen4exp state snapshot: restore failed"); return 0; }
+}
+
+TSG_EXPORT void TSGgml_Qwen4ExpStateSnapshotFree(void* handle)
+{
+    try { delete static_cast<Q4eStateSnapshot*>(handle); }
+    catch (...) { set_last_error("qwen4exp state snapshot: release failed"); }
 }

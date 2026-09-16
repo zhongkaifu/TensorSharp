@@ -2176,6 +2176,12 @@ namespace TensorSharp.Chat
                         continue;
                     }
 
+                    if (!update.Done && update.RawGenerationSuffix != null)
+                    {
+                        uiParser?.SetGenerationPromptSuffix(update.RawGenerationSuffix);
+                        if (string.IsNullOrEmpty(update.Piece)) continue;
+                    }
+
                     if (update.IsParsed)
                     {
                         sawParsedUpdate = true;
@@ -2268,6 +2274,7 @@ namespace TensorSharp.Chat
                 var retryParser = useUiParser ? OutputParserFactory.Create(_svc.Architecture) : null;
                 retryParser?.Init(false, uiTools);
                 bool retryCompleted = false;
+                bool retrySawParsedUpdate = false;
                 IAsyncEnumerator<ChatStreamUpdate> retry = _svc
                     .ChatStreamWithSkillsAsync(chatSession, messages, maxTokens, cancellationToken,
                         samplingConfig, uiTools, false, skillPlan, webUiLogger)
@@ -2306,23 +2313,28 @@ namespace TensorSharp.Chat
                             turnKvReusedTokens = update.KvCacheReusedTokens;
                             turnTruncated = FinishReasonMapper.IsTruncated(update.FinishReason);
                             turnFinishReason = update.FinishReason;
-                        turnRepetitionExplained = update.RepetitionExplained;
+                            turnRepetitionExplained = update.RepetitionExplained;
                             continue;
                         }
-                        if (string.IsNullOrEmpty(update.Piece))
-                            continue;
-
-                        // The retry's whole purpose is to produce the answer the first
-                        // attempt reasoned itself out of, and this is where that answer is
-                        // streamed — so it has to count as content. Without this the user
-                        // read a complete answer followed by "The model ended this turn
-                        // without writing an answer", which is the placeholder accusing the
-                        // model of the very thing the retry had just fixed. Observed
-                        // 2026-09-10 on a turn that delivered a ten-slide deck and a
-                        // download link.
-                        sawContent = true;
-                        tokenCount++;
-                        yield return WebUiSseEvents.Token(update.Piece);
+                        retrySawParsedUpdate |= update.IsParsed;
+                        update = ParseRetryUpdate(update, retryParser);
+                        if (!string.IsNullOrEmpty(update.ThinkingPiece))
+                            yield return WebUiSseEvents.Thinking(update.ThinkingPiece);
+                        if (!string.IsNullOrEmpty(update.Piece))
+                        {
+                            // Only the separated answer counts as retry content; a
+                            // prompt-opened thought channel can exist with thinking off.
+                            sawContent = true;
+                            tokenCount++;
+                            yield return WebUiSseEvents.Token(update.Piece);
+                        }
+                        if (update.ParsedToolCalls is { Count: > 0 })
+                            yield return WebUiSseEvents.ToolCalls(update.ParsedToolCalls);
+                        if (update.ToolProgressPhase != null)
+                            yield return WebUiSseEvents.ToolProgress(
+                                update.ToolProgressPhase, update.ToolProgressName,
+                                update.ToolProgressPiece, update.ToolProgressSeconds,
+                                update.ToolProgressDetail);
                     }
                 }
                 finally
@@ -2333,7 +2345,7 @@ namespace TensorSharp.Chat
                 if (retryCompleted)
                 {
                     uiParser = retryParser;
-                    sawParsedUpdate = true;   // the retry streamed content directly
+                    sawParsedUpdate = retrySawParsedUpdate;
                 }
             }
 
@@ -2696,6 +2708,21 @@ namespace TensorSharp.Chat
         /// </summary>
         internal static bool HasParsedAnswerContent(ChatStreamUpdate update) =>
             update.IsParsed && !string.IsNullOrEmpty(update.Piece);
+
+        /// <summary>Separates raw retry output while preserving already-parsed skill updates.</summary>
+        internal static ChatStreamUpdate ParseRetryUpdate(ChatStreamUpdate update, IOutputParser parser)
+        {
+            if (update.Done || update.IsParsed)
+                return update;
+
+            if (update.RawGenerationSuffix != null)
+                parser?.SetGenerationPromptSuffix(update.RawGenerationSuffix);
+            if (parser == null)
+                return update;
+
+            var parsed = parser.Add(update.Piece ?? string.Empty, false);
+            return ChatStreamUpdate.Parsed(parsed.Content, parsed.Thinking, parsed.ToolCalls);
+        }
 
         /// <summary>
         /// The skill lookups the disclosure loop has performed since the last call, to be

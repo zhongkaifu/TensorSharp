@@ -9,11 +9,13 @@
 // performance. The draft head ships as a SEPARATE GGUF and is attached to the
 // target via Gemma4Model.LoadMtpDraftWeights().
 //
-// Greedy speculative decoding is verification-gated, so the output stream must
-// match plain greedy decoding except where batched-vs-sequential kernel ordering
-// flips a near-tie argmax. A high acceptance rate is the signal that the draft
-// head itself is wired correctly (a broken draft still yields correct output via
-// verification, just with ~0 acceptance and no speedup).
+// Greedy speculative decoding accepts drafts against the target's verify logits.
+// Batch-dependent attention and quantized matrix arithmetic can change those
+// logits and the committed KV relative to sequential decode; verification alone
+// does not guarantee identical output streams. Diagnose a mismatch at the same
+// token prefix, including the winning-logit margin and cache replay, instead of
+// assuming a near tie. Acceptance rate measures draft agreement with the verify
+// target; it does not independently establish sequential-target parity.
 //
 // Opt-in via TS_GMTP_E2E=1. Model resolution:
 //   TS_GMTP_TARGET / TS_GMTP_DRAFT  — explicit .gguf paths
@@ -180,7 +182,8 @@ public class Gemma4SpeculativeTests
         Xunit.Assert.True(specTokens.Count >= Math.Min(8, maxNew), "spec generation did not progress");
         // The fix reuses the SAME prefill machinery as the baseline, so the first
         // generated token (identical prefill + identical fused last-token decode)
-        // must match exactly; later tokens may diverge on verify-kernel FP near-ties.
+        // must match exactly. This assertion does not qualify later-token parity;
+        // batch-dependent verify arithmetic can change logits and committed KV.
         Xunit.Assert.True(match >= 1, $"first token diverged (baseline {baseline[0]} vs spec {specTokens[0]})");
         // Prefill must be in the same ballpark as the non-MTP path (not a 3x-slower
         // per-op fallback). Generous bound to absorb warmup / measurement noise.

@@ -1,0 +1,76 @@
+// Tensor shapes and scalar configuration from the pinned publisher head.
+// Whole-file SHA256 5ff54097406a905cf3a724c709124ceb0e3e10235ee862298969e91c96fa96e6
+// No tensor payloads are embedded in this metadata fixture.
+using TensorSharp.Runtime;
+namespace InferenceWeb.Tests;
+public partial class Qwen4ExpMtpValidationTests
+{
+    private static readonly (string Name, ulong[] Shape, GgmlTensorType Type)[] PublishedTensors = new[]
+    {
+        ("blk.48.attn_k.weight", new ulong[] { 2560, 512 }, GgmlTensorType.Q8_0),
+        ("blk.48.attn_k_norm.weight", new ulong[] { 256 }, GgmlTensorType.F32),
+        ("blk.48.attn_output.weight", new ulong[] { 6144, 2560 }, GgmlTensorType.Q8_0),
+        ("blk.48.attn_q.weight", new ulong[] { 2560, 12288 }, GgmlTensorType.Q8_0),
+        ("blk.48.attn_q_norm.weight", new ulong[] { 256 }, GgmlTensorType.F32),
+        ("blk.48.attn_v.weight", new ulong[] { 2560, 512 }, GgmlTensorType.Q8_0),
+        ("blk.48.ffn_down_exps.weight", new ulong[] { 640, 2560, 512 }, GgmlTensorType.Q8_0),
+        ("blk.48.ffn_down_shexp.weight", new ulong[] { 640, 2560 }, GgmlTensorType.Q8_0),
+        ("blk.48.ffn_gate_exps.weight", new ulong[] { 2560, 640, 512 }, GgmlTensorType.Q8_0),
+        ("blk.48.ffn_gate_inp.weight", new ulong[] { 2560, 512 }, GgmlTensorType.F32),
+        ("blk.48.ffn_gate_inp_shexp.weight", new ulong[] { 2560 }, GgmlTensorType.F32),
+        ("blk.48.ffn_gate_shexp.weight", new ulong[] { 2560, 640 }, GgmlTensorType.Q8_0),
+        ("blk.48.ffn_up_exps.weight", new ulong[] { 2560, 640, 512 }, GgmlTensorType.Q8_0),
+        ("blk.48.ffn_up_shexp.weight", new ulong[] { 2560, 640 }, GgmlTensorType.Q8_0),
+        ("blk.48.hc_attn_down.weight", new ulong[] { 10240, 320 }, GgmlTensorType.Q8_0),
+        ("blk.48.hc_attn_inject.weight", new ulong[] { 10240, 4 }, GgmlTensorType.Q8_0),
+        ("blk.48.hc_attn_norm.weight", new ulong[] { 10240 }, GgmlTensorType.F32),
+        ("blk.48.hc_attn_up.weight", new ulong[] { 320, 10240 }, GgmlTensorType.Q8_0),
+        ("blk.48.hc_ffn_down.weight", new ulong[] { 10240, 320 }, GgmlTensorType.Q8_0),
+        ("blk.48.hc_ffn_inject.weight", new ulong[] { 10240, 4 }, GgmlTensorType.Q8_0),
+        ("blk.48.hc_ffn_norm.weight", new ulong[] { 10240 }, GgmlTensorType.F32),
+        ("blk.48.hc_ffn_up.weight", new ulong[] { 320, 10240 }, GgmlTensorType.Q8_0),
+        ("blk.48.indexer.k_norm.weight", new ulong[] { 128 }, GgmlTensorType.F32),
+        ("blk.48.indexer.k_proj.weight", new ulong[] { 2560, 128 }, GgmlTensorType.BF16),
+        ("blk.48.indexer.q_norm.weight", new ulong[] { 128 }, GgmlTensorType.F32),
+        ("blk.48.indexer.q_proj.weight", new ulong[] { 2560, 512 }, GgmlTensorType.BF16),
+        ("blk.48.nextn.eh_proj.weight", new ulong[] { 5120, 2560 }, GgmlTensorType.Q8_0),
+        ("blk.48.nextn.enorm.weight", new ulong[] { 2560 }, GgmlTensorType.F32),
+        ("blk.48.nextn.hc_head_down.weight", new ulong[] { 10240, 320 }, GgmlTensorType.Q8_0),
+        ("blk.48.nextn.hc_head_norm.weight", new ulong[] { 10240 }, GgmlTensorType.F32),
+        ("blk.48.nextn.hc_head_up.weight", new ulong[] { 320, 10240 }, GgmlTensorType.Q8_0),
+        ("blk.48.nextn.hnorm.weight", new ulong[] { 10240 }, GgmlTensorType.F32),
+    };
+    private static readonly Dictionary<string, object> PublishedScalarMetadata = new()
+    {
+        ["general.architecture"] = "qwen4exp",
+        ["qwen4exp.nextn_shared_target_tensors"] = true,
+        ["qwen4exp.block_count"] = 49u,
+        ["qwen4exp.context_length"] = 262144u,
+        ["qwen4exp.embedding_length"] = 2560u,
+        ["qwen4exp.attention.head_count"] = 24u,
+        ["qwen4exp.attention.head_count_kv"] = 2u,
+        ["qwen4exp.rope.freq_base"] = 10000000f,
+        ["qwen4exp.attention.layer_norm_rms_epsilon"] = 9.9999999747524271e-07f,
+        ["qwen4exp.expert_count"] = 512u,
+        ["qwen4exp.expert_used_count"] = 10u,
+        ["qwen4exp.attention.key_length"] = 256u,
+        ["qwen4exp.attention.value_length"] = 256u,
+        ["qwen4exp.expert_feed_forward_length"] = 640u,
+        ["qwen4exp.expert_shared_feed_forward_length"] = 640u,
+        ["qwen4exp.nextn_predict_layers"] = 1u,
+        ["qwen4exp.ssm.conv_kernel"] = 4u,
+        ["qwen4exp.ssm.state_size"] = 128u,
+        ["qwen4exp.ssm.group_count"] = 16u,
+        ["qwen4exp.ssm.time_step_rank"] = 48u,
+        ["qwen4exp.ssm.inner_size"] = 6144u,
+        ["qwen4exp.full_attention_interval"] = 4u,
+        ["qwen4exp.rope.dimension_count"] = 64u,
+        ["qwen4exp.hyper_connection.count"] = 4u,
+        ["qwen4exp.hyper_connection.low_rank"] = 320u,
+        ["qwen4exp.attention.indexer.head_count"] = 4u,
+        ["qwen4exp.attention.indexer.key_length"] = 128u,
+        ["qwen4exp.attention.indexer.top_k"] = 2048u,
+        ["tokenizer.ggml.model"] = "gpt2",
+        ["tokenizer.ggml.pre"] = "qwen35",
+    };
+}

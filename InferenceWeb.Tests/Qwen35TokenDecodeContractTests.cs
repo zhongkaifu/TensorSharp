@@ -252,7 +252,7 @@ public class Qwen35TokenDecodeContractTests
         string source = File.ReadAllText(Path.Combine(
             FindRepositoryRoot(),
             "TensorSharp.GGML.Native",
-            "ggml_ops_qwen35_decode.cpp"));
+            "ggml_ops_qwen35_decode.cpp")).ReplaceLineEndings("\n");
         const string lockLine =
             "std::lock_guard<std::recursive_mutex> lock(q35_decode_mutex());";
 

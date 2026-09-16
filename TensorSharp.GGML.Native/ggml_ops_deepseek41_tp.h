@@ -33,6 +33,13 @@ struct strip
 // Unquantized strips also honor ggml CUDA's two-element vector alignment.
 std::vector<strip> split(int64_t width, int64_t block, int ranks, int layer);
 
+// Prefer 64-channel floating-point strips where possible. This keeps BF16/F16
+// gate/up rows and down inner dimensions eligible for the same matrix path as
+// the full tensor, avoiding shape-dependent activation rounding. Use this for
+// both upload layout and loader memory pricing. Quantized/F32 layouts retain
+// their original block policy; small floating tensors retain vector alignment.
+std::vector<strip> split_weights(int64_t width, ggml_type down_type, int ranks, int layer);
+
 class executor
 {
 public:

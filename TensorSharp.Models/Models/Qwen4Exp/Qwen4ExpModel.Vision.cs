@@ -111,8 +111,9 @@ namespace TensorSharp.Models
             // The last prompt token is text, so its T component is the scalar
             // position stream; the next token continues at that + 1.
             int lastT = _pendingMRoPEPositions[3 * (seqLen - 1)];
-            _mropeCacheGap = (startPos + seqLen - 1) - lastT;
-            if (_mropeCacheGap < 0) _mropeCacheGap = 0;
+            // Video time coordinates can also lead the cache index. Preserve the
+            // signed offset so subsequent scalar text continues at lastT + 1.
+            _mropeCacheGap = checked((int)((long)startPos + seqLen - 1 - lastT));
         }
 
         private bool EnsureMropeSections()

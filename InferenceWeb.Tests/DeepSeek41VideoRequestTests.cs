@@ -25,8 +25,10 @@ public sealed class DeepSeek41VideoRequestTests : IDisposable
         if (Directory.Exists(_directory)) Directory.Delete(_directory, true);
     }
 
-    [Fact]
-    public void OpenAiVideo_UsesExistingDecoderAndRetainsSourceTimesBesideOrderedImages()
+    [Theory]
+    [InlineData("deepseek41")]
+    [InlineData("gemma4")]
+    public void OpenAiVideo_UsesExistingDecoderAndRetainsSourceTimesBesideOrderedImages(string architecture)
     {
         var uploads = new UploadStoragePolicy(_directory);
         using var json = JsonDocument.Parse("""
@@ -36,17 +38,28 @@ public sealed class DeepSeek41VideoRequestTests : IDisposable
               {"type":"image_url","image_url":{"url":"data:image/png;base64,Ag=="}},
               {"type":"text","text":"Describe the numbered frames in time order."}]}]
             """);
-        var message = Assert.Single(ChatMessageParser.ParseOpenAI(json.RootElement, uploads, architecture: "deepseek41"));
+        var message = Assert.Single(ChatMessageParser.ParseOpenAI(json.RootElement, uploads, architecture: architecture));
         Assert.True(message.IsVideo);
         Assert.Equal(new[] { 0, 2, 4 }, _decoder.Requested);
         Assert.Equal(5, message.ImagePaths.Count);
         Assert.Equal(new double?[] { null, 0, 1, 2, null }, message.ImageTimestamps);
         Assert.All(message.ImagePaths, path => Assert.True(File.Exists(path)));
         Assert.Equal(Directory.EnumerateFiles(_directory).Sum(path => new FileInfo(path).Length), uploads.UsedBytes);
-        string prompt = ChatTemplate.RenderDeepSeek41(new() { message });
-        string image = ChatTemplate.DeepSeek41ImagePlaceholder;
-        Assert.Contains(image + "Frame at 0 seconds: " + image + "\nFrame at 1 seconds: " + image +
-            "\nFrame at 2 seconds: " + image + "\n" + image, prompt);
+        if (architecture == "deepseek41")
+        {
+            string prompt = ChatTemplate.RenderDeepSeek41(new() { message });
+            string image = ChatTemplate.DeepSeek41ImagePlaceholder;
+            Assert.Contains(image + "Frame at 0 seconds: " + image + "\nFrame at 1 seconds: " + image +
+                "\nFrame at 2 seconds: " + image + "\n" + image, prompt);
+        }
+        else
+        {
+            const string frames = "<|image> 00:00 <|image> 00:01 <|image> 00:02 <|image><|image>";
+            string prompt = ChatTemplate.RenderGemma4(new() { message });
+            Assert.Contains(frames, prompt);
+            Assert.DoesNotContain("<|video>", prompt);
+            Assert.StartsWith(frames, ChatTemplate.InjectMultimodalTokens(new() { message }, "gemma4")[0].Content);
+        }
         var structured = StructuredOutputPrompt.Apply(new() { message }, StructuredOutputFormat.JsonObject());
         Assert.Equal(message.ImageTimestamps, structured.Last().ImageTimestamps);
     }

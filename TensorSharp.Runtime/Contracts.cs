@@ -74,6 +74,19 @@ namespace TensorSharp.Runtime
         int KVCacheTruncationGranularity => 1;
 
         /// <summary>
+        /// Whether a cache holding <paramref name="cachedTokenCount"/> tokens can
+        /// retain the requested prefix without losing history needed by later
+        /// attention. This side-effect-free check also applies to inactive retained
+        /// holders, so the scheduler can prefer an exact checkpoint before binding
+        /// one. A true result still requires TryTruncateKVCache at execution time.
+        /// </summary>
+        bool CanTruncateKVCache(int cachedTokenCount, int targetTokenCount)
+            => targetTokenCount >= 0 && targetTokenCount <= cachedTokenCount
+                && (targetTokenCount == cachedTokenCount
+                    || (SupportsKVCacheTruncation
+                        && targetTokenCount % Math.Max(1, KVCacheTruncationGranularity) == 0));
+
+        /// <summary>
         /// Whether this architecture exposes block-level snapshot / restore of its KV
         /// state through <see cref="TryExtractKVBlock"/> and <see cref="TryInjectKVBlock"/>.
         /// Required for the paged KV cache. Models with recurrent state should return

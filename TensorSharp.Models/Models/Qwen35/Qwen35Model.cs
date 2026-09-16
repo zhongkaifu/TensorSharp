@@ -1182,21 +1182,19 @@ namespace TensorSharp.Models
             InvalidateFullDecodeState(hardBindings: true);
             InvalidateVerifyCache();
 
-            int newCapacity;
-            if (geometricGrowth)
+            long? spare = GetCacheMemorySpareBytes();
+            int newCapacity = ResolveAttentionCacheGrowthCapacity(
+                _kvCacheCapacity, requiredSeqLen, _maxContextLength, KvCacheBytesPerToken, spare, geometricGrowth);
+            if (geometricGrowth && _holderPool?.Count > 0
+                && newCapacity < ResolveAttentionCacheGrowthCapacity(
+                    _kvCacheCapacity, requiredSeqLen, _maxContextLength, KvCacheBytesPerToken, null))
             {
-                newCapacity = Math.Max(_kvCacheCapacity, 1);
-                while (newCapacity < requiredSeqLen)
-                    newCapacity = Math.Min(_maxContextLength, newCapacity * 2);
-            }
-            else
-            {
-                // Native Qwen decode windows are 256-token aligned. Reserve
-                // exactly the request budget rounded to that boundary rather
-                // than doubling a multi-gigabyte cache.
-                const int alignment = CacheCapacityAlignment;
-                long rounded = ((long)requiredSeqLen + alignment - 1) / alignment * alignment;
-                newCapacity = (int)Math.Min(_maxContextLength, rounded);
+                // The active cache/state has already been synchronized above.
+                // Free optional idle buffers before committing more live capacity.
+                TrimIdleMemory();
+                newCapacity = ResolveAttentionCacheGrowthCapacity(
+                    _kvCacheCapacity, requiredSeqLen, _maxContextLength, KvCacheBytesPerToken,
+                    GetCacheMemorySpareBytes(), geometricGrowth);
             }
 
             DType kvDtype = _kvCacheDtype.ToDType();

@@ -32,10 +32,9 @@ namespace InferenceWeb.Tests;
 /// not happen, and nothing logs a complaint.
 /// </para>
 /// <para>
-/// That is exactly what shipped: <c>qwen4exp</c> is registered with no
-/// <c>CreateOutputParser</c>, so it got <see cref="PassthroughOutputParser"/> and claimed
-/// full tool support anyway; every architecture with no table entry did the same. These
-/// tests are the standing check that a new family cannot reintroduce it.
+/// Qwen4Exp originally had no output parser. It now parses its published tool
+/// syntax; unknown families still receive no tool declarations. These tests
+/// keep the skill capability decision consistent with actual parsed output.
 /// </para>
 /// </summary>
 public class SkillCapabilityConsistencyTests
@@ -95,18 +94,23 @@ public class SkillCapabilityConsistencyTests
     }
 
     [Fact]
-    public void Qwen4Exp_IsRegisteredButUnparseable_SoItsSkillBodiesAreInlinedInstead()
+    public void Qwen4Exp_ParsesSkillCalls_AndEnablesProgressiveDisclosure()
     {
-        // Registered, and RendersToolDeclarations defaults to true — but the entry has no
-        // CreateOutputParser, so nothing would read the call back.
         Assert.NotNull(ChatProtocolRegistry.For("qwen4exp"));
-        Assert.False(OutputParserFactory.Create("qwen4exp").HasToolSupport);
-        Assert.False(SkillCapabilities.For("qwen4exp").ToolsRendered);
+        var parser = OutputParserFactory.Create("qwen4exp");
+        parser.Init(false, null);
+        var output = parser.Add("<tool_call>\n<function=skills_read>\n" +
+            "<parameter=path>\nacme/SKILL.md\n</parameter>\n</function>\n</tool_call>", true);
+        var call = Assert.Single(output.ToolCalls!);
+        Assert.Equal("skills_read", call.Name);
+        Assert.Equal("acme/SKILL.md", call.Arguments["path"]);
+        Assert.True(SkillCapabilities.For("qwen4exp").ToolsRendered);
     }
 
     [Theory]
     [InlineData("gemma4")]
     [InlineData("qwen35")]
+    [InlineData("qwen4exp")]
     [InlineData("gpt-oss")]
     [InlineData("muse-glimmer")]
     [InlineData("nemotron_h_moe")]

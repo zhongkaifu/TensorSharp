@@ -438,6 +438,11 @@ public sealed class OllamaAdapter
         {
             if (!update.Done)
             {
+                if (update.RawGenerationSuffix != null)
+                {
+                    parser.SetGenerationPromptSuffix(update.RawGenerationSuffix);
+                    if (string.IsNullOrEmpty(update.Piece)) continue;
+                }
                 if (update.IsParsed)
                 {
                     sawParsedUpdate = true;

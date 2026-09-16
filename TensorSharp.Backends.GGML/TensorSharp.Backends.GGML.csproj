@@ -68,8 +68,6 @@
     <GgmlNativeSource Include="$(GgmlNativeSourceDir)/*.cu" />
     <GgmlNativeSource Include="$(GgmlNativeSourceDir)/*.cuh" />
     <GgmlNativeSource Include="$(GgmlNativeSourceDir)/CMakeLists.txt" />
-    <GgmlNativeSource Include="$(GgmlNativeSourceDir)/../eng/ggml-patches/*.cmake" />
-    <GgmlNativeSource Include="$(GgmlNativeSourceDir)/../eng/ggml-patches/*.patch" />
     <GgmlNativeSource Include="$(GgmlNativeSourceDir)/$(GgmlNativeBuildScript)" Condition="'$(GgmlNativeBuildScript)' != ''" />
     <!-- The build script defers to these helper scripts (VS discovery, ggml
          checkout, Vulkan toolchain provisioning); a fix there must re-run the

@@ -43,6 +43,7 @@ namespace TensorSharp.Models
         /// </para>
         /// </summary>
         public const int DefaultSoftTokens = 280;
+        public const int VideoSoftTokens = 70;
 
         public Gemma4ImageProcessor(int patchSize = 16, int nMerge = 3,
             int minTokens = DefaultSoftTokens, int maxTokens = DefaultSoftTokens,

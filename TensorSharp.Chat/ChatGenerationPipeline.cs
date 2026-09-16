@@ -119,6 +119,8 @@ namespace TensorSharp.Server
         /// produced (see <see cref="ChatMessage.RawGenerationSuffix"/>). The skills
         /// loops rebuild each tool round from this update, so without it a round's
         /// framing would be replayed as whatever the NEXT request's mode is.
+        /// An open Gemma thought channel is also sent in an empty non-terminal
+        /// update before generation, so streaming parsers know its initial state.
         /// </summary>
         public string? RawGenerationSuffix { get; init; }
 
@@ -223,12 +225,6 @@ namespace TensorSharp.Server
         // default; raise via DIFFUSION_MAX_BATCH when there's GPU headroom for more aggregate throughput.
         private static readonly int DiffusionMaxBatch =
             int.TryParse(Environment.GetEnvironmentVariable("DIFFUSION_MAX_BATCH"), out int mb) && mb > 0 ? mb : 2;
-
-        // Per-pipeline lock guarding multimodal-prompt preparation. The
-        // multimodal-prep serialisation is now handled by
-        // ModelBase.GpuComputeLock (shared with the InferenceEngine worker)
-        // so a vision encoder on the request thread can't race the engine's
-        // batched forward on the GPU.
 
         public ChatGenerationPipeline(
             ModelLifecycleService lifecycle,
@@ -413,10 +409,9 @@ namespace TensorSharp.Server
                 // engine's worker (which is doing the same thing for
                 // batched forward) - concurrent GGML on Metal/CUDA from
                 // two threads aborts the process via
-                // ggml_metal_synchronize. The lock also subsumes the
-                // injector-state serialisation that the old
-                // _multimodalGate provided, because the prepared-embedding
-                // list lives on the model.
+                // ggml_metal_synchronize. The injector keeps preparation state
+                // local to each request's execution flow because another encoder
+                // can enter during the cooperative yields below.
                 //
                 // The encoder forward is long (image 100ms–2s, audio
                 // similar, video longer), so to keep concurrent in-flight
@@ -588,6 +583,10 @@ namespace TensorSharp.Server
 
             promptSw.Stop();
             long promptNs = InferenceTelemetry.ToNanos(promptSw.ElapsedTicks);
+
+            string recordedSuffix = RecordedGenerationSuffix(model.Tokenizer, inputTokens, arch, enableThinking);
+            if (arch == "gemma4" && recordedSuffix.EndsWith("<|channel>thought\n", StringComparison.Ordinal))
+                yield return ChatStreamUpdate.Text(string.Empty) with { RawGenerationSuffix = recordedSuffix };
 
             var evalSw = Stopwatch.StartNew();
             var handle = engine.SubmitRequest(seq, cancellationToken);
@@ -767,7 +766,6 @@ namespace TensorSharp.Server
             evalSw.Stop();
             totalSw.Stop();
 
-            string recordedSuffix = RecordedGenerationSuffix(model.Tokenizer, inputTokens, arch, enableThinking);
             lock (session.HistoryLock)
                 ChatHistoryPreparer.UpdateTrackedHistory(
                     session.TrackedHistory, renderHistory, assistantText, generatedTokens,
@@ -1063,12 +1061,26 @@ namespace TensorSharp.Server
             ITokenizer tokenizer, List<int> promptTokens, string arch, bool enableThinking)
         {
             string suffix = KVCachePromptRenderer.GetAssistantGenerationSuffix(arch, enableThinking);
-            if (string.IsNullOrEmpty(suffix) || promptTokens == null || promptTokens.Count == 0 || tokenizer == null)
+            bool gemma = arch == "gemma4";
+            if ((!gemma && string.IsNullOrEmpty(suffix)) || promptTokens == null || promptTokens.Count == 0 || tokenizer == null)
                 return string.Empty;
             try
             {
-                int take = Math.Min(promptTokens.Count, 24);
+                int take = Math.Min(promptTokens.Count, 64);
                 string tail = tokenizer.Decode(promptTokens.GetRange(promptTokens.Count - take, take));
+                if (gemma)
+                {
+                    // A publisher template may prime a channel, and older tracked
+                    // turns may contain our former empty-channel prefix. Preserve
+                    // the actual boundary without imposing it on ordinary turns.
+                    const string closedChannel = "<|channel>thought\n<channel|>";
+                    const string openChannel = "<|channel>thought\n";
+                    if (tail.TrimEnd().EndsWith(closedChannel, StringComparison.Ordinal))
+                        return closedChannel;
+                    if (tail.EndsWith(openChannel, StringComparison.Ordinal))
+                        return openChannel;
+                    return string.Empty;
+                }
                 if (tail.EndsWith(suffix, StringComparison.Ordinal))
                     return suffix;
                 // Every Jinja render is TrimEnd()ed, and only some families put the

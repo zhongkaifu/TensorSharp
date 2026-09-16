@@ -19,7 +19,7 @@
 //            (read_file), then a short follow-up: the shape of every tool round
 //   newchat  two conversations sharing the system prompt (shared-prefix checkpoint)
 //   spec     greedy generation plain vs speculative (ngram, and the checkpoint's own
-//            drafter when it has one); the streams must match token for token
+//            drafter when it has one); token differences are recorded for diagnosis
 //   json     grammar-constrained (JSON object) generation, plain vs speculative
 //   conc     N concurrent requests on one engine, then a solo request after them
 //   image    a turn carrying an image (--mmproj + --image): the plain prefill must
@@ -31,7 +31,7 @@
 //       [--kv f16|q8_0|q4_0]
 //       [--chunk 1024] [--max-batched 4096] [--long 4096] [--tool 3000] [--new 32]
 //       [--spec-new 192] [--spec-file 600] [--spec-minimal-system] [--spec-engine ngram|auto] [--conc 2,4] [--conc-stagger 400] [--scenarios short,long,tool,newchat,spec,json,conc]
-//       [--warmup 0] [--out rows.json] [--verbose]
+//       [--warmup 0] [--measure-passes 1] [--out rows.json] [--verbose]
 using System.Diagnostics;
 using System.Globalization;
 using System.Text;
@@ -54,6 +54,9 @@ internal static class Program
         if (o == null) return 2;
 
         BackendType backend = ParseBackend(o.Backend);
+        // Match server startup so TS_N_CPU_MOE / TS_CPU_MOE and the host
+        // thread limit actually apply to offload benchmark profiles.
+        MoeCpuOffloadConfig.ConfigureFromEnvironment();
         if (o.Kv != null)
         {
             if (!KvCacheDtypeConfig.TryParse(o.Kv, out KvCacheDtype dt))
@@ -77,8 +80,13 @@ internal static class Program
         if (o.MmProj != null)
             model.MultimodalInjector.LoadProjectors(o.MmProj);
         model.WarmUpKernels();
+        // These managed cache implementations allocate K/V using KvCacheDtype.
+        // Opaque native executors need their own effective-storage diagnostics.
+        if (model is Gemma4Model or Qwen35Model or GptOssModel)
+            Console.WriteLine($"[agent-turn-bench] effective managed KV storage dtype={model.KvCacheDtype.ToShortString()} model_type={model.GetType().Name}");
         Console.WriteLine($"[agent-turn-bench] loaded {model.Config.Architecture} in {swLoad.Elapsed.TotalSeconds:0.0}s; " +
                           $"context={model.MaxContextLength} drafter={DescribeDrafter(model)}");
+        if (o.SpecDiagnostic) return SpecParityDiagnostic.Run(model, o);
 
         // Kernel warm-up does not exercise the scheduler, managed decoding, or
         // background tiered JIT. Optional full passes measure a warmed process
@@ -96,14 +104,47 @@ internal static class Program
             }
         }
 
-        var bench = new Bench(model, o);
-        await bench.RunAsync();
-        bench.PrintTable();
-        if (o.Out != null) bench.WriteJson(o.Out);
-        Console.WriteLine(bench.Failures == 0
-            ? "[agent-turn-bench] PASS: every multi-token input was forwarded in batched chunks."
-            : $"[agent-turn-bench] FAIL: {bench.Failures} check(s) failed (see notes).");
-        return bench.Failures == 0 ? 0 : 1;
+        var samples = new List<object>();
+        using var process = Process.GetCurrentProcess();
+        for (int pass = 0; pass < o.MeasurePasses; pass++)
+        {
+            if (o.MeasurePasses > 1)
+                Console.WriteLine($"[agent-turn-bench] measured pass {pass + 1}/{o.MeasurePasses}");
+            var started = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            var cpuBefore = process.TotalProcessorTime;
+            long allocatedBefore = GC.GetTotalAllocatedBytes(precise: false);
+            int gc0 = GC.CollectionCount(0), gc1 = GC.CollectionCount(1), gc2 = GC.CollectionCount(2);
+            var elapsed = Stopwatch.StartNew();
+            var bench = new Bench(model, o);
+            await bench.RunAsync();
+            elapsed.Stop();
+            samples.Add(new
+            {
+                Pass = pass + 1,
+                StartedUnixMilliseconds = started,
+                FinishedUnixMilliseconds = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                ElapsedMs = elapsed.Elapsed.TotalMilliseconds,
+                CpuMs = (process.TotalProcessorTime - cpuBefore).TotalMilliseconds,
+                AllocatedBytes = GC.GetTotalAllocatedBytes(precise: false) - allocatedBefore,
+                Gen0Collections = GC.CollectionCount(0) - gc0,
+                Gen1Collections = GC.CollectionCount(1) - gc1,
+                Gen2Collections = GC.CollectionCount(2) - gc2,
+                bench.Failures,
+            });
+            bench.PrintTable();
+            if (o.Out != null)
+            {
+                bench.WriteJson(o.MeasurePasses == 1 ? o.Out : o.Out + $".measure{pass + 1}.json");
+                if (o.MeasurePasses > 1)
+                    File.WriteAllText(o.Out + ".series.json", JsonSerializer.Serialize(samples,
+                        new JsonSerializerOptions { WriteIndented = true }));
+            }
+            Console.WriteLine(bench.Failures == 0
+                ? "[agent-turn-bench] PASS: every multi-token input was forwarded in batched chunks."
+                : $"[agent-turn-bench] FAIL: {bench.Failures} check(s) failed (see notes).");
+            if (bench.Failures != 0) return 1;
+        }
+        return 0;
     }
 
     private static BackendType ParseBackend(string s) => (s ?? "ggml_metal").ToLowerInvariant() switch
@@ -142,6 +183,7 @@ internal sealed class Options
     public int SpecNew = 192;
     public int SpecFile = 600;
     public bool SpecMinimalSystem;
+    public bool SpecDiagnostic;
 
     /// <summary>Enable speculation on EVERY engine the bench builds ("ngram" or "auto"),
         /// so the concurrent and solo-after-concurrency rows run with it - the way a
@@ -155,6 +197,7 @@ internal sealed class Options
     public string Out;
     public bool Verbose;
     public int Warmup;
+    public int MeasurePasses = 1;
 
     public static Options Parse(string[] args)
     {
@@ -180,6 +223,7 @@ internal sealed class Options
                     case "--spec-new": o.SpecNew = int.Parse(Next(), CultureInfo.InvariantCulture); break;
                     case "--spec-file": o.SpecFile = int.Parse(Next(), CultureInfo.InvariantCulture); break;
                     case "--spec-minimal-system": o.SpecMinimalSystem = true; break;
+                    case "--spec-diagnostic": o.SpecDiagnostic = true; break;
                     case "--spec-engine": o.SpecEngine = Next(); break;
                     case "--conc-stagger": o.ConcStaggerMs = int.Parse(Next(), CultureInfo.InvariantCulture); break;
                     case "--conc":
@@ -191,6 +235,7 @@ internal sealed class Options
                         break;
                     case "--out": o.Out = Next(); break;
                     case "--warmup": o.Warmup = int.Parse(Next(), CultureInfo.InvariantCulture); break;
+                    case "--measure-passes": o.MeasurePasses = int.Parse(Next(), CultureInfo.InvariantCulture); break;
                     case "--verbose": o.Verbose = true; break;
                     default: throw new ArgumentException($"unknown option {args[i]}");
                 }
@@ -198,6 +243,7 @@ internal sealed class Options
             if (string.IsNullOrEmpty(o.Model)) throw new ArgumentException("--model <gguf> is required");
             if (!File.Exists(o.Model)) throw new ArgumentException($"model not found: {o.Model}");
             if (o.Warmup < 0) throw new ArgumentException("--warmup must be nonnegative");
+            if (o.MeasurePasses < 1) throw new ArgumentException("--measure-passes must be positive");
         }
         catch (ArgumentException ex)
         {
@@ -218,6 +264,9 @@ internal sealed record Row(
     public List<int> Tokens { get; init; } = new();
     // Actual delivery times from submission, for individual requests only.
     public List<double> TokenTimesMs { get; init; }
+    public long StartedUnixMilliseconds { get; init; }
+    public List<RequestTimeline> RequestTimelines { get; init; }
+    public ConcurrentDecodeMetrics ConcurrentDecode { get; init; }
     // Boundaries in the flattened token stream for concurrent requests.
     public int[] TokenCounts { get; init; } = Array.Empty<int>();
     public List<string> ExtraNotes { get; } = new();
@@ -344,7 +393,7 @@ internal sealed class Bench
         // has to arm over a holder rather than the linear cache.
         List<int> chatB = Render(_agentSystem, $"Repeat this text exactly:\n```csharp\n{file}```");
         Row plainB = null;
-        foreach (var (label, spec) in new[] { ("", (SpeculationOptions)null), (" + ngram", SpecOptions(SpeculatorRegistry.NGram)) })
+        foreach (var (label, spec) in new[] { ("", SpeculationOptions.Disabled), (" + ngram", SpecOptions(SpeculatorRegistry.NGram)) })
         {
             using var engine = NewEngine(spec);
             await RunAsync(engine, "newchat", "chat A turn 1" + label, chatA, 16, SamplingConfig.Greedy, expectBatched: true, sharedPrefix: shared);
@@ -370,7 +419,7 @@ internal sealed class Bench
             $"Here is src/Program.cs:\n```csharp\n{file}```\nRepeat the file exactly as given, then add one sentence describing what it does.");
 
         Row plain;
-        using (var engine = NewEngine())
+        using (var engine = NewEngine(SpeculationOptions.Disabled))
             plain = await RunAsync(engine, "spec", "plain greedy", prompt, _o.SpecNew, SamplingConfig.Greedy, expectBatched: true);
 
         var candidates = new List<(string label, SpeculationOptions opts)>
@@ -412,7 +461,7 @@ internal sealed class Bench
         }
 
         Row plain;
-        using (var engine = NewEngine())
+        using (var engine = NewEngine(SpeculationOptions.Disabled))
             plain = await RunAsync(engine, "json", "plain + json grammar", prompt, 192, Cfg(), expectBatched: true);
         CheckJson(plain);
 
@@ -436,36 +485,47 @@ internal sealed class Bench
                 prompts.Add(Render(_agentSystem, $"Here is file {i}:\n```csharp\n{file}```\nName its main class."));
             }
             long steps0 = engine.TotalStepsRun;
-            var sw = Stopwatch.StartNew();
+            long startedUnixMilliseconds = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            long waveStart = Stopwatch.GetTimestamp();
             var tasks = new List<Task<Run>>(n);
             for (int i = 0; i < n; i++)
             {
                 if (i > 0 && _o.ConcStaggerMs > 0)
                     await Task.Delay(_o.ConcStaggerMs);
-                tasks.Add(SubmitAsync(engine, $"conc{n}-{i}", prompts[i], _o.New, SamplingConfig.Greedy, 0));
+                tasks.Add(SubmitAsync(engine, $"conc{n}-{i}", prompts[i], _o.New, SamplingConfig.Greedy, 0, waveStart));
             }
             Run[] runs = await Task.WhenAll(tasks);
-            sw.Stop();
+            double waveMs = Stopwatch.GetElapsedTime(waveStart).TotalMilliseconds;
             long steps = engine.TotalStepsRun - steps0;
             int outTokens = runs.Sum(r => r.Tokens.Count);
             int promptTokens = prompts.Sum(p => p.Count);
-            // Decode-only aggregate: every request's first token is out by the last
-            // TTFT, so what follows is the concurrent decode phase.
+            // A request's TTFT starts at its own submission. Staggered arrivals
+            // require an absolute wave offset to find the last first delivery.
+            var decode = ConcurrentDecodeMetrics.Calculate(runs.Select(r =>
+                new ConcurrentDelivery(r.SubmissionOffsetMs, r.TokenTimesMs)).ToArray(), waveMs);
             double maxTtft = runs.Max(r => r.TtftMs);
-            double decodeWindowMs = sw.Elapsed.TotalMilliseconds - maxTtft;
-            double aggregate = decodeWindowMs > 0 ? (outTokens - n) / (decodeWindowMs / 1000.0) : 0;
-            string note = $"decode aggregate {aggregate:0.0} tok/s over {n} requests after the last first token; " +
-                          $"wall {sw.Elapsed.TotalMilliseconds:0} ms; max ttft {maxTtft:0} ms";
+            double aggregate = decode.TokensPerSecond;
+            var timelines = runs.Select(ToTimeline).ToList();
+            var speculation = RequestSpeculationCounters.Sum(timelines.Select(r => r.Speculation));
+            string note = $"decode aggregate {aggregate:0.0} tok/s from {decode.TokensAfterLastFirst} deliveries strictly after the last first token; " +
+                          $"window {decode.WindowMs:0} ms; last first-token wave offset {decode.LastFirstTokenOffsetMs:0} ms; " +
+                          $"wall {waveMs:0} ms; max individual request ttft {maxTtft:0} ms; established={decode.Established}";
             var row = new Row("conc", $"{n} concurrent", promptTokens, runs.Sum(r => r.Reused), steps, 0, 0,
-                runs.Max(r => r.TtftMs), 0, aggregate, outTokens, sw.Elapsed.TotalMilliseconds,
-                string.Join("/", runs.Select(r => r.Finish)), 0, 0, 0, 0, 0, note)
+                runs.Max(r => r.TtftMs), 0, aggregate, outTokens, waveMs,
+                string.Join("/", runs.Select(r => r.Finish)),
+                speculation.Drafted, speculation.Accepted, speculation.VerifySteps, speculation.PlainSteps,
+                speculation.Rollbacks, note)
             {
                 Tokens = runs.SelectMany(r => r.Tokens).ToList(),
                 TokenCounts = runs.Select(r => r.Tokens.Count).ToArray(),
+                StartedUnixMilliseconds = startedUnixMilliseconds,
+                RequestTimelines = timelines,
+                ConcurrentDecode = decode,
             };
             Add(row);
             foreach (Run r in runs)
-                if (r.Tokens.Count == 0) { Failures++; Console.Error.WriteLine($"    FAIL: {r.Id} produced no tokens ({r.Error})"); }
+                if (RequestCompletionChecks.ConcurrentFailed(r.Tokens.Count, r.Finish, r.Error))
+                { Failures++; Console.Error.WriteLine($"    FAIL: {r.Id} produced {r.Tokens.Count} tokens, finish={r.Finish}, error={r.Error}"); }
         }
         // A solo request after the concurrent round must still run batched (and fast).
         List<int> solo = Render(_agentSystem, "After all that, say the single word: solo.");
@@ -506,7 +566,7 @@ internal sealed class Bench
             },
         };
         Row plain = null;
-        foreach (var (label, spec) in new[] { ("plain + image", (SpeculationOptions)null), ("ngram + image", SpecOptions(SpeculatorRegistry.NGram)) })
+        foreach (var (label, spec) in new[] { ("plain + image", SpeculationOptions.Disabled), ("ngram + image", SpecOptions(SpeculatorRegistry.NGram)) })
         {
             using var engine = NewEngine(spec);
             // The injector keeps the prepared embeddings per request id, and the
@@ -551,6 +611,8 @@ internal sealed class Bench
         public string Id;
         public List<int> Tokens = new();
         public List<double> TokenTimesMs = new();
+        public long StartedUnixMilliseconds;
+        public double SubmissionOffsetMs;
         public double TtftMs;
         public double TotalMs;
         public int Reused;
@@ -560,17 +622,21 @@ internal sealed class Bench
     }
 
     private async Task<Run> SubmitAsync(InferenceEngine engine, string id, List<int> prompt, int maxNew,
-        SamplingConfig cfg, int sharedPrefix)
+        SamplingConfig cfg, int sharedPrefix, long waveStart = 0)
     {
         var seq = new SequenceState(id, prompt, maxNew, engine.PoolStats.blockSize, cfg, sharedPrefixTokens: sharedPrefix);
-        var run = new Run { Id = id };
-        var sw = Stopwatch.StartNew();
+        long submitted = Stopwatch.GetTimestamp();
+        var run = new Run
+        {
+            Id = id, StartedUnixMilliseconds = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+            SubmissionOffsetMs = waveStart == 0 ? 0 : Stopwatch.GetElapsedTime(waveStart, submitted).TotalMilliseconds,
+        };
         try
         {
             InferenceRequestHandle handle = engine.SubmitRequest(seq);
             await foreach (int t in handle.Tokens.ReadAllAsync())
             {
-                double deliveredMs = sw.Elapsed.TotalMilliseconds;
+                double deliveredMs = Stopwatch.GetElapsedTime(submitted).TotalMilliseconds;
                 if (run.Tokens.Count == 0) run.TtftMs = deliveredMs;
                 run.Tokens.Add(t);
                 run.TokenTimesMs.Add(deliveredMs);
@@ -584,11 +650,17 @@ internal sealed class Bench
             run.Error = ex.Message;
             run.Finish = "error";
         }
-        sw.Stop();
-        run.TotalMs = sw.Elapsed.TotalMilliseconds;
+        run.TotalMs = Stopwatch.GetElapsedTime(submitted).TotalMilliseconds;
         run.Stats = seq.SpecStats;
         return run;
     }
+
+    private static RequestTimeline ToTimeline(Run run) => new(run.Id, run.StartedUnixMilliseconds,
+        run.SubmissionOffsetMs, run.Tokens.Count, run.TokenTimesMs, run.Finish, run.Error,
+        new RequestSpeculationCounters(run.Stats?.TokensDrafted ?? 0, run.Stats?.TokensAccepted ?? 0,
+            run.Stats?.VerifySteps ?? 0, run.Stats?.PlainSteps ?? 0, run.Stats?.RollbackSteps ?? 0,
+            run.Stats?.ParkedSteps ?? 0, run.Stats?.GovernorWins ?? 0, run.Stats?.GovernorLosses ?? 0,
+            run.Stats?.GovernorParkedSteps ?? 0));
 
     private async Task<Row> RunAsync(InferenceEngine engine, string scenario, string label, List<int> prompt, int maxNew,
         SamplingConfig cfg, bool expectBatched, int sharedPrefix = 0, string requestId = null)
@@ -612,7 +684,11 @@ internal sealed class Bench
         double decodeTps = run.Tokens.Count > 1 && decodeMs > 0 ? (run.Tokens.Count - 1) / (decodeMs / 1000.0) : 0;
 
         var notes = new List<string>();
-        if (run.Error != null) notes.Add("ERROR " + run.Error);
+        if (RequestCompletionChecks.HasError(run.Finish, run.Error))
+        {
+            Failures++;
+            notes.Add("ERROR " + run.Error);
+        }
         foreach (string line in _engineLog) notes.Add(line);
 
         // The claim under test: fresh prompt tokens go through the model in chunks of
@@ -632,7 +708,8 @@ internal sealed class Bench
             decodeTps, run.Tokens.Count, run.TotalMs, run.Finish,
             run.Stats?.TokensDrafted ?? 0, run.Stats?.TokensAccepted ?? 0, run.Stats?.VerifySteps ?? 0,
             run.Stats?.PlainSteps ?? 0, run.Stats?.RollbackSteps ?? 0, string.Join(" | ", notes))
-        { Tokens = run.Tokens, TokenTimesMs = run.TokenTimesMs };
+        { Tokens = run.Tokens, TokenTimesMs = run.TokenTimesMs, StartedUnixMilliseconds = run.StartedUnixMilliseconds,
+          RequestTimelines = new List<RequestTimeline> { ToTimeline(run) } };
         Add(row);
         return row;
     }
@@ -668,9 +745,9 @@ internal sealed class Bench
             Note(spec, $"stream identical to plain greedy ({i} tokens)");
             return;
         }
-        // Greedy speculation is verification-gated, so a divergence can only come from a
-        // near-tie argmax flipping under a different kernel batch shape; report it rather
-        // than assert on it.
+        // Different batch shapes may change rounding and activation quantization.
+        // Preserve the mismatch here; --spec-diagnostic measures the distributions
+        // and cache transitions instead of assuming that every mismatch is a near-tie.
         Note(spec, $"stream diverges from plain greedy at token {i} of {plain.Tokens.Count}/{spec.Tokens.Count} " +
                    $"(plain '{Shorten(_model.Tokenizer.Decode(plain.Tokens.Skip(i).Take(8).ToList()), 40)}' vs " +
                    $"{label} '{Shorten(_model.Tokenizer.Decode(spec.Tokens.Skip(i).Take(8).ToList()), 40)}')");
@@ -770,7 +847,7 @@ internal sealed class Bench
             r.Scenario, r.Label, r.Prompt, r.Reused, r.Fresh, r.Steps, r.PrefillSteps, r.TokensPerPrefillStep,
             r.TtftMs, r.PrefillTps, r.DecodeTps, r.OutTokens, r.TotalMs, r.Finish,
             r.Drafted, r.Accepted, r.VerifySteps, r.PlainSteps, r.Rollbacks, Note = r.AllNotes,
-            r.Tokens, r.TokenCounts, r.TokenTimesMs,
+            r.Tokens, r.TokenCounts, r.TokenTimesMs, r.StartedUnixMilliseconds, r.RequestTimelines, r.ConcurrentDecode,
         }), opts));
         Console.WriteLine($"[agent-turn-bench] rows written to {path}");
     }

@@ -499,6 +499,38 @@ public class SkillChatLoopStreamingTests : IDisposable
     // ---- the collector the non-streaming endpoints share --------------------
 
     [Fact]
+    public async Task GemmaPromptChannelMetadata_PrimesTheSkillLoopBeforeStreaming()
+    {
+        WriteSkill("alpha", "does alpha things");
+        async IAsyncEnumerable<ChatStreamUpdate> Generate(List<ChatMessage> messages,
+            List<ToolFunction> tools, [EnumeratorCancellation] CancellationToken cancellationToken)
+        {
+            yield return ChatStreamUpdate.Text("") with { RawGenerationSuffix = "<|channel>thought\n" };
+            foreach (char value in "Inspect the tool result.<channel|>42")
+                yield return ChatStreamUpdate.Text(value.ToString());
+            await Task.CompletedTask;
+            yield return new ChatStreamUpdate("", true, 10, 20, 0, 0, 0, 0, "eos");
+        }
+        var updates = new List<ChatStreamUpdate>();
+        await foreach (var update in SkillChatLoop.RunAsync("gemma4", new List<ChatMessage>(),
+            Plan(new[] { "alpha" }), true, Generate, null, CancellationToken.None))
+            updates.Add(update);
+        Assert.Equal("42", string.Concat(updates.Where(u => !u.Done).Select(u => u.Piece)));
+        Assert.Equal("Inspect the tool result.", string.Concat(updates.Select(u => u.ThinkingPiece)));
+    }
+
+    [Fact]
+    public void Collector_PreservesPromptOpenedGemmaChannel()
+    {
+        var collector = new ChatStreamCollector();
+        collector.Add(ChatStreamUpdate.Text("") with { RawGenerationSuffix = "<|channel>thought\n" });
+        collector.Add(ChatStreamUpdate.Text("Inspect the result.<channel|>42"));
+        var parsed = collector.Resolve("gemma4", true, null);
+        Assert.Equal("42", parsed.Content);
+        Assert.Equal("Inspect the result.", parsed.Thinking);
+    }
+
+    [Fact]
     public void Collector_OnAPreParsedStream_ReturnsThePiecesWithoutReParsing()
     {
         var collector = new ChatStreamCollector();

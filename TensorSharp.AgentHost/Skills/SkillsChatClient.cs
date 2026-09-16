@@ -516,9 +516,10 @@ namespace TensorSharp.AgentHost.Skills
                     writer.WriteBoolean("skills_discovery", false);
                 }
 
+                BuildMessageIds(messages, out string[][] callIds, out string?[] resultIds);
                 writer.WriteStartArray("messages");
-                foreach (ChatMessage message in messages)
-                    WriteMessage(writer, message);
+                for (int i = 0; i < messages.Count; i++)
+                    WriteMessage(writer, messages[i], callIds[i], resultIds[i]);
                 writer.WriteEndArray();
 
                 if (tools is { Count: > 0 })
@@ -534,11 +535,64 @@ namespace TensorSharp.AgentHost.Skills
             return Encoding.UTF8.GetString(buffer.WrittenSpan);
         }
 
-        private static void WriteMessage(Utf8JsonWriter writer, ChatMessage message)
+        private static void BuildMessageIds(List<ChatMessage> messages, out string[][] callIds, out string?[] resultIds)
+        {
+            callIds = new string[messages.Count][];
+            resultIds = new string?[messages.Count];
+            var used = new HashSet<string>(StringComparer.Ordinal);
+            foreach (ChatMessage message in messages)
+            {
+                if (!string.IsNullOrEmpty(message.ToolCallId)) used.Add(message.ToolCallId);
+                foreach (ToolCall call in message.ToolCalls ?? new())
+                    if (!string.IsNullOrEmpty(call.Id)) used.Add(call.Id);
+            }
+            int nextId = 0;
+            for (int i = 0; i < messages.Count; i++)
+            {
+                ChatMessage message = messages[i];
+                resultIds[i] = message.ToolCallId;
+                callIds[i] = new string[message.ToolCalls?.Count ?? 0];
+                for (int j = 0; j < callIds[i].Length; j++)
+                {
+                    string? id = message.ToolCalls![j].Id;
+                    if (string.IsNullOrEmpty(id))
+                    {
+                        // Legacy callers may have no IDs. Generate wire-only IDs,
+                        // reserving every explicit ID before choosing fallbacks.
+                        do { id = "call_" + (nextId++).ToString(CultureInfo.InvariantCulture); }
+                        while (!used.Add(id));
+                    }
+                    callIds[i][j] = id;
+                }
+            }
+            for (int i = 0; i < messages.Count; i++)
+            {
+                if (callIds[i].Length == 0) continue;
+                int end = i + 1;
+                while (end < messages.Count && messages[end].Role == "tool") end++;
+                var remaining = new List<string>(callIds[i]);
+                // Explicit out-of-order results take precedence over legacy
+                // positional association, even if an ID-less result comes first.
+                for (int j = i + 1; j < end; j++)
+                    if (!string.IsNullOrEmpty(resultIds[j])) remaining.Remove(resultIds[j]!);
+                for (int j = i + 1; j < end; j++)
+                    if (string.IsNullOrEmpty(resultIds[j]) && remaining.Count > 0)
+                    {
+                        resultIds[j] = remaining[0];
+                        remaining.RemoveAt(0);
+                    }
+            }
+            // An orphan ID-less result stays ID-less: no call can be inferred.
+            // This helper never changes caller-owned messages or ToolCall objects.
+        }
+
+        private static void WriteMessage(Utf8JsonWriter writer, ChatMessage message, string[] callIds, string? resultId)
         {
             writer.WriteStartObject();
             writer.WriteString("role", string.IsNullOrEmpty(message.Role) ? "user" : message.Role);
             writer.WriteString("content", message.Content ?? string.Empty);
+            if (!string.IsNullOrEmpty(resultId))
+                writer.WriteString("tool_call_id", resultId);
 
             if (message.ToolCalls is { Count: > 0 })
             {
@@ -547,7 +601,7 @@ namespace TensorSharp.AgentHost.Skills
                 {
                     ToolCall call = message.ToolCalls[i];
                     writer.WriteStartObject();
-                    writer.WriteString("id", "call_" + i.ToString(CultureInfo.InvariantCulture));
+                    writer.WriteString("id", callIds[i]);
                     writer.WriteString("type", "function");
                     writer.WriteStartObject("function");
                     writer.WriteString("name", call.Name ?? string.Empty);
@@ -699,6 +753,8 @@ namespace TensorSharp.AgentHost.Skills
 
                                 var call = new ToolCall
                                 {
+                                    Id = entry.TryGetProperty("id", out JsonElement id) && id.ValueKind == JsonValueKind.String
+                                        ? id.GetString() : null,
                                     Name = function.TryGetProperty("name", out JsonElement name)
                                            && name.ValueKind == JsonValueKind.String
                                         ? name.GetString() ?? string.Empty

@@ -63,6 +63,10 @@ namespace TensorSharp.Runtime.Paged
             _blocks.Add(block);
         }
 
+        // Reserve metadata before a model transfers native cache ownership.
+        // This does not acquire blocks or change the committed-token count.
+        internal void EnsureBlockCapacity(int blockCount) => _blocks.EnsureCapacity(blockCount);
+
         /// <summary>Mark <paramref name="newTokens"/> additional tokens as
         /// committed. Called by the executor after each forward.</summary>
         public void AdvanceTokens(int newTokens)

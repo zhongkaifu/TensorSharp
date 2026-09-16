@@ -10,7 +10,7 @@ namespace TensorSharp.Server.RequestParsers
 {
     internal static partial class ChatMessageParser
     {
-        private static void AppendDeepSeek41Video(ChatMessage message, JsonElement video,
+        private static void AppendSampledVideo(ChatMessage message, JsonElement video,
             UploadStoragePolicy uploads)
         {
             if (video.ValueKind != JsonValueKind.Object || !video.TryGetProperty("url", out var urlElement) ||

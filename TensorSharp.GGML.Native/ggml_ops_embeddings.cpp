@@ -3,6 +3,8 @@
 #include "ggml_ops_internal.h"
 #include "ggml-backend-impl.h"
 #include "gguf.h"
+#include "ggml_ops_q8_precision.h"
+#include "ggml_ops_dsv4_fused.h"
 
 #include <cctype>
 #include <fstream>
@@ -44,6 +46,9 @@ struct encoder {
     int dim = 0, heads = 0, layers = 0, ff = 0, context = 0, vocab = 0, pooling = 0;
     float eps = 0;
     ggml_backend_t backend = nullptr;
+    // Optional owned CUDA execution wrapper; the raw backend remains the
+    // allocator and capability identity, and must outlive this wrapper.
+    ggml_backend_t precise_backend = nullptr;
     ggml_threadpool_t threadpool = nullptr;
     ggml_context * weights_ctx = nullptr;
     ggml_backend_buffer_t weights_buffer = nullptr;
@@ -71,7 +76,9 @@ struct encoder {
     };
     std::unique_ptr<graph> cached;
     ~encoder() {
+        if (precise_backend) ggml_backend_synchronize(precise_backend);
         cached.reset();
+        if (precise_backend) ggml_backend_free(precise_backend);
         if (weights_buffer) ggml_backend_buffer_free(weights_buffer);
         for (auto * buffer : optimized_buffers) ggml_backend_buffer_free(buffer);
         if (weights_ctx) ggml_free(weights_ctx);
@@ -90,7 +97,9 @@ struct encoder {
         return value;
     }
     ggml_tensor * linear(ggml_context * ctx, ggml_tensor * x, const std::string & name) const {
-        auto * y = ggml_mul_mat(ctx, weight(name + ".weight"), x);
+        auto * w = weight(name + ".weight");
+        auto * y = precise_backend && w->type == GGML_TYPE_Q8_0
+            ? tsg_matmul_q8_f32(ctx, w, x) : ggml_mul_mat(ctx, w, x);
         if (auto * bias = find(name + ".bias")) y = ggml_add(ctx, y, bias);
         return y;
     }
@@ -253,7 +262,8 @@ struct encoder {
 #endif
         for (int i = 0; i < ggml_graph_n_nodes(g->gf); ++i) {
             auto * node = ggml_graph_node(g->gf, i);
-            require(ggml_backend_supports_op(backend, node), "backend does not support " + std::string(ggml_op_name(node->op)));
+            require(ggml_backend_supports_op(precise_backend ? precise_backend : backend, node),
+                "backend does not support " + std::string(ggml_op_name(node->op)));
         }
         g->allocator = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
         require(g->allocator && ggml_gallocr_alloc_graph(g->allocator, g->gf), "cannot allocate inference graph");
@@ -343,7 +353,7 @@ struct encoder {
         if (g.selected) ggml_backend_tensor_set(g.selected, selected.data(), 0, selected.size() * sizeof(int32_t));
         if (g.mean_weights) ggml_backend_tensor_set(g.mean_weights, means.data(), 0, means.size() * sizeof(float));
         const auto status = g.cpu_plan ? ggml_backend_graph_plan_compute(backend, g.cpu_plan) :
-            ggml_backend_graph_compute(backend, g.gf);
+            ggml_backend_graph_compute(precise_backend ? precise_backend : backend, g.gf);
         require(status == GGML_STATUS_SUCCESS, "graph computation failed");
         ggml_backend_tensor_get(g.output, output, 0, size_t(batch) * dim * sizeof(float));
         for (int b = 0; b < batch; ++b) {
@@ -405,6 +415,16 @@ std::unique_ptr<encoder> load(const char * path, const char * backend_name, int 
         }
     }
     require(e->backend != nullptr, "requested backend is unavailable: " + name);
+#ifdef TSG_GGML_USE_CUDA
+    // Prototype stays opt-in until both the numerical and balanced latency
+    // gates pass. Do not change quantized weight storage or other backends.
+    const char * q8_f32 = std::getenv("TS_EMBEDDING_Q8_F32");
+    if (name == "CUDA" && q8_f32 && std::strcmp(q8_f32, "1") == 0) {
+        e->precise_backend = tsg_dsv4_fused_backend_init(e->backend);
+        require(e->precise_backend != nullptr, "cannot create Q8/F32 execution backend");
+        std::fprintf(stderr, "Embedding encoder: TensorSharp Q8_0/F32 projections enabled (TS_EMBEDDING_Q8_F32=1).\n");
+    }
+#endif
     e->weights_ctx = ggml_init({size_t(gguf_get_n_tensors(file) + 1) * ggml_tensor_overhead() + 4096, nullptr, true});
     require(e->weights_ctx != nullptr, "cannot allocate weight metadata");
     std::map<std::string, std::vector<std::string>> fused;

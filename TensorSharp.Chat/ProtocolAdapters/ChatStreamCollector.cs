@@ -39,6 +39,7 @@ namespace TensorSharp.Server.ProtocolAdapters
         private readonly StringBuilder _content = new StringBuilder();
         private readonly StringBuilder _thinking = new StringBuilder();
         private readonly List<ToolCall> _toolCalls = new List<ToolCall>();
+        private string? _generationSuffix;
 
         /// <summary>Whether any update arrived pre-separated.</summary>
         public bool IsParsed { get; private set; }
@@ -52,6 +53,8 @@ namespace TensorSharp.Server.ProtocolAdapters
         /// <summary>Add one non-terminal update.</summary>
         public void Add(ChatStreamUpdate update)
         {
+            if (!update.Done && update.RawGenerationSuffix != null)
+                _generationSuffix = update.RawGenerationSuffix;
             if (update.IsParsed)
             {
                 IsParsed = true;
@@ -87,6 +90,7 @@ namespace TensorSharp.Server.ProtocolAdapters
 
             var parser = OutputParserFactory.Create(architecture);
             parser.Init(enableThinking, tools);
+            parser.SetGenerationPromptSuffix(_generationSuffix);
             return parser.Add(_raw.ToString(), true);
         }
 

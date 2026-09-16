@@ -44,6 +44,12 @@ internal static class GgmlBackendTestInitializer
     [ModuleInitializer]
     internal static void Initialize()
     {
+        // This explicit fixture records production prompt/tokenizer behavior
+        // without loading a native executor. The module initializer runs even
+        // when vstest selects only that fixture, before its identity guard.
+        if (Environment.GetEnvironmentVariable("TS_TEACHER_TOKEN_EXPORT") == "1")
+            return;
+
         GgmlBackendType backend =
             (Environment.GetEnvironmentVariable("TS_TEST_GGML_BACKEND") ?? "cpu").Trim().ToLowerInvariant() switch
             {

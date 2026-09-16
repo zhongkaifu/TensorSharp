@@ -37,13 +37,21 @@
 
 #include "ggml_ops_internal.h"
 #include "ggml_ops_dsv4_fused.h"
+#include "ggml_ops_matmul_precision.h"
+#include "ggml_ops_attention_precision.h"
+#include "ggml_ops_scheduler_alloc.h"
 #include "dsv41_engram.h"
 #include "dsv41_raw_gather.h"
 #include "dsv41_truncate.h"
+#include "dsv41_dspark.h"
+#include "dsv41_retention.h"
 #include "dsv41_engram_io.h"
 #include "dsv41_engram_advice.h"
 #include "ggml_ops_deepseek41_vision.h"
 #include "ggml_ops_deepseek41_tp.h"
+#if defined(TSG_GGML_TEST_HOOKS)
+#include "ggml-impl.h"
+#endif
 
 #include "gguf.h"
 
@@ -239,7 +247,9 @@ struct dsv4_dspark
     int32_t markov_rank = 0;
     int32_t noise_token = 0;
     int32_t n_stages = 0;
-    std::vector<int32_t> target_layers;   // trunk blocks whose output feeds main_proj
+    int32_t n_expert = 0;
+    int32_t n_expert_used = 0;
+    std::vector<int32_t> target_layers;   // V4 outputs; V4.1 attention-input stream means
     int layer_base = 0;                   // index of stage 0 in dsv4_model::layers
     int dev = 0;                          // hosting device (the output head's)
 
@@ -257,8 +267,9 @@ struct dsv4_dspark
 struct dsv4_slot
 {
     std::vector<int32_t> engram_history;
-    // A failed V4.1 execution may have written only part of its shared-cache
-    // topology. Only a complete cache reset makes that sequence reusable.
+    // A failed execution may have written only part of its cache topology,
+    // including V4 pipelined/speculative forwards. The historical field name
+    // is retained, but both architectures require a complete reset for reuse.
     bool v41_failed = false;
     int id = 0;
     int32_t n_past = 0;
@@ -275,10 +286,13 @@ struct dsv4_slot
     // before this checkpoint - so keeping the boundary state is what makes that
     // rewind possible at all. Decode steps deliberately do not move it.
     int32_t cp_n_past = -1;
+    int32_t spec_begin = -1;
+    int32_t spec_end = -1;
     std::vector<dsv4_slot_layer> layers;
     // DSpark: one SWA ring per drafter stage, keyed by trunk position and fed
     // from the trunk's own hidden states (see build_dspark_ring_update).
     std::vector<ggml_tensor *> ds_k;
+    std::vector<ggml_tensor *> ds_k_cp;
     ggml_context * ctx[MAX_GPUS + 1] = {};
     ggml_backend_buffer_t buf[MAX_GPUS + 1] = {};
 
@@ -323,7 +337,26 @@ static void dsv41_test_fail(const char * stage, int64_t position)
     const char * minimum = std::getenv("TS_DSV41_TEST_FAIL_POSITION");
     if (configured && std::strcmp(configured, stage) == 0 &&
         position >= (minimum ? std::atoll(minimum) : 0))
+    {
+        const char * kind = std::getenv("TS_DSV41_TEST_FAIL_KIND");
+        if (kind && std::strcmp(kind, "unknown") == 0) throw 41;
+        if (kind && std::strcmp(kind, "bad_alloc") == 0) throw std::bad_alloc();
         throw std::runtime_error(std::string("Injected V4.1 execution failure after ") + stage);
+    }
+}
+
+// Used only by the model-free C ABI regression below. Interception is before
+// any model tensors are accessed, never in a production or real-fixture run.
+static thread_local int dsv4_test_boundary_failure = 0;
+static thread_local int dsv4_test_boundary_visits = 0;
+static thread_local int dsv4_test_boundary_stage = 0;
+static bool dsv4_test_boundary_fault(int stage = 0)
+{
+    if (!dsv4_test_boundary_failure || stage != dsv4_test_boundary_stage) return false;
+    ++dsv4_test_boundary_visits;
+    if (dsv4_test_boundary_failure == 1) throw std::bad_alloc();
+    if (dsv4_test_boundary_failure == 2) throw 41;
+    return true;
 }
 #endif
 
@@ -672,6 +705,25 @@ struct dsv4_model
 // ---------------------------------------------------------------------------
 // GGUF loading
 // ---------------------------------------------------------------------------
+
+// A graph owns its scheduler arena and may capture addresses from multiple
+// slots. Scheduler destruction itself does not drain submitted work, so wait
+// before releasing an arena used by a V4 asynchronous prefill microbatch.
+static void dsv4_drop_slot_graphs(dsv4_model & model, int slot_id)
+{
+    for (auto it = model.graph_cache.begin(); it != model.graph_cache.end(); )
+    {
+        bool hit = (*it)->slot_id == slot_id;
+        for (const auto & slot : (*it)->bd)
+            if (slot.slot_id == slot_id) { hit = true; break; }
+        if (hit)
+        {
+            if ((*it)->sched) ggml_backend_sched_synchronize((*it)->sched);
+            it = model.graph_cache.erase(it);
+        }
+        else ++it;
+    }
+}
 
 static bool gguf_get_f32_key(gguf_context * ctx, const char * key, float * out)
 {
@@ -1223,9 +1275,13 @@ static void dsv4_init_slot_state_rows(dsv4_slot & slot)
 static void dsv4_reset_slot(dsv4_slot & slot)
 {
     slot.n_past = 0;
+    slot.spec_begin = slot.spec_end = -1;
     slot.engram_history.clear();
     for (int d = 0; d <= MAX_GPUS; d++)
         if (slot.buf[d]) ggml_backend_buffer_clear(slot.buf[d], 0);
+#if defined(TSG_GGML_TEST_HOOKS)
+    dsv4_test_boundary_fault(1);
+#endif
     dsv4_init_slot_state_rows(slot);
     slot.v41_failed = false;
     // The shadow rings live in the same buffers and were just zeroed, so the
@@ -1246,9 +1302,15 @@ static void dsv4_copy_rewind_rings(dsv4_slot & slot, bool save)
             ggml_backend_tensor_copy(save ? live : shadow, save ? shadow : live);
         };
         move(C.raw_k, C.raw_k_cp);
+#if defined(TSG_GGML_TEST_HOOKS)
+        if (!save) dsv4_test_boundary_fault(2);
+#endif
         move(C.comp_state_kv, C.comp_state_kv_cp);
         move(C.comp_state_score, C.comp_state_score_cp);
     }
+    for (size_t i = 0; i < slot.ds_k_cp.size(); ++i)
+        ggml_backend_tensor_copy(save ? slot.ds_k[i] : slot.ds_k_cp[i],
+                                 save ? slot.ds_k_cp[i] : slot.ds_k[i]);
 }
 
 // Record the slot's state as the rewind checkpoint. Called at the end of every
@@ -1257,6 +1319,9 @@ static void dsv4_checkpoint_slot(const dsv4_model & m, dsv4_slot & slot)
 {
     if (!m.rewind_cp || slot.v41_failed) return;
     dsv4_copy_rewind_rings(slot, /*save*/ true);
+#if defined(TSG_GGML_TEST_HOOKS)
+    dsv41_test_fail("checkpoint", slot.n_past);
+#endif
     slot.cp_n_past = slot.n_past;
     // engram_history needs no shadow: it is indexed by absolute position and
     // hash_tokens only ever writes from the current head forward, so its first
@@ -1280,7 +1345,7 @@ static dsv4_slot * dsv4_slot_alloc(dsv4_model & m)
     for (int d = 0; d <= m.n_gpu; d++)
     {
         // 10 cache tensors per layer, plus the 3 rewind-checkpoint shadows.
-        ggml_init_params cp = { (size_t) (hp.n_layer * 13 + 32) * ggml_tensor_overhead(), nullptr, true };
+        ggml_init_params cp = { (size_t) (hp.n_layer * 13 + m.ds.n_stages * 2 + 32) * ggml_tensor_overhead(), nullptr, true };
         slot->ctx[d] = ggml_init(cp);
         if (!slot->ctx[d]) return nullptr;
     }
@@ -1288,11 +1353,18 @@ static dsv4_slot * dsv4_slot_alloc(dsv4_model & m)
     if (m.ds.loaded)
     {
         slot->ds_k.assign(m.ds.n_stages, nullptr);
+        if (m.rewind_cp) slot->ds_k_cp.assign(m.ds.n_stages, nullptr);
         for (int s = 0; s < m.ds.n_stages; s++)
         {
             slot->ds_k[s] = ggml_new_tensor_2d(slot->ctx[m.ds.dev], GGML_TYPE_F16,
                                                hp.n_embd_head, m.ring_raw);
             ggml_format_name(slot->ds_k[s], "cache_ds_k.%d.%d", slot->id, s);
+            if (m.rewind_cp)
+            {
+                slot->ds_k_cp[s] = ggml_new_tensor_2d(slot->ctx[m.ds.dev], GGML_TYPE_F16,
+                                                      hp.n_embd_head, m.ring_raw);
+                ggml_format_name(slot->ds_k_cp[s], "cp_ds_k.%d.%d", slot->id, s);
+            }
         }
     }
 
@@ -1320,8 +1392,8 @@ static dsv4_slot * dsv4_slot_alloc(dsv4_model & m)
                 C.lid_k = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, hp.indexer_head_size, rows);
                 if (ratio > 1)
                 {
-                    C.comp_state_kv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, head, ratio + 1);
-                    C.comp_state_score = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, head, ratio + 1);
+                    C.comp_state_kv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, head, ratio + m.state_extra + 1);
+                    C.comp_state_score = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, head, ratio + m.state_extra + 1);
                 }
             }
             if (m.rewind_cp)
@@ -1498,7 +1570,23 @@ static bool dsv4_scan_dspark(dsv4_model & m, const char * dspark_path,
                    "deepseek4.dspark.n_layers", "deepseek4.dspark.layer_count" }, &ds.n_stages);
     ok &= kv_arr({ "dspark.target_layer_ids", "dspark.target_layers",
                    "deepseek4.dspark.target_layer_ids", "deepseek4.dspark.target_layers" }, ds.target_layers);
-    if (!ok || ds.block_size <= 0 || ds.n_stages <= 0 || ds.markov_rank <= 0 || ds.target_layers.empty())
+    ds.n_expert = m.hp.n_expert;
+    ds.n_expert_used = m.hp.n_expert_used;
+    if (m.hp.v41)
+    {
+        ok &= kv_u32({ "dspark.expert_count" }, &ds.n_expert);
+        ok &= kv_u32({ "dspark.expert_used_count" }, &ds.n_expert_used);
+    }
+    else
+    {
+        kv_u32({ "dspark.expert_count" }, &ds.n_expert);
+        kv_u32({ "dspark.expert_used_count" }, &ds.n_expert_used);
+    }
+    if (!ok || ds.block_size <= 0 || ds.block_size > 64 || ds.n_stages <= 0 || ds.n_stages > 16 ||
+        ds.markov_rank <= 0 || ds.target_layers.empty() || ds.noise_token < 0 || ds.noise_token >= m.hp.n_vocab ||
+        ds.n_expert <= 0 || ds.n_expert_used <= 0 || ds.n_expert_used > ds.n_expert ||
+        !std::is_sorted(ds.target_layers.begin(), ds.target_layers.end()) ||
+        std::adjacent_find(ds.target_layers.begin(), ds.target_layers.end()) != ds.target_layers.end())
     {
         fprintf(stderr, "[dsv4] %s is missing dspark.* metadata\n", dspark_path);
         gguf_free(g); if (meta) ggml_free(meta);
@@ -1520,10 +1608,13 @@ static bool dsv4_scan_dspark(dsv4_model & m, const char * dspark_path,
         if (ai >= 0 && gguf_get_kv_type(g, ai) == GGUF_TYPE_STRING)
             arch = gguf_get_val_str(g, ai);
     }
-    if (arch && strcmp(arch, "deepseek4-dspark") != 0 && strcmp(arch, "deepseek_v4_flash_dspark_draft") != 0)
+    const bool correct_arch = m.hp.v41
+        ? arch && strcmp(arch, "deepseek41-dspark") == 0
+        : !arch || strcmp(arch, "deepseek4-dspark") == 0 || strcmp(arch, "deepseek_v4_flash_dspark_draft") == 0;
+    if (!correct_arch)
     {
-        fprintf(stderr, "[dsv4] %s is a '%s' drafter, not a DeepSeek V4 DSpark one; DSpark drafters for other "
-                        "architectures use a different design and are not supported\n", dspark_path, arch);
+        fprintf(stderr, "[dsv4] %s has drafter architecture '%s', incompatible with target %s\n",
+                dspark_path, arch ? arch : "missing", m.hp.v41 ? "deepseek41" : "deepseek4");
         gguf_free(g); if (meta) ggml_free(meta);
         return false;
     }
@@ -1692,7 +1783,9 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
         const char * fe = getenv("TS_DSV4_FUSED");
         bool want_fused = !cpu_only && !(fe && atoi(fe) == 0);
 #ifdef TSG_GGML_USE_CUDA
-        if (want_fused)
+        // V4.1 precision is required even when optional elementwise fusion
+        // is disabled. Keep the TensorSharp CUDA executor for those matmuls.
+        if (want_fused || (!cpu_only && m->hp.v41))
         {
             bool all_ok = true;
             for (int d = 0; d < n_gpu; d++)
@@ -1700,7 +1793,7 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
                 m->ts_backends[d] = tsg_dsv4_fused_backend_init(m->backends[d]);
                 if (!m->ts_backends[d]) { all_ok = false; break; }
             }
-            m->fused = all_ok;
+            m->fused = all_ok && want_fused;
         }
 #else
         (void) want_fused;
@@ -1710,7 +1803,7 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
         // unaffected -- both report the same buffer type. Index n_gpu is the CPU
         // backend, which host-resident routed experts are pinned to.
         for (int d = 0; d < n_gpu; d++)
-            m->dev_backends[d] = m->fused ? m->ts_backends[d] : m->backends[d];
+            m->dev_backends[d] = m->ts_backends[d] ? m->ts_backends[d] : m->backends[d];
         m->dev_backends[n_gpu] = cpu;
         int nb = 0;
         for (int d = 0; d < n_gpu; d++) m->sched_backends[nb++] = m->dev_backends[d];
@@ -1811,8 +1904,6 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
             throw std::runtime_error("TS_DSV41_TP requires deepseek41 and must equal its selected GPU count (2..8)");
     }
     auto key = [&](const char * suffix) { return arch + "." + suffix; };
-    if (hp.v41 && dspark_path && *dspark_path)
-        throw std::runtime_error("V4.1 requires a V4.1 DSpark implementation; V4 drafters are incompatible");
     bool ok = true;
     ok &= gguf_get_u32_key(g0, key("block_count").c_str(), &hp.n_layer);
     ok &= gguf_get_u32_key(g0, key("embedding_length").c_str(), &hp.n_embd);
@@ -1951,14 +2042,6 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
         ggml_free(meta);
     }
 
-    size_t dspark_bytes = 0;
-    if (!dsv4_scan_dspark(*m, dspark_path, shards, sources, &dspark_bytes))
-        return nullptr;
-    // The drafter lands entirely on the output-head device, so it has to weigh
-    // on the split: counted as root bytes it pushes whole layers onto the
-    // earlier devices instead of overflowing the last one.
-    root_bytes += dspark_bytes;
-
     // --- vocab size from tok_embd ---
     // Its size is also where the split learns how the root bytes really land:
     // the embedding table on the first device, the output head and the whole
@@ -1970,11 +2053,22 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
         hp.n_vocab = (int32_t) it->second.ne[1];
         embd_bytes = it->second.size;
     }
+    // Draft metadata includes a vocabulary-bounded noise token. Validate it
+    // only after the target embedding has established the real vocabulary.
+    size_t dspark_bytes = 0;
+    if (!dsv4_scan_dspark(*m, dspark_path, shards, sources, &dspark_bytes))
+        return nullptr;
+    // The drafter lands entirely on the output-head device, so it has to weigh
+    // on the split: counted as root bytes it pushes whole layers onto the
+    // earlier devices instead of overflowing the last one.
+    root_bytes += dspark_bytes;
     const size_t head_bytes = root_bytes - embd_bytes;
 
     // --- geometry ---
     m->n_ctx = n_ctx > 0 ? n_ctx : 16384;
     m->n_ubatch = n_ubatch > 0 ? n_ubatch : 512;
+    if (m->ds.loaded && m->ds.block_size >= m->n_ubatch)
+        throw std::runtime_error("DSpark requires ubatch >= draft block size + 1");
     m->ring_raw = pad64(hp.n_swa + m->n_ubatch, 256);
     // +1 so the masked scratch row (last row) used by non-boundary CSA/LID
     // decode steps never collides with a real compressed row.
@@ -2025,7 +2119,7 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
             {
                 const int64_t rows = ratio == 2 ? m->n_csa_rows : m->n_hca_rows;
                 b += (head + idx) * rows * 2;
-                if (ratio > 1) b += 2 * head * (ratio + 1) * 4;
+                if (ratio > 1) b += 2 * head * (ratio + state_extra_est + 1) * 4;
             }
             if (m->rewind_cp)
             {
@@ -2035,7 +2129,7 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
                 if (ratio > 1
                     && std::find(hp.kv_sources.begin(), hp.kv_sources.end(), il) != hp.kv_sources.end())
                 {
-                    b += (size_t) (2 * head * (ratio + 1) * 4);
+                    b += (size_t) (2 * head * (ratio + state_extra_est + 1) * 4);
                 }
             }
         }
@@ -2147,7 +2241,7 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
                 const auto & gate = sources.at(prefix + "ffn_gate_exps.weight");
                 const auto & up = sources.at(prefix + "ffn_up_exps.weight");
                 const auto & down = sources.at(prefix + "ffn_down_exps.weight");
-                const auto strips = tsg_dsv41_tp::split(down.ne[0], ggml_blck_size(down.type), tp_ranks, il);
+                const auto strips = tsg_dsv41_tp::split_weights(down.ne[0], down.type, tp_ranks, il);
                 for (int d = 0; d < tp_ranks; ++d)
                     tp_bytes[il][d] = strips[d].count *
                         (ggml_row_size(gate.type, gate.ne[0]) * gate.ne[2] +
@@ -2158,6 +2252,9 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
         std::vector<size_t> fixed_bytes((size_t) n_gpu, 0);
         fixed_bytes[0] += embd_bytes;
         fixed_bytes[(size_t) n_gpu - 1] += head_bytes;
+        if (m->ds.loaded)
+            fixed_bytes[(size_t) n_gpu - 1] += (size_t) m->ds.n_stages *
+                ((size_t) hp.n_embd_head * m->ring_raw * sizeof(ggml_fp16_t) + 256) * (m->rewind_cp ? 2 : 1);
 
         // V4.1: prefer placing each Engram table on the GPU that owns its
         // layer. The lookup then becomes a device get_rows over the quantized
@@ -2438,19 +2535,11 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
 
     if (m->ds.loaded)
     {
-        // The drafter runs where the output head lives: it consumes the last
-        // trunk blocks' hidden states and reuses the trunk's LM head.
+        // The drafter runs where the output head lives. Target feature rows
+        // are reduced on their producing devices and gathered by its graph;
+        // their much larger trunk layers need not share this device.
         m->ds.dev = dev_last;
         m->ds.layer_base = hp.n_layer;
-        for (int32_t tl : m->ds.target_layers)
-        {
-            if (m->layers[tl].device != dev_last)
-            {
-                fprintf(stderr, "[dsv4] DSpark needs target layer %d on the output-head device %d (it is on %d)\n",
-                        (int) tl, dev_last, m->layers[tl].device);
-                return nullptr;
-            }
-        }
         m->layers.resize(hp.n_layer + m->ds.n_stages);
         for (int s = 0; s < m->ds.n_stages; s++)
         {
@@ -2600,6 +2689,14 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
             const std::string n = std::to_string(st);
             return DSW(d, "mtp." + n + "." + suffix, "dspark." + n + "." + suffix);
         };
+        auto shape = [](ggml_tensor * tensor, std::initializer_list<int64_t> dims)
+        {
+            if (!tensor) return false;
+            int axis = 0;
+            for (int64_t n : dims) if (axis >= 4 || tensor->ne[axis++] != n) return false;
+            while (axis < 4) if (tensor->ne[axis++] != 1) return false;
+            return true;
+        };
         for (int st = 0; st < ds.n_stages; st++)
         {
             dsv4_layer & L = m->layers[hp.n_layer + st];
@@ -2628,10 +2725,26 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
             L.ffn_gate_shexp = SW(d, st, "ffn_gate_shexp.weight");
             L.ffn_down_shexp = SW(d, st, "ffn_down_shexp.weight");
             L.ffn_up_shexp   = SW(d, st, "ffn_up_shexp.weight");
-            if (!L.attn_norm || !L.wq_a || !L.wq_b || !L.wkv || !L.wo_a || !L.wo_b ||
-                !L.ffn_gate_exps || !L.ffn_down_exps || !L.ffn_up_exps || !L.ffn_gate_inp)
+            const int64_t hc = hp.hc_mult, mix = hc * (hc + 2), dim = hp.n_embd, ff = hp.n_ff_exp;
+            if (!shape(L.attn_norm, {dim}) || !shape(L.ffn_norm, {dim}) ||
+                !shape(L.attn_q_a_norm, {hp.q_lora_rank}) || !shape(L.attn_kv_norm, {hp.n_embd_head}) ||
+                !shape(L.attn_sinks, {hp.n_head}) ||
+                !shape(L.wq_a, {dim, hp.q_lora_rank}) || !shape(L.wq_b, {hp.q_lora_rank, (int64_t) hp.n_embd_head * hp.n_head}) ||
+                !shape(L.wkv, {dim, hp.n_embd_head}) ||
+                (!shape(L.wo_a, {(int64_t) hp.n_embd_head * hp.n_head / hp.o_groups, (int64_t) hp.o_lora_rank * hp.o_groups}) &&
+                 !shape(L.wo_a, {(int64_t) hp.n_embd_head * hp.n_head / hp.o_groups, hp.o_lora_rank, hp.o_groups})) ||
+                !shape(L.wo_b, {(int64_t) hp.o_lora_rank * hp.o_groups, dim}) ||
+                !shape(L.hc_attn_fn, {dim * hc, mix}) || !shape(L.hc_ffn_fn, {dim * hc, mix}) ||
+                !shape(L.hc_attn_base, {mix}) || !shape(L.hc_ffn_base, {mix}) ||
+                !shape(L.hc_attn_scale, {3}) || !shape(L.hc_ffn_scale, {3}) ||
+                !shape(L.ffn_gate_inp, {dim, ds.n_expert}) || !shape(L.ffn_exp_probs_b, {ds.n_expert}) ||
+                !shape(L.ffn_gate_exps, {dim, ff, ds.n_expert}) || !shape(L.ffn_up_exps, {dim, ff, ds.n_expert}) ||
+                !shape(L.ffn_down_exps, {ff, dim, ds.n_expert}) ||
+                !shape(L.ffn_gate_shexp, {dim, ff * hp.n_expert_shared}) ||
+                !shape(L.ffn_up_shexp, {dim, ff * hp.n_expert_shared}) ||
+                !shape(L.ffn_down_shexp, {ff * hp.n_expert_shared, dim}))
             {
-                fprintf(stderr, "[dsv4] DSpark stage %d is incomplete\n", st);
+                fprintf(stderr, "[dsv4] DSpark stage %d has missing/incompatible tensor dimensions\n", st);
                 return nullptr;
             }
         }
@@ -2639,16 +2752,24 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
         ds.main_norm     = DSW(ds.dev, "mtp.0.main_norm.weight", "dspark.main_norm.weight");
         ds.main_proj     = DSW(ds.dev, "mtp.0.main_proj.weight", "dspark.main_proj.weight");
         ds.norm          = DSW(ds.dev, "mtp." + last + ".norm.weight", "dspark.norm.weight");
-        ds.hc_head_fn    = DSW(ds.dev, "mtp." + last + ".hc_head_fn.weight", "dspark.hc_head_fn.weight");
-        ds.hc_head_scale = DSW(ds.dev, "mtp." + last + ".hc_head_scale.weight", "dspark.hc_head_scale.weight");
-        ds.hc_head_base  = DSW(ds.dev, "mtp." + last + ".hc_head_base.weight", "dspark.hc_head_base.weight");
+        if (!hp.v41)
+        {
+            ds.hc_head_fn    = DSW(ds.dev, "mtp." + last + ".hc_head_fn.weight", "dspark.hc_head_fn.weight");
+            ds.hc_head_scale = DSW(ds.dev, "mtp." + last + ".hc_head_scale.weight", "dspark.hc_head_scale.weight");
+            ds.hc_head_base  = DSW(ds.dev, "mtp." + last + ".hc_head_base.weight", "dspark.hc_head_base.weight");
+        }
         ds.markov_w1     = DSW(ds.dev, "mtp." + last + ".markov_head.markov_w1.weight", "dspark.markov_w1.weight");
         ds.markov_w2     = DSW(ds.dev, "mtp." + last + ".markov_head.markov_w2.weight", "dspark.markov_w2.weight");
         ds.conf_proj     = DSW(ds.dev, "mtp." + last + ".confidence_head.proj.weight",
                                sources.count("dspark.conf_proj.weight") ? "dspark.conf_proj.weight"
                                                                        : "dspark.confidence_head.weight");
-        if (!ds.main_norm || !ds.main_proj || !ds.norm || !ds.hc_head_fn || !ds.markov_w1 ||
-            !ds.markov_w2 || !ds.conf_proj)
+        if (!shape(ds.main_norm, {hp.n_embd}) ||
+            !shape(ds.main_proj, {(int64_t) hp.n_embd * (int64_t) ds.target_layers.size(), hp.n_embd}) ||
+            !shape(ds.norm, {hp.n_embd}) ||
+            (!hp.v41 && (!ds.hc_head_fn || !ds.hc_head_scale || !ds.hc_head_base)) || !ds.markov_w1 ||
+            !shape(ds.markov_w1, {ds.markov_rank, hp.n_vocab}) ||
+            !shape(ds.markov_w2, {ds.markov_rank, hp.n_vocab}) ||
+            !shape(ds.conf_proj, {(int64_t) hp.n_embd + ds.markov_rank, 1}))
         {
             fprintf(stderr, "[dsv4] DSpark heads are incomplete\n");
             return nullptr;
@@ -3198,6 +3319,16 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
             ggml_free(pctx);
         }
         fprintf(stderr, "[dsv4] flash attention: %s\n", m->flash_attn ? "on" : "off");
+        if (hp.v41 && m->n_gpu > 0 && m->ts_backends[0])
+        {
+            const char * sparse = getenv("TS_DSV41_SPARSE_FA");
+            const bool sparse_prefill = sparse && atoi(sparse) != 0;
+            fprintf(stderr, "[dsv4] V4.1 CUDA precision: TensorSharp F32 matmul; attention=%s\n",
+                m->flash_attn ? (sparse_prefill
+                    ? "TensorSharp F32 (streaming decode; sparse prefill for queries>4, keys>=8192; tiled otherwise)"
+                    : "TensorSharp F32 (streaming decode, tiled prefill)") :
+                    "TensorSharp F32 decomposed (FA=0 or unavailable)");
+        }
     }
 
     m->logits.resize(hp.n_vocab);
@@ -3408,6 +3539,27 @@ struct graph_builder
         if (t->op != GGML_OP_NONE && !ggml_backend_supports_op(backend, t))
             return;
         ggml_backend_sched_set_tensor_backend(res.sched, t, backend);
+    }
+
+    void precise_matmul(ggml_tensor * t)
+    {
+        auto * backend = ggml_backend_sched_get_tensor_backend(res.sched, t);
+        if (t->src[0]->type == GGML_TYPE_F32 && t->src[1]->type == GGML_TYPE_F32 &&
+            (m.n_gpu == 0 || (backend && ggml_backend_is_cpu(backend))))
+        {
+            // Native CPU F32/F32 matmul already preserves both sources. Keep
+            // its optimized batching and established reduction order for
+            // CPU-only execution and explicitly offloaded expert projections.
+            ggml_prec_set_acc(t, GGML_PREC_F32);
+            ggml_prec_set_src(t, GGML_PREC_F32, 1);
+            return;
+        }
+        tsg_matmul_require_f32(ctx, t);
+        // A projection may already have a layer-placement hint from before
+        // the final precision pass. Route unsupported custom nodes to the
+        // CPU fallback instead of leaving them pinned to Metal or Vulkan.
+        if (backend && !ggml_backend_supports_op(backend, t))
+            ggml_backend_sched_set_tensor_backend(res.sched, t, m.dev_backends[m.n_gpu]);
     }
 
     ggml_tensor * new_input_i32(int64_t n, const char * name, int dev)
@@ -3665,10 +3817,16 @@ struct graph_builder
 
         ggml_tensor * feat = feats[0];
         for (size_t i = 1; i < feats.size(); i++)
+        {
             feat = ggml_concat(ctx, feat, feats[i], 0);          // [n_target*n_embd, nt]
+            pin(feat, ds.dev);
+        }
 
         ggml_tensor * mx = ggml_mul_mat(ctx, ds.main_proj, feat); // [n_embd, nt]
+        pin(mx, ds.dev);
         mx = rms(mx, ds.main_norm);
+        trace_v41(feat, 0, "dspark_features");
+        trace_v41(mx, 0, "dspark_main_normalized");
 
         float freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow;
         int n_ctx_orig;
@@ -3692,6 +3850,9 @@ struct graph_builder
                                   beta_fast, beta_slow);
             kv = ggml_concat(ctx, kv_nope, kv_pe, 0);
 
+            trace_v41(kv, st, "dspark_committed_prequant");
+            if (hp.v41) kv = v41_quant(kv, 0, ds.dev);
+            trace_v41(kv, st, "dspark_committed_quantized");
             ggml_tensor * kv2d = ggml_reshape_2d(ctx, kv, head, nt);
             ggml_build_forward_expand(gf,
                 ggml_set_rows(ctx, m.active_slot->ds_k[st], kv2d, raw_idxs));
@@ -3726,7 +3887,7 @@ struct graph_builder
         qr = rms(qr, L.attn_q_a_norm);
         ggml_tensor * q = ggml_mul_mat(ctx, L.wq_b, qr);
         q = ggml_reshape_3d(ctx, q, head, n_head, nt);
-        q = ggml_rms_norm(ctx, q, hp.rms_eps);
+        if (!hp.v41) q = ggml_rms_norm(ctx, q, hp.rms_eps);
         {
             ggml_tensor * q_nope = ggml_view_3d(ctx, q, n_nope, n_head, nt,
                     ggml_row_size(q->type, head), ggml_row_size(q->type, head) * n_head, 0);
@@ -3753,15 +3914,17 @@ struct graph_builder
         // [ring | block] keys. The block's own keys stay in the graph (they are
         // speculative, not committed), so they are concatenated rather than
         // written to the ring.
+        if (hp.v41) kv = v41_quant(kv, 0, m.ds.dev);
         ggml_tensor * ring = ggml_view_2d(ctx, m.active_slot->ds_k[st], head, m.ring_raw,
                                           m.active_slot->ds_k[st]->nb[1], 0);
         ring = ggml_reshape_3d(ctx, ring, head, 1, m.ring_raw);
         ggml_tensor * blk = ggml_cast(ctx, ggml_reshape_2d(ctx, kv, head, nt), GGML_TYPE_F16);
         blk = ggml_reshape_3d(ctx, blk, head, 1, nt);
         ggml_tensor * k_all = ggml_concat(ctx, ring, blk, 2);
+        if (hp.v41 && ggml_backend_is_cpu(m.backends[m.ds.dev])) k_all = ggml_cast(ctx, k_all, GGML_TYPE_F32);
 
         const float kq_scale = 1.0f / sqrtf((float) head);
-        ggml_tensor * out = attn_mha(q, k_all, res.inp.ds_mask, L.attn_sinks, kq_scale);
+        ggml_tensor * out = attn_mha(q, k_all, res.inp.ds_mask, L.attn_sinks, kq_scale, m.ds.dev);
 
         out = ggml_reshape_3d(ctx, out, head, n_head, nt);
         ggml_tensor * out_nope = ggml_view_3d(ctx, out, n_nope, n_head, nt,
@@ -3801,6 +3964,8 @@ struct graph_builder
         ggml_tensor * emb = ggml_get_rows(ctx, m.tok_embd, res.inp.ds_tokens);
         ggml_tensor * x = ggml_reshape_3d(ctx, emb, hp.n_embd, 1, nt);
         x = ggml_repeat_4d(ctx, x, hp.n_embd, hc, nt, 1);
+        pin(x, dev);
+        ggml_tensor * delayed_pre = nullptr;
 
         for (int st = 0; st < ds.n_stages; st++)
         {
@@ -3809,13 +3974,16 @@ struct graph_builder
             ggml_tensor * comb = nullptr;
 
             ggml_tensor * residual = x;
-            ggml_tensor * cur = build_hc_pre(x, L.hc_attn_fn, L.hc_attn_scale, L.hc_attn_base, &post, &comb, dev);
+            ggml_tensor * attn_pre = nullptr;
+            ggml_tensor * cur = build_hc_pre(x, L.hc_attn_fn, L.hc_attn_scale, L.hc_attn_base, &post, &comb, dev,
+                hp.v41 ? &attn_pre : nullptr, delayed_pre);
             cur = rms(cur, L.attn_norm);
             cur = build_dspark_attention(st, cur, res.inp.ds_pos);
             x = build_hc_post(cur, residual, post, comb);
 
             residual = x;
-            cur = build_hc_pre(x, L.hc_ffn_fn, L.hc_ffn_scale, L.hc_ffn_base, &post, &comb, dev);
+            cur = build_hc_pre(x, L.hc_ffn_fn, L.hc_ffn_scale, L.hc_ffn_base, &post, &comb, dev,
+                hp.v41 ? &delayed_pre : nullptr, attn_pre);
             ggml_build_forward_expand(gf, residual);
             ggml_build_forward_expand(gf, post);
             ggml_build_forward_expand(gf, comb);
@@ -3826,7 +3994,8 @@ struct graph_builder
         }
 
         // head: hc_head -> the drafter's norm -> the TRUNK's LM head
-        ggml_tensor * h = build_hc_head_w(x, ds.hc_head_fn, ds.hc_head_scale, ds.hc_head_base); // [n_embd, 1, nt]
+        ggml_tensor * h = hp.v41 ? build_hc_pre_op(x, delayed_pre)
+            : build_hc_head_w(x, ds.hc_head_fn, ds.hc_head_scale, ds.hc_head_base); // [n_embd, 1, nt]
         h = ggml_reshape_2d(ctx, h, hp.n_embd, nt);
         ggml_tensor * base = ggml_mul_mat(ctx, m.output, rms(h, ds.norm));   // [n_vocab, nt]
         ggml_mul_mat_set_prec(base, GGML_PREC_F32);
@@ -3863,6 +4032,13 @@ struct graph_builder
         res.ds_conf = conf;
         ggml_build_forward_expand(gf, toks);
         ggml_build_forward_expand(gf, conf);
+        if (hp.v41)
+            for (int i = 0; i < ggml_graph_n_nodes(gf); ++i)
+            {
+                ggml_tensor * node = ggml_graph_node(gf, i);
+                if ((node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) &&
+                    node->src[0]->type == GGML_TYPE_F32) precise_matmul(node);
+            }
     }
 
     // ---- compression ----
@@ -4029,27 +4205,44 @@ struct graph_builder
         ggml_tensor * cur;
         if (m.flash_attn)
         {
-            cur = ggml_flash_attn_ext(ctx, qp, kp, kp, kq_mask, kq_scale, 0.0f, 0.0f);
-            ggml_flash_attn_ext_add_sinks(cur, sinks);
-            ggml_flash_attn_ext_set_prec(cur, GGML_PREC_F32);
-            // V4.1 exposes at most the sliding window plus the selected
-            // compressed rows per query. CUDA can compact this existing mask
-            // and attend to its finite entries without duplicating K/V for
-            // every prefill token. Keep an explicit A/B switch until qualified.
-            const char * sparse_fa = hp.v41 ? getenv("TS_DSV41_SPARSE_FA") : nullptr;
-            // Dense tiles reuse K/V across prefill queries more efficiently
-            // at short contexts. Preserve that path below the measured
-            // crossover; upstream also checks device/kernel eligibility.
-            if (sparse_fa && atoi(sparse_fa) != 0 && (q->ne[2] == 1 || n_kv >= 16384))
-                ggml_flash_attn_ext_set_n_kv_max(cur, hp.n_swa + hp.indexer_top_k);
-            if (device >= 0) pin(cur, device);
+            const int attention_device = device >= 0 ? device : 0;
+            const bool owned_precision = hp.v41 && attention_device < m.n_gpu &&
+                m.ts_backends[attention_device] != nullptr;
+            if (owned_precision)
+            {
+                // ggml's CUDA FA narrows Q and softmax weights to F16 even
+                // with F32 accumulation. V4.1 quantization/routing can amplify
+                // those lost bits, so keep the complete attention path F32.
+                const char * sparse = getenv("TS_DSV41_SPARSE_FA");
+                const int capacity = sparse && atoi(sparse) != 0 && q->ne[2] > 4 && n_kv >= 8192
+                    ? hp.n_swa + hp.indexer_top_k : 0;
+                cur = tsg_attention_f32_on_backend(ctx, res.sched, m.dev_backends[attention_device],
+                    qp, kp, kp, kq_mask, sinks, kq_scale, capacity);
+            }
+            else
+            {
+                cur = ggml_flash_attn_ext(ctx, qp, kp, kp, kq_mask, kq_scale, 0.0f, 0.0f);
+                ggml_flash_attn_ext_add_sinks(cur, sinks);
+                ggml_flash_attn_ext_set_prec(cur, GGML_PREC_F32);
+                // V4.1 exposes at most the sliding window plus the selected
+                // compressed rows per query. CUDA can compact this existing mask
+                // and attend to its finite entries without duplicating K/V for
+                // every prefill token. Keep an explicit A/B switch until qualified.
+                const char * sparse_fa = hp.v41 ? getenv("TS_DSV41_SPARSE_FA") : nullptr;
+                // Dense tiles reuse K/V across prefill queries more efficiently
+                // at short contexts. Preserve that path below the measured
+                // crossover; upstream also checks device/kernel eligibility.
+                if (sparse_fa && atoi(sparse_fa) != 0 && (q->ne[2] == 1 || n_kv >= 16384))
+                    ggml_flash_attn_ext_set_n_kv_max(cur, hp.n_swa + hp.indexer_top_k);
+                if (device >= 0) pin(cur, device);
+            }
             cur = ggml_reshape_2d(ctx, cur, cur->ne[0] * cur->ne[1], cur->ne[2] * cur->ne[3]);
         }
         else
         {
             ggml_tensor * kq = ggml_mul_mat(ctx, kp, qp);   // [n_kv, nt, n_head]
             ggml_mul_mat_set_prec(kq, GGML_PREC_F32);
-            if (hp.v41) ggml_prec_set_src(kq, GGML_PREC_F32, 1);
+            if (hp.v41) precise_matmul(kq);
             if (device >= 0) pin(kq, device);
 
             kq = ggml_soft_max_ext(ctx, kq, kq_mask, kq_scale, 0.0f);
@@ -4062,8 +4255,7 @@ struct graph_builder
             ggml_tensor * kqv = ggml_mul_mat(ctx, v, kq);  // [head, nt, n_head]
             if (hp.v41)
             {
-                ggml_prec_set_acc(kqv, GGML_PREC_F32);
-                ggml_prec_set_src(kqv, GGML_PREC_F32, 1);
+                precise_matmul(kqv);
             }
             if (device >= 0) pin(kqv, device);
 
@@ -4455,8 +4647,9 @@ struct graph_builder
     {
         const dsv4_layer & L = m.layers[il];
         const int dev = L.device;
-        const int64_t n_expert = hp.n_expert;
-        const int64_t n_used = hp.n_expert_used;
+        const bool is_draft = m.ds.loaded && il >= m.ds.layer_base;
+        const int64_t n_expert = is_draft ? m.ds.n_expert : hp.n_expert;
+        const int64_t n_used = is_draft ? m.ds.n_expert_used : hp.n_expert_used;
         const float clamp_limit = hp.swiglu_clamp_exp.empty() ? 0.0f : hp.swiglu_clamp_exp[il];
 
         ggml_tensor * logits = ggml_mul_mat(ctx, L.ffn_gate_inp, cur);   // [n_expert, nt]
@@ -4465,7 +4658,7 @@ struct graph_builder
         ggml_tensor * selected = nullptr;
         ggml_tensor * weights = nullptr;
 
-        if (m.fused && !res.image_tokens)
+        if (m.fused && (!res.image_tokens || is_draft))
         {
             if (il < hp.hash_layer_count)
                 selected = ggml_get_rows(ctx, L.ffn_gate_tid2eid, inp_tokens);   // I32 [n_used, nt]
@@ -4476,7 +4669,7 @@ struct graph_builder
             const float scale = (hp.expert_weights_scale != 0.0f && hp.expert_weights_scale != 1.0f)
                 ? hp.expert_weights_scale : 1.0f;
             weights = fused_node(TSG_DSV4_FUSED_MOE_WEIGHTS, GGML_TYPE_F32, 1, n_used, nt, 1,
-                    { logits, selected }, dev, hp.expert_weights_norm ? 1 : 0, 0, 0, 0, scale);
+                    { logits, selected }, dev, hp.expert_weights_norm && (!is_draft || n_used > 1) ? 1 : 0, 0, 0, 0, scale);
         }
         else
         {
@@ -4490,7 +4683,7 @@ struct graph_builder
             {
                 // The trained visual bias changes top-k selection only. The
                 // selected experts' normalized weights still use unbiased scores.
-                ggml_tensor * bias = res.image_tokens
+                ggml_tensor * bias = res.image_tokens && !is_draft
                     ? ggml_get_rows(ctx, m.vision->router_bias[il], res.inp.image_types[dev])
                     : L.ffn_exp_probs_b;
                 ggml_tensor * selection = ggml_add(ctx, probs, bias);
@@ -4500,7 +4693,7 @@ struct graph_builder
             ggml_tensor * probs3 = ggml_reshape_3d(ctx, probs, 1, n_expert, nt);
             weights = ggml_get_rows(ctx, probs3, selected);       // [1, n_used, nt]
 
-            if (hp.expert_weights_norm)
+            if (hp.expert_weights_norm && (!is_draft || n_used > 1))
             {
                 weights = ggml_reshape_2d(ctx, weights, n_used, nt);
                 ggml_tensor * sum = ggml_sum_rows(ctx, weights);
@@ -4923,8 +5116,7 @@ struct graph_builder
             if ((node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) &&
                 node->src[0]->type == GGML_TYPE_F32)
             {
-                ggml_prec_set_acc(node, GGML_PREC_F32);
-                ggml_prec_set_src(node, GGML_PREC_F32, 1);
+                precise_matmul(node);
             }
         }
     }
@@ -5174,6 +5366,13 @@ struct graph_builder
 
             if (hp.v41) inpL = build_engram(il, inpL);
             trace_v41(inpL, il, "engram_output");
+            if (hp.v41 && m.ds.loaded &&
+                std::find(m.ds.target_layers.begin(), m.ds.target_layers.end(), il) != m.ds.target_layers.end())
+            {
+                auto * feature = hc_mean(inpL);
+                pin(feature, dev);
+                ds_feats.push_back(feature);
+            }
             ggml_tensor * residual = inpL;
             ggml_tensor * post = nullptr;
             ggml_tensor * comb = nullptr;
@@ -5201,10 +5400,12 @@ struct graph_builder
             inpL = build_hc_post(cur, residual, post, comb);
             trace_v41(inpL, il, "output");
 
-            if (m.ds.loaded &&
+            if (!hp.v41 && m.ds.loaded &&
                 std::find(m.ds.target_layers.begin(), m.ds.target_layers.end(), il) != m.ds.target_layers.end())
             {
-                ds_feats.push_back(hc_mean(inpL));
+                auto * feature = hc_mean(inpL);
+                pin(feature, dev);
+                ds_feats.push_back(feature);
             }
         }
 
@@ -5239,8 +5440,7 @@ struct graph_builder
                 if ((node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) &&
                     node->src[0]->type == GGML_TYPE_F32)
                 {
-                    ggml_prec_set_acc(node, GGML_PREC_F32);
-                    ggml_prec_set_src(node, GGML_PREC_F32, 1);
+                    precise_matmul(node);
                 }
             }
         }
@@ -5356,11 +5556,9 @@ namespace
 // positions produce many distinct shapes. Four concurrent 10.8k-token prefills
 // on the eight-A40 box filled the twelve slots and ran device 1 out of memory.
 //
-// That is not a survivable error. ggml's allocator frees a buffer before
-// reallocating it, so a failed reserve leaves a null buffer behind and the
-// retry inside ggml_backend_sched_alloc_graph dereferences it -- the process
-// dies rather than the request failing. So the cache has to stay inside the
-// memory instead of discovering the limit.
+// Explicit checked reservation below lets an allocation failure reject the
+// graph safely. Trimming first also avoids unnecessary failures and allocation
+// churn when older entries can release enough memory for the next shape.
 //
 // The rule: before building a new entry, free least-recently-used entries
 // until every device has room for another entry as large as the largest one
@@ -5423,6 +5621,9 @@ static void dsv4_trim_graph_cache(dsv4_model & m)
 static graph_build_result * dsv4_acquire_graph(dsv4_model & m, int64_t nt, int64_t p0, bool pipeline, bool * out_reuse,
                                               bool all_logits = false, int image_tokens = 0)
 {
+#if defined(TSG_GGML_TEST_HOOKS)
+    if (dsv4_test_boundary_fault()) return nullptr;
+#endif
     const dsv4_hparams & hp = m.hp;
     static const int perf_build = []() { const char * e = getenv("TS_DSV4_PERF"); return e ? atoi(e) : 0; }();
 
@@ -5479,12 +5680,11 @@ static graph_build_result * dsv4_acquire_graph(dsv4_model & m, int64_t nt, int64
 
     if (!reuse)
     {
-        // A failed V4.1 build must never become a reusable cache entry after
+        // A failed build must never become a reusable cache entry after
         // the caller resets its sequence. Keep ownership local until complete.
         auto pending = std::make_unique<graph_build_result>();
         graph_build_result & r = *pending;
         dsv4_trim_graph_cache(m);
-        if (!hp.v41) m.graph_cache.emplace_front(std::move(pending));
         const size_t meta_size = (size_t) 96 * 1024 * 1024;
         ggml_init_params gp = { meta_size, nullptr, true };
         r.ctx = ggml_init(gp);
@@ -5501,7 +5701,6 @@ static graph_build_result * dsv4_acquire_graph(dsv4_model & m, int64_t nt, int64
         if (!r.sched)
         {
             fprintf(stderr, "[dsv4] sched creation failed\n");
-            if (!hp.v41) m.graph_cache.pop_front();
             return nullptr;
         }
 
@@ -5511,10 +5710,9 @@ static graph_build_result * dsv4_acquire_graph(dsv4_model & m, int64_t nt, int64
         if (hp.v41) dsv41_test_fail("graph", p0);
 #endif
 
-        if (!ggml_backend_sched_alloc_graph(r.sched, r.gf))
+        if (!tsg_scheduler_alloc_graph(r.sched, r.gf))
         {
             fprintf(stderr, "[dsv4] sched_alloc_graph failed (nt=%" PRId64 ")\n", nt);
-            if (!hp.v41) m.graph_cache.pop_front();
             return nullptr;
         }
         dsv4_node_dump_attach(r.sched);
@@ -5583,7 +5781,7 @@ static graph_build_result * dsv4_acquire_graph(dsv4_model & m, int64_t nt, int64
                 nt, p0, line.c_str());
         }
         res_p = &r;
-        if (hp.v41) m.graph_cache.emplace_front(std::move(pending));
+        m.graph_cache.emplace_front(std::move(pending));
 
         while ((int) m.graph_cache.size() > m.graph_cache_cap)
             m.graph_cache.pop_back();
@@ -5679,7 +5877,7 @@ static bool dsv4_forward_ubatch(dsv4_model & m, const int32_t * tokens, int64_t 
                                 const float * image_embeddings = nullptr, int image_tokens = 0)
 {
     const dsv4_hparams & hp = m.hp;
-    if (hp.v41 && m.active_slot->v41_failed) return false;
+    if (m.active_slot->v41_failed) return false;
 #if defined(TSG_GGML_TEST_HOOKS)
     if (m.moe_tp) m.moe_tp->test_set_position(p0);
 #endif
@@ -5860,7 +6058,7 @@ static bool dsv4_forward_ubatch(dsv4_model & m, const int32_t * tokens, int64_t 
         }
     }
 
-    dsv41_slot_write_guard writes{hp.v41 ? m.active_slot : nullptr};
+    dsv41_slot_write_guard writes{m.active_slot};
     if (hp.v41)
     {
         std::vector<int32_t> hash_tokens;
@@ -5878,6 +6076,10 @@ static bool dsv4_forward_ubatch(dsv4_model & m, const int32_t * tokens, int64_t 
         dsv41_stage_engram(m, res, hashes.data(), nt, image_mask, image_tokens);
     }
     auto t_inputs = now();
+
+    // Both architectures can have partially written cache tensors once a
+    // graph is submitted, including a non-final asynchronous V4 microbatch.
+    writes.started = true;
 
 #ifdef TSG_GGML_USE_CUDA
     if (perf >= 3) tsg_dsv4_fused_counters_reset();
@@ -5966,6 +6168,9 @@ static bool dsv4_forward_ubatch(dsv4_model & m, const int32_t * tokens, int64_t 
 static graph_build_result * dsv4_acquire_batched_graph(
     dsv4_model & m, int n, const int32_t * slot_ids, const int32_t * positions, bool * out_reuse)
 {
+#if defined(TSG_GGML_TEST_HOOKS)
+    if (dsv4_test_boundary_fault()) return nullptr;
+#endif
     const dsv4_hparams & hp = m.hp;
 
     // V4.1 keeps the unfused compressor and its own ratios; the plan sizes and
@@ -6015,8 +6220,8 @@ static graph_build_result * dsv4_acquire_batched_graph(
     if (!reuse)
     {
         dsv4_trim_graph_cache(m);
-        m.graph_cache.emplace_front(new graph_build_result());
-        graph_build_result & r = *m.graph_cache.front();
+        auto pending = std::make_unique<graph_build_result>();
+        graph_build_result & r = *pending;
         // The per-slot attention forks are the only O(n) node cost, roughly
         // ~500 nodes/slot including the attn_cat concat chain; wide spans need
         // a bigger node table and metadata arena.
@@ -6033,15 +6238,11 @@ static graph_build_result * dsv4_acquire_batched_graph(
         if (!r.sched)
         {
             fprintf(stderr, "[dsv4] batched sched creation failed\n");
-            m.graph_cache.pop_front();
             return nullptr;
         }
 
-        // The V4.1 builder validates the shared sparse selection as it goes and
-        // throws if a layer publishes one its consumers cannot use. The entry is
-        // already in the cache under this signature, so a half-built graph left
-        // behind would be "reused" by the next call with the same shape. Drop it
-        // and let the caller fall back to per-slot forwards.
+        // Publish only a complete graph. Allocation/build exceptions also
+        // destroy the local pending entry before the caller can retry it.
         try
         {
             graph_builder gb(m, r, n, 0);
@@ -6050,19 +6251,19 @@ static graph_build_result * dsv4_acquire_batched_graph(
         catch (const std::exception & error)
         {
             fprintf(stderr, "[dsv4] batched graph build failed (n=%d): %s\n", n, error.what());
-            m.graph_cache.pop_front();
             return nullptr;
         }
 
-        if (!ggml_backend_sched_alloc_graph(r.sched, r.gf))
+        if (!tsg_scheduler_alloc_graph(r.sched, r.gf))
         {
             fprintf(stderr, "[dsv4] batched sched_alloc_graph failed (n=%d)\n", n);
-            m.graph_cache.pop_front();
             return nullptr;
         }
         for (int d = 0; d < m.n_gpu; d++)
             r.buffer_bytes[d] = ggml_backend_sched_get_buffer_size(r.sched, m.dev_backends[d]);
         res_p = &r;
+
+        m.graph_cache.emplace_front(std::move(pending));
 
         while ((int) m.graph_cache.size() > m.graph_cache_cap)
             m.graph_cache.pop_back();
@@ -6303,6 +6504,13 @@ static bool dsv4_forward_batched_decode(
         }
     }
 
+    if (!hp.v41)
+    {
+        // Input staging has not mutated V4 caches. Arm all slots only before
+        // compute; a graph-allocation decline remains safe for serial fallback.
+        writes.slots.reserve(n);
+        for (int i = 0; i < n; ++i) writes.slots.push_back(m.slots.at(slot_ids[i]).get());
+    }
     if (ggml_backend_sched_graph_compute(res.sched, res.gf) != GGML_STATUS_SUCCESS)
     {
         fprintf(stderr, "[dsv4] batched graph compute failed\n");
@@ -6329,6 +6537,9 @@ static bool dsv4_forward_batched_decode(
 static int dsv4_dspark_draft(dsv4_model & m, int32_t anchor_token, int64_t position,
                              int32_t * toks_out, float * conf_out)
 {
+#if defined(TSG_GGML_TEST_HOOKS)
+    if (dsv4_test_boundary_fault()) return 0;
+#endif
     const dsv4_dspark & ds = m.ds;
     if (!ds.loaded || position <= 0) return 0;
 
@@ -6353,8 +6564,8 @@ static int dsv4_dspark_draft(dsv4_model & m, int32_t anchor_token, int64_t posit
 
     if (!res_p)
     {
-        m.graph_cache.emplace_front(new graph_build_result());
-        graph_build_result & r = *m.graph_cache.front();
+        auto pending = std::make_unique<graph_build_result>();
+        graph_build_result & r = *pending;
         ggml_init_params gp = { (size_t) 32 * 1024 * 1024, nullptr, true };
         r.ctx = ggml_init(gp);
         r.gf = ggml_new_graph_custom(r.ctx, 8192, false);
@@ -6365,18 +6576,17 @@ static int dsv4_dspark_draft(dsv4_model & m, int32_t anchor_token, int64_t posit
         r.sched = ggml_backend_sched_new(m.sched_backends, m.sched_bufts, m.n_sched_backends, 8192, false, true);
         if (!r.sched)
         {
-            m.graph_cache.pop_front();
             return 0;
         }
         graph_builder gb(m, r, B, position);
         gb.build_dspark_draft();
-        if (!ggml_backend_sched_alloc_graph(r.sched, r.gf))
+        if (!tsg_scheduler_alloc_graph(r.sched, r.gf))
         {
             fprintf(stderr, "[dsv4] DSpark draft graph alloc failed\n");
-            m.graph_cache.pop_front();
             return 0;
         }
         res_p = &r;
+        m.graph_cache.emplace_front(std::move(pending));
     }
     graph_build_result & res = *res_p;
 
@@ -6506,8 +6716,18 @@ TSG_TEST_EXPORT int TSGgml_Dsv4TestSharedPlacement(void * handle, int layer, int
         ggml_tensor * node = ggml_graph_node(graph.gf, i);
         // Scheduler copies can replace src[0], so its tensor name is the
         // stable identity after allocation. Copies include the original name.
-        if (node->op != GGML_OP_MUL_MAT || !node->src[0] ||
+        if (!node->src[0] ||
             (node->src[0] != weight && !strstr(node->src[0]->name, weight->name))) continue;
+        bool projection_op = node->op == GGML_OP_MUL_MAT;
+        if (node->op == GGML_OP_CUSTOM)
+        {
+            ggml_custom_op_params params;
+            memcpy(&params, node->op_params, sizeof(params));
+            const auto * descriptor = static_cast<const tsg_dsv4_fused_desc *>(params.userdata);
+            projection_op = descriptor && descriptor->magic == TSG_DSV4_FUSED_MAGIC
+                && descriptor->kind == TSG_MATMUL_F32;
+        }
+        if (!projection_op) continue;
         auto actual = ggml_backend_sched_get_tensor_backend(graph.sched, node);
         // The scheduler's backend for a device, which is the fused wrapper when
         // fused ops are available and the CUDA backend otherwise.
@@ -6518,6 +6738,35 @@ TSG_TEST_EXPORT int TSGgml_Dsv4TestSharedPlacement(void * handle, int layer, int
     }
     snprintf(description, (size_t) capacity, "projection not found");
     return -2;
+}
+// Numerical fixture seam: expose the committed drafter window in logical
+// position order. Read-only and absent from production builds.
+TSG_TEST_EXPORT int TSGgml_Dsv4TestLayerDevice(void * handle, int layer)
+{
+    auto * m = static_cast<tsg_dsv4::dsv4_model *>(handle);
+    if (!m || layer < 0 || layer >= m->hp.n_layer) return -1;
+    return m->layers[layer].device;
+}
+
+TSG_TEST_EXPORT int TSGgml_Dsv4TestDsparkReadRing(void * handle, int stage, int count, float * output)
+{
+    auto * m = static_cast<tsg_dsv4::dsv4_model *>(handle);
+    if (!m || !m->active_slot || !m->ds.loaded || !output || stage < 0 || stage >= m->ds.n_stages ||
+        count <= 0 || count > m->ring_raw || count > m->active_slot->n_past) return 0;
+    try
+    {
+        auto * ring = m->active_slot->ds_k[stage];
+        const int64_t width = m->hp.n_embd_head;
+        std::vector<ggml_fp16_t> row((size_t) width);
+        for (int i = 0; i < count; ++i)
+        {
+            const int64_t position = m->active_slot->n_past - count + i;
+            ggml_backend_tensor_get(ring, row.data(), (size_t) (position % m->ring_raw) * ring->nb[1], row.size() * sizeof(ggml_fp16_t));
+            for (int64_t j = 0; j < width; ++j) output[i * width + j] = ggml_fp16_to_fp32(row[(size_t) j]);
+        }
+        return 1;
+    }
+    catch (...) { return 0; }
 }
 #undef TSG_TEST_EXPORT
 #endif
@@ -6531,13 +6780,13 @@ TSG_EXPORT int TSGgml_Dsv4Forward(void * handle, const int32_t * tokens, int n_t
     auto * m = (tsg_dsv4::dsv4_model *) handle;
     tsg_dsv4::dsv4_slot * slot = m->active_slot;
 
+    if (slot->v41_failed)
+    {
+        fprintf(stderr, "[dsv4] sequence execution previously failed; reset or destroy the slot before reuse\n");
+        return -4;
+    }
     if (m->hp.v41)
     {
-        if (slot->v41_failed)
-        {
-            fprintf(stderr, "[dsv41] sequence execution previously failed; reset or destroy the slot before reuse\n");
-            return -4;
-        }
         // Validate the whole request before a first microbatch can mutate the
         // sequence, including invalid IDs in a later microbatch.
         for (int i = 0; i < n_tokens; ++i)
@@ -6553,60 +6802,65 @@ TSG_EXPORT int TSGgml_Dsv4Forward(void * handle, const int32_t * tokens, int n_t
     const bool perf = []() { const char * e = getenv("TS_DSV4_PERF"); return e && atoi(e) > 0; }();
     auto t0 = std::chrono::steady_clock::now();
 
-    m->pos_end_hint = (int64_t) slot->n_past + n_tokens;
-    if (m->moe_tp) m->moe_tp->begin_forward();
-
-    // Pre-acquire the first two chunk graphs (the pipelined pair) and the
-    // final chunk's graph so the pipelined prefill never stalls on a
-    // device-synchronizing arena allocation mid-flight.
-    if (!m->hp.v41 && n_tokens > m->n_ubatch)
-    {
-        tsg_dsv4::dsv4_acquire_graph(*m, m->n_ubatch, slot->n_past, m->n_gpu > 1, nullptr);
-        const int nt2 = std::min(m->n_ubatch, n_tokens - m->n_ubatch);
-        const bool last2 = (2 * m->n_ubatch >= n_tokens);
-        tsg_dsv4::dsv4_acquire_graph(*m, nt2, slot->n_past + m->n_ubatch, !last2 && m->n_gpu > 1, nullptr);
-        if (!last2)
-        {
-            const int last_nt = n_tokens - m->n_ubatch * ((n_tokens - 1) / m->n_ubatch);
-            tsg_dsv4::dsv4_acquire_graph(*m, last_nt, (int64_t) slot->n_past + (n_tokens - last_nt), false, nullptr);
-        }
-    }
-
-    int done = 0;
     try
     {
+        slot->spec_begin = slot->spec_end = -1;
+        m->pos_end_hint = (int64_t) slot->n_past + n_tokens;
+        if (m->moe_tp) m->moe_tp->begin_forward();
+
+        // Pre-acquisition allocates graph metadata and device arenas. It must
+        // share the C ABI error boundary with compute and checkpointing.
+        if (!m->hp.v41 && n_tokens > m->n_ubatch)
+        {
+            const int nt2 = std::min(m->n_ubatch, n_tokens - m->n_ubatch);
+            const bool last2 = (2 * m->n_ubatch >= n_tokens);
+            if (!tsg_dsv4::dsv4_acquire_graph(*m, m->n_ubatch, slot->n_past, m->n_gpu > 1, nullptr) ||
+                !tsg_dsv4::dsv4_acquire_graph(*m, nt2, slot->n_past + m->n_ubatch, !last2 && m->n_gpu > 1, nullptr))
+            {
+                slot->v41_failed = true;
+                return -3;
+            }
+            if (!last2)
+            {
+                const int last_nt = n_tokens - m->n_ubatch * ((n_tokens - 1) / m->n_ubatch);
+                if (!tsg_dsv4::dsv4_acquire_graph(*m, last_nt,
+                        (int64_t) slot->n_past + (n_tokens - last_nt), false, nullptr))
+                {
+                    slot->v41_failed = true;
+                    return -3;
+                }
+            }
+        }
+        int done = 0;
         while (done < n_tokens)
         {
             const int nt = std::min(m->n_ubatch, n_tokens - done);
             const bool last = (done + nt == n_tokens);
             if (!tsg_dsv4::dsv4_forward_ubatch(*m, tokens + done, nt, slot->n_past, last, last ? logits_out : nullptr))
             {
-                if (m->hp.v41) slot->v41_failed = true;
+                slot->v41_failed = true;
                 return -3;
             }
             slot->n_past += nt;
             done += nt;
         }
+
+        // Only multi-token calls publish prompt-boundary rewind checkpoints.
+        // A copy failure can leave a partial shadow, so it also requires reset.
+        if (n_tokens > 1) tsg_dsv4::dsv4_checkpoint_slot(*m, *slot);
     }
     catch (const std::exception & error)
     {
-        if (!m->hp.v41) throw;
         slot->v41_failed = true;
-        fprintf(stderr, "[dsv41] forward failed: %s\n", error.what());
+        fprintf(stderr, "[dsv4] forward failed: %s\n", error.what());
         return -3;
     }
     catch (...)
     {
-        if (!m->hp.v41) throw;
         slot->v41_failed = true;
-        fprintf(stderr, "[dsv41] forward failed with an unknown execution exception\n");
+        fprintf(stderr, "[dsv4] forward failed with an unknown execution exception\n");
         return -3;
     }
-
-    // A multi-token call is a prompt, so this is the boundary a later turn wants
-    // to rewind to (see dsv4_slot::cp_n_past). A single-token decode step is not,
-    // and must leave the checkpoint where the prompt left it.
-    if (n_tokens > 1) tsg_dsv4::dsv4_checkpoint_slot(*m, *slot);
 
     if (perf)
     {
@@ -6625,7 +6879,140 @@ TSG_EXPORT void TSGgml_Dsv4Reset(void * handle)
 {
     if (!handle) return;
     auto * m = (tsg_dsv4::dsv4_model *) handle;
-    tsg_dsv4::dsv4_reset_slot(*m->active_slot);
+    // Initializing compressor sentinel rows uses host scratch. If that fails
+    // under memory pressure, the void reset ABI cannot claim a usable cache.
+    const bool failed = m->active_slot->v41_failed;
+    m->active_slot->v41_failed = true;
+    try
+    {
+        // Failed requests must release their captured arenas before retrying
+        // under memory pressure. Normal reset keeps successful graph reuse.
+        if (failed) tsg_dsv4::dsv4_drop_slot_graphs(*m, m->active_slot->id);
+        tsg_dsv4::dsv4_reset_slot(*m->active_slot);
+    }
+    catch (const std::exception & error)
+    {
+        fprintf(stderr, "[dsv4] reset failed; slot remains unusable: %s\n", error.what());
+    }
+    catch (...)
+    {
+        fprintf(stderr, "[dsv4] reset failed with an unknown exception; slot remains unusable\n");
+    }
+}
+
+// Slot inspection never selects a different slot or mutates continuation state.
+// The legacy void Reset ABI remains available; managed ownership transfers use
+// this checked form for every architecture, including V4 with a DSpark drafter.
+TSG_EXPORT int TSGgml_Dsv4ResetChecked(void * handle)
+{
+    auto * m = (tsg_dsv4::dsv4_model *) handle;
+    if (!m || !m->active_slot) return 0;
+    TSGgml_Dsv4Reset(handle);
+    return !m->active_slot->v41_failed && m->active_slot->n_past == 0;
+}
+
+// Slot inspection never selects a different slot or mutates continuation state.
+// Status: 1 = available V4.1 slot, 0 = unavailable; health is a separate output.
+TSG_EXPORT int TSGgml_Dsv4SlotStatus(void * handle, int slot_id,
+    int * head, int * checkpoint, int * healthy)
+{
+    if (!handle || !head || !checkpoint || !healthy) return 0;
+    auto * m = (tsg_dsv4::dsv4_model *) handle;
+    if (!m->hp.v41 || m->ds.loaded) return 0;
+    auto found = m->slots.find(slot_id);
+    if (found == m->slots.end()) return 0;
+    const auto & slot = *found->second;
+    *head = slot.n_past;
+    *checkpoint = m->rewind_cp ? slot.cp_n_past : -1;
+    *healthy = !slot.v41_failed;
+    return 1;
+}
+
+TSG_EXPORT int TSGgml_Dsv4SlotCanReuse(void * handle, int slot_id, int cached_head, int target)
+{
+    int head = 0, checkpoint = -1, healthy = 0;
+    if (!TSGgml_Dsv4SlotStatus(handle, slot_id, &head, &checkpoint, &healthy) ||
+        !healthy || head != cached_head) return 0;
+    auto * m = (tsg_dsv4::dsv4_model *) handle;
+    return dsv41_plan_truncate(target, head, checkpoint, m->rewind_span, m->truncate_align)
+        != dsv41_truncate_route::refuse;
+}
+
+TSG_EXPORT int TSGgml_Dsv4SlotReleaseGraphs(void * handle, int slot_id)
+{
+    if (!handle) return 0;
+    auto * m = (tsg_dsv4::dsv4_model *) handle;
+    if (!m->hp.v41 || m->slots.find(slot_id) == m->slots.end()) return 0;
+    try { tsg_dsv4::dsv4_drop_slot_graphs(*m, slot_id); return 1; }
+    catch (...) { return 0; }
+}
+
+// Admission uses the actual full-context slot buffers, not prefix length. All
+// slots in this model have the same geometry. Charging every graph once is
+// conservative when some belong to active requests. This never trims a graph.
+TSG_EXPORT int TSGgml_Dsv4SlotCanRetain(void * handle, int slot_id,
+    int retained_count, uint64_t budget_per_device)
+{
+    int head = 0, checkpoint = -1, healthy = 0;
+    if (retained_count < 0 || !TSGgml_Dsv4SlotStatus(handle, slot_id, &head, &checkpoint, &healthy) ||
+        !healthy || head <= 0) return 0;
+    auto * m = (tsg_dsv4::dsv4_model *) handle;
+    const auto & slot = *m->slots.find(slot_id)->second;
+    uint64_t reserve = 1024ULL * 1024 * 1024;
+    if (const char * e = getenv("TS_DSV4_GRAPH_CACHE_HEADROOM_MB"))
+    {
+        char * end = nullptr;
+        const long long mb = strtoll(e, &end, 10);
+        if (end != e && !*end && mb >= 0 && (uint64_t) mb <= UINT64_MAX / (1024 * 1024))
+            reserve = (uint64_t) mb * 1024 * 1024;
+    }
+    try
+    {
+        for (int d = 0; d <= m->n_gpu; ++d)
+        {
+            uint64_t bytes = slot.buf[d] ? ggml_backend_buffer_get_size(slot.buf[d]) : 0;
+            if (d == m->n_gpu)
+            {
+                uint64_t history = (uint64_t) m->n_ctx;
+                for (const auto & entry : m->slots)
+                    history = std::max(history, (uint64_t) entry.second->engram_history.capacity());
+                if (history > (UINT64_MAX - bytes) / sizeof(int32_t)) return 0;
+                bytes += history * sizeof(int32_t);
+            }
+            uint64_t graphs = 0, largest = 0;
+            for (const auto & graph : m->graph_cache)
+            {
+                const uint64_t n = graph->sched
+                    ? ggml_backend_sched_get_buffer_size(graph->sched, m->dev_backends[d]) : 0;
+                if (n > UINT64_MAX - graphs) return 0;
+                graphs += n;
+                largest = std::max(largest, n);
+            }
+            size_t free_bytes = 0, total_bytes = 0;
+            // n_gpu is also one for the explicitly selected CPU executor.
+            // Classify the actual device, not its position in that array.
+            ggml_backend_dev_t device = ggml_backend_get_device(m->dev_backends[d]);
+            if (!device) return 0;
+            const bool accelerator = ggml_backend_dev_type(device) != GGML_BACKEND_DEVICE_TYPE_CPU;
+            if (accelerator)
+            {
+                ggml_backend_dev_memory(device, &free_bytes, &total_bytes);
+                if (!total_bytes) return 0; // Unknown accelerator headroom must not authorize retention.
+            }
+            const bool fits = dsv41_retention_fits(bytes, graphs, largest, (uint64_t) retained_count,
+                budget_per_device, accelerator, free_bytes, reserve);
+            fprintf(stderr, "[dsv41 retain-admission] slot=%d device=%d accelerator=%d "
+                "cache_bytes=%llu all_graph_bytes=%llu largest_graph_bytes=%llu retained=%d "
+                "budget_bytes=%llu free_bytes=%llu reserve_bytes=%llu accepted=%d\n",
+                slot_id, d, accelerator, (unsigned long long) bytes,
+                (unsigned long long) graphs, (unsigned long long) largest, retained_count,
+                (unsigned long long) budget_per_device, (unsigned long long) free_bytes,
+                (unsigned long long) reserve, fits);
+            if (!fits) return 0;
+        }
+        return 1;
+    }
+    catch (...) { return 0; }
 }
 
 // Allocate a new sequence slot (own caches, shared weights). Returns the slot
@@ -6672,16 +7059,21 @@ TSG_EXPORT int TSGgml_Dsv4SlotFree(void * handle, int slot_id)
         fprintf(stderr, "[dsv4] refusing to free the active slot %d\n", slot_id);
         return -1;
     }
-    for (auto gi = m->graph_cache.begin(); gi != m->graph_cache.end(); )
+    try
     {
-        bool hit = (*gi)->slot_id == slot_id;
-        for (const auto & b : (*gi)->bd)
-            if (b.slot_id == slot_id) { hit = true; break; }
-        if (hit) gi = m->graph_cache.erase(gi);
-        else ++gi;
+        tsg_dsv4::dsv4_drop_slot_graphs(*m, slot_id);
+        m->slots.erase(it);
+        return 0;
     }
-    m->slots.erase(it);
-    return 0;
+    catch (const std::exception & error)
+    {
+        fprintf(stderr, "[dsv4] slot free failed: %s\n", error.what());
+    }
+    catch (...)
+    {
+        fprintf(stderr, "[dsv4] slot free failed with an unknown exception\n");
+    }
+    return -1;
 }
 
 // TRUE token-batched decode: one token for each of `n` distinct slots in a
@@ -6698,7 +7090,9 @@ TSG_EXPORT int TSGgml_Dsv4ForwardBatchedDecode(
     if (!handle || n < 2 || n > tsg_dsv4::DSV4_MAX_BATCHED_SLOTS ||
         !slot_ids || !tokens || !positions || !logits_out) return -1;
     auto * m = (tsg_dsv4::dsv4_model *) handle;
-    if (!m->fused) return -2;
+    // The multi-slot graph has no DSpark feature-ring writes. Preserve each
+    // request's target/draft state by taking the per-slot path when attached.
+    if (!m->fused || m->ds.loaded) return -2;
 
     tsg_dsv4::dsv4_slot * slots[tsg_dsv4::DSV4_MAX_BATCHED_SLOTS];
     for (int i = 0; i < n; i++)
@@ -6708,9 +7102,9 @@ TSG_EXPORT int TSGgml_Dsv4ForwardBatchedDecode(
         slots[i] = it->second.get();
         if (slots[i]->n_past != positions[i]) return -2;
         if (positions[i] + 1 > m->n_ctx) return -2;
-        // A slot whose V4.1 caches are inconsistent must be reset before it
+        // A slot whose caches are inconsistent must be reset before it
         // can decode again; batching it would spread the failure.
-        if (m->hp.v41 && slots[i]->v41_failed) return -2;
+        if (slots[i]->v41_failed) return -2;
         for (int j = 0; j < i; j++)
             if (slot_ids[j] == slot_ids[i]) return -2;
     }
@@ -6723,6 +7117,11 @@ TSG_EXPORT int TSGgml_Dsv4ForwardBatchedDecode(
     catch (const std::exception & e)
     {
         fprintf(stderr, "[dsv4] batched decode failed: %s\n", e.what());
+        return -3;
+    }
+    catch (...)
+    {
+        fprintf(stderr, "[dsv4] batched decode failed with an unknown execution exception\n");
         return -3;
     }
 
@@ -6742,40 +7141,85 @@ TSG_EXPORT int TSGgml_Dsv4DsparkBlockSize(void * handle)
 TSG_EXPORT int TSGgml_Dsv4ForwardSpec(void * handle, const int32_t * tokens, int n_tokens, float * logits_out)
 {
     auto * m = (tsg_dsv4::dsv4_model *) handle;
-    if (!m || m->hp.v41 || !tokens || n_tokens <= 0) return 0;
+    if (!m || !m->active_slot || !tokens || !logits_out || n_tokens <= 0 ||
+        (m->hp.v41 && (!m->ds.loaded || n_tokens > m->ds.block_size + 1))) return 0;
     if (n_tokens > m->n_ubatch)
     {
         fprintf(stderr, "[dsv4] spec forward needs a single micro-batch (%d > %d)\n", n_tokens, m->n_ubatch);
         return 0;
     }
     tsg_dsv4::dsv4_slot & slot = *m->active_slot;
-    if (slot.n_past + n_tokens > m->n_ctx) return 0;
-
-    m->pos_end_hint = slot.n_past + n_tokens;
-    if (!tsg_dsv4::dsv4_forward_ubatch(*m, tokens, n_tokens, slot.n_past, true, logits_out, /*all_logits*/ true))
-        return 0;
-    slot.n_past += n_tokens;
-    return 1;
+    if (slot.v41_failed || (int64_t) slot.n_past + n_tokens > m->n_ctx) return 0;
+    if (m->hp.v41)
+        for (int i = 0; i < n_tokens; ++i)
+            if (tokens[i] < 0 || tokens[i] >= m->hp.n_vocab) return 0;
+    try
+    {
+        slot.spec_begin = slot.spec_end = -1;
+        m->pos_end_hint = (int64_t) slot.n_past + n_tokens;
+        if (m->moe_tp) m->moe_tp->begin_forward();
+        if (tsg_dsv4::dsv4_forward_ubatch(*m, tokens, n_tokens, slot.n_past, true, logits_out, /*all_logits*/ true))
+        {
+            slot.spec_begin = slot.n_past;
+            slot.n_past += n_tokens;
+            slot.spec_end = slot.n_past;
+            return 1;
+        }
+    }
+    catch (const std::exception & error)
+    {
+        fprintf(stderr, "[dsv4] speculative forward failed: %s\n", error.what());
+    }
+    catch (...)
+    {
+        fprintf(stderr, "[dsv4] speculative forward failed with an unknown execution exception\n");
+    }
+    slot.v41_failed = true;
+    return 0;
 }
 
 TSG_EXPORT int TSGgml_Dsv4DsparkDraft(void * handle, int anchor_token, int32_t * toks_out, float * conf_out)
 {
     auto * m = (tsg_dsv4::dsv4_model *) handle;
-    if (!m || !m->ds.loaded || !toks_out || !conf_out) return 0;
-    return tsg_dsv4::dsv4_dspark_draft(*m, anchor_token, m->active_slot->n_past, toks_out, conf_out);
+    if (!m || !m->active_slot || !m->ds.loaded || !toks_out || !conf_out) return 0;
+    if (anchor_token < 0 || anchor_token >= m->hp.n_vocab) return 0;
+    if (m->active_slot->v41_failed) return 0;
+    try
+    {
+        return tsg_dsv4::dsv4_dspark_draft(*m, anchor_token, m->active_slot->n_past, toks_out, conf_out);
+    }
+    catch (const std::exception & error)
+    {
+        fprintf(stderr, "[dsv4] DSpark draft failed: %s\n", error.what());
+    }
+    catch (...)
+    {
+        fprintf(stderr, "[dsv4] DSpark draft failed with an unknown execution exception\n");
+    }
+    // A failed draft does not commit trunk KV; its local pending graph is
+    // discarded on construction failure. A normal zero return is retryable.
+    return 0;
 }
 
 // Drop the KV of rejected speculative tokens. Nothing is restored: the rings
 // are sized so a rejected tail cannot alias a row a later pass reads, and the
-// compressed rows it wrote are recomputed before they become visible. V4 only:
-// it is the DSpark rollback ABI, its no-restore argument rests on
-// state_extra == DSpark's block size, and a V4.1 load has no drafter. A
+// compressed rows it wrote are recomputed before they become visible. V4.1
+// additionally restricts this to the last successful verify's retained prefix;
+// every compressor ring has state_extra == DSpark's block size. A
 // conversational rewind (any depth, from any position) is TSGgml_Dsv4Truncate.
 TSG_EXPORT int TSGgml_Dsv4Rewind(void * handle, int n_past)
 {
     auto * m = (tsg_dsv4::dsv4_model *) handle;
-    if (!m || m->hp.v41 || n_past < 0 || n_past > m->active_slot->n_past) return 0;
-    m->active_slot->n_past = n_past;
+    if (!m || !m->active_slot || m->active_slot->v41_failed || n_past < 0 || n_past > m->active_slot->n_past) return 0;
+    auto & slot = *m->active_slot;
+    if (m->hp.v41 && (!m->ds.loaded || !dsv41_dspark_can_rewind(
+        slot.spec_begin, slot.spec_end, slot.n_past, n_past, m->ds.block_size, m->rewind_span))) return 0;
+    slot.n_past = n_past;
+    if (m->hp.v41)
+    {
+        if ((int64_t) slot.engram_history.size() > n_past) slot.engram_history.resize((size_t) n_past);
+        if (slot.cp_n_past > n_past) slot.cp_n_past = -1;
+    }
     return 1;
 }
 
@@ -6796,8 +7240,9 @@ TSG_EXPORT int TSGgml_Dsv4TruncateAlign(void * handle)
 //
 // Returns 1 when the slot now holds exactly `n_past` positions and a forward
 // from there is identical to a fresh prefill of the same tokens; 0 when it
-// cannot, in which case NOTHING was mutated and the caller must Reset and
-// re-prefill. A refusal is normal, not an error: the raw sliding-window ring is
+// cannot. A normal eligibility refusal mutates nothing. An execution exception
+// while restoring/resetting instead latches the slot unusable and logs the
+// failure; both outcomes require the caller to Reset and re-prefill. The raw ring is
 // only ring_raw positions deep, so a rewind past the checkpoint's reach has no
 // correct answer (the dropped positions' K rows are gone, and recomputing one
 // needs its own equally-gone window).
@@ -6812,29 +7257,45 @@ TSG_EXPORT int TSGgml_Dsv4Truncate(void * handle, int n_past)
         n_past, slot->n_past, m->rewind_cp ? slot->cp_n_past : -1,
         m->rewind_span, m->truncate_align);
 
-    switch (route)
-    {
-        case dsv41_truncate_route::refuse:
-            return 0;
-        case dsv41_truncate_route::none:
-            return 1;
-        case dsv41_truncate_route::reset:
-            tsg_dsv4::dsv4_reset_slot(*slot);
-            return 1;
-        case dsv41_truncate_route::checkpoint:
-            tsg_dsv4::dsv4_copy_rewind_rings(*slot, /*save*/ false);
-            break;
-        case dsv41_truncate_route::live:
-            break;
-    }
+    if (route == dsv41_truncate_route::refuse) return 0;
+    if (route == dsv41_truncate_route::none) return 1;
 
-    slot->n_past = n_past;
-    // Indexed by absolute position and only ever written from the head forward,
-    // so dropping the tail is the whole of it. hash_tokens' contiguity guard
-    // wants size() == the next start position, which is exactly n_past.
-    if ((int32_t) slot->engram_history.size() > n_past)
-        slot->engram_history.resize((size_t) n_past);
-    return 1;
+    // Reset/restore may already have changed buffers when an allocation or
+    // backend exception is raised. Contain it at this C ABI as well as Reset.
+    tsg_dsv4::dsv41_slot_write_guard writes{slot};
+    try
+    {
+        writes.started = true;
+        if (route == dsv41_truncate_route::reset)
+        {
+            tsg_dsv4::dsv4_reset_slot(*slot);
+            writes.complete = true;
+            return 1;
+        }
+        if (route == dsv41_truncate_route::checkpoint)
+            tsg_dsv4::dsv4_copy_rewind_rings(*slot, /*save*/ false);
+        slot->spec_begin = slot->spec_end = -1;
+        slot->n_past = n_past;
+        // Engram history is indexed by absolute position; shrinking discards
+        // exactly the tail and restores the hasher's expected next position.
+        if ((int32_t) slot->engram_history.size() > n_past)
+            slot->engram_history.resize((size_t) n_past);
+        // A shadow beyond the new head contains tokens on the abandoned
+        // branch. Subsequent single-token decoding does not refresh it, so it
+        // must not later restore old rings alongside the new Engram history.
+        if (slot->cp_n_past > n_past) slot->cp_n_past = -1;
+        writes.complete = true;
+        return 1;
+    }
+    catch (const std::exception & error)
+    {
+        fprintf(stderr, "[dsv4] truncate failed; reset required: %s\n", error.what());
+    }
+    catch (...)
+    {
+        fprintf(stderr, "[dsv4] truncate failed with an unknown exception; reset required\n");
+    }
+    return 0;
 }
 
 TSG_EXPORT void TSGgml_Dsv4Free(void * handle)
@@ -6842,3 +7303,233 @@ TSG_EXPORT void TSGgml_Dsv4Free(void * handle)
     if (!handle) return;
     delete (tsg_dsv4::dsv4_model *) handle;
 }
+
+#if defined(TSG_GGML_TEST_HOOKS)
+// Model-free regression of the actual C entry points. A scoped acquisition
+// fault intercepts before tensor access, so no model, backend or GPU allocation
+// is needed. Real partial-compute/checkpoint recovery is tested separately by
+// eng/tests/dsv41-failure-state.py against its independent model oracle.
+#define TSG_TEST_EXPORT TSG_EXPORT
+static void dsv4_test_cached_graphs(tsg_dsv4::dsv4_model & model)
+{
+    for (int id : {0, 1, -1})
+    {
+        auto graph = std::make_unique<tsg_dsv4::graph_build_result>();
+        graph->slot_id = id;
+        if (id == -1)
+        {
+            graph->bd.resize(2);
+            graph->bd[0].slot_id = 0;
+            graph->bd[1].slot_id = 1;
+        }
+        model.graph_cache.push_back(std::move(graph));
+    }
+}
+static int dsv4_test_cached_owner_mask(const tsg_dsv4::dsv4_model & model)
+{
+    int mask = 0;
+    for (const auto & graph : model.graph_cache)
+        mask |= graph->slot_id == 0 ? 1 : graph->slot_id == 1 ? 2 : 4;
+    return mask;
+}
+TSG_TEST_EXPORT int TSGgml_Dsv4TestExecutionBoundary(int v41, int api, int failure, int * observed, int capacity)
+{
+    if (!observed || capacity < (api == 4 ? 14 : 11) || v41 < 0 || v41 > 1 || api < 0 || api > 4 ||
+        failure < 1 || failure > 3 || (v41 && (api == 1 || api == 3))) return -1;
+    using namespace tsg_dsv4;
+    struct intercept_scope
+    {
+        explicit intercept_scope(int kind)
+        {
+            dsv4_test_boundary_failure = kind;
+            dsv4_test_boundary_visits = 0;
+            dsv4_test_boundary_stage = 0;
+        }
+        ~intercept_scope() { dsv4_test_boundary_failure = 0; dsv4_test_boundary_stage = 0; }
+    } intercept(failure);
+    try
+    {
+        dsv4_model model;
+        model.hp.v41 = v41 != 0;
+        model.hp.n_vocab = 32;
+        model.n_ctx = 128;
+        model.n_ubatch = 3;
+        model.fused = true;
+        // Ordinary batched decode must reach the injected execution fault.
+        // A loaded draft head deliberately refuses that route before compute;
+        // mode 4 checks that separate refusal without weakening either gate.
+        model.ds.loaded = api == 3 || api == 4;
+        for (int id = 0; id < 2; ++id)
+        {
+            auto slot = std::make_unique<dsv4_slot>();
+            slot->id = id;
+            slot->n_past = 5;
+            model.slots.emplace(id, std::move(slot));
+        }
+        model.active_slot = model.slots.at(0).get();
+        dsv4_test_cached_graphs(model);
+        auto * original_active = model.active_slot;
+        auto * original_peer = model.slots.at(1).get();
+        if (api == 4)
+        {
+            original_active->engram_history.assign(5, 11);
+            original_peer->engram_history.assign(5, 22);
+        }
+        const auto original_history = original_active->engram_history;
+        const auto original_peer_history = original_peer->engram_history;
+        const bool original_head_loaded = model.ds.loaded;
+        std::vector<const graph_build_result *> original_graphs;
+        for (const auto & graph : model.graph_cache) original_graphs.push_back(graph.get());
+        const int32_t tokens[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+        const int32_t ids[2] = {0, 1}, positions[2] = {5, 5};
+        float scratch[64] = {};
+        int32_t drafted[8] = {};
+        if (api == 4)
+        {
+            std::fill(std::begin(scratch), std::end(scratch), 12345.0f);
+            std::fill(std::begin(drafted), std::end(drafted), 12345);
+        }
+        auto invoke = [&]()
+        {
+            switch (api)
+            {
+                case 0: return TSGgml_Dsv4Forward(&model, tokens, 8, scratch);
+                case 1: return TSGgml_Dsv4ForwardSpec(&model, tokens, 2, scratch);
+                case 2:
+                case 4: return TSGgml_Dsv4ForwardBatchedDecode(&model, 2, ids, tokens, positions, scratch);
+                default: return TSGgml_Dsv4DsparkDraft(&model, 1, drafted, scratch);
+            }
+        };
+        observed[0] = invoke();
+        observed[1] = model.active_slot->v41_failed;
+        observed[2] = model.active_slot->n_past;
+        observed[3] = model.slots.at(1)->v41_failed;
+        observed[4] = model.slots.at(1)->n_past;
+        observed[5] = invoke();
+        observed[6] = dsv4_test_boundary_visits;
+        if (api == 4)
+        {
+            // Capture refusal invariants before Reset can hide any mutation.
+            observed[11] = model.ds.loaded == original_head_loaded &&
+                !original_active->v41_failed && original_active->n_past == 5 &&
+                !original_peer->v41_failed && original_peer->n_past == 5 &&
+                original_active->engram_history == original_history &&
+                original_peer->engram_history == original_peer_history;
+            bool graphs_unchanged = model.graph_cache.size() == original_graphs.size();
+            if (graphs_unchanged)
+            {
+                size_t i = 0;
+                for (const auto & graph : model.graph_cache)
+                {
+                    graphs_unchanged = graphs_unchanged && graph.get() == original_graphs[i];
+                    ++i;
+                }
+            }
+            observed[12] = model.active_slot == original_active && model.slots.size() == 2 &&
+                model.slots.at(0).get() == original_active && model.slots.at(1).get() == original_peer &&
+                graphs_unchanged && dsv4_test_cached_owner_mask(model) == 7 &&
+                original_graphs[0]->slot_id == 0 && original_graphs[1]->slot_id == 1 &&
+                original_graphs[2]->slot_id == -1 && original_graphs[2]->bd.size() == 2 &&
+                original_graphs[2]->bd[0].slot_id == 0 && original_graphs[2]->bd[1].slot_id == 1;
+            observed[13] = std::all_of(std::begin(scratch), std::end(scratch),
+                    [](float value) { return value == 12345.0f; }) &&
+                std::all_of(std::begin(drafted), std::end(drafted),
+                    [](int32_t value) { return value == 12345; });
+        }
+        TSGgml_Dsv4Reset(&model);
+        observed[7] = model.active_slot->v41_failed;
+        observed[8] = model.active_slot->n_past;
+        observed[9] = (int) model.graph_cache.size();
+        observed[10] = dsv4_test_cached_owner_mask(model);
+        return 0;
+    }
+    catch (...)
+    {
+        // Fixture construction can fail, but an exception escaping the actual
+        // entry point is never reported as a successful boundary regression.
+        return -2;
+    }
+}
+
+TSG_TEST_EXPORT int TSGgml_Dsv4TestResetTruncateBoundary(int api, int failure, int * observed, int capacity)
+{
+    if (!observed || capacity < 16 || api < 0 || api > 5 || failure < 1 || failure > 2) return -1;
+    using namespace tsg_dsv4;
+    struct intercept_scope
+    {
+        ~intercept_scope() { dsv4_test_boundary_failure = 0; dsv4_test_boundary_stage = 0; }
+    } intercept;
+    try
+    {
+        dsv4_model model;
+        model.hp.v41 = api < 4;
+        model.ds.loaded = api == 5;
+        model.hp.n_vocab = 32;
+        model.n_ctx = 128;
+        model.n_ubatch = 3;
+        model.rewind_cp = true;
+        model.rewind_span = 0;
+        model.backends[0] = ggml_backend_cpu_init();
+        if (!model.backends[0]) return -2;
+        model.n_backends = 1;
+        auto owner = std::make_unique<dsv4_slot>();
+        auto * slot = owner.get();
+        model.slots.emplace(0, std::move(owner));
+        model.active_slot = slot;
+        dsv4_test_cached_graphs(model);
+        slot->n_past = 20;
+        slot->cp_n_past = 10;
+        slot->engram_history.assign(20, 1);
+        slot->layers.resize(1);
+        slot->ctx[0] = ggml_init({64 * 1024, nullptr, true});
+        if (!slot->ctx[0]) return -2;
+        auto & layer = slot->layers[0];
+        layer.raw_k = ggml_new_tensor_1d(slot->ctx[0], GGML_TYPE_F32, 4);
+        layer.raw_k_cp = ggml_new_tensor_1d(slot->ctx[0], GGML_TYPE_F32, 4);
+        slot->buf[0] = ggml_backend_alloc_ctx_tensors(slot->ctx[0], model.backends[0]);
+        if (!slot->buf[0]) return -2;
+        const float live[4] = {1, 2, 3, 4}, shadow[4] = {77, 78, 79, 80};
+        ggml_backend_tensor_set(layer.raw_k, live, 0, sizeof(live));
+        ggml_backend_tensor_set(layer.raw_k_cp, shadow, 0, sizeof(shadow));
+        auto first = [](ggml_tensor * tensor)
+        {
+            float value = 0;
+            ggml_backend_tensor_get(tensor, &value, 0, sizeof(value));
+            return (int) value;
+        };
+        // An ordinary out-of-range refusal must still leave all state intact.
+        observed[12] = TSGgml_Dsv4Truncate(&model, 21);
+        observed[13] = !slot->v41_failed && slot->n_past == 20 && slot->cp_n_past == 10 &&
+            slot->engram_history.size() == 20 && first(layer.raw_k) == 1 && first(layer.raw_k_cp) == 77;
+        dsv4_test_boundary_failure = failure;
+        dsv4_test_boundary_stage = api == 2 ? 2 : 1;
+        dsv4_test_boundary_visits = 0;
+        if (api == 0) { TSGgml_Dsv4Reset(&model); observed[0] = 0; }
+        else if (api >= 3) observed[0] = TSGgml_Dsv4ResetChecked(&model);
+        else observed[0] = TSGgml_Dsv4Truncate(&model, api == 1 ? 0 : 10);
+        observed[1] = slot->v41_failed;
+        observed[2] = slot->n_past;
+        observed[3] = first(layer.raw_k);
+        observed[4] = first(layer.raw_k_cp);
+        const int32_t token = 1;
+        float logits[32] = {};
+        observed[5] = TSGgml_Dsv4Forward(&model, &token, 1, logits);
+        observed[6] = TSGgml_Dsv4Truncate(&model, 0);
+        observed[7] = dsv4_test_boundary_visits;
+        dsv4_test_boundary_failure = 0;
+        if (!TSGgml_Dsv4ResetChecked(&model)) return -3;
+        observed[8] = slot->v41_failed;
+        observed[9] = slot->n_past;
+        observed[10] = first(layer.raw_k);
+        observed[11] = first(layer.raw_k_cp);
+        observed[14] = (int) model.graph_cache.size();
+        observed[15] = dsv4_test_cached_owner_mask(model);
+        return 0;
+    }
+    catch (...)
+    {
+        return -2;
+    }
+}
+#undef TSG_TEST_EXPORT
+#endif

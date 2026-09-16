@@ -325,9 +325,9 @@ namespace TensorSharp.Server.RequestParsers
                             }
                             else if (type == "video_url" && part.TryGetProperty("video_url", out var videoUrl))
                             {
-                                if (architecture != "deepseek41")
-                                    throw new JsonException("video_url frame sampling is currently implemented for DeepSeek V4.1 only.");
-                                AppendDeepSeek41Video(msg, videoUrl, uploads);
+                                if (ChatProtocolRegistry.For(architecture)?.CapsVideoFrames != true)
+                                    throw new JsonException("video_url frame sampling is not supported by this model's chat protocol.");
+                                AppendSampledVideo(msg, videoUrl, uploads);
                             }
                             else if (type == "input_audio" && part.TryGetProperty("input_audio", out var audioEl))
                             {

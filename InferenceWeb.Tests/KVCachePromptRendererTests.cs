@@ -758,9 +758,9 @@ public class KVCachePromptRendererTests
     }
 
     [Fact]
-    public void GetAssistantGenerationSuffix_Gemma4ThinkingDisabled_ReturnsChannelBlock()
+    public void GetAssistantGenerationSuffix_Gemma4ThinkingDisabled_ReturnsEmpty()
     {
-        Assert.Equal("<|channel>thought\n<channel|>",
+        Assert.Equal(string.Empty,
             KVCachePromptRenderer.GetAssistantGenerationSuffix("gemma4", enableThinking: false));
     }
 
@@ -769,6 +769,38 @@ public class KVCachePromptRendererTests
     {
         Assert.Equal(string.Empty,
             KVCachePromptRenderer.GetAssistantGenerationSuffix("gemma4", enableThinking: true));
+    }
+
+    [Theory]
+    [InlineData("<|turn>model\n", "")]
+    [InlineData("<|turn>model\n<|channel>thought\n<channel|>", "<|channel>thought\n<channel|>")]
+    [InlineData("<tool_response|><|channel>thought\n", "<|channel>thought\n")]
+    [InlineData("<tool_response|>", "")]
+    public void Gemma4_RecordsActualPublisherGenerationSuffix(string tail, string suffix)
+    {
+        var tokenizer = new CharTokenizer();
+        Assert.Equal(suffix, TensorSharp.Server.ChatGenerationPipeline.RecordedGenerationSuffix(
+            tokenizer, tokenizer.Encode("Earlier conversation\n" + tail), "gemma4", false));
+    }
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("<|channel>thought\n<channel|>")]
+    public void Gemma4_ReplaysRecordedSuffixWithoutAddingADefault(string suffix)
+    {
+        var tokenizer = new CharTokenizer();
+        var renderer = new KVCachePromptRenderer(new FakeRenderer());
+        var raw = tokenizer.Encode("Answer.", addSpecial: false);
+        var history = new List<ChatMessage>
+        {
+            new() { Role = "user", Content = "Hi" },
+            new() { Role = "assistant", Content = "Answer.", RawOutputTokens = raw,
+                RawGenerationSuffix = suffix, RawPromptTrailingWhitespace = "" },
+            new() { Role = "user", Content = "Again" },
+        };
+        string text = tokenizer.Decode(renderer.RenderToTokens(
+            tokenizer, null, history, "gemma4", true));
+        Assert.Contains("<assistant>" + suffix + "Answer.</assistant>", text);
     }
 
     [Fact]

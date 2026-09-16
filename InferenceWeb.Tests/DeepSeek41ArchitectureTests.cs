@@ -248,18 +248,59 @@ public class DeepSeek41ArchitectureTests : IDisposable
     public void V4DraftCannotBeAppliedToV41()
     {
         var error = Assert.Throws<NotSupportedException>(() =>
-            DeepSeek41Architecture.ValidateLoad("missing.gguf", BackendType.GgmlCuda, "v4-draft.gguf"));
+            DeepSeek41Architecture.ValidateDsparkArchitecture("deepseek4-dspark"));
         Assert.Contains("DSpark", error.Message);
     }
 
     [Fact]
     public void V4DraftEnvironmentCannotBeAppliedToV41()
     {
-        _env.Set("TS_DSV4_DSPARK", "v4-draft.gguf");
-        var error = Assert.Throws<NotSupportedException>(() =>
-            DeepSeek41Architecture.ValidateLoad("missing.gguf", BackendType.GgmlCuda, null));
-        Assert.Contains("DSpark", error.Message);
+        string path = Path.GetTempFileName();
+        try
+        {
+            using (var writer = new BinaryWriter(File.Create(path)))
+            {
+                writer.Write(0x46554747u);
+                writer.Write(3u);
+                writer.Write(0UL);
+                writer.Write(1UL);
+                static void WriteString(BinaryWriter w, string text)
+                {
+                    byte[] bytes = System.Text.Encoding.UTF8.GetBytes(text);
+                    w.Write((ulong)bytes.Length);
+                    w.Write(bytes);
+                }
+                WriteString(writer, "general.architecture");
+                writer.Write(8u);
+                WriteString(writer, "deepseek4-dspark");
+                while (writer.BaseStream.Position % 32 != 0) writer.Write((byte)0);
+            }
+            _env.Set("TS_DSV4_DSPARK", path);
+            var error = Assert.Throws<NotSupportedException>(() =>
+                DeepSeek41Architecture.ValidateLoad("missing.gguf", BackendType.GgmlCuda, null));
+            Assert.Contains("DSpark", error.Message);
+        }
+        finally { File.Delete(path); }
     }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("deepseek_v4_flash_dspark_draft")]
+    [InlineData("qwen4exp")]
+    [InlineData("deepseek41")]
+    public void DraftArchitectureMustBeExplicitlyV41(string architecture)
+        => Assert.Throws<NotSupportedException>(() => DeepSeek41Architecture.ValidateDsparkArchitecture(architecture));
+
+    [Fact]
+    public void V41DraftArchitectureReachesNativeTensorValidation()
+        => DeepSeek41Architecture.ValidateDsparkArchitecture("deepseek41-dspark");
+
+    [Theory]
+    [InlineData(BackendType.Cpu)]
+    [InlineData(BackendType.Cuda)]
+    public void V41DraftRefusesExecutorsWithoutItsDraftGraph(BackendType backend)
+        => Assert.Throws<NotSupportedException>(() =>
+            DeepSeek41Architecture.ValidateLoad("missing.gguf", backend, "v41-draft.gguf"));
 
     [Theory]
     [InlineData(null, 4, 0)]

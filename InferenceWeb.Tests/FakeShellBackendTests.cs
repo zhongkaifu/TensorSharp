@@ -669,8 +669,14 @@ public sealed class SkillScriptRunnerBackendTests : IDisposable
         Assert.False(launch.AllowNetwork);
         Assert.Equal(TimeSpan.FromSeconds(60), launch.Timeout);
 
-        Assert.Equal(workspace.WorkDirectory, launch.Environment["HOME"]);
-        Assert.Equal(workspace.WorkDirectory, launch.Environment["TMPDIR"]);
+        // Windows keeps interpreter caches beneath the session's hidden home;
+        // POSIX redirects both variables to the writable working directory.
+        string expectedHome = OperatingSystem.IsWindows()
+            ? Path.Combine(workspace.WorkDirectory, ".home") : workspace.WorkDirectory;
+        string expectedTemp = OperatingSystem.IsWindows()
+            ? Path.Combine(expectedHome, "Temp") : workspace.WorkDirectory;
+        Assert.Equal(expectedHome, launch.Environment["HOME"]);
+        Assert.Equal(expectedTemp, launch.Environment["TMPDIR"]);
         Assert.Equal(workspace.WorkDirectory, launch.Environment["PWD"]);
         Assert.Equal(Path.Combine(workspace.EnvDirectory, "node_modules"), launch.Environment["NODE_PATH"]);
         Assert.Equal(

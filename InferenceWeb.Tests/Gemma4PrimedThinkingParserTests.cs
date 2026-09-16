@@ -12,6 +12,40 @@ namespace InferenceWeb.Tests;
 /// </summary>
 public class Gemma4PrimedThinkingParserTests
 {
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void PromptOpenedChannel_IsKnownBeforeAnyStreamingContent(bool thinkingEnabled)
+    {
+        IOutputParser parser = new Gemma4OutputParser();
+        parser.Init(thinkingEnabled, null);
+        parser.SetGenerationPromptSuffix("<|channel>thought\n");
+        var content = new System.Text.StringBuilder();
+        var thinking = new System.Text.StringBuilder();
+        const string thought = "Inspecting the tool result carefully.";
+        foreach (char value in thought)
+        {
+            var delta = parser.Add(value.ToString(), false);
+            Assert.Empty(delta.Content);
+            thinking.Append(delta.Thinking);
+        }
+        foreach (char value in "<channel|>42")
+        {
+            var delta = parser.Add(value.ToString(), false);
+            content.Append(delta.Content);
+            thinking.Append(delta.Thinking);
+        }
+        var final = parser.Add("", true);
+        content.Append(final.Content);
+        thinking.Append(final.Thinking);
+        Assert.Equal("42", content.ToString());
+        Assert.Equal(thinkingEnabled ? thought : "", thinking.ToString());
+
+        parser.Init(false, null);
+        parser.SetGenerationPromptSuffix("<|channel>thought\n<channel|>");
+        Assert.Equal("A plain answer", parser.Add("A plain answer", false).Content);
+    }
+
     private static ParsedOutput ParseWhole(string raw, bool thinkingEnabled)
     {
         var parser = new Gemma4OutputParser();

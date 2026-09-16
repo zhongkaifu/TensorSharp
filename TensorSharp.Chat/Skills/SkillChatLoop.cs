@@ -143,6 +143,8 @@ namespace TensorSharp.Server.Skills
                         terminal = update;
                         continue;
                     }
+                    if (update.RawGenerationSuffix != null)
+                        parser.SetGenerationPromptSuffix(update.RawGenerationSuffix);
                     if (string.IsNullOrEmpty(update.Piece))
                         continue;
 
@@ -418,6 +420,8 @@ namespace TensorSharp.Server.Skills
                     finalTerminal = update;
                     continue;
                 }
+                if (update.RawGenerationSuffix != null)
+                    finalParser.SetGenerationPromptSuffix(update.RawGenerationSuffix);
                 if (string.IsNullOrEmpty(update.Piece))
                     continue;
 
@@ -654,6 +658,8 @@ namespace TensorSharp.Server.Skills
                     terminal = update;
                     continue;
                 }
+                if (update.RawGenerationSuffix != null)
+                    parser.SetGenerationPromptSuffix(update.RawGenerationSuffix);
                 if (string.IsNullOrEmpty(update.Piece))
                     continue;
 

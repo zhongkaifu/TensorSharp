@@ -822,45 +822,53 @@ namespace TensorSharp.Models
             DType kvDtype = _kvCacheDtype.ToDType();
 
             totalCacheBytes = 0;
-            for (int l = 0; l < Config.NumLayers; l++)
+            try
             {
-                if (_kvDonorMap.ContainsKey(l)) continue;
+                for (int l = 0; l < Config.NumLayers; l++)
+                {
+                    if (_kvDonorMap.ContainsKey(l)) continue;
 
-                int kvHeads = KVHeadsForLayer(l);
-                int hd = HeadDimForLayer(l);
-                int cacheLen = IsLocalLayer(l) ? _slidingWindow : initialGlobalSeqLen;
-                cacheSize[l] = cacheLen;
-                cacheK[l] = new Tensor(_allocator, kvDtype, kvHeads, cacheLen, hd);
-                cacheV[l] = new Tensor(_allocator, kvDtype, kvHeads, cacheLen, hd);
-                // Zeroing happens once for the whole set below (ZeroKvCacheArrays),
-                // which also covers the backends ModelBase.InitializeCacheTensor
-                // skips - so no per-tensor init here.
-                // Q8_0 has fractional bytes/elem (1.0625) - go through ByteLengthFor
-                // so block-quantized layouts are accounted for correctly.
-                long perLayerElems = (long)kvHeads * cacheLen * hd;
-                totalCacheBytes += _kvCacheDtype.ByteLengthFor(perLayerElems) * 2;
+                    int kvHeads = KVHeadsForLayer(l);
+                    int hd = HeadDimForLayer(l);
+                    int cacheLen = IsLocalLayer(l) ? _slidingWindow : initialGlobalSeqLen;
+                    cacheSize[l] = cacheLen;
+                    cacheK[l] = new Tensor(_allocator, kvDtype, kvHeads, cacheLen, hd);
+                    cacheV[l] = new Tensor(_allocator, kvDtype, kvHeads, cacheLen, hd);
+                    // Zeroing happens once for the whole set below (ZeroKvCacheArrays),
+                    // which also covers the backends ModelBase.InitializeCacheTensor
+                    // skips - so no per-tensor init here.
+                    // Q8_0 has fractional bytes/elem (1.0625) - go through ByteLengthFor
+                    // so block-quantized layouts are accounted for correctly.
+                    long perLayerElems = (long)kvHeads * cacheLen * hd;
+                    totalCacheBytes += _kvCacheDtype.ByteLengthFor(perLayerElems) * 2;
+                }
+
+                foreach (var kv in _kvDonorMap)
+                {
+                    cacheK[kv.Key] = cacheK[kv.Value];
+                    cacheV[kv.Key] = cacheV[kv.Value];
+                    cacheSize[kv.Key] = cacheSize[kv.Value];
+                }
+
+                // Every freshly-allocated cache set MUST start finite. The fused
+                // decode kernels read a FIXED 256-padded attention window over the
+                // cache; rows past the written length are masked (-inf) but are
+                // still multiplied/added, so uninitialised VRAM (NaN/Inf) there
+                // poisons the softmax and every logit becomes NaN - argmax then
+                // returns token 0 (<pad>) forever.
+                // InitializeCacheTensor above skips the fill on GgmlCuda/Mlx, so do
+                // it here, in the ONE place every cache set is born. It used to live
+                // in CreateFreshHolder only, which is why the replacement primary
+                // cache minted by AdoptPrimaryCacheToFused came up uninitialised and
+                // the first single-stream request after any concurrent episode
+                // decoded nothing but <pad>.
+                ZeroKvCacheArrays(cacheK, cacheV);
             }
-
-            foreach (var kv in _kvDonorMap)
+            catch
             {
-                cacheK[kv.Key] = cacheK[kv.Value];
-                cacheV[kv.Key] = cacheV[kv.Value];
-                cacheSize[kv.Key] = cacheSize[kv.Value];
+                DisposeKvCacheArrays(cacheK, cacheV);
+                throw;
             }
-
-            // Every freshly-allocated cache set MUST start finite. The fused
-            // decode kernels read a FIXED 256-padded attention window over the
-            // cache; rows past the written length are masked (-inf) but are
-            // still multiplied/added, so uninitialised VRAM (NaN/Inf) there
-            // poisons the softmax and every logit becomes NaN - argmax then
-            // returns token 0 (<pad>) forever.
-            // InitializeCacheTensor above skips the fill on GgmlCuda/Mlx, so do
-            // it here, in the ONE place every cache set is born. It used to live
-            // in CreateFreshHolder only, which is why the replacement primary
-            // cache minted by AdoptPrimaryCacheToFused came up uninitialised and
-            // the first single-stream request after any concurrent episode
-            // decoded nothing but <pad>.
-            ZeroKvCacheArrays(cacheK, cacheV);
         }
 
         /// <summary>Zero every distinct tensor in a K/V cache array pair.
@@ -895,6 +903,9 @@ namespace TensorSharp.Models
         {
             if (tensor == null) return;
             Ops.Fill(tensor, 0f);
+            // A recycled host address can still have a previous tensor's
+            // device mirror. The next graph must upload the initialized bytes.
+            InvalidateTensorDeviceCache(tensor);
         }
 
         // Grow the global-attention layers' KV cache to fit requiredSeqLen
@@ -953,6 +964,10 @@ namespace TensorSharp.Models
                     using var dstV = newV.Narrow(1, 0, _cacheSeqLen);
                     Ops.Copy(dstV, srcV);
                 }
+
+                // Host copies above are authoritative for the enlarged cache.
+                InvalidateTensorDeviceCache(newK);
+                InvalidateTensorDeviceCache(newV);
 
                 // Evict the old tensors' device-copy cache entries (Metal binds
                 // the KV cache USAGE_COMPUTE -> a device-local MTLBuffer keyed by
@@ -1033,7 +1048,37 @@ namespace TensorSharp.Models
             }
         }
 
+        public override bool CanTruncateKVCache(int cachedTokenCount, int targetTokenCount)
+            => base.CanTruncateKVCache(cachedTokenCount, targetTokenCount)
+                && (targetTokenCount == 0 || targetTokenCount == cachedTokenCount
+                    || _slidingWindow <= 0 || cachedTokenCount <= _slidingWindow);
+
+        protected override bool TryTruncateKVCacheCore(int tokenCount)
+        {
+            // A wrapped ring no longer holds the oldest rows a rewound query
+            // needs. Changing its head cannot restore them. Exact checkpoints
+            // remain reusable; the scheduler must re-prefill other continuations.
+            // Speculative rollback has its own saved-row restoration path.
+            if (!CanTruncateKVCache(_cacheSeqLen, tokenCount)) return false;
+            if (tokenCount == _cacheSeqLen) return true;
+            if (tokenCount == 0)
+            {
+                ResetKVCacheCore();
+                return true;
+            }
+            ApplyKVCacheTruncation(tokenCount);
+            return true;
+        }
+
         protected override void TruncateKVCacheCore(int tokenCount)
+        {
+            if (!TryTruncateKVCacheCore(tokenCount))
+                throw new InvalidOperationException(
+                    $"Gemma 4 cannot truncate its KV cache from {_cacheSeqLen} to {tokenCount} " +
+                    "without losing sliding-window history. Use TryTruncateKVCache and re-prefill when it declines.");
+        }
+
+        private void ApplyKVCacheTruncation(int tokenCount)
         {
             DisposeSwaPrevWindows();
             EnsureKvCacheHostSynchronized();

@@ -85,6 +85,10 @@ namespace TensorSharp.GGML
 
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int TSGgml_Dsv4ResetChecked(IntPtr handle);
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         private static partial void TSGgml_Dsv4Free(IntPtr handle);
 
         [LibraryImport(DllName)]
@@ -98,6 +102,24 @@ namespace TensorSharp.GGML
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         private static partial int TSGgml_Dsv4SlotFree(IntPtr handle, int slotId);
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int TSGgml_Dsv4SlotStatus(IntPtr handle, int slotId,
+            out int head, out int checkpoint, out int healthy);
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int TSGgml_Dsv4SlotCanReuse(IntPtr handle, int slotId, int cachedHead, int target);
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int TSGgml_Dsv4SlotCanRetain(IntPtr handle, int slotId,
+            int retainedCount, ulong budgetPerDevice);
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int TSGgml_Dsv4SlotReleaseGraphs(IntPtr handle, int slotId);
 
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
@@ -136,6 +158,16 @@ namespace TensorSharp.GGML
         /// speculative verify). Advances the cache like Forward.</summary>
         public static unsafe bool ForwardSpec(IntPtr handle, int[] tokens, float[] logitsOut)
         {
+            ArgumentNullException.ThrowIfNull(tokens);
+            ArgumentNullException.ThrowIfNull(logitsOut);
+            if (handle == IntPtr.Zero || tokens.Length == 0) return false;
+            int vocabulary = TSGgml_Dsv4VocabSize(handle);
+            if (vocabulary <= 0) return false;
+            // The native ABI writes every vocabulary row. Widen before the
+            // multiplication so an oversized request cannot wrap the check.
+            long required = (long)tokens.Length * vocabulary;
+            if (logitsOut.LongLength < required)
+                throw new ArgumentException($"The output buffer needs at least {required} logits.", nameof(logitsOut));
             fixed (int* t = tokens)
             fixed (float* l = logitsOut)
             {
@@ -147,6 +179,15 @@ namespace TensorSharp.GGML
         /// at the cache's current position. Returns the number of proposals.</summary>
         public static unsafe int DsparkDraft(IntPtr handle, int anchorToken, int[] toksOut, float[] confOut)
         {
+            ArgumentNullException.ThrowIfNull(toksOut);
+            ArgumentNullException.ThrowIfNull(confOut);
+            if (handle == IntPtr.Zero) return 0;
+            int block = TSGgml_Dsv4DsparkBlockSize(handle);
+            if (block <= 0) return 0;
+            if (toksOut.Length < block)
+                throw new ArgumentException($"The output buffer needs at least {block} token IDs.", nameof(toksOut));
+            if (confOut.Length < block)
+                throw new ArgumentException($"The output buffer needs at least {block} confidence scores.", nameof(confOut));
             fixed (int* t = toksOut)
             fixed (float* c = confOut)
             {
@@ -192,11 +233,29 @@ namespace TensorSharp.GGML
         }
 
         public static void Reset(IntPtr handle) => TSGgml_Dsv4Reset(handle);
+        public static bool ResetChecked(IntPtr handle) => TSGgml_Dsv4ResetChecked(handle) != 0;
         public static void Free(IntPtr handle) => TSGgml_Dsv4Free(handle);
 
         /// <summary>Allocate a new sequence slot (own KV caches, shared
         /// weights). Returns the slot id, or -1 on failure (e.g. VRAM).</summary>
         public static int SlotAlloc(IntPtr handle) => TSGgml_Dsv4SlotAlloc(handle);
+
+        /// <summary>Inspect an explicitly identified V4.1 slot without selecting it.</summary>
+        public static bool SlotStatus(IntPtr handle, int slotId, out int head, out int checkpoint, out bool healthy)
+        {
+            int result = TSGgml_Dsv4SlotStatus(handle, slotId, out head, out checkpoint, out int ok);
+            healthy = result != 0 && ok != 0;
+            return result != 0;
+        }
+
+        public static bool SlotCanReuse(IntPtr handle, int slotId, int cachedHead, int target)
+            => TSGgml_Dsv4SlotCanReuse(handle, slotId, cachedHead, target) != 0;
+
+        public static bool SlotCanRetain(IntPtr handle, int slotId, int retainedCount, ulong budgetPerDevice)
+            => TSGgml_Dsv4SlotCanRetain(handle, slotId, retainedCount, budgetPerDevice) != 0;
+
+        public static bool SlotReleaseGraphs(IntPtr handle, int slotId)
+            => TSGgml_Dsv4SlotReleaseGraphs(handle, slotId) != 0;
 
         /// <summary>Select the slot Forward/Reset/NPast act on.</summary>
         public static bool SetActiveSlot(IntPtr handle, int slotId)

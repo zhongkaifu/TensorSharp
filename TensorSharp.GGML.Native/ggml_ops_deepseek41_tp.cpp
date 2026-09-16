@@ -1,6 +1,9 @@
 // Copyright (c) Zhongkai Fu. All rights reserved.
 // Licensed under the BSD-3-Clause license in the repository root.
 #include "ggml_ops_deepseek41_tp.h"
+#include "dsv41_workers.h"
+#include "ggml_ops_dsv4_fused.h"
+#include "ggml_ops_matmul_precision.h"
 #include "ggml-alloc.h"
 #include "ggml-cpu.h"
 
@@ -34,88 +37,6 @@ void require(bool condition, const char * message)
 {
     if (!condition) throw std::runtime_error(message);
 }
-
-// Persistent, model-owned workers. All ranks enter their GPU branch before
-// the caller waits for completion; this is not sequential layer placement.
-class workers
-{
-public:
-    explicit workers(int count)
-    {
-        try
-        {
-            for (int rank = 1; rank < count; ++rank)
-                threads.emplace_back([this, rank] {
-                    uint64_t seen = 0;
-                    for (;;)
-                    {
-                        std::function<void(int)> current;
-                        {
-                            std::unique_lock<std::mutex> lock(mutex);
-                            wake.wait(lock, [&] { return stopping || generation != seen; });
-                            if (stopping) return;
-                            seen = generation;
-                            current = job;
-                        }
-                        invoke(current, rank);
-                        {
-                            std::lock_guard<std::mutex> lock(mutex);
-                            if (--pending == 0) done.notify_one();
-                        }
-                    }
-                });
-        }
-        catch (...)
-        {
-            // std::thread may throw after earlier workers started. A partially
-            // constructed vector of joinable threads would otherwise terminate
-            // the process while the loader tries to report the resource error.
-            stop();
-            throw;
-        }
-    }
-    ~workers() { stop(); }
-    void stop() noexcept
-    {
-        { std::lock_guard<std::mutex> lock(mutex); stopping = true; }
-        wake.notify_all();
-        for (auto & thread : threads) if (thread.joinable()) thread.join();
-    }
-    void run(const std::function<void(int)> & operation)
-    {
-        {
-            std::lock_guard<std::mutex> lock(mutex);
-            failure = nullptr;
-            job = operation;
-            pending = (int) threads.size();
-            ++generation;
-        }
-        wake.notify_all();
-        invoke(operation, 0);
-        std::unique_lock<std::mutex> lock(mutex);
-        done.wait(lock, [&] { return pending == 0; });
-        job = {};
-        if (failure) std::rethrow_exception(failure);
-    }
-private:
-    void invoke(const std::function<void(int)> & operation, int rank)
-    {
-        try { operation(rank); }
-        catch (...)
-        {
-            std::lock_guard<std::mutex> lock(mutex);
-            if (!failure) failure = std::current_exception();
-        }
-    }
-    std::mutex mutex;
-    std::condition_variable wake, done;
-    std::vector<std::thread> threads;
-    std::function<void(int)> job;
-    std::exception_ptr failure;
-    uint64_t generation = 0;
-    int pending = 0;
-    bool stopping = false;
-};
 
 // One read-only mapping is shared across the rank workers for a source
 // tensor. Row-parallel quantized strips never require a full private copy.
@@ -226,6 +147,7 @@ struct rank_layer
 struct rank_state
 {
     ggml_backend_t backend = nullptr;
+    ggml_backend_t cuda_backend = nullptr;
     ggml_gallocr_t allocator = nullptr;
     std::map<int, std::unique_ptr<rank_layer>> layers;
     std::vector<float> partial;
@@ -235,6 +157,7 @@ struct rank_state
         layers.clear();
         if (allocator) ggml_gallocr_free(allocator);
         if (backend) ggml_backend_free(backend);
+        if (cuda_backend) ggml_backend_free(cuda_backend);
     }
 };
 }
@@ -257,6 +180,21 @@ std::vector<strip> split(int64_t width, int64_t block, int ranks, int layer)
         first += count;
     }
     return result;
+}
+
+std::vector<strip> split_weights(int64_t width, ggml_type down_type, int ranks, int layer)
+{
+    int64_t block = ggml_blck_size(down_type);
+    // For BF16/F16, two-element alignment alone yields 330/328-wide strips
+    // at 2304 channels on seven ranks. Those shapes change the upstream CUDA
+    // matrix path and can amplify small projection differences when hidden
+    // activations are rounded for the down projection. Aligned strips also
+    // avoid the sorted-expert fallback's synchronization. No weights are padded
+    // or converted, and small tensors keep the existing nonempty-strip policy.
+    if ((down_type == GGML_TYPE_BF16 || down_type == GGML_TYPE_F16) &&
+        width % 64 == 0 && width / 64 >= ranks)
+        block = 64;
+    return split(width, block, ranks, layer);
 }
 
 struct executor::impl
@@ -301,6 +239,13 @@ struct executor::impl
             auto rank = std::make_unique<rank_state>();
             rank->backend = ggml_backend_dev_init(device, nullptr);
             require(rank->backend != nullptr, "Cannot initialize V4.1 TP rank backend");
+#if defined(TSG_GGML_USE_CUDA)
+            if (auto * wrapped = tsg_dsv4_fused_backend_init(rank->backend))
+            {
+                rank->cuda_backend = rank->backend;
+                rank->backend = wrapped;
+            }
+#endif
             if (ggml_backend_is_cpu(rank->backend)) ggml_backend_cpu_set_n_threads(rank->backend, 1);
             rank->allocator = ggml_gallocr_new(ggml_backend_get_default_buffer_type(rank->backend));
             require(rank->allocator != nullptr, "Cannot initialize V4.1 TP scratch allocator");
@@ -332,6 +277,8 @@ struct executor::impl
             g.weights = ggml_new_tensor_3d(g.ctx, GGML_TYPE_F32, 1, used, tokens);
             for (auto * input : {g.input, g.ids, g.weights}) ggml_set_input(input);
             auto matmul = [&](ggml_tensor * w, ggml_tensor * x) {
+                if (w->type == GGML_TYPE_F32 && rank.cuda_backend)
+                    return tsg_matmul_id_f32(g.ctx, w, x, g.ids);
                 auto * out = ggml_mul_mat_id(g.ctx, w, x, g.ids);
                 if (w->type == GGML_TYPE_F32)
                 {
@@ -463,7 +410,7 @@ void executor::add_layer(int id, const source & gate, const source & up, const s
     require(gate.ne == up.ne && gate.ne[0] == down.ne[1] && gate.ne[1] == down.ne[0] &&
             gate.ne[2] == down.ne[2] && gate.ne[3] == 1 && down.ne[3] == 1 &&
             state->used <= gate.ne[2], "V4.1 TP expert tensor shapes disagree");
-    auto strips = split(gate.ne[1], ggml_blck_size(down.type), (int) state->ranks.size(), id);
+    auto strips = split_weights(gate.ne[1], down.type, (int) state->ranks.size(), id);
     reader gate_file(gate), up_file(up), down_file(down);
     state->pool.run([&](int r) {
         auto & rank = *state->ranks[r];

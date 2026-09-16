@@ -14,7 +14,7 @@
 // reports the wider hidden row (the concatenated target-layer features its
 // main_proj consumes) through SpecFeatureSize.
 //
-// Rollback is free here: the verify pass wrote correct KV for every token it
+// Rollback retains accepted KV: the verify pass wrote correct KV for every token it
 // processed, and the engine's rings are sized so a rejected tail can never
 // alias a row a later pass still reads, so partial acceptance only rewinds the
 // position counter (SpecVerifyPersistsAcceptedKv).
@@ -160,8 +160,10 @@ namespace TensorSharp.Models
         public void DraftStep(int token, float[] hPrev, int pos, float[] logitsOut, float[] hOut)
             => throw new NotSupportedException("DeepSeek V4 drafts whole blocks; use DraftBlock.");
 
-        // The DSV4 caches are preallocated for the whole context and hold no
-        // recurrent state that a rejected draft could corrupt.
+        // Native DSpark pads the modular compressor rings by the complete
+        // draft width. V4.1 also bounds Rewind to the last successful verify
+        // and shrinks Engram history. This retains the accepted prefix at
+        // partial compression boundaries without copying every cache per step.
         public void SpecEnsureCapacity(int requiredSeqLen) { }
 
         public void SpecSnapshotRecurrentState() { }

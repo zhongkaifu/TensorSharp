@@ -249,6 +249,9 @@ namespace TensorSharp.Runtime
     /// </summary>
     public interface IOutputParser : IOutputProtocolParser
     {
+        /// <summary>Prime parser state when the prompt already opened a channel.
+        /// Call before the first generated piece, after Init.</summary>
+        void SetGenerationPromptSuffix(string? suffix) { }
     }
 
     // ========================================================================
@@ -694,6 +697,15 @@ namespace TensorSharp.Runtime
         public bool HasThinkingSupport => true;
         public bool HasToolSupport => true;
         public bool AlwaysRequired => true;
+
+        public void SetGenerationPromptSuffix(string? suffix)
+        {
+            if (suffix?.EndsWith("<|channel>thought\n", StringComparison.Ordinal) == true)
+            {
+                _state = State.CollectingThinking;
+                _needsChannelNameStrip = false;
+            }
+        }
 
         public void Init(bool enableThinking, List<ToolFunction>? tools)
         {

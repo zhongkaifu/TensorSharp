@@ -95,7 +95,7 @@ struct evaluation
     ggml_tensor * x = nullptr, * ids = nullptr, * weights = nullptr, * out = nullptr;
     ggml_tensor * gate_out = nullptr, * up_out = nullptr, * hidden_out = nullptr;
     evaluation(const fixture & data, int tokens, tsg_dsv41_tp::executor * tp, int layer,
-               ggml_backend_dev_t reference_device = nullptr, bool preserve_taps = false)
+               ggml_backend_dev_t reference_device = nullptr, bool preserve_taps = false, bool shared_once = false)
     {
         backend = !tp && reference_device ? ggml_backend_dev_init(reference_device, nullptr) : ggml_backend_cpu_init();
         if (ggml_backend_is_cpu(backend)) ggml_backend_cpu_set_n_threads(backend, 1);
@@ -130,6 +130,15 @@ struct evaluation
                 out = out ? ggml_add(ctx, out, view) : view;
             }
         }
+        // The production caller adds the unsharded shared-expert output after
+        // the routed TP reduction. Exercise that boundary with a known tensor;
+        // the independent scalar check below rejects rank-count multiplication.
+        ggml_tensor * shared = nullptr;
+        if (shared_once)
+        {
+            shared = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, data.embedding, tokens);
+            out = ggml_add(ctx, out, shared);
+        }
         graph = ggml_new_graph(ctx);
         ggml_build_forward_expand(graph, out);
         for (int i = 0; i < ggml_graph_n_nodes(graph); ++i)
@@ -162,6 +171,12 @@ struct evaluation
             ggml_backend_tensor_set(ids, selected.data() + token * data.used,
                                     token * ids->nb[1], data.used * sizeof(int));
         ggml_backend_tensor_set(weights, routing.data(), 0, routing.size() * sizeof(float));
+        if (shared)
+        {
+            std::vector<float> values(data.embedding * tokens);
+            for (size_t i = 0; i < values.size(); ++i) values[i] = (i % 2 ? -.125f : .25f);
+            ggml_backend_tensor_set(shared, values.data(), 0, values.size() * sizeof(float));
+        }
     }
     ~evaluation()
     {
@@ -177,6 +192,127 @@ struct evaluation
         return result;
     }
 };
+
+// Small F32 oracle: no ggml graph, TP split/upload helper or sliced reference
+// participates. Direct logical tensor indexing and double dot products make
+// this independent of both the rank executor and the full-weight graph oracle.
+std::vector<float> scalar_f32_reference(const fixture & data, int tokens, bool shared_once)
+{
+    require(data.gate.type == GGML_TYPE_F32 && data.down.type == GGML_TYPE_F32,
+            "Scalar TP oracle requires F32 weights");
+    auto weight = [](const std::vector<char> & bytes, size_t index) {
+        float value;
+        std::memcpy(&value, bytes.data() + index * sizeof(float), sizeof(float));
+        return value;
+    };
+    std::vector<float> result(data.embedding * tokens);
+    for (int token = 0; token < tokens; ++token)
+    {
+        for (int selected = 0; selected < data.used; ++selected)
+        {
+            const int expert = (token + selected) % data.experts;
+            const float routing = float(selected + 1) / (data.used * (data.used + 1) / 2);
+            std::vector<float> hidden(data.hidden);
+            for (int row = 0; row < data.hidden; ++row)
+            {
+                double gate = 0, up = 0;
+                for (int k = 0; k < data.embedding; ++k)
+                {
+                    const float x = std::sin(float(token * data.embedding + k + 1) * .13f);
+                    const size_t index = ((size_t) expert * data.hidden + row) * data.embedding + k;
+                    gate += double(weight(data.gate_data, index)) * x;
+                    up += double(weight(data.up_data, index)) * x;
+                }
+                const float g = std::min(.1f, (float) gate), u = std::clamp((float) up, -.1f, .1f);
+                hidden[row] = g / (1.0f + std::exp(-g)) * u;
+            }
+            for (int row = 0; row < data.embedding; ++row)
+            {
+                double dot = 0;
+                for (int k = 0; k < data.hidden; ++k)
+                    dot += double(weight(data.down_data, ((size_t) expert * data.embedding + row) * data.hidden + k)) * hidden[k];
+                result[token * data.embedding + row] += (float) dot * routing;
+            }
+        }
+    }
+    if (shared_once)
+        for (size_t i = 0; i < result.size(); ++i) result[i] += (i % 2 ? -.125f : .25f);
+    return result;
+}
+
+void check_partitions()
+{
+    for (int ranks : {2, 4, 7, 8})
+    {
+        std::vector<int64_t> aggregate(ranks);
+        for (int layer = 0; layer < ranks; ++layer)
+        {
+            const auto strips = tsg_dsv41_tp::split(2304, 256, ranks, layer);
+            int64_t end = 0;
+            int wide = 0;
+            for (int rank = 0; rank < ranks; ++rank)
+            {
+                const auto & part = strips[rank];
+                require(part.first == end && part.first % 256 == 0 && part.count % 256 == 0 && part.count > 0,
+                        "TP split is incomplete, overlapping, or unaligned");
+                require(part.count == (9 / ranks) * 256 || part.count == (9 / ranks + 1) * 256,
+                        "TP strip is not balanced by quantization blocks");
+                wide += part.count > (9 / ranks) * 256;
+                aggregate[rank] += part.count;
+                end += part.count;
+            }
+            require(end == 2304 && wide == 9 % ranks, "TP split lost rows or assigned the wrong number of wider strips");
+            if (ranks == 7 && layer == 6)
+                require(strips[0].count == 512 && strips[6].count == 512 &&
+                        std::all_of(strips.begin() + 1, strips.begin() + 6, [](auto part) { return part.count == 256; }),
+                        "Seven-rank wider strips did not rotate across the last/first rank boundary");
+        }
+        require(std::all_of(aggregate.begin(), aggregate.end(), [](int64_t count) { return count == 2304; }),
+                "A complete layer rotation leaves imbalanced expert strips");
+    }
+    for (auto type : {GGML_TYPE_BF16, GGML_TYPE_F16})
+    for (int64_t width : {int64_t(2304), int64_t(2368)})
+    for (int ranks : {2, 4, 7, 8})
+    {
+        std::vector<int64_t> aggregate(ranks);
+        for (int layer = 0; layer < ranks; ++layer)
+        {
+            const auto parts = tsg_dsv41_tp::split_weights(width, type, ranks, layer);
+            int64_t end = 0;
+            int wide = 0;
+            for (int rank = 0; rank < ranks; ++rank)
+            {
+                const auto part = parts[rank];
+                require(part.first == end && part.first % 64 == 0 && part.count > 0 && part.count % 64 == 0,
+                        "Floating TP weights lost full coverage or matrix alignment");
+                require(part.count == (width / 64 / ranks) * 64 || part.count == (width / 64 / ranks + 1) * 64,
+                        "Floating TP strips are not balanced by 64-channel blocks");
+                wide += part.count > (width / 64 / ranks) * 64;
+                end += part.count;
+                aggregate[rank] += part.count;
+            }
+            require(end == width && wide == width / 64 % ranks, "Floating TP split lost blocks");
+            if (width == 2368 && ranks == 7 && layer == 6)
+                require(parts[6].count == 384 && parts[0].count == 384 && parts[1].count == 320,
+                        "Floating TP wider strips did not wrap across the last/first rank boundary");
+        }
+        require(std::all_of(aggregate.begin(), aggregate.end(), [=](int64_t count) { return count == width; }),
+                "Floating TP complete layer rotation is unbalanced");
+    }
+    for (auto type : {GGML_TYPE_F32, GGML_TYPE_BF16, GGML_TYPE_F16, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K})
+    for (int ranks : {2, 4, 7, 8})
+    {
+        // F32/quantized layouts must not change. Floating small/non-64 widths
+        // must still form valid nonempty strips through the original fallback.
+        const int64_t width = type == GGML_TYPE_BF16 ? 128 : type == GGML_TYPE_F16 ? 130 : 2304;
+        if ((type == GGML_TYPE_BF16 || type == GGML_TYPE_F16) && width % 64 == 0 && width / 64 >= ranks) continue;
+        const auto before = tsg_dsv41_tp::split(width, ggml_blck_size(type), ranks, 1);
+        const auto after = tsg_dsv41_tp::split_weights(width, type, ranks, 1);
+        for (int rank = 0; rank < ranks; ++rank)
+            require(before[rank].first == after[rank].first && before[rank].count == after[rank].count,
+                    "Typed split changed F32/quantized layout or small floating fallback");
+    }
+}
 
 std::vector<float> values(ggml_tensor * tensor)
 {
@@ -204,7 +340,7 @@ void diagnose(const fixture & data, int tokens, int ranks, int layer, ggml_backe
     const auto full_output = full.run();
     const auto full_gate = values(full.gate_out), full_up = values(full.up_out), full_hidden = values(full.hidden_out);
     std::vector<float> gate(full_gate.size()), up(full_up.size()), hidden(full_hidden.size()), sum(full_output.size());
-    for (auto part : tsg_dsv41_tp::split(data.hidden, ggml_blck_size(data.down.type), ranks, layer))
+    for (auto part : tsg_dsv41_tp::split_weights(data.hidden, data.down.type, ranks, layer))
     {
         fixture subset(data, part);
         evaluation sliced(subset, tokens, nullptr, layer, device, true);
@@ -361,9 +497,9 @@ int main(int argc, char ** argv)
             else if (option == "--diagnostic-down-f32") down_f32 = true;
             else if (option == "--failure-only") failure_only = true;
             else if (option == "--fanout-pairs" && arg + 1 < argc) fanout_pairs = std::stoi(argv[++arg]);
-            else throw std::runtime_error("Usage: GgmlOpsDsv41TpTest [--cuda 2|4|8] [--checkpoint-shape] [--diagnose] [--diagnostic-down-f32] [--failure-only|--fanout-pairs N]");
+            else throw std::runtime_error("Usage: GgmlOpsDsv41TpTest [--cuda 2|4|7|8] [--checkpoint-shape] [--diagnose] [--diagnostic-down-f32] [--failure-only|--fanout-pairs N]");
         }
-        if (cuda && cuda_ranks != 2 && cuda_ranks != 4 && cuda_ranks != 8) return 1;
+        if (cuda && cuda_ranks != 2 && cuda_ranks != 4 && cuda_ranks != 7 && cuda_ranks != 8) return 1;
         require(!down_f32 || checkpoint_shape, "The F32-down control requires --checkpoint-shape");
         require(fanout_pairs >= 0 && fanout_pairs <= 10000 && !(fanout_pairs && failure_only), "Invalid fanout comparison count");
         std::vector<ggml_backend_dev_t> devices;
@@ -389,19 +525,8 @@ int main(int argc, char ** argv)
             else for (int ranks : {2, 4, 8}) paired_fanout(std::vector<ggml_backend_dev_t>(ranks, cpu), fanout_pairs);
             return 0;
         }
-        // Quantized down rows have nine blocks: 5+4, 3+2+2+2, and 2+1+...+1.
-        for (int ranks : {2, 4, 8}) for (int layer = 0; layer < ranks; ++layer)
-        {
-            auto strips = tsg_dsv41_tp::split(2304, 256, ranks, layer);
-            int64_t end = 0;
-            for (const auto & part : strips)
-            {
-                require(part.first == end && part.first % 256 == 0 && part.count % 256 == 0 && part.count > 0,
-                        "TP split is incomplete, overlapping, or unaligned");
-                end += part.count;
-            }
-            require(end == 2304, "TP split lost expert rows");
-        }
+        // Quantized down rows have nine blocks, including seven unequal ranks.
+        check_partitions();
         bool rejected = false;
         try { tsg_dsv41_tp::split(256, 256, 2, 0); } catch (const std::exception &) { rejected = true; }
         require(rejected, "TP accepted empty rank strips");
@@ -410,10 +535,13 @@ int main(int argc, char ** argv)
         // down in Q3_K. Its nine down blocks must remain independently typed
         // and aligned when every rank receives a different hidden-width strip.
         const std::vector<std::pair<ggml_type, ggml_type>> formats = checkpoint_shape
-            ? std::vector<std::pair<ggml_type, ggml_type>>{{GGML_TYPE_Q2_K, down_f32 ? GGML_TYPE_F32 : GGML_TYPE_Q3_K}}
+            ? (down_f32
+                ? std::vector<std::pair<ggml_type, ggml_type>>{{GGML_TYPE_Q2_K, GGML_TYPE_F32}}
+                : std::vector<std::pair<ggml_type, ggml_type>>{{GGML_TYPE_Q2_K, GGML_TYPE_Q3_K}, {GGML_TYPE_Q4_K, GGML_TYPE_Q6_K}})
             : std::vector<std::pair<ggml_type, ggml_type>>{{GGML_TYPE_F32, GGML_TYPE_F32},
-                {GGML_TYPE_BF16, GGML_TYPE_BF16}, {GGML_TYPE_Q2_K, GGML_TYPE_Q2_K},
-                {GGML_TYPE_Q2_K, GGML_TYPE_Q3_K}};
+                {GGML_TYPE_BF16, GGML_TYPE_BF16}, {GGML_TYPE_F16, GGML_TYPE_F16}, {GGML_TYPE_Q2_K, GGML_TYPE_Q2_K},
+                {GGML_TYPE_Q2_K, GGML_TYPE_Q3_K}, {GGML_TYPE_Q4_K, GGML_TYPE_Q4_K},
+                {GGML_TYPE_Q6_K, GGML_TYPE_Q6_K}, {GGML_TYPE_Q4_K, GGML_TYPE_Q6_K}};
         for (auto [type, down_type] : formats)
         {
             fixture data(type, down_type, checkpoint_shape ? 5120 : 0);
@@ -423,19 +551,34 @@ int main(int argc, char ** argv)
             std::map<int, std::vector<float>> expected;
             for (int tokens : {1, 5, 16})
                 expected[tokens] = evaluation(data, tokens, nullptr, 0, cuda ? devices[0] : nullptr).run();
-            for (int ranks : {2, 4, 8})
+            for (int ranks : {2, 4, 7, 8})
             {
                 if (cuda && ranks != cuda_ranks) continue;
                 auto rank_devices = cuda ? devices : std::vector<ggml_backend_dev_t>(ranks, cpu);
                 tsg_dsv41_tp::executor tp(rank_devices, data.used);
-                // Two layers prove shared scratch does not corrupt cached graphs;
-                // layer rotation exercises the differently sized quantized strips.
-                for (int layer : {0, 1}) tp.add_layer(layer, data.gate, data.up, data.down, .1f);
+                // Reuse scratch across layers and shapes, including seven-rank
+                // wider strips wrapping from rank six back to rank zero.
+                const std::vector<int> layers = ranks == 7 ? std::vector<int>{0, 1, 6} : std::vector<int>{0, 1};
+                for (int layer : layers) tp.add_layer(layer, data.gate, data.up, data.down, .1f);
                 size_t total = 0;
                 for (int rank = 0; rank < ranks; ++rank) total += tp.rank_weight_bytes(rank);
-                require(total == 2 * (data.gate_data.size() + data.up_data.size() + data.down_data.size()),
+                require(total == layers.size() * (data.gate_data.size() + data.up_data.size() + data.down_data.size()),
                         "TP duplicated or dropped weight bytes");
-                for (int tokens : {1, 5, 16, 1}) for (int layer : {0, 1})
+                if (type == GGML_TYPE_F32)
+                {
+                    for (bool shared_once : {false, true})
+                    {
+                        const auto independent = scalar_f32_reference(data, 3, shared_once);
+                        const auto actual = evaluation(data, 3, &tp, layers.back(), nullptr, false, shared_once).run();
+                        require(tp.error().empty(), tp.error().c_str());
+                        for (size_t i = 0; i < actual.size(); ++i)
+                            require(std::isfinite(actual[i]) && std::abs(actual[i] - independent[i]) < 1e-7,
+                                    "TP differs from scalar F32 oracle or counts shared output more than once");
+                        std::cout << "Scalar F32 oracle ranks=" << ranks << " shared_output=" << shared_once << " passed\n";
+                        ++checks;
+                    }
+                }
+                for (int tokens : {1, 5, 16, 1}) for (int layer : layers)
                 {
                     auto actual = evaluation(data, tokens, &tp, layer).run();
                     require(tp.error().empty(), tp.error().c_str());
@@ -461,6 +604,7 @@ int main(int argc, char ** argv)
                 }
             }
         }
+        require(checks > 0, "No TP numerical comparisons executed");
         std::cout << "Passed " << checks << " true MoE tensor-parallel comparisons\n";
         return 0;
     }

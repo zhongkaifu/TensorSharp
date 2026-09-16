@@ -79,22 +79,13 @@ namespace TensorSharp.Runtime
                 Id = "gemma4",
                 Architectures = new[] { "gemma4" },
                 Render = r => ChatTemplate.RenderGemma4(r.Messages, r.AddGenerationPrompt, r.Tools, r.EnableThinking),
-                AppendMediaPlaceholders = (msg, sb) =>
-                {
-                    if (msg.IsVideo && msg.ImagePaths != null)
-                        sb.Append("<|video>");
-                    if (msg.ImagePaths != null)
-                        foreach (var _ in msg.ImagePaths) sb.Append("<|image>");
-                    if (msg.AudioPaths != null)
-                        foreach (var _ in msg.AudioPaths) sb.Append("<|audio>");
-                },
+                AppendMediaPlaceholders = ChatTemplate.AppendGemma4MediaPlaceholders,
                 CapsVideoFrames = true,
                 CreateOutputParser = () => new Gemma4OutputParser(),
                 OutputParserAlwaysRequired = true,
-                // Thinking-disabled adds an empty <|channel>thought<channel|> block to
-                // the generation prompt so the model skips reasoning; the template does
-                // not re-emit it for past assistant messages, but the cache holds it.
-                AssistantGenerationSuffix = thinking => thinking ? null : "<|channel>thought\n<channel|>",
+                // The publisher template owns channel priming. Ordinary model turns
+                // have no additional suffix; explicitly recorded older suffixes remain
+                // authoritative when replaying their raw generated tokens.
                 // The template can re-render an in-turn tool round's thinking channel
                 // from `reasoning`, and needs `tool_calls` present to render that round's
                 // tool RESULT. The KV renderer's canonical-template replay hook keeps
@@ -186,17 +177,21 @@ namespace TensorSharp.Runtime
                 ToolCallRawSplicing = ToolCallRawSplicing.Always,
             });
 
-            // Qwen3.8-Flash-Next uses generic ChatML framing with Qwen-VL vision
-            // placeholders.
+            // Qwen3.8 Flash Next uses ChatML reasoning and the Qwen XML-style
+            // function-call body, with Qwen-VL vision placeholders.
             Register(new ChatProtocol
             {
                 Id = "qwen4exp",
                 Architectures = new[] { "qwen4exp" },
-                // qwen4exp appends `<think>` to the generation prompt UNCONDITIONALLY -
-                // the model always reasons - so the cache always holds it, whatever the
-                // thinking flag says.
-                AssistantGenerationSuffix = _ => "<think>\n",
+                CreateOutputParser = () => new Qwen35OutputParser(),
+                // The published template emits the closed, empty block when
+                // enable_thinking=false. Cache replay must restore that exact suffix.
+                AssistantGenerationSuffix = thinking => thinking
+                    ? "<think>\n" : "<think>\n\n</think>\n\n",
                 EmitsEmptyThinkBlockForPastTurns = _ => true,
+                // role=tool renders independently of the assistant tool_calls field.
+                ToolCallRawSplicing = ToolCallRawSplicing.Always,
+                ThinkingGrammarActivationTrigger = "</think>",
                 AppendMediaPlaceholders = AppendQwenVisionPads,
             });
 

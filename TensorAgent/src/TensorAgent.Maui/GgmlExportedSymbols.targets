@@ -21,7 +21,7 @@
     with SIGABRT inside load_aot_module, before any managed code runs. Measured on
     device.
 
-    Names carry no leading underscore: the linker adds one for -u. Generated from the xcframework's device slice; 255 symbols.
+    Names carry no leading underscore: the linker adds one for -u. Native source export manifest; 282 symbols.
   -->
   <ItemGroup Condition="'$(RuntimeIdentifier)' == 'ios-arm64'">
     <ReferenceNativeSymbol Include="TSGgml_ActivationGradF32" SymbolType="Function" />
@@ -74,10 +74,15 @@
     <ReferenceNativeSymbol Include="TSGgml_Dsv4LoadModelDspark" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Dsv4NPast" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Dsv4Reset" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_Dsv4ResetChecked" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Dsv4Rewind" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Dsv4SetActiveSlot" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Dsv4SlotAlloc" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_Dsv4SlotCanRetain" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_Dsv4SlotCanReuse" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Dsv4SlotFree" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_Dsv4SlotReleaseGraphs" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_Dsv4SlotStatus" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Dsv4Truncate" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Dsv4TruncateAlign" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Dsv4VocabSize" SymbolType="Function" />
@@ -247,6 +252,18 @@
     <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpResUpload" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpResetFfnCache" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpTokenSpan" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpTokenSpanEx" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpTokenSpanQsa" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpCopyQsaCache" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpSpecApiVersion" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpStateSnapshotCreate" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpStateSnapshotCapture" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpStateSnapshotRestore" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpStateSnapshotFree" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpMtpCreate" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpMtpForward" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpMtpFree" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpMtpCopyKv" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_QwenImageBlock" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_QwenImageBlockCfg" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_QwenImageForward" SymbolType="Function" />
