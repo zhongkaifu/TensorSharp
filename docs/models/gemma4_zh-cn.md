@@ -558,7 +558,7 @@ Gemma 4 是 TensorSharp 中最难移植到分页批处理的模型，因为它�
 
 ## 12. MTP 投机解码（gemma4-assistant 草稿头）
 
-Gemma 4 在两个宿主上都支持为单序列（无并发）请求做无损的**多 token
+Gemma 4 在两个宿主上都支持为单序列（无并发）请求做**多 token
 预测（MTP）投机解码**。与 Qwen 3.6 把 NextN 块内嵌在主干 GGUF 不同，Gemma 4 的草稿头
 作为一个**独立的小 `gemma4-assistant` GGUF** 发布，通过 `--draft-model`
 （环境变量 `TS_SPEC_DRAFT_MODEL`，旧名 `TS_MTP_DRAFT_MODEL`）加载，
@@ -630,6 +630,23 @@ KV 缓存，并对每个起草 token 复用相同位置（递归只通过 `h` �
 完整参数列表与其他算法见[投机解码](../../FEATURES_zh-cn.md#投机解码) —— 其中
 `--spec-type ngram` 完全不需要草稿 GGUF，因此即便旁边没有 assistant 文件，也能在
 Gemma 4 checkpoint 上运行。
+
+### 12.4 贪心一致性
+
+每个输出 token 都取自主干的某一行，因此投机不会改变 token 所依据的前缀，只会改变计算这一行的
+kernel。用 `AgentTurnBench --spec-diagnostic --spec-diagnostic-teacher-force` 实测有两点后果：
+
+* **已修复：** 在不带逐层嵌入的稠密检查点（实测 12B；31B 走同一路径）上、ggml 与 CPU 后端下，越过滑动窗口的
+  一次**全部接受**的验证，过去会把被挤出的位置写回到已提交的行上，于是下一次验证偏差 30-47 个
+  logit，12B 的输出流在十个 token 内就与普通贪心分叉。现在 `SpecOnVerifyAccepted` 只对执行器会
+  重新前向的窗口恢复槽位；A40 上 12B 的 spec 与检查点克隆输出流重新与普通贪心一致，spec 提示上的
+  n-gram 接受率从 57% 升到 89%。
+* **容差：** K+1 行验证与单行 decode 是不同的 kernel。在 `ggml_cuda` 上两者的行在 E4B 上相差
+  中位数 0.5 个 logit（其 BF16 逐层嵌入投影在 ggml-cuda 中依赖 batch 形状），在 12B/26B-QAT 上为
+  1.7-2.2；Metal 上为 0.003（E4B）与 0.15（12B）；`ggml_cpu` 上为 0。若某个贪心 token 的前两名
+  logit 之差落在这一误差之内，它就可能不同：E4B 的 512 个散文 token 中出现了 4-5 次，每次的差都小于 0.25。
+
+细节与完整表格见：[What greedy parity delivers](../speculative_decoding.md#what-greedy-parity-delivers)。
 
 ## 13. 输出解析器与聊天模板
 

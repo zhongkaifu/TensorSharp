@@ -32,7 +32,7 @@ dotnet run --project TensorSharp.Cli -c Release -- \
   --mmproj models/mmproj-Muse-Glimmer-30B-Q8_0.gguf \
   --image photo.png --input question.txt --backend ggml_cuda --max-tokens 300
 
-# DFlash 投机解码（无损；输出与普通贪心 decode 一致）
+# DFlash 投机解码（每个 token 取自主干行；除浮点近平局外与普通贪心一致，见“输出一致性”）
 dotnet run --project TensorSharp.Cli -c Release -- \
   --model models/Muse-Glimmer-30B-UD-IQ2_XXS.gguf \
   --draft-model models/dflash-kquant.gguf \
