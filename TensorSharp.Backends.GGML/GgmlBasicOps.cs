@@ -3543,6 +3543,101 @@ namespace TensorSharp.GGML
                 finalNormData, logitSoftcap);
         }
 
+        /// <summary>Capability bits of the native token-batched dense decode kernel
+        /// (<c>TSGgml_Gemma4BatchedDecodeCapabilities</c>).</summary>
+        [Flags]
+        public enum Gemma4BatchedDecodeCaps
+        {
+            None = 0,
+            /// <summary>Per-layer embeddings (uploaded or gathered in-kernel per row).</summary>
+            Ple = 1,
+            /// <summary>KV-donor (shared-KV) layers via a kv_source map.</summary>
+            KvDonor = 2,
+            /// <summary>Local (SWA) layers past their ring: write pos % cache, read flat.</summary>
+            SwaWrap = 4,
+        }
+
+        /// <summary>What the native token-batched dense decode supports beyond its
+        /// v1 scope (PLE, KV-donor layers, SWA wrap). <see cref="Gemma4BatchedDecodeCaps.None"/>
+        /// on a native build that predates the probe.</summary>
+        public static Gemma4BatchedDecodeCaps Gemma4BatchedDecodeCapabilities()
+            => (Gemma4BatchedDecodeCaps)GgmlNative.Gemma4BatchedDecodeCapabilities();
+
+        /// <summary>Extended token-batched dense decode: <see cref="Gemma4ModelDecodeBatched"/>
+        /// plus the KV-donor map (<paramref name="kvSourceArr"/>) and per-row PLE,
+        /// gathered in-kernel from the quantized table over <paramref name="pleTokenIds"/>
+        /// (preferred) or uploaded through <paramref name="pleData"/>
+        /// ([nSeqs][numLayers*pleDim] F32). Returns false when the kernel declines
+        /// (a global layer's cache is too small) so the caller falls back.</summary>
+        public static bool Gemma4ModelDecodeBatchedEx(
+            IntPtr hiddenData, int hiddenSize, int numLayers, int nSeqs,
+            IntPtr[] attnNormArr, IntPtr[] qkvArr, IntPtr[] qNormArr, IntPtr[] kNormArr,
+            IntPtr[] oArr, IntPtr[] postAttnNormArr,
+            IntPtr[] ffnNormArr, IntPtr[] guArr, IntPtr[] downArr, IntPtr[] postFfnNormArr,
+            IntPtr[] kCacheArr, IntPtr[] vCacheArr,
+            int[] headDimArr, int[] kvHeadsArr, int[] cacheSizeArr, int[] isLocalArr,
+            float[] ropeBaseArr, float[] layerScalarArr,
+            int[] qkvTypeArr, long[] qkvNe0Arr, long[] qkvNe1Arr, long[] qkvBytesArr,
+            int[] oTypeArr, long[] oNe0Arr, long[] oNe1Arr, long[] oBytesArr,
+            int[] guTypeArr, long[] guNe0Arr, long[] guNe1Arr, long[] guBytesArr,
+            int[] downTypeArr, long[] downNe0Arr, long[] downNe1Arr, long[] downBytesArr,
+            int numHeads, int[] positions,
+            float eps, int slidingWindow,
+            IntPtr ropeFreqFactors, int ropeFreqFactorsLen,
+            int[] ropeNDimsArr,
+            int kvCacheType,
+            IntPtr[] kArr, int[] kTypeArr, long[] kNe0Arr, long[] kNe1Arr, long[] kBytesArr,
+            IntPtr[] vArr, int[] vTypeArr, long[] vNe0Arr, long[] vNe1Arr, long[] vBytesArr,
+            IntPtr logitsData, int vocabSize,
+            IntPtr lmHeadData, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
+            IntPtr finalNormData, float logitSoftcap,
+            int[] kvSourceArr,
+            IntPtr pleData, int pleDim,
+            IntPtr[] pleGateArr, int[] pleGateTypeArr, long[] pleGateNe0Arr, long[] pleGateNe1Arr, long[] pleGateBytesArr,
+            IntPtr[] pleProjArr, int[] pleProjTypeArr, long[] pleProjNe0Arr, long[] pleProjNe1Arr, long[] pleProjBytesArr,
+            IntPtr[] plePostNormArr,
+            IntPtr pleTokenEmbdData = default, int pleTokenEmbdType = 0,
+            long pleTokenEmbdNe0 = 0, long pleTokenEmbdNe1 = 0, long pleTokenEmbdBytes = 0,
+            int[] pleTokenIds = null,
+            IntPtr pleModelProjData = default, int pleModelProjType = 0,
+            long pleModelProjNe0 = 0, long pleModelProjNe1 = 0, long pleModelProjBytes = 0,
+            IntPtr pleModelProjNormData = default)
+        {
+            return GgmlNative.Gemma4ModelDecodeBatchedEx(
+                hiddenData, hiddenSize, numLayers, nSeqs,
+                attnNormArr, qkvArr, qNormArr, kNormArr,
+                oArr, postAttnNormArr,
+                ffnNormArr, guArr, downArr, postFfnNormArr,
+                kCacheArr, vCacheArr,
+                headDimArr, kvHeadsArr, cacheSizeArr, isLocalArr,
+                ropeBaseArr, layerScalarArr,
+                qkvTypeArr, qkvNe0Arr, qkvNe1Arr, qkvBytesArr,
+                oTypeArr, oNe0Arr, oNe1Arr, oBytesArr,
+                guTypeArr, guNe0Arr, guNe1Arr, guBytesArr,
+                downTypeArr, downNe0Arr, downNe1Arr, downBytesArr,
+                numHeads, positions,
+                eps, slidingWindow,
+                ropeFreqFactors, ropeFreqFactorsLen,
+                ropeNDimsArr,
+                kvCacheType,
+                kArr, kTypeArr, kNe0Arr, kNe1Arr, kBytesArr,
+                vArr, vTypeArr, vNe0Arr, vNe1Arr, vBytesArr,
+                logitsData, vocabSize,
+                lmHeadData, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes,
+                finalNormData, logitSoftcap,
+                kvSourceArr,
+                pleData, pleDim,
+                pleGateArr, pleGateTypeArr, pleGateNe0Arr, pleGateNe1Arr, pleGateBytesArr,
+                pleProjArr, pleProjTypeArr, pleProjNe0Arr, pleProjNe1Arr, pleProjBytesArr,
+                plePostNormArr,
+                pleTokenEmbdData, pleTokenEmbdType,
+                pleTokenEmbdNe0, pleTokenEmbdNe1, pleTokenEmbdBytes,
+                pleTokenIds,
+                pleModelProjData, pleModelProjType,
+                pleModelProjNe0, pleModelProjNe1, pleModelProjBytes,
+                pleModelProjNormData);
+        }
+
         /// <summary>Fused multi-token speculative verify. Returns false when the
         /// native kernel declines (total length past the SWA window) — caller falls
         /// back to the per-op path.</summary>

@@ -2965,6 +2965,49 @@ internal enum GgmlIndexReductionOp
             IntPtr lmHeadData, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
             IntPtr finalNormData, float logitSoftcap);
 
+        // Extended token-batched dense decode: the v1 signature plus the KV-donor
+        // map, uploaded / in-kernel-gathered PLE (per-row token ids). Probe
+        // TSGgml_Gemma4BatchedDecodeCapabilities before using it.
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int TSGgml_Gemma4ModelDecodeBatchedEx(
+            IntPtr hiddenData, int hiddenSize, int numLayers, int nSeqs,
+            IntPtr[] attnNormArr, IntPtr[] qkvArr, IntPtr[] qNormArr, IntPtr[] kNormArr,
+            IntPtr[] oArr, IntPtr[] postAttnNormArr,
+            IntPtr[] ffnNormArr, IntPtr[] guArr, IntPtr[] downArr, IntPtr[] postFfnNormArr,
+            IntPtr[] kCacheArr, IntPtr[] vCacheArr,
+            int[] headDimArr, int[] kvHeadsArr, int[] cacheSizeArr, int[] isLocalArr,
+            float[] ropeBaseArr, float[] layerScalarArr,
+            int[] qkvTypeArr, long[] qkvNe0Arr, long[] qkvNe1Arr, long[] qkvBytesArr,
+            int[] oTypeArr, long[] oNe0Arr, long[] oNe1Arr, long[] oBytesArr,
+            int[] guTypeArr, long[] guNe0Arr, long[] guNe1Arr, long[] guBytesArr,
+            int[] downTypeArr, long[] downNe0Arr, long[] downNe1Arr, long[] downBytesArr,
+            int numHeads, int[] positions,
+            float eps, int slidingWindow,
+            IntPtr ropeFreqFactors, int ropeFreqFactorsLen,
+            int[] ropeNDimsArr,
+            int kvCacheType,
+            IntPtr[] kArr, int[] kTypeArr, long[] kNe0Arr, long[] kNe1Arr, long[] kBytesArr,
+            IntPtr[] vArr, int[] vTypeArr, long[] vNe0Arr, long[] vNe1Arr, long[] vBytesArr,
+            IntPtr logitsData, int vocabSize,
+            IntPtr lmHeadData, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
+            IntPtr finalNormData, float logitSoftcap,
+            int[] kvSourceArr,
+            IntPtr pleData, int pleDim,
+            IntPtr[] pleGateArr, int[] pleGateTypeArr, long[] pleGateNe0Arr, long[] pleGateNe1Arr, long[] pleGateBytesArr,
+            IntPtr[] pleProjArr, int[] pleProjTypeArr, long[] pleProjNe0Arr, long[] pleProjNe1Arr, long[] pleProjBytesArr,
+            IntPtr[] plePostNormArr,
+            IntPtr pleTokenEmbdData, int pleTokenEmbdType,
+            long pleTokenEmbdNe0, long pleTokenEmbdNe1, long pleTokenEmbdBytes,
+            int[] pleTokenIds,
+            IntPtr pleModelProjData, int pleModelProjType,
+            long pleModelProjNe0, long pleModelProjNe1, long pleModelProjBytes,
+            IntPtr pleModelProjNormData);
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int TSGgml_Gemma4BatchedDecodeCapabilities();
+
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         private static partial int TSGgml_Gemma4ModelVerify(
@@ -6157,6 +6200,93 @@ internal enum GgmlIndexReductionOp
                 logitsData, vocabSize,
                 lmHeadData, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes,
                 finalNormData, logitSoftcap);
+            return rc != 0;
+        }
+
+        /// <summary>Probes what the native token-batched dense decode supports
+        /// (the bitmask <see cref="GgmlBasicOps.Gemma4BatchedDecodeCaps"/> decodes).
+        /// An older native build without the probe reports 0 (so its callers keep
+        /// the v1 gates) instead of throwing.</summary>
+        public static int Gemma4BatchedDecodeCapabilities()
+        {
+            try { return TSGgml_Gemma4BatchedDecodeCapabilities(); }
+            catch (EntryPointNotFoundException) { return 0; }
+            catch (DllNotFoundException) { return 0; }
+        }
+
+        /// <summary>Extended token-batched dense decode (see
+        /// <see cref="Gemma4ModelDecodeBatched"/>): adds the KV-donor map and PLE,
+        /// either uploaded (<paramref name="pleData"/>, [nSeqs][numLayers*pleDim])
+        /// or gathered in-kernel from the resident quantized table over
+        /// <paramref name="pleTokenIds"/> (one per sequence). Only callable when
+        /// <see cref="Gemma4BatchedDecodeCapabilities"/> reports support.</summary>
+        public static bool Gemma4ModelDecodeBatchedEx(
+            IntPtr hiddenData, int hiddenSize, int numLayers, int nSeqs,
+            IntPtr[] attnNormArr, IntPtr[] qkvArr, IntPtr[] qNormArr, IntPtr[] kNormArr,
+            IntPtr[] oArr, IntPtr[] postAttnNormArr,
+            IntPtr[] ffnNormArr, IntPtr[] guArr, IntPtr[] downArr, IntPtr[] postFfnNormArr,
+            IntPtr[] kCacheArr, IntPtr[] vCacheArr,
+            int[] headDimArr, int[] kvHeadsArr, int[] cacheSizeArr, int[] isLocalArr,
+            float[] ropeBaseArr, float[] layerScalarArr,
+            int[] qkvTypeArr, long[] qkvNe0Arr, long[] qkvNe1Arr, long[] qkvBytesArr,
+            int[] oTypeArr, long[] oNe0Arr, long[] oNe1Arr, long[] oBytesArr,
+            int[] guTypeArr, long[] guNe0Arr, long[] guNe1Arr, long[] guBytesArr,
+            int[] downTypeArr, long[] downNe0Arr, long[] downNe1Arr, long[] downBytesArr,
+            int numHeads, int[] positions,
+            float eps, int slidingWindow,
+            IntPtr ropeFreqFactors, int ropeFreqFactorsLen,
+            int[] ropeNDimsArr,
+            int kvCacheType,
+            IntPtr[] kArr, int[] kTypeArr, long[] kNe0Arr, long[] kNe1Arr, long[] kBytesArr,
+            IntPtr[] vArr, int[] vTypeArr, long[] vNe0Arr, long[] vNe1Arr, long[] vBytesArr,
+            IntPtr logitsData, int vocabSize,
+            IntPtr lmHeadData, int lmHeadType, long lmHeadNe0, long lmHeadNe1, long lmHeadBytes,
+            IntPtr finalNormData, float logitSoftcap,
+            int[] kvSourceArr,
+            IntPtr pleData, int pleDim,
+            IntPtr[] pleGateArr, int[] pleGateTypeArr, long[] pleGateNe0Arr, long[] pleGateNe1Arr, long[] pleGateBytesArr,
+            IntPtr[] pleProjArr, int[] pleProjTypeArr, long[] pleProjNe0Arr, long[] pleProjNe1Arr, long[] pleProjBytesArr,
+            IntPtr[] plePostNormArr,
+            IntPtr pleTokenEmbdData, int pleTokenEmbdType,
+            long pleTokenEmbdNe0, long pleTokenEmbdNe1, long pleTokenEmbdBytes,
+            int[] pleTokenIds,
+            IntPtr pleModelProjData, int pleModelProjType,
+            long pleModelProjNe0, long pleModelProjNe1, long pleModelProjBytes,
+            IntPtr pleModelProjNormData)
+        {
+            int rc = TSGgml_Gemma4ModelDecodeBatchedEx(
+                hiddenData, hiddenSize, numLayers, nSeqs,
+                attnNormArr, qkvArr, qNormArr, kNormArr,
+                oArr, postAttnNormArr,
+                ffnNormArr, guArr, downArr, postFfnNormArr,
+                kCacheArr, vCacheArr,
+                headDimArr, kvHeadsArr, cacheSizeArr, isLocalArr,
+                ropeBaseArr, layerScalarArr,
+                qkvTypeArr, qkvNe0Arr, qkvNe1Arr, qkvBytesArr,
+                oTypeArr, oNe0Arr, oNe1Arr, oBytesArr,
+                guTypeArr, guNe0Arr, guNe1Arr, guBytesArr,
+                downTypeArr, downNe0Arr, downNe1Arr, downBytesArr,
+                numHeads, positions,
+                eps, slidingWindow,
+                ropeFreqFactors, ropeFreqFactorsLen,
+                ropeNDimsArr,
+                kvCacheType,
+                kArr, kTypeArr, kNe0Arr, kNe1Arr, kBytesArr,
+                vArr, vTypeArr, vNe0Arr, vNe1Arr, vBytesArr,
+                logitsData, vocabSize,
+                lmHeadData, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes,
+                finalNormData, logitSoftcap,
+                kvSourceArr,
+                pleData, pleDim,
+                pleGateArr, pleGateTypeArr, pleGateNe0Arr, pleGateNe1Arr, pleGateBytesArr,
+                pleProjArr, pleProjTypeArr, pleProjNe0Arr, pleProjNe1Arr, pleProjBytesArr,
+                plePostNormArr,
+                pleTokenEmbdData, pleTokenEmbdType,
+                pleTokenEmbdNe0, pleTokenEmbdNe1, pleTokenEmbdBytes,
+                pleTokenIds,
+                pleModelProjData, pleModelProjType,
+                pleModelProjNe0, pleModelProjNe1, pleModelProjBytes,
+                pleModelProjNormData);
             return rc != 0;
         }
 

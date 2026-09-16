@@ -249,7 +249,7 @@ GPT OSS 可用 `TS_GPTOSS_PAGED_ATTN_MANAGED=1` 强制走托管 sinks 路径。
 | 模型家族 | 批处理 / 分页状态 | 关闭 / 子开关 |
 |---|---|---|
 | Mistral 3 | 默认 `ForwardBatch` 路径。使用分页 K/V、YaRN 感知位置、原生分页注意力，并在 prompt 准备后注入视觉 embedding。已在 Ministral-3-14B 上验证；长上下文原生分页注意力比旧按序列 GGML 路径快约 21%。 | `TS_PAGED_ATTN_KERNEL` 选择 `native`、`tensor` 或 `managed`。 |
-| Gemma 4 | 密集文本负载默认走批处理路径，覆盖逐层 SWA / 全局注意力、可变 head dim、PLE、KV donor 层别名。当前回退场景包括待注入多模态 embedding、MoE 层与块量化 KV cache。已完成请求的 request-owned fused K/V holder 可被保留，用于精确前缀续接。可选地通过独立 `gemma4-assistant` 草稿 GGUF 做 MTP 投机解码。 | `TS_GEMMA4_BATCHED=0` 强制按序列回退；`TS_RETAINED_FUSED_CACHE=0` 关闭 retained-holder 续接。服务端只需 `--draft-model` 即可启用投机（显式 `--no-spec` 可否决）；`TS_GMTP_*` 为草稿路径 A/B 开关。 |
+| Gemma 4 | 密集文本负载默认走批处理路径，覆盖逐层 SWA / 全局注意力、可变 head dim、PLE、KV donor 层别名。当前回退场景包括待注入多模态 embedding、MoE 层与块量化 KV cache。已完成请求的 request-owned fused K/V holder 可被保留，用于精确前缀续接。并发（N>=2）的 decode 步骤跑 token 批量融合内核（`TSGgml_Gemma4ModelDecodeBatchedEx`：一张图、每序列一个 token、权重只读一次），它覆盖 per-layer embedding、KV-donor 层与已回绕的 SWA 环，因此 E2B/E4B 不再回退到轮询。可选地通过独立 `gemma4-assistant` 草稿 GGUF 做 MTP 投机解码。 | `TS_GEMMA4_BATCHED=0` 强制按序列回退；`TS_RETAINED_FUSED_CACHE=0` 关闭 retained-holder 续接。服务端只需 `--draft-model` 即可启用投机（显式 `--no-spec` 可否决）；`TS_GMTP_*` 为草稿路径 A/B 开关。 |
 | Qwen 3.5 / 3.6 family | 默认批处理路径。支持 FullAttention 层、通过每槽位状态池处理 GatedDeltaNet 递归层、MoE 变体、视觉注入与多模态 RoPE 表。其 request-owned fused holder 会把 attention K/V 与匹配的 GDN 递归状态保存在一起；正常结束的 holder 可被保留并重新绑定，用于精确前缀续接。Qwen 3.6 还通过其内嵌 NextN 块支持 MTP 投机解码（GDN 递归状态快照 / 回滚）。 | `TS_QWEN35_BATCHED=0`；`TS_QWEN35_BATCHED_GDN_NATIVE=1` 启用原生批处理 GDN 内核；`TS_RETAINED_FUSED_CACHE=0` 关闭 retained-holder 续接；服务端 `--spec` 在 Qwen 3.6 上启用投机。 |
 | GPT OSS | 默认批处理路径。支持 Q/K/V/O bias、YaRN RoPE、滑窗层、attention sinks、MXFP4 MoE expert 与原生 sinks 注意力。已与旧路径做贪心正确性验证；性能仍主要受逐层图构建限制。 | `TS_GPTOSS_BATCHED=0`；`TS_GPTOSS_PAGED_ATTN_MANAGED=1`。 |
 | Nemotron-H | 默认批处理路径。Attention 层使用分页 K/V；Mamba2 层使用每槽位 conv/SSM 状态池；MoE 层使用批处理 expert 内核；准备好的图像 / 音频 embedding 可注入到批处理 hidden state。 | `TS_NEMOTRON_BATCHED=0`；`TS_NEMOTRON_MAMBA2_BATCHED_NATIVE=1` 启用原生批处理 Mamba2 step。 |
@@ -295,6 +295,7 @@ GatedDeltaNet 递归状态作为一个混合 holder 一起保留。未声明该�
 | `TS_BATCHED_N1_FAST_PATH` | `1` | solo 单序列步骤走融合 N=1 快速路径 decode；设为 `0` 可强制这些步骤走完全批处理路径（A/B 测试）。 |
 | `TS_PER_SEQ_FUSED` | `1` | fused 能力模型上的并发（N≥2）序列走 per-request 融合 Forward；设为 `0` 强制走逐算子批处理分页路径（A/B 测试）。 |
 | `TS_BATCHED_FUSED_DECODE` | `1` | `0` 在 per-seq fused 路径内关闭真正的 token 批量融合 decode（一张图同时 decode 全部 N 个序列）。 |
+| `TS_GEMMA4_BATCHED_CAPS` | 原生探测 | 覆盖 Gemma 4 token 批量内核报告的能力位（1 PLE、2 KV donor、4 SWA 回绕）；`0` 强制 v1 门控，PLE / 共享 KV / 已回绕 SWA 的模型（E2B/E4B）改为轮询 decode（A/B 测试）。 |
 | `TS_RETAINED_FUSED_CACHE` | `1` | 对声明支持的模型，保留已完成请求的 request-owned fused holder，用于精确前缀续接；`0` 关闭（限 VRAM / A/B）。支持的 holder 包括 Gemma 4 K/V，以及 Qwen 3.5/3.6 的 attention K/V 与 GDN 递归状态。 |
 | `TS_RETAINED_FUSED_CACHE_MAX` | `4` | 保留 fused holder 的 LRU 预算（每个 holder 都会占用模型完整的 per-request 续接状态）。 |
 | `TS_PREFIX_CHECKPOINTS` | `1` | 在共享提示前缀结束处（由 chat 层在请求上标记的边界）对模型完整状态做检查点，并让每个新会话从其副本开始（Gemma 4、Qwen 3.5/3.6）。`0` 关闭。 |

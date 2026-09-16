@@ -477,6 +477,36 @@ forward 内跨层复用的三类缓存：
 
 SWA 层用 `CopyToCacheCircular()` 在 `pos % cacheSize` 写入新 K/V 槽位，`AttentionDecodeCircular()` 走环形读。SWA 层因此无视上下文长度只分配 `slidingWindow` 个槽位 —— 常驻内存有界。
 
+### 并发请求的 token 批量融合 decode（`Gemma4ModelDecodeBatchedEx`）
+
+N >= 2 个请求同时在线时，引擎不再轮询 N 个单 token 图：`Gemma4Model.TryForwardBatchedFusedDecode` 在**一个**融合图（[`ggml_ops_gemma4_batched.cpp`](../../TensorSharp.GGML.Native/ggml_ops_gemma4_batched.cpp) 中的 `TSGgml_Gemma4ModelDecodeBatchedEx`）里为每个序列各 decode 一个 token，每步每个权重只加载一次、作用于 N 个 token。decode 受带宽限制，聚合吞吐正来自这里。每个序列保留自己的 per-request KV holder；内核以 `[layer * N + seq]` 指针数组接收这些 holder，在 `[hidden, N]` 上跑 projection / FFN / LM head，并对每个序列在其自身 cache 窗口的直接视图上跑一次单行 flash-attention。
+
+v1 内核只覆盖无 per-layer embedding、无共享 KV 层、且每个序列都还在 SWA 环内的密集模型，所以 E2B/E4B（PLE 维 256、18 个 KV-donor 层、大多数对话都会超出的 512 槽环）总是拒绝，服务器记录 "The model declined the default batched fused-decode path ... concurrency stays near 1x"。`Ex` 入口补上这三处：
+
+- **逐行 PLE。** per-layer embedding 在图内从常驻的量化 `per_layer_token_embd` 表通过对 N 个 token id 的一次 `get_rows` 收集（再加 `per_layer_model_proj` projection、其 RMSNorm 与 `1/sqrt(2)` 合并，与单 token decode 和 `ComputePLE` 完全一致），按层以 `[ple_dim, N]` 的跨步列切片注入。图内形式不可用时（`CanGatherPleInKernel` 为 false：`get_rows` 不支持的类型或带缩放的 projection），调用方改为上传 `ComputePLE` 的行，PLE 项永远不会被丢掉。
+- **KV-donor 层。** `kv_source_arr[l]` 指明第 `l` 层要 attend 的 cache 所属层。共享层只跑 Q projection，读取 donor 的逐序列窗口与 mask，不写任何东西。
+- **SWA 回绕。** 序列超出环的 local 层写到 `pos % cache_size`，并把整个环平铺读取、所有槽位有效；decode 的 softmax 对 key 的排列不变，因此旋转不需要 concat。全局（线性）层仍必须容纳整个序列；轮询回退会扩容，下一步重新进入批量路径。
+
+原生侧通过 `TSGgml_Gemma4BatchedDecodeCapabilities()`（位：PLE、KV donor、SWA wrap）报告支持范围。托管侧对已加载原生库缺少的每一位保留 v1 限制，所以旧的 `libGgmlOps`（没有探测符号）行为与以前完全一致，`TSGgml_Gemma4ModelDecodeBatched` 作为薄包装保留 v1 ABI。`TS_GEMMA4_BATCHED_CAPS=0` 可强制 v1 门控做 A/B。
+
+CUDA-graph 捕获不变：每步的所有输入（hidden 行、position、每 (层, 序列) 的 `set_rows` 写行、每层 F16 mask、PLE token id 或上传的 PLE 行）都是用 `ggml_backend_tensor_set` 刷新的图输入，图位于自己的 context 与独占 buffer 中，重复出现的请求集合在稳定地址上重放捕获的图。MoE 批量内核（`TSGgml_Gemma4MoEModelDecodeBatched`）保持无 PLE / 无 donor 的范围。
+
+**已验证**（[`Gemma4BatchedFusedDecodeParityTests`](../../InferenceWeb.Tests/Gemma4BatchedFusedDecodeParityTests.cs)，`TS_TEST_GGML_BACKEND=cuda`，gemma-4-E4B-it-Q8_0）：2、3、4 个并发序列（其中一个 prefill 超过 512 token 的 SWA 环）下，批量路径 12 步的贪心续写与轮询单 token decode 逐 token 一致，且每一步都跑在批量内核上。
+
+**实测**（gemma-4-E4B-it-Q8_0、NVIDIA A40、ggml_cuda、f16 KV、prefill 分块 512、4 个运行序列；轮询列用 `TS_GEMMA4_BATCHED_CAPS=0` 强制 v1 门控，其余完全相同）：
+
+| 负载 | 轮询（之前） | token 批量（之后） | 倍数 |
+|---|---:|---:|---:|
+| AgentTurnBench `conc`，1 个请求（decode tok/s） | 68.8 | 68.5 | 1.0× |
+| AgentTurnBench `conc`，2 路并发（总 decode tok/s） | 65.1 | 99.0 | 1.5× |
+| AgentTurnBench `conc`，4 路并发（总 decode tok/s） | 66.5 | 148.7 | 2.2× |
+| `validate_inference.py` `decode`（512 个新 token），并发 1（端到端 tok/s） | 76.8 | 77.7 | 1.0× |
+| `validate_inference.py` `decode`，并发 4（总端到端 tok/s） | 70.3 | 148.6 | 2.1× |
+| `validate_inference.py` `decode_8k`（8k prompt），并发 1 | 63.8 | 64.3 | 1.0× |
+| `validate_inference.py` `decode_8k`，并发 4 | 59.0 | 101.7 | 1.7× |
+
+`validate_inference.py` 各行比较的是本树构建的服务器与上一提交构建的服务器；两者单路（并发 1）输出逐字节一致。这里"逐 token 一致"的确切含义：AgentTurnBench `conc` 流（`compare.py` 要求输出 token id 完全相同）与 12 步的进程内 parity 测试与轮询 decode 完全一致；但在数百个贪心 token 之后，边际很小的 token 可能翻转（`ParityHarness --batched` 256 步：每组 2/3/4 路里各有一个序列分叉），而原有的 v1 内核在 gemma-4-12B（无 PLE、无共享 KV）上同样如此 —— 批处理改变 GEMM 形状从而改变舍入，这正是 GLM 批量 decode 已记录的注意事项。经 HTTP 服务器在并发 4 下，连两次轮询运行都会不同（16 个 case 中 10 个相同），因为 prefill/decode 的交错取决于调度，所以 parity 必须在进程内判断。
+
 ## 10. 内存与 KV cache 策略
 
 - **SWA 层**：容量 `_slidingWindow`，环形读写。

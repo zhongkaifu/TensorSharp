@@ -1769,7 +1769,7 @@ Quick reference for which environment variables (and matching CLI flags) gate ea
 | Model | Default state | Env var to flip default | Native-kernel sub-toggle |
 |---|---|---|---|
 | Mistral 3 | ON | — | `TS_PAGED_ATTN_KERNEL` = `native` (default) / `tensor` / `managed` |
-| Gemma 4 | ON | `TS_GEMMA4_BATCHED=0` to force legacy per-seq | — |
+| Gemma 4 | ON | `TS_GEMMA4_BATCHED=0` to force legacy per-seq | `TS_GEMMA4_BATCHED_CAPS=0` forces the v1 gates of the token-batched fused decode kernel (PLE / shared-KV / wrapped-SWA models such as E2B/E4B then decode round-robin) |
 | Qwen 3.5 / 3.6 family | ON | `TS_QWEN35_BATCHED=0` to force legacy per-seq (or `--no-continuous-batching`) | `TS_QWEN35_BATCHED_GDN_NATIVE=1` enables native batched GDN kernel; `FUSED_ATTN_LAYER_MIN_SEQ_LEN=N` overrides fused-attention engage threshold (default 4096) |
 | GPT OSS | ON | `TS_GPTOSS_BATCHED=0` to force legacy per-seq | `TS_GPTOSS_PAGED_ATTN_MANAGED=1` forces the managed (C#) sinks softmax instead of the native paged-attention-with-sinks kernel |
 | Nemotron-H | ON | `TS_NEMOTRON_BATCHED=0` to force legacy per-seq | `TS_NEMOTRON_MAMBA2_BATCHED_NATIVE=1` enables the native batched Mamba2 step (NEON SIMD + GCD parallelism) |

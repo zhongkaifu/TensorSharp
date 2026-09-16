@@ -3171,15 +3171,33 @@ namespace TensorSharp.Models
             return true;
         }
 
+        // Probed once per process: what the native token-batched decode kernel
+        // supports beyond its v1 scope. Set TS_GEMMA4_BATCHED_CAPS=0 to force the
+        // v1 gates (PLE / KV-donor / wrap models round-robin) for an A/B.
+        private static readonly Lazy<GgmlBasicOps.Gemma4BatchedDecodeCaps> s_batchedDecodeCaps = new(() =>
+        {
+            var env = Environment.GetEnvironmentVariable("TS_GEMMA4_BATCHED_CAPS");
+            if (env != null && int.TryParse(env, out int forced))
+                return (GgmlBasicOps.Gemma4BatchedDecodeCaps)forced;
+            return GgmlBasicOps.Gemma4BatchedDecodeCapabilities();
+        });
+        private static GgmlBasicOps.Gemma4BatchedDecodeCaps BatchedDecodeCaps => s_batchedDecodeCaps.Value;
+
         /// <summary>
         /// TRUE token-batched dense decode: decode one token for each of N
         /// concurrent sequences in ONE fused graph (one compute buffer, weights
-        /// loaded once) via <see cref="GgmlBasicOps.Gemma4ModelDecodeBatched"/>.
+        /// loaded once) via <see cref="GgmlBasicOps.Gemma4ModelDecodeBatched"/>
+        /// (or its <c>Ex</c> form when the native build supports PLE / KV-donor /
+        /// SWA wrap, which the E2B/E4B family needs).
         /// Each sequence decodes through its own per-request KV holder. Returns
-        /// false (caller falls back to the round-robin per-seq path) when any v1
-        /// precondition fails: dense fused-decode eligible, no PLE, no KV-donor,
-        /// folded quantized lm_head available, all holders present + uniform cache
-        /// sizes, and the no-wrap regime (every position+1 <= every cache size).
+        /// false (caller falls back to the round-robin per-seq path) when any
+        /// precondition fails: dense fused-decode eligible, folded quantized lm_head
+        /// available, all holders present + uniform cache sizes, every global
+        /// (linear) cache large enough for its sequence, and — for what the native
+        /// kernel reports it cannot do (<see cref="GgmlBasicOps.Gemma4BatchedDecodeCapabilities"/>,
+        /// e.g. an older native build) — no PLE, no KV-donor layers, no SWA wrap.
+        /// The E2B/E4B family needs all three: PLE dim 256, 18 shared-KV layers, and
+        /// a 512-slot SWA ring that most chats outgrow.
         /// On success writes each sequence's logits into <paramref name="outLogits"/>
         /// and advances its holder length.
         /// </summary>
@@ -3189,7 +3207,12 @@ namespace TensorSharp.Models
             // ---- gates (any failure => round-robin fallback) ----
             if (!IsGgmlBackend) return false;
             if (_decodeArrays == null || _fusedHolders == null) return false;
-            if (_pleDim != 0 || _kvDonorMap.Count != 0) return false;
+            var batchedCaps = BatchedDecodeCaps;
+            bool batchedPle = _pleDim != 0;
+            bool batchedKvDonor = _kvDonorMap.Count != 0;
+            if (batchedPle && (batchedCaps & GgmlBasicOps.Gemma4BatchedDecodeCaps.Ple) == 0) return false;
+            if (batchedKvDonor && (batchedCaps & GgmlBasicOps.Gemma4BatchedDecodeCaps.KvDonor) == 0) return false;
+            bool batchedSwaWrap = (batchedCaps & GgmlBasicOps.Gemma4BatchedDecodeCaps.SwaWrap) != 0;
 
             // MoE vs dense: an all-MoE model (e.g. 26B-A4B) routes through the MoE
             // batched kernel; otherwise the dense one. Prime the lazy MoE flag.
@@ -3249,24 +3272,26 @@ namespace TensorSharp.Models
                 if (!_fusedHolders.TryGetValue(requestIds[s], out holders[s]) || holders[s].K == null)
                     return false;
 
-            // Uniform cache sizes + no-wrap gate. Use holders[0].Sizes as the
-            // per-layer cache size passed to the kernel.
+            // Uniform cache sizes + capacity gate. Use holders[0].Sizes as the
+            // per-layer cache size passed to the kernel. A global (linear) cache
+            // must hold the whole sequence (the round-robin fallback grows it, and
+            // the next step re-enters here); a local SWA ring may wrap when the
+            // kernel supports it (write pos % size, read the ring flat).
             var cacheSize = holders[0].Sizes;
+            var a = _decodeArrays;
             for (int s = 0; s < N; s++)
             {
                 var hz = holders[s].Sizes;
                 for (int l = 0; l < numLayers; l++)
                 {
                     if (hz[l] != cacheSize[l]) return false;
-                    if (positions[s] + 1 > cacheSize[l]) return false;
+                    if (positions[s] + 1 > cacheSize[l] && !(batchedSwaWrap && a.IsLocal[l] != 0)) return false;
                 }
             }
 
             // Check in any holder still bound to the active fields so its SeqLen is
             // current and the active cache won't alias a holder we read directly.
             RestorePrimaryCache();
-
-            var a = _decodeArrays;
 
             // Canonicalise the sequence order by RequestId so the native persist
             // pool key (the SET of per-request KV caches) is STABLE across steps
@@ -3308,6 +3333,50 @@ namespace TensorSharp.Models
             float[] logitsBuf = new float[(long)vocab * N];
             IntPtr finalNormPtr = (IntPtr)GetFloatPtr(finalNormT);
 
+            // PLE for the N rows (dense only; the MoE kernel keeps its no-PLE gate).
+            // Preferred: the in-kernel gather (per-row token ids + the resident
+            // quantized table, the same graph the single-token decode runs). When
+            // that form is unavailable (CanGatherPleInKernel: unsupported get_rows
+            // type, scaled projection, F32 table) upload C#'s ComputePLE rows
+            // instead, so the batched path never silently drops the PLE term.
+            Tensor pleRows = null;
+            IntPtr pleDataPtr = IntPtr.Zero;
+            IntPtr pleTableData = IntPtr.Zero; int pleTableType = 0;
+            long pleTableNe0 = 0, pleTableNe1 = 0, pleTableBytes = 0;
+            int[] pleIds = null;
+            IntPtr pleProjWData = IntPtr.Zero; int pleProjWType = 0;
+            long pleProjWNe0 = 0, pleProjWNe1 = 0, pleProjWBytes = 0;
+            IntPtr pleProjNormData = IntPtr.Zero;
+            if (batchedPle && !isMoE)
+            {
+                if (CanGatherPleInKernel()
+                    && _quantWeights.TryGetValue("per_layer_token_embd.weight", out var pleQw))
+                {
+                    pleTableData = pleQw.CacheKey;
+                    pleTableType = (int)pleQw.GgmlType;
+                    pleTableNe0 = pleQw.Ne0;
+                    pleTableNe1 = pleQw.Ne1;
+                    pleTableBytes = pleQw.RawBytes;
+                    pleIds = tokSorted;
+                    if (_quantWeights.TryGetValue("per_layer_model_proj.weight", out var projQw)
+                        && _weights.TryGetValue("per_layer_proj_norm.weight", out var projNormW))
+                    {
+                        pleProjWData = projQw.CacheKey;
+                        pleProjWType = (int)projQw.GgmlType;
+                        pleProjWNe0 = projQw.Ne0;
+                        pleProjWNe1 = projQw.Ne1;
+                        pleProjWBytes = projQw.RawBytes;
+                        pleProjNormData = (IntPtr)GetFloatPtr(projNormW);
+                    }
+                }
+                else
+                {
+                    pleRows = ComputePLE(tokSorted, hidden, N);   // [N, numLayers*pleDim]
+                    if (pleRows == null) return false;
+                    pleDataPtr = (IntPtr)GetFloatPtr(pleRows);
+                }
+            }
+
             // MoE: build/refresh the per-layer descriptor array (weights; the
             // desc's hidden/k_cache/position fields are ignored by the batched
             // kernel, which uses the explicit hidden + per-seq KV + positions).
@@ -3331,8 +3400,55 @@ namespace TensorSharp.Models
                         lmqw.CacheKey, lmqw.GgmlType, lmqw.Ne0, lmqw.Ne1, lmqw.RawBytes,
                         finalNormPtr, _finalLogitSoftcap);
                 }
+                else if (batchedCaps != GgmlBasicOps.Gemma4BatchedDecodeCaps.None)
+                {
+                    // Native build with the extended kernel: KV-donor map + PLE +
+                    // SWA wrap are all handled in-graph. (A forced TS_GEMMA4_BATCHED_CAPS
+                    // against a native build without the entry declines instead of
+                    // throwing, exactly like a probe that reported None.)
+                    try
+                    {
+                    ok = GgmlBasicOps.Gemma4ModelDecodeBatchedEx(
+                        (IntPtr)hiddenPtr, Config.HiddenSize, numLayers, N,
+                        a.AttnNorm, a.Qkv, a.QNorm, a.KNorm,
+                        a.O, a.PostAttnNorm,
+                        a.FfnNorm, a.Gu, a.Down, a.PostFfnNorm,
+                        kCache, vCache,
+                        a.HeadDim, a.KvHeads, cacheSize, a.IsLocal,
+                        a.RopeBase, a.LayerScalar,
+                        a.QkvType, a.QkvNe0, a.QkvNe1, a.QkvBytes,
+                        a.OType, a.ONe0, a.ONe1, a.OBytes,
+                        a.GuType, a.GuNe0, a.GuNe1, a.GuBytes,
+                        a.DownType, a.DownNe0, a.DownNe1, a.DownBytes,
+                        Config.NumHeads, posSorted,
+                        Config.Eps, _slidingWindow,
+                        freqFactorsPtr, freqFactorsLen,
+                        a.RopeNDims,
+                        _kvCacheDtype.GgmlType(),
+                        a.K, a.KType, a.KNe0, a.KNe1, a.KBytes,
+                        a.V, a.VType, a.VNe0, a.VNe1, a.VBytes,
+                        (IntPtr)lp, vocab,
+                        lmqw.CacheKey, lmqw.GgmlType, lmqw.Ne0, lmqw.Ne1, lmqw.RawBytes,
+                        finalNormPtr, _finalLogitSoftcap,
+                        a.KvSource,
+                        pleDataPtr, batchedPle ? _pleDim : 0,
+                        a.PleGate, a.PleGateType, a.PleGateNe0, a.PleGateNe1, a.PleGateBytes,
+                        a.PleProj, a.PleProjType, a.PleProjNe0, a.PleProjNe1, a.PleProjBytes,
+                        a.PlePostNorm,
+                        pleTableData, pleTableType, pleTableNe0, pleTableNe1, pleTableBytes,
+                        pleIds,
+                        pleProjWData, pleProjWType, pleProjWNe0, pleProjWNe1, pleProjWBytes,
+                        pleProjNormData);
+                    }
+                    catch (EntryPointNotFoundException)
+                    {
+                        ok = false;
+                    }
+                }
                 else
                 {
+                    // v1 native ABI (no PLE / KV-donor / wrap; the gates above
+                    // already guaranteed none of them is needed).
                     ok = GgmlBasicOps.Gemma4ModelDecodeBatched(
                         (IntPtr)hiddenPtr, Config.HiddenSize, numLayers, N,
                         a.AttnNorm, a.Qkv, a.QNorm, a.KNorm,
@@ -3357,6 +3473,7 @@ namespace TensorSharp.Models
                         finalNormPtr, _finalLogitSoftcap);
                 }
             }
+            pleRows?.Dispose();
 
             if (!ok) return false;
 
