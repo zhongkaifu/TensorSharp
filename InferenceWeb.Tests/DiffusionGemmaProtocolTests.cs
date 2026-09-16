@@ -8,6 +8,7 @@
 // TensorSharp is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 
+using TensorSharp.AgentHost.Skills;
 using TensorSharp.Chat;
 using TensorSharp.Runtime;
 
@@ -34,6 +35,21 @@ public class DiffusionGemmaProtocolTests
         // The GGUF template keeps rendering the prompt.
         Assert.Null(protocol.Render);
         Assert.Null(protocol.PreferOwnRenderer);
+    }
+
+    [Fact]
+    public void RegisteringTheParser_DoesNotMakeTheFamilyToolCapable()
+    {
+        // Before this entry existed the passthrough parser kept ToolsRendered false,
+        // so --code-exec and skills discovery never offered a diffusion request the
+        // shell / skills_read tools (the denoising pipeline renders with tools: null
+        // and refuses client tools). Gemma4OutputParser CAN read a call back, so the
+        // protocol has to say explicitly that declarations never reach the prompt,
+        // or every adapter starts leasing a workspace and running the skills loop
+        // over a model that was never told about the tools.
+        Assert.False(ChatProtocolRegistry.For("diffusion-gemma")!.RendersToolDeclarations);
+        Assert.False(SkillCapabilities.For("diffusion-gemma").ToolsRendered);
+        Assert.False(SkillCapabilities.For("diffusion_gemma").ToolsRendered);
     }
 
     [Fact]

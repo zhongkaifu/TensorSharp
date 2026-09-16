@@ -220,6 +220,10 @@ Tool calling is refused up front: `/v1/chat/completions` answers HTTP 400
 (`{"error": ...}`, `invalid_request_error`) to any request that carries `tools`
 or a `tool_choice` other than `"none"` while a DiffusionGemma model is loaded,
 because a block-diffusion turn has no tool loop to feed a result back into.
+`/v1/responses` and Ollama's `/api/chat` refuse `tools` the same way. The
+built-in skills / code-execution tools are never offered to this family either
+(the protocol entry declares `RendersToolDeclarations = false`), so `--code-exec`
+and skills discovery leave a diffusion request exactly as it was before.
 
 ## 7. Test coverage
 

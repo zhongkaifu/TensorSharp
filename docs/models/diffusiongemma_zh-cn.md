@@ -202,6 +202,9 @@ Ollama 与 OpenAI 兼容适配器仍通过 `ChatStreamWithMetricsAsync` 使用 a
 工具调用会被直接拒绝：加载 DiffusionGemma 模型时，`/v1/chat/completions` 对任何带
 `tools` 或 `tool_choice`（`"none"` 除外）的请求返回 HTTP 400（`{"error": ...}`，
 `invalid_request_error`），因为分块扩散的一轮没有可以回填结果的工具循环。
+`/v1/responses` 与 Ollama 的 `/api/chat` 以同样方式拒绝 `tools`。内置的 skills /
+代码执行工具也永远不会提供给该系列（协议条目声明 `RendersToolDeclarations = false`），
+因此 `--code-exec` 与 skills 发现不会改变扩散请求的任何行为。
 
 ## 7. 测试覆盖
 

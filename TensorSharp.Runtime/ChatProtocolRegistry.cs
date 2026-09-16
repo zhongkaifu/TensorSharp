@@ -241,6 +241,13 @@ namespace TensorSharp.Runtime
                 Architectures = new[] { "diffusion-gemma", "diffusion_gemma" },
                 CreateOutputParser = () => new Gemma4OutputParser(),
                 OutputParserAlwaysRequired = true,
+                // The denoising pipeline renders every prompt with tools: null, so a
+                // declaration never reaches the model. Gemma4OutputParser CAN read a
+                // call back, and without this flag registering it flipped
+                // SkillCapabilities.ToolsRendered to true: --code-exec and skills
+                // discovery began offering the shell / skills_read tools, leasing a
+                // workspace and running the skills loop for every diffusion request.
+                RendersToolDeclarations = false,
             });
 
             // ---- Others -----------------------------------------------------

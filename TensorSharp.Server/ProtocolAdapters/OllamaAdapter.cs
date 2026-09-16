@@ -325,6 +325,19 @@ public sealed class OllamaAdapter
         }
         var ollamaTools = ToolFunctionParser.ParseOllama(body);
         bool ollamaThink = body.TryGetProperty("think", out var thinkProp) && thinkProp.GetBoolean();
+        // Same contract as /v1/chat/completions: a block-diffusion model has no
+        // tool-call loop, so tools are refused up front rather than answered with prose.
+        if (_svc.IsDiffusionModel && ollamaTools is { Count: > 0 })
+        {
+            ollamaLogger.LogWarning(LogEventIds.HttpRequestRejected,
+                "/api/chat/ollama rejected: tools on a diffusion model");
+            ctx.Response.StatusCode = 400;
+            await ctx.Response.WriteAsJsonAsync(new
+            {
+                error = "The loaded model generates by block diffusion and has no tool-call channel; remove tools from the request.",
+            }).ConfigureAwait(false);
+            return;
+        }
         if (!ReasoningEffortParser.TryParse(body, out string? reasoningEffort, out string? reasoningEffortError))
         {
             ctx.Response.StatusCode = 400;
