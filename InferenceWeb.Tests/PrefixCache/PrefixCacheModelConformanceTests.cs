@@ -34,6 +34,11 @@ public sealed class PrefixCacheModelConformanceTests
     // diffusiongemma-test-gate-was-skipping: a gate and a loader that disagree pass vacuously).
     private const string Gemma4E4B = "gemma-4-e4b-it-q8_0";
     internal const string Qwen35_9B = "qwen3.5-9b-q8_0";
+    // A40: the whole Qwen 3.8 Flash Next GGUF directory, loaded as a layer split over the GPUs in
+    // CUDA_VISIBLE_DEVICES with TENSORSHARP_TP_DEGREE set to their count.
+    private const string EnvQwen38Dir = "TS_TEST_QWEN38_DIR";
+    // The first shard of a split GGUF (the loader follows the rest).
+    private const string Qwen38FlashNext = "qwen3.8-flash-next-ud-q2_k_xl-00001";
 
     private readonly ITestOutputHelper _output;
 
@@ -100,11 +105,29 @@ public sealed class PrefixCacheModelConformanceTests
         Assert.Contains(report.Ran, r => r.StartsWith("export/import", StringComparison.Ordinal));
     }
 
+    [ModelFact(EnvQwen38Dir, Qwen38FlashNext)]
+    public void Qwen38_FlashNext_PassesTheConformanceScript()
+    {
+        using var model = (Qwen4ExpModel)LoadFrom(EnvQwen38Dir, Qwen38FlashNext);
+        model.AttachPrefixCache(new RecordingPayloadSink());
+        ConformanceReport report = PrefixCacheConformanceScript.Run(TextSubject(model, "qwen38-flash-next"));
+
+        Assert.Contains("capture", report.Ran);
+        Assert.Contains("clone x2", report.Ran);
+        Assert.Contains("donate/return/donate", report.Ran);
+        Assert.Contains("settle then clone", report.Ran);
+        Assert.Contains("truncate refused (Truncation=None)", report.Ran);
+        Assert.Contains("primary conversion", report.Ran);
+        Assert.Contains(report.Ran, r => r.StartsWith("batched release", StringComparison.Ordinal));
+    }
+
     // ------------------------------------------------------------------ helpers
 
-    internal ModelBase Load(string pattern)
+    internal ModelBase Load(string pattern) => LoadFrom(EnvModelDir, pattern);
+
+    private ModelBase LoadFrom(string envVar, string pattern)
     {
-        string dir = Environment.GetEnvironmentVariable(EnvModelDir);
+        string dir = Environment.GetEnvironmentVariable(envVar);
         string path = TestGates.FindGguf(dir, pattern);
         Assert.True(path != null, $"the gate admitted '{pattern}' but no GGUF under {dir} matches it");
         _output.WriteLine($"loading {path} on {TestGates.PinnedGgmlBackend}");

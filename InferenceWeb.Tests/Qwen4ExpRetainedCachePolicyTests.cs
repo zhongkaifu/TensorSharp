@@ -7,6 +7,7 @@ using TensorSharp;
 using TensorSharp.Cpu;
 using TensorSharp.Models;
 using TensorSharp.Runtime.Scheduling;
+using TensorSharp.Runtime.Scheduling.PrefixCache;
 
 namespace InferenceWeb.Tests;
 
@@ -119,6 +120,101 @@ public sealed class Qwen4ExpRetainedCachePolicyTests
         Fixture.AssertDisposed(ckpt, false);
         Assert.True(fixture.Retained.Contains("ckpt"));
         Assert.Equal(1, fixture.Retained.Count);
+    }
+
+    // ---- radix prefix cache M2: refuse-and-report once the prefix cache owns retention ----
+
+    [Fact]
+    public void TreeOwned_RefusesInsteadOfEvicting_AndLeavesEveryRetainedHolderIntact()
+    {
+        using var fixture = new Fixture(budgetBytes: 1000, spareBytes: long.MaxValue);
+        object older = fixture.Retain("older", bytes: 400, serial: 1);
+        object newer = fixture.Retain("newer", bytes: 500, serial: 2);
+        fixture.Model.AttachPrefixCache(new RecordingSink());
+
+        // 900 retained: legacy would evict "older" to fit 150 more; the tree-owned model refuses.
+        Assert.False(fixture.EnsureBudget(150));
+        Fixture.AssertDisposed(older, false);
+        Fixture.AssertDisposed(newer, false);
+        Assert.Equal(2, fixture.Retained.Count);
+        Assert.True(fixture.EnsureBudget(100));
+    }
+
+    [Fact]
+    public void TreeOwned_TrimReportsEveryHolderItFreesThroughTheSink()
+    {
+        using var fixture = new Fixture(budgetBytes: long.MaxValue / 4, spareBytes: null);
+        object a = fixture.Retain("pc:1:1", bytes: 10, serial: 1);
+        fixture.Retain("pc:1:2", bytes: 10, serial: 2, isCheckpoint: true);
+        object b = fixture.Retain("pc:1:3", bytes: 10, serial: 3);
+        var sink = new RecordingSink();
+        fixture.Model.AttachPrefixCache(sink);
+        fixture.Model.TrimIdleMemory();
+        Fixture.AssertDisposed(a, true);
+        Fixture.AssertDisposed(b, true);
+        Assert.Equal(new[] { ("pc:1:1", InvalidationReason.TrimmedByModel), ("pc:1:3", InvalidationReason.TrimmedByModel) },
+            sink.Reports.OrderBy(r => r.Key).ToArray());
+        Assert.True(fixture.Retained.Contains("pc:1:2"));
+    }
+
+    [Fact]
+    public void Legacy_TrimReportsNothing()
+    {
+        using var fixture = new Fixture(budgetBytes: long.MaxValue / 4, spareBytes: null);
+        fixture.Retain("a", bytes: 10, serial: 1);
+        fixture.Model.TrimIdleMemory();
+        Assert.Equal(0, fixture.Retained.Count);   // nothing attached, nothing to report to
+    }
+
+    [Fact]
+    public void TreeOwned_ACheckpointMayBeDonated_LegacyNever()
+    {
+        using var fixture = new Fixture(budgetBytes: long.MaxValue / 4, spareBytes: null);
+        fixture.Retain("pc:1:1", bytes: 10, serial: 1, isCheckpoint: true);
+        Assert.False(fixture.Model.TryRebindRetainedCache("pc:1:1", "request"));
+        fixture.Model.AttachPrefixCache(new RecordingSink());
+        Assert.True(fixture.Model.TryRebindRetainedCache("pc:1:1", "request"));
+        Assert.True(fixture.Model.HasFusedSequenceCache("request"));
+    }
+
+    [Fact]
+    public void DiscardRetainedCaches_ReleasesTheBatchAndIgnoresUnknownKeys()
+    {
+        using var fixture = new Fixture(budgetBytes: long.MaxValue / 4, spareBytes: null);
+        object a = fixture.Retain("pc:1:1", bytes: 10, serial: 1);
+        object b = fixture.Retain("pc:1:2", bytes: 10, serial: 2, isCheckpoint: true);
+        object c = fixture.Retain("pc:1:3", bytes: 10, serial: 3);
+        fixture.Model.DiscardRetainedCaches(new[] { "pc:1:1", "missing", "pc:1:2" }, ReleaseReason.Evicted);
+        Fixture.AssertDisposed(a, true);
+        Fixture.AssertDisposed(b, true);
+        Fixture.AssertDisposed(c, false);
+        Assert.Equal(new[] { "pc:1:3" }, fixture.Model.RetainedPayloadKeys);
+        fixture.Model.DiscardRetainedCaches(new[] { "pc:1:1" }, ReleaseReason.Evicted);
+        Assert.Equal(1, fixture.Retained.Count);
+    }
+
+    [Fact]
+    public void Capabilities_AreLegacyExactLengthAndCarryTheRetentionBudgetAsTheDeviceSubCap()
+    {
+        using var fixture = new Fixture(budgetBytes: 4096L * 1024 * 1024, spareBytes: null);
+        Set(typeof(ModelBase), fixture.Model, "<Config>k__BackingField", new ModelConfig { NumLayers = 2, NumKVHeads = 1, HiddenSize = 8, NumHeads = 1, Architecture = "qwen4exp" });
+        PrefixCacheCapabilities caps = fixture.Model.GetPrefixCacheCapabilities();
+        Assert.Equal(PrefixCacheMode.Legacy, caps.Readiness);
+        Assert.Equal(FamilyClass.R, caps.Class);
+        Assert.Equal(TruncationKind.None, caps.Truncation);
+        Assert.False(caps.ReuseAcrossMediaSpan);
+        Assert.False(caps.Persistable);
+        Assert.Equal(4096L * 1024 * 1024, caps.SubCapBytes.DeviceKv);
+        Assert.False(string.IsNullOrEmpty(caps.NamespaceFingerprint));
+    }
+
+    private static void Set(Type type, object target, string name, object value)
+        => type.GetField(name, BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public)!.SetValue(target, value);
+
+    private sealed class RecordingSink : IPrefixPayloadSink
+    {
+        public List<(string Key, InvalidationReason Reason)> Reports { get; } = new();
+        public void OnPayloadInvalidated(string payloadKey, InvalidationReason reason) => Reports.Add((payloadKey, reason));
     }
 
     private sealed class MemoryTestModel : Qwen4ExpModel

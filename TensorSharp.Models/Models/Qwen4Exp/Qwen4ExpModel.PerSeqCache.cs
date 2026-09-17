@@ -72,6 +72,10 @@ namespace TensorSharp.Models
             public bool IsCheckpoint;
             public bool Retired;
             public bool Disposed;
+            // The holder has been an active cache on a GPU backend, so its caches have
+            // device copies besides the host seeds (the prefix cache's MeasureEndState
+            // charges both). Copies start without.
+            public bool DeviceMirrored;
             public long RetainedBytes;
             public long RetainedSerial;
             // Pinned descriptor arrays. Their addresses are the native graph
@@ -149,6 +153,7 @@ namespace TensorSharp.Models
             GdnArgs = _gdnArgs,
             PleArgs = _pleArgs,
             SlotBase = _seqSlotBase,
+            DeviceMirrored = KeepsDeviceKvMirrors,
         };
 
         private void LoadCacheHolder(Qwen4ExpKvCacheHolder h)
@@ -378,8 +383,13 @@ namespace TensorSharp.Models
             // Free the native device-state entries FIRST (that also drops every
             // cached graph, so nothing baked can reference the buffers below);
             // then the tensors.
-            if (IsGgmlBackend)
+            // A batched release (DiscardRetainedCaches) frees every holder's native entries in one
+            // call, before the first disposal, and suppresses the per-holder release here.
+            if (IsGgmlBackend && _holderSeqStateReleaseSuppressed == 0)
+            {
                 GgmlBasicOps.Qwen4ExpReleaseSeqState(HolderStateKeys(holder));
+                CountDecodeGraphReset();
+            }
 
             void DisposeSet(Tensor[] set)
             {

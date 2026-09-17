@@ -26,6 +26,7 @@ using System.Runtime.InteropServices;
 using TensorSharp.Core;
 using TensorSharp.GGML;
 using TensorSharp.Runtime.Scheduling;
+using TensorSharp.Runtime.Scheduling.PrefixCache;
 
 namespace TensorSharp.Models
 {
@@ -129,13 +130,18 @@ namespace TensorSharp.Models
         /// usual) for a failed conversation, an empty one, a repeated key, or when
         /// the retention budget cannot take it even after evicting older
         /// conversations.</summary>
-        public bool RetainSequenceCache(string requestId)
+        public bool RetainSequenceCache(string requestId) => RetainSequenceCacheAs(requestId, requestId);
+
+        /// <summary>The key-parameterised form of <see cref="RetainSequenceCache"/>: the finished
+        /// holder of <paramref name="requestId"/> is retained under <paramref name="key"/>
+        /// (the prefix cache's tree-minted payload key, or the request id itself).</summary>
+        public bool RetainSequenceCacheAs(string requestId, string key)
         {
-            if (!SupportsRetainedFusedCache || _fusedHolders == null || string.IsNullOrEmpty(requestId))
+            if (!SupportsRetainedFusedCache || _fusedHolders == null || string.IsNullOrEmpty(requestId) || string.IsNullOrEmpty(key))
                 return false;
             if (!_fusedHolders.TryGetValue(requestId, out var holder))
                 return false;
-            if (_retainedFusedHolders != null && _retainedFusedHolders.ContainsKey(requestId))
+            if (_retainedFusedHolders != null && _retainedFusedHolders.ContainsKey(key))
                 return false;
             bool active = string.Equals(_activeFusedKey, requestId, StringComparison.Ordinal);
             // The dictionary entry is stale for the active holder: growth or a
@@ -161,7 +167,7 @@ namespace TensorSharp.Models
             }
             holder.RetainedBytes = bytes;
             holder.RetainedSerial = ++_retainedSerial;
-            _retainedFusedHolders.Add(requestId, holder);
+            _retainedFusedHolders.Add(key, holder);
             _fusedHolders.Remove(requestId);
             return true;
         }
@@ -177,7 +183,10 @@ namespace TensorSharp.Models
                 return false;
             if (!_retainedFusedHolders.TryGetValue(retainedRequestId, out var holder))
                 return false;
-            if (holder.Retired || holder.IsCheckpoint || holder.SpecStateFailed)
+            // A checkpoint serves every new chat and is cloned, never moved, while this model
+            // keeps its own retention. Once the prefix cache owns it, the tree decides what may
+            // be donated (a scoped capture, never a public one).
+            if (holder.Retired || (holder.IsCheckpoint && _prefixCacheSink == null) || holder.SpecStateFailed)
                 return false;
             _fusedHolders ??= new Dictionary<string, Qwen4ExpKvCacheHolder>(StringComparer.Ordinal);
             if (_fusedHolders.ContainsKey(newRequestId) || string.Equals(_activeFusedKey, newRequestId, StringComparison.Ordinal))
@@ -306,6 +315,22 @@ namespace TensorSharp.Models
         private bool EnsureRetentionBudget(long bytes, string what)
         {
             long? spare = GetCacheMemorySpareBytes();
+            if (_prefixCacheSink != null)
+            {
+                // Refuse-and-report (DEC-23): the prefix cache owns eviction, so a holder that does
+                // not fit beside what is retained is refused; nothing retained is evicted to fit it.
+                if (CanRetainWithinBudget(bytes, RetainedBytesTotal(), _retainedCacheBudgetBytes, spare))
+                    return true;
+                if (!_retainedBudgetWarned)
+                {
+                    _retainedBudgetWarned = true;
+                    Console.Error.WriteLine(
+                        $"[q4e retained] refused {what}: {bytes / 1048576.0:F1} MB does not fit the retention budget " +
+                        $"(TS_Q4E_RETAINED_CACHE_MB={_retainedCacheBudgetBytes / 1048576} MB, retained {RetainedBytesTotal() / 1048576.0:F1} MB" +
+                        (spare.HasValue ? $", headroom {spare.Value / 1048576.0:F0} MB" : "") + ") and the prefix cache owns eviction. Reported once.");
+                }
+                return false;
+            }
             // Evict nothing for a holder that could not fit beside the checkpoints
             // even with every conversation gone (a zero budget, a holder larger
             // than the budget): a decline must not cost the conversations kept.
@@ -411,6 +436,9 @@ namespace TensorSharp.Models
                 foreach (var kv in _retainedFusedHolders)
                     if (!kv.Value.IsCheckpoint) victims.Add(kv.Key);
                 foreach (string key in victims) DiscardRetainedCache(key);
+                // The prefix cache learns of every holder freed behind its back (DEC-23).
+                if (_prefixCacheSink != null)
+                    foreach (string key in victims) _prefixCacheSink.OnPayloadInvalidated(key, InvalidationReason.TrimmedByModel);
                 if (victims.Count > 0)
                     Console.WriteLine($"[memory] Qwen4Exp: freed {victims.Count} retained conversation holder(s)");
             }
