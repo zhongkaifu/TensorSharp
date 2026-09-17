@@ -2156,6 +2156,18 @@ namespace TensorSharp.Runtime
         private readonly StringBuilder _buffer = new();
         private bool _thinkingEnabled;
         private int _callIndex;
+        private readonly bool _promptAlwaysOpensThinking;
+        private bool _sawThinkClose;
+
+        /// <param name="promptAlwaysOpensThinking">The family's generation prompt opens
+        /// <c>&lt;think&gt;</c> whatever the request asked for (GLM-5.3-Flash's published
+        /// template has no thinking-off shape), so the reply starts INSIDE the reasoning
+        /// block even under <c>think:false</c>. Parsing it as content would hand the
+        /// client the chain of thought and a literal <c>&lt;/think&gt;</c>.</param>
+        public GlmDsaOutputParser(bool promptAlwaysOpensThinking = false)
+        {
+            _promptAlwaysOpensThinking = promptAlwaysOpensThinking;
+        }
 
         public bool HasThinkingSupport => true;
         public bool HasToolSupport => true;
@@ -2166,8 +2178,12 @@ namespace TensorSharp.Runtime
             _buffer.Clear();
             _thinkingEnabled = enableThinking;
             _callIndex = 0;
-            _state = enableThinking ? State.Thinking : State.Content;
+            _sawThinkClose = false;
+            _state = enableThinking || _promptAlwaysOpensThinking ? State.Thinking : State.Content;
         }
+
+        private bool HoldsUnrequestedThinking
+            => !_thinkingEnabled && _promptAlwaysOpensThinking && !_sawThinkClose;
 
         public ParsedOutput Add(string text, bool done)
         {
@@ -2197,12 +2213,25 @@ namespace TensorSharp.Runtime
                             _buffer.Clear();
                             _buffer.Append(after);
                             _state = State.Content;
+                            _sawThinkClose = true;
                             keepParsing = after.Length > 0;
                         }
                         else if (done)
                         {
-                            thinkingSb.Append(buf);
+                            // A reply that never closed a reasoning block the REQUEST did
+                            // not ask for (e.g. a JSON grammar enforced from the first
+                            // token) is the answer itself, not reasoning.
+                            if (HoldsUnrequestedThinking)
+                                contentSb.Append(buf);
+                            else
+                                thinkingSb.Append(buf);
                             _buffer.Clear();
+                        }
+                        else if (HoldsUnrequestedThinking)
+                        {
+                            // Hold the unrequested block until it closes (or generation
+                            // ends): only then is it known to be reasoning rather than a
+                            // grammar-constrained answer that skipped the block.
                         }
                         else
                         {

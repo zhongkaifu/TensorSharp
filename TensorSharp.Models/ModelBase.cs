@@ -1012,7 +1012,8 @@ namespace TensorSharp.Models
             IReadOnlyList<string> vocabTokens,
             int eosId,
             IEnumerable<int>? extraEosIds = null,
-            int? declaredEotId = null)
+            int? declaredEotId = null,
+            int? declaredEomId = null)
         {
             var ids = new HashSet<int>();
             if (eosId >= 0 && eosId < vocabTokens.Count)
@@ -1025,6 +1026,11 @@ namespace TensorSharp.Models
             }
             if (declaredEotId is int eotId && eotId >= 0 && eotId < vocabTokens.Count)
                 ids.Add(eotId);
+            // llama.cpp also folds tokenizer.ggml.eom_token_id (end of message) into the
+            // EOG set. GLM-5.x declares <|observation|> there: the turn ends after a tool
+            // call, and without it the model writes the tool result itself.
+            if (declaredEomId is int eomId && eomId >= 0 && eomId < vocabTokens.Count)
+                ids.Add(eomId);
 
             for (int id = 0; id < vocabTokens.Count; id++)
             {
@@ -1135,8 +1141,11 @@ namespace TensorSharp.Models
             int? declaredEotId = gguf.Metadata.ContainsKey("tokenizer.ggml.eot_token_id")
                 ? (int)gguf.GetUint32("tokenizer.ggml.eot_token_id")
                 : null;
+            int? declaredEomId = gguf.Metadata.ContainsKey("tokenizer.ggml.eom_token_id")
+                ? (int)gguf.GetUint32("tokenizer.ggml.eom_token_id")
+                : null;
             var eosIds = new List<int>(ResolveEogTokenIds(
-                vocabTokens, eosId, extraEos, declaredEotId));
+                vocabTokens, eosId, extraEos, declaredEotId, declaredEomId));
 
             // llama.cpp folds the declared end-of-turn control into the EOG set
             // for EVERY tokenizer type (llama_vocab::impl::load inserts

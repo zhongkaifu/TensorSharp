@@ -190,4 +190,61 @@ public class GlmDsaTinyModelTests : IDisposable
         // tojson'd numbers come back as numbers, not the literal text.
         Assert.Equal(3L, call.Arguments["days"]);
     }
+
+    [Fact]
+    public void Glm5Next_OutputParser_ThinkFalse_KeepsTheAlwaysOpenReasoningOutOfContent()
+    {
+        // GLM-5.3-Flash's published template ends every generation prompt with an
+        // open <think>, so a think:false reply still starts inside the reasoning block.
+        var parser = OutputParserFactory.Create("glm5next");
+        parser.Init(enableThinking: false, tools: null);
+
+        var streamed = parser.Add("The user wants only the integer.\n\n17 + 25 = 42", done: false);
+        Assert.Equal(string.Empty, streamed.Content);
+        var rest = parser.Add("</think>42", done: true);
+        Assert.Equal("42", streamed.Content + rest.Content);
+        Assert.DoesNotContain("</think>", streamed.Content + rest.Content);
+        Assert.Contains("17 + 25 = 42", streamed.Thinking + rest.Thinking);
+    }
+
+    [Fact]
+    public void Glm5Next_OutputParser_ThinkFalse_UnclosedReplyIsTheAnswer()
+    {
+        // response_format under think:false constrains from the first token, so the
+        // reply never writes </think>: it is the answer, not reasoning.
+        var parser = OutputParserFactory.Create("glm5next");
+        parser.Init(enableThinking: false, tools: null);
+        var parsed = parser.Add("{\"name\": \"Mars\"}", done: true);
+        Assert.Equal("{\"name\": \"Mars\"}", parsed.Content);
+        Assert.True(string.IsNullOrEmpty(parsed.Thinking));
+    }
+
+    [Fact]
+    public void Glm5Next_OutputParser_ThinkTrue_Unchanged()
+    {
+        var parser = OutputParserFactory.Create("glm5next");
+        parser.Init(enableThinking: true, tools: null);
+        var a = parser.Add("reasoning", done: false);
+        var b = parser.Add("</think>answer", done: true);
+        Assert.Equal("reasoning", a.Thinking + b.Thinking);
+        Assert.Equal("answer", a.Content + b.Content);
+    }
+
+    [Fact]
+    public void GlmDsa_OutputParser_ThinkFalse_StillStartsInContent()
+    {
+        // glm-dsa (GLM-5.2 / 5.3) renders an immediately-closed <think></think> when
+        // thinking is off, so its reply is content from the first token.
+        var parser = OutputParserFactory.Create("glm-dsa");
+        parser.Init(enableThinking: false, tools: null);
+        var parsed = parser.Add("42", done: true);
+        Assert.Equal("42", parsed.Content);
+    }
+
+    [Fact]
+    public void Glm5Next_DeclaresAThinkingGrammarTrigger()
+    {
+        Assert.Equal("</think>", OutputParserFactory.GrammarActivationTrigger("glm5next", enableThinking: true));
+        Assert.Null(OutputParserFactory.GrammarActivationTrigger("glm5next", enableThinking: false));
+    }
 }

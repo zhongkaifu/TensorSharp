@@ -353,8 +353,13 @@ namespace TensorSharp.Runtime
                         foreach (var _ in msg.ImagePaths)
                             sb.Append("<|begin_of_image|><|image|><|end_of_image|>");
                 },
-                CreateOutputParser = () => new GlmDsaOutputParser(),
+                // The published template opens <think> unconditionally, so the reply
+                // is parsed as reasoning first even under think:false.
+                CreateOutputParser = () => new GlmDsaOutputParser(promptAlwaysOpensThinking: true),
                 OutputParserAlwaysRequired = true,
+                // response_format under think:true arms the grammar after the reasoning
+                // block closes, as for the other always-reasoning families.
+                ThinkingGrammarActivationTrigger = "</think>",
             });
 
             Register(new ChatProtocol
