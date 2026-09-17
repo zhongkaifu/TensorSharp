@@ -1,0 +1,368 @@
+ggml_cuda_init: found 2 CUDA devices (Total VRAM: 90996 MiB):
+  Device 0: NVIDIA A40, compute capability 8.6, VMM: yes, VRAM: 45498 MiB
+  Device 1: NVIDIA A40, compute capability 8.6, VMM: yes, VRAM: 45498 MiB
+backend CUDA0 repeats=10 experts=32 kv=4096
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+MUL_MAT    q5_K 2560->10240                   T=2 batched:exact  max_abs=0          channels:exact  max_abs=0          us_batched=52.0 us_channels=77.9
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+MUL_MAT    q6_K 2560->512                     T=2 batched:exact  max_abs=0          channels:exact  max_abs=0          us_batched=13.4 us_channels=14.8
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+MUL_MAT    q8_0 10240->320                    T=2 batched:exact  max_abs=0          channels:exact  max_abs=0          us_batched=20.3 us_channels=16.6
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+MUL_MAT    q4_K 2560->32768                   T=2 batched:exact  max_abs=0          channels:exact  max_abs=0          us_batched=93.9 us_channels=162.7
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+MUL_MAT    f32 2560->512                      T=2 batched:exact  max_abs=0          channels:exact  max_abs=0          us_batched=18.7 us_channels=20.9
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+MUL_MAT    f32 10240->4                       T=2 batched:exact  max_abs=0          channels:exact  max_abs=0          us_batched=16.7 us_channels=16.0
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+MUL_MAT    bf16 2560->512                     T=2 batched:DIFFER max_abs=0.00592    channels:exact  max_abs=0          us_batched=16.1 us_channels=21.4
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+MUL_MAT    f16 2560->640                      T=2 batched:DIFFER max_abs=0.00112    channels:exact  max_abs=0          us_batched=17.1 us_channels=16.2
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+MUL_MAT_ID iq2_xs 2560->640 E32 k10           T=2 batched:DIFFER max_abs=4.77e-07   rows:exact  max_abs=0          us_batched=34.8 us_rows=41.7
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+MUL_MAT_ID iq4_nl 640->2560 E32 k10 slots     T=2 batched:DIFFER max_abs=2.38e-07   rows:exact  max_abs=0          us_batched=46.1 us_rows=51.4
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+MUL_MAT_ID f16 2560->640 E32 k10              T=2 batched:exact  max_abs=0          rows:exact  max_abs=0          us_batched=124.0 us_rows=145.5
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+FLASH_ATTN hd256 h24/2 kv4096                 T=2 batched:DIFFER max_abs=2.53e-05   rows:exact  max_abs=0          us_batched=44.5 us_rows=69.2
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+GDN        S128 H48                           T=2 batched:exact  max_abs=0          state:exact  max_abs=0          us_batched=21.7 us_state=0.0
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+MUL_MAT    q5_K 2560->10240                   T=3 batched:exact  max_abs=0          channels:exact  max_abs=0          us_batched=50.0 us_channels=110.0
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+MUL_MAT    q6_K 2560->512                     T=3 batched:exact  max_abs=0          channels:exact  max_abs=0          us_batched=21.2 us_channels=16.3
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+MUL_MAT    q8_0 10240->320                    T=3 batched:exact  max_abs=0          channels:exact  max_abs=0          us_batched=16.6 us_channels=18.3
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+MUL_MAT    q4_K 2560->32768                   T=3 batched:exact  max_abs=0          channels:exact  max_abs=0          us_batched=96.0 us_channels=237.8
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+MUL_MAT    f32 2560->512                      T=3 batched:exact  max_abs=0          channels:exact  max_abs=0          us_batched=15.9 us_channels=19.4
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+MUL_MAT    f32 10240->4                       T=3 batched:exact  max_abs=0          channels:exact  max_abs=0          us_batched=13.5 us_channels=10.8
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+MUL_MAT    bf16 2560->512                     T=3 batched:DIFFER max_abs=0.00592    channels:exact  max_abs=0          us_batched=16.1 us_channels=17.7
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+MUL_MAT    f16 2560->640                      T=3 batched:DIFFER max_abs=0.00112    channels:exact  max_abs=0          us_batched=16.0 us_channels=22.7
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+MUL_MAT_ID iq2_xs 2560->640 E32 k10           T=3 batched:DIFFER max_abs=4.77e-07   rows:exact  max_abs=0          us_batched=41.8 us_rows=61.2
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+MUL_MAT_ID iq4_nl 640->2560 E32 k10 slots     T=3 batched:DIFFER max_abs=2.38e-07   rows:exact  max_abs=0          us_batched=60.7 us_rows=74.5
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+MUL_MAT_ID f16 2560->640 E32 k10              T=3 batched:exact  max_abs=0          rows:exact  max_abs=0          us_batched=146.6 us_rows=207.2
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+FLASH_ATTN hd256 h24/2 kv4096                 T=3 batched:DIFFER max_abs=2.66e-05   rows:exact  max_abs=0          us_batched=43.0 us_rows=94.6
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+GDN        S128 H48                           T=3 batched:exact  max_abs=0          state:exact  max_abs=0          us_batched=22.4 us_state=0.0
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+MUL_MAT    q5_K 2560->10240                   T=4 batched:exact  max_abs=0          channels:exact  max_abs=0          us_batched=47.0 us_channels=132.4
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+MUL_MAT    q6_K 2560->512                     T=4 batched:exact  max_abs=0          channels:exact  max_abs=0          us_batched=14.9 us_channels=21.9
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+MUL_MAT    q8_0 10240->320                    T=4 batched:exact  max_abs=0          channels:exact  max_abs=0          us_batched=17.1 us_channels=20.5
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+MUL_MAT    q4_K 2560->32768                   T=4 batched:exact  max_abs=0          channels:exact  max_abs=0          us_batched=106.2 us_channels=312.6
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+MUL_MAT    f32 2560->512                      T=4 batched:DIFFER max_abs=0.0026     channels:exact  max_abs=0          us_batched=19.2 us_channels=22.6
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+MUL_MAT    f32 10240->4                       T=4 batched:DIFFER max_abs=0.0015     channels:exact  max_abs=0          us_batched=14.5 us_channels=10.8
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+MUL_MAT    bf16 2560->512                     T=4 batched:DIFFER max_abs=0.00592    channels:exact  max_abs=0          us_batched=15.1 us_channels=18.3
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+MUL_MAT    f16 2560->640                      T=4 batched:DIFFER max_abs=0.00115    channels:exact  max_abs=0          us_batched=15.1 us_channels=20.0
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+MUL_MAT_ID iq2_xs 2560->640 E32 k10           T=4 batched:DIFFER max_abs=4.77e-07   rows:exact  max_abs=0          us_batched=50.7 us_rows=75.9
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+MUL_MAT_ID iq4_nl 640->2560 E32 k10 slots     T=4 batched:DIFFER max_abs=2.38e-07   rows:exact  max_abs=0          us_batched=72.8 us_rows=97.2
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+MUL_MAT_ID f16 2560->640 E32 k10              T=4 batched:exact  max_abs=0          rows:exact  max_abs=0          us_batched=163.2 us_rows=274.7
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+FLASH_ATTN hd256 h24/2 kv4096                 T=4 batched:DIFFER max_abs=2.88e-05   rows:exact  max_abs=0          us_batched=43.4 us_rows=121.7
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+GDN        S128 H48                           T=4 batched:exact  max_abs=0          state:exact  max_abs=0          us_batched=25.8 us_state=0.0
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+MUL_MAT    q5_K 2560->10240                   T=5 batched:DIFFER max_abs=5.96e-07   channels:exact  max_abs=0          us_batched=49.8 us_channels=162.3
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+MUL_MAT    q6_K 2560->512                     T=5 batched:DIFFER max_abs=4.77e-07   channels:exact  max_abs=0          us_batched=14.6 us_channels=17.3
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+MUL_MAT    q8_0 10240->320                    T=5 batched:DIFFER max_abs=9.54e-07   channels:exact  max_abs=0          us_batched=19.4 us_channels=23.2
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+MUL_MAT    q4_K 2560->32768                   T=5 batched:DIFFER max_abs=7.15e-07   channels:exact  max_abs=0          us_batched=111.5 us_channels=387.7
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+MUL_MAT    f32 2560->512                      T=5 batched:DIFFER max_abs=0.0026     channels:exact  max_abs=0          us_batched=21.3 us_channels=26.6
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+MUL_MAT    f32 10240->4                       T=5 batched:DIFFER max_abs=0.0015     channels:exact  max_abs=0          us_batched=18.4 us_channels=14.0
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+MUL_MAT    bf16 2560->512                     T=5 batched:DIFFER max_abs=0.00592    channels:exact  max_abs=0          us_batched=15.6 us_channels=21.1
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+MUL_MAT    f16 2560->640                      T=5 batched:DIFFER max_abs=0.00115    channels:exact  max_abs=0          us_batched=15.2 us_channels=22.2
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+MUL_MAT_ID iq2_xs 2560->640 E32 k10           T=5 batched:DIFFER max_abs=4.77e-07   rows:exact  max_abs=0          us_batched=60.5 us_rows=92.2
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+MUL_MAT_ID iq4_nl 640->2560 E32 k10 slots     T=5 batched:DIFFER max_abs=2.38e-07   rows:exact  max_abs=0          us_batched=85.0 us_rows=121.2
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+MUL_MAT_ID f16 2560->640 E32 k10              T=5 batched:exact  max_abs=0          rows:exact  max_abs=0          us_batched=170.0 us_rows=345.0
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+FLASH_ATTN hd256 h24/2 kv4096                 T=5 batched:DIFFER max_abs=3.83e-05   rows:exact  max_abs=0          us_batched=72.2 us_rows=159.2
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+GDN        S128 H48                           T=5 batched:exact  max_abs=0          state:exact  max_abs=0          us_batched=30.7 us_state=0.0
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+MUL_MAT    q5_K 2560->10240                   T=6 batched:DIFFER max_abs=5.96e-07   channels:exact  max_abs=0          us_batched=52.8 us_channels=192.8
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+MUL_MAT    q6_K 2560->512                     T=6 batched:DIFFER max_abs=4.77e-07   channels:exact  max_abs=0          us_batched=15.3 us_channels=18.8
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+MUL_MAT    q8_0 10240->320                    T=6 batched:DIFFER max_abs=1.07e-06   channels:exact  max_abs=0          us_batched=20.6 us_channels=25.7
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+MUL_MAT    q4_K 2560->32768                   T=6 batched:DIFFER max_abs=7.15e-07   channels:exact  max_abs=0          us_batched=129.6 us_channels=463.5
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+MUL_MAT    f32 2560->512                      T=6 batched:DIFFER max_abs=0.0026     channels:exact  max_abs=0          us_batched=20.9 us_channels=28.4
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+MUL_MAT    f32 10240->4                       T=6 batched:DIFFER max_abs=0.0015     channels:exact  max_abs=0          us_batched=15.3 us_channels=12.0
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+MUL_MAT    bf16 2560->512                     T=6 batched:DIFFER max_abs=0.00592    channels:exact  max_abs=0          us_batched=17.1 us_channels=23.4
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+MUL_MAT    f16 2560->640                      T=6 batched:DIFFER max_abs=0.00116    channels:exact  max_abs=0          us_batched=16.0 us_channels=25.9
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+MUL_MAT_ID iq2_xs 2560->640 E32 k10           T=6 batched:DIFFER max_abs=4.77e-07   rows:exact  max_abs=0          us_batched=69.3 us_rows=109.1
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+MUL_MAT_ID iq4_nl 640->2560 E32 k10 slots     T=6 batched:DIFFER max_abs=2.38e-07   rows:exact  max_abs=0          us_batched=93.6 us_rows=145.0
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+MUL_MAT_ID f16 2560->640 E32 k10              T=6 batched:exact  max_abs=0          rows:exact  max_abs=0          us_batched=178.4 us_rows=411.1
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+FLASH_ATTN hd256 h24/2 kv4096                 T=6 batched:DIFFER max_abs=3.9e-05    rows:exact  max_abs=0          us_batched=59.6 us_rows=180.1
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+GDN        S128 H48                           T=6 batched:exact  max_abs=0          state:exact  max_abs=0          us_batched=30.1 us_state=0.0
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+MUL_MAT    q5_K 2560->10240                   T=7 batched:DIFFER max_abs=5.96e-07   channels:exact  max_abs=0          us_batched=59.4 us_channels=223.8
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+MUL_MAT    q6_K 2560->512                     T=7 batched:DIFFER max_abs=4.77e-07   channels:exact  max_abs=0          us_batched=16.4 us_channels=22.1
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+MUL_MAT    q8_0 10240->320                    T=7 batched:DIFFER max_abs=1.07e-06   channels:exact  max_abs=0          us_batched=23.8 us_channels=29.6
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+MUL_MAT    q4_K 2560->32768                   T=7 batched:DIFFER max_abs=7.15e-07   channels:exact  max_abs=0          us_batched=143.3 us_channels=538.3
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+MUL_MAT    f32 2560->512                      T=7 batched:DIFFER max_abs=0.0027     channels:exact  max_abs=0          us_batched=21.0 us_channels=31.9
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+MUL_MAT    f32 10240->4                       T=7 batched:DIFFER max_abs=0.0015     channels:exact  max_abs=0          us_batched=15.4 us_channels=12.1
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+MUL_MAT    bf16 2560->512                     T=7 batched:DIFFER max_abs=0.00592    channels:exact  max_abs=0          us_batched=15.8 us_channels=24.2
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+MUL_MAT    f16 2560->640                      T=7 batched:DIFFER max_abs=0.00127    channels:exact  max_abs=0          us_batched=15.7 us_channels=27.0
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+MUL_MAT_ID iq2_xs 2560->640 E32 k10           T=7 batched:DIFFER max_abs=4.77e-07   rows:exact  max_abs=0          us_batched=75.8 us_rows=128.8
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+MUL_MAT_ID iq4_nl 640->2560 E32 k10 slots     T=7 batched:DIFFER max_abs=2.38e-07   rows:exact  max_abs=0          us_batched=106.1 us_rows=168.4
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+MUL_MAT_ID f16 2560->640 E32 k10              T=7 batched:exact  max_abs=0          rows:exact  max_abs=0          us_batched=176.4 us_rows=477.6
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+FLASH_ATTN hd256 h24/2 kv4096                 T=7 batched:DIFFER max_abs=4.15e-05   rows:exact  max_abs=0          us_batched=61.7 us_rows=210.7
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+GDN        S128 H48                           T=7 batched:exact  max_abs=0          state:exact  max_abs=0          us_batched=32.6 us_state=0.0
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+MUL_MAT    q5_K 2560->10240                   T=8 batched:DIFFER max_abs=5.96e-07   channels:exact  max_abs=0          us_batched=63.3 us_channels=251.9
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+MUL_MAT    q6_K 2560->512                     T=8 batched:DIFFER max_abs=4.77e-07   channels:exact  max_abs=0          us_batched=15.3 us_channels=20.8
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+MUL_MAT    q8_0 10240->320                    T=8 batched:DIFFER max_abs=1.07e-06   channels:exact  max_abs=0          us_batched=22.6 us_channels=29.6
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+MUL_MAT    q4_K 2560->32768                   T=8 batched:DIFFER max_abs=7.15e-07   channels:exact  max_abs=0          us_batched=159.0 us_channels=613.0
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+MUL_MAT    f32 2560->512                      T=8 batched:DIFFER max_abs=0.0027     channels:exact  max_abs=0          us_batched=20.9 us_channels=34.8
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+MUL_MAT    f32 10240->4                       T=8 batched:DIFFER max_abs=0.0015     channels:exact  max_abs=0          us_batched=15.7 us_channels=12.5
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+MUL_MAT    bf16 2560->512                     T=8 batched:DIFFER max_abs=0.00592    channels:exact  max_abs=0          us_batched=16.1 us_channels=26.9
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+MUL_MAT    f16 2560->640                      T=8 batched:DIFFER max_abs=0.00127    channels:exact  max_abs=0          us_batched=15.9 us_channels=30.0
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+MUL_MAT_ID iq2_xs 2560->640 E32 k10           T=8 batched:DIFFER max_abs=4.77e-07   rows:exact  max_abs=0          us_batched=87.6 us_rows=142.9
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+MUL_MAT_ID iq4_nl 640->2560 E32 k10 slots     T=8 batched:DIFFER max_abs=2.38e-07   rows:exact  max_abs=0          us_batched=118.5 us_rows=194.4
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+MUL_MAT_ID f16 2560->640 E32 k10              T=8 batched:exact  max_abs=0          rows:exact  max_abs=0          us_batched=178.1 us_rows=546.5
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+FLASH_ATTN hd256 h24/2 kv4096                 T=8 batched:DIFFER max_abs=4.16e-05   rows:exact  max_abs=0          us_batched=62.3 us_rows=238.4
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+GDN        S128 H48                           T=8 batched:exact  max_abs=0          state:exact  max_abs=0          us_batched=34.7 us_state=0.0

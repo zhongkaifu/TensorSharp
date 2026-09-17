@@ -296,6 +296,159 @@ population.
 defines MRoPE section boundaries. When present, the RoPE step uses
 multi-modal RoPE; when absent, plain NeoX RoPE is used.
 
+#### Positions after an image: the M-RoPE delta
+
+An image whose merged grid is H x W takes H*W rows of the KV cache but only
+max(H, W) rotary positions. The injector lays the prompt out the way HF and
+SGLang `get_rope_index` do (`ModelMultimodalInjector.LayoutQwenVLPrompt`):
+the tokens of the span sit at `(base, base + h, base + w)`, and the text after
+it resumes at `base + max(H, W)`. Every token past that position table sits at
+
+```
+rope position = KV index + delta,   delta = max(last table row) + 1 - prompt length
+```
+
+which is SGLang's `mrope_position_delta` (decode position `delta - 1 + seq_len`).
+The delta is per sequence (`Qwen35Model.RopePositions.cs`):
+
+- **Settled before any kernel runs.** `BeginRopePositions` takes it from the staged
+  table of a prefill chunk; a forward from KV index 0 without a table starts a new
+  history at delta 0; any other forward continues the active sequence's delta. A
+  chunk whose rows are all text at `KV index + delta` drops the table and runs the
+  ordinary scalar-RoPE graphs, which rotate identically.
+- **Used by every path.** The whole-model decode (`rope_pos_delta`), the fused
+  prefill/verify graph (`rope_pos_delta` for scalar rows), the arena batched decode
+  (`rope_positions` per holder), the paged batched forward (the request's delta
+  from the injector), the per-op attention, the direct-CUDA prefill and decode
+  graphs, tensor parallelism and the MTP draft head. The per-layer native attention
+  kernels rotate at their KV index, so a sequence past an image does not take them.
+  `TSGgml_Qwen35RopePositionAbi` guards against a native library built before this
+  contract: such a library disables the fused graphs, loudly, instead of being
+  called with the wrong number of arguments. (A DFlash drafter keeps its own
+  positions; they only affect how many drafts are accepted, never the output.)
+- **Stored with the state it describes.** Each per-request holder carries it through
+  swaps, retention, re-keying and pooling, a shared-prefix checkpoint and its clone
+  copy it, the per-block KV snapshot of the KV-swap concurrency path ends with it (like
+  the recurrent state, as of the block's end; an injected block whose size does not fit,
+  or whose delta would put the next token at a negative position, is refused before
+  anything is written, so a refusal leaves the model holding exactly the blocks before
+  it), and the checkpoint file format (`Q5KC`) is **version 2**, which writes it
+  after the row count. A version-1 file names no delta and is refused on import; the
+  engine logs that the saved checkpoint does not fit, prefills the prefix and saves it
+  again.
+
+Before this, decode, speculative verify and every scalar path rotated at the KV index
+itself. Two things followed:
+
+- **Single requests.** The reply to an image was generated at positions the model was
+  not trained to see after that image: past the prompt, each token sat further along
+  than the reference position by the image's token count minus max(H, W) (a 1253x836
+  test picture: about a thousand positions). **Outputs after an image change** with this
+  fix: they are now what a correct Qwen-VL implementation produces. Measured on the Mac
+  (Metal, Qwen3.5-9B-Q8_0, greedy, 96 tokens), the image turn's reply before (584f8f71,
+  the same decode as 6db6dbf6) and after:
+  - OpenAI, image on turn 1: `...sitting gracefully against a futuristic, glowing
+    background filled with floating cubes and digital particles.` became `...sitting
+    gracefully amidst a futuristic, glowing digital landscape filled with floating cubes
+    and light trails.`
+  - Web UI, image on turn 3: `...amidst a futuristic digital environment.` became
+    `...amidst a futuristic digital landscape.`
+  - OpenAI, image on turn 3: `This digital artwork features an anime-style woman...`
+    became `This image features an anime-style illustration of a young woman...`
+  - Web UI, image on turn 1: unchanged over 96 tokens.
+- **Reuse.** A cache that went through an image turn was not the state a re-prefill of
+  the same history builds, so Phase 0 of the prefix cache stopped every reuse path at
+  the first image (`SupportsReuseAcrossMediaSpan = false`). Qwen 3.5/3.6 now declare
+  `true`: follow-up turns continue the cache past the image.
+
+**Validation.**
+
+- `Qwen35MRopeReferencePositionTests` compares the prompt layout, the delta, the
+  model's own chunked-prefill and decode positions, and a follow-up turn laid out from
+  scratch, against a fixture generated from SGLang's `get_rope_index(model_type="qwen3_5")`
+  and its decode rule (`eng/validation/qwen35_mrope_reference`, SGLang 2733afe5) for one
+  image, two images, tall and wide grids, a two-pair video and plain text. With decode
+  at the KV index (the old rule) 10 of its 26 cases fail.
+- `Qwen35ImageFollowUpExactnessTests` (model-gated, `TS_TEST_MODEL_DIR`) runs a
+  conversation text -> image -> text -> text on Qwen3.5-9B-Q8_0. In the engine, turns
+  3 and 4 must reuse the previous turn past the image, and every turn's greedy tokens
+  are compared with a cold engine's, also with a text conversation decoding beside it
+  (per-request holders and the arena batched decode). On the model directly, a turn
+  built by decoding the previous reply and prefilling the new suffix is compared with a
+  cold prefill of the whole prompt, logits step by step for 24 steps, and the same
+  comparison runs on a text-only conversation as a control. A checkpoint taken after
+  the image survives export, import and clone with bit-identical decode logits, and a
+  version-1 file is refused. With the delta disabled the test fails: on Metal the
+  image conversation's worst logit difference rises from 0.024 to 3.24 while the text
+  control stays at 0.010, and on CUDA from 2.39 to 8.11 (8.8x its 0.92 control) with a
+  turn-4 token change that is not a tie (on an earlier revision of the test it failed on turn 3's
+  tokens: `...there is no roof visible. The scene depicts...` reused vs `...features...`
+  cold).
+  The measurements below used a real photo (`TS_TEST_QWEN35_IMAGE`). Without one the
+  test draws a synthetic picture: 448x336 for the direct comparisons and 896x672 for the
+  concurrent case, because a finished request shorter than one scheduler block (256
+  tokens in this test) is never retained as a holder, so a 140-token picture left turn 2
+  too short for turn 3 to reuse anything and the concurrent case always failed.
+
+**Logit tolerance.** Reuse and cold are not bit-identical: the reused turn's reply rows
+were written by the decode graph and the cold turn's by the prefill graph (different
+attention and matmul kernels, quantized-activation matmuls on CUDA, NeoX vs interleaved
+M-RoPE on equal axes). The test therefore checks three things:
+
+- the worst max |dlogit| over the vocabulary stays under the backend's tolerance
+  (`TS_TEST_QWEN35_LOGIT_TOLERANCE`; default 0.1 on Metal, 3.0 elsewhere);
+- it is at most 4x the text-only control's (`TS_TEST_QWEN35_CONTROL_RATIO`): the image
+  may amplify the kernel difference through its longer context, but must add no error
+  of its own;
+- greedy tokens are identical, except at a step where the cold run's top-2 margin is
+  smaller than the logit difference measured there - a tie the two kernels may break
+  either way.
+
+Measured (24 steps, turns 2-4):
+
+| Backend | Image conversation worst \|dlogit\| | Text control | Ratio | Token differences | Checkpoint round trip |
+|---|---|---|---|---|---|
+| Metal (M-series, Qwen3.5-9B-Q8_0) | 0.024 | 0.010 | 2.3x | none | 0.0 |
+| CUDA (A40, Qwen3.5-9B-Q8_0, mmproj F16) | 2.39 | 0.92 | 2.6x | turn 3 step 0 (margin 0.034 < 0.47) and turn 4 step 1 (margin 0.13 < 0.29): ties | 0.0 |
+
+On CUDA the decode and prefill kernels differ by up to about one logit even for a
+text-only conversation, so over 24 greedy tokens a low-margin token can flip between a
+reused and a cold turn with or without images.
+
+The concurrent test (holders and the arena) applies the same tie rule. At the first step
+where a request's tokens differ from its cold engine run it captures the cold logits (the
+same prompt prefilled cold straight on the model, which must have decoded the same tokens
+up to that step) and accepts the difference only when their top-2 margin is below the
+backend's logit tolerance; the rest of that request is then not compared. Its text-only
+control opens with a system prompt longer than one block (a 346-token first turn): with
+the one-line prompt every text turn was shorter than a block, no turn was retained, and
+the control reused nothing. It must now reuse everything the previous turn left.
+Measured 2026-09-17:
+
+| Backend | Picture | Text turns 2-4 reused | Token differences |
+|---|---|---|---|
+| Metal (Qwen3.5-9B-Q8_0, mmproj BF16) | built-in 896x672 | 367 / 411 / 446 | none |
+| Metal | real photo | 367 / 411 / 446 | none |
+| CUDA (A40, Qwen3.5-9B-Q8_0, mmproj F16) | built-in 896x672 | 366 / 410 / 445 | image turn 3 step 0 (margin 0.23), image turn 4 step 5 (0.017), text turn 3 step 0 (0.041): ties |
+| CUDA | real photo | 366 / 410 / 445 | text turn 3 step 0 (margin 0.041): tie |
+
+Before the tie rule the CUDA built-in-picture run failed on its image turn 3 step 0.
+
+**Through the server** (the Phase 0 IMG probe: Web UI and OpenAI conversations with the
+image on turn 1 or turn 3, plus text controls; Metal, Qwen3.5-9B-Q8_0, greedy, 96 tokens
+per turn), every turn after an image now continues the cache:
+
+| Scenario | Turns after the image | Reused before (clamp) | Reused now | TTFT (Web UI) / wall (OpenAI) before | now |
+|---|---|---|---|---|---|
+| Web UI, image on turn 1 | 2, 3, 4 | 0, 0, 0 | 1,099 / 1,187 / 1,286 (98.0-98.2%) | 1.00 / 1.10 / 1.18 s | 0.13 / 0.13 / 0.13 s |
+| Web UI, image on turn 3 | 4 | 0 | 1,340 (98.2%) | 1.20 s | 0.13 s |
+| OpenAI, image on turn 1 | 2, 3, 4 | 0, 0, 0 | 1,099 / 1,188 / 1,286 (97.9-98.2%) | 3.67 / 3.64 / 3.31 s | 2.20 / 2.39 / 1.41 s |
+| OpenAI, image on turn 3 | 4 | 0 | 1,301 (98.1%) | 2.18 s | 0.94 s |
+
+All 24 replies of that run equal a run of the same build with prompt reuse off
+(`TS_SCHED_PREFIX_CACHE=0`), the image was encoded once, and the text controls are
+unchanged.
+
 ### 4.5 Vision encoder (`Qwen35VisionEncoder`)
 
 A SigLIP-style ViT with:
@@ -685,6 +838,53 @@ Allocated once in `InitGDNBuffers()`:
 - `ResetKVCache()` zeroes both kinds of cache.
 - Initial CUDA cache allocation can be smaller than `maxContextLength` and
   grows on demand (printed at startup).
+- **The whole-model decode's conv scratch** (`_fdConvScratch`) belongs to each cache
+  (the primary and every per-request holder) and is swapped with it. It is allocated
+  whenever the active cache has none, reseeded from the GDN host ring, not only when
+  the decode descriptors are first built. A cache that had never decoded by then - the
+  model's original primary cache, saved aside when a holder was bound first - used to
+  keep a null scratch, and its first decode after being restored threw a
+  `NullReferenceException` in `TryFullModelDecodeCore`. On the engine that is a freshly
+  loaded model whose first scheduled step is a concurrent one, followed later by a solo
+  decode on the primary cache. The arena batched decode treats a holder without a
+  scratch the same way. `Qwen35ConvScratchTests` (model-gated) covers it.
+
+### Retained holders: the one-block minimum
+
+A finished request's per-request holder is kept for its conversation's next turn
+(`BatchExecutor.TryRetainReleasedFusedCache`, and `DonateFinishedLiveCacheToRetained` for a
+conversation that finished on the primary cache) only when it holds at least one scheduler
+block (256 tokens by default). A shorter conversation - a short image conversation, since a
+448x336 picture is 140 tokens - therefore re-prefills its whole prompt, re-encoding the
+picture, on every turn that runs beside another request. A conversation that runs alone is
+not affected: it continues from the live cache, which has no minimum.
+
+The minimum is not something holders need. A holder is matched token by token
+(`FindRetainedFusedMatch`) and adopting one reserves ceil(lcp / BlockSize) placeholder blocks
+(`TryAdoptFusedContinuation`), so nothing on that path depends on a block boundary. It stays
+because lowering it failed validation on Metal (2026-09-17, Qwen3.5-9B-Q8_0 + mmproj BF16):
+
+- **What was tried.** Retain a shorter holder when it evicts no retained holder and its bytes
+  fit the model's idle-holder budget (half the measured cache headroom less the parked
+  holders, the rule `CanPoolIdleCache` applies to a released holder), in both retention paths.
+- **Engine.** An image conversation and a text conversation side by side, their first turns
+  under one block (the 448x336 picture; the one-line system prompt), then reused every turn,
+  but image turn 2 - the picture prefilled on top of a retained 41-token holder - diverged
+  from a cold run at step 20, where the cold top-2 margin is 0.255, above the 0.1 Metal
+  tolerance. Replaying just that pair (turn 1 beside a longer text request, turn 2 alone)
+  diverged the same way in 4 of 10 runs, 3 of them the first conversation on a freshly loaded
+  model; in 0 of 3 with the arena batched decode off (`TS_BATCHED_FUSED_DECODE=0`); and a turn 1
+  longer than one block on the unchanged code gave 0 divergences in 6 runs.
+- **Model level.** The same sequence driven straight through the model (turn 1 prefilled on
+  the primary cache and adopted, its reply decoded in the arena beside a longer holder, the
+  holder retained and re-keyed, the picture prefilled, 24 decode steps) stays within 0.023 of
+  an all-solo run, and an arena decode step is within 0.0008 of a solo one. The error comes
+  from something in how the engine schedules that path, not yet identified.
+- The same runs hit the null conv-scratch `NullReferenceException` above twice. It is fixed;
+  the divergence persists without it.
+
+Until that divergence is explained the one-block minimum stays, on Gemma 4 too (the same
+executor rule; shorter Gemma 4 holders were not validated).
 
 ### File-mapped quantized weights
 

@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Security.Cryptography;
 using TensorSharp.GGML;
+using TensorSharp.Models;
 using Xunit.Abstractions;
 
 namespace InferenceWeb.Tests;
@@ -25,6 +26,7 @@ public sealed class DeepSeek4NativeSpecBoundaryTests(ITestOutputHelper output)
     {
         Assert.False(GgmlDeepSeek4Native.ForwardSpec(IntPtr.Zero, [1], []));
         Assert.Equal(0, GgmlDeepSeek4Native.DsparkDraft(IntPtr.Zero, 1, [], []));
+        Assert.Equal(0, GgmlDeepSeek4Native.UBatch(IntPtr.Zero));
     }
 
     [DeepSeek41DsparkTinyFact, Trait("Requires", "Models")]
@@ -117,10 +119,36 @@ public sealed class DeepSeek4NativeSpecBoundaryTests(ITestOutputHelper output)
         Assert.Equal(5, GgmlDeepSeek4Native.NPast(model.Handle));
     }
 
+    /// <summary>UBatchAuto on the CPU device keeps the executor's 256; the export
+    /// reports what the loader runs.</summary>
+    [DeepSeek41DsparkTinyFact, Trait("Requires", "Models")]
+    public void AutomaticPrefillWidthOnTheCpuDeviceIs256()
+    {
+        using var model = Load(GgmlDeepSeek4Native.UBatchAuto);
+        Assert.Equal(256, GgmlDeepSeek4Native.UBatch(model.Handle));
+        Seed(model.Handle);
+        Assert.Equal(5, GgmlDeepSeek4Native.NPast(model.Handle));
+    }
+
+    /// <summary>On a GPU the tiny fixture fits at every candidate, so the loader
+    /// takes the widest, 1024; a verify still fits one micro-batch.</summary>
+    [DeepSeek41DsparkTinyFact(GgmlBackend = BackendType.GgmlCuda), Trait("Requires", "Models")]
+    public void AutomaticPrefillWidthOnCudaTakesTheWidestCandidateThatFits()
+    {
+        using var model = Load(GgmlDeepSeek4Native.UBatchAuto, "CUDA");
+        Assert.Equal(1024, GgmlDeepSeek4Native.UBatch(model.Handle));
+        Seed(model.Handle);
+        int vocabulary = GgmlDeepSeek4Native.VocabSize(model.Handle);
+        var rows = new float[3 * vocabulary];
+        Assert.True(GgmlDeepSeek4Native.ForwardSpec(model.Handle, [41, 43, 47], rows));
+        Assert.Equal(8, GgmlDeepSeek4Native.NPast(model.Handle));
+        Assert.All(rows, x => Assert.True(float.IsFinite(x)));
+    }
+
     private static void Seed(IntPtr handle)
         => Assert.True(GgmlDeepSeek4Native.Forward(handle, [0, 15, 32, 64, 128], new float[256]));
 
-    private NativeModel Load()
+    private NativeModel Load(int ubatch = 32, string backend = "CPU")
     {
         foreach (var (name, value) in new Dictionary<string, string>
         {
@@ -135,7 +163,7 @@ public sealed class DeepSeek4NativeSpecBoundaryTests(ITestOutputHelper output)
         string directory = Path.GetDirectoryName(target)!;
         CheckHash(Path.Combine(directory, "deepseek41.config.json"), "159a8b4c221953310a590a40b28c90181d8bc05e421d0f4ec49dda94360e96c0");
         CheckHash(Path.Combine(directory, "deepseek41.engram.bin"), "d9f9c28124c59c1df587ccd9eef24297c5eefa0aad1bcccc1939b8ded2f5f126");
-        var handle = GgmlDeepSeek4Native.LoadModelWithDspark(target, 1, 1024, 32, 2, head, backendName: "CPU");
+        var handle = GgmlDeepSeek4Native.LoadModelWithDspark(target, 1, 1024, ubatch, 2, head, backendName: backend);
         Assert.NotEqual(IntPtr.Zero, handle);
         try
         {
@@ -143,6 +171,7 @@ public sealed class DeepSeek4NativeSpecBoundaryTests(ITestOutputHelper output)
             CheckHash(native, Environment.GetEnvironmentVariable("TS_TEST_DSV41_DSPARK_NATIVE_SHA256")!);
             Assert.Equal(256, GgmlDeepSeek4Native.VocabSize(handle));
             Assert.Equal(5, GgmlDeepSeek4Native.DsparkBlockSize(handle));
+            if (ubatch > 0) Assert.Equal(ubatch, GgmlDeepSeek4Native.UBatch(handle));
             return new NativeModel(handle);
         }
         catch { GgmlDeepSeek4Native.Free(handle); throw; }

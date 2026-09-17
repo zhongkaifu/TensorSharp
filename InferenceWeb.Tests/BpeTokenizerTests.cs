@@ -226,6 +226,20 @@ public class BpeTokenizerTests
     }
 
     [Fact]
+    public void ResolveEogTokenIds_FoldsDeclaredEndOfMessageId()
+    {
+        // GLM-5.x: eos <|endoftext|>, eot <|user|>, eom <|observation|>. llama.cpp stops
+        // on all three; without the eom id the model wrote its own tool results.
+        string[] vocab = { "a", "<|endoftext|>", "<|user|>", "<|observation|>" };
+        Assert.Equal(
+            new[] { 1, 2, 3 },
+            ModelBase.ResolveEogTokenIds(vocab, eosId: 1, declaredEotId: 2, declaredEomId: 3));
+        Assert.Equal(
+            new[] { 1, 2 },
+            ModelBase.ResolveEogTokenIds(vocab, eosId: 1, declaredEotId: 2));
+    }
+
+    [Fact]
     public void Encode_ParsesNormalTypedEogMarkerAsSpecialToken()
     {
         string[] vocab = { "a", "b", "<|tool_response>" };

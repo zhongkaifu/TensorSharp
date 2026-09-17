@@ -14,6 +14,7 @@ using System.IO;
 using System.Runtime.InteropServices;
 using TensorSharp;
 using TensorSharp.Models;
+using TensorSharp.Runtime;
 using Xunit;
 
 namespace InferenceWeb.Tests;
@@ -89,9 +90,12 @@ public sealed class Glm5NextNativeTensorParallelTests : IDisposable
         using (ModelBase single = ModelBase.Create(path, BackendType.GgmlCpu, tpDegree: 1))
             Assert.Equal("glm5next", single.Config.Architecture);
 
-        var error = Assert.Throws<InvalidOperationException>(
+        // A refusal, carrying the native loader's own reason rather than "see stderr":
+        // the hosts turn it into one error line and exit code 2.
+        var error = Assert.Throws<ModelLoadRefusedException>(
             () => ModelBase.Create(path, BackendType.GgmlCpu, tpDegree: 2));
-        Assert.Contains("Failed to load the glm-dsa model", error.Message, StringComparison.Ordinal);
+        Assert.Contains("[glm] --tp 2 cannot split 2 heads", error.Message, StringComparison.Ordinal);
+        Assert.Contains("unaligned.gguf", error.Message, StringComparison.Ordinal);
     }
 
     private static int ArgMax(float[] values)

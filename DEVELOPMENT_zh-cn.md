@@ -184,6 +184,26 @@ MiniMax-H3 对**一条**无 mask 的打包序列做双向注意力——文本�
 
 采样器也不再无条件相信结果：velocity 出现非有限值时直接让请求失败并指明是第几步（`MiniMaxH3Pipeline.cs` 的 `RequireFinite`），而不是写出一个长度、帧率、音轨时长都正常但通体全黑的文件——这种失败本来是无声的，因为 RGB 钳位会把 NaN 像素固定成 0，WAV 写出会把 NaN 采样钳到 -1。
 
+#### 后端没有 kernel 的 flash-attention 形状
+
+`ggml_backend_graph_compute` 从不询问 `ggml_backend_supports_op`。因此 ggml-cuda 没有 kernel 的 `GGML_OP_FLASH_ATTN_EXT` 节点会一路走到 `ggml_cuda_flash_attn_ext`，以 `ggml-cuda/fattn.cu:730: fatal error`（`BEST_FATTN_KERNEL_NONE`）终止整个进程。在固定的 ggml（456172ec）中，`ggml_cuda_get_best_fattn_kernel` 在以下情况返回 none：
+
+- K 的 head 大小不是 40、64、72、80、96、112、128 或 256（V 的 head 大小相同），也不是 192（V 为 128）、320（V 为 256）、512 或 576（V 为 512）；
+- head 大小为 192、320、512 或 576，但 grouped-query 路径不成立：它要求 query/KV head 之比至少为 2（192 时为 8 的倍数，320 时为 32 的倍数）、有 mask、没有 ALiBi、KV 长度是 256（`FATTN_KQ_STRIDE`）的倍数，并且未量化的 Q/K/V/mask 的每个 `nb[1..3]` 都能被 16 整除；
+- K 或 V 不是 F32、F16、BF16、Q4_0、Q4_1、Q5_0、Q5_1 或 Q8_0，或者 mask 的 `ne[2] != 1`。
+
+`ggml_backend_supports_op` 回答的正是这个判定（它调用同一个函数），Metal 与 Vulkan 也以同样的方式报告各自的限制。实际中触发过两次：`HunyuanDenseServingTests` 的合成 `mistral3` 模型 head 大小为 16，其批处理 prefill 分块经过了 `TSGgml_PagedAttentionForward`；以及从 `TS_KV_INITIAL_TOKENS=8` 起步的 Gemma 4 全局缓存增长到 16 行，于是 512 维的全局层读取 16 行的窗口（`flash_attn_kv_length` 会补齐到 256，但从不超过缓存长度）。任何长度不是 256 倍数的 512/576 维缓存都有同样的截断，例如 `MAX_CONTEXT` 设为 4000 时，上下文超过 3840 个 token 之后。
+
+`TensorSharp.GGML.Native` 直接在某个后端上计算的图，都通过 `tsg_flash_attn_ext_guarded`（`ggml_ops_flash_attn_guard.h`；针对当前后端用 `tsg::flash_attn_ext_guarded`）构建 flash attention。它先构建 flash 节点，只要后端有对应 kernel 就直接返回，因此受支持的形状得到与之前相同的图。否则它返回以显式算子写成的同一个注意力——F32 `mul_mat`、带 mask/ALiBi/sinks/logit softcap 的 `soft_max_ext`、`mul_mat`——输出布局与 flash 节点一致，query 行分块处理以保证打分矩阵不超过 256 MiB，并且每个调用点打印一次警告：
+
+```
+[TensorSharp] warning: CUDA0 has no flash-attention kernel for paged attention (K head 16, V head 16, KV rows 64, query rows 8, heads 4/2, K/V f32/f32, mask yes); running this attention as explicit F32 mul_mat + soft_max instead (same math, slower, more memory). Reported once per call site.
+```
+
+`TSGgml_FlashAttnFallbackCount`（`GgmlBasicOps.FlashAttnFallbackCount()`）统计走显式路径的建图次数。覆盖的调用点：分页注意力（两个变体）与分页 KV 池；通用 transformer decode 入口；Qwen 3 decode 与 prefill；Qwen 3.5/3.6 的层 decode、整模型 decode、批处理 decode、verify 与层 prefill；Qwen 3.8 Flash Next（`qwen4exp`）；Gemma 4 dense 与 MoE 的 decode 和批处理 decode；GPT-OSS 的 decode、prefill、批处理 decode 与层 prefill；Muse-Glimmer 及其 DFlash drafter；GLM 5.x 的 decode 与 forward（询问该层所在设备的后端）；以及 CPU/Metal 上的视觉注意力。原本就询问后端的调用点保留各自的处理：Gemma 4 与 Qwen 3.5 verify、GPT-OSS 与 Qwen 3.5 slot arena 向托管调用方返回错误（现在检查每个 tile 与每一层，而不只是第一个），视觉、diffusion、Wan、Qwen-Image、MiniMax-H3 与 embedding 图照旧回退。DeepSeek V4/V4.1 的注意力不变：其滑动窗口环与压缩行缓存在构造上就补齐到 256 行，V4.1 运行 TensorSharp 自己的 F32 注意力。
+
+`GgmlOpsFlashAttnGuardTest`（ctest `flash-attn-unsupported-shape-fallback`）在 CPU 后端上把显式路径与双精度参考实现对比（mask、GQA、带步长的 F16 窗口、sinks、softcap、ALiBi、query 分块），并在第一个 GPU 设备上检查 head 16 以及过短或未对齐的 512 维窗口会以相同结果回退、受支持的形状仍走 kernel。在 CUDA 上，若 ggml 升级后 ggml-cuda 对这些形状的 kernel 可用性发生变化，该测试也会失败。`GgmlOpsFlashAttnGuardTest --unguarded` 在 GPU 上计算裸的 head-16 节点，复现该 abort。`FlashAttnUnsupportedShapeTests`（`Requires=Cuda`）以 head 大小 16 调用 `TSGgml_PagedAttentionForward`，并与托管参考实现对比。
+
 ### 构建原生 MLX 库（仅 macOS）
 
 MLX 后端依赖 `libmlxc`（[MLX](https://github.com/ml-explore/mlx) 的 C 绑定）。仓库在 `TensorSharp.Backends.MLX/Native/MLX_C_VERSION` 中固定了已知可用的 `mlx-c` tag，并提供一个辅助脚本来获取和构建：
@@ -263,6 +283,7 @@ TensorSharp/
 │   ├── ggml_ops_matmul.cpp                # GEMM / 量化 matmul
 │   ├── ggml_ops_fused.cpp                 # 跨域融合的每层内核
 │   ├── ggml_ops_norm_attn.cpp             # Norm + 注意力融合
+│   ├── ggml_ops_flash_attn_guard.cpp      # Flash attention；后端对该形状没有 kernel 时改为显式注意力并警告一次
 │   ├── ggml_ops_transformer.cpp           # 通用融合 Transformer 层/整模型 decode 与 flash-attn decode
 │   ├── ggml_ops_transformer_common.h      # 共享的 Transformer 辅助函数与 C# 层描述符结构体
 │   ├── ggml_ops_transformer_prefill.cpp   # 融合层 prefill（Gemma 4、GPT-OSS、Qwen 3.5）
@@ -531,6 +552,8 @@ dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj --filter "Category=Benc
 ```
 
 门控测试在前提条件缺失时会报告为**已跳过**（被跳过的 `[Theory]` 只计一次，不按数据行展开），因此在没有相应硬件/权重的机器上，绿色结果会显示为"N 通过，M 跳过"，而不是静默通过从未执行的测试。少数前提条件复杂的测试类（多个环境变量、按方法选择模型）仍在测试体内做门控，并保留显式的 `[Trait("Requires", ...)]` 标注。
+
+基数树前缀缓存的树级性质测试（`InferenceWeb.Tests/PrefixCache/TreeTraceHarnessTests.cs`，trait 为 `Category=PrefixCacheProperty`）默认运行 1,000 个带种子的操作序列，属于可移植测试分组。三个仅供测试使用的环境变量控制它：`PREFIX_CACHE_TREE_SEEDS=20000` 运行完整的 20,000 个种子，`PREFIX_CACHE_TREE_SEED_START=<n>` 设置种子起点，`PREFIX_CACHE_SEED=<n>` 重放单个失败的种子。树操作的时延与分配门槛由 [`benchmarks/RadixTreeBench`](benchmarks/RadixTreeBench/README.md) 检查，它不需要加载模型。
 
 ### 服务端集成测试
 

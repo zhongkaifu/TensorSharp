@@ -1,0 +1,199 @@
+{
+  "model": "Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf",
+  "promptTokens": 3248,
+  "reference": "4096",
+  "referenceText": " over 128 tokens, 4 prompts)\n- decode throughput is **not comparable** across the two runs: the 1-GPU run\n  ran at 1.2 tok/s because it was streaming weights from disk, while the\n  2-GPU run ran at 16.6 tok/s. The layer split is what lets the weights sit in\n  VRAM at all.\n\n## Tuning\n\n| env | default | effect",
+  "smallestReferenceMargins": [
+    {
+      "position": 76,
+      "margin": 0.00415802
+    },
+    {
+      "position": 85,
+      "margin": 0.0041999817
+    },
+    {
+      "position": 62,
+      "margin": 0.02423668
+    },
+    {
+      "position": 17,
+      "margin": 0.029380798
+    },
+    {
+      "position": 6,
+      "margin": 0.031629562
+    }
+  ],
+  "variants": [],
+  "verify": [
+    {
+      "rep": 0,
+      "kernels": "verify-row",
+      "width": 2,
+      "rows": 96,
+      "changedRows": 0,
+      "greedyFlips": 0,
+      "maxAbsLogitDiff": 0,
+      "medianVerifyMs": 24.4599,
+      "medianDecodeMs": 20.3898,
+      "prefillMs": 2303.9217
+    },
+    {
+      "rep": 0,
+      "kernels": "verify-row",
+      "width": 3,
+      "rows": 96,
+      "changedRows": 0,
+      "greedyFlips": 0,
+      "maxAbsLogitDiff": 0,
+      "medianVerifyMs": 28.0774,
+      "medianDecodeMs": 20.3898,
+      "prefillMs": 2303.9217
+    },
+    {
+      "rep": 0,
+      "kernels": "verify-row",
+      "width": 4,
+      "rows": 96,
+      "changedRows": 0,
+      "greedyFlips": 0,
+      "maxAbsLogitDiff": 0,
+      "medianVerifyMs": 32.2656,
+      "medianDecodeMs": 20.3898,
+      "prefillMs": 2303.9217
+    },
+    {
+      "rep": 0,
+      "kernels": "verify-row",
+      "width": 5,
+      "rows": 96,
+      "changedRows": 0,
+      "greedyFlips": 0,
+      "maxAbsLogitDiff": 0,
+      "medianVerifyMs": 43.3442,
+      "medianDecodeMs": 20.3898,
+      "prefillMs": 2303.9217
+    },
+    {
+      "rep": 0,
+      "kernels": "verify-row",
+      "width": 6,
+      "rows": 96,
+      "changedRows": 0,
+      "greedyFlips": 0,
+      "maxAbsLogitDiff": 0,
+      "medianVerifyMs": 47.9058,
+      "medianDecodeMs": 20.3898,
+      "prefillMs": 2303.9217
+    },
+    {
+      "rep": 0,
+      "kernels": "verify-row",
+      "width": 7,
+      "rows": 96,
+      "changedRows": 0,
+      "greedyFlips": 0,
+      "maxAbsLogitDiff": 0,
+      "medianVerifyMs": 51.1595,
+      "medianDecodeMs": 20.3898,
+      "prefillMs": 2303.9217
+    },
+    {
+      "rep": 0,
+      "kernels": "verify-row",
+      "width": 8,
+      "rows": 96,
+      "changedRows": 0,
+      "greedyFlips": 0,
+      "maxAbsLogitDiff": 0,
+      "medianVerifyMs": 55.412,
+      "medianDecodeMs": 20.3898,
+      "prefillMs": 2303.9217
+    },
+    {
+      "rep": 0,
+      "kernels": "batched",
+      "width": 2,
+      "rows": 96,
+      "changedRows": 96,
+      "greedyFlips": 8,
+      "maxAbsLogitDiff": 2.48230242729187,
+      "medianVerifyMs": 23.9497,
+      "medianDecodeMs": 20.6552,
+      "prefillMs": 2291.6484
+    },
+    {
+      "rep": 0,
+      "kernels": "batched",
+      "width": 3,
+      "rows": 96,
+      "changedRows": 96,
+      "greedyFlips": 8,
+      "maxAbsLogitDiff": 4.543323516845703,
+      "medianVerifyMs": 26.3817,
+      "medianDecodeMs": 20.6552,
+      "prefillMs": 2291.6484
+    },
+    {
+      "rep": 0,
+      "kernels": "batched",
+      "width": 4,
+      "rows": 96,
+      "changedRows": 96,
+      "greedyFlips": 9,
+      "maxAbsLogitDiff": 4.015749454498291,
+      "medianVerifyMs": 29.1279,
+      "medianDecodeMs": 20.6552,
+      "prefillMs": 2291.6484
+    },
+    {
+      "rep": 0,
+      "kernels": "batched",
+      "width": 5,
+      "rows": 96,
+      "changedRows": 96,
+      "greedyFlips": 5,
+      "maxAbsLogitDiff": 2.1820292472839355,
+      "medianVerifyMs": 32.3166,
+      "medianDecodeMs": 20.6552,
+      "prefillMs": 2291.6484
+    },
+    {
+      "rep": 0,
+      "kernels": "batched",
+      "width": 6,
+      "rows": 96,
+      "changedRows": 96,
+      "greedyFlips": 5,
+      "maxAbsLogitDiff": 2.1820292472839355,
+      "medianVerifyMs": 34.7806,
+      "medianDecodeMs": 20.6552,
+      "prefillMs": 2291.6484
+    },
+    {
+      "rep": 0,
+      "kernels": "batched",
+      "width": 7,
+      "rows": 96,
+      "changedRows": 96,
+      "greedyFlips": 6,
+      "maxAbsLogitDiff": 2.1820292472839355,
+      "medianVerifyMs": 37.4917,
+      "medianDecodeMs": 20.6552,
+      "prefillMs": 2291.6484
+    },
+    {
+      "rep": 0,
+      "kernels": "batched",
+      "width": 8,
+      "rows": 96,
+      "changedRows": 96,
+      "greedyFlips": 10,
+      "maxAbsLogitDiff": 4.2533135414123535,
+      "medianVerifyMs": 41.0352,
+      "medianDecodeMs": 20.6552,
+      "prefillMs": 2291.6484
+    }
+  ]
+}

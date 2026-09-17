@@ -272,6 +272,43 @@ public class WebUiChatServiceTests : IDisposable
         Assert.True(options.SkillsAllowNetwork);
     }
 
+    /// <summary>
+    /// TensorAgent opens a new session every time a saved chat is opened. Scoped by
+    /// session alone, each reopen could not continue that chat's own cached state
+    /// (another session's scope) and re-prefilled everything past the system prompt.
+    /// Sessions bound to one conversation share its cache scope; others do not.
+    /// </summary>
+    [Fact]
+    public void SessionsBoundToOneConversation_ShareItsCacheScope()
+    {
+        using var model = new ModelService(NullLogger<ModelService>.Instance);
+        var sessions = new SessionManager();
+        var service = new WebUiChatService(
+            model, sessions, Options(), new UploadStoragePolicy(_baseDir),
+            new SkillRegistry(new SkillRegistryOptions()),
+            codeRunner: null, workspaces: null, codeArtifacts: null,
+            NullLoggerFactory.Instance, WebUiChatService.DefaultArtifactUriPrefix);
+
+        ChatSession first = sessions.CreateSession();
+        ChatSession reopened = sessions.CreateSession();
+        ChatSession other = sessions.CreateSession();
+        Assert.NotEqual(first.ResolveCacheScope(null), reopened.ResolveCacheScope(null));
+
+        Assert.True(service.BindSessionConversation(first.Id, "conv-1"));
+        Assert.True(service.BindSessionConversation(reopened.Id, "conv-1"));
+        Assert.True(service.BindSessionConversation(other.Id, "conv-2"));
+        Assert.Equal(first.ResolveCacheScope(null), reopened.ResolveCacheScope(null));
+        Assert.NotEqual(first.ResolveCacheScope(null), other.ResolveCacheScope(null));
+        // The key never appears in the scope, and a new chat in the session still starts a new one.
+        Assert.DoesNotContain("conv-1", first.ResolveCacheScope(null), StringComparison.Ordinal);
+        lock (reopened.HistoryLock) reopened.ResetConversation();
+        Assert.NotEqual(first.ResolveCacheScope(null), reopened.ResolveCacheScope(null));
+
+        // The shared default session and unknown ids are never bound.
+        Assert.False(service.BindSessionConversation(SessionManager.DefaultSessionId, "conv-1"));
+        Assert.False(service.BindSessionConversation("no-such-session", "conv-1"));
+    }
+
     [Fact]
     public async Task RoutedArtifactSetupFailureAlsoCarriesTheBrowserRollbackCode()
     {
@@ -404,7 +441,7 @@ public class WebUiChatServiceTests : IDisposable
     {
         Fixture f = Build();
         ChatSession session = f.Sessions.CreateSession();
-        session.TrackedHistory.Add(new ChatMessage { Role = "user", Content = "earlier" });
+        TranscriptTestHelper.RecordTurn(session, "earlier");
 
         var ex = await RejectionOf(f.Service.ChatStreamAsync(
             Json($$"""{"sessionId":"{{session.Id}}","newChat":true,"messages":[]}"""), CancellationToken.None));
@@ -412,7 +449,7 @@ public class WebUiChatServiceTests : IDisposable
         // The refusal order is the adapter's: session lookup and reset come before the
         // model check, so a New Chat on a model-less server still clears the desk.
         Assert.Equal(400, ex.StatusCode);
-        Assert.Empty(session.TrackedHistory);
+        Assert.Equal(0, session.TrackedTurnCount);
     }
 
     // ---- sessions and models ---------------------------------------------------

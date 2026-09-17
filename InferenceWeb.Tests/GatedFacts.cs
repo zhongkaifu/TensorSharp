@@ -172,7 +172,7 @@ namespace InferenceWeb.Tests
         private static extern IntPtr DyldGetImageName(uint index);
 
         /// <summary>
-        /// First GGUF in <paramref name="dir"/> whose name contains
+        /// An explicit model file, or the first GGUF in <paramref name="dir"/> whose name contains
         /// <paramref name="contains"/> (case-insensitive; '|' separates
         /// accepted alternatives, e.g. "gpt-oss|gpt_oss"), skipping companion
         /// files (mmproj / assistant drafts). Shared by the attributes and the
@@ -196,6 +196,9 @@ namespace InferenceWeb.Tests
 
         private static IEnumerable<string> MatchingGgufs(string dir, string contains)
         {
+            // ModelSkip accepts an explicit file without applying the directory
+            // name filter. Keep the loader aligned with that discovery contract.
+            if (File.Exists(dir)) return new[] { dir };
             string[] alternatives = contains.ToLowerInvariant().Split('|');
             return Directory.GetFiles(dir, "*.gguf").Where(p =>
             {

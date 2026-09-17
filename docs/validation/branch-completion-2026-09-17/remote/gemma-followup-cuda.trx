@@ -1,0 +1,96 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TestRun id="227a08a1-6274-4114-b6c6-b67b4e847b4e" name="@d71188ba1e2e 2026-09-17 15:06:17" xmlns="http://microsoft.com/schemas/VisualStudio/TeamTest/2010">
+  <Times creation="2026-09-17T15:06:17.0579534+00:00" queuing="2026-09-17T15:06:17.0579537+00:00" start="2026-09-17T15:05:42.7930191+00:00" finish="2026-09-17T15:06:32.2176734+00:00" />
+  <TestSettings name="default" id="94607dbf-6fd6-4e41-9753-3515e6f1dee0">
+    <Deployment runDeploymentRoot="_d71188ba1e2e_2026-09-17_15_06_17" />
+  </TestSettings>
+  <Results>
+    <UnitTestResult executionId="46bf17d5-180d-41eb-bb2e-f49992afd81a" testId="aa108066-ca7e-10f2-6b71-a88f59d85770" testName="InferenceWeb.Tests.Gemma4BatchedDecodeLifetimeTests.BatchedDecode_KeepsInputStorageAliveAcrossForcedCollection" computerName="d71188ba1e2e" duration="00:00:15.0649413" startTime="2026-09-17T15:06:17.0204772+00:00" endTime="2026-09-17T15:06:31.9966326+00:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="46bf17d5-180d-41eb-bb2e-f49992afd81a" />
+    <UnitTestResult executionId="dea88d74-6e1f-4c49-99f6-c59bf4d52902" testId="fdf22a6b-093f-57c9-d640-3046dd2c1e22" testName="InferenceWeb.Tests.Gemma4BatchedFusedDecodeParityTests.BatchedFusedDecode_MatchesRoundRobin_TokenForToken" computerName="d71188ba1e2e" duration="00:00:29.2958923" startTime="2026-09-17T15:05:47.6323531+00:00" endTime="2026-09-17T15:06:16.9182423+00:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="dea88d74-6e1f-4c49-99f6-c59bf4d52902">
+      <Output>
+        <StdOut>[parity] backend=GgmlCuda native batched-decode caps=Ple, KvDonor, SwaWrap
+[parity] prompt lengths = 6,581,8,11
+[parity] n=2: fused steps=11 fallback steps=0
+[parity] n=2 seq0 (prompt 6 tok): MATCH
+[parity] n=2 seq1 (prompt 581 tok): MATCH
+[parity] n=3: fused steps=11 fallback steps=0
+[parity] n=3 seq0 (prompt 6 tok): MATCH
+[parity] n=3 seq1 (prompt 581 tok): MATCH
+[parity] n=3 seq2 (prompt 8 tok): MATCH
+[parity] n=4: fused steps=11 fallback steps=0
+[parity] n=4 seq0 (prompt 6 tok): MATCH
+[parity] n=4 seq1 (prompt 581 tok): MATCH
+[parity] n=4 seq2 (prompt 8 tok): MATCH
+[parity] n=4 seq3 (prompt 11 tok): MATCH</StdOut>
+      </Output>
+    </UnitTestResult>
+  </Results>
+  <TestDefinitions>
+    <UnitTest name="InferenceWeb.Tests.Gemma4BatchedDecodeLifetimeTests.BatchedDecode_KeepsInputStorageAliveAcrossForcedCollection" storage="/workspace/ts-codex-branch-completion-20260917/repo/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="aa108066-ca7e-10f2-6b71-a88f59d85770">
+      <Execution id="46bf17d5-180d-41eb-bb2e-f49992afd81a" />
+      <TestMethod codeBase="/workspace/ts-codex-branch-completion-20260917/repo/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Gemma4BatchedDecodeLifetimeTests" name="BatchedDecode_KeepsInputStorageAliveAcrossForcedCollection" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Gemma4BatchedFusedDecodeParityTests.BatchedFusedDecode_MatchesRoundRobin_TokenForToken" storage="/workspace/ts-codex-branch-completion-20260917/repo/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="fdf22a6b-093f-57c9-d640-3046dd2c1e22">
+      <Execution id="dea88d74-6e1f-4c49-99f6-c59bf4d52902" />
+      <TestMethod codeBase="/workspace/ts-codex-branch-completion-20260917/repo/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Gemma4BatchedFusedDecodeParityTests" name="BatchedFusedDecode_MatchesRoundRobin_TokenForToken" />
+    </UnitTest>
+  </TestDefinitions>
+  <TestEntries>
+    <TestEntry testId="aa108066-ca7e-10f2-6b71-a88f59d85770" executionId="46bf17d5-180d-41eb-bb2e-f49992afd81a" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="fdf22a6b-093f-57c9-d640-3046dd2c1e22" executionId="dea88d74-6e1f-4c49-99f6-c59bf4d52902" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+  </TestEntries>
+  <TestLists>
+    <TestList name="Results Not in a List" id="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestList name="All Loaded Results" id="19431567-8539-422a-85d7-44ee4e166bda" />
+  </TestLists>
+  <ResultSummary outcome="Completed">
+    <Counters total="2" executed="2" passed="2" failed="0" error="0" timeout="0" aborted="0" inconclusive="0" passedButRunAborted="0" notRunnable="0" notExecuted="0" disconnected="0" warning="0" completed="0" inProgress="0" pending="0" />
+    <Output>
+      <StdOut>[xUnit.net 00:00:00.01] xUnit.net VSTest Adapter v3.1.4+50e68bbb8b (64-bit .NET 10.0.12)
+[xUnit.net 00:00:00.68]   Discovering: InferenceWeb.Tests
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 45498 MiB):
+  Device 0: NVIDIA A40, compute capability 8.6, VMM: yes, VRAM: 45498 MiB
+[xUnit.net 00:00:02.71]   Discovered:  InferenceWeb.Tests
+[xUnit.net 00:00:02.81]   Starting:    InferenceWeb.Tests
+Backend: GgmlCuda
+Model: gemma4, Layers=42, Hidden=2560, Heads=8, KVHeads=2, GlobalKVHeads=2, Vocab=0
+Head dims: local=256, global=512
+RoPE global=1000000 local=10000
+Partial rotary dims=512
+Sliding window=512, Softcap=30
+PLE dim=256, SharedKVLayers=18
+Layer types: 7 global (causal), 35 local (SWA)
+KV sharing: layers 24-41 share with donors
+  Prefaulted GGUF page cache: 7.5 GiB with 16 read streams in 3.5s (2.14 GiB/s)
+Loading model weights... done (339 F32 tensors, 381 quantized tensors)
+  Quantized: 7641 MB (7641 MB file-backed), F32: 2 MB
+  Output tied to token_embd.weight
+  Fused QKV projections: 24
+  Fused projections: 42 Gate+Up
+  Device-resident quantized weights: 7641 MB across 291 tensors
+Context length: using MAX_CONTEXT=8192; model declares gemma4.context_length=131072.
+  KV cache: 148 MB (dtype: f16, global layers: 8192 seq, SWA layers: 512 seq)
+  Gemma4 fused model decode enabled
+Backend: GgmlCuda
+Model: gemma4, Layers=42, Hidden=2560, Heads=8, KVHeads=2, GlobalKVHeads=2, Vocab=0
+Head dims: local=256, global=512
+RoPE global=1000000 local=10000
+Partial rotary dims=512
+Sliding window=512, Softcap=30
+PLE dim=256, SharedKVLayers=18
+Layer types: 7 global (causal), 35 local (SWA)
+KV sharing: layers 24-41 share with donors
+Loading model weights... done (339 F32 tensors, 381 quantized tensors)
+  Quantized: 7641 MB (7641 MB file-backed), F32: 2 MB
+  Output tied to token_embd.weight
+  Fused QKV projections: 24
+  Fused projections: 42 Gate+Up
+  Device-resident quantized weights: 7641 MB across 291 tensors
+Context length: using MAX_CONTEXT=8192; model declares gemma4.context_length=131072.
+  KV cache: 148 MB (dtype: f16, global layers: 8192 seq, SWA layers: 512 seq)
+  Gemma4 fused model decode enabled
+[xUnit.net 00:00:47.30]   Finished:    InferenceWeb.Tests
+</StdOut>
+    </Output>
+  </ResultSummary>
+</TestRun>

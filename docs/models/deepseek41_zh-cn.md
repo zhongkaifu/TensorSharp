@@ -162,7 +162,7 @@ dotnet build TensorSharp.Server.Host/TensorSharp.Server.Host.csproj -c Release \
 
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 MAX_CONTEXT=65536 \
   TS_CPU_MOE_THREADS=32 TS_DSV41_TP=0 TS_DSV4_UBATCH=256 \
-  TS_DSV41_ENGRAM_WARM=1 TS_DSV41_SPARSE_FA=1 \
+  TS_DSV41_ENGRAM_WARM=1 \
   TS_DSV41_COMPACT_RAW_GATHER=0 KV_CACHE_DTYPE=f16 \
   TS_SCHED_MAX_RUNNING_SEQS=4 TS_SCHED_MAX_BATCHED_TOKENS=4096 \
   TS_SCHED_PREFILL_CHUNK=256 TS_SCHED_SOLO_PREFILL_CHUNK=8192 \
@@ -172,7 +172,9 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 MAX_CONTEXT=65536 \
 ```
 
 宿主构建会把原生库复制到服务端 DLL 旁边。上面这条启动命令使用的是保守基准矩阵的微批
-与调度器设置；验证报告里的优化配置用的是另一组参数。`TS_CPU_MOE_THREADS` 要按可用的
+与调度器设置；验证报告里的优化配置用的是另一组参数。稀疏 prefill attention 不需要任何
+开关：它在这条路径上默认开启，`TS_DSV41_SPARSE_FA=0` 可将其关闭。`TS_DSV4_UBATCH=256`
+固定为该矩阵实测的宽度；不设置则由加载器自行选择（见[后端](#后端)）。`TS_CPU_MOE_THREADS` 要按可用的
 CPU 配额来选，并为每次运行记录下来。即便是纯 GPU 放置也要在启动环境里设置它：原生的
 CPU 图工作与主机侧归约仍会影响延迟。当前 CLI 也接受 `--cpu-moe-threads N`；两者都给
 时请填相同的值，因为原生加载器优先采用为正的环境变量值。
@@ -197,7 +199,11 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 MAX_CONTEXT=65536 \
 
 [实测启动记录](../validation/deepseek41/full-checkpoint/layer8-context65536-ubatch1024-cpumoe0-cputhreads32-sparse1-compact1-chunk1024-6b3-final-launch.json)
 保留了原始 VM 路径、二进制哈希与环境。该配置通过了 138/138 项推理用例；其吞吐与限制
-记录在下文。稀疏 flash attention 与紧凑 gather 仍是可选项，并带有已记录的浮点差异。
+记录在下文。紧凑 gather 仍是可选项，并带有已记录的浮点差异。该记录中的
+`TS_DSV41_SPARSE_FA=1` 选择的是 ggml 的掩码压缩 flash-attention 内核：这些结果是在最初的
+V4.1 支持（`3347b06b`）上记录的，当时还没有 TensorSharp 自有的 F32 attention，而后者的
+稀疏 prefill 现在是默认行为（见[后端](#后端)）。因此其 19.985/80.240 s 的长提示词耗时并不
+是对当前 attention 路径的测量。
 启动与页预热不计入推理测量。
 
 在没有显式线程设置时，纯 GPU 的 V4.1 加载使用调用方的 `TS_DSV4_THREADS`，默认上限为
@@ -319,14 +325,25 @@ Q4_K_M 权重上，这意味着**每个 1024-token 的 prefill 分块要花 1435
 再加 8 GiB 装不进探测到的主机/cgroup 内存额度、或 `MemAvailable` 本来就留不住这些表时，
 预热会被跳过并给出诊断。
 
+预热用 `pread` 以 64 MiB 为块读取每张表，每个读取线程（`TS_DSV4_LOAD_THREADS`，默认 16）
+负责表中一段连续区间，并跳过 `mincore` 报告页面已全部驻留的块，因此表仍在缓存中时重新
+加载几乎不读任何数据。过去的做法是每 4 KiB 页触碰映射的一个字节，而在网络文件系统上每一次
+这样的缺页都是一次受挂载点预读上限约束的同步读（A40 虚拟机的 MooseFS 挂载为 128 KiB）：
+七卡 A40 通道同步预热 103 GiB 的 Q4_K_M 表用了 311.3 秒。在同一台虚拟机上实测，对一段已
+驱逐的 8 GiB 表区间，`pread` 为 2.38–2.54 GiB/s，逐页触碰为 0.63–0.69 GiB/s；测量方法见
+[加载时间](#加载时间)。`TS_DSV4_WARM_PREAD=0` 让下面两种形式都恢复逐页触碰。同步模式下的
+读取错误会让加载失败并给出文件与偏移；后台模式下只打印一行日志，模型照常服务。
+
 | `TS_DSV41_ENGRAM_WARM` | 行为 |
 |---|---|
-| 未设置（默认） | 模型开始服务后在后台预热 |
-| `1` | 与此前一致，在加载期间同步预热；启动时间增加约 110–210 秒 |
+| 未设置（默认） | 模型开始服务后在后台预热；完成时打印 `[dsv41] warmed ... Engram pages in ...s (background, ...)` |
+| `1` | 与此前一致，在加载期间同步预热；启动时间增加的就是读表的时间（七卡 A40 通道上逐页触碰 103 GiB 用了 311.3 秒；按实测的 2.24–2.54 GiB/s `pread` 速率计算约为 41–46 秒的读取） |
 | `0` | 从不预热 |
 
 稀疏读取的映射建议（`MADV_RANDOM`）只在预热结束之后才施加，无论采用哪种预热形式：该建议
-会关闭预热本身所依赖的预读。
+会关闭预热本身所依赖的预读。`pread` 预热只把页面放进页缓存，并不把它们映射进进程；此后
+查表第一次触碰某一行是一次次缺页（minor fault），而不是一次存储读取。在这样预热过的表上，
+经 `MADV_RANDOM` 映射随机读取 2,000 个 144 字节的行，平均 0.0037–0.0056 毫秒，没有主缺页。
 
 `TS_DSV41_ENGRAM_THREADS=1..32` 控制常驻查表工作线程数，默认取 16 与硬件线程数中的
 较小者。prefill 与 decode 都使用并行取行：单个 token 在每张 Engram 表上要选 24 行互不
@@ -365,6 +382,34 @@ prefill、分块大小 1/3/5/8 与 reset——不过那是 fixture 规模的对�
 没有数值门禁。和 `ggml_cpu` 一样，这两条都是正确性与可移植性通道，而不是服务通道；
 细节见[在 ggml CPU 后端上运行](#在-ggml-cpu-后端上运行)的末尾。`--backend mlx` 仍然被
 拒绝。
+
+在 `ggml_cuda` 上，V4.1 的 attention 运行 TensorSharp 自有的 F32 内核（ggml 的 CUDA flash
+attention 会把 Q 与 softmax 权重收窄到 F16，而 cache 量化可能放大丢失的这些位）。**prefill
+默认是稀疏的**，前提是调用既宽又长：超过 8 个 query、至少 8,192 个 key（原始窗口环加上可见的
+压缩行）的分块，每个 query 只经由掩码压缩内核关注自己的滑动窗口与索引器选中的行，最多
+128 + 512 个 key。其余情况保持稠密内核：单 token decode 与每次 DSpark verify（6 行）使用
+分 key 内核，因此 verify 提交的 cache 行仍与 decode 完全一致；更短的 prefill 使用分块
+（tiled）内核，因此 attention 始终低于 8,192 个 key 的提示词逐位不变。可见 key 多于上限的行
+会退回全行扫描，所以这个上限不会丢掉任何 key。
+
+在单张 A40 上实测（`GgmlOpsCudaAttentionPrecisionTest --benchmark-dsv41-prefill 512 33536 64 5`，
+它通过生产环境的门控与该变量选择内核）：64 个头、512 个 query、33,536 个 key 时，稀疏每次
+**34.1–34.3 ms**，分块为 **1,547–1,549 ms**。与分解的 F32 参考相比，稀疏内核的最大绝对误差为
+1.1e-7（相对 L2 7.4e-7），分块内核为 8.9e-8（4.8e-7）。稀疏 query 也与同一调用中的其他 query
+无关——query 0 单独计算、在 9 个 query 中、在 512 个 query 中逐位相同——因此提示词的结果不取决于
+prefill 如何分块。`TS_DSV41_SPARSE_FA=0` 恢复分块 prefill。
+
+这个自有门控（超过 8 个 query、至少 8,192 个 key、F32 压缩内核）与 ggml flash-attention
+内核的门控不同，后者由非自有的 attention 路径使用（非 CUDA GPU、CPU 后端）。在那里
+`TS_DSV41_SPARSE_FA=1` 仍然只在单个 query 或至少 16,384 个 key 时启用 ggml 的掩码压缩 flash
+attention，其 F16 运算与 CPU oracle 的相对 L2 实测最高 7.8e-4；该提示保持显式开启。稀疏
+attention 减少的是 attention 计算量，并不消除 prefill 期间共享压缩 cache 在 GPU 之间的拷贝。
+
+默认上下文分配上限为 65,536 个 token，除非提供 `MAX_CONTEXT`。`TS_DSV4_UBATCH` 控制前向
+微批。不设置时，V4.1 在 ggml GPU 后端上由加载器选择：1024、512 或 256 中所需路由专家 CPU
+层数不多于 256 的最宽者，记录为 `[dsv4] prefill ubatch: N (auto; ...)`（见
+[为图保留的设备内存](#为图保留的设备内存)）。CPU 执行器与 direct CUDA 引擎保持 256。任何
+显式值都原样使用；`TS_DSV4_UBATCH=256` 恢复此前固定的默认值。
 
 ### 每张 GPU 一个后端
 
@@ -446,6 +491,25 @@ top-k 临时量、一个微批的激活以及 2 GiB 底线计价。留得太多�
 Q4_K_M 上，5240 MiB 会把三层路由专家挤到主机上，而 3174 MiB 只需一层，差别是 prefill
 350 → 480 tok/s。
 
+这个保留量与原始滑动窗口环都随 prefill 微批增长，所以在 `TS_DSV4_UBATCH` 未设置时，加载器
+会为每个候选宽度分别计算一次切分。上下文 65,536 时，256 / 512 / 1024 的默认保留量为每张卡
+2,318 / 2,588 / 3,128 MiB，窗口环为 512 / 768 / 1,280 行。它选择所需路由专家 CPU 层数不多于
+256（或本次运行本就要付出的显式 `--n-cpu-moe`）、且不会把驻留 GPU 的 Engram 表挪回主机的
+最宽候选。更宽的分块让每个 prefill token 更便宜：一层 Q4_K_M 形状的路由专家层
+（`GgmlOpsDsv4MoeWidthBench`，均匀 top-6 路由，单张 A40）驻留 GPU 时在 256 / 512 / 1024 个
+token 下每个分块耗时 35.3–35.7 / 36.9–37.2 / 38.9–39.1 ms，1024 时每 token 便宜 3.6 倍；在 32 个
+主机线程上为 112.7–117.9 / 185.0–189.1 / 349.9–353.3 ms（每 token 0.44–0.46 对 0.34 ms）。但多一层
+主机专家的代价要由每个 decode token 承担，所以从不做这种交换。日志行会给出宽度，并在放弃更宽宽度时说明原因。低于 256
+所需层数的 `--n-cpu-moe` 会被拒绝并给出该数字（`Re-run with --n-cpu-moe N`）。2048 不在候选
+之列：保留量只在 1024 上验证过（一次 57,424 token 的 prefill 在 3,072 MiB 保留量下峰值时仍剩
+1,522 MiB），而 ggml 的设备 OOM 会直接结束进程。所选宽度通过 `TSGgml_Dsv4UBatch` 导出，推测
+解码的 prefill 按同一宽度分块。
+
+用 Q4_K_M 发行版的张量大小，以及它在七卡 A40 上的运行所反推的每卡预算（加载后空闲内存加上
+加载放置的字节，每卡 45,091–45,123 MiB）来计算：上下文 65,536 时三种宽度都需要 6 层路由
+专家 CPU 卸载，因此加载器选择 1024；上下文 131,072 时同样的预算下每种宽度也都是 6 层。这些
+是计算出的方案（`GgmlOpsDsv4UbatchPlanTest`），不是实测加载。
+
 图缓存现在同时按字节数和条目数设限。一个条目的计算缓冲区随其形状增长，而处于不同位置的
 并发序列会产生很多不同形状：过去四个并发的 10.8k token prefill 会占满全部十二个条目并把
 某张卡的显存用尽，而这不是可恢复的错误——ggml 的分配器在重新分配前先释放旧缓冲区，因此
@@ -474,6 +538,97 @@ Q4_K_M 上，5240 MiB 会把三层路由专家挤到主机上，而 3174 MiB 只
 设置 `TS_CPU_MOE_THREADS` 与 `TS_DSV41_COMPACT_RAW_GATHER=0`。若使用本卡片中的模型目录，
 请把 `BENCH_DSV41_GGUF` 指向第一个分片；矩阵默认的目录名与此不同。它的文本场景不能替代
 验证报告中单独的严格工具、JSON、图像/视频与推理检查。
+
+### 加载时间
+
+权重由一组读取线程（`TS_DSV4_LOAD_THREADS`，默认 16）按 `TS_DSV4_LOAD_CHUNK_MB` 大小的
+分块（默认 64）流式上传到 GPU。每个线程只走任务列表中的**一段连续区间**。在网络文件系统上，
+这一点比加载器的其他任何细节都重要：任务按（分片，文件偏移）排序，如果像这个加载器过去那样
+从共享游标分发，每个文件描述符读完一个分块就要跳过 `线程数 x 分块`，默认参数下是 1 GiB。
+预读是按描述符进行的，因此十六条读流没有一条是顺序的。
+
+在八卡 A40、MooseFS 挂载上的 Q4_K_M 发行版上冷态实测（每次运行前把全部 414 GiB 分片逐出
+页缓存，两种顺序各交替两次）：
+
+| 任务顺序 | 权重上传，294.8 GiB | 模型总加载时间 |
+|---|---:|---:|
+| 每线程一段连续区间 | **141–147 s**（2.0–2.1 GiB/s） | **144–155 s** |
+| 共享游标（`TS_DSV4_LOAD_CONTIGUOUS=0`） | 360–377 s（0.78–0.82 GiB/s） | 363–382 s |
+
+**2.5 倍。**`TensorSharp.Runtime/GgufReader.cs:330` 为托管侧 GGUF 预取记录了同样的结论
+（"~3x slower on MooseFS"）。区间按**字节数**而不是任务数切分，因为一个张量的最后一个分块
+不是满块；读完自己区间的线程从进度最落后区间的**尾部**窃取任务，让被窃取者继续向前读。
+
+有三件事看起来像是解法，但在这台机器上实测都不是：
+
+* **页锁定 staging 缓冲区。** 主机到设备的拷贝只占 87 s 线程时间，而 `fread` 占 5,539 s——
+  只是加载工作量的 1.6%。pinning 能让拷贝本身快几倍，但对整个加载几乎没有影响。
+* **更多读取线程。** 在这个文件系统上吞吐量并不随线程数单调增长；
+  `TensorSharp.Backends.Cuda/Dsv4/Dsv4CudaEngine.cs:744` 记录了 16 线程 2.4 GB/s，
+  96 线程只有 1.0 GB/s。
+* **对主机专家预取使用 `MADV_WILLNEED`。** 29.7 s 与 31.3 s，而普通的逐页缺页遍历平均
+  27.7 s，也就是说并没有更好。
+
+上传之后的两趟读取同样用 `pread`。驻留主机的专家（`--n-cpu-moe`）预取与 Engram 预热（见
+[主机映射的 Engram 表](#主机映射的-engram-表)）把各自的张量合并成文件区间，按字节切成每个
+线程一段连续区间（`TS_DSV4_LOAD_THREADS`），每个线程用自己的描述符按 64 MiB 块读取，并跳过
+`mincore` 报告页面已全部驻留的块。它们过去是每 4 KiB 页触碰映射的一个字节。在网络文件系统上，
+每一次这样的缺页都是一次受挂载点预读（`read_ahead_kb`，A40 虚拟机上为 128 KiB）约束的同步读，
+所以七卡 A40 通道（`--n-cpu-moe 6`，Q4_K_M）预取 48.2 GiB 专家花了 129.7 s，预热 103 GiB
+Engram 表花了 311.3 s。
+
+在那台虚拟机上用 `GgmlOpsDsv4FileWarmBench`（在 Linux 上随原生测试一起构建）实测：16 线程，
+8 GiB 区间，每组测量前逐出并确认 `mincore` = 0，重复三到五次，各组交替进行：
+
+| 读取 8 GiB | Engram 表，分片 00002 @ 20 GiB | 专家，分片 00003 @ 9,002,135,936 |
+|---|---:|---:|
+| `pread`（默认） | 2.38–2.54 GiB/s | 2.24–2.47 GiB/s |
+| 预取的逐页遍历，256 MiB 段（`TS_DSV4_WARM_PREAD=0`） | 0.62–0.66 GiB/s | 0.68–0.74 GiB/s |
+| Engram 的逐页遍历，8 MiB 块（`TS_DSV4_WARM_PREAD=0`） | 0.63–0.69 GiB/s | 0.65–0.68 GiB/s |
+| 同一区间再次预热，已驻留（所有块均跳过） | 64–159 GiB/s | 139–187 GiB/s |
+
+`pread` 只填充页缓存，并不填充进程的页表，而逐页遍历两者都做了；第一次 prefill 又会密集地
+读取专家。因此预取在每个块进入缓存后还会逐页读一个字节：在已驻留的页面上，这趟遍历在 16
+线程下耗时 0.004–0.006 s/GiB，而对同样区间调用 `madvise(MADV_POPULATE_READ)` 需要
+0.019–0.023 s/GiB。Engram 表不做映射；它的行每次只读几行。
+
+在这个挂载点上，预读提示无法替代读取。对一段已逐出的 8 GiB 区间调用 `MADV_WILLNEED`、
+`POSIX_FADV_WILLNEED` 或 `readahead(2)`，十秒后都只有 128 KiB（0.0015%）驻留。不要再尝试。
+
+预取或同步 Engram 预热中的读取错误会让加载失败，并给出分片与偏移。`TS_DSV4_WARM_PREAD=0`
+原样恢复两种逐页遍历。
+
+除非设置 `TS_HOST_MOE_PIN=1`，被卸载的专家不会被页锁定。被卸载层的路由专家的每个节点都被
+指定到 CPU 后端（`build_moe_host`），而 `ggml_backend_sched` 从不覆盖这种指定，因此它的
+op-offload 规则永远不会把这些权重流式送到 GPU：跨总线的只有 `[n_embd, n_tokens]` 的激活，
+锁定的专家页从来不是 DMA 的来源。在七卡 A40 通道（`--n-cpu-moe 6`）上，锁定 48.2 GiB 让加载
+多花 20.4 s，并让这些页面在同样承载页缓存的 cgroup 中无法被回收。现在加载时会打印一行，
+说明被卸载的专家保持可分页。`TS_HOST_MOE_PIN=1` 恢复页锁定以及
+`page-locked ... GiB of host experts` 日志；`TS_HOST_MOE_PIN=0` 仍对所有架构关闭锁页。
+其他 MoE 架构的 prefill 确实会流式传输被卸载的专家，默认仍然锁页。
+
+加载器不会再读已上传的分块，但上传之后紧接着就要读主机映射的权重，并在整个运行期间从页缓存
+提供它们，而页缓存计入 cgroup。因此默认情况下，只有当上传字节数加上主机映射的权重再加 8 GiB
+超过主机额度（cgroup 上限）时，每个分块上传到设备后才释放它的页缓存；否则保留，额度未知时也
+保留。加载时会打印这一判断及其数值：
+
+```text
+[dsv4] load page cache: dropping each uploaded chunk's page cache (automatic: 263.0 GiB upload + 151.2 GiB host-mapped + 8.0 GiB headroom exceeds the 326.9 GiB allowance; TS_DSV4_LOAD_DROP_CACHE=0 overrides)
+```
+
+这正是七卡 A40 通道的数值：414 GiB 的读取装进 326.9 GiB 的 cgroup。它的加载日志中专家预取为
+0.37 GiB/s、Engram 预热为 0.33 GiB/s，大约只有同样的逐页遍历在该虚拟机上、cgroup 约一半占用
+时实测速率（见上表）的一半。释放无法让上传本身变快——上传已经以存储速率读取——而且在该挂载上
+每个已驻留的 64 MiB 分块要花 5.9–7.3 ms（`GgmlOpsDsv4FileWarmBench --drop-cost`，263 GiB
+约合 25–30 s 线程时间）。预期收益在上传之后的阶段，尚未在完整加载上测量；检验方法是用默认值的
+冷加载对比 `TS_DSV4_LOAD_DROP_CACHE=0` 的冷加载。规则之所以保持有条件，是因为每次都释放会让
+完全驻留在 GPU 上的检查点每次重新加载都变冷。`TS_DSV4_LOAD_DROP_CACHE=0` 从不释放（此前的
+默认），`=1` 总是释放。在八卡 A40 机器上，`=1` 没有改变上传的读取线程时间（5,374 s 对比
+5,539 s，处于运行间波动之内），加载结束时页缓存约 39 GiB 而不是约 330 GiB。
+
+自己计时时有一点要注意：如果机器的页缓存已经塞满了这份检查点，加载可能比从空缓存开始**更慢**，
+因为 cgroup 在第一次读取之前就已到达上限，之后的每次读取都要与回收竞争。请同条件比较——先把
+分片逐出。
 
 ### 在 ggml CPU 后端上运行
 

@@ -132,6 +132,7 @@ namespace TensorSharp.Models
                 Buffer.MemoryCopy(TensorComputePrimitives.GetStoragePointer(old).ToPointer(),
                     TensorComputePrimitives.GetStoragePointer(grown).ToPointer(), grown.Storage.ByteLength, liveBytes);
                 GgmlBasicOps.Qwen4ExpReleaseSeqState([(IntPtr)TensorComputePrimitives.GetStoragePointer(old)]);
+                CountDecodeGraphReset();
                 InvalidateTensorDeviceCache(old);
                 old.Dispose();
                 _idxKCache[layer] = grown;

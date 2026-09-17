@@ -52,7 +52,7 @@ namespace TensorSharp.Cli
             catch (Exception ex) when (ex is ArgumentException or FileNotFoundException)
             {
                 Console.Error.WriteLine("Configuration error: " + ex.Message);
-                Environment.ExitCode = 1;
+                Environment.ExitCode = HostExitCodes.ConfigurationError;
                 return;
             }
 
@@ -90,7 +90,7 @@ namespace TensorSharp.Cli
             try
             {
                 MainCore(args);
-                _log.LogInformation(LogEventIds.CliCompleted, "tensorsharp-cli completed");
+                _log.LogInformation(LogEventIds.CliCompleted, "tensorsharp-cli completed exitCode={ExitCode}", Environment.ExitCode);
                 try { TensorSharp.GGML.GgmlBasicOps.Shutdown(); }
                 catch { /* native lib may be absent for non-GGML backends */ }
 
@@ -117,7 +117,7 @@ namespace TensorSharp.Cli
                 // to the log for the rare deep ArgumentException.
                 _log.LogError(LogEventIds.CliFailed, ex, "cli.invalid-arguments {Error}", ex.Message);
                 Console.Error.WriteLine("Configuration error: " + ex.Message);
-                Environment.ExitCode = 1;
+                Environment.ExitCode = HostExitCodes.ConfigurationError;
             }
             catch (Exception ex)
             {
@@ -198,7 +198,7 @@ namespace TensorSharp.Cli
             if (CodeExecOptions.RejectRemoved(args) is { } removedCodeExecFlag)
             {
                 Console.Error.WriteLine(removedCodeExecFlag);
-                Environment.ExitCode = 1;
+                Environment.ExitCode = HostExitCodes.ConfigurationError;
                 return;
             }
 
@@ -211,7 +211,7 @@ namespace TensorSharp.Cli
             catch (ArgumentException ex)
             {
                 Console.Error.WriteLine(ex.Message);
-                Environment.ExitCode = 1;
+                Environment.ExitCode = HostExitCodes.ConfigurationError;
                 return;
             }
             codeExecOptions.ApplyEnvironment();
@@ -714,9 +714,12 @@ namespace TensorSharp.Cli
             {
                 _log.LogError(LogEventIds.CliFailed,
                 "Model file not found: {ModelPath}", modelPath ?? "(none)");
-                Console.Error.WriteLine("Usage: TensorSharp.Cli --model <path.gguf> [options]");
-                Console.Error.WriteLine(
-                    "Run 'TensorSharp.Cli --help' for the full option list with descriptions, defaults, ranges, and examples.");
+                // This used to print usage and exit 0, so a script could not tell a
+                // missing model from a finished run.
+                Console.Error.WriteLine(ModelLoadRefusal.FormatErrorLine(
+                    $"model file not found: {modelPath ?? "(no --model given)"}. " +
+                    "Usage: TensorSharp.Cli --model <path.gguf> [options]; --help lists every option."));
+                Environment.ExitCode = HostExitCodes.ModelLoadRefused;
                 return;
             }
 
@@ -826,7 +829,28 @@ namespace TensorSharp.Cli
                 tpDegree = localDegree;
             }
 
-            using var model = ModelBase.Create(modelPath, backend, tpDegree, tpGroup, draftModelPath);
+            ModelBase createdModel;
+            try
+            {
+                createdModel = ModelBase.Create(modelPath, backend, tpDegree, tpGroup, draftModelPath);
+            }
+            catch (Exception ex) when (ModelLoadRefusal.TryDescribe(ex, out string loadRefusal))
+            {
+                // A refused load (not enough VRAM, an unsupported KV dtype or --tp layout,
+                // a missing or invalid file) is the operator's to fix: one line and
+                // HostExitCodes.ModelLoadRefused rather than an unhandled exception and
+                // abort(). The stack trace stays available at --log-level debug. Main's
+                // normal exit path then shuts the ggml backend down.
+                _log.LogError(LogEventIds.ModelLoadFailed,
+                    "Model load refused: {ModelFile} on backend {Backend}: {Reason}",
+                    Path.GetFileName(modelPath), backend, loadRefusal);
+                _log.LogDebug(LogEventIds.ModelLoadFailed, ex, "Model load refused: {ModelFile}", Path.GetFileName(modelPath));
+                tpGroup?.Dispose();
+                Console.Error.WriteLine(ModelLoadRefusal.FormatErrorLine(loadRefusal));
+                Environment.ExitCode = HostExitCodes.ModelLoadRefused;
+                return;
+            }
+            using var model = createdModel;
 
             // Speculator weights that ship as their own file (Gemma 4's
             // gemma4-assistant draft head, named with --draft-model) attach

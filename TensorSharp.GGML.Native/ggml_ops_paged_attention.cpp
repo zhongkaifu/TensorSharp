@@ -289,14 +289,10 @@ namespace
         ggml_tensor* k_attn = ggml_cont(sess.ctx, ggml_permute(sess.ctx, sess.k_in, 0, 2, 1, 3));
         ggml_tensor* v_attn = ggml_cont(sess.ctx, ggml_permute(sess.ctx, sess.v_in, 0, 2, 1, 3));
 
-        ggml_tensor* attn_out = ggml_flash_attn_ext(
-            sess.ctx, q_attn, k_attn, v_attn, sess.attn_mask, scale, 0.0f, 0.0f);
-
         if (has_sinks)
-        {
             sess.sinks_tensor = ggml_new_tensor_1d(sess.ctx, GGML_TYPE_F32, num_heads);
-            ggml_flash_attn_ext_add_sinks(attn_out, sess.sinks_tensor);
-        }
+        ggml_tensor* attn_out = flash_attn_ext_guarded(sess.ctx, "paged attention",
+            q_attn, k_attn, v_attn, sess.attn_mask, scale, 0.0f, 0.0f, sess.sinks_tensor);
 
         ggml_tensor* result = ggml_cpy(sess.ctx, attn_out, sess.attn_result);
         ggml_set_output(result);
@@ -619,15 +615,11 @@ namespace
         ggml_tensor* k_attn = ggml_cont(ctx, ggml_permute(ctx, k_in, 0, 2, 1, 3));
         ggml_tensor* v_attn = ggml_cont(ctx, ggml_permute(ctx, v_in, 0, 2, 1, 3));
 
-        ggml_tensor* attn_out = ggml_flash_attn_ext(ctx, q_attn, k_attn, v_attn,
-                                                   attn_mask, scale, 0.0f, 0.0f);
-
         ggml_tensor* sinks_tensor = nullptr;
         if (has_sinks)
-        {
             sinks_tensor = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, num_heads);
-            ggml_flash_attn_ext_add_sinks(attn_out, sinks_tensor);
-        }
+        ggml_tensor* attn_out = flash_attn_ext_guarded(ctx, "paged attention (device)",
+            q_attn, k_attn, v_attn, attn_mask, scale, 0.0f, 0.0f, sinks_tensor);
 
         ggml_tensor* result = ggml_cpy(ctx, attn_out, attn_result);
         ggml_set_output(result);

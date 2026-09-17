@@ -245,6 +245,7 @@ namespace TensorSharp.Models
                 // below then forces the rebuild that performs the re-seed.
                 InvalidateActiveSeqState();
                 GgmlBasicOps.Qwen4ExpResetFfnCache();
+                CountDecodeGraphReset();
             }
             _specStateFailed = false;
             // Host seeds zeroed and every entry re-armed: the host is the truth again.

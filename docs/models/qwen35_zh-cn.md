@@ -250,6 +250,125 @@ NeoX 风格旋转嵌入。频率在 `_ropeFreqs[halfDim]` 一次性预计算。�
 
 `qwen3next` GGUF 额外提供 `qwen35.rope.dimension_sections`，定义 MRoPE section 边界。存在时 RoPE 步骤使用多模态 RoPE；不存在时使用纯 NeoX RoPE。
 
+#### 图片之后的位置：M-RoPE 偏移（delta）
+
+合并网格为 H x W 的图片占用 KV cache 的 H*W 行，却只占 max(H, W) 个旋转位置。注入器按 HF 与
+SGLang `get_rope_index` 的方式排布提示（`ModelMultimodalInjector.LayoutQwenVLPrompt`）：区间内
+token 位于 `(base, base + h, base + w)`，其后的文本从 `base + max(H, W)` 继续。位置表之外的每个
+token 都位于
+
+```
+rope 位置 = KV 下标 + delta，   delta = 位置表最后一行的最大分量 + 1 - 提示长度
+```
+
+即 SGLang 的 `mrope_position_delta`（decode 位置为 `delta - 1 + seq_len`）。delta 按序列保存
+（`Qwen35Model.RopePositions.cs`）：
+
+- **在任何内核运行之前确定。** `BeginRopePositions` 从 prefill 分块暂存的位置表取得它；从 KV 下标
+  0 开始且没有位置表的前向会开启新历史（delta 为 0）；其他前向沿用当前序列的 delta。若一个分块的
+  所有行都是位于 `KV 下标 + delta` 的文本，则丢弃位置表，改走普通的标量 RoPE 图，旋转完全相同。
+- **所有路径都使用它。** 整模型 decode（`rope_pos_delta`）、融合 prefill/verify 图（标量行使用
+  `rope_pos_delta`）、arena 批处理 decode（每个 holder 的 `rope_positions`）、分页批处理前向
+  （来自注入器的请求 delta）、逐算子 attention、direct-CUDA 的 prefill 与 decode 图、张量并行以及
+  MTP 草稿头。逐层原生 attention 内核按 KV 下标旋转，因此越过图片的序列不会走它们。
+  `TSGgml_Qwen35RopePositionAbi` 防止使用在此约定之前构建的原生库：这样的库会明确报错并关闭融合图，
+  而不是以错误的参数个数被调用。（DFlash 草稿器保留自己的位置；它们只影响草稿被接受的数量，
+  从不影响输出。）
+- **与其描述的状态一起保存。** 每个请求的 holder 在换入换出、保留、重新绑定和池化过程中携带它；
+  共享前缀检查点及其克隆会复制它；KV-swap 并发路径的逐块 KV 快照在末尾保存它（与递归状态一样，
+  取块结束时的值；注入的块若大小不符，或其 delta 会让下一个 token 落在负位置，会在写入任何内容之前被
+  拒绝，因此被拒绝后模型恰好保留该块之前的内容）；检查点文件格式（`Q5KC`）升级为**版本 2**，在行数之后写入 delta。
+  版本 1 的文件没有 delta，导入时会被拒绝；引擎记录“保存的检查点与模型不符”，重新 prefill 该前缀
+  并再次保存。
+
+在此之前，decode、投机 verify 以及所有标量路径都直接按 KV 下标旋转，带来两个后果：
+
+- **单个请求。** 对图片的回复是在模型训练时不会在该图片之后见到的位置上生成的：提示之后的每个 token
+  都比参考位置多出“图片 token 数减 max(H, W)”（1253x836 的测试图片约为一千个位置）。修复之后
+  **图片之后的输出会改变**：现在它们就是正确的 Qwen-VL 实现所产生的结果。在 Mac 上实测（Metal，
+  Qwen3.5-9B-Q8_0，贪心，96 token），图片回合的回复在修复前（584f8f71，与 6db6dbf6 的 decode
+  相同）与修复后分别为：
+  - OpenAI，第 1 轮带图：`...sitting gracefully against a futuristic, glowing background filled
+    with floating cubes and digital particles.` 变为 `...sitting gracefully amidst a futuristic,
+    glowing digital landscape filled with floating cubes and light trails.`
+  - Web UI，第 3 轮带图：`...amidst a futuristic digital environment.` 变为
+    `...amidst a futuristic digital landscape.`
+  - OpenAI，第 3 轮带图：`This digital artwork features an anime-style woman...` 变为
+    `This image features an anime-style illustration of a young woman...`
+  - Web UI，第 1 轮带图：96 token 内没有变化。
+- **复用。** 经过图片回合的缓存与重新 prefill 同一历史得到的状态不同，因此前缀缓存 Phase 0 让所有
+  复用路径止于第一张图片（`SupportsReuseAcrossMediaSpan = false`）。Qwen 3.5/3.6 现在声明为
+  `true`：后续回合越过图片续接缓存。
+
+**验证。**
+
+- `Qwen35MRopeReferencePositionTests` 将提示排布、delta、模型自身的分块 prefill 与 decode 位置，
+  以及从头排布的后续回合，与由 SGLang `get_rope_index(model_type="qwen3_5")` 及其 decode 规则生成
+  的夹具进行比较（`eng/validation/qwen35_mrope_reference`，SGLang 2733afe5），覆盖一张图、两张图、
+  高与宽的网格、两对帧的视频和纯文本。若 decode 按 KV 下标（旧规则），26 个用例中有 10 个失败。
+- `Qwen35ImageFollowUpExactnessTests`（需要模型，`TS_TEST_MODEL_DIR`）在 Qwen3.5-9B-Q8_0 上运行
+  “文本 -> 图片 -> 文本 -> 文本”的对话。在引擎中，第 3、4 轮必须越过图片复用上一轮，每一轮的贪心
+  token 都与冷启动引擎比较；旁边同时有一段文本对话在 decode（按请求的 holder 与 arena 批处理 decode）
+  时同样比较。直接在模型上，把“decode 上一轮回复再 prefill 新后缀”构建出的回合与整段提示的冷启动
+  prefill 逐步比较 24 步 logits，并对一段纯文本对话做同样的比较作为对照。在图片之后建立的检查点经过
+  导出、导入和克隆后，decode logits 逐位相同；版本 1 文件会被拒绝。关闭 delta 时测试失败：在 Metal
+  上图片对话的最差 logit 差从 0.024 升到 3.24，而纯文本对照保持 0.010；在 CUDA 上从 2.39 升到 8.11（为其对照
+  0.92 的 8.8 倍），且第 4 轮出现一个并非平局的 token 变化（在测试的早期版本中，它在第 3
+  轮 token 上失败：复用得到 `...there is no roof visible. The scene depicts...`，冷启动得到
+  `...features...`）。
+  下面的测量使用真实照片（`TS_TEST_QWEN35_IMAGE`）。未设置时测试会绘制一张合成图片：直接比较用
+  448x336，并发用例用 896x672。原因是短于一个调度块（本测试中为 256 token）的已完成请求不会被保留为
+  holder，140 token 的图片让第 2 轮太短，第 3 轮无法复用任何内容，并发用例因此总是失败。
+
+**Logit 容差。** 复用与冷启动并非逐位相同：复用回合的回复行由 decode 图写入，冷启动回合由 prefill
+图写入（attention 与矩阵乘内核不同，CUDA 上是量化激活的矩阵乘，等轴时一个是 NeoX、一个是交错
+M-RoPE）。因此测试检查三点：
+
+- 词表上最差的最大 |dlogit| 不超过该后端的容差（`TS_TEST_QWEN35_LOGIT_TOLERANCE`；Metal 默认 0.1，
+  其他后端 3.0）；
+- 不超过纯文本对照的 4 倍（`TS_TEST_QWEN35_CONTROL_RATIO`）：图片的上下文更长，可以放大内核差异，
+  但不能带来自身的误差；
+- 贪心 token 相同，除非在出现差异的那一步冷启动的 top-2 差距小于该步测得的 logit 差——这是两个内核
+  都可能打破的平局。
+
+实测（24 步，第 2-4 轮）：
+
+| 后端 | 图片对话最差 \|dlogit\| | 纯文本对照 | 比值 | token 差异 | 检查点往返 |
+|---|---|---|---|---|---|
+| Metal（M 系列，Qwen3.5-9B-Q8_0） | 0.024 | 0.010 | 2.3x | 无 | 0.0 |
+| CUDA（A40，Qwen3.5-9B-Q8_0，mmproj F16） | 2.39 | 0.92 | 2.6x | 第 3 轮第 0 步（差距 0.034 < 0.47）与第 4 轮第 1 步（差距 0.13 < 0.29）：平局 | 0.0 |
+
+在 CUDA 上，即使是纯文本对话，decode 与 prefill 内核也会相差约一个 logit，因此在 24 个贪心 token 内，
+无论有没有图片，复用回合与冷启动回合都可能在低差距 token 上翻转。
+
+并发测试（holder 与 arena）采用同样的平局规则。在某个请求的 token 与其冷启动引擎运行首次不同的那一步，
+测试捕获冷启动 logits（直接在模型上对同一提示做冷启动 prefill，且到该步为止必须解码出相同的 token），
+只有当其 top-2 差距低于该后端的 logit 容差时才接受这一差异，并且不再比较该请求的剩余部分。它的纯文本
+对照以长于一个块的系统提示开头（第 1 轮 346 token）：使用一行系统提示时每个文本回合都短于一个块，没有
+回合被保留，对照什么也没复用。现在它必须复用上一轮留下的全部内容。2026-09-17 实测：
+
+| 后端 | 图片 | 文本第 2-4 轮复用 | token 差异 |
+|---|---|---|---|
+| Metal（Qwen3.5-9B-Q8_0，mmproj BF16） | 内置 896x672 | 367 / 411 / 446 | 无 |
+| Metal | 真实照片 | 367 / 411 / 446 | 无 |
+| CUDA（A40，Qwen3.5-9B-Q8_0，mmproj F16） | 内置 896x672 | 366 / 410 / 445 | 图片第 3 轮第 0 步（差距 0.23）、图片第 4 轮第 5 步（0.017）、文本第 3 轮第 0 步（0.041）：平局 |
+| CUDA | 真实照片 | 366 / 410 / 445 | 文本第 3 轮第 0 步（差距 0.041）：平局 |
+
+引入平局规则之前，CUDA 上使用内置图片的运行在图片第 3 轮第 0 步失败。
+
+**经过服务端**（Phase 0 的 IMG 探针：Web UI 与 OpenAI 对话，图片在第 1 或第 3 轮，另有纯文本对照；
+Metal，Qwen3.5-9B-Q8_0，贪心，每轮 96 token），图片之后的每一轮现在都续接缓存：
+
+| 场景 | 图片之后的回合 | 之前复用（截断） | 现在复用 | 之前 TTFT（Web UI）/ 总耗时（OpenAI） | 现在 |
+|---|---|---|---|---|---|
+| Web UI，第 1 轮带图 | 2、3、4 | 0、0、0 | 1,099 / 1,187 / 1,286（98.0-98.2%） | 1.00 / 1.10 / 1.18 s | 0.13 / 0.13 / 0.13 s |
+| Web UI，第 3 轮带图 | 4 | 0 | 1,340（98.2%） | 1.20 s | 0.13 s |
+| OpenAI，第 1 轮带图 | 2、3、4 | 0、0、0 | 1,099 / 1,188 / 1,286（97.9-98.2%） | 3.67 / 3.64 / 3.31 s | 2.20 / 2.39 / 1.41 s |
+| OpenAI，第 3 轮带图 | 4 | 0 | 1,301（98.1%） | 2.18 s | 0.94 s |
+
+该次运行的全部 24 条回复都与同一构建关闭提示复用（`TS_SCHED_PREFIX_CACHE=0`）时的结果相同，图片
+只编码一次，纯文本对照不变。
+
 ### 4.5 视觉编码器（`Qwen35VisionEncoder`）
 
 SigLIP 风格 ViT：
@@ -490,6 +609,40 @@ GGML 后端上 `qwen35moe` / `qwen3next` 的 decode 中，每层 MoE expert 计�
 - **GatedDeltaNet 层**：`_convState[layer]` 是 `(convKernel - 1) * qkvDim` 的 float 数组（conv1d 滑动窗口），`_deltaStateTensor[layer]` 形如 `[numVHeads, headVDim, headKDim]`（SSM 隐状态）。
 - `ResetKVCache()` 同时清零两类缓存。
 - 初始 CUDA 缓存可以小于 `maxContextLength`，按需扩张（启动时打印）。
+- **整模型 decode 的 conv scratch**（`_fdConvScratch`）属于每个缓存（主缓存和每个按请求的 holder），随缓存
+  一起换入换出。只要当前激活的缓存还没有 scratch 就会分配（其 GDN 真值在 host 环形缓冲里，从那里重新
+  填充），而不只是在首次构建 decode 描述符时分配。以前，一个在那一刻之前从未 decode 过的缓存（模型最初的
+  主缓存，在先绑定某个 holder 时被保存到一旁）会保留空 scratch，恢复后第一次 decode 就在
+  `TryFullModelDecodeCore` 中抛出 `NullReferenceException`；在引擎上，这对应新加载模型的第一个调度步是并发
+  步、之后主缓存上又有一次单独 decode 的情形。arena 批处理 decode 对 scratch 为空的 holder 同样处理。
+  `Qwen35ConvScratchTests`（需要模型）覆盖这一点。
+
+### 保留的 holder：一个块的下限
+
+已完成请求的按请求 holder 只有在至少覆盖一个调度块（默认 256 token）时，才会为其对话的下一轮保留
+（`BatchExecutor.TryRetainReleasedFusedCache`，以及对在主缓存上结束的对话使用的
+`DonateFinishedLiveCacheToRetained`）。因此更短的对话——例如短的图片对话，448x336 的图片只有 140 个
+token——每当与其他请求并行运行时，每一轮都要重新 prefill 整个提示并重新编码图片。单独运行的对话不受影响：
+它从 live cache 续接，而 live cache 没有这个下限。
+
+这个下限并不是 holder 本身的需要。holder 按 token 逐个匹配（`FindRetainedFusedMatch`），采用时预留
+ceil(lcp / BlockSize) 个占位块（`TryAdoptFusedContinuation`），这条路径上没有任何东西依赖块边界。它之所以
+保留，是因为降低下限在 Metal 上没有通过验证（2026-09-17，Qwen3.5-9B-Q8_0 + mmproj BF16）：
+
+- **尝试的做法。** 当更短的 holder 不会挤出任何已保留的 holder，且其字节数落在模型的空闲 holder 预算内
+  （测得的缓存余量的一半减去已停放的 holder，即 `CanPoolIdleCache` 对释放的 holder 使用的规则）时保留它，
+  两条保留路径都如此。
+- **引擎。** 一段图片对话与一段文本对话并行，前几轮都短于一个块（448x336 图片；一行的系统提示），之后每一轮
+  都复用了上一轮，但图片第 2 轮——在保留的 41 token holder 之上 prefill 图片——在第 20 步与冷启动运行分叉，
+  该步冷启动的 top-2 差距为 0.255，高于 Metal 的 0.1 容差。只重放这一对请求（第 1 轮与一个更长的文本请求
+  并行，第 2 轮单独运行）时，10 次中有 4 次以同样方式分叉，其中 3 次是新加载模型上的第一段对话；关闭 arena
+  批处理 decode（`TS_BATCHED_FUSED_DECODE=0`）时 3 次中 0 次；在未改动的代码上第 1 轮长于一个块时 6 次中 0 次。
+- **模型层面。** 直接在模型上驱动同样的序列（第 1 轮在主缓存上 prefill 后被采用，其回复在 arena 中与一个更长
+  的 holder 一起 decode，holder 被保留并重新绑定，prefill 图片，decode 24 步），与全程单独运行相比保持在 0.023
+  以内，arena decode 一步与单独 decode 相差不超过 0.0008。误差来自引擎调度这条路径的某个环节，目前尚未查明。
+- 同样的运行两次触发了上文的 conv scratch 空指针 `NullReferenceException`。该问题已修复，修复后分叉依然存在。
+
+在查明这一分叉之前，一个块的下限保持不变，Gemma 4 也一样（同一条执行器规则；更短的 Gemma 4 holder 未经验证）。
 
 ### mmap 量化权重
 

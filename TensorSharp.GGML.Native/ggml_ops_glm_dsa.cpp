@@ -948,7 +948,7 @@ struct weight_loader
         const int64_t blck = ggml_blck_size(src->type);
         if (first % blck != 0 || count % blck != 0)
         {
-            fprintf(stderr, "[glm] %s: a row-parallel split at [%" PRId64 ", %" PRId64 ") is not a multiple of the "
+            tsg::report_load_refusal( "[glm] %s: a row-parallel split at [%" PRId64 ", %" PRId64 ") is not a multiple of the "
                     "%" PRId64 "-element block of %s\n", name, first, first + count, blck, ggml_type_name(src->type));
             return nullptr;
         }
@@ -999,7 +999,7 @@ static bool check_shard_complete(const char * path, gguf_context * g, ggml_conte
     }
     if (needed <= fsz) return true;
 
-    fprintf(stderr, "[glm] %s is incomplete: the file is %zu bytes but its %" PRId64 " tensors need %zu "
+    tsg::report_load_refusal( "[glm] %s is incomplete: the file is %zu bytes but its %" PRId64 " tensors need %zu "
                     "(%.2f GiB missing; %s is the last one). Re-download this file.\n",
             path, fsz, n_tensors, needed, (needed - fsz) / (1024.0 * 1024.0 * 1024.0), last ? last : "?");
     return false;
@@ -1436,7 +1436,7 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
     {
         if (tp_req > MAX_GPUS)
         {
-            fprintf(stderr, "[glm] --tp %d exceeds this executor's maximum of %d ranks\n",
+            tsg::report_load_refusal( "[glm] --tp %d exceeds this executor's maximum of %d ranks\n",
                     tp_req, MAX_GPUS);
             return nullptr;
         }
@@ -1448,7 +1448,7 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
             // multi-GPU host.
             if (getenv("TS_GLM_TP_OVERSUBSCRIBE") == nullptr)
             {
-                fprintf(stderr, "[glm] --tp %d needs %d GPUs; only %d are visible "
+                tsg::report_load_refusal( "[glm] --tp %d needs %d GPUs; only %d are visible "
                         "(TS_GLM_TP_OVERSUBSCRIBE=1 packs several ranks onto one GPU for testing)\n",
                         tp_req, tp_req, n_gpu);
                 return nullptr;
@@ -1496,7 +1496,7 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
     ggml_context * meta0 = nullptr;
     gguf_init_params ip = { true, &meta0 };
     gguf_context * g0 = gguf_init_from_file(gguf_path, ip);
-    if (!g0) { fprintf(stderr, "[glm] failed to open %s\n", gguf_path); return nullptr; }
+    if (!g0) { tsg::report_load_refusal( "[glm] failed to open %s\n", gguf_path); return nullptr; }
 
     int32_t split_count = 1;
     kv_u32(g0, "split.count", &split_count);
@@ -1591,12 +1591,12 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
 
     if (!ok || hp.n_layer <= 0 || hp.n_nope <= 0 || hp.n_head <= 0)
     {
-        fprintf(stderr, "[glm] missing or invalid glm-dsa metadata\n");
+        tsg::report_load_refusal( "[glm] missing or invalid glm-dsa metadata\n");
         return nullptr;
     }
     if (expert_groups > 1 && expert_groups_used != expert_groups)
     {
-        fprintf(stderr, "[glm] %d expert groups (top-%d) are not supported\n", expert_groups, expert_groups_used);
+        tsg::report_load_refusal( "[glm] %d expert groups (top-%d) are not supported\n", expert_groups, expert_groups_used);
         return nullptr;
     }
     if (hp.g5n)
@@ -1608,7 +1608,7 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
     }
     else if (hp.indexer_full.empty() || hp.indexer_full[0] == 0)
     {
-        fprintf(stderr, "[glm] layer 0 must carry a full DSA indexer\n");
+        tsg::report_load_refusal( "[glm] layer 0 must carry a full DSA indexer\n");
         return nullptr;
     }
 
@@ -1629,7 +1629,7 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
         ggml_context * meta = nullptr;
         gguf_init_params sp = { true, &meta };
         gguf_context * g = gguf_init_from_file(shards.paths[si].c_str(), sp);
-        if (!g) { fprintf(stderr, "[glm] failed to open shard %s\n", shards.paths[si].c_str()); return nullptr; }
+        if (!g) { tsg::report_load_refusal( "[glm] failed to open shard %s\n", shards.paths[si].c_str()); return nullptr; }
         if (!check_shard_complete(shards.paths[si].c_str(), g, meta)) { gguf_free(g); ggml_free(meta); return nullptr; }
 
         const size_t data_off = gguf_get_data_offset(g);
@@ -1673,7 +1673,7 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
     size_t embd_bytes = 0;
     {
         auto it = sources.find("token_embd.weight");
-        if (it == sources.end()) { fprintf(stderr, "[glm] token_embd.weight missing\n"); return nullptr; }
+        if (it == sources.end()) { tsg::report_load_refusal( "[glm] token_embd.weight missing\n"); return nullptr; }
         hp.n_vocab = (int32_t) it->second.ne[1];
         embd_bytes = it->second.size;
     }
@@ -1787,7 +1787,7 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
         }
         if (hp.n_head % group != 0 || hp.n_head / group < m->tp)
         {
-            fprintf(stderr,
+            tsg::report_load_refusal(
                     "[glm] --tp %d cannot split %d heads in the %d-head groups required by the "
                     "output weights' quantization blocks\n",
                     m->tp, hp.n_head, group);
@@ -1943,12 +1943,56 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
             const int fit = w < budget ? ctx_that_fits(budget - w) : 0;
             if (fit < 256 || ctx_is_hard_limit)
             {
-                fprintf(stderr,
+                // Only advice that can actually make this load fit. The message
+                // used to end "Lower MAX_CONTEXT (0 tokens would fit) or add
+                // --n-cpu-moe N" even when the weights alone overflowed a rank
+                // and every routed expert was already counted in system RAM.
+                std::string advice;
+                auto add_advice = [&](const std::string & option)
+                {
+                    const bool first = advice.empty();
+                    advice += first ? " " : "; or ";
+                    advice += option;
+                    if (first) advice[1] = (char) std::toupper((unsigned char) advice[1]);
+                };
+                char buf[256];
+                if (fit >= 256)
+                {
+                    snprintf(buf, sizeof(buf), "set MAX_CONTEXT to %d or less", fit);
+                    add_advice(buf);
+                }
+                // Fewest leading layers whose experts, kept in system RAM, make
+                // the requested context fit at this rank count.
+                int cpu_moe_fix = -1;
+                for (int n = n_cpu_moe + 1; n <= hp.n_layer; n++)
+                    if (rank_weight_bytes(n) + kv_bytes <= budget) { cpu_moe_fix = n; break; }
+                const size_t w_all = rank_weight_bytes(hp.n_layer);
+                const int fit_all = w_all < budget ? ctx_that_fits(budget - w_all) : 0;
+                if (cpu_moe_fix > 0)
+                {
+                    snprintf(buf, sizeof(buf), "re-run with --n-cpu-moe %d (keeps the routed experts of the "
+                             "first %d layer(s) in system RAM)", cpu_moe_fix, cpu_moe_fix);
+                    add_advice(buf);
+                }
+                else if (n_cpu_moe < hp.n_layer && fit_all >= 256)
+                {
+                    snprintf(buf, sizeof(buf), "re-run with --cpu-moe and MAX_CONTEXT at most %d", fit_all);
+                    add_advice(buf);
+                }
+                if (advice.empty())
+                {
+                    snprintf(buf, sizeof(buf), "Neither a shorter context nor --n-cpu-moe can fix this: with every "
+                             "routed expert in system RAM a rank still needs %.1f GiB for the weights every rank "
+                             "replicates. Run without --tp", w_all / 1073741824.0);
+                    advice = std::string(" ") + buf +
+                             " (the layer split stores each layer on one GPU instead of on every rank), "
+                             "or on GPUs with more memory";
+                }
+                tsg::report_load_refusal(
                         "[glm] not enough VRAM for --tp %d: %.1f GiB per rank of weights plus %.1f GiB of KV and "
-                        "graphs for an %d-token context, against %.1f GiB usable on the smallest rank. Lower "
-                        "MAX_CONTEXT (%d tokens would fit) or add --n-cpu-moe N.\n",
+                        "graphs for a %d-token context, against %.1f GiB usable on the smallest rank.%s.\n",
                         m->tp, w / 1073741824.0, kv_bytes / 1073741824.0, m->n_ctx,
-                        budget / 1073741824.0, fit);
+                        budget / 1073741824.0, advice.c_str());
                 return nullptr;
             }
             if (!remeasure_ctx)
@@ -2050,7 +2094,7 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
                 for (int d = 0; d < n_gpu; d++) free_total += dev_free[d];
                 size_t would_free = 0;
                 for (int il = 0; il < need_cpu_moe && il < hp.n_layer; il++) would_free += layer_exps_bytes[il];
-                fprintf(stderr,
+                tsg::report_load_refusal(
                         "[glm] not enough VRAM: %.1f GiB of weights plus this context's KV caches against %.1f GiB "
                         "free across %d device(s). Re-run with --n-cpu-moe %d (moves the routed experts of the "
                         "first %d layer(s), %.1f GiB, to system RAM) or --cpu-moe to offload every layer.\n",
@@ -2400,7 +2444,7 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
                         && W.hc_ffn_fn && W.hc_ffn_scale && W.hc_ffn_base;
             if (!complete)
             {
-                fprintf(stderr, "[glm] layer %d rank %d is incomplete\n", il, r);
+                tsg::report_load_refusal( "[glm] layer %d rank %d is incomplete\n", il, r);
                 return nullptr;
             }
         }
@@ -2452,7 +2496,7 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
             if (unallocated)
             {
                 m->w_buf[d] = ggml_backend_alloc_ctx_tensors(m->w_ctx[d], m->backends[d]);
-                if (!m->w_buf[d]) { fprintf(stderr, "[glm] weight allocation failed on device %d\n", d); return nullptr; }
+                if (!m->w_buf[d]) { tsg::report_load_refusal( "[glm] weight allocation failed on device %d\n", d); return nullptr; }
                 // Weights, and ggml_backend_sched has to be told so: only a
                 // WEIGHTS buffer makes it place an op on the device that holds
                 // the matrix. With the default usage it picks by its own
@@ -2588,7 +2632,7 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
     {
         if (ggml_get_first_tensor(m->c_ctx[d]) == nullptr) continue;
         m->c_buf[d] = ggml_backend_alloc_ctx_tensors(m->c_ctx[d], m->backends[d]);
-        if (!m->c_buf[d]) { fprintf(stderr, "[glm] constant allocation failed on device %d\n", d); return nullptr; }
+        if (!m->c_buf[d]) { tsg::report_load_refusal( "[glm] constant allocation failed on device %d\n", d); return nullptr; }
         // These are per-device read-only constants — the Hadamard basis and, under
         // expert parallelism, the rank's expert mask. Marking the buffer as weights
         // is what makes ggml_backend_sched pin their consumers to this device; with
@@ -2784,7 +2828,7 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
             // Refuse now, with the reason, rather than letting slot_alloc fail
             // after the whole load: the measurement above mirrors exactly what
             // slot_alloc is about to allocate.
-            fprintf(stderr, "[glm] not enough VRAM left after the weights for even a 256-token context%s. "
+            tsg::report_load_refusal( "[glm] not enough VRAM left after the weights for even a 256-token context%s. "
                     "Lower TS_GLM_PLAN_SLOTS%s, set MAX_CONTEXT explicitly, or add --n-cpu-moe N to move "
                     "expert weights off the GPUs.\n",
                     plan_slots > 1 ? " per slot" : "",
@@ -2803,7 +2847,7 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
     }
 
     m->active_slot = slot_alloc(*m);
-    if (!m->active_slot) { fprintf(stderr, "[glm] primary slot allocation failed\n"); return nullptr; }
+    if (!m->active_slot) { tsg::report_load_refusal( "[glm] primary slot allocation failed\n"); return nullptr; }
 
     m->logits.resize((size_t) hp.n_vocab);
 
@@ -3076,8 +3120,8 @@ struct graph_builder
             if (m.flash_attn)
             {
                 ggml_tensor * qf = ggml_permute(ctx, Qi, 0, 2, 1, 3);           // [n_kv_row, 1, n_head]
-                ggml_tensor * fa = ggml_flash_attn_ext(ctx, qf, K, V, masks[(size_t) i], hp.kq_scale(), 0.0f, 0.0f);
-                ggml_flash_attn_ext_set_prec(fa, GGML_PREC_F32);
+                ggml_tensor * fa = tsg_flash_attn_ext_guarded(ctx, m.backends[dev], "GLM-DSA batched decode", qf, K, V, masks[(size_t) i], hp.kq_scale(), 0.0f, 0.0f,
+                    nullptr, GGML_PREC_F32);
                 out = ggml_permute(ctx, fa, 0, 2, 1, 3);                        // [kv_lora, 1, n_head]
             }
             else
@@ -3821,8 +3865,8 @@ struct graph_builder
         if (m.flash_attn)
         {
             ggml_tensor * qf = ggml_permute(ctx, Qcur, 0, 2, 1, 3);             // [n_kv_row, nt, n_head]
-            ggml_tensor * fa = ggml_flash_attn_ext(ctx, qf, K, V, mask, hp.kq_scale(), 0.0f, 0.0f);
-            ggml_flash_attn_ext_set_prec(fa, GGML_PREC_F32);
+            ggml_tensor * fa = tsg_flash_attn_ext_guarded(ctx, m.backends[device_of(il, rank)], "GLM-DSA forward", qf, K, V, mask, hp.kq_scale(), 0.0f, 0.0f,
+                nullptr, GGML_PREC_F32);
             // [kv_lora, n_head, nt] -> [kv_lora, nt, n_head] so wv_b's per-head
             // matmul runs as a matrix-matrix product with nt in dimension 1.
             fa = ggml_permute(ctx, fa, 0, 2, 1, 3);
@@ -5185,13 +5229,24 @@ static bool forward_batched_decode(glm_model & m, int n, const int32_t * slot_id
     std::vector<int64_t> idx(1);
     std::vector<int32_t> v32((size_t) n);
 
+    // Each input is set on its own liveness. The token ids are only read on the
+    // device that embeds them, but EVERY device with a RoPE layer reads its own
+    // positions: skipping a device whose token input was pruned left its
+    // positions uninitialised, so on a multi-GPU layer split every layer past
+    // the first device rotated q/k by garbage and concurrent GLM-5.2 streams
+    // degenerated (glm5next is NoPE, which is why it never showed).
     for (int d = 0; d <= m.n_gpu; d++)
     {
-        if (!live(gr->inp.tokens[d])) continue;
-        for (int i = 0; i < n; i++) v32[(size_t) i] = tokens[i];
-        set_input_i32(gr->inp.tokens[d], v32.data(), (size_t) n);
-        for (int i = 0; i < n; i++) v32[(size_t) i] = positions[i];
-        set_input_i32(gr->inp.pos[d], v32.data(), (size_t) n);
+        if (live(gr->inp.tokens[d]))
+        {
+            for (int i = 0; i < n; i++) v32[(size_t) i] = tokens[i];
+            set_input_i32(gr->inp.tokens[d], v32.data(), (size_t) n);
+        }
+        if (live(gr->inp.pos[d]))
+        {
+            for (int i = 0; i < n; i++) v32[(size_t) i] = positions[i];
+            set_input_i32(gr->inp.pos[d], v32.data(), (size_t) n);
+        }
     }
 
     for (int i = 0; i < n; i++)
@@ -5873,6 +5928,8 @@ TSG_EXPORT void * TSGgml_GlmLoadModel(const char * gguf_path, int n_gpu, int n_c
                                       int n_threads, int n_cpu_moe, const char * backend_name, int tp,
                                       int ctx_is_hard_limit, int load_mtp)
 {
+    // A stale error from an earlier op must not be reported as this load's reason.
+    tsg::clear_last_error();
     try
     {
         return glm_load(gguf_path, n_gpu, n_ctx, n_ubatch, n_threads, n_cpu_moe, backend_name, tp,
@@ -5880,7 +5937,7 @@ TSG_EXPORT void * TSGgml_GlmLoadModel(const char * gguf_path, int n_gpu, int n_c
     }
     catch (const std::exception & e)
     {
-        fprintf(stderr, "[glm] load failed: %s\n", e.what());
+        tsg::report_load_refusal("[glm] load failed: %s\n", e.what());
         return nullptr;
     }
 }

@@ -4,6 +4,7 @@ using System;
 using System.Collections.Generic;
 using TensorSharp.GGML;
 using TensorSharp.Runtime.Scheduling;
+using TensorSharp.Runtime.Scheduling.PrefixCache;
 
 namespace TensorSharp.Models
 {
@@ -73,15 +74,23 @@ namespace TensorSharp.Models
         internal static bool RetainNativeSequence<TNative>(Dictionary<string, int> requests,
             Dictionary<string, int> retained, string key, ref string active, ref string selectedRetained,
             ulong budget, TNative native) where TNative : INativeSlotRetention
+            => RetainNativeSequence(requests, retained, key, key, ref active, ref selectedRetained, budget, native);
+
+        /// <summary>The key-parameterised retain: <paramref name="requestId"/>'s slot is retained under
+        /// <paramref name="retainedKey"/> (the prefix cache's payload key, or the request id itself).</summary>
+        internal static bool RetainNativeSequence<TNative>(Dictionary<string, int> requests,
+            Dictionary<string, int> retained, string requestId, string retainedKey, ref string active,
+            ref string selectedRetained, ulong budget, TNative native) where TNative : INativeSlotRetention
         {
-            if (string.IsNullOrEmpty(key) || requests == null || !requests.TryGetValue(key, out int slot)
-                || retained.ContainsKey(key) || !native.Status(slot, out int head, out bool healthy)
+            if (string.IsNullOrEmpty(requestId) || string.IsNullOrEmpty(retainedKey) || requests == null
+                || !requests.TryGetValue(requestId, out int slot)
+                || retained.ContainsKey(retainedKey) || !native.Status(slot, out int head, out bool healthy)
                 || !healthy || head <= 0 || !native.CanRetain(slot, retained.Count, budget)) return false;
             // Add first: a managed allocation failure leaves the old owner intact.
-            try { retained.Add(key, slot); }
+            try { retained.Add(retainedKey, slot); }
             catch (OutOfMemoryException) { return false; }
-            requests.Remove(key);
-            if (active == key) { active = null; selectedRetained = key; }
+            requests.Remove(requestId);
+            if (active == requestId) { active = null; selectedRetained = retainedKey; }
             return true;
         }
 
@@ -130,16 +139,19 @@ namespace TensorSharp.Models
             retained.Remove(key);
         }
 
-        public bool RetainSequenceCache(string requestId)
+        public bool RetainSequenceCache(string requestId) => RetainSequenceCacheAs(requestId, requestId);
+
+        /// <summary>The key-parameterised form of <see cref="RetainSequenceCache"/> (DESIGN §4.8).</summary>
+        public bool RetainSequenceCacheAs(string requestId, string key)
         {
             lock (_sync)
             {
                 if (!SupportsRetainedFusedCache) return false;
                 try { _retainedSlotByRequest ??= new Dictionary<string, int>(StringComparer.Ordinal); }
                 catch (OutOfMemoryException) { return false; }
-                bool kept = RetainNativeSequence(_slotByRequest, _retainedSlotByRequest, requestId,
+                bool kept = RetainNativeSequence(_slotByRequest, _retainedSlotByRequest, requestId, key,
                     ref _activeSlotKey, ref _selectedRetainedKey, _nativeRetentionBudget, new NativeSlotRetention(_handle));
-                if (kept) TraceRetainedCommit("retain", requestId, _retainedSlotByRequest[requestId], _retainedSlotByRequest.Count);
+                if (kept) TraceRetainedCommit("retain", key, _retainedSlotByRequest[key], _retainedSlotByRequest.Count);
                 return kept;
             }
         }
@@ -209,6 +221,9 @@ namespace TensorSharp.Models
                 _selectedRetainedKey = key;
             }
             DiscardRetainedCache(key);
+            // The prefix cache learns of the slot reclaimed behind its back (DEC-23); it applies the
+            // invalidation before its next tree read, so a plan that still names the key re-matches.
+            _prefixCacheSink?.OnPayloadInvalidated(key, InvalidationReason.NativeSlotReclaimed);
             return true;
         }
     }

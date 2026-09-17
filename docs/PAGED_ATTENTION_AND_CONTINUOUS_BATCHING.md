@@ -129,7 +129,8 @@ BlockPool + PagedKvStorage + BlockHashIndex   (managed host memory)
 3. The pipeline creates a `SequenceState` and calls `InferenceEngine.SubmitRequest`.
 4. The engine worker asks `ContinuousBatchScheduler` for the next step.
 5. The scheduler admits waiting sequences while token and sequence budgets allow. Before allocating new blocks, it looks up full prompt blocks in `BlockHashIndex` and adopts shared blocks on a hit.
-6. If the pool is under pressure, the scheduler can preempt lower-priority running sequences, commit their full blocks, free the remainder, and requeue them.
+   A waiting request is admitted only when the free pool can hold its whole prompt on top of the prompt blocks the running requests still have to allocate; otherwise it stays queued until one finishes (a lone request is always admitted). Prefix blocks it would adopt from a running request are shared and do not count against it, unless a retained per-request holder (Gemma 4, Qwen 3.5/3.6) will serve the prompt instead: admission tries that holder first, and it backs the reused prefix with new blocks, so such a request is counted at its whole prompt.
+6. If the pool is under pressure (decode growth is not reserved), the scheduler can preempt a running sequence that ranks below the one needing blocks (lower priority, or submitted later), commit its full blocks, free the remainder, and requeue it. A sequence never preempts an older one: it waits a step instead, so a full pool drains oldest-first rather than livelocking long prefills against each other.
 7. `BatchExecutor` executes the scheduled step. It asks `ExecutionPlanner` for the step's `ExecutionPlan` and runs the first candidate path that accepts the step (see [Execution Planning](#execution-planning-capability-model)).
 8. The engine emits sampled tokens to the request handle, checks EOS / max-tokens / abort state, and releases blocks for completed sequences.
 
@@ -223,13 +224,71 @@ for GGML backends:
 
 | Kernel | Scope | Notes |
 |---|---|---|
-| `TSGgml_PagedAttentionForward` | Standard causal / sliding-window attention | C++ K/V gather plus `ggml_flash_attn_ext`. Default for Mistral 3 and most paged attention layers on GGML backends. |
+| `TSGgml_PagedAttentionForward` | Standard causal / sliding-window attention | C++ K/V gather plus `ggml_flash_attn_ext`. Default for Mistral 3 and most paged attention layers on GGML backends. A head size the backend has no flash kernel for (ggml-cuda: anything outside 40/64/72/80/96/112/128/256 and the grouped-query 192/320/512/576) runs as explicit attention with a one-time warning instead of aborting in `fattn.cu`. |
 | `TSGgml_PagedAttentionForwardWithSinks` | GPT OSS attention sinks | Adds the learned per-head sink logits to the softmax denominator. |
 | `TensorPagedAttention.Forward` | Tensor-op fallback | Uses tensor gathers plus batched matmul/softmax ops. Useful for A/B testing. |
 | `ManagedPagedAttention.Forward` | Pure C# fallback | Online-softmax implementation used for correctness and unsupported backend fallback. |
 
 `TS_PAGED_ATTN_KERNEL=native|tensor|managed` selects the Mistral 3 dispatch path.
 GPT OSS can force the managed sinks path with `TS_GPTOSS_PAGED_ATTN_MANAGED=1`.
+
+### Output identity under concurrency
+
+The same batches must give the same logits, bit for bit. Different batches may not.
+Which requests share a step, and how many tokens each forwards, decides which
+kernels run: ggml-cuda serves a quantized MXFP4 `mul_mat_id` with MMVQ for up to 7
+tokens on Turing and Ampere (8 on Volta, Ada and Blackwell) and with MMQ above that,
+and a sequence that arrives
+alone takes the solo fused path first. Those kernels agree only up to floating-point
+near-ties, and greedy decoding turns a near-tie into a different continuation. A
+concurrent round whose arrival order is not fixed can therefore produce different
+tokens from run to run without any defect. Two runs that schedule the same batches
+cannot.
+
+To tell the two apart:
+
+- `TS_CB_DEBUG=1` prints one `[cb] step#N <path>` line per engine step with every
+  scheduled request (`id:P|D fwd=<tokens> computed=<tokens after the step>`) and a
+  fingerprint of the logits it left: the top two tokens, their margin and a hash of
+  the whole row. Diff two runs step by step. A different composition before the
+  first differing hash is the near-tie class; the same composition with a different
+  hash is a bug.
+- `AgentTurnBench --conc-gate` holds the engine's compute gate until a whole
+  concurrent round is queued, so every run admits the round in the same batches.
+  Its rows record `ArrivalOrderFixed: true`, and `compare.py` requires identical
+  tokens for them. Concurrent rows without it report token differences as
+  informational unless `--require-concurrent-identity` is passed.
+
+**Measured (2026-09-17, gpt-oss-20b MXFP4, 1x A40, `ggml_cuda`, `TS_PER_SEQ_FUSED=0`,
+`AgentTurnBench --conc 1,4,8`).** Four concurrent greedy requests diverged at output
+tokens 3-26 between runs, including between the warm-up pass and the measured pass of
+one process; in those runs eight did not. The step trace showed the same batches in both runs and,
+at the first decode step, logits several units apart (41.28 against 38.84 for the
+same token) with every margin still wide. That was a defect, not a near-tie. The
+standalone MoE kernel (`TSGgml_MoEFFNPrefillSwiGLUQuantF32`, which the batched paged
+path uses for GPT OSS's experts) uploaded its per-expert biases as graph leafs in the
+reusable compute buffer. The allocator freed the gate bias after its `add_id` and
+placed the SwiGLU activation on top of it. ggml-cuda fuses `{mul_mat_id, add_id,
+mul_mat_id, add_id, swiglu_oai}` into one MMVQ kernel for 1-7 tokens. That kernel
+reads the biases while it writes the activation, and its overlap check skips leafs
+because llama.cpp's biases are weights. So the kernel overwrote the bias it was still
+reading. On this Ampere card eight tokens take MMQ, which does not fuse, which is why
+the 8-request round stayed stable; on Ada or Blackwell eight tokens still take MMVQ and
+would have been hit too. The builder now pins every small uploaded parameter (ids, routing
+weights, biases, post-norm weight) with the allocator's output flag. The CTest
+`moe-fused-bias-alias-cuda` (`GgmlOpsMoeFusedBiasAliasTest`) compares the kernel
+against an exact host evaluation for 1, 4 and 7 tokens. Before the fix the 4- and
+7-token cases were off by up to 644 and 1118 against tolerances of 21 and 25 and were
+not repeatable (the 1-token case passed); after it they match the CPU backend.
+`moe-fused-bias-alias-metal` runs the same check on Metal, which does not fuse this
+chain and passed before the fix too.
+
+After the fix, with `--conc-gate`, three passes gave bit-identical logits at every
+step of the 1-, 4- and 8-request rounds. Without the gate, one pass in three still
+changed the 8-request round. Its first request had been scheduled alone on the solo
+fused path before the other seven arrived. The first logits already differed at
+that step (42.94 against 42.86), and the argmax flips came later, at margins of
+0.011-0.11. That is the near-tie class, and `compare.py` reports it without failing.
 
 ### Per-Sequence Fallback
 
@@ -295,14 +354,113 @@ a small LRU and re-key it when a later request exactly extends the recorded toke
 prefix. Gemma 4 retains its circular attention K/V; Qwen 3.5/3.6 retains the
 attention K/V and matching GatedDeltaNet recurrent state as one hybrid holder.
 Models that do not advertise this capability ignore the retained-cache setting.
+A request of a scoped conversation that finished on the primary (N=1) cache is kept
+the same way when a fused step takes the model over, so a conversation does not lose its state because
+another chat arrived between two of its turns.
+
+### Prompt reuse across requests: conversation scopes and media identity
+
+Every cross-request reuse path - live-cache continuation, retained holders, the
+shared-prefix checkpoint and pooled blocks - honours two rules.
+
+**Conversation scope.** Each `SequenceState` carries a `CacheScope` (an opaque
+hash) and its public boundary `SharedPrefixTokens` (the leading system/developer
+messages plus tool declarations). State produced by another scope is reused only up
+to that public prefix: through the shared-prefix checkpoint, which is cloned, or by
+rewinding the live cache to exactly that prefix (the only public reuse a model without
+checkpoints has, e.g. DeepSeek V4.1; the new request's prefill would overwrite that cache
+anyway, and a checkpoint is preferred where one exists). Another conversation's retained
+holder is never adopted, rewound into or moved away from its owner, its live cache is
+never continued past the public prefix, and pooled blocks past the public prefix carry
+the scope in their hash. A scoped request never clones a
+checkpoint longer than its own public prefix. The scope comes from the chat layer:
+
+| Request | Scope |
+|---|---|
+| Web UI / TensorAgent with a `sessionId` | the session and its new-chat epoch (`newChat:true` starts a new one); a host that binds sessions to its saved conversations (`WebUiChatService.BindSessionConversation`, which TensorAgent calls for every session it opens) uses the conversation instead, so reopening a chat continues its own cached state |
+| OpenAI Chat / Responses, Ollama chat, Web UI without a `sessionId` | the conversation the request's history proves it continues: its last assistant message is a turn this server generated and sent (see below), and sent to that conversation only; otherwise (including when two conversations were sent the same turn after the same history, such as a greedy reply to a common opening) a fresh scope |
+| Skills / code tool-loop rounds | the scope of the client turn that started the loop |
+| Engine callers that set no scope (benchmarks, the CLI) | unscoped, which matches every scope (unchanged behaviour) |
+
+The chat layer's raw-token splice follows the same identity. Each generated turn is
+recorded under the content-hash chain of the client-visible history that preceded
+it (roles, content, tool calls, media and attached files by content), with the raw output tokens AND
+what the client was sent for them (the parsed content and tool calls, or the raw
+text). A later assistant message is rendered from the recorded tokens only when it
+equals that emitted form, ignoring whitespace; an assistant message a client wrote or
+edited renders from its own text. Before this, the stateless APIs shared one tracked
+history and spliced another client's generated turn over a client's own message.
+Concurrent conversations no longer overwrite each other's records.
+
+For a stateless request this is proof by content, and it has a residual. A request
+that reproduces ANY earlier generated turn of a conversation - not only its latest -
+continues that conversation's scope, including state its later turns left behind, and
+a deterministic (greedy) reply can be reproduced outside this server. Such a request
+reuses only tokens it sent itself, but `cached_tokens` then reflects how far its
+prompt matches that conversation's later turns: whole 256-token blocks on the pooled
+path, the last few tokens of a holder on Gemma 4, further on models with exact native
+rewinds (DeepSeek V4.1). Clients that need strict isolation use a Web UI / TensorAgent
+`sessionId`; a per-request cache key and the radix tree's leaf rule (SYNTHESIS S5.3)
+close this for stateless APIs.
+
+**Media identity.** Each image, video frame (pair) and audio clip is identified by the
+SHA-256 of its bytes. Base64 attachments (OpenAI `image_url`, Responses
+`input_image`, Ollama `images`, audio) are stored as `<sha256>.<ext>` and written
+once, so a client resending the same picture every turn keeps one file. The vision
+and audio embedding cache is keyed by that content id, bounded by
+`TS_MM_EMBEDDING_CACHE_MB` and evicted least-recently-used, never while a prepared
+prompt still references an entry. A request carries its media as positional spans
+(`SequenceState.MediaSpans`); a cached prefix is reusable when every span inside it is
+the same content at the same place, and a reuse length is clamped to the start of any
+span it would cut. Text before the first image is therefore always reusable. Pooled
+block hashes mix a span's id into the blocks that hold it (and, through the parent
+chain, everything after), not into the blocks before it.
+
+A model whose cache cannot be continued past media exactly declares
+`SupportsReuseAcrossMediaSpan = false`, and every reuse path then stops at the first
+media span. No model declares it today. Gemma 4 uses absolute positions. Qwen 3.5/3.6's
+M-RoPE prompt positions compress after an image, and every token past the position table
+- decode, speculative verify, a text continuation - rotates at its KV index plus the
+sequence's M-RoPE delta, which every holder, checkpoint and checkpoint file (format
+version 2) stores; follow-up turns therefore continue the cache past the image and match
+a re-prefill up to the backend's decode-versus-prefill kernel differences (see [the Qwen 3.5 card](models/qwen35.md#positions-after-an-image-the-m-rope-delta):
+on Metal the Web UI turns after an image reuse 98% of the prompt and reach the first token
+in 0.13 s instead of about 1.1 s). Until that fix Qwen 3.5/3.6 declared `false`, because
+decode ran at the absolute index.
+
+Prefilling an image *after* a reused prefix is a separate question. A model that cannot
+do it exactly returns false from `IModelArchitecture.CanPrefillMediaAfterReusedPrefix`, and
+such a turn then reuses nothing past its public prefix. The public prefix itself is still
+cloned from the shared-prefix checkpoint: while checkpoints are in use every prefill is cut
+at that boundary, so the media runs after it with or without reuse; a turn with no public
+prefix prefills from zero. No shipped model returns false. Gemma 4 did past its sliding
+window until its fused prefill applied the image's bidirectional mask at any start position
+and its per-op path mapped the mask onto a wrapped window; an image turn now reuses the
+conversation's text and prefills the image on the fused graph (E4B/Metal: a 457-token image
+turn reusing 179 tokens reaches its first token in 0.57 s, against 1.25 s on the per-op
+path and 0.64 s cold; an 889-token one past the window reuses 611 tokens, 0.62 s against
+0.85 to 0.90 s without reuse). See the [Gemma 4 card](models/gemma4.md#image-and-audio-turns-after-a-reused-prefix).
+
+On Gemma 4 the live cache is continued for turns of `MaxReusablePrefixTokens` (the
+sliding window) tokens or fewer too; before, such turns fell to the pooled path, which
+could only return whole 256-token blocks. Rewinds on a wrapped ring are still refused.
+
+The admission log names what served each request - `the model's live KV cache of this
+conversation`, `a shared-prefix checkpoint (public, N tokens)`, `a retained holder of
+this conversation`, or `pooled prefix-cache blocks` - with token counts and the scope
+as a truncated hash; at Debug level a `blocked by scope` line reports how many more
+tokens another conversation's state matched past the public prefix.
 
 ## Test Coverage
 
 | Area | Tests |
 |---|---|
 | Scheduler / block pool | `ContinuousBatchSchedulerTests`, `PagedKvCacheTests`, `PagedKvCacheCodecTests` |
-| Batched executor primitives | `BatchedExecutorTests`, including managed paged-attention correctness and multi-sequence logits routing; `RetainedFusedCacheTests` for capability-gated holder retention/re-keying and LRU cleanup |
+| Batched executor primitives | `BatchedExecutorTests`, including managed paged-attention correctness and multi-sequence logits routing; `RetainedFusedCacheTests` for capability-gated holder retention/re-keying and LRU cleanup, conversation-scope isolation (including a random-interleaving property test) and positional media checks |
+| Cross-request isolation and media identity | `ModelServiceRawTokenHistoryTests` and `ToolTranscriptSpliceTests` (content-verified raw-token splice), `PooledPrefixScopeAndMediaTests`, `ContentAddressedMediaTests`; `Gemma4MediaAfterReusedPrefixExactnessTests` (model-gated: an image or audio turn after a reused prefix against a cold prefill) and `Gemma4SoftTokenMaskTests` |
+| Reuse past media (Qwen 3.5 M-RoPE) | `Qwen35MRopeReferencePositionTests` (positions against an SGLang `get_rope_index` fixture), opt-in `Qwen35ImageFollowUpExactnessTests` (reuse vs cold after an image with real weights, solo and concurrent, checkpoint file round trip) |
 | Per-model correctness | `Qwen35BatchedCorrectnessTests`, `Mistral3BatchedForwardTests`, `Gemma4BatchedForwardTests`, `GptOssBatchedCorrectnessTests`, `NemotronBatchedCorrectnessTests` |
+| Batched MoE kernel under backend fusion | Native CTest `moe-fused-bias-alias-cpu` / `moe-fused-bias-alias-cuda` / `moe-fused-bias-alias-metal` (`GgmlOpsMoeFusedBiasAliasTest`): the standalone MoE FFN kernel with per-expert biases against an exact host evaluation, 1, 4 and 7 tokens, repeated |
 | MTP speculative decoding | `SpeculativeExecutionTests` (draft/verify/rollback core), opt-in end-to-end `Qwen36SpeculativeTests` (`TS_MTP_E2E=1`) and `Gemma4SpeculativeTests` (`TS_GMTP_E2E=1`) with real GGUFs |
 | Per-model performance probes | `Gemma4BatchedPerfBench`, `Qwen35BatchedPerfBench`, `GptOssBatchedPerfBench`, `NemotronBatchedPerfBench` |
 | DiffusionGemma path | `DiffusionGemmaTests` for denoising, prompt-KV caching, and batched generation probes |
@@ -320,7 +478,7 @@ Models that do not advertise this capability ignore the retained-cache setting.
 | `TS_SCHED_SOLO_PREFILL_CHUNK` | `8192` | Per-step prefill cap for a solo (uncontended) request — feeds the prompt through the fused whole-graph prefill path in big chunks. Bounded by `TS_SCHED_MAX_BATCHED_TOKENS`. |
 | `TS_SCHED_NUM_BLOCKS` | `256` | Physical blocks in the engine pool. |
 | `TS_SCHED_BLOCK_SIZE` | `256` | Tokens per block. |
-| `TS_SCHED_PREFIX_CACHE` | `1` | Set `0` to disable block-hash prefix reuse. |
+| `TS_SCHED_PREFIX_CACHE` | `1` | Set `0` to disable all admission-time prompt reuse: pooled blocks, live-cache continuation, retained holders and shared-prefix checkpoints. |
 | `TS_SCHED_STOP_REPETITION` | `1` | Set `0` to let a looping generation run to its token limit rather than ending it with finish reason `repetition`. |
 | `TS_SCHED_DECODE_QUANTUM` | `256` | Number of decode tokens before a sequence switch is allowed in fallback-heavy execution. |
 | `TS_BATCHED_N1_FAST_PATH` | `1` | Solo single-sequence steps use the fused N=1 fast-path decode; set `0` to force those steps onto the fully-batched path (A/B testing). |
@@ -331,6 +489,7 @@ Models that do not advertise this capability ignore the retained-cache setting.
 | `TS_RETAINED_FUSED_CACHE_MAX` | `4` | LRU budget of retained fused holders (each pins the model's complete per-request continuation state). |
 | `TS_PREFIX_CHECKPOINTS` | `1` | Checkpoint the model's complete state at the end of the shared prompt prefix (the boundary the chat layer marks on the request) and start each new chat from a clone of it, on models that can copy their state (Gemma 4, Qwen 3.5/3.6). `0` disables. |
 | `TS_PREFIX_CHECKPOINTS_MAX` | `2` | How many distinct shared prefixes stay checkpointed at once (LRU). |
+| `TS_MM_EMBEDDING_CACHE_MB` | `512` | Byte budget of the vision/audio embedding cache, which is keyed by media content (SHA-256); least-recently-used entries no prepared prompt references are evicted past it. |
 | `TS_KV_INITIAL_TOKENS` | `0` | Tokens of K/V a cache is given when created, before any request declares a budget; `0` keeps the engine policy (the whole window when `MAX_CONTEXT` is explicit). The cache still grows on demand. |
 | `TS_KV_GENERATION_RESERVE_MAX` | `0` | Cap on the generation share of a request's up-front K/V reservation (prompt + max_new_tokens); `0` = uncapped. Past the cap the cache grows on demand. |
 | `TS_KV_HOLDER_POOL_MAX` | `64` | How many released per-request holders a model may park for reuse; each costs its whole K/V allocation while parked. |

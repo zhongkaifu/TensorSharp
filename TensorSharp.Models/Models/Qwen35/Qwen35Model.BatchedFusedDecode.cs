@@ -94,6 +94,7 @@ namespace TensorSharp.Models
             // The captured graph pins the pool device addresses; a realloc moves
             // them, so drop the cached graph (rebuilds against the new pools).
             GgmlBasicOps.Qwen35ResetBatchedDecodeCache();
+            CountDecodeGraphReset();
         }
 
         /// <summary>Run the whole hybrid transformer over the batch's decode tokens

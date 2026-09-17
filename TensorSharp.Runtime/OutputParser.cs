@@ -2239,6 +2239,20 @@ namespace TensorSharp.Runtime
         private readonly StringBuilder _buffer = new();
         private bool _thinkingEnabled;
         private int _callIndex;
+        private readonly bool _promptAlwaysOpensThinking;
+        private bool _sawThinkClose;
+        // The unrequested block has shown prose, so it is reasoning: stream it.
+        private bool _unrequestedBlockIsReasoning;
+
+        /// <param name="promptAlwaysOpensThinking">The family's generation prompt opens
+        /// <c>&lt;think&gt;</c> whatever the request asked for (GLM-5.3-Flash's published
+        /// template has no thinking-off shape), so the reply starts INSIDE the reasoning
+        /// block even under <c>think:false</c>. Parsing it as content would hand the
+        /// client the chain of thought and a literal <c>&lt;/think&gt;</c>.</param>
+        public GlmDsaOutputParser(bool promptAlwaysOpensThinking = false)
+        {
+            _promptAlwaysOpensThinking = promptAlwaysOpensThinking;
+        }
 
         public bool HasThinkingSupport => true;
         public bool HasToolSupport => true;
@@ -2249,7 +2263,55 @@ namespace TensorSharp.Runtime
             _buffer.Clear();
             _thinkingEnabled = enableThinking;
             _callIndex = 0;
-            _state = enableThinking ? State.Thinking : State.Content;
+            _sawThinkClose = false;
+            _unrequestedBlockIsReasoning = false;
+            _state = enableThinking || _promptAlwaysOpensThinking ? State.Thinking : State.Content;
+        }
+
+        private bool InUnrequestedBlock
+            => !_thinkingEnabled && _promptAlwaysOpensThinking && !_sawThinkClose;
+
+        /// <summary>Under think:false the always-open block is either the model's
+        /// reasoning (prose, closed by &lt;/think&gt;) or an answer a JSON grammar forced
+        /// from the first token (which can never write &lt;/think&gt;). Only a reply that
+        /// still looks like JSON is held back; prose streams as reasoning at once.</summary>
+        private bool HoldsUnrequestedBlock(string buf)
+        {
+            if (!InUnrequestedBlock || _unrequestedBlockIsReasoning)
+                return false;
+            string trimmed = buf.TrimStart();
+            if (trimmed.Length == 0 || trimmed[0] == '{' || trimmed[0] == '[')
+                return true;
+            _unrequestedBlockIsReasoning = true;
+            return false;
+        }
+
+        private int FindThinkingClose(string buf)
+        {
+            // A first-token JSON grammar can legitimately emit protocol markers
+            // inside string values. They are data, not the end of reasoning.
+            // The ambiguous JSON block remains buffered, so scan its entire prefix
+            // each time and preserve quote/escape state across streaming chunks.
+            string trimmed = buf.TrimStart();
+            if (!InUnrequestedBlock || _unrequestedBlockIsReasoning || trimmed.Length == 0
+                || (trimmed[0] != '{' && trimmed[0] != '['))
+                return buf.IndexOf(ThinkClose, StringComparison.Ordinal);
+
+            bool quoted = false, escaped = false;
+            for (int i = 0; i < buf.Length; i++)
+            {
+                char c = buf[i];
+                if (quoted)
+                {
+                    if (escaped) escaped = false;
+                    else if (c == '\\') escaped = true;
+                    else if (c == '"') quoted = false;
+                }
+                else if (c == '"') quoted = true;
+                else if (c == '<' && buf.AsSpan(i).StartsWith(ThinkClose, StringComparison.Ordinal))
+                    return i;
+            }
+            return -1;
         }
 
         public ParsedOutput Add(string text, bool done)
@@ -2272,7 +2334,7 @@ namespace TensorSharp.Runtime
                 {
                     case State.Thinking:
                     {
-                        int closeIdx = buf.IndexOf(ThinkClose, StringComparison.Ordinal);
+                        int closeIdx = FindThinkingClose(buf);
                         if (closeIdx >= 0)
                         {
                             thinkingSb.Append(buf, 0, closeIdx);
@@ -2280,12 +2342,26 @@ namespace TensorSharp.Runtime
                             _buffer.Clear();
                             _buffer.Append(after);
                             _state = State.Content;
+                            _sawThinkClose = true;
                             keepParsing = after.Length > 0;
                         }
                         else if (done)
                         {
-                            thinkingSb.Append(buf);
+                            // A reply that never closed a reasoning block the REQUEST did
+                            // not ask for (e.g. a JSON grammar enforced from the first
+                            // token) is the answer itself, not reasoning.
+                            if (InUnrequestedBlock && !_unrequestedBlockIsReasoning
+                                && (buf.TrimStart().StartsWith('{') || buf.TrimStart().StartsWith('[')))
+                                contentSb.Append(buf);
+                            else
+                                thinkingSb.Append(buf);
                             _buffer.Clear();
+                        }
+                        else if (HoldsUnrequestedBlock(buf))
+                        {
+                            // Hold the unrequested block until it closes (or generation
+                            // ends): only then is it known to be reasoning rather than a
+                            // grammar-constrained answer that skipped the block.
                         }
                         else
                         {

@@ -500,7 +500,9 @@ public sealed class Qwen4ExpRetainedCacheTests(ITestOutputHelper output)
             float[] prefixLogits = (float[])scalar.ForwardRefill(prefix).Clone();
             float[][] expected = tokens.Select(token => (float[])scalar.Forward([token]).Clone()).ToArray();
             WriteTeacherVectors($"prefix{prefix.Length}-scalar", expected.SelectMany(row => row).ToArray());
-            foreach (int width in new[] { 1, 2, 3, 4 })
+            // Match TSG_PRECISION_DECODE_COLUMNS, including a partial final block
+            // and every row-group boundary used by the native CUDA construction.
+            foreach (int width in Enumerable.Range(1, 8))
             {
                 blocked.ResetKVCache();
                 Assert.Equal(prefixLogits, blocked.ForwardRefill(prefix));
@@ -583,10 +585,53 @@ public sealed class Qwen4ExpRetainedCacheTests(ITestOutputHelper output)
                 output.WriteLine($"raw-key max abs={expectedRaw.Zip(actualRaw, (x, y) => Math.Abs((double)x - y)).Max():G17}; "
                     + $"logit max abs={expected.Zip(actual, (x, y) => Math.Abs((double)x - y)).Max():G17}");
                 ReportChunkStateDifference(chunked, whole);
-                Assert.Equal(expectedKeys, actualKeys);
-                Assert.Equal(expected, actual);
+                if (fixture.Backend != BackendType.GgmlCuda)
+                {
+                    Assert.Equal(expectedKeys, actualKeys);
+                    Assert.Equal(expected, actual);
+                    continue;
+                }
+                AssertWithinPrefillShapeNoise(expectedRaw, actualRaw, "raw QSA key");
+                AssertWithinPrefillShapeNoise(expected, actual, "logit");
+                AssertSameGreedyUpToNearTie(expected, actual);
             }
         }
+    }
+
+    // The CUDA contract for prefill SHAPE. A 16-token prefill followed by a
+    // 4-token forward and one 20-token prefill run different ggml-cuda kernels:
+    // cuBLAS (TF32), tensor-core matmuls, flash attention and MMVQ/MMQ all pick
+    // their reduction by batch width, so the same row rounds differently (the
+    // first diverging node is a 32->3 F32 hyper-connection projection, 2.4e-7).
+    // Measured over the three suffixes: logits 1.7e-4, 4.4e-4 and 3.8e-4, raw QSA
+    // keys 0, 0 and 1.9e-6, same greedy token. Prefill does not promise width
+    // invariance - only the verify widths do, see TeacherForcedTargetVerify /
+    // RepeatedTargetBlocks, which stay bit-exact on CUDA - and forcing one-token
+    // kernels at prefill widths costs the throughput those kernels exist for. What
+    // this test guards is state: the defect it was written for replaced the prefix
+    // KV with stale host seeds after a shape change and moved these logits by
+    // 0.3155. So on CUDA the bound is 1e-2 - 23x the measured maximum and 32x below
+    // that defect - and greedy may differ only at a near-tie no wider than twice
+    // the measured difference. Every other backend stays bit-exact above.
+    // Evidence: eng/validation/qwen38_mtp_followup/verify-row-kernels-20260917.
+    private const double PrefillShapeNoiseBound = 1e-2;
+
+    private void AssertWithinPrefillShapeNoise(float[] expected, float[] actual, string what)
+    {
+        Assert.Equal(expected.Length, actual.Length);
+        double max = expected.Zip(actual, (x, y) => Math.Abs((double)x - y)).Max();
+        Assert.True(double.IsFinite(max) && max <= PrefillShapeNoiseBound,
+            $"chunked {what} rows moved by {max:G6} (bound {PrefillShapeNoiseBound:G3}): state was lost or corrupted, not rounded");
+    }
+
+    private static void AssertSameGreedyUpToNearTie(float[] expected, float[] actual)
+    {
+        int want = ArgMax(expected), got = ArgMax(actual);
+        if (want == got) return;
+        double max = expected.Zip(actual, (x, y) => Math.Abs((double)x - y)).Max();
+        double margin = (double)expected[want] - expected[got];
+        Assert.True(margin <= 2 * max,
+            $"greedy token {got} replaced {want} with a top-2 margin of {margin:G6}, wider than twice the logit difference {max:G6}");
     }
 
     private unsafe void ReportChunkStateDifference(Qwen4ExpModel chunked, Qwen4ExpModel whole)
@@ -810,6 +855,13 @@ public sealed class Qwen4ExpRetainedCacheTests(ITestOutputHelper output)
     {
         private readonly string _path;
         private readonly ITestOutputHelper _output;
+        internal BackendType Backend => Environment.GetEnvironmentVariable("TS_TEST_QWEN4EXP_MTP_BACKEND") switch
+        {
+            null or "" or "GgmlCpu" => BackendType.GgmlCpu,
+            "GgmlCuda" => BackendType.GgmlCuda,
+            "GgmlMetal" => BackendType.GgmlMetal,
+            var unsupported => throw new InvalidOperationException($"Unsupported fixture backend {unsupported}"),
+        };
         internal Fixture(ITestOutputHelper output)
         {
             _output = output;
@@ -822,13 +874,7 @@ public sealed class Qwen4ExpRetainedCacheTests(ITestOutputHelper output)
         }
         internal Qwen4ExpModel Load(int layerSplitDegree = 1)
         {
-            var backend = Environment.GetEnvironmentVariable("TS_TEST_QWEN4EXP_MTP_BACKEND") switch
-            {
-                null or "" or "GgmlCpu" => BackendType.GgmlCpu,
-                "GgmlCuda" => BackendType.GgmlCuda,
-                "GgmlMetal" => BackendType.GgmlMetal,
-                var unsupported => throw new InvalidOperationException($"Unsupported fixture backend {unsupported}"),
-            };
+            var backend = Backend;
             var model = new Qwen4ExpModel(Path.Combine(_path, "target.gguf"), backend,
                 layerSplitDegree: layerSplitDegree, draftGgufPath: Path.Combine(_path, "head.gguf"));
             try

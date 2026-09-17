@@ -25,8 +25,8 @@ public class ChatSessionTests
         Assert.False(string.IsNullOrEmpty(a.Id));
         Assert.False(string.IsNullOrEmpty(b.Id));
         Assert.NotEqual(a.Id, b.Id);
-        Assert.Empty(a.TrackedHistory);
-        Assert.Empty(b.TrackedHistory);
+        Assert.Equal(0, a.TrackedTurnCount);
+        Assert.Equal(0, b.TrackedTurnCount);
         Assert.False(a.IsDisposed);
     }
 
@@ -37,22 +37,22 @@ public class ChatSessionTests
         var a = new ChatSession();
         var b = new ChatSession();
 
-        a.TrackedHistory.Add(new ChatMessage { Role = "user", Content = "hello-a" });
+        TranscriptTestHelper.RecordTurn(a, "hello-a");
 
-        Assert.Single(a.TrackedHistory);
-        Assert.Empty(b.TrackedHistory);
+        Assert.Equal(1, a.TrackedTurnCount);
+        Assert.Equal(0, b.TrackedTurnCount);
     }
 
     [Fact]
     public void Dispose_ClearsHistory()
     {
         var session = new ChatSession();
-        session.TrackedHistory.Add(new ChatMessage { Role = "user", Content = "hi" });
+        TranscriptTestHelper.RecordTurn(session, "hi");
 
         session.Dispose();
 
         Assert.True(session.IsDisposed);
-        Assert.Empty(session.TrackedHistory);
+        Assert.Equal(0, session.TrackedTurnCount);
     }
 
     [Fact]

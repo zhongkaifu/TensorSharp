@@ -773,11 +773,12 @@ These can be set with either the `--paged-kv*` / `--continuous-batching` CLI fla
 | `TS_SCHED_SOLO_PREFILL_CHUNK` | Prefill chunk size for the fresh (start_pos = 0) part of a SOLO prompt — one uncontended request gets big fused-prefill chunks (default: `8192`). |
 | `TS_SCHED_NUM_BLOCKS` | Physical blocks in the engine block pool (default: `256`). |
 | `TS_SCHED_BLOCK_SIZE` | Tokens per block on the engine side (default: `256`). |
-| `TS_SCHED_PREFIX_CACHE` | `0` disables block-hash prefix sharing across requests. A block written by a batched paged step is adopted in the model's paged storage (the request starts as a paged resident); a block with a pooled snapshot is restored into the linear cache. A block that has neither form a request can read is not adopted and re-prefills. |
+| `TS_SCHED_PREFIX_CACHE` | `0` disables all prompt reuse across requests: pooled blocks, live-cache continuation, retained holders and shared-prefix checkpoints. Reuse is isolated per conversation either way: another conversation's state is shared only up to the system-prompt-and-tools prefix (see [docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md](docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md#prompt-reuse-across-requests-conversation-scopes-and-media-identity)). Pooled blocks: a block written by a batched paged step is adopted in the model's paged storage (the request starts as a paged resident); a block with a pooled snapshot is restored into the linear cache; a block that has neither form a request can read is not adopted and re-prefills. |
 | `TS_SCHED_STOP_REPETITION` | `0` lets a generation that has locked into a loop run to its token limit instead of being stopped. |
 | `TS_SCHED_DECODE_QUANTUM` | Tokens before a sequence-switch is allowed (default: block size). |
 | `TS_RETAINED_FUSED_CACHE` | `1` (default) retains a finished request's fused holder so an exact-prefix continuation skips re-prefilling it, on models that advertise support (Gemma 4 K/V; Qwen 3.5/3.6 attention K/V plus GatedDeltaNet recurrent state). `0` disables it (VRAM cap / A-B). |
 | `TS_RETAINED_FUSED_CACHE_MAX` | LRU budget of retained fused holders (default: `4`); each pins a complete per-request continuation state. |
+| `TS_MM_EMBEDDING_CACHE_MB` | Byte budget of the image/audio embedding cache (default: `512`). Entries are keyed by media content (SHA-256), so an API client resending the same image every turn encodes it once; least-recently-used entries no in-flight prompt references are evicted past the budget. |
 | `TS_PREFIX_CHECKPOINTS` | `1` (default) checkpoints the model state at the end of the prompt every conversation shares — system prompt, tools, skills — and starts each **new** chat from a clone of it, so a new chat re-prefills only its own message. Gemma 4 and Qwen 3.5/3.6 on the GGML backends. `0` disables. |
 | `TS_PREFIX_CHECKPOINTS_MAX` | How many distinct shared prefixes stay checkpointed at once, LRU (default: `2`). Each holds one copy of that prefix's K/V and, on Qwen, its recurrent state. |
 | `TS_KV_INITIAL_TOKENS` | Tokens of K/V a cache is given when it is created — the primary cache at load and every per-request holder — before any request declares a budget. `0` (default) keeps the engine policy: the whole window when `MAX_CONTEXT` is explicit, otherwise a backend default. The cache still grows on demand, so a memory-constrained device sets this small because every kept holder is paid at this size, host copy and device mirror both. |
@@ -1339,6 +1340,10 @@ offloaded prefill runs several times faster than llama.cpp's on the same files:
    expert range costs ~65 ms/GiB once and takes the transfer from 9.3 GB/s to
    55.6 GB/s on PCIe 5.0 x16. Disable with `TS_HOST_MOE_PIN=0`; bound it with
    `TS_HOST_MOE_PIN_MAX_MB` (default: 60% of the cgroup/host memory limit).
+   DeepSeek V4 / V4.1 are the exception: their loader multiplies offloaded experts
+   on the host at every batch size, nothing streams them, so it pins them only
+   when `TS_HOST_MOE_PIN=1` (see the
+   [V4.1 card](docs/models/deepseek41.md#load-time)).
 2. **Only the experts this batch routes to are sent**, grouped into consecutive
    runs — the same trick llama.cpp's scheduler plays with its used-expert bitset.
    At 512 tokens a large expert pool is only partly covered, and at the small
@@ -2028,6 +2033,48 @@ These are read by `build-linux.sh` / `build-windows.ps1` / the auto-build during
 | Native build parallelism cap | all CPUs, bounded by RAM (~3 GB per `nvcc` job) | `TENSORSHARP_GGML_NATIVE_BUILD_PARALLEL_LEVEL` | — |
 | Native build CMake generator (Windows) | Ninja when available, else `Visual Studio NN` | `CMAKE_GENERATOR` | `-G <generator>` |
 | Visual Studio installation used by the native build (Windows) | auto-detected, including installs flagged incomplete | `TENSORSHARP_VS_INSTALL_DIR` | — |
+
+## Exit codes (CLI + Server)
+
+`TensorSharp.Cli` and `TensorSharp.Server` leave with the same documented codes, so
+a script or supervisor can tell "fix the command line" from "this model does not
+load here" from "this is a bug":
+
+| Code | Meaning | What stderr shows |
+|---|---|---|
+| `0` | Success: the run finished, `--help` / `--list-skills` printed, or the server shut down cleanly. | — |
+| `1` | Configuration error: an unknown or removed flag, a bad value, an unreadable `--config` file. | `Configuration error: <what is wrong>` |
+| `2` | Model load refused. | Exactly one line, the last one: `error: model load refused: <reason>` |
+| anything else | Not a refusal: a bug or a crash. An unhandled .NET exception prints its stack trace and, on Linux and macOS, exits `134` (SIGABRT); a process the OS killed reports its signal (`137` for an out-of-memory kill). | The stack trace. Report it. |
+
+**What counts as a refused load** (code `2`) is a decision the loader made on
+purpose, with a reason you can act on: not enough VRAM for the requested context
+or `--n-cpu-moe` (the message names the number that fits), a `--tp` layout the
+devices cannot hold, a KV cache dtype the architecture does not support (for
+example `KV_CACHE_DTYPE=q8_0` on DeepSeek V4.1), a backend the model or this
+machine does not support, a missing, truncated or non-GGUF model file, a missing
+sidecar (DeepSeek V4.1's `deepseek41.engram.bin`), or an explicit `--draft-model`
+that cannot be activated. The native loaders' own diagnostic lines (`[dsv4] ...`,
+`[glm] ...`) may still appear above the error line; the error line repeats the
+reason so it is readable on its own. Anything else that fails during a load — a
+`NullReferenceException`, a CUDA error, an out-of-memory abort — is not a refusal
+and keeps its stack trace. One exception: the DeepSeek V4/V4.1 and GLM native
+whole-model loaders report every load they abandon as a refusal, including a
+weight or cache allocation that failed on a device, with their `[dsv4]`/`[glm]`
+line as the reason.
+
+Before exiting with `2` the server releases what the refused load left behind
+(the model service and the ggml backend) and never opens its port. A refusal's
+stack trace is noise by design, so it is only logged at Debug:
+`TENSORSHARP_LOG_LEVEL=Debug` (both hosts) or `--log-level debug` (CLI) shows it.
+
+A load that a running server is asked for does not exit the process.
+`POST /api/models/load` answers `500` with
+`{ "ok": false, "error": "<reason>", "refused": true, "loadedModel": "<file>" }`;
+the model that was loaded before is restored and named in `loadedModel`, which is
+`null` when none could be. An OpenAI or Ollama request that has to reload the
+hosted model reports the same reason in that protocol's error shape, and the
+server keeps serving.
 
 ## Server Logging
 

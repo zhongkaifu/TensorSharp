@@ -59,23 +59,29 @@ public sealed class Qwen4ExpVideoRequestTests : IDisposable
         Assert.Equal(new double?[] { null, 0, 1, 2, null }, message.ImageTimestamps);
         Assert.All(message.ImagePaths, path => Assert.True(File.Exists(path)));
 
-        // Three frames at 0, 1, 2 s merge into pairs (0,1) at 0.5 s and (2,2) at 2.0 s:
-        // the odd tail repeats its last frame. The vision blocks match the Qwen3-VL
-        // v4.57.1 processor: it replaces the whole outer vision-start/video-pad/end span.
+        // Three frames sampled 1 s apart are three scenes, twice as sparse as the 2 fps
+        // frames the tower merges in pairs, so each fills its own temporal patch with its
+        // own time label (pairing them read a 17/42/86 clip back as "12", "47", "86").
+        // The vision blocks match the Qwen3-VL v4.57.1 processor: it replaces the whole
+        // outer vision-start/video-pad/end span.
         // https://github.com/huggingface/transformers/blob/v4.57.1/src/transformers/models/qwen3_vl/processing_qwen3_vl.py
         string clip = "Sampled video frame times in chronological order: 0, 1, 2 seconds.\n"
-            + "<0.5 seconds>" + Start + VideoPad + End
+            + "<0.0 seconds>" + Start + VideoPad + End
+            + "<1.0 seconds>" + Start + VideoPad + End
             + "<2.0 seconds>" + Start + VideoPad + End;
         string content = ChatTemplate.InjectMultimodalTokens(new() { message }, "qwen4exp")[0].Content!;
         Assert.StartsWith(Image + clip + Image + "Describe the numbered frames", content);
-        Assert.Equal(2, Count(content, VideoPad));
+        Assert.Equal(3, Count(content, VideoPad));
         Assert.Equal(2, Count(content, QwenVideoFrames.ImagePad));
 
         var items = QwenVideoFrames.Layout(message);
         Assert.Equal(3, items.Count);
         Assert.False(items[0].IsVideo);
         Assert.True(items[1].IsVideo);
-        Assert.Equal(new[] { new QwenVideoFrames.Group(1, 2, 0.5), new QwenVideoFrames.Group(3, 3, 2.0) }, items[1].Groups);
+        Assert.Equal(new[]
+        {
+            new QwenVideoFrames.Group(1, 1, 0), new QwenVideoFrames.Group(2, 2, 1), new QwenVideoFrames.Group(3, 3, 2),
+        }, items[1].Groups);
         Assert.False(items[2].IsVideo);
         Assert.Equal(4, items[2].ImageIndex);
     }
@@ -95,12 +101,13 @@ public sealed class Qwen4ExpVideoRequestTests : IDisposable
         var items = QwenVideoFrames.Layout(message);
         Assert.Equal(2, items.Count);
         Assert.All(items, item => Assert.True(item.IsVideo));
-        Assert.Equal(new[] { new QwenVideoFrames.Group(0, 1, 1.0) }, items[0].Groups);
-        Assert.Equal(new[] { new QwenVideoFrames.Group(2, 3, 1.0) }, items[1].Groups);
+        Assert.Equal(new[] { new QwenVideoFrames.Group(0, 0, 0), new QwenVideoFrames.Group(1, 1, 2) }, items[0].Groups);
+        Assert.Equal(new[] { new QwenVideoFrames.Group(2, 2, 0), new QwenVideoFrames.Group(3, 3, 2) }, items[1].Groups);
 
         string content = ChatTemplate.InjectMultimodalTokens(new() { message }, "qwen4exp")[0].Content!;
         string clip = "Sampled video frame times in chronological order: 0, 2 seconds.\n"
-            + "<1.0 seconds>" + Start + VideoPad + End;
+            + "<0.0 seconds>" + Start + VideoPad + End
+            + "<2.0 seconds>" + Start + VideoPad + End;
         Assert.StartsWith(clip + clip + "Which clip", content);
     }
 
@@ -173,6 +180,52 @@ public sealed class Qwen4ExpVideoRequestTests : IDisposable
             + "<2.0 seconds>" + Start + VideoPad + End
             + "Sampled video frame times in chronological order: 0 seconds.\n"
             + "<0.0 seconds>" + Start + VideoPad + End, sb.ToString());
+    }
+
+    [Theory]
+    [InlineData(0.5, true)]    // the processor's own 2 fps sampling
+    [InlineData(0.52, true)]   // 2 fps rounded onto a 25 fps source
+    [InlineData(0.575, true)]
+    [InlineData(0.6, false)]
+    [InlineData(1.0, false)]   // fps: 1
+    [InlineData(4.0, false)]   // a long clip spread over max_frames
+    public void Layout_PairsOnlyFramesAsCloseAsTheTowersTemporalPatch(double gap, bool paired)
+    {
+        var message = new ChatMessage
+        {
+            Role = "user", IsVideo = true,
+            ImagePaths = new() { "f0.png", "f1.png" },
+            ImageTimestamps = new() { 1.0, 1.0 + gap },
+        };
+        var groups = Assert.Single(QwenVideoFrames.Layout(message)).Groups!;
+        if (paired)
+            Assert.Equal(new[] { new QwenVideoFrames.Group(0, 1, 1.0 + gap / 2) }, groups);
+        else
+            Assert.Equal(new[] { new QwenVideoFrames.Group(0, 0, 1.0), new QwenVideoFrames.Group(1, 1, 1.0 + gap) }, groups);
+    }
+
+    [Fact]
+    public void Layout_MixedSpacingPairsDenseRunsAndGivesSparseFramesTheirOwnPatch()
+    {
+        var message = new ChatMessage
+        {
+            Role = "user", IsVideo = true,
+            ImagePaths = new() { "a.png", "b.png", "c.png", "d.png", "e.png" },
+            ImageTimestamps = new() { 0, 0.5, 1.5, 3.0, 3.5 },
+        };
+        var groups = Assert.Single(QwenVideoFrames.Layout(message)).Groups!;
+        Assert.Equal(new[]
+        {
+            new QwenVideoFrames.Group(0, 1, 0.25),
+            new QwenVideoFrames.Group(2, 2, 1.5),
+            new QwenVideoFrames.Group(3, 4, 3.25),
+        }, groups);
+        var sb = new StringBuilder();
+        QwenVideoFrames.AppendPlaceholders(message, sb);
+        Assert.Equal("Sampled video frame times in chronological order: 0, 0.5, 1.5, 3, 3.5 seconds.\n"
+            + "<0.2 seconds>" + Start + VideoPad + End
+            + "<1.5 seconds>" + Start + VideoPad + End
+            + "<3.2 seconds>" + Start + VideoPad + End, sb.ToString());
     }
 
     [Fact]

@@ -1,0 +1,363 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="(empty)"
+	tests="33"
+	failures="0"
+	disabled="0"
+	skipped="3"
+	hostname=""
+	time="151"
+	timestamp="2026-09-17T14:36:38"
+	>
+	<testcase name="qwen4exp-qsa-position-plan" classname="qwen4exp-qsa-position-plan" time="0.0298443" status="run">
+		<properties/>
+		<system-out>PASS 253504 independent QSA plan checks; no model/native/GPU execution
+</system-out>
+	</testcase>
+	<testcase name="deepseek41-engram-parallel-io" classname="deepseek41-engram-parallel-io" time="1.26509" status="run">
+		<properties/>
+		<system-out>Simulated blocked reads: rows=24 threads=1 peak=1 elapsed_ms=49.97
+Simulated blocked reads: rows=24 threads=16 peak=16 elapsed_ms=4.47
+Simulated blocked reads: rows=72 threads=1 peak=1 elapsed_ms=151.52
+Simulated blocked reads: rows=72 threads=16 peak=16 elapsed_ms=10.75
+Engram 1/3/257-token serial/parallel/warm, invalid rows, lifecycle, concurrent submission and exception tests passed
+</system-out>
+	</testcase>
+	<testcase name="deepseek41-engram-mapped-advice" classname="deepseek41-engram-mapped-advice" time="0.0480274" status="run">
+		<properties/>
+		<system-out>Linux smaps confirms rr on the two advised pages only
+Passed 61 mapped Engram advice checks
+</system-out>
+	</testcase>
+	<testcase name="deepseek41-tp-worker-lifetime" classname="deepseek41-tp-worker-lifetime" time="0.0219972" status="run">
+		<properties/>
+		<system-out>Passed 72 TP worker lifetime checks
+</system-out>
+	</testcase>
+	<testcase name="deepseek41-moe-tensor-parallel" classname="deepseek41-moe-tensor-parallel" time="10.995" status="run">
+		<properties/>
+		<system-out>Fixture gate=f32 up=f32 down=f32 embedding=16 hidden=18 experts=8 top_k=6
+Scalar F32 oracle ranks=2 shared_output=0 passed
+Scalar F32 oracle ranks=2 shared_output=1 passed
+f32/f32 ranks=2 layer=0 tokens=1 max_abs=2.91038e-11 rel_l2=1.0581e-07
+  ORACLE full-weight=pass partitioned-reference=within (TP versus partitioned: max_abs=0 rel_l2=0; partitioned versus full-weight: max_abs=2.91038e-11 rel_l2=1.0581e-07)
+f32/f32 ranks=2 layer=1 tokens=1 max_abs=2.91038e-11 rel_l2=1.19264e-07
+  ORACLE full-weight=pass partitioned-reference=within (TP versus partitioned: max_abs=0 rel_l2=0; partitioned versus full-weight: max_abs=2.91038e-11 rel_l2=1.19264e-07)
+f32/f32 ranks=2 layer=0 tokens=5 max_abs=4.18368e-11 rel_l2=1.11829e-07
+  ORACLE full-weight=pass partitioned-reference=within (TP versus partitioned: max_abs=0 rel_l2=0; partitioned versus full-weight: max_abs=4.18368e-11 rel_l2=1.11829e-07)
+f32/f32 ranks=2 layer=1 tokens=5 max_abs=5.82077e-11 rel_l2=1.23503e-07
+  ORACLE full-weight=pass partitioned-reference=withi...
+[This part of the test output was removed since it exceeds the threshold of 1024 bytes.]
+</system-out>
+	</testcase>
+	<testcase name="deepseek41-tp-failure-recovery" classname="deepseek41-tp-failure-recovery" time="0.359168" status="run">
+		<properties/>
+		<system-out>Passed 63 TP failure lifecycle checks
+</system-out>
+	</testcase>
+	<testcase name="deepseek41-quantized-strip-projections-cuda" classname="deepseek41-quantized-strip-projections-cuda" time="68.0794" status="run">
+		<properties/>
+		<system-out>ggml_cuda_init: found 2 CUDA devices (Total VRAM: 90996 MiB):
+  Device 0: NVIDIA A40, compute capability 8.6, VMM: yes, VRAM: 45498 MiB
+  Device 1: NVIDIA A40, compute capability 8.6, VMM: yes, VRAM: 45498 MiB
+SCRATCH_LIFECYCLE tokens=16 injected=0 passed
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+SCRATCH_LIFECYCLE tokens=16 injected=0 passed
+SCRATCH_LIFECYCLE tokens=16 injected=0 passed
+SCRATCH_LIFECYCLE tokens=129 injected=1 passed
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+ggml_backend_cuda_graph_compute: CUDA graph warmup reset
+SCRATCH_LIFECYCLE tokens=16 injected=0 passed
+SCRATCH_LIFECYCLE tokens=129 injected=0 passed
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+SCRATCH_LIFECYCLE tokens=129 injected=0 passed
+SCRATCH_LIFECYCLE tokens=129 injected=0 passed
+SCRATCH_LIFECYCLE tokens=17 injected=0 passed
+SCRATCH_LIFECYCLE tokens=65 injected=0 pas...
+[This part of the test output was removed since it exceeds the threshold of 1024 bytes.]
+</system-out>
+	</testcase>
+	<testcase name="deepseek41-moe-tensor-parallel-cuda-2" classname="deepseek41-moe-tensor-parallel-cuda-2" time="7.9195" status="run">
+		<properties/>
+		<system-out>ggml_cuda_init: found 2 CUDA devices (Total VRAM: 90996 MiB):
+  Device 0: NVIDIA A40, compute capability 8.6, VMM: yes, VRAM: 45498 MiB
+  Device 1: NVIDIA A40, compute capability 8.6, VMM: yes, VRAM: 45498 MiB
+Fixture gate=f32 up=f32 down=f32 embedding=16 hidden=18 experts=8 top_k=6
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+Scalar F32 oracle ranks=2 shared_output=0 passed
+Scalar F32 oracle ranks=2 shared_output=1 passed
+f32/f32 ranks=2 layer=0 tokens=1 max_abs=2.18279e-11 rel_l2=6.11983e-08
+  ORACLE full-weight=pass partitioned-reference=within (TP versus partitioned: max_abs=0 rel_l2=0; partitioned versus full-weight: max_abs=2.18279e-11 rel_l2=6.11983e-08)
+f32/f32 ranks=2 layer=1 tokens=1 max_ab...
+[This part of the test output was removed since it exceeds the threshold of 1024 bytes.]
+</system-out>
+	</testcase>
+	<testcase name="deepseek41-moe-tensor-parallel-cuda-4" classname="deepseek41-moe-tensor-parallel-cuda-4" time="0.545866" status="notrun">
+		<skipped message="SKIP_RETURN_CODE=77"/>
+		<properties/>
+		<system-out>ggml_cuda_init: found 2 CUDA devices (Total VRAM: 90996 MiB):
+  Device 0: NVIDIA A40, compute capability 8.6, VMM: yes, VRAM: 45498 MiB
+  Device 1: NVIDIA A40, compute capability 8.6, VMM: yes, VRAM: 45498 MiB
+</system-out>
+	</testcase>
+	<testcase name="deepseek41-moe-tensor-parallel-cuda-7" classname="deepseek41-moe-tensor-parallel-cuda-7" time="0.589072" status="notrun">
+		<skipped message="SKIP_RETURN_CODE=77"/>
+		<properties/>
+		<system-out>ggml_cuda_init: found 2 CUDA devices (Total VRAM: 90996 MiB):
+  Device 0: NVIDIA A40, compute capability 8.6, VMM: yes, VRAM: 45498 MiB
+  Device 1: NVIDIA A40, compute capability 8.6, VMM: yes, VRAM: 45498 MiB
+</system-out>
+	</testcase>
+	<testcase name="deepseek41-moe-tensor-parallel-cuda-8" classname="deepseek41-moe-tensor-parallel-cuda-8" time="0.618208" status="notrun">
+		<skipped message="SKIP_RETURN_CODE=77"/>
+		<properties/>
+		<system-out>ggml_cuda_init: found 2 CUDA devices (Total VRAM: 90996 MiB):
+  Device 0: NVIDIA A40, compute capability 8.6, VMM: yes, VRAM: 45498 MiB
+  Device 1: NVIDIA A40, compute capability 8.6, VMM: yes, VRAM: 45498 MiB
+</system-out>
+	</testcase>
+	<testcase name="scheduler-seventeen-backends" classname="scheduler-seventeen-backends" time="0.0381059" status="run">
+		<properties/>
+		<system-out>17-backend scheduler creation, allocation and computation passed
+</system-out>
+	</testcase>
+	<testcase name="scheduler-allocation-failure-recovery" classname="scheduler-allocation-failure-recovery" time="0.0415097" status="run">
+		<properties/>
+		<system-out>ggml_gallocr_reserve_n_impl: failed to allocate TensorSharpAllocationFailureFixture buffer of size 256
+ggml_gallocr_reserve_n_impl: failed to allocate TensorSharpAllocationFailureFixture buffer of size 256
+ggml_gallocr_reserve_n_impl: failed to allocate TensorSharpAllocationFailureFixture buffer of size 256
+ggml_gallocr_reserve_n_impl: failed to allocate TensorSharpAllocationFailureFixture buffer of size 512
+Cross-device failure rank=0 kind=null
+Failure helper returned false rank=0 kind=null
+Failed graph destroyed rank=0 kind=null
+Cross-device failure rank=1 kind=null
+Failure helper returned false rank=1 kind=null
+Failed graph destroyed rank=1 kind=null
+Cross-device failure rank=0 kind=bad_alloc
+Failure helper returned false rank=0 kind=bad_alloc
+Failed graph destroyed rank=0 kind=bad_alloc
+Cross-device failure rank=1 kind=bad_alloc
+Failure helper returned false rank=1 kind=bad_alloc
+Failed graph destroyed rank=1 kind=bad_alloc
+Incompatible CPU devices: reserve rewrites sources; null/bad_alloc failures restor...
+[This part of the test output was removed since it exceeds the threshold of 1024 bytes.]
+</system-out>
+	</testcase>
+	<testcase name="cuda-scheduler-allocation-failure-recovery" classname="cuda-scheduler-allocation-failure-recovery" time="1.05689" status="run">
+		<properties/>
+		<system-out>ggml_cuda_init: found 2 CUDA devices (Total VRAM: 90996 MiB):
+  Device 0: NVIDIA A40, compute capability 8.6, VMM: yes, VRAM: 45498 MiB
+  Device 1: NVIDIA A40, compute capability 8.6, VMM: yes, VRAM: 45498 MiB
+CUDA backend 0: free_bytes=47428993024 total_bytes=47708110848 logical_total_bytes=47708110848; unified_memory=disabled
+Deliberate CUDA allocation: shape=[1048576,22750], output_bytes=95420416000, physical_total_bytes=47708110848
+ggml_backend_cuda_buffer_type_alloc_buffer: allocating 91000.00 MiB on device 0: cudaMalloc failed: out of memory
+ggml_gallocr_reserve_n_impl: failed to allocate CUDA0 buffer of size 95420416128
+CUDA Graph id 7 reused
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+Recovery pass 1: 64 exact outputs, changed CPU inputs, CUDA scale and CPU output passed
+Recovery pass 2: 64 exact outputs, changed CPU inputs, CUDA scale and CPU output passed
+Actual CUDA allocation failure, discard and fresh small-graph recovery passed. This is not full-model recovery evidence.
+</system-out>
+	</testcase>
+	<testcase name="deepseek41-compact-raw-gather" classname="deepseek41-compact-raw-gather" time="0.161476" status="run">
+		<properties/>
+		<system-out>Passed 16384 independent window/mask comparisons, 5 invalid-window guards, 34 bit-exact paired gathers
+</system-out>
+	</testcase>
+	<testcase name="deepseek41-truncate-guards" classname="deepseek41-truncate-guards" time="1.23566" status="run">
+		<properties/>
+		<system-out>dsv41 truncate guards: 4633 allowed rewinds verified against the ring simulation, 7955 refused, 3576 sound rewinds confirmed allowed
+</system-out>
+	</testcase>
+	<testcase name="deepseek41-dspark-ring-guards" classname="deepseek41-dspark-ring-guards" time="1.21651" status="run">
+		<properties/>
+		<system-out>PASS: DSpark guard/ring contract checks=281727 branches=24680 refused=1680
+Scope: direct production rewind predicate plus independent ring simulation; no model/CUDA/cache tensor execution.
+</system-out>
+	</testcase>
+	<testcase name="deepseek41-retention-budget" classname="deepseek41-retention-budget" time="0.0170177" status="run">
+		<properties/>
+		<system-out>13 retention budget/overflow checks passed
+</system-out>
+	</testcase>
+	<testcase name="gemma4-multimodal-mask-after-reused-prefix" classname="gemma4-multimodal-mask-after-reused-prefix" time="0.851986" status="run">
+		<properties/>
+		<system-out>media chunks at start_pos &gt; 0: 1200 cases, 1102 inexact with the old start_pos gate
+gemma4 multimodal mask: 1937414 checks passed
+</system-out>
+	</testcase>
+	<testcase name="deepseek41-activation-quant-candidates" classname="deepseek41-activation-quant-candidates" time="0.0209261" status="run">
+		<properties/>
+		<system-out>DeepSeek V4.1 FP8/FP4/BF16 quantization and candidate-mask tests passed
+</system-out>
+	</testcase>
+	<testcase name="deepseek41-sparse-flash-attention-cuda" classname="deepseek41-sparse-flash-attention-cuda" time="23.91" status="run">
+		<properties/>
+		<system-out>ggml_cuda_init: found 2 CUDA devices (Total VRAM: 90996 MiB):
+  Device 0: NVIDIA A40, compute capability 8.6, VMM: yes, VRAM: 45498 MiB
+  Device 1: NVIDIA A40, compute capability 8.6, VMM: yes, VRAM: 45498 MiB
+head=512 heads=64 nt=1 nkv=4096 bound=640 elements=32768 reference_elements=32768 dense_sparse_max_abs=4.4230372e-05 dense_sparse_rel_l2=0.00062709881 dense_reference_max_abs=4.3890894e-05 dense_reference_rel_l2=0.00057213832 sparse_reference_max_abs=2.4569436e-05 sparse_reference_rel_l2=0.00033238515 correctness=pass
+head=512 heads=64 nt=1 nkv=8192 bound=640 elements=32768 reference_elements=32768 dense_sparse_max_abs=6.4608641e-05 dense_sparse_rel_l2=0.00072733625 dense_reference_max_abs=5.5052832e-05 dense_reference_rel_l2=0.00067757576 sparse_reference_max_abs=2.545905e-05 sparse_reference_rel_l2=0.00033561938 correctness=pass
+head=512 heads=64 nt=1 nkv=16384 bound=640 elements=32768 reference_elements=32768 dense_sparse_max_abs=6.0338527e-05 dense_sparse_rel_l2=0.00071882534 dense_reference_max_abs...
+[This part of the test output was removed since it exceeds the threshold of 1024 bytes.]
+</system-out>
+	</testcase>
+	<testcase name="deepseek41-activation-quant-candidates-cuda" classname="deepseek41-activation-quant-candidates-cuda" time="0.85425" status="run">
+		<properties/>
+		<system-out>ggml_cuda_init: found 2 CUDA devices (Total VRAM: 90996 MiB):
+  Device 0: NVIDIA A40, compute capability 8.6, VMM: yes, VRAM: 45498 MiB
+  Device 1: NVIDIA A40, compute capability 8.6, VMM: yes, VRAM: 45498 MiB
+DeepSeek V4.1 FP8/FP4/BF16 quantization and candidate-mask tests passed
+</system-out>
+	</testcase>
+	<testcase name="cpu-explicit-f32-matmul" classname="cpu-explicit-f32-matmul" time="0.827522" status="run">
+		<properties/>
+		<system-out>CPU COLUMN_INVARIANCE MUL_MAT weights=f32 inner=4096 rows=96 widths=1..8 bit_identical
+CPU COLUMN_INVARIANCE MUL_MAT weights=f16 inner=4096 rows=96 widths=1..8 bit_identical
+CPU COLUMN_INVARIANCE MUL_MAT_ID weights=f32 inner=4096 rows=96 widths=1..8 bit_identical
+CPU COLUMN_INVARIANCE MUL_MAT_ID weights=f16 inner=4096 rows=96 widths=1..8 bit_identical
+CPU MUL_MAT nt=1 weights=f32 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=0 convert=0 precision=default pipeline=0 max_abs=5.5964921e-07 rel_l2=7.4756777e-08 mean_us=7.9 max_abs=5.3086552e-07 rel_l2=7.8884378e-08
+CPU MUL_MAT nt=1 weights=f32 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=0 convert=0 precision=F32 pipeline=0 max_abs=5.5964921e-07 rel_l2=7.4756777e-08 mean_us=5.6 max_abs=5.3086552e-07 rel_l2=7.8884378e-08
+CPU MUL_MAT nt=1 weights=f16 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=0 convert=0 precision=default pipeline=0 max_abs=0.0010105717 rel_l2=0.00015540758 mean_us=6.3 max_abs...
+[This part of the test output was removed since it exceeds the threshold of 1024 bytes.]
+</system-out>
+	</testcase>
+	<testcase name="cpu-explicit-f32-attention" classname="cpu-explicit-f32-attention" time="6.97279" status="run">
+		<properties/>
+		<system-out>CPU QUERY_INVARIANCE head=64 keys=300 heads=64 widths=1..8 bit_identical
+CPU COMPACTION_GUARDS mask=f32 exact_capacity=16 overflow_capacity=17 exceptional=nan,+inf repeats=3 passed
+CPU COMPACTION_GUARDS mask=f16 exact_capacity=16 overflow_capacity=17 exceptional=nan,+inf repeats=3 passed
+CPU COMPACTION_GUARDS mask=bf16 exact_capacity=16 overflow_capacity=17 exceptional=nan,+inf repeats=3 passed
+CPU F32_ATTN head=64 value_head=33 queries=5 keys=15 heads=8/2 batches=4/2 mask=1:f32/2/2 sink=1 padded=1 stride0=1 alias=0 pattern=0 sparse_capacity=1 k_type=f32 v_type=f32 v_heads=4 v_batches=1 max_abs=9.9793315e-09 rel_l2=3.3443921e-08 mean_us=346.1 max_abs=6.8803146e-09 rel_l2=3.1938473e-08
+CPU F32_ATTN head=64 value_head=33 queries=5 keys=15 heads=8/2 batches=4/2 mask=1:f32/2/2 sink=0 padded=1 stride0=1 alias=0 pattern=0 sparse_capacity=16 k_type=bf16 v_type=f32 v_heads=4 v_batches=1 max_abs=1.0121569e-08 rel_l2=1.9307397e-08 mean_us=326.2 max_abs=1.131325e-08 rel_l2=2.3662702e-08
+CPU F32_ATTN head=64 value_head=3...
+[This part of the test output was removed since it exceeds the threshold of 1024 bytes.]
+</system-out>
+	</testcase>
+	<testcase name="attention-exception-boundary" classname="attention-exception-boundary" time="0.0294693" status="run">
+		<properties/>
+		<system-out>attention exception boundary: before=1 caught=1 injected=1 unwound=1 changed_input=1
+</system-out>
+	</testcase>
+	<testcase name="cpu-q8-f32-projection" classname="cpu-q8-f32-projection" time="2.69367" status="run">
+		<properties/>
+		<system-out>Q8/F32 K=96 M=65 N=1 padded=0 interleaved=0 transposed=0 pipeline=0 pattern=0 revision=0 max=1.03842467e-07 relL2=2.87805963e-08 failures=0
+Q8/F32 K=96 M=65 N=1 padded=0 interleaved=0 transposed=0 pipeline=0 pattern=0 revision=1 max=4.49363142e-08 relL2=1.92488723e-08 failures=0
+Q8/F32 K=96 M=63 N=1 padded=1 interleaved=1 transposed=0 pipeline=0 pattern=0 revision=0 max=1.03842467e-07 relL2=2.92254668e-08 failures=0
+Q8/F32 K=96 M=63 N=1 padded=1 interleaved=1 transposed=0 pipeline=0 pattern=0 revision=1 max=4.49363142e-08 relL2=1.96243658e-08 failures=0
+Q8/F32 K=96 M=65 N=4 padded=0 interleaved=0 transposed=0 pipeline=0 pattern=0 revision=0 max=4.61470336e-07 relL2=2.41618327e-08 failures=0
+Q8/F32 K=96 M=65 N=4 padded=0 interleaved=0 transposed=0 pipeline=0 pattern=0 revision=1 max=2.02795491e-07 relL2=2.39039077e-08 failures=0
+Q8/F32 K=96 M=63 N=4 padded=1 interleaved=1 transposed=0 pipeline=0 pattern=0 revision=0 max=4.61470336e-07 relL2=2.4115506e-08 failures=0
+Q8/F32 K=96 M=63 N=4 padded=1 interleaved=1 t...
+[This part of the test output was removed since it exceeds the threshold of 1024 bytes.]
+</system-out>
+	</testcase>
+	<testcase name="cuda-explicit-f32-matmul" classname="cuda-explicit-f32-matmul" time="3.95176" status="run">
+		<properties/>
+		<system-out>ggml_cuda_init: found 2 CUDA devices (Total VRAM: 90996 MiB):
+  Device 0: NVIDIA A40, compute capability 8.6, VMM: yes, VRAM: 45498 MiB
+  Device 1: NVIDIA A40, compute capability 8.6, VMM: yes, VRAM: 45498 MiB
+TSDSV4-0 COLUMN_INVARIANCE MUL_MAT weights=f32 inner=4096 rows=96 widths=1..8 bit_identical
+TSDSV4-0 COLUMN_INVARIANCE MUL_MAT weights=f16 inner=4096 rows=96 widths=1..8 bit_identical
+TSDSV4-0 COLUMN_INVARIANCE MUL_MAT_ID weights=f32 inner=4096 rows=96 widths=1..8 bit_identical
+TSDSV4-0 COLUMN_INVARIANCE MUL_MAT_ID weights=f16 inner=4096 rows=96 widths=1..8 bit_identical
+TSDSV4-0 MUL_MAT nt=1 weights=f32 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=0 convert=0 precision=default pipeline=0 max_abs=4.900892e-07 rel_l2=7.8554572e-08ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=100.4 max_abs=6.6267833e-07 rel_l2=7.6771247e-08
+TSDSV4-0 MUL_MAT nt=1 weights=f32 inner=256 rows=64 slots=1 batches=1,1/1,1 padded=0 stride0=0 pattern=0 convert=0 precision=F32 pipeline...
+[This part of the test output was removed since it exceeds the threshold of 1024 bytes.]
+</system-out>
+	</testcase>
+	<testcase name="cuda-explicit-f32-attention" classname="cuda-explicit-f32-attention" time="5.65212" status="run">
+		<properties/>
+		<system-out>ggml_cuda_init: found 2 CUDA devices (Total VRAM: 90996 MiB):
+  Device 0: NVIDIA A40, compute capability 8.6, VMM: yes, VRAM: 45498 MiB
+  Device 1: NVIDIA A40, compute capability 8.6, VMM: yes, VRAM: 45498 MiB
+TSDSV4-0 QUERY_INVARIANCE head=64 keys=300 heads=64 widths=1..8 bit_identical
+TSDSV4-0 COMPACTION_GUARDS mask=f32 exact_capacity=16 overflow_capacity=17 exceptional=nan,+inf repeats=3 passed
+TSDSV4-0 COMPACTION_GUARDS mask=f16 exact_capacity=16 overflow_capacity=17 exceptional=nan,+inf repeats=3 passed
+TSDSV4-0 COMPACTION_GUARDS mask=bf16 exact_capacity=16 overflow_capacity=17 exceptional=nan,+inf repeats=3 passed
+TSDSV4-0 F32_ATTN head=64 value_head=33 queries=5 keys=15 heads=8/2 batches=4/2 mask=1:f32/2/2 sink=1 padded=1 stride0=1 alias=0 pattern=0 sparse_capacity=1 k_type=f32 v_type=f32 v_heads=4 v_batches=1 max_abs=2.0162873e-08 rel_l2=7.2892237e-08ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ mean_us=123.5 max_abs=1.0875726e-08 rel_l2=5.5152056e-08
+TSDSV4-0 F32_ATTN head=64 value_hea...
+[This part of the test output was removed since it exceeds the threshold of 1024 bytes.]
+</system-out>
+	</testcase>
+	<testcase name="cuda-q8-f32-projection" classname="cuda-q8-f32-projection" time="6.80027" status="run">
+		<properties/>
+		<system-out>ggml_cuda_init: found 2 CUDA devices (Total VRAM: 90996 MiB):
+  Device 0: NVIDIA A40, compute capability 8.6, VMM: yes, VRAM: 45498 MiB
+  Device 1: NVIDIA A40, compute capability 8.6, VMM: yes, VRAM: 45498 MiB
+Q8 projection CUDA device 0
+Q8/F32 K=96 M=65 N=1 padded=0 interleaved=0 transposed=0 pipeline=0 pattern=0 revision=0 max=1.05751678e-06 relL2=2.16887403e-07 failures=0
+Q8/F32 K=96 M=65 N=1 padded=0 interleaved=0 transposed=0 pipeline=0 pattern=0 revision=1 max=4.90574166e-07 relL2=2.10431096e-07 failures=0
+Q8/F32 K=96 M=63 N=1 padded=1 interleaved=1 transposed=0 pipeline=0 pattern=0 revision=0 max=1.05751678e-06 relL2=2.14774284e-07 failures=0
+Q8/F32 K=96 M=63 N=1 padded=1 interleaved=1 transposed=0 pipeline=0 pattern=0 revision=1 max=4.90574166e-07 relL2=2.11305582e-07 failures=0
+Q8/F32 K=96 M=65 N=4 padded=0 interleaved=0 transposed=0 pipeline=0 pattern=0 revision=0 max=5.26057556e-06 relL2=1.83341319e-07 failures=0
+Q8/F32 K=96 M=65 N=4 padded=0 interleaved=0 transposed=0 pipeline=0 pattern=0 revision...
+[This part of the test output was removed since it exceeds the threshold of 1024 bytes.]
+</system-out>
+	</testcase>
+	<testcase name="attention-allocation" classname="attention-allocation" time="0.646846" status="run">
+		<properties/>
+		<system-out>CPU f16 q=1 kv=65 retained=0 late_view=0 slots=1 bytes=11424 -&gt; 7360
+CPU f16 q=1 kv=128 retained=1 late_view=0 slots=2 bytes=11520 -&gt; 8480
+CPU f16 q=1 kv=129 retained=0 late_view=1 slots=2 bytes=12576 -&gt; 9536
+CPU f16 q=32 kv=129 retained=0 late_view=0 slots=1 bytes=368704 -&gt; 237664
+CPU f16 q=1 kv=4096 retained=0 late_view=0 slots=1 bytes=41984 -&gt; 26656
+CPU f32 q=1 kv=65 retained=0 late_view=0 slots=1 bytes=11424 -&gt; 7360
+CPU f32 q=1 kv=128 retained=1 late_view=0 slots=2 bytes=11520 -&gt; 8480
+CPU f32 q=1 kv=129 retained=0 late_view=1 slots=2 bytes=12576 -&gt; 9536
+CPU f32 q=32 kv=129 retained=0 late_view=0 slots=1 bytes=368704 -&gt; 237664
+CPU f32 q=1 kv=4096 retained=0 late_view=0 slots=1 bytes=41984 -&gt; 26656
+CPU q8_0 q=1 kv=65 retained=0 late_view=0 slots=1 bytes=11424 -&gt; 7360
+CPU q8_0 q=1 kv=128 retained=1 late_view=0 slots=2 bytes=11520 -&gt; 8480
+CPU q8_0 q=1 kv=129 retained=0 late_view=1 slots=2 bytes=12576 -&gt; 9536
+CPU q8_0 q=32 kv=129 retained=0 late_view=0 slots=1 bytes=368704 -&gt; 237664
+CPU q8_0 q=1 kv=4096 retain...
+[This part of the test output was removed since it exceeds the threshold of 1024 bytes.]
+</system-out>
+	</testcase>
+	<testcase name="flash-attn-unsupported-shape-fallback" classname="flash-attn-unsupported-shape-fallback" time="1.41368" status="run">
+		<properties/>
+		<system-out>ggml_cuda_init: found 2 CUDA devices (Total VRAM: 90996 MiB):
+  Device 0: NVIDIA A40, compute capability 8.6, VMM: yes, VRAM: 45498 MiB
+  Device 1: NVIDIA A40, compute capability 8.6, VMM: yes, VRAM: 45498 MiB
+cpu  explicit head 16 gqa strided f16     max|diff| 5.96e-08
+cpu  explicit sinks softcap               max|diff| 5.96e-08
+cpu  explicit alibi                       max|diff| 8.94e-08
+cpu  explicit no mask                     max|diff| 8.94e-08
+cpu  explicit chunked queries             max|diff| 8.94e-08
+gpu backend: CUDA0
+gpu  explicit F32 value range                   max|diff| 0
+[TensorSharp] warning: CUDA0 has no flash-attention kernel for synthetic head 16 prefill (K head 16, V head 16, KV rows 12, query rows 5, heads 4/2, K/V f16/f16, mask yes); running this attention as explicit F32 mul_mat + soft_max instead (same math, slower, more memory). Reported once per call site.
+gpu  synthetic head 16 prefill                  kernel=0 path=explicit max|diff| 8.94e-08
+[TensorSharp] warning: CUDA0 has no fl...
+[This part of the test output was removed since it exceeds the threshold of 1024 bytes.]
+</system-out>
+	</testcase>
+	<testcase name="moe-fused-bias-alias-cpu" classname="moe-fused-bias-alias-cpu" time="0.474802" status="run">
+		<properties/>
+		<system-out>cpu tokens=1: 64 repeats, output scale 1788.8408, worst |error| 3.9838 (repeat 0, token 0, dim 94), tolerance 17.8884, deterministic=yes
+cpu tokens=4: 64 repeats, output scale 2148.7321, worst |error| 4.60639 (repeat 0, token 2, dim 107), tolerance 21.4873, deterministic=yes
+cpu tokens=7: 64 repeats, output scale 2508.7886, worst |error| 4.06798 (repeat 0, token 6, dim 113), tolerance 25.0879, deterministic=yes
+PASS
+</system-out>
+	</testcase>
+	<testcase name="moe-fused-bias-alias-cuda" classname="moe-fused-bias-alias-cuda" time="1.15005" status="run">
+		<properties/>
+		<system-out>ggml_cuda_init: found 2 CUDA devices (Total VRAM: 90996 MiB):
+  Device 0: NVIDIA A40, compute capability 8.6, VMM: yes, VRAM: 45498 MiB
+  Device 1: NVIDIA A40, compute capability 8.6, VMM: yes, VRAM: 45498 MiB
+cuda tokens=1: 64 repeats, output scale 1788.8408, worst |error| 3.9838 (repeat 0, token 0, dim 94), tolerance 17.8884, deterministic=yes
+cuda tokens=4: 64 repeats, output scale 2148.7321, worst |error| 4.60614 (repeat 0, token 2, dim 107), tolerance 21.4873, deterministic=yes
+cuda tokens=7: 64 repeats, output scale 2508.7886, worst |error| 4.06798 (repeat 0, token 6, dim 113), tolerance 25.0879, deterministic=yes
+PASS
+</system-out>
+	</testcase>
+</testsuite>

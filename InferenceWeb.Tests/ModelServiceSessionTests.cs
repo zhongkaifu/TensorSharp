@@ -21,11 +21,11 @@ public class ModelServiceSessionTests
     {
         var svc = new ModelService();
         var session = new ChatSession();
-        session.TrackedHistory.Add(new ChatMessage { Role = "user", Content = "hi" });
+        TranscriptTestHelper.RecordTurn(session, "hi");
 
         svc.ResetSession(session);
 
-        Assert.Empty(session.TrackedHistory);
+        Assert.Equal(0, session.TrackedTurnCount);
         Assert.False(session.IsDisposed);
     }
 
@@ -36,13 +36,13 @@ public class ModelServiceSessionTests
         var sessA = new ChatSession();
         var sessB = new ChatSession();
 
-        sessA.TrackedHistory.Add(new ChatMessage { Role = "user", Content = "a" });
-        sessB.TrackedHistory.Add(new ChatMessage { Role = "user", Content = "b" });
+        TranscriptTestHelper.RecordTurn(sessA, "a");
+        TranscriptTestHelper.RecordTurn(sessB, "b");
 
         svc.ResetSession(sessA);
 
-        Assert.Empty(sessA.TrackedHistory);
-        Assert.Single(sessB.TrackedHistory);
+        Assert.Equal(0, sessA.TrackedTurnCount);
+        Assert.Equal(1, sessB.TrackedTurnCount);
     }
 
     [Fact]
@@ -57,12 +57,12 @@ public class ModelServiceSessionTests
     {
         var svc = new ModelService();
         var session = new ChatSession();
-        session.TrackedHistory.Add(new ChatMessage { Role = "user", Content = "x" });
+        TranscriptTestHelper.RecordTurn(session, "x");
 
         svc.DisposeSession(session);
 
         Assert.True(session.IsDisposed);
-        Assert.Empty(session.TrackedHistory);
+        Assert.Equal(0, session.TrackedTurnCount);
     }
 
     [Fact]
@@ -73,12 +73,12 @@ public class ModelServiceSessionTests
         var sessA = new ChatSession();
         var sessB = new ChatSession();
 
-        sessB.TrackedHistory.Add(new ChatMessage { Role = "user", Content = "keep" });
+        TranscriptTestHelper.RecordTurn(sessB, "keep");
 
         svc.DisposeSession(sessA);
 
         Assert.False(sessB.IsDisposed);
-        Assert.Single(sessB.TrackedHistory);
+        Assert.Equal(1, sessB.TrackedTurnCount);
     }
 
     [Fact]

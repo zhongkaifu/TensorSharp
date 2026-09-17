@@ -1078,6 +1078,20 @@ namespace TensorSharp.Models
         // state without updating _convState / _deltaStateTensor's host mirrors.
         private bool _gdnStateHostDirty;
 
+        /// <summary>A whole-model-decode conv scratch for one cache: every GDN layer's
+        /// [time, channel] conv state, the layout <see cref="AllocateHolder"/> gives a
+        /// per-request holder.</summary>
+        private IntPtr AllocateConvScratch()
+        {
+            int gdnCount = 0;
+            for (int l = 0; l < Config.NumLayers; l++)
+                if (_isRecurrent[l]) gdnCount++;
+            int qkvDim = _headKDim * _numKHeads * 2 + _headVDim * _numVHeads;
+            int convDim = _convKernel - 1;
+            return Marshal.AllocHGlobal(checked((nint)((long)Math.Max(1, gdnCount)
+                * Math.Max(1, convDim) * qkvDim * sizeof(float))));
+        }
+
         /// <summary>
         /// Drain fused-decode GDN state to its host representation without
         /// evicting the device buffers.  Snapshotting can then read exact state
@@ -1182,7 +1196,10 @@ namespace TensorSharp.Models
             // any state reset/rebuild must force a re-seed before the next fused decode.
             _bfdPoolSeeded = false;
             if (_backend == BackendType.GgmlCuda)
+            {
                 GgmlBasicOps.Qwen35ResetBatchedDecodeCache();
+                CountDecodeGraphReset();
+            }
             // CUDA/Vulkan persistent graphs still use their established hard-drop
             // lifecycle. Metal can retain its graph across a logical state change:
             // the next replay receives an explicit reseed flag and uploads the
@@ -1198,7 +1215,10 @@ namespace TensorSharp.Models
             // call sites reset it explicitly via InvalidateVerifyCache().
             if (_backend == BackendType.GgmlCuda || _backend == BackendType.GgmlVulkan
                 || (_backend == BackendType.GgmlMetal && hardBindings))
+            {
                 GgmlBasicOps.Qwen35ResetDecodeCache();
+                CountDecodeGraphReset();
+            }
         }
 
         /// <summary>Drop the persistent fused-verify graph cache (it pins the KV +
@@ -1401,6 +1421,8 @@ namespace TensorSharp.Models
             if (_backend != BackendType.GgmlCuda && _backend != BackendType.GgmlMetal
                 && _backend != BackendType.GgmlVulkan)
                 return FdBail($"backend {_backend} has no fused whole-model decode graph");
+            if (!NativeRopePositionAbiSupported())
+                return FdBail("the native library predates the M-RoPE position argument");
             // Interior Metal prefill chunks can leave GDN state in the verify
             // ping-pong buffer. The decode graph owns different resident-state
             // bindings, so synchronize the authoritative verify state before its
@@ -1487,22 +1509,29 @@ namespace TensorSharp.Models
                     {
                         _fdUnsupported = true;
                 GgmlBasicOps.Qwen35ArenaResetBatchedDecodeCache();   // flush stranded arena slots to host
+                        CountDecodeGraphReset();
                         return FdBail($"layer {l} ({(_isRecurrent[l] ? "recurrent" : "attention")}, moe={isMoeL}) missing a required weight/state" +
                             (!_isRecurrent[l] && _kvCacheK[l] != null && !IsFusedGraphKvCacheDType(_kvCacheK[l].ElementType)
                                 ? $" (KV cache dtype {_kvCacheK[l].ElementType} unsupported by fused graph on {_backend})"
                                 : ""));
                     }
                 }
-                int gdnCount = 0;
                 _fdGdnSlot = new int[n];
+                int gdnCount = 0;
                 for (int l = 0; l < n; l++)
                     _fdGdnSlot[l] = _isRecurrent[l] ? gdnCount++ : -1;
-                // The conv scratch is per-request-cache state (the per-seq fused
-                // path swaps _fdConvScratch via the holder); only allocate the
-                // primary/default one here if a holder hasn't already bound one.
-                if (_fdConvScratch == IntPtr.Zero)
-                    _fdConvScratch = Marshal.AllocHGlobal(Math.Max(1, gdnCount) * convDim * qkvDim * sizeof(float));
                 _fdLayers = new Qwen35LayerDecodeArgs[n];
+            }
+            // The conv scratch is per-cache state (the per-seq fused path swaps
+            // _fdConvScratch with the holder). Allocated whenever the ACTIVE cache has
+            // none, not only when the descriptors are first built: a cache that had
+            // never decoded by then - the model's original primary cache, saved aside
+            // when a per-request holder was bound first - would otherwise reach the
+            // reseed below with a null scratch. Its GDN truth is the host ring.
+            if (_fdConvScratch == IntPtr.Zero)
+            {
+                _fdConvScratch = AllocateConvScratch();
+                _fdStateResident = false;
             }
 
             int cacheSize = 0;
@@ -1702,7 +1731,7 @@ namespace TensorSharp.Models
                         tokenId,
                         tokenEmbedding.ptr, tokenEmbedding.type,
                         tokenEmbedding.ne0, tokenEmbedding.ne1, tokenEmbedding.bytes,
-                        Config.HiddenSize, position,
+                        Config.HiddenSize, position, _ropeDelta,
                         Config.NumHeads, Config.NumKVHeads, headDim, cacheSize,
                         _ropeDimCount > 0 ? _ropeDimCount : headDim, 2, kvCacheType,
                         _convKernel, _headKDim, _headVDim, _numKHeads, _numVHeads,
@@ -1718,7 +1747,7 @@ namespace TensorSharp.Models
                     ok2 = GgmlBasicOps.Qwen35ModelDecode(
                         _fdLayers, n,
                         reseedState,
-                        TensorComputePrimitives.GetStoragePointer(hidden), Config.HiddenSize, position,
+                        TensorComputePrimitives.GetStoragePointer(hidden), Config.HiddenSize, position, _ropeDelta,
                         Config.NumHeads, Config.NumKVHeads, headDim, cacheSize,
                         // rope_n_dims: this model uses partial rotary (rope.dimension_count,
                         // e.g. 64 of the 256-dim head). Passing headDim here rotated ALL 256
@@ -1745,6 +1774,7 @@ namespace TensorSharp.Models
                 }
                 _fdUnsupported = true;
                 GgmlBasicOps.Qwen35ArenaResetBatchedDecodeCache();   // flush stranded arena slots to host   // don't retry a failing kernel every token
+                CountDecodeGraphReset();
                 return false;
             }
 
@@ -1946,6 +1976,8 @@ namespace TensorSharp.Models
             // Single-device state only — see the note in TryFullModelDecode.
             if (IsTensorParallel)
                 return false;
+            if (!NativeRopePositionAbiSupported())
+                return FvBail("the native library predates the M-RoPE position argument");
             // Prefill requests logits for only the last nLogitRows tokens; MTP verify
             // (nLogitRows<=0) needs all seqLen rows. The kernel writes vocab*effLogitRows.
             int effLogitRows = (nLogitRows > 0 && nLogitRows < seqLen) ? nLogitRows : seqLen;
@@ -2269,7 +2301,10 @@ namespace TensorSharp.Models
                         stateSnapshotsUsed: (IntPtr)(&snapshotsUsed),
                         deviceStateCurrent: deviceStateCurrent,
                         deferStateDownload: deferState,
-                        ownerId: _verifyOwnerId);
+                        ownerId: _verifyOwnerId,
+                        // Rows the table covers carry their own positions; scalar rows
+                        // sit at KV index + the sequence's M-RoPE delta.
+                        ropePositionDelta: mropePos != null ? 0 : _ropeDelta);
                 }
             }
             if (!ok2)
@@ -2517,6 +2552,8 @@ namespace TensorSharp.Models
                 return false;
             if (!HasDraftHead || x == null || seqLen < 1)
                 return false;
+            if (!NativeRopePositionAbiSupported())
+                return false;
             int mtp = _mtpLayerIdx;
             if (mtp < 0 || _isRecurrent[mtp])     // the MTP block is a full-attention layer
                 return false;
@@ -2573,7 +2610,8 @@ namespace TensorSharp.Models
                         lmh.ptr, lmh.type, lmh.ne0, lmh.ne1, lmh.bytes,
                         finalNormPtr, normedOut != null ? (IntPtr)np : IntPtr.Zero, nLogitRows,
                         null, null,
-                        ownerId: _verifyOwnerId);
+                        ownerId: _verifyOwnerId,
+                        ropePositionDelta: _ropeDelta);
                 }
             }
             if (ok)

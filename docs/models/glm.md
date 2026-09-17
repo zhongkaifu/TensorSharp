@@ -495,6 +495,26 @@ pick therefore drops much further:
 if it fits and refused with the numbers if it does not, rather than quietly
 shrunk under you.
 
+Under `--tp N` the refusal names only remedies that would actually make the load
+fit on that rank count: a `MAX_CONTEXT` that fits, the `--n-cpu-moe` value that
+fits the context you asked for, or, when even every routed expert in system RAM
+leaves the replicated weights too large for one rank, running without `--tp`.
+Measured on 2x A40 with GLM-5.3-Flash UD-Q2_K_XL (lines shortened):
+
+```
+[glm] not enough VRAM for --tp 2: 52.5 GiB per rank of weights plus 5.5 GiB of KV and graphs
+      for a 65536-token context, against 41.2 GiB usable on the smallest rank. Re-run with
+      --n-cpu-moe 19 (keeps the routed experts of the first 19 layer(s) in system RAM).
+[glm] not enough VRAM for --tp 2: 6.4 GiB per rank of weights plus 62.3 GiB of KV and graphs
+      for a 1048576-token context, against 41.2 GiB usable on the smallest rank. Set
+      MAX_CONTEXT to 571904 or less.
+```
+
+It used to end every such refusal with "Lower MAX_CONTEXT (N tokens would fit) or
+add --n-cpu-moe N", including "0 tokens would fit" when the weights alone were
+the problem. Like every refused load, the host then prints the reason once more
+as its last stderr line and exits with code 2 (USAGE.md, "Exit codes").
+
 ### Environment knobs
 
 | Variable | Default | Meaning |
@@ -534,6 +554,15 @@ dropped from the prompt, matching the template's `clear_thinking` default. Tool 
 `<tool_call>NAME<arg_key>k</arg_key><arg_value>v</arg_value>...</tool_call>`,
 one XML element per argument (values that were rendered with `tojson` are parsed
 back into numbers / arrays / objects).
+
+Generation also stops on `<|observation|>` (the GGUF's
+`tokenizer.ggml.eom_token_id`, which llama.cpp folds into its end-of-generation
+set): the model writes it right after a tool call, and without the stop it went
+on to invent the tool result. Prompts are split with the `glm4` / `chatglm-bpe`
+pre-tokenizer, which keeps digit runs of up to three; splitting every digit
+instead fed numbers to the model in a shape it was never trained on, and it
+quoted `INV-472` back as `INV-4472`. The split and the token ids are checked
+against the reference `tokenizer.json` (`Glm4TokenizerParityTests`).
 
 ## GLM-5.3 (`glm-dsa`)
 
@@ -637,6 +666,13 @@ and `Reset` wipes the state along with the position counter. The one exact
 "rewind" is a speculative rollback: a device-resident snapshot of the state is
 taken before every verify batch and copied back when part of the window is
 rejected (see [speculative decoding](#speculative-decoding-on-glm-53-flash)).
+
+A KV rewind the native executor refuses (a target past the slot's head, any
+glm5next rewind other than to 0 or to the head, or a slot whose KDA restore
+failed) reaches the caller as a refusal on both glm-dsa and glm5next:
+`TryTruncateKVCache` returns false, so the engine re-prefills instead of reusing,
+and the non-refusable `TruncateKVCache` throws. It used to report success with
+the head unmoved (`GlmTruncateRefusalTests`).
 
 ### Native local tensor parallelism
 
@@ -783,8 +819,16 @@ own top-2 margin at a flip point is ~0.13 logits with the same candidate set).
 
 GLM-5.3-Flash's template always reasons: the `<|system|>Reasoning Effort: Max`
 line is unconditional, the generation prompt always opens `<think>`, and past
-turns keep their reasoning (`clear_thinking` defaults to false). Tool calls
-use the same XML element form as GLM-5.2. Images render as
+turns keep their reasoning (`clear_thinking` defaults to false). Because the
+prompt cannot turn reasoning off, `"think": false` only decides what the client
+sees: the reply is parsed as reasoning up to `</think>` and only what follows is
+the answer. Streaming clients still receive that reasoning as it is generated
+(`reasoning_content` / `thinking` deltas, as for other always-reasoning
+families), so a `max_tokens` budget spent entirely inside the block ends with an
+empty answer. A reply that starts as JSON and never closes the block (a
+`response_format` grammar enforced from the first token) is the answer itself.
+`response_format` with `"think": true` arms the JSON grammar after `</think>`.
+Tool calls use the same XML element form as GLM-5.2. Images render as
 `<|begin_of_image|><|image|><|end_of_image|>`, and the host expands
 `<|image|>` to the merged-patch token count.
 

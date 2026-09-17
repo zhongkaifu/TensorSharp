@@ -7,11 +7,19 @@ public sealed class GlmNativeCudaFactAttribute : FactAttribute, ITraitAttribute
 {
     public string RequiresValue => "Cuda";
 
-    public GlmNativeCudaFactAttribute()
+    public GlmNativeCudaFactAttribute(int minimumGpuCount = 1)
     {
         Skip = Environment.GetEnvironmentVariable("TS_TEST_GLM_CUDA") != "1"
             ? "Requires TS_TEST_GLM_CUDA=1 for the native GLM CUDA fixture."
             : TestGates.CudaSkip;
+        if (Skip == null && minimumGpuCount > 1)
+        {
+            // GLM owns its CUDA backends independently of the process-global
+            // GGML backend (which the test initializer normally pins to CPU).
+            int available = TensorSharp.Cuda.CudaDevice.GetDeviceCount();
+            if (available < minimumGpuCount)
+                Skip = $"Requires {minimumGpuCount} visible CUDA devices; found {available}.";
+        }
     }
 }
 

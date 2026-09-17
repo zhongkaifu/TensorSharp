@@ -1,0 +1,2 @@
+78e2ce677f68668f6e1c6c3d966a1cce6a96b6bb8042f9b2cf97df89f4a61a51  TensorSharp.GGML.Native/build/libGgmlOps.so
+78e2ce677f68668f6e1c6c3d966a1cce6a96b6bb8042f9b2cf97df89f4a61a51  InferenceWeb.Tests/bin/Release/net10.0/libGgmlOps.so

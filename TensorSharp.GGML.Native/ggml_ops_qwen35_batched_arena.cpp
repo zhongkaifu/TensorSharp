@@ -456,6 +456,10 @@ TSG_EXPORT void TSGgml_Qwen35ArenaResetBatchedDecodeCache()
 //                    converted the ring into the scratch layout). Zero means
 //                    the resident device copy is the truth (post solo decode).
 //   token_ids/positions: [n_seqs]; embedding happens in-graph (get_rows).
+//                    positions are KV indices (the write row and the mask length).
+//   rope_positions:  [n_seqs] RoPE positions, or null for positions. They differ
+//                    for a Qwen-VL sequence after an image, whose span holds H*W
+//                    rows but only max(H, W) M-RoPE positions.
 //   logits_data [vocab, n_seqs] filled when want_logits; sampled_data [n_seqs]
 //   filled when non-null (in-graph argmax, first-max ties).
 // Returns 1 on success, 0 when declining before graph execution (safe for the
@@ -465,6 +469,7 @@ TSG_EXPORT void TSGgml_Qwen35ArenaResetBatchedDecodeCache()
 TSG_EXPORT int TSGgml_Qwen35ArenaDecodeBatched(
     const TSGgmlQwen35LayerDesc* layers, int num_layers, int n_seqs,
     const std::int32_t* token_ids, const std::int32_t* positions,
+    const std::int32_t* rope_positions,
     void** k_cache_arr, void** v_cache_arr,
     void** conv_state_arr, void** delta_state_arr,
     const std::int32_t* gdn_host_auth,
@@ -1436,7 +1441,7 @@ TSG_EXPORT int TSGgml_Qwen35ArenaDecodeBatched(
             const int s = slot_of[i];
             pos_by_slot[s] = positions[i];
             e.tok_stage[s] = token_ids[i];
-            e.pos_stage[s] = positions[i];
+            e.pos_stage[s] = rope_positions != nullptr ? rope_positions[i] : positions[i];
             for (int h = 0; h < kvH; h++)
                 e.idx_stage[static_cast<std::size_t>(s) * kvH + h] =
                     static_cast<std::int64_t>(s) * e.rows_per_slot +

@@ -1034,6 +1034,7 @@ namespace TensorSharp.Models
                 GgmlBasicOps.Gemma4ResetBatchedDecodeCache();
                 GgmlBasicOps.Gemma4MoEResetDecodeCache();
                 GgmlBasicOps.Gemma4ResetMoEBatchedDecodeCache();
+                CountDecodeGraphReset();
             }
             DisposeSwaPrevWindows();
             if (_kvCacheK == null) return;
@@ -1126,6 +1127,14 @@ namespace TensorSharp.Models
             Config != null && Config.UsesCircularKvCache && _slidingWindow > 0
                 ? _slidingWindow
                 : int.MaxValue;
+
+        // A media chunk prefilled after a reused prefix is exact at any prompt length, so
+        // Gemma 4 keeps the default CanPrefillMediaAfterReusedPrefix (true). The fused
+        // whole-model prefill applies the soft-token mask at any start position
+        // (gemma4_mm_mask.h), and the per-op fallback shifts the soft-token positions
+        // into the frame of its gathered sliding window (ShiftPositions). Before both,
+        // an image chunk after a prefix longer than the 512-token window changed the
+        // greedy answer, and such a turn reused nothing past its public prefix.
 
         public override string KVStateFingerprint =>
             $"gemma4|arch={Config.Architecture}|L={Config.NumLayers}|H={Config.NumHeads}|KV={Config.NumKVHeads}|gKV={_numGlobalKVHeads}|gD={_globalHeadDim}|lD={_localHeadDim}|swa={_slidingWindow}|dtype={_kvCacheDtype.ToShortString()}";
@@ -1411,6 +1420,7 @@ namespace TensorSharp.Models
                 GgmlBasicOps.Gemma4ResetBatchedDecodeCache();
                 GgmlBasicOps.Gemma4MoEResetDecodeCache();
                 GgmlBasicOps.Gemma4ResetMoEBatchedDecodeCache();
+                CountDecodeGraphReset();
             }
 
             // The fused MoE whole-model decode (TryFusedMoEModelDecode) writes the KV
@@ -2027,6 +2037,7 @@ namespace TensorSharp.Models
                 GgmlBasicOps.Gemma4ResetBatchedDecodeCache();
                 GgmlBasicOps.Gemma4MoEResetDecodeCache();
                 GgmlBasicOps.Gemma4ResetMoEBatchedDecodeCache();
+                CountDecodeGraphReset();
             }
 
             int startPos = _cacheSeqLen;
@@ -3183,6 +3194,10 @@ namespace TensorSharp.Models
         });
         private static GgmlBasicOps.Gemma4BatchedDecodeCaps BatchedDecodeCaps => s_batchedDecodeCaps.Value;
 
+        // Tests force collection after extracting the raw input pointer. A weak
+        // reference observes the owner without extending its lifetime itself.
+        internal Action<WeakReference<Storage>> BeforeBatchedDecodeNativeForTest { get; set; }
+
         /// <summary>
         /// TRUE token-batched dense decode: decode one token for each of N
         /// concurrent sequences in ONE fused graph (one compute buffer, weights
@@ -3325,7 +3340,9 @@ namespace TensorSharp.Models
             }
 
             // Embed all N decode tokens -> hidden [hidden_size, N] (column s = seq s, canonical order).
-            Tensor hidden = Embedding(tokSorted);
+            // Native receives only its raw pointer. Keep the owner alive until
+            // the upload/compute returns, including optimized JIT lifetimes.
+            using Tensor hidden = Embedding(tokSorted);
             ScaleEmbedding(hidden);
             float* hiddenPtr = GetFloatPtr(hidden);
 
@@ -3388,6 +3405,7 @@ namespace TensorSharp.Models
                     return false;
             }
 
+            BeforeBatchedDecodeNativeForTest?.Invoke(new WeakReference<Storage>(hidden.Storage));
             bool ok;
             fixed (float* lp = logitsBuf)
             {
@@ -3545,16 +3563,10 @@ namespace TensorSharp.Models
                     throw new InvalidOperationException("The verify's folded LM head was requested but its weights have no device address.");
             }
 
-            // Multimodal bidirectional-span mask (image/audio soft tokens). Only
-            // valid at startPos==0 (the kernel maps view-index to logical position
-            // directly there); the gate guarantees that. One byte per token.
-            byte[] isExcept = null;
-            if (exceptPositions != null && exceptPositions.Count > 0 && startPos == 0)
-            {
-                isExcept = new byte[n];
-                foreach (int p in exceptPositions)
-                    if (p >= 0 && p < n) isExcept[p] = 1;
-            }
+            // Multimodal bidirectional-span mask (image/audio soft tokens), one byte
+            // per CHUNK token. The kernel maps it onto every attention buffer at any
+            // startPos, so a media chunk after a reused prefix stays on this path.
+            byte[] isExcept = ChunkSoftTokenMask(exceptPositions, startPos, n);
 
             float* hiddenPtr = GetFloatPtr(hidden);
 
@@ -3612,7 +3624,7 @@ namespace TensorSharp.Models
 
             fixed (float* logitsPtr = foldLogitsOut)
             {
-                return GgmlBasicOps.Gemma4ModelVerify(
+                bool verified = GgmlBasicOps.Gemma4ModelVerify(
                 (IntPtr)hiddenPtr, Config.HiddenSize, Config.NumLayers, n,
                 a.AttnNorm, a.Qkv, a.QNorm, a.KNorm,
                 a.O, a.PostAttnNorm,
@@ -3645,7 +3657,43 @@ namespace TensorSharp.Models
                 logitsData: fold ? (IntPtr)logitsPtr : IntPtr.Zero, vocabSize: fold ? Config.VocabSize : 0,
                 lmHeadData: lmHeadKey, lmHeadType: lmHeadType, lmHeadNe0: lmHeadNe0, lmHeadNe1: lmHeadNe1, lmHeadBytes: lmHeadBytes,
                 finalNormData: finalNormPtr, logitSoftcap: _finalLogitSoftcap);
+                if (verified && isExcept != null)
+                    CountFusedMediaPrefillChunk(startPos);
+                return verified;
             }
+        }
+
+        /// <summary>The fused kernels' multimodal mask for one chunk: one byte per chunk
+        /// token, 1 where <paramref name="exceptPositions"/> (ABSOLUTE positions of the
+        /// chunk's image/audio soft tokens) holds its position. Null for a text chunk.
+        /// </summary>
+        internal static byte[] ChunkSoftTokenMask(HashSet<int> exceptPositions, int startPos, int n)
+        {
+            if (exceptPositions == null || exceptPositions.Count == 0)
+                return null;
+            var isExcept = new byte[n];
+            foreach (int p in exceptPositions)
+            {
+                long chunkIndex = (long)p - startPos;
+                if (chunkIndex >= 0 && chunkIndex < n)
+                    isExcept[chunkIndex] = 1;
+            }
+            return isExcept;
+        }
+
+        // Media (image/audio) prefill chunks the fused whole-model kernels served,
+        // total and at a non-zero start position (after a reused prefix or an earlier
+        // chunk). Diagnostics for tests; no behaviour depends on them.
+        private int _fusedMediaPrefillChunks;
+        private int _fusedMediaPrefillChunksAfterPrefix;
+        internal int FusedMediaPrefillChunks => _fusedMediaPrefillChunks;
+        internal int FusedMediaPrefillChunksAfterPrefix => _fusedMediaPrefillChunksAfterPrefix;
+
+        private void CountFusedMediaPrefillChunk(int startPos)
+        {
+            System.Threading.Interlocked.Increment(ref _fusedMediaPrefillChunks);
+            if (startPos > 0)
+                System.Threading.Interlocked.Increment(ref _fusedMediaPrefillChunksAfterPrefix);
         }
 
         // Gates the whole-model multi-token prefill path. Default on; set
@@ -3658,6 +3706,11 @@ namespace TensorSharp.Models
         // TS_G4_MM_PREFILL=0 to keep multimodal on the per-op path for A/B.
         private static readonly bool s_wholeModelMMPrefillEnabled =
             Environment.GetEnvironmentVariable("TS_G4_MM_PREFILL") != "0";
+
+        /// <summary>This instance's TS_G4_MM_PREFILL: whether image/audio prefill chunks
+        /// may use the fused whole-model kernels. Tests switch it off to compare the
+        /// per-op multimodal path against itself.</summary>
+        internal bool FusedMediaPrefillEnabled { get; set; } = s_wholeModelMMPrefillEnabled;
 
         // Allow the whole-model verify kernel to serve SWA-wrapped chunks at
         // start_pos>0 via its in-kernel swaPrev gather (the previous window is read
@@ -3726,17 +3779,19 @@ namespace TensorSharp.Models
         ///     path), correct for any N. The start_pos==0 restriction holds because
         ///     only then is the fresh chunk the entire history; chunked / multi-turn
         ///     prefill past the window falls back to the per-op path (which gathers
-        ///     the previous window). Multimodal spans (exceptPositions) and MoE are
-        ///     excluded.
+        ///     the previous window). MoE is excluded. Multimodal spans
+        ///     (exceptPositions) run through the kernel's soft-token mask at any
+        ///     startPos, including a media chunk after a reused prefix on a wrapped
+        ///     ring (the mask indexes the chunk; see gemma4_mm_mask.h).
         /// </summary>
         private bool CanUseWholeModelPrefillVerify(int startPos, int seqLen, HashSet<int> exceptPositions)
         {
             if (!s_wholeModelPrefillEnabled) return false;
             if (!IsGgmlBackend || seqLen <= 1) return false;
             // Multimodal (image/audio soft tokens): the kernel's bidirectional-span
-            // mask is only valid at startPos==0 (view-index == logical position).
-            // Later-turn multimodal chunks (startPos>0) keep the per-op path.
-            if (exceptPositions != null && (!s_wholeModelMMPrefillEnabled || startPos != 0)) return false;
+            // mask covers the chunk at any startPos (TS_G4_MM_PREFILL=0 keeps
+            // multimodal chunks on the per-op path for A/B).
+            if (exceptPositions != null && !FusedMediaPrefillEnabled) return false;
             if (_decodeArrays == null || !_canUseFusedFullModelDecode) return false; // dense only (no MoE)
             if (FusedGraphRejectsKvDtype) return false;
 
@@ -3784,17 +3839,16 @@ namespace TensorSharp.Models
         ///     (the kernel's plain-causal mask is exact).
         /// Longer prompts / later chunks (totalSeqLen &gt; window) fall back to the
         /// per-op chunked path. Multimodal spans (exceptPositions) run through the
-        /// kernel's bidirectional-span mask at startPos == 0 (mirrors the dense
-        /// verify); later multimodal chunks and PLE excluded.
+        /// kernel's bidirectional-span mask at any startPos (mirrors the dense
+        /// verify); PLE excluded.
         /// </summary>
         private bool CanUseWholeModelMoEPrefillVerify(int startPos, int seqLen, HashSet<int> exceptPositions)
         {
             if (!s_wholeModelPrefillEnabled) return false;
             if (!IsGgmlBackend || seqLen <= 1) return false;
-            // Multimodal bidirectional spans are only expressible at startPos == 0,
-            // where the kernel's mask view-index == logical position (mirrors the
-            // dense gate).
-            if (exceptPositions != null && (!s_wholeModelMMPrefillEnabled || startPos != 0)) return false;
+            // Multimodal bidirectional spans: the kernel's mask covers the chunk at
+            // any startPos (mirrors the dense gate).
+            if (exceptPositions != null && !FusedMediaPrefillEnabled) return false;
             if (_moeModelVerifyDisabled || !s_MoeModelDecodeEnabled) return false;
             if (FusedGraphRejectsKvDtype) return false;
 
@@ -4132,7 +4186,10 @@ namespace TensorSharp.Models
             // CUDA-graph-captured decode graph. Drop it so the next plain-step decode
             // rebuilds + re-captures against the post-verify pool state.
             if (_backend == BackendType.GgmlCuda)
+            {
                 GgmlBasicOps.Gemma4MoEResetDecodeCache();
+                CountDecodeGraphReset();
+            }
 
             // The kernel reads/writes the KV cache through the cached _decodeArrays
             // K/V pointers, which are only repointed on cache growth or an explicit
@@ -4157,15 +4214,9 @@ namespace TensorSharp.Models
             }
 
             // Multimodal bidirectional-span mask (image/audio soft tokens attend
-            // bidirectionally within their span). Only valid at startPos == 0;
-            // the CanUseWholeModelMoEPrefillVerify gate guarantees that.
-            byte[] isExcept = null;
-            if (exceptPositions != null && exceptPositions.Count > 0 && startPos == 0)
-            {
-                isExcept = new byte[n];
-                foreach (int p in exceptPositions)
-                    if (p >= 0 && p < n) isExcept[p] = 1;
-            }
+            // bidirectionally within their span), one byte per chunk token, at any
+            // startPos.
+            byte[] isExcept = ChunkSoftTokenMask(exceptPositions, startPos, n);
 
             bool ok;
             try
@@ -4179,6 +4230,8 @@ namespace TensorSharp.Models
                 return false;
             }
             if (!ok) return false;   // kernel declined (e.g. global cache too small): per-op fallback
+            if (isExcept != null)
+                CountFusedMediaPrefillChunk(startPos);
             _kvCacheHostDirty = true;
             return true;
         }
@@ -6780,7 +6833,17 @@ namespace TensorSharp.Models
                     // the image batch with set_causal_attn(false) on all
                     // layers; the soft-token span fits inside the 1024 SWA
                     // window so the window bound never clips it.
-                    ApplyCausalMask(scores, seqLen, kvLen, windowSize, exceptPositions);
+                    // ApplyCausalMask reads key index 0 as position 0 and derives
+                    // the query positions from kvLen, but exceptPositions are
+                    // ABSOLUTE. The key buffer starts at totalSeqLen - kvLen: 0 for
+                    // the global cache and for a chunk whose gathered SWA window
+                    // reaches back to position 0, later once the ring has wrapped
+                    // (the window holds W-1 positions). Shift the positions into the
+                    // buffer's frame, as the tensor-parallel path does; without it a
+                    // media chunk after a prefix longer than the window marked the
+                    // wrong rows as bidirectional.
+                    HashSet<int> exceptForMask = ShiftPositions(exceptPositions, totalSeqLen - kvLen);
+                    ApplyCausalMask(scores, seqLen, kvLen, windowSize, exceptForMask);
                     Ops.Softmax(scores, scores);
 
                     var attnOut = new Tensor(_allocator, DType.Float32, Config.NumHeads, seqLen, hd);
@@ -8042,6 +8105,20 @@ namespace TensorSharp.Models
             }
 
             InvalidateTensorDeviceCache(cache);
+        }
+
+        /// <summary><paramref name="positions"/> moved <paramref name="shift"/> positions
+        /// earlier: absolute positions in the frame of a key buffer whose first key is
+        /// position <paramref name="shift"/>. Returns the same set when there is nothing
+        /// to move.</summary>
+        internal static HashSet<int> ShiftPositions(HashSet<int> positions, int shift)
+        {
+            if (positions == null || shift == 0)
+                return positions;
+            var shifted = new HashSet<int>();
+            foreach (int p in positions)
+                shifted.Add(p - shift);
+            return shifted;
         }
 
         private unsafe void ApplyCausalMask(Tensor scores, int queryLen, int totalKVLen, int windowSize,

@@ -1,0 +1,37 @@
+  Multi-GPU: 3 GPUs by LAYER SPLIT (each GPU holds a contiguous run of whole layers), not tensor parallelism - this architecture shards no weights. Same mode llama.cpp uses for it. This raises capacity; it is not expected to raise decode speed.
+ggml_cuda_init: found 3 CUDA devices (Total VRAM: 136494 MiB):
+  Device 0: NVIDIA A40, compute capability 8.6, VMM: yes, VRAM: 45498 MiB
+  Device 1: NVIDIA A40, compute capability 8.6, VMM: yes, VRAM: 45498 MiB
+  Device 2: NVIDIA A40, compute capability 8.6, VMM: yes, VRAM: 45498 MiB
+[GGML] multi-device (layer split): 3 device(s), no collectives
+Backend: GgmlCuda
+Model: qwen4exp, Layers=48, Hidden=2560, Heads=24, KVHeads=2, HeadDim=256, Vocab=248320
+  hyper-connections: count=4 lowRank=320 (residual is 10240 wide)
+  experts=512 used=10 ff=640 sharedFf=640
+  GDN layers=36/48, QSA indexer heads=4 dim=128 topK=2048
+  PLE: layers=[1] ngram=3 heads=16 headDim=160
+  Prefaulted GGUF page cache: 46.5 GiB with 16 read streams in 17.7s (2.64 GiB/s)
+  Prefaulted GGUF page cache: 26.9 GiB with 16 read streams in 10.5s (2.56 GiB/s)
+Loading model weights... done (557 F32 tensors, 74251 quantized tensors)
+  Quantized: 74905 MB (74905 MB file-backed), F32: 298 MB
+  Layer split across 3 GPUs: gpu0=15 layers/15229 MB, gpu1=16 layers/15595 MB, gpu2=17 layers/16913 MB
+  Device-resident quantized weights: 3073 MB across 521 tensors
+Context length: using MAX_CONTEXT=16384; model declares qwen4exp.context_length=262144.
+[chunk-probe] prompt 3248 tokens, chunks [4096], 96 new tokens
+[chunk-probe] reference chunk=4096 prefill 9845 ms:  over 128 tokens, 4 prompts)\n- decode throughput is **not comparable** across the two runs: the 1-GPU run\n  ran at 1.2 tok/s because it was streaming weights 
+[chunk-probe] reference's five smallest top-2 margins: @76=0.0042, @85=0.0042, @62=0.0242, @17=0.0294, @6=0.0316
+[verify-probe] rep=0 kernels=verify-row width=2 rows=96 changed=0 flips=0 max|dlogit|=0 median verify 24.46 ms, decode step 20.39 ms, prefill 2304 ms
+[verify-probe] rep=0 kernels=verify-row width=3 rows=96 changed=0 flips=0 max|dlogit|=0 median verify 28.08 ms, decode step 20.39 ms, prefill 2304 ms
+[verify-probe] rep=0 kernels=verify-row width=4 rows=96 changed=0 flips=0 max|dlogit|=0 median verify 32.27 ms, decode step 20.39 ms, prefill 2304 ms
+[verify-probe] rep=0 kernels=verify-row width=5 rows=96 changed=0 flips=0 max|dlogit|=0 median verify 43.34 ms, decode step 20.39 ms, prefill 2304 ms
+[verify-probe] rep=0 kernels=verify-row width=6 rows=96 changed=0 flips=0 max|dlogit|=0 median verify 47.91 ms, decode step 20.39 ms, prefill 2304 ms
+[verify-probe] rep=0 kernels=verify-row width=7 rows=96 changed=0 flips=0 max|dlogit|=0 median verify 51.16 ms, decode step 20.39 ms, prefill 2304 ms
+[verify-probe] rep=0 kernels=verify-row width=8 rows=96 changed=0 flips=0 max|dlogit|=0 median verify 55.41 ms, decode step 20.39 ms, prefill 2304 ms
+[verify-probe] rep=0 kernels=batched width=2 rows=96 changed=96 flips=8 max|dlogit|=2.482 median verify 23.95 ms, decode step 20.66 ms, prefill 2292 ms
+[verify-probe] rep=0 kernels=batched width=3 rows=96 changed=96 flips=8 max|dlogit|=4.543 median verify 26.38 ms, decode step 20.66 ms, prefill 2292 ms
+[verify-probe] rep=0 kernels=batched width=4 rows=96 changed=96 flips=9 max|dlogit|=4.016 median verify 29.13 ms, decode step 20.66 ms, prefill 2292 ms
+[verify-probe] rep=0 kernels=batched width=5 rows=96 changed=96 flips=5 max|dlogit|=2.182 median verify 32.32 ms, decode step 20.66 ms, prefill 2292 ms
+[verify-probe] rep=0 kernels=batched width=6 rows=96 changed=96 flips=5 max|dlogit|=2.182 median verify 34.78 ms, decode step 20.66 ms, prefill 2292 ms
+[verify-probe] rep=0 kernels=batched width=7 rows=96 changed=96 flips=6 max|dlogit|=2.182 median verify 37.49 ms, decode step 20.66 ms, prefill 2292 ms
+[verify-probe] rep=0 kernels=batched width=8 rows=96 changed=96 flips=10 max|dlogit|=4.253 median verify 41.04 ms, decode step 20.66 ms, prefill 2292 ms
+[chunk-probe] done

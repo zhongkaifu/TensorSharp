@@ -129,7 +129,19 @@ namespace TensorSharp.Server.Hosting
                 return true;
             }
 
-            svc.LoadModel(resolvedModelPath, hostedMmProjPath, backend);
+            try
+            {
+                svc.LoadModel(resolvedModelPath, hostedMmProjPath, backend);
+            }
+            catch (Exception ex) when (ModelLoadRefusal.TryDescribe(ex, out string refusal))
+            {
+                // A request that has to (re)load the hosted model and is refused answers
+                // with the reason instead of escaping as a 500 with a stack trace in the
+                // log. The lifecycle has already restored the previous model when there
+                // was one, or holds none; the server keeps serving either way.
+                error = $"Failed to load hosted model '{Path.GetFileName(resolvedModelPath)}': {refusal}";
+                return false;
+            }
             if (!svc.IsLoaded)
             {
                 error = $"Failed to load hosted model '{Path.GetFileName(resolvedModelPath)}'.";

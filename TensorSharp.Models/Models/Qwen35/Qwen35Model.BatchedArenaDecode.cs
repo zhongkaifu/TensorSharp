@@ -148,6 +148,8 @@ namespace TensorSharp.Models
                 return ArenaDecline("per-tensor sidecar weight scales (NVFP4 scale2) are not applied by the arena graph");
             if (!ArenaPrefillVerifyEnabled)
                 return ArenaDecline("TS_QWEN35_PREFILL_VERIFY=0 (unhooked prefill path)");
+            if (!NativeRopePositionAbiSupported())
+                return ArenaDecline("the native library predates the M-RoPE position argument");
             DType kvDt = _kvCacheDtype.ToDType();
             // One predicate for every fused graph, including this one. The arena used
             // to hardcode F32/F16 here while the solo whole-model graph had already
@@ -242,6 +244,7 @@ namespace TensorSharp.Models
 
             var tokSorted = new int[n];
             var posSorted = new int[n];
+            var ropeSorted = new int[n];
             var cacheSizes = new int[n];
             var gdnHostAuth = new int[n];
             var kPtrs = new IntPtr[attnLayers * n];
@@ -253,7 +256,16 @@ namespace TensorSharp.Models
                 var h = holders[order[i]];
                 tokSorted[i] = tokens[order[i]];
                 posSorted[i] = positions[order[i]];
+                // RoPE at KV index + the holder's M-RoPE delta (non-zero past an image).
+                ropeSorted[i] = checked(positions[order[i]] + h.RopeDelta);
                 cacheSizes[i] = h.KvCapacity;
+                if (h.ConvScratch == IntPtr.Zero)
+                {
+                    // A holder adopted from a primary cache that had never decoded
+                    // (see TryFullModelDecodeCore): its GDN truth is the host ring.
+                    h.ConvScratch = AllocateConvScratch();
+                    h.FdStateResident = false;
+                }
                 if (!h.FdStateResident)
                 {
                     // Host ring is the GDN truth: land it in the scratch layout
@@ -294,7 +306,7 @@ namespace TensorSharp.Models
             {
                 arenaStatus = GgmlBasicOps.Qwen35ArenaDecodeBatchedStatus(
                     _fdLayers, numLayers, n,
-                    tokSorted, posSorted,
+                    tokSorted, posSorted, ropeSorted,
                     kPtrs, vPtrs, convPtrs, deltaPtrs,
                     gdnHostAuth, cacheSizes,
                     Config.NumHeads, Config.NumKVHeads, Config.HeadDim,

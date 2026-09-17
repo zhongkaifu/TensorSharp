@@ -119,7 +119,8 @@ BlockPool + PagedKvStorage + BlockHashIndex   (托管主机内存)
 3. Pipeline 创建 `SequenceState` 并调用 `InferenceEngine.SubmitRequest`。
 4. 引擎 worker 向 `ContinuousBatchScheduler` 请求下一步工作。
 5. 调度器在 token 与序列预算允许时接纳等待序列。分配新块前，它会在 `BlockHashIndex` 中查找完整 prompt 块，命中时直接复用共享块。
-6. 块池压力较大时，调度器可以抢占优先级较低的运行序列，提交其完整块、释放剩余块，并重新排入等待队列。
+   只有当空闲块在扣除运行中请求尚需分配的 prompt 块之后，仍能容纳等待请求的整段 prompt 时，才会接纳它；否则它留在队列中，直到有请求结束（单独一个请求总会被接纳）。它会从运行中请求那里复用的前缀块是共享的，不计入其需求；但如果改由保留的按请求 holder（Gemma 4、Qwen 3.5/3.6）服务该提示，则不享受这一扣减：接纳会先尝试该 holder，而它为复用的前缀分配新的块，因此这样的请求按整段 prompt 计算。
+6. 块池压力较大时（decode 增长不预留），调度器可以抢占排名低于需要块的那个序列的运行序列（优先级更低，或同优先级但提交更晚），提交其完整块、释放剩余块，并重新排入等待队列。序列绝不抢占比它更早的序列：它会等待一步，因此块池满时按从旧到新的顺序排空，而不是让长 prefill 彼此抢占形成活锁。
 7. `BatchExecutor` 执行本步工作。它向 `ExecutionPlanner` 请求本步的 `ExecutionPlan`，并运行第一个接受该步的候选路径（见 [执行规划](#执行规划capability-model)）。
 8. 引擎把采样 token 发给 request handle，检查 EOS / max-tokens / abort 状态，并释放已完成序列的块。
 
@@ -203,13 +204,58 @@ GGML 后端使用原生分页注意力：
 
 | 内核 | 范围 | 说明 |
 |---|---|---|
-| `TSGgml_PagedAttentionForward` | 标准因果 / 滑窗注意力 | C++ K/V 聚合加 `ggml_flash_attn_ext`。Mistral 3 与大多数 GGML 分页注意力层默认使用。 |
+| `TSGgml_PagedAttentionForward` | 标准因果 / 滑窗注意力 | C++ K/V 聚合加 `ggml_flash_attn_ext`。Mistral 3 与大多数 GGML 分页注意力层默认使用。后端没有 flash kernel 的 head 大小（ggml-cuda：40/64/72/80/96/112/128/256 以及 grouped-query 的 192/320/512/576 之外的任何大小）改为以显式注意力运行并警告一次，而不是在 `fattn.cu` 中 abort。 |
 | `TSGgml_PagedAttentionForwardWithSinks` | GPT OSS attention sinks | 将每头可学习 sink logit 加入 softmax 分母。 |
 | `TensorPagedAttention.Forward` | Tensor 算子回退 | 使用 Tensor gather、批量 matmul 与 softmax，适合 A/B 测试。 |
 | `ManagedPagedAttention.Forward` | 纯 C# 回退 | online-softmax 实现，用于正确性与未支持后端回退。 |
 
 `TS_PAGED_ATTN_KERNEL=native|tensor|managed` 选择 Mistral 3 的派发路径。
 GPT OSS 可用 `TS_GPTOSS_PAGED_ATTN_MANAGED=1` 强制走托管 sinks 路径。
+
+### 并发下的输出一致性
+
+同样的批次必须逐位给出同样的 logits；不同的批次不必。哪些请求共处一步、每个请求
+前向多少 token，决定了跑哪些内核：ggml-cuda 对 MXFP4 的
+量化 `mul_mat_id` 在 Turing 与 Ampere 上不超过 7 个 token 时走 MMVQ（Volta、Ada 与
+Blackwell 上为 8 个），超过时走 MMQ；而独自先到达的序列会
+先走单序列 fused 路径。这些内核只在浮点近似平局（near-tie）的范围内一致，贪心解码会
+把一个近似平局变成另一段续写。因此，到达顺序没有固定的并发轮次，即使没有任何缺陷，
+不同运行之间也可能产生不同的 token。调度出相同批次的两次运行则不可能不同。
+
+区分这两种情况的方法：
+
+- `TS_CB_DEBUG=1` 为引擎的每一步打印一行 `[cb] step#N <path>`，列出本步调度的每个
+  请求（`id:P|D fwd=<token 数> computed=<本步之后的 token 数>`），以及它留下的 logits
+  指纹：前两个 token、二者的差值（margin）和整行的哈希。逐步对比两次运行：如果在第一个
+  哈希不同之前批次组成已经不同，属于近似平局一类；批次组成相同而哈希不同，就是缺陷。
+- `AgentTurnBench --conc-gate` 让引擎的 compute gate 保持关闭，直到整轮并发请求都已
+  入队，于是每次运行都以相同的批次接纳这一轮。这些行会记录 `ArrivalOrderFixed: true`，
+  `compare.py` 要求它们的 token 完全相同。没有该标记的并发行，token 差异只作为信息
+  报告，除非传入 `--require-concurrent-identity`。
+
+**实测（2026-09-17，gpt-oss-20b MXFP4，1x A40，`ggml_cuda`，`TS_PER_SEQ_FUSED=0`，
+`AgentTurnBench --conc 1,4,8`）。** 4 个并发贪心请求在不同运行之间于第 3-26 个输出
+token 处分叉，连同一进程内的预热轮与测量轮之间也会分叉；在这些运行中 8 个并发请求则没有。步骤跟踪
+显示两次运行的批次完全相同，而在第一个解码步，同一 token 的 logits 相差数个单位
+（41.28 对 38.84），所有 margin 仍然很大。这是缺陷，不是近似平局。独立 MoE 内核
+（`TSGgml_MoEFFNPrefillSwiGLUQuantF32`，批处理分页路径用它计算 GPT OSS 的专家）把每个
+专家的 bias 作为图的叶子张量上传到可复用的计算缓冲区。分配器在 gate bias 的 `add_id`
+之后释放了它，并把 SwiGLU 激活放在同一块内存上。ggml-cuda 在 1-7 个 token 时把
+`{mul_mat_id, add_id, mul_mat_id, add_id, swiglu_oai}` 融合成一个 MMVQ 内核。该内核
+在写激活的同时读取 bias，而它的内存重叠检查会跳过叶子张量，因为 llama.cpp 的 bias
+都是权重。于是内核覆盖了它仍在读取的 bias。在这块 Ampere 卡上 8 个 token 走不做融合的 MMQ，这就是 8 请求
+轮次保持稳定的原因；在 Ada 或 Blackwell 上 8 个 token 仍走 MMVQ，同样会受影响。现在图构建器用分配器的 output 标志固定住所有小的上传参数（ids、
+路由权重、bias、post-norm 权重）。CTest `moe-fused-bias-alias-cuda`
+（`GgmlOpsMoeFusedBiasAliasTest`）在 1、4、7 个 token 下把该内核与精确的主机计算结果
+比较。修复前 4 个和 7 个 token 的误差分别高达 644 和 1118（容差为 21 和 25），且重复运行
+结果不一致（1 个 token 的情况通过）；修复后与 CPU 后端一致。`moe-fused-bias-alias-metal`
+在 Metal 上做同样的检查；Metal 不融合这条算子链，修复前也能通过。
+
+修复后，在 `--conc-gate` 下，三轮运行在 1、4、8 请求轮次的每一步都给出逐位相同的
+logits。不加 gate 时，三轮中仍有一轮改变了 8 请求轮次的输出：它的第一个请求在另外七个
+到达之前被单独调度到单序列 fused 路径上。那一步的 logits 已经不同（42.94 对 42.86），
+随后的 argmax 翻转发生在 0.011-0.11 的 margin 上。这属于近似平局一类，`compare.py`
+只报告而不判失败。
 
 ### 按序列回退路径
 
@@ -264,14 +310,87 @@ GPT OSS 可用 `TS_GPTOSS_PAGED_ATTN_MANAGED=1` 强制走托管 sinks 路径。
 LRU 中；后续请求精确扩展已记录的 token 前缀时，再把该 holder 重新绑定给新请求。
 Gemma 4 保留其环形 attention K/V；Qwen 3.5/3.6 则把 attention K/V 与匹配的
 GatedDeltaNet 递归状态作为一个混合 holder 一起保留。未声明该能力的模型会忽略这组设置。
+带作用域的会话在主（N=1）缓存上结束的请求，在 fused 步骤接管模型时也会以同样方式保留，因此不会因为
+另一个会话插在它两轮之间到达而丢失自己的状态。
+
+### 跨请求的提示复用：会话作用域与媒体身份
+
+所有跨请求复用路径——live cache 续接、保留的 holder、共享前缀检查点和池化块——都遵守两条规则。
+
+**会话作用域。** 每个 `SequenceState` 携带一个 `CacheScope`（不透明的哈希）以及它的公开边界
+`SharedPrefixTokens`（开头的 system/developer 消息加工具声明）。其他作用域产生的状态只能复用到
+这个公开前缀为止：通过被克隆的共享前缀检查点，或者把 live cache 回退到恰好这个前缀（这是没有检查点的
+模型——例如 DeepSeek V4.1——唯一的公开复用；新请求的预填充本来也会覆盖这个缓存，存在检查点时仍优先使用
+检查点）。绝不会采纳、回退进入或移走另一个会话的保留 holder，绝不会越过公开前缀续接它的 live cache，
+公开前缀之后的池化块在哈希中带有作用域。带作用域的
+请求也不会克隆比自己公开前缀更长的检查点。作用域由 chat 层给出：
+
+| 请求 | 作用域 |
+|---|---|
+| 带 `sessionId` 的 Web UI / TensorAgent | 会话及其新会话纪元（`newChat:true` 开始一个新纪元）；把会话绑定到已保存对话的宿主（`WebUiChatService.BindSessionConversation`，TensorAgent 为它打开的每个会话都会调用）改用该对话，因此重新打开一个聊天会延续它自己的缓存状态 |
+| OpenAI Chat / Responses、Ollama chat、不带 `sessionId` 的 Web UI | 请求历史证明自己所延续的会话：它最后一条 assistant 消息是本服务器生成并只发给该会话的回合（见下文）；否则（包括两个会话在相同历史之后收到了相同回合的情况，例如对常见开场白的贪心回复）是一个全新的作用域 |
+| Skills / 代码工具循环的各轮 | 启动该循环的客户端回合的作用域 |
+| 不设置作用域的引擎调用方（基准测试、CLI） | 无作用域，与所有作用域匹配（行为不变） |
+
+chat 层的原始 token 拼接遵循同样的身份。每个生成的回合都以其之前的客户端可见历史的内容哈希链
+（角色、内容、工具调用、按内容计的媒体与附件文件）为键记录下来，同时记录原始输出 token 以及当时发给客户端
+的内容（解析后的正文和工具调用，或原始文本）。之后的 assistant 消息只有在（忽略空白后）等于这份
+已发出的内容时才会用记录的 token 渲染；客户端自己编写或修改过的 assistant 消息按其自身文本渲染。
+在此之前，无状态 API 共享同一份跟踪历史，会把另一个客户端生成的回合拼接到本客户端自己的消息上。
+并发的会话也不再相互覆盖记录。
+
+对无状态请求而言这是"以内容为证"，存在一个残余风险：一个请求只要重现了某会话的**任意**一个较早的
+生成回合（不只是最新一个），就会延续该会话的作用域，包括其后续回合留下的状态；而确定性（贪心）
+回复可以在本服务器之外复现。这样的请求只会复用它自己发来的 token，但 `cached_tokens` 会反映其提示
+与该会话后续回合匹配到多远：池化路径上是整块 256 token，Gemma 4 上是 holder 末尾的少数 token，
+在支持精确原生回退的模型（DeepSeek V4.1）上更远。需要严格隔离的客户端应使用 Web UI / TensorAgent
+的 `sessionId`；针对无状态 API，按请求的缓存键与 radix 树的叶子规则（SYNTHESIS S5.3）会补上这一点。
+
+**媒体身份。** 每张图片、视频帧（对）和音频片段都以其字节的 SHA-256 标识。Base64 附件（OpenAI
+`image_url`、Responses `input_image`、Ollama `images`、音频）以 `<sha256>.<ext>` 存储且只写一次，
+因此客户端每轮重发同一张图片只保留一个文件。视觉与音频嵌入缓存以该内容 id 为键，受
+`TS_MM_EMBEDDING_CACHE_MB` 约束并按最近最少使用淘汰，已准备好的提示仍引用的条目不会被淘汰。
+请求以位置区间的形式携带其媒体（`SequenceState.MediaSpans`）；当缓存前缀内的每个区间都是同一
+位置上的相同内容时，该前缀可以复用，复用长度会被截到它将切断的任何区间的起点。因此第一张图片
+之前的文本总是可以复用。池化块哈希只把区间 id 混入包含该区间的块（并通过父链带入其后的所有块），
+而不混入之前的块。
+
+无法精确越过媒体续接缓存的模型声明 `SupportsReuseAcrossMediaSpan = false`，此时所有复用路径都止于
+第一个媒体区间。目前没有模型这样声明。Gemma 4 使用绝对位置。Qwen 3.5/3.6 的 M-RoPE 提示位置在图片
+之后被压缩，位置表之外的每个 token（decode、投机 verify、文本续接）都按其 KV 下标加上该序列的
+M-RoPE 偏移（delta）旋转，而每个 holder、检查点和检查点文件（格式版本 2）都保存这个 delta；因此后续
+回合越过图片续接缓存，并与重新 prefill 一致（仅差后端 decode 与 prefill 内核之间的数值差异；见 [Qwen 3.5 模型卡](models/qwen35_zh-cn.md)：在 Metal
+上，图片之后的 Web UI 回合复用 98% 的提示，首 token 用时 0.13 s，而不是约 1.1 s）。在此修复之前
+Qwen 3.5/3.6 声明为 `false`，因为 decode 使用绝对下标。
+
+在复用前缀*之后*预填充图片是另一回事。无法精确做到这一点的模型让
+`IModelArchitecture.CanPrefillMediaAfterReusedPrefix` 返回 false，这样的回合便不复用公共前缀之后的内容。
+公共前缀本身仍从共享前缀检查点克隆：启用检查点时每次 prefill 都会在该边界切分，所以无论是否复用，媒体
+都在它之后预填充；没有公共前缀的回合从零 prefill。目前发布的模型都不返回 false。Gemma 4 过去在超出
+滑动窗口时返回 false，直到它的融合 prefill 能在任意起始位置应用图片的双向掩码、逐算子路径能把掩码
+映射到已回绕的窗口上；现在图片回合会复用会话的文本，并在融合图上预填充图片（E4B/Metal：一个复用
+179 token 的 457 token 图片回合首 token 用时 0.57 s，逐算子路径为 1.25 s，冷启动为 0.64 s；一个超出窗口的
+889 token 回合复用 611 token，首 token 0.62 s，不复用时为 0.85 到 0.90 s）。详见
+[Gemma 4 模型卡](models/gemma4_zh-cn.md#复用前缀之后的图片与音频回合)。
+
+在 Gemma 4 上，不超过 `MaxReusablePrefixTokens`（滑动窗口）个 token 的回合现在也会续接 live cache；
+之前这类回合落到池化路径，只能返回整块的 256 token。已回绕环上的回退依旧被拒绝。
+
+准入日志会写明服务该请求的来源——`the model's live KV cache of this conversation`、
+`a shared-prefix checkpoint (public, N tokens)`、`a retained holder of this conversation` 或
+`pooled prefix-cache blocks`——带 token 数和截断哈希形式的作用域；Debug 级别下一行
+`blocked by scope` 报告另一个会话的状态在公开前缀之后还匹配了多少 token。
 
 ## 测试覆盖
 
 | 范围 | 测试 |
 |---|---|
 | 调度器 / 块池 | `ContinuousBatchSchedulerTests`、`PagedKvCacheTests`、`PagedKvCacheCodecTests` |
-| 批处理执行原语 | `BatchedExecutorTests`，覆盖托管分页注意力正确性与多序列 logits 路由；`RetainedFusedCacheTests` 覆盖按能力启用的 holder 保留 / 重新绑定与 LRU 清理 |
+| 批处理执行原语 | `BatchedExecutorTests`，覆盖托管分页注意力正确性与多序列 logits 路由；`RetainedFusedCacheTests` 覆盖按能力启用的 holder 保留 / 重新绑定与 LRU 清理、会话作用域隔离（含随机交错的性质测试）与按位置的媒体检查 |
+| 跨请求隔离与媒体身份 | `ModelServiceRawTokenHistoryTests` 与 `ToolTranscriptSpliceTests`（按内容校验的原始 token 拼接）、`PooledPrefixScopeAndMediaTests`、`ContentAddressedMediaTests`；`Gemma4MediaAfterReusedPrefixExactnessTests`（受模型门控：复用前缀之后的图片或音频回合对比冷启动 prefill）与 `Gemma4SoftTokenMaskTests` |
+| 越过媒体复用（Qwen 3.5 M-RoPE） | `Qwen35MRopeReferencePositionTests`（与 SGLang `get_rope_index` 夹具比较位置），需显式启用的 `Qwen35ImageFollowUpExactnessTests`（真实权重下图片之后复用与冷启动对比，单请求与并发，检查点文件往返） |
 | 按模型正确性 | `Qwen35BatchedCorrectnessTests`、`Mistral3BatchedForwardTests`、`Gemma4BatchedForwardTests`、`GptOssBatchedCorrectnessTests`、`NemotronBatchedCorrectnessTests` |
+| 后端融合下的批处理 MoE 内核 | 原生 CTest `moe-fused-bias-alias-cpu` / `moe-fused-bias-alias-cuda` / `moe-fused-bias-alias-metal`（`GgmlOpsMoeFusedBiasAliasTest`）：带每专家 bias 的独立 MoE FFN 内核与精确主机计算结果对比，1、4、7 个 token，重复执行 |
 | MTP 投机解码 | `SpeculativeExecutionTests`（起草 / 验证 / 回滚核心）、可选端到端 `Qwen36SpeculativeTests`（`TS_MTP_E2E=1`）与 `Gemma4SpeculativeTests`（`TS_GMTP_E2E=1`），需真实 GGUF |
 | 按模型性能探针 | `Gemma4BatchedPerfBench`、`Qwen35BatchedPerfBench`、`GptOssBatchedPerfBench`、`NemotronBatchedPerfBench` |
 | DiffusionGemma 路径 | `DiffusionGemmaTests` 覆盖去噪、prompt-KV 缓存与批处理生成探针 |
@@ -289,7 +408,7 @@ GatedDeltaNet 递归状态作为一个混合 holder 一起保留。未声明该�
 | `TS_SCHED_SOLO_PREFILL_CHUNK` | `8192` | solo（无争用）请求的每步 prefill 上限——以大分块把 prompt 送入融合整图 prefill 路径。受 `TS_SCHED_MAX_BATCHED_TOKENS` 约束。 |
 | `TS_SCHED_NUM_BLOCKS` | `256` | 引擎块池物理块数。 |
 | `TS_SCHED_BLOCK_SIZE` | `256` | 每块 token 数。 |
-| `TS_SCHED_PREFIX_CACHE` | `1` | 设为 `0` 关闭块哈希前缀复用。 |
+| `TS_SCHED_PREFIX_CACHE` | `1` | 设为 `0` 关闭准入时的全部提示复用：池化块、live cache 续接、保留的 holder 和共享前缀检查点。 |
 | `TS_SCHED_STOP_REPETITION` | `1` | 设为 `0` 时，陷入重复循环的生成会继续跑到 token 上限，而不是以 `repetition` 结束原因停止。 |
 | `TS_SCHED_DECODE_QUANTUM` | `256` | 在偏回退路径中，允许切换序列前的 decode token 数。 |
 | `TS_BATCHED_N1_FAST_PATH` | `1` | solo 单序列步骤走融合 N=1 快速路径 decode；设为 `0` 可强制这些步骤走完全批处理路径（A/B 测试）。 |
@@ -300,6 +419,7 @@ GatedDeltaNet 递归状态作为一个混合 holder 一起保留。未声明该�
 | `TS_RETAINED_FUSED_CACHE_MAX` | `4` | 保留 fused holder 的 LRU 预算（每个 holder 都会占用模型完整的 per-request 续接状态）。 |
 | `TS_PREFIX_CHECKPOINTS` | `1` | 在共享提示前缀结束处（由 chat 层在请求上标记的边界）对模型完整状态做检查点，并让每个新会话从其副本开始（Gemma 4、Qwen 3.5/3.6）。`0` 关闭。 |
 | `TS_PREFIX_CHECKPOINTS_MAX` | `2` | 同时保留多少个不同共享前缀的检查点（LRU）。 |
+| `TS_MM_EMBEDDING_CACHE_MB` | `512` | 视觉/音频嵌入缓存的字节预算，缓存以媒体内容（SHA-256）为键；超出后淘汰没有被已准备提示引用的最近最少使用条目。 |
 | `TS_KV_INITIAL_TOKENS` | `0` | 缓存创建时、任何请求声明预算之前分配的 K/V token 数；`0` 沿用引擎策略（显式 `MAX_CONTEXT` 时为整个窗口）。缓存仍按需增长。 |
 | `TS_KV_GENERATION_RESERVE_MAX` | `0` | 请求预先保留的 K/V（prompt + max_new_tokens）中生成部分的上限；`0` = 不限制。超过上限后缓存按需增长。 |
 | `TS_KV_HOLDER_POOL_MAX` | `64` | 模型最多可停放多少个已释放的 per-request holder 以待复用；停放期间每个都占用其完整 K/V 分配。 |

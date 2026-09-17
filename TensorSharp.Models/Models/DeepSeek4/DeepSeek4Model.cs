@@ -36,7 +36,7 @@ namespace TensorSharp.Models
         // rather than the native one). Resolved once: it is a property of the checkpoint's
         // compression ratios, and SupportsKVCacheTruncation is read on hot scheduler paths.
         private readonly int _truncateAlign;
-        protected IntPtr NativeHandle => _handle;
+        protected internal IntPtr NativeHandle => _handle;
         protected object NativeSync => _sync;
 
         public DeepSeek4Model(string ggufPath, BackendType backend, int tpDegree = 1, ITensorParallelGroup tpGroup = null,
@@ -47,7 +47,17 @@ namespace TensorSharp.Models
             bool isV41 = string.Equals(arch, "deepseek41", StringComparison.Ordinal);
             if (isV41)
             {
-                DeepSeek41Architecture.ValidateLoad(ggufPath, backend, ResolveDsparkPath(draftModelPath), tpDegree, tpGroup);
+                // A refusal here would otherwise leak the GGUF mapping the base
+                // constructor opened: nobody disposes an object whose constructor threw.
+                try
+                {
+                    DeepSeek41Architecture.ValidateLoad(ggufPath, backend, ResolveDsparkPath(draftModelPath), tpDegree, tpGroup);
+                }
+                catch
+                {
+                    base.Dispose();
+                    throw;
+                }
                 // Once per load, and only here: ValidateLoad also runs as the
                 // descriptor's ApplyNativeTunables, so warning from inside it
                 // would print the same line twice.
@@ -62,7 +72,17 @@ namespace TensorSharp.Models
             // V4.1 was refused in ValidateLoad above (and once more before the
             // factory ran); plain V4 has no pre-load hook, so refuse here.
             if (!isV41)
-                DeepSeek4Architecture.RefuseBlockQuantizedKvCache("DeepSeek V4 (Flash)", v41: false);
+            {
+                try
+                {
+                    DeepSeek4Architecture.RefuseBlockQuantizedKvCache("DeepSeek V4 (Flash)", v41: false);
+                }
+                catch
+                {
+                    base.Dispose();
+                    throw;
+                }
+            }
             // Every executor of this family keeps F16 caches and ignores the
             // process-wide dtype, so report what is actually allocated rather
             // than whatever KV_CACHE_DTYPE happened to say.
@@ -89,13 +109,10 @@ namespace TensorSharp.Models
                 maxContext = Math.Min(maxContext, 65536);
             _maxContextLength = maxContext;
 
-            // GPU prefill chunks amortize the MoE expert-GEMM tile padding (256
-            // experts x top-6 leaves ~nt/42 rows per expert, so per-chunk MoE
-            // cost is nearly flat in nt): 1024 measured ~11-21% faster overall
-            // prefill than 512 and also halves what a non-multiple tail chunk
-            // costs relative to the whole prompt. The CPU executor stays at 512
-            // (activation memory bound, no tile padding to amortize).
-            int nUbatch = ParseEnvInt("TS_DSV4_UBATCH", isV41 ? 256 : backend == BackendType.Cpu ? 512 : 1024);
+            int nUbatch = ResolveNativeUbatch(isV41, backend, Environment.GetEnvironmentVariable("TS_DSV4_UBATCH"),
+                out string ubatchWarning);
+            if (ubatchWarning != null)
+                Console.Error.WriteLine(ubatchWarning);
 
             if (backend == BackendType.Cuda)
             {
@@ -141,11 +158,13 @@ namespace TensorSharp.Models
                 _handle = dspark != null
                     ? GgmlDeepSeek4Native.LoadModelWithDspark(ggufPath, nGpu, maxContext, nUbatch, nThreads, dspark, nCpuMoe, backendName)
                     : GgmlDeepSeek4Native.LoadModel(ggufPath, nGpu, maxContext, nUbatch, nThreads, nCpuMoe, backendName);
-                _nativeUBatch = nUbatch;
                 _nativeDsparkBlock = _handle != IntPtr.Zero && dspark != null
                     ? GgmlDeepSeek4Native.DsparkBlockSize(_handle) : 0;
                 if (_handle == IntPtr.Zero)
-                    throw new InvalidOperationException($"Failed to load {arch} model from {ggufPath} (see stderr for details).");
+                    throw NativeLoadRefused("dsv4", ggufPath);
+                // The width the loader actually runs: the request, or its own
+                // choice for UBatchAuto. Speculative prefill chunks to it.
+                _nativeUBatch = GgmlDeepSeek4Native.UBatch(_handle);
                 // Zero for plain V4: its compressor overlaps blocks, so a rewind reads state
                 // rows an aligned target does not protect, and the native side declines.
                 _truncateAlign = GgmlDeepSeek4Native.TruncateAlign(_handle);
@@ -259,6 +278,42 @@ namespace TensorSharp.Models
             };
         }
 
+        /// <summary>
+        /// The prefill micro-batch width handed to the executor.
+        ///
+        /// <para>A positive <c>TS_DSV4_UBATCH</c> is used verbatim by every executor.
+        /// Unset, DeepSeek V4.1 on a ggml GPU backend passes
+        /// <see cref="GgmlDeepSeek4Native.UBatchAuto"/>: the native loader then
+        /// evaluates 1024, 512 and 256 against the visible VRAM and keeps the widest
+        /// one that needs no more routed-expert CPU offload than 256 would. A resident
+        /// routed-expert layer costs about the same per chunk at any width (one
+        /// Q4_K_M-shaped layer on an A40: 35.3-35.7 / 36.9-37.2 / 38.9-39.1 ms at
+        /// 256 / 512 / 1024 tokens), so 1024 is ~3.6x cheaper per prefill token, while
+        /// an extra host layer would slow every decoded token.
+        /// V4.1's CPU and direct-CUDA executors keep 256; plain V4 keeps 512 on the
+        /// pure C# executor and 1024 elsewhere (GPU chunks amortize its expert-GEMM
+        /// tile padding, measured ~11-21% faster than 512).</para>
+        ///
+        /// <para>A set value that is not a positive integer is reported and ignored
+        /// rather than silently replaced by the default.</para>
+        /// </summary>
+        internal static int ResolveNativeUbatch(bool isV41, BackendType backend, string configured, out string warning)
+        {
+            warning = null;
+            if (!string.IsNullOrWhiteSpace(configured))
+            {
+                if (int.TryParse(configured, out int requested) && requested > 0)
+                    return requested;
+                warning = $"[dsv4] TS_DSV4_UBATCH='{configured}' is not a positive integer; ignoring it and using " +
+                          "the default prefill width.";
+            }
+            if (!isV41)
+                return backend == BackendType.Cpu ? 512 : 1024;
+            return backend is BackendType.GgmlCuda or BackendType.GgmlVulkan or BackendType.GgmlMetal
+                ? GgmlDeepSeek4Native.UBatchAuto
+                : 256;
+        }
+
         private static int ParseEnvInt(string name, int fallback)
         {
             string raw = Environment.GetEnvironmentVariable(name);
@@ -292,6 +347,19 @@ namespace TensorSharp.Models
         /// <summary>The compression-block alignment the native truncate requires (the lcm
         /// of the per-layer compress ratios: 2 for the released checkpoint).</summary>
         public override int KVCacheTruncationGranularity => Math.Max(1, _truncateAlign);
+
+        /// <summary>
+        /// What a slot of this load holds: the MLA latent ring, compressed and indexer
+        /// rows, all sized by the layer count, head geometry and sliding window, plus which
+        /// executor owns them (the native, direct-CUDA and pure-C# executors keep different
+        /// state and rewind differently) and the dtype actually allocated (always F16, see
+        /// <see cref="DeepSeek4Architecture.ExecutorKvCacheDtype"/>). All construction-time.
+        /// </summary>
+        public override string KVStateFingerprint =>
+            $"deepseek4|arch={Config.Architecture}|L={Config.NumLayers}|H={Config.NumHeads}|D={Config.KeyLength}" +
+            $"|hidden={Config.HiddenSize}|experts={Config.NumExperts}x{Config.NumExpertsUsed}|swa={Config.SlidingWindow}" +
+            $"|exec={(_cudaExec != null ? "cuda" : _cpuExec != null ? "cpu" : "native")}|align={_truncateAlign}" +
+            $"|dspark={DraftBlockSize}|dtype={_kvCacheDtype.ToShortString()}";
 
         /// <summary>
         /// Refusable truncation. A refusal is normal - it means the target is further back

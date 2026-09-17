@@ -22,7 +22,10 @@ namespace TensorSharp.Runtime
     /// processor then merges the sampled frames in pairs (the tower's temporal patch
     /// size) and replaces the single <c>&lt;|video_pad|&gt;</c> with one
     /// <c>&lt;{t:F1} seconds&gt;&lt;|vision_start|&gt;&lt;|video_pad|&gt;&lt;|vision_end|&gt;</c>
-    /// block per pair, where <c>t</c> is the mean source time of the pair. The
+    /// block per pair, where <c>t</c> is the mean source time of the pair. Frames are
+    /// paired only when they are at most <see cref="MaxPairedFrameGapSeconds"/> apart
+    /// (the processor's own 2 fps sampling); a sparser frame fills its own temporal
+    /// patch and is labelled with its own time. The
     /// processor replaces the clip's outer start/pad/end sequence; it does not
     /// nest a second pair of vision delimiters around the temporal blocks. A clip with
     /// an odd number of frames repeats its last frame to complete the final pair, and
@@ -47,6 +50,19 @@ namespace TensorSharp.Runtime
 
         /// <summary>Frames merged into one temporal patch by the Qwen-VL tower.</summary>
         public const int TemporalPatchSize = 2;
+
+        /// <summary>
+        /// The widest gap between two sampled frames that still share a temporal patch.
+        /// The Qwen3-VL video processor samples at 2 fps, so the tower's temporal patch
+        /// merges frames 0.5 s apart - one patch per second of video. A client that
+        /// samples sparser (<c>fps: 1</c>, or a long clip spread over <c>max_frames</c>)
+        /// hands over frames that are different scenes; merging two of them blends both
+        /// into one patch, and the model reads neither (a 17 / 42 / 86 slide clip at
+        /// 1 fps read back as "12", "47", "86"). Such frames each fill their own patch
+        /// instead. The 15% margin absorbs the rounding of 2 fps samples onto a 25 or
+        /// 29.97 fps source.
+        /// </summary>
+        public const double MaxPairedFrameGapSeconds = 0.575;
 
         /// <summary>
         /// One temporal patch of a clip: the indices (into the message's image list) of
@@ -95,14 +111,28 @@ namespace TensorSharp.Runtime
                     j++;
                 }
 
-                var groups = new List<Group>(frames.Count / TemporalPatchSize + 1);
-                for (int f = 0; f < frames.Count; f += TemporalPatchSize)
+                var groups = new List<Group>(frames.Count);
+                int f = 0;
+                while (f < frames.Count)
                 {
-                    int last = Math.Min(f + TemporalPatchSize - 1, frames.Count - 1);
-                    double seconds = 0;
-                    for (int k = f; k < f + TemporalPatchSize; k++)
-                        seconds += frames[Math.Min(k, frames.Count - 1)].Seconds;
-                    groups.Add(new Group(frames[f].Index, frames[last].Index, seconds / TemporalPatchSize));
+                    // Pair a frame with the next only when the two are as close as the
+                    // frames the tower was trained to merge. Sparser samples are
+                    // different scenes: merging them blends both into one patch.
+                    if (f + 1 < frames.Count
+                        && frames[f + 1].Seconds - frames[f].Seconds <= MaxPairedFrameGapSeconds)
+                    {
+                        groups.Add(new Group(frames[f].Index, frames[f + 1].Index,
+                            (frames[f].Seconds + frames[f + 1].Seconds) / TemporalPatchSize));
+                        f += TemporalPatchSize;
+                    }
+                    else
+                    {
+                        // The frame fills its own temporal patch (repeated, exactly as the
+                        // processor completes an odd clip and as a still image is encoded)
+                        // and keeps its own time label.
+                        groups.Add(new Group(frames[f].Index, frames[f].Index, frames[f].Seconds));
+                        f++;
+                    }
                 }
                 items.Add(new Item { Groups = groups });
                 i = j;

@@ -85,8 +85,10 @@
     <ReferenceNativeSymbol Include="TSGgml_Dsv4SlotStatus" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Dsv4Truncate" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Dsv4TruncateAlign" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_Dsv4UBatch" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Dsv4VocabSize" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_FlashAttnDecodeF32" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_FlashAttnFallbackCount" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_FusedActMulF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_FusedActMulSplitF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_FusedFFNActProjectQuantF32" SymbolType="Function" />
@@ -245,6 +247,7 @@
     <ReferenceNativeSymbol Include="TSGgml_Qwen35ResetVerifyCache" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Qwen35ResetVerifyCacheForHostPointer" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Qwen35ResetVerifyCacheOwner" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_Qwen35RopePositionAbi" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Qwen35VisionEncoderF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpArenaDecodeBatched" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpArenaFlushHostPointer" SymbolType="Function" />

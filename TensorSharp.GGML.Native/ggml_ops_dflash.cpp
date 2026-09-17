@@ -720,22 +720,9 @@ TSG_EXPORT int TSGgml_DFlashDraftBlock(
 
             ggml_tensor* qa = ggml_permute(ctx, q3, 0, 2, 1, 3);                   // [hd, b, heads]
             ggml_tensor* attn_flat;
-            ggml_tensor* fa = ggml_flash_attn_ext(ctx, qa, kcat, vcat, mask_t, kq_scale, 0.0f, 0.0f);
-            ggml_flash_attn_ext_set_prec(fa, GGML_PREC_F32);
-            if (backend_supports_op(fa))
-            {
-                attn_flat = ggml_reshape_2d(ctx, fa, q_dim, b);
-            }
-            else
-            {
-                ggml_tensor* qc = ggml_cont(ctx, qa);
-                ggml_tensor* scores = ggml_mul_mat(ctx, kcat, qc);
-                ggml_mul_mat_set_prec(scores, GGML_PREC_F32);
-                ggml_tensor* probs = ggml_soft_max_ext(ctx, scores, mask_t, kq_scale, 0.0f);
-                ggml_tensor* vperm = ggml_cont(ctx, ggml_permute(ctx, vcat, 1, 0, 2, 3));
-                ggml_tensor* o = ggml_mul_mat(ctx, vperm, probs);
-                attn_flat = ggml_reshape_2d(ctx, ggml_cont(ctx, ggml_permute(ctx, o, 0, 2, 1, 3)), q_dim, b);
-            }
+            ggml_tensor* fa = flash_attn_ext_guarded(ctx, "DFlash draft", qa, kcat, vcat, mask_t,
+                kq_scale, 0.0f, 0.0f, nullptr, GGML_PREC_F32);
+            attn_flat = ggml_reshape_2d(ctx, fa, q_dim, b);
 
             ggml_tensor* attn_out = ggml_mul_mat(ctx, lt.o_w, attn_flat);
             if (use_conv)

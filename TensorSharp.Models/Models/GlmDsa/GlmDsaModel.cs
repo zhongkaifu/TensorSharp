@@ -222,6 +222,27 @@ namespace TensorSharp.Models
         /// </summary>
         public override bool SupportsKVCacheTruncation => Config.Architecture != "glm5next";
 
+        /// <summary>
+        /// The dtype a slot's MLA and indexer rows are actually allocated in: F16 in the
+        /// native executor (<c>ggml_ops_glm_dsa.cpp</c> slot_alloc), F32 on the per-op
+        /// path (<see cref="InitCaches"/>). Neither reads the process-wide KV dtype.
+        /// </summary>
+        private KvCacheDtype CacheRowDtype => UsesNativeExecutor ? KvCacheDtype.F16 : KvCacheDtype.F32;
+
+        /// <summary>
+        /// glm-dsa (MLA + DSA indexer) and glm5next (KDA + NoPE MLA + pooled indexer)
+        /// keep different state per position, so the architecture string leads. The MLA
+        /// row geometry, the indexer, the NextN cache layer, the KDA recurrence (glm5next,
+        /// per-op path only; the native executor parses it itself) and which executor
+        /// holds the rows all go in. Construction-time values only.
+        /// </summary>
+        public override string KVStateFingerprint =>
+            $"glm|arch={Config.Architecture}|L={_numTrunkLayers}|nextn={_numNextnLayers}|mtp={_mtpLayer}|H={Config.NumHeads}" +
+            $"|kvLora={_kvLoraRank}|rope={_ropeDim}|hk={_headDimK}|hv={_headDimV}" +
+            $"|idx={_indexerHeads}x{_indexerHeadDim}k{_indexerTopK}:{KvStateFingerprints.Layout(_indexerFull)}" +
+            $"|kda={KvStateFingerprints.Layout(_layerIsRecurrent)}:h{_kdaHeads}d{_kdaHeadDim}c{_dConv}|hc={_hcMult}" +
+            $"|exec={(UsesNativeExecutor ? "native" : "managed")}|dtype={CacheRowDtype.ToShortString()}";
+
         private int CountIndexerFull()
         {
             int n = 0;

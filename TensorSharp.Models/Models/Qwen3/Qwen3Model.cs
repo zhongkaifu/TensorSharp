@@ -1317,13 +1317,19 @@ namespace TensorSharp.Models
             // graphs belonging to inactive per-request cache holders, before the
             // base method evicts those weights.
             if (_backend == BackendType.GgmlMetal)
+            {
                 GgmlBasicOps.Qwen3ResetDecodeCache();
+                CountDecodeGraphReset();
+            }
         }
 
         public override void Dispose()
         {
             if (_backend == BackendType.GgmlMetal)
+            {
                 GgmlBasicOps.Qwen3ResetDecodeCache();
+                CountDecodeGraphReset();
+            }
             DisposeFusedSequenceCaches();
             if (_kvCacheK != null)
                 foreach (var t in _kvCacheK) t?.Dispose();

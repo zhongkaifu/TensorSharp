@@ -221,7 +221,7 @@ namespace
         }
 
         // 7. Flash attention (handles GQA broadcasting)
-        ggml_tensor* attn_out_4d = ggml_flash_attn_ext(ctx,
+        ggml_tensor* attn_out_4d = flash_attn_ext_guarded(ctx, "Qwen3.5 attention layer decode",
             q_attn, k_full, v_full, attn_mask, scale, 0.0f, 0.0f);
 
         // attn_out_4d: [head_dim, num_heads, 1] -> reshape to [head_dim, num_heads]
@@ -570,7 +570,7 @@ namespace
 
     int qwen35_model_decode_impl(
         const TSGgmlQwen35LayerDesc* layers, int num_layers, int reseed_state,
-        void* hidden_data, int hidden_size, int position,
+        void* hidden_data, int hidden_size, int position, int rope_pos_delta,
         int num_heads, int num_kv_heads, int head_dim, int cache_size,
         int rope_n_dims, int rope_mode, int kv_cache_type,
         int conv_kernel, int head_k_dim, int head_v_dim, int num_k_heads, int num_v_heads,
@@ -882,7 +882,9 @@ namespace
             {
                 ggml_backend_tensor_set(dc->hidden_t, hidden_data, 0, static_cast<std::size_t>(H) * sizeof(float));
             }
-            std::int32_t pos_val = position;
+            // RoPE position = KV index + the sequence's M-RoPE delta (Qwen-VL: an
+            // image span holds H*W cache rows but only max(H, W) positions).
+            std::int32_t pos_val = position + rope_pos_delta;
             ggml_backend_tensor_set(dc->pos_tensor, &pos_val, 0, sizeof(std::int32_t));
             if (dc->kv_index != nullptr)
             {
@@ -1377,8 +1379,8 @@ namespace
                 }
                 else
                 {
-                    ggml_tensor* attn_out_4d = ggml_flash_attn_ext(ctx, q_attn, k_full, v_full, mask_for_attn, attn_scale, 0.0f, 0.0f);
-                    ggml_flash_attn_ext_set_prec(attn_out_4d, GGML_PREC_F32);
+                    ggml_tensor* attn_out_4d = flash_attn_ext_guarded(ctx, "Qwen3.5 model decode", q_attn, k_full, v_full, mask_for_attn, attn_scale, 0.0f, 0.0f,
+                        nullptr, GGML_PREC_F32);
                     attn_out_2d = ggml_reshape_2d(ctx, attn_out_4d, head_dim, num_heads);
                 }
                 // Metal unary kernels also accept this row-contiguous strided
@@ -2067,7 +2069,7 @@ namespace
         {
             ggml_backend_tensor_set(hidden_t, hidden_data, 0, static_cast<std::size_t>(H) * sizeof(float));
         }
-        std::int32_t pos_val = position;
+        std::int32_t pos_val = position + rope_pos_delta;
         ggml_backend_tensor_set(pos_tensor, &pos_val, 0, sizeof(std::int32_t));
         if (persist)
         {
@@ -2258,7 +2260,7 @@ namespace
 
 TSG_EXPORT int TSGgml_Qwen35ModelDecode(
     const TSGgmlQwen35LayerDesc* layers, int num_layers, int reseed_state,
-    void* hidden_data, int hidden_size, int position,
+    void* hidden_data, int hidden_size, int position, int rope_pos_delta,
     int num_heads, int num_kv_heads, int head_dim, int cache_size,
     int rope_n_dims, int rope_mode, int kv_cache_type,
     int conv_kernel, int head_k_dim, int head_v_dim, int num_k_heads, int num_v_heads,
@@ -2274,7 +2276,7 @@ TSG_EXPORT int TSGgml_Qwen35ModelDecode(
     {
         int r = qwen35_model_decode_impl(
             layers, num_layers, reseed_state,
-            hidden_data, hidden_size, position,
+            hidden_data, hidden_size, position, rope_pos_delta,
             num_heads, num_kv_heads, head_dim, cache_size,
             rope_n_dims, rope_mode, kv_cache_type,
             conv_kernel, head_k_dim, head_v_dim, num_k_heads, num_v_heads,
@@ -2314,7 +2316,7 @@ TSG_EXPORT int TSGgml_Qwen35ModelDecodeToken(
     const void* token_embd_data, int token_embd_type,
     std::int64_t token_embd_ne0, std::int64_t token_embd_ne1,
     std::int64_t token_embd_bytes,
-    int hidden_size, int position,
+    int hidden_size, int position, int rope_pos_delta,
     int num_heads, int num_kv_heads, int head_dim, int cache_size,
     int rope_n_dims, int rope_mode, int kv_cache_type,
     int conv_kernel, int head_k_dim, int head_v_dim, int num_k_heads, int num_v_heads,
@@ -2331,7 +2333,7 @@ TSG_EXPORT int TSGgml_Qwen35ModelDecodeToken(
     {
         return qwen35_model_decode_impl(
             layers, num_layers, reseed_state,
-            nullptr, hidden_size, position,
+            nullptr, hidden_size, position, rope_pos_delta,
             num_heads, num_kv_heads, head_dim, cache_size,
             rope_n_dims, rope_mode, kv_cache_type,
             conv_kernel, head_k_dim, head_v_dim, num_k_heads, num_v_heads,
@@ -2374,6 +2376,16 @@ TSG_EXPORT void TSGgml_Qwen35ResetDecodeCache()
 {
     std::lock_guard<std::recursive_mutex> lock(q35_decode_mutex());
     g_q35dc_pool.reset_all();
+}
+
+// Version of the Qwen3.5 fused-graph position contract. 1: the solo decode
+// (rope_pos_delta), verify (rope_pos_delta) and arena (rope_positions) entry
+// points take the RoPE position separately from the KV index. The managed model
+// checks it once, so a library built before that contract (whose entry points
+// have fewer arguments) is refused instead of being called with a shifted stack.
+TSG_EXPORT int TSGgml_Qwen35RopePositionAbi()
+{
+    return 1;
 }
 
 // ============================================================================
@@ -2741,8 +2753,8 @@ namespace
                     ggml_tensor* qperm = ggml_cont(ctx, ggml_permute(ctx, qs, 0, 2, 1, 3)); // [head_dim, 1, num_heads]
                     // Padded gather: positions [seq_len, pad_kv) point at slot 0 and
                     // are masked out by mask[s] (0 valid, -inf padding).
-                    ggml_tensor* o4 = ggml_flash_attn_ext(ctx, qperm, kperm, vperm, mask[s], attn_scale, 0.0f, 0.0f);
-                    ggml_flash_attn_ext_set_prec(o4, GGML_PREC_F32);
+                    ggml_tensor* o4 = flash_attn_ext_guarded(ctx, "Qwen3.5 batched decode", qperm, kperm, vperm, mask[s], attn_scale, 0.0f, 0.0f,
+                        nullptr, GGML_PREC_F32);
                     // o4: [head_dim, num_heads, 1, 1] -> [head_dim*num_heads, 1]
                     attn_per_seq[s] = ggml_reshape_2d(ctx, o4, qDim, 1);
                 }

@@ -251,6 +251,7 @@ set(TSG_GGMLOPS_SOURCES
     ggml_ops_core.cpp
     ggml_ops_attention_alloc.cpp
     ggml_ops_attention_precision.cpp
+    ggml_ops_flash_attn_guard.cpp
     ggml_ops_matmul.cpp
     ggml_ops_matmul_precision.cpp
     ggml_ops_q8_precision.cpp
@@ -448,6 +449,16 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
     add_executable(GgmlOpsDsv41EngramIoTest tests/dsv41_engram_io_test.cpp)
     target_link_libraries(GgmlOpsDsv41EngramIoTest PRIVATE Threads::Threads)
     add_test(NAME deepseek41-engram-parallel-io COMMAND GgmlOpsDsv41EngramIoTest)
+    add_executable(GgmlOpsDsv4FileWarmTest tests/dsv4_file_warm_test.cpp)
+    target_link_libraries(GgmlOpsDsv4FileWarmTest PRIVATE Threads::Threads)
+    add_test(NAME deepseek41-host-file-warm COMMAND GgmlOpsDsv4FileWarmTest)
+    set_tests_properties(deepseek41-host-file-warm PROPERTIES TIMEOUT 120)
+    if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        # Explicit host-only storage measurement on a real checkpoint shard; it
+        # evicts the named range from the page cache. Never part of CTest.
+        add_executable(GgmlOpsDsv4FileWarmBench tests/dsv4_file_warm_bench.cpp)
+        target_link_libraries(GgmlOpsDsv4FileWarmBench PRIVATE Threads::Threads)
+    endif()
     add_executable(GgmlOpsDsv41EngramAdviceTest tests/dsv41_engram_advice_test.cpp)
     add_test(NAME deepseek41-engram-mapped-advice COMMAND GgmlOpsDsv41EngramAdviceTest)
     if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -523,6 +534,9 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
     add_executable(GgmlOpsDsv41RetentionTest tests/dsv41_retention_test.cpp)
     target_include_directories(GgmlOpsDsv41RetentionTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
     add_test(NAME deepseek41-retention-budget COMMAND GgmlOpsDsv41RetentionTest)
+    add_executable(GgmlOpsGemma4MmMaskTest tests/gemma4_mm_mask_test.cpp)
+    target_include_directories(GgmlOpsGemma4MmMaskTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME gemma4-multimodal-mask-after-reused-prefix COMMAND GgmlOpsGemma4MmMaskTest)
 
     add_executable(GgmlOpsDsv41QuantTest
         tests/dsv41_quant_test.cpp ggml_ops_dsv4_fused_cpu.cpp)
@@ -591,6 +605,11 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
             "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/src")
         target_link_libraries(GgmlOpsCudaMatmulPrecisionTest PRIVATE ggml-cuda ggml-cpu ggml-base CUDA::cublas)
         add_test(NAME cuda-explicit-f32-matmul COMMAND GgmlOpsCudaMatmulPrecisionTest)
+        # Measurement probe (not a test): which CUDA kernels a qwen4exp verify
+        # row shares with the one-token decode graph, and at what cost.
+        add_executable(GgmlOpsQwen4ExpRowKernelProbe tests/qwen4exp_row_kernel_probe.cpp)
+        target_compile_definitions(GgmlOpsQwen4ExpRowKernelProbe PRIVATE TSG_GGML_USE_CUDA=1)
+        target_link_libraries(GgmlOpsQwen4ExpRowKernelProbe PRIVATE ggml-cuda ggml-cpu ggml-base)
         set_tests_properties(cuda-explicit-f32-matmul PROPERTIES SKIP_RETURN_CODE 77)
         add_executable(GgmlOpsCudaAttentionPrecisionTest tests/attention_precision_test.cpp
             ggml_ops_attention_precision.cpp ggml_ops_attention_precision.cu
@@ -636,11 +655,57 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
     endif()
     add_test(NAME attention-allocation COMMAND GgmlOpsAttentionAllocTest)
 
+    # Flash attention on shapes the backend has no kernel for (ggml-cuda aborts in
+    # fattn.cu): the guard must fall back to explicit attention with the same
+    # result and keep supported shapes on the kernel. CPU always, plus the first
+    # GPU device the build has (CUDA / Metal).
+    add_executable(GgmlOpsFlashAttnGuardTest
+        tests/flash_attn_guard_test.cpp ggml_ops_flash_attn_guard.cpp)
+    target_include_directories(GgmlOpsFlashAttnGuardTest PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/include")
+    target_link_libraries(GgmlOpsFlashAttnGuardTest PRIVATE ggml ggml-cpu ggml-base)
+    if (MSVC)
+        target_compile_options(GgmlOpsFlashAttnGuardTest PRIVATE /O2 /EHsc)
+    endif()
+    add_test(NAME flash-attn-unsupported-shape-fallback COMMAND GgmlOpsFlashAttnGuardTest)
+    set_tests_properties(flash-attn-unsupported-shape-fallback PROPERTIES TIMEOUT 120)
+
+    add_executable(GgmlOpsDsv4UbatchPlanTest tests/dsv4_ubatch_plan_test.cpp)
+    target_include_directories(GgmlOpsDsv4UbatchPlanTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME deepseek4-ubatch-plan COMMAND GgmlOpsDsv4UbatchPlanTest)
+    set_tests_properties(deepseek4-ubatch-plan PROPERTIES TIMEOUT 60)
+    # Explicit per-width routed-expert layer timing behind the automatic ubatch
+    # (see the source header). Never registered as a CTest.
+    add_executable(GgmlOpsDsv4MoeWidthBench tests/dsv4_moe_width_bench.cpp)
+    target_include_directories(GgmlOpsDsv4MoeWidthBench PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/include")
+    target_link_libraries(GgmlOpsDsv4MoeWidthBench PRIVATE ggml-cpu ggml-base)
+    if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
+        target_compile_definitions(GgmlOpsDsv4MoeWidthBench PRIVATE TSG_GGML_USE_CUDA=1)
+        target_link_libraries(GgmlOpsDsv4MoeWidthBench PRIVATE ggml-cuda)
+    endif()
+
     add_executable(GgmlOpsGetRowsQuantTest tests/get_rows_quant_test.cpp)
     target_include_directories(GgmlOpsGetRowsQuantTest PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/include"
     )
     target_link_libraries(GgmlOpsGetRowsQuantTest PRIVATE GgmlOps)
+
+    # The standalone MoE kernel's uploaded biases must never share memory with an
+    # activation a fused backend kernel writes while still reading them.
+    add_executable(GgmlOpsMoeFusedBiasAliasTest tests/moe_fused_bias_alias_test.cpp)
+    target_link_libraries(GgmlOpsMoeFusedBiasAliasTest PRIVATE GgmlOps)
+    add_test(NAME moe-fused-bias-alias-cpu COMMAND GgmlOpsMoeFusedBiasAliasTest cpu)
+    set_tests_properties(moe-fused-bias-alias-cpu PROPERTIES SKIP_RETURN_CODE 77)
+    if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
+        add_test(NAME moe-fused-bias-alias-cuda COMMAND GgmlOpsMoeFusedBiasAliasTest cuda)
+        set_tests_properties(moe-fused-bias-alias-cuda PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
+    if (APPLE AND TENSORSHARP_GGML_NATIVE_ENABLE_METAL)
+        add_test(NAME moe-fused-bias-alias-metal COMMAND GgmlOpsMoeFusedBiasAliasTest metal)
+        set_tests_properties(moe-fused-bias-alias-metal PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
 
     add_executable(GgmlOpsAddmmVectorTest tests/addmm_vector_test.cpp)
     target_include_directories(GgmlOpsAddmmVectorTest PRIVATE

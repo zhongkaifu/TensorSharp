@@ -134,7 +134,9 @@ namespace TensorSharp.Models
                 && (_numExperts <= 0 || UsesExpertParallelMoE)
                 && (TpCrossNodeReducer != null
                     ? GgmlBasicOps.TensorParallelFusedAvailableDistributed(TpDegree)
-                    : GgmlBasicOps.TensorParallelFusedAvailable(TpDegree));
+                    : GgmlBasicOps.TensorParallelFusedAvailable(TpDegree))
+                // The graphs take the M-RoPE delta next to the KV index.
+                && NativeRopePositionAbiSupported();
             if (_tpFdReady)
                 _tpFdPlans = new IntPtr[TpDegree];
             else if (IsTensorParallel)
@@ -161,6 +163,7 @@ namespace TensorSharp.Models
             if (!IsGgmlBackend || !IsTensorParallel)
                 return;
             GgmlBasicOps.Qwen35ResetDecodeCache();
+            CountDecodeGraphReset();
             _tpFdBuiltCapacity = -1;
         }
 
@@ -410,7 +413,7 @@ namespace TensorSharp.Models
                         bool ok = GgmlBasicOps.Qwen35ModelDecode(
                             _tpFdLayers[r], n,
                             false,
-                            (IntPtr)GetFloatPtr(hidden), Config.HiddenSize, position,
+                            (IntPtr)GetFloatPtr(hidden), Config.HiddenSize, position, _ropeDelta,
                             headsPerRank, kvHeadsPerRank, headDim, cacheSize,
                             _ropeDimCount > 0 ? _ropeDimCount : headDim, 2, kvCacheType,
                             _convKernel, _headKDim, _headVDim, kHeadsPerRank, vHeadsPerRank,
@@ -697,7 +700,8 @@ namespace TensorSharp.Models
                                 finalNormPtr, IntPtr.Zero, nLogitRows: 1,
                                 mropePos, mropeSecs,
                                 tpDegree: tp, tpPlanOut: planSlot,
-                                ownerId: _verifyOwnerId);
+                                ownerId: _verifyOwnerId,
+                                ropePositionDelta: mropePos != null ? 0 : _ropeDelta);
                             if (!ok || planSlot[0] == IntPtr.Zero)
                             {
                                 _tpPfFailed = true;

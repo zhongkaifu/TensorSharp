@@ -9,6 +9,8 @@
   </PropertyGroup>
   <ItemGroup>
     <InternalsVisibleTo Include="InferenceWeb.Tests" />
+    <!-- benchmarks/RadixTreeBench drives the internal PrefixTree directly (DESIGN §13.2). -->
+    <InternalsVisibleTo Include="RadixTreeBench" />
   </ItemGroup>
   <ItemGroup>
     <PackageReference Include="StackExchange.Redis" Version="2.8.31" />

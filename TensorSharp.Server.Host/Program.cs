@@ -39,7 +39,7 @@ try
 catch (Exception ex) when (ex is ArgumentException or FileNotFoundException)
 {
     Console.Error.WriteLine("Configuration error: " + ex.Message);
-    Environment.ExitCode = 1;
+    Environment.ExitCode = HostExitCodes.ConfigurationError;
     return;
 }
 
@@ -84,7 +84,7 @@ try
 catch (ArgumentException ex)
 {
     Console.Error.WriteLine("Configuration error: " + ex.Message);
-    Environment.ExitCode = 1;
+    Environment.ExitCode = HostExitCodes.ConfigurationError;
     return;
 }
 codeExecOptions.ApplyEnvironment();
@@ -114,7 +114,7 @@ catch (ArgumentException ex)
     // A configuration mistake is the operator's to fix; a stack trace buries
     // the one line they need.
     Console.Error.WriteLine("Configuration error: " + ex.Message);
-    Environment.ExitCode = 1;
+    Environment.ExitCode = HostExitCodes.ConfigurationError;
     return;
 }
 codeExecOptions.ArtifactUriPrefix = CodeArtifactEndpoints.RoutePrefix;
@@ -569,20 +569,43 @@ app.MapWebUiEndpoints();
 app.MapOllamaEndpoints();
 app.MapOpenAIEndpoints();
 
-if (hostingOptions.EmbeddingsEnabled)
+try
 {
-    var embeddingModel = app.Services.GetRequiredService<IEmbeddingModel>();
-    startupLogger.LogInformation(LogEventIds.ModelLoadCompleted,
-        "Embedding model loaded: {Model} architecture={Architecture} dimensions={Dimensions} context={ContextLength} backend={Backend}",
-        embeddingModel.ModelName, embeddingModel.Architecture, embeddingModel.Dimensions, embeddingModel.MaxTokens,
-        hostingOptions.DefaultBackend);
+    if (hostingOptions.EmbeddingsEnabled)
+    {
+        var embeddingModel = app.Services.GetRequiredService<IEmbeddingModel>();
+        startupLogger.LogInformation(LogEventIds.ModelLoadCompleted,
+            "Embedding model loaded: {Model} architecture={Architecture} dimensions={Dimensions} context={ContextLength} backend={Backend}",
+            embeddingModel.ModelName, embeddingModel.Architecture, embeddingModel.Dimensions, embeddingModel.MaxTokens,
+            hostingOptions.DefaultBackend);
+    }
+    else
+    {
+        StartupModelLoader.LoadIfConfigured(
+            hostingOptions,
+            app.Services.GetRequiredService<ModelService>(),
+            configuredBackendInput,
+            startupLogger);
+    }
 }
-else
-    StartupModelLoader.LoadIfConfigured(
-    hostingOptions,
-    app.Services.GetRequiredService<ModelService>(),
-    configuredBackendInput,
-    startupLogger);
+catch (Exception ex) when (ModelLoadRefusal.TryDescribe(ex, out string loadRefusal))
+{
+    // A refused load (not enough VRAM, an unsupported KV dtype or --tp layout, a
+    // missing file or sidecar) used to leave through an unhandled exception: a stack
+    // trace after the refusal, then abort() and exit code 134. It is the operator's to
+    // fix, so it gets one line and HostExitCodes.ModelLoadRefused (USAGE.md "Exit
+    // codes"). Anything that is not a refusal still propagates with its stack trace.
+    Environment.ExitCode = StartupModelLoader.ReportRefusal(ex, loadRefusal, Console.Error, startupLogger, () =>
+    {
+        // The container owns ModelService (and whatever the refused load left behind)
+        // and the logger providers, so disposing it releases the model and flushes the
+        // file log; the ggml backend is a process global and goes last.
+        ((IDisposable)app).Dispose();
+        if (!hostingOptions.UsesManagedEmbeddingBackend)
+            GgmlBasicOps.Shutdown();
+    });
+    return;
+}
 
 // Prepare the prompt every conversation shares, HERE: after the endpoints are mapped and
 // the container is live, but before app.Run binds a socket. That position is the whole

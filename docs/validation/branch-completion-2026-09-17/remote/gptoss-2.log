@@ -1,0 +1,60 @@
+[agent-turn-bench] loading gpt-oss-20b-MXFP4.gguf backend=GgmlCuda chunk=1024 maxBatched=4096 kv=default
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 45498 MiB):
+  Device 0: NVIDIA A40, compute capability 8.6, VMM: yes, VRAM: 45498 MiB
+Backend: GgmlCuda
+Model: gpt-oss, Layers=24, Hidden=2880, Heads=64, KVHeads=8, HeadDim=64, Vocab=201088
+RoPE base=150000, scale=32, eps=1E-05
+MoE: 32 experts, 4 used, SlidingWindow=128, ExpertFFN=2880
+Loading model weights... done (289 F32 tensors, 2402 quantized tensors)
+  Quantized: 11501 MB (11501 MB file-backed), F32: 35 MB
+  Split expert biases: 72 tensors
+  Fused expert Gate+Up projections: 768
+  Fused projections: 24 QKV
+  Fused MoE prefill: stacked weights ready for 24/24 layers, stacked gate/up biases for 24/24 layers
+  Device-resident quantized weights: 1819 MB across 50 tensors
+Context length: using MAX_CONTEXT=8192; model declares gpt-oss.context_length=131072.
+  Warming up kernels (decode + prefill)...
+    Decode warmup: 1586.0 ms
+    Prefill warmup (2048 tokens): starting...
+    Prefill warmup (2048 tokens): completed in 490.6 ms
+[agent-turn-bench] effective managed KV storage dtype=f16 model_type=GptOssModel
+[agent-turn-bench] loaded gpt-oss in 8.4s; context=8192 drafter=none
+[agent-turn-bench] warm-up pass 1/1
+
+==== conc ====
+    1 concurrent: prompt 1169 reused 0 fresh 1169 | steps 34 (prefill 0 x 0 tok) | ttft 390 ms prefill 0 tok/s decode 139.3 tok/s | 32 tokens (max_tokens)
+      text: <|channel|>analysis<|message|>We need to identify the main class in the file. The file contains two classes: W...
+      note: decode aggregate 139.3 tok/s from 31 deliveries strictly after the last first token; window 223 ms; last first-token wave offset 393 ms; wall 615 ms; max individual request ttft 390 ms; established=True
+    4 concurrent: prompt 4753 reused 3328 fresh 1425 | steps 33 (prefill 0 x 0 tok) | ttft 1279 ms prefill 0 tok/s decode 341.4 tok/s | 128 tokens (max_tokens/max_tokens/max_tokens/max_tokens)
+      text: <|channel|>analysis<|message|>We need to identify the main class in the file. The file contains two classes: W...
+      note: decode aggregate 341.4 tok/s from 124 deliveries strictly after the last first token; window 363 ms; last first-token wave offset 1279 ms; wall 1642 ms; max individual request ttft 1279 ms; established=True
+    8 concurrent: prompt 9502 reused 6400 fresh 3102 | steps 33 (prefill 0 x 0 tok) | ttft 2068 ms prefill 0 tok/s decode 564.3 tok/s | 256 tokens (max_tokens/max_tokens/max_tokens/max_tokens/max_tokens/max_tokens/max_tokens/max_tokens)
+      text: <|channel|>analysis<|message|>We need to identify the main class in the file. The file contains two classes: W...
+      note: decode aggregate 564.3 tok/s from 248 deliveries strictly after the last first token; window 439 ms; last first-token wave offset 2068 ms; wall 2508 ms; max individual request ttft 2068 ms; established=True
+    solo after concurrency: prompt 789 reused 768 fresh 21 | steps 33 (prefill 1 x 21 tok) | ttft 129 ms prefill 163 tok/s decode 144.9 tok/s | 32 tokens (max_tokens)
+      text: <|channel|>analysis<|message|>The user says: "After all that, say the single word: solo." They want the assist...
+      note: [Debug] Live-cache continuation declined for conc-3: no live cache resident (reset, batched step, or first request).
+[agent-turn-bench] rows written to /workspace/ts-codex-branch-completion-20260917/results/gptoss-2.json.warmup1.json
+
+==== conc ====
+    1 concurrent: prompt 1169 reused 0 fresh 1169 | steps 34 (prefill 0 x 0 tok) | ttft 456 ms prefill 0 tok/s decode 145.8 tok/s | 32 tokens (max_tokens)
+      text: <|channel|>analysis<|message|>We need to identify the main class in the file. The file contains two classes: W...
+      note: decode aggregate 145.8 tok/s from 31 deliveries strictly after the last first token; window 213 ms; last first-token wave offset 456 ms; wall 669 ms; max individual request ttft 456 ms; established=True
+    4 concurrent: prompt 4753 reused 3328 fresh 1425 | steps 33 (prefill 0 x 0 tok) | ttft 667 ms prefill 0 tok/s decode 349.1 tok/s | 128 tokens (max_tokens/max_tokens/max_tokens/max_tokens)
+      text: <|channel|>analysis<|message|>We need to identify the main class in the file. The file contains two classes: W...
+      note: decode aggregate 349.1 tok/s from 124 deliveries strictly after the last first token; window 355 ms; last first-token wave offset 668 ms; wall 1023 ms; max individual request ttft 667 ms; established=True
+    8 concurrent: prompt 9502 reused 6400 fresh 3102 | steps 33 (prefill 0 x 0 tok) | ttft 1369 ms prefill 0 tok/s decode 577.1 tok/s | 256 tokens (max_tokens/max_tokens/max_tokens/max_tokens/max_tokens/max_tokens/max_tokens/max_tokens)
+      text: <|channel|>analysis<|message|>We need to identify the main class in the file. The file contains two classes: W...
+      note: decode aggregate 577.1 tok/s from 248 deliveries strictly after the last first token; window 430 ms; last first-token wave offset 1369 ms; wall 1799 ms; max individual request ttft 1369 ms; established=True
+    solo after concurrency: prompt 789 reused 768 fresh 21 | steps 33 (prefill 1 x 21 tok) | ttft 58 ms prefill 362 tok/s decode 148.7 tok/s | 32 tokens (max_tokens)
+      text: <|channel|>analysis<|message|>The user says: "After all that, say the single word: solo." They want the assist...
+      note: [Debug] Live-cache continuation declined for conc-3: no live cache resident (reset, batched step, or first request).
+
+| scenario | request | prompt | reused | fresh | steps | prefill steps | tok/prefill step | ttft ms | prefill tok/s | decode tok/s | out | drafted | accepted | verify | plain | note |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| conc | 1 concurrent | 1169 | 0 | 1169 | 34 | 0 | 0 | 456 | 0 | 145.8 | 32 | 0 | 0 | 0 | 0 | decode aggregate 145.8 tok/s from 31 deliveries strictly after the last first token; window 213 ms; last first-token wave offset 456 ms; wall 669 ms; max individual request ttft 456 ms; established=True |
+| conc | 4 concurrent | 4753 | 3328 | 1425 | 33 | 0 | 0 | 667 | 0 | 349.1 | 128 | 0 | 0 | 0 | 0 | decode aggregate 349.1 tok/s from 124 deliveries strictly after the last first token; window 355 ms; last first-token wave offset 668 ms; wall 1023 ms; max individual request ttft 667 ms; established=True |
+| conc | 8 concurrent | 9502 | 6400 | 3102 | 33 | 0 | 0 | 1369 | 0 | 577.1 | 256 | 0 | 0 | 0 | 0 | decode aggregate 577.1 tok/s from 248 deliveries strictly after the last first token; window 430 ms; last first-token wave offset 1369 ms; wall 1799 ms; max individual request ttft 1369 ms; established=True |
+| conc | solo after concurrency | 789 | 768 | 21 | 33 | 1 | 21 | 58 | 362 | 148.7 | 32 | 0 | 0 | 0 | 0 | [Debug] Live-cache continuation declined for conc-3: no live cache resident (reset, batched step, or first request). |
+[agent-turn-bench] rows written to /workspace/ts-codex-branch-completion-20260917/results/gptoss-2.json
+[agent-turn-bench] PASS: every multi-token input was forwarded in batched chunks.

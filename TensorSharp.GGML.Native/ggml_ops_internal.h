@@ -13,6 +13,7 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -39,6 +40,7 @@
 #endif
 #include "ggml-cpu.h"
 #include "ggml-quants.h"
+#include "ggml_ops_flash_attn_guard.h"
 
 #if defined(_WIN32)
 #define TSG_EXPORT extern "C" __declspec(dllexport)
@@ -704,6 +706,17 @@ namespace tsg
     void set_last_error(const std::string& message);
     void clear_last_error();
 
+    // A whole-model loader declining a load (not enough VRAM, a --tp layout the
+    // devices cannot hold, a missing shard): print the line to stderr exactly as
+    // before AND keep it as the thread's last error, so the managed side can put
+    // the reason in the exception it throws instead of "see stderr". The hosts
+    // turn that exception into one error line and a documented exit code; a
+    // pointer at scrollback is useless once the process has exited.
+#if defined(__GNUC__) || defined(__clang__)
+    __attribute__((format(printf, 1, 2)))
+#endif
+    void report_load_refusal(const char* format, ...);
+
     // --- VRAM allocation diagnostics (TS_GGML_LOG_VRAM=1) ---
     //
     // Logs each device-buffer allocation with a tag plus the device's current
@@ -739,6 +752,20 @@ namespace tsg
     bool ensure_backend();
     bool can_initialize_backend(int backend_type);
     bool backend_supports_op(ggml_tensor* op);
+
+    // ggml_flash_attn_ext for the active backend, or the explicit attention
+    // when the backend has no kernel for this exact shape (warned once per
+    // site). Use this instead of a bare ggml_flash_attn_ext in any graph that
+    // is computed directly on g_backend: see ggml_ops_flash_attn_guard.h.
+    inline ggml_tensor* flash_attn_ext_guarded(
+        ggml_context* ctx, const char* site,
+        ggml_tensor* q, ggml_tensor* k, ggml_tensor* v, ggml_tensor* mask,
+        float scale, float max_bias, float logit_softcap,
+        ggml_tensor* sinks = nullptr, ggml_prec prec = GGML_PREC_DEFAULT)
+    {
+        return tsg_flash_attn_ext_guarded(ctx, g_backend, site, q, k, v, mask,
+            scale, max_bias, logit_softcap, sinks, prec);
+    }
 
     // --- Tensor parallelism (ggml_ops_tensor_parallel.cpp) ---
 

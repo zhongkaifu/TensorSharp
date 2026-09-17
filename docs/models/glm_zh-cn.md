@@ -403,6 +403,24 @@ GGUF 宣称 1,048,576 token，但这并不意味着缓存放得下：78 层里�
 `MAX_CONTEXT` 则反过来：你指定的上下文是硬性要求，放得下就照办，放不下就带着数字拒绝，
 而不会在你背后悄悄缩小。
 
+在 `--tp N` 下，拒绝信息只会给出在该并行度下真正能让加载放得下的办法：一个放得下的
+`MAX_CONTEXT`、能容纳你所请求上下文的 `--n-cpu-moe` 数值，或者——当所有路由专家都放到系统
+内存后，每个 rank 复制的权重仍然太大时——改为不使用 `--tp` 运行。以下是在 2x A40 上用
+GLM-5.3-Flash UD-Q2_K_XL 实测的输出（行已截短）：
+
+```
+[glm] not enough VRAM for --tp 2: 52.5 GiB per rank of weights plus 5.5 GiB of KV and graphs
+      for a 65536-token context, against 41.2 GiB usable on the smallest rank. Re-run with
+      --n-cpu-moe 19 (keeps the routed experts of the first 19 layer(s) in system RAM).
+[glm] not enough VRAM for --tp 2: 6.4 GiB per rank of weights plus 62.3 GiB of KV and graphs
+      for a 1048576-token context, against 41.2 GiB usable on the smallest rank. Set
+      MAX_CONTEXT to 571904 or less.
+```
+
+过去这类拒绝一律以 "Lower MAX_CONTEXT (N tokens would fit) or add --n-cpu-moe N" 结尾，
+即使问题只是权重本身放不下、提示 "0 tokens would fit" 时也是如此。与所有被拒绝的加载一样，
+宿主随后会把原因作为 stderr 的最后一行再打印一次，并以退出码 2 退出（见 USAGE_zh-cn.md 的"退出码"）。
+
 ### 环境变量
 
 | 变量 | 默认值 | 含义 |
@@ -440,6 +458,13 @@ GGUF 宣称 1,048,576 token，但这并不意味着缓存放得下：78 层里�
 作答。历史轮次的思考内容始终不会带进提示，与模板 `clear_thinking` 的默认行为一致。工具调用回来的形式是
 `<tool_call>NAME<arg_key>k</arg_key><arg_value>v</arg_value>...</tool_call>`，
 每个参数一个 XML 元素（用 `tojson` 渲染的值会被解析回数字 / 数组 / 对象）。
+
+生成遇到 `<|observation|>` 也会停止（即 GGUF 的 `tokenizer.ggml.eom_token_id`，
+llama.cpp 同样把它并入生成结束集合）：模型在工具调用之后紧接着写出它，不停下来的话
+模型会自己编造工具结果。提示使用 `glm4` / `chatglm-bpe` 预分词器切分，数字最多三位
+一组；若逐位切分，数字以模型训练时从未见过的形式输入，模型会把 `INV-472` 复述成
+`INV-4472`。切分结果与 token id 都与参考 `tokenizer.json` 做了比对
+（`Glm4TokenizerParityTests`）。
 
 
 ## GLM-5.3（`glm-dsa`）
@@ -532,6 +557,11 @@ KDA 递归状态（卷积尾部 + delta-net 状态，每序列约 150 MB）无�
 新 prompt **恰好扩展**缓存前缀时才复用——与 Qwen 3.5 / 3.6 GDN 家族相同的契约；`Reset`
 会连同位置计数一起清空该状态。唯一精确的"回退"是投机解码的回滚：每次验证批次之前
 都会在设备上拍一份该状态的快照，窗口被部分拒绝时再拷回去（见[投机解码](#glm-53-flash-上的投机解码)）。
+
+原生执行器拒绝的 KV 回退（目标超过 slot 当前位置、glm5next 上除回到 0 或当前位置之外的任何回退，
+或 KDA 恢复失败的 slot），在 glm-dsa 与 glm5next 上都会作为拒绝返回给调用方：`TryTruncateKVCache`
+返回 false，引擎改为重新 prefill 而不复用；不可拒绝的 `TruncateKVCache` 会抛异常。过去它会在位置
+没有移动的情况下报告成功（`GlmTruncateRefusalTests`）。
 
 ### 原生本地张量并行
 
@@ -648,6 +678,12 @@ llama.cpp 自己的 top-2 边距也只有约 0.13 logit，候选集完全相同�
 
 GLM-5.3-Flash 的模板始终思考：`<|system|>Reasoning Effort: Max` 无条件出现，生成提示
 总是以 `<think>` 开启，历史轮次保留思考内容（`clear_thinking` 默认 false）。
+由于提示无法关闭思考，`"think": false` 只决定客户端看到什么：回复在 `</think>` 之前
+都按思考内容解析，之后的部分才是答案。流式客户端仍会在生成时收到这段思考
+（`reasoning_content` / `thinking` 增量，与其他始终思考的系列一致），因此若
+`max_tokens` 全部耗在思考块内，答案为空。以 JSON 开头且从不闭合思考块的回复
+（即从第一个 token 起就受 `response_format` 语法约束的回复）本身就是答案。
+`response_format` 配合 `"think": true` 时，JSON 语法在 `</think>` 之后才生效。
 工具调用与 GLM-5.2 相同的 XML 元素形式。图像渲染为
 `<|begin_of_image|><|image|><|end_of_image|>`，宿主把 `<|image|>` 展开为合并
 patch 的 token 数。

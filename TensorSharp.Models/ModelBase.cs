@@ -1025,7 +1025,8 @@ namespace TensorSharp.Models
             IReadOnlyList<string> vocabTokens,
             int eosId,
             IEnumerable<int>? extraEosIds = null,
-            int? declaredEotId = null)
+            int? declaredEotId = null,
+            int? declaredEomId = null)
         {
             var ids = new HashSet<int>();
             if (eosId >= 0 && eosId < vocabTokens.Count)
@@ -1038,6 +1039,11 @@ namespace TensorSharp.Models
             }
             if (declaredEotId is int eotId && eotId >= 0 && eotId < vocabTokens.Count)
                 ids.Add(eotId);
+            // llama.cpp also folds tokenizer.ggml.eom_token_id (end of message) into the
+            // EOG set. GLM-5.x declares <|observation|> there: the turn ends after a tool
+            // call, and without it the model writes the tool result itself.
+            if (declaredEomId is int eomId && eomId >= 0 && eomId < vocabTokens.Count)
+                ids.Add(eomId);
 
             for (int id = 0; id < vocabTokens.Count; id++)
             {
@@ -1148,8 +1154,11 @@ namespace TensorSharp.Models
             int? declaredEotId = gguf.Metadata.ContainsKey("tokenizer.ggml.eot_token_id")
                 ? (int)gguf.GetUint32("tokenizer.ggml.eot_token_id")
                 : null;
+            int? declaredEomId = gguf.Metadata.ContainsKey("tokenizer.ggml.eom_token_id")
+                ? (int)gguf.GetUint32("tokenizer.ggml.eom_token_id")
+                : null;
             var eosIds = new List<int>(ResolveEogTokenIds(
-                vocabTokens, eosId, extraEos, declaredEotId));
+                vocabTokens, eosId, extraEos, declaredEotId, declaredEomId));
 
             // llama.cpp folds the declared end-of-turn control into the EOG set
             // for EVERY tokenizer type (llama_vocab::impl::load inserts
@@ -2461,6 +2470,15 @@ namespace TensorSharp.Models
         /// </summary>
         public virtual int MaxReusablePrefixTokens => int.MaxValue;
 
+        /// <summary>Whether a cache holding a media span can be continued past it
+        /// exactly (see <see cref="IModelArchitecture.SupportsReuseAcrossMediaSpan"/>).
+        /// True for absolute-position families and for M-RoPE models that store the
+        /// rope delta with the cache (Qwen 3.5 / 3.6).</summary>
+        public virtual bool SupportsReuseAcrossMediaSpan => true;
+
+        /// <summary>See <see cref="IModelArchitecture.CanPrefillMediaAfterReusedPrefix"/>.</summary>
+        public virtual bool CanPrefillMediaAfterReusedPrefix(int promptTokens) => true;
+
         /// <summary>
         /// Stable identifier tying snapshots to a specific (model, layer count,
         /// head counts, head dim, KV dtype) tuple. The paged cache stores blocks
@@ -2662,6 +2680,44 @@ namespace TensorSharp.Models
 
             if (_allocator is IDisposable allocatorDisposable)
                 allocatorDisposable.Dispose();
+        }
+
+        /// <summary>
+        /// The refusal a whole-model native executor's loader returned (a null handle),
+        /// after releasing what this partially constructed model already holds.
+        /// </summary>
+        /// <remarks>
+        /// The loaders free their own half-built state; the managed side still holds the
+        /// GGUF mapping and allocator the base constructor opened, and nothing else will
+        /// dispose an object whose constructor threw. The native loaders record their
+        /// refusal (not enough VRAM, a <c>--tp</c> layout that cannot fit, a missing
+        /// shard) as the thread's last error, so the exception carries the reason itself
+        /// rather than pointing at stderr, which a host that exits no longer shows.
+        /// </remarks>
+        /// <param name="family">Short family name for the fallback message.</param>
+        /// <param name="ggufPath">The model file being loaded.</param>
+        /// <param name="hintWithoutReason">Extra advice used only when the loader
+        /// recorded no reason.</param>
+        private protected ModelLoadRefusedException NativeLoadRefused(string family, string ggufPath,
+            string hintWithoutReason = null)
+        {
+            string reason = GgmlBasicOps.LastNativeError(null);
+            try
+            {
+                Dispose();
+            }
+            catch (Exception disposeEx)
+            {
+                Console.Error.WriteLine(
+                    $"[{family}] releasing the refused load also failed: {disposeEx.GetType().Name}: {disposeEx.Message}");
+            }
+
+            string file = System.IO.Path.GetFileName(ggufPath);
+            return string.IsNullOrWhiteSpace(reason)
+                ? new ModelLoadRefusedException(
+                    $"The native {family} loader declined {file}; its reason is the [{family}] line printed to stderr above." +
+                    (string.IsNullOrEmpty(hintWithoutReason) ? string.Empty : " " + hintWithoutReason))
+                : new ModelLoadRefusedException($"{reason.Trim()} (model: {file})");
         }
 
         /// <summary>

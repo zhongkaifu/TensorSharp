@@ -1538,6 +1538,10 @@ namespace TensorSharp.GGML
         /// <see cref="GgmlNative.HasBackendFailure"/>. Sticky until <see cref="RecreateBackend"/>.</summary>
         public static bool HasBackendFailure() => GgmlNative.HasBackendFailure();
 
+        /// <summary>Graph builds that ran an attention as explicit ops because the backend
+        /// has no flash-attention kernel for its shape. See <see cref="GgmlNative.FlashAttnFallbackCount"/>.</summary>
+        public static long FlashAttnFallbackCount() => GgmlNative.FlashAttnFallbackCount();
+
         /// <summary>
         /// Throw the GPU backend away and build a new one. Clears
         /// <see cref="HasBackendFailure"/>; the loaded model must be released first.
@@ -2318,13 +2322,16 @@ namespace TensorSharp.GGML
         /// GDN state is re-seeded so the next fused decode rebuilds).</summary>
         public static void Qwen35ResetDecodeCache() => GgmlNative.Qwen35ResetDecodeCache();
 
+        /// <summary>See <see cref="GgmlNative.Qwen35RopePositionAbi"/>.</summary>
+        public static int Qwen35RopePositionAbi() => GgmlNative.Qwen35RopePositionAbi();
+
         /// <summary>Qwen3.5/3.8 slot-stable arena token-batched decode (one fused
         /// graph for N sequences; see ggml_ops_qwen35_batched_arena.cpp). Returns
         /// 1 on success, 0 on a safe pre-compute decline, and -1 when graph
         /// execution may have partially mutated recurrent state.</summary>
         public static int Qwen35ArenaDecodeBatchedStatus(
             Qwen35LayerDecodeArgs[] layers, int numLayers, int nSeqs,
-            int[] tokenIds, int[] positions,
+            int[] tokenIds, int[] positions, int[] ropePositions,
             IntPtr[] kCaches, IntPtr[] vCaches,
             IntPtr[] convStates, IntPtr[] deltaStates,
             int[] gdnHostAuth, int[] cacheSizes,
@@ -2340,7 +2347,7 @@ namespace TensorSharp.GGML
             IntPtr tokenEmbd, int tokenEmbdType,
             long tokenEmbdNe0, long tokenEmbdNe1, long tokenEmbdBytes,
             IntPtr sampled, bool wantLogits)
-            => GgmlNative.Qwen35ArenaDecodeBatchedStatus(layers, numLayers, nSeqs, tokenIds, positions,
+            => GgmlNative.Qwen35ArenaDecodeBatchedStatus(layers, numLayers, nSeqs, tokenIds, positions, ropePositions,
                 kCaches, vCaches, convStates, deltaStates, gdnHostAuth, cacheSizes,
                 numHeads, numKvHeads, headDim, ropeNDims, ropeMode, kvCacheType,
                 convKernel, headKDim, headVDim, numKHeads, numVHeads,
@@ -2355,7 +2362,7 @@ namespace TensorSharp.GGML
         /// failure cannot be mistaken for a safe runtime decline.</summary>
         public static bool TryQwen35ArenaDecodeBatched(
             Qwen35LayerDecodeArgs[] layers, int numLayers, int nSeqs,
-            int[] tokenIds, int[] positions,
+            int[] tokenIds, int[] positions, int[] ropePositions,
             IntPtr[] kCaches, IntPtr[] vCaches,
             IntPtr[] convStates, IntPtr[] deltaStates,
             int[] gdnHostAuth, int[] cacheSizes,
@@ -2372,7 +2379,7 @@ namespace TensorSharp.GGML
             long tokenEmbdNe0, long tokenEmbdNe1, long tokenEmbdBytes,
             IntPtr sampled, bool wantLogits)
             => Qwen35ArenaStatusAsBool(Qwen35ArenaDecodeBatchedStatus(
-                layers, numLayers, nSeqs, tokenIds, positions,
+                layers, numLayers, nSeqs, tokenIds, positions, ropePositions,
                 kCaches, vCaches, convStates, deltaStates, gdnHostAuth, cacheSizes,
                 numHeads, numKvHeads, headDim, ropeNDims, ropeMode, kvCacheType,
                 convKernel, headKDim, headVDim, numKHeads, numVHeads,
@@ -2501,7 +2508,7 @@ namespace TensorSharp.GGML
         public static bool Qwen35ModelDecode(
             Qwen35LayerDecodeArgs[] layers, int numLayers,
             bool reseedState,
-            IntPtr hidden, int hiddenSize, int position,
+            IntPtr hidden, int hiddenSize, int position, int ropePositionDelta,
             int numHeads, int numKvHeads, int headDim, int cacheSize,
             int ropeNDims, int ropeMode, int kvCacheType,
             int convKernel, int headKDim, int headVDim, int numKHeads, int numVHeads,
@@ -2515,7 +2522,7 @@ namespace TensorSharp.GGML
         {
             return GgmlNative.Qwen35ModelDecode(
                 layers, numLayers, reseedState,
-                hidden, hiddenSize, position,
+                hidden, hiddenSize, position, ropePositionDelta,
                 numHeads, numKvHeads, headDim, cacheSize,
                 ropeNDims, ropeMode, kvCacheType,
                 convKernel, headKDim, headVDim, numKHeads, numVHeads,
@@ -2538,7 +2545,7 @@ namespace TensorSharp.GGML
             int tokenId,
             IntPtr tokenEmbedding, int tokenEmbeddingType,
             long tokenEmbeddingNe0, long tokenEmbeddingNe1, long tokenEmbeddingBytes,
-            int hiddenSize, int position,
+            int hiddenSize, int position, int ropePositionDelta,
             int numHeads, int numKvHeads, int headDim, int cacheSize,
             int ropeNDims, int ropeMode, int kvCacheType,
             int convKernel, int headKDim, int headVDim, int numKHeads, int numVHeads,
@@ -2554,7 +2561,7 @@ namespace TensorSharp.GGML
                 tokenId,
                 tokenEmbedding, tokenEmbeddingType,
                 tokenEmbeddingNe0, tokenEmbeddingNe1, tokenEmbeddingBytes,
-                hiddenSize, position,
+                hiddenSize, position, ropePositionDelta,
                 numHeads, numKvHeads, headDim, cacheSize,
                 ropeNDims, ropeMode, kvCacheType,
                 convKernel, headKDim, headVDim, numKHeads, numVHeads,
@@ -2593,7 +2600,7 @@ namespace TensorSharp.GGML
             IntPtr captureData = default, int[] captureLayers = null, int captureCount = 0,
             int stateSnapshots = 1, IntPtr stateSnapshotsUsed = default,
             bool deviceStateCurrent = false, bool deferStateDownload = false,
-            long ownerId = 0)
+            long ownerId = 0, int ropePositionDelta = 0)
         {
             return GgmlNative.Qwen35ModelVerify(
                 layers, numLayers, hidden, hiddenSize, startPos, numTokens,
@@ -2607,7 +2614,7 @@ namespace TensorSharp.GGML
                 lmHead, lmHeadType, lmHeadNe0, lmHeadNe1, lmHeadBytes,
                 finalNorm, normedOut, nLogitRows, mropePos, mropeSections,
                 tpDegree, tpPlanOut, captureData, captureLayers, captureCount, stateSnapshots,
-                stateSnapshotsUsed, deviceStateCurrent, deferStateDownload, ownerId);
+                stateSnapshotsUsed, deviceStateCurrent, deferStateDownload, ownerId, ropePositionDelta);
         }
 
         /// <summary>Commit one recurrent-state snapshot into the live device state

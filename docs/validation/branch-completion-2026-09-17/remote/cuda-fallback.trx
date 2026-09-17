@@ -1,0 +1,156 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TestRun id="14dc15bd-6ba2-4d64-93a3-871f5c724afe" name="@d71188ba1e2e 2026-09-17 14:39:21" xmlns="http://microsoft.com/schemas/VisualStudio/TeamTest/2010">
+  <Times creation="2026-09-17T14:39:21.4273897+00:00" queuing="2026-09-17T14:39:21.4273900+00:00" start="2026-09-17T14:39:15.8419801+00:00" finish="2026-09-17T14:39:21.5692274+00:00" />
+  <TestSettings name="default" id="b4a2ca45-dd6f-41e2-a269-e9d36a45f4eb">
+    <Deployment runDeploymentRoot="_d71188ba1e2e_2026-09-17_14_39_21" />
+  </TestSettings>
+  <Results>
+    <UnitTestResult executionId="90d3dcb6-01fe-449e-ac9d-112c0a0ce7e2" testId="794bec13-4791-3b6a-6075-0d32b28510f5" testName="InferenceWeb.Tests.HunyuanDenseServingTests.HunyuanDense_ExposesTheSnapshotContractTheEngineRequires" computerName="d71188ba1e2e" duration="00:00:00.0447904" startTime="2026-09-17T14:39:21.2836234+00:00" endTime="2026-09-17T14:39:21.3283596+00:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="90d3dcb6-01fe-449e-ac9d-112c0a0ce7e2" />
+    <UnitTestResult executionId="fb0a0b4b-dc66-46bf-9348-536480d5d9fa" testId="369de25a-b9f8-f9ce-99f8-6b4948639f9d" testName="InferenceWeb.Tests.HunyuanDenseServingTests.RepeatedLongPrompt_ReusesPrefixBlocks_AndMatchesTheFirstRun(architecture: &quot;hunyuan-dense&quot;, batched: True)" computerName="d71188ba1e2e" duration="00:00:00.1297775" startTime="2026-09-17T14:39:20.6626309+00:00" endTime="2026-09-17T14:39:20.7982037+00:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="fb0a0b4b-dc66-46bf-9348-536480d5d9fa" />
+    <UnitTestResult executionId="6924ba9f-4de3-452c-b5f8-fa93c6553813" testId="ea61de26-e37c-3b79-49a3-e3327da92583" testName="InferenceWeb.Tests.HunyuanDenseServingTests.RepeatedLongPrompt_InAnotherConversation_AdoptsOnlyThePublicPrefix" computerName="d71188ba1e2e" duration="00:00:00.1235968" startTime="2026-09-17T14:39:21.1583402+00:00" endTime="2026-09-17T14:39:21.2832418+00:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="6924ba9f-4de3-452c-b5f8-fa93c6553813" />
+    <UnitTestResult executionId="8326b34d-93d8-4394-a49a-24f091b5f31f" testId="73ecf64c-74b5-d08b-1753-24bd85267d65" testName="InferenceWeb.Tests.HunyuanDenseServingTests.RepeatedLongPrompt_ReusesPrefixBlocks_AndMatchesTheFirstRun(architecture: &quot;mistral3&quot;, batched: True)" computerName="d71188ba1e2e" duration="00:00:00.3675525" startTime="2026-09-17T14:39:20.1117297+00:00" endTime="2026-09-17T14:39:20.4722733+00:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="8326b34d-93d8-4394-a49a-24f091b5f31f" />
+    <UnitTestResult executionId="1a82ea9f-eb7d-4035-8869-897f99592634" testId="304e1dfb-6905-0891-1ff5-3261859ca042" testName="InferenceWeb.Tests.HunyuanDenseServingTests.HunyuanDense_ConcurrentEngineRequests_MatchEachRequestServedAlone(batched: True)" computerName="d71188ba1e2e" duration="00:00:00.1525127" startTime="2026-09-17T14:39:21.0043159+00:00" endTime="2026-09-17T14:39:21.1577040+00:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="1a82ea9f-eb7d-4035-8869-897f99592634" />
+    <UnitTestResult executionId="ece6ed4b-41ec-4f2b-ac27-a0669184d8fc" testId="69b188e5-01fc-e929-117c-df98826cca56" testName="InferenceWeb.Tests.HunyuanDenseServingTests.HunyuanDense_ConcurrentEngineRequests_MatchEachRequestServedAlone(batched: False)" computerName="d71188ba1e2e" duration="00:00:00.2030062" startTime="2026-09-17T14:39:20.7996274+00:00" endTime="2026-09-17T14:39:21.0040165+00:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="ece6ed4b-41ec-4f2b-ac27-a0669184d8fc" />
+    <UnitTestResult executionId="6d4cb2f2-ddc4-4a1a-a674-0b8686839e1f" testId="b9a297a4-fab8-aebe-a6a6-d922cc1668b4" testName="InferenceWeb.Tests.HunyuanDenseServingTests.HunyuanDense_ExtractInjectRoundTrip_ReproducesTheUninterruptedRun" computerName="d71188ba1e2e" duration="00:00:00.0510528" startTime="2026-09-17T14:39:21.3291412+00:00" endTime="2026-09-17T14:39:21.3797298+00:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="6d4cb2f2-ddc4-4a1a-a674-0b8686839e1f" />
+    <UnitTestResult executionId="2ebe2f31-c91e-4c5e-9a24-59b992287df1" testId="0bed7b7c-7bef-d389-8521-70f3528fc0be" testName="InferenceWeb.Tests.FlashAttnUnsupportedShapeTests.PagedAttention_WithAHeadSizeCudaHasNoKernelFor_FallsBackInsteadOfAborting" computerName="d71188ba1e2e" duration="00:00:00.2664869" startTime="2026-09-17T14:39:19.8586121+00:00" endTime="2026-09-17T14:39:20.0953328+00:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="2ebe2f31-c91e-4c5e-9a24-59b992287df1" />
+    <UnitTestResult executionId="e1f1d5d8-406d-4d0e-a48e-2e5d7755de13" testId="7430758c-ac32-013e-7541-782a0a09f364" testName="InferenceWeb.Tests.HunyuanDenseServingTests.RepeatedLongPrompt_ReusesPrefixBlocks_AndMatchesTheFirstRun(architecture: &quot;hunyuan-dense&quot;, batched: False)" computerName="d71188ba1e2e" duration="00:00:00.1872999" startTime="2026-09-17T14:39:20.4743129+00:00" endTime="2026-09-17T14:39:20.6619602+00:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="e1f1d5d8-406d-4d0e-a48e-2e5d7755de13" />
+  </Results>
+  <TestDefinitions>
+    <UnitTest name="InferenceWeb.Tests.HunyuanDenseServingTests.RepeatedLongPrompt_ReusesPrefixBlocks_AndMatchesTheFirstRun(architecture: &quot;hunyuan-dense&quot;, batched: False)" storage="/workspace/ts-codex-branch-completion-20260917/repo/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="7430758c-ac32-013e-7541-782a0a09f364">
+      <Execution id="e1f1d5d8-406d-4d0e-a48e-2e5d7755de13" />
+      <TestMethod codeBase="/workspace/ts-codex-branch-completion-20260917/repo/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.HunyuanDenseServingTests" name="RepeatedLongPrompt_ReusesPrefixBlocks_AndMatchesTheFirstRun" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.HunyuanDenseServingTests.RepeatedLongPrompt_ReusesPrefixBlocks_AndMatchesTheFirstRun(architecture: &quot;hunyuan-dense&quot;, batched: True)" storage="/workspace/ts-codex-branch-completion-20260917/repo/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="369de25a-b9f8-f9ce-99f8-6b4948639f9d">
+      <Execution id="fb0a0b4b-dc66-46bf-9348-536480d5d9fa" />
+      <TestMethod codeBase="/workspace/ts-codex-branch-completion-20260917/repo/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.HunyuanDenseServingTests" name="RepeatedLongPrompt_ReusesPrefixBlocks_AndMatchesTheFirstRun" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.HunyuanDenseServingTests.HunyuanDense_ExtractInjectRoundTrip_ReproducesTheUninterruptedRun" storage="/workspace/ts-codex-branch-completion-20260917/repo/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="b9a297a4-fab8-aebe-a6a6-d922cc1668b4">
+      <Execution id="6d4cb2f2-ddc4-4a1a-a674-0b8686839e1f" />
+      <TestMethod codeBase="/workspace/ts-codex-branch-completion-20260917/repo/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.HunyuanDenseServingTests" name="HunyuanDense_ExtractInjectRoundTrip_ReproducesTheUninterruptedRun" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.HunyuanDenseServingTests.HunyuanDense_ConcurrentEngineRequests_MatchEachRequestServedAlone(batched: False)" storage="/workspace/ts-codex-branch-completion-20260917/repo/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="69b188e5-01fc-e929-117c-df98826cca56">
+      <Execution id="ece6ed4b-41ec-4f2b-ac27-a0669184d8fc" />
+      <TestMethod codeBase="/workspace/ts-codex-branch-completion-20260917/repo/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.HunyuanDenseServingTests" name="HunyuanDense_ConcurrentEngineRequests_MatchEachRequestServedAlone" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.HunyuanDenseServingTests.RepeatedLongPrompt_InAnotherConversation_AdoptsOnlyThePublicPrefix" storage="/workspace/ts-codex-branch-completion-20260917/repo/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="ea61de26-e37c-3b79-49a3-e3327da92583">
+      <Execution id="6924ba9f-4de3-452c-b5f8-fa93c6553813" />
+      <TestMethod codeBase="/workspace/ts-codex-branch-completion-20260917/repo/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.HunyuanDenseServingTests" name="RepeatedLongPrompt_InAnotherConversation_AdoptsOnlyThePublicPrefix" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.HunyuanDenseServingTests.HunyuanDense_ConcurrentEngineRequests_MatchEachRequestServedAlone(batched: True)" storage="/workspace/ts-codex-branch-completion-20260917/repo/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="304e1dfb-6905-0891-1ff5-3261859ca042">
+      <Execution id="1a82ea9f-eb7d-4035-8869-897f99592634" />
+      <TestMethod codeBase="/workspace/ts-codex-branch-completion-20260917/repo/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.HunyuanDenseServingTests" name="HunyuanDense_ConcurrentEngineRequests_MatchEachRequestServedAlone" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.FlashAttnUnsupportedShapeTests.PagedAttention_WithAHeadSizeCudaHasNoKernelFor_FallsBackInsteadOfAborting" storage="/workspace/ts-codex-branch-completion-20260917/repo/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="0bed7b7c-7bef-d389-8521-70f3528fc0be">
+      <Execution id="2ebe2f31-c91e-4c5e-9a24-59b992287df1" />
+      <TestMethod codeBase="/workspace/ts-codex-branch-completion-20260917/repo/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.FlashAttnUnsupportedShapeTests" name="PagedAttention_WithAHeadSizeCudaHasNoKernelFor_FallsBackInsteadOfAborting" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.HunyuanDenseServingTests.RepeatedLongPrompt_ReusesPrefixBlocks_AndMatchesTheFirstRun(architecture: &quot;mistral3&quot;, batched: True)" storage="/workspace/ts-codex-branch-completion-20260917/repo/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="73ecf64c-74b5-d08b-1753-24bd85267d65">
+      <Execution id="8326b34d-93d8-4394-a49a-24f091b5f31f" />
+      <TestMethod codeBase="/workspace/ts-codex-branch-completion-20260917/repo/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.HunyuanDenseServingTests" name="RepeatedLongPrompt_ReusesPrefixBlocks_AndMatchesTheFirstRun" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.HunyuanDenseServingTests.HunyuanDense_ExposesTheSnapshotContractTheEngineRequires" storage="/workspace/ts-codex-branch-completion-20260917/repo/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="794bec13-4791-3b6a-6075-0d32b28510f5">
+      <Execution id="90d3dcb6-01fe-449e-ac9d-112c0a0ce7e2" />
+      <TestMethod codeBase="/workspace/ts-codex-branch-completion-20260917/repo/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.HunyuanDenseServingTests" name="HunyuanDense_ExposesTheSnapshotContractTheEngineRequires" />
+    </UnitTest>
+  </TestDefinitions>
+  <TestEntries>
+    <TestEntry testId="794bec13-4791-3b6a-6075-0d32b28510f5" executionId="90d3dcb6-01fe-449e-ac9d-112c0a0ce7e2" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="369de25a-b9f8-f9ce-99f8-6b4948639f9d" executionId="fb0a0b4b-dc66-46bf-9348-536480d5d9fa" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="ea61de26-e37c-3b79-49a3-e3327da92583" executionId="6924ba9f-4de3-452c-b5f8-fa93c6553813" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="73ecf64c-74b5-d08b-1753-24bd85267d65" executionId="8326b34d-93d8-4394-a49a-24f091b5f31f" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="304e1dfb-6905-0891-1ff5-3261859ca042" executionId="1a82ea9f-eb7d-4035-8869-897f99592634" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="69b188e5-01fc-e929-117c-df98826cca56" executionId="ece6ed4b-41ec-4f2b-ac27-a0669184d8fc" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="b9a297a4-fab8-aebe-a6a6-d922cc1668b4" executionId="6d4cb2f2-ddc4-4a1a-a674-0b8686839e1f" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="0bed7b7c-7bef-d389-8521-70f3528fc0be" executionId="2ebe2f31-c91e-4c5e-9a24-59b992287df1" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="7430758c-ac32-013e-7541-782a0a09f364" executionId="e1f1d5d8-406d-4d0e-a48e-2e5d7755de13" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+  </TestEntries>
+  <TestLists>
+    <TestList name="Results Not in a List" id="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestList name="All Loaded Results" id="19431567-8539-422a-85d7-44ee4e166bda" />
+  </TestLists>
+  <ResultSummary outcome="Completed">
+    <Counters total="9" executed="9" passed="9" failed="0" error="0" timeout="0" aborted="0" inconclusive="0" passedButRunAborted="0" notRunnable="0" notExecuted="0" disconnected="0" warning="0" completed="0" inProgress="0" pending="0" />
+    <Output>
+      <StdOut>[xUnit.net 00:00:00.00] xUnit.net VSTest Adapter v3.1.4+50e68bbb8b (64-bit .NET 10.0.12)
+[xUnit.net 00:00:00.50]   Discovering: InferenceWeb.Tests
+ggml_cuda_init: found 2 CUDA devices (Total VRAM: 90996 MiB):
+  Device 0: NVIDIA A40, compute capability 8.6, VMM: yes, VRAM: 45498 MiB
+  Device 1: NVIDIA A40, compute capability 8.6, VMM: yes, VRAM: 45498 MiB
+[xUnit.net 00:00:02.47]   Discovered:  InferenceWeb.Tests
+[xUnit.net 00:00:02.55]   Starting:    InferenceWeb.Tests
+[TensorSharp] warning: CUDA0 has no flash-attention kernel for paged attention (K head 16, V head 16, KV rows 64, query rows 4, heads 4/2, K/V f32/f32, mask yes); running this attention as explicit F32 mul_mat + soft_max instead (same math, slower, more memory). Reported once per call site.
+Backend: GgmlCuda
+Model: mistral3, Layers=2, Hidden=64, Heads=4, KVHeads=2, KeyLen=16, ValLen=16, Vocab=0
+RoPE base=1000000, scale=1, type=, dim=16, origCtx=0
+Loading model weights... done (21 F32 tensors, 0 quantized tensors)
+  Fused projections: 2 QKV
+  Fused projections: 2 Gate+Up
+Context length: using MAX_CONTEXT=8192; model declares mistral3.context_length=4096.
+Backend: GgmlCuda
+Model: hunyuan-dense, Layers=2, Hidden=64, Heads=4, KVHeads=2, KeyLen=16, ValLen=16, Vocab=256
+RoPE base=10000, scale=1, dim=16 (NeoX, then QK-norm)
+Loading model weights... done (25 F32 tensors, 0 quantized tensors)
+  Fused projections: 2 QKV
+  Fused projections: 2 Gate+Up
+Context length: using MAX_CONTEXT=8192; model declares hunyuan-dense.context_length=4096.
+Backend: GgmlCuda
+Model: hunyuan-dense, Layers=2, Hidden=64, Heads=4, KVHeads=2, KeyLen=16, ValLen=16, Vocab=256
+RoPE base=10000, scale=1, dim=16 (NeoX, then QK-norm)
+Loading model weights... done (25 F32 tensors, 0 quantized tensors)
+  Fused projections: 2 QKV
+  Fused projections: 2 Gate+Up
+Context length: using MAX_CONTEXT=8192; model declares hunyuan-dense.context_length=4096.
+Backend: GgmlCuda
+Model: hunyuan-dense, Layers=2, Hidden=64, Heads=4, KVHeads=2, KeyLen=16, ValLen=16, Vocab=256
+RoPE base=10000, scale=1, dim=16 (NeoX, then QK-norm)
+Loading model weights... done (25 F32 tensors, 0 quantized tensors)
+  Fused projections: 2 QKV
+  Fused projections: 2 Gate+Up
+Context length: using MAX_CONTEXT=8192; model declares hunyuan-dense.context_length=4096.
+Backend: GgmlCuda
+Model: hunyuan-dense, Layers=2, Hidden=64, Heads=4, KVHeads=2, KeyLen=16, ValLen=16, Vocab=256
+RoPE base=10000, scale=1, dim=16 (NeoX, then QK-norm)
+Loading model weights... done (25 F32 tensors, 0 quantized tensors)
+  Fused projections: 2 QKV
+  Fused projections: 2 Gate+Up
+Context length: using MAX_CONTEXT=8192; model declares hunyuan-dense.context_length=4096.
+Backend: GgmlCuda
+Model: hunyuan-dense, Layers=2, Hidden=64, Heads=4, KVHeads=2, KeyLen=16, ValLen=16, Vocab=256
+RoPE base=10000, scale=1, dim=16 (NeoX, then QK-norm)
+Loading model weights... done (25 F32 tensors, 0 quantized tensors)
+  Fused projections: 2 QKV
+  Fused projections: 2 Gate+Up
+Context length: using MAX_CONTEXT=8192; model declares hunyuan-dense.context_length=4096.
+Backend: GgmlCuda
+Model: hunyuan-dense, Layers=2, Hidden=64, Heads=4, KVHeads=2, KeyLen=16, ValLen=16, Vocab=256
+RoPE base=10000, scale=1, dim=16 (NeoX, then QK-norm)
+Loading model weights... done (25 F32 tensors, 0 quantized tensors)
+  Fused projections: 2 QKV
+  Fused projections: 2 Gate+Up
+Context length: using MAX_CONTEXT=8192; model declares hunyuan-dense.context_length=4096.
+Backend: GgmlCuda
+Model: hunyuan-dense, Layers=2, Hidden=64, Heads=4, KVHeads=2, KeyLen=16, ValLen=16, Vocab=256
+RoPE base=10000, scale=1, dim=16 (NeoX, then QK-norm)
+Loading model weights... done (25 F32 tensors, 0 quantized tensors)
+  Fused projections: 2 QKV
+  Fused projections: 2 Gate+Up
+Context length: using MAX_CONTEXT=8192; model declares hunyuan-dense.context_length=4096.
+Backend: GgmlCuda
+Model: hunyuan-dense, Layers=2, Hidden=64, Heads=4, KVHeads=2, KeyLen=16, ValLen=16, Vocab=256
+RoPE base=10000, scale=1, dim=16 (NeoX, then QK-norm)
+Loading model weights... done (25 F32 tensors, 0 quantized tensors)
+  Fused projections: 2 QKV
+  Fused projections: 2 Gate+Up
+Context length: using MAX_CONTEXT=8192; model declares hunyuan-dense.context_length=4096.
+Backend: GgmlCuda
+Model: hunyuan-dense, Layers=2, Hidden=64, Heads=4, KVHeads=2, KeyLen=16, ValLen=16, Vocab=256
+RoPE base=10000, scale=1, dim=16 (NeoX, then QK-norm)
+Loading model weights... done (25 F32 tensors, 0 quantized tensors)
+  Fused projections: 2 QKV
+  Fused projections: 2 Gate+Up
+Context length: using MAX_CONTEXT=8192; model declares hunyuan-dense.context_length=4096.
+[xUnit.net 00:00:04.14]   Finished:    InferenceWeb.Tests
+</StdOut>
+    </Output>
+  </ResultSummary>
+</TestRun>

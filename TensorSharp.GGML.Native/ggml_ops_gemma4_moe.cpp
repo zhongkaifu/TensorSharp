@@ -10,6 +10,7 @@
 #include "ggml_ops_internal.h"
 #include "ggml_ops_attention_alloc.h"
 #include "ggml_ops_transformer_common.h"
+#include "gemma4_mm_mask.h"
 #include <chrono>
 #include <cstdio>
 
@@ -214,8 +215,8 @@ TSG_EXPORT int TSGgml_Gemma4MoELayerDecode(const TSGgmlGemma4MoELayerDesc* d)
         }
 
         ggml_tensor* q_attn = ggml_permute(ctx, q_rope, 0, 2, 1, 3);
-        ggml_tensor* attn_out = ggml_flash_attn_ext(ctx, q_attn, k_full, v_full, attn_mask, 1.0f, 0.0f, 0.0f);
-        ggml_flash_attn_ext_set_prec(attn_out, GGML_PREC_F32);
+        ggml_tensor* attn_out = flash_attn_ext_guarded(ctx, "Gemma4 MoE layer decode", q_attn, k_full, v_full, attn_mask, 1.0f, 0.0f, 0.0f,
+            nullptr, GGML_PREC_F32);
         ggml_tensor* attn_flat = ggml_reshape_2d(ctx, attn_out, qDim, 1);
         ggml_tensor* o_flat = ggml_reshape_1d(ctx, ggml_mul_mat(ctx, o_w, attn_flat), H);
         ggml_tensor* post_attn_normed = ggml_mul(ctx, ggml_rms_norm(ctx, o_flat, eps), post_attn_norm_w);
@@ -1049,8 +1050,8 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelDecode(
             }
 
             ggml_tensor* q_attn = ggml_permute(ctx, q_rope, 0, 2, 1, 3);
-            ggml_tensor* attn_out = ggml_flash_attn_ext(ctx, q_attn, k_full, v_full, t.attn_mask, 1.0f, 0.0f, 0.0f);
-            ggml_flash_attn_ext_set_prec(attn_out, GGML_PREC_F32);
+            ggml_tensor* attn_out = flash_attn_ext_guarded(ctx, "Gemma4 MoE model decode", q_attn, k_full, v_full, t.attn_mask, 1.0f, 0.0f, 0.0f,
+                nullptr, GGML_PREC_F32);
             ggml_tensor* attn_flat = ggml_reshape_2d(ctx, attn_out, qDim, 1);
             ggml_tensor* o_mm = ggml_mul_mat(ctx, t.o_w, attn_flat);
             ggml_tensor* o_flat = ggml_reshape_1d(ctx, o_mm, H);
@@ -1585,9 +1586,8 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelVerify(
     const TSGgmlGemma4MoELayerDesc* layers, int num_layers,
     void* hidden_data, int hidden_size, int start_pos, int num_tokens,
     // Multimodal bidirectional-span mask, nullable, length N (one byte per
-    // token, 1 = "soft" image/audio token). Only honoured at start_pos == 0
-    // (view index == logical position); mirrors the dense verify's
-    // is_except_arr and the C# per-op ApplyCausalMask exceptPositions path.
+    // CHUNK token, 1 = "soft" image/audio token), honoured at any start_pos;
+    // mirrors the dense verify's is_except_arr (see gemma4_mm_mask.h).
     const unsigned char* mm_is_except,
     // Tensor parallelism — same contract as TSGgml_Gemma4MoEModelDecode.
     int tp_degree, void** tp_plan_out)
@@ -1641,9 +1641,10 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelVerify(
             return 0;
         const int H = hidden_size;
         const int totalSeqLen = start_pos + N;
-        // The bidirectional-span mask maps view-index == logical position only
-        // at start_pos == 0; the C# gate guarantees that for multimodal.
-        const unsigned char* is_except = (start_pos == 0) ? mm_is_except : nullptr;
+        // The bidirectional-span mask is indexed by chunk position; both mask
+        // builders below map a key to its chunk index at any start_pos
+        // (gemma4_mm_mask.h), so an image chunk after a reused prefix stays here.
+        const unsigned char* is_except = mm_is_except;
         const int num_heads = layers[0].num_heads;
         const float eps = layers[0].eps;
         const int kvType = layers[0].kv_cache_type;
@@ -1814,36 +1815,13 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelVerify(
             std::vector<ggml_fp16_t> data(static_cast<std::size_t>(kvLen) * N);
             const ggml_fp16_t neg_inf = ggml_fp32_to_fp16(-INFINITY);
             const ggml_fp16_t zero_val = ggml_fp32_to_fp16(0.0f);
-            const int nPast = validLen - N;
+            // Causal band per row (filled analytically — a per-element host loop
+            // blocks the GPU at long prefill), plus the chunk's soft keys ahead of
+            // a soft query (no window low bound on that clause). The chunk's keys
+            // are the last N real keys [validLen-N, validLen).
             for (int qi = 0; qi < N; qi++)
-            {
-                const int threshold = nPast + qi;
-                const int low = (window > 0) ? (threshold - window + 1) : 0;
-                ggml_fp16_t* row = &data[static_cast<std::size_t>(qi) * kvLen];
-                // Bidirectional within soft-token (image/audio) spans: a soft
-                // query also keeps soft keys ahead of it (window low bound not
-                // applied to the bidi branch — mirrors the C# per-op path). At
-                // start_pos == 0 (the only case with is_except set) key index
-                // == logical position.
-                if (is_except != nullptr && qi < N && is_except[qi] != 0)
-                {
-                    for (int ki = 0; ki < kvLen; ki++)
-                    {
-                        bool causal = (ki < validLen) && (ki <= threshold) && !(window > 0 && ki < low);
-                        bool bidi = ki < N && is_except[ki] != 0;
-                        row[ki] = (causal || bidi) ? zero_val : neg_inf;
-                    }
-                    continue;
-                }
-                // Unmasked keys form a single contiguous band [lo, hi]; fill it
-                // analytically rather than a per-element branch over [0, kvLen)
-                // (the host loop blocks the GPU at long prefill — see dense verify).
-                const int lo = (low > 0) ? low : 0;
-                const int hi = std::min(threshold, validLen - 1);
-                std::fill(row, row + kvLen, neg_inf);
-                if (hi >= lo && lo < kvLen)
-                    std::fill(row + lo, row + std::min(hi + 1, kvLen), zero_val);
-            }
+                tsg_gemma4_mask::fill_relative_row(&data[static_cast<std::size_t>(qi) * kvLen],
+                    kvLen, qi, N, validLen, window, is_except, zero_val, neg_inf);
             const int idx = static_cast<int>(mask_data_store.size());
             mask_data_store.push_back(std::move(data));
             mask_cache.push_back({kvLen, validLen, window, mt, idx});
@@ -1876,30 +1854,12 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelVerify(
             std::vector<ggml_fp16_t> data(static_cast<std::size_t>(kLen) * qLen);
             const ggml_fp16_t neg_inf = ggml_fp32_to_fp16(-INFINITY);
             const ggml_fp16_t zero_val = ggml_fp32_to_fp16(0.0f);
+            // Key ki sits at logical position kStart + ki; a soft query also
+            // keeps the chunk's soft keys ahead of it, with no window low bound on
+            // that clause (the chunk starts at start_pos).
             for (int qi = 0; qi < qLen; qi++)
-            {
-                const int gQ = qStartAbs + qi;
-                ggml_fp16_t* row = &data[static_cast<std::size_t>(qi) * kLen];
-                // Bidirectional soft-token spans (multimodal, start_pos == 0
-                // only): a soft query also keeps soft keys ahead of it, with no
-                // window low bound on the bidi branch. Key ki sits at logical
-                // position kStart + ki.
-                if (is_except != nullptr && gQ < N && is_except[gQ] != 0)
-                {
-                    for (int ki = 0; ki < kLen; ki++)
-                    {
-                        const int kAbs = kStart + ki;
-                        bool causal = (kAbs <= gQ) && !(window > 0 && kAbs < gQ - window + 1);
-                        bool bidi = kAbs < N && is_except[kAbs] != 0;
-                        row[ki] = (causal || bidi) ? zero_val : neg_inf;
-                    }
-                    continue;
-                }
-                const int lo = (window > 0) ? std::max(0, gQ - window + 1 - kStart) : 0;
-                int hi = gQ - kStart; if (hi > kLen - 1) hi = kLen - 1;
-                std::fill(row, row + kLen, neg_inf);
-                if (hi >= lo && lo < kLen) std::fill(row + lo, row + hi + 1, zero_val);
-            }
+                tsg_gemma4_mask::fill_absolute_row(&data[static_cast<std::size_t>(qi) * kLen],
+                    kLen, qStartAbs + qi, kStart, window, start_pos, N, is_except, zero_val, neg_inf);
             const int idx = static_cast<int>(mask_data_store.size());
             mask_data_store.push_back(std::move(data));
             tile_mask_cache.push_back({kLen, qLen, qStartAbs, kStart, window, mt, idx});
@@ -1945,8 +1905,8 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelVerify(
             // chunk), otherwise once there are >= 3 query tiles.
             // Bidi multimodal spans need forward attention past a query tile's
             // key slice — keep the full-N attention there (mirrors the dense
-            // verify's swa_tiled fallback). is_except implies start_pos == 0,
-            // so swaPrev (start_pos != 0) never overlaps with it.
+            // verify's swa_tiled fallback), including swaPrev: a media chunk after a
+            // reused prefix attends [prev window ++ chunk] in one flash call.
             const bool moe_use_tiled = moe_attn_tiled && is_except == nullptr
                 && (swaPrev || (N > 2 * moe_attn_tile && (swaFresh || !isLocal)));
             const bool tileQ = moe_use_tiled && separate_qkv;
@@ -2294,7 +2254,7 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelVerify(
                     ggml_tensor* m_tile = get_tile_mask(kLen, qLen, start_pos + qs, kStartLogical, window);
                     ggml_tensor* fa = ggml_flash_attn_ext(ctx, q_tile, k_tile, v_tile, m_tile, 1.0f, 0.0f, 0.0f);
                     ggml_flash_attn_ext_set_prec(fa, GGML_PREC_F32);
-                    if (qs == 0 && !backend_supports_op(fa))
+                    if (!backend_supports_op(fa))
                     {
                         set_last_error("Gemma4 MoE model verify: tiled flash attention unsupported for this shape; use per-op path.");
                         return 0;

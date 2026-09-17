@@ -508,9 +508,8 @@ TSG_EXPORT int TSGgml_Qwen3ModelDecodeLogits(
                 return 0;
             }
 
-            ggml_tensor* attn = ggml_flash_attn_ext(ctx,
-                q_attn, k_full, v_full, mask_in, attn_scale, 0.0f, 0.0f);
-            ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32);
+            ggml_tensor* attn = flash_attn_ext_guarded(ctx, "Qwen3 model decode", q_attn, k_full, v_full, mask_in, attn_scale, 0.0f, 0.0f,
+                nullptr, GGML_PREC_F32);
             ggml_tensor* attn_proj = ggml_reshape_1d(ctx,
                 ggml_mul_mat(ctx, t.o,
                     ggml_reshape_2d(ctx, attn, q_dim, 1)),

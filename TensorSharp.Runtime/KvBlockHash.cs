@@ -73,6 +73,8 @@ namespace TensorSharp.Runtime
     /// </summary>
     public static class KvBlockHasher
     {
+        private static readonly byte[] SaltMarker = { 0, 0xFF, (byte)'s', 0 };
+
         /// <summary>
         /// Compute hashes for the largest number of full blocks contained in
         /// <paramref name="tokens"/>. A trailing partial block is not hashed - paging
@@ -80,10 +82,16 @@ namespace TensorSharp.Runtime
         /// specific (model, dtype, layer count) tuple so cache entries cannot leak
         /// across incompatible models loaded into the same store.
         /// </summary>
+        /// <param name="blockSalt">Optional extra identity for block <c>b</c> (its media
+        /// spans, or the request's cache scope once the block extends past the public
+        /// prefix). Null or empty adds nothing, so unsalted blocks hash exactly as they
+        /// always did; a salted block changes its own hash and, through the parent
+        /// chain, every later one.</param>
         public static List<KvBlockHash> ComputeBlockHashes(
             IReadOnlyList<int> tokens,
             int blockSize,
-            string fingerprint)
+            string fingerprint,
+            Func<int, string> blockSalt = null)
         {
             if (tokens == null)
                 throw new ArgumentNullException(nameof(tokens));
@@ -121,6 +129,14 @@ namespace TensorSharp.Runtime
 
                     using var sha = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
                     sha.AppendData(fingerprintBytes);
+                    string salt = blockSalt?.Invoke(b);
+                    if (!string.IsNullOrEmpty(salt))
+                    {
+                        // A separator no fingerprint contains, so "fp" + "salt" can never
+                        // collide with a longer fingerprint that happens to end in "salt".
+                        sha.AppendData(SaltMarker);
+                        sha.AppendData(Encoding.UTF8.GetBytes(salt));
+                    }
                     // Chain the parent digest. For the first block the parent is the
                     // all-zero sentinel so the same prompt prefix always hashes the
                     // same way regardless of who hashed it.

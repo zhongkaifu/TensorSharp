@@ -9,6 +9,7 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 #include "ggml_ops_internal.h"
 #include "ggml_ops_transformer_common.h"
+#include "gemma4_mm_mask.h"
 #include <chrono>
 #include <cstdio>
 
@@ -103,11 +104,11 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
     void** ple_gate_arr, int* ple_gate_type_arr, std::int64_t* ple_gate_ne0_arr, std::int64_t* ple_gate_ne1_arr, std::int64_t* ple_gate_bytes_arr,
     void** ple_proj_arr, int* ple_proj_type_arr, std::int64_t* ple_proj_ne0_arr, std::int64_t* ple_proj_ne1_arr, std::int64_t* ple_proj_bytes_arr,
     void** ple_post_norm_arr,
-    // Multimodal bidirectional-span mask, nullable, length N (one byte per token,
-    // 1 = "soft" image/audio token). When set (multimodal prefill, start_pos==0)
-    // the attention mask is causal PLUS bidirectional within the soft-token spans:
-    // a soft-token query may attend forward to a soft-token key. Mirrors the C#
-    // per-op ApplyCausalMask exceptPositions path. Null for text / MTP verify.
+    // Multimodal bidirectional-span mask, nullable, length N (one byte per CHUNK
+    // token, 1 = "soft" image/audio token). When set (multimodal prefill, at any
+    // start_pos) the attention mask is causal PLUS bidirectional among the chunk's
+    // soft tokens: a soft-token query may attend forward to a soft-token key of the
+    // same chunk. See gemma4_mm_mask.h. Null for text / MTP verify.
     const unsigned char* is_except_arr,
     // In-kernel PLE gather. When ple_token_embd_data != nullptr, the per-layer
     // embeddings are gathered INSIDE this graph via ggml_get_rows on the resident
@@ -217,9 +218,11 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
         const bool pad_batch = g4v_npad_enabled && g_backend_type == BACKEND_TYPE_VULKAN && N > 64;
         const int NQ = pad_batch ? ((N + 63) & ~63) : N;
 
-        // The bidirectional-span mask maps view-index == logical position only at
-        // start_pos==0 (nPast==0); the C# gate guarantees that for multimodal.
-        const unsigned char* is_except = (start_pos == 0) ? is_except_arr : nullptr;
+        // The bidirectional-span mask is indexed by chunk position. Every attention
+        // buffer below keeps the chunk's keys as its last N real keys, so the mask
+        // maps a key to its chunk index at any start_pos (gemma4_mm_mask.h): an
+        // image chunk after a reused prefix stays on this path.
+        const unsigned char* is_except = is_except_arr;
 
         struct LayerInfo { int hd; int kvHeads; int qDim; int kDim; int cacheSize; bool isLocal; bool isShared; int kvSource; };
         std::vector<LayerInfo> li(num_layers);
@@ -444,38 +447,12 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
             std::vector<ggml_fp16_t> data(static_cast<std::size_t>(kvLen) * NQ);
             const ggml_fp16_t neg_inf = ggml_fp32_to_fp16(-INFINITY);
             const ggml_fp16_t zero_val = ggml_fp32_to_fp16(0.0f);
-            const int nPast = validLen - N;
+            // Causal + sliding-window band per row, plus (soft-token queries only)
+            // the chunk's soft keys ahead of it. The window low bound is not applied
+            // to the soft-token clause. Keys [validLen-N, validLen) are the chunk.
             for (int qi = 0; qi < NQ; qi++)
-            {
-                const int threshold = nPast + qi;
-                const int low = (window > 0) ? (threshold - window + 1) : 0;
-                // Bidirectional within soft-token (image/audio) spans: a soft query
-                // also keeps soft keys ahead of it. Window low-bound is not applied
-                // to the bidi branch (mirrors the C# per-op exceptPositions path).
-                const bool q_except = is_except != nullptr && qi < N && is_except[qi] != 0;
-                ggml_fp16_t* row = &data[static_cast<std::size_t>(qi) * kvLen];
-                if (!q_except)
-                {
-                    // Fast path (no multimodal bidi): the unmasked (zero) keys form a
-                    // single contiguous band [lo, hi]: lo = sliding-window low bound,
-                    // hi = min(causal threshold, last real key). Fill it analytically
-                    // instead of a per-element branch + fp16 convert over [0, kvLen)
-                    // — this host loop is O(N*kvLen) and at multi-thousand-token
-                    // prefill it blocks the GPU (the [N,N] mask reaches 134M entries).
-                    const int lo = (low > 0) ? low : 0;
-                    const int hi = std::min(threshold, validLen - 1);
-                    std::fill(row, row + kvLen, neg_inf);
-                    if (hi >= lo && lo < kvLen)
-                        std::fill(row + lo, row + std::min(hi + 1, kvLen), zero_val);
-                    continue;
-                }
-                for (int ki = 0; ki < kvLen; ki++)
-                {
-                    bool causal = (ki < validLen) && (ki <= threshold) && !(window > 0 && ki < low);
-                    bool bidi = q_except && ki < N && is_except[ki] != 0;
-                    row[ki] = (causal || bidi) ? zero_val : neg_inf;
-                }
-            }
+                tsg_gemma4_mask::fill_relative_row(&data[static_cast<std::size_t>(qi) * kvLen],
+                    kvLen, qi, N, validLen, window, is_except, zero_val, neg_inf);
             const int idx = static_cast<int>(mask_data_store.size());
             mask_data_store.push_back(std::move(data));
             mask_cache.push_back({kvLen, validLen, window, mt, idx});
@@ -901,7 +878,7 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
                     ggml_tensor* m_tile = get_window_tile_mask(kLen, qLen, qs, ks, maskWindow);
                     ggml_tensor* fa = ggml_flash_attn_ext(ctx, q_tile, k_tile, v_tile, m_tile, 1.0f, 0.0f, 0.0f);
                     ggml_flash_attn_ext_set_prec(fa, GGML_PREC_F32);
-                    if (qs == 0 && !backend_supports_op(fa))
+                    if (!backend_supports_op(fa))
                     {
                         set_last_error("Gemma4 model verify: tiled flash attention unsupported for this shape; use per-op path.");
                         return 0;

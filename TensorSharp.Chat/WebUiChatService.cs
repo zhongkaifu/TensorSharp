@@ -270,6 +270,26 @@ namespace TensorSharp.Chat
         }
 
         /// <summary>
+        /// Bind session <paramref name="sessionId"/> to the host's saved conversation
+        /// <paramref name="conversationKey"/>, so every session opened for that
+        /// conversation continues its cached prompt state (one cache scope per
+        /// conversation instead of per session). For a host that owns conversation
+        /// identity and serves one user, such as TensorAgent. Returns false for an
+        /// unknown session or the shared default session.
+        /// </summary>
+        public bool BindSessionConversation(string sessionId, string conversationKey)
+        {
+            if (string.IsNullOrEmpty(sessionId)
+                || string.Equals(sessionId, SessionManager.DefaultSessionId, StringComparison.Ordinal))
+                return false;
+            ChatSession session = _sessions.GetSession(sessionId);
+            if (session == null || session.SharedAcrossConversations)
+                return false;
+            session.BindConversation(conversationKey);
+            return true;
+        }
+
+        /// <summary>
         /// <c>DELETE /api/sessions/{id}</c> — <c>{ ok = true, sessionId }</c>; 400 for
         /// the default session, 404 for an unknown one. Releases the session's
         /// execution workspace — its files, installed packages, everything its runs
@@ -382,7 +402,9 @@ namespace TensorSharp.Chat
         /// <c>POST /api/models/load</c> — <c>{ model, backend?, mmproj? }</c>. The model
         /// must be the hosted one (the guard resolves the file name against the startup
         /// path, so a client never needs a host path); 400 <c>{ ok = false, error }</c>
-        /// for a refused request, 500 with the same shape when the load itself fails.
+        /// for a refused request, 500 with the same shape when the load itself fails. A load
+        /// the model refuses (see <see cref="ModelLoadRefusal"/>) adds <c>refused = true</c>
+        /// and <c>loadedModel</c>: the previous model when it was restored, null for none.
         /// </summary>
         public Task<object> LoadModelAsync(JsonElement body, CancellationToken cancellationToken)
         {
@@ -425,6 +447,23 @@ namespace TensorSharp.Chat
                     model = _svc.LoadedModelName,
                     loadedMmProj = _svc.LoadedMmProjName,
                     architecture = _svc.Architecture,
+                });
+            }
+            catch (Exception ex) when (ModelLoadRefusal.TryDescribe(ex, out string refusal))
+            {
+                // Refused (not enough VRAM, an unsupported dtype or --tp layout, a bad
+                // file): the lifecycle already logged the reason, restored the previous
+                // model if there was one, and the server keeps serving. Say which model
+                // is loaded now, null for none, so a client does not have to guess.
+                modelLoadLogger.LogWarning(LogEventIds.ModelLoadFailed,
+                    "Web UI model load refused: model={Model} backend={Backend}: {Reason}; loaded now: {Loaded}",
+                    modelName, backend, refusal, _svc.LoadedModelName ?? "(none)");
+                throw new WebUiRequestRejectedException(500, new
+                {
+                    ok = false,
+                    error = refusal,
+                    refused = true,
+                    loadedModel = _svc.LoadedModelName,
                 });
             }
             catch (Exception ex)
@@ -2238,6 +2277,11 @@ namespace TensorSharp.Chat
                     }
                     else
                     {
+                        // Unparsed text is answer text too. Without this every reply of
+                        // a model that needs no parser ended with the "ended this turn
+                        // without writing an answer" note, which the page then sent back
+                        // as part of the assistant's message on the next turn.
+                        sawContent = true;
                         yield return WebUiSseEvents.Token(piece);
                     }
                 }

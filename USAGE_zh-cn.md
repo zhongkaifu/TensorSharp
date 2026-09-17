@@ -725,11 +725,12 @@ Unix IPC 并非完整隔离边界：macOS 为兼容性保留共享临时目录�
 | `TS_SCHED_SOLO_PREFILL_CHUNK` | SOLO（无争用）prompt 全新部分（start_pos = 0）的 prefill 分块大小——单个无争用请求会以大分块走融合 prefill 路径（默认：`8192`）。 |
 | `TS_SCHED_NUM_BLOCKS` | 引擎块池的物理块数（默认：`256`）。 |
 | `TS_SCHED_BLOCK_SIZE` | 引擎侧每块的 token 数（默认：`256`）。 |
-| `TS_SCHED_PREFIX_CACHE` | `0` 关闭跨请求的块级哈希前缀共享。由批处理分页步写入的块在模型自己的分页存储中被复用（请求一开始就是分页驻留）；带池化快照的块被恢复到线性 cache。两种可读形式都没有的块不会被复用，改为重新 prefill。 |
+| `TS_SCHED_PREFIX_CACHE` | `0` 关闭跨请求的全部提示复用：池化块、live cache 续接、保留的 holder 和共享前缀检查点。无论开关如何，复用都按会话隔离：另一个会话的状态只共享到系统提示词加工具声明前缀为止（见 [docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING_zh-cn.md](docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING_zh-cn.md)）。池化块方面：由批处理分页步写入的块在模型自己的分页存储中被复用（请求一开始就是分页驻留）；带池化快照的块被恢复到线性 cache；两种可读形式都没有的块不会被复用，改为重新 prefill。 |
 | `TS_SCHED_STOP_REPETITION` | `0` 允许陷入重复循环的生成继续跑到 token 上限，而不是被提前结束。 |
 | `TS_SCHED_DECODE_QUANTUM` | 在允许切换序列前的 token 数（默认与 block size 相同）。 |
 | `TS_RETAINED_FUSED_CACHE` | `1`（默认）在请求结束后保留其融合 holder，使前缀完全一致的续写不必重新 prefill；仅对声明支持的模型有效（Gemma 4 的 K/V；Qwen 3.5/3.6 的注意力 K/V 加 GatedDeltaNet 递归状态）。`0` 关闭（用于限制显存或做 A/B）。 |
 | `TS_RETAINED_FUSED_CACHE_MAX` | 保留的融合 holder 的 LRU 预算（默认 `4`）；每个都钉住一份完整的按请求续写状态。 |
+| `TS_MM_EMBEDDING_CACHE_MB` | 图像/音频嵌入缓存的字节预算（默认 `512`）。条目以媒体内容（SHA-256）为键，因此 API 客户端每轮重发同一张图片只编码一次；超出预算后淘汰没有被进行中提示引用的最近最少使用条目。 |
 | `TS_PREFIX_CHECKPOINTS` | `1`（默认）在所有会话共享的那段提示词末尾——系统提示词、工具、技能——对模型状态做 checkpoint，并让每个**新**会话从它的副本开始，因此新会话只需重新 prefill 自己的那条消息。适用于 GGML 后端上的 Gemma 4 与 Qwen 3.5/3.6。`0` 关闭。 |
 | `TS_PREFIX_CHECKPOINTS_MAX` | 同时保留 checkpoint 的不同共享前缀数量，按 LRU 淘汰（默认 `2`）。每个都持有该前缀的一份 K/V，Qwen 上还包括递归状态。 |
 | `TS_KV_INITIAL_TOKENS` | 缓存创建时（加载时的主缓存，以及每个按请求的 holder）在任何请求声明预算之前先分配多少 token 的 K/V。`0`（默认）沿用引擎策略：显式设置 `MAX_CONTEXT` 时取整个窗口，否则取后端默认值。缓存仍会按需增长，因此内存受限的设备应把它设小——每个保留的 holder 都要按这个大小付费，主机副本与设备镜像各一份。 |
@@ -1211,6 +1212,9 @@ llama.cpp 快数倍的原因：
    中转。对专家区间调用 `cudaHostRegister` 一次性花费约 65 ms/GiB，却把 PCIe 5.0
    x16 上的传输从 9.3 GB/s 提升到 55.6 GB/s。用 `TS_HOST_MOE_PIN=0` 关闭，用
    `TS_HOST_MOE_PIN_MAX_MB` 设上限（默认为 cgroup/主机内存上限的 60%）。
+   DeepSeek V4 / V4.1 是例外：它们的加载器在任何批大小下都在主机上计算被卸载的专家，
+   没有任何流式传输，因此只有设置 `TS_HOST_MOE_PIN=1` 时才会锁页（见
+   [V4.1 卡片](docs/models/deepseek41_zh-cn.md#加载时间)）。
 2. **只发送这一批实际路由到的专家**，并按连续区段分组——和 llama.cpp 调度器用
    已用专家位图玩的是同一个把戏。512 token 时较大的专家池只会被部分覆盖，而在投机
    验证与轻负载服务产生的小批下，这项节省相当可观。`TS_HOST_MOE_EXPERT_FILTER=0`
@@ -1825,6 +1829,36 @@ shell 能够到达 PATH 上的每一个解释器——于是手上还拿着旧�
 | 原生构建并行度上限 | 使用全部 CPU，并按内存容量限制（`nvcc` 每任务约 3 GB） | `TENSORSHARP_GGML_NATIVE_BUILD_PARALLEL_LEVEL` | — |
 | 原生构建使用的 CMake 生成器（Windows） | 有 Ninja 时优先使用，否则用 `Visual Studio NN` | `CMAKE_GENERATOR` | `-G <生成器>` |
 | 原生构建使用的 Visual Studio 安装（Windows） | 自动检测，包含被标记为"不完整"的安装 | `TENSORSHARP_VS_INSTALL_DIR` | — |
+
+## 退出码（CLI + Server）
+
+`TensorSharp.Cli` 与 `TensorSharp.Server` 使用同一套有文档约定的退出码，脚本或进程守护程序据此
+即可区分"命令行写错了"、"这个模型在这台机器上加载不了"和"这是个 bug"：
+
+| 退出码 | 含义 | stderr 输出 |
+|---|---|---|
+| `0` | 成功：运行结束、`--help` / `--list-skills` 已打印，或服务端正常关闭。 | — |
+| `1` | 配置错误：未知或已移除的参数、非法取值、无法读取的 `--config` 文件。 | `Configuration error: <错误说明>` |
+| `2` | 模型加载被拒绝。 | 恰好一行，且是最后一行：`error: model load refused: <原因>` |
+| 其他任何值 | 不是拒绝，而是 bug 或崩溃。未处理的 .NET 异常会打印堆栈，并在 Linux 和 macOS 上以 `134`（SIGABRT）退出；被操作系统杀掉的进程返回对应信号（内存不足被杀为 `137`）。 | 堆栈信息，请提交问题报告。 |
+
+**什么算"加载被拒绝"**（退出码 `2`）：加载器有意做出的、给出可操作原因的决定——显存不足以容纳
+请求的上下文或 `--n-cpu-moe` 设置（消息会给出放得下的数值）、设备装不下的 `--tp` 布局、架构不支持的
+KV 缓存类型（例如 DeepSeek V4.1 上的 `KV_CACHE_DTYPE=q8_0`）、模型或本机不支持的后端、缺失/截断/
+不是 GGUF 的模型文件、缺失的附属文件（DeepSeek V4.1 的 `deepseek41.engram.bin`），或者显式指定却无法
+启用的 `--draft-model`。原生加载器自己的诊断行（`[dsv4] ...`、`[glm] ...`）仍可能出现在错误行之前；
+错误行会重复原因，单独读也能看懂。加载过程中其他任何失败——`NullReferenceException`、CUDA 错误、
+内存不足导致的中止——都不算拒绝，会保留堆栈信息。唯一的例外：DeepSeek V4/V4.1 与 GLM 的原生整模型加载器
+放弃的每一次加载都按拒绝报告，包括在设备上分配权重或缓存失败，原因即它们的 `[dsv4]`/`[glm]` 那一行。
+
+以 `2` 退出之前，服务端会先释放被拒绝的加载留下的资源（模型服务与 ggml 后端），并且不会打开端口。
+拒绝的堆栈本来就是噪音，所以只在 Debug 级别记录：`TENSORSHARP_LOG_LEVEL=Debug`（两个宿主都适用）
+或 `--log-level debug`（CLI）即可看到。
+
+运行中的服务端收到的加载请求被拒绝时，进程不会退出。`POST /api/models/load` 返回 `500` 和
+`{ "ok": false, "error": "<原因>", "refused": true, "loadedModel": "<文件>" }`；之前已加载的模型会被恢复，
+并写在 `loadedModel` 中，恢复不了时为 `null`。需要重新加载托管模型的 OpenAI 或 Ollama 请求会以该协议的
+错误格式返回同样的原因，服务端继续提供服务。
 
 ## 服务端日志
 

@@ -261,4 +261,56 @@ public class HunyuanDenseServingTests : IDisposable
             Environment.SetEnvironmentVariable("TS_HUNYUAN_BATCHED", previous);
         }
     }
+    /// <summary>
+    /// The same repeat through conversation scopes: a batched paged step leaves its
+    /// blocks only in the model's paged arrays, and the scope salt past the public prefix
+    /// decides which of them another conversation may adopt. Both conversations must
+    /// still produce the first run's greedy tokens.
+    /// </summary>
+    [Fact]
+    public async Task RepeatedLongPrompt_InAnotherConversation_AdoptsOnlyThePublicPrefix()
+    {
+        string previous = Environment.GetEnvironmentVariable("TS_HUNYUAN_BATCHED");
+        Environment.SetEnvironmentVariable("TS_HUNYUAN_BATCHED", null);
+        try
+        {
+            using var model = ModelBase.Create(BuildModel(), Backend);
+            var cfg = new SchedulerConfig
+            {
+                MaxNumBatchedTokens = 256,
+                MaxNumRunningSequences = 4,
+                MaxPrefillChunkSize = 64,
+                NumBlocks = 32,
+                BlockSize = 16,
+                EnablePrefixCaching = true,
+            };
+            using var engine = new InferenceEngine(model, cfg, NullLogger.Instance);
+            int[] prompt = Enumerable.Range(0, 43).Select(i => 65 + (i * 11) % 57).ToArray();
+            const int publicPrefix = 16;
+
+            async Task<(int[] Tokens, int Reused)> Serve(string id, string scope)
+            {
+                var handle = engine.SubmitRequest(new SequenceState(id, prompt, 8, cfg.BlockSize, SamplingConfig.Greedy,
+                    sharedPrefixTokens: publicPrefix, cacheScope: scope));
+                var tokens = new List<int>();
+                await foreach (int t in handle.Tokens.ReadAllAsync())
+                    tokens.Add(t);
+                var completion = await handle.Completion;
+                return (tokens.ToArray(), completion.PrefixCacheReusedTokens);
+            }
+
+            var a1 = await Serve("A1", "scope-a");
+            var b1 = await Serve("B1", "scope-b");
+            var a2 = await Serve("A2", "scope-a");
+            Assert.Equal(0, a1.Reused);
+            Assert.InRange(b1.Reused, 1, publicPrefix);
+            Assert.True(a2.Reused > publicPrefix, $"the owner should adopt past the public prefix, reused {a2.Reused}");
+            Assert.Equal(a1.Tokens, b1.Tokens);
+            Assert.Equal(a1.Tokens, a2.Tokens);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("TS_HUNYUAN_BATCHED", previous);
+        }
+    }
 }

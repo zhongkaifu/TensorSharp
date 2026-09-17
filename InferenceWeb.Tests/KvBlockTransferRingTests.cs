@@ -296,4 +296,123 @@ public class KvBlockTransferRingTests : IDisposable
         long bytes = KvBlockTransfer.ComputeBlockByteSize(k, v, 256);
         Assert.False(KvBlockTransfer.Inject(_alloc, k, v, 0, 0, 256, new byte[bytes], ringRows: ring));
     }
+
+    // ------------------------------------------------------------------
+    // Rewinding a ring (radix design M0c, P23)
+    //
+    // A ring layer keeps position p at row p % rows, so after the sequence passes
+    // `rows` tokens every new position overwrites an old one. Truncation only moves
+    // the head; the rows a wrap overwrote do not come back, and the next query still
+    // attends a whole window behind the new head. Muse-Glimmer's truncation had no
+    // guard, so a rewind deeper than the ring's slack (rows - window - 1) continued
+    // from overwritten rows. Real geometry: window 2048, prefill chunk 2048, ring
+    // pad256(2048 + 2048 + 1) = 4352 rows, slack 2303.
+    // ------------------------------------------------------------------
+
+    private const int GlimmerWindow = 2048;
+    private const int GlimmerRing = 4352;
+    private const int GlimmerSlack = GlimmerRing - GlimmerWindow - 1;   // 2303
+
+    [Theory]
+    // Never wrapped: every row is still there, any depth is exact.
+    [InlineData(4000, 100, true)]
+    [InlineData(GlimmerRing, 1, true)]
+    // Wrapped: exact within the slack, including the executor's 16-token live rewind...
+    [InlineData(6000, 6000 - 16, true)]
+    [InlineData(6000, 6000 - GlimmerSlack, true)]
+    // ...and refused one token past it.
+    [InlineData(6000, 6000 - GlimmerSlack - 1, false)]
+    [InlineData(20000, 5000, false)]
+    // Dropping to nothing or to the head reads no old row.
+    [InlineData(6000, 0, true)]
+    [InlineData(6000, 6000, true)]
+    // A target past the head is not a truncation.
+    [InlineData(6000, 6001, false)]
+    public void MuseGlimmer_CanTruncate_HonoursTheRingSlack(int cached, int target, bool expected)
+    {
+        var model = RingModel(cached);
+        Assert.Equal(expected, model.CanTruncateKVCache(cached, target));
+    }
+
+    [Fact]
+    public void MuseGlimmer_UniformCache_KeepsTheBaseRule()
+    {
+        // No ring (ggml-cpu, TP, or TS_MUSE_GLIMMER_SWA_RING=0): a linear cache rewinds
+        // to any depth, as before.
+        var model = RingModel(cachedTokens: 20000, ringRows: 0);
+        Assert.True(model.CanTruncateKVCache(20000, 5));
+        Assert.True(model.TryTruncateKVCache(5));
+        Assert.Equal(5, model.CacheSeqLen);
+    }
+
+    [Fact]
+    public void MuseGlimmer_TryTruncate_RefusesADeepRewindOnAWrappedRing_AndChangesNothing()
+    {
+        var model = RingModel(cachedTokens: 6000);
+        Assert.False(model.TryTruncateKVCache(6000 - GlimmerSlack - 1));
+        Assert.Equal(6000, model.CacheSeqLen);
+    }
+
+    [Fact]
+    public void MuseGlimmer_TryTruncate_RewindsWithinTheSlack()
+    {
+        var model = RingModel(cachedTokens: 6000);
+        Assert.True(model.TryTruncateKVCache(6000 - 16));
+        Assert.Equal(6000 - 16, model.CacheSeqLen);
+    }
+
+    [Fact]
+    public void MuseGlimmer_Truncate_ThrowsInsteadOfContinuingFromOverwrittenRows()
+    {
+        var model = RingModel(cachedTokens: 6000);
+        var refused = Assert.Throws<InvalidOperationException>(() => model.TruncateKVCache(1000));
+        Assert.Contains("TryTruncateKVCache", refused.Message);
+        Assert.Equal(6000, model.CacheSeqLen);
+    }
+
+    [Fact]
+    public void MuseGlimmer_TryTruncate_JudgesASecondRewindByTheFurthestHead_NotTheCurrentOne()
+    {
+        // 6000 -> 4000 is within the slack and accepted, and leaves the head below the
+        // ring size. Rows 0..1647 still hold positions 4352..5999, so 4000 -> 3500
+        // (window 1453..3500) would read overwritten rows: measured from the furthest
+        // head it is 2500 tokens deep, past the 2303-token slack.
+        var model = RingModel(cachedTokens: 6000);
+        Assert.True(model.TryTruncateKVCache(4000));
+        Assert.False(model.CanTruncateKVCache(4000, 3500));
+        Assert.False(model.TryTruncateKVCache(3500));
+        Assert.Equal(4000, model.CacheSeqLen);
+        // Still within the slack of the furthest head.
+        Assert.True(model.TryTruncateKVCache(6000 - GlimmerSlack));
+
+        // Emptying the cache forgets the wrap: a short sequence rewinds to any depth.
+        Assert.True(model.TryTruncateKVCache(0));
+        SetField(typeof(ModelBase), model, "_cacheSeqLen", 3000);
+        Assert.True(model.TryTruncateKVCache(10));
+    }
+
+    /// <summary>A Muse-Glimmer instance with only the ring geometry and the head set:
+    /// what the truncation guard reads. No tensors, so the cache-invalidation tail of
+    /// an accepted rewind has nothing to touch.</summary>
+    private static MuseGlimmerModel RingModel(int cachedTokens, int ringRows = GlimmerRing)
+    {
+        var model = (MuseGlimmerModel)System.Runtime.CompilerServices.RuntimeHelpers
+            .GetUninitializedObject(typeof(MuseGlimmerModel));
+        SetField(typeof(ModelBase), model, "<Config>k__BackingField",
+            new TensorSharp.Runtime.ModelConfig { Architecture = "muse-glimmer", NumLayers = 2 });
+        SetField(typeof(ModelBase), model, "<ExecutionPlan>k__BackingField", new BackendExecutionPlan(BackendType.Cpu));
+        SetField(typeof(ModelBase), model, "_backend", BackendType.Cpu);
+        SetField(typeof(ModelBase), model, "_cacheSeqLen", cachedTokens);
+        SetField(typeof(MuseGlimmerModel), model, "_kvSwaRows", ringRows);
+        SetField(typeof(MuseGlimmerModel), model, "_slidingWindow", GlimmerWindow);
+        return model;
+    }
+
+    private static void SetField(Type owner, object target, string name, object value)
+    {
+        var field = owner.GetField(name,
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Public)
+            ?? throw new MissingFieldException(owner.Name, name);
+        field.SetValue(target, value);
+    }
 }
