@@ -2158,6 +2158,8 @@ namespace TensorSharp.Runtime
         private int _callIndex;
         private readonly bool _promptAlwaysOpensThinking;
         private bool _sawThinkClose;
+        // The unrequested block has shown prose, so it is reasoning: stream it.
+        private bool _unrequestedBlockIsReasoning;
 
         /// <param name="promptAlwaysOpensThinking">The family's generation prompt opens
         /// <c>&lt;think&gt;</c> whatever the request asked for (GLM-5.3-Flash's published
@@ -2179,11 +2181,27 @@ namespace TensorSharp.Runtime
             _thinkingEnabled = enableThinking;
             _callIndex = 0;
             _sawThinkClose = false;
+            _unrequestedBlockIsReasoning = false;
             _state = enableThinking || _promptAlwaysOpensThinking ? State.Thinking : State.Content;
         }
 
-        private bool HoldsUnrequestedThinking
+        private bool InUnrequestedBlock
             => !_thinkingEnabled && _promptAlwaysOpensThinking && !_sawThinkClose;
+
+        /// <summary>Under think:false the always-open block is either the model's
+        /// reasoning (prose, closed by &lt;/think&gt;) or an answer a JSON grammar forced
+        /// from the first token (which can never write &lt;/think&gt;). Only a reply that
+        /// still looks like JSON is held back; prose streams as reasoning at once.</summary>
+        private bool HoldsUnrequestedBlock(string buf)
+        {
+            if (!InUnrequestedBlock || _unrequestedBlockIsReasoning)
+                return false;
+            string trimmed = buf.TrimStart();
+            if (trimmed.Length == 0 || trimmed[0] == '{' || trimmed[0] == '[')
+                return true;
+            _unrequestedBlockIsReasoning = true;
+            return false;
+        }
 
         public ParsedOutput Add(string text, bool done)
         {
@@ -2221,13 +2239,14 @@ namespace TensorSharp.Runtime
                             // A reply that never closed a reasoning block the REQUEST did
                             // not ask for (e.g. a JSON grammar enforced from the first
                             // token) is the answer itself, not reasoning.
-                            if (HoldsUnrequestedThinking)
+                            if (InUnrequestedBlock && !_unrequestedBlockIsReasoning
+                                && (buf.TrimStart().StartsWith('{') || buf.TrimStart().StartsWith('[')))
                                 contentSb.Append(buf);
                             else
                                 thinkingSb.Append(buf);
                             _buffer.Clear();
                         }
-                        else if (HoldsUnrequestedThinking)
+                        else if (HoldsUnrequestedBlock(buf))
                         {
                             // Hold the unrequested block until it closes (or generation
                             // ends): only then is it known to be reasoning rather than a

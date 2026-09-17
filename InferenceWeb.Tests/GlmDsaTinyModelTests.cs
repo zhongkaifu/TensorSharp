@@ -201,6 +201,8 @@ public class GlmDsaTinyModelTests : IDisposable
 
         var streamed = parser.Add("The user wants only the integer.\n\n17 + 25 = 42", done: false);
         Assert.Equal(string.Empty, streamed.Content);
+        // Prose streams as reasoning while it is generated (clients see progress).
+        Assert.StartsWith("The user wants", streamed.Thinking);
         var rest = parser.Add("</think>42", done: true);
         Assert.Equal("42", streamed.Content + rest.Content);
         Assert.DoesNotContain("</think>", streamed.Content + rest.Content);
@@ -214,9 +216,11 @@ public class GlmDsaTinyModelTests : IDisposable
         // reply never writes </think>: it is the answer, not reasoning.
         var parser = OutputParserFactory.Create("glm5next");
         parser.Init(enableThinking: false, tools: null);
-        var parsed = parser.Add("{\"name\": \"Mars\"}", done: true);
-        Assert.Equal("{\"name\": \"Mars\"}", parsed.Content);
-        Assert.True(string.IsNullOrEmpty(parsed.Thinking));
+        var first = parser.Add("{\"name\":", done: false);
+        Assert.True(string.IsNullOrEmpty(first.Content + first.Thinking));
+        var parsed = parser.Add(" \"Mars\"}", done: true);
+        Assert.Equal("{\"name\": \"Mars\"}", first.Content + parsed.Content);
+        Assert.True(string.IsNullOrEmpty(first.Thinking + parsed.Thinking));
     }
 
     [Fact]
