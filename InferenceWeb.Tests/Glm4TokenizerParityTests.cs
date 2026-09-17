@@ -11,7 +11,7 @@ namespace InferenceWeb.Tests;
 /// pre-tokenizer's offsets and <c>ids</c> are <c>encode(add_special_tokens=False)</c>
 /// over numbers, CJK, code, whitespace runs, contractions and supplementary-plane
 /// text. That vocabulary and merge list are identical to the GLM-5.2, GLM-5.3 and
-/// GLM-5.3-Flash GGUFs.
+/// GLM-5.3-Flash GGUFs. Regenerate with eng/tests/glm4-tokenizer-fixture.py.
 /// </summary>
 public class Glm4TokenizerParityTests
 {
