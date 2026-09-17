@@ -34,4 +34,10 @@
 // single-query decode already used the split-key path and is unchanged. The
 // owned aarch64 CPU dot that keeps neighbouring F32 products together measured
 // within 0.76% of ggml's upstream dot (numerical-r3 ARM benchmark).
+//
+// Qwen 3.8 Flash Next (ggml_ops_qwen4exp.cpp, Q4eRowKernels) uses the same
+// bound for the same reason without owned kernels: a CUDA span graph of up to
+// this many tokens builds each row from the kernels its one-token graph would
+// run (float projections on the broadcast axis, experts and attention one row
+// at a time), so a verify block commits exactly what plain decoding would.
 constexpr int64_t TSG_PRECISION_DECODE_COLUMNS = 8;

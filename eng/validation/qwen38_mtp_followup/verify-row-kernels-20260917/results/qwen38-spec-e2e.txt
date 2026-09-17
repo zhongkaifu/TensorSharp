@@ -1,0 +1,58 @@
+# AgentTurnBench --scenarios spec --warmup 1 --measure-passes 3, UD-Q2_K_XL, 3xA40 layer split (GPUs 2,3,5), runs in order rowk-1 batched-1 rowk-2 batched-2
+# columns: request | ttft ms | prefill tok/s | decode tok/s | drafted | accepted | verify
+== rowk-1 (TS_Q4E_TEST_BATCHED_VERIFY=0)
+[agent-turn-bench] measured pass 1/3
+ plain greedy | 1706 | 813 | 48.1 | 0 | 0 | 0 
+ ngram | 1715 | 810 | 68.7 | 146 | 137 | 49 
+ draft head (auto) | 2104 | 660 | 75.3 | 141 | 141 | 47 
+[agent-turn-bench] measured pass 2/3
+ plain greedy | 1675 | 828 | 51.0 | 0 | 0 | 0 
+ ngram | 1760 | 788 | 70.9 | 146 | 137 | 49 
+ draft head (auto) | 1868 | 743 | 82.8 | 141 | 141 | 47 
+[agent-turn-bench] measured pass 3/3
+ plain greedy | 1605 | 865 | 51.3 | 0 | 0 | 0 
+ ngram | 1685 | 824 | 70.1 | 146 | 137 | 49 
+ draft head (auto) | 1888 | 735 | 86.6 | 141 | 141 | 47 
+stream-identical notes: 14, divergence notes: 0
+== batched-1 (TS_Q4E_TEST_BATCHED_VERIFY=1)
+[agent-turn-bench] measured pass 1/3
+ plain greedy | 1700 | 817 | 49.3 | 0 | 0 | 0 
+ ngram | 1616 | 859 | 77.2 | 146 | 137 | 49 
+ draft head (auto) | 1770 | 784 | 88.2 | 141 | 141 | 47 
+[agent-turn-bench] measured pass 2/3
+ plain greedy | 1723 | 805 | 46.6 | 0 | 0 | 0 
+ ngram | 1710 | 812 | 84.5 | 146 | 137 | 49 
+ draft head (auto) | 1763 | 787 | 95.5 | 141 | 141 | 47 
+[agent-turn-bench] measured pass 3/3
+ plain greedy | 1686 | 823 | 45.8 | 0 | 0 | 0 
+ ngram | 1719 | 807 | 73.8 | 146 | 137 | 49 
+ draft head (auto) | 1936 | 717 | 80.9 | 141 | 141 | 47 
+stream-identical notes: 14, divergence notes: 0
+== rowk-2 (TS_Q4E_TEST_BATCHED_VERIFY=0)
+[agent-turn-bench] measured pass 1/3
+ plain greedy | 1730 | 802 | 45.6 | 0 | 0 | 0 
+ ngram | 1667 | 833 | 75.7 | 146 | 137 | 49 
+ draft head (auto) | 1875 | 740 | 85.4 | 141 | 141 | 47 
+[agent-turn-bench] measured pass 2/3
+ plain greedy | 1661 | 835 | 49.5 | 0 | 0 | 0 
+ ngram | 1623 | 855 | 78.9 | 146 | 137 | 49 
+ draft head (auto) | 1739 | 798 | 87.2 | 141 | 141 | 47 
+[agent-turn-bench] measured pass 3/3
+ plain greedy | 1660 | 836 | 49.0 | 0 | 0 | 0 
+ ngram | 1628 | 852 | 78.4 | 146 | 137 | 49 
+ draft head (auto) | 1806 | 769 | 82.1 | 141 | 141 | 47 
+stream-identical notes: 14, divergence notes: 0
+== batched-2 (TS_Q4E_TEST_BATCHED_VERIFY=1)
+[agent-turn-bench] measured pass 1/3
+ plain greedy | 1691 | 821 | 46.0 | 0 | 0 | 0 
+ ngram | 1712 | 811 | 74.5 | 146 | 137 | 49 
+ draft head (auto) | 1873 | 741 | 82.6 | 141 | 141 | 47 
+[agent-turn-bench] measured pass 2/3
+ plain greedy | 1689 | 822 | 48.4 | 0 | 0 | 0 
+ ngram | 1685 | 824 | 84.5 | 146 | 137 | 49 
+ draft head (auto) | 1913 | 725 | 39.2 | 117 | 117 | 39 
+[agent-turn-bench] measured pass 3/3
+ plain greedy | 1886 | 736 | 45.9 | 0 | 0 | 0 
+ ngram | 1693 | 820 | 82.3 | 146 | 137 | 49 
+ draft head (auto) | 1858 | 747 | 85.4 | 141 | 141 | 47 
+stream-identical notes: 14, divergence notes: 0

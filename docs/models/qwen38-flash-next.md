@@ -116,8 +116,9 @@ concurrent requests x three waves of a 2,928-token prompt that every request
 prefills in one chunk (`TS_SCHED_PREFILL_CHUNK=4096`,
 `TS_SCHED_MAX_BATCHED_TOKENS=16384`) came back byte-identical to solo, 12/12
 over 512 tokens, so no state leaks between the per-sequence holders and the
-round-robin decode does not depend on concurrency. The strict chunked-versus-whole
-logit gate is the open item recorded in
+round-robin decode does not depend on concurrency. Prefill shape is not promised
+to be width-invariant on CUDA, so the fixture's chunked-versus-whole gate bounds
+that difference instead of requiring bit equality; see
 [Retained-prefix reuse](#retained-prefix-reuse).
 
 ## Retained-prefix reuse
@@ -152,16 +153,19 @@ Evidence (synthetic fixtures, not trained-model acceptance or performance):
 [`eng/validation/qwen38_mtp_followup/retained-cache-20260916`](../../eng/validation/qwen38_mtp_followup/retained-cache-20260916/README.md)
 — `Qwen4ExpRetainedCacheTests` / `Qwen4ExpRetainedCachePolicyTests` cover
 retained A/B/A, checkpoint clones, speculative rebound, budget eviction,
-missing-state refusal and QSA first/reset growth on CPU, and a physical
-two-GPU layer-split checkpoint lifecycle on CUDA. Three strict bit-exactness
-gates pass on CPU and remain failed on single-GPU CUDA, all with the same
-greedy argmax on this untrained fixture: chunked 16+4 versus whole 20-token
-prefill differs in full logits (`SharedPrefixChunking_…`); a four-token target
-verify differs from four scalar forwards (`TeacherForcedTargetVerify_…`, max
-abs 0.0070); and 32 teacher-forced tokens committed in blocks of 2-4 differ
-from scalar decode (`RepeatedTargetBlocks_…`, max abs 0.0082). The CUDA target
-graph's reductions depend on the batch width; the isolated precision
-prototypes in the evidence README close some of these but are not integrated.
+missing-state refusal and QSA first/reset growth, and a physical two-GPU
+layer-split checkpoint lifecycle on CUDA. Every gate is bit-exact on CPU. On
+single-GPU CUDA a four-token target verify equals four one-token forwards
+(`TeacherForcedTargetVerify_…`) and 32 teacher-forced tokens committed in blocks
+of 2-4 equal scalar decode at every row (`RepeatedTargetBlocks_…`), bit for bit —
+see [Verify rows run the one-token kernels](#verify-rows-run-the-one-token-kernels).
+A 16-token prefill continued by 4 tokens is not bit-identical to one 20-token
+prefill on CUDA, because prefill kernels are chosen by batch width:
+`SharedPrefixChunking_…` bounds that difference at 1e-2 on CUDA (measured
+1.7e-4 to 4.4e-4 in logits; the stale-seed defect it was written for moved them
+by 0.3155) and allows a greedy change only at a near-tie within twice the
+measured difference
+([`verify-row-kernels-20260917`](../../eng/validation/qwen38_mtp_followup/verify-row-kernels-20260917/README.md)).
 
 ## Speculative decoding with the shared MTP head
 
@@ -174,10 +178,10 @@ three-GPU layer split (A40), `--spec-draft 3`:
 
 - **Parity.** A 192-token code-copy stream is identical to plain greedy at
   1.75-1.96x (141/141 drafts accepted, no rollbacks); the speculative prefill
-  (`SpecForward`) is bit-identical to the plain one for the same chunking. The
-  4-row verify kernel does flip near-ties against the 1-row decode kernel, which
-  shows up as a fenced ```` ```json ```` answer where plain greedy wrote a bare
-  object, or pretty-printed versus compact JSON.
+  (`SpecForward`) is bit-identical to the plain one for the same chunking. Before
+  2026-09-17 a 4-row verify did not round like a 1-row decode step and could turn
+  a plain-greedy bare JSON object into a fenced ```` ```json ```` answer; verify
+  rows now run the one-token kernels (below).
 - **Prose does not pay.** Over 18 prose requests acceptance was 68-70% (3.0
   tokens per verify), but a verify costs ~45 ms, a partial acceptance adds a
   ~43-46 ms rollback (restore the recurrent state, re-forward the kept rows), and
@@ -185,6 +189,44 @@ three-GPU layer split (A40), `--spec-draft 3`:
   capture (~24-26 ms against a 19 ms plain decode): decode at c1 was 44-46 tok/s
   against 52 plain for 512-token prose, and 34-38 against 40 after an 8k
   prompt.
+
+### Verify rows run the one-token kernels
+
+A verify and the replay of its accepted prefix push 2-8 tokens through one span
+graph (as does any prefill that short), and on CUDA ggml picks several kernels by
+batch width. At those widths a row does not round the way its one-token decode step does:
+F32 projections leave `mul_mat_vec_f` after 3 columns for a tensor-core / cuBLAS
+TF32 path (router logits move by 2.6e-3), the BF16 QSA indexer projections take a
+half-precision path from 2 columns (5.9e-3), routed experts switch to the
+multi-token MoE kernel (4.8e-7) and flash attention to a multi-query launch
+(2.9e-5). Through 48 layers of MoE and QSA routing that is not last-bit noise: on
+UD-Q2_K_XL over three A40s, teacher-forcing the first 48 greedy tokens after a
+3,248-token prompt, every 2-, 3- and 4-row verify row differed from its decode step,
+by up to 2.5 in logits, and 4-6 of the 48 rows changed the greedy token — not only
+at near-ties.
+
+So on CUDA a span graph of 2-8 tokens builds each row from the kernels its
+one-token graph runs: float projections put the tokens on the broadcast axis (one
+`mul_mat_vec_f` launch), quantized projections run in blocks of at most 4 rows
+(MMVQ's shared reduction group), and routed experts and attention are expanded one
+row at a time, each attention row over exactly the KV window and mask row its
+decode step reads. Graphs of up to 8 tokens, decode included, also keep the inputs
+of two ggml-cuda fusions whose use depends on memory reuse (MoE weighted reduction;
+RMS norm + RoPE) allocated, so those fusions happen at every width. One-token and
+prefill kernels are unchanged.
+
+Measured on the same setup, three interleaved repetitions: every verify row at
+widths 2, 3 and 4 is now bit-identical to its decode step (0 of 48 rows differ, no
+greedy flips). A 4-row verify costs 32.4-33.1 ms instead of 29.3-29.6 ms (+11%),
+3 rows 28.3-29.9 against 26.8-27.2 (+8%), 2 rows 24.5-24.8 against 24.1-24.3 (+2%);
+decode steps (20.6-20.7 ms against 20.6-21.1) and the 3,248-token prefill
+(2,335-2,338 ms against 2,324-2,359) are unchanged. End to end on the 192-token
+code-copy stream (six passes per kernel set, all streams identical to plain greedy),
+MTP speculation ran at 83.2 tok/s instead of 86.5 (1.69x plain instead of 1.84x) and
+n-gram speculation at 73.8 instead of 79.5, while plain decode (49.1 against 47.0) and
+prefill (830 against 804 tok/s) did not regress: speculation pays for its exactness.
+Evidence and the per-assertion diagnosis:
+[`verify-row-kernels-20260917`](../../eng/validation/qwen38_mtp_followup/verify-row-kernels-20260917/README.md).
 
 ## Multi-GPU
 

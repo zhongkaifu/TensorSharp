@@ -12,12 +12,16 @@
 #include "ggml_ops_qwen4exp_qsa.h"
 #include "ggml_ops_matmul_precision.h"
 #include "ggml_ops_dsv4_fused.h"
+#include "ggml_ops_precision_policy.h"
 #ifdef TSG_GGML_USE_CUDA
 #include "ggml-cuda.h"
 #endif
 #include <cstdlib>
 #include <cstdio>
 
+#include <algorithm>
+#include <array>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <cstdint>
@@ -26,6 +30,159 @@
 #include <unordered_map>
 
 using namespace tsg;
+
+namespace
+{
+    // ------------------------------------------------------------------------
+    // Verify-width rows run the one-token kernels (CUDA).
+    //
+    // A speculative verify and the replay of its accepted prefix forward
+    // 2..TSG_PRECISION_DECODE_COLUMNS tokens through one span graph (so does a
+    // prefill that short), and every row that graph commits - logits, attention
+    // K/V, QSA keys, GDN and PLE state - must equal what the same tokens leave
+    // behind decoded one at a time. Otherwise a speculative stream is only plain
+    // greedy up to floating-point differences, and a committed block is not the
+    // state a plain decode would have continued from.
+    //
+    // ggml-cuda picks kernels by batch width, and at these widths several picks
+    // are not row-invariant. Measured on an A40 against one-row graphs with
+    // tests/qwen4exp_row_kernel_probe.cpp (max |difference| at 4 rows):
+    //   * F32 projections: mul_mat_vec_f up to 3 columns, then the tensor-core
+    //     mul_mat_f or cuBLAS (TF32) path - router logits move by 2.6e-3;
+    //   * F16 / BF16 projections: mul_mat_vec_f at 1 column, a half-precision
+    //     path from 2 - 1.1e-3 / 5.9e-3 (BF16 is the QSA indexer projection);
+    //   * routed experts: the single-token MMVQ kernel at 1 row, the multi-token
+    //     MoE kernel from 2 - 4.8e-7;
+    //   * flash attention: one query against several - 2.9e-5.
+    // Quantized dense projections (MMVQ) size their reduction by column count in
+    // groups (1-4 and 5-8 columns on the A40 table) and match a single column
+    // within the first group; GDN, SSM conv, norms, softmax, top-k and the
+    // elementwise kernels are computed per row. The fixture's non-flash attention
+    // additionally narrows V x probabilities to F16 in cuBLAS from 2 rows.
+    // Through 48 layers of MoE and QSA routing this is not last-bit noise: on
+    // Qwen3.8-Flash-Next UD-Q2_K_XL every 2-4 row verify row differed from its
+    // decode step by up to 2.5 in logits and 4-6 of 48 rows flipped the greedy
+    // token.
+    //
+    // So while such a graph is built (g_q4e_row_kernels.rows != 0):
+    //   * float projections with an even input width move the tokens onto the
+    //     broadcast (channel) axis: one mul_mat_vec_f launch whose every channel
+    //     is a one-column reduction (an odd width is not a mul_mat_vec_f case, so
+    //     its rows go to cuBLAS one at a time, as the one-token graph's do);
+    //   * the qualified A40 quantized projections run in blocks of at most four
+    //     rows; other devices/types use one-column reductions on the broadcast axis;
+    //   * routed experts and attention are expanded one row at a time, each
+    //     attention row over exactly the KV window and mask row its one-token
+    //     graph reads (the windows join the replay key).
+    // One-token (decode) and wider (prefill) graphs keep their kernels. Measured
+    // on the model above over three A40s: every verify row bit-identical at 2-4
+    // rows; a 4-row verify 29.4 -> 32.7 ms; decode steps and prefill unchanged.
+    //
+    // Allocation-dependent fusions. ggml-cuda fuses the MoE weighted reduction
+    // and RMS norm * weight -> RoPE only if the fused destination does not
+    // overlap an input's memory, and whether it does depends on which freed
+    // blocks the allocator reused - on the graph's width. The fused and the
+    // separate kernels differ in the last bits (FMA), so a one-token and a
+    // four-token graph could round the same row differently. Graphs of up to
+    // TSG_PRECISION_DECODE_COLUMNS tokens therefore keep those inputs allocated
+    // (graph outputs), which makes both fusions unconditional there.
+    // ------------------------------------------------------------------------
+    struct Q4eRowKernels
+    {
+        int rows = 0;                     // tokens of the verify-width graph being built; 0 = off
+        int n_kv = 0;                     // live KV rows once that graph has written its tokens
+        bool keep_fusion_inputs = false;  // graph of at most TSG_PRECISION_DECODE_COLUMNS tokens
+    };
+    thread_local Q4eRowKernels g_q4e_row_kernels;
+
+    // MMVQ's single-column reduction is architecture- and type-dependent. Turing
+    // K-quants use two warps at width 1 and four at widths 2..4; GB10 can double
+    // the width-1 reduction. Only the measured A40 types may share a four-row
+    // group. Everything else keeps ncols_dst=1 via the broadcast axis.
+    bool q4e_qualified_mmvq_group(ggml_type type)
+    {
+#ifdef TSG_GGML_USE_CUDA
+#ifdef TSG_GGML_TEST_HOOKS
+        static const bool force_channels = [] {
+            const char* e = std::getenv("TS_Q4E_TEST_MMVQ_CHANNELS");
+            return e != nullptr && e[0] == '1';
+        }();
+        if (force_channels) return false;
+#endif
+        const char* device = ggml_backend_dev_description(ggml_backend_get_device(g_backend));
+        if (device == nullptr || std::strcmp(device, "NVIDIA A40") != 0) return false;
+        return type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K
+            || type == GGML_TYPE_Q6_K || type == GGML_TYPE_Q8_0;
+#else
+        (void)type;
+        return false;
+#endif
+    }
+
+    bool q4e_float_type(ggml_type type)
+    {
+        return type == GGML_TYPE_F32 || type == GGML_TYPE_F16 || type == GGML_TYPE_BF16;
+    }
+
+    // Keep a fusion input's memory from being reused inside its graph.
+    void q4e_keep_fusion_input(ggml_tensor* t)
+    {
+        if (!g_q4e_row_kernels.keep_fusion_inputs || t == nullptr) return;
+        while (t->view_src != nullptr) t = t->view_src;
+        if (t->op != GGML_OP_NONE) ggml_set_output(t);
+    }
+
+    ggml_tensor* q4e_mul_mat(ggml_context* ctx, ggml_tensor* w, ggml_tensor* x)
+    {
+        const int rows = g_q4e_row_kernels.rows;
+        if (rows < 2 || x->ne[1] != rows || x->ne[2] != 1 || x->ne[3] != 1)
+            return ggml_mul_mat(ctx, w, x);
+        if (!ggml_is_contiguous(x)) x = ggml_cont(ctx, x);
+        const bool grouped_quant = ggml_is_quantized(w->type) && q4e_qualified_mmvq_group(w->type);
+        if ((q4e_float_type(w->type) && w->ne[0] % 2 == 0)
+            || (ggml_is_quantized(w->type) && !grouped_quant))
+        {
+            // Both MMVF and MMVQ take one column at any channel count.
+            ggml_tensor* y = ggml_mul_mat(ctx, w, ggml_reshape_3d(ctx, x, x->ne[0], 1, rows));
+            return ggml_reshape_2d(ctx, y, y->ne[0], rows);
+        }
+        // An odd-width float matrix is not a mul_mat_vec_f case: its one-token
+        // graph calls cuBLAS with one column, which a batched call does not
+        // reproduce. Qualified quantized projections share MMVQ's reduction group.
+        const int group = grouped_quant ? 4 : 1;
+        if (rows <= group) return ggml_mul_mat(ctx, w, x);
+        ggml_tensor* out = nullptr;
+        for (int start = 0; start < rows; start += group)
+        {
+            const int count = std::min(group, rows - start);
+            ggml_tensor* part = ggml_view_2d(ctx, x, x->ne[0], count, x->nb[1], (std::size_t)start * x->nb[1]);
+            // A cuBLAS row gets its own buffer, as the one-token graph's input has.
+            if (group == 1) part = ggml_cont(ctx, part);
+            part = ggml_mul_mat(ctx, w, part);
+            out = out ? ggml_concat(ctx, out, part, 1) : part;
+        }
+        return out;
+    }
+
+    ggml_tensor* q4e_mul_mat_id(ggml_context* ctx, ggml_tensor* w, ggml_tensor* x, ggml_tensor* ids)
+    {
+        const int rows = g_q4e_row_kernels.rows;
+        if (rows < 2 || x->ne[2] != rows || x->ne[3] != 1 || ids->ne[1] != rows)
+            return ggml_mul_mat_id(ctx, w, x, ids);
+        ggml_tensor* out = nullptr;
+        for (int r = 0; r < rows; ++r)
+        {
+            ggml_tensor* xr = ggml_view_3d(ctx, x, x->ne[0], x->ne[1], 1, x->nb[1], x->nb[2],
+                    (std::size_t)r * x->nb[2]);
+            if (!ggml_is_contiguous(xr)) xr = ggml_cont(ctx, xr);
+            ggml_tensor* ir = ggml_view_2d(ctx, ids, ids->ne[0], 1, ids->nb[1], (std::size_t)r * ids->nb[1]);
+            ggml_tensor* y = ggml_mul_mat_id(ctx, w, xr, ir);
+            out = out ? ggml_concat(ctx, out, y, 2) : y;
+        }
+        return out;
+    }
+}
+
 #include "ggml_ops_qwen4exp_qsa.inc"
 
 // ============================================================================
@@ -129,6 +286,13 @@ namespace
         ggml_tensor* pos = nullptr;
         ggml_tensor* kv_idx = nullptr;
         int n_kv = -1;
+        // Span only: the attention window of every row of a verify-width graph
+        // (see Q4eRowKernels); empty (count 0) for any other graph. Two graphs with
+        // the same padded window can still split their rows across a pad
+        // boundary at different rows, so all of them are part of the key.
+        std::array<int, TSG_PRECISION_DECODE_COLUMNS> row_kv{};
+        int row_kv_count = 0;
+        bool row_scope = false;
 
         // Drop the graph but KEEP the recurrent state: a shape change does this.
         void reset_graph()
@@ -144,7 +308,7 @@ namespace
             logits = nullptr; logits_rows = 1; export_hidden = false; ple_emb_in = nullptr;
             layer_begin = -1; layer_end = -1; kv_capacity = -1; first_ffn_only = 0;
             use_mrope = 0;
-            mask = nullptr; pos = nullptr; kv_idx = nullptr; n_kv = -1;
+            mask = nullptr; pos = nullptr; kv_idx = nullptr; n_kv = -1; row_kv_count = 0; row_scope = false;
             span_copies.clear(); rebinds.clear(); gdn_probe.clear();
             span_masks.clear(); span_pos.clear(); span_kvidx.clear();
         }
@@ -287,6 +451,35 @@ namespace
     // TS_Q4E_SPAN_REBUILD=1 disables the span replay path entirely - every call
     // rebuilds the graph. Diagnosis only: separates a wrong-graph bug from a
     // wrong-replay one.
+    // Q4eRowKernels applies to CUDA span graphs. A test-hook build can turn it off
+    // - TS_Q4E_TEST_BATCHED_VERIFY=1 at start-up, or TSGgml_Qwen4ExpTestBatchedVerify
+    // at run time - to measure the batched kernels it replaces in one process.
+#ifdef TSG_GGML_TEST_HOOKS
+    std::atomic<int> g_q4e_test_batched_verify{-1};
+#endif
+
+    bool q4e_row_kernels_enabled()
+    {
+#ifdef TSG_GGML_USE_CUDA
+        if (!ggml_backend_is_cuda(g_backend)) return false;
+#ifdef TSG_GGML_TEST_HOOKS
+        int batched = g_q4e_test_batched_verify.load(std::memory_order_relaxed);
+        if (batched < 0)
+        {
+            static const bool from_environment = []{
+                const char* e = std::getenv("TS_Q4E_TEST_BATCHED_VERIFY");
+                return e != nullptr && e[0] == '1';
+            }();
+            batched = from_environment ? 1 : 0;
+        }
+        if (batched) return false;
+#endif
+        return true;
+#else
+        return false;
+#endif
+    }
+
     bool q4e_span_force_rebuild()
     {
         static const bool v = []{
@@ -400,6 +593,83 @@ namespace
         }
         fprintf(stderr, "%c", 10);
     }
+
+#ifdef TSG_GGML_TEST_HOOKS
+    // TS_Q4E_NODE_DUMP=<dir> (test-hook builds only): every span graph is
+    // rebuilt, every node is flagged OUTPUT, and after the compute each node's
+    // value is written to <dir>/<call>_T<T>_p<position>_r<logits rows>_kv<n_kv>.bin
+    // together with its op, shape and source node indices, so an offline diff
+    // can name the first node whose inputs agree and whose output does not.
+    // Diagnosis only: OUTPUT flags change what ggml-cuda may fuse, so the dump
+    // describes the unfused kernels.
+    const char* q4e_node_dump_dir()
+    {
+        static const char* v = []() -> const char* {
+            const char* e = std::getenv("TS_Q4E_NODE_DUMP");
+            return (e != nullptr && *e != 0) ? e : nullptr;
+        }();
+        return v;
+    }
+
+    void q4e_node_dump(ggml_cgraph* graph, int T, int position, int logits_rows, int n_kv)
+    {
+        static int call = 0;
+        char path[1024];
+        snprintf(path, sizeof(path), "%s/%05d_T%d_p%d_r%d_kv%d.bin", q4e_node_dump_dir(), call++, T, position,
+                 logits_rows, n_kv);
+        FILE* file = fopen(path, "wb");
+        if (file == nullptr) return;
+        const int n = ggml_graph_n_nodes(graph);
+        std::unordered_map<const ggml_tensor*, int> index;
+        for (int i = 0; i < n; ++i) index[ggml_graph_node(graph, i)] = i;
+        std::vector<float> values;
+        std::vector<char> raw;
+        for (int i = 0; i < n; ++i)
+        {
+            ggml_tensor* t = ggml_graph_node(graph, i);
+            int32_t header[4] = { 0x444e3451, i, (int32_t)t->op, (int32_t)t->type };
+            int64_t ne[4] = { t->ne[0], t->ne[1], t->ne[2], t->ne[3] };
+            int32_t src[GGML_MAX_SRC];
+            for (int s = 0; s < GGML_MAX_SRC; ++s)
+            {
+                auto it = t->src[s] ? index.find(t->src[s]) : index.end();
+                src[s] = t->src[s] == nullptr ? -2 : (it == index.end() ? -1 : it->second);
+            }
+            char name[64] = {};
+            snprintf(name, sizeof(name), "%s", t->name);
+            values.clear();
+            const bool readable = t->buffer != nullptr && ggml_is_contiguous(t)
+                && t->op != GGML_OP_VIEW && t->op != GGML_OP_RESHAPE && t->op != GGML_OP_PERMUTE
+                && t->op != GGML_OP_TRANSPOSE && t->op != GGML_OP_NONE;
+            if (readable && (t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_F16
+                             || t->type == GGML_TYPE_I32 || t->type == GGML_TYPE_I64))
+            {
+                const int64_t count = ggml_nelements(t);
+                raw.resize(ggml_nbytes(t));
+                ggml_backend_tensor_get(t, raw.data(), 0, raw.size());
+                values.resize((std::size_t)count);
+                for (int64_t k = 0; k < count; ++k)
+                {
+                    switch (t->type)
+                    {
+                        case GGML_TYPE_F32: std::memcpy(&values[k], raw.data() + k * 4, 4); break;
+                        case GGML_TYPE_F16: { ggml_fp16_t h; std::memcpy(&h, raw.data() + k * 2, 2); values[k] = ggml_fp16_to_fp32(h); } break;
+                        case GGML_TYPE_I32: { int32_t v; std::memcpy(&v, raw.data() + k * 4, 4); values[k] = (float)v; } break;
+                        default: { int64_t v; std::memcpy(&v, raw.data() + k * 8, 8); values[k] = (float)v; } break;
+                    }
+                }
+            }
+            const int64_t count = (int64_t)values.size();
+            fwrite(header, sizeof(header), 1, file);
+            fwrite(ne, sizeof(ne), 1, file);
+            fwrite(src, sizeof(src), 1, file);
+            fwrite(name, sizeof(name), 1, file);
+            fwrite(&count, sizeof(count), 1, file);
+            if (count) fwrite(values.data(), sizeof(float), values.size(), file);
+        }
+        fclose(file);
+    }
+#endif
 
     int q4e_pad_kv(int n_kv, int kv_capacity, bool use_flash)
     {
@@ -672,9 +942,9 @@ ggml_tensor* q4e_nodes_ffn(
     xn = ggml_reshape_2d(ctx, xn, hc_dim, T);
     xn = ggml_mul(ctx, xn, w_norm);
 
-    ggml_tensor* lo = ggml_mul_mat(ctx, w_down, xn);
+    ggml_tensor* lo = q4e_mul_mat(ctx, w_down, xn);
     lo = ggml_silu(ctx, ggml_scale(ctx, lo, 1.0f / (float)hc));
-    ggml_tensor* gate = ggml_sigmoid(ctx, ggml_mul_mat(ctx, w_up, lo));
+    ggml_tensor* gate = ggml_sigmoid(ctx, q4e_mul_mat(ctx, w_up, lo));
 
     ggml_tensor* gated = ggml_mul(ctx, xn, gate);
     gated = ggml_reshape_3d(ctx, gated, n_embd, hc, T);
@@ -691,12 +961,12 @@ ggml_tensor* q4e_nodes_ffn(
     }
     mixed = ggml_scale(ctx, mixed, 1.0f / (float)hc);
 
-    ggml_tensor* inject = ggml_mul_mat(ctx, w_inject, xn);   // [hc, T]
+    ggml_tensor* inject = q4e_mul_mat(ctx, w_inject, xn);   // [hc, T]
 
     // ---- routed experts ---------------------------------------------------
     // Softmax over every expert, top-k, then renormalise the selected
     // weights - llama.cpp's build_moe_ffn with norm_w.
-    ggml_tensor* logits = ggml_mul_mat(ctx, w_router, mixed);      // [n_expert, T]
+    ggml_tensor* logits = q4e_mul_mat(ctx, w_router, mixed);      // [n_expert, T]
     ggml_tensor* probs = ggml_soft_max(ctx, logits);
     // ggml_argsort_top_k, not ggml_top_k: this is the exact node shape llama.cpp's
     // build_moe_ffn emits, and ggml-cuda's topk_moe fusion matches on the node
@@ -708,13 +978,15 @@ ggml_tensor* q4e_nodes_ffn(
     w_sel = ggml_reshape_2d(ctx, w_sel, n_expert_used, T);
     ggml_tensor* w_sum = ggml_sum_rows(ctx, w_sel);                // [1, T]
     w_sel = ggml_div(ctx, w_sel, w_sum);
+    q4e_keep_fusion_input(w_sel);
     w_sel = ggml_reshape_3d(ctx, w_sel, 1, n_expert_used, T);
 
     ggml_tensor* moe_in = ggml_reshape_3d(ctx, mixed, n_embd, 1, T);
-    ggml_tensor* e_up = ggml_mul_mat_id(ctx, w_up_e, moe_in, sel);      // [n_ff, n_used, T]
-    ggml_tensor* e_gate = ggml_mul_mat_id(ctx, w_gate_e, moe_in, sel);
+    ggml_tensor* e_up = q4e_mul_mat_id(ctx, w_up_e, moe_in, sel);      // [n_ff, n_used, T]
+    ggml_tensor* e_gate = q4e_mul_mat_id(ctx, w_gate_e, moe_in, sel);
     ggml_tensor* par = ggml_mul(ctx, ggml_silu(ctx, e_gate), e_up);
-    ggml_tensor* experts = ggml_mul_mat_id(ctx, w_down_e, par, sel);    // [n_embd, n_used, T]
+    ggml_tensor* experts = q4e_mul_mat_id(ctx, w_down_e, par, sel);    // [n_embd, n_used, T]
+    q4e_keep_fusion_input(experts);   // weighted-reduction fusion inputs: see Q4eRowKernels
     experts = ggml_mul(ctx, experts, w_sel);
 
     ggml_tensor* moe_out = ggml_view_2d(ctx, experts, n_embd, T,
@@ -727,10 +999,10 @@ ggml_tensor* q4e_nodes_ffn(
     }
 
     // ---- shared expert, behind its own sigmoid scalar ---------------------
-    ggml_tensor* sg = ggml_mul_mat(ctx, w_sh_g, mixed);
-    ggml_tensor* su = ggml_mul_mat(ctx, w_sh_u, mixed);
-    ggml_tensor* sh = ggml_mul_mat(ctx, w_sh_d, ggml_mul(ctx, ggml_silu(ctx, sg), su));
-    ggml_tensor* s_gate = ggml_sigmoid(ctx, ggml_mul_mat(ctx, w_sh_gi, mixed)); // [1, T]
+    ggml_tensor* sg = q4e_mul_mat(ctx, w_sh_g, mixed);
+    ggml_tensor* su = q4e_mul_mat(ctx, w_sh_u, mixed);
+    ggml_tensor* sh = q4e_mul_mat(ctx, w_sh_d, ggml_mul(ctx, ggml_silu(ctx, sg), su));
+    ggml_tensor* s_gate = ggml_sigmoid(ctx, q4e_mul_mat(ctx, w_sh_gi, mixed)); // [1, T]
     ggml_tensor* ffn_out = ggml_add(ctx, moe_out, ggml_mul(ctx, sh, s_gate));
 
     // ---- hyper-connection scatter ----------------------------------------
@@ -806,8 +1078,8 @@ ggml_tensor* q4e_nodes_gdn(
     xn = ggml_reshape_2d(ctx, xn, hc_dim, T);
     xn = ggml_mul(ctx, xn, w_norm);
 
-    ggml_tensor* lo = ggml_silu(ctx, ggml_scale(ctx, ggml_mul_mat(ctx, w_down, xn), 1.0f / (float)hc));
-    ggml_tensor* gt = ggml_sigmoid(ctx, ggml_mul_mat(ctx, w_up, lo));
+    ggml_tensor* lo = ggml_silu(ctx, ggml_scale(ctx, q4e_mul_mat(ctx, w_down, xn), 1.0f / (float)hc));
+    ggml_tensor* gt = ggml_sigmoid(ctx, q4e_mul_mat(ctx, w_up, lo));
     ggml_tensor* gated = ggml_reshape_3d(ctx, ggml_mul(ctx, xn, gt), n_embd, hc, T);
 
     ggml_tensor* mixed = ggml_cont(ctx, ggml_view_2d(ctx, gated, n_embd, T,
@@ -819,13 +1091,13 @@ ggml_tensor* q4e_nodes_gdn(
                 ggml_row_size(gated->type, n_embd) * c));
     }
     mixed = ggml_scale(ctx, mixed, 1.0f / (float)hc);
-    ggml_tensor* inject = ggml_mul_mat(ctx, w_inject, xn);
+    ggml_tensor* inject = q4e_mul_mat(ctx, w_inject, xn);
 
     // ---- projections ----
-    ggml_tensor* qkv = ggml_mul_mat(ctx, w_qkv, mixed);        // [conv_dim, T]
-    ggml_tensor* z = ggml_mul_mat(ctx, w_gate, mixed);         // [value_dim, T]
-    ggml_tensor* beta_raw = ggml_mul_mat(ctx, w_beta, mixed);  // [n_v_heads, T]
-    ggml_tensor* alpha_raw = ggml_mul_mat(ctx, w_alpha, mixed);
+    ggml_tensor* qkv = q4e_mul_mat(ctx, w_qkv, mixed);        // [conv_dim, T]
+    ggml_tensor* z = q4e_mul_mat(ctx, w_gate, mixed);         // [value_dim, T]
+    ggml_tensor* beta_raw = q4e_mul_mat(ctx, w_beta, mixed);  // [n_v_heads, T]
+    ggml_tensor* alpha_raw = q4e_mul_mat(ctx, w_alpha, mixed);
 
     // ---- causal depthwise conv over the ring history ----
     // conv_state is [hist, conv_dim]; qkv transposed is [T, conv_dim].
@@ -888,7 +1160,7 @@ ggml_tensor* q4e_nodes_gdn(
     ggml_tensor* normed = ggml_mul(ctx, ggml_rms_norm(ctx, ggml_cont(ctx, core), eps), w_ssmnorm);
     ggml_tensor* zg = ggml_sigmoid(ctx, ggml_reshape_3d(ctx, z, head_v_dim, n_v_heads, T));
     ggml_tensor* out2 = ggml_reshape_2d(ctx, ggml_mul(ctx, normed, zg), value_dim, T);
-    ggml_tensor* proj = ggml_mul_mat(ctx, w_out, out2);        // [n_embd, T]
+    ggml_tensor* proj = q4e_mul_mat(ctx, w_out, out2);        // [n_embd, T]
 
     // ---- hyper-connection scatter ----
     ggml_tensor* wsc = ggml_reshape_3d(ctx, ggml_scale(ctx,
@@ -974,8 +1246,8 @@ ggml_tensor* q4e_nodes_attn(
     ggml_tensor* res3 = ggml_reshape_3d(ctx, res_in, n_embd, hc, T);
     ggml_tensor* xn = ggml_mul(ctx,
             ggml_reshape_2d(ctx, ggml_rms_norm(ctx, res3, eps), hc_dim, T), w_norm);
-    ggml_tensor* lo = ggml_silu(ctx, ggml_scale(ctx, ggml_mul_mat(ctx, w_down, xn), 1.0f / (float)hc));
-    ggml_tensor* gt = ggml_sigmoid(ctx, ggml_mul_mat(ctx, w_up, lo));
+    ggml_tensor* lo = ggml_silu(ctx, ggml_scale(ctx, q4e_mul_mat(ctx, w_down, xn), 1.0f / (float)hc));
+    ggml_tensor* gt = ggml_sigmoid(ctx, q4e_mul_mat(ctx, w_up, lo));
     ggml_tensor* gated = ggml_reshape_3d(ctx, ggml_mul(ctx, xn, gt), n_embd, hc, T);
     ggml_tensor* mixed = ggml_cont(ctx, ggml_view_2d(ctx, gated, n_embd, T,
             ggml_row_size(gated->type, n_embd) * hc, 0));
@@ -983,24 +1255,28 @@ ggml_tensor* q4e_nodes_attn(
         mixed = ggml_add(ctx, mixed, ggml_view_2d(ctx, gated, n_embd, T,
                 ggml_row_size(gated->type, n_embd) * hc, ggml_row_size(gated->type, n_embd) * c));
     mixed = ggml_scale(ctx, mixed, 1.0f / (float)hc);
-    ggml_tensor* inject = ggml_mul_mat(ctx, w_inject, xn);
+    ggml_tensor* inject = q4e_mul_mat(ctx, w_inject, xn);
 
     if (qsa != nullptr)
         mask = q4e_nodes_qsa_mask(ctx, graph, bnd, *qsa, mixed, mask, kv_idx,
             n_embd, T, n_kv_pad, n_rot, rope_base, rope_freq_scale, eps);
 
     // ---- q | gate, interleaved per head ----
-    ggml_tensor* qg = ggml_mul_mat(ctx, wq, mixed);                 // [q_dim*2, T]
+    ggml_tensor* qg = q4e_mul_mat(ctx, wq, mixed);                 // [q_dim*2, T]
     const std::size_t esz = ggml_element_size(qg);
     ggml_tensor* q = ggml_view_3d(ctx, qg, head_dim, n_head, T,
             esz * head_dim * 2, esz * head_dim * 2 * n_head, 0);
     ggml_tensor* gate = ggml_cont(ctx, ggml_view_3d(ctx, qg, head_dim, n_head, T,
             esz * head_dim * 2, esz * head_dim * 2 * n_head, esz * head_dim));
 
-    q = ggml_mul(ctx, ggml_rms_norm(ctx, ggml_cont(ctx, q), eps), q_norm_w);
-    ggml_tensor* k = ggml_reshape_3d(ctx, ggml_mul_mat(ctx, wk, mixed), head_dim, n_head_kv, T);
+    // RMS norm * weight -> RoPE fusion inputs: see Q4eRowKernels.
+    q = ggml_cont(ctx, q);
+    q4e_keep_fusion_input(q);
+    q = ggml_mul(ctx, ggml_rms_norm(ctx, q, eps), q_norm_w);
+    ggml_tensor* k = ggml_reshape_3d(ctx, q4e_mul_mat(ctx, wk, mixed), head_dim, n_head_kv, T);
+    q4e_keep_fusion_input(k);
     k = ggml_mul(ctx, ggml_rms_norm(ctx, k, eps), k_norm_w);
-    ggml_tensor* v = ggml_reshape_3d(ctx, ggml_mul_mat(ctx, wv, mixed), head_dim, n_head_kv, T);
+    ggml_tensor* v = ggml_reshape_3d(ctx, q4e_mul_mat(ctx, wv, mixed), head_dim, n_head_kv, T);
 
     // Partial rotary over the first n_rot dims. IMRoPE reduces to NEOX when every
     // position component is equal, which it is for text - so text graphs keep the
@@ -1067,7 +1343,37 @@ ggml_tensor* q4e_nodes_attn(
 
     // ---- attention ----
     ggml_tensor* q_attn = ggml_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3));  // [hd, T, nH]
-    if (use_flash)
+    if (g_q4e_row_kernels.rows == T && T > 1)
+    {
+        // Verify-width graph: row r attends exactly what a one-token graph at its
+        // position reads - its own padded key window and its own mask row - with
+        // the same kernel, a single query.
+        for (int r = 0; r < T; ++r)
+        {
+            const int nk = q4e_pad_kv(g_q4e_row_kernels.n_kv - T + r + 1, kv_capacity, use_flash);
+            ggml_tensor* kr = ggml_view_3d(ctx, k_cache, head_dim, nk, n_head_kv, k_cache->nb[1], k_cache->nb[2], 0);
+            ggml_tensor* vr = ggml_view_3d(ctx, v_cache, head_dim, nk, n_head_kv, v_cache->nb[1], v_cache->nb[2], 0);
+            ggml_tensor* mr = ggml_cont(ctx, ggml_view_2d(ctx, mask, nk, 1, mask->nb[1], (std::size_t)r * mask->nb[1]));
+            ggml_tensor* qr = ggml_cont(ctx, ggml_view_3d(ctx, q_attn, head_dim, 1, n_head,
+                    q_attn->nb[1], q_attn->nb[2], (std::size_t)r * q_attn->nb[1]));
+            ggml_tensor* ar = nullptr;
+            if (use_flash)
+            {
+                ar = ggml_flash_attn_ext(ctx, qr, kr, vr, mr, attn_scale, 0.0f, 0.0f);
+                ggml_flash_attn_ext_set_prec(ar, GGML_PREC_F32);
+            }
+            else
+            {
+                ggml_tensor* scores = ggml_mul_mat(ctx, kr, qr);
+                ggml_mul_mat_set_prec(scores, GGML_PREC_F32);
+                ggml_tensor* probs = ggml_soft_max_ext(ctx, scores, mr, attn_scale, 0.0f);
+                ggml_tensor* v_perm = ggml_cont(ctx, ggml_permute(ctx, vr, 1, 0, 2, 3));
+                ar = ggml_cont(ctx, ggml_permute(ctx, ggml_mul_mat(ctx, v_perm, probs), 0, 2, 1, 3));
+            }
+            attn = attn ? ggml_concat(ctx, attn, ar, 2) : ar;
+        }
+    }
+    else if (use_flash)
     {
         // One fused kernel in place of mul_mat -> soft_max -> cont(permute(V)) ->
         // mul_mat -> cont(permute). It never materialises the [n_kv, T, n_head]
@@ -1096,7 +1402,7 @@ ggml_tensor* q4e_nodes_attn(
 
     // qwen4exp gates the attention output before the output projection.
     attn = ggml_mul(ctx, attn, ggml_sigmoid(ctx, gate));
-    ggml_tensor* proj = ggml_mul_mat(ctx, wo, ggml_reshape_2d(ctx, attn, q_dim, T));
+    ggml_tensor* proj = q4e_mul_mat(ctx, wo, ggml_reshape_2d(ctx, attn, q_dim, T));
 
     // ---- hyper-connection scatter ----
     ggml_tensor* wsc = ggml_reshape_3d(ctx, ggml_scale(ctx,
@@ -1165,7 +1471,7 @@ ggml_tensor* q4e_nodes_ple(
         return ggml_mul(ctx, nx, w);
     };
 
-    ggml_tensor* keyn = gnorm(ggml_mul_mat(ctx, w_key, ple_emb_in), w_nk);   // [hc_dim, TT]
+    ggml_tensor* keyn = gnorm(q4e_mul_mat(ctx, w_key, ple_emb_in), w_nk);   // [hc_dim, TT]
     ggml_tensor* qryn = gnorm(res_in, w_nq);
 
     // Per-stream dot, scaled, signed-sqrt, sigmoid: the PLE gate.
@@ -1177,7 +1483,7 @@ ggml_tensor* q4e_nodes_ple(
             1e-6f, 3.0e38f));
     ggml_tensor* gate = ggml_sigmoid(ctx, ggml_mul(ctx, sg, mag));            // [1, hc, TT]
 
-    ggml_tensor* val  = ggml_mul_mat(ctx, w_value, ple_emb_in);               // [n_embd, TT]
+    ggml_tensor* val  = q4e_mul_mat(ctx, w_value, ple_emb_in);               // [n_embd, TT]
     ggml_tensor* v3   = ggml_repeat_4d(ctx,
             ggml_reshape_3d(ctx, val, n_embd, 1, TT), n_embd, hc, TT, 1);
     ggml_tensor* gated = ggml_reshape_2d(ctx, ggml_mul(ctx, v3, gate), hc_dim2, TT);
@@ -1273,8 +1579,8 @@ ggml_tensor* q4e_nodes_head(
     ggml_tensor* xnf = ggml_mul(ctx,
             ggml_reshape_2d(ctx, ggml_rms_norm(ctx, res3f, eps), hc_dim, T), w_fnorm);
     ggml_tensor* lof = ggml_silu(ctx, ggml_scale(ctx,
-            ggml_mul_mat(ctx, w_fdown, xnf), 1.0f / (float)hc));
-    ggml_tensor* gtf = ggml_sigmoid(ctx, ggml_mul_mat(ctx, w_fup, lof));
+            q4e_mul_mat(ctx, w_fdown, xnf), 1.0f / (float)hc));
+    ggml_tensor* gtf = ggml_sigmoid(ctx, q4e_mul_mat(ctx, w_fup, lof));
     ggml_tensor* gatedf = ggml_reshape_3d(ctx, ggml_mul(ctx, xnf, gtf), n_embd, hc, T);
     ggml_tensor* mixedf = ggml_cont(ctx, ggml_view_2d(ctx, gatedf, n_embd, T,
             ggml_row_size(gatedf->type, n_embd) * hc, 0));
@@ -1284,7 +1590,7 @@ ggml_tensor* q4e_nodes_head(
                 ggml_row_size(gatedf->type, n_embd) * c));
     mixedf = ggml_scale(ctx, mixedf, 1.0f / (float)hc);
 
-    ggml_tensor* logits = ggml_mul_mat(ctx, w_head, mixedf);                  // [vocab, T]
+    ggml_tensor* logits = q4e_mul_mat(ctx, w_head, mixedf);                  // [vocab, T]
 
     bnd.add(w_fnorm, a->hc_norm, (std::size_t)hc_dim * sizeof(float));
     bnd.add(w_fdown, a->hc_down, (std::size_t)a->hc_down_bytes);
@@ -1950,8 +2256,25 @@ static int q4e_token_span_impl(
 
         // Replay: same span, same shape, same descriptors, same padded window - and
         // every cache-bound weight still where the graph believes it is.
-        if (!q4e_span_force_rebuild()
+        const bool q4e_dump_nodes =
+#ifdef TSG_GGML_TEST_HOOKS
+            q4e_node_dump_dir() != nullptr;
+#else
+            false;
+#endif
+        // Verify-width graphs run the one-token kernels; see Q4eRowKernels. Their
+        // attention rows read per-row windows, which join the replay key.
+        const bool row_scope = q4e_row_kernels_enabled() && T <= TSG_PRECISION_DECODE_COLUMNS;
+        const bool verify_rows = row_scope && T >= 2;
+        std::array<int, TSG_PRECISION_DECODE_COLUMNS> row_kv{};
+        const int row_kv_count = verify_rows && has_attn ? T : 0;
+        for (int r = 0; r < row_kv_count; ++r)
+            row_kv[r] = q4e_pad_kv(n_kv - T + r + 1, kv_capacity, use_flash);
+        struct RowKernelScope { ~RowKernelScope() { g_q4e_row_kernels = Q4eRowKernels{}; } } row_kernel_scope;
+        if (!q4e_span_force_rebuild() && !q4e_dump_nodes
             && slot->valid
+            && slot->row_scope == row_scope && slot->row_kv_count == row_kv_count
+            && std::equal(row_kv.begin(), row_kv.begin() + row_kv_count, slot->row_kv.begin())
             && q4e_refresh_bindings(slot, ggml_backend_get_device(g_backend))
             && slot->n_tokens == T && slot->hc_dim == hc_dim
             && slot->sig == (const void*)ffn && slot->sig2 == (const void*)gdn
@@ -2030,12 +2353,21 @@ static int q4e_token_span_impl(
             return 1;
         }
         slot->reset_graph();
+        g_q4e_row_kernels.keep_fusion_inputs = row_scope;
+        if (verify_rows)
+        {
+            g_q4e_row_kernels.rows = T;
+            g_q4e_row_kernels.n_kv = n_kv;
+        }
 
         const double t0 = q4e_phase_log() ? q4e_now_ms() : 0.0;
         const int n_layers = layer_end - layer_begin;
+        // A verify-width graph expands experts and attention once per row.
+        const std::size_t tensors_per_layer = 256 + (verify_rows ? (std::size_t)48 * T : 0);
+        const int graph_size = verify_rows ? 4 * kQwen4ExpSpanGraphSize : kQwen4ExpSpanGraphSize;
         ggml_init_params ip{};
-        ip.mem_size = ggml_tensor_overhead() * ((std::size_t)n_layers * 256 + 1024)
-                    + ggml_graph_overhead_custom(kQwen4ExpSpanGraphSize, false);
+        ip.mem_size = ggml_tensor_overhead() * ((std::size_t)n_layers * tensors_per_layer + 1024)
+                    + ggml_graph_overhead_custom(graph_size, false);
         ip.mem_buffer = nullptr;
         ip.no_alloc = true;
         ggml_context* ctx = ggml_init(ip);
@@ -2074,7 +2406,7 @@ static int q4e_token_span_impl(
             ggml_set_input(ple_emb_in);
         }
 
-        ggml_cgraph* graph = ggml_new_graph_custom(ctx, kQwen4ExpSpanGraphSize, false);
+        ggml_cgraph* graph = ggml_new_graph_custom(ctx, graph_size, false);
         if (q4e_graph_uid_enabled()) graph->uid = q4e_next_graph_uid();
 
         Q4eBinder binder{ggml_backend_get_device(g_backend)};
@@ -2279,6 +2611,10 @@ static int q4e_token_span_impl(
             ggml_set_output(res_out);
         }
 
+#ifdef TSG_GGML_TEST_HOOKS
+        if (q4e_dump_nodes)
+            for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) ggml_set_output(ggml_graph_node(graph, i));
+#endif
         const double t_pregal = q4e_phase_log() ? q4e_now_ms() : 0.0;
         ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(g_backend));
         std::unique_ptr<std::remove_pointer_t<ggml_gallocr_t>, decltype(&ggml_gallocr_free)>
@@ -2346,6 +2682,13 @@ static int q4e_token_span_impl(
         }
         else
             ggml_backend_tensor_get(res_out, res_data, 0, res_bytes);
+#ifdef TSG_GGML_TEST_HOOKS
+        if (q4e_dump_nodes)
+        {
+            tsg::sync_backend(g_backend);
+            q4e_node_dump(graph, T, position, logits_rows, n_kv);
+        }
+#endif
         q4e_trace_probe(slot, "build", position);
         q4e_trace_state(slot, "build", position);
 
@@ -2427,6 +2770,7 @@ static int q4e_token_span_impl(
         slot->ple_emb_in = ple_emb_in;
         slot->layer_begin = layer_begin; slot->layer_end = layer_end;
         slot->kv_capacity = kv_capacity; slot->n_kv = n_kv_pad;
+        slot->row_kv = row_kv; slot->row_kv_count = row_kv_count; slot->row_scope = row_scope;
         slot->first_ffn_only = first_ffn_only;
         slot->use_mrope = use_mrope ? 1 : 0;
         slot->rebinds = std::move(binder.cached);
@@ -2462,6 +2806,16 @@ static int q4e_token_span_impl(
     n_rot, rope_base, rope_freq_scale, attn_scale, n_expert, n_expert_used, n_ff, n_ff_sh, \
     eps, cache_slot, first_ffn_only, head, logits_out, ple, ple_layer, ple_emb, \
     mrope_pos, mrope_sections, rope_position, device
+
+#ifdef TSG_GGML_TEST_HOOKS
+// Test hook: 1 builds verify-width span graphs with ggml-cuda's batched kernels
+// (no Q4eRowKernels), 0 with the one-token kernels, -1 back to the environment.
+// Graphs built the other way are rebuilt on their next call.
+TSG_TEST_EXPORT void TSGgml_Qwen4ExpTestBatchedVerify(int batched)
+{
+    g_q4e_test_batched_verify.store(batched < 0 ? -1 : (batched ? 1 : 0), std::memory_order_relaxed);
+}
+#endif
 
 TSG_EXPORT int TSGgml_Qwen4ExpTokenSpan(Q4E_SPAN_PARAMETERS)
 {

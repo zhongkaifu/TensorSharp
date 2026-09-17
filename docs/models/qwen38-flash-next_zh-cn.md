@@ -82,8 +82,8 @@ MP4、WebM 或 MOV data URI（不会抓取远程 URL）：
 最早在第 9 个输出 token，top-2 差值为 0.002（标题的第一个词）。保持分块形状相同就消除了这一效应：
 一个 2,928 token 的 prompt，每个请求都一次 prefill 完（`TS_SCHED_PREFILL_CHUNK=4096`、
 `TS_SCHED_MAX_BATCHED_TOKENS=16384`），4 路并发 × 3 轮的输出与单独运行逐字节一致（512 token，12/12），
-所以逐序列 holder 之间没有状态泄漏，轮询 decode 也不依赖并发度。严格的分块与整段 logits 关卡仍是
-[保留前缀复用](#保留前缀复用) 中记录的未决项。
+所以逐序列 holder 之间没有状态泄漏，轮询 decode 也不依赖并发度。CUDA 上不承诺 prefill 形状的宽度不变性，
+所以 fixture 的分块与整段关卡给差异设上界，而不是要求逐位一致；见 [保留前缀复用](#保留前缀复用)。
 
 ## 保留前缀复用
 
@@ -104,14 +104,16 @@ MP4、WebM 或 MOV data URI（不会抓取远程 URL）：
 
 证据（合成 fixture，不代表训练模型的验收或性能）：
 [`eng/validation/qwen38_mtp_followup/retained-cache-20260916`](../../eng/validation/qwen38_mtp_followup/retained-cache-20260916/README.md)
-——`Qwen4ExpRetainedCacheTests` / `Qwen4ExpRetainedCachePolicyTests` 在 CPU 上覆盖保留 A/B/A、检查点
-克隆、投机重绑定、预算驱逐、缺失状态拒绝以及 QSA 首次/重置增长，并在 CUDA 上覆盖真实双 GPU 按层
-切分的检查点生命周期。有三个严格的逐位一致关卡在 CPU 上通过、在单卡 CUDA 上仍然失败，在这个未训练
-的 fixture 上贪心 argmax 都相同：分块 16+4 与整段 20 token 的 prefill 在完整 logits 上有差异
-（`SharedPrefixChunking_…`）；一次 4 token 的目标验证与 4 次标量前向不同（`TeacherForcedTargetVerify_…`，
-最大绝对差 0.0070）；以 2–4 为块提交的 32 个 teacher-forced token 与标量解码不同
-（`RepeatedTargetBlocks_…`，最大绝对差 0.0082）。CUDA 目标计算图的归约依赖批宽度；证据 README 中的
-隔离精度原型能消除其中一部分，但尚未集成。
+——`Qwen4ExpRetainedCacheTests` / `Qwen4ExpRetainedCachePolicyTests` 覆盖保留 A/B/A、检查点克隆、投机重绑定、
+预算驱逐、缺失状态拒绝以及 QSA 首次/重置增长，并在 CUDA 上覆盖真实双 GPU 按层切分的检查点生命周期。
+所有关卡在 CPU 上都逐位一致。在单卡 CUDA 上，一次 4 token 的目标验证与 4 次单 token 前向逐位相同
+（`TeacherForcedTargetVerify_…`），以 2–4 为块提交的 32 个 teacher-forced token 在每一行上都与标量解码
+逐位相同（`RepeatedTargetBlocks_…`）——见 [验证行使用单 token kernel](#验证行使用单-token-kernel)。
+16 token 的 prefill 再接 4 个 token，在 CUDA 上与一次 20 token 的 prefill 并不逐位相同，因为 prefill 的
+kernel 按批宽度选择：`SharedPrefixChunking_…` 在 CUDA 上把差异上界设为 1e-2（实测 logits 相差 1.7e-4 到
+4.4e-4；它当初要抓的陈旧种子缺陷让 logits 偏移了 0.3155），并且只允许在 top-2 差值不超过实测差异两倍的
+近似平局处改变贪心结果
+（[`verify-row-kernels-20260917`](../../eng/validation/qwen38_mtp_followup/verify-row-kernels-20260917/README.md)）。
 
 ## 共享 MTP 头的投机解码
 
@@ -121,13 +123,39 @@ prefill 的单独请求做投机（与其他序列共享的步，以及延续保
 （A40）上以 `--spec-draft 3` 实测：
 
 - **一致性。** 192 token 的代码复制流与普通贪心完全一致，速度 1.75-1.96 倍（141/141 草稿被接受，
-  无回滚）；投机 prefill（`SpecForward`）在相同分块下与普通 prefill 逐位一致。4 行 verify kernel
-  与 1 行 decode kernel 在近似平局处确实会翻转，表现为普通贪心写出裸对象的地方出现了
-  ```` ```json ```` 围栏，或者缩进 JSON 与紧凑 JSON 的差别。
+  无回滚）；投机 prefill（`SpecForward`）在相同分块下与普通 prefill 逐位一致。2026-09-17 之前，4 行
+  verify 的舍入与 1 行 decode 步不同，可能把普通贪心写出的裸 JSON 对象变成 ```` ```json ```` 围栏
+  回答；现在验证行使用单 token kernel（见下文）。
 - **散文不划算。** 18 个散文请求的接受率为 68-70%（每次 verify 3.0 个 token），但一次 verify 约 45 ms，
   部分接受还要加约 43-46 ms 的回滚（恢复递归状态、重新前向保留的行），而被调速器暂停的步仍然要跑
   带隐藏状态捕获的单行投机前向（约 24-26 ms，普通 decode 为 19 ms）：512 token 散文在 c1 下 decode 为
   44-46 tok/s，普通为 52；8k prompt 之后为 34-38，普通为 40。
+
+### 验证行使用单 token kernel
+
+一次 verify 以及对其接受前缀的重放，都会把 2–8 个 token 放进同一张 span 计算图（同样长度的 prefill 也是如此），
+而在 CUDA 上 ggml 会按批宽度选择多个 kernel。在这些宽度下，一行的舍入方式与它对应的单 token decode 步并不
+相同：F32 投影超过 3 列后离开 `mul_mat_vec_f`，改走 tensor-core / cuBLAS TF32 路径（router logits 偏移
+2.6e-3）；BF16 的 QSA indexer 投影从 2 列起走半精度路径（5.9e-3）；路由专家换成多 token MoE kernel
+（4.8e-7）；flash attention 换成多 query 启动（2.9e-5）。经过 48 层 MoE 与 QSA 路由，这已不是最后一位的
+噪声：在三张 A40 上的 UD-Q2_K_XL 里，3,248 token prompt 之后 teacher-force 前 48 个贪心 token，2、3、4 行
+verify 的每一行都与其 decode 步不同，logits 最多相差 2.5，48 行里有 4–6 行改变了贪心 token——并不只发生在
+近似平局处。
+
+因此在 CUDA 上，2–8 个 token 的 span 计算图用其单 token 图会运行的 kernel 构建每一行：浮点投影把 token 放在
+广播轴上（一次 `mul_mat_vec_f` 启动），量化投影按至多 4 行一块运行（MMVQ 共用的归约分组），路由专家与注意力
+逐行展开，每个注意力行读取的 KV 窗口与 mask 行恰好就是它的 decode 步所读的那些。不超过 8 个 token 的图
+（包括 decode）还会让两个是否融合取决于内存复用的 ggml-cuda 融合（MoE 加权归约；RMS norm + RoPE）的输入
+保持分配，于是这两个融合在任何宽度下都会发生。单 token 与 prefill 的 kernel 不变。
+
+在同一环境下交替重复三次实测：宽度 2、3、4 的每个验证行现在都与其 decode 步逐位相同（48 行中 0 行不同，
+没有贪心翻转）。4 行 verify 耗时 32.4–33.1 ms，此前为 29.3–29.6 ms（+11%）；3 行 28.3–29.9 对 26.8–27.2（+8%）；
+2 行 24.5–24.8 对 24.1–24.3（+2%）；decode 步（20.6–20.7 ms 对 20.6–21.1）与 3,248 token 的 prefill
+（2,335–2,338 ms 对 2,324–2,359）不变。在 192 token 的代码复制流上端到端测量（每种 kernel 各 6 轮，所有输出
+都与普通贪心一致），MTP 投机为 83.2 tok/s，此前为 86.5（相对普通 decode 从 1.84 倍变为 1.69 倍）；n-gram 投机为
+73.8，此前为 79.5；普通 decode（49.1 对 47.0）与 prefill（830 对 804 tok/s）没有退化：精确性的代价由投机承担。
+证据以及逐断言诊断：
+[`verify-row-kernels-20260917`](../../eng/validation/qwen38_mtp_followup/verify-row-kernels-20260917/README.md)。
 
 ## 多 GPU
 

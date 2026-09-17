@@ -1,0 +1,70 @@
+gpu=2 start 13:10:51
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 45498 MiB):
+  Device 0: NVIDIA A40, compute capability 8.6, VMM: yes, VRAM: 45498 MiB
+backend CUDA0 repeats=30 experts=32 kv=4096
+MUL_MAT    q5_K 2560->10240                   T=2 batched:exact  max_abs=0          channels:exact  max_abs=0          us_batched=45.9 us_channels=75.1
+MUL_MAT    q6_K 2560->512                     T=2 batched:exact  max_abs=0          channels:exact  max_abs=0          us_batched=13.3 us_channels=17.9
+MUL_MAT    q8_0 10240->320                    T=2 batched:exact  max_abs=0          channels:exact  max_abs=0          us_batched=15.3 us_channels=16.2
+MUL_MAT    q4_K 2560->32768                   T=2 batched:exact  max_abs=0          channels:exact  max_abs=0          us_batched=93.7 us_channels=163.1
+MUL_MAT    f32 2560->512                      T=2 batched:exact  max_abs=0          channels:exact  max_abs=0          us_batched=19.1 us_channels=19.5
+MUL_MAT    f32 10240->4                       T=2 batched:exact  max_abs=0          channels:exact  max_abs=0          us_batched=14.8 us_channels=15.4
+MUL_MAT    bf16 2560->512                     T=2 batched:DIFFER max_abs=0.00592    channels:exact  max_abs=0          us_batched=19.9 us_channels=20.5
+MUL_MAT    f16 2560->640                      T=2 batched:DIFFER max_abs=0.00112    channels:exact  max_abs=0          us_batched=17.8 us_channels=19.6
+MUL_MAT_ID iq2_xs 2560->640 E32 k10           T=2 batched:DIFFER max_abs=4.77e-07   rows:exact  max_abs=0          us_batched=33.9 us_rows=41.5
+MUL_MAT_ID iq4_nl 640->2560 E32 k10 slots     T=2 batched:DIFFER max_abs=2.38e-07   rows:exact  max_abs=0          us_batched=44.6 us_rows=51.4
+MUL_MAT_ID f16 2560->640 E32 k10              T=2 batched:exact  max_abs=0          rows:exact  max_abs=0          us_batched=117.5 us_rows=140.9
+FLASH_ATTN hd256 h24/2 kv4096                 T=2 batched:DIFFER max_abs=2.53e-05   rows:exact  max_abs=0          us_batched=44.2 us_rows=64.3
+GDN        S128 H48                           T=2 batched:exact  max_abs=0          state:exact  max_abs=0          us_batched=20.6 us_state=0.0
+MUL_MAT    q5_K 2560->10240                   T=3 batched:exact  max_abs=0          channels:exact  max_abs=0          us_batched=44.6 us_channels=102.7
+MUL_MAT    q6_K 2560->512                     T=3 batched:exact  max_abs=0          channels:exact  max_abs=0          us_batched=18.4 us_channels=14.7
+MUL_MAT    q8_0 10240->320                    T=3 batched:exact  max_abs=0          channels:exact  max_abs=0          us_batched=16.2 us_channels=18.4
+MUL_MAT    q4_K 2560->32768                   T=3 batched:exact  max_abs=0          channels:exact  max_abs=0          us_batched=96.1 us_channels=237.8
+MUL_MAT    f32 2560->512                      T=3 batched:exact  max_abs=0          channels:exact  max_abs=0          us_batched=16.2 us_channels=19.4
+MUL_MAT    f32 10240->4                       T=3 batched:exact  max_abs=0          channels:exact  max_abs=0          us_batched=13.4 us_channels=10.8
+MUL_MAT    bf16 2560->512                     T=3 batched:DIFFER max_abs=0.00592    channels:exact  max_abs=0          us_batched=15.6 us_channels=16.5
+MUL_MAT    f16 2560->640                      T=3 batched:DIFFER max_abs=0.00112    channels:exact  max_abs=0          us_batched=19.9 us_channels=17.9
+MUL_MAT_ID iq2_xs 2560->640 E32 k10           T=3 batched:DIFFER max_abs=4.77e-07   rows:exact  max_abs=0          us_batched=41.8 us_rows=58.2
+MUL_MAT_ID iq4_nl 640->2560 E32 k10 slots     T=3 batched:DIFFER max_abs=2.38e-07   rows:exact  max_abs=0          us_batched=61.9 us_rows=75.3
+MUL_MAT_ID f16 2560->640 E32 k10              T=3 batched:exact  max_abs=0          rows:exact  max_abs=0          us_batched=149.8 us_rows=207.6
+FLASH_ATTN hd256 h24/2 kv4096                 T=3 batched:DIFFER max_abs=2.66e-05   rows:exact  max_abs=0          us_batched=42.8 us_rows=97.0
+GDN        S128 H48                           T=3 batched:exact  max_abs=0          state:exact  max_abs=0          us_batched=23.5 us_state=0.0
+MUL_MAT    q5_K 2560->10240                   T=4 batched:exact  max_abs=0          channels:exact  max_abs=0          us_batched=50.6 us_channels=132.6
+MUL_MAT    q6_K 2560->512                     T=4 batched:exact  max_abs=0          channels:exact  max_abs=0          us_batched=15.9 us_channels=17.9
+MUL_MAT    q8_0 10240->320                    T=4 batched:exact  max_abs=0          channels:exact  max_abs=0          us_batched=17.1 us_channels=20.5
+MUL_MAT    q4_K 2560->32768                   T=4 batched:exact  max_abs=0          channels:exact  max_abs=0          us_batched=116.9 us_channels=318.7
+MUL_MAT    f32 2560->512                      T=4 batched:DIFFER max_abs=0.0026     channels:exact  max_abs=0          us_batched=22.6 us_channels=25.5
+MUL_MAT    f32 10240->4                       T=4 batched:DIFFER max_abs=0.0015     channels:exact  max_abs=0          us_batched=16.0 us_channels=15.5
+MUL_MAT    bf16 2560->512                     T=4 batched:DIFFER max_abs=0.00592    channels:exact  max_abs=0          us_batched=15.5 us_channels=18.7
+MUL_MAT    f16 2560->640                      T=4 batched:DIFFER max_abs=0.00115    channels:exact  max_abs=0          us_batched=19.7 us_channels=20.6
+MUL_MAT_ID iq2_xs 2560->640 E32 k10           T=4 batched:DIFFER max_abs=4.77e-07   rows:exact  max_abs=0          us_batched=51.1 us_rows=77.6
+MUL_MAT_ID iq4_nl 640->2560 E32 k10 slots     T=4 batched:DIFFER max_abs=2.38e-07   rows:exact  max_abs=0          us_batched=74.5 us_rows=98.4
+MUL_MAT_ID f16 2560->640 E32 k10              T=4 batched:exact  max_abs=0          rows:exact  max_abs=0          us_batched=164.8 us_rows=277.7
+FLASH_ATTN hd256 h24/2 kv4096                 T=4 batched:DIFFER max_abs=2.88e-05   rows:exact  max_abs=0          us_batched=44.8 us_rows=122.9
+GDN        S128 H48                           T=4 batched:exact  max_abs=0          state:exact  max_abs=0          us_batched=27.2 us_state=0.0
+MUL_MAT    q5_K 2560->10240                   T=5 batched:DIFFER max_abs=5.96e-07   channels:exact  max_abs=0          us_batched=52.5 us_channels=163.8
+MUL_MAT    q6_K 2560->512                     T=5 batched:DIFFER max_abs=4.77e-07   channels:exact  max_abs=0          us_batched=15.4 us_channels=21.2
+MUL_MAT    q8_0 10240->320                    T=5 batched:DIFFER max_abs=9.54e-07   channels:exact  max_abs=0          us_batched=21.4 us_channels=24.2
+MUL_MAT    q4_K 2560->32768                   T=5 batched:DIFFER max_abs=7.15e-07   channels:exact  max_abs=0          us_batched=113.8 us_channels=393.0
+MUL_MAT    f32 2560->512                      T=5 batched:DIFFER max_abs=0.0026     channels:exact  max_abs=0          us_batched=21.5 us_channels=25.9
+MUL_MAT    f32 10240->4                       T=5 batched:DIFFER max_abs=0.0015     channels:exact  max_abs=0          us_batched=16.2 us_channels=11.9
+MUL_MAT    bf16 2560->512                     T=5 batched:DIFFER max_abs=0.00592    channels:exact  max_abs=0          us_batched=16.0 us_channels=20.8
+MUL_MAT    f16 2560->640                      T=5 batched:DIFFER max_abs=0.00115    channels:exact  max_abs=0          us_batched=17.0 us_channels=23.7
+MUL_MAT_ID iq2_xs 2560->640 E32 k10           T=5 batched:DIFFER max_abs=4.77e-07   rows:exact  max_abs=0          us_batched=59.6 us_rows=92.8
+MUL_MAT_ID iq4_nl 640->2560 E32 k10 slots     T=5 batched:DIFFER max_abs=2.38e-07   rows:exact  max_abs=0          us_batched=86.3 us_rows=122.4
+MUL_MAT_ID f16 2560->640 E32 k10              T=5 batched:exact  max_abs=0          rows:exact  max_abs=0          us_batched=173.3 us_rows=346.9
+FLASH_ATTN hd256 h24/2 kv4096                 T=5 batched:DIFFER max_abs=3.83e-05   rows:exact  max_abs=0          us_batched=59.4 us_rows=154.6
+GDN        S128 H48                           T=5 batched:exact  max_abs=0          state:exact  max_abs=0          us_batched=29.1 us_state=0.0
+MUL_MAT    q5_K 2560->10240                   T=8 batched:DIFFER max_abs=5.96e-07   channels:exact  max_abs=0          us_batched=64.3 us_channels=253.3
+MUL_MAT    q6_K 2560->512                     T=8 batched:DIFFER max_abs=4.77e-07   channels:exact  max_abs=0          us_batched=16.9 us_channels=22.0
+MUL_MAT    q8_0 10240->320                    T=8 batched:DIFFER max_abs=1.07e-06   channels:exact  max_abs=0          us_batched=23.3 us_channels=33.5
+MUL_MAT    q4_K 2560->32768                   T=8 batched:DIFFER max_abs=7.15e-07   channels:exact  max_abs=0          us_batched=161.2 us_channels=614.1
+MUL_MAT    f32 2560->512                      T=8 batched:DIFFER max_abs=0.0027     channels:exact  max_abs=0          us_batched=23.4 us_channels=35.5
+MUL_MAT    f32 10240->4                       T=8 batched:DIFFER max_abs=0.0015     channels:exact  max_abs=0          us_batched=18.8 us_channels=11.7
+MUL_MAT    bf16 2560->512                     T=8 batched:DIFFER max_abs=0.00592    channels:exact  max_abs=0          us_batched=16.0 us_channels=26.8
+MUL_MAT    f16 2560->640                      T=8 batched:DIFFER max_abs=0.00127    channels:exact  max_abs=0          us_batched=16.0 us_channels=30.4
+MUL_MAT_ID iq2_xs 2560->640 E32 k10           T=8 batched:DIFFER max_abs=4.77e-07   rows:exact  max_abs=0          us_batched=89.2 us_rows=145.4
+MUL_MAT_ID iq4_nl 640->2560 E32 k10 slots     T=8 batched:DIFFER max_abs=2.38e-07   rows:exact  max_abs=0          us_batched=120.7 us_rows=199.7
+MUL_MAT_ID f16 2560->640 E32 k10              T=8 batched:exact  max_abs=0          rows:exact  max_abs=0          us_batched=178.6 us_rows=549.1
+FLASH_ATTN hd256 h24/2 kv4096                 T=8 batched:DIFFER max_abs=4.16e-05   rows:exact  max_abs=0          us_batched=63.4 us_rows=240.9
+GDN        S128 H48                           T=8 batched:exact  max_abs=0          state:exact  max_abs=0          us_batched=36.3 us_state=0.0
+rc=0 end 13:17:56

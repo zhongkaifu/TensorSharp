@@ -591,6 +591,11 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
             "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/src")
         target_link_libraries(GgmlOpsCudaMatmulPrecisionTest PRIVATE ggml-cuda ggml-cpu ggml-base CUDA::cublas)
         add_test(NAME cuda-explicit-f32-matmul COMMAND GgmlOpsCudaMatmulPrecisionTest)
+        # Measurement probe (not a test): which CUDA kernels a qwen4exp verify
+        # row shares with the one-token decode graph, and at what cost.
+        add_executable(GgmlOpsQwen4ExpRowKernelProbe tests/qwen4exp_row_kernel_probe.cpp)
+        target_compile_definitions(GgmlOpsQwen4ExpRowKernelProbe PRIVATE TSG_GGML_USE_CUDA=1)
+        target_link_libraries(GgmlOpsQwen4ExpRowKernelProbe PRIVATE ggml-cuda ggml-cpu ggml-base)
         set_tests_properties(cuda-explicit-f32-matmul PROPERTIES SKIP_RETURN_CODE 77)
         add_executable(GgmlOpsCudaAttentionPrecisionTest tests/attention_precision_test.cpp
             ggml_ops_attention_precision.cpp ggml_ops_attention_precision.cu

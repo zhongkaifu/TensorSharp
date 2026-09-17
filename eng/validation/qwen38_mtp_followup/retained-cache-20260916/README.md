@@ -2,6 +2,8 @@
 
 This record contains synthetic CPU and physical CUDA verification, followed by isolated arithmetic diagnostics. The public two-GPU checkpoint lifecycle passed; strict CUDA chunk/output gates remain open. Trained acceptance/performance, true tensor parallelism, and historical trained-model output drift are not qualified by these fixtures.
 
+Follow-up (2026-09-17): the three open CUDA gates are resolved in [`verify-row-kernels-20260917`](../verify-row-kernels-20260917/README.md). Verify-width span graphs now run the one-token kernels, so the teacher-forced and committed-block gates pass bit for bit on CUDA; the chunked-versus-whole prefill gate is a bounded contract on CUDA with its reasons and numbers recorded there. The isolated precision prototypes below were not integrated.
+
 ## Imported and corrected implementation
 
 The reviewed remote candidate was `/workspace/ts-q4e-retained/repo`. It retained complete request holders and cloned attention KV, QSA raw keys/positions, recurrent GDN/PLE state, and private MTP state. Source was first staged under `/tmp/tensorsharp-qwen-retained-review` for review. Its old suite had failures and QSA skips; those results are not recast as passes.
