@@ -3661,6 +3661,12 @@ namespace TensorSharp.Runtime.Scheduling
             while (start < target)
             {
                 int n = Math.Min(chunk, target - start);
+                // Never mix prompt and generated tokens in one forward, as the planned
+                // steps never do: a prompt slice queues its media embeddings and M-RoPE
+                // position table for exactly its prompt tokens, so a forward that ran on
+                // into generated tokens would carry a position table shorter than itself.
+                if (start < promptTokens)
+                    n = Math.Min(n, promptTokens - start);
                 var tokens = new int[n];
                 for (int i = 0; i < n; i++)
                     tokens[i] = seq.TokenAt(start + i);

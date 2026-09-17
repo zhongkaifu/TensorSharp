@@ -112,10 +112,109 @@ public sealed class InjectShortfallAccountingTests
         Assert.Contains(model.Forwards, f => f.Start == 2 * BlockSize && f.Count == extra);
     }
 
-    private static async Task<(HistoryHashModel Model, SequenceState A, SequenceState B)> RunConcurrentAsync(
-        int[] promptA, int[] promptB, int maxNew, int? refuseInjectAt)
+    [Fact]
+    public async Task RefusedBlockOnAFreshFusedHolder_CorrectsReuse_AndOutputEqualsCold()
     {
-        var model = new HistoryHashModel { RefuseInjectAt = refuseInjectAt };
+        // The second inject site: a request admitted with pooled reuse while another
+        // request is running goes to the per-sequence fused path, whose FRESH holder is
+        // filled from the pool before its first forward.
+        int[] shared = Enumerable.Range(0, 3 * BlockSize).Select(i => 6 + (i * 17) % 80).ToArray();
+        int[] promptA = shared.Concat(new[] { 2, 3, 4 }).ToArray();
+        int[] promptB = shared.Concat(new[] { 40, 41, 42, 43, 44 }).ToArray();
+        int[] promptC = Enumerable.Range(0, 10).Select(i => 60 + i).ToArray();
+        const int maxNewB = 6, maxNewC = 120;
+        int[] coldB = await RunColdFusedAsync(promptB, maxNewB);
+        int[] coldC = await RunColdFusedAsync(promptC, maxNewC);
+
+        var model = new FusedHistoryHashModel();
+        using var engine = new InferenceEngine(model, FusedConfig(prefixCaching: true), NullLogger.Instance);
+        await RunAsync(engine, "a", promptA, maxNew: 4);
+
+        // c runs alone first (the single-stream path); b arrives while it decodes.
+        int decodesBeforeC = model.DecodeForwards;
+        var c = new SequenceState("c", promptC.ToList(), maxNewC, BlockSize, SamplingConfig.Greedy);
+        var hc = engine.SubmitRequest(c);
+        var until = DateTime.UtcNow.AddSeconds(20);
+        while (model.DecodeForwards - decodesBeforeC < 2 && DateTime.UtcNow < until)
+            await Task.Delay(1);
+        Assert.True(model.DecodeForwards - decodesBeforeC >= 2, "c never started decoding");
+
+        model.RefuseInjectAt = 2 * BlockSize;
+        var b = new SequenceState("b", promptB.ToList(), maxNewB, BlockSize, SamplingConfig.Greedy);
+        var completionB = await engine.SubmitRequest(b).Completion.WaitAsync(TimeSpan.FromSeconds(30));
+        await hc.Completion.WaitAsync(TimeSpan.FromSeconds(30));
+
+        Assert.Equal(1, model.RefusedInjects);
+        Assert.Equal("b", model.RefusedInjectCache);
+        Assert.Equal(2 * BlockSize, completionB.PrefixCacheReusedTokens);
+        Assert.Equal(coldB, b.OutputTokens.ToArray());
+        Assert.Equal(coldC, c.OutputTokens.ToArray());
+    }
+
+    [Fact]
+    public async Task PerBlockCaptureModel_BacksOffToTheLastRestorableBlock_AndOutputEqualsCold()
+    {
+        // A recurrent model restores its running state from the LAST injected block.
+        // With 12-token prefill chunks, blocks 0 and 1 are captured mid-chunk (not
+        // restorable) and block 2 at a chunk end (restorable), so admission adopts all
+        // three. Refusing block 2 leaves blocks 0-1 injected, whose saved state is the
+        // chunk-end state at token 24, not 16: the only exact resume point is zero.
+        int[] shared = Enumerable.Range(0, 3 * BlockSize).Select(i => 5 + (i * 19) % 80).ToArray();
+        int[] promptA = shared.Concat(new[] { 7, 8, 9 }).ToArray();
+        int[] promptB = shared.Concat(new[] { 20, 21, 22, 23 }).ToArray();
+
+        int[] coldB;
+        {
+            var coldModel = new RecurrentHashModel();
+            using var coldEngine = new InferenceEngine(coldModel, Config(prefixCaching: false, prefillChunk: 12), NullLogger.Instance);
+            coldB = (await RunAsync(coldEngine, "cold", promptB, maxNew: 6)).OutputTokens.ToArray();
+        }
+
+        var model = new RecurrentHashModel();
+        using var engine = new InferenceEngine(model, Config(prefixCaching: true, prefillChunk: 12), NullLogger.Instance);
+        await RunAsync(engine, "a", promptA, maxNew: 3);
+
+        model.RefuseInjectAt = 2 * BlockSize;
+        var b = new SequenceState("b", promptB.ToList(), 6, BlockSize, SamplingConfig.Greedy);
+        var completion = await engine.SubmitRequest(b).Completion.WaitAsync(TimeSpan.FromSeconds(20));
+
+        Assert.Equal(1, model.RefusedInjects);
+        Assert.Equal(0, completion.PrefixCacheReusedTokens);
+        Assert.Equal(coldB, b.OutputTokens.ToArray());
+    }
+
+    [Fact]
+    public async Task RecomputedTailThatCrossesThePromptEnd_ForwardsPromptAndGeneratedTokensSeparately()
+    {
+        // Block 1 (tokens 8..15) straddles both prompt ends. Letting the first two
+        // injects of it through makes the refused one a decoder that already generated
+        // past its prompt, so the lost tail holds prompt AND generated tokens. The
+        // planned steps never mix the two in one forward (a prompt slice queues media
+        // embeddings and an M-RoPE table sized to its prompt tokens), so the recompute
+        // must not either.
+        int[] promptA = Enumerable.Range(0, 11).Select(i => 20 + i).ToArray();
+        int[] promptB = Enumerable.Range(0, 13).Select(i => 50 + (i * 3) % 40).ToArray();
+        const int maxNew = 10;
+        int[] coldA = await RunColdAsync(promptA, maxNew);
+        int[] coldB = await RunColdAsync(promptB, maxNew);
+        var (controlModel, _, _) = await RunConcurrentAsync(promptA, promptB, maxNew, refuseInjectAt: null);
+
+        var (model, a, b) = await RunConcurrentAsync(promptA, promptB, maxNew, refuseInjectAt: BlockSize, refuseSkip: 2);
+
+        Assert.Equal(1, model.RefusedInjects);
+        Assert.Equal(coldA, a.OutputTokens.ToArray());
+        Assert.Equal(coldB, b.OutputTokens.ToArray());
+        // Only the recompute starts a forward at token 8.
+        var first = Assert.Single(model.Forwards, f => f.Start == BlockSize);
+        int extra = model.Forwards.Sum(f => f.Count) - controlModel.Forwards.Sum(f => f.Count);
+        Assert.True(extra > first.Count, $"the refused inject lost no generated tokens (extra {extra}, first {first.Count})");
+        Assert.Contains(first.Start + first.Count, new[] { promptA.Length, promptB.Length });
+    }
+
+    private static async Task<(HistoryHashModel Model, SequenceState A, SequenceState B)> RunConcurrentAsync(
+        int[] promptA, int[] promptB, int maxNew, int? refuseInjectAt, int refuseSkip = 0)
+    {
+        var model = new HistoryHashModel { RefuseInjectAt = refuseInjectAt, RefuseInjectSkip = refuseSkip };
         using var engine = new InferenceEngine(model, Config(prefixCaching: false, decodeQuantum: 1), NullLogger.Instance);
         var a = new SequenceState("a", promptA.ToList(), maxNew, BlockSize, SamplingConfig.Greedy);
         var b = new SequenceState("b", promptB.ToList(), maxNew, BlockSize, SamplingConfig.Greedy);
@@ -127,11 +226,11 @@ public sealed class InjectShortfallAccountingTests
 
     // ------------------------------------------------------------------ helpers
 
-    private static SchedulerConfig Config(bool prefixCaching, int decodeQuantum = BlockSize) => new()
+    private static SchedulerConfig Config(bool prefixCaching, int decodeQuantum = BlockSize, int prefillChunk = 64) => new()
     {
         MaxNumBatchedTokens = 64,
         MaxNumRunningSequences = 4,
-        MaxPrefillChunkSize = 64,
+        MaxPrefillChunkSize = prefillChunk,
         NumBlocks = 32,
         BlockSize = BlockSize,
         EnablePrefixCaching = prefixCaching,
@@ -142,6 +241,25 @@ public sealed class InjectShortfallAccountingTests
     {
         var model = new HistoryHashModel();
         using var engine = new InferenceEngine(model, Config(prefixCaching: false), NullLogger.Instance);
+        var seq = await RunAsync(engine, "cold", prompt, maxNew);
+        Assert.Equal(0, model.RefusedInjects);
+        return seq.OutputTokens.ToArray();
+    }
+
+    private static SchedulerConfig FusedConfig(bool prefixCaching) => new()
+    {
+        MaxNumBatchedTokens = 64,
+        MaxNumRunningSequences = 4,
+        MaxPrefillChunkSize = 64,
+        NumBlocks = 64,
+        BlockSize = BlockSize,
+        EnablePrefixCaching = prefixCaching,
+    };
+
+    private static async Task<int[]> RunColdFusedAsync(int[] prompt, int maxNew)
+    {
+        var model = new FusedHistoryHashModel();
+        using var engine = new InferenceEngine(model, FusedConfig(prefixCaching: false), NullLogger.Instance);
         var seq = await RunAsync(engine, "cold", prompt, maxNew);
         Assert.Equal(0, model.RefusedInjects);
         return seq.OutputTokens.ToArray();
@@ -167,12 +285,14 @@ public sealed class InjectShortfallAccountingTests
         private readonly object _gate = new();
 
         public int? RefuseInjectAt { get; set; }
+        /// <summary>How many matching injects to let through before refusing one.</summary>
+        public int RefuseInjectSkip { get; set; }
         public int RefusedInjects { get; private set; }
         public int InjectCalls { get; private set; }
         public List<(int Start, int Count)> Forwards { get; } = new();
 
         public ModelConfig Config { get; } = new() { VocabSize = VocabSize };
-        public ITokenizer Tokenizer { get; } = new NumberTokenizer();
+        public ITokenizer Tokenizer { get; } = new NumberTokenizerPublic();
         public IMultimodalInjector MultimodalInjector => null;
         public IBackendExecutionPlan ExecutionPlan => null;
         public bool SupportsKVCacheTruncation => true;
@@ -229,7 +349,11 @@ public sealed class InjectShortfallAccountingTests
             lock (_gate)
             {
                 InjectCalls++;
-                if (RefuseInjectAt == destToken)
+                if (RefuseInjectAt == destToken && RefuseInjectSkip > 0)
+                {
+                    RefuseInjectSkip--;
+                }
+                else if (RefuseInjectAt == destToken)
                 {
                     RefuseInjectAt = null;
                     RefusedInjects++;
@@ -242,7 +366,7 @@ public sealed class InjectShortfallAccountingTests
             }
         }
 
-        private sealed class NumberTokenizer : ITokenizer
+        internal sealed class NumberTokenizerPublic : ITokenizer
         {
             public string[] Vocab { get; } = Enumerable.Range(0, InjectShortfallAccountingTests.VocabSize).Select(i => i.ToString()).ToArray();
             public int BosTokenId => -1;
@@ -253,6 +377,246 @@ public sealed class InjectShortfallAccountingTests
             public void AppendTokenBytes(int tokenId, List<byte> buffer) { }
             public bool IsEos(int tokenId) => false;
             public int LookupToken(string tokenStr) => -1;
+        }
+    }
+
+    private static float[] PeakLogits(ulong h)
+    {
+        var logits = new float[VocabSize];
+        logits[(int)(h % (ulong)(VocabSize - 1)) + 1] = 10f;
+        return logits;
+    }
+
+    private static ulong Fold(ulong h, int position, int token)
+    {
+        h = (h ^ (ulong)position) * 1099511628211UL;
+        return (h ^ (ulong)token) * 1099511628211UL;
+    }
+
+    private const ulong Seed = 1469598103934665603UL;
+
+    /// <summary>
+    /// <see cref="HistoryHashModel"/> with one cache per request (the per-sequence
+    /// fused contract): a primary cache for the single-stream path and a holder per
+    /// bound RequestId. Logits hash every (position, token) row of the ACTIVE cache.
+    /// </summary>
+    private sealed class FusedHistoryHashModel : IModelArchitecture, IBatchedPagedModel
+    {
+        private readonly object _gate = new();
+        private readonly Dictionary<string, List<int>> _holders = new(StringComparer.Ordinal);
+        private List<int> _primary = new();
+        private List<int> _active;
+        private string _activeKey;
+
+        public FusedHistoryHashModel() => _active = _primary;
+
+        public int? RefuseInjectAt { get; set; }
+        public int RefusedInjects { get; private set; }
+        public string RefusedInjectCache { get; private set; }
+
+        private int _decodeForwardCount;
+
+        /// <summary>Single-token forwards so far, on any cache.</summary>
+        public int DecodeForwards => Volatile.Read(ref _decodeForwardCount);
+
+        public ModelConfig Config { get; } = new() { VocabSize = VocabSize };
+        public ITokenizer Tokenizer { get; } = new HistoryHashModel.NumberTokenizerPublic();
+        public IMultimodalInjector MultimodalInjector => null;
+        public IBackendExecutionPlan ExecutionPlan => null;
+        public bool SupportsKVCacheTruncation => true;
+        public bool SupportsKVStateSnapshot => true;
+        public string KVStateFingerprint => "fused-history-hash";
+
+        public float[] Forward(int[] tokens)
+        {
+            lock (_gate)
+            {
+                if (tokens.Length == 1)
+                {
+                    Interlocked.Increment(ref _decodeForwardCount);
+                    // Slow decode slightly so the second request reliably arrives while
+                    // the first is still running.
+                    Thread.Sleep(1);
+                }
+                _active.AddRange(tokens);
+                ulong h = Seed;
+                for (int p = 0; p < _active.Count; p++) h = Fold(h, p, _active[p]);
+                return PeakLogits(h);
+            }
+        }
+
+        public void ResetKVCache() { lock (_gate) _active.Clear(); }
+
+        public void TruncateKVCache(int tokenCount)
+        {
+            lock (_gate)
+            {
+                if (tokenCount < _active.Count)
+                    _active.RemoveRange(tokenCount, _active.Count - tokenCount);
+            }
+        }
+
+        public void Dispose() { }
+
+        public long ComputeKVBlockByteSize(int tokenCount) => (long)tokenCount * sizeof(int);
+
+        public bool TryExtractKVBlock(int startToken, int tokenCount, Span<byte> destination)
+        {
+            lock (_gate)
+            {
+                if (startToken < 0 || startToken + tokenCount > _active.Count) return false;
+                for (int i = 0; i < tokenCount; i++)
+                    BitConverter.TryWriteBytes(destination.Slice(i * sizeof(int), sizeof(int)), _active[startToken + i]);
+                return true;
+            }
+        }
+
+        public bool TryInjectKVBlock(int destToken, int tokenCount, ReadOnlySpan<byte> source)
+        {
+            lock (_gate)
+            {
+                if (RefuseInjectAt == destToken)
+                {
+                    RefuseInjectAt = null;
+                    RefusedInjects++;
+                    RefusedInjectCache = _activeKey ?? "<primary>";
+                    return false;
+                }
+                if (destToken != _active.Count) return false;
+                for (int i = 0; i < tokenCount; i++)
+                    _active.Add(BitConverter.ToInt32(source.Slice(i * sizeof(int), sizeof(int))));
+                return true;
+            }
+        }
+
+        public IReadOnlyList<float[]> ForwardBatch(BatchedForwardContext ctx)
+            => throw new InvalidOperationException("the paged batched path is not part of this fake");
+
+        public bool BatchedForwardAvailable => false;
+        public bool SupportsLinearKVMigration => true;
+        public bool TryMigrateLinearKVToPaged(SequenceState owner, int blockSize) => false;
+        public bool SupportsPerSequenceFusedForward => true;
+        public bool CanBatchDecode(string requestId, int position) => false;
+
+        public bool BindSequenceCache(string requestId)
+        {
+            lock (_gate)
+            {
+                bool fresh = !_holders.TryGetValue(requestId, out var holder);
+                if (fresh) _holders[requestId] = holder = new List<int>();
+                _active = holder;
+                _activeKey = requestId;
+                return fresh;
+            }
+        }
+
+        public void AdoptPrimaryCacheToFused(string requestId)
+        {
+            lock (_gate)
+            {
+                _holders[requestId] = _primary;
+                _primary = new List<int>();
+                _active = _holders[requestId];
+                _activeKey = requestId;
+            }
+        }
+
+        public void RestorePrimaryCache()
+        {
+            lock (_gate) { _active = _primary; _activeKey = null; }
+        }
+
+        public bool HasFusedSequenceCache(string requestId)
+        {
+            lock (_gate) return _holders.ContainsKey(requestId);
+        }
+
+        public void OnSequenceReleased(string requestId)
+        {
+            lock (_gate)
+            {
+                if (_holders.Remove(requestId, out var holder) && ReferenceEquals(_active, holder))
+                {
+                    _active = _primary;
+                    _activeKey = null;
+                }
+            }
+        }
+    }
+
+    /// <summary>
+    /// A per-block-capture (recurrent) fake: its logits come from a running state
+    /// folded over every forwarded (position, token), and a block snapshot carries
+    /// that state AS OF THE EXTRACTION, so an injected prefix resumes from the state
+    /// its last block was captured at - exactly the hazard a mid-chunk capture has.
+    /// </summary>
+    private sealed class RecurrentHashModel : IModelArchitecture
+    {
+        private readonly object _gate = new();
+        private readonly List<int> _rows = new();
+        private ulong _state = Seed;
+
+        public int? RefuseInjectAt { get; set; }
+        public int RefusedInjects { get; private set; }
+
+        public ModelConfig Config { get; } = new() { VocabSize = VocabSize };
+        public ITokenizer Tokenizer { get; } = new HistoryHashModel.NumberTokenizerPublic();
+        public IMultimodalInjector MultimodalInjector => null;
+        public IBackendExecutionPlan ExecutionPlan => null;
+        public bool SupportsKVCacheTruncation => false;
+        public bool SupportsKVStateSnapshot => true;
+        public bool RequiresPerBlockCapture => true;
+        public string KVStateFingerprint => "recurrent-hash";
+
+        public float[] Forward(int[] tokens)
+        {
+            lock (_gate)
+            {
+                foreach (int t in tokens)
+                {
+                    _state = Fold(_state, _rows.Count, t);
+                    _rows.Add(t);
+                }
+                return PeakLogits(_state);
+            }
+        }
+
+        public void ResetKVCache() { lock (_gate) { _rows.Clear(); _state = Seed; } }
+
+        public void TruncateKVCache(int tokenCount) => throw new NotSupportedException();
+
+        public void Dispose() { }
+
+        public long ComputeKVBlockByteSize(int tokenCount) => (long)tokenCount * sizeof(int) + sizeof(ulong);
+
+        public bool TryExtractKVBlock(int startToken, int tokenCount, Span<byte> destination)
+        {
+            lock (_gate)
+            {
+                if (startToken < 0 || startToken + tokenCount > _rows.Count) return false;
+                for (int i = 0; i < tokenCount; i++)
+                    BitConverter.TryWriteBytes(destination.Slice(i * sizeof(int), sizeof(int)), _rows[startToken + i]);
+                BitConverter.TryWriteBytes(destination.Slice(tokenCount * sizeof(int), sizeof(ulong)), _state);
+                return true;
+            }
+        }
+
+        public bool TryInjectKVBlock(int destToken, int tokenCount, ReadOnlySpan<byte> source)
+        {
+            lock (_gate)
+            {
+                if (RefuseInjectAt == destToken)
+                {
+                    RefuseInjectAt = null;
+                    RefusedInjects++;
+                    return false;
+                }
+                if (destToken != _rows.Count) return false;
+                for (int i = 0; i < tokenCount; i++)
+                    _rows.Add(BitConverter.ToInt32(source.Slice(i * sizeof(int), sizeof(int))));
+                _state = BitConverter.ToUInt64(source.Slice(tokenCount * sizeof(int), sizeof(ulong)));
+                return true;
+            }
         }
     }
 }
