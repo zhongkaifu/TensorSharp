@@ -161,7 +161,11 @@ runner writes `run-plan.json` before starting, records each process exit code in
 `runs.txt`, and returns nonzero if any process fails. The summary rejects missing
 processes, partial pass sets, failed passes, missing workload rows, and incomplete
 runner logs. Older directories without a run plan cannot certify the requested
-number of runs. Run `compare.py` separately for token identity and workload shape;
+number of runs. Each arm runs from a private copy of its build output, with the
+native library from the specified repository; `name=managed-repo:native-repo`
+selects a different native build. `arm-identities.json` records repository paths
+and assembly/native SHA-256 hashes. Original build outputs are preserved.
+Run `compare.py` separately for token identity and workload shape;
 the summary's performance verdict does not establish numerical correctness.
 
 `python3 -m unittest discover -s benchmarks/AgentTurnBench -p 'test_abba.py'`
