@@ -558,7 +558,22 @@ OpenAI column wall time for the whole non-streamed request):
 
 Every reply in those runs (24 short-conversation and 16 long-conversation turns) is the
 same text as the Phase 0 head's and as this change's with the prefix cache off
-(`TS_SCHED_PREFIX_CACHE=0`), and text-only turns keep their reuse and timing.
+(`TS_SCHED_PREFIX_CACHE=0`), and text-only turns keep their reuse and timing
+(`AgentTurnBench --scenarios short,long,tool`, two runs each: within 0.5% of 6db6dbf6 and
+of the Phase 0 head on every row, identical tokens).
+
+On CUDA (E4B Q8_0, A40, one round) the image turn gets the same reuse and runs faster
+too: Web UI 449-token prompt 1.10 s (6db6dbf6) / 2.85 s (Phase 0) / **0.93 s**, OpenAI
+1.45 / 2.49 / **0.98 s**; past the window, Web UI 893 tokens reusing 615: 1.10 / 1.12 /
+**0.91 s**, OpenAI 870 tokens reusing 592: 2.05 / 1.06 / **0.87 s**. There, however, a
+turn continued from a cache is not token-for-token the cold reply on any build: on text
+turns and image turns alike, and on 6db6dbf6 as well, the greedy reply after a reused
+prefix leaves the cold one after a few dozen to a few hundred characters, because
+prefilling the same tokens in two chunks instead of one moves the logits by 0.65 to 0.8
+on E4B with these kernels (the text control of the test below). With identical prompts,
+the Phase 0 head's image-turn reply equals this change's in the short conversation, where
+both reuse the same prefix, and differs past the window, where the Phase 0 head prefilled
+from zero.
 
 Coverage: the native `gemma4-multimodal-mask-after-reused-prefix` test keeps a verbatim
 copy of the old rows, checks they are unchanged at P = 0 and for text, and checks that a
@@ -566,9 +581,16 @@ chunk at P > 0 sees exactly what the same queries see in a cold prefill in every
 layout (the old start-position gate fails 1,102 of its 1,200 media cases).
 `Gemma4MediaAfterReusedPrefixExactnessTests` (model-gated, `TS_TEST_MODEL_DIR`) prefills a
 text turn and then an image or audio turn with and without reuse, inside and past the
-window, on the fused and the per-op path: the fused greedy streams are identical and the
-prefill logits agree within 0.026 (on the Phase 0 head they differed by 3.2 for an image
-and 2.0 to 7.1 for audio past the window, and the per-op path by 3.2). The per-op path's
+window, on the fused and the per-op path. Its tolerance is twice the larger of two noise
+estimates measured in the same row: the same split with the media left out, and the cold
+media prefill on the other path. On Metal (E4B, E2B) both estimates are about 0.02 logits,
+the fused greedy streams are identical and the prefill logits agree within 0.026, while on
+the Phase 0 head they differed by 3.2 for an image and 2.0 to 7.1 for audio past the window
+(per-op path: 3.2). On CUDA (E4B, 12B, 26B-A4B) the estimates are 0.35 to 1.4 (2.7 for
+12B's short text control), every row passes, and the Phase 0 head's long-prefix rows
+differ by 3.3 to 3.8 (image) and 2.1 (audio), above the tolerances measured for the same
+rows here (1.3 to 2.8); the greedy streams there are compared only up to the first
+near-tie within the noise, which is usually the first token or two. The per-op path's
 greedy stream is not compared token for token: it is not reproducible against itself (four
 identical cold prefills flipped a near-tie at decode step 16). `Gemma4SoftTokenMaskTests`
 pins the two position conversions.
