@@ -294,6 +294,19 @@ namespace TensorSharp.Models
         public override int KVCacheTruncationGranularity => Math.Max(1, _truncateAlign);
 
         /// <summary>
+        /// What a slot of this load holds: the MLA latent ring, compressed and indexer
+        /// rows, all sized by the layer count, head geometry and sliding window, plus which
+        /// executor owns them (the native, direct-CUDA and pure-C# executors keep different
+        /// state and rewind differently) and the dtype actually allocated (always F16, see
+        /// <see cref="DeepSeek4Architecture.ExecutorKvCacheDtype"/>). All construction-time.
+        /// </summary>
+        public override string KVStateFingerprint =>
+            $"deepseek4|arch={Config.Architecture}|L={Config.NumLayers}|H={Config.NumHeads}|D={Config.KeyLength}" +
+            $"|hidden={Config.HiddenSize}|experts={Config.NumExperts}x{Config.NumExpertsUsed}|swa={Config.SlidingWindow}" +
+            $"|exec={(_cudaExec != null ? "cuda" : _cpuExec != null ? "cpu" : "native")}|align={_truncateAlign}" +
+            $"|dspark={DraftBlockSize}|dtype={_kvCacheDtype.ToShortString()}";
+
+        /// <summary>
         /// Refusable truncation. A refusal is normal - it means the target is further back
         /// than the slot's checkpoint can reach - and the caller resets and re-prefills.
         /// </summary>

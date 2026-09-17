@@ -16,7 +16,8 @@ namespace TensorSharp.Server
     /// Owner of the per-model <see cref="InferenceEngine"/>. Lifecycle-bound to
     /// <see cref="ModelLifecycleService"/>: the engine is constructed lazily on
     /// first access (after a model has been loaded) and rebuilt whenever the
-    /// model's KV-state fingerprint changes (i.e. on model swap). Disposing
+    /// model object or its KV-state fingerprint changes (i.e. on model swap,
+    /// including a reload of a checkpoint with the same fingerprint). Disposing
     /// this service tears down the engine, which joins its worker thread and
     /// frees the paged KV block pool.
     ///
@@ -36,6 +37,12 @@ namespace TensorSharp.Server
         private readonly object _gate = new();
         private InferenceEngine _engine;
         private string _fingerprint;
+        // The model object the standing engine was built on. The fingerprint alone is
+        // not an identity: it names a cache SHAPE, so two loads of the same checkpoint
+        // (or two checkpoints that share a geometry) report the same string, and an
+        // engine built on the first would keep driving a model that has since been
+        // disposed and replaced (DEC-37).
+        private object _engineModel;
         private bool _disposed;
 
         /// <summary>
@@ -121,7 +128,9 @@ namespace TensorSharp.Server
             lock (_gate)
             {
                 if (_disposed) return null;
-                if (_engine != null && string.Equals(_fingerprint, fp, StringComparison.Ordinal))
+                if (_engine != null
+                    && ReferenceEquals(_engineModel, model)
+                    && string.Equals(_fingerprint, fp, StringComparison.Ordinal))
                     return _engine;
 
                 _engine?.Dispose();
@@ -134,6 +143,7 @@ namespace TensorSharp.Server
                     PrefixCheckpointStore = _checkpointStore,
                 };
                 _fingerprint = fp;
+                _engineModel = model;
                 // The most recent switch, in case it was written after this engine's
                 // configuration was read from the environment.
                 if (_pendingSpeculation is { } pending)
@@ -238,6 +248,7 @@ namespace TensorSharp.Server
                 _engine?.Dispose();
                 _engine = null;
                 _fingerprint = null;
+                _engineModel = null;
             }
         }
 
@@ -249,6 +260,7 @@ namespace TensorSharp.Server
                 _disposed = true;
                 _engine?.Dispose();
                 _engine = null;
+                _engineModel = null;
             }
         }
     }
