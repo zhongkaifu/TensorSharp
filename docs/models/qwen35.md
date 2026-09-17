@@ -820,6 +820,16 @@ Allocated once in `InitGDNBuffers()`:
 - `ResetKVCache()` zeroes both kinds of cache.
 - Initial CUDA cache allocation can be smaller than `maxContextLength` and
   grows on demand (printed at startup).
+- **The whole-model decode's conv scratch** (`_fdConvScratch`) belongs to each cache
+  (the primary and every per-request holder) and is swapped with it. It is allocated
+  whenever the active cache has none, reseeded from the GDN host ring, not only when
+  the decode descriptors are first built. A cache that had never decoded by then - the
+  model's original primary cache, saved aside when a holder was bound first - used to
+  keep a null scratch, and its first decode after being restored threw a
+  `NullReferenceException` in `TryFullModelDecodeCore`. On the engine that is a freshly
+  loaded model whose first scheduled step is a concurrent one, followed later by a solo
+  decode on the primary cache. The arena batched decode treats a holder without a
+  scratch the same way. `Qwen35ConvScratchTests` (model-gated) covers it.
 
 ### File-mapped quantized weights
 

@@ -595,6 +595,13 @@ GGML 后端上 `qwen35moe` / `qwen3next` 的 decode 中，每层 MoE expert 计�
 - **GatedDeltaNet 层**：`_convState[layer]` 是 `(convKernel - 1) * qkvDim` 的 float 数组（conv1d 滑动窗口），`_deltaStateTensor[layer]` 形如 `[numVHeads, headVDim, headKDim]`（SSM 隐状态）。
 - `ResetKVCache()` 同时清零两类缓存。
 - 初始 CUDA 缓存可以小于 `maxContextLength`，按需扩张（启动时打印）。
+- **整模型 decode 的 conv scratch**（`_fdConvScratch`）属于每个缓存（主缓存和每个按请求的 holder），随缓存
+  一起换入换出。只要当前激活的缓存还没有 scratch 就会分配（其 GDN 真值在 host 环形缓冲里，从那里重新
+  填充），而不只是在首次构建 decode 描述符时分配。以前，一个在那一刻之前从未 decode 过的缓存（模型最初的
+  主缓存，在先绑定某个 holder 时被保存到一旁）会保留空 scratch，恢复后第一次 decode 就在
+  `TryFullModelDecodeCore` 中抛出 `NullReferenceException`；在引擎上，这对应新加载模型的第一个调度步是并发
+  步、之后主缓存上又有一次单独 decode 的情形。arena 批处理 decode 对 scratch 为空的 holder 同样处理。
+  `Qwen35ConvScratchTests`（需要模型）覆盖这一点。
 
 ### mmap 量化权重
 
