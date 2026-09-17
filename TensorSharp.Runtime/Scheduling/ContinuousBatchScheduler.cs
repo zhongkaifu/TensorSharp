@@ -777,7 +777,8 @@ namespace TensorSharp.Runtime.Scheduling
         /// after every running prompt has allocated the rest of its own. Decode growth
         /// is not reserved: it arrives one token at a time and is served by preempting
         /// the newest sequence, which re-prefills a prompt that was already admitted.
-        /// Conservative for a prompt whose prefix is later adopted from the index.
+        /// Prompt blocks the candidate would adopt from a running sequence are not
+        /// counted (see the body).
         /// </summary>
         private bool HasPromptCapacityFor(SequenceState candidate)
         {
@@ -788,7 +789,22 @@ namespace TensorSharp.Runtime.Scheduling
                 if (missing > 0) outstanding += missing;
             }
             int need = BlocksFor(candidate.PromptTokens.Count, _cfg.BlockSize) - candidate.BlockTable.NumBlocks;
-            return (long)_pool.NumFreeBlocks - outstanding >= need;
+            long available = (long)_pool.NumFreeBlocks - outstanding;
+            if (available >= need)
+                return true;
+
+            // Prefix blocks another sequence is still using are shared on adoption
+            // and cost the pool nothing, so they do not count against the newcomer
+            // (without this, requests sharing a long system prompt or document ran one
+            // at a time once their prompts summed past the pool). An idle cached block
+            // sits in the free queue, so adopting it costs a free block like a new one.
+            // Only consulted when the cheap check fails, i.e. while a request waits.
+            if (PrefixCachingActive && candidate.BlockTable.NumBlocks == 0)
+            {
+                foreach (var block in FindAdoptablePrefixBlocks(candidate, out _))
+                    if (block.RefCount > 0) need--;
+            }
+            return available >= need;
         }
 
         private string _capacityWaitLoggedFor;
@@ -883,7 +899,41 @@ namespace TensorSharp.Runtime.Scheduling
         private void AdoptPrefixBlocksCapped(SequenceState seq)
         {
             if (seq.BlockTable.NumBlocks > 0) return;
-            if (seq.PromptTokens.Count < _cfg.BlockSize) return;
+            var adoptable = FindAdoptablePrefixBlocks(seq, out int matched);
+            int adopted = adoptable.Count;
+            if (adopted < matched)
+            {
+                // The cache MATCHED more than it can deliver; without this line
+                // the user sees kvCacheReusedTokens far below a warm cache's
+                // promise with no explanation.
+                _logger.LogInformation(
+                    "Prefix cache matched {Matched} block(s) for {RequestId} but only {Adopted} are " +
+                    "restorable (a recurrent checkpoint boundary caps adoption); the rest of the " +
+                    "prompt re-prefills.",
+                    matched, seq.RequestId, adopted);
+            }
+            for (int i = 0; i < adopted; i++)
+            {
+                _pool.Touch(adoptable[i]);
+                seq.BlockTable.AppendBlock(adoptable[i]);
+            }
+
+            int adoptedTokens = adopted * _cfg.BlockSize;
+            if (adoptedTokens > 0)
+            {
+                seq.PrefixCacheReusedTokens = adoptedTokens;
+                seq.SetComputedTokensForPrefixAdoption(adoptedTokens);
+            }
+        }
+
+        /// <summary>The leading prompt blocks <see cref="AdoptPrefixBlocksCapped"/>
+        /// would adopt for <paramref name="seq"/>, without touching refcounts or the
+        /// block table. <paramref name="matched"/> is how many blocks the index
+        /// matched before the restorable-endpoint backtrack.</summary>
+        private List<KvBlock> FindAdoptablePrefixBlocks(SequenceState seq, out int matched)
+        {
+            matched = 0;
+            if (seq.PromptTokens.Count < _cfg.BlockSize) return new List<KvBlock>();
 
             var hashes = KvBlockHasher.ComputeBlockHashes(seq.PromptTokens, _cfg.BlockSize, EffectiveFingerprint(seq));
             int maxAdoptableTokens = Math.Max(0, seq.PromptTokens.Count - 1);
@@ -916,30 +966,11 @@ namespace TensorSharp.Runtime.Scheduling
             // only when followed by a real checkpoint, whose injection overwrites
             // that transient state. Backtrack to the newest such endpoint before
             // changing refcounts or the sequence block table.
+            matched = matching.Count;
             int adopted = lastRestorable + 1;
             if (adopted < matching.Count)
-            {
-                // The cache MATCHED more than it can deliver; without this line
-                // the user sees kvCacheReusedTokens far below a warm cache's
-                // promise with no explanation.
-                _logger.LogInformation(
-                    "Prefix cache matched {Matched} block(s) for {RequestId} but only {Adopted} are " +
-                    "restorable (a recurrent checkpoint boundary caps adoption); the rest of the " +
-                    "prompt re-prefills.",
-                    matching.Count, seq.RequestId, adopted);
-            }
-            for (int i = 0; i < adopted; i++)
-            {
-                _pool.Touch(matching[i]);
-                seq.BlockTable.AppendBlock(matching[i]);
-            }
-
-            int adoptedTokens = adopted * _cfg.BlockSize;
-            if (adoptedTokens > 0)
-            {
-                seq.PrefixCacheReusedTokens = adoptedTokens;
-                seq.SetComputedTokensForPrefixAdoption(adoptedTokens);
-            }
+                matching.RemoveRange(adopted, matching.Count - adopted);
+            return matching;
         }
 
         /// <summary>After advancing tokens or finishing, check whether the
