@@ -363,18 +363,18 @@ holder records a rope delta, so continuing a cache past an image is not what a
 re-prefill builds. Their reuse stops at the first media span until decode carries the
 compressed position; Gemma 4 uses absolute positions and continues past images.
 
-Prefilling an image *after* a reused prefix is a separate question. Gemma 4's fused
-prefill emits the image's bidirectional mask only at start position 0, so such a chunk
-runs on the slower per-op path. Within the sliding window that path matched a cold
-prefill token for token (and costs time: on E4B/Metal a 457-token image turn reusing 179
-tokens took 1.25 s to first token instead of 0.66 s). Once the prompt outgrows the window
-it did not match, so `IModelArchitecture.CanPrefillMediaAfterReusedPrefix` makes such a
-turn reuse nothing past its public prefix; the text turns after it still continue the cache
-past the image. The public prefix itself is still cloned from the shared-prefix checkpoint:
-while checkpoints are in use every prefill is cut at that boundary, so the image runs after
-it with or without reuse (E4B/Metal, a 1,163-token system prompt plus an image: the same
-reply either way, 1.51 s to first token with the checkpoint and 1.84 s without). A turn with
-no public prefix prefills from zero, in one fused pass when it fits one prefill chunk.
+Prefilling an image *after* a reused prefix is a separate question. A model that cannot
+do it exactly returns false from `IModelArchitecture.CanPrefillMediaAfterReusedPrefix`, and
+such a turn then reuses nothing past its public prefix. The public prefix itself is still
+cloned from the shared-prefix checkpoint: while checkpoints are in use every prefill is cut
+at that boundary, so the media runs after it with or without reuse; a turn with no public
+prefix prefills from zero. No shipped model returns false. Gemma 4 did past its sliding
+window until its fused prefill applied the image's bidirectional mask at any start position
+and its per-op path mapped the mask onto a wrapped window; an image turn now reuses the
+conversation's text and prefills the image on the fused graph (E4B/Metal: a 457-token image
+turn reusing 179 tokens reaches its first token in 0.57 s, against 1.25 s on the per-op
+path and 0.64 s cold; an 889-token one past the window reuses 611 tokens, 0.62 s against
+0.85 to 0.90 s without reuse). See the [Gemma 4 card](models/gemma4.md#image-and-audio-turns-after-a-reused-prefix).
 
 On Gemma 4 the live cache is continued for turns of `MaxReusablePrefixTokens` (the
 sliding window) tokens or fewer too; before, such turns fell to the pooled path, which
@@ -392,7 +392,7 @@ tokens another conversation's state matched past the public prefix.
 |---|---|
 | Scheduler / block pool | `ContinuousBatchSchedulerTests`, `PagedKvCacheTests`, `PagedKvCacheCodecTests` |
 | Batched executor primitives | `BatchedExecutorTests`, including managed paged-attention correctness and multi-sequence logits routing; `RetainedFusedCacheTests` for capability-gated holder retention/re-keying and LRU cleanup, conversation-scope isolation (including a random-interleaving property test) and positional media checks |
-| Cross-request isolation and media identity | `ModelServiceRawTokenHistoryTests` and `ToolTranscriptSpliceTests` (content-verified raw-token splice), `PooledPrefixScopeAndMediaTests`, `ContentAddressedMediaTests` |
+| Cross-request isolation and media identity | `ModelServiceRawTokenHistoryTests` and `ToolTranscriptSpliceTests` (content-verified raw-token splice), `PooledPrefixScopeAndMediaTests`, `ContentAddressedMediaTests`; `Gemma4MediaAfterReusedPrefixExactnessTests` (model-gated: an image or audio turn after a reused prefix against a cold prefill) and `Gemma4SoftTokenMaskTests` |
 | Per-model correctness | `Qwen35BatchedCorrectnessTests`, `Mistral3BatchedForwardTests`, `Gemma4BatchedForwardTests`, `GptOssBatchedCorrectnessTests`, `NemotronBatchedCorrectnessTests` |
 | MTP speculative decoding | `SpeculativeExecutionTests` (draft/verify/rollback core), opt-in end-to-end `Qwen36SpeculativeTests` (`TS_MTP_E2E=1`) and `Gemma4SpeculativeTests` (`TS_GMTP_E2E=1`) with real GGUFs |
 | Per-model performance probes | `Gemma4BatchedPerfBench`, `Qwen35BatchedPerfBench`, `GptOssBatchedPerfBench`, `NemotronBatchedPerfBench` |

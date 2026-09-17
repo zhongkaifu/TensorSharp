@@ -410,9 +410,32 @@ rope_freqs.weight                          # 比例频率因子
 
 ### 整模型单图 prefill（`NativeGemma4ModelVerify`）
 
-在 ggml 后端上，普通的多 token prefill 由 MTP 验证所用的同一个融合整模型内核（§12）来执行：所有层在单次 GGML 图派发中完成，激活值常驻设备，而不是每层一张图。`CanUseWholeModelPrefillVerify()` 决定是否走该路径——仅限密集模型，包括 E 系列的内核内 PLE 与共享 KV donor 层；多模态 chunk 在 `startPos == 0` 时可通过内核的双向 span mask 走该路径（`TS_G4_MM_PREFILL=0` 让多模态退回逐算子路径）。`startPos > 0` 的 SWA 包裹 chunk 通过内核内的 swaPrev gather 留在融合路径上（`TS_G4_VERIFY_SWAPREV=0` 关闭）。全 MoE 变体（例如 26B-A4B）有对应的融合路径：`CanUseWholeModelMoEPrefillVerify()` / `TryFusedMoEModelVerify()`。设 `TS_G4_WHOLE_PREFILL=0` 可强制走逐算子分块路径做 A/B。注意，块量化（`q8_0` / `q4_0`）KV cache 的多 token prefill *必须*走该路径——逐算子回退无法遍历块量化的 cache 布局。
+在 ggml 后端上，普通的多 token prefill 由 MTP 验证所用的同一个融合整模型内核（§12）来执行：所有层在单次 GGML 图派发中完成，激活值常驻设备，而不是每层一张图。`CanUseWholeModelPrefillVerify()` 决定是否走该路径——仅限密集模型，包括 E 系列的内核内 PLE 与共享 KV donor 层；多模态 chunk 在任意起始位置都可通过内核的双向 span mask 走该路径（`TS_G4_MM_PREFILL=0` 让多模态退回逐算子路径；见[复用前缀之后的图片与音频回合](#复用前缀之后的图片与音频回合)）。`startPos > 0` 的 SWA 包裹 chunk 通过内核内的 swaPrev gather 留在融合路径上（`TS_G4_VERIFY_SWAPREV=0` 关闭）。全 MoE 变体（例如 26B-A4B）有对应的融合路径：`CanUseWholeModelMoEPrefillVerify()` / `TryFusedMoEModelVerify()`。设 `TS_G4_WHOLE_PREFILL=0` 可强制走逐算子分块路径做 A/B。注意，块量化（`q8_0` / `q4_0`）KV cache 的多 token prefill *必须*走该路径——逐算子回退无法遍历块量化的 cache 布局。
 
 调度器会把 solo（无争用）prompt 以大分块喂给该路径，分块上限由 `TS_SCHED_SOLO_PREFILL_CHUNK`（默认 8192）控制。实测设计见 [`docs/perf/gemma4-prefill-cuda-graph-design.md`](../perf/gemma4-prefill-cuda-graph-design.md)。
+
+### 复用前缀之后的图片与音频回合
+
+图片、视频帧或音频片段以一段软 token 进入提示，这些软 token 彼此双向注意。prefill 内核用每个 chunk token 一个字节（`is_except`）表达这一点：软 token 查询还会读取本 chunk 中位于其后的软 token 键，而所有查询都因果地读取其之前的键，局部层上限定在滑动窗口之内。当一个会话把缓存续接到图片回合时，图片 chunk 从非零位置 P 开始，位于之前回合留下的文本之后。
+
+在此之前，融合内核（密集的 `TSGgml_Gemma4ModelVerify`、MoE 的 `TSGgml_Gemma4MoEModelVerify`）只在 P = 0 时应用软 token 条件，因为它们拿键在缓冲区中的下标与 chunk 的字节比较。于是门控把 P > 0 的媒体 chunk 交给逐算子路径，这条路径更慢（E4B/Metal，一个复用 179 token 的 457 token 图片回合：首 token 1.25 s，冷启动为 0.64 s），而且环回绕之后是错的：它的掩码把缓冲区下标当作绝对位置，但超出窗口后收集的窗口从 P - 511 开始，而不是 0。Phase 0 因此只能让这样的回合不复用公共前缀之后的内容（`CanPrefillMediaAfterReusedPrefix`）。
+
+融合内核注意的每个缓冲区都把本 chunk 作为最后 N 个真实键：P = 0 时只有 chunk 本身，全局缓存 `[0, P + N)`，未回绕的滑动窗口缓存，或者从已回绕的环中收集并前置到 chunk 之前的上一窗口。因此键在 chunk 中的下标就是它在缓冲区中的下标减去 chunk 之前的真实键数，`gemma4_mm_mask.h` 中的行构造函数应用了这个偏移。在 P = 0 以及文本 chunk 上，它们生成的行与之前相同。逐算子路径把软 token 的绝对位置平移到其键缓冲区的坐标系中（`ShiftPositions`），与张量并行的逐算子路径早已采用的做法一致；张量并行的融合 verify 现在也在任意 P 传入 chunk 掩码（其密集变体过去在 P > 0 运行媒体 chunk 时完全没有软 token 掩码）。
+
+所以 Gemma 4 不再重写 `CanPrefillMediaAfterReusedPrefix`：图片回合在任意提示长度下都会复用会话的文本，图片 chunk 走融合图。在 E4B（Q8_0，Metal，M5 Pro）上用 IMG 会话（文本、文本、图片、文本；贪心；两轮取中位数；Web UI 一列为首 token 时间，OpenAI 一列为整个非流式请求的耗时）测得：
+
+| 第 3 回合（图片） | 6db6dbf6 | Phase 0 | 本改动 |
+|---|---|---|---|
+| Web UI，457 token 提示：复用 / 首 token 时间 | 0 / 0.64 s | 179 / 1.25 s | 179 / **0.57 s** |
+| OpenAI，457 token 提示：复用 / 耗时 | 0 / 1.80 s | 179 / 2.09 s | 179 / **1.46 s** |
+| Web UI，889 token 提示（超出窗口）：复用 / 首 token 时间 | 0 / 0.85 s | 0 / 0.90 s | 611 / **0.62 s** |
+| OpenAI，946 token 提示（超出窗口）：复用 / 耗时 | 0 / 1.86 s | 0 / 1.60 s | 668 / **1.29 s** |
+
+这些运行中的每条回复（短会话 24 个回合、长会话 16 个回合）都与 Phase 0 头部的文本相同，也与本改动关闭前缀缓存（`TS_SCHED_PREFIX_CACHE=0`）时的文本相同，纯文本回合的复用量和耗时保持不变。
+
+覆盖：原生测试 `gemma4-multimodal-mask-after-reused-prefix` 保留旧行构造的逐字副本，检查它们在 P = 0 和文本上不变，并检查 P > 0 的 chunk 在每种缓冲区布局下看到的内容与冷启动 prefill 中相同查询看到的完全一致（旧的起始位置门控在其 1,200 个媒体用例中失败 1,102 个）。`Gemma4MediaAfterReusedPrefixExactnessTests`（受模型门控，`TS_TEST_MODEL_DIR`）先 prefill 一个文本回合，再以复用和不复用两种方式 prefill 一个图片或音频回合，分别在窗口内外、融合与逐算子路径上运行：融合路径的贪心输出完全相同，prefill logits 相差不超过 0.026（在 Phase 0 头部，超出窗口时图片相差 3.2、音频相差 2.0 到 7.1，逐算子路径相差 3.2）。逐算子路径的贪心输出不逐 token 比较：它自身就不可复现（四次相同的冷启动 prefill 在第 16 步解码处翻转了一个近乎平局的 token）。`Gemma4SoftTokenMaskTests` 固定了两种位置换算。
+
+有两个限制沿袭自冷启动路径。掩码标记的是软 token，而不是它们属于哪个媒体项，因此在同一 chunk 中 prefill 的两张图片会彼此双向注意。在较早回合发送过图片的会话，是在该图片自己的 chunk 中 prefill 的，那时它看不到后来的图片；而对整段历史的冷启动 prefill 让它看得到，所以两张图片之后的回复在两者之间可能不同。另外，落在 span 内部的 chunk 边界（调度器在争用时的 256 token 分块可能造成）会切断其双向注意。
 
 ### 内核内 PLE gather
 

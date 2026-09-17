@@ -314,14 +314,15 @@ Qwen 3.5/3.6 声明 `SupportsReuseAcrossMediaSpan = false`：它们的 M-RoPE �
 prefill 不同。在 decode 使用压缩位置之前，它们的复用止于第一个媒体区间；Gemma 4 使用绝对位置，
 可以越过图片续接。
 
-在复用前缀*之后*预填充图片是另一回事。Gemma 4 的融合 prefill 只在起始位置 0 输出图片的双向掩码，
-因此这样的分块走较慢的逐算子路径。在滑动窗口之内，该路径与冷启动 prefill 逐 token 一致（但更慢：
-E4B/Metal 上一个复用 179 token 的 457 token 图片回合首 token 用时 1.25 s，而不是 0.66 s）。一旦提示
-超出窗口就不再一致，所以 `IModelArchitecture.CanPrefillMediaAfterReusedPrefix` 让这样的回合不复用
-公共前缀之后的内容；其后的文本回合仍会越过图片续接缓存。公共前缀本身仍从共享前缀检查点克隆：启用
-检查点时每次 prefill 都会在该边界切分，所以无论是否复用，图片都在它之后预填充（E4B/Metal，1,163 token
-的系统提示加一张图片：两种情况回复相同，使用检查点时首 token 1.51 s，不使用时 1.84 s）。没有公共前缀
-的回合从零 prefill，能放进一个 prefill 分块时走一次融合计算。
+在复用前缀*之后*预填充图片是另一回事。无法精确做到这一点的模型让
+`IModelArchitecture.CanPrefillMediaAfterReusedPrefix` 返回 false，这样的回合便不复用公共前缀之后的内容。
+公共前缀本身仍从共享前缀检查点克隆：启用检查点时每次 prefill 都会在该边界切分，所以无论是否复用，媒体
+都在它之后预填充；没有公共前缀的回合从零 prefill。目前发布的模型都不返回 false。Gemma 4 过去在超出
+滑动窗口时返回 false，直到它的融合 prefill 能在任意起始位置应用图片的双向掩码、逐算子路径能把掩码
+映射到已回绕的窗口上；现在图片回合会复用会话的文本，并在融合图上预填充图片（E4B/Metal：一个复用
+179 token 的 457 token 图片回合首 token 用时 0.57 s，逐算子路径为 1.25 s，冷启动为 0.64 s；一个超出窗口的
+889 token 回合复用 611 token，首 token 0.62 s，不复用时为 0.85 到 0.90 s）。详见
+[Gemma 4 模型卡](models/gemma4_zh-cn.md#复用前缀之后的图片与音频回合)。
 
 在 Gemma 4 上，不超过 `MaxReusablePrefixTokens`（滑动窗口）个 token 的回合现在也会续接 live cache；
 之前这类回合落到池化路径，只能返回整块的 256 token。已回绕环上的回退依旧被拒绝。
@@ -337,7 +338,7 @@ E4B/Metal 上一个复用 179 token 的 457 token 图片回合首 token 用时 1
 |---|---|
 | 调度器 / 块池 | `ContinuousBatchSchedulerTests`、`PagedKvCacheTests`、`PagedKvCacheCodecTests` |
 | 批处理执行原语 | `BatchedExecutorTests`，覆盖托管分页注意力正确性与多序列 logits 路由；`RetainedFusedCacheTests` 覆盖按能力启用的 holder 保留 / 重新绑定与 LRU 清理、会话作用域隔离（含随机交错的性质测试）与按位置的媒体检查 |
-| 跨请求隔离与媒体身份 | `ModelServiceRawTokenHistoryTests` 与 `ToolTranscriptSpliceTests`（按内容校验的原始 token 拼接）、`PooledPrefixScopeAndMediaTests`、`ContentAddressedMediaTests` |
+| 跨请求隔离与媒体身份 | `ModelServiceRawTokenHistoryTests` 与 `ToolTranscriptSpliceTests`（按内容校验的原始 token 拼接）、`PooledPrefixScopeAndMediaTests`、`ContentAddressedMediaTests`；`Gemma4MediaAfterReusedPrefixExactnessTests`（受模型门控：复用前缀之后的图片或音频回合对比冷启动 prefill）与 `Gemma4SoftTokenMaskTests` |
 | 按模型正确性 | `Qwen35BatchedCorrectnessTests`、`Mistral3BatchedForwardTests`、`Gemma4BatchedForwardTests`、`GptOssBatchedCorrectnessTests`、`NemotronBatchedCorrectnessTests` |
 | MTP 投机解码 | `SpeculativeExecutionTests`（起草 / 验证 / 回滚核心）、可选端到端 `Qwen36SpeculativeTests`（`TS_MTP_E2E=1`）与 `Gemma4SpeculativeTests`（`TS_GMTP_E2E=1`），需真实 GGUF |
 | 按模型性能探针 | `Gemma4BatchedPerfBench`、`Qwen35BatchedPerfBench`、`GptOssBatchedPerfBench`、`NemotronBatchedPerfBench` |
