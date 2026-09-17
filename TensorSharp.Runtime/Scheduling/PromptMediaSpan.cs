@@ -42,9 +42,9 @@ namespace TensorSharp.Runtime.Scheduling
         /// starts at or after the result is irrelevant: it is prefilled either way.
         /// </summary>
         /// <param name="allowReuseAcrossSpans">False for a model whose positions after a
-        /// media span are not reproduced exactly by continuing a cache (Qwen 3.5's
-        /// M-RoPE, see <see cref="IModelArchitecture.SupportsReuseAcrossMediaSpan"/>):
-        /// the prefix then stops at the first span either side has.</param>
+        /// media span are not reproduced exactly by continuing a cache (see
+        /// <see cref="IModelArchitecture.SupportsReuseAcrossMediaSpan"/>): the prefix
+        /// then stops at the first span either side has.</param>
         public static int ClampReusablePrefix(
             int reusableTokens,
             IReadOnlyList<PromptMediaSpan> target,

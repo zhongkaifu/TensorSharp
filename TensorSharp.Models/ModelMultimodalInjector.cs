@@ -343,6 +343,27 @@ namespace TensorSharp.Models
             return slice;
         }
 
+        /// <summary>The M-RoPE position delta of a request whose prompt has a position
+        /// table: the largest axis of its last row, plus one, minus the prompt length -
+        /// HF / SGLang <c>mrope_position_delta</c>. Every token past the prompt sits at
+        /// its KV index plus this. False for a text-only request (delta 0).</summary>
+        internal bool TryGetMRoPEPositionDelta(string requestId, out int delta)
+        {
+            delta = 0;
+            string key = NormalizeRequestId(requestId);
+            int[] full;
+            lock (_bucketLock)
+            {
+                if (!_mropePositionsByRequest.TryGetValue(key, out full) || full == null)
+                    return false;
+            }
+            int rows = full.Length / 3;
+            if (rows <= 0)
+                return false;
+            delta = Qwen35RopePositions.DeltaAfterRows(full, rows, rows);
+            return true;
+        }
+
         public bool HasPendingEmbeddings(string requestId)
         {
             string key = NormalizeRequestId(requestId);

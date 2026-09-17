@@ -1401,6 +1401,8 @@ namespace TensorSharp.Models
             if (_backend != BackendType.GgmlCuda && _backend != BackendType.GgmlMetal
                 && _backend != BackendType.GgmlVulkan)
                 return FdBail($"backend {_backend} has no fused whole-model decode graph");
+            if (!NativeRopePositionAbiSupported())
+                return FdBail("the native library predates the M-RoPE position argument");
             // Interior Metal prefill chunks can leave GDN state in the verify
             // ping-pong buffer. The decode graph owns different resident-state
             // bindings, so synchronize the authoritative verify state before its
@@ -1702,7 +1704,7 @@ namespace TensorSharp.Models
                         tokenId,
                         tokenEmbedding.ptr, tokenEmbedding.type,
                         tokenEmbedding.ne0, tokenEmbedding.ne1, tokenEmbedding.bytes,
-                        Config.HiddenSize, position,
+                        Config.HiddenSize, position, _ropeDelta,
                         Config.NumHeads, Config.NumKVHeads, headDim, cacheSize,
                         _ropeDimCount > 0 ? _ropeDimCount : headDim, 2, kvCacheType,
                         _convKernel, _headKDim, _headVDim, _numKHeads, _numVHeads,
@@ -1718,7 +1720,7 @@ namespace TensorSharp.Models
                     ok2 = GgmlBasicOps.Qwen35ModelDecode(
                         _fdLayers, n,
                         reseedState,
-                        TensorComputePrimitives.GetStoragePointer(hidden), Config.HiddenSize, position,
+                        TensorComputePrimitives.GetStoragePointer(hidden), Config.HiddenSize, position, _ropeDelta,
                         Config.NumHeads, Config.NumKVHeads, headDim, cacheSize,
                         // rope_n_dims: this model uses partial rotary (rope.dimension_count,
                         // e.g. 64 of the 256-dim head). Passing headDim here rotated ALL 256
@@ -1946,6 +1948,8 @@ namespace TensorSharp.Models
             // Single-device state only — see the note in TryFullModelDecode.
             if (IsTensorParallel)
                 return false;
+            if (!NativeRopePositionAbiSupported())
+                return FvBail("the native library predates the M-RoPE position argument");
             // Prefill requests logits for only the last nLogitRows tokens; MTP verify
             // (nLogitRows<=0) needs all seqLen rows. The kernel writes vocab*effLogitRows.
             int effLogitRows = (nLogitRows > 0 && nLogitRows < seqLen) ? nLogitRows : seqLen;
@@ -2269,7 +2273,10 @@ namespace TensorSharp.Models
                         stateSnapshotsUsed: (IntPtr)(&snapshotsUsed),
                         deviceStateCurrent: deviceStateCurrent,
                         deferStateDownload: deferState,
-                        ownerId: _verifyOwnerId);
+                        ownerId: _verifyOwnerId,
+                        // Rows the table covers carry their own positions; scalar rows
+                        // sit at KV index + the sequence's M-RoPE delta.
+                        ropePositionDelta: mropePos != null ? 0 : _ropeDelta);
                 }
             }
             if (!ok2)
@@ -2517,6 +2524,8 @@ namespace TensorSharp.Models
                 return false;
             if (!HasDraftHead || x == null || seqLen < 1)
                 return false;
+            if (!NativeRopePositionAbiSupported())
+                return false;
             int mtp = _mtpLayerIdx;
             if (mtp < 0 || _isRecurrent[mtp])     // the MTP block is a full-attention layer
                 return false;
@@ -2573,7 +2582,8 @@ namespace TensorSharp.Models
                         lmh.ptr, lmh.type, lmh.ne0, lmh.ne1, lmh.bytes,
                         finalNormPtr, normedOut != null ? (IntPtr)np : IntPtr.Zero, nLogitRows,
                         null, null,
-                        ownerId: _verifyOwnerId);
+                        ownerId: _verifyOwnerId,
+                        ropePositionDelta: _ropeDelta);
                 }
             }
             if (ok)

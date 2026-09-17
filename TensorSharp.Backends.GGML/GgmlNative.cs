@@ -3729,7 +3729,7 @@ internal enum GgmlIndexReductionOp
         private static partial int TSGgml_Qwen35ModelDecode(
             [In] Qwen35LayerDecodeArgs[] layers, int numLayers,
             [MarshalAs(UnmanagedType.Bool)] bool reseedState,
-            IntPtr hidden, int hiddenSize, int position,
+            IntPtr hidden, int hiddenSize, int position, int ropePositionDelta,
             int numHeads, int numKvHeads, int headDim, int cacheSize,
             int ropeNDims, int ropeMode, int kvCacheType,
             int convKernel, int headKDim, int headVDim, int numKHeads, int numVHeads,
@@ -3749,7 +3749,7 @@ internal enum GgmlIndexReductionOp
             int tokenId,
             IntPtr tokenEmbedding, int tokenEmbeddingType,
             long tokenEmbeddingNe0, long tokenEmbeddingNe1, long tokenEmbeddingBytes,
-            int hiddenSize, int position,
+            int hiddenSize, int position, int ropePositionDelta,
             int numHeads, int numKvHeads, int headDim, int cacheSize,
             int ropeNDims, int ropeMode, int kvCacheType,
             int convKernel, int headKDim, int headVDim, int numKHeads, int numVHeads,
@@ -3764,6 +3764,20 @@ internal enum GgmlIndexReductionOp
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         private static partial void TSGgml_Qwen35ResetDecodeCache();
 
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int TSGgml_Qwen35RopePositionAbi();
+
+        /// <summary>The Qwen3.5 fused-graph position contract the loaded library
+        /// implements (see TSGgml_Qwen35RopePositionAbi), or 0 for a library built
+        /// before the solo decode, verify and arena entry points took the RoPE
+        /// position separately from the KV index.</summary>
+        public static int Qwen35RopePositionAbi()
+        {
+            try { return TSGgml_Qwen35RopePositionAbi(); }
+            catch (EntryPointNotFoundException) { return 0; }
+        }
+
         // Qwen3.5/3.8 SLOT-STABLE ARENA token-batched decode (the GPT-OSS arena
         // design ported to the hybrid GDN + attention family; see
         // ggml_ops_qwen35_batched_arena.cpp). kCaches/vCaches are
@@ -3772,7 +3786,7 @@ internal enum GgmlIndexReductionOp
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         private static partial int TSGgml_Qwen35ArenaDecodeBatched(
             [In] Qwen35LayerDecodeArgs[] layers, int numLayers, int nSeqs,
-            [In] int[] tokenIds, [In] int[] positions,
+            [In] int[] tokenIds, [In] int[] positions, [In] int[] ropePositions,
             [In] IntPtr[] kCaches, [In] IntPtr[] vCaches,
             [In] IntPtr[] convStates, [In] IntPtr[] deltaStates,
             [In] int[] gdnHostAuth, [In] int[] cacheSizes,
@@ -3794,7 +3808,7 @@ internal enum GgmlIndexReductionOp
         /// A -1 must never be converted into serial fallback.</summary>
         public static int Qwen35ArenaDecodeBatchedStatus(
             Qwen35LayerDecodeArgs[] layers, int numLayers, int nSeqs,
-            int[] tokenIds, int[] positions,
+            int[] tokenIds, int[] positions, int[] ropePositions,
             IntPtr[] kCaches, IntPtr[] vCaches,
             IntPtr[] convStates, IntPtr[] deltaStates,
             int[] gdnHostAuth, int[] cacheSizes,
@@ -3810,7 +3824,7 @@ internal enum GgmlIndexReductionOp
             IntPtr tokenEmbd, int tokenEmbdType,
             long tokenEmbdNe0, long tokenEmbdNe1, long tokenEmbdBytes,
             IntPtr sampled, bool wantLogits)
-            => TSGgml_Qwen35ArenaDecodeBatched(layers, numLayers, nSeqs, tokenIds, positions,
+            => TSGgml_Qwen35ArenaDecodeBatched(layers, numLayers, nSeqs, tokenIds, positions, ropePositions,
                 kCaches, vCaches, convStates, deltaStates, gdnHostAuth, cacheSizes,
                 numHeads, numKvHeads, headDim, ropeNDims, ropeMode, kvCacheType,
                 convKernel, headKDim, headVDim, numKHeads, numVHeads,
@@ -3942,7 +3956,7 @@ internal enum GgmlIndexReductionOp
         public static bool Qwen35ModelDecode(
             Qwen35LayerDecodeArgs[] layers, int numLayers,
             bool reseedState,
-            IntPtr hidden, int hiddenSize, int position,
+            IntPtr hidden, int hiddenSize, int position, int ropePositionDelta,
             int numHeads, int numKvHeads, int headDim, int cacheSize,
             int ropeNDims, int ropeMode, int kvCacheType,
             int convKernel, int headKDim, int headVDim, int numKHeads, int numVHeads,
@@ -3956,7 +3970,7 @@ internal enum GgmlIndexReductionOp
         {
             return TSGgml_Qwen35ModelDecode(
                 layers, numLayers, reseedState,
-                hidden, hiddenSize, position,
+                hidden, hiddenSize, position, ropePositionDelta,
                 numHeads, numKvHeads, headDim, cacheSize,
                 ropeNDims, ropeMode, kvCacheType,
                 convKernel, headKDim, headVDim, numKHeads, numVHeads,
@@ -3974,7 +3988,7 @@ internal enum GgmlIndexReductionOp
             int tokenId,
             IntPtr tokenEmbedding, int tokenEmbeddingType,
             long tokenEmbeddingNe0, long tokenEmbeddingNe1, long tokenEmbeddingBytes,
-            int hiddenSize, int position,
+            int hiddenSize, int position, int ropePositionDelta,
             int numHeads, int numKvHeads, int headDim, int cacheSize,
             int ropeNDims, int ropeMode, int kvCacheType,
             int convKernel, int headKDim, int headVDim, int numKHeads, int numVHeads,
@@ -3990,7 +4004,7 @@ internal enum GgmlIndexReductionOp
                 tokenId,
                 tokenEmbedding, tokenEmbeddingType,
                 tokenEmbeddingNe0, tokenEmbeddingNe1, tokenEmbeddingBytes,
-                hiddenSize, position,
+                hiddenSize, position, ropePositionDelta,
                 numHeads, numKvHeads, headDim, cacheSize,
                 ropeNDims, ropeMode, kvCacheType,
                 convKernel, headKDim, headVDim, numKHeads, numVHeads,
@@ -4013,7 +4027,7 @@ internal enum GgmlIndexReductionOp
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         private static partial int TSGgml_Qwen35ModelVerifyOwned(
             [In] Qwen35LayerDecodeArgs[] layers, int numLayers,
-            IntPtr hidden, int hiddenSize, int startPos, int numTokens,
+            IntPtr hidden, int hiddenSize, int startPos, int numTokens, int ropePositionDelta,
             int numHeads, int numKvHeads, int headDim, int cacheSize,
             int ropeNDims, int ropeMode, int kvCacheType,
             int convKernel, int headKDim, int headVDim, int numKHeads, int numVHeads,
@@ -4046,10 +4060,10 @@ internal enum GgmlIndexReductionOp
             IntPtr captureData = default, int[] captureLayers = null, int captureCount = 0,
             int stateSnapshots = 1, IntPtr stateSnapshotsUsed = default,
             bool deviceStateCurrent = false, bool deferStateDownload = false,
-            long ownerId = 0)
+            long ownerId = 0, int ropePositionDelta = 0)
         {
             return TSGgml_Qwen35ModelVerifyOwned(
-                layers, numLayers, hidden, hiddenSize, startPos, numTokens,
+                layers, numLayers, hidden, hiddenSize, startPos, numTokens, ropePositionDelta,
                 numHeads, numKvHeads, headDim, cacheSize,
                 ropeNDims, ropeMode, kvCacheType,
                 convKernel, headKDim, headVDim, numKHeads, numVHeads,

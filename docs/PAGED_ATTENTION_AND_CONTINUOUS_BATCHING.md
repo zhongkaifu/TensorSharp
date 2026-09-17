@@ -357,11 +357,17 @@ span it would cut. Text before the first image is therefore always reusable. Poo
 block hashes mix a span's id into the blocks that hold it (and, through the parent
 chain, everything after), not into the blocks before it.
 
-Qwen 3.5/3.6 declare `SupportsReuseAcrossMediaSpan = false`: their M-RoPE prompt
-positions compress after an image, but decode runs at the absolute token index and no
-holder records a rope delta, so continuing a cache past an image is not what a
-re-prefill builds. Their reuse stops at the first media span until decode carries the
-compressed position; Gemma 4 uses absolute positions and continues past images.
+A model whose cache cannot be continued past media exactly declares
+`SupportsReuseAcrossMediaSpan = false`, and every reuse path then stops at the first
+media span. No model declares it today. Gemma 4 uses absolute positions. Qwen 3.5/3.6's
+M-RoPE prompt positions compress after an image, and every token past the position table
+- decode, speculative verify, a text continuation - rotates at its KV index plus the
+sequence's M-RoPE delta, which every holder, checkpoint and checkpoint file (format
+version 2) stores; follow-up turns therefore continue the cache past the image and match
+a re-prefill up to the backend's decode-versus-prefill kernel differences (see [the Qwen 3.5 card](models/qwen35.md#positions-after-an-image-the-m-rope-delta):
+on Metal the Web UI turns after an image reuse 98% of the prompt and reach the first token
+in 0.13 s instead of about 1.1 s). Until that fix Qwen 3.5/3.6 declared `false`, because
+decode ran at the absolute index.
 
 Prefilling an image *after* a reused prefix is a separate question. Gemma 4's fused
 prefill emits the image's bidirectional mask only at start position 0, so such a chunk
@@ -393,6 +399,7 @@ tokens another conversation's state matched past the public prefix.
 | Scheduler / block pool | `ContinuousBatchSchedulerTests`, `PagedKvCacheTests`, `PagedKvCacheCodecTests` |
 | Batched executor primitives | `BatchedExecutorTests`, including managed paged-attention correctness and multi-sequence logits routing; `RetainedFusedCacheTests` for capability-gated holder retention/re-keying and LRU cleanup, conversation-scope isolation (including a random-interleaving property test) and positional media checks |
 | Cross-request isolation and media identity | `ModelServiceRawTokenHistoryTests` and `ToolTranscriptSpliceTests` (content-verified raw-token splice), `PooledPrefixScopeAndMediaTests`, `ContentAddressedMediaTests` |
+| Reuse past media (Qwen 3.5 M-RoPE) | `Qwen35MRopeReferencePositionTests` (positions against an SGLang `get_rope_index` fixture), opt-in `Qwen35ImageFollowUpExactnessTests` (reuse vs cold after an image with real weights, solo and concurrent, checkpoint file round trip) |
 | Per-model correctness | `Qwen35BatchedCorrectnessTests`, `Mistral3BatchedForwardTests`, `Gemma4BatchedForwardTests`, `GptOssBatchedCorrectnessTests`, `NemotronBatchedCorrectnessTests` |
 | MTP speculative decoding | `SpeculativeExecutionTests` (draft/verify/rollback core), opt-in end-to-end `Qwen36SpeculativeTests` (`TS_MTP_E2E=1`) and `Gemma4SpeculativeTests` (`TS_GMTP_E2E=1`) with real GGUFs |
 | Per-model performance probes | `Gemma4BatchedPerfBench`, `Qwen35BatchedPerfBench`, `GptOssBatchedPerfBench`, `NemotronBatchedPerfBench` |

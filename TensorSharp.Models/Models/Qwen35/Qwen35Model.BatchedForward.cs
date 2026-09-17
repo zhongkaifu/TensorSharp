@@ -310,6 +310,31 @@ namespace TensorSharp.Models
 
             int[] positions = ctx.Positions.ToArray();
             int[] queryStartLoc = ctx.QueryStartLoc.ToArray();
+
+            // M-RoPE: positions are KV indices (slot mapping, masks). A sequence whose
+            // prompt holds an image rotates every token past its position table at KV
+            // index + its delta; rows inside the table take the table (below).
+            int[] seqRopeDelta = new int[numSeqs];
+            int[] ropePositions = positions;
+            if (MultimodalInjector is ModelMultimodalInjector ropeInj)
+            {
+                bool anyDelta = false;
+                for (int s = 0; s < numSeqs; s++)
+                {
+                    if (ropeInj.TryGetMRoPEPositionDelta(ctx.Sequences[s].RequestId, out int d) && d != 0)
+                    {
+                        seqRopeDelta[s] = d;
+                        anyDelta = true;
+                    }
+                }
+                if (anyDelta)
+                {
+                    ropePositions = (int[])positions.Clone();
+                    for (int s = 0; s < numSeqs; s++)
+                        for (int t = queryStartLoc[s]; t < queryStartLoc[s + 1]; t++)
+                            ropePositions[t] = checked(positions[t] + seqRopeDelta[s]);
+                }
+            }
             int[] slotMapping = ctx.SlotMapping.ToArray();
             int[] seqLens = new int[numSeqs];
             for (int s = 0; s < numSeqs; s++)
@@ -375,7 +400,7 @@ namespace TensorSharp.Models
                         // rotation as standard RoPE.
                         for (int t = 0; t < seqLen; t++)
                         {
-                            int abs = promptStartToken + t;
+                            int abs = promptStartToken + t + seqRopeDelta[s];
                             batchedMRoPE[3 * (seqStart + t) + 0] = abs;
                             batchedMRoPE[3 * (seqStart + t) + 1] = abs;
                             batchedMRoPE[3 * (seqStart + t) + 2] = abs;
@@ -436,7 +461,7 @@ namespace TensorSharp.Models
                     if (ctx.NumScheduledTokens[s] != 1) { allDecodeBatch = false; break; }
 
             Tensor bfdHidden = allDecodeBatch
-                ? TryRunBatchedFusedDecode(hiddenStates, ctx, numTokens, numSeqs, positions, slotMapping, blockSize, seqLens)
+                ? TryRunBatchedFusedDecode(hiddenStates, ctx, numTokens, numSeqs, ropePositions, slotMapping, blockSize, seqLens)
                 : null;
 
             if (bfdHidden != null)
@@ -525,11 +550,11 @@ namespace TensorSharp.Models
                     }
                     else
                     {
-                        using (var posTensorQ = BuildRoPEPositionsTensorQ35(positions, numHeads))
+                        using (var posTensorQ = BuildRoPEPositionsTensorQ35(ropePositions, numHeads))
                         {
                             qTensor = ApplyBatchedRoPENeoXQ35(qTensor, posTensorQ, numTokens, numHeads, headDim, ropeDim, ropeBase, ropeFreqScale);
                         }
-                        using (var posTensorK = BuildRoPEPositionsTensorQ35(positions, numKVHeads))
+                        using (var posTensorK = BuildRoPEPositionsTensorQ35(ropePositions, numKVHeads))
                         {
                             kTensor = ApplyBatchedRoPENeoXQ35(kTensor, posTensorK, numTokens, numKVHeads, headDim, ropeDim, ropeBase, ropeFreqScale);
                         }

@@ -2463,7 +2463,8 @@ namespace TensorSharp.Models
 
         /// <summary>Whether a cache holding a media span can be continued past it
         /// exactly (see <see cref="IModelArchitecture.SupportsReuseAcrossMediaSpan"/>).
-        /// True for absolute-position families; Qwen 3.5's M-RoPE overrides it.</summary>
+        /// True for absolute-position families and for M-RoPE models that store the
+        /// rope delta with the cache (Qwen 3.5 / 3.6).</summary>
         public virtual bool SupportsReuseAcrossMediaSpan => true;
 
         /// <summary>See <see cref="IModelArchitecture.CanPrefillMediaAfterReusedPrefix"/>.</summary>

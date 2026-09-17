@@ -482,6 +482,7 @@ namespace TensorSharp.Models
             int seqLen = tokens.Length;
             int startPos = _cacheSeqLen;
             int hiddenSize = Config.HiddenSize;
+            BeginRopePositions(startPos, seqLen);
             EnsureCacheCapacity(startPos + seqLen);
 
             long t0 = Stopwatch.GetTimestamp();
@@ -867,6 +868,10 @@ namespace TensorSharp.Models
                 throw new ArgumentOutOfRangeException(nameof(length),
                     $"Rewind length {length} outside [0, {_cacheSeqLen}].");
             _cacheSeqLen = length;
+            // Speculation rewinds only generated rows, which all share the delta;
+            // a rewind to nothing leaves no history for one to belong to.
+            if (length == 0)
+                _ropeDelta = 0;
         }
 
         // ====================================================================
