@@ -223,6 +223,38 @@ public class GlmDsaTinyModelTests : IDisposable
         Assert.True(string.IsNullOrEmpty(first.Thinking + parsed.Thinking));
     }
 
+    [Theory]
+    [InlineData("{\"text\":\"</think><tool_call>literal</tool_call>\"}")]
+    [InlineData("{\"text\":\"escaped \\\" quote </think>\",\"path\":\"C:\\\\\"}")]
+    public void Glm5Next_OutputParser_ThinkFalse_JsonStringMarkersAreContent(string json)
+    {
+        // Include every two-piece boundary, including inside the marker and its
+        // escaped quote, to pin the same result for streaming and buffered callers.
+        for (int split = 0; split <= json.Length; split++)
+        {
+            var parser = OutputParserFactory.Create("glm5next");
+            parser.Init(enableThinking: false, tools: null);
+            var first = parser.Add(json[..split], done: false);
+            var last = parser.Add(json[split..], done: true);
+            Assert.Equal(json, first.Content + last.Content);
+            Assert.Equal(string.Empty, first.Thinking + last.Thinking);
+            Assert.True(first.ToolCalls == null || first.ToolCalls.Count == 0);
+            Assert.True(last.ToolCalls == null || last.ToolCalls.Count == 0);
+        }
+    }
+
+    [Fact]
+    public void Glm5Next_OutputParser_ThinkFalse_JsonReasoningStillClosesOutsideStrings()
+    {
+        var parser = OutputParserFactory.Create("glm5next");
+        parser.Init(enableThinking: false, tools: null);
+        const string reasoning = "{\"quoted\":\"</think>\"}";
+        var first = parser.Add(reasoning + "</thi", done: false);
+        var last = parser.Add("nk>answer", done: true);
+        Assert.Equal(reasoning, first.Thinking + last.Thinking);
+        Assert.Equal("answer", first.Content + last.Content);
+    }
+
     [Fact]
     public void Glm5Next_OutputParser_ThinkTrue_Unchanged()
     {

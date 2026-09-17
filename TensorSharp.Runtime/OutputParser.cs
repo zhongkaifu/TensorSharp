@@ -2203,6 +2203,34 @@ namespace TensorSharp.Runtime
             return false;
         }
 
+        private int FindThinkingClose(string buf)
+        {
+            // A first-token JSON grammar can legitimately emit protocol markers
+            // inside string values. They are data, not the end of reasoning.
+            // The ambiguous JSON block remains buffered, so scan its entire prefix
+            // each time and preserve quote/escape state across streaming chunks.
+            string trimmed = buf.TrimStart();
+            if (!InUnrequestedBlock || _unrequestedBlockIsReasoning || trimmed.Length == 0
+                || (trimmed[0] != '{' && trimmed[0] != '['))
+                return buf.IndexOf(ThinkClose, StringComparison.Ordinal);
+
+            bool quoted = false, escaped = false;
+            for (int i = 0; i < buf.Length; i++)
+            {
+                char c = buf[i];
+                if (quoted)
+                {
+                    if (escaped) escaped = false;
+                    else if (c == '\\') escaped = true;
+                    else if (c == '"') quoted = false;
+                }
+                else if (c == '"') quoted = true;
+                else if (c == '<' && buf.AsSpan(i).StartsWith(ThinkClose, StringComparison.Ordinal))
+                    return i;
+            }
+            return -1;
+        }
+
         public ParsedOutput Add(string text, bool done)
         {
             _buffer.Append(text);
@@ -2223,7 +2251,7 @@ namespace TensorSharp.Runtime
                 {
                     case State.Thinking:
                     {
-                        int closeIdx = buf.IndexOf(ThinkClose, StringComparison.Ordinal);
+                        int closeIdx = FindThinkingClose(buf);
                         if (closeIdx >= 0)
                         {
                             thinkingSb.Append(buf, 0, closeIdx);

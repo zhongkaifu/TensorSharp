@@ -1,0 +1,74 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TestRun id="a6053e22-b5fc-473d-9a02-f5f4af87af6b" name="@d71188ba1e2e 2026-09-17 14:32:24" xmlns="http://microsoft.com/schemas/VisualStudio/TeamTest/2010">
+  <Times creation="2026-09-17T14:32:24.8324485+00:00" queuing="2026-09-17T14:32:24.8324487+00:00" start="2026-09-17T14:32:20.3279236+00:00" finish="2026-09-17T14:32:24.8535787+00:00" />
+  <TestSettings name="default" id="15735024-65ec-4ced-a2f6-4bd0ec3a88ef">
+    <Deployment runDeploymentRoot="_d71188ba1e2e_2026-09-17_14_32_24" />
+  </TestSettings>
+  <Results>
+    <UnitTestResult executionId="80e0ea40-fdb4-46f3-bd89-2af98e137d9d" testId="3f0d818b-b185-89cf-cd5d-23f661d6d542" testName="InferenceWeb.Tests.GlmDsaNativeBatchedDecodeLayerSplitTests.BatchedDecode_MatchesPerSequenceDecode_ThreeGpus" computerName="d71188ba1e2e" duration="00:00:00.3879483" startTime="2026-09-17T14:32:24.2146955+00:00" endTime="2026-09-17T14:32:24.5999224+00:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="80e0ea40-fdb4-46f3-bd89-2af98e137d9d">
+      <Output>
+        <StdOut>nGpu=3: worst max|batched - serial| over 6 steps = 0</StdOut>
+      </Output>
+    </UnitTestResult>
+    <UnitTestResult executionId="d192779b-3749-42df-b397-2a860a0d8845" testId="025efe8c-bfa8-a559-fa89-16175b48f2d3" testName="InferenceWeb.Tests.GlmDsaNativeBatchedDecodeLayerSplitTests.BatchedDecode_MatchesPerSequenceDecode_OneGpu" computerName="d71188ba1e2e" duration="00:00:00.7565857" startTime="2026-09-17T14:32:23.1901673+00:00" endTime="2026-09-17T14:32:23.9230990+00:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="d192779b-3749-42df-b397-2a860a0d8845">
+      <Output>
+        <StdOut>nGpu=1: worst max|batched - serial| over 6 steps = 0</StdOut>
+      </Output>
+    </UnitTestResult>
+    <UnitTestResult executionId="b233c1b7-aa25-4375-865a-05ab5b26a18a" testId="c06b5f4f-2745-88fe-47f7-e7e49fa67b0c" testName="InferenceWeb.Tests.GlmDsaNativeBatchedDecodeLayerSplitTests.BatchedDecode_MatchesPerSequenceDecode_TwoGpus" computerName="d71188ba1e2e" duration="00:00:00.2882891" startTime="2026-09-17T14:32:23.9343643+00:00" endTime="2026-09-17T14:32:24.2119149+00:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="b233c1b7-aa25-4375-865a-05ab5b26a18a">
+      <Output>
+        <StdOut>nGpu=2: worst max|batched - serial| over 6 steps = 0</StdOut>
+      </Output>
+    </UnitTestResult>
+  </Results>
+  <TestDefinitions>
+    <UnitTest name="InferenceWeb.Tests.GlmDsaNativeBatchedDecodeLayerSplitTests.BatchedDecode_MatchesPerSequenceDecode_OneGpu" storage="/workspace/ts-codex-glm-completion-20260917/repo/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="025efe8c-bfa8-a559-fa89-16175b48f2d3">
+      <Execution id="d192779b-3749-42df-b397-2a860a0d8845" />
+      <TestMethod codeBase="/workspace/ts-codex-glm-completion-20260917/repo/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.GlmDsaNativeBatchedDecodeLayerSplitTests" name="BatchedDecode_MatchesPerSequenceDecode_OneGpu" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.GlmDsaNativeBatchedDecodeLayerSplitTests.BatchedDecode_MatchesPerSequenceDecode_TwoGpus" storage="/workspace/ts-codex-glm-completion-20260917/repo/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="c06b5f4f-2745-88fe-47f7-e7e49fa67b0c">
+      <Execution id="b233c1b7-aa25-4375-865a-05ab5b26a18a" />
+      <TestMethod codeBase="/workspace/ts-codex-glm-completion-20260917/repo/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.GlmDsaNativeBatchedDecodeLayerSplitTests" name="BatchedDecode_MatchesPerSequenceDecode_TwoGpus" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.GlmDsaNativeBatchedDecodeLayerSplitTests.BatchedDecode_MatchesPerSequenceDecode_ThreeGpus" storage="/workspace/ts-codex-glm-completion-20260917/repo/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="3f0d818b-b185-89cf-cd5d-23f661d6d542">
+      <Execution id="80e0ea40-fdb4-46f3-bd89-2af98e137d9d" />
+      <TestMethod codeBase="/workspace/ts-codex-glm-completion-20260917/repo/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.GlmDsaNativeBatchedDecodeLayerSplitTests" name="BatchedDecode_MatchesPerSequenceDecode_ThreeGpus" />
+    </UnitTest>
+  </TestDefinitions>
+  <TestEntries>
+    <TestEntry testId="3f0d818b-b185-89cf-cd5d-23f661d6d542" executionId="80e0ea40-fdb4-46f3-bd89-2af98e137d9d" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="025efe8c-bfa8-a559-fa89-16175b48f2d3" executionId="d192779b-3749-42df-b397-2a860a0d8845" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="c06b5f4f-2745-88fe-47f7-e7e49fa67b0c" executionId="b233c1b7-aa25-4375-865a-05ab5b26a18a" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+  </TestEntries>
+  <TestLists>
+    <TestList name="Results Not in a List" id="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestList name="All Loaded Results" id="19431567-8539-422a-85d7-44ee4e166bda" />
+  </TestLists>
+  <ResultSummary outcome="Completed">
+    <Counters total="3" executed="3" passed="3" failed="0" error="0" timeout="0" aborted="0" inconclusive="0" passedButRunAborted="0" notRunnable="0" notExecuted="0" disconnected="0" warning="0" completed="0" inProgress="0" pending="0" />
+    <Output>
+      <StdOut>[xUnit.net 00:00:00.00] xUnit.net VSTest Adapter v3.1.4+50e68bbb8b (64-bit .NET 10.0.12)
+[xUnit.net 00:00:00.35]   Discovering: InferenceWeb.Tests
+[xUnit.net 00:00:01.96]   Discovered:  InferenceWeb.Tests
+[xUnit.net 00:00:02.00]   Starting:    InferenceWeb.Tests
+ggml_cuda_init: found 3 CUDA devices (Total VRAM: 136494 MiB):
+  Device 0: NVIDIA A40, compute capability 8.6, VMM: yes, VRAM: 45498 MiB
+  Device 1: NVIDIA A40, compute capability 8.6, VMM: yes, VRAM: 45498 MiB
+  Device 2: NVIDIA A40, compute capability 8.6, VMM: yes, VRAM: 45498 MiB
+[glm] glm-dsa: 4 trunk layers (NextN block present but not loaded; --spec loads it), n_embd=64, 4 heads, MLA(q_lora=32, kv_lora=32, head_k=48, head_v=48, rope=16), 8 experts top-2 (ff=32), dense_lead=1, indexer 8x64 top-8 on 4/4 layers, vocab=128
+[glm] loaded 0.0 GiB across 1 GPU(s) in 0.2s (0.01 GiB/s); n_ctx=256, n_ubatch=16, flash_attn=off, fused_indexer=off
+[glm]   device 0: layers 0..3 (4), 44.2 GiB free after load
+[glm] glm-dsa: 4 trunk layers (NextN block present but not loaded; --spec loads it), n_embd=64, 4 heads, MLA(q_lora=32, kv_lora=32, head_k=48, head_v=48, rope=16), 8 experts top-2 (ff=32), dense_lead=1, indexer 8x64 top-8 on 4/4 layers, vocab=128
+[glm] loaded 0.0 GiB across 2 GPU(s) in 0.2s (0.01 GiB/s); n_ctx=256, n_ubatch=16, flash_attn=off, fused_indexer=off
+[glm]   device 0: layers 0..1 (2), 44.1 GiB free after load
+[glm]   device 1: layers 2..3 (2), 44.2 GiB free after load
+[glm] glm-dsa: 4 trunk layers (NextN block present but not loaded; --spec loads it), n_embd=64, 4 heads, MLA(q_lora=32, kv_lora=32, head_k=48, head_v=48, rope=16), 8 experts top-2 (ff=32), dense_lead=1, indexer 8x64 top-8 on 4/4 layers, vocab=128
+[glm] loaded 0.0 GiB across 3 GPU(s) in 0.3s (0.01 GiB/s); n_ctx=256, n_ubatch=16, flash_attn=off, fused_indexer=off
+[glm]   device 0: layers 0..1 (2), 44.1 GiB free after load
+[glm]   device 1: layers 2..2 (1), 44.1 GiB free after load
+[glm]   device 2: layers 3..3 (1), 44.2 GiB free after load
+[xUnit.net 00:00:03.48]   Finished:    InferenceWeb.Tests
+</StdOut>
+    </Output>
+  </ResultSummary>
+</TestRun>

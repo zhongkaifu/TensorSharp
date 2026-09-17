@@ -1,0 +1,46 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TestRun id="a2d95939-1913-4fda-b5f3-9b3f0aaa007b" name="@d71188ba1e2e 2026-09-17 14:27:44" xmlns="http://microsoft.com/schemas/VisualStudio/TeamTest/2010">
+  <Times creation="2026-09-17T14:27:44.7360103+00:00" queuing="2026-09-17T14:27:44.7360106+00:00" start="2026-09-17T14:27:40.6948922+00:00" finish="2026-09-17T14:27:44.7539583+00:00" />
+  <TestSettings name="default" id="2c20cf15-19fc-4254-8e12-0c4625377231">
+    <Deployment runDeploymentRoot="_d71188ba1e2e_2026-09-17_14_27_44" />
+  </TestSettings>
+  <Results>
+    <UnitTestResult executionId="fd8e5a9b-a496-4b4f-a4fb-7a9377bc4e43" testId="23ab6493-9e84-01f4-9d71-928527990201" testName="InferenceWeb.Tests.Glm4TokenizerParityTests.PreTokenizer_MatchesTheReferenceSplitOnEveryCase(pre: &quot;glm4&quot;)" computerName="d71188ba1e2e" duration="00:00:00.0104789" startTime="2026-09-17T14:27:44.4954399+00:00" endTime="2026-09-17T14:27:44.5036243+00:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="fd8e5a9b-a496-4b4f-a4fb-7a9377bc4e43" />
+    <UnitTestResult executionId="574e7720-151a-420b-8a6c-4a4adc492700" testId="f16ecbc8-1348-85f1-6ceb-d73b1baf45da" testName="InferenceWeb.Tests.Glm4TokenizerParityTests.PreTokenizer_MatchesTheReferenceSplitOnEveryCase(pre: &quot;chatglm-bpe&quot;)" computerName="d71188ba1e2e" duration="00:00:00.0113397" startTime="2026-09-17T14:27:44.4946267+00:00" endTime="2026-09-17T14:27:44.4947515+00:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="574e7720-151a-420b-8a6c-4a4adc492700" />
+    <UnitTestResult executionId="2d76261c-6ce7-4066-bf5a-6dc04e776982" testId="e0b15e32-c148-420f-eced-4e4892e1a51a" testName="InferenceWeb.Tests.Glm4TokenizerParityTests.Encode_FromGlm5Gguf_MatchesTheReferenceIds" computerName="d71188ba1e2e" duration="00:00:00.2523293" startTime="2026-09-17T14:27:44.2569294+00:00" endTime="2026-09-17T14:27:44.4826893+00:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="2d76261c-6ce7-4066-bf5a-6dc04e776982" />
+  </Results>
+  <TestDefinitions>
+    <UnitTest name="InferenceWeb.Tests.Glm4TokenizerParityTests.Encode_FromGlm5Gguf_MatchesTheReferenceIds" storage="/workspace/ts-codex-glm-completion-20260917/repo/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="e0b15e32-c148-420f-eced-4e4892e1a51a">
+      <Execution id="2d76261c-6ce7-4066-bf5a-6dc04e776982" />
+      <TestMethod codeBase="/workspace/ts-codex-glm-completion-20260917/repo/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Glm4TokenizerParityTests" name="Encode_FromGlm5Gguf_MatchesTheReferenceIds" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Glm4TokenizerParityTests.PreTokenizer_MatchesTheReferenceSplitOnEveryCase(pre: &quot;chatglm-bpe&quot;)" storage="/workspace/ts-codex-glm-completion-20260917/repo/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="f16ecbc8-1348-85f1-6ceb-d73b1baf45da">
+      <Execution id="574e7720-151a-420b-8a6c-4a4adc492700" />
+      <TestMethod codeBase="/workspace/ts-codex-glm-completion-20260917/repo/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Glm4TokenizerParityTests" name="PreTokenizer_MatchesTheReferenceSplitOnEveryCase" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Glm4TokenizerParityTests.PreTokenizer_MatchesTheReferenceSplitOnEveryCase(pre: &quot;glm4&quot;)" storage="/workspace/ts-codex-glm-completion-20260917/repo/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="23ab6493-9e84-01f4-9d71-928527990201">
+      <Execution id="fd8e5a9b-a496-4b4f-a4fb-7a9377bc4e43" />
+      <TestMethod codeBase="/workspace/ts-codex-glm-completion-20260917/repo/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Glm4TokenizerParityTests" name="PreTokenizer_MatchesTheReferenceSplitOnEveryCase" />
+    </UnitTest>
+  </TestDefinitions>
+  <TestEntries>
+    <TestEntry testId="23ab6493-9e84-01f4-9d71-928527990201" executionId="fd8e5a9b-a496-4b4f-a4fb-7a9377bc4e43" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="f16ecbc8-1348-85f1-6ceb-d73b1baf45da" executionId="574e7720-151a-420b-8a6c-4a4adc492700" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="e0b15e32-c148-420f-eced-4e4892e1a51a" executionId="2d76261c-6ce7-4066-bf5a-6dc04e776982" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+  </TestEntries>
+  <TestLists>
+    <TestList name="Results Not in a List" id="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestList name="All Loaded Results" id="19431567-8539-422a-85d7-44ee4e166bda" />
+  </TestLists>
+  <ResultSummary outcome="Completed">
+    <Counters total="3" executed="3" passed="3" failed="0" error="0" timeout="0" aborted="0" inconclusive="0" passedButRunAborted="0" notRunnable="0" notExecuted="0" disconnected="0" warning="0" completed="0" inProgress="0" pending="0" />
+    <Output>
+      <StdOut>[xUnit.net 00:00:00.00] xUnit.net VSTest Adapter v3.1.4+50e68bbb8b (64-bit .NET 10.0.12)
+[xUnit.net 00:00:00.37]   Discovering: InferenceWeb.Tests
+[xUnit.net 00:00:02.63]   Discovered:  InferenceWeb.Tests
+[xUnit.net 00:00:02.67]   Starting:    InferenceWeb.Tests
+[xUnit.net 00:00:02.98]   Finished:    InferenceWeb.Tests
+</StdOut>
+    </Output>
+  </ResultSummary>
+</TestRun>

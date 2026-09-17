@@ -1,0 +1,46 @@
+Test run for /workspace/ts-codex-glm-completion-20260917/repo/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll (.NETCoreApp,Version=v10.0)
+A total of 1 test files matched the specified pattern.
+/workspace/ts-codex-glm-completion-20260917/repo/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll
+[xUnit.net 00:00:00.00] xUnit.net VSTest Adapter v3.1.4+50e68bbb8b (64-bit .NET 10.0.12)
+[xUnit.net 00:00:00.35]   Discovering: InferenceWeb.Tests
+[xUnit.net 00:00:01.96]   Discovered:  InferenceWeb.Tests
+[xUnit.net 00:00:02.00]   Starting:    InferenceWeb.Tests
+ggml_cuda_init: found 3 CUDA devices (Total VRAM: 136494 MiB):
+  Device 0: NVIDIA A40, compute capability 8.6, VMM: yes, VRAM: 45498 MiB
+  Device 1: NVIDIA A40, compute capability 8.6, VMM: yes, VRAM: 45498 MiB
+  Device 2: NVIDIA A40, compute capability 8.6, VMM: yes, VRAM: 45498 MiB
+[glm] glm-dsa: 4 trunk layers (NextN block present but not loaded; --spec loads it), n_embd=64, 4 heads, MLA(q_lora=32, kv_lora=32, head_k=48, head_v=48, rope=16), 8 experts top-2 (ff=32), dense_lead=1, indexer 8x64 top-8 on 4/4 layers, vocab=128
+[glm] loaded 0.0 GiB across 1 GPU(s) in 0.2s (0.01 GiB/s); n_ctx=256, n_ubatch=16, flash_attn=off, fused_indexer=off
+[glm]   device 0: layers 0..3 (4), 44.2 GiB free after load
+[glm] glm-dsa: 4 trunk layers (NextN block present but not loaded; --spec loads it), n_embd=64, 4 heads, MLA(q_lora=32, kv_lora=32, head_k=48, head_v=48, rope=16), 8 experts top-2 (ff=32), dense_lead=1, indexer 8x64 top-8 on 4/4 layers, vocab=128
+[glm] loaded 0.0 GiB across 2 GPU(s) in 0.2s (0.01 GiB/s); n_ctx=256, n_ubatch=16, flash_attn=off, fused_indexer=off
+[glm]   device 0: layers 0..1 (2), 44.1 GiB free after load
+[glm]   device 1: layers 2..3 (2), 44.2 GiB free after load
+[glm] glm-dsa: 4 trunk layers (NextN block present but not loaded; --spec loads it), n_embd=64, 4 heads, MLA(q_lora=32, kv_lora=32, head_k=48, head_v=48, rope=16), 8 experts top-2 (ff=32), dense_lead=1, indexer 8x64 top-8 on 4/4 layers, vocab=128
+[glm] loaded 0.0 GiB across 3 GPU(s) in 0.3s (0.01 GiB/s); n_ctx=256, n_ubatch=16, flash_attn=off, fused_indexer=off
+[glm]   device 0: layers 0..1 (2), 44.1 GiB free after load
+[glm]   device 1: layers 2..2 (1), 44.1 GiB free after load
+[glm]   device 2: layers 3..3 (1), 44.2 GiB free after load
+[xUnit.net 00:00:03.48]   Finished:    InferenceWeb.Tests
+  Passed InferenceWeb.Tests.GlmDsaNativeBatchedDecodeLayerSplitTests.BatchedDecode_MatchesPerSequenceDecode_OneGpu [756 ms]
+  Standard Output Messages:
+ nGpu=1: worst max|batched - serial| over 6 steps = 0
+
+
+  Passed InferenceWeb.Tests.GlmDsaNativeBatchedDecodeLayerSplitTests.BatchedDecode_MatchesPerSequenceDecode_TwoGpus [288 ms]
+  Standard Output Messages:
+ nGpu=2: worst max|batched - serial| over 6 steps = 0
+
+
+  Passed InferenceWeb.Tests.GlmDsaNativeBatchedDecodeLayerSplitTests.BatchedDecode_MatchesPerSequenceDecode_ThreeGpus [387 ms]
+  Standard Output Messages:
+ nGpu=3: worst max|batched - serial| over 6 steps = 0
+
+
+WARNING: Overwriting results file: /workspace/ts-codex-glm-completion-20260917/results/glm-cuda-batched.trx
+Results File: /workspace/ts-codex-glm-completion-20260917/results/glm-cuda-batched.trx
+
+Test Run Successful.
+Total tests: 3
+     Passed: 3
+ Total time: 4.4732 Seconds

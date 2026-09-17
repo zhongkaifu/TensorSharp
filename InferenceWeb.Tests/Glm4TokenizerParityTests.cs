@@ -1,6 +1,7 @@
 // Copyright (c) Zhongkai Fu. All rights reserved.
 // Licensed under the BSD-3-Clause license in the repository root.
 using System.Text.Json;
+using System.Text.RegularExpressions;
 
 namespace InferenceWeb.Tests;
 
@@ -50,10 +51,18 @@ public class Glm4TokenizerParityTests
     [ModelFact("TS_TEST_MODEL_DIR", "glm-5")]
     public void Encode_FromGlm5Gguf_MatchesTheReferenceIds()
     {
-        string path = TestGates.FindSmallestGguf(Environment.GetEnvironmentVariable("TS_TEST_MODEL_DIR")!, "glm-5")!;
+        string configured = Environment.GetEnvironmentVariable("TS_TEST_MODEL_DIR")!;
+        string path = File.Exists(configured) ? configured : TestGates.FindSmallestGguf(configured, "glm-5")!;
+        // The smallest shard is usually the last one, which has no tokenizer.
+        // Resolve the first shard explicitly without mapping the sibling weights.
+        path = Regex.Replace(path, @"-\d{5}-of-(\d{5})\.gguf$", "-00001-of-$1.gguf",
+            RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
         using var gguf = GgufFile.OpenWithoutSiblingShards(path);
         Assert.Equal("glm4", gguf.GetString("tokenizer.ggml.pre", null));
         var tokenizer = ModelBase.CreateTokenizerFromGguf(gguf);
+        int observation = (int)gguf.GetUint32("tokenizer.ggml.eom_token_id");
+        Assert.Equal("<|observation|>", tokenizer.Decode([observation]));
+        Assert.True(tokenizer.IsEos(observation));
         var mismatches = Cases()
             .Where(c => !c.Ids.SequenceEqual(tokenizer.Encode(c.Text, addSpecial: false)))
             .Select(c => $"{JsonSerializer.Serialize(c.Text)}: expected [{string.Join(",", c.Ids)}], " +

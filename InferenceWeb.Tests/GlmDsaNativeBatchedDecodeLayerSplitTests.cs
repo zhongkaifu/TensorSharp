@@ -10,8 +10,8 @@ namespace InferenceWeb.Tests;
 /// split. forward_batched_decode used to write the RoPE positions only on the device
 /// that embeds the tokens, so every layer on a later device rotated q/k by stale
 /// positions and every concurrent GLM-5.2 stream degenerated on a 6-GPU split.
-/// Rows past the visible GPU count degenerate to fewer devices (nGpu is a cap), so
-/// the multi-device rows need at least that many GPUs to cover the defect.
+/// Each device-count case is gated separately: the loader treats nGpu as a cap,
+/// so a request exceeding the available devices must not count as split coverage.
 /// </summary>
 public sealed class GlmDsaNativeBatchedDecodeLayerSplitTests : IDisposable
 {
@@ -36,12 +36,20 @@ public sealed class GlmDsaNativeBatchedDecodeLayerSplitTests : IDisposable
         return best;
     }
 
-    [GlmNativeCudaTheory]
-    [InlineData(1)]
-    [InlineData(2)]
-    [InlineData(3)]
-    public void BatchedDecode_MatchesPerSequenceDecode(int nGpu)
+    [GlmNativeCudaFact]
+    public void BatchedDecode_MatchesPerSequenceDecode_OneGpu() => CheckBatchedDecode(1);
+
+    [GlmNativeCudaFact(2)]
+    public void BatchedDecode_MatchesPerSequenceDecode_TwoGpus() => CheckBatchedDecode(2);
+
+    [GlmNativeCudaFact(3)]
+    public void BatchedDecode_MatchesPerSequenceDecode_ThreeGpus() => CheckBatchedDecode(3);
+
+    private void CheckBatchedDecode(int nGpu)
     {
+        Assert.True(TensorSharp.Cuda.CudaDevice.GetDeviceCount() >= nGpu);
+        Assert.True(GgmlBasicOps.CanInitializeBackend(GgmlBackendType.Cuda),
+            "The GLM CUDA fixture requires a native library built with CUDA support.");
         string path = GlmDsaSyntheticModelBuilder.Write(Path.Combine(_dir, "tiny-glm-dsa.gguf"));
         IntPtr handle = GgmlGlmNative.LoadModel(path, nGpu, 256, 16, 2, backendName: "CUDA", ctxIsHardLimit: true);
         Assert.NotEqual(IntPtr.Zero, handle);
