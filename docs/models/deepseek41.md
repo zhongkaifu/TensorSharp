@@ -191,7 +191,7 @@ dotnet build TensorSharp.Server.Host/TensorSharp.Server.Host.csproj -c Release \
 
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 MAX_CONTEXT=65536 \
   TS_CPU_MOE_THREADS=32 TS_DSV41_TP=0 TS_DSV4_UBATCH=256 \
-  TS_DSV41_ENGRAM_WARM=1 TS_DSV41_SPARSE_FA=1 \
+  TS_DSV41_ENGRAM_WARM=1 \
   TS_DSV41_COMPACT_RAW_GATHER=0 KV_CACHE_DTYPE=f16 \
   TS_SCHED_MAX_RUNNING_SEQS=4 TS_SCHED_MAX_BATCHED_TOKENS=4096 \
   TS_SCHED_PREFILL_CHUNK=256 TS_SCHED_SOLO_PREFILL_CHUNK=8192 \
@@ -202,8 +202,12 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 MAX_CONTEXT=65536 \
 
 The host build copies the native library beside the server DLL. This launch
 uses the conservative benchmark matrix's microbatch and scheduler settings;
-the optimized profiles in the validation report use different settings. Choose
-`TS_CPU_MOE_THREADS` for the available CPU quota and record it for each run.
+the optimized profiles in the validation report use different settings.
+Sparse prefill attention needs no flag: it is the default on this path, and
+`TS_DSV41_SPARSE_FA=0` turns it off. `TS_DSV4_UBATCH=256` pins the width that
+matrix measured; leave it unset to let the loader choose (see
+[Backends](#backends)). Choose `TS_CPU_MOE_THREADS` for the available CPU quota
+and record it for each run.
 Set it in the launch environment, including for GPU-only placements: native
 CPU graph work and host reduction can still affect latency. The current CLI
 also accepts `--cpu-moe-threads N`; use the same value if supplying both, since
@@ -231,9 +235,14 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 MAX_CONTEXT=65536 \
 The [measured launch record](../validation/deepseek41/full-checkpoint/layer8-context65536-ubatch1024-cpumoe0-cputhreads32-sparse1-compact1-chunk1024-6b3-final-launch.json)
 contains the original VM paths, binary hashes and environment. This profile
 passed 138/138 inference cases; its throughput and limits are recorded below.
-Sparse flash attention and compact gathering remain opt-in, with their
-documented floating-point differences. Startup and page warming are excluded
-from the inference measurements.
+Compact gathering remains opt-in, with its documented floating-point
+differences. That record's `TS_DSV41_SPARSE_FA=1` selected ggml's
+mask-compacted flash-attention kernel: its results were recorded with the initial
+V4.1 support (`3347b06b`), before TensorSharp's owned F32 attention existed,
+whose sparse prefill is now the default (see [Backends](#backends)). Its
+19.985/80.240 s long-prompt times are therefore not a measurement of the current
+attention path. Startup and page warming are excluded from the inference
+measurements.
 
 Without an explicit thread setting, a GPU-only V4.1 load uses the caller's
 `TS_DSV4_THREADS` value, defaulting to at most 32; CPU expert offload instead
@@ -391,15 +400,32 @@ and leaves the pages evictable. It is skipped with a diagnostic when the mapped
 host weights plus 8 GiB do not fit the detected host/cgroup memory allowance, or
 when `MemAvailable` could not keep the tables cached anyway.
 
+Warming reads each table with `pread` in 64 MiB blocks, one contiguous run of
+the table per reader thread (`TS_DSV4_LOAD_THREADS`, default 16), and skips a
+block whose pages `mincore` already reports resident, so a reload whose tables
+are still cached reads almost nothing. It used to touch the mapping one byte per
+4 KiB page, and on a network filesystem every such fault is a synchronous read
+capped at the mount's readahead (128 KiB on the A40 VMs' MooseFS mount): the
+seven-A40 lane's synchronous warm of the 103 GiB Q4_K_M tables took 311.3 s.
+Measured on that VM, 8 GiB of an evicted table reads at 2.38-2.54 GiB/s with
+`pread` and 0.63-0.69 GiB/s with the page walk; see [Load time](#load-time) for
+the method. `TS_DSV4_WARM_PREAD=0` restores the page walk for both forms below.
+A sync-mode read error fails the load with the file and offset; in the
+background it is one log line and the model keeps serving.
+
 | `TS_DSV41_ENGRAM_WARM` | behaviour |
 |---|---|
-| unset (default) | warm in the background once the model is serving |
-| `1` | warm synchronously during load, as before; startup takes ~110-210 s longer |
+| unset (default) | warm in the background once the model is serving; the finish line reads `[dsv41] warmed ... Engram pages in ...s (background, ...)` |
+| `1` | warm synchronously during load, as before; startup takes as long as reading the tables (311.3 s for 103 GiB with the page walk on the seven-A40 lane; at the measured 2.24-2.54 GiB/s `pread` rate that is 41-46 s of reads) |
 | `0` | never warm |
 
 Sparse-read mapping advice (`MADV_RANDOM`) is applied only after warming
 finishes, whichever form it took: the advice turns off the readahead the warm
-pass depends on.
+pass depends on. The `pread` warm leaves the pages in the page cache without
+mapping them into the process; a lookup's first touch of a row is then a minor
+fault, not a storage read. 2,000 random 144-byte rows through a `MADV_RANDOM`
+mapping of a table warmed that way averaged 0.0037-0.0056 ms, with no major
+faults.
 
 `TS_DSV41_ENGRAM_THREADS=1..32` controls the persistent lookup workers;
 the default is the smaller of 16 and the hardware thread count. Both prefill
@@ -490,13 +516,37 @@ CPU fallback. `TS_DSV4_PERF=2` reports input preparation and graph-compute times
 are diagnostic modes whose logging overhead affects throughput. See the
 [CLI execution investigation](../validation/deepseek41/cli-gpu-execution/README.md).
 
-`TS_DSV41_SPARSE_FA=1` opts into CUDA mask-compacted flash attention for
-single-token batches or at least 16,384 cached keys. It attends to at most
-128 raw-window keys plus 512 selected compressed keys. Shorter prefill
-uses dense flash attention because its shared KV tiles were faster on the
-tested A40. The measured complete-checkpoint profiles explicitly enable this
-option; its default remains disabled. This option reduces attention work; it does not eliminate
-cross-GPU copies of the shared compressed cache during prefill.
+On `ggml_cuda`, V4.1 attention runs TensorSharp's owned F32 kernels (ggml's CUDA
+flash attention narrows Q and the softmax weights to F16, and the cache
+quantization can amplify those lost bits). **Prefill is sparse by default** once
+a launch is wide and long: a chunk of more than 8 queries over at least 8,192
+keys (the raw window ring plus the visible compressed rows) attends only to each
+query's sliding window and indexer selection, at most 128 + 512 keys, through a
+mask-compacted kernel. Everything else keeps the dense kernels: single-token
+decode and every DSpark verify (6 rows) the split-key kernel, so a verify still
+commits exactly the cache rows decode would; shorter prefill the tiled one, so a
+prompt whose attention stays below 8,192 keys is unchanged bit for bit. A row
+with more visible keys than the bound falls back to a full scan, so the bound
+never drops a key.
+
+Measured on one A40 (`GgmlOpsCudaAttentionPrecisionTest --benchmark-dsv41-prefill
+512 33536 64 5`, which selects the kernel through the production gate and the
+variable): 512 queries over 33,536 keys with 64 heads took **34.1-34.3 ms** per
+launch sparse against **1,547-1,549 ms** tiled. Against a decomposed F32
+reference the sparse kernel's maximum absolute error was 1.1e-7 (relative L2
+7.4e-7) and the tiled kernel's 8.9e-8 (4.8e-7). A sparse query is also
+independent of the other queries in its launch -- query 0 alone, in 9 queries
+and in 512 is bit-identical -- so a prompt's result does not depend on how
+prefill chunked it. `TS_DSV41_SPARSE_FA=0` restores tiled prefill.
+
+This owned gate (more than 8 queries, at least 8,192 keys, F32 compacted kernel)
+is not the gate of ggml's flash-attention kernel, which the non-owned attention
+path uses (non-CUDA GPUs, the CPU backend). There `TS_DSV41_SPARSE_FA=1` still
+opts into ggml's mask-compacted flash attention for single-token batches or at
+least 16,384 keys, whose F16 operands measured up to 7.8e-4 relative L2 against
+the CPU oracle; that hint stays opt-in. Sparse attention reduces attention work;
+it does not eliminate cross-GPU copies of the shared compressed cache during
+prefill.
 
 `TS_DSV41_COMPACT_RAW_GATHER=1` opts into raw-window compaction for sparse
 single-token decode. It gathers the 128 visible raw rows on their owning GPU
@@ -509,9 +559,15 @@ Q2_K comparison at an approximately 8k prompt improved sustained decode by
 complete measurement settings remain in the validation report.
 
 The default context allocation is capped at 65,536 tokens unless `MAX_CONTEXT`
-is supplied. `TS_DSV4_UBATCH` controls the forward microbatch, defaulting to 256
-for V4.1. A larger advertised model window does not establish that a particular
-GPU configuration can allocate or efficiently serve it.
+is supplied. `TS_DSV4_UBATCH` controls the forward microbatch. Unset, V4.1 on a
+ggml GPU backend lets the loader choose it: 1024, 512 or 256, the widest that
+needs no more routed-expert CPU layers than 256 would, logged as
+`[dsv4] prefill ubatch: N (auto; ...)` (see
+[Device memory held back for the graph](#device-memory-held-back-for-the-graph)).
+The CPU executors and the direct-CUDA engine keep 256. Any explicit value is used
+verbatim; `TS_DSV4_UBATCH=256` restores the previous fixed default. A larger
+advertised model window does not establish that a particular GPU configuration
+can allocate or efficiently serve it.
 
 ### Token-batched decode
 
@@ -556,6 +612,32 @@ packer leaves unspent. The default prices the indexer's top-k transients, one
 microbatch of activations and a 2 GiB floor. Holding back too much is not free:
 on the eight-A40 VM at Q4_K_M, 5,240 MiB forced three layers of routed experts
 onto the host and 3,174 MiB needs one, worth 350 -> 480 prefill tok/s.
+
+Both that reserve and the raw sliding-window ring grow with the prefill
+micro-batch, so with `TS_DSV4_UBATCH` unset the loader prices the split once per
+candidate width. At 65,536 context the default reserve is 2,318 / 2,588 / 3,128
+MiB per device for 256 / 512 / 1024, and the ring 512 / 768 / 1,280 rows. It
+takes the widest candidate that needs no more routed-expert CPU layers than 256
+would -- or than an explicit `--n-cpu-moe` the run pays anyway -- and that does
+not move GPU-resident Engram tables to the host. A wider chunk is cheaper per
+prefill token: one Q4_K_M-shaped routed-expert layer (`GgmlOpsDsv4MoeWidthBench`,
+uniform top-6 routing, one A40) took 35.3-35.7 / 36.9-37.2 / 38.9-39.1 ms a chunk
+at 256 / 512 / 1024 tokens resident on the GPU, 3.6x cheaper per token at 1024,
+and 112.7-117.9 / 185.0-189.1 / 349.9-353.3 ms on 32 host threads (0.44-0.46
+against 0.34 ms a token). But an extra host layer is paid on every decoded
+token, so that trade is never made. The log line names the width and, when a
+wider one was declined, why. A `--n-cpu-moe` below what 256 needs is refused with that number
+(`Re-run with --n-cpu-moe N`). 2048 is not a candidate: the reserve was
+validated at 1024 (a 57,424-token prefill peaked with 1,522 MiB free against a
+3,072 MiB reserve) and a ggml device OOM ends the process. The choice is exported
+(`TSGgml_Dsv4UBatch`) so speculative prefill chunks to the same width.
+
+Priced with the Q4_K_M release's tensor sizes and the per-device budgets its
+seven-A40 run implies (free memory after load plus what the load placed, 45,091-
+45,123 MiB per device), all three widths need 6 routed-expert CPU layers at 65,536
+context, so the loader picks 1024; at 131,072 context the same budgets also give
+6 at every width. These are computed plans (`GgmlOpsDsv4UbatchPlanTest`), not
+measured loads.
 
 The graph cache is bounded by bytes as well as by entry count. An entry's
 compute buffers scale with its shape, and concurrent sequences at different
@@ -605,12 +687,83 @@ Three things that look like the fix and are not, each measured on this box:
 * **`MADV_WILLNEED` on the host-expert prefault.** 29.7 s and 31.3 s against a
   27.7 s mean for the plain fault-in walk, i.e. no better.
 
-`TS_DSV4_LOAD_DROP_CACHE=1` releases each chunk's page cache once it is on the
-device. It does not make the load faster (5,374 s of read thread-time with it
-against 5,539 s without, inside the run-to-run spread) but it ends the load with
-~39 GiB of page cache instead of ~330 GiB, which leaves room for the host experts
-the next phase pins. It is off by default because each call costs real time on a
-FUSE mount.
+The passes after the upload read with `pread` too. The prefault of the
+host-resident experts (`--n-cpu-moe`) and the Engram warm (see
+[Host-mapped Engram tables](#host-mapped-engram-tables)) merge their tensors
+into file ranges, split the bytes into one contiguous run per thread
+(`TS_DSV4_LOAD_THREADS`), and read 64 MiB blocks on a descriptor per thread,
+skipping a block whose pages `mincore` already reports resident. They used to
+touch the mapping one byte per 4 KiB page. On a network filesystem each of
+those faults is a synchronous read capped at the mount's readahead
+(`read_ahead_kb`, 128 KiB on the A40 VMs), which is why the seven-A40 lane
+(`--n-cpu-moe 6`, Q4_K_M) logged 129.7 s to prefault 48.2 GiB of experts and
+311.3 s to warm 103 GiB of Engram tables.
+
+Measured on that VM with `GgmlOpsDsv4FileWarmBench` (built on Linux with the
+native tests), 16 threads, 8 GiB ranges evicted before every arm with
+`mincore` = 0 checked, three to five repeats, arms alternated:
+
+| pass over 8 GiB | Engram table, shard 00002 @ 20 GiB | experts, shard 00003 @ 9,002,135,936 |
+|---|---:|---:|
+| `pread` (default) | 2.38-2.54 GiB/s | 2.24-2.47 GiB/s |
+| prefault page walk, 256 MiB spans (`TS_DSV4_WARM_PREAD=0`) | 0.62-0.66 GiB/s | 0.68-0.74 GiB/s |
+| Engram page walk, 8 MiB chunks (`TS_DSV4_WARM_PREAD=0`) | 0.63-0.69 GiB/s | 0.65-0.68 GiB/s |
+| the same range again, already resident (all blocks skipped) | 64-159 GiB/s | 139-187 GiB/s |
+
+`pread` fills the page cache but not the process's page tables, which the walk
+also did, and the first prefill reads the experts densely. So the prefault also
+reads one byte per page of each block once it is cached: on resident pages that
+walk costs 0.004-0.006 s/GiB at 16 threads, against 0.019-0.023 s/GiB for
+`madvise(MADV_POPULATE_READ)` on the same ranges. The Engram tables are left
+unmapped; their rows are read a few at a time.
+
+Read-ahead hints are no substitute on this mount. `MADV_WILLNEED`,
+`POSIX_FADV_WILLNEED` and `readahead(2)` over an evicted 8 GiB range each left
+128 KiB of it (0.0015%) resident ten seconds later. Do not retry them.
+
+A read error in the prefault or the synchronous Engram warm fails the load and
+names the shard and offset. `TS_DSV4_WARM_PREAD=0` restores both page walks
+exactly.
+
+The offloaded experts are not page-locked unless `TS_HOST_MOE_PIN=1`. Every node
+of an offloaded layer's routed experts is assigned to the CPU backend
+(`build_moe_host`), and `ggml_backend_sched` never overrides that assignment, so
+its op-offload rule never streams those weights to a GPU: only the
+`[n_embd, n_tokens]` activations cross the bus, and a pinned expert is never a
+DMA source. On the seven-A40 lane (`--n-cpu-moe 6`) the page-lock added 20.4 s
+to the load for 48.2 GiB and made those pages unevictable in the same cgroup
+that holds the page cache. The load now prints one line saying the offloaded
+experts stay pageable. `TS_HOST_MOE_PIN=1` restores the page-lock and its
+`page-locked ... GiB of host experts` line; `TS_HOST_MOE_PIN=0` still disables
+pinning for every architecture. The other MoE architectures, whose prefill does
+stream offloaded experts, keep pinning by default.
+
+The loader never reads an uploaded chunk again, but it reads the host-mapped
+weights right after the upload and serves them from the page cache for the rest
+of the run, and page cache is charged to the cgroup. So by default each uploaded
+chunk's page cache is released once the chunk is on the device exactly when the
+upload plus the host-mapped weights plus 8 GiB exceed the host allowance (the
+cgroup limit), and kept otherwise or when the allowance is unknown. The load
+prints the decision with its numbers:
+
+```text
+[dsv4] load page cache: dropping each uploaded chunk's page cache (automatic: 263.0 GiB upload + 151.2 GiB host-mapped + 8.0 GiB headroom exceeds the 326.9 GiB allowance; TS_DSV4_LOAD_DROP_CACHE=0 overrides)
+```
+
+Those are the seven-A40 lane's numbers: 414 GiB of reads into a 326.9 GiB
+cgroup. Its load logged the expert prefault at 0.37 GiB/s and the Engram warm at
+0.33 GiB/s, about half the rate the same page walks measured on that VM with the
+cgroup roughly half full (table above). Dropping cannot speed the upload itself,
+which already reads at the storage rate, and costs 5.9-7.3 ms per resident
+64 MiB chunk on that mount (`GgmlOpsDsv4FileWarmBench --drop-cost`, about 25-30 s
+of thread time for 263 GiB). Its gain is expected on the stages after the upload
+and has not yet been measured on a full load; the check is a cold load with the
+default against one with `TS_DSV4_LOAD_DROP_CACHE=0`. The rule stays conditional
+because dropping every time would make each reload of a checkpoint that lives
+entirely on the GPUs cold. `TS_DSV4_LOAD_DROP_CACHE=0` never drops (the previous
+default) and `=1` always drops. On the eight-A40 box, `=1` did not change the
+upload's read thread-time (5,374 s against 5,539 s, inside the run-to-run spread)
+and ended the load with ~39 GiB of page cache instead of ~330 GiB.
 
 One caveat when timing this yourself: on a box whose page cache is already full of
 the checkpoint, a load can be SLOWER than one that starts with an empty cache,

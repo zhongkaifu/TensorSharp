@@ -1,5 +1,6 @@
 // Copyright (c) Zhongkai Fu. All rights reserved.
 // Licensed under the BSD-3-Clause license in the repository root.
+using TensorSharp.GGML;
 using TensorSharp.Models;
 using TensorSharp.Models.Architecture;
 
@@ -19,6 +20,74 @@ public class DeepSeek41ArchitectureTests : IDisposable
     }
 
     public void Dispose() => _env.Dispose();
+
+    /// <summary>
+    /// TS_DSV4_UBATCH unset: V4.1 on a ggml GPU backend asks the native loader to
+    /// choose (1024/512/256, never trading an extra host routed-expert layer for
+    /// prefill width); its CPU executors and the direct-CUDA engine keep 256.
+    /// </summary>
+    [Theory]
+    [InlineData(BackendType.GgmlCuda, GgmlDeepSeek4Native.UBatchAuto)]
+    [InlineData(BackendType.GgmlVulkan, GgmlDeepSeek4Native.UBatchAuto)]
+    [InlineData(BackendType.GgmlMetal, GgmlDeepSeek4Native.UBatchAuto)]
+    [InlineData(BackendType.GgmlCpu, 256)]
+    [InlineData(BackendType.Cpu, 256)]
+    [InlineData(BackendType.Cuda, 256)]
+    public void V41PrefillWidthIsAutomaticOnlyOnGgmlGpuBackends(BackendType backend, int expected)
+    {
+        Assert.Equal(-1, GgmlDeepSeek4Native.UBatchAuto);
+        foreach (string unset in new[] { null, "", "  " })
+        {
+            Assert.Equal(expected, DeepSeek4Model.ResolveNativeUbatch(true, backend, unset, out string warning));
+            Assert.Null(warning);
+        }
+    }
+
+    /// <summary>Any explicit positive TS_DSV4_UBATCH is used verbatim and turns the
+    /// automatic choice off, on every backend and for both architectures.</summary>
+    [Theory]
+    [InlineData(BackendType.GgmlCuda)]
+    [InlineData(BackendType.GgmlCpu)]
+    [InlineData(BackendType.Cpu)]
+    [InlineData(BackendType.Cuda)]
+    [InlineData(BackendType.GgmlVulkan)]
+    public void AnExplicitPrefillWidthIsUsedVerbatim(BackendType backend)
+    {
+        foreach (bool v41 in new[] { true, false })
+            foreach (int width in new[] { 32, 256, 512, 1024, 2048 })
+            {
+                Assert.Equal(width, DeepSeek4Model.ResolveNativeUbatch(v41, backend, width.ToString(), out string warning));
+                Assert.Null(warning);
+            }
+    }
+
+    /// <summary>Plain V4 keeps its defaults: 512 on the pure C# executor, 1024 elsewhere.</summary>
+    [Theory]
+    [InlineData(BackendType.Cpu, 512)]
+    [InlineData(BackendType.GgmlCuda, 1024)]
+    [InlineData(BackendType.GgmlCpu, 1024)]
+    [InlineData(BackendType.Cuda, 1024)]
+    public void V4PrefillWidthDefaultsAreUnchanged(BackendType backend, int expected)
+        => Assert.Equal(expected, DeepSeek4Model.ResolveNativeUbatch(false, backend, null, out _));
+
+    /// <summary>A set value that is not a positive width is reported, not silently
+    /// replaced -- and "-1" is not a way to spell the automatic choice, which is
+    /// what leaving the variable unset means.</summary>
+    [Theory]
+    [InlineData("abc")]
+    [InlineData("0")]
+    [InlineData("-1")]
+    [InlineData("1.5")]
+    public void AnInvalidPrefillWidthIsReportedAndIgnored(string configured)
+    {
+        Assert.Equal(GgmlDeepSeek4Native.UBatchAuto,
+            DeepSeek4Model.ResolveNativeUbatch(true, BackendType.GgmlCuda, configured, out string warning));
+        Assert.NotNull(warning);
+        Assert.Contains("TS_DSV4_UBATCH", warning);
+        Assert.Contains(configured, warning);
+        Assert.Equal(256, DeepSeek4Model.ResolveNativeUbatch(true, BackendType.GgmlCpu, configured, out warning));
+        Assert.NotNull(warning);
+    }
 
     [Fact]
     public void DescriptorIsIndependentAndDeclaresLayerSplit()

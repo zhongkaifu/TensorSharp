@@ -1,0 +1,75 @@
+[dsv4] compute devices initialized: 1 CPU device(s)
+[dsv4]   compute device 0: backend=CPU, device=CPU (Intel(R) Xeon(R) Gold 6342 CPU @ 2.80GHz)
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 45498 MiB):
+  Device 0: NVIDIA A40, compute capability 8.6, VMM: yes, VRAM: 45498 MiB
+[dsv4] auxiliary CPU worker pool: threads=2, persistent=yes
+[dsv4] prefill ubatch: 256 (auto on the CPU device)
+[dsv4] VRAM reserve: 2053 MiB per device (indexer 3 x1.25 + activations 2 + 2048 headroom)
+[dsv4] routed-expert placement: all 5 layer(s) on the explicitly selected CPU device
+[dsv4] DSpark drafter on device 0: 3 stage(s), block_size=5, markov_rank=32, target_layers=[1..4], noise_token=250
+[dsv41] Engram sparse prefill/decode reads: 2 persistent I/O threads
+[dsv4] host weights are served from the GGUF mapping (0.0 GiB, no private copy)
+[dsv4] load page cache: keeping each uploaded chunk's page cache (automatic: 0.0 GiB upload + 0.0 GiB host-mapped + 8.0 GiB headroom fits the 326.9 GiB allowance; TS_DSV4_LOAD_DROP_CACHE=1 overrides)
+[dsv4] prefaulted 0.0 GiB of mmapped host experts in 0.0s (pread, 0 threads: 0.0 GiB read, 0.0 GiB already resident)
+[dsv4] loaded 0.0 GiB across 1 CPU device(s) in 0.6s (0.06 GiB/s, 16 load threads; host weights mmapped; n_ctx=1024, ring=512, csa_rows=768, hca_rows=1280)
+[dsv4]   device 0: layers 0..4 (5), 503.5 GiB free after load
+[dsv41] Engram mmap advice: RANDOM (automatic: parallel I/O; accepted=1, unsupported=0, skipped=0, failed=0)
+[dsv4] hyper-connection ops: native
+[dsv4] flash attention: on
+[dsv4] compute devices initialized: 1 GPU(s)
+[dsv4]   compute device 0: backend=CUDA0, device=CUDA0 (NVIDIA A40)
+[dsv4] auxiliary CPU worker pool: threads=2, persistent=yes
+[dsv4] prefill ubatch: 1024 (auto; 1024 needs 0 routed-expert CPU layers, the same as 256)
+[dsv4] VRAM reserve: 2069 MiB per device (indexer 12 x1.25 + activations 6 + 2048 headroom)
+[dsv4] routed-expert CPU offload: 0 of 5 layer(s); 5 layer(s) on GPUs
+[dsv4] DSpark drafter on device 0: 3 stage(s), block_size=5, markov_rank=32, target_layers=[1..4], noise_token=250
+[dsv41] Engram lookup: GPU-resident tables, gathered in-graph (no host reads)
+[dsv41] note: TS_DSV41_ENGRAM_THREADS/WARM/RANDOM only affect host-mapped tables; set TS_DSV41_ENGRAM_DEVICE=0 to use that path
+[dsv4] load page cache: keeping each uploaded chunk's page cache (automatic: 0.0 GiB upload + 0.0 GiB host-mapped + 8.0 GiB headroom fits the 326.9 GiB allowance; TS_DSV4_LOAD_DROP_CACHE=1 overrides)
+[dsv4] loaded 0.0 GiB across 1 GPU(s) in 0.1s (0.53 GiB/s, 16 load threads; n_ctx=1024, ring=1280, csa_rows=768, hca_rows=1280)
+[dsv4]   device 0: layers 0..4 (5), 44.1 GiB free after load
+[dsv4] fused ops: on
+[dsv4] hyper-connection ops: native
+[dsv4] flash attention: on
+[dsv4] V4.1 CUDA precision: TensorSharp F32 matmul; attention=TensorSharp F32 (streaming decode and verify; sparse prefill for queries>8, keys>=8192, window+top-k; tiled otherwise; TS_DSV41_SPARSE_FA=0 selects tiled)
+[dsv4] compute devices initialized: 1 GPU(s)
+[dsv4]   compute device 0: backend=CUDA0, device=CUDA0 (NVIDIA A40)
+[dsv4] auxiliary CPU worker pool: threads=2, persistent=yes
+[dsv4] VRAM reserve: 2048 MiB per device (indexer 0 x1.25 + activations 0 + 2048 headroom)
+[dsv4] routed-expert CPU offload: 0 of 5 layer(s); 5 layer(s) on GPUs
+[dsv4] DSpark drafter on device 0: 3 stage(s), block_size=5, markov_rank=32, target_layers=[1..4], noise_token=250
+[dsv41] Engram lookup: GPU-resident tables, gathered in-graph (no host reads)
+[dsv41] note: TS_DSV41_ENGRAM_THREADS/WARM/RANDOM only affect host-mapped tables; set TS_DSV41_ENGRAM_DEVICE=0 to use that path
+[dsv4] load page cache: keeping each uploaded chunk's page cache (automatic: 0.0 GiB upload + 0.0 GiB host-mapped + 8.0 GiB headroom fits the 326.9 GiB allowance; TS_DSV4_LOAD_DROP_CACHE=1 overrides)
+[dsv4] loaded 0.0 GiB across 1 GPU(s) in 0.0s (0.82 GiB/s, 16 load threads; n_ctx=1024, ring=256, csa_rows=768, hca_rows=1280)
+[dsv4]   device 0: layers 0..4 (5), 44.1 GiB free after load
+[dsv4] fused ops: on
+[dsv4] hyper-connection ops: native
+[dsv4] flash attention: on
+[dsv4] V4.1 CUDA precision: TensorSharp F32 matmul; attention=TensorSharp F32 (streaming decode and verify; sparse prefill for queries>8, keys>=8192, window+top-k; tiled otherwise; TS_DSV41_SPARSE_FA=0 selects tiled)
+[
+  {
+    "backend": "CPU",
+    "requested": -1,
+    "actual": 256,
+    "verify_rows": 3,
+    "head": 8,
+    "passed": true
+  },
+  {
+    "backend": "CUDA",
+    "requested": -1,
+    "actual": 1024,
+    "verify_rows": 3,
+    "head": 8,
+    "passed": true
+  },
+  {
+    "backend": "CUDA",
+    "requested": 32,
+    "actual": 32,
+    "verify_rows": 3,
+    "head": 8,
+    "passed": true
+  }
+]

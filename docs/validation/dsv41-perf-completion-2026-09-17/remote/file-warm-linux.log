@@ -1,0 +1,4 @@
+resident re-warm: 14692218 bytes skipped, 0 read, 0.0002s
+after eviction (0.000 left resident): pass 3 read 14484933 of 14692218 bytes, 207285 already resident
+truncated: /tmp/dsv4-file-warm-ZfKhTA/truncated.gguf: short read at offset 5242897 (175 of 1048576 bytes missing; the file ends early)
+dsv4 file warm: policies, planning, pread coverage, residency skip, stop flag and truncation passed

@@ -1212,6 +1212,9 @@ llama.cpp 快数倍的原因：
    中转。对专家区间调用 `cudaHostRegister` 一次性花费约 65 ms/GiB，却把 PCIe 5.0
    x16 上的传输从 9.3 GB/s 提升到 55.6 GB/s。用 `TS_HOST_MOE_PIN=0` 关闭，用
    `TS_HOST_MOE_PIN_MAX_MB` 设上限（默认为 cgroup/主机内存上限的 60%）。
+   DeepSeek V4 / V4.1 是例外：它们的加载器在任何批大小下都在主机上计算被卸载的专家，
+   没有任何流式传输，因此只有设置 `TS_HOST_MOE_PIN=1` 时才会锁页（见
+   [V4.1 卡片](docs/models/deepseek41_zh-cn.md#加载时间)）。
 2. **只发送这一批实际路由到的专家**，并按连续区段分组——和 llama.cpp 调度器用
    已用专家位图玩的是同一个把戏。512 token 时较大的专家池只会被部分覆盖，而在投机
    验证与轻负载服务产生的小批下，这项节省相当可观。`TS_HOST_MOE_EXPERT_FILTER=0`

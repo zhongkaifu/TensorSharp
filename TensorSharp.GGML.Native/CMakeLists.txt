@@ -449,6 +449,16 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
     add_executable(GgmlOpsDsv41EngramIoTest tests/dsv41_engram_io_test.cpp)
     target_link_libraries(GgmlOpsDsv41EngramIoTest PRIVATE Threads::Threads)
     add_test(NAME deepseek41-engram-parallel-io COMMAND GgmlOpsDsv41EngramIoTest)
+    add_executable(GgmlOpsDsv4FileWarmTest tests/dsv4_file_warm_test.cpp)
+    target_link_libraries(GgmlOpsDsv4FileWarmTest PRIVATE Threads::Threads)
+    add_test(NAME deepseek41-host-file-warm COMMAND GgmlOpsDsv4FileWarmTest)
+    set_tests_properties(deepseek41-host-file-warm PROPERTIES TIMEOUT 120)
+    if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        # Explicit host-only storage measurement on a real checkpoint shard; it
+        # evicts the named range from the page cache. Never part of CTest.
+        add_executable(GgmlOpsDsv4FileWarmBench tests/dsv4_file_warm_bench.cpp)
+        target_link_libraries(GgmlOpsDsv4FileWarmBench PRIVATE Threads::Threads)
+    endif()
     add_executable(GgmlOpsDsv41EngramAdviceTest tests/dsv41_engram_advice_test.cpp)
     add_test(NAME deepseek41-engram-mapped-advice COMMAND GgmlOpsDsv41EngramAdviceTest)
     if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -660,6 +670,21 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
     endif()
     add_test(NAME flash-attn-unsupported-shape-fallback COMMAND GgmlOpsFlashAttnGuardTest)
     set_tests_properties(flash-attn-unsupported-shape-fallback PROPERTIES TIMEOUT 120)
+
+    add_executable(GgmlOpsDsv4UbatchPlanTest tests/dsv4_ubatch_plan_test.cpp)
+    target_include_directories(GgmlOpsDsv4UbatchPlanTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME deepseek4-ubatch-plan COMMAND GgmlOpsDsv4UbatchPlanTest)
+    set_tests_properties(deepseek4-ubatch-plan PROPERTIES TIMEOUT 60)
+    # Explicit per-width routed-expert layer timing behind the automatic ubatch
+    # (see the source header). Never registered as a CTest.
+    add_executable(GgmlOpsDsv4MoeWidthBench tests/dsv4_moe_width_bench.cpp)
+    target_include_directories(GgmlOpsDsv4MoeWidthBench PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/include")
+    target_link_libraries(GgmlOpsDsv4MoeWidthBench PRIVATE ggml-cpu ggml-base)
+    if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
+        target_compile_definitions(GgmlOpsDsv4MoeWidthBench PRIVATE TSG_GGML_USE_CUDA=1)
+        target_link_libraries(GgmlOpsDsv4MoeWidthBench PRIVATE ggml-cuda)
+    endif()
 
     add_executable(GgmlOpsGetRowsQuantTest tests/get_rows_quant_test.cpp)
     target_include_directories(GgmlOpsGetRowsQuantTest PRIVATE

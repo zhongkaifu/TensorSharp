@@ -1,0 +1,2 @@
+red control exit: -6
+libc++abi: terminating due to uncaught exception of type std::runtime_error: injected warm failure

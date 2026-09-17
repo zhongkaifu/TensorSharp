@@ -1,0 +1,11 @@
+Test project /Users/zhongkaifu/work/TensorSharp/.claude/worktrees/dsv41-perf/TensorSharp.GGML.Native/build
+    Start  3: deepseek41-host-file-warm
+1/3 Test  #3: deepseek41-host-file-warm ........   Passed    0.13 sec
+    Start 16: cpu-explicit-f32-attention
+2/3 Test #16: cpu-explicit-f32-attention .......   Passed    2.15 sec
+    Start 20: deepseek4-ubatch-plan
+3/3 Test #20: deepseek4-ubatch-plan ............   Passed    0.00 sec
+
+100% tests passed out of 3
+
+Total Test time (real) =   2.28 sec
