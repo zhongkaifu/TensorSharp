@@ -214,8 +214,8 @@ TSG_EXPORT int TSGgml_Gemma4MoELayerDecode(const TSGgmlGemma4MoELayerDesc* d)
         }
 
         ggml_tensor* q_attn = ggml_permute(ctx, q_rope, 0, 2, 1, 3);
-        ggml_tensor* attn_out = ggml_flash_attn_ext(ctx, q_attn, k_full, v_full, attn_mask, 1.0f, 0.0f, 0.0f);
-        ggml_flash_attn_ext_set_prec(attn_out, GGML_PREC_F32);
+        ggml_tensor* attn_out = flash_attn_ext_guarded(ctx, "Gemma4 MoE layer decode", q_attn, k_full, v_full, attn_mask, 1.0f, 0.0f, 0.0f,
+            nullptr, GGML_PREC_F32);
         ggml_tensor* attn_flat = ggml_reshape_2d(ctx, attn_out, qDim, 1);
         ggml_tensor* o_flat = ggml_reshape_1d(ctx, ggml_mul_mat(ctx, o_w, attn_flat), H);
         ggml_tensor* post_attn_normed = ggml_mul(ctx, ggml_rms_norm(ctx, o_flat, eps), post_attn_norm_w);
@@ -1049,8 +1049,8 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelDecode(
             }
 
             ggml_tensor* q_attn = ggml_permute(ctx, q_rope, 0, 2, 1, 3);
-            ggml_tensor* attn_out = ggml_flash_attn_ext(ctx, q_attn, k_full, v_full, t.attn_mask, 1.0f, 0.0f, 0.0f);
-            ggml_flash_attn_ext_set_prec(attn_out, GGML_PREC_F32);
+            ggml_tensor* attn_out = flash_attn_ext_guarded(ctx, "Gemma4 MoE model decode", q_attn, k_full, v_full, t.attn_mask, 1.0f, 0.0f, 0.0f,
+                nullptr, GGML_PREC_F32);
             ggml_tensor* attn_flat = ggml_reshape_2d(ctx, attn_out, qDim, 1);
             ggml_tensor* o_mm = ggml_mul_mat(ctx, t.o_w, attn_flat);
             ggml_tensor* o_flat = ggml_reshape_1d(ctx, o_mm, H);
@@ -2294,7 +2294,7 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelVerify(
                     ggml_tensor* m_tile = get_tile_mask(kLen, qLen, start_pos + qs, kStartLogical, window);
                     ggml_tensor* fa = ggml_flash_attn_ext(ctx, q_tile, k_tile, v_tile, m_tile, 1.0f, 0.0f, 0.0f);
                     ggml_flash_attn_ext_set_prec(fa, GGML_PREC_F32);
-                    if (qs == 0 && !backend_supports_op(fa))
+                    if (!backend_supports_op(fa))
                     {
                         set_last_error("Gemma4 MoE model verify: tiled flash attention unsupported for this shape; use per-op path.");
                         return 0;

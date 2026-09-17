@@ -145,7 +145,7 @@ namespace
 
         // 4. Flash attention (handles GQA broadcasting automatically).
         //    q: [head_dim, 1, num_heads], k/v: [head_dim, attnKvLen, num_kv_heads]
-        ggml_tensor* attn_out = ggml_flash_attn_ext(ctx,
+        ggml_tensor* attn_out = flash_attn_ext_guarded(ctx, "flash attention decode",
             q_attn, k_full, v_full, attn_mask, scale, 0.0f, 0.0f);
 
         // 5. Reshape back to [num_heads * head_dim] for download.
@@ -376,7 +376,7 @@ namespace
 
         // 7. Flash attention (handles GQA broadcasting automatically)
         // q: [head_dim, 1, num_heads], k/v: [head_dim, attnKvLen, num_kv_heads]
-        ggml_tensor* attn_out = ggml_flash_attn_ext(ctx,
+        ggml_tensor* attn_out = flash_attn_ext_guarded(ctx, "transformer layer decode",
             q_attn, k_full, v_full, attn_mask, scale, 0.0f, 0.0f);
 
         // 8. O projection
@@ -829,7 +829,7 @@ TSG_EXPORT int TSGgml_TransformerModelDecode(
             }
 
             // Flash attention
-            ggml_tensor* attn_out = ggml_flash_attn_ext(ctx,
+            ggml_tensor* attn_out = flash_attn_ext_guarded(ctx, "transformer model decode",
                 q_attn, k_full, v_full, attn_mask, scale, 0.0f, 0.0f);
 
             // O projection + residual

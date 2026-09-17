@@ -531,6 +531,19 @@ size copies nothing — this eliminates the incremental doubling grows that
 each re-copied and device↔host round-tripped the whole global cache (a
 measured ~7% at 64k). GGML GPU backends only, clamped to the model context.
 
+### Global caches shorter than 256 rows or not a multiple of 256
+
+ggml-cuda runs the 512-dim global layers only on its grouped-query flash
+kernel, which needs a KV window that is a multiple of 256 rows. The window is
+padded to 256 but never past the allocated cache, so a cache that has grown to
+16 rows (`TS_KV_INITIAL_TOKENS=8`) or that is capped at a length like 4000
+(`MAX_CONTEXT=4000`, past 3840 tokens) used to abort the process in
+`ggml-cuda/fattn.cu`. Those global layers now run as explicit attention with the
+same result and a one-time `has no flash-attention kernel` warning, and return
+to the kernel once the cache length is a multiple of 256 again; the default
+cache sizes never take this path. See
+[Flash attention on shapes a backend has no kernel for](../../DEVELOPMENT.md#flash-attention-on-shapes-a-backend-has-no-kernel-for).
+
 ### Fused per-layer prefill (`Gemma4LayerPrefill`)
 
 For each eligible layer (dense, non-shared KV, no PLE injection in the

@@ -299,7 +299,6 @@ TSG_EXPORT int TSGgml_Qwen3ModelPrefill(
 
         ggml_tensor* hidden = ggml_get_rows(ctx, token_embd, ids); // [H, N]
         const bool metal_strided_qkv = g_backend_type == BACKEND_TYPE_METAL;
-        bool used_standard_attention = false;
 
         for (int l = 0; l < num_layers; ++l)
         {
@@ -446,50 +445,9 @@ TSG_EXPORT int TSGgml_Qwen3ModelPrefill(
                 query_count = 1;
             }
 
-            ggml_tensor* attn = ggml_flash_attn_ext(
-                ctx, q_attn, k_full, v_full, mask,
-                attn_scale, 0.0f, 0.0f);
-            ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32);
-
-            ggml_tensor* attn_flat = nullptr;
-            if (backend_supports_op(attn))
-            {
-                attn_flat = ggml_reshape_2d(
-                    ctx, attn, q_dim, query_count);
-            }
-            else
-            {
-                // F32 KV and some CPU/Vulkan builds do not provide flash
-                // attention. Keep the native whole-model path correct with the
-                // same materialized GQA attention graph used by GPT-OSS.
-                used_standard_attention = true;
-                ggml_tensor* k_attn = k_full;
-                ggml_tensor* v_attn = v_full;
-                if (kv_cache_is_block_quantized(kv_cache_type))
-                {
-                    // ggml_cont cannot copy a block-quantized strided view into
-                    // another quantized tensor. Materialize it as F32 before the
-                    // standard-attention permute/matmul chain instead.
-                    ggml_tensor* k_f32 = ggml_new_tensor_3d(
-                        ctx, GGML_TYPE_F32, head_dim, attn_kv_len, num_kv_heads);
-                    ggml_tensor* v_f32 = ggml_new_tensor_3d(
-                        ctx, GGML_TYPE_F32, head_dim, attn_kv_len, num_kv_heads);
-                    k_attn = ggml_cpy(ctx, k_full, k_f32);
-                    v_attn = ggml_cpy(ctx, v_full, v_f32);
-                }
-                ggml_tensor* q_cont = ggml_cont(ctx, q_attn);
-                ggml_tensor* scores = ggml_mul_mat(ctx, k_attn, q_cont);
-                ggml_mul_mat_set_prec(scores, GGML_PREC_F32);
-                ggml_tensor* probs = ggml_soft_max_ext(
-                    ctx, scores, mask, attn_scale, 0.0f);
-                ggml_tensor* vp = ggml_cont(
-                    ctx, ggml_permute(ctx, v_attn, 1, 0, 2, 3));
-                ggml_tensor* av = ggml_mul_mat(ctx, vp, probs);
-                ggml_tensor* avp = ggml_cont(
-                    ctx, ggml_permute(ctx, av, 0, 2, 1, 3));
-                attn_flat = ggml_reshape_2d(
-                    ctx, avp, q_dim, query_count);
-            }
+            ggml_tensor* attn = flash_attn_ext_guarded(ctx, "Qwen3 model prefill", q_attn, k_full, v_full, mask,
+                attn_scale, 0.0f, 0.0f, nullptr, GGML_PREC_F32);
+            ggml_tensor* attn_flat = ggml_reshape_2d(ctx, attn, q_dim, query_count);
 
             ggml_tensor* projected = ggml_mul_mat(ctx, t.o_w, attn_flat);
             ggml_tensor* residual1 = ggml_add(ctx, residual, projected);
@@ -685,7 +643,6 @@ TSG_EXPORT int TSGgml_Qwen3ModelPrefill(
             pt.mark("download");
         }
 
-        (void) used_standard_attention;
         clear_last_error();
         return 1;
     }

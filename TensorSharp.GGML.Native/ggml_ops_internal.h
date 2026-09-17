@@ -39,6 +39,7 @@
 #endif
 #include "ggml-cpu.h"
 #include "ggml-quants.h"
+#include "ggml_ops_flash_attn_guard.h"
 
 #if defined(_WIN32)
 #define TSG_EXPORT extern "C" __declspec(dllexport)
@@ -739,6 +740,20 @@ namespace tsg
     bool ensure_backend();
     bool can_initialize_backend(int backend_type);
     bool backend_supports_op(ggml_tensor* op);
+
+    // ggml_flash_attn_ext for the active backend, or the explicit attention
+    // when the backend has no kernel for this exact shape (warned once per
+    // site). Use this instead of a bare ggml_flash_attn_ext in any graph that
+    // is computed directly on g_backend: see ggml_ops_flash_attn_guard.h.
+    inline ggml_tensor* flash_attn_ext_guarded(
+        ggml_context* ctx, const char* site,
+        ggml_tensor* q, ggml_tensor* k, ggml_tensor* v, ggml_tensor* mask,
+        float scale, float max_bias, float logit_softcap,
+        ggml_tensor* sinks = nullptr, ggml_prec prec = GGML_PREC_DEFAULT)
+    {
+        return tsg_flash_attn_ext_guarded(ctx, g_backend, site, q, k, v, mask,
+            scale, max_bias, logit_softcap, sinks, prec);
+    }
 
     // --- Tensor parallelism (ggml_ops_tensor_parallel.cpp) ---
 

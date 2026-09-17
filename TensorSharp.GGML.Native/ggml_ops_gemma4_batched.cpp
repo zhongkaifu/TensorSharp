@@ -681,8 +681,8 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecodeBatchedEx(
                 ggml_tensor* mask_s = ggml_view_4d(ctx, wl.attn_mask, winfo.win, 1, 1, 1,
                     wl.attn_mask->nb[1], wl.attn_mask->nb[2], wl.attn_mask->nb[3],
                     static_cast<std::size_t>(s) * wl.attn_mask->nb[3]);
-                ggml_tensor* fa = ggml_flash_attn_ext(ctx, q_attn, k_win, v_win, mask_s, 1.0f, 0.0f, 0.0f);
-                ggml_flash_attn_ext_set_prec(fa, GGML_PREC_F32);
+                ggml_tensor* fa = flash_attn_ext_guarded(ctx, "Gemma4 batched decode", q_attn, k_win, v_win, mask_s,
+                    1.0f, 0.0f, 0.0f, nullptr, GGML_PREC_F32);
 
                 // Deposit this sequence's attention output into column s of the
                 // packed [qDim, N] activation; node ORDER (expanded before the
@@ -1248,8 +1248,8 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelDecodeBatched(
                 ggml_tensor* mask_s = ggml_view_4d(ctx, t.attn_mask, info.win, 1, 1, 1,
                     t.attn_mask->nb[1], t.attn_mask->nb[2], t.attn_mask->nb[3],
                     static_cast<std::size_t>(s) * t.attn_mask->nb[3]);
-                ggml_tensor* fa = ggml_flash_attn_ext(ctx, q_attn, k_win, v_win, mask_s, 1.0f, 0.0f, 0.0f);
-                ggml_flash_attn_ext_set_prec(fa, GGML_PREC_F32);
+                ggml_tensor* fa = flash_attn_ext_guarded(ctx, "Gemma4 MoE batched decode", q_attn, k_win, v_win, mask_s,
+                    1.0f, 0.0f, 0.0f, nullptr, GGML_PREC_F32);
                 ggml_tensor* fa_flat = ggml_reshape_1d(ctx, fa, info.qDim);
                 ggml_tensor* col = ggml_view_1d(ctx, attn_2d, info.qDim,
                     static_cast<std::size_t>(s) * attn_2d->nb[1]);

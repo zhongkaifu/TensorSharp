@@ -221,7 +221,7 @@ namespace
         }
 
         // 7. Flash attention (handles GQA broadcasting)
-        ggml_tensor* attn_out_4d = ggml_flash_attn_ext(ctx,
+        ggml_tensor* attn_out_4d = flash_attn_ext_guarded(ctx, "Qwen3.5 attention layer decode",
             q_attn, k_full, v_full, attn_mask, scale, 0.0f, 0.0f);
 
         // attn_out_4d: [head_dim, num_heads, 1] -> reshape to [head_dim, num_heads]
@@ -1379,8 +1379,8 @@ namespace
                 }
                 else
                 {
-                    ggml_tensor* attn_out_4d = ggml_flash_attn_ext(ctx, q_attn, k_full, v_full, mask_for_attn, attn_scale, 0.0f, 0.0f);
-                    ggml_flash_attn_ext_set_prec(attn_out_4d, GGML_PREC_F32);
+                    ggml_tensor* attn_out_4d = flash_attn_ext_guarded(ctx, "Qwen3.5 model decode", q_attn, k_full, v_full, mask_for_attn, attn_scale, 0.0f, 0.0f,
+                        nullptr, GGML_PREC_F32);
                     attn_out_2d = ggml_reshape_2d(ctx, attn_out_4d, head_dim, num_heads);
                 }
                 // Metal unary kernels also accept this row-contiguous strided
@@ -2753,8 +2753,8 @@ namespace
                     ggml_tensor* qperm = ggml_cont(ctx, ggml_permute(ctx, qs, 0, 2, 1, 3)); // [head_dim, 1, num_heads]
                     // Padded gather: positions [seq_len, pad_kv) point at slot 0 and
                     // are masked out by mask[s] (0 valid, -inf padding).
-                    ggml_tensor* o4 = ggml_flash_attn_ext(ctx, qperm, kperm, vperm, mask[s], attn_scale, 0.0f, 0.0f);
-                    ggml_flash_attn_ext_set_prec(o4, GGML_PREC_F32);
+                    ggml_tensor* o4 = flash_attn_ext_guarded(ctx, "Qwen3.5 batched decode", qperm, kperm, vperm, mask[s], attn_scale, 0.0f, 0.0f,
+                        nullptr, GGML_PREC_F32);
                     // o4: [head_dim, num_heads, 1, 1] -> [head_dim*num_heads, 1]
                     attn_per_seq[s] = ggml_reshape_2d(ctx, o4, qDim, 1);
                 }

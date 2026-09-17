@@ -224,7 +224,7 @@ for GGML backends:
 
 | Kernel | Scope | Notes |
 |---|---|---|
-| `TSGgml_PagedAttentionForward` | Standard causal / sliding-window attention | C++ K/V gather plus `ggml_flash_attn_ext`. Default for Mistral 3 and most paged attention layers on GGML backends. |
+| `TSGgml_PagedAttentionForward` | Standard causal / sliding-window attention | C++ K/V gather plus `ggml_flash_attn_ext`. Default for Mistral 3 and most paged attention layers on GGML backends. A head size the backend has no flash kernel for (ggml-cuda: anything outside 40/64/72/80/96/112/128/256 and the grouped-query 192/320/512/576) runs as explicit attention with a one-time warning instead of aborting in `fattn.cu`. |
 | `TSGgml_PagedAttentionForwardWithSinks` | GPT OSS attention sinks | Adds the learned per-head sink logits to the softmax denominator. |
 | `TensorPagedAttention.Forward` | Tensor-op fallback | Uses tensor gathers plus batched matmul/softmax ops. Useful for A/B testing. |
 | `ManagedPagedAttention.Forward` | Pure C# fallback | Online-softmax implementation used for correctness and unsupported backend fallback. |

@@ -942,22 +942,9 @@ TSG_EXPORT int TSGgml_MuseGlimmerModelForward(
 
             ggml_tensor* q_attn = ggml_permute(ctx, q_3d, 0, 2, 1, 3);     // [hd, n_tokens, n_heads]
             ggml_tensor* attn_flat;
-            ggml_tensor* fa = ggml_flash_attn_ext(ctx, q_attn, k_full, v_full, mask, kq_scale, 0.0f, 0.0f);
-            ggml_flash_attn_ext_set_prec(fa, GGML_PREC_F32);
-            if (backend_supports_op(fa))
-            {
-                attn_flat = ggml_reshape_2d(ctx, fa, q_dim, n_tokens);
-            }
-            else
-            {
-                ggml_tensor* q_cont = ggml_cont(ctx, q_attn);
-                ggml_tensor* scores = ggml_mul_mat(ctx, k_full, q_cont);
-                ggml_mul_mat_set_prec(scores, GGML_PREC_F32);
-                ggml_tensor* probs = ggml_soft_max_ext(ctx, scores, mask, kq_scale, 0.0f);
-                ggml_tensor* v_perm = ggml_cont(ctx, ggml_permute(ctx, v_full, 1, 0, 2, 3));
-                ggml_tensor* out = ggml_mul_mat(ctx, v_perm, probs);       // [hd, n_tokens, n_heads]
-                attn_flat = ggml_reshape_2d(ctx, ggml_cont(ctx, ggml_permute(ctx, out, 0, 2, 1, 3)), q_dim, n_tokens);
-            }
+            ggml_tensor* fa = flash_attn_ext_guarded(ctx, "Muse-Glimmer model", q_attn, k_full, v_full, mask,
+                kq_scale, 0.0f, 0.0f, nullptr, GGML_PREC_F32);
+            attn_flat = ggml_reshape_2d(ctx, fa, q_dim, n_tokens);
 
             // 7. attention output gate, then o_proj
             attn_flat = ggml_mul(ctx, attn_flat, ggml_sigmoid(ctx, gate));

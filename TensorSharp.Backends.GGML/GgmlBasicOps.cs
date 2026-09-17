@@ -1538,6 +1538,10 @@ namespace TensorSharp.GGML
         /// <see cref="GgmlNative.HasBackendFailure"/>. Sticky until <see cref="RecreateBackend"/>.</summary>
         public static bool HasBackendFailure() => GgmlNative.HasBackendFailure();
 
+        /// <summary>Graph builds that ran an attention as explicit ops because the backend
+        /// has no flash-attention kernel for its shape. See <see cref="GgmlNative.FlashAttnFallbackCount"/>.</summary>
+        public static long FlashAttnFallbackCount() => GgmlNative.FlashAttnFallbackCount();
+
         /// <summary>
         /// Throw the GPU backend away and build a new one. Clears
         /// <see cref="HasBackendFailure"/>; the loaded model must be released first.

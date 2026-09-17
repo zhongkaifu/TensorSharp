@@ -1388,29 +1388,9 @@ TSG_EXPORT int TSGgml_GptOssAttentionLayerPrefill(
         // explicit mul_mat → soft_max → mul_mat chain only when flash_attn_ext
         // isn't supported.
         ggml_tensor* attn_flat = nullptr;
-        ggml_tensor* fa_test = ggml_flash_attn_ext(ctx, q_attn, k_attn, v_attn, mask_t,
-            scale, 0.0f, 0.0f);
-        ggml_flash_attn_ext_set_prec(fa_test, GGML_PREC_F32);
-        if (sinks_t != nullptr)
-            ggml_flash_attn_ext_add_sinks(fa_test, sinks_t);
-        const bool fa_supported = backend_supports_op(fa_test);
-        if (fa_supported)
-        {
-            attn_flat = ggml_reshape_2d(ctx, fa_test, qDim, seqLen);
-        }
-        else
-        {
-            ggml_tensor* q_attn_cont = ggml_cont(ctx, q_attn);
-            ggml_tensor* scores = ggml_mul_mat(ctx, k_attn, q_attn_cont);
-            ggml_mul_mat_set_prec(scores, GGML_PREC_F32);
-            ggml_tensor* probs = ggml_soft_max_ext(ctx, scores, mask_t, scale, 0.0f);
-            if (sinks_t != nullptr)
-                ggml_soft_max_add_sinks(probs, sinks_t);
-            ggml_tensor* v_perm = ggml_cont(ctx, ggml_permute(ctx, v_attn, 1, 0, 2, 3));
-            ggml_tensor* attn_out = ggml_mul_mat(ctx, v_perm, probs);
-            ggml_tensor* attn_perm = ggml_cont(ctx, ggml_permute(ctx, attn_out, 0, 2, 1, 3));
-            attn_flat = ggml_reshape_2d(ctx, attn_perm, qDim, seqLen);
-        }
+        ggml_tensor* fa = flash_attn_ext_guarded(ctx, "GPT-OSS layer prefill", q_attn, k_attn, v_attn, mask_t,
+            scale, 0.0f, 0.0f, sinks_t, GGML_PREC_F32);
+        attn_flat = ggml_reshape_2d(ctx, fa, qDim, seqLen);
 
         // 9. Output projection (+ bias) and residual add.
         ggml_tensor* o_out = ggml_mul_mat(ctx, o_w, attn_flat);
@@ -1836,24 +1816,9 @@ TSG_EXPORT int TSGgml_Qwen35AttentionLayerPrefill(
         // 10. Attention. Use ggml_flash_attn_ext when supported (no sinks needed
         // for Qwen3.5 dense); fall back to mul_mat → soft_max → mul_mat otherwise.
         ggml_tensor* attn_flat = nullptr;
-        ggml_tensor* fa_test = ggml_flash_attn_ext(ctx, q_attn, k_attn, v_attn, mask_t,
-            scale, 0.0f, 0.0f);
-        ggml_flash_attn_ext_set_prec(fa_test, GGML_PREC_F32);
-        if (backend_supports_op(fa_test))
-        {
-            attn_flat = ggml_reshape_2d(ctx, fa_test, qDim, seqLen);
-        }
-        else
-        {
-            ggml_tensor* q_attn_cont = ggml_cont(ctx, q_attn);
-            ggml_tensor* scores = ggml_mul_mat(ctx, k_attn, q_attn_cont);
-            ggml_mul_mat_set_prec(scores, GGML_PREC_F32);
-            ggml_tensor* probs = ggml_soft_max_ext(ctx, scores, mask_t, scale, 0.0f);
-            ggml_tensor* v_perm = ggml_cont(ctx, ggml_permute(ctx, v_attn, 1, 0, 2, 3));
-            ggml_tensor* attn_out = ggml_mul_mat(ctx, v_perm, probs);
-            ggml_tensor* attn_perm = ggml_cont(ctx, ggml_permute(ctx, attn_out, 0, 2, 1, 3));
-            attn_flat = ggml_reshape_2d(ctx, attn_perm, qDim, seqLen);
-        }
+        ggml_tensor* fa = flash_attn_ext_guarded(ctx, "Qwen3.5 attention layer prefill", q_attn, k_attn, v_attn, mask_t,
+            scale, 0.0f, 0.0f, nullptr, GGML_PREC_F32);
+        attn_flat = ggml_reshape_2d(ctx, fa, qDim, seqLen);
 
         // 11. Sigmoid-gated mix: attn_flat *= sigmoid(gate). gate_cont is
         // [headDim, numHeads, seqLen] with the same per-head per-token order

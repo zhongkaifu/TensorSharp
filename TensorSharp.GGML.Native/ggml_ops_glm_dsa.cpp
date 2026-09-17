@@ -3076,8 +3076,8 @@ struct graph_builder
             if (m.flash_attn)
             {
                 ggml_tensor * qf = ggml_permute(ctx, Qi, 0, 2, 1, 3);           // [n_kv_row, 1, n_head]
-                ggml_tensor * fa = ggml_flash_attn_ext(ctx, qf, K, V, masks[(size_t) i], hp.kq_scale(), 0.0f, 0.0f);
-                ggml_flash_attn_ext_set_prec(fa, GGML_PREC_F32);
+                ggml_tensor * fa = tsg_flash_attn_ext_guarded(ctx, m.backends[dev], "GLM-DSA batched decode", qf, K, V, masks[(size_t) i], hp.kq_scale(), 0.0f, 0.0f,
+                    nullptr, GGML_PREC_F32);
                 out = ggml_permute(ctx, fa, 0, 2, 1, 3);                        // [kv_lora, 1, n_head]
             }
             else
@@ -3821,8 +3821,8 @@ struct graph_builder
         if (m.flash_attn)
         {
             ggml_tensor * qf = ggml_permute(ctx, Qcur, 0, 2, 1, 3);             // [n_kv_row, nt, n_head]
-            ggml_tensor * fa = ggml_flash_attn_ext(ctx, qf, K, V, mask, hp.kq_scale(), 0.0f, 0.0f);
-            ggml_flash_attn_ext_set_prec(fa, GGML_PREC_F32);
+            ggml_tensor * fa = tsg_flash_attn_ext_guarded(ctx, m.backends[device_of(il, rank)], "GLM-DSA forward", qf, K, V, mask, hp.kq_scale(), 0.0f, 0.0f,
+                nullptr, GGML_PREC_F32);
             // [kv_lora, n_head, nt] -> [kv_lora, nt, n_head] so wv_b's per-head
             // matmul runs as a matrix-matrix product with nt in dimension 1.
             fa = ggml_permute(ctx, fa, 0, 2, 1, 3);

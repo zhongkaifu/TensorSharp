@@ -204,7 +204,7 @@ GGML 后端使用原生分页注意力：
 
 | 内核 | 范围 | 说明 |
 |---|---|---|
-| `TSGgml_PagedAttentionForward` | 标准因果 / 滑窗注意力 | C++ K/V 聚合加 `ggml_flash_attn_ext`。Mistral 3 与大多数 GGML 分页注意力层默认使用。 |
+| `TSGgml_PagedAttentionForward` | 标准因果 / 滑窗注意力 | C++ K/V 聚合加 `ggml_flash_attn_ext`。Mistral 3 与大多数 GGML 分页注意力层默认使用。后端没有 flash kernel 的 head 大小（ggml-cuda：40/64/72/80/96/112/128/256 以及 grouped-query 的 192/320/512/576 之外的任何大小）改为以显式注意力运行并警告一次，而不是在 `fattn.cu` 中 abort。 |
 | `TSGgml_PagedAttentionForwardWithSinks` | GPT OSS attention sinks | 将每头可学习 sink logit 加入 softmax 分母。 |
 | `TensorPagedAttention.Forward` | Tensor 算子回退 | 使用 Tensor gather、批量 matmul 与 softmax，适合 A/B 测试。 |
 | `ManagedPagedAttention.Forward` | 纯 C# 回退 | online-softmax 实现，用于正确性与未支持后端回退。 |

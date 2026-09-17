@@ -422,6 +422,10 @@ per-layer embeddings（PLE）在融合 verify 图内通过对常驻的量化 `pe
 
 全新 prefill 开始时，按需增长的全局 KV cache 会被预先扩容到整个 prompt 的大小（`PrepareForPrefill(totalPromptTokens)`）。在 `start_pos == 0` 时 cache 中还没有已提交的 K/V，一次性扩容到最终大小无需拷贝任何数据——从而消除了逐次翻倍扩容（每次扩容都要重新拷贝并对整个全局 cache 做 device↔host 往返，64k 时实测约 7%）。仅 GGML GPU 后端，且钳制到模型上下文长度。
 
+### 短于 256 行或不是 256 倍数的全局缓存
+
+ggml-cuda 只在 grouped-query flash kernel 上运行 512 维全局层，该 kernel 要求 KV 窗口是 256 行的倍数。窗口会补齐到 256，但从不超过已分配的缓存，因此增长到 16 行的缓存（`TS_KV_INITIAL_TOKENS=8`），或上限为 4000 这类长度的缓存（`MAX_CONTEXT=4000`，超过 3840 个 token 后）过去会在 `ggml-cuda/fattn.cu` 中终止进程。现在这些全局层以显式注意力运行，结果相同，并打印一次 `has no flash-attention kernel` 警告；缓存长度重新成为 256 的倍数后即回到 kernel。默认的缓存大小不会走这条路径。参见 [后端没有 kernel 的 flash-attention 形状](../../DEVELOPMENT_zh-cn.md#后端没有-kernel-的-flash-attention-形状)。
+
 ### 融合 per-layer prefill（`Gemma4LayerPrefill`）
 
 每个符合条件的层（密集、非共享 KV、当前 chunk 无 PLE 注入、所有权重均量化），`TryFusedLayerPrefill()` 调起单次 GGML 图：

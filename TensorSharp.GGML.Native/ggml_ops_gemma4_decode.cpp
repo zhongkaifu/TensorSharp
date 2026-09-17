@@ -846,7 +846,7 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
 
             // Flash attention (scale=1.0 due to QK-Norm, no attention softcap)
             ggml_tensor* q_attn = ggml_permute(ctx, q_rope, 0, 2, 1, 3);
-            ggml_tensor* attn_out = ggml_flash_attn_ext(ctx,
+            ggml_tensor* attn_out = flash_attn_ext_guarded(ctx, "Gemma4 model decode",
                 q_attn, k_full, v_full, layer_attn_mask[l], 1.0f, 0.0f, 0.0f);
 
             // 8. O projection. Row-parallel under TP: lt.o_w holds this rank's
