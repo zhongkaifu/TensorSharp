@@ -466,9 +466,11 @@ continuations across the A/B envs on the same binary) before it was kept.
 * **A rewind on a wrapped ring is bounded by its slack.** Truncating the cache
   only moves the head; rows the wrap overwrote do not come back, and the next
   query still attends a whole window behind the new head. So once a sequence
-  is longer than the ring, a rewind is accepted only while
-  `cached - target <= rows - n_swa - 1` (2303 tokens at the default chunk,
-  which covers the engine's 16-token live-cache rewind). A deeper one is refused
+  has been longer than the ring since the cache was last emptied, a rewind is
+  accepted only while `furthest - target <= rows - n_swa - 1`, where `furthest`
+  is the longest the sequence got (not its current length, which an earlier
+  rewind may have brought back under the ring size). That is 2303 tokens at the
+  default chunk, which covers the engine's 16-token live-cache rewind. A deeper one is refused
   — `CanTruncateKVCache`/`TryTruncateKVCache` say no and the turn re-prefills,
   `TruncateKVCache` throws. An unwrapped ring, a uniform cache and a drop to 0
   rewind to any depth, as before (`KvBlockTransferRingTests`).

@@ -140,6 +140,7 @@ namespace TensorSharp.Models
                 throw new ArgumentOutOfRangeException(nameof(length),
                     $"Rewind length {length} outside [0, {_cacheSeqLen}].");
             }
+            NoteHeadBeforeRewind(length);
             _cacheSeqLen = length;
             _cachedSWAMaskStartPos = -1;
         }

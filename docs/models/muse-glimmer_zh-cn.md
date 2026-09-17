@@ -515,9 +515,10 @@ TensorSharp 现在给 SWA 层分配 `pad(n_swa + chunk + 1, 256)` 行（默认�
   如果环已启用而融合前向拒绝执行，逐算子路径会抛异常，而不是悄悄返回错误 logits。
   `TS_MUSE_GLIMMER_SWA_RING=0` 恢复统一尺寸。
 * **已回卷的环上，回退深度受余量限制。** 截断缓存只移动写入位置；被回卷覆盖的行
-  不会回来，而下一个 query 仍要回看新位置之前完整的一个窗口。因此序列长度超过环之后，
-  只有满足 `cached - target <= rows - n_swa - 1`（默认分块下为 2303 个 token，覆盖引擎
-  16 token 的 live-cache 回退）时才接受回退。更深的回退会被拒绝——
+  不会回来，而下一个 query 仍要回看新位置之前完整的一个窗口。因此自缓存上次清空以来序列长度
+  一旦超过过环，只有满足 `furthest - target <= rows - n_swa - 1` 时才接受回退，其中 `furthest`
+  是序列曾达到的最大长度（而不是当前长度：之前的回退可能已把它降回环大小以下）。默认分块下为
+  2303 个 token，覆盖引擎 16 token 的 live-cache 回退。更深的回退会被拒绝——
   `CanTruncateKVCache`/`TryTruncateKVCache` 返回否，本轮改为重新 prefill，
   `TruncateKVCache` 抛异常。尚未回卷的环、统一尺寸的缓存以及回退到 0 仍可回退到任意深度
   （`KvBlockTransferRingTests`）。

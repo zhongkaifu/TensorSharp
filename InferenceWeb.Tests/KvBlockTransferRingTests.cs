@@ -370,6 +370,27 @@ public class KvBlockTransferRingTests : IDisposable
         Assert.Equal(6000, model.CacheSeqLen);
     }
 
+    [Fact]
+    public void MuseGlimmer_TryTruncate_JudgesASecondRewindByTheFurthestHead_NotTheCurrentOne()
+    {
+        // 6000 -> 4000 is within the slack and accepted, and leaves the head below the
+        // ring size. Rows 0..1647 still hold positions 4352..5999, so 4000 -> 3500
+        // (window 1453..3500) would read overwritten rows: measured from the furthest
+        // head it is 2500 tokens deep, past the 2303-token slack.
+        var model = RingModel(cachedTokens: 6000);
+        Assert.True(model.TryTruncateKVCache(4000));
+        Assert.False(model.CanTruncateKVCache(4000, 3500));
+        Assert.False(model.TryTruncateKVCache(3500));
+        Assert.Equal(4000, model.CacheSeqLen);
+        // Still within the slack of the furthest head.
+        Assert.True(model.TryTruncateKVCache(6000 - GlimmerSlack));
+
+        // Emptying the cache forgets the wrap: a short sequence rewinds to any depth.
+        Assert.True(model.TryTruncateKVCache(0));
+        SetField(typeof(ModelBase), model, "_cacheSeqLen", 3000);
+        Assert.True(model.TryTruncateKVCache(10));
+    }
+
     /// <summary>A Muse-Glimmer instance with only the ring geometry and the head set:
     /// what the truncation guard reads. No tensors, so the cache-invalidation tail of
     /// an accepted rewind has nothing to touch.</summary>
