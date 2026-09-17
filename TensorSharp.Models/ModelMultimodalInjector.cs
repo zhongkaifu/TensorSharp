@@ -1015,6 +1015,9 @@ namespace TensorSharp.Models
             int mergedW = resizedWidth / processor.PatchSize / processor.MergeSize;
             var fresh = new CachedEmbedding(key, firstSize, firstTicks, embeddings, (int)embeddings.Sizes[0],
                 mergedH, mergedW, secondSize, secondTicks) { ContentId = key };
+            if (!key.Contains("path:", StringComparison.Ordinal)
+                && TryTakeRacedEntry(_videoFrameCache, key, fresh, out CachedEmbedding raced))
+                return raced;
             AddCachedEmbedding(_videoFrameCache, key, fresh);
             return fresh;
         }
@@ -1157,9 +1160,27 @@ namespace TensorSharp.Models
             if (cached != null)
                 RemoveCachedEmbedding(cache, key, cached);
             CachedEmbedding fresh = factory(fullPath);
+            if (contentHash != null && TryTakeRacedEntry(cache, key, fresh, out CachedEmbedding raced))
+                return raced;
             fresh.ContentId = key;
             AddCachedEmbedding(cache, key, fresh);
             return fresh;
+        }
+
+        /// <summary>
+        /// Every encoder yields the GPU compute lock between blocks, so another preparation
+        /// carrying the same media can encode and cache it while this one is still encoding.
+        /// Keep that entry (it may already be in a prepared prompt) and drop this copy;
+        /// overwriting it lost the entry without disposing it or releasing its bytes.
+        /// </summary>
+        private bool TryTakeRacedEntry(
+            Dictionary<string, CachedEmbedding> cache, string key, CachedEmbedding fresh, out CachedEmbedding raced)
+        {
+            if (!cache.TryGetValue(key, out raced))
+                return false;
+            fresh.Dispose();
+            TouchAndPin(raced);
+            return true;
         }
 
         private void TouchAndPin(CachedEmbedding entry)
@@ -1175,6 +1196,10 @@ namespace TensorSharp.Models
 
         private void AddCachedEmbedding(Dictionary<string, CachedEmbedding> cache, string key, CachedEmbedding entry)
         {
+            // A path-identified entry that went stale while this one was encoding: release
+            // its bytes (and its tensor, unless a prepared prompt still uses it).
+            if (cache.TryGetValue(key, out CachedEmbedding displaced) && !ReferenceEquals(displaced, entry))
+                RemoveCachedEmbedding(cache, key, displaced);
             cache[key] = entry;
             _embeddingCacheBytes += entry.Bytes;
             TouchAndPin(entry);
