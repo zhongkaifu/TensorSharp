@@ -520,6 +520,15 @@ when a GPU backend is selected.
 - **Mamba2 prefill** processes tokens **sequentially** (loop over `seqLen`)
   through the SSM scan; chunked parallel scanning is on the optimization
   list.
+- **Mamba2 prefill graphs** (`TSGgml_NemotronMamba2PrefillF32`) are cached
+  per chunk length, and every graph intermediate lives in the cached
+  buffer: about 2.7 GB for a 4,096-token chunk on the 8B and 5.5 GB on the
+  47B. The cache is held to a byte budget, `TS_MAMBA2_PREFILL_CACHE_MB`
+  (default 1024), least recently used first out; a graph larger than the
+  whole budget serves its call and is released. It used to keep every
+  distinct chunk length forever, so after a 32k prompt the 47B had no
+  device memory left and the next concurrent decode step failed its
+  allocations with HTTP 500.
 - **Multimodal prefill** supports chunked server prefill by slicing prepared
   image/audio embedding spans per prompt chunk, so long image prompts no longer
   have to run as one monolithic forward pass.
@@ -638,6 +647,26 @@ its device state. A native library that predates the export makes the
 decode kernel download its state every token instead (correct, slower) and
 says so once on stderr.
 
+**Concurrency hand-offs.** Two more defects made the first request of a
+concurrent wave answer differently from the same request served alone (on
+the 8B, `17 + 25` came back as `18`, `35`, an empty answer, or another
+prompt's content), and both had nothing to do with kernel numerics:
+
+- *Paged pool growth wiped live K/V.* `EnsureNemoPagedBuffers` reused the
+  outer per-layer array when it grew the block pool, so the new buffer
+  replaced the old one before the copy read it. Any sequence decoding in the
+  step that first brought a higher block id (a newcomer's prefill, or the
+  single-sequence owner just migrated in) attended over zeros. The grow now
+  builds fresh outer arrays, as the Qwen 3, Qwen 3.5, Gemma 4 and Mistral 3
+  ports already did.
+- *Borrowed logits on an ownership swap.* A step that forwards one sequence
+  alone lets it borrow the model's reusable logits buffer until it samples.
+  When a newcomer took ownership first, its `Forward` rewrote that buffer
+  and the outgoing owner sampled its next token from the newcomer's logits.
+  `BatchExecutor.EnsureOwnership` now gives the outgoing owner its own copy.
+  This one is model-independent and was also what broke
+  `TS_NEMOTRON_BATCHED=0` at concurrency.
+
 A **native batched Mamba2 step kernel** —
 `TSGgml_NemotronMamba2BatchedStepF32`
 ([`ggml_ops_mamba2.cpp`](../../TensorSharp.GGML.Native/ggml_ops_mamba2.cpp))
@@ -667,10 +696,19 @@ active (i.e. unless `TS_NEMOTRON_BATCHED=0` is set).
 
 - **100% greedy match** vs legacy on text-only prompts
   ([`NemotronBatchedCorrectnessTests`](../../InferenceWeb.Tests/NemotronBatchedCorrectnessTests.cs)).
-- Requests served together (all at once, and joining while the first one
-  is already decoding) produce the same greedy tokens as each request
-  served alone, and a multi-token forward that continues a sequence after
-  decode matches prefilling it from scratch
+- Concurrent requests (all at once, joining while the first one is already
+  decoding, and a four-client worker pool) on the per-sequence path
+  (`TS_NEMOTRON_BATCHED=0`) produce exactly the greedy tokens of each request
+  served alone: that path runs the same kernels and swaps state in and out.
+  On the batched path every token chosen is a near-top token when the same
+  history is replayed through the single-sequence forward. Exact token
+  parity is not guaranteed there: the batched step runs different kernels
+  (paged F32 attention instead of the F16 cache, batch-composition dependent
+  quantized matmul), which track the single-sequence logits only to
+  max|dlogit| 0.3-1.4 on the 8B, and a prompt whose top two candidates sit
+  inside that band can flip. A multi-token forward that continues a
+  sequence after decode matches prefilling it from scratch, and a sequence
+  decoding in a step that grows the paged pool keeps its history
   ([`NemotronHServingRegressionTests`](../../InferenceWeb.Tests/NemotronHServingRegressionTests.cs),
   needs `TS_TEST_NEMOTRON_H_DIR` and `TS_TEST_GGML_BACKEND=cuda|metal`).
 - Multimodal-prompt correctness is structurally validated (text-only

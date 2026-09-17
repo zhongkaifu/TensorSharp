@@ -164,11 +164,16 @@ namespace TensorSharp.Models
             int oldNumBlocks = _nemoPagedNumBlocks;
             int oldBlockSize = _nemoPagedBlockSize;
 
-            if (oldPagedK == null || oldPagedK.Length != numLayers)
-            {
-                _nemoPagedK = new float[numLayers][];
-                _nemoPagedV = new float[numLayers][];
-            }
+            // Fresh OUTER arrays on every rebuild. These used to be reused whenever
+            // the layer count matched, so `oldPagedK` aliased `_nemoPagedK` and the
+            // new per-layer buffer replaced the old one before the copy below read
+            // it: every grow of the block pool wiped the K/V history of all live
+            // sequences. A sequence decoding in the step that first brought a
+            // higher block id (a newcomer's prefill, or the linear owner just
+            // migrated in) attended over zeros - on Nemotron-H 8B at concurrency 4
+            // "17 + 25" came back as "18", "35" or another prompt's question.
+            _nemoPagedK = new float[numLayers][];
+            _nemoPagedV = new float[numLayers][];
 
             for (int l = 0; l < numLayers; l++)
             {

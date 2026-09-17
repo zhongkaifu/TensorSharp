@@ -791,6 +791,7 @@ These can be set with either the `--paged-kv*` / `--continuous-batching` CLI fla
 | `TS_NEMOTRON_BATCHED` | Set to `0` to force Nemotron-H onto the legacy per-sequence KV-swap path (default: batched/paged). |
 | `TS_NEMOTRON_MAMBA2_BATCHED_NATIVE` | Use the native Mamba2 batched step kernel inside Nemotron-H batched path. |
 | `TS_NEMOTRON_ATTN_SCORE_BUDGET_MB` | Nemotron-H: largest attention score tensor (MiB) the materialized prefill fallback builds before it attends in query sub-chunks (default 1024). The GGML fused/flash prefill path builds no score tensor. |
+| `TS_MAMBA2_PREFILL_CACHE_MB` | Nemotron-H: device memory (MiB) the cached native Mamba2 prefill graphs may hold, least recently used first out (default 1024). A graph larger than the budget serves its call and is released. |
 | `TS_PAGED_ATTN_KERNEL` | Paged-attention dispatch kernel for `Mistral3Model.BatchedForward`: `native` (default), `tensor` (C# Tensor-based), or `managed` (pure C# scalar). |
 | `TS_MLX_PIPELINED_DECODE` | `1` (default) enables pipelined greedy decode on the MLX backend when the request is greedy, has no stop sequences, and the model supports device-side argmax / next-embedding lookup. Set to `0` to disable. CLI only. |
 | `TS_MLX_MLOCK_GGUF` | `1` (default) pins the GGUF mmap region in physical RAM via `mlock(2)` so model weights stay resident between forward passes. Set to `0` to skip (use if the process `memlock` rlimit is too low or you want the OS to manage paging). MLX backend only. |

@@ -16,6 +16,12 @@
 //      same requests served alone ("101", "1000000...", loops).
 //   2. Long-prompt prefill materialized one [heads, chunk, context] score tensor per
 //      attention layer: 37 GB at 4,096 x 37k on the 8B, cudaMalloc OOM, HTTP 500.
+//   3. Growing the model-owned paged K/V pool replaced every layer's buffer before
+//      copying from it, so a sequence decoding in that step attended over zeros.
+//   4. A sequence forwarded alone borrowed the model's logits buffer; when another
+//      request took ownership first, the owner sampled from that request's logits
+//      (engine-level, also on the per-sequence path).
+//   5. Cached Mamba2 prefill graphs (GBs each at 4,096 tokens) were never evicted.
 //
 // Opt-in (needs the weights and a GPU backend for the state split to exist at all):
 //   TS_TEST_NEMOTRON_H_DIR=/workspace/models/nemotron-h8b TS_TEST_GGML_BACKEND=cuda
@@ -76,11 +82,10 @@ public class NemotronHServingRegressionTests : IClassFixture<NemotronHModelFixtu
         _output = output;
     }
 
-    // Batched and single-sequence forwards run different kernels (paged F32 K/V against
-    // the F16 cache, batch-size dependent quantized matmul): ForwardBatch tracks the
-    // single-sequence logits to max|dlogit| 0.3-1.4 on the 8B, so a prompt whose top two
-    // candidates are that close can legitimately differ. These four have clear answers
-    // (measured: identical at every arrival pattern); a state bug changes them.
+    // Short prompts with clear answers. Batched and single-sequence forwards run
+    // different kernels (paged F32 K/V against the F16 cache, batch-size dependent
+    // quantized matmul): ForwardBatch tracks the single-sequence logits to max|dlogit|
+    // 0.3-1.4 on the 8B, so only near-ties may flip; a state bug moves far more.
     private static readonly string[] Prompts =
     {
         "[validation short-c4-r0-i0]\nWhat is 17 + 25? Reply with only the integer.",
@@ -131,77 +136,134 @@ public class NemotronHServingRegressionTests : IClassFixture<NemotronHModelFixtu
         Assert.True(maxDiff < 1.0, $"continued-vs-fresh logits differ by {maxDiff:F3}: the continuation read stale recurrent state.");
     }
 
-    /// <summary>Greedy output of requests served together - arriving at once, and
-    /// arriving while the first one is already decoding - matches serving each alone.</summary>
+    /// <summary>The per-sequence path (<c>TS_NEMOTRON_BATCHED=0</c>) serves concurrent
+    /// requests one sequence per step through the same kernels as a request served
+    /// alone, swapping each sequence's K/V and recurrent state in and out. Its greedy
+    /// output must therefore equal the serial output token for token.</summary>
     [ModelFact(NemotronHModelFixture.EnvDir, NemotronHModelFixture.GgufPattern)]
-    public async Task ConcurrentGreedy_MatchesSerial()
+    public Task ConcurrentGreedy_PerSequencePath_MatchesSerialExactly() => RunConcurrentGreedy(batchedPath: false);
+
+    /// <summary>The batched path runs different kernels than a request served alone
+    /// (paged F32 attention, batch-composition dependent quantized matmul), so a token
+    /// whose top two candidates are within that numeric noise may legitimately flip.
+    /// Every token it chooses must still be a near-top choice when the same history is
+    /// replayed through the single-sequence forward; a sequence reading another's state,
+    /// or state from the wrong step, chooses tokens far below the top.</summary>
+    [ModelFact(NemotronHModelFixture.EnvDir, NemotronHModelFixture.GgufPattern)]
+    public Task ConcurrentGreedy_BatchedPath_ChoosesOnlyNearTopTokens() => RunConcurrentGreedy(batchedPath: true);
+
+    // Largest serial-forward logit gap a batched choice may have. ForwardBatch tracks the
+    // single-sequence logits to max|dlogit| 0.3-1.4 on the 8B, so a flip needs a gap
+    // below about twice that.
+    private const float NearTopLogitGap = 3.0f;
+
+    private async Task RunConcurrentGreedy(bool batchedPath)
     {
         var model = _fixture.Model;
-        model.ResetKVCache();
+        string previous = Environment.GetEnvironmentVariable("TS_NEMOTRON_BATCHED");
+        Environment.SetEnvironmentVariable("TS_NEMOTRON_BATCHED", batchedPath ? "1" : "0");
         var renderer = new KVCachePromptRenderer(new GgufPromptRenderer());
+        int[][] promptTokens = Prompts.Select(p => Render(model, renderer, p)).ToArray();
         const int maxNew = 32;
-        var cfg = new SchedulerConfig
+        var outputs = new List<(string Label, int Prompt, List<int> Tokens)>();
+        List<int>[] serial = new List<int>[Prompts.Length];
+        try
         {
-            MaxNumBatchedTokens = 4096,
-            MaxNumRunningSequences = 4,
-            MaxPrefillChunkSize = 512,
-            NumBlocks = 64,
-            BlockSize = 256,
-            EnablePrefixCaching = true,
-            DecodeQuantumTokens = 256,
-        };
-        using var engine = new InferenceEngine(model, cfg, NullLogger.Instance);
+            model.ResetKVCache();
+            var cfg = new SchedulerConfig
+            {
+                MaxNumBatchedTokens = 4096,
+                MaxNumRunningSequences = 4,
+                MaxPrefillChunkSize = 512,
+                NumBlocks = 64,
+                BlockSize = 256,
+                EnablePrefixCaching = true,
+                DecodeQuantumTokens = 256,
+            };
+            using (var engine = new InferenceEngine(model, cfg, NullLogger.Instance))
+            {
+                for (int i = 0; i < Prompts.Length; i++)
+                    serial[i] = await Generate(engine, promptTokens[i], $"serial-{i}", maxNew, _ => { });
 
-        var serial = new List<int>[Prompts.Length];
-        for (int i = 0; i < Prompts.Length; i++)
-            serial[i] = await Generate(engine, model, renderer, Prompts[i], $"serial-{i}", maxNew, _ => { });
+                var burst = await Task.WhenAll(Enumerable.Range(0, Prompts.Length).Select(i =>
+                    Generate(engine, promptTokens[i], $"burst-{i}", maxNew, _ => { })));
+                for (int i = 0; i < Prompts.Length; i++) outputs.Add(($"burst[{i}]", i, burst[i]));
 
-        var burst = await Task.WhenAll(Prompts.Take(4).Select((p, i) =>
-            Generate(engine, model, renderer, p, $"burst-{i}", maxNew, _ => { })));
+                // Staggered: the first request is decoding alone when the others arrive,
+                // so its state has to move (into the batched slot pool, or out to a
+                // snapshot on the per-sequence path).
+                var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                var first = Generate(engine, promptTokens[0], "stagger-0", maxNew,
+                    n => { if (n == 6) started.TrySetResult(); });
+                await Task.WhenAny(started.Task, first);
+                var rest = Enumerable.Range(1, Prompts.Length - 1).Select(i =>
+                    Generate(engine, promptTokens[i], $"stagger-{i}", maxNew, _ => { })).ToList();
+                outputs.Add(("staggered[0]", 0, await first));
+                var restOut = await Task.WhenAll(rest);
+                for (int i = 1; i < Prompts.Length; i++) outputs.Add(($"staggered[{i}]", i, restOut[i - 1]));
 
-        // Staggered: the first request is decoding on the single-sequence path when the
-        // others arrive, so its state has to move into the batched slot pool.
-        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var first = Generate(engine, model, renderer, Prompts[0], "stagger-0", maxNew,
-            n => { if (n == 6) started.TrySetResult(); });
-        await Task.WhenAny(started.Task, first);
-        var rest = Prompts.Skip(1).Take(3).Select((p, i) =>
-            Generate(engine, model, renderer, p, $"stagger-{i + 1}", maxNew, _ => { })).ToList();
-        var staggered = new List<List<int>> { await first };
-        staggered.AddRange(await Task.WhenAll(rest));
-
-        // Worker pool: four clients drain all prompts, so a new request arrives whenever
-        // one finishes while the others are still decoding in the batched path - the
-        // arrival pattern of an HTTP benchmark at concurrency 4.
-        // Every prompt twice, so the second wave lands on the Mamba2 slots and attention
-        // blocks the first wave released.
-        const int poolRequests = 12;
-        var pooled = new List<int>[poolRequests];
-        int next = -1;
-        await Task.WhenAll(Enumerable.Range(0, 4).Select(async w =>
+                // Worker pool: four clients drain every prompt twice, so a new request
+                // arrives whenever one finishes while the others are still decoding - the
+                // arrival pattern of an HTTP benchmark at concurrency 4 - and the second
+                // wave lands on the recurrent-state slots the first wave released.
+                const int poolRequests = 12;
+                var pooled = new List<int>[poolRequests];
+                int next = -1;
+                await Task.WhenAll(Enumerable.Range(0, 4).Select(async w =>
+                {
+                    int i;
+                    while ((i = Interlocked.Increment(ref next)) < poolRequests)
+                        pooled[i] = await Generate(engine, promptTokens[i % Prompts.Length], $"pool-{w}-{i}", maxNew, _ => { });
+                }));
+                for (int k = 0; k < poolRequests; k++) outputs.Add(($"pooled[{k}]", k % Prompts.Length, pooled[k]));
+            }
+        }
+        finally
         {
-            int i;
-            while ((i = Interlocked.Increment(ref next)) < poolRequests)
-                pooled[i] = await Generate(engine, model, renderer, Prompts[i % Prompts.Length], $"pool-{w}-{i}", maxNew, _ => { });
-        }));
+            Environment.SetEnvironmentVariable("TS_NEMOTRON_BATCHED", previous);
+        }
 
         var failures = new List<string>();
+        double worstGap = 0;
         for (int i = 0; i < Prompts.Length; i++)
+            _output.WriteLine($"[{i}] serial      : {Show(Decode(model, serial[i]))}");
+        foreach (var (label, p, tokens) in outputs)
         {
-            string s = Decode(model, serial[i]);
-            _output.WriteLine($"[{i}] serial   : {Show(s)}");
-            for (int k = i; k < poolRequests; k += Prompts.Length)
+            bool same = serial[p].SequenceEqual(tokens);
+            _output.WriteLine($"[{p}] {label,-12}: {(same ? "same  " : "DIFF  ")}{Show(Decode(model, tokens))}");
+            if (same) continue;
+            if (!batchedPath)
             {
-                _output.WriteLine($"[{i}] pooled#{k,-2}: {Show(Decode(model, pooled[k]))}");
-                if (!serial[i].SequenceEqual(pooled[k])) failures.Add($"pooled[{k}] diverges at token {FirstDiff(serial[i], pooled[k])}");
+                failures.Add($"{label} diverges from serial at token {FirstDiff(serial[p], tokens)}");
+                continue;
             }
-            _output.WriteLine($"[{i}] burst    : {Show(Decode(model, burst[i]))}");
-            _output.WriteLine($"[{i}] staggered: {Show(Decode(model, staggered[i]))}");
-            if (!serial[i].SequenceEqual(burst[i])) failures.Add($"burst[{i}] diverges at token {FirstDiff(serial[i], burst[i])}");
-            if (!serial[i].SequenceEqual(staggered[i])) failures.Add($"staggered[{i}] diverges at token {FirstDiff(serial[i], staggered[i])}");
+
+            // Replay the concurrent history through the single-sequence forward.
+            model.ResetKVCache();
+            float[] logits = model.Forward(promptTokens[p]);
+            for (int t = 0; t < tokens.Count; t++)
+            {
+                float top = logits.Max();
+                float gap = top - logits[tokens[t]];
+                worstGap = Math.Max(worstGap, gap);
+                if (gap > NearTopLogitGap)
+                {
+                    failures.Add($"{label} token {t} ({Show(model.Tokenizer.Decode(new List<int> { tokens[t] }))}) is {gap:F2} logits below the single-sequence top choice");
+                    break;
+                }
+                if (t + 1 < tokens.Count)
+                    logits = model.Forward(new[] { tokens[t] });
+            }
+            model.ResetKVCache();
         }
+        _output.WriteLine($"largest serial-forward logit gap of a concurrent choice: {worstGap:F2}");
         Assert.True(failures.Count == 0, string.Join("; ", failures));
     }
+
+    private static int[] Render(ModelBase model, KVCachePromptRenderer renderer, string prompt) =>
+        renderer.RenderToTokens(model.Tokenizer, model.Config?.ChatTemplate,
+            new List<ChatMessage> { new() { Role = "user", Content = prompt } },
+            model.Config?.Architecture ?? string.Empty, addGenerationPrompt: true, tools: null, enableThinking: false).ToArray();
 
     /// <summary>A prompt far past the point where one materialized score tensor per chunk
     /// stops fitting on the device prefills without an allocation failure.</summary>
@@ -231,6 +293,43 @@ public class NemotronHServingRegressionTests : IClassFixture<NemotronHModelFixtu
         _output.WriteLine($"prefilled {tokens.Length} tokens in {sw.Elapsed.TotalSeconds:F1}s ({tokens.Length / sw.Elapsed.TotalSeconds:F0} tok/s)");
         Assert.NotNull(logits);
         Assert.All(logits, v => Assert.True(float.IsFinite(v)));
+    }
+
+    /// <summary>Mamba2 prefill graphs are cached per chunk length, and every graph
+    /// intermediate lives in the cached buffer (2.7 GB at 4,096 tokens on the 8B, 5.5 GB
+    /// on the 47B). Prompts whose chunks come in many lengths must not leave all of those
+    /// graphs resident: unbounded, a 32k prompt on the 47B left the device full and the
+    /// next concurrent decode step failed its allocations (HTTP 500).</summary>
+    [ModelFact(NemotronHModelFixture.EnvDir, NemotronHModelFixture.GgufPattern)]
+    public void PrefillOfManyChunkLengths_DoesNotAccumulateDeviceMemory()
+    {
+        var model = _fixture.Model;
+        var sb = new StringBuilder();
+        for (int i = 0; i < 1200; i++)
+            sb.Append("Entry ").Append(i).Append(": the lantern code is ember-").Append(i * 13 + 7).Append(".\n");
+        int[] tokens = model.Tokenizer.Encode(sb.ToString(), addSpecial: true).ToArray();
+        Assert.True(tokens.Length >= 4096, $"need 4096 tokens, have {tokens.Length}");
+
+        model.ResetKVCache();
+        model.Forward(tokens.Take(4096).ToArray()); // first long prefill sizes every pool
+        model.ResetKVCache();
+        if (!TensorSharp.GGML.GgmlBasicOps.TryGetDeviceMemoryInfo(out long freeBefore, out long total) || total <= 0)
+        {
+            _output.WriteLine("backend reports no device memory; nothing to measure");
+            return;
+        }
+
+        foreach (int len in new[] { 3968, 3840, 3712, 3584, 3456, 3328 })
+        {
+            model.ResetKVCache();
+            model.Forward(tokens.Take(len).ToArray());
+        }
+        model.ResetKVCache();
+
+        Assert.True(TensorSharp.GGML.GgmlBasicOps.TryGetDeviceMemoryInfo(out long freeAfter, out _));
+        long grownMiB = (freeBefore - freeAfter) >> 20;
+        _output.WriteLine($"device free before={freeBefore >> 20} MiB after={freeAfter >> 20} MiB grown={grownMiB} MiB");
+        Assert.True(grownMiB < 2048, $"six prefills of distinct chunk lengths left {grownMiB} MiB more resident on the device");
     }
 
     /// <summary>The fused prefill kernel and the query-chunked materialized fallback
@@ -362,6 +461,60 @@ public class NemotronHServingRegressionTests : IClassFixture<NemotronHModelFixtu
         Assert.True(failures.Count == 0, string.Join("; ", failures));
     }
 
+    /// <summary>A sequence decoding in the batched step that grows the model-owned paged
+    /// K/V pool (another request's prefill brings a block id past its capacity) keeps its
+    /// attention history. The grow used to replace every layer's buffer before copying
+    /// from it, so that sequence attended over zeros: max|dlogit| 6.95 against the
+    /// single-sequence forward and a wrong greedy token, where the batched kernels
+    /// otherwise stay within about 1.</summary>
+    [ModelFact(NemotronHModelFixture.EnvDir, NemotronHModelFixture.GgufPattern)]
+    public void ForwardBatch_PagedPoolGrowth_KeepsLiveSequenceHistory()
+    {
+        var model = _fixture.Model;
+        var batched = Assert.IsAssignableFrom<IBatchedPagedModel>(model);
+        var renderer = new KVCachePromptRenderer(new GgufPromptRenderer());
+        int[][] prompts = Prompts.Select(p => Render(model, renderer, p)).ToArray();
+        const int blockSize = 16;
+        // Block ids far past anything the pool has held, so the second step must grow it.
+        const int farBlockId = 1024;
+
+        model.ResetKVCache();
+        int token = ArgMax(model.Forward(prompts[0]));
+        float[] reference = (float[])model.Forward(new[] { token }).Clone();
+        model.ResetKVCache();
+
+        var seqs = prompts.Select((p, i) => new SequenceState($"grow-{i}-{Guid.NewGuid():N}", p, 4, blockSize, SamplingConfig.Greedy)).ToArray();
+        int nextId = farBlockId;
+        for (int s = 0; s < seqs.Length; s++)
+        {
+            int blocks = (prompts[s].Length + 1 + blockSize - 1) / blockSize;
+            for (int b = 0; b < blocks; b++)
+                seqs[s].BlockTable.AppendBlock(new TensorSharp.Runtime.Paged.KvBlock(s == 0 ? b : nextId++));
+        }
+
+        float[] batchedDecode;
+        try
+        {
+            batched.ForwardBatch(BuildContext(new[] { seqs[0] }, new[] { prompts[0] }, blockSize));
+            seqs[0].AdvanceComputedTokens(prompts[0].Length);
+
+            var tokens = new int[seqs.Length][];
+            tokens[0] = new[] { token };
+            for (int s = 1; s < seqs.Length; s++) tokens[s] = prompts[s];
+            batchedDecode = batched.ForwardBatch(BuildContext(seqs, tokens, blockSize))[0];
+        }
+        finally
+        {
+            foreach (var seq in seqs) batched.OnSequenceReleased(seq.RequestId);
+            model.ResetKVCache();
+        }
+
+        double diff = MaxAbsDiff(reference, batchedDecode);
+        _output.WriteLine($"decode after pool grow: max|dlogit|={diff:F2} argmax single={ArgMax(reference)} batched={ArgMax(batchedDecode)}");
+        Assert.True(diff < 3.0, $"the decoding sequence lost its K/V history when the paged pool grew (max|dlogit| {diff:F2})");
+        Assert.Equal(ArgMax(reference), ArgMax(batchedDecode));
+    }
+
     private static BatchedForwardContext BuildContext(SequenceState[] seqs, int[][] tokens, int blockSize)
     {
         var ctx = new BatchedForwardContext
@@ -395,12 +548,8 @@ public class NemotronHServingRegressionTests : IClassFixture<NemotronHModelFixtu
         return ctx;
     }
 
-    private static async Task<List<int>> Generate(InferenceEngine engine, ModelBase model, KVCachePromptRenderer renderer,
-        string prompt, string reqId, int maxNew, Action<int> onToken)
+    private static async Task<List<int>> Generate(InferenceEngine engine, int[] tokens, string reqId, int maxNew, Action<int> onToken)
     {
-        var history = new List<ChatMessage> { new() { Role = "user", Content = prompt } };
-        var tokens = renderer.RenderToTokens(model.Tokenizer, model.Config?.ChatTemplate, history,
-            model.Config?.Architecture ?? string.Empty, addGenerationPrompt: true, tools: null, enableThinking: false);
         var seq = new SequenceState(reqId, tokens, maxNew, 256, SamplingConfig.Greedy);
         var handle = engine.SubmitRequest(seq);
         var outs = new List<int>();

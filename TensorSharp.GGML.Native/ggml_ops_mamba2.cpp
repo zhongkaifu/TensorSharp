@@ -119,6 +119,11 @@ namespace
         bool projected_zero_copy = false;
         bool hidden_out_zero_copy = false;
 
+        // Device bytes the entry's graph buffer holds, and when it was last used
+        // (g_mamba2_prefill_use_clock), for the byte-budgeted LRU below.
+        std::size_t device_bytes = 0;
+        std::uint64_t last_use = 0;
+
         std::mutex compute_mutex;
 
         ~Mamba2PrefillCacheEntry()
@@ -246,11 +251,55 @@ namespace
         }
     };
 
+    // Prefill graphs are cached per chunk length T. Every intermediate of the graph
+    // lives in the entry's buffer (ggml_backend_alloc_ctx_tensors does no reuse), so
+    // an entry costs roughly 20 x d_inner x T x 4 bytes: 5.5 GB at T = 4,096 on
+    // Nemotron-H 47B. Unbounded, every distinct chunk length a long prompt produced
+    // stayed resident, the device ran out of memory, and the next batched decode
+    // step failed with HTTP 500. Entries are therefore held to a byte budget
+    // (least-recently-used first out); a graph larger than the whole budget is built
+    // for the call and released with it. Map values are shared so an entry evicted
+    // while another thread computes on it stays alive until that call returns.
     std::mutex g_mamba2_prefill_cache_mutex;
     std::unordered_map<Mamba2PrefillCacheKey,
-                       std::unique_ptr<Mamba2PrefillCacheEntry>,
+                       std::shared_ptr<Mamba2PrefillCacheEntry>,
                        Mamba2PrefillCacheKeyHash,
                        Mamba2PrefillCacheKeyEq> g_mamba2_prefill_cache;
+    std::size_t g_mamba2_prefill_cache_bytes = 0;
+    std::uint64_t g_mamba2_prefill_use_clock = 0;
+
+    // TS_MAMBA2_PREFILL_CACHE_MB overrides the default 1 GiB.
+    std::size_t mamba2_prefill_cache_budget_bytes()
+    {
+        static const std::size_t budget = []() -> std::size_t {
+            const char* raw = std::getenv("TS_MAMBA2_PREFILL_CACHE_MB");
+            if (raw != nullptr && *raw != '\0')
+            {
+                char* end = nullptr;
+                long long mb = std::strtoll(raw, &end, 10);
+                if (end != raw && mb >= 0)
+                    return static_cast<std::size_t>(mb) << 20;
+            }
+            return static_cast<std::size_t>(1024) << 20;
+        }();
+        return budget;
+    }
+
+    // Caller holds g_mamba2_prefill_cache_mutex.
+    void mamba2_prefill_cache_evict_for_locked(std::size_t incoming_bytes, std::size_t budget)
+    {
+        while (!g_mamba2_prefill_cache.empty() && g_mamba2_prefill_cache_bytes + incoming_bytes > budget)
+        {
+            auto victim = g_mamba2_prefill_cache.begin();
+            for (auto it = g_mamba2_prefill_cache.begin(); it != g_mamba2_prefill_cache.end(); ++it)
+            {
+                if (it->second->last_use < victim->second->last_use)
+                    victim = it;
+            }
+            g_mamba2_prefill_cache_bytes -= std::min(g_mamba2_prefill_cache_bytes, victim->second->device_bytes);
+            g_mamba2_prefill_cache.erase(victim);
+        }
+    }
 
     std::atomic<std::uint64_t> g_mamba2_decode_compute_serial{0};
 
@@ -267,6 +316,7 @@ namespace
             std::atexit([]() {
                 std::lock_guard<std::mutex> lk(g_mamba2_prefill_cache_mutex);
                 g_mamba2_prefill_cache.clear();
+                g_mamba2_prefill_cache_bytes = 0;
                 std::lock_guard<std::mutex> lk_decode(g_mamba2_decode_cache_mutex);
                 g_mamba2_decode_cache.clear();
             });
@@ -465,12 +515,17 @@ TSG_EXPORT int TSGgml_NemotronMamba2PrefillF32(
             eps
         };
 
+        std::shared_ptr<Mamba2PrefillCacheEntry> entry_ref;
         Mamba2PrefillCacheEntry* entry = nullptr;
         {
             std::lock_guard<std::mutex> lk(g_mamba2_prefill_cache_mutex);
             auto it = g_mamba2_prefill_cache.find(cache_key);
             if (it != g_mamba2_prefill_cache.end())
-                entry = it->second.get();
+            {
+                entry_ref = it->second;
+                entry = entry_ref.get();
+                entry->last_use = ++g_mamba2_prefill_use_clock;
+            }
         }
 
         if (entry == nullptr)
@@ -479,7 +534,7 @@ TSG_EXPORT int TSGgml_NemotronMamba2PrefillF32(
             std::size_t ctx_size = 160 * per_tensor_bytes;
             if (ctx_size < 4 * 1024 * 1024) ctx_size = 4 * 1024 * 1024;
 
-            auto new_entry = std::make_unique<Mamba2PrefillCacheEntry>();
+            auto new_entry = std::make_shared<Mamba2PrefillCacheEntry>();
             new_entry->ctx_buffer = std::make_unique<std::uint8_t[]>(ctx_size);
 
             ggml_init_params params = {};
@@ -683,10 +738,24 @@ TSG_EXPORT int TSGgml_NemotronMamba2PrefillF32(
             const std::int32_t zero_id = 0;
             ggml_backend_tensor_set(new_entry->ids_storage, &zero_id, 0, sizeof(zero_id));
 
-            std::lock_guard<std::mutex> lk(g_mamba2_prefill_cache_mutex);
-            auto [it, inserted] = g_mamba2_prefill_cache.emplace(cache_key, std::move(new_entry));
-            entry = it->second.get();
-            ensure_mamba2_prefill_cache_cleanup_registered();
+            new_entry->device_bytes = ggml_backend_buffer_get_size(new_entry->buffer.value);
+            entry_ref = new_entry;
+            entry = entry_ref.get();
+
+            const std::size_t budget = mamba2_prefill_cache_budget_bytes();
+            if (new_entry->device_bytes <= budget)
+            {
+                std::lock_guard<std::mutex> lk(g_mamba2_prefill_cache_mutex);
+                if (g_mamba2_prefill_cache.find(cache_key) == g_mamba2_prefill_cache.end())
+                {
+                    mamba2_prefill_cache_evict_for_locked(new_entry->device_bytes, budget);
+                    new_entry->last_use = ++g_mamba2_prefill_use_clock;
+                    g_mamba2_prefill_cache.emplace(cache_key, new_entry);
+                    g_mamba2_prefill_cache_bytes += new_entry->device_bytes;
+                }
+                ensure_mamba2_prefill_cache_cleanup_registered();
+            }
+            // Otherwise the graph serves this call only and entry_ref frees it on return.
         }
 
         {
