@@ -1340,6 +1340,10 @@ offloaded prefill runs several times faster than llama.cpp's on the same files:
    expert range costs ~65 ms/GiB once and takes the transfer from 9.3 GB/s to
    55.6 GB/s on PCIe 5.0 x16. Disable with `TS_HOST_MOE_PIN=0`; bound it with
    `TS_HOST_MOE_PIN_MAX_MB` (default: 60% of the cgroup/host memory limit).
+   DeepSeek V4 / V4.1 are the exception: their loader multiplies offloaded experts
+   on the host at every batch size, nothing streams them, so it pins them only
+   when `TS_HOST_MOE_PIN=1` (see the
+   [V4.1 card](docs/models/deepseek41.md#load-time)).
 2. **Only the experts this batch routes to are sent**, grouped into consecutive
    runs — the same trick llama.cpp's scheduler plays with its used-expert bitset.
    At 512 tokens a large expert pool is only partly covered, and at the small
