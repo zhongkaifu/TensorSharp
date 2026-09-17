@@ -49,8 +49,7 @@ public class HostLoadRefusalProcessTests : IDisposable
     public void Server_MissingModel_ExitsWithTheRefusalCodeAndOneStderrLine()
     {
         string missing = Path.Combine(_dir, "missing.gguf");
-        HostRun? run = RunServer(missing);
-        if (run == null) return;
+        HostRun run = RunServer(missing);
 
         AssertRefused(run, "missing.gguf");
     }
@@ -58,8 +57,7 @@ public class HostLoadRefusalProcessTests : IDisposable
     [Fact]
     public void Server_FileThatIsNotAGguf_ExitsWithTheRefusalCodeAndOneStderrLine()
     {
-        HostRun? run = RunServer(WriteJunkModel());
-        if (run == null) return;
+        HostRun run = RunServer(WriteJunkModel());
 
         AssertRefused(run, "Not a GGUF file");
         // Refused, not crashed: no stack trace anywhere at the default log level.
@@ -70,8 +68,7 @@ public class HostLoadRefusalProcessTests : IDisposable
     [Fact]
     public void Server_DebugLogLevel_StillOneStderrLine_ButTheStackTraceIsLogged()
     {
-        HostRun? run = RunServer(WriteJunkModel(), logLevel: "Debug");
-        if (run == null) return;
+        HostRun run = RunServer(WriteJunkModel(), logLevel: "Debug");
 
         AssertRefused(run, "Not a GGUF file");
         Assert.Contains("   at ", run.Stdout, StringComparison.Ordinal);
@@ -80,8 +77,7 @@ public class HostLoadRefusalProcessTests : IDisposable
     [Fact]
     public void Cli_MissingModel_ExitsWithTheRefusalCodeAndOneStderrLine()
     {
-        HostRun? run = RunCli(Path.Combine(_dir, "missing.gguf"));
-        if (run == null) return;
+        HostRun run = RunCli(Path.Combine(_dir, "missing.gguf"));
 
         // This one used to exit 0 after printing the usage lines, so a script could not
         // tell a missing model from a completed run.
@@ -91,8 +87,7 @@ public class HostLoadRefusalProcessTests : IDisposable
     [Fact]
     public void Cli_FileThatIsNotAGguf_ExitsWithTheRefusalCodeAndOneStderrLine()
     {
-        HostRun? run = RunCli(WriteJunkModel());
-        if (run == null) return;
+        HostRun run = RunCli(WriteJunkModel());
 
         AssertRefused(run, "Not a GGUF file");
         Assert.DoesNotContain("Unhandled exception", run.Stdout + run.Stderr, StringComparison.Ordinal);
@@ -120,18 +115,16 @@ public class HostLoadRefusalProcessTests : IDisposable
         return path;
     }
 
-    private HostRun? RunServer(string modelPath, string logLevel = "Information")
+    private HostRun RunServer(string modelPath, string logLevel = "Information")
     {
-        string? dll = HostAssembly("TensorSharp.Server.Host", "TensorSharp.Server.Host.dll");
-        if (dll == null) return null;
+        string dll = HostAssembly("TensorSharp.Server.Host", "TensorSharp.Server.Host.dll");
         return Run(dll, logLevel,
             "--model", modelPath, "--backend", "cpu", "--no-webui", "--no-skills", "--no-prefix-cache");
     }
 
-    private HostRun? RunCli(string modelPath)
+    private HostRun RunCli(string modelPath)
     {
-        string? dll = HostAssembly("TensorSharp.Cli", "TensorSharp.Cli.dll");
-        if (dll == null) return null;
+        string dll = HostAssembly("TensorSharp.Cli", "TensorSharp.Cli.dll");
         string input = Path.Combine(_dir, "prompt.txt");
         File.WriteAllText(input, "hello");
         return Run(dll, "Information",
@@ -193,17 +186,17 @@ public class HostLoadRefusalProcessTests : IDisposable
     /// <summary>
     /// The host's own build output (both projects build into <c>&lt;project&gt;/bin/</c>),
     /// not the copy beside the test assembly, whose deps.json is the test project's.
-    /// Null, which skips the test, when the host has not been built.
+    /// Both hosts are project references; a missing output is a failed prerequisite.
     /// </summary>
-    private static string? HostAssembly(string project, string fileName)
+    private static string HostAssembly(string project, string fileName)
     {
         var dir = new DirectoryInfo(AppContext.BaseDirectory);
         while (dir != null && !File.Exists(Path.Combine(dir.FullName, "TensorSharp.slnx")))
             dir = dir.Parent;
-        if (dir == null)
-            return null;
+        Assert.NotNull(dir);
         string path = Path.Combine(dir.FullName, project, "bin", fileName);
-        return File.Exists(path) ? path : null;
+        Assert.True(File.Exists(path), $"Required host build output not found: {path}");
+        return path;
     }
 
     private static string Tail(string text)
