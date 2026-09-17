@@ -362,6 +362,117 @@ public class SchedulerCapacityAdmissionTests
         Assert.Equal(64, b.PrefixCacheReusedTokens);
         Assert.Contains(second.ScheduledWork, w => ReferenceEquals(w.Sequence, b));
     }
+    /// <summary>
+    /// The shared-prefix discount is for pooled adoption only. Admission tries a
+    /// retained fused holder first (Gemma 4 has both), and the executor backs that
+    /// holder with ceil(lcp / BlockSize) NEW blocks for the whole prefix, not the
+    /// blocks another running request already holds. A candidate that the discount
+    /// admits but the holder serves takes blocks the running prompts still need.
+    /// </summary>
+    [Theory]
+    [InlineData(false, true)]   // pooled adoption: the discount is real, "b" runs next to "a"
+    [InlineData(true, false)]   // a retained holder serves "b": no discount, "b" waits
+    public void SharedPrefixDiscount_DoesNotApply_WhenARetainedHolderServesThePrefix(bool fusedMatch, bool admitted)
+    {
+        // 20 blocks x 8. "a" is a 144-token prompt (64-token shared prefix + 80) that
+        // prefills 8 tokens per contended step; "b" is the same prefix + 8 tokens.
+        var cfg = new SchedulerConfig
+        {
+            MaxNumBatchedTokens = 16,
+            MaxNumRunningSequences = 4,
+            MaxPrefillChunkSize = 16,
+            SoloPrefillChunkSize = 16,
+            NumBlocks = 20,
+            BlockSize = BlockSize,
+            EnablePrefixCaching = true,
+            DecodeQuantumTokens = 1,
+            StopRepetition = false,
+        };
+        var pool = new BlockPool(cfg.NumBlocks, cfg.BlockSize, 0);
+        var sched = new ContinuousBatchScheduler(cfg, pool, "fp-fused-discount", NullLogger.Instance);
+        var prefix = Enumerable.Range(1, 64).ToList();
+        var a = new SequenceState("a", prefix.Concat(Enumerable.Range(500, 80)).ToList(), 8, BlockSize, SamplingConfig.Greedy);
+        var b = new SequenceState("b", prefix.Concat(Enumerable.Range(900, 8)).ToList(), 8, BlockSize, SamplingConfig.Greedy);
+
+        int fusedAdoptions = 0;
+        // Mirrors BatchExecutor.ComputeFusedContinuationLcp / TryAdoptFusedContinuation:
+        // a holder of "b"'s conversation covers the 64-token prefix, and adopting it
+        // allocates fresh placeholder blocks for the whole prefix.
+        sched.AttachFusedCacheContinuation(
+            seq => fusedMatch && seq.RequestId == "b" ? 64 : 0,
+            (seq, lcp) =>
+            {
+                var blocks = pool.AllocateNew((lcp + BlockSize - 1) / BlockSize);
+                if (blocks == null) return false;
+                foreach (var block in blocks) seq.BlockTable.AppendBlock(block);
+                seq.SetComputedTokensForPrefixAdoption(lcp);
+                seq.PrefixCacheReusedTokens = lcp;
+                fusedAdoptions++;
+                return true;
+            });
+
+        void Apply(SchedulerOutput output)
+        {
+            foreach (var work in output.ScheduledWork)
+            {
+                int before = work.Sequence.NumComputedTokens;
+                work.Sequence.AdvanceComputedTokens(work.NumScheduledTokens);
+                sched.OnBlocksCommitted(work.Sequence, before);
+            }
+        }
+
+        sched.Submit(a);
+        while (a.NumComputedTokens < 64)
+            Apply(sched.Schedule());
+        Assert.Equal(64, a.NumComputedTokens);
+        Assert.Equal(8, a.BlockTable.NumBlocks);
+
+        // This step "a" takes its next 8 tokens (a 9th block): 11 blocks free, 9 more
+        // still owed to "a"'s prompt, so 2 are available. "b" needs 9, or 1 when its 8
+        // prefix blocks are shared with "a"; a holder instead takes 8 new ones.
+        sched.Submit(b);
+        var contested = sched.Schedule();
+
+        Assert.Empty(contested.PreemptedRequestIds);
+        if (admitted)
+        {
+            Assert.Equal(SequenceStatus.Running, b.Status);
+            Assert.Equal(64, b.PrefixCacheReusedTokens);
+            Assert.Equal(0, fusedAdoptions);
+        }
+        else
+        {
+            Assert.Equal(SequenceStatus.Waiting, b.Status);
+            Assert.Equal(0, b.BlockTable.NumBlocks);
+            Assert.Equal(0, fusedAdoptions);
+            Assert.DoesNotContain(contested.ScheduledWork, w => ReferenceEquals(w.Sequence, b));
+        }
+
+        // Both finish and every block comes back. When the holder serves "b" it runs
+        // after "a", so nothing is preempted; pooled sharing leaves no room for "a"'s
+        // decode growth, which preempts "b" as designed (growth is never reserved).
+        var all = new[] { a, b };
+        for (int step = 0; step < 400 && all.Any(s => !s.Status.IsFinished()); step++)
+        {
+            var output = sched.Schedule();
+            if (fusedMatch)
+                Assert.Empty(output.PreemptedRequestIds);
+            foreach (var work in output.ScheduledWork)
+            {
+                var seq = work.Sequence;
+                int before = seq.NumComputedTokens;
+                seq.AdvanceComputedTokens(work.NumScheduledTokens);
+                sched.OnBlocksCommitted(seq, before);
+                if (seq.NumComputedTokens < seq.NumTotalTokens) continue;
+                seq.AppendOutputToken(3);
+                if (seq.ShouldStopForLength())
+                    sched.NotifyStop(seq, SequenceStatus.FinishedLengthCapped, "length", output);
+            }
+        }
+        Assert.All(all, s => Assert.Equal(SequenceStatus.FinishedLengthCapped, s.Status));
+        Assert.Equal(cfg.NumBlocks, pool.NumFreeBlocks);
+    }
+
     /// <summary>The shared-prefix discount counts only the blocks the candidate would
     /// really adopt: a cache breakpoint, a different picture at the same position, a
     /// model that cannot continue past a media span, or another conversation's scope

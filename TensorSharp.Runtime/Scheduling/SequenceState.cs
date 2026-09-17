@@ -337,7 +337,34 @@ namespace TensorSharp.Runtime.Scheduling
 
         public bool ShouldStopForLength() => OutputTokens.Count >= MaxNewTokens;
 
+        /// <summary>The prompt's full-block prefix-cache hashes, as the scheduler last
+        /// computed them (see <c>ContinuousBatchScheduler.GetPromptBlockHashes</c>).</summary>
+        internal PromptBlockHashes CachedPromptBlockHashes { get; set; }
+
         public override string ToString()
             => $"Seq({RequestId}, sn={Sn}, status={Status}, prompt={PromptTokens.Count}, out={OutputTokens.Count}, computed={NumComputedTokens})";
+    }
+
+    /// <summary>A sequence's prompt block hashes and the scheduler inputs they were
+    /// computed under (the sequence's own inputs are fixed at construction).</summary>
+    internal sealed class PromptBlockHashes
+    {
+        public PromptBlockHashes(string fingerprint, int blockSize, int promptTokens, IReadOnlyList<KvBlockHash> hashes)
+        {
+            Fingerprint = fingerprint;
+            BlockSize = blockSize;
+            PromptTokens = promptTokens;
+            Hashes = hashes;
+        }
+
+        public string Fingerprint { get; }
+        public int BlockSize { get; }
+        public int PromptTokens { get; }
+        public IReadOnlyList<KvBlockHash> Hashes { get; }
+
+        public bool Matches(string fingerprint, int blockSize, int promptTokens)
+            => blockSize == BlockSize
+               && promptTokens == PromptTokens
+               && string.Equals(fingerprint, Fingerprint, StringComparison.Ordinal);
     }
 }

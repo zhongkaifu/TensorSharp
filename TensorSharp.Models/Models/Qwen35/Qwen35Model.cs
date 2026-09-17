@@ -1473,14 +1473,41 @@ namespace TensorSharp.Models
 
         public override bool TryInjectKVBlock(int destToken, int tokenCount, ReadOnlySpan<byte> source)
         {
+            // A refusal must leave the model exactly as it was: callers treat a refused
+            // block as the end of what the model holds and resume from there (an inject
+            // shortfall is a miss). Every GDN layer's recurrent state is overwritten in
+            // place, so a refusal found after the first layer was written would leave the
+            // state of neither this block nor the one before it. Everything that can refuse
+            // is therefore decided here, before the first write.
             if (!SupportsKVStateSnapshot) return false;
-            if (destToken != _cacheSeqLen) return false;
+            if (destToken != _cacheSeqLen || tokenCount <= 0) return false;
+            long endToken = (long)destToken + tokenCount;
+            if (endToken > _maxContextLength) return false;   // EnsureCacheCapacity would throw
             long expected = ComputeKVBlockByteSize(tokenCount);
-            if (source.Length != expected) return false;
+            if (expected <= sizeof(int) || source.Length != expected) return false;
+            long layerBytes = 0;
+            for (int l = 0; l < Config.NumLayers; l++)
+            {
+                layerBytes += _isRecurrent[l]
+                    ? GdnLayerStateBytes(l)
+                    : AttentionLayerBlockBytes(_kvCacheK[l], tokenCount) + AttentionLayerBlockBytes(_kvCacheV[l], tokenCount);
+            }
+            // The trailing M-RoPE delta (see ComputeKVBlockByteSize): present, and a
+            // rotation the next token can actually take - a position is never negative.
+            if (source.Length - layerBytes != sizeof(int)) return false;
+            int ropeDelta = System.Buffers.Binary.BinaryPrimitives.ReadInt32LittleEndian(source[(int)layerBytes..]);
+            if (endToken + ropeDelta < 0) return false;
 
             EnsureCacheCapacity(destToken + tokenCount);
+            for (int l = 0; l < Config.NumLayers; l++)
+            {
+                if (!_isRecurrent[l]
+                    && (_kvCacheK[l].Sizes[1] < endToken || _kvCacheV[l].Sizes[1] < endToken))
+                    return false;   // growth fell short; nothing has been written yet
+            }
             EnsureKvCacheHostSynchronized();
             EnsureFusedDecodeStateHostSynchronized();
+            // From here on no check can fail: sizes, capacity and the delta were settled above.
             int offset = 0;
             for (int l = 0; l < Config.NumLayers; l++)
             {
@@ -1500,11 +1527,9 @@ namespace TensorSharp.Models
                     offset += rG;
                 }
             }
-            if (source.Length - offset != sizeof(int))
-                return false;
             _cacheSeqLen = destToken + tokenCount;
             // The delta as of this block's end (see ComputeKVBlockByteSize).
-            _ropeDelta = System.Buffers.Binary.BinaryPrimitives.ReadInt32LittleEndian(source[offset..]);
+            _ropeDelta = ropeDelta;
 
             // Invalidate any device-cached views so the next forward refills them
             // from the freshly-written host buffers. Drop native graphs first:

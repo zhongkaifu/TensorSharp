@@ -259,6 +259,13 @@ namespace TensorSharp.Models
                 // RoPE at KV index + the holder's M-RoPE delta (non-zero past an image).
                 ropeSorted[i] = checked(positions[order[i]] + h.RopeDelta);
                 cacheSizes[i] = h.KvCapacity;
+                if (h.ConvScratch == IntPtr.Zero)
+                {
+                    // A holder adopted from a primary cache that had never decoded
+                    // (see TryFullModelDecodeCore): its GDN truth is the host ring.
+                    h.ConvScratch = AllocateConvScratch();
+                    h.FdStateResident = false;
+                }
                 if (!h.FdStateResident)
                 {
                     // Host ring is the GDN truth: land it in the scratch layout

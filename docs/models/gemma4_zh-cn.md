@@ -539,6 +539,15 @@ CUDA-graph 捕获不变：每步的所有输入（hidden 行、position、每 (�
 - **共享层**：alias 到 donor 的 cache，无独立分配。
 - **量化权重绑定**：在 GGML CPU / Metal / CUDA 上零拷贝 mmap（GGUF 文件用 `MemoryMappedFile` + `QuantizedWeight.CreateExternalView`）。Direct CUDA 把量化数据上传到设备一次，释放 host 拷贝。
 
+### 保留的 holder：一个块的下限
+
+已完成的并发请求的按请求 holder 只有在至少覆盖一个调度块（默认 256 token）时，才会为其对话的下一轮保留，
+规则与 Qwen 3.5 相同（`BatchExecutor.TryRetainReleasedFusedCache` 与 `DonateFinishedLiveCacheToRetained`）。
+更短的对话在每一轮与其他请求并行运行时都要重新 prefill 整个提示；单独运行的对话从没有这一下限的 live cache
+续接。holder 并不需要块粒度（按 token 逐个匹配，采用时预留 ceil(lcp / BlockSize) 个占位块），但降低下限在
+Qwen 3.5 的 Metal 精确性验证中失败，原因尚未查明，详见 [Qwen 3.5：保留的 holder：一个块的下限](qwen35_zh-cn.md#保留的-holder一个块的下限)。
+更短的 Gemma 4 holder 未经验证，因此这里同样保持该下限。
+
 ## 11. 批处理 / 分页前向（连续批处理）
 
 Gemma 4 提供完整的 `IBatchedPagedModel.ForwardBatch` 移植

@@ -119,7 +119,7 @@ BlockPool + PagedKvStorage + BlockHashIndex   (托管主机内存)
 3. Pipeline 创建 `SequenceState` 并调用 `InferenceEngine.SubmitRequest`。
 4. 引擎 worker 向 `ContinuousBatchScheduler` 请求下一步工作。
 5. 调度器在 token 与序列预算允许时接纳等待序列。分配新块前，它会在 `BlockHashIndex` 中查找完整 prompt 块，命中时直接复用共享块。
-   只有当空闲块在扣除运行中请求尚需分配的 prompt 块之后，仍能容纳等待请求的整段 prompt 时，才会接纳它；否则它留在队列中，直到有请求结束（单独一个请求总会被接纳）。它会从运行中请求那里复用的前缀块是共享的，不计入其需求。
+   只有当空闲块在扣除运行中请求尚需分配的 prompt 块之后，仍能容纳等待请求的整段 prompt 时，才会接纳它；否则它留在队列中，直到有请求结束（单独一个请求总会被接纳）。它会从运行中请求那里复用的前缀块是共享的，不计入其需求；但如果改由保留的按请求 holder（Gemma 4、Qwen 3.5/3.6）服务该提示，则不享受这一扣减：接纳会先尝试该 holder，而它为复用的前缀分配新的块，因此这样的请求按整段 prompt 计算。
 6. 块池压力较大时（decode 增长不预留），调度器可以抢占排名低于需要块的那个序列的运行序列（优先级更低，或同优先级但提交更晚），提交其完整块、释放剩余块，并重新排入等待队列。序列绝不抢占比它更早的序列：它会等待一步，因此块池满时按从旧到新的顺序排空，而不是让长 prefill 彼此抢占形成活锁。
 7. `BatchExecutor` 执行本步工作。它向 `ExecutionPlanner` 请求本步的 `ExecutionPlan`，并运行第一个接受该步的候选路径（见 [执行规划](#执行规划capability-model)）。
 8. 引擎把采样 token 发给 request handle，检查 EOS / max-tokens / abort 状态，并释放已完成序列的块。

@@ -252,15 +252,21 @@ public class Qwen35ImageFollowUpExactnessTests
     /// The concurrent paths: an image conversation and a text conversation run side by
     /// side, so each decodes through its own per-request holder (and, on CUDA and Metal,
     /// the arena batched decode, whose RoPE positions come from each holder's delta), and
-    /// each follow-up continues the holder its previous turn retained. Every turn must
-    /// reuse the previous one past the image and produce the tokens a cold solo prefill
-    /// of the same prompt produces.
+    /// each follow-up continues the holder its previous turn retained. Every later turn
+    /// must reuse the previous one (past the image, for the image conversation) and
+    /// produce the tokens a cold solo prefill of the same prompt produces, up to a near
+    /// tie (see <see cref="CompareWithCold"/>).
     /// </summary>
     [ModelFact(EnvModelDir, ModelPattern)]
     public async Task ConcurrentReuseAfterAnImage_MatchesColdPrefill()
     {
         using var ctx = Context.Open(_output, syntheticScale: 2);
         if (ctx == null) return;
+        await RunConcurrentConversations(ctx);
+    }
+
+    private async Task RunConcurrentConversations(Context ctx)
+    {
         if (ctx.Backend is not (BackendType.GgmlMetal or BackendType.GgmlCuda))
         {
             // Holders, their retention and the arena exist on CUDA and Metal only. Elsewhere
@@ -277,6 +283,7 @@ public class Qwen35ImageFollowUpExactnessTests
         var imageOut = new List<List<int>>();
         var textOut = new List<List<int>>();
         var imageReused = new List<int>();
+        var textReused = new List<int>();
         using (var engine = new InferenceEngine(ctx.Model, Config(), NullLogger.Instance))
         {
             for (int k = 0; k < 4; k++)
@@ -284,7 +291,7 @@ public class Qwen35ImageFollowUpExactnessTests
                 var a = ctx.BuildTurn(k, k == 0 ? null : imageTurns[k - 1].Unexpanded, k == 0 ? null : imageOut[k - 1],
                     Context.UserTexts, imageTurn: 1);
                 var b = ctx.BuildTurn(k, k == 0 ? null : textTurns[k - 1].Unexpanded, k == 0 ? null : textOut[k - 1],
-                    Context.TextOnlyUserTexts, imageTurn: -1);
+                    Context.TextOnlyUserTexts, imageTurn: -1, systemText: Context.LongSystemText);
                 imageTurns.Add(a);
                 textTurns.Add(b);
                 var ta = ctx.GenerateAsync(engine, a, $"conc-img-{k}", scope: "conversation-image");
@@ -293,6 +300,7 @@ public class Qwen35ImageFollowUpExactnessTests
                 imageOut.Add(ta.Result.output);
                 textOut.Add(tb.Result.output);
                 imageReused.Add(ta.Result.completion.PrefixCacheReusedTokens);
+                textReused.Add(tb.Result.completion.PrefixCacheReusedTokens);
                 _output.WriteLine($"[concurrent t{k + 1}] image prompt {a.Expanded.Count} reused {ta.Result.completion.PrefixCacheReusedTokens}: {ctx.Decode(ta.Result.output)}");
                 _output.WriteLine($"[concurrent t{k + 1}] text  prompt {b.Expanded.Count} reused {tb.Result.completion.PrefixCacheReusedTokens}: {ctx.Decode(tb.Result.output)}");
             }
@@ -305,25 +313,79 @@ public class Qwen35ImageFollowUpExactnessTests
         if (ctx.Backend is BackendType.GgmlMetal or BackendType.GgmlCuda)
             Assert.True(arenaSteps > 0, "the concurrent turns never reached the arena batched decode");
 
-        var mismatches = new List<string>();
+        var failures = new List<string>();
         for (int k = 0; k < 4; k++)
         {
             foreach (var (turn, output, label) in new[] { (imageTurns[k], imageOut[k], "image"), (textTurns[k], textOut[k], "text") })
             {
-                using var engine = new InferenceEngine(ctx.Model, Config(), NullLogger.Instance);
-                var (completion, cold) = await ctx.GenerateAsync(engine, turn, $"conc-cold-{label}-{k}");
-                Assert.Equal(0, completion.PrefixCacheReusedTokens);
-                if (!cold.SequenceEqual(output))
-                    mismatches.Add($"{label} turn {k + 1}: concurrent {ctx.Decode(output)} | cold {ctx.Decode(cold)}");
+                List<int> cold;
+                using (var engine = new InferenceEngine(ctx.Model, Config(), NullLogger.Instance))
+                {
+                    var (completion, coldOut) = await ctx.GenerateAsync(engine, turn, $"conc-cold-{label}-{k}");
+                    Assert.Equal(0, completion.PrefixCacheReusedTokens);
+                    cold = coldOut;
+                }
+                CompareWithCold(ctx, $"{label} turn {k + 1}", turn, output, cold, failures);
             }
         }
-        foreach (var m in mismatches) _output.WriteLine("[mismatch] " + m);
-        Assert.Empty(mismatches);
 
+        // The text control is only a control if it reuses: its first turn alone passes one
+        // block, so every later turn continues the holder the previous turn retained.
+        if (textTurns[0].Expanded.Count <= Config().BlockSize)
+            failures.Add($"the text control's first turn is {textTurns[0].Expanded.Count} tokens, not longer than one {Config().BlockSize}-token block");
+        for (int k = 1; k < 4; k++)
+        {
+            int textCached = textTurns[k - 1].Expanded.Count + textOut[k - 1].Count - 1;
+            if (textReused[k] < textCached)
+                failures.Add($"text turn {k + 1} reused {textReused[k]} tokens; its previous turn left {textCached} in the holder");
+        }
         int imageEnd = imageTurns[1].ImageSpanEnd;
         for (int k = 2; k < 4; k++)
-            Assert.True(imageReused[k] > imageEnd,
-                $"concurrent image turn {k + 1} reused {imageReused[k]} tokens, which stops before the image ends at {imageEnd}");
+        {
+            if (imageReused[k] <= imageEnd)
+                failures.Add($"image turn {k + 1} reused {imageReused[k]} tokens, which stops before the image ends at {imageEnd}");
+        }
+        foreach (var f in failures) _output.WriteLine("[failure] " + f);
+        Assert.Empty(failures);
+    }
+
+    /// <summary>
+    /// A concurrent request's greedy tokens against a cold engine run of the same prompt,
+    /// with the direct test's tie allowance. At the first differing step the cold run's
+    /// logits are captured (the same prompt prefilled cold straight on the model, which
+    /// must have decoded the engine's cold tokens up to that step); if their top-2 margin
+    /// is below the backend's logit tolerance (<see cref="LogitTolerance"/>, the bound the
+    /// direct test holds every compared step to), the kernels may break that tie either
+    /// way and the rest of the request is not compared: past it the two runs decode
+    /// different histories. Any other difference is a failure.
+    /// </summary>
+    private void CompareWithCold(Context ctx, string label, Turn turn, List<int> output, List<int> cold, List<string> failures)
+    {
+        int s = FirstDifference(output, cold);
+        if (s < 0)
+            return;
+        string detail = $"concurrent {ctx.Decode(output)} | cold {ctx.Decode(cold)}";
+        if (s >= DirectSteps)
+        {
+            failures.Add($"{label}: tokens differ at step {s}, beyond the {DirectSteps} compared steps; {detail}");
+            return;
+        }
+        var direct = ctx.RunDirect(turn, prefix: null, prefixOutput: null, DirectSteps);
+        for (int i = 0; i < Math.Min(s, cold.Count); i++)
+        {
+            if (direct.Tokens[i] != cold[i])
+            {
+                failures.Add($"{label}: tokens differ at step {s}, but the direct cold run already differs from the engine's " +
+                             $"cold run at step {i}, so its logits do not describe step {s}; {detail}");
+                return;
+            }
+        }
+        float margin = TopMargin(direct.Logits[s]);
+        float bound = LogitTolerance(ctx.Backend);
+        if (margin < bound)
+            _output.WriteLine($"[tie] {label} step {s}: cold top-2 margin {margin:F4} < {ctx.Backend} tolerance {bound}; the rest of this request is not compared");
+        else
+            failures.Add($"{label}: tokens differ at step {s} although the cold top-2 margin {margin} is not below the {ctx.Backend} tolerance {bound}; {detail}");
     }
 
     private static SchedulerConfig Config() => new()
@@ -456,6 +518,30 @@ public class Qwen35ImageFollowUpExactnessTests
             "Now suggest a short title for the picture.",
         };
 
+        public const string DefaultSystemText = "You are a helpful assistant. Answer briefly.";
+
+        /// <summary>A system prompt longer than one scheduler block (Config().BlockSize =
+        /// 256 tokens) on its own. The concurrent test's text-only control uses it: with the
+        /// default system prompt every text turn is shorter than a block, no finished turn
+        /// was retained as a holder, and the control reused nothing on any turn.</summary>
+        public const string LongSystemText =
+            "You are a helpful assistant for a geography class. Follow these guidelines in every answer. " +
+            "Answer briefly, in one or two sentences, unless the student asks for a list. When you name a river, " +
+            "a city or a country, use the English name that an atlas printed in London would use, and do not add " +
+            "the local name in parentheses. When a question depends on a definition that geographers disagree " +
+            "about, such as where a river begins or which tributary counts as the main stem, pick the most common " +
+            "convention and do not discuss the alternatives. Give lengths in kilometres and round them to the " +
+            "nearest ten; give populations in millions with one decimal place and say which year the figure is " +
+            "from only if the student asks. Never invent a statistic: if you are not sure of a number, say that " +
+            "you are not sure. Do not use bullet points, headings, bold text or tables. Do not greet the student, " +
+            "do not thank the student for the question and do not end with an offer of further help. If the " +
+            "student refers to something from earlier in the conversation, such as a river you listed before, " +
+            "answer about exactly that item and do not repeat the earlier list. If a question is ambiguous, answer " +
+            "the most likely reading and do not ask the student to clarify. Keep the tone plain and factual, as " +
+            "in a school textbook written for twelve-year-old readers, and avoid figurative language, jokes and " +
+            "rhetorical questions. When you mention a direction, use the cardinal points north, south, east and " +
+            "west rather than left or right, and when you mention a border, name both countries on either side.";
+
         public static readonly string[] TextOnlyUserTexts =
         {
             "List three rivers in Europe.",
@@ -472,14 +558,15 @@ public class Qwen35ImageFollowUpExactnessTests
         public Turn BuildTurn(int k, List<int> previous, List<int> previousOutput)
             => BuildTurn(k, previous, previousOutput, UserTexts, imageTurn: 1);
 
-        public Turn BuildTurn(int k, List<int> previous, List<int> previousOutput, string[] userTexts, int imageTurn)
+        public Turn BuildTurn(int k, List<int> previous, List<int> previousOutput, string[] userTexts, int imageTurn,
+            string systemText = DefaultSystemText)
         {
             int imStart = Special("<|im_start|>"), imEnd = Special("<|im_end|>");
             var tokens = new List<int>();
             if (previous == null)
             {
                 tokens.Add(imStart);
-                tokens.AddRange(Text("system\nYou are a helpful assistant. Answer briefly."));
+                tokens.AddRange(Text("system\n" + systemText));
                 tokens.Add(imEnd);
                 tokens.AddRange(Text("\n"));
             }

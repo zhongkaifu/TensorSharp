@@ -276,7 +276,8 @@ rope 位置 = KV 下标 + delta，   delta = 位置表最后一行的最大分�
   从不影响输出。）
 - **与其描述的状态一起保存。** 每个请求的 holder 在换入换出、保留、重新绑定和池化过程中携带它；
   共享前缀检查点及其克隆会复制它；KV-swap 并发路径的逐块 KV 快照在末尾保存它（与递归状态一样，
-  取块结束时的值）；检查点文件格式（`Q5KC`）升级为**版本 2**，在行数之后写入 delta。
+  取块结束时的值；注入的块若大小不符，或其 delta 会让下一个 token 落在负位置，会在写入任何内容之前被
+  拒绝，因此被拒绝后模型恰好保留该块之前的内容）；检查点文件格式（`Q5KC`）升级为**版本 2**，在行数之后写入 delta。
   版本 1 的文件没有 delta，导入时会被拒绝；引擎记录“保存的检查点与模型不符”，重新 prefill 该前缀
   并再次保存。
 
@@ -338,8 +339,22 @@ M-RoPE）。因此测试检查三点：
 | CUDA（A40，Qwen3.5-9B-Q8_0，mmproj F16） | 2.39 | 0.92 | 2.6x | 第 3 轮第 0 步（差距 0.034 < 0.47）与第 4 轮第 1 步（差距 0.13 < 0.29）：平局 | 0.0 |
 
 在 CUDA 上，即使是纯文本对话，decode 与 prefill 内核也会相差约一个 logit，因此在 24 个贪心 token 内，
-无论有没有图片，复用回合与冷启动回合都可能在低差距 token 上翻转；并发测试（holder 与 arena）在两个
-后端上都得到相同的 token。
+无论有没有图片，复用回合与冷启动回合都可能在低差距 token 上翻转。
+
+并发测试（holder 与 arena）采用同样的平局规则。在某个请求的 token 与其冷启动引擎运行首次不同的那一步，
+测试捕获冷启动 logits（直接在模型上对同一提示做冷启动 prefill，且到该步为止必须解码出相同的 token），
+只有当其 top-2 差距低于该后端的 logit 容差时才接受这一差异，并且不再比较该请求的剩余部分。它的纯文本
+对照以长于一个块的系统提示开头（第 1 轮 346 token）：使用一行系统提示时每个文本回合都短于一个块，没有
+回合被保留，对照什么也没复用。现在它必须复用上一轮留下的全部内容。2026-09-17 实测：
+
+| 后端 | 图片 | 文本第 2-4 轮复用 | token 差异 |
+|---|---|---|---|
+| Metal（Qwen3.5-9B-Q8_0，mmproj BF16） | 内置 896x672 | 367 / 411 / 446 | 无 |
+| Metal | 真实照片 | 367 / 411 / 446 | 无 |
+| CUDA（A40，Qwen3.5-9B-Q8_0，mmproj F16） | 内置 896x672 | 366 / 410 / 445 | 图片第 3 轮第 0 步（差距 0.23）、图片第 4 轮第 5 步（0.017）、文本第 3 轮第 0 步（0.041）：平局 |
+| CUDA | 真实照片 | 366 / 410 / 445 | 文本第 3 轮第 0 步（差距 0.041）：平局 |
+
+引入平局规则之前，CUDA 上使用内置图片的运行在图片第 3 轮第 0 步失败。
 
 **经过服务端**（Phase 0 的 IMG 探针：Web UI 与 OpenAI 对话，图片在第 1 或第 3 轮，另有纯文本对照；
 Metal，Qwen3.5-9B-Q8_0，贪心，每轮 96 token），图片之后的每一轮现在都续接缓存：
@@ -594,6 +609,40 @@ GGML 后端上 `qwen35moe` / `qwen3next` 的 decode 中，每层 MoE expert 计�
 - **GatedDeltaNet 层**：`_convState[layer]` 是 `(convKernel - 1) * qkvDim` 的 float 数组（conv1d 滑动窗口），`_deltaStateTensor[layer]` 形如 `[numVHeads, headVDim, headKDim]`（SSM 隐状态）。
 - `ResetKVCache()` 同时清零两类缓存。
 - 初始 CUDA 缓存可以小于 `maxContextLength`，按需扩张（启动时打印）。
+- **整模型 decode 的 conv scratch**（`_fdConvScratch`）属于每个缓存（主缓存和每个按请求的 holder），随缓存
+  一起换入换出。只要当前激活的缓存还没有 scratch 就会分配（其 GDN 真值在 host 环形缓冲里，从那里重新
+  填充），而不只是在首次构建 decode 描述符时分配。以前，一个在那一刻之前从未 decode 过的缓存（模型最初的
+  主缓存，在先绑定某个 holder 时被保存到一旁）会保留空 scratch，恢复后第一次 decode 就在
+  `TryFullModelDecodeCore` 中抛出 `NullReferenceException`；在引擎上，这对应新加载模型的第一个调度步是并发
+  步、之后主缓存上又有一次单独 decode 的情形。arena 批处理 decode 对 scratch 为空的 holder 同样处理。
+  `Qwen35ConvScratchTests`（需要模型）覆盖这一点。
+
+### 保留的 holder：一个块的下限
+
+已完成请求的按请求 holder 只有在至少覆盖一个调度块（默认 256 token）时，才会为其对话的下一轮保留
+（`BatchExecutor.TryRetainReleasedFusedCache`，以及对在主缓存上结束的对话使用的
+`DonateFinishedLiveCacheToRetained`）。因此更短的对话——例如短的图片对话，448x336 的图片只有 140 个
+token——每当与其他请求并行运行时，每一轮都要重新 prefill 整个提示并重新编码图片。单独运行的对话不受影响：
+它从 live cache 续接，而 live cache 没有这个下限。
+
+这个下限并不是 holder 本身的需要。holder 按 token 逐个匹配（`FindRetainedFusedMatch`），采用时预留
+ceil(lcp / BlockSize) 个占位块（`TryAdoptFusedContinuation`），这条路径上没有任何东西依赖块边界。它之所以
+保留，是因为降低下限在 Metal 上没有通过验证（2026-09-17，Qwen3.5-9B-Q8_0 + mmproj BF16）：
+
+- **尝试的做法。** 当更短的 holder 不会挤出任何已保留的 holder，且其字节数落在模型的空闲 holder 预算内
+  （测得的缓存余量的一半减去已停放的 holder，即 `CanPoolIdleCache` 对释放的 holder 使用的规则）时保留它，
+  两条保留路径都如此。
+- **引擎。** 一段图片对话与一段文本对话并行，前几轮都短于一个块（448x336 图片；一行的系统提示），之后每一轮
+  都复用了上一轮，但图片第 2 轮——在保留的 41 token holder 之上 prefill 图片——在第 20 步与冷启动运行分叉，
+  该步冷启动的 top-2 差距为 0.255，高于 Metal 的 0.1 容差。只重放这一对请求（第 1 轮与一个更长的文本请求
+  并行，第 2 轮单独运行）时，10 次中有 4 次以同样方式分叉，其中 3 次是新加载模型上的第一段对话；关闭 arena
+  批处理 decode（`TS_BATCHED_FUSED_DECODE=0`）时 3 次中 0 次；在未改动的代码上第 1 轮长于一个块时 6 次中 0 次。
+- **模型层面。** 直接在模型上驱动同样的序列（第 1 轮在主缓存上 prefill 后被采用，其回复在 arena 中与一个更长
+  的 holder 一起 decode，holder 被保留并重新绑定，prefill 图片，decode 24 步），与全程单独运行相比保持在 0.023
+  以内，arena decode 一步与单独 decode 相差不超过 0.0008。误差来自引擎调度这条路径的某个环节，目前尚未查明。
+- 同样的运行两次触发了上文的 conv scratch 空指针 `NullReferenceException`。该问题已修复，修复后分叉依然存在。
+
+在查明这一分叉之前，一个块的下限保持不变，Gemma 4 也一样（同一条执行器规则；更短的 Gemma 4 holder 未经验证）。
 
 ### mmap 量化权重
 

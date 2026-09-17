@@ -1078,6 +1078,20 @@ namespace TensorSharp.Models
         // state without updating _convState / _deltaStateTensor's host mirrors.
         private bool _gdnStateHostDirty;
 
+        /// <summary>A whole-model-decode conv scratch for one cache: every GDN layer's
+        /// [time, channel] conv state, the layout <see cref="AllocateHolder"/> gives a
+        /// per-request holder.</summary>
+        private IntPtr AllocateConvScratch()
+        {
+            int gdnCount = 0;
+            for (int l = 0; l < Config.NumLayers; l++)
+                if (_isRecurrent[l]) gdnCount++;
+            int qkvDim = _headKDim * _numKHeads * 2 + _headVDim * _numVHeads;
+            int convDim = _convKernel - 1;
+            return Marshal.AllocHGlobal(checked((nint)((long)Math.Max(1, gdnCount)
+                * Math.Max(1, convDim) * qkvDim * sizeof(float))));
+        }
+
         /// <summary>
         /// Drain fused-decode GDN state to its host representation without
         /// evicting the device buffers.  Snapshotting can then read exact state
@@ -1495,16 +1509,22 @@ namespace TensorSharp.Models
                                 : ""));
                     }
                 }
-                int gdnCount = 0;
                 _fdGdnSlot = new int[n];
+                int gdnCount = 0;
                 for (int l = 0; l < n; l++)
                     _fdGdnSlot[l] = _isRecurrent[l] ? gdnCount++ : -1;
-                // The conv scratch is per-request-cache state (the per-seq fused
-                // path swaps _fdConvScratch via the holder); only allocate the
-                // primary/default one here if a holder hasn't already bound one.
-                if (_fdConvScratch == IntPtr.Zero)
-                    _fdConvScratch = Marshal.AllocHGlobal(Math.Max(1, gdnCount) * convDim * qkvDim * sizeof(float));
                 _fdLayers = new Qwen35LayerDecodeArgs[n];
+            }
+            // The conv scratch is per-cache state (the per-seq fused path swaps
+            // _fdConvScratch with the holder). Allocated whenever the ACTIVE cache has
+            // none, not only when the descriptors are first built: a cache that had
+            // never decoded by then - the model's original primary cache, saved aside
+            // when a per-request holder was bound first - would otherwise reach the
+            // reseed below with a null scratch. Its GDN truth is the host ring.
+            if (_fdConvScratch == IntPtr.Zero)
+            {
+                _fdConvScratch = AllocateConvScratch();
+                _fdStateResident = false;
             }
 
             int cacheSize = 0;

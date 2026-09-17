@@ -329,7 +329,10 @@ The delta is per sequence (`Qwen35Model.RopePositions.cs`):
 - **Stored with the state it describes.** Each per-request holder carries it through
   swaps, retention, re-keying and pooling, a shared-prefix checkpoint and its clone
   copy it, the per-block KV snapshot of the KV-swap concurrency path ends with it (like
-  the recurrent state, as of the block's end), and the checkpoint file format (`Q5KC`) is **version 2**, which writes it
+  the recurrent state, as of the block's end; an injected block whose size does not fit,
+  or whose delta would put the next token at a negative position, is refused before
+  anything is written, so a refusal leaves the model holding exactly the blocks before
+  it), and the checkpoint file format (`Q5KC`) is **version 2**, which writes it
   after the row count. A version-1 file names no delta and is refused on import; the
   engine logs that the saved checkpoint does not fit, prefills the prefix and saves it
   again.
@@ -410,8 +413,26 @@ Measured (24 steps, turns 2-4):
 
 On CUDA the decode and prefill kernels differ by up to about one logit even for a
 text-only conversation, so over 24 greedy tokens a low-margin token can flip between a
-reused and a cold turn with or without images; the concurrent test (holders and the
-arena) produced identical tokens on both backends.
+reused and a cold turn with or without images.
+
+The concurrent test (holders and the arena) applies the same tie rule. At the first step
+where a request's tokens differ from its cold engine run it captures the cold logits (the
+same prompt prefilled cold straight on the model, which must have decoded the same tokens
+up to that step) and accepts the difference only when their top-2 margin is below the
+backend's logit tolerance; the rest of that request is then not compared. Its text-only
+control opens with a system prompt longer than one block (a 346-token first turn): with
+the one-line prompt every text turn was shorter than a block, no turn was retained, and
+the control reused nothing. It must now reuse everything the previous turn left.
+Measured 2026-09-17:
+
+| Backend | Picture | Text turns 2-4 reused | Token differences |
+|---|---|---|---|
+| Metal (Qwen3.5-9B-Q8_0, mmproj BF16) | built-in 896x672 | 367 / 411 / 446 | none |
+| Metal | real photo | 367 / 411 / 446 | none |
+| CUDA (A40, Qwen3.5-9B-Q8_0, mmproj F16) | built-in 896x672 | 366 / 410 / 445 | image turn 3 step 0 (margin 0.23), image turn 4 step 5 (0.017), text turn 3 step 0 (0.041): ties |
+| CUDA | real photo | 366 / 410 / 445 | text turn 3 step 0 (margin 0.041): tie |
+
+Before the tie rule the CUDA built-in-picture run failed on its image turn 3 step 0.
 
 **Through the server** (the Phase 0 IMG probe: Web UI and OpenAI conversations with the
 image on turn 1 or turn 3, plus text controls; Metal, Qwen3.5-9B-Q8_0, greedy, 96 tokens
@@ -817,6 +838,53 @@ Allocated once in `InitGDNBuffers()`:
 - `ResetKVCache()` zeroes both kinds of cache.
 - Initial CUDA cache allocation can be smaller than `maxContextLength` and
   grows on demand (printed at startup).
+- **The whole-model decode's conv scratch** (`_fdConvScratch`) belongs to each cache
+  (the primary and every per-request holder) and is swapped with it. It is allocated
+  whenever the active cache has none, reseeded from the GDN host ring, not only when
+  the decode descriptors are first built. A cache that had never decoded by then - the
+  model's original primary cache, saved aside when a holder was bound first - used to
+  keep a null scratch, and its first decode after being restored threw a
+  `NullReferenceException` in `TryFullModelDecodeCore`. On the engine that is a freshly
+  loaded model whose first scheduled step is a concurrent one, followed later by a solo
+  decode on the primary cache. The arena batched decode treats a holder without a
+  scratch the same way. `Qwen35ConvScratchTests` (model-gated) covers it.
+
+### Retained holders: the one-block minimum
+
+A finished request's per-request holder is kept for its conversation's next turn
+(`BatchExecutor.TryRetainReleasedFusedCache`, and `DonateFinishedLiveCacheToRetained` for a
+conversation that finished on the primary cache) only when it holds at least one scheduler
+block (256 tokens by default). A shorter conversation - a short image conversation, since a
+448x336 picture is 140 tokens - therefore re-prefills its whole prompt, re-encoding the
+picture, on every turn that runs beside another request. A conversation that runs alone is
+not affected: it continues from the live cache, which has no minimum.
+
+The minimum is not something holders need. A holder is matched token by token
+(`FindRetainedFusedMatch`) and adopting one reserves ceil(lcp / BlockSize) placeholder blocks
+(`TryAdoptFusedContinuation`), so nothing on that path depends on a block boundary. It stays
+because lowering it failed validation on Metal (2026-09-17, Qwen3.5-9B-Q8_0 + mmproj BF16):
+
+- **What was tried.** Retain a shorter holder when it evicts no retained holder and its bytes
+  fit the model's idle-holder budget (half the measured cache headroom less the parked
+  holders, the rule `CanPoolIdleCache` applies to a released holder), in both retention paths.
+- **Engine.** An image conversation and a text conversation side by side, their first turns
+  under one block (the 448x336 picture; the one-line system prompt), then reused every turn,
+  but image turn 2 - the picture prefilled on top of a retained 41-token holder - diverged
+  from a cold run at step 20, where the cold top-2 margin is 0.255, above the 0.1 Metal
+  tolerance. Replaying just that pair (turn 1 beside a longer text request, turn 2 alone)
+  diverged the same way in 4 of 10 runs, 3 of them the first conversation on a freshly loaded
+  model; in 0 of 3 with the arena batched decode off (`TS_BATCHED_FUSED_DECODE=0`); and a turn 1
+  longer than one block on the unchanged code gave 0 divergences in 6 runs.
+- **Model level.** The same sequence driven straight through the model (turn 1 prefilled on
+  the primary cache and adopted, its reply decoded in the arena beside a longer holder, the
+  holder retained and re-keyed, the picture prefilled, 24 decode steps) stays within 0.023 of
+  an all-solo run, and an arena decode step is within 0.0008 of a solo one. The error comes
+  from something in how the engine schedules that path, not yet identified.
+- The same runs hit the null conv-scratch `NullReferenceException` above twice. It is fixed;
+  the divergence persists without it.
+
+Until that divergence is explained the one-block minimum stays, on Gemma 4 too (the same
+executor rule; shorter Gemma 4 holders were not validated).
 
 ### File-mapped quantized weights
 
