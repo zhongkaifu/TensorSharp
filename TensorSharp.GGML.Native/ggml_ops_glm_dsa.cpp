@@ -5185,13 +5185,24 @@ static bool forward_batched_decode(glm_model & m, int n, const int32_t * slot_id
     std::vector<int64_t> idx(1);
     std::vector<int32_t> v32((size_t) n);
 
+    // Each input is set on its own liveness. The token ids are only read on the
+    // device that embeds them, but EVERY device with a RoPE layer reads its own
+    // positions: skipping a device whose token input was pruned left its
+    // positions uninitialised, so on a multi-GPU layer split every layer past
+    // the first device rotated q/k by garbage and concurrent GLM-5.2 streams
+    // degenerated (glm5next is NoPE, which is why it never showed).
     for (int d = 0; d <= m.n_gpu; d++)
     {
-        if (!live(gr->inp.tokens[d])) continue;
-        for (int i = 0; i < n; i++) v32[(size_t) i] = tokens[i];
-        set_input_i32(gr->inp.tokens[d], v32.data(), (size_t) n);
-        for (int i = 0; i < n; i++) v32[(size_t) i] = positions[i];
-        set_input_i32(gr->inp.pos[d], v32.data(), (size_t) n);
+        if (live(gr->inp.tokens[d]))
+        {
+            for (int i = 0; i < n; i++) v32[(size_t) i] = tokens[i];
+            set_input_i32(gr->inp.tokens[d], v32.data(), (size_t) n);
+        }
+        if (live(gr->inp.pos[d]))
+        {
+            for (int i = 0; i < n; i++) v32[(size_t) i] = positions[i];
+            set_input_i32(gr->inp.pos[d], v32.data(), (size_t) n);
+        }
     }
 
     for (int i = 0; i < n; i++)
