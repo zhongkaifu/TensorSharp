@@ -440,10 +440,11 @@ Nemotron-H 是所有批处理移植里最复杂的，因为它结合了**三种�
 
 **驻留在设备上的递归状态。** 原生单 token Mamba2 decode kernel 在 token 之间把每个序列的 conv/SSM 状态留在设备上（每层每 token 下载约 2 MB 的代价超过 kernel 省下的时间），所以 decode 之后 host 数组是过期的。所有读取 host 状态的地方都会先通过 `TSGgml_NemotronMamba2DecodeReadState`（`SyncMamba2HostState`）把设备状态拷回：继续同一序列的托管 / 原生多 token forward、按块 KV 快照、第二个请求到达时把单序列 owner 迁移进槽位池、原生批处理步，以及投机解码快照。此前它们读到的都是第一个 decode token 之前的状态，因此并发请求（会在按序列路径和批处理路径之间交接序列）的贪心输出与单独服务同一请求时不同——8B 在并发 4 时出现 `101`、`1000000...` 以及重复循环。旧的单序列路径使用独立的 decode cache 槽位（`LegacyMamba2Slot`），批处理序列占用 slot 0 时不会再覆盖它的设备状态。若原生库早于该导出函数，decode kernel 会改为每个 token 下载状态（结果正确、速度较慢），并在 stderr 提示一次。
 
-**并发交接。** 另外两个缺陷让并发批次中第一个请求的回答与单独服务时不同（8B 上 `17 + 25` 被回答成 `18`、`35`、空回答或其他 prompt 的内容），两者都与 kernel 数值无关：
+**并发交接。** 另外三个缺陷让并发批次中的请求回答与单独服务时不同（8B 上 `17 + 25` 被回答成 `18`、`35`、空回答或其他 prompt 的内容），均与 kernel 数值无关：
 
 - *分页池扩容清空了在用的 K/V。* `EnsureNemoPagedBuffers` 扩容 block 池时复用了外层按层数组，新 buffer 在拷贝读取旧 buffer 之前就替换了它。在首次引入更大 block id 的那一步（新请求的 prefill，或刚迁移进来的单序列 owner）中 decode 的序列都会对全零做注意力。现在扩容时新建外层数组，与 Qwen 3、Qwen 3.5、Gemma 4、Mistral 3 的移植一致。
 - *所有权切换时借用的 logits。* 单独前向一个序列的步骤会让它借用模型可复用的 logits buffer，直到它采样。若新请求先取得所有权，其 `Forward` 会改写该 buffer，被换出的 owner 于是从新请求的 logits 中采样下一个 token。`BatchExecutor.EnsureOwnership` 现在给被换出的 owner 一份自己的拷贝。此问题与模型无关，也正是 `TS_NEMOTRON_BATCHED=0` 在并发下出错的原因。
+- *未清零的分页注意力 session。* `TSGgml_PagedAttentionForward` 按 query 数与 2 的幂 K/V bucket 缓存计算图，只上传前 `seq_len` 行，bucket 其余部分被 mask。session 假定其 backend buffer 初始为零，但 cudaMalloc 并不保证；CUDA flash attention kernel 会先为被 mask 的 key 计算 `q.k` 再加上 `-inf` mask：残留且溢出的 key 得到 `inf + -inf = NaN`，整行变为 NaN。现在 session 构建时清零其 buffer（所有使用原生分页 kernel 的模型共用）。这被作为 47B 在 32k prompt 之后某个批次一直解码出 `<unk>` 的可能原因修复；合成复现无法迫使分配器交还脏内存，因此两者的关联尚未证实。
 
 **原生批处理 Mamba2 步内核** —— `TSGgml_NemotronMamba2BatchedStepF32`
 （[`ggml_ops_mamba2.cpp`](../../TensorSharp.GGML.Native/ggml_ops_mamba2.cpp)）

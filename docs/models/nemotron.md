@@ -647,10 +647,10 @@ its device state. A native library that predates the export makes the
 decode kernel download its state every token instead (correct, slower) and
 says so once on stderr.
 
-**Concurrency hand-offs.** Two more defects made the first request of a
-concurrent wave answer differently from the same request served alone (on
-the 8B, `17 + 25` came back as `18`, `35`, an empty answer, or another
-prompt's content), and both had nothing to do with kernel numerics:
+**Concurrency hand-offs.** Three more defects made requests of a concurrent
+wave answer differently from the same request served alone (on the 8B,
+`17 + 25` came back as `18`, `35`, an empty answer, or another prompt's
+content), and none had anything to do with kernel numerics:
 
 - *Paged pool growth wiped live K/V.* `EnsureNemoPagedBuffers` reused the
   outer per-layer array when it grew the block pool, so the new buffer
@@ -666,6 +666,17 @@ prompt's content), and both had nothing to do with kernel numerics:
   `BatchExecutor.EnsureOwnership` now gives the outgoing owner its own copy.
   This one is model-independent and was also what broke
   `TS_NEMOTRON_BATCHED=0` at concurrency.
+- *Uncleared paged-attention sessions.* `TSGgml_PagedAttentionForward`
+  caches one graph per query count and power-of-two K/V bucket and uploads
+  only the leading `seq_len` rows; the rest of the bucket is masked. The
+  session assumed its backend buffer started zeroed, which cudaMalloc does
+  not promise, and the CUDA flash-attention kernels compute `q.k` for masked
+  keys before adding the `-inf` mask: a leftover key that overflows gives
+  `inf + -inf = NaN` for the whole row. The session buffer is now cleared
+  when it is built (shared by every model on the native paged kernel). This
+  was fixed as the likely cause of one 47B wave after a 32k prompt decoding
+  `<unk>` forever; a synthetic reproduction could not force the allocator to
+  hand the dirty memory back, so that link is unproven.
 
 A **native batched Mamba2 step kernel** —
 `TSGgml_NemotronMamba2BatchedStepF32`
