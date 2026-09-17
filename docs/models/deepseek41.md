@@ -191,7 +191,7 @@ dotnet build TensorSharp.Server.Host/TensorSharp.Server.Host.csproj -c Release \
 
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 MAX_CONTEXT=65536 \
   TS_CPU_MOE_THREADS=32 TS_DSV41_TP=0 TS_DSV4_UBATCH=256 \
-  TS_DSV41_ENGRAM_WARM=1 TS_DSV41_SPARSE_FA=1 \
+  TS_DSV41_ENGRAM_WARM=1 \
   TS_DSV41_COMPACT_RAW_GATHER=0 KV_CACHE_DTYPE=f16 \
   TS_SCHED_MAX_RUNNING_SEQS=4 TS_SCHED_MAX_BATCHED_TOKENS=4096 \
   TS_SCHED_PREFILL_CHUNK=256 TS_SCHED_SOLO_PREFILL_CHUNK=8192 \
@@ -202,8 +202,10 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 MAX_CONTEXT=65536 \
 
 The host build copies the native library beside the server DLL. This launch
 uses the conservative benchmark matrix's microbatch and scheduler settings;
-the optimized profiles in the validation report use different settings. Choose
-`TS_CPU_MOE_THREADS` for the available CPU quota and record it for each run.
+the optimized profiles in the validation report use different settings.
+Sparse prefill attention needs no flag: it is the default on this path, and
+`TS_DSV41_SPARSE_FA=0` turns it off. Choose `TS_CPU_MOE_THREADS` for the
+available CPU quota and record it for each run.
 Set it in the launch environment, including for GPU-only placements: native
 CPU graph work and host reduction can still affect latency. The current CLI
 also accepts `--cpu-moe-threads N`; use the same value if supplying both, since
@@ -231,9 +233,14 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 MAX_CONTEXT=65536 \
 The [measured launch record](../validation/deepseek41/full-checkpoint/layer8-context65536-ubatch1024-cpumoe0-cputhreads32-sparse1-compact1-chunk1024-6b3-final-launch.json)
 contains the original VM paths, binary hashes and environment. This profile
 passed 138/138 inference cases; its throughput and limits are recorded below.
-Sparse flash attention and compact gathering remain opt-in, with their
-documented floating-point differences. Startup and page warming are excluded
-from the inference measurements.
+Compact gathering remains opt-in, with its documented floating-point
+differences. That record's `TS_DSV41_SPARSE_FA=1` selected ggml's
+mask-compacted flash-attention kernel: its results were recorded with the initial
+V4.1 support (`3347b06b`), before TensorSharp's owned F32 attention existed,
+whose sparse prefill is now the default (see [Backends](#backends)). Its
+19.985/80.240 s long-prompt times are therefore not a measurement of the current
+attention path. Startup and page warming are excluded from the inference
+measurements.
 
 Without an explicit thread setting, a GPU-only V4.1 load uses the caller's
 `TS_DSV4_THREADS` value, defaulting to at most 32; CPU expert offload instead
@@ -490,13 +497,37 @@ CPU fallback. `TS_DSV4_PERF=2` reports input preparation and graph-compute times
 are diagnostic modes whose logging overhead affects throughput. See the
 [CLI execution investigation](../validation/deepseek41/cli-gpu-execution/README.md).
 
-`TS_DSV41_SPARSE_FA=1` opts into CUDA mask-compacted flash attention for
-single-token batches or at least 16,384 cached keys. It attends to at most
-128 raw-window keys plus 512 selected compressed keys. Shorter prefill
-uses dense flash attention because its shared KV tiles were faster on the
-tested A40. The measured complete-checkpoint profiles explicitly enable this
-option; its default remains disabled. This option reduces attention work; it does not eliminate
-cross-GPU copies of the shared compressed cache during prefill.
+On `ggml_cuda`, V4.1 attention runs TensorSharp's owned F32 kernels (ggml's CUDA
+flash attention narrows Q and the softmax weights to F16, and the cache
+quantization can amplify those lost bits). **Prefill is sparse by default** once
+a launch is wide and long: a chunk of more than 8 queries over at least 8,192
+keys (the raw window ring plus the visible compressed rows) attends only to each
+query's sliding window and indexer selection, at most 128 + 512 keys, through a
+mask-compacted kernel. Everything else keeps the dense kernels: single-token
+decode and every DSpark verify (6 rows) the split-key kernel, so a verify still
+commits exactly the cache rows decode would; shorter prefill the tiled one, so a
+prompt whose attention stays below 8,192 keys is unchanged bit for bit. A row
+with more visible keys than the bound falls back to a full scan, so the bound
+never drops a key.
+
+Measured on one A40 (`GgmlOpsCudaAttentionPrecisionTest --benchmark-dsv41-prefill
+512 33536 64 5`, which selects the kernel through the production gate and the
+variable): 512 queries over 33,536 keys with 64 heads took **34.1-34.3 ms** per
+launch sparse against **1,547-1,549 ms** tiled. Against a decomposed F32
+reference the sparse kernel's maximum absolute error was 1.1e-7 (relative L2
+7.4e-7) and the tiled kernel's 8.9e-8 (4.8e-7). A sparse query is also
+independent of the other queries in its launch -- query 0 alone, in 9 queries
+and in 512 is bit-identical -- so a prompt's result does not depend on how
+prefill chunked it. `TS_DSV41_SPARSE_FA=0` restores tiled prefill.
+
+This owned gate (more than 8 queries, at least 8,192 keys, F32 compacted kernel)
+is not the gate of ggml's flash-attention kernel, which the non-owned attention
+path uses (non-CUDA GPUs, the CPU backend). There `TS_DSV41_SPARSE_FA=1` still
+opts into ggml's mask-compacted flash attention for single-token batches or at
+least 16,384 keys, whose F16 operands measured up to 7.8e-4 relative L2 against
+the CPU oracle; that hint stays opt-in. Sparse attention reduces attention work;
+it does not eliminate cross-GPU copies of the shared compressed cache during
+prefill.
 
 `TS_DSV41_COMPACT_RAW_GATHER=1` opts into raw-window compaction for sparse
 single-token decode. It gathers the 128 visible raw rows on their owning GPU

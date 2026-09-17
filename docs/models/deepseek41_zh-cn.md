@@ -162,7 +162,7 @@ dotnet build TensorSharp.Server.Host/TensorSharp.Server.Host.csproj -c Release \
 
 CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 MAX_CONTEXT=65536 \
   TS_CPU_MOE_THREADS=32 TS_DSV41_TP=0 TS_DSV4_UBATCH=256 \
-  TS_DSV41_ENGRAM_WARM=1 TS_DSV41_SPARSE_FA=1 \
+  TS_DSV41_ENGRAM_WARM=1 \
   TS_DSV41_COMPACT_RAW_GATHER=0 KV_CACHE_DTYPE=f16 \
   TS_SCHED_MAX_RUNNING_SEQS=4 TS_SCHED_MAX_BATCHED_TOKENS=4096 \
   TS_SCHED_PREFILL_CHUNK=256 TS_SCHED_SOLO_PREFILL_CHUNK=8192 \
@@ -172,7 +172,8 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 MAX_CONTEXT=65536 \
 ```
 
 宿主构建会把原生库复制到服务端 DLL 旁边。上面这条启动命令使用的是保守基准矩阵的微批
-与调度器设置；验证报告里的优化配置用的是另一组参数。`TS_CPU_MOE_THREADS` 要按可用的
+与调度器设置；验证报告里的优化配置用的是另一组参数。稀疏 prefill attention 不需要任何
+开关：它在这条路径上默认开启，`TS_DSV41_SPARSE_FA=0` 可将其关闭。`TS_CPU_MOE_THREADS` 要按可用的
 CPU 配额来选，并为每次运行记录下来。即便是纯 GPU 放置也要在启动环境里设置它：原生的
 CPU 图工作与主机侧归约仍会影响延迟。当前 CLI 也接受 `--cpu-moe-threads N`；两者都给
 时请填相同的值，因为原生加载器优先采用为正的环境变量值。
@@ -197,7 +198,11 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 MAX_CONTEXT=65536 \
 
 [实测启动记录](../validation/deepseek41/full-checkpoint/layer8-context65536-ubatch1024-cpumoe0-cputhreads32-sparse1-compact1-chunk1024-6b3-final-launch.json)
 保留了原始 VM 路径、二进制哈希与环境。该配置通过了 138/138 项推理用例；其吞吐与限制
-记录在下文。稀疏 flash attention 与紧凑 gather 仍是可选项，并带有已记录的浮点差异。
+记录在下文。紧凑 gather 仍是可选项，并带有已记录的浮点差异。该记录中的
+`TS_DSV41_SPARSE_FA=1` 选择的是 ggml 的掩码压缩 flash-attention 内核：这些结果是在最初的
+V4.1 支持（`3347b06b`）上记录的，当时还没有 TensorSharp 自有的 F32 attention，而后者的
+稀疏 prefill 现在是默认行为（见[后端](#后端)）。因此其 19.985/80.240 s 的长提示词耗时并不
+是对当前 attention 路径的测量。
 启动与页预热不计入推理测量。
 
 在没有显式线程设置时，纯 GPU 的 V4.1 加载使用调用方的 `TS_DSV4_THREADS`，默认上限为
@@ -365,6 +370,28 @@ prefill、分块大小 1/3/5/8 与 reset——不过那是 fixture 规模的对�
 没有数值门禁。和 `ggml_cpu` 一样，这两条都是正确性与可移植性通道，而不是服务通道；
 细节见[在 ggml CPU 后端上运行](#在-ggml-cpu-后端上运行)的末尾。`--backend mlx` 仍然被
 拒绝。
+
+在 `ggml_cuda` 上，V4.1 的 attention 运行 TensorSharp 自有的 F32 内核（ggml 的 CUDA flash
+attention 会把 Q 与 softmax 权重收窄到 F16，而 cache 量化可能放大丢失的这些位）。**prefill
+默认是稀疏的**，前提是调用既宽又长：超过 8 个 query、至少 8,192 个 key（原始窗口环加上可见的
+压缩行）的分块，每个 query 只经由掩码压缩内核关注自己的滑动窗口与索引器选中的行，最多
+128 + 512 个 key。其余情况保持稠密内核：单 token decode 与每次 DSpark verify（6 行）使用
+分 key 内核，因此 verify 提交的 cache 行仍与 decode 完全一致；更短的 prefill 使用分块
+（tiled）内核，因此 attention 始终低于 8,192 个 key 的提示词逐位不变。可见 key 多于上限的行
+会退回全行扫描，所以这个上限不会丢掉任何 key。
+
+在单张 A40 上实测（`GgmlOpsCudaAttentionPrecisionTest --benchmark-dsv41-prefill 512 33536 64 5`，
+它通过生产环境的门控与该变量选择内核）：64 个头、512 个 query、33,536 个 key 时，稀疏每次
+**34.1–34.3 ms**，分块为 **1,547–1,549 ms**。与分解的 F32 参考相比，稀疏内核的最大绝对误差为
+1.1e-7（相对 L2 7.4e-7），分块内核为 8.9e-8（4.8e-7）。稀疏 query 也与同一调用中的其他 query
+无关——query 0 单独计算、在 9 个 query 中、在 512 个 query 中逐位相同——因此提示词的结果不取决于
+prefill 如何分块。`TS_DSV41_SPARSE_FA=0` 恢复分块 prefill。
+
+这个自有门控（超过 8 个 query、至少 8,192 个 key、F32 压缩内核）与 ggml flash-attention
+内核的门控不同，后者由非自有的 attention 路径使用（非 CUDA GPU、CPU 后端）。在那里
+`TS_DSV41_SPARSE_FA=1` 仍然只在单个 query 或至少 16,384 个 key 时启用 ggml 的掩码压缩 flash
+attention，其 F16 运算与 CPU oracle 的相对 L2 实测最高 7.8e-4；该提示保持显式开启。稀疏
+attention 减少的是 attention 计算量，并不消除 prefill 期间共享压缩 cache 在 GPU 之间的拷贝。
 
 ### 每张 GPU 一个后端
 

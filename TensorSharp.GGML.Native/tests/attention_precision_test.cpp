@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <iterator>
 #include <limits>
 #include <random>
 
@@ -370,9 +371,157 @@ static void check_query_invariance(ggml_backend_t allocator, ggml_backend_t back
         ggml_backend_name(backend), head, keys, heads, widest);
 }
 
+// DeepSeek V4.1 checkpoint geometry the sparse gate is sized for.
+constexpr int DSV41_N_SWA = 128, DSV41_INDEXER_TOP_K = 512;
+
+// The same contract for sparse (mask-compacted) launches, which DeepSeek V4.1
+// prefill takes by default above the decode-class width at >= 8,192 keys: a
+// query's output may not depend on the other queries in its launch, so a
+// prompt's result does not depend on how prefill chunked it. Query 0 inside a
+// 9-query and a 512-query launch must equal query 0 computed alone. 64 heads
+// and 8,960 keys (a 768-row raw ring plus 8,192 compressed rows) are the
+// production shape; each query sees its 128-key window plus up to 512
+// scattered selected keys, the capacity's worth.
+static void check_sparse_query_invariance(ggml_backend_t allocator, ggml_backend_t backend)
+{
+#ifdef TSG_GGML_USE_CUDA
+    const int head = 512;   // the checkpoint's head width and CUDA kernel instantiation
+#else
+    const int head = 8;     // the scalar CPU reference would take minutes at 512
+#endif
+    const int keys = 8960, heads = 64, capacity = DSV41_N_SWA + DSV41_INDEXER_TOP_K;
+    // The last entry is the same single query through the dense split-key
+    // kernel decode uses. It is reported, not required: it is why launches of
+    // at most TSG_PRECISION_DECODE_COLUMNS queries (a DSpark verify) never
+    // take the sparse kernel.
+    const int widths[] = {1, 9, 512, 1};
+    std::vector<float> alone, dense_alone;
+    std::vector<std::vector<float>> launches;
+    for (size_t width = 0; width < std::size(widths); ++width)
+    {
+        const int queries = widths[width];
+        const bool dense = width + 1 == std::size(widths);
+        auto * ctx = ggml_init({4 * 1024 * 1024, nullptr, true});
+        require(ctx != nullptr, "Cannot create sparse query invariance context");
+        input_tensor q(ctx, GGML_TYPE_F32, {head, queries, heads, 1});
+        input_tensor k(ctx, GGML_TYPE_F16, {head, keys, 1, 1});
+        input_tensor mask(ctx, GGML_TYPE_F16, {keys, queries, 1, 1});
+        input_tensor sink(ctx, GGML_TYPE_F32, {heads, 1, 1, 1});
+        auto * output = tsg_attention_f32_sparse(ctx, q.tensor, k.tensor, k.tensor, mask.tensor, sink.tensor,
+            1.0f / std::sqrt(float(head)), dense ? 0 : capacity);
+        require(output != nullptr && output->src[0] && (dense || output->src[0]->src[4]),
+            "Sparse query invariance graph lost its mask compaction");
+        auto * graph = ggml_new_graph(ctx);
+        ggml_build_forward_expand(graph, output);
+        auto * buffer = ggml_backend_alloc_ctx_tensors(ctx, allocator);
+        require(buffer != nullptr, "Sparse query invariance allocation failed");
+        std::mt19937 shared_random(60913);
+        std::uniform_real_distribution<float> uniform(-0.5f, 0.5f);
+        for (float & value : k.values) value = uniform(shared_random);
+        for (int h = 0; h < heads; ++h) sink.values[h] = float(h % 5) - 2.0f;
+        const float negative_infinity = -std::numeric_limits<float>::infinity();
+        std::fill(mask.values.begin(), mask.values.end(), negative_infinity);
+        // Query j carries the same data and the same visible keys in every launch.
+        for (int query = 0; query < queries; ++query)
+        {
+            std::mt19937 query_random(7000 + query);
+            for (int h = 0; h < heads; ++h) for (int x = 0; x < head; ++x)
+                q.values[q.logical(x, query, h, 0)] = uniform(query_random);
+            const int newest = keys - 1 - (query * 97) % 1024;
+            for (int key = std::max(0, newest - DSV41_N_SWA + 1); key <= newest; ++key)
+                mask.values[mask.logical(key, query, 0, 0)] = -0.125f * ((key + query) % 5);
+            for (int selected = 0; selected < DSV41_INDEXER_TOP_K; ++selected)
+            {
+                const int key = int(query_random() % uint32_t(newest - DSV41_N_SWA));
+                mask.values[mask.logical(key, query, 0, 0)] = -0.0625f * ((key + 3 * query) % 7);
+            }
+        }
+        q.upload(); k.upload(); mask.upload(); sink.upload();
+        require(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS, "Sparse query invariance compute failed");
+        if (!dense)
+        {
+            // Every row must stay within the capacity: a full-row fallback would
+            // pass the comparison without exercising the compacted kernel.
+            auto * compact = output->src[0]->src[4];
+            std::vector<int32_t> indices(ggml_nelements(compact));
+            ggml_backend_tensor_get(compact, indices.data(), 0, indices.size() * sizeof(int32_t));
+            for (int query = 0; query < queries; ++query)
+            {
+                const int32_t count = indices[size_t(query) * (capacity + 1)];
+                require(count > DSV41_N_SWA && count <= capacity, "Sparse invariance rows must use the compacted kernel");
+            }
+        }
+        std::vector<float> result(ggml_nelements(output));
+        ggml_backend_tensor_get(output, result.data(), 0, result.size() * sizeof(float));
+        for (float value : result) require(std::isfinite(value), "Sparse query invariance produced a non-finite value");
+        if (dense) dense_alone = std::move(result);
+        else if (queries == 1) alone = std::move(result);
+        else launches.push_back(std::move(result));
+        ggml_backend_buffer_free(buffer);
+        ggml_free(ctx);
+    }
+    // Output is [Dv, H, N, B].
+    const size_t per_query = size_t(head) * heads;
+    auto differing = [&](const std::vector<float> & a, const std::vector<float> & b, size_t queries) {
+        size_t count = 0;
+        for (size_t i = 0; i < per_query * queries; ++i) count += std::memcmp(&a[i], &b[i], sizeof(float)) != 0;
+        return count;
+    };
+    for (size_t launch = 0; launch < launches.size(); ++launch)
+    {
+        const size_t wrong = differing(launches[launch], alone, 1);
+        if (wrong)
+            std::fprintf(stderr, "%s sparse query 0 of a %d-query launch differs from query 0 alone in %zu of %zu outputs\n",
+                ggml_backend_name(backend), widths[launch + 1], wrong, per_query);
+        require(wrong == 0, "A sparse query must not depend on the other queries in its launch");
+    }
+    const size_t shared = differing(launches[0], launches[1], size_t(widths[1]));
+    if (shared)
+        std::fprintf(stderr, "%s sparse queries 0..%d differ between the 9- and 512-query launches in %zu outputs\n",
+            ggml_backend_name(backend), widths[1] - 1, shared);
+    require(shared == 0, "Sparse queries shared by two launch widths must be bit-identical");
+    const size_t versus_dense = differing(alone, dense_alone, 1);
+    double dense_max_abs = 0;
+    for (size_t i = 0; i < per_query; ++i)
+        dense_max_abs = std::max(dense_max_abs, std::abs(double(alone[i]) - dense_alone[i]));
+    std::printf("%s SPARSE_QUERY_INVARIANCE head=%d keys=%d heads=%d capacity=%d widths=1,9,512 bit_identical "
+        "sparse_vs_dense_decode_kernel differing=%zu/%zu max_abs=%.3g\n",
+        ggml_backend_name(backend), head, keys, heads, capacity, versus_dense, per_query, dense_max_abs);
+}
+
+// The DeepSeek V4.1 prefill gate: dense below the decode-class width or below
+// 8,192 keys, the window + top-k capacity otherwise, and TS_DSV41_SPARSE_FA=0
+// restoring the dense (tiled) kernels.
+static void check_sparse_gate()
+{
+    const int capacity = DSV41_N_SWA + DSV41_INDEXER_TOP_K;
+    auto gate = [](int64_t queries, int64_t keys, const char * env) {
+        return tsg_dsv41_owned_sparse_capacity(queries, keys, DSV41_N_SWA, DSV41_INDEXER_TOP_K, env);
+    };
+    require(TSG_DSV41_SPARSE_MIN_KEYS == 8192, "The DeepSeek V4.1 sparse key threshold moved");
+    for (int64_t queries = 1; queries <= TSG_PRECISION_DECODE_COLUMNS; ++queries)
+        for (int64_t keys : {int64_t(1), int64_t(640), int64_t(8191), int64_t(8192), int64_t(33536), int64_t(1) << 30})
+            for (const char * env : {static_cast<const char *>(nullptr), "1", "0"})
+                require(gate(queries, keys, env) == 0, "Decode-class launches (1-8 queries) must stay dense");
+    for (int64_t queries : {int64_t(9), int64_t(10), int64_t(512), int64_t(1024), int64_t(4096)})
+    {
+        require(gate(queries, 8192, nullptr) == capacity, "Unset TS_DSV41_SPARSE_FA must select sparse prefill");
+        require(gate(queries, 65536, nullptr) == capacity, "Sparse prefill must hold at long contexts");
+        require(gate(queries, 8192, "1") == capacity, "TS_DSV41_SPARSE_FA=1 must keep sparse prefill");
+        require(gate(queries, 8191, nullptr) == 0, "Below 8,192 keys prefill must stay dense");
+        require(gate(queries, 8192, "0") == 0, "TS_DSV41_SPARSE_FA=0 must restore tiled prefill");
+        require(gate(queries, 65536, "0") == 0, "TS_DSV41_SPARSE_FA=0 must restore tiled prefill at any context");
+    }
+    require(tsg_dsv41_owned_sparse_capacity(9, 8192, 0, 0, nullptr) == 0, "A model without a sparse bound must stay dense");
+    std::printf("SPARSE_GATE queries<=%lld dense; queries>%lld keys>=%lld capacity=%d; keys=8191 dense; env=0 dense\n",
+        (long long) TSG_PRECISION_DECODE_COLUMNS, (long long) TSG_PRECISION_DECODE_COLUMNS,
+        (long long) TSG_DSV41_SPARSE_MIN_KEYS, capacity);
+}
+
 static void run(ggml_backend_t allocator, ggml_backend_t backend)
 {
     check_query_invariance(allocator, backend);
+    check_sparse_query_invariance(allocator, backend);
     for (ggml_type type : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16})
         check_compaction_guards(allocator, backend, type);
     for (int keys : {15, 16, 17, 255, 256, 257})
@@ -444,15 +593,33 @@ static void run(ggml_backend_t allocator, ggml_backend_t backend)
 #ifdef TSG_GGML_USE_CUDA
 // Run separately from CTest: realistic prefill sizes use a decomposed F32 GPU
 // reference, and never allocate both large graphs on the device at once.
+//
+// dsv41_prefill: time only the kernel DeepSeek V4.1 prefill selects for this
+// shape, through the production gate and the TS_DSV41_SPARSE_FA it reads, so
+// the default and its escape hatch are A/B'd by the environment alone. The
+// mask always exposes the checkpoint's 128 + 512 keys per query, so both arms
+// attend to identical inputs.
 static void benchmark(ggml_backend_t allocator, ggml_backend_t backend,
-                      int queries, int keys, int heads, int repeats, int sparse_capacity = 0)
+                      int queries, int keys, int heads, int repeats, int sparse_capacity = 0,
+                      bool dsv41_prefill = false)
 {
     constexpr int width = 512;
     require(queries > 0 && keys > 0 && heads > 0 && repeats > 0, "Invalid attention benchmark dimensions");
+    int gate_capacity = 0;
+    if (dsv41_prefill)
+    {
+        const char * env = std::getenv("TS_DSV41_SPARSE_FA");
+        gate_capacity = tsg_dsv41_owned_sparse_capacity(queries, keys, DSV41_N_SWA, DSV41_INDEXER_TOP_K, env);
+        sparse_capacity = DSV41_N_SWA + DSV41_INDEXER_TOP_K;
+        std::printf("DSV41_PREFILL_GATE queries=%d keys=%d TS_DSV41_SPARSE_FA=%s capacity=%d kernel=%s\n",
+            queries, keys, env ? env : "(unset)", gate_capacity, gate_capacity > 0 ? "owned-sparse-f32" : "owned-f32");
+    }
     std::vector<float> reference;
     double baseline_us = 0;
     for (int mode = 0; mode < (sparse_capacity > 0 ? 3 : 2); ++mode)
     {
+        // The production arm runs only the gate's kernel after the reference.
+        if (dsv41_prefill && mode != 0 && mode != (gate_capacity > 0 ? 2 : 1)) continue;
         const bool owned = mode != 0;
         auto * ctx = ggml_init({4 * 1024 * 1024, nullptr, true});
         require(ctx != nullptr, "Cannot create attention benchmark context");
@@ -572,8 +739,10 @@ int main(int argc, char ** argv)
                 (sparse_scheduler && std::strcmp(argv[1], "--scheduler-shape-stress-sparse") == 0),
             sparse_scheduler ? std::atoi(argv[6]) : 0);
     const bool sparse_bench = argc == 7 && std::strcmp(argv[1], "--benchmark-sparse") == 0;
-    const bool bench = sparse_bench || (argc == 6 && std::strcmp(argv[1], "--benchmark") == 0);
-    require(argc == 1 || bench, "Usage: attention_precision_test [--benchmark|--scheduler-stress queries keys heads repeats] or --benchmark-sparse queries keys heads repeats capacity");
+    const bool dsv41_bench = argc == 6 && std::strcmp(argv[1], "--benchmark-dsv41-prefill") == 0;
+    const bool bench = sparse_bench || dsv41_bench || (argc == 6 && std::strcmp(argv[1], "--benchmark") == 0);
+    require(argc == 1 || bench, "Usage: attention_precision_test [--benchmark|--benchmark-dsv41-prefill|--scheduler-stress queries keys heads repeats] or --benchmark-sparse queries keys heads repeats capacity");
+    check_sparse_gate();
     for (int device = 0; device < devices; ++device)
     {
         auto * cuda = ggml_backend_cuda_init(device);
@@ -581,7 +750,7 @@ int main(int argc, char ** argv)
         auto * backend = tsg_dsv4_fused_backend_init(cuda);
         require(backend != nullptr, "Cannot initialize TensorSharp attention backend");
         if (bench) benchmark(cuda, backend, std::atoi(argv[2]), std::atoi(argv[3]), std::atoi(argv[4]), std::atoi(argv[5]),
-            sparse_bench ? std::atoi(argv[6]) : 0);
+            sparse_bench ? std::atoi(argv[6]) : 0, dsv41_bench);
         else run(cuda, backend);
         ggml_backend_free(backend);
         ggml_backend_free(cuda);
@@ -589,6 +758,7 @@ int main(int argc, char ** argv)
     }
 #else
     require(argc == 1, "Large attention benchmark mode requires CUDA");
+    check_sparse_gate();
     auto * backend = ggml_backend_cpu_init();
     require(backend != nullptr, "Cannot initialize CPU attention backend");
     ggml_backend_cpu_set_n_threads(backend, 4);

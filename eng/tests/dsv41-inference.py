@@ -32,7 +32,22 @@ def main():
                              "Keep it TIGHT even where --atol is loose - a backend's distance from the "
                              "PyTorch oracle is not a licence for a rewind to change the answer")
     parser.add_argument("--report", type=Path, help="Write a distinct report when comparing native precision modes")
+    parser.add_argument("--dump-logits", type=Path,
+                        help="Save every native forward's logits, in call order, to this .npz so two native "
+                             "libraries can be compared byte for byte on the same fixture and settings")
+    parser.add_argument("--long-sparse-tokens", type=int, default=0,
+                        help="Also prefill a synthetic prompt of this many tokens, long enough that the owned F32 "
+                             "attention sees >= 8,192 keys, once with the default sparse prefill and once with "
+                             "TS_DSV41_SPARSE_FA=0 (tiled), and compare the logits and a greedy continuation. "
+                             "GPU backends only: the CPU backend has no owned sparse kernel. 0 skips the case")
+    parser.add_argument("--long-sparse-context", type=int, default=16384)
+    parser.add_argument("--long-sparse-steps", type=int, default=32)
+    parser.add_argument("--long-sparse-atol", type=float, default=2e-5)
     args = parser.parse_args()
+    if args.long_sparse_tokens and args.backend.upper() == "CPU":
+        raise ValueError("--long-sparse-tokens needs a GPU backend: only the owned CUDA attention has the sparse gate")
+    if args.long_sparse_tokens and args.long_sparse_tokens + args.long_sparse_steps > args.long_sparse_context:
+        raise ValueError("--long-sparse-tokens plus --long-sparse-steps must fit --long-sparse-context")
     config = json.loads((args.fixture_dir / "deepseek41.config.json").read_text())
     if not config.get("fixture"):
         raise ValueError("This test is for the small deterministic fixture, not downloaded model weights")
@@ -71,12 +86,15 @@ def main():
     if not handle:
         raise RuntimeError("Native fixture model load failed")
     checks = []
+    dumped = []
     def forward(ids):
         ids = np.ascontiguousarray(ids, dtype=np.int32)
         output = np.empty(config["config"]["text_config"]["vocab_size"], dtype=np.float32)
         result = api["Forward"](handle, ids.ctypes.data, len(ids), output.ctypes.data)
         if result:
             raise RuntimeError(f"Native forward returned {result}")
+        if args.dump_logits:
+            dumped.append(output.copy())
         return output
     def compare(name, output, target, atol=None, rtol=None):
         atol = args.atol if atol is None else atol
@@ -251,14 +269,107 @@ def main():
         api["Free"](handle)
     environment = {name: os.environ.get(name) for name in ("TS_DSV4_FA", "TS_DSV4_GATHER", "TS_DSV41_TP", "TS_DSV41_SPARSE_FA",
                   "TS_DSV41_ENGRAM_THREADS", "TS_DSV41_ENGRAM_WARM", "NVIDIA_TF32_OVERRIDE")}
+    long_sparse = long_sparse_case(args, config, api, checks, dumped) if args.long_sparse_tokens else None
+    if args.dump_logits:
+        np.savez(args.dump_logits, logits=np.stack(dumped))
     result = dict(backend=args.backend, gpus=args.gpus, cpu_moe=args.cpu_moe, atol=args.atol, rtol=args.rtol,
                   environment=environment, checks=checks)
+    if long_sparse:
+        result["long_sparse"] = long_sparse
     path = args.report or args.fixture_dir / f"validation-{args.backend.lower()}-{args.gpus}.json"
     path.write_text(json.dumps(result, indent=2) + "\n")
     passed = sum(check["passed"] for check in checks)
     print(f"Passed {passed}/{len(checks)} native/reference checks; {path}")
     if passed != len(checks):
         raise SystemExit(1)
+
+
+def long_sparse_case(args, config, api, checks, dumped):
+    """Default sparse prefill against its TS_DSV41_SPARSE_FA=0 escape hatch at >= 8,192 keys.
+
+    The owned CUDA attention compacts each prefill query's mask to its sliding window plus
+    the indexer's selection once a launch has more than 8 queries and at least 8,192 keys;
+    below that, and with =0, it runs the tiled dense kernel. Both are F32 and must agree to
+    the fixture tolerance, and a greedy continuation (decode stays dense in both) must pick
+    the same tokens. Each arm is a fresh load, so no graph built under one setting is reused
+    by the other; the native loader reads the variable when it builds a graph.
+    """
+    text = config["config"]["text_config"]
+    vocabulary, window = text["vocab_size"], text["sliding_window"]
+    context, count, steps = args.long_sparse_context, args.long_sparse_tokens, args.long_sparse_steps
+    ubatch = 32
+    ring = (window + ubatch + 255) // 256 * 256
+    ratios = sorted({r for r in text["compress_ratios"] if r > 0})
+    # build_comp_plan: a power-of-two bucket (min 256) of the call's final row count, capped
+    # at 8,192 positions of hint; K is the raw ring plus that bucket.
+    def keys_at(ratio):
+        needed = max(min(count, 8192) // ratio, (count + 1) // ratio, 1)
+        bucket = 256
+        while bucket < needed:
+            bucket <<= 1
+        return ring + min(bucket, (context // ratio + 1 + 255) // 256 * 256)
+    widest = max(keys_at(r) for r in ratios)
+    if widest < 8192:
+        raise ValueError(f"--long-sparse-tokens {count} reaches only {widest} attention keys; the sparse gate needs 8,192")
+    prompt = np.array([(7 * i * i + 13 * i + 5) % vocabulary for i in range(count)], dtype=np.int32)
+
+    def run(setting):
+        saved = os.environ.get("TS_DSV41_SPARSE_FA")
+        if setting is None:
+            os.environ.pop("TS_DSV41_SPARSE_FA", None)
+        else:
+            os.environ["TS_DSV41_SPARSE_FA"] = setting
+        try:
+            handle = api["LoadModel"](str(args.fixture_dir / "deepseek41-fixture.gguf").encode(),
+                                      args.gpus, context, ubatch, 2, args.cpu_moe, args.backend.encode())
+            if not handle:
+                raise RuntimeError("Native fixture model load failed for the long sparse case")
+            try:
+                def step(ids):
+                    ids = np.ascontiguousarray(ids, dtype=np.int32)
+                    output = np.empty(vocabulary, dtype=np.float32)
+                    result = api["Forward"](handle, ids.ctypes.data, len(ids), output.ctypes.data)
+                    if result:
+                        raise RuntimeError(f"Native forward returned {result}")
+                    return output
+                rows, tokens = [step(prompt)], []
+                for _ in range(steps):
+                    tokens.append(int(rows[-1].argmax()))
+                    rows.append(step(np.array([tokens[-1]], dtype=np.int32)))
+                assert api["NPast"](handle) == count + steps
+                return rows, tokens
+            finally:
+                api["Free"](handle)
+        finally:
+            if saved is None:
+                os.environ.pop("TS_DSV41_SPARSE_FA", None)
+            else:
+                os.environ["TS_DSV41_SPARSE_FA"] = saved
+
+    sparse_rows, sparse_tokens = run(None)
+    tiled_rows, tiled_tokens = run("0")
+    if args.dump_logits:
+        dumped.extend(sparse_rows + tiled_rows)
+    worst = 0.0
+    for index, (sparse, tiled) in enumerate(zip(sparse_rows, tiled_rows)):
+        name = "long_sparse_prefill_logits" if index == 0 else f"long_sparse_decode_{index}_logits"
+        error = float(np.max(np.abs(sparse - tiled)))
+        worst = max(worst, error)
+        checks.append(dict(name=name, max_absolute_error=error,
+                           relative_l2=float(np.linalg.norm(sparse - tiled) / max(np.linalg.norm(tiled), 1e-30)),
+                           argmax=int(sparse.argmax()), reference_argmax=int(tiled.argmax()),
+                           passed=bool(np.allclose(sparse, tiled, atol=args.long_sparse_atol, rtol=0))))
+    checks.append(dict(name=f"long_sparse_greedy_{steps}_tokens", max_absolute_error=0.0, relative_l2=0.0,
+                       argmax=sparse_tokens[-1], reference_argmax=tiled_tokens[-1],
+                       passed=sparse_tokens == tiled_tokens))
+    identical = all(np.array_equal(a, b) for a, b in zip(sparse_rows, tiled_rows))
+    print(f"long sparse case: {count} tokens, context {context}, widest attention {widest} keys; "
+          f"max |default - TS_DSV41_SPARSE_FA=0| = {worst:.3g} over {len(sparse_rows)} logit rows; "
+          f"greedy {'identical' if sparse_tokens == tiled_tokens else 'DIFFERENT'}; "
+          f"bit-identical logits: {identical}")
+    return dict(tokens=count, context=context, ubatch=ubatch, steps=steps, widest_keys=widest,
+                atol=args.long_sparse_atol, max_absolute_error=worst, bit_identical=identical,
+                default_tokens=sparse_tokens, tiled_tokens=tiled_tokens)
 
 
 if __name__ == "__main__":

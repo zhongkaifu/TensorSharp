@@ -227,8 +227,16 @@ static ggml_tensor * attention_impl(ggml_context * ctx, ggml_tensor * q, ggml_te
     // Decode-class query counts always partition the keys the same way: the
     // partition decides the online-softmax merge order, so it may depend on
     // the key extent but never on how many queries or heads share the launch.
+    //
+    // A sparse launch attends to at most `capacity` compacted keys per row, so
+    // it keeps ONE partition per row at every width. Its per-row arithmetic is
+    // then independent of the launch width as well -- a sparse query computed
+    // alone equals the same query inside a 9- or 512-query launch bit for bit
+    // -- and a prompt's result does not depend on how prefill chunked it.
+    // DeepSeek V4.1 launches (64 heads, more than 8 queries) already had one
+    // partition per row, so its outputs are unchanged by this bound.
     const int64_t query_rows = q->ne[1] * q->ne[2] * q->ne[3];
-    const int max_splits = q->ne[1] <= TSG_PRECISION_DECODE_COLUMNS ? 16 : query_rows >= 512 ? 1 : 4;
+    const int max_splits = capacity > 0 ? 1 : q->ne[1] <= TSG_PRECISION_DECODE_COLUMNS ? 16 : query_rows >= 512 ? 1 : 4;
     const int64_t extent = capacity > 0 ? std::min<int64_t>(capacity, k->ne[1]) : k->ne[1];
     const int64_t chunk = std::max<int64_t>(128, ((extent + max_splits - 1) / max_splits + 15) / 16 * 16);
     const int64_t splits = (extent + chunk - 1) / chunk;

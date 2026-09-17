@@ -228,7 +228,7 @@ V4.1 的服务路径是一套原生 `ggml_cuda` 计算图，另有 `ggml_cpu` �
 | `TS_DSV4_LOAD_CONTIGUOUS` | V4 与 V4.1 | `0` 让权重加载器退回到从共享游标分发分块任务，每个读取线程会以 `线程数 x 分块` 的步幅跨越文件，而不是读一段连续区间。保留它只是为了能对连续读取的默认行为做 A/B：在 MooseFS 挂载上实测慢 2.5 倍（八卡 A40 加载 Q4_K_M 发行版 363–382 s，对比 144–155 s） | 开 | 否 |
 | `TS_DSV4_LOAD_DROP_CACHE` | V4 与 V4.1 | `1` 在每个权重分块上传到设备后释放它的页缓存。不改变加载时间；加载结束时页缓存约 39 GiB 而不是约 330 GiB，为驻留主机的专家留出空间。默认关闭，因为该调用在 FUSE 上耗时明显 | 关 | 否 |
 | `TS_DSV41_REWIND_CHECKPOINT` | V4.1，原生执行器 | `0` 去掉逐槽位的回退检查点（在每个 prompt 边界对原始滑动窗口环与压缩器状态环做的影子拷贝）。没有它，部分 KV 复用最多只能回退到活动环还覆盖的位置——发布的 checkpoint 上是 385 个位置——多轮思考对话因此会重新 prefill。每个序列槽位约占 21 MiB 显存 | 开 | 否 |
-| `TS_DSV41_SPARSE_FA` | V4.1 | `1` 选择稀疏 flash attention。需显式开启，与稠密路径存在已记录的浮点差异 | 关 | 否 |
+| `TS_DSV41_SPARSE_FA` | V4.1 | 稀疏 prefill attention。在自有 F32 CUDA 路径上**默认开启**，作用于超过 8 个 query、至少 8,192 个 key 的调用：每个 query 只关注它的滑动窗口加索引器选中的行（最多 640 个 key），而不是全部 key。A40 上 512 个 query × 33,536 个 key 实测 34 ms，分块（tiled）为 1,548 ms，二者与 F32 参考的偏差都在 1.5e-7 以内；decode、DSpark verify 与更短的提示词保持稠密内核、逐位不变。`0` 恢复分块 prefill。`1` 另外让 ggml flash attention 路径（非 CUDA GPU、CPU 后端）在单个 query 或至少 16,384 个 key 时使用其掩码压缩内核，该内核有已记录的 F16 差异 | 自有 CUDA 路径默认开；ggml flash attention 默认关 | 否 |
 | `TS_DSV41_COMPACT_RAW_GATHER` | V4.1 | `1` 为原始滑动窗口选择紧凑 gather。同样需显式开启，同样有浮点差异 | 关 | 否 |
 | `TS_DSV41_ALLOW_NON_CUDA_GPU` | V4.1 | `1` 允许 `ggml_vulkan` / `ggml_metal`：普通计算图跑在 GPU 上，只有架构专属算子回退到 CPU 后端，每次都要一次主机往返。之所以需要显式开启，是因为它解除的那道拒绝原本挡住的是*静默*回退 | 关 | 否 |
 | `TS_DSV41_VISION_FA` / `TS_DSV41_VISION_BF16_GEMM` | V4.1 视觉伴随文件 | `TS_DSV41_VISION_FA=1` 让图像编码器使用 F16 中间量的 flash attention（真实图像上的特征差异更大）；`TS_DSV41_VISION_BF16_GEMM=0` 选择诊断用的 F32 提升矩阵路径 | 稠密 F32 注意力，BF16 GEMM + F32 累加 | 否 |

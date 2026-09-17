@@ -3331,12 +3331,14 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
         fprintf(stderr, "[dsv4] flash attention: %s\n", m->flash_attn ? "on" : "off");
         if (hp.v41 && m->n_gpu > 0 && m->ts_backends[0])
         {
-            const char * sparse = getenv("TS_DSV41_SPARSE_FA");
-            const bool sparse_prefill = sparse && atoi(sparse) != 0;
+            // Probe the same gate attn_mha uses, at the widest shape it takes.
+            const bool sparse_prefill = tsg_dsv41_owned_sparse_capacity(TSG_PRECISION_DECODE_COLUMNS + 1,
+                TSG_DSV41_SPARSE_MIN_KEYS, hp.n_swa, hp.indexer_top_k, getenv("TS_DSV41_SPARSE_FA")) > 0;
             fprintf(stderr, "[dsv4] V4.1 CUDA precision: TensorSharp F32 matmul; attention=%s\n",
                 m->flash_attn ? (sparse_prefill
-                    ? "TensorSharp F32 (streaming decode; sparse prefill for queries>4, keys>=8192; tiled otherwise)"
-                    : "TensorSharp F32 (streaming decode, tiled prefill)") :
+                    ? "TensorSharp F32 (streaming decode and verify; sparse prefill for queries>8, keys>=8192, "
+                      "window+top-k; tiled otherwise; TS_DSV41_SPARSE_FA=0 selects tiled)"
+                    : "TensorSharp F32 (streaming decode, tiled prefill; TS_DSV41_SPARSE_FA=0)") :
                     "TensorSharp F32 decomposed (FA=0 or unavailable)");
         }
     }
@@ -4223,9 +4225,13 @@ struct graph_builder
                 // ggml's CUDA FA narrows Q and softmax weights to F16 even
                 // with F32 accumulation. V4.1 quantization/routing can amplify
                 // those lost bits, so keep the complete attention path F32.
-                const char * sparse = getenv("TS_DSV41_SPARSE_FA");
-                const int capacity = sparse && atoi(sparse) != 0 && q->ne[2] > 4 && n_kv >= 8192
-                    ? hp.n_swa + hp.indexer_top_k : 0;
+                // Prefill chunks of more than the decode-class width over at
+                // least 8,192 keys attend to their compacted window + top-k
+                // rows (on by default; TS_DSV41_SPARSE_FA=0 restores tiled
+                // prefill). Verify and decode keep the split-key kernel. The
+                // gate and its measurements live in ggml_ops_precision_policy.h.
+                const int capacity = tsg_dsv41_owned_sparse_capacity(q->ne[2], n_kv, hp.n_swa, hp.indexer_top_k,
+                    getenv("TS_DSV41_SPARSE_FA"));
                 cur = tsg_attention_f32_on_backend(ctx, res.sched, m.dev_backends[attention_device],
                     qp, kp, kp, kq_mask, sinks, kq_scale, capacity);
             }
@@ -4237,7 +4243,10 @@ struct graph_builder
                 // V4.1 exposes at most the sliding window plus the selected
                 // compressed rows per query. CUDA can compact this existing mask
                 // and attend to its finite entries without duplicating K/V for
-                // every prefill token. Keep an explicit A/B switch until qualified.
+                // every prefill token. Unlike the owned F32 branch above, this
+                // hint stays opt-in (=1): ggml's kernel narrows its operands to
+                // F16 (rel_l2 ~1e-3 against the F32 reference), and its gate is
+                // one query or >= 16,384 keys rather than > 8 queries at >= 8,192.
                 const char * sparse_fa = hp.v41 ? getenv("TS_DSV41_SPARSE_FA") : nullptr;
                 // Dense tiles reuse K/V across prefill queries more efficiently
                 // at short contexts. Preserve that path below the measured
