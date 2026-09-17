@@ -603,6 +603,33 @@ GGML 后端上 `qwen35moe` / `qwen3next` 的 decode 中，每层 MoE expert 计�
   步、之后主缓存上又有一次单独 decode 的情形。arena 批处理 decode 对 scratch 为空的 holder 同样处理。
   `Qwen35ConvScratchTests`（需要模型）覆盖这一点。
 
+### 保留的 holder：一个块的下限
+
+已完成请求的按请求 holder 只有在至少覆盖一个调度块（默认 256 token）时，才会为其对话的下一轮保留
+（`BatchExecutor.TryRetainReleasedFusedCache`，以及对在主缓存上结束的对话使用的
+`DonateFinishedLiveCacheToRetained`）。因此更短的对话——例如短的图片对话，448x336 的图片只有 140 个
+token——每当与其他请求并行运行时，每一轮都要重新 prefill 整个提示并重新编码图片。单独运行的对话不受影响：
+它从 live cache 续接，而 live cache 没有这个下限。
+
+这个下限并不是 holder 本身的需要。holder 按 token 逐个匹配（`FindRetainedFusedMatch`），采用时预留
+ceil(lcp / BlockSize) 个占位块（`TryAdoptFusedContinuation`），这条路径上没有任何东西依赖块边界。它之所以
+保留，是因为降低下限在 Metal 上没有通过验证（2026-09-17，Qwen3.5-9B-Q8_0 + mmproj BF16）：
+
+- **尝试的做法。** 当更短的 holder 不会挤出任何已保留的 holder，且其字节数落在模型的空闲 holder 预算内
+  （测得的缓存余量的一半减去已停放的 holder，即 `CanPoolIdleCache` 对释放的 holder 使用的规则）时保留它，
+  两条保留路径都如此。
+- **引擎。** 一段图片对话与一段文本对话并行，前几轮都短于一个块（448x336 图片；一行的系统提示），之后每一轮
+  都复用了上一轮，但图片第 2 轮——在保留的 41 token holder 之上 prefill 图片——在第 20 步与冷启动运行分叉，
+  该步冷启动的 top-2 差距为 0.255，高于 Metal 的 0.1 容差。只重放这一对请求（第 1 轮与一个更长的文本请求
+  并行，第 2 轮单独运行）时，10 次中有 4 次以同样方式分叉，其中 3 次是新加载模型上的第一段对话；关闭 arena
+  批处理 decode（`TS_BATCHED_FUSED_DECODE=0`）时 3 次中 0 次；在未改动的代码上第 1 轮长于一个块时 6 次中 0 次。
+- **模型层面。** 直接在模型上驱动同样的序列（第 1 轮在主缓存上 prefill 后被采用，其回复在 arena 中与一个更长
+  的 holder 一起 decode，holder 被保留并重新绑定，prefill 图片，decode 24 步），与全程单独运行相比保持在 0.023
+  以内，arena decode 一步与单独 decode 相差不超过 0.0008。误差来自引擎调度这条路径的某个环节，目前尚未查明。
+- 同样的运行两次触发了上文的 conv scratch 空指针 `NullReferenceException`。该问题已修复，修复后分叉依然存在。
+
+在查明这一分叉之前，一个块的下限保持不变，Gemma 4 也一样（同一条执行器规则；更短的 Gemma 4 holder 未经验证）。
+
 ### mmap 量化权重
 
 后端支持时（direct CUDA、GGML CUDA、Apple Silicon Metal、GGML CPU、集成显卡），加载器避免把量化 tensor 拷贝到新分配的 native 堆缓冲，而是通过 `MemoryMappedFile` + `QuantizedWeight.CreateExternalView` 直接绑定 GGUF 文件。结合 GGML 的 host-pointer buffer mapping，让 Metal command buffer 直接读 OS page cache 中的权重。`Qwen3.5-35B-A3B-IQ2_XXS`（~10 GB GGUF）在 M 系 Mac 上的常驻内存从 ~17 GB 降到 ~7 GB，且没有任何 per-token 拷贝。

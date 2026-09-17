@@ -3379,6 +3379,10 @@ namespace TensorSharp.Runtime.Scheduling
             // Retain any non-trivial fused conversation: the fused path contributes
             // nothing to the shared pool, so retention is the only cross-request reuse
             // source for it (not just the >window case). The LRU budget bounds VRAM.
+            // The one-block minimum is not a holder requirement (matching is per token);
+            // lowering it failed exactness validation on Metal, see docs/models/qwen35.md
+            // "Retained holders: the one-block minimum". Keep it and the one in
+            // DonateFinishedLiveCacheToRetained in step.
             if (len < _blockSize) return false;
 
             // Request ids are unique only while in flight. If a caller reuses one

@@ -711,6 +711,20 @@ scheduling-dependent, so parity has to be judged in-process.
   Direct CUDA uploads quantized blobs to device memory once and frees the host
   copy.
 
+### Retained holders: the one-block minimum
+
+A finished concurrent request's per-request holder is kept for its conversation's next
+turn only when it holds at least one scheduler block (256 tokens by default), by the same
+executor rule Qwen 3.5 uses (`BatchExecutor.TryRetainReleasedFusedCache` and
+`DonateFinishedLiveCacheToRetained`). A shorter conversation re-prefills its whole prompt on
+every turn that runs beside another request; one that runs alone continues from the live
+cache, which has no minimum. Holders do not need the block granularity (they are matched
+token by token and adoption reserves ceil(lcp / BlockSize) placeholder blocks), but lowering
+the minimum failed its exactness validation on Qwen 3.5 on Metal, with a cause not yet
+identified; see [Qwen 3.5, Retained holders: the one-block
+minimum](qwen35.md#retained-holders-the-one-block-minimum). Shorter Gemma 4 holders were not
+validated, so the minimum stays here as well.
+
 ## 11. Batched / paged forward (continuous batching)
 
 Gemma 4 has a full `IBatchedPagedModel.ForwardBatch` port

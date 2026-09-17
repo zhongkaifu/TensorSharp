@@ -831,6 +831,43 @@ Allocated once in `InitGDNBuffers()`:
   decode on the primary cache. The arena batched decode treats a holder without a
   scratch the same way. `Qwen35ConvScratchTests` (model-gated) covers it.
 
+### Retained holders: the one-block minimum
+
+A finished request's per-request holder is kept for its conversation's next turn
+(`BatchExecutor.TryRetainReleasedFusedCache`, and `DonateFinishedLiveCacheToRetained` for a
+conversation that finished on the primary cache) only when it holds at least one scheduler
+block (256 tokens by default). A shorter conversation - a short image conversation, since a
+448x336 picture is 140 tokens - therefore re-prefills its whole prompt, re-encoding the
+picture, on every turn that runs beside another request. A conversation that runs alone is
+not affected: it continues from the live cache, which has no minimum.
+
+The minimum is not something holders need. A holder is matched token by token
+(`FindRetainedFusedMatch`) and adopting one reserves ceil(lcp / BlockSize) placeholder blocks
+(`TryAdoptFusedContinuation`), so nothing on that path depends on a block boundary. It stays
+because lowering it failed validation on Metal (2026-09-17, Qwen3.5-9B-Q8_0 + mmproj BF16):
+
+- **What was tried.** Retain a shorter holder when it evicts no retained holder and its bytes
+  fit the model's idle-holder budget (half the measured cache headroom less the parked
+  holders, the rule `CanPoolIdleCache` applies to a released holder), in both retention paths.
+- **Engine.** An image conversation and a text conversation side by side, their first turns
+  under one block (the 448x336 picture; the one-line system prompt), then reused every turn,
+  but image turn 2 - the picture prefilled on top of a retained 41-token holder - diverged
+  from a cold run at step 20, where the cold top-2 margin is 0.255, above the 0.1 Metal
+  tolerance. Replaying just that pair (turn 1 beside a longer text request, turn 2 alone)
+  diverged the same way in 4 of 10 runs, 3 of them the first conversation on a freshly loaded
+  model; in 0 of 3 with the arena batched decode off (`TS_BATCHED_FUSED_DECODE=0`); and a turn 1
+  longer than one block on the unchanged code gave 0 divergences in 6 runs.
+- **Model level.** The same sequence driven straight through the model (turn 1 prefilled on
+  the primary cache and adopted, its reply decoded in the arena beside a longer holder, the
+  holder retained and re-keyed, the picture prefilled, 24 decode steps) stays within 0.023 of
+  an all-solo run, and an arena decode step is within 0.0008 of a solo one. The error comes
+  from something in how the engine schedules that path, not yet identified.
+- The same runs hit the null conv-scratch `NullReferenceException` above twice. It is fixed;
+  the divergence persists without it.
+
+Until that divergence is explained the one-block minimum stays, on Gemma 4 too (the same
+executor rule; shorter Gemma 4 holders were not validated).
+
 ### File-mapped quantized weights
 
 When the backend supports it (direct CUDA, GGML CUDA, Apple Silicon Metal,
