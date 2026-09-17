@@ -413,8 +413,26 @@ Measured (24 steps, turns 2-4):
 
 On CUDA the decode and prefill kernels differ by up to about one logit even for a
 text-only conversation, so over 24 greedy tokens a low-margin token can flip between a
-reused and a cold turn with or without images; the concurrent test (holders and the
-arena) produced identical tokens on both backends.
+reused and a cold turn with or without images.
+
+The concurrent test (holders and the arena) applies the same tie rule. At the first step
+where a request's tokens differ from its cold engine run it captures the cold logits (the
+same prompt prefilled cold straight on the model, which must have decoded the same tokens
+up to that step) and accepts the difference only when their top-2 margin is below the
+backend's logit tolerance; the rest of that request is then not compared. Its text-only
+control opens with a system prompt longer than one block (a 346-token first turn): with
+the one-line prompt every text turn was shorter than a block, no turn was retained, and
+the control reused nothing. It must now reuse everything the previous turn left.
+Measured 2026-09-17:
+
+| Backend | Picture | Text turns 2-4 reused | Token differences |
+|---|---|---|---|
+| Metal (Qwen3.5-9B-Q8_0, mmproj BF16) | built-in 896x672 | 367 / 411 / 446 | none |
+| Metal | real photo | 367 / 411 / 446 | none |
+| CUDA (A40, Qwen3.5-9B-Q8_0, mmproj F16) | built-in 896x672 | 366 / 410 / 445 | image turn 3 step 0 (margin 0.23), image turn 4 step 5 (0.017), text turn 3 step 0 (0.041): ties |
+| CUDA | real photo | 366 / 410 / 445 | text turn 3 step 0 (margin 0.041): tie |
+
+Before the tie rule the CUDA built-in-picture run failed on its image turn 3 step 0.
 
 **Through the server** (the Phase 0 IMG probe: Web UI and OpenAI conversations with the
 image on turn 1 or turn 3, plus text controls; Metal, Qwen3.5-9B-Q8_0, greedy, 96 tokens
