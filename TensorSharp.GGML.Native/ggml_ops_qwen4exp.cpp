@@ -1359,8 +1359,8 @@ ggml_tensor* q4e_nodes_attn(
             ggml_tensor* ar = nullptr;
             if (use_flash)
             {
-                ar = ggml_flash_attn_ext(ctx, qr, kr, vr, mr, attn_scale, 0.0f, 0.0f);
-                ggml_flash_attn_ext_set_prec(ar, GGML_PREC_F32);
+                ar = flash_attn_ext_guarded(ctx, "Qwen4Exp verify-row attention", qr, kr, vr, mr,
+                    attn_scale, 0.0f, 0.0f, nullptr, GGML_PREC_F32);
             }
             else
             {
