@@ -74,10 +74,11 @@ public sealed class QwenVLVideoEncoderTests : IDisposable
             {
                 Role = "user", Content = "order?", IsVideo = true,
                 ImagePaths = frames.ToList(),
-                ImageTimestamps = new() { 0, 1, 2 },
+                ImageTimestamps = new() { 0, 0.5, 1.0 },
             };
             const int imagePad = 100, videoPad = 101;
-            // vision_start <0.5 seconds> vision_start PAIR vision_end <2.0 seconds> vision_start PAIR vision_end vision_end text
+            // Frames 0.5 s apart (the tower's 2 fps) pair as (f0,f1) and (f2,f2).
+            // vision_start <0.2 seconds> vision_start PAIR vision_end <1.0 seconds> vision_start PAIR vision_end vision_end text
             var prompt = new List<int> { 7, 8, 7, videoPad, 9, 8, 7, videoPad, 9, 9, 5 };
             var expanded = injector.ProcessPromptTokens(new() { message }, prompt);
 
@@ -115,7 +116,7 @@ public sealed class QwenVLVideoEncoderTests : IDisposable
             {
                 Role = "user", Content = "order?", IsVideo = true,
                 ImagePaths = frames.Reverse().ToList(),
-                ImageTimestamps = new() { 0, 1, 2 },
+                ImageTimestamps = new() { 0, 0.5, 1.0 },
             };
             var expandedReversed = injector.ProcessPromptTokens(new() { reversed }, prompt);
             Assert.Equal(expanded, expandedReversed);
@@ -197,7 +198,7 @@ public sealed class QwenVLVideoEncoderTests : IDisposable
             File.SetLastWriteTimeUtc(first, epoch);
             File.SetLastWriteTimeUtc(second, epoch.AddHours(2));
             var message = new ChatMessage { Role = "user", IsVideo = true,
-                ImagePaths = new() { first, second }, ImageTimestamps = new() { 0, 1 } };
+                ImagePaths = new() { first, second }, ImageTimestamps = new() { 0, 0.5 } };
             float[] Encode()
             {
                 var tokens = injector.ProcessPromptTokens(new() { message }, new() { 7, 101, 9 });
