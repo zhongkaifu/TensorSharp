@@ -90,7 +90,6 @@ internal static class DeepSeekTeacherTokenExporter
         _ = OpenAIChatAdapter.PrepareDeepSeek41ToolGrammar(body, effectiveTools, effectiveTools, format);
         messages = StructuredOutputPrompt.Apply(messages, format);
         messages = ChatHistoryPreparer.PrepareHistoryForInference(messages, "deepseek41");
-        messages = ChatHistoryPreparer.AugmentWithCachedRawTokens(messages, []);
         if (messages.Any(m => m.RawOutputTokens is { Count: > 0 } || m.CacheControl != null || m.ContentCacheBreakpoints is { Count: > 0 }))
             throw new InvalidDataException("Unexpected cached-token or marker path in teacher history.");
         EncodedPrompt Render(List<ChatMessage> history) => Encode(tokenizer, template, history, effectiveTools, thinking);

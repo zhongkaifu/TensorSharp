@@ -2238,6 +2238,11 @@ namespace TensorSharp.Chat
                     }
                     else
                     {
+                        // Unparsed text is answer text too. Without this every reply of
+                        // a model that needs no parser ended with the "ended this turn
+                        // without writing an answer" note, which the page then sent back
+                        // as part of the assistant's message on the next turn.
+                        sawContent = true;
                         yield return WebUiSseEvents.Token(piece);
                     }
                 }

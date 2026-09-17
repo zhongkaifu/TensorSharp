@@ -653,18 +653,73 @@ namespace TensorSharp.Server.RequestParsers
         private static string WriteBase64Image(string base64, UploadStoragePolicy uploads)
         {
             byte[] imgData = Convert.FromBase64String(base64);
-            uploads.ReserveClientWriteOrThrow(imgData.Length);
-            string path = Path.Combine(uploads.DirectoryPath, $"{Guid.NewGuid():N}.png");
+            return WriteContentAddressed(imgData, ".png", uploads);
+        }
+
+        /// <summary>
+        /// Store a decoded attachment under the SHA-256 of its bytes and return the path.
+        ///
+        /// <para>
+        /// API clients resend every image and audio clip of the conversation with each
+        /// turn. Written under a fresh random name each time, one picture became a new
+        /// file per turn (the upload directory grew without bound) and, since media was
+        /// identified by path, a new picture as far as prompt reuse and the embedding
+        /// cache could tell: every turn after an image re-prefilled from the image and
+        /// re-ran the vision encoder. The same bytes now land on the same file, written
+        /// once; a repeat only refreshes its write time so the TTL sweep keeps a file a
+        /// conversation still sends.
+        /// </para>
+        /// </summary>
+        internal static string WriteContentAddressed(byte[] data, string extension, UploadStoragePolicy uploads)
+        {
+            string path = Path.Combine(uploads.DirectoryPath, MediaContentId.OfBytes(data) + extension);
+            if (TryReuseStoredCopy(path, data.Length))
+                return path;
+
+            uploads.ReserveClientWriteOrThrow(data.Length);
+            // Written aside and moved into place, so a reader never sees a partial file
+            // under a content name and two concurrent writers of the same bytes agree.
+            string temp = path + "." + Guid.NewGuid().ToString("N") + ".partial";
             try
             {
-                File.WriteAllBytes(path, imgData);
+                File.WriteAllBytes(temp, data);
+                File.Move(temp, path, overwrite: false);
+            }
+            catch (IOException) when (TryReuseStoredCopy(path, data.Length))
+            {
+                // Another request stored the same bytes first.
+                TryDelete(temp);
+                uploads.Release(data.Length);
             }
             catch
             {
-                uploads.Release(imgData.Length);
+                TryDelete(temp);
+                uploads.Release(data.Length);
                 throw;
             }
             return path;
+        }
+
+        private static bool TryReuseStoredCopy(string path, long length)
+        {
+            try
+            {
+                var existing = new FileInfo(path);
+                if (!existing.Exists || existing.Length != length)
+                    return false;
+                existing.LastWriteTimeUtc = DateTime.UtcNow;
+                return true;
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                return File.Exists(path);
+            }
+        }
+
+        private static void TryDelete(string path)
+        {
+            try { File.Delete(path); }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
         }
 
         /// <summary>
@@ -700,18 +755,7 @@ namespace TensorSharp.Server.RequestParsers
             if (data.Length == 0)
                 return null;
 
-            uploads.ReserveClientWriteOrThrow(data.Length);
-            string path = Path.Combine(uploads.DirectoryPath, $"{Guid.NewGuid():N}{AudioExtension(format, data)}");
-            try
-            {
-                File.WriteAllBytes(path, data);
-            }
-            catch
-            {
-                uploads.Release(data.Length);
-                throw;
-            }
-            return path;
+            return WriteContentAddressed(data, AudioExtension(format, data), uploads);
         }
 
         private static string WriteBase64AudioDataUri(string url, UploadStoragePolicy uploads)

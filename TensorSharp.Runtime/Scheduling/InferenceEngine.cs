@@ -67,7 +67,9 @@ namespace TensorSharp.Runtime.Scheduling
             _scheduler = new ContinuousBatchScheduler(cfg, _pool, model.KVStateFingerprint ?? string.Empty, logger,
                 supportsCrossSequenceKvReuse: model.SupportsCrossSequenceKvReuse,
                 maxReusablePrefixTokens: model.MaxReusablePrefixTokens,
-                requiresPerBlockCapture: model.RequiresPerBlockCapture);
+                requiresPerBlockCapture: model.RequiresPerBlockCapture,
+                supportsReuseAcrossMediaSpan: model.SupportsReuseAcrossMediaSpan,
+                canPrefillMediaAfterReusedPrefix: model.CanPrefillMediaAfterReusedPrefix);
             _executor = new BatchExecutor(model, _pool, _scheduler, logger);
             // Let the scheduler plan same-session live-cache continuations through the
             // executor (which owns the model's live KV-cache state).
@@ -85,7 +87,9 @@ namespace TensorSharp.Runtime.Scheduling
             // request, so only it can report the outcome without guessing.
             _scheduler.AttachReuseDiagnostics(
                 () => _executor.LastLiveContinuationDeclineReason,
-                () => _executor.LastFusedContinuationDeclineReason);
+                () => _executor.LastFusedContinuationDeclineReason,
+                () => _executor.LastFusedAdoptionSource,
+                () => _executor.LastBlockedByScopeTokens);
             // Shared-prefix checkpoints: end a prefill chunk exactly where the chat
             // layer says the shared prompt ends, so the executor can copy the model's
             // state there and start every later new chat from that copy.

@@ -404,7 +404,7 @@ public class WebUiChatServiceTests : IDisposable
     {
         Fixture f = Build();
         ChatSession session = f.Sessions.CreateSession();
-        session.TrackedHistory.Add(new ChatMessage { Role = "user", Content = "earlier" });
+        TranscriptTestHelper.RecordTurn(session, "earlier");
 
         var ex = await RejectionOf(f.Service.ChatStreamAsync(
             Json($$"""{"sessionId":"{{session.Id}}","newChat":true,"messages":[]}"""), CancellationToken.None));
@@ -412,7 +412,7 @@ public class WebUiChatServiceTests : IDisposable
         // The refusal order is the adapter's: session lookup and reset come before the
         // model check, so a New Chat on a model-less server still clears the desk.
         Assert.Equal(400, ex.StatusCode);
-        Assert.Empty(session.TrackedHistory);
+        Assert.Equal(0, session.TrackedTurnCount);
     }
 
     // ---- sessions and models ---------------------------------------------------

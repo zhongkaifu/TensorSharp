@@ -8,6 +8,8 @@
 // TensorSharp is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 
+using static InferenceWeb.Tests.TranscriptTestHelper;
+
 namespace InferenceWeb.Tests;
 
 /// <summary>
@@ -39,35 +41,31 @@ public class ModelServiceRawTokenHistoryTests
         Assert.Equal(0, ModelService.ResolvePrefillChunkSize(BackendType.GgmlCuda, -5));
     }
 
+    private static ConversationTranscriptStore NewStore() => new(maxChains: 64, maxTokens: 100_000);
+
     [Fact]
-    public void AugmentWithCachedRawTokens_FreshService_ReturnsIncomingUnchanged()
+    public void Augment_FreshStore_ReturnsIncomingUnchanged()
     {
-        // Without prior turns we can't augment anything.
-        var tracked = new List<ChatMessage>();
-        var incoming = new List<ChatMessage>
-        {
-            new() { Role = "user", Content = "hi" },
-        };
+        var incoming = new List<ChatMessage> { new() { Role = "user", Content = "hi" } };
 
-        var result = ModelService.AugmentWithCachedRawTokens(incoming, tracked);
+        var result = NewStore().Augment(incoming);
 
-        Assert.Single(result);
-        Assert.Equal("hi", result[0].Content);
-        Assert.Null(result[0].RawOutputTokens);
+        Assert.Single(result.History);
+        Assert.Equal("hi", result.History[0].Content);
+        Assert.Null(result.History[0].RawOutputTokens);
+        Assert.Null(result.InheritedScope);
     }
 
     [Fact]
-    public void AugmentWithCachedRawTokens_NullInput_ReturnsNull()
+    public void Augment_NullInput_ReturnsNull()
     {
-        Assert.Null(ModelService.AugmentWithCachedRawTokens(null, new List<ChatMessage>()));
+        Assert.Null(NewStore().Augment(null).History);
     }
 
     [Fact]
-    public void AugmentWithCachedRawTokens_PreservesIncomingRawTokensIfAlreadySet()
+    public void Augment_PreservesIncomingRawTokensIfAlreadySet()
     {
-        // If the caller already attached raw tokens (e.g. test harness), the service must
-        // not overwrite them with stale tracked values.
-        var tracked = new List<ChatMessage>();
+        // A caller that attached raw tokens itself (the tool loop's own rounds) keeps them.
         var explicitTokens = new List<int> { 9001, 9002 };
         var incoming = new List<ChatMessage>
         {
@@ -76,44 +74,31 @@ public class ModelServiceRawTokenHistoryTests
             new() { Role = "user", Content = "u2" },
         };
 
-        var result = ModelService.AugmentWithCachedRawTokens(incoming, tracked);
+        var result = NewStore().Augment(incoming);
 
-        Assert.Same(explicitTokens, result[1].RawOutputTokens);
+        Assert.Same(explicitTokens, result.History[1].RawOutputTokens);
     }
 
     /// <summary>
-    /// Reproduces the Qwen 3.5 / 3.6 WebUI raw-token history bug:
-    /// the streaming output parser strips &lt;think&gt;...&lt;/think&gt; framing from the
-    /// assistant text before the WebUI accumulates it, so on the next chat request the
-    /// WebUI sends back an assistant message whose Content is a STRIPPED subset of what
-    /// our tracked history stored. The augmenter MUST still recognise this as the same
-    /// turn and splice the cached raw output tokens, otherwise every multi-turn chat with
-    /// a thinking model changes the rendered token prefix.
+    /// The Qwen 3.5 / 3.6 Web UI case: the streaming parser strips the thinking framing
+    /// before the page accumulates the answer, so the next request's assistant message is
+    /// the PARSED content while the generated tokens include the reasoning. The recorded
+    /// emitted form is that parsed content, so the turn still gets its raw tokens back.
     /// </summary>
     [Fact]
-    public void AugmentWithCachedRawTokens_WebUIParsedContentMismatch_StillSplicesRawTokens()
+    public void Augment_WebUIParsedContentMismatch_StillSplicesRawTokens()
     {
-        // Simulate the result of UpdateTrackedHistory() after a previous turn:
-        //   - User asked "What is 1+1?"
-        //   - Model raw-emitted "<think>let me think</think>1+1=2" (raw bytes from token decoding)
-        //   - Tracked content holds the FULL raw text; raw output tokens are the model's bytes.
+        var store = NewStore();
         var rawTokens = new List<int> { 11, 22, 33, 44, 55 };
-        var tracked = new List<ChatMessage>
-        {
-            new() { Role = "user", Content = "What is 1+1?" },
-            new()
-            {
-                Role = "assistant",
-                Content = "<think>let me think</think>1+1=2",  // RAW text the model emitted
-                RawOutputTokens = rawTokens,
-            },
-        };
+        store.Record(
+            new List<ChatMessage> { new() { Role = "user", Content = "What is 1+1?" } },
+            Generated("<think>let me think</think>1+1=2", rawTokens),
+            Emitted("1+1=2", rawText: "<think>let me think</think>1+1=2", thinking: "let me think"),
+            scope: "webui-a");
 
-        // Simulate what the WebUI sends back on the SECOND turn: the OutputParser stripped
-        // the thinking block, so Content is just "1+1=2" (plus an optional Thinking field).
         var incoming = new List<ChatMessage>
         {
-            new() { Role = "user", Content = "What is 1+1?" },          // unchanged
+            new() { Role = "user", Content = "What is 1+1?" },
             new()
             {
                 Role = "assistant",
@@ -121,36 +106,124 @@ public class ModelServiceRawTokenHistoryTests
                 Thinking = "let me think",
                 CacheControl = new CacheControlMarker(),
                 ContentCacheBreakpoints = new List<int> { 3 },
-            }, // PARSED!
+            },
             new() { Role = "user", Content = "What is 2+2?" },
         };
 
-        var result = ModelService.AugmentWithCachedRawTokens(incoming, tracked);
+        var result = store.Augment(incoming);
 
-        Assert.Equal(3, result.Count);
-        Assert.Same(rawTokens, result[1].RawOutputTokens);
-        Assert.NotNull(result[1].CacheControl);
-        Assert.Equal(new[] { 3 }, result[1].ContentCacheBreakpoints);
+        Assert.Equal(3, result.History.Count);
+        Assert.Same(rawTokens, result.History[1].RawOutputTokens);
+        Assert.NotNull(result.History[1].CacheControl);
+        Assert.Equal(new[] { 3 }, result.History[1].ContentCacheBreakpoints);
+        Assert.Equal("webui-a", result.InheritedScope);
     }
 
+    /// <summary>
+    /// repro-cross-session P2/WD2: client X asked for a secret codeword and was told
+    /// "Quintessence". Client Y sends the same system and user messages but ITS history
+    /// says the assistant answered "Zeppelin". The shared stateless session used to splice
+    /// X's raw tokens over Y's message (Y was answered "Quintessence", reusing 574/601
+    /// tokens). A message the server never emitted must render from its own text.
+    /// </summary>
     [Fact]
-    public void AugmentWithCachedRawTokens_UserMessageEdited_StopsSplicingAtEdit()
+    public void Augment_ClientAuthoredAssistantMessage_IsNotSplicedWithAnotherConversationsTokens()
     {
-        // When the user edits an earlier message, the conversation diverges at that
-        // position and no later assistant message corresponds to anything we have cached.
-        var tracked = new List<ChatMessage>
+        var store = NewStore();
+        var sys = new ChatMessage { Role = "system", Content = "You are a helpful assistant." };
+        var ask = new ChatMessage { Role = "user", Content = "Invent a random secret codeword and tell me only the codeword." };
+        store.Record(new List<ChatMessage> { sys, ask },
+            Generated("Quintessence", new List<int> { 501, 502, 503 }), Emitted("Quintessence"), scope: "client-x");
+
+        var clientY = new List<ChatMessage>
         {
-            new() { Role = "user", Content = "ORIGINAL" },
+            new() { Role = "system", Content = sys.Content },
+            new() { Role = "user", Content = ask.Content },
+            new() { Role = "assistant", Content = "Zeppelin" },
+            new() { Role = "user", Content = "Repeat exactly the codeword you told me earlier." },
+        };
+
+        var result = store.Augment(clientY);
+
+        Assert.Null(result.History[2].RawOutputTokens);
+        Assert.Equal("Zeppelin", result.History[2].Content);
+        Assert.Null(result.InheritedScope);
+        Assert.Equal(0, result.SplicedTurns);
+
+        // X's own next turn still gets its tokens and its conversation.
+        var clientX = new List<ChatMessage>(clientY) { [2] = new() { Role = "assistant", Content = "Quintessence" } };
+        var own = store.Augment(clientX);
+        Assert.Equal(new[] { 501, 502, 503 }, own.History[2].RawOutputTokens);
+        Assert.Equal("client-x", own.InheritedScope);
+    }
+
+    /// <summary>
+    /// repro-cross-session T1: conversation T0 called get_weather for Paris; a different
+    /// client replays the same question with a Tokyo call and a Tokyo result. The Tokyo
+    /// call must not be rendered as the recorded Paris call.
+    /// </summary>
+    [Fact]
+    public void Augment_ToolCallOfAnotherConversation_IsNotSpliced()
+    {
+        var store = NewStore();
+        var ask = new ChatMessage { Role = "user", Content = "What's the weather in Paris right now?" };
+        var paris = new List<ToolCall>
+        {
+            new() { Name = "get_weather", Arguments = new Dictionary<string, object> { ["city"] = "Paris" } },
+        };
+        store.Record(new List<ChatMessage> { ask },
+            Generated("<tool_call>{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Paris\"}}</tool_call>", new List<int> { 7, 8, 9 }),
+            Emitted(string.Empty, rawText: "<tool_call>...</tool_call>", toolCalls: paris), scope: "t0");
+
+        var tokyoClient = new List<ChatMessage>
+        {
+            new() { Role = "user", Content = ask.Content },
             new()
             {
                 Role = "assistant",
-                Content = "<think>x</think>response_to_original",
-                RawOutputTokens = new List<int> { 1, 2, 3 },
+                Content = string.Empty,
+                ToolCalls = new List<ToolCall>
+                {
+                    new() { Id = "call_1", Name = "get_weather", Arguments = new Dictionary<string, object> { ["city"] = "Tokyo" } },
+                },
             },
+            new() { Role = "tool", Content = "{\"city\":\"Tokyo\",\"temp_c\":31}", ToolCallId = "call_1" },
+            new() { Role = "user", Content = "Which city did you look up?" },
         };
 
-        // User edited the first message to "EDITED" - the assistant message is no longer
-        // a continuation of anything we have raw tokens for.
+        var result = store.Augment(tokyoClient);
+        Assert.Null(result.History[1].RawOutputTokens);
+        Assert.Null(result.InheritedScope);
+
+        // The Paris conversation's own replay (the client echoes the call it was sent,
+        // with its own id and JSON spelling) still splices.
+        tokyoClient[1] = new ChatMessage
+        {
+            Role = "assistant",
+            Content = null,
+            ToolCalls = new List<ToolCall>
+            {
+                new()
+                {
+                    Id = "call_9",
+                    Name = "get_weather",
+                    Arguments = System.Text.Json.JsonSerializer.Deserialize<Dictionary<string, object>>("{ \"city\" : \"Paris\" }"),
+                },
+            },
+        };
+        var own = store.Augment(tokyoClient);
+        Assert.Equal(new[] { 7, 8, 9 }, own.History[1].RawOutputTokens);
+        Assert.Equal("t0", own.InheritedScope);
+    }
+
+    [Fact]
+    public void Augment_UserMessageEdited_StopsSplicingAtEdit()
+    {
+        var store = NewStore();
+        store.Record(new List<ChatMessage> { new() { Role = "user", Content = "ORIGINAL" } },
+            Generated("<think>x</think>response_to_original", new List<int> { 1, 2, 3 }),
+            Emitted("response_to_original"), scope: "s");
+
         var incoming = new List<ChatMessage>
         {
             new() { Role = "user", Content = "EDITED" },
@@ -158,62 +231,35 @@ public class ModelServiceRawTokenHistoryTests
             new() { Role = "user", Content = "follow-up" },
         };
 
-        var result = ModelService.AugmentWithCachedRawTokens(incoming, tracked);
+        var result = store.Augment(incoming);
 
-        // No augmentation should have happened: the assistant message keeps its caller-set
-        // RawOutputTokens (null) since the user message before it diverged.
-        Assert.Null(result[1].RawOutputTokens);
+        Assert.Null(result.History[1].RawOutputTokens);
     }
 
     /// <summary>
-    /// Reproduces the SECOND symptom from the Qwen 3.6 WebUI bug: even after the
-    /// content-mismatch fix, multi-turn conversations beyond two turns still degraded to
-    /// full reset because the previous turn's `UpdateTrackedHistory` re-cloned from the
-    /// (raw-token-less) WebUI request body instead of the augmented history. So the
-    /// raw tokens of every-but-the-most-recent assistant fell off the tracked record,
-    /// and on turn 3 the augmenter could only restore raw tokens for the IMMEDIATELY
-    /// previous assistant, not earlier ones.
-    ///
-    /// This test walks the augmenter through three simulated WebUI turns and asserts
-    /// that all prior assistant turns are still augmentable.
+    /// Every earlier assistant turn keeps its raw tokens, however many turns later: each
+    /// turn is its own record, keyed by the client-visible history before it.
     /// </summary>
     [Fact]
-    public void AugmentWithCachedRawTokens_ThreeTurnsViaWebUIFlow_AllPriorAssistantsCarryRawTokens()
+    public void Augment_ThreeTurnsViaWebUIFlow_AllPriorAssistantsCarryRawTokens()
     {
-        var tracked = new List<ChatMessage>();
-
+        var store = NewStore();
         var raw1 = new List<int> { 11, 12, 13 };
         var raw2 = new List<int> { 21, 22, 23, 24 };
 
-        // Simulate state after turn 1 generation (UpdateTrackedHistory was called).
-        tracked.Add(new ChatMessage { Role = "user", Content = "Q1" });
-        tracked.Add(new ChatMessage
-        {
-            Role = "assistant",
-            Content = "RAW1",
-            RawOutputTokens = raw1,
-        });
+        var turn1 = new List<ChatMessage> { new() { Role = "user", Content = "Q1" } };
+        store.Record(turn1, Generated("RAW1", raw1), Emitted("PARSED1", rawText: "RAW1"), scope: "s");
 
-        // Simulate the WebUI sending TURN 2 - assistant1 content is parsed (no raw tokens).
-        var turn2Incoming = new List<ChatMessage>
+        var turn2 = new List<ChatMessage>
         {
             new() { Role = "user", Content = "Q1" },
             new() { Role = "assistant", Content = "PARSED1" },
             new() { Role = "user", Content = "Q2" },
         };
-        var turn2Augmented = ModelService.AugmentWithCachedRawTokens(turn2Incoming, tracked);
-        Assert.Same(raw1, turn2Augmented[1].RawOutputTokens);
+        Assert.Same(raw1, store.Augment(turn2).History[1].RawOutputTokens);
+        store.Record(turn2, Generated("RAW2", raw2), Emitted("PARSED2", rawText: "RAW2"), scope: "s");
 
-        // Simulate state AFTER turn 2 generation: tracked is rebuilt FROM THE AUGMENTED
-        // history (the fix), with the new assistant turn appended. This is what the bug
-        // breaks: if the rebuild uses turn2Incoming instead, raw1 would be lost forever.
-        tracked.Clear();
-        for (int i = 0; i < turn2Augmented.Count; i++)
-            tracked.Add(turn2Augmented[i]);
-        tracked.Add(new ChatMessage { Role = "assistant", Content = "RAW2", RawOutputTokens = raw2 });
-
-        // Simulate the WebUI sending TURN 3 - both prior assistants have parsed content.
-        var turn3Incoming = new List<ChatMessage>
+        var turn3 = new List<ChatMessage>
         {
             new() { Role = "user", Content = "Q1" },
             new() { Role = "assistant", Content = "PARSED1" },
@@ -221,37 +267,81 @@ public class ModelServiceRawTokenHistoryTests
             new() { Role = "assistant", Content = "PARSED2" },
             new() { Role = "user", Content = "Q3" },
         };
-        var turn3Augmented = ModelService.AugmentWithCachedRawTokens(turn3Incoming, tracked);
+        var result = store.Augment(turn3);
 
-        Assert.Same(raw1, turn3Augmented[1].RawOutputTokens);
-        Assert.Same(raw2, turn3Augmented[3].RawOutputTokens);
+        Assert.Same(raw1, result.History[1].RawOutputTokens);
+        Assert.Same(raw2, result.History[3].RawOutputTokens);
+        Assert.Null(result.History[4].RawOutputTokens);
+        Assert.Equal("s", result.InheritedScope);
+    }
+
+    /// <summary>
+    /// Two OpenAI conversations interleaved on the one stateless session (A1, B1, A2, B2,
+    /// A3). The old tracked history was overwritten by whichever request finished last, so
+    /// every conversation but the last re-rendered its answers from text (Qwen: U2 536/583
+    /// against V2 567/585). Records are per conversation position now.
+    /// </summary>
+    [Fact]
+    public void Augment_InterleavedConversations_EachKeepsItsOwnRawTokens()
+    {
+        var store = NewStore();
+        var sys = new ChatMessage { Role = "system", Content = "shared system prompt" };
+        List<ChatMessage> History(string who, int turns)
+        {
+            var h = new List<ChatMessage> { sys };
+            for (int t = 1; t <= turns; t++)
+            {
+                h.Add(new ChatMessage { Role = "user", Content = $"{who} question {t}" });
+                if (t < turns) h.Add(new ChatMessage { Role = "assistant", Content = $"{who} answer {t}" });
+            }
+            return h;
+        }
+        List<int> Raw(string who, int t) => new() { who == "A" ? 1000 + t : 2000 + t };
+
+        foreach (var (who, turn) in new[] { ("A", 1), ("B", 1), ("A", 2), ("B", 2), ("A", 3) })
+        {
+            var history = History(who, turn);
+            var augmented = store.Augment(history);
+            for (int t = 1; t < turn; t++)
+                Assert.Equal(Raw(who, t), augmented.History[2 * t].RawOutputTokens);
+            if (turn > 1)
+                Assert.Equal("scope-" + who, augmented.InheritedScope);
+            store.Record(history, Generated($"{who} answer {turn}", Raw(who, turn)),
+                Emitted($"{who} answer {turn}"), scope: "scope-" + who);
+        }
+
+        var b3 = store.Augment(History("B", 3));
+        Assert.Equal(Raw("B", 1), b3.History[2].RawOutputTokens);
+        Assert.Equal(Raw("B", 2), b3.History[4].RawOutputTokens);
     }
 
     [Fact]
-    public void AugmentWithCachedRawTokens_ThreeTurnConversation_SplicesAllPriorAssistantsByPosition()
+    public void Augment_StoppedTurn_SplicesWhatTheClientKeptBeforeTheStop()
     {
-        var tracked = new List<ChatMessage>();
+        var store = NewStore();
+        store.Record(new List<ChatMessage> { new() { Role = "user", Content = "write a long story" } },
+            Generated("Once upon a time there was a small robot who loved", new List<int> { 5, 6, 7, 8 }),
+            Emitted("Once upon a time there was a small robot who loved", cancelled: true), scope: "s");
 
-        var raw1 = new List<int> { 100, 101 };
-        var raw2 = new List<int> { 200, 201, 202 };
-        tracked.Add(new ChatMessage { Role = "user", Content = "u1" });
-        tracked.Add(new ChatMessage { Role = "assistant", Content = "<think>...</think>a1raw", RawOutputTokens = raw1 });
-        tracked.Add(new ChatMessage { Role = "user", Content = "u2" });
-        tracked.Add(new ChatMessage { Role = "assistant", Content = "<think>...</think>a2raw", RawOutputTokens = raw2 });
-
-        var incoming = new List<ChatMessage>
+        var result = store.Augment(new List<ChatMessage>
         {
-            new() { Role = "user", Content = "u1" },
-            new() { Role = "assistant", Content = "a1raw" },     // parsed
-            new() { Role = "user", Content = "u2" },
-            new() { Role = "assistant", Content = "a2raw" },     // parsed
-            new() { Role = "user", Content = "u3" },             // new
-        };
+            new() { Role = "user", Content = "write a long story" },
+            new() { Role = "assistant", Content = "Once upon a time there was a small robot who lov" },
+            new() { Role = "user", Content = "go on" },
+        });
 
-        var result = ModelService.AugmentWithCachedRawTokens(incoming, tracked);
+        Assert.Equal(new[] { 5, 6, 7, 8 }, result.History[1].RawOutputTokens);
+    }
 
-        Assert.Same(raw1, result[1].RawOutputTokens);
-        Assert.Same(raw2, result[3].RawOutputTokens);
-        Assert.Null(result[4].RawOutputTokens);
+    [Fact]
+    public void BuildEmittedTurn_UsesTheFamilyParser_AndKeepsTheRawText()
+    {
+        EmittedAssistantTurn emitted = ChatGenerationPipeline.BuildEmittedTurn(
+            "qwen35", "<think>\nreasoning\n</think>\n\nThe answer.", enableThinking: true, tools: null,
+            generationSuffix: null, cancelled: false);
+
+        Assert.Equal("The answer.", emitted.Content.Trim());
+        Assert.Contains("reasoning", emitted.Thinking);
+        Assert.Equal("<think>\nreasoning\n</think>\n\nThe answer.", emitted.RawText);
     }
 }

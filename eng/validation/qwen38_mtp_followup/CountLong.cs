@@ -32,7 +32,7 @@ using var doc = JsonDocument.Parse(File.ReadAllBytes(args[1])); var body = doc.R
 if (body.TryGetProperty("tools", out _) || body.TryGetProperty("response_format", out _) || body.GetProperty("think").GetBoolean()) throw new InvalidDataException("Unexpected preprocessing branch");
 var history = ChatMessageParser.ParseOpenAI(body.GetProperty("messages"), null!, architecture: "qwen4exp");
 history = StructuredOutputPrompt.Apply(history, null);
-history = ChatHistoryPreparer.AugmentWithCachedRawTokens(ChatHistoryPreparer.PrepareHistoryForInference(history, "qwen4exp"), []);
+history = ChatHistoryPreparer.PrepareHistoryForInference(history, "qwen4exp");
 var recording = new Recorder(tokenizer);
 var tokens = new KVCachePromptRenderer(new GgufPromptRenderer()).RenderToTokens(recording, gguf.GetString("tokenizer.chat_template"), history, "qwen4exp", true,
     out var breakpoints, out var boundary, null, false);

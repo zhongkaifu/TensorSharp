@@ -8,21 +8,22 @@
 // TensorSharp is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 
+using static InferenceWeb.Tests.TranscriptTestHelper;
+
 namespace InferenceWeb.Tests;
 
 /// <summary>
-/// Pins the transcript EXPANSION in <c>ChatHistoryPreparer.AugmentWithCachedRawTokens</c>.
+/// Pins the transcript EXPANSION in <c>ConversationTranscriptStore.Augment</c>.
 ///
 /// <para>
 /// The incident this encodes: a turn that ran the skills/code tool loop leaves
-/// <c>assistant, tool, assistant, ...</c> in the session's tracked history (each
-/// assistant round carrying its raw output tokens), but the client sends that turn back
-/// as ONE clean assistant message. The old positional walk broke at the first tool
-/// result, the next render diverged thousands of tokens before the live cache's end,
-/// and the engine — which only rewinds a few trailing tokens — re-prefilled the whole
-/// conversation: 15.7k tokens, 10.7s to first token, 0% KV reuse. Expansion substitutes
-/// the tracked transcript for the clean message so the rendered prefix stays
-/// byte-identical to the cache.
+/// <c>assistant, tool, assistant, ...</c> in the model's cache (each assistant round
+/// carrying its raw output tokens), but the client sends that turn back as ONE clean
+/// assistant message. A positional walk broke at the first tool result, the next render
+/// diverged thousands of tokens before the live cache's end, and the engine re-prefilled
+/// the whole conversation: 15.7k tokens, 10.7s to first token, 0% KV reuse. Expansion
+/// substitutes the recorded transcript for the clean message so the rendered prefix stays
+/// byte-identical to the cache - now only when the clean message is what the loop sent.
 /// </para>
 /// </summary>
 public class ToolTranscriptSpliceTests
@@ -31,24 +32,31 @@ public class ToolTranscriptSpliceTests
     private static readonly List<int> Raw2 = new() { 21, 22 };
     private static readonly List<int> Raw3 = new() { 31, 32, 33, 34 };
 
-    /// <summary>Tracked history as a skills turn leaves it: two tool rounds, then the answer.</summary>
-    private static List<ChatMessage> TrackedTranscript() => new()
-    {
-        new() { Role = "user", Content = "convert this file" },
-        new() { Role = "assistant", Content = "Using the pdf skill.\n\n", RawOutputTokens = Raw1 },
-        new() { Role = "tool", Content = "Ran python (exit code 1)\nModuleNotFoundError" },
-        new() { Role = "assistant", Content = "Retrying with packages.\n\n", RawOutputTokens = Raw2 },
-        new() { Role = "tool", Content = "Ran python (exit code 0)\nFiles produced" },
-        // The final round is tracked with the RAW model text, not the parsed content —
-        // that is what UpdateTrackedHistory records.
-        new() { Role = "assistant", Content = "<thought>done</thought>Here is your PDF.", RawOutputTokens = Raw3 },
-    };
-
     /// <summary>What the Web UI sends back: the rounds' parsed contents, concatenated.</summary>
     private const string CleanAssistantText = "Using the pdf skill.\n\nRetrying with packages.\n\nHere is your PDF.";
 
+    /// <summary>A store holding a skills turn as the loop's last generation records it:
+    /// the request history ends with the loop's own rounds, then the final round.</summary>
+    private static ConversationTranscriptStore StoreWithTranscript()
+    {
+        var store = new ConversationTranscriptStore(maxChains: 64, maxTokens: 100_000);
+        var lastRoundHistory = new List<ChatMessage>
+        {
+            new() { Role = "user", Content = "convert this file" },
+            new() { Role = "assistant", Content = "Using the pdf skill.\n\n", RawOutputTokens = Raw1 },
+            new() { Role = "tool", Content = "Ran python (exit code 1)\nModuleNotFoundError" },
+            new() { Role = "assistant", Content = "Retrying with packages.\n\n", RawOutputTokens = Raw2 },
+            new() { Role = "tool", Content = "Ran python (exit code 0)\nFiles produced" },
+        };
+        store.Record(lastRoundHistory,
+            Generated("<thought>done</thought>Here is your PDF.", Raw3),
+            Emitted("Here is your PDF.", rawText: "<thought>done</thought>Here is your PDF."),
+            scope: "chat");
+        return store;
+    }
+
     [Fact]
-    public void ACleanAssistantTurn_ExpandsIntoTheTrackedToolTranscript()
+    public void ACleanAssistantTurn_ExpandsIntoTheRecordedToolTranscript()
     {
         var incoming = new List<ChatMessage>
         {
@@ -57,7 +65,7 @@ public class ToolTranscriptSpliceTests
             new() { Role = "user", Content = "thanks, and now translate it" },
         };
 
-        var result = ModelService.AugmentWithCachedRawTokens(incoming, TrackedTranscript());
+        var result = StoreWithTranscript().Augment(incoming).History;
 
         // 1 user + 5 transcript messages + 1 new user.
         Assert.Equal(7, result.Count);
@@ -71,10 +79,27 @@ public class ToolTranscriptSpliceTests
     }
 
     [Fact]
+    public void AHostNoteAfterTheLoopsAnswer_StillExpands()
+    {
+        // The loop appends its own paragraph after a verified artifact; that is host
+        // text, not model output, and the generated part is all there.
+        var incoming = new List<ChatMessage>
+        {
+            new() { Role = "user", Content = "convert this file" },
+            new() { Role = "assistant", Content = CleanAssistantText + "\n\n[Download report.pdf](/files/report.pdf)" },
+            new() { Role = "user", Content = "next" },
+        };
+
+        var result = StoreWithTranscript().Augment(incoming).History;
+
+        Assert.Equal(7, result.Count);
+        Assert.Same(Raw3, result[5].RawOutputTokens);
+    }
+
+    [Fact]
     public void ExpandedTurn_PreservesClientCacheMarkersAtSafeTranscriptBoundaries()
     {
-        var tracked = TrackedTranscript();
-        int firstRoundLength = tracked[1].Content.Length;
+        int firstRoundLength = "Using the pdf skill.\n\n".Length;
         var incoming = new List<ChatMessage>
         {
             new() { Role = "user", Content = "convert this file" },
@@ -88,25 +113,37 @@ public class ToolTranscriptSpliceTests
             new() { Role = "user", Content = "next" },
         };
 
-        var result = ModelService.AugmentWithCachedRawTokens(incoming, tracked);
+        var store = StoreWithTranscript();
+        var result = store.Augment(incoming).History;
 
         Assert.Equal(new[] { 5 }, result[1].ContentCacheBreakpoints);
         Assert.Equal(new[] { 5 }, result[3].ContentCacheBreakpoints);
         Assert.NotNull(result[5].CacheControl);
-        Assert.Null(tracked[1].ContentCacheBreakpoints);
-        Assert.Null(tracked[5].CacheControl);
+
+        // The record itself is untouched by the mapping.
+        var again = store.Augment(new List<ChatMessage>
+        {
+            new() { Role = "user", Content = "convert this file" },
+            new() { Role = "assistant", Content = CleanAssistantText },
+            new() { Role = "user", Content = "next" },
+        }).History;
+        Assert.Null(again[1].ContentCacheBreakpoints);
+        Assert.Null(again[5].CacheControl);
     }
 
     [Fact]
     public void TheTurnAfterAnExpandedTurn_SplicesBothTurns()
     {
-        // Tracked after turn 2 (a plain turn following the tool turn): the expanded
-        // transcript plus turn 2's own record — this is what UpdateTrackedHistory
-        // rebuilds from the augmented render history.
         var raw4 = new List<int> { 41, 42 };
-        var tracked = TrackedTranscript();
-        tracked.Add(new ChatMessage { Role = "user", Content = "thanks, and now translate it" });
-        tracked.Add(new ChatMessage { Role = "assistant", Content = "RAW turn-2 text", RawOutputTokens = raw4 });
+        var store = StoreWithTranscript();
+        var turn2 = new List<ChatMessage>
+        {
+            new() { Role = "user", Content = "convert this file" },
+            new() { Role = "assistant", Content = CleanAssistantText },
+            new() { Role = "user", Content = "thanks, and now translate it" },
+        };
+        store.Record(turn2, Generated("RAW turn-2 text", raw4),
+            Emitted("parsed turn-2 text", rawText: "RAW turn-2 text"), scope: "chat");
 
         var incoming = new List<ChatMessage>
         {
@@ -117,33 +154,32 @@ public class ToolTranscriptSpliceTests
             new() { Role = "user", Content = "one more thing" },
         };
 
-        var result = ModelService.AugmentWithCachedRawTokens(incoming, tracked);
+        var result = store.Augment(incoming).History;
 
         Assert.Equal(9, result.Count);
         Assert.Same(Raw3, result[5].RawOutputTokens);       // the transcript's final round
         Assert.Equal("user", result[6].Role);
-        Assert.Same(raw4, result[7].RawOutputTokens);       // turn 2, plain positional splice
+        Assert.Same(raw4, result[7].RawOutputTokens);       // turn 2
         Assert.Equal("one more thing", result[8].Content);
     }
 
     [Fact]
-    public void AnEditedAssistantTurn_DoesNotExpand()
+    public void AnEditedAssistantTurn_IsNeitherExpandedNorSpliced()
     {
         var incoming = new List<ChatMessage>
         {
             new() { Role = "user", Content = "convert this file" },
-            // The user (or another client) rewrote the assistant text: the intermediate
-            // rounds' contents no longer lead it, so expanding would splice a transcript
-            // this conversation does not contain.
+            // The user (or another client) rewrote the assistant text. The old walk fell
+            // back to splicing the first round's raw tokens under it anyway; a message
+            // the loop did not send renders from its own text.
             new() { Role = "assistant", Content = "Something entirely different." },
             new() { Role = "user", Content = "next" },
         };
 
-        var result = ModelService.AugmentWithCachedRawTokens(incoming, TrackedTranscript());
+        var result = StoreWithTranscript().Augment(incoming).History;
 
         Assert.Equal(3, result.Count);
-        // Falls back to the plain positional splice, which stays content-tolerant.
-        Assert.Same(Raw1, result[1].RawOutputTokens);
+        Assert.Null(result[1].RawOutputTokens);
         Assert.Equal("Something entirely different.", result[1].Content);
     }
 
@@ -157,17 +193,18 @@ public class ToolTranscriptSpliceTests
             new() { Role = "user", Content = "next" },
         };
 
-        var result = ModelService.AugmentWithCachedRawTokens(incoming, TrackedTranscript());
+        var result = StoreWithTranscript().Augment(incoming).History;
 
         Assert.Equal(3, result.Count);
         Assert.Null(result[1].RawOutputTokens);
     }
 
     [Fact]
-    public void AClientThatSendsItsOwnToolMessages_IsMatchedPositionally_NotExpanded()
+    public void AClientThatSendsItsOwnToolMessages_IsNotExpanded()
     {
-        // An OpenAI-style caller that carries the tool transcript itself: every message
-        // lines up one-to-one, so the plain walk handles it and nothing is inserted.
+        // A caller that carries a tool transcript itself sends a different visible
+        // history than the loop's client, so the loop's record does not apply to it and
+        // nothing is inserted.
         var incoming = new List<ChatMessage>
         {
             new() { Role = "user", Content = "convert this file" },
@@ -179,61 +216,59 @@ public class ToolTranscriptSpliceTests
             new() { Role = "user", Content = "next" },
         };
 
-        var result = ModelService.AugmentWithCachedRawTokens(incoming, TrackedTranscript());
+        var result = StoreWithTranscript().Augment(incoming).History;
 
         Assert.Equal(7, result.Count);
-        Assert.Same(Raw1, result[1].RawOutputTokens);
-        Assert.Same(Raw2, result[3].RawOutputTokens);
-        Assert.Same(Raw3, result[5].RawOutputTokens);
+        Assert.All(result, m => Assert.Null(m.RawOutputTokens));
     }
 
     [Fact]
-    public void ToolResultsFedBackAsUserTurns_NeverExpand()
+    public void ToolResultsFedBackAsUserTurns_ExpandLikeAnyTranscript()
     {
-        // Mistral 3 renders tool results as user messages; that shape must keep
-        // today's behavior — a run of "user" messages is a conversation, not a
-        // transcript.
-        var tracked = new List<ChatMessage>
-        {
-            new() { Role = "user", Content = "q" },
-            new() { Role = "assistant", Content = "calling", RawOutputTokens = Raw1 },
-            new() { Role = "user", Content = "Result of your shell call: ok" },
-            new() { Role = "assistant", Content = "answer", RawOutputTokens = Raw2 },
-        };
-        var incoming = new List<ChatMessage>
+        // Mistral 3 renders tool results as user messages. The loop's rounds are
+        // identified by their raw tokens, not by role, so its transcript expands too.
+        var store = new ConversationTranscriptStore(maxChains: 64, maxTokens: 100_000);
+        store.Record(new List<ChatMessage>
+            {
+                new() { Role = "user", Content = "q" },
+                new() { Role = "assistant", Content = "calling", RawOutputTokens = Raw1 },
+                new() { Role = "user", Content = "Result of your shell call: ok" },
+            },
+            Generated("answer", Raw2), Emitted("answer"), scope: "chat");
+
+        var result = store.Augment(new List<ChatMessage>
         {
             new() { Role = "user", Content = "q" },
             new() { Role = "assistant", Content = "callinganswer" },
             new() { Role = "user", Content = "next" },
-        };
+        }).History;
 
-        var result = ModelService.AugmentWithCachedRawTokens(incoming, tracked);
-
-        Assert.Equal(3, result.Count);
-        Assert.Same(Raw1, result[1].RawOutputTokens);   // plain splice of the aligned assistant
+        Assert.Equal(5, result.Count);
+        Assert.Same(Raw1, result[1].RawOutputTokens);
         Assert.Equal("user", result[2].Role);
-        Assert.Null(result[2].RawOutputTokens);
+        Assert.Same(Raw2, result[3].RawOutputTokens);
+        Assert.Equal("next", result[4].Content);
     }
 
     [Fact]
     public void ARoundWithSeveralToolResults_ExpandsAsOneRun()
     {
-        var tracked = new List<ChatMessage>
-        {
-            new() { Role = "user", Content = "q" },
-            new() { Role = "assistant", Content = "reading\n", RawOutputTokens = Raw1 },
-            new() { Role = "tool", Content = "file one" },
-            new() { Role = "tool", Content = "file two" },
-            new() { Role = "assistant", Content = "RAW answer", RawOutputTokens = Raw2 },
-        };
-        var incoming = new List<ChatMessage>
+        var store = new ConversationTranscriptStore(maxChains: 64, maxTokens: 100_000);
+        store.Record(new List<ChatMessage>
+            {
+                new() { Role = "user", Content = "q" },
+                new() { Role = "assistant", Content = "reading\n", RawOutputTokens = Raw1 },
+                new() { Role = "tool", Content = "file one" },
+                new() { Role = "tool", Content = "file two" },
+            },
+            Generated("RAW answer", Raw2), Emitted("the answer", rawText: "RAW answer"), scope: "chat");
+
+        var result = store.Augment(new List<ChatMessage>
         {
             new() { Role = "user", Content = "q" },
             new() { Role = "assistant", Content = "reading\nthe answer" },
             new() { Role = "user", Content = "next" },
-        };
-
-        var result = ModelService.AugmentWithCachedRawTokens(incoming, tracked);
+        }).History;
 
         Assert.Equal(6, result.Count);
         Assert.Same(Raw1, result[1].RawOutputTokens);

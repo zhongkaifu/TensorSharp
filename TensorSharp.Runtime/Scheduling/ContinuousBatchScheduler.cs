@@ -46,6 +46,12 @@ namespace TensorSharp.Runtime.Scheduling
         // is a valid prefix endpoint.
         private readonly bool _requiresPerBlockCapture;
 
+        // Whether a pooled prefix may extend past a media span (see
+        // IModelArchitecture.SupportsReuseAcrossMediaSpan).
+        private readonly bool _reuseAcrossMediaSpan;
+        // See IModelArchitecture.CanPrefillMediaAfterReusedPrefix; null means yes.
+        private readonly Func<int, bool> _canPrefillMediaAfterReusedPrefix;
+
         // Live-cache continuation hooks (wired by the engine to the executor). The
         // first computes how many leading prompt tokens can be served by continuing
         // the model's live KV cache (beyond the pooled-snapshot cap); the second
@@ -83,8 +89,12 @@ namespace TensorSharp.Runtime.Scheduling
             ILogger logger = null,
             bool supportsCrossSequenceKvReuse = true,
             int maxReusablePrefixTokens = int.MaxValue,
-            bool requiresPerBlockCapture = false)
+            bool requiresPerBlockCapture = false,
+            bool supportsReuseAcrossMediaSpan = true,
+            Func<int, bool> canPrefillMediaAfterReusedPrefix = null)
         {
+            _reuseAcrossMediaSpan = supportsReuseAcrossMediaSpan;
+            _canPrefillMediaAfterReusedPrefix = canPrefillMediaAfterReusedPrefix;
             _cfg = cfg ?? throw new ArgumentNullException(nameof(cfg));
             _pool = pool ?? throw new ArgumentNullException(nameof(pool));
             _logger = logger ?? NullLogger.Instance;
@@ -154,14 +164,23 @@ namespace TensorSharp.Runtime.Scheduling
         // three mechanisms could have helped and why none did.
         private Func<string?>? _liveDeclineReason;
         private Func<string?>? _fusedDeclineReason;
+        private Func<string?>? _fusedAdoptionSource;
+        private Func<int>? _blockedByScopeTokens;
 
         /// <summary>Wire the executor's reuse diagnostics so admission can explain a
-        /// turn that reused nothing. Optional: without it the summary still reports
-        /// what was reused, just without the per-mechanism reasons.</summary>
-        public void AttachReuseDiagnostics(Func<string?> liveReason, Func<string?> fusedReason)
+        /// turn that reused nothing, name what served one that reused something, and
+        /// count what conversation scoping withheld. Optional: without it the summary
+        /// still reports what was reused, just without the per-mechanism detail.</summary>
+        public void AttachReuseDiagnostics(
+            Func<string?> liveReason,
+            Func<string?> fusedReason,
+            Func<string?>? fusedSource = null,
+            Func<int>? blockedByScopeTokens = null)
         {
             _liveDeclineReason = liveReason;
             _fusedDeclineReason = fusedReason;
+            _fusedAdoptionSource = fusedSource;
+            _blockedByScopeTokens = blockedByScopeTokens;
         }
 
         /// <summary>
@@ -183,17 +202,36 @@ namespace TensorSharp.Runtime.Scheduling
             int prompt = seq.PromptTokens.Count;
             if (prompt <= 0) return;
             int reused = seq.PrefixCacheReusedTokens;
+            int blocked = _blockedByScopeTokens?.Invoke() ?? 0;
+            string scope = seq.CacheScope == null
+                ? "unscoped"
+                : seq.CacheScope.Length <= 8 ? seq.CacheScope : seq.CacheScope.Substring(0, 8);
+
+            // Isolation at work, not a fault: another conversation's state matched past
+            // the public prefix and was not used. Debug, because on a multi-client host
+            // it is routine; it is the line that proves a leak is NOT happening.
+            if (blocked > 0)
+            {
+                _logger.LogDebug(
+                    "Prompt reuse for {RequestId}: blocked by scope - another conversation's state matched " +
+                    "{Blocked} more token(s) past the public prefix ({Public} tokens); scope {Scope}.",
+                    seq.RequestId, blocked, seq.SharedPrefixTokens, scope);
+            }
 
             if (reused > 0)
             {
+                string source = servedByLiveCache
+                    ? $"the model's live KV cache of this conversation ({reused} tokens)"
+                    : servedByRetainedState
+                        ? _fusedAdoptionSource?.Invoke() ?? $"retained model state ({reused} tokens)"
+                        : $"pooled prefix-cache blocks ({reused} tokens)";
                 _logger.LogInformation(
                     "Prompt reuse for {RequestId}: {Reused}/{Prompt} tokens ({Percent:F1}%) continue from " +
-                    "{Source}; {Prefill} token(s) to prefill.",
+                    "{Source}; {Prefill} token(s) to prefill; scope {Scope}.",
                     seq.RequestId, reused, prompt, 100.0 * reused / prompt,
-                    servedByLiveCache ? "the model's live KV cache"
-                        : servedByRetainedState ? "retained model state (a finished request's holder or a shared-prefix checkpoint)"
-                        : "pooled prefix-cache blocks",
-                    Math.Max(0, prompt - reused));
+                    source,
+                    Math.Max(0, prompt - reused),
+                    scope);
                 return;
             }
 
@@ -457,7 +495,15 @@ namespace TensorSharp.Runtime.Scheduling
                         && _liveContinuationAdopt != null)
                     {
                         int lcp = _liveContinuationLcp(seq);
-                        if (lcp > 0 && _liveContinuationAdopt(seq, lcp))
+                        // A short live prefix on a pooled-capable model: take the live
+                        // cache unless the pooled blocks actually cover at least as much
+                        // (whole blocks only, one token left, and only if captured).
+                        int pooledCovers = lcp > 0 && PrefixCachingActive && lcp <= _maxReusablePrefixTokens
+                            ? PlanPrefixBlockAdoption(seq, logBacktrack: false).Count * _cfg.BlockSize
+                            : 0;
+                        if (lcp > 0 && pooledCovers >= lcp)
+                            liveDeclineReason = $"pooled prefix-cache blocks cover {pooledCovers} tokens, at least the live match of {lcp}";
+                        else if (lcp > 0 && _liveContinuationAdopt(seq, lcp))
                             plannedLiveContinuation = true;
                         else
                             liveDeclineReason = _liveDeclineReason?.Invoke() ?? "no usable live prefix";
@@ -820,9 +866,29 @@ namespace TensorSharp.Runtime.Scheduling
         private void AdoptPrefixBlocksCapped(SequenceState seq)
         {
             if (seq.BlockTable.NumBlocks > 0) return;
-            if (seq.PromptTokens.Count < _cfg.BlockSize) return;
+            var adoptable = PlanPrefixBlockAdoption(seq, logBacktrack: true);
+            for (int i = 0; i < adoptable.Count; i++)
+            {
+                _pool.Touch(adoptable[i]);
+                seq.BlockTable.AppendBlock(adoptable[i]);
+            }
 
-            var hashes = KvBlockHasher.ComputeBlockHashes(seq.PromptTokens, _cfg.BlockSize, EffectiveFingerprint(seq));
+            int adoptedTokens = adoptable.Count * _cfg.BlockSize;
+            if (adoptedTokens > 0)
+            {
+                seq.PrefixCacheReusedTokens = adoptedTokens;
+                seq.SetComputedTokensForPrefixAdoption(adoptedTokens);
+            }
+        }
+
+        /// <summary>The pooled blocks <see cref="AdoptPrefixBlocksCapped"/> would adopt
+        /// for <paramref name="seq"/>, without touching refcounts or the block table.</summary>
+        private List<KvBlock> PlanPrefixBlockAdoption(SequenceState seq, bool logBacktrack)
+        {
+            var matching = new List<KvBlock>();
+            if (seq.PromptTokens.Count < _cfg.BlockSize) return matching;
+
+            var hashes = ComputeHashesForTokens(seq, seq.PromptTokens, seq.PromptTokens.Count);
             int maxAdoptableTokens = Math.Max(0, seq.PromptTokens.Count - 1);
             // An explicit boundary limits reuse as well as registration. Otherwise a
             // request that says "cache none" (empty/[0]) could still adopt blocks that
@@ -835,9 +901,16 @@ namespace TensorSharp.Runtime.Scheduling
             // snapshot that the model can't faithfully reconstruct -> corrupt output.
             if (_maxReusablePrefixTokens != int.MaxValue)
                 maxAdoptableTokens = Math.Min(maxAdoptableTokens, _maxReusablePrefixTokens);
+            // A reused prefix never ends inside a media span (the block hashes already
+            // carry each span's content identity, so the spans before it match).
+            maxAdoptableTokens = PromptMediaSpans.ClampReusablePrefix(
+                maxAdoptableTokens, seq.MediaSpans, seq.MediaSpans, _reuseAcrossMediaSpan);
+            // Any adoption leaves the prompt's media to prefill at a non-zero position.
+            if (seq.MediaSpans.Count > 0 && _canPrefillMediaAfterReusedPrefix != null
+                && !_canPrefillMediaAfterReusedPrefix(seq.PromptTokens.Count))
+                maxAdoptableTokens = 0;
             int maxAdoptableBlocks = maxAdoptableTokens / _cfg.BlockSize;
 
-            var matching = new List<KvBlock>();
             int lastRestorable = -1;
             for (int i = 0; i < hashes.Count && i < maxAdoptableBlocks; i++)
             {
@@ -859,24 +932,15 @@ namespace TensorSharp.Runtime.Scheduling
                 // The cache MATCHED more than it can deliver; without this line
                 // the user sees kvCacheReusedTokens far below a warm cache's
                 // promise with no explanation.
-                _logger.LogInformation(
+                if (logBacktrack)
+                    _logger.LogInformation(
                     "Prefix cache matched {Matched} block(s) for {RequestId} but only {Adopted} are " +
                     "restorable (a recurrent checkpoint boundary caps adoption); the rest of the " +
                     "prompt re-prefills.",
                     matching.Count, seq.RequestId, adopted);
+                matching.RemoveRange(adopted, matching.Count - adopted);
             }
-            for (int i = 0; i < adopted; i++)
-            {
-                _pool.Touch(matching[i]);
-                seq.BlockTable.AppendBlock(matching[i]);
-            }
-
-            int adoptedTokens = adopted * _cfg.BlockSize;
-            if (adoptedTokens > 0)
-            {
-                seq.PrefixCacheReusedTokens = adoptedTokens;
-                seq.SetComputedTokensForPrefixAdoption(adoptedTokens);
-            }
+            return matching;
         }
 
         /// <summary>After advancing tokens or finishing, check whether the
@@ -972,23 +1036,37 @@ namespace TensorSharp.Runtime.Scheduling
             var list = new List<int>(tokens);
             for (int i = 0; i < tokens; i++)
                 list.Add(seq.TokenAt(i));
-            return KvBlockHasher.ComputeBlockHashes(list, _cfg.BlockSize, EffectiveFingerprint(seq));
+            return ComputeHashesForTokens(seq, list, tokens);
         }
 
+        private List<KvBlockHash> ComputeHashesForTokens(SequenceState seq, IReadOnlyList<int> tokens, int count)
+            => KvBlockHasher.ComputeBlockHashes(tokens, _cfg.BlockSize, _fingerprint, b => BlockSalt(seq, b));
+
         /// <summary>
-        /// The model fingerprint, additionally salted with the sequence's media
-        /// fingerprint when the prompt carries images/audio/video. This keeps the
-        /// prefix-cache block hashes content-aware: identical media reuses cached
-        /// K/V, but different media (sharing the same placeholder token IDs) can
-        /// never adopt a stale neighbour's blocks. Text-only sequences fall back to
-        /// the bare model fingerprint, so their hashes are unchanged.
+        /// What block <paramref name="blockIndex"/> of <paramref name="seq"/> is salted
+        /// with beyond its tokens, or null. Two things, each only where it applies:
+        /// <list type="bullet">
+        /// <item>its media: the content identity of every span overlapping the block.
+        /// Placeholder token ids are identical for any image, so without it two prompts
+        /// with different pictures would share K/V; blocks before the first span stay
+        /// unsalted, so a media prompt still shares its text-only leading blocks, and the
+        /// parent chain carries the salt into every later block.</item>
+        /// <item>its conversation: once a block extends past the request's public prefix
+        /// (<see cref="SequenceState.SharedPrefixTokens"/>, the system prompt and tool
+        /// declarations) it carries the request's <see cref="SequenceState.CacheScope"/>,
+        /// so another conversation shares the public blocks and nothing after them.</item>
+        /// </list>
         /// </summary>
-        private string EffectiveFingerprint(SequenceState seq)
+        private string BlockSalt(SequenceState seq, int blockIndex)
         {
-            string media = seq?.MediaFingerprint;
-            if (string.IsNullOrEmpty(media))
-                return _fingerprint;
-            return string.Concat(_fingerprint, "mm:", media);
+            int start = blockIndex * _cfg.BlockSize;
+            int end = start + _cfg.BlockSize;
+            string media = PromptMediaSpans.BlockSalt(seq.MediaSpans, start, end);
+            string scope = seq.CacheScope != null && end > seq.SharedPrefixTokens
+                ? "scope:" + seq.CacheScope
+                : null;
+            if (media == null) return scope;
+            return scope == null ? media : media + scope;
         }
     }
 }

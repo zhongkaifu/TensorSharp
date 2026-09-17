@@ -51,7 +51,10 @@ namespace TensorSharp.Server
             _lifecycle = createModel == null
                 ? new ModelLifecycleService(logger)
                 : new ModelLifecycleService(logger, createModel);
-            _intrinsicSession = new ChatSession("__svc_intrinsic__");
+            // Shared by every stateless request (OpenAI Chat, Responses, Ollama chat).
+            // It holds many conversations: each request's transcripts and cache scope
+            // come from what its own history proves, never from the session.
+            _intrinsicSession = new ChatSession("__svc_intrinsic__", sharedAcrossConversations: true);
             _engineHost = new InferenceEngineHost(_lifecycle, logger);
             _generation = new ChatGenerationPipeline(_lifecycle, _engineHost, kvCacheRenderer, telemetry, logger);
         }
@@ -98,7 +101,7 @@ namespace TensorSharp.Server
         /// Session-aware requests use the explicit <see cref="ChatSession"/>
         /// instance passed to the generation methods.
         /// </summary>
-        public IReadOnlyList<ChatMessage> TrackedHistory => _intrinsicSession.TrackedHistory.AsReadOnly();
+        public IReadOnlyList<ChatMessage> TrackedHistory => _intrinsicSession.Transcripts.LatestTranscript;
 
         public bool IsModelAlreadyLoaded(string modelName)
         {
@@ -150,7 +153,8 @@ namespace TensorSharp.Server
             // unloaded so their worker threads don't race the model disposal.
             _engineHost.Reset();
             _generation.ResetDiffusionScheduler();
-            _intrinsicSession.TrackedHistory.Clear();
+            lock (_intrinsicSession.HistoryLock)
+                _intrinsicSession.Transcripts.Clear();
             _lifecycle.LoadModel(modelPath, mmProjPath, backendStr);
         }
 
@@ -165,7 +169,8 @@ namespace TensorSharp.Server
         {
             _engineHost.Reset();
             _generation.ResetDiffusionScheduler();
-            _intrinsicSession.TrackedHistory.Clear();
+            lock (_intrinsicSession.HistoryLock)
+                _intrinsicSession.Transcripts.Clear();
             _lifecycle.Unload();
         }
 
@@ -208,7 +213,8 @@ namespace TensorSharp.Server
         /// </summary>
         public void InvalidateKVCache()
         {
-            _intrinsicSession.TrackedHistory.Clear();
+            lock (_intrinsicSession.HistoryLock)
+                _intrinsicSession.Transcripts.Clear();
         }
 
         /// <summary>
@@ -221,8 +227,14 @@ namespace TensorSharp.Server
                 return;
             // Guard against a concurrent request on the same (e.g. default) session reading/rewriting
             // TrackedHistory while we clear it.
+            // A shared session (the stateless API session, the Web UI default session)
+            // holds other clients' conversations too; one client's new chat is simply a
+            // request whose history proves no earlier turn, so nothing is cleared there.
             lock (session.HistoryLock)
-                session.TrackedHistory.Clear();
+            {
+                if (!session.SharedAcrossConversations)
+                    session.ResetConversation();
+            }
             session.LastUsedAt = DateTime.UtcNow;
         }
 
@@ -346,9 +358,14 @@ namespace TensorSharp.Server
         {
             if (skills == null || !skills.ToolsOffered)
             {
-                return ChatStreamWithMetricsAsync(
+                return _generation.ChatStreamWithMetricsAsync(
                     session, history, maxTokens, cancellationToken, samplingConfig, tools, enableThinking);
             }
+
+            // One turn, many generations: every round of the loop runs in the cache scope
+            // its first round resolved, so round two continues round one's state even on
+            // a shared session where the scope is proved from history.
+            var turn = new ChatTurnContext();
 
             // Sampling for a turn that can run code. The runner decides, because it is
             // what knows the operator's configuration; SamplingConfig.ForCodingTurn then
@@ -366,7 +383,8 @@ namespace TensorSharp.Server
                 enableThinking,
                 (turnMessages, turnTools, ct) => _generation.ChatStreamWithMetricsAsync(
                     session, turnMessages, maxTokens, ct,
-                    SamplingForDeepSeek41SkillRound(Architecture, turnSampling, samplingConfig), turnTools, enableThinking),
+                    SamplingForDeepSeek41SkillRound(Architecture, turnSampling, samplingConfig), turnTools, enableThinking,
+                    turn),
                 logger,
                 cancellationToken);
         }
@@ -452,23 +470,10 @@ namespace TensorSharp.Server
             return _generation.GenerateStreamAsync(session, prompt, imagePaths, maxTokens, cancellationToken, samplingConfig);
         }
 
-        /// <summary>
-        /// Instance-friendly shim that augments against the intrinsic compatibility
-        /// session's tracked history. Prefer the static overload that takes an
-        /// explicit tracked history for deterministic testing.
-        /// </summary>
-        internal List<ChatMessage> AugmentWithCachedRawTokens(List<ChatMessage> incoming)
-        {
-            return AugmentWithCachedRawTokens(incoming, _intrinsicSession.TrackedHistory);
-        }
 
         internal static int ResolvePrefillChunkSize(BackendType backend, int tokenCount)
             => PrefillChunking.ResolveChunkSize(backend, tokenCount);
 
-        internal static List<ChatMessage> AugmentWithCachedRawTokens(
-            List<ChatMessage> incoming,
-            IReadOnlyList<ChatMessage> trackedHistory)
-            => ChatHistoryPreparer.AugmentWithCachedRawTokens(incoming, trackedHistory);
 
         internal static List<ChatMessage> PrepareHistoryForInference(List<ChatMessage> history, string arch)
             => ChatHistoryPreparer.PrepareHistoryForInference(history, arch);
