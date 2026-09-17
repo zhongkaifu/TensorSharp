@@ -1036,27 +1036,29 @@ struct load_job
 // to all GPUs proceed concurrently. Jobs are handed out in file order per
 // shard to keep the concurrent streams roughly sequential for readahead.
 //
-// Each chunk's page cache is released as soon as the chunk is on the device,
-// because THE LOADER NEVER READS THOSE BYTES AGAIN and leaving them cached is
-// what makes a large checkpoint load slowly. Measured on an 8xA40 box with a
-// 373.5 GiB cgroup limit, reading 221 GiB off the MooseFS mount with this
-// function's 16 threads:
-//
-//   keeping the pages  2.58 GiB/s overall, and the rate DECAYS as the cache
-//                      fills: 5.24 GiB/s for the first window, 0.38 GiB/s for
-//                      the last, with cgroup usage climbing to 228 GiB
-//   dropping each      6.25 GiB/s overall and FLAT: 8.8-9.1 GiB/s throughout,
-//   consumed chunk     with cgroup usage falling to 26 GiB
-//
-// A 415 GiB checkpoint cannot fit its streamed weights in that cgroup at all
-// (294.8 GiB of reads plus a 119.4 GiB host mapping), so without this the
-// kernel spends most of the load reclaiming page cache it was never going to
-// reuse. Cache the loader does NOT own is left alone: the host-resident experts
-// are served from their own mapping and are deliberately prefaulted below.
+// PAGE CACHE (TS_DSV4_LOAD_DROP_CACHE). The loader never reads an uploaded
+// chunk's bytes again, but it does read the host-mapped weights next (the expert
+// prefault, the Engram warm) and serves them from the page cache afterwards. When
+// the upload plus those mapped bytes cannot fit the host allowance (the cgroup
+// limit: page cache is charged to it), every later read competes with reclaim.
+// The seven-A40 lane is that case: 263.0 GiB uploaded, then 48.2 GiB of experts and
+// 103 GiB of Engram tables read through the mapping, 414 GiB into a 326.9 GiB
+// cgroup. Its load logged the expert prefault at 0.37 GiB/s and the Engram warm
+// at 0.33 GiB/s, while the same page walks measured 0.62-0.74 GiB/s on that VM
+// with the cgroup about half full. So by default each consumed chunk's page
+// cache is dropped exactly when upload + mapped + 8 GiB exceeds the allowance,
+// and kept otherwise (and whenever the allowance is unknown): an unconditional
+// drop would make every reload of a GPU-resident checkpoint cold. Dropping costs
+// 5.9-7.3 ms per resident 64 MiB chunk on that mount (POSIX_FADV_DONTNEED,
+// measured with GgmlOpsDsv4FileWarmBench --drop-cost), ~25-30 s of thread time
+// for 263 GiB. It cannot speed the upload itself, which already runs at the
+// storage rate; the benefit expected is on the later stages, and whether it
+// outweighs the drop cost is settled by comparing a cold load against =0.
+// TS_DSV4_LOAD_DROP_CACHE=0 never drops, =1 always drops. Cache the loader does
+// NOT own is left alone.
 static bool dsv4_upload_parallel(const shard_files & shards, std::vector<load_job> & jobs, int n_threads,
                                  size_t mmap_weight_bytes)
 {
-    (void) mmap_weight_bytes;
     std::sort(jobs.begin(), jobs.end(), [](const load_job & a, const load_job & b)
     {
         if (a.shard != b.shard) return a.shard < b.shard;
@@ -1067,14 +1069,19 @@ static bool dsv4_upload_parallel(const shard_files & shards, std::vector<load_jo
     if (n_threads < 1) n_threads = 1;
 
     std::atomic<bool> failed(false);
-    // Releasing each consumed chunk's page cache keeps the process's memory
-    // footprint down (measured: 39 GiB of page cache at the end of a load instead
-    // of ~330 GiB, which leaves room for the host experts the next phase pins).
-    // It did NOT make the load faster on the 8xA40 box - reads were 5374s of
-    // thread time with it and 5539s without, inside run-to-run spread - and each
-    // call costs real time on FUSE, so it is opt-in.
-    bool drop_cache = false;
-    if (const char * e = getenv("TS_DSV4_LOAD_DROP_CACHE")) drop_cache = atoi(e) != 0;
+    // See PAGE CACHE above: automatic unless TS_DSV4_LOAD_DROP_CACHE is set.
+    const bool drop_cache = [&]()
+    {
+        uint64_t upload_bytes = 0;
+        for (const load_job & j : jobs) upload_bytes += j.len;
+        const uint64_t allowance = dsv4_host_mem_allowance();
+        const tsg_dsv4::drop_cache_decision d = tsg_dsv4::decide_drop_cache(
+            getenv("TS_DSV4_LOAD_DROP_CACHE"), upload_bytes, mmap_weight_bytes, allowance);
+        if (upload_bytes > 0)
+            fprintf(stderr, "[dsv4] load page cache: %s\n",
+                    tsg_dsv4::describe_drop_cache(d, upload_bytes, mmap_weight_bytes, allowance).c_str());
+        return d.drop;
+    }();
 
     // Each thread walks ONE CONTIGUOUS RUN of the sorted job list instead of
     // taking every n_threads'th job from a shared cursor.

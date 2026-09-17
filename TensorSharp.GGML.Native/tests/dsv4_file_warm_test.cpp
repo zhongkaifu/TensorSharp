@@ -68,6 +68,10 @@ static void test_policies()
           text.find("326.9 GiB") != std::string::npos && text.find("8.0 GiB") != std::string::npos,
           "the automatic drop-cache line must name every number: %s", text.c_str());
     check(text.find("dropping") != std::string::npos, "the drop line must say it drops: %s", text.c_str());
+    // docs/models/deepseek41.md quotes this line; keep them identical.
+    check(text == "dropping each uploaded chunk's page cache (automatic: 263.0 GiB upload + 151.2 GiB host-mapped + "
+                  "8.0 GiB headroom exceeds the 326.9 GiB allowance; TS_DSV4_LOAD_DROP_CACHE=0 overrides)",
+          "the documented drop-cache line changed: %s", text.c_str());
 
     d = decide_drop_cache(nullptr, gib_tenths(80.0), 0, allowance);
     check(!d.drop && d.automatic, "80 + 0 + 8 GiB against 326.9 GiB must keep the cache");

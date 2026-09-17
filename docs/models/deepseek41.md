@@ -673,12 +673,32 @@ experts stay pageable. `TS_HOST_MOE_PIN=1` restores the page-lock and its
 pinning for every architecture. The other MoE architectures, whose prefill does
 stream offloaded experts, keep pinning by default.
 
-`TS_DSV4_LOAD_DROP_CACHE=1` releases each chunk's page cache once it is on the
-device. It does not make the load faster (5,374 s of read thread-time with it
-against 5,539 s without, inside the run-to-run spread) but it ends the load with
-~39 GiB of page cache instead of ~330 GiB, which leaves room for the host experts
-the next phase pins. It is off by default because each call costs real time on a
-FUSE mount.
+The loader never reads an uploaded chunk again, but it reads the host-mapped
+weights right after the upload and serves them from the page cache for the rest
+of the run, and page cache is charged to the cgroup. So by default each uploaded
+chunk's page cache is released once the chunk is on the device exactly when the
+upload plus the host-mapped weights plus 8 GiB exceed the host allowance (the
+cgroup limit), and kept otherwise or when the allowance is unknown. The load
+prints the decision with its numbers:
+
+```text
+[dsv4] load page cache: dropping each uploaded chunk's page cache (automatic: 263.0 GiB upload + 151.2 GiB host-mapped + 8.0 GiB headroom exceeds the 326.9 GiB allowance; TS_DSV4_LOAD_DROP_CACHE=0 overrides)
+```
+
+Those are the seven-A40 lane's numbers: 414 GiB of reads into a 326.9 GiB
+cgroup. Its load logged the expert prefault at 0.37 GiB/s and the Engram warm at
+0.33 GiB/s, about half the rate the same page walks measured on that VM with the
+cgroup roughly half full (table above). Dropping cannot speed the upload itself,
+which already reads at the storage rate, and costs 5.9-7.3 ms per resident
+64 MiB chunk on that mount (`GgmlOpsDsv4FileWarmBench --drop-cost`, about 25-30 s
+of thread time for 263 GiB). Its gain is expected on the stages after the upload
+and has not yet been measured on a full load; the check is a cold load with the
+default against one with `TS_DSV4_LOAD_DROP_CACHE=0`. The rule stays conditional
+because dropping every time would make each reload of a checkpoint that lives
+entirely on the GPUs cold. `TS_DSV4_LOAD_DROP_CACHE=0` never drops (the previous
+default) and `=1` always drops. On the eight-A40 box, `=1` did not change the
+upload's read thread-time (5,374 s against 5,539 s, inside the run-to-run spread)
+and ended the load with ~39 GiB of page cache instead of ~330 GiB.
 
 One caveat when timing this yourself: on a box whose page cache is already full of
 the checkpoint, a load can be SLOWER than one that starts with an empty cache,

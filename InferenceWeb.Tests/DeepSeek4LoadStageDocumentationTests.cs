@@ -110,6 +110,32 @@ public class DeepSeek4LoadStageDocumentationTests
     }
 
     [Fact]
+    public void DropCacheRow_DefaultsToTheAutomaticRule_AndTheCardsQuoteItsLogLine()
+    {
+        string root = RepoRoot();
+        string loader = File.ReadAllText(Path.Combine(root, "TensorSharp.GGML.Native/ggml_ops_deepseek4.cpp"));
+        Assert.Matches(@"decide_drop_cache\(\s*getenv\(""TS_DSV4_LOAD_DROP_CACHE""\)", loader);
+
+        var expected = new Dictionary<string, string>
+        {
+            ["docs/env_var_feature_matrix.md"] = "auto",
+            ["docs/env_var_feature_matrix_zh-cn.md"] = "自动",
+        };
+        foreach ((string matrix, string defaultText) in expected)
+        {
+            MatrixRow row = MatrixRows(root, matrix).Single(r => r.Names.SequenceEqual(new[] { "TS_DSV4_LOAD_DROP_CACHE" }));
+            Assert.Equal(defaultText, row.Default);
+            Assert.Contains("`0`", row.Text);
+            Assert.Contains("`1`", row.Text);
+        }
+        // tests/dsv4_file_warm_test.cpp asserts the native text is exactly this line.
+        const string line = "[dsv4] load page cache: dropping each uploaded chunk's page cache (automatic: 263.0 GiB upload + "
+                          + "151.2 GiB host-mapped + 8.0 GiB headroom exceeds the 326.9 GiB allowance; TS_DSV4_LOAD_DROP_CACHE=0 overrides)";
+        foreach (string card in new[] { "docs/models/deepseek41.md", "docs/models/deepseek41_zh-cn.md" })
+            Assert.Contains(line, File.ReadAllText(Path.Combine(root, card)));
+    }
+
+    [Fact]
     public void ModelCards_DescribeThePreadWarmInBothLanguages()
     {
         string root = RepoRoot();
