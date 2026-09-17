@@ -492,7 +492,7 @@ GgmlMetal、进程内 legacy-vs-batched 切换；详见
 ### 投机解码被拒绝
 
 Nemotron-H 不做投机解码：`--draft-model` 不会挂载 DSpark/DFlash 草稿器（Nemotron 3.5
-Lightning 的 `NVFP4-DSpark` GGUF 会被识别并报告“未挂载”），`--spec` 或
+Lightning 的 `NVFP4-DSpark` GGUF 会被识别并报告“未挂载”；服务器在 `--draft-model` 指定它时会在启动阶段失败并提示去掉该参数），`--spec` 或
 `--spec-type ngram` 也只提供普通解码，并打印一次警告。原因是正确性：投机输出必须与普通贪心解码一致，
 而在这个主干上，多 token verify 与单 token decode 使用不同的注意力内核（基于展开缓存的主机端注意力 vs.
 flash-attention decode 内核）和不同的 MoE 内核（按专家批处理 vs. 逐 token 内核）。在 `nemotron_h_moe`

@@ -676,7 +676,8 @@ the path. Now exposed as a method getter (same pattern as Qwen 3.5).
 
 Nemotron-H does not speculate: `--draft-model` does not attach a DSpark/DFlash
 drafter (the Nemotron 3.5 Lightning `NVFP4-DSpark` GGUF is recognized and
-reported as not attached), and `--spec` or `--spec-type ngram` serve plain
+reported as not attached; the server stops at startup when `--draft-model` names
+one, saying to drop the flag), and `--spec` or `--spec-type ngram` serve plain
 decoding with a one-time warning. The reason is correctness. A speculative
 stream must equal plain greedy decoding, and on this trunk the multi-token
 verify and the single-token decode use different attention kernels (host

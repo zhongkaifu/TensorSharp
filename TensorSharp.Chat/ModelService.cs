@@ -80,6 +80,10 @@ namespace TensorSharp.Server
         /// </summary>
         public string DraftHeadActivationError => _lifecycle.DraftHeadActivationError;
 
+        /// <summary>The draft was not activated because the loaded model refuses
+        /// speculation (see <see cref="ModelLifecycleService.DraftHeadRefusedByModel"/>).</summary>
+        public bool DraftHeadRefusedByModel => _lifecycle.DraftHeadRefusedByModel;
+
         /// <summary>
         /// Legacy compatibility shim. The engine owns KV state, so no server
         /// session is ever active in the model.
