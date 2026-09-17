@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Security.Cryptography;
+using TensorSharp.GGML;
 using TensorSharp.Models;
 using TensorSharp.Runtime;
 using TensorSharp.Runtime.Speculative;
@@ -167,6 +168,10 @@ public sealed class DeepSeek41DsparkIntegrationTests(ITestOutputHelper output)
             Assert.Equal(256, model.Config.VocabSize);
             Assert.True(model.SpeculationProfitable);
             Assert.True(model.SupportsPerSequenceFusedForward);
+            // Speculative prefill chunks to the width the native loader runs,
+            // read back from it rather than assumed from the request.
+            Assert.Equal(32, GgmlDeepSeek4Native.UBatch(model.NativeHandle));
+            Assert.Equal(GgmlDeepSeek4Native.UBatch(model.NativeHandle), model.SpecPrefillChunkSize);
             return model;
         }
         catch { model.Dispose(); throw; }

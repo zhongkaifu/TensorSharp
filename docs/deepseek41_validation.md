@@ -688,6 +688,83 @@ Artifact: `/workspace/deepseek41-work/native-sparse-fa-16k-crossover.log`.
 The expanded 12-shape test passed in the combined CTest suite. It compares
 35,913,728 output values per CUDA path with the independent oracle.
 
+Everything above describes ggml's flash-attention kernel with the
+`ggml_flash_attn_ext_set_n_kv_max` hint, which is what V4.1 on CUDA ran when
+this experiment and the full-checkpoint profiles (including the 19.985/80.240 s
+long-prompt TTFT) were recorded with the initial V4.1 support (`3347b06b`). V4.1
+on CUDA now runs TensorSharp's owned F32 attention instead, whose sparse prefill
+is a different kernel with a different gate, described next.
+
+### Owned F32 sparse prefill (default)
+
+The owned attention (`tsg_attention_f32_on_backend`) gives a launch a sparse
+capacity of `n_swa + indexer_top_k` = 640 keys when it has **more than 8 queries
+and at least 8,192 keys** (`tsg_dsv41_owned_sparse_capacity` in
+`ggml_ops_precision_policy.h`). A mask compaction lists each query's finite keys
+in order and one F32 online-softmax partition per row attends to them; a row
+with more finite keys than the capacity scans every key instead. One to eight
+queries -- decode and every DSpark verify -- keep the split-key kernel, so a
+verify still commits exactly the rows single-token decode would; shorter keys
+keep the tiled SGEMM kernel. The gate is on by default; `TS_DSV41_SPARSE_FA=0`
+restores tiled prefill. The ggml flash-attention hint above keeps its own gate
+(one query or at least 16,384 keys) and stays opt-in with `=1`.
+
+Before this change the owned kernel was sparse only with `TS_DSV41_SPARSE_FA=1`
+and above 4 queries, and it partitioned a sparse row into up to 16 key splits
+when fewer than 512 query rows shared the launch. A sparse row now always has
+one partition, so its arithmetic no longer depends on the launch width; every
+V4.1 launch that took the sparse kernel before (64 heads, so at least 576 rows)
+already had one.
+
+Measured on one A40 (GPU 2 of the 7x A40 VM, load average 16-26 from other
+tenants), 64 heads, head width 512, 640 visible keys per query, each arm checked
+against a decomposed F32 reference with `atol = rtol = 6e-6`:
+
+```bash
+GgmlOpsCudaAttentionPrecisionTest --benchmark-dsv41-prefill QUERIES KEYS 64 REPEATS
+TS_DSV41_SPARSE_FA=0 GgmlOpsCudaAttentionPrecisionTest --benchmark-dsv41-prefill QUERIES KEYS 64 REPEATS
+```
+
+| Queries | Keys | Default (kernel) | `TS_DSV41_SPARSE_FA=0` (kernel) | Default max abs / rel L2 |
+|---:|---:|---:|---:|---:|
+| 512 | 8,960 | 34.4 ms (sparse) | 106.8 ms (tiled) | 1.4e-7 / 7.5e-7 |
+| 512 | 33,536 | 34.1, 34.3 ms (sparse) | 1,548.5, 1,547.2 ms (tiled) | 1.1e-7 / 7.4e-7 |
+| 512 | 66,304 | 34.8 ms (sparse) | 6,864.6 ms (tiled) | 1.4e-7 / 7.5e-7 |
+| 1,024 | 33,536 | 68.2 ms (sparse) | 3,059.5 ms (tiled) | 1.4e-7 / 7.4e-7 |
+| 6 | 33,536 | 9.23 ms (split-key) | 9.25 ms (split-key) | 5.6e-8 / 5.6e-7 |
+
+Medians of 5 (default) and 3 (`=0`) samples after 3 warmups; the 33,536-key
+row was run twice, alternating arms. The tiled kernel's maximum error was
+8.9e-8 or less. The last row is a DSpark-verify-width launch: both settings
+select the same kernel.
+
+`attention_precision_test` (CTest `cpu-explicit-f32-attention`,
+`cuda-explicit-f32-attention`) adds two checks. A gate check: capacity 0 for 1-8
+queries at any key count, 640 for 9+ queries at 8,192 keys, 0 at 8,191 keys and
+0 with the variable `0`. A sparse invariance check at 8,960 keys and 64 heads:
+query 0 alone, inside 9 queries and inside 512 queries is bit-identical (head
+width 512 on CUDA, 8 on the CPU reference path). The same query through the
+decode kernel differs in 31,198 of 32,768 outputs on CUDA (max abs 5.2e-8),
+which is why verify widths stay on the decode kernel. Without the one-partition
+rule the CPU check fails (query 0 of 9 differs from query 0 alone in 221 of 512
+outputs).
+
+On the deterministic V4.1 text fixture on one CUDA A40
+(`eng/tests/dsv41-inference.py --long-sparse-tokens 8500 --long-sparse-context
+16384`, 256-token vocabulary, ubatch 32), an 8,500-token prompt reaches 16,640
+attention keys. Default against `TS_DSV41_SPARSE_FA=0`, each a fresh load: the
+prefill logits and 32 greedy decode steps differed by at most 1.19e-6 (atol
+2e-5), the logits were not bit-identical (the sparse kernel ran), and the 32
+greedy tokens were identical. Below 8,192 keys the fixtures are byte-identical
+to the `06665adc` library: 1,341 logit rows each for CPU, CUDA and CUDA with
+`--cpu-moe 2`, and every native array of the DSpark fixture (155 arrays over
+prefixes 1/5/17 plus the state checks). Both libraries miss the same
+`draft_confidence_prefix5` tolerance (max abs 1.03e-4), so that miss predates
+this change.
+
+These are operator and fixture measurements; the full-checkpoint time to first
+token with this default has not been measured yet.
+
 ## Independent numerical reference
 
 `eng/dsv41-reference.py` evaluates the GGUF weights with independent PyTorch

@@ -45,6 +45,10 @@ namespace TensorSharp.GGML
 
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int TSGgml_Dsv4UBatch(IntPtr handle);
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         private static unsafe partial int TSGgml_Dsv4ForwardSpec(IntPtr handle, int* tokens, int nTokens, float* logitsOut);
 
         [LibraryImport(DllName)]
@@ -139,6 +143,15 @@ namespace TensorSharp.GGML
         /// <summary>No routed-expert offload — what an unspecified policy means.</summary>
         public const int CpuMoeNone = 0;
 
+        /// <summary>
+        /// <c>nUbatch</c> value asking the loader to choose the prefill width: on
+        /// accelerators it evaluates 1024, 512 and 256 and keeps the widest that
+        /// needs no more routed-expert CPU offload than 256 (the CPU device keeps
+        /// 256). Not 0, which already means 512. Read the choice back with
+        /// <see cref="UBatch"/>.
+        /// </summary>
+        public const int UBatchAuto = -1;
+
         public static IntPtr LoadModel(string ggufPath, int nGpu, int nCtx, int nUbatch, int nThreads,
             int nCpuMoe = CpuMoeNone, string backendName = null)
             => TSGgml_Dsv4LoadModel(ggufPath, nGpu, nCtx, nUbatch, nThreads, nCpuMoe, backendName ?? string.Empty);
@@ -153,6 +166,11 @@ namespace TensorSharp.GGML
         /// <summary>Tokens the DSpark drafter proposes per block, or 0 when no
         /// drafter is loaded.</summary>
         public static int DsparkBlockSize(IntPtr handle) => TSGgml_Dsv4DsparkBlockSize(handle);
+
+        /// <summary>The prefill micro-batch the loaded model runs: the requested
+        /// width, or the loader's choice for <see cref="UBatchAuto"/>; 0 for a
+        /// null handle.</summary>
+        public static int UBatch(IntPtr handle) => handle == IntPtr.Zero ? 0 : TSGgml_Dsv4UBatch(handle);
 
         /// <summary>Trunk forward returning logits for EVERY row (the
         /// speculative verify). Advances the cache like Forward.</summary>

@@ -213,7 +213,7 @@ V4.1 的服务路径是一套原生 `ggml_cuda` 计算图，另有 `ggml_cpu` �
 | 变量 | 适用范围 | 作用 | 默认值 | 在矩阵中 |
 |---|---|---|---|---|
 | `TS_DSV4_NGPU` | V4 与 V4.1 | 按层切分把整层铺到几张 GPU 上——对这两个架构来说，`--tp N` 设置的就是它。`0` 表示使用所有可见设备 | `0`（全部可见） | 否 |
-| `TS_DSV4_UBATCH` | V4 与 V4.1 | Prefill 微批宽度 | 保守配置为 `256`；八卡 A40 的实测 V4.1 配置用 `1024` | 否 |
+| `TS_DSV4_UBATCH` | V4 与 V4.1 | Prefill 微批宽度。不设置时，V4.1 在 ggml GPU 后端上由原生加载器在 1024、512、256 中选择：取所需路由专家 CPU 层数不多于 256（或显式 `--n-cpu-moe`）的最宽者，并记录为 `[dsv4] prefill ubatch: N (auto; ...)`。驻留 GPU 的路由专家层每个分块的耗时在各宽度下相近，因此越宽每个 prefill token 越便宜。任何显式的正整数都原样使用并关闭自动选择；`256` 恢复此前固定的 V4.1 默认值 | V4.1：ggml GPU 后端上自动，CPU 执行器与 direct CUDA 为 `256`；V4：`1024`（纯 C# 执行器为 `512`） | 否 |
 | `TS_DSV4_THREADS` | V4 与 V4.1 | 纯 GPU 加载时的原生线程池。CPU 专家卸载改用探测到的可用并行度，由 `--cpu-moe-threads N` / `TS_CPU_MOE_THREADS` 设定。在纯 C# 的 `--backend cpu` 执行器上，它设定的是该执行器自己的工作线程池，默认取 `ProcessorCount` 而不是 min(核数, 32) | min(核数, 32) | 否 |
 | `TS_DSV4_PERF` | V4 与 V4.1 | `1` 打印分阶段耗时 | 关 | 否 |
 | `TS_DSV4_VRAM_RESERVE_MB` / `TS_DSV4_GRAPH_CACHE` / `TS_DSV4_LOAD_THREADS` / `TS_DSV4_LOAD_CHUNK_MB` / `TS_DSV4_MOE_MMAP` | V4 与 V4.1 | 放置余量、计算图缓存深度、权重加载并行度，以及驻留主机的专家是否直接在 GGUF 映射上就地相乘 | 见各卡片 | 否 |
@@ -229,7 +229,7 @@ V4.1 的服务路径是一套原生 `ggml_cuda` 计算图，另有 `ggml_cpu` �
 | `TS_DSV4_WARM_PREAD` | V4 与 V4.1，主机映射 | 加载时如何预热映射的主机权重：主机专家预取（`--n-cpu-moe`）以及 V4.1 的 Engram 预热（同步与后台）。未设置或 `1` 用 `pread` 读取文件区间：64 MiB 为块，每个 `TS_DSV4_LOAD_THREADS` 线程一段连续区间，跳过 `mincore` 报告已驻留的块，读取错误会给出分片与偏移。`0` 原样恢复逐页触碰遍历（预取为 256 MiB 段、Engram 为 8 MiB 块，均从共享游标分发）。七卡 A40 虚拟机上已逐出的 8 GiB 区间：2.24–2.54 GiB/s，逐页遍历为 0.62–0.74 GiB/s；`MADV_WILLNEED`、`POSIX_FADV_WILLNEED` 与 `readahead(2)` 在那里只让 128 KiB 驻留，不能替代读取 | 开 | 否 |
 | `TS_DSV4_LOAD_DROP_CACHE` | V4 与 V4.1 | 每个权重分块上传到设备后是否释放它的页缓存。未设置时自动判断：当上传字节数加上主机映射的权重（专家、Engram 表）再加 8 GiB 超过主机额度（cgroup 上限）时释放，否则保留，额度未知时也保留，因此纯 GPU 驻留的检查点重新加载时仍是热的；加载时会打印这一判断及三个数值。`1` 总是释放，`0` 从不释放（此前的默认）。七卡 A40 通道（上传 263.0 GiB + 映射 151.2 GiB，对比 326.9 GiB）会释放。在 MooseFS 挂载上释放每个已驻留的 64 MiB 分块耗时 5.9–7.3 ms，也无法让上传本身变快；预期收益在其后的预取与 Engram 预热上 | 自动 | 否 |
 | `TS_DSV41_REWIND_CHECKPOINT` | V4.1，原生执行器 | `0` 去掉逐槽位的回退检查点（在每个 prompt 边界对原始滑动窗口环与压缩器状态环做的影子拷贝）。没有它，部分 KV 复用最多只能回退到活动环还覆盖的位置——发布的 checkpoint 上是 385 个位置——多轮思考对话因此会重新 prefill。每个序列槽位约占 21 MiB 显存 | 开 | 否 |
-| `TS_DSV41_SPARSE_FA` | V4.1 | `1` 选择稀疏 flash attention。需显式开启，与稠密路径存在已记录的浮点差异 | 关 | 否 |
+| `TS_DSV41_SPARSE_FA` | V4.1 | 稀疏 prefill attention。在自有 F32 CUDA 路径上**默认开启**，作用于超过 8 个 query、至少 8,192 个 key 的调用：每个 query 只关注它的滑动窗口加索引器选中的行（最多 640 个 key），而不是全部 key。A40 上 512 个 query × 33,536 个 key 实测 34 ms，分块（tiled）为 1,548 ms，二者与 F32 参考的偏差都在 1.5e-7 以内；decode、DSpark verify 与更短的提示词保持稠密内核、逐位不变。`0` 恢复分块 prefill。`1` 另外让 ggml flash attention 路径（非 CUDA GPU、CPU 后端）在单个 query 或至少 16,384 个 key 时使用其掩码压缩内核，该内核有已记录的 F16 差异 | 自有 CUDA 路径默认开；ggml flash attention 默认关 | 否 |
 | `TS_DSV41_COMPACT_RAW_GATHER` | V4.1 | `1` 为原始滑动窗口选择紧凑 gather。同样需显式开启，同样有浮点差异 | 关 | 否 |
 | `TS_DSV41_ALLOW_NON_CUDA_GPU` | V4.1 | `1` 允许 `ggml_vulkan` / `ggml_metal`：普通计算图跑在 GPU 上，只有架构专属算子回退到 CPU 后端，每次都要一次主机往返。之所以需要显式开启，是因为它解除的那道拒绝原本挡住的是*静默*回退 | 关 | 否 |
 | `TS_DSV41_VISION_FA` / `TS_DSV41_VISION_BF16_GEMM` | V4.1 视觉伴随文件 | `TS_DSV41_VISION_FA=1` 让图像编码器使用 F16 中间量的 flash attention（真实图像上的特征差异更大）；`TS_DSV41_VISION_BF16_GEMM=0` 选择诊断用的 F32 提升矩阵路径 | 稠密 F32 注意力，BF16 GEMM + F32 累加 | 否 |
