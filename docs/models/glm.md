@@ -658,6 +658,13 @@ and `Reset` wipes the state along with the position counter. The one exact
 taken before every verify batch and copied back when part of the window is
 rejected (see [speculative decoding](#speculative-decoding-on-glm-53-flash)).
 
+A KV rewind the native executor refuses (a target past the slot's head, any
+glm5next rewind other than to 0 or to the head, or a slot whose KDA restore
+failed) reaches the caller as a refusal on both glm-dsa and glm5next:
+`TryTruncateKVCache` returns false, so the engine re-prefills instead of reusing,
+and the non-refusable `TruncateKVCache` throws. It used to report success with
+the head unmoved (`GlmTruncateRefusalTests`).
+
 ### Native local tensor parallelism
 
 Omitting `--tp` keeps the automatic layer split across every visible GPU.

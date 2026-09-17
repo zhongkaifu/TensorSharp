@@ -337,6 +337,7 @@ namespace TensorSharp.Models
             if (_fusedArrays != null && _fusedArrays.CacheCapacity != _kvCacheCapacity)
             {
                 GgmlBasicOps.MuseGlimmerResetDecodeCache();
+                CountDecodeGraphReset();
                 BuildFusedArrays();
             }
             return _fusedArrays;
@@ -481,7 +482,10 @@ namespace TensorSharp.Models
         private void ResetFusedDecodeCache()
         {
             if (IsGgmlBackend)
+            {
                 GgmlBasicOps.MuseGlimmerResetDecodeCache();
+                CountDecodeGraphReset();
+            }
         }
     }
 }

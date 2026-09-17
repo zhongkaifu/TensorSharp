@@ -163,6 +163,7 @@ namespace TensorSharp.Models
             if (!IsGgmlBackend || !IsTensorParallel)
                 return;
             GgmlBasicOps.Qwen35ResetDecodeCache();
+            CountDecodeGraphReset();
             _tpFdBuiltCapacity = -1;
         }
 

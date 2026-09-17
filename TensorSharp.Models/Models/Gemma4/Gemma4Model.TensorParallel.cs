@@ -545,6 +545,7 @@ namespace TensorSharp.Models
             {
                 GgmlBasicOps.Gemma4ResetDecodeCache();
                 GgmlBasicOps.Gemma4MoEResetDecodeCache();
+                CountDecodeGraphReset();
                 BuildGemma4TpDecodeArrays();
             }
             Console.WriteLine($"Expanded Gemma4 TP cache to {newCapacity} tokens ({tp} GPUs).");

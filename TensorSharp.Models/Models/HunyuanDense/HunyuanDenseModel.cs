@@ -71,6 +71,12 @@ namespace TensorSharp.Models
 
         protected override bool SupportsSplitGateUpFfn => true;
 
+        /// <summary>A plain GQA linear cache: layer count, head geometry and dtype are the
+        /// whole identity of what a snapshot of it holds.</summary>
+        public override string KVStateFingerprint =>
+            $"hunyuan-dense|arch={Config.Architecture}|L={Config.NumLayers}|H={Config.NumHeads}|KV={Config.NumKVHeads}" +
+            $"|kL={_attnKeyLen}|vL={_attnValLen}|rope={_ropeDim}|dtype={_kvCacheDtype.ToShortString()}";
+
         public override void PrepareForPrefill(int requiredContextTokens)
             => EnsureCacheCapacity(requiredContextTokens);
 
@@ -260,8 +266,8 @@ namespace TensorSharp.Models
 
         public override bool SupportsKVStateSnapshot => _kvCacheK != null && _kvCacheV != null;
 
-        public override string KVStateFingerprint =>
-            $"hunyuan-dense|L={Config.NumLayers}|H={Config.NumHeads}|KV={Config.NumKVHeads}|kL={_attnKeyLen}|vL={_attnValLen}|dtype={_kvCacheDtype.ToShortString()}";
+        // KVStateFingerprint is declared with the model's other overrides above (it also
+        // carries the architecture and RoPE dimension).
 
         public override long ComputeKVBlockByteSize(int tokenCount)
             => KvBlockTransfer.ComputeBlockByteSize(_kvCacheK, _kvCacheV, tokenCount);

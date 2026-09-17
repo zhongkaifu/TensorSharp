@@ -155,7 +155,32 @@ namespace TensorSharp.Models
 
         /// <summary>
         /// The native executor rewinds by position only — the MLA and indexer
-        /// caches are plain per-position rows, so dropping the tail is exact.
+        /// caches are plain per-position rows, so dropping the tail is exact — but
+        /// it can still REFUSE: a target past the slot's head, any rewind on
+        /// glm5next other than to 0 or to the head (its KDA recurrence cannot go
+        /// back), or a slot whose KDA restore failed. The refusal is reported, never
+        /// swallowed. This used to be a void override, so the base
+        /// <see cref="ModelBase.TryTruncateKVCache"/> answered true with the head
+        /// where it was, and the caller decoded the rest of the turn against
+        /// positions it believed it had dropped.
+        /// </summary>
+        protected override bool TryTruncateKVCacheCore(int tokenCount)
+        {
+            if (!UsesNativeExecutor)
+                return base.TryTruncateKVCacheCore(tokenCount);
+            lock (_nativeSync)
+            {
+                if (!GgmlGlmNative.Rewind(_native, tokenCount))
+                    return false;
+                _cacheSeqLen = tokenCount;
+                return true;
+            }
+        }
+
+        /// <summary>
+        /// The non-refusable form, for callers with no re-prefill fallback. A
+        /// native refusal throws rather than returning with the head where it was
+        /// (the contract DeepSeek V4.1 and Gemma 4 keep).
         /// </summary>
         protected override void TruncateKVCacheCore(int tokenCount)
         {
@@ -164,10 +189,11 @@ namespace TensorSharp.Models
                 base.TruncateKVCacheCore(tokenCount);
                 return;
             }
-            lock (_nativeSync)
+            if (!TryTruncateKVCacheCore(tokenCount))
             {
-                if (GgmlGlmNative.Rewind(_native, tokenCount))
-                    _cacheSeqLen = tokenCount;
+                throw new InvalidOperationException(
+                    $"{Config.Architecture} cannot truncate its KV cache to {tokenCount} tokens " +
+                    $"(head at {_cacheSeqLen}). Use TryTruncateKVCache and re-prefill when it declines.");
             }
         }
 

@@ -154,6 +154,34 @@ public sealed class DeepSeekSlotRetentionTests
         Assert.Equal(17, native.Heads[0]);
     }
 
+    [Fact]
+    public void KeyParameterisedRetain_MovesTheRequestsSlotUnderThePayloadKeyAndDonatesItBack()
+    {
+        // The radix prefix cache retains under a tree-minted key, never the request id (I10).
+        var native = new Slots(0, (0, 4411));
+        var requests = new Dictionary<string, int> { ["request"] = 0 };
+        var retained = new Dictionary<string, int>();
+        string active = "request", selected = null;
+        Assert.True(DeepSeek4Model.RetainNativeSequence(requests, retained, "request", "pc:1:7",
+            ref active, ref selected, 1UL << 30, native));
+        Assert.Empty(requests);
+        Assert.Equal(0, retained["pc:1:7"]);
+        Assert.False(retained.ContainsKey("request"));
+        Assert.Null(active);
+        Assert.Equal("pc:1:7", selected);
+        // A second retain under the same key is refused and consumes nothing.
+        requests["other"] = 5;
+        native.Heads[5] = 9;
+        Assert.False(DeepSeek4Model.RetainNativeSequence(requests, retained, "other", "pc:1:7",
+            ref active, ref selected, 1UL << 30, native));
+        Assert.Equal(5, requests["other"]);
+        // Donation re-keys the payload to the next request, which is then the active one.
+        Assert.True(Rebind(requests, retained, "pc:1:7", "next", ref active, ref selected, native));
+        Assert.Equal("next", active);
+        Assert.Null(selected);
+        Assert.Empty(native.Mutations);
+    }
+
     private static bool Retain(Dictionary<string, int> requests, Dictionary<string, int> retained,
         string key, ref string active, ref string selected, Slots native)
         => DeepSeek4Model.RetainNativeSequence(requests, retained, key, ref active, ref selected, 1UL << 30, native);

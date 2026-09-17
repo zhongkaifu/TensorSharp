@@ -553,6 +553,8 @@ dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj --filter "Category=Benc
 
 门控测试在前提条件缺失时会报告为**已跳过**（被跳过的 `[Theory]` 只计一次，不按数据行展开），因此在没有相应硬件/权重的机器上，绿色结果会显示为"N 通过，M 跳过"，而不是静默通过从未执行的测试。少数前提条件复杂的测试类（多个环境变量、按方法选择模型）仍在测试体内做门控，并保留显式的 `[Trait("Requires", ...)]` 标注。
 
+基数树前缀缓存的树级性质测试（`InferenceWeb.Tests/PrefixCache/TreeTraceHarnessTests.cs`，trait 为 `Category=PrefixCacheProperty`）默认运行 1,000 个带种子的操作序列，属于可移植测试分组。三个仅供测试使用的环境变量控制它：`PREFIX_CACHE_TREE_SEEDS=20000` 运行完整的 20,000 个种子，`PREFIX_CACHE_TREE_SEED_START=<n>` 设置种子起点，`PREFIX_CACHE_SEED=<n>` 重放单个失败的种子。树操作的时延与分配门槛由 [`benchmarks/RadixTreeBench`](benchmarks/RadixTreeBench/README.md) 检查，它不需要加载模型。
+
 ### 服务端集成测试
 
 TensorSharp.Server 的集成测试位于 `TensorSharp.Server/testdata/`。测试覆盖所有三种 API 风格（Web UI SSE、Ollama、OpenAI）、多轮对话、思维链模式、工具调用、结构化输出、队列状态兼容、并发请求和中断支持。架构特定能力（思维链、工具调用）会自动检测，当前模型不支持时会自动跳过。

@@ -596,6 +596,8 @@ dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj --filter "Category=Benc
 
 Gated tests report as **Skipped** when their prerequisite is missing (a skipped `[Theory]` counts once, not per data row), so a green run on a bare box reads "N passed, M skipped" rather than silently passing tests that never executed. A few classes with compound prerequisites (multiple env vars, per-method model choice) still gate inside the test body and keep explicit `[Trait("Requires", ...)]` lines.
 
+The radix prefix-cache tree harness (`InferenceWeb.Tests/PrefixCache/TreeTraceHarnessTests.cs`, trait `Category=PrefixCacheProperty`) runs 1,000 seeded traces by default and is part of the portable lane. Three test-only variables control it: `PREFIX_CACHE_TREE_SEEDS=20000` runs the full 20,000-seed run, `PREFIX_CACHE_TREE_SEED_START=<n>` offsets the seed range, and `PREFIX_CACHE_SEED=<n>` replays one seed that failed. The tree's latency and allocation gates live in [`benchmarks/RadixTreeBench`](benchmarks/RadixTreeBench/README.md), which needs no model.
+
 ### Server integration tests
 
 Integration tests for TensorSharp.Server are in `TensorSharp.Server/testdata/`. They cover all three API styles (Web UI SSE, Ollama, OpenAI), multi-turn conversations, thinking mode, tool calling, structured outputs, queue-status compatibility, concurrent requests, and abort support. Architecture-specific features (thinking, tool calling) are auto-detected and skipped when the active model does not support them.

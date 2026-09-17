@@ -1034,6 +1034,7 @@ namespace TensorSharp.Models
                 GgmlBasicOps.Gemma4ResetBatchedDecodeCache();
                 GgmlBasicOps.Gemma4MoEResetDecodeCache();
                 GgmlBasicOps.Gemma4ResetMoEBatchedDecodeCache();
+                CountDecodeGraphReset();
             }
             DisposeSwaPrevWindows();
             if (_kvCacheK == null) return;
@@ -1419,6 +1420,7 @@ namespace TensorSharp.Models
                 GgmlBasicOps.Gemma4ResetBatchedDecodeCache();
                 GgmlBasicOps.Gemma4MoEResetDecodeCache();
                 GgmlBasicOps.Gemma4ResetMoEBatchedDecodeCache();
+                CountDecodeGraphReset();
             }
 
             // The fused MoE whole-model decode (TryFusedMoEModelDecode) writes the KV
@@ -2035,6 +2037,7 @@ namespace TensorSharp.Models
                 GgmlBasicOps.Gemma4ResetBatchedDecodeCache();
                 GgmlBasicOps.Gemma4MoEResetDecodeCache();
                 GgmlBasicOps.Gemma4ResetMoEBatchedDecodeCache();
+                CountDecodeGraphReset();
             }
 
             int startPos = _cacheSeqLen;
@@ -4176,7 +4179,10 @@ namespace TensorSharp.Models
             // CUDA-graph-captured decode graph. Drop it so the next plain-step decode
             // rebuilds + re-captures against the post-verify pool state.
             if (_backend == BackendType.GgmlCuda)
+            {
                 GgmlBasicOps.Gemma4MoEResetDecodeCache();
+                CountDecodeGraphReset();
+            }
 
             // The kernel reads/writes the KV cache through the cached _decodeArrays
             // K/V pointers, which are only repointed on cache growth or an explicit

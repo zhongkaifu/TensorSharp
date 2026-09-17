@@ -1196,7 +1196,10 @@ namespace TensorSharp.Models
             // any state reset/rebuild must force a re-seed before the next fused decode.
             _bfdPoolSeeded = false;
             if (_backend == BackendType.GgmlCuda)
+            {
                 GgmlBasicOps.Qwen35ResetBatchedDecodeCache();
+                CountDecodeGraphReset();
+            }
             // CUDA/Vulkan persistent graphs still use their established hard-drop
             // lifecycle. Metal can retain its graph across a logical state change:
             // the next replay receives an explicit reseed flag and uploads the
@@ -1212,7 +1215,10 @@ namespace TensorSharp.Models
             // call sites reset it explicitly via InvalidateVerifyCache().
             if (_backend == BackendType.GgmlCuda || _backend == BackendType.GgmlVulkan
                 || (_backend == BackendType.GgmlMetal && hardBindings))
+            {
                 GgmlBasicOps.Qwen35ResetDecodeCache();
+                CountDecodeGraphReset();
+            }
         }
 
         /// <summary>Drop the persistent fused-verify graph cache (it pins the KV +
@@ -1503,6 +1509,7 @@ namespace TensorSharp.Models
                     {
                         _fdUnsupported = true;
                 GgmlBasicOps.Qwen35ArenaResetBatchedDecodeCache();   // flush stranded arena slots to host
+                        CountDecodeGraphReset();
                         return FdBail($"layer {l} ({(_isRecurrent[l] ? "recurrent" : "attention")}, moe={isMoeL}) missing a required weight/state" +
                             (!_isRecurrent[l] && _kvCacheK[l] != null && !IsFusedGraphKvCacheDType(_kvCacheK[l].ElementType)
                                 ? $" (KV cache dtype {_kvCacheK[l].ElementType} unsupported by fused graph on {_backend})"
@@ -1524,6 +1531,21 @@ namespace TensorSharp.Models
             if (_fdConvScratch == IntPtr.Zero)
             {
                 _fdConvScratch = AllocateConvScratch();
+                _fdStateResident = false;
+            }
+
+            // The conv scratch is per-request-cache state: a holder brings its own and
+            // the per-seq fused path swaps _fdConvScratch with it. The primary cache
+            // gets one the first time IT decodes, which is not necessarily the model's
+            // first fused decode: when a holder ran that one, the one-time gate above
+            // is already past and the primary had none (its first decode wrote the
+            // conv reseed through a null pointer).
+            if (_fdConvScratch == IntPtr.Zero)
+            {
+                int gdnLayers = 0;
+                foreach (int slot in _fdGdnSlot)
+                    if (slot >= 0) gdnLayers++;
+                _fdConvScratch = Marshal.AllocHGlobal(Math.Max(1, gdnLayers) * convDim * qkvDim * sizeof(float));
                 _fdStateResident = false;
             }
 
@@ -1767,6 +1789,7 @@ namespace TensorSharp.Models
                 }
                 _fdUnsupported = true;
                 GgmlBasicOps.Qwen35ArenaResetBatchedDecodeCache();   // flush stranded arena slots to host   // don't retry a failing kernel every token
+                CountDecodeGraphReset();
                 return false;
             }
 

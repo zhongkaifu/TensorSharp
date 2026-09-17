@@ -77,6 +77,10 @@ namespace TensorSharp.Models
             public float[] Logits;
             public bool Retired;
             public bool DisposalStarted;
+            // The holder has been an active cache on a GPU backend, so its K/V and
+            // recurrent state have device copies besides the host bytes (the prefix
+            // cache's MeasureEndState charges both). Copies and imports start without.
+            public bool DeviceMirrored;
         }
 
         // Per-request fused-decode holders, keyed by RequestId.
@@ -253,6 +257,7 @@ namespace TensorSharp.Models
             FdStateResident = _fdStateResident,
             GdnHostDirty = _gdnStateHostDirty,
             ArenaStateResident = _arenaStateResident,
+            DeviceMirrored = KeepsDeviceKvMirrors,
         };
 
         private void LoadCacheHolder(Qwen35KvCacheHolder h)
@@ -475,13 +480,18 @@ namespace TensorSharp.Models
         /// arena slot intentionally remains registered: it is keyed by the holder's
         /// stable storage pointer, so a later rebind can continue in place; normal
         /// arena eviction flushes it back to the same holder before retiring it.</summary>
-        public bool RetainSequenceCache(string requestId)
+        public bool RetainSequenceCache(string requestId) => RetainSequenceCacheAs(requestId, requestId);
+
+        /// <summary>The key-parameterised form of <see cref="RetainSequenceCache"/>: the finished
+        /// holder of <paramref name="requestId"/> is retained under <paramref name="key"/>
+        /// (the prefix cache's tree-minted payload key, or the request id itself).</summary>
+        public bool RetainSequenceCacheAs(string requestId, string key)
         {
-            if (_fusedHolders == null || string.IsNullOrEmpty(requestId))
+            if (_fusedHolders == null || string.IsNullOrEmpty(requestId) || string.IsNullOrEmpty(key))
                 return false;
             if (!_fusedHolders.TryGetValue(requestId, out var holder))
                 return false;
-            if (_retainedFusedHolders != null && _retainedFusedHolders.ContainsKey(requestId))
+            if (_retainedFusedHolders != null && _retainedFusedHolders.ContainsKey(key))
                 return false;
             _retainedFusedHolders ??= new Dictionary<string, Qwen35KvCacheHolder>(StringComparer.Ordinal);
             _retainedFusedHolders.EnsureCapacity(checked(_retainedFusedHolders.Count + 1));
@@ -500,7 +510,7 @@ namespace TensorSharp.Models
                 }
             }
 
-            _retainedFusedHolders.Add(requestId, holder);
+            _retainedFusedHolders.Add(key, holder);
             _fusedHolders.Remove(requestId);
             return true;
         }
@@ -969,13 +979,16 @@ namespace TensorSharp.Models
             // freed device memory.  Releases are infrequent (one per completed
             // concurrent request), so rebuilding the surviving holders' graphs on
             // their next token is a small price for deterministic lifetime safety.
-            if (IsGgmlBackend)
+            // A batched release (DiscardRetainedCaches) resets once, before its
+            // first disposal, and suppresses the per-holder reset here.
+            if (IsGgmlBackend && _holderGraphResetSuppressed == 0)
             {
                 GgmlBasicOps.Qwen35ResetDecodeCache();
                 // Persistent fused prefill/spec verify graphs bind the same
                 // holder K/V and recurrent-state buffers. Release them before
                 // invalidating those host keys as well.
                 InvalidateVerifyCache();
+                CountDecodeGraphReset();
             }
 
             if (holder.K != null)

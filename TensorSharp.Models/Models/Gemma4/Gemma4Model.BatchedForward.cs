@@ -122,6 +122,7 @@ namespace TensorSharp.Models
                 GgmlBasicOps.Gemma4ResetBatchedDecodeCache();
                 GgmlBasicOps.Gemma4MoEResetDecodeCache();
                 GgmlBasicOps.Gemma4ResetMoEBatchedDecodeCache();
+                CountDecodeGraphReset();
             }
 
             // Disable gate. The batched path is now the DEFAULT for Gemma 4
