@@ -134,6 +134,14 @@ namespace TensorSharp.Runtime.Speculative
             options ??= SpeculationOptions.Disabled;
             declineReason = null;
 
+            // A correctness refusal outranks every algorithm choice: no speculator,
+            // learned or weight-free, may run on a trunk whose verify diverges.
+            if (target.SpeculationRefusal is { } refusal)
+            {
+                declineReason = refusal;
+                return null;
+            }
+
             string name = string.IsNullOrWhiteSpace(options.SpeculatorName)
                 ? Auto
                 : options.SpeculatorName.Trim();

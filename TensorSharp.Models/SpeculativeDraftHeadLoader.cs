@@ -55,6 +55,14 @@ namespace TensorSharp.Models
             if (draftPath == null)
                 return true;
 
+            // A trunk that refuses speculation for correctness refuses every
+            // drafter too; say so instead of loading weights nothing may use.
+            if (model is ISpeculativeTarget { SpeculationRefusal: { } refusal })
+            {
+                error = $"--draft-model '{Path.GetFileName(draftPath)}' is not attached: {refusal}";
+                return false;
+            }
+
             // Block drafters have to participate in model construction so their
             // weights are included in device placement/layer splitting. If the
             // factory already produced a usable one (DSpark or DFlash), the

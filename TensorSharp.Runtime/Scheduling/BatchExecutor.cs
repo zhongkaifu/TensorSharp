@@ -299,6 +299,8 @@ namespace TensorSharp.Runtime.Scheduling
 
                 if (plan.SpeculationUnprofitable)
                     WarnSpeculationUnprofitableOnce();
+                if (plan.SpeculationRefusal != null)
+                    WarnSpeculationRefusedOnce(plan.SpeculationRefusal);
                 LogPlanTransition(plan);
 
                 for (int i = 0; i < plan.Candidates.Count; i++)
@@ -738,6 +740,17 @@ namespace TensorSharp.Runtime.Scheduling
             _ownerTokensInModel = 0;
             _ownerForwardedTokens = 0;
             _liveCacheValid = false;
+        }
+
+        private bool _speculationRefusedWarned;
+
+        private void WarnSpeculationRefusedOnce(string reason)
+        {
+            if (_speculationRefusedWarned) return;
+            _speculationRefusedWarned = true;
+            _logger.LogWarning(
+                "Speculative decoding was requested but the loaded model refuses it: {Reason} "
+                + "Every request is served with plain decoding.", reason);
         }
 
         private void WarnSpeculationUnprofitableOnce()

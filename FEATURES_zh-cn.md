@@ -68,7 +68,7 @@ Muse-Glimmer 有自己的块级草稿模型 **DFlash**：一个独立的 5 层 G
 
 **DFlash2** 是同一套主干加上两处新增，两者都由 GGUF 自身标明，因此同一条代码路径可服务两代草稿器：一是在每个注意力与每个 FFN 子层周围加入分组动态深度卷积（让块扩散式起草无需第二次前向就获得局部的从左到右信号），二是一个候选选择器——它通过两个低秩 `[vocab, r]` 码本，对相邻位置的 top-K 候选做两两打分，并把整块读作在该格状图上的一次游走，于是位置 *i+1* 不再是在不知道 *i* 选了什么的情况下被选出来的。两者都用 `--draft-model` 挂载，文件本身会说明它是哪一代。详见 [speculative_decoding.md](docs/speculative_decoding.md#dflash-and-dflash2)。
 
-**Nemotron 3.5 Lightning 上的 DSpark** 是同一套块级机制，配 NVIDIA 为它发布的 DSpark 模块：官方 `nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DSpark` checkpoint 是一个 6 层的 Qwen3DSparkModel 风格草稿器（SWA-1024、每头的 attention-sink 偏置、在第 2/6/20/30/42/52 层读取主干残差的编码器、把每个草稿位置都以其前一个位置为条件的 rank-512 **Markov 头**，以及一个可选的 bonus-anchor 槽位）。该 GGUF（`dflash` 架构；`eng/nemotron-dspark-to-gguf.py` 可从 safetensors 重建，并与 llama.cpp 的导出逐位核对）用 `--draft-model` 加载；草稿器文件会声明自己带 Markov 头与 sinks，块级前向随即用这条链起草整个块宽——不涉及 DFlash2 的卷积 / 选择器。Nemotron 主干是第一个作为块级起草目标的递归（Mamba-2）主干：`SpecForward` 抽取目标层，执行器在部分接受时对 conv/SSM 状态做快照与回滚，DSpark 窗口默认为 3 个草稿。
+**Nemotron 3.5 Lightning 拒绝投机解码，包括它的 DSpark 草稿器。** 官方 `nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-NVFP4-DSpark` 模块（6 层 SWA-1024、每头 attention sink、rank-512 Markov 头；`eng/nemotron-dspark-to-gguf.py` 可重建 GGUF）能被识别，但 `--draft-model` 不会挂载它，`--spec` / `--spec-type ngram` 也只提供普通解码，并打印一次说明原因的警告。投机解码的约定是输出与普通贪心解码完全一致，而这个混合主干做不到：它的多 token verify 与单 token decode 使用不同的注意力和 MoE 内核，同一批 token 的 logits 在 `ggml_cuda` 上相差 0.2-1.1，在 2026-09-16 验证中让每个单序列请求的贪心选择都发生了翻转；把这些层逐行运行的 verify 可以逐位一致，但 4 行要花 4.1 个普通步（116 ms，对比 28 ms 的 decode 步，另加每个 DSpark 块 70 ms），因此不存在既精确又更快的模式。Mamba-2 的快照 / 回滚本身是精确的。另外，共享的 DFlash attention-sink 路径过去把 sink 加到 softmax 之后的权重上，而不是作为额外的 softmax logit，导致这个草稿器输出噪声（教师强制下 47 个下一 token 猜中 0 个；修复后 17 个）。详见 [speculative_decoding.md](docs/speculative_decoding.md#nemotron-h-refuses-speculation)。
 
 ## 投机解码
 
@@ -84,7 +84,7 @@ Muse-Glimmer 有自己的块级草稿模型 **DFlash**：一个独立的 5 层 G
 |---|---|---|
 | `auto` *（默认）* | checkpoint 自带哪种草稿器就用哪种 | — |
 | `draft-head` | 每次前向出一个 token，走 NextN/MTP 头并把自己的 hidden state 串下去（Qwen 3.6、GLM 5.2、GLM-5.3、Gemma 4 的独立 assistant GGUF） | 是，且与目标模型一一对应 |
-| `block` | 每次前向出一整块，配一个置信度头（DeepSeek V4 DSpark；Muse-Glimmer 与 Qwen 3.8 上的 DFlash / DFlash2；Nemotron 3.5 Lightning 上的 DSpark Markov 头） | 是，且与目标模型一一对应 |
+| `block` | 每次前向出一整块，配一个置信度头（DeepSeek V4 DSpark；Muse-Glimmer 与 Qwen 3.8 上的 DFlash / DFlash2） | 是，且与目标模型一一对应 |
 | `ngram` | 在序列自己的 token 上做后缀匹配——这几个 token 之前出现在哪里、后面跟的是什么？ | **否** |
 
 `ngram` 是与模型无关的那一个：它对**每一个** checkpoint 都可用，包括完全不带草稿器的模型；在答案会引用输入的场景下最强——摘要、编辑、翻译、就文档作答、重复性的结构化输出、含重复标识符的代码、智能体的工具循环。在不带草稿头的 Qwen3.5-9B 上实测（Q8_0、ggml_metal、M5 Pro）：一条"复现这份配置"的提示词跑出 **45.2 tok/s，对比普通 decode 的 31.4（1.44×）**，输出逐字节一致。在自由散文上它找不到可用后缀，每一步都退化成普通 decode，而运行期的成本调控器会让这件事保持廉价。

@@ -70,6 +70,17 @@ namespace TensorSharp.Runtime.Speculative
         /// </summary>
         bool SpeculationProfitable => true;
 
+        /// <summary>
+        /// Non-null when this trunk must not speculate at all, with the reason in
+        /// operator words. Unlike <see cref="SpeculationProfitable"/> (a speed
+        /// judgment) this is a CORRECTNESS refusal: the trunk's multi-token verify
+        /// cannot reproduce the logits its own single-token decode produces, so a
+        /// speculative stream would diverge from plain greedy decoding. The engine
+        /// then serves every request with plain decoding and says why, once.
+        /// Default null (speculation allowed).
+        /// </summary>
+        string SpeculationRefusal => null;
+
         /// <summary>Trunk tokens currently committed to the model's live KV cache.</summary>
         int CacheSeqLen { get; }
 
