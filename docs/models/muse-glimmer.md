@@ -463,6 +463,15 @@ continuations across the A/B envs on the same binary) before it was kept.
   arms when the fused kernel is available; if the fused forward declines while
   the ring is armed, the per-op path throws rather than returning quietly wrong
   logits. `TS_MUSE_GLIMMER_SWA_RING=0` restores uniform sizing.
+* **A rewind on a wrapped ring is bounded by its slack.** Truncating the cache
+  only moves the head; rows the wrap overwrote do not come back, and the next
+  query still attends a whole window behind the new head. So once a sequence
+  is longer than the ring, a rewind is accepted only while
+  `cached - target <= rows - n_swa - 1` (2303 tokens at the default chunk,
+  which covers the engine's 16-token live-cache rewind). A deeper one is refused
+  — `CanTruncateKVCache`/`TryTruncateKVCache` say no and the turn re-prefills,
+  `TruncateKVCache` throws. An unwrapped ring, a uniform cache and a drop to 0
+  rewind to any depth, as before (`KvBlockTransferRingTests`).
 * **The padded KV window is materialized on CUDA only where ggml's own
   flash-attention VEC kernel would be selected** — that kernel misreads a
   truncated-prefix K/V view (all 16 query heads sharing a KV head return the
