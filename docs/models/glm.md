@@ -535,6 +535,15 @@ dropped from the prompt, matching the template's `clear_thinking` default. Tool 
 one XML element per argument (values that were rendered with `tojson` are parsed
 back into numbers / arrays / objects).
 
+Generation also stops on `<|observation|>` (the GGUF's
+`tokenizer.ggml.eom_token_id`, which llama.cpp folds into its end-of-generation
+set): the model writes it right after a tool call, and without the stop it went
+on to invent the tool result. Prompts are split with the `glm4` / `chatglm-bpe`
+pre-tokenizer, which keeps digit runs of up to three; splitting every digit
+instead fed numbers to the model in a shape it was never trained on, and it
+quoted `INV-472` back as `INV-4472`. The split and the token ids are checked
+against the reference `tokenizer.json` (`Glm4TokenizerParityTests`).
+
 ## GLM-5.3 (`glm-dsa`)
 
 GLM-5.3 (not Flash) is the same architecture as GLM-5.2, so everything above
@@ -783,8 +792,16 @@ own top-2 margin at a flip point is ~0.13 logits with the same candidate set).
 
 GLM-5.3-Flash's template always reasons: the `<|system|>Reasoning Effort: Max`
 line is unconditional, the generation prompt always opens `<think>`, and past
-turns keep their reasoning (`clear_thinking` defaults to false). Tool calls
-use the same XML element form as GLM-5.2. Images render as
+turns keep their reasoning (`clear_thinking` defaults to false). Because the
+prompt cannot turn reasoning off, `"think": false` only decides what the client
+sees: the reply is parsed as reasoning up to `</think>` and only what follows is
+the answer. Streaming clients still receive that reasoning as it is generated
+(`reasoning_content` / `thinking` deltas, as for other always-reasoning
+families), so a `max_tokens` budget spent entirely inside the block ends with an
+empty answer. A reply that starts as JSON and never closes the block (a
+`response_format` grammar enforced from the first token) is the answer itself.
+`response_format` with `"think": true` arms the JSON grammar after `</think>`.
+Tool calls use the same XML element form as GLM-5.2. Images render as
 `<|begin_of_image|><|image|><|end_of_image|>`, and the host expands
 `<|image|>` to the merged-patch token count.
 

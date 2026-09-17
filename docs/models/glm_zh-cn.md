@@ -441,6 +441,13 @@ GGUF 宣称 1,048,576 token，但这并不意味着缓存放得下：78 层里�
 `<tool_call>NAME<arg_key>k</arg_key><arg_value>v</arg_value>...</tool_call>`，
 每个参数一个 XML 元素（用 `tojson` 渲染的值会被解析回数字 / 数组 / 对象）。
 
+生成遇到 `<|observation|>` 也会停止（即 GGUF 的 `tokenizer.ggml.eom_token_id`，
+llama.cpp 同样把它并入生成结束集合）：模型在工具调用之后紧接着写出它，不停下来的话
+模型会自己编造工具结果。提示使用 `glm4` / `chatglm-bpe` 预分词器切分，数字最多三位
+一组；若逐位切分，数字以模型训练时从未见过的形式输入，模型会把 `INV-472` 复述成
+`INV-4472`。切分结果与 token id 都与参考 `tokenizer.json` 做了比对
+（`Glm4TokenizerParityTests`）。
+
 
 ## GLM-5.3（`glm-dsa`）
 
@@ -648,6 +655,12 @@ llama.cpp 自己的 top-2 边距也只有约 0.13 logit，候选集完全相同�
 
 GLM-5.3-Flash 的模板始终思考：`<|system|>Reasoning Effort: Max` 无条件出现，生成提示
 总是以 `<think>` 开启，历史轮次保留思考内容（`clear_thinking` 默认 false）。
+由于提示无法关闭思考，`"think": false` 只决定客户端看到什么：回复在 `</think>` 之前
+都按思考内容解析，之后的部分才是答案。流式客户端仍会在生成时收到这段思考
+（`reasoning_content` / `thinking` 增量，与其他始终思考的系列一致），因此若
+`max_tokens` 全部耗在思考块内，答案为空。以 JSON 开头且从不闭合思考块的回复
+（即从第一个 token 起就受 `response_format` 语法约束的回复）本身就是答案。
+`response_format` 配合 `"think": true` 时，JSON 语法在 `</think>` 之后才生效。
 工具调用与 GLM-5.2 相同的 XML 元素形式。图像渲染为
 `<|begin_of_image|><|image|><|end_of_image|>`，宿主把 `<|image|>` 展开为合并
 patch 的 token 数。
