@@ -381,6 +381,11 @@ itself. Two things followed:
   turn-4 token change that is not a tie (on an earlier revision of the test it failed on turn 3's
   tokens: `...there is no roof visible. The scene depicts...` reused vs `...features...`
   cold).
+  The measurements below used a real photo (`TS_TEST_QWEN35_IMAGE`). Without one the
+  test draws a synthetic picture: 448x336 for the direct comparisons and 896x672 for the
+  concurrent case, because a finished request shorter than one scheduler block (256
+  tokens in this test) is never retained as a holder, so a 140-token picture left turn 2
+  too short for turn 3 to reuse anything and the concurrent case always failed.
 
 **Logit tolerance.** Reuse and cold are not bit-identical: the reused turn's reply rows
 were written by the decode graph and the cold turn's by the prefill graph (different

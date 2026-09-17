@@ -26,7 +26,10 @@
 // Opt-in:
 //   TS_TEST_MODEL_DIR=<dir with Qwen3.5-9B*.gguf and its mmproj>
 //   TS_TEST_QWEN35_MMPROJ=<mmproj path>   (optional when the dir holds one Qwen3.5-9B mmproj)
-//   TS_TEST_QWEN35_IMAGE=<image path>     (optional; a synthetic picture otherwise)
+//   TS_TEST_QWEN35_IMAGE=<image path>     (optional; a synthetic picture otherwise, 448x336
+//                                          for the direct cases and 896x672 for the
+//                                          concurrent one, whose turn 2 must be longer
+//                                          than one 256-token block to be retained)
 //   TS_TEST_GGML_BACKEND=metal|cuda|cpu
 //   TS_TEST_QWEN35_LOGIT_TOLERANCE=<max |dlogit|>  (optional; see LogitTolerance)
 using System.Diagnostics;
@@ -256,7 +259,7 @@ public class Qwen35ImageFollowUpExactnessTests
     [ModelFact(EnvModelDir, ModelPattern)]
     public async Task ConcurrentReuseAfterAnImage_MatchesColdPrefill()
     {
-        using var ctx = Context.Open(_output);
+        using var ctx = Context.Open(_output, syntheticScale: 2);
         if (ctx == null) return;
         if (ctx.Backend is not (BackendType.GgmlMetal or BackendType.GgmlCuda))
         {
@@ -376,7 +379,14 @@ public class Qwen35ImageFollowUpExactnessTests
             _tempDir = tempDir;
         }
 
-        public static Context Open(ITestOutputHelper output)
+        /// <param name="syntheticScale">Linear scale of the synthetic picture used when
+        /// TS_TEST_QWEN35_IMAGE is unset. The concurrent test needs 2: a finished request
+        /// shorter than one scheduler block (Config().BlockSize = 256) is never retained
+        /// as a holder, and at 448x336 (140 image tokens) turn 2 is 227 tokens, so turn 3
+        /// could reuse nothing and that test always failed without a real image. At 2
+        /// (896x672, 588 tokens) turn 2 passes one block. The direct comparisons keep 1,
+        /// the picture their logit bounds were set against.</param>
+        public static Context Open(ITestOutputHelper output, int syntheticScale = 1)
         {
             string dir = Environment.GetEnvironmentVariable(EnvModelDir);
             string modelPath = dir == null ? null : TestGates.FindGguf(dir, ModelPattern);
@@ -405,7 +415,7 @@ public class Qwen35ImageFollowUpExactnessTests
             Directory.CreateDirectory(temp);
             string image = Environment.GetEnvironmentVariable("TS_TEST_QWEN35_IMAGE");
             if (string.IsNullOrEmpty(image))
-                image = WriteSyntheticImage(Path.Combine(temp, "scene.png"));
+                image = WriteSyntheticImage(Path.Combine(temp, "scene.png"), syntheticScale);
 
             var sw = Stopwatch.StartNew();
             var model = ModelBase.Create(modelPath, backend);
@@ -414,15 +424,16 @@ public class Qwen35ImageFollowUpExactnessTests
             return new Context(output, model, backend, image, temp);
         }
 
-        private static string WriteSyntheticImage(string path)
+        private static string WriteSyntheticImage(string path, int k)
         {
-            // Something to describe: a sky, a sun, a house and a lawn.
-            using var img = new MagickImage(new MagickColor("#87CEEB"), 448, 336);
+            // Something to describe: a sky, a sun, a house and a lawn, drawn at 448x336
+            // times k (see Open's syntheticScale).
+            using var img = new MagickImage(new MagickColor("#87CEEB"), (uint)(448 * k), (uint)(336 * k));
             new ImageMagick.Drawing.Drawables()
-                .FillColor(new MagickColor("#2E8B57")).Rectangle(0, 240, 448, 336)
-                .FillColor(new MagickColor("#FFD700")).Circle(370, 70, 370, 110)
-                .FillColor(new MagickColor("#B22222")).Rectangle(120, 150, 260, 250)
-                .FillColor(new MagickColor("#8B4513")).Polygon(new PointD(110, 150), new PointD(190, 90), new PointD(270, 150))
+                .FillColor(new MagickColor("#2E8B57")).Rectangle(0, 240 * k, 448 * k, 336 * k)
+                .FillColor(new MagickColor("#FFD700")).Circle(370 * k, 70 * k, 370 * k, 110 * k)
+                .FillColor(new MagickColor("#B22222")).Rectangle(120 * k, 150 * k, 260 * k, 250 * k)
+                .FillColor(new MagickColor("#8B4513")).Polygon(new PointD(110 * k, 150 * k), new PointD(190 * k, 90 * k), new PointD(270 * k, 150 * k))
                 .Draw(img);
             img.Write(path, MagickFormat.Png);
             return path;
