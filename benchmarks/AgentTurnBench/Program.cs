@@ -30,7 +30,7 @@
 //       [--backend ggml_metal|ggml_cuda|ggml_cpu] [--draft-model <gguf>] [--mmproj <gguf> --image <file>]
 //       [--kv f16|q8_0|q4_0]
 //       [--chunk 1024] [--max-batched 4096] [--long 4096] [--tool 3000] [--new 32]
-//       [--spec-new 192] [--spec-file 600] [--spec-minimal-system] [--spec-engine ngram|auto] [--conc 2,4] [--conc-stagger 400] [--scenarios short,long,tool,newchat,spec,json,conc]
+//       [--spec-new 192] [--spec-file 600] [--spec-minimal-system] [--spec-engine ngram|auto] [--conc 2,4] [--conc-stagger 400] [--conc-gate] [--scenarios short,long,tool,newchat,spec,json,conc]
 //       [--warmup 0] [--measure-passes 1] [--out rows.json] [--verbose]
 using System.Diagnostics;
 using System.Globalization;
@@ -206,6 +206,10 @@ internal sealed class Options
         /// <summary>Milliseconds between the submissions of a concurrent round, so
         /// later requests arrive while earlier ones already decode (and speculate).</summary>
         public int ConcStaggerMs;
+        /// <summary>Submit a whole concurrent round while the engine's compute gate is
+        /// closed and open it afterwards, so the first scheduler step sees every request
+        /// (a fixed arrival order instead of racing the engine thread).</summary>
+        public bool ConcGate;
     public List<int> Conc = new() { 2, 4 };
     public List<string> Scenarios = new() { "short", "long", "tool", "newchat", "spec", "json", "conc" };
     public string Out;
@@ -247,6 +251,7 @@ internal sealed class Options
                     case "--spec-diagnostic-window": o.SpecDiagWindow = int.Parse(Next(), CultureInfo.InvariantCulture); break;
                     case "--spec-engine": o.SpecEngine = Next(); break;
                     case "--conc-stagger": o.ConcStaggerMs = int.Parse(Next(), CultureInfo.InvariantCulture); break;
+                    case "--conc-gate": o.ConcGate = true; break;
                     case "--conc":
                         o.Conc = Next().Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
                             .Select(s => int.Parse(s, CultureInfo.InvariantCulture)).ToList();
@@ -265,6 +270,8 @@ internal sealed class Options
             if (!File.Exists(o.Model)) throw new ArgumentException($"model not found: {o.Model}");
             if (o.Warmup < 0) throw new ArgumentException("--warmup must be nonnegative");
             if (o.MeasurePasses < 1) throw new ArgumentException("--measure-passes must be positive");
+            if (o.ConcGate && o.ConcStaggerMs > 0)
+                throw new ArgumentException("--conc-gate submits a round at once and cannot be combined with --conc-stagger");
         }
         catch (ArgumentException ex)
         {
@@ -288,6 +295,9 @@ internal sealed record Row(
     public long StartedUnixMilliseconds { get; init; }
     public List<RequestTimeline> RequestTimelines { get; init; }
     public ConcurrentDecodeMetrics ConcurrentDecode { get; init; }
+    /// <summary>Concurrent rows only: true when --conc-gate held the engine until the
+    /// whole round was queued, so every run schedules the same batches. Null elsewhere.</summary>
+    public bool? ArrivalOrderFixed { get; init; }
     // Boundaries in the flattened token stream for concurrent requests.
     public int[] TokenCounts { get; init; } = Array.Empty<int>();
     public List<string> ExtraNotes { get; } = new();
@@ -509,13 +519,20 @@ internal sealed class Bench
             long startedUnixMilliseconds = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
             long waveStart = Stopwatch.GetTimestamp();
             var tasks = new List<Task<Run>>(n);
+            // SubmitAsync enqueues synchronously, before its first await; with the gate
+            // closed the engine thread cannot schedule a step until every request is queued.
+            ComputeGate gate = _o.ConcGate ? new ComputeGate() : null;
+            gate?.Close();
+            engine.ComputeGate = gate;
             for (int i = 0; i < n; i++)
             {
                 if (i > 0 && _o.ConcStaggerMs > 0)
                     await Task.Delay(_o.ConcStaggerMs);
                 tasks.Add(SubmitAsync(engine, $"conc{n}-{i}", prompts[i], _o.New, SamplingConfig.Greedy, 0, waveStart));
             }
+            gate?.Open();
             Run[] runs = await Task.WhenAll(tasks);
+            engine.ComputeGate = null;
             double waveMs = Stopwatch.GetElapsedTime(waveStart).TotalMilliseconds;
             long steps = engine.TotalStepsRun - steps0;
             int outTokens = runs.Sum(r => r.Tokens.Count);
@@ -542,6 +559,7 @@ internal sealed class Bench
                 StartedUnixMilliseconds = startedUnixMilliseconds,
                 RequestTimelines = timelines,
                 ConcurrentDecode = decode,
+                ArrivalOrderFixed = _o.ConcGate,
             };
             Add(row);
             foreach (Run r in runs)
@@ -869,6 +887,7 @@ internal sealed class Bench
             r.TtftMs, r.PrefillTps, r.DecodeTps, r.OutTokens, r.TotalMs, r.Finish,
             r.Drafted, r.Accepted, r.VerifySteps, r.PlainSteps, r.Rollbacks, Note = r.AllNotes,
             r.Tokens, r.TokenCounts, r.TokenTimesMs, r.StartedUnixMilliseconds, r.RequestTimelines, r.ConcurrentDecode,
+            r.ArrivalOrderFixed,
         }), opts));
         Console.WriteLine($"[agent-turn-bench] rows written to {path}");
     }

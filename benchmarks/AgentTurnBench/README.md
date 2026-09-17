@@ -29,6 +29,19 @@ already decode (and speculate); `--conc 1,2,4` includes a solo round as the
 reference. Concurrent rows aggregate the actual per-request speculative counters;
 zero counters do not establish speculative engagement.
 
+`--conc-gate` holds the engine's compute gate closed until a whole concurrent round
+is queued, so the first scheduler step sees every request. Without it the
+submissions race the engine thread: one run may prefill the first request alone on
+the solo fused path and the rest a step later, another may admit all of them
+together. Different batches run different kernels, which agree only up to
+floating-point near-ties, so greedy tokens of an ungated concurrent round can change
+from run to run without a defect. Gated rows record `ArrivalOrderFixed: true`. It
+cannot be combined with `--conc-stagger`. For a determinism investigation run the
+engine with `TS_CB_DEBUG=1`: each step prints the requests it scheduled and a
+fingerprint of their logits (top two tokens, margin, hash), so two runs can be
+diffed step by step (see
+[Output identity under concurrency](../../docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md#output-identity-under-concurrency)).
+
 ```
 dotnet build benchmarks/AgentTurnBench -c Release
 dotnet benchmarks/AgentTurnBench/bin/Release/net10.0/AgentTurnBench.dll \
@@ -66,7 +79,14 @@ With `--out`, each warm-up pass is saved separately as
 `--warmup 0` continues to measure the first workload after kernel initialization.
 
 The comparison requires identical output token IDs, request rows, prompt/cache
-counts, and finish reasons. It reports prefill/decode throughput and TTFT changes,
+counts, and finish reasons. One exception: in a concurrent row with more than one
+request whose arrival order was not fixed on both sides (no `ArrivalOrderFixed: true`,
+which includes results written before the flag existed), a token difference is
+printed as `TOKENS INFORMATIONAL` instead of failing, because different batch
+compositions legitimately flip near-ties. Request lengths, finish reasons and the
+other fields stay required. Pass `--require-concurrent-identity` to fail on those
+differences too, or benchmark both runs with `--conc-gate`, whose rows are always
+compared token for token. It reports prefill/decode throughput and TTFT changes,
 and fails on output differences, benchmark errors, missing data, or a regression
 above the threshold. Decode throughput is omitted when there are no tokens after
 the first. For repeated measurements, add `--baseline-repeat before2.json` and

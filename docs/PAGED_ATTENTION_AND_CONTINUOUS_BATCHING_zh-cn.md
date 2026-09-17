@@ -212,6 +212,49 @@ GGML 后端使用原生分页注意力：
 `TS_PAGED_ATTN_KERNEL=native|tensor|managed` 选择 Mistral 3 的派发路径。
 GPT OSS 可用 `TS_GPTOSS_PAGED_ATTN_MANAGED=1` 强制走托管 sinks 路径。
 
+### 并发下的输出一致性
+
+同样的批次必须逐位给出同样的 logits；不同的批次不必。哪些请求共处一步、每个请求
+前向多少 token，决定了跑哪些内核：ggml-cuda 对 MXFP4 的
+量化 `mul_mat_id` 在 Turing 与 Ampere 上不超过 7 个 token 时走 MMVQ（Volta、Ada 与
+Blackwell 上为 8 个），超过时走 MMQ；而独自先到达的序列会
+先走单序列 fused 路径。这些内核只在浮点近似平局（near-tie）的范围内一致，贪心解码会
+把一个近似平局变成另一段续写。因此，到达顺序没有固定的并发轮次，即使没有任何缺陷，
+不同运行之间也可能产生不同的 token。调度出相同批次的两次运行则不可能不同。
+
+区分这两种情况的方法：
+
+- `TS_CB_DEBUG=1` 为引擎的每一步打印一行 `[cb] step#N <path>`，列出本步调度的每个
+  请求（`id:P|D fwd=<token 数> computed=<本步之后的 token 数>`），以及它留下的 logits
+  指纹：前两个 token、二者的差值（margin）和整行的哈希。逐步对比两次运行：如果在第一个
+  哈希不同之前批次组成已经不同，属于近似平局一类；批次组成相同而哈希不同，就是缺陷。
+- `AgentTurnBench --conc-gate` 让引擎的 compute gate 保持关闭，直到整轮并发请求都已
+  入队，于是每次运行都以相同的批次接纳这一轮。这些行会记录 `ArrivalOrderFixed: true`，
+  `compare.py` 要求它们的 token 完全相同。没有该标记的并发行，token 差异只作为信息
+  报告，除非传入 `--require-concurrent-identity`。
+
+**实测（2026-09-17，gpt-oss-20b MXFP4，1x A40，`ggml_cuda`，`TS_PER_SEQ_FUSED=0`，
+`AgentTurnBench --conc 1,4,8`）。** 4 个并发贪心请求在不同运行之间于第 3-26 个输出
+token 处分叉，连同一进程内的预热轮与测量轮之间也会分叉；在这些运行中 8 个并发请求则没有。步骤跟踪
+显示两次运行的批次完全相同，而在第一个解码步，同一 token 的 logits 相差数个单位
+（41.28 对 38.84），所有 margin 仍然很大。这是缺陷，不是近似平局。独立 MoE 内核
+（`TSGgml_MoEFFNPrefillSwiGLUQuantF32`，批处理分页路径用它计算 GPT OSS 的专家）把每个
+专家的 bias 作为图的叶子张量上传到可复用的计算缓冲区。分配器在 gate bias 的 `add_id`
+之后释放了它，并把 SwiGLU 激活放在同一块内存上。ggml-cuda 在 1-7 个 token 时把
+`{mul_mat_id, add_id, mul_mat_id, add_id, swiglu_oai}` 融合成一个 MMVQ 内核。该内核
+在写激活的同时读取 bias，而它的内存重叠检查会跳过叶子张量，因为 llama.cpp 的 bias
+都是权重。于是内核覆盖了它仍在读取的 bias。在这块 Ampere 卡上 8 个 token 走不做融合的 MMQ，这就是 8 请求
+轮次保持稳定的原因；在 Ada 或 Blackwell 上 8 个 token 仍走 MMVQ，同样会受影响。现在图构建器用分配器的 output 标志固定住所有小的上传参数（ids、
+路由权重、bias、post-norm 权重）。CTest `moe-fused-bias-alias-cuda`
+（`GgmlOpsMoeFusedBiasAliasTest`）在 1、4、7 个 token 下把该内核与精确的主机计算结果
+比较。修复前误差为 449（容差 27），且重复运行结果不一致。
+
+修复后，在 `--conc-gate` 下，三轮运行在 1、4、8 请求轮次的每一步都给出逐位相同的
+logits。不加 gate 时，三轮中仍有一轮改变了 8 请求轮次的输出：它的第一个请求在另外七个
+到达之前被单独调度到单序列 fused 路径上。那一步的 logits 已经不同（42.94 对 42.86），
+随后的 argmax 翻转发生在 0.011-0.11 的 margin 上。这属于近似平局一类，`compare.py`
+只报告而不判失败。
+
 ### 按序列回退路径
 
 回退路径仍运行在 `InferenceEngine` 内部；它不再是服务端外层并发原语。它会把
@@ -344,6 +387,7 @@ E4B/Metal 上一个复用 179 token 的 457 token 图片回合首 token 用时 1
 | 跨请求隔离与媒体身份 | `ModelServiceRawTokenHistoryTests` 与 `ToolTranscriptSpliceTests`（按内容校验的原始 token 拼接）、`PooledPrefixScopeAndMediaTests`、`ContentAddressedMediaTests` |
 | 越过媒体复用（Qwen 3.5 M-RoPE） | `Qwen35MRopeReferencePositionTests`（与 SGLang `get_rope_index` 夹具比较位置），需显式启用的 `Qwen35ImageFollowUpExactnessTests`（真实权重下图片之后复用与冷启动对比，单请求与并发，检查点文件往返） |
 | 按模型正确性 | `Qwen35BatchedCorrectnessTests`、`Mistral3BatchedForwardTests`、`Gemma4BatchedForwardTests`、`GptOssBatchedCorrectnessTests`、`NemotronBatchedCorrectnessTests` |
+| 后端融合下的批处理 MoE 内核 | 原生 CTest `moe-fused-bias-alias-cpu` / `moe-fused-bias-alias-cuda`（`GgmlOpsMoeFusedBiasAliasTest`）：带每专家 bias 的独立 MoE FFN 内核与精确主机计算结果对比，1、4、7 个 token，重复执行 |
 | MTP 投机解码 | `SpeculativeExecutionTests`（起草 / 验证 / 回滚核心）、可选端到端 `Qwen36SpeculativeTests`（`TS_MTP_E2E=1`）与 `Gemma4SpeculativeTests`（`TS_GMTP_E2E=1`），需真实 GGUF |
 | 按模型性能探针 | `Gemma4BatchedPerfBench`、`Qwen35BatchedPerfBench`、`GptOssBatchedPerfBench`、`NemotronBatchedPerfBench` |
 | DiffusionGemma 路径 | `DiffusionGemmaTests` 覆盖去噪、prompt-KV 缓存与批处理生成探针 |
