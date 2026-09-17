@@ -3194,6 +3194,10 @@ namespace TensorSharp.Models
         });
         private static GgmlBasicOps.Gemma4BatchedDecodeCaps BatchedDecodeCaps => s_batchedDecodeCaps.Value;
 
+        // Tests force collection after extracting the raw input pointer. A weak
+        // reference observes the owner without extending its lifetime itself.
+        internal Action<WeakReference<Storage>> BeforeBatchedDecodeNativeForTest { get; set; }
+
         /// <summary>
         /// TRUE token-batched dense decode: decode one token for each of N
         /// concurrent sequences in ONE fused graph (one compute buffer, weights
@@ -3336,7 +3340,9 @@ namespace TensorSharp.Models
             }
 
             // Embed all N decode tokens -> hidden [hidden_size, N] (column s = seq s, canonical order).
-            Tensor hidden = Embedding(tokSorted);
+            // Native receives only its raw pointer. Keep the owner alive until
+            // the upload/compute returns, including optimized JIT lifetimes.
+            using Tensor hidden = Embedding(tokSorted);
             ScaleEmbedding(hidden);
             float* hiddenPtr = GetFloatPtr(hidden);
 
@@ -3399,6 +3405,7 @@ namespace TensorSharp.Models
                     return false;
             }
 
+            BeforeBatchedDecodeNativeForTest?.Invoke(new WeakReference<Storage>(hidden.Storage));
             bool ok;
             fixed (float* lp = logitsBuf)
             {
