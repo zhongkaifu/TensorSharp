@@ -88,11 +88,22 @@ class AbbaTests(unittest.TestCase):
         tools = self.directory / "tools"
         tools.mkdir()
         dotnet = tools / "dotnet"
-        dotnet.write_text("#!/bin/sh\nexit 17\n")
+        # Exit 17 only when the native override was staged beside the assembly.
+        native_name = "libGgmlOps.dylib" if os.uname().sysname == "Darwin" else "libGgmlOps.so"
+        dotnet.write_text(f'#!/bin/sh\ncase "$(cat "$(dirname "$1")/{native_name}")" in right) exit 17;; *) exit 42;; esac\n')
         dotnet.chmod(0o755)
+        managed = self.directory / "managed"
+        managed_bin = managed / "benchmarks/AgentTurnBench/bin/Release/net10.0"
+        managed_bin.mkdir(parents=True)
+        (managed_bin / "AgentTurnBench.dll").write_text("fake assembly")
+        (managed_bin / native_name).write_text("wrong")
+        native = self.directory / "native"
+        native_bin = native / "TensorSharp.GGML.Native/build"
+        native_bin.mkdir(parents=True)
+        (native_bin / native_name).write_text("right")
         result_dir = self.directory / "results"
         command = ["bash", str(Path(__file__).with_name("abba.sh")), str(result_dir), "1",
-                   "--measure-passes 3", "base=/unused", "candidate=/unused"]
+                   "--measure-passes 3", f"base={managed}:{native}", f"candidate={managed}:{native}"]
         env = {**os.environ, "PATH": str(tools) + os.pathsep + os.environ["PATH"]}
         result = subprocess.run(command, env=env, capture_output=True, text=True)
         self.assertEqual(1, result.returncode, result.stderr)
@@ -100,6 +111,8 @@ class AbbaTests(unittest.TestCase):
         self.assertEqual(2, log.count("rc=17"))
         self.assertTrue(log.endswith("FAILED 2 process(es)\n"))
         self.assertEqual(3, json.loads((result_dir / "run-plan.json").read_text())["measure_passes"])
+        self.assertEqual("wrong", (managed_bin / native_name).read_text())
+        self.assertTrue((result_dir / "arm-identities.json").is_file())
         repeated = subprocess.run(command, env=env, capture_output=True, text=True)
         self.assertEqual(2, repeated.returncode)
         self.assertEqual(log, (result_dir / "runs.txt").read_text())
