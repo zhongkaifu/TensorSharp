@@ -110,7 +110,7 @@ internal sealed class PrefixTree
     private ResourceVector _optionCap;
     private long _scopeQuota = long.MaxValue;
     private int _scopedEndStates, _publicEndStates, _nativeSlots, _primaryResidents;
-    private int[] _matchStack = new int[16];
+    private readonly int[] _matchStack = new int[MatchPlan.MaxTrailEnds + 1];
     private int[] _order = new int[256];                 // pre-sized: probes stay allocation-free (BG-15)
     private RadixNode[] _bfs;
     private RadixNode[] _scratch = new RadixNode[64];
@@ -162,9 +162,7 @@ internal sealed class PrefixTree
     internal long ScopeQuota => _scopeQuota;
     internal int PublicEndStateCount => _publicEndStates;
     internal int ScopedEndStateCount => _scopedEndStates;
-    internal int NativeSlotCount => _nativeSlots;
     internal int PrimaryResidentCount => _primaryResidents;
-    internal IReadOnlyList<RadixNode> PublicBoundaryNodes => _publicBoundaries;
     internal IReadOnlyCollection<string> PayloadKeys => _keyIndex.Keys;
     internal int QueuedRefusalCount => _refusedKeys.Count;
 
@@ -246,13 +244,10 @@ internal sealed class PrefixTree
         }
     }
 
+    /// <remarks>Only called with <c>d &lt; limit</c>: the root is expanded when <c>limit &gt; 0</c>, and
+    /// <see cref="AddTrail"/> pushes an entry only when <c>d + len &lt; limit</c>.</remarks>
     private void ExpandInto(in MatchRequest r, MatchPlan plan, RadixNode node, int d, int prev, int limit, ref int stackCount)
     {
-        if (d >= limit)
-        {
-            if (prev >= 0) plan.TrailEnds.Add(prev);
-            return;
-        }
         long e = r.Key[d];
         RadixNode? pub = node.Children.Find(0, e);
         RadixNode? own = r.ScopeIx != 0 ? node.Children.Find(r.ScopeIx, e) : null;
@@ -279,7 +274,8 @@ internal sealed class PrefixTree
         int ix = plan.Trail.Count - 1;
         if (len == c.Edge.Length && d + len < limit)
         {
-            if (stackCount == _matchStack.Length) Array.Resize(ref _matchStack, _matchStack.Length * 2);
+            // Bounded: an expansion that pushes two entries is allowed only while
+            // TrailEnds + stack + 2 ≤ MaxTrailEnds, so the stack never exceeds MaxTrailEnds.
             _matchStack[stackCount++] = ix;
         }
         else
@@ -295,7 +291,6 @@ internal sealed class PrefixTree
     /// </summary>
     internal static int MediaVerify(RadixNode c, int d, int len, MediaSpanRecord[]? spans)
     {
-        if (len <= 0) return 0;
         int end = d + len;
         int cut = end;
         ReadOnlySpan<MediaSpanRecord> records = c.SpanRecords;
@@ -312,7 +307,9 @@ internal sealed class PrefixTree
             {
                 MediaSpanRecord s = spans[i];
                 if (s.Start >= cut) break;
-                if (!ContainsRecord(records, s)) { cut = s.Start; break; }
+                // Every node record starting before `cut` already equals a request span, so a request
+                // span is verified exactly when the node has a record at its start.
+                if (!HasRecordAt(records, s.Start)) { cut = s.Start; break; }
             }
         }
         return cut - d;
@@ -320,19 +317,15 @@ internal sealed class PrefixTree
 
     private static bool ContainsSpan(MediaSpanRecord[]? spans, in MediaSpanRecord rec)
     {
-        if (spans is null || spans.Length == 0) return false;
+        if (spans is null) return false;
         int i = LowerBound(spans, rec.Start);
         return i < spans.Length && spans[i].Start == rec.Start && spans[i].End == rec.End && spans[i].Id.Equals(rec.Id);
     }
 
-    private static bool ContainsRecord(ReadOnlySpan<MediaSpanRecord> records, in MediaSpanRecord s)
+    private static bool HasRecordAt(ReadOnlySpan<MediaSpanRecord> records, int start)
     {
-        for (int i = 0; i < records.Length; i++)
-        {
-            if (records[i].Start == s.Start)
-                return records[i].End == s.End && records[i].Id.Equals(s.Id);
-            if (records[i].Start > s.Start) break;
-        }
+        foreach (MediaSpanRecord rec in records)
+            if (rec.Start == start) return true;
         return false;
     }
 
@@ -399,10 +392,11 @@ internal sealed class PrefixTree
         {
             clamps |= ClampReasons.CloneCost;
             SetDecline(plan, best.Kind, SourceDecline.CloneCost);
+            // The next candidate that is not a clone. C is never it: C exists only when longer than A and B,
+            // so a valid C is always the best, and a best that is a clone is excluded.
             Candidate next = default;
-            if (!IsCloneOrNone(a) && !SameCandidate(a, best)) next = Better(next, a);
-            if (!IsCloneOrNone(b) && !SameCandidate(b, best)) next = Better(next, b);
-            if (!IsCloneOrNone(c) && !SameCandidate(c, best)) next = Better(next, c);
+            if (!IsCloneOrNone(a)) next = a;
+            if (!IsCloneOrNone(b)) next = Better(next, b);
             best = next;
         }
         if (best.IsValid && Caps.MmReuseMinTokens > 0 && best.Length < Caps.MmReuseMinTokens && HasSpanAtOrAfter(r.Spans, best.Length))
@@ -463,26 +457,20 @@ internal sealed class PrefixTree
         SetDeclineIfNone(plan, cand.Kind, SourceDecline.Shorter);
     }
 
-    private static void SetDecline(MatchPlan plan, CandidateKind kind, SourceDecline decline)
+    private static ref SourceDecline DeclineSlot(MatchPlan plan, CandidateKind kind)
     {
-        switch (kind)
-        {
-            case CandidateKind.EndState: plan.EndStateDecline = decline; break;
-            case CandidateKind.PrimaryResident: plan.PrimaryDecline = decline; break;
-            case CandidateKind.Pages: plan.PageDecline = decline; break;
-            case CandidateKind.TruncatedEndState: plan.TruncationDecline = decline; break;
-        }
+        if (kind == CandidateKind.EndState) return ref plan.EndStateDecline;
+        if (kind == CandidateKind.PrimaryResident) return ref plan.PrimaryDecline;
+        if (kind == CandidateKind.Pages) return ref plan.PageDecline;
+        return ref plan.TruncationDecline;
     }
+
+    private static void SetDecline(MatchPlan plan, CandidateKind kind, SourceDecline decline) => DeclineSlot(plan, kind) = decline;
 
     private static void SetDeclineIfNone(MatchPlan plan, CandidateKind kind, SourceDecline decline)
     {
-        switch (kind)
-        {
-            case CandidateKind.EndState: if (plan.EndStateDecline == SourceDecline.None) plan.EndStateDecline = decline; break;
-            case CandidateKind.PrimaryResident: if (plan.PrimaryDecline == SourceDecline.None) plan.PrimaryDecline = decline; break;
-            case CandidateKind.Pages: if (plan.PageDecline == SourceDecline.None) plan.PageDecline = decline; break;
-            case CandidateKind.TruncatedEndState: if (plan.TruncationDecline == SourceDecline.None) plan.TruncationDecline = decline; break;
-        }
+        ref SourceDecline slot = ref DeclineSlot(plan, kind);
+        if (slot == SourceDecline.None) slot = decline;
     }
 
     /// <summary>argmax L, then the §5.3.3 tie order, then the older node.</summary>
@@ -568,21 +556,10 @@ internal sealed class PrefixTree
                 SetDeclineIfNone(plan, kind, SourceDecline.DonateOnlyShared);
                 continue;
             }
-            var cand = new Candidate { Kind = kind, Mode = mode, Length = length, Payload = c, TrailEnd = TrailEndOf(plan, _order[k]), TieId = c.Id };
+            var cand = new Candidate { Kind = kind, Mode = mode, Length = length, Payload = c, TrailEnd = -1, TieId = c.Id };   // anchored at the payload itself
             best = Better(best, cand);
         }
         return best;
-    }
-
-    /// <summary>Index into <c>plan.TrailEnds</c> of a path containing trail entry <paramref name="entryIx"/>.</summary>
-    private static int TrailEndOf(MatchPlan plan, int entryIx)
-    {
-        for (int t = 0; t < plan.TrailEnds.Count; t++)
-        {
-            for (int ix = plan.TrailEnds[t]; ix >= 0; ix = plan.Trail[ix].Prev)
-                if (ix == entryIx) return t;
-        }
-        return -1;
     }
 
     /// <summary>(B) Pages, per path and per materialization mode.</summary>
@@ -763,8 +740,7 @@ internal sealed class PrefixTree
     /// <summary>Among truncation candidates at one target: the smallest depth, then tie order, then the older node.</summary>
     private static Candidate BetterTruncation(in Candidate x, in Candidate y)
     {
-        if (!x.IsValid) return y;
-        if (!y.IsValid) return x;
+        if (!x.IsValid) return y;                  // y is always a qualified candidate
         if (x.Length != y.Length) return x.Length > y.Length ? x : y;
         if (x.Payload!.Depth != y.Payload!.Depth) return x.Payload.Depth < y.Payload.Depth ? x : y;
         int rx = ResumabilityRules.TieRank(x.Kind, x.Mode), ry = ResumabilityRules.TieRank(y.Kind, y.Mode);
@@ -827,13 +803,12 @@ internal sealed class PrefixTree
 
     private static (RadixNode Node, int Offset) LocateOnTrail(MatchPlan plan, int trailEnd, int length)
     {
-        for (int ix = plan.TrailEnds[trailEnd]; ix >= 0; ix = plan.Trail[ix].Prev)
-        {
-            TrailEntry te = plan.Trail[ix];
-            if (te.StartDepth < length && length <= te.EndDepth)
-                return (te.Node, length - te.Node.EdgeStartDepth);
-        }
-        throw new InvalidOperationException($"Length {length} is not on the matched path.");
+        // The candidate's length lies on its path by construction; walking past the root (Prev = -1)
+        // would throw from the trail indexer.
+        TrailEntry te = plan.Trail[plan.TrailEnds[trailEnd]];
+        while (!(te.StartDepth < length && length <= te.EndDepth))
+            te = plan.Trail[te.Prev];
+        return (te.Node, length - te.Node.EdgeStartDepth);
     }
 
     private static int PublicTokensOnPath(RadixNode anchor, int length, int publicCap)
@@ -882,7 +857,7 @@ internal sealed class PrefixTree
         }
         if (plan.Kind == CandidateKind.None || plan.Length <= 0)
             return default;
-        RadixNode anchor = plan.AnchorParent ?? throw new InvalidOperationException("Plan has no anchor.");
+        RadixNode anchor = plan.AnchorParent!;     // every plan with reuse has an anchor (Evaluate)
         if (plan.AnchorOffset < anchor.Edge.Length)
             anchor = SplitAt(anchor, plan.AnchorOffset);
         LockPath(anchor);
@@ -898,8 +873,9 @@ internal sealed class PrefixTree
     /// <summary>Path lock only, anchored at <paramref name="anchor"/> (publication and durable lock moves).</summary>
     internal LockReceipt AcquirePath(RadixNode anchor)
     {
-        if (anchor is null || anchor.IsRoot) return default;
-        RequireInTree(anchor);
+        if (anchor is null) return default;
+        RequireInTree(anchor);                     // a deleted (pooled) node has no parent: check before IsRoot
+        if (anchor.IsRoot) return default;
         LockPath(anchor);
         TouchPath(anchor);
         Version++;
@@ -909,8 +885,9 @@ internal sealed class PrefixTree
     /// <summary>State lock only, on <paramref name="node"/>'s end state.</summary>
     internal LockReceipt AcquireState(RadixNode node)
     {
-        if (node is null || node.IsRoot) return default;
+        if (node is null) return default;
         RequireInTree(node);
+        if (node.IsRoot) return default;
         LockState(node);
         Touch(node);
         Version++;
@@ -1636,21 +1613,20 @@ internal sealed class PrefixTree
             RadixNode n = _scratch[i];
             _scratch[i] = null!;
             if (!n.InTree) continue;
-            if (n.AnyLock || n.IsDonationPending || SubtreeLocked(n))
+            if (SubtreeLocked(n))
             {
+                // Locked here or below: flag it (deleted at its last unlock). An internal node whose
+                // own end state is not locked loses it now.
                 n.Flags |= NodeFlags.Retired;
-                if (!n.AnyLock && !n.IsDonationPending && n.EndState is not null && n.Children.Count > 0)
+                if (!n.AnyLock && !n.IsDonationPending && n.EndState is not null)
                     DetachEndState(n, ReleaseReason.ScopeRetired);
                 Relink(n);
             }
-            else if (n.Children.Count == 0)
-            {
-                DeleteLeafCascade(n, ReleaseReason.ScopeRetired);
-            }
             else
             {
-                if (n.EndState is not null) DetachEndState(n, ReleaseReason.ScopeRetired);
-                Relink(n);
+                // Nothing below is locked, and deeper nodes of the scope were handled first (children of a
+                // scoped node share its scope, I3), so this is an unlocked leaf now.
+                DeleteLeafCascade(n, ReleaseReason.ScopeRetired);
             }
         }
         if (rec.NewestLeaf is not null) Relink(rec.NewestLeaf);
@@ -1813,18 +1789,6 @@ internal sealed class PrefixTree
 
     // ------------------------------------------------------------------ enumeration (checker, harness, dump)
 
-    internal IEnumerable<RadixNode> EnumerateNodes()
-    {
-        var stack = new Stack<RadixNode>();
-        foreach (RadixNode c in Root.Children) stack.Push(c);
-        while (stack.Count > 0)
-        {
-            RadixNode n = stack.Pop();
-            yield return n;
-            foreach (RadixNode c in n.Children) stack.Push(c);
-        }
-    }
-
     /// <summary>The full key of a node's root path (tests and dumps).</summary>
     internal static long[] PathKey(RadixNode n)
     {
@@ -1927,7 +1891,6 @@ internal sealed class PrefixTree
     private void DetachRopeSlice(RadixNode n)
     {
         KeyRope rope = n.Edge.Rope;
-        if (rope is null) return;
         rope.SliceRefs--;
         rope.LiveSliceTokens -= n.Edge.Length;
         if (n.RopePrev is null) rope.FirstSliceNode = n.RopeNext; else n.RopePrev.RopeNext = n.RopeNext;

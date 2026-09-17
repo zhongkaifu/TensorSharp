@@ -36,27 +36,13 @@ internal sealed class EvictionLists
 
     internal static LruKind KindOf(byte listId) => listId <= TierCount ? LruKind.Leaf : LruKind.State;
 
-    internal static EvictionTier TierOfList(byte listId) => (EvictionTier)((listId - 1) % TierCount);
-
     internal RadixNode? First(LruKind kind, EvictionTier tier) => _head[ListId(kind, tier)];
 
     internal RadixNode? First(byte listId) => _head[listId];
 
     internal RadixNode? Last(byte listId) => _tail[listId];
 
-    internal int Count(LruKind kind, EvictionTier tier) => _count[ListId(kind, tier)];
-
     internal int Count(byte listId) => _count[listId];
-
-    internal int TotalCount
-    {
-        get
-        {
-            int n = 0;
-            for (int i = 1; i <= ListCount; i++) n += _count[i];
-            return n;
-        }
-    }
 
     /// <summary>Links <paramref name="n"/> into <paramref name="listId"/>, keeping the list ordered by LastAccess.</summary>
     internal void Link(RadixNode n, byte listId)
