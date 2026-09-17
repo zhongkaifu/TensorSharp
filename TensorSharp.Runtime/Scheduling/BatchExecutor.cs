@@ -932,6 +932,10 @@ namespace TensorSharp.Runtime.Scheduling
                 }
                 seq.LastLogits = perSeqLogits[s];
                 seq.AdvanceComputedTokens(inputTokens.Length);
+                // These positions now live in the model's paged arrays, not in pool
+                // storage: a later sequence adopting these blocks must read them there.
+                seq.BlockTable.SetHoldsModelPagedKv(
+                    seq.NumComputedTokens - inputTokens.Length, seq.NumComputedTokens, true);
                 // In the batched path the model owns its own K/V layout
                 // (paged storage referenced by slotMapping/block tables), so
                 // the executor does NOT need to extract/inject between
@@ -2246,6 +2250,7 @@ namespace TensorSharp.Runtime.Scheduling
             {
                 _liveCacheValid = false;
                 seq.KvStateInPagedStorage = true;
+                seq.BlockTable.SetHoldsModelPagedKv(prevComputed, seq.NumComputedTokens, true);
                 int prevFullBlocks = prevComputed / _blockSize;
                 _scheduler.OnBlocksCommitted(seq, prevFullBlocks * _blockSize);
             }
@@ -3561,6 +3566,7 @@ namespace TensorSharp.Runtime.Scheduling
                 var slab = _pool.Storage.GetSpan(block.Id);
                 dst.CopyTo(slab);
                 block.Used = tokensInBlock;
+                block.HoldsSnapshotBytes = tokensInBlock == _blockSize;
             }
         }
 
@@ -3627,6 +3633,7 @@ namespace TensorSharp.Runtime.Scheduling
                     break;
                 dst.CopyTo(_pool.Storage.GetSpan(block.Id));
                 block.Used = _blockSize;
+                block.HoldsSnapshotBytes = true;
                 block.IsRestorablePrefixEnd = !_model.RequiresPerBlockCapture
                     || (b == fullBlocksNow - 1 && seq.NumComputedTokens % _blockSize == 0);
                 captured++;

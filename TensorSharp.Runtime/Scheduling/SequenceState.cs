@@ -230,8 +230,13 @@ namespace TensorSharp.Runtime.Scheduling
 
         public void AdvanceComputedTokens(int n)
         {
+            int from = NumComputedTokens;
             NumComputedTokens += n;
             BlockTable.AdvanceTokens(n);
+            // Whatever path wrote these positions, a block that holds them is no longer
+            // known to be complete in the model's paged arrays; the batched path marks
+            // its own writes again right after advancing (BatchExecutor).
+            BlockTable.SetHoldsModelPagedKv(from, NumComputedTokens, false);
         }
 
         /// <summary>Set computed-token counter directly without touching the

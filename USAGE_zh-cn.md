@@ -725,7 +725,7 @@ Unix IPC 并非完整隔离边界：macOS 为兼容性保留共享临时目录�
 | `TS_SCHED_SOLO_PREFILL_CHUNK` | SOLO（无争用）prompt 全新部分（start_pos = 0）的 prefill 分块大小——单个无争用请求会以大分块走融合 prefill 路径（默认：`8192`）。 |
 | `TS_SCHED_NUM_BLOCKS` | 引擎块池的物理块数（默认：`256`）。 |
 | `TS_SCHED_BLOCK_SIZE` | 引擎侧每块的 token 数（默认：`256`）。 |
-| `TS_SCHED_PREFIX_CACHE` | `0` 关闭跨请求的块级哈希前缀共享。 |
+| `TS_SCHED_PREFIX_CACHE` | `0` 关闭跨请求的块级哈希前缀共享。由批处理分页步写入的块在模型自己的分页存储中被复用（请求一开始就是分页驻留）；带池化快照的块被恢复到线性 cache。两种可读形式都没有的块不会被复用，改为重新 prefill。 |
 | `TS_SCHED_STOP_REPETITION` | `0` 允许陷入重复循环的生成继续跑到 token 上限，而不是被提前结束。 |
 | `TS_SCHED_DECODE_QUANTUM` | 在允许切换序列前的 token 数（默认与 block size 相同）。 |
 | `TS_RETAINED_FUSED_CACHE` | `1`（默认）在请求结束后保留其融合 holder，使前缀完全一致的续写不必重新 prefill；仅对声明支持的模型有效（Gemma 4 的 K/V；Qwen 3.5/3.6 的注意力 K/V 加 GatedDeltaNet 递归状态）。`0` 关闭（用于限制显存或做 A/B）。 |
@@ -744,7 +744,8 @@ Unix IPC 并非完整隔离边界：macOS 为兼容性保留共享临时目录�
 | `TS_NEMOTRON_MAMBA2_BATCHED_NATIVE` | 在 Nemotron-H 批处理路径中使用原生 Mamba2 批处理步骤内核。 |
 | `TS_NEMOTRON_ATTN_SCORE_BUDGET_MB` | Nemotron-H：物化 prefill 回退路径在改为按 query 子块计算前允许构建的最大注意力得分张量（MiB，默认 1024）。GGML 融合 prefill kernel（F32 / F16 cache）不受此预算约束，得分张量较大时会切换到 flash attention。 |
 | `TS_MAMBA2_PREFILL_CACHE_MB` | Nemotron-H：缓存的原生 Mamba2 prefill 计算图可占用的设备内存（MiB，按最近最少使用淘汰，默认 1024）。大于预算的计算图只服务当次调用，随后释放。 |
-| `TS_PAGED_ATTN_KERNEL` | `Mistral3Model.BatchedForward` 选择的分页注意力派发内核：`native`（默认）、`tensor`（基于 C# Tensor）或 `managed`（纯 C# 标量）。 |
+| `TS_PAGED_ATTN_KERNEL` | `Mistral3Model.BatchedForward` 与 `HunyuanDenseModel.BatchedForward` 选择的分页注意力派发内核：`native`（默认）、`tensor`（基于 C# Tensor）或 `managed`（纯 C# 标量）。 |
+| `TS_HUNYUAN_BATCHED` | 设为 `0` 强制 Hunyuan Dense 走按序列的 KV 快照换入换出路径（默认走批处理 / 分页；块量化 KV cache 始终走快照路径）。 |
 | `TS_MLX_PIPELINED_DECODE` | 默认 `1`，当请求为贪心采样、没有 stop 序列且模型支持 device-side argmax / 下一 token embedding 查找时，在 MLX 后端启用流水化贪心 decode。设为 `0` 可关闭。仅 CLI。 |
 | `TS_MLX_MLOCK_GGUF` | 默认 `1`，通过 `mlock(2)` 把 GGUF mmap 区域钉在物理内存，避免前向之间被换出。设为 `0` 关闭（适用于进程 `memlock` rlimit 太低、或希望让 OS 自行管理分页的情况）。仅 MLX 后端。 |
 | `TS_MLX_FUSED_KV_WRITE` | 默认 `1`，使用单次多维 `slice_update` 写入每个 token 的 KV block。设为 `0` 回退到按 head 的循环（A/B 测试 / 隔离回归用）。 |
@@ -1578,6 +1579,7 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model <model.gg
 | 模型 | 默认状态 | 切换默认的环境变量 | 原生内核子开关 |
 |---|---|---|---|
 | Mistral 3 | 启用 | — | `TS_PAGED_ATTN_KERNEL` = `native`（默认）/ `tensor` / `managed` |
+| Hunyuan Dense | 启用（块量化 KV cache 时关闭） | `TS_HUNYUAN_BATCHED=0` 强制走 KV 快照换入换出路径 | `TS_PAGED_ATTN_KERNEL` = `native`（默认）/ `tensor` / `managed` |
 | Gemma 4 | 启用 | `TS_GEMMA4_BATCHED=0` 强制走旧的按序列路径 | `TS_GEMMA4_BATCHED_CAPS=0` 强制 token 批量融合 decode 内核的 v1 门控（PLE / 共享 KV / 已回绕 SWA 的模型如 E2B/E4B 改为轮询 decode） |
 | Qwen 3.5 / 3.6 系列 | 启用 | `TS_QWEN35_BATCHED=0` 强制走旧的按序列路径（或 `--no-continuous-batching`） | `TS_QWEN35_BATCHED_GDN_NATIVE=1` 启用原生批处理 GDN 内核；`FUSED_ATTN_LAYER_MIN_SEQ_LEN=N` 覆盖融合注意力启用阈值（默认 4096） |
 | GPT OSS | 启用 | `TS_GPTOSS_BATCHED=0` 强制走旧的按序列路径 | `TS_GPTOSS_PAGED_ATTN_MANAGED=1` 强制使用托管 (C#) sinks softmax，而非原生带 sinks 的分页注意力内核 |

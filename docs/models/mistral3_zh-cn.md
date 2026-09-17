@@ -5,7 +5,7 @@
 | 属性 | 值 |
 |---|---|
 | 提供方 | Mistral AI |
-| GGUF 架构标识 | `mistral3` |
+| GGUF 架构标识 | `mistral3`；以及 llama.cpp 尚无 `mistral3` 时转换的 Mistral Small 3.x 文件所用的 `llama`（见[标记为 llama 的文件](#标记为-llama-的文件)） |
 | 模型类 | [`Mistral3Model`](../../TensorSharp.Models/Models/Mistral3/Mistral3Model.cs)（旧单序列路径）+ [`Mistral3Model.BatchedForward.cs`](../../TensorSharp.Models/Models/Mistral3/Mistral3Model.BatchedForward.cs)（`IBatchedPagedModel`） |
 | 视觉编码器 | [`Mistral3VisionEncoder`](../../TensorSharp.Models/Models/Mistral3/Mistral3VisionEncoder.cs)（Pixtral） |
 | 图像处理器 | [`Mistral3ImageProcessor`](../../TensorSharp.Models/Models/Mistral3/Mistral3ImageProcessor.cs) |
@@ -23,6 +23,71 @@
 | 模型 | HF 仓库 | 推荐文件 | Pixtral mmproj |
 |---|---|---|---|
 | Mistral-Small-3.1-24B-Instruct-2503 | [bartowski/mistralai_Mistral-Small-3.1-24B-Instruct-2503-GGUF](https://huggingface.co/bartowski/mistralai_Mistral-Small-3.1-24B-Instruct-2503-GGUF) | `mistralai_Mistral-Small-3.1-24B-Instruct-2503-Q4_K_M.gguf`（14.334 GB）或 `mistralai_Mistral-Small-3.1-24B-Instruct-2503-Q8_0.gguf`（25.055 GB） | `mmproj-mistralai_Mistral-Small-3.1-24B-Instruct-2503-f16.gguf`（0.878 GB；同仓库） |
+
+### 标记为 llama 的文件
+
+上面的 bartowski 文件声明 `general.architecture = llama`，全部超参数都在 `llama.*`
+下：它们是在 llama.cpp 拥有 `mistral3` 架构之前转换的。修复之前，这些文件在加载时
+报 `Unsupported architecture: llama` 而失败。
+
+`llama` **不是** `mistral3` 的别名，因为同一个标记也指 Llama 2/3、Mixtral 等模型，
+用 Mistral 的计算图跑它们只会得到流畅的乱码。注册表改为把标记为 `llama` 的文件交给
+`Mistral3Architecture.IsLlamaLabelledMistral3`
+（`ModelArchitectureDescriptor.RecognizeRelabelledFile`）判断，只有下列条件全部成立时
+才接受：
+
+| 检查 | 拒绝的对象 |
+|---|---|
+| `tokenizer.ggml.pre = tekken` | SentencePiece 的 Mistral 7B / Mixtral、Llama 3 BPE |
+| 词表含 `[INST]`、`[/INST]`、`[SYSTEM_PROMPT]`、`[/SYSTEM_PROMPT]`（渲染器会输出它们） | 缺少这些控制 token 的 Tekken 词表 |
+| 没有 `llama.expert_count`，没有 `blk.0.ffn_gate_inp.weight` | MoE 文件 |
+| 没有 `rope_freqs.weight`，且 `llama.rope.scaling.type` 缺省、为 `none` 或 `yarn` | 本模型不实现的 Llama 3.1 式频率缩放 |
+| 没有 `attn_q_norm` / `attn_k_norm`；稠密注意力与 SwiGLU 张量齐全 | 其他块结构的系列 |
+
+被接受的文件以 `Mistral3Model` 加载。`Config.Architecture` 仍为 `mistral3`，因此对话
+渲染器、输出解析器和能力表都选择 Mistral 3；超参数与上下文长度则按文件实际使用的
+`llama.*` 前缀读取（`ModelBase.MetadataArchitecture`）。启动时打印
+`GGUF labelled 'llama' is served as mistral3`。未通过检查的 `llama` 文件仍被拒绝，
+且错误信息会说明 `mistral3` 接受什么样的文件。
+
+配套投影器文件名 `mmproj-mistralai_Mistral-Small-3.1-...-f16.gguf` 匹配自动发现规则
+`*mmproj*istral*.gguf`，因此 CLI 无需 `--mmproj` 即可在模型旁找到它；服务端仍通过
+`--mmproj` 传入。
+
+### llama.cpp 投影器文件
+
+bartowski 的 `mmproj-...-f16.gguf` 是 llama.cpp 的 `clip` 文件（`clip.projector_type
+= pixtral`）。编码器原本按 Ollama 的投影器编写，在这个文件上，每个图像请求起初都报
+HTTP 500（`KeyNotFoundException: 'v.patch_conv.weight'`）。修掉这一点之后模型仍然“看
+不见”：写着 `4821` 的红色卡片被读成蓝色的 `2975`。用真实投影器和图像，把编码器与
+Hugging Face Pixtral 视觉塔及 `Mistral3PatchMerger` 的转写实现逐一对比，找出了全部差异：
+
+| 差异 | 修复 |
+|---|---|
+| 张量名：`v.patch_embd`、`v.pre_ln`、`v.blk.N.ln1`/`ln2`/`attn_out`、`mm.input_norm`、`mm.patch_merger`、`mm.1`、`mm.2` | 加载时改名（`Mistral3VisionEncoder.CanonicalTensorName`）；Ollama 命名照常加载 |
+| llama.cpp 转换器把视觉 Q/K 的行重排为交错 RoPE 对（`LlamaModel.permute`） | llama.cpp 文件的 Q/K 行还原为 Hugging Face 的 rotate-half 布局（`UnpermuteInterleavedRows`） |
+| 视觉 MLP 写死为 SiLU。Mistral Small 3.1 的视觉塔用 GELU 门控（`hidden_act = "gelu"`，存为 `clip.use_gelu`） | 激活函数取自 `clip.use_gelu` / `clip.use_silu`。两者都没有的文件用 GELU，这也是 `PixtralVisionConfig` 的默认值 |
+| 2D RoPE 表按频率优先写入、按 patch 优先读取，每个 patch 拿到的是别的 patch 的角度 | 按 patch 优先构建（`BuildVisionRopeAngles`） |
+| patch merger 按 patch 逐个收集每个 2x2 窗口。`torch.nn.functional.unfold` 是通道优先 | 改为通道优先（`MergePatches`） |
+| Mistral 3 渲染器（总是使用自己的模板）跳过了媒体占位符处理。提示词里没有 `[IMG]`，编码好的图像被丢弃 | `RenderMistral3` 在文本前为每张图像输出一个 `[IMG]` |
+| 注入器把 `rows x cols` 个 patch 嵌入连续拷贝到一段 token 区间上，而这段 token 在每行之后都有一个 `[IMG_BREAK]`。越往后的行，错位越多，逐行滑到标记 token 上 | 嵌入按 token 的排布构建：每行 patch 之后接 `[IMG_BREAK]` 的 token 嵌入，最后一行之后接 `[IMG_END]`（`LayOutMistral3ImageRows`），与 llama.cpp 一致 |
+
+修复后，一张 640x480 图像的 391 个合并嵌入与参考实现的逐 token 余弦最小为 0.99999
+（托管 CPU 路径）。把 SiLU、旧的合并顺序或重排的 Q/K 中任意一项单独改回去，逐 token
+余弦均值分别降到 0.69、0.08、0.37。缺少编码器所需张量，或带有编码器不会应用的线性
+bias 的投影器，现在在加载时就被拒绝，错误信息会列出两种可接受的布局。此前编码器会
+静默跳过缺失的 norm，并在第一张图像时因缺失的 linear 崩溃。
+
+在发布媒体夹具上（`validate_deepseek41_media.py --scenarios image_ocr,multi_image,image_follow_up
+--concurrency 1,4`，Q4_K_M + f16 mmproj，`ggml_cuda`），TensorSharp 的 `image_ocr`
+5/5、`image_follow_up` 5/5 通过，`multi_image` 0/5 失败：在双图 prompt 上两个编码都少读
+最后一位（`482`、`936`）。同样文件上 llama.cpp 的 `llama-server` 得分为 `image_ocr` 2/5、
+`image_follow_up` 3/5、`multi_image` 2/5；它失败的那几次给出同样的三位答案
+（`["482", "936"]`），单图时还会把 `4821` 读成 `0482`。双图少读一位是这个检查点本身的
+读法，不是注入错误：TensorSharp 的日志显示第二张图紧接在第一张图的 `[IMG_END]` 之后。
+
+只有 llama.cpp 投影器与参考实现做过对比；手头没有 Ollama 布局的投影器，它按同样的规则加载：
+不还原 Q/K 行，除非声明 `clip.use_silu`，否则用 GELU。
 
 转换仓库将 [mistralai/Mistral-Small-3.1-24B-Instruct-2503](https://huggingface.co/mistralai/Mistral-Small-3.1-24B-Instruct-2503)
 标记为官方上游；两个模型卡都声明 Apache-2.0。
@@ -176,7 +241,7 @@ hidden ─► narrow(seq_len-1) if prefill
 - **Conv2D patch embedding**：`v.patch_conv.weight`（形状 `[hidden, channels, patchSize, patchSize]`）+ 可选 bias。
 - **RMSNorm** 在 encoder 输入。
 - **2D RoPE** 空间位置编码。
-- **SiLU-gated MLP transformer block**：LayerNorm + 多头 attention + residual + LayerNorm + SiLU-gated MLP + residual。
+- **门控 MLP transformer block**：RMSNorm + 多头 attention + residual + RMSNorm + 门控 MLP + residual。Mistral Small 3.1 的门控激活为 GELU（`clip.use_gelu`）；`clip.use_silu` 时为 SiLU。
 - **Spatial patch merging**：在 projector 边界把相邻 patch 合并为一个 token。
 - **多模态 projector**：RMSNorm → PatchMerger → Linear → GELU → Linear，映射到 LM hidden 维。
 
@@ -236,7 +301,7 @@ v.blk.{L}.attn_k.weight                    # K 投影
 v.blk.{L}.attn_v.weight                    # V 投影
 v.blk.{L}.attn_output.weight               # 输出投影
 v.blk.{L}.ffn_norm.weight                  # FFN 前 RMSNorm
-v.blk.{L}.ffn_gate.weight                  # SiLU gate
+v.blk.{L}.ffn_gate.weight                  # gate（GELU；clip.use_silu 时为 SiLU）
 v.blk.{L}.ffn_up.weight                    # up 投影
 v.blk.{L}.ffn_down.weight                  # down 投影
 mm.norm.weight                             # projector RMSNorm
@@ -244,6 +309,11 @@ mm.patch_merger.merging_layer.weight       # 空间 patch merger
 mm.linear_1.weight                         # projector linear 1
 mm.linear_2.weight                         # projector linear 2
 ```
+
+以上是 Ollama 的命名。llama.cpp 投影器把同样的张量命名为 `v.patch_embd`、`v.pre_ln`、
+`v.blk.{L}.ln1` / `ln2` / `attn_out`、`mm.input_norm`、`mm.patch_merger` 和
+`mm.1` / `mm.2`，并以重排后的形式存储 Q/K 行；见
+[llama.cpp 投影器文件](#llamacpp-投影器文件)。
 
 ## 7. TensorSharp 实现走读
 

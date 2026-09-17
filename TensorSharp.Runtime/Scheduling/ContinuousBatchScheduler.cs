@@ -838,13 +838,49 @@ namespace TensorSharp.Runtime.Scheduling
             int maxAdoptableBlocks = maxAdoptableTokens / _cfg.BlockSize;
 
             var matching = new List<KvBlock>();
-            int lastRestorable = -1;
             for (int i = 0; i < hashes.Count && i < maxAdoptableBlocks; i++)
             {
                 if (!_pool.TryFindByHash(hashes[i], out var block))
                     break;
                 matching.Add(block);
-                if (block.IsRestorablePrefixEnd)
+            }
+
+            // Where the matched K/V actually lives decides how it can be adopted. A
+            // block written by a batched paged step (IBatchedPagedModel.ForwardBatch)
+            // exists only in the model's paged arrays - nothing was extracted into the
+            // pool - so it is served by adopting it IN PAGED STORAGE: the sequence starts
+            // as a paged resident and its first forward reads those slots directly.
+            // Restoring such a block into the linear cache instead injects bytes that
+            // were never captured, which is how a repeated Mistral 3 / Hy-MT2 prompt
+            // longer than one block turned into fluent garbage. A block with a pool
+            // snapshot keeps the linear restore it always had. Recurrent models keep
+            // state outside the paged arrays and media prompts are peeled onto the
+            // per-sequence path, so neither adopts paged-only blocks.
+            int pagedChain = 0;
+            while (pagedChain < matching.Count && matching[pagedChain].HoldsModelPagedKv)
+                pagedChain++;
+            int snapshotChain = 0;
+            while (snapshotChain < matching.Count
+                   && !(matching[snapshotChain].HoldsModelPagedKv && !matching[snapshotChain].HoldsSnapshotBytes))
+                snapshotChain++;
+            bool adoptInPagedStorage = !_requiresPerBlockCapture
+                && string.IsNullOrEmpty(seq.MediaFingerprint)
+                && pagedChain > snapshotChain;
+            int usableBlocks = adoptInPagedStorage ? pagedChain : snapshotChain;
+            if (usableBlocks < matching.Count)
+            {
+                _logger.LogInformation(
+                    "Prefix cache matched {Matched} block(s) for {RequestId} but only {Usable} hold K/V this " +
+                    "request can read ({Where}); the rest of the prompt re-prefills.",
+                    matching.Count, seq.RequestId, usableBlocks,
+                    adoptInPagedStorage ? "model paged storage" : "pool snapshots");
+                matching.RemoveRange(usableBlocks, matching.Count - usableBlocks);
+            }
+
+            int lastRestorable = -1;
+            for (int i = 0; i < matching.Count; i++)
+            {
+                if (matching[i].IsRestorablePrefixEnd)
                     lastRestorable = i;
             }
 
@@ -876,6 +912,9 @@ namespace TensorSharp.Runtime.Scheduling
             {
                 seq.PrefixCacheReusedTokens = adoptedTokens;
                 seq.SetComputedTokensForPrefixAdoption(adoptedTokens);
+                // Set both ways: a preempted sequence re-admitted onto pool snapshots
+                // must not keep a stale paged-resident flag from its previous run.
+                seq.KvStateInPagedStorage = adoptInPagedStorage;
             }
         }
 

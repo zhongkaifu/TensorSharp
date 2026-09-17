@@ -773,7 +773,7 @@ These can be set with either the `--paged-kv*` / `--continuous-batching` CLI fla
 | `TS_SCHED_SOLO_PREFILL_CHUNK` | Prefill chunk size for the fresh (start_pos = 0) part of a SOLO prompt — one uncontended request gets big fused-prefill chunks (default: `8192`). |
 | `TS_SCHED_NUM_BLOCKS` | Physical blocks in the engine block pool (default: `256`). |
 | `TS_SCHED_BLOCK_SIZE` | Tokens per block on the engine side (default: `256`). |
-| `TS_SCHED_PREFIX_CACHE` | `0` disables block-hash prefix sharing across requests. |
+| `TS_SCHED_PREFIX_CACHE` | `0` disables block-hash prefix sharing across requests. A block written by a batched paged step is adopted in the model's paged storage (the request starts as a paged resident); a block with a pooled snapshot is restored into the linear cache. A block that has neither form a request can read is not adopted and re-prefills. |
 | `TS_SCHED_STOP_REPETITION` | `0` lets a generation that has locked into a loop run to its token limit instead of being stopped. |
 | `TS_SCHED_DECODE_QUANTUM` | Tokens before a sequence-switch is allowed (default: block size). |
 | `TS_RETAINED_FUSED_CACHE` | `1` (default) retains a finished request's fused holder so an exact-prefix continuation skips re-prefilling it, on models that advertise support (Gemma 4 K/V; Qwen 3.5/3.6 attention K/V plus GatedDeltaNet recurrent state). `0` disables it (VRAM cap / A-B). |
@@ -792,7 +792,8 @@ These can be set with either the `--paged-kv*` / `--continuous-batching` CLI fla
 | `TS_NEMOTRON_MAMBA2_BATCHED_NATIVE` | Use the native Mamba2 batched step kernel inside Nemotron-H batched path. |
 | `TS_NEMOTRON_ATTN_SCORE_BUDGET_MB` | Nemotron-H: largest attention score tensor (MiB) the materialized prefill fallback builds before it attends in query sub-chunks (default 1024). Not used by the GGML fused prefill kernel (F32/F16 cache), which switches to flash attention once the scores would be large. |
 | `TS_MAMBA2_PREFILL_CACHE_MB` | Nemotron-H: device memory (MiB) the cached native Mamba2 prefill graphs may hold, least recently used first out (default 1024). A graph larger than the budget serves its call and is released. |
-| `TS_PAGED_ATTN_KERNEL` | Paged-attention dispatch kernel for `Mistral3Model.BatchedForward`: `native` (default), `tensor` (C# Tensor-based), or `managed` (pure C# scalar). |
+| `TS_PAGED_ATTN_KERNEL` | Paged-attention dispatch kernel for `Mistral3Model.BatchedForward` and `HunyuanDenseModel.BatchedForward`: `native` (default), `tensor` (C# Tensor-based), or `managed` (pure C# scalar). |
+| `TS_HUNYUAN_BATCHED` | Set to `0` to force Hunyuan Dense onto the per-sequence KV-snapshot swap path (default: batched/paged; a block-quantized KV cache always uses the snapshot path). |
 | `TS_MLX_PIPELINED_DECODE` | `1` (default) enables pipelined greedy decode on the MLX backend when the request is greedy, has no stop sequences, and the model supports device-side argmax / next-embedding lookup. Set to `0` to disable. CLI only. |
 | `TS_MLX_MLOCK_GGUF` | `1` (default) pins the GGUF mmap region in physical RAM via `mlock(2)` so model weights stay resident between forward passes. Set to `0` to skip (use if the process `memlock` rlimit is too low or you want the OS to manage paging). MLX backend only. |
 | `TS_MLX_FUSED_KV_WRITE` | `1` (default) uses a single multi-dim `slice_update` to write the per-token KV block. Set to `0` to revert to the per-head loop (A/B testing / regression isolation). |
@@ -1772,6 +1773,7 @@ Quick reference for which environment variables (and matching CLI flags) gate ea
 | Model | Default state | Env var to flip default | Native-kernel sub-toggle |
 |---|---|---|---|
 | Mistral 3 | ON | — | `TS_PAGED_ATTN_KERNEL` = `native` (default) / `tensor` / `managed` |
+| Hunyuan Dense | ON (off for a block-quantized KV cache) | `TS_HUNYUAN_BATCHED=0` to force the KV-snapshot swap path | `TS_PAGED_ATTN_KERNEL` = `native` (default) / `tensor` / `managed` |
 | Gemma 4 | ON | `TS_GEMMA4_BATCHED=0` to force legacy per-seq | `TS_GEMMA4_BATCHED_CAPS=0` forces the v1 gates of the token-batched fused decode kernel (PLE / shared-KV / wrapped-SWA models such as E2B/E4B then decode round-robin) |
 | Qwen 3.5 / 3.6 family | ON | `TS_QWEN35_BATCHED=0` to force legacy per-seq (or `--no-continuous-batching`) | `TS_QWEN35_BATCHED_GDN_NATIVE=1` enables native batched GDN kernel; `FUSED_ATTN_LAYER_MIN_SEQ_LEN=N` overrides fused-attention engage threshold (default 4096) |
 | GPT OSS | ON | `TS_GPTOSS_BATCHED=0` to force legacy per-seq | `TS_GPTOSS_PAGED_ATTN_MANAGED=1` forces the managed (C#) sinks softmax instead of the native paged-attention-with-sinks kernel |

@@ -99,9 +99,27 @@ namespace TensorSharp.Models.Architecture
             {
                 if (TryGet(architecture, out var byName))
                     return byName;
+
+                // A generic label (llama) is never an alias: it is claimed per file, by
+                // the one family whose own recogniser matches the file's contents.
+                var relabelClaimants = All.Where(d => d.RecognizeRelabelledFile != null).ToArray();
+                if (probe != null)
+                {
+                    foreach (var candidate in relabelClaimants)
+                    {
+                        if (candidate.RecognizeRelabelledFile(architecture, probe))
+                            return candidate;
+                    }
+                }
+
+                string relabelHint = relabelClaimants.Length == 0
+                    ? string.Empty
+                    : " No family that also accepts a differently labelled file recognised this one: " +
+                      string.Join("; ", relabelClaimants.Select(d => $"{d.Id} ({d.RelabelledFileDescription})")) + ".";
                 throw new NotSupportedException(
                     $"Unsupported architecture: {architecture}. Registered: " +
-                    string.Join(", ", All.Select(d => d.Id).OrderBy(x => x, StringComparer.Ordinal)) + ".");
+                    string.Join(", ", All.Select(d => d.Id).OrderBy(x => x, StringComparer.Ordinal)) + "." +
+                    relabelHint);
             }
 
             if (probe != null)

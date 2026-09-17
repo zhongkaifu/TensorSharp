@@ -83,6 +83,10 @@ namespace TensorSharp.Runtime.Paged
                 block.RefCount = 1;
                 block.Used = 0;
                 block.IsRestorablePrefixEnd = true;
+                // A new owner rewrites the block from position 0 on whichever path it
+                // takes; neither the previous paged K/V nor its snapshot describes it.
+                block.HoldsModelPagedKv = false;
+                block.HoldsSnapshotBytes = false;
                 result[i] = block;
             }
             return result;
@@ -151,6 +155,7 @@ namespace TensorSharp.Runtime.Paged
                 _hashIndex.Unregister(hash, block);
                 block.ContentHash = null;
                 block.IsRestorablePrefixEnd = true;
+                block.HoldsSnapshotBytes = false;
                 // Drop the slab too - the new owner will rewrite it on first
                 // capture, and keeping the stale bytes alive wastes memory.
                 _storage.ReleaseSlab(block.Id);

@@ -78,6 +78,17 @@ namespace TensorSharp.Runtime.Paged
                     $"AdvanceTokens({newTokens}) wants {neededBlocks} blocks but only {_blocks.Count} are allocated.");
         }
 
+        /// <summary>Set <see cref="KvBlock.HoldsModelPagedKv"/> on every block that
+        /// covers a position in [<paramref name="fromToken"/>, <paramref name="toToken"/>).</summary>
+        internal void SetHoldsModelPagedKv(int fromToken, int toToken, bool value)
+        {
+            if (toToken <= fromToken || fromToken < 0)
+                return;
+            int last = Math.Min(_blocks.Count - 1, (toToken - 1) / _blockSize);
+            for (int b = fromToken / _blockSize; b <= last; b++)
+                _blocks[b].HoldsModelPagedKv = value;
+        }
+
         /// <summary>Truncate the sequence back to <paramref name="newTokenCount"/>.
         /// Returns blocks that should be freed (those whose first position was
         /// past <paramref name="newTokenCount"/>). The returned blocks are

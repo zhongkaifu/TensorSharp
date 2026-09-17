@@ -1056,6 +1056,42 @@ namespace TensorSharp.Models
             });
         }
 
+        /// <summary>
+        /// The prompt carries each image as rows of <c>[IMG]</c> separated by
+        /// <c>[IMG_BREAK]</c> and closed by <c>[IMG_END]</c>, but the encoder returns only
+        /// the <paramref name="rows"/> x <paramref name="cols"/> patch embeddings. The span
+        /// is injected row-for-row from its first position, so the embedding has to be laid
+        /// out exactly like the tokens: each row of patches followed by the break (or, for
+        /// the last row, end) marker's own token embedding - what llama.cpp's Pixtral graph
+        /// builds from <c>v.token_embd.img_break</c>. Before this the 391 patch rows of a
+        /// 23x17 image were copied contiguously over a 408-token span: every row after the
+        /// first slid one position further onto the markers, and the last 17 positions kept
+        /// the plain <c>[IMG]</c>/<c>[IMG_BREAK]</c> text embeddings.
+        /// </summary>
+        internal static unsafe Tensor LayOutMistral3ImageRows(Tensor patches, Tensor markers, int rows, int cols)
+        {
+            int dim = (int)patches.Sizes[1];
+            if (patches.Sizes[0] != (long)rows * cols)
+                throw new InvalidOperationException($"Mistral 3 image encoder returned {patches.Sizes[0]} patch rows for a {cols}x{rows} grid.");
+            if (markers.Sizes[0] != 2 || markers.Sizes[1] != dim)
+                throw new InvalidOperationException("Mistral 3 image layout needs the [IMG_BREAK] and [IMG_END] token embeddings.");
+
+            float[] patchData = patches.GetElementsAsFloat((int)patches.ElementCount());
+            float[] markerData = markers.GetElementsAsFloat((int)markers.ElementCount());
+            var laid = new float[(long)rows * (cols + 1) * dim];
+            for (int r = 0; r < rows; r++)
+            {
+                int dstRow = r * (cols + 1);
+                Array.Copy(patchData, (long)r * cols * dim, laid, (long)dstRow * dim, (long)cols * dim);
+                int marker = r == rows - 1 ? 1 : 0;
+                Array.Copy(markerData, (long)marker * dim, laid, (long)(dstRow + cols) * dim, dim);
+            }
+
+            var result = new Tensor(patches.Allocator, DType.Float32, rows * (cols + 1), dim);
+            result.SetElementsAsFloat(laid);
+            return result;
+        }
+
         private CachedEmbedding GetOrCreateMistral3VisionEmbedding(
             Mistral3Model model,
             Mistral3ImageProcessor processor,
@@ -1064,9 +1100,14 @@ namespace TensorSharp.Models
             return GetOrCreateCachedEmbedding(_visionCache, imagePath, fullPath =>
             {
                 var (pixels, imageWidth, imageHeight) = processor.ProcessImage(fullPath);
-                Tensor embeddings = model.VisionEncoder.Encode(pixels, imageWidth, imageHeight);
                 int numRows = imageHeight / model.VisionEncoder.PatchSize / model.VisionEncoder.SpatialMergeSize;
                 int numCols = imageWidth / model.VisionEncoder.PatchSize / model.VisionEncoder.SpatialMergeSize;
+                using Tensor patches = model.VisionEncoder.Encode(pixels, imageWidth, imageHeight);
+                using Tensor markers = model.EmbedTokensForMultimodal(new[]
+                {
+                    Mistral3ImageProcessor.ImgBreakTokenId, Mistral3ImageProcessor.ImgEndTokenId,
+                });
+                Tensor embeddings = LayOutMistral3ImageRows(patches, markers, numRows, numCols);
                 return CreateCachedEmbedding(fullPath, embeddings, numRows, numCols);
             });
         }
