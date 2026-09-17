@@ -232,6 +232,64 @@ for GGML backends:
 `TS_PAGED_ATTN_KERNEL=native|tensor|managed` selects the Mistral 3 dispatch path.
 GPT OSS can force the managed sinks path with `TS_GPTOSS_PAGED_ATTN_MANAGED=1`.
 
+### Output identity under concurrency
+
+The same batches must give the same logits, bit for bit. Different batches may not.
+Which requests share a step, and how many tokens each forwards, decides which
+kernels run: ggml-cuda serves a quantized MXFP4 `mul_mat_id` with MMVQ for up to 7
+tokens on Turing and Ampere (8 on Volta, Ada and Blackwell) and with MMQ above that,
+and a sequence that arrives
+alone takes the solo fused path first. Those kernels agree only up to floating-point
+near-ties, and greedy decoding turns a near-tie into a different continuation. A
+concurrent round whose arrival order is not fixed can therefore produce different
+tokens from run to run without any defect. Two runs that schedule the same batches
+cannot.
+
+To tell the two apart:
+
+- `TS_CB_DEBUG=1` prints one `[cb] step#N <path>` line per engine step with every
+  scheduled request (`id:P|D fwd=<tokens> computed=<tokens after the step>`) and a
+  fingerprint of the logits it left: the top two tokens, their margin and a hash of
+  the whole row. Diff two runs step by step. A different composition before the
+  first differing hash is the near-tie class; the same composition with a different
+  hash is a bug.
+- `AgentTurnBench --conc-gate` holds the engine's compute gate until a whole
+  concurrent round is queued, so every run admits the round in the same batches.
+  Its rows record `ArrivalOrderFixed: true`, and `compare.py` requires identical
+  tokens for them. Concurrent rows without it report token differences as
+  informational unless `--require-concurrent-identity` is passed.
+
+**Measured (2026-09-17, gpt-oss-20b MXFP4, 1x A40, `ggml_cuda`, `TS_PER_SEQ_FUSED=0`,
+`AgentTurnBench --conc 1,4,8`).** Four concurrent greedy requests diverged at output
+tokens 3-26 between runs, including between the warm-up pass and the measured pass of
+one process; in those runs eight did not. The step trace showed the same batches in both runs and,
+at the first decode step, logits several units apart (41.28 against 38.84 for the
+same token) with every margin still wide. That was a defect, not a near-tie. The
+standalone MoE kernel (`TSGgml_MoEFFNPrefillSwiGLUQuantF32`, which the batched paged
+path uses for GPT OSS's experts) uploaded its per-expert biases as graph leafs in the
+reusable compute buffer. The allocator freed the gate bias after its `add_id` and
+placed the SwiGLU activation on top of it. ggml-cuda fuses `{mul_mat_id, add_id,
+mul_mat_id, add_id, swiglu_oai}` into one MMVQ kernel for 1-7 tokens. That kernel
+reads the biases while it writes the activation, and its overlap check skips leafs
+because llama.cpp's biases are weights. So the kernel overwrote the bias it was still
+reading. On this Ampere card eight tokens take MMQ, which does not fuse, which is why
+the 8-request round stayed stable; on Ada or Blackwell eight tokens still take MMVQ and
+would have been hit too. The builder now pins every small uploaded parameter (ids, routing
+weights, biases, post-norm weight) with the allocator's output flag. The CTest
+`moe-fused-bias-alias-cuda` (`GgmlOpsMoeFusedBiasAliasTest`) compares the kernel
+against an exact host evaluation for 1, 4 and 7 tokens. Before the fix the 4- and
+7-token cases were off by up to 644 and 1118 against tolerances of 21 and 25 and were
+not repeatable (the 1-token case passed); after it they match the CPU backend.
+`moe-fused-bias-alias-metal` runs the same check on Metal, which does not fuse this
+chain and passed before the fix too.
+
+After the fix, with `--conc-gate`, three passes gave bit-identical logits at every
+step of the 1-, 4- and 8-request rounds. Without the gate, one pass in three still
+changed the 8-request round. Its first request had been scheduled alone on the solo
+fused path before the other seven arrived. The first logits already differed at
+that step (42.94 against 42.86), and the argmax flips came later, at margins of
+0.011-0.11. That is the near-tie class, and `compare.py` reports it without failing.
+
 ### Per-Sequence Fallback
 
 The fallback path still runs inside `InferenceEngine`; it is no longer the
@@ -402,6 +460,7 @@ tokens another conversation's state matched past the public prefix.
 | Cross-request isolation and media identity | `ModelServiceRawTokenHistoryTests` and `ToolTranscriptSpliceTests` (content-verified raw-token splice), `PooledPrefixScopeAndMediaTests`, `ContentAddressedMediaTests`; `Gemma4MediaAfterReusedPrefixExactnessTests` (model-gated: an image or audio turn after a reused prefix against a cold prefill) and `Gemma4SoftTokenMaskTests` |
 | Reuse past media (Qwen 3.5 M-RoPE) | `Qwen35MRopeReferencePositionTests` (positions against an SGLang `get_rope_index` fixture), opt-in `Qwen35ImageFollowUpExactnessTests` (reuse vs cold after an image with real weights, solo and concurrent, checkpoint file round trip) |
 | Per-model correctness | `Qwen35BatchedCorrectnessTests`, `Mistral3BatchedForwardTests`, `Gemma4BatchedForwardTests`, `GptOssBatchedCorrectnessTests`, `NemotronBatchedCorrectnessTests` |
+| Batched MoE kernel under backend fusion | Native CTest `moe-fused-bias-alias-cpu` / `moe-fused-bias-alias-cuda` / `moe-fused-bias-alias-metal` (`GgmlOpsMoeFusedBiasAliasTest`): the standalone MoE FFN kernel with per-expert biases against an exact host evaluation, 1, 4 and 7 tokens, repeated |
 | MTP speculative decoding | `SpeculativeExecutionTests` (draft/verify/rollback core), opt-in end-to-end `Qwen36SpeculativeTests` (`TS_MTP_E2E=1`) and `Gemma4SpeculativeTests` (`TS_GMTP_E2E=1`) with real GGUFs |
 | Per-model performance probes | `Gemma4BatchedPerfBench`, `Qwen35BatchedPerfBench`, `GptOssBatchedPerfBench`, `NemotronBatchedPerfBench` |
 | DiffusionGemma path | `DiffusionGemmaTests` for denoising, prompt-KV caching, and batched generation probes |

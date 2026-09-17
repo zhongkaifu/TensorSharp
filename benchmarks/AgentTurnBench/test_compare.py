@@ -103,6 +103,42 @@ class CompareTests(unittest.TestCase):
                 result = self.run_comparison([row], [dict(row, TokenCounts=counts)])
                 self.assertEqual(1, result.returncode)
 
+    def test_unordered_concurrent_token_change_is_informational_unless_required(self):
+        row = dict(self.row, TokenCounts=[1, 2], PrefillTps=0)
+        changed = dict(row, Tokens=[10, 21, 30])
+        result = self.run_comparison([row], [changed])
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("TOKENS INFORMATIONAL:", result.stdout)
+        self.assertIn("output token 1 changed", result.stdout)
+        self.assertIn("identical tokens except 1 unordered concurrent comparison", result.stdout)
+        self.assertNotIn("PASS: identical tokens and workload shapes", result.stdout)
+        result = self.run_comparison([row], [changed], extra=["--require-concurrent-identity"])
+        self.assertEqual(1, result.returncode)
+        self.assertIn("output token 1 changed", result.stderr)
+
+    def test_fixed_arrival_order_and_single_requests_keep_strict_token_identity(self):
+        ordered = dict(self.row, TokenCounts=[1, 2], PrefillTps=0, ArrivalOrderFixed=True)
+        cases = (
+            ("both runs ordered", ordered, dict(ordered, Tokens=[10, 21, 30])),
+            ("one request", dict(self.row, TokenCounts=[3]), dict(self.row, TokenCounts=[3], Tokens=[10, 21, 30])),
+            ("no boundaries", self.row, dict(self.row, Tokens=[10, 21, 30])),
+        )
+        for label, before, after in cases:
+            with self.subTest(label):
+                result = self.run_comparison([before], [after])
+                self.assertEqual(1, result.returncode)
+                self.assertIn("output token 1 changed", result.stderr)
+        # Only one side ordered: the batches may still differ, so it stays informational.
+        result = self.run_comparison([ordered], [dict(ordered, ArrivalOrderFixed=False, Tokens=[10, 21, 30])])
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual(1, self.run_comparison(candidate=[dict(self.row, ArrivalOrderFixed="yes")]).returncode)
+
+    def test_unordered_concurrent_rows_still_require_request_lengths(self):
+        row = dict(self.row, TokenCounts=[1, 2], PrefillTps=0)
+        result = self.run_comparison([row], [dict(row, TokenCounts=[2, 1], Tokens=[10, 21, 30])])
+        self.assertEqual(1, result.returncode)
+        self.assertIn("token counts changed", result.stderr)
+
     def test_concurrent_first_tokens_only_has_no_decode_measurement(self):
         row = dict(self.row, TokenCounts=[1, 1, 1], DecodeTps=0, PrefillTps=0)
         result = self.run_comparison([row], [row])

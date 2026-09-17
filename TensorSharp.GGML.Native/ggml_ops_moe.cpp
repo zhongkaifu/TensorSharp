@@ -1031,6 +1031,29 @@ namespace
             return 0;
         }
 
+        // Keep every small host-uploaded parameter out of the allocator's free
+        // list. A graph allocator frees a leaf after its last consumer node and
+        // may place a later activation on top of it, which is safe only while
+        // every node runs on its own. Backends fuse nodes: ggml-cuda runs
+        // {mul_mat_id, add_id, mul_mat_id, add_id, swiglu} as ONE MMVQ kernel for
+        // a small token batch, reading the gate/up biases while it writes the
+        // activation, and its overlap check skips leafs because llama.cpp's biases
+        // are weights, never compute memory. Unpinned, the activation landed on the
+        // gate bias and the kernel overwrote the bias it was reading: wrong, run-to-
+        // run different expert outputs (gpt-oss batched decode of 2-7 sequences).
+        // An output flag is the allocator's "never free"; these tensors are a few
+        // hundred KB at most. The hidden input is not pinned: it can be tokens x
+        // hidden large, and every kernel that reads it (the expert matmuls)
+        // quantizes or gathers it before writing anything.
+        for (ggml_tensor* uploaded : { ids_t, weights_t, gate_bias_t, up_bias_t, down_bias_t, post_norm_w_t })
+        {
+            if (uploaded != nullptr)
+            {
+                ggml_set_input(uploaded);
+                ggml_set_output(uploaded);
+            }
+        }
+
         // --- Build graph ---
         // Reshape input to [hidden_dim, 1, seq_len] so mul_mat_id can broadcast
         // it across the n_used expert slots per token.

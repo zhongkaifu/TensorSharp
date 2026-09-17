@@ -435,7 +435,11 @@ namespace TensorSharp.Runtime.Scheduling
                     }
                     var results = TryExecutePath(plan.Candidates[i], output, options);
                     if (results != null)
+                    {
+                        if (_cbDebug)
+                            TraceStepResults(plan.Candidates[i], output, results);
                         return results;
+                    }
                 }
 
                 // Unreachable: the planner always terminates the chain with a
@@ -443,6 +447,54 @@ namespace TensorSharp.Runtime.Scheduling
                 // fallback so a planner bug degrades to correctness, not loss.
                 return ExecuteStepPerSequence(output);
             }
+        }
+
+        private long _cbStepIndex;
+
+        /// <summary>TS_CB_DEBUG=1 step trace: the path that served the step, every
+        /// scheduled sequence (request, prefill/decode, tokens forwarded, computed
+        /// tokens after the step) and a fingerprint of the logits it left behind: the
+        /// top two tokens with their margin and a hash of the whole row. Two runs of
+        /// the same workload can then be diffed step by step, telling a different
+        /// batch composition from the same composition producing different logits.</summary>
+        private void TraceStepResults(ExecutionPathKind path, SchedulerOutput output, List<SequenceStepResult> results)
+        {
+            var sb = new StringBuilder();
+            sb.Append("[cb] step#").Append(_cbStepIndex++).Append(' ').Append(path)
+              .Append(" scheduled=").Append(output.ScheduledWork.Count).Append(" served=").Append(results.Count);
+            foreach (var r in results)
+            {
+                var seq = r.Sequence;
+                sb.Append(" | ").Append(seq?.RequestId).Append(r.IsPrefill ? ":P" : ":D")
+                  .Append(" fwd=").Append(r.TokensForwarded)
+                  .Append(" computed=").Append(seq?.NumComputedTokens)
+                  .Append(" in=").Append(r.SampledToken);
+                if (r.Error != null) sb.Append(" error=").Append(r.Error.GetType().Name);
+                sb.Append(' ').Append(DescribeLogits(seq?.LastLogits));
+            }
+            // The step has already committed; a failing diagnostic writer must not
+            // turn it into a failed step.
+            try { Console.Error.WriteLine(sb.ToString()); }
+            catch (Exception) { }
+        }
+
+        internal static string DescribeLogits(float[] logits)
+        {
+            if (logits == null || logits.Length < 2) return "logits=<none>";
+            int top1 = logits[0] >= logits[1] ? 0 : 1, top2 = 1 - top1;
+            ulong hash = 14695981039346656037UL;
+            for (int i = 0; i < logits.Length; i++)
+            {
+                float v = logits[i];
+                if (i >= 2)
+                {
+                    if (v > logits[top1]) { top2 = top1; top1 = i; }
+                    else if (v > logits[top2]) top2 = i;
+                }
+                hash = (hash ^ (uint)BitConverter.SingleToInt32Bits(v)) * 1099511628211UL;
+            }
+            return string.Create(System.Globalization.CultureInfo.InvariantCulture,
+                $"top1={top1}:{logits[top1]:R} top2={top2}:{logits[top2]:R} margin={logits[top1] - logits[top2]:R} hash={hash:x16}");
         }
 
         /// <summary>Request-side features of this step (the planner input that

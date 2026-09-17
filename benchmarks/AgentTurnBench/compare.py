@@ -47,6 +47,8 @@ def load_rows(path):
                     or any(type(n) is not int or n < 0 for n in counts)
                     or (counts and sum(counts) != len(tokens))):
                 raise ValueError(f"{where}: invalid TokenCounts")
+        if "ArrivalOrderFixed" in row and type(row["ArrivalOrderFixed"]) is not bool:
+            raise ValueError(f"{where}: invalid ArrivalOrderFixed")
         for field, _ in METRICS:
             value = row.get(field)
             if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
@@ -69,7 +71,21 @@ def load_rows(path):
     return indexed
 
 
-def require_same_output(reference, other, path):
+def unordered_concurrent(before, after):
+    """Several requests whose arrival order the benchmark did not fix.
+
+    Submissions race the engine thread, so two runs can admit a round in different
+    batches (one request alone on the solo fused path, then the rest). Different
+    batches take different kernels, which is only floating-point identical up to
+    near-ties; greedy decoding then turns a near-tie into a different continuation.
+    `--conc-gate` fixes the arrival order and makes the batches, and therefore the
+    tokens, reproducible.
+    """
+    return (len(before.get("TokenCounts") or []) > 1
+            and not (before.get("ArrivalOrderFixed") is True and after.get("ArrivalOrderFixed") is True))
+
+
+def require_same_output(reference, other, path, strict_concurrent=False, notes=None):
     missing, extra = reference.keys() - other.keys(), other.keys() - reference.keys()
     if missing or extra:
         raise ValueError(f"{path}: row keys differ; missing={sorted(missing)}, extra={sorted(extra)}")
@@ -83,7 +99,11 @@ def require_same_output(reference, other, path):
             raise ValueError(f"{where}: concurrent request token counts changed")
         if before["Tokens"] != after["Tokens"]:
             first = next(i for i, (a, b) in enumerate(zip(before["Tokens"], after["Tokens"])) if a != b)
-            raise ValueError(f"{where}: output token {first} changed: {before['Tokens'][first]} -> {after['Tokens'][first]}")
+            message = f"{where}: output token {first} changed: {before['Tokens'][first]} -> {after['Tokens'][first]}"
+            if strict_concurrent or not unordered_concurrent(before, after):
+                raise ValueError(message)
+            if notes is not None:
+                notes.append(message)
 
 
 def delivery_dominance(baselines, candidates, key):
@@ -108,7 +128,7 @@ def delivery_dominance(baselines, candidates, key):
     return before_total, after_total
 
 
-def compare(baselines, candidates, max_regression):
+def compare(baselines, candidates, max_regression, token_notes=()):
     regressions = []
     exceptions = []
     print("Positive percentages mean higher throughput or longer TTFT. Repeated runs use medians.")
@@ -145,15 +165,21 @@ def compare(baselines, candidates, max_regression):
         print(f"{key[0]} / {key[1]} | " + " | ".join(cells))
     for exception in exceptions:
         print(f"DECODE-RATE EXCEPTION: {exception}")
+    for note in token_notes:
+        print(f"TOKENS INFORMATIONAL: {note} (concurrent arrival order not fixed; rerun both with --conc-gate, "
+              "or pass --require-concurrent-identity to fail on it)")
     for failure in regressions:
         print(f"FAIL: {failure}", file=sys.stderr)
     if regressions:
         return 1
+    tokens = (f"identical tokens and workload shapes in {len(baselines[0])} rows" if not token_notes else
+              f"identical workload shapes in {len(baselines[0])} rows, identical tokens except "
+              f"{len(token_notes)} unordered concurrent comparison(s) reported above")
     if exceptions:
-        print(f"PASS: identical tokens and workload shapes in {len(baselines[0])} rows; performance checks passed "
+        print(f"PASS: {tokens}; performance checks passed "
               f"with {len(exceptions)} decode-rate exception(s) supported by complete delivery timelines.")
     else:
-        print(f"PASS: identical tokens and workload shapes in {len(baselines[0])} rows; no regression above {max_regression:g}%.")
+        print(f"PASS: {tokens}; no regression above {max_regression:g}%.")
     return 0
 
 
@@ -167,6 +193,9 @@ def main():
                         help="additional baseline run; repeat this option for more runs")
     parser.add_argument("--candidate-repeat", action="append", default=[], metavar="JSON",
                         help="additional candidate run; repeat this option for more runs")
+    parser.add_argument("--require-concurrent-identity", action="store_true",
+                        help="fail on token differences in concurrent rows whose arrival order was not fixed "
+                             "(rows benchmarked without --conc-gate); by default they are reported only")
     args = parser.parse_args()
     if not math.isfinite(args.max_regression_percent) or args.max_regression_percent < 0:
         parser.error("--max-regression-percent must be finite and nonnegative")
@@ -175,9 +204,10 @@ def main():
         candidate_paths = [args.candidate, *args.candidate_repeat]
         baselines = [load_rows(path) for path in baseline_paths]
         candidates = [load_rows(path) for path in candidate_paths]
+        token_notes = []
         for path, run in zip(baseline_paths[1:] + candidate_paths, baselines[1:] + candidates):
-            require_same_output(baselines[0], run, path)
-        return compare(baselines, candidates, args.max_regression_percent)
+            require_same_output(baselines[0], run, path, args.require_concurrent_identity, token_notes)
+        return compare(baselines, candidates, args.max_regression_percent, token_notes)
     except (OSError, ValueError) as error:
         print(f"FAIL: {error}", file=sys.stderr)
         return 1

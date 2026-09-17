@@ -645,6 +645,21 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
     )
     target_link_libraries(GgmlOpsGetRowsQuantTest PRIVATE GgmlOps)
 
+    # The standalone MoE kernel's uploaded biases must never share memory with an
+    # activation a fused backend kernel writes while still reading them.
+    add_executable(GgmlOpsMoeFusedBiasAliasTest tests/moe_fused_bias_alias_test.cpp)
+    target_link_libraries(GgmlOpsMoeFusedBiasAliasTest PRIVATE GgmlOps)
+    add_test(NAME moe-fused-bias-alias-cpu COMMAND GgmlOpsMoeFusedBiasAliasTest cpu)
+    set_tests_properties(moe-fused-bias-alias-cpu PROPERTIES SKIP_RETURN_CODE 77)
+    if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
+        add_test(NAME moe-fused-bias-alias-cuda COMMAND GgmlOpsMoeFusedBiasAliasTest cuda)
+        set_tests_properties(moe-fused-bias-alias-cuda PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
+    if (APPLE AND TENSORSHARP_GGML_NATIVE_ENABLE_METAL)
+        add_test(NAME moe-fused-bias-alias-metal COMMAND GgmlOpsMoeFusedBiasAliasTest metal)
+        set_tests_properties(moe-fused-bias-alias-metal PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
+
     add_executable(GgmlOpsAddmmVectorTest tests/addmm_vector_test.cpp)
     target_include_directories(GgmlOpsAddmmVectorTest PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/include"
