@@ -1276,7 +1276,7 @@ namespace TensorSharp.Runtime.Scheduling
                     // its first forward. (Injection READS the shared blocks into
                     // this request's own cache; it never writes them.)
                     if (freshCache && seq.NumComputedTokens > 0)
-                        InjectAllBlocks(seq, seq.NumComputedTokens);
+                        InjectPrefixOrRecompute(seq, seq.NumComputedTokens);
 
                     // A solo decode step on the bound holder may speculate (see
                     // TrySpeculativeFusedDecode); a mixed step keeps every request
@@ -3331,7 +3331,7 @@ namespace TensorSharp.Runtime.Scheduling
                 }
                 else
                 {
-                    InjectAllBlocks(seq, seq.NumComputedTokens);
+                    InjectPrefixOrRecompute(seq, seq.NumComputedTokens);
                     _ownerTokensInModel = seq.NumComputedTokens;
                 }
             }
@@ -3535,12 +3535,16 @@ namespace TensorSharp.Runtime.Scheduling
         }
 
         /// <summary>Inject all blocks for <paramref name="seq"/> into the model's
-        /// fresh KV state. Called when swapping in.</summary>
-        private void InjectAllBlocks(SequenceState seq, int tokensToInject)
+        /// fresh KV state. Called when swapping in. Returns how many leading tokens
+        /// were actually injected: <paramref name="tokensToInject"/> on success, less
+        /// when a block could not be read or the model refused it (the model then
+        /// holds exactly the blocks before it, per the TryInjectKVBlock contract).</summary>
+        private int InjectAllBlocks(SequenceState seq, int tokensToInject)
         {
-            if (!_model.SupportsKVStateSnapshot || !_model.SupportsCrossSequenceKvReuse) return;
-            if (tokensToInject <= 0) return;
+            if (tokensToInject <= 0) return 0;
+            if (!_model.SupportsKVStateSnapshot || !_model.SupportsCrossSequenceKvReuse) return 0;
 
+            int injected = 0;
             int blocks = seq.BlockTable.NumBlocks;
             for (int b = 0; b < blocks; b++)
             {
@@ -3558,7 +3562,7 @@ namespace TensorSharp.Runtime.Scheduling
                     _logger.LogWarning(
                         "Inject would underflow for sequence {RequestId} block {Block}: have {Have} need {Need}",
                         seq.RequestId, b, src.Length, expectedBytes);
-                    return;
+                    break;
                 }
                 var slice = src[..(int)expectedBytes];
                 if (!_model.TryInjectKVBlock(startToken, tokensInBlock, slice))
@@ -3566,9 +3570,116 @@ namespace TensorSharp.Runtime.Scheduling
                     _logger.LogWarning(
                         "Inject failed for sequence {RequestId} block {Block} at {Start}",
                         seq.RequestId, b, startToken);
-                    return;
+                    break;
+                }
+                injected = startToken + tokensInBlock;
+            }
+            return injected;
+        }
+
+        /// <summary>
+        /// Make the model hold <paramref name="seq"/>'s first <paramref name="tokens"/>
+        /// computed tokens from its blocks (radix design M0e, D10/P16).
+        ///
+        /// <para>An inject that stops early used to be silent: the sequence kept its
+        /// claimed <see cref="SequenceState.NumComputedTokens"/>, so the next forward
+        /// appended at the model's real head while every position after it was
+        /// numbered as if the whole prefix were there, and
+        /// <see cref="SequenceState.PrefixCacheReusedTokens"/> still reported the
+        /// promised reuse. A materialization failure is now a MISS, never a partial
+        /// state: the reuse accounting drops to what was materialized, the request is
+        /// reset to that length, and the lost tail is forwarded again right here, so
+        /// the model and the step's already-planned work agree again. The re-forward
+        /// is done in place rather than left to the next schedule because the
+        /// scheduler still treats a sequence whose prompt is computed as a decoder
+        /// and would never re-forward generated tokens (D7, M0d).</para>
+        /// </summary>
+        private void InjectPrefixOrRecompute(SequenceState seq, int tokens)
+        {
+            int injected = InjectAllBlocks(seq, tokens);
+            if (injected >= tokens)
+                return;
+
+            int usable = LastRestorableInjectedLength(seq, injected);
+            if (usable < injected)
+            {
+                // A per-block-capture (recurrent) model restores its running state from
+                // the LAST injected block, which is only a real checkpoint at a
+                // restorable endpoint. Rebuild from the deepest one, or from nothing.
+                _model.ResetKVCache();
+                if (usable > 0 && InjectAllBlocks(seq, usable) < usable)
+                {
+                    _model.ResetKVCache();
+                    usable = 0;
                 }
             }
+            else if (usable == 0)
+            {
+                _model.ResetKVCache();
+            }
+
+            _logger.LogWarning(
+                "Materializing the cached prefix of {RequestId} stopped at {Materialized} of {Claimed} tokens; " +
+                "reuse is corrected to {Reused} and the remaining {Recompute} tokens are forwarded again.",
+                seq.RequestId, usable, tokens, Math.Min(seq.PrefixCacheReusedTokens, usable), tokens - usable);
+
+            seq.PrefixCacheReusedTokens = Math.Min(seq.PrefixCacheReusedTokens, usable);
+            seq.RevokeComputedTokensTo(usable);
+            RecomputeLostTail(seq, tokens);
+        }
+
+        /// <summary>The injected length a model can actually resume from. Attention-only
+        /// models resume at any injected block end; a per-block-capture model only at a
+        /// block whose payload was captured at its own endpoint.</summary>
+        private int LastRestorableInjectedLength(SequenceState seq, int injected)
+        {
+            if (injected <= 0 || !_model.RequiresPerBlockCapture)
+                return Math.Max(0, injected);
+            // A shortfall always stops at a block start, so every injected block is full.
+            for (int b = injected / _blockSize - 1; b >= 0; b--)
+            {
+                if (seq.BlockTable.Blocks[b].IsRestorablePrefixEnd)
+                    return (b + 1) * _blockSize;
+            }
+            return 0;
+        }
+
+        /// <summary>Forward <paramref name="seq"/>'s tokens from its (just revoked)
+        /// computed count up to <paramref name="target"/>, in scheduler-sized chunks,
+        /// without sampling. The logits the sequence will sample from next are kept.</summary>
+        private void RecomputeLostTail(SequenceState seq, int target)
+        {
+            int start = seq.NumComputedTokens;
+            if (start >= target)
+                return;
+            // The logits a decoder samples from next may be the model's own buffer
+            // (borrowed on a single-work step), which the forwards below overwrite.
+            float[] pendingLogits = seq.LastLogits != null ? (float[])seq.LastLogits.Clone() : null;
+            float[] lastLogits = null;
+            int chunk = Math.Max(1, _scheduler.Config.MaxNumBatchedTokens);
+            int promptTokens = seq.PromptTokens.Count;
+            while (start < target)
+            {
+                int n = Math.Min(chunk, target - start);
+                // Never mix prompt and generated tokens in one forward, as the planned
+                // steps never do: a prompt slice queues its media embeddings and M-RoPE
+                // position table for exactly its prompt tokens, so a forward that ran on
+                // into generated tokens would carry a position table shorter than itself.
+                if (start < promptTokens)
+                    n = Math.Min(n, promptTokens - start);
+                var tokens = new int[n];
+                for (int i = 0; i < n; i++)
+                    tokens[i] = seq.TokenAt(start + i);
+                if (_model.MultimodalInjector != null && start < promptTokens)
+                {
+                    _model.MultimodalInjector.QueuePromptEmbeddingsForSlice(
+                        start, Math.Min(n, promptTokens - start), seq.RequestId);
+                }
+                lastLogits = _model.Forward(tokens);
+                seq.AdvanceComputedTokens(n);
+                start += n;
+            }
+            seq.LastLogits = pendingLogits ?? (lastLogits != null ? (float[])lastLogits.Clone() : null);
         }
 
         /// <summary>For each newly-full block, extract its content into the

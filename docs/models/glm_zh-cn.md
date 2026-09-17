@@ -533,6 +533,11 @@ KDA 递归状态（卷积尾部 + delta-net 状态，每序列约 150 MB）无�
 会连同位置计数一起清空该状态。唯一精确的"回退"是投机解码的回滚：每次验证批次之前
 都会在设备上拍一份该状态的快照，窗口被部分拒绝时再拷回去（见[投机解码](#glm-53-flash-上的投机解码)）。
 
+原生执行器拒绝的 KV 回退（目标超过 slot 当前位置、glm5next 上除回到 0 或当前位置之外的任何回退，
+或 KDA 恢复失败的 slot），在 glm-dsa 与 glm5next 上都会作为拒绝返回给调用方：`TryTruncateKVCache`
+返回 false，引擎改为重新 prefill 而不复用；不可拒绝的 `TruncateKVCache` 会抛异常。过去它会在位置
+没有移动的情况下报告成功（`GlmTruncateRefusalTests`）。
+
 ### 原生本地张量并行
 
 不传 `--tp` 时，仍使用跨所有可见 GPU 的自动按层切分。在 GGML GPU 后端上，

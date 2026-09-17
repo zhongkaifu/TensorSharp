@@ -245,6 +245,21 @@ namespace TensorSharp.Runtime.Scheduling
             BlockTable.AdvanceTokens(n);
         }
 
+        /// <summary>Move the computed-token counter BACK to <paramref name="n"/>,
+        /// keeping every allocated block. Used when a prefix the scheduler counted as
+        /// computed turns out, at execution, to be only partly materialized in the
+        /// model (a pooled inject that stopped at a block): the counter and the block
+        /// table's token count must describe what the model actually holds before
+        /// anything is forwarded on top of it.</summary>
+        internal void RevokeComputedTokensTo(int n)
+        {
+            if (n < 0 || n > NumComputedTokens)
+                throw new ArgumentOutOfRangeException(nameof(n));
+            NumComputedTokens = n;
+            BlockTable.ResetTokensKeepingBlocks();
+            BlockTable.AdvanceTokens(n);
+        }
+
         /// <summary>Reset computed-token counter to 0. Called when the
         /// sequence is preempted - its blocks were freed, the next admission
         /// re-prefills from scratch (with the help of the prefix cache).</summary>

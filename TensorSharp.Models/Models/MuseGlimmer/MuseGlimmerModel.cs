@@ -480,6 +480,7 @@ namespace TensorSharp.Models
         protected override void ResetKVCacheCore()
         {
             _cacheSeqLen = 0;
+            _ringWrittenTokens = 0;
             _cachedSWAMaskStartPos = -1;
             ResetFusedDecodeCache();
             _linearTicks = _attnTicks = _normTicks = _embTicks = _lmHeadTicks = _logitsCopyTicks = 0;
@@ -494,7 +495,76 @@ namespace TensorSharp.Models
             }
         }
 
+        /// <summary>
+        /// Whether a rewind from <paramref name="cachedTokenCount"/> to
+        /// <paramref name="targetTokenCount"/> leaves every sliding-window row the next
+        /// query needs intact in a ring of <paramref name="ringRows"/> rows.
+        ///
+        /// <para>A ring layer stores position <c>p</c> at row <c>p % rows</c>, so once the
+        /// sequence passes <c>rows</c> tokens each new position overwrites the oldest one.
+        /// Rewinding moves only the head: the rows positions below the target lost to the
+        /// wrap do not come back, and a query at the target still attends a whole window
+        /// behind it. The window behind the target survives while
+        /// <c>written - target &lt;= rows - window - 1</c> (the ring is window + chunk + 1
+        /// rows, so the 16-token live-cache rewind always fits whenever the prefill chunk
+        /// is at least 16). A ring that never wrapped (<c>written &lt;= rows</c>) still
+        /// holds every row, and dropping to zero or to the head reads nothing old.</para>
+        ///
+        /// <para><c>written</c> is the furthest head this cache reached since it was last
+        /// emptied, not the current head: an earlier accepted rewind can bring the head
+        /// back below <c>rows</c> while the rows its wrap overwrote stay overwritten, so
+        /// a second rewind judged by the current head alone would pass as "never
+        /// wrapped" and read them.</para>
+        ///
+        /// <para>Muse-Glimmer had no such guard, so a deeper rewind on a wrapped ring
+        /// continued from rows another position had overwritten (radix design P23, M0c).</para>
+        /// </summary>
+        internal static bool RingRewindIsExact(int cachedTokenCount, int targetTokenCount, int ringRows, int slidingWindow,
+            int writtenTokenCount = 0)
+        {
+            if (targetTokenCount < 0 || targetTokenCount > cachedTokenCount) return false;
+            if (targetTokenCount == cachedTokenCount || targetTokenCount == 0) return true;
+            int written = Math.Max(cachedTokenCount, writtenTokenCount);
+            if (ringRows <= 0 || written <= ringRows) return true;
+            return written - targetTokenCount <= ringRows - slidingWindow - 1;
+        }
+
+        /// <summary>The furthest head this cache has reached since it was last emptied
+        /// (reset, or truncated to zero). Only a rewind lowers the head, so it is folded
+        /// in there; see <see cref="RingRewindIsExact"/>.</summary>
+        private int _ringWrittenTokens;
+
+        private void NoteHeadBeforeRewind(int tokenCount)
+            => _ringWrittenTokens = tokenCount == 0 ? 0 : Math.Max(_ringWrittenTokens, _cacheSeqLen);
+
+        public override bool CanTruncateKVCache(int cachedTokenCount, int targetTokenCount)
+            => base.CanTruncateKVCache(cachedTokenCount, targetTokenCount)
+                && RingRewindIsExact(cachedTokenCount, targetTokenCount, _kvSwaRows, _slidingWindow, _ringWrittenTokens);
+
+        /// <summary>
+        /// Refuses (changing nothing) a rewind the ring cannot honour; see
+        /// <see cref="RingRewindIsExact"/>. The caller then resets and re-prefills.
+        /// </summary>
+        protected override bool TryTruncateKVCacheCore(int tokenCount)
+        {
+            if (!CanTruncateKVCache(_cacheSeqLen, tokenCount)) return false;
+            NoteHeadBeforeRewind(tokenCount);
+            ApplyKVCacheTruncation(tokenCount);
+            return true;
+        }
+
+        /// <summary>The non-refusable form throws on a rewind the ring cannot honour,
+        /// rather than continuing from overwritten rows (Gemma 4 keeps the same contract).</summary>
         protected override void TruncateKVCacheCore(int tokenCount)
+        {
+            if (!TryTruncateKVCacheCore(tokenCount))
+                throw new InvalidOperationException(
+                    $"Muse-Glimmer cannot truncate its KV cache from {_cacheSeqLen} to {tokenCount}: its " +
+                    $"{_kvSwaRows}-row sliding-window ring no longer holds the window behind that position. " +
+                    "Use TryTruncateKVCache and re-prefill when it declines.");
+        }
+
+        private void ApplyKVCacheTruncation(int tokenCount)
         {
             // The fused kernel writes K/V on-device and leaves the host mirror stale
             // (_fusedKvDirty). The invalidation below drops the device copies so the
