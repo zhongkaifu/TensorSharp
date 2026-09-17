@@ -40,6 +40,31 @@ dotnet run --project TensorSharp.Cli -c Release -- \
 
 `--draft-model` can also be supplied as `TS_MUSE_GLIMMER_DFLASH`.
 
+### Structured output
+
+The generation prompt ends at `<|start|>assistant`, so a normal reply begins
+with its own routing header (` to=self<|message|>` for reasoning,
+` to=user<|message|>` or `<|message|>` for the answer). With
+`response_format` the JSON grammar enforces from the first token, so the model
+writes the object with no header at all. `MuseGlimmerOutputParser` treats a
+reply that cannot start a header (JSON's `{`, `[`, `"`, a digit) as answer
+content, and at the end of the stream it returns unframed text instead of
+dropping it. Before, it waited for a `<|message|>` that the grammar made
+impossible: the stream delivered `content: null` and `json_schema` returned
+HTTP 422 after generating the correct object (campaign 2026-09-16, B6). The
+non-streaming path now also validates the parsed content, not the raw stream.
+`response_format` also combines with `"think": true`. The model reasons in a
+` to=self<|message|>` message and then opens its answer with
+`<|start|>assistant to=user<|message|>`, so the protocol declares
+`to=user<|message|>` as `ThinkingGrammarActivationTrigger` and the grammar arms
+there. Before, the combination was refused with HTTP 400 (every `--thinking`
+json case on the first re-run). Measured with `validate_inference.py --thinking`
+(json / json_schema / json_unicode, c1 and c4, three repeats, Q4_K_XL on one
+RTX PRO 6000): 38/45, and every answer header written (41) was `to=user<|message|>`.
+The seven failures all ended at `max_tokens` 256: the reasoning restates the
+prompt before it answers, and Muse-Glimmer declares no thinking-budget end
+token that could close it early.
+
 ## 1. Text architecture
 
 52 dense layers, `n_embd` 6656, `n_ff` 19968, 32 query heads / 2 KV heads,

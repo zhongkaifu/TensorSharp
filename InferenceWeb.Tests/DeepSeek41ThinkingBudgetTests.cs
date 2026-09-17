@@ -327,6 +327,7 @@ public class DeepSeek41ThinkingBudgetTests
     [InlineData("deepseek41", 2, true)]
     [InlineData("deepseek_v41", 2, true)]
     [InlineData("deepseek41", 0, false)]
+    [InlineData("nemotron_h_moe", 2, true)]
     [InlineData("deepseek4", 2, false)]
     [InlineData("qwen35", 2, false)]
     public void HostInstallsCapabilityOnlyForSupportedThinkingProtocol(string architecture, int budget, bool expected)

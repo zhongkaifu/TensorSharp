@@ -419,7 +419,7 @@ public sealed partial class OpenAIChatAdapter
                 // question (see OutputParserFactory.GrammarActivationTrigger).
                 string? trigger = OutputParserFactory.GrammarActivationTrigger(_svc.Architecture, enableThinking);
                 if (trigger != null)
-                    constraint.ActivateAfter(trigger);
+                    constraint.ActivateAfter(trigger, skipLeadingWhitespace: true);
                 withGrammar.Grammar = constraint;
                 return withGrammar;
             }
@@ -841,7 +841,13 @@ public sealed partial class OpenAIChatAdapter
 
         if (responseFormat != null)
         {
-            var normalized = StructuredOutputValidator.NormalizeOutput(rawOutput, responseFormat);
+            // Validate the ANSWER, never the raw stream: a reasoning channel or a
+            // message frame around it holds text (and braces) that are not the
+            // structured output, exactly as the streaming path strips them first.
+            string structuredText = useParser || collector.IsParsed
+                ? collector.Resolve(_svc.Architecture, openaiThink, openaiTools).Content ?? ""
+                : rawOutput;
+            var normalized = StructuredOutputValidator.NormalizeOutput(structuredText, responseFormat);
             if (!normalized.IsValid)
             {
                 ctx.Response.StatusCode = 422;

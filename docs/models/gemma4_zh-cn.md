@@ -670,6 +670,18 @@ Gemma 4 checkpoint 上运行。
 
 聊天模板在 GGUF 没带 Jinja2 模板时回退到内置 Gemma 4 模板。
 
+### 关闭思考时的思维通道
+
+关闭思考时，没有任何 Gemma 4 模板会在工具结果之后预置内容：E2B/E4B 的 canonical 模板以及 12B/26B/DiffusionGemma 模板都让 prompt 停在 `<tool_response|>`，由模型继续自己的轮次（较大模型的模板只在新的 `<|turn>model` 之后预置闭合的 `<|channel>thought\n<channel|>`）。渲染器保持这个 prompt。我们在 E4B（Metal，Q8_0，带 skills 前导）上实测过在工具结果之后强行预置闭合块，结果更糟：模型不加标记地写出推理，再次关闭通道后才回答，推理因此进入了 `content`。
+
+E4B 在该边界上的行为（2026-09-16 验证活动，B10）改为在采样阶段处理，依据协议的 `ThinkingBudgetOpenToken` / `ThinkingBudgetEndToken` / `SuppressUnopenedThinkingEndAfter`：
+
+- **关闭思考时模型自行打开的通道会被限长。** 预算从 `<|channel>` 开始计，在超过 `max_tokens` 四分之一（最多 64 token，两倍处强制关闭）后的第一个换行处以 `<channel|>` 关闭通道。解析器隐藏思考内容，随后是答案。此前 `agentic` 的最后一轮把 256 个 token 全部花在通道里，content 为空。我们也实测过恰好在 16 或 64 token（句子中间）关闭：模型会泄漏推理或把被截断的句子续写成工具调用；而在超过 16、32、48、64 token 后的第一个换行处关闭，每次都给出了正确答案。
+- **工具结果之后，没有打开通道的 `<channel|>` 会被屏蔽。** E4B 先写出答案，关闭一个从未打开的通道，然后再写一遍答案；流式响应已经发出了第一份，客户端因此收到两份。屏蔽后模型在第一份答案后结束轮次。屏蔽需要 host logits，因此这类请求不走 device-argmax 路径。屏蔽只限于该边界：其他位置的孤立关闭标记仍由解析器用来分隔推理与答案。
+- 开启思考时，同一预算从模型的 `<|channel>` 开始计（若 prompt 在工具结果后预置了 `<|channel>thought\n`，则从第一个 token 开始计），并恰好在 `TS_THINKING_BUDGET` 处关闭。此前 Gemma 4 没有声明训练过的结束 token，通用的硬停止在寻找 Gemma 从不输出的 `</think>`。`TS_THINKING_BUDGET=0` 同时关闭两个上限。
+
+`response_format` 可以与 `"think": true` 同时使用：JSON 语法在思维通道内保持休眠，在 `<channel|>` 之后启用（`ThinkingGrammarActivationTrigger`）。关闭思考时语法从第一个 token 起生效，这同时排除了 `<|channel>`。
+
 ## 13a. 张量并行
 
 Gemma 4 在 Direct `cuda` 后端以及 GGML CUDA / Vulkan 后端上都支持 `--tp N`，并且

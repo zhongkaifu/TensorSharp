@@ -103,7 +103,8 @@ namespace TensorSharp.Runtime.Grammar
         private readonly Dictionary<TransitionKey, GrammarState> _transitions = new();
         private readonly Dictionary<GrammarState, ulong[]> _masks = new();
         private readonly Dictionary<(GrammarState, PartialUtf8), ulong[]> _partialMasks = new();
-        private readonly Dictionary<(GrammarState, PartialUtf8, string, int, int), ulong[]> _delayedMasks = new();
+        private readonly Dictionary<(GrammarState, PartialUtf8, string, int, int, bool), ulong[]> _delayedMasks = new();
+        private readonly Dictionary<GrammarState, ulong[]> _leadingMasks = new();
         private readonly object _lock = new();
 
         /// <summary>
@@ -223,15 +224,16 @@ namespace TensorSharp.Runtime.Grammar
         // grammar suffix are forbidden. Traverse shared byte prefixes once per
         // marker-prefix state, then reuse the mask across tokens and requests.
         internal ulong[] GetDelayedMask(GrammarState state, PartialUtf8 partial,
-            GrammarByteTriggers trigger, int stage, int matched, ITokenizer tokenizer)
+            GrammarByteTriggers trigger, int stage, int matched, ITokenizer tokenizer,
+            bool skipLeadingWhitespace = false)
         {
             lock (_lock)
             {
-                var key = (state, partial, trigger.CacheKey, stage, matched);
+                var key = (state, partial, trigger.CacheKey, stage, matched, skipLeadingWhitespace);
                 if (_delayedMasks.TryGetValue(key, out ulong[]? cached)) return cached;
                 var mask = new ulong[_vocab.MaskWords];
                 Array.Fill(mask, ulong.MaxValue);
-                DescendDelayed(0, state, partial, trigger, stage, matched, false, mask);
+                DescendDelayed(0, state, partial, trigger, stage, matched, Phase.Dormant, skipLeadingWhitespace, mask);
                 // Control tokens are absent from the grammar trie. They remain
                 // free before activation, but their bytes can also complete a
                 // marker and contain a suffix that must be checked.
@@ -243,13 +245,23 @@ namespace TensorSharp.Runtime.Grammar
                     try { tokenizer.AppendTokenBytes(id, bytes); }
                     catch { continue; }
                     int prefix = matched, nextStage = stage;
-                    bool active = false, allowed = true;
+                    Phase phase = Phase.Dormant;
+                    bool allowed = true;
                     GrammarState next = state;
                     PartialUtf8 utf8 = partial;
                     foreach (byte value in bytes)
                     {
-                        if (!active) active = trigger.Advance(ref nextStage, ref prefix, value);
-                        else if (!AdvanceByte(ref next, ref utf8, value)) { allowed = false; break; }
+                        if (phase == Phase.Dormant)
+                        {
+                            if (trigger.Advance(ref nextStage, ref prefix, value))
+                                phase = skipLeadingWhitespace ? Phase.Leading : Phase.Active;
+                        }
+                        else if (phase == Phase.Leading && IsLeadingWhitespace(value)) { }
+                        else
+                        {
+                            phase = Phase.Active;
+                            if (!AdvanceByte(ref next, ref utf8, value)) { allowed = false; break; }
+                        }
                     }
                     if (!allowed) mask[id >> 6] &= ~(1UL << (id & 63));
                 }
@@ -277,8 +289,15 @@ namespace TensorSharp.Runtime.Grammar
                 ClearSubtree(_vocab.EdgeNode(edge), mask);
         }
 
+        /// <summary>Where a delayed constraint is along one token's bytes.</summary>
+        private enum Phase { Dormant, Leading, Active }
+
+        /// <summary>Whitespace a model may write between a trigger and the value.</summary>
+        internal static bool IsLeadingWhitespace(byte value) =>
+            value == (byte)' ' || value == (byte)'\t' || value == (byte)'\n' || value == (byte)'\r';
+
         private void DescendDelayed(int node, GrammarState state, PartialUtf8 partial,
-            GrammarByteTriggers trigger, int stage, int matched, bool active, ulong[] mask)
+            GrammarByteTriggers trigger, int stage, int matched, Phase phase, bool skipLeadingWhitespace, ulong[] mask)
         {
             for (int edge = _vocab.ChildStart(node); edge < _vocab.ChildEnd(node); edge++)
             {
@@ -286,14 +305,58 @@ namespace TensorSharp.Runtime.Grammar
                 byte value = _vocab.EdgeByte(edge);
                 GrammarState next = state;
                 PartialUtf8 utf8 = partial;
-                bool nextActive = active;
-                if (!active) nextActive = trigger.Advance(ref nextStage, ref prefix, value);
-                else if (!AdvanceByte(ref next, ref utf8, value))
+                Phase nextPhase = phase;
+                if (phase == Phase.Dormant)
                 {
-                    ClearSubtree(child, mask);
+                    if (trigger.Advance(ref nextStage, ref prefix, value))
+                        nextPhase = skipLeadingWhitespace ? Phase.Leading : Phase.Active;
+                }
+                else if (phase == Phase.Leading && IsLeadingWhitespace(value)) { }
+                else
+                {
+                    nextPhase = Phase.Active;
+                    if (!AdvanceByte(ref next, ref utf8, value))
+                    {
+                        ClearSubtree(child, mask);
+                        continue;
+                    }
+                }
+                DescendDelayed(child, next, utf8, trigger, nextStage, prefix, nextPhase, skipLeadingWhitespace, mask);
+            }
+        }
+
+        /// <summary>
+        /// Mask right after a trigger fired when leading whitespace is skipped: a token
+        /// may be whitespace, or whitespace followed by text the grammar admits from
+        /// <paramref name="state"/>. Control tokens stay forbidden, as in
+        /// <see cref="GetMask(GrammarState)"/>.
+        /// </summary>
+        internal ulong[] GetLeadingWhitespaceMask(GrammarState state)
+        {
+            lock (_lock)
+            {
+                if (_leadingMasks.TryGetValue(state, out ulong[]? cached)) return cached;
+                var mask = new ulong[_vocab.MaskWords];
+                DescendLeading(0, state, mask);
+                if (_leadingMasks.Count >= MaxCachedMasks) _leadingMasks.Clear();
+                return _leadingMasks[state] = mask;
+            }
+        }
+
+        private void DescendLeading(int node, GrammarState state, ulong[] mask)
+        {
+            int end = _vocab.ChildEnd(node);
+            for (int edge = _vocab.ChildStart(node); edge < end; edge++)
+            {
+                if (!IsLeadingWhitespace(_vocab.EdgeByte(edge)))
+                {
+                    DescendEdge(edge, state, PartialUtf8.Empty, mask);
                     continue;
                 }
-                DescendDelayed(child, next, utf8, trigger, nextStage, prefix, nextActive, mask);
+                int child = _vocab.EdgeNode(edge);
+                foreach (int tokenId in _vocab.TokensAt(child))
+                    mask[tokenId >> 6] |= 1UL << (tokenId & 63);
+                DescendLeading(child, state, mask);
             }
         }
 
@@ -301,35 +364,38 @@ namespace TensorSharp.Runtime.Grammar
         {
             int end = _vocab.ChildEnd(node);
             for (int edge = _vocab.ChildStart(node); edge < end; edge++)
+                DescendEdge(edge, state, partial, mask);
+        }
+
+        private void DescendEdge(int edge, GrammarState state, PartialUtf8 partial, ulong[] mask)
+        {
+            byte b = _vocab.EdgeByte(edge);
+
+            PartialUtf8 nextPartial = partial;
+            if (!GrammarMatcher.TryFeedByte(ref nextPartial, b, out uint codePoint, out bool complete))
+                return;                         // malformed UTF-8: no token below this can be text
+
+            GrammarState nextState;
+            if (complete)
             {
-                byte b = _vocab.EdgeByte(edge);
-
-                PartialUtf8 nextPartial = partial;
-                if (!GrammarMatcher.TryFeedByte(ref nextPartial, b, out uint codePoint, out bool complete))
-                    continue;                       // malformed UTF-8: no token below this can be text
-
-                GrammarState nextState;
-                if (complete)
-                {
-                    nextState = AdvanceLocked(state, codePoint);
-                    if (nextState.IsDead) continue; // prunes the entire subtree
-                }
-                else
-                {
-                    // Mid-character: keep the branch only if some completion of
-                    // this partial code point could still satisfy the grammar.
-                    if (!_matcher.AcceptsPartial(state, nextPartial)) continue;
-                    nextState = state;
-                }
-
-                int child = _vocab.EdgeNode(edge);
-                // Byte-fallback tokens can end mid-character. Accept preserves
-                // that UTF-8 prefix, and the next mask checks its continuation.
-                foreach (int tokenId in _vocab.TokensAt(child))
-                    mask[tokenId >> 6] |= 1UL << (tokenId & 63);
-
-                Descend(child, nextState, nextPartial, mask);
+                nextState = AdvanceLocked(state, codePoint);
+                if (nextState.IsDead) return;   // prunes the entire subtree
             }
+            else
+            {
+                // Mid-character: keep the branch only if some completion of
+                // this partial code point could still satisfy the grammar.
+                if (!_matcher.AcceptsPartial(state, nextPartial)) return;
+                nextState = state;
+            }
+
+            int child = _vocab.EdgeNode(edge);
+            // Byte-fallback tokens can end mid-character. Accept preserves
+            // that UTF-8 prefix, and the next mask checks its continuation.
+            foreach (int tokenId in _vocab.TokensAt(child))
+                mask[tokenId >> 6] |= 1UL << (tokenId & 63);
+
+            Descend(child, nextState, nextPartial, mask);
         }
     }
 
@@ -351,6 +417,9 @@ namespace TensorSharp.Runtime.Grammar
         private int _triggerStage;
         private int _triggerMatched;
         private bool _active = true;
+        // Whitespace right after the trigger is prelude (see ActivateAfter).
+        private bool _skipLeadingWhitespace;
+        private bool _inLeadingWhitespace;
 
         public GrammarConstraint(Grammar grammar, ITokenizer tokenizer)
             : this(new GrammarMaskCache(grammar, GrammarTokenVocabulary.ForTokenizer(tokenizer)), tokenizer)
@@ -379,6 +448,8 @@ namespace TensorSharp.Runtime.Grammar
             _triggerStage = _triggerStage,
             _triggerMatched = _triggerMatched,
             _active = _active,
+            _skipLeadingWhitespace = _skipLeadingWhitespace,
+            _inLeadingWhitespace = _inLeadingWhitespace,
         };
 
         /// <summary>
@@ -399,11 +470,25 @@ namespace TensorSharp.Runtime.Grammar
         /// only a token that completes the marker with an invalid grammar
         /// suffix is masked; ordinary prelude tokens remain unrestricted.
         /// </summary>
-        public void ActivateAfter(string triggerText)
+        /// <param name="triggerText">Marker after which the grammar enforces.</param>
+        /// <param name="skipLeadingWhitespace">
+        /// Treat whitespace between the marker and the first grammar byte as part of
+        /// the prelude, as llama.cpp's <c>&lt;/think&gt;\s*</c> trigger patterns do.
+        /// A vocabulary may merge the marker's last byte with the line break that
+        /// follows it (Nemotron-H Reasoning's <c>&gt;\n\n</c>): with a JSON root that
+        /// cannot start with whitespace that token is masked, the model's next choice
+        /// (<c>}</c>) no longer spells the marker, and the grammar never arms. Only for
+        /// grammars whose root does not itself begin with whitespace, such as the JSON
+        /// response_format grammars.
+        /// </param>
+        public void ActivateAfter(string triggerText, bool skipLeadingWhitespace)
         {
             if (string.IsNullOrEmpty(triggerText)) return;
             ActivateAfterTriggers(triggerText);
+            _skipLeadingWhitespace = skipLeadingWhitespace;
         }
+
+        public void ActivateAfter(string triggerText) => ActivateAfter(triggerText, skipLeadingWhitespace: false);
 
         /// <summary>
         /// Activate after all markers appear in order. Each marker is matched
@@ -418,6 +503,7 @@ namespace TensorSharp.Runtime.Grammar
             _trigger = new GrammarByteTriggers(triggerTexts);
             _triggerStage = _triggerMatched = 0;
             _active = false;
+            _skipLeadingWhitespace = _inLeadingWhitespace = false;
         }
 
         /// <summary>Whether the grammar is currently enforcing (see <see cref="ActivateAfter"/>).</summary>
@@ -433,8 +519,10 @@ namespace TensorSharp.Runtime.Grammar
         public bool IsDead => _state.IsDead;
 
         /// <summary>Current mask; bit <c>i</c> set means token <c>i</c> is legal.</summary>
-        public ulong[] CurrentMask() => _active ? _cache.GetMask(_state, _partial)
-            : _cache.GetDelayedMask(_state, _partial, _trigger!, _triggerStage, _triggerMatched, _tokenizer);
+        public ulong[] CurrentMask() => !_active
+            ? _cache.GetDelayedMask(_state, _partial, _trigger!, _triggerStage, _triggerMatched, _tokenizer, _skipLeadingWhitespace)
+            : _inLeadingWhitespace ? _cache.GetLeadingWhitespaceMask(_state)
+            : _cache.GetMask(_state, _partial);
 
         /// <summary>Opaque snapshot for rollback (speculative decoding).</summary>
         public (GrammarState State, PartialUtf8 Partial) Snapshot() => (_state, _partial);
@@ -470,8 +558,14 @@ namespace TensorSharp.Runtime.Grammar
                     _active = true;
                     _trigger = null;
                     _triggerMatched = 0;
+                    _inLeadingWhitespace = _skipLeadingWhitespace;
                 }
                 return true;
+            }
+            if (_inLeadingWhitespace)
+            {
+                if (GrammarMaskCache.IsLeadingWhitespace(value)) return true;
+                _inLeadingWhitespace = false;
             }
             if (!GrammarMatcher.TryFeedByte(ref _partial, value, out uint cp, out bool complete))
             {

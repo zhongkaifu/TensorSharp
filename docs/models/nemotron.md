@@ -782,6 +782,34 @@ verify cannot beat plain decoding. Details: [speculative decoding](../speculativ
   checkpoints' own tool format is a list and they fall back to it), and a
   body of any other JSON shape yields no call. Such a body used to throw from
   the parser and abort the streamed HTTP response.
+- `response_format` combines with `"think": true`. Thinking on primes
+  `<think>\n` after the assistant marker (the Nemotron 3.5 GGUF template does
+  the same), so the JSON grammar stays dormant through the reasoning and arms
+  after the model's `</think>` (`ThinkingGrammarActivationTrigger`). Before, the
+  request was refused with HTTP 400. `</think>` is also the family's
+  `ThinkingBudgetEndToken`: on Nemotron 3.5 / Omni, whose vocabulary has it as
+  one token, reaching `TS_THINKING_BUDGET` (75% of an allowance of at least 512
+  tokens) emits it and the constrained answer follows inside `max_tokens`. The
+  Nemotron-H Reasoning-128K GGUFs spell `</think>` in several tokens, so they
+  keep the explained `thinking_budget` stop. Measured on Nemotron 3.5 Lightning
+  IQ4_XS (Metal): with `max_tokens` 256 the reasoning alone used the whole
+  allowance (content empty, `finish_reason=length`); with 1024, json /
+  json_schema / json_unicode passed at c1 and json_schema / json_unicode 4/4 at
+  c4. json at c4 was 1/4: three of the four requests reasoned about a different
+  prompt ("User says: Mars"), the batched-prefill corruption tracked separately.
+- Whitespace between `</think>` and the JSON is part of the prelude
+  (`GrammarConstraint.ActivateAfter(trigger, skipLeadingWhitespace: true)`, used
+  by `response_format` only). The Nemotron-H 8B Reasoning-128K vocabulary spells
+  `</think>\n\n` as `</think` + `>\n\n`; the JSON root cannot start with a
+  line break, so that token was masked, the model wrote `</think}` instead, the
+  trigger never matched and the whole reply stayed reasoning (content null,
+  `json_schema` HTTP 422). Measured on Nemotron-H 8B Q4_K_M (RTX PRO 6000,
+  `--thinking`, c1 and c4, three repeats, `max_tokens` 256): 10 replies wrote
+  `</think}` before, none after; json_schema 4/15 -> 15/15, json 13/15 -> 14/15.
+  json_unicode stayed 0/15 because the reasoning alone reaches 256 tokens; with
+  `max_tokens` 1024 it is 5/5 (c1 + c4). At 1024 json c4 was 0/4 (the objects
+  omit `moons` or reason about a different prompt) and json_schema c4 2/4 (two
+  requests hit the explained `thinking_budget` stop at 768 tokens).
 - Two turn formats ship under the same architecture name, and the GGUF's
   embedded `tokenizer.chat_template` decides which one is rendered
   (`ChatTemplate.IsNemotronHReasoningTemplate`):

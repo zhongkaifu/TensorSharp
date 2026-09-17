@@ -170,6 +170,29 @@ namespace TensorSharp.Runtime
         public string? ThinkingBudgetEndToken { get; init; }
 
         /// <summary>
+        /// Trained single token with which the MODEL opens its reasoning channel
+        /// mid-reply, or null when only the prompt ever opens it. With it declared the
+        /// budget counts from the opener instead of from the first generated token, and
+        /// it also caps a channel the model opens although the request turned thinking
+        /// OFF (see <c>ChatGenerationPipeline.UnrequestedThinkingBudgetFor</c>): that
+        /// channel is hidden from the client, and Gemma 4 E4B otherwise spent a whole
+        /// 256-token turn in it after a tool result and answered nothing.
+        /// </summary>
+        public string? ThinkingBudgetOpenToken { get; init; }
+
+        /// <summary>
+        /// Prompt tail after which, with thinking off, the
+        /// <see cref="ThinkingBudgetEndToken"/> is masked while no channel is open, or
+        /// null. Gemma 4's templates continue the model's own turn straight after
+        /// <c>&lt;tool_response|&gt;</c> with no channel framing, and E4B there writes
+        /// its answer, closes a channel it never opened and writes the answer again; a
+        /// stream has already delivered the first copy by the time the stray close
+        /// arrives, so the client got both. Scoped to that boundary because masking
+        /// costs the device-argmax fast path.
+        /// </summary>
+        public string? SuppressUnopenedThinkingEndAfter { get; init; }
+
+        /// <summary>
         /// Text the GENERATION PROMPT appends after the assistant role marker that
         /// re-rendering the same turn as HISTORY does not reproduce - given the
         /// thinking flag the turn ran under. Returns null/empty when the family's
@@ -309,6 +332,12 @@ namespace TensorSharp.Runtime
             {
                 throw new InvalidOperationException(
                     $"Chat protocol '{Id}' says its parser is always required but supplies none.");
+            }
+            if ((ThinkingBudgetOpenToken != null || SuppressUnopenedThinkingEndAfter != null) && ThinkingBudgetEndToken == null)
+            {
+                throw new InvalidOperationException(
+                    $"Chat protocol '{Id}' declares a reasoning-channel opener or stray-close policy without the " +
+                    "channel's end token.");
             }
         }
     }
