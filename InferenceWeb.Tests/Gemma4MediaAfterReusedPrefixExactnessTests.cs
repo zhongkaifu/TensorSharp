@@ -22,13 +22,22 @@
 // the media chunk at P) and on the per-op multimodal path (TS_G4_MM_PREFILL=0),
 // each path compared with its own cold prefill.
 //
-// The fused kernels are bitwise reproducible, so their greedy streams must match
-// token for token. The per-op path is not reproducible even against itself: four
-// identical cold prefills in one process (E4B, Metal) left the runner-up 0.045 to
-// 0.274 logits behind at decode step 16, and its cold stream flipped there between
-// runs (E2B: at step 19). So the per-op rows check the prefill logits only - a wrong
-// soft-token mask moved them by 3.2 on E4B, the noise by 0.02 - and report the
-// streams.
+// Every row also runs a text control: the same conversation and split with the media
+// left out. It measures what splitting the prefill at P costs on this backend with no
+// soft tokens involved, and the media turn must be as close to cold as that: its logits
+// within max(0.5% of the logit scale, twice the control's difference). On E4B/Metal the
+// control differs by 0.02 logits and a wrong soft-token mask moved the logits by 3.2; on
+// E4B/CUDA (A40) the control itself differs by 0.65 to 0.79 and a wrong mask by 3.3 to
+// 3.8 (image) and 2.1 (audio).
+//
+// Greedy streams: where the control is within 0.5% of the scale, the fused streams must
+// match token for token. Where it is not, a cold runner-up within that noise can flip,
+// so the streams are compared up to the first such near-tie (margin below twice the
+// larger of the two differences) - on CUDA that is usually the first token or two, so
+// there the logits are the check. The per-op path is not reproducible even against itself (four
+// identical cold prefills on E4B/Metal left the runner-up 0.045 to 0.274 logits behind
+// at decode step 16 and flipped there between runs), so its rows check the logits and
+// report the streams.
 //
 //   TS_TEST_MODEL_DIR=~/work/models/gemma-4-E4B TS_TEST_GGML_BACKEND=metal
 //   TS_TEST_MODEL_DIR=~/work/models/gemma-4-E2B TS_TEST_GGML_BACKEND=metal
@@ -132,43 +141,89 @@ public class Gemma4MediaAfterReusedPrefixExactnessTests
         Assert.True(longPrefix ? reused > window : reused + (prompt.Length - reused) <= window,
             $"the test prompt does not exercise the intended case (reused {reused}, prompt {prompt.Length})");
 
-        // ---- cold: the whole prompt from position 0.
-        model.ResetKVCache();
-        Assert.True(injector.QueuePromptEmbeddings(0, requestId));
+        // ---- the media turn: cold vs reuse.
         int coldChunks = model.FusedMediaPrefillChunks;
-        float[] coldLogits = (float[])model.Forward(prompt).Clone();
-        bool coldFused = model.FusedMediaPrefillChunks > coldChunks;
-        List<int> coldTokens = Decode(model, coldLogits, out List<float> coldMargins);
-
-        // ---- reuse: the previous turn's text, then the media chunk at position P.
-        model.ResetKVCache();
-        model.Forward(prompt.Take(reused).ToArray());
-        Assert.True(injector.QueuePromptEmbeddingsForSlice(reused, prompt.Length - reused, requestId));
         int afterPrefix = model.FusedMediaPrefillChunksAfterPrefix;
-        float[] reuseLogits = (float[])model.Forward(prompt.Skip(reused).ToArray()).Clone();
+        Split mediaRun = RunSplit(model, prompt, reused,
+            () => Assert.True(injector.QueuePromptEmbeddings(0, requestId)),
+            () => Assert.True(injector.QueuePromptEmbeddingsForSlice(reused, prompt.Length - reused, requestId)));
+        // The reuse arm's media chunk is the only one at a non-zero start position.
+        bool coldFused = model.FusedMediaPrefillChunks - (model.FusedMediaPrefillChunksAfterPrefix - afterPrefix) > coldChunks;
         bool reuseFused = model.FusedMediaPrefillChunksAfterPrefix > afterPrefix;
-        List<int> reuseTokens = Decode(model, reuseLogits, out _);
         injector.ClearPreparedPromptState(requestId);
 
-        float diff = MaxAbsDiff(coldLogits, reuseLogits);
-        float scale = Math.Max(1e-6f, coldLogits.Max(Math.Abs));
+        // ---- the text control: the same conversation and split without the media.
+        var textHistory = new List<ChatMessage>(firstTurn) { new() { Role = "user", Content = history[^1].Content } };
+        int[] textPrompt = renderer.RenderToTokens(model.Tokenizer, model.Config.ChatTemplate, textHistory, "gemma4", addGenerationPrompt: true).ToArray();
+        int textReused = 0;
+        while (textReused < previous.Count && textReused < textPrompt.Length - 1 && previous[textReused] == textPrompt[textReused]) textReused++;
+        Split textRun = RunSplit(model, textPrompt, textReused, () => { }, () => { });
+
+        float scale = Math.Max(1e-6f, mediaRun.ColdLogits.Max(Math.Abs));
+        float floor = 0.005f * scale;
         _output.WriteLine($"fused media chunk: cold={coldFused} reuse={reuseFused}");
-        _output.WriteLine($"prefill logits max|diff| {diff:E2} (logit scale {scale:F1})");
-        _output.WriteLine($"cold:  {Escape(model.Tokenizer.Decode(coldTokens))}");
-        _output.WriteLine($"reuse: {Escape(model.Tokenizer.Decode(reuseTokens))}");
-        int firstDiff = Enumerable.Range(0, DecodeTokens).FirstOrDefault(i => coldTokens[i] != reuseTokens[i], -1);
+        _output.WriteLine($"prefill logits max|diff| {mediaRun.Diff:E2} (logit scale {scale:F1}); " +
+                          $"text control ({textPrompt.Length} tokens, split at {textReused}) {textRun.Diff:E2}");
+        _output.WriteLine($"cold:  {Escape(model.Tokenizer.Decode(mediaRun.ColdTokens))}");
+        _output.WriteLine($"reuse: {Escape(model.Tokenizer.Decode(mediaRun.ReuseTokens))}");
+        int firstDiff = FirstDifference(mediaRun.ColdTokens, mediaRun.ReuseTokens);
         if (firstDiff >= 0)
-            _output.WriteLine($"first different token at {firstDiff}: the cold top-2 logit margin there was {coldMargins[firstDiff]:F4} " +
-                              $"(smallest margin up to it {coldMargins.Take(firstDiff + 1).Min():F4})");
+            _output.WriteLine($"first different token at {firstDiff}: the cold top-2 logit margin there was {mediaRun.ColdMargins[firstDiff]:F4} " +
+                              $"(smallest margin up to it {mediaRun.ColdMargins.Take(firstDiff + 1).Min():F4})");
+        int textDiffAt = FirstDifference(textRun.ColdTokens, textRun.ReuseTokens);
+        _output.WriteLine($"text control streams {(textDiffAt < 0 ? "identical" : $"differ from token {textDiffAt}")}");
 
         Assert.Equal(fused, coldFused);
         Assert.Equal(fused, reuseFused);
-        Assert.True(diff <= 0.005f * scale,
-            $"the media turn's logits after a {reused}-token reused prefix differ from a cold prefill by {diff:E2} " +
-            $"(scale {scale:F1})");
+        float tolerance = Math.Max(floor, 2 * textRun.Diff);
+        Assert.True(mediaRun.Diff <= tolerance,
+            $"the media turn's logits after a {reused}-token reused prefix differ from a cold prefill by {mediaRun.Diff:E2} " +
+            $"(scale {scale:F1}; the text control differs by {textRun.Diff:E2}, tolerance {tolerance:E2})");
         if (fused)
-            Assert.Equal(coldTokens, reuseTokens);
+        {
+            int compared = DecodeTokens;
+            if (textRun.Diff > floor)
+            {
+                float noise = 2 * Math.Max(mediaRun.Diff, textRun.Diff);
+                int tie = mediaRun.ColdMargins.FindIndex(m => m < noise);
+                if (tie >= 0) compared = tie;
+            }
+            _output.WriteLine($"greedy tokens compared: {compared} of {DecodeTokens}");
+            Assert.Equal(mediaRun.ColdTokens.Take(compared), mediaRun.ReuseTokens.Take(compared));
+        }
     }
+
+    private sealed class Split
+    {
+        public float[] ColdLogits;
+        public float Diff;
+        public List<int> ColdTokens, ReuseTokens;
+        public List<float> ColdMargins;
+    }
+
+    /// <summary>Cold prefill of <paramref name="prompt"/> from position 0, then the same
+    /// prompt as a prefix of <paramref name="reused"/> tokens plus the rest; greedy decode
+    /// after each. The queue callbacks stage media before the forward that injects it.</summary>
+    private static Split RunSplit(Gemma4Model model, int[] prompt, int reused,
+        Action queueCold, Action queueRest)
+    {
+        var r = new Split();
+        model.ResetKVCache();
+        queueCold();
+        r.ColdLogits = (float[])model.Forward(prompt).Clone();
+        r.ColdTokens = Decode(model, r.ColdLogits, out r.ColdMargins);
+
+        model.ResetKVCache();
+        model.Forward(prompt.Take(reused).ToArray());
+        queueRest();
+        float[] reuseLogits = (float[])model.Forward(prompt.Skip(reused).ToArray()).Clone();
+        r.ReuseTokens = Decode(model, reuseLogits, out _);
+        r.Diff = MaxAbsDiff(r.ColdLogits, reuseLogits);
+        return r;
+    }
+
+    private static int FirstDifference(List<int> a, List<int> b)
+        => Enumerable.Range(0, Math.Min(a.Count, b.Count)).FirstOrDefault(i => a[i] != b[i], -1);
 
     private static string FirstQuestion(bool longPrefix)
     {
