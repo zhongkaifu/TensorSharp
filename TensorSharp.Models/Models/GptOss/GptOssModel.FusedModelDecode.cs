@@ -541,7 +541,10 @@ namespace TensorSharp.Models
         private void ResetFusedModelDecodeCache()
         {
             if (IsGgmlBackend)
+            {
                 GgmlBasicOps.GptOssResetDecodeCache();
+                CountDecodeGraphReset();
+            }
             // The per-rank TP graphs come from the same native pools.
             _tpFdBuiltCapacity = -1;
         }
@@ -554,7 +557,10 @@ namespace TensorSharp.Models
             // the reset above); on model teardown it must go explicitly or its
             // per-entry arena buffers keep their VRAM until process exit.
             if (IsGgmlBackend)
+            {
                 GgmlBasicOps.GptOssResetBatchedDecodeCache();
+                CountDecodeGraphReset();
+            }
             FreePinnedDecodeArrays();
             if (_foldLogitsHandle.IsAllocated)
                 _foldLogitsHandle.Free();
