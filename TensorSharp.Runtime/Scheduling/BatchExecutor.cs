@@ -2370,17 +2370,23 @@ namespace TensorSharp.Runtime.Scheduling
                 lcp++;
 
             // The live cache is one conversation's state. Another conversation may share
-            // only its public prefix, which the shared-prefix checkpoint serves by copy;
-            // continuing (and rewinding) the cache itself would hand over the owner's
-            // private tail and take its state away from it.
+            // only its public prefix: never the owner's private tail. Rewinding the cache
+            // to that prefix hands over nothing private (those tokens are this request's
+            // own system prompt, matched token for token) and takes nothing from the
+            // owner that this request's own prefill on the primary cache would not
+            // overwrite anyway. It is the only public reuse a model without shared-prefix
+            // checkpoints has (DeepSeek V4.1's native slots rewind exactly but cannot be
+            // copied); where a checkpoint exists, the rules below still prefer it.
             if (!ScopeAllows(_liveCacheSeq.CacheScope, seq.CacheScope))
             {
                 if (IsPlausibleContinuation(liveLen, lcp, seq))
                     _lastLiveBlockedByScopeTokens = Math.Max(
                         0, Math.Min(lcp, seq.PromptTokens.Count - 1) - seq.SharedPrefixTokens);
-                return LiveContinuationDeclined(seq,
-                    $"the live cache belongs to another conversation (scope {DescribeScope(_liveCacheSeq.CacheScope)}); " +
-                    "only the public prefix is shared across conversations");
+                if (seq.SharedPrefixTokens <= 0 || lcp < seq.SharedPrefixTokens)
+                    return LiveContinuationDeclined(seq,
+                        $"the live cache belongs to another conversation (scope {DescribeScope(_liveCacheSeq.CacheScope)}); " +
+                        "only the public prefix is shared across conversations, and this prompt does not reproduce it");
+                lcp = seq.SharedPrefixTokens;
             }
 
             if (seq.PromptTokens.Count <= lcp)
@@ -3456,7 +3462,8 @@ namespace TensorSharp.Runtime.Scheduling
                     && _liveCacheSeq != null
                     && _liveCacheSeq.CacheBreakpoints == null
                     && seq.CacheBreakpoints == null
-                    && ScopeAllows(_liveCacheSeq.CacheScope, seq.CacheScope)
+                    && (ScopeAllows(_liveCacheSeq.CacheScope, seq.CacheScope)
+                        || seq.NumComputedTokens <= seq.SharedPrefixTokens)
                     && seq.NumComputedTokens > 0
                     && ClampReuseToMedia(seq.NumComputedTokens, seq, _liveCacheSeq.MediaSpans) == seq.NumComputedTokens
                     && _liveCacheLen >= seq.NumComputedTokens

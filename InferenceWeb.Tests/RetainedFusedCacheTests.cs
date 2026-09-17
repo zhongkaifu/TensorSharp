@@ -1924,6 +1924,39 @@ public class RetainedFusedCacheTests
     }
 
     /// <summary>
+    /// A new chat of another conversation on a model with no shared-prefix checkpoint
+    /// (DeepSeek V4.1's native slots rewind exactly but cannot be copied): the live cache
+    /// the previous conversation left is rewound to this request's PUBLIC prefix, which is
+    /// the system prompt both requests rendered token for token. Refusing it outright
+    /// re-prefilled the whole system prompt of every new chat, and bought no isolation:
+    /// the new request overwrites that primary cache either way, and nothing past the
+    /// public prefix is reused.
+    /// </summary>
+    [Theory]
+    [InlineData("A", SharedPrefixLen + FirstMessageLen)]
+    [InlineData("B", SharedPrefixLen)]
+    public async Task AnotherConversationsLiveCache_StillServesThePublicPrefix_OnAModelWithoutCheckpoints(
+        string secondScope, int expectedReuse)
+    {
+        await WithCheckpointsOnAsync(async () =>
+        {
+            var model = new FusedStubModel(supportsCrossSequenceKvReuse: false)
+            { SupportsPrefixCheckpoints = false, SupportsExactFusedCacheReuse = true, KVCacheTruncationGranularity = 2 };
+            using var engine = new InferenceEngine(model, Config(), NullLogger.Instance);
+            var a1Prompt = Concat(SharedPrefix(), Enumerable.Repeat(7, FirstMessageLen));
+            await DrainAsync(engine.SubmitRequest(Scoped("A1", a1Prompt, "A", maxNew: 32)));
+
+            // The same user message in the same conversation continues past it; another
+            // conversation shares only the system prompt.
+            var next = Concat(SharedPrefix(), Enumerable.Repeat(7, FirstMessageLen), Enumerable.Repeat(9, SuffixLen));
+            var second = await DrainAsync(engine.SubmitRequest(Scoped("next", next, secondScope)));
+
+            Assert.Equal(expectedReuse, second.completion.PrefixCacheReusedTokens);
+            Assert.Contains(model.ForwardCalls, call => call.Start == expectedReuse && call.Count == next.Count - expectedReuse);
+        });
+    }
+
+    /// <summary>
     /// A3 -> B1 -> A4: conversation A ran on the primary cache; a new chat B arrived and
     /// ran on the fused path, which used to drop A's live state (A4 reused 584 of 740).
     /// A's finished state is now kept as its own retained holder when that happens.
