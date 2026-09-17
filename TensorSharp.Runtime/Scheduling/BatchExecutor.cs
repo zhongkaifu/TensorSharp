@@ -115,16 +115,43 @@ namespace TensorSharp.Runtime.Scheduling
         {
             int clamped = PromptMediaSpans.ClampReusablePrefix(
                 lcp, seq.MediaSpans, cachedSpans, _model.SupportsReuseAcrossMediaSpan);
+            if (!_model.SupportsReuseAcrossMediaSpan && !_mediaSpanReuseClampWarned
+                && clamped < PromptMediaSpans.ClampReusablePrefix(lcp, seq.MediaSpans, cachedSpans))
+            {
+                // A model limit, not a content difference: say so once, because every
+                // turn after an image now re-prefills from that image.
+                _mediaSpanReuseClampWarned = true;
+                _logger.LogWarning(
+                    "Prompt reuse stops at the first image/audio span on this model: it cannot continue a cached " +
+                    "prefix past media exactly (M-RoPE decode positions), so every turn after an attachment " +
+                    "re-prefills from that attachment (this request: {Clamped} of {Matched} matching tokens kept). " +
+                    "Text before the first attachment is still reused. Reported once.",
+                    clamped, lcp);
+            }
             // Media still to prefill after the reused prefix: only where the model can
             // prefill it at a non-zero position exactly.
             if (clamped > 0 && !_model.CanPrefillMediaAfterReusedPrefix(seq.PromptTokens.Count))
             {
                 foreach (var span in seq.MediaSpans)
                     if (span.End > clamped)
+                    {
+                        if (!_mediaAfterReusedPrefixWarned)
+                        {
+                            _mediaAfterReusedPrefixWarned = true;
+                            _logger.LogWarning(
+                                "A {Prompt}-token prompt whose attachment follows a reusable {Clamped}-token prefix " +
+                                "prefills from zero instead: this model cannot prefill media after a reused prefix " +
+                                "exactly at this length (Gemma 4 past its sliding window). Reported once.",
+                                seq.PromptTokens.Count, clamped);
+                        }
                         return 0;
+                    }
             }
             return clamped;
         }
+
+        private bool _mediaSpanReuseClampWarned;
+        private bool _mediaAfterReusedPrefixWarned;
 
         // ---- Retained fused-cache continuation (cross-request prefix reuse) ----
         // The per-sequence fused path (concurrent N>=2 decode) keeps each request's

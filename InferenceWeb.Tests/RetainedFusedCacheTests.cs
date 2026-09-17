@@ -2142,6 +2142,57 @@ public class RetainedFusedCacheTests
     }
 
     /// <summary>
+    /// The media clamps are model limits a user sees as a slow turn (Qwen 3.5 re-prefills
+    /// from the image on every later turn; Gemma 4 prefills a long image turn from zero),
+    /// so each is reported once as a warning instead of only at Debug.
+    /// </summary>
+    [Fact]
+    public async Task MediaReuseLimits_AreWarnedOnce()
+    {
+        var logger = new WarningRecorder();
+        var model = new FusedStubModel(supportsReuseAcrossMediaSpan: false, supportsKvCacheTruncation: false);
+        using (var engine = new InferenceEngine(model, Config(), logger))
+        {
+            var prompt = Concat(Enumerable.Repeat(1, 4), Enumerable.Repeat(6, 8), Enumerable.Repeat(1, 12));
+            for (int turn = 1; turn <= 3; turn++)
+            {
+                var result = await DrainAsync(engine.SubmitRequest(
+                    Scoped("q" + turn, prompt, "A", sharedPrefix: 0, media: ImageAt(4, "img:photo"), maxNew: Round1NewTokens)));
+                prompt = Concat(prompt, result.output, Enumerable.Repeat(PeakToken, SuffixLen));
+            }
+        }
+        Assert.Single(logger.Warnings, w => w.Contains("stops at the first image/audio span", StringComparison.Ordinal));
+
+        logger = new WarningRecorder();
+        model = new FusedStubModel(mediaAfterReuseMaxPromptTokens: 40);
+        using (var engine = new InferenceEngine(model, Config(), logger))
+        {
+            var prompt1 = Enumerable.Repeat(1, PromptLen).ToList();
+            var first = await DrainAsync(engine.SubmitRequest(Scoped("g1", prompt1, "A", sharedPrefix: 0, maxNew: Round1NewTokens)));
+            var history = Concat(prompt1, first.output);
+            var prompt2 = Concat(history, Enumerable.Repeat(6, 8), Enumerable.Repeat(PeakToken, SuffixLen));
+            var second = await DrainAsync(engine.SubmitRequest(Scoped("g2", prompt2, "A", sharedPrefix: 0,
+                media: ImageAt(history.Count, "img:photo"))));
+            Assert.Equal(0, second.completion.PrefixCacheReusedTokens);
+        }
+        Assert.Single(logger.Warnings, w => w.Contains("prefills from zero instead", StringComparison.Ordinal));
+    }
+
+    private sealed class WarningRecorder : Microsoft.Extensions.Logging.ILogger
+    {
+        private readonly List<string> _warnings = new();
+        public List<string> Warnings { get { lock (_warnings) return new List<string>(_warnings); } }
+        public IDisposable BeginScope<TState>(TState state) where TState : notnull => null;
+        public bool IsEnabled(Microsoft.Extensions.Logging.LogLevel logLevel) => true;
+        public void Log<TState>(Microsoft.Extensions.Logging.LogLevel logLevel, Microsoft.Extensions.Logging.EventId eventId,
+            TState state, Exception exception, Func<TState, Exception, string> formatter)
+        {
+            if (logLevel == Microsoft.Extensions.Logging.LogLevel.Warning)
+                lock (_warnings) _warnings.Add(formatter(state, exception));
+        }
+    }
+
+    /// <summary>
     /// Gemma 4 turns of 512 tokens or fewer: the live cache used to be refused as "within
     /// the pooled reuse cap", and the pooled path could return at most whole blocks, so a
     /// short turn reused 0 or 256 tokens of what the live cache held.
