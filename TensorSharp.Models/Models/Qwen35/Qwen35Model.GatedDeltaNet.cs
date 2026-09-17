@@ -1534,21 +1534,6 @@ namespace TensorSharp.Models
                 _fdStateResident = false;
             }
 
-            // The conv scratch is per-request-cache state: a holder brings its own and
-            // the per-seq fused path swaps _fdConvScratch with it. The primary cache
-            // gets one the first time IT decodes, which is not necessarily the model's
-            // first fused decode: when a holder ran that one, the one-time gate above
-            // is already past and the primary had none (its first decode wrote the
-            // conv reseed through a null pointer).
-            if (_fdConvScratch == IntPtr.Zero)
-            {
-                int gdnLayers = 0;
-                foreach (int slot in _fdGdnSlot)
-                    if (slot >= 0) gdnLayers++;
-                _fdConvScratch = Marshal.AllocHGlobal(Math.Max(1, gdnLayers) * convDim * qkvDim * sizeof(float));
-                _fdStateResident = false;
-            }
-
             int cacheSize = 0;
             int kvCacheType = 0;
             IntPtr bindingKCache = IntPtr.Zero;
