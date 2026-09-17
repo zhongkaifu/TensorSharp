@@ -340,6 +340,11 @@ namespace TensorSharp.Runtime.Scheduling
             // vLLM and SGLang, every runnable decoder gets its one-token slot
             // before any long prompt is allowed to consume the remaining budget.
             var runningSnapshot = new List<SequenceState>(_runningOrder);
+            // Allocate in rank order (priority, then submission): a re-admitted
+            // preemption victim is appended to _runningOrder, and visiting it first
+            // would let it claim blocks an older sequence then cannot preempt back
+            // from (work already planned this step is never a victim).
+            runningSnapshot.Sort((a, b) => VictimRank(a).CompareTo(VictimRank(b)));
             var decodeSnapshot = new List<SequenceState>(runningSnapshot.Count);
             var prefillSnapshot = new List<SequenceState>(runningSnapshot.Count);
             foreach (var seq in runningSnapshot)
@@ -435,6 +440,21 @@ namespace TensorSharp.Runtime.Scheduling
                 // now-running request's model-owned cache after the step.
                 if (output.PreemptedRequestIds.Contains(seq.RequestId))
                     break;
+
+                // Admit by capacity. A newcomer is admitted only when the free pool
+                // can hold its whole prompt on top of what the prompts already
+                // running still have to allocate. Admitting on the strength of its
+                // FIRST chunk alone let four 20k-token prompts start against a pool
+                // that holds three: they prefilled in parallel until the pool ran dry,
+                // then preempted each other's nearly finished prefills over and over
+                // (a request re-prefilled 15 times; waves took 700 s against 39 s
+                // solo). Waiting in the queue costs nothing; a preempted prefill costs
+                // all of its work. A lone request always fits (Submit checks it).
+                if (_running.Count > 0 && !HasPromptCapacityFor(seq))
+                {
+                    LogCapacityWait(seq);
+                    break;
+                }
 
                 // Try prefix cache lookup before allocating blocks (only for
                 // brand-new sequences; preempted ones already had their blocks
@@ -749,15 +769,58 @@ namespace TensorSharp.Runtime.Scheduling
             return aligned > 0 ? aligned : want;
         }
 
-        /// <summary>Preempt the lowest-priority running sequence (other than
-        /// <paramref name="needyForBlocks"/>) and free its blocks, then retry
-        /// allocation. Returns true if successful.</summary>
+        private static int BlocksFor(int tokens, int blockSize)
+            => tokens <= 0 ? 0 : (tokens + blockSize - 1) / blockSize;
+
+        /// <summary>
+        /// Whether the free pool can hold <paramref name="candidate"/>'s whole prompt
+        /// after every running prompt has allocated the rest of its own. Decode growth
+        /// is not reserved: it arrives one token at a time and is served by preempting
+        /// the newest sequence, which re-prefills a prompt that was already admitted.
+        /// Conservative for a prompt whose prefix is later adopted from the index.
+        /// </summary>
+        private bool HasPromptCapacityFor(SequenceState candidate)
+        {
+            long outstanding = 0;
+            foreach (var running in _runningOrder)
+            {
+                int missing = BlocksFor(running.PromptTokens.Count, _cfg.BlockSize) - running.BlockTable.NumBlocks;
+                if (missing > 0) outstanding += missing;
+            }
+            int need = BlocksFor(candidate.PromptTokens.Count, _cfg.BlockSize) - candidate.BlockTable.NumBlocks;
+            return (long)_pool.NumFreeBlocks - outstanding >= need;
+        }
+
+        private string _capacityWaitLoggedFor;
+
+        private void LogCapacityWait(SequenceState seq)
+        {
+            if (string.Equals(_capacityWaitLoggedFor, seq.RequestId, StringComparison.Ordinal))
+                return;
+            _capacityWaitLoggedFor = seq.RequestId;
+            _logger.LogInformation(
+                "KV block pool: {RequestId} ({PromptTokens} prompt tokens) waits for capacity; " +
+                "{Running} running request(s) still need their prompts' blocks ({Free}/{Total} blocks free). " +
+                "It is admitted when one of them finishes. Raise TS_SCHED_NUM_BLOCKS to run more at once.",
+                seq.RequestId, seq.PromptTokens.Count, _running.Count, _pool.NumFreeBlocks, _pool.NumBlocks);
+        }
+
+        /// <summary>Scheduling rank: higher priority first, then earlier submission.
+        /// A larger value is a better preemption victim.</summary>
+        private static long VictimRank(SequenceState s) => -(long)s.Priority * (1L << 40) + s.Sn;
+
+        /// <summary>Preempt the lowest-ranked running sequence that ranks BELOW
+        /// <paramref name="needyForBlocks"/> (lower priority, or the same priority and
+        /// submitted later) and free its blocks, then retry allocation. Returns true
+        /// if successful. A sequence never preempts one that outranks it: when the
+        /// needy sequence is itself the newest it simply waits a step with its blocks
+        /// intact, and the older sequences finish and free theirs. Letting the newest
+        /// preempt the oldest turned a full pool into a livelock of long prefills
+        /// preempting each other at 14-20k computed tokens.</summary>
         private bool TryPreemptForBlocks(SequenceState needyForBlocks, int extraTokens, SchedulerOutput output)
         {
-            // Find the candidate to preempt: highest sn (latest submission) and
-            // lowest priority, not the requester.
             SequenceState victim = null;
-            int victimScore = int.MinValue;
+            long victimRank = VictimRank(needyForBlocks);
             foreach (var s in _runningOrder)
             {
                 if (ReferenceEquals(s, needyForBlocks)) continue;
@@ -768,10 +831,10 @@ namespace TensorSharp.Runtime.Scheduling
                 if (output.ScheduledWork.Exists(
                         work => ReferenceEquals(work.Sequence, s)))
                     continue;
-                int score = -s.Priority * 1_000_000 + (int)(s.Sn & 0xfffff);
-                if (score > victimScore)
+                long rank = VictimRank(s);
+                if (rank > victimRank)
                 {
-                    victimScore = score;
+                    victimRank = rank;
                     victim = s;
                 }
             }

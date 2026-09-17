@@ -41,7 +41,16 @@ Qwen-VL video layout takes over from there:
 - **Temporal pairs.** The tower's patch embedding has two temporal slices
   (`v.patch_embd.weight` and `.weight.1`), so consecutive frames are merged
   two at a time exactly as the Qwen-VL processor stacks them; an odd clip
-  repeats its last frame to complete the final pair. Each pair is encoded on
+  repeats its last frame to complete the final pair. The processor samples at
+  2 fps, so the frames it merges are 0.5 s apart, and TensorSharp pairs two
+  sampled frames only when they are that close (at most
+  `QwenVideoFrames.MaxPairedFrameGapSeconds`, 0.575 s). A sparser frame — the
+  default 1 fps, or a long clip spread over `max_frames` — is a different scene,
+  so it fills its own temporal patch (repeated, like a still image) and keeps
+  its own time label. Pairing such frames blended them: a three-frame 1 fps
+  clip of the cards 17, 42, 86 read back as `["12", "47", "86"]` and reads
+  `["17", "42", "86"]` with a patch per frame. The cost is one patch per
+  sampled frame instead of per two. Each pair is encoded on
   its own (the reference tower attends within one temporal patch only) and
   yields the same merged-patch token count as one still frame. The clip is
   resized as a whole against one video pixel budget
