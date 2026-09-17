@@ -1,0 +1,37 @@
+Test run for /workspace/ts-codex-glm-completion-20260917/repo/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll (.NETCoreApp,Version=v10.0)
+A total of 1 test files matched the specified pattern.
+/workspace/ts-codex-glm-completion-20260917/repo/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll
+[xUnit.net 00:00:00.00] xUnit.net VSTest Adapter v3.1.4+50e68bbb8b (64-bit .NET 10.0.12)
+[xUnit.net 00:00:00.40]   Discovering: InferenceWeb.Tests
+[xUnit.net 00:00:01.78]   Discovered:  InferenceWeb.Tests
+[xUnit.net 00:00:01.82]   Starting:    InferenceWeb.Tests
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 45498 MiB):
+  Device 0: NVIDIA A40, compute capability 8.6, VMM: yes, VRAM: 45498 MiB
+[glm] glm-dsa: 4 trunk layers (NextN block present but not loaded; --spec loads it), n_embd=64, 4 heads, MLA(q_lora=32, kv_lora=32, head_k=48, head_v=48, rope=16), 8 experts top-2 (ff=32), dense_lead=1, indexer 8x64 top-8 on 4/4 layers, vocab=128
+[glm] loaded 0.0 GiB across 1 GPU(s) in 0.2s (0.01 GiB/s); n_ctx=256, n_ubatch=16, flash_attn=off, fused_indexer=off
+[glm]   device 0: layers 0..3 (4), 44.2 GiB free after load
+[xUnit.net 00:00:02.38]     InferenceWeb.Tests.GlmDsaNativeBatchedDecodeLayerSplitTests.BatchedDecode_MatchesPerSequenceDecode_TwoGpus [SKIP]
+[xUnit.net 00:00:02.38]       Requires 2 visible CUDA devices; found 1.
+[xUnit.net 00:00:02.38]     InferenceWeb.Tests.GlmDsaNativeBatchedDecodeLayerSplitTests.BatchedDecode_MatchesPerSequenceDecode_ThreeGpus [SKIP]
+[xUnit.net 00:00:02.38]       Requires 3 visible CUDA devices; found 1.
+[xUnit.net 00:00:02.38]   Finished:    InferenceWeb.Tests
+  Passed InferenceWeb.Tests.GlmDsaNativeBatchedDecodeLayerSplitTests.BatchedDecode_MatchesPerSequenceDecode_OneGpu [496 ms]
+  Standard Output Messages:
+ nGpu=1: worst max|batched - serial| over 6 steps = 0
+
+
+  Skipped InferenceWeb.Tests.GlmDsaNativeBatchedDecodeLayerSplitTests.BatchedDecode_MatchesPerSequenceDecode_TwoGpus [1 ms]
+  Error Message:
+   Requires 2 visible CUDA devices; found 1.
+
+  Skipped InferenceWeb.Tests.GlmDsaNativeBatchedDecodeLayerSplitTests.BatchedDecode_MatchesPerSequenceDecode_ThreeGpus [1 ms]
+  Error Message:
+   Requires 3 visible CUDA devices; found 1.
+
+Results File: /workspace/ts-codex-glm-completion-20260917/results/glm-one-visible-gpu.trx
+
+Test Run Successful.
+Total tests: 3
+     Passed: 1
+    Skipped: 2
+ Total time: 3.7941 Seconds

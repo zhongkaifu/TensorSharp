@@ -66,6 +66,19 @@ public class MuseGlimmerRegressionTests
     }
 
     [Theory]
+    [InlineData("glm4")]
+    [InlineData("chatglm-bpe")]
+    public void PreTokenizer_Glm4_KeepsDigitRunsOfUpToThree(string pre)
+    {
+        // llama.cpp LLAMA_VOCAB_PRE_TYPE_CHATGLM4 (GLM-4, GLM-5.2, GLM-5.3, GLM-5.3-Flash).
+        var regex = new Regex(BpeTokenizer.ResolvePreTokenizerPattern(pre));
+        Assert.Equal(new[] { "INV", "-", "472" }, Split(regex, "INV-472"));
+        Assert.Equal(new[] { "silver", "-", "482", "1" }, Split(regex, "silver-4821"));
+        Assert.Equal(new[] { " is", " 17", " +", " 25" }.Select(x => x.Trim()).ToArray(),
+            Split(regex, " is 17 + 25").Select(x => x.Trim()).ToArray());
+    }
+
+    [Theory]
     [InlineData("gpt-4o")]
     [InlineData("llama4")]
     public void PreTokenizer_Gpt4oFamily_KeepsMultiDigitRunsTogether(string pre)

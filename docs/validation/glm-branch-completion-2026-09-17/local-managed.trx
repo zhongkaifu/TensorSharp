@@ -1,0 +1,555 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TestRun id="d996fcf2-8419-452d-958f-8dbdb20655c9" name="@Zhongkais-MacBook-Pro 2026-09-17 07:33:28" xmlns="http://microsoft.com/schemas/VisualStudio/TeamTest/2010">
+  <Times creation="2026-09-17T07:33:28.2437910-07:00" queuing="2026-09-17T07:33:28.2437910-07:00" start="2026-09-17T07:33:27.6273650-07:00" finish="2026-09-17T07:33:28.7284940-07:00" />
+  <TestSettings name="default" id="eb4f9f48-e2c2-492f-a1d1-9e7efbbf8177">
+    <Deployment runDeploymentRoot="_Zhongkais-MacBook-Pro_2026-09-17_07_33_28" />
+  </TestSettings>
+  <Results>
+    <UnitTestResult executionId="b5aaf4bc-1f46-43ef-ad44-90d208ee5fd1" testId="13d12492-71da-98be-0629-739284739629" testName="InferenceWeb.Tests.GlmDsaTinyModelTests.Glm5Next_DeclaresAThinkingGrammarTrigger" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0002178" startTime="2026-09-17T07:33:28.3043880-07:00" endTime="2026-09-17T07:33:28.3045730-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="b5aaf4bc-1f46-43ef-ad44-90d208ee5fd1" />
+    <UnitTestResult executionId="0b6cc700-4d60-43f5-b224-b8b5eb28b5ed" testId="2e826c11-aace-6239-d53e-8c629f654d9f" testName="InferenceWeb.Tests.BpeTokenizerTests.ResolveEogTokenIds_FoldsDeclaredEndOfMessageId" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0000783" startTime="2026-09-17T07:33:28.2355200-07:00" endTime="2026-09-17T07:33:28.2355390-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="0b6cc700-4d60-43f5-b224-b8b5eb28b5ed" />
+    <UnitTestResult executionId="a887871f-2f35-4cca-b5fa-b09e1eb24802" testId="5c170fc7-804f-b4c8-d9c7-b2f0e2564a12" testName="InferenceWeb.Tests.GlmDsaTinyModelTests.GlmDsa_SharedIndexerLayers_Run" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0275104" startTime="2026-09-17T07:33:28.6704060-07:00" endTime="2026-09-17T07:33:28.6978560-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="a887871f-2f35-4cca-b5fa-b09e1eb24802">
+      <Output>
+        <StdOut>shared-indexer continuation: 84 29 35 31</StdOut>
+      </Output>
+    </UnitTestResult>
+    <UnitTestResult executionId="cebfabd2-5a0c-4c4e-a9f1-5886ea24e286" testId="da08b014-c559-de4f-f189-e8e889935e33" testName="InferenceWeb.Tests.BpeTokenizerTests.Encode_ParsesNormalTypedEogMarkerAsSpecialToken" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0095190" startTime="2026-09-17T07:33:28.2048750-07:00" endTime="2026-09-17T07:33:28.2164150-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="cebfabd2-5a0c-4c4e-a9f1-5886ea24e286" />
+    <UnitTestResult executionId="27d07bd3-efa7-48b4-b052-86c935059b2b" testId="23ab6493-9e84-01f4-9d71-928527990201" testName="InferenceWeb.Tests.Glm4TokenizerParityTests.PreTokenizer_MatchesTheReferenceSplitOnEveryCase(pre: &quot;glm4&quot;)" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0037469" startTime="2026-09-17T07:33:28.2495810-07:00" endTime="2026-09-17T07:33:28.2532570-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="27d07bd3-efa7-48b4-b052-86c935059b2b" />
+    <UnitTestResult executionId="539a1708-eb3d-4693-8d2a-ac0ca74d6c7c" testId="899ee396-d816-2a5c-a56e-3d0259d24191" testName="InferenceWeb.Tests.MuseGlimmerRegressionTests.InjectMultimodalTokens_EveryVisionArchEmitsAMarker(architecture: &quot;qwen35&quot;, expectedMarker: &quot;&lt;|vision_start|&gt;&lt;|image_pad|&gt;&lt;|vision_end|&gt;&quot;)" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0004890" startTime="2026-09-17T07:33:28.6993300-07:00" endTime="2026-09-17T07:33:28.6997910-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="539a1708-eb3d-4693-8d2a-ac0ca74d6c7c" />
+    <UnitTestResult executionId="1223bb0d-931f-4ef8-bb0f-a9f0ad319bc2" testId="82dfef19-f141-476b-918b-b4f319c46274" testName="InferenceWeb.Tests.MuseGlimmerRegressionTests.InjectMultimodalTokens_MuseGlimmer_UnderscoreSpellingAlsoWorks" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0000345" startTime="2026-09-17T07:33:28.7020590-07:00" endTime="2026-09-17T07:33:28.7020750-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="1223bb0d-931f-4ef8-bb0f-a9f0ad319bc2" />
+    <UnitTestResult executionId="b4b0782f-5581-4db3-b413-40fbcde1a06a" testId="8eb895fc-f02d-72f9-53f9-68abd3e2c043" testName="InferenceWeb.Tests.MuseGlimmerRegressionTests.InjectMultimodalTokens_EveryVisionArchEmitsAMarker(architecture: &quot;gemma4&quot;, expectedMarker: &quot;&lt;|image&gt;&quot;)" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0001900" startTime="2026-09-17T07:33:28.6991620-07:00" endTime="2026-09-17T07:33:28.6992920-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="b4b0782f-5581-4db3-b413-40fbcde1a06a" />
+    <UnitTestResult executionId="0e338b25-210a-4682-b802-715d67bc2e4d" testId="ad1a7f4d-c964-122f-6d8a-47e9b19e15b8" testName="InferenceWeb.Tests.GlmDsaTinyModelTests.GlmDsa_ChunkedPrefill_MatchesSingleShot(chunk: 7)" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0651428" startTime="2026-09-17T07:33:28.4873980-07:00" endTime="2026-09-17T07:33:28.5525290-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="0e338b25-210a-4682-b802-715d67bc2e4d" />
+    <UnitTestResult executionId="5a6575ae-2ba0-46e2-8010-163e756d7964" testId="4dc01418-b9d1-d6b0-951e-bd30d810b3a5" testName="InferenceWeb.Tests.GlmDsaTinyModelTests.Glm_OutputParser_StreamedCharByChar_ToolCallAfterReasoningIsParsed(arch: &quot;glm-dsa&quot;, enableThinking: True)" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0001134" startTime="2026-09-17T07:33:28.2572230-07:00" endTime="2026-09-17T07:33:28.2573160-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="5a6575ae-2ba0-46e2-8010-163e756d7964" />
+    <UnitTestResult executionId="5098d6a2-1a7e-4829-a519-ee1ae20b4e02" testId="72ec60f7-59c0-0271-f283-5a858a950d73" testName="InferenceWeb.Tests.BpeTokenizerTests.Encode_Gemma4FallsBackToRawUtf8ByteTokens" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0010603" startTime="2026-09-17T07:33:28.2201470-07:00" endTime="2026-09-17T07:33:28.2201610-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="5098d6a2-1a7e-4829-a519-ee1ae20b4e02" />
+    <UnitTestResult executionId="e49e3c1c-b15c-497b-80e6-93b22eb73261" testId="9021e26e-d258-ba6a-84da-3fc09a4d5878" testName="InferenceWeb.Tests.GlmDsaTinyModelTests.GlmDsa_ChunkedPrefill_MatchesSingleShot(chunk: 16)" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0656299" startTime="2026-09-17T07:33:28.3046110-07:00" endTime="2026-09-17T07:33:28.3702470-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="e49e3c1c-b15c-497b-80e6-93b22eb73261" />
+    <UnitTestResult executionId="3d00c0ae-74d2-4c47-afc4-54e36554511a" testId="025efe8c-bfa8-a559-fa89-16175b48f2d3" testName="InferenceWeb.Tests.GlmDsaNativeBatchedDecodeLayerSplitTests.BatchedDecode_MatchesPerSequenceDecode_OneGpu" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0010000" startTime="2026-09-17T07:33:28.2374000-07:00" endTime="2026-09-17T07:33:28.2375230-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="NotExecuted" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="3d00c0ae-74d2-4c47-afc4-54e36554511a">
+      <Output>
+        <ErrorInfo>
+          <Message>Requires TS_TEST_GLM_CUDA=1 for the native GLM CUDA fixture.</Message>
+        </ErrorInfo>
+      </Output>
+    </UnitTestResult>
+    <UnitTestResult executionId="ba50a930-4b2f-4b68-9bcd-6ab02cc4f28c" testId="0a3c1104-d989-b577-0fbc-a1f8a4487e29" testName="InferenceWeb.Tests.MuseGlimmerRegressionTests.InjectMultimodalTokens_EveryVisionArchEmitsAMarker(architecture: &quot;muse-glimmer&quot;, expectedMarker: &quot;&lt;|patch|&gt;&quot;)" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0003250" startTime="2026-09-17T07:33:28.6986630-07:00" endTime="2026-09-17T07:33:28.6989420-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="ba50a930-4b2f-4b68-9bcd-6ab02cc4f28c" />
+    <UnitTestResult executionId="5fa999b6-2b71-49a6-ba13-786d0eb3b849" testId="b3e29ac1-ab83-6973-3d51-f4064ff02e2d" testName="InferenceWeb.Tests.GlmDsaTinyModelTests.Glm5Next_OutputParser_ThinkTrue_Unchanged" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0001428" startTime="2026-09-17T07:33:28.5529310-07:00" endTime="2026-09-17T07:33:28.5530330-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="5fa999b6-2b71-49a6-ba13-786d0eb3b849" />
+    <UnitTestResult executionId="49993561-84fb-4ae5-aea8-1ff16806f20b" testId="558e7f20-6f0f-a64c-55cc-0c71bfad15c2" testName="InferenceWeb.Tests.MuseGlimmerRegressionTests.PreTokenizer_Gpt4oFamily_SharesTheGpt4oPattern(pre: &quot;kanana2&quot;)" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0000015" startTime="2026-09-17T07:33:28.7015280-07:00" endTime="2026-09-17T07:33:28.7015430-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="49993561-84fb-4ae5-aea8-1ff16806f20b" />
+    <UnitTestResult executionId="293b2ef9-c057-4578-9ec5-ad143046ee89" testId="b295ab53-0552-02cd-0d1c-f4d3cb58fed2" testName="InferenceWeb.Tests.GlmDsaTinyModelTests.GlmDsa_OutputParser_ThinkFalse_StillStartsInContent" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0001083" startTime="2026-09-17T07:33:28.2557610-07:00" endTime="2026-09-17T07:33:28.2557850-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="293b2ef9-c057-4578-9ec5-ad143046ee89" />
+    <UnitTestResult executionId="d93df869-73aa-4b02-bf69-96c5b9b91db9" testId="1cadca4d-921f-b4cc-be77-884e41ab4b84" testName="InferenceWeb.Tests.MuseGlimmerRegressionTests.InjectMultimodalTokens_MuseGlimmer_TextOnlyMessageIsUntouched" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0003500" startTime="2026-09-17T07:33:28.6982760-07:00" endTime="2026-09-17T07:33:28.6986040-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="d93df869-73aa-4b02-bf69-96c5b9b91db9" />
+    <UnitTestResult executionId="17a6f7ab-833f-45a3-8fd5-758ff5129c14" testId="1a869902-0daf-22ce-5de3-53b7fd2de380" testName="InferenceWeb.Tests.GlmDsaTinyModelTests.GlmDsa_OutputParser_SplitsThinkingContentAndToolCalls" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0011421" startTime="2026-09-17T07:33:28.2558220-07:00" endTime="2026-09-17T07:33:28.2567100-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="17a6f7ab-833f-45a3-8fd5-758ff5129c14" />
+    <UnitTestResult executionId="4923d914-6a95-4a3f-9c53-593d4edcaa69" testId="2b7016f4-3b95-ac48-3b8d-e50f3233ec17" testName="InferenceWeb.Tests.GlmDsaTinyModelTests.GlmDsa_LoadsAndReportsArchitecture" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0469450" startTime="2026-09-17T07:33:28.2573860-07:00" endTime="2026-09-17T07:33:28.3042960-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="4923d914-6a95-4a3f-9c53-593d4edcaa69" />
+    <UnitTestResult executionId="10d2aef9-55ab-4569-bda4-0b01dc789d9e" testId="444b62bc-66b3-3ab5-15a5-c006b73124a8" testName="InferenceWeb.Tests.MuseGlimmerRegressionTests.PreTokenizer_DefaultPattern_StillSplitsEveryDigit" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0000552" startTime="2026-09-17T07:33:28.7021180-07:00" endTime="2026-09-17T07:33:28.7021330-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="10d2aef9-55ab-4569-bda4-0b01dc789d9e" />
+    <UnitTestResult executionId="6ef62bab-90fb-4298-a741-80bb2990b4e2" testId="d2b7591f-cb33-f9ee-6498-e817fc7701d5" testName="InferenceWeb.Tests.BpeTokenizerTests.UsesSentencePieceTokenizer_DispatchesProductionTokenizerFamily(tokenizerModel: &quot;llama&quot;, expected: True)" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0000007" startTime="2026-09-17T07:33:28.2215490-07:00" endTime="2026-09-17T07:33:28.2215630-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="6ef62bab-90fb-4298-a741-80bb2990b4e2" />
+    <UnitTestResult executionId="86e19396-5c2c-4e69-898e-0090c2df225a" testId="d26b27c8-ab1e-f9e5-7e36-f959d71c5cc4" testName="InferenceWeb.Tests.BpeTokenizerTests.Encode_ParsesNormalTypedEogMarkerForDefaultBpeTokenizer" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0019879" startTime="2026-09-17T07:33:28.2309940-07:00" endTime="2026-09-17T07:33:28.2310090-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="86e19396-5c2c-4e69-898e-0090c2df225a" />
+    <UnitTestResult executionId="dff31388-491d-4e7f-9be2-f8159872cc8f" testId="fbeb0308-9ebe-d1b1-bde6-a43d78de3b66" testName="InferenceWeb.Tests.GlmDsaTinyModelTests.GlmDsa_ChatTemplate_MatchesModelFormat" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0004696" startTime="2026-09-17T07:33:28.5530870-07:00" endTime="2026-09-17T07:33:28.5535240-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="dff31388-491d-4e7f-9be2-f8159872cc8f" />
+    <UnitTestResult executionId="67c5ada2-acf8-4c0d-baa4-e4513057d1aa" testId="0e30f58f-0468-c89a-f230-3ae7cc232a82" testName="InferenceWeb.Tests.BpeTokenizerTests.ResolveEogTokenIds_AppliesLlamaHarmonyAndGemmaWorkarounds" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0001196" startTime="2026-09-17T07:33:28.2309330-07:00" endTime="2026-09-17T07:33:28.2309510-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="67c5ada2-acf8-4c0d-baa4-e4513057d1aa" />
+    <UnitTestResult executionId="688492a3-2c3e-41b8-a946-fc7bbe4449a4" testId="7217cbae-b031-2506-0380-236ac073865d" testName="InferenceWeb.Tests.GlmDsaTinyModelTests.Glm_OutputParser_StreamedCharByChar_ToolCallAfterReasoningIsParsed(arch: &quot;glm5next&quot;, enableThinking: True)" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0001615" startTime="2026-09-17T07:33:28.2570360-07:00" endTime="2026-09-17T07:33:28.2571740-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="688492a3-2c3e-41b8-a946-fc7bbe4449a4" />
+    <UnitTestResult executionId="87a5bdc0-8dd4-42d5-a1f4-3a0bb34f0989" testId="32a98c3b-410c-9fb5-ec9b-d59b9cefec8f" testName="InferenceWeb.Tests.GlmDsaTinyModelTests.Glm5Next_FallbackRenderer_AlwaysOpensThinking_SoThinkFalseAnswersStayContent(enableThinking: False)" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0002705" startTime="2026-09-17T07:33:28.5922820-07:00" endTime="2026-09-17T07:33:28.5925330-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="87a5bdc0-8dd4-42d5-a1f4-3a0bb34f0989" />
+    <UnitTestResult executionId="71612bc0-c177-4f17-8f66-bd2149f1f903" testId="4662e0b1-6aa8-6659-6099-9e76face3a5d" testName="InferenceWeb.Tests.BpeTokenizerTests.UsesSentencePieceTokenizer_DispatchesProductionTokenizerFamily(tokenizerModel: &quot;gemma4&quot;, expected: False)" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0000011" startTime="2026-09-17T07:33:28.2215090-07:00" endTime="2026-09-17T07:33:28.2215240-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="71612bc0-c177-4f17-8f66-bd2149f1f903" />
+    <UnitTestResult executionId="d0796583-f29b-45ca-a2c6-09884ba12661" testId="af76451f-11d0-e6bc-d841-3769323fd88a" testName="InferenceWeb.Tests.BpeTokenizerTests.Encode_Qwen35KeepsCombiningMarksWithLetters" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0019324" startTime="2026-09-17T07:33:28.2308270-07:00" endTime="2026-09-17T07:33:28.2308450-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="d0796583-f29b-45ca-a2c6-09884ba12661" />
+    <UnitTestResult executionId="84025518-98bd-4d76-8e60-97092124bb8f" testId="ba2f4566-d798-1d7f-8ed2-afd0bbc5a71d" testName="InferenceWeb.Tests.BpeTokenizerTests.Encode_RequeuesChangedPairAtItsCurrentRank" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0022137" startTime="2026-09-17T07:33:28.2306220-07:00" endTime="2026-09-17T07:33:28.2307090-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="84025518-98bd-4d76-8e60-97092124bb8f" />
+    <UnitTestResult executionId="195edbbd-589a-47f9-92b4-11e207254e85" testId="4a8f8971-c91d-63a3-a4df-976c85bc0837" testName="InferenceWeb.Tests.GlmDsaTinyModelTests.GlmDsa_Quantized_MatchesLlamaCpp" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0432066" startTime="2026-09-17T07:33:28.6270150-07:00" endTime="2026-09-17T07:33:28.6702140-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="195edbbd-589a-47f9-92b4-11e207254e85" />
+    <UnitTestResult executionId="2203f528-1c3c-4ce3-b526-f0fcf2a61e4a" testId="307c9588-fb5b-30b8-8d68-0ec0461c041e" testName="InferenceWeb.Tests.GlmDsaTinyModelTests.GlmDsa_LongerSparsePrompt_MatchesLlamaCpp" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0374683" startTime="2026-09-17T07:33:28.5535650-07:00" endTime="2026-09-17T07:33:28.5910700-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="2203f528-1c3c-4ce3-b526-f0fcf2a61e4a" />
+    <UnitTestResult executionId="3db4135a-2801-4b01-9b41-e16c0394dc0e" testId="18ede5ac-0df9-0bfd-00cb-c0d3be2499cc" testName="InferenceWeb.Tests.BpeTokenizerTests.ResolveAddBosToken_ForcesGemma4BosWithoutTemplateMarker" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0001413" startTime="2026-09-17T07:33:28.2198790-07:00" endTime="2026-09-17T07:33:28.2199140-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="3db4135a-2801-4b01-9b41-e16c0394dc0e" />
+    <UnitTestResult executionId="028aabeb-4f25-4889-97be-906601d9283c" testId="13f05968-e79c-cc22-dead-df6fe344ef37" testName="InferenceWeb.Tests.MuseGlimmerRegressionTests.InjectMultimodalTokens_EveryVisionArchEmitsAMarker(architecture: &quot;mistral3&quot;, expectedMarker: &quot;[IMG]&quot;)" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0001272" startTime="2026-09-17T07:33:28.6989820-07:00" endTime="2026-09-17T07:33:28.6990930-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="028aabeb-4f25-4889-97be-906601d9283c" />
+    <UnitTestResult executionId="35a95726-5820-4a13-9ff1-661442309e35" testId="4ddab774-7b71-70f1-d754-2f5a63a5a544" testName="InferenceWeb.Tests.GlmDsaTinyModelTests.GlmDsa_SparsePrompt_MatchesLlamaCpp" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0303335" startTime="2026-09-17T07:33:28.5969500-07:00" endTime="2026-09-17T07:33:28.6268780-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="35a95726-5820-4a13-9ff1-661442309e35" />
+    <UnitTestResult executionId="0dc0ac3d-2d0d-40a0-9ed3-31ef492885ff" testId="8cf3a4a2-812f-30dd-30cf-d1153dc17525" testName="InferenceWeb.Tests.GlmDsaTinyModelTests.Glm_OutputParser_StreamedCharByChar_ToolCallAfterReasoningIsParsed(arch: &quot;glm5next&quot;, enableThinking: False)" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0002858" startTime="2026-09-17T07:33:28.2567710-07:00" endTime="2026-09-17T07:33:28.2570050-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="0dc0ac3d-2d0d-40a0-9ed3-31ef492885ff" />
+    <UnitTestResult executionId="525f1c93-3cae-42d0-aaae-054811b4c79a" testId="2e858603-94cb-907a-53f8-4c0172fd6c7b" testName="InferenceWeb.Tests.GlmDsaTinyModelTests.Glm5Next_FallbackRenderer_AlwaysOpensThinking_SoThinkFalseAnswersStayContent(enableThinking: True)" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0010397" startTime="2026-09-17T07:33:28.5912040-07:00" endTime="2026-09-17T07:33:28.5921940-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="525f1c93-3cae-42d0-aaae-054811b4c79a" />
+    <UnitTestResult executionId="9fa6dd07-55db-469d-b51d-d06220a0d916" testId="08102d9d-24f3-ca98-c56f-3aa6335ea093" testName="InferenceWeb.Tests.BpeTokenizerTests.Encode_Qwen35CombiningMarkRuleDoesNotChangeDefaultTokenizer" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0018496" startTime="2026-09-17T07:33:28.2310450-07:00" endTime="2026-09-17T07:33:28.2310610-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="9fa6dd07-55db-469d-b51d-d06220a0d916" />
+    <UnitTestResult executionId="4c50cc55-9615-4afb-9cd3-87d8070a3b80" testId="3f0d818b-b185-89cf-cd5d-23f661d6d542" testName="InferenceWeb.Tests.GlmDsaNativeBatchedDecodeLayerSplitTests.BatchedDecode_MatchesPerSequenceDecode_ThreeGpus" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0010000" startTime="2026-09-17T07:33:28.2383040-07:00" endTime="2026-09-17T07:33:28.2383090-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="NotExecuted" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="4c50cc55-9615-4afb-9cd3-87d8070a3b80">
+      <Output>
+        <ErrorInfo>
+          <Message>Requires TS_TEST_GLM_CUDA=1 for the native GLM CUDA fixture.</Message>
+        </ErrorInfo>
+      </Output>
+    </UnitTestResult>
+    <UnitTestResult executionId="6edea0ca-71e5-429c-a524-62669137423b" testId="1f74ef6f-daab-b0b0-8be6-4c83e6692798" testName="InferenceWeb.Tests.MuseGlimmerRegressionTests.InjectMultimodalTokens_MuseGlimmer_EmitsPatchMarkerPerImage" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0000865" startTime="2026-09-17T07:33:28.7021750-07:00" endTime="2026-09-17T07:33:28.7021920-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="6edea0ca-71e5-429c-a524-62669137423b" />
+    <UnitTestResult executionId="a627fa27-e9f3-48f6-a61f-6c5ec6d3c2e9" testId="a08f7776-9409-2c97-f1ac-4d32da05addb" testName="InferenceWeb.Tests.BpeTokenizerTests.Encode_Gemma4UsesRankedBpeOverRawUnicodeAndEscapedSpaces" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0019837" startTime="2026-09-17T07:33:28.2334680-07:00" endTime="2026-09-17T07:33:28.2354380-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="a627fa27-e9f3-48f6-a61f-6c5ec6d3c2e9" />
+    <UnitTestResult executionId="aa90316f-99ad-4e96-bd25-ac317d9f5c4f" testId="66e907ec-977c-c934-ebf5-933aa65c231f" testName="InferenceWeb.Tests.GlmDsaTinyModelTests.Glm5Next_OutputParser_ThinkFalse_JsonStringMarkersAreContent(json: &quot;{\&quot;text\&quot;:\&quot;escaped \\\&quot; quote &lt;/think&gt;\&quot;,\&quot;path\&quot;&quot;···)" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0002163" startTime="2026-09-17T07:33:28.2549750-07:00" endTime="2026-09-17T07:33:28.2551530-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="aa90316f-99ad-4e96-bd25-ac317d9f5c4f" />
+    <UnitTestResult executionId="cea8ceef-0a58-41fc-b991-b75ccdb125e9" testId="fedd477a-bff1-3a81-e853-08cf41180cd8" testName="InferenceWeb.Tests.GlmDsaTinyModelTests.Glm5Next_OutputParser_ThinkFalse_StreamedJsonAnswerIsContentAndPartialCloseTagIsHeld" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0002481" startTime="2026-09-17T07:33:28.2551960-07:00" endTime="2026-09-17T07:33:28.2554230-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="cea8ceef-0a58-41fc-b991-b75ccdb125e9" />
+    <UnitTestResult executionId="2873f6fe-f4c7-4001-afec-9a036a5ccc10" testId="5b4bdd36-ed1e-b59c-48d0-3cda846e7d50" testName="InferenceWeb.Tests.MuseGlimmerRegressionTests.PreTokenizer_Gpt4oFamily_SharesTheGpt4oPattern(pre: &quot;llama4&quot;)" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0000183" startTime="2026-09-17T07:33:28.7014380-07:00" endTime="2026-09-17T07:33:28.7014560-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="2873f6fe-f4c7-4001-afec-9a036a5ccc10" />
+    <UnitTestResult executionId="1ff2d7fe-e709-4af8-924d-ca623bdc27f7" testId="351d0e51-38ae-8395-fa8a-adc9bc2cf264" testName="InferenceWeb.Tests.GlmDsaTinyModelTests.GlmDsa_ChunkedPrefill_MatchesSingleShot(chunk: 64)" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0424937" startTime="2026-09-17T07:33:28.4450760-07:00" endTime="2026-09-17T07:33:28.4872710-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="1ff2d7fe-e709-4af8-924d-ca623bdc27f7" />
+    <UnitTestResult executionId="0b825157-772f-446b-b30f-5da701ad1616" testId="23a5fd91-feeb-f1db-b3d3-4eb428010ecc" testName="InferenceWeb.Tests.BpeTokenizerTests.Encode_Gemma4PreservesKnownNewlineRuns" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0007880" startTime="2026-09-17T07:33:28.2200900-07:00" endTime="2026-09-17T07:33:28.2201060-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="0b825157-772f-446b-b30f-5da701ad1616" />
+    <UnitTestResult executionId="a2e5a70a-bb89-4191-9986-7b0c9e3288a8" testId="91918684-7707-b56c-01da-8dc324a4d199" testName="InferenceWeb.Tests.GlmDsaTinyModelTests.Glm5Next_OutputParser_ThinkFalse_UnclosedReplyIsTheAnswer" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0002027" startTime="2026-09-17T07:33:28.6980440-07:00" endTime="2026-09-17T07:33:28.6980780-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="a2e5a70a-bb89-4191-9986-7b0c9e3288a8" />
+    <UnitTestResult executionId="624e5465-ddbe-42c2-a606-147ff45e9090" testId="c06b5f4f-2745-88fe-47f7-e7e49fa67b0c" testName="InferenceWeb.Tests.GlmDsaNativeBatchedDecodeLayerSplitTests.BatchedDecode_MatchesPerSequenceDecode_TwoGpus" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0010000" startTime="2026-09-17T07:33:28.2382150-07:00" endTime="2026-09-17T07:33:28.2382300-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="NotExecuted" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="624e5465-ddbe-42c2-a606-147ff45e9090">
+      <Output>
+        <ErrorInfo>
+          <Message>Requires TS_TEST_GLM_CUDA=1 for the native GLM CUDA fixture.</Message>
+        </ErrorInfo>
+      </Output>
+    </UnitTestResult>
+    <UnitTestResult executionId="3d14ab34-d20f-45a4-b3eb-1d8aa6d0299c" testId="8278813c-7b0b-efce-2597-beaffdd969f8" testName="InferenceWeb.Tests.MuseGlimmerRegressionTests.PreTokenizer_Gpt4oFamily_SharesTheGpt4oPattern(pre: &quot;talkie&quot;)" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0000269" startTime="2026-09-17T07:33:28.7014850-07:00" endTime="2026-09-17T07:33:28.7015000-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="3d14ab34-d20f-45a4-b3eb-1d8aa6d0299c" />
+    <UnitTestResult executionId="5c07cb4c-4999-4e96-a430-edf5f62df464" testId="1953b47a-bc11-c99d-fa2b-a4c0efc7dd11" testName="InferenceWeb.Tests.BpeTokenizerTests.UsesSentencePieceTokenizer_DispatchesProductionTokenizerFamily(tokenizerModel: &quot;gpt2&quot;, expected: False)" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0000634" startTime="2026-09-17T07:33:28.2214590-07:00" endTime="2026-09-17T07:33:28.2214800-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="5c07cb4c-4999-4e96-a430-edf5f62df464" />
+    <UnitTestResult executionId="38378e9e-87dc-422d-9e16-e1babefa2b74" testId="7f57bba1-0107-94c1-1897-4925932bf40b" testName="InferenceWeb.Tests.BpeTokenizerTests.ResolveEogTokenIds_UsesOnlyDeclaredEndOfTurnId" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0003115" startTime="2026-09-17T07:33:28.2310940-07:00" endTime="2026-09-17T07:33:28.2311110-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="38378e9e-87dc-422d-9e16-e1babefa2b74" />
+    <UnitTestResult executionId="f9c44c84-bfa5-4e69-a5f5-ece24da6a0c5" testId="f396610e-2a87-93cd-7ad6-e0c431b405b3" testName="InferenceWeb.Tests.GlmDsaTinyModelTests.Glm5Next_OutputParser_ThinkFalse_JsonReasoningStillClosesOutsideStrings" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0002803" startTime="2026-09-17T07:33:28.5526710-07:00" endTime="2026-09-17T07:33:28.5528690-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="f9c44c84-bfa5-4e69-a5f5-ece24da6a0c5" />
+    <UnitTestResult executionId="63f1efa4-23f9-4dd1-a9de-ac6d40ccbea9" testId="64048051-3bf8-a995-8c41-225ba0f78c8b" testName="InferenceWeb.Tests.MuseGlimmerRegressionTests.ImageGeometry_IosPortrait_UsesBoundedReferenceGrid" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0003717" startTime="2026-09-17T07:33:28.7010290-07:00" endTime="2026-09-17T07:33:28.7013820-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="63f1efa4-23f9-4dd1-a9de-ac6d40ccbea9" />
+    <UnitTestResult executionId="758b608d-740c-43fa-bb06-32f81a98a01a" testId="dccb71f5-6a85-5d61-7971-baf41e8d72ae" testName="InferenceWeb.Tests.MuseGlimmerRegressionTests.PreTokenizer_Gpt4oFamily_KeepsMultiDigitRunsTogether(pre: &quot;llama4&quot;)" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0009943" startTime="2026-09-17T07:33:28.7004740-07:00" endTime="2026-09-17T07:33:28.7008580-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="758b608d-740c-43fa-bb06-32f81a98a01a" />
+    <UnitTestResult executionId="24e5e4bf-ee55-497d-bba8-e206fd64b1e4" testId="cb4282f7-d66d-09e3-594c-afbeb722b13c" testName="InferenceWeb.Tests.BpeTokenizerTests.UsesSentencePieceTokenizer_DispatchesProductionTokenizerFamily(tokenizerModel: &quot;t5&quot;, expected: True)" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0008305" startTime="2026-09-17T07:33:28.2205810-07:00" endTime="2026-09-17T07:33:28.2214080-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="24e5e4bf-ee55-497d-bba8-e206fd64b1e4" />
+    <UnitTestResult executionId="22b20d66-e938-4488-bf7e-6206103530a2" testId="7af9a7d2-3594-47e8-4bf0-2eefa13e49e6" testName="InferenceWeb.Tests.MuseGlimmerRegressionTests.PreTokenizer_Glm4_KeepsDigitRunsOfUpToThree(pre: &quot;glm4&quot;)" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0000625" startTime="2026-09-17T07:33:28.7016820-07:00" endTime="2026-09-17T07:33:28.7017060-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="22b20d66-e938-4488-bf7e-6206103530a2" />
+    <UnitTestResult executionId="cb48c081-9063-4e45-8d90-2d52838ad052" testId="7a4de2a2-5f06-f50c-2b2a-93d3a98f5ca2" testName="InferenceWeb.Tests.MuseGlimmerRegressionTests.InjectMultimodalTokens_MuseGlimmer_EmitsOneMarkerPerImage" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0000455" startTime="2026-09-17T07:33:28.7004030-07:00" endTime="2026-09-17T07:33:28.7004230-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="cb48c081-9063-4e45-8d90-2d52838ad052" />
+    <UnitTestResult executionId="f013cc18-8fb0-4216-9a8d-a3add2a8aa28" testId="e0b15e32-c148-420f-eced-4e4892e1a51a" testName="InferenceWeb.Tests.Glm4TokenizerParityTests.Encode_FromGlm5Gguf_MatchesTheReferenceIds" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0010000" startTime="2026-09-17T07:33:28.2384430-07:00" endTime="2026-09-17T07:33:28.2384520-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="NotExecuted" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="f013cc18-8fb0-4216-9a8d-a3add2a8aa28">
+      <Output>
+        <ErrorInfo>
+          <Message>Requires model weights (TS_TEST_MODEL_DIR not set).</Message>
+        </ErrorInfo>
+      </Output>
+    </UnitTestResult>
+    <UnitTestResult executionId="fe10b48b-5f60-48b7-b290-2bd71f9d4273" testId="5718b775-663f-b776-a188-2b5ab67c8e20" testName="InferenceWeb.Tests.MuseGlimmerRegressionTests.InjectMultimodalTokens_MuseGlimmer_UsesVideoMarkerForFrames" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0000492" startTime="2026-09-17T07:33:28.7019950-07:00" endTime="2026-09-17T07:33:28.7020140-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="fe10b48b-5f60-48b7-b290-2bd71f9d4273" />
+    <UnitTestResult executionId="82113066-59a5-4081-bbb9-9cfa8b845277" testId="f446c920-3bcb-07b1-026c-9aa8eba7bc9c" testName="InferenceWeb.Tests.GlmDsaTinyModelTests.GlmDsa_ChunkedPrefill_MatchesSingleShot(chunk: 3)" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0743702" startTime="2026-09-17T07:33:28.3703380-07:00" endTime="2026-09-17T07:33:28.4446950-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="82113066-59a5-4081-bbb9-9cfa8b845277" />
+    <UnitTestResult executionId="fd87dfe1-6160-4279-9a89-78a71c8ab8f8" testId="f4c51d38-9cdb-a378-ab94-452fc90d6183" testName="InferenceWeb.Tests.GlmDsaTinyModelTests.Glm5Next_OutputParser_ThinkFalse_JsonStringMarkersAreContent(json: &quot;{\&quot;text\&quot;:\&quot;&lt;/think&gt;&lt;tool_call&gt;literal&lt;/tool_call&gt;&quot;···)" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0013737" startTime="2026-09-17T07:33:28.2533980-07:00" endTime="2026-09-17T07:33:28.2549250-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="fd87dfe1-6160-4279-9a89-78a71c8ab8f8" />
+    <UnitTestResult executionId="9bc88d27-cb51-4543-9d0c-95f402e9079b" testId="a4b11f13-32a1-6940-1a96-e2d613ef21cf" testName="InferenceWeb.Tests.GlmDsaTinyModelTests.Glm5Next_OutputParser_ThinkFalse_KeepsTheAlwaysOpenReasoningOutOfContent" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0038921" startTime="2026-09-17T07:33:28.5926110-07:00" endTime="2026-09-17T07:33:28.5964540-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="9bc88d27-cb51-4543-9d0c-95f402e9079b" />
+    <UnitTestResult executionId="5ef411bc-4d82-40e2-b557-bbcb9bbd1eda" testId="cf776f8a-7b7d-b6d8-6144-22d1a522e3f9" testName="InferenceWeb.Tests.MuseGlimmerRegressionTests.PreTokenizer_Gpt4oFamily_KeepsMultiDigitRunsTogether(pre: &quot;gpt-4o&quot;)" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0001141" startTime="2026-09-17T07:33:28.7008920-07:00" endTime="2026-09-17T07:33:28.7009850-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="5ef411bc-4d82-40e2-b557-bbcb9bbd1eda" />
+    <UnitTestResult executionId="228275e4-e7da-473b-b0c2-1e8a63805751" testId="8dc52063-692d-19aa-f1e3-ca686bb5dfcb" testName="InferenceWeb.Tests.MuseGlimmerRegressionTests.PreTokenizer_Glm4_KeepsDigitRunsOfUpToThree(pre: &quot;chatglm-bpe&quot;)" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0001786" startTime="2026-09-17T07:33:28.7015810-07:00" endTime="2026-09-17T07:33:28.7016430-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="228275e4-e7da-473b-b0c2-1e8a63805751" />
+    <UnitTestResult executionId="454a56d2-5e95-42ad-b18c-45a99eab1722" testId="1069da5b-e56a-345e-abac-251eba0f971d" testName="InferenceWeb.Tests.BpeTokenizerTests.ResolveEogTokenIds_IncludesBothQwenControlEndings" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0021209" startTime="2026-09-17T07:33:28.2201950-07:00" endTime="2026-09-17T07:33:28.2205450-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="454a56d2-5e95-42ad-b18c-45a99eab1722" />
+    <UnitTestResult executionId="5a43a878-d211-454f-b950-a02cb933755a" testId="f16ecbc8-1348-85f1-6ceb-d73b1baf45da" testName="InferenceWeb.Tests.Glm4TokenizerParityTests.PreTokenizer_MatchesTheReferenceSplitOnEveryCase(pre: &quot;chatglm-bpe&quot;)" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0130846" startTime="2026-09-17T07:33:28.2385440-07:00" endTime="2026-09-17T07:33:28.2494780-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="5a43a878-d211-454f-b950-a02cb933755a" />
+    <UnitTestResult executionId="6819e000-1262-4909-a9f2-3e281d27ae21" testId="e8a300e0-241d-c6a8-c9e2-1e4306a6a063" testName="InferenceWeb.Tests.BpeTokenizerTests.Encode_DiscardsStaleCandidateAfterNeighborMerge" computerName="Zhongkais-MacBook-Pro" duration="00:00:00.0033432" startTime="2026-09-17T07:33:28.2311580-07:00" endTime="2026-09-17T07:33:28.2334090-07:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="6819e000-1262-4909-a9f2-3e281d27ae21" />
+  </Results>
+  <TestDefinitions>
+    <UnitTest name="InferenceWeb.Tests.MuseGlimmerRegressionTests.PreTokenizer_Gpt4oFamily_SharesTheGpt4oPattern(pre: &quot;talkie&quot;)" storage="/users/zhongkaifu/work/tensorsharp/.claude/worktrees/biglane-glm-fixes/inferenceweb.tests/bin/debug/net10.0/inferenceweb.tests.dll" id="8278813c-7b0b-efce-2597-beaffdd969f8">
+      <Execution id="3d14ab34-d20f-45a4-b3eb-1d8aa6d0299c" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/.claude/worktrees/biglane-glm-fixes/InferenceWeb.Tests/bin/Debug/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.MuseGlimmerRegressionTests" name="PreTokenizer_Gpt4oFamily_SharesTheGpt4oPattern" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.BpeTokenizerTests.UsesSentencePieceTokenizer_DispatchesProductionTokenizerFamily(tokenizerModel: &quot;t5&quot;, expected: True)" storage="/users/zhongkaifu/work/tensorsharp/.claude/worktrees/biglane-glm-fixes/inferenceweb.tests/bin/debug/net10.0/inferenceweb.tests.dll" id="cb4282f7-d66d-09e3-594c-afbeb722b13c">
+      <Execution id="24e5e4bf-ee55-497d-bba8-e206fd64b1e4" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/.claude/worktrees/biglane-glm-fixes/InferenceWeb.Tests/bin/Debug/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.BpeTokenizerTests" name="UsesSentencePieceTokenizer_DispatchesProductionTokenizerFamily" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.GlmDsaTinyModelTests.Glm5Next_OutputParser_ThinkTrue_Unchanged" storage="/users/zhongkaifu/work/tensorsharp/.claude/worktrees/biglane-glm-fixes/inferenceweb.tests/bin/debug/net10.0/inferenceweb.tests.dll" id="b3e29ac1-ab83-6973-3d51-f4064ff02e2d">
+      <Execution id="5fa999b6-2b71-49a6-ba13-786d0eb3b849" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/.claude/worktrees/biglane-glm-fixes/InferenceWeb.Tests/bin/Debug/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.GlmDsaTinyModelTests" name="Glm5Next_OutputParser_ThinkTrue_Unchanged" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.BpeTokenizerTests.UsesSentencePieceTokenizer_DispatchesProductionTokenizerFamily(tokenizerModel: &quot;gpt2&quot;, expected: False)" storage="/users/zhongkaifu/work/tensorsharp/.claude/worktrees/biglane-glm-fixes/inferenceweb.tests/bin/debug/net10.0/inferenceweb.tests.dll" id="1953b47a-bc11-c99d-fa2b-a4c0efc7dd11">
+      <Execution id="5c07cb4c-4999-4e96-a430-edf5f62df464" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/.claude/worktrees/biglane-glm-fixes/InferenceWeb.Tests/bin/Debug/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.BpeTokenizerTests" name="UsesSentencePieceTokenizer_DispatchesProductionTokenizerFamily" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Glm4TokenizerParityTests.PreTokenizer_MatchesTheReferenceSplitOnEveryCase(pre: &quot;chatglm-bpe&quot;)" storage="/users/zhongkaifu/work/tensorsharp/.claude/worktrees/biglane-glm-fixes/inferenceweb.tests/bin/debug/net10.0/inferenceweb.tests.dll" id="f16ecbc8-1348-85f1-6ceb-d73b1baf45da">
+      <Execution id="5a43a878-d211-454f-b950-a02cb933755a" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/.claude/worktrees/biglane-glm-fixes/InferenceWeb.Tests/bin/Debug/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Glm4TokenizerParityTests" name="PreTokenizer_MatchesTheReferenceSplitOnEveryCase" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.GlmDsaTinyModelTests.GlmDsa_LoadsAndReportsArchitecture" storage="/users/zhongkaifu/work/tensorsharp/.claude/worktrees/biglane-glm-fixes/inferenceweb.tests/bin/debug/net10.0/inferenceweb.tests.dll" id="2b7016f4-3b95-ac48-3b8d-e50f3233ec17">
+      <Execution id="4923d914-6a95-4a3f-9c53-593d4edcaa69" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/.claude/worktrees/biglane-glm-fixes/InferenceWeb.Tests/bin/Debug/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.GlmDsaTinyModelTests" name="GlmDsa_LoadsAndReportsArchitecture" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.GlmDsaTinyModelTests.Glm5Next_OutputParser_ThinkFalse_JsonStringMarkersAreContent(json: &quot;{\&quot;text\&quot;:\&quot;&lt;/think&gt;&lt;tool_call&gt;literal&lt;/tool_call&gt;&quot;···)" storage="/users/zhongkaifu/work/tensorsharp/.claude/worktrees/biglane-glm-fixes/inferenceweb.tests/bin/debug/net10.0/inferenceweb.tests.dll" id="f4c51d38-9cdb-a378-ab94-452fc90d6183">
+      <Execution id="fd87dfe1-6160-4279-9a89-78a71c8ab8f8" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/.claude/worktrees/biglane-glm-fixes/InferenceWeb.Tests/bin/Debug/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.GlmDsaTinyModelTests" name="Glm5Next_OutputParser_ThinkFalse_JsonStringMarkersAreContent" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.MuseGlimmerRegressionTests.InjectMultimodalTokens_MuseGlimmer_UnderscoreSpellingAlsoWorks" storage="/users/zhongkaifu/work/tensorsharp/.claude/worktrees/biglane-glm-fixes/inferenceweb.tests/bin/debug/net10.0/inferenceweb.tests.dll" id="82dfef19-f141-476b-918b-b4f319c46274">
+      <Execution id="1223bb0d-931f-4ef8-bb0f-a9f0ad319bc2" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/.claude/worktrees/biglane-glm-fixes/InferenceWeb.Tests/bin/Debug/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.MuseGlimmerRegressionTests" name="InjectMultimodalTokens_MuseGlimmer_UnderscoreSpellingAlsoWorks" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.GlmDsaTinyModelTests.Glm5Next_FallbackRenderer_AlwaysOpensThinking_SoThinkFalseAnswersStayContent(enableThinking: False)" storage="/users/zhongkaifu/work/tensorsharp/.claude/worktrees/biglane-glm-fixes/inferenceweb.tests/bin/debug/net10.0/inferenceweb.tests.dll" id="32a98c3b-410c-9fb5-ec9b-d59b9cefec8f">
+      <Execution id="87a5bdc0-8dd4-42d5-a1f4-3a0bb34f0989" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/.claude/worktrees/biglane-glm-fixes/InferenceWeb.Tests/bin/Debug/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.GlmDsaTinyModelTests" name="Glm5Next_FallbackRenderer_AlwaysOpensThinking_SoThinkFalseAnswersStayContent" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.BpeTokenizerTests.Encode_Qwen35KeepsCombiningMarksWithLetters" storage="/users/zhongkaifu/work/tensorsharp/.claude/worktrees/biglane-glm-fixes/inferenceweb.tests/bin/debug/net10.0/inferenceweb.tests.dll" id="af76451f-11d0-e6bc-d841-3769323fd88a">
+      <Execution id="d0796583-f29b-45ca-a2c6-09884ba12661" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/.claude/worktrees/biglane-glm-fixes/InferenceWeb.Tests/bin/Debug/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.BpeTokenizerTests" name="Encode_Qwen35KeepsCombiningMarksWithLetters" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.BpeTokenizerTests.Encode_ParsesNormalTypedEogMarkerForDefaultBpeTokenizer" storage="/users/zhongkaifu/work/tensorsharp/.claude/worktrees/biglane-glm-fixes/inferenceweb.tests/bin/debug/net10.0/inferenceweb.tests.dll" id="d26b27c8-ab1e-f9e5-7e36-f959d71c5cc4">
+      <Execution id="86e19396-5c2c-4e69-898e-0090c2df225a" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/.claude/worktrees/biglane-glm-fixes/InferenceWeb.Tests/bin/Debug/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.BpeTokenizerTests" name="Encode_ParsesNormalTypedEogMarkerForDefaultBpeTokenizer" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.GlmDsaTinyModelTests.GlmDsa_OutputParser_SplitsThinkingContentAndToolCalls" storage="/users/zhongkaifu/work/tensorsharp/.claude/worktrees/biglane-glm-fixes/inferenceweb.tests/bin/debug/net10.0/inferenceweb.tests.dll" id="1a869902-0daf-22ce-5de3-53b7fd2de380">
+      <Execution id="17a6f7ab-833f-45a3-8fd5-758ff5129c14" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/.claude/worktrees/biglane-glm-fixes/InferenceWeb.Tests/bin/Debug/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.GlmDsaTinyModelTests" name="GlmDsa_OutputParser_SplitsThinkingContentAndToolCalls" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.GlmDsaTinyModelTests.GlmDsa_ChunkedPrefill_MatchesSingleShot(chunk: 3)" storage="/users/zhongkaifu/work/tensorsharp/.claude/worktrees/biglane-glm-fixes/inferenceweb.tests/bin/debug/net10.0/inferenceweb.tests.dll" id="f446c920-3bcb-07b1-026c-9aa8eba7bc9c">
+      <Execution id="82113066-59a5-4081-bbb9-9cfa8b845277" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/.claude/worktrees/biglane-glm-fixes/InferenceWeb.Tests/bin/Debug/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.GlmDsaTinyModelTests" name="GlmDsa_ChunkedPrefill_MatchesSingleShot" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.MuseGlimmerRegressionTests.InjectMultimodalTokens_MuseGlimmer_TextOnlyMessageIsUntouched" storage="/users/zhongkaifu/work/tensorsharp/.claude/worktrees/biglane-glm-fixes/inferenceweb.tests/bin/debug/net10.0/inferenceweb.tests.dll" id="1cadca4d-921f-b4cc-be77-884e41ab4b84">
+      <Execution id="d93df869-73aa-4b02-bf69-96c5b9b91db9" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/.claude/worktrees/biglane-glm-fixes/InferenceWeb.Tests/bin/Debug/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.MuseGlimmerRegressionTests" name="InjectMultimodalTokens_MuseGlimmer_TextOnlyMessageIsUntouched" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.MuseGlimmerRegressionTests.PreTokenizer_Glm4_KeepsDigitRunsOfUpToThree(pre: &quot;glm4&quot;)" storage="/users/zhongkaifu/work/tensorsharp/.claude/worktrees/biglane-glm-fixes/inferenceweb.tests/bin/debug/net10.0/inferenceweb.tests.dll" id="7af9a7d2-3594-47e8-4bf0-2eefa13e49e6">
+      <Execution id="22b20d66-e938-4488-bf7e-6206103530a2" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/.claude/worktrees/biglane-glm-fixes/InferenceWeb.Tests/bin/Debug/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.MuseGlimmerRegressionTests" name="PreTokenizer_Glm4_KeepsDigitRunsOfUpToThree" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.GlmDsaTinyModelTests.Glm5Next_OutputParser_ThinkFalse_StreamedJsonAnswerIsContentAndPartialCloseTagIsHeld" storage="/users/zhongkaifu/work/tensorsharp/.claude/worktrees/biglane-glm-fixes/inferenceweb.tests/bin/debug/net10.0/inferenceweb.tests.dll" id="fedd477a-bff1-3a81-e853-08cf41180cd8">
+      <Execution id="cea8ceef-0a58-41fc-b991-b75ccdb125e9" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/.claude/worktrees/biglane-glm-fixes/InferenceWeb.Tests/bin/Debug/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.GlmDsaTinyModelTests" name="Glm5Next_OutputParser_ThinkFalse_StreamedJsonAnswerIsContentAndPartialCloseTagIsHeld" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.GlmDsaTinyModelTests.GlmDsa_ChatTemplate_MatchesModelFormat" storage="/users/zhongkaifu/work/tensorsharp/.claude/worktrees/biglane-glm-fixes/inferenceweb.tests/bin/debug/net10.0/inferenceweb.tests.dll" id="fbeb0308-9ebe-d1b1-bde6-a43d78de3b66">
+      <Execution id="dff31388-491d-4e7f-9be2-f8159872cc8f" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/.claude/worktrees/biglane-glm-fixes/InferenceWeb.Tests/bin/Debug/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.GlmDsaTinyModelTests" name="GlmDsa_ChatTemplate_MatchesModelFormat" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.MuseGlimmerRegressionTests.ImageGeometry_IosPortrait_UsesBoundedReferenceGrid" storage="/users/zhongkaifu/work/tensorsharp/.claude/worktrees/biglane-glm-fixes/inferenceweb.tests/bin/debug/net10.0/inferenceweb.tests.dll" id="64048051-3bf8-a995-8c41-225ba0f78c8b">
+      <Execution id="63f1efa4-23f9-4dd1-a9de-ac6d40ccbea9" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/.claude/worktrees/biglane-glm-fixes/InferenceWeb.Tests/bin/Debug/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.MuseGlimmerRegressionTests" name="ImageGeometry_IosPortrait_UsesBoundedReferenceGrid" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.BpeTokenizerTests.Encode_Gemma4FallsBackToRawUtf8ByteTokens" storage="/users/zhongkaifu/work/tensorsharp/.claude/worktrees/biglane-glm-fixes/inferenceweb.tests/bin/debug/net10.0/inferenceweb.tests.dll" id="72ec60f7-59c0-0271-f283-5a858a950d73">
+      <Execution id="5098d6a2-1a7e-4829-a519-ee1ae20b4e02" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/.claude/worktrees/biglane-glm-fixes/InferenceWeb.Tests/bin/Debug/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.BpeTokenizerTests" name="Encode_Gemma4FallsBackToRawUtf8ByteTokens" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.BpeTokenizerTests.UsesSentencePieceTokenizer_DispatchesProductionTokenizerFamily(tokenizerModel: &quot;gemma4&quot;, expected: False)" storage="/users/zhongkaifu/work/tensorsharp/.claude/worktrees/biglane-glm-fixes/inferenceweb.tests/bin/debug/net10.0/inferenceweb.tests.dll" id="4662e0b1-6aa8-6659-6099-9e76face3a5d">
+      <Execution id="71612bc0-c177-4f17-8f66-bd2149f1f903" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/.claude/worktrees/biglane-glm-fixes/InferenceWeb.Tests/bin/Debug/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.BpeTokenizerTests" name="UsesSentencePieceTokenizer_DispatchesProductionTokenizerFamily" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.BpeTokenizerTests.Encode_Qwen35CombiningMarkRuleDoesNotChangeDefaultTokenizer" storage="/users/zhongkaifu/work/tensorsharp/.claude/worktrees/biglane-glm-fixes/inferenceweb.tests/bin/debug/net10.0/inferenceweb.tests.dll" id="08102d9d-24f3-ca98-c56f-3aa6335ea093">
+      <Execution id="9fa6dd07-55db-469d-b51d-d06220a0d916" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/.claude/worktrees/biglane-glm-fixes/InferenceWeb.Tests/bin/Debug/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.BpeTokenizerTests" name="Encode_Qwen35CombiningMarkRuleDoesNotChangeDefaultTokenizer" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.GlmDsaTinyModelTests.GlmDsa_LongerSparsePrompt_MatchesLlamaCpp" storage="/users/zhongkaifu/work/tensorsharp/.claude/worktrees/biglane-glm-fixes/inferenceweb.tests/bin/debug/net10.0/inferenceweb.tests.dll" id="307c9588-fb5b-30b8-8d68-0ec0461c041e">
+      <Execution id="2203f528-1c3c-4ce3-b526-f0fcf2a61e4a" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/.claude/worktrees/biglane-glm-fixes/InferenceWeb.Tests/bin/Debug/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.GlmDsaTinyModelTests" name="GlmDsa_LongerSparsePrompt_MatchesLlamaCpp" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.MuseGlimmerRegressionTests.PreTokenizer_Gpt4oFamily_KeepsMultiDigitRunsTogether(pre: &quot;gpt-4o&quot;)" storage="/users/zhongkaifu/work/tensorsharp/.claude/worktrees/biglane-glm-fixes/inferenceweb.tests/bin/debug/net10.0/inferenceweb.tests.dll" id="cf776f8a-7b7d-b6d8-6144-22d1a522e3f9">
+      <Execution id="5ef411bc-4d82-40e2-b557-bbcb9bbd1eda" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/.claude/worktrees/biglane-glm-fixes/InferenceWeb.Tests/bin/Debug/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.MuseGlimmerRegressionTests" name="PreTokenizer_Gpt4oFamily_KeepsMultiDigitRunsTogether" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.MuseGlimmerRegressionTests.PreTokenizer_DefaultPattern_StillSplitsEveryDigit" storage="/users/zhongkaifu/work/tensorsharp/.claude/worktrees/biglane-glm-fixes/inferenceweb.tests/bin/debug/net10.0/inferenceweb.tests.dll" id="444b62bc-66b3-3ab5-15a5-c006b73124a8">
+      <Execution id="10d2aef9-55ab-4569-bda4-0b01dc789d9e" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/.claude/worktrees/biglane-glm-fixes/InferenceWeb.Tests/bin/Debug/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.MuseGlimmerRegressionTests" name="PreTokenizer_DefaultPattern_StillSplitsEveryDigit" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.BpeTokenizerTests.ResolveEogTokenIds_AppliesLlamaHarmonyAndGemmaWorkarounds" storage="/users/zhongkaifu/work/tensorsharp/.claude/worktrees/biglane-glm-fixes/inferenceweb.tests/bin/debug/net10.0/inferenceweb.tests.dll" id="0e30f58f-0468-c89a-f230-3ae7cc232a82">
+      <Execution id="67c5ada2-acf8-4c0d-baa4-e4513057d1aa" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/.claude/worktrees/biglane-glm-fixes/InferenceWeb.Tests/bin/Debug/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.BpeTokenizerTests" name="ResolveEogTokenIds_AppliesLlamaHarmonyAndGemmaWorkarounds" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.BpeTokenizerTests.Encode_RequeuesChangedPairAtItsCurrentRank" storage="/users/zhongkaifu/work/tensorsharp/.claude/worktrees/biglane-glm-fixes/inferenceweb.tests/bin/debug/net10.0/inferenceweb.tests.dll" id="ba2f4566-d798-1d7f-8ed2-afd0bbc5a71d">
+      <Execution id="84025518-98bd-4d76-8e60-97092124bb8f" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/.claude/worktrees/biglane-glm-fixes/InferenceWeb.Tests/bin/Debug/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.BpeTokenizerTests" name="Encode_RequeuesChangedPairAtItsCurrentRank" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.GlmDsaTinyModelTests.GlmDsa_SharedIndexerLayers_Run" storage="/users/zhongkaifu/work/tensorsharp/.claude/worktrees/biglane-glm-fixes/inferenceweb.tests/bin/debug/net10.0/inferenceweb.tests.dll" id="5c170fc7-804f-b4c8-d9c7-b2f0e2564a12">
+      <Execution id="a887871f-2f35-4cca-b5fa-b09e1eb24802" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/.claude/worktrees/biglane-glm-fixes/InferenceWeb.Tests/bin/Debug/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.GlmDsaTinyModelTests" name="GlmDsa_SharedIndexerLayers_Run" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.GlmDsaTinyModelTests.GlmDsa_OutputParser_ThinkFalse_StillStartsInContent" storage="/users/zhongkaifu/work/tensorsharp/.claude/worktrees/biglane-glm-fixes/inferenceweb.tests/bin/debug/net10.0/inferenceweb.tests.dll" id="b295ab53-0552-02cd-0d1c-f4d3cb58fed2">
+      <Execution id="293b2ef9-c057-4578-9ec5-ad143046ee89" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/.claude/worktrees/biglane-glm-fixes/InferenceWeb.Tests/bin/Debug/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.GlmDsaTinyModelTests" name="GlmDsa_OutputParser_ThinkFalse_StillStartsInContent" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.GlmDsaTinyModelTests.Glm_OutputParser_StreamedCharByChar_ToolCallAfterReasoningIsParsed(arch: &quot;glm-dsa&quot;, enableThinking: True)" storage="/users/zhongkaifu/work/tensorsharp/.claude/worktrees/biglane-glm-fixes/inferenceweb.tests/bin/debug/net10.0/inferenceweb.tests.dll" id="4dc01418-b9d1-d6b0-951e-bd30d810b3a5">
+      <Execution id="5a6575ae-2ba0-46e2-8010-163e756d7964" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/.claude/worktrees/biglane-glm-fixes/InferenceWeb.Tests/bin/Debug/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.GlmDsaTinyModelTests" name="Glm_OutputParser_StreamedCharByChar_ToolCallAfterReasoningIsParsed" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.MuseGlimmerRegressionTests.PreTokenizer_Glm4_KeepsDigitRunsOfUpToThree(pre: &quot;chatglm-bpe&quot;)" storage="/users/zhongkaifu/work/tensorsharp/.claude/worktrees/biglane-glm-fixes/inferenceweb.tests/bin/debug/net10.0/inferenceweb.tests.dll" id="8dc52063-692d-19aa-f1e3-ca686bb5dfcb">
+      <Execution id="228275e4-e7da-473b-b0c2-1e8a63805751" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/.claude/worktrees/biglane-glm-fixes/InferenceWeb.Tests/bin/Debug/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.MuseGlimmerRegressionTests" name="PreTokenizer_Glm4_KeepsDigitRunsOfUpToThree" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Glm4TokenizerParityTests.PreTokenizer_MatchesTheReferenceSplitOnEveryCase(pre: &quot;glm4&quot;)" storage="/users/zhongkaifu/work/tensorsharp/.claude/worktrees/biglane-glm-fixes/inferenceweb.tests/bin/debug/net10.0/inferenceweb.tests.dll" id="23ab6493-9e84-01f4-9d71-928527990201">
+      <Execution id="27d07bd3-efa7-48b4-b052-86c935059b2b" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/.claude/worktrees/biglane-glm-fixes/InferenceWeb.Tests/bin/Debug/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Glm4TokenizerParityTests" name="PreTokenizer_MatchesTheReferenceSplitOnEveryCase" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.MuseGlimmerRegressionTests.InjectMultimodalTokens_EveryVisionArchEmitsAMarker(architecture: &quot;mistral3&quot;, expectedMarker: &quot;[IMG]&quot;)" storage="/users/zhongkaifu/work/tensorsharp/.claude/worktrees/biglane-glm-fixes/inferenceweb.tests/bin/debug/net10.0/inferenceweb.tests.dll" id="13f05968-e79c-cc22-dead-df6fe344ef37">
+      <Execution id="028aabeb-4f25-4889-97be-906601d9283c" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/.claude/worktrees/biglane-glm-fixes/InferenceWeb.Tests/bin/Debug/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.MuseGlimmerRegressionTests" name="InjectMultimodalTokens_EveryVisionArchEmitsAMarker" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.BpeTokenizerTests.UsesSentencePieceTokenizer_DispatchesProductionTokenizerFamily(tokenizerModel: &quot;llama&quot;, expected: True)" storage="/users/zhongkaifu/work/tensorsharp/.claude/worktrees/biglane-glm-fixes/inferenceweb.tests/bin/debug/net10.0/inferenceweb.tests.dll" id="d2b7591f-cb33-f9ee-6498-e817fc7701d5">
+      <Execution id="6ef62bab-90fb-4298-a741-80bb2990b4e2" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/.claude/worktrees/biglane-glm-fixes/InferenceWeb.Tests/bin/Debug/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.BpeTokenizerTests" name="UsesSentencePieceTokenizer_DispatchesProductionTokenizerFamily" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.MuseGlimmerRegressionTests.PreTokenizer_Gpt4oFamily_SharesTheGpt4oPattern(pre: &quot;llama4&quot;)" storage="/users/zhongkaifu/work/tensorsharp/.claude/worktrees/biglane-glm-fixes/inferenceweb.tests/bin/debug/net10.0/inferenceweb.tests.dll" id="5b4bdd36-ed1e-b59c-48d0-3cda846e7d50">
+      <Execution id="2873f6fe-f4c7-4001-afec-9a036a5ccc10" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/.claude/worktrees/biglane-glm-fixes/InferenceWeb.Tests/bin/Debug/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.MuseGlimmerRegressionTests" name="PreTokenizer_Gpt4oFamily_SharesTheGpt4oPattern" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.GlmDsaTinyModelTests.GlmDsa_ChunkedPrefill_MatchesSingleShot(chunk: 64)" storage="/users/zhongkaifu/work/tensorsharp/.claude/worktrees/biglane-glm-fixes/inferenceweb.tests/bin/debug/net10.0/inferenceweb.tests.dll" id="351d0e51-38ae-8395-fa8a-adc9bc2cf264">
+      <Execution id="1ff2d7fe-e709-4af8-924d-ca623bdc27f7" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/.claude/worktrees/biglane-glm-fixes/InferenceWeb.Tests/bin/Debug/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.GlmDsaTinyModelTests" name="GlmDsa_ChunkedPrefill_MatchesSingleShot" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.GlmDsaTinyModelTests.GlmDsa_ChunkedPrefill_MatchesSingleShot(chunk: 16)" storage="/users/zhongkaifu/work/tensorsharp/.claude/worktrees/biglane-glm-fixes/inferenceweb.tests/bin/debug/net10.0/inferenceweb.tests.dll" id="9021e26e-d258-ba6a-84da-3fc09a4d5878">
+      <Execution id="e49e3c1c-b15c-497b-80e6-93b22eb73261" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/.claude/worktrees/biglane-glm-fixes/InferenceWeb.Tests/bin/Debug/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.GlmDsaTinyModelTests" name="GlmDsa_ChunkedPrefill_MatchesSingleShot" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.GlmDsaTinyModelTests.Glm5Next_DeclaresAThinkingGrammarTrigger" storage="/users/zhongkaifu/work/tensorsharp/.claude/worktrees/biglane-glm-fixes/inferenceweb.tests/bin/debug/net10.0/inferenceweb.tests.dll" id="13d12492-71da-98be-0629-739284739629">
+      <Execution id="b5aaf4bc-1f46-43ef-ad44-90d208ee5fd1" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/.claude/worktrees/biglane-glm-fixes/InferenceWeb.Tests/bin/Debug/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.GlmDsaTinyModelTests" name="Glm5Next_DeclaresAThinkingGrammarTrigger" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.GlmDsaTinyModelTests.GlmDsa_Quantized_MatchesLlamaCpp" storage="/users/zhongkaifu/work/tensorsharp/.claude/worktrees/biglane-glm-fixes/inferenceweb.tests/bin/debug/net10.0/inferenceweb.tests.dll" id="4a8f8971-c91d-63a3-a4df-976c85bc0837">
+      <Execution id="195edbbd-589a-47f9-92b4-11e207254e85" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/.claude/worktrees/biglane-glm-fixes/InferenceWeb.Tests/bin/Debug/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.GlmDsaTinyModelTests" name="GlmDsa_Quantized_MatchesLlamaCpp" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.BpeTokenizerTests.Encode_Gemma4UsesRankedBpeOverRawUnicodeAndEscapedSpaces" storage="/users/zhongkaifu/work/tensorsharp/.claude/worktrees/biglane-glm-fixes/inferenceweb.tests/bin/debug/net10.0/inferenceweb.tests.dll" id="a08f7776-9409-2c97-f1ac-4d32da05addb">
+      <Execution id="a627fa27-e9f3-48f6-a61f-6c5ec6d3c2e9" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/.claude/worktrees/biglane-glm-fixes/InferenceWeb.Tests/bin/Debug/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.BpeTokenizerTests" name="Encode_Gemma4UsesRankedBpeOverRawUnicodeAndEscapedSpaces" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.BpeTokenizerTests.ResolveAddBosToken_ForcesGemma4BosWithoutTemplateMarker" storage="/users/zhongkaifu/work/tensorsharp/.claude/worktrees/biglane-glm-fixes/inferenceweb.tests/bin/debug/net10.0/inferenceweb.tests.dll" id="18ede5ac-0df9-0bfd-00cb-c0d3be2499cc">
+      <Execution id="3db4135a-2801-4b01-9b41-e16c0394dc0e" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/.claude/worktrees/biglane-glm-fixes/InferenceWeb.Tests/bin/Debug/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.BpeTokenizerTests" name="ResolveAddBosToken_ForcesGemma4BosWithoutTemplateMarker" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.GlmDsaTinyModelTests.Glm5Next_OutputParser_ThinkFalse_KeepsTheAlwaysOpenReasoningOutOfContent" storage="/users/zhongkaifu/work/tensorsharp/.claude/worktrees/biglane-glm-fixes/inferenceweb.tests/bin/debug/net10.0/inferenceweb.tests.dll" id="a4b11f13-32a1-6940-1a96-e2d613ef21cf">
+      <Execution id="9bc88d27-cb51-4543-9d0c-95f402e9079b" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/.claude/worktrees/biglane-glm-fixes/InferenceWeb.Tests/bin/Debug/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.GlmDsaTinyModelTests" name="Glm5Next_OutputParser_ThinkFalse_KeepsTheAlwaysOpenReasoningOutOfContent" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.GlmDsaTinyModelTests.Glm_OutputParser_StreamedCharByChar_ToolCallAfterReasoningIsParsed(arch: &quot;glm5next&quot;, enableThinking: False)" storage="/users/zhongkaifu/work/tensorsharp/.claude/worktrees/biglane-glm-fixes/inferenceweb.tests/bin/debug/net10.0/inferenceweb.tests.dll" id="8cf3a4a2-812f-30dd-30cf-d1153dc17525">
+      <Execution id="0dc0ac3d-2d0d-40a0-9ed3-31ef492885ff" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/.claude/worktrees/biglane-glm-fixes/InferenceWeb.Tests/bin/Debug/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.GlmDsaTinyModelTests" name="Glm_OutputParser_StreamedCharByChar_ToolCallAfterReasoningIsParsed" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.GlmDsaTinyModelTests.GlmDsa_ChunkedPrefill_MatchesSingleShot(chunk: 7)" storage="/users/zhongkaifu/work/tensorsharp/.claude/worktrees/biglane-glm-fixes/inferenceweb.tests/bin/debug/net10.0/inferenceweb.tests.dll" id="ad1a7f4d-c964-122f-6d8a-47e9b19e15b8">
+      <Execution id="0e338b25-210a-4682-b802-715d67bc2e4d" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/.claude/worktrees/biglane-glm-fixes/InferenceWeb.Tests/bin/Debug/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.GlmDsaTinyModelTests" name="GlmDsa_ChunkedPrefill_MatchesSingleShot" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.MuseGlimmerRegressionTests.InjectMultimodalTokens_MuseGlimmer_UsesVideoMarkerForFrames" storage="/users/zhongkaifu/work/tensorsharp/.claude/worktrees/biglane-glm-fixes/inferenceweb.tests/bin/debug/net10.0/inferenceweb.tests.dll" id="5718b775-663f-b776-a188-2b5ab67c8e20">
+      <Execution id="fe10b48b-5f60-48b7-b290-2bd71f9d4273" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/.claude/worktrees/biglane-glm-fixes/InferenceWeb.Tests/bin/Debug/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.MuseGlimmerRegressionTests" name="InjectMultimodalTokens_MuseGlimmer_UsesVideoMarkerForFrames" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.GlmDsaNativeBatchedDecodeLayerSplitTests.BatchedDecode_MatchesPerSequenceDecode_TwoGpus" storage="/users/zhongkaifu/work/tensorsharp/.claude/worktrees/biglane-glm-fixes/inferenceweb.tests/bin/debug/net10.0/inferenceweb.tests.dll" id="c06b5f4f-2745-88fe-47f7-e7e49fa67b0c">
+      <Execution id="624e5465-ddbe-42c2-a606-147ff45e9090" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/.claude/worktrees/biglane-glm-fixes/InferenceWeb.Tests/bin/Debug/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.GlmDsaNativeBatchedDecodeLayerSplitTests" name="BatchedDecode_MatchesPerSequenceDecode_TwoGpus" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.MuseGlimmerRegressionTests.PreTokenizer_Gpt4oFamily_KeepsMultiDigitRunsTogether(pre: &quot;llama4&quot;)" storage="/users/zhongkaifu/work/tensorsharp/.claude/worktrees/biglane-glm-fixes/inferenceweb.tests/bin/debug/net10.0/inferenceweb.tests.dll" id="dccb71f5-6a85-5d61-7971-baf41e8d72ae">
+      <Execution id="758b608d-740c-43fa-bb06-32f81a98a01a" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/.claude/worktrees/biglane-glm-fixes/InferenceWeb.Tests/bin/Debug/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.MuseGlimmerRegressionTests" name="PreTokenizer_Gpt4oFamily_KeepsMultiDigitRunsTogether" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.MuseGlimmerRegressionTests.PreTokenizer_Gpt4oFamily_SharesTheGpt4oPattern(pre: &quot;kanana2&quot;)" storage="/users/zhongkaifu/work/tensorsharp/.claude/worktrees/biglane-glm-fixes/inferenceweb.tests/bin/debug/net10.0/inferenceweb.tests.dll" id="558e7f20-6f0f-a64c-55cc-0c71bfad15c2">
+      <Execution id="49993561-84fb-4ae5-aea8-1ff16806f20b" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/.claude/worktrees/biglane-glm-fixes/InferenceWeb.Tests/bin/Debug/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.MuseGlimmerRegressionTests" name="PreTokenizer_Gpt4oFamily_SharesTheGpt4oPattern" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.GlmDsaTinyModelTests.GlmDsa_SparsePrompt_MatchesLlamaCpp" storage="/users/zhongkaifu/work/tensorsharp/.claude/worktrees/biglane-glm-fixes/inferenceweb.tests/bin/debug/net10.0/inferenceweb.tests.dll" id="4ddab774-7b71-70f1-d754-2f5a63a5a544">
+      <Execution id="35a95726-5820-4a13-9ff1-661442309e35" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/.claude/worktrees/biglane-glm-fixes/InferenceWeb.Tests/bin/Debug/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.GlmDsaTinyModelTests" name="GlmDsa_SparsePrompt_MatchesLlamaCpp" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.GlmDsaTinyModelTests.Glm5Next_OutputParser_ThinkFalse_UnclosedReplyIsTheAnswer" storage="/users/zhongkaifu/work/tensorsharp/.claude/worktrees/biglane-glm-fixes/inferenceweb.tests/bin/debug/net10.0/inferenceweb.tests.dll" id="91918684-7707-b56c-01da-8dc324a4d199">
+      <Execution id="a2e5a70a-bb89-4191-9986-7b0c9e3288a8" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/.claude/worktrees/biglane-glm-fixes/InferenceWeb.Tests/bin/Debug/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.GlmDsaTinyModelTests" name="Glm5Next_OutputParser_ThinkFalse_UnclosedReplyIsTheAnswer" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.GlmDsaNativeBatchedDecodeLayerSplitTests.BatchedDecode_MatchesPerSequenceDecode_ThreeGpus" storage="/users/zhongkaifu/work/tensorsharp/.claude/worktrees/biglane-glm-fixes/inferenceweb.tests/bin/debug/net10.0/inferenceweb.tests.dll" id="3f0d818b-b185-89cf-cd5d-23f661d6d542">
+      <Execution id="4c50cc55-9615-4afb-9cd3-87d8070a3b80" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/.claude/worktrees/biglane-glm-fixes/InferenceWeb.Tests/bin/Debug/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.GlmDsaNativeBatchedDecodeLayerSplitTests" name="BatchedDecode_MatchesPerSequenceDecode_ThreeGpus" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.BpeTokenizerTests.Encode_DiscardsStaleCandidateAfterNeighborMerge" storage="/users/zhongkaifu/work/tensorsharp/.claude/worktrees/biglane-glm-fixes/inferenceweb.tests/bin/debug/net10.0/inferenceweb.tests.dll" id="e8a300e0-241d-c6a8-c9e2-1e4306a6a063">
+      <Execution id="6819e000-1262-4909-a9f2-3e281d27ae21" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/.claude/worktrees/biglane-glm-fixes/InferenceWeb.Tests/bin/Debug/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.BpeTokenizerTests" name="Encode_DiscardsStaleCandidateAfterNeighborMerge" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.MuseGlimmerRegressionTests.InjectMultimodalTokens_MuseGlimmer_EmitsPatchMarkerPerImage" storage="/users/zhongkaifu/work/tensorsharp/.claude/worktrees/biglane-glm-fixes/inferenceweb.tests/bin/debug/net10.0/inferenceweb.tests.dll" id="1f74ef6f-daab-b0b0-8be6-4c83e6692798">
+      <Execution id="6edea0ca-71e5-429c-a524-62669137423b" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/.claude/worktrees/biglane-glm-fixes/InferenceWeb.Tests/bin/Debug/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.MuseGlimmerRegressionTests" name="InjectMultimodalTokens_MuseGlimmer_EmitsPatchMarkerPerImage" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.GlmDsaTinyModelTests.Glm5Next_OutputParser_ThinkFalse_JsonStringMarkersAreContent(json: &quot;{\&quot;text\&quot;:\&quot;escaped \\\&quot; quote &lt;/think&gt;\&quot;,\&quot;path\&quot;&quot;···)" storage="/users/zhongkaifu/work/tensorsharp/.claude/worktrees/biglane-glm-fixes/inferenceweb.tests/bin/debug/net10.0/inferenceweb.tests.dll" id="66e907ec-977c-c934-ebf5-933aa65c231f">
+      <Execution id="aa90316f-99ad-4e96-bd25-ac317d9f5c4f" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/.claude/worktrees/biglane-glm-fixes/InferenceWeb.Tests/bin/Debug/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.GlmDsaTinyModelTests" name="Glm5Next_OutputParser_ThinkFalse_JsonStringMarkersAreContent" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.BpeTokenizerTests.ResolveEogTokenIds_IncludesBothQwenControlEndings" storage="/users/zhongkaifu/work/tensorsharp/.claude/worktrees/biglane-glm-fixes/inferenceweb.tests/bin/debug/net10.0/inferenceweb.tests.dll" id="1069da5b-e56a-345e-abac-251eba0f971d">
+      <Execution id="454a56d2-5e95-42ad-b18c-45a99eab1722" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/.claude/worktrees/biglane-glm-fixes/InferenceWeb.Tests/bin/Debug/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.BpeTokenizerTests" name="ResolveEogTokenIds_IncludesBothQwenControlEndings" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.GlmDsaTinyModelTests.Glm5Next_OutputParser_ThinkFalse_JsonReasoningStillClosesOutsideStrings" storage="/users/zhongkaifu/work/tensorsharp/.claude/worktrees/biglane-glm-fixes/inferenceweb.tests/bin/debug/net10.0/inferenceweb.tests.dll" id="f396610e-2a87-93cd-7ad6-e0c431b405b3">
+      <Execution id="f9c44c84-bfa5-4e69-a5f5-ece24da6a0c5" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/.claude/worktrees/biglane-glm-fixes/InferenceWeb.Tests/bin/Debug/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.GlmDsaTinyModelTests" name="Glm5Next_OutputParser_ThinkFalse_JsonReasoningStillClosesOutsideStrings" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.BpeTokenizerTests.ResolveEogTokenIds_UsesOnlyDeclaredEndOfTurnId" storage="/users/zhongkaifu/work/tensorsharp/.claude/worktrees/biglane-glm-fixes/inferenceweb.tests/bin/debug/net10.0/inferenceweb.tests.dll" id="7f57bba1-0107-94c1-1897-4925932bf40b">
+      <Execution id="38378e9e-87dc-422d-9e16-e1babefa2b74" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/.claude/worktrees/biglane-glm-fixes/InferenceWeb.Tests/bin/Debug/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.BpeTokenizerTests" name="ResolveEogTokenIds_UsesOnlyDeclaredEndOfTurnId" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.BpeTokenizerTests.Encode_ParsesNormalTypedEogMarkerAsSpecialToken" storage="/users/zhongkaifu/work/tensorsharp/.claude/worktrees/biglane-glm-fixes/inferenceweb.tests/bin/debug/net10.0/inferenceweb.tests.dll" id="da08b014-c559-de4f-f189-e8e889935e33">
+      <Execution id="cebfabd2-5a0c-4c4e-a9f1-5886ea24e286" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/.claude/worktrees/biglane-glm-fixes/InferenceWeb.Tests/bin/Debug/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.BpeTokenizerTests" name="Encode_ParsesNormalTypedEogMarkerAsSpecialToken" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.BpeTokenizerTests.ResolveEogTokenIds_FoldsDeclaredEndOfMessageId" storage="/users/zhongkaifu/work/tensorsharp/.claude/worktrees/biglane-glm-fixes/inferenceweb.tests/bin/debug/net10.0/inferenceweb.tests.dll" id="2e826c11-aace-6239-d53e-8c629f654d9f">
+      <Execution id="0b6cc700-4d60-43f5-b224-b8b5eb28b5ed" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/.claude/worktrees/biglane-glm-fixes/InferenceWeb.Tests/bin/Debug/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.BpeTokenizerTests" name="ResolveEogTokenIds_FoldsDeclaredEndOfMessageId" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.GlmDsaNativeBatchedDecodeLayerSplitTests.BatchedDecode_MatchesPerSequenceDecode_OneGpu" storage="/users/zhongkaifu/work/tensorsharp/.claude/worktrees/biglane-glm-fixes/inferenceweb.tests/bin/debug/net10.0/inferenceweb.tests.dll" id="025efe8c-bfa8-a559-fa89-16175b48f2d3">
+      <Execution id="3d00c0ae-74d2-4c47-afc4-54e36554511a" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/.claude/worktrees/biglane-glm-fixes/InferenceWeb.Tests/bin/Debug/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.GlmDsaNativeBatchedDecodeLayerSplitTests" name="BatchedDecode_MatchesPerSequenceDecode_OneGpu" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.BpeTokenizerTests.Encode_Gemma4PreservesKnownNewlineRuns" storage="/users/zhongkaifu/work/tensorsharp/.claude/worktrees/biglane-glm-fixes/inferenceweb.tests/bin/debug/net10.0/inferenceweb.tests.dll" id="23a5fd91-feeb-f1db-b3d3-4eb428010ecc">
+      <Execution id="0b825157-772f-446b-b30f-5da701ad1616" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/.claude/worktrees/biglane-glm-fixes/InferenceWeb.Tests/bin/Debug/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.BpeTokenizerTests" name="Encode_Gemma4PreservesKnownNewlineRuns" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.MuseGlimmerRegressionTests.InjectMultimodalTokens_MuseGlimmer_EmitsOneMarkerPerImage" storage="/users/zhongkaifu/work/tensorsharp/.claude/worktrees/biglane-glm-fixes/inferenceweb.tests/bin/debug/net10.0/inferenceweb.tests.dll" id="7a4de2a2-5f06-f50c-2b2a-93d3a98f5ca2">
+      <Execution id="cb48c081-9063-4e45-8d90-2d52838ad052" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/.claude/worktrees/biglane-glm-fixes/InferenceWeb.Tests/bin/Debug/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.MuseGlimmerRegressionTests" name="InjectMultimodalTokens_MuseGlimmer_EmitsOneMarkerPerImage" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Glm4TokenizerParityTests.Encode_FromGlm5Gguf_MatchesTheReferenceIds" storage="/users/zhongkaifu/work/tensorsharp/.claude/worktrees/biglane-glm-fixes/inferenceweb.tests/bin/debug/net10.0/inferenceweb.tests.dll" id="e0b15e32-c148-420f-eced-4e4892e1a51a">
+      <Execution id="f013cc18-8fb0-4216-9a8d-a3add2a8aa28" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/.claude/worktrees/biglane-glm-fixes/InferenceWeb.Tests/bin/Debug/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Glm4TokenizerParityTests" name="Encode_FromGlm5Gguf_MatchesTheReferenceIds" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.MuseGlimmerRegressionTests.InjectMultimodalTokens_EveryVisionArchEmitsAMarker(architecture: &quot;gemma4&quot;, expectedMarker: &quot;&lt;|image&gt;&quot;)" storage="/users/zhongkaifu/work/tensorsharp/.claude/worktrees/biglane-glm-fixes/inferenceweb.tests/bin/debug/net10.0/inferenceweb.tests.dll" id="8eb895fc-f02d-72f9-53f9-68abd3e2c043">
+      <Execution id="b4b0782f-5581-4db3-b413-40fbcde1a06a" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/.claude/worktrees/biglane-glm-fixes/InferenceWeb.Tests/bin/Debug/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.MuseGlimmerRegressionTests" name="InjectMultimodalTokens_EveryVisionArchEmitsAMarker" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.MuseGlimmerRegressionTests.InjectMultimodalTokens_EveryVisionArchEmitsAMarker(architecture: &quot;qwen35&quot;, expectedMarker: &quot;&lt;|vision_start|&gt;&lt;|image_pad|&gt;&lt;|vision_end|&gt;&quot;)" storage="/users/zhongkaifu/work/tensorsharp/.claude/worktrees/biglane-glm-fixes/inferenceweb.tests/bin/debug/net10.0/inferenceweb.tests.dll" id="899ee396-d816-2a5c-a56e-3d0259d24191">
+      <Execution id="539a1708-eb3d-4693-8d2a-ac0ca74d6c7c" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/.claude/worktrees/biglane-glm-fixes/InferenceWeb.Tests/bin/Debug/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.MuseGlimmerRegressionTests" name="InjectMultimodalTokens_EveryVisionArchEmitsAMarker" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.MuseGlimmerRegressionTests.InjectMultimodalTokens_EveryVisionArchEmitsAMarker(architecture: &quot;muse-glimmer&quot;, expectedMarker: &quot;&lt;|patch|&gt;&quot;)" storage="/users/zhongkaifu/work/tensorsharp/.claude/worktrees/biglane-glm-fixes/inferenceweb.tests/bin/debug/net10.0/inferenceweb.tests.dll" id="0a3c1104-d989-b577-0fbc-a1f8a4487e29">
+      <Execution id="ba50a930-4b2f-4b68-9bcd-6ab02cc4f28c" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/.claude/worktrees/biglane-glm-fixes/InferenceWeb.Tests/bin/Debug/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.MuseGlimmerRegressionTests" name="InjectMultimodalTokens_EveryVisionArchEmitsAMarker" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.GlmDsaTinyModelTests.Glm5Next_FallbackRenderer_AlwaysOpensThinking_SoThinkFalseAnswersStayContent(enableThinking: True)" storage="/users/zhongkaifu/work/tensorsharp/.claude/worktrees/biglane-glm-fixes/inferenceweb.tests/bin/debug/net10.0/inferenceweb.tests.dll" id="2e858603-94cb-907a-53f8-4c0172fd6c7b">
+      <Execution id="525f1c93-3cae-42d0-aaae-054811b4c79a" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/.claude/worktrees/biglane-glm-fixes/InferenceWeb.Tests/bin/Debug/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.GlmDsaTinyModelTests" name="Glm5Next_FallbackRenderer_AlwaysOpensThinking_SoThinkFalseAnswersStayContent" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.GlmDsaTinyModelTests.Glm_OutputParser_StreamedCharByChar_ToolCallAfterReasoningIsParsed(arch: &quot;glm5next&quot;, enableThinking: True)" storage="/users/zhongkaifu/work/tensorsharp/.claude/worktrees/biglane-glm-fixes/inferenceweb.tests/bin/debug/net10.0/inferenceweb.tests.dll" id="7217cbae-b031-2506-0380-236ac073865d">
+      <Execution id="688492a3-2c3e-41b8-a946-fc7bbe4449a4" />
+      <TestMethod codeBase="/Users/zhongkaifu/work/TensorSharp/.claude/worktrees/biglane-glm-fixes/InferenceWeb.Tests/bin/Debug/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.GlmDsaTinyModelTests" name="Glm_OutputParser_StreamedCharByChar_ToolCallAfterReasoningIsParsed" />
+    </UnitTest>
+  </TestDefinitions>
+  <TestEntries>
+    <TestEntry testId="13d12492-71da-98be-0629-739284739629" executionId="b5aaf4bc-1f46-43ef-ad44-90d208ee5fd1" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="2e826c11-aace-6239-d53e-8c629f654d9f" executionId="0b6cc700-4d60-43f5-b224-b8b5eb28b5ed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="5c170fc7-804f-b4c8-d9c7-b2f0e2564a12" executionId="a887871f-2f35-4cca-b5fa-b09e1eb24802" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="da08b014-c559-de4f-f189-e8e889935e33" executionId="cebfabd2-5a0c-4c4e-a9f1-5886ea24e286" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="23ab6493-9e84-01f4-9d71-928527990201" executionId="27d07bd3-efa7-48b4-b052-86c935059b2b" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="899ee396-d816-2a5c-a56e-3d0259d24191" executionId="539a1708-eb3d-4693-8d2a-ac0ca74d6c7c" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="82dfef19-f141-476b-918b-b4f319c46274" executionId="1223bb0d-931f-4ef8-bb0f-a9f0ad319bc2" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="8eb895fc-f02d-72f9-53f9-68abd3e2c043" executionId="b4b0782f-5581-4db3-b413-40fbcde1a06a" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="ad1a7f4d-c964-122f-6d8a-47e9b19e15b8" executionId="0e338b25-210a-4682-b802-715d67bc2e4d" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="4dc01418-b9d1-d6b0-951e-bd30d810b3a5" executionId="5a6575ae-2ba0-46e2-8010-163e756d7964" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="72ec60f7-59c0-0271-f283-5a858a950d73" executionId="5098d6a2-1a7e-4829-a519-ee1ae20b4e02" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="9021e26e-d258-ba6a-84da-3fc09a4d5878" executionId="e49e3c1c-b15c-497b-80e6-93b22eb73261" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="025efe8c-bfa8-a559-fa89-16175b48f2d3" executionId="3d00c0ae-74d2-4c47-afc4-54e36554511a" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="0a3c1104-d989-b577-0fbc-a1f8a4487e29" executionId="ba50a930-4b2f-4b68-9bcd-6ab02cc4f28c" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="b3e29ac1-ab83-6973-3d51-f4064ff02e2d" executionId="5fa999b6-2b71-49a6-ba13-786d0eb3b849" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="558e7f20-6f0f-a64c-55cc-0c71bfad15c2" executionId="49993561-84fb-4ae5-aea8-1ff16806f20b" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="b295ab53-0552-02cd-0d1c-f4d3cb58fed2" executionId="293b2ef9-c057-4578-9ec5-ad143046ee89" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="1cadca4d-921f-b4cc-be77-884e41ab4b84" executionId="d93df869-73aa-4b02-bf69-96c5b9b91db9" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="1a869902-0daf-22ce-5de3-53b7fd2de380" executionId="17a6f7ab-833f-45a3-8fd5-758ff5129c14" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="2b7016f4-3b95-ac48-3b8d-e50f3233ec17" executionId="4923d914-6a95-4a3f-9c53-593d4edcaa69" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="444b62bc-66b3-3ab5-15a5-c006b73124a8" executionId="10d2aef9-55ab-4569-bda4-0b01dc789d9e" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="d2b7591f-cb33-f9ee-6498-e817fc7701d5" executionId="6ef62bab-90fb-4298-a741-80bb2990b4e2" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="d26b27c8-ab1e-f9e5-7e36-f959d71c5cc4" executionId="86e19396-5c2c-4e69-898e-0090c2df225a" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="fbeb0308-9ebe-d1b1-bde6-a43d78de3b66" executionId="dff31388-491d-4e7f-9be2-f8159872cc8f" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="0e30f58f-0468-c89a-f230-3ae7cc232a82" executionId="67c5ada2-acf8-4c0d-baa4-e4513057d1aa" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="7217cbae-b031-2506-0380-236ac073865d" executionId="688492a3-2c3e-41b8-a946-fc7bbe4449a4" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="32a98c3b-410c-9fb5-ec9b-d59b9cefec8f" executionId="87a5bdc0-8dd4-42d5-a1f4-3a0bb34f0989" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="4662e0b1-6aa8-6659-6099-9e76face3a5d" executionId="71612bc0-c177-4f17-8f66-bd2149f1f903" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="af76451f-11d0-e6bc-d841-3769323fd88a" executionId="d0796583-f29b-45ca-a2c6-09884ba12661" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="ba2f4566-d798-1d7f-8ed2-afd0bbc5a71d" executionId="84025518-98bd-4d76-8e60-97092124bb8f" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="4a8f8971-c91d-63a3-a4df-976c85bc0837" executionId="195edbbd-589a-47f9-92b4-11e207254e85" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="307c9588-fb5b-30b8-8d68-0ec0461c041e" executionId="2203f528-1c3c-4ce3-b526-f0fcf2a61e4a" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="18ede5ac-0df9-0bfd-00cb-c0d3be2499cc" executionId="3db4135a-2801-4b01-9b41-e16c0394dc0e" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="13f05968-e79c-cc22-dead-df6fe344ef37" executionId="028aabeb-4f25-4889-97be-906601d9283c" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="4ddab774-7b71-70f1-d754-2f5a63a5a544" executionId="35a95726-5820-4a13-9ff1-661442309e35" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="8cf3a4a2-812f-30dd-30cf-d1153dc17525" executionId="0dc0ac3d-2d0d-40a0-9ed3-31ef492885ff" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="2e858603-94cb-907a-53f8-4c0172fd6c7b" executionId="525f1c93-3cae-42d0-aaae-054811b4c79a" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="08102d9d-24f3-ca98-c56f-3aa6335ea093" executionId="9fa6dd07-55db-469d-b51d-d06220a0d916" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="3f0d818b-b185-89cf-cd5d-23f661d6d542" executionId="4c50cc55-9615-4afb-9cd3-87d8070a3b80" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="1f74ef6f-daab-b0b0-8be6-4c83e6692798" executionId="6edea0ca-71e5-429c-a524-62669137423b" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="a08f7776-9409-2c97-f1ac-4d32da05addb" executionId="a627fa27-e9f3-48f6-a61f-6c5ec6d3c2e9" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="66e907ec-977c-c934-ebf5-933aa65c231f" executionId="aa90316f-99ad-4e96-bd25-ac317d9f5c4f" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="fedd477a-bff1-3a81-e853-08cf41180cd8" executionId="cea8ceef-0a58-41fc-b991-b75ccdb125e9" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="5b4bdd36-ed1e-b59c-48d0-3cda846e7d50" executionId="2873f6fe-f4c7-4001-afec-9a036a5ccc10" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="351d0e51-38ae-8395-fa8a-adc9bc2cf264" executionId="1ff2d7fe-e709-4af8-924d-ca623bdc27f7" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="23a5fd91-feeb-f1db-b3d3-4eb428010ecc" executionId="0b825157-772f-446b-b30f-5da701ad1616" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="91918684-7707-b56c-01da-8dc324a4d199" executionId="a2e5a70a-bb89-4191-9986-7b0c9e3288a8" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="c06b5f4f-2745-88fe-47f7-e7e49fa67b0c" executionId="624e5465-ddbe-42c2-a606-147ff45e9090" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="8278813c-7b0b-efce-2597-beaffdd969f8" executionId="3d14ab34-d20f-45a4-b3eb-1d8aa6d0299c" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="1953b47a-bc11-c99d-fa2b-a4c0efc7dd11" executionId="5c07cb4c-4999-4e96-a430-edf5f62df464" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="7f57bba1-0107-94c1-1897-4925932bf40b" executionId="38378e9e-87dc-422d-9e16-e1babefa2b74" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="f396610e-2a87-93cd-7ad6-e0c431b405b3" executionId="f9c44c84-bfa5-4e69-a5f5-ece24da6a0c5" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="64048051-3bf8-a995-8c41-225ba0f78c8b" executionId="63f1efa4-23f9-4dd1-a9de-ac6d40ccbea9" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="dccb71f5-6a85-5d61-7971-baf41e8d72ae" executionId="758b608d-740c-43fa-bb06-32f81a98a01a" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="cb4282f7-d66d-09e3-594c-afbeb722b13c" executionId="24e5e4bf-ee55-497d-bba8-e206fd64b1e4" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="7af9a7d2-3594-47e8-4bf0-2eefa13e49e6" executionId="22b20d66-e938-4488-bf7e-6206103530a2" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="7a4de2a2-5f06-f50c-2b2a-93d3a98f5ca2" executionId="cb48c081-9063-4e45-8d90-2d52838ad052" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="e0b15e32-c148-420f-eced-4e4892e1a51a" executionId="f013cc18-8fb0-4216-9a8d-a3add2a8aa28" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="5718b775-663f-b776-a188-2b5ab67c8e20" executionId="fe10b48b-5f60-48b7-b290-2bd71f9d4273" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="f446c920-3bcb-07b1-026c-9aa8eba7bc9c" executionId="82113066-59a5-4081-bbb9-9cfa8b845277" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="f4c51d38-9cdb-a378-ab94-452fc90d6183" executionId="fd87dfe1-6160-4279-9a89-78a71c8ab8f8" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="a4b11f13-32a1-6940-1a96-e2d613ef21cf" executionId="9bc88d27-cb51-4543-9d0c-95f402e9079b" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="cf776f8a-7b7d-b6d8-6144-22d1a522e3f9" executionId="5ef411bc-4d82-40e2-b557-bbcb9bbd1eda" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="8dc52063-692d-19aa-f1e3-ca686bb5dfcb" executionId="228275e4-e7da-473b-b0c2-1e8a63805751" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="1069da5b-e56a-345e-abac-251eba0f971d" executionId="454a56d2-5e95-42ad-b18c-45a99eab1722" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="f16ecbc8-1348-85f1-6ceb-d73b1baf45da" executionId="5a43a878-d211-454f-b950-a02cb933755a" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="e8a300e0-241d-c6a8-c9e2-1e4306a6a063" executionId="6819e000-1262-4909-a9f2-3e281d27ae21" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+  </TestEntries>
+  <TestLists>
+    <TestList name="Results Not in a List" id="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestList name="All Loaded Results" id="19431567-8539-422a-85d7-44ee4e166bda" />
+  </TestLists>
+  <ResultSummary outcome="Completed">
+    <Counters total="67" executed="63" passed="63" failed="0" error="0" timeout="0" aborted="0" inconclusive="0" passedButRunAborted="0" notRunnable="0" notExecuted="0" disconnected="0" warning="0" completed="0" inProgress="0" pending="0" />
+    <Output>
+      <StdOut>[xUnit.net 00:00:00.00] xUnit.net VSTest Adapter v3.1.4+50e68bbb8b (64-bit .NET 10.0.10)
+[xUnit.net 00:00:00.07]   Discovering: InferenceWeb.Tests
+[xUnit.net 00:00:00.37]   Discovered:  InferenceWeb.Tests
+[xUnit.net 00:00:00.39]   Starting:    InferenceWeb.Tests
+[xUnit.net 00:00:00.43]       Requires TS_TEST_GLM_CUDA=1 for the native GLM CUDA fixture.
+[xUnit.net 00:00:00.43]       Requires TS_TEST_GLM_CUDA=1 for the native GLM CUDA fixture.
+[xUnit.net 00:00:00.43]       Requires TS_TEST_GLM_CUDA=1 for the native GLM CUDA fixture.
+[xUnit.net 00:00:00.43]       Requires model weights (TS_TEST_MODEL_DIR not set).
+Test 'InferenceWeb.Tests.GlmDsaNativeBatchedDecodeLayerSplitTests.BatchedDecode_MatchesPerSequenceDecode_OneGpu' was skipped in the test run.
+Test 'InferenceWeb.Tests.GlmDsaNativeBatchedDecodeLayerSplitTests.BatchedDecode_MatchesPerSequenceDecode_TwoGpus' was skipped in the test run.
+Test 'InferenceWeb.Tests.GlmDsaNativeBatchedDecodeLayerSplitTests.BatchedDecode_MatchesPerSequenceDecode_ThreeGpus' was skipped in the test run.
+Test 'InferenceWeb.Tests.Glm4TokenizerParityTests.Encode_FromGlm5Gguf_MatchesTheReferenceIds' was skipped in the test run.
+Backend: Cpu
+Model: glm-dsa, Layers=4 (+1 NextN/MTP block in the file), Hidden=64, Heads=4, MLA(q_lora=32, kv_lora=32, head_k=48, head_v=48, rope=16), Vocab=128
+  MoE: 8 experts, top-2, ffn=32, shared=1, scale=2.5, norm=True, gating=sigmoid, dense_lead=1
+  DSA indexer: 8 heads x 64, top-k=8, full layers=4/4
+RoPE base=10000, scale=1, eps=1E-06
+Context length: using GGUF metadata glm-dsa.context_length=4096.
+Loading model weights... done (117 F32 tensors, 0 quantized tensors)
+  NextN/MTP draft head ready (block 4, dense attention, ffn=moe, ownEmbd=no, ownHead=no)
+Backend: Cpu
+Model: glm-dsa, Layers=4 (+1 NextN/MTP block in the file), Hidden=64, Heads=4, MLA(q_lora=32, kv_lora=32, head_k=48, head_v=48, rope=16), Vocab=128
+  MoE: 8 experts, top-2, ffn=32, shared=1, scale=2.5, norm=True, gating=sigmoid, dense_lead=1
+  DSA indexer: 8 heads x 64, top-k=8, full layers=4/4
+RoPE base=10000, scale=1, eps=1E-06
+Context length: using GGUF metadata glm-dsa.context_length=4096.
+Loading model weights... done (117 F32 tensors, 0 quantized tensors)
+  NextN/MTP draft head ready (block 4, dense attention, ffn=moe, ownEmbd=no, ownHead=no)
+Backend: Cpu
+Model: glm-dsa, Layers=4 (+1 NextN/MTP block in the file), Hidden=64, Heads=4, MLA(q_lora=32, kv_lora=32, head_k=48, head_v=48, rope=16), Vocab=128
+  MoE: 8 experts, top-2, ffn=32, shared=1, scale=2.5, norm=True, gating=sigmoid, dense_lead=1
+  DSA indexer: 8 heads x 64, top-k=8, full layers=4/4
+RoPE base=10000, scale=1, eps=1E-06
+Context length: using GGUF metadata glm-dsa.context_length=4096.
+Loading model weights... done (117 F32 tensors, 0 quantized tensors)
+  NextN/MTP draft head ready (block 4, dense attention, ffn=moe, ownEmbd=no, ownHead=no)
+Backend: Cpu
+Model: glm-dsa, Layers=4 (+1 NextN/MTP block in the file), Hidden=64, Heads=4, MLA(q_lora=32, kv_lora=32, head_k=48, head_v=48, rope=16), Vocab=128
+  MoE: 8 experts, top-2, ffn=32, shared=1, scale=2.5, norm=True, gating=sigmoid, dense_lead=1
+  DSA indexer: 8 heads x 64, top-k=8, full layers=4/4
+RoPE base=10000, scale=1, eps=1E-06
+Context length: using GGUF metadata glm-dsa.context_length=4096.
+Loading model weights... done (117 F32 tensors, 0 quantized tensors)
+  NextN/MTP draft head ready (block 4, dense attention, ffn=moe, ownEmbd=no, ownHead=no)
+Backend: Cpu
+Model: glm-dsa, Layers=4 (+1 NextN/MTP block in the file), Hidden=64, Heads=4, MLA(q_lora=32, kv_lora=32, head_k=48, head_v=48, rope=16), Vocab=128
+  MoE: 8 experts, top-2, ffn=32, shared=1, scale=2.5, norm=True, gating=sigmoid, dense_lead=1
+  DSA indexer: 8 heads x 64, top-k=8, full layers=4/4
+RoPE base=10000, scale=1, eps=1E-06
+Context length: using GGUF metadata glm-dsa.context_length=4096.
+Loading model weights... done (117 F32 tensors, 0 quantized tensors)
+  NextN/MTP draft head ready (block 4, dense attention, ffn=moe, ownEmbd=no, ownHead=no)
+Backend: Cpu
+Model: glm-dsa, Layers=4 (+1 NextN/MTP block in the file), Hidden=64, Heads=4, MLA(q_lora=32, kv_lora=32, head_k=48, head_v=48, rope=16), Vocab=128
+  MoE: 8 experts, top-2, ffn=32, shared=1, scale=2.5, norm=True, gating=sigmoid, dense_lead=1
+  DSA indexer: 8 heads x 64, top-k=8, full layers=4/4
+RoPE base=10000, scale=1, eps=1E-06
+Context length: using GGUF metadata glm-dsa.context_length=4096.
+Loading model weights... done (117 F32 tensors, 0 quantized tensors)
+  NextN/MTP draft head ready (block 4, dense attention, ffn=moe, ownEmbd=no, ownHead=no)
+[ChatTemplate] Using hardcoded template for 'glm5next'
+[ChatTemplate] Using hardcoded template for 'glm5next'
+Backend: Cpu
+Model: glm-dsa, Layers=4 (+1 NextN/MTP block in the file), Hidden=64, Heads=4, MLA(q_lora=32, kv_lora=32, head_k=48, head_v=48, rope=16), Vocab=128
+  MoE: 8 experts, top-2, ffn=32, shared=1, scale=2.5, norm=True, gating=sigmoid, dense_lead=1
+  DSA indexer: 8 heads x 64, top-k=8, full layers=4/4
+RoPE base=10000, scale=1, eps=1E-06
+Context length: using GGUF metadata glm-dsa.context_length=4096.
+Loading model weights... done (117 F32 tensors, 0 quantized tensors)
+  NextN/MTP draft head ready (block 4, dense attention, ffn=moe, ownEmbd=no, ownHead=no)
+Backend: Cpu
+Model: glm-dsa, Layers=4 (+1 NextN/MTP block in the file), Hidden=64, Heads=4, MLA(q_lora=32, kv_lora=32, head_k=48, head_v=48, rope=16), Vocab=128
+  MoE: 8 experts, top-2, ffn=32, shared=1, scale=2.5, norm=True, gating=sigmoid, dense_lead=1
+  DSA indexer: 8 heads x 64, top-k=8, full layers=4/4
+RoPE base=10000, scale=1, eps=1E-06
+Context length: using GGUF metadata glm-dsa.context_length=4096.
+Loading model weights... done (48 F32 tensors, 153 quantized tensors)
+  Quantized: 0 MB (0 MB file-backed), F32: 0 MB
+  NextN/MTP draft head ready (block 4, dense attention, ffn=moe, ownEmbd=no, ownHead=no)
+Backend: Cpu
+Model: glm-dsa, Layers=4 (+1 NextN/MTP block in the file), Hidden=64, Heads=4, MLA(q_lora=32, kv_lora=32, head_k=48, head_v=48, rope=16), Vocab=128
+  MoE: 8 experts, top-2, ffn=32, shared=1, scale=2.5, norm=True, gating=sigmoid, dense_lead=1
+  DSA indexer: 8 heads x 64, top-k=8, full layers=2/4
+RoPE base=10000, scale=1, eps=1E-06
+Context length: using GGUF metadata glm-dsa.context_length=4096.
+Loading model weights... done (117 F32 tensors, 0 quantized tensors)
+  NextN/MTP draft head ready (block 4, dense attention, ffn=moe, ownEmbd=no, ownHead=no)
+[xUnit.net 00:00:00.89]   Finished:    InferenceWeb.Tests
+</StdOut>
+    </Output>
+    <RunInfos>
+      <RunInfo computerName="Zhongkais-MacBook-Pro" outcome="Warning" timestamp="2026-09-17T07:33:28.2473360-07:00">
+        <Text>[xUnit.net 00:00:00.43]     InferenceWeb.Tests.GlmDsaNativeBatchedDecodeLayerSplitTests.BatchedDecode_MatchesPerSequenceDecode_OneGpu [SKIP]</Text>
+      </RunInfo>
+      <RunInfo computerName="Zhongkais-MacBook-Pro" outcome="Warning" timestamp="2026-09-17T07:33:28.2474880-07:00">
+        <Text>[xUnit.net 00:00:00.43]     InferenceWeb.Tests.GlmDsaNativeBatchedDecodeLayerSplitTests.BatchedDecode_MatchesPerSequenceDecode_TwoGpus [SKIP]</Text>
+      </RunInfo>
+      <RunInfo computerName="Zhongkais-MacBook-Pro" outcome="Warning" timestamp="2026-09-17T07:33:28.2475000-07:00">
+        <Text>[xUnit.net 00:00:00.43]     InferenceWeb.Tests.GlmDsaNativeBatchedDecodeLayerSplitTests.BatchedDecode_MatchesPerSequenceDecode_ThreeGpus [SKIP]</Text>
+      </RunInfo>
+      <RunInfo computerName="Zhongkais-MacBook-Pro" outcome="Warning" timestamp="2026-09-17T07:33:28.2475100-07:00">
+        <Text>[xUnit.net 00:00:00.43]     InferenceWeb.Tests.Glm4TokenizerParityTests.Encode_FromGlm5Gguf_MatchesTheReferenceIds [SKIP]</Text>
+      </RunInfo>
+    </RunInfos>
+  </ResultSummary>
+</TestRun>
