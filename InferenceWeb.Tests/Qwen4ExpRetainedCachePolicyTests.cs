@@ -194,12 +194,12 @@ public sealed class Qwen4ExpRetainedCachePolicyTests
     }
 
     [Fact]
-    public void Capabilities_AreLegacyExactLengthAndCarryTheRetentionBudgetAsTheDeviceSubCap()
+    public void Capabilities_AreTreeExactLengthAndCarryTheRetentionBudgetAsTheDeviceSubCap()
     {
         using var fixture = new Fixture(budgetBytes: 4096L * 1024 * 1024, spareBytes: null);
         Set(typeof(ModelBase), fixture.Model, "<Config>k__BackingField", new ModelConfig { NumLayers = 2, NumKVHeads = 1, HiddenSize = 8, NumHeads = 1, Architecture = "qwen4exp" });
         PrefixCacheCapabilities caps = fixture.Model.GetPrefixCacheCapabilities();
-        Assert.Equal(PrefixCacheMode.Legacy, caps.Readiness);
+        Assert.Equal(PrefixCacheMode.Tree, caps.Readiness);
         Assert.Equal(FamilyClass.R, caps.Class);
         Assert.Equal(TruncationKind.None, caps.Truncation);
         Assert.False(caps.ReuseAcrossMediaSpan);

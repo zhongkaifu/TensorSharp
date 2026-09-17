@@ -18,6 +18,7 @@ using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
@@ -1100,9 +1101,17 @@ namespace TensorSharp.Server
         // The rendered token run of the last few distinct shared prefixes, so a turn
         // does not re-tokenize thousands of tokens of system prompt to find where its
         // own prompt stops sharing them. Keyed by everything the render depends on.
-        private readonly object _sharedPrefixLock = new();
-        private readonly Dictionary<string, List<int>> _sharedPrefixRenders = new(StringComparer.Ordinal);
-        private readonly Queue<string> _sharedPrefixOrder = new();
+        private sealed class SharedPrefixRenderCache
+        {
+            internal readonly object Gate = new();
+            internal readonly Dictionary<string, List<int>> Renders = new(StringComparer.Ordinal);
+            internal readonly Queue<string> Order = new();
+        }
+
+        // Token ids belong to one tokenizer. A reload may use the same architecture
+        // and system text with a different vocabulary or template; old tokenizers and
+        // their cached renders can be collected when their model is released.
+        private readonly ConditionalWeakTable<ITokenizer, SharedPrefixRenderCache> _sharedPrefixRenders = new();
 
         /// <summary>
         /// How many leading tokens of <paramref name="promptTokens"/> are the prefix
@@ -1136,32 +1145,36 @@ namespace TensorSharp.Server
                     if (ChatHistoryPreparer.HasMultimodalContent(history[i]))
                         return 0;
 
-                var keyBuilder = new StringBuilder();
-                keyBuilder.Append(arch).Append('|').Append(enableThinking ? 'T' : 'F').Append('|')
-                    .Append(reasoningEffort ?? string.Empty).Append('|');
-                for (int i = 0; i < leading; i++)
-                    keyBuilder.Append(history[i].Role).Append(':').Append(history[i].Content).Append('\u0001');
-                if (hasTools)
-                    foreach (var t in tools)
-                        keyBuilder.Append(t.Name).Append(':').Append(t.Description).Append(':')
-                            .Append(t.Parameters?.Count ?? 0).Append('\u0001');
-                string key = keyBuilder.ToString();
+                // A parameter's type, description, enum and required status all affect
+                // rendering even when the tool name and parameter count are unchanged.
+                // The original schema is also rendered by DeepSeek, but is JsonIgnore
+                // on ToolFunction, so include it explicitly.
+                var parameterSchemas = new string[tools?.Count ?? 0];
+                for (int i = 0; i < parameterSchemas.Length; i++)
+                    parameterSchemas[i] = tools[i].ParametersSchemaJson;
+                string key = JsonSerializer.Serialize(new
+                {
+                    arch, enableThinking, reasoningEffort, template = model.Config.ChatTemplate,
+                    messages = history.GetRange(0, leading), tools, parameterSchemas,
+                });
+                SharedPrefixRenderCache cache = _sharedPrefixRenders.GetValue(model.Tokenizer,
+                    static _ => new SharedPrefixRenderCache());
 
                 List<int> prefixTokens;
-                lock (_sharedPrefixLock)
-                    _sharedPrefixRenders.TryGetValue(key, out prefixTokens);
+                lock (cache.Gate)
+                    cache.Renders.TryGetValue(key, out prefixTokens);
                 if (prefixTokens == null)
                 {
                     prefixTokens = _kvCacheRenderer.RenderToTokens(
                         model.Tokenizer, model.Config.ChatTemplate, history.GetRange(0, leading), arch,
                         addGenerationPrompt: false, tools: tools, enableThinking: enableThinking, reasoningEffort: reasoningEffort);
-                    lock (_sharedPrefixLock)
+                    lock (cache.Gate)
                     {
-                        if (_sharedPrefixRenders.TryAdd(key, prefixTokens))
+                        if (cache.Renders.TryAdd(key, prefixTokens))
                         {
-                            _sharedPrefixOrder.Enqueue(key);
-                            while (_sharedPrefixOrder.Count > 8)
-                                _sharedPrefixRenders.Remove(_sharedPrefixOrder.Dequeue());
+                            cache.Order.Enqueue(key);
+                            while (cache.Order.Count > 8)
+                                cache.Renders.Remove(cache.Order.Dequeue());
                         }
                     }
                 }

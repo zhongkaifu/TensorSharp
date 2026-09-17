@@ -27,6 +27,7 @@ using Microsoft.Extensions.Logging.Abstractions;
 using TensorSharp;
 using TensorSharp.Runtime;
 using TensorSharp.Runtime.Scheduling;
+using TensorSharp.Runtime.Scheduling.PrefixCache;
 using Xunit;
 using Xunit.Abstractions;
 
@@ -87,16 +88,21 @@ public class PrefixCheckpointExactnessTests
                 " steps, naming the physical process behind every step and where on Earth it mostly happens.", addSpecial: false));
             _output.WriteLine($"[{ggufContains}] prefix {prefix.Count} tokens, A {promptA.Count}, B {promptB.Count}, backend {backend}");
 
-            // 1. Chat A, cold. Its prefill stops at the prefix boundary, the state
-            //    is checkpointed there, and the chat carries on.
+            // 1. Startup warms only the shared system prefix and asks for one
+            //    discarded token. A fresh conversation must reuse the WHOLE
+            //    prefix, including its final token and non-page-aligned tail.
             List<int> coldB;
             List<int> clonedB;
             int reusedByB;
             using (var engine = new InferenceEngine(model, Config(), NullLogger.Instance))
             {
+                Assert.Equal(PrefixCacheMode.Tree, engine.PrefixCacheMode);
+                var warmup = await GenerateAsync(engine, prefix, prefix.Count, "startup-warmup", maxTokens: 1);
+                Assert.Equal(0, warmup.completion.PrefixCacheReusedTokens);
+                Assert.Single(warmup.output);
                 var a = await GenerateAsync(engine, promptA, prefix.Count, "chat-a");
-                Assert.Equal(0, a.completion.PrefixCacheReusedTokens);
-                _output.WriteLine($"[A] {Decode(model, a.output)}");
+                Assert.Equal(prefix.Count, a.completion.PrefixCacheReusedTokens);
+                _output.WriteLine($"[A after startup warmup] reused {a.completion.PrefixCacheReusedTokens}: {Decode(model, a.output)}");
                 Assert.True(promptA.Count - prefix.Count > 16, "chat A's message must exceed the rewind allowance");
                 Assert.True(promptB.Count - prefix.Count > 16, "chat B's message must exceed the rewind allowance");
 
@@ -129,8 +135,9 @@ public class PrefixCheckpointExactnessTests
             var store = new BytesCheckpointStore();
             using (var engine = new InferenceEngine(model, Config(), NullLogger.Instance) { PrefixCheckpointStore = store })
             {
-                var a = await GenerateAsync(engine, promptA, prefix.Count, "chat-a-save");
-                Assert.Equal(0, a.completion.PrefixCacheReusedTokens);
+                var warmup = await GenerateAsync(engine, prefix, prefix.Count, "startup-save", maxTokens: 1);
+                Assert.Equal(0, warmup.completion.PrefixCacheReusedTokens);
+                Assert.Single(warmup.output);
             }
             Assert.Equal(1, store.Saves);
             _output.WriteLine($"[store] {store.Bytes / 1048576.0:F1} MB saved");
@@ -211,9 +218,10 @@ public class PrefixCheckpointExactnessTests
     };
 
     private static async Task<(InferenceCompletion completion, List<int> output)> GenerateAsync(
-        InferenceEngine engine, List<int> prompt, int sharedPrefix, string id)
+        InferenceEngine engine, List<int> prompt, int sharedPrefix, string id, int maxTokens = NewTokens)
     {
-        var seq = new SequenceState(id, prompt, NewTokens, 256, SamplingConfig.Greedy, sharedPrefixTokens: sharedPrefix);
+        var seq = new SequenceState(id, prompt, maxTokens, 256, SamplingConfig.Greedy,
+            sharedPrefixTokens: sharedPrefix, cacheScope: id);
         var handle = engine.SubmitRequest(seq);
         var output = new List<int>();
         await foreach (int t in handle.Tokens.ReadAllAsync())

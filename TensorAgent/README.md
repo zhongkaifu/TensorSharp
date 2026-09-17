@@ -752,6 +752,13 @@ tokens of context at a 1.7 GB footprint where it used to die.
 
 ### The first message of a launch
 
+TensorAgent uses the radix KV prefix cache by default, through the same engine as
+TensorSharp.Server and TensorSharp.Cli. Prefix lookup respects the model's cache
+capabilities, conversation scope, and media boundaries. The phone's existing
+retention limits still apply, and memory warnings release idle cache payloads.
+`TS_PREFIX_CACHE_MODE=legacy` selects the compatibility path for diagnosis;
+`TS_SCHED_PREFIX_CACHE=0` disables runtime prefix reuse.
+
 Every chat starts from a copy of the model's state at the end of the prompt they all
 share, but in a fresh process that state has to be made first: the warm-up after a
 load prefills it, and on the phone that is 36-48 s for Qwen3.5 9B and 152 s for

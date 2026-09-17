@@ -5,9 +5,8 @@
 //
 // TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
 //
-// Mistral3's side of the radix prefix cache contract (DESIGN §6.2.3, class P).
-// No holders: pages and the primary cache. Reuse across an image span stays off
-// until its M5 PR carries an image-turn exactness test. Readiness=Legacy.
+// Mistral3's radix prefix cache: pages and the resident primary cache.
+// Reuse across image spans remains disabled pending image-turn exactness coverage.
 using System;
 using System.Collections.Generic;
 using TensorSharp.Runtime.Scheduling.PrefixCache;

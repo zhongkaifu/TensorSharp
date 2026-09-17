@@ -88,19 +88,6 @@ namespace TensorSharp.Server
         public bool DraftHeadRefusedByModel => _lifecycle.DraftHeadRefusedByModel;
 
         /// <summary>
-        /// Legacy compatibility shim. The engine owns KV state, so no server
-        /// session is ever active in the model.
-        /// </summary>
-        public ChatSession ActiveSession => null;
-
-        /// <summary>
-        /// Legacy compatibility shim. Server-side session KV bookkeeping was
-        /// removed; callers receive an isolated empty cache that is never used
-        /// by inference.
-        /// </summary>
-        public KVCache KVCache => new();
-
-        /// <summary>
         /// Snapshot of the intrinsic compatibility session's tracked history.
         /// Session-aware requests use the explicit <see cref="ChatSession"/>
         /// instance passed to the generation methods.
@@ -208,17 +195,6 @@ namespace TensorSharp.Server
         {
             UnloadModel();
             return TensorSharp.GGML.GgmlBasicOps.RecreateBackend();
-        }
-
-        /// <summary>
-        /// Legacy compatibility shim for older callers. There is no
-        /// service-owned KV cache to invalidate; this clears only the intrinsic
-        /// tracked history used by non-session-aware overloads.
-        /// </summary>
-        public void InvalidateKVCache()
-        {
-            lock (_intrinsicSession.HistoryLock)
-                _intrinsicSession.Transcripts.Clear();
         }
 
         /// <summary>

@@ -61,6 +61,10 @@ public interface IPrefixCacheModel
     /// refuses instead) and reports any eviction it still performs through the sink.</summary>
     void AttachPrefixCache(IPrefixPayloadSink sink);
 
+    /// <summary>Detach an engine after all its payloads have been released. Models
+    /// resume their standalone retention policy when reused by a different host.</summary>
+    void DetachPrefixCache() { }
+
     // ---- end states ----
 
     /// <summary>Deep copy of the request's ACTIVE cache (bound holder or primary) at its

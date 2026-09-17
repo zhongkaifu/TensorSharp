@@ -155,13 +155,6 @@ namespace TensorSharp.Runtime.Scheduling
             return raw != "0" && !string.Equals(raw, "false", StringComparison.OrdinalIgnoreCase);
         }
 
-        // Strict opt-in: only "1" or "true" enables; everything else stays off.
-        private static bool ReadStrictOptIn(string name)
-        {
-            string raw = Environment.GetEnvironmentVariable(name);
-            return raw == "1" || string.Equals(raw, "true", StringComparison.OrdinalIgnoreCase);
-        }
-
         private static int ReadNonNegativeInt(string name, int fallback)
         {
             string raw = Environment.GetEnvironmentVariable(name);

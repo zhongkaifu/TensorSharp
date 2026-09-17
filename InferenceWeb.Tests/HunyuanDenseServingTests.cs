@@ -235,7 +235,8 @@ public class HunyuanDenseServingTests : IDisposable
 
             async Task<(int[] Tokens, int Reused)> Serve(string id)
             {
-                var handle = engine.SubmitRequest(new SequenceState(id, prompt, 8, cfg.BlockSize, SamplingConfig.Greedy));
+                var handle = engine.SubmitRequest(new SequenceState(id, prompt, 8, cfg.BlockSize, SamplingConfig.Greedy,
+                    cacheScope: "repeat-prompt-conversation"));
                 var tokens = new List<int>();
                 await foreach (int t in handle.Tokens.ReadAllAsync())
                     tokens.Add(t);

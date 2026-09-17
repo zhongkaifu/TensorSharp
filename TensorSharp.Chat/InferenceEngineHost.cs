@@ -150,9 +150,9 @@ namespace TensorSharp.Server
                     _engine.UpdateSpeculation(pending);
                 var poolStats = _engine.PoolStats;
                 _logger.LogInformation(
-                    "InferenceEngine constructed for fingerprint {Fingerprint} (blocks={NumBlocks}, blockSize={BlockSize}, kvCapacityTokens={KvCapacity}, maxBatched={MaxBatched}, config={ConfigSource})",
+                    "InferenceEngine constructed for fingerprint {Fingerprint} (blocks={NumBlocks}, blockSize={BlockSize}, kvCapacityTokens={KvCapacity}, maxBatched={MaxBatched}, prefixCache={PrefixCacheMode}, config={ConfigSource})",
                     fp, poolStats.totalBlocks, poolStats.blockSize,
-                    (long)poolStats.totalBlocks * poolStats.blockSize, cfg.MaxNumBatchedTokens, cfgSource);
+                    (long)poolStats.totalBlocks * poolStats.blockSize, cfg.MaxNumBatchedTokens, _engine.PrefixCacheMode, cfgSource);
                 return _engine;
             }
         }

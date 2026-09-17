@@ -253,7 +253,8 @@ namespace TensorSharp.Cli
                     "Gemma 4). Default: off.",
                     "--think"),
                 new OptionHelp("--max-tokens <N>",
-                    "Maximum number of tokens to generate. Range: >= 1. Default: 100.",
+                    "Maximum number of tokens to generate. Range: >= 0; zero prefills without output in " +
+                    "non-interactive generation. Interactive chat requires a positive limit. Default: 100.",
                     "--max-tokens 1024"),
                 new OptionHelp("--output <file>",
                     "Write the generated text to a file instead of stdout (for Qwen-Image-Edit: the output image, " +
@@ -466,8 +467,9 @@ namespace TensorSharp.Cli
                     "overrides).",
                     "--kv-cache-dtype q8_0"),
                 new OptionHelp("--paged-kv | --no-paged-kv",
-                    "Enable/disable the cross-session paged KV cache (prefix reuse across requests; aliases " +
-                    "--paged-kv-cache / --no-paged-kv-cache). Default: off.",
+                    "Configure the standalone paged KV store used by --paged-bench (aliases " +
+                    "--paged-kv-cache / --no-paged-kv-cache). Default: off. Normal generation uses the " +
+                    "shared inference engine's Radix KV cache by default, independently of this flag.",
                     "--paged-kv"),
                 new OptionHelp("--paged-kv-block-size <N>",
                     "Tokens per paged-KV block. Range: >= 1. Default: 256.",
@@ -488,11 +490,11 @@ namespace TensorSharp.Cli
             ("Scheduling", new[]
             {
                 new OptionHelp("--no-prefix-cache",
-                    "Do not forward the shared part of the prompt before the first message. By default an " +
-                    "interactive chat forwards its system block, tool declarations and skill catalog at startup, so " +
-                    "the first message continues from them instead of prefilling them (measured 18.5s -> 0.3s on an " +
-                    "agent configuration); the price is that the session takes that long to become ready. Unrelated " +
-                    "to --warmup-runs, which times whole inferences to warm the compute kernels.",
+                    "Disable Radix prefix caching and interactive system/tool prompt warm-up. Prefix caching " +
+                    "is on by default for single-shot, interactive, JSONL and skill/tool generation; the cache " +
+                    "stays in memory across /new and independent JSONL requests while the engine is loaded. " +
+                    "Only the shared system/tool prefix crosses conversation scopes; restarting the CLI starts cold. " +
+                    "TS_SCHED_PREFIX_CACHE=0 also disables reuse.",
                     "--no-prefix-cache"),
                 new OptionHelp("--continuous-batching | --no-continuous-batching",
                     "Paged-attention continuous batching across concurrent requests (aliases --paged-batching / " +
@@ -538,14 +540,14 @@ namespace TensorSharp.Cli
                     "Decode steps compared by --test-chunked-prefill. Range: >= 1. Default: 8.",
                     "--correct-decode 16"),
                 new OptionHelp("--bench-kvcache",
-                    "Benchmark multi-turn chat with KV-cache reuse vs full re-prefill; reports per-turn prefill " +
-                    "latency. Tune with --bench-kv-turns. Default: off.",
+                    "Benchmark multi-turn chat with the default Radix KV cache vs full re-prefill; reports " +
+                    "latency to the first token, including scheduling and sampling. Tune with --bench-kv-turns. Default: off.",
                     "--bench-kvcache --bench-kv-turns 6"),
                 new OptionHelp("--bench-kv-turns <N>",
                     "Number of simulated chat turns for --bench-kvcache. Range: >= 1. Default: 4.",
                     "--bench-kv-turns 8"),
                 new OptionHelp("--paged-bench",
-                    "Benchmark the cross-session paged KV cache: pay the full prefill once, then measure how much " +
+                    "Benchmark the standalone paged KV store, separately from default Radix generation: pay the full prefill once, then measure how much " +
                     "a second identical-prefix request recovers. Tune with --paged-bench-prompt / " +
                     "--paged-bench-trials. Default: off.",
                     "--paged-bench"),
@@ -557,7 +559,8 @@ namespace TensorSharp.Cli
                     "--paged-bench-trials 5"),
                 new OptionHelp("--warmup-runs <N>",
                     "Run the full inference path N times silently before the real pass so JIT/pipeline compilation " +
-                    "and allocator growth don't skew timings. Range: >= 0. Default: 0.",
+                    "and allocator growth don't skew timings. Retains the shared system/tool prefix for the real pass " +
+                    "when prefix caching is enabled. Range: >= 0. Default: 0.",
                     "--warmup-runs 1"),
                 new OptionHelp("--test-templates <dir>",
                     "Run chat-template rendering tests against every GGUF in the directory and exit (no inference).",

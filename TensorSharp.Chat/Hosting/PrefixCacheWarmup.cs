@@ -22,18 +22,17 @@ namespace TensorSharp.Server.Hosting
     /// Forward the prompt every conversation shares, once, before anyone asks.
     ///
     /// <para>
-    /// The engine checkpoints its state where the shared prompt ends and starts every
-    /// later chat from a copy, so a conversation costs 0.65 s instead of 21.8 s. What it
-    /// cannot do is make the FIRST crossing free: somebody has to forward those 6,459
-    /// tokens, and on a fresh process that somebody is the user's first message. This
-    /// runs it instead, so the checkpoint exists — and, with a store attached, is written
-    /// to disk — before the first request arrives.
+    /// On models that support shared checkpoints, the engine retains state at the
+    /// shared prompt boundary so later conversations can start from a copy. A host can
+    /// run this request before serving users, and an attached checkpoint store can
+    /// persist the payload when the model supports export. Completing the request does
+    /// not itself prove that a reusable payload was retained.
     /// </para>
     /// <para>
     /// There is no prefill-only entry point anywhere in this codebase, and adding one
     /// would be a second way to build a prompt that could drift from the real one. So the
-    /// warm-up is an ORDINARY CHAT REQUEST that asks for a single token: the same service,
-    /// the same renderer, the same skills plan, and therefore provably the same prefix.
+    /// warm-up is an ordinary chat request that asks for a single token, using the same
+    /// service, renderer and default skills plan as a real request.
     /// </para>
     /// </summary>
     public static class PrefixCacheWarmup
@@ -59,9 +58,8 @@ namespace TensorSharp.Server.Hosting
         /// save a real turn only the part before the tools.
         /// </param>
         /// <param name="think">
-        /// Must match what real requests send. Measured on Qwen 3.8: thinking off shares
-        /// 6,459 tokens and thinking on shares 6,497 — two different prefixes, two
-        /// different checkpoints, and warming one does nothing at all for the other.
+        /// Must match what real requests send to maximize reuse. Some templates render
+        /// different system prefixes for thinking on and off.
         /// </param>
         /// <remarks>
         /// Every field of the body is load-bearing, and three of them are traps:
@@ -75,10 +73,9 @@ namespace TensorSharp.Server.Hosting
         /// <item><c>newChat</c> is FALSE. True would reset the session and release its
         /// workspace — deleting a conversation's files to warm a cache.</item>
         /// </list>
-        /// The message is "hi" because it must be short: a live-cache continuation
-        /// tolerates a rewind of only a handful of tokens, and the first real message has
-        /// to be able to rewind past the warm-up's turn framing and continue rather than
-        /// re-prefill.
+        /// The message is "hi" to keep warm-up work small. Only the declared shared
+        /// system prefix is public; the warm-up's user message and reply stay scoped to
+        /// its own session.
         /// </remarks>
         public static JsonElement BuildRequest(string sessionId, bool think, int maxTokens = 1)
         {
@@ -132,19 +129,30 @@ namespace TensorSharp.Server.Hosting
             {
                 JsonElement body = BuildRequest(sessionId, think);
                 string failure = null;
+                bool completed = false;
                 await foreach (object frame in frames(body, cancellationToken).ConfigureAwait(false))
+                {
                     failure ??= ErrorIn(frame);
+                    if (frame?.GetType().GetProperty("done")?.GetValue(frame) is true)
+                    {
+                        completed = true;
+                        if (frame.GetType().GetProperty("aborted")?.GetValue(frame) is true)
+                            failure ??= "warm-up request was aborted";
+                    }
+                }
 
                 clock.Stop();
                 if (cancellationToken.IsCancellationRequested)
                     return new Result(false, "cancelled", clock.Elapsed);
+                if (!completed)
+                    failure ??= "warm-up stream ended without completing the request";
                 if (!string.IsNullOrEmpty(failure))
                 {
                     logger?.LogWarning(LogEventIds.HostConfiguration,
                         "Prefix cache warm-up failed: {Error}", failure);
                     return new Result(false, failure, clock.Elapsed);
                 }
-                return new Result(true, "the prompt every chat starts with is in the cache", clock.Elapsed);
+                return new Result(true, "shared-prompt warm-up request completed", clock.Elapsed);
             }
             catch (OperationCanceledException)
             {

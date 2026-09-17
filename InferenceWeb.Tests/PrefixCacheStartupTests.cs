@@ -116,6 +116,27 @@ public class PrefixCacheStartupTests
         Assert.True(result.Warmed, result.Detail);
     }
 
+    [Fact]
+    public async Task AnEmptyOrUnfinishedStreamDoesNotReportWarmupCompleted()
+    {
+        foreach (object[] frames in new[] { Array.Empty<object>(), new object[] { new { token = "partial" } } })
+        {
+            PrefixCacheWarmup.Result result = await PrefixCacheWarmup.RunAsync(
+                (_, _) => Frames(frames), "s", think: false, logger: null);
+            Assert.False(result.Warmed);
+            Assert.Contains("without completing", result.Detail);
+        }
+    }
+
+    [Fact]
+    public async Task AnAbortedTerminalFrameDoesNotReportWarmupCompleted()
+    {
+        PrefixCacheWarmup.Result result = await PrefixCacheWarmup.RunAsync(
+            (_, _) => Frames(new { done = true, aborted = true }), "s", think: false, logger: null);
+        Assert.False(result.Warmed);
+        Assert.Contains("aborted", result.Detail);
+    }
+
     /// <summary>
     /// Several refusals throw before a single frame is yielded - no model loaded, an
     /// unknown session, a rejected backend. A startup latency optimisation must not be

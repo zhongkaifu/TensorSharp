@@ -70,9 +70,10 @@ namespace TensorSharp.Runtime.Scheduling
                 ? new List<PromptMediaSpan>(mediaSpans)
                 : Array.Empty<PromptMediaSpan>();
             CacheScope = string.IsNullOrEmpty(cacheScope) ? null : cacheScope;
-            // At least one prompt token has to follow the prefix, or there is nothing
-            // to forward from a clone of it.
-            SharedPrefixTokens = Math.Clamp(sharedPrefixTokens, 0, Math.Max(0, promptTokens.Count - 1));
+            // A startup warm-up may consist entirely of the public prefix. Its
+            // checkpoint serves a later, longer chat prompt. Admission separately
+            // leaves one token to forward when matching the current request.
+            SharedPrefixTokens = Math.Clamp(sharedPrefixTokens, 0, promptTokens.Count);
         }
 
         /// <summary>
@@ -153,9 +154,10 @@ namespace TensorSharp.Runtime.Scheduling
         /// a stateless API request), or null for a caller that does not scope its
         /// requests. State another scope produced - a retained holder, the live cache,
         /// pooled blocks past the public prefix - is reused only up to
-        /// <see cref="SharedPrefixTokens"/>, and never moved away from its owner. Null
-        /// matches every scope, which is how engine-level callers that run one
-        /// conversation at a time (benchmarks, the CLI) keep today's behaviour.
+        /// <see cref="SharedPrefixTokens"/>, and never moved away from its owner.
+        /// Radix gives a null scope a fresh identity for each request; callers that
+        /// want continuation reuse pass a stable conversation scope. The explicit
+        /// legacy mode retains its historical unscoped matching behavior.
         /// </summary>
         public string CacheScope { get; }
 

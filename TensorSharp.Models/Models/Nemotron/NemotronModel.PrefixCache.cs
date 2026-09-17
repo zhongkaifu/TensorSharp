@@ -5,10 +5,8 @@
 //
 // TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
 //
-// Nemotron-H's side of the radix prefix cache contract (DESIGN §6.4.3, class R).
-// A1 pages whose Mamba state is restorable only at a page that ended a forward
-// (KvBlock.IsRestorablePrefixEnd), the primary cache, no truncation, no end
-// states. Readiness=Legacy.
+// Nemotron-H's radix prefix cache: host pages with Mamba state at restorable
+// forward boundaries and the resident primary cache. No rewinds or end states.
 using System;
 using System.Collections.Generic;
 using TensorSharp.Runtime.Scheduling.PrefixCache;

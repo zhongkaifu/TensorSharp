@@ -12,6 +12,7 @@ using System.Threading;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using TensorSharp.Runtime.Paged;
+using TensorSharp.Runtime.Scheduling.PrefixCache;
 
 using TensorSharp.Runtime.Speculative;
 
@@ -343,6 +344,18 @@ namespace TensorSharp.Runtime.Scheduling
 
         public IModelArchitecture Model => _model;
         public SequenceState CurrentOwner => _currentOwner;
+        internal PrefixCacheCoordinator RadixCache { get; private set; }
+        public bool RadixPrefixCacheEnabled => RadixCache != null;
+
+        internal void InitializeRadixCache(SchedulerConfig configuration)
+        {
+            if (!configuration.EnablePrefixCaching || configuration.PrefixCacheMode != PrefixCacheMode.Tree
+                || _model is not IPrefixCacheModel prefixModel) return;
+            PrefixCacheCapabilities capabilities = prefixModel.GetPrefixCacheCapabilities();
+            if (capabilities.Readiness != PrefixCacheMode.Tree) return;
+            RadixCache = new PrefixCacheCoordinator(_model, _pool, _scheduler, capabilities, _logger);
+            _scheduler.AttachRadixCacheContinuation(RadixCache, ComputeFusedContinuationLcp, TryAdoptFusedContinuation);
+        }
 
         /// <summary>Execute one scheduler step. Path selection is centralised
         /// in <see cref="ExecutionPlanner"/>: the executor snapshots the
@@ -370,6 +383,13 @@ namespace TensorSharp.Runtime.Scheduling
             // ggml_metal_synchronize aborts the process.
             lock (_model.GpuComputeLock)
             {
+                if (RadixCache != null)
+                {
+                    RadixCache.Drain();
+                    RadixCache.InvalidatePrimary();
+                    foreach (var work in output.ScheduledWork)
+                        _fusedSeqById[work.Sequence.RequestId] = work.Sequence;
+                }
                 // The scheduler freed the previous owner's blocks during
                 // FinishSequence / PreemptSequence, but our _currentOwner
                 // reference outlives that. Without this reset, the next
@@ -2783,7 +2803,7 @@ namespace TensorSharp.Runtime.Scheduling
 
         /// <summary>Whether shared-prefix checkpoints are in use for this model, so the
         /// scheduler ends prefill chunks at the boundary the chat layer marked.</summary>
-        public bool PrefixCheckpointsSupported => ModelSupportsPrefixCheckpoints();
+        public bool PrefixCheckpointsSupported => RadixCache != null ? RadixCache.CheckpointsSupported : ModelSupportsPrefixCheckpoints();
 
         /// <summary>
         /// After a prefill step: if this sequence has just reached the end of its shared
@@ -2794,6 +2814,11 @@ namespace TensorSharp.Runtime.Scheduling
         /// </summary>
         private void MaybeCheckpointSharedPrefix(SequenceState seq)
         {
+            if (RadixCache != null)
+            {
+                RadixCache.CaptureCheckpoint(seq);
+                return;
+            }
             if (seq == null || seq.PrefixCheckpointTaken || seq.SharedPrefixTokens <= 0)
                 return;
             if (seq.NumComputedTokens != seq.SharedPrefixTokens)
@@ -2894,6 +2919,13 @@ namespace TensorSharp.Runtime.Scheduling
             _lastFusedAdoptionSource = null;
             _lastFusedBlockedByScopeTokens = 0;
             if (seq == null) return 0;
+            if (RadixCache != null)
+            {
+                int reused = RadixCache.ComputeReusablePrefix(seq);
+                _lastFusedBlockedByScopeTokens = RadixCache.LastBlockedByScope;
+                _lastFusedDeclineReason = reused > 0 ? null : "no resumable radix prefix";
+                return reused;
+            }
             if (!ModelUsesRetainableFusedCache())
             {
                 _lastFusedDeclineReason =
@@ -2929,8 +2961,12 @@ namespace TensorSharp.Runtime.Scheduling
         /// </summary>
         public IPrefixCheckpointStore PrefixCheckpointStore
         {
-            get => Volatile.Read(ref _checkpointStore);
-            set => Volatile.Write(ref _checkpointStore, value);
+            get => RadixCache != null ? RadixCache.CheckpointStore : Volatile.Read(ref _checkpointStore);
+            set
+            {
+                if (RadixCache != null) RadixCache.CheckpointStore = value;
+                else Volatile.Write(ref _checkpointStore, value);
+            }
         }
 
         private IPrefixCheckpointStore _checkpointStore;
@@ -3098,6 +3134,15 @@ namespace TensorSharp.Runtime.Scheduling
         /// the scheduler at admission.</summary>
         public bool TryAdoptFusedContinuation(SequenceState seq, int lcp)
         {
+            if (RadixCache != null)
+            {
+                // Reserve rewind metadata before materialization transfers ownership.
+                _pendingRetainedFusedTruncations.EnsureCapacity(_pendingRetainedFusedTruncations.Count + 1);
+                bool adopted = RadixCache.TryAdopt(seq, lcp,
+                    (sequence, tokens) => _pendingRetainedFusedTruncations[sequence.RequestId] = tokens);
+                _lastFusedAdoptionSource = RadixCache.LastSource;
+                return adopted;
+            }
             if (seq == null || lcp <= 0) return false;
             if (seq.BlockTable.NumBlocks != 0) return false;
             if (_model is not IBatchedPagedModel fused) return false;
@@ -3347,6 +3392,7 @@ namespace TensorSharp.Runtime.Scheduling
             _pendingRetainedFusedTruncations.Remove(requestId);
             _fusedSeqById.Remove(requestId);
             DisposeFusedSpecContext(requestId);
+            RadixCache?.ReleaseRequest(requestId);
         }
 
         /// <summary>Remove stale retained metadata (and its model holder) before a
@@ -3397,8 +3443,33 @@ namespace TensorSharp.Runtime.Scheduling
             DisposeFusedSpecContext(requestId);
             _pendingRetainedFusedTruncations.Remove(requestId);
             if (!_fusedSeqById.TryGetValue(requestId, out var seq))
+            {
+                RadixCache?.ReleaseRequest(requestId);
                 return false;
+            }
             _fusedSeqById.Remove(requestId);
+
+            if (RadixCache != null)
+            {
+                try
+                {
+                    bool cleanFinish = seq.Status is SequenceStatus.FinishedStopped or SequenceStatus.FinishedLengthCapped
+                        || (seq.Status == SequenceStatus.FinishedAborted && seq.Error == null
+                            && seq.NumComputedTokens >= seq.NumTotalTokens);
+                    bool primary = _liveCacheValid && ReferenceEquals(_liveCacheSeq, seq)
+                        && !(_model is IBatchedPagedModel holder && holder.HasFusedSequenceCache(requestId));
+                    bool retained = cleanFinish && RadixCache.RetainFinished(seq, primary);
+                    if (retained && primary)
+                    {
+                        _liveCacheValid = false;
+                        _currentOwner = null;
+                        _ownerTokensInModel = 0;
+                        _ownerForwardedTokens = 0;
+                    }
+                    return retained;
+                }
+                finally { RadixCache.ReleaseRequest(seq); }
+            }
 
             if (!ModelUsesRetainableFusedCache()) return false;
             if (_model is not IBatchedPagedModel fused) return false;
@@ -3495,6 +3566,7 @@ namespace TensorSharp.Runtime.Scheduling
         /// </summary>
         private void DonateFinishedLiveCacheToRetained(IBatchedPagedModel fused)
         {
+            if (RadixCache != null) return;
             SequenceState live = _liveCacheSeq;
             if (!_liveCacheValid || live == null || _currentOwner != null)
                 return;
@@ -3784,6 +3856,7 @@ namespace TensorSharp.Runtime.Scheduling
         /// </summary>
         public string TrimIdleMemory()
         {
+            if (RadixCache != null) return RadixCache.TrimIdleMemory();
             int evicted = 0;
             if (_model is IBatchedPagedModel fused)
             {
@@ -3863,6 +3936,12 @@ namespace TensorSharp.Runtime.Scheduling
                 if (startToken >= tokensInModel) break;
                 int tokensInBlock = Math.Min(_blockSize, tokensInModel - startToken);
                 var block = seq.BlockTable.Blocks[b];
+
+                // Cached radix pages are immutable. An ownership swap only needs
+                // to refresh the request's private tail, never shared full slabs.
+                if (tokensInBlock == _blockSize && block.HoldsSnapshotBytes
+                    && RadixCache != null && RadixCache.Tree.TryGetBlockOwner(block, out _))
+                    continue;
 
                 // A recurrent full block was captured at the exact Forward
                 // boundary where it first became available. Re-extracting it on
@@ -4117,6 +4196,8 @@ namespace TensorSharp.Runtime.Scheduling
         /// <summary>Reset internal state. Called by the engine on model reload.</summary>
         public void Reset()
         {
+            SetSpeculation(Speculation);
+            RadixCache?.Reset();
             _currentOwner = null;
             _ownerTokensInModel = 0;
             _ownerForwardedTokens = 0;

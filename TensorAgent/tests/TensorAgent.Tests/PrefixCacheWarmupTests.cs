@@ -103,6 +103,26 @@ public sealed class PrefixCacheWarmupTests : IDisposable
         Assert.Equal(1, body.GetProperty("maxTokens").GetInt32());
         Assert.False(body.GetProperty("think").GetBoolean());
         Assert.Single(body.GetProperty("messages").EnumerateArray());
+        Assert.False(body.GetProperty("newChat").GetBoolean());
+        Assert.False(body.TryGetProperty("skills", out _));
+        Assert.False(body.TryGetProperty("tools", out _));
+    }
+
+    [Fact]
+    public void DisabledRuntimeCacheDoesNotStartWarmup()
+    {
+        AgentAppHost host = Start();
+        host.ModelService.EngineHost.SchedulerConfigOverride = new TensorSharp.Runtime.Scheduling.SchedulerConfig
+        {
+            EnablePrefixCaching = false,
+        };
+        var stream = new RecordingStream();
+        host.WarmUpFrames = stream.Frames;
+        host.WarmThePrefixCache();
+
+        Assert.Equal(0, host.PrefixCacheWarmupsStarted);
+        Assert.Equal(0, stream.Calls);
+        Assert.False(host.PrefixCacheIsWarm);
     }
 
     [Fact]

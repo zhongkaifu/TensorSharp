@@ -5,24 +5,9 @@
 //
 // TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
 //
-// Gemma 4's side of the radix prefix cache contract (DESIGN §6.3.1, class S).
-//
-// Inert by default. The capability record says Readiness=Legacy, so an engine
-// never calls a state member here, and nothing below changes a code path the
-// engine runs today:
-//   * the holder pool is used only after AttachPrefixCache (Tree mode);
-//   * RetainSequenceCache is RetainSequenceCacheAs(id, id), the same move;
-//   * DiscardRetainedCaches, SettleForCopy and the measurements are new members.
-//
-// What the tree gets once a family PR raises the readiness (M5a):
-//   * end states that are copied (capture, clone) or moved (donate) at zero copy;
-//   * rewinds only while the ring has not wrapped (cached <= W), the exact guard
-//     of CanTruncateKVCache, capped at 16 tokens until the per-backend exactness
-//     tests lift it;
-//   * a pool of released holders, so releasing a request no longer drops every
-//     running request's captured batched decode graphs (DEC-24);
-//   * a settle that flushes a donated, device-authoritative holder before it is
-//     cloned (G-12).
+// Gemma 4's radix prefix cache: complete holders copied or donated with
+// rewinds limited by the unwrapped sliding window. Released holders reuse the
+// pool, and device-authoritative state is settled before copying.
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -49,7 +34,7 @@ namespace TensorSharp.Models
             return new PrefixCacheCapabilities
             {
                 Class = FamilyClass.S,
-                Readiness = PrefixCacheMode.Legacy,
+                Readiness = PrefixCacheMode.Tree,
                 NamespaceFingerprint = KVStateFingerprint,
                 EndState = holders ? EndStateSupport.CopyAndDonate : EndStateSupport.None,
                 CanCaptureCopy = holders && SupportsPrefixCheckpoints,
@@ -71,6 +56,8 @@ namespace TensorSharp.Models
 
         public void AttachPrefixCache(IPrefixPayloadSink sink)
             => _prefixCacheSink = sink ?? throw new ArgumentNullException(nameof(sink));
+
+        public void DetachPrefixCache() => _prefixCacheSink = null;
 
         public long QuerySpareBytes(ResourceClass cls) => QueryPrefixCacheSpareBytes(cls);
 
@@ -280,7 +267,7 @@ namespace TensorSharp.Models
         }
 
         /// <summary>Free the parked holders (prefix-cache mode keeps some), then the base trim. In the
-        /// default Legacy mode the pool is always empty and this is the base trim.</summary>
+        /// unattached mode the pool is empty and this is the base trim.</summary>
         public override void TrimIdleMemory()
         {
             int parked = _holderPool?.Count ?? 0;

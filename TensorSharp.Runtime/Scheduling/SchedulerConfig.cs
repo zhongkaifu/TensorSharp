@@ -5,6 +5,7 @@
 //
 // TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
 using TensorSharp.Runtime.Speculative;
+using TensorSharp.Runtime.Scheduling.PrefixCache;
 
 namespace TensorSharp.Runtime.Scheduling
 {
@@ -63,6 +64,11 @@ namespace TensorSharp.Runtime.Scheduling
         /// when the free queue is empty. Default true.</summary>
         public bool EnablePrefixCaching { get; init; } = true;
 
+        /// <summary>Radix owns prefix reuse by default. Legacy remains available for
+        /// compatibility diagnostics through <c>TS_PREFIX_CACHE_MODE=legacy</c>.
+        /// <see cref="EnablePrefixCaching"/> disables reuse in either mode.</summary>
+        public PrefixCacheMode PrefixCacheMode { get; init; } = PrefixCacheMode.Tree;
+
         /// <summary>
         /// End a sequence whose output has locked into a loop (see
         /// <see cref="RepetitionGuard"/>) with the finish reason <c>repetition</c>,
@@ -104,6 +110,7 @@ namespace TensorSharp.Runtime.Scheduling
             NumBlocks = NumBlocks,
             BlockSize = BlockSize,
             EnablePrefixCaching = EnablePrefixCaching,
+            PrefixCacheMode = PrefixCacheMode,
             StopRepetition = StopRepetition,
             DecodeQuantumTokens = DecodeQuantumTokens,
             Speculation = speculation ?? SpeculationOptions.Disabled,
@@ -120,6 +127,7 @@ namespace TensorSharp.Runtime.Scheduling
                 NumBlocks = ReadInt("TS_SCHED_NUM_BLOCKS", 256),
                 BlockSize = ReadInt("TS_SCHED_BLOCK_SIZE", 256),
                 EnablePrefixCaching = ReadBool("TS_SCHED_PREFIX_CACHE", true),
+                PrefixCacheMode = ReadPrefixCacheMode(),
                 StopRepetition = ReadBool("TS_SCHED_STOP_REPETITION", true),
                 DecodeQuantumTokens = ReadInt("TS_SCHED_DECODE_QUANTUM", 256),
                 Speculation = SpeculationOptions.FromEnvironment(),
@@ -135,17 +143,14 @@ namespace TensorSharp.Runtime.Scheduling
             return fallback;
         }
 
-        private static float ReadFloat(string name, float fallback)
+        private static PrefixCacheMode ReadPrefixCacheMode()
         {
-            string raw = System.Environment.GetEnvironmentVariable(name);
-            if (!string.IsNullOrEmpty(raw)
-                && float.TryParse(raw, System.Globalization.NumberStyles.Float,
-                    System.Globalization.CultureInfo.InvariantCulture, out float v)
-                && v > 0f)
-            {
-                return v;
-            }
-            return fallback;
+            string raw = System.Environment.GetEnvironmentVariable("TS_PREFIX_CACHE_MODE");
+            if (string.IsNullOrWhiteSpace(raw) || string.Equals(raw.Trim(), "tree", System.StringComparison.OrdinalIgnoreCase))
+                return PrefixCacheMode.Tree;
+            if (string.Equals(raw.Trim(), "legacy", System.StringComparison.OrdinalIgnoreCase))
+                return PrefixCacheMode.Legacy;
+            throw new System.ArgumentException("TS_PREFIX_CACHE_MODE must be 'tree' or 'legacy'.");
         }
 
         // Boolean flag reader that accepts "0"/"1" (and "true"/"false"). Unlike

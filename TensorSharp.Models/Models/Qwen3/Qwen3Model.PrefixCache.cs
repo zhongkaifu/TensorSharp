@@ -5,10 +5,8 @@
 //
 // TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
 //
-// Qwen3 / Bonsai's side of the radix prefix cache contract (DESIGN §6.2.1, class P).
-// M2 parity: pages (A1 host slabs, A2 on the batched paged route) and the primary
-// cache; no end states until M7a gives class P holder end states. Readiness=Legacy,
-// so no engine calls a state member.
+// Qwen3 / Bonsai's radix prefix cache: pages (host slabs or model-paged storage)
+// and the resident primary cache. End-state holders are not exposed.
 using System;
 using System.Collections.Generic;
 using TensorSharp.Runtime.Scheduling.PrefixCache;

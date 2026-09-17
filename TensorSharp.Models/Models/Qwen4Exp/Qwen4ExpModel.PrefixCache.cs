@@ -1,17 +1,9 @@
 // Copyright (c) Zhongkai Fu. All rights reserved.
 // Licensed under the BSD-3-Clause license in the repository root.
 //
-// Qwen 3.8 Flash Next's (qwen4exp) side of the radix prefix cache contract
-// (DESIGN §6.4.2, class R).
-//
-// Inert by default. The capability record says Readiness=Legacy, so an engine
-// never calls a state member here, and nothing below changes a code path the
-// engine runs today:
-//   * RetainSequenceCache is RetainSequenceCacheAs(id, id);
-//   * the refuse-and-report mode (EnsureRetentionBudget refuses instead of
-//     evicting, TrimIdleMemory reports what it frees, a checkpoint may be
-//     donated) is active only after AttachPrefixCache;
-//   * DiscardRetainedCaches, SettleForCopy and the measurements are new members.
+// Qwen4Exp's radix prefix cache: complete holders copied or donated at exact
+// lengths. The tree owns retention and eviction after AttachPrefixCache; model
+// budgets may refuse new payloads and report unavoidable reclamation.
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -36,7 +28,7 @@ namespace TensorSharp.Models
             return new PrefixCacheCapabilities
             {
                 Class = FamilyClass.R,
-                Readiness = PrefixCacheMode.Legacy,
+                Readiness = PrefixCacheMode.Tree,
                 NamespaceFingerprint = KVStateFingerprint,
                 EndState = holders ? EndStateSupport.CopyAndDonate : EndStateSupport.None,
                 CanCaptureCopy = holders && SupportsPrefixCheckpoints,
@@ -57,6 +49,8 @@ namespace TensorSharp.Models
         /// <see cref="TrimIdleMemory"/> reports every holder it frees through <paramref name="sink"/>.</summary>
         public void AttachPrefixCache(IPrefixPayloadSink sink)
             => _prefixCacheSink = sink ?? throw new ArgumentNullException(nameof(sink));
+
+        public void DetachPrefixCache() => _prefixCacheSink = null;
 
         public long QuerySpareBytes(ResourceClass cls) => QueryPrefixCacheSpareBytes(cls);
 

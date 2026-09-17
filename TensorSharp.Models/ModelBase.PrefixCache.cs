@@ -66,18 +66,21 @@ namespace TensorSharp.Models
         /// HunyuanDense; DESIGN §6.2-§6.4.3): its pages as the model serves them today — A1 host slabs where
         /// it restores snapshots across sequences, A2 model-paged storage where its batched paged forward is
         /// available — the window its pooled path is capped at, and the primary cache as a resident payload.
-        /// Readiness stays Legacy until the family's M5 PR.
+        /// Tree mode uses only the storage and truncation operations available on this instance.
         /// </summary>
         protected PrefixCacheCapabilities PageFamilyCapabilities(FamilyClass familyClass, TruncationKind truncation,
             int truncationParameter = 0, bool pagesNeedStateAtEnd = false, bool reuseAcrossMediaSpan = false)
         {
             bool a1 = SupportsKVStateSnapshot && SupportsCrossSequenceKvReuse;
-            bool a2 = this is TensorSharp.Runtime.Scheduling.IBatchedPagedModel paged && paged.BatchedForwardAvailable;
+            // Model-paged attention rows do not contain the recurrent state required
+            // at a restorable boundary. Those families must use complete host slabs.
+            bool a2 = !pagesNeedStateAtEnd
+                && this is TensorSharp.Runtime.Scheduling.IBatchedPagedModel paged && paged.BatchedForwardAvailable;
             PageSupport pages = a1 && a2 ? PageSupport.Both : a1 ? PageSupport.A1HostSlab : a2 ? PageSupport.A2ModelPaged : PageSupport.None;
             return new PrefixCacheCapabilities
             {
                 Class = familyClass,
-                Readiness = PrefixCacheMode.Legacy,
+                Readiness = PrefixCacheMode.Tree,
                 NamespaceFingerprint = KVStateFingerprint,
                 EndState = EndStateSupport.None,
                 PrimaryResident = true,

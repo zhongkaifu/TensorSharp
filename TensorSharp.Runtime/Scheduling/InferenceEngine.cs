@@ -13,6 +13,7 @@ using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using TensorSharp.Runtime.Paged;
+using TensorSharp.Runtime.Scheduling.PrefixCache;
 using TensorSharp.Runtime.Speculative;
 
 namespace TensorSharp.Runtime.Scheduling
@@ -53,6 +54,10 @@ namespace TensorSharp.Runtime.Scheduling
         private long _totalForwardTicks;
         private bool _disposed;
 
+        /// <summary>The effective cache owner for this loaded model.</summary>
+        public PrefixCacheMode PrefixCacheMode => _executor.RadixPrefixCacheEnabled
+            ? PrefixCacheMode.Tree : PrefixCacheMode.Legacy;
+
         public InferenceEngine(IModelArchitecture model, SchedulerConfig cfg, ILogger logger = null)
         {
             _model = model ?? throw new ArgumentNullException(nameof(model));
@@ -71,17 +76,20 @@ namespace TensorSharp.Runtime.Scheduling
                 supportsReuseAcrossMediaSpan: model.SupportsReuseAcrossMediaSpan,
                 canPrefillMediaAfterReusedPrefix: model.CanPrefillMediaAfterReusedPrefix);
             _executor = new BatchExecutor(model, _pool, _scheduler, logger);
+            _executor.InitializeRadixCache(cfg);
             // Let the scheduler plan same-session live-cache continuations through the
             // executor (which owns the model's live KV-cache state).
-            _scheduler.AttachLiveCacheContinuation(
-                _executor.ComputeLiveContinuationLcp,
-                _executor.TryAdoptLiveCache);
+            if (!_executor.RadixPrefixCacheEnabled)
+                _scheduler.AttachLiveCacheContinuation(
+                    _executor.ComputeLiveContinuationLcp,
+                    _executor.TryAdoptLiveCache);
             // Cross-request prefix reuse for concurrent (per-seq fused) decode:
             // re-adopt a finished request's complete retained holder (K/V and,
             // for hybrid models, recurrent state) for a follow-up turn.
-            _scheduler.AttachFusedCacheContinuation(
-                _executor.ComputeFusedContinuationLcp,
-                _executor.TryAdoptFusedContinuation);
+            if (!_executor.RadixPrefixCacheEnabled)
+                _scheduler.AttachFusedCacheContinuation(
+                    _executor.ComputeFusedContinuationLcp,
+                    _executor.TryAdoptFusedContinuation);
             // So admission can say WHY a turn reused nothing. The mechanisms record
             // their reasons; only the scheduler knows which one ended up serving the
             // request, so only it can report the outcome without guessing.
@@ -286,6 +294,20 @@ namespace TensorSharp.Runtime.Scheduling
                 if (_handles.TryRemove(entry.Key, out var handle))
                     handle.CompleteWithError(abandoned);
             }
+            if (!_worker.IsAlive)
+            {
+                lock (_model.GpuComputeLock)
+                {
+                    foreach (var sequence in _scheduler.GetInFlightSequencesSnapshot())
+                    {
+                        _scheduler.Abort(sequence.RequestId);
+                        NotifyReleasedSequence(_model as IBatchedPagedModel, sequence.RequestId,
+                            seen: null, retainFusedCache: false);
+                    }
+                    _executor.Reset();
+                    _executor.RadixCache?.Detach();
+                }
+            }
         }
 
         private void WorkerLoop()
@@ -296,7 +318,8 @@ namespace TensorSharp.Runtime.Scheduling
                 // Drain queued commands (non-blocking).
                 while (_commands.Reader.TryRead(out var cmd))
                 {
-                    ApplyCommand(cmd);
+                    lock (_model.GpuComputeLock)
+                        ApplyCommand(cmd);
                 }
 
                 // If there's nothing in flight, block on command channel.
@@ -326,69 +349,74 @@ namespace TensorSharp.Runtime.Scheduling
                     continue;
                 }
 
-                // Run one scheduler step.
-                sw.Restart();
-                SchedulerOutput output = null;
-                List<SequenceStepResult> results;
-                try
+                // Admission materializes model payloads, and completion captures them.
+                // They share the same compute gate as forwarding and media encoders.
+                lock (_model.GpuComputeLock)
                 {
-                    output = _scheduler.Schedule();
-                }
-                catch (Exception ex)
-                {
-                    FailStepSequences(ex, output, "scheduler");
-                    continue;
-                }
+                    // Run one scheduler step.
+                    sw.Restart();
+                    SchedulerOutput output = null;
+                    List<SequenceStepResult> results;
+                    try
+                    {
+                        output = _scheduler.Schedule();
+                    }
+                    catch (Exception ex)
+                    {
+                        FailStepSequences(ex, output, "scheduler");
+                        continue;
+                    }
 
-                if (output.IsEmpty)
-                {
-                    // A preemption may have happened while trying to make room.
-                    // Release its model-owned state even though no forward pass
-                    // was produced this iteration.
+                    if (output.IsEmpty)
+                    {
+                        // A preemption may have happened while trying to make room.
+                        // Release its model-owned state even though no forward pass
+                        // was produced this iteration.
+                        NotifyReleasedSequences(output);
+
+                        // A non-empty running set cannot become schedulable without
+                        // completing a step or freeing blocks. If Schedule returned
+                        // no work, neither can happen: continuing would busy-spin the
+                        // worker forever with an open client stream and an idle GPU.
+                        // Schedule may need more than one pass to preempt enough
+                        // small victims for a large allocation. A preemption is
+                        // real progress even if this pass produced no forward work.
+                        if (_scheduler.RunningCount > 0
+                            && output.PreemptedRequestIds.Count == 0)
+                            FailStalledSequences();
+                        continue;
+                    }
+
+                    try
+                    {
+                        results = _executor.ExecuteStep(output);
+                    }
+                    catch (Exception ex)
+                    {
+                        FailStepSequences(ex, output, "executor");
+                        continue;
+                    }
+
+                    Interlocked.Increment(ref _totalStepsRun);
+                    Interlocked.Add(ref _totalForwardTicks, sw.ElapsedTicks);
+
+                    // Post-step: emit tokens, detect stop conditions, finish sequences.
+                    ApplyResults(results, output);
+
+                    // Notify the model about sequences whose per-request state can
+                    // now be reclaimed (finished, preempted, errored). Hybrid
+                    // models (Nemotron-H, Qwen 3.5) allocate Mamba2 / GatedDeltaNet
+                    // recurrent-state slots keyed by RequestId; without this
+                    // notification the slot pool grows unbounded and slot indices
+                    // get reused incorrectly across abandoned sequences.
                     NotifyReleasedSequences(output);
-
-                    // A non-empty running set cannot become schedulable without
-                    // completing a step or freeing blocks. If Schedule returned
-                    // no work, neither can happen: continuing would busy-spin the
-                    // worker forever with an open client stream and an idle GPU.
-                    // Schedule may need more than one pass to preempt enough
-                    // small victims for a large allocation. A preemption is
-                    // real progress even if this pass produced no forward work.
-                    if (_scheduler.RunningCount > 0
-                        && output.PreemptedRequestIds.Count == 0)
-                        FailStalledSequences();
-                    continue;
                 }
-
-                try
-                {
-                    results = _executor.ExecuteStep(output);
-                }
-                catch (Exception ex)
-                {
-                    FailStepSequences(ex, output, "executor");
-                    continue;
-                }
-
-                Interlocked.Increment(ref _totalStepsRun);
-                Interlocked.Add(ref _totalForwardTicks, sw.ElapsedTicks);
-
-                // Post-step: emit tokens, detect stop conditions, finish sequences.
-                ApplyResults(results, output);
-
-                // Notify the model about sequences whose per-request state can
-                // now be reclaimed (finished, preempted, errored). Hybrid
-                // models (Nemotron-H, Qwen 3.5) allocate Mamba2 / GatedDeltaNet
-                // recurrent-state slots keyed by RequestId; without this
-                // notification the slot pool grows unbounded and slot indices
-                // get reused incorrectly across abandoned sequences.
-                NotifyReleasedSequences(output);
             }
         }
 
         private void NotifyReleasedSequences(SchedulerOutput output)
         {
-            if (_model is not Runtime.Scheduling.IBatchedPagedModel batched) return;
+            var batched = _model as Runtime.Scheduling.IBatchedPagedModel;
             var seen = new HashSet<string>(StringComparer.Ordinal);
             if (output.FinishedRequestIds != null)
             {
@@ -540,7 +568,7 @@ namespace TensorSharp.Runtime.Scheduling
 
         private void NotifyReleasedSequences(IEnumerable<string> requestIds)
         {
-            if (_model is not Runtime.Scheduling.IBatchedPagedModel batched) return;
+            var batched = _model as Runtime.Scheduling.IBatchedPagedModel;
             var seen = new HashSet<string>(StringComparer.Ordinal);
             foreach (var id in requestIds)
                 NotifyReleasedSequence(batched, id, seen);
@@ -586,7 +614,8 @@ namespace TensorSharp.Runtime.Scheduling
 
             try
             {
-                batched.OnSequenceReleased(requestId);
+                batched?.OnSequenceReleased(requestId);
+                _executor.RadixCache?.Drain();
             }
             catch (Exception ex)
             {
@@ -644,19 +673,13 @@ namespace TensorSharp.Runtime.Scheduling
 
                 case EngineCommandKind.Abort:
                     _scheduler.Abort(cmd.RequestId);
-                    if (_model is Runtime.Scheduling.IBatchedPagedModel batchedAbort)
-                    {
-                        // Abort bypasses ApplyResults/NotifyReleasedSequences, so run
-                        // the same executor-first cleanup before freeing model state.
-                        // The executor keeps a cleanly stopped sequence's holder (the
-                        // Stop button is the ordinary way a phone turn ends) and
-                        // declines anything inconsistent itself.
-                        NotifyReleasedSequence(
-                            batchedAbort,
-                            cmd.RequestId,
-                            seen: null,
-                            retainFusedCache: true);
-                    }
+                    // Every radix family owns request keys, including primary-only
+                    // models which have no IBatchedPagedModel release hook.
+                    NotifyReleasedSequence(
+                        _model as IBatchedPagedModel,
+                        cmd.RequestId,
+                        seen: null,
+                        retainFusedCache: true);
                     if (_handles.TryRemove(cmd.RequestId, out var handle))
                     {
                         // Aborted requests (stop button, client disconnect,
@@ -810,7 +833,7 @@ namespace TensorSharp.Runtime.Scheduling
                 st.PlainMsPerToken, st.SpecMsPerToken, st.GovernorWins, st.GovernorLosses, st.GovernorParkedSteps);
         }
 
-        private static long ComputeBlockByteSize(IModelArchitecture model, int blockSize)
+        internal static long ComputeBlockByteSize(IModelArchitecture model, int blockSize)
         {
             if (!model.SupportsKVStateSnapshot) return 0;
             long size = model.ComputeKVBlockByteSize(blockSize);

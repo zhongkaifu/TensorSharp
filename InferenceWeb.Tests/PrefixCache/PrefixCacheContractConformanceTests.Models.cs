@@ -168,7 +168,7 @@ public sealed partial class PrefixCacheContractConformanceTests
             DecodeTokens = 8,
             DonateAfter = 3,
             RewindTokens = 4,
-            ExpectedReadiness = PrefixCacheMode.Legacy,
+            ExpectedReadiness = PrefixCacheMode.Tree,
             // Native slots: the managed side does not measure their bytes (M5e).
             PayloadBytesKnown = false,
             Log = _output.WriteLine,
@@ -221,7 +221,7 @@ public sealed partial class PrefixCacheContractConformanceTests
         DecodeTokens = decodeTokens,
         DonateAfter = 3,
         RewindTokens = 4,
-        ExpectedReadiness = PrefixCacheMode.Legacy,
+        ExpectedReadiness = PrefixCacheMode.Tree,
         Log = _output.WriteLine,
     };
 

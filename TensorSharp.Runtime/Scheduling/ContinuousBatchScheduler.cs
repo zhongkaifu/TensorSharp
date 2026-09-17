@@ -9,6 +9,7 @@ using System.Collections.Generic;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using TensorSharp.Runtime.Paged;
+using TensorSharp.Runtime.Scheduling.PrefixCache;
 
 namespace TensorSharp.Runtime.Scheduling
 {
@@ -69,6 +70,7 @@ namespace TensorSharp.Runtime.Scheduling
         // their own holder. Null when unwired.
         private Func<SequenceState, int> _fusedContinuationLcp;
         private Func<SequenceState, int, bool> _fusedContinuationAdopt;
+        private PrefixCacheCoordinator _radixCache;
 
         private readonly LinkedList<SequenceState> _waiting = new();
         private readonly Dictionary<string, LinkedListNode<SequenceState>> _waitingIndex = new();
@@ -110,7 +112,7 @@ namespace TensorSharp.Runtime.Scheduling
         /// <summary>Whether cross-sequence prefix-cache reuse is enabled for this
         /// model. False for models (e.g. Gemma 4 SWA) whose K/V snapshot cannot be
         /// faithfully restored into a different sequence.</summary>
-        private bool PrefixCachingActive => _cfg.EnablePrefixCaching && _crossSeqKvReuse;
+        private bool PrefixCachingActive => _cfg.EnablePrefixCaching && (_radixCache != null || _crossSeqKvReuse);
 
         /// <summary>Wire the live-cache continuation hooks (see the fields). Called
         /// once by the engine after the executor is constructed.</summary>
@@ -141,12 +143,21 @@ namespace TensorSharp.Runtime.Scheduling
         /// </summary>
         private int AlignSharedPrefixBoundary(SequenceState seq, int want)
         {
-            if (!_alignToSharedPrefix || want <= 0 || seq.SharedPrefixTokens <= 0 || seq.PrefixCheckpointTaken)
+            if (!_alignToSharedPrefix || want <= 0)
                 return want;
             int start = seq.NumComputedTokens;
-            int boundary = seq.SharedPrefixTokens;
-            if (boundary > start && start + want > boundary)
-                return boundary - start;
+            if (_radixCache != null && seq.CacheBreakpoints != null)
+            {
+                foreach (int breakpoint in seq.CacheBreakpoints)
+                    if (breakpoint > start && breakpoint <= seq.PromptTokens.Count && breakpoint < start + want)
+                        want = breakpoint - start;
+            }
+            if (seq.SharedPrefixTokens > 0 && !seq.PrefixCheckpointTaken)
+            {
+                int boundary = seq.SharedPrefixTokens;
+                if (boundary > start && start + want > boundary)
+                    return boundary - start;
+            }
             return want;
         }
 
@@ -154,6 +165,16 @@ namespace TensorSharp.Runtime.Scheduling
             Func<SequenceState, int> computeLcp,
             Func<SequenceState, int, bool> adopt)
         {
+            _fusedContinuationLcp = computeLcp;
+            _fusedContinuationAdopt = adopt;
+        }
+
+        internal void AttachRadixCacheContinuation(
+            PrefixCacheCoordinator coordinator,
+            Func<SequenceState, int> computeLcp,
+            Func<SequenceState, int, bool> adopt)
+        {
+            _radixCache = coordinator;
             _fusedContinuationLcp = computeLcp;
             _fusedContinuationAdopt = adopt;
         }
@@ -502,72 +523,89 @@ namespace TensorSharp.Runtime.Scheduling
                 string? liveDeclineReason = null;
                 if (seq.BlockTable.NumBlocks == 0 && _cfg.EnablePrefixCaching)
                 {
-                    // Live-cache continuation: when this is the SOLE sequence about to
-                    // run (nothing else running or already scheduled this step), the
-                    // model's live KV cache from the previous turn is still intact and
-                    // its prompt may extend it. Continuing from that live cache reuses
-                    // the whole conversation prefix - past the pooled-snapshot window
-                    // cap - with no corruption. Gated to the sole-sequence case so no
-                    // concurrent sequence can clobber the live cache before we run.
-                    if (_running.Count == 0
-                        && output.ScheduledWork.Count == 0
-                        && _liveContinuationLcp != null
-                        && _liveContinuationAdopt != null)
+                    if (_radixCache != null)
                     {
-                        int lcp = _liveContinuationLcp(seq);
-                        // A short live prefix on a pooled-capable model: take the live
-                        // cache unless the pooled blocks actually cover at least as much
-                        // (whole blocks only, one token left, and only if captured).
-                        int pooledCovers = lcp > 0 && PrefixCachingActive && lcp <= _maxReusablePrefixTokens
-                            ? PlanPrefixBlockAdoption(seq, logBacktrack: false, out _).Count * _cfg.BlockSize
-                            : 0;
-                        if (lcp > 0 && pooledCovers >= lcp)
-                            liveDeclineReason = $"pooled prefix-cache blocks cover {pooledCovers} tokens, at least the live match of {lcp}";
-                        else if (lcp > 0 && _liveContinuationAdopt(seq, lcp))
-                            plannedLiveContinuation = true;
-                        else
-                            liveDeclineReason = _liveDeclineReason?.Invoke() ?? "no usable live prefix";
-                    }
-                    else if (_liveContinuationLcp != null)
-                    {
-                        // Not even attempted. The sole-sequence gate is the usual
-                        // reason and it is invisible from the request's telemetry,
-                        // which just reports 0% reuse.
-                        liveDeclineReason =
-                            $"not attempted (another sequence holds the live cache: running={_running.Count}, "
-                            + $"scheduledThisStep={output.ScheduledWork.Count})";
-                        _logger.LogDebug(
-                            "Live-cache continuation not attempted for {RequestId}: running={Running} scheduledThisStep={Scheduled}.",
-                            seq.RequestId, _running.Count, output.ScheduledWork.Count);
-                    }
-
-                    // Retained fused-cache continuation: a finished concurrent
-                    // request's complete model-owned state remains alive; if this
-                    // prompt extends it exactly, continue from that holder without
-                    // reconstructing circular K/V (Gemma 4) or separating attention
-                    // K/V from recurrent GDN state (Qwen 3.5/3.6). Each retained holder
-                    // is independent ÔÇö no shared live cache to clobber ÔÇö so this is
-                    // NOT gated to the sole-sequence case and doesn't block co-admitting
-                    // other sequences this step. It restores multi-turn prefix reuse
-                    // after a concurrent fused round left nothing in the paged pool.
-                    if (!plannedLiveContinuation
-                        && _fusedContinuationLcp != null
-                        && _fusedContinuationAdopt != null)
-                    {
-                        int flcp = _fusedContinuationLcp(seq);
-                        if (flcp > 0 && _fusedContinuationAdopt(seq, flcp))
+                        _radixCache.PrimaryAvailable = _running.Count == 0 && output.ScheduledWork.Count == 0;
+                        int length = _fusedContinuationLcp(seq);
+                        if (length > 0 && _fusedContinuationAdopt(seq, length))
+                        {
                             plannedFusedContinuation = true;
+                            plannedLiveContinuation = _radixCache.RequiresSoleAdmission;
+                        }
+                        _logger.LogInformation(
+                            "Radix prompt reuse for {RequestId}: {Reused}/{Prompt} tokens; {Prefill} token(s) to prefill.",
+                            seq.RequestId, seq.PrefixCacheReusedTokens, seq.PromptTokens.Count,
+                            seq.PromptTokens.Count - seq.PrefixCacheReusedTokens);
                     }
+                    else
+                    {
+                        // Live-cache continuation: when this is the SOLE sequence about to
+                        // run (nothing else running or already scheduled this step), the
+                        // model's live KV cache from the previous turn is still intact and
+                        // its prompt may extend it. Continuing from that live cache reuses
+                        // the whole conversation prefix - past the pooled-snapshot window
+                        // cap - with no corruption. Gated to the sole-sequence case so no
+                        // concurrent sequence can clobber the live cache before we run.
+                        if (_running.Count == 0
+                            && output.ScheduledWork.Count == 0
+                            && _liveContinuationLcp != null
+                            && _liveContinuationAdopt != null)
+                        {
+                            int lcp = _liveContinuationLcp(seq);
+                            // A short live prefix on a pooled-capable model: take the live
+                            // cache unless the pooled blocks actually cover at least as much
+                            // (whole blocks only, one token left, and only if captured).
+                            int pooledCovers = lcp > 0 && PrefixCachingActive && lcp <= _maxReusablePrefixTokens
+                                ? PlanPrefixBlockAdoption(seq, logBacktrack: false, out _).Count * _cfg.BlockSize
+                                : 0;
+                            if (lcp > 0 && pooledCovers >= lcp)
+                                liveDeclineReason = $"pooled prefix-cache blocks cover {pooledCovers} tokens, at least the live match of {lcp}";
+                            else if (lcp > 0 && _liveContinuationAdopt(seq, lcp))
+                                plannedLiveContinuation = true;
+                            else
+                                liveDeclineReason = _liveDeclineReason?.Invoke() ?? "no usable live prefix";
+                        }
+                        else if (_liveContinuationLcp != null)
+                        {
+                            // Not even attempted. The sole-sequence gate is the usual
+                            // reason and it is invisible from the request's telemetry,
+                            // which just reports 0% reuse.
+                            liveDeclineReason =
+                                $"not attempted (another sequence holds the live cache: running={_running.Count}, "
+                                + $"scheduledThisStep={output.ScheduledWork.Count})";
+                            _logger.LogDebug(
+                                "Live-cache continuation not attempted for {RequestId}: running={Running} scheduledThisStep={Scheduled}.",
+                                seq.RequestId, _running.Count, output.ScheduledWork.Count);
+                        }
 
-                    if (!plannedLiveContinuation
-                        && !plannedFusedContinuation
-                        && PrefixCachingActive)
-                        AdoptPrefixBlocksCapped(seq);
+                        // Retained fused-cache continuation: a finished concurrent
+                        // request's complete model-owned state remains alive; if this
+                        // prompt extends it exactly, continue from that holder without
+                        // reconstructing circular K/V (Gemma 4) or separating attention
+                        // K/V from recurrent GDN state (Qwen 3.5/3.6). Each retained holder
+                        // is independent ÔÇö no shared live cache to clobber ÔÇö so this is
+                        // NOT gated to the sole-sequence case and doesn't block co-admitting
+                        // other sequences this step. It restores multi-turn prefix reuse
+                        // after a concurrent fused round left nothing in the paged pool.
+                        if (!plannedLiveContinuation
+                            && _fusedContinuationLcp != null
+                            && _fusedContinuationAdopt != null)
+                        {
+                            int flcp = _fusedContinuationLcp(seq);
+                            if (flcp > 0 && _fusedContinuationAdopt(seq, flcp))
+                                plannedFusedContinuation = true;
+                        }
 
-                    // Every mechanism has now had its turn, so the outcome is finally
-                    // knowable. Exactly one line, whatever happened.
-                    LogPromptReuseOutcome(
-                        seq, plannedLiveContinuation, plannedFusedContinuation, liveDeclineReason);
+                        if (!plannedLiveContinuation
+                            && !plannedFusedContinuation
+                            && PrefixCachingActive)
+                            AdoptPrefixBlocksCapped(seq);
+
+                        // Every mechanism has now had its turn, so the outcome is finally
+                        // knowable. Exactly one line, whatever happened.
+                        LogPromptReuseOutcome(
+                            seq, plannedLiveContinuation, plannedFusedContinuation, liveDeclineReason);
+                    }
                 }
 
                 int promptUncomputed = Math.Max(0, seq.PromptTokens.Count - seq.NumComputedTokens);
@@ -765,6 +803,7 @@ namespace TensorSharp.Runtime.Scheduling
             int delta = neededBlocks - currentBlocks;
             if (delta <= 0) return true;
 
+            _radixCache?.EnsureFreePages(delta);
             var newBlocks = _pool.AllocateNew(delta);
             if (newBlocks == null) return false;
             for (int i = 0; i < newBlocks.Length; i++)
@@ -835,6 +874,8 @@ namespace TensorSharp.Runtime.Scheduling
                 if (missing > 0) outstanding += missing;
             }
             int need = BlocksFor(candidate.PromptTokens.Count, _cfg.BlockSize) - candidate.BlockTable.NumBlocks;
+            if (_radixCache != null)
+                _radixCache.EnsureFreePages((int)Math.Min(_pool.NumBlocks, Math.Max(0, need + outstanding)));
             long available = (long)_pool.NumFreeBlocks - outstanding;
             if (available >= need)
                 return true;
@@ -845,7 +886,7 @@ namespace TensorSharp.Runtime.Scheduling
             // at a time once their prompts summed past the pool). An idle cached block
             // sits in the free queue, so adopting it costs a free block like a new one.
             // Only consulted when the cheap check fails, i.e. while a request waits.
-            if (!PrefixCachingActive || candidate.BlockTable.NumBlocks != 0)
+            if (_radixCache != null || !PrefixCachingActive || candidate.BlockTable.NumBlocks != 0)
                 return false;
             _capacityPlanScratch.Clear();
             FillPrefixBlockAdoptionPlan(candidate, logBacktrack: false, _capacityPlanScratch, out _);
@@ -1098,6 +1139,11 @@ namespace TensorSharp.Runtime.Scheduling
             int prevFull = previousTokens / _cfg.BlockSize;
             int curFull = seq.NumComputedTokens / _cfg.BlockSize;
             if (curFull <= prevFull) return;
+            if (_radixCache != null)
+            {
+                _radixCache.CapturePages(seq);
+                return;
+            }
 
             int allTokensCovered = curFull * _cfg.BlockSize;
             // Build hashes from prompt+output prefix that's now block-aligned.
@@ -1143,6 +1189,11 @@ namespace TensorSharp.Runtime.Scheduling
         private void CacheFullBlocksForSequence(SequenceState seq)
         {
             if (!PrefixCachingActive) return;
+            if (_radixCache != null)
+            {
+                _radixCache.CapturePages(seq);
+                return;
+            }
             // Hash only over positions that actually exist in the token list.
             // A speculative step that hit a mid-batch stop can leave
             // NumComputedTokens ahead of NumTotalTokens (the dropped tail's

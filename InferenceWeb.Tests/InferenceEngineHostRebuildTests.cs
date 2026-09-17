@@ -17,6 +17,7 @@ using Microsoft.Extensions.Logging.Abstractions;
 using TensorSharp;
 using TensorSharp.Models;
 using TensorSharp.Runtime.Scheduling;
+using TensorSharp.Runtime.Scheduling.PrefixCache;
 using TensorSharp.Server;
 
 namespace InferenceWeb.Tests;
@@ -52,6 +53,8 @@ public sealed class InferenceEngineHostRebuildTests : IDisposable
         InferenceEngine first = host.TryGetEngine();
         Assert.NotNull(first);
         Assert.Same(created[0], first.Model);
+        Assert.Equal(PrefixCacheMode.Tree, first.PrefixCacheMode);
+        Assert.Equal(1, created[0].PrefixCacheAttachments);
         // Unchanged model: the standing engine is reused.
         Assert.Same(first, host.TryGetEngine());
 
@@ -67,6 +70,8 @@ public sealed class InferenceEngineHostRebuildTests : IDisposable
         Assert.NotSame(first, second);
         Assert.Same(created[1], second.Model);
         Assert.Same(second, host.TryGetEngine());
+        Assert.Equal(PrefixCacheMode.Tree, second.PrefixCacheMode);
+        Assert.Equal(1, created[1].PrefixCacheAttachments);
     }
 
     [Fact]
@@ -116,10 +121,11 @@ public sealed class InferenceEngineHostRebuildTests : IDisposable
 
     /// <summary>A snapshot-capable model with no weights: enough for the host to build
     /// an engine on it, never enough to run a request.</summary>
-    private sealed class SnapshotFakeModel : ModelBase
+    private sealed class SnapshotFakeModel : ModelBase, IPageOnlyPrefixCacheModel
     {
         public bool Disposed;
         public string Fingerprint;
+        public int PrefixCacheAttachments;
 
         public SnapshotFakeModel(string ggufPath, string fingerprint)
             : base(ggufPath, BackendType.Cpu)
@@ -131,6 +137,10 @@ public sealed class InferenceEngineHostRebuildTests : IDisposable
         public override bool SupportsKVStateSnapshot => true;
         public override string KVStateFingerprint => Fingerprint;
         public override long ComputeKVBlockByteSize(int tokenCount) => 4L * tokenCount;
+        public PrefixCacheCapabilities GetPrefixCacheCapabilities()
+            => PageFamilyCapabilities(FamilyClass.P, TruncationKind.Any);
+        public void AttachPrefixCache(IPrefixPayloadSink sink) => PrefixCacheAttachments++;
+        public long QuerySpareBytes(ResourceClass resourceClass) => -1;
 
         protected override float[] ForwardCore(int[] tokens) => new float[8];
 

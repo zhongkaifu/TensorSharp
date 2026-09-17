@@ -206,6 +206,26 @@ public class ServerOptionsBuilderTests : IDisposable
     }
 
     [Fact]
+    public void NoPrefixCache_DisablesRuntimeReuseAndStartupPersistence()
+    {
+        _env.Set("TS_SCHED_PREFIX_CACHE", "1");
+        string[] args = { "--no-prefix-cache" };
+
+        Assert.True(ServerOptionsBuilder.ApplyPrefixCacheCliFlag(args));
+        Assert.False(SchedulerConfig.FromEnvironment().EnablePrefixCaching);
+        Assert.False(ServerOptionsBuilder.Build(args, _baseDir).PrefixCacheEnabled);
+    }
+
+    [Fact]
+    public void NoPrefixCache_AbsentPreservesRuntimeEnvironment()
+    {
+        _env.Set("TS_SCHED_PREFIX_CACHE", "1");
+
+        Assert.False(ServerOptionsBuilder.ApplyPrefixCacheCliFlag(Array.Empty<string>()));
+        Assert.True(SchedulerConfig.FromEnvironment().EnablePrefixCaching);
+    }
+
+    [Fact]
     public void ApplyPagedKvCacheCliFlags_NoPagedKvFlag_DisablesEnabledEnvVar()
     {
         _env.Set("TS_KV_PAGED_CACHE", "1");

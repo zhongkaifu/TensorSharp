@@ -786,6 +786,16 @@ public static class ServerOptionsBuilder
         return changed;
     }
 
+    /// <summary>Disable scheduler prefix reuse when the host's prefix-cache opt-out
+    /// is present. Startup preparation and persistence use the same parsed flag.</summary>
+    public static bool ApplyPrefixCacheCliFlag(string[] args)
+    {
+        if (args == null || !args.Any(a => string.Equals(a, "--no-prefix-cache", StringComparison.OrdinalIgnoreCase)))
+            return false;
+        Environment.SetEnvironmentVariable("TS_SCHED_PREFIX_CACHE", "0");
+        return true;
+    }
+
     /// <summary>
     /// Translate <c>--redis-url &lt;url&gt;</c> into both
     /// <c>TS_KV_CACHE_REDIS_URL</c> and

@@ -1,17 +1,9 @@
 // Copyright (c) Zhongkai Fu. All rights reserved.
 // Licensed under the BSD-3-Clause license in the repository root.
 //
-// DeepSeek V4.1's side of the radix prefix cache contract (DESIGN §6.5.1, class N).
-//
-// Inert by default. The capability record says Readiness=Legacy, so an engine
-// never calls a state member here, and nothing below changes a code path the
-// engine runs today: RetainSequenceCache is RetainSequenceCacheAs(id, id), and
-// ReclaimRetainedPrimary reports a reclaimed slot only once AttachPrefixCache
-// has given it a sink.
-//
-// End states are the native retention's whole-model slots, moved at zero copy
-// and never copied (DonateOnly; no slot copy API exists, DEC-50). Only with
-// TS_DSV41_RETAINED_CACHE=1 and no DSpark head; otherwise the family has none.
+// DeepSeek V4 / V4.1's radix prefix cache: donate-only native slots. Native
+// reuse checks and retention budgets remain authoritative; reclaimed slots are
+// reported to the tree through the attached payload sink.
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -32,7 +24,7 @@ namespace TensorSharp.Models
             return new PrefixCacheCapabilities
             {
                 Class = FamilyClass.N,
-                Readiness = PrefixCacheMode.Legacy,
+                Readiness = PrefixCacheMode.Tree,
                 NamespaceFingerprint = KVStateFingerprint,
                 EndState = slots ? EndStateSupport.DonateOnly : EndStateSupport.None,
                 CanCaptureCopy = false,
@@ -57,6 +49,12 @@ namespace TensorSharp.Models
         {
             lock (_sync)
                 _prefixCacheSink = sink ?? throw new ArgumentNullException(nameof(sink));
+        }
+
+        public void DetachPrefixCache()
+        {
+            lock (_sync)
+                _prefixCacheSink = null;
         }
 
         public long QuerySpareBytes(ResourceClass cls) => QueryPrefixCacheSpareBytes(cls);

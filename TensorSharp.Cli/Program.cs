@@ -462,6 +462,7 @@ namespace TensorSharp.Cli
                         // Spelled the same as the server's, because a config file's keys
                         // ARE flags and the same file is expected to drive either host.
                         noPrefixCache = true;
+                        Environment.SetEnvironmentVariable("TS_SCHED_PREFIX_CACHE", "0");
                         break;
                     case "--paged-kv-block-size":
                         pagedKvBlockSizeOverride = int.Parse(args[++i]);
@@ -1404,6 +1405,9 @@ namespace TensorSharp.Cli
             // once per shape, so the timed run reflects steady-state speed
             // rather than first-touch compile cost.  Decode tokens are kept
             // small during warmup so the wall cost is bounded.
+            using var inference = new CliInferenceSession(model,
+                SchedulerConfig.FromEnvironment().WithSpeculation(
+                    SpeculativeDecodingOptions.Resolve(specDraftMax, specDraftConfMin)), _log);
             for (int w = 0; w < warmupInferenceRuns; w++)
             {
                 int warmupDecodeTokens = Math.Min(maxTokens, 4);
@@ -1413,8 +1417,10 @@ namespace TensorSharp.Cli
                 _ = RunInference(model, rawText, imagePaths, warmupDecodeTokens, audioPaths,
                     isVideo: videoPath != null, samplingConfig: samplingConfig,
                     enableThinking: enableThinking, tools: tools, silent: true,
-                    preserveAllInput: pdfPath != null);
-                model.ResetKVCache();
+                    preserveAllInput: pdfPath != null,
+                    specDraftMax: specDraftMax, specDraftConfMin: specDraftConfMin,
+                    systemPrompt: systemPrompt, inference: inference);
+                inference.StartNewConversation();
                 model.ResetForwardTiming();
             }
 
@@ -1431,7 +1437,7 @@ namespace TensorSharp.Cli
                     specDraftMax, specDraftConfMin, systemPrompt,
                     skillToolContext, skillOptions.RoundsFor(skillToolContext.CodeRunner is { CanRun: true }),
                     SkillCapabilities.For(model.Config.Architecture).ToolResultsRendered,
-                    clientTools);
+                    clientTools, inference);
             }
             else
             {
@@ -1440,7 +1446,7 @@ namespace TensorSharp.Cli
                     enableThinking: enableThinking, tools: tools,
                     preserveAllInput: pdfPath != null,
                     specDraftMax: specDraftMax, specDraftConfMin: specDraftConfMin,
-                    systemPrompt: systemPrompt);
+                    systemPrompt: systemPrompt, inference: inference);
             }
 
             _log.LogInformation(LogEventIds.ChatCompleted,
@@ -1480,20 +1486,15 @@ namespace TensorSharp.Cli
 
             var specSettings = SpeculativeDecodingOptions.Resolve(specDraftMax, specDraftConfMin);
 
-            // One decoder for the whole run: its draft/verify buffers are sized by
-            // the vocabulary, so rebuilding it per turn costs several MB a turn on a
-            // 155k-token vocabulary for nothing.
-            SpeculativeDecoder multiTurnDecoder = null;
+            using var inference = new CliInferenceSession(model,
+                SchedulerConfig.FromEnvironment().WithSpeculation(specSettings), _log);
 
             string[] lines = File.ReadAllLines(jsonlPath);
             var history = new List<ChatMessage>();
             string arch = model.Config.Architecture;
             int swa = model.Config.SlidingWindow;
 
-            // Conversation cache state - drives KV cache reuse across turns by tracking
-            // the canonical token sequence currently in the model and splicing the raw
-            // output tokens of past assistant turns directly into the rendered prompt.
-            var kvCache = new KVCache();
+            // Preserve raw assistant token splicing while the engine owns KV state.
             var renderer = new KVCachePromptRenderer(PromptRenderer);
 
             _log.LogInformation(LogEventIds.CliBenchmark,
@@ -1549,8 +1550,7 @@ namespace TensorSharp.Cli
                 {
                     _log.LogInformation(LogEventIds.SessionReset,
                         "multi-turn forcing KV cache reset (per JSONL force_reset flag)");
-                    kvCache.Reset();
-                    model.ResetKVCache();
+                    inference.Reset();
                 }
 
                 var inputTokens = renderer.RenderToTokens(
@@ -1563,99 +1563,25 @@ namespace TensorSharp.Cli
                     out string generationPromptTrailingWhitespace,
                     enableThinking: enableThinking);
 
-                // Expand image placeholders, prepare (cached) vision embeddings and
-                // the IMRoPE position table over the WHOLE conversation so far.
-                bool anyImages = history.Exists(m => m.ImagePaths != null && m.ImagePaths.Count > 0);
-                if (anyImages)
-                    inputTokens = model.MultimodalInjector.ProcessPromptTokens(history, inputTokens);
-
-                _log.LogInformation(LogEventIds.ChatStarted,
-                    "multi-turn prompt tokens={PromptTokens}", inputTokens.Count);
-
-                var cfg = sampling ?? SamplingConfig.Greedy;
-                var sampler = new TokenSampler(cfg);
-                var generatedTokens = new List<int>();
-                var sb = new StringBuilder();
-                double prefillMs;
-                double decodeMs;
-
-                var turnDecoder = SpeculativeDecodingOptions.TryCreate(
-                    model, specSettings, hasMediaAttachments: anyImages, out string turnDeclineReason,
-                    multiTurnDecoder);
-                if (turnDecoder != null)
-                    multiTurnDecoder = turnDecoder;
-                if (turnDecoder == null && specSettings.Requested && turnDeclineReason != null && turn == 0)
+                string requestId = $"cli-multiturn-{Guid.NewGuid():N}";
+                CliInferenceSession.Result result;
+                try
                 {
-                    _log.LogWarning(LogEventIds.HostConfiguration,
-                        "--spec was requested but speculative decoding is not available: {Reason} "
-                        + "Serving standard decode.", turnDeclineReason);
+                    inputTokens = model.MultimodalInjector.ProcessPromptTokens(history, inputTokens, requestId);
+                    result = inference.Generate(inputTokens, turnMaxTokens, sampling ?? SamplingConfig.Greedy,
+                        requestId: requestId, mediaSpans: model.MultimodalInjector.GetPreparedMediaSpans(requestId));
                 }
-
-                if (turnDecoder != null)
+                finally
                 {
-                    // The whole turn goes to the speculative decoder, which owns the
-                    // reset, the drafter-aware chunked prefill and the draft/verify
-                    // loop. Re-prefilling every turn is not a compromise here: a
-                    // block drafter's compressed cache cannot be truncated anyway,
-                    // and a prefix the DRAFT head never saw would leave a hole in
-                    // its KV that collapses acceptance for the rest of the turn.
-                    var turnSpecModel = (ISpeculativeTarget)model;
-                    kvCache.Reset();
-                    bool turnArgmax = InteractiveSession.IsArgmaxSampling(cfg);
-                    var turnTokens = turnArgmax
-                        ? turnDecoder.GenerateGreedy(inputTokens.ToArray(), turnMaxTokens,
-                            t => model.Tokenizer.IsEos(t))
-                        : turnDecoder.GenerateSampled(inputTokens.ToArray(), turnMaxTokens, sampler,
-                            t => model.Tokenizer.IsEos(t));
-                    if (turnTokens.Count > 0 && model.Tokenizer.IsEos(turnTokens[turnTokens.Count - 1]))
-                        turnTokens.RemoveAt(turnTokens.Count - 1);
-                    generatedTokens.AddRange(turnTokens);
-                    sb.Append(model.Tokenizer.Decode(generatedTokens));
-                    prefillMs = turnDecoder.LastPrefillSeconds * 1000.0;
-                    decodeMs = turnDecoder.LastDecodeSeconds * 1000.0;
-
-                    _log.LogInformation(LogEventIds.KvCacheReusePlan,
-                        "kv plan=Reset prefillMs={PrefillMs:F1} description={Description}",
-                        prefillMs, $"Full reset: forwarding {inputTokens.Count} tokens (speculative)");
-                    _log.LogInformation(LogEventIds.CliBenchmark,
-                        "multi-turn speculative: draft={DraftKind} window={Window} confMin={ConfMin:F2} verify={VerifyMode} " +
-                        "drafted={Drafted} accepted={Accepted} acceptanceRate={Rate:F3} " +
-                        "verifySteps={VerifySteps} plainSteps={Plain} rollbacks={Rollbacks} parked={Parked}",
-                        SpeculativeDecodingOptions.DescribeDrafter(turnDecoder), turnDecoder.MaxDraftTokens,
-                        turnDecoder.MinDraftProb, turnArgmax ? "argmax" : "sampled",
-                        turnDecoder.TokensDrafted, turnDecoder.TokensAccepted, turnDecoder.AcceptanceRate,
-                        turnDecoder.VerifySteps, turnDecoder.PlainSteps, turnDecoder.RollbackSteps,
-                        turnDecoder.ParkedSteps);
+                    model.MultimodalInjector.ClearPreparedPromptState(requestId);
                 }
-                else
-                {
-                    var sw = Stopwatch.StartNew();
-                    ReusePlan plan = kvCache.PlanReuse(inputTokens, model.SupportsKVCacheTruncation,
-                        model.KVCacheTruncationGranularity);
-                    float[] logits = ApplyReusePlan(model, kvCache, plan, inputTokens,
-                        out ReusePlanKind appliedPlan);
-                    prefillMs = sw.Elapsed.TotalMilliseconds;
-
-                    _log.LogInformation(LogEventIds.KvCacheReusePlan,
-                        "kv plan={Plan} prefillMs={PrefillMs:F1} description={Description}",
-                        appliedPlan, prefillMs, DescribePlan(plan, inputTokens.Count));
-
-                    var decodeSw = Stopwatch.StartNew();
-                    for (int step = 0; step < turnMaxTokens; step++)
-                    {
-                        int nextToken = sampler.Sample(logits, generatedTokens);
-                        if (model.Tokenizer.IsEos(nextToken)) break;
-                        generatedTokens.Add(nextToken);
-                        string decoded = model.Tokenizer.Decode(generatedTokens);
-                        sb.Clear();
-                        sb.Append(decoded);
-                        logits = model.Forward(new[] { nextToken });
-                        kvCache.RecordAppend(nextToken, logits);
-                    }
-                    decodeMs = decodeSw.Elapsed.TotalMilliseconds;
-                }
-
-                string rawOutput = sb.ToString();
+                var generatedTokens = result.Tokens;
+                double prefillMs = result.PrefillMs;
+                double decodeMs = result.DecodeMs;
+                _log.LogInformation(LogEventIds.KvCacheReusePlan,
+                    "radix prefix reused={ReusedTokens}/{PromptTokens} prefillMs={PrefillMs:F1}",
+                    result.Completion.PrefixCacheReusedTokens, inputTokens.Count, prefillMs);
+                string rawOutput = model.Tokenizer.Decode(generatedTokens);
 
                 var parser = CliOutputParser.Create(arch, enableThinking, null,
                     model.Tokenizer, inputTokens);
@@ -1699,77 +1625,6 @@ namespace TensorSharp.Cli
                 "multi-turn test completed: {Turns} turns", history.Count / 2);
         }
 
-        /// <summary>
-        /// Apply a <see cref="ReusePlan"/> to bring the model's KV state up to date and
-        /// return next-token logits. Mirrors the orchestration logic used by ModelService.
-        /// </summary>
-        /// <param name="applied">What happened, rather than what was planned: a model whose
-        /// rewind depth depends on where the sequence is can decline the truncation a partial
-        /// reuse needs, and the full re-prefill is then the only correct answer.</param>
-        static float[] ApplyReusePlan(ModelBase model, KVCache kvCache, ReusePlan plan,
-            List<int> inputTokens, out ReusePlanKind applied)
-        {
-            applied = plan.Kind;
-
-            if (plan.Kind == ReusePlanKind.ExactMatch)
-                return plan.CachedLogits;
-
-            if (plan.Kind == ReusePlanKind.PartialReuse)
-            {
-                int reused = plan.ReusedPrefixLength;
-                // A reuse boundary inside an image span would truncate half an
-                // injection; the injector pulls it back to the span start.
-                int clamped = model.MultimodalInjector.ClampReusablePrefix(reused);
-                if (clamped != reused)
-                    reused = clamped;
-                // Realign after the clamp: it knows about media spans, not about a model
-                // whose head can only stop on a compression-block boundary.
-                int granularity = model.KVCacheTruncationGranularity;
-                if (granularity > 1) reused -= reused % granularity;
-                if (reused > 0 && model.TryTruncateKVCache(reused))
-                {
-                    int suffixLength = inputTokens.Count - reused;
-                    kvCache.TruncateTo(reused);
-
-                    // Vision embeddings and the IMRoPE slice for the tokens being
-                    // forwarded, offset by the reused prefix.
-                    model.MultimodalInjector.QueuePromptEmbeddingsForSlice(reused, suffixLength);
-
-                    var suffix = new int[suffixLength];
-                    for (int i = 0; i < suffixLength; i++)
-                        suffix[i] = inputTokens[reused + i];
-                    float[] suffixLogits = model.ForwardRefill(suffix);
-                    kvCache.RecordAppend(suffix, suffixLogits);
-                    return suffixLogits;
-                }
-
-                _log.LogDebug(LogEventIds.KvCacheReusePlan,
-                    "partial reuse declined by the model at {Reused} of {Cached} cached token(s); "
-                    + "re-prefilling {PromptTokens} token(s)",
-                    reused, kvCache.Count, inputTokens.Count);
-                applied = ReusePlanKind.Reset;
-            }
-
-            model.ResetKVCache();
-            kvCache.Reset();
-            model.MultimodalInjector.QueuePromptEmbeddingsForSlice(0, inputTokens.Count);
-            var allTokens = inputTokens.ToArray();
-            float[] logits = model.Forward(allTokens);
-            kvCache.RecordAppend(allTokens, logits);
-            return logits;
-        }
-
-        static string DescribePlan(ReusePlan plan, int totalTokens)
-        {
-            return plan.Kind switch
-            {
-                ReusePlanKind.ExactMatch => $"Exact match: reusing all {totalTokens} cached tokens (saved 100%)",
-                ReusePlanKind.PartialReuse => $"Partial reuse: keeping {plan.ReusedPrefixLength}/{totalTokens} tokens, forwarding {plan.TokensToForward} new (saved {100.0 * plan.ReusedPrefixLength / totalTokens:F0}%)",
-                ReusePlanKind.Reset => $"Full reset: forwarding {plan.TokensToForward} tokens",
-                _ => "(unknown plan)",
-            };
-        }
-
         static void RunJsonlBatch(ModelBase model, string inputJsonlPath, string outputFile, int defaultMaxTokens,
             SamplingConfig defaultSampling, bool enableThinking = false,
             int specDraftMax = 0, float specDraftConfMin = -1f)
@@ -1780,11 +1635,9 @@ namespace TensorSharp.Cli
                 return;
             }
 
-            // One decoder for the whole batch: its buffers are sized by the
-            // vocabulary, and every request resets it anyway.
             var specSettings = SpeculativeDecodingOptions.Resolve(specDraftMax, specDraftConfMin);
-            SpeculativeDecoder batchDecoder = null;
-            bool specDeclineLogged = false;
+            using var inference = new CliInferenceSession(model,
+                SchedulerConfig.FromEnvironment().WithSpeculation(specSettings), _log);
 
             string[] lines = File.ReadAllLines(inputJsonlPath);
             var results = new List<string>();
@@ -1824,6 +1677,9 @@ namespace TensorSharp.Cli
 
                 try
                 {
+                    // Each JSONL line is an independent conversation. Only its
+                    // declared system prefix may reuse another line's cache.
+                    inference.StartNewConversation();
                     var messages = ParseMessages(root);
                     int maxTokens = root.TryGetProperty("max_tokens", out var mt) ? mt.GetInt32() : defaultMaxTokens;
                     var sampling = ParseSamplingFromJson(root, defaultSampling);
@@ -1832,7 +1688,13 @@ namespace TensorSharp.Cli
                     var audioPaths = ParseStringList(root, "audios");
                     bool isVideo = root.TryGetProperty("is_video", out var iv) && iv.GetBoolean();
 
-                    model.ResetKVCache();
+                    var lastUser = messages.LastOrDefault(m => m.Role == "user");
+                    if (lastUser != null)
+                    {
+                        lastUser.ImagePaths = imagePaths ?? lastUser.ImagePaths;
+                        lastUser.AudioPaths = audioPaths ?? lastUser.AudioPaths;
+                        lastUser.IsVideo |= isVideo;
+                    }
 
                     bool reqThinking = enableThinking ||
                         (root.TryGetProperty("enable_thinking", out var etProp) && etProp.GetBoolean());
@@ -1846,111 +1708,38 @@ namespace TensorSharp.Cli
                         id, reqThinking, LoggingExtensions.SanitizeForLog(rendered, maxLength: 320));
 
                     var inputTokens = model.Tokenizer.Encode(rendered, addSpecial: true);
+                    var sharedPrefix = ComputeSharedPrefix(model, messages, reqThinking);
                     _log.LogDebug(LogEventIds.ChatStarted,
                         "jsonl batch [{RequestId}] inputTokens={TokenCount} first20=[{First20}]",
                         id, inputTokens.Count, string.Join(", ", inputTokens.Take(20)));
 
                     var cfg = sampling ?? SamplingConfig.Greedy;
-                    var sampler = new TokenSampler(cfg);
-                    var generatedTokens = new List<int>();
-                    var sb = new StringBuilder();
-
-                    bool requestHasMedia = (imagePaths != null && imagePaths.Count > 0)
-                                           || (audioPaths != null && audioPaths.Count > 0) || isVideo;
-                    // Assigned back only on success: a request that declines (media,
-                    // say) must not throw away the decoder the next one can reuse.
-                    var requestDecoder = SpeculativeDecodingOptions.TryCreate(
-                        model, specSettings, requestHasMedia, out string specDeclineReason, batchDecoder);
-                    if (requestDecoder != null)
+                    string requestId = $"cli-batch-{Guid.NewGuid():N}";
+                    CliInferenceSession.Result result;
+                    try
                     {
-                        if (!ReferenceEquals(batchDecoder, requestDecoder))
+                        inputTokens = model.MultimodalInjector.ProcessPromptTokens(messages, inputTokens, requestId);
+                        var stopSampler = new TokenSampler(cfg);
+                        var streamed = new List<int>();
+                        result = inference.Generate(inputTokens, maxTokens, cfg, token =>
                         {
-                            _log.LogInformation(LogEventIds.HostConfiguration,
-                                "jsonl batch speculative decoding armed: draft={DraftKind} window={Window} confMin={ConfMin:F2}",
-                                SpeculativeDecodingOptions.DescribeDrafter(requestDecoder),
-                                requestDecoder.MaxDraftTokens, requestDecoder.MinDraftProb);
-                        }
-                        batchDecoder = requestDecoder;
+                            streamed.Add(token);
+                            return cfg.StopSequences == null || cfg.StopSequences.Count == 0
+                                || !stopSampler.CheckStopSequences(model.Tokenizer.Decode(streamed)).shouldStop;
+                        }, requestId: requestId, mediaSpans: model.MultimodalInjector.GetPreparedMediaSpans(requestId),
+                            sharedPrefixTokens: CliSharedPrefix.MatchingLength(sharedPrefix, inputTokens));
                     }
-                    if (requestDecoder == null && specSettings.Requested && specDeclineReason != null
-                        && !specDeclineLogged)
+                    finally
                     {
-                        specDeclineLogged = true;
-                        _log.LogWarning(LogEventIds.HostConfiguration,
-                            "--spec was requested but speculative decoding is not available: {Reason} "
-                            + "Serving standard decode.", specDeclineReason);
+                        model.MultimodalInjector.ClearPreparedPromptState(requestId);
                     }
-
-                    var sw = Stopwatch.StartNew();
-                    double prefillMs;
-
-                    if (requestDecoder != null)
-                    {
-                        // The decoder owns the reset and the drafter-aware prefill;
-                        // every emitted token still comes from a trunk row.
-                        bool KeepGoing(int t)
-                        {
-                            generatedTokens.Add(t);
-                            string soFar = model.Tokenizer.Decode(generatedTokens);
-                            sb.Clear();
-                            sb.Append(soFar);
-                            if (cfg.StopSequences == null || cfg.StopSequences.Count == 0)
-                                return true;
-                            var (trimmed, shouldStop) = sampler.CheckStopSequences(soFar);
-                            if (!shouldStop)
-                                return true;
-                            sb.Clear();
-                            sb.Append(trimmed);
-                            return false;
-                        }
-
-                        int[] promptArray = inputTokens.ToArray();
-                        bool batchArgmax = InteractiveSession.IsArgmaxSampling(cfg);
-                        if (batchArgmax)
-                        {
-                            requestDecoder.GenerateGreedy(promptArray, maxTokens,
-                                t => model.Tokenizer.IsEos(t), KeepGoing);
-                        }
-                        else
-                        {
-                            requestDecoder.GenerateSampled(promptArray, maxTokens, sampler,
-                                t => model.Tokenizer.IsEos(t), KeepGoing);
-                        }
-                        prefillMs = requestDecoder.LastPrefillSeconds * 1000.0;
-                    }
-                    else
-                    {
-                        float[] logits = model.Forward(inputTokens.ToArray());
-                        prefillMs = sw.Elapsed.TotalMilliseconds;
-
-                        for (int step = 0; step < maxTokens; step++)
-                        {
-                            int nextToken = sampler.Sample(logits, generatedTokens);
-                            if (model.Tokenizer.IsEos(nextToken)) break;
-
-                            generatedTokens.Add(nextToken);
-                            string decoded = model.Tokenizer.Decode(generatedTokens);
-                            sb.Clear();
-                            sb.Append(decoded);
-
-                            if (cfg.StopSequences != null)
-                            {
-                                var (trimmed, shouldStop) = sampler.CheckStopSequences(decoded);
-                                if (shouldStop)
-                                {
-                                    sb.Clear();
-                                    sb.Append(trimmed);
-                                    break;
-                                }
-                            }
-
-                            logits = model.Forward(new[] { nextToken });
-                        }
-                    }
-
-                    double totalMs = sw.Elapsed.TotalMilliseconds;
-                    string output = sb.ToString();
-                    double tokPerSec = generatedTokens.Count / (totalMs / 1000.0);
+                    var generatedTokens = result.Tokens;
+                    double prefillMs = result.PrefillMs;
+                    double totalMs = result.TotalMs;
+                    string output = model.Tokenizer.Decode(generatedTokens);
+                    if (cfg.StopSequences != null && cfg.StopSequences.Count > 0)
+                        (output, _) = new TokenSampler(cfg).CheckStopSequences(output);
+                    double tokPerSec = generatedTokens.Count / Math.Max(totalMs / 1000.0, 1e-9);
 
                     _log.LogInformation(LogEventIds.ChatCompleted,
                         "jsonl batch [{RequestId}] tokens={Tokens} tokPerSec={TokensPerSec:F1} totalMs={TotalMs:F1} output={OutputPreview}",
@@ -2332,15 +2121,8 @@ namespace TensorSharp.Cli
         }
 
         /// <summary>
-        /// Run a single-shot turn that may need to read skill content first.
-        ///
-        /// <para>
-        /// Each round is a fresh prefill — the CLI has no continuous-batching engine and
-        /// no prefix cache on this path, so the KV state is reset between rounds and the
-        /// conversation is re-rendered from scratch. That is the honest cost of the
-        /// single-shot path: interactive chat pays it once per turn instead, because
-        /// <see cref="InteractiveSession"/> keeps its cache warm across rounds.
-        /// </para>
+        /// Run skill/tool rounds on one engine, reusing their shared radix prefix and
+        /// splicing assistant token IDs into each subsequent prompt.
         /// </summary>
         static string RunInferenceWithSkills(
             ModelBase model, string rawText, List<string> imagePaths, int maxTokens,
@@ -2348,14 +2130,21 @@ namespace TensorSharp.Cli
             bool enableThinking, List<ToolFunction> tools, bool preserveAllInput,
             int specDraftMax, float specDraftConfMin, string systemPrompt,
             SkillToolContext skillContext, int maxRounds, bool toolResultsRendered,
-            List<ToolFunction> clientTools = null)
+            List<ToolFunction> clientTools = null, CliInferenceSession inference = null)
         {
+            var specSettings = SpeculativeDecodingOptions.Resolve(specDraftMax, specDraftConfMin);
+            using var ownedInference = inference == null
+                ? new CliInferenceSession(model,
+                    SchedulerConfig.FromEnvironment().WithSpeculation(specSettings), _log) : null;
+            inference ??= ownedInference;
             var priorTurns = new List<ChatMessage>();
             string result = string.Empty;
 
             for (int round = 1; round <= Math.Max(1, maxRounds); round++)
             {
                 ParsedOutput parsed = null;
+                List<int> rawTokens = null;
+                string rawTrailingWhitespace = null;
                 result = RunInference(model, rawText, imagePaths, maxTokens, audioPaths,
                     isVideo: isVideo, samplingConfig: samplingConfig,
                     enableThinking: enableThinking, tools: tools,
@@ -2363,7 +2152,8 @@ namespace TensorSharp.Cli
                     specDraftMax: specDraftMax, specDraftConfMin: specDraftConfMin,
                     systemPrompt: systemPrompt,
                     priorTurns: priorTurns.Count > 0 ? priorTurns : null,
-                    onParsed: p => parsed = p);
+                    onParsed: p => parsed = p, inference: inference,
+                    onGenerated: (tokens, whitespace) => { rawTokens = tokens; rawTrailingWhitespace = whitespace; });
 
                 // Three ways, so a name nobody declared is answered here rather than
                 // dropped: returning at this point handed the operator whatever prose
@@ -2382,6 +2172,8 @@ namespace TensorSharp.Cli
                     Content = parsed.Content ?? string.Empty,
                     Thinking = string.IsNullOrEmpty(parsed.Thinking) ? null : parsed.Thinking,
                     ToolCalls = new List<ToolCall>(calls),
+                    RawOutputTokens = rawTokens,
+                    RawPromptTrailingWhitespace = rawTrailingWhitespace,
                 });
 
                 foreach (var call in unknownCalls)
@@ -2412,10 +2204,6 @@ namespace TensorSharp.Cli
                     priorTurns.Add(BuildSkillResultMessage(toolResultsRendered, toolResult.Content, call.Name));
                 }
 
-                // The CLI drives Forward() directly with no engine-owned KV lifecycle, so
-                // the next round must start from a clean cache or its prefill would
-                // continue the previous round's state.
-                model.ResetKVCache();
             }
 
             _log.LogWarning(LogEventIds.SkillLoopCapped,
@@ -2423,14 +2211,12 @@ namespace TensorSharp.Cli
             priorTurns.Add(BuildSkillResultMessage(toolResultsRendered,
                 "Error: the limit on skill lookups for this turn has been reached. Answer now using what you "
                 + "have already read, and say which part you could not check.", null));
-            model.ResetKVCache();
-
             return RunInference(model, rawText, imagePaths, maxTokens, audioPaths,
                 isVideo: isVideo, samplingConfig: samplingConfig,
                 enableThinking: enableThinking, tools: tools,
                 preserveAllInput: preserveAllInput,
                 specDraftMax: specDraftMax, specDraftConfMin: specDraftConfMin,
-                systemPrompt: systemPrompt, priorTurns: priorTurns);
+                systemPrompt: systemPrompt, priorTurns: priorTurns, inference: inference);
         }
 
         /// <summary>
@@ -2468,7 +2254,8 @@ namespace TensorSharp.Cli
             bool enableThinking = false, List<ToolFunction> tools = null, bool silent = false,
             bool preserveAllInput = false, int specDraftMax = 0, float specDraftConfMin = -1f,
             string systemPrompt = null, List<ChatMessage> priorTurns = null,
-            Action<ParsedOutput> onParsed = null)
+            Action<ParsedOutput> onParsed = null, CliInferenceSession inference = null,
+            Action<List<int>, string> onGenerated = null)
         {
             var messages = new List<ChatMessage>();
             if (!string.IsNullOrWhiteSpace(systemPrompt))
@@ -2477,438 +2264,99 @@ namespace TensorSharp.Cli
             if (priorTurns != null)
                 messages.AddRange(priorTurns);
 
-            string rendered = PromptRenderer.Render(
-                model.Config.ChatTemplate, messages, addGenerationPrompt: true,
-                architecture: model.Config.Architecture,
+            var inputTokens = new KVCachePromptRenderer(PromptRenderer).RenderToTokens(
+                model.Tokenizer, model.Config.ChatTemplate, messages, model.Config.Architecture,
+                addGenerationPrompt: true, out _, out string trailingWhitespace,
                 tools: tools, enableThinking: enableThinking);
-
+            var sharedPrefix = ComputeSharedPrefix(model, messages, enableThinking, tools);
             _log.LogDebug(LogEventIds.ChatStarted,
-                "cli.inference rendered prompt chars={Chars} preview={Preview}",
-                rendered.Length, LoggingExtensions.SanitizeForLog(rendered, maxLength: 480));
+                "cli.inference prompt tokens={Tokens}", inputTokens.Count);
 
-            var inputTokens = model.Tokenizer.Encode(rendered, addSpecial: true);
-
-            if ((imagePaths != null && imagePaths.Count > 0) ||
-                (audioPaths != null && audioPaths.Count > 0))
+            string requestId = $"cli-inference-{Guid.NewGuid():N}";
+            var settings = SpeculativeDecodingOptions.Resolve(specDraftMax, specDraftConfMin);
+            using var ownedInference = inference == null
+                ? new CliInferenceSession(model, SchedulerConfig.FromEnvironment().WithSpeculation(settings), _log)
+                : null;
+            inference ??= ownedInference;
+            try
             {
-                // ONE multimodal path, shared with the server and the batching engine:
-                // the injector owns placeholder expansion, encoder caching and the
-                // embedding hand-off, and asks each architecture for its own prompt
-                // format through IMultimodalPromptExpander.
-                //
-                // The CLI used to carry a second, per-architecture copy of all of that -
-                // ~600 lines that had drifted from the injector (one path only ever
-                // encoded imagePaths[0]; Gemma 4 audio re-derived its own mel path) and
-                // that every new vision model had to be added to twice. qwen4exp and
-                // glm-dsa already routed through the injector; the rest now do too.
-                bool wantsVision = imagePaths != null && imagePaths.Count > 0;
-                bool wantsAudio = audioPaths != null && audioPaths.Count > 0;
-
-                if (wantsVision && !model.HasVisionEncoder())
-                {
+                if (imagePaths is { Count: > 0 } && !model.HasVisionEncoder())
                     _log.LogWarning(LogEventIds.HostConfiguration,
                         "No vision encoder loaded. Use --mmproj to specify the vision encoder GGUF.");
-                }
-                if (wantsAudio && model is not IAudioCapableModel)
+                if (audioPaths is { Count: > 0 } && model is not IAudioCapableModel)
+                    _log.LogWarning(LogEventIds.HostConfiguration, "This model has no audio path; the audio input will be ignored.");
+                inputTokens = model.MultimodalInjector.ProcessPromptTokens(messages, inputTokens, requestId);
+                if (preserveAllInput && model.MaxContextLength > 0
+                    && (long)inputTokens.Count + maxTokens > model.MaxContextLength)
+                    throw new InvalidOperationException(
+                        $"The complete PDF requires {inputTokens.Count} prompt tokens plus a " +
+                        $"{maxTokens}-token generation reserve, but the loaded model supports " +
+                        $"{model.MaxContextLength} context tokens. No document content was truncated. " +
+                        "Reduce --max-tokens, use a shorter PDF, or choose a model with a larger context window.");
+
+                var cfg = samplingConfig ?? SamplingConfig.Greedy;
+                var sampler = new TokenSampler(cfg);
+                var streamed = new List<int>();
+                string trimmedAtStop = null;
+                bool Emit(int token)
                 {
-                    _log.LogWarning(LogEventIds.HostConfiguration,
-                        "This model has no audio path; the audio input will be ignored.");
+                    streamed.Add(token);
+                    if (cfg.StopSequences == null || cfg.StopSequences.Count == 0)
+                        return true;
+                    var (trimmed, shouldStop) = sampler.CheckStopSequences(model.Tokenizer.Decode(streamed));
+                    if (shouldStop)
+                        trimmedAtStop = trimmed;
+                    return !shouldStop;
                 }
-
-                int tokensBefore = inputTokens.Count;
-                inputTokens = model.MultimodalInjector.ProcessPromptTokens(messages, inputTokens);
-                model.MultimodalInjector.QueuePromptEmbeddingsForSlice(0, inputTokens.Count);
-
-                if (inputTokens.Count != tokensBefore)
+                var result = inference.Generate(inputTokens, maxTokens, cfg, Emit,
+                    requestId: requestId, mediaSpans: model.MultimodalInjector.GetPreparedMediaSpans(requestId),
+                    sharedPrefixTokens: CliSharedPrefix.MatchingLength(sharedPrefix, inputTokens));
+                onGenerated?.Invoke(result.Tokens, trailingWhitespace);
+                if (!silent)
                 {
-                    _log.LogInformation(LogEventIds.HostConfiguration,
-                        "Multimodal prompt expanded {Before} -> {After} tokens for {Images} image(s), {Audios} audio clip(s)",
-                        tokensBefore, inputTokens.Count, imagePaths?.Count ?? 0, audioPaths?.Count ?? 0);
+                    _log.LogInformation(LogEventIds.CliBenchmark,
+                        "cli.inference prefill complete: tokens={Tokens} ms={Ms:F1} radixReused={ReusedTokens}",
+                        inputTokens.Count, result.PrefillMs, result.Completion.PrefixCacheReusedTokens);
+                    _log.LogInformation(LogEventIds.CliBenchmark,
+                        "cli.inference decode complete: tokens={Tokens} ms={Ms:F1} tokensPerSec={Tps:F1}",
+                        result.Tokens.Count, result.DecodeMs, result.Tokens.Count / Math.Max(result.DecodeMs / 1000.0, 1e-9));
+                    _log.LogInformation(LogEventIds.ChatCompleted,
+                        "cli.inference finishReason={FinishReason} tokens={Tokens}",
+                        trimmedAtStop != null ? "stop_sequence" : result.Completion.FinishReason, result.Tokens.Count);
+                    model.PrintTimingStats();
                 }
-                else
-                {
-                    _log.LogWarning(LogEventIds.HostConfiguration,
-                        "Multimodal input was supplied but the prompt did not expand - the rendered prompt " +
-                        "may carry no media placeholder for this architecture.");
-                }
-            }
-
-            _log.LogInformation(LogEventIds.ChatStarted,
-                "cli.inference inputTokens={InputTokens} preview=[{First30}{TruncationSuffix}]",
-                inputTokens.Count,
-                string.Join(", ", inputTokens.Take(30)),
-                inputTokens.Count > 30 ? $"... ({inputTokens.Count} total)" : string.Empty);
-
-            int modelContextLimit = model.MaxContextLength;
-            if (preserveAllInput && modelContextLimit > 0 &&
-                (long)inputTokens.Count + maxTokens > modelContextLimit)
-            {
-                throw new InvalidOperationException(
-                    $"The complete PDF requires {inputTokens.Count} prompt tokens plus a " +
-                    $"{maxTokens}-token generation reserve, but the loaded model supports " +
-                    $"{modelContextLimit} context tokens. No document content was truncated. " +
-                    "Reduce --max-tokens, use a shorter PDF, or choose a model with a larger context window.");
-            }
-
-            // Speculative decoding: a draft head proposes tokens and the trunk
-            // verifies them in one batched forward. Either a block drafter
-            // (DeepSeek V4 + DSpark, Muse-Glimmer + DFlash) or a per-token NextN/MTP
-            // head under --spec (GLM-5.2, Qwen 3.6). Every emitted token still
-            // comes from a trunk row, so this is a speed path only.
-            {
-                var specCfg = samplingConfig ?? SamplingConfig.Greedy;
-                var specSettings = SpeculativeDecodingOptions.Resolve(specDraftMax, specDraftConfMin);
-                var specDecoder = SpeculativeDecodingOptions.TryCreate(
-                    model, specSettings,
-                    // The single-shot path renders one message; media reaches the
-                    // model through the injector, which the speculative prefill
-                    // cannot drive.
-                    hasMediaAttachments: (imagePaths != null && imagePaths.Count > 0)
-                                         || (audioPaths != null && audioPaths.Count > 0)
-                                         || isVideo,
-                    out string specDeclineReason);
-
-                if (specDecoder != null)
-                {
-                    return RunSpeculativeInference(model, (ISpeculativeTarget)model, specDecoder,
-                        inputTokens, maxTokens, specCfg, enableThinking, tools, silent, onParsed);
-                }
-                if (specSettings.Requested && specDeclineReason != null && !silent)
-                {
-                    _log.LogWarning(LogEventIds.HostConfiguration,
-                        "--spec was requested but speculative decoding is not available: {Reason} "
-                        + "Serving standard decode.", specDeclineReason);
-                }
-            }
-
-            model.ResetKVCache();
-
-            var prefillSw = Stopwatch.StartNew();
-            float[] logits = model.Forward(inputTokens.ToArray());
-            prefillSw.Stop();
-            double prefillMs = prefillSw.Elapsed.TotalMilliseconds;
-            double prefillTps = inputTokens.Count > 0 && prefillMs > 0
-                ? inputTokens.Count / (prefillMs / 1000.0)
-                : 0.0;
-            if (!silent)
-            {
-                _log.LogInformation(LogEventIds.CliBenchmark,
-                    "cli.inference prefill complete: tokens={Tokens} ms={Ms:F1} tokensPerSec={Tps:F1}",
-                    inputTokens.Count, prefillMs, prefillTps);
-            }
-            var generatedTokens = new List<int>();
-
-            LogTopLogits(logits, model, "prefill");
-
-            var cfg = samplingConfig ?? SamplingConfig.Greedy;
-            var sampler = new TokenSampler(cfg);
-
-            if (!cfg.IsGreedy)
-            {
-                _log.LogInformation(LogEventIds.HostConfiguration,
-                    "Sampling config: temperature={Temperature} topK={TopK} topP={TopP} minP={MinP} repPen={RepPenalty} presPen={PresPenalty} freqPen={FreqPenalty} seed={Seed}",
-                    cfg.Temperature, cfg.TopK, cfg.TopP, cfg.MinP, cfg.RepetitionPenalty,
-                    cfg.PresencePenalty, cfg.FrequencyPenalty, cfg.Seed);
-            }
-
-            var parser = CliOutputParser.Create(model.Config.Architecture, enableThinking, tools,
-                model.Tokenizer, inputTokens);
-            bool useParser = enableThinking || (tools != null && tools.Count > 0) || parser.AlwaysRequired;
-            bool showThinking = enableThinking || parser.AlwaysRequired;
-            if (useParser)
-            {
-                _log.LogInformation(LogEventIds.HostConfiguration,
-                    "Output parser={Parser} thinking={Thinking} tools={ToolCount}",
-                    parser.GetType().Name, enableThinking, tools?.Count ?? 0);
-            }
-
-            string finishReason = "max_tokens";
-            var decodeSw = Stopwatch.StartNew();
-
-            // Pipelined greedy decode: when the model supports a device-side
-            // argmax + embedding lookup, queue forward N+1 BEFORE syncing
-            // forward N's predicted token. This overlaps the LM-head host
-            // sync wait with the next forward's first kernels.
-            // Used when:
-            //   - greedy sampling (no top-K / temperature)
-            //   - no stop sequences (the pipeline issues one extra forward
-            //     that we'd waste on a mid-stream stop)
-            //   - model.SupportsPipelinedGreedy
-            // Default ON; opt-out with TS_MLX_PIPELINED_DECODE=0.
-            string pipelinedEnv = Environment.GetEnvironmentVariable("TS_MLX_PIPELINED_DECODE");
-            bool pipelinedDecodeEnabled =
-                !string.Equals(pipelinedEnv, "0", StringComparison.Ordinal)
-                && !string.Equals(pipelinedEnv, "false", StringComparison.OrdinalIgnoreCase);
-            bool pipelinedGreedy = IsArgmaxDecode(cfg)
-                && (cfg.StopSequences == null || cfg.StopSequences.Count == 0)
-                && model.SupportsPipelinedGreedy
-                && pipelinedDecodeEnabled;
-
-            if (pipelinedGreedy)
-            {
-                _log.LogInformation(LogEventIds.HostConfiguration,
-                    "cli.inference using pipelined greedy decode (TS_MLX_PIPELINED_DECODE=1)");
-
-                // Bootstrap: sample the FIRST decode token from prefill logits.
-                int firstToken = sampler.Sample(logits, generatedTokens);
-                if (model.Tokenizer.IsEos(firstToken))
-                {
-                    finishReason = "eos";
-                }
-                else
-                {
-                    generatedTokens.Add(firstToken);
-
-                    // Submit decode step that will predict the SECOND decode
-                    // token. Returns a [1] int32 device tensor we'll sync later.
-                    Tensor pending = model.SubmitGreedyDecodeStep(firstToken);
-
-                    int step = 1;
-                    for (; step < maxTokens; step++)
-                    {
-                        // Issue the NEXT forward (using cached device embedding).
-                        // Its argmax + next-embedding queueing runs on GPU while
-                        // we host-wait on `pending` below.
-                        Tensor next = model.SubmitGreedyDecodeStep(null);
-
-                        // Sync the previously submitted prediction.
-                        int tok = pending.GetElementsAsInt(1)[0];
-                        pending.Dispose();
-                        pending = next;
-
-                        if (model.Tokenizer.IsEos(tok))
-                        {
-                            pending.Dispose();
-                            pending = null;
-                            finishReason = "eos";
-                            break;
-                        }
-                        generatedTokens.Add(tok);
-                    }
-
-                    if (pending != null)
-                    {
-                        // Drain the last queued forward; if non-EOS and we still
-                        // have room, emit it as the final token. "Room" is
-                        // step < maxTokens: on a normal loop exit step ==
-                        // maxTokens and generatedTokens already HOLDS maxTokens
-                        // entries (the bootstrap token plus maxTokens-1 loop
-                        // tokens), so the old `step <= maxTokens` emitted one
-                        // token past the caller's budget — which also made a
-                        // pipelined-vs-legacy output diff look like a decode
-                        // divergence when it was only an extra trailing token.
-                        int tok = pending.GetElementsAsInt(1)[0];
-                        pending.Dispose();
-                        if (step < maxTokens && !model.Tokenizer.IsEos(tok))
-                        {
-                            generatedTokens.Add(tok);
-                        }
-                        else if (model.Tokenizer.IsEos(tok))
-                        {
-                            finishReason = "eos";
-                        }
-                    }
-                    model.ResetPipelinedGreedyState();
-                }
-            }
-            else
-            {
-                for (int step = 0; step < maxTokens; step++)
-                {
-                    int nextToken = sampler.Sample(logits, generatedTokens);
-                    _log.LogTrace(LogEventIds.GenerationProgress,
-                        "step={Step} token={TokenId} text={TokenText}",
-                        step, nextToken, model.Tokenizer.Vocab[nextToken]);
-
-                    if (model.Tokenizer.IsEos(nextToken))
-                    {
-                        finishReason = "eos";
-                        break;
-                    }
-
-                    generatedTokens.Add(nextToken);
-
-                    if (cfg.StopSequences != null && cfg.StopSequences.Count > 0)
-                    {
-                        string partial = model.Tokenizer.Decode(generatedTokens);
-                        var (trimmed, shouldStop) = sampler.CheckStopSequences(partial);
-                        if (shouldStop)
-                        {
-                            decodeSw.Stop();
-                            double sdMs = decodeSw.Elapsed.TotalMilliseconds;
-                            double sdTps = generatedTokens.Count > 0 && sdMs > 0
-                                ? generatedTokens.Count / (sdMs / 1000.0)
-                                : 0.0;
-                            if (!silent)
-                            {
-                                _log.LogInformation(LogEventIds.CliBenchmark,
-                                    "cli.inference decode complete: tokens={Tokens} ms={Ms:F1} tokensPerSec={Tps:F1}",
-                                    generatedTokens.Count, sdMs, sdTps);
-                            }
-                            finishReason = "stop_sequence";
-                            _log.LogInformation(LogEventIds.ChatCompleted,
-                                "cli.inference finishReason={FinishReason} tokens={Tokens}",
-                                finishReason, generatedTokens.Count);
-                            if (useParser)
-                            {
-                                var finalParsed = parser.Add(trimmed, true);
-                                onParsed?.Invoke(finalParsed);
-                                return FormatParsedResult(finalParsed, showThinking);
-                            }
-                            return trimmed;
-                        }
-                    }
-
-                    logits = model.Forward(new[] { nextToken });
-                    if (step < 3)
-                        LogTopLogits(logits, model, $"decode_{step}");
-                }
-            }
-            decodeSw.Stop();
-            double decodeMs = decodeSw.Elapsed.TotalMilliseconds;
-            double decodeTps = generatedTokens.Count > 0 && decodeMs > 0
-                ? generatedTokens.Count / (decodeMs / 1000.0)
-                : 0.0;
-            if (!silent)
-            {
-                _log.LogInformation(LogEventIds.CliBenchmark,
-                    "cli.inference decode complete: tokens={Tokens} ms={Ms:F1} tokensPerSec={Tps:F1}",
-                    generatedTokens.Count, decodeMs, decodeTps);
-
-                _log.LogInformation(LogEventIds.ChatCompleted,
-                    "cli.inference finishReason={FinishReason} tokens={Tokens}",
-                    finishReason, generatedTokens.Count);
-                model.PrintTimingStats();
-            }
-            string decoded = model.Tokenizer.Decode(generatedTokens);
-
-            if (useParser)
-            {
-                var parsed = parser.Add(decoded, true);
+                string decoded = trimmedAtStop ?? model.Tokenizer.Decode(result.Tokens);
+                var parser = CliOutputParser.Create(model.Config.Architecture, enableThinking, tools,
+                    model.Tokenizer, inputTokens);
+                bool useParser = enableThinking || (tools != null && tools.Count > 0) || parser.AlwaysRequired;
+                var parsed = useParser ? parser.Add(decoded, true) : new ParsedOutput { Content = decoded };
                 onParsed?.Invoke(parsed);
-                return FormatParsedResult(parsed, showThinking);
+                return useParser ? FormatParsedResult(parsed, enableThinking || parser.AlwaysRequired) : decoded;
             }
-            onParsed?.Invoke(new ParsedOutput { Content = decoded });
-            return decoded;
+            finally
+            {
+                model.MultimodalInjector.ClearPreparedPromptState(requestId);
+            }
         }
 
-        /// <summary>
-        /// Single-shot generation through the shared speculative core: prompt
-        /// prefill runs the drafter-aware path so the draft head's cache covers the
-        /// prompt, then every step drafts (a block for DSpark/DFlash, a chained
-        /// window for a per-token NextN/MTP head) and verifies it with one batched
-        /// trunk forward. Every emitted token is drawn from a trunk row — with
-        /// argmax under a greedy config, with <paramref name="sampling"/> otherwise
-        /// — so speculation only changes how many forwards it took to get there.
-        /// </summary>
-        static string RunSpeculativeInference(ModelBase model, ISpeculativeTarget spec,
-            SpeculativeDecoder decoder, List<int> inputTokens, int maxTokens,
-            SamplingConfig sampling, bool enableThinking, List<ToolFunction> tools, bool silent,
-            Action<ParsedOutput> onParsed = null)
+        private static List<int> ComputeSharedPrefix(ModelBase model, IReadOnlyList<ChatMessage> messages,
+            bool enableThinking, List<ToolFunction> tools = null)
         {
-            var parser = CliOutputParser.Create(model.Config.Architecture, enableThinking, tools,
-                model.Tokenizer, inputTokens);
-            bool useParser = enableThinking || (tools != null && tools.Count > 0) || parser.AlwaysRequired;
-            bool showThinking = enableThinking || parser.AlwaysRequired;
-
-            bool argmax = InteractiveSession.IsArgmaxSampling(sampling);
-            if (!silent)
+            string system = messages.Count > 0 && messages[0].Role == "system" ? messages[0].Content : null;
+            try
             {
-                _log.LogInformation(LogEventIds.HostConfiguration,
-                    "cli.inference speculative decoding armed: draft={DraftKind} window={Window} confMin={ConfMin:F2} verify={VerifyMode}",
-                    SpeculativeDecodingOptions.DescribeDrafter(decoder), decoder.MaxDraftTokens,
-                    decoder.MinDraftProb, argmax ? "argmax" : "sampled");
+                return CliSharedPrefix.Compute(system, tools is { Count: > 0 }, (probe, generationPrompt) =>
+                    model.Tokenizer.Encode(PromptRenderer.Render(model.Config.ChatTemplate,
+                        new List<ChatMessage>(probe), addGenerationPrompt: generationPrompt,
+                        architecture: model.Config.Architecture, tools: tools, enableThinking: enableThinking),
+                        addSpecial: true));
             }
-
-            // --stop has to work here exactly as it does on the plain path: it is a
-            // sampler-level stop, not an EOS, so the decoder only sees it through
-            // this callback — and a speculative window can put several tokens past
-            // the marker into the result before the check runs, which is why the
-            // TRIMMED text is what gets returned rather than the token stream.
-            var sampler = new TokenSampler(sampling);
-            bool hasStopSequences = sampling?.StopSequences != null && sampling.StopSequences.Count > 0;
-            var emitted = new List<int>();
-            string trimmedAtStop = null;
-
-            bool OnToken(int t)
+            catch (Exception ex)
             {
-                emitted.Add(t);
-                if (!hasStopSequences)
-                    return true;
-                var (trimmed, shouldStop) = sampler.CheckStopSequences(model.Tokenizer.Decode(emitted));
-                if (!shouldStop)
-                    return true;
-                trimmedAtStop = trimmed;
-                return false;
+                _log.LogDebug(LogEventIds.KvCacheReusePlan, ex,
+                    "Could not establish a shared system prefix; keeping this request private");
+                return new List<int>();
             }
-
-            int[] prompt = inputTokens.ToArray();
-            var generated = argmax
-                ? decoder.GenerateGreedy(prompt, maxTokens, t => model.Tokenizer.IsEos(t), OnToken)
-                : decoder.GenerateSampled(prompt, maxTokens, sampler,
-                    t => model.Tokenizer.IsEos(t), OnToken);
-
-            bool hitEos = generated.Count > 0 && model.Tokenizer.IsEos(generated[generated.Count - 1]);
-            if (hitEos)
-                generated.RemoveAt(generated.Count - 1);
-
-            if (!silent)
-            {
-                double prefillMs = decoder.LastPrefillSeconds * 1000.0;
-                double decodeMs = decoder.LastDecodeSeconds * 1000.0;
-                _log.LogInformation(LogEventIds.CliBenchmark,
-                    "cli.inference prefill complete: tokens={Tokens} ms={Ms:F1} tokensPerSec={Tps:F1}",
-                    inputTokens.Count, prefillMs,
-                    prefillMs > 0 ? inputTokens.Count / (prefillMs / 1000.0) : 0.0);
-                _log.LogInformation(LogEventIds.CliBenchmark,
-                    "cli.inference decode complete: tokens={Tokens} ms={Ms:F1} tokensPerSec={Tps:F1}",
-                    generated.Count, decodeMs,
-                    decodeMs > 0 ? generated.Count / (decodeMs / 1000.0) : 0.0);
-                _log.LogInformation(LogEventIds.CliBenchmark,
-                    "cli.inference speculative: draft={DraftKind} window={Window} confMin={ConfMin:F2} verify={VerifyMode} " +
-                    "drafted={Drafted} accepted={Accepted} " +
-                    "acceptanceRate={Rate:F3} verifySteps={VerifySteps} plainSteps={Plain} rollbacks={Rollbacks} " +
-                    "parked={Parked} plainMsPerTok={PlainMs:F1} specMsPerTok={SpecMs:F1}",
-                    SpeculativeDecodingOptions.DescribeDrafter(decoder), decoder.MaxDraftTokens,
-                    decoder.MinDraftProb, argmax ? "argmax" : "sampled",
-                    decoder.TokensDrafted, decoder.TokensAccepted,
-                    decoder.AcceptanceRate, decoder.VerifySteps, decoder.PlainSteps, decoder.RollbackSteps,
-                    decoder.ParkedSteps, decoder.PlainMsPerToken, decoder.SpecMsPerToken);
-                // Where a speculative step actually goes. Cheap (one timestamp per
-                // phase per step) and the only way to tell a slow DRAFTER from a slow
-                // verify or an expensive rollback without a profiler.
-                _log.LogInformation(LogEventIds.CliBenchmark,
-                    "cli.inference speculative timing: draftMs={DraftMs:F0} verifyMs={VerifyMs:F0} "
-                    + "snapshotMs={SnapMs:F0} rollbackMs={RollMs:F0} catchUpMs={CatchMs:F0} plainMs={PlainMs:F0}",
-                    decoder.Stats.DraftMs, decoder.Stats.VerifyMs, decoder.Stats.SnapshotMs,
-                    decoder.Stats.RollbackMs, decoder.Stats.CatchUpMs, decoder.Stats.PlainMs);
-                _log.LogInformation(LogEventIds.ChatCompleted,
-                    "cli.inference finishReason={FinishReason} tokens={Tokens}",
-                    trimmedAtStop != null ? "stop_sequence" : hitEos ? "eos" : "max_tokens",
-                    generated.Count);
-            }
-
-            if (trimmedAtStop != null)
-            {
-                if (useParser)
-                {
-                    var stopParsed = parser.Add(trimmedAtStop, true);
-                    onParsed?.Invoke(stopParsed);
-                    return FormatParsedResult(stopParsed, showThinking);
-                }
-                onParsed?.Invoke(new ParsedOutput { Content = trimmedAtStop });
-                return trimmedAtStop;
-            }
-
-            string decoded = model.Tokenizer.Decode(generated);
-            if (useParser)
-            {
-                var finalParsed = parser.Add(decoded, true);
-                onParsed?.Invoke(finalParsed);
-                return FormatParsedResult(finalParsed, showThinking);
-            }
-            onParsed?.Invoke(new ParsedOutput { Content = decoded });
-            return decoded;
         }
 
         // Per-turn upload manifest used by cli.inference.start. Each entry records
@@ -2993,23 +2441,9 @@ namespace TensorSharp.Cli
             return sb.ToString();
         }
 
-        static void LogTopLogits(float[] logits, ModelBase model, string label)
-        {
-            if (!_log.IsEnabled(LogLevel.Debug))
-                return;
-
-            var indexed = logits.Select((v, i) => (v, i)).OrderByDescending(x => x.v).Take(10).ToArray();
-            var sb = new StringBuilder();
-            foreach (var (v, i) in indexed)
-                sb.Append($"{i}({model.Tokenizer.Vocab[i]})={v:F4} ");
-            _log.LogDebug(LogEventIds.GenerationProgress,
-                "topLogits[{Label}] {TopList}", label, sb.ToString().TrimEnd());
-        }
-
         static void RunTests(ModelBase model, int maxTokens, string outputFile)
         {
             _log.LogInformation(LogEventIds.CliBenchmark, "Running verification tests");
-
             TestTokenizer(model);
             TestChatTemplate();
             TestInferenceWithOllamaComparison(model, maxTokens, outputFile);
@@ -3529,8 +2963,7 @@ namespace TensorSharp.Cli
                 "benchmark pass: kvCache={KvCacheEnabled}",
                 useCache ? "enabled" : "disabled");
 
-            model.ResetKVCache();
-            var kvCache = new KVCache();
+            using var inference = new CliInferenceSession(model, SchedulerConfig.FromEnvironment(), _log);
             var renderer = new KVCachePromptRenderer(PromptRenderer);
 
             var history = new List<ChatMessage>();
@@ -3555,42 +2988,20 @@ namespace TensorSharp.Cli
                 promptTokens[turn] = inputTokens.Count;
 
                 if (!useCache)
-                {
-                    model.ResetKVCache();
-                    kvCache.Reset();
-                }
-
-                var sw = Stopwatch.StartNew();
-                ReusePlan plan = kvCache.PlanReuse(inputTokens, model.SupportsKVCacheTruncation,
-                    model.KVCacheTruncationGranularity);
-                float[] logits = ApplyReusePlan(model, kvCache, plan, inputTokens, out ReusePlanKind appliedPlan);
-                prefillMs[turn] = sw.Elapsed.TotalMilliseconds;
-
-                // Generate the assistant response so the cached path has realistic raw
-                // tokens to splice in for subsequent turns. We use greedy sampling for
-                // determinism / reproducibility.
-                var sampler = new TokenSampler(samplerCfg);
-                var generatedTokens = new List<int>();
-                var sb = new StringBuilder();
-
-                for (int step = 0; step < maxTokens; step++)
-                {
-                    int nextToken = sampler.Sample(logits, generatedTokens);
-                    if (model.Tokenizer.IsEos(nextToken)) break;
-                    generatedTokens.Add(nextToken);
-                    sb.Append(model.Tokenizer.Decode(new List<int> { nextToken }));
-                    logits = model.Forward(new[] { nextToken });
-                    kvCache.RecordAppend(nextToken, logits);
-                }
+                    inference.Reset();
+                var result = inference.Generate(inputTokens, maxTokens, samplerCfg, enablePrefixCache: useCache);
+                prefillMs[turn] = result.PrefillMs;
+                var generatedTokens = result.Tokens;
 
                 _log.LogInformation(LogEventIds.CliBenchmark,
-                    "benchmark turn {Turn}: promptTokens={PromptTokens} prefillMs={PrefillMs:F1} decodeTokens={DecodeTokens} plan={Plan}",
-                    turn + 1, inputTokens.Count, prefillMs[turn], generatedTokens.Count, appliedPlan);
+                    "benchmark turn {Turn}: promptTokens={PromptTokens} prefillMs={PrefillMs:F1} decodeTokens={DecodeTokens} radixReused={ReusedTokens}",
+                    turn + 1, inputTokens.Count, prefillMs[turn], generatedTokens.Count,
+                    result.Completion.PrefixCacheReusedTokens);
 
                 // Append the assistant turn so subsequent renders include it.
                 var parser = CliOutputParser.Create(arch, enableThinking, null,
                     model.Tokenizer, inputTokens);
-                var parsed = parser.Add(sb.ToString(), true);
+                var parsed = parser.Add(model.Tokenizer.Decode(generatedTokens), true);
                 history.Add(new ChatMessage
                 {
                     Role = "assistant",

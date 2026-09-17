@@ -156,8 +156,8 @@ namespace TensorSharp.Server.Hosting
             if (!options.PrefixCacheEnabled)
             {
                 logger.LogInformation(LogEventIds.HostConfiguration,
-                    "Prefix cache disabled (--no-prefix-cache): the first message of this process "
-                    + "will prefill the whole shared prompt, and nothing is kept between launches.");
+                    "Prefix cache disabled (--no-prefix-cache): runtime reuse, startup warmup, "
+                    + "and disk persistence are off.");
                 return;
             }
 
@@ -171,7 +171,7 @@ namespace TensorSharp.Server.Hosting
                 var store = new PrefixCheckpointFileStore(options.PrefixCacheDirectory, identity, logger);
                 modelService.EngineHost.PrefixCheckpointStore = store;
                 logger.LogInformation(LogEventIds.HostConfiguration,
-                    "Prefix cache: keeping shared-prefix checkpoints in {Directory} ({Bytes} bytes already there). "
+                    "Prefix cache persistence: keeping shared-prefix checkpoints in {Directory} ({Bytes} bytes already there). "
                     + "Turn it off with --no-prefix-cache; move it with TENSORSHARP_PREFIX_CACHE_DIR.",
                     store.Directory, store.TotalBytes());
             }

@@ -289,7 +289,7 @@ quietly. Measured on gemma-4-26B-A4B (`--cpu-moe`, peak VRAM): `ggml_cuda`
 15244 → 5756 MiB; `cuda` 14261 → 14253 MiB (no-op, warns).
 | `--kv-cache-dtype <type>` | KV cache precision: `f32`, `f16`, `q8_0`, or `q4_0` (default: auto — the backend/model pick; env `KV_CACHE_DTYPE`). Half-precision / quantized KV caches reduce memory at the cost of small numerical drift; `q4_0` (~0.56 bytes/elem, ~1/7 of f32) is the most aggressive tier for very long (128K–256K) contexts where the KV cache dominates memory. Block-quantized caches (`q8_0`/`q4_0`) require the native GGML flash path; DeepSeek V4 / V4.1 refuse them at load (their executors keep F16 caches read by their own kernels) and report `f16` for an explicit `f32`. |
 | `--interactive` / `-i` / `--chat` | Start an interactive REPL chat session (turn-by-turn input/output) with KV cache reuse, slash commands, hot-swappable model/backend/projector, file attachments (image, audio, video, text) and live sampling tuning. See the **Interactive REPL commands** section below for the full list. |
-| `--no-prefix-cache` | Do not forward the shared part of the prompt before the first message. By default an interactive chat forwards its system block, tool declarations and skill catalog at startup so the first message continues from them instead of prefilling them (measured 18.5s → 0.3s on an agent configuration); the price is that the session takes that long to become ready. Unrelated to `--warmup-runs` |
+| `--no-prefix-cache` | Disable runtime prefix reuse and interactive system/tool prompt warmup. Radix caching is enabled by default for normal CLI generation, including interactive, JSONL, and skill/tool requests. Unrelated to `--warmup-runs`, which warms compute kernels. |
 | `--system <text>` | System prompt to seed the interactive session (overridden inside the REPL by `/system`) |
 | `--system-file <path>` | Read the initial system prompt from a UTF-8 text file (alternative to `--system`) |
 | `--think` | Enable thinking/reasoning mode (chain-of-thought). Opt-in on every family, GLM 5.x included: without it the GLM template closes the reasoning block immediately (`<think></think>`) so the model answers directly, and with it the prompt carries `Reasoning Effort: Max` and leaves the block open for the model to close. `/think on\|off` toggles it inside the REPL. |
@@ -687,7 +687,7 @@ of quietly losing a setting.
 | `--kv-cache-dtype <type>` | KV cache precision for the hosted model: `f32`, `f16`, `q8_0`, or `q4_0` (quantized caches trade small numerical drift for memory; see the CLI table above for the tier trade-offs). Default: auto — the backend/model pick. Env: `KV_CACHE_DTYPE`. |
 | `--continuous-batching` / `--no-continuous-batching` | Enable (default) or disable iteration-level paged-batching. When enabled the server admits / preempts sequences mid-batch and packs them into one forward pass on models that implement `IBatchedPagedModel`. `--no-continuous-batching` falls back to per-sequence KV-swap for every model. Alias: `--paged-batching` / `--no-paged-batching`. |
 | `--no-webui` | Do not serve the bundled web UI; `GET /` answers the plain liveness text instead. Every HTTP API endpoint, `/uploads` included, stays up. Env: `TS_NO_WEBUI` |
-| `--no-prefix-cache` | Do not prepare the prompt every conversation shares before serving, and do not keep it between launches. By default the server forwards that prompt once at startup and saves the result, so the first message of a process costs the same as any other (measured 21.8s → 0.7s on an agent configuration) |
+| `--no-prefix-cache` | Disable runtime radix prefix reuse, startup shared-prompt warmup, and persistence between launches. Caching is enabled by default; the server warms and saves the shared prompt so later launches can restore it. |
 | `--prefill-chunk-size <N>` | Maximum prefill tokens per request in a mixed prefill+decode step, so active streams get frequent GPU turns (default: `256`). Prefill-only batches still divide and consume the full device token budget. Env: `TS_SCHED_PREFILL_CHUNK`. |
 | `--spec` / `--no-spec` | Enable speculative decoding (default off). `--spec` is the explicit opt-in for drafters embedded in the trunk checkpoint (Qwen 3.6's, GLM 5.2's and GLM-5.3's NextN blocks), because loading them pages extra weights into VRAM; a drafter that ships as its own GGUF is enabled by `--draft-model` alone, and an explicit `--no-spec` vetoes either. Engages for solo (non-concurrent) sequences: the draft head proposes up to `--spec-draft` tokens per step and the trunk verifies them in one batched forward, with the request's own sampler (penalties included) driving both drafting and verification, so output matches standard decode up to floating-point near-ties between the verify and decode kernels ([what greedy parity delivers](docs/speculative_decoding.md#what-greedy-parity-delivers)). Engaged automatically only where profitable: Qwen 3.6 reports its embedded NextN block profitable on every backend, while Gemma 4's separate draft head engages on the ggml backends and on the direct `cuda` backend only. CPU / GGML CPU / MLX serve standard decode. GLM-5.3-Flash (`glm5next`) builds no draft head (its NextN block is not implemented), so `--spec` alone serves standard decode there; `--spec --spec-type ngram` engages the weight-free n-gram drafter, with the KDA recurrent state snapshotted before every verify and restored on a partial rejection (default window 3; see the [GLM card](docs/models/glm.md#speculative-decoding-on-glm-53-flash)). Env: `TS_SPEC` (legacy `TS_MTP_SPEC`). |
 | `--spec-type <name>` | Speculation algorithm: `auto` (default) / `draft-head` / `block` / `ngram`. `ngram` needs no trained weights and works on every model — it drafts by finding where the last few tokens occurred earlier in the context and proposing what followed, so it is strong wherever the answer quotes its input. Env: `TS_SPEC_TYPE`. |
@@ -1766,12 +1766,45 @@ Quick reference for which environment variables (and matching CLI flags) gate ea
 
 | Feature | Default | Env vars | CLI equivalent |
 |---|---|---|---|
-| Continuous-batching engine (`InferenceEngine` + scheduler) | ON in `TensorSharp.Server` | `TS_SCHED_DISABLE_BATCHED=1` to force per-seq fallback | `--no-continuous-batching` / `--continuous-batching` |
+| Continuous-batching engine (`InferenceEngine` + scheduler) | ON in Server, CLI generation, and TensorAgent | `TS_SCHED_DISABLE_BATCHED=1` to force per-seq fallback | `--no-continuous-batching` / `--continuous-batching` |
 | Legacy per-session paged-KV manager | removed from Server request path | `TS_KV_PAGED_CACHE` (`0` / `1`), `TS_KV_BLOCK_SIZE` retained for compatibility / standalone tests | `--paged-kv` / `--no-paged-kv`, `--paged-kv-block-size N` |
 | Legacy paged-KV SSD spillover (standalone manager) | OFF | `TS_KV_CACHE_MAX_RAM_MB`, `TS_KV_CACHE_SSD_DIR`, `TS_KV_CACHE_MAX_SSD_MB` | `--paged-kv-ram-mb`, `--paged-kv-ssd-dir`, `--paged-kv-ssd-mb` |
 | Legacy paged-KV block quantization (standalone manager) | OFF (`0` = passthrough) | `TS_KV_PAGED_QUANT_BITS` (`0` / `2` / `4` / `8`) | `--paged-kv-quant-bits` |
-| Block-hash prefix sharing across requests | ON | `TS_SCHED_PREFIX_CACHE=0` to disable | — |
+| Radix KV prefix reuse | ON for supported models | `TS_SCHED_PREFIX_CACHE=0` disables reuse; `TS_PREFIX_CACHE_MODE=legacy` selects the compatibility path | `--no-prefix-cache` also disables warmup |
 | Scheduler tunables (per-step token budget, max in-flight seqs, prefill chunks, block pool size, decode quantum) | engine defaults | `TS_SCHED_MAX_BATCHED_TOKENS`, `TS_SCHED_MAX_RUNNING_SEQS`, `TS_SCHED_PREFILL_CHUNK`, `TS_SCHED_SOLO_PREFILL_CHUNK`, `TS_SCHED_NUM_BLOCKS`, `TS_SCHED_BLOCK_SIZE`, `TS_SCHED_DECODE_QUANTUM` | — |
+
+Radix keeps page snapshots, model-paged blocks, and model-owned continuation states
+in one prefix index. Reuse respects conversation scopes, explicit cache markers,
+media identities, and each model's resumable boundaries. Public prefix checkpoints
+remain eligible for disk persistence. Engine API callers should supply a stable
+`SequenceState.CacheScope` for conversation reuse; an unscoped request shares only
+its declared `SharedPrefixTokens` in Radix mode.
+
+Startup warmup makes the common system/developer messages and tool declarations
+available to new chats as a public prefix. Server warms its configured startup
+model before accepting requests, and TensorAgent warms after loading a model.
+Both attach a checkpoint store so models supporting export/import can restore
+the prefix on a later launch. Interactive CLI warms its shared prefix at startup;
+`/new` and `/reset` start a fresh conversation scope while retaining the engine's
+public cache. Independent CLI JSONL conversations also share only their declared
+system prefix. CLI caching is in memory and is rebuilt after the process exits.
+
+Reuse requires identical rendered tokens, including tool schemas, the chat
+template and thinking settings, and remains subject to cache budgets. The host
+declares shared prefixes of at least 64 tokens; CLI eager startup warmup uses
+the same minimum, but shorter CLI prefixes can be cached by actual requests.
+Copyable model checkpoints can preserve the exact boundary; page-only models
+reuse complete pages. Models
+without copyable checkpoints or reusable pages cannot share a system checkpoint
+across sessions. Models without export/import support cannot persist it across
+launches. `--warmup-runs` controls extra inference warmups; these can populate the
+same public cache but are not required for interactive startup prefix warmup.
+
+The old standalone `PagedKvCacheManager` remains available to the paged cache
+microbenchmark. Its `--paged-kv` flags do not enable or disable Radix. The CLI's
+normal generation now uses the shared scheduler; its reported prefill time is time
+to first token, including scheduling and sampling. The standalone model benchmark
+continues to measure its direct backend decode paths, including MLX pipelining.
 
 #### Per-model batched / paged forward (`IBatchedPagedModel.ForwardBatch`)
 

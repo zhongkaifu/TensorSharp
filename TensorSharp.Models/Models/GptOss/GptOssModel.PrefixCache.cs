@@ -5,10 +5,8 @@
 //
 // TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
 //
-// GPT-OSS's side of the radix prefix cache contract (DESIGN §6.2.2, class P).
-// M2 parity, as Qwen3: pages and the primary cache, no end states until M7a. The
-// sliding window is a mask over a linear cache, so any rewind is exact.
-// Readiness=Legacy, so no engine calls a state member.
+// GPT-OSS's radix prefix cache: pages and the resident primary cache. The
+// sliding window masks a linear cache, so a supported rewind is exact.
 using System;
 using System.Collections.Generic;
 using TensorSharp.Runtime.Scheduling.PrefixCache;

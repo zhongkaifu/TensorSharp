@@ -800,9 +800,9 @@ public sealed class AgentAppHost : IDisposable
     internal Func<JsonElement, CancellationToken, IAsyncEnumerable<object>>? WarmUpFrames { get; set; }
 
     /// <summary>
-    /// Whether the prompt every conversation begins with has already been forwarded,
-    /// so the next message will reuse it instead of paying for it. False until the
-    /// warm-up finishes, and false again after a load throws the cache away.
+    /// Whether the shared-prompt warm-up request completed successfully. This does not
+    /// guarantee a retained payload: model capability and cache budgets still apply.
+    /// False until completion, and false again when another warm-up starts.
     /// </summary>
     public bool PrefixCacheIsWarm { get; private set; }
 
@@ -836,16 +836,18 @@ public sealed class AgentAppHost : IDisposable
     /// nothing is recorded and no chat appears in the user's list.
     /// </para>
     /// <para>
-    /// The message it sends is one short word, on purpose. A sliding-window model
-    /// (Gemma 4) can continue its live cache only when the new prompt differs from
-    /// the cached one by a handful of trailing tokens (see
-    /// <c>BatchExecutor.MaxLiveContinuationRewindTokens</c>); "hi", the turn framing
-    /// and the single generated token fit inside that allowance, so the first real
-    /// message rewinds them and continues instead of re-prefilling.
+    /// The one-token request uses the same system prompt and tools as a real chat.
+    /// The pipeline declares that shared prefix public, so a new conversation can
+    /// reuse it without sharing the warm-up's user message or generated token.
     /// </para>
     /// </summary>
     public void WarmThePrefixCache()
     {
+        if (!(ModelService.EngineHost.SchedulerConfigOverride ?? SchedulerConfig.FromEnvironment()).EnablePrefixCaching)
+        {
+            HostLog.LogInformation("not warming the prefix cache: runtime prefix reuse is disabled");
+            return;
+        }
         // Never beside a turn. The warm-up is opportunistic by definition -- it exists to
         // save the NEXT message a wait -- so contending with a message already being
         // answered is all cost and no benefit, and on a model that cannot take two
@@ -912,27 +914,14 @@ public sealed class AgentAppHost : IDisposable
                 // warmed with thinking off shares nothing with one the user sends with
                 // it on.
                 bool think = Settings.Load().ThinkByDefault;
-                JsonElement body = JsonDocument.Parse(
-                    $$"""
-                      {"sessionId":"{{WarmUpSessionId()}}","messages":[{"role":"user","content":"hi"}],"maxTokens":1,"think":{{(think ? "true" : "false")}}}
-                      """).RootElement;
-
-                var clock = System.Diagnostics.Stopwatch.StartNew();
                 Func<JsonElement, CancellationToken, IAsyncEnumerable<object>> frames = WarmUpFrames ?? Chat.ChatStreamAsync;
-                string? failure = null;
-                await foreach (object frame in frames(body, token).ConfigureAwait(false))
-                {
-                    // Drained rather than read: nothing here wants the answer, only the
-                    // K/V the prompt leaves behind on the way to it. Except a failure,
-                    // which the chat service reports as a frame rather than a throw: a
-                    // warm-up that forwarded nothing must not be called warm.
-                    failure ??= ErrorIn(frame);
-                }
-                clock.Stop();
+                PrefixCacheWarmup.Result warmed = await PrefixCacheWarmup.RunAsync(
+                    frames, WarmUpSessionId(), think, HostLog, token).ConfigureAwait(false);
                 if (token.IsCancellationRequested)
                     return;
-                if (failure is { Length: > 0 })
+                if (!warmed.Warmed)
                 {
+                    string failure = warmed.Detail;
                     HostLog.LogWarning("warming the prefix cache failed: {Error}", failure);
                     Console.WriteLine("TensorAgent: warm-up failed: " + failure);
                     // The warm-up is the likeliest thing to meet a dead GPU: it runs
@@ -952,7 +941,7 @@ public sealed class AgentAppHost : IDisposable
                     return;
                 }
                 PrefixCacheIsWarm = true;
-                string line = $"the prompt every chat starts with is now in the cache ({clock.Elapsed.TotalSeconds:0.#}s)";
+                string line = $"shared-prompt warm-up completed ({warmed.Elapsed.TotalSeconds:0.#}s)";
                 HostLog.LogInformation("{Line}", line);
                 Console.WriteLine("TensorAgent: warm-up: " + line);
                 LogMemory("after the warm-up");
@@ -1001,13 +990,9 @@ public sealed class AgentAppHost : IDisposable
     /// </para>
     /// </summary>
     /// <remarks>
-    /// Cancelled, not waited for to finish -- and that was measured, not assumed. A
-    /// turn arriving while the warm-up is forwarding might seem better off letting it
-    /// finish, since the tokens forwarded so far are the turn's own prefix; but the
-    /// engine already salvages them: the cancelled request's live cache stays resident
-    /// and the turn continues from it at the last chunk boundary (Qwen3.5-9B: 52%
-    /// reuse, first token 3.46 s vs 3.67 s waiting; Gemma 4 E2B: 63%, 0.77 s vs 0.82 s;
-    /// TensorAgentTtftBench --delay). Waiting only adds the warm-up's tail.
+    /// Wait for cancellation to drain instead of forcing the warm-up to finish. A
+    /// later conversation can reuse any public prefix already captured; an unfinished
+    /// warm-up may leave no reusable shared checkpoint.
     /// </remarks>
     public async Task StopWarmingThePrefixCacheAndWaitAsync()
     {

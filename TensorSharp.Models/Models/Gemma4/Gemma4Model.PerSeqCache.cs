@@ -142,8 +142,7 @@ namespace TensorSharp.Models
 
         private Gemma4KvCacheHolder CreateFreshHolder()
         {
-            // Only once the prefix cache owns this model's reuse state (never in
-            // the default Legacy mode): a released holder parked by the pool.
+            // Once the prefix cache owns reuse, take a released holder from its pool.
             if (TryTakePooledHolder(out var pooled))
                 return pooled;
             // AllocateKvCacheArrays zero-fills: the token-batched fused-decode

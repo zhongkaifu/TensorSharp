@@ -107,7 +107,10 @@ namespace TensorSharp.Runtime.Paged
                     throw new InvalidOperationException($"Double-free of block {b.Id}");
                 b.RefCount--;
                 if (b.RefCount == 0)
+                {
                     _freeQueue.Enqueue(b);
+                    ReleaseUncachedStorage(b);
+                }
             }
         }
 
@@ -119,7 +122,20 @@ namespace TensorSharp.Runtime.Paged
                 throw new InvalidOperationException($"Double-free of block {block.Id}");
             block.RefCount--;
             if (block.RefCount == 0)
+            {
                 _freeQueue.Enqueue(block);
+                ReleaseUncachedStorage(block);
+            }
+        }
+
+        private void ReleaseUncachedStorage(KvBlock block)
+        {
+            // Radix owns a reference while it caches a page. Once its final
+            // reference is gone, no content-hash entry keeps the slab alive.
+            if (block.ContentHash != null) return;
+            _storage.ReleaseSlab(block.Id);
+            block.HoldsSnapshotBytes = false;
+            block.HoldsModelPagedKv = false;
         }
 
         /// <summary>Promote a block from "being written" to "full and hashed".

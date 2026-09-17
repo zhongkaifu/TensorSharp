@@ -178,7 +178,8 @@ public class SpeculativeExecutionTests
         int eosToken = model.ExpectedNext(promptLen + 4);
         model.EosTokenId = eosToken;
 
-        var seq = RunEngineRequest(model, promptLen, maxNewTokens: 32, specEnabled: true);
+        var seq = RunEngineRequest(model, promptLen, maxNewTokens: 32, specEnabled: true,
+            beforeDispose: () => Assert.Equal(promptLen + 6, model.CacheSeqLen));
 
         Assert.Equal(SequenceStatus.FinishedStopped, seq.Status);
         // Output ends at EOS (kept, per the engine's contract) with the
@@ -190,7 +191,7 @@ public class SpeculativeExecutionTests
         // and the six emitted tokens, so a holder retained from here matches the
         // tokens it is recorded as holding (and, on a sliding-window ring, no
         // post-stop row evicted a position the next turn still attends to).
-        Assert.Equal(promptLen + 6, model.CacheSeqLen);
+        // The cache-length assertion above runs before engine shutdown clears state.
         Assert.Equal(0, model.ProtocolViolations.Count);
     }
 
@@ -598,7 +599,8 @@ public class SpeculativeExecutionTests
     }
 
     private static SequenceState RunEngineRequest(FakeSpeculativeModel model, int promptLen, int maxNewTokens,
-        bool specEnabled, bool enablePrefixCaching = false, int soloPrefillChunk = 0, string speculator = null)
+        bool specEnabled, bool enablePrefixCaching = false, int soloPrefillChunk = 0, string speculator = null,
+        Action beforeDispose = null)
     {
         var cfg = new SchedulerConfig
         {
@@ -633,6 +635,7 @@ public class SpeculativeExecutionTests
             maxNewTokens, BlockSize, greedy);
         var handle = engine.SubmitRequest(seq);
         handle.Completion.GetAwaiter().GetResult();
+        beforeDispose?.Invoke();
         return seq;
     }
 

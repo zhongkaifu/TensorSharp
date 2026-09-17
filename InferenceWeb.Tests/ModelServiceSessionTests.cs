@@ -100,28 +100,4 @@ public class ModelServiceSessionTests
         Assert.True(session.IsDisposed);
     }
 
-    [Fact]
-    public void InvalidateKVCache_DoesNotThrowWhenNoModelLoaded()
-    {
-        var svc = new ModelService();
-        svc.InvalidateKVCache();
-        Assert.False(svc.IsLoaded);
-    }
-
-    [Fact]
-    public void KVCache_ReturnsIsolatedCompatibilityShim()
-    {
-        var svc = new ModelService();
-        var legacyView = svc.KVCache;
-        legacyView.RecordAppend(new[] { 1, 2, 3 }, new float[] { 0.5f });
-
-        Assert.True(svc.KVCache.IsEmpty);
-    }
-
-    [Fact]
-    public void ActiveSession_StartsNullUntilInferenceActivatesOne()
-    {
-        var svc = new ModelService();
-        Assert.Null(svc.ActiveSession);
-    }
 }

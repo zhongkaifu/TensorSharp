@@ -428,6 +428,7 @@ namespace TensorSharp.Server.Hosting
         /// Turned off with <c>--no-prefix-cache</c>, which is the flag to reach for when
         /// the disk is read-only, when startup latency matters more than first-token
         /// latency, or when diagnosing whether a wrong answer came from a restored state.
+        /// The host applies the same flag to the scheduler to disable runtime reuse.
         /// </para>
         /// </summary>
         public bool PrefixCacheEnabled { get; }

@@ -5,21 +5,9 @@
 //
 // TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
 //
-// GLM's (glm-dsa, glm5next) side of the radix prefix cache contract (DESIGN §6.5.2,
-// class N, DEC-39): managed retention of whole native sequence slots.
-//
-// UNUSED until M5f. GLM has no retention today (SupportsRetainedFusedCache stays
-// false, so the legacy executor never retains a GLM slot), the capability record
-// says Readiness=Legacy (so no engine calls a state member here), and nothing in
-// this file is reachable from an existing code path. It exists so AdoptPrimary-
-// OnDisplacement has somewhere to put a slot when M5f raises the readiness:
-//   * a finished request's slot is retained under a payload key (a rewind to a
-//     shorter length first, glm-dsa only), the tree's sub-cap is one slot;
-//   * a retained slot is donated (re-keyed) to the request that continues it,
-//     never copied (no slot copy API exists, DEC-50);
-//   * release frees the slot.
-// The ownership moves are static helpers over IGlmSlotStore so they are tested
-// without a GLM checkpoint (GlmSlotRetentionTests).
+// GLM's radix prefix cache: donate-only native sequence slots. GLM-DSA can
+// rewind where the model permits it; GLM5Next keeps exact recurrent states.
+// Ownership moves are tested without weights through IGlmSlotStore.
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -189,7 +177,7 @@ namespace TensorSharp.Models
             return new PrefixCacheCapabilities
             {
                 Class = FamilyClass.N,
-                Readiness = PrefixCacheMode.Legacy,
+                Readiness = PrefixCacheMode.Tree,
                 NamespaceFingerprint = KVStateFingerprint,
                 EndState = slots ? EndStateSupport.DonateOnly : EndStateSupport.None,
                 CanCaptureCopy = false,
@@ -212,6 +200,12 @@ namespace TensorSharp.Models
         {
             lock (_nativeSync)
                 _prefixCacheSink = sink ?? throw new ArgumentNullException(nameof(sink));
+        }
+
+        public void DetachPrefixCache()
+        {
+            lock (_nativeSync)
+                _prefixCacheSink = null;
         }
 
         public bool TryCaptureCopy(string requestId, string payloadKey, out PayloadFootprint footprint)

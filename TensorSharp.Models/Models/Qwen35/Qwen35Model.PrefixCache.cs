@@ -5,22 +5,10 @@
 //
 // TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
 //
-// Qwen 3.5 / 3.6's side of the radix prefix cache contract (DESIGN §6.4.1, class R).
-//
-// Inert by default. The capability record says Readiness=Legacy, so an engine
-// never calls a state member here, and nothing below changes a code path the
-// engine runs today: RetainSequenceCache is RetainSequenceCacheAs(id, id), and
-// DiscardRetainedCaches, SettleForCopy and the measurements are new members.
-//
-// What the tree gets once a family PR raises the readiness (M5a):
-//   * end states copied (capture, clone) or moved (donate) at zero copy, each
-//     holding attention K/V and the matching GatedDeltaNet state together;
-//   * exact-length materialization only (no truncation: the recurrence cannot
-//     be rewound);
-//   * batched releases that recycle into the existing holder pool and reset the
-//     decode graphs at most once per batch (DEC-24);
-//   * a settle that flushes a donated holder's arena slot, K/V mirrors, fused
-//     decode state and verify state before it is cloned (G-12).
+// Qwen 3.5 / 3.6's radix prefix cache: complete attention and GatedDeltaNet
+// holders, copied or donated at exact lengths. Released holders reuse the pool;
+// device-authoritative state is settled before copying. Backend and tensor-
+// parallel capabilities still determine which operations are available.
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -45,7 +33,7 @@ namespace TensorSharp.Models
             return new PrefixCacheCapabilities
             {
                 Class = FamilyClass.R,
-                Readiness = PrefixCacheMode.Legacy,
+                Readiness = PrefixCacheMode.Tree,
                 NamespaceFingerprint = KVStateFingerprint,
                 EndState = holders ? EndStateSupport.CopyAndDonate : EndStateSupport.None,
                 // False under tensor parallelism (the cache lives on the ranks).
@@ -64,6 +52,8 @@ namespace TensorSharp.Models
 
         public void AttachPrefixCache(IPrefixPayloadSink sink)
             => _prefixCacheSink = sink ?? throw new ArgumentNullException(nameof(sink));
+
+        public void DetachPrefixCache() => _prefixCacheSink = null;
 
         public long QuerySpareBytes(ResourceClass cls) => QueryPrefixCacheSpareBytes(cls);
 

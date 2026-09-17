@@ -5,9 +5,8 @@
 //
 // TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
 //
-// HunyuanDense's side of the radix prefix cache contract (DESIGN §6.2.4, class P).
-// Pages on its batched paged route (and host slabs where it snapshots) plus the
-// primary cache. Readiness=Legacy until its own readiness PR.
+// HunyuanDense's radix prefix cache: model-paged storage (and host slabs where
+// snapshots are supported) plus the resident primary cache.
 using System;
 using System.Collections.Generic;
 using TensorSharp.Runtime.Scheduling.PrefixCache;

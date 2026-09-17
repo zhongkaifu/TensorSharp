@@ -285,24 +285,24 @@ public sealed class SpeculativeCliFlagsTests : IDisposable
     }
 
     [Fact]
-    public void Resolve_ExplicitNoSpec_VetoesAnAlreadyLoadedBlockDrafter()
+    public void Resolve_ExplicitNoSpec_PreservesEngineVeto()
     {
         SpeculativeCliFlags.Apply(new[] { "--no-spec" });
 
         var settings = SpeculativeDecodingOptions.Resolve(0, -1f);
 
         Assert.True(settings.ExplicitlyDisabled);
-        Assert.False(SpeculativeDecodingOptions.ShouldEngage(DraftHeadKind.Block, settings));
+        Assert.False(settings.Enabled);
     }
 
     [Fact]
-    public void Resolve_DefaultOff_DoesNotVetoASeparatelyLoadedBlockDrafter()
+    public void Resolve_DefaultOff_PreservesEnginePolicy()
     {
         var settings = SpeculativeDecodingOptions.Resolve(0, -1f);
 
         Assert.False(settings.ExplicitlyDisabled);
-        Assert.True(SpeculativeDecodingOptions.ShouldEngage(DraftHeadKind.Block, settings));
-        Assert.False(SpeculativeDecodingOptions.ShouldEngage(DraftHeadKind.PerToken, settings));
+        Assert.False(settings.Enabled);
+        Assert.Equal(SpeculatorRegistry.Auto, settings.SpeculatorName);
     }
 
     [Fact]

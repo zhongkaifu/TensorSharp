@@ -130,6 +130,13 @@ dotnet run --project TensorSharp.Server.Host -c Release -p:TensorSharpSkipMlxNat
 
 > The server binds `0.0.0.0:5000` by default (change it with `--port` / `--host`, or the `PORT` / `HOST` environment variables; on macOS port 5000 is taken by the AirPlay Receiver) with no built-in auth or TLS — keep it behind a firewall or an authenticated HTTPS reverse proxy. For image/video/audio add the companion [`mmproj-gemma-4-E4B-it-Q8_0.gguf`](https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF/blob/main/mmproj-gemma-4-E4B-it-Q8_0.gguf) with `--mmproj`.
 
+TensorSharp.Server, TensorSharp.Cli, and TensorAgent use the shared engine's Radix
+KV prefix cache by default for supported models. It reuses public prompt prefixes
+and each conversation's private state, respecting model and media boundaries.
+Set `TS_SCHED_PREFIX_CACHE=0` to disable runtime prefix reuse, or
+`TS_PREFIX_CACHE_MODE=legacy` to select the compatibility path for diagnosis.
+Server and CLI `--no-prefix-cache` also disable prefix reuse and startup warmup.
+
 Both executables print their full option reference — description, default, range, and an example per flag — when started with no arguments or with `--help`:
 
 ```bash
