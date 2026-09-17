@@ -267,7 +267,7 @@ namespace TensorSharp.Server
                 _loadedModelPath = null;
                 _loadedMmProjPath = null;
                 DraftHeadActivationError = null;
-            DraftHeadRefusedByModel = false;
+                DraftHeadRefusedByModel = false;
                 throw;
             }
         }
