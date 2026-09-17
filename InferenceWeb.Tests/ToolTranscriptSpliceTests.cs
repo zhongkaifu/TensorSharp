@@ -78,6 +78,51 @@ public class ToolTranscriptSpliceTests
         Assert.Equal("thanks, and now translate it", result[6].Content);
     }
 
+    /// <summary>
+    /// An OpenAI client that sends <c>reasoning_content</c> back gets the reasoning of
+    /// EVERY round of a tool-loop turn, since the loop streams each round's thinking. The
+    /// transcript must still expand: the record's reasoning is the rounds' reasoning, not
+    /// only the final round's (which read as a conflict and re-prefilled the whole turn).
+    /// </summary>
+    [Theory]
+    [InlineData("plan the conversion\n\nretry with packages\n\nall done")]
+    [InlineData("all done")]
+    public void AClientEchoingTheLoopsReasoning_StillExpands(string clientThinking)
+    {
+        var store = new ConversationTranscriptStore(maxChains: 64, maxTokens: 100_000);
+        store.Record(new List<ChatMessage>
+            {
+                new() { Role = "user", Content = "convert this file" },
+                new() { Role = "assistant", Content = "Using the pdf skill.\n\n", Thinking = "plan the conversion", RawOutputTokens = Raw1 },
+                new() { Role = "tool", Content = "Ran python (exit code 1)" },
+                new() { Role = "assistant", Content = "Retrying with packages.\n\n", Thinking = "retry with packages", RawOutputTokens = Raw2 },
+                new() { Role = "tool", Content = "Ran python (exit code 0)" },
+            },
+            Generated("Here is your PDF.", Raw3),
+            Emitted("Here is your PDF.", thinking: "all done"),
+            scope: "chat");
+
+        var result = store.Augment(new List<ChatMessage>
+        {
+            new() { Role = "user", Content = "convert this file" },
+            new() { Role = "assistant", Content = CleanAssistantText, Thinking = clientThinking },
+            new() { Role = "user", Content = "next" },
+        });
+
+        Assert.Equal(7, result.History.Count);
+        Assert.Same(Raw3, result.History[5].RawOutputTokens);
+        Assert.Equal("chat", result.InheritedScope);
+
+        // Reasoning that is not what the loop produced still refuses the splice.
+        var edited = store.Augment(new List<ChatMessage>
+        {
+            new() { Role = "user", Content = "convert this file" },
+            new() { Role = "assistant", Content = CleanAssistantText, Thinking = "something else entirely" },
+            new() { Role = "user", Content = "next" },
+        });
+        Assert.Equal(3, edited.History.Count);
+    }
+
     [Fact]
     public void AHostNoteAfterTheLoopsAnswer_StillExpands()
     {

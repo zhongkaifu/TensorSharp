@@ -250,6 +250,7 @@ namespace TensorSharp.Server
 
             var replacement = new List<ChatMessage>(history.Count - visibleEnd + 1);
             var emittedContent = new StringBuilder();
+            var emittedThinking = new StringBuilder();
             long tokens = generated.RawOutputTokens.Count;
             for (int i = visibleEnd; i < history.Count; i++)
             {
@@ -258,6 +259,7 @@ namespace TensorSharp.Server
                 if (internalMessage.Role == "assistant")
                 {
                     emittedContent.Append(internalMessage.Content);
+                    emittedThinking.Append(internalMessage.Thinking);
                     tokens += internalMessage.RawOutputTokens?.Count ?? 0;
                 }
                 else
@@ -271,8 +273,16 @@ namespace TensorSharp.Server
             replacement.Add(generated);
             if (visibleEnd < history.Count)
             {
+                // The loop streamed every round's content AND reasoning to the client, so
+                // both are compared over all rounds.
                 emittedContent.Append(emitted.Content);
-                emitted = emitted with { Content = emittedContent.ToString(), RawText = null };
+                emittedThinking.Append(emitted.Thinking);
+                emitted = emitted with
+                {
+                    Content = emittedContent.ToString(),
+                    Thinking = emittedThinking.Length == 0 ? null : emittedThinking.ToString(),
+                    RawText = null,
+                };
             }
 
             var record = new TurnRecord { Replacement = replacement, Emitted = emitted, Scope = scope, Tokens = tokens };
@@ -407,8 +417,11 @@ namespace TensorSharp.Server
                 return false;
             string clientThinking = Squash(client.Thinking);
             string emittedThinking = Squash(emitted.Thinking);
+            // A tool-loop transcript records every round's reasoning; a client may send back
+            // all of it or only the final round's, which is a suffix of it.
             if (clientThinking.Length > 0 && emittedThinking.Length > 0
-                && !string.Equals(clientThinking, emittedThinking, StringComparison.Ordinal))
+                && !string.Equals(clientThinking, emittedThinking, StringComparison.Ordinal)
+                && !(record.Replacement.Count > 1 && emittedThinking.EndsWith(clientThinking, StringComparison.Ordinal)))
                 return false;
 
             string clientContent = Squash(client.Content);
