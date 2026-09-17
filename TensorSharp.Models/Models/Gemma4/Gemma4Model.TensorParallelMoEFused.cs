@@ -488,18 +488,9 @@ namespace TensorSharp.Models
         {
             if (!_tpMoeFusedReady || n <= 1)
                 return false;
-            // Multimodal spans are only expressible at startPos == 0 (mask
-            // view-index == logical position); later chunks fall to per-op.
-            if (exceptPositions != null && exceptPositions.Count > 0 && startPos != 0)
-                return false;
-
-            byte[] isExcept = null;
-            if (exceptPositions != null && exceptPositions.Count > 0)
-            {
-                isExcept = new byte[n];
-                foreach (int p in exceptPositions)
-                    if (p >= 0 && p < n) isExcept[p] = 1;
-            }
+            // Multimodal spans: one byte per chunk token, honoured by the kernel at
+            // any startPos.
+            byte[] isExcept = ChunkSoftTokenMask(exceptPositions, startPos, n);
 
             int tp = TpDegree;
             int layers = Config.NumLayers;

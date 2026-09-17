@@ -152,14 +152,13 @@ namespace TensorSharp.Runtime.Scheduling
                             _logger.LogWarning(
                                 "A {Prompt}-token prompt whose attachment follows a reusable {Clamped}-token prefix " +
                                 "prefills from zero instead: this model cannot prefill media after a reused prefix " +
-                                "exactly at this length (Gemma 4 past its sliding window). Reported once.",
+                                "exactly at this length. Reported once.",
                                 seq.PromptTokens.Count, clamped);
                         else
                             _logger.LogWarning(
                                 "A {Prompt}-token prompt whose attachment follows a reusable {Clamped}-token prefix " +
                                 "reuses only its {Kept}-token public prefix instead: this model cannot prefill media " +
-                                "after a longer reused prefix exactly at this length (Gemma 4 past its sliding window). " +
-                                "Reported once.",
+                                "after a longer reused prefix exactly at this length. Reported once.",
                                 seq.PromptTokens.Count, clamped, kept);
                     }
                     return kept;
