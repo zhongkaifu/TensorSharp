@@ -140,6 +140,74 @@ public class Qwen35ImageFollowUpExactnessTests
             _output.WriteLine("[checkpoint] backend has no serializable checkpoints; part C not run");
     }
 
+    /// <summary>
+    /// The concurrent paths: an image conversation and a text conversation run side by
+    /// side, so each decodes through its own per-request holder (and, on CUDA and Metal,
+    /// the arena batched decode, whose RoPE positions come from each holder's delta), and
+    /// each follow-up continues the holder its previous turn retained. Every turn must
+    /// reuse the previous one past the image and produce the tokens a cold solo prefill
+    /// of the same prompt produces.
+    /// </summary>
+    [ModelFact(EnvModelDir, ModelPattern)]
+    public async Task ConcurrentReuseAfterAnImage_MatchesColdPrefill()
+    {
+        using var ctx = Context.Open(_output);
+        if (ctx == null) return;
+
+        var imageTurns = new List<Turn>();
+        var textTurns = new List<Turn>();
+        var imageOut = new List<List<int>>();
+        var textOut = new List<List<int>>();
+        var imageReused = new List<int>();
+        using (var engine = new InferenceEngine(ctx.Model, Config(), NullLogger.Instance))
+        {
+            for (int k = 0; k < 4; k++)
+            {
+                var a = ctx.BuildTurn(k, k == 0 ? null : imageTurns[k - 1].Unexpanded, k == 0 ? null : imageOut[k - 1],
+                    Context.UserTexts, imageTurn: 1);
+                var b = ctx.BuildTurn(k, k == 0 ? null : textTurns[k - 1].Unexpanded, k == 0 ? null : textOut[k - 1],
+                    Context.TextOnlyUserTexts, imageTurn: -1);
+                imageTurns.Add(a);
+                textTurns.Add(b);
+                var ta = ctx.GenerateAsync(engine, a, $"conc-img-{k}", scope: "conversation-image");
+                var tb = ctx.GenerateAsync(engine, b, $"conc-txt-{k}", scope: "conversation-text");
+                await Task.WhenAll(ta, tb);
+                imageOut.Add(ta.Result.output);
+                textOut.Add(tb.Result.output);
+                imageReused.Add(ta.Result.completion.PrefixCacheReusedTokens);
+                _output.WriteLine($"[concurrent t{k + 1}] image prompt {a.Expanded.Count} reused {ta.Result.completion.PrefixCacheReusedTokens}: {ctx.Decode(ta.Result.output)}");
+                _output.WriteLine($"[concurrent t{k + 1}] text  prompt {b.Expanded.Count} reused {tb.Result.completion.PrefixCacheReusedTokens}: {ctx.Decode(tb.Result.output)}");
+            }
+        }
+
+        // The arena batched decode is where each sequence's RoPE position comes from its
+        // holder's delta; say whether it served these steps (CUDA and Metal only).
+        long arenaSteps = ctx.Model is Qwen35Model q35 ? q35.ArenaBatchedDecodeSteps : 0;
+        _output.WriteLine($"[concurrent] arena batched decode steps: {arenaSteps}");
+        if (ctx.Backend is BackendType.GgmlMetal or BackendType.GgmlCuda)
+            Assert.True(arenaSteps > 0, "the concurrent turns never reached the arena batched decode");
+
+        var mismatches = new List<string>();
+        for (int k = 0; k < 4; k++)
+        {
+            foreach (var (turn, output, label) in new[] { (imageTurns[k], imageOut[k], "image"), (textTurns[k], textOut[k], "text") })
+            {
+                using var engine = new InferenceEngine(ctx.Model, Config(), NullLogger.Instance);
+                var (completion, cold) = await ctx.GenerateAsync(engine, turn, $"conc-cold-{label}-{k}");
+                Assert.Equal(0, completion.PrefixCacheReusedTokens);
+                if (!cold.SequenceEqual(output))
+                    mismatches.Add($"{label} turn {k + 1}: concurrent {ctx.Decode(output)} | cold {ctx.Decode(cold)}");
+            }
+        }
+        foreach (var m in mismatches) _output.WriteLine("[mismatch] " + m);
+        Assert.Empty(mismatches);
+
+        int imageEnd = imageTurns[1].ImageSpanEnd;
+        for (int k = 2; k < 4; k++)
+            Assert.True(imageReused[k] > imageEnd,
+                $"concurrent image turn {k + 1} reused {imageReused[k]} tokens, which stops before the image ends at {imageEnd}");
+    }
+
     private static SchedulerConfig Config() => new()
     {
         MaxNumBatchedTokens = 4096,
@@ -182,11 +250,13 @@ public class Qwen35ImageFollowUpExactnessTests
         private int _prepSerial;
 
         public ModelBase Model { get; }
+        public BackendType Backend { get; }
 
-        private Context(ITestOutputHelper output, ModelBase model, string image, string tempDir)
+        private Context(ITestOutputHelper output, ModelBase model, BackendType backend, string image, string tempDir)
         {
             _output = output;
             Model = model;
+            Backend = backend;
             _image = image;
             _tempDir = tempDir;
         }
@@ -226,7 +296,7 @@ public class Qwen35ImageFollowUpExactnessTests
             var model = ModelBase.Create(modelPath, backend);
             model.MultimodalInjector.LoadProjectors(mmproj);
             output.WriteLine($"model {Path.GetFileName(modelPath)} + {Path.GetFileName(mmproj)} on {backend}, image {image}, loaded in {sw.Elapsed.TotalSeconds:F1}s");
-            return new Context(output, model, image, temp);
+            return new Context(output, model, backend, image, temp);
         }
 
         private static string WriteSyntheticImage(string path)
@@ -252,12 +322,20 @@ public class Qwen35ImageFollowUpExactnessTests
 
         private List<int> Text(string text) => Model.Tokenizer.Encode(text, addSpecial: false);
 
-        private static readonly string[] UserTexts =
+        public static readonly string[] UserTexts =
         {
             "Name three primary colors, one per line.",
             "Describe the picture in two sentences.",
-            "What color is the roof in the picture, and why might that color be chosen?",
+            "What is the most prominent color in the picture, and where is it?",
             "Now suggest a short title for the picture.",
+        };
+
+        public static readonly string[] TextOnlyUserTexts =
+        {
+            "List three rivers in Europe.",
+            "Which of them is the longest?",
+            "Name one city on that river.",
+            "Give one fact about that city.",
         };
 
         /// <summary>Turn <paramref name="k"/>'s prompt at the token level: the previous
@@ -266,6 +344,9 @@ public class Qwen35ImageFollowUpExactnessTests
         /// carries the image. Token-level concatenation makes every turn an exact
         /// extension of the one before, which is what reuse needs.</summary>
         public Turn BuildTurn(int k, List<int> previous, List<int> previousOutput)
+            => BuildTurn(k, previous, previousOutput, UserTexts, imageTurn: 1);
+
+        public Turn BuildTurn(int k, List<int> previous, List<int> previousOutput, string[] userTexts, int imageTurn)
         {
             int imStart = Special("<|im_start|>"), imEnd = Special("<|im_end|>");
             var tokens = new List<int>();
@@ -287,15 +368,15 @@ public class Qwen35ImageFollowUpExactnessTests
             tokens.Add(imStart);
             tokens.AddRange(Text("user\n"));
             var history = new List<ChatMessage>();
-            if (k >= 1)
-                history.Add(new ChatMessage { Role = "user", Content = UserTexts[1], ImagePaths = new List<string> { _image } });
-            if (k == 1)
+            if (imageTurn >= 0 && k >= imageTurn)
+                history.Add(new ChatMessage { Role = "user", Content = userTexts[imageTurn], ImagePaths = new List<string> { _image } });
+            if (k == imageTurn)
             {
                 tokens.Add(Special("<|vision_start|>"));
                 tokens.Add(Special("<|image_pad|>"));
                 tokens.Add(Special("<|vision_end|>"));
             }
-            tokens.AddRange(Text(UserTexts[k]));
+            tokens.AddRange(Text(userTexts[k]));
             tokens.Add(imEnd);
             tokens.AddRange(Text("\n"));
             tokens.Add(imStart);
@@ -340,13 +421,13 @@ public class Qwen35ImageFollowUpExactnessTests
         }
 
         public async Task<(InferenceCompletion completion, List<int> output)> GenerateAsync(
-            InferenceEngine engine, Turn turn, string requestId)
+            InferenceEngine engine, Turn turn, string requestId, string scope = "q35-image-conversation")
         {
             var (tokens, spans) = Prepare(turn, requestId);
             try
             {
                 var seq = new SequenceState(requestId, tokens, EngineNewTokens, 256, SamplingConfig.Greedy,
-                    mediaSpans: spans, cacheScope: "q35-image-conversation");
+                    mediaSpans: spans, cacheScope: scope);
                 var handle = engine.SubmitRequest(seq);
                 var output = new List<int>();
                 await foreach (int t in handle.Tokens.ReadAllAsync())
