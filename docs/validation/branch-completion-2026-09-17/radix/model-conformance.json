@@ -1,0 +1,170 @@
+{
+  "date": "2026-09-17",
+  "ggml_revision": "456172ec733a135778adcd32d00e576a58232e45",
+  "ggml_worktree_status_local_and_remote": "clean",
+  "local": {
+    "hardware": "Apple M5 Pro",
+    "dotnet_runtime": "10.0.10",
+    "native_sha256": "64e85b3b33c5fe9042fa1af66fb0fb6f7f1fb7d79784612ae0dfa2dde3640d3f",
+    "source_commit": "0aaa01a2",
+    "note": "Final explicit-file GPT-OSS rerun and helper tests use 0aaa01a2; prior conformance uses d0463f1c with identical model/runtime code."
+  },
+  "remote": {
+    "hardware": "NVIDIA A40",
+    "physical_gpu": 4,
+    "driver": "570.195.03",
+    "native_sha256": "0e75fe2580062b8335e0197f8a71021248aa8c665529a9e62f89aa205c92625b",
+    "repository": "/workspace/ts-codex-branch-completion-20260917/repo",
+    "source_note": "Combined integration snapshot supplied by root agent; top-level source copy has no .git directory. Native identity and clean upstream revision independently verified."
+  },
+  "runs": [
+    {
+      "lane": "gemma4",
+      "backend": "Metal",
+      "model": "gemma-4-E4B-it-Q8_0",
+      "tests": [
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixCacheContractConformanceTests.Gemma4_E4B_PassesTheConformanceScript_WithTheHolderPoolAttached",
+          "outcome": "Passed",
+          "duration": "00:00:11.9937903",
+          "conformance_output": [
+            "loading /Users/zhongkaifu/work/models/gemma-4-E4B/gemma-4-E4B-it-Q8_0.gguf on GgmlMetal",
+            "[gemma4-e4b] conformance ran [capabilities, capture, clone x2, donate/return/donate, settle then clone, truncate refused (wrapped window), truncate in range (511 -> 507, Clone), primary conversion, batched release (3 payloads, 0 reset), export/import (40911657 bytes), release leaves no keys]; not applicable [end-state refusals (the family has end states)]"
+          ]
+        }
+      ]
+    },
+    {
+      "lane": "qwen35",
+      "backend": "Metal",
+      "model": "Qwen3.5-9B-Q8_0",
+      "tests": [
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixCacheContractConformanceTests.Qwen35_9B_PassesTheConformanceScript",
+          "outcome": "Passed",
+          "duration": "00:00:15.0173730",
+          "conformance_output": [
+            "loading /Users/zhongkaifu/work/models/Qwen/Qwen3.5-9B-Q8_0.gguf on GgmlMetal",
+            "[qwen35-9b] conformance ran [capabilities, capture, clone x2, donate/return/donate, settle then clone, truncate refused (Truncation=None), primary conversion, batched release (3 payloads, 0 reset), export/import (91226851 bytes), release leaves no keys]; not applicable [end-state refusals (the family has end states)]"
+          ]
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.MeasureEndStateTests.Qwen35_MeasureEndState_MatchesIdleHolderBytesWithinOnePercent",
+          "outcome": "Passed",
+          "duration": "00:00:02.0800830",
+          "conformance_output": [
+            "loading /Users/zhongkaifu/work/models/Qwen/Qwen3.5-9B-Q8_0.gguf on GgmlMetal"
+          ]
+        }
+      ]
+    },
+    {
+      "lane": "qwen35-primary",
+      "backend": "Metal",
+      "model": "Qwen3.5-9B-Q8_0",
+      "tests": [
+        {
+          "name": "InferenceWeb.Tests.Qwen35PrimaryDecodeAfterHolderTests.PrimaryDecodes_WhenAHolderRanTheModelsFirstFusedDecode",
+          "outcome": "Passed",
+          "duration": "00:00:01.3299432",
+          "conformance_output": []
+        }
+      ]
+    },
+    {
+      "lane": "gptoss",
+      "backend": "Metal",
+      "model": "gpt-oss-20b-Q8_0",
+      "tests": [
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixCacheContractConformanceTests.GptOss20B_PassesTheConformanceScript_WithParityCapabilities",
+          "outcome": "Passed",
+          "duration": "00:00:04.1034496",
+          "conformance_output": [
+            "loading /Users/zhongkaifu/work/models/gpt-oss-20b-Q8_0.gguf on GgmlMetal",
+            "[gpt-oss-20b] conformance ran [capabilities, end-state refusals, truncate in range on the primary (1181 -> 1177), release leaves no keys]; not applicable [capture (CanCaptureCopy=false), clone (donate-only or no end states), donate/return/donate (no end states), settle then clone (donate-only or no end states), primary conversion (AdoptPrimaryOnDisplacement=false), batched release (no end states), export/import (Persistable=false)]"
+          ]
+        }
+      ]
+    },
+    {
+      "lane": "gptoss-explicit-file",
+      "backend": "Metal",
+      "model": "gpt-oss-20b-Q8_0",
+      "tests": [
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixCacheContractConformanceTests.GptOss20B_PassesTheConformanceScript_WithParityCapabilities",
+          "outcome": "Passed",
+          "duration": "00:00:03.7460812",
+          "conformance_output": [
+            "loading /Users/zhongkaifu/work/models/gpt-oss-20b-Q8_0.gguf on GgmlMetal",
+            "[gpt-oss-20b] conformance ran [capabilities, end-state refusals, truncate in range on the primary (1181 -> 1177), release leaves no keys]; not applicable [capture (CanCaptureCopy=false), clone (donate-only or no end states), donate/return/donate (no end states), settle then clone (donate-only or no end states), primary conversion (AdoptPrimaryOnDisplacement=false), batched release (no end states), export/import (Persistable=false)]"
+          ]
+        }
+      ]
+    },
+    {
+      "lane": "gemma4",
+      "backend": "CUDA",
+      "model": "gemma-4-E4B-it-Q8_0",
+      "tests": [
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixCacheContractConformanceTests.Gemma4_E4B_PassesTheConformanceScript_WithTheHolderPoolAttached",
+          "outcome": "Passed",
+          "duration": "00:00:13.6334249",
+          "conformance_output": [
+            "loading /workspace/models/gemma4-e4b/gemma-4-E4B-it-Q8_0.gguf on GgmlCuda",
+            "[gemma4-e4b] conformance ran [capabilities, capture, clone x2, donate/return/donate, settle then clone, truncate refused (wrapped window), truncate in range (511 -> 507, Clone), primary conversion, batched release (3 payloads, 1 reset), export/import (40911657 bytes), release leaves no keys]; not applicable [end-state refusals (the family has end states)]"
+          ]
+        }
+      ]
+    },
+    {
+      "lane": "qwen35",
+      "backend": "CUDA",
+      "model": "Qwen3.5-9B-Q8_0",
+      "tests": [
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixCacheContractConformanceTests.Qwen35_9B_PassesTheConformanceScript",
+          "outcome": "Passed",
+          "duration": "00:00:17.5947150",
+          "conformance_output": [
+            "loading /workspace/models/qwen35-9b/Qwen3.5-9B-Q8_0.gguf on GgmlCuda",
+            "[qwen35-9b] conformance ran [capabilities, capture, clone x2, donate/return/donate, settle then clone, truncate refused (Truncation=None), primary conversion, batched release (3 payloads, 0 reset), export/import (91226855 bytes), release leaves no keys]; not applicable [end-state refusals (the family has end states)]"
+          ]
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.MeasureEndStateTests.Qwen35_MeasureEndState_MatchesIdleHolderBytesWithinOnePercent",
+          "outcome": "Passed",
+          "duration": "00:00:06.0920035",
+          "conformance_output": [
+            "loading /workspace/models/qwen35-9b/Qwen3.5-9B-Q8_0.gguf on GgmlCuda"
+          ]
+        }
+      ]
+    },
+    {
+      "lane": "qwen35-primary",
+      "backend": "CUDA",
+      "model": "Qwen3.5-9B-Q8_0",
+      "tests": [
+        {
+          "name": "InferenceWeb.Tests.Qwen35PrimaryDecodeAfterHolderTests.PrimaryDecodes_WhenAHolderRanTheModelsFirstFusedDecode",
+          "outcome": "Passed",
+          "duration": "00:00:05.1665897",
+          "conformance_output": []
+        }
+      ]
+    }
+  ],
+  "remaining_cases": [
+    "Qwen3.8 Flash Next full-model radix conformance not run.",
+    "DeepSeek V4.1 Flash full-model radix conformance not run; managed CPU fixture passed separately.",
+    "CUDA GPT-OSS MXFP4 radix conformance not run; Metal Q8_0 passed."
+  ],
+  "setup_failures_resolved": [
+    "Initial remote shell lacked dotnet in PATH; all four attempted processes exited 127 before model loading. Retried using /workspace/tensorsharp-no-patch-20260915/dotnet/dotnet.",
+    "Explicit model file passed ModelSkip but FindGguf incorrectly tried to enumerate it as a directory. Five tests failed before loading models. Corrected leaf directories passed the Gemma and Qwen CUDA lanes; 0aaa01a2 fixes helper mismatch with three regression tests and a passing Metal GPT-OSS explicit-file rerun.",
+    "Initial Metal Gemma and Qwen attempts skipped because matching only searches one directory level. All four cases were rerun and passed with their exact model leaf directories."
+  ]
+}

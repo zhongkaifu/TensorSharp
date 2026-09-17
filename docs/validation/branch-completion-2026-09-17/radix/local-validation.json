@@ -1,0 +1,1877 @@
+{
+  "scope": "M0a/M0c/M0e, M1 tree core and M2 Legacy-readiness model contracts",
+  "source_commit": "d0463f1ca35cf3b2aeca1e7dd6b67588f2f52205",
+  "ggml_revision": "456172ec733a135778adcd32d00e576a58232e45",
+  "ggml_status": "",
+  "native_sha256": "64e85b3b33c5fe9042fa1af66fb0fb6f7f1fb7d79784612ae0dfa2dde3640d3f",
+  "test_runs": {
+    "radix-completion": {
+      "counters": {
+        "total": "299",
+        "executed": "291",
+        "passed": "291",
+        "failed": "0",
+        "error": "0",
+        "timeout": "0",
+        "aborted": "0",
+        "inconclusive": "0",
+        "passedButRunAborted": "0",
+        "notRunnable": "0",
+        "notExecuted": "0",
+        "disconnected": "0",
+        "warning": "0",
+        "completed": "0",
+        "inProgress": "0",
+        "pending": "0"
+      },
+      "tests": [
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeInsertSplitTests.ScopedUnderPublic_AndADifferentScopeUnderAScopedNodeIsImpossible",
+          "outcome": "Passed",
+          "duration": "00:00:00.0001527"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeInsertSplitTests.PageOwnerRule_HoldsAcrossSplits_AndDuplicatesAreSkipped",
+          "outcome": "Passed",
+          "duration": "00:00:00.0016519"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeInvariantCheckerTests.I8_CachedCounter",
+          "outcome": "Passed",
+          "duration": "00:00:00.0001562"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCacheStartupTests.AStreamThatEndsCleanlyIsAWarmCache",
+          "outcome": "Passed",
+          "duration": "00:00:00.0010137"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixCacheContractConformanceTests.Qwen35_9B_PassesTheConformanceScript",
+          "outcome": "NotExecuted",
+          "duration": "00:00:00.0010000",
+          "output": "Requires model weights (TS_TEST_MODEL_DIR not set)."
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeInvariantCheckerTests.I12_A2PageNotInPagedStorage",
+          "outcome": "Passed",
+          "duration": "00:00:00.0009997"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.RadixKeyTests.ReleasingTheOwnerOfAnUnreferencedRope_ReturnsItsChunks",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000823"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.RadixKeyTests.BuildPrompt_RejectsInvalidSpans(start: 3, end: 3)",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000885"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeEvaluateTests.TruncationKinds_AndRewindCap(kind: Any, parameter: 0, cached: 60, diverge: 40, expectTruncation: False)",
+          "outcome": "Passed",
+          "duration": "00:00:00.0001777"
+        },
+        {
+          "name": "InferenceWeb.Tests.Qwen4ExpRetainedCachePolicyTests.ZeroBudget_DeclinesWithoutTouchingRetainedHolders",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000839"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCacheStartupTests.AThrowingChatStreamIsReportedRatherThanPropagated",
+          "outcome": "Passed",
+          "duration": "00:00:00.0030709"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeEvictionTests.RelieveMemoryPressure_ModerateHalvesCritical_KeepsNewestPublicAndScopeLeaf",
+          "outcome": "Passed",
+          "duration": "00:00:00.0004166"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeMatchTests.MediaVerify_SameKeyElementDifferentId_StopsAtTheSpanStart",
+          "outcome": "Passed",
+          "duration": "00:00:00.0002226"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.RadixKeyTests.BuildPrompt_RejectsUnsortedOrOverlappingSpans_AndNegativeTokens",
+          "outcome": "Passed",
+          "duration": "00:00:00.0006527"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeEdgeCaseTests.BranchPosition_IsZeroWhenClampedBelowTheReuse",
+          "outcome": "Passed",
+          "duration": "00:00:00.0008275"
+        },
+        {
+          "name": "InferenceWeb.Tests.DeepSeekSlotRetentionTests.InactiveEvictionDoesNotSelectOrResetAnotherRequest",
+          "outcome": "Passed",
+          "duration": "00:00:00.0007632"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCacheStartupTests.NoStartupModelStillResolvesToTheRoot",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000270"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.DonationDecisionTests.AllConditionsHold_Donates",
+          "outcome": "Passed",
+          "duration": "00:00:00.0004280"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixCacheContractConformanceTests.OracleS2_RefusesARewindBeyondTheRingSlack",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000727"
+        },
+        {
+          "name": "InferenceWeb.Tests.GlmSlotRetentionTests.ConvertPrimary_RetainsTheLivePrimaryAndSelectsAFreshOne_OrRefusesUntouched",
+          "outcome": "Passed",
+          "duration": "00:00:00.0005850"
+        },
+        {
+          "name": "InferenceWeb.Tests.DeepSeekSlotRetentionTests.FailedEmptyOrOverBudgetHolderKeepsItsOriginalOwner(healthy: False, fits: True, head: 9)",
+          "outcome": "Passed",
+          "duration": "00:00:00.0003586"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeEvictionTests.ReclaimQueue_RepeatedKeyCanRequireDisposalWithoutDoubleCounting(disposal: Reset)",
+          "outcome": "Passed",
+          "duration": "00:00:00.0001441"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.ResumabilityRulesTests.TruncationAllows_EveryKind(kind: 3, parameter: 5, cached: 100, target: 95, expected: True)",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000009"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixCacheFamilyCoverageTests.HolderFamilies_UseTheHolderAdapter(family: typeof(TensorSharp.Models.DeepSeek4Model))",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000008"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeInvariantCheckerTests.I9_OutOfOrder",
+          "outcome": "Passed",
+          "duration": "00:00:00.0001173"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.RadixKeyTests.BuildPrompt_OverwritesSpanPositionsWithMediaKeys",
+          "outcome": "Passed",
+          "duration": "00:00:00.0009667"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeInvariantCheckerTests.ValidWorld_HasNoViolations",
+          "outcome": "Passed",
+          "duration": "00:00:00.0002188"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeEdgeCaseTests.BlockedByScope_AtAPartiallyMatchedNode",
+          "outcome": "Passed",
+          "duration": "00:00:00.0003671"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeInvariantCheckerTests.I4_ScopedPublicBoundary",
+          "outcome": "Passed",
+          "duration": "00:00:00.0001229"
+        },
+        {
+          "name": "InferenceWeb.Tests.ContinuousBatchSchedulerTests.Engine_PrefixCacheHit_ReducesUncomputedTokens",
+          "outcome": "Passed",
+          "duration": "00:00:00.0234080"
+        },
+        {
+          "name": "InferenceWeb.Tests.Qwen4ExpRetainedCachePolicyTests.TreeOwned_RefusesInsteadOfEvicting_AndLeavesEveryRetainedHolderIntact",
+          "outcome": "Passed",
+          "duration": "00:00:00.0020309"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCacheStartupTests.TheEnvironmentVariableMovesTheRootButKeepsThePerModelSplit",
+          "outcome": "Passed",
+          "duration": "00:00:00.0025582"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.InflightTableTests.Promotion_OnLeaderGone_ReleasesTheOldestFollower(reason: 1)",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000619"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCacheStartupTests.AShortAgreementIsNotWorthWarming",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000366"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.HolderPrefixCacheAdapterTests.Donation_ShorterThanTheHolder_IsRefusedForAFamilyWithoutTruncationAndTheHolderStaysTheRequests",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000530"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.InflightTableTests.Promotion_OnLeaderGone_ReleasesTheOldestFollower(reason: 3)",
+          "outcome": "Passed",
+          "duration": "00:00:00.0001396"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeEdgeCaseTests.RetireScope_DetachesAnInternalEndStateAboveAStateLockedDescendant",
+          "outcome": "Passed",
+          "duration": "00:00:00.0005002"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeEvictionTests.ReclaimQueue_ReleasesOneBatchPerDrain",
+          "outcome": "Passed",
+          "duration": "00:00:00.0037955"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.DonationDecisionTests.PrimaryResident_KeepPrimary_Or_ConvertThenClone_Or_Rejected",
+          "outcome": "Passed",
+          "duration": "00:00:00.0002986"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeEvaluateTests.CostRule_SkipsClonesBelowMinCloneTokens",
+          "outcome": "Passed",
+          "duration": "00:00:00.0002458"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeAccountingTests.ResourceVector_Arithmetic",
+          "outcome": "Passed",
+          "duration": "00:00:00.0016385"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeEvictionTests.PublicMax_LimitsTierPublicTop_AndTheCountSubCap",
+          "outcome": "Passed",
+          "duration": "00:00:00.0022705"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeInvariantCheckerTests.I10_DuplicateKey",
+          "outcome": "Passed",
+          "duration": "00:00:00.0001324"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixCacheContractConformanceTests.DeviceDirtyOracle_RefusesToCloneAnUnsettledHolderUntilMaterializeSettlesIt(name: \"S\")",
+          "outcome": "Passed",
+          "duration": "00:00:00.0001011"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixCacheFamilyCoverageTests.PageFamilies_RefuseEveryEndStateMember(family: typeof(TensorSharp.Models.HunyuanDenseModel))",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000007"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.HolderPrefixCacheAdapterTests.AdapterBackedHolderFamily_PassesTheConformanceScript(name: \"N\")",
+          "outcome": "Passed",
+          "duration": "00:00:00.0002087"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.DonationDecisionTests.A_NotALeaf_Clones",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000502"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeAccountingTests.EffectiveCap_ClampsToSpareWithAFakeSource",
+          "outcome": "Passed",
+          "duration": "00:00:00.0002257"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeMatchTests.Match_IsPure",
+          "outcome": "Passed",
+          "duration": "00:00:00.0014258"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeMatchTests.K6_LeavesOneTokenUnmatched",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000972"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.HolderPrefixCacheAdapterTests.Donation_OfAHolderThatWrappedIsRefusedWithoutCorruptingIt",
+          "outcome": "Passed",
+          "duration": "00:00:00.0003461"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeEdgeCaseTests.SearchCap_GreedyPrefersTheLongerOwnChild",
+          "outcome": "Passed",
+          "duration": "00:00:00.0102922"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeInvariantCheckerTests.I6_LockRefWithoutAReceipt",
+          "outcome": "Passed",
+          "duration": "00:00:00.0001321"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixCacheFamilyCoverageTests.PageFamilies_RefuseEveryEndStateMember(family: typeof(TensorSharp.Models.Mistral3Model))",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000004"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.InflightTableTests.XxHash64_MatchesTheReferenceVectors",
+          "outcome": "Passed",
+          "duration": "00:00:00.0002524"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixCacheContractConformanceTests.OracleR_MaterializesExactLengthsOnlyAndCannotRewind",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000646"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeEvaluateTests.PageChain_StopsAtAMissingPage_AndAtMediaInsideAPage",
+          "outcome": "Passed",
+          "duration": "00:00:00.0001235"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCacheStartupTests.AWarmUpWithoutASessionIsRefused",
+          "outcome": "Passed",
+          "duration": "00:00:00.0001428"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeEvaluateTests.PageWindowTokens_StopsTheChain",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000705"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeMatchTests.SearchCap_FallsBackToTheGreedyRule",
+          "outcome": "Passed",
+          "duration": "00:00:00.0015426"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeLockTests.Acquire_SplitsAtThePlanLength_AndLocksPathAndState",
+          "outcome": "Passed",
+          "duration": "00:00:00.0003481"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeEvictionTests.ReclaimQueue_RepeatedKeyCanRequireDisposalWithoutDoubleCounting(disposal: Pressure)",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000032"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeEvaluateTests.TruncationKinds_AndRewindCap(kind: WithinRingSlack, parameter: 4, cached: 60, diverge: 55, expectTruncation: False)",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000072"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixCacheContractConformanceTests.OracleFake_PassesTheConformanceScript(name: \"P\")",
+          "outcome": "Passed",
+          "duration": "00:00:00.0002270"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeInvariantCheckerTests.I8_ProtectedCounter",
+          "outcome": "Passed",
+          "duration": "00:00:00.0001906"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeInvariantCheckerTests.I10_NotTreeMinted",
+          "outcome": "Passed",
+          "duration": "00:00:00.0001287"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeInsertSplitTests.Insert_PublicNodeContinuingPastP_IsSplitAtTheInsertersP",
+          "outcome": "Passed",
+          "duration": "00:00:00.0001293"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixCacheContractConformanceTests.OracleFakes_ReleaseIsBatchedAndIdempotent",
+          "outcome": "Passed",
+          "duration": "00:00:00.0001423"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeInvariantCheckerTests.I5_UnlockedPayloadlessLeaf",
+          "outcome": "Passed",
+          "duration": "00:00:00.0001390"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCacheStartupTests.TheWarmUpRequestIsTheOneARealTurnSends",
+          "outcome": "Passed",
+          "duration": "00:00:00.0105963"
+        },
+        {
+          "name": "InferenceWeb.Tests.DeepSeekSlotRetentionTests.KeyParameterisedRetain_MovesTheRequestsSlotUnderThePayloadKeyAndDonatesItBack",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000957"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.ResumabilityRulesTests.RouteMatrix",
+          "outcome": "Passed",
+          "duration": "00:00:00.0002221"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeInvariantCheckerTests.I8_NodeBytes",
+          "outcome": "Passed",
+          "duration": "00:00:00.0001760"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeEvaluateTests.TruncationKinds_AndRewindCap(kind: WithinRingSlack, parameter: 4, cached: 60, diverge: 56, expectTruncation: True)",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000078"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeMatchTests.Match_AllocatesNothingOnceWarm",
+          "outcome": "Passed",
+          "duration": "00:00:00.0237292"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.ResumabilityRulesTests.TruncationAllows_EveryKind(kind: 2, parameter: 64, cached: 64, target: 10, expected: True)",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000013"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.TreeTraceHarnessTests.TreeTraceHarness_AllSeedsClean",
+          "outcome": "Passed",
+          "duration": "00:07:05.4579603",
+          "output": "20000 seeds in 425.5 s: 5577492 plans, 5577492 brute-force comparisons, 4661865 acquires, 4531099 finishes, 0 failing seeds"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixCacheContractConformanceTests.OracleFakes_CountContractCallsButNotTheCapabilityRead",
+          "outcome": "Passed",
+          "duration": "00:00:00.0001865"
+        },
+        {
+          "name": "InferenceWeb.Tests.Qwen4ExpRetainedCachePolicyTests.DiscardAndTrim_FreeConversationsAndKeepCheckpoints",
+          "outcome": "Passed",
+          "duration": "00:00:00.0001613"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixCacheContractConformanceTests.GptOss20B_PassesTheConformanceScript_WithParityCapabilities",
+          "outcome": "NotExecuted",
+          "duration": "00:00:00.0010000",
+          "output": "Requires model weights (TS_TEST_MODEL_DIR not set)."
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.HolderPrefixCacheAdapterTests.AdapterWithoutASettle_FailsTheSettleThenCloneStep(name: \"R\")",
+          "outcome": "Passed",
+          "duration": "00:00:00.0004135"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeInvariantCheckerTests.I24_DepthBeyondTheContext",
+          "outcome": "Passed",
+          "duration": "00:00:00.0001466"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixCacheContractConformanceTests.OracleP_ModelPagedForwardReadsThroughTheBlockTableAndCopiesToAHolderExactly",
+          "outcome": "Passed",
+          "duration": "00:00:00.0018691"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeEvaluateTests.TieOrder_PrimaryThenDonateThenBindThenCloneThenInject",
+          "outcome": "Passed",
+          "duration": "00:00:00.0001605"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeEdgeCaseTests.InflightPromotion_SkipsAFollowerThatMovedToAnotherEntry",
+          "outcome": "Passed",
+          "duration": "00:00:00.0025219"
+        },
+        {
+          "name": "InferenceWeb.Tests.Qwen4ExpRetainedCachePolicyTests.Qwen4Exp_AdvertisesExactPrefixReuseOnly",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000708"
+        },
+        {
+          "name": "InferenceWeb.Tests.Qwen4ExpRetainedCachePolicyTests.DiscardRetainedCaches_ReleasesTheBatchAndIgnoresUnknownKeys",
+          "outcome": "Passed",
+          "duration": "00:00:00.0011179"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeInvariantCheckerTests.I15_RetiredScopeWithAnUnlockedNode",
+          "outcome": "Passed",
+          "duration": "00:00:00.0001326"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeScopeTests.RetireScope_DeletesUnlockedNodes_FlagsLockedOnes_DeletesThemOnUnlock",
+          "outcome": "Passed",
+          "duration": "00:00:00.0002734"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.InflightTableTests.Promotion_OnLeaderGone_ReleasesTheOldestFollower(reason: 0)",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000625"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeEvaluateTests.CandidatesAB_AndC_TheLongestWins",
+          "outcome": "Passed",
+          "duration": "00:00:00.0002125"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.DonationDecisionTests.B_Locked_Clones",
+          "outcome": "Passed",
+          "duration": "00:00:00.0002183"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeInvariantCheckerTests.I7_ChildLockedMoreThanParent",
+          "outcome": "Passed",
+          "duration": "00:00:00.0001321"
+        },
+        {
+          "name": "InferenceWeb.Tests.EngineParallelInferenceTests.Nemotron3_PrefixCacheHitAcceleratesSecondRequest",
+          "outcome": "Passed",
+          "duration": "00:00:00.0001020"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixCacheFamilyCoverageTests.HolderFamilies_UseTheHolderAdapter(family: typeof(TensorSharp.Models.Gemma4Model))",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000288"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeMatchTests.MediaVerify_SameIdDifferentLength_AndAdjacentSpans",
+          "outcome": "Passed",
+          "duration": "00:00:00.0001441"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeInvariantCheckerTests.I13_MediaElementWithoutARecord",
+          "outcome": "Passed",
+          "duration": "00:00:00.0001208"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.HolderPrefixCacheAdapterTests.ConvertPrimary_RefusesBeforeAdoptingWhenTheLengthDiffersOrAHolderIsCheckedOut",
+          "outcome": "Passed",
+          "duration": "00:00:00.0004596"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.HolderPrefixCacheAdapterTests.AdapterWithoutASettle_FailsTheSettleThenCloneStep(name: \"S\")",
+          "outcome": "Passed",
+          "duration": "00:00:00.0002127"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixCacheContractConformanceTests.DeviceDirtyOracle_RefusesToCloneAnUnsettledHolderUntilMaterializeSettlesIt(name: \"R\")",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000723"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeInvariantCheckerTests.I20_PersistedScopedEndState",
+          "outcome": "Passed",
+          "duration": "00:00:00.0001446"
+        },
+        {
+          "name": "InferenceWeb.Tests.Qwen4ExpRetainedCachePolicyTests.Capabilities_AreLegacyExactLengthAndCarryTheRetentionBudgetAsTheDeviceSubCap",
+          "outcome": "Passed",
+          "duration": "00:00:00.0029716"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeEvaluateTests.RouteReadability_PicksTheRoutesNaturalMode(storeValue: 1, routeValue: 0, expectedValue: 5)",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000083"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeMatchTests.AnotherScopesNodesAreNeverMatched",
+          "outcome": "Passed",
+          "duration": "00:00:00.0005551"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCacheStartupTests.TheThinkingFlagReachesTheRequest",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000996"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeEdgeCaseTests.CountSubCap_FailsWhenEveryVictimIsLocked",
+          "outcome": "Passed",
+          "duration": "00:00:00.0005578"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeInvariantCheckerTests.I9_DetachedButStillRecorded",
+          "outcome": "Passed",
+          "duration": "00:00:00.0001528"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.HolderPrefixCacheAdapterTests.AdapterBackedHolderFamily_PassesTheConformanceScript(name: \"P\")",
+          "outcome": "Passed",
+          "duration": "00:00:00.0002476"
+        },
+        {
+          "name": "InferenceWeb.Tests.DeepSeekSlotRetentionTests.FailedEmptyOrOverBudgetHolderKeepsItsOriginalOwner(healthy: True, fits: False, head: 9)",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000205"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCacheStartupTests.EachModelGetsItsOwnCheckpointDirectory",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000461"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.HolderPrefixCacheAdapterTests.PageOnlyFamily_RefusesEveryEndStateMember",
+          "outcome": "Passed",
+          "duration": "00:00:00.0004313"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixCacheContractConformanceTests.Gemma4_E4B_PassesTheConformanceScript_WithTheHolderPoolAttached",
+          "outcome": "NotExecuted",
+          "duration": "00:00:00.0010000",
+          "output": "Requires model weights (TS_TEST_MODEL_DIR not set)."
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeScopeTests.UnscopedRequests_AreIsolated_I29",
+          "outcome": "Passed",
+          "duration": "00:00:00.0001970"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeEdgeCaseTests.WithoutAReceiptLedger_LocksStillBalance",
+          "outcome": "Passed",
+          "duration": "00:00:00.0204459"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeEvictionTests.EffectiveCaps_EnforceCaps",
+          "outcome": "Passed",
+          "duration": "00:00:00.0005047"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.HolderPrefixCacheAdapterTests.AdapterBackedHolderFamily_PassesTheConformanceScript(name: \"R\")",
+          "outcome": "Passed",
+          "duration": "00:00:00.0016520"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.ResumabilityRulesTests.RewindCap_AndGranularityAlignment",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000829"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeEdgeCaseTests.Persistence_OnlyOnMediaFreePublicBoundaries",
+          "outcome": "Passed",
+          "duration": "00:00:00.0024786"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeScopeTests.Reset_ReleasesEverything_AndInvalidatesReceipts",
+          "outcome": "Passed",
+          "duration": "00:00:00.0001388"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeEvictionTests.ReclaimQueue_DisposalReasonSurvivesOrdinaryReleasesInEitherOrder(disposal: Reset)",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000115"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeEvaluateTests.RouteReadability_UnreadableStoresProduceNoPages",
+          "outcome": "Passed",
+          "duration": "00:00:00.0001975"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeInsertSplitTests.DuplicateEndState_IsQueued_TombstoneIsRevived",
+          "outcome": "Passed",
+          "duration": "00:00:00.0003347"
+        },
+        {
+          "name": "InferenceWeb.Tests.EngineParallelInferenceTests.Qwen36_PrefixCacheHitAcceleratesSecondRequest",
+          "outcome": "Passed",
+          "duration": "00:00:00.0007190"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeInvariantCheckerTests.I15_ScopeBytes",
+          "outcome": "Passed",
+          "duration": "00:00:00.0001410"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeInvariantCheckerTests.I24_ReceiptOfAnotherEpoch",
+          "outcome": "Passed",
+          "duration": "00:00:00.0001993"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.DonationDecisionTests.D_AnotherWaiterOfTheScope_Clones",
+          "outcome": "Passed",
+          "duration": "00:00:00.0004162"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixCacheContractConformanceTests.DeepSeek41_ManagedFixture_PassesTheConformanceScript_OnCpu",
+          "outcome": "NotExecuted",
+          "duration": "00:00:00.0010000",
+          "output": "Requires model weights (TS_TEST_DSV41_FIXTURE_DIR not set)."
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeEvaluateTests.TruncationKinds_AndRewindCap(kind: WithinUnwrappedWindow, parameter: 64, cached: 60, diverge: 50, expectTruncation: True)",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000117"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeMatchTests.APublicBranchNeverHidesALongerOwnScopeBranch",
+          "outcome": "Passed",
+          "duration": "00:00:00.0001455"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.ResumabilityRulesTests.TruncationAllows_EveryKind(kind: 99, parameter: 0, cached: 10, target: 5, expected: False)",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000009"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeEvaluateTests.TruncationKinds_AndRewindCap(kind: None, parameter: 0, cached: 60, diverge: 58, expectTruncation: False)",
+          "outcome": "Passed",
+          "duration": "00:00:00.0002205"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixCacheFamilyCoverageTests.PageFamilies_RefuseEveryEndStateMember(family: typeof(TensorSharp.Models.NemotronModel))",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000594"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixCacheContractConformanceTests.OracleFake_PassesTheConformanceScript(name: \"N\")",
+          "outcome": "Passed",
+          "duration": "00:00:00.0018346"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeInvariantCheckerTests.I28_RecycledScopeIndex",
+          "outcome": "Passed",
+          "duration": "00:00:00.0001648"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeInvariantCheckerTests.I21_CountSubCapExceeded",
+          "outcome": "Passed",
+          "duration": "00:00:00.0001527"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixCacheContractConformanceTests.OracleFake_PassesTheConformanceScript(name: \"S2\")",
+          "outcome": "Passed",
+          "duration": "00:00:00.0075440"
+        },
+        {
+          "name": "InferenceWeb.Tests.Qwen4ExpRetainedCachePolicyTests.Eviction_DropsOldestConversationsFirst_NeverACheckpoint_AndDeclinesWhenNothingFits",
+          "outcome": "Passed",
+          "duration": "00:00:00.0003357"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.CacheScopeTests.ScopeId_FromHex_AcceptsPhase0Widths",
+          "outcome": "Passed",
+          "duration": "00:00:00.0012926"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeInvariantCheckerTests.I9_UnlinkedLruEntry",
+          "outcome": "Passed",
+          "duration": "00:00:00.0001287"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeInvariantCheckerTests.I22_LockAtQuiescence",
+          "outcome": "Passed",
+          "duration": "00:00:00.0001600"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeInsertSplitTests.MediaRecords_MoveOnSplit",
+          "outcome": "Passed",
+          "duration": "00:00:00.0002387"
+        },
+        {
+          "name": "InferenceWeb.Tests.DeepSeekSlotRetentionTests.SelectedRetainedSlotWithNoPrimaryIsReclaimedAndItsGraphArenasReleased",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000725"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeEvaluateTests.RouteReadability_PicksTheRoutesNaturalMode(storeValue: 2, routeValue: 1, expectedValue: 6)",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000095"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeInvariantCheckerTests.I29_SharedUnscopedId",
+          "outcome": "Passed",
+          "duration": "00:00:00.0007736"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeEvaluateTests.BranchPosition_IsAHintWhenEnabled",
+          "outcome": "Passed",
+          "duration": "00:00:00.0001248"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixCacheFamilyCoverageTests.PageFamilies_RefuseEveryEndStateMember(family: typeof(TensorSharp.Models.GptOssModel))",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000296"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeEvictionTests.LockedPinnedAndDonationPending_AreNeverEvicted",
+          "outcome": "Passed",
+          "duration": "00:00:00.0008499"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeLockTests.StaleEmptyAndCrossTreeReceipts",
+          "outcome": "Passed",
+          "duration": "00:00:00.0005697"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.ResumabilityRulesTests.TruncationAllows_EveryKind(kind: 3, parameter: 5, cached: 100, target: 94, expected: False)",
+          "outcome": "Passed",
+          "duration": "00:00:00.0001555"
+        },
+        {
+          "name": "InferenceWeb.Tests.DeepSeekSlotRetentionTests.ExistingPrimaryIsSelectedBeforeFreeAndUnrelatedStateSurvives",
+          "outcome": "Passed",
+          "duration": "00:00:00.0001045"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixCacheContractConformanceTests.OracleR2_APageEndingOffAForwardBoundaryIsNotRestorable",
+          "outcome": "Passed",
+          "duration": "00:00:00.0014777"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.RadixKeyTests.KeyChunk_StaysBelowTheLargeObjectHeap",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000710"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeEvaluateTests.RouteReadability_PicksTheRoutesNaturalMode(storeValue: 3, routeValue: 1, expectedValue: 5)",
+          "outcome": "Passed",
+          "duration": "00:00:00.0025071"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeEvaluateTests.TruncationKinds_AndRewindCap(kind: Any, parameter: 0, cached: 60, diverge: 50, expectTruncation: True)",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000070"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeMatchTests.BlockedByScope_IsDiagnosticOnly",
+          "outcome": "Passed",
+          "duration": "00:00:00.0001547"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.CacheScopeTests.ScopeTable_InternsRecyclesAndIsolatesUnscoped",
+          "outcome": "Passed",
+          "duration": "00:00:00.0003427"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.ResumabilityRulesTests.TruncationAllows_EveryKind(kind: 1, parameter: 0, cached: 50, target: -1, expected: False)",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000009"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeEdgeCaseTests.DeletionAndCollection_Guards",
+          "outcome": "Passed",
+          "duration": "00:00:00.0087604"
+        },
+        {
+          "name": "InferenceWeb.Tests.DeepSeekSlotRetentionTests.AdoptedPrimaryRetainsAndRebindsWithoutResetCopyOrAllocation",
+          "outcome": "Passed",
+          "duration": "00:00:00.0001962"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixCacheContractConformanceTests.DeepSeek41_Flash_PassesTheConformanceScript",
+          "outcome": "NotExecuted",
+          "duration": "00:00:00.0010000",
+          "output": "Requires model weights (TS_TEST_DSV41_MODEL_DIR not set)."
+        },
+        {
+          "name": "InferenceWeb.Tests.Qwen4ExpRetainedCachePolicyTests.HalfSpareClamp_EvictsEvenUnderAGenerousConfiguredBudget",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000667"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.ResumabilityRulesTests.TruncationAllows_EveryKind(kind: 4, parameter: 0, cached: 1000, target: 2, expected: True)",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000012"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeScopeTests.AnotherScopesNodes_AreNeverMatchedTruncatedClonedOrDonated",
+          "outcome": "Passed",
+          "duration": "00:00:00.0005016"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeInvariantCheckerTests.I1_WrongDepth",
+          "outcome": "Passed",
+          "duration": "00:00:00.0001285"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeEvictionTests.ReclaimQueue_DisposalReasonSurvivesOrdinaryReleasesInEitherOrder(disposal: Invalidated)",
+          "outcome": "Passed",
+          "duration": "00:00:00.0001177"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeInvariantCheckerTests.I21_CapExceededAfterATrigger",
+          "outcome": "Passed",
+          "duration": "00:00:00.0019019"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCacheStartupTests.TheCheckpointDirectoryNamesTheModel",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000501"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeInvariantCheckerTests.I13_EndStateInsideASpan",
+          "outcome": "Passed",
+          "duration": "00:00:00.0001577"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.RadixKeyTests.BuildPrompt_RejectsInvalidSpans(start: 5, end: 9)",
+          "outcome": "Passed",
+          "duration": "00:00:00.0001418"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.RadixKeyTests.TextAndMediaElements_AreSeparatedByTheSignBit",
+          "outcome": "Passed",
+          "duration": "00:00:00.0001262"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.DonationDecisionTests.F_TruncationBeyondTheSlack_Clones",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000486"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeEvaluateTests.ModelDecides_HasNoRewindCap_GranularityAligns_ValidatorDecides",
+          "outcome": "Passed",
+          "duration": "00:00:00.0003212"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.ResumabilityRulesTests.TruncationAllows_EveryKind(kind: 1, parameter: 0, cached: 50, target: 50, expected: True)",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000027"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeInvariantCheckerTests.I12_A1PageWithoutASnapshot",
+          "outcome": "Passed",
+          "duration": "00:00:00.0011072"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.CacheScopeTests.ScopeId_NewFresh_IsRandomAndNeverPublic",
+          "outcome": "Passed",
+          "duration": "00:00:00.0018131"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.DonationDecisionTests.C_PublicNode_Clones",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000814"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeMatchTests.BreakpointLimit_CapsTheMatch",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000992"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeEvictionTests.LeafFirst_TombstoneCascade_InternalEndStateDetach",
+          "outcome": "Passed",
+          "duration": "00:00:00.0001716"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixCacheContractConformanceTests.OracleFake_PassesTheConformanceScript(name: \"P2\")",
+          "outcome": "Passed",
+          "duration": "00:00:00.0002003"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.ResumabilityRulesTests.Validate_RejectsUnusableRecords",
+          "outcome": "Passed",
+          "duration": "00:00:00.0009547"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeInvariantCheckerTests.I14_SecondPrimaryResident",
+          "outcome": "Passed",
+          "duration": "00:00:00.0001347"
+        },
+        {
+          "name": "InferenceWeb.Tests.GlmSlotRetentionTests.Release_FreesKnownSlots_IgnoresUnknownKeys_AndKeepsARefusedSlotForARetry",
+          "outcome": "Passed",
+          "duration": "00:00:00.0004140"
+        },
+        {
+          "name": "InferenceWeb.Tests.EngineParallelInferenceTests.Gemma4_PrefixCacheHitAcceleratesSecondRequest",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000122"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeScopeTests.RetireScope_WithWaitingRequests_RecyclesOnlyAfterThey_Leave",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000966"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeEvictionTests.EvictionOrder_FollowsTiers",
+          "outcome": "Passed",
+          "duration": "00:00:00.0005905"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeAccountingTests.EveryZeroOneTransition_MovesProtectedBytes_PerClass",
+          "outcome": "Passed",
+          "duration": "00:00:00.0003749"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.ResumabilityRulesTests.ClampAligned_NeverLandsInsideASpan",
+          "outcome": "Passed",
+          "duration": "00:00:00.0001182"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeInvariantCheckerTests.I11_BlockOwnedTwice",
+          "outcome": "Passed",
+          "duration": "00:00:00.0001882"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.HolderPrefixCacheAdapterTests.Import_OfTheWrongLengthIsDiscarded",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000868"
+        },
+        {
+          "name": "InferenceWeb.Tests.Qwen4ExpRetainedCachePolicyTests.TreeOwned_ACheckpointMayBeDonated_LegacyNever",
+          "outcome": "Passed",
+          "duration": "00:00:00.0055629"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.HolderPrefixCacheAdapterTests.Materialize_RevalidatesWithCanMaterialize",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000853"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.InflightTableTests.Promotion_OnLeaderGone_ReleasesTheOldestFollower(reason: 2)",
+          "outcome": "Passed",
+          "duration": "00:00:00.0001747"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeInvariantCheckerTests.I11_PageOnTheWrongNode",
+          "outcome": "Passed",
+          "duration": "00:00:00.0001934"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeLockTests.MoveDurableLock_AcquiresTheNewPathBeforeReleasingTheOld",
+          "outcome": "Passed",
+          "duration": "00:00:00.0004319"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeMatchTests.PublicAndOwnScopeChildren_LongerWins_TieGoesToOwnScope",
+          "outcome": "Passed",
+          "duration": "00:00:00.0001237"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeInvariantCheckerTests.I3_ScopedChildOfAnotherScope",
+          "outcome": "Passed",
+          "duration": "00:00:00.0001460"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeLockTests.StateLockProtectsTheEndState_PathLockProtectsPages",
+          "outcome": "Passed",
+          "duration": "00:00:00.0014456"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeEvaluateTests.ModelRefusal_IsQueuedAndAppliedAfterAdmission",
+          "outcome": "Passed",
+          "duration": "00:00:00.0001649"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeInvariantCheckerTests.I6_StateLockWithoutAReceipt",
+          "outcome": "Passed",
+          "duration": "00:00:00.0003423"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.RadixKeyTests.RopeCompaction_CopiesSurvivingSlicesAndReturnsChunks",
+          "outcome": "Passed",
+          "duration": "00:00:00.0011375"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.DonationDecisionTests.DonateOnly_SharedPayload_IsRejected",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000715"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixCacheContractConformanceTests.OracleN_ReclaimsTheOldestRetainedSlotAndReportsItThroughTheSink",
+          "outcome": "Passed",
+          "duration": "00:00:00.0017317"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCacheStartupTests.OneDivergentRenderCutsThePrefixForEveryone",
+          "outcome": "Passed",
+          "duration": "00:00:00.0016586"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeScopeTests.InvalidatePayload_DetachesWithoutRelease_AndBackendRecreatedDropsDeviceState",
+          "outcome": "Passed",
+          "duration": "00:00:00.0013835"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.InflightTableTests.Follow_SkipNotBlock_Completion",
+          "outcome": "Passed",
+          "duration": "00:00:00.0003712"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeEdgeCaseTests.LockUnderflow_IsReportedNotHidden",
+          "outcome": "Passed",
+          "duration": "00:00:00.0003092"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.ResumabilityRulesTests.TruncationAllows_EveryKind(kind: 1, parameter: 0, cached: 50, target: 51, expected: False)",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000022"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.ResumabilityRulesTests.TruncationAllows_EveryKind(kind: 1, parameter: 0, cached: 50, target: 40, expected: True)",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000010"
+        },
+        {
+          "name": "InferenceWeb.Tests.DeepSeekSlotRetentionTests.NativeEvictionRefusalKeepsOwnershipForRetry(failure: \"free\")",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000352"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.RadixKeyTests.MediaId_ParsesLowercaseHex_AndFallsBackToAPathHash",
+          "outcome": "Passed",
+          "duration": "00:00:00.0016666"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCacheStartupTests.SameFileNameInDifferentDirectoriesDoesNotCollide",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000353"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeEvictionTests.ScopeQuota_AndScopedCountSubCap",
+          "outcome": "Passed",
+          "duration": "00:00:00.0003408"
+        },
+        {
+          "name": "InferenceWeb.Tests.EngineParallelInferenceTests.Gemma4_SwaPrefixCacheReuseAcrossLongTurn",
+          "outcome": "Passed",
+          "duration": "00:00:00.0018334"
+        },
+        {
+          "name": "InferenceWeb.Tests.DeepSeekSlotRetentionTests.FailedEmptyOrOverBudgetHolderKeepsItsOriginalOwner(healthy: True, fits: True, head: 0)",
+          "outcome": "Passed",
+          "duration": "00:00:00.0001108"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixCacheFamilyCoverageTests.HolderFamilies_UseTheHolderAdapter(family: typeof(TensorSharp.Models.Qwen4ExpModel))",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000201"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixCacheContractConformanceTests.OracleFake_PassesTheConformanceScript(name: \"S\")",
+          "outcome": "Passed",
+          "duration": "00:00:00.0003043"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCacheStartupTests.OnlyTokensEveryRenderAgreesOnAreWarmed",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000554"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixCacheContractConformanceTests.OracleFake_PassesTheConformanceScript(name: \"R2\")",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000646"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixCacheContractConformanceTests.OracleS_ARewindOfAWrappedRingSucceedsWithAWrongState",
+          "outcome": "Passed",
+          "duration": "00:00:00.0013256"
+        },
+        {
+          "name": "InferenceWeb.Tests.DeepSeekSlotRetentionTests.KeyCollisionDoesNotConsumeEitherHolder",
+          "outcome": "Passed",
+          "duration": "00:00:00.0003653"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.ResumabilityRulesTests.TruncationAllows_EveryKind(kind: 2, parameter: 64, cached: 65, target: 60, expected: False)",
+          "outcome": "Passed",
+          "duration": "00:00:00.0010344"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeMatchTests.PublicCap_AllowsALongerSharedSystemPrompt_S4",
+          "outcome": "Passed",
+          "duration": "00:00:00.0001408"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeInsertSplitTests.Insert_SplitsAtP_AndFlagsThePublicBoundary",
+          "outcome": "Passed",
+          "duration": "00:00:00.0004357"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeEvaluateTests.PagesNeedStateAtEnd_BacktracksToTheLastRestorablePage",
+          "outcome": "Passed",
+          "duration": "00:00:00.0001660"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.HolderPrefixCacheAdapterTests.Donation_ShorterThanTheHolder_RewindsWhereTheFamilyCanAndContinuesExactly",
+          "outcome": "Passed",
+          "duration": "00:00:00.0005697"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.HolderPrefixCacheAdapterTests.AdapterBackedHolderFamily_PassesTheConformanceScript(name: \"S\")",
+          "outcome": "Passed",
+          "duration": "00:00:00.0011646"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeInvariantCheckerTests.I2_TwoChildrenShareAKey",
+          "outcome": "Passed",
+          "duration": "00:00:00.0002887"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeInvariantCheckerTests.I25_QueuedKeyStillOnANode",
+          "outcome": "Passed",
+          "duration": "00:00:00.0002258"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixCacheContractConformanceTests.OracleFakes_AreSevenAndEachEmulatesADistinctFamily",
+          "outcome": "Passed",
+          "duration": "00:00:00.0025535"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeEdgeCaseTests.MediaVerification_ToleratesACorruptNodeAndNullSpans",
+          "outcome": "Passed",
+          "duration": "00:00:00.0002774"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeInsertSplitTests.Insert_BreakpointAndPromptEndFlags_AreRecorded",
+          "outcome": "Passed",
+          "duration": "00:00:00.0001016"
+        },
+        {
+          "name": "InferenceWeb.Tests.Qwen4ExpRetainedCachePolicyTests.TreeOwned_TrimReportsEveryHolderItFreesThroughTheSink",
+          "outcome": "Passed",
+          "duration": "00:00:00.0027015"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixCacheContractConformanceTests.Qwen38_FlashNext_PassesTheConformanceScript",
+          "outcome": "NotExecuted",
+          "duration": "00:00:00.0010000",
+          "output": "Requires model weights (TS_TEST_QWEN38_DIR not set)."
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.RadixKeyTests.BuildPrompt_RejectsInvalidSpans(start: -1, end: 2)",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000064"
+        },
+        {
+          "name": "InferenceWeb.Tests.GlmSlotRetentionTests.ARefusedRewind_FreesTheFreshPrimaryItAllocated_AndLeavesTheSlotAsItWas",
+          "outcome": "Passed",
+          "duration": "00:00:00.0006623"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.InflightTableTests.HashCollision_IsRejectedByTheFullCompare",
+          "outcome": "Passed",
+          "duration": "00:00:00.0003506"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeEvaluateTests.RouteReadability_PicksTheRoutesNaturalMode(storeValue: 2, routeValue: 0, expectedValue: 6)",
+          "outcome": "Passed",
+          "duration": "00:00:00.0002474"
+        },
+        {
+          "name": "InferenceWeb.Tests.GlmSlotRetentionTests.DonateThenReturn_MovesTheSlotBothWays_AndABoundDonationCannotReturn",
+          "outcome": "Passed",
+          "duration": "00:00:00.0003457"
+        },
+        {
+          "name": "InferenceWeb.Tests.Qwen4ExpRetainedCachePolicyTests.Legacy_TrimReportsNothing",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000530"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeEvictionTests.E7_InternalPagesAreFreedOnlyWithTheLeaf",
+          "outcome": "Passed",
+          "duration": "00:00:00.0008649"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeInvariantCheckerTests.I19_MutationWithoutAVersionBump",
+          "outcome": "Passed",
+          "duration": "00:00:00.0014720"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeInvariantCheckerTests.I15_NodeMissingFromItsScopeList",
+          "outcome": "Passed",
+          "duration": "00:00:00.0002207"
+        },
+        {
+          "name": "InferenceWeb.Tests.DeepSeekSlotRetentionTests.NativeEvictionRefusalKeepsOwnershipForRetry(failure: \"select\")",
+          "outcome": "Passed",
+          "duration": "00:00:00.0001518"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeEdgeCaseTests.DeepPaths_GrowTheScratchBuffers",
+          "outcome": "Passed",
+          "duration": "00:00:00.0248441"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeEvaluateTests.TruncationKinds_AndRewindCap(kind: WithinUnwrappedWindow, parameter: 32, cached: 60, diverge: 50, expectTruncation: False)",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000070"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeLockTests.Receipt_ReplaysThroughNodesCreatedAfterTheLock",
+          "outcome": "Passed",
+          "duration": "00:00:00.0002648"
+        },
+        {
+          "name": "InferenceWeb.Tests.Qwen35PrimaryDecodeAfterHolderTests.PrimaryDecodes_WhenAHolderRanTheModelsFirstFusedDecode",
+          "outcome": "NotExecuted",
+          "duration": "00:00:00.0010000",
+          "output": "Requires model weights (TS_TEST_MODEL_DIR not set)."
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeEvictionTests.PreemptHold_KeepsANodeInTierScopeNewest",
+          "outcome": "Passed",
+          "duration": "00:00:00.0002464"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeMatchTests.ReuseAcrossMediaSpanFalse_ClampsToTheFirstSpanStart",
+          "outcome": "Passed",
+          "duration": "00:00:00.0004586"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeEvaluateTests.RouteReadability_PicksTheRoutesNaturalMode(storeValue: 1, routeValue: 2, expectedValue: 5)",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000100"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.MeasureEndStateTests.Qwen35_MeasureEndState_MatchesIdleHolderBytesWithinOnePercent",
+          "outcome": "NotExecuted",
+          "duration": "00:00:00.0010000",
+          "output": "Requires model weights (TS_TEST_MODEL_DIR not set)."
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCacheStartupTests.TheMarginIsAlwaysTaken",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000224"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeAccountingTests.PendingReclaim_HoldsEvictedBytesUntilTheDrain",
+          "outcome": "Passed",
+          "duration": "00:00:00.0001652"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCacheStartupTests.AnErrorFrameIsNotAWarmCache",
+          "outcome": "Passed",
+          "duration": "00:00:00.0005784"
+        },
+        {
+          "name": "InferenceWeb.Tests.GlmSlotRetentionTests.RetainingARequestThatAdoptedThePrimary_AllocatesAFreshPrimary_OrRefusesUntouched",
+          "outcome": "Passed",
+          "duration": "00:00:00.0005494"
+        },
+        {
+          "name": "InferenceWeb.Tests.Qwen4ExpRetainedCachePolicyTests.Budget_IncludesRetainedBytes_ClampsToHalfSpare_AndZeroDeclines",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000708"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeEvictionTests.ReclaimQueue_RepeatedKeyCanRequireDisposalWithoutDoubleCounting(disposal: Invalidated)",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000757"
+        },
+        {
+          "name": "InferenceWeb.Tests.DeepSeekSlotRetentionTests.FailedSelectedReclamationIsNotPublishedAsHealthyPrimary(failure: \"graphs\")",
+          "outcome": "Passed",
+          "duration": "00:00:00.0002936"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeMatchTests.ExactPartialAndMidEdgeMatches",
+          "outcome": "Passed",
+          "duration": "00:00:00.0004316"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeEdgeCaseTests.TruncationSearch_StopsAtItsNodeBudget",
+          "outcome": "Passed",
+          "duration": "00:00:00.0010352"
+        },
+        {
+          "name": "InferenceWeb.Tests.DeepSeekSlotRetentionTests.FailedSelectedReclamationIsNotPublishedAsHealthyPrimary(failure: \"reset\")",
+          "outcome": "Passed",
+          "duration": "00:00:00.0001574"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCacheStartupTests.NoRendersWarmNothing",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000771"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.DonationDecisionTests.E_NoEndStateSupport_IsRejected",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000835"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.RadixKeyTests.AppendOutput_WritesOnlyPastTheLength",
+          "outcome": "Passed",
+          "duration": "00:00:00.0003891"
+        },
+        {
+          "name": "InferenceWeb.Tests.GlmSlotRetentionTests.RetainingTheActiveSlot_SelectsThePrimaryAndKeysTheSlotByThePayload",
+          "outcome": "Passed",
+          "duration": "00:00:00.0003822"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeInvariantCheckerTests.I28_UnknownScopeIndex",
+          "outcome": "Passed",
+          "duration": "00:00:00.0001358"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixCacheFamilyCoverageTests.PageFamilies_RefuseEveryEndStateMember(family: typeof(TensorSharp.Models.MuseGlimmerModel))",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000011"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.InflightTableTests.DiskRestore_IsALeader_AndItsFailurePromotes",
+          "outcome": "Passed",
+          "duration": "00:00:00.0012526"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeEvaluateTests.RouteReadability_PicksTheRoutesNaturalMode(storeValue: 2, routeValue: 2, expectedValue: 4)",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000088"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixCacheContractConformanceTests.OracleFake_PassesTheConformanceScript(name: \"R\")",
+          "outcome": "Passed",
+          "duration": "00:00:00.0008375"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeInvariantCheckerTests.EveryTreeLevelInvariant_HasAMutationTest",
+          "outcome": "Passed",
+          "duration": "00:00:00.0004256"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeInvariantCheckerTests.I18_DonationPendingAfterTheStep",
+          "outcome": "Passed",
+          "duration": "00:00:00.0003306"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixCacheContractConformanceTests.OracleP2_AZeroSlabInjectedAsAPageChangesTheOutput",
+          "outcome": "Passed",
+          "duration": "00:00:00.0001528"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.InflightTableTests.Promotion_OnStall_AfterEightScheduledStepsWithoutProgress",
+          "outcome": "Passed",
+          "duration": "00:00:00.0002796"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeLockTests.LastUnlockOfAPayloadlessLeaf_DeletesIt",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000961"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeInsertSplitTests.SplittingAPagesOnlyLeaf_DropsTheEmptyRemainder",
+          "outcome": "Passed",
+          "duration": "00:00:00.0001417"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeInvariantCheckerTests.I16_TooManyPublicTop",
+          "outcome": "Passed",
+          "duration": "00:00:00.0002198"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.ResumabilityRulesTests.TruncationAllows_EveryKind(kind: 0, parameter: 0, cached: 50, target: 40, expected: False)",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000008"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeEdgeCaseTests.StaleMatchException_CarriesBothVersions",
+          "outcome": "Passed",
+          "duration": "00:00:00.0002426"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.RadixKeyTests.KeyRope_CommonPrefixAcrossChunkBoundaries",
+          "outcome": "Passed",
+          "duration": "00:00:00.0030034"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeEvictionTests.CountSubCap_EvictsTheOldestAcrossLeafAndStateLists",
+          "outcome": "Passed",
+          "duration": "00:00:00.0002170"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeEvictionTests.ReclaimQueue_DisposalReasonSurvivesOrdinaryReleasesInEitherOrder(disposal: Pressure)",
+          "outcome": "Passed",
+          "duration": "00:00:00.0050823"
+        },
+        {
+          "name": "InferenceWeb.Tests.GlmSlotRetentionTests.RetainingAnInactiveSlot_ReadsItThroughASelectAndRestoresTheSelection",
+          "outcome": "Passed",
+          "duration": "00:00:00.0040465"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeEvaluateTests.RouteReadability_PicksTheRoutesNaturalMode(storeValue: 3, routeValue: 0, expectedValue: 5)",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000501"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeInvariantCheckerTests.I1_EdgeOutsideRopeAndNodeCount",
+          "outcome": "Passed",
+          "duration": "00:00:00.0002905"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeEvaluateTests.TruncationTarget_AlignedToGranularity_StaysOutsideMediaSpans",
+          "outcome": "Passed",
+          "duration": "00:00:00.0001111"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeEvaluateTests.RouteReadability_PicksTheRoutesNaturalMode(storeValue: 3, routeValue: 2, expectedValue: 4)",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000075"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.ResumabilityRulesTests.Permitted_AndClamp",
+          "outcome": "Passed",
+          "duration": "00:00:00.0014308"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeInsertSplitTests.Split_IsO1_WithSharedRopeSlices",
+          "outcome": "Passed",
+          "duration": "00:00:00.0004689"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeEdgeCaseTests.EvictionLists_Guards",
+          "outcome": "Passed",
+          "duration": "00:00:00.0011899"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeEdgeCaseTests.EqualCandidates_TieBreakByRankThenAge",
+          "outcome": "Passed",
+          "duration": "00:00:00.0014321"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixCacheFamilyCoverageTests.HolderFamilies_UseTheHolderAdapter(family: typeof(TensorSharp.Models.Qwen35Model))",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000005"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixCacheFamilyCoverageTests.EveryEngineServedFamily_ImplementsTheContractAndItsDiagnostics",
+          "outcome": "Passed",
+          "duration": "00:00:00.0024118"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeEvictionTests.PromptEndSplit_EvictsOutputPagesFirst",
+          "outcome": "Passed",
+          "duration": "00:00:00.0002327"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeEvaluateTests.MmReuseMinTokens_DropsShortReuseBeforeMedia",
+          "outcome": "Passed",
+          "duration": "00:00:00.0001448"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeEvaluateTests.PrimaryAvailable_GatesThePrimaryResident",
+          "outcome": "Passed",
+          "duration": "00:00:00.0005018"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixCacheFamilyCoverageTests.PageFamilies_RefuseEveryEndStateMember(family: typeof(TensorSharp.Models.Qwen3Model))",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000006"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeEdgeCaseTests.CostRule_FallsBackFromATruncatedCloneOrAConvertedPrimary",
+          "outcome": "Passed",
+          "duration": "00:00:00.0031027"
+        },
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixTreeEvictionTests.RetiredTier_IsEvictedFirst",
+          "outcome": "Passed",
+          "duration": "00:00:00.0001934"
+        }
+      ]
+    },
+    "radix-m0": {
+      "counters": {
+        "total": "51",
+        "executed": "51",
+        "passed": "51",
+        "failed": "0",
+        "error": "0",
+        "timeout": "0",
+        "aborted": "0",
+        "inconclusive": "0",
+        "passedButRunAborted": "0",
+        "notRunnable": "0",
+        "notExecuted": "0",
+        "disconnected": "0",
+        "warning": "0",
+        "completed": "0",
+        "inProgress": "0",
+        "pending": "0"
+      },
+      "tests": [
+        {
+          "name": "InferenceWeb.Tests.KvStateFingerprintNonEmptyTests.Fingerprint_IsNonEmpty_AndVariesWithLayerCountAndKvDtype(family: typeof(TensorSharp.Models.Qwen3Model))",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000420"
+        },
+        {
+          "name": "InferenceWeb.Tests.KvBlockTransferRingTests.MuseGlimmer_CanTruncate_HonoursTheRingSlack(cached: 6000, target: 6001, expected: False)",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000009"
+        },
+        {
+          "name": "InferenceWeb.Tests.InferenceEngineHostRebuildTests.SameFingerprint_DifferentModelObject_BuildsANewEngineOnTheNewModel",
+          "outcome": "Passed",
+          "duration": "00:00:00.0190895"
+        },
+        {
+          "name": "InferenceWeb.Tests.KvStateFingerprintNonEmptyTests.EveryEngineServedFamily_OverridesTheFingerprint",
+          "outcome": "Passed",
+          "duration": "00:00:00.0027096"
+        },
+        {
+          "name": "InferenceWeb.Tests.KvBlockTransferRingTests.Extract_BlockPastTheRing_ReadsTheWrappedRows",
+          "outcome": "Passed",
+          "duration": "00:00:00.0040461"
+        },
+        {
+          "name": "InferenceWeb.Tests.KvStateFingerprintNonEmptyTests.Fingerprint_IsNonEmpty_AndVariesWithLayerCountAndKvDtype(family: typeof(TensorSharp.Models.GptOssModel))",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000460"
+        },
+        {
+          "name": "InferenceWeb.Tests.KvBlockTransferRingTests.Extract_UniformCache_IsUnaffectedByTheRingParameter",
+          "outcome": "Passed",
+          "duration": "00:00:00.0015117"
+        },
+        {
+          "name": "InferenceWeb.Tests.KvStateFingerprintNonEmptyTests.Glm_SyntheticCheckpoints_ReportDistinctNonEmptyFingerprints",
+          "outcome": "Passed",
+          "duration": "00:00:00.0557528"
+        },
+        {
+          "name": "InferenceWeb.Tests.InjectShortfallAccountingTests.PerBlockCaptureModel_BacksOffToTheLastRestorableBlock_AndOutputEqualsCold",
+          "outcome": "Passed",
+          "duration": "00:00:00.0198758"
+        },
+        {
+          "name": "InferenceWeb.Tests.InjectShortfallAccountingTests.RefusedBlockOnAFreshFusedHolder_CorrectsReuse_AndOutputEqualsCold",
+          "outcome": "Passed",
+          "duration": "00:00:00.3284167"
+        },
+        {
+          "name": "InferenceWeb.Tests.KvBlockTransferRingTests.MuseGlimmer_CanTruncate_HonoursTheRingSlack(cached: 4000, target: 100, expected: True)",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000012"
+        },
+        {
+          "name": "InferenceWeb.Tests.InferenceEngineHostRebuildTests.DifferentFingerprint_SameModelObject_StillRebuilds",
+          "outcome": "Passed",
+          "duration": "00:00:00.0011940"
+        },
+        {
+          "name": "InferenceWeb.Tests.KvBlockTransferRingTests.MuseGlimmer_CanTruncate_HonoursTheRingSlack(cached: 20000, target: 5000, expected: False)",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000020"
+        },
+        {
+          "name": "InferenceWeb.Tests.KvBlockTransferRingTests.MuseGlimmer_TryTruncate_JudgesASecondRewindByTheFurthestHead_NotTheCurrentOne",
+          "outcome": "Passed",
+          "duration": "00:00:00.0025970"
+        },
+        {
+          "name": "InferenceWeb.Tests.KvStateFingerprintNonEmptyTests.Fingerprint_IsNonEmpty_AndVariesWithLayerCountAndKvDtype(family: typeof(TensorSharp.Models.DeepSeek4Model))",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000050"
+        },
+        {
+          "name": "InferenceWeb.Tests.KvBlockTransferRingTests.MuseGlimmer_CanTruncate_HonoursTheRingSlack(cached: 4352, target: 1, expected: True)",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000010"
+        },
+        {
+          "name": "InferenceWeb.Tests.InjectShortfallAccountingTests.RecomputedTailThatCrossesThePromptEnd_ForwardsPromptAndGeneratedTokensSeparately",
+          "outcome": "Passed",
+          "duration": "00:00:00.0020780"
+        },
+        {
+          "name": "InferenceWeb.Tests.KvBlockTransferRingTests.MuseGlimmer_Truncate_ThrowsInsteadOfContinuingFromOverwrittenRows",
+          "outcome": "Passed",
+          "duration": "00:00:00.0001451"
+        },
+        {
+          "name": "InferenceWeb.Tests.KvBlockTransferRingTests.Inject_BlockWiderThanTheRing_ReturnsFalse",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000688"
+        },
+        {
+          "name": "InferenceWeb.Tests.InjectShortfallAccountingTests.RefusedBlockAtAdmission_OnTheFirstBlock_ReusesNothing_AndOutputEqualsCold",
+          "outcome": "Passed",
+          "duration": "00:00:00.0014637"
+        },
+        {
+          "name": "InferenceWeb.Tests.KvStateFingerprintNonEmptyTests.Glm_IsNonEmpty_AndVariesWithTrunkDepthArchitectureAndCacheDtype",
+          "outcome": "Passed",
+          "duration": "00:00:00.0003239"
+        },
+        {
+          "name": "InferenceWeb.Tests.KvBlockTransferRingTests.Extract_RangePastAUniformCachesRows_ReturnsFalse",
+          "outcome": "Passed",
+          "duration": "00:00:00.0011151"
+        },
+        {
+          "name": "InferenceWeb.Tests.GlmTruncateRefusalTests.GlmDsa_NativeRefusal_IsReportedAndLeavesTheHead",
+          "outcome": "Passed",
+          "duration": "00:00:00.0917786"
+        },
+        {
+          "name": "InferenceWeb.Tests.KvStateFingerprintNonEmptyTests.Fingerprint_IsNonEmpty_AndVariesWithLayerCountAndKvDtype(family: typeof(TensorSharp.Models.HunyuanDenseModel))",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000494"
+        },
+        {
+          "name": "InferenceWeb.Tests.KvBlockTransferRingTests.ExtractThenInject_RingAndLinearLayers_RoundTripsExactly(ring: 300, blockSize: 100, seqLen: 1000)",
+          "outcome": "Passed",
+          "duration": "00:00:00.0106667"
+        },
+        {
+          "name": "InferenceWeb.Tests.KvBlockTransferRingTests.MuseGlimmer_UniformCache_KeepsTheBaseRule",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000347"
+        },
+        {
+          "name": "InferenceWeb.Tests.GlmTruncateRefusalTests.Glm5Next_NativeRefusesAMidSequenceRewind_AndTheTrunkIsUntouched",
+          "outcome": "Passed",
+          "duration": "00:00:00.0110185"
+        },
+        {
+          "name": "InferenceWeb.Tests.GlmTruncateRefusalTests.Glm_VoidTruncate_ThrowsOnARefusal_InsteadOfReturningWithAStaleHead",
+          "outcome": "Passed",
+          "duration": "00:00:00.0084162"
+        },
+        {
+          "name": "InferenceWeb.Tests.KvBlockTransferRingTests.Extract_BlockPastAShortLayersRows_IsRefusedWhenAddressedLinearly",
+          "outcome": "Passed",
+          "duration": "00:00:00.0022302"
+        },
+        {
+          "name": "InferenceWeb.Tests.GlmTruncateRefusalTests.Glm5Next_RewindToTheHeadOrToZero_IsStillAccepted",
+          "outcome": "Passed",
+          "duration": "00:00:00.0755412"
+        },
+        {
+          "name": "InferenceWeb.Tests.InjectShortfallAccountingTests.RefusedBlockOnADecodersSwapIn_RecomputesItsGeneratedTail_AndOutputEqualsCold",
+          "outcome": "Passed",
+          "duration": "00:00:00.0040502"
+        },
+        {
+          "name": "InferenceWeb.Tests.KvBlockTransferRingTests.Extract_BlockScrolledOutOfTheRing_ReturnsFalse",
+          "outcome": "Passed",
+          "duration": "00:00:00.0028155"
+        },
+        {
+          "name": "InferenceWeb.Tests.KvStateFingerprintNonEmptyTests.Fingerprint_IsNonEmpty_AndVariesWithLayerCountAndKvDtype(family: typeof(TensorSharp.Models.NemotronModel))",
+          "outcome": "Passed",
+          "duration": "00:00:00.0001372"
+        },
+        {
+          "name": "InferenceWeb.Tests.KvBlockTransferRingTests.MuseGlimmer_CanTruncate_HonoursTheRingSlack(cached: 6000, target: 3696, expected: False)",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000009"
+        },
+        {
+          "name": "InferenceWeb.Tests.KvBlockTransferRingTests.ExtractThenInject_RingAndLinearLayers_RoundTripsExactly(ring: 512, blockSize: 256, seqLen: 1536)",
+          "outcome": "Passed",
+          "duration": "00:00:00.0126669"
+        },
+        {
+          "name": "InferenceWeb.Tests.KvStateFingerprintNonEmptyTests.Fingerprint_IsNonEmpty_AndVariesWithLayerCountAndKvDtype(family: typeof(TensorSharp.Models.MuseGlimmerModel))",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000462"
+        },
+        {
+          "name": "InferenceWeb.Tests.KvBlockTransferRingTests.ExtractThenInject_RingAndLinearLayers_RoundTripsExactly(ring: 640, blockSize: 256, seqLen: 1792)",
+          "outcome": "Passed",
+          "duration": "00:00:00.0274454"
+        },
+        {
+          "name": "InferenceWeb.Tests.KvBlockTransferRingTests.MuseGlimmer_CanTruncate_HonoursTheRingSlack(cached: 6000, target: 6000, expected: True)",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000014"
+        },
+        {
+          "name": "InferenceWeb.Tests.KvStateFingerprintNonEmptyTests.Fingerprint_IsNonEmpty_AndVariesWithLayerCountAndKvDtype(family: typeof(TensorSharp.Models.Mistral3Model))",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000534"
+        },
+        {
+          "name": "InferenceWeb.Tests.KvBlockTransferRingTests.MuseGlimmer_CanTruncate_HonoursTheRingSlack(cached: 6000, target: 0, expected: True)",
+          "outcome": "Passed",
+          "duration": "00:00:00.0013369"
+        },
+        {
+          "name": "InferenceWeb.Tests.KvStateFingerprintNonEmptyTests.Fingerprint_IsNonEmpty_AndVariesWithLayerCountAndKvDtype(family: typeof(TensorSharp.Models.Qwen4ExpModel))",
+          "outcome": "Passed",
+          "duration": "00:00:00.0001482"
+        },
+        {
+          "name": "InferenceWeb.Tests.KvBlockTransferRingTests.MuseGlimmer_TryTruncate_RewindsWithinTheSlack",
+          "outcome": "Passed",
+          "duration": "00:00:00.0001072"
+        },
+        {
+          "name": "InferenceWeb.Tests.KvBlockTransferRingTests.MuseGlimmer_CanTruncate_HonoursTheRingSlack(cached: 6000, target: 3697, expected: True)",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000009"
+        },
+        {
+          "name": "InferenceWeb.Tests.KvStateFingerprintNonEmptyTests.Fingerprint_IsNonEmpty_AndVariesWithLayerCountAndKvDtype(family: typeof(TensorSharp.Models.Qwen35Model))",
+          "outcome": "Passed",
+          "duration": "00:00:00.0020213"
+        },
+        {
+          "name": "InferenceWeb.Tests.KvBlockTransferRingTests.MuseGlimmer_CanTruncate_HonoursTheRingSlack(cached: 6000, target: 5984, expected: True)",
+          "outcome": "Passed",
+          "duration": "00:00:00.0001081"
+        },
+        {
+          "name": "InferenceWeb.Tests.KvStateFingerprintNonEmptyTests.Fingerprint_IsNonEmpty_AndVariesWithLayerCountAndKvDtype(family: typeof(TensorSharp.Models.DeepSeek41Model))",
+          "outcome": "Passed",
+          "duration": "00:00:00.0003094"
+        },
+        {
+          "name": "InferenceWeb.Tests.GlmTruncateRefusalTests.GlmDsa_AcceptedRewind_MovesTheHead_AndContinuesExactly",
+          "outcome": "Passed",
+          "duration": "00:00:00.0320882"
+        },
+        {
+          "name": "InferenceWeb.Tests.KvStateFingerprintNonEmptyTests.Fingerprint_IsNonEmpty_AndVariesWithLayerCountAndKvDtype(family: typeof(TensorSharp.Models.Gemma4Model))",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000532"
+        },
+        {
+          "name": "InferenceWeb.Tests.KvBlockTransferRingTests.MuseGlimmer_TryTruncate_RefusesADeepRewindOnAWrappedRing_AndChangesNothing",
+          "outcome": "Passed",
+          "duration": "00:00:00.0000605"
+        },
+        {
+          "name": "InferenceWeb.Tests.KvBlockTransferRingTests.Extract_BlockWiderThanTheRing_ReturnsFalse",
+          "outcome": "Passed",
+          "duration": "00:00:00.0012895"
+        },
+        {
+          "name": "InferenceWeb.Tests.InjectShortfallAccountingTests.RefusedBlockAtAdmission_CorrectsReuse_AndOutputEqualsCold",
+          "outcome": "Passed",
+          "duration": "00:00:00.0012622"
+        }
+      ]
+    },
+    "deepseek-fixture-conformance": {
+      "counters": {
+        "total": "1",
+        "executed": "1",
+        "passed": "1",
+        "failed": "0",
+        "error": "0",
+        "timeout": "0",
+        "aborted": "0",
+        "inconclusive": "0",
+        "passedButRunAborted": "0",
+        "notRunnable": "0",
+        "notExecuted": "0",
+        "disconnected": "0",
+        "warning": "0",
+        "completed": "0",
+        "inProgress": "0",
+        "pending": "0"
+      },
+      "tests": [
+        {
+          "name": "InferenceWeb.Tests.PrefixCache.PrefixCacheContractConformanceTests.DeepSeek41_ManagedFixture_PassesTheConformanceScript_OnCpu",
+          "outcome": "Passed",
+          "duration": "00:00:00.1363203"
+        }
+      ]
+    },
+    "model-path-helper": {
+      "tests": [
+        {
+          "name": "InferenceWeb.Tests.TestGateModelPathTests.ExplicitFileOverride_IsReturnedByBothLoadersWithoutTheDirectoryNameFilter",
+          "outcome": "Passed",
+          "duration": "00:00:00.0003225"
+        },
+        {
+          "name": "InferenceWeb.Tests.TestGateModelPathTests.SmallestDirectoryMatch_IsSelectedByFileSize",
+          "outcome": "Passed",
+          "duration": "00:00:00.0044381"
+        },
+        {
+          "name": "InferenceWeb.Tests.TestGateModelPathTests.DirectorySearch_ExcludesCompanionsAndAcceptsAlternativeNames",
+          "outcome": "Passed",
+          "duration": "00:00:00.0005223"
+        }
+      ],
+      "source_commit": "0aaa01a2"
+    }
+  },
+  "coverage": {
+    "TensorSharp.Runtime.Scheduling.PrefixCache.EvictionLists": {
+      "line_rate": 1.0,
+      "branch_rate": 1.0
+    },
+    "TensorSharp.Runtime.Scheduling.PrefixCache.InflightTable": {
+      "line_rate": 1.0,
+      "branch_rate": 1.0
+    },
+    "TensorSharp.Runtime.Scheduling.PrefixCache.PrefixTree": {
+      "line_rate": 1.0,
+      "branch_rate": 0.9931
+    },
+    "TensorSharp.Runtime.Scheduling.PrefixCache.ResumabilityRules": {
+      "line_rate": 1.0,
+      "branch_rate": 1.0
+    }
+  }
+}
