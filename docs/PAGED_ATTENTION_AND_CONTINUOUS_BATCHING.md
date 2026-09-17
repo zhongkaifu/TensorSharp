@@ -295,13 +295,104 @@ a small LRU and re-key it when a later request exactly extends the recorded toke
 prefix. Gemma 4 retains its circular attention K/V; Qwen 3.5/3.6 retains the
 attention K/V and matching GatedDeltaNet recurrent state as one hybrid holder.
 Models that do not advertise this capability ignore the retained-cache setting.
+A request of a scoped conversation that finished on the primary (N=1) cache is kept
+the same way when a fused step takes the model over, so a conversation does not lose its state because
+another chat arrived between two of its turns.
+
+### Prompt reuse across requests: conversation scopes and media identity
+
+Every cross-request reuse path - live-cache continuation, retained holders, the
+shared-prefix checkpoint and pooled blocks - honours two rules.
+
+**Conversation scope.** Each `SequenceState` carries a `CacheScope` (an opaque
+hash) and its public boundary `SharedPrefixTokens` (the leading system/developer
+messages plus tool declarations). State produced by another scope is reused only up
+to that public prefix: through the shared-prefix checkpoint, which is cloned, or by
+rewinding the live cache to exactly that prefix (the only public reuse a model without
+checkpoints has, e.g. DeepSeek V4.1; the new request's prefill would overwrite that cache
+anyway, and a checkpoint is preferred where one exists). Another conversation's retained
+holder is never adopted, rewound into or moved away from its owner, its live cache is
+never continued past the public prefix, and pooled blocks past the public prefix carry
+the scope in their hash. A scoped request never clones a
+checkpoint longer than its own public prefix. The scope comes from the chat layer:
+
+| Request | Scope |
+|---|---|
+| Web UI / TensorAgent with a `sessionId` | the session and its new-chat epoch (`newChat:true` starts a new one); a host that binds sessions to its saved conversations (`WebUiChatService.BindSessionConversation`, which TensorAgent calls for every session it opens) uses the conversation instead, so reopening a chat continues its own cached state |
+| OpenAI Chat / Responses, Ollama chat, Web UI without a `sessionId` | the conversation the request's history proves it continues: its last assistant message is a turn this server generated and sent (see below), and sent to that conversation only; otherwise (including when two conversations were sent the same turn after the same history, such as a greedy reply to a common opening) a fresh scope |
+| Skills / code tool-loop rounds | the scope of the client turn that started the loop |
+| Engine callers that set no scope (benchmarks, the CLI) | unscoped, which matches every scope (unchanged behaviour) |
+
+The chat layer's raw-token splice follows the same identity. Each generated turn is
+recorded under the content-hash chain of the client-visible history that preceded
+it (roles, content, tool calls, media and attached files by content), with the raw output tokens AND
+what the client was sent for them (the parsed content and tool calls, or the raw
+text). A later assistant message is rendered from the recorded tokens only when it
+equals that emitted form, ignoring whitespace; an assistant message a client wrote or
+edited renders from its own text. Before this, the stateless APIs shared one tracked
+history and spliced another client's generated turn over a client's own message.
+Concurrent conversations no longer overwrite each other's records.
+
+For a stateless request this is proof by content, and it has a residual. A request
+that reproduces ANY earlier generated turn of a conversation - not only its latest -
+continues that conversation's scope, including state its later turns left behind, and
+a deterministic (greedy) reply can be reproduced outside this server. Such a request
+reuses only tokens it sent itself, but `cached_tokens` then reflects how far its
+prompt matches that conversation's later turns: whole 256-token blocks on the pooled
+path, the last few tokens of a holder on Gemma 4, further on models with exact native
+rewinds (DeepSeek V4.1). Clients that need strict isolation use a Web UI / TensorAgent
+`sessionId`; a per-request cache key and the radix tree's leaf rule (SYNTHESIS S5.3)
+close this for stateless APIs.
+
+**Media identity.** Each image, video frame (pair) and audio clip is identified by the
+SHA-256 of its bytes. Base64 attachments (OpenAI `image_url`, Responses
+`input_image`, Ollama `images`, audio) are stored as `<sha256>.<ext>` and written
+once, so a client resending the same picture every turn keeps one file. The vision
+and audio embedding cache is keyed by that content id, bounded by
+`TS_MM_EMBEDDING_CACHE_MB` and evicted least-recently-used, never while a prepared
+prompt still references an entry. A request carries its media as positional spans
+(`SequenceState.MediaSpans`); a cached prefix is reusable when every span inside it is
+the same content at the same place, and a reuse length is clamped to the start of any
+span it would cut. Text before the first image is therefore always reusable. Pooled
+block hashes mix a span's id into the blocks that hold it (and, through the parent
+chain, everything after), not into the blocks before it.
+
+Qwen 3.5/3.6 declare `SupportsReuseAcrossMediaSpan = false`: their M-RoPE prompt
+positions compress after an image, but decode runs at the absolute token index and no
+holder records a rope delta, so continuing a cache past an image is not what a
+re-prefill builds. Their reuse stops at the first media span until decode carries the
+compressed position; Gemma 4 uses absolute positions and continues past images.
+
+Prefilling an image *after* a reused prefix is a separate question. Gemma 4's fused
+prefill emits the image's bidirectional mask only at start position 0, so such a chunk
+runs on the slower per-op path. Within the sliding window that path matched a cold
+prefill token for token (and costs time: on E4B/Metal a 457-token image turn reusing 179
+tokens took 1.25 s to first token instead of 0.66 s). Once the prompt outgrows the window
+it did not match, so `IModelArchitecture.CanPrefillMediaAfterReusedPrefix` makes such a
+turn reuse nothing past its public prefix; the text turns after it still continue the cache
+past the image. The public prefix itself is still cloned from the shared-prefix checkpoint:
+while checkpoints are in use every prefill is cut at that boundary, so the image runs after
+it with or without reuse (E4B/Metal, a 1,163-token system prompt plus an image: the same
+reply either way, 1.51 s to first token with the checkpoint and 1.84 s without). A turn with
+no public prefix prefills from zero, in one fused pass when it fits one prefill chunk.
+
+On Gemma 4 the live cache is continued for turns of `MaxReusablePrefixTokens` (the
+sliding window) tokens or fewer too; before, such turns fell to the pooled path, which
+could only return whole 256-token blocks. Rewinds on a wrapped ring are still refused.
+
+The admission log names what served each request - `the model's live KV cache of this
+conversation`, `a shared-prefix checkpoint (public, N tokens)`, `a retained holder of
+this conversation`, or `pooled prefix-cache blocks` - with token counts and the scope
+as a truncated hash; at Debug level a `blocked by scope` line reports how many more
+tokens another conversation's state matched past the public prefix.
 
 ## Test Coverage
 
 | Area | Tests |
 |---|---|
 | Scheduler / block pool | `ContinuousBatchSchedulerTests`, `PagedKvCacheTests`, `PagedKvCacheCodecTests` |
-| Batched executor primitives | `BatchedExecutorTests`, including managed paged-attention correctness and multi-sequence logits routing; `RetainedFusedCacheTests` for capability-gated holder retention/re-keying and LRU cleanup |
+| Batched executor primitives | `BatchedExecutorTests`, including managed paged-attention correctness and multi-sequence logits routing; `RetainedFusedCacheTests` for capability-gated holder retention/re-keying and LRU cleanup, conversation-scope isolation (including a random-interleaving property test) and positional media checks |
+| Cross-request isolation and media identity | `ModelServiceRawTokenHistoryTests` and `ToolTranscriptSpliceTests` (content-verified raw-token splice), `PooledPrefixScopeAndMediaTests`, `ContentAddressedMediaTests` |
 | Per-model correctness | `Qwen35BatchedCorrectnessTests`, `Mistral3BatchedForwardTests`, `Gemma4BatchedForwardTests`, `GptOssBatchedCorrectnessTests`, `NemotronBatchedCorrectnessTests` |
 | MTP speculative decoding | `SpeculativeExecutionTests` (draft/verify/rollback core), opt-in end-to-end `Qwen36SpeculativeTests` (`TS_MTP_E2E=1`) and `Gemma4SpeculativeTests` (`TS_GMTP_E2E=1`) with real GGUFs |
 | Per-model performance probes | `Gemma4BatchedPerfBench`, `Qwen35BatchedPerfBench`, `GptOssBatchedPerfBench`, `NemotronBatchedPerfBench` |
@@ -320,7 +411,7 @@ Models that do not advertise this capability ignore the retained-cache setting.
 | `TS_SCHED_SOLO_PREFILL_CHUNK` | `8192` | Per-step prefill cap for a solo (uncontended) request — feeds the prompt through the fused whole-graph prefill path in big chunks. Bounded by `TS_SCHED_MAX_BATCHED_TOKENS`. |
 | `TS_SCHED_NUM_BLOCKS` | `256` | Physical blocks in the engine pool. |
 | `TS_SCHED_BLOCK_SIZE` | `256` | Tokens per block. |
-| `TS_SCHED_PREFIX_CACHE` | `1` | Set `0` to disable block-hash prefix reuse. |
+| `TS_SCHED_PREFIX_CACHE` | `1` | Set `0` to disable all admission-time prompt reuse: pooled blocks, live-cache continuation, retained holders and shared-prefix checkpoints. |
 | `TS_SCHED_STOP_REPETITION` | `1` | Set `0` to let a looping generation run to its token limit rather than ending it with finish reason `repetition`. |
 | `TS_SCHED_DECODE_QUANTUM` | `256` | Number of decode tokens before a sequence switch is allowed in fallback-heavy execution. |
 | `TS_BATCHED_N1_FAST_PATH` | `1` | Solo single-sequence steps use the fused N=1 fast-path decode; set `0` to force those steps onto the fully-batched path (A/B testing). |
@@ -331,6 +422,7 @@ Models that do not advertise this capability ignore the retained-cache setting.
 | `TS_RETAINED_FUSED_CACHE_MAX` | `4` | LRU budget of retained fused holders (each pins the model's complete per-request continuation state). |
 | `TS_PREFIX_CHECKPOINTS` | `1` | Checkpoint the model's complete state at the end of the shared prompt prefix (the boundary the chat layer marks on the request) and start each new chat from a clone of it, on models that can copy their state (Gemma 4, Qwen 3.5/3.6). `0` disables. |
 | `TS_PREFIX_CHECKPOINTS_MAX` | `2` | How many distinct shared prefixes stay checkpointed at once (LRU). |
+| `TS_MM_EMBEDDING_CACHE_MB` | `512` | Byte budget of the vision/audio embedding cache, which is keyed by media content (SHA-256); least-recently-used entries no prepared prompt references are evicted past it. |
 | `TS_KV_INITIAL_TOKENS` | `0` | Tokens of K/V a cache is given when created, before any request declares a budget; `0` keeps the engine policy (the whole window when `MAX_CONTEXT` is explicit). The cache still grows on demand. |
 | `TS_KV_GENERATION_RESERVE_MAX` | `0` | Cap on the generation share of a request's up-front K/V reservation (prompt + max_new_tokens); `0` = uncapped. Past the cap the cache grows on demand. |
 | `TS_KV_HOLDER_POOL_MAX` | `64` | How many released per-request holders a model may park for reuse; each costs its whole K/V allocation while parked. |

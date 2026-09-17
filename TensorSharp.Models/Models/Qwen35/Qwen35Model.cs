@@ -1393,6 +1393,18 @@ namespace TensorSharp.Models
         // re-prefill cleanly.
         public override bool SupportsCrossSequenceKvReuse => false;
 
+        /// <summary>
+        /// Not yet: prompt M-RoPE positions compress after an image span (the running
+        /// position resumes at <c>base + max(H, W)</c>, see
+        /// <c>ModelMultimodalInjector.LayoutQwenVLPrompt</c>), but decode forwards at the
+        /// absolute token index and no holder records a rope delta. A cache that went
+        /// through an image turn therefore holds the reply at different positions than a
+        /// re-prefill of the same history would, so continuing it past the image is not
+        /// exact. Every reuse path stops at the first media span until decode carries the
+        /// compressed position; the text before the image is still reused.
+        /// </summary>
+        public override bool SupportsReuseAcrossMediaSpan => false;
+
         public override string KVStateFingerprint =>
             $"qwen35|arch={Config.Architecture}|L={Config.NumLayers}|H={Config.NumHeads}|KV={Config.NumKVHeads}|D={Config.HeadDim}|gdnK={_headKDim}|gdnV={_headVDim}|nKHead={_numKHeads}|nVHead={_numVHeads}|convKern={_convKernel}|dtype={_kvCacheDtype.ToShortString()}";
 

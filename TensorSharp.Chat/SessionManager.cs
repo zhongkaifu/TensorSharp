@@ -18,8 +18,9 @@ namespace TensorSharp.Server
 {
     /// <summary>
     /// Thread-safe registry of <see cref="ChatSession"/> instances. The Web UI creates
-    /// one session per chat; the Ollama and OpenAI compatibility endpoints share a
-    /// single built-in "default" session that survives the lifetime of the server.
+    /// one session per chat; requests without a session id share a built-in "default"
+    /// session that survives the lifetime of the server and keeps each conversation's
+    /// transcripts apart by content (see <see cref="ConversationTranscriptStore"/>).
     ///
     /// The manager is intentionally a thin wrapper around a concurrent dictionary so
     /// that session lookup is lock-free on the inference hot path. Sessions track
@@ -40,7 +41,10 @@ namespace TensorSharp.Server
         public SessionManager(ILogger<SessionManager> logger)
         {
             _logger = logger ?? NullLogger<SessionManager>.Instance;
-            _sessions[DefaultSessionId] = new ChatSession(DefaultSessionId);
+            // Every Web UI request without a sessionId lands here, so it stands for many
+            // unrelated conversations: transcripts and cache scope come from each
+            // request's own history, never from the session.
+            _sessions[DefaultSessionId] = new ChatSession(DefaultSessionId, sharedAcrossConversations: true);
             _logger.LogDebug(LogEventIds.SessionCreated,
                 "Default session {SessionId} created", DefaultSessionId);
         }

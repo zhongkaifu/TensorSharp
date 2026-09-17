@@ -725,11 +725,12 @@ Unix IPC 并非完整隔离边界：macOS 为兼容性保留共享临时目录�
 | `TS_SCHED_SOLO_PREFILL_CHUNK` | SOLO（无争用）prompt 全新部分（start_pos = 0）的 prefill 分块大小——单个无争用请求会以大分块走融合 prefill 路径（默认：`8192`）。 |
 | `TS_SCHED_NUM_BLOCKS` | 引擎块池的物理块数（默认：`256`）。 |
 | `TS_SCHED_BLOCK_SIZE` | 引擎侧每块的 token 数（默认：`256`）。 |
-| `TS_SCHED_PREFIX_CACHE` | `0` 关闭跨请求的块级哈希前缀共享。由批处理分页步写入的块在模型自己的分页存储中被复用（请求一开始就是分页驻留）；带池化快照的块被恢复到线性 cache。两种可读形式都没有的块不会被复用，改为重新 prefill。 |
+| `TS_SCHED_PREFIX_CACHE` | `0` 关闭跨请求的全部提示复用：池化块、live cache 续接、保留的 holder 和共享前缀检查点。无论开关如何，复用都按会话隔离：另一个会话的状态只共享到系统提示词加工具声明前缀为止（见 [docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING_zh-cn.md](docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING_zh-cn.md)）。池化块方面：由批处理分页步写入的块在模型自己的分页存储中被复用（请求一开始就是分页驻留）；带池化快照的块被恢复到线性 cache；两种可读形式都没有的块不会被复用，改为重新 prefill。 |
 | `TS_SCHED_STOP_REPETITION` | `0` 允许陷入重复循环的生成继续跑到 token 上限，而不是被提前结束。 |
 | `TS_SCHED_DECODE_QUANTUM` | 在允许切换序列前的 token 数（默认与 block size 相同）。 |
 | `TS_RETAINED_FUSED_CACHE` | `1`（默认）在请求结束后保留其融合 holder，使前缀完全一致的续写不必重新 prefill；仅对声明支持的模型有效（Gemma 4 的 K/V；Qwen 3.5/3.6 的注意力 K/V 加 GatedDeltaNet 递归状态）。`0` 关闭（用于限制显存或做 A/B）。 |
 | `TS_RETAINED_FUSED_CACHE_MAX` | 保留的融合 holder 的 LRU 预算（默认 `4`）；每个都钉住一份完整的按请求续写状态。 |
+| `TS_MM_EMBEDDING_CACHE_MB` | 图像/音频嵌入缓存的字节预算（默认 `512`）。条目以媒体内容（SHA-256）为键，因此 API 客户端每轮重发同一张图片只编码一次；超出预算后淘汰没有被进行中提示引用的最近最少使用条目。 |
 | `TS_PREFIX_CHECKPOINTS` | `1`（默认）在所有会话共享的那段提示词末尾——系统提示词、工具、技能——对模型状态做 checkpoint，并让每个**新**会话从它的副本开始，因此新会话只需重新 prefill 自己的那条消息。适用于 GGML 后端上的 Gemma 4 与 Qwen 3.5/3.6。`0` 关闭。 |
 | `TS_PREFIX_CHECKPOINTS_MAX` | 同时保留 checkpoint 的不同共享前缀数量，按 LRU 淘汰（默认 `2`）。每个都持有该前缀的一份 K/V，Qwen 上还包括递归状态。 |
 | `TS_KV_INITIAL_TOKENS` | 缓存创建时（加载时的主缓存，以及每个按请求的 holder）在任何请求声明预算之前先分配多少 token 的 K/V。`0`（默认）沿用引擎策略：显式设置 `MAX_CONTEXT` 时取整个窗口，否则取后端默认值。缓存仍会按需增长，因此内存受限的设备应把它设小——每个保留的 holder 都要按这个大小付费，主机副本与设备镜像各一份。 |

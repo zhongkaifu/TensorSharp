@@ -2461,6 +2461,14 @@ namespace TensorSharp.Models
         /// </summary>
         public virtual int MaxReusablePrefixTokens => int.MaxValue;
 
+        /// <summary>Whether a cache holding a media span can be continued past it
+        /// exactly (see <see cref="IModelArchitecture.SupportsReuseAcrossMediaSpan"/>).
+        /// True for absolute-position families; Qwen 3.5's M-RoPE overrides it.</summary>
+        public virtual bool SupportsReuseAcrossMediaSpan => true;
+
+        /// <summary>See <see cref="IModelArchitecture.CanPrefillMediaAfterReusedPrefix"/>.</summary>
+        public virtual bool CanPrefillMediaAfterReusedPrefix(int promptTokens) => true;
+
         /// <summary>
         /// Stable identifier tying snapshots to a specific (model, layer count,
         /// head counts, head dim, KV dtype) tuple. The paged cache stores blocks

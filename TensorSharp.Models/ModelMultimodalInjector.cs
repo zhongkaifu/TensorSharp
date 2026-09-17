@@ -14,6 +14,7 @@ using System.Threading;
 using TensorSharp;
 using TensorSharp.Models.Architecture;
 using TensorSharp.Runtime;
+using TensorSharp.Runtime.Scheduling;
 
 namespace TensorSharp.Models
 {
@@ -49,7 +50,27 @@ namespace TensorSharp.Models
         // this synchronous expansion's context local to its execution flow.
         private readonly AsyncLocal<PreparationContext> _preparation = new();
         private sealed record PreparationContext(string RequestId,
-            List<PreparedEmbeddingSpan> Vision, List<PreparedEmbeddingSpan> Audio);
+            List<PreparedEmbeddingSpan> Vision, List<PreparedEmbeddingSpan> Audio)
+        {
+            // Embeddings this preparation obtained that are not yet in a bucket: an
+            // encoder may yield the GPU lock between two images, and another request's
+            // insert must not evict (and dispose) the first image's tensor meanwhile.
+            public List<CachedEmbedding> Pinned { get; } = new();
+        }
+
+        // The embedding cache is keyed by media CONTENT (MediaContentId), so an API
+        // client resending the same base64 image each turn encodes it once. It is bounded
+        // by bytes and evicted least-recently-used; an entry a prepared prompt still
+        // references is never evicted. TS_MM_EMBEDDING_CACHE_MB (default 512).
+        private static readonly long EmbeddingCacheBudgetBytes = ResolveEmbeddingCacheBudgetBytes();
+        private long _embeddingCacheBytes;
+        private long _embeddingUseClock;
+
+        private static long ResolveEmbeddingCacheBudgetBytes()
+        {
+            string raw = Environment.GetEnvironmentVariable("TS_MM_EMBEDDING_CACHE_MB");
+            return long.TryParse(raw, out long mb) && mb > 0 ? mb * 1024L * 1024L : 512L * 1024L * 1024L;
+        }
         private List<PreparedEmbeddingSpan> _preparedVisionEmbeddings =>
             _preparation.Value?.Vision ?? GetOrCreateBucket(_visionByRequest, "");
         private List<PreparedEmbeddingSpan> _preparedAudioEmbeddings =>
@@ -93,6 +114,14 @@ namespace TensorSharp.Models
             }
 
             public string FullPath { get; }
+            /// <summary>What the embedding encodes, by content: the cache key and the
+            /// identity the engine compares for prompt reuse (PromptMediaSpan).</summary>
+            public string ContentId { get; set; }
+            public long LastUsed { get; set; }
+            public int PreparationPins { get; set; }
+            public long Bytes => Embeddings == null
+                ? 0
+                : TensorDimensionHelpers.ElementCount(Embeddings.Sizes) * Embeddings.ElementType.Size();
             public long FileSize { get; }
             public long LastWriteUtcTicks { get; }
             public Tensor Embeddings { get; }
@@ -184,9 +213,33 @@ namespace TensorSharp.Models
             }
             finally
             {
+                foreach (CachedEmbedding pinned in current.Pinned)
+                    pinned.PreparationPins--;
+                current.Pinned.Clear();
                 _preparation.Value = previous;
             }
         }
+
+        public IReadOnlyList<PromptMediaSpan> GetPreparedMediaSpans(string requestId)
+        {
+            string key = NormalizeRequestId(requestId);
+            var spans = new List<PromptMediaSpan>();
+            lock (_bucketLock)
+            {
+                if (_visionByRequest.TryGetValue(key, out var vision))
+                    foreach (var span in vision)
+                        spans.Add(ToMediaSpan(span));
+                if (_audioByRequest.TryGetValue(key, out var audio))
+                    foreach (var span in audio)
+                        spans.Add(ToMediaSpan(span));
+            }
+            spans.Sort((a, b) => a.Start.CompareTo(b.Start));
+            return spans;
+        }
+
+        private static PromptMediaSpan ToMediaSpan(PreparedEmbeddingSpan span)
+            => new(span.PromptTokenStart, span.PromptTokenEndExclusive,
+                span.CacheEntry.ContentId ?? "path:" + span.CacheEntry.FullPath);
 
         public int ClampReusablePrefix(int reusablePrefixTokenCount, string requestId = null)
         {
@@ -938,13 +991,20 @@ namespace TensorSharp.Models
         {
             string first = NormalizePath(firstFramePath);
             string second = NormalizePath(secondFramePath);
-            string key = first + "\n" + second + "\n" + resizedHeight + "x" + resizedWidth;
+            string firstId = MediaContentId.OfFile(first) ?? "path:" + first;
+            string secondId = MediaContentId.OfFile(second) ?? "path:" + second;
+            string key = "vid2:" + firstId + ":" + secondId + ":" + resizedHeight + "x" + resizedWidth;
             GetMediaVersion(first, out long firstSize, out long firstTicks);
             GetMediaVersion(second, out long secondSize, out long secondTicks);
             if (_videoFrameCache.TryGetValue(key, out var cached) &&
-                cached.MatchesPair(firstSize, firstTicks, secondSize, secondTicks))
+                (cached.ContentId != null && !key.Contains("path:", StringComparison.Ordinal)
+                    || cached.MatchesPair(firstSize, firstTicks, secondSize, secondTicks)))
+            {
+                TouchAndPin(cached);
                 return cached;
-            cached?.Dispose();
+            }
+            if (cached != null)
+                RemoveCachedEmbedding(_videoFrameCache, key, cached);
 
             float[] firstPixels = processor.ProcessImage(first, resizedHeight, resizedWidth);
             float[] secondPixels = string.Equals(first, second, StringComparison.Ordinal)
@@ -954,8 +1014,11 @@ namespace TensorSharp.Models
             int mergedH = resizedHeight / processor.PatchSize / processor.MergeSize;
             int mergedW = resizedWidth / processor.PatchSize / processor.MergeSize;
             var fresh = new CachedEmbedding(key, firstSize, firstTicks, embeddings, (int)embeddings.Sizes[0],
-                mergedH, mergedW, secondSize, secondTicks);
-            _videoFrameCache[key] = fresh;
+                mergedH, mergedW, secondSize, secondTicks) { ContentId = key };
+            if (!key.Contains("path:", StringComparison.Ordinal)
+                && TryTakeRacedEntry(_videoFrameCache, key, fresh, out CachedEmbedding raced))
+                return raced;
+            AddCachedEmbedding(_videoFrameCache, key, fresh);
             return fresh;
         }
 
@@ -1120,13 +1183,125 @@ namespace TensorSharp.Models
             string fullPath = NormalizePath(path);
             GetMediaVersion(fullPath, out long fileSize, out long lastWriteUtcTicks);
 
-            if (cache.TryGetValue(fullPath, out var cached) && cached.Matches(fileSize, lastWriteUtcTicks))
-                return cached;
+            // Keyed by what the file CONTAINS, namespaced by the cache (image, video
+            // frame, audio: each is encoded differently). A file that cannot be hashed
+            // keeps the old path identity, still guarded by its size and write time.
+            string contentHash = MediaContentId.OfFile(fullPath);
+            string kind = ReferenceEquals(cache, _audioCache) ? "aud"
+                : ReferenceEquals(cache, _videoFrameCache) ? "vf" : "img";
+            string key = contentHash != null ? kind + ":" + contentHash : kind + ":path:" + fullPath;
 
-            cached?.Dispose();
+            if (cache.TryGetValue(key, out var cached)
+                && (contentHash != null || cached.Matches(fileSize, lastWriteUtcTicks)))
+            {
+                TouchAndPin(cached);
+                return cached;
+            }
+
+            if (cached != null)
+                RemoveCachedEmbedding(cache, key, cached);
             CachedEmbedding fresh = factory(fullPath);
-            cache[fullPath] = fresh;
+            if (contentHash != null && TryTakeRacedEntry(cache, key, fresh, out CachedEmbedding raced))
+                return raced;
+            fresh.ContentId = key;
+            AddCachedEmbedding(cache, key, fresh);
             return fresh;
+        }
+
+        /// <summary>
+        /// Every encoder yields the GPU compute lock between blocks, so another preparation
+        /// carrying the same media can encode and cache it while this one is still encoding.
+        /// Keep that entry (it may already be in a prepared prompt) and drop this copy;
+        /// overwriting it lost the entry without disposing it or releasing its bytes.
+        /// </summary>
+        private bool TryTakeRacedEntry(
+            Dictionary<string, CachedEmbedding> cache, string key, CachedEmbedding fresh, out CachedEmbedding raced)
+        {
+            if (!cache.TryGetValue(key, out raced))
+                return false;
+            fresh.Dispose();
+            TouchAndPin(raced);
+            return true;
+        }
+
+        private void TouchAndPin(CachedEmbedding entry)
+        {
+            entry.LastUsed = ++_embeddingUseClock;
+            PreparationContext context = _preparation.Value;
+            if (context != null)
+            {
+                entry.PreparationPins++;
+                context.Pinned.Add(entry);
+            }
+        }
+
+        private void AddCachedEmbedding(Dictionary<string, CachedEmbedding> cache, string key, CachedEmbedding entry)
+        {
+            // A path-identified entry that went stale while this one was encoding: release
+            // its bytes (and its tensor, unless a prepared prompt still uses it).
+            if (cache.TryGetValue(key, out CachedEmbedding displaced) && !ReferenceEquals(displaced, entry))
+                RemoveCachedEmbedding(cache, key, displaced);
+            cache[key] = entry;
+            _embeddingCacheBytes += entry.Bytes;
+            TouchAndPin(entry);
+            EvictEmbeddingsBeyondBudget();
+        }
+
+        private void RemoveCachedEmbedding(Dictionary<string, CachedEmbedding> cache, string key, CachedEmbedding entry)
+        {
+            cache.Remove(key);
+            _embeddingCacheBytes -= entry.Bytes;
+            if (!IsEmbeddingInUse(entry))
+                entry.Dispose();
+        }
+
+        /// <summary>Evict least-recently-used embeddings until the cache fits its byte
+        /// budget, skipping any a prepared prompt (or a preparation in progress) still
+        /// references. Callers hold the model's GPU compute lock, as every encoder does.</summary>
+        private void EvictEmbeddingsBeyondBudget()
+        {
+            while (_embeddingCacheBytes > EmbeddingCacheBudgetBytes)
+            {
+                Dictionary<string, CachedEmbedding> victimCache = null;
+                string victimKey = null;
+                CachedEmbedding victim = null;
+                foreach (var cache in new[] { _visionCache, _videoFrameCache, _audioCache })
+                {
+                    foreach (var pair in cache)
+                    {
+                        if (victim != null && pair.Value.LastUsed >= victim.LastUsed)
+                            continue;
+                        if (IsEmbeddingInUse(pair.Value))
+                            continue;
+                        victimCache = cache;
+                        victimKey = pair.Key;
+                        victim = pair.Value;
+                    }
+                }
+                if (victim == null)
+                    return;   // everything left is in use; the budget is exceeded for now
+                victimCache.Remove(victimKey);
+                _embeddingCacheBytes -= victim.Bytes;
+                victim.Dispose();
+            }
+        }
+
+        private bool IsEmbeddingInUse(CachedEmbedding entry)
+        {
+            if (entry.PreparationPins > 0)
+                return true;
+            lock (_bucketLock)
+            {
+                foreach (var bucket in _visionByRequest.Values)
+                    foreach (var span in bucket)
+                        if (ReferenceEquals(span.CacheEntry, entry))
+                            return true;
+                foreach (var bucket in _audioByRequest.Values)
+                    foreach (var span in bucket)
+                        if (ReferenceEquals(span.CacheEntry, entry))
+                            return true;
+            }
+            return false;
         }
 
         private static CachedEmbedding CreateCachedEmbedding(string fullPath, Tensor embeddings, int extra0 = 0, int extra1 = 0)
@@ -1390,6 +1565,7 @@ namespace TensorSharp.Models
         {
             ClearAllPreparedPromptState();
 
+            _embeddingCacheBytes = 0;
             foreach (var cached in _visionCache.Values)
                 cached.Dispose();
             _visionCache.Clear();

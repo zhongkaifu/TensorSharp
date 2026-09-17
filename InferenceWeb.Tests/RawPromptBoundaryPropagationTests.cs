@@ -47,30 +47,27 @@ public sealed class RawPromptBoundaryPropagationTests : IDisposable
     }
 
     [Fact]
-    public void TrackedHistory_RetainsEveryAssistantBoundaryAcrossCloneAndAugmentation()
+    public void RecordedTurns_RetainEveryAssistantBoundaryAcrossAugmentation()
     {
         var firstRaw = new List<int> { 101, 102 };
         var secondRaw = new List<int> { 201, 202, 203 };
-        var tracked = new List<ChatMessage>();
-        var renderHistory = new List<ChatMessage>
-        {
-            new() { Role = "user", Content = "Q1" },
-            new()
+        var store = new ConversationTranscriptStore(maxChains: 16, maxTokens: 10_000);
+
+        store.Record(
+            new List<ChatMessage> { new() { Role = "user", Content = "Q1" } },
+            new ChatMessage { Role = "assistant", Content = "RAW1", RawOutputTokens = firstRaw, RawPromptTrailingWhitespace = "\n" },
+            new EmittedAssistantTurn("PARSED1", null, null, "RAW1", false),
+            scope: "s");
+        store.Record(
+            new List<ChatMessage>
             {
-                Role = "assistant",
-                Content = "RAW1",
-                RawOutputTokens = firstRaw,
-                RawPromptTrailingWhitespace = "\n",
+                new() { Role = "user", Content = "Q1" },
+                new() { Role = "assistant", Content = "PARSED1" },
+                new() { Role = "user", Content = "Q2" },
             },
-            new() { Role = "user", Content = "Q2" },
-        };
-
-        ChatHistoryPreparer.UpdateTrackedHistory(
-            tracked, renderHistory, "RAW2", secondRaw,
-            rawPromptTrailingWhitespace: string.Empty);
-
-        Assert.Equal("\n", tracked[1].RawPromptTrailingWhitespace);
-        Assert.Equal(string.Empty, tracked[3].RawPromptTrailingWhitespace);
+            new ChatMessage { Role = "assistant", Content = "RAW2", RawOutputTokens = secondRaw, RawPromptTrailingWhitespace = string.Empty },
+            new EmittedAssistantTurn("PARSED2", null, null, "RAW2", false),
+            scope: "s");
 
         // A later HTTP request contains client-visible text rather than raw model
         // output. Augmentation must restore BOTH token runs and their own boundaries.
@@ -83,8 +80,7 @@ public sealed class RawPromptBoundaryPropagationTests : IDisposable
             new() { Role = "user", Content = "Q3" },
         };
 
-        List<ChatMessage> augmented =
-            ChatHistoryPreparer.AugmentWithCachedRawTokens(nextRequest, tracked);
+        List<ChatMessage> augmented = store.Augment(nextRequest).History;
 
         Assert.Same(firstRaw, augmented[1].RawOutputTokens);
         Assert.Equal("\n", augmented[1].RawPromptTrailingWhitespace);

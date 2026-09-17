@@ -264,13 +264,80 @@ GPT OSS 可用 `TS_GPTOSS_PAGED_ATTN_MANAGED=1` 强制走托管 sinks 路径。
 LRU 中；后续请求精确扩展已记录的 token 前缀时，再把该 holder 重新绑定给新请求。
 Gemma 4 保留其环形 attention K/V；Qwen 3.5/3.6 则把 attention K/V 与匹配的
 GatedDeltaNet 递归状态作为一个混合 holder 一起保留。未声明该能力的模型会忽略这组设置。
+带作用域的会话在主（N=1）缓存上结束的请求，在 fused 步骤接管模型时也会以同样方式保留，因此不会因为
+另一个会话插在它两轮之间到达而丢失自己的状态。
+
+### 跨请求的提示复用：会话作用域与媒体身份
+
+所有跨请求复用路径——live cache 续接、保留的 holder、共享前缀检查点和池化块——都遵守两条规则。
+
+**会话作用域。** 每个 `SequenceState` 携带一个 `CacheScope`（不透明的哈希）以及它的公开边界
+`SharedPrefixTokens`（开头的 system/developer 消息加工具声明）。其他作用域产生的状态只能复用到
+这个公开前缀为止：通过被克隆的共享前缀检查点，或者把 live cache 回退到恰好这个前缀（这是没有检查点的
+模型——例如 DeepSeek V4.1——唯一的公开复用；新请求的预填充本来也会覆盖这个缓存，存在检查点时仍优先使用
+检查点）。绝不会采纳、回退进入或移走另一个会话的保留 holder，绝不会越过公开前缀续接它的 live cache，
+公开前缀之后的池化块在哈希中带有作用域。带作用域的
+请求也不会克隆比自己公开前缀更长的检查点。作用域由 chat 层给出：
+
+| 请求 | 作用域 |
+|---|---|
+| 带 `sessionId` 的 Web UI / TensorAgent | 会话及其新会话纪元（`newChat:true` 开始一个新纪元）；把会话绑定到已保存对话的宿主（`WebUiChatService.BindSessionConversation`，TensorAgent 为它打开的每个会话都会调用）改用该对话，因此重新打开一个聊天会延续它自己的缓存状态 |
+| OpenAI Chat / Responses、Ollama chat、不带 `sessionId` 的 Web UI | 请求历史证明自己所延续的会话：它最后一条 assistant 消息是本服务器生成并只发给该会话的回合（见下文）；否则（包括两个会话在相同历史之后收到了相同回合的情况，例如对常见开场白的贪心回复）是一个全新的作用域 |
+| Skills / 代码工具循环的各轮 | 启动该循环的客户端回合的作用域 |
+| 不设置作用域的引擎调用方（基准测试、CLI） | 无作用域，与所有作用域匹配（行为不变） |
+
+chat 层的原始 token 拼接遵循同样的身份。每个生成的回合都以其之前的客户端可见历史的内容哈希链
+（角色、内容、工具调用、按内容计的媒体与附件文件）为键记录下来，同时记录原始输出 token 以及当时发给客户端
+的内容（解析后的正文和工具调用，或原始文本）。之后的 assistant 消息只有在（忽略空白后）等于这份
+已发出的内容时才会用记录的 token 渲染；客户端自己编写或修改过的 assistant 消息按其自身文本渲染。
+在此之前，无状态 API 共享同一份跟踪历史，会把另一个客户端生成的回合拼接到本客户端自己的消息上。
+并发的会话也不再相互覆盖记录。
+
+对无状态请求而言这是"以内容为证"，存在一个残余风险：一个请求只要重现了某会话的**任意**一个较早的
+生成回合（不只是最新一个），就会延续该会话的作用域，包括其后续回合留下的状态；而确定性（贪心）
+回复可以在本服务器之外复现。这样的请求只会复用它自己发来的 token，但 `cached_tokens` 会反映其提示
+与该会话后续回合匹配到多远：池化路径上是整块 256 token，Gemma 4 上是 holder 末尾的少数 token，
+在支持精确原生回退的模型（DeepSeek V4.1）上更远。需要严格隔离的客户端应使用 Web UI / TensorAgent
+的 `sessionId`；针对无状态 API，按请求的缓存键与 radix 树的叶子规则（SYNTHESIS S5.3）会补上这一点。
+
+**媒体身份。** 每张图片、视频帧（对）和音频片段都以其字节的 SHA-256 标识。Base64 附件（OpenAI
+`image_url`、Responses `input_image`、Ollama `images`、音频）以 `<sha256>.<ext>` 存储且只写一次，
+因此客户端每轮重发同一张图片只保留一个文件。视觉与音频嵌入缓存以该内容 id 为键，受
+`TS_MM_EMBEDDING_CACHE_MB` 约束并按最近最少使用淘汰，已准备好的提示仍引用的条目不会被淘汰。
+请求以位置区间的形式携带其媒体（`SequenceState.MediaSpans`）；当缓存前缀内的每个区间都是同一
+位置上的相同内容时，该前缀可以复用，复用长度会被截到它将切断的任何区间的起点。因此第一张图片
+之前的文本总是可以复用。池化块哈希只把区间 id 混入包含该区间的块（并通过父链带入其后的所有块），
+而不混入之前的块。
+
+Qwen 3.5/3.6 声明 `SupportsReuseAcrossMediaSpan = false`：它们的 M-RoPE 提示位置在图片之后被压缩，
+但 decode 使用绝对 token 下标，holder 也不记录 rope 偏移，因此越过图片续接缓存得到的状态与重新
+prefill 不同。在 decode 使用压缩位置之前，它们的复用止于第一个媒体区间；Gemma 4 使用绝对位置，
+可以越过图片续接。
+
+在复用前缀*之后*预填充图片是另一回事。Gemma 4 的融合 prefill 只在起始位置 0 输出图片的双向掩码，
+因此这样的分块走较慢的逐算子路径。在滑动窗口之内，该路径与冷启动 prefill 逐 token 一致（但更慢：
+E4B/Metal 上一个复用 179 token 的 457 token 图片回合首 token 用时 1.25 s，而不是 0.66 s）。一旦提示
+超出窗口就不再一致，所以 `IModelArchitecture.CanPrefillMediaAfterReusedPrefix` 让这样的回合不复用
+公共前缀之后的内容；其后的文本回合仍会越过图片续接缓存。公共前缀本身仍从共享前缀检查点克隆：启用
+检查点时每次 prefill 都会在该边界切分，所以无论是否复用，图片都在它之后预填充（E4B/Metal，1,163 token
+的系统提示加一张图片：两种情况回复相同，使用检查点时首 token 1.51 s，不使用时 1.84 s）。没有公共前缀
+的回合从零 prefill，能放进一个 prefill 分块时走一次融合计算。
+
+在 Gemma 4 上，不超过 `MaxReusablePrefixTokens`（滑动窗口）个 token 的回合现在也会续接 live cache；
+之前这类回合落到池化路径，只能返回整块的 256 token。已回绕环上的回退依旧被拒绝。
+
+准入日志会写明服务该请求的来源——`the model's live KV cache of this conversation`、
+`a shared-prefix checkpoint (public, N tokens)`、`a retained holder of this conversation` 或
+`pooled prefix-cache blocks`——带 token 数和截断哈希形式的作用域；Debug 级别下一行
+`blocked by scope` 报告另一个会话的状态在公开前缀之后还匹配了多少 token。
 
 ## 测试覆盖
 
 | 范围 | 测试 |
 |---|---|
 | 调度器 / 块池 | `ContinuousBatchSchedulerTests`、`PagedKvCacheTests`、`PagedKvCacheCodecTests` |
-| 批处理执行原语 | `BatchedExecutorTests`，覆盖托管分页注意力正确性与多序列 logits 路由；`RetainedFusedCacheTests` 覆盖按能力启用的 holder 保留 / 重新绑定与 LRU 清理 |
+| 批处理执行原语 | `BatchedExecutorTests`，覆盖托管分页注意力正确性与多序列 logits 路由；`RetainedFusedCacheTests` 覆盖按能力启用的 holder 保留 / 重新绑定与 LRU 清理、会话作用域隔离（含随机交错的性质测试）与按位置的媒体检查 |
+| 跨请求隔离与媒体身份 | `ModelServiceRawTokenHistoryTests` 与 `ToolTranscriptSpliceTests`（按内容校验的原始 token 拼接）、`PooledPrefixScopeAndMediaTests`、`ContentAddressedMediaTests` |
 | 按模型正确性 | `Qwen35BatchedCorrectnessTests`、`Mistral3BatchedForwardTests`、`Gemma4BatchedForwardTests`、`GptOssBatchedCorrectnessTests`、`NemotronBatchedCorrectnessTests` |
 | MTP 投机解码 | `SpeculativeExecutionTests`（起草 / 验证 / 回滚核心）、可选端到端 `Qwen36SpeculativeTests`（`TS_MTP_E2E=1`）与 `Gemma4SpeculativeTests`（`TS_GMTP_E2E=1`），需真实 GGUF |
 | 按模型性能探针 | `Gemma4BatchedPerfBench`、`Qwen35BatchedPerfBench`、`GptOssBatchedPerfBench`、`NemotronBatchedPerfBench` |
@@ -289,7 +356,7 @@ GatedDeltaNet 递归状态作为一个混合 holder 一起保留。未声明该�
 | `TS_SCHED_SOLO_PREFILL_CHUNK` | `8192` | solo（无争用）请求的每步 prefill 上限——以大分块把 prompt 送入融合整图 prefill 路径。受 `TS_SCHED_MAX_BATCHED_TOKENS` 约束。 |
 | `TS_SCHED_NUM_BLOCKS` | `256` | 引擎块池物理块数。 |
 | `TS_SCHED_BLOCK_SIZE` | `256` | 每块 token 数。 |
-| `TS_SCHED_PREFIX_CACHE` | `1` | 设为 `0` 关闭块哈希前缀复用。 |
+| `TS_SCHED_PREFIX_CACHE` | `1` | 设为 `0` 关闭准入时的全部提示复用：池化块、live cache 续接、保留的 holder 和共享前缀检查点。 |
 | `TS_SCHED_STOP_REPETITION` | `1` | 设为 `0` 时，陷入重复循环的生成会继续跑到 token 上限，而不是以 `repetition` 结束原因停止。 |
 | `TS_SCHED_DECODE_QUANTUM` | `256` | 在偏回退路径中，允许切换序列前的 decode token 数。 |
 | `TS_BATCHED_N1_FAST_PATH` | `1` | solo 单序列步骤走融合 N=1 快速路径 decode；设为 `0` 可强制这些步骤走完全批处理路径（A/B 测试）。 |
@@ -300,6 +367,7 @@ GatedDeltaNet 递归状态作为一个混合 holder 一起保留。未声明该�
 | `TS_RETAINED_FUSED_CACHE_MAX` | `4` | 保留 fused holder 的 LRU 预算（每个 holder 都会占用模型完整的 per-request 续接状态）。 |
 | `TS_PREFIX_CHECKPOINTS` | `1` | 在共享提示前缀结束处（由 chat 层在请求上标记的边界）对模型完整状态做检查点，并让每个新会话从其副本开始（Gemma 4、Qwen 3.5/3.6）。`0` 关闭。 |
 | `TS_PREFIX_CHECKPOINTS_MAX` | `2` | 同时保留多少个不同共享前缀的检查点（LRU）。 |
+| `TS_MM_EMBEDDING_CACHE_MB` | `512` | 视觉/音频嵌入缓存的字节预算，缓存以媒体内容（SHA-256）为键；超出后淘汰没有被已准备提示引用的最近最少使用条目。 |
 | `TS_KV_INITIAL_TOKENS` | `0` | 缓存创建时、任何请求声明预算之前分配的 K/V token 数；`0` 沿用引擎策略（显式 `MAX_CONTEXT` 时为整个窗口）。缓存仍按需增长。 |
 | `TS_KV_GENERATION_RESERVE_MAX` | `0` | 请求预先保留的 K/V（prompt + max_new_tokens）中生成部分的上限；`0` = 不限制。超过上限后缓存按需增长。 |
 | `TS_KV_HOLDER_POOL_MAX` | `64` | 模型最多可停放多少个已释放的 per-request holder 以待复用；停放期间每个都占用其完整 K/V 分配。 |
