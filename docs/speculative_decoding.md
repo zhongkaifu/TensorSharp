@@ -894,19 +894,23 @@ over the vocabulary:
 | E4B Q8_0, server decode prompt, `ggml_metal` (M5 Pro), n-gram / draft head | 256 | 0.0024 / 0.014, 0.0026 / 0.0079 | 0 / 0 |
 | E4B Q8_0, server decode prompt, n-gram | 512 | 0.52 / 3.27 | 4 (0.046, 0.081, 0.095, 0.141) |
 | E4B Q8_0, server decode prompt, draft head | 512 | 0.51 / 1.72 | 5 (0.081, 0.095, 0.141, 0.240, 0.243) |
-| 12B QAT Q4_0, spec prompt (1,419-token prompt), n-gram, after the fix | 192 | 2.22 / 7.47 | 0 (smallest margin in the run 1.96) |
-| 12B QAT Q4_0, spec prompt, `ggml_metal`, n-gram, after the fix | 192 | 0.15 / 0.82 | 0 |
-| 12B QAT Q4_0, JSON grammar, n-gram, after the fix | 58 | 1.86 / 5.63 | 2 (0.081, 0.269) |
-| 26B-A4B QAT, server decode prompt, draft head | 256 | 1.72 / 6.70 | 7 (0.025 - 0.361) |
+| 12B QAT UD-Q4_K_XL, spec prompt (1,419-token prompt), n-gram, after the fix | 192 | 2.22 / 7.47 | 0 (smallest margin in the run 1.96) |
+| 12B UD-Q4_K_XL (the non-QAT file), spec prompt, `ggml_metal` (M5 Pro), n-gram, after the fix | 192 | 0.15 / 0.82 | 0 |
+| 12B QAT UD-Q4_K_XL, JSON grammar, n-gram, after the fix | 58 | 1.86 / 5.63 | 2 (0.081, 0.269) |
+| 26B-A4B QAT UD-Q4_K_XL, server decode prompt, draft head | 256 | 1.72 / 6.70 | 7 (0.025 - 0.361) |
 | Qwen 3.6-35B-A3B UD-Q4_K_M, JSON grammar, n-gram (window 3) | 64 | 0.73 / 3.53 | 2 (0.023, 0.070) |
 | Qwen 3.6-35B-A3B, spec prompt, n-gram (window 3) | 96 | 1.41 / 6.05 | 0 |
 | Muse-Glimmer 30B UD-Q4_K_XL, newchat chat B prompt (linear trunk), n-gram | 96 | 0.28 / 0.90 | 1 (0.041) |
 
 The error does not grow with the number of verifies or rollbacks (it is the
-same order in every eighth of every run), `ggml_cpu` is bit-identical, and every
-flip lies inside twice its row's error - kernel arithmetic, not a state bug.
-The campaign's JSON (Qwen token 50, margin 0.070; 12B token 56, margin 0.081)
-and Muse checkpoint-clone divergences are these near-ties.
+same order in every eighth of every run), `ggml_cpu` was bit-identical on E4B, and
+every flip lies inside twice its row's error - kernel arithmetic, not a state bug.
+The campaign's Qwen JSON divergence at token 50 is the teacher-forced flip at row
+50 (margin 0.070). Its 12B JSON divergence (token 56) and Muse checkpoint-clone
+divergence (token 20) sit next to near-ties in these runs (12B row 53, margin
+0.081; Muse row 24 on the linear trunk, margin 0.041), but the 12B campaign run
+predates the sliding-window fix and its prompt crosses the window, so that one
+is not attributed to either cause by this evidence.
 
 Where the `ggml_cuda` disagreement comes from, measured on E4B: a one-row
 speculative forward is bit-identical to the plain decode, while every multi-row
