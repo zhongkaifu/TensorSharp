@@ -306,21 +306,36 @@ rope 位置 = KV 下标 + delta，   delta = 位置表最后一行的最大分�
   的夹具进行比较（`eng/validation/qwen35_mrope_reference`，SGLang 2733afe5），覆盖一张图、两张图、
   高与宽的网格、两对帧的视频和纯文本。若 decode 按 KV 下标（旧规则），26 个用例中有 10 个失败。
 - `Qwen35ImageFollowUpExactnessTests`（需要模型，`TS_TEST_MODEL_DIR`）在 Qwen3.5-9B-Q8_0 上运行
-  “文本 -> 图片 -> 文本 -> 文本”的对话。在引擎中，第 3、4 轮越过图片复用上一轮，每一轮的贪心 token
-  都与冷启动引擎一致；旁边同时有一段文本对话在 decode（按请求的 holder 与 arena 批处理 decode）时
-  同样如此。直接在模型上，把“decode 上一轮回复再 prefill 新后缀”构建出的回合与整段提示的冷启动
-  prefill 逐步比较 logits。在图片之后建立的检查点经过导出、导入和克隆后，decode logits 逐位相同；
-  版本 1 文件会被拒绝。关闭 delta 时，同一测试在第 3 轮失败（复用得到 `...there is no roof visible.
-  The scene depicts...`，冷启动得到 `...features...`）。
+  “文本 -> 图片 -> 文本 -> 文本”的对话。在引擎中，第 3、4 轮必须越过图片复用上一轮，每一轮的贪心
+  token 都与冷启动引擎比较；旁边同时有一段文本对话在 decode（按请求的 holder 与 arena 批处理 decode）
+  时同样比较。直接在模型上，把“decode 上一轮回复再 prefill 新后缀”构建出的回合与整段提示的冷启动
+  prefill 逐步比较 24 步 logits，并对一段纯文本对话做同样的比较作为对照。在图片之后建立的检查点经过
+  导出、导入和克隆后，decode logits 逐位相同；版本 1 文件会被拒绝。关闭 delta 时测试失败：在 Metal
+  上图片对话的最差 logit 差从 0.024 升到 3.24，而纯文本对照保持 0.010（在测试的早期版本中，它在第 3
+  轮 token 上失败：复用得到 `...there is no roof visible. The scene depicts...`，冷启动得到
+  `...features...`）。
 
 **Logit 容差。** 复用与冷启动并非逐位相同：复用回合的回复行由 decode 图写入，冷启动回合由 prefill
-图写入（attention 与矩阵乘内核不同，等轴时一个是 NeoX、一个是交错 M-RoPE）。测试上限为
-`TS_TEST_QWEN35_LOGIT_TOLERANCE`，默认 0.5（词表上的最大 |dlogit|），并要求每一步 argmax 相同。
-实测最差值：
+图写入（attention 与矩阵乘内核不同，CUDA 上是量化激活的矩阵乘，等轴时一个是 NeoX、一个是交错
+M-RoPE）。因此测试检查三点：
 
-| 后端 | 提示 | 最差最大 \|dlogit\|（12 步，第 2-4 轮） | 检查点往返 |
-|---|---|---|---|
-| Metal（M 系列，Qwen3.5-9B-Q8_0） | 1,038 token 的图片回合，30 与 24 token 的后续回合 | 0.0187 | 0.0 |
+- 词表上最差的最大 |dlogit| 不超过该后端的容差（`TS_TEST_QWEN35_LOGIT_TOLERANCE`；Metal 默认 0.1，
+  其他后端 3.0）；
+- 不超过纯文本对照的 4 倍（`TS_TEST_QWEN35_CONTROL_RATIO`）：图片的上下文更长，可以放大内核差异，
+  但不能带来自身的误差；
+- 贪心 token 相同，除非在出现差异的那一步冷启动的 top-2 差距小于该步测得的 logit 差——这是两个内核
+  都可能打破的平局。
+
+实测（24 步，第 2-4 轮）：
+
+| 后端 | 图片对话最差 \|dlogit\| | 纯文本对照 | 比值 | token 差异 | 检查点往返 |
+|---|---|---|---|---|---|
+| Metal（M 系列，Qwen3.5-9B-Q8_0） | 0.024 | 0.010 | 2.3x | 无 | 0.0 |
+| CUDA（A40，Qwen3.5-9B-Q8_0，mmproj F16） | 2.39 | 0.92 | 2.6x | 第 3 轮第 0 步（差距 0.034 < 0.47）与第 4 轮第 1 步（差距 0.13 < 0.29）：平局 | 0.0 |
+
+在 CUDA 上，即使是纯文本对话，decode 与 prefill 内核也会相差约一个 logit，因此在 24 个贪心 token 内，
+无论有没有图片，复用回合与冷启动回合都可能在低差距 token 上翻转；并发测试（holder 与 arena）在两个
+后端上都得到相同的 token。
 
 **经过服务端**（Phase 0 的 IMG 探针：Web UI 与 OpenAI 对话，图片在第 1 或第 3 轮，另有纯文本对照；
 Metal，Qwen3.5-9B-Q8_0，贪心，每轮 96 token），图片之后的每一轮现在都续接缓存：

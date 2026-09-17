@@ -313,7 +313,7 @@ chat 层的原始 token 拼接遵循同样的身份。每个生成的回合都�
 第一个媒体区间。目前没有模型这样声明。Gemma 4 使用绝对位置。Qwen 3.5/3.6 的 M-RoPE 提示位置在图片
 之后被压缩，位置表之外的每个 token（decode、投机 verify、文本续接）都按其 KV 下标加上该序列的
 M-RoPE 偏移（delta）旋转，而每个 holder、检查点和检查点文件（格式版本 2）都保存这个 delta；因此后续
-回合越过图片续接缓存，并与重新 prefill 一致（见 [Qwen 3.5 模型卡](models/qwen35_zh-cn.md)：在 Metal
+回合越过图片续接缓存，并与重新 prefill 一致（仅差后端 decode 与 prefill 内核之间的数值差异；见 [Qwen 3.5 模型卡](models/qwen35_zh-cn.md)：在 Metal
 上，图片之后的 Web UI 回合复用 98% 的提示，首 token 用时 0.13 s，而不是约 1.1 s）。在此修复之前
 Qwen 3.5/3.6 声明为 `false`，因为 decode 使用绝对下标。
 

@@ -368,24 +368,44 @@ itself. Two things followed:
   at the KV index (the old rule) 10 of its 26 cases fail.
 - `Qwen35ImageFollowUpExactnessTests` (model-gated, `TS_TEST_MODEL_DIR`) runs a
   conversation text -> image -> text -> text on Qwen3.5-9B-Q8_0. In the engine, turns
-  3 and 4 reuse the previous turn past the image and every turn's greedy tokens equal a
-  cold engine's, also with a text conversation decoding beside it (per-request holders
-  and the arena batched decode). On the model directly, a turn built by decoding the
-  previous reply and prefilling the new suffix is compared with a cold prefill of the
-  whole prompt, logits step by step. A checkpoint taken after the image survives
-  export, import and clone with bit-identical decode logits, and a version-1 file is
-  refused. With the delta disabled the same test fails on turn 3 (`...there is no roof
-  visible. The scene depicts...` reused vs `...features...` cold).
+  3 and 4 must reuse the previous turn past the image, and every turn's greedy tokens
+  are compared with a cold engine's, also with a text conversation decoding beside it
+  (per-request holders and the arena batched decode). On the model directly, a turn
+  built by decoding the previous reply and prefilling the new suffix is compared with a
+  cold prefill of the whole prompt, logits step by step for 24 steps, and the same
+  comparison runs on a text-only conversation as a control. A checkpoint taken after
+  the image survives export, import and clone with bit-identical decode logits, and a
+  version-1 file is refused. With the delta disabled the test fails: on Metal the
+  image conversation's worst logit difference rises from 0.024 to 3.24 while the text
+  control stays at 0.010 (on an earlier revision of the test it failed on turn 3's
+  tokens: `...there is no roof visible. The scene depicts...` reused vs `...features...`
+  cold).
 
 **Logit tolerance.** Reuse and cold are not bit-identical: the reused turn's reply rows
 were written by the decode graph and the cold turn's by the prefill graph (different
-attention and matmul kernels, NeoX vs interleaved M-RoPE on equal axes). The test bound
-is `TS_TEST_QWEN35_LOGIT_TOLERANCE`, default 0.5 (max |dlogit| over the vocabulary),
-with identical argmax at every step. Measured worst case:
+attention and matmul kernels, quantized-activation matmuls on CUDA, NeoX vs interleaved
+M-RoPE on equal axes). The test therefore checks three things:
 
-| Backend | Prompt | Worst max \|dlogit\| (12 steps, turns 2-4) | Checkpoint round trip |
-|---|---|---|---|
-| Metal (M-series, Qwen3.5-9B-Q8_0) | 1,038-token image turn, 30- and 24-token follow-ups | 0.0187 | 0.0 |
+- the worst max |dlogit| over the vocabulary stays under the backend's tolerance
+  (`TS_TEST_QWEN35_LOGIT_TOLERANCE`; default 0.1 on Metal, 3.0 elsewhere);
+- it is at most 4x the text-only control's (`TS_TEST_QWEN35_CONTROL_RATIO`): the image
+  may amplify the kernel difference through its longer context, but must add no error
+  of its own;
+- greedy tokens are identical, except at a step where the cold run's top-2 margin is
+  smaller than the logit difference measured there - a tie the two kernels may break
+  either way.
+
+Measured (24 steps, turns 2-4):
+
+| Backend | Image conversation worst \|dlogit\| | Text control | Ratio | Token differences | Checkpoint round trip |
+|---|---|---|---|---|---|
+| Metal (M-series, Qwen3.5-9B-Q8_0) | 0.024 | 0.010 | 2.3x | none | 0.0 |
+| CUDA (A40, Qwen3.5-9B-Q8_0, mmproj F16) | 2.39 | 0.92 | 2.6x | turn 3 step 0 (margin 0.034 < 0.47) and turn 4 step 1 (margin 0.13 < 0.29): ties | 0.0 |
+
+On CUDA the decode and prefill kernels differ by up to about one logit even for a
+text-only conversation, so over 24 greedy tokens a low-margin token can flip between a
+reused and a cold turn with or without images; the concurrent test (holders and the
+arena) produced identical tokens on both backends.
 
 **Through the server** (the Phase 0 IMG probe: Web UI and OpenAI conversations with the
 image on turn 1 or turn 3, plus text controls; Metal, Qwen3.5-9B-Q8_0, greedy, 96 tokens

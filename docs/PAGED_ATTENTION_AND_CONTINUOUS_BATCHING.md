@@ -364,7 +364,7 @@ M-RoPE prompt positions compress after an image, and every token past the positi
 - decode, speculative verify, a text continuation - rotates at its KV index plus the
 sequence's M-RoPE delta, which every holder, checkpoint and checkpoint file (format
 version 2) stores; follow-up turns therefore continue the cache past the image and match
-a re-prefill (see [the Qwen 3.5 card](models/qwen35.md#positions-after-an-image-the-m-rope-delta):
+a re-prefill up to the backend's decode-versus-prefill kernel differences (see [the Qwen 3.5 card](models/qwen35.md#positions-after-an-image-the-m-rope-delta):
 on Metal the Web UI turns after an image reuse 98% of the prompt and reach the first token
 in 0.13 s instead of about 1.1 s). Until that fix Qwen 3.5/3.6 declared `false`, because
 decode ran at the absolute index.
