@@ -402,7 +402,9 @@ namespace TensorSharp.Chat
         /// <c>POST /api/models/load</c> — <c>{ model, backend?, mmproj? }</c>. The model
         /// must be the hosted one (the guard resolves the file name against the startup
         /// path, so a client never needs a host path); 400 <c>{ ok = false, error }</c>
-        /// for a refused request, 500 with the same shape when the load itself fails.
+        /// for a refused request, 500 with the same shape when the load itself fails. A load
+        /// the model refuses (see <see cref="ModelLoadRefusal"/>) adds <c>refused = true</c>
+        /// and <c>loadedModel</c>: the previous model when it was restored, null for none.
         /// </summary>
         public Task<object> LoadModelAsync(JsonElement body, CancellationToken cancellationToken)
         {
@@ -445,6 +447,23 @@ namespace TensorSharp.Chat
                     model = _svc.LoadedModelName,
                     loadedMmProj = _svc.LoadedMmProjName,
                     architecture = _svc.Architecture,
+                });
+            }
+            catch (Exception ex) when (ModelLoadRefusal.TryDescribe(ex, out string refusal))
+            {
+                // Refused (not enough VRAM, an unsupported dtype or --tp layout, a bad
+                // file): the lifecycle already logged the reason, restored the previous
+                // model if there was one, and the server keeps serving. Say which model
+                // is loaded now, null for none, so a client does not have to guess.
+                modelLoadLogger.LogWarning(LogEventIds.ModelLoadFailed,
+                    "Web UI model load refused: model={Model} backend={Backend}: {Reason}; loaded now: {Loaded}",
+                    modelName, backend, refusal, _svc.LoadedModelName ?? "(none)");
+                throw new WebUiRequestRejectedException(500, new
+                {
+                    ok = false,
+                    error = refusal,
+                    refused = true,
+                    loadedModel = _svc.LoadedModelName,
                 });
             }
             catch (Exception ex)

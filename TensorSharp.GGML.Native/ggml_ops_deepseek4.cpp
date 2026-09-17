@@ -1712,7 +1712,7 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
     }
     if (n_gpu == 0)
     {
-        fprintf(stderr, "[dsv4] no GPU backend available; refusing CPU-only run for a %s\n", "250B model");
+        tsg::report_load_refusal( "[dsv4] no GPU backend available; refusing CPU-only run for a %s\n", "250B model");
         return nullptr;
     }
 
@@ -1830,7 +1830,7 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
     std::unique_ptr<ggml_context, decltype(&ggml_free)> metadata_tensors_owner(meta_ctx0, ggml_free);
     if (!g0)
     {
-        fprintf(stderr, "[dsv4] failed to open %s\n", gguf_path);
+        tsg::report_load_refusal( "[dsv4] failed to open %s\n", gguf_path);
         return nullptr;
     }
 
@@ -1948,7 +1948,7 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
 
     if (!ok || hp.n_layer <= 0 || (int) hp.compress_ratios.size() < hp.n_layer)
     {
-        fprintf(stderr, "[dsv4] missing/invalid deepseek4 metadata\n");
+        tsg::report_load_refusal( "[dsv4] missing/invalid deepseek4 metadata\n");
         return nullptr;
     }
     if (hp.v41)
@@ -2000,7 +2000,7 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
         gguf_context * g = gguf_init_from_file(shards.paths[si].c_str(), sp);
         if (!g)
         {
-            fprintf(stderr, "[dsv4] failed to open shard %s\n", shards.paths[si].c_str());
+            tsg::report_load_refusal( "[dsv4] failed to open shard %s\n", shards.paths[si].c_str());
             return nullptr;
         }
         if (!dsv4_check_shard_complete(shards.paths[si].c_str(), g, meta))
@@ -2050,7 +2050,7 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
     size_t embd_bytes = 0;
     {
         auto it = sources.find("token_embd.weight");
-        if (it == sources.end()) { fprintf(stderr, "[dsv4] token_embd missing\n"); return nullptr; }
+        if (it == sources.end()) { tsg::report_load_refusal( "[dsv4] token_embd missing\n"); return nullptr; }
         hp.n_vocab = (int32_t) it->second.ne[1];
         embd_bytes = it->second.size;
     }
@@ -2432,7 +2432,7 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
                 for (int d = 0; d < n_gpu; d++) free_total += dev_free[d];
                 size_t would_free = 0;
                 for (int il = 0; il < need_cpu_moe && il < hp.n_layer; il++) would_free += layer_exps_bytes[il];
-                fprintf(stderr,
+                tsg::report_load_refusal(
                         "[dsv4] not enough VRAM: %.1f GiB of weights plus this context's KV caches against "
                         "%.1f GiB free across %d device(s)%s. Re-run with --n-cpu-moe %d (moves the routed "
                         "experts of the first %d layer(s), %.1f GiB, to system RAM) or --cpu-moe to offload "
@@ -2448,7 +2448,7 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
         {
             size_t free_total = 0;
             for (int d = 0; d < n_gpu; d++) free_total += dev_free[d];
-            fprintf(stderr, "[dsv4] model does not fit: %.1f GiB of weights (%.1f GiB of them routed experts) "
+            tsg::report_load_refusal( "[dsv4] model does not fit: %.1f GiB of weights (%.1f GiB of them routed experts) "
                     "against %.1f GiB free across %d device(s), even with every expert on the host. "
                     "Free VRAM, add devices, or use a smaller quantization.\n",
                     total_bytes / 1073741824.0,
@@ -2677,7 +2677,7 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
             ((!m->moe_tp || !m->moe_tp->has_layer(il)) &&
              (!L.ffn_gate_exps || !L.ffn_down_exps || !L.ffn_up_exps)))
         {
-            fprintf(stderr, "[dsv4] layer %d incomplete\n", il);
+            tsg::report_load_refusal( "[dsv4] layer %d incomplete\n", il);
             return nullptr;
         }
     }
@@ -2754,7 +2754,7 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
                 !shape(L.ffn_up_shexp, {dim, ff * hp.n_expert_shared}) ||
                 !shape(L.ffn_down_shexp, {ff * hp.n_expert_shared, dim}))
             {
-                fprintf(stderr, "[dsv4] DSpark stage %d has missing/incompatible tensor dimensions\n", st);
+                tsg::report_load_refusal( "[dsv4] DSpark stage %d has missing/incompatible tensor dimensions\n", st);
                 return nullptr;
             }
         }
@@ -2781,7 +2781,7 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
             !shape(ds.markov_w2, {ds.markov_rank, hp.n_vocab}) ||
             !shape(ds.conf_proj, {(int64_t) hp.n_embd + ds.markov_rank, 1}))
         {
-            fprintf(stderr, "[dsv4] DSpark heads are incomplete\n");
+            tsg::report_load_refusal( "[dsv4] DSpark heads are incomplete\n");
             return nullptr;
         }
         fprintf(stderr, "[dsv4] DSpark drafter on device %d: %d stage(s), block_size=%d, markov_rank=%d, "
@@ -2929,13 +2929,13 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
             if (unallocated)
             {
                 m->w_buf[d] = ggml_backend_alloc_ctx_tensors(m->w_ctx[d], m->backends[d]);
-                if (!m->w_buf[d]) { fprintf(stderr, "[dsv4] weight alloc failed on device %d\n", d); return nullptr; }
+                if (!m->w_buf[d]) { tsg::report_load_refusal( "[dsv4] weight alloc failed on device %d\n", d); return nullptr; }
             }
         }
         if (ggml_get_first_tensor(m->c_ctx[d]) != nullptr)
         {
             m->c_buf[d] = ggml_backend_alloc_ctx_tensors(m->c_ctx[d], m->backends[d]);
-            if (!m->c_buf[d]) { fprintf(stderr, "[dsv4] cache alloc failed on device %d\n", d); return nullptr; }
+            if (!m->c_buf[d]) { tsg::report_load_refusal( "[dsv4] cache alloc failed on device %d\n", d); return nullptr; }
             ggml_backend_buffer_clear(m->c_buf[d], 0);
         }
     }
@@ -2970,7 +2970,7 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
                 const size_t total = ggml_nbytes(t);
                 if (total != src.size)
                 {
-                    fprintf(stderr, "[dsv4] size mismatch for %s: tensor %zu vs file %zu\n", t->name, total, src.size);
+                    tsg::report_load_refusal( "[dsv4] size mismatch for %s: tensor %zu vs file %zu\n", t->name, total, src.size);
                     sizes_ok = false;
                     continue;
                 }
@@ -3262,7 +3262,7 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
     m->active_slot = dsv4_slot_alloc(*m);
     if (!m->active_slot)
     {
-        fprintf(stderr, "[dsv4] primary slot allocation failed\n");
+        tsg::report_load_refusal( "[dsv4] primary slot allocation failed\n");
         return nullptr;
     }
 
@@ -6657,13 +6657,15 @@ static int dsv4_dspark_draft(dsv4_model & m, int32_t anchor_token, int64_t posit
 TSG_EXPORT void * TSGgml_Dsv4LoadModelDspark(const char * gguf_path, int n_gpu, int n_ctx, int n_ubatch, int n_threads,
                                              const char * dspark_path, int n_cpu_moe, const char * backend_name)
 {
+    // A stale error from an earlier op must not be reported as this load's reason.
+    tsg::clear_last_error();
     try
     {
         return tsg_dsv4::dsv4_load(gguf_path, n_gpu, n_ctx, n_ubatch, n_threads, dspark_path, n_cpu_moe, backend_name);
     }
     catch (const std::exception & e)
     {
-        fprintf(stderr, "[dsv4] DSpark load failed: %s\n", e.what());
+        tsg::report_load_refusal("[dsv4] DSpark load failed: %s\n", e.what());
         return nullptr;
     }
 }
@@ -6671,13 +6673,15 @@ TSG_EXPORT void * TSGgml_Dsv4LoadModelDspark(const char * gguf_path, int n_gpu, 
 TSG_EXPORT void * TSGgml_Dsv4LoadModel(const char * gguf_path, int n_gpu, int n_ctx, int n_ubatch, int n_threads,
                                        int n_cpu_moe, const char * backend_name)
 {
+    // A stale error from an earlier op must not be reported as this load's reason.
+    tsg::clear_last_error();
     try
     {
         return tsg_dsv4::dsv4_load(gguf_path, n_gpu, n_ctx, n_ubatch, n_threads, nullptr, n_cpu_moe, backend_name);
     }
     catch (const std::exception & e)
     {
-        fprintf(stderr, "[dsv4] load failed: %s\n", e.what());
+        tsg::report_load_refusal("[dsv4] load failed: %s\n", e.what());
         return nullptr;
     }
 }

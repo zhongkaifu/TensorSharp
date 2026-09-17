@@ -495,6 +495,26 @@ pick therefore drops much further:
 if it fits and refused with the numbers if it does not, rather than quietly
 shrunk under you.
 
+Under `--tp N` the refusal names only remedies that would actually make the load
+fit on that rank count: a `MAX_CONTEXT` that fits, the `--n-cpu-moe` value that
+fits the context you asked for, or, when even every routed expert in system RAM
+leaves the replicated weights too large for one rank, running without `--tp`.
+Measured on 2x A40 with GLM-5.3-Flash UD-Q2_K_XL (lines shortened):
+
+```
+[glm] not enough VRAM for --tp 2: 52.5 GiB per rank of weights plus 5.5 GiB of KV and graphs
+      for a 65536-token context, against 41.2 GiB usable on the smallest rank. Re-run with
+      --n-cpu-moe 19 (keeps the routed experts of the first 19 layer(s) in system RAM).
+[glm] not enough VRAM for --tp 2: 6.4 GiB per rank of weights plus 62.3 GiB of KV and graphs
+      for a 1048576-token context, against 41.2 GiB usable on the smallest rank. Set
+      MAX_CONTEXT to 571904 or less.
+```
+
+It used to end every such refusal with "Lower MAX_CONTEXT (N tokens would fit) or
+add --n-cpu-moe N", including "0 tokens would fit" when the weights alone were
+the problem. Like every refused load, the host then prints the reason once more
+as its last stderr line and exits with code 2 (USAGE.md, "Exit codes").
+
 ### Environment knobs
 
 | Variable | Default | Meaning |

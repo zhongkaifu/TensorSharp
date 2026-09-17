@@ -1827,6 +1827,35 @@ shell 能够到达 PATH 上的每一个解释器——于是手上还拿着旧�
 | 原生构建使用的 CMake 生成器（Windows） | 有 Ninja 时优先使用，否则用 `Visual Studio NN` | `CMAKE_GENERATOR` | `-G <生成器>` |
 | 原生构建使用的 Visual Studio 安装（Windows） | 自动检测，包含被标记为"不完整"的安装 | `TENSORSHARP_VS_INSTALL_DIR` | — |
 
+## 退出码（CLI + Server）
+
+`TensorSharp.Cli` 与 `TensorSharp.Server` 使用同一套有文档约定的退出码，脚本或进程守护程序据此
+即可区分"命令行写错了"、"这个模型在这台机器上加载不了"和"这是个 bug"：
+
+| 退出码 | 含义 | stderr 输出 |
+|---|---|---|
+| `0` | 成功：运行结束、`--help` / `--list-skills` 已打印，或服务端正常关闭。 | — |
+| `1` | 配置错误：未知或已移除的参数、非法取值、无法读取的 `--config` 文件。 | `Configuration error: <错误说明>` |
+| `2` | 模型加载被拒绝。 | 恰好一行，且是最后一行：`error: model load refused: <原因>` |
+| 其他任何值 | 不是拒绝，而是 bug 或崩溃。未处理的 .NET 异常会打印堆栈，并在 Linux 和 macOS 上以 `134`（SIGABRT）退出；被操作系统杀掉的进程返回对应信号（内存不足被杀为 `137`）。 | 堆栈信息，请提交问题报告。 |
+
+**什么算"加载被拒绝"**（退出码 `2`）：加载器有意做出的、给出可操作原因的决定——显存不足以容纳
+请求的上下文或 `--n-cpu-moe` 设置（消息会给出放得下的数值）、设备装不下的 `--tp` 布局、架构不支持的
+KV 缓存类型（例如 DeepSeek V4.1 上的 `KV_CACHE_DTYPE=q8_0`）、模型或本机不支持的后端、缺失/截断/
+不是 GGUF 的模型文件、缺失的附属文件（DeepSeek V4.1 的 `deepseek41.engram.bin`），或者显式指定却无法
+启用的 `--draft-model`。原生加载器自己的诊断行（`[dsv4] ...`、`[glm] ...`）仍可能出现在错误行之前；
+错误行会重复原因，单独读也能看懂。加载过程中其他任何失败——`NullReferenceException`、CUDA 错误、
+内存不足导致的中止——都不算拒绝，会保留堆栈信息。
+
+以 `2` 退出之前，服务端会先释放被拒绝的加载留下的资源（模型服务与 ggml 后端），并且不会打开端口。
+拒绝的堆栈本来就是噪音，所以只在 Debug 级别记录：`TENSORSHARP_LOG_LEVEL=Debug`（两个宿主都适用）
+或 `--log-level debug`（CLI）即可看到。
+
+运行中的服务端收到的加载请求被拒绝时，进程不会退出。`POST /api/models/load` 返回 `500` 和
+`{ "ok": false, "error": "<原因>", "refused": true, "loadedModel": "<文件>" }`；之前已加载的模型会被恢复，
+并写在 `loadedModel` 中，恢复不了时为 `null`。需要重新加载托管模型的 OpenAI 或 Ollama 请求会以该协议的
+错误格式返回同样的原因，服务端继续提供服务。
+
 ## 服务端日志
 
 每一轮 chat / generate 请求开始与结束时，服务都会打出一条结构化的
