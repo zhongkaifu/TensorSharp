@@ -133,19 +133,37 @@ namespace TensorSharp.Runtime.Scheduling
             if (clamped > 0 && !_model.CanPrefillMediaAfterReusedPrefix(seq.PromptTokens.Count))
             {
                 foreach (var span in seq.MediaSpans)
-                    if (span.End > clamped)
+                {
+                    if (span.End <= clamped)
+                        continue;
+                    // Except up to the public prefix: while checkpoints are in use the
+                    // scheduler ends a prefill chunk there (AlignSharedPrefixBoundary), so
+                    // the media is prefilled after position P whether or not anything is
+                    // reused, and cloning the checkpoint is the same computation. Refusing
+                    // it re-prefilled the system prompt for an identical reply (Gemma 4
+                    // E4B, Metal: 1163 reused -> 0, time to first token 1.51 s -> 1.84 s).
+                    int kept = seq.SharedPrefixTokens > 0 && ModelSupportsPrefixCheckpoints()
+                        ? Math.Min(clamped, seq.SharedPrefixTokens)
+                        : 0;
+                    if (!_mediaAfterReusedPrefixWarned)
                     {
-                        if (!_mediaAfterReusedPrefixWarned)
-                        {
-                            _mediaAfterReusedPrefixWarned = true;
+                        _mediaAfterReusedPrefixWarned = true;
+                        if (kept == 0)
                             _logger.LogWarning(
                                 "A {Prompt}-token prompt whose attachment follows a reusable {Clamped}-token prefix " +
                                 "prefills from zero instead: this model cannot prefill media after a reused prefix " +
                                 "exactly at this length (Gemma 4 past its sliding window). Reported once.",
                                 seq.PromptTokens.Count, clamped);
-                        }
-                        return 0;
+                        else
+                            _logger.LogWarning(
+                                "A {Prompt}-token prompt whose attachment follows a reusable {Clamped}-token prefix " +
+                                "reuses only its {Kept}-token public prefix instead: this model cannot prefill media " +
+                                "after a longer reused prefix exactly at this length (Gemma 4 past its sliding window). " +
+                                "Reported once.",
+                                seq.PromptTokens.Count, clamped, kept);
                     }
+                    return kept;
+                }
             }
             return clamped;
         }

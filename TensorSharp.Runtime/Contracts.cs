@@ -143,7 +143,9 @@ namespace TensorSharp.Runtime
         /// an image chunk prefilled after a reused prefix on a wrapped ring (the per-op
         /// multimodal path) was measured to change the greedy output against a cold
         /// prefill, while the same turn within the window matched it. Such a turn then
-        /// reuses nothing and prefills from zero, which is exact (and on the fused path).
+        /// reuses nothing past its public prefix (SequenceState.SharedPrefixTokens): the
+        /// prefill is cut there for the shared-prefix checkpoint anyway, so cloning the
+        /// checkpoint changes nothing, and without a public prefix it prefills from zero.
         /// </summary>
         bool CanPrefillMediaAfterReusedPrefix(int promptTokens) => true;
 

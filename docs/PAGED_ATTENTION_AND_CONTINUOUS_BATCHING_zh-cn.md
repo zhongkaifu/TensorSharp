@@ -317,8 +317,11 @@ prefill 不同。在 decode 使用压缩位置之前，它们的复用止于第�
 在复用前缀*之后*预填充图片是另一回事。Gemma 4 的融合 prefill 只在起始位置 0 输出图片的双向掩码，
 因此这样的分块走较慢的逐算子路径。在滑动窗口之内，该路径与冷启动 prefill 逐 token 一致（但更慢：
 E4B/Metal 上一个复用 179 token 的 457 token 图片回合首 token 用时 1.25 s，而不是 0.66 s）。一旦提示
-超出窗口就不再一致，所以 `IModelArchitecture.CanPrefillMediaAfterReusedPrefix` 让这样的回合不复用、
-从零走融合路径 prefill；其后的文本回合仍会越过图片续接缓存。
+超出窗口就不再一致，所以 `IModelArchitecture.CanPrefillMediaAfterReusedPrefix` 让这样的回合不复用
+公共前缀之后的内容；其后的文本回合仍会越过图片续接缓存。公共前缀本身仍从共享前缀检查点克隆：启用
+检查点时每次 prefill 都会在该边界切分，所以无论是否复用，图片都在它之后预填充（E4B/Metal，1,163 token
+的系统提示加一张图片：两种情况回复相同，使用检查点时首 token 1.51 s，不使用时 1.84 s）。没有公共前缀
+的回合从零 prefill，能放进一个 prefill 分块时走一次融合计算。
 
 在 Gemma 4 上，不超过 `MaxReusablePrefixTokens`（滑动窗口）个 token 的回合现在也会续接 live cache；
 之前这类回合落到池化路径，只能返回整块的 256 token。已回绕环上的回退依旧被拒绝。

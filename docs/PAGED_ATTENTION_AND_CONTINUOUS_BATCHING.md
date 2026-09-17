@@ -369,8 +369,12 @@ runs on the slower per-op path. Within the sliding window that path matched a co
 prefill token for token (and costs time: on E4B/Metal a 457-token image turn reusing 179
 tokens took 1.25 s to first token instead of 0.66 s). Once the prompt outgrows the window
 it did not match, so `IModelArchitecture.CanPrefillMediaAfterReusedPrefix` makes such a
-turn reuse nothing and prefill from zero on the fused path; the text turns after it still
-continue the cache past the image.
+turn reuse nothing past its public prefix; the text turns after it still continue the cache
+past the image. The public prefix itself is still cloned from the shared-prefix checkpoint:
+while checkpoints are in use every prefill is cut at that boundary, so the image runs after
+it with or without reuse (E4B/Metal, a 1,163-token system prompt plus an image: the same
+reply either way, 1.51 s to first token with the checkpoint and 1.84 s without). A turn with
+no public prefix prefills from zero, in one fused pass when it fits one prefill chunk.
 
 On Gemma 4 the live cache is continued for turns of `MaxReusablePrefixTokens` (the
 sliding window) tokens or fewer too; before, such turns fell to the pooled path, which

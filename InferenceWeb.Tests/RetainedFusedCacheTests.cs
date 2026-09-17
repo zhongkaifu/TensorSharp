@@ -2108,6 +2108,31 @@ public class RetainedFusedCacheTests
         Assert.Equal(reused ? history.Count : 0, second.completion.PrefixCacheReusedTokens);
     }
 
+    /// <summary>
+    /// A new chat whose image follows the shared system prompt. Its prefill is cut at the
+    /// public prefix anyway (so the prefix can be checkpointed), which puts the image after
+    /// position P with or without reuse; a model that cannot prefill media after a reused
+    /// prefix must still clone the checkpoint rather than re-prefill the system prompt for
+    /// the same computation.
+    /// </summary>
+    [Fact]
+    public async Task MediaAfterTheSharedPrefix_StillClonesTheCheckpoint_WhenMediaAfterReuseIsRefused()
+    {
+        await WithCheckpointsOnAsync(async () =>
+        {
+            var model = new FusedStubModel(mediaAfterReuseMaxPromptTokens: 40);
+            using var engine = new InferenceEngine(model, Config(), NullLogger.Instance);
+            await DrainAsync(engine.SubmitRequest(Scoped("chat-1", NewChat("unused", firstToken: 7).PromptTokens.ToList(), "A")));
+            Assert.Single(model.Checkpoints);
+
+            var prompt = Concat(SharedPrefix(), Enumerable.Repeat(6, 8), Enumerable.Repeat(8, FirstMessageLen));
+            var image = await DrainAsync(engine.SubmitRequest(
+                Scoped("chat-2", prompt, "B", media: ImageAt(SharedPrefixLen, "img:photo"))));
+
+            Assert.Equal(SharedPrefixLen, image.completion.PrefixCacheReusedTokens);
+        });
+    }
+
     private async Task<int> ReuseAfterAnImageTurnAsync(string sameOrOtherImage, bool modelContinuesPastMedia)
     {
         var model = new FusedStubModel(

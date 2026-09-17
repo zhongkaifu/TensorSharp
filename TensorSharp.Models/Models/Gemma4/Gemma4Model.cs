@@ -1133,7 +1133,8 @@ namespace TensorSharp.Models
         /// sliding window that path matched a cold prefill token for token; once the ring
         /// has wrapped it did not (Gemma 4 E4B, Metal: a 611-token reused prefix plus a
         /// 278-token image turn changed the greedy answer). Until that path is exact, such a
-        /// turn prefills from zero. See IModelArchitecture.CanPrefillMediaAfterReusedPrefix.
+        /// turn reuses at most its public prefix, where the prefill is cut anyway. See
+        /// IModelArchitecture.CanPrefillMediaAfterReusedPrefix.
         /// </summary>
         public override bool CanPrefillMediaAfterReusedPrefix(int promptTokens)
             => MaxReusablePrefixTokens == int.MaxValue || promptTokens <= MaxReusablePrefixTokens;
