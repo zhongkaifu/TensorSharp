@@ -116,6 +116,11 @@ namespace TensorSharp.Runtime.Scheduling
         /// this backend; the executor surfaces a one-time operator notice.</summary>
         public bool SpeculationUnprofitable { get; init; }
 
+        /// <summary>Speculative decoding was requested but the model refuses it for
+        /// correctness (see <see cref="ISpeculativeTarget.SpeculationRefusal"/>);
+        /// the executor surfaces this reason once.</summary>
+        public string SpeculationRefusal { get; init; }
+
         /// <summary>The path this plan selects (first candidate).</summary>
         public ExecutionPathKind Selected => Candidates[0];
 

@@ -424,6 +424,13 @@ Nemotron-H 是所有批处理移植里最复杂的，因为它结合了**三种�
 - 按序列的注意力派发使用 `ManagedPagedAttention.Forward`（纯 C# 在线
   softmax 内核）作为正确性参考；同时通过 `GgmlBasicOps` 接入了原生分页
   内核路径。
+- 原生主机数组内核（`TSGgml_PagedAttentionForward`）按形状桶缓存一份计算图和
+  后端缓冲，并把 K/V 填充到桶长。构建会话时现在会清零该缓冲：后端缓冲本身不保证为零，
+  而 CUDA flash attention 仍会读取被 `-inf` 掩码的填充 key，因此被释放缓冲留下的
+  NaN（例如一个长提示结束之后）会让下一次批处理 prefill 的每一行都变成 NaN。
+  Nemotron 3.5 随后在 `TryMoEPrefillBatchedByExpert` 中抛出
+  `IndexOutOfRangeException`（NaN 行没有 top-k），整个 4 序列步失败。
+  现在 MoE 路由器会按层和行号报告非有限值的行。
 
 ### Mamba2 层 —— 每槽位 conv + SSM 状态池
 
@@ -492,6 +499,18 @@ GgmlMetal、进程内 legacy-vs-batched 切换；详见
 移植过程中还修了一个潜伏 bug：`s_nemoBatchedOptIn` 原本是 `static readonly`，
 在 class-load 时捕获环境变量 —— 测试在运行时设置 `TS_NEMOTRON_BATCHED=1`
 实际无法切换路径。现在改为方法 getter（与 Qwen 3.5 的写法一致）。
+
+### 投机解码被拒绝
+
+Nemotron-H 不做投机解码：`--draft-model` 不会挂载 DSpark/DFlash 草稿器（Nemotron 3.5
+Lightning 的 `NVFP4-DSpark` GGUF 会被识别并报告“未挂载”；服务器在 `--draft-model` 指定它时会在启动阶段失败并提示去掉该参数），`--spec` 或
+`--spec-type ngram` 也只提供普通解码，并打印一次警告。原因是正确性：投机输出必须与普通贪心解码一致，
+而在这个主干上，多 token verify 与单 token decode 使用不同的注意力内核（基于展开缓存的主机端注意力 vs.
+flash-attention decode 内核）和不同的 MoE 内核（按专家批处理 vs. 逐 token 内核）。在 `nemotron_h_moe`
+（A40，`ggml_cuda`）上实测：单行投机步与 `Forward` 的 logits 相差 0.16-1.1，verify 各行相差 0.2-0.8，
+足以翻转低置信度的贪心选择（2026-09-16 验证中每个单序列 DSpark 请求都发生了偏离）。Mamba-2 的快照 / 回滚是精确的。
+把注意力和 MoE 逐行运行可以让 verify 精确，但 4 行需要 116 ms，而一个 decode 步只要 28 ms（另加每个 DSpark 块 70 ms），
+因此精确的 verify 无法快过普通解码。详见 [投机解码](../speculative_decoding.md#nemotron-h-refuses-speculation)。
 
 ## 12. 输出解析器与聊天模板
 

@@ -151,6 +151,14 @@ namespace TensorSharp.Cli
             if (!ShouldEngage(draftHeadKind, settings))
                 return null;
 
+            // A trunk whose verify cannot reproduce its own decode would emit a
+            // different stream than plain greedy decoding: refused outright.
+            if (spec.SpeculationRefusal is { } refusal)
+            {
+                declineReason = refusal;
+                return null;
+            }
+
             // Backends whose accelerated verify/draft kernels are missing run the
             // per-op fallback, which does not amortize the trunk over the window.
             if (!spec.SpeculationProfitable)

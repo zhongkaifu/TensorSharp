@@ -272,6 +272,14 @@ fused whole-model kernel its prefill runs, and the hidden-state capture is only
 filled when a speculator asks for it. TensorAgent ships the assistant GGUF as an
 optional download, so this is what makes speculation reachable there at all.)
 
+A model can also refuse speculation outright. `ISpeculativeTarget.SpeculationRefusal`
+is a correctness verdict, not a speed one: a non-null reason makes the planner,
+`SpeculatorRegistry.Create`, the CLI and the draft-head loader all decline, the
+engine logs the reason once, and every request decodes plainly. Use it when the
+trunk's verify cannot reproduce its own decode (see
+[Nemotron-H refuses speculation](#nemotron-h-refuses-speculation)); use
+`SpeculationProfitable` when it only would not pay.
+
 ## Operator surface
 
 ```
@@ -988,6 +996,37 @@ the device, so a device-to-device copy is about 0.2 ms for 60 MB on an A40 - the
 expensive part was always the host round trip, not the copy.
 `BackendType.Cuda` already has that path (`MtpSnapshotRecurrentStateCudaDevice`);
 ggml_cuda does not.
+
+## Nemotron-H refuses speculation
+
+The 2026-09-16 campaign ran Nemotron 3.5 Lightning (`nemotron_h_moe`, MXFP4_MOE)
+with its DSpark drafter: no draft was ever accepted, every solo greedy request
+differed from the same request without the drafter, and decode ran at 0.55x.
+Measured in-process on one A40 (`ggml_cuda`), one question at a time:
+
+| Question | Result |
+| --- | --- |
+| Is the rollback exact? | Yes. Snapshot, a 4-row verify of wrong tokens, restore + rewind, then plain decode: logits identical to plain decoding (max \|diff\| 0) for 47 steps. |
+| Does a one-row `SpecForward` equal `Forward`? | No: 0.16 after the first token, up to 1.1 over 48 steps; first argmax flip at step 33. It passes `isDecode: false`, which routes the MoE through the batched-by-expert path instead of the per-token decode kernel. With the decode flag it is identical. |
+| Do verify rows equal plain decoding? | No: 0.2-0.8 per row for a 4- or 8-row verify. Running the MoE row by row leaves 0.2-0.5; running MoE **and** attention row by row makes it exact (the Mamba-2 multi-row scan is already exact). |
+| What does an exact verify cost? | 116 ms for 4 rows row by row (4.1x a 28 ms plain step); the batched verify is 187 ms; one DSpark block is 70 ms per-op. |
+
+So an exact verify costs as much as decoding its rows one at a time, before the
+drafter runs, and an inexact one changes the output. `NemotronModel` therefore
+reports `SpeculationRefusal` (both `nemotron_h` and `nemotron_h_moe` share the
+attention half of the mismatch), refuses DFlash/DSpark drafters before reading
+the file, and serves plain decoding with a one-time warning.
+
+The drafter had its own bug, in shared code: DFlash's attention-sink path added
+the per-head sink to the post-softmax attention weights. A sink is a logit that
+joins the softmax denominator (`ggml_soft_max_add_sinks`, gpt-oss); adding it
+afterwards spread tens of units of attention mass evenly over a ~1000-key window.
+With teacher forcing on the trunk's own greedy tokens, the first draft matched the
+next token 0 of 47 times before the fix and 17 of 47 after it. Later block
+positions stay weak (mean accepted prefix 0.45-0.57 depending on in-block
+causality and on the bonus-anchor reading, where NVIDIA reports 3.75 of 7 on
+SPEED-Bench), so more of this drafter is still unverified; that matters again
+only if the trunk gets a bit-exact verify.
 
 ## Measuring it
 

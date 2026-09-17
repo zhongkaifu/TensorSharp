@@ -207,6 +207,13 @@ namespace TensorSharp.Models
         /// of the hot buffers.</summary>
         private float[] _dflashMarkovScratch;
 
+        /// <summary>
+        /// Non-null when this architecture refuses DFlash/DSpark drafters, with the
+        /// reason; <see cref="LoadDFlashDraftWeights"/> then throws
+        /// <see cref="NotSupportedException"/> carrying it. Default null.
+        /// </summary>
+        protected virtual string DFlashDrafterRefusal => null;
+
         /// <summary>True when a usable DFlash drafter is attached to this model.</summary>
         public bool HasDFlash => _hasDFlash;
 
@@ -227,6 +234,12 @@ namespace TensorSharp.Models
         /// </summary>
         public void LoadDFlashDraftWeights(string ggufPath)
         {
+            // A trunk that cannot verify a draft window bit-exactly refuses every
+            // drafter up front: attaching one would only produce a stream that
+            // differs from plain greedy decoding.
+            if (DFlashDrafterRefusal is { } refusal)
+                throw new NotSupportedException(refusal);
+
             if (string.IsNullOrEmpty(ggufPath) || !System.IO.File.Exists(ggufPath))
                 throw new System.IO.FileNotFoundException("DFlash drafter GGUF not found.", ggufPath);
 
@@ -1095,9 +1108,16 @@ namespace TensorSharp.Models
             gk.Dispose();
 
             DFlashApplyWindowMask(scores, b, groupSize, kvHeads, w, total, position, winStart);
-            Ops.Softmax(scores, scores);
             if (cfg.HasAttentionSinks)
-                DFlashApplyAttentionSinks(scores, il, b, groupSize, kvHeads, total);
+            {
+                // Sinks are extra softmax LOGITS (gpt-oss / ggml_soft_max_add_sinks),
+                // so they have to be part of the normalization itself.
+                DFlashSoftmaxWithSinks(scores, il, b, groupSize, kvHeads, total);
+            }
+            else
+            {
+                Ops.Softmax(scores, scores);
+            }
 
             var attnGrouped = new Tensor(_allocator, DType.Float32, kvHeads, (long)groupSize * b, hd);
             Ops.AddmmBatch(attnGrouped, 0, attnGrouped, 1f, scores, gv);
@@ -1156,14 +1176,19 @@ namespace TensorSharp.Models
         }
 
         /// <summary>
-        /// Adds the drafter's per-head attention-sink bias to the normalized
-        /// attention weights, mirroring llama.cpp's build_attn (the sink lands on
-        /// the POST-softmax scores, a fixed attention-mass floor per head). The
-        /// sink is keyed on the QUERY head there, so query row (g, j) of the
-        /// grouped scores -- head g*groupSize + j/b, block slot j % b -- gets
-        /// sink[head] added to every key column.
+        /// Softmax with per-head attention sinks, the gpt-oss / llama.cpp
+        /// (<c>ggml_soft_max_add_sinks</c>) definition: the sink is one extra LOGIT
+        /// per query head that joins the softmax denominator and whose probability
+        /// is then dropped, so w_c = exp(x_c) / (exp(sink) + sum_k exp(x_k)). The
+        /// sink is keyed on the QUERY head, so query row (g, j) of the grouped scores
+        /// -- head g*groupSize + j/b, block slot j % b -- uses sink[head].
+        ///
+        /// This used to ADD the sink to the post-softmax weights. With ~1000 key
+        /// columns in the window that spread tens of units of attention mass evenly
+        /// over every cached position, and the Nemotron-3.5 DSpark drafter drafted
+        /// noise (0 of 47 teacher-forced next tokens right; 17 of 47 with this).
         /// </summary>
-        private unsafe void DFlashApplyAttentionSinks(Tensor scores, int il, int b, int groupSize, int kvHeads, int total)
+        private unsafe void DFlashSoftmaxWithSinks(Tensor scores, int il, int b, int groupSize, int kvHeads, int total)
         {
             Tensor sinkW = _weights[_dflashLayerNames[il][DfAttnSinks]];
             if (sinkW.ElementCount() != (long)kvHeads * groupSize)
@@ -1172,9 +1197,25 @@ namespace TensorSharp.Models
                     $"DFlash attn_sinks of draft layer {il} has {sinkW.ElementCount()} values "
                     + $"for {kvHeads * groupSize} heads; refusing to run a half-wired sink.");
             }
-
             float* sp = GetFloatPtr(scores);
             float* sink = GetFloatPtr(sinkW);
+            DFlashSinkSoftmaxRows(sp, sink, b, groupSize, kvHeads, total);
+            InvalidateTensorDeviceCache(scores);
+        }
+
+        /// <summary>Managed entry to the sink softmax over grouped scores
+        /// [kvHeads, groupSize*b, total] with one sink logit per query head.</summary>
+        internal static unsafe void DFlashSinkSoftmaxRows(float[] scores, float[] sinks, int b, int groupSize, int kvHeads, int total)
+        {
+            if ((long)kvHeads * groupSize * b * total != scores.LongLength || sinks.Length != kvHeads * groupSize)
+                throw new ArgumentException("scores/sinks do not match the grouped attention shape.");
+            fixed (float* sp = scores)
+            fixed (float* sk = sinks)
+                DFlashSinkSoftmaxRows(sp, sk, b, groupSize, kvHeads, total);
+        }
+
+        private static unsafe void DFlashSinkSoftmaxRows(float* sp, float* sink, int b, int groupSize, int kvHeads, int total)
+        {
             int rowsPerGroup = groupSize * b;
             for (int g = 0; g < kvHeads; g++)
             {
@@ -1182,14 +1223,17 @@ namespace TensorSharp.Models
                 for (int j = 0; j < rowsPerGroup; j++)
                 {
                     float s = sink[g * groupSize + j / b];
-                    if (s == 0f)
-                        continue;
                     float* row = groupScores + (long)j * total;
+                    float max = s;
                     for (int c = 0; c < total; c++)
-                        row[c] += s;
+                        if (row[c] > max) max = row[c];
+                    double sum = Math.Exp(s - max);
+                    for (int c = 0; c < total; c++)
+                        sum += Math.Exp(row[c] - max);
+                    for (int c = 0; c < total; c++)
+                        row[c] = (float)(Math.Exp(row[c] - max) / sum);
                 }
             }
-            InvalidateTensorDeviceCache(scores);
         }
 
         // ====================================================================

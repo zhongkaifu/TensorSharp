@@ -101,6 +101,11 @@ namespace TensorSharp.Runtime.Scheduling
         /// was requested.</summary>
         public bool SpeculationProfitable { get; init; }
 
+        /// <summary>Non-null when the model refuses speculation for correctness
+        /// (<see cref="ISpeculativeTarget.SpeculationRefusal"/>); the engine serves
+        /// plain decoding and reports this reason.</summary>
+        public string SpeculationRefusal { get; init; }
+
         /// <summary>The speculative trunk can run through the batched paged
         /// path (<see cref="IBatchedSpeculativeTarget"/>), composing with
         /// prefix caching and concurrency transitions.</summary>
@@ -128,7 +133,8 @@ namespace TensorSharp.Runtime.Scheduling
                 HasMultimodalInjector = model.MultimodalInjector != null,
                 SupportsSpeculativeTrunk = specTrunk,
                 HasDraftHead = draftHead,
-                SpeculationProfitable = specTrunk && spec.SpeculationProfitable,
+                SpeculationProfitable = specTrunk && spec.SpeculationRefusal == null && spec.SpeculationProfitable,
+                SpeculationRefusal = specTrunk ? spec.SpeculationRefusal : null,
                 SupportsBatchedSpecTrunk = specTrunk
                     && spec is IBatchedSpeculativeTarget batchedSpec
                     && batchedSpec.SupportsBatchedSpecTrunk,

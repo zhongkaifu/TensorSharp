@@ -211,7 +211,7 @@ curl http://127.0.0.1:5001/v1/embeddings -H 'Content-Type: application/json' \
 | Qwen 3.5 / 3.6 family | `qwen35`, `qwen35moe`, `qwen3next` | Qwen3.5-9B（混合 Attn+递归）、Qwen3.5/3.6-35B-A3B（MoE） | 图像 | 支持 | 支持 | Qwen 3.6 支持（内嵌 NextN） | [qwen35](docs/models/qwen35_zh-cn.md) |
 | Bonsai（Qwen 家族） | `qwen3`（8B）、`qwen35`（27B） | Bonsai-8B（36 层稠密 GQA）、Bonsai-27B（48 层 GatedDeltaNet + 16 层全注意力），均为 Q1_0 | 仅文本 | 27B 支持；8B 模板输出固定的空 think 块 | 支持 | — | [bonsai](docs/models/bonsai_zh-cn.md) |
 | GPT OSS | `gptoss`, `gpt-oss` | gpt-oss-20b（MoE） | 仅文本 | 支持（始终） | 支持 | — | [gptoss](docs/models/gptoss_zh-cn.md) |
-| Nemotron-H | `nemotron_h`, `nemotron_h_moe` | Nemotron-H-8B/47B（混合 SSM-Transformer，MoE）、Nemotron 3 Nano Omni、Nemotron 3.5 Lightning 30B-A3B（23 Mamba-2 + 23 MoE + 6 注意力） | 图像（Omni） | 支持 | 支持 | Nemotron 3.5 Lightning：DSpark 块级起草（独立草稿 GGUF） | [nemotron](docs/models/nemotron_zh-cn.md) |
+| Nemotron-H | `nemotron_h`, `nemotron_h_moe` | Nemotron-H-8B/47B（混合 SSM-Transformer，MoE）、Nemotron 3 Nano Omni、Nemotron 3.5 Lightning 30B-A3B（23 Mamba-2 + 23 MoE + 6 注意力） | 图像（Omni） | 支持 | 支持 | 不支持（拒绝：verify 与 decode 内核不同，投机会改变输出） | [nemotron](docs/models/nemotron_zh-cn.md) |
 | Mistral 3 | `mistral3` | Mistral-Small-3.1-24B-Instruct | 图像 | 不支持 | 不支持 | — | [mistral3](docs/models/mistral3_zh-cn.md) |
 | Hunyuan Dense | `hunyuan-dense` | 腾讯稠密 Hunyuan 解码器，例如 Hy-MT2（GQA，per-head QK-norm 在 NeoX RoPE **之后**，SwiGLU） | 仅文本 | 不支持 | 不支持 | — | [hunyuan-dense](docs/models/hunyuan-dense_zh-cn.md) |
 | Muse-Glimmer | `muse-glimmer`、`muse_glimmer` | Muse-Glimmer-30B（交错滑动窗口 + NoPE 全注意力层，注意力输出门控） | 图像 | 支持 | 支持（ATEM） | 支持（DFlash 块级草稿，独立 GGUF） | [muse-glimmer](docs/models/muse-glimmer_zh-cn.md) |

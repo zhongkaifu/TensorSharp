@@ -1052,6 +1052,19 @@ public class ServerOptionsBuilderTests : IDisposable
         Assert.Contains("embedding_length_out", msg);
     }
 
+    [Fact]
+    public void SpeculationStartupValidation_ModelRefusal_SaysToDropTheFlagNotToSwapTheDraft()
+    {
+        // Nemotron-H refuses every drafter: suggesting "the draft GGUF that matches
+        // this target" would send the operator after a file that cannot exist.
+        string reason = "--draft-model 'x-DSpark.gguf' is not attached: " + NemotronModel.SpeculationRefusalReason;
+        string msg = SpeculationStartupValidation.GetFatalActivationError(reason, refusedByModel: true);
+        Assert.Contains(reason, msg);
+        Assert.Contains("refuses it", msg);
+        Assert.Contains("drop --draft-model", msg);
+        Assert.DoesNotContain("embedding_length_out", msg);
+    }
+
     // ---- Listen address (--port / --host / --urls) -------------------------
     // The ambient environment can carry PORT / HOST / ASPNETCORE_URLS (container
     // platforms inject them), so every test here clears all three first and then

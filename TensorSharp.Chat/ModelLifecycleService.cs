@@ -62,6 +62,15 @@ namespace TensorSharp.Server
         /// </summary>
         public string DraftHeadActivationError { get; private set; }
 
+        /// <summary>
+        /// True when <see cref="DraftHeadActivationError"/> comes from the loaded
+        /// model refusing speculation outright
+        /// (<see cref="TensorSharp.Runtime.Speculative.ISpeculativeTarget.SpeculationRefusal"/>)
+        /// rather than from a missing or mismatched draft file, so no other draft
+        /// GGUF could fix it.
+        /// </summary>
+        public bool DraftHeadRefusedByModel { get; private set; }
+
         public string LoadedModelName => _loadedModelPath != null ? Path.GetFileName(_loadedModelPath) : null;
         public string LoadedModelPath => _loadedModelPath;
         public string LoadedMmProjName => _loadedMmProjPath != null ? Path.GetFileName(_loadedMmProjPath) : null;
@@ -165,6 +174,7 @@ namespace TensorSharp.Server
             _loadedModelPath = null;
             _loadedMmProjPath = null;
             DraftHeadActivationError = null;
+            DraftHeadRefusedByModel = false;
 
             if (!string.IsNullOrEmpty(previousModel))
             {
@@ -226,6 +236,8 @@ namespace TensorSharp.Server
                 if (!SpeculativeDraftHeadLoader.TryAttachConfiguredDraftHead(_model, out string draftError))
                 {
                     DraftHeadActivationError = draftError;
+                    DraftHeadRefusedByModel =
+                        _model is TensorSharp.Runtime.Speculative.ISpeculativeTarget { SpeculationRefusal: not null };
                     _logger.LogWarning("{Error}; speculation disabled.", draftError);
                 }
                 else if (SpeculativeDraftHeadLoader.ConfiguredDraftHeadPath() is { } attachedDraft)
@@ -255,6 +267,7 @@ namespace TensorSharp.Server
                 _loadedModelPath = null;
                 _loadedMmProjPath = null;
                 DraftHeadActivationError = null;
+                DraftHeadRefusedByModel = false;
                 throw;
             }
         }
