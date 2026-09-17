@@ -16,7 +16,7 @@ using Xunit;
 namespace InferenceWeb.Tests.PrefixCache;
 
 /// <summary>One model under the conformance script, with the prompts it runs.</summary>
-internal sealed class ConformanceSubject
+internal sealed record ConformanceSubject
 {
     public required string Name { get; init; }
     /// <summary>Implements <see cref="IModelArchitecture"/>, <see cref="IBatchedPagedModel"/>,
@@ -34,6 +34,11 @@ internal sealed class ConformanceSubject
     public PrefixCacheMode ExpectedReadiness { get; init; } = PrefixCacheMode.Legacy;
     /// <summary>False for native-slot families, whose slot bytes the managed side does not measure.</summary>
     public bool PayloadBytesKnown { get; init; } = true;
+    /// <summary>When set, reports whether a retained payload is device-authoritative. With
+    /// <see cref="ExpectDirtyDonations"/> the settle step asserts its donated holder was dirty,
+    /// so the settle it checks is not vacuous.</summary>
+    public Func<string, bool>? PayloadDeviceDirty { get; init; }
+    public bool ExpectDirtyDonations { get; init; }
     public Action<string> Log { get; init; } = _ => { };
 }
 
@@ -258,6 +263,12 @@ internal static class PrefixCacheConformanceScript
         {
             if (!Copies) { NotApplicable("settle then clone", "donate-only or no end states"); return; }
             (string key, int length, List<int> generated) = DonatedHolder("settle", _a);
+            if (_s.PayloadDeviceDirty != null)
+            {
+                bool dirty = _s.PayloadDeviceDirty(key);
+                _s.Log($"[{_s.Name}] donated holder device-authoritative before the clone: {dirty}");
+                if (_s.ExpectDirtyDonations) Assert.True(dirty, "the donated holder was already host-authoritative: the settle was not exercised");
+            }
             string clone = Request("settle-clone");
             Assert.True(_pcm.TryMaterialize(new MaterializeRequest(MaterializeOp.Clone, key, clone, length, length)),
                 "clone of a donated holder refused: the settle did not make it host-authoritative");

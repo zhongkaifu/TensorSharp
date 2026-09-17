@@ -46,6 +46,13 @@ public sealed class PrefixCacheContractConformanceTests
         RewindTokens = 6,
         ExpectedReadiness = PrefixCacheMode.Tree,
         PayloadBytesKnown = true,
+        PayloadDeviceDirty = model switch
+        {
+            OracleModel o => o.IsDeviceDirty,
+            AdaptedOracleModel a => a.Inner.IsDeviceDirty,
+            _ => null,
+        },
+        ExpectDirtyDonations = (model as OracleModel ?? (model as AdaptedOracleModel)?.Inner)?.Traits.DeviceDirtyOnForward == true,
         Log = log,
     };
 
