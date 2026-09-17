@@ -391,15 +391,32 @@ and leaves the pages evictable. It is skipped with a diagnostic when the mapped
 host weights plus 8 GiB do not fit the detected host/cgroup memory allowance, or
 when `MemAvailable` could not keep the tables cached anyway.
 
+Warming reads each table with `pread` in 64 MiB blocks, one contiguous run of
+the table per reader thread (`TS_DSV4_LOAD_THREADS`, default 16), and skips a
+block whose pages `mincore` already reports resident, so a reload whose tables
+are still cached reads almost nothing. It used to touch the mapping one byte per
+4 KiB page, and on a network filesystem every such fault is a synchronous read
+capped at the mount's readahead (128 KiB on the A40 VMs' MooseFS mount): the
+seven-A40 lane's synchronous warm of the 103 GiB Q4_K_M tables took 311.3 s.
+Measured on that VM, 8 GiB of an evicted table reads at 2.38-2.54 GiB/s with
+`pread` and 0.63-0.69 GiB/s with the page walk; see [Load time](#load-time) for
+the method. `TS_DSV4_WARM_PREAD=0` restores the page walk for both forms below.
+A sync-mode read error fails the load with the file and offset; in the
+background it is one log line and the model keeps serving.
+
 | `TS_DSV41_ENGRAM_WARM` | behaviour |
 |---|---|
-| unset (default) | warm in the background once the model is serving |
-| `1` | warm synchronously during load, as before; startup takes ~110-210 s longer |
+| unset (default) | warm in the background once the model is serving; the finish line reads `[dsv41] warmed ... Engram pages in ...s (background, ...)` |
+| `1` | warm synchronously during load, as before; startup takes as long as reading the tables (311.3 s for 103 GiB with the page walk on the seven-A40 lane; at the measured 2.24-2.54 GiB/s `pread` rate that is 41-46 s of reads) |
 | `0` | never warm |
 
 Sparse-read mapping advice (`MADV_RANDOM`) is applied only after warming
 finishes, whichever form it took: the advice turns off the readahead the warm
-pass depends on.
+pass depends on. The `pread` warm leaves the pages in the page cache without
+mapping them into the process; a lookup's first touch of a row is then a minor
+fault, not a storage read. 2,000 random 144-byte rows through a `MADV_RANDOM`
+mapping of a table warmed that way averaged 0.0037-0.0056 ms, with no major
+faults.
 
 `TS_DSV41_ENGRAM_THREADS=1..32` controls the persistent lookup workers;
 the default is the smaller of 16 and the hardware thread count. Both prefill
@@ -604,6 +621,44 @@ Three things that look like the fix and are not, each measured on this box:
   2.4 GB/s at 16 threads against 1.0 GB/s at 96.
 * **`MADV_WILLNEED` on the host-expert prefault.** 29.7 s and 31.3 s against a
   27.7 s mean for the plain fault-in walk, i.e. no better.
+
+The passes after the upload read with `pread` too. The prefault of the
+host-resident experts (`--n-cpu-moe`) and the Engram warm (see
+[Host-mapped Engram tables](#host-mapped-engram-tables)) merge their tensors
+into file ranges, split the bytes into one contiguous run per thread
+(`TS_DSV4_LOAD_THREADS`), and read 64 MiB blocks on a descriptor per thread,
+skipping a block whose pages `mincore` already reports resident. They used to
+touch the mapping one byte per 4 KiB page. On a network filesystem each of
+those faults is a synchronous read capped at the mount's readahead
+(`read_ahead_kb`, 128 KiB on the A40 VMs), which is why the seven-A40 lane
+(`--n-cpu-moe 6`, Q4_K_M) logged 129.7 s to prefault 48.2 GiB of experts and
+311.3 s to warm 103 GiB of Engram tables.
+
+Measured on that VM with `GgmlOpsDsv4FileWarmBench` (built on Linux with the
+native tests), 16 threads, 8 GiB ranges evicted before every arm with
+`mincore` = 0 checked, three to five repeats, arms alternated:
+
+| pass over 8 GiB | Engram table, shard 00002 @ 20 GiB | experts, shard 00003 @ 9,002,135,936 |
+|---|---:|---:|
+| `pread` (default) | 2.38-2.54 GiB/s | 2.24-2.47 GiB/s |
+| prefault page walk, 256 MiB spans (`TS_DSV4_WARM_PREAD=0`) | 0.62-0.66 GiB/s | 0.68-0.74 GiB/s |
+| Engram page walk, 8 MiB chunks (`TS_DSV4_WARM_PREAD=0`) | 0.63-0.69 GiB/s | 0.65-0.68 GiB/s |
+| the same range again, already resident (all blocks skipped) | 64-159 GiB/s | 139-187 GiB/s |
+
+`pread` fills the page cache but not the process's page tables, which the walk
+also did, and the first prefill reads the experts densely. So the prefault also
+reads one byte per page of each block once it is cached: on resident pages that
+walk costs 0.004-0.006 s/GiB at 16 threads, against 0.019-0.023 s/GiB for
+`madvise(MADV_POPULATE_READ)` on the same ranges. The Engram tables are left
+unmapped; their rows are read a few at a time.
+
+Read-ahead hints are no substitute on this mount. `MADV_WILLNEED`,
+`POSIX_FADV_WILLNEED` and `readahead(2)` over an evicted 8 GiB range each left
+128 KiB of it (0.0015%) resident ten seconds later. Do not retry them.
+
+A read error in the prefault or the synchronous Engram warm fails the load and
+names the shard and offset. `TS_DSV4_WARM_PREAD=0` restores both page walks
+exactly.
 
 `TS_DSV4_LOAD_DROP_CACHE=1` releases each chunk's page cache once it is on the
 device. It does not make the load faster (5,374 s of read thread-time with it
