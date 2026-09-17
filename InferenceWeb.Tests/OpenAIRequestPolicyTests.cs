@@ -159,11 +159,14 @@ public sealed class OpenAIRequestPolicyTests : IDisposable
     // an HTTP 400, because neither declared where its reasoning ends. Gemma 4 closes its
     // thought channel with <channel|>; the Nemotron-H renderer (and the Nemotron 3.5 GGUF
     // template) primes <think>\n and the model closes it with </think>.
+    // Muse-Glimmer was refused the same way on its --thinking re-run; its answer message
+    // always opened with "<|start|>assistant to=user<|message|>".
     [Theory]
     [InlineData("gemma4", "<channel|>")]
     [InlineData("nemotron_h", "</think>")]
     [InlineData("nemotron_h_moe", "</think>")]
     [InlineData("nemotron_h_omni", "</think>")]
+    [InlineData("muse-glimmer", "to=user<|message|>")]
     public async Task ReasoningFamilies_AcceptResponseFormatWithThinking(string architecture, string trigger)
     {
         Assert.Equal(trigger, OutputParserFactory.GrammarActivationTrigger(architecture, enableThinking: true));

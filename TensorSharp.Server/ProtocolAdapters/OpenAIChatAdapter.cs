@@ -419,7 +419,7 @@ public sealed partial class OpenAIChatAdapter
                 // question (see OutputParserFactory.GrammarActivationTrigger).
                 string? trigger = OutputParserFactory.GrammarActivationTrigger(_svc.Architecture, enableThinking);
                 if (trigger != null)
-                    constraint.ActivateAfter(trigger);
+                    constraint.ActivateAfter(trigger, skipLeadingWhitespace: true);
                 withGrammar.Grammar = constraint;
                 return withGrammar;
             }

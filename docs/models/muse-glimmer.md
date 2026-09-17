@@ -53,8 +53,17 @@ dropping it. Before, it waited for a `<|message|>` that the grammar made
 impossible: the stream delivered `content: null` and `json_schema` returned
 HTTP 422 after generating the correct object (campaign 2026-09-16, B6). The
 non-streaming path now also validates the parsed content, not the raw stream.
-`response_format` with `"think": true` is still refused with HTTP 400: the
-reasoning message has no single end marker the grammar could arm on.
+`response_format` also combines with `"think": true`. The model reasons in a
+` to=self<|message|>` message and then opens its answer with
+`<|start|>assistant to=user<|message|>`, so the protocol declares
+`to=user<|message|>` as `ThinkingGrammarActivationTrigger` and the grammar arms
+there. Before, the combination was refused with HTTP 400 (every `--thinking`
+json case on the first re-run). Measured with `validate_inference.py --thinking`
+(json / json_schema / json_unicode, c1 and c4, three repeats, Q4_K_XL on one
+RTX PRO 6000): 38/45, and every answer header written (41) was `to=user<|message|>`.
+The seven failures all ended at `max_tokens` 256: the reasoning restates the
+prompt before it answers, and Muse-Glimmer declares no thinking-budget end
+token that could close it early.
 
 ## 1. Text architecture
 

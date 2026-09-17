@@ -210,6 +210,52 @@ public class DeepSeek41GrammarTriggerTests
         Assert.Throws<ArgumentException>(() => constraint.ActivateAfterTriggers(End, ""));
     }
 
+    // Campaign re-run 2026-09-16: Nemotron-H 8B Reasoning spells "</think>\n\n" as
+    // "</think" + ">\n\n". The JSON root cannot start with whitespace, so the merged
+    // token completing the marker was masked, the model wrote "</think}" instead, the
+    // marker never matched and 10 of 36 --thinking json cases ended with content null
+    // (json_schema: HTTP 422). The response_format path skips whitespace after the marker.
+    [Fact]
+    public void LeadingWhitespaceAfterMarker_IsPreludeWhenOptedIn()
+    {
+        var tokens = new BytesTokenizer(Utf8("</think"), Utf8(">\n\n"), Utf8("}"), Utf8("\n"),
+            Utf8("{\"ok\":true}"), Utf8(" \t{}"), Utf8(">\n\nnot json"), Utf8("x"), Utf8(">\n{}"));
+        var constraint = new GrammarConstraint(Grammar.JsonObject(), tokens);
+        constraint.ActivateAfter(End, skipLeadingWhitespace: true);
+        constraint.Accept(1);
+        AssertAllowed(constraint, 2, true);
+        AssertAllowed(constraint, 7, false);
+        AssertAllowed(constraint, 9, true);
+        var fork = constraint.Fork();
+        constraint.Accept(2);
+        Assert.True(constraint.IsActive);
+        Assert.False(constraint.IsComplete);
+        AssertAllowed(constraint, 3, false);
+        AssertAllowed(constraint, 4, true);
+        AssertAllowed(constraint, 6, true);
+        AssertAllowed(constraint, 8, false);
+        AssertAllowed(constraint, 5, true);
+        constraint.Accept(4);
+        constraint.Accept(5);
+        Assert.True(constraint.IsComplete && !constraint.IsDead);
+        // A fork taken before the marker keeps its own position, and one token may
+        // complete the marker, skip whitespace and write the whole value.
+        AssertAllowed(fork, 2, true);
+        fork.Accept(9);
+        Assert.True(fork.IsActive && fork.IsComplete);
+    }
+
+    [Fact]
+    public void LeadingWhitespaceAfterMarker_StaysMaskedByDefault()
+    {
+        var tokens = new BytesTokenizer(Utf8("</think"), Utf8(">\n\n"), Utf8("}"), Utf8(">{}"));
+        var constraint = Json(tokens, End);
+        constraint.Accept(1);
+        AssertAllowed(constraint, 2, false);
+        AssertAllowed(constraint, 3, true);
+        AssertAllowed(constraint, 4, true);
+    }
+
     private static GrammarConstraint Json(BytesTokenizer tokens, params string[] markers)
     {
         var constraint = new GrammarConstraint(Grammar.JsonObject(), tokens);

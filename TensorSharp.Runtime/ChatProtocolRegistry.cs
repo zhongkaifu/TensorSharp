@@ -290,6 +290,14 @@ namespace TensorSharp.Runtime
                 // channel, so an unparsed stream shows the raw tags and the whole chain
                 // of thought as if it were the answer.
                 OutputParserAlwaysRequired = true,
+                // With thinking off no trigger: a grammar from token 0 makes the model
+                // write the object with no header (MuseGlimmerOutputParser reads that as
+                // the answer). With thinking on the reply is " to=self<|message|>...",
+                // then "<|start|>assistant to=user<|message|>" and the answer - every
+                // answer header in the 2026-09-16 --thinking run (65/65) had that
+                // recipient - so the grammar arms after it. Without a trigger
+                // response_format + think=true could only be refused (HTTP 400).
+                ThinkingGrammarActivationTrigger = "to=user<|message|>",
             });
 
             Register(new ChatProtocol

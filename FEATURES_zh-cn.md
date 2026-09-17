@@ -44,10 +44,11 @@
 
 ## 思维链 / 推理模式
 
-支持思维链模式的模型（Qwen 3.5/3.6-family、Qwen 3.8 Flash Next、Gemma 4、GPT OSS、Nemotron-H、DeepSeek V4、DeepSeek V4.1、GLM 5.x）可以在生成最终答案之前产出结构化的思维链推理内容。思维内容与主要回复分开，客户端可选择显示或隐藏。
+支持思维链模式的模型（Qwen 3.5/3.6-family、Qwen 3.8 Flash Next、Gemma 4、GPT OSS、Nemotron-H、Muse-Glimmer、DeepSeek V4、DeepSeek V4.1、GLM 5.x）可以在生成最终答案之前产出结构化的思维链推理内容。思维内容与主要回复分开，客户端可选择显示或隐藏。
 
 - **Qwen 3.5/3.6-family / Nemotron-H：** 使用 `<think>...</think>` 标签
-- **Gemma 4：** 使用 `<|channel>thought\n...<channel|>` 标签。`response_format` 可以与 `"think": true` 同时使用，JSON 语法在 `<channel|>` 之后启用。通道由模型自己打开，因此预算从 `<|channel>` 开始计：开启思考时，`TS_THINKING_BUDGET`（输出额度不少于 512 token 时默认 75%）以 `<channel|>` 关闭通道，答案在原有 `max_tokens` 内继续。关闭思考时，模型仍打开的通道（E4B 在工具结果之后会这样做）不会返回给客户端，并在超过额度四分之一（最多 64 token）后的第一个换行处关闭；工具结果之后没有打开通道的 `<channel|>` 会被屏蔽，因此答案既不会为空，也不会在流中重复两次。`TS_THINKING_BUDGET=0` 同时关闭这两个上限。Nemotron-H（`nemotron_h`、`nemotron_h_moe`、`nemotron_h_omni`）同样允许 `response_format` 与 `"think": true` 同时使用，JSON 语法在 `</think>` 之后启用；词表中 `</think>` 为单个 token 时（Nemotron 3.5、Nemotron Omni），`TS_THINKING_BUDGET` 用它关闭思考块，答案在原有 `max_tokens` 内继续
+- **Gemma 4：** 使用 `<|channel>thought\n...<channel|>` 标签。`response_format` 可以与 `"think": true` 同时使用，JSON 语法在 `<channel|>` 之后启用。通道由模型自己打开，因此预算从 `<|channel>` 开始计：开启思考时，`TS_THINKING_BUDGET`（输出额度不少于 512 token 时默认 75%）以 `<channel|>` 关闭通道，答案在原有 `max_tokens` 内继续。关闭思考时，模型仍打开的通道（E4B 在工具结果之后会这样做）不会返回给客户端，并在超过额度四分之一（最多 64 token）后的第一个换行处关闭；工具结果之后没有打开通道的 `<channel|>` 会被屏蔽，因此答案既不会为空，也不会在流中重复两次。`TS_THINKING_BUDGET=0` 同时关闭这两个上限。Nemotron-H（`nemotron_h`、`nemotron_h_moe`、`nemotron_h_omni`）同样允许 `response_format` 与 `"think": true` 同时使用，JSON 语法在 `</think>` 之后启用；词表中 `</think>` 为单个 token 时（Nemotron 3.5、Nemotron Omni），`TS_THINKING_BUDGET` 用它关闭思考块，答案在原有 `max_tokens` 内继续。`</think>` 与 JSON 之间允许出现空白：Nemotron-H Reasoning-128K 的词表把 `>` 与其后的换行合成一个 token，屏蔽该 token 会让模型写出 `</think}`，语法因此从未启用
+- **Muse-Glimmer：** 在 `assistant to=self` 消息中推理，在 `assistant to=user` 消息中作答。`response_format` 可以与 `"think": true` 同时使用：JSON 语法在 `to=user<|message|>` 之后启用；关闭思考时语法从第一个 token 起生效，解析器把没有头部的对象当作答案
 - **GPT OSS：** 使用 Harmony 格式，以 `<|channel|>analysis` 标记思维过程，以 `<|channel|>final` 标记最终回复。推理无法关闭，只能缩短：OpenAI 的 `reasoning_effort` 字段（`low` / `medium` / `high`，默认 `medium`；其他值返回 HTTP 400）设置 Harmony 的 `Reasoning:` 行，显式 `"think": false` 且未指定 effort 时按 `low` 渲染。`response_format` 可以与 `"think": true` 同时使用（两种模式下语法都在 final channel 启用）
 - **DiffusionGemma：** 使用 Gemma 4 的 channel 语法；每帧预览和最终文本都会剥离思维块，仅在 `"think": true` 时返回。tools / `tool_choice` 以 HTTP 400 拒绝
 - **DeepSeek V4：** 使用 `<think>...</think>` 标签；不传 `--think` 时聊天模板会直接闭合该块，因此推理是显式开启的
