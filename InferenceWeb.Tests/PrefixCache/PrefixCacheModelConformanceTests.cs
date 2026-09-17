@@ -33,6 +33,7 @@ public sealed class PrefixCacheModelConformanceTests
     // One pattern per family, shared by the gate and the loader (memory note
     // diffusiongemma-test-gate-was-skipping: a gate and a loader that disagree pass vacuously).
     private const string Gemma4E4B = "gemma-4-e4b-it-q8_0";
+    internal const string Qwen35_9B = "qwen3.5-9b-q8_0";
 
     private readonly ITestOutputHelper _output;
 
@@ -76,9 +77,32 @@ public sealed class PrefixCacheModelConformanceTests
         model.OnSequenceReleased("fresh-allocation");
     }
 
+    [ModelFact(EnvModelDir, Qwen35_9B)]
+    public void Qwen35_9B_PassesTheConformanceScript()
+    {
+        using var model = (Qwen35Model)Load(Qwen35_9B);
+        model.AttachPrefixCache(new RecordingPayloadSink());
+        ConformanceSubject subject = TextSubject(model, "qwen35-9b") with
+        {
+            PayloadDeviceDirty = model.IsRetainedDeviceAuthoritative,
+            // A decoded holder's GDN state is device-resident (and its K/V dirty) on Metal.
+            ExpectDirtyDonations = true,
+        };
+        ConformanceReport report = PrefixCacheConformanceScript.Run(subject);
+
+        Assert.Contains("capture", report.Ran);
+        Assert.Contains("clone x2", report.Ran);
+        Assert.Contains("donate/return/donate", report.Ran);
+        Assert.Contains("settle then clone", report.Ran);
+        Assert.Contains("truncate refused (Truncation=None)", report.Ran);
+        Assert.Contains("primary conversion", report.Ran);
+        Assert.Contains(report.Ran, r => r.StartsWith("batched release", StringComparison.Ordinal));
+        Assert.Contains(report.Ran, r => r.StartsWith("export/import", StringComparison.Ordinal));
+    }
+
     // ------------------------------------------------------------------ helpers
 
-    private ModelBase Load(string pattern)
+    internal ModelBase Load(string pattern)
     {
         string dir = Environment.GetEnvironmentVariable(EnvModelDir);
         string path = TestGates.FindGguf(dir, pattern);

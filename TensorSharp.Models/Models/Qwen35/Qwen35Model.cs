@@ -6348,6 +6348,7 @@ namespace TensorSharp.Models
             InvalidateFullDecodeState(hardBindings: true);
             InvalidateVerifyCache();
             GgmlBasicOps.Qwen35ResetBatchedDecodeCache();
+            CountDecodeGraphReset();
             GgmlBasicOps.Qwen35ReleaseVerifyOwner(_verifyOwnerId);
             GgmlBasicOps.Qwen35ReleaseAttentionTpGraphs();
             GgmlBasicOps.Qwen35GdnDropTpGraphs();
@@ -6397,6 +6398,7 @@ namespace TensorSharp.Models
                 GgmlBasicOps.Qwen35ArenaResetBatchedDecodeCache();
                 DiscardVerifyStateForDispose();
                 GgmlBasicOps.Qwen35ResetBatchedDecodeCache();
+                CountDecodeGraphReset();
                 GgmlBasicOps.Qwen35ReleaseVerifyOwner(_verifyOwnerId);
                 GgmlBasicOps.Qwen35ReleaseAttentionTpGraphs();
                 GgmlBasicOps.Qwen35GdnDropTpGraphs();

@@ -1182,7 +1182,10 @@ namespace TensorSharp.Models
             // any state reset/rebuild must force a re-seed before the next fused decode.
             _bfdPoolSeeded = false;
             if (_backend == BackendType.GgmlCuda)
+            {
                 GgmlBasicOps.Qwen35ResetBatchedDecodeCache();
+                CountDecodeGraphReset();
+            }
             // CUDA/Vulkan persistent graphs still use their established hard-drop
             // lifecycle. Metal can retain its graph across a logical state change:
             // the next replay receives an explicit reseed flag and uploads the
@@ -1198,7 +1201,10 @@ namespace TensorSharp.Models
             // call sites reset it explicitly via InvalidateVerifyCache().
             if (_backend == BackendType.GgmlCuda || _backend == BackendType.GgmlVulkan
                 || (_backend == BackendType.GgmlMetal && hardBindings))
+            {
                 GgmlBasicOps.Qwen35ResetDecodeCache();
+                CountDecodeGraphReset();
+            }
         }
 
         /// <summary>Drop the persistent fused-verify graph cache (it pins the KV +
@@ -1487,6 +1493,7 @@ namespace TensorSharp.Models
                     {
                         _fdUnsupported = true;
                 GgmlBasicOps.Qwen35ArenaResetBatchedDecodeCache();   // flush stranded arena slots to host
+                        CountDecodeGraphReset();
                         return FdBail($"layer {l} ({(_isRecurrent[l] ? "recurrent" : "attention")}, moe={isMoeL}) missing a required weight/state" +
                             (!_isRecurrent[l] && _kvCacheK[l] != null && !IsFusedGraphKvCacheDType(_kvCacheK[l].ElementType)
                                 ? $" (KV cache dtype {_kvCacheK[l].ElementType} unsupported by fused graph on {_backend})"
@@ -1755,6 +1762,7 @@ namespace TensorSharp.Models
                 }
                 _fdUnsupported = true;
                 GgmlBasicOps.Qwen35ArenaResetBatchedDecodeCache();   // flush stranded arena slots to host   // don't retry a failing kernel every token
+                CountDecodeGraphReset();
                 return false;
             }
 
