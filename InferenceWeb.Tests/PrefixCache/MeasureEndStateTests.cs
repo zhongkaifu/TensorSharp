@@ -32,12 +32,12 @@ public sealed class MeasureEndStateTests
 
     public MeasureEndStateTests(ITestOutputHelper output) { _output = output; }
 
-    [ModelFact(EnvModelDir, PrefixCacheModelConformanceTests.Qwen35_9B)]
+    [ModelFact(EnvModelDir, PrefixCacheContractConformanceTests.Qwen35_9B)]
     public void Qwen35_MeasureEndState_MatchesIdleHolderBytesWithinOnePercent()
     {
-        using var model = (Qwen35Model)new PrefixCacheModelConformanceTests(_output).Load(PrefixCacheModelConformanceTests.Qwen35_9B);
+        using var model = (Qwen35Model)new PrefixCacheContractConformanceTests(_output).Load(PrefixCacheContractConformanceTests.Qwen35_9B);
         IPrefixCacheModel pcm = model;
-        int[] prefix = model.Tokenizer.Encode(PrefixCacheModelConformanceTests.SharedPrefixText(), addSpecial: true).ToArray();
+        int[] prefix = model.Tokenizer.Encode(PrefixCacheContractConformanceTests.SharedPrefixText(), addSpecial: true).ToArray();
         int[] suffix = model.Tokenizer.Encode(" Name three rivers in Europe.", addSpecial: false).ToArray();
 
         // A capture: host-authoritative, never bound.

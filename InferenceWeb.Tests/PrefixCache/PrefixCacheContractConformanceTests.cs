@@ -22,8 +22,7 @@ namespace InferenceWeb.Tests.PrefixCache;
 /// oracle detects the misuse it exists to detect: an oracle that cannot tell a wrong reuse from a
 /// right one would let every engine-level test built on it pass vacuously.
 /// </summary>
-[Trait("Category", "PrefixCacheUnit")]
-public sealed class PrefixCacheContractConformanceTests
+public sealed partial class PrefixCacheContractConformanceTests
 {
     private readonly ITestOutputHelper _output;
 
@@ -56,6 +55,7 @@ public sealed class PrefixCacheContractConformanceTests
         Log = log,
     };
 
+    [Trait("Category", "PrefixCacheUnit")]
     [Theory]
     [MemberData(nameof(Fakes))]
     public void OracleFake_PassesTheConformanceScript(string name)
@@ -82,6 +82,7 @@ public sealed class PrefixCacheContractConformanceTests
             Assert.Contains("truncate refused (wrapped window)", report.Ran);
     }
 
+    [Trait("Category", "PrefixCacheUnit")]
     [Fact]
     public void OracleFakes_AreSevenAndEachEmulatesADistinctFamily()
     {
@@ -92,6 +93,7 @@ public sealed class PrefixCacheContractConformanceTests
         Assert.All(classes, c => ResumabilityRules.Validate(c, 16));
     }
 
+    [Trait("Category", "PrefixCacheUnit")]
     [Fact]
     public void OracleFakes_CountContractCallsButNotTheCapabilityRead()
     {
@@ -122,6 +124,7 @@ public sealed class PrefixCacheContractConformanceTests
     private static int[] Tokens(int count, int salt) =>
         Enumerable.Range(0, count).Select(i => (i * 31 + salt) % OracleModel.DefaultVocab).ToArray();
 
+    [Trait("Category", "PrefixCacheUnit")]
     [Fact]
     public void OracleS_ARewindOfAWrappedRingSucceedsWithAWrongState()
     {
@@ -146,6 +149,7 @@ public sealed class PrefixCacheContractConformanceTests
         Assert.Equal(StateAfter(model, shortPrompt.Take(shortPrompt.Length - 4).ToArray()), StateOf(model, "short"));
     }
 
+    [Trait("Category", "PrefixCacheUnit")]
     [Theory]
     [InlineData("S")]
     [InlineData("R")]
@@ -161,6 +165,7 @@ public sealed class PrefixCacheContractConformanceTests
         Assert.False(model.IsDeviceDirty("a"));
     }
 
+    [Trait("Category", "PrefixCacheUnit")]
     [Fact]
     public void OracleR_MaterializesExactLengthsOnlyAndCannotRewind()
     {
@@ -177,6 +182,7 @@ public sealed class PrefixCacheContractConformanceTests
         Assert.False(model.TryCaptureDonate("b", "pc:1:3", 19, out _), "a donation below the holder length needs a rewind the family lacks");
     }
 
+    [Trait("Category", "PrefixCacheUnit")]
     [Fact]
     public void OracleN_ReclaimsTheOldestRetainedSlotAndReportsItThroughTheSink()
     {
@@ -202,6 +208,7 @@ public sealed class PrefixCacheContractConformanceTests
         Assert.False(model.TryMaterialize(new MaterializeRequest(MaterializeOp.Clone, "pc:1:1", "clone", 10, 10)), "donate-only");
     }
 
+    [Trait("Category", "PrefixCacheUnit")]
     [Fact]
     public void OracleP2_AZeroSlabInjectedAsAPageChangesTheOutput()
     {
@@ -226,6 +233,7 @@ public sealed class PrefixCacheContractConformanceTests
         Assert.NotEqual(cold, Greedy(model, model.Forward(prompt.Skip(32).ToArray()), 6));
     }
 
+    [Trait("Category", "PrefixCacheUnit")]
     [Fact]
     public void OracleP_ModelPagedForwardReadsThroughTheBlockTableAndCopiesToAHolderExactly()
     {
@@ -259,6 +267,7 @@ public sealed class PrefixCacheContractConformanceTests
         }
     }
 
+    [Trait("Category", "PrefixCacheUnit")]
     [Fact]
     public void OracleR2_APageEndingOffAForwardBoundaryIsNotRestorable()
     {
@@ -285,6 +294,7 @@ public sealed class PrefixCacheContractConformanceTests
         Assert.NotEqual(cold, Greedy(model, model.Forward(prompt.Skip(32).ToArray()), 6));
     }
 
+    [Trait("Category", "PrefixCacheUnit")]
     [Fact]
     public void OracleS2_RefusesARewindBeyondTheRingSlack()
     {
@@ -297,6 +307,7 @@ public sealed class PrefixCacheContractConformanceTests
         Assert.Equal(OracleFakes.MuseRingRows, model.MaxReusablePrefixTokens);
     }
 
+    [Trait("Category", "PrefixCacheUnit")]
     [Fact]
     public void OracleFakes_ReleaseIsBatchedAndIdempotent()
     {

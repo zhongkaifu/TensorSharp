@@ -11,7 +11,7 @@
 //
 // Opt-in, one model per process, under the Mac model lock:
 //   TS_TEST_MODEL_DIR=<dir holding the GGUF>  TS_TEST_GGML_BACKEND=metal
-//   flock /tmp/ts-mac-model.lock dotnet test ... --filter "FullyQualifiedName~PrefixCacheModelConformanceTests.Gemma4"
+//   flock /tmp/ts-mac-model.lock dotnet test ... --filter "FullyQualifiedName~PrefixCacheContractConformanceTests.Gemma4"
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -25,9 +25,9 @@ using Xunit.Abstractions;
 
 namespace InferenceWeb.Tests.PrefixCache;
 
-[Trait("Category", "PrefixCacheModel")]
+// The ModelFacts half of PrefixCacheContractConformanceTests; the oracle fakes are in the other part.
 [Collection("PrefixCacheModelConformance")]
-public sealed class PrefixCacheModelConformanceTests
+public sealed partial class PrefixCacheContractConformanceTests
 {
     private const string EnvModelDir = "TS_TEST_MODEL_DIR";
     // One pattern per family, shared by the gate and the loader (memory note
@@ -47,10 +47,7 @@ public sealed class PrefixCacheModelConformanceTests
     private const string EnvDsv41ModelDir = "TS_TEST_DSV41_MODEL_DIR";
     private const string Dsv41Flash = "deepseek-v4.1-flash";
 
-    private readonly ITestOutputHelper _output;
-
-    public PrefixCacheModelConformanceTests(ITestOutputHelper output) { _output = output; }
-
+    [Trait("Category", "PrefixCacheModel")]
     [ModelFact(EnvModelDir, Gemma4E4B)]
     public void Gemma4_E4B_PassesTheConformanceScript_WithTheHolderPoolAttached()
     {
@@ -89,6 +86,7 @@ public sealed class PrefixCacheModelConformanceTests
         model.OnSequenceReleased("fresh-allocation");
     }
 
+    [Trait("Category", "PrefixCacheModel")]
     [ModelFact(EnvModelDir, Qwen35_9B)]
     public void Qwen35_9B_PassesTheConformanceScript()
     {
@@ -112,6 +110,7 @@ public sealed class PrefixCacheModelConformanceTests
         Assert.Contains(report.Ran, r => r.StartsWith("export/import", StringComparison.Ordinal));
     }
 
+    [Trait("Category", "PrefixCacheModel")]
     [ModelFact(EnvModelDir, GptOss20B)]
     public void GptOss20B_PassesTheConformanceScript_WithParityCapabilities()
     {
@@ -127,6 +126,7 @@ public sealed class PrefixCacheModelConformanceTests
         Assert.NotEqual(PageSupport.None, caps.Pages);
     }
 
+    [Trait("Category", "PrefixCacheModel")]
     [ModelFact(EnvQwen38Dir, Qwen38FlashNext)]
     public void Qwen38_FlashNext_PassesTheConformanceScript()
     {
@@ -143,6 +143,7 @@ public sealed class PrefixCacheModelConformanceTests
         Assert.Contains(report.Ran, r => r.StartsWith("batched release", StringComparison.Ordinal));
     }
 
+    [Trait("Category", "PrefixCacheModel")]
     [ModelFact(EnvDsv41FixtureDir, Dsv41Fixture, GgmlBackend = BackendType.GgmlCpu)]
     public void DeepSeek41_ManagedFixture_PassesTheConformanceScript_OnCpu()
     {
@@ -182,6 +183,7 @@ public sealed class PrefixCacheModelConformanceTests
 
     /// <summary>The same script on the full DeepSeek V4.1 Flash checkpoint (CUDA). Pending: V4.1 GPU runs are
     /// on hold, so M2 ran the fixture above instead; gated on its own variable so no lane loads it by accident.</summary>
+    [Trait("Category", "PrefixCacheModel")]
     [ModelFact(EnvDsv41ModelDir, Dsv41Flash)]
     public void DeepSeek41_Flash_PassesTheConformanceScript()
     {
