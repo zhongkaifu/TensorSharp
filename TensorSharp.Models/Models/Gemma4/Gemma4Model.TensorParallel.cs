@@ -627,8 +627,9 @@ namespace TensorSharp.Models
 
             // MoE trunk: same treatment through its own whole-model kernel, with a
             // third AllReduce per layer for the expert down projection. The verify
-            // kernel takes the multimodal bidirectional-span mask directly (at
-            // startPos == 0), so image chunks stay on the fused path too.
+            // kernel takes the multimodal bidirectional-span mask directly (one byte
+            // per chunk token, at any startPos; see gemma4_mm_mask.h), so image
+            // chunks stay on the fused path too.
             if (perLayerInputs == null && _tpMoeFusedReady)
             {
                 if (seqLen == 1 && exceptPositions == null)
