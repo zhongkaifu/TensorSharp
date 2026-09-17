@@ -437,7 +437,6 @@ static int gptoss_model_prefill_impl(
         std::vector<ggml_tensor*> tp_boundary;
 
         ggml_tensor* hidden = hidden_t;      // [H, N]
-        bool fa_unsupported = false;
         for (int l = 0; l < num_layers; l++)
         {
             const TSGgmlGptOssLayerDesc& d = layers[l];
@@ -518,29 +517,9 @@ static int gptoss_model_prefill_impl(
 
             ggml_tensor* q_attn = ggml_permute(ctx, q_rope, 0, 2, 1, 3);   // [hd, N, nH]
             ggml_tensor* attn_flat = nullptr;
-            ggml_tensor* fa = ggml_flash_attn_ext(ctx, q_attn, k_full, v_full, t.attn_mask, scale, 0.0f, 0.0f);
-            ggml_flash_attn_ext_set_prec(fa, GGML_PREC_F32);
-            if (t.sinks != nullptr)
-                ggml_flash_attn_ext_add_sinks(fa, t.sinks);
-            if (l == 0)
-                fa_unsupported = !backend_supports_op(fa);
-            if (!fa_unsupported)
-            {
-                attn_flat = ggml_reshape_2d(ctx, fa, qDim, N);
-            }
-            else
-            {
-                ggml_tensor* q_cont = ggml_cont(ctx, q_attn);
-                ggml_tensor* scores = ggml_mul_mat(ctx, k_full, q_cont);
-                ggml_mul_mat_set_prec(scores, GGML_PREC_F32);
-                ggml_tensor* probs = ggml_soft_max_ext(ctx, scores, t.attn_mask, scale, 0.0f);
-                if (t.sinks != nullptr)
-                    ggml_soft_max_add_sinks(probs, t.sinks);
-                ggml_tensor* v_perm = ggml_cont(ctx, ggml_permute(ctx, v_full, 1, 0, 2, 3));
-                ggml_tensor* attn_out = ggml_mul_mat(ctx, v_perm, probs);
-                ggml_tensor* attn_perm = ggml_cont(ctx, ggml_permute(ctx, attn_out, 0, 2, 1, 3));
-                attn_flat = ggml_reshape_2d(ctx, attn_perm, qDim, N);
-            }
+            ggml_tensor* fa = flash_attn_ext_guarded(ctx, "GPT-OSS model prefill", q_attn, k_full, v_full, t.attn_mask,
+                scale, 0.0f, 0.0f, t.sinks, GGML_PREC_F32);
+            attn_flat = ggml_reshape_2d(ctx, fa, qDim, N);
 
             ggml_tensor* o_mm = ggml_mul_mat(ctx, t.o_w, attn_flat);       // [H, N]
             // Row-parallel cut #1, recorded before the bias so the add runs in

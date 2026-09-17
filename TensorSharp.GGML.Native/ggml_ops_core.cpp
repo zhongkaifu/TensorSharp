@@ -2982,6 +2982,14 @@ TSG_EXPORT const char* TSGgml_GetBackendFailureText()
     return snapshot.c_str();
 }
 
+// Graph builds that ran an attention as explicit ops because the backend has no
+// flash-attention kernel for its shape (ggml_ops_flash_attn_guard.h). Lets a
+// test prove the shape it drives really took the fallback.
+TSG_EXPORT int64_t TSGgml_FlashAttnFallbackCount()
+{
+    return static_cast<int64_t>(tsg_flash_attn_fallback_count());
+}
+
 TSG_EXPORT int TSGgml_IsMetalAvailable()
 {
     clear_last_error();

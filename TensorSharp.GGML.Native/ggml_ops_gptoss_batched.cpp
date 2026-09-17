@@ -588,15 +588,8 @@ static int gob_decode_batched_legacy(
             ggml_tensor* mask_s = ggml_view_4d(ctx, t.attn_mask, win[l], 1, 1, 1,
                 t.attn_mask->nb[1], t.attn_mask->nb[2], t.attn_mask->nb[3],
                 static_cast<std::size_t>(s) * t.attn_mask->nb[3]);
-            ggml_tensor* fa = ggml_flash_attn_ext(ctx, q_attn, k_win_v, v_win_v, mask_s, scale, 0.0f, 0.0f);
-            ggml_flash_attn_ext_set_prec(fa, GGML_PREC_F32);
-            if (t.sinks != nullptr)
-                ggml_flash_attn_ext_add_sinks(fa, t.sinks);
-            if (l == 0 && s == 0 && !backend_supports_op(fa))
-            {
-                set_last_error("GPT-OSS batched decode: flash attention shape unsupported on this backend.");
-                return 0;
-            }
+            ggml_tensor* fa = flash_attn_ext_guarded(ctx, "GPT-OSS batched decode", q_attn, k_win_v, v_win_v, mask_s,
+                scale, 0.0f, 0.0f, t.sinks, GGML_PREC_F32);
 
             ggml_tensor* fa_flat = ggml_reshape_1d(ctx, fa, qDim);
             ggml_tensor* col = ggml_view_1d(ctx, attn_2d, qDim,
@@ -1092,7 +1085,8 @@ static int gob_decode_batched_arena(
             ggml_flash_attn_ext_set_prec(fa, GGML_PREC_F32);
             if (t.sinks != nullptr)
                 ggml_flash_attn_ext_add_sinks(fa, t.sinks);
-            if (l == 0 && !backend_supports_op(fa))
+            // Every layer: sliding-window and full layers read different lengths.
+            if (!backend_supports_op(fa))
                 op_unsupported = true;
             if (op_unsupported)
                 return abort_build("unsupported op");

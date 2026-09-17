@@ -184,6 +184,26 @@ MiniMax-H3 attends bidirectionally over **one** packed sequence with no mask —
 
 The sampler no longer trusts the result either. A non-finite velocity fails the request naming the step it appeared at (`RequireFinite` in `MiniMaxH3Pipeline.cs`) rather than writing out a file of the right length, frame rate and soundtrack duration that is uniformly black — the failure mode is silent by construction, because the RGB clamp pins a NaN pixel at 0 and the WAV writer clamps a NaN sample to -1.
 
+#### Flash attention on shapes a backend has no kernel for
+
+`ggml_backend_graph_compute` never asks `ggml_backend_supports_op`. A `GGML_OP_FLASH_ATTN_EXT` node that ggml-cuda has no kernel for therefore reaches `ggml_cuda_flash_attn_ext`, which ends the process with `ggml-cuda/fattn.cu:730: fatal error` (`BEST_FATTN_KERNEL_NONE`). At the pinned ggml (456172ec) `ggml_cuda_get_best_fattn_kernel` returns none when:
+
+- the K head size is not 40, 64, 72, 80, 96, 112, 128 or 256 (with an equal V head size), nor 192 (V 128), 320 (V 256), 512 or 576 (V 512);
+- the head size is 192, 320, 512 or 576 and the grouped-query path does not apply: that needs a query/KV head ratio of at least 2 (a multiple of 8 for 192, of 32 for 320), a mask, no ALiBi, a KV length that is a multiple of 256 (`FATTN_KQ_STRIDE`) and every `nb[1..3]` of the unquantized Q/K/V/mask divisible by 16;
+- K or V is not F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1 or Q8_0, or the mask has `ne[2] != 1`.
+
+`ggml_backend_supports_op` answers exactly that predicate (it calls the same function), and Metal and Vulkan report their own limits the same way. Two things reached it in practice: the synthetic `mistral3` model of `HunyuanDenseServingTests` has a head size of 16, and its batched prefill chunk went through `TSGgml_PagedAttentionForward`; and a Gemma 4 global cache started from `TS_KV_INITIAL_TOKENS=8` grew to 16 rows, so the 512-dim global layers read a 16-row window (`flash_attn_kv_length` pads to 256 but never past the cache). The same clamp applies to any 512/576-dim cache whose length is not a multiple of 256, for example a `MAX_CONTEXT` like 4000 once the context passes 3840 tokens.
+
+Graphs that `TensorSharp.GGML.Native` computes directly on a backend build flash attention through `tsg_flash_attn_ext_guarded` (`ggml_ops_flash_attn_guard.h`, `tsg::flash_attn_ext_guarded` for the active backend). It builds the flash node and returns it whenever the backend has a kernel for it, so a supported shape produces the same graph as before. Otherwise it returns the same attention as explicit ops - F32 `mul_mat`, `soft_max_ext` with the mask, ALiBi, sinks and logit softcap, `mul_mat` - with the flash node's output layout, processing query rows in chunks that keep the score matrix under 256 MiB, and prints one warning per call site:
+
+```
+[TensorSharp] warning: CUDA0 has no flash-attention kernel for paged attention (K head 16, V head 16, KV rows 64, query rows 8, heads 4/2, K/V f32/f32, mask yes); running this attention as explicit F32 mul_mat + soft_max instead (same math, slower, more memory). Reported once per call site.
+```
+
+`TSGgml_FlashAttnFallbackCount` (`GgmlBasicOps.FlashAttnFallbackCount()`) counts the graph builds that took the explicit path. Covered call sites: paged attention (both variants) and the paged KV pool; the generic transformer decode entry points; Qwen 3 decode and prefill; Qwen 3.5/3.6 layer decode, whole-model decode, batched decode, verify and layer prefill; Qwen 3.8 Flash Next (`qwen4exp`); Gemma 4 dense and MoE decode and batched decode; GPT-OSS decode, prefill, batched decode and layer prefill; Muse-Glimmer and its DFlash drafter; GLM 5.x decode and forward (asked of the layer's own device); and the CPU/Metal vision attention. The call sites that already asked the backend keep their own handling: Gemma 4 and Qwen 3.5 verify, the GPT-OSS and Qwen 3.5 slot arenas return an error to the managed caller (now checked for every tile and every layer, not only the first), and the vision, diffusion, Wan, Qwen-Image, MiniMax-H3 and embedding graphs fall back as they did. DeepSeek V4/V4.1 attention is unchanged: its sliding-window ring and compressed-row caches are padded to 256 rows by construction, and V4.1 runs TensorSharp's own F32 attention.
+
+`GgmlOpsFlashAttnGuardTest` (ctest `flash-attn-unsupported-shape-fallback`) checks the explicit path against a double-precision reference on the CPU backend (masks, GQA, strided F16 windows, sinks, softcap, ALiBi, query chunking) and, on the first GPU device, that head-16 and short or unaligned 512-dim windows fall back with the same result while supported shapes stay on the kernel. On CUDA it also fails if ggml-cuda's kernel availability for those shapes changes after a ggml bump. `GgmlOpsFlashAttnGuardTest --unguarded` computes the bare head-16 node on the GPU and reproduces the abort. `FlashAttnUnsupportedShapeTests` (`Requires=Cuda`) drives `TSGgml_PagedAttentionForward` with head size 16 against a managed reference.
+
 ### Build the native MLX library (macOS only)
 
 The MLX backend depends on `libmlxc` (the C bindings for [MLX](https://github.com/ml-explore/mlx)). The repository pins a known-good tag of `mlx-c` in `TensorSharp.Backends.MLX/Native/MLX_C_VERSION` and a helper script fetches and builds it:
@@ -263,6 +283,7 @@ TensorSharp/
 │   ├── ggml_ops_matmul.cpp                # GEMM / quantized matmul
 │   ├── ggml_ops_fused.cpp                 # Cross-cutting fused per-layer kernels
 │   ├── ggml_ops_norm_attn.cpp             # Norm + attention fusions
+│   ├── ggml_ops_flash_attn_guard.cpp      # Flash attention, or explicit attention with a one-time warning when the backend has no kernel for the shape
 │   ├── ggml_ops_transformer.cpp           # Generic fused transformer layer/model decode + flash-attn decode
 │   ├── ggml_ops_transformer_common.h      # Shared transformer helpers + C# layer-descriptor structs
 │   ├── ggml_ops_transformer_prefill.cpp   # Fused layer prefill (Gemma 4, GPT-OSS, Qwen 3.5)

@@ -1046,9 +1046,9 @@ ggml_tensor* q4e_nodes_attn(
                 (std::size_t)arena->cap * kv_row_bytes,
                 (std::size_t)arena->rows_per_slot * kv_row_bytes, 0);
         ggml_tensor* q_4d = ggml_reshape_4d(ctx, q, head_dim, 1, n_head, T);
-        arena->fa = ggml_flash_attn_ext(ctx, q_4d, k_view, v_view, mask,
-                                        attn_scale, 0.0f, 0.0f);
-        ggml_flash_attn_ext_set_prec(arena->fa, GGML_PREC_F32);
+        arena->fa = flash_attn_ext_guarded(ctx, "Qwen4Exp arena decode", q_4d, k_view, v_view, mask,
+                                        attn_scale, 0.0f, 0.0f,
+            nullptr, GGML_PREC_F32);
         attn = ggml_reshape_3d(ctx, arena->fa, head_dim, n_head, T);
     }
     else
@@ -1074,9 +1074,9 @@ ggml_tensor* q4e_nodes_attn(
         // scores and never copies the whole V window. This is also what llama.cpp
         // runs here. Result lands as [hd, nH, T] - already the layout the gate and
         // the output projection want.
-        attn = ggml_flash_attn_ext(ctx, q_attn, k_full, v_full, mask,
-                                   attn_scale, 0.0f, 0.0f);
-        ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32);
+        attn = flash_attn_ext_guarded(ctx, "Qwen4Exp attention", q_attn, k_full, v_full, mask,
+                                   attn_scale, 0.0f, 0.0f,
+            nullptr, GGML_PREC_F32);
     }
     else
     {

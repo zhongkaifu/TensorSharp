@@ -1713,6 +1713,10 @@ internal enum GgmlIndexReductionOp
 
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial long TSGgml_FlashAttnFallbackCount();
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         private static partial int TSGgml_RecreateBackend();
 
         [LibraryImport(DllName, StringMarshalling = StringMarshalling.Utf8)]
@@ -7111,6 +7115,15 @@ internal enum GgmlIndexReductionOp
         /// Sticky: cleared only by <see cref="RecreateBackend"/>.
         /// </summary>
         public static bool HasBackendFailure() => TSGgml_HasBackendFailure() != 0;
+
+        /// <summary>
+        /// Graph builds, since the process started, that ran an attention as explicit
+        /// mul_mat + soft_max ops because the backend reported no flash-attention kernel
+        /// for that exact shape (for example a head size ggml-cuda has no kernel for, or
+        /// a 512-dim head whose KV length is not a multiple of 256). Each call site also
+        /// warns once on stderr. Tests use it to prove a shape really took the fallback.
+        /// </summary>
+        public static long FlashAttnFallbackCount() => TSGgml_FlashAttnFallbackCount();
 
         /// <summary>
         /// Free the GPU backend and build a new one, in this process.

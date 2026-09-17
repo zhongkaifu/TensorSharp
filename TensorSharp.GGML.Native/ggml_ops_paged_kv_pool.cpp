@@ -452,7 +452,8 @@ TSG_EXPORT int TSGgml_PagedKvPoolAttention(
             ggml_tensor* k_attn = ggml_cont(ctx, ggml_permute(ctx, k3, 0, 2, 1, 3));
             ggml_tensor* v_attn = ggml_cont(ctx, ggml_permute(ctx, v3, 0, 2, 1, 3));
 
-            ggml_tensor* attn = ggml_flash_attn_ext(ctx, q_attn, k_attn, v_attn, mask, scale, 0.0f, 0.0f);
+            ggml_tensor* attn = flash_attn_ext_guarded(ctx, "paged KV pool attention",
+                q_attn, k_attn, v_attn, mask, scale, 0.0f, 0.0f);
             ggml_tensor* copy = ggml_cpy(ctx, attn, result);
             ggml_set_output(copy);
 

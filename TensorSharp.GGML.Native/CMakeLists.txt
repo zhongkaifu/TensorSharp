@@ -251,6 +251,7 @@ set(TSG_GGMLOPS_SOURCES
     ggml_ops_core.cpp
     ggml_ops_attention_alloc.cpp
     ggml_ops_attention_precision.cpp
+    ggml_ops_flash_attn_guard.cpp
     ggml_ops_matmul.cpp
     ggml_ops_matmul_precision.cpp
     ggml_ops_q8_precision.cpp
@@ -638,6 +639,22 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
         target_compile_definitions(GgmlOpsAttentionAllocTest PRIVATE TSG_GGML_USE_METAL=1)
     endif()
     add_test(NAME attention-allocation COMMAND GgmlOpsAttentionAllocTest)
+
+    # Flash attention on shapes the backend has no kernel for (ggml-cuda aborts in
+    # fattn.cu): the guard must fall back to explicit attention with the same
+    # result and keep supported shapes on the kernel. CPU always, plus the first
+    # GPU device the build has (CUDA / Metal).
+    add_executable(GgmlOpsFlashAttnGuardTest
+        tests/flash_attn_guard_test.cpp ggml_ops_flash_attn_guard.cpp)
+    target_include_directories(GgmlOpsFlashAttnGuardTest PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/include")
+    target_link_libraries(GgmlOpsFlashAttnGuardTest PRIVATE ggml ggml-cpu ggml-base)
+    if (MSVC)
+        target_compile_options(GgmlOpsFlashAttnGuardTest PRIVATE /O2 /EHsc)
+    endif()
+    add_test(NAME flash-attn-unsupported-shape-fallback COMMAND GgmlOpsFlashAttnGuardTest)
+    set_tests_properties(flash-attn-unsupported-shape-fallback PROPERTIES TIMEOUT 120)
 
     add_executable(GgmlOpsGetRowsQuantTest tests/get_rows_quant_test.cpp)
     target_include_directories(GgmlOpsGetRowsQuantTest PRIVATE

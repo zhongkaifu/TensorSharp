@@ -1268,9 +1268,8 @@ ggml_tensor* build_vision_attention(
     if (g_backend_type != BACKEND_TYPE_CUDA && g_backend_type != BACKEND_TYPE_VULKAN)
     {
         ggml_tensor* v_perm = ggml_permute(ctx, v_3d, 0, 2, 1, 3); // [hd, rows, heads]
-        ggml_tensor* attn = ggml_flash_attn_ext(ctx, q_perm, k_perm, v_perm, nullptr, attn_scale, 0.0f, 0.0f);
-        ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32);
-        return attn;
+        return flash_attn_ext_guarded(ctx, "vision attention", q_perm, k_perm, v_perm, nullptr,
+            attn_scale, 0.0f, 0.0f, nullptr, GGML_PREC_F32);
     }
 
     ggml_tensor* q_cont = ggml_cont(ctx, q_perm); // [hd, rows, heads]

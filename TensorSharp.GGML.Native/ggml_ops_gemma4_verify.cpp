@@ -878,7 +878,7 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
                     ggml_tensor* m_tile = get_window_tile_mask(kLen, qLen, qs, ks, maskWindow);
                     ggml_tensor* fa = ggml_flash_attn_ext(ctx, q_tile, k_tile, v_tile, m_tile, 1.0f, 0.0f, 0.0f);
                     ggml_flash_attn_ext_set_prec(fa, GGML_PREC_F32);
-                    if (qs == 0 && !backend_supports_op(fa))
+                    if (!backend_supports_op(fa))
                     {
                         set_last_error("Gemma4 model verify: tiled flash attention unsupported for this shape; use per-op path.");
                         return 0;
