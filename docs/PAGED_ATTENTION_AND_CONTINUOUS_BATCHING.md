@@ -307,10 +307,13 @@ shared-prefix checkpoint and pooled blocks - honours two rules.
 **Conversation scope.** Each `SequenceState` carries a `CacheScope` (an opaque
 hash) and its public boundary `SharedPrefixTokens` (the leading system/developer
 messages plus tool declarations). State produced by another scope is reused only up
-to that public prefix, and only through the shared-prefix checkpoint, which is
-cloned: another conversation's retained holder is never adopted, rewound into or
-moved away from its owner, its live cache is never continued, and pooled blocks past
-the public prefix carry the scope in their hash. A scoped request never clones a
+to that public prefix: through the shared-prefix checkpoint, which is cloned, or by
+rewinding the live cache to exactly that prefix (the only public reuse a model without
+checkpoints has, e.g. DeepSeek V4.1; the new request's prefill would overwrite that cache
+anyway, and a checkpoint is preferred where one exists). Another conversation's retained
+holder is never adopted, rewound into or moved away from its owner, its live cache is
+never continued past the public prefix, and pooled blocks past the public prefix carry
+the scope in their hash. A scoped request never clones a
 checkpoint longer than its own public prefix. The scope comes from the chat layer:
 
 | Request | Scope |
