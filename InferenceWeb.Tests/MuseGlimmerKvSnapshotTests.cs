@@ -35,6 +35,22 @@ using Xunit.Abstractions;
 
 namespace InferenceWeb.Tests;
 
+/// <summary>
+/// [ModelFact] for the Muse-Glimmer weights that also skips when the backend these
+/// tests construct (TS_MUSE_GLIMMER_BACKEND, default ggml_cuda) is not the GGML
+/// backend this process pinned: the second backend could only fail to initialize.
+/// </summary>
+[Xunit.Sdk.TraitDiscoverer("InferenceWeb.Tests.RequiresTraitDiscoverer", "InferenceWeb.Tests")]
+[AttributeUsage(AttributeTargets.Method)]
+public sealed class MuseGlimmerKvFactAttribute : FactAttribute, Xunit.Sdk.ITraitAttribute
+{
+    public string RequiresValue => "Models";
+
+    public MuseGlimmerKvFactAttribute()
+        => Skip = TestGates.ModelSkip("TS_TEST_MODEL_DIR", "muse-glimmer")
+            ?? TestGates.GgmlPinSkip(MuseGlimmerKvSnapshotTests.ResolveBackend());
+}
+
 public class MuseGlimmerKvSnapshotTests
 {
     private const string EnvModelDir = "TS_TEST_MODEL_DIR";
@@ -51,7 +67,7 @@ public class MuseGlimmerKvSnapshotTests
     /// the batch executor does. Before the fix this faulted the process the first
     /// time a block started at or beyond _kvSwaRows.
     /// </summary>
-    [ModelFact("TS_TEST_MODEL_DIR", "muse-glimmer")]
+    [MuseGlimmerKvFact]
     public void MuseGlimmer_CapturingBlocksPastTheSwaRing_DoesNotFault()
     {
         string modelPath = TryFindModel();
@@ -124,7 +140,7 @@ public class MuseGlimmerKvSnapshotTests
     /// pick up exactly where it left off. Bit-identical logits are the bar: the
     /// restore writes the same rows the prefill did, so nothing should shift.
     /// </summary>
-    [ModelFact("TS_TEST_MODEL_DIR", "muse-glimmer")]
+    [MuseGlimmerKvFact]
     public void MuseGlimmer_RestoringACapturedPrefix_ReproducesTheLivePrefillLogits()
     {
         string modelPath = TryFindModel();
@@ -209,7 +225,7 @@ public class MuseGlimmerKvSnapshotTests
         return best;
     }
 
-    private static BackendType ResolveBackend()
+    internal static BackendType ResolveBackend()
     {
         string name = Environment.GetEnvironmentVariable(EnvBackend);
         if (string.IsNullOrWhiteSpace(name))

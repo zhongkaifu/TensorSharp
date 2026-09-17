@@ -33,8 +33,9 @@ public class EngineParallelInferenceTests
     {
         ["gemma4"] = new ModelManifest(
             ModelPatterns: new[] { "gemma-4-E4B-it-Q8_0" },
-            // The "-assistant" variant ships under the same prefix; exclude it.
-            ExcludePatterns: new[] { "assistant" },
+            // The "-assistant" variant and llama.cpp's "mmproj-<model>" projector
+            // ship under the same name; exclude both (the projector is a clip GGUF).
+            ExcludePatterns: new[] { "assistant", "mmproj" },
             MmprojPatterns: new[] { "gemma-4-mmproj" }),
         // The exact E4B build from the q4_0 KV-cache reuse bug report
         // (gemma-4-E4B-it-uncensored-Q8_0.gguf). Matches any E4B "it" GGUF;
@@ -354,12 +355,34 @@ public class EngineParallelInferenceTests
     private async Task RunKvDtypeLongPromptReuseRepro(string key, TensorSharp.Models.KvCacheDtype kvDtype)
     {
         // The model captures KvCacheDtypeConfig.Current at construction, so
-        // set it BEFORE loading (mirrors the server's --kv-cache-dtype flag).
-        TensorSharp.Models.KvCacheDtypeConfig.Set(kvDtype);
+        // set it BEFORE loading (mirrors the server's --kv-cache-dtype flag), and
+        // put the process-wide choice back afterwards for the tests that follow.
+        var restoreDtype = TensorSharp.Models.KvCacheDtypeConfig.Current;
+        bool restoreExplicit = TensorSharp.Models.KvCacheDtypeConfig.IsExplicitlySet;
+        try
+        {
+            TensorSharp.Models.KvCacheDtypeConfig.Set(kvDtype);
+            await RunKvDtypeLongPromptReuseReproCore(key, kvDtype);
+        }
+        finally
+        {
+            TensorSharp.Models.KvCacheDtypeConfig.RestoreForTests(restoreDtype, restoreExplicit);
+        }
+    }
+
+    private async Task RunKvDtypeLongPromptReuseReproCore(string key, TensorSharp.Models.KvCacheDtype kvDtype)
+    {
         if (!TryLoad(key, out var ctx)) return;
         using (ctx)
         {
-            Assert.Equal(kvDtype, ctx.Model.KvCacheDtype);
+            // Gemma 4 declines a block-quantized K/V cache on every attention path
+            // (Gemma4Model.SupportsBlockQuantizedKvCache: its circular SWA helpers
+            // are float-only) and loads f16 instead, with a warning. Its q4_0 and
+            // q8_0 rows therefore check that fallback and that long-turn reuse
+            // still holds under it.
+            bool declinesBlockQuantized = ctx.Model is Gemma4Model
+                && (kvDtype == TensorSharp.Models.KvCacheDtype.Q8_0 || kvDtype == TensorSharp.Models.KvCacheDtype.Q4_0);
+            Assert.Equal(declinesBlockQuantized ? TensorSharp.Models.KvCacheDtype.F16 : kvDtype, ctx.Model.KvCacheDtype);
             int window = ctx.Model.Config?.SlidingWindow ?? 0;
             _output.WriteLine($"[{key}] kvDtype={ctx.Model.KvCacheDtype.ToShortString()} slidingWindow={window}");
             var sampling = SamplingConfig.Greedy;
@@ -897,16 +920,11 @@ public class EngineParallelInferenceTests
         string mmproj = manifest.MmprojPatterns != null ? FindFirst(dir, manifest.MmprojPatterns, null) : null;
 
         _output.WriteLine($"[{key}] loading {Path.GetFileName(modelPath)} (mmproj={Path.GetFileName(mmproj ?? "")})");
-        try
-        {
-            ctx = new EngineContext(modelPath, mmproj);
-            return true;
-        }
-        catch (Exception ex)
-        {
-            _output.WriteLine($"[{key}] failed to load: {ex.GetType().Name}: {ex.Message}");
-            return false;
-        }
+        // A model that is present but does not load is a failure, not a skip: the
+        // old catch-and-return turned "A different GGML backend was already
+        // initialized" into a passing test on every lane that pinned another backend.
+        ctx = new EngineContext(modelPath, mmproj);
+        return true;
     }
 
     private static string FindFirst(string dir, IEnumerable<string> patterns, string[] excludePatterns)
@@ -979,9 +997,22 @@ public class EngineParallelInferenceTests
         public int BlockSize { get; }
         public object MultimodalLock { get; } = new();
 
+        /// <summary>The longest conversation these tests build (the long-turn reuse
+        /// repros reach ~4.9k tokens).</summary>
+        private const int MinimumContext = 8192;
+
         public EngineContext(string modelPath, string mmprojPath)
         {
-            Model = TensorSharp.Models.ModelBase.Create(modelPath, ResolveBackend());
+            // A lane's small explicit MAX_CONTEXT (1024 in the model gates) would end
+            // the long-turn repros with "exceeds configured max context"; raise it for
+            // the load only, and leave an unset or larger value alone.
+            using (var env = new EnvScope())
+            {
+                if (int.TryParse(Environment.GetEnvironmentVariable("MAX_CONTEXT"), out int configured)
+                    && configured > 0 && configured < MinimumContext)
+                    env.Set("MAX_CONTEXT", MinimumContext.ToString(System.Globalization.CultureInfo.InvariantCulture));
+                Model = TensorSharp.Models.ModelBase.Create(modelPath, ResolveBackend());
+            }
             if (!string.IsNullOrEmpty(mmprojPath) && File.Exists(mmprojPath))
             {
                 Model.MultimodalInjector.LoadProjectors(mmprojPath);
@@ -1002,9 +1033,11 @@ public class EngineParallelInferenceTests
             Engine = new InferenceEngine(Model, cfg, NullLogger.Instance);
         }
 
-        // Default to the platform GGML variant, but let TS_TEST_BACKEND override
-        // (e.g. ggml_cuda) so the parallel/repro tests can exercise the per-sequence
-        // fused concurrent-decode path on a CUDA box like the bug report's setup.
+        // Default to the process's pinned GGML backend (TS_TEST_GGML_BACKEND: the
+        // native bridge takes one backend per process, so any other default fails
+        // to initialize), but let TS_TEST_BACKEND override (e.g. ggml_cuda) so the
+        // parallel/repro tests can exercise the per-sequence fused concurrent-decode
+        // path on a CUDA box like the bug report's setup.
         private static BackendType ResolveBackend()
         {
             string b = Environment.GetEnvironmentVariable("TS_TEST_BACKEND");
@@ -1017,7 +1050,7 @@ public class EngineParallelInferenceTests
                 if (b.Equals("ggml_cpu", StringComparison.OrdinalIgnoreCase) || b.Equals("cpu", StringComparison.OrdinalIgnoreCase))
                     return BackendType.GgmlCpu;
             }
-            return OperatingSystem.IsMacOS() ? BackendType.GgmlMetal : BackendType.GgmlCpu;
+            return TestGates.PinnedGgmlBackend;
         }
 
         public void Dispose()

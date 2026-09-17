@@ -31,6 +31,9 @@ public class Gemma4TruncateExactnessTests
                 "metal" => BackendType.GgmlMetal,
                 _ => BackendType.GgmlCpu,
             };
+        // The wrapped cases reach ~3 windows: pin the context instead of inheriting a lane's MAX_CONTEXT.
+        using var env = new EnvScope();
+        env.Set("MAX_CONTEXT", "4096");
         using var model = ModelBase.Create(path, backend);
         Assert.True(model.SupportsKVCacheTruncation);
         int window = model.Config.SlidingWindow;
