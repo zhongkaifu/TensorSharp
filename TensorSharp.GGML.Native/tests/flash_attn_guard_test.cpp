@@ -343,6 +343,19 @@ int main(int argc, char** argv)
     const bool is_cuda = gpu_name.rfind("CUDA", 0) == 0;
     std::printf("gpu backend: %s\n", gpu_name.c_str());
 
+    // F32 fallback must preserve values outside F16's range. CUDA's default
+    // multi-query value matmul may narrow both operands before accumulation.
+    {
+        attention_case c; c.name = "explicit F32 value range"; c.kv_type = GGML_TYPE_F32;
+        case_data d = make_data(c, rng);
+        std::fill(d.q.begin(), d.q.end(), 0.0f);
+        std::fill(d.v.begin(), d.v.end(), 70000.0f);
+        const run_result r = run_case(gpu, c, d, 0, build_mode::explicit_only);
+        const double diff = max_abs_diff(r.out, reference(c, d, 0));
+        std::printf("gpu  %-42s max|diff| %.3g\n", c.name, diff);
+        check(diff < 0.05, "explicit F32 attention narrowed large values to F16");
+    }
+
     struct gpu_case { attention_case c; bool cuda_has_kernel; };
     std::vector<gpu_case> gpu_cases;
     {
