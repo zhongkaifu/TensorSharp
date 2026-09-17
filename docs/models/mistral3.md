@@ -83,6 +83,9 @@ old merge order or the permuted Q/K, one at a time, and the mean per-token cosin
 falls to 0.69, 0.08 or 0.37. A projector
 that is missing a tensor the encoder needs, or that has linear biases the encoder
 does not apply, is now refused at load with a message naming both accepted layouts.
+Before, the encoder skipped a missing norm silently and crashed on a missing linear
+at the first image.
+
 On the release media fixtures
 (`validate_deepseek41_media.py --scenarios image_ocr,multi_image,image_follow_up
 --concurrency 1,4`, Q4_K_M + f16 mmproj, `ggml_cuda`) TensorSharp passes
@@ -98,8 +101,6 @@ image's `[IMG_END]`.
 Only the llama.cpp projector was checked against the reference. No Ollama-layout
 projector was available, and one loads under the same rules: no Q/K un-permute, and
 GELU unless it declares `clip.use_silu`.
-Before, the encoder skipped a missing norm silently and crashed on a missing linear
-at the first image.
 
 The conversion identifies [mistralai/Mistral-Small-3.1-24B-Instruct-2503](https://huggingface.co/mistralai/Mistral-Small-3.1-24B-Instruct-2503)
 as its official upstream; both model cards declare Apache-2.0.

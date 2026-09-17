@@ -22,7 +22,7 @@ namespace TensorSharp.Models
     /// - Conv2D patch embedding
     /// - RMSNorm on patch embeddings (encoder_norm)
     /// - 2D RoPE positional embeddings (computed on-the-fly)
-    /// - Transformer blocks with RMSNorm, SiLU-gated MLP
+    /// - Transformer blocks with RMSNorm, gated MLP (GELU, or SiLU when the file declares clip.use_silu)
     /// - Patch merger with spatial merge
     /// - Multi-modal projector: RMSNorm → PatchMerger → Linear → GELU → Linear
     /// </summary>

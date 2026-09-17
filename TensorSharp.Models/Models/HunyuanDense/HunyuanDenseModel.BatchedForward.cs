@@ -208,7 +208,8 @@ namespace TensorSharp.Models
             Tensor logitsTensor = LinearForward(lastHidden, "output.weight")
                 ?? LinearForward(lastHidden, "token_embd.weight");
             lastHidden.Dispose();
-            float[] allLogits = logitsTensor.GetElementsAsFloat(numSeqs * Config.VocabSize);            logitsTensor.Dispose();
+            float[] allLogits = logitsTensor.GetElementsAsFloat(numSeqs * Config.VocabSize);
+            logitsTensor.Dispose();
 
             var perSeq = new float[numSeqs][];
             for (int s = 0; s < numSeqs; s++)
