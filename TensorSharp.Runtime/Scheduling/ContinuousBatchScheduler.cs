@@ -823,7 +823,8 @@ namespace TensorSharp.Runtime.Scheduling
         /// after every running prompt has allocated the rest of its own. Decode growth
         /// is not reserved: it arrives one token at a time and is served by preempting
         /// the newest sequence, which re-prefills a prompt that was already admitted.
-        /// Conservative for a prompt whose prefix is later adopted from the index.
+        /// Prompt blocks the candidate would adopt from a running sequence are not
+        /// counted (see the body).
         /// </summary>
         private bool HasPromptCapacityFor(SequenceState candidate)
         {
@@ -834,7 +835,22 @@ namespace TensorSharp.Runtime.Scheduling
                 if (missing > 0) outstanding += missing;
             }
             int need = BlocksFor(candidate.PromptTokens.Count, _cfg.BlockSize) - candidate.BlockTable.NumBlocks;
-            return (long)_pool.NumFreeBlocks - outstanding >= need;
+            long available = (long)_pool.NumFreeBlocks - outstanding;
+            if (available >= need)
+                return true;
+
+            // Prefix blocks another sequence is still using are shared on adoption
+            // and cost the pool nothing, so they do not count against the newcomer
+            // (without this, requests sharing a long system prompt or document ran one
+            // at a time once their prompts summed past the pool). An idle cached block
+            // sits in the free queue, so adopting it costs a free block like a new one.
+            // Only consulted when the cheap check fails, i.e. while a request waits.
+            if (PrefixCachingActive && candidate.BlockTable.NumBlocks == 0)
+            {
+                foreach (var block in PlanPrefixBlockAdoption(candidate, logBacktrack: false, out _))
+                    if (block.RefCount > 0) need--;
+            }
+            return available >= need;
         }
 
         private string _capacityWaitLoggedFor;

@@ -257,4 +257,109 @@ public class SchedulerCapacityAdmissionTests
         Assert.Same(old, Assert.Single(decode.ScheduledWork).Sequence);
         Assert.Equal(SequenceStatus.Preempted, newer.Status);
     }
+
+    [Fact]
+    public void NewerDecode_NeverEvictsAnOlderPrefill_ThatIsNotYetScheduled()
+    {
+        // Sn follows construction, not submission: build "old" first, submit it
+        // second. "new" prefills alone and decodes; "old" is admitted while "new"
+        // decodes and prefills in 8-token chunks (the mixed-step cap). Decode runs
+        // first, so when "new" needs its third block "old" is not yet part of the
+        // step - exactly where rank-blind victim selection used to evict the older
+        // prefill for the newer decode.
+        var cfg = new SchedulerConfig
+        {
+            MaxNumBatchedTokens = 64,
+            MaxNumRunningSequences = 4,
+            MaxPrefillChunkSize = 8,
+            SoloPrefillChunkSize = 64,
+            NumBlocks = 4,
+            BlockSize = BlockSize,
+            EnablePrefixCaching = false,
+            DecodeQuantumTokens = 1,
+            StopRepetition = false,
+        };
+        var pool = new BlockPool(cfg.NumBlocks, cfg.BlockSize, 0);
+        var sched = new ContinuousBatchScheduler(cfg, pool, "fp-victim-prefill", NullLogger.Instance);
+        var old = Sequence("old", 24, 8);
+        var newer = Sequence("new", 7, 16);
+        Assert.True(old.Sn < newer.Sn);
+
+        void Apply(SchedulerOutput output)
+        {
+            foreach (var work in output.ScheduledWork)
+            {
+                var seq = work.Sequence;
+                seq.AdvanceComputedTokens(work.NumScheduledTokens);
+                if (seq.NumComputedTokens < seq.NumTotalTokens) continue;
+                seq.AppendOutputToken(3);
+                if (seq.ShouldStopForLength())
+                    sched.NotifyStop(seq, SequenceStatus.FinishedLengthCapped, "length", output);
+            }
+        }
+
+        sched.Submit(newer);
+        Apply(sched.Schedule());
+        sched.Submit(old);
+
+        SchedulerOutput contested = null;
+        for (int step = 0; step < 64 && contested == null; step++)
+        {
+            var output = sched.Schedule();
+            if (output.PreemptedRequestIds.Count > 0)
+                contested = output;
+            Apply(output);
+        }
+
+        Assert.NotNull(contested);
+        Assert.Equal(new[] { "new" }, contested.PreemptedRequestIds);
+        Assert.Contains(contested.ScheduledWork, w => ReferenceEquals(w.Sequence, old));
+    }
+
+    [Fact]
+    public void SharedPrefixBlocksInUse_DoNotCountAgainstAdmission()
+    {
+        // 12 blocks x 8. Each prompt is a 64-token shared prefix (8 blocks) plus 8
+        // unique tokens. While "a" runs and holds the prefix, "b" adopts those 8
+        // blocks and needs only its own tail: it must be admitted next to "a", not
+        // held back as if its whole 9-block prompt had to come out of the free pool.
+        var cfg = new SchedulerConfig
+        {
+            MaxNumBatchedTokens = 128,
+            MaxNumRunningSequences = 4,
+            MaxPrefillChunkSize = 128,
+            SoloPrefillChunkSize = 128,
+            NumBlocks = 12,
+            BlockSize = BlockSize,
+            EnablePrefixCaching = true,
+            DecodeQuantumTokens = 1,
+            StopRepetition = false,
+        };
+        var pool = new BlockPool(cfg.NumBlocks, cfg.BlockSize, 0);
+        var sched = new ContinuousBatchScheduler(cfg, pool, "fp-shared-prefix", NullLogger.Instance);
+        var prefix = Enumerable.Range(1, 64).ToList();
+        SequenceState Shared(string id, int salt)
+            => new(id, prefix.Concat(Enumerable.Range(1000 + salt, 8)).ToList(), 8, BlockSize, SamplingConfig.Greedy);
+        var a = Shared("a", 0);
+        var b = Shared("b", 100);
+
+        sched.Submit(a);
+        var first = sched.Schedule();
+        foreach (var work in first.ScheduledWork)
+        {
+            int before = work.Sequence.NumComputedTokens;
+            work.Sequence.AdvanceComputedTokens(work.NumScheduledTokens);
+            sched.OnBlocksCommitted(work.Sequence, before);
+            work.Sequence.AppendOutputToken(3);
+        }
+        Assert.Equal(72, a.NumComputedTokens);
+
+        sched.Submit(b);
+        var second = sched.Schedule();
+
+        Assert.Empty(second.PreemptedRequestIds);
+        Assert.Equal(SequenceStatus.Running, b.Status);
+        Assert.Equal(64, b.PrefixCacheReusedTokens);
+        Assert.Contains(second.ScheduledWork, w => ReferenceEquals(w.Sequence, b));
+    }
 }

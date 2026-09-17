@@ -129,7 +129,7 @@ BlockPool + PagedKvStorage + BlockHashIndex   (managed host memory)
 3. The pipeline creates a `SequenceState` and calls `InferenceEngine.SubmitRequest`.
 4. The engine worker asks `ContinuousBatchScheduler` for the next step.
 5. The scheduler admits waiting sequences while token and sequence budgets allow. Before allocating new blocks, it looks up full prompt blocks in `BlockHashIndex` and adopts shared blocks on a hit.
-   A waiting request is admitted only when the free pool can hold its whole prompt on top of the prompt blocks the running requests still have to allocate; otherwise it stays queued until one finishes (a lone request is always admitted).
+   A waiting request is admitted only when the free pool can hold its whole prompt on top of the prompt blocks the running requests still have to allocate; otherwise it stays queued until one finishes (a lone request is always admitted). Prefix blocks it would adopt from a running request are shared and do not count against it.
 6. If the pool is under pressure (decode growth is not reserved), the scheduler can preempt a running sequence that ranks below the one needing blocks (lower priority, or submitted later), commit its full blocks, free the remainder, and requeue it. A sequence never preempts an older one: it waits a step instead, so a full pool drains oldest-first rather than livelocking long prefills against each other.
 7. `BatchExecutor` executes the scheduled step. It asks `ExecutionPlanner` for the step's `ExecutionPlan` and runs the first candidate path that accepts the step (see [Execution Planning](#execution-planning-capability-model)).
 8. The engine emits sampled tokens to the request handle, checks EOS / max-tokens / abort state, and releases blocks for completed sequences.

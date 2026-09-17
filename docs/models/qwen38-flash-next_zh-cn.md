@@ -34,7 +34,12 @@ MP4、WebM 或 MOV data URI（不会抓取远程 URL）：
 
 - **帧对（temporal pair）。** 视觉塔的 patch embedding 有两个时间切片
   （`v.patch_embd.weight` 与 `.weight.1`），所以连续帧两两合并，与 Qwen-VL processor 堆叠帧
-  的方式完全一致；奇数帧的片段会重复最后一帧补齐最后一对。每一对单独编码（参考实现的视觉塔
+  的方式完全一致；奇数帧的片段会重复最后一帧补齐最后一对。processor 以 2 fps 采样，所以它合并的
+  两帧相隔 0.5 秒；TensorSharp 只在两帧相距不超过 `QwenVideoFrames.MaxPairedFrameGapSeconds`
+  （0.575 秒）时才把它们配成一对。更稀疏的帧——默认的 1 fps，或按 `max_frames` 分散到长片段上的
+  帧——是不同的画面，因此各自独占一个时间 patch（像静态图一样重复该帧），并保留自己的时间标签。
+  把这种帧配对会把它们混在一起：卡片 17、42、86 的三帧 1 fps 片段读成 `["12", "47", "86"]`，
+  每帧一个 patch 时读成 `["17", "42", "86"]`。代价是每个采样帧一个 patch，而不是每两帧一个。每一对单独编码（参考实现的视觉塔
   只在一个时间 patch 内做注意力），得到与一张静态帧相同的合并 patch token 数。整段片段按同一个
   视频像素预算（`Qwen35ImageProcessor.VideoMinPixels` / `VideoMaxPixels`）整体缩放，因此同一片段的
   每一对共用一个网格；即使用最小网格也放不进该预算的帧数会被拒绝。
@@ -69,6 +74,17 @@ MP4、WebM 或 MOV data URI（不会抓取远程 URL）：
 单图融合 decode 上解码。引擎按步在各序列间轮询（`SupportsPerSequenceFusedForward`）；
 融合的 N 路批量 decode 属于后续优化。
 
+**并发时的贪心输出可能与单独运行不同，原因在于 prefill 的分块形状。** 调度器对单独一个请求用
+一个大块 prefill（`TS_SCHED_SOLO_PREFILL_CHUNK` 与 `TS_SCHED_MAX_BATCHED_TOKENS` 中较小者），对并发
+请求则按步预算分份，而本模型的 logits 依赖分块大小。在 UD-Q2_K_XL、三 GPU 按层切分上用
+`benchmarks/ChunkParityProbe` 对一个 19,121 token 的 prompt 实测：重复同样的 4096 分块逐位一致
+（max |Δlogit| 为 0）；1024 与 512 token 的分块让 logits 最多偏移 1.3，并在近似平局处翻转贪心解码——
+最早在第 9 个输出 token，top-2 差值为 0.002（标题的第一个词）。保持分块形状相同就消除了这一效应：
+一个 2,928 token 的 prompt，每个请求都一次 prefill 完（`TS_SCHED_PREFILL_CHUNK=4096`、
+`TS_SCHED_MAX_BATCHED_TOKENS=16384`），4 路并发 × 3 轮的输出与单独运行逐字节一致（512 token，12/12），
+所以逐序列 holder 之间没有状态泄漏，轮询 decode 也不依赖并发度。严格的分块与整段 logits 关卡仍是
+[保留前缀复用](#保留前缀复用) 中记录的未决项。
+
 ## 保留前缀复用
 
 `Qwen4ExpModel.RetainedCache.cs` 为 `qwen4exp` 提供与 Qwen 3.5、DeepSeek V4 路径相同的保留 holder 复用：
@@ -96,6 +112,22 @@ MP4、WebM 或 MOV data URI（不会抓取远程 URL）：
 最大绝对差 0.0070）；以 2–4 为块提交的 32 个 teacher-forced token 与标量解码不同
 （`RepeatedTargetBlocks_…`，最大绝对差 0.0082）。CUDA 目标计算图的归约依赖批宽度；证据 README 中的
 隔离精度原型能消除其中一部分，但尚未集成。
+
+## 共享 MTP 头的投机解码
+
+`--draft-model mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf` 挂上逐 token 的 MTP 块；它只为从位置 0 开始
+prefill 的单独请求做投机（与其他序列共享的步，以及延续保留 holder 或共享前缀克隆的轮次，都按普通
+方式解码——草稿头有自己的 K/V，无法跨越它从未重放过的位置起草）。在 UD-Q2_K_XL、三 GPU 按层切分
+（A40）上以 `--spec-draft 3` 实测：
+
+- **一致性。** 192 token 的代码复制流与普通贪心完全一致，速度 1.75-1.96 倍（141/141 草稿被接受，
+  无回滚）；投机 prefill（`SpecForward`）在相同分块下与普通 prefill 逐位一致。4 行 verify kernel
+  与 1 行 decode kernel 在近似平局处确实会翻转，表现为普通贪心写出裸对象的地方出现了
+  ```` ```json ```` 围栏，或者缩进 JSON 与紧凑 JSON 的差别。
+- **散文不划算。** 18 个散文请求的接受率为 68-70%（每次 verify 3.0 个 token），但一次 verify 约 45 ms，
+  部分接受还要加约 43-46 ms 的回滚（恢复递归状态、重新前向保留的行），而被调速器暂停的步仍然要跑
+  带隐藏状态捕获的单行投机前向（约 24-26 ms，普通 decode 为 19 ms）：512 token 散文在 c1 下 decode 为
+  44-46 tok/s，普通为 52；8k prompt 之后为 34-38，普通为 40。
 
 ## 多 GPU
 
