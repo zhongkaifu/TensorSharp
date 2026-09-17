@@ -205,15 +205,26 @@ UD-Q2_K_XL over three A40s, teacher-forcing the first 48 greedy tokens after a
 by up to 2.5 in logits, and 4-6 of the 48 rows changed the greedy token — not only
 at near-ties.
 
-So on CUDA a span graph of 2-8 tokens builds each row from the kernels its
+So on CPU and CUDA a span graph of 2-8 tokens builds each row from the kernels its
 one-token graph runs: float projections put the tokens on the broadcast axis (one
-`mul_mat_vec_f` launch), quantized projections run in blocks of at most 4 rows
-(MMVQ's shared reduction group), and routed experts and attention are expanded one
+`mul_mat_vec_f` launch on CUDA). The measured Q4_K, Q5_K, Q6_K and Q8_0 projections
+on NVIDIA A40 run in blocks of at most 4 rows. Other devices and quantized types
+use one-column reductions on the broadcast axis: Turing and GB10 select different
+MMVQ reductions at width 1, so A40's four-row grouping cannot be applied globally.
+Routed experts and attention are expanded one
 row at a time, each attention row over exactly the KV window and mask row its
 decode step reads. Graphs of up to 8 tokens, decode included, also keep the inputs
 of two ggml-cuda fusions whose use depends on memory reuse (MoE weighted reduction;
 RMS norm + RoPE) allocated, so those fusions happen at every width. One-token and
-prefill kernels are unchanged.
+prefill kernels are unchanged. Metal retains its existing graph construction.
+
+The completion tests cover every committed row at widths 1 through 8. CPU also
+needs this construction on macOS ARM: without it, widths 2 and 4 differed from
+scalar logits despite identical stored GDN, PLE and KV state. The strict fixture
+suite passes with the CPU path enabled; its runtime is not a performance benchmark.
+The timing measurements below describe the original A40 run, not a qualification
+of other GPU architectures or the broadcast fallback. A test-hook build can set
+`TS_Q4E_TEST_MMVQ_CHANNELS=1` at startup to exercise that fallback on A40.
 
 Measured on the same setup, three interleaved repetitions: every verify row at
 widths 2, 3 and 4 is now bit-identical to its decode step (0 of 48 rows differ, no

@@ -142,11 +142,18 @@ prefill 的单独请求做投机（与其他序列共享的步，以及延续保
 verify 的每一行都与其 decode 步不同，logits 最多相差 2.5，48 行里有 4–6 行改变了贪心 token——并不只发生在
 近似平局处。
 
-因此在 CUDA 上，2–8 个 token 的 span 计算图用其单 token 图会运行的 kernel 构建每一行：浮点投影把 token 放在
-广播轴上（一次 `mul_mat_vec_f` 启动），量化投影按至多 4 行一块运行（MMVQ 共用的归约分组），路由专家与注意力
+因此在 CPU 与 CUDA 上，2–8 个 token 的 span 计算图用其单 token 图会运行的 kernel 构建每一行：浮点投影把 token 放在
+广播轴上（CUDA 上一次 `mul_mat_vec_f` 启动）。只有实测过的 NVIDIA A40 上的 Q4_K、Q5_K、Q6_K、Q8_0 投影
+按至多 4 行一块运行；其他设备和量化类型在广播轴上使用单列归约。Turing 与 GB10 在宽度 1 时的 MMVQ 归约
+与 A40 不同，不能全局套用四行分组。路由专家与注意力
 逐行展开，每个注意力行读取的 KV 窗口与 mask 行恰好就是它的 decode 步所读的那些。不超过 8 个 token 的图
 （包括 decode）还会让两个是否融合取决于内存复用的 ggml-cuda 融合（MoE 加权归约；RMS norm + RoPE）的输入
-保持分配，于是这两个融合在任何宽度下都会发生。单 token 与 prefill 的 kernel 不变。
+保持分配，于是这两个融合在任何宽度下都会发生。单 token 与 prefill 的 kernel 不变；Metal 保留现有的图构建方式。
+
+补充测试现覆盖宽度 1–8 的每一行。macOS ARM CPU 也需要此构建方式：原路径在宽度 2、4 时，虽然保存的 GDN、PLE、
+KV 状态相同，logits 仍与逐 token decode 不同。启用 CPU 路径后严格的 fixture 测试通过；测试耗时不视为性能基准。
+下方耗时仅来自原 A40 测量，不能作为其他 GPU 架构或广播回退路径的性能结论。测试 hook 构建可在启动时设置
+`TS_Q4E_TEST_MMVQ_CHANNELS=1`，在 A40 上验证广播回退路径。
 
 在同一环境下交替重复三次实测：宽度 2、3、4 的每个验证行现在都与其 decode 步逐位相同（48 行中 0 行不同，
 没有贪心翻转）。4 行 verify 耗时 32.4–33.1 ms，此前为 29.3–29.6 ms（+11%）；3 行 28.3–29.9 对 26.8–27.2（+8%）；
