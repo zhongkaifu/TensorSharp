@@ -255,7 +255,7 @@ public class PrefixTreeEvictionTests
         Assert.True(t.PendingReclaim.IsZero);
         Assert.Equal(0, t.DrainReclaimQueue((keys, reason) => calls.Add((keys.ToArray(), reason))));
         Assert.Single(calls);                          // an empty queue makes no call
-        // The first reason labels a mixed batch; re-queuing a key is ignored.
+        // Disposal takes precedence in a mixed batch; re-queuing does not double count a key.
         var q = new ReclaimQueue();
         Assert.True(q.Enqueue("pc:0:1", ReleaseReason.Duplicate, new ResourceVector { HostKv = 1 }));
         Assert.False(q.Enqueue("pc:0:1", ReleaseReason.Evicted, new ResourceVector { HostKv = 1 }));
@@ -263,7 +263,7 @@ public class PrefixTreeEvictionTests
         Assert.Throws<ArgumentException>(() => q.Enqueue("", ReleaseReason.Evicted, default));
         ReleaseReason seen = ReleaseReason.Reset;
         q.Drain((keys, reason) => seen = reason);
-        Assert.Equal(ReleaseReason.Duplicate, seen);
+        Assert.Equal(ReleaseReason.Pressure, seen);
         Assert.Equal(1, q.DrainCalls);
         Assert.Equal(2, q.ReleasedKeys);
         Assert.Equal(0, q.Drain(null));
@@ -273,6 +273,51 @@ public class PrefixTreeEvictionTests
         q.Enqueue("pc:0:4", ReleaseReason.Evicted, default);
         Assert.Throws<InvalidOperationException>(() => q.Drain((k, r) => throw new InvalidOperationException()));
         Assert.Equal(0, q.Count);
+    }
+
+    [Theory]
+    [InlineData(ReleaseReason.Pressure)]
+    [InlineData(ReleaseReason.Invalidated)]
+    [InlineData(ReleaseReason.Reset)]
+    public void ReclaimQueue_DisposalReasonSurvivesOrdinaryReleasesInEitherOrder(ReleaseReason disposal)
+    {
+        foreach (bool disposalFirst in new[] { false, true })
+        {
+            var q = new ReclaimQueue();
+            q.Enqueue("pc:0:1", disposalFirst ? disposal : ReleaseReason.Evicted, new ResourceVector { HostKv = 10 });
+            q.Enqueue("pc:0:2", disposalFirst ? ReleaseReason.Duplicate : disposal, new ResourceVector { HostKv = 20 });
+            int calls = 0;
+            q.Drain((keys, reason) =>
+            {
+                calls++;
+                Assert.Equal(disposal, reason); // holders must be disposed instead of returned to the pool
+                Assert.Equal(new[] { "pc:0:1", "pc:0:2" }, keys.ToArray());
+            });
+            Assert.Equal(1, calls);
+            Assert.True(q.PendingReclaim.IsZero);
+
+            // A completed pressure batch must not disable pooling in the next ordinary batch.
+            q.Enqueue("pc:0:3", ReleaseReason.Evicted, default);
+            q.Drain((keys, reason) => Assert.Equal(ReleaseReason.Evicted, reason));
+        }
+    }
+
+    [Theory]
+    [InlineData(ReleaseReason.Pressure)]
+    [InlineData(ReleaseReason.Invalidated)]
+    [InlineData(ReleaseReason.Reset)]
+    public void ReclaimQueue_RepeatedKeyCanRequireDisposalWithoutDoubleCounting(ReleaseReason disposal)
+    {
+        var q = new ReclaimQueue();
+        Assert.True(q.Enqueue("pc:0:1", ReleaseReason.Evicted, new ResourceVector { HostKv = 10 }));
+        Assert.False(q.Enqueue("pc:0:1", disposal, new ResourceVector { HostKv = 10 }));
+        Assert.Equal(1, q.Count);
+        Assert.Equal(10, q.PendingReclaim.HostKv);
+        q.Drain((keys, reason) =>
+        {
+            Assert.Equal(1, keys.Length);
+            Assert.Equal(disposal, reason);
+        });
     }
 
     [Fact]

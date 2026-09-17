@@ -124,6 +124,29 @@ format is unchanged. Summarize within each process before comparing independent
 process runs: passes in the same process share runtime and device state and
 must not be counted as independent process repeats.
 
+For interleaved process runs, `abba.sh` rotates the arm order between paired
+rounds. Supply the baseline twice to measure a baseline-versus-baseline noise
+floor, then summarize the median pass in each process:
+
+```bash
+benchmarks/AgentTurnBench/abba.sh results/abba 6 \
+  "--model /models/model.gguf --backend ggml_cuda --scenarios short,tool,conc --conc 1,4 --measure-passes 3" \
+  base=/work/base candidate=/work/candidate control=/work/base
+python3 benchmarks/AgentTurnBench/abba_summary.py results/abba \
+  --baseline base --candidate candidate --control control
+```
+
+Use a fresh output directory and reserve the device for the whole run. The
+runner writes `run-plan.json` before starting, records each process exit code in
+`runs.txt`, and returns nonzero if any process fails. The summary rejects missing
+processes, partial pass sets, failed passes, missing workload rows, and incomplete
+runner logs. Older directories without a run plan cannot certify the requested
+number of runs. Run `compare.py` separately for token identity and workload shape;
+the summary's performance verdict does not establish numerical correctness.
+
+`python3 -m unittest discover -s benchmarks/AgentTurnBench -p 'test_abba.py'`
+checks this failure reporting without loading a model.
+
 ## What it measured (2026-09-09, Apple M5 Pro, ggml_metal, chunk 1024)
 
 The engine was already batching: a 3,019-token tool result reaches the model as
