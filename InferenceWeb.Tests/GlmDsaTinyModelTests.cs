@@ -251,4 +251,83 @@ public class GlmDsaTinyModelTests : IDisposable
         Assert.Equal("</think>", OutputParserFactory.GrammarActivationTrigger("glm5next", enableThinking: true));
         Assert.Null(OutputParserFactory.GrammarActivationTrigger("glm5next", enableThinking: false));
     }
+
+    [Theory]
+    [InlineData("glm5next", false)]
+    [InlineData("glm5next", true)]
+    [InlineData("glm-dsa", true)]
+    public void Glm_OutputParser_StreamedCharByChar_ToolCallAfterReasoningIsParsed(string arch, bool enableThinking)
+    {
+        // The stream ends at the <|observation|> stop, straight after </tool_call>.
+        const string reply = "\nThe user wants the weather.</think>\n<tool_call>get_weather"
+            + "<arg_key>city</arg_key><arg_value>Paris</arg_value>"
+            + "<arg_key>days</arg_key><arg_value>3</arg_value></tool_call>";
+        var parser = OutputParserFactory.Create(arch);
+        parser.Init(enableThinking, tools: null);
+        string content = "", thinking = "";
+        var calls = new List<ToolCall>();
+        foreach (char c in reply)
+        {
+            var p = parser.Add(c.ToString(), done: false);
+            content += p.Content; thinking += p.Thinking;
+            if (p.ToolCalls != null) calls.AddRange(p.ToolCalls);
+        }
+        var last = parser.Add("", done: true);
+        content += last.Content; thinking += last.Thinking;
+        if (last.ToolCalls != null) calls.AddRange(last.ToolCalls);
+
+        var call = Assert.Single(calls);
+        Assert.Equal("get_weather", call.Name);
+        Assert.Equal("Paris", call.Arguments["city"]);
+        Assert.Equal(3L, call.Arguments["days"]);
+        Assert.Equal("\nThe user wants the weather.", thinking);
+        Assert.Equal("\n", content);
+    }
+
+    [Fact]
+    public void Glm5Next_OutputParser_ThinkFalse_StreamedJsonAnswerIsContentAndPartialCloseTagIsHeld()
+    {
+        var json = OutputParserFactory.Create("glm5next");
+        json.Init(enableThinking: false, tools: null);
+        string content = "", thinking = "";
+        foreach (string piece in new[] { "\n", " {", "\"a\"", ": 1", "}" })
+        {
+            var p = json.Add(piece, done: false);
+            content += p.Content; thinking += p.Thinking;
+        }
+        var end = json.Add("", done: true);
+        Assert.Equal("\n {\"a\": 1}", content + end.Content);
+        Assert.Equal(string.Empty, thinking + end.Thinking);
+
+        var prose = OutputParserFactory.Create("glm5next");
+        prose.Init(enableThinking: false, tools: null);
+        var a = prose.Add("ok</thi", done: false);
+        Assert.Equal("ok", a.Thinking);
+        var b = prose.Add("nk>42", done: true);
+        Assert.Equal("42", a.Content + b.Content);
+        Assert.Equal(string.Empty, b.Thinking);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Glm5Next_FallbackRenderer_AlwaysOpensThinking_SoThinkFalseAnswersStayContent(bool enableThinking)
+    {
+        // An empty template takes the hardcoded fallback (as does a Jinja failure). The
+        // published GLM-5.3-Flash template ends every generation prompt with an open
+        // <think>, and the glm5next parser assumes it: a fallback that closed the block
+        // under think:false made the model answer straight away, and that answer was
+        // then parsed as hidden reasoning with an empty content.
+        var messages = new List<ChatMessage> { new() { Role = "user", Content = "What is 17 + 25?" } };
+        string prompt = ChatTemplate.RenderFromGgufTemplate(string.Empty, messages, addGenerationPrompt: true,
+            architecture: "glm5next", tools: null, enableThinking: enableThinking);
+        Assert.EndsWith("<|assistant|><think>", prompt);
+        Assert.EndsWith(ChatProtocolRegistry.For("glm5next")!.AssistantGenerationSuffix!(enableThinking)!, prompt);
+
+        var parser = OutputParserFactory.Create("glm5next");
+        parser.Init(enableThinking, tools: null);
+        var a = parser.Add("17 + 25 = 42.", done: false);
+        var b = parser.Add("</think>42", done: true);
+        Assert.Equal("42", a.Content + b.Content);
+    }
 }

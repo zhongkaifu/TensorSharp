@@ -878,9 +878,11 @@ namespace TensorSharp.Runtime
         /// <list type="bullet">
         /// <item>The reasoning-effort system line is ALWAYS emitted (the template
         /// defaults <c>reasoning_effort</c> to <c>max</c>); this family has no
-        /// thinking-off prompt shape, so <paramref name="enableThinking"/> only
-        /// decides whether the generation prompt's <c>&lt;think&gt;</c> block is
-        /// left open or closed immediately.</item>
+        /// thinking-off prompt shape: the generation prompt ALWAYS ends with an open
+        /// <c>&lt;think&gt;</c>, whatever <paramref name="enableThinking"/> says. The
+        /// glm5next output parser relies on that (it starts inside the reasoning block
+        /// under think:false too), so closing the block here would turn every
+        /// think:false answer into hidden reasoning when this fallback renders.</item>
         /// <item><c>clear_thinking</c> defaults to FALSE: historical assistant
         /// turns KEEP their reasoning when the message still carries it.</item>
         /// <item>No newline after the <c>&lt;|assistant|&gt;</c> tag.</item>
@@ -951,7 +953,7 @@ namespace TensorSharp.Runtime
             }
 
             if (addGenerationPrompt)
-                sb.Append("<|assistant|>").Append(enableThinking ? "<think>" : "<think></think>");
+                sb.Append("<|assistant|><think>");
 
             return sb.ToString();
         }
