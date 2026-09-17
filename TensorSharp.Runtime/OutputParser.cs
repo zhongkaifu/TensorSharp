@@ -435,8 +435,7 @@ namespace TensorSharp.Runtime
                             if (endIdx > _toolReportedChars)
                                 toolCallTextSb.Append(raw, _toolReportedChars, endIdx - _toolReportedChars);
                             _toolReportedChars = 0;
-                            var tc = ParseToolCall(raw);
-                            if (tc != null) toolCalls.Add(tc);
+                            toolCalls.AddRange(ParseToolCalls(raw));
                             _state = State.CollectingContent;
                             keepParsing = after.Length > 0;
                         }
@@ -445,8 +444,7 @@ namespace TensorSharp.Runtime
                             if (buf.Length > _toolReportedChars)
                                 toolCallTextSb.Append(buf, _toolReportedChars, buf.Length - _toolReportedChars);
                             _toolReportedChars = 0;
-                            var tc = ParseToolCall(buf);
-                            if (tc != null) toolCalls.Add(tc);
+                            toolCalls.AddRange(ParseToolCalls(buf));
                             _buffer.Clear();
                             _state = State.CollectingContent;
                         }
@@ -501,24 +499,37 @@ namespace TensorSharp.Runtime
             return null;
         }
 
-        private ToolCall? ParseToolCall(string raw)
+        /// <summary>
+        /// Calls in one <c>&lt;tool_call&gt;</c> body. The body is model output, so any
+        /// shape can arrive: the JSON object the prompt asks for, a JSON array of such
+        /// objects (Nemotron-H Reasoning-128K's own tool format is a list), or JSON that
+        /// is neither. An unexpected shape used to escape as an
+        /// InvalidOperationException from <c>GetProperty</c> and abort the whole
+        /// streamed response mid-flight; it now yields no call.
+        /// </summary>
+        private IEnumerable<ToolCall> ParseToolCalls(string raw)
         {
             raw = raw.Trim();
-            if (raw.Length == 0) return null;
+            if (raw.Length == 0) return Array.Empty<ToolCall>();
             try
             {
                 using var doc = JsonDocument.Parse(raw);
                 var root = doc.RootElement;
-                string? name = root.GetProperty("name").GetString();
-                if (string.IsNullOrEmpty(name)) return null;
-
-                var args = new Dictionary<string, object>();
-                if (root.TryGetProperty("arguments", out var argsEl) && argsEl.ValueKind == JsonValueKind.Object)
+                var calls = new List<ToolCall>();
+                if (root.ValueKind == JsonValueKind.Array)
                 {
-                    foreach (var prop in argsEl.EnumerateObject())
-                        args[prop.Name] = JsonElementToObject(prop.Value);
+                    foreach (var element in root.EnumerateArray())
+                    {
+                        var call = ToolCallFromJson(element);
+                        if (call != null) calls.Add(call);
+                    }
                 }
-                return new ToolCall { Name = name, Arguments = args, Index = _callIndex++ };
+                else
+                {
+                    var call = ToolCallFromJson(root);
+                    if (call != null) calls.Add(call);
+                }
+                return calls;
             }
             catch (JsonException)
             {
@@ -528,8 +539,29 @@ namespace TensorSharp.Runtime
                 //   </function>
                 // Dropping it silently loses the whole turn (the text was already
                 // consumed as a tool call), so fall back to that form here.
-                return ParseXmlToolCall(raw);
+                var call = ParseXmlToolCall(raw);
+                return call != null ? new[] { call } : Array.Empty<ToolCall>();
             }
+        }
+
+        private ToolCall? ToolCallFromJson(JsonElement element)
+        {
+            if (element.ValueKind != JsonValueKind.Object
+                || !element.TryGetProperty("name", out var nameEl)
+                || nameEl.ValueKind != JsonValueKind.String)
+            {
+                return null;
+            }
+            string? name = nameEl.GetString();
+            if (string.IsNullOrEmpty(name)) return null;
+
+            var args = new Dictionary<string, object>();
+            if (element.TryGetProperty("arguments", out var argsEl) && argsEl.ValueKind == JsonValueKind.Object)
+            {
+                foreach (var prop in argsEl.EnumerateObject())
+                    args[prop.Name] = JsonElementToObject(prop.Value);
+            }
+            return new ToolCall { Name = name, Arguments = args, Index = _callIndex++ };
         }
 
         /// <summary>

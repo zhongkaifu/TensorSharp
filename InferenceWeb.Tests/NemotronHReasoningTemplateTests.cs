@@ -136,4 +136,29 @@ public class NemotronHReasoningTemplateTests
         Assert.False(ChatTemplate.IsNemotronHReasoningTemplate(chatMl));
         Assert.False(ChatTemplate.IsNemotronHReasoningTemplate(null));
     }
+
+    /// <summary>The tool-call body is model output. Nemotron-H 8B at concurrency 4 answered
+    /// with a JSON list inside &lt;tool_call&gt; (its own tool format is a list), and
+    /// <c>GetProperty("name")</c> on the array threw InvalidOperationException, which
+    /// aborted the streamed HTTP response mid-flight. No JSON shape may throw; a list of
+    /// call objects yields each call.</summary>
+    [Theory]
+    [InlineData("<tool_call>[{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Paris\"}}]</tool_call>", 1)]
+    [InlineData("<tool_call>[{\"name\":\"a\",\"arguments\":{}},{\"name\":\"b\",\"arguments\":{}}]</tool_call>", 2)]
+    [InlineData("<tool_call>[1, \"x\", null]</tool_call>", 0)]
+    [InlineData("<tool_call>\"get_weather\"</tool_call>", 0)]
+    [InlineData("<tool_call>{\"arguments\":{\"city\":\"Paris\"}}</tool_call>", 0)]
+    [InlineData("<tool_call>{\"name\":42,\"arguments\":{}}</tool_call>", 0)]
+    [InlineData("<tool_call>{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Paris\"}}</tool_call>", 1)]
+    public void ChatMlParser_ToolCallBodyOfAnyJsonShape_DoesNotThrow(string output, int expectedCalls)
+    {
+        var parser = new ChatMlOutputParser();
+        parser.Init(enableThinking: false, tools: null);
+
+        ParsedOutput parsed = parser.Add(output, done: true);
+
+        Assert.Equal(expectedCalls, parsed.ToolCalls?.Count ?? 0);
+        if (expectedCalls > 0)
+            Assert.All(parsed.ToolCalls!, call => Assert.False(string.IsNullOrEmpty(call.Name)));
+    }
 }

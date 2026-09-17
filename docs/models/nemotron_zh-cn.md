@@ -494,7 +494,7 @@ GgmlMetal、进程内 legacy-vs-batched 切换；详见
 
 ## 12. 输出解析器与聊天模板
 
-- `ChatMlOutputParser` 解析 `<think> ... </think>` 思维链与 `<tool_call>{...}</tool_call>` 工具调用。
+- `ChatMlOutputParser` 解析 `<think> ... </think>` 思维链与 `<tool_call>{...}</tool_call>` 工具调用。单个 `<tool_call>` 内的 JSON 调用对象列表同样被接受（Reasoning-128K checkpoint 自身的工具格式就是列表，模型会退回到该格式），其他任何 JSON 形状的调用体不产生调用。此前这样的调用体会让解析器抛出异常并中断流式 HTTP 响应。
 - 同一架构名下有两种轮次格式，由 GGUF 内嵌的 `tokenizer.chat_template` 决定渲染哪一种（`ChatTemplate.IsNemotronHReasoningTemplate`）：
   - **Nemotron-H 8B/47B Reasoning-128K** 训练时使用 `<SPECIAL_10>System\n{system}\n<SPECIAL_11>User\n{user}\n<SPECIAL_11>Assistant\n`（EOS 为 `<SPECIAL_11>`）。推理开关是 system prompt 中的 `{'reasoning': True}` / `{'reasoning': False}`，生成提示随之打开（`<think>\n`）或关闭（`<think></think>`）推理块。`RenderNemotronHReasoning` 根据请求的 `think` 标志加入该标记，除非 system prompt 已经带有。官方模板没有工具语法，因此工具以 JSON `<tool_call>` 约定声明在 system prompt 中，工具结果作为包裹在 `<tool_response>` 中的 user 轮次返回。这些 checkpoint 过去被当作 ChatML 渲染：模型把 `<|im_start|>` 当普通文本，回答里出现 `</think>`、自编的 `<|im_start|>user` 轮次和 `<unk>` 循环。
   - **Nemotron 3 Nano / Omni**（以及其他所有 `nemotron_h*` 模板）使用 ChatML（`<|im_start|>` / `<|im_end|>`）。多模态占位符包括 `<image>`（之后展开为 `<img>` + N 个 token + `</img>`）与 `<so_embedding>`（音频）。

@@ -738,7 +738,11 @@ the path. Now exposed as a method getter (same pattern as Qwen 3.5).
 ## 12. Output parser and chat template
 
 - `ChatMlOutputParser` parses `<think> ... </think>` for chain-of-thought
-  reasoning and `<tool_call>{...}</tool_call>` for tool calls.
+  reasoning and `<tool_call>{...}</tool_call>` for tool calls. A JSON list
+  of call objects inside one `<tool_call>` is accepted too (the Reasoning-128K
+  checkpoints' own tool format is a list and they fall back to it), and a
+  body of any other JSON shape yields no call. Such a body used to throw from
+  the parser and abort the streamed HTTP response.
 - Two turn formats ship under the same architecture name, and the GGUF's
   embedded `tokenizer.chat_template` decides which one is rendered
   (`ChatTemplate.IsNemotronHReasoningTemplate`):
