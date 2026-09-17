@@ -1052,8 +1052,10 @@ struct load_job
 // kernel spends most of the load reclaiming page cache it was never going to
 // reuse. Cache the loader does NOT own is left alone: the host-resident experts
 // are served from their own mapping and are deliberately prefaulted below.
-static bool dsv4_upload_parallel(const shard_files & shards, std::vector<load_job> & jobs, int n_threads)
+static bool dsv4_upload_parallel(const shard_files & shards, std::vector<load_job> & jobs, int n_threads,
+                                 size_t mmap_weight_bytes)
 {
+    (void) mmap_weight_bytes;
     std::sort(jobs.begin(), jobs.end(), [](const load_job & a, const load_job & b)
     {
         if (a.shard != b.shard) return a.shard < b.shard;
@@ -1252,6 +1254,283 @@ static bool dsv4_upload_parallel(const shard_files & shards, std::vector<load_jo
                 100.0 * rs / std::max(1e-9, rs + ss));
     }
     return !failed.load();
+}
+
+// TS_DSV4_LOAD_THREADS: reader threads for every whole-file pass of a load
+// (the weight upload, the host-expert prefault and the Engram warm).
+static int dsv4_load_thread_count()
+{
+    int load_threads = 16;
+    if (const char * e = getenv("TS_DSV4_LOAD_THREADS")) { int v = atoi(e); if (v > 0) load_threads = v; }
+    unsigned hw = std::thread::hardware_concurrency();
+    if (hw > 0 && load_threads > (int) hw) load_threads = (int) hw;
+    return load_threads;
+}
+
+// Load stage: fault the mmapped host-resident weights (the cpu_moe experts) in
+// before the model serves. Returns false only on a load error.
+static bool dsv4_prefault_host_experts(dsv4_model & loaded, const shard_files & shards, int load_threads)
+{
+    (void) shards;
+    dsv4_model * const m = &loaded;
+    const dsv4_hparams & hp = m->hp;
+    const int n_gpu = m->n_gpu;
+    // Warm the mmapped experts with the same parallelism the copy path had.
+    // Lazy faulting would make the first prompt pay for the whole read at
+    // single-stream storage speed, mid-generation. Only when they actually
+    // fit: warming 137 GiB into an 87 GiB allowance just evicts itself (and
+    // everything else) for nothing, so there lazy-on-demand IS the plan.
+    if (m->mmap_weight_bytes > 0)
+    {
+        const size_t allow = dsv4_host_mem_allowance();
+        const size_t headroom = (size_t) 8 * 1024 * 1024 * 1024;
+        if (allow == 0 || m->mmap_weight_bytes + headroom <= allow)
+        {
+            const auto t_warm = std::chrono::steady_clock::now();
+            std::vector<std::pair<const volatile char *, size_t>> ranges;
+            size_t warm_bytes = 0;
+            ggml_context * hctx = m->w_ctx[n_gpu];
+            for (ggml_tensor * t = ggml_get_first_tensor(hctx); t; t = ggml_get_next_tensor(hctx, t))
+            {
+                if (t->buffer == nullptr ||
+                    std::find(m->mmap_bufs.begin(), m->mmap_bufs.end(), t->buffer) == m->mmap_bufs.end())
+                    continue;
+                // Engram reads only 24 rows per token; prefaulting its entire
+                // hundred-billion-element table wastes I/O and evicts useful pages.
+                if (hp.v41 && strstr(t->name, ".engram_embd.") != nullptr) continue;
+                ranges.emplace_back((const volatile char *) t->data, ggml_nbytes(t));
+                warm_bytes += ggml_nbytes(t);
+            }
+            // Split each tensor into spans so the pool is sized by BYTES, not by
+            // tensor count: --n-cpu-moe 2 leaves 6 tensors, which capped the pool
+            // at 6 threads and made this 31 s for 16.4 GiB. Each thread still walks
+            // one contiguous span, which is what readahead wants.
+            const size_t warm_span = (size_t) 256 * 1024 * 1024;
+            std::vector<std::pair<const volatile char *, size_t>> spans;
+            for (const auto & r : ranges)
+                for (size_t off = 0; off < r.second; off += warm_span)
+                    spans.emplace_back(r.first + off, std::min(warm_span, r.second - off));
+            std::atomic<size_t> r_cursor(0);
+            auto warm_worker = [&]()
+            {
+                for (;;)
+                {
+                    const size_t i = r_cursor.fetch_add(1, std::memory_order_relaxed);
+                    if (i >= spans.size()) break;
+                    const volatile char * p = spans[i].first;
+                    // MADV_WILLNEED here was measured and did NOT help on the MooseFS
+                    // mount (29.7 s against 27.7 s for the plain walk, i.e. inside the
+                    // run-to-run spread), so this stays a plain fault-in walk.
+                    for (size_t off = 0; off < spans[i].second; off += 4096)
+                        (void) p[off];
+                }
+            };
+            std::vector<std::thread> warm_pool;
+            for (int i = 0; i < std::min<int>(load_threads, (int) spans.size()); i++) warm_pool.emplace_back(warm_worker);
+            for (auto & th : warm_pool) th.join();
+            fprintf(stderr, "[dsv4] prefaulted %.1f GiB of mmapped host experts in %.1fs\n",
+                    warm_bytes / 1073741824.0,
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - t_warm).count());
+        }
+    }
+    return true;
+}
+
+// Load stage: optionally page-lock the offloaded experts.
+static void dsv4_pin_host_experts(dsv4_model & loaded, int n_cpu_moe)
+{
+    dsv4_model * const m = &loaded;
+    const dsv4_hparams & hp = m->hp;
+    // Page-lock the offloaded experts. DSV4 hands its offloaded layers to
+    // ggml_backend_sched, which — with op_offload on — sends their
+    // mul_mat_id back to the GPU for a prefill-sized batch and streams the
+    // weights over for that one graph. Those copies come out of a PAGEABLE
+    // host buffer, which cannot DMA: measured 9.3 GB/s against 55.6 GB/s
+    // once the range is registered (PCIe 5.0 x16). Registering costs
+    // ~65 ms/GiB, once, here rather than in the middle of the first prompt.
+    // Failures (no budget, driver refusal) are silent and simply leave the
+    // slower path in place — see host_pin_range.
+    //
+    // Not when the mmapped experts outweigh the host allowance: registering
+    // faults the pages in at storage speed (minutes on a network FS) and
+    // every pinned page is one the kernel can no longer evict, which is
+    // exactly the headroom an over-committed page cache lives on.
+    const bool experts_over_allowance = m->mmap_weight_bytes > 0 &&
+        [&]{ const size_t a = dsv4_host_mem_allowance();
+             return a > 0 && m->mmap_weight_bytes + (size_t) 8 * 1024 * 1024 * 1024 > a; }();
+    if (n_cpu_moe > 0 && !experts_over_allowance)
+    {
+        const auto t_pin = std::chrono::steady_clock::now();
+        std::size_t pinned = 0;
+        for (int il = 0; il < hp.n_layer; il++)
+        {
+            const dsv4_layer & L = m->layers[il];
+            if (!L.cpu_moe) continue;
+            for (ggml_tensor * t : { L.ffn_gate_exps, L.ffn_up_exps, L.ffn_down_exps })
+            {
+                if (t == nullptr || t->data == nullptr) continue;
+                if (tsg::host_pin_range(t->data, ggml_nbytes(t)))
+                    pinned += ggml_nbytes(t);
+            }
+        }
+        if (pinned > 0)
+        {
+            fprintf(stderr, "[dsv4] page-locked %.1f GiB of host experts in %.1fs (streamed prefill DMAs at full link speed)\n",
+                    pinned / 1073741824.0,
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - t_pin).count());
+        }
+    }
+}
+
+// Load stage (V4.1): warm the host-mapped Engram tables, synchronously or on a
+// background thread, and apply the sparse-read mapping advice once warming is
+// done. Returns false only on a load error.
+static bool dsv4_warm_engram(dsv4_model & loaded, const shard_files & shards,
+                             bool engram_random_advice, bool engram_random_override)
+{
+    (void) shards;
+    dsv4_model * const m = &loaded;
+    // Sparse-read advice turns off the kernel's readahead, which is exactly
+    // what a whole-table warm pass depends on, so this runs only once the
+    // warming (synchronous or background) is finished. Never alter another
+    // host tensor's entire shard, or an allocation that is not one of our
+    // mmaps.
+    dsv4_model * const model_ptr = m;
+    auto apply_engram_advice = [model_ptr, engram_random_advice, engram_random_override]()
+    {
+        if (!engram_random_advice)
+        {
+            if (!model_ptr->engram_on_device)
+                fprintf(stderr, "[dsv41] Engram mmap advice: default (%s)\n",
+                    engram_random_override ? "override=0" : "automatic: one I/O thread");
+            return;
+        }
+        size_t accepted = 0, unsupported = 0, skipped = 0, failed = 0;
+        for (const auto & layout : model_ptr->engram.layers)
+        {
+            const auto * table = model_ptr->layers[layout.id].engram_embd;
+            const auto found = std::find(model_ptr->mmap_bufs.begin(), model_ptr->mmap_bufs.end(), table->buffer);
+            if (!table->buffer || found == model_ptr->mmap_bufs.end()) { ++skipped; continue; }
+            const size_t index = size_t(found - model_ptr->mmap_bufs.begin());
+            const auto result = tsg_dsv41::advise_engram_random(model_ptr->mmap_addrs[index], model_ptr->mmap_sizes[index],
+                table->data, ggml_nbytes(table));
+            if (result.status == tsg_dsv41::mapped_advice_status::applied) ++accepted;
+            else if (result.status == tsg_dsv41::mapped_advice_status::unsupported) ++unsupported;
+            else if (result.status == tsg_dsv41::mapped_advice_status::empty) ++skipped;
+            else
+            {
+                ++failed;
+                fprintf(stderr, "[dsv41] Engram random advice was not applied to layer %d (error %d); continuing\n",
+                    layout.id, result.error);
+            }
+        }
+        fprintf(stderr, "[dsv41] Engram mmap advice: RANDOM (%s; accepted=%zu, unsupported=%zu, skipped=%zu, failed=%zu)\n",
+            engram_random_override ? "override=1" : "automatic: parallel I/O", accepted, unsupported, skipped, failed);
+    };
+    bool advice_deferred = false;
+
+    // A host-resident Engram table is read 24 scattered rows per token per
+    // table. Each row that is not page cache is one storage round trip, and
+    // on a network filesystem that is ~1 ms: input preparation for a
+    // 1024-token prefill chunk measured 1.44 s cold against 0.04-0.09 s
+    // warm on the eight-A40 VM's Q4_K_M checkpoint (prefill 201-255 ->
+    // 363-381 tok/s, decode 23-24 -> 29 tok/s).
+    //
+    // So warming is the default whenever the pages can actually STAY
+    // resident. It is minutes of I/O, so the automatic form runs on its own
+    // thread after the model is serving rather than holding up load;
+    // TS_DSV41_ENGRAM_WARM=1 keeps the documented synchronous behaviour and
+    // =0 turns warming off.
+    const char * warm_opt = m->engram_on_device ? nullptr : getenv("TS_DSV41_ENGRAM_WARM");
+    const int warm_mode = m->engram_on_device ? 0 : (warm_opt ? atoi(warm_opt) : -1);
+    if (warm_mode != 0)
+    {
+        size_t bytes = 0;
+        for (const auto & layout : m->engram.layers) bytes += ggml_nbytes(m->layers[layout.id].engram_embd);
+        const size_t headroom = (size_t) 8 * 1024 * 1024 * 1024;
+        const size_t allowance = dsv4_host_mem_allowance();
+        const size_t resident = std::max(bytes, m->mmap_weight_bytes);
+        const char * refused = nullptr;
+        if (allowance && (resident > allowance || allowance - resident < headroom))
+            refused = "host allowance lacks 8 GiB headroom";
+        else if (warm_mode < 0)
+        {
+            // Automatic only: an explicit =1 is the operator's call. Warming
+            // pages that the host will immediately evict costs the I/O and
+            // buys nothing, so require room for the whole table set now.
+            const size_t available = dsv4_host_mem_available();
+            if (available && available < bytes + headroom)
+                refused = "free host memory would not keep the tables cached";
+        }
+
+        if (refused)
+        {
+            fprintf(stderr, "[dsv41] Engram warming skipped: %s\n", refused);
+        }
+        else if (warm_mode > 0)
+        {
+            const auto start = std::chrono::steady_clock::now();
+            fprintf(stderr, "[dsv41] warming %.2f GiB of Engram pages with %u I/O threads...\n",
+                bytes / 1073741824.0, m->engram_io->threads());
+            for (const auto & layout : m->engram.layers)
+            {
+                auto * table = m->layers[layout.id].engram_embd;
+                m->engram_io->warm(table->data, ggml_nbytes(table));
+            }
+            fprintf(stderr, "[dsv41] warmed %.2f GiB of Engram pages in %.2fs (%u I/O threads)\n",
+                bytes / 1073741824.0, std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count(),
+                m->engram_io->threads());
+        }
+        else
+        {
+            // Its own pool, not m->engram_io: that one is what per-token
+            // lookups run on, and a warming submission holds it for the
+            // length of a slice.
+            std::vector<std::pair<void *, size_t>> ranges;
+            for (const auto & layout : m->engram.layers)
+            {
+                auto * table = m->layers[layout.id].engram_embd;
+                ranges.emplace_back(table->data, ggml_nbytes(table));
+            }
+            const unsigned warm_threads = std::min<unsigned>(16u, m->engram_io->threads());
+            fprintf(stderr, "[dsv41] warming %.2f GiB of Engram pages in the background with %u I/O threads; "
+                "requests run at page-cache speed once it finishes (TS_DSV41_ENGRAM_WARM=0 disables)\n",
+                bytes / 1073741824.0, warm_threads);
+            dsv4_model * model = model_ptr;
+            advice_deferred = true;
+            m->engram_warm_thread = std::thread([model, ranges, bytes, warm_threads, apply_engram_advice]() {
+                try
+                {
+                    const auto start = std::chrono::steady_clock::now();
+                    tsg_dsv41::engram_io_pool pool(warm_threads);
+                    // Slices keep the stop flag responsive: a model freed
+                    // mid-warm waits at most one slice, not one table.
+                    constexpr size_t slice = (size_t) 1024 * 1024 * 1024;
+                    for (const auto & range : ranges)
+                    {
+                        for (size_t off = 0; off < range.second; off += slice)
+                        {
+                            if (model->engram_warm_stop.load(std::memory_order_relaxed)) return;
+                            pool.warm((const char *) range.first + off, std::min(slice, range.second - off));
+                        }
+                    }
+                    fprintf(stderr, "[dsv41] warmed %.2f GiB of Engram pages in %.2fs (background, %u I/O threads)\n",
+                        bytes / 1073741824.0,
+                        std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count(),
+                        warm_threads);
+                }
+                catch (const std::exception & e)
+                {
+                    fprintf(stderr, "[dsv41] background Engram warming stopped: %s\n", e.what());
+                }
+                // Readahead is no longer wanted: from here the table is read
+                // a few scattered rows at a time.
+                apply_engram_advice();
+            });
+        }
+    }
+    if (!advice_deferred) apply_engram_advice();
+    return true;
 }
 
 // The overlap compressors read a synthetic "before the first block" source
@@ -2946,10 +3225,7 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
         size_t chunk = (size_t) 64 * 1024 * 1024;
         if (const char * e = getenv("TS_DSV4_LOAD_CHUNK_MB")) { long v = atol(e); if (v > 0) chunk = (size_t) v * 1024 * 1024; }
 
-        int load_threads = 16;
-        if (const char * e = getenv("TS_DSV4_LOAD_THREADS")) { int v = atoi(e); if (v > 0) load_threads = v; }
-        unsigned hw = std::thread::hardware_concurrency();
-        if (hw > 0 && load_threads > (int) hw) load_threads = (int) hw;
+        int load_threads = dsv4_load_thread_count();
 
         std::vector<load_job> jobs;
         size_t uploaded = 0;
@@ -2980,106 +3256,11 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
             }
         }
         if (!sizes_ok) return nullptr;
-        if (!dsv4_upload_parallel(shards, jobs, load_threads)) return nullptr;
+        if (!dsv4_upload_parallel(shards, jobs, load_threads, m->mmap_weight_bytes)) return nullptr;
 
-        // Warm the mmapped experts with the same parallelism the copy path had.
-        // Lazy faulting would make the first prompt pay for the whole read at
-        // single-stream storage speed, mid-generation. Only when they actually
-        // fit: warming 137 GiB into an 87 GiB allowance just evicts itself (and
-        // everything else) for nothing, so there lazy-on-demand IS the plan.
-        if (m->mmap_weight_bytes > 0)
-        {
-            const size_t allow = dsv4_host_mem_allowance();
-            const size_t headroom = (size_t) 8 * 1024 * 1024 * 1024;
-            if (allow == 0 || m->mmap_weight_bytes + headroom <= allow)
-            {
-                const auto t_warm = std::chrono::steady_clock::now();
-                std::vector<std::pair<const volatile char *, size_t>> ranges;
-                size_t warm_bytes = 0;
-                ggml_context * hctx = m->w_ctx[n_gpu];
-                for (ggml_tensor * t = ggml_get_first_tensor(hctx); t; t = ggml_get_next_tensor(hctx, t))
-                {
-                    if (t->buffer == nullptr ||
-                        std::find(m->mmap_bufs.begin(), m->mmap_bufs.end(), t->buffer) == m->mmap_bufs.end())
-                        continue;
-                    // Engram reads only 24 rows per token; prefaulting its entire
-                    // hundred-billion-element table wastes I/O and evicts useful pages.
-                    if (hp.v41 && strstr(t->name, ".engram_embd.") != nullptr) continue;
-                    ranges.emplace_back((const volatile char *) t->data, ggml_nbytes(t));
-                    warm_bytes += ggml_nbytes(t);
-                }
-                // Split each tensor into spans so the pool is sized by BYTES, not by
-                // tensor count: --n-cpu-moe 2 leaves 6 tensors, which capped the pool
-                // at 6 threads and made this 31 s for 16.4 GiB. Each thread still walks
-                // one contiguous span, which is what readahead wants.
-                const size_t warm_span = (size_t) 256 * 1024 * 1024;
-                std::vector<std::pair<const volatile char *, size_t>> spans;
-                for (const auto & r : ranges)
-                    for (size_t off = 0; off < r.second; off += warm_span)
-                        spans.emplace_back(r.first + off, std::min(warm_span, r.second - off));
-                std::atomic<size_t> r_cursor(0);
-                auto warm_worker = [&]()
-                {
-                    for (;;)
-                    {
-                        const size_t i = r_cursor.fetch_add(1, std::memory_order_relaxed);
-                        if (i >= spans.size()) break;
-                        const volatile char * p = spans[i].first;
-                        // MADV_WILLNEED here was measured and did NOT help on the MooseFS
-                        // mount (29.7 s against 27.7 s for the plain walk, i.e. inside the
-                        // run-to-run spread), so this stays a plain fault-in walk.
-                        for (size_t off = 0; off < spans[i].second; off += 4096)
-                            (void) p[off];
-                    }
-                };
-                std::vector<std::thread> warm_pool;
-                for (int i = 0; i < std::min<int>(load_threads, (int) spans.size()); i++) warm_pool.emplace_back(warm_worker);
-                for (auto & th : warm_pool) th.join();
-                fprintf(stderr, "[dsv4] prefaulted %.1f GiB of mmapped host experts in %.1fs\n",
-                        warm_bytes / 1073741824.0,
-                        std::chrono::duration<double>(std::chrono::steady_clock::now() - t_warm).count());
-            }
-        }
+        if (!dsv4_prefault_host_experts(*m, shards, load_threads)) return nullptr;
 
-        // Page-lock the offloaded experts. DSV4 hands its offloaded layers to
-        // ggml_backend_sched, which — with op_offload on — sends their
-        // mul_mat_id back to the GPU for a prefill-sized batch and streams the
-        // weights over for that one graph. Those copies come out of a PAGEABLE
-        // host buffer, which cannot DMA: measured 9.3 GB/s against 55.6 GB/s
-        // once the range is registered (PCIe 5.0 x16). Registering costs
-        // ~65 ms/GiB, once, here rather than in the middle of the first prompt.
-        // Failures (no budget, driver refusal) are silent and simply leave the
-        // slower path in place — see host_pin_range.
-        //
-        // Not when the mmapped experts outweigh the host allowance: registering
-        // faults the pages in at storage speed (minutes on a network FS) and
-        // every pinned page is one the kernel can no longer evict, which is
-        // exactly the headroom an over-committed page cache lives on.
-        const bool experts_over_allowance = m->mmap_weight_bytes > 0 &&
-            [&]{ const size_t a = dsv4_host_mem_allowance();
-                 return a > 0 && m->mmap_weight_bytes + (size_t) 8 * 1024 * 1024 * 1024 > a; }();
-        if (n_cpu_moe > 0 && !experts_over_allowance)
-        {
-            const auto t_pin = std::chrono::steady_clock::now();
-            std::size_t pinned = 0;
-            for (int il = 0; il < hp.n_layer; il++)
-            {
-                const dsv4_layer & L = m->layers[il];
-                if (!L.cpu_moe) continue;
-                for (ggml_tensor * t : { L.ffn_gate_exps, L.ffn_up_exps, L.ffn_down_exps })
-                {
-                    if (t == nullptr || t->data == nullptr) continue;
-                    if (tsg::host_pin_range(t->data, ggml_nbytes(t)))
-                        pinned += ggml_nbytes(t);
-                }
-            }
-            if (pinned > 0)
-            {
-                fprintf(stderr, "[dsv4] page-locked %.1f GiB of host experts in %.1fs (streamed prefill DMAs at full link speed)\n",
-                        pinned / 1073741824.0,
-                        std::chrono::duration<double>(std::chrono::steady_clock::now() - t_pin).count());
-            }
-        }
+        dsv4_pin_host_experts(*m, n_cpu_moe);
 
         auto t_end = std::chrono::steady_clock::now();
         double secs = std::chrono::duration<double>(t_end - t_start).count();
@@ -3114,149 +3295,8 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
         }
     }
 
-    if (hp.v41)
-    {
-        // Sparse-read advice turns off the kernel's readahead, which is exactly
-        // what a whole-table warm pass depends on, so this runs only once the
-        // warming (synchronous or background) is finished. Never alter another
-        // host tensor's entire shard, or an allocation that is not one of our
-        // mmaps.
-        dsv4_model * const model_ptr = m.get();
-        auto apply_engram_advice = [model_ptr, engram_random_advice, engram_random_override]()
-        {
-            if (!engram_random_advice)
-            {
-                if (!model_ptr->engram_on_device)
-                    fprintf(stderr, "[dsv41] Engram mmap advice: default (%s)\n",
-                        engram_random_override ? "override=0" : "automatic: one I/O thread");
-                return;
-            }
-            size_t accepted = 0, unsupported = 0, skipped = 0, failed = 0;
-            for (const auto & layout : model_ptr->engram.layers)
-            {
-                const auto * table = model_ptr->layers[layout.id].engram_embd;
-                const auto found = std::find(model_ptr->mmap_bufs.begin(), model_ptr->mmap_bufs.end(), table->buffer);
-                if (!table->buffer || found == model_ptr->mmap_bufs.end()) { ++skipped; continue; }
-                const size_t index = size_t(found - model_ptr->mmap_bufs.begin());
-                const auto result = tsg_dsv41::advise_engram_random(model_ptr->mmap_addrs[index], model_ptr->mmap_sizes[index],
-                    table->data, ggml_nbytes(table));
-                if (result.status == tsg_dsv41::mapped_advice_status::applied) ++accepted;
-                else if (result.status == tsg_dsv41::mapped_advice_status::unsupported) ++unsupported;
-                else if (result.status == tsg_dsv41::mapped_advice_status::empty) ++skipped;
-                else
-                {
-                    ++failed;
-                    fprintf(stderr, "[dsv41] Engram random advice was not applied to layer %d (error %d); continuing\n",
-                        layout.id, result.error);
-                }
-            }
-            fprintf(stderr, "[dsv41] Engram mmap advice: RANDOM (%s; accepted=%zu, unsupported=%zu, skipped=%zu, failed=%zu)\n",
-                engram_random_override ? "override=1" : "automatic: parallel I/O", accepted, unsupported, skipped, failed);
-        };
-        bool advice_deferred = false;
-
-        // A host-resident Engram table is read 24 scattered rows per token per
-        // table. Each row that is not page cache is one storage round trip, and
-        // on a network filesystem that is ~1 ms: input preparation for a
-        // 1024-token prefill chunk measured 1.44 s cold against 0.04-0.09 s
-        // warm on the eight-A40 VM's Q4_K_M checkpoint (prefill 201-255 ->
-        // 363-381 tok/s, decode 23-24 -> 29 tok/s).
-        //
-        // So warming is the default whenever the pages can actually STAY
-        // resident. It is minutes of I/O, so the automatic form runs on its own
-        // thread after the model is serving rather than holding up load;
-        // TS_DSV41_ENGRAM_WARM=1 keeps the documented synchronous behaviour and
-        // =0 turns warming off.
-        const char * warm_opt = m->engram_on_device ? nullptr : getenv("TS_DSV41_ENGRAM_WARM");
-        const int warm_mode = m->engram_on_device ? 0 : (warm_opt ? atoi(warm_opt) : -1);
-        if (warm_mode != 0)
-        {
-            size_t bytes = 0;
-            for (const auto & layout : m->engram.layers) bytes += ggml_nbytes(m->layers[layout.id].engram_embd);
-            const size_t headroom = (size_t) 8 * 1024 * 1024 * 1024;
-            const size_t allowance = dsv4_host_mem_allowance();
-            const size_t resident = std::max(bytes, m->mmap_weight_bytes);
-            const char * refused = nullptr;
-            if (allowance && (resident > allowance || allowance - resident < headroom))
-                refused = "host allowance lacks 8 GiB headroom";
-            else if (warm_mode < 0)
-            {
-                // Automatic only: an explicit =1 is the operator's call. Warming
-                // pages that the host will immediately evict costs the I/O and
-                // buys nothing, so require room for the whole table set now.
-                const size_t available = dsv4_host_mem_available();
-                if (available && available < bytes + headroom)
-                    refused = "free host memory would not keep the tables cached";
-            }
-
-            if (refused)
-            {
-                fprintf(stderr, "[dsv41] Engram warming skipped: %s\n", refused);
-            }
-            else if (warm_mode > 0)
-            {
-                const auto start = std::chrono::steady_clock::now();
-                fprintf(stderr, "[dsv41] warming %.2f GiB of Engram pages with %u I/O threads...\n",
-                    bytes / 1073741824.0, m->engram_io->threads());
-                for (const auto & layout : m->engram.layers)
-                {
-                    auto * table = m->layers[layout.id].engram_embd;
-                    m->engram_io->warm(table->data, ggml_nbytes(table));
-                }
-                fprintf(stderr, "[dsv41] warmed %.2f GiB of Engram pages in %.2fs (%u I/O threads)\n",
-                    bytes / 1073741824.0, std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count(),
-                    m->engram_io->threads());
-            }
-            else
-            {
-                // Its own pool, not m->engram_io: that one is what per-token
-                // lookups run on, and a warming submission holds it for the
-                // length of a slice.
-                std::vector<std::pair<void *, size_t>> ranges;
-                for (const auto & layout : m->engram.layers)
-                {
-                    auto * table = m->layers[layout.id].engram_embd;
-                    ranges.emplace_back(table->data, ggml_nbytes(table));
-                }
-                const unsigned warm_threads = std::min<unsigned>(16u, m->engram_io->threads());
-                fprintf(stderr, "[dsv41] warming %.2f GiB of Engram pages in the background with %u I/O threads; "
-                    "requests run at page-cache speed once it finishes (TS_DSV41_ENGRAM_WARM=0 disables)\n",
-                    bytes / 1073741824.0, warm_threads);
-                dsv4_model * model = model_ptr;
-                advice_deferred = true;
-                m->engram_warm_thread = std::thread([model, ranges, bytes, warm_threads, apply_engram_advice]() {
-                    try
-                    {
-                        const auto start = std::chrono::steady_clock::now();
-                        tsg_dsv41::engram_io_pool pool(warm_threads);
-                        // Slices keep the stop flag responsive: a model freed
-                        // mid-warm waits at most one slice, not one table.
-                        constexpr size_t slice = (size_t) 1024 * 1024 * 1024;
-                        for (const auto & range : ranges)
-                        {
-                            for (size_t off = 0; off < range.second; off += slice)
-                            {
-                                if (model->engram_warm_stop.load(std::memory_order_relaxed)) return;
-                                pool.warm((const char *) range.first + off, std::min(slice, range.second - off));
-                            }
-                        }
-                        fprintf(stderr, "[dsv41] warmed %.2f GiB of Engram pages in %.2fs (background, %u I/O threads)\n",
-                            bytes / 1073741824.0,
-                            std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count(),
-                            warm_threads);
-                    }
-                    catch (const std::exception & e)
-                    {
-                        fprintf(stderr, "[dsv41] background Engram warming stopped: %s\n", e.what());
-                    }
-                    // Readahead is no longer wanted: from here the table is read
-                    // a few scattered rows at a time.
-                    apply_engram_advice();
-                });
-            }
-        }
-        if (!advice_deferred) apply_engram_advice();
-    }
+    if (hp.v41 && !dsv4_warm_engram(*m, shards, engram_random_advice, engram_random_override))
+        return nullptr;
 
     // primary sequence slot (slot 0) — the CLI / single-stream cache
     m->active_slot = dsv4_slot_alloc(*m);
