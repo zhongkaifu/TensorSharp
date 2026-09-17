@@ -277,8 +277,11 @@ the 8-request round stayed stable; on Ada or Blackwell eight tokens still take M
 would have been hit too. The builder now pins every small uploaded parameter (ids, routing
 weights, biases, post-norm weight) with the allocator's output flag. The CTest
 `moe-fused-bias-alias-cuda` (`GgmlOpsMoeFusedBiasAliasTest`) compares the kernel
-against an exact host evaluation for 1, 4 and 7 tokens. Before the fix it was off by
-449 against a tolerance of 27 and was not repeatable.
+against an exact host evaluation for 1, 4 and 7 tokens. Before the fix the 4- and
+7-token cases were off by up to 644 and 1118 against tolerances of 21 and 25 and were
+not repeatable (the 1-token case passed); after it they match the CPU backend.
+`moe-fused-bias-alias-metal` runs the same check on Metal, which does not fuse this
+chain and passed before the fix too.
 
 After the fix, with `--conc-gate`, three passes gave bit-identical logits at every
 step of the 1-, 4- and 8-request rounds. Without the gate, one pass in three still
@@ -457,7 +460,7 @@ tokens another conversation's state matched past the public prefix.
 | Cross-request isolation and media identity | `ModelServiceRawTokenHistoryTests` and `ToolTranscriptSpliceTests` (content-verified raw-token splice), `PooledPrefixScopeAndMediaTests`, `ContentAddressedMediaTests` |
 | Reuse past media (Qwen 3.5 M-RoPE) | `Qwen35MRopeReferencePositionTests` (positions against an SGLang `get_rope_index` fixture), opt-in `Qwen35ImageFollowUpExactnessTests` (reuse vs cold after an image with real weights, solo and concurrent, checkpoint file round trip) |
 | Per-model correctness | `Qwen35BatchedCorrectnessTests`, `Mistral3BatchedForwardTests`, `Gemma4BatchedForwardTests`, `GptOssBatchedCorrectnessTests`, `NemotronBatchedCorrectnessTests` |
-| Batched MoE kernel under backend fusion | Native CTest `moe-fused-bias-alias-cpu` / `moe-fused-bias-alias-cuda` (`GgmlOpsMoeFusedBiasAliasTest`): the standalone MoE FFN kernel with per-expert biases against an exact host evaluation, 1, 4 and 7 tokens, repeated |
+| Batched MoE kernel under backend fusion | Native CTest `moe-fused-bias-alias-cpu` / `moe-fused-bias-alias-cuda` / `moe-fused-bias-alias-metal` (`GgmlOpsMoeFusedBiasAliasTest`): the standalone MoE FFN kernel with per-expert biases against an exact host evaluation, 1, 4 and 7 tokens, repeated |
 | MTP speculative decoding | `SpeculativeExecutionTests` (draft/verify/rollback core), opt-in end-to-end `Qwen36SpeculativeTests` (`TS_MTP_E2E=1`) and `Gemma4SpeculativeTests` (`TS_GMTP_E2E=1`) with real GGUFs |
 | Per-model performance probes | `Gemma4BatchedPerfBench`, `Qwen35BatchedPerfBench`, `GptOssBatchedPerfBench`, `NemotronBatchedPerfBench` |
 | DiffusionGemma path | `DiffusionGemmaTests` for denoising, prompt-KV caching, and batched generation probes |

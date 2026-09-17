@@ -20,7 +20,9 @@
 // sit on the Q8_0 / Q8_1 grids, so the only quantization error left is in the
 // down projection's input and the tolerance can be tight.
 //
-// Usage: GgmlOpsMoeFusedBiasAliasTest [cpu|cuda]   (exit 77 = backend unavailable)
+// Metal does not fuse this chain, so its run is a plain kernel-correctness guard.
+//
+// Usage: GgmlOpsMoeFusedBiasAliasTest [cpu|cuda|metal]   (exit 77 = backend unavailable)
 
 #include <algorithm>
 #include <cmath>
@@ -35,6 +37,7 @@
 extern "C" {
     const char* TSGgml_GetLastError();
     int TSGgml_IsBackendAvailable(int backendType);
+    void TSGgml_Shutdown();
     int TSGgml_MoEFFNPrefillSwiGLUQuantF32(
         float* hidden_in, float* hidden_out, int seq_len, int hidden_dim, int n_ff,
         int num_experts, int n_used, const std::int32_t* selected_experts, const float* routing_weights,
@@ -47,6 +50,7 @@ extern "C" {
 
 namespace
 {
+    constexpr int BackendTypeMetal = 1;
     constexpr int BackendTypeCpu = 2;
     constexpr int BackendTypeCuda = 3;
     constexpr int GgmlTypeQ8_0 = 8;
@@ -245,7 +249,8 @@ int main(int argc, char** argv)
     {
         name = argv[1];
         if (name == "cuda" || name == "ggml_cuda") backend = BackendTypeCuda;
-        else if (name != "cpu" && name != "ggml_cpu") fail("unknown backend argument " + name + "; use cpu or cuda");
+        else if (name == "metal" || name == "ggml_metal") backend = BackendTypeMetal;
+        else if (name != "cpu" && name != "ggml_cpu") fail("unknown backend argument " + name + "; use cpu, cuda or metal");
     }
     if (TSGgml_IsBackendAvailable(backend) == 0)
     {
@@ -266,6 +271,9 @@ int main(int argc, char** argv)
     bool ok = true;
     for (int tokens : { 1, 4, 7 })
         ok = run_case(name, m, tokens) && ok;
+    // Release the cached buffers and the backend before exit: ggml-metal asserts in
+    // its static destructor while residency sets still hold buffers.
+    TSGgml_Shutdown();
     if (!ok)
         fail("the MoE FFN kernel disagreed with the host evaluation or with itself");
     std::printf("PASS\n");

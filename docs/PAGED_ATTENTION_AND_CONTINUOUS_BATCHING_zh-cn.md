@@ -247,7 +247,9 @@ token 处分叉，连同一进程内的预热轮与测量轮之间也会分叉�
 轮次保持稳定的原因；在 Ada 或 Blackwell 上 8 个 token 仍走 MMVQ，同样会受影响。现在图构建器用分配器的 output 标志固定住所有小的上传参数（ids、
 路由权重、bias、post-norm 权重）。CTest `moe-fused-bias-alias-cuda`
 （`GgmlOpsMoeFusedBiasAliasTest`）在 1、4、7 个 token 下把该内核与精确的主机计算结果
-比较。修复前误差为 449（容差 27），且重复运行结果不一致。
+比较。修复前 4 个和 7 个 token 的误差分别高达 644 和 1118（容差为 21 和 25），且重复运行
+结果不一致（1 个 token 的情况通过）；修复后与 CPU 后端一致。`moe-fused-bias-alias-metal`
+在 Metal 上做同样的检查；Metal 不融合这条算子链，修复前也能通过。
 
 修复后，在 `--conc-gate` 下，三轮运行在 1、4、8 请求轮次的每一步都给出逐位相同的
 logits。不加 gate 时，三轮中仍有一轮改变了 8 请求轮次的输出：它的第一个请求在另外七个
@@ -387,7 +389,7 @@ E4B/Metal 上一个复用 179 token 的 457 token 图片回合首 token 用时 1
 | 跨请求隔离与媒体身份 | `ModelServiceRawTokenHistoryTests` 与 `ToolTranscriptSpliceTests`（按内容校验的原始 token 拼接）、`PooledPrefixScopeAndMediaTests`、`ContentAddressedMediaTests` |
 | 越过媒体复用（Qwen 3.5 M-RoPE） | `Qwen35MRopeReferencePositionTests`（与 SGLang `get_rope_index` 夹具比较位置），需显式启用的 `Qwen35ImageFollowUpExactnessTests`（真实权重下图片之后复用与冷启动对比，单请求与并发，检查点文件往返） |
 | 按模型正确性 | `Qwen35BatchedCorrectnessTests`、`Mistral3BatchedForwardTests`、`Gemma4BatchedForwardTests`、`GptOssBatchedCorrectnessTests`、`NemotronBatchedCorrectnessTests` |
-| 后端融合下的批处理 MoE 内核 | 原生 CTest `moe-fused-bias-alias-cpu` / `moe-fused-bias-alias-cuda`（`GgmlOpsMoeFusedBiasAliasTest`）：带每专家 bias 的独立 MoE FFN 内核与精确主机计算结果对比，1、4、7 个 token，重复执行 |
+| 后端融合下的批处理 MoE 内核 | 原生 CTest `moe-fused-bias-alias-cpu` / `moe-fused-bias-alias-cuda` / `moe-fused-bias-alias-metal`（`GgmlOpsMoeFusedBiasAliasTest`）：带每专家 bias 的独立 MoE FFN 内核与精确主机计算结果对比，1、4、7 个 token，重复执行 |
 | MTP 投机解码 | `SpeculativeExecutionTests`（起草 / 验证 / 回滚核心）、可选端到端 `Qwen36SpeculativeTests`（`TS_MTP_E2E=1`）与 `Gemma4SpeculativeTests`（`TS_GMTP_E2E=1`），需真实 GGUF |
 | 按模型性能探针 | `Gemma4BatchedPerfBench`、`Qwen35BatchedPerfBench`、`GptOssBatchedPerfBench`、`NemotronBatchedPerfBench` |
 | DiffusionGemma 路径 | `DiffusionGemmaTests` 覆盖去噪、prompt-KV 缓存与批处理生成探针 |

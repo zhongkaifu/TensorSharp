@@ -652,6 +652,10 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
         add_test(NAME moe-fused-bias-alias-cuda COMMAND GgmlOpsMoeFusedBiasAliasTest cuda)
         set_tests_properties(moe-fused-bias-alias-cuda PROPERTIES SKIP_RETURN_CODE 77)
     endif()
+    if (APPLE AND TENSORSHARP_GGML_NATIVE_ENABLE_METAL)
+        add_test(NAME moe-fused-bias-alias-metal COMMAND GgmlOpsMoeFusedBiasAliasTest metal)
+        set_tests_properties(moe-fused-bias-alias-metal PROPERTIES SKIP_RETURN_CODE 77)
+    endif()
 
     add_executable(GgmlOpsAddmmVectorTest tests/addmm_vector_test.cpp)
     target_include_directories(GgmlOpsAddmmVectorTest PRIVATE
