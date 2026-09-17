@@ -142,9 +142,9 @@ public class NemotronBatchedCorrectnessTests
 
         public CorrCtx(string modelPath)
         {
-            BackendType backend = OperatingSystem.IsMacOS()
-                ? BackendType.GgmlMetal : BackendType.GgmlCpu;
-            Model = TensorSharp.Models.ModelBase.Create(modelPath, backend);
+            // Follow the process's pinned GGML backend: the native bridge takes
+            // one backend per process, so a hard-coded choice fails every lane but one.
+            Model = TensorSharp.Models.ModelBase.Create(modelPath, TestGates.PinnedGgmlBackend);
             Renderer = new KVCachePromptRenderer(new GgufPromptRenderer());
             BlockSize = 256;
             var cfg = new SchedulerConfig

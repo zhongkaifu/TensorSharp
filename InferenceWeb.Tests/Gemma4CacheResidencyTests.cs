@@ -22,7 +22,7 @@ public class Gemma4CacheResidencyTests
 
     public Gemma4CacheResidencyTests(ITestOutputHelper output) => _output = output;
 
-    [CudaFact("TS_TEST_MODEL_DIR", "gemma-4-e4b")]
+    [CudaFact("TS_TEST_MODEL_DIR", "gemma-4-e4b", GgmlBackend = BackendType.GgmlCuda)]
     public void InitializeResidentCache_DoesNotRestorePreviousDeviceContents()
     {
         string path = TestGates.FindGguf(

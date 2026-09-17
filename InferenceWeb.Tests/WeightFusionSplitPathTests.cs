@@ -81,14 +81,19 @@ public sealed class WeightFusionSplitPathTests
         while (matching < fused.Length && matching < split.Length && fused[matching] == split[matching])
             matching++;
 
-        _output.WriteLine($"[fusion] {Path.GetFileName(path)}: {matching}/{tokens} tokens agree");
+        // A reply that ends its turn before the budget is judged against the longer
+        // of the two streams: two identical 8-token answers agree completely, while a
+        // stream that stops where the other continues still counts as divergence.
+        int compared = Math.Min(tokens, Math.Max(fused.Length, split.Length));
+        _output.WriteLine($"[fusion] {Path.GetFileName(path)}: {matching}/{compared} tokens agree (budget {tokens})");
         _output.WriteLine($"[fusion] fused={string.Join(",", fused)}");
         _output.WriteLine($"[fusion] split={string.Join(",", split)}");
 
         // A prefix, not the whole stream: the two orders of the same arithmetic drift.
         // Structural breakage shows up in the first token or two, never at token 20.
-        Assert.True(matching >= tokens * 3 / 4,
-            $"only {matching} of {tokens} tokens agree between the fused and split FFN paths; "
+        Assert.True(compared > 0, "neither fusion policy generated a token");
+        Assert.True(matching >= compared * 3 / 4,
+            $"only {matching} of {compared} tokens agree between the fused and split FFN paths; "
             + "that is structural divergence, not floating-point drift");
     }
 
@@ -99,8 +104,8 @@ public sealed class WeightFusionSplitPathTests
         Environment.SetEnvironmentVariable(FusionVar, allowFusionCopies ? "1" : "0");
         try
         {
-            BackendType backend = OperatingSystem.IsMacOS() ? BackendType.GgmlMetal : BackendType.GgmlCpu;
-            using ModelBase model = ModelBase.Create(modelPath, backend);
+            // The pinned GGML backend: one backend per process (GgmlBackendTestInitializer).
+            using ModelBase model = ModelBase.Create(modelPath, TestGates.PinnedGgmlBackend);
             var config = new SchedulerConfig
             {
                 MaxNumBatchedTokens = 4096,
@@ -130,7 +135,11 @@ public sealed class WeightFusionSplitPathTests
                     produced.Add(token);
             }
             catch (Exception) { /* the assertion reads what arrived */ }
-            handle.Completion.GetAwaiter().GetResult();
+            InferenceCompletion completion = handle.Completion.GetAwaiter().GetResult();
+            // A short stream is only an answer when the model ended its turn; an
+            // error or abort must not pass as agreement.
+            if (produced.Count < tokens)
+                Assert.Equal("eos", completion.FinishReason);
             return produced.ToArray();
         }
         finally

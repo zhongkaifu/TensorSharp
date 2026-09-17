@@ -9,7 +9,7 @@ namespace InferenceWeb.Tests;
 /// This is not a publisher-checkpoint quality or performance test.</summary>
 public sealed class DeepSeekNativeRetentionFixtureTests
 {
-    [ModelTheory("TS_TEST_DSV41_FIXTURE_DIR", "deepseek41-fixture")]
+    [ModelTheory("TS_TEST_DSV41_FIXTURE_DIR", "deepseek41-fixture", GgmlBackend = BackendType.GgmlCpu)]
     [InlineData("io")]
     [InlineData("oom")]
     [InlineData("disposed")]
@@ -71,7 +71,7 @@ public sealed class DeepSeekNativeRetentionFixtureTests
         }
     }
 
-    [ModelFact("TS_TEST_DSV41_FIXTURE_DIR", "deepseek41-fixture")]
+    [ModelFact("TS_TEST_DSV41_FIXTURE_DIR", "deepseek41-fixture", GgmlBackend = BackendType.GgmlCpu)]
     public void RetainedNativeHolderPreservesContinuationAndCanBeReclaimedWithoutASparePrimary()
     {
         string path = TestGates.FindGguf(Environment.GetEnvironmentVariable("TS_TEST_DSV41_FIXTURE_DIR"), "deepseek41-fixture");

@@ -28,6 +28,9 @@ public class Gemma4PrefixCloneExactnessTests
             "metal" => BackendType.GgmlMetal,
             _ => BackendType.GgmlCpu,
         };
+        // Prefixes reach ~5k tokens: pin the context instead of inheriting a lane's MAX_CONTEXT.
+        using var env = new EnvScope();
+        env.Set("MAX_CONTEXT", "8192");
         using var model = ModelBase.Create(path, backend);
         var fused = Assert.IsAssignableFrom<IBatchedPagedModel>(model);
         Assert.True(fused.SupportsPrefixCheckpoints);

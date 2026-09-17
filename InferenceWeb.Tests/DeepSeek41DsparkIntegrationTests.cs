@@ -14,6 +14,14 @@ public sealed class DeepSeek41DsparkTinyFactAttribute : FactAttribute
         if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("TS_TEST_DSV41_DSPARK_TARGET")))
             Skip = "Requires explicitly pinned tiny DeepSeek V4.1 target and DSpark fixtures.";
     }
+
+    /// <summary>The GGML backend the test constructs; skips unless the process pins it (<see cref="TestGates.GgmlPinSkip"/>).</summary>
+    public BackendType GgmlBackend
+    {
+        get => _ggmlBackend;
+        set { _ggmlBackend = value; Skip ??= TestGates.GgmlPinSkip(value); }
+    }
+    private BackendType _ggmlBackend;
 }
 
 [CollectionDefinition("DeepSeek V4.1 DSpark integration", DisableParallelization = true)]
@@ -27,7 +35,7 @@ public sealed class DeepSeek41DsparkIntegrationTests(ITestOutputHelper output)
 {
     private static readonly int[] Prompt = [0, 15, 32, 64, 128];
 
-    [DeepSeek41DsparkTinyFact]
+    [DeepSeek41DsparkTinyFact(GgmlBackend = BackendType.GgmlCpu)]
     public void CpuAttachedBlockHead_EngagesAndPreservesSixteenGreedyTokens()
     {
         using var model = Load();
@@ -63,7 +71,7 @@ public sealed class DeepSeek41DsparkIntegrationTests(ITestOutputHelper output)
         AssertFinite(model.ForwardRefill(Prompt));
     }
 
-    [DeepSeek41DsparkTinyFact]
+    [DeepSeek41DsparkTinyFact(GgmlBackend = BackendType.GgmlCpu)]
     public void VerifyRewindAndTwoSlots_PreserveAcceptedPrefixAndUnrelatedContinuation()
     {
         using var model = Load();
