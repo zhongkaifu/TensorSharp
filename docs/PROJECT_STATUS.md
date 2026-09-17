@@ -60,6 +60,18 @@ faster load of that 236.4 GiB checkpoint (264 s vs 753 s) and a slower TTFT
 (41.9 s vs 29.0 s); see the [cross-engine report](validation/cross-engine-2026-09/README.md)
 beside the [GLM card](models/glm.md#glm-53-glm-dsa).
 
+### Release notes: behaviour changes since the last tag
+
+- **Qwen 3.5/3.6: outputs after an image change.** Tokens after an image are now
+  generated at Qwen-VL's compressed M-RoPE positions (KV index plus the per-sequence
+  rope delta, as HF and SGLang do) instead of at the absolute KV index, so replies to
+  image prompts differ from earlier builds and match a correct implementation. Follow-up
+  turns after an image reuse the cache again (98% of the prompt, 0.13 s to the first token
+  on Metal instead of about 1.1 s). Saved Qwen 3.5 shared-prefix checkpoint files move to
+  format version 2; a version-1 file is ignored with a warning and rewritten. The native
+  library must be rebuilt with the managed code. Details in the
+  [Qwen 3.5 card](models/qwen35.md#positions-after-an-image-the-m-rope-delta).
+
 ### TensorAgent and iOS
 
 TensorAgent is a .NET MAUI iOS/iPadOS application that runs the TensorSharp engine locally. It links the native GGML library as an iOS `.xcframework`, uses `ggml_metal` on physical devices, and shares the host-neutral chat pipeline (`TensorSharp.Chat`) with the CLI and server. The iOS target is enabled with `TensorSharpIosTargets=true`; it is not a separate numerical backend or a remote inference service.

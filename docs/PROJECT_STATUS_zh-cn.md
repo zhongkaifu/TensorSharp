@@ -43,6 +43,15 @@ GLM-5.3 不在上面这份清单里，是因为它不需要新架构：非 Flash
 TTFT 更慢（41.9 秒对 29.0 秒）；见[跨引擎报告](validation/cross-engine-2026-09/README.md)
 与[GLM 卡片](models/glm_zh-cn.md#glm-53glm-dsa)。
 
+### 发布说明：自上个标签以来的行为变化
+
+- **Qwen 3.5/3.6：图片之后的输出会改变。** 图片之后的 token 现在在 Qwen-VL 压缩后的 M-RoPE 位置上
+  生成（KV 下标加上按序列保存的 rope 偏移，与 HF、SGLang 一致），而不是在绝对 KV 下标上，因此对图片
+  提示的回复与之前的构建不同，并与正确实现一致。图片之后的后续回合重新复用缓存（Metal 上复用 98%
+  的提示，首 token 0.13 s，而不是约 1.1 s）。已保存的 Qwen 3.5 共享前缀检查点文件升级到格式版本 2；
+  版本 1 的文件会被忽略并给出警告，然后重新写入。原生库必须与托管代码一起重新构建。详见
+  [Qwen 3.5 模型卡](models/qwen35_zh-cn.md)。
+
 ### TensorAgent 与 iOS
 
 TensorAgent 是使用 .NET MAUI 构建的 iOS/iPadOS 应用，在设备本地运行 TensorSharp 引擎。它把原生 GGML 作为 iOS `.xcframework` 链接进来，在真机上使用 `ggml_metal`，并与 CLI、服务端共享与宿主无关的聊天流水线（`TensorSharp.Chat`）。iOS 目标通过 `TensorSharpIosTargets=true` 启用；它不是独立的数值后端，也不是远程推理服务。

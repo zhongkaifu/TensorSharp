@@ -309,10 +309,13 @@ chat 层的原始 token 拼接遵循同样的身份。每个生成的回合都�
 之前的文本总是可以复用。池化块哈希只把区间 id 混入包含该区间的块（并通过父链带入其后的所有块），
 而不混入之前的块。
 
-Qwen 3.5/3.6 声明 `SupportsReuseAcrossMediaSpan = false`：它们的 M-RoPE 提示位置在图片之后被压缩，
-但 decode 使用绝对 token 下标，holder 也不记录 rope 偏移，因此越过图片续接缓存得到的状态与重新
-prefill 不同。在 decode 使用压缩位置之前，它们的复用止于第一个媒体区间；Gemma 4 使用绝对位置，
-可以越过图片续接。
+无法精确越过媒体续接缓存的模型声明 `SupportsReuseAcrossMediaSpan = false`，此时所有复用路径都止于
+第一个媒体区间。目前没有模型这样声明。Gemma 4 使用绝对位置。Qwen 3.5/3.6 的 M-RoPE 提示位置在图片
+之后被压缩，位置表之外的每个 token（decode、投机 verify、文本续接）都按其 KV 下标加上该序列的
+M-RoPE 偏移（delta）旋转，而每个 holder、检查点和检查点文件（格式版本 2）都保存这个 delta；因此后续
+回合越过图片续接缓存，并与重新 prefill 一致（见 [Qwen 3.5 模型卡](models/qwen35_zh-cn.md)：在 Metal
+上，图片之后的 Web UI 回合复用 98% 的提示，首 token 用时 0.13 s，而不是约 1.1 s）。在此修复之前
+Qwen 3.5/3.6 声明为 `false`，因为 decode 使用绝对下标。
 
 在复用前缀*之后*预填充图片是另一回事。Gemma 4 的融合 prefill 只在起始位置 0 输出图片的双向掩码，
 因此这样的分块走较慢的逐算子路径。在滑动窗口之内，该路径与冷启动 prefill 逐 token 一致（但更慢：
@@ -338,6 +341,7 @@ E4B/Metal 上一个复用 179 token 的 457 token 图片回合首 token 用时 1
 | 调度器 / 块池 | `ContinuousBatchSchedulerTests`、`PagedKvCacheTests`、`PagedKvCacheCodecTests` |
 | 批处理执行原语 | `BatchedExecutorTests`，覆盖托管分页注意力正确性与多序列 logits 路由；`RetainedFusedCacheTests` 覆盖按能力启用的 holder 保留 / 重新绑定与 LRU 清理、会话作用域隔离（含随机交错的性质测试）与按位置的媒体检查 |
 | 跨请求隔离与媒体身份 | `ModelServiceRawTokenHistoryTests` 与 `ToolTranscriptSpliceTests`（按内容校验的原始 token 拼接）、`PooledPrefixScopeAndMediaTests`、`ContentAddressedMediaTests` |
+| 越过媒体复用（Qwen 3.5 M-RoPE） | `Qwen35MRopeReferencePositionTests`（与 SGLang `get_rope_index` 夹具比较位置），需显式启用的 `Qwen35ImageFollowUpExactnessTests`（真实权重下图片之后复用与冷启动对比，单请求与并发，检查点文件往返） |
 | 按模型正确性 | `Qwen35BatchedCorrectnessTests`、`Mistral3BatchedForwardTests`、`Gemma4BatchedForwardTests`、`GptOssBatchedCorrectnessTests`、`NemotronBatchedCorrectnessTests` |
 | MTP 投机解码 | `SpeculativeExecutionTests`（起草 / 验证 / 回滚核心）、可选端到端 `Qwen36SpeculativeTests`（`TS_MTP_E2E=1`）与 `Gemma4SpeculativeTests`（`TS_GMTP_E2E=1`），需真实 GGUF |
 | 按模型性能探针 | `Gemma4BatchedPerfBench`、`Qwen35BatchedPerfBench`、`GptOssBatchedPerfBench`、`NemotronBatchedPerfBench` |

@@ -250,6 +250,90 @@ NeoX 风格旋转嵌入。频率在 `_ropeFreqs[halfDim]` 一次性预计算。�
 
 `qwen3next` GGUF 额外提供 `qwen35.rope.dimension_sections`，定义 MRoPE section 边界。存在时 RoPE 步骤使用多模态 RoPE；不存在时使用纯 NeoX RoPE。
 
+#### 图片之后的位置：M-RoPE 偏移（delta）
+
+合并网格为 H x W 的图片占用 KV cache 的 H*W 行，却只占 max(H, W) 个旋转位置。注入器按 HF 与
+SGLang `get_rope_index` 的方式排布提示（`ModelMultimodalInjector.LayoutQwenVLPrompt`）：区间内
+token 位于 `(base, base + h, base + w)`，其后的文本从 `base + max(H, W)` 继续。位置表之外的每个
+token 都位于
+
+```
+rope 位置 = KV 下标 + delta，   delta = 位置表最后一行的最大分量 + 1 - 提示长度
+```
+
+即 SGLang 的 `mrope_position_delta`（decode 位置为 `delta - 1 + seq_len`）。delta 按序列保存
+（`Qwen35Model.RopePositions.cs`）：
+
+- **在任何内核运行之前确定。** `BeginRopePositions` 从 prefill 分块暂存的位置表取得它；从 KV 下标
+  0 开始且没有位置表的前向会开启新历史（delta 为 0）；其他前向沿用当前序列的 delta。若一个分块的
+  所有行都是位于 `KV 下标 + delta` 的文本，则丢弃位置表，改走普通的标量 RoPE 图，旋转完全相同。
+- **所有路径都使用它。** 整模型 decode（`rope_pos_delta`）、融合 prefill/verify 图（标量行使用
+  `rope_pos_delta`）、arena 批处理 decode（每个 holder 的 `rope_positions`）、分页批处理前向
+  （来自注入器的请求 delta）、逐算子 attention、direct-CUDA 的 prefill 与 decode 图、张量并行以及
+  MTP 草稿头。逐层原生 attention 内核按 KV 下标旋转，因此越过图片的序列不会走它们。
+  `TSGgml_Qwen35RopePositionAbi` 防止使用在此约定之前构建的原生库：这样的库会明确报错并关闭融合图，
+  而不是以错误的参数个数被调用。（DFlash 草稿器保留自己的位置；它们只影响草稿被接受的数量，
+  从不影响输出。）
+- **与其描述的状态一起保存。** 每个请求的 holder 在换入换出、保留、重新绑定和池化过程中携带它；
+  共享前缀检查点及其克隆会复制它；检查点文件格式（`Q5KC`）升级为**版本 2**，在行数之后写入 delta。
+  版本 1 的文件没有 delta，导入时会被拒绝；引擎记录“保存的检查点与模型不符”，重新 prefill 该前缀
+  并再次保存。
+
+在此之前，decode、投机 verify 以及所有标量路径都直接按 KV 下标旋转，带来两个后果：
+
+- **单个请求。** 对图片的回复是在模型训练时不会在该图片之后见到的位置上生成的：提示之后的每个 token
+  都比参考位置多出“图片 token 数减 max(H, W)”（1253x836 的测试图片约为一千个位置）。修复之后
+  **图片之后的输出会改变**：现在它们就是正确的 Qwen-VL 实现所产生的结果。在 Mac 上实测（Metal，
+  Qwen3.5-9B-Q8_0，贪心，96 token），图片回合的回复在修复前（584f8f71，与 6db6dbf6 的 decode
+  相同）与修复后分别为：
+  - OpenAI，第 1 轮带图：`...sitting gracefully against a futuristic, glowing background filled
+    with floating cubes and digital particles.` 变为 `...sitting gracefully amidst a futuristic,
+    glowing digital landscape filled with floating cubes and light trails.`
+  - Web UI，第 3 轮带图：`...amidst a futuristic digital environment.` 变为
+    `...amidst a futuristic digital landscape.`
+  - OpenAI，第 3 轮带图：`This digital artwork features an anime-style woman...` 变为
+    `This image features an anime-style illustration of a young woman...`
+  - Web UI，第 1 轮带图：96 token 内没有变化。
+- **复用。** 经过图片回合的缓存与重新 prefill 同一历史得到的状态不同，因此前缀缓存 Phase 0 让所有
+  复用路径止于第一张图片（`SupportsReuseAcrossMediaSpan = false`）。Qwen 3.5/3.6 现在声明为
+  `true`：后续回合越过图片续接缓存。
+
+**验证。**
+
+- `Qwen35MRopeReferencePositionTests` 将提示排布、delta、模型自身的分块 prefill 与 decode 位置，
+  以及从头排布的后续回合，与由 SGLang `get_rope_index(model_type="qwen3_5")` 及其 decode 规则生成
+  的夹具进行比较（`eng/validation/qwen35_mrope_reference`，SGLang 2733afe5），覆盖一张图、两张图、
+  高与宽的网格、两对帧的视频和纯文本。若 decode 按 KV 下标（旧规则），26 个用例中有 10 个失败。
+- `Qwen35ImageFollowUpExactnessTests`（需要模型，`TS_TEST_MODEL_DIR`）在 Qwen3.5-9B-Q8_0 上运行
+  “文本 -> 图片 -> 文本 -> 文本”的对话。在引擎中，第 3、4 轮越过图片复用上一轮，每一轮的贪心 token
+  都与冷启动引擎一致；旁边同时有一段文本对话在 decode（按请求的 holder 与 arena 批处理 decode）时
+  同样如此。直接在模型上，把“decode 上一轮回复再 prefill 新后缀”构建出的回合与整段提示的冷启动
+  prefill 逐步比较 logits。在图片之后建立的检查点经过导出、导入和克隆后，decode logits 逐位相同；
+  版本 1 文件会被拒绝。关闭 delta 时，同一测试在第 3 轮失败（复用得到 `...there is no roof visible.
+  The scene depicts...`，冷启动得到 `...features...`）。
+
+**Logit 容差。** 复用与冷启动并非逐位相同：复用回合的回复行由 decode 图写入，冷启动回合由 prefill
+图写入（attention 与矩阵乘内核不同，等轴时一个是 NeoX、一个是交错 M-RoPE）。测试上限为
+`TS_TEST_QWEN35_LOGIT_TOLERANCE`，默认 0.5（词表上的最大 |dlogit|），并要求每一步 argmax 相同。
+实测最差值：
+
+| 后端 | 提示 | 最差最大 \|dlogit\|（12 步，第 2-4 轮） | 检查点往返 |
+|---|---|---|---|
+| Metal（M 系列，Qwen3.5-9B-Q8_0） | 1,038 token 的图片回合，30 与 24 token 的后续回合 | 0.0187 | 0.0 |
+
+**经过服务端**（Phase 0 的 IMG 探针：Web UI 与 OpenAI 对话，图片在第 1 或第 3 轮，另有纯文本对照；
+Metal，Qwen3.5-9B-Q8_0，贪心，每轮 96 token），图片之后的每一轮现在都续接缓存：
+
+| 场景 | 图片之后的回合 | 之前复用（截断） | 现在复用 | 之前 TTFT（Web UI）/ 总耗时（OpenAI） | 现在 |
+|---|---|---|---|---|---|
+| Web UI，第 1 轮带图 | 2、3、4 | 0、0、0 | 1,099 / 1,187 / 1,286（98.0-98.2%） | 1.00 / 1.10 / 1.18 s | 0.13 / 0.13 / 0.13 s |
+| Web UI，第 3 轮带图 | 4 | 0 | 1,340（98.2%） | 1.20 s | 0.13 s |
+| OpenAI，第 1 轮带图 | 2、3、4 | 0、0、0 | 1,099 / 1,188 / 1,286（97.9-98.2%） | 3.67 / 3.64 / 3.31 s | 2.20 / 2.39 / 1.41 s |
+| OpenAI，第 3 轮带图 | 4 | 0 | 1,301（98.1%） | 2.18 s | 0.94 s |
+
+该次运行的全部 24 条回复都与同一构建关闭提示复用（`TS_SCHED_PREFIX_CACHE=0`）时的结果相同，图片
+只编码一次，纯文本对照不变。
+
 ### 4.5 视觉编码器（`Qwen35VisionEncoder`）
 
 SigLIP 风格 ViT：
