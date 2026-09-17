@@ -137,6 +137,14 @@ namespace TensorSharp.Server
                         _logger.LogWarning("Restored previous model {PreviousModel} after failed load of {ModelFile}",
                             Path.GetFileName(previousModelPath), Path.GetFileName(modelPath));
                     }
+                    catch (Exception rollbackEx) when (ModelLoadRefusal.TryDescribe(rollbackEx, out string rollbackReason))
+                    {
+                        // LoadModelCore already logged the refusal's reason; the stack trace
+                        // of a refusal is Debug-only here too.
+                        _logger.LogError(LogEventIds.ModelLoadFailed,
+                            "Could not restore previous model {PreviousModel} after failed load of {ModelFile}: {Reason}; no model is loaded",
+                            Path.GetFileName(previousModelPath), Path.GetFileName(modelPath), rollbackReason);
+                    }
                     catch (Exception rollbackEx)
                     {
                         _logger.LogError(LogEventIds.ModelLoadFailed, rollbackEx,

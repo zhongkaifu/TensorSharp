@@ -2054,7 +2054,10 @@ that cannot be activated. The native loaders' own diagnostic lines (`[dsv4] ...`
 `[glm] ...`) may still appear above the error line; the error line repeats the
 reason so it is readable on its own. Anything else that fails during a load — a
 `NullReferenceException`, a CUDA error, an out-of-memory abort — is not a refusal
-and keeps its stack trace.
+and keeps its stack trace. One exception: the DeepSeek V4/V4.1 and GLM native
+whole-model loaders report every load they abandon as a refusal, including a
+weight or cache allocation that failed on a device, with their `[dsv4]`/`[glm]`
+line as the reason.
 
 Before exiting with `2` the server releases what the refused load left behind
 (the model service and the ggml backend) and never opens its port. A refusal's

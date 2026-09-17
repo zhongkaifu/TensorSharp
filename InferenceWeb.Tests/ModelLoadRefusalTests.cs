@@ -168,6 +168,31 @@ public class ModelLoadRefusalTests : IDisposable
     }
 
     [Fact]
+    public void Refusal_OfTheRollbackToo_IsLoggedWithoutAStackTrace()
+    {
+        // The model file changed under a running server (or the devices lost memory):
+        // the new load AND the restore of the previous one are both refused. Neither is
+        // a bug, so no Error entry may carry an exception; the traces stay at Debug.
+        string pathA = WriteMinimalGguf("model-a.gguf");
+        string pathB = WriteMinimalGguf("model-b.gguf");
+        bool refuseEverything = false;
+        var logger = new RecordingLogger();
+        var lifecycle = new ModelLifecycleService(logger, (path, _, _, _) =>
+            refuseEverything
+                ? throw new ModelLoadRefusedException("[glm] not enough VRAM for --tp 2")
+                : new FakeModel(path));
+        lifecycle.LoadModel(pathA, null, "cpu");
+        refuseEverything = true;
+        logger.Entries.Clear();
+
+        Assert.Throws<ModelLoadRefusedException>(() => lifecycle.LoadModel(pathB, null, "cpu"));
+
+        Assert.False(lifecycle.IsLoaded);
+        Assert.Contains(logger.Entries, e => e.Level == LogLevel.Error && e.Message.Contains("Could not restore previous model"));
+        Assert.DoesNotContain(logger.Entries, e => e.Level >= LogLevel.Error && e.Exception != null);
+    }
+
+    [Fact]
     public void Refusal_ReleasesTheTensorParallelGroupBuiltForIt()
     {
         var groups = new List<RecordingTpGroup>();
