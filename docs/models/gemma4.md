@@ -498,9 +498,9 @@ whole-model kernel that MTP verification uses (§12): all layers run in a
 single GGML graph dispatch with activations device-resident, instead of one
 graph per layer. `CanUseWholeModelPrefillVerify()` gates the path — dense
 models only, including E-series in-kernel PLE and shared-KV donor layers, with
-multimodal chunks eligible at `startPos == 0` via the kernel's
+multimodal chunks eligible at any start position via the kernel's
 bidirectional-span mask (`TS_G4_MM_PREFILL=0` reverts multimodal to the per-op
-path). SWA-wrapped chunks at `startPos > 0` stay on the fused path through the
+path; see [Image and audio turns after a reused prefix](#image-and-audio-turns-after-a-reused-prefix)). SWA-wrapped chunks at `startPos > 0` stay on the fused path through the
 kernel's in-kernel swaPrev gather (`TS_G4_VERIFY_SWAPREV=0` disables).
 All-MoE variants (e.g. 26B-A4B) have a sibling fused path,
 `CanUseWholeModelMoEPrefillVerify()` / `TryFusedMoEModelVerify()`. Set
@@ -513,6 +513,95 @@ The scheduler feeds a solo (uncontended) prompt to this path in big chunks
 capped by `TS_SCHED_SOLO_PREFILL_CHUNK` (default 8192). See
 [`docs/perf/gemma4-prefill-cuda-graph-design.md`](../perf/gemma4-prefill-cuda-graph-design.md)
 for the measured design.
+
+### Image and audio turns after a reused prefix
+
+An image, video frame or audio clip enters the prompt as a span of soft tokens that
+attend to each other in both directions. The prefill kernels encode that as one byte
+per chunk token (`is_except`): a soft-token query also reads the chunk's soft-token
+keys ahead of it, while every query reads the keys before it causally, inside its
+sliding window on local layers. When a conversation continues its cache into an image
+turn, the image chunk starts at a non-zero position P, after the text the earlier turns
+left behind.
+
+Until this change the fused kernels (dense `TSGgml_Gemma4ModelVerify`, MoE
+`TSGgml_Gemma4MoEModelVerify`) applied the soft-token clause only at P = 0, because they
+compared a key's buffer index with the chunk's bytes. The gates therefore sent a media
+chunk at P > 0 to the per-op path, which was slower (E4B/Metal, a 457-token image turn
+reusing 179 tokens: 1.25 s to first token instead of 0.64 s cold) and, once the ring had
+wrapped, wrong: its mask read the buffer index as the absolute position, but past the
+window the gathered window starts at P - 511, not 0. Phase 0 had to make such a turn
+reuse nothing past its public prefix (`CanPrefillMediaAfterReusedPrefix`).
+
+Every buffer the fused kernels attend keeps the chunk as its last N real keys: the chunk
+alone at P = 0, the global cache `[0, P + N)`, an unwrapped sliding-window cache, or the
+previous window gathered from a wrapped ring prepended to the chunk. A key's chunk index
+is therefore its buffer index minus the number of real keys before the chunk, and the row
+builders in `gemma4_mm_mask.h` apply that offset. At P = 0 and for text chunks they
+produce the same rows as before. The per-op path shifts the absolute soft-token positions
+into the frame of its key buffer (`ShiftPositions`), as the tensor-parallel per-op path
+already did; the tensor-parallel fused verify passes the chunk mask at any P too (its dense
+variant used to run a media chunk at P > 0 with no soft-token mask at all).
+
+So Gemma 4 no longer overrides `CanPrefillMediaAfterReusedPrefix`: an image turn reuses
+the conversation's text at any prompt length, and the image chunk runs on the fused
+graph. Measured on E4B (Q8_0, Metal, M5 Pro) with the IMG conversations (text, text,
+image, text; greedy; median of two rounds; the Web UI column is time to first token, the
+OpenAI column wall time for the whole non-streamed request):
+
+| Image turn 3 | 6db6dbf6 | Phase 0 | this change |
+|---|---|---|---|
+| Web UI, 457-token prompt: reused / time to first token | 0 / 0.64 s | 179 / 1.25 s | 179 / **0.57 s** |
+| OpenAI, 457-token prompt: reused / wall | 0 / 1.80 s | 179 / 2.09 s | 179 / **1.46 s** |
+| Web UI, 889-token prompt (past the window): reused / time to first token | 0 / 0.85 s | 0 / 0.90 s | 611 / **0.62 s** |
+| OpenAI, 946-token prompt (past the window): reused / wall | 0 / 1.86 s | 0 / 1.60 s | 668 / **1.29 s** |
+
+Every reply in those runs (24 short-conversation and 16 long-conversation turns) is the
+same text as the Phase 0 head's and as this change's with the prefix cache off
+(`TS_SCHED_PREFIX_CACHE=0`), and text-only turns keep their reuse and timing
+(`AgentTurnBench --scenarios short,long,tool`, two runs each: within 0.5% of 6db6dbf6 and
+of the Phase 0 head on every row, identical tokens).
+
+On CUDA (E4B Q8_0, A40, one round) the image turn gets the same reuse and runs faster
+too: Web UI 449-token prompt 1.10 s (6db6dbf6) / 2.85 s (Phase 0) / **0.93 s**, OpenAI
+1.45 / 2.49 / **0.98 s**; past the window, Web UI 893 tokens reusing 615: 1.10 / 1.12 /
+**0.91 s**, OpenAI 870 tokens reusing 592: 2.05 / 1.06 / **0.87 s**. There, however, a
+turn continued from a cache is not token-for-token the cold reply on any build: on text
+turns and image turns alike, and on 6db6dbf6 as well, the greedy reply after a reused
+prefix leaves the cold one after a few dozen to a few hundred characters, because
+prefilling the same tokens in two chunks instead of one moves the logits by 0.65 to 0.8
+on E4B with these kernels (the text control of the test below). With identical prompts,
+the Phase 0 head's image-turn reply equals this change's in the short conversation, where
+both reuse the same prefix, and differs past the window, where the Phase 0 head prefilled
+from zero.
+
+Coverage: the native `gemma4-multimodal-mask-after-reused-prefix` test keeps a verbatim
+copy of the old rows, checks they are unchanged at P = 0 and for text, and checks that a
+chunk at P > 0 sees exactly what the same queries see in a cold prefill in every buffer
+layout (the old start-position gate fails 1,102 of its 1,200 media cases).
+`Gemma4MediaAfterReusedPrefixExactnessTests` (model-gated, `TS_TEST_MODEL_DIR`) prefills a
+text turn and then an image or audio turn with and without reuse, inside and past the
+window, on the fused and the per-op path. Its tolerance is twice the larger of two noise
+estimates measured in the same row: the same split with the media left out, and the cold
+media prefill on the other path. On Metal (E4B, E2B) both estimates are about 0.02 logits,
+the fused greedy streams are identical and the prefill logits agree within 0.026, while on
+the Phase 0 head they differed by 3.2 for an image and 2.0 to 7.1 for audio past the window
+(per-op path: 3.2). On CUDA (E4B, 12B, 26B-A4B) the estimates are 0.35 to 1.4 (2.7 for
+12B's short text control), every row passes, and the Phase 0 head's long-prefix rows
+differ by 3.3 to 3.8 (image) and 2.1 (audio), above the tolerances measured for the same
+rows here (1.3 to 2.8); the greedy streams there are compared only up to the first
+near-tie within the noise, which is usually the first token or two. The per-op path's
+greedy stream is not compared token for token: it is not reproducible against itself (four
+identical cold prefills flipped a near-tie at decode step 16). `Gemma4SoftTokenMaskTests`
+pins the two position conversions.
+
+Two limits carry over from the cold path. The mask marks soft tokens, not which media item
+they belong to, so two images prefilled in the same chunk attend to each other in both
+directions. A conversation that sent an image in an earlier turn prefilled that image in
+its own chunk, where it could not see a later image; a cold prefill of the whole history
+lets it, so a reply after two images can differ between the two. And a chunk
+boundary that falls inside a span, which the scheduler's 256-token contention chunks can
+cause, splits its bidirectional attention.
 
 ### In-kernel PLE gather
 

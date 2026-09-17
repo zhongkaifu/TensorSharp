@@ -140,13 +140,12 @@ namespace TensorSharp.Runtime
         /// Whether a prompt of <paramref name="promptTokens"/> tokens whose media span
         /// lies in the part still to prefill may continue a reused prefix, i.e. prefill
         /// that media at a non-zero start position and still match a fresh prefill. True
-        /// by default. Gemma 4 returns false once the prompt outgrows its sliding window:
-        /// an image chunk prefilled after a reused prefix on a wrapped ring (the per-op
-        /// multimodal path) was measured to change the greedy output against a cold
-        /// prefill, while the same turn within the window matched it. Such a turn then
-        /// reuses nothing past its public prefix (SequenceState.SharedPrefixTokens): the
-        /// prefill is cut there for the shared-prefix checkpoint anyway, so cloning the
-        /// checkpoint changes nothing, and without a public prefix it prefills from zero.
+        /// by default, and true for every shipped model. A model that returns false has
+        /// such a turn reuse nothing past its public prefix
+        /// (SequenceState.SharedPrefixTokens): the prefill is cut there for the
+        /// shared-prefix checkpoint anyway, so cloning the checkpoint changes nothing, and
+        /// without a public prefix it prefills from zero. (Gemma 4 returned false past its
+        /// sliding window until its image chunks after a reused prefix were made exact.)
         /// </summary>
         bool CanPrefillMediaAfterReusedPrefix(int promptTokens) => true;
 

@@ -391,13 +391,10 @@ namespace TensorSharp.Models
             if (!_tpFusedDecodeReady || n <= 1)
                 return false;
 
-            byte[] isExcept = null;
-            if (exceptPositions != null && exceptPositions.Count > 0 && startPos == 0)
-            {
-                isExcept = new byte[n];
-                foreach (int p in exceptPositions)
-                    if (p >= 0 && p < n) isExcept[p] = 1;
-            }
+            // One byte per chunk token at any startPos. This used to be built only
+            // at startPos 0, so a media chunk after a prefix ran here with no
+            // soft-token mask at all (plain causal attention over the image).
+            byte[] isExcept = ChunkSoftTokenMask(exceptPositions, startPos, n);
 
             int tp = TpDegree;
             float* hiddenPtr = GetFloatPtr(hidden);
