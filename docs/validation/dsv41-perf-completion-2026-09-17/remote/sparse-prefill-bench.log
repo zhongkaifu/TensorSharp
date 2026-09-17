@@ -1,0 +1,8 @@
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 45498 MiB):
+  Device 0: NVIDIA A40, compute capability 8.6, VMM: yes, VRAM: 45498 MiB
+SPARSE_GATE queries<=8 dense; queries>8 keys>=8192 capacity=640; keys=8191 dense; env=0 dense
+DSV41_PREFILL_GATE queries=512 keys=33536 TS_DSV41_SPARSE_FA=(unset) capacity=640 kernel=owned-sparse-f32
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ggml_backend_cuda_graph_compute: CUDA graph warmup complete
+ATTENTION_BENCH implementation=decomposed-f32 queries=512 keys=33536 heads=64 head=512 visible_capacity=640 median_us=203315.8 mean_us=203706.9 min_us=203159.3 max_us=204419.8 buffer_bytes=4598530304 samples_us=[204379.7,204419.8,203159.3,203315.8,203260.0]
+ATTENTION_BENCH implementation=owned-sparse-f32 queries=512 keys=33536 heads=64 head=512 visible_capacity=640 median_us=34904.0 mean_us=34820.3 min_us=34620.7 max_us=34955.4 buffer_bytes=271583488 samples_us=[34925.4,34904.0,34955.4,34695.8,34620.7] max_abs=1.1175871e-07 rel_l2=7.445791e-07 speedup=5.8250 failures=0

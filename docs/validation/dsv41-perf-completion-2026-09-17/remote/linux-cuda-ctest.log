@@ -1,0 +1,74 @@
+Internal ctest changing into directory: /tmp/ts-codex-20260917-dsv41-native-make
+Test project /tmp/ts-codex-20260917-dsv41-native-make
+      Start  1: qwen4exp-qsa-position-plan
+ 1/31 Test  #1: qwen4exp-qsa-position-plan ....................   Passed    0.01 sec
+      Start  2: deepseek41-engram-parallel-io
+ 2/31 Test  #2: deepseek41-engram-parallel-io .................   Passed    1.24 sec
+      Start  3: deepseek41-host-file-warm
+ 3/31 Test  #3: deepseek41-host-file-warm .....................   Passed    0.06 sec
+      Start  4: deepseek41-engram-mapped-advice
+ 4/31 Test  #4: deepseek41-engram-mapped-advice ...............   Passed    0.01 sec
+      Start  5: deepseek41-tp-worker-lifetime
+ 5/31 Test  #5: deepseek41-tp-worker-lifetime .................   Passed    0.02 sec
+      Start  6: deepseek41-moe-tensor-parallel
+ 6/31 Test  #6: deepseek41-moe-tensor-parallel ................   Passed   11.33 sec
+      Start  7: deepseek41-tp-failure-recovery
+ 7/31 Test  #7: deepseek41-tp-failure-recovery ................   Passed    0.13 sec
+      Start  8: deepseek41-quantized-strip-projections-cuda
+ 8/31 Test  #8: deepseek41-quantized-strip-projections-cuda ...   Passed   67.06 sec
+      Start  9: deepseek41-moe-tensor-parallel-cuda-2
+ 9/31 Test  #9: deepseek41-moe-tensor-parallel-cuda-2 .........***Skipped   0.59 sec
+      Start 10: deepseek41-moe-tensor-parallel-cuda-4
+10/31 Test #10: deepseek41-moe-tensor-parallel-cuda-4 .........***Skipped   0.58 sec
+      Start 11: deepseek41-moe-tensor-parallel-cuda-7
+11/31 Test #11: deepseek41-moe-tensor-parallel-cuda-7 .........***Skipped   0.54 sec
+      Start 12: deepseek41-moe-tensor-parallel-cuda-8
+12/31 Test #12: deepseek41-moe-tensor-parallel-cuda-8 .........***Skipped   0.63 sec
+      Start 13: scheduler-seventeen-backends
+13/31 Test #13: scheduler-seventeen-backends ..................   Passed    0.01 sec
+      Start 14: scheduler-allocation-failure-recovery
+14/31 Test #14: scheduler-allocation-failure-recovery .........   Passed    0.01 sec
+      Start 15: cuda-scheduler-allocation-failure-recovery
+15/31 Test #15: cuda-scheduler-allocation-failure-recovery ....   Passed    0.72 sec
+      Start 16: deepseek41-compact-raw-gather
+16/31 Test #16: deepseek41-compact-raw-gather .................   Passed    0.13 sec
+      Start 17: deepseek41-truncate-guards
+17/31 Test #17: deepseek41-truncate-guards ....................   Passed    1.19 sec
+      Start 18: deepseek41-dspark-ring-guards
+18/31 Test #18: deepseek41-dspark-ring-guards .................   Passed    1.20 sec
+      Start 19: deepseek41-retention-budget
+19/31 Test #19: deepseek41-retention-budget ...................   Passed    0.00 sec
+      Start 20: deepseek41-activation-quant-candidates
+20/31 Test #20: deepseek41-activation-quant-candidates ........   Passed    0.01 sec
+      Start 21: deepseek41-sparse-flash-attention-cuda
+21/31 Test #21: deepseek41-sparse-flash-attention-cuda ........   Passed   25.59 sec
+      Start 22: deepseek41-activation-quant-candidates-cuda
+22/31 Test #22: deepseek41-activation-quant-candidates-cuda ...   Passed    0.76 sec
+      Start 23: cpu-explicit-f32-matmul
+23/31 Test #23: cpu-explicit-f32-matmul .......................   Passed    0.97 sec
+      Start 24: cpu-explicit-f32-attention
+24/31 Test #24: cpu-explicit-f32-attention ....................   Passed    8.96 sec
+      Start 25: attention-exception-boundary
+25/31 Test #25: attention-exception-boundary ..................   Passed    0.01 sec
+      Start 26: cpu-q8-f32-projection
+26/31 Test #26: cpu-q8-f32-projection .........................   Passed    2.69 sec
+      Start 27: cuda-explicit-f32-matmul
+27/31 Test #27: cuda-explicit-f32-matmul ......................   Passed    1.96 sec
+      Start 28: cuda-explicit-f32-attention
+28/31 Test #28: cuda-explicit-f32-attention ...................   Passed    3.45 sec
+      Start 29: cuda-q8-f32-projection
+29/31 Test #29: cuda-q8-f32-projection ........................   Passed    2.67 sec
+      Start 30: attention-allocation
+30/31 Test #30: attention-allocation ..........................   Passed    0.50 sec
+      Start 31: deepseek4-ubatch-plan
+31/31 Test #31: deepseek4-ubatch-plan .........................   Passed    0.00 sec
+
+100% tests passed, 0 tests failed out of 31
+
+Total Test time (real) = 133.06 sec
+
+The following tests did not run:
+	  9 - deepseek41-moe-tensor-parallel-cuda-2 (Skipped)
+	 10 - deepseek41-moe-tensor-parallel-cuda-4 (Skipped)
+	 11 - deepseek41-moe-tensor-parallel-cuda-7 (Skipped)
+	 12 - deepseek41-moe-tensor-parallel-cuda-8 (Skipped)

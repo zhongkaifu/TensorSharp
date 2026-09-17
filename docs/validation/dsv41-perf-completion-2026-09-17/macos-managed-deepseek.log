@@ -1,0 +1,15 @@
+Test run for /Users/zhongkaifu/work/TensorSharp/.claude/worktrees/dsv41-perf/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll (.NETCoreApp,Version=v10.0)
+A total of 1 test files matched the specified pattern.
+[xUnit.net 00:00:00.66]     InferenceWeb.Tests.DeepSeekTeacherTokenExportFixture.ExportPinned113RequestsMetadataOnly [SKIP]
+  Skipped InferenceWeb.Tests.DeepSeekTeacherTokenExportFixture.ExportPinned113RequestsMetadataOnly [1 ms]
+[xUnit.net 00:00:00.73]     InferenceWeb.Tests.DeepSeek41KvCacheDtypeFixtureTests.FloatRequestsLoadAndReportTheF16TheExecutorUses [SKIP]
+[xUnit.net 00:00:00.73]     InferenceWeb.Tests.DeepSeek41KvCacheDtypeFixtureTests.BlockQuantizedRequestIsRefusedBeforeTheNativeLoad [SKIP]
+  Skipped InferenceWeb.Tests.DeepSeek41KvCacheDtypeFixtureTests.FloatRequestsLoadAndReportTheF16TheExecutorUses [1 ms]
+  Skipped InferenceWeb.Tests.DeepSeek41KvCacheDtypeFixtureTests.BlockQuantizedRequestIsRefusedBeforeTheNativeLoad [1 ms]
+[xUnit.net 00:00:01.79]     InferenceWeb.Tests.DeepSeekTeacherTokenExporterTests.All113PinnedBodiesTraverseProductionPreprocessingWithSyntheticTokenizer [SKIP]
+  Skipped InferenceWeb.Tests.DeepSeekTeacherTokenExporterTests.All113PinnedBodiesTraverseProductionPreprocessingWithSyntheticTokenizer [1 ms]
+[xUnit.net 00:00:02.00]     InferenceWeb.Tests.DeepSeek4NativeSpecBoundaryTests.AutomaticPrefillWidthOnCudaTakesTheWidestCandidateThatFits [SKIP]
+  Skipped InferenceWeb.Tests.DeepSeek4NativeSpecBoundaryTests.AutomaticPrefillWidthOnCudaTakesTheWidestCandidateThatFits [1 ms]
+Results File: /tmp/dsv4-perf-managed/dsv4-perf-managed-deepseek.trx
+
+Passed!  - Failed:     0, Passed:   509, Skipped:     5, Total:   514, Duration: 1 s - InferenceWeb.Tests.dll (net10.0)
