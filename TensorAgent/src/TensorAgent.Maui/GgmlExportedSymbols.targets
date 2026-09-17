@@ -244,6 +244,7 @@
     <ReferenceNativeSymbol Include="TSGgml_Qwen35ResetVerifyCache" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Qwen35ResetVerifyCacheForHostPointer" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Qwen35ResetVerifyCacheOwner" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_Qwen35RopePositionAbi" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Qwen35VisionEncoderF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpArenaDecodeBatched" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpArenaFlushHostPointer" SymbolType="Function" />

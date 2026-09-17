@@ -1428,7 +1428,10 @@ namespace TensorSharp.Models
                     total += GdnLayerStateBytes(l);
                 }
             }
-            return total;
+            // The M-RoPE delta as of the block's end, like the recurrent state: a
+            // sequence swapped out after an image and swapped back in must keep
+            // rotating its next tokens at KV index + delta.
+            return total + sizeof(int);
         }
 
         public override bool TryExtractKVBlock(int startToken, int tokenCount, Span<byte> destination)
@@ -1462,18 +1465,16 @@ namespace TensorSharp.Models
                     offset += wG;
                 }
             }
-            return offset == destination.Length;
+            if (destination.Length - offset != sizeof(int))
+                return false;
+            System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(destination[offset..], _ropeDelta);
+            return true;
         }
 
         public override bool TryInjectKVBlock(int destToken, int tokenCount, ReadOnlySpan<byte> source)
         {
             if (!SupportsKVStateSnapshot) return false;
             if (destToken != _cacheSeqLen) return false;
-            // A block carries no M-RoPE delta. One injected at the start of an empty
-            // cache begins a new history; the prompt suffix after injected blocks is
-            // forwarded with its position table, which settles the delta again.
-            if (destToken == 0)
-                _ropeDelta = 0;
             long expected = ComputeKVBlockByteSize(tokenCount);
             if (source.Length != expected) return false;
 
@@ -1499,7 +1500,11 @@ namespace TensorSharp.Models
                     offset += rG;
                 }
             }
+            if (source.Length - offset != sizeof(int))
+                return false;
             _cacheSeqLen = destToken + tokenCount;
+            // The delta as of this block's end (see ComputeKVBlockByteSize).
+            _ropeDelta = System.Buffers.Binary.BinaryPrimitives.ReadInt32LittleEndian(source[offset..]);
 
             // Invalidate any device-cached views so the next forward refills them
             // from the freshly-written host buffers. Drop native graphs first:
