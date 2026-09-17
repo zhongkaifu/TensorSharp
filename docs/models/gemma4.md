@@ -612,6 +612,92 @@ layers. `AttentionDecodeCircular()` traverses the circular buffer for read.
 SWA layers therefore allocate `slidingWindow` slots regardless of context
 length — the resident set is bounded.
 
+### Token-batched fused decode for concurrent requests (`Gemma4ModelDecodeBatchedEx`)
+
+With N >= 2 requests in flight the engine does not round-robin N single-token
+graphs: `Gemma4Model.TryForwardBatchedFusedDecode` decodes one token for every
+sequence in ONE fused graph (`TSGgml_Gemma4ModelDecodeBatchedEx` in
+[`ggml_ops_gemma4_batched.cpp`](../../TensorSharp.GGML.Native/ggml_ops_gemma4_batched.cpp)),
+so every weight is loaded once per step and applied to N tokens. Decode is
+bandwidth-bound, which is where the aggregate throughput comes from. Each
+sequence keeps its own per-request KV holder; the kernel takes the holders as a
+`[layer * N + seq]` pointer array, runs the projections / FFN / LM head over
+`[hidden, N]`, and runs one single-row flash-attention per sequence over a
+direct view of that sequence's cache window.
+
+The v1 kernel covered dense models without per-layer embeddings, without
+shared-KV layers and only while every sequence fitted its SWA ring, so the
+E2B/E4B checkpoints (PLE dim 256, 18 KV-donor layers, a 512-slot ring most
+chats outgrow) always declined and the server logged "The model declined the
+default batched fused-decode path ... concurrency stays near 1x". The `Ex`
+entry closes those three gaps:
+
+- **PLE per row.** The per-layer embeddings are gathered *inside* the graph
+  from the resident quantized `per_layer_token_embd` table with one
+  `get_rows` over the N token ids (plus the `per_layer_model_proj` projection,
+  its RMSNorm and the `1/sqrt(2)` combine, exactly as the single-token decode
+  and `ComputePLE`), and injected per layer as a strided `[ple_dim, N]` column
+  slice. When the in-kernel form is unavailable (`CanGatherPleInKernel` false:
+  an unsupported `get_rows` type or a scaled projection) the caller uploads
+  `ComputePLE`'s rows instead, so the PLE term is never dropped.
+- **KV-donor layers.** `kv_source_arr[l]` names the layer whose cache layer
+  `l` attends. A shared layer runs the Q-only projection and reads the donor's
+  per-sequence window and mask; it writes nothing.
+- **SWA wrap.** A local layer whose sequence is past its ring writes at
+  `pos % cache_size` and reads the whole ring flat with every slot valid; decode
+  softmax is permutation-invariant over keys, so the rotation needs no concat.
+  Global (linear) layers must still fit their cache; the round-robin fallback
+  grows them and the next step re-enters the batched path.
+
+The native side reports what it supports through
+`TSGgml_Gemma4BatchedDecodeCapabilities()` (bits: PLE, KV donor, SWA wrap).
+The managed gate keeps the v1 restriction for every bit the loaded native
+library lacks, so an older `libGgmlOps` (no probe symbol) behaves exactly as
+before, and `TSGgml_Gemma4ModelDecodeBatched` keeps its v1 ABI as a thin
+wrapper. `TS_GEMMA4_BATCHED_CAPS=0` forces the v1 gates for an A/B.
+
+CUDA-graph capture is unchanged: every per-step input (hidden rows,
+positions, per-(layer, seq) `set_rows` write rows, per-layer F16 masks, the
+PLE token ids or uploaded PLE rows) is a graph input refreshed with
+`ggml_backend_tensor_set`, and the graph lives in its own context and own-slot
+buffer, so a recurring request set replays a captured graph at stable
+addresses. The MoE batched kernel (`TSGgml_Gemma4MoEModelDecodeBatched`) keeps
+its no-PLE / no-donor scope.
+
+**Verified** ([`Gemma4BatchedFusedDecodeParityTests`](../../InferenceWeb.Tests/Gemma4BatchedFusedDecodeParityTests.cs),
+`TS_TEST_GGML_BACKEND=cuda`, gemma-4-E4B-it-Q8_0): for 2, 3 and 4 concurrent
+sequences, one of them prefilled past the 512-token SWA ring, the 12-step greedy
+continuations of the batched path equal the round-robin single-token decodes
+token for token, and every step ran on the batched kernel.
+
+**Measured** (gemma-4-E4B-it-Q8_0, NVIDIA A40, ggml_cuda, f16 KV, prefill
+chunk 512, 4 running sequences; the round-robin column forces the v1 gates with
+`TS_GEMMA4_BATCHED_CAPS=0`, everything else identical):
+
+| Workload | Round-robin (before) | Token-batched (after) | Ratio |
+|---|---:|---:|---:|
+| AgentTurnBench `conc`, 1 request (decode tok/s) | 68.8 | 68.5 | 1.0× |
+| AgentTurnBench `conc`, 2 concurrent (aggregate decode tok/s) | 65.1 | 99.0 | 1.5× |
+| AgentTurnBench `conc`, 4 concurrent (aggregate decode tok/s) | 66.5 | 148.7 | 2.2× |
+| `validate_inference.py` `decode` (512 new tokens), concurrency 1 (end-to-end tok/s) | 76.8 | 77.7 | 1.0× |
+| `validate_inference.py` `decode`, concurrency 4 (aggregate end-to-end tok/s) | 70.3 | 148.6 | 2.1× |
+| `validate_inference.py` `decode_8k` (8k prompt), concurrency 1 | 63.8 | 64.3 | 1.0× |
+| `validate_inference.py` `decode_8k`, concurrency 4 | 59.0 | 101.7 | 1.7× |
+
+The `validate_inference.py` rows compare the server built from this tree
+against the server built from the previous commit; their solo (concurrency 1)
+outputs are byte-identical. What "token for token" does and does not mean
+here: the AgentTurnBench `conc` streams (`compare.py`, identical output token
+ids required) and the 12-step in-process parity test match the round-robin
+decode exactly, but over hundreds of greedy tokens a low-margin token can flip
+(`ParityHarness --batched` at 256 steps: one of the sequences in each 2/3/4-way
+set diverged), and the pre-existing v1 kernel does the same on gemma-4-12B
+(no PLE, no shared KV) under the identical run — batching changes GEMM shapes
+and therefore rounding, the caveat already documented for the GLM batched
+decode. Through the HTTP server at concurrency 4 even two round-robin runs
+differ (10/16 identical cases), because prefill/decode interleaving is
+scheduling-dependent, so parity has to be judged in-process.
+
 ## 10. Memory and KV cache strategy
 
 - **SWA layers**: capacity `_slidingWindow` slots, circular write/read via

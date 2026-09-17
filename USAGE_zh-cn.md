@@ -1576,7 +1576,7 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model <model.gg
 | 模型 | 默认状态 | 切换默认的环境变量 | 原生内核子开关 |
 |---|---|---|---|
 | Mistral 3 | 启用 | — | `TS_PAGED_ATTN_KERNEL` = `native`（默认）/ `tensor` / `managed` |
-| Gemma 4 | 启用 | `TS_GEMMA4_BATCHED=0` 强制走旧的按序列路径 | — |
+| Gemma 4 | 启用 | `TS_GEMMA4_BATCHED=0` 强制走旧的按序列路径 | `TS_GEMMA4_BATCHED_CAPS=0` 强制 token 批量融合 decode 内核的 v1 门控（PLE / 共享 KV / 已回绕 SWA 的模型如 E2B/E4B 改为轮询 decode） |
 | Qwen 3.5 / 3.6 系列 | 启用 | `TS_QWEN35_BATCHED=0` 强制走旧的按序列路径（或 `--no-continuous-batching`） | `TS_QWEN35_BATCHED_GDN_NATIVE=1` 启用原生批处理 GDN 内核；`FUSED_ATTN_LAYER_MIN_SEQ_LEN=N` 覆盖融合注意力启用阈值（默认 4096） |
 | GPT OSS | 启用 | `TS_GPTOSS_BATCHED=0` 强制走旧的按序列路径 | `TS_GPTOSS_PAGED_ATTN_MANAGED=1` 强制使用托管 (C#) sinks softmax，而非原生带 sinks 的分页注意力内核 |
 | Nemotron-H | 启用 | `TS_NEMOTRON_BATCHED=0` 强制走旧的按序列路径 | `TS_NEMOTRON_MAMBA2_BATCHED_NATIVE=1` 启用原生批处理 Mamba2 步（NEON SIMD + GCD 并行） |

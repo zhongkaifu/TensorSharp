@@ -114,7 +114,9 @@
     <ReferenceNativeSymbol Include="TSGgml_Gemma4MoEReleaseVerifyTpGraphs" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Gemma4MoEResetDecodeCache" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Gemma4ModelDecode" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_Gemma4BatchedDecodeCapabilities" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Gemma4ModelDecodeBatched" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_Gemma4ModelDecodeBatchedEx" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Gemma4ModelVerify" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Gemma4ReleaseVerifyTpGraphs" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Gemma4ResetBatchedDecodeCache" SymbolType="Function" />
