@@ -52,6 +52,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -338,7 +339,8 @@ inline void populate(const void * p, uint64_t bytes)
 #endif
 
 // Read every byte of `ranges` into the page cache (see the header comment).
-// Never throws; a failure is reported in the result with the path and offset.
+// I/O and worker failures are reported in the result. Planning allocations may
+// throw to the caller, before any workers are started.
 inline file_warm_result warm_file_ranges(const std::vector<std::string> & paths,
                                          const std::vector<file_warm_range> & ranges,
                                          const file_warm_options & options)
@@ -372,6 +374,14 @@ inline file_warm_result warm_file_ranges(const std::vector<std::string> & paths,
     std::atomic<bool> failed(false), stopped(false);
     std::atomic<uint64_t> bytes_read(0), bytes_resident(0);
     std::mutex error_mu;
+    std::exception_ptr worker_error;
+    auto capture_exception = [&]()
+    {
+        std::lock_guard<std::mutex> lock(error_mu);
+        // Defer formatting until after every thread has joined: a worker may
+        // be reporting an allocation failure, so its catch must not allocate.
+        if (!failed.exchange(true)) worker_error = std::current_exception();
+    };
     auto fail = [&](const std::string & message)
     {
         std::lock_guard<std::mutex> lock(error_mu);
@@ -380,12 +390,13 @@ inline file_warm_result warm_file_ranges(const std::vector<std::string> & paths,
 
     auto worker = [&](int k)
     {
-        std::vector<int> fds(paths.size(), -1);
+        std::vector<int> fds;
         std::unique_ptr<char[]> buffer;
         std::vector<unsigned char> residency;
         // Returns at the first failure or stop; the descriptors close below.
         auto run = [&]()
         {
+            fds.assign(paths.size(), -1);
             for (const file_warm_piece & piece : plan[(size_t) k])
             {
                 const file_warm_range & range = merged[piece.range];
@@ -458,7 +469,14 @@ inline file_warm_result warm_file_ranges(const std::vector<std::string> & paths,
                 }
             }
         };
-        run();
+        try
+        {
+            run();
+        }
+        catch (...)
+        {
+            capture_exception();
+        }
         for (int fd : fds) if (fd >= 0) ::close(fd);
     };
 
@@ -468,12 +486,19 @@ inline file_warm_result warm_file_ranges(const std::vector<std::string> & paths,
     {
         for (int k = 1; k < (int) plan.size(); ++k) pool.emplace_back(worker, k);
     }
-    catch (const std::exception & e)
+    catch (...)
     {
-        fail(std::string("cannot start warm threads: ") + e.what());
+        capture_exception();
     }
     worker(0);
     for (auto & th : pool) th.join();
+
+    if (worker_error)
+    {
+        try { std::rethrow_exception(worker_error); }
+        catch (const std::exception & e) { result.error = std::string("warm worker failed: ") + e.what(); }
+        catch (...) { result.error = "warm worker failed: unknown exception"; }
+    }
 
     result.ok = !failed.load();
     result.stopped = stopped.load();

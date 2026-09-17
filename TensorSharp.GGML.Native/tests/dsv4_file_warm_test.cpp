@@ -394,6 +394,31 @@ static void test_file_warm()
         check(r.ok && r.stopped && r.bytes_read == 0, "a stop set beforehand must read nothing");
     }
 
+    // An exception in either the calling-thread worker or a spawned worker
+    // must return an error rather than terminate the serving process. A later
+    // warm still works after the failed workers have joined and closed files.
+    for (int failing_thread : { 0, 1 })
+    {
+        file_warm_options s;
+        s.threads = 2;
+        s.block_bytes = MiB;
+        s.skip_resident = false;
+        s.on_block = [failing_thread](int thread, int, uint64_t, uint64_t, bool)
+        {
+            if (thread == failing_thread) throw std::runtime_error("injected warm failure");
+        };
+        r = warm_file_ranges(paths, ranges, s);
+        check(!r.ok && r.error.find("injected warm failure") != std::string::npos,
+              "thread %d exception must become a warm failure: '%s'", failing_thread, r.error.c_str());
+        s.on_block = [](int, int, uint64_t, uint64_t, bool) { throw 7; };
+        r = warm_file_ranges(paths, ranges, s);
+        check(!r.ok && r.error.find("unknown exception") != std::string::npos,
+              "a non-standard worker exception must become a warm failure: '%s'", r.error.c_str());
+        s.on_block = {};
+        r = warm_file_ranges(paths, ranges, s);
+        check(r.ok && r.bytes_read == total, "retry after a worker exception failed: '%s'", r.error.c_str());
+    }
+
     // A truncated file fails with its path and the offset where the data ends.
     {
         const std::string c = dir.create("truncated.gguf", 5 * MiB + 17);
