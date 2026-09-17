@@ -159,19 +159,32 @@ namespace TensorSharp.Server
                     }
 
                     TurnRecord match = null;
+                    bool ownerAmbiguous = false;
                     if (_chains.TryGetValue(Convert.ToHexString(chain), out ChainEntry entry))
                     {
                         foreach (TurnRecord candidate in entry.Records)
                         {
-                            if (EmittedMatches(src, candidate))
+                            if (!EmittedMatches(src, candidate))
+                                continue;
+                            if (match == null)
                             {
-                                match = candidate;
+                                match = candidate;   // newest: its tokens are spliced
+                            }
+                            else if (!string.Equals(candidate.Scope, match.Scope, StringComparison.Ordinal))
+                            {
+                                ownerAmbiguous = true;
                                 break;
                             }
                         }
                         if (match != null)
                             Touch(entry);
                     }
+                    // Two conversations were sent the same answer after the same history
+                    // (a greedy reply to a common opening): the content proves no more
+                    // than that, so the request continues NEITHER one's cache scope.
+                    // Picking one let anyone who reproduced an opening move the next
+                    // turns of the conversation that had it first into their own scope.
+                    string matchScope = ownerAmbiguous ? null : match?.Scope;
 
                     string nextRole = i + 1 < incoming.Count ? incoming[i + 1].Role : null;
                     if (match == null || (match.Replacement.Count > 1 && nextRole == "tool"))
@@ -185,7 +198,7 @@ namespace TensorSharp.Server
                         result.Add(SpliceOnto(src, match.Replacement[0]));
                         spliced++;
                         if (i == lastAssistant)
-                            inheritedScope = match.Scope;
+                            inheritedScope = matchScope;
                     }
                     else
                     {
@@ -196,7 +209,7 @@ namespace TensorSharp.Server
                         result.AddRange(expanded);
                         spliced++;
                         if (i == lastAssistant)
-                            inheritedScope = match.Scope;
+                            inheritedScope = matchScope;
                     }
 
                     // The chain continues over what the CLIENT sent, so the next turn's
@@ -214,8 +227,9 @@ namespace TensorSharp.Server
         /// raw tokens, <paramref name="emitted"/> what the client was sent for them. When
         /// the history ends with the in-process tool loop's own rounds, the record is that
         /// whole transcript, keyed by the client-visible history before it. Earlier records
-        /// of other conversations are never touched; a newer record of the same scope at
-        /// the same position replaces the older one (a retry or regenerate).
+        /// of other conversations are never touched (not even one with the same answer); a
+        /// newer record of the same scope at the same position replaces the older one (a
+        /// retry or regenerate).
         /// </summary>
         public void Record(
             IReadOnlyList<ChatMessage> history,
@@ -278,8 +292,11 @@ namespace TensorSharp.Server
                 for (int r = entry.Records.Count - 1; r >= 0; r--)
                 {
                     TurnRecord old = entry.Records[r];
-                    if (string.Equals(old.Scope, scope, StringComparison.Ordinal)
-                        || SameEmitted(old.Emitted, record.Emitted))
+                    // Only this conversation's own earlier record (a retry or regenerate).
+                    // Another conversation's record stays even when its answer reads the
+                    // same: dropping it made that conversation's next turn continue this
+                    // one's scope.
+                    if (string.Equals(old.Scope, scope, StringComparison.Ordinal))
                     {
                         _tokens -= old.Tokens;
                         entry.Records.RemoveAt(r);
@@ -434,10 +451,6 @@ namespace TensorSharp.Server
                     newlines++;
             return newlines >= 2;
         }
-
-        private static bool SameEmitted(EmittedAssistantTurn a, EmittedAssistantTurn b)
-            => string.Equals(Squash(a.Content), Squash(b.Content), StringComparison.Ordinal)
-                && ToolCallsEqual(a.ToolCalls, b.ToolCalls);
 
         /// <summary>Whitespace is not content: an adapter or client that trims, or
         /// re-flows line endings, still sent back what it was given.</summary>

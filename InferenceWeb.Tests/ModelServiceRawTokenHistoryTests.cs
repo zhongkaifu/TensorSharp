@@ -334,6 +334,45 @@ public class ModelServiceRawTokenHistoryTests
     }
 
     /// <summary>
+    /// Two unrelated conversations sent the same answer after the same history (a greedy
+    /// reply to a common opening). The later one's record used to REPLACE the earlier
+    /// one's, so the earlier conversation's next turn continued the later one's cache
+    /// scope: anyone who reproduced an opening could pull that conversation's following
+    /// turns into their own scope. Content proves neither owner, so neither scope is
+    /// inherited; each conversation's own record is kept and the tokens still splice.
+    /// </summary>
+    [Fact]
+    public void Augment_SameAnswerSentToTwoConversations_InheritsNeitherScope()
+    {
+        var store = NewStore();
+        var opening = new List<ChatMessage> { new() { Role = "user", Content = "hi" } };
+        store.Record(opening, Generated("Hello! How can I help?", new List<int> { 1, 2 }),
+            Emitted("Hello! How can I help?"), scope: "victim");
+        store.Record(opening, Generated("Hello! How can I help?", new List<int> { 1, 2 }),
+            Emitted("Hello! How can I help?"), scope: "other");
+
+        var next = store.Augment(new List<ChatMessage>
+        {
+            new() { Role = "user", Content = "hi" },
+            new() { Role = "assistant", Content = "Hello! How can I help?" },
+            new() { Role = "user", Content = "my private follow-up" },
+        });
+
+        Assert.Equal(new[] { 1, 2 }, next.History[1].RawOutputTokens);
+        Assert.Null(next.InheritedScope);
+
+        // A retry within one conversation still replaces its own record.
+        store.Record(opening, Generated("Hi there.", new List<int> { 3 }), Emitted("Hi there."), scope: "victim");
+        var retried = store.Augment(new List<ChatMessage>
+        {
+            new() { Role = "user", Content = "hi" },
+            new() { Role = "assistant", Content = "Hi there." },
+            new() { Role = "user", Content = "next" },
+        });
+        Assert.Equal("victim", retried.InheritedScope);
+    }
+
+    /// <summary>
     /// A file-backed attachment (a CSV the tool loop reads from the workspace) is not in
     /// the message content, and a recorded tool transcript's results were computed from
     /// its bytes. Another conversation that sends the same words and the same final

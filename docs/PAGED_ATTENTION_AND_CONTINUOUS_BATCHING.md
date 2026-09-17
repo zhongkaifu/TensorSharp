@@ -319,13 +319,13 @@ checkpoint longer than its own public prefix. The scope comes from the chat laye
 | Request | Scope |
 |---|---|
 | Web UI / TensorAgent with a `sessionId` | the session and its new-chat epoch (`newChat:true` starts a new one) |
-| OpenAI Chat / Responses, Ollama chat, Web UI without a `sessionId` | the conversation the request's history proves it continues: its last assistant message is a turn this server generated and sent (see below); otherwise a fresh scope |
+| OpenAI Chat / Responses, Ollama chat, Web UI without a `sessionId` | the conversation the request's history proves it continues: its last assistant message is a turn this server generated and sent (see below), and sent to that conversation only; otherwise (including when two conversations were sent the same turn after the same history, such as a greedy reply to a common opening) a fresh scope |
 | Skills / code tool-loop rounds | the scope of the client turn that started the loop |
 | Engine callers that set no scope (benchmarks, the CLI) | unscoped, which matches every scope (unchanged behaviour) |
 
 The chat layer's raw-token splice follows the same identity. Each generated turn is
 recorded under the content-hash chain of the client-visible history that preceded
-it (roles, content, tool calls, media by content), with the raw output tokens AND
+it (roles, content, tool calls, media and attached files by content), with the raw output tokens AND
 what the client was sent for them (the parsed content and tool calls, or the raw
 text). A later assistant message is rendered from the recorded tokens only when it
 equals that emitted form, ignoring whitespace; an assistant message a client wrote or
