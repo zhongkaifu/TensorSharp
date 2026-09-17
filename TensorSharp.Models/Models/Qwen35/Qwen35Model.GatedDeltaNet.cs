@@ -1497,12 +1497,22 @@ namespace TensorSharp.Models
                 _fdGdnSlot = new int[n];
                 for (int l = 0; l < n; l++)
                     _fdGdnSlot[l] = _isRecurrent[l] ? gdnCount++ : -1;
-                // The conv scratch is per-request-cache state (the per-seq fused
-                // path swaps _fdConvScratch via the holder); only allocate the
-                // primary/default one here if a holder hasn't already bound one.
-                if (_fdConvScratch == IntPtr.Zero)
-                    _fdConvScratch = Marshal.AllocHGlobal(Math.Max(1, gdnCount) * convDim * qkvDim * sizeof(float));
                 _fdLayers = new Qwen35LayerDecodeArgs[n];
+            }
+
+            // The conv scratch is per-request-cache state: a holder brings its own and
+            // the per-seq fused path swaps _fdConvScratch with it. The primary cache
+            // gets one the first time IT decodes, which is not necessarily the model's
+            // first fused decode: when a holder ran that one, the one-time gate above
+            // is already past and the primary had none (its first decode wrote the
+            // conv reseed through a null pointer).
+            if (_fdConvScratch == IntPtr.Zero)
+            {
+                int gdnLayers = 0;
+                foreach (int slot in _fdGdnSlot)
+                    if (slot >= 0) gdnLayers++;
+                _fdConvScratch = Marshal.AllocHGlobal(Math.Max(1, gdnLayers) * convDim * qkvDim * sizeof(float));
+                _fdStateResident = false;
             }
 
             int cacheSize = 0;
