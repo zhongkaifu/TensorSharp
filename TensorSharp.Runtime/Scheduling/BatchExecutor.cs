@@ -732,6 +732,14 @@ namespace TensorSharp.Runtime.Scheduling
                 ClearLinearOwner();
         }
 
+        /// <summary>Give <paramref name="seq"/> its own copy of logits it may be
+        /// borrowing from the model's reusable output buffer.</summary>
+        private static void DetachBorrowedLogits(SequenceState seq)
+        {
+            if (seq?.LastLogits != null)
+                seq.LastLogits = (float[])seq.LastLogits.Clone();
+        }
+
         private void ClearLinearOwner()
         {
             _currentOwner = null;
@@ -3216,6 +3224,15 @@ namespace TensorSharp.Runtime.Scheduling
             // or live-cache adoption by a different request), which orphans the
             // MTP draft head's cache and pending hidden state.
             _specCtx = null;
+
+            // A step that forwarded the outgoing owner alone let it BORROW the
+            // model's logits buffer (see ExecuteStepPerSequence), on the promise
+            // that it samples before the next Forward. The incoming sequence's
+            // Forward breaks that promise: the owner would later sample its next
+            // token from another request's logits. Seen as the first request of
+            // a concurrent burst answering with nothing, or with another prompt's
+            // content. Detach it here, once per ownership change.
+            DetachBorrowedLogits(_currentOwner);
 
             // Live-cache continuation: the new sequence's prompt extends exactly the
             // tokens still resident in the model's live KV cache (planned by the

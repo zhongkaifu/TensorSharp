@@ -3419,6 +3419,27 @@ namespace TensorSharp.GGML
         public static void NemotronMamba2DecodeClear(ulong modelKey) =>
             GgmlNative.NemotronMamba2DecodeClear(modelKey);
 
+        /// <summary>
+        /// Copy the device-resident recurrent state that <see cref="NemotronMamba2Decode"/>
+        /// keeps for <paramref name="stateKey"/> back into the host arrays. Returns false when
+        /// the native library has no entry for the key (the host arrays are authoritative).
+        /// Throws <see cref="EntryPointNotFoundException"/> against a native library that
+        /// predates the export.
+        /// </summary>
+        public static unsafe bool NemotronMamba2DecodeReadState(ulong stateKey, float[] convState, float[] ssmState)
+        {
+            if (stateKey == 0)
+                throw new ArgumentException("stateKey must be non-zero.", nameof(stateKey));
+            ArgumentNullException.ThrowIfNull(convState);
+            ArgumentNullException.ThrowIfNull(ssmState);
+            fixed (float* convPtr = convState)
+            fixed (float* ssmPtr = ssmState)
+            {
+                return GgmlNative.NemotronMamba2DecodeReadState(
+                    stateKey, (IntPtr)convPtr, convState.Length, (IntPtr)ssmPtr, ssmState.Length);
+            }
+        }
+
         public static void Gemma4ModelDecode(
             IntPtr hiddenData, int hiddenSize, int numLayers,
             IntPtr[] attnNormArr, IntPtr[] qkvArr, IntPtr[] qNormArr, IntPtr[] kNormArr,

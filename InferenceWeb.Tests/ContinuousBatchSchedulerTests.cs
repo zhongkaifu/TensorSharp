@@ -800,6 +800,38 @@ public class ContinuousBatchSchedulerTests
     }
 
     [Fact]
+    public void Executor_OwnerSwap_OutgoingOwnerSamplesFromItsOwnLogits()
+    {
+        // A step that forwards one sequence alone lets it borrow the model's
+        // reusable logits buffer. When a newcomer takes ownership before the
+        // owner samples again, the newcomer's Forward rewrites that buffer; the
+        // owner then used to draw its next token from the newcomer's logits (on
+        // Nemotron-H: the first request of a concurrent burst answered with
+        // nothing, or with another prompt's content).
+        var model = new SharedLogitsStubModel("fp-shared-logits");
+        var pool = NewPool(numBlocks: 16);
+        var sched = new ContinuousBatchScheduler(SmallConfig(), pool, model.KVStateFingerprint, NullLogger.Instance);
+        var executor = new BatchExecutor(model, pool, sched, NullLogger.Instance);
+
+        var owner = NewSequenceFromTokens("owner", new[] { 1, 2, 3 }, maxNew: 2);
+        sched.Submit(owner);
+        var first = executor.ExecuteStep(sched.Schedule());
+        Assert.Same(owner, Assert.Single(first).Sequence); // owner prefilled alone
+
+        var newcomer = NewSequenceFromTokens("newcomer", new[] { 9, 10, 11 }, maxNew: 2);
+        sched.Submit(newcomer);
+        for (int i = 0; i < 8 && owner.OutputTokens.Count == 0; i++)
+        {
+            foreach (var r in executor.ExecuteStep(sched.Schedule()))
+                Assert.Null(r.Error);
+        }
+
+        Assert.True(model.ForwardedSequences.Contains(11), "the newcomer never forwarded before the owner sampled");
+        Assert.NotEmpty(owner.OutputTokens);
+        Assert.Equal(4, owner.OutputTokens[0]); // peak of the owner's own prompt (last token + 1)
+    }
+
+    [Fact]
     public void TrimComputedToTotalTokens_RestoresInvariantAfterTailTruncation()
     {
         // Mirrors what the engine does after a mid-batch speculative stop:
@@ -1186,6 +1218,77 @@ public class ContinuousBatchSchedulerTests
                     buffer.Add(b);
             }
             public bool IsEos(int tokenId) => _owner._eos == tokenId;
+            public int LookupToken(string tokenStr) => -1;
+        }
+    }
+
+    /// <summary>
+    /// Snapshot stub whose Forward returns ONE reused logits buffer (as the real
+    /// models do) peaking at the last input token + 1, so a sequence that samples
+    /// from logits another sequence's Forward produced picks a detectably wrong token.
+    /// </summary>
+    private sealed class SharedLogitsStubModel : IModelArchitecture
+    {
+        private readonly string _fp;
+        private readonly float[] _logits = new float[VocabSize];
+        private readonly List<byte> _state = new();
+
+        public SharedLogitsStubModel(string fingerprint)
+        {
+            _fp = fingerprint;
+            Tokenizer = new SharedLogitsTokenizer();
+        }
+
+        /// <summary>Last input token of every Forward call, in order.</summary>
+        public List<int> ForwardedSequences { get; } = new();
+        public ModelConfig Config { get; } = new() { VocabSize = VocabSize };
+        public ITokenizer Tokenizer { get; }
+        public IMultimodalInjector MultimodalInjector => null;
+        public IBackendExecutionPlan ExecutionPlan => null;
+        public bool SupportsKVCacheTruncation => false;
+        public bool SupportsKVStateSnapshot => true;
+        public string KVStateFingerprint => _fp;
+
+        public float[] Forward(int[] tokens)
+        {
+            foreach (int t in tokens)
+                _state.Add((byte)t);
+            int last = tokens[^1];
+            ForwardedSequences.Add(last);
+            Array.Clear(_logits);
+            _logits[(last + 1) % VocabSize] = 10f;
+            return _logits;
+        }
+
+        public void ResetKVCache() => _state.Clear();
+        public void TruncateKVCache(int tokenCount) => throw new NotSupportedException();
+        public void Dispose() { }
+        public long ComputeKVBlockByteSize(int tokenCount) => tokenCount;
+
+        public bool TryExtractKVBlock(int startToken, int tokenCount, Span<byte> destination)
+        {
+            if (destination.Length != tokenCount || startToken + tokenCount > _state.Count) return false;
+            for (int i = 0; i < tokenCount; i++) destination[i] = _state[startToken + i];
+            return true;
+        }
+
+        public bool TryInjectKVBlock(int destToken, int tokenCount, ReadOnlySpan<byte> source)
+        {
+            if (destToken != _state.Count || source.Length != tokenCount) return false;
+            foreach (byte b in source) _state.Add(b);
+            return true;
+        }
+
+        private sealed class SharedLogitsTokenizer : ITokenizer
+        {
+            public string[] Vocab { get; } = Enumerable.Range(0, ContinuousBatchSchedulerTests.VocabSize).Select(i => i.ToString()).ToArray();
+            public int BosTokenId => -1;
+            public int[] EosTokenIds => Array.Empty<int>();
+            public int VocabSize => Vocab.Length;
+            public List<int> Encode(string text, bool addSpecial = true) => new();
+            public string Decode(List<int> ids) => string.Join(",", ids);
+            public void AppendTokenBytes(int tokenId, List<byte> buffer) { }
+            public bool IsEos(int tokenId) => false;
             public int LookupToken(string tokenStr) => -1;
         }
     }

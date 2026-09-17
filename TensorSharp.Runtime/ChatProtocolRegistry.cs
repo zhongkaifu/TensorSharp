@@ -361,7 +361,13 @@ namespace TensorSharp.Runtime
             {
                 Id = "nemotron_h",
                 Architectures = new[] { "nemotron_h", "nemotron_h_moe", "nemotron_h_omni" },
-                Render = r => ChatTemplate.RenderNemotron(r.Messages, r.AddGenerationPrompt, r.Tools, r.EnableThinking),
+                // Two turn formats share this architecture name: ChatML (Nemotron 3
+                // Nano / Omni) and <SPECIAL_10>System / <SPECIAL_11>User|Assistant
+                // (Nemotron-H 8B/47B Reasoning-128K). The embedded template says which
+                // one the checkpoint was trained on.
+                Render = r => ChatTemplate.IsNemotronHReasoningTemplate(r.GgufTemplate)
+                    ? ChatTemplate.RenderNemotronHReasoning(r.Messages, r.AddGenerationPrompt, r.Tools, r.EnableThinking)
+                    : ChatTemplate.RenderNemotron(r.Messages, r.AddGenerationPrompt, r.Tools, r.EnableThinking),
                 PreferOwnRenderer = _ => true,
                 CreateOutputParser = () => new ChatMlOutputParser(),
             });

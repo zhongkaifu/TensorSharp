@@ -197,6 +197,7 @@
     <ReferenceNativeSymbol Include="TSGgml_NemotronMamba2BatchedStepF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_NemotronMamba2DecodeClear" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_NemotronMamba2DecodeF32" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_NemotronMamba2DecodeReadState" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_NemotronMamba2PrefillF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_NormF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_NormGradF32" SymbolType="Function" />

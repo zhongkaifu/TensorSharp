@@ -13,13 +13,19 @@ namespace TensorSharp.Runtime
     /// <summary>Everything a chat renderer is given for one prompt.</summary>
     /// <param name="ReasoningEffort">The request's <c>reasoning_effort</c> level, or null
     /// for the family's default. See <see cref="Runtime.ReasoningEffort"/>.</param>
+    /// <param name="GgufTemplate">The chat template embedded in the model file, or null
+    /// when there is none (or the caller has none to give). One architecture name can
+    /// ship more than one turn format - <c>nemotron_h</c> covers both the ChatML Nemotron 3
+    /// Nano/Omni checkpoints and the <c>&lt;SPECIAL_10&gt;</c>/<c>&lt;SPECIAL_11&gt;</c>
+    /// Nemotron-H Reasoning-128K ones - so a renderer may need it to pick the format.</param>
     public sealed record ChatRenderRequest(
         List<ChatMessage> Messages,
         bool AddGenerationPrompt,
         string? Architecture,
         List<ToolFunction>? Tools,
         bool EnableThinking,
-        string? ReasoningEffort = null);
+        string? ReasoningEffort = null,
+        string? GgufTemplate = null);
 
     /// <summary>
     /// Whether a family may reuse a past TOOL-CALLING round's exact generated tokens
