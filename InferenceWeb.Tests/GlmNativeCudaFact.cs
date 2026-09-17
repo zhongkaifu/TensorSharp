@@ -41,3 +41,16 @@ public sealed class GlmSnapshotBoundaryCudaTheoryAttribute : TheoryAttribute, IT
                 : TestGates.CudaSkip;
     }
 }
+
+[TraitDiscoverer("InferenceWeb.Tests.RequiresTraitDiscoverer", "InferenceWeb.Tests")]
+public sealed class GlmNativeCudaTheoryAttribute : TheoryAttribute, ITraitAttribute
+{
+    public string RequiresValue => "Cuda";
+
+    public GlmNativeCudaTheoryAttribute()
+    {
+        Skip = Environment.GetEnvironmentVariable("TS_TEST_GLM_CUDA") != "1"
+            ? "Requires TS_TEST_GLM_CUDA=1 for the native GLM CUDA fixture."
+            : TestGates.CudaSkip;
+    }
+}
