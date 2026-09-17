@@ -314,7 +314,8 @@ internal class OracleModel : IModelArchitecture, IBatchedPagedModel, IPrefixCach
 
     public bool RetainSequenceCache(string requestId) => RetainAs(requestId, requestId);
 
-    private bool RetainAs(string requestId, string key)
+    /// <summary>The key-parameterised retain (used directly by the adapter-backed oracle).</summary>
+    internal bool RetainAs(string requestId, string key)
     {
         if (string.IsNullOrEmpty(requestId) || string.IsNullOrEmpty(key)) return false;
         if (!_holders.TryGetValue(requestId, out OracleCache? holder) || _retained.ContainsKey(key)) return false;
@@ -649,4 +650,13 @@ internal class OracleModel : IModelArchitecture, IBatchedPagedModel, IPrefixCach
     internal ulong ActiveState => Active.State;
     internal int ActiveLength => Active.Length;
     internal bool IsDeviceDirty(string payloadKey) => _retained.TryGetValue(payloadKey, out OracleCache? c) && c.DeviceDirty;
+
+    /// <summary>Flush a retained holder's device-authoritative state to the host (the family side of
+    /// <c>SettleForCopy</c>, used by the adapter-backed oracle).</summary>
+    internal bool Settle(string payloadKey)
+    {
+        if (payloadKey == null || !_retained.TryGetValue(payloadKey, out OracleCache? cache) || cache.Retired) return false;
+        cache.Flush();
+        return true;
+    }
 }
