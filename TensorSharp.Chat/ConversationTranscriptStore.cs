@@ -246,6 +246,13 @@ namespace TensorSharp.Server
                     emittedContent.Append(internalMessage.Content);
                     tokens += internalMessage.RawOutputTokens?.Count ?? 0;
                 }
+                else
+                {
+                    // A tool result has no raw tokens but is held all the same, and can
+                    // be far larger than the answer (a file the loop read): charge it,
+                    // at about four characters a token, or the budget bounds nothing.
+                    tokens += ((long)(internalMessage.Content?.Length ?? 0) + 3) / 4;
+                }
             }
             replacement.Add(generated);
             if (visibleEnd < history.Count)
@@ -339,6 +346,12 @@ namespace TensorSharp.Server
             }
             AppendMedia(sha, "img", message.ImagePaths);
             AppendMedia(sha, "aud", message.AudioPaths);
+            // Attached files too, by content: a file-backed upload (a CSV the tool loop
+            // reads from the workspace) is not in Content, and a recorded transcript's
+            // tool results were computed from those bytes. Two conversations that send
+            // the same words with different files are different conversations.
+            AppendMedia(sha, "txt", message.TextFilePaths);
+            AppendMedia(sha, "att", message.AttachmentPaths);
             if (message.IsVideo)
                 Append(sha, "video");
             if (message.ImageTimestamps != null)

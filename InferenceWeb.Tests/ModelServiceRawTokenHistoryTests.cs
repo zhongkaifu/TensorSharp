@@ -333,6 +333,82 @@ public class ModelServiceRawTokenHistoryTests
         Assert.Equal(new[] { 5, 6, 7, 8 }, result.History[1].RawOutputTokens);
     }
 
+    /// <summary>
+    /// A file-backed attachment (a CSV the tool loop reads from the workspace) is not in
+    /// the message content, and a recorded tool transcript's results were computed from
+    /// its bytes. Another conversation that sends the same words and the same final
+    /// answer with a DIFFERENT file must not get that transcript - its tool output - nor
+    /// that conversation's scope; the same bytes under another upload name still match.
+    /// </summary>
+    [Fact]
+    public void Augment_AttachedFileWithOtherContent_IsNotSpliced()
+    {
+        string dir = Path.Combine(Path.GetTempPath(), "ts-transcript-att-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            string mine = Path.Combine(dir, "a.csv"), theirs = Path.Combine(dir, "b.csv"), copy = Path.Combine(dir, "c.csv");
+            File.WriteAllText(mine, "name,salary\nalice,100\n");
+            File.WriteAllText(theirs, "name,salary\nbob,999\n");
+            File.WriteAllText(copy, "name,salary\nalice,100\n");
+            ChatMessage Ask(string path) => new()
+            {
+                Role = "user", Content = "chart data.csv",
+                TextFilePaths = new List<string> { path }, AttachmentPaths = new List<string> { path },
+            };
+
+            var store = NewStore();
+            store.Record(new List<ChatMessage>
+                {
+                    Ask(mine),
+                    new() { Role = "assistant", Content = "", RawOutputTokens = new List<int> { 5 } },
+                    new() { Role = "tool", Content = "alice 100" },
+                },
+                Generated("Here is your chart.", new List<int> { 6 }), Emitted("Here is your chart."), scope: "owner");
+
+            List<ChatMessage> Next(string path) => new()
+            {
+                Ask(path),
+                new() { Role = "assistant", Content = "Here is your chart." },
+                new() { Role = "user", Content = "what did the tool print?" },
+            };
+
+            var other = store.Augment(Next(theirs));
+            Assert.Equal(3, other.History.Count);
+            Assert.DoesNotContain(other.History, m => m.Role == "tool");
+            Assert.Null(other.InheritedScope);
+
+            var same = store.Augment(Next(copy));
+            Assert.Equal(5, same.History.Count);
+            Assert.Equal("owner", same.InheritedScope);
+        }
+        finally
+        {
+            Directory.Delete(dir, recursive: true);
+        }
+    }
+
+    /// <summary>The store's budget bounds what it holds: a recorded tool transcript's
+    /// tool results count, not only the assistant rounds' raw tokens.</summary>
+    [Fact]
+    public void Record_ToolResultsCountTowardTheBudget()
+    {
+        var store = new ConversationTranscriptStore(maxChains: 64, maxTokens: 15_000);
+        for (int i = 0; i < 2; i++)
+        {
+            store.Record(new List<ChatMessage>
+                {
+                    new() { Role = "user", Content = "read file " + i },
+                    new() { Role = "assistant", Content = "", RawOutputTokens = new List<int> { 5 } },
+                    new() { Role = "tool", Content = new string('x', 40_000) },
+                },
+                Generated("Done.", new List<int> { 6 }), Emitted("Done."), scope: "s" + i);
+        }
+
+        // Each transcript holds ~10k tokens of tool output: the older one is evicted.
+        Assert.Equal(1, store.Count);
+    }
+
     [Fact]
     public void BuildEmittedTurn_UsesTheFamilyParser_AndKeepsTheRawText()
     {
