@@ -328,7 +328,8 @@ The delta is per sequence (`Qwen35Model.RopePositions.cs`):
   positions; they only affect how many drafts are accepted, never the output.)
 - **Stored with the state it describes.** Each per-request holder carries it through
   swaps, retention, re-keying and pooling, a shared-prefix checkpoint and its clone
-  copy it, and the checkpoint file format (`Q5KC`) is **version 2**, which writes it
+  copy it, the per-block KV snapshot of the KV-swap concurrency path ends with it (like
+  the recurrent state, as of the block's end), and the checkpoint file format (`Q5KC`) is **version 2**, which writes it
   after the row count. A version-1 file names no delta and is refused on import; the
   engine logs that the saved checkpoint does not fit, prefills the prefix and saves it
   again.

@@ -153,6 +153,16 @@ public class Qwen35ImageFollowUpExactnessTests
     {
         using var ctx = Context.Open(_output);
         if (ctx == null) return;
+        if (ctx.Backend is not (BackendType.GgmlMetal or BackendType.GgmlCuda))
+        {
+            // Holders, their retention and the arena exist on CUDA and Metal only. Elsewhere
+            // concurrency runs the paged batched forward or the KV swap, which retain no
+            // conversation state to reuse, and the paged batched decode of a TEXT request can
+            // differ from a solo decode on a near tie (ggml_cpu, measured) - neither is what
+            // this test is about.
+            _output.WriteLine($"[concurrent] {ctx.Backend} has no per-request holders; test not applicable");
+            return;
+        }
 
         var imageTurns = new List<Turn>();
         var textTurns = new List<Turn>();
