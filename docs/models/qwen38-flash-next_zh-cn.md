@@ -90,8 +90,12 @@ MP4、WebM 或 MOV data URI（不会抓取远程 URL）：
 [`eng/validation/qwen38_mtp_followup/retained-cache-20260916`](../../eng/validation/qwen38_mtp_followup/retained-cache-20260916/README.md)
 ——`Qwen4ExpRetainedCacheTests` / `Qwen4ExpRetainedCachePolicyTests` 在 CPU 上覆盖保留 A/B/A、检查点
 克隆、投机重绑定、预算驱逐、缺失状态拒绝以及 QSA 首次/重置增长，并在 CUDA 上覆盖真实双 GPU 按层
-切分的检查点生命周期。仍有一个严格的 CUDA 关卡失败：分块 16+4 与整段 20 token 的 prefill 在完整
-logits 上仍有差异（贪心 argmax 相同）。
+切分的检查点生命周期。有三个严格的逐位一致关卡在 CPU 上通过、在单卡 CUDA 上仍然失败，在这个未训练
+的 fixture 上贪心 argmax 都相同：分块 16+4 与整段 20 token 的 prefill 在完整 logits 上有差异
+（`SharedPrefixChunking_…`）；一次 4 token 的目标验证与 4 次标量前向不同（`TeacherForcedTargetVerify_…`，
+最大绝对差 0.0070）；以 2–4 为块提交的 32 个 teacher-forced token 与标量解码不同
+（`RepeatedTargetBlocks_…`，最大绝对差 0.0082）。CUDA 目标计算图的归约依赖批宽度；证据 README 中的
+隔离精度原型能消除其中一部分，但尚未集成。
 
 ## 多 GPU
 
