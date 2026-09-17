@@ -111,16 +111,16 @@ internal sealed class PrefixTree
     private long _scopeQuota = long.MaxValue;
     private int _scopedEndStates, _publicEndStates, _nativeSlots, _primaryResidents;
     private int[] _matchStack = new int[16];
-    private int[] _order = new int[32];
-    private RadixNode[] _bfs = new RadixNode[64];
+    private int[] _order = new int[256];                 // pre-sized: probes stay allocation-free (BG-15)
+    private RadixNode[] _bfs;
     private RadixNode[] _scratch = new RadixNode[64];
-    private RadixNode[] _children = new RadixNode[8];
     internal PrefixTreeCounters Counters;
 
     internal PrefixTree(PrefixTreeOptions options)
     {
         _options = options ?? throw new ArgumentNullException(nameof(options));
         Rules = new ResumabilityRules(options.Capabilities, options.BlockSize, options.BatchedPagedEnabled);
+        _bfs = new RadixNode[Math.Max(64, options.TruncationSearchNodes + 2)];
         _pages = options.PageHost ?? NullPageHost.Instance;
         _clock = options.ClockMs ?? (() => Environment.TickCount64);
         if (options.PublicMax < 0) throw new ArgumentOutOfRangeException(nameof(options), "PublicMax must not be negative.");
@@ -705,6 +705,7 @@ internal sealed class PrefixTree
                 foreach (RadixNode child in d.Children)
                 {
                     if (child.ScopeIx != 0 && child.ScopeIx != r.ScopeIx) continue;
+                    if (tail > budget) break;          // never visited: the loop caps at budget (no queue growth)
                     EnsureBfs(tail + 1);
                     _bfs[tail++] = child;
                 }

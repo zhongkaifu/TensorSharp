@@ -141,7 +141,7 @@ internal sealed class MatchPlan
     public bool SearchCapped;                                // more than MaxTrailEnds alternative paths
     public bool TruncationSearchCapped;                      // the truncation BFS stopped at its node budget
     public int CandidateCount;                               // candidates considered (diagnostics)
-    internal readonly PooledList<TrailEntry> Trail = new(32);   // every matched node of every alternative path
+    internal readonly PooledList<TrailEntry> Trail = new(128);   // every matched node of every alternative path
     internal readonly PooledList<int> TrailEnds = new(4);       // index of the last entry of each path
 
     internal void Reset()

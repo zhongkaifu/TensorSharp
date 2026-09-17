@@ -189,36 +189,19 @@ internal struct ChildMap
         if (ReferenceEquals(_c1, child)) { _c1 = null; return; }
     }
 
-    /// <summary>Copies the children into <paramref name="buffer"/> (grown when needed); returns the count.</summary>
-    internal readonly int CopyTo(ref RadixNode[] buffer)
-    {
-        int n = Count;
-        if (buffer.Length < n) buffer = new RadixNode[Math.Max(n, buffer.Length * 2)];
-        if (_many is not null)
-        {
-            int i = 0;
-            foreach (RadixNode c in _many.Values) buffer[i++] = c;
-            return n;
-        }
-        int k = 0;
-        if (_c0 is not null) buffer[k++] = _c0;
-        if (_c1 is not null) buffer[k++] = _c1;
-        return k;
-    }
-
     public readonly Enumerator GetEnumerator() => new(this);
 
     public struct Enumerator
     {
         private readonly RadixNode? _c0, _c1;
-        private Dictionary<Key, RadixNode>.ValueCollection.Enumerator _it;
+        private Dictionary<Key, RadixNode>.Enumerator _it;             // not .Values: that allocates a collection object
         private readonly bool _useMany;
         private int _state;
 
         internal Enumerator(ChildMap map)
         {
             _c0 = map._c0; _c1 = map._c1; _useMany = map._many is not null;
-            _it = _useMany ? map._many!.Values.GetEnumerator() : default;
+            _it = _useMany ? map._many!.GetEnumerator() : default;
             _state = 0;
             Current = null!;
         }
@@ -229,7 +212,7 @@ internal struct ChildMap
         {
             if (_useMany)
             {
-                if (_it.MoveNext()) { Current = _it.Current; return true; }
+                if (_it.MoveNext()) { Current = _it.Current.Value; return true; }
                 return false;
             }
             while (_state < 2)

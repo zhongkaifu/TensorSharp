@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>disable</Nullable>
+    <IsPackable>false</IsPackable>
+    <ServerGarbageCollection>false</ServerGarbageCollection>
+    <TieredPGO>true</TieredPGO>
+    <Description>CPU-only benchmark of the radix prefix tree (DESIGN §13.2, gate BG-15): probe, insert, eviction and admission-step latency plus bytes allocated per probe, over synthetic session, long-prompt, queue, fan-out and churn traces. Loads no model.</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\TensorSharp.Runtime\TensorSharp.Runtime.csproj" />
+  </ItemGroup>
+</Project>
