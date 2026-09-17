@@ -51,7 +51,20 @@ Maximum \|batched − one-row\| at 4 rows (batched µs → candidate µs):
 
 ## 3. Change
 
-`ggml_ops_qwen4exp.cpp` (`Q4eRowKernels`): on CUDA, a span graph of 2 to
+Completion review tightened the scope of the measured MMVQ optimization: only
+NVIDIA A40 with Q4_K, Q5_K, Q6_K and Q8_0 uses groups of four. Other devices/types
+use the single-column broadcast construction already measured by the row probe.
+Upstream Turing and GB10 reduction tables differ at width 1; the A40 group is not
+portable. `TS_Q4E_TEST_MMVQ_CHANNELS=1` in a test-hook build forces the fallback
+on A40. The committed-row fixture test now covers every width 1–8; the probe also
+includes widths 6 and 7. The historical raw files below remain their original
+measurements and do not claim fresh coverage of those added cases or other GPUs.
+
+The combined completion branch also enables the construction on CPU. A fresh
+macOS ARM run found width-dependent logits with exact stored recurrent/KV state;
+the strict fixture suite passes with this path enabled. Metal is unchanged.
+
+`ggml_ops_qwen4exp.cpp` (`Q4eRowKernels`): on CPU and CUDA, a span graph of 2 to
 `TSG_PRECISION_DECODE_COLUMNS` (8) tokens builds each row from the kernels its
 one-token graph runs — float projections with an even input width on the
 broadcast axis (one `mul_mat_vec_f` launch; odd widths, which a one-token graph
