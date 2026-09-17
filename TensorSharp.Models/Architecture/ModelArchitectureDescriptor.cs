@@ -73,6 +73,24 @@ namespace TensorSharp.Models.Architecture
         /// </summary>
         public Func<GgufFile, bool> DetectFromTensors { get; init; }
 
+        /// <summary>
+        /// Recognises a GGUF of this family that a converter labelled with a GENERIC
+        /// architecture instead of the family's own id - llama.cpp's older
+        /// <c>convert_hf_to_gguf.py</c> wrote Mistral Small 3.1 as
+        /// <c>general.architecture = llama</c>, for example. Receives the declared
+        /// architecture and the probe; must return true only when the file's metadata and
+        /// tensor layout are exactly what this family's model implements.
+        ///
+        /// A generic label is deliberately NOT an alias: "llama" also names Llama 3 (with
+        /// rope_freqs scaling), Mixtral (experts) and others that a Mistral graph would run
+        /// into fluent garbage. Consulted only when no alias matched. Null for the normal case.
+        /// </summary>
+        public Func<string, GgufFile, bool> RecognizeRelabelledFile { get; init; }
+
+        /// <summary>What <see cref="RecognizeRelabelledFile"/> accepts, in one phrase, for the
+        /// refusal message when it accepts nothing. Required when the recogniser is set.</summary>
+        public string RelabelledFileDescription { get; init; }
+
         /// <summary>How this architecture uses several GPUs. See <see cref="MultiGpuMode"/>.</summary>
         public MultiGpuMode MultiGpu { get; init; } = MultiGpuMode.TensorParallel;
 
@@ -129,6 +147,12 @@ namespace TensorSharp.Models.Architecture
                 throw new InvalidOperationException($"Architecture '{Id}' must list its own id among its aliases.");
             if (Factory == null)
                 throw new InvalidOperationException($"Architecture '{Id}' has no factory.");
+            if (RecognizeRelabelledFile != null && string.IsNullOrWhiteSpace(RelabelledFileDescription))
+            {
+                throw new InvalidOperationException(
+                    $"Architecture '{Id}' recognises relabelled files but does not say which; the refusal " +
+                    "message for a file it rejects would not tell the operator what is accepted.");
+            }
             if (MultiGpu != MultiGpuMode.TensorParallel && string.IsNullOrWhiteSpace(MultiGpuLimitation))
             {
                 throw new InvalidOperationException(

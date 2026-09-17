@@ -11,6 +11,12 @@
 // ---------------------------------------------------------------------------
 // Nemotron-3.5 Lightning as a DSpark / DFlash speculation TARGET.
 //
+// STATUS: speculation is REFUSED on this trunk (SpeculationRefusal): its verify
+// and its decode run different attention/MoE kernels, so no speculative stream
+// matches plain greedy decoding, and a row-by-row exact verify is slower than
+// plain decoding. Everything below is kept so the refusal can be lifted once a
+// bit-exact batched verify exists; see SpeculationRefusalReason.
+//
 // The drafter itself is shared - see ModelBase.DFlash*.cs. What lives here is
 // the half only this trunk can provide: the per-layer residuals the drafter's
 // encoder was trained on (eagle_aux_hidden_state_layer_ids = the 6 trunk layers
@@ -70,37 +76,51 @@ namespace TensorSharp.Models
         }
 
         /// <summary>
-        /// Attach a DFlash/DSpark drafter to this trunk. Called from the
-        /// constructor after the trunk weights and caches exist, because the
-        /// drafter's tensors are merged into the same dictionaries and its ring
-        /// is allocated from the same allocator.
+        /// Called from the constructor with the configured drafter path. Every
+        /// DFlash/DSpark drafter is refused on this trunk (see
+        /// <see cref="SpeculationRefusalReason"/>), so this only tells the operator
+        /// that the file named on --draft-model / TS_NEMOTRON_DFLASH is ignored and
+        /// why; nothing is read from it. The capture taps below stay in place for
+        /// the day a bit-exact verify exists.
         /// </summary>
         private void TryLoadNemotronDFlash(string draftModelPath)
         {
             string path = ResolveNemotronDFlashPath(draftModelPath);
             if (path == null)
                 return;
-
-            if (IsTensorParallel)
-            {
-                // The drafter borrows the trunk's LM head and token embedding,
-                // both sharded under TP. Refuse rather than draft from a shard.
-                Console.WriteLine("  DFlash/DSpark speculative decoding is not supported under tensor parallelism; ignoring the drafter.");
-                return;
-            }
-
-            try
-            {
-                LoadDFlashDraftWeights(path);
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"  DFlash drafter '{System.IO.Path.GetFileName(path)}' could not be attached: {ex.Message}");
-                return;
-            }
-
-            Console.WriteLine($"  DSpark drafter attached; a DFlash block drafter will propose tokens for this Nemotron trunk.");
+            Console.WriteLine($"  DFlash/DSpark drafter '{System.IO.Path.GetFileName(path)}' is NOT attached: {SpeculationRefusalReason}");
         }
+
+        /// <summary>
+        /// Why this trunk does not speculate (see <see cref="SpeculationRefusal"/>).
+        ///
+        /// Speculation's contract is that the emitted stream equals plain greedy
+        /// decoding. On this hybrid trunk the verify batch and the single-token
+        /// decode run different kernels for the same math: attention over the
+        /// host-expanded cache versus the flash-attention decode kernel, and the
+        /// batched-by-expert MoE versus the per-token MoE kernel (the Mamba-2 scan
+        /// and the rollback are exact - restore + decode reproduces plain decoding
+        /// bit for bit). Measured on nemotron_h_moe (ggml_cuda) the verify rows'
+        /// logits differ from plain decoding by 0.2-0.8 and a one-row speculative
+        /// step by 0.16-1.1, which flips low-margin greedy picks: the 2026-09-16
+        /// campaign saw every solo DSpark request diverge from plain decoding. A
+        /// bit-exact verify has to run attention and MoE row by row, which is the
+        /// cost of decoding those rows one at a time, so no speculation mode can
+        /// both match plain decoding and be faster than it here.
+        /// </summary>
+        internal const string SpeculationRefusalReason =
+            "speculative decoding is not supported on Nemotron-H: the trunk's multi-token verify and its "
+            + "single-token decode run different attention and MoE kernels whose logits differ (by up to ~1 "
+            + "on the same tokens), so a speculative stream would not match plain greedy decoding, and a "
+            + "bit-exact verify costs as much as decoding the rows one at a time.";
+
+        /// <summary>Correctness refusal of every speculator on this trunk; see
+        /// <see cref="SpeculationRefusalReason"/>.</summary>
+        public string SpeculationRefusal => SpeculationRefusalReason;
+
+        /// <summary>Every DFlash/DSpark drafter is refused on this trunk, including
+        /// one attached after construction through the shared draft-head loader.</summary>
+        protected override string DFlashDrafterRefusal => SpeculationRefusalReason;
 
         // ====================================================================
         // IDraftHead - the shared DFlash block machinery, thinly wrapped
@@ -385,6 +405,7 @@ namespace TensorSharp.Models
             {
                 if (_layerTypes[l] != LayerType.Mamba2)
                     continue;
+                SyncMamba2HostState(l, LegacyMamba2Slot);
                 float[] c = _convState[l], s = _ssmState[l];
                 if (c == null || s == null)
                     continue;
@@ -416,6 +437,8 @@ namespace TensorSharp.Models
             }
             if (_mamba2NativeDecodeStateInitialized != null)
                 Array.Clear(_mamba2NativeDecodeStateInitialized);
+            if (_mamba2HostStateStale != null)
+                Array.Clear(_mamba2HostStateStale);
         }
 
         /// <summary>

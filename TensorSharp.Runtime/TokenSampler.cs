@@ -33,6 +33,10 @@ namespace TensorSharp.Runtime
         private int _thinkingLastScannedToken = -1;
         private int _thinkingClosedAt = -1;
         private int _thinkingCloseRequestedAt = -1;
+        // Channel state derived from committed history (see ScanThinkingHistory).
+        private bool _thinkingScanStarted;
+        private bool _channelOpen;
+        private int _channelStart;
 
         public TokenSampler(SamplingConfig config)
         {
@@ -53,7 +57,8 @@ namespace TensorSharp.Runtime
         /// forced-token override before consuming a device-side argmax, so
         /// ordinary greedy decoding need not materialize host logits.</summary>
         internal bool IsPlainGreedyArgmax =>
-            _config.Temperature <= 0f && _config.Grammar == null && !HasPenalties();
+            _config.Temperature <= 0f && _config.Grammar == null && !HasPenalties()
+            && _config.ThinkingBudget?.SuppressUnopenedEnd != true;
 
         public int Sample(float[] logits, IList<int>? generatedTokenIds = null)
         {
@@ -65,6 +70,13 @@ namespace TensorSharp.Runtime
                     throw new InvalidOperationException("Thinking end token is outside the model vocabulary.");
                 return thinkingEnd;
             }
+
+            // A close with no open channel is masked (see ThinkingTokenBudget).
+            // TryGetForcedThinkingToken has just brought the channel state up to date.
+            var channelPolicy = _config.ThinkingBudget;
+            if (channelPolicy is { SuppressUnopenedEnd: true } && !_channelOpen
+                && channelPolicy.EndTokenId < vocabSize)
+                logits[channelPolicy.EndTokenId] = float.NegativeInfinity;
 
             // Grammar-constrained decoding. Applied FIRST and by rewriting the
             // logits themselves, so every downstream stage — penalties, top-k,
@@ -148,9 +160,17 @@ namespace TensorSharp.Runtime
 
             // An active answer grammar must never be bypassed. A thinking
             // request installs its grammar with delayed activation instead.
-            if (_thinkingClosedAt >= 0 ||
-                (count < budget.TokenLimit && _thinkingCloseRequestedAt < 0) || _config.Grammar?.IsActive == true)
+            if (!_channelOpen || _config.Grammar?.IsActive == true)
                 return false;
+            if (_thinkingCloseRequestedAt < 0)
+            {
+                long inChannel = count - _channelStart;
+                if (inChannel < budget.TokenLimit)
+                    return false;
+                if (budget.CloseAtBoundary != null && inChannel < 2L * budget.TokenLimit
+                    && !(inChannel > 0 && budget.CloseAtBoundary(tokens![count - 1])))
+                    return false;
+            }
             token = budget.EndTokenId;
             return true;
         }
@@ -164,24 +184,45 @@ namespace TensorSharp.Runtime
             if (budget?.CloseOnRepetition != true || _config.Grammar?.IsActive == true)
                 return false;
             ScanThinkingHistory(tokens, tokens.Count, budget);
-            if (_thinkingClosedAt >= 0) return false;
+            if (!_channelOpen) return false;
             _thinkingCloseRequestedAt = tokens.Count;
             return true;
         }
 
         private void ScanThinkingHistory(IList<int>? tokens, int count, ThinkingTokenBudget budget)
         {
-            if (_thinkingScanned > count ||
+            if (!_thinkingScanStarted ||
+                _thinkingScanned > count ||
                 (_thinkingScanned > 0 && tokens![_thinkingScanned - 1] != _thinkingLastScannedToken) ||
                 (_thinkingClosedAt >= 0 && (_thinkingClosedAt >= count || tokens![_thinkingClosedAt] != budget.EndTokenId)))
             {
+                _thinkingScanStarted = true;
                 _thinkingScanned = 0;
                 _thinkingClosedAt = -1;
                 _thinkingCloseRequestedAt = -1;
+                _channelOpen = budget.OpenAtStart;
+                _channelStart = 0;
             }
             for (int i = _thinkingScanned; i < count; i++)
-                if (tokens![i] == budget.EndTokenId && _thinkingClosedAt < 0)
-                    _thinkingClosedAt = i;
+            {
+                int token = tokens![i];
+                if (_channelOpen)
+                {
+                    if (token == budget.EndTokenId)
+                    {
+                        _channelOpen = false;
+                        _thinkingClosedAt = i;
+                        _thinkingCloseRequestedAt = -1;
+                    }
+                }
+                else if (budget.OpenTokenId >= 0 && token == budget.OpenTokenId)
+                {
+                    // Only a family whose model opens the channel itself can reopen it;
+                    // with no open token a closed channel stays closed.
+                    _channelOpen = true;
+                    _channelStart = i + 1;
+                }
+            }
             _thinkingScanned = count;
             _thinkingLastScannedToken = count > 0 ? tokens![count - 1] : -1;
         }

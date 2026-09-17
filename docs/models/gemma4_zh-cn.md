@@ -588,7 +588,7 @@ Gemma 4 是 TensorSharp 中最难移植到分页批处理的模型，因为它�
 
 ## 12. MTP 投机解码（gemma4-assistant 草稿头）
 
-Gemma 4 在两个宿主上都支持为单序列（无并发）请求做无损的**多 token
+Gemma 4 在两个宿主上都支持为单序列（无并发）请求做**多 token
 预测（MTP）投机解码**。与 Qwen 3.6 把 NextN 块内嵌在主干 GGUF 不同，Gemma 4 的草稿头
 作为一个**独立的小 `gemma4-assistant` GGUF** 发布，通过 `--draft-model`
 （环境变量 `TS_SPEC_DRAFT_MODEL`，旧名 `TS_MTP_DRAFT_MODEL`）加载，
@@ -661,6 +661,23 @@ KV 缓存，并对每个起草 token 复用相同位置（递归只通过 `h` �
 `--spec-type ngram` 完全不需要草稿 GGUF，因此即便旁边没有 assistant 文件，也能在
 Gemma 4 checkpoint 上运行。
 
+### 12.4 贪心一致性
+
+每个输出 token 都取自主干的某一行，因此投机不会改变 token 所依据的前缀，只会改变计算这一行的
+kernel。用 `AgentTurnBench --spec-diagnostic --spec-diagnostic-teacher-force` 实测有两点后果：
+
+* **已修复：** 在不带逐层嵌入的稠密检查点（实测 12B；31B 走同一路径）上、ggml 与 CPU 后端下，越过滑动窗口的
+  一次**全部接受**的验证，过去会把被挤出的位置写回到已提交的行上，于是下一次验证偏差 30-47 个
+  logit，12B 的输出流在十个 token 内就与普通贪心分叉。现在 `SpecOnVerifyAccepted` 只对执行器会
+  重新前向的窗口恢复槽位；A40 上 12B 的 spec 与检查点克隆输出流重新与普通贪心一致，spec 提示上的
+  n-gram 接受率从 57% 升到 89%。
+* **容差：** K+1 行验证与单行 decode 是不同的 kernel。在 `ggml_cuda` 上两者的行在 E4B 上相差
+  中位数 0.5 个 logit（其 BF16 逐层嵌入投影在 ggml-cuda 中依赖 batch 形状），在 12B/26B-QAT 上为
+  1.7-2.2；Metal 上为 0.003（E4B）与 0.15（12B）；`ggml_cpu` 上为 0。若某个贪心 token 的前两名
+  logit 之差落在这一误差之内，它就可能不同：E4B 的 512 个散文 token 中出现了 4-5 次，每次的差都小于 0.25。
+
+细节与完整表格见：[What greedy parity delivers](../speculative_decoding.md#what-greedy-parity-delivers)。
+
 ## 13. 输出解析器与聊天模板
 
 `Gemma4OutputParser` 处理两种结构化包装：
@@ -669,6 +686,18 @@ Gemma 4 checkpoint 上运行。
 - **工具调用** —— `<|tool_call>call:function_name{...args...}<tool_call|>` 块，由 `OutputParser` 解出结构化的 tool call。参数使用 Gemma 自己的语法（裸键名，字符串用 `<|"|>` 包裹），而模型经常把看起来像标识符的字符串值直接裸写——`call:read_invoice{invoice_id:INV-472}`、`{path:src/main.py}`、`{ids:[INV-1, INV-2]}`。转换器会给每个不是 JSON 数字 / `true` / `false` / `null` 的裸值加引号（数组内也一样；数字保持数字）。参数仍无法解析的调用会以原文作为 content 返回，而不是一条空消息；多调用轮次中每个调用都带自己的 `index`，流式客户端可据此配对参数增量。
 
 聊天模板在 GGUF 没带 Jinja2 模板时回退到内置 Gemma 4 模板。
+
+### 关闭思考时的思维通道
+
+关闭思考时，没有任何 Gemma 4 模板会在工具结果之后预置内容：E2B/E4B 的 canonical 模板以及 12B/26B/DiffusionGemma 模板都让 prompt 停在 `<tool_response|>`，由模型继续自己的轮次（较大模型的模板只在新的 `<|turn>model` 之后预置闭合的 `<|channel>thought\n<channel|>`）。渲染器保持这个 prompt。我们在 E4B（Metal，Q8_0，带 skills 前导）上实测过在工具结果之后强行预置闭合块，结果更糟：模型不加标记地写出推理，再次关闭通道后才回答，推理因此进入了 `content`。
+
+E4B 在该边界上的行为（2026-09-16 验证活动，B10）改为在采样阶段处理，依据协议的 `ThinkingBudgetOpenToken` / `ThinkingBudgetEndToken` / `SuppressUnopenedThinkingEndAfter`：
+
+- **关闭思考时模型自行打开的通道会被限长。** 预算从 `<|channel>` 开始计，在超过 `max_tokens` 四分之一（最多 64 token，两倍处强制关闭）后的第一个换行处以 `<channel|>` 关闭通道。解析器隐藏思考内容，随后是答案。此前 `agentic` 的最后一轮把 256 个 token 全部花在通道里，content 为空。我们也实测过恰好在 16 或 64 token（句子中间）关闭：模型会泄漏推理或把被截断的句子续写成工具调用；而在超过 16、32、48、64 token 后的第一个换行处关闭，每次都给出了正确答案。
+- **工具结果之后，没有打开通道的 `<channel|>` 会被屏蔽。** E4B 先写出答案，关闭一个从未打开的通道，然后再写一遍答案；流式响应已经发出了第一份，客户端因此收到两份。屏蔽后模型在第一份答案后结束轮次。屏蔽需要 host logits，因此这类请求不走 device-argmax 路径。屏蔽只限于该边界：其他位置的孤立关闭标记仍由解析器用来分隔推理与答案。
+- 开启思考时，同一预算从模型的 `<|channel>` 开始计（若 prompt 在工具结果后预置了 `<|channel>thought\n`，则从第一个 token 开始计），并恰好在 `TS_THINKING_BUDGET` 处关闭。此前 Gemma 4 没有声明训练过的结束 token，通用的硬停止在寻找 Gemma 从不输出的 `</think>`。`TS_THINKING_BUDGET=0` 同时关闭两个上限。
+
+`response_format` 可以与 `"think": true` 同时使用：JSON 语法在思维通道内保持休眠，在 `<channel|>` 之后启用（`ThinkingGrammarActivationTrigger`）。关闭思考时语法从第一个 token 起生效，这同时排除了 `<|channel>`。
 
 ## 13a. 张量并行
 

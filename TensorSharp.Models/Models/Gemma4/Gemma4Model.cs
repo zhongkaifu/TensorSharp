@@ -1127,6 +1127,18 @@ namespace TensorSharp.Models
                 ? _slidingWindow
                 : int.MaxValue;
 
+        /// <summary>
+        /// A media chunk prefilled after a reused prefix runs on the per-op path (the fused
+        /// prefill emits the bidirectional span mask only at start_pos 0). Within the
+        /// sliding window that path matched a cold prefill token for token; once the ring
+        /// has wrapped it did not (Gemma 4 E4B, Metal: a 611-token reused prefix plus a
+        /// 278-token image turn changed the greedy answer). Until that path is exact, such a
+        /// turn reuses at most its public prefix, where the prefill is cut anyway. See
+        /// IModelArchitecture.CanPrefillMediaAfterReusedPrefix.
+        /// </summary>
+        public override bool CanPrefillMediaAfterReusedPrefix(int promptTokens)
+            => MaxReusablePrefixTokens == int.MaxValue || promptTokens <= MaxReusablePrefixTokens;
+
         public override string KVStateFingerprint =>
             $"gemma4|arch={Config.Architecture}|L={Config.NumLayers}|H={Config.NumHeads}|KV={Config.NumKVHeads}|gKV={_numGlobalKVHeads}|gD={_globalHeadDim}|lD={_localHeadDim}|swa={_slidingWindow}|dtype={_kvCacheDtype.ToShortString()}";
 

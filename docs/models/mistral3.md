@@ -5,7 +5,7 @@
 | Property | Value |
 |---|---|
 | Provider | Mistral AI |
-| GGUF architecture key | `mistral3` |
+| GGUF architecture key | `mistral3`; also `llama` for Mistral Small 3.x files converted before llama.cpp had `mistral3` (see [llama-labelled files](#llama-labelled-files)) |
 | Source class | [`Mistral3Model`](../../TensorSharp.Models/Models/Mistral3/Mistral3Model.cs) (legacy per-seq) + [`Mistral3Model.BatchedForward.cs`](../../TensorSharp.Models/Models/Mistral3/Mistral3Model.BatchedForward.cs) (`IBatchedPagedModel`) |
 | Vision encoder | [`Mistral3VisionEncoder`](../../TensorSharp.Models/Models/Mistral3/Mistral3VisionEncoder.cs) (Pixtral) |
 | Image processor | [`Mistral3ImageProcessor`](../../TensorSharp.Models/Models/Mistral3/Mistral3ImageProcessor.cs) |
@@ -23,6 +23,84 @@ Verified GGUF pointer (the Pixtral `mmproj` lives in the same repo):
 | Model | HF repo | Recommended file | Pixtral mmproj |
 |---|---|---|---|
 | Mistral-Small-3.1-24B-Instruct-2503 | [bartowski/mistralai_Mistral-Small-3.1-24B-Instruct-2503-GGUF](https://huggingface.co/bartowski/mistralai_Mistral-Small-3.1-24B-Instruct-2503-GGUF) | `mistralai_Mistral-Small-3.1-24B-Instruct-2503-Q4_K_M.gguf` (14.334 GB) or `mistralai_Mistral-Small-3.1-24B-Instruct-2503-Q8_0.gguf` (25.055 GB) | `mmproj-mistralai_Mistral-Small-3.1-24B-Instruct-2503-f16.gguf` (0.878 GB; same repo) |
+
+### llama-labelled files
+
+The bartowski files above declare `general.architecture = llama` and keep every
+hyperparameter under `llama.*`: they were converted before llama.cpp had a
+`mistral3` architecture. Until this was handled they failed at load with
+`Unsupported architecture: llama`.
+
+`llama` is **not** an alias of `mistral3`, because the same label also names
+Llama 2/3, Mixtral and others that the Mistral graph would run into fluent
+garbage. Instead the registry offers a `llama`-labelled file to
+`Mistral3Architecture.IsLlamaLabelledMistral3`
+(`ModelArchitectureDescriptor.RecognizeRelabelledFile`), which accepts it only
+when every one of these holds:
+
+| Check | Refuses |
+|---|---|
+| `tokenizer.ggml.pre = tekken` | SentencePiece Mistral 7B / Mixtral, Llama 3 BPE |
+| the vocabulary has `[INST]`, `[/INST]`, `[SYSTEM_PROMPT]`, `[/SYSTEM_PROMPT]` (the renderer emits them) | Tekken vocabularies without those control tokens |
+| no `llama.expert_count`, no `blk.0.ffn_gate_inp.weight` | MoE files |
+| no `rope_freqs.weight`, and `llama.rope.scaling.type` absent, `none` or `yarn` | Llama 3.1-style frequency scaling this model does not apply |
+| no `attn_q_norm` / `attn_k_norm`; the dense attention and SwiGLU tensors are present | families with other block layouts |
+
+An accepted file loads as `Mistral3Model`. `Config.Architecture` stays `mistral3`,
+so the chat renderer, output parser and capability tables all select Mistral 3,
+while the hyperparameters and context length are read under the `llama.*` prefix
+the file actually uses (`ModelBase.MetadataArchitecture`). Startup prints
+`GGUF labelled 'llama' is served as mistral3`. A `llama` file that fails a check is
+still refused, and the message now names what `mistral3` would have accepted.
+
+The companion projector name `mmproj-mistralai_Mistral-Small-3.1-...-f16.gguf`
+matches the auto-discovery hint `*mmproj*istral*.gguf`, so the CLI finds it
+beside the model without `--mmproj`. The server still takes it through `--mmproj`.
+
+### llama.cpp projector files
+
+bartowski's `mmproj-...-f16.gguf` is a llama.cpp `clip` file (`clip.projector_type
+= pixtral`). The encoder was written against Ollama's projector, and on this file
+every image request first failed with HTTP 500
+(`KeyNotFoundException: 'v.patch_conv.weight'`). Once that was fixed the model was
+still blind: it read a red card showing `4821` as a blue `2975`. Comparing the
+encoder, on the real projector and image, with a transcription of Hugging Face's
+Pixtral tower and `Mistral3PatchMerger` located every difference:
+
+| Difference | Fix |
+|---|---|
+| Tensor names: `v.patch_embd`, `v.pre_ln`, `v.blk.N.ln1`/`ln2`/`attn_out`, `mm.input_norm`, `mm.patch_merger`, `mm.1`, `mm.2` | Renamed at load (`Mistral3VisionEncoder.CanonicalTensorName`); the Ollama names still load unchanged |
+| llama.cpp's converter permutes the vision Q/K rows into interleaved RoPE pairs (`LlamaModel.permute`) | A llama.cpp file's Q/K rows are put back into Hugging Face's rotate-half layout (`UnpermuteInterleavedRows`) |
+| The vision MLP was hard-coded to SiLU. Mistral Small 3.1's tower is GELU-gated (`hidden_act = "gelu"`, stored as `clip.use_gelu`) | The activation comes from `clip.use_gelu` / `clip.use_silu`. A file with neither gets GELU, which is also `PixtralVisionConfig`'s default |
+| The 2D RoPE table was written frequency-major but read patch-major, so every patch got another patch's angles | Built patch-major (`BuildVisionRopeAngles`) |
+| The patch merger gathered each 2x2 window patch by patch. `torch.nn.functional.unfold` is channel-major | Channel-major (`MergePatches`) |
+| The Mistral 3 renderer (it always renders its own template) skipped the media-placeholder pass. The prompt had no `[IMG]`, so the encoded image was dropped | `RenderMistral3` emits one `[IMG]` per image before the text |
+| The injector copied the `rows x cols` patch embeddings contiguously over a span whose tokens put an `[IMG_BREAK]` after every row. Each later row slid one more position onto the markers | The embedding is laid out like the tokens: each row of patches is followed by the `[IMG_BREAK]` token embedding, or `[IMG_END]` after the last row (`LayOutMistral3ImageRows`), as llama.cpp does |
+
+After the fixes, the 391 merged embeddings for a 640x480 image match the reference
+with a minimum per-token cosine of 0.99999 (managed CPU path). Put back SiLU, the
+old merge order or the permuted Q/K, one at a time, and the mean per-token cosine
+falls to 0.69, 0.08 or 0.37. A projector
+that is missing a tensor the encoder needs, or that has linear biases the encoder
+does not apply, is now refused at load with a message naming both accepted layouts.
+Before, the encoder skipped a missing norm silently and crashed on a missing linear
+at the first image.
+
+On the release media fixtures
+(`validate_deepseek41_media.py --scenarios image_ocr,multi_image,image_follow_up
+--concurrency 1,4`, Q4_K_M + f16 mmproj, `ggml_cuda`) TensorSharp passes
+`image_ocr` 5/5 and `image_follow_up` 5/5 and fails `multi_image` 0/5. On the
+two-image prompt it reads both codes with the last digit missing (`482`, `936`).
+llama.cpp's `llama-server` on the same files scores `image_ocr` 2/5,
+`image_follow_up` 3/5 and `multi_image` 2/5. Its failures give the same
+three-digit answer (`["482", "936"]`), and it misreads `4821` alone as `0482`.
+The two-image miss is this checkpoint's reading, not an injection error:
+TensorSharp's log places the second image at the position right after the first
+image's `[IMG_END]`.
+
+Only the llama.cpp projector was checked against the reference. No Ollama-layout
+projector was available, and one loads under the same rules: no Q/K un-permute, and
+GELU unless it declares `clip.use_silu`.
 
 The conversion identifies [mistralai/Mistral-Small-3.1-24B-Instruct-2503](https://huggingface.co/mistralai/Mistral-Small-3.1-24B-Instruct-2503)
 as its official upstream; both model cards declare Apache-2.0.
@@ -199,8 +277,9 @@ hidden ─► narrow(seq_len-1) if prefill
   `[hidden, channels, patchSize, patchSize]`) with optional bias.
 - **RMSNorm** at the encoder input.
 - **2D RoPE** positional embedding for spatial position.
-- **SiLU-gated MLP transformer blocks**: LayerNorm + multi-head attention +
-  residual + LayerNorm + SiLU-gated MLP + residual.
+- **Gated MLP transformer blocks**: RMSNorm + multi-head attention +
+  residual + RMSNorm + gated MLP + residual. The gate activation is GELU for
+  Mistral Small 3.1 (`clip.use_gelu`); `clip.use_silu` selects SiLU.
 - **Spatial patch merging**: groups neighboring patches into one merged
   token at the projector boundary.
 - **Multimodal projector**: RMSNorm → PatchMerger → Linear → GELU →
@@ -268,7 +347,7 @@ v.blk.{L}.attn_k.weight                    # K projection
 v.blk.{L}.attn_v.weight                    # V projection
 v.blk.{L}.attn_output.weight               # output projection
 v.blk.{L}.ffn_norm.weight                  # pre-FFN RMSNorm
-v.blk.{L}.ffn_gate.weight                  # SiLU gate
+v.blk.{L}.ffn_gate.weight                  # gate (GELU, or SiLU with clip.use_silu)
 v.blk.{L}.ffn_up.weight                    # up projection
 v.blk.{L}.ffn_down.weight                  # down projection
 mm.norm.weight                             # projector RMSNorm
@@ -276,6 +355,11 @@ mm.patch_merger.merging_layer.weight       # spatial patch merger
 mm.linear_1.weight                         # projector linear 1
 mm.linear_2.weight                         # projector linear 2
 ```
+
+These are Ollama's names. A llama.cpp projector names the same tensors
+`v.patch_embd`, `v.pre_ln`, `v.blk.{L}.ln1` / `ln2` / `attn_out`, `mm.input_norm`,
+`mm.patch_merger` and `mm.1` / `mm.2`, and stores the Q/K rows permuted; see
+[llama.cpp projector files](#llamacpp-projector-files).
 
 ## 7. TensorSharp implementation walkthrough
 

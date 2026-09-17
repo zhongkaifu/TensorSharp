@@ -17,7 +17,7 @@ namespace TensorSharp.Models
     /// per-head Q/K RMSNorm → GQA attention → SwiGLU. QK-norm is AFTER RoPE,
     /// the opposite of Qwen 3.5.
     /// </summary>
-    public sealed class HunyuanDenseModel : ModelBase
+    public sealed partial class HunyuanDenseModel : ModelBase
     {
         private Tensor[] _kvCacheK;
         private Tensor[] _kvCacheV;
@@ -238,6 +238,67 @@ namespace TensorSharp.Models
                 ResetCacheTensor(_kvCacheK[l]);
                 ResetCacheTensor(_kvCacheV[l]);
             }
+        }
+
+        protected override void TruncateKVCacheCore(int tokenCount)
+        {
+            base.TruncateKVCacheCore(tokenCount);
+            if (_kvCacheK == null)
+                return;
+            for (int l = 0; l < Config.NumLayers; l++)
+            {
+                InvalidateTensorDeviceCache(_kvCacheK[l]);
+                InvalidateTensorDeviceCache(_kvCacheV[l]);
+            }
+        }
+
+        // ---- K/V state snapshot contract --------------------------------------------
+        //
+        // The server's continuous-batching engine needs one of two capabilities: a
+        // batched paged forward, or a byte-exact extract/inject of a sequence's K/V rows.
+        // Without either, InferenceEngineHost.TryGetEngine returned null and every chat
+        // request was a 500. Every layer here is full causal attention over a LINEAR
+        // cache (row == absolute position, no sliding window, no recurrent state), so a
+        // snapshot restores exactly what a fresh prefill would write: concurrent requests
+        // swap ownership of the single cache, and shared prompt prefixes are reused
+        // across requests. Same contract, same helper and same device-cache invalidation
+        // as the per-op Mistral 3 path this model's attention mirrors.
+
+        public override bool SupportsKVStateSnapshot => _kvCacheK != null && _kvCacheV != null;
+
+        // KVStateFingerprint is declared with the model's other overrides above (it also
+        // carries the architecture and RoPE dimension).
+
+        public override long ComputeKVBlockByteSize(int tokenCount)
+            => KvBlockTransfer.ComputeBlockByteSize(_kvCacheK, _kvCacheV, tokenCount);
+
+        public override bool TryExtractKVBlock(int startToken, int tokenCount, Span<byte> destination)
+        {
+            if (!SupportsKVStateSnapshot)
+                return false;
+            return KvBlockTransfer.Extract(
+                _allocator, _kvCacheK, _kvCacheV, _cacheSeqLen,
+                startToken, tokenCount, destination);
+        }
+
+        public override bool TryInjectKVBlock(int destToken, int tokenCount, ReadOnlySpan<byte> source)
+        {
+            if (!SupportsKVStateSnapshot)
+                return false;
+            EnsureCacheCapacity(destToken + tokenCount);
+            if (!KvBlockTransfer.Inject(
+                    _allocator, _kvCacheK, _kvCacheV, _cacheSeqLen,
+                    destToken, tokenCount, source))
+            {
+                return false;
+            }
+            _cacheSeqLen = destToken + tokenCount;
+            for (int l = 0; l < Config.NumLayers; l++)
+            {
+                InvalidateTensorDeviceCache(_kvCacheK[l]);
+                InvalidateTensorDeviceCache(_kvCacheV[l]);
+            }
+            return true;
         }
 
         protected override float[] ForwardCore(int[] tokens)

@@ -43,6 +43,7 @@ namespace TensorSharp.Runtime.Scheduling
             var candidates = new List<ExecutionPathKind>(3);
             var rejections = new List<ExecutionPathRejection>();
             bool mtpUnprofitable = false;
+            string speculationRefusal = null;
 
             bool batchedEnabled = !options.BatchedPathDisabled;
             bool batchedImpl = caps.SupportsBatchedPagedAttention;
@@ -78,6 +79,13 @@ namespace TensorSharp.Runtime.Scheduling
                         ExecutionPathKind.SpeculativePerSequence,
                         $"requested (--spec) but the loaded weights have no draft head; "
                         + $"--spec-type {SpeculatorRegistry.NGram} needs none"));
+                }
+                else if (caps.SpeculationRefusal != null)
+                {
+                    speculationRefusal = caps.SpeculationRefusal;
+                    rejections.Add(new ExecutionPathRejection(
+                        ExecutionPathKind.SpeculativePerSequence,
+                        "refused by the model: " + caps.SpeculationRefusal));
                 }
                 else if (!caps.SpeculationProfitable)
                 {
@@ -123,7 +131,7 @@ namespace TensorSharp.Runtime.Scheduling
                     else
                     {
                         candidates.Add(ExecutionPathKind.SpeculativePerSequence); // terminal
-                        return Build(candidates, rejections, mtpUnprofitable);
+                        return Build(candidates, rejections, mtpUnprofitable, speculationRefusal);
                     }
                 }
             }
@@ -153,7 +161,7 @@ namespace TensorSharp.Runtime.Scheduling
                 else
                 {
                     candidates.Add(ExecutionPathKind.PerSequenceFused); // terminal
-                    return Build(candidates, rejections, mtpUnprofitable);
+                    return Build(candidates, rejections, mtpUnprofitable, speculationRefusal);
                 }
             }
 
@@ -161,7 +169,7 @@ namespace TensorSharp.Runtime.Scheduling
             if (batchedEnabled && batchedImpl && multimodalCount > 0 && textCount > 0)
             {
                 candidates.Add(ExecutionPathKind.MixedMultimodalSplit); // terminal
-                return Build(candidates, rejections, mtpUnprofitable);
+                return Build(candidates, rejections, mtpUnprofitable, speculationRefusal);
             }
 
             // ---- Batched paged path (with the N=1 fused fast path in front) ----
@@ -187,7 +195,7 @@ namespace TensorSharp.Runtime.Scheduling
                     else
                     {
                         candidates.Add(ExecutionPathKind.SingleSequenceFused); // terminal
-                        return Build(candidates, rejections, mtpUnprofitable);
+                        return Build(candidates, rejections, mtpUnprofitable, speculationRefusal);
                     }
                 }
 
@@ -218,7 +226,7 @@ namespace TensorSharp.Runtime.Scheduling
 
             // ---- Universal fallback ----
             candidates.Add(ExecutionPathKind.PerSequence);
-            return Build(candidates, rejections, mtpUnprofitable);
+            return Build(candidates, rejections, mtpUnprofitable, speculationRefusal);
         }
 
         /// <summary>Startup capability report: which paths are statically
@@ -276,6 +284,8 @@ namespace TensorSharp.Runtime.Scheduling
                 sb.Append("requested but unavailable (no draft head in weights; --spec-type ")
                   .Append(SpeculatorRegistry.NGram).Append(" needs none)");
             }
+            else if (caps.SpeculationRefusal != null)
+                sb.Append("requested but refused by the model (serving standard decode): ").Append(caps.SpeculationRefusal);
             else if (!caps.SpeculationProfitable)
                 sb.Append("requested but unprofitable on this backend (serving standard decode)");
             else
@@ -314,7 +324,8 @@ namespace TensorSharp.Runtime.Scheduling
         private static ExecutionPlan Build(
             List<ExecutionPathKind> candidates,
             List<ExecutionPathRejection> rejections,
-            bool mtpUnprofitable)
+            bool mtpUnprofitable,
+            string speculationRefusal = null)
         {
             // A plan whose last candidate can decline would leave the step
             // unserved; PerSequence never declines, SpeculativePerSequence /
@@ -330,6 +341,7 @@ namespace TensorSharp.Runtime.Scheduling
                 Candidates = candidates,
                 Rejections = rejections,
                 SpeculationUnprofitable = mtpUnprofitable,
+                SpeculationRefusal = speculationRefusal,
             };
         }
     }

@@ -123,6 +123,33 @@ namespace TensorSharp.Runtime
         int MaxReusablePrefixTokens => int.MaxValue;
 
         /// <summary>
+        /// Whether a cache that already holds a media span (image, video pair, audio
+        /// clip) can be continued past it with the same result a fresh prefill gives.
+        /// True for models whose positions after a span are the plain token index
+        /// (Gemma 4 and every other absolute-position family). Qwen 3.5 returns false:
+        /// its M-RoPE prompt positions compress after an image, but decode positions
+        /// are the absolute index and the cache records no rope delta, so the state
+        /// after an image turn is not the state a re-prefill of the same history
+        /// builds. For such a model every prompt-reuse path stops at the first media
+        /// span, and reuse of the text BEFORE the span is unaffected.
+        /// </summary>
+        bool SupportsReuseAcrossMediaSpan => true;
+
+        /// <summary>
+        /// Whether a prompt of <paramref name="promptTokens"/> tokens whose media span
+        /// lies in the part still to prefill may continue a reused prefix, i.e. prefill
+        /// that media at a non-zero start position and still match a fresh prefill. True
+        /// by default. Gemma 4 returns false once the prompt outgrows its sliding window:
+        /// an image chunk prefilled after a reused prefix on a wrapped ring (the per-op
+        /// multimodal path) was measured to change the greedy output against a cold
+        /// prefill, while the same turn within the window matched it. Such a turn then
+        /// reuses nothing past its public prefix (SequenceState.SharedPrefixTokens): the
+        /// prefill is cut there for the shared-prefix checkpoint anyway, so cloning the
+        /// checkpoint changes nothing, and without a public prefix it prefills from zero.
+        /// </summary>
+        bool CanPrefillMediaAfterReusedPrefix(int promptTokens) => true;
+
+        /// <summary>
         /// Maximum context length (in tokens) this model can serve — its KV cache
         /// grows on demand up to this bound. The paged engine uses it to size the
         /// KV block pool so a long in-context prompt cannot exhaust the block table
@@ -285,6 +312,13 @@ namespace TensorSharp.Runtime
         /// The engine uses this to force the per-seq forward path for multimodal sequences,
         /// because the batched paged path doesn't currently know how to inject embeddings.</summary>
         bool HasPendingEmbeddings(string requestId);
+
+        /// <summary>The media spans prepared for <paramref name="requestId"/>, in prompt
+        /// order, with the content identity of each. The engine compares them
+        /// positionally when it continues a cached prefix (see
+        /// <see cref="Scheduling.PromptMediaSpans"/>). Call after any front trim.</summary>
+        IReadOnlyList<Scheduling.PromptMediaSpan> GetPreparedMediaSpans(string requestId)
+            => Array.Empty<Scheduling.PromptMediaSpan>();
 
         /// <summary>Discard the per-request bucket. Called when a request finishes (success,
         /// error, or abort).</summary>

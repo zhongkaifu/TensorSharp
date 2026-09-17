@@ -143,14 +143,44 @@ namespace TensorSharp.Models
             int headDim = Config.HeadDim;
             for (int layer = 0; layer < Config.NumLayers; layer++)
             {
-                // attn_qkv exists only on attention layers; the call no-ops
-                // otherwise. Mamba2 layers stay replicated (not sharded).
+                if (_layerTypes[layer] != LayerType.Attention)
+                    continue; // Mamba2 layers stay replicated (not sharded).
+
                 // NB: _layerPrefixes isn't populated until InitLayerInfo (which
                 // runs after sharding), so use the literal prefix here.
-                ShardConcatenatedColumnParallel($"blk.{layer}.attn_qkv.weight",
-                    _layerNumHeads[layer] * headDim,     // Q
-                    _layerNumKVHeads[layer] * headDim,   // K
-                    _layerNumKVHeads[layer] * headDim);  // V
+                string qkvName = $"blk.{layer}.attn_qkv.weight";
+                int qDim = _layerNumHeads[layer] * headDim;
+                int kvDim = _layerNumKVHeads[layer] * headDim;
+                if (_quantWeights.ContainsKey(qkvName) || _weights.ContainsKey(qkvName))
+                {
+                    ShardConcatenatedColumnParallel(qkvName, qDim, kvDim, kvDim);
+                }
+                else
+                {
+                    // FuseQKVWeights only fuses when Q, K and V share one quant type.
+                    // Q4_K_M quantizes some attention layers' V as Q6_K (Nemotron-H
+                    // 8B blk.29, 47B blk.49), so those layers have no attn_qkv to
+                    // shard and the TP forward died with an unhandled "TP
+                    // column-parallel weight 'blk.29.attn_qkv.weight' not found".
+                    // Build each rank's [Q_r|K_r|V_r] slice from the separate
+                    // tensors under the fused name, as Qwen3 and gpt-oss do.
+                    ShardSeparateColumnParallel(qkvName,
+                        new[]
+                        {
+                            $"blk.{layer}.attn_q.weight",
+                            $"blk.{layer}.attn_k.weight",
+                            $"blk.{layer}.attn_v.weight",
+                        },
+                        new[] { qDim, kvDim, kvDim });
+                }
+
+                if (!_tpQuantWeights.ContainsKey(qkvName) && !_tpWeights.ContainsKey(qkvName))
+                {
+                    throw new InvalidOperationException(
+                        $"Nemotron TP: attention layer {layer} has neither a fused attn_qkv weight nor " +
+                        "separate attn_q/attn_k/attn_v weights with a common input dimension, so it cannot " +
+                        "be sharded for --tp. Run this model without --tp.");
+                }
             }
 
             // MoE expert weights: tensor-parallel experts
@@ -628,23 +658,13 @@ namespace TensorSharp.Models
                     Tensor kExpanded = ExpandKVHeads(_tpKvCacheK[layer][r], groupSize, totalSeqLen);
                     Tensor vExpanded = ExpandKVHeads(_tpKvCacheV[layer][r], groupSize, totalSeqLen);
 
-                    using var kT = kExpanded.Transpose(1, 2);
-                    var scores = new Tensor(alloc, DType.Float32, numHeadsPerGpu, seqLen, totalSeqLen);
-                    Ops.AddmmBatch(scores, 0, scores, scale, qHeads, kT);
+                    // Query sub-chunks keep the per-rank score tensor bounded on long
+                    // prompts (same helper as the single-GPU fallback).
+                    attnResults[r] = ChunkedMaterializedAttention(alloc, qHeads, kExpanded, vExpanded,
+                        numHeadsPerGpu, headDim, seqLen, startPos, scale, fusedSoftmax: false);
                     qHeads.Dispose();
                     kExpanded.Dispose();
-
-                    Ops.AddCausalMask(scores, seqLen, startPos, float.NegativeInfinity);
-                    Ops.Softmax(scores, scores);
-
-                    var attnOut = new Tensor(alloc, DType.Float32, numHeadsPerGpu, seqLen, headDim);
-                    Ops.AddmmBatch(attnOut, 0, attnOut, 1.0f, scores, vExpanded);
-                    scores.Dispose();
                     vExpanded.Dispose();
-
-                    Tensor flatOutput = ReshapeFromHeads(attnOut, numHeadsPerGpu, seqLen, headDim);
-                    attnOut.Dispose();
-                    attnResults[r] = flatOutput;
                 }
             });
 

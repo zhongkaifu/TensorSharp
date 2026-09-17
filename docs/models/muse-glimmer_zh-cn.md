@@ -32,7 +32,7 @@ dotnet run --project TensorSharp.Cli -c Release -- \
   --mmproj models/mmproj-Muse-Glimmer-30B-Q8_0.gguf \
   --image photo.png --input question.txt --backend ggml_cuda --max-tokens 300
 
-# DFlash 投机解码（无损；输出与普通贪心 decode 一致）
+# DFlash 投机解码（每个 token 取自主干行；除浮点近平局外与普通贪心一致，见“输出一致性”）
 dotnet run --project TensorSharp.Cli -c Release -- \
   --model models/Muse-Glimmer-30B-UD-IQ2_XXS.gguf \
   --draft-model models/dflash-kquant.gguf \
@@ -40,6 +40,10 @@ dotnet run --project TensorSharp.Cli -c Release -- \
 ```
 
 `--draft-model` 也可以用环境变量 `TS_MUSE_GLIMMER_DFLASH` 指定。
+
+### 结构化输出
+
+生成 prompt 停在 `<|start|>assistant`，因此正常回复以模型自己写的路由头开始（推理为 ` to=self<|message|>`，答案为 ` to=user<|message|>` 或 `<|message|>`）。使用 `response_format` 时 JSON 语法从第一个 token 起生效，模型会直接写出对象而没有任何头部。`MuseGlimmerOutputParser` 把不可能是头部开头的回复（JSON 的 `{`、`[`、`"` 或数字）视为答案内容，并在流结束时返回未加框架的文本而不是丢弃。此前解析器一直等待被语法排除的 `<|message|>`：流式响应返回 `content: null`，`json_schema` 在生成正确对象后返回 HTTP 422（2026-09-16 验证活动，B6）。非流式路径现在也对解析后的 content 而不是原始输出做校验。`response_format` 也可以与 `"think": true` 同时使用。模型先在 ` to=self<|message|>` 消息中推理，再以 `<|start|>assistant to=user<|message|>` 开始答案，因此协议把 `to=user<|message|>` 声明为 `ThinkingGrammarActivationTrigger`，语法在那里启用。此前该组合返回 HTTP 400（首次复测中每个 `--thinking` json 用例都是如此）。用 `validate_inference.py --thinking` 实测（json / json_schema / json_unicode，c1 与 c4，重复三次，Q4_K_XL，单张 RTX PRO 6000）：38/45，模型写出的 41 个答案头全部是 `to=user<|message|>`。7 个失败都停在 `max_tokens` 256：推理会先复述 prompt 再作答，而 Muse-Glimmer 没有声明可以提前关闭推理的思考预算结束 token。
 
 ## 1. 文本架构
 

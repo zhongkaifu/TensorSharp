@@ -272,6 +272,14 @@ fused whole-model kernel its prefill runs, and the hidden-state capture is only
 filled when a speculator asks for it. TensorAgent ships the assistant GGUF as an
 optional download, so this is what makes speculation reachable there at all.)
 
+A model can also refuse speculation outright. `ISpeculativeTarget.SpeculationRefusal`
+is a correctness verdict, not a speed one: a non-null reason makes the planner,
+`SpeculatorRegistry.Create`, the CLI and the draft-head loader all decline, the
+engine logs the reason once, and every request decodes plainly. Use it when the
+trunk's verify cannot reproduce its own decode (see
+[Nemotron-H refuses speculation](#nemotron-h-refuses-speculation)); use
+`SpeculationProfitable` when it only would not pay.
+
 ## Operator surface
 
 ```
@@ -621,6 +629,26 @@ the whole cache. A trunk with a linear cache (every global layer, Qwen 3.5's
 attention layers) needs none of this: a rewound position simply overwrites the
 rejected rows later.
 
+Which rows go back depends on what the executor does next, and the first version
+got one case wrong. On a trunk whose verify KV is not kept on a partial acceptance
+(`SpecVerifyPersistsAcceptedKv` false: dense Gemma 4 without per-layer embeddings,
+12B and 31B, on the ggml and CPU backends) the kept prefix is re-forwarded, so
+every saved row has to go back first. That restore also ran on a FULLY accepted
+window, which the executor neither rolls back nor re-forwards: the committed rows
+`p+1..p+K` were left holding the evicted positions `p+1-W..p+K-W`, and every later
+token attended stale keys in place of its own recent context. On gemma-4-12B
+(window 1,024) the second verify past the window came out 30-47 logits away from
+plain decoding, and AgentTurnBench's streams diverged from plain greedy at token
+10 of 192 (spec prompt, n-gram and draft head alike, on CUDA and Metal) and at
+token 88 of 96 over a checkpoint clone; the stale context also cost acceptance
+(n-gram 57% before, 89% after, 67.9 -> 100.8 tok/s against 46.5 plain on an A40).
+`Gemma4Model.SwaSlotsToRestore` now restores every saved row only when the kept
+prefix will be re-forwarded (`acceptedRows < verifyRows`) and nothing on a full
+acceptance. `Gemma4SwaVerifyRestoreTests` pins the rule;
+`Gemma4SwaRollbackExactnessTests.AcceptedDraftWindow_LeavesTheNextDecodeExact`
+drives a real 12B trunk through a fully accepted verify past the window (26.5
+logits off before the fix, 0.30 after, on Metal).
+
 ## How many rows to verify
 
 ggml's small-batch matmul kernels — ggml-metal's `mul_mv_ext`, ggml-cuda's
@@ -800,7 +828,9 @@ verify kernel and the 1-row decode kernel accumulate in different orders, so a
 token that is a near-tie in the logits can come out differently depending on
 which kernel produced it - and which one did depends on the governor's timing.
 The stream-equality benchmarks pass on their prompts; on the host benchmark one
-run in ten took a different (still well-formed) greedy path at such a tie.
+run in ten took a different (still well-formed) greedy path at such a tie. How
+large that disagreement is per backend, and what it does to a long greedy
+stream, is measured in [What greedy parity delivers](#what-greedy-parity-delivers).
 
 A holder can only be speculated on by a trunk that forwards on the BOUND cache
 (`ISpeculativeTarget.SpecTrunkFollowsBoundCache`; Gemma 4 and Qwen 3.5 both
@@ -825,6 +855,97 @@ decoding while drafting nothing. `SpecPlainStepUsesForward` now routes a PARKED
 plain step through the fused decode, and `SpecPlainStepCostsFamilySwitch` keeps
 an ordinary no-proposal plain step inside the verify family, where alternating
 with verifies is free. Prose came back to within 5% of plain.
+
+## What greedy parity delivers
+
+The contract, stated exactly: every token speculation emits is drawn from a
+trunk row whose input tokens are the tokens plain decoding would have fed at
+that position. It is the argmax of *a* correct forward of the right prefix -
+but of a K+1-row forward, not of the one-row decode the plain path runs, and
+the two are different kernels. Wherever the top two logits are further apart
+than the two kernels disagree, the token is the one plain greedy would have
+produced; at a closer near-tie it can be the other one, and from there the two
+streams are different, equally well-formed continuations. Nothing stronger is
+delivered on a GPU backend, and a stream-equality check against plain greedy is
+therefore evidence about the prompt's margins as much as about speculation.
+
+The 2026-09-16 campaign reported every server-side Gemma 4 speculative variant
+differing from plain greedy (6/6 512-token decode cases on E4B, 12B and
+26B-QAT) plus n-gram divergences under a JSON grammar (Qwen 3.6-35B-A3B token
+50, gemma-4-12B token 56) and over a shared-prefix checkpoint clone
+(Muse-Glimmer token 20, gemma-4-12B token 88). Two different things were
+behind that, and telling them apart takes more than the first mismatch - past
+it, every row compares a different prefix. `AgentTurnBench --spec-diagnostic
+--spec-diagnostic-teacher-force` keeps the speculative run on the plain token
+path so every row stays a same-prefix comparison, and reports the logit error
+of each row class and every argmax flip with its margin (see the
+[AgentTurnBench README](../benchmarks/AgentTurnBench/README.md)).
+
+**A real bug (fixed).** gemma-4-12B's first verify past its 1,024-token window
+was 0.1-0.3 logits from plain decoding and the second was 30-47 logits off, with
+29 flips at margins of 5.6-25 logits in 192 tokens: a fully accepted window had
+its sliding-window slots overwritten with the positions it evicted
+([Sliding-window caches and rollback](#sliding-window-caches-and-rollback)).
+That is the 12B "token 10 of 192" divergence, the checkpoint-clone divergence
+at token 88 (its generation crosses the window) and the low 12B acceptance;
+with the fix AgentTurnBench's spec (n-gram and draft head, 192 tokens) and
+newchat (96 tokens) streams on an A40 are identical to plain greedy.
+
+**Kernel arithmetic (bounded, not fixed).** Everything else measured is a
+bounded row error with flips only at small margins. Teacher-forced, one A40
+(`ggml_cuda`) unless named; error = max |spec row - plain one-row decode row|
+over the vocabulary:
+
+| model, prompt, drafter | rows | median / max error | flips (reference top-two margin of each) |
+| --- | ---: | --- | --- |
+| E4B Q8_0, server decode prompt, `ggml_cpu`, n-gram | 96 | 0 / 0 (bit-identical) | 0 |
+| E4B Q8_0, server decode prompt, `ggml_metal` (M5 Pro), n-gram / draft head | 256 | 0.0024 / 0.014, 0.0026 / 0.0079 | 0 / 0 |
+| E4B Q8_0, server decode prompt, n-gram | 512 | 0.52 / 3.27 | 4 (0.046, 0.081, 0.095, 0.141) |
+| E4B Q8_0, server decode prompt, draft head | 512 | 0.51 / 1.72 | 5 (0.081, 0.095, 0.141, 0.240, 0.243) |
+| 12B QAT UD-Q4_K_XL, spec prompt (1,419-token prompt), n-gram, after the fix | 192 | 2.22 / 7.47 | 0 (smallest margin in the run 1.96) |
+| 12B UD-Q4_K_XL (the non-QAT file), spec prompt, `ggml_metal` (M5 Pro), n-gram, after the fix | 192 | 0.15 / 0.82 | 0 |
+| 12B QAT UD-Q4_K_XL, JSON grammar, n-gram, after the fix | 58 | 1.86 / 5.63 | 2 (0.081, 0.269) |
+| 26B-A4B QAT UD-Q4_K_XL, server decode prompt, draft head | 256 | 1.72 / 6.70 | 7 (0.025 - 0.361) |
+| Qwen 3.6-35B-A3B UD-Q4_K_M, JSON grammar, n-gram (window 3) | 64 | 0.73 / 3.53 | 2 (0.023, 0.070) |
+| Qwen 3.6-35B-A3B, spec prompt, n-gram (window 3) | 96 | 1.41 / 6.05 | 0 |
+| Muse-Glimmer 30B UD-Q4_K_XL, newchat chat B prompt (linear trunk), n-gram | 96 | 0.28 / 0.90 | 1 (0.041) |
+
+The error does not grow with the number of verifies or rollbacks (it is the
+same order in every eighth of every run), `ggml_cpu` was bit-identical on E4B, and
+every flip lies inside twice its row's error - kernel arithmetic, not a state bug.
+The campaign's Qwen JSON divergence at token 50 is the teacher-forced flip at row
+50 (margin 0.070). Its 12B JSON divergence (token 56) and Muse checkpoint-clone
+divergence (token 20) sit next to near-ties in these runs (12B row 53, margin
+0.081; Muse row 24 on the linear trunk, margin 0.041), but the 12B campaign run
+predates the sliding-window fix and its prompt crosses the window, so that one
+is not attributed to either cause by this evidence.
+
+Where the `ggml_cuda` disagreement comes from, measured on E4B: a one-row
+speculative forward is bit-identical to the plain decode, while every multi-row
+forward - a verify, a kept-prefix re-forward, and the plain path's own two-token
+prefill forward - lands 0.40-0.65 logits away (`--spec-diagnostic-rowcheck`),
+insensitive to the KV dtype (f16 and f32 give identical rows), the persistent
+decode graph and the in-kernel PLE gather. An op probe on the A40
+([`batch_probe.cpp`](validation/campaign-2026-09-16/spec-parity/batch_probe.cpp))
+finds the batch-shape dependence in ggml-cuda's matmul kernels, not in
+attention: a row of a BF16 matmul computed with others differs from the same row
+alone by up to 8.3e-3 on values of ~4 (the one-row result matches a float64
+reference to 4e-7), F16 by 1.5e-3, F32 by 3e-3 from four rows up, while Q8_0,
+Q4_K and Q6_K rows agree to 7e-7 and `flash_attn_ext` queries to 7e-5. E4B's
+per-layer-embedding projection is BF16 and feeds every layer. Holding it as F32
+made row 0 of a two- or three-row verify bit-identical, but row 1 of the same
+verify still differed by 0.42, the default window verifies eight rows, and row 0
+of a four-row verify was back to 0.49, so that change was not kept: equivalence at the default width needs batch-invariant ggml-cuda
+matmul kernels, and the quantized 12B/26B/Qwen errors (1-2 logits median) point
+at further batch-shape-dependent paths in the MoE and larger models that were
+not isolated here. Metal agrees 15-200x more closely on the same code.
+
+What that means in practice: on `ggml_cuda`, expect a speculative greedy stream
+to match plain greedy for as long as the prompt's top-two margins stay above
+roughly one logit (code, quoted text, JSON keys) and to take a different branch
+at a word-choice near-tie in free prose - the campaign's "deterministic
+algorithm" / "mathematical function" pairs. For a byte-exact comparison against
+plain greedy, compare with speculation off, or on `ggml_cpu`.
 
 ## Switching it at run time
 
@@ -988,6 +1109,37 @@ the device, so a device-to-device copy is about 0.2 ms for 60 MB on an A40 - the
 expensive part was always the host round trip, not the copy.
 `BackendType.Cuda` already has that path (`MtpSnapshotRecurrentStateCudaDevice`);
 ggml_cuda does not.
+
+## Nemotron-H refuses speculation
+
+The 2026-09-16 campaign ran Nemotron 3.5 Lightning (`nemotron_h_moe`, MXFP4_MOE)
+with its DSpark drafter: no draft was ever accepted, every solo greedy request
+differed from the same request without the drafter, and decode ran at 0.55x.
+Measured in-process on one A40 (`ggml_cuda`), one question at a time:
+
+| Question | Result |
+| --- | --- |
+| Is the rollback exact? | Yes. Snapshot, a 4-row verify of wrong tokens, restore + rewind, then plain decode: logits identical to plain decoding (max \|diff\| 0) for 47 steps. |
+| Does a one-row `SpecForward` equal `Forward`? | No: 0.16 after the first token, up to 1.1 over 48 steps; first argmax flip at step 33. It passes `isDecode: false`, which routes the MoE through the batched-by-expert path instead of the per-token decode kernel. With the decode flag it is identical. |
+| Do verify rows equal plain decoding? | No: 0.2-0.8 per row for a 4- or 8-row verify. Running the MoE row by row leaves 0.2-0.5; running MoE **and** attention row by row makes it exact (the Mamba-2 multi-row scan is already exact). |
+| What does an exact verify cost? | 116 ms for 4 rows row by row (4.1x a 28 ms plain step); the batched verify is 187 ms; one DSpark block is 70 ms per-op. |
+
+So an exact verify costs as much as decoding its rows one at a time, before the
+drafter runs, and an inexact one changes the output. `NemotronModel` therefore
+reports `SpeculationRefusal` (both `nemotron_h` and `nemotron_h_moe` share the
+attention half of the mismatch), refuses DFlash/DSpark drafters before reading
+the file, and serves plain decoding with a one-time warning.
+
+The drafter had its own bug, in shared code: DFlash's attention-sink path added
+the per-head sink to the post-softmax attention weights. A sink is a logit that
+joins the softmax denominator (`ggml_soft_max_add_sinks`, gpt-oss); adding it
+afterwards spread tens of units of attention mass evenly over a ~1000-key window.
+With teacher forcing on the trunk's own greedy tokens, the first draft matched the
+next token 0 of 47 times before the fix and 17 of 47 after it. Later block
+positions stay weak (mean accepted prefix 0.45-0.57 depending on in-block
+causality and on the bonus-anchor reading, where NVIDIA reports 3.75 of 7 on
+SPEED-Bench), so more of this drafter is still unverified; that matters again
+only if the trunk gets a bit-exact verify.
 
 ## Measuring it
 

@@ -56,6 +56,53 @@ namespace InferenceWeb.Tests
             VideoWritable.Value ? null : "Requires an OpenCV build that can encode video.";
 
         /// <summary>
+        /// The GGML backend <see cref="GgmlBackendTestInitializer"/> pins for this
+        /// process, from <c>TS_TEST_GGML_BACKEND</c> (default cpu). One place, so the
+        /// initializer, the gates below and tests that follow the pin agree.
+        /// </summary>
+        public static TensorSharp.GGML.GgmlBackendType PinnedGgmlBackendType =>
+            (Environment.GetEnvironmentVariable("TS_TEST_GGML_BACKEND") ?? "cpu").Trim().ToLowerInvariant() switch
+            {
+                "metal" => TensorSharp.GGML.GgmlBackendType.Metal,
+                "cuda" => TensorSharp.GGML.GgmlBackendType.Cuda,
+                "vulkan" => TensorSharp.GGML.GgmlBackendType.Vulkan,
+                _ => TensorSharp.GGML.GgmlBackendType.Cpu,
+            };
+
+        /// <summary>The pinned GGML backend as the model-level <see cref="BackendType"/>.</summary>
+        public static BackendType PinnedGgmlBackend => PinnedGgmlBackendType switch
+        {
+            TensorSharp.GGML.GgmlBackendType.Metal => BackendType.GgmlMetal,
+            TensorSharp.GGML.GgmlBackendType.Cuda => BackendType.GgmlCuda,
+            TensorSharp.GGML.GgmlBackendType.Vulkan => BackendType.GgmlVulkan,
+            _ => BackendType.GgmlCpu,
+        };
+
+        /// <summary>
+        /// Skip reason for a test that constructs <paramref name="required"/> in a
+        /// process pinned to another GGML backend, or null to run. The native bridge
+        /// allows one GGML backend per process, so such a test can only ever fail
+        /// with "A different GGML backend was already initialized"; it belongs to
+        /// the lane that pins its backend. Non-GGML backends never conflict.
+        /// </summary>
+        public static string GgmlPinSkip(BackendType required)
+        {
+            if (required is not (BackendType.GgmlCpu or BackendType.GgmlMetal or BackendType.GgmlCuda or BackendType.GgmlVulkan))
+                return null;
+            BackendType pinned = PinnedGgmlBackend;
+            if (required == pinned)
+                return null;
+            string name = required switch
+            {
+                BackendType.GgmlMetal => "metal",
+                BackendType.GgmlCuda => "cuda",
+                BackendType.GgmlVulkan => "vulkan",
+                _ => "cpu",
+            };
+            return $"Requires TS_TEST_GGML_BACKEND={name}: this test constructs {required}, and this process pins {pinned} (one GGML backend per process).";
+        }
+
+        /// <summary>
         /// Skip reason for weight-gated tests, or null to run. The env var may
         /// name a file or a directory; with <paramref name="ggufContains"/> the
         /// directory must hold a matching GGUF (see <see cref="FindGguf"/>).
@@ -189,6 +236,14 @@ namespace InferenceWeb.Tests
             Skip = TestGates.CudaSkip
                 ?? (modelEnvVar == null ? null : TestGates.ModelSkip(modelEnvVar, ggufContains));
         }
+
+        /// <summary>The GGML backend the test constructs; skips unless the process pins it (<see cref="TestGates.GgmlPinSkip"/>).</summary>
+        public BackendType GgmlBackend
+        {
+            get => _ggmlBackend;
+            set { _ggmlBackend = value; Skip ??= TestGates.GgmlPinSkip(value); }
+        }
+        private BackendType _ggmlBackend;
     }
 
     /// <summary>[Theory] variant of <see cref="CudaFactAttribute"/>.</summary>
@@ -264,6 +319,14 @@ namespace InferenceWeb.Tests
 
         public ModelFactAttribute(string envVar, string ggufContains = null)
             => Skip = TestGates.ModelSkip(envVar, ggufContains);
+
+        /// <summary>The GGML backend the test constructs; skips unless the process pins it (<see cref="TestGates.GgmlPinSkip"/>).</summary>
+        public BackendType GgmlBackend
+        {
+            get => _ggmlBackend;
+            set { _ggmlBackend = value; Skip ??= TestGates.GgmlPinSkip(value); }
+        }
+        private BackendType _ggmlBackend;
     }
 
     /// <summary>[Theory] variant of <see cref="ModelFactAttribute"/>.</summary>
@@ -275,5 +338,13 @@ namespace InferenceWeb.Tests
 
         public ModelTheoryAttribute(string envVar, string ggufContains = null)
             => Skip = TestGates.ModelSkip(envVar, ggufContains);
+
+        /// <summary>The GGML backend the test constructs; skips unless the process pins it (<see cref="TestGates.GgmlPinSkip"/>).</summary>
+        public BackendType GgmlBackend
+        {
+            get => _ggmlBackend;
+            set { _ggmlBackend = value; Skip ??= TestGates.GgmlPinSkip(value); }
+        }
+        private BackendType _ggmlBackend;
     }
 }

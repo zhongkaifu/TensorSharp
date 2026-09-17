@@ -270,6 +270,26 @@ namespace TensorSharp.Chat
         }
 
         /// <summary>
+        /// Bind session <paramref name="sessionId"/> to the host's saved conversation
+        /// <paramref name="conversationKey"/>, so every session opened for that
+        /// conversation continues its cached prompt state (one cache scope per
+        /// conversation instead of per session). For a host that owns conversation
+        /// identity and serves one user, such as TensorAgent. Returns false for an
+        /// unknown session or the shared default session.
+        /// </summary>
+        public bool BindSessionConversation(string sessionId, string conversationKey)
+        {
+            if (string.IsNullOrEmpty(sessionId)
+                || string.Equals(sessionId, SessionManager.DefaultSessionId, StringComparison.Ordinal))
+                return false;
+            ChatSession session = _sessions.GetSession(sessionId);
+            if (session == null || session.SharedAcrossConversations)
+                return false;
+            session.BindConversation(conversationKey);
+            return true;
+        }
+
+        /// <summary>
         /// <c>DELETE /api/sessions/{id}</c> — <c>{ ok = true, sessionId }</c>; 400 for
         /// the default session, 404 for an unknown one. Releases the session's
         /// execution workspace — its files, installed packages, everything its runs
@@ -2238,6 +2258,11 @@ namespace TensorSharp.Chat
                     }
                     else
                     {
+                        // Unparsed text is answer text too. Without this every reply of
+                        // a model that needs no parser ended with the "ended this turn
+                        // without writing an answer" note, which the page then sent back
+                        // as part of the assistant's message on the next turn.
+                        sawContent = true;
                         yield return WebUiSseEvents.Token(piece);
                     }
                 }

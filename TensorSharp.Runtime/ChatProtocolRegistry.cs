@@ -107,6 +107,22 @@ namespace TensorSharp.Runtime
                 // tokens is safe THERE and only there. The renderer decides per prompt by
                 // checking what the active template actually produced.
                 ToolCallRawSplicing = ToolCallRawSplicing.WhenTemplateLosesTheRound,
+                // With thinking on, the reply is `<|channel>thought\n...<channel|>` and
+                // then the answer (after a tool result the template primes the opener
+                // itself). The channel's own close is where a structured-output grammar
+                // may start enforcing; without a trigger response_format + think=true
+                // could only be refused.
+                ThinkingGrammarActivationTrigger = "<channel|>",
+                // The model opens its thought channel itself (only a tool-result
+                // continuation with thinking on is primed open), so the budget counts
+                // from `<|channel>` and closes with `<channel|>`. With thinking off no
+                // Gemma 4 template primes anything after a tool result, and priming a
+                // closed `<|channel>thought\n<channel|>` there was measured to make E4B
+                // write its reasoning unmarked into the answer - so the prompt stays as
+                // the template renders it and the sampler bounds what the model does.
+                ThinkingBudgetEndToken = "<channel|>",
+                ThinkingBudgetOpenToken = "<|channel>",
+                SuppressUnopenedThinkingEndAfter = "<tool_response|>",
             });
 
             // ---- Qwen -------------------------------------------------------
@@ -274,6 +290,14 @@ namespace TensorSharp.Runtime
                 // channel, so an unparsed stream shows the raw tags and the whole chain
                 // of thought as if it were the answer.
                 OutputParserAlwaysRequired = true,
+                // With thinking off no trigger: a grammar from token 0 makes the model
+                // write the object with no header (MuseGlimmerOutputParser reads that as
+                // the answer). With thinking on the reply is " to=self<|message|>...",
+                // then "<|start|>assistant to=user<|message|>" and the answer - every
+                // answer header in the 2026-09-16 --thinking run (65/65) had that
+                // recipient - so the grammar arms after it. Without a trigger
+                // response_format + think=true could only be refused (HTTP 400).
+                ThinkingGrammarActivationTrigger = "to=user<|message|>",
             });
 
             Register(new ChatProtocol
@@ -361,9 +385,26 @@ namespace TensorSharp.Runtime
             {
                 Id = "nemotron_h",
                 Architectures = new[] { "nemotron_h", "nemotron_h_moe", "nemotron_h_omni" },
-                Render = r => ChatTemplate.RenderNemotron(r.Messages, r.AddGenerationPrompt, r.Tools, r.EnableThinking),
+                // Two turn formats share this architecture name: ChatML (Nemotron 3
+                // Nano / Omni) and <SPECIAL_10>System / <SPECIAL_11>User|Assistant
+                // (Nemotron-H 8B/47B Reasoning-128K). The embedded template says which
+                // one the checkpoint was trained on.
+                Render = r => ChatTemplate.IsNemotronHReasoningTemplate(r.GgufTemplate)
+                    ? ChatTemplate.RenderNemotronHReasoning(r.Messages, r.AddGenerationPrompt, r.Tools, r.EnableThinking)
+                    : ChatTemplate.RenderNemotron(r.Messages, r.AddGenerationPrompt, r.Tools, r.EnableThinking),
                 PreferOwnRenderer = _ => true,
                 CreateOutputParser = () => new ChatMlOutputParser(),
+                // Thinking on primes `<think>\n` after the assistant marker (thinking off
+                // renders the closed `<think></think>`), so the answer starts after the
+                // model's own `</think>` - the same boundary the Nemotron 3.5 GGUF
+                // template uses. The JSON grammar arms there.
+                ThinkingGrammarActivationTrigger = "</think>",
+                // Nemotron 3.5 / Omni vocabularies carry `</think>` as one token, so the
+                // thinking budget closes the block and the answer (and an armed grammar)
+                // follows inside max_tokens. The Nemotron-H Reasoning-128K GGUFs spell it
+                // in several tokens; WithThinkingBudget then declines and the generic
+                // explained stop stays in place.
+                ThinkingBudgetEndToken = "</think>",
             });
 
             Register(new ChatProtocol

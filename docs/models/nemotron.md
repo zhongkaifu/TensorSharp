@@ -504,13 +504,31 @@ when a GPU backend is selected.
   MoE GPU kernel (`MoEExpertsForward`) so all selected experts run in a
   single dispatch per token, but the token loop is still managed C# — see
   the optimization opportunities below.
-- **Attention prefill** uses the standard managed loop. There is no fused
-  prefill attention kernel for Nemotron-H yet because the score tensor is
-  small (no SWA window machinery is needed since attention layers have no
-  RoPE).
+- **Attention prefill** attends each prompt chunk against the resident K/V
+  in a bounded working set. On GGML backends with an F32 or F16 cache it
+  runs the fused prefill kernel (`GgmlBasicOps.FusedPrefillAttention` /
+  `FusedPrefillAttentionF16KV`), which reads the grouped cache directly and
+  switches to `ggml_flash_attn_ext` once the score tensor would be large.
+  Every other case (non-GGML backends, block-quantized caches) attends in
+  query sub-chunks sized so one `[heads, rows, context]` score tensor stays
+  under `TS_NEMOTRON_ATTN_SCORE_BUDGET_MB` (default 1024). This used to
+  materialize the whole `[heads, chunk, context]` score tensor per layer:
+  a 4,096-token chunk deep into a 32k prompt asked ggml-cuda for 37 GB on
+  the 8B (12.5 GB at 8k on the 47B) and every long request failed with
+  HTTP 500. The same code serves `nemotron_h_moe` (Nemotron 3.5, Nemotron 3
+  Nano Omni).
 - **Mamba2 prefill** processes tokens **sequentially** (loop over `seqLen`)
   through the SSM scan; chunked parallel scanning is on the optimization
   list.
+- **Mamba2 prefill graphs** (`TSGgml_NemotronMamba2PrefillF32`) are cached
+  per chunk length, and every graph intermediate lives in the cached
+  buffer: about 2.7 GB for a 4,096-token chunk on the 8B and 5.5 GB on the
+  47B. The cache is held to a byte budget, `TS_MAMBA2_PREFILL_CACHE_MB`
+  (default 1024), least recently used first out; a graph larger than the
+  whole budget serves its call and is released. It used to keep every
+  distinct chunk length forever, so after a 32k prompt the 47B had no
+  device memory left and the next concurrent decode step failed its
+  allocations with HTTP 500.
 - **Multimodal prefill** supports chunked server prefill by slicing prepared
   image/audio embedding spans per prompt chunk, so long image prompts no longer
   have to run as one monolithic forward pass.
@@ -595,6 +613,15 @@ The batched path therefore needs two orthogonal caches:
 - Per-sequence attention dispatch via `ManagedPagedAttention.Forward`
   (the pure-C# online-softmax kernel) as the correctness reference. The
   native paged kernel path is also wired through `GgmlBasicOps`.
+- The native host-array kernel (`TSGgml_PagedAttentionForward`) caches one
+  graph and backend buffer per shape bucket and pads K/V up to the bucket.
+  That buffer is cleared when a session is built: backend buffers are not
+  zeroed, and CUDA flash attention still reads the `-inf`-masked padded keys,
+  so stale NaN from memory a freed buffer had used (a long prompt that came
+  and went) turned every row of the next batched prefill into NaN. Nemotron
+  3.5 then failed the whole 4-sequence step with an `IndexOutOfRangeException`
+  in `TryMoEPrefillBatchedByExpert` (the router has no top-k for a NaN row).
+  The MoE router now reports a non-finite row by layer and row instead.
 
 ### Mamba2 layers — per-slot conv + SSM state pool
 
@@ -609,6 +636,56 @@ block id** (matching vLLM's `state_indices_tensor`):
 
 Slots are allocated lazily on first touch and freed when the engine
 retires the sequence.
+
+**Device-resident recurrent state.** The native single-token Mamba2 decode
+kernel keeps each sequence's conv/SSM state on the device between tokens
+(downloading ~2 MB per layer per token would cost more than the kernel
+saves), so after a decode step the host arrays are stale. Every host reader
+drains first through `TSGgml_NemotronMamba2DecodeReadState`
+(`SyncMamba2HostState`): the managed/native multi-token forward that
+continues a sequence, the per-block KV snapshot, the migration of the
+single-sequence owner into the slot pool when a second request arrives, the
+native batched step, and the speculative snapshot. Before this, all of them
+read the state from before the first decoded token, so concurrent requests
+(which hand sequences between the per-sequence and batched paths) produced
+different greedy output from the same requests served alone - on the 8B at
+concurrency 4 answers such as `101`, `1000000...` and repetition loops. The
+legacy single-sequence path uses its own decode-cache slot
+(`LegacyMamba2Slot`), so a batched sequence on slot 0 can no longer overwrite
+its device state. A native library that predates the export makes the
+decode kernel download its state every token instead (correct, slower) and
+says so once on stderr.
+
+**Concurrency hand-offs.** Three more defects made requests of a concurrent
+wave answer differently from the same request served alone (on the 8B,
+`17 + 25` came back as `18`, `35`, an empty answer, or another prompt's
+content), and none had anything to do with kernel numerics:
+
+- *Paged pool growth wiped live K/V.* `EnsureNemoPagedBuffers` reused the
+  outer per-layer array when it grew the block pool, so the new buffer
+  replaced the old one before the copy read it. Any sequence decoding in the
+  step that first brought a higher block id (a newcomer's prefill, or the
+  single-sequence owner just migrated in) attended over zeros. The grow now
+  builds fresh outer arrays, as the Qwen 3, Qwen 3.5, Gemma 4 and Mistral 3
+  ports already did.
+- *Borrowed logits on an ownership swap.* A step that forwards one sequence
+  alone lets it borrow the model's reusable logits buffer until it samples.
+  When a newcomer took ownership first, its `Forward` rewrote that buffer
+  and the outgoing owner sampled its next token from the newcomer's logits.
+  `BatchExecutor.EnsureOwnership` now gives the outgoing owner its own copy.
+  This one is model-independent and was also what broke
+  `TS_NEMOTRON_BATCHED=0` at concurrency.
+- *Uncleared paged-attention sessions.* `TSGgml_PagedAttentionForward`
+  caches one graph per query count and power-of-two K/V bucket and uploads
+  only the leading `seq_len` rows; the rest of the bucket is masked. The
+  session assumed its backend buffer started zeroed, which cudaMalloc does
+  not promise, and the CUDA flash-attention kernels compute `q.k` for masked
+  keys before adding the `-inf` mask: a leftover key that overflows gives
+  `inf + -inf = NaN` for the whole row. The session buffer is now cleared
+  when it is built (shared by every model on the native paged kernel). This
+  was fixed as the likely cause of one 47B wave after a 32k prompt decoding
+  `<unk>` forever; a synthetic reproduction could not force the allocator to
+  hand the dirty memory back, so that link is unproven.
 
 A **native batched Mamba2 step kernel** —
 `TSGgml_NemotronMamba2BatchedStepF32`
@@ -639,6 +716,21 @@ active (i.e. unless `TS_NEMOTRON_BATCHED=0` is set).
 
 - **100% greedy match** vs legacy on text-only prompts
   ([`NemotronBatchedCorrectnessTests`](../../InferenceWeb.Tests/NemotronBatchedCorrectnessTests.cs)).
+- Concurrent requests (all at once, joining while the first one is already
+  decoding, and a four-client worker pool) on the per-sequence path
+  (`TS_NEMOTRON_BATCHED=0`) produce exactly the greedy tokens of each request
+  served alone: that path runs the same kernels and swaps state in and out.
+  On the batched path every token chosen is a near-top token when the same
+  history is replayed through the single-sequence forward. Exact token
+  parity is not guaranteed there: the batched step runs different kernels
+  (paged F32 attention instead of the F16 cache, batch-composition dependent
+  quantized matmul), which track the single-sequence logits only to
+  max|dlogit| 0.3-1.4 on the 8B, and a prompt whose top two candidates sit
+  inside that band can flip. A multi-token forward that continues a
+  sequence after decode matches prefilling it from scratch, and a sequence
+  decoding in a step that grows the paged pool keeps its history
+  ([`NemotronHServingRegressionTests`](../../InferenceWeb.Tests/NemotronHServingRegressionTests.cs),
+  needs `TS_TEST_NEMOTRON_H_DIR` and `TS_TEST_GGML_BACKEND=cuda|metal`).
 - Multimodal-prompt correctness is structurally validated (text-only
   stays 100% after removing the multimodal pre-flight rejection) but
   lacks a local audio/image fixture for end-to-end verification.
@@ -663,13 +755,81 @@ be `static readonly`, which captured the env var at class-load time —
 tests setting `TS_NEMOTRON_BATCHED=1` at runtime never actually toggled
 the path. Now exposed as a method getter (same pattern as Qwen 3.5).
 
+### Speculative decoding is refused
+
+Nemotron-H does not speculate: `--draft-model` does not attach a DSpark/DFlash
+drafter (the Nemotron 3.5 Lightning `NVFP4-DSpark` GGUF is recognized and
+reported as not attached; the server stops at startup when `--draft-model` names
+one, saying to drop the flag), and `--spec` or `--spec-type ngram` serve plain
+decoding with a one-time warning. The reason is correctness. A speculative
+stream must equal plain greedy decoding, and on this trunk the multi-token
+verify and the single-token decode use different attention kernels (host
+attention over the expanded cache against the flash-attention decode kernel)
+and different MoE kernels (batched-by-expert against the per-token kernel).
+Measured on `nemotron_h_moe` (A40, `ggml_cuda`): a one-row speculative step
+differs from `Forward` by 0.16-1.1 in the logits and verify rows by 0.2-0.8,
+enough to flip low-margin greedy picks (the 2026-09-16 campaign saw every solo
+DSpark request diverge). The Mamba-2 snapshot/rollback is exact. Running
+attention and MoE row by row makes the verify exact, but 4 rows then cost
+116 ms against a 28 ms decode step (plus 70 ms per DSpark block), so an exact
+verify cannot beat plain decoding. Details: [speculative decoding](../speculative_decoding.md#nemotron-h-refuses-speculation).
+
 ## 12. Output parser and chat template
 
 - `ChatMlOutputParser` parses `<think> ... </think>` for chain-of-thought
-  reasoning and `<tool_call>{...}</tool_call>` for tool calls.
-- Chat template uses the ChatML format (`<|im_start|>` /
-  `<|im_end|>`). Multimodal placeholders include `<image>` (later expanded
-  into `<img>` + N + `</img>`) and `<so_embedding>` (audio).
+  reasoning and `<tool_call>{...}</tool_call>` for tool calls. A JSON list
+  of call objects inside one `<tool_call>` is accepted too (the Reasoning-128K
+  checkpoints' own tool format is a list and they fall back to it), and a
+  body of any other JSON shape yields no call. Such a body used to throw from
+  the parser and abort the streamed HTTP response.
+- `response_format` combines with `"think": true`. Thinking on primes
+  `<think>\n` after the assistant marker (the Nemotron 3.5 GGUF template does
+  the same), so the JSON grammar stays dormant through the reasoning and arms
+  after the model's `</think>` (`ThinkingGrammarActivationTrigger`). Before, the
+  request was refused with HTTP 400. `</think>` is also the family's
+  `ThinkingBudgetEndToken`: on Nemotron 3.5 / Omni, whose vocabulary has it as
+  one token, reaching `TS_THINKING_BUDGET` (75% of an allowance of at least 512
+  tokens) emits it and the constrained answer follows inside `max_tokens`. The
+  Nemotron-H Reasoning-128K GGUFs spell `</think>` in several tokens, so they
+  keep the explained `thinking_budget` stop. Measured on Nemotron 3.5 Lightning
+  IQ4_XS (Metal): with `max_tokens` 256 the reasoning alone used the whole
+  allowance (content empty, `finish_reason=length`); with 1024, json /
+  json_schema / json_unicode passed at c1 and json_schema / json_unicode 4/4 at
+  c4. json at c4 was 1/4: three of the four requests reasoned about a different
+  prompt ("User says: Mars"), the batched-prefill corruption tracked separately.
+- Whitespace between `</think>` and the JSON is part of the prelude
+  (`GrammarConstraint.ActivateAfter(trigger, skipLeadingWhitespace: true)`, used
+  by `response_format` only). The Nemotron-H 8B Reasoning-128K vocabulary spells
+  `</think>\n\n` as `</think` + `>\n\n`; the JSON root cannot start with a
+  line break, so that token was masked, the model wrote `</think}` instead, the
+  trigger never matched and the whole reply stayed reasoning (content null,
+  `json_schema` HTTP 422). Measured on Nemotron-H 8B Q4_K_M (RTX PRO 6000,
+  `--thinking`, c1 and c4, three repeats, `max_tokens` 256): 10 replies wrote
+  `</think}` before, none after; json_schema 4/15 -> 15/15, json 13/15 -> 14/15.
+  json_unicode stayed 0/15 because the reasoning alone reaches 256 tokens; with
+  `max_tokens` 1024 it is 5/5 (c1 + c4). At 1024 json c4 was 0/4 (the objects
+  omit `moons` or reason about a different prompt) and json_schema c4 2/4 (two
+  requests hit the explained `thinking_budget` stop at 768 tokens).
+- Two turn formats ship under the same architecture name, and the GGUF's
+  embedded `tokenizer.chat_template` decides which one is rendered
+  (`ChatTemplate.IsNemotronHReasoningTemplate`):
+  - **Nemotron-H 8B/47B Reasoning-128K** were trained on
+    `<SPECIAL_10>System\n{system}\n<SPECIAL_11>User\n{user}\n<SPECIAL_11>Assistant\n`
+    (EOS is `<SPECIAL_11>`). Reasoning is switched by
+    `{'reasoning': True}` / `{'reasoning': False}` in the system prompt, and
+    the generation prompt then opens (`<think>\n`) or closes
+    (`<think></think>`) the reasoning block. `RenderNemotronHReasoning` adds
+    the marker from the request's `think` flag unless the system prompt
+    already carries one. The shipped template has no tool syntax, so tools
+    are declared in the system prompt with the JSON `<tool_call>`
+    convention and tool results come back as a user turn wrapped in
+    `<tool_response>`. These checkpoints used to be rendered as ChatML: the
+    model saw `<|im_start|>` as plain text and answered with `</think>`,
+    invented `<|im_start|>user` turns and `<unk>` loops.
+  - **Nemotron 3 Nano / Omni** (and every other `nemotron_h*` template) use
+    ChatML (`<|im_start|>` / `<|im_end|>`). Multimodal placeholders include
+    `<image>` (later expanded into `<img>` + N + `</img>`) and
+    `<so_embedding>` (audio).
 
 ## 13. Optimization opportunities
 

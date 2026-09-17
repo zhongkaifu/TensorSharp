@@ -458,9 +458,21 @@ namespace TensorSharp.Models
             _quantBackendReady = true;
         }
 
+        /// <summary>
+        /// Key prefix of this file's hyperparameters (<c>&lt;prefix&gt;.block_count</c>, ...)
+        /// when it differs from <see cref="ModelConfig.Architecture"/>. Null means the two
+        /// are the same, which is true of nearly every GGUF. A family served from a
+        /// generically labelled file (a Mistral 3 checkpoint converted as
+        /// <c>general.architecture = llama</c>) keeps its own protocol id in
+        /// <see cref="ModelConfig.Architecture"/>, so chat rendering, output parsing and
+        /// capability lookups still select the family, while the hyperparameters are read
+        /// under the prefix the converter actually wrote.
+        /// </summary>
+        protected string MetadataArchitecture { get; set; }
+
         protected void ParseBaseConfig()
         {
-            string arch = Config.Architecture;
+            string arch = MetadataArchitecture ?? Config.Architecture;
             Config.NumLayers = (int)_gguf.GetUint32($"{arch}.block_count");
             Config.HiddenSize = (int)_gguf.GetUint32($"{arch}.embedding_length");
             Config.NumHeads = (int)_gguf.GetUint32($"{arch}.attention.head_count");
@@ -488,7 +500,8 @@ namespace TensorSharp.Models
             if (!string.IsNullOrWhiteSpace(ctxEnv) && int.TryParse(ctxEnv, out int envCtx) && envCtx > 0)
                 explicitOverride = envCtx;
 
-            string architecture = Config?.Architecture
+            string architecture = MetadataArchitecture
+                ?? Config?.Architecture
                 ?? _gguf.GetString("general.architecture")
                 ?? string.Empty;
             int modelContextLength = ResolveModelContextLength(
@@ -2447,6 +2460,14 @@ namespace TensorSharp.Models
         /// (e.g. Gemma 4) override this with their window size.
         /// </summary>
         public virtual int MaxReusablePrefixTokens => int.MaxValue;
+
+        /// <summary>Whether a cache holding a media span can be continued past it
+        /// exactly (see <see cref="IModelArchitecture.SupportsReuseAcrossMediaSpan"/>).
+        /// True for absolute-position families; Qwen 3.5's M-RoPE overrides it.</summary>
+        public virtual bool SupportsReuseAcrossMediaSpan => true;
+
+        /// <summary>See <see cref="IModelArchitecture.CanPrefillMediaAfterReusedPrefix"/>.</summary>
+        public virtual bool CanPrefillMediaAfterReusedPrefix(int promptTokens) => true;
 
         /// <summary>
         /// Stable identifier tying snapshots to a specific (model, layer count,

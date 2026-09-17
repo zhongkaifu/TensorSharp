@@ -144,8 +144,8 @@ internal readonly record struct PageRef(KvBlock Block, int PageIndex, PageStore 
 
 /// <summary>
 /// What the tree needs from the block pool for the pages it owns. The engine implementation
-/// (M4) wraps <see cref="BlockPool"/> and the Hunyuan branch's <c>KvBlock.HoldsModelPagedKv</c> /
-/// <c>HoldsSnapshotBytes</c> flags, which are not on the M1 base commit.
+/// (M4) wraps <see cref="BlockPool"/> and the <see cref="KvBlock.HoldsModelPagedKv"/> /
+/// <see cref="KvBlock.HoldsSnapshotBytes"/> flags (on the radix branch since the Phase 0 merge).
 /// </summary>
 internal interface IPrefixTreePageHost
 {

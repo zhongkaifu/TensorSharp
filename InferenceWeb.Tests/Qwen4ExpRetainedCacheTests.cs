@@ -548,6 +548,11 @@ public sealed class Qwen4ExpRetainedCacheTests(ITestOutputHelper output)
     [Qwen4ExpMtpTinyFact]
     public void SharedPrefixChunking_MatchesWholePromptForEachDistinctSuffix()
     {
+        // The small-buffer precondition below needs the fixture's own small cache.
+        // An explicit MAX_CONTEXT allocates the whole context up front (1024 tokens
+        // is 32768 bytes here), so pin the initial size the recorded replay used.
+        using var env = new EnvScope();
+        env.Set("TS_KV_INITIAL_TOKENS", "8");
         using var fixture = new Fixture(output);
         int[] prefix = Other.Concat(Prompt).ToArray();
         foreach (bool preGrow in new[] { false, true })

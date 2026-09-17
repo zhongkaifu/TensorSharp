@@ -126,9 +126,15 @@ Evidence (synthetic fixtures, not trained-model acceptance or performance):
 — `Qwen4ExpRetainedCacheTests` / `Qwen4ExpRetainedCachePolicyTests` cover
 retained A/B/A, checkpoint clones, speculative rebound, budget eviction,
 missing-state refusal and QSA first/reset growth on CPU, and a physical
-two-GPU layer-split checkpoint lifecycle on CUDA. One strict CUDA gate remains
-failed: chunked 16+4 versus whole 20-token prefill still differs in full
-logits (same greedy argmax).
+two-GPU layer-split checkpoint lifecycle on CUDA. Three strict bit-exactness
+gates pass on CPU and remain failed on single-GPU CUDA, all with the same
+greedy argmax on this untrained fixture: chunked 16+4 versus whole 20-token
+prefill differs in full logits (`SharedPrefixChunking_…`); a four-token target
+verify differs from four scalar forwards (`TeacherForcedTargetVerify_…`, max
+abs 0.0070); and 32 teacher-forced tokens committed in blocks of 2-4 differ
+from scalar decode (`RepeatedTargetBlocks_…`, max abs 0.0082). The CUDA target
+graph's reductions depend on the batch width; the isolated precision
+prototypes in the evidence README close some of these but are not integrated.
 
 ## Multi-GPU
 

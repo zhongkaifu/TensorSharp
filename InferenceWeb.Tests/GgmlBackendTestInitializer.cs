@@ -50,14 +50,9 @@ internal static class GgmlBackendTestInitializer
         if (Environment.GetEnvironmentVariable("TS_TEACHER_TOKEN_EXPORT") == "1")
             return;
 
-        GgmlBackendType backend =
-            (Environment.GetEnvironmentVariable("TS_TEST_GGML_BACKEND") ?? "cpu").Trim().ToLowerInvariant() switch
-            {
-                "metal" => GgmlBackendType.Metal,
-                "cuda" => GgmlBackendType.Cuda,
-                "vulkan" => GgmlBackendType.Vulkan,
-                _ => GgmlBackendType.Cpu,
-            };
+        // Shared with TestGates.GgmlPinSkip, which skips tests that construct
+        // a different GGML backend than the one pinned here.
+        GgmlBackendType backend = TestGates.PinnedGgmlBackendType;
 
         // Best effort: a host without the native bridge built must still be able
         // to run the ~1200 tests that never touch GGML. The tests that DO touch

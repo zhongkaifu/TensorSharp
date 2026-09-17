@@ -212,6 +212,19 @@ namespace TensorSharp.Server
             };
     }
 
+    /// <summary>
+    /// State one client turn carries across the generations it runs: the skills/code
+    /// tool loop calls the pipeline once per round, and every round must run in the cache
+    /// scope the first one resolved (on a shared session that scope is proved from the
+    /// history, and round two's history ends in the loop's own rounds).
+    /// </summary>
+    internal sealed class ChatTurnContext
+    {
+        /// <summary>The engine cache scope (<see cref="SequenceState.CacheScope"/>), set by
+        /// the first generation of the turn.</summary>
+        public string CacheScope { get; set; }
+    }
+
     internal sealed class ChatGenerationPipeline : IDisposable
     {
         private readonly ModelLifecycleService _lifecycle;
@@ -270,9 +283,10 @@ namespace TensorSharp.Server
                 [EnumeratorCancellation] CancellationToken cancellationToken,
                 SamplingConfig samplingConfig = null,
                 List<ToolFunction> tools = null,
-                bool enableThinking = false)
+                bool enableThinking = false,
+                ChatTurnContext turnContext = null)
         {
-            session ??= new ChatSession("__svc_intrinsic__");
+            session ??= new ChatSession("__svc_intrinsic__", sharedAcrossConversations: true);
             var model = _lifecycle.Model
                 ?? throw new InvalidOperationException("No model is loaded.");
 
@@ -325,9 +339,16 @@ namespace TensorSharp.Server
             // A prompt fact carried on the sampling config (see SamplingConfig.ReasoningEffort).
             string reasoningEffort = samplingConfig?.ReasoningEffort;
             var preparedHistory = ChatHistoryPreparer.PrepareHistoryForInference(history, arch, _logger);
-            List<ChatMessage> renderHistory;
+            TranscriptAugmentation augmentation;
             lock (session.HistoryLock)
-                renderHistory = ChatHistoryPreparer.AugmentWithCachedRawTokens(preparedHistory, session.TrackedHistory);
+                augmentation = session.Transcripts.Augment(preparedHistory);
+            List<ChatMessage> renderHistory = augmentation.History;
+            // Which conversation's cached state this request may continue past the
+            // public prefix: the session's own (Web UI chat), or the one the history
+            // just proved it continues (stateless APIs), or a fresh one.
+            turnContext ??= new ChatTurnContext();
+            turnContext.CacheScope ??= session.ResolveCacheScope(augmentation.InheritedScope);
+            string cacheScope = turnContext.CacheScope;
             bool preserveAttachedDocuments = HasTextFileAttachments(renderHistory);
 
             using var chatScope = _telemetry.BeginInferenceScope(
@@ -349,6 +370,7 @@ namespace TensorSharp.Server
             var promptSw = Stopwatch.StartNew();
             int effectiveMaxTokens;
             List<int> explicitBreakpoints = null;
+            IReadOnlyList<PromptMediaSpan> mediaSpans = null;
             string generationPromptTrailingWhitespace;
             List<int> inputTokens = _kvCacheRenderer.RenderToTokens(
                 model.Tokenizer, model.Config.ChatTemplate, renderHistory, arch,
@@ -552,6 +574,10 @@ namespace TensorSharp.Server
                         executionContextLimit: engineContextLimit,
                         explicitBreakpoints: explicitBreakpoints,
                         preservedInputKind: preserveAttachedDocuments ? "document and media input" : "media input");
+
+                    // Where each image/audio span landed and what it is, after any trim:
+                    // the engine compares these positionally when it reuses a prefix.
+                    mediaSpans = model.MultimodalInjector.GetPreparedMediaSpans(requestId);
                 }
             }
             else
@@ -565,15 +591,11 @@ namespace TensorSharp.Server
             int promptTokenCount = inputTokens.Count;
             var cfg = samplingConfig ?? SamplingConfig.Default;
             int thinkingBudget = ThinkingBudgetFor(effectiveMaxTokens, enableThinking);
-            cfg = WithThinkingBudget(cfg, model.Tokenizer, arch, thinkingBudget, out bool samplingEndsThinking);
-
-            // Fingerprint the media (images/audio/video) folded into this prompt.
-            // The image/placeholder token IDs are identical across requests, so the
-            // prefix-cache block hashes must be salted with the actual media content
-            // — otherwise a later request with the *same* template but a *different*
-            // image would adopt the previous image's K/V blocks and describe a stale
-            // image. Null for text-only prompts (no change to their cache behavior).
-            string mediaFingerprint = BuildMediaFingerprint(renderHistory);
+            // With thinking off only a family whose model opens its channel itself is
+            // given a (small) cap; WithThinkingBudget ignores it for every other family.
+            int channelBudget = enableThinking ? thinkingBudget : UnrequestedThinkingBudgetFor(effectiveMaxTokens);
+            cfg = WithThinkingBudget(cfg, model.Tokenizer, arch, channelBudget, out bool samplingEndsThinking,
+                enableThinking, inputTokens);
 
             // Where the prompt every conversation on this host shares ends, so the
             // engine can checkpoint its state there once and start the next new chat
@@ -588,15 +610,16 @@ namespace TensorSharp.Server
                 blockSize: enginePoolStats.blockSize,
                 samplingConfig: cfg,
                 userTag: session,
-                mediaFingerprint: mediaFingerprint,
+                mediaSpans: mediaSpans,
                 cacheBreakpoints: explicitBreakpoints,
-                sharedPrefixTokens: sharedPrefixTokens);
+                sharedPrefixTokens: sharedPrefixTokens,
+                cacheScope: cacheScope);
 
             promptSw.Stop();
             long promptNs = InferenceTelemetry.ToNanos(promptSw.ElapsedTicks);
 
             string recordedSuffix = RecordedGenerationSuffix(model.Tokenizer, inputTokens, arch, enableThinking);
-            if (arch == "gemma4" && recordedSuffix.EndsWith("<|channel>thought\n", StringComparison.Ordinal))
+            if (SignalsOpenThoughtChannel(arch, recordedSuffix))
                 yield return ChatStreamUpdate.Text(string.Empty) with { RawGenerationSuffix = recordedSuffix };
 
             var evalSw = Stopwatch.StartNew();
@@ -777,10 +800,24 @@ namespace TensorSharp.Server
             evalSw.Stop();
             totalSw.Stop();
 
-            lock (session.HistoryLock)
-                ChatHistoryPreparer.UpdateTrackedHistory(
-                    session.TrackedHistory, renderHistory, assistantText, generatedTokens,
-                    generationPromptTrailingWhitespace, recordedSuffix);
+            // Record this turn for the next request of the same conversation: the raw
+            // tokens the cache holds, and what the client was sent for them - the next
+            // request's assistant message must match that to get the tokens back.
+            RecordGeneratedTurn(session, preparedHistory, renderHistory, cacheScope,
+                new ChatMessage
+                {
+                    Role = "assistant",
+                    Content = assistantText,
+                    RawOutputTokens = generatedTokens,
+                    RawPromptTrailingWhitespace = generationPromptTrailingWhitespace,
+                    RawGenerationSuffix = recordedSuffix,
+                },
+                BuildEmittedTurn(arch, assistantText, enableThinking, tools,
+                    // Parsers are primed with the prompt's open channel exactly when this
+                    // pipeline announced it (above); mirror that, or the recorded content
+                    // would differ from what the adapters parsed.
+                    SignalsOpenThoughtChannel(arch, recordedSuffix) ? recordedSuffix : null,
+                    wasCancelled));
 
             if (stopped != null)
             {
@@ -850,17 +887,16 @@ namespace TensorSharp.Server
             [EnumeratorCancellation] CancellationToken cancellationToken,
             bool enableThinking = false)
         {
-            session ??= new ChatSession("__svc_intrinsic__");
+            session ??= new ChatSession("__svc_intrinsic__", sharedAcrossConversations: true);
             var model = (DiffusionGemmaModel)(_lifecycle.Model
                 ?? throw new InvalidOperationException("No model is loaded."));
             string arch = model.Config.Architecture;
 
             var preparedHistory = ChatHistoryPreparer.PrepareHistoryForInference(history, arch, _logger);
-            // Snapshot the (shared, for DefaultSession) tracked history under the session lock so a parallel
-            // request's turn-end rewrite can't race this read.
+            // Read under the session lock so a parallel request's record can't race it.
             List<ChatMessage> renderHistory;
             lock (session.HistoryLock)
-                renderHistory = ChatHistoryPreparer.AugmentWithCachedRawTokens(preparedHistory, session.TrackedHistory);
+                renderHistory = session.Transcripts.Augment(preparedHistory).History;
             bool preserveAttachedDocuments = HasTextFileAttachments(renderHistory);
 
             using var chatScope = _telemetry.BeginInferenceScope(
@@ -920,10 +956,16 @@ namespace TensorSharp.Server
             var (finalContent, finalThinking) =
                 SeparateDiffusionChannels(arch, finalText, enableThinking, generationSuffix);
 
-            lock (session.HistoryLock)
-                ChatHistoryPreparer.UpdateTrackedHistory(
-                    session.TrackedHistory, renderHistory, finalText, generated,
-                    generationPromptTrailingWhitespace);
+            RecordGeneratedTurn(session, preparedHistory, renderHistory, cacheScope: null,
+                new ChatMessage
+                {
+                    Role = "assistant",
+                    Content = finalText,
+                    RawOutputTokens = generated,
+                    RawPromptTrailingWhitespace = generationPromptTrailingWhitespace,
+                },
+                new EmittedAssistantTurn(finalContent, null, finalThinking, finalText,
+                    cancellationToken.IsCancellationRequested));
 
             long totalNs = InferenceTelemetry.ToNanos(totalSw.ElapsedTicks);
             _telemetry.LogChatFinished(
@@ -1012,6 +1054,44 @@ namespace TensorSharp.Server
             for (int i = 0; i < cut; i++) slice.Add(tokens[i]);
             try { return model.Tokenizer.Decode(slice); }
             catch { return string.Empty; }
+        }
+
+        private static bool SignalsOpenThoughtChannel(string arch, string recordedSuffix)
+            => arch == "gemma4" && recordedSuffix != null
+                && recordedSuffix.EndsWith("<|channel>thought\n", StringComparison.Ordinal);
+
+        private static void RecordGeneratedTurn(
+            ChatSession session, List<ChatMessage> preparedHistory, List<ChatMessage> renderHistory,
+            string cacheScope, ChatMessage generated, EmittedAssistantTurn emitted)
+        {
+            lock (session.HistoryLock)
+                session.Transcripts.Record(preparedHistory, generated, emitted, cacheScope, renderHistory);
+        }
+
+        /// <summary>
+        /// What a client received for <paramref name="rawText"/>: the family's output
+        /// parser run over it the way the protocol adapters and the Web UI run it
+        /// (thinking mode, tools, the prompt's open channel), plus the raw text for a
+        /// client that runs no parser. A parser failure leaves the raw text as content.
+        /// </summary>
+        internal static EmittedAssistantTurn BuildEmittedTurn(
+            string arch, string rawText, bool enableThinking, List<ToolFunction> tools,
+            string generationSuffix, bool cancelled)
+        {
+            rawText ??= string.Empty;
+            try
+            {
+                IOutputParser parser = OutputParserFactory.Create(arch);
+                parser.Init(enableThinking, tools);
+                parser.SetGenerationPromptSuffix(generationSuffix);
+                ParsedOutput parsed = parser.Add(rawText, true);
+                return new EmittedAssistantTurn(parsed.Content ?? string.Empty, parsed.ToolCalls,
+                    parsed.Thinking, rawText, cancelled);
+            }
+            catch (Exception)
+            {
+                return new EmittedAssistantTurn(rawText, null, null, rawText, cancelled);
+            }
         }
 
         /// <summary>Below this many shared tokens a checkpoint is not worth its copy.</summary>
@@ -1178,7 +1258,7 @@ namespace TensorSharp.Server
             {
                 new ChatMessage { Role = "user", Content = prompt, ImagePaths = imagePaths }
             };
-            var freshSession = new ChatSession("__generate_intrinsic__");
+            var freshSession = new ChatSession("__generate_intrinsic__", sharedAcrossConversations: true);
             await foreach (var item in ChatStreamWithMetricsAsync(
                 freshSession, oneShot, maxTokens, cancellationToken, samplingConfig))
             {
@@ -1530,7 +1610,10 @@ namespace TensorSharp.Server
                 "prompt.truncated from {OriginalTokens} to {KeptTokens} tokens (contextLimit={ContextLimit}, generationReserve={MaxTokens}, sessionId={SessionId})",
                 inputTokens.Count, kept, maxCtx, effectiveMaxTokens, session?.Id ?? "(none)");
             model.MultimodalInjector.TrimPreparedPrompt(trimStart, requestId);
-            session?.TrackedHistory.Clear();
+            // Recorded turns are NOT cleared here. They are keyed by the history that
+            // preceded each turn and spliced only where a later request reproduces it, so
+            // dropping this prompt's head invalidates none of them; clearing a shared
+            // session's store would also have wiped every other conversation's turns.
 
             // Dropping the first trimStart tokens renumbers everything that
             // survives, so the breakpoints have to move with it (in place - the
@@ -1707,12 +1790,10 @@ namespace TensorSharp.Server
         }
 
         /// <summary>
-        /// Build a stable fingerprint of every image/audio attachment in the
-        /// prompt, in prompt order. Uploads are stored under content-addressed
-        /// filenames, so the path identifies the content: identical media yields
-        /// the same fingerprint (prefix cache reused), different media yields a
-        /// different one (prefix cache correctly bypassed). Returns null when the
-        /// prompt has no media, leaving text-only cache behavior unchanged.
+        /// A string naming every image/audio attachment of a history in order, or null
+        /// when there is none. Used only to tell whether history compaction removed
+        /// media; prompt reuse compares media positionally by content instead
+        /// (<see cref="SequenceState.MediaSpans"/>).
         /// </summary>
         private static string BuildMediaFingerprint(List<ChatMessage> history)
         {
@@ -1828,15 +1909,66 @@ namespace TensorSharp.Server
             return (int)(maxTokens * 0.75);
         }
 
+        /// <summary>
+        /// Cap for a reasoning channel the model opens although the request turned
+        /// thinking OFF (families declaring <see cref="ChatProtocol.ThinkingBudgetOpenToken"/>).
+        /// That channel never reaches the client, so every token in it is latency nobody
+        /// asked for, and a model that stays in it until <c>max_tokens</c> returns an empty
+        /// answer - Gemma 4 E4B did exactly that on the final turn of a tool workflow
+        /// (256 tokens of thought, content empty). A short, closed thought still lets it
+        /// answer: measured on E4B (Metal, Q8_0) the channel closed at the first line break
+        /// past 16, 32, 48 or 64 tokens was followed by the correct result every time,
+        /// while closing at exactly 16 or 64 tokens - mid-sentence - produced leaked
+        /// reasoning and a tool call. A quarter of the allowance, at most 64 tokens;
+        /// <c>TS_THINKING_BUDGET=0</c> disables it together with the thinking cap.
+        /// </summary>
+        internal static int UnrequestedThinkingBudgetFor(int maxTokens)
+        {
+            if (maxTokens <= 0)
+                return 0;
+            string configured = Environment.GetEnvironmentVariable("TS_THINKING_BUDGET");
+            if (!string.IsNullOrWhiteSpace(configured)
+                && int.TryParse(configured, NumberStyles.Integer, CultureInfo.InvariantCulture, out int explicitBudget)
+                && explicitBudget <= 0)
+                return 0;
+            return Math.Clamp(maxTokens / 4, 1, MaxUnrequestedThinkingTokens);
+        }
+
+        internal const int MaxUnrequestedThinkingTokens = 64;
+
         internal static SamplingConfig WithThinkingBudget(SamplingConfig config, ITokenizer tokenizer,
-            string architecture, int tokenBudget, out bool installed)
+            string architecture, int tokenBudget, out bool installed,
+            bool enableThinking = true, IReadOnlyList<int> promptTokens = null)
         {
             installed = false;
-            string end = ChatProtocolRegistry.For(architecture)?.ThinkingBudgetEndToken;
-            if (tokenBudget <= 0 || end == null || tokenizer == null || config.Grammar?.IsActive == true)
+            var protocol = ChatProtocolRegistry.For(architecture);
+            string end = protocol?.ThinkingBudgetEndToken;
+            if (end == null || tokenizer == null || config.Grammar?.IsActive == true)
                 return config;
-            int id = tokenizer.LookupToken(end);
-            if (id < 0 || id >= tokenizer.VocabSize || tokenizer.Vocab[id] != end || tokenizer.IsEos(id))
+            int id = TrainedSingleToken(tokenizer, end);
+            if (id < 0)
+                return config;
+
+            int openId = -1;
+            bool openAtStart = true;
+            bool suppressUnopenedEnd = false;
+            if (protocol.ThinkingBudgetOpenToken != null)
+            {
+                openId = TrainedSingleToken(tokenizer, protocol.ThinkingBudgetOpenToken);
+                if (openId < 0 || openId == id)
+                    return config;
+                openAtStart = PromptLeavesChannelOpen(promptTokens, openId, id);
+                suppressUnopenedEnd = !enableThinking && !openAtStart
+                    && PromptEndsWith(tokenizer, promptTokens, protocol.SuppressUnopenedThinkingEndAfter);
+            }
+            else if (!enableThinking)
+            {
+                // A family whose channel only the prompt opens has nothing to cap when
+                // thinking is off: its prompt closed the channel, and the reply is the answer.
+                return config;
+            }
+
+            if (tokenBudget <= 0 && !suppressUnopenedEnd)
                 return config;
             // The caller's config can be shared by requests. Only this request
             // gets the immutable budget policy and an independent grammar position.
@@ -1844,9 +1976,65 @@ namespace TensorSharp.Server
             // may reuse one delayed-grammar config across concurrent requests.
             SamplingConfig result = config.Clone();
             result.Grammar = config.Grammar?.Fork();
-            result.ThinkingBudget = new ThinkingTokenBudget(tokenBudget, id, closeOnRepetition: true);
+            // A channel the request did not ask for closes at a line break (see
+            // ThinkingTokenBudget.CloseAtBoundary); a requested one keeps its exact budget.
+            Func<int, bool> boundary = enableThinking ? null : EndsLine(tokenizer);
+            result.ThinkingBudget = new ThinkingTokenBudget(tokenBudget > 0 ? tokenBudget : int.MaxValue, id,
+                closeOnRepetition: true, openTokenId: openId, openAtStart: openAtStart,
+                suppressUnopenedEnd: suppressUnopenedEnd, closeAtBoundary: boundary);
             installed = true;
             return result;
+        }
+
+        private static Func<int, bool> EndsLine(ITokenizer tokenizer) => token =>
+        {
+            try
+            {
+                return tokenizer.Decode(new List<int> { token }).EndsWith('\n');
+            }
+            catch (Exception)
+            {
+                return false;
+            }
+        };
+
+        private static int TrainedSingleToken(ITokenizer tokenizer, string text)
+        {
+            int id = tokenizer.LookupToken(text);
+            return id < 0 || id >= tokenizer.VocabSize || tokenizer.Vocab[id] != text || tokenizer.IsEos(id) ? -1 : id;
+        }
+
+        /// <summary>The prompt's tail opens a channel it does not close (Gemma 4 primes
+        /// <c>&lt;|channel&gt;thought\n</c> after a tool result with thinking on).</summary>
+        internal static bool PromptLeavesChannelOpen(IReadOnlyList<int> promptTokens, int openId, int endId)
+        {
+            if (promptTokens == null)
+                return false;
+            int stop = Math.Max(0, promptTokens.Count - 64);
+            for (int i = promptTokens.Count - 1; i >= stop; i--)
+            {
+                if (promptTokens[i] == endId) return false;
+                if (promptTokens[i] == openId) return true;
+            }
+            return false;
+        }
+
+        private static bool PromptEndsWith(ITokenizer tokenizer, IReadOnlyList<int> promptTokens, string marker)
+        {
+            if (string.IsNullOrEmpty(marker) || promptTokens == null || promptTokens.Count == 0)
+                return false;
+            try
+            {
+                int take = Math.Min(promptTokens.Count, 16);
+                var tail = new List<int>(take);
+                for (int i = promptTokens.Count - take; i < promptTokens.Count; i++)
+                    tail.Add(promptTokens[i]);
+                return tokenizer.Decode(tail).TrimEnd().EndsWith(marker, StringComparison.Ordinal);
+            }
+            catch (Exception)
+            {
+                return false;
+            }
         }
 
         private static int FindValidUtf8Length(List<byte> bytes)

@@ -360,8 +360,9 @@ blk.{L}.ffn_down_shexp.weight
 
 - **Per-layer 派发表**（`_layerPrefixes`、`_layerWeightNames`）避免热循环里的字符串拼接。
 - **MoE prefill** 仍然 per token 迭代。每 token 用批量 MoE GPU kernel（`MoEExpertsForward`），所以一次派发跑完所有被选 expert，但 token 循环还是托管 C# —— 见下方优化机会。
-- **Attention prefill** 走标准托管循环。Nemotron-H 还没有融合 prefill attention kernel，因为 attention 层没有 RoPE，得分张量也比较小（不需要 SWA 窗口的 machinery）。
+- **Attention prefill** 在有界工作集内让每个 prompt chunk 与已驻留的 K/V 做注意力。GGML 后端且 cache 为 F32 / F16 时走融合 prefill kernel（`GgmlBasicOps.FusedPrefillAttention` / `FusedPrefillAttentionF16KV`），它直接读取分组 cache，得分张量较大时切换到 `ggml_flash_attn_ext`。其他情况（非 GGML 后端、块量化 cache）按 query 子块计算，使单个 `[heads, rows, context]` 得分张量不超过 `TS_NEMOTRON_ATTN_SCORE_BUDGET_MB`（默认 1024）。此前每层都物化整个 `[heads, chunk, context]` 得分张量：8B 上 32k prompt 深处的 4,096 token chunk 向 ggml-cuda 申请 37 GB（47B 在 8k 时 12.5 GB），所有长请求都以 HTTP 500 失败。同一份代码也服务 `nemotron_h_moe`（Nemotron 3.5、Nemotron 3 Nano Omni）。
 - **Mamba2 prefill** 顺序处理 token（按 `seqLen` 循环）跑 SSM scan；分块并行扫描在优化清单上。
+- **Mamba2 prefill 计算图**（`TSGgml_NemotronMamba2PrefillF32`）按 chunk 长度缓存，计算图的所有中间张量都驻留在缓存的 buffer 中：8B 上 4,096 token 的 chunk 约 2.7 GB，47B 上约 5.5 GB。缓存受字节预算 `TS_MAMBA2_PREFILL_CACHE_MB`（默认 1024）约束，按最近最少使用淘汰；大于整个预算的计算图只服务当次调用后即释放。此前每种不同的 chunk 长度都会永久保留，47B 处理完 32k prompt 后设备内存耗尽，下一个并发 decode 步骤分配失败并返回 HTTP 500。
 - **多模态 prefill** 支持按 prompt chunk 切片已准备好的图像 / 音频 embedding span，因此长图像 prompt 不再必须作为一个超大的 forward pass 执行。
 - **多模态 warmup** 在加载 Nemotron `mmproj` 的服务器启动阶段运行一次小的视觉编码和 image-token prefill，把 Metal pipeline 初始化从第一个真实图像请求前移；设置 `TS_NEMOTRON_MULTIMODAL_WARMUP=0` 可关闭。
 
@@ -423,6 +424,13 @@ Nemotron-H 是所有批处理移植里最复杂的，因为它结合了**三种�
 - 按序列的注意力派发使用 `ManagedPagedAttention.Forward`（纯 C# 在线
   softmax 内核）作为正确性参考；同时通过 `GgmlBasicOps` 接入了原生分页
   内核路径。
+- 原生主机数组内核（`TSGgml_PagedAttentionForward`）按形状桶缓存一份计算图和
+  后端缓冲，并把 K/V 填充到桶长。构建会话时现在会清零该缓冲：后端缓冲本身不保证为零，
+  而 CUDA flash attention 仍会读取被 `-inf` 掩码的填充 key，因此被释放缓冲留下的
+  NaN（例如一个长提示结束之后）会让下一次批处理 prefill 的每一行都变成 NaN。
+  Nemotron 3.5 随后在 `TryMoEPrefillBatchedByExpert` 中抛出
+  `IndexOutOfRangeException`（NaN 行没有 top-k），整个 4 序列步失败。
+  现在 MoE 路由器会按层和行号报告非有限值的行。
 
 ### Mamba2 层 —— 每槽位 conv + SSM 状态池
 
@@ -436,6 +444,14 @@ Nemotron-H 是所有批处理移植里最复杂的，因为它结合了**三种�
   标志。
 
 槽位在首次访问时分配，序列在引擎中被回收时释放。
+
+**驻留在设备上的递归状态。** 原生单 token Mamba2 decode kernel 在 token 之间把每个序列的 conv/SSM 状态留在设备上（每层每 token 下载约 2 MB 的代价超过 kernel 省下的时间），所以 decode 之后 host 数组是过期的。所有读取 host 状态的地方都会先通过 `TSGgml_NemotronMamba2DecodeReadState`（`SyncMamba2HostState`）把设备状态拷回：继续同一序列的托管 / 原生多 token forward、按块 KV 快照、第二个请求到达时把单序列 owner 迁移进槽位池、原生批处理步，以及投机解码快照。此前它们读到的都是第一个 decode token 之前的状态，因此并发请求（会在按序列路径和批处理路径之间交接序列）的贪心输出与单独服务同一请求时不同——8B 在并发 4 时出现 `101`、`1000000...` 以及重复循环。旧的单序列路径使用独立的 decode cache 槽位（`LegacyMamba2Slot`），批处理序列占用 slot 0 时不会再覆盖它的设备状态。若原生库早于该导出函数，decode kernel 会改为每个 token 下载状态（结果正确、速度较慢），并在 stderr 提示一次。
+
+**并发交接。** 另外三个缺陷让并发批次中的请求回答与单独服务时不同（8B 上 `17 + 25` 被回答成 `18`、`35`、空回答或其他 prompt 的内容），均与 kernel 数值无关：
+
+- *分页池扩容清空了在用的 K/V。* `EnsureNemoPagedBuffers` 扩容 block 池时复用了外层按层数组，新 buffer 在拷贝读取旧 buffer 之前就替换了它。在首次引入更大 block id 的那一步（新请求的 prefill，或刚迁移进来的单序列 owner）中 decode 的序列都会对全零做注意力。现在扩容时新建外层数组，与 Qwen 3、Qwen 3.5、Gemma 4、Mistral 3 的移植一致。
+- *所有权切换时借用的 logits。* 单独前向一个序列的步骤会让它借用模型可复用的 logits buffer，直到它采样。若新请求先取得所有权，其 `Forward` 会改写该 buffer，被换出的 owner 于是从新请求的 logits 中采样下一个 token。`BatchExecutor.EnsureOwnership` 现在给被换出的 owner 一份自己的拷贝。此问题与模型无关，也正是 `TS_NEMOTRON_BATCHED=0` 在并发下出错的原因。
+- *未清零的分页注意力 session。* `TSGgml_PagedAttentionForward` 按 query 数与 2 的幂 K/V bucket 缓存计算图，只上传前 `seq_len` 行，bucket 其余部分被 mask。session 假定其 backend buffer 初始为零，但 cudaMalloc 并不保证；CUDA flash attention kernel 会先为被 mask 的 key 计算 `q.k` 再加上 `-inf` mask：残留且溢出的 key 得到 `inf + -inf = NaN`，整行变为 NaN。现在 session 构建时清零其 buffer（所有使用原生分页 kernel 的模型共用）。这被作为 47B 在 32k prompt 之后某个批次一直解码出 `<unk>` 的可能原因修复；合成复现无法迫使分配器交还脏内存，因此两者的关联尚未证实。
 
 **原生批处理 Mamba2 步内核** —— `TSGgml_NemotronMamba2BatchedStepF32`
 （[`ggml_ops_mamba2.cpp`](../../TensorSharp.GGML.Native/ggml_ops_mamba2.cpp)）
@@ -461,6 +477,8 @@ Nemotron-H 是所有批处理移植里最复杂的，因为它结合了**三种�
 
 - 文本 prompt 上与旧路径**100% 贪心一致**
   （[`NemotronBatchedCorrectnessTests`](../../InferenceWeb.Tests/NemotronBatchedCorrectnessTests.cs)）。
+- 在按序列路径（`TS_NEMOTRON_BATCHED=0`）上，并发请求（同时到达、在第一个请求已在 decode 时加入、以及四客户端 worker pool）与单独服务每个请求得到完全相同的贪心 token：该路径使用相同的 kernel，并把状态换入换出。批处理路径上，把同一历史回放到单序列 forward 时，所选的每个 token 都是接近最高分的 token。批处理路径不保证逐 token 完全一致：批处理步骤使用不同的 kernel（分页 F32 注意力而非 F16 cache、依赖批次组成的量化 matmul），在 8B 上与单序列 logits 只相差 max|dlogit| 0.3-1.4，前两名候选落在该范围内的 prompt 可能翻转。decode 之后继续同一序列的多 token forward 与从头 prefill 一致，在扩容分页池的步骤中 decode 的序列也保留其历史
+  （[`NemotronHServingRegressionTests`](../../InferenceWeb.Tests/NemotronHServingRegressionTests.cs)，需要 `TS_TEST_NEMOTRON_H_DIR` 与 `TS_TEST_GGML_BACKEND=cuda|metal`）。
 - 多模态 prompt 的正确性已被结构性验证（在移除多模态预检拒绝后纯文本仍
   100%），但缺少本地 audio/image fixture 用于端到端验证。
 
@@ -482,10 +500,26 @@ GgmlMetal、进程内 legacy-vs-batched 切换；详见
 在 class-load 时捕获环境变量 —— 测试在运行时设置 `TS_NEMOTRON_BATCHED=1`
 实际无法切换路径。现在改为方法 getter（与 Qwen 3.5 的写法一致）。
 
+### 投机解码被拒绝
+
+Nemotron-H 不做投机解码：`--draft-model` 不会挂载 DSpark/DFlash 草稿器（Nemotron 3.5
+Lightning 的 `NVFP4-DSpark` GGUF 会被识别并报告“未挂载”；服务器在 `--draft-model` 指定它时会在启动阶段失败并提示去掉该参数），`--spec` 或
+`--spec-type ngram` 也只提供普通解码，并打印一次警告。原因是正确性：投机输出必须与普通贪心解码一致，
+而在这个主干上，多 token verify 与单 token decode 使用不同的注意力内核（基于展开缓存的主机端注意力 vs.
+flash-attention decode 内核）和不同的 MoE 内核（按专家批处理 vs. 逐 token 内核）。在 `nemotron_h_moe`
+（A40，`ggml_cuda`）上实测：单行投机步与 `Forward` 的 logits 相差 0.16-1.1，verify 各行相差 0.2-0.8，
+足以翻转低置信度的贪心选择（2026-09-16 验证中每个单序列 DSpark 请求都发生了偏离）。Mamba-2 的快照 / 回滚是精确的。
+把注意力和 MoE 逐行运行可以让 verify 精确，但 4 行需要 116 ms，而一个 decode 步只要 28 ms（另加每个 DSpark 块 70 ms），
+因此精确的 verify 无法快过普通解码。详见 [投机解码](../speculative_decoding.md#nemotron-h-refuses-speculation)。
+
 ## 12. 输出解析器与聊天模板
 
-- `ChatMlOutputParser` 解析 `<think> ... </think>` 思维链与 `<tool_call>{...}</tool_call>` 工具调用。
-- 聊天模板使用 ChatML 格式（`<|im_start|>` / `<|im_end|>`）。多模态占位符包括 `<image>`（之后展开为 `<img>` + N 个 token + `</img>`）与 `<so_embedding>`（音频）。
+- `ChatMlOutputParser` 解析 `<think> ... </think>` 思维链与 `<tool_call>{...}</tool_call>` 工具调用。单个 `<tool_call>` 内的 JSON 调用对象列表同样被接受（Reasoning-128K checkpoint 自身的工具格式就是列表，模型会退回到该格式），其他任何 JSON 形状的调用体不产生调用。此前这样的调用体会让解析器抛出异常并中断流式 HTTP 响应。
+- `response_format` 可以与 `"think": true` 同时使用。开启思考时 prompt 在 assistant 标记后预置 `<think>\n`（Nemotron 3.5 的 GGUF 模板也是如此），因此 JSON 语法在推理期间保持休眠，并在模型输出 `</think>` 后启用（`ThinkingGrammarActivationTrigger`）。此前该组合返回 HTTP 400。`</think>` 同时是该家族的 `ThinkingBudgetEndToken`：Nemotron 3.5 / Omni 的词表中它是单个 token，达到 `TS_THINKING_BUDGET`（输出额度不少于 512 token 时为 75%）时会输出它，受约束的答案在原有 `max_tokens` 内继续。Nemotron-H Reasoning-128K 的 GGUF 用多个 token 拼出 `</think>`，因此保留带说明的 `thinking_budget` 停止。在 Nemotron 3.5 Lightning IQ4_XS（Metal）上实测：`max_tokens` 为 256 时推理就用完了全部额度（content 为空，`finish_reason=length`）；为 1024 时 json / json_schema / json_unicode 在 c1 全部通过，json_schema / json_unicode 在 c4 为 4/4。json 在 c4 为 1/4：四个请求中有三个是在针对另一个 prompt 推理（"User says: Mars"），这是另行跟踪的批量 prefill 损坏问题。
+- `</think>` 与 JSON 之间的空白属于前导部分（`GrammarConstraint.ActivateAfter(trigger, skipLeadingWhitespace: true)`，仅 `response_format` 使用）。Nemotron-H 8B Reasoning-128K 的词表把 `</think>\n\n` 切成 `</think` + `>\n\n`；JSON 根不能以换行开头，于是该 token 被屏蔽，模型改写 `</think}`，触发词始终不匹配，整个回复都停留在推理中（content 为 null，`json_schema` 返回 HTTP 422）。在 Nemotron-H 8B Q4_K_M（RTX PRO 6000，`--thinking`，c1 与 c4，重复三次，`max_tokens` 256）上实测：修复前有 10 个回复写出 `</think}`，修复后没有；json_schema 由 4/15 升至 15/15，json 由 13/15 升至 14/15。json_unicode 仍为 0/15，因为仅推理就用满 256 token；`max_tokens` 为 1024 时为 5/5（c1 + c4）。在 1024 下 json c4 为 0/4（对象缺少 `moons`，或在针对另一个 prompt 推理），json_schema c4 为 2/4（两个请求在 768 token 处触发带说明的 `thinking_budget` 停止）。
+- 同一架构名下有两种轮次格式，由 GGUF 内嵌的 `tokenizer.chat_template` 决定渲染哪一种（`ChatTemplate.IsNemotronHReasoningTemplate`）：
+  - **Nemotron-H 8B/47B Reasoning-128K** 训练时使用 `<SPECIAL_10>System\n{system}\n<SPECIAL_11>User\n{user}\n<SPECIAL_11>Assistant\n`（EOS 为 `<SPECIAL_11>`）。推理开关是 system prompt 中的 `{'reasoning': True}` / `{'reasoning': False}`，生成提示随之打开（`<think>\n`）或关闭（`<think></think>`）推理块。`RenderNemotronHReasoning` 根据请求的 `think` 标志加入该标记，除非 system prompt 已经带有。官方模板没有工具语法，因此工具以 JSON `<tool_call>` 约定声明在 system prompt 中，工具结果作为包裹在 `<tool_response>` 中的 user 轮次返回。这些 checkpoint 过去被当作 ChatML 渲染：模型把 `<|im_start|>` 当普通文本，回答里出现 `</think>`、自编的 `<|im_start|>user` 轮次和 `<unk>` 循环。
+  - **Nemotron 3 Nano / Omni**（以及其他所有 `nemotron_h*` 模板）使用 ChatML（`<|im_start|>` / `<|im_end|>`）。多模态占位符包括 `<image>`（之后展开为 `<img>` + N 个 token + `</img>`）与 `<so_embedding>`（音频）。
 
 ## 13. 优化机会
 

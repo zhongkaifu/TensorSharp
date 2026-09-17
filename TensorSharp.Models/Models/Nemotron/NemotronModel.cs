@@ -75,6 +75,15 @@ namespace TensorSharp.Models
         private Tensor[] _mamba2NativeDecodeProjected;
         private Tensor[] _mamba2NativeDecodeHidden;
         private bool[] _mamba2NativeDecodeStateInitialized;
+        // True while the native decode kernel holds a NEWER conv/SSM state on the device
+        // than _convState/_ssmState on the host (it runs with downloadState: false). Every
+        // reader of the host arrays drains first (SyncMamba2HostState). Without this a
+        // per-block snapshot, a migration into the batched slot pool, or a multi-token
+        // forward that continues the sequence read the state from before the first decoded
+        // token: concurrent requests (which hand sequences between the per-sequence and
+        // batched paths) and continued conversations produced different - and at times
+        // degenerate - greedy output than the same request served alone.
+        private bool[] _mamba2HostStateStale;
 
         // SSM config
         private int _ssmDConv;
@@ -563,6 +572,7 @@ namespace TensorSharp.Models
                 _mamba2NativeDecodeProjected = new Tensor[numLayers];
                 _mamba2NativeDecodeHidden = new Tensor[numLayers];
                 _mamba2NativeDecodeStateInitialized = new bool[numLayers];
+                _mamba2HostStateStale = new bool[numLayers];
             }
             ApplyModelAlignedKvCacheDefault(_quantWeights);
 
@@ -931,6 +941,118 @@ namespace TensorSharp.Models
             }
         }
 
+        /// <summary>
+        /// Router for a multi-token MoE step: sigmoid gate, optional selection
+        /// bias, top-<paramref name="nUsed"/> experts per token, then the
+        /// optional renormalisation and scale. Row <c>s</c> of the outputs
+        /// holds routes <c>[s * nUsed, (s + 1) * nUsed)</c>.
+        /// </summary>
+        internal static unsafe void RouteMoEPrefillTokens(
+            float* routerPtr, float* biasPtr, int seqLen, int numExperts, int nUsed,
+            bool normalize, float scale, int layer,
+            float[] probs, float[] selectionProbs, int[] tokenTopExperts,
+            int[] selectedExperts, float[] routingWeights)
+        {
+            for (int s = 0; s < seqLen; s++)
+            {
+                float* logitsRow = routerPtr + (long)s * numExperts;
+
+                for (int e = 0; e < numExperts; e++)
+                    probs[e] = SigmoidScalar(logitsRow[e]);
+
+                if (biasPtr != null)
+                {
+                    for (int e = 0; e < numExperts; e++)
+                        selectionProbs[e] = probs[e] + biasPtr[e];
+                }
+                else
+                {
+                    Array.Copy(probs, 0, selectionProbs, 0, numExperts);
+                }
+
+                SelectTopKInPlace(selectionProbs, numExperts, nUsed, tokenTopExperts);
+                ThrowIfMoEUnroutable(tokenTopExperts, nUsed, numExperts, layer, s);
+
+                int routeOffset = s * nUsed;
+                for (int k = 0; k < nUsed; k++)
+                {
+                    int expert = tokenTopExperts[k];
+                    selectedExperts[routeOffset + k] = expert;
+                    routingWeights[routeOffset + k] = probs[expert];
+                }
+
+                if (normalize)
+                {
+                    float wSum = 0;
+                    for (int k = 0; k < nUsed; k++)
+                        wSum += routingWeights[routeOffset + k];
+                    if (wSum < 6.103515625e-5f)
+                        wSum = 6.103515625e-5f;
+                    float inv = 1.0f / wSum;
+                    for (int k = 0; k < nUsed; k++)
+                        routingWeights[routeOffset + k] *= inv;
+                }
+
+                if (scale != 1.0f)
+                {
+                    for (int k = 0; k < nUsed; k++)
+                        routingWeights[routeOffset + k] *= scale;
+                }
+            }
+        }
+
+        /// <summary>
+        /// Groups the routes of <see cref="RouteMoEPrefillTokens"/> by expert:
+        /// expert <c>e</c>'s rows are <c>routedRows[expertOffsets[e] ..
+        /// expertOffsets[e + 1])</c>, each with its routing weight, in token order.
+        /// </summary>
+        internal static void GroupMoERoutesByExpert(
+            int[] selectedExperts, float[] routingWeights, int seqLen, int nUsed, int numExperts,
+            int[] expertCounts, int[] expertOffsets, int[] cursors, int[] routedRows, float[] routedWeights)
+        {
+            Array.Clear(expertCounts, 0, numExperts);
+            int totalRoutes = seqLen * nUsed;
+            for (int r = 0; r < totalRoutes; r++)
+                expertCounts[selectedExperts[r]]++;
+
+            expertOffsets[0] = 0;
+            for (int e = 0; e < numExperts; e++)
+                expertOffsets[e + 1] = expertOffsets[e] + expertCounts[e];
+
+            Array.Copy(expertOffsets, cursors, numExperts);
+            for (int s = 0; s < seqLen; s++)
+            {
+                int routeOffset = s * nUsed;
+                for (int k = 0; k < nUsed; k++)
+                {
+                    int dst = cursors[selectedExperts[routeOffset + k]]++;
+                    routedRows[dst] = s;
+                    routedWeights[dst] = routingWeights[routeOffset + k];
+                }
+            }
+        }
+
+        /// <summary>
+        /// A token whose router logits are not finite (a NaN/Inf hidden state)
+        /// has no top-k: every comparison fails and the selection keeps its -1
+        /// sentinels, which used to surface as an IndexOutOfRangeException deep
+        /// in the MoE (or an out-of-bounds read in the native fused kernel).
+        /// Name the real failure instead.
+        /// </summary>
+        internal static void ThrowIfMoEUnroutable(int[] topExperts, int nUsed, int numExperts, int layer, int tokenRow)
+        {
+            for (int k = 0; k < nUsed; k++)
+            {
+                if ((uint)topExperts[k] >= (uint)numExperts)
+                {
+                    throw new InvalidOperationException(
+                        $"Nemotron MoE layer {layer}: token row {tokenRow} has non-finite router logits "
+                        + "(its hidden state is NaN/Inf before the router), so no expert can be selected. "
+                        + "The step is failed instead of routing garbage.");
+                }
+            }
+        }
+
         private void EnsureMoEPrefillRouteBuffers(int totalRoutes)
         {
             if (_moePrefillSelectedExperts == null || _moePrefillSelectedExperts.Length != totalRoutes)
@@ -981,11 +1103,16 @@ namespace TensorSharp.Models
                         break;
                 }
             }
+            // Clearing the flags is what re-seeds the legacy slot's device state from the
+            // host arrays on the next decode step. The native decode cache is deliberately
+            // NOT cleared here: it also holds the device state of every live batched
+            // sequence, which is authoritative (their host arrays are stale), and a
+            // per-sequence step for another request resets this model while they run.
             if (_mamba2NativeDecodeStateInitialized != null)
             {
                 Array.Clear(_mamba2NativeDecodeStateInitialized);
-                if (IsGgmlBackend)
-                    GgmlBasicOps.NemotronMamba2DecodeClear(_nativeMamba2DecodeModelId);
+                if (_mamba2HostStateStale != null)
+                    Array.Clear(_mamba2HostStateStale);
             }
             _cacheSeqLen = 0;
             _kvCacheHostDirty = false;
@@ -1114,13 +1241,17 @@ namespace TensorSharp.Models
             _cacheSeqLen = destToken + tokenCount;
 
             // The native Mamba2 decode shadow state mirrors _convState / _ssmState
-            // lazily. Force a refresh on the next decode step so it picks up the
-            // host arrays we just rewrote.
+            // lazily. Clearing the flags forces the next decode step to re-seed the
+            // legacy slot's device state from the host arrays we just rewrote. The
+            // native decode cache itself is NOT cleared: it also holds the device state
+            // of every live batched sequence, which is authoritative (their host arrays
+            // are stale), and an ownership swap for another request lands here while
+            // they run.
             if (_mamba2NativeDecodeStateInitialized != null)
             {
                 Array.Clear(_mamba2NativeDecodeStateInitialized);
-                if (IsGgmlBackend)
-                    GgmlBasicOps.NemotronMamba2DecodeClear(_nativeMamba2DecodeModelId);
+                if (_mamba2HostStateStale != null)
+                    Array.Clear(_mamba2HostStateStale);
             }
             for (int l = 0; l < Config.NumLayers; l++)
             {
@@ -1197,6 +1328,7 @@ namespace TensorSharp.Models
         private bool CopyMamba2StateOut(int layer, Span<byte> destination, out int written)
         {
             written = 0;
+            SyncMamba2HostState(layer, LegacyMamba2Slot);
             float[] conv = _convState[layer];
             float[] ssm = _ssmState[layer];
             int convBytes = conv.Length * sizeof(float);
@@ -1709,38 +1841,8 @@ namespace TensorSharp.Models
             kHeads.Dispose();
             vHeads.Dispose();
 
-            int groupSize = numHeads / numKVHeads;
-            Tensor kExpanded = ExpandKVHeads(_kvCacheK[layer], groupSize, totalSeqLen);
-            Tensor vExpanded = ExpandKVHeads(_kvCacheV[layer], groupSize, totalSeqLen);
-
-            using var kT = kExpanded.Transpose(1, 2);
-            var scores = new Tensor(_allocator, DType.Float32, numHeads, seqLen, totalSeqLen);
-            Ops.AddmmBatch(scores, 0, scores, scale, qHeads, kT);
+            Tensor flatOutput = PrefillAttention(qHeads, layer, numHeads, numKVHeads, headDim, seqLen, startPos, scale);
             qHeads.Dispose();
-            kExpanded.Dispose();
-
-            // Fused causal-mask + softmax on GPU. Replaces AddCausalMask + Softmax
-            // (two separate ops) with one Metal kernel.
-            if (IsGgmlBackend)
-            {
-                GgmlBasicOps.AttentionSoftmaxWithSinks(
-                    scores, sinks: null,
-                    numHeads: numHeads, seqLen: seqLen, kvLen: totalSeqLen,
-                    maskStartPos: startPos, slidingWindow: 0, scale: 1.0f);
-            }
-            else
-            {
-                Ops.AddCausalMask(scores, seqLen, startPos, float.NegativeInfinity);
-                Ops.Softmax(scores, scores);
-            }
-
-            var attnOut = new Tensor(_allocator, DType.Float32, numHeads, seqLen, headDim);
-            Ops.AddmmBatch(attnOut, 0, attnOut, 1.0f, scores, vExpanded);
-            scores.Dispose();
-            vExpanded.Dispose();
-
-            Tensor flatOutput = ReshapeFromHeads(attnOut, numHeads, seqLen, headDim);
-            attnOut.Dispose();
 
             _attnTicks += Stopwatch.GetTimestamp() - t0;
 
@@ -1753,6 +1855,175 @@ namespace TensorSharp.Models
             Tensor output = LinearForward(flatOutput, prefix + "attn_output.weight");
             flatOutput.Dispose();
             return output;
+        }
+
+
+        /// <summary>
+        /// Upper bound, in bytes, for one [numHeads, queryRows, kvLen] F32 attention score
+        /// tensor on the materialized prefill path. A prompt chunk whose scores would exceed
+        /// it is attended in query sub-chunks instead. Override with
+        /// <c>TS_NEMOTRON_ATTN_SCORE_BUDGET_MB</c> (tests use a tiny value to force the split).
+        /// </summary>
+        internal static bool MaterializedPrefillAttentionForTest { get; set; }
+
+        internal static long PrefillScoreBudgetBytes()
+        {
+            string raw = Environment.GetEnvironmentVariable("TS_NEMOTRON_ATTN_SCORE_BUDGET_MB");
+            if (!string.IsNullOrEmpty(raw) && long.TryParse(raw, out long mb) && mb > 0)
+                return mb << 20;
+            return 1024L << 20;
+        }
+
+        /// <summary>
+        /// Rows per query sub-chunk so that <paramref name="numHeads"/> x rows x
+        /// <paramref name="kvLen"/> F32 scores stay within <paramref name="budgetBytes"/>.
+        /// Always at least one row; never more than <paramref name="seqLen"/>.
+        /// </summary>
+        internal static int PrefillQueryRowsPerChunk(int numHeads, int seqLen, int kvLen, long budgetBytes)
+        {
+            long perRow = Math.Max(1L, (long)numHeads * kvLen * sizeof(float));
+            long rows = budgetBytes / perRow;
+            return (int)Math.Clamp(rows, 1L, Math.Max(1, seqLen));
+        }
+
+        /// <summary>
+        /// Causal attention for a multi-token chunk whose K/V have already been written to
+        /// the cache at [startPos, startPos + seqLen). Returns [seqLen, numHeads * headDim].
+        ///
+        /// <para>This used to materialize one [numHeads, seqLen, startPos + seqLen] score
+        /// tensor (plus a GQA-expanded copy of the whole cache) per attention layer, so the
+        /// allocation grew with the prompt: a 4,096-token chunk deep into a 32k prompt asked
+        /// ggml-cuda for 37 GB on the 8B and every long request failed with HTTP 500. GGML
+        /// backends now take the fused prefill kernel, which reads the grouped F32/F16 cache
+        /// directly and switches to flash attention (O(kvLen) working set) once the scores
+        /// would be large. Every other case attends in query sub-chunks sized by
+        /// <see cref="PrefillScoreBudgetBytes"/>; each sub-chunk sees exactly the keys a
+        /// causal mask would let it see, so the result is unchanged.</para>
+        /// </summary>
+        private Tensor PrefillAttention(Tensor qHeads, int layer, int numHeads, int numKVHeads, int headDim,
+            int seqLen, int startPos, float scale)
+        {
+            int totalSeqLen = startPos + seqLen;
+            Tensor kCache = _kvCacheK[layer];
+            Tensor vCache = _kvCacheV[layer];
+
+            if (IsGgmlBackend && !IsTensorParallel && numHeads % numKVHeads == 0 && !MaterializedPrefillAttentionForTest)
+            {
+                if (kCache.ElementType == DType.Float16 && vCache.ElementType == DType.Float16)
+                {
+                    var fused = new Tensor(_allocator, DType.Float32, seqLen, numHeads * headDim);
+                    GgmlBasicOps.FusedPrefillAttentionF16KV(
+                        qHeads, kCache, vCache, fused,
+                        numHeads, numKVHeads, headDim,
+                        seqLen, totalSeqLen, checked((int)kCache.Sizes[1]),
+                        startPos, 0, scale);
+                    return fused;
+                }
+                if (kCache.ElementType == DType.Float32 && vCache.ElementType == DType.Float32)
+                {
+                    bool exact = kCache.Sizes[1] == totalSeqLen;
+                    Tensor kSrc = exact ? kCache : NarrowContiguous(kCache, totalSeqLen);
+                    Tensor vSrc = exact ? vCache : NarrowContiguous(vCache, totalSeqLen);
+                    try
+                    {
+                        var fused = new Tensor(_allocator, DType.Float32, seqLen, numHeads * headDim);
+                        GgmlBasicOps.FusedPrefillAttention(
+                            qHeads, kSrc, vSrc, fused,
+                            numHeads, numKVHeads, headDim,
+                            seqLen, totalSeqLen, startPos, 0, scale);
+                        return fused;
+                    }
+                    finally
+                    {
+                        if (!exact) { kSrc.Dispose(); vSrc.Dispose(); }
+                    }
+                }
+            }
+
+            int groupSize = numHeads / numKVHeads;
+            Tensor kExpanded = ExpandKVHeads(kCache, groupSize, totalSeqLen);
+            Tensor vExpanded = ExpandKVHeads(vCache, groupSize, totalSeqLen);
+            try
+            {
+                return ChunkedMaterializedAttention(_allocator, qHeads, kExpanded, vExpanded,
+                    numHeads, headDim, seqLen, startPos, scale, fusedSoftmax: IsGgmlBackend);
+            }
+            finally
+            {
+                kExpanded.Dispose();
+                vExpanded.Dispose();
+            }
+        }
+
+        /// <summary>Causal attention of q [numHeads, seqLen, headDim] (rows at absolute
+        /// positions startPos..) against GQA-expanded k/v [numHeads, startPos + seqLen,
+        /// headDim], in query sub-chunks sized by <see cref="PrefillScoreBudgetBytes"/>.
+        /// Returns [seqLen, numHeads * headDim] on <paramref name="alloc"/>.</summary>
+        private Tensor ChunkedMaterializedAttention(IAllocator alloc, Tensor qHeads, Tensor kExpanded, Tensor vExpanded,
+            int numHeads, int headDim, int seqLen, int startPos, float scale, bool fusedSoftmax)
+        {
+            int totalSeqLen = startPos + seqLen;
+            int rowsPerChunk = PrefillQueryRowsPerChunk(numHeads, seqLen, totalSeqLen, PrefillScoreBudgetBytes());
+            if (rowsPerChunk >= seqLen)
+                return MaterializedAttentionChunk(alloc, qHeads, kExpanded, vExpanded, numHeads, headDim, seqLen, startPos, scale, fusedSoftmax);
+
+            var output = new Tensor(alloc, DType.Float32, seqLen, numHeads * headDim);
+            for (int q0 = 0; q0 < seqLen; q0 += rowsPerChunk)
+            {
+                int rows = Math.Min(rowsPerChunk, seqLen - q0);
+                int kvLen = startPos + q0 + rows; // causal: later keys are masked anyway
+                using var qView = qHeads.Narrow(1, q0, rows);
+                using var qPart = Ops.NewContiguous(qView);
+                using var kView = kExpanded.Narrow(1, 0, kvLen);
+                using var vView = vExpanded.Narrow(1, 0, kvLen);
+                using var kPart = Ops.NewContiguous(kView);
+                using var vPart = Ops.NewContiguous(vView);
+                using var part = MaterializedAttentionChunk(alloc, qPart, kPart, vPart, numHeads, headDim, rows, startPos + q0, scale, fusedSoftmax);
+                using var dst = output.Narrow(0, q0, rows);
+                Ops.Copy(dst, part);
+            }
+            return output;
+        }
+
+        private Tensor NarrowContiguous(Tensor cache, int rows)
+        {
+            using var view = cache.Narrow(1, 0, rows);
+            return Ops.NewContiguous(view);
+        }
+
+        /// <summary>One materialized causal attention: q [numHeads, rows, headDim] against
+        /// GQA-expanded k/v [numHeads, kvLen, headDim], query row i sitting at absolute
+        /// position maskStartPos + i. Returns [rows, numHeads * headDim].</summary>
+        private Tensor MaterializedAttentionChunk(IAllocator alloc, Tensor qHeads, Tensor kExpanded, Tensor vExpanded,
+            int numHeads, int headDim, int rows, int maskStartPos, float scale, bool fusedSoftmax)
+        {
+            int kvLen = (int)kExpanded.Sizes[1];
+            using var kT = kExpanded.Transpose(1, 2);
+            var scores = new Tensor(alloc, DType.Float32, numHeads, rows, kvLen);
+            Ops.AddmmBatch(scores, 0, scores, scale, qHeads, kT);
+
+            // Fused causal-mask + softmax on GPU. Replaces AddCausalMask + Softmax
+            // (two separate ops) with one Metal kernel.
+            if (fusedSoftmax)
+            {
+                GgmlBasicOps.AttentionSoftmaxWithSinks(
+                    scores, sinks: null,
+                    numHeads: numHeads, seqLen: rows, kvLen: kvLen,
+                    maskStartPos: maskStartPos, slidingWindow: 0, scale: 1.0f);
+            }
+            else
+            {
+                Ops.AddCausalMask(scores, rows, maskStartPos, float.NegativeInfinity);
+                Ops.Softmax(scores, scores);
+            }
+
+            var attnOut = new Tensor(alloc, DType.Float32, numHeads, rows, headDim);
+            Ops.AddmmBatch(attnOut, 0, attnOut, 1.0f, scores, vExpanded);
+            scores.Dispose();
+
+            Tensor flat = ReshapeFromHeads(attnOut, numHeads, rows, headDim);
+            attnOut.Dispose();
+            return flat;
         }
 
         #endregion
@@ -1918,6 +2189,7 @@ namespace TensorSharp.Models
                 }
 
                 SelectTopKInPlace(selectionProbs, _numExperts, _numExpertsUsed, topExperts);
+                ThrowIfMoEUnroutable(topExperts, _numExpertsUsed, _numExperts, layer, s);
 
                 for (int k = 0; k < _numExpertsUsed; k++)
                     routeW[k] = probs[topExperts[k]];
@@ -2242,78 +2514,15 @@ namespace TensorSharp.Models
             int[] selectedExperts = _moePrefillSelectedExperts;
             float[] routingWeights = _moePrefillRoutingWeights;
             int[] expertCounts = _moePrefillExpertCounts;
-            int[] tokenTopExperts = _moeTopExperts;
-            float[] probs = _moeProbs;
-            float[] selectionProbs = _moeSelectionProbs;
-            Array.Clear(expertCounts, 0, _numExperts);
-
-            for (int s = 0; s < seqLen; s++)
-            {
-                float* logitsRow = routerPtr + (long)s * _numExperts;
-
-                for (int e = 0; e < _numExperts; e++)
-                    probs[e] = SigmoidScalar(logitsRow[e]);
-
-                if (biasPtr != null)
-                {
-                    for (int e = 0; e < _numExperts; e++)
-                        selectionProbs[e] = probs[e] + biasPtr[e];
-                }
-                else
-                {
-                    Array.Copy(probs, 0, selectionProbs, 0, _numExperts);
-                }
-
-                SelectTopKInPlace(selectionProbs, _numExperts, nUsed, tokenTopExperts);
-
-                int routeOffset = s * nUsed;
-                for (int k = 0; k < nUsed; k++)
-                {
-                    int expert = tokenTopExperts[k];
-                    selectedExperts[routeOffset + k] = expert;
-                    routingWeights[routeOffset + k] = probs[expert];
-                    expertCounts[expert]++;
-                }
-
-                if (_expertWeightsNorm)
-                {
-                    float wSum = 0;
-                    for (int k = 0; k < nUsed; k++)
-                        wSum += routingWeights[routeOffset + k];
-                    if (wSum < 6.103515625e-5f)
-                        wSum = 6.103515625e-5f;
-                    float inv = 1.0f / wSum;
-                    for (int k = 0; k < nUsed; k++)
-                        routingWeights[routeOffset + k] *= inv;
-                }
-
-                if (_expertWeightsScale != 1.0f)
-                {
-                    for (int k = 0; k < nUsed; k++)
-                        routingWeights[routeOffset + k] *= _expertWeightsScale;
-                }
-            }
-
             int[] expertOffsets = _moePrefillExpertOffsets;
-            expertOffsets[0] = 0;
-            for (int e = 0; e < _numExperts; e++)
-                expertOffsets[e + 1] = expertOffsets[e] + expertCounts[e];
-
-            int[] cursors = _moePrefillExpertCursors;
-            Array.Copy(expertOffsets, cursors, _numExperts);
             int[] routedRows = _moePrefillRoutedRows;
             float[] routedWeights = _moePrefillRoutedWeights;
-            for (int s = 0; s < seqLen; s++)
-            {
-                int routeOffset = s * nUsed;
-                for (int k = 0; k < nUsed; k++)
-                {
-                    int expert = selectedExperts[routeOffset + k];
-                    int dst = cursors[expert]++;
-                    routedRows[dst] = s;
-                    routedWeights[dst] = routingWeights[routeOffset + k];
-                }
-            }
+            RouteMoEPrefillTokens(
+                routerPtr, biasPtr, seqLen, _numExperts, nUsed, _expertWeightsNorm, _expertWeightsScale, layer,
+                _moeProbs, _moeSelectionProbs, _moeTopExperts, selectedExperts, routingWeights);
+            GroupMoERoutesByExpert(
+                selectedExperts, routingWeights, seqLen, nUsed, _numExperts,
+                expertCounts, expertOffsets, _moePrefillExpertCursors, routedRows, routedWeights);
 
             float* inputPtr = GetFloatPtr(routedInput);
             float* outputPtr = GetFloatPtr(moeOut);
@@ -2584,55 +2793,9 @@ namespace TensorSharp.Models
             EnsureMoEPrefillRouteBuffers(totalRoutes);
             int[] selectedExperts = _moePrefillSelectedExperts;
             float[] routingWeights = _moePrefillRoutingWeights;
-            int[] tokenTopExperts = _moeTopExperts;
-            float[] probs = _moeProbs;
-            float[] selectionProbs = _moeSelectionProbs;
-
-            for (int s = 0; s < seqLen; s++)
-            {
-                float* logitsRow = routerPtr + (long)s * _numExperts;
-
-                for (int e = 0; e < _numExperts; e++)
-                    probs[e] = SigmoidScalar(logitsRow[e]);
-
-                if (biasPtr != null)
-                {
-                    for (int e = 0; e < _numExperts; e++)
-                        selectionProbs[e] = probs[e] + biasPtr[e];
-                }
-                else
-                {
-                    Array.Copy(probs, 0, selectionProbs, 0, _numExperts);
-                }
-
-                SelectTopKInPlace(selectionProbs, _numExperts, nUsed, tokenTopExperts);
-
-                int routeOffset = s * nUsed;
-                for (int k = 0; k < nUsed; k++)
-                {
-                    int expert = tokenTopExperts[k];
-                    selectedExperts[routeOffset + k] = expert;
-                    routingWeights[routeOffset + k] = probs[expert];
-                }
-
-                if (_expertWeightsNorm)
-                {
-                    float wSum = 0;
-                    for (int k = 0; k < nUsed; k++)
-                        wSum += routingWeights[routeOffset + k];
-                    if (wSum < 6.103515625e-5f)
-                        wSum = 6.103515625e-5f;
-                    float inv = 1.0f / wSum;
-                    for (int k = 0; k < nUsed; k++)
-                        routingWeights[routeOffset + k] *= inv;
-                }
-
-                if (_expertWeightsScale != 1.0f)
-                {
-                    for (int k = 0; k < nUsed; k++)
-                        routingWeights[routeOffset + k] *= _expertWeightsScale;
-                }
-            }
+            RouteMoEPrefillTokens(
+                routerPtr, biasPtr, seqLen, _numExperts, nUsed, _expertWeightsNorm, _expertWeightsScale, layer,
+                _moeProbs, _moeSelectionProbs, _moeTopExperts, selectedExperts, routingWeights);
 
             try
             {
@@ -2701,7 +2864,7 @@ namespace TensorSharp.Models
 
         #region Mamba2 Block
 
-        private Tensor Mamba2Block(Tensor hidden, int layer, int seqLen, bool isDecode, int slot = 0)
+        private Tensor Mamba2Block(Tensor hidden, int layer, int seqLen, bool isDecode, int slot = LegacyMamba2Slot)
         {
             string prefix = _layerPrefixes[layer];
 
@@ -2723,8 +2886,8 @@ namespace TensorSharp.Models
         /// <param name="slot">Per-active-sequence Mamba2 slot index used to key
         /// the persistent GPU decode-state cache so concurrent sequences in
         /// the batched path don't share GPU state via cache-key collision.
-        /// Pass 0 for the legacy single-sequence Forward path.</param>
-        private unsafe Tensor Mamba2Forward(Tensor input, int layer, string prefix, int seqLen, Tensor residual = null, int slot = 0)
+        /// The legacy single-sequence Forward path uses <see cref="LegacyMamba2Slot"/>.</param>
+        private unsafe Tensor Mamba2Forward(Tensor input, int layer, string prefix, int seqLen, Tensor residual = null, int slot = LegacyMamba2Slot)
         {
             long t0 = Stopwatch.GetTimestamp();
 
@@ -2746,6 +2909,9 @@ namespace TensorSharp.Models
                 _attnTicks += Stopwatch.GetTimestamp() - t0;
                 return nativeDecodeOut;
             }
+
+            // The host path below reads (and advances) _convState/_ssmState.
+            SyncMamba2HostState(layer, slot);
 
             Tensor projected = LinearForward(input, prefix + "ssm_in.weight");
             Tensor result = new Tensor(_allocator, DType.Float32, seqLen, dInner);
@@ -3016,6 +3182,10 @@ namespace TensorSharp.Models
             {
                 LinearForwardInto(projected, input, prefix + "ssm_in.weight");
 
+                // A native library that predates TSGgml_NemotronMamba2DecodeReadState
+                // cannot drain the device state later, so it must download every step.
+                bool drainLater = NativeMamba2StateReadAvailable;
+
                 GgmlBasicOps.NemotronMamba2Decode(
                     NativeMamba2DecodeStateKey(layer, slot),
                     projected,
@@ -3029,8 +3199,9 @@ namespace TensorSharp.Models
                     // measured a NET LOSS: 55.6 vs 80.9 tok/s on one GPU. The device
                     // state therefore stays authoritative between decode steps, and
                     // the flag reset on the multi-token paths keeps the two directions
-                    // from silently disagreeing.
-                    downloadState: false,
+                    // from silently disagreeing. SyncMamba2HostState drains it for
+                    // every host reader.
+                    downloadState: !drainLater,
                     TensorComputePrimitives.GetStoragePointer(convW),
                     convBias == null ? IntPtr.Zero : TensorComputePrimitives.GetStoragePointer(convBias),
                     TensorComputePrimitives.GetStoragePointer(dtBias),
@@ -3046,6 +3217,8 @@ namespace TensorSharp.Models
                     Config.Eps);
 
                 _mamba2NativeDecodeStateInitialized[layer] = true;
+                if (_mamba2HostStateStale != null)
+                    _mamba2HostStateStale[layer] = drainLater;
                 if (TryLinearAddInto(residual, result, prefix + "ssm_out.weight"))
                 {
                     output = null;
@@ -3086,7 +3259,56 @@ namespace TensorSharp.Models
         // every concurrent batched sequence would collapse to the same cache
         // entry and trample each other's GPU-side conv/SSM state across
         // decode steps, producing garbled output for all participants.
-        private ulong NativeMamba2DecodeStateKey(int layer, int slot = 0) =>
+        /// <summary>Decode-cache slot of the legacy single-sequence path. Distinct from
+        /// every batched slot (those count up from 0), so the two paths never share a
+        /// device state entry: a batched sequence on slot 0 used to overwrite the
+        /// legacy owner's device state under the same key.</summary>
+        internal const int LegacyMamba2Slot = 0xFFFF;
+
+        private static int s_nativeMamba2StateRead; // 0 unknown, 1 available, -1 missing
+
+        /// <summary>Whether the loaded native library can copy decode state back to the
+        /// host. Probed once per process.</summary>
+        private bool NativeMamba2StateReadAvailable
+        {
+            get
+            {
+                int known = Volatile.Read(ref s_nativeMamba2StateRead);
+                if (known != 0)
+                    return known > 0;
+                bool available;
+                try
+                {
+                    // A key with no entry: an up-to-date library answers "nothing to read".
+                    GgmlBasicOps.NemotronMamba2DecodeReadState(ulong.MaxValue, new float[1], new float[1]);
+                    available = true;
+                }
+                catch (EntryPointNotFoundException)
+                {
+                    available = false;
+                    Console.Error.WriteLine(
+                        "[Nemotron] The loaded GgmlOps native library has no TSGgml_NemotronMamba2DecodeReadState; " +
+                        "native Mamba2 decode downloads its state every token instead (correct, slower). Rebuild the " +
+                        "native library to restore full decode speed.");
+                }
+                Volatile.Write(ref s_nativeMamba2StateRead, available ? 1 : -1);
+                return available;
+            }
+        }
+
+        /// <summary>Bring _convState/_ssmState[<paramref name="layer"/>] (whichever arrays
+        /// are currently swapped in) up to date with the device state the native decode
+        /// kernel holds for <paramref name="slot"/>. No-op when the host is authoritative.</summary>
+        private void SyncMamba2HostState(int layer, int slot)
+        {
+            if (_mamba2HostStateStale == null || !_mamba2HostStateStale[layer])
+                return;
+            GgmlBasicOps.NemotronMamba2DecodeReadState(
+                NativeMamba2DecodeStateKey(layer, slot), _convState[layer], _ssmState[layer]);
+            _mamba2HostStateStale[layer] = false;
+        }
+
+        private ulong NativeMamba2DecodeStateKey(int layer, int slot) =>
             (_nativeMamba2DecodeModelId << 32)
             | ((ulong)(uint)(layer & 0xFFFF) << 16)
             | (uint)(slot & 0xFFFF);

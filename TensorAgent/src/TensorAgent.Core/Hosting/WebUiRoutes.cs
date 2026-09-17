@@ -181,6 +181,9 @@ public static class WebUiRoutes
 
             string sessionId = SessionIdOf(created);
             Conversation conversation = recorder.Bind(sessionId, request.Query("conversation"));
+            // Reopening a chat opens a new session; keep that chat's cached prompt state
+            // reachable from it (one cache scope per conversation, not per session).
+            chat.BindSessionConversation(sessionId, conversation.Id);
             return Task.FromResult<LoopbackResponse?>(LoopbackResponse.Json(new
             {
                 sessionId,

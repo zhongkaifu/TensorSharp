@@ -30,9 +30,10 @@ namespace TensorSharp.Runtime.Scheduling
             int blockSize,
             SamplingConfig samplingConfig,
             object userTag = null,
-            string mediaFingerprint = null,
+            IReadOnlyList<PromptMediaSpan> mediaSpans = null,
             IReadOnlyList<int> cacheBreakpoints = null,
-            int sharedPrefixTokens = 0)
+            int sharedPrefixTokens = 0,
+            string cacheScope = null)
         {
             if (promptTokens == null) throw new ArgumentNullException(nameof(promptTokens));
             if (promptTokens.Count == 0) throw new ArgumentException("Prompt must be non-empty.", nameof(promptTokens));
@@ -65,7 +66,10 @@ namespace TensorSharp.Runtime.Scheduling
             Status = SequenceStatus.Waiting;
             SubmittedAt = DateTime.UtcNow;
             UserTag = userTag;
-            MediaFingerprint = string.IsNullOrEmpty(mediaFingerprint) ? null : mediaFingerprint;
+            MediaSpans = mediaSpans is { Count: > 0 }
+                ? new List<PromptMediaSpan>(mediaSpans)
+                : Array.Empty<PromptMediaSpan>();
+            CacheScope = string.IsNullOrEmpty(cacheScope) ? null : cacheScope;
             // At least one prompt token has to follow the prefix, or there is nothing
             // to forward from a clone of it.
             SharedPrefixTokens = Math.Clamp(sharedPrefixTokens, 0, Math.Max(0, promptTokens.Count - 1));
@@ -133,14 +137,27 @@ namespace TensorSharp.Runtime.Scheduling
         public object UserTag { get; }
 
         /// <summary>
-        /// Stable identifier of the multimodal content (images/audio/video) baked
-        /// into this prompt's embeddings, or <c>null</c> for text-only prompts.
-        /// Mixed into the prefix-cache block hashes so two prompts that share
-        /// identical placeholder token IDs but carry <em>different</em> media never
-        /// adopt each other's K/V blocks (which would otherwise surface a stale
-        /// image/audio). Identical media still shares the cache.
+        /// Where the prompt's images, video frames and audio clips sit and what content
+        /// each one is, in prompt order; empty for a text-only prompt. Placeholder token
+        /// ids are identical for different media, so every prompt-reuse path compares
+        /// these positionally over the prefix it reuses (see
+        /// <see cref="PromptMediaSpans.ClampReusablePrefix"/>): text before the first
+        /// media span is always reusable, identical media is reusable across turns, and
+        /// a reused prefix never ends inside a span.
         /// </summary>
-        public string MediaFingerprint { get; }
+        public IReadOnlyList<PromptMediaSpan> MediaSpans { get; }
+
+        /// <summary>
+        /// The conversation this request belongs to, as an opaque hash (a Web UI session
+        /// and its new-chat epoch, or the conversation lineage the chat layer proved for
+        /// a stateless API request), or null for a caller that does not scope its
+        /// requests. State another scope produced - a retained holder, the live cache,
+        /// pooled blocks past the public prefix - is reused only up to
+        /// <see cref="SharedPrefixTokens"/>, and never moved away from its owner. Null
+        /// matches every scope, which is how engine-level callers that run one
+        /// conversation at a time (benchmarks, the CLI) keep today's behaviour.
+        /// </summary>
+        public string CacheScope { get; }
 
         public SequenceStatus Status { get; internal set; }
         public DateTime SubmittedAt { get; }
@@ -230,8 +247,13 @@ namespace TensorSharp.Runtime.Scheduling
 
         public void AdvanceComputedTokens(int n)
         {
+            int from = NumComputedTokens;
             NumComputedTokens += n;
             BlockTable.AdvanceTokens(n);
+            // Whatever path wrote these positions, a block that holds them is no longer
+            // known to be complete in the model's paged arrays; the batched path marks
+            // its own writes again right after advancing (BatchExecutor).
+            BlockTable.SetHoldsModelPagedKv(from, NumComputedTokens, false);
         }
 
         /// <summary>Set computed-token counter directly without touching the

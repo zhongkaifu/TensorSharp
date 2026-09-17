@@ -184,6 +184,20 @@ internal sealed class Options
     public int SpecFile = 600;
     public bool SpecMinimalSystem;
     public bool SpecDiagnostic;
+    /// <summary>--spec-diagnostic drafter: "ngram" (default) or "auto" (the checkpoint's own head).</summary>
+    public string SpecDiagSpeculator = "ngram";
+    /// <summary>--spec-diagnostic user message replacing the file-repeat prompt (no system prompt).</summary>
+    public string SpecDiagPrompt;
+    /// <summary>--spec-diagnostic keeps following plain greedy past a mismatch and records every row.</summary>
+    public bool SpecDiagTeacherForce;
+    /// <summary>--spec-diagnostic draft window.</summary>
+    public int SpecDiagWindow = 7;
+    /// <summary>--spec-diagnostic draws both runs through the JSON-object grammar (json scenario prompt).</summary>
+    public bool SpecDiagJson;
+    /// <summary>--spec-diagnostic uses the newchat scenario's chat B prompt.</summary>
+    public bool SpecDiagNewChat;
+    /// <summary>--spec-diagnostic compares one next-token row across every trunk path, then exits.</summary>
+    public bool SpecDiagRowCheck;
 
     /// <summary>Enable speculation on EVERY engine the bench builds ("ngram" or "auto"),
         /// so the concurrent and solo-after-concurrency rows run with it - the way a
@@ -224,6 +238,13 @@ internal sealed class Options
                     case "--spec-file": o.SpecFile = int.Parse(Next(), CultureInfo.InvariantCulture); break;
                     case "--spec-minimal-system": o.SpecMinimalSystem = true; break;
                     case "--spec-diagnostic": o.SpecDiagnostic = true; break;
+                    case "--spec-diagnostic-speculator": o.SpecDiagSpeculator = Next(); break;
+                    case "--spec-diagnostic-prompt": o.SpecDiagPrompt = Next(); break;
+                    case "--spec-diagnostic-teacher-force": o.SpecDiagTeacherForce = true; break;
+                    case "--spec-diagnostic-json": o.SpecDiagJson = true; break;
+                    case "--spec-diagnostic-newchat": o.SpecDiagNewChat = true; break;
+                    case "--spec-diagnostic-rowcheck": o.SpecDiagRowCheck = true; break;
+                    case "--spec-diagnostic-window": o.SpecDiagWindow = int.Parse(Next(), CultureInfo.InvariantCulture); break;
                     case "--spec-engine": o.SpecEngine = Next(); break;
                     case "--conc-stagger": o.ConcStaggerMs = int.Parse(Next(), CultureInfo.InvariantCulture); break;
                     case "--conc":

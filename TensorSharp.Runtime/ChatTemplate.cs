@@ -323,6 +323,137 @@ namespace TensorSharp.Runtime
             return sb.ToString();
         }
 
+        private const string NemotronHSystemMarker = "<SPECIAL_10>System";
+        private const string NemotronHTurnMarker = "<SPECIAL_11>";
+        private const string NemotronHReasoningOn = "{'reasoning': True}";
+        private const string NemotronHReasoningOff = "{'reasoning': False}";
+
+        /// <summary>
+        /// True when a <c>nemotron_h</c> GGUF carries the Nemotron-H Reasoning-128K turn
+        /// format (<c>&lt;SPECIAL_10&gt;System</c> / <c>&lt;SPECIAL_11&gt;User</c> /
+        /// <c>&lt;SPECIAL_11&gt;Assistant</c>) rather than the ChatML format of Nemotron 3
+        /// Nano / Omni. Both ship under the same architecture name, so the embedded
+        /// template is the only thing that tells them apart; rendering the Reasoning-128K
+        /// checkpoints as ChatML fed them <c>&lt;|im_start|&gt;</c> as plain text, and they
+        /// answered with <c>&lt;/think&gt;</c> and invented <c>&lt;|im_start|&gt;user</c>
+        /// turns in the content.
+        /// </summary>
+        public static bool IsNemotronHReasoningTemplate(string? template)
+            => !string.IsNullOrEmpty(template)
+               && template.Contains(NemotronHSystemMarker, StringComparison.Ordinal)
+               && template.Contains(NemotronHTurnMarker + "Assistant", StringComparison.Ordinal);
+
+        /// <summary>
+        /// Render the Nemotron-H Reasoning-128K chat format (nvidia/Nemotron-H-8B/47B-
+        /// Reasoning-128K). Mirrors the shipped template:
+        /// <code>
+        /// &lt;SPECIAL_10&gt;System\n{system}
+        /// \n&lt;SPECIAL_11&gt;User\n{user}\n&lt;SPECIAL_11&gt;Assistant\n[&lt;think&gt;\n | &lt;think&gt;&lt;/think&gt;]{assistant}...
+        /// </code>
+        /// <para>Reasoning is switched by the <c>{'reasoning': True|False}</c> marker in
+        /// the system prompt, which the template also uses to open (<c>&lt;think&gt;\n</c>)
+        /// or close (<c>&lt;think&gt;&lt;/think&gt;</c>) the reasoning block after the final
+        /// assistant header. The marker is added here from the request's thinking flag
+        /// unless the caller's system prompt already carries one. EOS is
+        /// <c>&lt;SPECIAL_11&gt;</c>, the same token that opens the next turn.</para>
+        /// <para>The shipped template has no tool syntax. Tools are declared in the system
+        /// prompt with the JSON <c>&lt;tool_call&gt;</c> convention the ChatML parser reads,
+        /// and tool results are fed back as a user turn wrapped in
+        /// <c>&lt;tool_response&gt;</c>, so an agentic loop still sees its results.</para>
+        /// </summary>
+        public static string RenderNemotronHReasoning(List<ChatMessage> messages, bool addGenerationPrompt = true,
+            List<ToolFunction>? tools = null, bool enableThinking = false)
+        {
+            messages ??= new List<ChatMessage>();
+            var sb = new StringBuilder();
+
+            bool hasSystem = messages.Count > 0 && messages[0].Role == "system";
+            string system = hasSystem ? (messages[0].Content ?? string.Empty).Trim() : string.Empty;
+            bool thinkingOn;
+            if (system.Contains(NemotronHReasoningOn, StringComparison.Ordinal))
+            {
+                thinkingOn = true;
+            }
+            else if (system.Contains(NemotronHReasoningOff, StringComparison.Ordinal))
+            {
+                thinkingOn = false;
+            }
+            else
+            {
+                thinkingOn = enableThinking;
+                string marker = enableThinking ? NemotronHReasoningOn : NemotronHReasoningOff;
+                system = system.Length > 0 ? marker + "\n" + system : marker;
+            }
+
+            if (tools != null && tools.Count > 0)
+            {
+                system += "\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\n" +
+                          "You are provided with function signatures within <tools></tools> XML tags:\n<tools>";
+                foreach (var tool in tools)
+                    system += "\n" + Jinja2Template.ToJson(BuildToolDeclaration(tool));
+                system += "\n</tools>\n\nFor each function call, return a json object with function name and " +
+                          "arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n" +
+                          "{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call>\n" +
+                          "Function results are returned to you inside <tool_response></tool_response> tags.";
+            }
+
+            sb.Append(NemotronHSystemMarker).Append('\n').Append(system);
+
+            int start = hasSystem ? 1 : 0;
+            for (int i = start; i < messages.Count; i++)
+            {
+                var msg = messages[i];
+                bool isLast = i == messages.Count - 1;
+                switch (msg.Role)
+                {
+                    case "assistant":
+                    {
+                        var parts = new List<string>();
+                        string content = (msg.Content ?? string.Empty).Trim();
+                        if (content.Length > 0)
+                            parts.Add(content);
+                        if (msg.ToolCalls != null)
+                        {
+                            foreach (var tc in msg.ToolCalls)
+                                parts.Add("<tool_call>\n" + SerializeToolCall(tc) + "\n</tool_call>");
+                        }
+                        sb.Append(string.Join("\n", parts));
+                        break;
+                    }
+                    case "tool":
+                    {
+                        bool prevIsTool = i > start && messages[i - 1].Role == "tool";
+                        if (!prevIsTool)
+                            sb.Append('\n').Append(NemotronHTurnMarker).Append("User\n");
+                        else
+                            sb.Append('\n');
+                        sb.Append("<tool_response>\n").Append((msg.Content ?? string.Empty).Trim())
+                          .Append("\n</tool_response>");
+                        bool nextIsTool = i + 1 < messages.Count && messages[i + 1].Role == "tool";
+                        if (!nextIsTool)
+                            AppendNemotronHAssistantHeader(sb, isLast && addGenerationPrompt, thinkingOn);
+                        break;
+                    }
+                    default: // user, or a later system message rendered as a user turn
+                    {
+                        sb.Append('\n').Append(NemotronHTurnMarker).Append("User\n");
+                        sb.Append((msg.Content ?? string.Empty).Trim());
+                        AppendNemotronHAssistantHeader(sb, isLast && addGenerationPrompt, thinkingOn);
+                        break;
+                    }
+                }
+            }
+
+            return sb.ToString();
+        }
+
+        private static void AppendNemotronHAssistantHeader(StringBuilder sb, bool generationPrompt, bool thinkingOn)
+        {
+            sb.Append('\n').Append(NemotronHTurnMarker).Append("Assistant\n");
+            if (generationPrompt)
+                sb.Append(thinkingOn ? "<think>\n" : "<think></think>");
+        }
+
         private static void AppendNemotronUserContent(StringBuilder sb, ChatMessage msg)
         {
             int imgCount = msg.ImagePaths?.Count ?? 0;
@@ -648,9 +779,9 @@ namespace TensorSharp.Runtime
             var protocol = ChatProtocolRegistry.For(architecture);
             if (protocol?.PreferOwnRenderer != null
                 && protocol.PreferOwnRenderer(new ChatRenderRequest(
-                    messages, addGenerationPrompt, architecture, tools, enableThinking, reasoningEffort)))
+                    messages, addGenerationPrompt, architecture, tools, enableThinking, reasoningEffort, template)))
             {
-                return RenderHardcoded(messages, addGenerationPrompt, architecture, tools, enableThinking, reasoningEffort);
+                return RenderHardcoded(messages, addGenerationPrompt, architecture, tools, enableThinking, reasoningEffort, template);
             }
 
             if (!string.IsNullOrWhiteSpace(template))
@@ -705,7 +836,7 @@ namespace TensorSharp.Runtime
             }
 
             Console.Error.WriteLine($"[ChatTemplate] Using hardcoded template for '{architecture}'");
-            return RenderHardcoded(messages, addGenerationPrompt, architecture, tools, enableThinking);
+            return RenderHardcoded(messages, addGenerationPrompt, architecture, tools, enableThinking, null, template);
         }
 
         // (architecture, reason-kind) pairs whose Jinja→hardcoded fallback has
@@ -768,9 +899,9 @@ namespace TensorSharp.Runtime
         private static string RenderHardcoded(List<ChatMessage> messages,
             bool addGenerationPrompt, string? architecture,
             List<ToolFunction>? tools = null, bool enableThinking = false,
-            string? reasoningEffort = null)
+            string? reasoningEffort = null, string? ggufTemplate = null)
         {
-            var request = new ChatRenderRequest(messages, addGenerationPrompt, architecture, tools, enableThinking, reasoningEffort);
+            var request = new ChatRenderRequest(messages, addGenerationPrompt, architecture, tools, enableThinking, reasoningEffort, ggufTemplate);
             var render = ChatProtocolRegistry.For(architecture)?.Render;
 
             // No purpose-built renderer: generic ChatML, which is also what an
@@ -1634,6 +1765,11 @@ namespace TensorSharp.Runtime
 
         public static string RenderMistral3(List<ChatMessage> messages, bool addGenerationPrompt = true)
         {
+            // Mistral 3 always takes this renderer (PreferOwnRenderer), which bypasses the
+            // generic InjectMultimodalTokens pass the Jinja path runs, so the [IMG]
+            // placeholders are added here. Without them the injector found no [IMG] to
+            // expand, dropped the encoded image and the model answered from the text alone.
+            messages = InjectMultimodalTokens(messages, "mistral3");
             var sb = new StringBuilder();
             int startIdx = 0;
 

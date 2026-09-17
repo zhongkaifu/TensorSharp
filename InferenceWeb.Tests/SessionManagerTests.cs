@@ -106,11 +106,11 @@ public class SessionManagerTests
         var a = mgr.CreateSession();
         var b = mgr.CreateSession();
 
-        a.TrackedHistory.Add(new ChatMessage { Role = "user", Content = "A's secret" });
+        TranscriptTestHelper.RecordTurn(a, "A's secret");
 
         // Session B must not see any of A's state.
-        Assert.Empty(b.TrackedHistory);
-        Assert.Single(a.TrackedHistory);
+        Assert.Equal(0, b.TrackedTurnCount);
+        Assert.Equal(1, a.TrackedTurnCount);
     }
 
     [Fact]
@@ -120,11 +120,11 @@ public class SessionManagerTests
         // The returned session should still be usable for inspection.
         var mgr = new SessionManager();
         var created = mgr.CreateSession();
-        created.TrackedHistory.Add(new ChatMessage { Role = "user", Content = "keep" });
+        TranscriptTestHelper.RecordTurn(created, "keep");
 
         var removed = mgr.TryRemove(created.Id);
 
         Assert.False(removed!.IsDisposed);
-        Assert.Single(removed.TrackedHistory);
+        Assert.Equal(1, removed.TrackedTurnCount);
     }
 }

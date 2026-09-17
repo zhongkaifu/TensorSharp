@@ -57,6 +57,24 @@ namespace TensorSharp.Runtime.Paged
         /// </summary>
         public bool IsRestorablePrefixEnd { get; internal set; }
 
+        /// <summary>
+        /// The model's OWN paged K/V arrays hold this block's positions: every token in
+        /// it was forwarded through <c>IBatchedPagedModel.ForwardBatch</c> (which writes
+        /// through the slot mapping) rather than through the linear-cache
+        /// <c>Forward</c>. A block registered by a batched step carries no bytes in
+        /// <see cref="PagedKvStorage"/>, so a sequence that adopts it has to keep reading
+        /// it from the model's paged arrays; restoring it into the linear cache from the
+        /// pool would inject bytes that were never captured.
+        /// </summary>
+        public bool HoldsModelPagedKv { get; internal set; }
+
+        /// <summary>
+        /// <see cref="PagedKvStorage"/> holds a full-block snapshot extracted from the
+        /// model's linear cache (<c>TryExtractKVBlock</c>), so the block can be restored
+        /// into any sequence's linear cache.
+        /// </summary>
+        public bool HoldsSnapshotBytes { get; internal set; }
+
         /// <summary>Doubly-linked-list pointers for the free queue. Maintained by
         /// <see cref="FreeBlockQueue"/>. When the block is allocated both pointers
         /// are null.</summary>
@@ -76,7 +94,7 @@ namespace TensorSharp.Runtime.Paged
         public bool IsFree => RefCount == 0;
 
         public override string ToString()
-            => $"KvBlock(id={Id}, refs={RefCount}, used={Used}, restorable={IsRestorablePrefixEnd}, hash={(ContentHash.HasValue ? "yes" : "no")})";
+            => $"KvBlock(id={Id}, refs={RefCount}, used={Used}, restorable={IsRestorablePrefixEnd}, paged={HoldsModelPagedKv}, snapshot={HoldsSnapshotBytes}, hash={(ContentHash.HasValue ? "yes" : "no")})";
     }
 
     /// <summary>

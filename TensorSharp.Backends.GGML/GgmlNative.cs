@@ -4583,6 +4583,15 @@ internal enum GgmlIndexReductionOp
 
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int TSGgml_NemotronMamba2DecodeReadState(
+            ulong stateKey,
+            IntPtr convStateData,
+            int convStateElements,
+            IntPtr ssmStateData,
+            int ssmStateElements);
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         private static partial IntPtr TSGgml_AlignedAlloc(UIntPtr size);
 
         [LibraryImport(DllName)]
@@ -6525,6 +6534,20 @@ internal enum GgmlIndexReductionOp
         public static void NemotronMamba2DecodeClear(ulong modelKey)
         {
             TSGgml_NemotronMamba2DecodeClear(modelKey);
+        }
+
+        /// <summary>Copy a decode-cache entry's device conv/SSM state into host memory.
+        /// Returns true when copied, false when no initialized entry exists for the key;
+        /// throws on a native failure.</summary>
+        public static bool NemotronMamba2DecodeReadState(
+            ulong stateKey, IntPtr convStateData, int convStateElements, IntPtr ssmStateData, int ssmStateElements)
+        {
+            int rc = TSGgml_NemotronMamba2DecodeReadState(
+                stateKey, convStateData, convStateElements, ssmStateData, ssmStateElements);
+            if (rc < 0)
+                return false;
+            CheckResult(rc, "nemotron_mamba2_decode_read_state");
+            return true;
         }
 
         /// <summary>Allocate memory with 16 KB alignment (page-aligned for Metal host_ptr).</summary>
