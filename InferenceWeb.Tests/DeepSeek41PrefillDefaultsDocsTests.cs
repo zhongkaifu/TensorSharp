@@ -2,12 +2,14 @@
 // Licensed under the BSD-3-Clause license in the repository root.
 using System.Globalization;
 using System.Text.RegularExpressions;
+using TensorSharp.GGML;
+using TensorSharp.Models;
 
 namespace InferenceWeb.Tests;
 
 /// <summary>
-/// Drift guards for the DeepSeek V4.1 prefill defaults, in both directions:
-/// what the native loader implements must be what
+/// Drift guards for the two DeepSeek V4.1 prefill defaults, in both directions:
+/// what the native loader and the managed resolver implement must be what
 /// docs/env_var_feature_matrix(.md, _zh-cn.md) and the V4.1 model cards say,
 /// and every value those rows promise must still exist in the code.
 ///
@@ -15,6 +17,8 @@ namespace InferenceWeb.Tests;
 /// <item><c>TS_DSV41_SPARSE_FA</c>: sparse prefill on the owned F32 CUDA path for
 /// launches of more than TSG_PRECISION_DECODE_COLUMNS queries over at least
 /// TSG_DSV41_SPARSE_MIN_KEYS keys, <c>0</c> restoring tiled prefill.</item>
+/// <item><c>TS_DSV4_UBATCH</c>: unset on a ggml GPU backend means the loader's
+/// automatic 1024/512/256 choice, logged as <c>[dsv4] prefill ubatch: N (auto; ...)</c>.</item>
 /// </list>
 /// </summary>
 public class DeepSeek41PrefillDefaultsDocsTests
@@ -86,5 +90,54 @@ public class DeepSeek41PrefillDefaultsDocsTests
             Assert.Contains("--benchmark-dsv41-prefill", text);
         }
         Assert.Contains("--benchmark-dsv41-prefill", Read("TensorSharp.GGML.Native", "tests", "attention_precision_test.cpp"));
+    }
+
+    [Fact]
+    public void AutomaticPrefillWidth_CodeAndDocsAgree()
+    {
+        if (RepoRoot is null) return;
+        string plan = Read("TensorSharp.GGML.Native", "dsv4_ubatch_plan.h");
+        string loader = Read("TensorSharp.GGML.Native", "ggml_ops_deepseek4.cpp");
+        Match candidates = Regex.Match(plan, @"AUTO_UBATCH_CANDIDATES\[\]\s*=\s*\{([^}]*)\}");
+        Assert.True(candidates.Success, "dsv4_ubatch_plan.h must declare AUTO_UBATCH_CANDIDATES");
+        int[] widths = candidates.Groups[1].Value.Split(',').Select(v => int.Parse(v.Trim(), CultureInfo.InvariantCulture)).ToArray();
+        Assert.Equal(new[] { 1024, 512, 256 }, widths);
+        Assert.Contains($"constexpr int UBATCH_AUTO = {GgmlDeepSeek4Native.UBatchAuto};", plan);
+        Assert.Contains("prefill ubatch: %d (auto; %s)", loader);
+        Assert.Contains("TSG_EXPORT int TSGgml_Dsv4UBatch(void * handle)", loader);
+        Assert.Contains("Re-run with --n-cpu-moe %d", plan);
+
+        // The managed default the rows describe.
+        Assert.Equal(GgmlDeepSeek4Native.UBatchAuto, DeepSeek4Model.ResolveNativeUbatch(true, BackendType.GgmlCuda, null, out _));
+        Assert.Equal(256, DeepSeek4Model.ResolveNativeUbatch(true, BackendType.GgmlCpu, null, out _));
+        Assert.Equal(256, DeepSeek4Model.ResolveNativeUbatch(true, BackendType.Cpu, null, out _));
+        Assert.Equal(256, DeepSeek4Model.ResolveNativeUbatch(true, BackendType.Cuda, null, out _));
+        Assert.Equal(1024, DeepSeek4Model.ResolveNativeUbatch(false, BackendType.GgmlCuda, null, out _));
+        Assert.Equal(512, DeepSeek4Model.ResolveNativeUbatch(false, BackendType.Cpu, null, out _));
+
+        string en = Row(Read("docs", "env_var_feature_matrix.md"), "TS_DSV4_UBATCH", "env_var_feature_matrix.md");
+        string zh = Row(Read("docs", "env_var_feature_matrix_zh-cn.md"), "TS_DSV4_UBATCH", "env_var_feature_matrix_zh-cn.md");
+        Assert.Contains($"{widths[0]}, {widths[1]} or {widths[2]}", en);
+        Assert.Contains($"{widths[0]}、{widths[1]}、{widths[2]}", zh);
+        foreach (string row in new[] { en, zh })
+        {
+            Assert.Contains("[dsv4] prefill ubatch: N (auto; ...)", row);
+            Assert.Contains("`256`", row);
+            Assert.Contains("`1024`", row);
+            Assert.Contains("`512`", row);
+        }
+        Assert.Contains("V4.1: auto on ggml GPU backends", en);
+        Assert.Contains("used verbatim", en);
+        Assert.Contains("ggml GPU 后端上自动", zh);
+        Assert.Contains("原样使用", zh);
+        foreach (string card in new[] { "deepseek41.md", "deepseek41_zh-cn.md" })
+        {
+            string text = Read("docs", "models", card);
+            Assert.Contains("[dsv4] prefill ubatch: N (auto; ...)", text);
+            Assert.Contains("TS_DSV4_UBATCH=256", text);
+            Assert.Contains("TSGgml_Dsv4UBatch", text);
+            Assert.Contains("Re-run with --n-cpu-moe N", text);
+            Assert.Contains("2,318 / 2,588 / 3,128", text);
+        }
     }
 }

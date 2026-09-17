@@ -45,6 +45,7 @@
 #include "dsv41_truncate.h"
 #include "dsv41_dspark.h"
 #include "ggml_ops_precision_policy.h"
+#include "dsv4_ubatch_plan.h"
 #include "dsv41_retention.h"
 #include "dsv41_engram_io.h"
 #include "dsv41_engram_advice.h"
@@ -2067,8 +2068,13 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
 
     // --- geometry ---
     m->n_ctx = n_ctx > 0 ? n_ctx : 16384;
-    m->n_ubatch = n_ubatch > 0 ? n_ubatch : 512;
-    if (m->ds.loaded && m->ds.block_size >= m->n_ubatch)
+    // tsg_dsv4_plan::UBATCH_AUTO (-1) lets the split below choose the prefill
+    // width from the candidates it can afford (accelerators only; the CPU
+    // device keeps the executor's 256). Any other value is the caller's width,
+    // used as given, with 0 or less meaning 512.
+    const bool ubatch_auto = n_ubatch == tsg_dsv4_plan::UBATCH_AUTO && !cpu_only;
+    m->n_ubatch = n_ubatch == tsg_dsv4_plan::UBATCH_AUTO ? 256 : n_ubatch > 0 ? n_ubatch : 512;
+    if (!ubatch_auto && m->ds.loaded && m->ds.block_size >= m->n_ubatch)
         throw std::runtime_error("DSpark requires ubatch >= draft block size + 1");
     // The owned CUDA precision paths compute a verify batch exactly like
     // single-token decode only up to TSG_PRECISION_DECODE_COLUMNS rows. A
@@ -2079,7 +2085,6 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
         fprintf(stderr, "[dsv4] warning: DSpark verify batches of %d rows exceed the decode-class width %lld; "
                         "speculative verify and single-token decode will not commit bit-identical cache rows on GPU\n",
                 m->ds.block_size + 1, (long long) TSG_PRECISION_DECODE_COLUMNS);
-    m->ring_raw = pad64(hp.n_swa + m->n_ubatch, 256);
     // +1 so the masked scratch row (last row) used by non-boundary CSA/LID
     // decode steps never collides with a real compressed row.
     m->n_csa_rows = pad64(m->n_ctx / (hp.v41 ? 2 : CSA_RATIO) + 1, 256);
@@ -2091,7 +2096,8 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
     // of the state ring and aligning the target to the ratio is not enough;
     // that case is left refusing rather than half-proved. V4.1 compresses
     // disjoint blocks, so a target aligned to the widest ratio reads nothing
-    // the rewind dropped.
+    // the rewind dropped. The rewind span depends on the raw ring, so it is
+    // set once the split has fixed the prefill width.
     if (hp.v41)
     {
         int32_t align = 1;
@@ -2101,120 +2107,46 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
             align = (int32_t) std::lcm((int64_t) align, (int64_t) r);
         }
         m->truncate_align = align;
-        // A query at the new head reads the raw window (new_head - n_swa,
-        // new_head]; the ring holds ring_raw consecutive positions, so this is
-        // how far the head may move back before one of those rows has been
-        // overwritten by an abandoned position.
-        m->rewind_span = std::max<int64_t>(0, m->ring_raw - hp.n_swa + 1);
         m->rewind_cp = true;
         if (const char * e = getenv("TS_DSV41_REWIND_CHECKPOINT")) m->rewind_cp = atoi(e) != 0;
     }
 
     // --- what a layer costs its device beyond its weights -----------------
     // The KV caches and compressor state rings are allocated on the layer's
-    // own device right after the weights, so the split has to price them:
-    // a device packed to the last byte of weights fails at slot allocation
-    // instead of at load, which reads as a runtime crash rather than a
-    // capacity problem.
-    const int64_t state_extra_est = m->ds.loaded ? m->ds.block_size : 0;
-    auto layer_cache_bytes = [&](int il) -> size_t
-    {
-        const int64_t head = hp.n_embd_head;
-        const int64_t idx  = hp.indexer_head_size;
-        size_t b = (size_t) (head * m->ring_raw * 2);                    // raw_k F16
-        const int ratio = hp.compress_ratios[il];
-        if (hp.v41)
-        {
-            if (std::find(hp.kv_sources.begin(), hp.kv_sources.end(), il) != hp.kv_sources.end())
-            {
-                const int64_t rows = ratio == 2 ? m->n_csa_rows : m->n_hca_rows;
-                b += (head + idx) * rows * 2;
-                if (ratio > 1) b += 2 * head * (ratio + state_extra_est + 1) * 4;
-            }
-            if (m->rewind_cp)
-            {
-                // Rewind-checkpoint shadows: the raw ring, and the compressor
-                // state ring where the layer owns one.
-                b += (size_t) (head * m->ring_raw * 2);
-                if (ratio > 1
-                    && std::find(hp.kv_sources.begin(), hp.kv_sources.end(), il) != hp.kv_sources.end())
-                {
-                    b += (size_t) (2 * head * (ratio + state_extra_est + 1) * 4);
-                }
-            }
-        }
-        else if (ratio == CSA_RATIO)
-        {
-            const int64_t st = 2 * CSA_RATIO + state_extra_est + 1;
-            b += (size_t) (head * m->n_csa_rows * 2);                    // csa_k F16
-            b += (size_t) (idx * m->n_csa_rows * 2);                     // lid_k F16
-            b += (size_t) (2 * (2 * head) * st * 4);                     // comp_state kv+score F32
-            b += (size_t) (2 * (2 * idx) * st * 4);                      // lid_state  kv+score F32
-        }
-        else if (ratio == HCA_RATIO)
-        {
-            const int64_t st = HCA_RATIO + state_extra_est + 1;
-            b += (size_t) (head * m->n_hca_rows * 2);                    // hca_k F16
-            b += (size_t) (2 * head * st * 4);                           // comp_state kv+score F32
-        }
-        return b + 13 * 256;   // ggml buffer alignment padding per tensor
-    };
+    // own device right after the weights, so the split prices them for each
+    // candidate width (the raw ring grows with the ubatch); see
+    // tsg_dsv4_plan::layer_cache_bytes.
+    tsg_dsv4_plan::cache_geometry cache_geometry;
+    cache_geometry.v41 = hp.v41;
+    cache_geometry.n_embd_head = hp.n_embd_head;
+    cache_geometry.indexer_head_size = hp.indexer_head_size;
+    cache_geometry.n_csa_rows = m->n_csa_rows;
+    cache_geometry.n_hca_rows = m->n_hca_rows;
+    cache_geometry.state_extra = m->ds.loaded ? m->ds.block_size : 0;
+    cache_geometry.rewind_cp = m->rewind_cp;
+    cache_geometry.compress_ratios = hp.compress_ratios;
+    cache_geometry.kv_sources = hp.kv_sources;
+    cache_geometry.csa_ratio = CSA_RATIO;
+    cache_geometry.hca_ratio = HCA_RATIO;
 
     // --- per-device VRAM budget -------------------------------------------
     // Free VRAM now, minus what the graph itself needs at run time (the
     // scheduler's compute buffers, which are sized from the largest ubatch
-    // graph and cannot be known before the model exists). Everything else the
-    // split accounts for exactly.
-    std::vector<size_t> dev_budget((size_t) n_gpu, 0);
+    // graph and cannot be known before the model exists). The reserve scales
+    // with the ubatch, so each candidate width gets its own budget; see
+    // tsg_dsv4_plan::estimate_reserve. Everything else the split accounts for
+    // exactly.
     std::vector<size_t> dev_free((size_t) n_gpu, 0);
+    long reserve_override_mb = -1;
+    if (const char * e = getenv("TS_DSV4_VRAM_RESERVE_MB")) { long v = atol(e); if (v >= 0) reserve_override_mb = v; }
+    // Per-device residents the split does not attribute to any layer.
+    size_t per_dev_fixed = 0;
+    if (m->fused) per_dev_fixed += (size_t) (2 * hp.n_rot * m->n_ctx * 4);   // rope cos/sin tables
+    for (int d = 0; d < n_gpu; d++)
     {
-        // The scheduler's compute buffers are sized from the largest ubatch graph
-        // and cannot be known before the model exists, so the split holds back a
-        // reserve. A flat 2 GiB was too small for this architecture once the
-        // weights nearly fill the cards: the lightning indexer's top-k runs an
-        // argsort over every visible compressed row, and CUB takes its workspace
-        // from the CUDA VMM pool at RUN time, not from any layer's budget. A
-        // 1024-token ubatch over a 64k context is ~768 MiB for that one transient
-        // alone, and a DeepSeek V4.1 Q4_K_M prefill of a 28k-token prompt aborted
-        // in argsort_f32_i32_cuda_cub with the flat reserve.
-        //
-        // So price the transients that scale: the indexer's scores and its sort
-        // workspace, and the hidden activations of one ubatch across the streams.
-        // TS_DSV4_VRAM_RESERVE_MB still overrides, including downward.
-        const int64_t comp_rows = m->n_ctx / (hp.v41 ? 1 : CSA_RATIO) + 1;
-        // The factor on the indexer term used to be 4, because the reserve also
-        // had to cover a graph cache capped by ENTRY COUNT: twelve prefill
-        // graphs of a few hundred MiB each is more than any headroom.
-        // dsv4_trim_graph_cache now bounds that cache by bytes, so the reserve
-        // covers one graph's compute buffers plus the run-time transients that
-        // never pass through a graph buffer (ggml-cuda takes CUB's segmented
-        // argsort workspace straight from the VMM pool).
-        //
-        // Measured on the eight-A40 VM, Q4_K_M, ubatch 1024, 64k context: the
-        // largest graph's compute buffers were 1,336 MiB on a device (1.7x the
-        // indexer term), and a 57,424-token prefill peaked with 1,522 MiB still
-        // free on the tightest device against a 3,072 MiB reserve. 1.25 lands
-        // just above that, and holding back more costs routed-expert offload --
-        // 5,240 MiB forced three CPU-MoE layers where 3,174 MiB needs one, worth
-        // 350 -> 480 prefill tok/s. TS_DSV4_VRAM_RESERVE_MB still overrides,
-        // including upward for a rig that wants more margin.
-        const double idx_mb = (double) m->n_ubatch * comp_rows * 4.0 * 3.0 / (1024.0 * 1024.0);
-        const double act_mb = (double) m->n_ubatch * hp.n_embd * 4.0 * (hp.hc_mult + 2) / (1024.0 * 1024.0);
-        size_t reserve_mb = (size_t) std::max(2048.0, 1.25 * idx_mb + act_mb + 2048.0);
-        if (const char * e = getenv("TS_DSV4_VRAM_RESERVE_MB")) { long v = atol(e); if (v >= 0) reserve_mb = (size_t) v; }
-        fprintf(stderr, "[dsv4] VRAM reserve: %zu MiB per device (indexer %.0f x1.25 + activations %.0f + 2048 headroom)\n",
-                reserve_mb, idx_mb, act_mb);
-        // Per-device residents the split does not attribute to any layer.
-        size_t per_dev_fixed = 0;
-        if (m->fused) per_dev_fixed += (size_t) (2 * hp.n_rot * m->n_ctx * 4);   // rope cos/sin tables
-        const size_t reserve = reserve_mb * 1024 * 1024 + per_dev_fixed;
-        for (int d = 0; d < n_gpu; d++)
-        {
-            size_t free_b = 0, total_b = 0;
-            ggml_backend_dev_memory(ggml_backend_get_device(m->backends[d]), &free_b, &total_b);
-            dev_free[d] = free_b;
-            dev_budget[d] = free_b > reserve ? free_b - reserve : 0;
-        }
+        size_t free_b = 0, total_b = 0;
+        ggml_backend_dev_memory(ggml_backend_get_device(m->backends[d]), &free_b, &total_b);
+        dev_free[d] = free_b;
     }
 
     // --- routed-expert CPU offload + layer -> device split -----------------
@@ -2262,17 +2194,14 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
         std::vector<size_t> fixed_bytes((size_t) n_gpu, 0);
         fixed_bytes[0] += embd_bytes;
         fixed_bytes[(size_t) n_gpu - 1] += head_bytes;
-        if (m->ds.loaded)
-            fixed_bytes[(size_t) n_gpu - 1] += (size_t) m->ds.n_stages *
-                ((size_t) hp.n_embd_head * m->ring_raw * sizeof(ggml_fp16_t) + 256) * (m->rewind_cp ? 2 : 1);
 
         // V4.1: prefer placing each Engram table on the GPU that owns its
         // layer. The lookup then becomes a device get_rows over the quantized
         // table instead of host page faults plus a CPU dequantize and an
         // upload. A table is tens of GiB, so it is only taken when it costs no
         // routed-expert offload the run was not already going to pay; the
-        // packer prices the tables through layer_cost while `engram_device` is
-        // set, and the decision is made just after the offload search below.
+        // packer prices the tables while `engram_device` is set, and
+        // tsg_dsv4_plan::plan_offload makes the decision for each width.
         bool engram_device = false;
         bool engram_device_forced = false;
         {
@@ -2322,95 +2251,91 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
                 throw std::runtime_error("TS_DSV41_ENGRAM_DEVICE=1 requires DeepSeek V4.1 on GPU devices; this run "
                     + std::string(hp.v41 ? "selected the CPU device" : "is not V4.1") + ".");
         }
-        auto layer_cost = [&](int il, int n_cpu) -> size_t
+        const bool engram_device_wanted = engram_device;
+
+        // Everything the packer prices for one prefill width: the raw ring
+        // (and the drafter's rings) grow with the ubatch, and so does the
+        // graph reserve held back from every device's budget.
+        auto costs_for = [&](int ubatch, tsg_dsv4_plan::reserve_estimate & reserve) -> tsg_dsv4_plan::split_costs
         {
-            size_t w = layer_bytes[il];
-            if (il < n_cpu || tp_ranks) w -= layer_exps_bytes[il];
-            if (engram_device) w += layer_engram_bytes[il];
-            return w + layer_cache_bytes(il);
+            const int64_t ring = tsg_dsv4_plan::ring_rows(hp.n_swa, ubatch);
+            tsg_dsv4_plan::split_costs c;
+            c.layer_bytes = layer_bytes;
+            c.layer_exps_bytes = layer_exps_bytes;
+            c.layer_engram_bytes = layer_engram_bytes;
+            c.layer_cache_bytes.resize((size_t) hp.n_layer);
+            for (int il = 0; il < hp.n_layer; ++il)
+                c.layer_cache_bytes[(size_t) il] = tsg_dsv4_plan::layer_cache_bytes(cache_geometry, il, ring);
+            c.tp_bytes = tp_bytes;
+            c.tp_ranks = tp_ranks;
+            c.fixed_bytes = fixed_bytes;
+            if (m->ds.loaded)
+                c.fixed_bytes[(size_t) n_gpu - 1] += (size_t) m->ds.n_stages *
+                    ((size_t) hp.n_embd_head * ring * sizeof(ggml_fp16_t) + 256) * (m->rewind_cp ? 2 : 1);
+            reserve = tsg_dsv4_plan::estimate_reserve(ubatch, m->n_ctx, hp.v41, hp.n_embd, hp.hc_mult, CSA_RATIO,
+                reserve_override_mb);
+            const size_t held = reserve.reserve_mb * 1024 * 1024 + per_dev_fixed;
+            c.dev_budget.resize((size_t) n_gpu);
+            for (int d = 0; d < n_gpu; d++)
+                c.dev_budget[(size_t) d] = dev_free[(size_t) d] > held ? dev_free[(size_t) d] - held : 0;
+            return c;
         };
 
-        // Layers stay in pipeline order, so every device takes one contiguous
-        // run: fill each device up to `frac` of its budget, and report whether
-        // all of them fit.
-        auto pack = [&](double frac, int n_cpu, std::vector<int> * out) -> bool
+        // --- prefill width -------------------------------------------------
+        // A resident routed-expert layer costs about the same per prefill
+        // chunk at any width (one Q4_K_M-shaped layer on an A40,
+        // GgmlOpsDsv4MoeWidthBench: 35.3-35.7 / 36.9-37.2 / 38.9-39.1 ms at
+        // 256 / 512 / 1024 tokens, so 3.6x cheaper per token at 1024; a host
+        // layer at 32 threads 0.44-0.46 against 0.34 ms a token). A wider chunk's
+        // graph reserve and raw ring cost VRAM, though, which can push one more
+        // layer's experts to the host, a cost every decoded token then pays.
+        // Automatic selection takes the widest candidate that needs no more host
+        // layers than 256 would (or than an explicit --n-cpu-moe the run pays
+        // anyway).
+        const std::vector<int> widths = tsg_dsv4_plan::ubatch_candidates(n_ubatch, !cpu_only,
+            m->ds.loaded ? m->ds.block_size : 0);
+        std::vector<tsg_dsv4_plan::split_costs> costs;
+        std::vector<tsg_dsv4_plan::reserve_estimate> reserves(widths.size());
+        std::vector<tsg_dsv4_plan::ubatch_candidate> candidates;
+        for (size_t i = 0; i < widths.size(); ++i)
         {
-            auto fixed = fixed_bytes;
-            if (tp_ranks)
-                for (int il = n_cpu; il < hp.n_layer; ++il)
-                    for (int d = 0; d < tp_ranks; ++d) fixed[d] += tp_bytes[il][d];
-            if (tp_ranks)
-                for (int d = 0; d < n_gpu; ++d)
-                    if (fixed[d] > (size_t) (dev_budget[d] * frac)) return false;
-            int dev = 0;
-            size_t used = fixed[0];
-            for (int il = 0; il < hp.n_layer; il++)
-            {
-                const size_t cost = layer_cost(il, n_cpu);
-                while (used + cost > (size_t) (dev_budget[dev] * frac))
-                {
-                    if (dev + 1 >= n_gpu) return false;
-                    used = fixed[++dev];
-                }
-                used += cost;
-                if (out) (*out)[il] = dev;
-            }
-            return true;
-        };
-
-        // How many leading layers have to give up their experts.
-        int need_cpu_moe = 0;
-        while (need_cpu_moe <= hp.n_layer && !pack(1.0, need_cpu_moe, nullptr)) need_cpu_moe++;
-        if (engram_device)
+            costs.push_back(costs_for(widths[i], reserves[i]));
+            tsg_dsv4_plan::ubatch_candidate candidate;
+            candidate.ubatch = widths[i];
+            candidate.offload = tsg_dsv4_plan::plan_offload(costs.back(), engram_device_wanted, n_cpu_moe_req);
+            candidates.push_back(candidate);
+        }
+        const tsg_dsv4_plan::ubatch_choice choice =
+            tsg_dsv4_plan::choose_ubatch(candidates, hp.n_layer, n_cpu_moe_req, engram_device_forced);
+        const size_t pick = (size_t) std::max(0, choice.index);
+        m->n_ubatch = widths[pick];
+        m->ring_raw = tsg_dsv4_plan::ring_rows(hp.n_swa, m->n_ubatch);
+        if (hp.v41)
         {
-            // `need_cpu_moe` above was priced WITH the tables on GPUs. Price the
-            // same model without them, and keep the tables on GPUs only when
-            // two things hold: they cost no routed-expert offload beyond what
-            // this run was going to pay anyway, and they still leave a little of
-            // every device's budget unspent.
-            //
-            // The first matters because paying for device tables with host
-            // expert matmuls on every token is a bad trade -- though an operator
-            // who already asked for --n-cpu-moe should not be refused a
-            // placement that fits inside it. The second matters because the
-            // packer prices ONE sequence slot's caches, and 60 GiB of tables
-            // would otherwise be allowed to consume exactly the headroom the
-            // next concurrent sequence needs.
-            constexpr double engram_device_margin = 0.95;
-            const int with_tables = need_cpu_moe;
-            engram_device = false;
-            int without_tables = 0;
-            while (without_tables <= hp.n_layer && !pack(1.0, without_tables, nullptr)) without_tables++;
-            const int already_paying = n_cpu_moe_req >= 0 ? std::max(n_cpu_moe_req, without_tables) : without_tables;
+            // A query at the new head reads the raw window (new_head - n_swa,
+            // new_head]; the ring holds ring_raw consecutive positions, so this
+            // is how far the head may move back before one of those rows has
+            // been overwritten by an abandoned position.
+            m->rewind_span = std::max<int64_t>(0, m->ring_raw - hp.n_swa + 1);
+        }
+        if (ubatch_auto)
+            fprintf(stderr, "[dsv4] prefill ubatch: %d (auto; %s)\n", m->n_ubatch, choice.reason.c_str());
+        else if (n_ubatch == tsg_dsv4_plan::UBATCH_AUTO)
+            fprintf(stderr, "[dsv4] prefill ubatch: %d (auto on the CPU device)\n", m->n_ubatch);
+        const tsg_dsv4_plan::split_costs & split = costs[pick];
+        const tsg_dsv4_plan::offload_plan & offload = candidates[pick].offload;
+        fprintf(stderr, "[dsv4] VRAM reserve: %zu MiB per device (indexer %.0f x1.25 + activations %.0f + 2048 headroom)\n",
+                reserves[pick].reserve_mb, reserves[pick].idx_mb, reserves[pick].act_mb);
 
-            const char * refused = nullptr;
-            if (with_tables > hp.n_layer)
-                refused = "they do not fit these devices even with every routed expert on the host";
-            else if (with_tables > already_paying)
-                refused = "they would cost routed-expert offload this run was not already paying";
-            else
-            {
-                // pack() prices the tables only while engram_device is set, so
-                // set it before asking whether the margin holds.
-                engram_device = true;
-                if (!pack(engram_device_margin, std::max(with_tables, n_cpu_moe_req < 0 ? 0 : n_cpu_moe_req), nullptr))
-                {
-                    engram_device = false;
-                    refused = "they would leave no headroom for a second concurrent sequence";
-                }
-            }
-
-            if (engram_device)
-                need_cpu_moe = with_tables;
-            else
-            {
-                need_cpu_moe = without_tables;
-                if (engram_device_forced)
-                    throw std::runtime_error(std::string("TS_DSV41_ENGRAM_DEVICE=1 does not fit on these devices: ") +
-                        refused + ". With host tables this model needs --n-cpu-moe " +
-                        std::to_string(without_tables) + ". Unset the option to choose automatically, or free VRAM.");
-                fprintf(stderr, "[dsv41] Engram tables stay host mappings: %s\n", refused);
-            }
+        int need_cpu_moe = offload.need_cpu_moe;
+        engram_device = offload.engram_device;
+        if (engram_device_wanted && !engram_device)
+        {
+            if (engram_device_forced)
+                throw std::runtime_error(std::string("TS_DSV41_ENGRAM_DEVICE=1 does not fit on these devices: ") +
+                    offload.engram_refused + ". With host tables this model needs --n-cpu-moe " +
+                    std::to_string(offload.without_tables) + ". Unset the option to choose automatically, or free VRAM.");
+            fprintf(stderr, "[dsv41] Engram tables stay host mappings: %s\n", offload.engram_refused);
         }
         m->engram_on_device = engram_device;
 
@@ -2427,19 +2352,14 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
                 // abort. Naming WHICH number would work is the whole value
                 // here: the operator cannot derive it from the model size,
                 // because what has to fit is the weights PLUS this context's
-                // KV caches.
+                // KV caches. With an automatic width this is the narrowest
+                // candidate's need: a wider one never needs fewer.
                 size_t free_total = 0;
                 for (int d = 0; d < n_gpu; d++) free_total += dev_free[d];
                 size_t would_free = 0;
                 for (int il = 0; il < need_cpu_moe && il < hp.n_layer; il++) would_free += layer_exps_bytes[il];
-                fprintf(stderr,
-                        "[dsv4] not enough VRAM: %.1f GiB of weights plus this context's KV caches against "
-                        "%.1f GiB free across %d device(s)%s. Re-run with --n-cpu-moe %d (moves the routed "
-                        "experts of the first %d layer(s), %.1f GiB, to system RAM) or --cpu-moe to offload "
-                        "every layer.\n",
-                        total_bytes / 1073741824.0, free_total / 1073741824.0, n_gpu,
-                        n_cpu_moe > 0 ? " at the requested offload" : "",
-                        need_cpu_moe, need_cpu_moe, would_free / 1073741824.0);
+                fputs(tsg_dsv4_plan::not_enough_vram_message(total_bytes / 1073741824.0, free_total / 1073741824.0,
+                    n_gpu, n_cpu_moe > 0, need_cpu_moe, would_free / 1073741824.0).c_str(), stderr);
                 return nullptr;
             }
         }
@@ -2462,11 +2382,11 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
         for (int it = 0; it < 40; it++)
         {
             const double mid = 0.5 * (lo + hi);
-            if (pack(mid, n_cpu_moe, nullptr)) hi = mid; else lo = mid;
+            if (tsg_dsv4_plan::pack(split, engram_device, mid, n_cpu_moe, nullptr)) hi = mid; else lo = mid;
         }
 
         std::vector<int> devs((size_t) hp.n_layer, 0);
-        if (pack(hi, n_cpu_moe, &devs))
+        if (tsg_dsv4_plan::pack(split, engram_device, hi, n_cpu_moe, &devs))
         {
             for (int il = 0; il < hp.n_layer; il++)
                 m->layers[il].device = devs[il];
@@ -7153,6 +7073,14 @@ TSG_EXPORT int TSGgml_Dsv4DsparkBlockSize(void * handle)
 {
     auto * m = (tsg_dsv4::dsv4_model *) handle;
     return (m && m->ds.loaded) ? m->ds.block_size : 0;
+}
+
+// The prefill micro-batch the loaded model runs: the caller's explicit width,
+// or what the loader chose for n_ubatch = -1 (automatic). 0 without a model.
+TSG_EXPORT int TSGgml_Dsv4UBatch(void * handle)
+{
+    auto * m = (tsg_dsv4::dsv4_model *) handle;
+    return m ? m->n_ubatch : 0;
 }
 
 // Trunk forward with per-row logits (the speculative verify). Behaves exactly

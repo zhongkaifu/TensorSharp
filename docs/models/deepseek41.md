@@ -204,8 +204,10 @@ The host build copies the native library beside the server DLL. This launch
 uses the conservative benchmark matrix's microbatch and scheduler settings;
 the optimized profiles in the validation report use different settings.
 Sparse prefill attention needs no flag: it is the default on this path, and
-`TS_DSV41_SPARSE_FA=0` turns it off. Choose `TS_CPU_MOE_THREADS` for the
-available CPU quota and record it for each run.
+`TS_DSV41_SPARSE_FA=0` turns it off. `TS_DSV4_UBATCH=256` pins the width that
+matrix measured; leave it unset to let the loader choose (see
+[Backends](#backends)). Choose `TS_CPU_MOE_THREADS` for the available CPU quota
+and record it for each run.
 Set it in the launch environment, including for GPU-only placements: native
 CPU graph work and host reduction can still affect latency. The current CLI
 also accepts `--cpu-moe-threads N`; use the same value if supplying both, since
@@ -540,9 +542,15 @@ Q2_K comparison at an approximately 8k prompt improved sustained decode by
 complete measurement settings remain in the validation report.
 
 The default context allocation is capped at 65,536 tokens unless `MAX_CONTEXT`
-is supplied. `TS_DSV4_UBATCH` controls the forward microbatch, defaulting to 256
-for V4.1. A larger advertised model window does not establish that a particular
-GPU configuration can allocate or efficiently serve it.
+is supplied. `TS_DSV4_UBATCH` controls the forward microbatch. Unset, V4.1 on a
+ggml GPU backend lets the loader choose it: 1024, 512 or 256, the widest that
+needs no more routed-expert CPU layers than 256 would, logged as
+`[dsv4] prefill ubatch: N (auto; ...)` (see
+[Device memory held back for the graph](#device-memory-held-back-for-the-graph)).
+The CPU executors and the direct-CUDA engine keep 256. Any explicit value is used
+verbatim; `TS_DSV4_UBATCH=256` restores the previous fixed default. A larger
+advertised model window does not establish that a particular GPU configuration
+can allocate or efficiently serve it.
 
 ### Token-batched decode
 
@@ -587,6 +595,32 @@ packer leaves unspent. The default prices the indexer's top-k transients, one
 microbatch of activations and a 2 GiB floor. Holding back too much is not free:
 on the eight-A40 VM at Q4_K_M, 5,240 MiB forced three layers of routed experts
 onto the host and 3,174 MiB needs one, worth 350 -> 480 prefill tok/s.
+
+Both that reserve and the raw sliding-window ring grow with the prefill
+micro-batch, so with `TS_DSV4_UBATCH` unset the loader prices the split once per
+candidate width. At 65,536 context the default reserve is 2,318 / 2,588 / 3,128
+MiB per device for 256 / 512 / 1024, and the ring 512 / 768 / 1,280 rows. It
+takes the widest candidate that needs no more routed-expert CPU layers than 256
+would -- or than an explicit `--n-cpu-moe` the run pays anyway -- and that does
+not move GPU-resident Engram tables to the host. A wider chunk is cheaper per
+prefill token: one Q4_K_M-shaped routed-expert layer (`GgmlOpsDsv4MoeWidthBench`,
+uniform top-6 routing, one A40) took 35.3-35.7 / 36.9-37.2 / 38.9-39.1 ms a chunk
+at 256 / 512 / 1024 tokens resident on the GPU, 3.6x cheaper per token at 1024,
+and 112.7-117.9 / 185.0-189.1 / 349.9-353.3 ms on 32 host threads (0.44-0.46
+against 0.34 ms a token). But an extra host layer is paid on every decoded
+token, so that trade is never made. The log line names the width and, when a
+wider one was declined, why. A `--n-cpu-moe` below what 256 needs is refused with that number
+(`Re-run with --n-cpu-moe N`). 2048 is not a candidate: the reserve was
+validated at 1024 (a 57,424-token prefill peaked with 1,522 MiB free against a
+3,072 MiB reserve) and a ggml device OOM ends the process. The choice is exported
+(`TSGgml_Dsv4UBatch`) so speculative prefill chunks to the same width.
+
+Priced with the Q4_K_M release's tensor sizes and the per-device budgets its
+seven-A40 run implies (free memory after load plus what the load placed, 45,091-
+45,123 MiB per device), all three widths need 6 routed-expert CPU layers at 65,536
+context, so the loader picks 1024; at 131,072 context the same budgets also give
+6 at every width. These are computed plans (`GgmlOpsDsv4UbatchPlanTest`), not
+measured loads.
 
 The graph cache is bounded by bytes as well as by entry count. An entry's
 compute buffers scale with its shape, and concurrent sequences at different

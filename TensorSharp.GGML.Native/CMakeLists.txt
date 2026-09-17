@@ -636,6 +636,21 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
     endif()
     add_test(NAME attention-allocation COMMAND GgmlOpsAttentionAllocTest)
 
+    add_executable(GgmlOpsDsv4UbatchPlanTest tests/dsv4_ubatch_plan_test.cpp)
+    target_include_directories(GgmlOpsDsv4UbatchPlanTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME deepseek4-ubatch-plan COMMAND GgmlOpsDsv4UbatchPlanTest)
+    set_tests_properties(deepseek4-ubatch-plan PROPERTIES TIMEOUT 60)
+    # Explicit per-width routed-expert layer timing behind the automatic ubatch
+    # (see the source header). Never registered as a CTest.
+    add_executable(GgmlOpsDsv4MoeWidthBench tests/dsv4_moe_width_bench.cpp)
+    target_include_directories(GgmlOpsDsv4MoeWidthBench PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/include")
+    target_link_libraries(GgmlOpsDsv4MoeWidthBench PRIVATE ggml-cpu ggml-base)
+    if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
+        target_compile_definitions(GgmlOpsDsv4MoeWidthBench PRIVATE TSG_GGML_USE_CUDA=1)
+        target_link_libraries(GgmlOpsDsv4MoeWidthBench PRIVATE ggml-cuda)
+    endif()
+
     add_executable(GgmlOpsGetRowsQuantTest tests/get_rows_quant_test.cpp)
     target_include_directories(GgmlOpsGetRowsQuantTest PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/include"
