@@ -742,7 +742,7 @@ Unix IPC 并非完整隔离边界：macOS 为兼容性保留共享临时目录�
 | `TS_GPTOSS_PAGED_ATTN_MANAGED` | 在 GPT OSS 批处理路径中使用托管 (C#) 的带 sinks 分页注意力内核。 |
 | `TS_NEMOTRON_BATCHED` | 设为 `0` 强制 Nemotron-H 走旧的按序列 KV-swap 路径（默认走批处理 / 分页）。 |
 | `TS_NEMOTRON_MAMBA2_BATCHED_NATIVE` | 在 Nemotron-H 批处理路径中使用原生 Mamba2 批处理步骤内核。 |
-| `TS_NEMOTRON_ATTN_SCORE_BUDGET_MB` | Nemotron-H：物化 prefill 回退路径在改为按 query 子块计算前允许构建的最大注意力得分张量（MiB，默认 1024）。GGML 融合 / flash prefill 路径不构建得分张量。 |
+| `TS_NEMOTRON_ATTN_SCORE_BUDGET_MB` | Nemotron-H：物化 prefill 回退路径在改为按 query 子块计算前允许构建的最大注意力得分张量（MiB，默认 1024）。GGML 融合 prefill kernel（F32 / F16 cache）不受此预算约束，得分张量较大时会切换到 flash attention。 |
 | `TS_MAMBA2_PREFILL_CACHE_MB` | Nemotron-H：缓存的原生 Mamba2 prefill 计算图可占用的设备内存（MiB，按最近最少使用淘汰，默认 1024）。大于预算的计算图只服务当次调用，随后释放。 |
 | `TS_PAGED_ATTN_KERNEL` | `Mistral3Model.BatchedForward` 选择的分页注意力派发内核：`native`（默认）、`tensor`（基于 C# Tensor）或 `managed`（纯 C# 标量）。 |
 | `TS_MLX_PIPELINED_DECODE` | 默认 `1`，当请求为贪心采样、没有 stop 序列且模型支持 device-side argmax / 下一 token embedding 查找时，在 MLX 后端启用流水化贪心 decode。设为 `0` 可关闭。仅 CLI。 |
