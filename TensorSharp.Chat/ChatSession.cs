@@ -102,9 +102,30 @@ namespace TensorSharp.Server
             if (SharedAcrossConversations)
                 return inheritedScope ?? HashScope("lineage|" + Guid.NewGuid().ToString("N"));
             int epoch;
+            string conversation;
             lock (HistoryLock)
+            {
                 epoch = ConversationEpoch;
-            return HashScope("session|" + Id + "|" + epoch.ToString(System.Globalization.CultureInfo.InvariantCulture));
+                conversation = _conversationKey;
+            }
+            string owner = conversation != null ? "conversation|" + conversation : "session|" + Id;
+            return HashScope(owner + "|" + epoch.ToString(System.Globalization.CultureInfo.InvariantCulture));
+        }
+
+        private string _conversationKey;
+
+        /// <summary>
+        /// Name the saved conversation this session serves, so every session a host opens
+        /// for that conversation runs in ONE cache scope. TensorAgent opens a new session
+        /// each time a chat is opened (a menu switch, a relaunch, a page re-attached after
+        /// the WebView was suspended); scoped by session alone, each reopen lost the
+        /// conversation's own retained state and re-prefilled everything past the system
+        /// prompt. The key must identify a conversation of one user; null unbinds.
+        /// </summary>
+        internal void BindConversation(string conversationKey)
+        {
+            lock (HistoryLock)
+                _conversationKey = string.IsNullOrEmpty(conversationKey) ? null : conversationKey;
         }
 
         private static string HashScope(string value)

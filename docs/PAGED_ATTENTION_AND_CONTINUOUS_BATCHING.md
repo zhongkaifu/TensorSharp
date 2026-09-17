@@ -318,7 +318,7 @@ checkpoint longer than its own public prefix. The scope comes from the chat laye
 
 | Request | Scope |
 |---|---|
-| Web UI / TensorAgent with a `sessionId` | the session and its new-chat epoch (`newChat:true` starts a new one) |
+| Web UI / TensorAgent with a `sessionId` | the session and its new-chat epoch (`newChat:true` starts a new one); a host that binds sessions to its saved conversations (`WebUiChatService.BindSessionConversation`, which TensorAgent calls for every session it opens) uses the conversation instead, so reopening a chat continues its own cached state |
 | OpenAI Chat / Responses, Ollama chat, Web UI without a `sessionId` | the conversation the request's history proves it continues: its last assistant message is a turn this server generated and sent (see below), and sent to that conversation only; otherwise (including when two conversations were sent the same turn after the same history, such as a greedy reply to a common opening) a fresh scope |
 | Skills / code tool-loop rounds | the scope of the client turn that started the loop |
 | Engine callers that set no scope (benchmarks, the CLI) | unscoped, which matches every scope (unchanged behaviour) |

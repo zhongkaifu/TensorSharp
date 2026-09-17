@@ -281,7 +281,7 @@ GatedDeltaNet 递归状态作为一个混合 holder 一起保留。未声明该�
 
 | 请求 | 作用域 |
 |---|---|
-| 带 `sessionId` 的 Web UI / TensorAgent | 会话及其新会话纪元（`newChat:true` 开始一个新纪元） |
+| 带 `sessionId` 的 Web UI / TensorAgent | 会话及其新会话纪元（`newChat:true` 开始一个新纪元）；把会话绑定到已保存对话的宿主（`WebUiChatService.BindSessionConversation`，TensorAgent 为它打开的每个会话都会调用）改用该对话，因此重新打开一个聊天会延续它自己的缓存状态 |
 | OpenAI Chat / Responses、Ollama chat、不带 `sessionId` 的 Web UI | 请求历史证明自己所延续的会话：它最后一条 assistant 消息是本服务器生成并只发给该会话的回合（见下文）；否则（包括两个会话在相同历史之后收到了相同回合的情况，例如对常见开场白的贪心回复）是一个全新的作用域 |
 | Skills / 代码工具循环的各轮 | 启动该循环的客户端回合的作用域 |
 | 不设置作用域的引擎调用方（基准测试、CLI） | 无作用域，与所有作用域匹配（行为不变） |
