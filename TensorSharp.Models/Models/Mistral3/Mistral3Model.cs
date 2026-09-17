@@ -64,8 +64,18 @@ namespace TensorSharp.Models
         public Mistral3Model(string ggufPath, BackendType backend, int tpDegree = 1, ITensorParallelGroup tpGroup = null)
             : base(ggufPath, backend, tpDegree, tpGroup)
         {
+            // Hyperparameters live under whatever prefix the converter wrote: "mistral3"
+            // for current conversions, "llama" for Mistral Small 3.x files converted before
+            // llama.cpp had a mistral3 architecture (the registry admits those only through
+            // Mistral3Architecture.IsLlamaLabelledMistral3). The protocol id is always
+            // mistral3, so rendering, parsing and capabilities select this family either way.
             string arch = _gguf.GetString("general.architecture") ?? "mistral3";
-            Config = new ModelConfig { Architecture = arch };
+            Config = new ModelConfig { Architecture = "mistral3" };
+            if (!string.Equals(arch, Config.Architecture, StringComparison.Ordinal))
+            {
+                MetadataArchitecture = arch;
+                Console.WriteLine($"  GGUF labelled '{arch}' is served as mistral3 (metadata read under '{arch}.*').");
+            }
             ParseBaseConfig();
 
             _attnKeyLen = Config.KeyLength > 0 ? Config.KeyLength : Config.HeadDim;
@@ -401,6 +411,10 @@ namespace TensorSharp.Models
             _visionEncoder = new Mistral3VisionEncoder(mmProjPath, _allocator);
             _visionEncoder.SetHostModel(this);
         }
+
+        /// <summary>Text-embedding rows for <paramref name="tokens"/>, for multimodal
+        /// layouts that interleave marker tokens with encoder output.</summary>
+        internal Tensor EmbedTokensForMultimodal(int[] tokens) => Embedding(tokens);
 
         public void SetVisionEmbeddings(Tensor embeddings, int insertPosition)
         {

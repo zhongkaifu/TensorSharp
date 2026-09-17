@@ -1634,6 +1634,11 @@ namespace TensorSharp.Runtime
 
         public static string RenderMistral3(List<ChatMessage> messages, bool addGenerationPrompt = true)
         {
+            // Mistral 3 always takes this renderer (PreferOwnRenderer), which bypasses the
+            // generic InjectMultimodalTokens pass the Jinja path runs, so the [IMG]
+            // placeholders are added here. Without them the injector found no [IMG] to
+            // expand, dropped the encoded image and the model answered from the text alone.
+            messages = InjectMultimodalTokens(messages, "mistral3");
             var sb = new StringBuilder();
             int startIdx = 0;
 
