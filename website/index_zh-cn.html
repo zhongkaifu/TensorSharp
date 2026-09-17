@@ -15,7 +15,7 @@
 <a class="skip" href="#content">跳到正文</a>
 <main class="content" id="content">
 
-  <section class="hero">
+  <section class="hero hero-home">
     <div>
       <span class="pill">⚡ C# · .NET 10 · GGUF · AgentHost · GPU 加速</span>
       <h1>TensorSharp</h1>
@@ -24,43 +24,94 @@
         <a class="btn" href="getting-started_zh-cn.html">开始使用 →</a>
         <a class="btn secondary" href="overview_zh-cn.html">TensorSharp 是什么？</a>
         <a class="btn secondary" href="agentic_zh-cn.html">智能体工作流</a>
-        <a class="btn secondary" href="https://www.amazon.com/dp/B0HJQ4VQ31" target="_blank" rel="noopener">阅读本书 ↗</a>
+        <a class="btn secondary" href="#books">阅读配套图书 ↓</a>
         <a class="btn secondary" href="https://github.com/zhongkaifu/TensorSharp" target="_blank" rel="noopener">GitHub ↗</a>
       </div>
     </div>
-    <div class="hero-art" aria-hidden="true">
-      <div><span class="c-cm"># 一次性生成</span></div>
-      <div>dotnet run --project TensorSharp.Cli -- \</div>
-      <div>&nbsp;&nbsp;--model <span class="c-st">gemma-4-E4B-it-Q8_0.gguf</span> \</div>
-      <div>&nbsp;&nbsp;--input prompt.txt \</div>
-      <div>&nbsp;&nbsp;--backend <span class="c-ac">ggml_cuda</span></div>
-      <div>&nbsp;</div>
-      <div><span class="c-cm"># 或启动兼容 OpenAI 的 API 服务</span></div>
-      <div>dotnet run --project TensorSharp.Server.Host -- \</div>
-      <div>&nbsp;&nbsp;--model <span class="c-st">model.gguf</span> --backend <span class="c-ac">cpu</span></div>
-      <div><span class="c-cm"># UI → http://localhost:5000/ · 健康检查 → /health</span></div>
-    </div>
   </section>
+
+  <section class="model-overview" aria-labelledby="supported-models">
+    <h2 id="supported-models">支持的模型家族</h2>
+    <div class="model-group">
+      <h3>文本与多模态 LLM</h3>
+      <ul class="model-links">
+        <li><a href="models-text_zh-cn.html#gemma4-fast-lane">Gemma 4</a></li>
+        <li><a href="models-text_zh-cn.html#qwen35">Qwen 3.5 / 3.6</a></li>
+        <li><a href="models-text_zh-cn.html#qwen4exp">Qwen 3.8 Flash Next</a></li>
+        <li><a href="models-text_zh-cn.html#deepseek4">DeepSeek V4 Flash</a></li>
+        <li><a href="models-text_zh-cn.html#deepseek41">DeepSeek V4.1 Flash</a></li>
+        <li><a href="models-text_zh-cn.html#glm">GLM 5.x</a></li>
+        <li><a href="models-text_zh-cn.html#bonsai">Bonsai (Qwen)</a></li>
+        <li><a href="models-text_zh-cn.html#gptoss">GPT OSS</a></li>
+        <li><a href="models-text_zh-cn.html#nemotron">Nemotron-H</a></li>
+        <li><a href="models-text_zh-cn.html#mistral3">Mistral 3</a></li>
+        <li><a href="models-text_zh-cn.html#hunyuan-dense">Hunyuan Dense</a></li>
+        <li><a href="models-text_zh-cn.html#muse-glimmer">Muse-Glimmer</a></li>
+      </ul>
+    </div>
+    <div class="model-group">
+      <h3>文本扩散</h3>
+      <ul class="model-links">
+        <li><a href="models-text_zh-cn.html#diffusiongemma">DiffusionGemma</a></li>
+      </ul>
+    </div>
+    <div class="model-group">
+      <h3>图像与视频生成</h3>
+      <ul class="model-links">
+        <li><a href="models-image_zh-cn.html#qwen-image-edit">Qwen-Image-Edit</a></li>
+        <li><a href="models-video_zh-cn.html#minimax-h3">MiniMax-H3</a></li>
+        <li><a href="models-video_zh-cn.html#wan">Wan 2.1 / 2.2</a></li>
+      </ul>
+    </div>
+    <div class="model-group">
+      <h3>嵌入模型 · BERT / XLM-R</h3>
+      <ul class="model-links">
+        <li><a href="embeddings_zh-cn.html">Snowflake Arctic Embed L v2.0</a></li>
+        <li><a href="embeddings_zh-cn.html">all-MiniLM-L6-v2</a></li>
+      </ul>
+    </div>
+    <p class="model-note">各家族的后端、多模态输入、工具调用与验证范围不同。<a href="models_zh-cn.html">查看完整能力矩阵 →</a></p>
+  </section>
+
 
   <p>一切都运行在<strong>你自己的硬件</strong>上：你的笔记本、工作站或服务器。推理与智能体工作默认留在本机，没有按 token 计费，同一套引擎既能完成快速的命令行测试，也能支撑团队内部共享的聊天机器人和生产环境的 REST 接口。运维方明确授予任一执行面的网络权限，或接受 Windows 的非受限代码执行模式后，数据才可能离开本机。本维基是完整指南 —— 从下方选择一个起点，或按 <kbd>/</kbd> 进行搜索。</p>
 
   <p><strong>新增句向量编码器：</strong> Snowflake Arctic Embed L v2.0 / all-MiniLM-L6-v2，支持纯 C# CPU 与原生 GGML CPU/Metal/CUDA，通过 <code>--embeddings</code> 提供兼容 OpenAI/Ollama 的 API。 <a href="embeddings_zh-cn.html">嵌入模型、支持的后端与验证 →</a></p>
 
-  <section class="book-spotlight" aria-labelledby="book-spotlight-title">
-    <a class="book-cover-link" href="https://www.amazon.com/dp/B0HJQ4VQ31" target="_blank" rel="noopener">
-      <img class="book-cover" src="assets/building-inference-engines-cover.jpg" alt="Zhongkai Fu 所著《Building Inference Engines and Agentic Runtimes from Scratch: Qwen Dense and MoE Models with TensorSharp and TensorAgent》封面" width="376" height="500" loading="lazy">
-    </a>
-    <div>
-      <p class="book-kicker">新书 · TensorSharp 与 TensorAgent</p>
-      <h2 id="book-spotlight-title">Building Inference Engines and Agentic Runtimes from Scratch</h2>
-      <p class="book-subtitle"><strong>Qwen Dense and MoE Models with TensorSharp and TensorAgent</strong></p>
-      <p>以 Qwen 稠密模型与混合专家（MoE）模型为例，探索如何使用 TensorSharp 和 TensorAgent 从零构建推理引擎与智能体运行时。配合源码阅读，将模型执行与支撑智能体应用的运行时联系起来。</p>
-      <div class="book-points" aria-label="本书主题"><span>Qwen 稠密模型</span><span>混合专家（MoE）</span><span>推理引擎</span><span>智能体运行时</span></div>
-      <div class="btn-row">
-        <a class="btn" href="https://www.amazon.com/dp/B0HJQ4VQ31" target="_blank" rel="noopener">前往 Amazon 购买 ↗</a>
-        <a class="btn secondary" href="book_zh-cn.html#building-inference-engines">查看书籍介绍 →</a>
-      </div>
-      <p class="book-meta">作者：<strong>Zhongkai Fu</strong></p>
+  <section aria-labelledby="books">
+    <h2 id="books">配套图书</h2>
+    <p>Zhongkai Fu 所著的两本书，将 TensorSharp 源码串联为循序渐进的实现路线。</p>
+    <div class="books-grid">
+      <article class="book-card" aria-labelledby="book-B0HJQ4VQ31-title">
+        <a class="book-cover-link" href="https://www.amazon.com/dp/B0HJQ4VQ31" target="_blank" rel="noopener">
+          <img class="book-cover" src="assets/building-llm-inference-engines-cover.jpg" alt="Zhongkai Fu 所著《Building LLM Inference Engines and Agentic Runtimes from Scratch: Qwen Dense and MoE Models with TensorSharp and TensorAgent》封面" width="1000" height="1329" loading="lazy">
+        </a>
+        <div class="book-card-copy">
+          <p class="book-kicker">Qwen · 推理与智能体</p>
+          <h3 id="book-B0HJQ4VQ31-title">Building LLM Inference Engines and Agentic Runtimes from Scratch</h3>
+          <p class="book-subtitle">Qwen Dense and MoE Models with TensorSharp and TensorAgent</p>
+          <p>以 TensorSharp 和 TensorAgent 为工程参考，使用 C# 探索从张量、分词到 Qwen 稠密与 MoE 推理的实现，再延伸至工具、技能、代码执行与沙箱边界，串联 GPU 优化、多模态输入及桌面和移动端部署。</p>
+          <div class="btn-row">
+            <a class="btn" href="https://www.amazon.com/dp/B0HJQ4VQ31" target="_blank" rel="noopener">在 Amazon 购买 ↗</a>
+            <a class="btn secondary" href="book_zh-cn.html#building-inference-engines">了解本书 →</a>
+          </div>
+        </div>
+      </article>
+      <article class="book-card" aria-labelledby="book-B0H9P44QZZ-title">
+        <a class="book-cover-link" href="https://www.amazon.com/dp/B0H9P44QZZ" target="_blank" rel="noopener">
+          <img class="book-cover" src="assets/from-tensors-to-tokens-cover.jpg" alt="Zhongkai Fu 所著《From Tensors to Tokens: Building a Multimodal LLM Inference Engine from Scratch with TensorSharp and Gemma 4 E4B》封面" width="1000" height="1430" loading="lazy">
+        </a>
+        <div class="book-card-copy">
+          <p class="book-kicker">Gemma 4 · 多模态推理</p>
+          <h3 id="book-B0H9P44QZZ-title">From Tensors to Tokens</h3>
+          <p class="book-subtitle">Building a Multimodal LLM Inference Engine from Scratch with TensorSharp and Gemma 4 E4B</p>
+          <p>以 Gemma 4 E4B 为具体示例，使用 C# 与 .NET 构建多模态推理引擎，从张量存储、GGUF、量化和分词走向图像、视频与音频输入，并通过数值验证、缓存和批处理理解正确性与性能。</p>
+          <div class="btn-row">
+            <a class="btn" href="https://www.amazon.com/dp/B0H9P44QZZ" target="_blank" rel="noopener">在 Amazon 购买 ↗</a>
+            <a class="btn secondary" href="book_zh-cn.html#why-read">了解本书 →</a>
+          </div>
+        </div>
+      </article>
     </div>
   </section>
 
@@ -74,7 +125,7 @@
     <a class="card" href="http-api_zh-cn.html"><div class="ic">🔌</div><h3>HTTP API</h3><p>用 curl、Python 或任意 Ollama / OpenAI 客户端调用它。</p></a>
     <a class="card" href="code-api_zh-cn.html"><div class="ic">🧩</div><h3>C# 库</h3><p>将引擎直接嵌入你的 .NET 应用。</p></a>
     <a class="card" href="api-reference_zh-cn.html"><div class="ic">📚</div><h3>API 参考</h3><p>可搜索的参数、环境变量、端点与类型表。</p></a>
-    <a class="card" href="models_zh-cn.html"><div class="ic">🧠</div><h3>模型</h3><p>全部十三种架构、下载方式、多模态与推理能力 —— 以及想要更快时该选哪个权重。</p></a>
+    <a class="card" href="models_zh-cn.html"><div class="ic">🧠</div><h3>模型</h3><p>支持的模型家族、下载方式、多模态与推理能力 —— 以及想要更快时该选哪个权重。</p></a>
     <a class="card" href="distributed_zh-cn.html"><div class="ic">🔗</div><h3>多 GPU 与多节点</h3><p>跨 GPU（CUDA 与 GGML）、跨机器的张量并行。</p></a>
     <a class="card" href="glossary_zh-cn.html"><div class="ic">📖</div><h3>术语表与 FAQ</h3><p>初识大模型？这里有通俗的定义和常见问题。</p></a>
   </div>

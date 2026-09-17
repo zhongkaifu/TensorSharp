@@ -2,15 +2,15 @@
 
 [← Back to TensorSharp](../README.md) | [English](BOOK.md) | [中文](BOOK_zh-cn.md)
 
-## Building Inference Engines and Agentic Runtimes from Scratch: Qwen Dense and MoE Models with TensorSharp and TensorAgent
+## Building LLM Inference Engines and Agentic Runtimes from Scratch: Qwen Dense and MoE Models with TensorSharp and TensorAgent
 
 <p align="center">
   <a href="https://www.amazon.com/dp/B0HJQ4VQ31">
-    <img src="../website/assets/building-inference-engines-cover.jpg" alt="Building Inference Engines and Agentic Runtimes from Scratch: Qwen Dense and MoE Models with TensorSharp and TensorAgent" width="280">
+    <img src="../website/assets/building-llm-inference-engines-cover.jpg" alt="Building LLM Inference Engines and Agentic Runtimes from Scratch: Qwen Dense and MoE Models with TensorSharp and TensorAgent" width="280">
   </a>
 </p>
 
-**Building Inference Engines and Agentic Runtimes from Scratch** is a guide to building inference engines and agentic runtimes with TensorSharp and TensorAgent, using Qwen dense and mixture-of-experts (MoE) models as the examples. It connects model architecture with the systems that execute inference and support agentic applications.
+**Building LLM Inference Engines and Agentic Runtimes from Scratch** follows a practical C# path from tensors, tokenization, and model loading to Qwen dense/MoE inference and controlled agent workflows. It connects attention, expert routing, quantization, caching, GPU execution, batching, speculation, distributed and multimodal inference with tools, skills, sandboxed code execution, and desktop/mobile deployment using TensorSharp and TensorAgent.
 
 Read the book alongside the source to explore how these ideas fit together, from model execution in TensorSharp to the agent experience in TensorAgent. The companion links below provide current implementation details and instructions for running the projects.
 

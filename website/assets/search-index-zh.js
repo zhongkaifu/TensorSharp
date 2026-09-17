@@ -1,13 +1,14 @@
 /* 中文搜索索引（TensorSharp 维基）。每条：
    t = 标题, p = 页面标签, u = url(+锚点，英文形式，app.js 会本地化为 _zh-cn), s = 摘要, k = 额外关键词。 */
 window.SEARCH_INDEX_ZH = [
+  { t: "支持的模型家族", p: "首页", u: "index.html#supported-models", s: "Gemma、Qwen、DeepSeek、GLM、Bonsai、GPT OSS、Nemotron、Mistral、Hunyuan、Muse-Glimmer、DiffusionGemma、Qwen-Image-Edit、MiniMax-H3、Wan 与 BERT/XLM-R 嵌入模型。", k: "models families support snowflake arctic minilm 模型 家族 支持 多模态 文本 图像 视频 嵌入" },
   { t: "嵌入模型与语义检索", p: "嵌入模型", u: "embeddings_zh-cn.html", s: "纯 C# CPU 与原生 GGML CPU/Metal/CUDA；Snowflake Arctic Embed 与 MiniLM：OpenAI/Ollama 嵌入 API、批处理、dimensions、base64、查询前缀与性能验证。", k: "embedding embeddings bert xlm roberta snowflake arctic minilm semantic search vector rag sqlite embed dimensions pooling 嵌入 向量 语义 检索" },
   { t: "TensorSharp 是什么", p: "首页", u: "index.html", s: "原生 .NET GGUF 推理引擎 —— CLI、Web UI、兼容 API，以及可选的 AgentHost 技能与模型生成代码沙箱。", k: "intro 简介 概览 关于 llm gguf csharp dotnet agent 智能体 技能 代码执行" },
   { t: "约 30 秒快速上手", p: "首页", u: "index.html#quickstart", s: "克隆仓库、下载经基准验证的 Gemma 4 E4B Q8_0（7.48 GiB），并通过四步可复制命令在原生 GGML CUDA 上运行。", k: "30 秒 begin 开始 教程 第一次 运行 hello gemma e4b q8 cuda" },
   { t: "其他后端与多模态", p: "首页", u: "index.html#quickstart-e4b", s: "在 ggml_metal、ggml_vulkan 或 ggml_cpu 上运行 Gemma 4 E4B，并为图像/视频/音频添加 mmproj 投影器。", k: "gemma4 gemma 4 e4b q8 原生 ggml metal vulkan cpu mmproj 投影器 多模态" },
   { t: "TensorSharp 适合谁", p: "首页", u: "index.html#audience", s: "面向开发者、管理者、CTO、学生与采用本地大模型推理的企业的价值。", k: "audience 受众 商业价值 高管 销售 市场 学生" },
 
-  { t: "Building Inference Engines and Agentic Runtimes from Scratch: Qwen Dense and MoE Models with TensorSharp and TensorAgent", p: "配套图书", u: "book.html#building-inference-engines", s: "使用 TensorSharp 与 TensorAgent，围绕 Qwen 稠密模型与 MoE 模型，从零构建推理引擎和智能体运行时。", k: "book 图书 amazon zhongkai fu 阅读 购买 学习 指南 教程 qwen dense moe tensoragent 稠密 混合专家 智能体" },
+  { t: "Building LLM Inference Engines and Agentic Runtimes from Scratch: Qwen Dense and MoE Models with TensorSharp and TensorAgent", p: "配套图书", u: "book.html#building-inference-engines", s: "以 TensorSharp 和 TensorAgent 为参考，探索 Qwen 稠密与 MoE 推理、GPU 执行、工具与技能、沙箱边界，以及桌面和移动端部署。", k: "book 图书 amazon zhongkai fu 阅读 购买 学习 指南 教程 qwen dense moe tensoragent 稠密 混合专家 智能体" },
   { t: "From Tensors to Tokens — TensorSharp 配套图书", p: "配套图书", u: "book.html#why-read", s: "使用 TensorSharp 与 Gemma 4 E4B，在 C#/.NET 中从零构建多模态大模型推理引擎。", k: "book 图书 纸质书 amazon zhongkai fu 阅读 购买 学习 指南 教程" },
   { t: "本书内容", p: "配套图书", u: "book.html#inside", s: "张量存储、GGUF、量化、tokenization、Transformer 执行、多模态投影、采样、流式输出与生产级优化。", k: "章节 主题 内容 tensor stride allocator operator cpu accelerator paged kv 连续批处理 投机解码" },
   { t: "配合源码阅读", p: "配套图书", u: "book.html#read-with-repo", s: "将本书的连贯讲解与 TensorSharp 源码、快速开始、模型卡片、API 和性能文档配合使用。", k: "companion 配套 源码 github 文档 gemma4 实现" },

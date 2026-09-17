@@ -15,7 +15,7 @@
 <a class="skip" href="#content">Skip to content</a>
 <main class="content" id="content">
 
-  <section class="hero">
+  <section class="hero hero-home">
     <div>
       <span class="pill">⚡ C# · .NET 10 · GGUF · AgentHost · GPU-accelerated</span>
       <h1>TensorSharp</h1>
@@ -24,43 +24,94 @@
         <a class="btn" href="getting-started.html">Get started →</a>
         <a class="btn secondary" href="overview.html">What is TensorSharp?</a>
         <a class="btn secondary" href="agentic.html">Agentic work</a>
-        <a class="btn secondary" href="https://www.amazon.com/dp/B0HJQ4VQ31" target="_blank" rel="noopener">Read the book ↗</a>
+        <a class="btn secondary" href="#books">Explore both books ↓</a>
         <a class="btn secondary" href="https://github.com/zhongkaifu/TensorSharp" target="_blank" rel="noopener">GitHub ↗</a>
       </div>
     </div>
-    <div class="hero-art" aria-hidden="true">
-      <div><span class="c-cm"># one-shot generation</span></div>
-      <div>dotnet run --project TensorSharp.Cli -- \</div>
-      <div>&nbsp;&nbsp;--model <span class="c-st">gemma-4-E4B-it-Q8_0.gguf</span> \</div>
-      <div>&nbsp;&nbsp;--input prompt.txt \</div>
-      <div>&nbsp;&nbsp;--backend <span class="c-ac">ggml_cuda</span></div>
-      <div>&nbsp;</div>
-      <div><span class="c-cm"># or serve an OpenAI-compatible API</span></div>
-      <div>dotnet run --project TensorSharp.Server.Host -- \</div>
-      <div>&nbsp;&nbsp;--model <span class="c-st">model.gguf</span> --backend <span class="c-ac">cpu</span></div>
-      <div><span class="c-cm"># UI → http://localhost:5000/ · health → /health</span></div>
-    </div>
   </section>
+
+  <section class="model-overview" aria-labelledby="supported-models">
+    <h2 id="supported-models">Supported model families</h2>
+    <div class="model-group">
+      <h3>Text &amp; multimodal LLMs</h3>
+      <ul class="model-links">
+        <li><a href="models-text.html#gemma4-fast-lane">Gemma 4</a></li>
+        <li><a href="models-text.html#qwen35">Qwen 3.5 / 3.6</a></li>
+        <li><a href="models-text.html#qwen4exp">Qwen 3.8 Flash Next</a></li>
+        <li><a href="models-text.html#deepseek4">DeepSeek V4 Flash</a></li>
+        <li><a href="models-text.html#deepseek41">DeepSeek V4.1 Flash</a></li>
+        <li><a href="models-text.html#glm">GLM 5.x</a></li>
+        <li><a href="models-text.html#bonsai">Bonsai (Qwen)</a></li>
+        <li><a href="models-text.html#gptoss">GPT OSS</a></li>
+        <li><a href="models-text.html#nemotron">Nemotron-H</a></li>
+        <li><a href="models-text.html#mistral3">Mistral 3</a></li>
+        <li><a href="models-text.html#hunyuan-dense">Hunyuan Dense</a></li>
+        <li><a href="models-text.html#muse-glimmer">Muse-Glimmer</a></li>
+      </ul>
+    </div>
+    <div class="model-group">
+      <h3>Text diffusion</h3>
+      <ul class="model-links">
+        <li><a href="models-text.html#diffusiongemma">DiffusionGemma</a></li>
+      </ul>
+    </div>
+    <div class="model-group">
+      <h3>Image &amp; video generation</h3>
+      <ul class="model-links">
+        <li><a href="models-image.html#qwen-image-edit">Qwen-Image-Edit</a></li>
+        <li><a href="models-video.html#minimax-h3">MiniMax-H3</a></li>
+        <li><a href="models-video.html#wan">Wan 2.1 / 2.2</a></li>
+      </ul>
+    </div>
+    <div class="model-group">
+      <h3>Embeddings · BERT / XLM-R</h3>
+      <ul class="model-links">
+        <li><a href="embeddings.html">Snowflake Arctic Embed L v2.0</a></li>
+        <li><a href="embeddings.html">all-MiniLM-L6-v2</a></li>
+      </ul>
+    </div>
+    <p class="model-note">Backend availability, input modalities, tool calling, and validation vary by family. <a href="models.html">Compare model capabilities →</a></p>
+  </section>
+
 
   <p>Everything runs on <strong>your own hardware</strong>: your laptop, workstation, or server. Inference and agent work stay local by default, there are no per-token fees, and the same engine powers a quick command-line test, a shared internal chatbot, and a production REST endpoint. Data can leave if an operator explicitly grants either execution surface network access, or accepts Windows' unconfined code-execution mode. This wiki is the complete guide — pick a starting point below or use <kbd>/</kbd> to search.</p>
 
   <p><strong>Sentence encoders:</strong> Snowflake Arctic Embed L v2.0 / all-MiniLM-L6-v2, with pure C# CPU and native GGML CPU/Metal/CUDA execution, served through <code>--embeddings</code> and OpenAI/Ollama embedding APIs. <a href="embeddings.html">Embedding models, supported backends, and validation →</a></p>
 
-  <section class="book-spotlight" aria-labelledby="book-spotlight-title">
-    <a class="book-cover-link" href="https://www.amazon.com/dp/B0HJQ4VQ31" target="_blank" rel="noopener">
-      <img class="book-cover" src="assets/building-inference-engines-cover.jpg" alt="Cover of Building Inference Engines and Agentic Runtimes from Scratch: Qwen Dense and MoE Models with TensorSharp and TensorAgent by Zhongkai Fu" width="376" height="500" loading="lazy">
-    </a>
-    <div>
-      <p class="book-kicker">New book · TensorSharp and TensorAgent</p>
-      <h2 id="book-spotlight-title">Building Inference Engines and Agentic Runtimes from Scratch</h2>
-      <p class="book-subtitle"><strong>Qwen Dense and MoE Models with TensorSharp and TensorAgent</strong></p>
-      <p>Explore how to build inference engines and agentic runtimes from scratch with TensorSharp and TensorAgent, using Qwen dense and mixture-of-experts (MoE) models. Read alongside the source to connect model execution with the runtime that supports agentic applications.</p>
-      <div class="book-points" aria-label="Book topics"><span>Qwen dense models</span><span>Mixture of experts (MoE)</span><span>Inference engines</span><span>Agentic runtimes</span></div>
-      <div class="btn-row">
-        <a class="btn" href="https://www.amazon.com/dp/B0HJQ4VQ31" target="_blank" rel="noopener">Buy on Amazon ↗</a>
-        <a class="btn secondary" href="book.html#building-inference-engines">Explore the books →</a>
-      </div>
-      <p class="book-meta">By <strong>Zhongkai Fu</strong></p>
+  <section aria-labelledby="books">
+    <h2 id="books">Learn with the books</h2>
+    <p>Two books by Zhongkai Fu turn the TensorSharp source into guided implementation journeys.</p>
+    <div class="books-grid">
+      <article class="book-card" aria-labelledby="book-B0HJQ4VQ31-title">
+        <a class="book-cover-link" href="https://www.amazon.com/dp/B0HJQ4VQ31" target="_blank" rel="noopener">
+          <img class="book-cover" src="assets/building-llm-inference-engines-cover.jpg" alt="Cover of Building LLM Inference Engines and Agentic Runtimes from Scratch: Qwen Dense and MoE Models with TensorSharp and TensorAgent by Zhongkai Fu" width="1000" height="1329" loading="lazy">
+        </a>
+        <div class="book-card-copy">
+          <p class="book-kicker">Qwen · Inference &amp; agents</p>
+          <h3 id="book-B0HJQ4VQ31-title">Building LLM Inference Engines and Agentic Runtimes from Scratch</h3>
+          <p class="book-subtitle">Qwen Dense and MoE Models with TensorSharp and TensorAgent</p>
+          <p>Follow a C# implementation from tensors and tokenization to Qwen dense and MoE inference, then to agent tools, skills, code execution, and sandbox boundaries. TensorSharp and TensorAgent connect the design to GPU optimization, multimodal input, and desktop and mobile deployment.</p>
+          <div class="btn-row">
+            <a class="btn" href="https://www.amazon.com/dp/B0HJQ4VQ31" target="_blank" rel="noopener">Buy on Amazon ↗</a>
+            <a class="btn secondary" href="book.html#building-inference-engines">Explore the book →</a>
+          </div>
+        </div>
+      </article>
+      <article class="book-card" aria-labelledby="book-B0H9P44QZZ-title">
+        <a class="book-cover-link" href="https://www.amazon.com/dp/B0H9P44QZZ" target="_blank" rel="noopener">
+          <img class="book-cover" src="assets/from-tensors-to-tokens-cover.jpg" alt="Cover of From Tensors to Tokens: Building a Multimodal LLM Inference Engine from Scratch with TensorSharp and Gemma 4 E4B by Zhongkai Fu" width="1000" height="1430" loading="lazy">
+        </a>
+        <div class="book-card-copy">
+          <p class="book-kicker">Gemma 4 · Multimodal inference</p>
+          <h3 id="book-B0H9P44QZZ-title">From Tensors to Tokens</h3>
+          <p class="book-subtitle">Building a Multimodal LLM Inference Engine from Scratch with TensorSharp and Gemma 4 E4B</p>
+          <p>Build a multimodal inference engine in C# and .NET using Gemma 4 E4B. Work through tensor storage, GGUF loading, quantization, and tokenization, then explore image, video, and audio inputs, numerical checks, caching, and batching.</p>
+          <div class="btn-row">
+            <a class="btn" href="https://www.amazon.com/dp/B0H9P44QZZ" target="_blank" rel="noopener">Buy on Amazon ↗</a>
+            <a class="btn secondary" href="book.html#why-read">Explore the book →</a>
+          </div>
+        </div>
+      </article>
     </div>
   </section>
 
@@ -74,7 +125,7 @@
     <a class="card" href="http-api.html"><div class="ic">🔌</div><h3>HTTP API</h3><p>Call it from curl, Python, or any Ollama/OpenAI client.</p></a>
     <a class="card" href="code-api.html"><div class="ic">🧩</div><h3>C# Library</h3><p>Embed the engine directly in your .NET application.</p></a>
     <a class="card" href="api-reference.html"><div class="ic">📚</div><h3>API Reference</h3><p>Searchable tables of flags, env vars, endpoints, and types.</p></a>
-    <a class="card" href="models.html"><div class="ic">🧠</div><h3>Models</h3><p>All thirteen architectures, downloads, multimodal, reasoning — and which checkpoint to pick when you want it fast.</p></a>
+    <a class="card" href="models.html"><div class="ic">🧠</div><h3>Models</h3><p>Supported model families, downloads, multimodal, reasoning — and which checkpoint to pick when you want it fast.</p></a>
     <a class="card" href="distributed.html"><div class="ic">🔗</div><h3>Multi-GPU &amp; Multi-Node</h3><p>Tensor parallelism across GPUs — CUDA and GGML — and across machines.</p></a>
     <a class="card" href="glossary.html"><div class="ic">📖</div><h3>Glossary &amp; FAQ</h3><p>New to LLMs? Plain-language definitions and common questions.</p></a>
   </div>

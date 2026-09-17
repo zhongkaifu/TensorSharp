@@ -50,7 +50,7 @@
       footOpen: "open", footNav: "navigate", footClose: "close",
       onThisPage: "On this page",
       copy: "Copy", copied: "Copied!",
-      menu: "Menu", theme: "Toggle theme", search: "Search", github: "GitHub", book: "Book",
+      menu: "Menu", theme: "Toggle theme", search: "Search", github: "GitHub", book: "Books",
       switchLabel: "中文", switchAria: "切换到中文 (Switch to Chinese)",
       noMatches: function (q) { return "No matches for “" + q + "”."; },
     },
@@ -68,7 +68,6 @@
   };
 
   var REPO = "https://github.com/zhongkaifu/TensorSharp";
-  var BOOK = "https://www.amazon.com/dp/B0HJQ4VQ31";
 
   function el(tag, attrs, html) {
     var e = document.createElement(tag);
@@ -134,7 +133,7 @@
     var trig = el("button", { class: "search-trigger", id: "search-trigger", "aria-label": S.search });
     trig.innerHTML = ICONS.search + '<span class="lbl">' + S.searchTrigger + '</span><kbd>/</kbd>';
     actions.appendChild(trig);
-    var book = el("a", { class: "book-link", href: BOOK, target: "_blank", rel: "noopener", "aria-label": S.book }, "<span aria-hidden=\"true\">📘</span> " + S.book);
+    var book = el("a", { class: "book-link", href: hrefFor("book", currentLang()), "aria-label": S.book }, "<span aria-hidden=\"true\">📘</span> " + S.book);
     actions.appendChild(book);
     var langBtn = el("a", { class: "icon-btn lang-btn", href: otherLangHref(), "aria-label": S.switchAria, title: S.switchAria }, S.switchLabel);
     actions.appendChild(langBtn);

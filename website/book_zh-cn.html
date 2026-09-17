@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>TensorSharp 配套图书</title>
-  <meta name="description" content="了解《Building Inference Engines and Agentic Runtimes from Scratch》：以 Qwen、TensorSharp 和 TensorAgent 为例学习推理引擎与智能体运行时，以及以 Gemma 4 E4B 为例的《From Tensors to Tokens》。">
+  <meta name="description" content="使用 C#、Qwen、TensorSharp 与 TensorAgent 构建 LLM 推理引擎和智能体运行时，并通过《From Tensors to Tokens》探索 Gemma 4 E4B 多模态推理。">
   <meta name="author" content="Zhongkai Fu">
   <link rel="canonical" href="https://tensorsharp.ai/book_zh-cn.html">
   <link rel="alternate" hreflang="en" href="https://tensorsharp.ai/book.html">
@@ -13,18 +13,18 @@
   <meta property="og:type" content="website">
   <meta property="og:site_name" content="TensorSharp">
   <meta property="og:title" content="TensorSharp 配套图书">
-  <meta property="og:description" content="了解《Building Inference Engines and Agentic Runtimes from Scratch》：以 Qwen、TensorSharp 和 TensorAgent 为例学习推理引擎与智能体运行时，以及以 Gemma 4 E4B 为例的《From Tensors to Tokens》。">
+  <meta property="og:description" content="使用 C#、Qwen、TensorSharp 与 TensorAgent 构建 LLM 推理引擎和智能体运行时，并通过《From Tensors to Tokens》探索 Gemma 4 E4B 多模态推理。">
   <meta property="og:url" content="https://tensorsharp.ai/book_zh-cn.html">
-  <meta property="og:image" content="https://tensorsharp.ai/assets/building-inference-engines-cover.jpg">
-  <meta property="og:image:alt" content="Zhongkai Fu 所著《Building Inference Engines and Agentic Runtimes from Scratch: Qwen Dense and MoE Models with TensorSharp and TensorAgent》封面">
-  <meta property="og:image:width" content="376">
-  <meta property="og:image:height" content="500">
+  <meta property="og:image" content="https://tensorsharp.ai/assets/building-llm-inference-engines-cover.jpg">
+  <meta property="og:image:alt" content="Zhongkai Fu 所著《Building LLM Inference Engines and Agentic Runtimes from Scratch: Qwen Dense and MoE Models with TensorSharp and TensorAgent》封面">
+  <meta property="og:image:width" content="1000">
+  <meta property="og:image:height" content="1329">
   <meta property="og:locale" content="zh_CN">
   <meta property="og:locale:alternate" content="en_US">
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="TensorSharp 配套图书">
-  <meta name="twitter:description" content="了解《Building Inference Engines and Agentic Runtimes from Scratch》：以 Qwen、TensorSharp 和 TensorAgent 为例学习推理引擎与智能体运行时，以及以 Gemma 4 E4B 为例的《From Tensors to Tokens》。">
-  <meta name="twitter:image" content="https://tensorsharp.ai/assets/building-inference-engines-cover.jpg">
+  <meta name="twitter:description" content="使用 C#、Qwen、TensorSharp 与 TensorAgent 构建 LLM 推理引擎和智能体运行时，并通过《From Tensors to Tokens》探索 Gemma 4 E4B 多模态推理。">
+  <meta name="twitter:image" content="https://tensorsharp.ai/assets/building-llm-inference-engines-cover.jpg">
   <link rel="icon" href="assets/logo.svg" type="image/svg+xml">
   <link rel="stylesheet" href="assets/style.css">
   <script type="application/ld+json">
@@ -39,13 +39,13 @@
         "position": 1,
         "item": {
           "@type": "Book",
-          "name": "Building Inference Engines and Agentic Runtimes from Scratch: Qwen Dense and MoE Models with TensorSharp and TensorAgent",
+          "name": "Building LLM Inference Engines and Agentic Runtimes from Scratch: Qwen Dense and MoE Models with TensorSharp and TensorAgent",
           "author": {
             "@type": "Person",
             "name": "Zhongkai Fu"
           },
-          "description": "以 Qwen 稠密模型与混合专家（MoE）模型为例，探索如何使用 TensorSharp 和 TensorAgent 从零构建推理引擎与智能体运行时。配合源码阅读，将模型执行与支撑智能体应用的运行时联系起来。",
-          "image": "https://tensorsharp.ai/assets/building-inference-engines-cover.jpg",
+          "description": "从张量、分词和模型加载出发，用 C# 构建 Qwen 稠密与混合专家（MoE）模型推理。探索注意力、专家路由、量化、缓存、GPU 执行、批处理、推测解码、分布式推理和多模态输入，再将 TensorSharp 与 TensorAgent 连接起来，实现结构化工具、技能、代码生成、受控执行、沙箱，以及桌面和移动端部署。",
+          "image": "https://tensorsharp.ai/assets/building-llm-inference-engines-cover.jpg",
           "url": "https://www.amazon.com/dp/B0HJQ4VQ31"
         }
       },
@@ -86,18 +86,18 @@
   <section class="book-hero" id="building-inference-engines" aria-labelledby="new-book-title">
     <div>
       <p class="book-kicker">新书 · TensorSharp 与 TensorAgent</p>
-      <h2 id="new-book-title">Building Inference Engines and Agentic Runtimes from Scratch</h2>
+      <h2 id="new-book-title">Building LLM Inference Engines and Agentic Runtimes from Scratch</h2>
       <p class="lede"><strong>Qwen Dense and MoE Models with TensorSharp and TensorAgent</strong></p>
-      <p>以 Qwen 稠密模型与混合专家（MoE）模型为例，探索如何使用 TensorSharp 和 TensorAgent 从零构建推理引擎与智能体运行时。配合源码阅读，将模型执行与支撑智能体应用的运行时联系起来。</p>
+      <p>从张量、分词和模型加载出发，用 C# 构建 Qwen 稠密与混合专家（MoE）模型推理。探索注意力、专家路由、量化、缓存、GPU 执行、批处理、推测解码、分布式推理和多模态输入，再将 TensorSharp 与 TensorAgent 连接起来，实现结构化工具、技能、代码生成、受控执行、沙箱，以及桌面和移动端部署。</p>
       <div class="book-meta" aria-label="图书信息"><span>作者：<strong>Zhongkai Fu</strong></span></div>
-      <div class="book-points" aria-label="本书主题"><span>Qwen 稠密模型</span><span>混合专家（MoE）</span><span>推理引擎</span><span>智能体运行时</span></div>
+      <div class="book-points" aria-label="本书主题"><span>C# 推理引擎</span><span>Qwen 稠密与 MoE 模型</span><span>受控智能体工作流</span><span>桌面和移动端部署</span></div>
       <div class="btn-row">
         <a class="btn" href="https://www.amazon.com/dp/B0HJQ4VQ31" target="_blank" rel="noopener">前往 Amazon 购买 ↗</a>
       </div>
       <p>配合 <a href="getting-started_zh-cn.html">TensorSharp 快速开始</a>、<a href="models-text_zh-cn.html">文本模型指南</a>和<a href="agentic_zh-cn.html">智能体工作流指南</a>阅读。</p>
     </div>
     <a class="book-cover-link" href="https://www.amazon.com/dp/B0HJQ4VQ31" target="_blank" rel="noopener">
-      <img class="book-cover" src="assets/building-inference-engines-cover.jpg" alt="Zhongkai Fu 所著《Building Inference Engines and Agentic Runtimes from Scratch: Qwen Dense and MoE Models with TensorSharp and TensorAgent》封面" width="376" height="500">
+      <img class="book-cover" src="assets/building-llm-inference-engines-cover.jpg" alt="Zhongkai Fu 所著《Building LLM Inference Engines and Agentic Runtimes from Scratch: Qwen Dense and MoE Models with TensorSharp and TensorAgent》封面" width="1000" height="1329">
     </a>
   </section>
 
