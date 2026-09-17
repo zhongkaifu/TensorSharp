@@ -6,6 +6,11 @@
     <Nullable>disable</Nullable>
     <IsPackable>false</IsPackable>
     <ServerGarbageCollection>false</ServerGarbageCollection>
+    <!-- The zero-allocation gate reads GC.GetAllocatedBytesForCurrentThread, which a background GC corrupts:
+         at the end of its mark phase it voids every thread's allocation context without subtracting the unused
+         remainder, so a probe that allocates nothing can read up to one allocation quantum (~8 KB). Blocking GCs
+         keep the counter exact, and Program refuses to run when concurrent GC is on anyway (DOTNET_gcConcurrent=1). -->
+    <ConcurrentGarbageCollection>false</ConcurrentGarbageCollection>
     <TieredPGO>true</TieredPGO>
     <Description>CPU-only benchmark of the radix prefix tree (DESIGN §13.2, gate BG-15): probe, insert, eviction and admission-step latency plus bytes allocated per probe, over synthetic session, long-prompt, queue, fan-out and churn traces. Loads no model.</Description>
   </PropertyGroup>

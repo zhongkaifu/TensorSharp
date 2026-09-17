@@ -54,10 +54,21 @@ internal static class Program
         foreach (string t in selected)
             if (!AllTraces.Contains(t)) { Console.Error.WriteLine($"unknown trace {t}"); return 2; }
 
-        Console.WriteLine($"RadixTreeBench: {Environment.ProcessorCount} cores, {RuntimeInformation()}, GC {(GCSettings.IsServerGC ? "server" : "workstation")}, scale {scale}");
-        // Warm the JIT on small, unrecorded runs of every trace for ~2 s, then let background tier-1
-        // compilation finish: a tier-up that lands inside a measured probe shows up as a one-off
-        // allocation on the calling thread and as a latency outlier.
+        Console.WriteLine($"RadixTreeBench: {Environment.ProcessorCount} cores, {RuntimeInformation()}, GC {(GCSettings.IsServerGC ? "server" : "workstation")}/{GCSettings.LatencyMode}, scale {scale}");
+        // The allocation gate needs blocking GCs. A background GC ends its mark phase by voiding every thread's
+        // allocation context (gc.cpp repair_allocation_contexts(FALSE)) without taking the unused remainder out of
+        // the thread's allocated-bytes counter, so GC.GetAllocatedBytesForCurrentThread jumps by up to one
+        // allocation quantum (~8 KB) across a window that allocated nothing, whenever that suspension lands in it.
+        // The csproj turns concurrent GC off; an environment override (DOTNET_gcConcurrent=1) would bring back a
+        // gate that fails at random, so refuse to run rather than report it.
+        if (GCSettings.LatencyMode != GCLatencyMode.Batch)
+        {
+            Console.Error.WriteLine($"RadixTreeBench needs concurrent GC off (GC latency mode is {GCSettings.LatencyMode}, expected Batch): a background GC makes the bytes-per-probe counter jump without an allocation. Unset DOTNET_gcConcurrent / System.GC.Concurrent.");
+            return 2;
+        }
+        // Warm up on small, unrecorded runs of every trace for ~2 s: the first probes of a process pay one-time
+        // JIT and type initialisation (latency outliers, and a small allocation on the very first probes), and
+        // tiered compilation promotes the hot methods before measurement.
         var warm = Stopwatch.StartNew();
         while (warm.Elapsed.TotalSeconds < 2)
         {
