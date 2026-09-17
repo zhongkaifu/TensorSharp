@@ -88,6 +88,24 @@ internal sealed class ResumabilityRules
         return Math.Max(0, x);
     }
 
+    /// <summary>
+    /// <c>AlignDown(Clamp(x), g)</c>, repeated until stable. The design's single pass can align a clamped
+    /// length back inside a media span (e.g. span [34, 37), x = 37, g = 2 → 36); aligning and clamping
+    /// until neither moves keeps spans atomic.
+    /// </summary>
+    internal int ClampAligned(int x, in MatchRequest r, int granularity, ref ClampReasons reasons)
+    {
+        int clamped = ClampLength(x, r, ref reasons);
+        while (true)
+        {
+            int aligned = AlignDown(clamped, granularity);
+            if (aligned != clamped) reasons |= ClampReasons.Granularity;
+            int again = ClampLength(aligned, r, ref reasons);
+            if (again == aligned) return aligned;
+            clamped = again;
+        }
+    }
+
     /// <summary>Clamp without recording reasons.</summary>
     internal int ClampLength(int x, in MatchRequest r)
     {

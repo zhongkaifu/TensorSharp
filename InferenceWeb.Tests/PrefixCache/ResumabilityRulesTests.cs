@@ -105,6 +105,27 @@ public class ResumabilityRulesTests
     }
 
     [Fact]
+    public void ClampAligned_NeverLandsInsideASpan()
+    {
+        // Found by the tree trace harness: AlignDown(Clamp(37), 2) = 36 lies inside [34, 37).
+        var pool = new KeyChunkPool();
+        KeyRope key = KeyRope.FromKeys(new long[100], pool);
+        var spans = new[] { Tk.Span(34, 37, "img"), Tk.Span(40, 43, "img2") };
+        var rules = Rules(Tk.Caps(truncation: TruncationKind.ModelDecides, granularity: 2));
+        var r = new MatchRequest(key, 100, 1, 0, 99, spans, ExpectedRoute.Primary, true);
+        Assert.Equal(36, ResumabilityRules.AlignDown(rules.ClampLength(37, r), 2));   // the single pass is wrong
+        ClampReasons reasons = ClampReasons.None;
+        Assert.Equal(34, rules.ClampAligned(37, r, 2, ref reasons));
+        Assert.True((reasons & ClampReasons.Granularity) != 0);
+        Assert.True((reasons & ClampReasons.Media) != 0);
+        reasons = ClampReasons.None;
+        Assert.Equal(38, rules.ClampAligned(39, r, 2, ref reasons));
+        Assert.Equal(40, rules.ClampAligned(42, r, 2, ref reasons));   // inside [40, 43) → its start, already aligned
+        Assert.Equal(32, rules.ClampAligned(39, r, 4, ref reasons));   // 39 → 36, which lies inside [34, 37) → 34 → 32
+        Assert.Equal(32, rules.ClampAligned(36, r, 4, ref reasons));
+    }
+
+    [Fact]
     public void Permitted_AndClamp()
     {
         Assert.True(ResumabilityRules.Permitted(0, 16, 3, 16));

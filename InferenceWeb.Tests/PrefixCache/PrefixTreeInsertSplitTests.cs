@@ -177,6 +177,31 @@ public class PrefixTreeInsertSplitTests
     }
 
     [Fact]
+    public void SplittingAPagesOnlyLeaf_DropsTheEmptyRemainder()
+    {
+        // Harness seed 15 (OracleS2): a public leaf [0, 20) holding pages 0-1 is split at 16 by an
+        // Acquire; every page moves to the new parent and the remainder [16, 20) must not stay behind
+        // as an unlocked payload-less leaf (I5).
+        var host = new FakePageHost(B);
+        PrefixTree t = Tk.Tree(Tk.Caps(pages: PageSupport.A1HostSlab, endState: EndStateSupport.None, truncation: TruncationKind.None), host: host);
+        int s = Tk.Scope(t);
+        KeyRope key = Tk.Key(t, Tk.Seq(1, 40));
+        RadixNode leaf = t.Insert(key, 20, 0, 20, NodeFlags.None, null);
+        t.AttachPages(leaf, Tk.Pages(host, 2, PageStore.A1HostSlab));
+        Tk.Valid(t);
+        MatchPlan plan = Tk.Plan(t, Tk.Req(Tk.Key(t, Tk.Seq(1, 40)), s, p: 20));
+        Assert.Equal(CandidateKind.Pages, plan.Kind);
+        Assert.Equal(16, plan.Length);
+        LockReceipt r = t.Acquire(plan);
+        Assert.False(leaf.InTree);
+        Assert.Equal(16, r.PathDepth);
+        Assert.Equal(1, t.NodeCount);
+        Tk.Valid(t);
+        t.Release(ref r);
+        Tk.Valid(t, new InvariantCheckContext(Quiescent: true));
+    }
+
+    [Fact]
     public void Split_IsO1_WithSharedRopeSlices()
     {
         PrefixTree t = Tk.Tree(Tk.Caps(pages: PageSupport.None));

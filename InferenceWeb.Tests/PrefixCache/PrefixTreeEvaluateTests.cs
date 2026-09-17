@@ -5,6 +5,7 @@
 //
 // TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
 using System;
+using System.Linq;
 using TensorSharp.Runtime.Scheduling.PrefixCache;
 
 namespace InferenceWeb.Tests.PrefixCache;
@@ -221,6 +222,25 @@ public class PrefixTreeEvaluateTests
         Assert.Equal(CandidateKind.TruncatedEndState, plan.Kind);
         Assert.Equal(46, plan.Length);
         Assert.Equal(MaterializeMode.DonateEndState, plan.Mode);
+    }
+
+    [Fact]
+    public void TruncationTarget_AlignedToGranularity_StaysOutsideMediaSpans()
+    {
+        // Harness seed 586 (OracleN): structural 37 right after a span [34, 37); aligning to 2 gave 36.
+        var validator = new FakeValidator();
+        PrefixTree t = Tk.Tree(Tk.Caps(endState: EndStateSupport.CopyAndDonate, truncation: TruncationKind.ModelDecides, granularity: 2,
+                                       pages: PageSupport.None), validator: validator);
+        int s = Tk.Scope(t);
+        var spans = new[] { Tk.Span(34, 37, new string('9', 64)) };
+        int[] cached = Tk.WithPlaceholders(60, spans);
+        Tk.Put(t, Tk.Key(t, cached, spans), 50, s, spans: spans);
+        int[] fork = Tk.Cat(cached.Take(37).ToArray(), Tk.Seq(900, 10));
+        MatchPlan plan = Tk.Plan(t, Tk.Req(Tk.Key(t, fork, spans), s, spans: spans));
+        Assert.Equal(37, plan.Structural);
+        Assert.Equal(CandidateKind.TruncatedEndState, plan.Kind);
+        Assert.Equal(34, plan.Length);
+        Assert.True((plan.Clamps & ClampReasons.Granularity) != 0);
     }
 
     [Fact]

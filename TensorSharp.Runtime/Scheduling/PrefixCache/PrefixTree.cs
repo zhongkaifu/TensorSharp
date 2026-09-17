@@ -445,7 +445,8 @@ internal sealed class PrefixTree
         }
         if (_options.BranchSnapshots && Caps.Truncation == TruncationKind.None && structural - plan.Length >= 256)
         {
-            int bp = ResumabilityRules.AlignDown(Rules.ClampLength(structural, r), _options.BlockSize);
+            ClampReasons ignored = ClampReasons.None;
+            int bp = Rules.ClampAligned(structural, r, _options.BlockSize, ref ignored);
             plan.BranchPosition = bp > plan.Length ? bp : 0;
         }
         if (_options.ComputeBlockedByScope)
@@ -676,9 +677,7 @@ internal sealed class PrefixTree
             TrailEntry end = plan.Trail[plan.TrailEnds[t]];
             int structural = end.EndDepth;
             ClampReasons local = ClampReasons.None;
-            int clamped = Rules.ClampLength(structural, r, ref local);
-            int target = ResumabilityRules.AlignDown(clamped, Caps.TruncationGranularity);
-            if (target != clamped) local |= ClampReasons.Granularity;
+            int target = Rules.ClampAligned(structural, r, Caps.TruncationGranularity, ref local);
             if (target <= bestSoFar || target <= 0) continue;
             clamps |= local;
             considered = true;
@@ -1089,6 +1088,10 @@ internal sealed class PrefixTree
         Counters.NodesCreated++;
         Relink(p);
         Relink(c);
+        // A pages-only leaf whose pages all moved to p is now an unlocked payload-less leaf (I5): it only
+        // repeated key structure below p, so it goes (p itself keeps its pages and stays).
+        if (c.Children.Count == 0 && !c.AnyLock && !c.HasPayload && !c.IsDonationPending)
+            DeleteNode(c, ReleaseReason.Evicted);
         Version++;
         return p;
     }
