@@ -54,13 +54,26 @@ public class Qwen35ImageFollowUpExactnessTests
     /// The documented bound for reuse-vs-cold logits on one backend: the reused turn's
     /// reply rows were written by the decode graph and the cold turn's by the prefill
     /// graph, which are different kernels (flash-attention decode vs batched prefill
-    /// attention, NeoX vs interleaved M-RoPE on equal axes), so the logits are close,
-    /// not bit-identical. docs/models/qwen35.md records the measured values.
+    /// attention, quantized-activation vs float matmuls on CUDA, NeoX vs interleaved
+    /// M-RoPE on equal axes), so the logits are close, not bit-identical.
+    /// docs/models/qwen35.md records the measured values behind these defaults.
     /// </summary>
-    private static float LogitTolerance =>
+    private static float LogitTolerance(BackendType backend) =>
         float.TryParse(Environment.GetEnvironmentVariable("TS_TEST_QWEN35_LOGIT_TOLERANCE"),
             System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float t)
-            ? t : 2.0f;
+            ? t : backend == BackendType.GgmlMetal ? 0.1f : 3.0f;
+
+    /// <summary>
+    /// How far the image conversation's worst logit difference may exceed the text-only
+    /// control's on the same backend. Reuse past an image is exact when the image adds no
+    /// error of its own; the longer image context does amplify the same kernel
+    /// differences somewhat (measured 2.3x on Metal, 2.6x on CUDA), while decoding at the
+    /// pre-fix positions measured 310x on Metal.
+    /// </summary>
+    private static float ControlRatio =>
+        float.TryParse(Environment.GetEnvironmentVariable("TS_TEST_QWEN35_CONTROL_RATIO"),
+            System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float r)
+            ? r : 4.0f;
 
     [ModelFact(EnvModelDir, ModelPattern)]
     public async Task ReuseAfterAnImage_MatchesColdPrefill()
@@ -135,12 +148,16 @@ public class Qwen35ImageFollowUpExactnessTests
         }
         var text = CompareDirect(ctx, "text control", textTurns, textOutputs);
 
-        float bound = Math.Max(LogitTolerance, 0f);
-        _output.WriteLine($"[direct] worst max |dlogit|: image {image.Worst:F5}, text control {text.Worst:F5}; tolerance {bound}");
+        float bound = LogitTolerance(ctx.Backend);
+        float ratio = text.Worst > 0 ? image.Worst / text.Worst : float.PositiveInfinity;
+        _output.WriteLine($"[direct] worst max |dlogit|: image {image.Worst:F5}, text control {text.Worst:F5} " +
+                          $"(ratio {ratio:F2}, allowed {ControlRatio}); tolerance {bound}");
         if (image.Worst > bound)
             failures.Add($"reuse after an image: max |dlogit| {image.Worst} exceeds the {ctx.Backend} tolerance {bound} (text control {text.Worst})");
         if (text.Worst > bound)
             failures.Add($"text control: max |dlogit| {text.Worst} exceeds the {ctx.Backend} tolerance {bound}");
+        if (image.Worst > ControlRatio * text.Worst)
+            failures.Add($"reuse after an image: max |dlogit| {image.Worst} is {ratio:F1}x the text-only control's {text.Worst} (allowed {ControlRatio}x)");
 
         // Greedy tokens: identical, except where the cold run's top-2 margin at the
         // first differing step is inside the logit difference measured there - a tie the
@@ -644,7 +661,7 @@ public class Qwen35ImageFollowUpExactnessTests
                             float d = MaxAbsDiff(reference[s], l);
                             worst = Math.Max(worst, d);
                             Assert.Equal(ArgMax(reference[s]), ArgMax(l));
-                            Assert.True(d <= LogitTolerance, $"restored checkpoint step {s}: max |dlogit| {d}");
+                            Assert.True(d <= LogitTolerance(Backend), $"restored checkpoint step {s}: max |dlogit| {d}");
                         }
                     }
                     finally
