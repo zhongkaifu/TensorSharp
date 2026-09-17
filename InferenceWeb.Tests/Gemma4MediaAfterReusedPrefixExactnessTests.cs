@@ -16,7 +16,7 @@
 // greedily. The prefill logits must agree to floating-point noise and the greedy
 // tokens must be identical.
 //
-// Two prefix lengths: inside Gemma 4's 512-token sliding window, and past it, where
+// Two prefix lengths: inside Gemma 4's sliding window (512 tokens on E4B), and past it, where
 // the local layers' ring has wrapped and the chunk attends a window gathered from
 // the ring. Each runs on the fused whole-model prefill (which must actually serve
 // the media chunk at P) and on the per-op multimodal path (TS_G4_MM_PREFILL=0),
@@ -32,6 +32,8 @@
 //
 //   TS_TEST_MODEL_DIR=~/work/models/gemma-4-E4B TS_TEST_GGML_BACKEND=metal
 //   TS_TEST_MODEL_DIR=~/work/models/gemma-4-E2B TS_TEST_GGML_BACKEND=metal
+//   (also gemma-4-12b, and gemma-4-26b for the all-MoE kernel; each directory holds
+//    one model, since the MTP head GGUF matches the same name)
 //   (the directory also holds the model's mmproj GGUF; TS_TEST_MEDIA_DIR holds
 //    image.png and sample.wav, default ~/work/models/testmedia)
 using System;
@@ -51,7 +53,7 @@ namespace InferenceWeb.Tests;
 public class Gemma4MediaAfterReusedPrefixExactnessTests
 {
     private const string EnvModelDir = "TS_TEST_MODEL_DIR";
-    private const string ModelNames = "gemma-4-e4b|gemma-4-e2b";
+    private const string ModelNames = "gemma-4-e4b|gemma-4-e2b|gemma-4-12b|gemma-4-26b";
     private const int DecodeTokens = 24;
     private readonly ITestOutputHelper _output;
 
@@ -67,7 +69,7 @@ public class Gemma4MediaAfterReusedPrefixExactnessTests
     {
         string dir = Environment.GetEnvironmentVariable(EnvModelDir);
         string modelPath = dir == null ? null : TestGates.FindGguf(dir, ModelNames);
-        if (modelPath == null) { _output.WriteLine("no Gemma 4 E-series model; skipping"); return; }
+        if (modelPath == null) { _output.WriteLine("no Gemma 4 model; skipping"); return; }
         string mmproj = Directory.GetFiles(Path.GetDirectoryName(modelPath)!, "*.gguf")
             .Where(p => Path.GetFileName(p).Contains("mmproj", StringComparison.OrdinalIgnoreCase))
             .OrderBy(p => new FileInfo(p).Length)
@@ -124,7 +126,7 @@ public class Gemma4MediaAfterReusedPrefixExactnessTests
         int reused = 0;
         while (reused < previous.Count && reused < prompt.Length && previous[reused] == prompt[reused]) reused++;
         reused = Math.Min(reused, mediaStart);
-        const int window = 512;
+        int window = model.MaxReusablePrefixTokens;   // the sliding window
         _output.WriteLine($"model={Path.GetFileName(modelPath)} backend={backend} media={media} fused={fused} " +
                           $"prompt={prompt.Length} reused={reused} span=[{spans[0].Start},{spans[0].End})");
         Assert.True(longPrefix ? reused > window : reused + (prompt.Length - reused) <= window,
