@@ -192,6 +192,10 @@ public class RadixKeyTests
         Assert.True(key.Disposed);
         Assert.NotSame(key, shortNode.Edge.Rope);
         Assert.Equal(10, shortNode.Edge.Rope.Length);
+        // Right-sized: 10 surviving elements do not pin a whole 64 KB chunk, and the sealed rope cannot grow.
+        Assert.Equal(1, shortNode.Edge.Rope.ChunkCount);
+        Assert.Equal(10, shortNode.Edge.Rope.Chunks[0].Data.Length);
+        Assert.Throws<InvalidOperationException>(() => shortNode.Edge.Rope.Append(7, t.KeyPool));
         Assert.Equal(Enumerable.Range(1, 10).Select(i => (long)i), Enumerable.Range(0, 10).Select(i => shortNode.Edge[i]));
         Tk.Valid(t);
         // The compacted rope still matches.
@@ -203,6 +207,17 @@ public class RadixKeyTests
         t.DeleteLeafCascade(shortNode, ReleaseReason.Evicted);
         Assert.True(fresh.Disposed);
         Tk.Valid(t);
+        // A sealed rope spanning chunks: whole chunks come from the pool, only the tail is right-sized,
+        // and a right-sized chunk is never pooled.
+        var pool = new KeyChunkPool();
+        KeyRope sealedRope = KeyRope.Sealed(KeyChunk.Size + 3, pool);
+        sealedRope.Append(Enumerable.Range(0, KeyChunk.Size + 3).Select(i => (long)i).ToArray(), pool);
+        Assert.Equal(2, sealedRope.ChunkCount);
+        Assert.Equal(KeyChunk.Size, sealedRope.Chunks[0].Data.Length);
+        Assert.Equal(3, sealedRope.Chunks[1].Data.Length);
+        Assert.Equal(KeyChunk.Size + 2, sealedRope[KeyChunk.Size + 2]);
+        sealedRope.ReturnChunks(pool);
+        Assert.Equal(1, pool.FreeCount);
     }
 
     [Fact]

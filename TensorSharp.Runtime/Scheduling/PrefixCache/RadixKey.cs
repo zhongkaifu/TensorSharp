@@ -101,12 +101,26 @@ public readonly record struct MediaSpanRecord(int Start, int End, MediaId256 Id)
         => new(start, end, MediaId256.FromContentId(contentId));
 }
 
-/// <summary>8,192 × 8 B = 65,536 B, below the 85 KB large-object-heap threshold (DEC-29).</summary>
+/// <summary>
+/// 8,192 × 8 B = 65,536 B, below the 85 KB large-object-heap threshold (DEC-29). The last chunk of a
+/// sealed (compacted) rope is sized to its content instead, so a short surviving slice does not pin
+/// a whole 64 KB chunk; such a chunk is never pooled.
+/// </summary>
 internal sealed class KeyChunk
 {
     internal const int Size = 8192, Shift = 13, Mask = Size - 1;
-    internal readonly long[] Data = new long[Size];
+    internal readonly long[] Data;
     internal int RefCount;                                      // ropes referencing this chunk; worker-thread only
+
+    internal KeyChunk() : this(Size) { }
+
+    internal KeyChunk(int capacity)
+    {
+        if (capacity <= 0 || capacity > Size) throw new ArgumentOutOfRangeException(nameof(capacity));
+        Data = new long[capacity];
+    }
+
+    internal bool IsFull => Data.Length == Size;
 }
 
 /// <summary>Per-engine bounded free list of key chunks (256 chunks).</summary>
@@ -141,7 +155,7 @@ internal sealed class KeyChunkPool
 
     internal void Return(KeyChunk c)
     {
-        if (c == null) return;
+        if (c == null || !c.IsFull) return;                    // a right-sized tail chunk goes to the GC
         if (_freeCount < _free.Length)
             _free[_freeCount++] = c;
     }
@@ -191,7 +205,8 @@ internal sealed class KeyRope
             if (ci >= ChunkCount)
                 AddChunk(pool);
             int off = Length & KeyChunk.Mask;
-            int n = Math.Min(KeyChunk.Size - off, keys.Length - written);
+            int n = Math.Min(Chunks[ci].Data.Length - off, keys.Length - written);
+            if (n <= 0) throw new InvalidOperationException("The rope is sealed: its last chunk is full.");
             keys.Slice(written, n).CopyTo(new Span<long>(Chunks[ci].Data, off, n));
             written += n;
             Length += n;
@@ -205,6 +220,8 @@ internal sealed class KeyRope
         int ci = Length >> KeyChunk.Shift;
         if (ci >= ChunkCount)
             AddChunk(pool);
+        if ((Length & KeyChunk.Mask) >= Chunks[ci].Data.Length)
+            throw new InvalidOperationException("The rope is sealed: its last chunk is full.");
         Chunks[ci].Data[Length & KeyChunk.Mask] = key;
         Length++;
     }
@@ -232,6 +249,26 @@ internal sealed class KeyRope
         ChunkCount = 0;
         Length = 0;
         Disposed = true;
+    }
+
+    /// <summary>
+    /// An empty rope with capacity for exactly <paramref name="length"/> elements: pooled chunks for the
+    /// whole chunks, and a right-sized last chunk. Used by compaction, whose ropes are never extended.
+    /// </summary>
+    internal static KeyRope Sealed(int length, KeyChunkPool pool)
+    {
+        var rope = new KeyRope();
+        int full = length >> KeyChunk.Shift, rem = length & KeyChunk.Mask;
+        rope.Chunks = new KeyChunk[full + (rem > 0 ? 1 : 0)];
+        for (int i = 0; i < full; i++)
+        {
+            KeyChunk c = pool.Rent();
+            c.RefCount++;
+            rope.Chunks[rope.ChunkCount++] = c;
+        }
+        if (rem > 0)
+            rope.Chunks[rope.ChunkCount++] = new KeyChunk(rem) { RefCount = 1 };
+        return rope;
     }
 
     internal static KeyRope FromKeys(ReadOnlySpan<long> keys, KeyChunkPool pool)

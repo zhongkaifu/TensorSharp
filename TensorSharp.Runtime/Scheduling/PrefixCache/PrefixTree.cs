@@ -1914,8 +1914,9 @@ internal sealed class PrefixTree
     /// <summary>Copies the surviving slices of a sparsely used rope into fresh chunks (DEC-29).</summary>
     private void CompactRope(KeyRope rope)
     {
-        var fresh = new KeyRope { OwnerReleased = true };
-        Span<long> buffer = stackalloc long[1024];
+        // Right-sized: a short surviving slice must not pin a whole 64 KB chunk per compacted rope.
+        KeyRope fresh = KeyRope.Sealed(rope.LiveSliceTokens, KeyPool);
+        fresh.OwnerReleased = true;
         RadixNode? n = rope.FirstSliceNode;
         while (n is not null)
         {
