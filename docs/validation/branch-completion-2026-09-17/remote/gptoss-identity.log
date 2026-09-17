@@ -1,0 +1,7 @@
+Positive percentages mean higher throughput or longer TTFT. Repeated runs use medians.
+scenario / request | prefill tok/s | decode tok/s | TTFT ms
+conc / 1 concurrent | n/a | 143.33 -> 145.80 (+1.73%) | 332.79 -> 456.09 (+37.05%)
+conc / 4 concurrent | n/a | 344.80 -> 349.12 (+1.25%) | 606.89 -> 667.49 (+9.99%)
+conc / 8 concurrent | n/a | 566.97 -> 577.11 (+1.79%) | 1617.71 -> 1368.93 (-15.38%)
+conc / solo after concurrency | 262.49 -> 362.46 (+38.09%) | 144.02 -> 148.75 (+3.28%) | 80.00 -> 57.94 (-27.58%)
+PASS: identical tokens and workload shapes in 4 rows; no regression above 100%.

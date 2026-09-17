@@ -1,0 +1,228 @@
+Test run for /workspace/ts-codex-branch-completion-20260917/repo/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll (.NETCoreApp,Version=v10.0)
+A total of 1 test files matched the specified pattern.
+/workspace/ts-codex-branch-completion-20260917/repo/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll
+[xUnit.net 00:00:00.00] xUnit.net VSTest Adapter v3.1.4+50e68bbb8b (64-bit .NET 10.0.12)
+[xUnit.net 00:00:00.46]   Discovering: InferenceWeb.Tests
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 45498 MiB):
+  Device 0: NVIDIA A40, compute capability 8.6, VMM: yes, VRAM: 45498 MiB
+[xUnit.net 00:00:03.12]   Discovered:  InferenceWeb.Tests
+[xUnit.net 00:00:03.23]   Starting:    InferenceWeb.Tests
+Backend: GgmlCuda
+Model: gemma4, Layers=48, Hidden=3840, Heads=16, KVHeads=8, GlobalKVHeads=1, Vocab=0
+Head dims: local=256, global=512
+RoPE global=1000000 local=10000
+Partial rotary dims=512
+Sliding window=1024, Softcap=30
+PLE dim=0, SharedKVLayers=0
+Layer types: 8 global (causal), 40 local (SWA)
+  Prefaulted GGUF page cache: 6.3 GiB with 16 read streams in 4.4s (1.44 GiB/s)
+Loading model weights... done (338 F32 tensors, 329 quantized tensors)
+  Quantized: 6387 MB (6387 MB file-backed), F32: 2 MB
+  Output tied to token_embd.weight
+  Fused QKV projections: 48
+  Fused projections: 48 Gate+Up
+  Device-resident quantized weights: 6395 MB across 193 tensors
+Context length: using MAX_CONTEXT=8192; model declares gemma4.context_length=262144.
+  KV cache: 448 MB (dtype: f16, global layers: 8192 seq, SWA layers: 1024 seq)
+  Gemma4 fused model decode enabled
+Vision encoder: type=gemma4uv, hidden=3840, intermediate=0, heads=1, blocks=0, projDim=3840, patch=16, nMerge=3, unifiedPatch=48
+Loading vision encoder weights... done (10 tensors, 0 clampable linears)
+Audio encoder: hidden=640, heads=1, headDim=640, ffn=0, layers=0, melBins=128, eps=1E-06
+  chunk=12, maxPast=12, maxFuture=0, context=24
+  projDim=3840
+Loading audio encoder weights... done (1 tensors, 0 clampable linears)
+  GGUF naming: mmproj/Unsloth
+  projector_type: gemma4ua (encoder-free / raw-waveform)
+[ChatTemplate] Jinja2 rendering succeeded for 'gemma4', prompt length=3864
+[ChatTemplate] Jinja2 rendering succeeded for 'gemma4', prompt length=3757
+Injected 260 vision tokens at chunk-offset 1421 (absolute position 1421)
+Injected 260 vision tokens at chunk-offset 5 (absolute position 1421)
+Injected 260 vision tokens at chunk-offset 1421 (absolute position 1421)
+[ChatTemplate] Jinja2 rendering succeeded for 'gemma4', prompt length=3856
+  Passed InferenceWeb.Tests.Gemma4MediaAfterReusedPrefixExactnessTests.MediaTurnAfterAReusedPrefix_MatchesAColdPrefill(media: "image", longPrefix: True, fused: True) [49 s]
+  Standard Output Messages:
+ model=gemma-4-12B-it-qat-UD-Q4_K_XL.gguf backend=GgmlCuda media=image fused=True prompt=1698 reused=1416 span=[1420,1682)
+ fused media chunk: cold=True reuse=True
+ prefill logits max|diff| 9.85E-001 (logit scale 26.6); text control (1436 tokens, split at 1416) 7.83E-001; cold on the other path 7.52E-001
+ cold:  This image features an anime-style girl with long dark hair wearing a blue traditional dress and black stockings, sitting in a
+ reuse: This image features an anime-style illustration of a woman in a blue dress sitting amidst a digital, technological background. The
+ first different token at 7: the cold top-2 logit margin there was 0.1453 (smallest margin up to it 0.0299)
+ text control streams identical
+ greedy tokens compared: 0 of 24
+
+
+Backend: GgmlCuda
+Model: gemma4, Layers=48, Hidden=3840, Heads=16, KVHeads=8, GlobalKVHeads=1, Vocab=0
+Head dims: local=256, global=512
+RoPE global=1000000 local=10000
+Partial rotary dims=512
+Sliding window=1024, Softcap=30
+PLE dim=0, SharedKVLayers=0
+Layer types: 8 global (causal), 40 local (SWA)
+Loading model weights... done (338 F32 tensors, 329 quantized tensors)
+  Quantized: 6387 MB (6387 MB file-backed), F32: 2 MB
+  Output tied to token_embd.weight
+  Fused QKV projections: 48
+  Fused projections: 48 Gate+Up
+  Device-resident quantized weights: 6395 MB across 193 tensors
+Context length: using MAX_CONTEXT=8192; model declares gemma4.context_length=262144.
+  KV cache: 448 MB (dtype: f16, global layers: 8192 seq, SWA layers: 1024 seq)
+  Gemma4 fused model decode enabled
+Vision encoder: type=gemma4uv, hidden=3840, intermediate=0, heads=1, blocks=0, projDim=3840, patch=16, nMerge=3, unifiedPatch=48
+Loading vision encoder weights... done (10 tensors, 0 clampable linears)
+Audio encoder: hidden=640, heads=1, headDim=640, ffn=0, layers=0, melBins=128, eps=1E-06
+  chunk=12, maxPast=12, maxFuture=0, context=24
+  projDim=3840
+Loading audio encoder weights... done (1 tensors, 0 clampable linears)
+  GGUF naming: mmproj/Unsloth
+  projector_type: gemma4ua (encoder-free / raw-waveform)
+[ChatTemplate] Jinja2 rendering succeeded for 'gemma4', prompt length=350
+[ChatTemplate] Jinja2 rendering succeeded for 'gemma4', prompt length=243
+Injected 260 vision tokens at chunk-offset 66 (absolute position 66)
+Injected 260 vision tokens at chunk-offset 5 (absolute position 66)
+Injected 260 vision tokens at chunk-offset 66 (absolute position 66)
+[ChatTemplate] Jinja2 rendering succeeded for 'gemma4', prompt length=342
+  Passed InferenceWeb.Tests.Gemma4MediaAfterReusedPrefixExactnessTests.MediaTurnAfterAReusedPrefix_MatchesAColdPrefill(media: "image", longPrefix: False, fused: False) [15 s]
+  Standard Output Messages:
+ model=gemma-4-12B-it-qat-UD-Q4_K_XL.gguf backend=GgmlCuda media=image fused=False prompt=343 reused=61 span=[65,327)
+ fused media chunk: cold=False reuse=False
+ prefill logits max|diff| 6.01E-001 (logit scale 26.7); text control (81 tokens, split at 61) 2.70E+000; cold on the other path 8.24E-001
+ cold:  The image features an anime-style illustration of a woman in a blue traditional dress sitting amidst a digital, futuristic background.
+ reuse: The image features an anime-style illustration of a woman in a blue traditional dress sitting amidst a digital, futuristic background.
+ text control streams identical
+
+
+Backend: GgmlCuda
+Model: gemma4, Layers=48, Hidden=3840, Heads=16, KVHeads=8, GlobalKVHeads=1, Vocab=0
+Head dims: local=256, global=512
+RoPE global=1000000 local=10000
+Partial rotary dims=512
+Sliding window=1024, Softcap=30
+PLE dim=0, SharedKVLayers=0
+Layer types: 8 global (causal), 40 local (SWA)
+Loading model weights... done (338 F32 tensors, 329 quantized tensors)
+  Quantized: 6387 MB (6387 MB file-backed), F32: 2 MB
+  Output tied to token_embd.weight
+  Fused QKV projections: 48
+  Fused projections: 48 Gate+Up
+  Device-resident quantized weights: 6395 MB across 193 tensors
+Context length: using MAX_CONTEXT=8192; model declares gemma4.context_length=262144.
+  KV cache: 448 MB (dtype: f16, global layers: 8192 seq, SWA layers: 1024 seq)
+  Gemma4 fused model decode enabled
+Vision encoder: type=gemma4uv, hidden=3840, intermediate=0, heads=1, blocks=0, projDim=3840, patch=16, nMerge=3, unifiedPatch=48
+Loading vision encoder weights... done (10 tensors, 0 clampable linears)
+Audio encoder: hidden=640, heads=1, headDim=640, ffn=0, layers=0, melBins=128, eps=1E-06
+  chunk=12, maxPast=12, maxFuture=0, context=24
+  projDim=3840
+Loading audio encoder weights... done (1 tensors, 0 clampable linears)
+  GGUF naming: mmproj/Unsloth
+  projector_type: gemma4ua (encoder-free / raw-waveform)
+[ChatTemplate] Jinja2 rendering succeeded for 'gemma4', prompt length=3864
+[ChatTemplate] Jinja2 rendering succeeded for 'gemma4', prompt length=3757
+Injected 260 vision tokens at chunk-offset 1421 (absolute position 1421)
+Injected 260 vision tokens at chunk-offset 5 (absolute position 1421)
+Injected 260 vision tokens at chunk-offset 1421 (absolute position 1421)
+[ChatTemplate] Jinja2 rendering succeeded for 'gemma4', prompt length=3856
+  Passed InferenceWeb.Tests.Gemma4MediaAfterReusedPrefixExactnessTests.MediaTurnAfterAReusedPrefix_MatchesAColdPrefill(media: "image", longPrefix: True, fused: False) [47 s]
+  Standard Output Messages:
+ model=gemma-4-12B-it-qat-UD-Q4_K_XL.gguf backend=GgmlCuda media=image fused=False prompt=1698 reused=1416 span=[1420,1682)
+ fused media chunk: cold=False reuse=False
+ prefill logits max|diff| 5.06E-001 (logit scale 26.6); text control (1436 tokens, split at 1416) 7.83E-001; cold on the other path 7.52E-001
+ cold:  This image features an anime-style illustration of a woman in a blue dress sitting amidst floating, glowing geometric cubes. The
+ reuse: This image features an anime-style illustration of a woman in a blue dress sitting amidst a digital, technological background. The
+ first different token at 17: the cold top-2 logit margin there was 0.1699 (smallest margin up to it 0.0929)
+ text control streams identical
+
+
+Backend: GgmlCuda
+Model: gemma4, Layers=48, Hidden=3840, Heads=16, KVHeads=8, GlobalKVHeads=1, Vocab=0
+Head dims: local=256, global=512
+RoPE global=1000000 local=10000
+Partial rotary dims=512
+Sliding window=1024, Softcap=30
+PLE dim=0, SharedKVLayers=0
+Layer types: 8 global (causal), 40 local (SWA)
+Loading model weights... done (338 F32 tensors, 329 quantized tensors)
+  Quantized: 6387 MB (6387 MB file-backed), F32: 2 MB
+  Output tied to token_embd.weight
+  Fused QKV projections: 48
+  Fused projections: 48 Gate+Up
+  Device-resident quantized weights: 6395 MB across 193 tensors
+Context length: using MAX_CONTEXT=8192; model declares gemma4.context_length=262144.
+  KV cache: 448 MB (dtype: f16, global layers: 8192 seq, SWA layers: 1024 seq)
+  Gemma4 fused model decode enabled
+Vision encoder: type=gemma4uv, hidden=3840, intermediate=0, heads=1, blocks=0, projDim=3840, patch=16, nMerge=3, unifiedPatch=48
+Loading vision encoder weights... done (10 tensors, 0 clampable linears)
+Audio encoder: hidden=640, heads=1, headDim=640, ffn=0, layers=0, melBins=128, eps=1E-06
+  chunk=12, maxPast=12, maxFuture=0, context=24
+  projDim=3840
+Loading audio encoder weights... done (1 tensors, 0 clampable linears)
+  GGUF naming: mmproj/Unsloth
+  projector_type: gemma4ua (encoder-free / raw-waveform)
+[ChatTemplate] Jinja2 rendering succeeded for 'gemma4', prompt length=350
+[ChatTemplate] Jinja2 rendering succeeded for 'gemma4', prompt length=243
+Injected 260 vision tokens at chunk-offset 66 (absolute position 66)
+Injected 260 vision tokens at chunk-offset 5 (absolute position 66)
+Injected 260 vision tokens at chunk-offset 66 (absolute position 66)
+[ChatTemplate] Jinja2 rendering succeeded for 'gemma4', prompt length=342
+  Passed InferenceWeb.Tests.Gemma4MediaAfterReusedPrefixExactnessTests.MediaTurnAfterAReusedPrefix_MatchesAColdPrefill(media: "image", longPrefix: False, fused: True) [15 s]
+  Standard Output Messages:
+ model=gemma-4-12B-it-qat-UD-Q4_K_XL.gguf backend=GgmlCuda media=image fused=True prompt=343 reused=61 span=[65,327)
+ fused media chunk: cold=True reuse=True
+ prefill logits max|diff| 1.07E+000 (logit scale 26.7); text control (81 tokens, split at 61) 2.70E+000; cold on the other path 8.24E-001
+ cold:  The image features an anime-style illustration of a woman in a blue traditional dress sitting amidst a digital, futuristic background.
+ reuse: The image features an anime-style illustration of a woman in a blue traditional dress sitting amidst a digital, futuristic background.
+ text control streams identical
+ greedy tokens compared: 0 of 24
+
+
+Backend: GgmlCuda
+Model: gemma4, Layers=48, Hidden=3840, Heads=16, KVHeads=8, GlobalKVHeads=1, Vocab=0
+Head dims: local=256, global=512
+RoPE global=1000000 local=10000
+Partial rotary dims=512
+Sliding window=1024, Softcap=30
+PLE dim=0, SharedKVLayers=0
+Layer types: 8 global (causal), 40 local (SWA)
+Loading model weights... done (338 F32 tensors, 329 quantized tensors)
+  Quantized: 6387 MB (6387 MB file-backed), F32: 2 MB
+  Output tied to token_embd.weight
+  Fused QKV projections: 48
+  Fused projections: 48 Gate+Up
+  Device-resident quantized weights: 6395 MB across 193 tensors
+Context length: using MAX_CONTEXT=8192; model declares gemma4.context_length=262144.
+  KV cache: 448 MB (dtype: f16, global layers: 8192 seq, SWA layers: 1024 seq)
+  Gemma4 fused model decode enabled
+Vision encoder: type=gemma4uv, hidden=3840, intermediate=0, heads=1, blocks=0, projDim=3840, patch=16, nMerge=3, unifiedPatch=48
+Loading vision encoder weights... done (10 tensors, 0 clampable linears)
+Audio encoder: hidden=640, heads=1, headDim=640, ffn=0, layers=0, melBins=128, eps=1E-06
+  chunk=12, maxPast=12, maxFuture=0, context=24
+  projDim=3840
+Loading audio encoder weights... done (1 tensors, 0 clampable linears)
+  GGUF naming: mmproj/Unsloth
+  projector_type: gemma4ua (encoder-free / raw-waveform)
+[ChatTemplate] Jinja2 rendering succeeded for 'gemma4', prompt length=3883
+[ChatTemplate] Jinja2 rendering succeeded for 'gemma4', prompt length=3757
+Audio encoder (gemma4ua): frames=93 x 640 -> [93,3840]... done
+Injected 93 vision tokens at chunk-offset 1421 (absolute position 1421)
+Injected 93 vision tokens at chunk-offset 5 (absolute position 1421)
+Injected 93 vision tokens at chunk-offset 1421 (absolute position 1421)
+[ChatTemplate] Jinja2 rendering succeeded for 'gemma4', prompt length=3875
+[xUnit.net 00:02:47.15]   Finished:    InferenceWeb.Tests
+  Passed InferenceWeb.Tests.Gemma4MediaAfterReusedPrefixExactnessTests.MediaTurnAfterAReusedPrefix_MatchesAColdPrefill(media: "audio", longPrefix: True, fused: True) [35 s]
+  Standard Output Messages:
+ model=gemma-4-12B-it-qat-UD-Q4_K_XL.gguf backend=GgmlCuda media=audio fused=True prompt=1536 reused=1416 span=[1420,1515)
+ fused media chunk: cold=True reuse=True
+ prefill logits max|diff| 1.06E+000 (logit scale 28.9); text control (1441 tokens, split at 1416) 6.27E-001; cold on the other path 1.39E+000
+ cold:  The recording describes a quick brown fox jumping over a lazy dog. It also mentions that this action takes place near the river
+ reuse: The recording describes a quick brown fox jumping over a lazy dog. It also mentions that this action takes place near the river
+ text control streams identical
+ greedy tokens compared: 12 of 24
+
+
+Results File: /workspace/ts-codex-branch-completion-20260917/results/gemma4.trx
+
+Test Run Successful.
+Total tests: 5
+     Passed: 5
+ Total time: 2.8092 Minutes

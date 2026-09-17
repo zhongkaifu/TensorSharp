@@ -1,0 +1,268 @@
+{
+  "schemaVersion": 1,
+  "date": "2026-09-17",
+  "status": "passed",
+  "purpose": "Explicit correctness assertions over completed Qwen operator and real-model evidence; timings are not performance gates.",
+  "provenance": {
+    "remoteResultsDirectory": "/workspace/ts-codex-branch-completion-20260917/results",
+    "nativeLibrarySha256": "0e75fe2580062b8335e0197f8a71021248aa8c665529a9e62f89aa205c92625b",
+    "nativeIdentityCheck": "Build and ChunkParityProbe copies matched before and after both model runs, before final-union rebuild.",
+    "ggmlRevision": "456172ec733a135778adcd32d00e576a58232e45",
+    "ggmlWorktreeStatus": "clean; unmodified upstream",
+    "cudaToolkit": "12.8",
+    "gpu": "NVIDIA A40, compute capability 8.6",
+    "artifacts": [
+      {
+        "file": "qwen4-row-probe.log",
+        "sha256": "0f5793d5c8133419ef4636e18488ae1d9fad0f2384055ee281fb42253ec25d00"
+      },
+      {
+        "file": "qwen38-current.json",
+        "sha256": "cd2b2c07ad7e5bdf727dedc837765d69b39d915a0d2419d0f06f3d058a8b9647"
+      },
+      {
+        "file": "qwen38-channels.json",
+        "sha256": "7e4f7bb08b0fefd64c8f6b9dae9ab1e9552f27ef9f451c3858890a78b0e8e819"
+      }
+    ]
+  },
+  "operatorProbe": {
+    "source": "qwen4-row-probe.log",
+    "backend": "CUDA0; one A40 computes, two visible",
+    "timingRepeats": 10,
+    "experts": 32,
+    "kvTokens": 4096,
+    "widths": [
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8
+    ],
+    "expectedCasesPerWidth": 13,
+    "parsedCases": 91,
+    "assertions": {
+      "completeWidthAndPathMatrix": true,
+      "all56ChannelsComparisonsExact": true,
+      "all28RowsComparisonsExact": true,
+      "all7GdnOutputsExact": true,
+      "all7GdnFinalStatesExact": true,
+      "optimizedFailures": 0,
+      "optimizedMaxAbsDifference": 0
+    },
+    "operators": [
+      {
+        "name": "MUL_MAT q5_K 2560->10240",
+        "comparison": "channels"
+      },
+      {
+        "name": "MUL_MAT q6_K 2560->512",
+        "comparison": "channels"
+      },
+      {
+        "name": "MUL_MAT q8_0 10240->320",
+        "comparison": "channels"
+      },
+      {
+        "name": "MUL_MAT q4_K 2560->32768",
+        "comparison": "channels"
+      },
+      {
+        "name": "MUL_MAT f32 2560->512",
+        "comparison": "channels"
+      },
+      {
+        "name": "MUL_MAT f32 10240->4",
+        "comparison": "channels"
+      },
+      {
+        "name": "MUL_MAT bf16 2560->512",
+        "comparison": "channels"
+      },
+      {
+        "name": "MUL_MAT f16 2560->640",
+        "comparison": "channels"
+      },
+      {
+        "name": "MUL_MAT_ID iq2_xs 2560->640 E32 k10",
+        "comparison": "rows"
+      },
+      {
+        "name": "MUL_MAT_ID iq4_nl 640->2560 E32 k10 slots",
+        "comparison": "rows"
+      },
+      {
+        "name": "MUL_MAT_ID f16 2560->640 E32 k10",
+        "comparison": "rows"
+      },
+      {
+        "name": "FLASH_ATTN hd256 h24/2 kv4096",
+        "comparison": "rows"
+      },
+      {
+        "name": "GDN S128 H48",
+        "comparison": "state"
+      }
+    ],
+    "batchedControl": {
+      "interpretation": "Deliberately batched kernels are compared with one-token graphs. DIFFER is an expected control observation, not a failure of channels/rows; GDN batched outputs are exact.",
+      "differentCases": 61,
+      "exactCases": 30,
+      "differentCasesByWidth": [
+        {
+          "width": 2,
+          "cases": 5
+        },
+        {
+          "width": 3,
+          "cases": 5
+        },
+        {
+          "width": 4,
+          "cases": 7
+        },
+        {
+          "width": 5,
+          "cases": 11
+        },
+        {
+          "width": 6,
+          "cases": 11
+        },
+        {
+          "width": 7,
+          "cases": 11
+        },
+        {
+          "width": 8,
+          "cases": 11
+        }
+      ]
+    }
+  },
+  "realModel": {
+    "model": "Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf",
+    "modelPath": "/workspace/models/qwen38/UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf",
+    "benchmark": "ChunkParityProbe",
+    "promptPath": "/workspace/ts-q4x/results/q38/prompt.txt",
+    "promptSha256": "abf52cd0b111488d586034618227a403b918f25f39c9da78c7086980442578c0",
+    "promptTokens": 3248,
+    "contextLimit": 16384,
+    "prefillChunkTokens": 4096,
+    "generatedTokens": 96,
+    "widths": [
+      2,
+      3,
+      4,
+      5,
+      6,
+      7,
+      8
+    ],
+    "rowsPerWidth": 96,
+    "repetitionsPerMode": 1,
+    "physicalGpus": [
+      2,
+      3,
+      5
+    ],
+    "tensorParallelDegree": 3,
+    "layerDistribution": [
+      15,
+      16,
+      17
+    ],
+    "modes": [
+      {
+        "name": "default",
+        "source": "qwen38-current.json",
+        "log": "qwen38-current.log",
+        "exitCode": 0,
+        "forceMmvqChannels": false
+      },
+      {
+        "name": "forced channels",
+        "source": "qwen38-channels.json",
+        "log": "qwen38-channels.log",
+        "exitCode": 0,
+        "forceMmvqChannels": true,
+        "environment": "TS_Q4E_TEST_MMVQ_CHANNELS=1"
+      }
+    ],
+    "assertions": {
+      "eachModeContainsAllSevenOptimizedAndSevenControlWidths": true,
+      "optimizedRowsComparedPerMode": 672,
+      "optimizedRowsComparedBothModes": 1344,
+      "optimizedChangedRows": 0,
+      "optimizedGreedyFlips": 0,
+      "optimizedMaxAbsLogitDifference": 0,
+      "referenceTextIdenticalAcrossModes": true,
+      "allCorrectnessMetricsIdenticalAcrossModes": true,
+      "crossesFlashAttentionKvPaddingBoundary": true
+    },
+    "oldBatchedControl": {
+      "interpretation": "The benchmark explicitly restores old batched kernels. These nonzero differences establish control sensitivity and are expected; they are not optimized-path failures.",
+      "sameInBothModes": true,
+      "byWidth": [
+        {
+          "width": 2,
+          "rows": 96,
+          "changedRows": 96,
+          "greedyFlips": 8,
+          "maxAbsLogitDiff": 2.48230242729187
+        },
+        {
+          "width": 3,
+          "rows": 96,
+          "changedRows": 96,
+          "greedyFlips": 8,
+          "maxAbsLogitDiff": 4.543323516845703
+        },
+        {
+          "width": 4,
+          "rows": 96,
+          "changedRows": 96,
+          "greedyFlips": 9,
+          "maxAbsLogitDiff": 4.015749454498291
+        },
+        {
+          "width": 5,
+          "rows": 96,
+          "changedRows": 96,
+          "greedyFlips": 5,
+          "maxAbsLogitDiff": 2.1820292472839355
+        },
+        {
+          "width": 6,
+          "rows": 96,
+          "changedRows": 96,
+          "greedyFlips": 5,
+          "maxAbsLogitDiff": 2.1820292472839355
+        },
+        {
+          "width": 7,
+          "rows": 96,
+          "changedRows": 96,
+          "greedyFlips": 6,
+          "maxAbsLogitDiff": 2.1820292472839355
+        },
+        {
+          "width": 8,
+          "rows": 96,
+          "changedRows": 96,
+          "greedyFlips": 10,
+          "maxAbsLogitDiff": 4.2533135414123535
+        }
+      ]
+    }
+  },
+  "limitations": [
+    "One real checkpoint, one raw prompt, 96 generated tokens and one repetition per mode; this is verify/decode parity evidence, not broad model or chat-quality qualification.",
+    "Forced broadcast fallback was exercised on A40; non-A40 hardware, including Turing and GB10, was not tested.",
+    "Operator inputs are synthetic at representative model shapes; this is distinct from the real-weight model comparisons.",
+    "Concurrent work on the VM makes timings uncontrolled; no throughput, latency or regression claim is made.",
+    "These artifacts identify the tested pre-final-union native snapshot. Later rebuilds require their own identity and validation records."
+  ]
+}

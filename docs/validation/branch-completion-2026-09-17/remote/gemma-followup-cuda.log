@@ -1,0 +1,72 @@
+Test run for /workspace/ts-codex-branch-completion-20260917/repo/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll (.NETCoreApp,Version=v10.0)
+A total of 1 test files matched the specified pattern.
+/workspace/ts-codex-branch-completion-20260917/repo/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll
+[xUnit.net 00:00:00.01] xUnit.net VSTest Adapter v3.1.4+50e68bbb8b (64-bit .NET 10.0.12)
+[xUnit.net 00:00:00.68]   Discovering: InferenceWeb.Tests
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 45498 MiB):
+  Device 0: NVIDIA A40, compute capability 8.6, VMM: yes, VRAM: 45498 MiB
+[xUnit.net 00:00:02.71]   Discovered:  InferenceWeb.Tests
+[xUnit.net 00:00:02.81]   Starting:    InferenceWeb.Tests
+Backend: GgmlCuda
+Model: gemma4, Layers=42, Hidden=2560, Heads=8, KVHeads=2, GlobalKVHeads=2, Vocab=0
+Head dims: local=256, global=512
+RoPE global=1000000 local=10000
+Partial rotary dims=512
+Sliding window=512, Softcap=30
+PLE dim=256, SharedKVLayers=18
+Layer types: 7 global (causal), 35 local (SWA)
+KV sharing: layers 24-41 share with donors
+  Prefaulted GGUF page cache: 7.5 GiB with 16 read streams in 3.5s (2.14 GiB/s)
+Loading model weights... done (339 F32 tensors, 381 quantized tensors)
+  Quantized: 7641 MB (7641 MB file-backed), F32: 2 MB
+  Output tied to token_embd.weight
+  Fused QKV projections: 24
+  Fused projections: 42 Gate+Up
+  Device-resident quantized weights: 7641 MB across 291 tensors
+Context length: using MAX_CONTEXT=8192; model declares gemma4.context_length=131072.
+  KV cache: 148 MB (dtype: f16, global layers: 8192 seq, SWA layers: 512 seq)
+  Gemma4 fused model decode enabled
+  Passed InferenceWeb.Tests.Gemma4BatchedFusedDecodeParityTests.BatchedFusedDecode_MatchesRoundRobin_TokenForToken [29 s]
+  Standard Output Messages:
+ [parity] backend=GgmlCuda native batched-decode caps=Ple, KvDonor, SwaWrap
+ [parity] prompt lengths = 6,581,8,11
+ [parity] n=2: fused steps=11 fallback steps=0
+ [parity] n=2 seq0 (prompt 6 tok): MATCH
+ [parity] n=2 seq1 (prompt 581 tok): MATCH
+ [parity] n=3: fused steps=11 fallback steps=0
+ [parity] n=3 seq0 (prompt 6 tok): MATCH
+ [parity] n=3 seq1 (prompt 581 tok): MATCH
+ [parity] n=3 seq2 (prompt 8 tok): MATCH
+ [parity] n=4: fused steps=11 fallback steps=0
+ [parity] n=4 seq0 (prompt 6 tok): MATCH
+ [parity] n=4 seq1 (prompt 581 tok): MATCH
+ [parity] n=4 seq2 (prompt 8 tok): MATCH
+ [parity] n=4 seq3 (prompt 11 tok): MATCH
+
+
+Backend: GgmlCuda
+Model: gemma4, Layers=42, Hidden=2560, Heads=8, KVHeads=2, GlobalKVHeads=2, Vocab=0
+Head dims: local=256, global=512
+RoPE global=1000000 local=10000
+Partial rotary dims=512
+Sliding window=512, Softcap=30
+PLE dim=256, SharedKVLayers=18
+Layer types: 7 global (causal), 35 local (SWA)
+KV sharing: layers 24-41 share with donors
+Loading model weights... done (339 F32 tensors, 381 quantized tensors)
+  Quantized: 7641 MB (7641 MB file-backed), F32: 2 MB
+  Output tied to token_embd.weight
+  Fused QKV projections: 24
+  Fused projections: 42 Gate+Up
+  Device-resident quantized weights: 7641 MB across 291 tensors
+Context length: using MAX_CONTEXT=8192; model declares gemma4.context_length=131072.
+  KV cache: 148 MB (dtype: f16, global layers: 8192 seq, SWA layers: 512 seq)
+  Gemma4 fused model decode enabled
+[xUnit.net 00:00:47.30]   Finished:    InferenceWeb.Tests
+  Passed InferenceWeb.Tests.Gemma4BatchedDecodeLifetimeTests.BatchedDecode_KeepsInputStorageAliveAcrossForcedCollection [15 s]
+Results File: /workspace/ts-codex-branch-completion-20260917/results/gemma-followup-cuda.trx
+
+Test Run Successful.
+Total tests: 2
+     Passed: 2
+ Total time: 49.3575 Seconds

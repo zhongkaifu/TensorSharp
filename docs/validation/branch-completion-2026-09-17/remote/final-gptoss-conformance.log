@@ -1,0 +1,43 @@
+Test run for /workspace/ts-codex-branch-completion-20260917/repo/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll (.NETCoreApp,Version=v10.0)
+A total of 1 test files matched the specified pattern.
+/workspace/ts-codex-branch-completion-20260917/repo/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll
+[xUnit.net 00:00:00.00] xUnit.net VSTest Adapter v3.1.4+50e68bbb8b (64-bit .NET 10.0.12)
+[xUnit.net 00:00:00.44]   Discovering: InferenceWeb.Tests
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 45498 MiB):
+  Device 0: NVIDIA A40, compute capability 8.6, VMM: yes, VRAM: 45498 MiB
+[xUnit.net 00:00:02.32]   Discovered:  InferenceWeb.Tests
+[xUnit.net 00:00:02.38]   Starting:    InferenceWeb.Tests
+Backend: GgmlCuda
+Model: gpt-oss, Layers=24, Hidden=2880, Heads=64, KVHeads=8, HeadDim=64, Vocab=201088
+RoPE base=150000, scale=32, eps=1E-05
+MoE: 32 experts, 4 used, SlidingWindow=128, ExpertFFN=2880
+  Prefaulted GGUF page cache: 11.3 GiB with 16 read streams in 4.7s (2.40 GiB/s)
+Loading model weights... done (289 F32 tensors, 2402 quantized tensors)
+  Quantized: 11501 MB (11501 MB file-backed), F32: 35 MB
+  Split expert biases: 72 tensors
+  Fused expert Gate+Up projections: 768
+  Fused projections: 24 QKV
+  Fused MoE prefill: stacked weights ready for 24/24 layers, stacked gate/up biases for 24/24 layers
+  Device-resident quantized weights: 1819 MB across 50 tensors
+Context length: using MAX_CONTEXT=8192; model declares gpt-oss.context_length=131072.
+Initial GgmlCuda KV cache allocation: 8 tokens (grows on demand up to 8192).
+Expanded GPT-OSS attention cache to 2048 tokens.
+[KV cache] Truncating from 1181 to 1177
+[xUnit.net 00:00:24.48]   Finished:    InferenceWeb.Tests
+  Passed InferenceWeb.Tests.PrefixCache.PrefixCacheContractConformanceTests.GptOss20B_PassesTheConformanceScript_WithParityCapabilities [22 s]
+  Standard Output Messages:
+ loading /workspace/models/gptoss20b/gpt-oss-20b-MXFP4.gguf on GgmlCuda
+ [gpt-oss-20b] capabilities: ok
+ [gpt-oss-20b] cold over 1179 tokens: 623,1825,10648,30,623,1825,10648,30
+ [gpt-oss-20b] end-state refusals: ok
+ [gpt-oss-20b] truncate in range on the primary (1181 -> 1177): ok
+ [gpt-oss-20b] release leaves no keys: ok
+ [gpt-oss-20b] conformance ran [capabilities, end-state refusals, truncate in range on the primary (1181 -> 1177), release leaves no keys]; not applicable [capture (CanCaptureCopy=false), clone (donate-only or no end states), donate/return/donate (no end states), settle then clone (donate-only or no end states), primary conversion (AdoptPrimaryOnDisplacement=false), batched release (no end states), export/import (Persistable=false)]
+
+
+Results File: /workspace/ts-codex-branch-completion-20260917/results/final-gptoss-conformance.trx
+
+Test Run Successful.
+Total tests: 1
+     Passed: 1
+ Total time: 25.8598 Seconds

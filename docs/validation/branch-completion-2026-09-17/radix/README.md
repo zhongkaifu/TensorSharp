@@ -72,10 +72,13 @@ InflightTable was 100% of lines; branch coverage was 99.31% for PrefixTree and
 Real-model checks used Gemma 4 E4B Q8_0 contract conformance; Qwen3.5 9B Q8_0
 contract conformance, end-state byte accounting, and primary decode after a
 holder; and GPT-OSS 20B Q8_0 contract conformance. All five passed on Metal.
-The four Gemma/Qwen checks also passed on CUDA. GPT-OSS CUDA conformance was
-not completed: the VM's available variant is MXFP4, while the original test's
-directory selector requires Q8_0. The fixed explicit-file helper was also
-exercised by a second passing Metal GPT-OSS run.
+The four Gemma/Qwen checks also passed on CUDA. The initial CUDA run excluded
+GPT-OSS because the VM has MXFP4 and the original directory selector requires
+Q8_0. After the explicit-file helper fix, the final integrated build passed
+the GPT-OSS CUDA conformance test with that MXFP4 file (one passed, zero
+skipped); see [final result](../remote/final-gptoss-conformance.trx). This is
+additional to the four CUDA checks in the table above. The fixed helper was
+also exercised by a second passing Metal GPT-OSS run.
 
 The DeepSeek fixture was the prepared managed metadata fixture
 `deepseek41-fixture.gguf`, SHA-256

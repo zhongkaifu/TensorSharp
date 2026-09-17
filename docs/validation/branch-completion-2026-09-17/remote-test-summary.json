@@ -1,0 +1,68 @@
+{
+  "cuda-fallback.trx": {
+    "total": 9,
+    "passed": 9,
+    "failed": 0,
+    "skipped": 0
+  },
+  "final-gptoss-conformance.trx": {
+    "total": 1,
+    "passed": 1,
+    "failed": 0,
+    "skipped": 0
+  },
+  "final-integrated.trx": {
+    "total": 41,
+    "passed": 41,
+    "failed": 0,
+    "skipped": 0
+  },
+  "final-qwen4.trx": {
+    "total": 20,
+    "passed": 20,
+    "failed": 0,
+    "skipped": 0
+  },
+  "gemma4.trx": {
+    "total": 5,
+    "passed": 5,
+    "failed": 0,
+    "skipped": 0
+  },
+  "qwen35.trx": {
+    "total": 4,
+    "passed": 4,
+    "failed": 0,
+    "skipped": 0
+  },
+  "qwen4-channels.trx": {
+    "total": 20,
+    "passed": 20,
+    "failed": 0,
+    "skipped": 0
+  },
+  "qwen4-cuda.trx": {
+    "total": 20,
+    "passed": 20,
+    "failed": 0,
+    "skipped": 0
+  },
+  "final-native.xml": {
+    "total": 35,
+    "passed": 32,
+    "failed": 0,
+    "skipped": 3
+  },
+  "native.xml": {
+    "total": 33,
+    "passed": 30,
+    "failed": 0,
+    "skipped": 3
+  },
+  "gemma-followup-cuda.trx": {
+    "total": 2,
+    "passed": 2,
+    "failed": 0,
+    "skipped": 0
+  }
+}

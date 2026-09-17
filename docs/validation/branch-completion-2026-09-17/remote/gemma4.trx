@@ -1,0 +1,267 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TestRun id="732ca4b3-9f74-463b-bd4e-581810384a6e" name="@d71188ba1e2e 2026-09-17 14:40:22" xmlns="http://microsoft.com/schemas/VisualStudio/TeamTest/2010">
+  <Times creation="2026-09-17T14:40:22.6803820+00:00" queuing="2026-09-17T14:40:22.6803823+00:00" start="2026-09-17T14:39:28.2113789+00:00" finish="2026-09-17T14:42:16.8334984+00:00" />
+  <TestSettings name="default" id="17753c23-7966-45e8-93ef-dbe9247edcbb">
+    <Deployment runDeploymentRoot="_d71188ba1e2e_2026-09-17_14_40_22" />
+  </TestSettings>
+  <Results>
+    <UnitTestResult executionId="72efd080-cb92-45a5-a1b1-ac26a46993d2" testId="d779d479-9a1d-d246-6721-19308d7bcb34" testName="InferenceWeb.Tests.Gemma4MediaAfterReusedPrefixExactnessTests.MediaTurnAfterAReusedPrefix_MatchesAColdPrefill(media: &quot;image&quot;, longPrefix: False, fused: False)" computerName="d71188ba1e2e" duration="00:00:15.6584098" startTime="2026-09-17T14:40:22.6565274+00:00" endTime="2026-09-17T14:40:38.2530993+00:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="72efd080-cb92-45a5-a1b1-ac26a46993d2">
+      <Output>
+        <StdOut>model=gemma-4-12B-it-qat-UD-Q4_K_XL.gguf backend=GgmlCuda media=image fused=False prompt=343 reused=61 span=[65,327)
+fused media chunk: cold=False reuse=False
+prefill logits max|diff| 6.01E-001 (logit scale 26.7); text control (81 tokens, split at 61) 2.70E+000; cold on the other path 8.24E-001
+cold:  The image features an anime-style illustration of a woman in a blue traditional dress sitting amidst a digital, futuristic background.
+reuse: The image features an anime-style illustration of a woman in a blue traditional dress sitting amidst a digital, futuristic background.
+text control streams identical</StdOut>
+      </Output>
+    </UnitTestResult>
+    <UnitTestResult executionId="b2ad37ea-aa1e-4558-aeae-5e9a026034fb" testId="16dbbec4-ccec-fd4f-6362-4050177cb83d" testName="InferenceWeb.Tests.Gemma4MediaAfterReusedPrefixExactnessTests.MediaTurnAfterAReusedPrefix_MatchesAColdPrefill(media: &quot;image&quot;, longPrefix: False, fused: True)" computerName="d71188ba1e2e" duration="00:00:15.6288008" startTime="2026-09-17T14:41:25.5288608+00:00" endTime="2026-09-17T14:41:41.1571221+00:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="b2ad37ea-aa1e-4558-aeae-5e9a026034fb">
+      <Output>
+        <StdOut>model=gemma-4-12B-it-qat-UD-Q4_K_XL.gguf backend=GgmlCuda media=image fused=True prompt=343 reused=61 span=[65,327)
+fused media chunk: cold=True reuse=True
+prefill logits max|diff| 1.07E+000 (logit scale 26.7); text control (81 tokens, split at 61) 2.70E+000; cold on the other path 8.24E-001
+cold:  The image features an anime-style illustration of a woman in a blue traditional dress sitting amidst a digital, futuristic background.
+reuse: The image features an anime-style illustration of a woman in a blue traditional dress sitting amidst a digital, futuristic background.
+text control streams identical
+greedy tokens compared: 0 of 24</StdOut>
+      </Output>
+    </UnitTestResult>
+    <UnitTestResult executionId="fea97d4c-8656-4e2e-81b2-27a83f2cab1f" testId="8e434e57-abdd-e100-bc17-67fffe9374ab" testName="InferenceWeb.Tests.Gemma4MediaAfterReusedPrefixExactnessTests.MediaTurnAfterAReusedPrefix_MatchesAColdPrefill(media: &quot;audio&quot;, longPrefix: True, fused: True)" computerName="d71188ba1e2e" duration="00:00:35.4997114" startTime="2026-09-17T14:41:41.1593328+00:00" endTime="2026-09-17T14:42:16.6569982+00:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="fea97d4c-8656-4e2e-81b2-27a83f2cab1f">
+      <Output>
+        <StdOut>model=gemma-4-12B-it-qat-UD-Q4_K_XL.gguf backend=GgmlCuda media=audio fused=True prompt=1536 reused=1416 span=[1420,1515)
+fused media chunk: cold=True reuse=True
+prefill logits max|diff| 1.06E+000 (logit scale 28.9); text control (1441 tokens, split at 1416) 6.27E-001; cold on the other path 1.39E+000
+cold:  The recording describes a quick brown fox jumping over a lazy dog. It also mentions that this action takes place near the river
+reuse: The recording describes a quick brown fox jumping over a lazy dog. It also mentions that this action takes place near the river
+text control streams identical
+greedy tokens compared: 12 of 24</StdOut>
+      </Output>
+    </UnitTestResult>
+    <UnitTestResult executionId="1542536d-2740-4d09-bc56-e970d10fb129" testId="27262428-5e74-72b0-f9fe-dd4823e87acc" testName="InferenceWeb.Tests.Gemma4MediaAfterReusedPrefixExactnessTests.MediaTurnAfterAReusedPrefix_MatchesAColdPrefill(media: &quot;image&quot;, longPrefix: True, fused: True)" computerName="d71188ba1e2e" duration="00:00:49.8026366" startTime="2026-09-17T14:39:32.8230259+00:00" endTime="2026-09-17T14:40:22.5960219+00:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="1542536d-2740-4d09-bc56-e970d10fb129">
+      <Output>
+        <StdOut>model=gemma-4-12B-it-qat-UD-Q4_K_XL.gguf backend=GgmlCuda media=image fused=True prompt=1698 reused=1416 span=[1420,1682)
+fused media chunk: cold=True reuse=True
+prefill logits max|diff| 9.85E-001 (logit scale 26.6); text control (1436 tokens, split at 1416) 7.83E-001; cold on the other path 7.52E-001
+cold:  This image features an anime-style girl with long dark hair wearing a blue traditional dress and black stockings, sitting in a
+reuse: This image features an anime-style illustration of a woman in a blue dress sitting amidst a digital, technological background. The
+first different token at 7: the cold top-2 logit margin there was 0.1453 (smallest margin up to it 0.0299)
+text control streams identical
+greedy tokens compared: 0 of 24</StdOut>
+      </Output>
+    </UnitTestResult>
+    <UnitTestResult executionId="a3159209-184e-4293-a1cf-0b10b417fea7" testId="30852b6b-3dab-01ec-cb16-252d2dc5fa3f" testName="InferenceWeb.Tests.Gemma4MediaAfterReusedPrefixExactnessTests.MediaTurnAfterAReusedPrefix_MatchesAColdPrefill(media: &quot;image&quot;, longPrefix: True, fused: False)" computerName="d71188ba1e2e" duration="00:00:47.2747729" startTime="2026-09-17T14:40:38.2559175+00:00" endTime="2026-09-17T14:41:25.5279654+00:00" testType="13cdc9d9-ddb5-4fa4-a97d-d965ccfc6d4b" outcome="Passed" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" relativeResultsDirectory="a3159209-184e-4293-a1cf-0b10b417fea7">
+      <Output>
+        <StdOut>model=gemma-4-12B-it-qat-UD-Q4_K_XL.gguf backend=GgmlCuda media=image fused=False prompt=1698 reused=1416 span=[1420,1682)
+fused media chunk: cold=False reuse=False
+prefill logits max|diff| 5.06E-001 (logit scale 26.6); text control (1436 tokens, split at 1416) 7.83E-001; cold on the other path 7.52E-001
+cold:  This image features an anime-style illustration of a woman in a blue dress sitting amidst floating, glowing geometric cubes. The
+reuse: This image features an anime-style illustration of a woman in a blue dress sitting amidst a digital, technological background. The
+first different token at 17: the cold top-2 logit margin there was 0.1699 (smallest margin up to it 0.0929)
+text control streams identical</StdOut>
+      </Output>
+    </UnitTestResult>
+  </Results>
+  <TestDefinitions>
+    <UnitTest name="InferenceWeb.Tests.Gemma4MediaAfterReusedPrefixExactnessTests.MediaTurnAfterAReusedPrefix_MatchesAColdPrefill(media: &quot;image&quot;, longPrefix: True, fused: True)" storage="/workspace/ts-codex-branch-completion-20260917/repo/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="27262428-5e74-72b0-f9fe-dd4823e87acc">
+      <Execution id="1542536d-2740-4d09-bc56-e970d10fb129" />
+      <TestMethod codeBase="/workspace/ts-codex-branch-completion-20260917/repo/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Gemma4MediaAfterReusedPrefixExactnessTests" name="MediaTurnAfterAReusedPrefix_MatchesAColdPrefill" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Gemma4MediaAfterReusedPrefixExactnessTests.MediaTurnAfterAReusedPrefix_MatchesAColdPrefill(media: &quot;image&quot;, longPrefix: True, fused: False)" storage="/workspace/ts-codex-branch-completion-20260917/repo/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="30852b6b-3dab-01ec-cb16-252d2dc5fa3f">
+      <Execution id="a3159209-184e-4293-a1cf-0b10b417fea7" />
+      <TestMethod codeBase="/workspace/ts-codex-branch-completion-20260917/repo/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Gemma4MediaAfterReusedPrefixExactnessTests" name="MediaTurnAfterAReusedPrefix_MatchesAColdPrefill" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Gemma4MediaAfterReusedPrefixExactnessTests.MediaTurnAfterAReusedPrefix_MatchesAColdPrefill(media: &quot;image&quot;, longPrefix: False, fused: False)" storage="/workspace/ts-codex-branch-completion-20260917/repo/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="d779d479-9a1d-d246-6721-19308d7bcb34">
+      <Execution id="72efd080-cb92-45a5-a1b1-ac26a46993d2" />
+      <TestMethod codeBase="/workspace/ts-codex-branch-completion-20260917/repo/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Gemma4MediaAfterReusedPrefixExactnessTests" name="MediaTurnAfterAReusedPrefix_MatchesAColdPrefill" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Gemma4MediaAfterReusedPrefixExactnessTests.MediaTurnAfterAReusedPrefix_MatchesAColdPrefill(media: &quot;audio&quot;, longPrefix: True, fused: True)" storage="/workspace/ts-codex-branch-completion-20260917/repo/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="8e434e57-abdd-e100-bc17-67fffe9374ab">
+      <Execution id="fea97d4c-8656-4e2e-81b2-27a83f2cab1f" />
+      <TestMethod codeBase="/workspace/ts-codex-branch-completion-20260917/repo/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Gemma4MediaAfterReusedPrefixExactnessTests" name="MediaTurnAfterAReusedPrefix_MatchesAColdPrefill" />
+    </UnitTest>
+    <UnitTest name="InferenceWeb.Tests.Gemma4MediaAfterReusedPrefixExactnessTests.MediaTurnAfterAReusedPrefix_MatchesAColdPrefill(media: &quot;image&quot;, longPrefix: False, fused: True)" storage="/workspace/ts-codex-branch-completion-20260917/repo/inferenceweb.tests/bin/release/net10.0/inferenceweb.tests.dll" id="16dbbec4-ccec-fd4f-6362-4050177cb83d">
+      <Execution id="b2ad37ea-aa1e-4558-aeae-5e9a026034fb" />
+      <TestMethod codeBase="/workspace/ts-codex-branch-completion-20260917/repo/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll" adapterTypeName="executor://xunit/VsTestRunner3/netcore/" className="InferenceWeb.Tests.Gemma4MediaAfterReusedPrefixExactnessTests" name="MediaTurnAfterAReusedPrefix_MatchesAColdPrefill" />
+    </UnitTest>
+  </TestDefinitions>
+  <TestEntries>
+    <TestEntry testId="d779d479-9a1d-d246-6721-19308d7bcb34" executionId="72efd080-cb92-45a5-a1b1-ac26a46993d2" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="16dbbec4-ccec-fd4f-6362-4050177cb83d" executionId="b2ad37ea-aa1e-4558-aeae-5e9a026034fb" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="8e434e57-abdd-e100-bc17-67fffe9374ab" executionId="fea97d4c-8656-4e2e-81b2-27a83f2cab1f" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="27262428-5e74-72b0-f9fe-dd4823e87acc" executionId="1542536d-2740-4d09-bc56-e970d10fb129" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestEntry testId="30852b6b-3dab-01ec-cb16-252d2dc5fa3f" executionId="a3159209-184e-4293-a1cf-0b10b417fea7" testListId="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+  </TestEntries>
+  <TestLists>
+    <TestList name="Results Not in a List" id="8c84fa94-04c1-424b-9868-57a2d4851a1d" />
+    <TestList name="All Loaded Results" id="19431567-8539-422a-85d7-44ee4e166bda" />
+  </TestLists>
+  <ResultSummary outcome="Completed">
+    <Counters total="5" executed="5" passed="5" failed="0" error="0" timeout="0" aborted="0" inconclusive="0" passedButRunAborted="0" notRunnable="0" notExecuted="0" disconnected="0" warning="0" completed="0" inProgress="0" pending="0" />
+    <Output>
+      <StdOut>[xUnit.net 00:00:00.00] xUnit.net VSTest Adapter v3.1.4+50e68bbb8b (64-bit .NET 10.0.12)
+[xUnit.net 00:00:00.46]   Discovering: InferenceWeb.Tests
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 45498 MiB):
+  Device 0: NVIDIA A40, compute capability 8.6, VMM: yes, VRAM: 45498 MiB
+[xUnit.net 00:00:03.12]   Discovered:  InferenceWeb.Tests
+[xUnit.net 00:00:03.23]   Starting:    InferenceWeb.Tests
+Backend: GgmlCuda
+Model: gemma4, Layers=48, Hidden=3840, Heads=16, KVHeads=8, GlobalKVHeads=1, Vocab=0
+Head dims: local=256, global=512
+RoPE global=1000000 local=10000
+Partial rotary dims=512
+Sliding window=1024, Softcap=30
+PLE dim=0, SharedKVLayers=0
+Layer types: 8 global (causal), 40 local (SWA)
+  Prefaulted GGUF page cache: 6.3 GiB with 16 read streams in 4.4s (1.44 GiB/s)
+Loading model weights... done (338 F32 tensors, 329 quantized tensors)
+  Quantized: 6387 MB (6387 MB file-backed), F32: 2 MB
+  Output tied to token_embd.weight
+  Fused QKV projections: 48
+  Fused projections: 48 Gate+Up
+  Device-resident quantized weights: 6395 MB across 193 tensors
+Context length: using MAX_CONTEXT=8192; model declares gemma4.context_length=262144.
+  KV cache: 448 MB (dtype: f16, global layers: 8192 seq, SWA layers: 1024 seq)
+  Gemma4 fused model decode enabled
+Vision encoder: type=gemma4uv, hidden=3840, intermediate=0, heads=1, blocks=0, projDim=3840, patch=16, nMerge=3, unifiedPatch=48
+Loading vision encoder weights... done (10 tensors, 0 clampable linears)
+Audio encoder: hidden=640, heads=1, headDim=640, ffn=0, layers=0, melBins=128, eps=1E-06
+  chunk=12, maxPast=12, maxFuture=0, context=24
+  projDim=3840
+Loading audio encoder weights... done (1 tensors, 0 clampable linears)
+  GGUF naming: mmproj/Unsloth
+  projector_type: gemma4ua (encoder-free / raw-waveform)
+[ChatTemplate] Jinja2 rendering succeeded for 'gemma4', prompt length=3864
+[ChatTemplate] Jinja2 rendering succeeded for 'gemma4', prompt length=3757
+Injected 260 vision tokens at chunk-offset 1421 (absolute position 1421)
+Injected 260 vision tokens at chunk-offset 5 (absolute position 1421)
+Injected 260 vision tokens at chunk-offset 1421 (absolute position 1421)
+[ChatTemplate] Jinja2 rendering succeeded for 'gemma4', prompt length=3856
+Backend: GgmlCuda
+Model: gemma4, Layers=48, Hidden=3840, Heads=16, KVHeads=8, GlobalKVHeads=1, Vocab=0
+Head dims: local=256, global=512
+RoPE global=1000000 local=10000
+Partial rotary dims=512
+Sliding window=1024, Softcap=30
+PLE dim=0, SharedKVLayers=0
+Layer types: 8 global (causal), 40 local (SWA)
+Loading model weights... done (338 F32 tensors, 329 quantized tensors)
+  Quantized: 6387 MB (6387 MB file-backed), F32: 2 MB
+  Output tied to token_embd.weight
+  Fused QKV projections: 48
+  Fused projections: 48 Gate+Up
+  Device-resident quantized weights: 6395 MB across 193 tensors
+Context length: using MAX_CONTEXT=8192; model declares gemma4.context_length=262144.
+  KV cache: 448 MB (dtype: f16, global layers: 8192 seq, SWA layers: 1024 seq)
+  Gemma4 fused model decode enabled
+Vision encoder: type=gemma4uv, hidden=3840, intermediate=0, heads=1, blocks=0, projDim=3840, patch=16, nMerge=3, unifiedPatch=48
+Loading vision encoder weights... done (10 tensors, 0 clampable linears)
+Audio encoder: hidden=640, heads=1, headDim=640, ffn=0, layers=0, melBins=128, eps=1E-06
+  chunk=12, maxPast=12, maxFuture=0, context=24
+  projDim=3840
+Loading audio encoder weights... done (1 tensors, 0 clampable linears)
+  GGUF naming: mmproj/Unsloth
+  projector_type: gemma4ua (encoder-free / raw-waveform)
+[ChatTemplate] Jinja2 rendering succeeded for 'gemma4', prompt length=350
+[ChatTemplate] Jinja2 rendering succeeded for 'gemma4', prompt length=243
+Injected 260 vision tokens at chunk-offset 66 (absolute position 66)
+Injected 260 vision tokens at chunk-offset 5 (absolute position 66)
+Injected 260 vision tokens at chunk-offset 66 (absolute position 66)
+[ChatTemplate] Jinja2 rendering succeeded for 'gemma4', prompt length=342
+Backend: GgmlCuda
+Model: gemma4, Layers=48, Hidden=3840, Heads=16, KVHeads=8, GlobalKVHeads=1, Vocab=0
+Head dims: local=256, global=512
+RoPE global=1000000 local=10000
+Partial rotary dims=512
+Sliding window=1024, Softcap=30
+PLE dim=0, SharedKVLayers=0
+Layer types: 8 global (causal), 40 local (SWA)
+Loading model weights... done (338 F32 tensors, 329 quantized tensors)
+  Quantized: 6387 MB (6387 MB file-backed), F32: 2 MB
+  Output tied to token_embd.weight
+  Fused QKV projections: 48
+  Fused projections: 48 Gate+Up
+  Device-resident quantized weights: 6395 MB across 193 tensors
+Context length: using MAX_CONTEXT=8192; model declares gemma4.context_length=262144.
+  KV cache: 448 MB (dtype: f16, global layers: 8192 seq, SWA layers: 1024 seq)
+  Gemma4 fused model decode enabled
+Vision encoder: type=gemma4uv, hidden=3840, intermediate=0, heads=1, blocks=0, projDim=3840, patch=16, nMerge=3, unifiedPatch=48
+Loading vision encoder weights... done (10 tensors, 0 clampable linears)
+Audio encoder: hidden=640, heads=1, headDim=640, ffn=0, layers=0, melBins=128, eps=1E-06
+  chunk=12, maxPast=12, maxFuture=0, context=24
+  projDim=3840
+Loading audio encoder weights... done (1 tensors, 0 clampable linears)
+  GGUF naming: mmproj/Unsloth
+  projector_type: gemma4ua (encoder-free / raw-waveform)
+[ChatTemplate] Jinja2 rendering succeeded for 'gemma4', prompt length=3864
+[ChatTemplate] Jinja2 rendering succeeded for 'gemma4', prompt length=3757
+Injected 260 vision tokens at chunk-offset 1421 (absolute position 1421)
+Injected 260 vision tokens at chunk-offset 5 (absolute position 1421)
+Injected 260 vision tokens at chunk-offset 1421 (absolute position 1421)
+[ChatTemplate] Jinja2 rendering succeeded for 'gemma4', prompt length=3856
+Backend: GgmlCuda
+Model: gemma4, Layers=48, Hidden=3840, Heads=16, KVHeads=8, GlobalKVHeads=1, Vocab=0
+Head dims: local=256, global=512
+RoPE global=1000000 local=10000
+Partial rotary dims=512
+Sliding window=1024, Softcap=30
+PLE dim=0, SharedKVLayers=0
+Layer types: 8 global (causal), 40 local (SWA)
+Loading model weights... done (338 F32 tensors, 329 quantized tensors)
+  Quantized: 6387 MB (6387 MB file-backed), F32: 2 MB
+  Output tied to token_embd.weight
+  Fused QKV projections: 48
+  Fused projections: 48 Gate+Up
+  Device-resident quantized weights: 6395 MB across 193 tensors
+Context length: using MAX_CONTEXT=8192; model declares gemma4.context_length=262144.
+  KV cache: 448 MB (dtype: f16, global layers: 8192 seq, SWA layers: 1024 seq)
+  Gemma4 fused model decode enabled
+Vision encoder: type=gemma4uv, hidden=3840, intermediate=0, heads=1, blocks=0, projDim=3840, patch=16, nMerge=3, unifiedPatch=48
+Loading vision encoder weights... done (10 tensors, 0 clampable linears)
+Audio encoder: hidden=640, heads=1, headDim=640, ffn=0, layers=0, melBins=128, eps=1E-06
+  chunk=12, maxPast=12, maxFuture=0, context=24
+  projDim=3840
+Loading audio encoder weights... done (1 tensors, 0 clampable linears)
+  GGUF naming: mmproj/Unsloth
+  projector_type: gemma4ua (encoder-free / raw-waveform)
+[ChatTemplate] Jinja2 rendering succeeded for 'gemma4', prompt length=350
+[ChatTemplate] Jinja2 rendering succeeded for 'gemma4', prompt length=243
+Injected 260 vision tokens at chunk-offset 66 (absolute position 66)
+Injected 260 vision tokens at chunk-offset 5 (absolute position 66)
+Injected 260 vision tokens at chunk-offset 66 (absolute position 66)
+[ChatTemplate] Jinja2 rendering succeeded for 'gemma4', prompt length=342
+Backend: GgmlCuda
+Model: gemma4, Layers=48, Hidden=3840, Heads=16, KVHeads=8, GlobalKVHeads=1, Vocab=0
+Head dims: local=256, global=512
+RoPE global=1000000 local=10000
+Partial rotary dims=512
+Sliding window=1024, Softcap=30
+PLE dim=0, SharedKVLayers=0
+Layer types: 8 global (causal), 40 local (SWA)
+Loading model weights... done (338 F32 tensors, 329 quantized tensors)
+  Quantized: 6387 MB (6387 MB file-backed), F32: 2 MB
+  Output tied to token_embd.weight
+  Fused QKV projections: 48
+  Fused projections: 48 Gate+Up
+  Device-resident quantized weights: 6395 MB across 193 tensors
+Context length: using MAX_CONTEXT=8192; model declares gemma4.context_length=262144.
+  KV cache: 448 MB (dtype: f16, global layers: 8192 seq, SWA layers: 1024 seq)
+  Gemma4 fused model decode enabled
+Vision encoder: type=gemma4uv, hidden=3840, intermediate=0, heads=1, blocks=0, projDim=3840, patch=16, nMerge=3, unifiedPatch=48
+Loading vision encoder weights... done (10 tensors, 0 clampable linears)
+Audio encoder: hidden=640, heads=1, headDim=640, ffn=0, layers=0, melBins=128, eps=1E-06
+  chunk=12, maxPast=12, maxFuture=0, context=24
+  projDim=3840
+Loading audio encoder weights... done (1 tensors, 0 clampable linears)
+  GGUF naming: mmproj/Unsloth
+  projector_type: gemma4ua (encoder-free / raw-waveform)
+[ChatTemplate] Jinja2 rendering succeeded for 'gemma4', prompt length=3883
+[ChatTemplate] Jinja2 rendering succeeded for 'gemma4', prompt length=3757
+Audio encoder (gemma4ua): frames=93 x 640 -&gt; [93,3840]... done
+Injected 93 vision tokens at chunk-offset 1421 (absolute position 1421)
+Injected 93 vision tokens at chunk-offset 5 (absolute position 1421)
+Injected 93 vision tokens at chunk-offset 1421 (absolute position 1421)
+[ChatTemplate] Jinja2 rendering succeeded for 'gemma4', prompt length=3875
+[xUnit.net 00:02:47.15]   Finished:    InferenceWeb.Tests
+</StdOut>
+    </Output>
+  </ResultSummary>
+</TestRun>

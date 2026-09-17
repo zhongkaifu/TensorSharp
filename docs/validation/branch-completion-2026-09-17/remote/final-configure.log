@@ -1,0 +1,16 @@
+-- NCCL found: enabling multi-GPU collective AllReduce for tensor parallelism
+-- CMAKE_SYSTEM_PROCESSOR: x86_64
+-- GGML_SYSTEM_ARCH: x86
+-- Including CPU backend
+-- x86 detected
+-- Adding CPU backend variant ggml-cpu: -march=native 
+-- CUDA Toolkit found
+-- Using CMAKE_CUDA_ARCHITECTURES=86 CMAKE_CUDA_ARCHITECTURES_NATIVE=86-real
+-- FlashAttention K-V type combinations: f16-f16;q4_0-q4_0;q8_0-q8_0;bf16-bf16
+-- Including CUDA backend
+-- ggml version: 0.24.0
+-- ggml commit:  456172e
+-- TensorSharp: cuDNN headers at /usr/include; VAE convolutions will use cuDNN when its runtime is present
+-- Configuring done (1.7s)
+-- Generating done (5.5s)
+-- Build files have been written to: /workspace/ts-codex-branch-completion-20260917/repo/TensorSharp.GGML.Native/build

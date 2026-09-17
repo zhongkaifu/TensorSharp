@@ -1,0 +1,14 @@
+{
+  "source_revision": "668cc48167e6a9e8bd81460ef6e5f7ecf39ade9b",
+  "base_revision": "90701d93046770335ece4bf8bff981ee7e3683f1",
+  "changed_file_sha256": {
+    "InferenceWeb.Tests/Gemma4BatchedDecodeLifetimeTests.cs": "bbffc22726caa66680f20a824b138ecefa594a35e2ef5ff67b770871e2b1b6e2",
+    "TensorSharp.Models/Models/Gemma4/Gemma4Model.cs": "0e47e4eee5f0456205b62917c63a13762a79cc6714b8a26a76a8611783cd58ba",
+    "docs/validation/branch-completion-2026-09-17/radix/README.md": "2f1d79ca5e7d0d0199a3074b540630414036b0c6add8db11bf27e61f66f2ed07",
+    "docs/validation/branch-completion-2026-09-17/radix/local-validation.json": "db244a095ee43f41cad827468d2016f9e96fbef90c283a740e6ab5f1328d1d15",
+    "docs/validation/branch-completion-2026-09-17/radix/model-conformance.json": "cfddea881d2610edda5ccf4eb5651dd4ab54b945c803cfceaff2c77637286667",
+    "docs/validation/branch-completion-2026-09-17/radix/radix-tree-benchmark.json": "f9fe024e25ec75d3261e373655571a1e7efc4a0e4785c173be9a76a5937846aa"
+  },
+  "native_source_changed": false,
+  "mismatches": []
+}

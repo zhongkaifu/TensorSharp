@@ -1,0 +1,152 @@
+Test run for /workspace/ts-codex-branch-completion-20260917/repo/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll (.NETCoreApp,Version=v10.0)
+A total of 1 test files matched the specified pattern.
+/workspace/ts-codex-branch-completion-20260917/repo/InferenceWeb.Tests/bin/Release/net10.0/InferenceWeb.Tests.dll
+[xUnit.net 00:00:00.00] xUnit.net VSTest Adapter v3.1.4+50e68bbb8b (64-bit .NET 10.0.12)
+[xUnit.net 00:00:00.47]   Discovering: InferenceWeb.Tests
+ggml_cuda_init: found 1 CUDA devices (Total VRAM: 45498 MiB):
+  Device 0: NVIDIA A40, compute capability 8.6, VMM: yes, VRAM: 45498 MiB
+[xUnit.net 00:00:03.05]   Discovered:  InferenceWeb.Tests
+[xUnit.net 00:00:03.16]   Starting:    InferenceWeb.Tests
+Backend: GgmlCuda
+Model: qwen35, Layers=32, Hidden=4096, Heads=16, KVHeads=4, HeadDim=256, Vocab=248320
+RoPE base=10000000, scale=1, eps=1E-06
+SSM: dInner=4096, dState=128, nGroup=16, dtRank=32, convKernel=4, fullAttnInterval=4
+MRoPE sections: [11, 11, 10, 0]
+Layer types: 8 full attention, 24 recurrent (GatedDeltaNet)
+  Prefaulted GGUF page cache: 8.9 GiB with 16 read streams in 5.4s (1.64 GiB/s)
+Loading model weights... done (177 F32 tensors, 250 quantized tensors)
+  Quantized: 9071 MB (9071 MB file-backed), F32: 4 MB
+  Fused projections: 8 Q+K+V
+  Fused projections: 24 recurrent input packs
+  Fused projections: 32 Gate+Up
+  Device-resident quantized weights: 10302 MB across 226 tensors
+Context length: using MAX_CONTEXT=8192; model declares qwen35.context_length=262144.
+  Passed InferenceWeb.Tests.Qwen35InjectKVBlockRefusalTests.RefusedPayloads_LeaveTheModelUntouched_AndAGoodOneStillInjects [12 s]
+  Standard Output Messages:
+ model Qwen3.5-9B-Q8_0.gguf on GgmlCuda
+ refused, state unchanged: truncated by one byte
+ refused, state unchanged: missing the M-RoPE delta
+ refused, state unchanged: one byte too long
+ refused, state unchanged: empty
+ refused, state unchanged: a delta that puts the next token at a negative position
+ refused, state unchanged: not appended at the cache end
+ refused, state unchanged: past the cache end
+ after inject, next-token max |dlogit| vs a straight run: 0.1606
+
+
+Backend: GgmlCuda
+Model: qwen35, Layers=32, Hidden=4096, Heads=16, KVHeads=4, HeadDim=256, Vocab=248320
+RoPE base=10000000, scale=1, eps=1E-06
+SSM: dInner=4096, dState=128, nGroup=16, dtRank=32, convKernel=4, fullAttnInterval=4
+MRoPE sections: [11, 11, 10, 0]
+Layer types: 8 full attention, 24 recurrent (GatedDeltaNet)
+Loading model weights... done (177 F32 tensors, 250 quantized tensors)
+  Quantized: 9071 MB (9071 MB file-backed), F32: 4 MB
+  Fused projections: 8 Q+K+V
+  Fused projections: 24 recurrent input packs
+  Fused projections: 32 Gate+Up
+  Device-resident quantized weights: 10302 MB across 226 tensors
+Context length: using MAX_CONTEXT=8192; model declares qwen35.context_length=262144.
+Qwen3.5 Vision encoder: imageSize=768, patchSize=16, hidden=1152, intermediate=4304, heads=16, blocks=27, projDim=4096, mergeSize=2, gridPerSide=48, ropeTheta=10000
+Loading vision encoder weights... done (334 tensors)
+ done
+  Vision encode: 2173 ms total (patchEmbed 139 ms, blocks 499 ms, proj 1503 ms), 2352 patches -> 588 tokens
+  Injected 588 vision embeddings at position 46
+  Injected 588 vision embeddings at position 46
+  Injected 588 vision embeddings at position 46
+  Injected 588 vision embeddings at position 46
+  Injected 588 vision embeddings at position 46
+  Injected 588 vision embeddings at position 46
+  Passed InferenceWeb.Tests.Qwen35ImageFollowUpExactnessTests.ConcurrentReuseAfterAnImage_MatchesColdPrefill [22 s]
+  Standard Output Messages:
+ model Qwen3.5-9B-Q8_0.gguf + mmproj-F16.gguf on GgmlCuda, image /tmp/q35-img-exact-7db5073193034d13b238c7f1b4f70fff/scene.png, loaded in 8.4s
+ [concurrent t1] image prompt 35 reused 0: Red\nBlue\nYellow
+ [concurrent t1] text  prompt 346 reused 0: The Volga, the Danube, and the Rhine are three major rivers in Europe.
+ [concurrent t2] image prompt 651 reused 0: A simple, colorful illustration depicts a house with a red body and a brown roof, situated on a green field. A
+ [concurrent t2] text  prompt 386 reused 366: The Volga is the longest river among the three, with a length of approximately 3,690 kilometres.
+ [concurrent t3] image prompt 704 reused 675: <think>\n\n</think>\n\nThe most prominent color is light blue, which fills the sky and covers the majority of the image's
+ [concurrent t3] text  prompt 431 reused 410: Volgograd is a city located on the Volga River.
+ [concurrent t4] image prompt 751 reused 728: <think>\n\n</think>\n\n**Sunny Day House**
+ [concurrent t4] text  prompt 465 reused 445: Volgograd was formerly known as Stalingrad before being renamed in 1961.
+ [concurrent] arena batched decode steps: 54
+ [tie] image turn 3 step 0: cold top-2 margin 0.2281 < GgmlCuda tolerance 3; the rest of this request is not compared
+ [tie] text turn 3 step 0: cold top-2 margin 0.0406 < GgmlCuda tolerance 3; the rest of this request is not compared
+ [tie] image turn 4 step 5: cold top-2 margin 0.0165 < GgmlCuda tolerance 3; the rest of this request is not compared
+
+
+Backend: GgmlCuda
+Model: qwen35, Layers=32, Hidden=4096, Heads=16, KVHeads=4, HeadDim=256, Vocab=248320
+RoPE base=10000000, scale=1, eps=1E-06
+SSM: dInner=4096, dState=128, nGroup=16, dtRank=32, convKernel=4, fullAttnInterval=4
+MRoPE sections: [11, 11, 10, 0]
+Layer types: 8 full attention, 24 recurrent (GatedDeltaNet)
+Loading model weights... done (177 F32 tensors, 250 quantized tensors)
+  Quantized: 9071 MB (9071 MB file-backed), F32: 4 MB
+  Fused projections: 8 Q+K+V
+  Fused projections: 24 recurrent input packs
+  Fused projections: 32 Gate+Up
+  Device-resident quantized weights: 10302 MB across 226 tensors
+Context length: using MAX_CONTEXT=8192; model declares qwen35.context_length=262144.
+Qwen3.5 Vision encoder: imageSize=768, patchSize=16, hidden=1152, intermediate=4304, heads=16, blocks=27, projDim=4096, mergeSize=2, gridPerSide=48, ropeTheta=10000
+Loading vision encoder weights... done (334 tensors)
+ done
+  Vision encode: 1998 ms total (patchEmbed 36 ms, blocks 473 ms, proj 1478 ms), 560 patches -> 140 tokens
+  Injected 140 vision embeddings at position 5
+  Injected 140 vision embeddings at position 46
+  Injected 140 vision embeddings at position 46
+  Injected 140 vision embeddings at position 46
+  Injected 140 vision embeddings at position 46
+  Injected 140 vision embeddings at position 7
+  Injected 140 vision embeddings at position 46
+  Injected 140 vision embeddings at position 46
+  Injected 140 vision embeddings at position 46
+  Injected 140 vision embeddings at position 46
+  Injected 140 vision embeddings at position 46
+  Passed InferenceWeb.Tests.Qwen35ImageFollowUpExactnessTests.ReuseAfterAnImage_MatchesColdPrefill [26 s]
+  Standard Output Messages:
+ model Qwen3.5-9B-Q8_0.gguf + mmproj-F16.gguf on GgmlCuda, image /tmp/q35-img-exact-d7c8360169f14e87971aa0708e56fc32/scene.png, loaded in 7.0s
+ [reuse t1] prompt 35 reused 0 (0.0%): Red\nBlue\nYellow
+ [reuse t2] prompt 203 reused 41 (20.2%): A simple, flat-style illustration depicts a house with a red body and a brown roof sitting on a green field. A
+ [reuse t3] prompt 256 reused 227 (88.7%): The most prominent color is light blue, which fills the entire background as the sky.
+ [reuse t4] prompt 296 reused 274 (92.6%): **Sunny Day House**
+ [cold  t1] Red\nBlue\nYellow
+ [cold  t2] A simple, flat-style illustration depicts a house with a red body and a brown roof sitting on a green field. A
+ [cold  t3] <think>\n\n</think>\n\nThe most prominent color is light blue, which fills the sky and covers the majority of the image's
+ [engine t3] reused and cold greedy tokens first differ at step 0
+ [cold  t4] **Sunny Day House**
+ [direct image t2] suffix 164 tokens, max |dlogit| / cold top-2 margin per step: 0.566/0.40 0.386/3.99 0.341/0.37 0.308/0.62 0.317/0.61 0.249/2.64 0.247/2.07 0.325/8.75 0.282/1.64 0.255/4.38 0.227/5.86 0.342/1.99 0.336/2.98 0.241/3.28 0.256/0.08 0.313/4.96 0.236/1.05 0.311/0.55 0.308/4.02 0.239/1.84 0.258/6.57 0.248/1.33 0.258/1.41 0.297/0.20
+ [direct image t3] suffix 30 tokens, max |dlogit| / cold top-2 margin per step: 0.695/0.09
+ [direct image t4] suffix 24 tokens, max |dlogit| / cold top-2 margin per step: 0.330/0.25 0.391/0.31 0.288/9.56 0.259/1.36 0.324/0.06 0.299/8.71 0.285/7.46 0.935/17.45 1.148/15.13 0.347/6.98 0.820/6.97 0.766/4.18 0.518/0.94 1.136/1.23 1.164/0.76 0.945/11.98 1.580/7.21 1.938/17.45 1.362/6.83 1.213/1.31 0.848/1.99 0.329/8.51 0.385/3.32 0.384/2.83
+ [direct text control t2] suffix 22 tokens, max |dlogit| / cold top-2 margin per step: 0.256/3.93 0.263/5.11 0.247/2.25 0.324/13.17 0.238/5.92 0.245/5.91 0.207/5.53 0.249/9.72 0.209/1.36 0.252/0.38 0.250/3.51 0.235/0.43 0.253/0.50 0.243/7.39 0.219/1.57 0.197/9.64 0.224/7.42 0.289/2.02 0.325/6.94 0.301/11.43 0.291/1.82 0.316/9.77 0.230/3.26 0.246/4.28
+ [direct text control t3] suffix 22 tokens, max |dlogit| / cold top-2 margin per step: 0.218/0.40 0.234/1.25 0.254/12.50 0.253/3.71 0.270/0.61 0.248/1.23 0.188/2.63 0.196/8.90 0.205/1.10 0.233/6.89 0.414/7.87 0.279/1.25 0.437/10.64 0.449/4.73 0.443/2.75 0.218/0.37 0.625/12.58 0.371/2.26 0.211/5.94 0.534/4.89 0.248/5.28 0.199/1.07 0.247/3.44 0.358/11.51
+ [direct text control t4] suffix 22 tokens, max |dlogit| / cold top-2 margin per step: 0.225/1.63 0.310/11.40 0.247/2.41 0.248/1.15 0.285/2.29 0.257/1.63 0.232/0.92 0.432/10.30 0.310/6.49 0.229/5.52 0.211/0.17 0.189/3.84 0.590/9.49 0.352/1.22 0.457/10.58 0.340/6.07 0.259/3.00 0.204/5.38 0.369/10.78 0.271/7.62 0.238/0.82 0.465/4.45 0.401/11.96 0.924/7.14
+ [direct] worst max |dlogit|: image 1.93768, text control 0.92432 (ratio 2.10, allowed 4); tolerance 3
+ [tie] turn 3 step 0: cold top-2 margin 0.0941 < max |dlogit| 0.6952
+ [checkpoint] 58.4 MB file through an image; restored decode max |dlogit| 0.00000 over 6 steps; version-1 file refused
+
+
+Backend: GgmlCuda
+Model: qwen35, Layers=32, Hidden=4096, Heads=16, KVHeads=4, HeadDim=256, Vocab=248320
+RoPE base=10000000, scale=1, eps=1E-06
+SSM: dInner=4096, dState=128, nGroup=16, dtRank=32, convKernel=4, fullAttnInterval=4
+MRoPE sections: [11, 11, 10, 0]
+Layer types: 8 full attention, 24 recurrent (GatedDeltaNet)
+Loading model weights... done (177 F32 tensors, 250 quantized tensors)
+  Quantized: 9071 MB (9071 MB file-backed), F32: 4 MB
+  Fused projections: 8 Q+K+V
+  Fused projections: 24 recurrent input packs
+  Fused projections: 32 Gate+Up
+  Device-resident quantized weights: 10302 MB across 226 tensors
+Context length: using MAX_CONTEXT=8192; model declares qwen35.context_length=262144.
+[xUnit.net 00:01:10.16]   Finished:    InferenceWeb.Tests
+  Passed InferenceWeb.Tests.Qwen35ConvScratchTests.APrimaryCacheThatNeverDecoded_DecodesAfterAHolderDid [4 s]
+  Standard Output Messages:
+ primary decode vs holder decode: max |dlogit| 0
+
+
+Results File: /workspace/ts-codex-branch-completion-20260917/results/qwen35.trx
+
+Test Run Successful.
+Total tests: 4
+     Passed: 4
+ Total time: 1.1910 Minutes

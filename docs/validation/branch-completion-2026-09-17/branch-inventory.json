@@ -1,0 +1,77 @@
+{
+  "integration_revision": "cbe338ca66319dc175fbe68e7943943b58f0979a",
+  "review_target": "feature/fix_build_break_and_optimization",
+  "initial_target": "e10dd42b",
+  "branches": [
+    {
+      "branch": "biglane-glm-fixes",
+      "tip": "079a34a370c719fcbf9bcc0eb63b16315e05dcc5",
+      "included": true
+    },
+    {
+      "branch": "claude/dsv41-perf",
+      "tip": "cb6b2344827559a1fc3ff5ba04a529bf7c3ac1fa",
+      "included": true
+    },
+    {
+      "branch": "claude/dsv41-perf-load",
+      "tip": "17b86f195c85fca6866985cfbac08e6b808c30ff",
+      "included": true
+    },
+    {
+      "branch": "claude/dsv41-perf-prefill",
+      "tip": "94afb376a0a38f68fd914f0bdee03d9e66bf7f16",
+      "included": true
+    },
+    {
+      "branch": "claude/fix-fattn-abort",
+      "tip": "6ceb15a48028ee7a251d65848948983500604360",
+      "included": true
+    },
+    {
+      "branch": "claude/gptoss-conc4-determinism",
+      "tip": "4cb73a6420c99210d5b0785c3e477b86b11df255",
+      "included": true
+    },
+    {
+      "branch": "claude/load-refusal-exit",
+      "tip": "c068cfcefd55360a49a57286716334f0f55bb7dd",
+      "included": true
+    },
+    {
+      "branch": "claude/qualification-2026-09-16",
+      "tip": "2ee41ab135f551e12e4aa9ac0b932420af7c28ba",
+      "included": true
+    },
+    {
+      "branch": "claude/qwen4exp-cuda-exactness",
+      "tip": "01cda2b064f26f7d5c2074f6734ada6b3414c43a",
+      "included": true
+    },
+    {
+      "branch": "claude/radix-m2",
+      "tip": "9ae80b49e4556d95917eb4af891d2894acd63aaf",
+      "included": true
+    },
+    {
+      "branch": "claude/radix-prefix-cache",
+      "tip": "cb98c0fba61c82a316ba357843af2c14c61c59bd",
+      "included": true
+    },
+    {
+      "branch": "claude/scheduler-followups",
+      "tip": "c94f2c4608864217897b4c224481e6d23e3a4ff7",
+      "included": true
+    },
+    {
+      "branch": "review-wf_21939204-cd7-1-fixes",
+      "tip": "505f2b5b61455518df128da5a96d105af59fed3b",
+      "included": true
+    },
+    {
+      "branch": "review/merge-082599d7-fixes",
+      "tip": "999b534bf1e6ef8e84e3fbd4ebfea7e4d7f15294",
+      "included": true
+    }
+  ]
+}
