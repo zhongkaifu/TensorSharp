@@ -114,9 +114,8 @@ namespace TensorSharp.Models
                 ResolveCpuMoeLayers(), BackendRegistryName(backend), tp, ctxIsHardLimit,
                 NativeMtpRequested());
             if (_native == IntPtr.Zero)
-                throw new InvalidOperationException(
-                    $"Failed to load the glm-dsa model from {ggufPath} with the native executor (see stderr). " +
-                    "TS_GLM_NATIVE=0 falls back to the per-op path.");
+                throw NativeLoadRefused("glm", ggufPath,
+                    "TS_GLM_NATIVE=0 selects the per-op path instead of the native executor.");
 
             _maxContextLength = GgmlGlmNative.CtxSize(_native);
             // The native loader is the authority on whether the draft block

@@ -2030,6 +2030,48 @@ These are read by `build-linux.sh` / `build-windows.ps1` / the auto-build during
 | Native build CMake generator (Windows) | Ninja when available, else `Visual Studio NN` | `CMAKE_GENERATOR` | `-G <generator>` |
 | Visual Studio installation used by the native build (Windows) | auto-detected, including installs flagged incomplete | `TENSORSHARP_VS_INSTALL_DIR` | — |
 
+## Exit codes (CLI + Server)
+
+`TensorSharp.Cli` and `TensorSharp.Server` leave with the same documented codes, so
+a script or supervisor can tell "fix the command line" from "this model does not
+load here" from "this is a bug":
+
+| Code | Meaning | What stderr shows |
+|---|---|---|
+| `0` | Success: the run finished, `--help` / `--list-skills` printed, or the server shut down cleanly. | — |
+| `1` | Configuration error: an unknown or removed flag, a bad value, an unreadable `--config` file. | `Configuration error: <what is wrong>` |
+| `2` | Model load refused. | Exactly one line, the last one: `error: model load refused: <reason>` |
+| anything else | Not a refusal: a bug or a crash. An unhandled .NET exception prints its stack trace and, on Linux and macOS, exits `134` (SIGABRT); a process the OS killed reports its signal (`137` for an out-of-memory kill). | The stack trace. Report it. |
+
+**What counts as a refused load** (code `2`) is a decision the loader made on
+purpose, with a reason you can act on: not enough VRAM for the requested context
+or `--n-cpu-moe` (the message names the number that fits), a `--tp` layout the
+devices cannot hold, a KV cache dtype the architecture does not support (for
+example `KV_CACHE_DTYPE=q8_0` on DeepSeek V4.1), a backend the model or this
+machine does not support, a missing, truncated or non-GGUF model file, a missing
+sidecar (DeepSeek V4.1's `deepseek41.engram.bin`), or an explicit `--draft-model`
+that cannot be activated. The native loaders' own diagnostic lines (`[dsv4] ...`,
+`[glm] ...`) may still appear above the error line; the error line repeats the
+reason so it is readable on its own. Anything else that fails during a load — a
+`NullReferenceException`, a CUDA error, an out-of-memory abort — is not a refusal
+and keeps its stack trace. One exception: the DeepSeek V4/V4.1 and GLM native
+whole-model loaders report every load they abandon as a refusal, including a
+weight or cache allocation that failed on a device, with their `[dsv4]`/`[glm]`
+line as the reason.
+
+Before exiting with `2` the server releases what the refused load left behind
+(the model service and the ggml backend) and never opens its port. A refusal's
+stack trace is noise by design, so it is only logged at Debug:
+`TENSORSHARP_LOG_LEVEL=Debug` (both hosts) or `--log-level debug` (CLI) shows it.
+
+A load that a running server is asked for does not exit the process.
+`POST /api/models/load` answers `500` with
+`{ "ok": false, "error": "<reason>", "refused": true, "loadedModel": "<file>" }`;
+the model that was loaded before is restored and named in `loadedModel`, which is
+`null` when none could be. An OpenAI or Ollama request that has to reload the
+hosted model reports the same reason in that protocol's error shape, and the
+server keeps serving.
+
 ## Server Logging
 
 The server emits one structured Information-level entry at the start and end of

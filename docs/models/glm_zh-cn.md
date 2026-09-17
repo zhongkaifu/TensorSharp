@@ -403,6 +403,24 @@ GGUF 宣称 1,048,576 token，但这并不意味着缓存放得下：78 层里�
 `MAX_CONTEXT` 则反过来：你指定的上下文是硬性要求，放得下就照办，放不下就带着数字拒绝，
 而不会在你背后悄悄缩小。
 
+在 `--tp N` 下，拒绝信息只会给出在该并行度下真正能让加载放得下的办法：一个放得下的
+`MAX_CONTEXT`、能容纳你所请求上下文的 `--n-cpu-moe` 数值，或者——当所有路由专家都放到系统
+内存后，每个 rank 复制的权重仍然太大时——改为不使用 `--tp` 运行。以下是在 2x A40 上用
+GLM-5.3-Flash UD-Q2_K_XL 实测的输出（行已截短）：
+
+```
+[glm] not enough VRAM for --tp 2: 52.5 GiB per rank of weights plus 5.5 GiB of KV and graphs
+      for a 65536-token context, against 41.2 GiB usable on the smallest rank. Re-run with
+      --n-cpu-moe 19 (keeps the routed experts of the first 19 layer(s) in system RAM).
+[glm] not enough VRAM for --tp 2: 6.4 GiB per rank of weights plus 62.3 GiB of KV and graphs
+      for a 1048576-token context, against 41.2 GiB usable on the smallest rank. Set
+      MAX_CONTEXT to 571904 or less.
+```
+
+过去这类拒绝一律以 "Lower MAX_CONTEXT (N tokens would fit) or add --n-cpu-moe N" 结尾，
+即使问题只是权重本身放不下、提示 "0 tokens would fit" 时也是如此。与所有被拒绝的加载一样，
+宿主随后会把原因作为 stderr 的最后一行再打印一次，并以退出码 2 退出（见 USAGE_zh-cn.md 的"退出码"）。
+
 ### 环境变量
 
 | 变量 | 默认值 | 含义 |

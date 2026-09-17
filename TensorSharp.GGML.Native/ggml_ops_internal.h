@@ -13,6 +13,7 @@
 #include <array>
 #include <atomic>
 #include <cmath>
+#include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -703,6 +704,17 @@ namespace tsg
 
     void set_last_error(const std::string& message);
     void clear_last_error();
+
+    // A whole-model loader declining a load (not enough VRAM, a --tp layout the
+    // devices cannot hold, a missing shard): print the line to stderr exactly as
+    // before AND keep it as the thread's last error, so the managed side can put
+    // the reason in the exception it throws instead of "see stderr". The hosts
+    // turn that exception into one error line and a documented exit code; a
+    // pointer at scrollback is useless once the process has exited.
+#if defined(__GNUC__) || defined(__clang__)
+    __attribute__((format(printf, 1, 2)))
+#endif
+    void report_load_refusal(const char* format, ...);
 
     // --- VRAM allocation diagnostics (TS_GGML_LOG_VRAM=1) ---
     //

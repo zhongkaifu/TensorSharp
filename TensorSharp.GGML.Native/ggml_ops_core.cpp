@@ -266,6 +266,43 @@ namespace tsg
         }
     }
 
+    void report_load_refusal(const char* format, ...)
+    {
+        char stack_buffer[1024];
+        va_list args;
+        va_start(args, format);
+        va_list copy;
+        va_copy(copy, args);
+        int needed = std::vsnprintf(stack_buffer, sizeof(stack_buffer), format, args);
+        va_end(args);
+
+        std::string message;
+        if (needed < 0)
+        {
+            message = format;
+        }
+        else if ((size_t) needed < sizeof(stack_buffer))
+        {
+            message.assign(stack_buffer, (size_t) needed);
+        }
+        else
+        {
+            message.resize((size_t) needed + 1);
+            std::vsnprintf(&message[0], message.size(), format, copy);
+            message.resize((size_t) needed);
+        }
+        va_end(copy);
+
+        std::fputs(message.c_str(), stderr);
+        if (message.empty() || message.back() != '\n')
+            std::fputc('\n', stderr);
+        std::fflush(stderr);
+
+        while (!message.empty() && (message.back() == '\n' || message.back() == '\r'))
+            message.pop_back();
+        set_last_error(message);
+    }
+
     void clear_last_error()
     {
         g_last_error.clear();

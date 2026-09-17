@@ -47,7 +47,17 @@ namespace TensorSharp.Models
             bool isV41 = string.Equals(arch, "deepseek41", StringComparison.Ordinal);
             if (isV41)
             {
-                DeepSeek41Architecture.ValidateLoad(ggufPath, backend, ResolveDsparkPath(draftModelPath), tpDegree, tpGroup);
+                // A refusal here would otherwise leak the GGUF mapping the base
+                // constructor opened: nobody disposes an object whose constructor threw.
+                try
+                {
+                    DeepSeek41Architecture.ValidateLoad(ggufPath, backend, ResolveDsparkPath(draftModelPath), tpDegree, tpGroup);
+                }
+                catch
+                {
+                    base.Dispose();
+                    throw;
+                }
                 // Once per load, and only here: ValidateLoad also runs as the
                 // descriptor's ApplyNativeTunables, so warning from inside it
                 // would print the same line twice.
@@ -62,7 +72,17 @@ namespace TensorSharp.Models
             // V4.1 was refused in ValidateLoad above (and once more before the
             // factory ran); plain V4 has no pre-load hook, so refuse here.
             if (!isV41)
-                DeepSeek4Architecture.RefuseBlockQuantizedKvCache("DeepSeek V4 (Flash)", v41: false);
+            {
+                try
+                {
+                    DeepSeek4Architecture.RefuseBlockQuantizedKvCache("DeepSeek V4 (Flash)", v41: false);
+                }
+                catch
+                {
+                    base.Dispose();
+                    throw;
+                }
+            }
             // Every executor of this family keeps F16 caches and ignores the
             // process-wide dtype, so report what is actually allocated rather
             // than whatever KV_CACHE_DTYPE happened to say.
@@ -145,7 +165,7 @@ namespace TensorSharp.Models
                 _nativeDsparkBlock = _handle != IntPtr.Zero && dspark != null
                     ? GgmlDeepSeek4Native.DsparkBlockSize(_handle) : 0;
                 if (_handle == IntPtr.Zero)
-                    throw new InvalidOperationException($"Failed to load {arch} model from {ggufPath} (see stderr for details).");
+                    throw NativeLoadRefused("dsv4", ggufPath);
                 // Zero for plain V4: its compressor overlaps blocks, so a rewind reads state
                 // rows an aligned target does not protect, and the native side declines.
                 _truncateAlign = GgmlDeepSeek4Native.TruncateAlign(_handle);
