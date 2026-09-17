@@ -1928,8 +1928,10 @@ public class RetainedFusedCacheTests
     /// ran on the fused path, which used to drop A's live state (A4 reused 584 of 740).
     /// A's finished state is now kept as its own retained holder when that happens.
     /// </summary>
-    [Fact]
-    public async Task InterleavedNewChat_KeepsTheLiveConversationsReuse()
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task InterleavedNewChat_KeepsTheLiveConversationsReuse(bool scoped)
     {
         await WithCheckpointsOnAsync(async () =>
         {
@@ -1937,20 +1939,21 @@ public class RetainedFusedCacheTests
             using var engine = new InferenceEngine(model, Config(), NullLogger.Instance);
 
             var prompt = Concat(SharedPrefix(), Enumerable.Repeat(7, FirstMessageLen));
-            var turn = await DrainAsync(engine.SubmitRequest(Scoped("A1", prompt, "A")));
+            var turn = await DrainAsync(engine.SubmitRequest(Scoped("A1", prompt, scoped ? "A" : null)));
             for (int t = 2; t <= 3; t++)
             {
                 prompt = Concat(prompt, turn.output, Enumerable.Repeat(PeakToken + 1, SuffixLen));
-                turn = await DrainAsync(engine.SubmitRequest(Scoped("A" + t, prompt, "A")));
+                turn = await DrainAsync(engine.SubmitRequest(Scoped("A" + t, prompt, scoped ? "A" : null)));
                 Assert.Equal(prompt.Count - SuffixLen, turn.completion.PrefixCacheReusedTokens);
             }
 
-            var b1 = await DrainAsync(engine.SubmitRequest(Scoped("B1", Concat(SharedPrefix(), Enumerable.Repeat(8, FirstMessageLen)), "B")));
+            var b1 = await DrainAsync(engine.SubmitRequest(Scoped("B1", Concat(SharedPrefix(), Enumerable.Repeat(8, FirstMessageLen)), scoped ? "B" : null)));
             Assert.Equal(SharedPrefixLen, b1.completion.PrefixCacheReusedTokens);
 
             prompt = Concat(prompt, turn.output, Enumerable.Repeat(PeakToken + 1, SuffixLen));
-            var a4 = await DrainAsync(engine.SubmitRequest(Scoped("A4", prompt, "A")));
-            Assert.Equal(prompt.Count - SuffixLen, a4.completion.PrefixCacheReusedTokens);
+            var a4 = await DrainAsync(engine.SubmitRequest(Scoped("A4", prompt, scoped ? "A" : null)));
+            // An unscoped caller keeps the old behaviour: no donation, the checkpoint only.
+            Assert.Equal(scoped ? prompt.Count - SuffixLen : SharedPrefixLen, a4.completion.PrefixCacheReusedTokens);
         });
     }
 

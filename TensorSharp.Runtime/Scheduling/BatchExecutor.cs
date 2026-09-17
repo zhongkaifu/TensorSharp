@@ -3366,6 +3366,11 @@ namespace TensorSharp.Runtime.Scheduling
             SequenceState live = _liveCacheSeq;
             if (!_liveCacheValid || live == null || _currentOwner != null)
                 return;
+            // Only a conversation can continue. An unscoped caller (a benchmark, the CLI)
+            // keeps today's behaviour: the donation moves the primary into a holder and
+            // allocates a fresh primary, a cost worth paying only for a known next turn.
+            if (live.CacheScope == null)
+                return;
             if (_model is IExactFusedCacheReuse exact && exact.SupportsExactFusedCacheReuse)
                 return;
             bool cleanStop = live.Status == SequenceStatus.FinishedAborted

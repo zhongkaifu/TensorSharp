@@ -295,8 +295,8 @@ a small LRU and re-key it when a later request exactly extends the recorded toke
 prefix. Gemma 4 retains its circular attention K/V; Qwen 3.5/3.6 retains the
 attention K/V and matching GatedDeltaNet recurrent state as one hybrid holder.
 Models that do not advertise this capability ignore the retained-cache setting.
-A request that finished on the primary (N=1) cache is kept the same way when a
-fused step takes the model over, so a conversation does not lose its state because
+A request of a scoped conversation that finished on the primary (N=1) cache is kept
+the same way when a fused step takes the model over, so a conversation does not lose its state because
 another chat arrived between two of its turns.
 
 ### Prompt reuse across requests: conversation scopes and media identity

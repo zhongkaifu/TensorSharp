@@ -264,7 +264,7 @@ GPT OSS 可用 `TS_GPTOSS_PAGED_ATTN_MANAGED=1` 强制走托管 sinks 路径。
 LRU 中；后续请求精确扩展已记录的 token 前缀时，再把该 holder 重新绑定给新请求。
 Gemma 4 保留其环形 attention K/V；Qwen 3.5/3.6 则把 attention K/V 与匹配的
 GatedDeltaNet 递归状态作为一个混合 holder 一起保留。未声明该能力的模型会忽略这组设置。
-在主（N=1）缓存上结束的请求，在 fused 步骤接管模型时也会以同样方式保留，因此不会因为
+带作用域的会话在主（N=1）缓存上结束的请求，在 fused 步骤接管模型时也会以同样方式保留，因此不会因为
 另一个会话插在它两轮之间到达而丢失自己的状态。
 
 ### 跨请求的提示复用：会话作用域与媒体身份
