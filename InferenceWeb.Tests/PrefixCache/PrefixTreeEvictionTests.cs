@@ -343,4 +343,46 @@ public class PrefixTreeEvictionTests
         PrefixTree ram = new(new PrefixTreeOptions { Capabilities = Tk.Caps(), BlockSize = B, HostRamBytes = 4000 });
         Assert.Equal(1000, ram.OptionCaps.HostKv);
     }
+
+    [Fact]
+    public void CountSubCap_EvictsTheOldestAcrossLeafAndStateLists()
+    {
+        // Review addition: the count sub-cap victim is the oldest end state of the category across
+        // both lists, not the head of whichever list happens to be scanned last (DEC-20).
+        PrefixTree t = Tk.Tree(Tk.Caps(pages: PageSupport.None), scopedMax: 2);
+        int s = Tk.Scope(t), other = Tk.Scope(t);
+        KeyRope key = Tk.Key(t, Tk.Seq(1, 80));
+        RadixNode mid = Tk.Put(t, key, 30, s, host: 1);             // oldest, becomes internal (StateLru)
+        RadixNode leaf = Tk.Put(t, key, 60, s, host: 1);            // newer (LeafLru)
+        Tk.Put(t, Tk.Key(t, Tk.Seq(300, 20)), 10, other, host: 1);  // newest scoped end state (other scope's newest leaf)
+        Assert.Equal(EvictionLists.ListId(LruKind.State, EvictionTier.Ordinary), mid.LruList);
+        Assert.Equal(EvictionLists.ListId(LruKind.Leaf, EvictionTier.ScopeNewest), leaf.LruList);
+        Assert.True(t.EnforceCountSubCaps());
+        Assert.Equal(2, t.ScopedEndStateCount);
+        Assert.Null(mid.EndState);                                  // the oldest, although it is in the other list
+        Assert.NotNull(leaf.EndState);
+        Tk.Valid(t);
+    }
+
+    [Fact]
+    public void PreemptHold_KeepsANodeInTierScopeNewest()
+    {
+        // Review addition: a node inserted by OnPreempted while its request waits is tier ScopeNewest (§5.11),
+        // even when it is not the scope's newest leaf.
+        PrefixTree t = Tk.Tree(Tk.Caps(pages: PageSupport.None));
+        int s = Tk.Scope(t);
+        RadixNode held = Tk.Put(t, Tk.Key(t, Tk.Seq(1, 20)), 10, s, host: 1, flags: NodeFlags.PreemptHold);
+        RadixNode plain = Tk.Put(t, Tk.Key(t, Tk.Seq(100, 20)), 10, s, host: 1);
+        RadixNode newest = Tk.Put(t, Tk.Key(t, Tk.Seq(200, 20)), 10, s, host: 1);
+        Assert.Equal(EvictionTier.ScopeNewest, t.TierOf(newest));
+        Assert.Equal(EvictionTier.Ordinary, t.TierOf(plain));
+        Assert.Equal(EvictionTier.ScopeNewest, t.TierOf(held));
+        Assert.Equal(EvictionLists.ListId(LruKind.Leaf, EvictionTier.ScopeNewest), held.LruList);
+        Tk.Valid(t);
+        Assert.True(t.Evict(ResourceClass.HostKv, 1, ReleaseReason.Evicted, EvictionTier.Ordinary));
+        Assert.False(plain.InTree);
+        Assert.False(t.Evict(ResourceClass.HostKv, 1, ReleaseReason.Evicted, EvictionTier.Breakpoint));
+        Assert.True(held.InTree);
+        Tk.Valid(t);
+    }
 }
