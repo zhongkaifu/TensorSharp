@@ -15,7 +15,7 @@
 // thread - fills the same page cache in large requests. Measured on the seven-A40
 // VM (tests/dsv4_file_warm_bench.cpp), 16 threads, 8 GiB of an Engram table
 // (shard 00002 @20 GiB) and 8 GiB of experts (shard 00003 @9,002,135,936), each
-// arm evicted with mincore()=0 verified, three repeats: pread 2.24-2.54 GiB/s,
+// arm evicted with mincore()=0 verified, 3-5 repeats: pread 2.24-2.54 GiB/s,
 // against 0.62-0.74 GiB/s for the 256 MiB-span prefault walk and 0.63-0.69 for
 // the 8 MiB-chunk Engram walk. A resident range re-warms (every block skipped)
 // at 64-187 GiB/s.
