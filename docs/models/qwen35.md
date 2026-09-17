@@ -377,7 +377,8 @@ itself. Two things followed:
   the image survives export, import and clone with bit-identical decode logits, and a
   version-1 file is refused. With the delta disabled the test fails: on Metal the
   image conversation's worst logit difference rises from 0.024 to 3.24 while the text
-  control stays at 0.010 (on an earlier revision of the test it failed on turn 3's
+  control stays at 0.010, and on CUDA from 2.39 to 8.11 (8.8x its 0.92 control) with a
+  turn-4 token change that is not a tie (on an earlier revision of the test it failed on turn 3's
   tokens: `...there is no roof visible. The scene depicts...` reused vs `...features...`
   cold).
 
