@@ -845,12 +845,22 @@ namespace TensorSharp.Runtime.Scheduling
             // at a time once their prompts summed past the pool). An idle cached block
             // sits in the free queue, so adopting it costs a free block like a new one.
             // Only consulted when the cheap check fails, i.e. while a request waits.
-            if (PrefixCachingActive && candidate.BlockTable.NumBlocks == 0)
-            {
-                foreach (var block in PlanPrefixBlockAdoption(candidate, logBacktrack: false, out _))
-                    if (block.RefCount > 0) need--;
-            }
-            return available >= need;
+            if (!PrefixCachingActive || candidate.BlockTable.NumBlocks != 0)
+                return false;
+            foreach (var block in PlanPrefixBlockAdoption(candidate, logBacktrack: false, out _))
+                if (block.RefCount > 0) need--;
+            if (available < need)
+                return false;
+
+            // The discount is real only if admission ends up on the pooled path. A
+            // retained fused holder is tried first and the executor backs it with new
+            // blocks for its whole prefix (TryAdoptFusedContinuation), so a model with
+            // both kinds of reuse (Gemma 4) would be admitted on a discount it never
+            // takes. Asked last, and only when the discount is what admits the request.
+            if (_fusedContinuationLcp != null && _fusedContinuationAdopt != null
+                && _fusedContinuationLcp(candidate) > 0)
+                return false;
+            return true;
         }
 
         private string _capacityWaitLoggedFor;
