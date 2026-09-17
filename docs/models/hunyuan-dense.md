@@ -8,9 +8,10 @@ releases. Before this architecture was registered, those official Q4 files
 failed at load rather than falling back to a similar family: the loader fails
 closed on an unknown architecture instead of guessing a graph.
 
-This is a first cut. It is a single-device, text-only path on the generic
-per-op executor: there is no fused whole-model graph, no tensor parallelism and
-no layer split.
+It is a single-device, text-only path on the generic per-op executor: there is
+no fused whole-model graph, no tensor parallelism and no layer split. The
+server serves it through the continuous-batching engine with a batched paged
+forward (see [Serving](#serving-continuous-batching)).
 
 | Property | Value |
 |---|---|
@@ -21,6 +22,7 @@ no layer split.
 | Modalities | Text only |
 | Thinking | No |
 | Tool calling | No — the protocol renders neither tool declarations nor `role: "tool"` results |
+| Batched / paged forward | **Default** — [`HunyuanDenseModel.BatchedForward.cs`](../../TensorSharp.Models/Models/HunyuanDense/HunyuanDenseModel.BatchedForward.cs) (`IBatchedPagedModel`); `TS_HUNYUAN_BATCHED=0` selects the K/V-snapshot swap path |
 | Speculative decoding | Not supported |
 | Multi-GPU | Single device. `MultiGpuLimitation` says so on stderr rather than leaving extra GPUs idle in silence |
 | Backends | Every backend, through the generic per-op path: `cpu`, `ggml_cpu`, `ggml_metal`, `ggml_cuda`, `ggml_vulkan`, `cuda`, `mlx` |
@@ -95,6 +97,31 @@ V3/V4 and JoyAI vocabularies: digits in runs of up to three, then CJK runs, then
 the general pattern. Folding those passes into one alternation moves boundaries
 at mixed CJK/Latin text, which is why they stay separate.
 
+## Serving (continuous batching)
+
+The server's continuous-batching engine needs a model to offer a batched paged
+forward or a K/V-state snapshot. Hunyuan Dense first shipped with neither, so
+`InferenceEngineHost.TryGetEngine` returned null and **every** chat request was
+an HTTP 500 (`Continuous-batching engine is unavailable for this model`), with
+the startup prefix-cache warm-up failing the same way. It now offers both:
+
+- **Batched paged forward (default).** One `ForwardBatch` packs every
+  scheduled token of every running request, scatters K/V into per-layer paged
+  buffers through the slot mapping and runs per-request causal attention through
+  the native paged-attention kernel (`TS_PAGED_ATTN_KERNEL`, as for Mistral 3).
+  The per-layer order is the one above: NeoX RoPE, then per-head Q/K RMSNorm.
+  A block-quantized KV cache (`q8_0`/`q4_0`) declines this path, because the
+  paged buffers are F32.
+- **K/V-state snapshot.** Every layer is full causal attention over a linear
+  cache, so `TryExtractKVBlock` / `TryInjectKVBlock` restore exactly what a
+  fresh prefill writes. With `TS_HUNYUAN_BATCHED=0` (or a block-quantized KV
+  cache) concurrent requests take turns on the single cache by swapping
+  snapshots; they are served correctly but serially.
+
+Prefix reuse works on both paths. A block the batched path wrote is adopted in
+the model's paged storage; a block the snapshot path captured is restored into
+the linear cache (see `KvBlock.HoldsModelPagedKv` / `HoldsSnapshotBytes`).
+
 ## Chat template
 
 Hy-MT2 framing always opens with BOS, and the assistant marker is appended only
@@ -120,3 +147,9 @@ instructions here, as they do for every family without a tool parser.
 - No thinking channel and no tool-call parser.
 - Single device: no tensor parallelism, no layer split, no fused whole-model
   graph, and no speculative decoding.
+- Hy-MT2-1.8B is a translation model and follows its own output habits: it
+  answers `What is 17 + 25? Reply with only the integer.` with `42.`, and on the
+  release translation fixtures it copies the input back for the
+  `structured_json` and `||`-delimited word-list prompts instead of translating
+  them. Those are model outputs, identical whether a request is served alone or
+  concurrently (see the validation notes in the commit that added serving).
