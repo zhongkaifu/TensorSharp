@@ -88,6 +88,28 @@ public class DeepSeek4LoadStageDocumentationTests
     }
 
     [Fact]
+    public void HostMoePinRow_StatesTheDeepSeekDefault_WhichTheLoaderImplements()
+    {
+        string root = RepoRoot();
+        string loader = File.ReadAllText(Path.Combine(root, "TensorSharp.GGML.Native/ggml_ops_deepseek4.cpp"));
+        Assert.Contains("dsv4_host_expert_pin_requested(getenv(\"TS_HOST_MOE_PIN\"))", loader);
+
+        var expected = new Dictionary<string, string>
+        {
+            ["docs/env_var_feature_matrix.md"] = "off for DeepSeek V4 / V4.1",
+            ["docs/env_var_feature_matrix_zh-cn.md"] = "DeepSeek V4 / V4.1 为关闭",
+        };
+        foreach ((string matrix, string defaultText) in expected)
+        {
+            MatrixRow row = MatrixRows(root, matrix).Single(r => r.Names.SequenceEqual(new[] { "TS_HOST_MOE_PIN" }));
+            Assert.Contains(defaultText, row.Text);
+            Assert.Contains("`0`", row.Text);
+        }
+        foreach (string card in new[] { "docs/models/deepseek41.md", "docs/models/deepseek41_zh-cn.md", "USAGE.md", "USAGE_zh-cn.md" })
+            Assert.Contains("TS_HOST_MOE_PIN=1", File.ReadAllText(Path.Combine(root, card)));
+    }
+
+    [Fact]
     public void ModelCards_DescribeThePreadWarmInBothLanguages()
     {
         string root = RepoRoot();

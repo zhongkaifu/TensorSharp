@@ -545,6 +545,15 @@ Engram 表花了 311.3 s。
 预取或同步 Engram 预热中的读取错误会让加载失败，并给出分片与偏移。`TS_DSV4_WARM_PREAD=0`
 原样恢复两种逐页遍历。
 
+除非设置 `TS_HOST_MOE_PIN=1`，被卸载的专家不会被页锁定。被卸载层的路由专家的每个节点都被
+指定到 CPU 后端（`build_moe_host`），而 `ggml_backend_sched` 从不覆盖这种指定，因此它的
+op-offload 规则永远不会把这些权重流式送到 GPU：跨总线的只有 `[n_embd, n_tokens]` 的激活，
+锁定的专家页从来不是 DMA 的来源。在七卡 A40 通道（`--n-cpu-moe 6`）上，锁定 48.2 GiB 让加载
+多花 20.4 s，并让这些页面在同样承载页缓存的 cgroup 中无法被回收。现在加载时会打印一行，
+说明被卸载的专家保持可分页。`TS_HOST_MOE_PIN=1` 恢复页锁定以及
+`page-locked ... GiB of host experts` 日志；`TS_HOST_MOE_PIN=0` 仍对所有架构关闭锁页。
+其他 MoE 架构的 prefill 确实会流式传输被卸载的专家，默认仍然锁页。
+
 `TS_DSV4_LOAD_DROP_CACHE=1` 在每个分块上传到设备后释放它的页缓存。它不会让加载更快（开启时
 读取线程时间 5,374 s，不开启 5,539 s，处于运行间波动之内），但加载结束时页缓存约 39 GiB 而
 不是约 330 GiB，为下一阶段要 pin 的主机专家留出空间。它默认关闭，因为在 FUSE 挂载上每次调用

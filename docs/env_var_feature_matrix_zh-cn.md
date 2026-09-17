@@ -68,7 +68,7 @@ DiffusionGemma 当前不属于已注册的 TestMatrix 功能目录：还没有 d
 | `TS_CPU_MOE` | MoE 模型 | 卸载所有层的路由专家（等价于 `TS_N_CPU_MOE=all`） | 关闭 | `0`, `1` | 否 |
 | `TS_CPU_MOE_THREADS` | MoE 模型 | 主机端专家 matmul 的工作线程数。默认是可用 CPU 并行度（硬件线程数按亲和性掩码与 cgroup CPU 配额收敛后）的一半，上限 64：decode 侧的 matmul 只有一个 token 宽，超过几十个线程后每多一个线程只是多一个屏障参与者（在双路 Xeon 上实测 192 线程比 32 线程慢 7 倍） | min(可用数/2, 64) | - | 否 |
 | `TS_HOST_MOE_DEVICE_MIN_BATCH` | 启用卸载的 MoE 模型 | 达到或超过该 batch 大小时，被卸载的层改为在加速器上计算、专家权重流式送入，而不是在主机上算。`0` 恢复纯主机卸载 | `128` | `0`, `32`, `128` | 否 |
-| `TS_HOST_MOE_PIN` | 启用卸载的 MoE 模型 | 把被卸载的专家区间页锁定（`cudaHostRegister`），使流式 prefill 走 DMA 而不是经驱动中转（PCIe 5.0 上 9.3 → 55.6 GB/s） | 启用 | `0`, `1` | 否 |
+| `TS_HOST_MOE_PIN` | 启用卸载的 MoE 模型 | 把被卸载的专家区间页锁定（`cudaHostRegister`），使流式 prefill 走 DMA 而不是经驱动中转（PCIe 5.0 上 9.3 → 55.6 GB/s）。`0` 对所有架构关闭。DeepSeek V4 / V4.1 的默认值是例外：它们的加载器在任何批大小下都在 CPU 后端上计算被卸载的专家，没有任何流式传输，因此只有 `1` 时才锁页（七卡 A40 通道上锁定 48.2 GiB 让加载多花 20.4 s，并使这些页面无法被回收） | 启用；DeepSeek V4 / V4.1 为关闭 | `0`, `1` | 否 |
 | `TS_HOST_MOE_PIN_MAX_MB` | 启用卸载的 MoE 模型 | 页锁定专家区间的预算 | cgroup / 主机内存上限的 60% | - | 否 |
 | `TS_HOST_MOE_EXPERT_FILTER` | 启用卸载的 MoE 模型 | 只流式传输该 batch 实际路由到的专家，并合并成连续区间 | 启用 | `0`, `1` | 否 |
 | `MAX_CONTEXT` | 长文本 / 上传文本 | 硬上下文上限。设置了就是硬性要求：缓存放得下就照办，放不下就带着数字拒绝。不设置时，GGUF 宣称的长度只是上限，加载器会按设备真正装得下的量来定——GLM-5.2 宣称 1M token，那是约 93 GiB 的 KV | 模型默认值（是上限而非承诺） | `4096`, `8192`, `16384` | 是 |

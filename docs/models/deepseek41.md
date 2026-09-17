@@ -660,6 +660,19 @@ A read error in the prefault or the synchronous Engram warm fails the load and
 names the shard and offset. `TS_DSV4_WARM_PREAD=0` restores both page walks
 exactly.
 
+The offloaded experts are not page-locked unless `TS_HOST_MOE_PIN=1`. Every node
+of an offloaded layer's routed experts is assigned to the CPU backend
+(`build_moe_host`), and `ggml_backend_sched` never overrides that assignment, so
+its op-offload rule never streams those weights to a GPU: only the
+`[n_embd, n_tokens]` activations cross the bus, and a pinned expert is never a
+DMA source. On the seven-A40 lane (`--n-cpu-moe 6`) the page-lock added 20.4 s
+to the load for 48.2 GiB and made those pages unevictable in the same cgroup
+that holds the page cache. The load now prints one line saying the offloaded
+experts stay pageable. `TS_HOST_MOE_PIN=1` restores the page-lock and its
+`page-locked ... GiB of host experts` line; `TS_HOST_MOE_PIN=0` still disables
+pinning for every architecture. The other MoE architectures, whose prefill does
+stream offloaded experts, keep pinning by default.
+
 `TS_DSV4_LOAD_DROP_CACHE=1` releases each chunk's page cache once it is on the
 device. It does not make the load faster (5,374 s of read thread-time with it
 against 5,539 s without, inside the run-to-run spread) but it ends the load with

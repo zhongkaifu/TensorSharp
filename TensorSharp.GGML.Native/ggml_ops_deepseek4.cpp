@@ -1381,20 +1381,28 @@ static void dsv4_pin_host_experts(dsv4_model & loaded, int n_cpu_moe)
 {
     dsv4_model * const m = &loaded;
     const dsv4_hparams & hp = m->hp;
-    // Page-lock the offloaded experts. DSV4 hands its offloaded layers to
-    // ggml_backend_sched, which — with op_offload on — sends their
-    // mul_mat_id back to the GPU for a prefill-sized batch and streams the
-    // weights over for that one graph. Those copies come out of a PAGEABLE
-    // host buffer, which cannot DMA: measured 9.3 GB/s against 55.6 GB/s
-    // once the range is registered (PCIe 5.0 x16). Registering costs
-    // ~65 ms/GiB, once, here rather than in the middle of the first prompt.
-    // Failures (no budget, driver refusal) are silent and simply leave the
-    // slower path in place — see host_pin_range.
-    //
+    // Page-locking the offloaded experts buys nothing here, so it is off unless
+    // TS_HOST_MOE_PIN=1 asks for it. build_moe_host assigns EVERY node of an
+    // offloaded layer's routed experts to the CPU backend (mul_mat_id up, gate
+    // and down, clamp, swiglu, mul and the expert adds), and
+    // ggml_backend_sched never overrides a user assignment, so its op_offload
+    // rule never streams the expert weights to a GPU: only [n_embd, n_tokens]
+    // activations cross the bus. A pinned expert is therefore never a DMA
+    // source. Registering them cost 20.4 s for 48.2 GiB on the seven-A40 lane
+    // (--n-cpu-moe 6) and made those pages unevictable inside the cgroup the
+    // page cache lives in. ggml_ops_moe.cpp, which really streams offloaded
+    // experts for the other MoE architectures, keeps pinning by default.
+    if (n_cpu_moe > 0 && !tsg_dsv4::dsv4_host_expert_pin_requested(getenv("TS_HOST_MOE_PIN")))
+    {
+        fprintf(stderr, "[dsv4] host experts of %d offloaded layer(s) run on the CPU backend and stay pageable "
+                        "(TS_HOST_MOE_PIN=1 registers them with the GPU driver)\n", n_cpu_moe);
+        return;
+    }
     // Not when the mmapped experts outweigh the host allowance: registering
     // faults the pages in at storage speed (minutes on a network FS) and
     // every pinned page is one the kernel can no longer evict, which is
-    // exactly the headroom an over-committed page cache lives on.
+    // exactly the headroom an over-committed page cache lives on. Failures
+    // (no budget, driver refusal) leave the pages pageable; see host_pin_range.
     const bool experts_over_allowance = m->mmap_weight_bytes > 0 &&
         [&]{ const size_t a = dsv4_host_mem_allowance();
              return a > 0 && m->mmap_weight_bytes + (size_t) 8 * 1024 * 1024 * 1024 > a; }();
@@ -1415,7 +1423,8 @@ static void dsv4_pin_host_experts(dsv4_model & loaded, int n_cpu_moe)
         }
         if (pinned > 0)
         {
-            fprintf(stderr, "[dsv4] page-locked %.1f GiB of host experts in %.1fs (streamed prefill DMAs at full link speed)\n",
+            fprintf(stderr, "[dsv4] page-locked %.1f GiB of host experts in %.1fs (TS_HOST_MOE_PIN=1; they compute on the CPU backend, "
+                            "so this speeds up no transfer)\n",
                     pinned / 1073741824.0,
                     std::chrono::duration<double>(std::chrono::steady_clock::now() - t_pin).count());
         }
