@@ -333,6 +333,17 @@ edited renders from its own text. Before this, the stateless APIs shared one tra
 history and spliced another client's generated turn over a client's own message.
 Concurrent conversations no longer overwrite each other's records.
 
+For a stateless request this is proof by content, and it has a residual. A request
+that reproduces ANY earlier generated turn of a conversation - not only its latest -
+continues that conversation's scope, including state its later turns left behind, and
+a deterministic (greedy) reply can be reproduced outside this server. Such a request
+reuses only tokens it sent itself, but `cached_tokens` then reflects how far its
+prompt matches that conversation's later turns: whole 256-token blocks on the pooled
+path, the last few tokens of a holder on Gemma 4, further on models with exact native
+rewinds (DeepSeek V4.1). Clients that need strict isolation use a Web UI / TensorAgent
+`sessionId`; a per-request cache key and the radix tree's leaf rule (SYNTHESIS S5.3)
+close this for stateless APIs.
+
 **Media identity.** Each image, video frame (pair) and audio clip is identified by the
 SHA-256 of its bytes. Base64 attachments (OpenAI `image_url`, Responses
 `input_image`, Ollama `images`, audio) are stored as `<sha256>.<ext>` and written
