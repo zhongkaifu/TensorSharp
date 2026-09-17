@@ -499,6 +499,51 @@ public class Qwen35TokenDecodeContractTests
             Marshal.OffsetOf<Qwen35LayerDecodeArgs>(nameof(Qwen35LayerDecodeArgs.FfnGateNe0)).ToInt64());
     }
 
+    /// <summary>
+    /// Every fused Qwen3.5 graph rotates at the RoPE position, not the KV index: the
+    /// solo decode adds rope_pos_delta, the verify adds it to its scalar positions,
+    /// and the arena reads rope_positions. A sequence past an image has a non-zero
+    /// M-RoPE delta, so a site that went back to the KV index would silently decode
+    /// at the pre-fix positions (Qwen35ImageFollowUpExactnessTests is the model-gated
+    /// proof; this is the portable guard).
+    /// </summary>
+    [Fact]
+    public void NativeFusedGraphs_RotateAtTheRopePositionNotTheKvIndex()
+    {
+        string Read(string file) => File.ReadAllText(Path.Combine(
+            FindRepositoryRoot(), "TensorSharp.GGML.Native", file)).ReplaceLineEndings("\n");
+
+        string decode = Read("ggml_ops_qwen35_decode.cpp");
+        // The whole-model decode (the per-layer TSGgml_Qwen35AttentionLayerDecode still
+        // rotates at its KV index; the managed caller refuses it past an image).
+        int implStart = decode.IndexOf("int qwen35_model_decode_impl(", StringComparison.Ordinal);
+        int implEnd = decode.IndexOf("TSG_EXPORT int TSGgml_Qwen35ModelDecode(", StringComparison.Ordinal);
+        Assert.True(implStart >= 0 && implEnd > implStart);
+        string solo = decode[implStart..implEnd];
+        Assert.DoesNotContain("pos_val = position;", solo);
+        Assert.Equal(2, solo.Split("std::int32_t pos_val = position + rope_pos_delta;").Length - 1);
+        Assert.Contains("TSG_EXPORT int TSGgml_Qwen35RopePositionAbi()", decode);
+
+        string verify = Read("ggml_ops_qwen35_verify.cpp");
+        Assert.DoesNotContain("pv[i] = start_pos + i;", verify);
+        Assert.DoesNotContain("pos_vals[i] = start_pos + i;", verify);
+        Assert.Contains("pv[i] = start_pos + rope_pos_delta + i;", verify);
+        Assert.Contains("pos_vals[i] = start_pos + rope_pos_delta + i;", verify);
+
+        string arena = Read("ggml_ops_qwen35_batched_arena.cpp");
+        Assert.DoesNotContain("e.pos_stage[s] = positions[i];", arena);
+        Assert.Contains("e.pos_stage[s] = rope_positions != nullptr ? rope_positions[i] : positions[i];", arena);
+    }
+
+    [Fact]
+    public void Qwen35_ReusesAcrossMedia_AndCheckpointFilesCarryTheDelta()
+    {
+        var model = (Qwen35Model)System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(Qwen35Model));
+        Assert.True(model.SupportsReuseAcrossMediaSpan);
+        // Version 2 adds the M-RoPE delta; a version-1 file is refused on import.
+        Assert.Equal(2, Qwen35Model.CheckpointFileVersion);
+    }
+
     private static string FindRepositoryRoot()
     {
         var dir = new DirectoryInfo(AppContext.BaseDirectory);

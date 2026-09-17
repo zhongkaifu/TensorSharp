@@ -356,7 +356,7 @@ namespace
 
     int qwen35_model_verify_impl(
         const TSGgmlQwen35LayerDesc* layers, int num_layers,
-        void* hidden_data, int hidden_size, int start_pos, int num_tokens,
+        void* hidden_data, int hidden_size, int start_pos, int num_tokens, int rope_pos_delta,
         int num_heads, int num_kv_heads, int head_dim, int cache_size,
         int rope_n_dims, int rope_mode, int kv_cache_type,
         int conv_kernel, int head_k_dim, int head_v_dim, int num_k_heads, int num_v_heads,
@@ -632,7 +632,8 @@ namespace
                 ggml_backend_tensor_set(c.hidden_t, hidden_data, 0, static_cast<std::size_t>(H) * N * sizeof(float));
                 std::vector<std::int32_t> pv(N);
                 std::vector<std::int64_t> kv(N);
-                for (int i = 0; i < N; i++) { pv[i] = start_pos + i; kv[i] = start_pos + i; }
+                // RoPE positions carry the sequence's M-RoPE delta; KV rows do not.
+                for (int i = 0; i < N; i++) { pv[i] = start_pos + rope_pos_delta + i; kv[i] = start_pos + i; }
                 // An all-recurrent graph has no attention inputs. Its private
                 // gallocr leaves these unused context tensors unallocated.
                 if (c.pos_t->buffer != nullptr)
@@ -1924,7 +1925,7 @@ namespace
         else if (pos_tensor->buffer != nullptr)
         {
             std::vector<std::int32_t> pos_vals(N);
-            for (int i = 0; i < N; i++) pos_vals[i] = start_pos + i;
+            for (int i = 0; i < N; i++) pos_vals[i] = start_pos + rope_pos_delta + i;
             ggml_backend_tensor_set(pos_tensor, pos_vals.data(), 0, static_cast<std::size_t>(N) * sizeof(std::int32_t));
         }
         if (uses_dynamic_kv_index && kv_index->buffer != nullptr)
@@ -2293,7 +2294,7 @@ namespace
 
 TSG_EXPORT int TSGgml_Qwen35ModelVerifyOwned(
     const TSGgmlQwen35LayerDesc* layers, int num_layers,
-    void* hidden_data, int hidden_size, int start_pos, int num_tokens,
+    void* hidden_data, int hidden_size, int start_pos, int num_tokens, int rope_pos_delta,
     int num_heads, int num_kv_heads, int head_dim, int cache_size,
     int rope_n_dims, int rope_mode, int kv_cache_type,
     int conv_kernel, int head_k_dim, int head_v_dim, int num_k_heads, int num_v_heads,
@@ -2324,7 +2325,7 @@ TSG_EXPORT int TSGgml_Qwen35ModelVerifyOwned(
         }
         std::lock_guard<std::recursive_mutex> lock(q35v_mutex());
         int r = qwen35_model_verify_impl(
-            layers, num_layers, hidden_data, hidden_size, start_pos, num_tokens,
+            layers, num_layers, hidden_data, hidden_size, start_pos, num_tokens, rope_pos_delta,
             num_heads, num_kv_heads, head_dim, cache_size,
             rope_n_dims, rope_mode, kv_cache_type,
             conv_kernel, head_k_dim, head_v_dim, num_k_heads, num_v_heads,
@@ -2364,7 +2365,7 @@ TSG_EXPORT int TSGgml_Qwen35ModelVerify(
     int defer_state_download)
 {
     return TSGgml_Qwen35ModelVerifyOwned(
-        layers, num_layers, hidden_data, hidden_size, start_pos, num_tokens,
+        layers, num_layers, hidden_data, hidden_size, start_pos, num_tokens, /*rope_pos_delta=*/0,
         num_heads, num_kv_heads, head_dim, cache_size,
         rope_n_dims, rope_mode, kv_cache_type,
         conv_kernel, head_k_dim, head_v_dim, num_k_heads, num_v_heads,

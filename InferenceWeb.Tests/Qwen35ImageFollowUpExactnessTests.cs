@@ -1,0 +1,498 @@
+// Copyright (c) Zhongkai Fu. All rights reserved.
+// https://github.com/zhongkaifu/TensorSharp
+//
+// This file is part of TensorSharp.
+//
+// TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
+//
+// Reuse past an image on Qwen 3.5 against REAL weights: a conversation
+// text -> image -> text -> text whose turns continue the cache must produce the
+// tokens (and, within tolerance, the logits) a cold prefill of the same prompts
+// produces. Before the M-RoPE delta, decode after an image ran at the absolute KV
+// index while a re-prefill used the compressed positions, so the two diverged and
+// every reuse path had to stop at the first image.
+//
+// Three parts:
+//  A. The engine. Turns 3 and 4 must reuse past the image (the whole previous turn),
+//     and every turn's greedy tokens must equal a cold engine's.
+//  B. The model directly, where logits are observable: a turn built by prefilling the
+//     previous prompt, DECODING its reply and prefilling the new suffix, against a cold
+//     prefill of the whole new prompt - logits within the tolerance below, same argmax,
+//     for the first token and each of the following greedy steps.
+//  C. A checkpoint of a cache that went through an image (non-zero delta), exported to
+//     bytes, imported and cloned into a holder, decodes exactly like the cache it was
+//     taken from; a version-1 file is refused.
+//
+// Opt-in:
+//   TS_TEST_MODEL_DIR=<dir with Qwen3.5-9B*.gguf and its mmproj>
+//   TS_TEST_QWEN35_MMPROJ=<mmproj path>   (optional when the dir holds one Qwen3.5-9B mmproj)
+//   TS_TEST_QWEN35_IMAGE=<image path>     (optional; a synthetic picture otherwise)
+//   TS_TEST_GGML_BACKEND=metal|cuda|cpu
+//   TS_TEST_QWEN35_LOGIT_TOLERANCE=<max |dlogit|>  (optional; see LogitTolerance)
+using System.Diagnostics;
+using ImageMagick;
+using Microsoft.Extensions.Logging.Abstractions;
+using TensorSharp;
+using TensorSharp.Models;
+using TensorSharp.Runtime;
+using TensorSharp.Runtime.Scheduling;
+using Xunit.Abstractions;
+
+namespace InferenceWeb.Tests;
+
+public class Qwen35ImageFollowUpExactnessTests
+{
+    private const string EnvModelDir = "TS_TEST_MODEL_DIR";
+    private const string ModelPattern = "qwen3.5-9b-q8_0|qwen3.5-9b";
+    private const int EngineNewTokens = 24;
+    private const int DirectSteps = 12;
+    private readonly ITestOutputHelper _output;
+
+    public Qwen35ImageFollowUpExactnessTests(ITestOutputHelper output) { _output = output; }
+
+    /// <summary>
+    /// The documented bound for reuse-vs-cold logits on one backend: the reused turn's
+    /// reply rows were written by the decode graph and the cold turn's by the prefill
+    /// graph, which are different kernels (flash-attention decode vs batched prefill
+    /// attention, NeoX vs interleaved M-RoPE on equal axes), so the logits are close,
+    /// not bit-identical. docs/models/qwen35.md records the measured values.
+    /// </summary>
+    private static float LogitTolerance =>
+        float.TryParse(Environment.GetEnvironmentVariable("TS_TEST_QWEN35_LOGIT_TOLERANCE"),
+            System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out float t)
+            ? t : 0.5f;
+
+    [ModelFact(EnvModelDir, ModelPattern)]
+    public async Task ReuseAfterAnImage_MatchesColdPrefill()
+    {
+        using var ctx = Context.Open(_output);
+        if (ctx == null) return;
+
+        // ---------- A. the engine ----------
+        var turns = new List<Turn>();
+        var reuseOutputs = new List<List<int>>();
+        var reused = new List<int>();
+        using (var engine = new InferenceEngine(ctx.Model, Config(), NullLogger.Instance))
+        {
+            List<int> previous = null;
+            List<int> previousOut = null;
+            for (int k = 0; k < 4; k++)
+            {
+                var turn = ctx.BuildTurn(k, previous, previousOut);
+                turns.Add(turn);
+                var (completion, output) = await ctx.GenerateAsync(engine, turn, $"reuse-{k}");
+                reuseOutputs.Add(output);
+                reused.Add(completion.PrefixCacheReusedTokens);
+                _output.WriteLine($"[reuse t{k + 1}] prompt {turn.Expanded.Count} reused {completion.PrefixCacheReusedTokens} " +
+                                  $"({100.0 * completion.PrefixCacheReusedTokens / turn.Expanded.Count:F1}%): {ctx.Decode(output)}");
+                previous = turn.Unexpanded;
+                previousOut = output;
+            }
+        }
+
+        for (int k = 0; k < 4; k++)
+        {
+            using var engine = new InferenceEngine(ctx.Model, Config(), NullLogger.Instance);
+            var (completion, output) = await ctx.GenerateAsync(engine, turns[k], $"cold-{k}");
+            Assert.Equal(0, completion.PrefixCacheReusedTokens);
+            _output.WriteLine($"[cold  t{k + 1}] {ctx.Decode(output)}");
+            Assert.True(reuseOutputs[k].SequenceEqual(output),
+                $"turn {k + 1}: reused and cold greedy tokens differ\n reuse {string.Join(",", reuseOutputs[k])}\n cold  {string.Join(",", output)}");
+        }
+
+        int imageEnd = turns[1].ImageSpanEnd;
+        Assert.True(imageEnd > 0, "turn 2 carries the image");
+        for (int k = 2; k < 4; k++)
+        {
+            int previousCached = turns[k - 1].Expanded.Count + reuseOutputs[k - 1].Count - 1;
+            Assert.True(reused[k] > imageEnd,
+                $"turn {k + 1} reused {reused[k]} tokens, which stops before the image ends at {imageEnd}");
+            Assert.True(reused[k] >= previousCached,
+                $"turn {k + 1} reused {reused[k]} tokens; the previous turn left {previousCached} in the cache");
+        }
+
+        // ---------- B. the model, logits ----------
+        var model = ctx.Model;
+        float worst = 0;
+        for (int k = 1; k < 4; k++)
+        {
+            var cold = ctx.RunDirect(turns[k], prefix: null, prefixOutput: null, DirectSteps);
+            var warm = ctx.RunDirect(turns[k], turns[k - 1], reuseOutputs[k - 1], DirectSteps);
+            Assert.Equal(cold.Tokens, warm.Tokens);
+            for (int s = 0; s < cold.Logits.Count; s++)
+            {
+                float d = MaxAbsDiff(cold.Logits[s], warm.Logits[s]);
+                worst = Math.Max(worst, d);
+                Assert.Equal(ArgMax(cold.Logits[s]), ArgMax(warm.Logits[s]));
+                Assert.True(d <= LogitTolerance,
+                    $"turn {k + 1} step {s}: max |dlogit| {d} exceeds {LogitTolerance}");
+            }
+            _output.WriteLine($"[direct t{k + 1}] suffix {turns[k].Expanded.Count - (turns[k - 1].Expanded.Count + reuseOutputs[k - 1].Count - 1)} tokens, " +
+                              $"{cold.Logits.Count} steps, max |dlogit| per step: " +
+                              string.Join(" ", cold.Logits.Select((l, s) => MaxAbsDiff(l, warm.Logits[s]).ToString("F4"))));
+        }
+        _output.WriteLine($"[direct] worst max |dlogit| {worst:F5} (tolerance {LogitTolerance})");
+
+        // ---------- C. a checkpoint through an image, to bytes and back ----------
+        if (model is IBatchedPagedModel paged && paged.SupportsRetainedCacheSerialization)
+            ctx.CheckpointRoundTrip(paged, turns[2], reuseOutputs[2]);
+        else
+            _output.WriteLine("[checkpoint] backend has no serializable checkpoints; part C not run");
+    }
+
+    private static SchedulerConfig Config() => new()
+    {
+        MaxNumBatchedTokens = 4096,
+        MaxNumRunningSequences = 4,
+        MaxPrefillChunkSize = 1024,
+        SoloPrefillChunkSize = 1024,
+        NumBlocks = 128,
+        BlockSize = 256,
+        EnablePrefixCaching = true,
+        DecodeQuantumTokens = 256,
+    };
+
+    private static float MaxAbsDiff(float[] a, float[] b)
+    {
+        float m = 0;
+        for (int i = 0; i < a.Length; i++) m = Math.Max(m, Math.Abs(a[i] - b[i]));
+        return m;
+    }
+
+    private static int ArgMax(float[] a)
+    {
+        int best = 0;
+        for (int i = 1; i < a.Length; i++) if (a[i] > a[best]) best = i;
+        return best;
+    }
+
+    private sealed record Turn(int Index, List<int> Unexpanded, List<int> Expanded, List<ChatMessage> History, int ImageSpanEnd);
+
+    private sealed class DirectRun
+    {
+        public List<int> Tokens { get; } = new();
+        public List<float[]> Logits { get; } = new();
+    }
+
+    private sealed class Context : IDisposable
+    {
+        private readonly ITestOutputHelper _output;
+        private readonly string _tempDir;
+        private readonly string _image;
+        private int _prepSerial;
+
+        public ModelBase Model { get; }
+
+        private Context(ITestOutputHelper output, ModelBase model, string image, string tempDir)
+        {
+            _output = output;
+            Model = model;
+            _image = image;
+            _tempDir = tempDir;
+        }
+
+        public static Context Open(ITestOutputHelper output)
+        {
+            string dir = Environment.GetEnvironmentVariable(EnvModelDir);
+            string modelPath = dir == null ? null : TestGates.FindGguf(dir, ModelPattern);
+            if (modelPath == null) { output.WriteLine("no Qwen3.5-9B model; skipping"); return null; }
+            string mmproj = Environment.GetEnvironmentVariable("TS_TEST_QWEN35_MMPROJ");
+            if (string.IsNullOrEmpty(mmproj))
+            {
+                var candidates = Directory.GetFiles(Path.GetDirectoryName(modelPath)!, "*.gguf")
+                    .Where(p => Path.GetFileName(p).Contains("mmproj", StringComparison.OrdinalIgnoreCase))
+                    .ToList();
+                mmproj = candidates.FirstOrDefault(p => Path.GetFileName(p).Contains("Qwen3.5-9B", StringComparison.OrdinalIgnoreCase))
+                    ?? (candidates.Count == 1 ? candidates[0] : null);
+            }
+            Assert.True(mmproj != null && File.Exists(mmproj),
+                "The Qwen3.5-9B vision projector was not found: set TS_TEST_QWEN35_MMPROJ.");
+
+            BackendType backend = (Environment.GetEnvironmentVariable("TS_TEST_GGML_BACKEND") ?? "cpu")
+                .Trim().ToLowerInvariant() switch
+            {
+                "metal" => BackendType.GgmlMetal,
+                "cuda" => BackendType.GgmlCuda,
+                _ => BackendType.GgmlCpu,
+            };
+
+            string temp = Path.Combine(Path.GetTempPath(), "q35-img-exact-" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(temp);
+            string image = Environment.GetEnvironmentVariable("TS_TEST_QWEN35_IMAGE");
+            if (string.IsNullOrEmpty(image))
+                image = WriteSyntheticImage(Path.Combine(temp, "scene.png"));
+
+            var sw = Stopwatch.StartNew();
+            var model = ModelBase.Create(modelPath, backend);
+            model.MultimodalInjector.LoadProjectors(mmproj);
+            output.WriteLine($"model {Path.GetFileName(modelPath)} + {Path.GetFileName(mmproj)} on {backend}, image {image}, loaded in {sw.Elapsed.TotalSeconds:F1}s");
+            return new Context(output, model, image, temp);
+        }
+
+        private static string WriteSyntheticImage(string path)
+        {
+            // Something to describe: a sky, a sun, a house and a lawn.
+            using var img = new MagickImage(new MagickColor("#87CEEB"), 448, 336);
+            new ImageMagick.Drawing.Drawables()
+                .FillColor(new MagickColor("#2E8B57")).Rectangle(0, 240, 448, 336)
+                .FillColor(new MagickColor("#FFD700")).Circle(370, 70, 370, 110)
+                .FillColor(new MagickColor("#B22222")).Rectangle(120, 150, 260, 250)
+                .FillColor(new MagickColor("#8B4513")).Polygon(new PointD(110, 150), new PointD(190, 90), new PointD(270, 150))
+                .Draw(img);
+            img.Write(path, MagickFormat.Png);
+            return path;
+        }
+
+        private int Special(string token)
+        {
+            int id = Model.Tokenizer.LookupToken(token);
+            Assert.True(id >= 0, $"the tokenizer has no {token} token");
+            return id;
+        }
+
+        private List<int> Text(string text) => Model.Tokenizer.Encode(text, addSpecial: false);
+
+        private static readonly string[] UserTexts =
+        {
+            "Name three primary colors, one per line.",
+            "Describe the picture in two sentences.",
+            "What color is the roof in the picture, and why might that color be chosen?",
+            "Now suggest a short title for the picture.",
+        };
+
+        /// <summary>Turn <paramref name="k"/>'s prompt at the token level: the previous
+        /// prompt, the previous reply's raw tokens (closed with im_end when it did not
+        /// end there) and the new user message with the generation prompt. Turn 2
+        /// carries the image. Token-level concatenation makes every turn an exact
+        /// extension of the one before, which is what reuse needs.</summary>
+        public Turn BuildTurn(int k, List<int> previous, List<int> previousOutput)
+        {
+            int imStart = Special("<|im_start|>"), imEnd = Special("<|im_end|>");
+            var tokens = new List<int>();
+            if (previous == null)
+            {
+                tokens.Add(imStart);
+                tokens.AddRange(Text("system\nYou are a helpful assistant. Answer briefly."));
+                tokens.Add(imEnd);
+                tokens.AddRange(Text("\n"));
+            }
+            else
+            {
+                tokens.AddRange(previous);
+                tokens.AddRange(previousOutput);
+                if (previousOutput.Count == 0 || previousOutput[^1] != imEnd)
+                    tokens.Add(imEnd);
+                tokens.AddRange(Text("\n"));
+            }
+            tokens.Add(imStart);
+            tokens.AddRange(Text("user\n"));
+            var history = new List<ChatMessage>();
+            if (k >= 1)
+                history.Add(new ChatMessage { Role = "user", Content = UserTexts[1], ImagePaths = new List<string> { _image } });
+            if (k == 1)
+            {
+                tokens.Add(Special("<|vision_start|>"));
+                tokens.Add(Special("<|image_pad|>"));
+                tokens.Add(Special("<|vision_end|>"));
+            }
+            tokens.AddRange(Text(UserTexts[k]));
+            tokens.Add(imEnd);
+            tokens.AddRange(Text("\n"));
+            tokens.Add(imStart);
+            tokens.AddRange(Text("assistant\n"));
+            int thinkOpen = Model.Tokenizer.LookupToken("<think>");
+            int thinkClose = Model.Tokenizer.LookupToken("</think>");
+            if (thinkOpen >= 0 && thinkClose >= 0)
+            {
+                tokens.Add(thinkOpen);
+                tokens.AddRange(Text("\n\n"));
+                tokens.Add(thinkClose);
+                tokens.AddRange(Text("\n\n"));
+            }
+
+            string probe = $"turn-probe-{k}-{_prepSerial++}";
+            List<int> expanded;
+            int imageEnd = 0;
+            lock (Model.GpuComputeLock)
+            {
+                expanded = history.Count == 0
+                    ? new List<int>(tokens)
+                    : Model.MultimodalInjector.ProcessPromptTokens(history, new List<int>(tokens), probe);
+                foreach (var span in Model.MultimodalInjector.GetPreparedMediaSpans(probe))
+                    imageEnd = Math.Max(imageEnd, span.End);
+                Model.MultimodalInjector.ClearPreparedPromptState(probe);
+            }
+            return new Turn(k, tokens, expanded, history, imageEnd);
+        }
+
+        /// <summary>Prepare <paramref name="turn"/> for one request: expanded tokens and
+        /// media spans in the injector bucket <paramref name="requestId"/>.</summary>
+        private (List<int> Tokens, IReadOnlyList<PromptMediaSpan> Spans) Prepare(Turn turn, string requestId)
+        {
+            lock (Model.GpuComputeLock)
+            {
+                if (turn.History.Count == 0)
+                    return (new List<int>(turn.Unexpanded), Array.Empty<PromptMediaSpan>());
+                var tokens = Model.MultimodalInjector.ProcessPromptTokens(turn.History, new List<int>(turn.Unexpanded), requestId);
+                Assert.Equal(turn.Expanded, tokens);
+                return (tokens, Model.MultimodalInjector.GetPreparedMediaSpans(requestId));
+            }
+        }
+
+        public async Task<(InferenceCompletion completion, List<int> output)> GenerateAsync(
+            InferenceEngine engine, Turn turn, string requestId)
+        {
+            var (tokens, spans) = Prepare(turn, requestId);
+            try
+            {
+                var seq = new SequenceState(requestId, tokens, EngineNewTokens, 256, SamplingConfig.Greedy,
+                    mediaSpans: spans, cacheScope: "q35-image-conversation");
+                var handle = engine.SubmitRequest(seq);
+                var output = new List<int>();
+                await foreach (int t in handle.Tokens.ReadAllAsync())
+                    output.Add(t);
+                var completion = await handle.Completion;
+                return (completion, output);
+            }
+            finally
+            {
+                Model.MultimodalInjector.ClearPreparedPromptState(requestId);
+            }
+        }
+
+        private float[] ForwardSlice(List<int> tokens, int start, int count, string requestId)
+        {
+            Model.MultimodalInjector.QueuePromptEmbeddingsForSlice(start, count, requestId);
+            return (float[])Model.Forward(tokens.GetRange(start, count).ToArray()).Clone();
+        }
+
+        /// <summary>Greedy steps of <paramref name="turn"/> straight on the model. With a
+        /// <paramref name="prefix"/>, the cache is first built the way a conversation
+        /// builds it - the previous prompt prefilled, its reply DECODED token by token
+        /// (all but the last sampled token) - and only the new suffix is prefilled.</summary>
+        public DirectRun RunDirect(Turn turn, Turn prefix, List<int> prefixOutput, int steps)
+        {
+            var run = new DirectRun();
+            string id = $"direct-{turn.Index}-{_prepSerial++}";
+            string prefixId = $"direct-prefix-{turn.Index}-{_prepSerial++}";
+            var (tokens, _) = Prepare(turn, id);
+            try
+            {
+                lock (Model.GpuComputeLock)
+                {
+                    Model.ResetKVCache();
+                    int cached = 0;
+                    if (prefix != null)
+                    {
+                        var (prefixTokens, _) = Prepare(prefix, prefixId);
+                        ForwardSlice(prefixTokens, 0, prefixTokens.Count, prefixId);
+                        for (int i = 0; i < prefixOutput.Count - 1; i++)
+                            Model.Forward(new[] { prefixOutput[i] });
+                        cached = prefixTokens.Count + prefixOutput.Count - 1;
+                        for (int i = 0; i < cached; i++)
+                        {
+                            int expected = i < prefixTokens.Count ? prefixTokens[i] : prefixOutput[i - prefixTokens.Count];
+                            Assert.Equal(expected, tokens[i]);
+                        }
+                    }
+                    float[] logits = ForwardSlice(tokens, cached, tokens.Count - cached, id);
+                    for (int s = 0; s < steps; s++)
+                    {
+                        run.Logits.Add(logits);
+                        int next = ArgMax(logits);
+                        run.Tokens.Add(next);
+                        if (s + 1 < steps)
+                            logits = (float[])Model.Forward(new[] { next }).Clone();
+                    }
+                }
+            }
+            finally
+            {
+                Model.MultimodalInjector.ClearPreparedPromptState(id);
+                Model.MultimodalInjector.ClearPreparedPromptState(prefixId);
+            }
+            return run;
+        }
+
+        /// <summary>Part C: checkpoint the primary cache after an image turn (non-zero
+        /// M-RoPE delta), continue the primary as the reference, then export the
+        /// checkpoint, import it under a new key, clone it into a holder and decode the
+        /// same tokens there.</summary>
+        public void CheckpointRoundTrip(IBatchedPagedModel paged, Turn turn, List<int> reply)
+        {
+            string id = $"ckpt-{_prepSerial++}";
+            var (tokens, _) = Prepare(turn, id);
+            try
+            {
+                lock (Model.GpuComputeLock)
+                {
+                    Model.ResetKVCache();
+                    ForwardSlice(tokens, 0, tokens.Count, id);
+                    for (int i = 0; i < 4 && i < reply.Count - 1; i++)
+                        Model.Forward(new[] { reply[i] });
+                    Assert.True(paged.TryCheckpointActiveCache("q35-img-ckpt"), "checkpoint of the primary cache");
+
+                    var reference = new List<float[]>();
+                    int next = reply[Math.Min(4, reply.Count - 1)];
+                    var forced = new List<int>();
+                    for (int s = 0; s < 6; s++)
+                    {
+                        forced.Add(next);
+                        float[] l = (float[])Model.Forward(new[] { next }).Clone();
+                        reference.Add(l);
+                        next = ArgMax(l);
+                    }
+
+                    var bytes = new MemoryStream();
+                    Assert.True(paged.TryExportRetainedCache("q35-img-ckpt", bytes), "export");
+                    byte[] payload = bytes.ToArray();
+                    paged.DiscardRetainedCache("q35-img-ckpt");
+
+                    // A version-1 file (no delta) is refused.
+                    byte[] v1 = (byte[])payload.Clone();
+                    BitConverter.GetBytes(1).CopyTo(v1, 4);
+                    Assert.False(paged.TryImportRetainedCache("q35-img-ckpt-v1", new MemoryStream(v1)), "a version-1 checkpoint must be refused");
+
+                    Assert.True(paged.TryImportRetainedCache("q35-img-ckpt-restored", new MemoryStream(payload)), "import");
+                    Assert.True(paged.TryCloneRetainedCache("q35-img-ckpt-restored", "q35-img-ckpt-clone"), "clone");
+                    paged.BindSequenceCache("q35-img-ckpt-clone");
+                    float worst = 0;
+                    try
+                    {
+                        for (int s = 0; s < forced.Count; s++)
+                        {
+                            float[] l = Model.Forward(new[] { forced[s] });
+                            float d = MaxAbsDiff(reference[s], l);
+                            worst = Math.Max(worst, d);
+                            Assert.Equal(ArgMax(reference[s]), ArgMax(l));
+                            Assert.True(d <= LogitTolerance, $"restored checkpoint step {s}: max |dlogit| {d}");
+                        }
+                    }
+                    finally
+                    {
+                        paged.RestorePrimaryCache();
+                        paged.OnSequenceReleased("q35-img-ckpt-clone");
+                        paged.DiscardRetainedCache("q35-img-ckpt-restored");
+                    }
+                    _output.WriteLine($"[checkpoint] {payload.Length / 1048576.0:F1} MB file through an image; restored decode max |dlogit| {worst:F5} over {forced.Count} steps; version-1 file refused");
+                }
+            }
+            finally
+            {
+                Model.MultimodalInjector.ClearPreparedPromptState(id);
+            }
+        }
+
+        public string Decode(List<int> tokens)
+        {
+            try { return Model.Tokenizer.Decode(tokens).Replace("\n", "\\n"); }
+            catch { return string.Join(",", tokens); }
+        }
+
+        public void Dispose()
+        {
+            Model.Dispose();
+            try { Directory.Delete(_tempDir, true); } catch { }
+        }
+    }
+}

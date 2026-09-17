@@ -1310,6 +1310,7 @@ namespace TensorSharp.Models
             {
                 ResetTpKVCache();
                 _cacheSeqLen = 0;
+                _ropeDelta = 0;
                 _linearTicks = _attnTicks = _normTicks = _embTicks = _lmHeadTicks = _logitsCopyTicks = 0;
                 _forwardCount = 0;
                 _forwardSw.Reset();
@@ -1339,6 +1340,7 @@ namespace TensorSharp.Models
                 }
             }
             _cacheSeqLen = 0;
+            _ropeDelta = 0;
             _fdSpecSessionActive = false;
             _linearTicks = _attnTicks = _normTicks = _embTicks = _lmHeadTicks = _logitsCopyTicks = 0;
             _mlxEvalBoundaryTicks = 0;
@@ -1394,16 +1396,17 @@ namespace TensorSharp.Models
         public override bool SupportsCrossSequenceKvReuse => false;
 
         /// <summary>
-        /// Not yet: prompt M-RoPE positions compress after an image span (the running
-        /// position resumes at <c>base + max(H, W)</c>, see
-        /// <c>ModelMultimodalInjector.LayoutQwenVLPrompt</c>), but decode forwards at the
-        /// absolute token index and no holder records a rope delta. A cache that went
-        /// through an image turn therefore holds the reply at different positions than a
-        /// re-prefill of the same history would, so continuing it past the image is not
-        /// exact. Every reuse path stops at the first media span until decode carries the
-        /// compressed position; the text before the image is still reused.
+        /// Prompt M-RoPE positions compress after an image span (the running position
+        /// resumes at <c>base + max(H, W)</c>, see
+        /// <c>ModelMultimodalInjector.LayoutQwenVLPrompt</c>), and every token past the
+        /// position table - decode, speculative verify and draft, a text continuation -
+        /// rotates at its KV index plus the sequence's M-RoPE delta
+        /// (<see cref="Qwen35RopePositions"/>). The delta is stored with every holder,
+        /// checkpoint and checkpoint file, so a cache that went through an image turn holds
+        /// its reply at the positions a re-prefill of the same history uses, and reusing
+        /// it past the image is exact (Qwen35ImageFollowUpExactnessTests).
         /// </summary>
-        public override bool SupportsReuseAcrossMediaSpan => false;
+        public override bool SupportsReuseAcrossMediaSpan => true;
 
         public override string KVStateFingerprint =>
             $"qwen35|arch={Config.Architecture}|L={Config.NumLayers}|H={Config.NumHeads}|KV={Config.NumKVHeads}|D={Config.HeadDim}|gdnK={_headKDim}|gdnV={_headVDim}|nKHead={_numKHeads}|nVHead={_numVHeads}|convKern={_convKernel}|dtype={_kvCacheDtype.ToShortString()}";
@@ -1466,6 +1469,11 @@ namespace TensorSharp.Models
         {
             if (!SupportsKVStateSnapshot) return false;
             if (destToken != _cacheSeqLen) return false;
+            // A block carries no M-RoPE delta. One injected at the start of an empty
+            // cache begins a new history; the prompt suffix after injected blocks is
+            // forwarded with its position table, which settles the delta again.
+            if (destToken == 0)
+                _ropeDelta = 0;
             long expected = ComputeKVBlockByteSize(tokenCount);
             if (source.Length != expected) return false;
 
@@ -1969,7 +1977,7 @@ namespace TensorSharp.Models
             long statePtr = firstRec >= 0 && _deltaStateTensor?[firstRec] != null
                 ? CudaFusedOps.GetDevicePointer(_deltaStateTensor[firstRec]).ToInt64() : 0;
             int convPhase = firstRec >= 0 && _convStateWriteIdx != null ? _convStateWriteIdx[firstRec] : 0;
-            string key = $"{seqLen}|{startPos}|{kvPtr:x}|{statePtr:x}|{convPhase}";
+            string key = $"{seqLen}|{startPos}|{_ropeDelta}|{kvPtr:x}|{statePtr:x}|{convPhase}";
 
             if (graphs.TryGetReplayInput(key, out Tensor pinned))
             {
@@ -1986,8 +1994,8 @@ namespace TensorSharp.Models
             // Pre-warm the RoPE position tensors so their host->device upload
             // happens before capture (a captured upload would bake the host
             // pointer into the graph; these tensors are pinned by the entry).
-            Tensor posQ = EnsureRoPEPositions(startPos, seqLen, Config.NumHeads);
-            Tensor posK = EnsureRoPEPositions(startPos, seqLen, Config.NumKVHeads);
+            Tensor posQ = EnsureRoPEPositions(RopePosition(startPos), seqLen, Config.NumHeads);
+            Tensor posK = EnsureRoPEPositions(RopePosition(startPos), seqLen, Config.NumKVHeads);
             CudaFusedOps.TryEnsureDeviceResident(posQ);
             CudaFusedOps.TryEnsureDeviceResident(posK);
 
@@ -2081,7 +2089,7 @@ namespace TensorSharp.Models
                 EnsureDecodeGraphInputsResident();
                 Ops.Copy(pinned, hidden);
                 hidden.Dispose();
-                dyn.Write(attendLen, startPos, convPhase, startPos);
+                dyn.Write(attendLen, startPos, convPhase, RopePosition(startPos));
                 graphs.Replay(key);
                 // Mirror the C# bookkeeping the plain loop would have done.
                 AdvanceGdnConvPhases(convDim);
@@ -2096,8 +2104,8 @@ namespace TensorSharp.Models
             // Pre-warm the RoPE position tensors so their host->device upload
             // happens before capture; the in-graph fill kernel refreshes their
             // CONTENT from the dyn block on every replay.
-            Tensor posQ = EnsureRoPEPositions(startPos, 1, Config.NumHeads);
-            Tensor posK = EnsureRoPEPositions(startPos, 1, Config.NumKVHeads);
+            Tensor posQ = EnsureRoPEPositions(RopePosition(startPos), 1, Config.NumHeads);
+            Tensor posK = EnsureRoPEPositions(RopePosition(startPos), 1, Config.NumKVHeads);
             CudaFusedOps.TryEnsureDeviceResident(posQ);
             CudaFusedOps.TryEnsureDeviceResident(posK);
 
@@ -2105,7 +2113,7 @@ namespace TensorSharp.Models
             Ops.Copy(pinnedIn, hidden);
             hidden.Dispose();
 
-            dyn.Write(attendLen, startPos, convPhase, startPos);
+            dyn.Write(attendLen, startPos, convPhase, RopePosition(startPos));
             if (!graphs.BeginCapture(key))
                 return RunPerOpLayerLoop(pinnedIn, 1, startPos);
 
@@ -2319,6 +2327,7 @@ namespace TensorSharp.Models
             _forwardSw.Start();
             int seqLen = tokens.Length;
             int startPos = _cacheSeqLen;
+            BeginRopePositions(startPos, seqLen);
             EnsureCacheCapacity(startPos + seqLen);
 
             long t1 = Stopwatch.GetTimestamp();
@@ -2378,6 +2387,8 @@ namespace TensorSharp.Models
 
         protected override float[] ForwardCore(int[] tokens)
         {
+            // Settle the M-RoPE delta before any path reads a position (TP included).
+            BeginRopePositions(_cacheSeqLen, tokens.Length);
             if (IsTensorParallel)
                 return ForwardTP(tokens);
 
@@ -2432,7 +2443,7 @@ namespace TensorSharp.Models
             // as one fused, CUDA-graph-captured GGML graph that outputs LOGITS
             // directly. Collapses ~120-400 per-op dispatches/token + the separate
             // lm_head graph_compute into a single captured replay.
-            if (seqLen == 1 && TryFullModelDecode(hidden, startPos, _logitsBuffer))
+            if (seqLen == 1 && _pendingMRoPEPositions == null && TryFullModelDecode(hidden, startPos, _logitsBuffer))
             {
                 // _logitsBuffer holds the final logits; skip the per-op loop + lm head.
                 hidden.Dispose();
@@ -2572,6 +2583,7 @@ namespace TensorSharp.Models
             _forwardSw.Start();
             int seqLen = 1;
             int startPos = _cacheSeqLen;
+            BeginRopePositions(startPos, seqLen);
             EnsureCacheCapacity(startPos + seqLen);
 
             Tensor inputHidden;
@@ -2786,7 +2798,10 @@ namespace TensorSharp.Models
             // already faster, so we keep the existing path.
             int totalSeqLen = startPos + seqLen;
             bool fusedDecodeApplied = false;
-            if (seqLen == 1 && totalSeqLen >= FusedAttnLayerDecodeMinSeqLen
+            // The per-layer native decode rotates at its KV index; a sequence past an
+            // image (non-zero M-RoPE delta) takes the managed path, which rotates at
+            // KV index + delta.
+            if (seqLen == 1 && totalSeqLen >= FusedAttnLayerDecodeMinSeqLen && _ropeDelta == 0
                 && TryFusedAttnLayerDecode(hidden, layer, startPos))
             {
                 fusedDecodeApplied = true;
@@ -3006,10 +3021,10 @@ namespace TensorSharp.Models
                 int qRows = seqLen * numHeads;
                 int kRows = seqLen * numKVHeads;
 
-                Tensor qPosTensor = EnsureRoPEPositions(startPos, seqLen, numHeads);
+                Tensor qPosTensor = EnsureRoPEPositions(RopePosition(startPos), seqLen, numHeads);
                 Tensor kPosTensor = numHeads == numKVHeads
                     ? qPosTensor
-                    : EnsureRoPEPositions(startPos, seqLen, numKVHeads);
+                    : EnsureRoPEPositions(RopePosition(startPos), seqLen, numKVHeads);
 
                 bool qOk = CudaFusedOps.TryQKNormRopeNeox(
                     qTensor, _attnQNormW[layer], qPosTensor,
@@ -3039,18 +3054,18 @@ namespace TensorSharp.Models
                 {
                     if (_backend == BackendType.Mlx || _backend == BackendType.Cuda)
                     {
-                        qTensor = ApplyRoPEPrefill(qTensor, numHeads, seqLen, startPos);
-                        kTensor = ApplyRoPEPrefill(kTensor, numKVHeads, seqLen, startPos);
+                        qTensor = ApplyRoPEPrefill(qTensor, numHeads, seqLen, RopePosition(startPos));
+                        kTensor = ApplyRoPEPrefill(kTensor, numKVHeads, seqLen, RopePosition(startPos));
                     }
                     else
                     {
-                        ApplyRoPEDecodeQKInPlace(qTensor, kTensor, numHeads, numKVHeads, startPos);
+                        ApplyRoPEDecodeQKInPlace(qTensor, kTensor, numHeads, numKVHeads, RopePosition(startPos));
                     }
                 }
                 else
                 {
-                    qTensor = ApplyRoPEPrefill(qTensor, numHeads, seqLen, startPos);
-                    kTensor = ApplyRoPEPrefill(kTensor, numKVHeads, seqLen, startPos);
+                    qTensor = ApplyRoPEPrefill(qTensor, numHeads, seqLen, RopePosition(startPos));
+                    kTensor = ApplyRoPEPrefill(kTensor, numKVHeads, seqLen, RopePosition(startPos));
                 }
             }
 
@@ -4159,8 +4174,9 @@ namespace TensorSharp.Models
             // Fused kernels bake scalar RoPE into the graph. Per-axis MRoPE
             // angles can't be expressed without a kernel update, so when
             // multimodal positions are pending fall back to the legacy
-            // multi-dispatch path which routes through ApplyMRoPEPrefill.
-            if (_pendingMRoPEPositions != null) return false;
+            // multi-dispatch path which routes through ApplyMRoPEPrefill. The kernel
+            // also rotates at its KV index, which is not the position past an image.
+            if (_pendingMRoPEPositions != null || _ropeDelta != 0) return false;
 
             QuantizedWeight qkv = _attnQkvQW[layer];
             QuantizedWeight oOut = _attnOutputQW[layer];

@@ -126,12 +126,13 @@ namespace TensorSharp.Runtime
         /// Whether a cache that already holds a media span (image, video pair, audio
         /// clip) can be continued past it with the same result a fresh prefill gives.
         /// True for models whose positions after a span are the plain token index
-        /// (Gemma 4 and every other absolute-position family). Qwen 3.5 returns false:
-        /// its M-RoPE prompt positions compress after an image, but decode positions
-        /// are the absolute index and the cache records no rope delta, so the state
-        /// after an image turn is not the state a re-prefill of the same history
-        /// builds. For such a model every prompt-reuse path stops at the first media
-        /// span, and reuse of the text BEFORE the span is unaffected.
+        /// (Gemma 4 and every other absolute-position family), and for M-RoPE models
+        /// that carry the compressed position forward with the cache (Qwen 3.5 / 3.6
+        /// store the rope delta in every holder and checkpoint). A model returns false
+        /// when the state after a media turn is not the state a re-prefill of the same
+        /// history builds - for example compressed prompt positions with decode at the
+        /// absolute index. For such a model every prompt-reuse path stops at the first
+        /// media span, and reuse of the text BEFORE the span is unaffected.
         /// </summary>
         bool SupportsReuseAcrossMediaSpan => true;
 

@@ -1610,8 +1610,8 @@ namespace TensorSharp.Models
                 }
                 else
                 {
-                    qTensor = ApplyRoPEPrefill(qTensor, numHeadsPerGpu, seqLen, startPos);
-                    kTensor = ApplyRoPEPrefill(kTensor, numKVHeadsPerGpu, seqLen, startPos);
+                    qTensor = ApplyRoPEPrefill(qTensor, numHeadsPerGpu, seqLen, RopePosition(startPos));
+                    kTensor = ApplyRoPEPrefill(kTensor, numKVHeadsPerGpu, seqLen, RopePosition(startPos));
                 }
 
                 if (seqLen == 1)

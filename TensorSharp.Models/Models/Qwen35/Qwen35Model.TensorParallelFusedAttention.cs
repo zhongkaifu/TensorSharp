@@ -277,8 +277,10 @@ namespace TensorSharp.Models
                 return TpAttnBail($"layer {layer} attention carries a per-tensor weight scale");
             if (!TpFusedAttentionAvailable())
                 return false;
-            // MRoPE bakes per-axis angles the fused graph cannot express.
-            if (_pendingMRoPEPositions != null)
+            // MRoPE bakes per-axis angles the fused graph cannot express, and the
+            // layer graph rotates at its KV index, so a sequence past an image
+            // (non-zero M-RoPE delta) keeps the per-op path too.
+            if (_pendingMRoPEPositions != null || _ropeDelta != 0)
                 return false;
 
             int tp = TpDegree;
