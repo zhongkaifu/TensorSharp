@@ -595,6 +595,15 @@ The batched path therefore needs two orthogonal caches:
 - Per-sequence attention dispatch via `ManagedPagedAttention.Forward`
   (the pure-C# online-softmax kernel) as the correctness reference. The
   native paged kernel path is also wired through `GgmlBasicOps`.
+- The native host-array kernel (`TSGgml_PagedAttentionForward`) caches one
+  graph and backend buffer per shape bucket and pads K/V up to the bucket.
+  That buffer is cleared when a session is built: backend buffers are not
+  zeroed, and CUDA flash attention still reads the `-inf`-masked padded keys,
+  so stale NaN from memory a freed buffer had used (a long prompt that came
+  and went) turned every row of the next batched prefill into NaN. Nemotron
+  3.5 then failed the whole 4-sequence step with an `IndexOutOfRangeException`
+  in `TryMoEPrefillBatchedByExpert` (the router has no top-k for a NaN row).
+  The MoE router now reports a non-finite row by layer and row instead.
 
 ### Mamba2 layers — per-slot conv + SSM state pool
 
@@ -662,6 +671,24 @@ A latent bug was also fixed during the port: `s_nemoBatchedOptIn` used to
 be `static readonly`, which captured the env var at class-load time —
 tests setting `TS_NEMOTRON_BATCHED=1` at runtime never actually toggled
 the path. Now exposed as a method getter (same pattern as Qwen 3.5).
+
+### Speculative decoding is refused
+
+Nemotron-H does not speculate: `--draft-model` does not attach a DSpark/DFlash
+drafter (the Nemotron 3.5 Lightning `NVFP4-DSpark` GGUF is recognized and
+reported as not attached), and `--spec` or `--spec-type ngram` serve plain
+decoding with a one-time warning. The reason is correctness. A speculative
+stream must equal plain greedy decoding, and on this trunk the multi-token
+verify and the single-token decode use different attention kernels (host
+attention over the expanded cache against the flash-attention decode kernel)
+and different MoE kernels (batched-by-expert against the per-token kernel).
+Measured on `nemotron_h_moe` (A40, `ggml_cuda`): a one-row speculative step
+differs from `Forward` by 0.16-1.1 in the logits and verify rows by 0.2-0.8,
+enough to flip low-margin greedy picks (the 2026-09-16 campaign saw every solo
+DSpark request diverge). The Mamba-2 snapshot/rollback is exact. Running
+attention and MoE row by row makes the verify exact, but 4 rows then cost
+116 ms against a 28 ms decode step (plus 70 ms per DSpark block), so an exact
+verify cannot beat plain decoding. Details: [speculative decoding](../speculative_decoding.md#nemotron-h-refuses-speculation).
 
 ## 12. Output parser and chat template
 

@@ -931,6 +931,118 @@ namespace TensorSharp.Models
             }
         }
 
+        /// <summary>
+        /// Router for a multi-token MoE step: sigmoid gate, optional selection
+        /// bias, top-<paramref name="nUsed"/> experts per token, then the
+        /// optional renormalisation and scale. Row <c>s</c> of the outputs
+        /// holds routes <c>[s * nUsed, (s + 1) * nUsed)</c>.
+        /// </summary>
+        internal static unsafe void RouteMoEPrefillTokens(
+            float* routerPtr, float* biasPtr, int seqLen, int numExperts, int nUsed,
+            bool normalize, float scale, int layer,
+            float[] probs, float[] selectionProbs, int[] tokenTopExperts,
+            int[] selectedExperts, float[] routingWeights)
+        {
+            for (int s = 0; s < seqLen; s++)
+            {
+                float* logitsRow = routerPtr + (long)s * numExperts;
+
+                for (int e = 0; e < numExperts; e++)
+                    probs[e] = SigmoidScalar(logitsRow[e]);
+
+                if (biasPtr != null)
+                {
+                    for (int e = 0; e < numExperts; e++)
+                        selectionProbs[e] = probs[e] + biasPtr[e];
+                }
+                else
+                {
+                    Array.Copy(probs, 0, selectionProbs, 0, numExperts);
+                }
+
+                SelectTopKInPlace(selectionProbs, numExperts, nUsed, tokenTopExperts);
+                ThrowIfMoEUnroutable(tokenTopExperts, nUsed, numExperts, layer, s);
+
+                int routeOffset = s * nUsed;
+                for (int k = 0; k < nUsed; k++)
+                {
+                    int expert = tokenTopExperts[k];
+                    selectedExperts[routeOffset + k] = expert;
+                    routingWeights[routeOffset + k] = probs[expert];
+                }
+
+                if (normalize)
+                {
+                    float wSum = 0;
+                    for (int k = 0; k < nUsed; k++)
+                        wSum += routingWeights[routeOffset + k];
+                    if (wSum < 6.103515625e-5f)
+                        wSum = 6.103515625e-5f;
+                    float inv = 1.0f / wSum;
+                    for (int k = 0; k < nUsed; k++)
+                        routingWeights[routeOffset + k] *= inv;
+                }
+
+                if (scale != 1.0f)
+                {
+                    for (int k = 0; k < nUsed; k++)
+                        routingWeights[routeOffset + k] *= scale;
+                }
+            }
+        }
+
+        /// <summary>
+        /// Groups the routes of <see cref="RouteMoEPrefillTokens"/> by expert:
+        /// expert <c>e</c>'s rows are <c>routedRows[expertOffsets[e] ..
+        /// expertOffsets[e + 1])</c>, each with its routing weight, in token order.
+        /// </summary>
+        internal static void GroupMoERoutesByExpert(
+            int[] selectedExperts, float[] routingWeights, int seqLen, int nUsed, int numExperts,
+            int[] expertCounts, int[] expertOffsets, int[] cursors, int[] routedRows, float[] routedWeights)
+        {
+            Array.Clear(expertCounts, 0, numExperts);
+            int totalRoutes = seqLen * nUsed;
+            for (int r = 0; r < totalRoutes; r++)
+                expertCounts[selectedExperts[r]]++;
+
+            expertOffsets[0] = 0;
+            for (int e = 0; e < numExperts; e++)
+                expertOffsets[e + 1] = expertOffsets[e] + expertCounts[e];
+
+            Array.Copy(expertOffsets, cursors, numExperts);
+            for (int s = 0; s < seqLen; s++)
+            {
+                int routeOffset = s * nUsed;
+                for (int k = 0; k < nUsed; k++)
+                {
+                    int dst = cursors[selectedExperts[routeOffset + k]]++;
+                    routedRows[dst] = s;
+                    routedWeights[dst] = routingWeights[routeOffset + k];
+                }
+            }
+        }
+
+        /// <summary>
+        /// A token whose router logits are not finite (a NaN/Inf hidden state)
+        /// has no top-k: every comparison fails and the selection keeps its -1
+        /// sentinels, which used to surface as an IndexOutOfRangeException deep
+        /// in the MoE (or an out-of-bounds read in the native fused kernel).
+        /// Name the real failure instead.
+        /// </summary>
+        internal static void ThrowIfMoEUnroutable(int[] topExperts, int nUsed, int numExperts, int layer, int tokenRow)
+        {
+            for (int k = 0; k < nUsed; k++)
+            {
+                if ((uint)topExperts[k] >= (uint)numExperts)
+                {
+                    throw new InvalidOperationException(
+                        $"Nemotron MoE layer {layer}: token row {tokenRow} has non-finite router logits "
+                        + "(its hidden state is NaN/Inf before the router), so no expert can be selected. "
+                        + "The step is failed instead of routing garbage.");
+                }
+            }
+        }
+
         private void EnsureMoEPrefillRouteBuffers(int totalRoutes)
         {
             if (_moePrefillSelectedExperts == null || _moePrefillSelectedExperts.Length != totalRoutes)
@@ -1918,6 +2030,7 @@ namespace TensorSharp.Models
                 }
 
                 SelectTopKInPlace(selectionProbs, _numExperts, _numExpertsUsed, topExperts);
+                ThrowIfMoEUnroutable(topExperts, _numExpertsUsed, _numExperts, layer, s);
 
                 for (int k = 0; k < _numExpertsUsed; k++)
                     routeW[k] = probs[topExperts[k]];
@@ -2242,78 +2355,15 @@ namespace TensorSharp.Models
             int[] selectedExperts = _moePrefillSelectedExperts;
             float[] routingWeights = _moePrefillRoutingWeights;
             int[] expertCounts = _moePrefillExpertCounts;
-            int[] tokenTopExperts = _moeTopExperts;
-            float[] probs = _moeProbs;
-            float[] selectionProbs = _moeSelectionProbs;
-            Array.Clear(expertCounts, 0, _numExperts);
-
-            for (int s = 0; s < seqLen; s++)
-            {
-                float* logitsRow = routerPtr + (long)s * _numExperts;
-
-                for (int e = 0; e < _numExperts; e++)
-                    probs[e] = SigmoidScalar(logitsRow[e]);
-
-                if (biasPtr != null)
-                {
-                    for (int e = 0; e < _numExperts; e++)
-                        selectionProbs[e] = probs[e] + biasPtr[e];
-                }
-                else
-                {
-                    Array.Copy(probs, 0, selectionProbs, 0, _numExperts);
-                }
-
-                SelectTopKInPlace(selectionProbs, _numExperts, nUsed, tokenTopExperts);
-
-                int routeOffset = s * nUsed;
-                for (int k = 0; k < nUsed; k++)
-                {
-                    int expert = tokenTopExperts[k];
-                    selectedExperts[routeOffset + k] = expert;
-                    routingWeights[routeOffset + k] = probs[expert];
-                    expertCounts[expert]++;
-                }
-
-                if (_expertWeightsNorm)
-                {
-                    float wSum = 0;
-                    for (int k = 0; k < nUsed; k++)
-                        wSum += routingWeights[routeOffset + k];
-                    if (wSum < 6.103515625e-5f)
-                        wSum = 6.103515625e-5f;
-                    float inv = 1.0f / wSum;
-                    for (int k = 0; k < nUsed; k++)
-                        routingWeights[routeOffset + k] *= inv;
-                }
-
-                if (_expertWeightsScale != 1.0f)
-                {
-                    for (int k = 0; k < nUsed; k++)
-                        routingWeights[routeOffset + k] *= _expertWeightsScale;
-                }
-            }
-
             int[] expertOffsets = _moePrefillExpertOffsets;
-            expertOffsets[0] = 0;
-            for (int e = 0; e < _numExperts; e++)
-                expertOffsets[e + 1] = expertOffsets[e] + expertCounts[e];
-
-            int[] cursors = _moePrefillExpertCursors;
-            Array.Copy(expertOffsets, cursors, _numExperts);
             int[] routedRows = _moePrefillRoutedRows;
             float[] routedWeights = _moePrefillRoutedWeights;
-            for (int s = 0; s < seqLen; s++)
-            {
-                int routeOffset = s * nUsed;
-                for (int k = 0; k < nUsed; k++)
-                {
-                    int expert = selectedExperts[routeOffset + k];
-                    int dst = cursors[expert]++;
-                    routedRows[dst] = s;
-                    routedWeights[dst] = routingWeights[routeOffset + k];
-                }
-            }
+            RouteMoEPrefillTokens(
+                routerPtr, biasPtr, seqLen, _numExperts, nUsed, _expertWeightsNorm, _expertWeightsScale, layer,
+                _moeProbs, _moeSelectionProbs, _moeTopExperts, selectedExperts, routingWeights);
+            GroupMoERoutesByExpert(
+                selectedExperts, routingWeights, seqLen, nUsed, _numExperts,
+                expertCounts, expertOffsets, _moePrefillExpertCursors, routedRows, routedWeights);
 
             float* inputPtr = GetFloatPtr(routedInput);
             float* outputPtr = GetFloatPtr(moeOut);
@@ -2584,55 +2634,9 @@ namespace TensorSharp.Models
             EnsureMoEPrefillRouteBuffers(totalRoutes);
             int[] selectedExperts = _moePrefillSelectedExperts;
             float[] routingWeights = _moePrefillRoutingWeights;
-            int[] tokenTopExperts = _moeTopExperts;
-            float[] probs = _moeProbs;
-            float[] selectionProbs = _moeSelectionProbs;
-
-            for (int s = 0; s < seqLen; s++)
-            {
-                float* logitsRow = routerPtr + (long)s * _numExperts;
-
-                for (int e = 0; e < _numExperts; e++)
-                    probs[e] = SigmoidScalar(logitsRow[e]);
-
-                if (biasPtr != null)
-                {
-                    for (int e = 0; e < _numExperts; e++)
-                        selectionProbs[e] = probs[e] + biasPtr[e];
-                }
-                else
-                {
-                    Array.Copy(probs, 0, selectionProbs, 0, _numExperts);
-                }
-
-                SelectTopKInPlace(selectionProbs, _numExperts, nUsed, tokenTopExperts);
-
-                int routeOffset = s * nUsed;
-                for (int k = 0; k < nUsed; k++)
-                {
-                    int expert = tokenTopExperts[k];
-                    selectedExperts[routeOffset + k] = expert;
-                    routingWeights[routeOffset + k] = probs[expert];
-                }
-
-                if (_expertWeightsNorm)
-                {
-                    float wSum = 0;
-                    for (int k = 0; k < nUsed; k++)
-                        wSum += routingWeights[routeOffset + k];
-                    if (wSum < 6.103515625e-5f)
-                        wSum = 6.103515625e-5f;
-                    float inv = 1.0f / wSum;
-                    for (int k = 0; k < nUsed; k++)
-                        routingWeights[routeOffset + k] *= inv;
-                }
-
-                if (_expertWeightsScale != 1.0f)
-                {
-                    for (int k = 0; k < nUsed; k++)
-                        routingWeights[routeOffset + k] *= _expertWeightsScale;
-                }
-            }
+            RouteMoEPrefillTokens(
+                routerPtr, biasPtr, seqLen, _numExperts, nUsed, _expertWeightsNorm, _expertWeightsScale, layer,
+                _moeProbs, _moeSelectionProbs, _moeTopExperts, selectedExperts, routingWeights);
 
             try
             {

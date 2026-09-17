@@ -314,6 +314,17 @@ namespace
             return false;
         }
 
+        // The kv_zero_covered_from tracking below relies on the K/V padding
+        // region [seq_len, bucket) starting out zero, but backend buffers are
+        // NOT zero-initialised (CPU is posix_memalign, CUDA is cudaMalloc, and
+        // both hand back memory a freed buffer just used). The mask only puts
+        // -inf on the padded keys; CUDA flash attention still forms q.k for
+        // them, and NaN + -inf = NaN poisons the whole softmax row. Nemotron
+        // 3.5 hit this after a long prompt's buffers were freed: the next
+        // batched prefill's first attention layer returned NaN for every row
+        // and the MoE router then had no finite logits. Clear once per build.
+        ggml_backend_buffer_clear(sess.buffer, 0);
+
         sess.num_q = num_q;
         sess.padded_kv_len_bucket = padded_kv_len_bucket;
         sess.num_heads = num_heads;
@@ -321,8 +332,8 @@ namespace
         sess.head_dim = head_dim;
         sess.scale_bits = float_bits(scale);
         sess.has_sinks = has_sinks;
-        // K/V buffer is zero-initialised by ggml_backend_alloc_ctx_tensors,
-        // so the entire padded range is already clean.
+        // The buffer was explicitly cleared above, so the entire padded
+        // range is already clean.
         sess.kv_zero_covered_from = 0;
         sess.valid = true;
         return true;
