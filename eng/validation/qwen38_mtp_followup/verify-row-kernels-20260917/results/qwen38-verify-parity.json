@@ -1,0 +1,247 @@
+{
+  "model": "Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf",
+  "promptTokens": 3248,
+  "reference": "4096",
+  "referenceText": " over 128 tokens, 4 prompts)\n- decode throughput is **not comparable** across the two runs: the 1-GPU run\n  ran at 1.2 tok/s because it was streaming weights from disk, while the\n  2-GPU run ran at 16.",
+  "smallestReferenceMargins": [
+    {
+      "position": 62,
+      "margin": 0.02423668
+    },
+    {
+      "position": 17,
+      "margin": 0.029380798
+    },
+    {
+      "position": 6,
+      "margin": 0.031629562
+    },
+    {
+      "position": 49,
+      "margin": 0.07641029
+    },
+    {
+      "position": 38,
+      "margin": 0.08442497
+    }
+  ],
+  "variants": [],
+  "verify": [
+    {
+      "rep": 0,
+      "kernels": "verify-row",
+      "width": 2,
+      "rows": 48,
+      "changedRows": 0,
+      "greedyFlips": 0,
+      "maxAbsLogitDiff": 0,
+      "medianVerifyMs": 25.6192,
+      "medianDecodeMs": 22.6605,
+      "prefillMs": 2448.7304
+    },
+    {
+      "rep": 0,
+      "kernels": "verify-row",
+      "width": 3,
+      "rows": 48,
+      "changedRows": 0,
+      "greedyFlips": 0,
+      "maxAbsLogitDiff": 0,
+      "medianVerifyMs": 28.8135,
+      "medianDecodeMs": 22.6605,
+      "prefillMs": 2448.7304
+    },
+    {
+      "rep": 0,
+      "kernels": "verify-row",
+      "width": 4,
+      "rows": 48,
+      "changedRows": 0,
+      "greedyFlips": 0,
+      "maxAbsLogitDiff": 0,
+      "medianVerifyMs": 32.231,
+      "medianDecodeMs": 22.6605,
+      "prefillMs": 2448.7304
+    },
+    {
+      "rep": 0,
+      "kernels": "batched",
+      "width": 2,
+      "rows": 48,
+      "changedRows": 48,
+      "greedyFlips": 6,
+      "maxAbsLogitDiff": 2.48230242729187,
+      "medianVerifyMs": 23.9791,
+      "medianDecodeMs": 20.6306,
+      "prefillMs": 2378.6492
+    },
+    {
+      "rep": 0,
+      "kernels": "batched",
+      "width": 3,
+      "rows": 48,
+      "changedRows": 48,
+      "greedyFlips": 4,
+      "maxAbsLogitDiff": 2.3440639972686768,
+      "medianVerifyMs": 26.5672,
+      "medianDecodeMs": 20.6306,
+      "prefillMs": 2378.6492
+    },
+    {
+      "rep": 0,
+      "kernels": "batched",
+      "width": 4,
+      "rows": 48,
+      "changedRows": 48,
+      "greedyFlips": 5,
+      "maxAbsLogitDiff": 2.5261290073394775,
+      "medianVerifyMs": 29.2013,
+      "medianDecodeMs": 20.6306,
+      "prefillMs": 2378.6492
+    },
+    {
+      "rep": 1,
+      "kernels": "verify-row",
+      "width": 2,
+      "rows": 48,
+      "changedRows": 0,
+      "greedyFlips": 0,
+      "maxAbsLogitDiff": 0,
+      "medianVerifyMs": 24.5204,
+      "medianDecodeMs": 20.6851,
+      "prefillMs": 2334.8481
+    },
+    {
+      "rep": 1,
+      "kernels": "verify-row",
+      "width": 3,
+      "rows": 48,
+      "changedRows": 0,
+      "greedyFlips": 0,
+      "maxAbsLogitDiff": 0,
+      "medianVerifyMs": 28.275,
+      "medianDecodeMs": 20.6851,
+      "prefillMs": 2334.8481
+    },
+    {
+      "rep": 1,
+      "kernels": "verify-row",
+      "width": 4,
+      "rows": 48,
+      "changedRows": 0,
+      "greedyFlips": 0,
+      "maxAbsLogitDiff": 0,
+      "medianVerifyMs": 32.3989,
+      "medianDecodeMs": 20.6851,
+      "prefillMs": 2334.8481
+    },
+    {
+      "rep": 1,
+      "kernels": "batched",
+      "width": 2,
+      "rows": 48,
+      "changedRows": 48,
+      "greedyFlips": 6,
+      "maxAbsLogitDiff": 2.48230242729187,
+      "medianVerifyMs": 24.0613,
+      "medianDecodeMs": 20.6042,
+      "prefillMs": 2323.6111
+    },
+    {
+      "rep": 1,
+      "kernels": "batched",
+      "width": 3,
+      "rows": 48,
+      "changedRows": 48,
+      "greedyFlips": 4,
+      "maxAbsLogitDiff": 2.3440639972686768,
+      "medianVerifyMs": 26.7667,
+      "medianDecodeMs": 20.6042,
+      "prefillMs": 2323.6111
+    },
+    {
+      "rep": 1,
+      "kernels": "batched",
+      "width": 4,
+      "rows": 48,
+      "changedRows": 48,
+      "greedyFlips": 5,
+      "maxAbsLogitDiff": 2.5261290073394775,
+      "medianVerifyMs": 29.2633,
+      "medianDecodeMs": 20.6042,
+      "prefillMs": 2323.6111
+    },
+    {
+      "rep": 2,
+      "kernels": "verify-row",
+      "width": 2,
+      "rows": 48,
+      "changedRows": 0,
+      "greedyFlips": 0,
+      "maxAbsLogitDiff": 0,
+      "medianVerifyMs": 24.8419,
+      "medianDecodeMs": 20.6438,
+      "prefillMs": 2338.2671
+    },
+    {
+      "rep": 2,
+      "kernels": "verify-row",
+      "width": 3,
+      "rows": 48,
+      "changedRows": 0,
+      "greedyFlips": 0,
+      "maxAbsLogitDiff": 0,
+      "medianVerifyMs": 29.8787,
+      "medianDecodeMs": 20.6438,
+      "prefillMs": 2338.2671
+    },
+    {
+      "rep": 2,
+      "kernels": "verify-row",
+      "width": 4,
+      "rows": 48,
+      "changedRows": 0,
+      "greedyFlips": 0,
+      "maxAbsLogitDiff": 0,
+      "medianVerifyMs": 33.0691,
+      "medianDecodeMs": 20.6438,
+      "prefillMs": 2338.2671
+    },
+    {
+      "rep": 2,
+      "kernels": "batched",
+      "width": 2,
+      "rows": 48,
+      "changedRows": 48,
+      "greedyFlips": 6,
+      "maxAbsLogitDiff": 2.48230242729187,
+      "medianVerifyMs": 24.3139,
+      "medianDecodeMs": 21.051,
+      "prefillMs": 2358.6275
+    },
+    {
+      "rep": 2,
+      "kernels": "batched",
+      "width": 3,
+      "rows": 48,
+      "changedRows": 48,
+      "greedyFlips": 4,
+      "maxAbsLogitDiff": 2.3440639972686768,
+      "medianVerifyMs": 27.2236,
+      "medianDecodeMs": 21.051,
+      "prefillMs": 2358.6275
+    },
+    {
+      "rep": 2,
+      "kernels": "batched",
+      "width": 4,
+      "rows": 48,
+      "changedRows": 48,
+      "greedyFlips": 5,
+      "maxAbsLogitDiff": 2.5261290073394775,
+      "medianVerifyMs": 29.5567,
+      "medianDecodeMs": 21.051,
+      "prefillMs": 2358.6275
+    }
+  ]
+}

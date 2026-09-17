@@ -4,12 +4,15 @@
 // Uses public ggml nodes, with no graph callbacks or external source changes.
 static ggml_tensor* q4e_qsa_matmul(ggml_context* ctx, ggml_tensor* w, ggml_tensor* x)
 {
-    auto* out = ggml_mul_mat(ctx, w, x);
 #ifdef TSG_GGML_USE_CUDA
     if (ggml_backend_is_cuda(g_backend) && w->type == GGML_TYPE_F32 && x->type == GGML_TYPE_F32)
+    {
+        auto* out = ggml_mul_mat(ctx, w, x);
         tsg_matmul_require_f32(ctx, out);
+        return out;
+    }
 #endif
-    return out;
+    return q4e_mul_mat(ctx, w, x);
 }
 
 static ggml_tensor* q4e_nodes_qsa_mask(ggml_context* ctx, ggml_cgraph* graph,

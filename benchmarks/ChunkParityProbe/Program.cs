@@ -31,7 +31,18 @@
 // the same chunking must reproduce itself bit for bit). The prompt text is encoded
 // as-is (no chat template), so pass already-templated text for a chat model.
 // Layer split / TP comes from TENSORSHARP_TP_DEGREE as for every other bench.
+//
+// --verify-widths 2,3,4 [--verify-tokens 32] [--verify-reps 3] adds a
+// speculative-verify parity pass: after prefilling with the reference chunking it
+// teacher-forces the reference's first tokens once as one-token decode steps and
+// once per width as SpecForward blocks of that many rows (every row's logits),
+// and reports how many committed rows differ from the decode rows bit for bit,
+// greedy flips, and the median decode-step / verify-block / prefill times. A
+// native library built with test hooks alternates each repetition between the
+// Qwen 3.8 verify-row kernels and ggml-cuda's batched kernels
+// (TSGgml_Qwen4ExpTestBatchedVerify), so both are measured in one process.
 using System.Diagnostics;
+using System.Runtime.InteropServices;
 using System.Text.Json;
 using TensorSharp;
 using TensorSharp.Models;
@@ -43,6 +54,8 @@ string[] chunks = { "4096", "1024", "512" };
 string draftModel = null;
 int newTokens = 128;
 bool repeatFirst = false;
+int[] verifyWidths = null;
+int verifyTokens = 32, verifyReps = 3;
 BackendType backend = BackendType.GgmlCuda;
 for (int i = 1; i < args.Length; i++)
 {
@@ -54,6 +67,9 @@ for (int i = 1; i < args.Length; i++)
         case "--new": newTokens = int.Parse(args[++i]); break;
         case "--out": outPath = args[++i]; break;
         case "--repeat-first": repeatFirst = true; break;
+        case "--verify-widths": verifyWidths = args[++i].Split(',').Select(int.Parse).ToArray(); break;
+        case "--verify-tokens": verifyTokens = int.Parse(args[++i]); break;
+        case "--verify-reps": verifyReps = int.Parse(args[++i]); break;
         case "--backend":
             backend = args[++i].ToLowerInvariant() switch
             {
@@ -132,6 +148,7 @@ var smallestMargins = Enumerable.Range(0, refRows.Count)
     .OrderBy(x => x.margin).Take(5).ToList();
 Console.WriteLine($"[chunk-probe] reference's five smallest top-2 margins: {string.Join(", ", smallestMargins.Select(x => $"@{x.p}={x.margin:F4}"))}");
 
+var verifyReport = verifyWidths == null ? null : VerifyParity();
 var report = new List<object>();
 var variants = chunks.Skip(1).ToList();
 if (repeatFirst) variants.Insert(0, chunks[0]);
@@ -174,5 +191,87 @@ if (outPath != null)
     {
         model = Path.GetFileName(modelPath), promptTokens = prompt.Length, reference = chunks[0], referenceText = refText,
         smallestReferenceMargins = smallestMargins.Select(x => new { position = x.p, x.margin }), variants = report,
+        verify = verifyReport,
     }, new JsonSerializerOptions { WriteIndented = true }));
 Console.WriteLine("[chunk-probe] done");
+
+List<object> VerifyParity()
+{
+    var target = (TensorSharp.Runtime.Speculative.ISpeculativeTarget)model;
+    int vocab = model.Config.VocabSize;
+    int n = Math.Min(verifyTokens, refTokens.Count);
+    int[] teacher = refTokens.Take(n).ToArray();
+    bool spec0 = chunks[0].StartsWith('s');
+    int prefillChunk = int.Parse(spec0 ? chunks[0][1..] : chunks[0]);
+    double Prefill()
+    {
+        model.ResetKVCache();
+        var sw = Stopwatch.StartNew();
+        for (int start = 0; start < prompt.Length; start += prefillChunk)
+            model.Forward(prompt.AsSpan(start, Math.Min(prefillChunk, prompt.Length - start)).ToArray());
+        return sw.Elapsed.TotalMilliseconds;
+    }
+    static double Median(List<double> v) { if (v.Count == 0) return 0; var s = v.OrderBy(x => x).ToList(); return s[s.Count / 2]; }
+    bool toggle = TrySetBatchedVerify(-1);
+    var results = new List<object>();
+    for (int rep = 0; rep < verifyReps; rep++)
+    {
+        foreach (bool batched in toggle ? new[] { false, true } : new[] { false })
+        {
+            if (toggle) TrySetBatchedVerify(batched ? 1 : 0);
+            string kernels = !toggle ? "library default" : batched ? "batched" : "verify-row";
+            double prefillMs = Prefill();
+            var decodeMs = new List<double>();
+            var scalar = new float[n][];
+            for (int p = 0; p < n; p++)
+            {
+                var sw = Stopwatch.StartNew();
+                scalar[p] = (float[])model.Forward(new[] { teacher[p] }).Clone();
+                decodeMs.Add(sw.Elapsed.TotalMilliseconds);
+            }
+            foreach (int width in verifyWidths)
+            {
+                Prefill();
+                int changed = 0, flips = 0;
+                double maxAbs = 0;
+                var blockMs = new List<double>();
+                var logits = new float[width * vocab];
+                for (int start = 0; start < n; start += width)
+                {
+                    int count = Math.Min(width, n - start);
+                    var sw = Stopwatch.StartNew();
+                    target.SpecForward(teacher.AsSpan(start, count).ToArray(), null, logits, allLogitsRows: true);
+                    if (count == width) blockMs.Add(sw.Elapsed.TotalMilliseconds);
+                    for (int row = 0; row < count; row++)
+                    {
+                        var got = new ReadOnlySpan<float>(logits, row * vocab, vocab);
+                        var want = scalar[start + row];
+                        bool same = true;
+                        for (int i = 0; i < vocab; i++)
+                        {
+                            if (BitConverter.SingleToInt32Bits(got[i]) != BitConverter.SingleToInt32Bits(want[i])) same = false;
+                            maxAbs = Math.Max(maxAbs, Math.Abs((double)got[i] - want[i]));
+                        }
+                        if (!same) changed++;
+                        if (ArgMax(got.ToArray()) != ArgMax(want)) flips++;
+                    }
+                }
+                Console.WriteLine($"[verify-probe] rep={rep} kernels={kernels} width={width} rows={n} changed={changed} flips={flips} max|dlogit|={maxAbs:G4} "
+                    + $"median verify {Median(blockMs):F2} ms, decode step {Median(decodeMs):F2} ms, prefill {prefillMs:F0} ms");
+                results.Add(new { rep, kernels, width, rows = n, changedRows = changed, greedyFlips = flips, maxAbsLogitDiff = maxAbs,
+                    medianVerifyMs = Median(blockMs), medianDecodeMs = Median(decodeMs), prefillMs });
+            }
+        }
+    }
+    if (toggle) TrySetBatchedVerify(-1);
+    return results;
+}
+
+static bool TrySetBatchedVerify(int value)
+{
+    try { SetBatchedVerify(value); return true; }
+    catch (EntryPointNotFoundException) { return false; }
+}
+
+[DllImport("GgmlOps", EntryPoint = "TSGgml_Qwen4ExpTestBatchedVerify")]
+static extern void SetBatchedVerify(int batched);
