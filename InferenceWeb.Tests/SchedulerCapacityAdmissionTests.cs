@@ -362,4 +362,85 @@ public class SchedulerCapacityAdmissionTests
         Assert.Equal(64, b.PrefixCacheReusedTokens);
         Assert.Contains(second.ScheduledWork, w => ReferenceEquals(w.Sequence, b));
     }
+    /// <summary>The shared-prefix discount counts only the blocks the candidate would
+    /// really adopt: a cache breakpoint, a different picture at the same position, a
+    /// model that cannot continue past a media span, or another conversation's scope
+    /// each stop adoption early, and every block past that point is new. Were the
+    /// discount computed from the raw token match, "b" below would be admitted into a
+    /// pool that cannot hold its prompt.</summary>
+    [Theory]
+    [InlineData("none", true)]
+    [InlineData("breakpoint", false)]
+    [InlineData("different-picture", false)]
+    [InlineData("same-picture", true)]
+    [InlineData("same-picture-no-media-reuse", false)]
+    [InlineData("same-scope", true)]
+    [InlineData("other-scope", false)]
+    public void SharedPrefixDiscount_CountsOnlyBlocksAdoptionWouldTake(string variant, bool admitted)
+    {
+        var cfg = new SchedulerConfig
+        {
+            MaxNumBatchedTokens = 128,
+            MaxNumRunningSequences = 4,
+            // A one-block chunk fits the free pool whatever was adopted, so only the
+            // capacity check (not the chunk's own allocation) can hold "b" back.
+            MaxPrefillChunkSize = BlockSize,
+            SoloPrefillChunkSize = 128,
+            NumBlocks = 12,
+            BlockSize = BlockSize,
+            EnablePrefixCaching = true,
+            DecodeQuantumTokens = 1,
+            StopRepetition = false,
+        };
+        var pool = new BlockPool(cfg.NumBlocks, cfg.BlockSize, 0);
+        var sched = new ContinuousBatchScheduler(cfg, pool, "fp-shared-prefix-limits", NullLogger.Instance,
+            supportsReuseAcrossMediaSpan: variant != "same-picture-no-media-reuse");
+        var prefix = Enumerable.Range(1, 64).ToList();
+        bool media = variant.Contains("picture");
+        bool scoped = variant.EndsWith("scope");
+        SequenceState Shared(string id, int salt, string picture, IReadOnlyList<int> breakpoints, string scope)
+            => new(id, prefix.Concat(Enumerable.Range(1000 + salt, 8)).ToList(), 8, BlockSize, SamplingConfig.Greedy,
+                mediaSpans: picture == null ? null : new[] { new PromptMediaSpan(16, 32, picture) },
+                cacheBreakpoints: breakpoints,
+                sharedPrefixTokens: scoped ? 16 : 0,
+                cacheScope: scope);
+        var a = Shared("a", 0, media ? "picture-a" : null, null, scoped ? "chat-a" : null);
+        var b = Shared("b", 100,
+            variant == "different-picture" ? "picture-b" : media ? "picture-a" : null,
+            variant == "breakpoint" ? new[] { 16 } : null,
+            variant == "other-scope" ? "chat-b" : scoped ? "chat-a" : null);
+
+        sched.Submit(a);
+        // A shared-prefix boundary splits "a"'s prefill at token 16, so drive it until
+        // its whole prompt is in the pool.
+        for (int step = 0; step < 4 && a.NumComputedTokens < 72; step++)
+        {
+            foreach (var work in sched.Schedule().ScheduledWork)
+            {
+                int before = work.Sequence.NumComputedTokens;
+                work.Sequence.AdvanceComputedTokens(work.NumScheduledTokens);
+                sched.OnBlocksCommitted(work.Sequence, before);
+                if (work.Sequence.NumComputedTokens == work.Sequence.NumTotalTokens)
+                    work.Sequence.AppendOutputToken(3);
+            }
+        }
+        Assert.Equal(72, a.NumComputedTokens);
+
+        // 3 blocks are free; "b" needs 9. Adopting all 8 prefix blocks leaves 1 new
+        // block; stopping at token 16 leaves 7, which must wait for "a".
+        sched.Submit(b);
+        var second = sched.Schedule();
+
+        Assert.Empty(second.PreemptedRequestIds);
+        if (admitted)
+        {
+            Assert.Equal(SequenceStatus.Running, b.Status);
+            Assert.Equal(64, b.PrefixCacheReusedTokens);
+        }
+        else
+        {
+            Assert.Equal(SequenceStatus.Waiting, b.Status);
+            Assert.DoesNotContain(second.ScheduledWork, w => ReferenceEquals(w.Sequence, b));
+        }
+    }
 }
