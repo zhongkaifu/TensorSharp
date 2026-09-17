@@ -19,6 +19,13 @@
 //
 //   ChunkParityProbe <model.gguf> --prompt-file <utf8 text> [--chunks 4096,1024,512]
 //                    [--new 128] [--backend ggml_cuda] [--repeat-first] [--out report.json]
+//                    [--draft-model <head.gguf>]
+//
+// A chunk written "s1024" prefills through ISpeculativeTarget.SpecForward (the
+// linear speculative trunk a NextN/MTP head arms on, capturing every hidden row)
+// instead of Forward, in 1024-token chunks; pass --draft-model so the head is
+// attached as it is when the server speculates. Decoding stays plain, so such a
+// variant isolates the speculative prefill graph from the plain one.
 //
 // --repeat-first reruns the reference chunking once more (a determinism control:
 // the same chunking must reproduce itself bit for bit). The prompt text is encoded
@@ -32,7 +39,8 @@ using TensorSharp.Runtime;
 
 string modelPath = args.Length > 0 ? args[0] : throw new ArgumentException("usage: ChunkParityProbe <model.gguf> --prompt-file <file> [...]");
 string promptFile = null, outPath = null;
-int[] chunks = { 4096, 1024, 512 };
+string[] chunks = { "4096", "1024", "512" };
+string draftModel = null;
 int newTokens = 128;
 bool repeatFirst = false;
 BackendType backend = BackendType.GgmlCuda;
@@ -41,7 +49,8 @@ for (int i = 1; i < args.Length; i++)
     switch (args[i])
     {
         case "--prompt-file": promptFile = args[++i]; break;
-        case "--chunks": chunks = args[++i].Split(',').Select(int.Parse).ToArray(); break;
+        case "--chunks": chunks = args[++i].Split(','); break;
+        case "--draft-model": draftModel = args[++i]; break;
         case "--new": newTokens = int.Parse(args[++i]); break;
         case "--out": outPath = args[++i]; break;
         case "--repeat-first": repeatFirst = true; break;
@@ -58,19 +67,32 @@ for (int i = 1; i < args.Length; i++)
 }
 if (promptFile == null) throw new ArgumentException("--prompt-file is required");
 
-using var model = ModelBase.Create(modelPath, backend);
+// The architecture factory attaches a draft head passed here (Qwen 3.8's MTP block).
+using var model = ModelBase.Create(modelPath, backend, draftModelPath: draftModel);
 int[] prompt = model.Tokenizer.Encode(File.ReadAllText(promptFile), addSpecial: false).ToArray();
 Console.WriteLine($"[chunk-probe] prompt {prompt.Length} tokens, chunks [{string.Join(",", chunks)}], {newTokens} new tokens");
 
 // Returns the logits after every generated position: row p is the distribution
 // the token at output index p was drawn from.
-List<float[]> Run(int chunk, IReadOnlyList<int> forced, out List<int> tokens, out double prefillMs)
+List<float[]> Run(string chunkSpec, IReadOnlyList<int> forced, out List<int> tokens, out double prefillMs)
 {
+    bool spec = chunkSpec.StartsWith('s');
+    int chunk = int.Parse(spec ? chunkSpec[1..] : chunkSpec);
     model.ResetKVCache();
     var sw = Stopwatch.StartNew();
     float[] logits = null;
     for (int start = 0; start < prompt.Length; start += chunk)
-        logits = model.Forward(prompt.AsSpan(start, Math.Min(chunk, prompt.Length - start)).ToArray());
+    {
+        int[] part = prompt.AsSpan(start, Math.Min(chunk, prompt.Length - start)).ToArray();
+        if (!spec)
+        {
+            logits = model.Forward(part);
+            continue;
+        }
+        var target = (TensorSharp.Runtime.Speculative.ISpeculativeTarget)model;
+        logits = new float[model.Config.VocabSize];
+        target.SpecForward(part, new float[(long)part.Length * target.SpecFeatureSize], logits, allLogitsRows: false);
+    }
     prefillMs = sw.Elapsed.TotalMilliseconds;
     var rows = new List<float[]>(newTokens);
     tokens = new List<int>(newTokens);
@@ -113,7 +135,7 @@ Console.WriteLine($"[chunk-probe] reference's five smallest top-2 margins: {stri
 var report = new List<object>();
 var variants = chunks.Skip(1).ToList();
 if (repeatFirst) variants.Insert(0, chunks[0]);
-foreach (int chunk in variants)
+foreach (string chunk in variants)
 {
     var rows = Run(chunk, refTokens, out _, out double prefillMs);
     double maxAbs = 0, sumTopAbs = 0;

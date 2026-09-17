@@ -102,6 +102,24 @@ fused decode. The engine round-robins sequences per step
 (`SupportsPerSequenceFusedForward`); a fused N-way batched decode is a future
 optimization.
 
+**Concurrent greedy output can differ from solo, and the reason is the prefill
+shape.** The scheduler prefills a lone request in one large chunk (the smaller
+of `TS_SCHED_SOLO_PREFILL_CHUNK` and `TS_SCHED_MAX_BATCHED_TOKENS`) and
+concurrent requests in shares of the step budget, and this model's logits
+depend on the chunk size. Measured with `benchmarks/ChunkParityProbe` on
+UD-Q2_K_XL over a three-GPU layer split, a 19,121-token prompt: the same 4096
+chunking reproduces itself bit for bit (max |Δlogit| 0), while 1024- and
+512-token chunks move the logits by up to 1.3 and flip greedy decoding at
+near-ties — first at output token 9, where the top-2 margin is 0.002 (the
+heading's first word). Holding the shape equal removes the effect: four
+concurrent requests x three waves of a 2,928-token prompt that every request
+prefills in one chunk (`TS_SCHED_PREFILL_CHUNK=4096`,
+`TS_SCHED_MAX_BATCHED_TOKENS=16384`) came back byte-identical to solo, 12/12
+over 512 tokens, so no state leaks between the per-sequence holders and the
+round-robin decode does not depend on concurrency. The strict chunked-versus-whole
+logit gate is the open item recorded in
+[Retained-prefix reuse](#retained-prefix-reuse).
+
 ## Retained-prefix reuse
 
 `Qwen4ExpModel.RetainedCache.cs` gives `qwen4exp` the retained-holder reuse the
@@ -138,6 +156,29 @@ missing-state refusal and QSA first/reset growth on CPU, and a physical
 two-GPU layer-split checkpoint lifecycle on CUDA. One strict CUDA gate remains
 failed: chunked 16+4 versus whole 20-token prefill still differs in full
 logits (same greedy argmax).
+
+## Speculative decoding with the shared MTP head
+
+`--draft-model mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf` attaches the per-token
+MTP block; it speculates for a solo request that prefilled from position 0
+(steps shared with other sequences, and turns that continue a retained holder or
+a shared-prefix clone, decode plainly — the head keeps its own K/V and cannot
+draft across positions it never replayed). Measured on UD-Q2_K_XL over a
+three-GPU layer split (A40), `--spec-draft 3`:
+
+- **Parity.** A 192-token code-copy stream is identical to plain greedy at
+  1.75-1.96x (141/141 drafts accepted, no rollbacks); the speculative prefill
+  (`SpecForward`) is bit-identical to the plain one for the same chunking. The
+  4-row verify kernel does flip near-ties against the 1-row decode kernel, which
+  shows up as a fenced ```` ```json ```` answer where plain greedy wrote a bare
+  object, or pretty-printed versus compact JSON.
+- **Prose does not pay.** Over 18 prose requests acceptance was 68-70% (3.0
+  tokens per verify), but a verify costs ~45 ms, a partial acceptance adds a
+  ~43-46 ms rollback (restore the recurrent state, re-forward the kept rows), and
+  a governor-parked step still runs the one-row speculative forward with hidden
+  capture (~24-26 ms against a 19 ms plain decode): decode at c1 was 44-46 tok/s
+  against 52 plain for 512-token prose, and 34-38 against 40 after an 8k
+  prompt.
 
 ## Multi-GPU
 
