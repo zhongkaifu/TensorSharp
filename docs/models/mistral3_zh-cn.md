@@ -75,7 +75,15 @@ Hugging Face Pixtral 视觉塔及 `Mistral3PatchMerger` 的转写实现逐一对
 修复后，一张 640x480 图像的 391 个合并嵌入与参考实现的逐 token 余弦最小为 0.99999
 （托管 CPU 路径）。把 SiLU、旧的合并顺序或重排的 Q/K 中任意一项单独改回去，逐 token
 余弦均值分别降到 0.69、0.08、0.37。缺少编码器所需张量，或带有编码器不会应用的线性
-bias 的投影器，现在在加载时就被拒绝，错误信息会列出两种可接受的布局。只有 llama.cpp 投影器与参考实现做过对比；手头没有 Ollama 布局的投影器，它按同样的规则加载：
+bias 的投影器，现在在加载时就被拒绝，错误信息会列出两种可接受的布局。在发布媒体夹具上（`validate_deepseek41_media.py --scenarios image_ocr,multi_image,image_follow_up
+--concurrency 1,4`，Q4_K_M + f16 mmproj，`ggml_cuda`），TensorSharp 的 `image_ocr`
+5/5、`image_follow_up` 5/5 通过，`multi_image` 0/5 失败：在双图 prompt 上两个编码都少读
+最后一位（`482`、`936`）。同样文件上 llama.cpp 的 `llama-server` 得分为 `image_ocr` 2/5、
+`image_follow_up` 3/5、`multi_image` 2/5；它失败的那几次给出同样的三位答案
+（`["482", "936"]`），单图时还会把 `4821` 读成 `0482`。双图少读一位是这个检查点本身的
+读法，不是注入错误：TensorSharp 的日志显示第二张图紧接在第一张图的 `[IMG_END]` 之后。
+
+只有 llama.cpp 投影器与参考实现做过对比；手头没有 Ollama 布局的投影器，它按同样的规则加载：
 不还原 Q/K 行，除非声明 `clip.use_silu`，否则用 GELU。此前编码器会
 静默跳过缺失的 norm，并在第一张图像时因缺失的 linear 崩溃。
 

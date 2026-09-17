@@ -83,6 +83,18 @@ old merge order or the permuted Q/K, one at a time, and the mean per-token cosin
 falls to 0.69, 0.08 or 0.37. A projector
 that is missing a tensor the encoder needs, or that has linear biases the encoder
 does not apply, is now refused at load with a message naming both accepted layouts.
+On the release media fixtures
+(`validate_deepseek41_media.py --scenarios image_ocr,multi_image,image_follow_up
+--concurrency 1,4`, Q4_K_M + f16 mmproj, `ggml_cuda`) TensorSharp passes
+`image_ocr` 5/5 and `image_follow_up` 5/5 and fails `multi_image` 0/5. On the
+two-image prompt it reads both codes with the last digit missing (`482`, `936`).
+llama.cpp's `llama-server` on the same files scores `image_ocr` 2/5,
+`image_follow_up` 3/5 and `multi_image` 2/5. Its failures give the same
+three-digit answer (`["482", "936"]`), and it misreads `4821` alone as `0482`.
+The two-image miss is this checkpoint's reading, not an injection error:
+TensorSharp's log places the second image at the position right after the first
+image's `[IMG_END]`.
+
 Only the llama.cpp projector was checked against the reference. No Ollama-layout
 projector was available, and one loads under the same rules: no Q/K un-permute, and
 GELU unless it declares `clip.use_silu`.

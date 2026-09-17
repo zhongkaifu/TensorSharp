@@ -133,5 +133,12 @@ Agent Skills 在这里退回到内联指令，与所有没有工具解析器的�
 - 单设备：没有张量并行、没有按层切分、没有融合整模型计算图、不支持投机解码。
 - Hy-MT2-1.8B 是翻译模型，有自己的输出习惯：对 `What is 17 + 25? Reply with only
   the integer.` 回答 `42.`；在发布翻译夹具上，`structured_json` 与 `||` 分隔词表
-  两类 prompt 会被原样抄回而不是翻译。这些是模型本身的输出，单独服务与并发服务时
-  完全一致。
+  两类 prompt 会被原样抄回而不是翻译。这是模型本身的行为，与服务路径无关。在
+  `ggml_cuda` 上运行 `validate-release-translation.py --concurrency 1,4 --repeats 3`，
+  两条服务路径的规律相同：`zh_en`、`en_zh`、`fr_en`、`long_translation` 全部通过
+  （每项并发 1 为 3 个请求，并发 4 为 12 个），`delimiters` 全部失败。
+  `structured_json` 在并发 1 时 3 个全部失败，并发 4 时批处理路径 12 个中有 3 个、
+  快照路径 12 个中有 4 个完成了翻译。模型在这里处于近乎持平的状态（`"Hello"` 对
+  `"你好"`），批处理改变的 kernel 形状足以让结果翻转。同一个 GGUF 在 llama.cpp（`llama-server`，CUDA）上
+  同样把 `delimiters` prompt 原样抄回；它在并发 1 时翻译了 `structured_json`，而决定
+  结果的那个 token 上前两名的对数概率为 -0.63（`你好`）与 -0.79（`Hello`）。

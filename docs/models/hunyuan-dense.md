@@ -151,5 +151,15 @@ instructions here, as they do for every family without a tool parser.
   answers `What is 17 + 25? Reply with only the integer.` with `42.`, and on the
   release translation fixtures it copies the input back for the
   `structured_json` and `||`-delimited word-list prompts instead of translating
-  them. Those are model outputs, identical whether a request is served alone or
-  concurrently (see the validation notes in the commit that added serving).
+  them. That is the model, not the serving path. With
+  `validate-release-translation.py --concurrency 1,4 --repeats 3` on
+  `ggml_cuda`, both serving paths showed the same pattern:
+  `zh_en`, `en_zh`, `fr_en` and `long_translation` passed every request
+  (3 at concurrency 1 and 12 at concurrency 4 each), and `delimiters` failed
+  every request. `structured_json` failed all 3 at concurrency 1, but 3 of 12
+  (batched) and 4 of 12 (snapshot) translated at concurrency 4. The model sits
+  on a near-tie there (`"Hello"` against `"你好"`), and batching changes the
+  kernel shapes enough to flip it. llama.cpp (`llama-server`, CUDA) on the same
+  GGUF also copies the `delimiters` prompt back. It translates `structured_json`
+  at concurrency 1, with top-2 log-probabilities of -0.63 (`你好`) and -0.79
+  (`Hello`) at the token that decides it.
