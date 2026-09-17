@@ -39,6 +39,12 @@ public sealed class PrefixCacheModelConformanceTests
     private const string EnvQwen38Dir = "TS_TEST_QWEN38_DIR";
     // The first shard of a split GGUF (the loader follows the rest).
     private const string Qwen38FlashNext = "qwen3.8-flash-next-ud-q2_k_xl-00001";
+    // The small generated DeepSeek V4.1 GGUF (eng/validation/prepare-dsv41-managed-fixture.py), on CPU.
+    private const string EnvDsv41FixtureDir = "TS_TEST_DSV41_FIXTURE_DIR";
+    private const string Dsv41Fixture = "deepseek41-fixture";
+    // The full DeepSeek V4.1 Flash checkpoint. Not run while V4.1 GPU runs are on hold.
+    private const string EnvDsv41ModelDir = "TS_TEST_DSV41_MODEL_DIR";
+    private const string Dsv41Flash = "deepseek-v4.1-flash";
 
     private readonly ITestOutputHelper _output;
 
@@ -121,6 +127,57 @@ public sealed class PrefixCacheModelConformanceTests
         Assert.Contains(report.Ran, r => r.StartsWith("batched release", StringComparison.Ordinal));
     }
 
+    [ModelFact(EnvDsv41FixtureDir, Dsv41Fixture, GgmlBackend = BackendType.GgmlCpu)]
+    public void DeepSeek41_ManagedFixture_PassesTheConformanceScript_OnCpu()
+    {
+        using var env = new ScopedEnvironment(new Dictionary<string, string>
+        {
+            // The managed fixture's environment (DeepSeekNativeRetentionFixtureTests), retention on.
+            ["TS_DSV41_RETAINED_CACHE"] = "1", ["TS_DSV41_RETAINED_CACHE_MB"] = "2048", ["MAX_CONTEXT"] = "512",
+            ["TS_DSV4_UBATCH"] = "3", ["TS_DSV4_THREADS"] = "2", ["TS_DSV41_ENGRAM_THREADS"] = "2",
+            ["TS_DSV4_FA"] = "0", ["TS_DSV41_TP"] = "0",
+        });
+        string path = TestGates.FindGguf(Environment.GetEnvironmentVariable(EnvDsv41FixtureDir), Dsv41Fixture);
+        Assert.True(path != null, "the gate admitted the fixture but the loader found none");
+        using var model = new DeepSeek4Model(path, BackendType.GgmlCpu);
+        var sink = new RecordingPayloadSink();
+        model.AttachPrefixCache(sink);
+        ConformanceReport report = PrefixCacheConformanceScript.Run(new ConformanceSubject
+        {
+            Name = "deepseek41-fixture",
+            Model = model,
+            SharedPrefix = new[] { 0, 15, 32, 64, 128, 13, 254, 18, 7, 99, 42, 3, 77, 150, 201, 33 },
+            Suffix = new[] { 9, 21, 85, 60, 11, 140, 2, 58 },
+            DecodeTokens = 8,
+            DonateAfter = 3,
+            RewindTokens = 4,
+            ExpectedReadiness = PrefixCacheMode.Legacy,
+            // Native slots: the managed side does not measure their bytes (M5e).
+            PayloadBytesKnown = false,
+            Log = _output.WriteLine,
+        });
+
+        Assert.Contains("donate/return/donate", report.Ran);
+        Assert.Contains(report.Ran, r => r.StartsWith("truncate in range", StringComparison.Ordinal));
+        Assert.Contains("primary conversion", report.Ran);
+        Assert.Contains(report.Ran, r => r.StartsWith("batched release", StringComparison.Ordinal));
+        _output.WriteLine($"reclaims reported through the sink: {sink.Reports.Count}");
+    }
+
+    /// <summary>The same script on the full DeepSeek V4.1 Flash checkpoint (CUDA). Pending: V4.1 GPU runs are
+    /// on hold, so M2 ran the fixture above instead; gated on its own variable so no lane loads it by accident.</summary>
+    [ModelFact(EnvDsv41ModelDir, Dsv41Flash)]
+    public void DeepSeek41_Flash_PassesTheConformanceScript()
+    {
+        using var env = new ScopedEnvironment(new Dictionary<string, string> { ["TS_DSV41_RETAINED_CACHE"] = "1" });
+        using var model = (DeepSeek4Model)LoadFrom(EnvDsv41ModelDir, Dsv41Flash);
+        model.AttachPrefixCache(new RecordingPayloadSink());
+        ConformanceReport report = PrefixCacheConformanceScript.Run(
+            TextSubject(model, "deepseek41-flash") with { PayloadBytesKnown = false });
+        Assert.Contains("donate/return/donate", report.Ran);
+        Assert.Contains("primary conversion", report.Ran);
+    }
+
     // ------------------------------------------------------------------ helpers
 
     internal ModelBase Load(string pattern) => LoadFrom(EnvModelDir, pattern);
@@ -175,6 +232,27 @@ public sealed class PrefixCacheModelConformanceTests
             output.Add(best);
         }
         return output;
+    }
+}
+
+/// <summary>Sets environment variables for one test and restores them afterwards.</summary>
+internal sealed class ScopedEnvironment : IDisposable
+{
+    private readonly Dictionary<string, string> _previous = new();
+
+    internal ScopedEnvironment(IReadOnlyDictionary<string, string> values)
+    {
+        foreach (var (key, value) in values)
+        {
+            _previous[key] = Environment.GetEnvironmentVariable(key);
+            Environment.SetEnvironmentVariable(key, value);
+        }
+    }
+
+    public void Dispose()
+    {
+        foreach (var (key, value) in _previous)
+            Environment.SetEnvironmentVariable(key, value);
     }
 }
 
