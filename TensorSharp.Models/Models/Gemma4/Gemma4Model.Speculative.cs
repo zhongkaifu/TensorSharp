@@ -1003,18 +1003,8 @@ namespace TensorSharp.Models
             _swaVerifyBackup = null;
             if (backup == null)
                 return;
-            // Rows 0..acceptedRows are kept (row 0 is the token the window started
-            // from); rows acceptedRows+1..verifyRows were rejected and their slots
-            // must hold what they held before the verify. When the executor will
-            // re-forward the kept prefix instead of keeping the verify's rows
-            // (SpecVerifyPersistsAcceptedKv false), the kept rows attend the positions
-            // THEIR slots evicted too, so every saved row goes back: the re-forward
-            // then rewrites the kept rows' slots with the same K/V the verify wrote.
-            int firstRejected = SpecVerifyPersistsAcceptedKv
-                ? Math.Max(backup.FirstRow, acceptedRows + 1)
-                : backup.FirstRow;
-            int lastRow = Math.Min(backup.Rows - 1, verifyRows);
-            int count = lastRow - firstRejected + 1;
+            (int firstRejected, int count) = SwaSlotsToRestore(
+                backup.FirstRow, backup.Rows, acceptedRows, verifyRows, SpecVerifyPersistsAcceptedKv);
             if (count <= 0)
                 return;
             int skip = firstRejected - backup.FirstRow;   // rows of the backup to skip
@@ -1032,6 +1022,40 @@ namespace TensorSharp.Models
                 }
                 CopySwaSlots(layer, backup.StartPos + firstRejected, count, kSlice, vSlice, toBackup: false);
             }
+        }
+
+        /// <summary>
+        /// Which saved verify rows go back into the sliding-window ring once the accept
+        /// count is known, as (first verify row, row count).
+        ///
+        /// Rows 0..acceptedRows are kept (row 0 is the token the window started from);
+        /// rows acceptedRows+1..verifyRows were rejected and their slots must hold what
+        /// they held before the verify. When the executor will re-forward the kept
+        /// prefix instead of keeping the verify's rows (<paramref name="verifyKvKept"/>
+        /// false AND a partial acceptance), the kept rows attend the positions THEIR
+        /// slots evicted too, so every saved row goes back: the re-forward then rewrites
+        /// the kept rows' slots.
+        ///
+        /// A FULLY accepted window is never re-forwarded - <c>SpeculativeExecution</c>
+        /// rolls back only when <c>acceptedRows &lt; verifyRows</c> - so there is nothing
+        /// to restore, whatever <paramref name="verifyKvKept"/> says. Restoring anyway
+        /// (as this used to on dense Gemma 4 without PLE, where the verify's KV is not
+        /// kept on a partial acceptance) put the evicted positions p+i-W back into the
+        /// slots of committed rows p+1..p+K: every later token attended stale keys in
+        /// place of its own recent context. On gemma-4-12B that turned the second
+        /// verify past a 1,024-token window into rows 30-47 logits away from plain
+        /// decoding (AgentTurnBench spec prompt: divergence at token 10 of 192, on CUDA
+        /// and Metal alike).
+        /// </summary>
+        internal static (int FirstRow, int Count) SwaSlotsToRestore(
+            int backupFirstRow, int backupRows, int acceptedRows, int verifyRows, bool verifyKvKept)
+        {
+            bool reforwardsKeptPrefix = !verifyKvKept && acceptedRows < verifyRows;
+            int firstRejected = reforwardsKeptPrefix
+                ? backupFirstRow
+                : Math.Max(backupFirstRow, acceptedRows + 1);
+            int lastRow = Math.Min(backupRows - 1, verifyRows);
+            return (firstRejected, Math.Max(0, lastRow - firstRejected + 1));
         }
 
         /// <summary>

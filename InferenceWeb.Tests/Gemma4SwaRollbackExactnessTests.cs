@@ -153,6 +153,90 @@ public class Gemma4SwaRollbackExactnessTests
         Assert.Equal(plainTokens, specTokens);
     }
 
+    /// <summary>
+    /// The other half of the protocol: a FULLY accepted verify past the window. The
+    /// executor keeps every row and neither rolls back nor re-forwards, so the ring must
+    /// hold exactly the verify's rows. Gated on a dense Gemma 4 without per-layer
+    /// embeddings (12B), because that is the trunk whose verify KV is not kept on a
+    /// partial acceptance - the case where the ring used to be "restored" on a full
+    /// acceptance too, putting the evicted positions back over the committed rows.
+    ///
+    ///   TS_TEST_MODEL_DIR=~/work/models/gemma-4-12b TS_TEST_GGML_BACKEND=metal
+    /// </summary>
+    [ModelTheory(EnvModelDir, "gemma-4-12b")]
+    [InlineData(1300, 7)]   // past the 1,024-token window
+    [InlineData(600, 7)]    // under the window (control)
+    public void AcceptedDraftWindow_LeavesTheNextDecodeExact(int promptTokens, int draftCount)
+    {
+        string dir = Environment.GetEnvironmentVariable(EnvModelDir);
+        string modelPath = dir == null ? null : TestGates.FindGguf(dir, "gemma-4-12b");
+        if (modelPath == null) { _output.WriteLine("no gemma-4-12b model; skipping"); return; }
+        BackendType backend = (Environment.GetEnvironmentVariable("TS_TEST_GGML_BACKEND") ?? "cpu")
+            .Trim().ToLowerInvariant() switch
+        {
+            "metal" => BackendType.GgmlMetal,
+            "cuda" => BackendType.GgmlCuda,
+            _ => BackendType.GgmlCpu,
+        };
+
+        using var model = ModelBase.Create(modelPath, backend);
+        var spec = (ISpeculativeTarget)model;
+        int[] prompt = BuildPrompt(model, promptTokens);
+        int vocab = model.Config.VocabSize;
+        int follow = draftCount + 6;
+
+        // ---- plain: prefill, then greedy decode one token at a time.
+        // plainTokens[i] is fed at step i; plainLogits[i] is what feeding it returned.
+        model.ResetKVCache();
+        float[] logits = model.ForwardRefill(prompt);
+        var plainTokens = new List<int> { Argmax(logits) };
+        var plainLogits = new List<float[]>();
+        for (int i = 0; i < follow; i++)
+        {
+            logits = model.Forward(new[] { plainTokens[i] });
+            plainLogits.Add((float[])logits.Clone());
+            plainTokens.Add(Argmax(logits));
+        }
+
+        // ---- speculative: the same prefill, then ONE verify of [t0, t1..tK] with the
+        // plain continuation as the drafts, so every draft is accepted.
+        model.ResetKVCache();
+        model.ForwardRefill(prompt);
+        int position = spec.CacheSeqLen;
+        var batch = plainTokens.Take(draftCount + 1).ToArray();
+        var verifyLogits = new float[(draftCount + 1) * vocab];
+        spec.SpecEnsureCapacity(position + draftCount + 1);
+        spec.SpecSnapshotRecurrentState();
+        spec.SpecForward(batch, null, verifyLogits, allLogitsRows: true);
+        for (int row = 0; row < draftCount; row++)
+            Assert.Equal(plainTokens[row + 1], Argmax(verifyLogits.AsSpan(row * vocab, vocab)));
+        // Full acceptance: SpeculativeExecution reports it and keeps every row.
+        spec.SpecOnVerifyAccepted(draftCount, draftCount);
+        Assert.Equal(position + draftCount + 1, spec.CacheSeqLen);
+
+        // ---- continue plainly from the committed window and compare.
+        var specTokens = new List<int>();
+        float maxDiff = 0, scale = 1e-6f;
+        for (int i = draftCount + 1; i < follow; i++)
+        {
+            logits = model.Forward(new[] { plainTokens[i] });
+            maxDiff = Math.Max(maxDiff, MaxAbsDiff(plainLogits[i], logits));
+            scale = Math.Max(scale, plainLogits[i].Max(Math.Abs));
+            specTokens.Add(Argmax(logits));
+        }
+        var expected = plainTokens.Skip(draftCount + 2).Take(specTokens.Count).ToList();
+
+        _output.WriteLine($"prompt={prompt.Length} drafts={draftCount} persistsKv={spec.SpecVerifyPersistsAcceptedKv}");
+        _output.WriteLine($"plain: {string.Join(",", expected)}");
+        _output.WriteLine($"spec:  {string.Join(",", specTokens)}");
+        _output.WriteLine($"decode after the accepted window vs plain: max|diff| {maxDiff:E2} (logit scale {scale:F1})");
+
+        Assert.True(maxDiff <= 0.02f * scale,
+            $"logits after a fully accepted verify differ from plain decoding by {maxDiff:E2} " +
+            $"(scale {scale:F1}); the committed rows are not what the ring holds");
+        Assert.Equal(expected, specTokens);
+    }
+
     private static int[] BuildPrompt(ModelBase model, int tokens)
     {
         var sb = new System.Text.StringBuilder();

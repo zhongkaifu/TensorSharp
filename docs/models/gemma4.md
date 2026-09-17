@@ -801,7 +801,7 @@ exists for batch-1 workloads.
 
 ## 12. MTP speculative decoding (gemma4-assistant draft head)
 
-Gemma 4 supports lossless **multi-token-prediction (MTP) speculative decoding**
+Gemma 4 supports **multi-token-prediction (MTP) speculative decoding**
 for solo (non-concurrent) sequences on both hosts. Unlike Qwen 3.6,
 whose NextN block is embedded in the trunk GGUF, the Gemma 4 draft head ships as
 a **separate small `gemma4-assistant` GGUF** loaded with `--draft-model`
@@ -884,6 +884,30 @@ see [Speculative decoding](../../FEATURES.md#speculative-decoding) for the full
 flag list and the other algorithms — `--spec-type ngram` in particular needs no
 draft GGUF at all and so runs on a Gemma 4 checkpoint with no assistant file
 beside it.
+
+### 12.4 Greedy parity
+
+Every emitted token is drawn from a trunk row, so speculation cannot change
+which prefix a token is conditioned on, only the kernel that computed its row.
+Two consequences, both measured with `AgentTurnBench --spec-diagnostic
+--spec-diagnostic-teacher-force`:
+
+* **Fixed:** on the dense checkpoints without per-layer embeddings (12B measured; 31B takes the same path)
+  under the ggml and CPU backends, a fully accepted verify past the sliding
+  window used to put the evicted positions back over its committed rows, so the
+  next verify was 30-47 logits off and 12B streams diverged from plain greedy
+  within ten tokens. `SpecOnVerifyAccepted` now restores slots only for a window
+  the executor re-forwards; 12B spec and checkpoint-clone streams on an A40 are
+  identical to plain greedy again, and n-gram acceptance on the spec prompt went
+  from 57% to 89%.
+* **Tolerance:** a K+1-row verify and a one-row decode are different kernels. On
+  `ggml_cuda` their rows differ by 0.5 logits median on E4B (whose BF16
+  per-layer-embedding projection is batch-shape dependent in ggml-cuda) and 1.7-2.2
+  on 12B/26B-QAT; on Metal 0.003 (E4B) and 0.15 (12B); on `ggml_cpu`, 0. A greedy
+  token whose top-two margin is inside that error can differ: over 512 prose
+  tokens on E4B that happened 4-5 times, every one at a margin under 0.25.
+
+Details and the full table: [What greedy parity delivers](../speculative_decoding.md#what-greedy-parity-delivers).
 
 ## 13. Output parser and chat template
 

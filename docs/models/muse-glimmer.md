@@ -31,7 +31,7 @@ dotnet run --project TensorSharp.Cli -c Release -- \
   --mmproj models/mmproj-Muse-Glimmer-30B-Q8_0.gguf \
   --image photo.png --input question.txt --backend ggml_cuda --max-tokens 300
 
-# DFlash speculative decoding (lossless; output is identical to plain greedy)
+# DFlash speculative decoding (every token from a trunk row; plain greedy up to near-ties, see section 3)
 dotnet run --project TensorSharp.Cli -c Release -- \
   --model models/Muse-Glimmer-30B-UD-IQ2_XXS.gguf \
   --draft-model models/dflash-kquant.gguf \

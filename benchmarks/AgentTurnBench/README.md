@@ -89,6 +89,32 @@ rows are also saved as `.plain_logits.f32` and `.spec_logits.f32` beside the JSO
 This diagnostic disables timing-based draft parking to make proposal windows
 repeatable; its timings and outputs do not replace the scheduler benchmark.
 
+The first mismatch alone cannot tell a near-tie from a broken cache, because every
+row after it compares different prefixes. `--spec-diagnostic-teacher-force` keeps
+the speculative run on the plain token path past a mismatch, so all `--spec-new`
+rows stay same-prefix comparisons; the JSON `summary` and the
+`SPEC_DIAGNOSTIC_PHASE` / `SPEC_DIAGNOSTIC_FLIP` lines report the logit error by row
+class (verify row 0, later verify rows, plain steps, and whether a rollback or a
+verified-prefix commit preceded the row) and every argmax flip with both margins.
+A bounded error with flips only at small margins is kernel arithmetic; an error
+that jumps after a verify or a rollback (tens of logits) is a cache or state bug.
+The other switches pick the prompt and drafter:
+
+| switch | effect |
+| --- | --- |
+| `--spec-diagnostic-prompt <text>` | one user message, no system prompt (the server's `decode` shape) |
+| `--spec-diagnostic-json` | the `json` scenario prompt, both runs drawn through the JSON-object grammar |
+| `--spec-diagnostic-newchat` | the `newchat` scenario's chat B prompt, on the linear trunk |
+| `--spec-diagnostic-speculator auto` | the checkpoint's own drafter instead of n-gram (pass `--draft-model` where it is a separate file) |
+| `--spec-diagnostic-window N` | draft window (default 7) |
+| `--spec-diagnostic-rowcheck` | after the prompt, the same next-token rows through a one-row spec forward, 2..window+1-row verifies, a kept-prefix re-forward, a decode after a committed verify and a plain two-token forward, each against the one-row decode; then exits. The prompt plus the window must stay under the model's sliding window (the checks rewind the cache, which cannot restore an evicted slot), so pair it with `--spec-diagnostic-prompt`; a longer prompt is refused |
+
+```
+dotnet benchmarks/AgentTurnBench/bin/Release/net10.0/AgentTurnBench.dll \
+    --model gemma-4-12B-it-qat-UD-Q4_K_XL.gguf --backend ggml_cuda --chunk 1024 \
+    --spec-diagnostic --spec-diagnostic-teacher-force --spec-new 192 --out 12b-spec.json
+```
+
 For a longer measurement window, use `--warmup 3 --measure-passes 20` with a
 focused scenario list such as `--scenarios long,tool`. The model loads once;
 each pass repeats the same scenario and cache-reset behavior. Every measured
