@@ -159,7 +159,7 @@ class TestRunner:
     def _declares_reasoning_end(self, architecture):
         # Mirrors ChatProtocolRegistry.ThinkingGrammarActivationTrigger declarations.
         normalized = self._normalize_name(architecture)
-        return normalized in ("gptoss", "deepseek41", "deepseekv41", "qwen4exp", "gemma4") \
+        return normalized in ("gptoss", "deepseek41", "deepseekv41", "qwen4exp", "gemma4", "museglimmer") \
             or normalized.startswith("nemotronh")
 
     def _extract_sse_tokens(self, events):

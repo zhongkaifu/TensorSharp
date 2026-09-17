@@ -108,7 +108,7 @@ Unsupported architectures are reported as `SKIP`, not `FAIL`.
 ## Notes
 
 - The OpenAI coverage in this folder targets Chat Completions compatibility. OpenAI's newer Responses API is not the compatibility surface TensorSharp.Server.Host currently emulates here.
-- Structured outputs follow the Chat Completions `response_format` contract. `json_schema` requests combined with `tools` are expected to return HTTP `400`. Combined with `think` they return `400` except on families that declare where reasoning ends (GPT-OSS, DeepSeek V4.1, Qwen 3.8 Flash Next, Gemma 4, Nemotron-H), which serve them; the scripts pick the expectation from the reported architecture.
+- Structured outputs follow the Chat Completions `response_format` contract. `json_schema` requests combined with `tools` are expected to return HTTP `400`. Combined with `think` they return `400` except on families that declare where reasoning ends (GPT-OSS, DeepSeek V4.1, Qwen 3.8 Flash Next, Gemma 4, Nemotron-H, Muse-Glimmer), which serve them; the scripts pick the expectation from the reported architecture.
 - The Ollama and OpenAI compatibility projects continue to evolve. These scripts are aligned with the server's current contract plus the current documented behavior around thinking, tool calling, and structured outputs.
 - DiffusionGemma can return final text through append-oriented compatibility endpoints, but only Web UI `/api/chat` exposes the live denoising `replace` frames.
 - The browser UI is at `http://localhost:5000` (`GET /` serves `index.html`); `GET /health` is the liveness endpoint.

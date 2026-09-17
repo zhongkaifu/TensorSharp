@@ -872,7 +872,7 @@ test_error_handling() {
     # ThinkingGrammarActivationTrigger) serve the combination; the rest refuse it.
     local think_json_expected=400
     case "$(printf '%s' "$ARCHITECTURE" | tr '[:upper:]' '[:lower:]' | tr -d '._-')" in
-        gptoss|deepseek41|deepseekv41|qwen4exp|gemma4|nemotronh*) think_json_expected=200 ;;
+        gptoss|deepseek41|deepseekv41|qwen4exp|gemma4|museglimmer|nemotronh*) think_json_expected=200 ;;
     esac
     log "Test: response_format + think (expected $think_json_expected)"
     resp=$(curl -sf -w "\n%{http_code}" -X POST "$BASE_URL/v1/chat/completions" \
