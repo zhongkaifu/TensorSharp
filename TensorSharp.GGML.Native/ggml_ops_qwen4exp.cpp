@@ -34,7 +34,7 @@ using namespace tsg;
 namespace
 {
     // ------------------------------------------------------------------------
-    // Verify-width rows run the one-token kernels (CUDA).
+    // Verify-width rows run the one-token kernels (CUDA and CPU).
     //
     // A speculative verify and the replay of its accepted prefix forward
     // 2..TSG_PRECISION_DECODE_COLUMNS tokens through one span graph (so does a
@@ -86,6 +86,9 @@ namespace
     // four-token graph could round the same row differently. Graphs of up to
     // TSG_PRECISION_DECODE_COLUMNS tokens therefore keep those inputs allocated
     // (graph outputs), which makes both fusions unconditional there.
+    // CPU uses the same row construction: ARM F16 reductions also depend on
+    // graph width. The QSA fixture's committed-row test differed by up to 0.0032
+    // before enabling it on CPU and is bit-exact at widths 1..8 afterwards.
     // ------------------------------------------------------------------------
     struct Q4eRowKernels
     {
@@ -451,7 +454,7 @@ namespace
     // TS_Q4E_SPAN_REBUILD=1 disables the span replay path entirely - every call
     // rebuilds the graph. Diagnosis only: separates a wrong-graph bug from a
     // wrong-replay one.
-    // Q4eRowKernels applies to CUDA span graphs. A test-hook build can turn it off
+    // Q4eRowKernels applies to CPU and CUDA span graphs. A test-hook build can turn CUDA off
     // - TS_Q4E_TEST_BATCHED_VERIFY=1 at start-up, or TSGgml_Qwen4ExpTestBatchedVerify
     // at run time - to measure the batched kernels it replaces in one process.
 #ifdef TSG_GGML_TEST_HOOKS
@@ -460,6 +463,7 @@ namespace
 
     bool q4e_row_kernels_enabled()
     {
+        if (ggml_backend_is_cpu(g_backend)) return true;
 #ifdef TSG_GGML_USE_CUDA
         if (!ggml_backend_is_cuda(g_backend)) return false;
 #ifdef TSG_GGML_TEST_HOOKS
