@@ -847,8 +847,11 @@ namespace TensorSharp.Runtime.Scheduling
             // Only consulted when the cheap check fails, i.e. while a request waits.
             if (!PrefixCachingActive || candidate.BlockTable.NumBlocks != 0)
                 return false;
-            foreach (var block in PlanPrefixBlockAdoption(candidate, logBacktrack: false, out _))
+            _capacityPlanScratch.Clear();
+            FillPrefixBlockAdoptionPlan(candidate, logBacktrack: false, _capacityPlanScratch, out _);
+            foreach (var block in _capacityPlanScratch)
                 if (block.RefCount > 0) need--;
+            _capacityPlanScratch.Clear();
             if (available < need)
                 return false;
 
@@ -862,6 +865,10 @@ namespace TensorSharp.Runtime.Scheduling
                 return false;
             return true;
         }
+
+        // HasPromptCapacityFor runs on every Schedule() while a request waits; its plan
+        // is only counted, so it reuses one list instead of allocating one per call.
+        private readonly List<KvBlock> _capacityPlanScratch = new();
 
         private string _capacityWaitLoggedFor;
 
@@ -980,10 +987,18 @@ namespace TensorSharp.Runtime.Scheduling
         private List<KvBlock> PlanPrefixBlockAdoption(SequenceState seq, bool logBacktrack, out bool adoptInPagedStorage)
         {
             var matching = new List<KvBlock>();
-            adoptInPagedStorage = false;
-            if (seq.PromptTokens.Count < _cfg.BlockSize) return matching;
+            FillPrefixBlockAdoptionPlan(seq, logBacktrack, matching, out adoptInPagedStorage);
+            return matching;
+        }
 
-            var hashes = ComputeHashesForTokens(seq, seq.PromptTokens, seq.PromptTokens.Count);
+        /// <summary><see cref="PlanPrefixBlockAdoption"/> into a caller-owned, empty list.</summary>
+        private void FillPrefixBlockAdoptionPlan(
+            SequenceState seq, bool logBacktrack, List<KvBlock> matching, out bool adoptInPagedStorage)
+        {
+            adoptInPagedStorage = false;
+            if (seq.PromptTokens.Count < _cfg.BlockSize) return;
+
+            var hashes = GetPromptBlockHashes(seq);
             int maxAdoptableTokens = Math.Max(0, seq.PromptTokens.Count - 1);
             // An explicit boundary limits reuse as well as registration. Otherwise a
             // request that says "cache none" (empty/[0]) could still adopt blocks that
@@ -1072,7 +1087,6 @@ namespace TensorSharp.Runtime.Scheduling
                     matching.Count, seq.RequestId, adopted);
                 matching.RemoveRange(adopted, matching.Count - adopted);
             }
-            return matching;
         }
 
         /// <summary>After advancing tokens or finishing, check whether the
@@ -1173,6 +1187,46 @@ namespace TensorSharp.Runtime.Scheduling
 
         private List<KvBlockHash> ComputeHashesForTokens(SequenceState seq, IReadOnlyList<int> tokens, int count)
             => KvBlockHasher.ComputeBlockHashes(tokens, _cfg.BlockSize, _fingerprint, b => BlockSalt(seq, b));
+
+        /// <summary>Test hook: false recomputes the prompt's block hashes on every plan,
+        /// which is what every plan did before they were cached.</summary>
+        internal bool CachePromptBlockHashes { get; set; } = true;
+
+        /// <summary>Test hook: how many times the prompt's block hashes were computed.</summary>
+        internal int PromptBlockHashComputations { get; private set; }
+
+        internal IReadOnlyList<KvBlockHash> GetPromptBlockHashesForTest(SequenceState seq) => GetPromptBlockHashes(seq);
+
+        /// <summary>
+        /// The full-block hashes of <paramref name="seq"/>'s prompt, computed once per
+        /// sequence. A request waiting for capacity is planned on every
+        /// <see cref="Schedule"/> call, and hashing its prompt (SHA-256 per block, with
+        /// media and scope salts) is the whole cost of that plan for a long prompt; the
+        /// pool lookups that follow are cheap and are always redone, because the pool
+        /// changes between calls.
+        ///
+        /// <para>What the hashes depend on, and why each is covered: the prompt tokens,
+        /// media spans, cache scope and shared-prefix length are fixed when the sequence
+        /// is constructed (PromptTokens is copied from the caller's list there and nothing
+        /// edits it afterwards; its count is still checked as a guard); the fingerprint and block size belong
+        /// to the scheduler, and a sequence handed to another engine (a rebuilt one after
+        /// a model change) finds a different pair and hashes again. Preemption, pool
+        /// eviction and registration change which hashes are found, never the hashes.</para>
+        /// </summary>
+        private IReadOnlyList<KvBlockHash> GetPromptBlockHashes(SequenceState seq)
+        {
+            var cached = seq.CachedPromptBlockHashes;
+            if (CachePromptBlockHashes && cached != null
+                && cached.Matches(_fingerprint, _cfg.BlockSize, seq.PromptTokens.Count))
+                return cached.Hashes;
+
+            PromptBlockHashComputations++;
+            var hashes = ComputeHashesForTokens(seq, seq.PromptTokens, seq.PromptTokens.Count);
+            if (CachePromptBlockHashes)
+                seq.CachedPromptBlockHashes = new PromptBlockHashes(
+                    _fingerprint, _cfg.BlockSize, seq.PromptTokens.Count, hashes);
+            return hashes;
+        }
 
         /// <summary>
         /// What block <paramref name="blockIndex"/> of <paramref name="seq"/> is salted
