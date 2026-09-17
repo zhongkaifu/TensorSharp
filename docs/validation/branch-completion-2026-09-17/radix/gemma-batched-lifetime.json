@@ -1,0 +1,97 @@
+{
+  "fix_commit": "258e6368",
+  "backend": "Metal",
+  "hardware": "Apple M5 Pro",
+  "model": "gemma-4-E4B-it-Q8_0.gguf",
+  "model_sha256": "34be82b17b4942d389b9b527170c4b058027abdd32531fda063d3d97dd8ce80a",
+  "native_sha256": "64e85b3b33c5fe9042fa1af66fb0fb6f7f1fb7d79784612ae0dfa2dde3640d3f",
+  "ggml_revision": "456172ec733a135778adcd32d00e576a58232e45",
+  "native_changed": false,
+  "original_crash": {
+    "arm": "b-1 (baseline/control)",
+    "source_named_by_runner": "99d4f94906ba5ccf9480b62d9ec093abe56204a7",
+    "native_sha256": "f5a5810ab09a4e2165e4a9228f0b300ff9d988569780c76cc50bc19fbbec4caf",
+    "native_macho_uuid": "0B1D5651-5163-3EFD-A0D4-A3372E4B663F",
+    "pid": 82726,
+    "time_utc": "2026-09-17T13:43:31Z",
+    "exception": "EXC_BAD_ACCESS / SIGSEGV / KERN_INVALID_ADDRESS",
+    "native_symbol": "TSGgml_Gemma4ModelDecodeBatchedEx",
+    "symbol_offset": 10324,
+    "image_return_pc": "0xa4090",
+    "call_pc": "0xa408c",
+    "faulting_read_address": "0x717f524000",
+    "upload_bytes": 71680,
+    "hidden_size": 2560,
+    "active_sequences": 7,
+    "benchmark_scenario": "measured pass 3, concurrency 8; two complete measured passes persisted",
+    "relationship": "Managed batched method is identical in 99d4f949, claude/radix-m2 9ae80b49 and pre-fix combined integration. Native batched source is identical to original target e10dd42b; final integration only adds flash-attention guard outside upload site. Loaded Mach-O UUID matches both baseline and original M2 identical native copies.",
+    "baseline_program_and_native_batched_source_match_99d4f949": true,
+    "managed_assembly_has_source_revision": false,
+    "baseline_agentturnbench_dll_sha256": "0601532919976e4d62c185a13f553b91e482850f5f9ddbc8e8f9cb4c0fcd34a6",
+    "baseline_model_dll_sha256": "1a7a7513b46e274ece738028fe436a8d5f378bc5f1ab450735e9640b5886c49b",
+    "baseline_runtime_dll_sha256": "e995d53b0dbf880dfe33b65c1f21eb4bbe065138f9fe903cca56650282a9db89"
+  },
+  "runs": [
+    {
+      "run": "gemma-lifetime-before",
+      "optimized_jit": false,
+      "tests": [
+        {
+          "testName": "InferenceWeb.Tests.Gemma4BatchedDecodeLifetimeTests.BatchedDecode_KeepsInputStorageAliveAcrossForcedCollection",
+          "outcome": "Passed",
+          "duration": "00:00:01.8869565"
+        }
+      ]
+    },
+    {
+      "run": "gemma-lifetime-optimized-before",
+      "optimized_jit": true,
+      "tests": [
+        {
+          "testName": "InferenceWeb.Tests.Gemma4BatchedDecodeLifetimeTests.BatchedDecode_KeepsInputStorageAliveAcrossForcedCollection",
+          "outcome": "Failed",
+          "duration": "00:00:01.2525732",
+          "error": "Batched hidden storage was collected before native upload."
+        }
+      ]
+    },
+    {
+      "run": "gemma-lifetime-optimized-after",
+      "optimized_jit": true,
+      "tests": [
+        {
+          "testName": "InferenceWeb.Tests.Gemma4BatchedDecodeLifetimeTests.BatchedDecode_KeepsInputStorageAliveAcrossForcedCollection",
+          "outcome": "Passed",
+          "duration": "00:00:01.7122529"
+        },
+        {
+          "testName": "InferenceWeb.Tests.Gemma4BatchedFusedDecodeParityTests.BatchedFusedDecode_MatchesRoundRobin_TokenForToken",
+          "outcome": "Passed",
+          "duration": "00:00:06.8809366",
+          "parity_output": [
+            "[parity] backend=GgmlMetal native batched-decode caps=Ple, KvDonor, SwaWrap",
+            "[parity] prompt lengths = 6,581,8,11",
+            "[parity] n=2: fused steps=11 fallback steps=0",
+            "[parity] n=2 seq0 (prompt 6 tok): MATCH",
+            "[parity] n=2 seq1 (prompt 581 tok): MATCH",
+            "[parity] n=3: fused steps=11 fallback steps=0",
+            "[parity] n=3 seq0 (prompt 6 tok): MATCH",
+            "[parity] n=3 seq1 (prompt 581 tok): MATCH",
+            "[parity] n=3 seq2 (prompt 8 tok): MATCH",
+            "[parity] n=4: fused steps=11 fallback steps=0",
+            "[parity] n=4 seq0 (prompt 6 tok): MATCH",
+            "[parity] n=4 seq1 (prompt 581 tok): MATCH",
+            "[parity] n=4 seq2 (prompt 8 tok): MATCH",
+            "[parity] n=4 seq3 (prompt 11 tok): MATCH"
+          ]
+        }
+      ]
+    }
+  ],
+  "limitations": [
+    "Original ABBA was not rerun; no ABBA performance gate claimed.",
+    "Before-fix default-tiered cold execution passed; optimized execution is required for repeatable early-finalization reproduction.",
+    "No CUDA result is included here; root task owns the combined CUDA follow-up.",
+    "The regression asserts owner reachability, nonzero allocation pointer, and live exclusive ownership before native upload to avoid deliberately dereferencing freed memory."
+  ]
+}

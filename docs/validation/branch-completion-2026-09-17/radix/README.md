@@ -56,6 +56,7 @@ validates the combined build, not a separate radix-only CUDA binary.
 | Real-model CUDA checks listed below | 4 | 0 | 0 |
 | Model path helper regressions | 3 | 0 | 0 |
 | ABBA runner/summary Python regressions | 7 | 0 | 0 |
+| Gemma Metal optimized-JIT lifetime regression and batched parity | 2 | 0 | 0 |
 
 These are separate invocations, not a deduplicated suite total. The original
 eight skips were opt-in model tests. Six were subsequently executed successfully
@@ -104,7 +105,11 @@ host was not isolated. They do not establish end-to-end model throughput.
 The pre-existing Gemma ABBA series contains a `b-1` child exit 139 and only two
 of its three expected measured passes. The previous wrapper incorrectly
 returned success. The completed summary correctly rejects that series rather
-than computing a partial median. No fresh large model ABBA series was run;
+than computing a partial median. A follow-up audit identified the crash in the
+older control build, demonstrated premature collection of the batched hidden
+tensor, and fixed its managed ownership. The forced-GC regression failed before
+the fix and passed afterward with the optimized JIT; see
+[gemma-batched-lifetime.md](gemma-batched-lifetime.md). No fresh large model ABBA series was run;
 there is no new model performance nonregression claim. The seven automated
 ABBA tests cover child failures, missing passes/rows, complete data, and actual
 staging of the selected native override. Token parity still requires
