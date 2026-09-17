@@ -61,6 +61,37 @@ namespace TensorSharp.Models
             }
         }
 
+        /// <summary>
+        /// The capability record of a family with no end states (class P parity, MuseGlimmer, Nemotron,
+        /// HunyuanDense; DESIGN §6.2-§6.4.3): its pages as the model serves them today — A1 host slabs where
+        /// it restores snapshots across sequences, A2 model-paged storage where its batched paged forward is
+        /// available — the window its pooled path is capped at, and the primary cache as a resident payload.
+        /// Readiness stays Legacy until the family's M5 PR.
+        /// </summary>
+        protected PrefixCacheCapabilities PageFamilyCapabilities(FamilyClass familyClass, TruncationKind truncation,
+            int truncationParameter = 0, bool pagesNeedStateAtEnd = false, bool reuseAcrossMediaSpan = false)
+        {
+            bool a1 = SupportsKVStateSnapshot && SupportsCrossSequenceKvReuse;
+            bool a2 = this is TensorSharp.Runtime.Scheduling.IBatchedPagedModel paged && paged.BatchedForwardAvailable;
+            PageSupport pages = a1 && a2 ? PageSupport.Both : a1 ? PageSupport.A1HostSlab : a2 ? PageSupport.A2ModelPaged : PageSupport.None;
+            return new PrefixCacheCapabilities
+            {
+                Class = familyClass,
+                Readiness = PrefixCacheMode.Legacy,
+                NamespaceFingerprint = KVStateFingerprint,
+                EndState = EndStateSupport.None,
+                PrimaryResident = true,
+                Truncation = SupportsKVCacheTruncation ? truncation : TruncationKind.None,
+                TruncationParameter = truncationParameter,
+                TruncationGranularity = Math.Max(1, KVCacheTruncationGranularity),
+                RewindCapTokens = 16,
+                Pages = pages,
+                PagesNeedStateAtEnd = pagesNeedStateAtEnd,
+                PageWindowTokens = MaxReusablePrefixTokens == int.MaxValue ? 0 : MaxReusablePrefixTokens,
+                ReuseAcrossMediaSpan = reuseAcrossMediaSpan && SupportsReuseAcrossMediaSpan,
+            };
+        }
+
         /// <summary>Host headroom by the rule the Qwen 3.5 holder pool already applies: the GC's
         /// available-memory limit, less the process working set and a reserve. -1 when unknown.</summary>
         private static long HostSpareBytes()
