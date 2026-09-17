@@ -255,6 +255,18 @@ internal static class SpecParityDiagnostic
     {
         var target = (ISpeculativeTarget)model;
         int vocab = model.Config.VocabSize;
+        // Every comparison below rewinds to the prompt's end and writes up to
+        // max(3, window + 1) positions again. Once a write lands past the sliding
+        // window it evicts a slot that a rewound query still attends, so the rows
+        // would measure the rewind rather than the kernels: refuse instead of
+        // printing numbers that look like a kernel disagreement.
+        int slidingWindow = model.Config.SlidingWindow;
+        int lastWritten = prompt.Length + Math.Max(3, Math.Max(2, options.SpecDiagWindow + 1)) - 1;
+        if (slidingWindow > 0 && lastWritten >= slidingWindow)
+            throw new ArgumentException(
+                $"--spec-diagnostic-rowcheck needs every position it writes under the model's {slidingWindow}-token sliding window, " +
+                $"but this prompt ({prompt.Length} tokens) with --spec-diagnostic-window {options.SpecDiagWindow} reaches position {lastWritten}; " +
+                "use a shorter prompt (e.g. --spec-diagnostic-prompt) or a smaller window");
         model.ResetKVCache();
         float[] last = null;
         for (int offset = 0; offset < prompt.Length; offset += options.Chunk)

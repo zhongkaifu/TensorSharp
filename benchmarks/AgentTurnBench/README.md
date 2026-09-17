@@ -107,7 +107,7 @@ The other switches pick the prompt and drafter:
 | `--spec-diagnostic-newchat` | the `newchat` scenario's chat B prompt, on the linear trunk |
 | `--spec-diagnostic-speculator auto` | the checkpoint's own drafter instead of n-gram (pass `--draft-model` where it is a separate file) |
 | `--spec-diagnostic-window N` | draft window (default 7) |
-| `--spec-diagnostic-rowcheck` | after the prompt, the same next-token rows through a one-row spec forward, 2..window+1-row verifies, a kept-prefix re-forward, a decode after a committed verify and a plain two-token forward, each against the one-row decode; then exits |
+| `--spec-diagnostic-rowcheck` | after the prompt, the same next-token rows through a one-row spec forward, 2..window+1-row verifies, a kept-prefix re-forward, a decode after a committed verify and a plain two-token forward, each against the one-row decode; then exits. The prompt plus the window must stay under the model's sliding window (the checks rewind the cache, which cannot restore an evicted slot), so pair it with `--spec-diagnostic-prompt`; a longer prompt is refused |
 
 ```
 dotnet benchmarks/AgentTurnBench/bin/Release/net10.0/AgentTurnBench.dll \
