@@ -523,6 +523,9 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
     add_executable(GgmlOpsDsv41RetentionTest tests/dsv41_retention_test.cpp)
     target_include_directories(GgmlOpsDsv41RetentionTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
     add_test(NAME deepseek41-retention-budget COMMAND GgmlOpsDsv41RetentionTest)
+    add_executable(GgmlOpsGemma4MmMaskTest tests/gemma4_mm_mask_test.cpp)
+    target_include_directories(GgmlOpsGemma4MmMaskTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME gemma4-multimodal-mask-after-reused-prefix COMMAND GgmlOpsGemma4MmMaskTest)
 
     add_executable(GgmlOpsDsv41QuantTest
         tests/dsv41_quant_test.cpp ggml_ops_dsv4_fused_cpu.cpp)
