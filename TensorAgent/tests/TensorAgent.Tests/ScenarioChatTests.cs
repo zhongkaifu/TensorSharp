@@ -487,7 +487,7 @@ public sealed class ScenarioChatTests : LiveModelHarness
         SkillStep specWrite = Assert.Single(steps, step => step.Tool == "write_file");
         if (writerSteps.Any(step => !step.Ok && step.Round > specWrite.Round))
         {
-            Assert.Contains("<function=edit_file>", toolDrafts, StringComparison.Ordinal);
+            Assert.Contains("<function=apply_patch>", toolDrafts, StringComparison.Ordinal);
         }
         Assert.Single(Regex.Matches(
             toolDrafts,

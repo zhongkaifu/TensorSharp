@@ -60,7 +60,7 @@ internal static class TensorAgentSkillRouter
         + "and answer without calling validate_document, shell, or any package installer. Do not install "
         + "python-pptx/lxml (both are already built in) or hand-build OOXML. The task is incomplete "
         + "until a real .pptx exists in the shared workspace and is returned as a downloadable artifact. If the "
-        + "spec or run fails, use read_file/edit_file on only the broken region and rerun; never regenerate it.";
+        + "spec or run fails, use read_file/apply_patch on only the broken region and rerun; never regenerate it.";
 
     private static readonly string[] ResearchPhrases =
     {

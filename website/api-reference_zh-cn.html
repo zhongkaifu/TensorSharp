@@ -58,7 +58,7 @@
       <tr><td><code>--skills-dir &lt;path&gt;</code> · <code>--skill &lt;name&gt;</code> · <code>--list-skills</code> · <code>--no-skills</code> · <code>--skills-no-discovery</code></td><td>发现、选择、列出或禁用 Agent Skills，并可限制发现。对支持工具的模型，已选择技能也先只披露元数据，正文按需读取。环境变量 <code>TS_SKILLS_DIR</code> / <code>TS_NO_SKILLS</code>。</td></tr>
       <tr><td><code>--skills-allow-exec</code> · <code>--skills-sandbox &lt;off|preferred|required&gt;</code> · <code>--skills-allow-network</code></td><td>启用 <code>skills_run</code> 并选择脚本隔离/联网策略。执行和网络默认关闭，沙箱默认 <code>required</code>。macOS 使用 Seatbelt，Linux 需要 bubblewrap 0.12+，Windows 作业对象无法限制文件/网络。</td></tr>
       <tr><td><code>--skills-max-rounds &lt;1..64&gt;</code></td><td>内部模型/工具轮次上限：默认 8；提供代码执行时为 24；显式取值不变。</td></tr>
-      <tr><td><code>--code-exec</code></td><td>启用服务端拥有的五个智能体工具：<code>read_file</code>、<code>edit_file</code>、<code>write_file</code>、<code>shell</code>、<code>apply_patch</code>。默认关闭；环境变量 <code>TS_CODE_EXEC</code>。</td></tr>
+      <tr><td><code>--code-exec</code></td><td>启用服务端拥有的四个智能体工具：<code>read_file</code>、<code>write_file</code>、<code>shell</code>、<code>apply_patch</code>。默认关闭；环境变量 <code>TS_CODE_EXEC</code>。</td></tr>
       <tr><td><code>--code-exec-allow-install</code> · <code>--code-exec-packages &lt;list&gt;</code></td><td>允许宿主代为安装 pip/npm 包，并可限制包名；不会授予生成命令网络访问权。</td></tr>
       <tr><td><code>--code-exec-install-domains &lt;list&gt;</code> · <code>--code-exec-install-index &lt;url&gt;</code></td><td>安装器主机白名单（默认 <code>pypi.org,files.pythonhosted.org,registry.npmjs.org</code>）与运维方指定的索引。</td></tr>
       <tr><td><code>--code-exec-allow-network</code></td><td>允许生成命令不受限地使用宿主 IP 网络，包括局域网/回环与监听套接字。默认关闭，且独立于安装和技能联网开关。</td></tr>

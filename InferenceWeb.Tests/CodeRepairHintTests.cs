@@ -45,7 +45,7 @@ public sealed class CodeRepairHintTests : IDisposable
         Assert.NotNull(hint);
         Assert.Contains("'calculator.py' around line 4", hint, StringComparison.Ordinal);
         Assert.Contains(NumberedListing.Prefix(4) + "print(divide(4, 0))", hint, StringComparison.Ordinal);
-        Assert.Contains("`" + ShellTools.EditToolName + "`", hint, StringComparison.Ordinal);
+        Assert.DoesNotContain(ShellTools.EditToolName, hint, StringComparison.Ordinal);
         Assert.Contains("`" + ShellTools.PatchToolName + "`", hint, StringComparison.Ordinal);
         Assert.Contains("Do not use `" + ShellTools.WriteToolName + "`", hint, StringComparison.Ordinal);
         Assert.Contains("run the same check again", hint, StringComparison.Ordinal);

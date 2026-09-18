@@ -250,7 +250,7 @@ curl -N -X POST http://localhost:5000/api/chat \
   <p><code>skill_step</code> 是执行过的内置工具，<code>skill</code>/<code>detail</code> 标识目标，<code>ok</code> 表示成功与否，<code>round</code> 从 1 起算；<code>files</code> 以 <code>{name, bytes, url}</code> 携带生成产物。→ <a href="#webui-sse">Web UI SSE 协议</a></p>
 
   <h3 id="agentic-http">智能体代码执行</h3>
-  <p>代码执行是服务端启动能力，不是逐请求开关。带上 <code>--code-exec</code> 后，每个能调用工具的聊天接口都可以使用五个服务端自有工具：<code>read_file</code>、<code>edit_file</code>、<code>write_file</code>、<code>shell</code> 与 <code>apply_patch</code>。它们与技能共用同一个有界循环，绝不会转发客户端；调用方定义的工具仍由调用方处理。这里没有逐命令审批 API。→ <a href="agentic_zh-cn.html">参数、沙箱与信任模型</a></p>
+  <p>代码执行是服务端启动能力，不是逐请求开关。带上 <code>--code-exec</code> 后，每个能调用工具的聊天接口都可以使用四个服务端自有工具：<code>read_file</code>、<code>write_file</code>、<code>shell</code> 与 <code>apply_patch</code>。它们与技能共用同一个有界循环，绝不会转发客户端；调用方定义的工具仍由调用方处理。这里没有逐命令审批 API。→ <a href="agentic_zh-cn.html">参数、沙箱与信任模型</a></p>
   <p>每个 OpenAI 或 Ollama 请求都得到唯一的私有工作区，在内部轮次之间共享，并在完成、取消或失败后删除。具名 Web UI 会话则跨聊天轮次保留工作区；技能脚本与代码工具共用它。保留的产物可通过 <code>GET /api/code/artifacts/{runId}</code> 列出，并从 <code>GET /api/code/artifacts/{runId}/{*path}</code> 下载；下载始终带 attachment 与 <code>nosniff</code>。</p>
   <div class="callout warn"><div class="ic">🔒</div><p>脚本与命令执行都默认关闭，OS 沙箱默认 <code>required</code>（要么隔离，要么拒绝）。macOS Seatbelt 与 Linux bubblewrap 0.12+ 会约束写入、主目录读取与默认关闭的网络，但 macOS 无法保证清理故意脱离的子进程。Windows job object 只约束进程树，不能限制文件或网络，因此代码需要显式 <code>--code-exec-unconfined</code>，技能脚本需要 <code>--skills-sandbox preferred</code>。<code>--code-exec-allow-network</code> 赋予生成命令不受限的宿主 IP 网络访问（含 LAN / loopback）；它与宿主代安装、<code>--skills-allow-network</code> 彼此独立。</p></div>
 

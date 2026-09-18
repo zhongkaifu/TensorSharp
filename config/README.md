@@ -210,7 +210,7 @@ Notes:
 
 The `agent-*.json` files turn a model into an **agent** rather than a chat
 endpoint: Agent Skills and their bundled scripts, network access for both, the
-`shell` / `read_file` / `edit_file` / `write_file` / `apply_patch` tool loop, and
+`shell` / `read_file` / `write_file` / `apply_patch` tool loop, and
 host-performed `pip` / `npm` installs are all switched on in one file. They point
 at local paths on an Apple Silicon Mac (`ggml_metal`), so change `backend` and the
 `variables` block to run them elsewhere.

@@ -440,14 +440,18 @@ result lands on 68.75 and is recorded as wrong. Every tool result is a fixed
 fixture; nothing is executed.
 
 Both loops are driven **from the client**. TensorSharp's own code-execution tool
-surface (`--code-exec`: `shell`, `read_file`, `edit_file`, `write_file`,
-`apply_patch`) is answered *inside the server* and never handed back to the API
+surface (`--code-exec`: `shell`, `read_file`, `write_file`, `apply_patch`) is
+answered *inside the server* and never handed back to the API
 client, it is off by default, and an OpenAI-request workspace is destroyed when
 the response ends — so it can neither be observed round-trip-by-round-trip nor
 carry a file from one request to the next, and llama.cpp and vLLM have no
 equivalent at all. A client-driven loop is the only shape that is both
 measurable and identical on every engine, which is what makes these cells
 comparable.
+
+On TensorSharp's server-owned surface, `apply_patch` handles every modification
+to an existing file, from a single-line change in one file to atomic changes
+across multiple files. `write_file` is reserved for creating new files.
 
 A follow-up that cannot continue — the model emitted no structured tool call,
 or called the wrong function — **stops the conversation there** instead of

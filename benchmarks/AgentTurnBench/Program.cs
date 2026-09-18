@@ -942,14 +942,13 @@ internal static class Corpus
         sb.AppendLine();
         sb.AppendLine("## Tools");
         sb.AppendLine("- read_file(path: string, offset?: integer, limit?: integer): return the numbered lines of a file in the workspace.");
-        sb.AppendLine("- write_file(path: string, content: string): create or replace a file in the workspace.");
-        sb.AppendLine("- edit_file(path: string, old_string: string, new_string: string): replace one exact occurrence of old_string.");
+        sb.AppendLine("- write_file(path: string, content: string): create a new file in the workspace; use apply_patch to modify an existing file.");
         sb.AppendLine("- shell(command: string, timeout_seconds?: integer): run a command in the sandboxed workspace shell and return stdout, stderr and the exit code.");
-        sb.AppendLine("- apply_patch(patch: string): apply a V4A patch to one or more workspace files.");
+        sb.AppendLine("- apply_patch(patch: string): atomically modify one file or multiple workspace files using anchored V4A hunks; also supports creating, renaming, and deleting files.");
         sb.AppendLine();
         sb.AppendLine("## Rules");
         sb.AppendLine("1. Read a file before editing it. Never guess its contents.");
-        sb.AppendLine("2. Prefer edit_file for small changes and apply_patch for multi-file changes; rewrite a whole file only when most of it changes.");
+        sb.AppendLine("2. Use apply_patch for every modification to an existing file, from a single-line edit to changes across multiple files. Use write_file only to create new files.");
         sb.AppendLine("3. After a code change, run the relevant tests or a syntax check with shell and report the result truthfully.");
         sb.AppendLine("4. Keep answers short. Do not repeat the tool output back to the user unless asked.");
         sb.AppendLine("5. If a command fails, show the error and propose one fix at a time.");

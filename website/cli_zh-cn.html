@@ -403,12 +403,12 @@ dotnet run --project TensorSharp.Cli/TensorSharp.Cli.csproj -- \
   <div class="callout warn"><div class="ic">🔒</div><p><strong>技能属于不受信任的内容。</strong>模型点名的每条路径都经过词法、规范化与符号链接检查，一个技能不能读取另一个技能。脚本执行仍是运维的信任决定：默认要求沙箱，但 macOS 会开放共享的 <code>/private/tmp</code>，且无法保证清理故意脱离的子进程；Windows 必须改用 <code>preferred</code> 才会运行，因为 job object 无法约束文件或网络。不要在面向不可信用户的共享服务上为不可信技能开启它。</p></div>
 
   <h2 id="code-exec">智能体工作与代码执行</h2>
-  <p><code>--code-exec</code> 启用有界的单助手模型 / 工具循环。TensorSharp 声明并执行五个内置工具：<code>read_file</code>、<code>edit_file</code>、<code>write_file</code>、<code>shell</code> 与原子化的 <code>apply_patch</code>；通过 <code>--tools</code> 提供的调用方工具仍回传调用方处理。这里没有子智能体运行时，也没有逐命令审批提示；下列启动参数就是运维授权。→ <a href="agentic_zh-cn.html">智能体工作</a></p>
+  <p><code>--code-exec</code> 启用有界的单助手模型 / 工具循环。TensorSharp 声明并执行四个内置工具：<code>read_file</code>、<code>write_file</code>、<code>shell</code> 与原子化的 <code>apply_patch</code>；通过 <code>--tools</code> 提供的调用方工具仍回传调用方处理。这里没有子智能体运行时，也没有逐命令审批提示；下列启动参数就是运维授权。→ <a href="agentic_zh-cn.html">智能体工作</a></p>
   <div class="table-scroll">
   <table>
     <thead><tr><th>选项</th><th>说明</th></tr></thead>
     <tbody>
-      <tr><td><code>--code-exec</code></td><td>提供全部五个内置工具。默认关闭；环境变量 <code>TS_CODE_EXEC</code>。没有持久工作区的直接调用方只能得到 <code>shell</code>，但 CLI 会话会保留工作区。</td></tr>
+      <tr><td><code>--code-exec</code></td><td>提供全部四个内置工具。默认关闭；环境变量 <code>TS_CODE_EXEC</code>。没有持久工作区的直接调用方只能得到 <code>shell</code>，但 CLI 会话会保留工作区。</td></tr>
       <tr><td><code>--code-exec-allow-install</code></td><td>允许宿主代为执行 pip/npm 安装，写入会话共享环境。默认关闭；不会赋予生成命令联网权限。环境变量：<code>TS_CODE_EXEC_ALLOW_INSTALL</code>。</td></tr>
       <tr><td><code>--code-exec-packages &lt;list&gt;</code></td><td>识别出的宿主安装器可装的软件包白名单，逗号分隔；空表示任意合法包。命令联网后它不再是出口边界。</td></tr>
       <tr><td><code>--code-exec-install-domains &lt;list&gt;</code> · <code>--code-exec-install-index &lt;url&gt;</code></td><td>安装器可访问的主机（默认 <code>pypi.org,files.pythonhosted.org,registry.npmjs.org</code>），以及运维指定的软件包索引。</td></tr>

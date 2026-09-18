@@ -80,7 +80,7 @@ public sealed class ChatGenerationPipelineContextWindowTests
         history.Add(new ChatMessage
         {
             Role = "assistant",
-            Content = "Repair the existing deck spec with edit_file, then rerun make_pptx.py.",
+            Content = "Repair the existing deck spec with apply_patch, then rerun make_pptx.py.",
         });
         history.Add(new ChatMessage
         {

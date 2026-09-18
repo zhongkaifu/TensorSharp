@@ -40,7 +40,7 @@ See the [embedding guide](../docs/embeddings.md) for all fields, token-ID inputs
 | Image editing | Qwen-Image-Edit (`qwen_image`) models are served through `/api/image-edit` and `/api/image-edit/stream`, not the chat endpoints |
 | Video generation | Any video-generation model — MiniMax-H3 (`minimax-h3`), Wan 2.1 / 2.2 (`wan`) — is served through `/api/video-generate`, `/api/video-generate/stream` and `/v1/videos/generations`; MiniMax-H3 returns a 32 kHz stereo `.wav` sidecar alongside the MP4, and `/api/models` advertises what conditioning the loaded checkpoint takes |
 | Agent Skills | Skill directories from `--skills-dir` (or a `skills` folder beside the binary), listed at `/v1/skills` and `/api/skills` and installable as a `.zip` through `POST /api/skills`. Selected per request with `"skills": [...]` on every chat endpoint. On families with both declaration and output-parser support, the model's own skill calls are answered inside the server, so clients receive a finished completion. No-tool families such as `qwen4exp` receive selected skill instructions inline instead. `skills_run` is off unless the server starts with `--skills-allow-exec`. |
-| Agentic code execution | `--code-exec` adds the in-process `shell`, `read_file`, `edit_file`, `write_file`, and `apply_patch` tools on tool-capable model families. Web UI keeps one workspace per chat session; each OpenAI/Ollama HTTP request gets a private workspace across its internal rounds and the server deletes it after the response. Network and package installation are separate, off-by-default permissions. |
+| Agentic code execution | `--code-exec` adds the in-process `shell`, `read_file`, `write_file`, and `apply_patch` tools on tool-capable model families. Web UI keeps one workspace per chat session; each OpenAI/Ollama HTTP request gets a private workspace across its internal rounds and the server deletes it after the response. Network and package installation are separate, off-by-default permissions. |
 | Structured outputs | OpenAI `response_format` supports `text`, `json_object`, and `json_schema`; `response_format` (`json_object` / `json_schema`) cannot be combined with `tools`, and combines with `think` only on families that declare where reasoning ends (GPT-OSS, DeepSeek V4.1, Qwen 3.8 Flash Next, Gemma 4, Nemotron-H, Muse-Glimmer) |
 
 > **Network safety:** the server listens on `0.0.0.0:5000` and has no API-key
@@ -140,7 +140,7 @@ model.
 
 ### Server-side agentic code execution
 
-Code execution is opt-in. A conservative local start enables the five built-in
+Code execution is opt-in. A conservative local start enables the four built-in
 tools while keeping the listener on loopback and leaving generated commands
 offline; Linux needs `bwrap` 0.12.0 or newer, while macOS uses its built-in
 Seatbelt sandbox:
@@ -502,7 +502,7 @@ tools comes back to you as usual — with whatever the model read from a skill
 already folded into the conversation.
 
 When the server starts with `--code-exec`, the same in-process loop may also use
-`shell`, `read_file`, `edit_file`, `write_file`, and `apply_patch`. Those built-in
+`shell`, `read_file`, `write_file`, and `apply_patch`. Those built-in
 calls stay inside TensorSharp; see [Server-side agentic code execution](#server-side-agentic-code-execution)
 for workspace, sandbox, network, install, and artifact behavior.
 

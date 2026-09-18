@@ -30,7 +30,7 @@
     <div class="card"><div class="ic">💭</div><h3>思考模式</h3><p>结构化的思维链，与可见答案分离。</p></div>
     <div class="card"><div class="ic">🛠️</div><h3>工具调用</h3><p>跨三种 API 风格的多轮函数调用。</p></div>
     <a class="card" href="#skills"><div class="ic">🧩</div><h3>Agent Skills（智能体技能）</h3><p>面向模型的说明文件夹，只在任务需要时才加载 —— 用 <code>--skill</code> 或 <code>"skills": ["pdf"]</code> 选中，其余内容由模型通过 TensorSharp 自己应答的内置工具取回。</p></a>
-    <a class="card" href="agentic_zh-cn.html"><div class="ic">🤖</div><h3>智能体工作</h3><p>有界模型 / 工具循环，带五个代码工具、隔离工作区、沙箱化命令、依赖安装、实时进度与可下载产物。</p></a>
+    <a class="card" href="agentic_zh-cn.html"><div class="ic">🤖</div><h3>智能体工作</h3><p>有界模型 / 工具循环，带四个代码工具、隔离工作区、沙箱化命令、依赖安装、实时进度与可下载产物。</p></a>
     <div class="card"><div class="ic">📦</div><h3>原生量化计算</h3><p>Q4_K_M、Q8_0、MXFP4、IQ2_XXS 等在 matmul 中直接运算，无需反量化到 FP32。</p></div>
     <div class="card"><div class="ic">🔀</div><h3>连续批处理</h3><p>vLLM 式分页 KV 缓存，跨请求前缀共享。</p></div>
     <a class="card" href="advanced_zh-cn.html#dspark"><div class="ic">⏩</div><h3>推测解码</h3><p>MTP / NextN 草稿头，以及 DeepSeek V4 的 DSpark 与 Muse-Glimmer 的 DFlash 块级草稿器加速单序列解码。</p></a>
@@ -77,7 +77,7 @@
     <li><strong>提示词形态</strong> —— 该文本块会并入首条 <code>system</code>/<code>developer</code> 消息，而不是另起一条——这是本仓库所有聊天模板都能正确处理的唯一注入点。它的每一个字节都是“排序后的技能选择”的纯函数：没有时间戳、没有路径、没有计数，因此同一段对话逐轮哈希结果一致，KV 前缀缓存可以从第 0 块起持续命中。</li>
     <li><strong>边界约束</strong> —— 模型给出的每一个路径都要经过 <code>SkillPathGuard</code>，它同时封堵词法层（<code>..</code>、绝对路径、<code>~</code>、UNC、盘符限定）、规范化层与<strong>符号链接</strong>三类逃逸，并把每个技能限制在它自己的目录内。ZIP 安装同样让每个条目走这道关卡（zip-slip），按解压后的字节流校验大小，并设置单文件（64 MB）、整包（256 MB）、条目数（4096）与压缩比（200×）上限。</li>
     <li><strong>模型家族差异</strong> —— 只有聊天渲染器与输出解析器都支持时才提供工具。Mistral 3 不承载工具声明，<code>qwen4exp</code> 则没有工具输出解析器；两者都会内联选中技能正文，并隐藏技能 / 代码工具，而不是发出无人能处理的调用。</li>
-    <li><strong>智能体代码执行</strong> —— <code>--code-exec</code> 增加 <code>read_file</code>、<code>edit_file</code>、<code>write_file</code>、<code>shell</code> 与 <code>apply_patch</code>。TensorSharp 在同一个有界循环中执行这些内置工具；调用方自己的工具从不代跑，仍回传调用方。普通技能循环默认 8 轮；提供代码执行时自动提高到 24 轮，除非运维显式设过上限。→ <a href="agentic_zh-cn.html">架构、权限与平台限制</a></li>
+    <li><strong>智能体代码执行</strong> —— <code>--code-exec</code> 增加 <code>read_file</code>、<code>write_file</code>、<code>shell</code> 与 <code>apply_patch</code>。TensorSharp 在同一个有界循环中执行这些内置工具；调用方自己的工具从不代跑，仍回传调用方。普通技能循环默认 8 轮；提供代码执行时自动提高到 24 轮，除非运维显式设过上限。→ <a href="agentic_zh-cn.html">架构、权限与平台限制</a></li>
     <li><strong>工作区与结果</strong> —— Web/CLI 聊天跨轮保留一个工作区；每个 OpenAI/Ollama 请求在其内部轮次间拥有独立工作区，结束后删除。技能脚本与代码工具共用它。Web UI 用临时 <code>tool_progress</code> 显示实时活动，并保留生成文件链接；服务端产物可从 <code>/api/code/artifacts/</code> 下载。</li>
     <li><strong>安全边界</strong> —— 生成命令默认离线。macOS Seatbelt 与 Linux bubblewrap 0.12+ 会约束写入与主目录读取；macOS 无法保证清理故意脱离的子进程。Windows job object 只能约束进程树，无法限制文件或网络，因此 required 模式会拒绝代码；运维必须显式选择 <code>--code-exec-unconfined</code>（技能脚本则是 <code>--skills-sandbox preferred</code>）。TensorSharp 没有逐命令审批 UI：启动参数就是运维的决定。</li>
     <li><strong>结构化输出</strong> —— 使用 <code>response_format</code> 的请求仍能选择技能，但技能正文会改为内联，内置技能 / 代码工具会被隐藏，因为 schema 约束下无法生成工具调用标记。</li>

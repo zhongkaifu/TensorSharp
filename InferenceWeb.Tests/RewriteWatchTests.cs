@@ -85,6 +85,15 @@ public class RewriteWatchTests : IDisposable
         // patch tool exists to avoid, so the advice would cause the thing it warns about.
         Assert.Contains("- line_5 = 5", note!, StringComparison.Ordinal);
         Assert.Contains("+ line_5 = 'LAYOUT_16x9'", note!, StringComparison.Ordinal);
+        Assert.Contains("patch argument", note!, StringComparison.Ordinal);
+        Assert.Contains("*** Begin Patch / *** End Patch", note!, StringComparison.Ordinal);
+        Assert.Contains("*** Update File: <path>", note!, StringComparison.Ordinal);
+        Assert.Contains("@@ hunks", note!, StringComparison.Ordinal);
+        Assert.Contains("single-file or multi-file change", note!, StringComparison.Ordinal);
+        Assert.Contains("they are not a patch to apply now", note!, StringComparison.Ordinal);
+        Assert.DoesNotContain("old_string", note!, StringComparison.Ordinal);
+        Assert.DoesNotContain("new_string", note!, StringComparison.Ordinal);
+        Assert.DoesNotContain("edit_file", note!, StringComparison.Ordinal);
     }
 
     // ---- and every case where it must stay quiet ------------------------------

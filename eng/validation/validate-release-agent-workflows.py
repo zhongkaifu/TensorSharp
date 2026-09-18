@@ -28,8 +28,8 @@ CASES = {
                   "expected": "release-shell-4821", "tools": ["shell"], "execution": True},
     "code_generation_run": {"prompt": "Create sum_numbers.py in the request workspace using write_file. Its function sum_numbers(n) must return the sum of the integers 1 through n. Use shell to run the program for n=37 and verify n=0 gives 0 and n=1 gives 1. Save result.json with exactly {\"n\":37,\"sum\":703,\"tests_passed\":true}. Return the artifact download link. Do not claim a test ran if shell refuses.",
                             "tools": ["write_file", "shell"], "artifact": {"n": 37, "sum": 703, "tests_passed": True}, "execution": True},
-    "code_edit_run": {"prompt": "Use write_file to create parity.py containing def parity(n): return 'even'. Use read_file to inspect it, then edit_file to fix it to return 'even' for even integers and 'odd' for odd integers. Use shell to run checks for -3,0,4,7. Write result.json containing exactly {\"outputs\":[\"odd\",\"even\",\"even\",\"odd\"],\"tests_passed\":true}. Return its download link. Do not claim execution if a tool refuses.",
-                      "tools": ["write_file", "read_file", "edit_file", "shell"], "artifact": {"outputs": ["odd", "even", "even", "odd"], "tests_passed": True}, "execution": True},
+    "code_edit_run": {"prompt": "Use write_file to create parity.py containing def parity(n): return 'even'. Use read_file to inspect it, then apply_patch to fix this single file to return 'even' for even integers and 'odd' for odd integers. Use shell to run checks for -3,0,4,7. Write result.json containing exactly {\"outputs\":[\"odd\",\"even\",\"even\",\"odd\"],\"tests_passed\":true}. Return its download link. Do not claim execution if a tool refuses.",
+                      "tools": ["write_file", "read_file", "apply_patch", "shell"], "artifact": {"outputs": ["odd", "even", "even", "odd"], "tests_passed": True}, "execution": True},
 }
 
 

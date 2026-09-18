@@ -40,7 +40,7 @@ curl http://127.0.0.1:5000/api/embeddings -H 'Content-Type: application/json' \
 | 图像编辑 | Qwen-Image-Edit（`qwen_image`）模型通过 `/api/image-edit` 与 `/api/image-edit/stream` 提供服务，而不是聊天端点 |
 | 视频生成 | 任何视频生成模型 —— MiniMax-H3（`minimax-h3`）、Wan 2.1 / 2.2（`wan`）—— 都通过 `/api/video-generate`、`/api/video-generate/stream` 与 `/v1/videos/generations` 提供服务；MiniMax-H3 在 MP4 之外还会返回一个 32 kHz 立体声 `.wav` 旁挂文件，`/api/models` 会告知当前加载的检查点接受哪些条件输入 |
 | Agent Skills | 技能目录来自 `--skills-dir`（或二进制文件旁的 `skills` 目录），在 `/v1/skills` 与 `/api/skills` 列出，也可通过 `POST /api/skills` 以 `.zip` 安装。所有聊天端点都可用 `"skills": [...]` 按请求选中。对同时支持工具声明与输出解析的模型族，模型自己的技能调用在服务端内部应答，因此客户端拿到完整回复；`qwen4exp` 等无工具模型族则以内联方式获得选中技能说明。`skills_run` 只有在服务启动时传入 `--skills-allow-exec` 才可用。 |
-| Agent 式代码执行 | `--code-exec` 会为支持工具调用的模型族加入进程内执行的 `shell`、`read_file`、`edit_file`、`write_file` 与 `apply_patch`。Web UI 每个聊天会话保留一个工作区；每个 OpenAI/Ollama HTTP 请求在内部轮次间使用私有工作区，响应结束后由服务删除。联网与安装软件包是相互独立且默认关闭的权限。 |
+| Agent 式代码执行 | `--code-exec` 会为支持工具调用的模型族加入进程内执行的 `shell`、`read_file`、`write_file` 与 `apply_patch`。Web UI 每个聊天会话保留一个工作区；每个 OpenAI/Ollama HTTP 请求在内部轮次间使用私有工作区，响应结束后由服务删除。联网与安装软件包是相互独立且默认关闭的权限。 |
 | 结构化输出 | OpenAI `response_format` 支持 `text`、`json_object`、`json_schema`；`response_format`（`json_object` / `json_schema`）不能与 `tools` 同时使用；只有声明了推理结束位置的模型家族（GPT-OSS、DeepSeek V4.1、Qwen 3.8 Flash Next、Gemma 4、Nemotron-H、Muse-Glimmer）允许与 `think` 同时使用 |
 
 > **网络安全：**服务监听 `0.0.0.0:5000`，没有 API Key 身份验证或内置 TLS。
@@ -135,7 +135,7 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model <model.gg
 
 ### 服务端 Agent 式代码执行
 
-代码执行必须显式开启。下面是一条较保守的本地启动命令：启用五个内置工具，
+代码执行必须显式开启。下面是一条较保守的本地启动命令：启用四个内置工具，
 同时只监听环回地址，并让模型生成的命令保持离线。Linux 需要 `bwrap` 0.12.0
 或更高版本，macOS 则使用系统自带的 Seatbelt 沙箱：
 
@@ -484,7 +484,7 @@ curl -X POST http://localhost:5000/api/chat/ollama \
 已经留在对话中。
 
 服务端使用 `--code-exec` 启动后，同一个进程内循环还可使用 `shell`、`read_file`、
-`edit_file`、`write_file` 与 `apply_patch`。这些内置调用始终留在 TensorSharp 内部；
+`write_file` 与 `apply_patch`。这些内置调用始终留在 TensorSharp 内部；
 工作区、沙箱、网络、安装与制品行为见[服务端 Agent 式代码执行](#服务端-agent-式代码执行)。
 
 ---

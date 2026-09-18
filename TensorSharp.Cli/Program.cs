@@ -3289,7 +3289,7 @@ namespace TensorSharp.Cli
         /// It is passed rather than assumed: this took the <c>DeclareTools()</c> overload
         /// whose <c>persists</c> defaults to true, so a CLI without a workspace would have
         /// been offered the file tools and the patcher — every call to which refuses,
-        /// because all four need a directory that outlives the call.
+        /// because all three need a directory that outlives the call.
         /// </param>
         /// <summary>
         /// The six editing rules for the tools that were actually declared, or the empty
@@ -3305,7 +3305,7 @@ namespace TensorSharp.Cli
                 tools.Any(t => string.Equals(t?.Name, name, StringComparison.Ordinal));
 
             return CodePrompt.Block(
-                fileTools: Declared(SkillToolNames.EditFile) && Declared(SkillToolNames.ReadFile),
+                fileTools: Declared(SkillToolNames.ReadFile) && Declared(SkillToolNames.WriteFile),
                 hasPatch: Declared(SkillToolNames.ApplyPatch));
         }
 

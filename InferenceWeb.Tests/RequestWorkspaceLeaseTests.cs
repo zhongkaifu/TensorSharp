@@ -91,10 +91,9 @@ public sealed class RequestWorkspaceLeaseTests : IDisposable
             new[]
             {
                 SkillToolNames.ReadFile,
-                SkillToolNames.EditFile,
+                SkillToolNames.ApplyPatch,
                 SkillToolNames.WriteFile,
                 SkillToolNames.Shell,
-                SkillToolNames.ApplyPatch,
             },
             plan.Tools.Select(tool => tool.Name));
         Assert.Contains(CodePrompt.Heading, plan.Prompt.Instructions, StringComparison.Ordinal);
@@ -117,8 +116,8 @@ public sealed class RequestWorkspaceLeaseTests : IDisposable
         CodeExecResult created = fileTools.WriteFile(
             new ShellTools.WriteRequest("main.py", "answer = 40 + 1\nprint(answer)\n"),
             lease.Workspace);
-        CodeExecResult edited = fileTools.EditFile(
-            new ShellTools.EditRequest("main.py", "40 + 1", "40 + 2", ReplaceAll: false),
+        CodeExecResult edited = fileTools.ApplyPatch(
+            "*** Begin Patch\n*** Update File: main.py\n@@\n-answer = 40 + 1\n+answer = 40 + 2\n*** End Patch",
             lease.Workspace);
 
         Assert.True(created.Ok, created.Content);
@@ -144,10 +143,9 @@ public sealed class RequestWorkspaceLeaseTests : IDisposable
                 ? new[]
                 {
                     SkillToolNames.ReadFile,
-                    SkillToolNames.EditFile,
+                    SkillToolNames.ApplyPatch,
                     SkillToolNames.WriteFile,
                     SkillToolNames.Shell,
-                    SkillToolNames.ApplyPatch,
                 }
                 : new[] { SkillToolNames.Shell };
             return names.Select(name => new ToolFunction { Name = name, Description = name }).ToArray();

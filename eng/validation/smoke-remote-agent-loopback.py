@@ -43,8 +43,10 @@ STEPS = {
                             ('shell', {'command': 'python3 sum_numbers.py'})],
     'code_edit_run': [('write_file', {'path': 'parity.py', 'content': PARITY_SOURCE}),
                       ('read_file', {'path': 'parity.py'}),
-                      ('edit_file', {'path': 'parity.py', 'old_string': "def parity(n): return 'even'",
-                                     'new_string': "def parity(n): return 'even' if n % 2 == 0 else 'odd'"}),
+                      ('apply_patch', {'patch': "*** Begin Patch\n*** Update File: parity.py\n@@\n"
+                                               "-def parity(n): return 'even'\n"
+                                               "+def parity(n): return 'even' if n % 2 == 0 else 'odd'\n"
+                                               "*** End Patch\n"}),
                       ('shell', {'command': 'python3 parity.py'})],
 }
 
@@ -163,7 +165,7 @@ def main():
         (args.output / 'scripted-http-trace.json').write_text(json.dumps(requests, indent=2) + '\n')
     passed = result.returncode == 0 and not errors and len(requests) == sum(len(value) + 1 for value in STEPS.values())
     report = {'status': 'passed' if passed else 'failed', 'scripted_fixture': True, 'release_qualified': False,
-              'scope': 'Real local file/read/edit/shell/sandbox/artifact/independent source checks; scripted responses, no model quality or native proof',
+              'scope': 'Real local file/read/patch/shell/sandbox/artifact/independent source checks; scripted responses, no model quality or native proof',
               'assembly_sha256': hashlib.sha256(args.assembly.read_bytes()).hexdigest(),
               'source_fixtures_sha256': hashlib.sha256(args.fixtures.read_bytes()).hexdigest(),
               'request_count': len(requests), 'errors': errors, 'profile_exit_code': result.returncode, 'command': command}

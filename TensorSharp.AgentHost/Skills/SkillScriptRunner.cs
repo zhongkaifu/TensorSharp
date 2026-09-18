@@ -614,7 +614,7 @@ namespace TensorSharp.AgentHost.Skills
                               .Append(overlay)
                               .Append("'. It was not overwritten, so any repair already made there is intact. "
                                       + "Continue with that copy: use read_file for only the relevant region, "
-                                      + "change the exact broken text with edit_file, and ")
+                                      + "change the broken region with apply_patch, and ")
                               .Append(runAdvice)
                               .Append("Do not rewrite the complete file. The skill's own copy is read-only "
                                       + "and unchanged.\n");
@@ -624,7 +624,7 @@ namespace TensorSharp.AgentHost.Skills
                             sb.Append("\nThe traceback points to this bundled script. A copy of this script is now in your working directory as '")
                               .Append(overlay)
                               .Append("'. Fix THAT copy: use read_file for only the relevant region, "
-                                      + "change the exact broken text with edit_file, and ")
+                                      + "change the broken region with apply_patch, and ")
                               .Append(runAdvice)
                               .Append("Do not rewrite the complete file. "
                                       + "The skill's own copy is read-only and unchanged.\n");
@@ -1192,7 +1192,7 @@ namespace TensorSharp.AgentHost.Skills
         /// Describe a malformed workspace JSON file passed through <c>--spec</c>, or
         /// return null when this failure does not prove that that input is the problem.
         /// The returned excerpt is also entered in the file ledger: an immediately
-        /// following <c>edit_file</c> call may use the shown text without spending a
+        /// following <c>apply_patch</c> call may use the shown text without spending a
         /// separate read round.
         /// </summary>
         private static string? InvalidJsonSpecRepairHint(
@@ -1276,11 +1276,11 @@ namespace TensorSharp.AgentHost.Skills
               .Append(byteInLine.ToString(CultureInfo.InvariantCulture)).Append(" is:\n")
               .Append(excerpt)
               .Append("Fix the smallest incorrect region in '").Append(display).Append("' with `")
-              .Append(ShellTools.EditToolName)
+              .Append(ShellTools.PatchToolName)
               .Append("`, then run the same skill call again. Do not use `")
               .Append(ShellTools.WriteToolName)
               .Append("` or re-type the whole spec, and do not edit or copy the bundled skill script. ")
-              .Append("If the exact edit no longer matches, read that region and retry against its current text.\n");
+              .Append("If the patch context no longer matches, read that region and retry against its current text.\n");
             return sb.ToString();
         }
 

@@ -16,7 +16,7 @@
 <main class="content" id="content">
   <div class="breadcrumb"><a href="index.html">Home</a> › Agentic Work</div>
   <h1>Agentic Work</h1>
-  <p class="lede">TensorSharp.AgentHost turns a local model response into a bounded <strong>generate → inspect → run → repair → answer</strong> loop. It can load Agent Skills only when they are needed, work with files through five built-in code tools, run checks inside an OS sandbox, and return finished artifacts to an ordinary CLI, Web UI, Ollama, or OpenAI client.</p>
+  <p class="lede">TensorSharp.AgentHost turns a local model response into a bounded <strong>generate → inspect → run → repair → answer</strong> loop. It can load Agent Skills only when they are needed, work with files through four built-in code tools, run checks inside an OS sandbox, and return finished artifacts to an ordinary CLI, Web UI, Ollama, or OpenAI client.</p>
 
   <h2 id="flow">What happens in one turn</h2>
   <ol class="steps">
@@ -67,21 +67,20 @@
   <p>The normal metadata block uses about 2% of the context window, clamped to roughly 1,024–10,000 tokens. The old behavior that inlined every selected body is off by default. A model family that cannot carry and parse tool declarations has no opportunity to call <code>skills_read</code>, so TensorSharp instead inlines selected skill bodies within a bounded fallback budget and does not advertise skills it cannot load.</p>
   <p>The built-in skill tools are <code>skills_list</code> and <code>skills_read</code>. A third tool, <code>skills_run</code>, appears only with <code>--skills-allow-exec</code>. Script execution is off by default and remains separate from model-authored code execution.</p>
 
-  <h2 id="code-tools">Five code tools, off by default</h2>
+  <h2 id="code-tools">Four code tools, off by default</h2>
   <p><code>--code-exec</code> adds a patch-first coding surface. It does not require a skill, and merely installing or selecting a skill does not turn it on.</p>
   <div class="table-scroll">
   <table>
     <thead><tr><th>Tool</th><th>Purpose</th><th>Important bound</th></tr></thead>
     <tbody>
       <tr><td><code>read_file</code></td><td>Read real workspace bytes with line numbers.</td><td>Bounded output; paths stay inside the workspace.</td></tr>
-      <tr><td><code>edit_file</code></td><td>Replace one exact string in one file.</td><td>Refuses missing or ambiguous matches instead of guessing.</td></tr>
-      <tr><td><code>write_file</code></td><td>Create a file or deliberately replace it whole.</td><td>Confined to the workspace and reports rewrite scope.</td></tr>
-      <tr><td><code>apply_patch</code></td><td>Create, update, rename, or delete several files by anchored hunks.</td><td>Atomic: all hunks apply or none do.</td></tr>
+      <tr><td><code>write_file</code></td><td>Create a new file.</td><td>Confined to the workspace; use <code>apply_patch</code> for existing files.</td></tr>
+      <tr><td><code>apply_patch</code></td><td>Modify one file or multiple files by anchored hunks, including a single-line change; also create, rename, or delete files.</td><td>Atomic: all hunks apply or none do.</td></tr>
       <tr><td><code>shell</code></td><td>Run tests, commands, and generated programs.</td><td>Timeout and output caps; sandbox-or-refuse on supported hosts.</td></tr>
     </tbody>
   </table>
   </div>
-  <p>Failures are designed to be repairable. A diagnostic that identifies a regular source file in the workspace returns a bounded source excerpt and asks for the smallest exact edit before rerunning. Syntax checks, missing-import installation when allowed, and installed-library API hints reduce avoidable model rounds.</p>
+  <p>Failures are designed to be repairable. A diagnostic that identifies a regular source file in the workspace returns a bounded source excerpt and asks for the smallest <code>apply_patch</code> change before rerunning. Syntax checks, missing-import installation when allowed, and installed-library API hints reduce avoidable model rounds.</p>
 
   <h2 id="workspaces">Workspace lifetime and artifacts</h2>
   <div class="table-scroll">
@@ -95,7 +94,7 @@
     </tbody>
   </table>
   </div>
-  <p>When code execution is enabled, a skill script shares the same request/chat workspace as the five code tools. The server copies produced files into its bounded artifact store; the Web UI exposes safe download links, and artifact responses are sent as attachments with content sniffing disabled.</p>
+  <p>When code execution is enabled, a skill script shares the same request/chat workspace as the four code tools. The server copies produced files into its bounded artifact store; the Web UI exposes safe download links, and artifact responses are sent as attachments with content sniffing disabled.</p>
 
   <h2 id="sandbox">Sandbox-or-refuse security model</h2>
   <p>Enabling execution is an operator decision, not a request field. On macOS and Linux, model-authored commands and opted-in skill scripts run with a workspace write boundary, an unreadable home directory, a scrubbed environment, and network denied by default. Paths are also checked in process before the OS sandbox is entered.</p>
@@ -129,7 +128,7 @@
   <pre data-lang="bash"><code>dotnet run --project TensorSharp.Cli -c Release -- \
   --model models/model.gguf --backend ggml_metal \
   --skills-dir ./skills --skill pdf -i</code></pre>
-  <p>Add the five code tools explicitly. This example keeps both command networking and package installation off:</p>
+  <p>Add the four code tools explicitly. This example keeps both command networking and package installation off:</p>
   <pre data-lang="bash"><code>dotnet run --project TensorSharp.Cli -c Release -- \
   --model models/model.gguf --backend ggml_metal \
   --skills-dir ./skills --skill pdf --code-exec -i</code></pre>
@@ -153,10 +152,10 @@
   "skills_discovery": false,
   "stream": true
 }</code></pre>
-  <p><code>skills_discovery</code> defaults to <code>true</code>. Code execution has no per-request enable field: the operator either started the host with <code>--code-exec</code> or the five tools are absent. The agent loop allows 8 internal rounds by default, or 24 when code execution is enabled; <code>--skills-max-rounds</code> sets an explicit 1–64 bound.</p>
+  <p><code>skills_discovery</code> defaults to <code>true</code>. Code execution has no per-request enable field: the operator either started the host with <code>--code-exec</code> or the four tools are absent. The agent loop allows 8 internal rounds by default, or 24 when code execution is enabled; <code>--skills-max-rounds</code> sets an explicit 1–64 bound.</p>
 
   <h2 id="compatibility">Model-family limits</h2>
-  <p>The in-process loop requires a model family that can both carry tool declarations and parse tool calls. Families without that round trip receive selected skill instructions inline as a fallback, but are not offered the five code tools. TensorSharp logs the limitation rather than silently pretending code execution is available.</p>
+  <p>The in-process loop requires a model family that can both carry tool declarations and parse tool calls. Families without that round trip receive selected skill instructions inline as a fallback, but are not offered the four code tools. TensorSharp logs the limitation rather than silently pretending code execution is available.</p>
 
   <div class="content-footer">
     <a href="server.html">← Server &amp; Web UI</a>

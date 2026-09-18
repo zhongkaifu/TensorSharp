@@ -160,15 +160,13 @@ namespace TensorSharp.AgentHost.CodeExec
                 };
             }
 
-            // ORDER MATTERS, and this is the order. read_file and edit_file come first
-            // because a declaration list is read top-down and the measured failure is a
-            // model reaching for the shell to do a job the editor does better; apply_patch
-            // stays last, now correctly, as the specialist for a change that spans several
-            // files atomically.
+            // Keep reading and patching before the shell: apply_patch handles every
+            // modification, from a single line in one file to an atomic multi-file change.
+            // Legacy edit calls remain dispatchable but are not advertised to the model.
             return new[]
             {
                 ShellTools.DeclareRead(),
-                ShellTools.DeclareEdit(),
+                ShellTools.DeclarePatch(),
                 ShellTools.DeclareWrite(),
                 ShellTools.DeclareShell(
                     _options, shell, _runner.KeepsArtifacts, persists, fileTools: true,
@@ -178,7 +176,6 @@ namespace TensorSharp.AgentHost.CodeExec
                     networkHosts: _networkHosts?.Invoke(),
                         providedPackagesInstructions: _providedPackagesInstructions,
                         executionInstructions: _executionInstructions),
-                ShellTools.DeclarePatch(),
             };
         }
 

@@ -128,7 +128,7 @@ namespace TensorSharp.AgentHost.CodeExec
         /// </para>
         /// </param>
         /// <param name="fileTools">
-        /// Whether <c>read_file</c>, <c>edit_file</c> and <c>write_file</c> are on this
+        /// Whether <c>read_file</c>, <c>apply_patch</c> and <c>write_file</c> are on this
         /// endpoint. It is a PARAMETER rather than an assumption because the advice it
         /// changes is the advice that decides whether a model re-types a file: an endpoint
         /// that keeps nothing between calls has no file tools and must be told to write
@@ -173,9 +173,12 @@ namespace TensorSharp.AgentHost.CodeExec
 
             description.Append("Run a ").Append(shell.DialectName)
                 .Append(" command in this conversation's working directory and read back what it printed. ")
-                .Append("This is how you do everything with files and code here: create and edit them, run ")
-                .Append("them, search them, move and delete them, inspect what a program produced, and check ")
-                .Append("your own work. Running code is more reliable than doing arithmetic or parsing in your head.\n");
+                .Append(fileTools
+                    ? "Use it to run code, search files, inspect program output, and check your work. "
+                    : "This is how you do everything with files and code here: create and edit them, run "
+                      + "them, search them, move and delete them, inspect what a program produced, and check "
+                      + "your own work. ")
+                .Append("Running code is more reliable than doing arithmetic or parsing in your head.\n");
 
             description.Append("\nWhat you are typing into: ").Append(shell.DialectName).Append(". ");
             if (persists)
@@ -337,11 +340,13 @@ namespace TensorSharp.AgentHost.CodeExec
             if (fileTools)
             {
                 description.Append("\nFiles: use ").Append(ReadToolName).Append(" to read one, ")
-                    .Append(EditToolName).Append(" to change part of one, and ").Append(WriteToolName)
-                    .Append(" to create one. Do not use this tool to write a file you could edit — ")
+                    .Append(PatchToolName).Append(" to modify or update one file or multiple files, and ")
+                    .Append(WriteToolName).Append(" only to create a new file. Use ")
+                    .Append(PatchToolName).Append(" for all changes to existing files. Do not use this tool ")
+                    .Append("to rewrite a file you could patch — ")
                     .Append("re-typing a file costs you every line that was already right, and re-rolls ")
                     .Append("each of them, which is how a second bug appears in code that worked. ")
-                    .Append("Use the shell to RUN things, to search, and to move, copy and delete files.\n");
+                    .Append("Use the shell to RUN things and to search.\n");
             }
             else
             {
@@ -378,7 +383,7 @@ namespace TensorSharp.AgentHost.CodeExec
                 : "`Get-ChildItem`, `Get-Content`, `Get-Content file -TotalCount 40`, "
                   + "`Select-String -Pattern p -Path *.py`, `New-Item -ItemType Directory`, `Move-Item`, "
                   + "`Remove-Item`, `python x.py`, `node x.js`.");
-            if (posix)
+            if (posix && !fileTools)
             {
                 // Two rounds were spent on this in the logs, twice with the same error:
                 //   sed: 1: "create_slides.py\n": command c expects \\ followed by text
@@ -414,7 +419,7 @@ namespace TensorSharp.AgentHost.CodeExec
                 description.Append(" To read a file, use ").Append(ReadToolName)
                     .Append(" rather than ").Append(posix ? "`cat` or `sed -n`" : "`Get-Content`")
                     .Append(": it numbers the lines, so you can copy exact text out of it into an ")
-                    .Append(EditToolName).Append(" call.");
+                    .Append(PatchToolName).Append(" call.");
             }
             description.Append('\n');
 
@@ -521,10 +526,10 @@ namespace TensorSharp.AgentHost.CodeExec
                     "Read a file from the working directory and see its exact current contents, with "
                     + "line numbers. Use it before changing a file you did not just write, and to check "
                     + "what a program produced. Reading is how you get text you can copy into "
-                    + EditToolName + " — an edit has to match the file byte for byte, so copy the text, "
+                    + PatchToolName + " — patch context and removed lines must match the current file, so copy the text, "
                     + "do not retype it from memory.\n"
                     + "Lines come back as '   42 | the text of the line'. The number and the ' | ' are "
-                    + "NOT part of the file: never include them in " + EditToolName + ". Indentation "
+                    + "NOT part of the file: never include them in " + PatchToolName + ". Indentation "
                     + "after the ' | ' IS part of the file and must be kept exactly.\n"
                     + "By default you get the start of the file; for a longer one, use 'offset' and "
                     + "'limit' to walk through it, and the result tells you how many lines there are in "
@@ -566,7 +571,7 @@ namespace TensorSharp.AgentHost.CodeExec
         public const int DefaultReadLines = 400;
 
         /// <summary>
-        /// Declare <c>edit_file</c>.
+        /// Declare the legacy <c>edit_file</c> API, which is not advertised by the host.
         ///
         /// <para>
         /// Short on purpose. The entire output obligation is two strings, and the two
@@ -639,10 +644,8 @@ namespace TensorSharp.AgentHost.CodeExec
             {
                 Name = WriteToolName,
                 Description =
-                    "Create a new file. To intentionally replace a file that already exists, set "
-                    + "overwrite=true; otherwise the host refuses before changing it. Reserve full "
-                    + "replacement for the rare case where the old file should be discarded.\n"
-                    + "To CHANGE a file that already exists, use " + EditToolName + " instead. Rewriting "
+                    "Create a new file. If the path already exists, the host refuses before changing it.\n"
+                    + "To modify or update any existing file, use " + PatchToolName + ". Rewriting "
                     + "a file to change part of it costs you every line that was already correct and "
                     + "re-rolls each one, which is how a second bug appears in code that worked — and it "
                     + "is slow, because you pay for every line twice.\n"
@@ -660,14 +663,6 @@ namespace TensorSharp.AgentHost.CodeExec
                         Type = "string",
                         Description = "The complete contents of the file.",
                     },
-                    ["overwrite"] = new()
-                    {
-                        Type = "boolean",
-                        Description =
-                            "Optional confirmation for an intentional full replacement of a file that already "
-                            + "exists. Omit or false for normal use. A local bug fix belongs in edit_file, not "
-                            + "here; set true only when the old file genuinely should be discarded in full.",
-                    },
                 },
                 Required = new List<string> { "path", "content" },
             };
@@ -682,10 +677,10 @@ namespace TensorSharp.AgentHost.CodeExec
             {
                 Name = PatchToolName,
                 Description =
-                    "Change SEVERAL FILES AT ONCE, all or nothing: if any part of the patch does not fit, "
-                    + "nothing is written anywhere. That is what this tool is for. To change one thing in "
-                    + "one file, use " + EditToolName + " instead — it is simpler and there is no envelope "
-                    + "to get wrong.\n"
+                    "Modify or update a single file or multiple files. This is the only tool for changing "
+                    + "existing files, including a one-line fix in one file. Patch only the lines that need "
+                    + "to change and leave unrelated content intact. All changes are atomic: if any part "
+                    + "of the patch does not fit, nothing is written anywhere.\n"
                     + "It does all four kinds of change, over as many files as you like in one call: ADD a "
                     + "file, UPDATE one, DELETE one, and rename with '*** Move to:'.\n"
                     + "Send the whole envelope in 'patch':\n"
@@ -965,7 +960,8 @@ namespace TensorSharp.AgentHost.CodeExec
             if (oldString == null || oldString.Length == 0)
             {
                 error = "the 'old_string' argument is required: the exact text to replace, copied from "
-                      + "the file. To create a file or replace one completely, use " + WriteToolName + ".";
+                      + "the file. Use " + PatchToolName + " to modify or replace existing content, and "
+                      + WriteToolName + " only to create a new file.";
                 return false;
             }
 

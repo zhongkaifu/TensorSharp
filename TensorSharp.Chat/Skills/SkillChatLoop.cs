@@ -237,7 +237,7 @@ namespace TensorSharp.Server.Skills
                             + "or saved. Do not continue or resend that text. Take a different approach in one "
                             + "short step: produce long or repetitive content with a loop or a library rather "
                             + "than spelling it out, keep each command brief, and if a file must be long, write "
-                            + "it in parts with write_file/edit_file. Then continue the task.";
+                            + "it in parts with apply_patch. Then continue the task.";
                         working.Add(calls.Count == 0
                             ? new HostCompletionCorrectionMessage { Role = "user", Content = feedback }
                             : BuildResult(plan, feedback));

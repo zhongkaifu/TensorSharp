@@ -211,7 +211,7 @@ namespace TensorSharp.AgentHost.CodeExec
         /// <param name="path">The file's name, as the model spelled it.</param>
         /// <param name="before">What it held.</param>
         /// <param name="after">What it holds now.</param>
-        /// <param name="editToolName">The tool to point at instead.</param>
+        /// <param name="editToolName">The patch tool to point at instead.</param>
         /// <returns>The note, or null when this was not a re-typing.</returns>
         public static string? DescribeRetyped(string path, string? before, string? after, string editToolName)
         {
@@ -256,7 +256,7 @@ namespace TensorSharp.AgentHost.CodeExec
         /// was rewritten must not be told it should have edited.
         /// </para>
         /// </summary>
-        private static string? Compare(string path, string[] before, string[] after, string editToolName)
+        private static string? Compare(string path, string[] before, string[] after, string patchToolName)
         {
             if (before.Length < MinLines && after.Length < MinLines)
                 return null;
@@ -298,31 +298,17 @@ namespace TensorSharp.AgentHost.CodeExec
             sb.Append("Re-typing a file costs you every line that was already correct, and re-rolls "
                     + "each of them, which is how a second bug appears in code that worked. ");
 
-            // A ready-to-send call, not a preference. "Prefer editing" is an instruction
-            // the logs show models read and did not act on; a filled-in example of the
-            // exact call is one they can copy.
-            if (removed.Count == 1 && added.Count == 1)
-            {
-                sb.Append("That change was one line, so next time call ").Append(editToolName)
-                  .Append(" with path=\"").Append(path).Append("\", old_string=")
-                  .Append(Quote(removed[0])).Append(" and new_string=").Append(Quote(added[0]))
-                  .Append(".\n");
-            }
-            else
-            {
-                sb.Append("Next time, send just the lines that differ to ").Append(editToolName)
-                  .Append(" — one call per change, each with the exact text to replace.\n");
-            }
+            // Difference is an unordered, potentially clipped summary. It cannot supply
+            // the ordered context required by a patch, and the change has already happened.
+            sb.Append("For the next modification, use ").Append(patchToolName)
+              .Append(" for either a single-file or multi-file change. Set its patch argument to a "
+                    + "*** Begin Patch / *** End Patch envelope with a *** Update File: <path> section "
+                    + "per existing file and @@ hunks containing exact current context (space prefix), "
+                    + "removed lines (-), and replacement lines (+). Read the relevant current region "
+                    + "if needed. Multiple hunks and file sections can share one patch. The excerpts "
+                    + "above summarize the completed change; they are not a patch to apply now.\n");
 
             return sb.ToString();
-        }
-
-        /// <summary>A line as it would be written in a tool argument, clipped and escaped.</summary>
-        private static string Quote(string line)
-        {
-            string clipped = Clip(line);
-            return "\"" + clipped.Replace("\\", "\\\\", StringComparison.Ordinal)
-                                 .Replace("\"", "\\\"", StringComparison.Ordinal) + "\"";
         }
 
         /// <summary>

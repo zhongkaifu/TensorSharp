@@ -620,23 +620,25 @@ public class FileToolsTests : IDisposable
 
         Assert.False(result.Ok);
         Assert.Equal("value = 1\nkeep = true\n", Read("main.py"));
-        Assert.Contains(ShellTools.EditToolName, result.Content, StringComparison.Ordinal);
-        Assert.Contains("overwrite=true", result.Content, StringComparison.Ordinal);
+        Assert.Contains(ShellTools.PatchToolName, result.Content, StringComparison.Ordinal);
+        Assert.DoesNotContain(ShellTools.EditToolName, result.Content, StringComparison.Ordinal);
+        Assert.DoesNotContain("overwrite=true", result.Content, StringComparison.Ordinal);
+        Assert.Contains("write_file only to create", result.Content, StringComparison.Ordinal);
         Assert.Contains("Nothing was written", result.Content, StringComparison.Ordinal);
     }
 
     [Fact]
-    public void TheWriteToolRequiresAnOverwriteFlagForAnExistingFile()
+    public void TheWriteToolAdvertisesOnlyNewFileCreation()
     {
         ToolFunction declaration = ShellTools.DeclareWrite();
 
-        Assert.Contains("overwrite", declaration.Parameters.Keys);
+        Assert.DoesNotContain("overwrite", declaration.Parameters.Keys);
         Assert.DoesNotContain("overwrite", declaration.Required);
-        Assert.Contains("local bug fix", declaration.Parameters["overwrite"].Description, StringComparison.Ordinal);
+        Assert.Contains(ShellTools.PatchToolName, declaration.Description, StringComparison.Ordinal);
     }
 
     [Fact]
-    public void TheDeclaredOverwriteArgumentIsParsedAsExplicitConfirmation()
+    public void TheLegacyOverwriteArgumentIsParsedAsExplicitConfirmation()
     {
         var call = new ToolCall
         {
@@ -759,10 +761,8 @@ public class FileToolsTests : IDisposable
     [Fact]
     public void AWriteThatRetypesAFileToChangeOneLine_IsNamedWithTheNumbers()
     {
-        // The sanctioned rewrite path, which is the whole reason write_file exists even
-        // though a whole-file write is the thing being discouraged: here the rewrite can
-        // be noticed BY CONSTRUCTION, rather than by scanning a command line for a
-        // redirect and missing every other way a file gets replaced.
+        // The legacy overwrite API can still notice a rewrite by construction rather
+        // than by scanning a command line for a redirect.
         string before = string.Join("\n", Enumerable.Range(1, 60).Select(i => $"line{i} = {i}")) + "\n";
         Write("deck.py", before);
         Assert.True(DoRead("deck.py").Ok);
@@ -775,13 +775,15 @@ public class FileToolsTests : IDisposable
         Assert.Contains("only 1 line is different", result.Content, StringComparison.Ordinal);
         Assert.Contains("59 lines came back exactly as they already were", result.Content, StringComparison.Ordinal);
 
-        // The differing lines themselves, and a call the model can copy. Telling it to
-        // "send those lines to edit_file" without saying WHICH would ask it to
-        // reconstruct them from memory, which is the failure being prevented.
+        // Show the differing lines as evidence and explain the actual patch argument.
+        // A multiset comparison cannot safely produce an ordered contextual patch.
         Assert.Contains("- line30 = 30", result.Content, StringComparison.Ordinal);
         Assert.Contains("+ line30 = 999", result.Content, StringComparison.Ordinal);
-        Assert.Contains(ShellTools.EditToolName, result.Content, StringComparison.Ordinal);
-        Assert.Contains("old_string=", result.Content, StringComparison.Ordinal);
+        Assert.Contains(ShellTools.PatchToolName, result.Content, StringComparison.Ordinal);
+        Assert.Contains("patch argument", result.Content, StringComparison.Ordinal);
+        Assert.Contains("*** Update File:", result.Content, StringComparison.Ordinal);
+        Assert.DoesNotContain(ShellTools.EditToolName, result.Content, StringComparison.Ordinal);
+        Assert.DoesNotContain("old_string=", result.Content, StringComparison.Ordinal);
     }
 
     [Fact]

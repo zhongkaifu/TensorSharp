@@ -49,7 +49,7 @@ public class CodePromptTests
         string block = CodePrompt.Block(fileTools: true, hasPatch: true);
 
         Assert.Contains(SkillToolNames.ReadFile, block, StringComparison.Ordinal);
-        Assert.Contains(SkillToolNames.EditFile, block, StringComparison.Ordinal);
+        Assert.DoesNotContain(SkillToolNames.EditFile, block, StringComparison.Ordinal);
         Assert.Contains(SkillToolNames.WriteFile, block, StringComparison.Ordinal);
         Assert.Contains(SkillToolNames.ApplyPatch, block, StringComparison.Ordinal);
         Assert.Contains(SkillToolNames.Shell, block, StringComparison.Ordinal);
@@ -63,7 +63,8 @@ public class CodePromptTests
         string block = CodePrompt.Block(fileTools: true, hasPatch: false);
 
         Assert.DoesNotContain(SkillToolNames.ApplyPatch, block, StringComparison.Ordinal);
-        Assert.Contains(SkillToolNames.EditFile, block, StringComparison.Ordinal);
+        Assert.DoesNotContain(SkillToolNames.EditFile, block, StringComparison.Ordinal);
+        Assert.Contains("`write_file` only to create a new file", block, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -83,6 +84,8 @@ public class CodePromptTests
         string block = CodePrompt.Block(fileTools: true, hasPatch: true);
 
         Assert.Contains("Never rewrite a whole file to change part of it", block, StringComparison.Ordinal);
+        Assert.Contains("one file or multiple files", block, StringComparison.Ordinal);
+        Assert.Contains("only tool for changing existing files", block, StringComparison.Ordinal);
         Assert.Contains("do not read the file back", block, StringComparison.Ordinal);
     }
 

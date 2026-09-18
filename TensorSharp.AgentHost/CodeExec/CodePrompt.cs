@@ -55,9 +55,9 @@ namespace TensorSharp.AgentHost.CodeExec
         /// The block, or the empty string when this host has no file tools to talk about.
         /// </summary>
         /// <param name="fileTools">
-        /// Whether <c>read_file</c>, <c>edit_file</c> and <c>write_file</c> are declared.
-        /// A caller with no workspace has none of them, and telling such a model to "use
-        /// edit_file" names a tool it was never given — the one failure worse than saying
+        /// Whether <c>read_file</c> and <c>write_file</c> are declared.
+        /// A caller with no workspace has neither, and telling such a model to use a
+        /// file tool names a tool it was never given — the one failure worse than saying
         /// nothing, because the model cannot tell that the instruction is inapplicable
         /// rather than that it has misread its own tool list.
         /// </param>
@@ -70,34 +70,29 @@ namespace TensorSharp.AgentHost.CodeExec
             var sb = new StringBuilder();
             sb.Append(Heading).Append('\n');
 
-            sb.Append("- To change part of a file that already exists, use `")
-              .Append(ShellTools.EditToolName)
-              .Append("`. Never rewrite a whole file to change part of it: it costs you every line "
-                    + "that was already right, re-rolls each one, and is how a second bug appears in "
-                    + "code that worked.\n");
-
-            sb.Append("- Use `").Append(ShellTools.WriteToolName)
-              .Append("` only to create a new file, or when a file genuinely should be thrown away "
-                    + "and written again.\n");
-
             if (hasPatch)
             {
-                sb.Append("- Use `").Append(ShellTools.PatchToolName)
-                  .Append("` when one change spans several files and all of it has to land or none "
-                        + "of it.\n");
+                sb.Append("- To modify or update one file or multiple files, use `")
+                  .Append(ShellTools.PatchToolName)
+                  .Append("`. It is the only tool for changing existing files. Never rewrite a whole "
+                        + "file to change part of it: patch only the necessary lines and keep the rest intact.\n");
             }
 
+            sb.Append("- Use `").Append(ShellTools.WriteToolName)
+              .Append("` only to create a new file.\n");
+
             sb.Append("- Read a file with `").Append(ShellTools.ReadToolName)
-              .Append("` before an edit that depends on lines you cannot already see. An edit has to "
-                    + "match the file exactly, so copy the text out of what you read rather than "
-                    + "recalling it.\n");
+              .Append(hasPatch
+                  ? "` before a patch that depends on lines you cannot already see. Copy the current "
+                    + "text into patch context and removed lines rather than recalling it.\n"
+                  : "` to see its current contents.\n");
 
             sb.Append("- After an edit or a write reports success, do not read the file back to check "
                     + "it. The result is authoritative — if it had not applied, it would have said so.\n");
 
             sb.Append("- Search with `rg` (or `grep -rn`) through the `")
               .Append(ShellTools.ShellToolName)
-              .Append("`; use the shell to run programs, and to move, copy and delete files.\n");
+              .Append("`; use the shell to run programs and checks.\n");
 
             // Without this line a model given file tools treats the CONVERSATION as if
             // it were a filesystem. Measured on gemma-4-E4B: asked a question about a

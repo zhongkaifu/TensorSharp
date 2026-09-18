@@ -76,7 +76,7 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model ./models/
   </ul>
 
   <h2 id="agentic">Agentic Work 与代码执行</h2>
-  <p>在能够完整往返工具调用的模型家族上，服务器可让<strong>单个模型</strong>在进程内执行「生成 → 工具 → 再生成」循环。Agent Skills 可以在不执行脚本的情况下被发现与读取；运维者需另行传入 <code>--skills-allow-exec</code> 才允许运行技能自带脚本。<code>--code-exec</code> 则显式开启由宿主处理的 <code>read_file</code>、<code>edit_file</code>、<code>write_file</code>、<code>apply_patch</code> 与沙箱化 <code>shell</code> 工具。Web UI 聊天会话会在各轮之间保留私有工作区；无状态 API 请求各自获得隔离的请求工作区，并在结束后删除。</p>
+  <p>在能够完整往返工具调用的模型家族上，服务器可让<strong>单个模型</strong>在进程内执行「生成 → 工具 → 再生成」循环。Agent Skills 可以在不执行脚本的情况下被发现与读取；运维者需另行传入 <code>--skills-allow-exec</code> 才允许运行技能自带脚本。<code>--code-exec</code> 则显式开启由宿主处理的 <code>read_file</code>、<code>write_file</code>、<code>apply_patch</code> 与沙箱化 <code>shell</code> 工具。Web UI 聊天会话会在各轮之间保留私有工作区；无状态 API 请求各自获得隔离的请求工作区，并在结束后删除。</p>
   <div class="callout warn"><div class="ic">🔒</div><p>执行类工具在运维者开启前保持关闭，但一旦开启，系统不会再逐条命令弹出审批。沙箱模式默认是 <code>required</code>，无法安全隔离时直接拒绝：macOS 使用 Seatbelt，Linux 要求 bubblewrap 0.12.0 或更新版本。Windows Job Object 只能约束后代进程，不能隔离文件系统或网络，因此技能脚本需要显式选择更弱的沙箱模式，而模型生成的命令需要 <code>--code-exec-unconfined</code>。这是 agentic 工具循环，并非多智能体编排。完整参数、模型家族限制、工作区生命周期与安全边界见 <a href="agentic_zh-cn.html">Agentic Work、Skills 与沙箱</a>。</p></div>
 
   <h2 id="video">视频生成：网页界面能设什么，什么只能靠 API</h2>

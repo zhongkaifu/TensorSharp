@@ -38,7 +38,7 @@
       <tr><td><code>TensorSharp.Server</code></td><td><code>TensorSharp.Server</code></td><td>ASP.NET Core 库：OpenAI/Ollama 适配器、基于 TensorSharp.Chat 的 HTTP 传输、Web UI 资源。它是库——单独构建不产生可执行文件。</td></tr>
       <tr><td><code>TensorSharp.Server.Host</code></td><td><code>TensorSharp.Server.Host</code></td><td>基于该库的可运行 Web 应用：<code>Program.cs</code>、宿主装配、<code>wwwroot/</code> 与命令行。实际运行的是它。尚未发布到 NuGet.org。</td></tr>
       <tr><td><code>TensorSharp.Cli</code></td><td><code>TensorSharp.Cli</code></td><td>控制台宿主与调试 / 批处理工具。</td></tr>
-      <tr><td><code>TensorSharp.AgentHost</code></td><td><code>TensorSharp.AgentHost.*</code></td><td>技能、有界智能体循环、五个代码工具、沙箱、工作区与产物。尚未发布到 NuGet.org。</td></tr>
+      <tr><td><code>TensorSharp.AgentHost</code></td><td><code>TensorSharp.AgentHost.*</code></td><td>技能、有界智能体循环、四个代码工具、沙箱、工作区与产物。尚未发布到 NuGet.org。</td></tr>
       <tr><td><code>TensorSharp.Distributed</code></td><td><code>TensorSharp.Distributed</code></td><td>点对点 TCP 分布式张量并行。尚未发布到 NuGet.org。</td></tr>
     </tbody>
   </table>
@@ -300,7 +300,7 @@ foreach (SkillToolInvocation call in reply.SkillInvocations)
   <p>完整参考（frontmatter 字段、提示词预算与安全模型）见 <code>docs/agent_skills.md</code>。可直接取用的开源技能：<a href="https://github.com/anthropics/skills" target="_blank" rel="noopener">github.com/anthropics/skills</a>。</p>
 
   <h2 id="agenthost">AgentHost 运行时层</h2>
-  <p><code>TensorSharp.AgentHost</code> 是构建在 <code>TensorSharp.Runtime</code> 之上的可选智能体层；Runtime 不反向依赖它。<code>CodeExecOptions</code>、<code>ShellRunner</code> 与 <code>CodeRunnerAdapter</code> 实现宿主拥有的五个工具：<code>read_file</code>、<code>edit_file</code>、<code>write_file</code>、<code>shell</code>、<code>apply_patch</code>。只有宿主提供持久工作区时才声明文件工具；没有工作区的直接调用方只获得 <code>shell</code>。</p>
+  <p><code>TensorSharp.AgentHost</code> 是构建在 <code>TensorSharp.Runtime</code> 之上的可选智能体层；Runtime 不反向依赖它。<code>CodeExecOptions</code>、<code>ShellRunner</code> 与 <code>CodeRunnerAdapter</code> 实现宿主拥有的四个工具：<code>read_file</code>、<code>write_file</code>、<code>shell</code>、<code>apply_patch</code>。只有宿主提供持久工作区时才声明文件工具；没有工作区的直接调用方只获得 <code>shell</code>。</p>
   <p><code>SkillAgentLoop</code> 运行有界的单助手循环，只执行 TensorSharp 自有的技能/代码调用，并把应用自身工具的调用放入 <code>SkillLoopResult.PendingClientToolCalls</code> 返回。宿主默认最多生成 8 轮；提供代码工具时提升为 24，除非运维方显式设定。<code>SessionWorkspaceManager</code> 为每个服务器会话提供私有工作区；仅请求调用方则在一次请求内共享。工作文件、允许导出的环境状态与已安装包会在该作用域内保留，而 <code>PATH</code> 每次 shell 调用都会重建。</p>
   <div class="callout warn"><div class="ic">🔒</div><p>代码工具默认关闭，沙箱模式默认 <code>required</code>。macOS Seatbelt 无法保证清理刻意脱离的子进程；Linux 需要 bubblewrap 0.12+；Windows 作业对象无法约束文件或套接字，因此执行必须显式选择无隔离模式。这些是启动权限，不是逐命令审批，循环也不会生成子智能体。结构化输出请求会内联已选择技能并隐藏内置工具。完整边界见<a href="agentic_zh-cn.html">智能体工作</a>。</p></div>
 

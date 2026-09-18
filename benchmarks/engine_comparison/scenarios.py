@@ -18,8 +18,8 @@ never fabricate the next turn out of a response that did not contain what that
 turn needs, because the cell would then silently be measuring something else.
 
 Everything is driven from the client on purpose. TensorSharp's own code-exec
-surface (`--code-exec`: shell / read_file / edit_file / write_file /
-apply_patch) is answered *inside the server* and never handed back to the API
+surface (`--code-exec`: shell / read_file / write_file / apply_patch) is answered
+*inside the server* and never handed back to the API
 client, it is off by default, and its request workspace is destroyed when the
 response ends — so it can neither be observed round-trip-by-round-trip nor
 carry a file from one request to the next, and llama.cpp/vLLM have no

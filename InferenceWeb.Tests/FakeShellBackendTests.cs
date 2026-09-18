@@ -858,7 +858,8 @@ public sealed class SkillScriptRunnerBackendTests : IDisposable
         Assert.Contains("input file 'reports/apple-chips.json'", result.Content, StringComparison.Ordinal);
         Assert.Contains("not from the bundled skill script", result.Content, StringComparison.Ordinal);
         Assert.Contains("Apple M6 vs M5", result.Content, StringComparison.Ordinal);
-        Assert.Contains("with `edit_file`", result.Content, StringComparison.Ordinal);
+        Assert.Contains("with `apply_patch`", result.Content, StringComparison.Ordinal);
+        Assert.DoesNotContain("edit_file", result.Content, StringComparison.Ordinal);
         Assert.Contains("Do not use `write_file` or re-type the whole spec", result.Content, StringComparison.Ordinal);
         Assert.DoesNotContain("A copy of this script", result.Content, StringComparison.Ordinal);
         Assert.Empty(RepairCopies(workspace));
@@ -893,8 +894,8 @@ public sealed class SkillScriptRunnerBackendTests : IDisposable
 
         Assert.False(result.Ok);
         Assert.Contains("A copy of this script", result.Content, StringComparison.Ordinal);
-        Assert.Contains("edit_file", result.Content, StringComparison.Ordinal);
-        Assert.DoesNotContain("apply_patch", result.Content, StringComparison.Ordinal);
+        Assert.Contains("apply_patch", result.Content, StringComparison.Ordinal);
+        Assert.DoesNotContain("edit_file", result.Content, StringComparison.Ordinal);
         Assert.DoesNotContain("input file 'deck.json'", result.Content, StringComparison.Ordinal);
         string overlay = Assert.Single(RepairCopies(workspace));
         Assert.Equal(File.ReadAllBytes(scriptPath), File.ReadAllBytes(overlay));
@@ -929,7 +930,8 @@ public sealed class SkillScriptRunnerBackendTests : IDisposable
         Assert.Single(RepairCopies(workspace));
         Assert.Contains("editable repair copy already exists", result.Content, StringComparison.Ordinal);
         Assert.Contains("was not overwritten", result.Content, StringComparison.Ordinal);
-        Assert.Contains("edit_file", result.Content, StringComparison.Ordinal);
+        Assert.Contains("apply_patch", result.Content, StringComparison.Ordinal);
+        Assert.DoesNotContain("edit_file", result.Content, StringComparison.Ordinal);
         Assert.Contains("Do not rewrite the complete file", result.Content, StringComparison.Ordinal);
     }
 
@@ -1138,7 +1140,8 @@ public sealed class SkillScriptRunnerBackendTests : IDisposable
 
         Assert.False(result.Ok);
         Assert.Contains("input file 'deck.json'", result.Content, StringComparison.Ordinal);
-        Assert.Contains("with `edit_file`", result.Content, StringComparison.Ordinal);
+        Assert.Contains("with `apply_patch`", result.Content, StringComparison.Ordinal);
+        Assert.DoesNotContain("edit_file", result.Content, StringComparison.Ordinal);
         Assert.DoesNotContain("A copy of this script", result.Content, StringComparison.Ordinal);
     }
 

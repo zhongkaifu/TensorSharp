@@ -57,7 +57,7 @@ namespace TensorSharp.AgentHost.CodeExec
                     out string? displayPath, out string? fullPath, out int line))
             {
                 // Inline code and installed-library frames have no workspace file the
-                // declared editors can change. Naming edit_file there would prescribe
+                // declared patch tool can change. Naming apply_patch there would prescribe
                 // an impossible next action; the original diagnostic remains intact.
                 return null;
             }
@@ -140,11 +140,10 @@ namespace TensorSharp.AgentHost.CodeExec
             }
 
             sb.Append("Fix the smallest incorrect region with `")
-              .Append(ShellTools.EditToolName)
-              .Append("` (or `").Append(ShellTools.PatchToolName)
-              .Append("` when the fix spans files), then run the same check again. Do not use `")
+              .Append(ShellTools.PatchToolName)
+              .Append("` for a change in one file or across multiple files, then run the same check again. Do not use `")
               .Append(ShellTools.WriteToolName)
-              .Append("` or re-type the whole file for a local bug. If the exact edit no longer "
+              .Append("` or re-type the whole file for a local bug. If the patch context no longer "
                     + "matches, read that region and retry against its current text.\n");
 
             return sb.ToString();

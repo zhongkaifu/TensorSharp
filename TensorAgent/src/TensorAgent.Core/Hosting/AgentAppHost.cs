@@ -902,8 +902,8 @@ public sealed class AgentAppHost : IDisposable
                 // prompt and warming a different one. A request that carries no session
                 // is served by the DEFAULT session; WorkspaceFor returns null for that
                 // one, and a chat with no workspace is declared only `shell` with no
-                // file tools, where a real turn is declared read_file, edit_file,
-                // write_file, a persisting shell and apply_patch, plus the "Working with
+                // file tools, where a real turn is declared read_file, apply_patch,
+                // write_file and a persisting shell, plus the "Working with
                 // files" instructions. KV reuse is a longest-common-PREFIX match, so a
                 // tool block that differs makes everything after it unshareable -- the
                 // warm-up would run for twenty seconds and save a real turn only the

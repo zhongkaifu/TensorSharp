@@ -16,7 +16,7 @@
 <main class="content" id="content">
   <div class="breadcrumb"><a href="index_zh-cn.html">首页</a> › 智能体工作流</div>
   <h1>智能体工作流</h1>
-  <p class="lede">TensorSharp.AgentHost 把本地模型的一次回复变成有界的<strong>生成 → 检查 → 运行 → 修复 → 回答</strong>循环。它只在需要时加载 Agent Skills（智能体技能），通过五个内置代码工具处理文件，在操作系统沙箱中运行检查，并向普通 CLI、Web UI、Ollama 或 OpenAI 客户端返回完成的产物。</p>
+  <p class="lede">TensorSharp.AgentHost 把本地模型的一次回复变成有界的<strong>生成 → 检查 → 运行 → 修复 → 回答</strong>循环。它只在需要时加载 Agent Skills（智能体技能），通过四个内置代码工具处理文件，在操作系统沙箱中运行检查，并向普通 CLI、Web UI、Ollama 或 OpenAI 客户端返回完成的产物。</p>
 
   <h2 id="flow">一轮请求里发生什么</h2>
   <ol class="steps">
@@ -67,21 +67,20 @@
   <p>正常元数据块约使用上下文窗口的 2%，并限制在大约 1,024–10,000 token。旧版“把所有选中技能正文预先内联”的行为默认关闭。无法携带并解析工具声明的模型家族没有机会调用 <code>skills_read</code>，因此 TensorSharp 会在有界回退预算内直接内联所选技能正文，同时不再宣传根本无法加载的技能。</p>
   <p>内置技能工具是 <code>skills_list</code> 与 <code>skills_read</code>。只有传入 <code>--skills-allow-exec</code> 才会出现第三个工具 <code>skills_run</code>。技能脚本默认不允许运行，并且始终与模型生成代码的执行权限分开控制。</p>
 
-  <h2 id="code-tools">五个代码工具，默认关闭</h2>
+  <h2 id="code-tools">四个代码工具，默认关闭</h2>
   <p><code>--code-exec</code> 会加入一套补丁优先的代码工作面。它不要求安装技能；仅安装或选中技能也不会自动开启它。</p>
   <div class="table-scroll">
   <table>
     <thead><tr><th>工具</th><th>用途</th><th>关键边界</th></tr></thead>
     <tbody>
       <tr><td><code>read_file</code></td><td>按行号读取工作区中的真实字节。</td><td>输出有界；路径必须留在工作区内。</td></tr>
-      <tr><td><code>edit_file</code></td><td>在一个文件中精确替换一段字符串。</td><td>找不到或命中多处时拒绝执行，不做猜测。</td></tr>
-      <tr><td><code>write_file</code></td><td>新建文件，或有意整体替换文件。</td><td>限制在工作区内，并报告重写范围。</td></tr>
-      <tr><td><code>apply_patch</code></td><td>通过带锚点的 hunk 新建、修改、重命名或删除多个文件。</td><td>原子操作：全部 hunk 成功，否则一个也不落地。</td></tr>
+      <tr><td><code>write_file</code></td><td>新建文件。</td><td>限制在工作区内；已有文件使用 <code>apply_patch</code> 修改。</td></tr>
+      <tr><td><code>apply_patch</code></td><td>通过带锚点的 hunk 修改单个或多个文件，包括单行修改；也支持新建、重命名与删除文件。</td><td>原子操作：全部 hunk 成功，否则一个也不落地。</td></tr>
       <tr><td><code>shell</code></td><td>运行测试、命令与生成的程序。</td><td>有超时与输出上限；受支持主机上必须沙箱化，否则拒绝。</td></tr>
     </tbody>
   </table>
   </div>
-  <p>失败结果专门为后续修复而设计。若诊断定位到工作区内的常规源文件，结果会附上有界的源码片段，并要求先做最小精确修改再重新运行。语法检查、允许时自动补齐缺失依赖、以及从已安装库中探测真实 API，都能减少无意义的模型轮次。</p>
+  <p>失败结果专门为后续修复而设计。若诊断定位到工作区内的常规源文件，结果会附上有界的源码片段，并要求先用 <code>apply_patch</code> 做最小修改再重新运行。语法检查、允许时自动补齐缺失依赖、以及从已安装库中探测真实 API，都能减少无意义的模型轮次。</p>
 
   <h2 id="workspaces">工作区生命周期与产物</h2>
   <div class="table-scroll">
@@ -95,7 +94,7 @@
     </tbody>
   </table>
   </div>
-  <p>开启代码执行后，技能脚本会与五个代码工具共享同一个请求 / 聊天工作区。服务端会把生成的文件复制到有界产物存储中；Web UI 提供安全下载链接，产物响应始终作为附件发送并禁用内容嗅探。</p>
+  <p>开启代码执行后，技能脚本会与四个代码工具共享同一个请求 / 聊天工作区。服务端会把生成的文件复制到有界产物存储中；Web UI 提供安全下载链接，产物响应始终作为附件发送并禁用内容嗅探。</p>
 
   <h2 id="sandbox">“沙箱化，否则拒绝”的安全模型</h2>
   <p>是否允许执行由运维方决定，不是请求字段。在 macOS 与 Linux 上，模型生成命令和已获准的技能脚本默认具有工作区写入边界、不可读的用户主目录、清理后的环境变量，并且不可联网。进入操作系统沙箱之前，进程内还会再次检查路径。</p>
@@ -129,7 +128,7 @@
   <pre data-lang="bash"><code>dotnet run --project TensorSharp.Cli -c Release -- \
   --model models/model.gguf --backend ggml_metal \
   --skills-dir ./skills --skill pdf -i</code></pre>
-  <p>显式加入五个代码工具。下例仍然关闭命令网络与软件包安装：</p>
+  <p>显式加入四个代码工具。下例仍然关闭命令网络与软件包安装：</p>
   <pre data-lang="bash"><code>dotnet run --project TensorSharp.Cli -c Release -- \
   --model models/model.gguf --backend ggml_metal \
   --skills-dir ./skills --skill pdf --code-exec -i</code></pre>
@@ -153,10 +152,10 @@
   "skills_discovery": false,
   "stream": true
 }</code></pre>
-  <p><code>skills_discovery</code> 默认为 <code>true</code>。代码执行没有按请求开启的字段：运维方要么以 <code>--code-exec</code> 启动宿主，要么五个工具根本不会出现。智能体循环默认最多 8 个内部轮次；开启代码执行后默认 24 个；<code>--skills-max-rounds</code> 可明确设置 1–64 的上限。</p>
+  <p><code>skills_discovery</code> 默认为 <code>true</code>。代码执行没有按请求开启的字段：运维方要么以 <code>--code-exec</code> 启动宿主，要么四个工具根本不会出现。智能体循环默认最多 8 个内部轮次；开启代码执行后默认 24 个；<code>--skills-max-rounds</code> 可明确设置 1–64 的上限。</p>
 
   <h2 id="compatibility">模型家族限制</h2>
-  <p>进程内循环要求模型家族既能携带工具声明，也能解析工具调用。不支持这种往返的家族会以内联方式获得选中的技能说明作为回退，但不会得到五个代码工具。TensorSharp 会记录这一限制，而不是假装代码执行可用。</p>
+  <p>进程内循环要求模型家族既能携带工具声明，也能解析工具调用。不支持这种往返的家族会以内联方式获得选中的技能说明作为回退，但不会得到四个代码工具。TensorSharp 会记录这一限制，而不是假装代码执行可用。</p>
 
   <div class="content-footer">
     <a href="server_zh-cn.html">← 服务器与 Web UI</a>

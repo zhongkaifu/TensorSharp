@@ -217,27 +217,23 @@ skills_read(skill, path, offset)               -> one page of one file; "SKILL.m
 skills_run(skill, path, args)                  -> run a bundled script; OFF unless the operator opts in
 ```
 
-`--code-exec` adds five more, and they ride *alongside* these rather than
+`--code-exec` adds four more, and they ride *alongside* these rather than
 replacing them: `read_file`, which shows a file's real bytes with line numbers;
-`edit_file`, which replaces one exact string in one file; `write_file`, which
-creates a file or deliberately replaces one whole; `shell`, which runs a command
-line in the current working directory; and `apply_patch`, which changes several
-files at once by anchored hunks, all or nothing. A Web/CLI conversation keeps that
-directory for its session. An OpenAI or Ollama request keeps an isolated directory
+`write_file`, which creates a new file; `shell`, which runs a command
+line in the current working directory; and `apply_patch`, which modifies a single
+file or multiple files by anchored hunks, all or nothing. A Web/CLI conversation
+keeps that directory for its session. An OpenAI or Ollama request keeps an isolated directory
 for every internal tool round in that request and deletes it afterward, preserving
 cross-request statelessness without forcing a repair round to regenerate a file
 the preceding round just created. A skill's instructions and a command the model
 writes are useful in the same turn.
 
-The split follows the reference tools: [Claude Code's editing
-surface](https://code.claude.com/docs/en/tools-reference#edit-tool-behavior) is
-`Read`/`Edit`/`Write`, while [Codex exposes precise diffs through
-`apply_patch`](https://developers.openai.com/api/docs/guides/tools-apply-patch).
-Each is kept for the job it actually solved —
-string replacement for the common one-file change, an atomic envelope for the
-multi-file one — because emitting a patch and reading one are different problems
-with different right answers, and a small model gets the envelope wrong far more
-often than it gets two byte strings wrong.
+`apply_patch` is the only tool models are instructed to use to modify existing
+files, from a one-line replacement in one file to coordinated changes across
+multiple files. It also supports creating, renaming, and deleting files.
+`write_file` is reserved for creating new files. Read the relevant contents first,
+then send the smallest anchored patch in a `*** Begin Patch` / `*** End Patch`
+envelope; each existing file being modified has its own `*** Update File:` section.
 
 `skills_read` returns at most 48 KB per call by default, with a header naming
 the skill, the file and the byte range, and a footer that spells out the exact
@@ -278,9 +274,9 @@ feature it did not ask for would break a working integration.
 `SkillAgentLoop.RunAsync` drives: generate → answer any skill tool calls in
 process → generate again, until the model stops asking.
 
-With `--code-exec`, the same loop also answers five built-ins: bounded
-`read_file`, exact-match `edit_file`, deliberate whole-file `write_file`,
-`shell`, and atomic multi-file `apply_patch`. These are operator-provided tools,
+With `--code-exec`, the same loop also answers four built-ins: bounded
+`read_file`, new-file `write_file`, `shell`, and atomic `apply_patch` for
+single-file or multi-file changes. These are operator-provided tools,
 not caller tools. They are off by default; enabling them does not imply network
 or package-install permission.
 
@@ -296,7 +292,7 @@ progressive disclosure work over a stateless HTTP API at all.
 **Stateless does not mean stateless between the tool calls inside one request.**
 When code execution is available, the OpenAI chat, OpenAI Responses and Ollama
 chat adapters allocate a private request workspace before entering a tool-compatible
-loop. A generated file, its failing test, an exact `edit_file` repair and the
+loop. A generated file, its failing test, an anchored `apply_patch` repair and the
 successful rerun therefore operate on the same bytes. The workspace is released
 after the buffered or streaming response ends (including rejection and cancellation);
 another HTTP request never inherits it. With skill-script execution but no code
@@ -427,7 +423,7 @@ thousand tokens ago is a capability it does not use.
 |---|---|---|
 | First run dies on a missing import | 17 incidents / 68 rounds / 116 min | Installs it and re-runs the command **inside the same call** (`ShellRunner.RunWithAutoInstall`), bounded by 5 distinct packages and by the call's own `timeout_ms` |
 | The model guessed a library's API | 10 incidents / 60 rounds | Reads the real API out of the installed package and appends it — `did you mean: notes_slide` plus the names the class actually has (`ApiProbe`). Measured at 100 ms on the real failing script |
-| A whole file re-typed to change one line | 38 re-emissions / ~52k output tokens | `edit_file` replaces the one string instead (Claude Code's `Edit`, parameter for parameter); `write_file` names the file, counts the lines that came back byte-identical and shows those that differ (`RewriteWatch`); and the rules are stated in the system prompt as well as in the declaration — `apply_patch` had been declared the whole time, with an emphatic prefer-a-patch paragraph, and was used **zero** times in ten opportunities, which is what killed the bet that a declaration alone is enough |
+| A whole file re-typed to change one line | 38 re-emissions / ~52k output tokens | The current tool declarations and system prompt require `apply_patch` for every existing-file modification, including one-line changes in a single file; `write_file` is reserved for new files. The earlier logs recorded **zero** patch calls in ten opportunities despite a prefer-a-patch paragraph, so that historical observation is not evidence of compliance with the current prompt. |
 | A byte-identical failing command re-sent nine times | one whole turn | Says so, with the count (`AppendRepeatWarning`). The nine results had been identical except a scratch filename, which reads as new information |
 | Absolute host paths in every traceback | 13.9% of all result characters | Rewritten to paths relative to where the command ran (`OutputPaths`) — still usable, and one logged round was lost to a model splicing two session ids together |
 | A patch that applied but broke the file | — | The parse is checked and reported (`SyntaxCheck`); matching all-or-nothing is not the same as being right |

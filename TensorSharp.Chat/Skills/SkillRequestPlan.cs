@@ -500,7 +500,7 @@ namespace TensorSharp.Server.Skills
                 tools.Any(t => string.Equals(t?.Name, name, StringComparison.Ordinal));
 
             string block = CodePrompt.Block(
-                fileTools: Declared(SkillToolNames.EditFile) && Declared(SkillToolNames.ReadFile),
+                fileTools: Declared(SkillToolNames.ReadFile) && Declared(SkillToolNames.WriteFile),
                 hasPatch: Declared(SkillToolNames.ApplyPatch));
 
             return block.Length == 0
@@ -524,7 +524,7 @@ namespace TensorSharp.Server.Skills
             // BY NAME, never by index. Everything below patches this declaration's
             // description — the conversation's attachments, the skills on the module
             // path — and it was written as declarations[0] back when the shell was the
-            // first thing declared. The moment read_file/edit_file/write_file went in
+            // first thing declared. The moment the file tools went in
             // front of it, every attachment note and skill-import note would have landed
             // on read_file's description instead: it compiles, and the only place it
             // shows up is in what the model was told.
