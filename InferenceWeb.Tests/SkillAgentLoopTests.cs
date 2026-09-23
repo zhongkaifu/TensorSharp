@@ -118,6 +118,72 @@ public class SkillAgentLoopTests : IDisposable
         }
     }
 
+    // ---- identical rounds ----------------------------------------------------
+
+    [Fact]
+    public async Task RunAsync_IdenticalRoundsAtTheLimit_AreAnsweredNotRun_AndOneMoreEndsTheTurn()
+    {
+        // The same skills_read, forever. With a limit of 3: rounds 1-2 run, round 3 is
+        // answered with the refusal instead of being run, round 4 ends the turn.
+        var generator = new ScriptedGenerator(new SkillTurnOutput(SkillCall()));
+        var ran = new List<SkillToolInvocation>();
+
+        SkillLoopResult result = await SkillAgentLoop.RunAsync(
+            Conversation(), null, Context(), generator.Generate,
+            new SkillAgentLoopOptions { MaxRounds = 10, MaxIdenticalRounds = 3, OnInvocation = ran.Add });
+
+        Assert.Equal(4, generator.Calls);
+        Assert.True(result.HitRoundLimit);
+        Assert.StartsWith("(Stopped: the same skills_read call was made 4 rounds in a row",
+            result.Output.Parsed!.Content, StringComparison.Ordinal);
+        // Two real reads, then the refusal, which reaches the model as a tool result.
+        Assert.Equal(new[] { true, true, false }, ran.Select(i => i.Ok || i.ResultBytes > 0).ToArray());
+        ChatMessage refusal = result.Messages.Last(m => m.Role == "tool");
+        Assert.StartsWith("Error: you have made this exact call 3 rounds in a row", refusal.Content, StringComparison.Ordinal);
+        // The ending round is not left in the history as if it had been answered.
+        Assert.Equal("tool", result.Messages[^1].Role);
+    }
+
+    [Fact]
+    public async Task RunAsync_ARoundThatChangesItsArguments_ResetsTheCount()
+    {
+        var generator = new ScriptedGenerator(
+            new SkillTurnOutput(SkillCall("a.md")),
+            new SkillTurnOutput(SkillCall("a.md")),
+            new SkillTurnOutput(SkillCall("b.md")),
+            new SkillTurnOutput(SkillCall("b.md")),
+            new SkillTurnOutput(Answer("done")));
+
+        SkillLoopResult result = await SkillAgentLoop.RunAsync(
+            Conversation(), null, Context(), generator.Generate,
+            new SkillAgentLoopOptions { MaxRounds = 10, MaxIdenticalRounds = 3 });
+
+        Assert.Equal("done", result.Output.Parsed!.Content);
+        Assert.False(result.HitRoundLimit);
+        Assert.DoesNotContain(result.Messages, m => (m.Content ?? string.Empty).Contains("exact call", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task RunAsync_WithoutTheOption_IdenticalRoundsRunToTheRoundLimit()
+    {
+        // Off by default: the top-level loop's behaviour is unchanged.
+        var generator = new ScriptedGenerator(new SkillTurnOutput(SkillCall()));
+
+        SkillLoopResult result = await SkillAgentLoop.RunAsync(
+            Conversation(), null, Context(), generator.Generate, new SkillAgentLoopOptions { MaxRounds = 5 });
+
+        Assert.Equal(6, generator.Calls);
+        Assert.DoesNotContain(result.Messages, m => (m.Content ?? string.Empty).Contains("exact call", StringComparison.Ordinal));
+        Assert.Equal(0, SkillAgentLoopOptions.Default.MaxIdenticalRounds);
+    }
+
+    [Fact]
+    public void WithClientTools_KeepsTheIdenticalRoundLimit()
+    {
+        var options = new SkillAgentLoopOptions { MaxIdenticalRounds = 3 };
+        Assert.Equal(3, options.WithClientTools(Array.Empty<ToolFunction>()).MaxIdenticalRounds);
+    }
+
     // ---- stopping ----------------------------------------------------------
 
     [Fact]

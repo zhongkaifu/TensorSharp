@@ -119,6 +119,22 @@ namespace TensorSharp.AgentHost.Skills
         /// </summary>
         public IReadOnlyCollection<ToolFunction>? ClientTools { get; init; }
 
+        /// <summary>
+        /// Rounds in a row that may make exactly the same calls — same names, same
+        /// arguments — before the loop stops running them. Zero, the default, never stops.
+        ///
+        /// <para>
+        /// At the limit the calls are answered, not run: the model is told it has sent
+        /// this exact call that many times, with the same result each time. One more
+        /// identical round after that ends the turn, with an answer that says so. A
+        /// sub-agent runs with this on (see <c>SubAgentRuntime</c>): measured on
+        /// Qwen3.5-9B Q8_0, one re-sent the same failing <c>apply_patch</c>, byte for byte,
+        /// in ten consecutive rounds — twenty-five rounds and seven and a half minutes in
+        /// all — while its parent sat waiting for it.
+        /// </para>
+        /// </summary>
+        public int MaxIdenticalRounds { get; init; }
+
         /// <summary>A copy of these options that also knows the caller's own tools.</summary>
         public SkillAgentLoopOptions WithClientTools(IReadOnlyCollection<ToolFunction>? clientTools) => new()
         {
@@ -127,6 +143,7 @@ namespace TensorSharp.AgentHost.Skills
             ToolResultsAreRendered = ToolResultsAreRendered,
             OnInvocation = OnInvocation,
             ClientTools = clientTools,
+            MaxIdenticalRounds = MaxIdenticalRounds,
         };
 
         /// <summary>Defaults.</summary>
@@ -241,6 +258,8 @@ namespace TensorSharp.AgentHost.Skills
             var invocations = new List<SkillToolInvocation>();
             int maxRounds = Math.Max(1, options.MaxRounds);
             SkillTurnOutput output = default;
+            string? previousCalls = null;
+            int identicalRounds = 0;
 
             for (int round = 1; round <= maxRounds; round++)
             {
@@ -293,6 +312,47 @@ namespace TensorSharp.AgentHost.Skills
                 // Record what the model said, tool calls and raw tokens included, so the
                 // next render splices this turn back rather than re-tokenizing it.
                 working.Add(AssistantTurn(output, calls));
+
+                // The same calls as last round, again. Past the limit they are answered
+                // rather than run — the result would be the one the model already has —
+                // and one more such round ends the turn.
+                if (options.MaxIdenticalRounds > 0)
+                {
+                    string signature = CallSignature(skillCalls.Concat(unknownCalls));
+                    identicalRounds = signature == previousCalls ? identicalRounds + 1 : 1;
+                    previousCalls = signature;
+                    if (identicalRounds > options.MaxIdenticalRounds)
+                    {
+                        ParsedOutput stopped = output.Parsed ?? new ParsedOutput();
+                        string note = "(Stopped: the same " + DescribeCalls(skillCalls.Concat(unknownCalls))
+                            + " was made " + identicalRounds.ToString(CultureInfo.InvariantCulture)
+                            + " rounds in a row with the same result each time, so this task ended here unfinished.)";
+                        string said = stopped.Content ?? string.Empty;
+                        stopped.Content = said.Length == 0 ? note : said.TrimEnd() + "\n\n" + note;
+                        working.RemoveAt(working.Count - 1);
+                        return new SkillLoopResult(
+                            output with { Parsed = stopped }, working, round, invocations, HitRoundLimit: true,
+                            Array.Empty<ToolCall>());
+                    }
+                    if (identicalRounds == options.MaxIdenticalRounds)
+                    {
+                        foreach (ToolCall repeated in skillCalls.Concat(unknownCalls))
+                        {
+                            var refused = new SkillToolInvocation(
+                                round, repeated.Name ?? string.Empty, null, null, Ok: false, ResultBytes: 0);
+                            invocations.Add(refused);
+                            options.OnInvocation?.Invoke(refused);
+                            working.Add(BuildResultMessage(options,
+                                "Error: you have made this exact call " + identicalRounds.ToString(CultureInfo.InvariantCulture)
+                                + " rounds in a row and it gave the same result each time, so it was not run again. "
+                                + "Repeating it will not change the result. Take a different approach, or give your "
+                                + "final answer with what you have and say what you could not do.",
+                                repeated.Name, repeated.Id));
+                        }
+                        SubAgentConversation.AppendDeliveries(working, agents);
+                        continue;
+                    }
+                }
 
                 foreach (ToolCall unknownCall in unknownCalls)
                 {
@@ -419,6 +479,38 @@ namespace TensorSharp.AgentHost.Skills
             RawPromptTrailingWhitespace = output.RawPromptTrailingWhitespace,
             RawGenerationSuffix = output.RawGenerationSuffix,
         };
+
+        /// <summary>
+        /// Names and arguments of a round's calls, in order, canonically: two rounds whose
+        /// signatures are equal asked for exactly the same thing.
+        /// </summary>
+        private static string CallSignature(IEnumerable<ToolCall> calls)
+        {
+            var sb = new System.Text.StringBuilder();
+            foreach (ToolCall call in calls)
+            {
+                sb.Append(call.Name).Append('(');
+                if (call.Arguments != null)
+                {
+                    foreach (KeyValuePair<string, object?> argument in call.Arguments.OrderBy(a => a.Key, StringComparer.Ordinal))
+                    {
+                        sb.Append(argument.Key).Append('=')
+                          .Append(argument.Value is System.Text.Json.JsonElement element
+                              ? element.GetRawText()
+                              : System.Text.Json.JsonSerializer.Serialize(argument.Value))
+                          .Append(';');
+                    }
+                }
+                sb.Append(')');
+            }
+            return sb.ToString();
+        }
+
+        private static string DescribeCalls(IEnumerable<ToolCall> calls)
+        {
+            string[] names = calls.Select(c => c.Name).Where(n => !string.IsNullOrEmpty(n)).Distinct(StringComparer.Ordinal).ToArray()!;
+            return (names.Length == 0 ? "tool" : string.Join(", ", names)) + (names.Length > 1 ? " calls" : " call");
+        }
 
         /// <summary>
         /// A top-level turn that hands tool calls back to the application ends here: its

@@ -988,6 +988,9 @@ namespace TensorSharp.AgentHost.Agents
                 MaxCallsPerRound = baseOptions.MaxCallsPerRound,
                 ToolResultsAreRendered = baseOptions.ToolResultsAreRendered,
                 ClientTools = baseOptions.ClientTools,
+                // A sub-agent stuck re-sending one failing call holds its parent in
+                // wait_agent the whole time; see SkillAgentLoopOptions.MaxIdenticalRounds.
+                MaxIdenticalRounds = baseOptions.MaxIdenticalRounds > 0 ? baseOptions.MaxIdenticalRounds : 3,
                 OnInvocation = invocation =>
                 {
                     Report(agent, "round " + invocation.Round.ToString(CultureInfo.InvariantCulture) + ": "
