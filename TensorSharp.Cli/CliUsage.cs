@@ -47,7 +47,8 @@ namespace TensorSharp.Cli
         // Grouped by task. Keep flags in sync with the switch in
         // Program.MainCore, with CliLoggingSetup.ParseFromArgs, and with the
         // shared option parsers that run before the switch: CodeExecOptions.Parse,
-        // SkillHostOptions.Parse and SpeculativeCliFlags.Apply. CliUsageTests
+        // SubAgentOptions.Parse (through CliSubAgents.Parse), SkillHostOptions.Parse
+        // and SpeculativeCliFlags.Apply. CliUsageTests
         // asserts the constant-table families are all documented here.
         private static readonly (string Section, OptionHelp[] Options)[] Sections =
         {
@@ -263,6 +264,36 @@ namespace TensorSharp.Cli
                     "Write the generated text to a file instead of stdout (for Qwen-Image-Edit: the output image, " +
                     "default edited.png). Default: print to stdout.",
                     "--output answer.txt"),
+            }),
+            ("Sub-agents (the model starts parallel copies of itself for sub-tasks)", new[]
+            {
+                new OptionHelp("--sub-agents",
+                    "Offer the model Codex's sub-agent tools: spawn_agent starts a sub-agent - another copy of " +
+                    "the model with the same tools and working directory but its own context - that works on one " +
+                    "task in parallel and reports back a final answer; send_input gives one a follow-up, wait_agent " +
+                    "collects answers, close_agent stops one, list_agents shows them. Sub-agents run as separate " +
+                    "sequences on the SAME loaded model, so the engine schedules their decoding together (batched " +
+                    "into one forward on the model families that support it), and each " +
+                    "one's prompt starts with the parent's exact instructions and tool list, so they reuse the " +
+                    "parent's cached prefix instead of prefilling it again. Needs a run that already has tools " +
+                    "(skills or --code-exec); without them the flag is reported and has no effect. The tool " +
+                    "descriptions tell the model to start sub-agents only when you or a skill asks for them. " +
+                    "Sub-agents live for one turn - the whole run with --input, one message in interactive chat: " +
+                    "any still working when the turn ends are collected first, or stopped - and the answer says " +
+                    "so. What they do is printed to stderr as [agent] lines. Also raises the engine's " +
+                    "retained-state cap (TS_RETAINED_FUSED_CACHE_MAX) unless you set it, so the parent keeps its " +
+                    "cached conversation while its sub-agents run. Default: off (TS_SUB_AGENTS env var overrides; " +
+                    "any value but 0 turns it on).",
+                    "--code-exec --sub-agents"),
+                new OptionHelp("--sub-agents-max-threads <N>",
+                    "How many sub-agents may be open at once in one turn (1-16). Starting one more first closes " +
+                    "the longest-finished agent whose answer was already delivered, and fails only when every " +
+                    "open agent is still working. Default: 4 (TS_SUB_AGENTS_MAX_THREADS env var overrides).",
+                    "--sub-agents-max-threads 3"),
+                new OptionHelp("--sub-agents-max-depth <N>",
+                    "How deep sub-agents may nest (1-4). 1, the default, lets the model start sub-agents but " +
+                    "not a sub-agent start its own (TS_SUB_AGENTS_MAX_DEPTH env var overrides).",
+                    "--sub-agents-max-depth 2"),
             }),
             ("Multimodal input (vision / audio / video models)", new[]
             {

@@ -4,6 +4,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
+using System.Threading.Tasks;
 using InferenceWeb.Tests.PrefixCache.Fakes;
 using Microsoft.Extensions.Logging.Abstractions;
 using TensorSharp;
@@ -202,5 +203,100 @@ public sealed class CliInferenceSessionTests
         using var cold = new CliInferenceSession(reference, Config, NullLogger.Instance);
         Assert.Equal(cold.Generate(prompt, 3, SamplingConfig.Greedy, cancellationToken: timeout.Token).Tokens,
             recovered.Tokens);
+    }
+
+    // ---- scoped generation (sub-agents) ------------------------------------------
+
+    private static SchedulerConfig ConcurrentConfig => new()
+    {
+        BlockSize = 16,
+        NumBlocks = 128,
+        MaxNumRunningSequences = 4,
+        MaxNumBatchedTokens = 128,
+        SoloPrefillChunkSize = 128,
+        StopRepetition = false,
+    };
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ScopedGenerationsRunTogetherAndShareOnlyThePublicPrefix(bool recurrent)
+    {
+        using var model = recurrent ? OracleFakes.R() : OracleFakes.P();
+        using var session = new CliInferenceSession(model, ConcurrentConfig, NullLogger.Instance);
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        int[] system = Enumerable.Range(1, 29).ToArray();
+        session.Generate(system, 1, SamplingConfig.Greedy, cancellationToken: timeout.Token,
+            sharedPrefixTokens: system.Length);
+        string consoleScope = session.CacheScope;
+        int consoleCached = session.CachedTokens;
+
+        // Three sub-agents at once, each in a scope of its own, starting with the same
+        // public prefix and diverging after it.
+        int[][] prompts = Enumerable.Range(0, 3)
+            .Select(i => system.Concat(Enumerable.Range(100 + 10 * i, 9)).ToArray())
+            .ToArray();
+        CliInferenceSession.Result[] results = await Task.WhenAll(prompts.Select(prompt =>
+            session.GenerateInScopeAsync(prompt, 4, SamplingConfig.Greedy, CliInferenceSession.NewAgentScope(),
+                cancellationToken: timeout.Token, sharedPrefixTokens: system.Length)));
+
+        using var reference = recurrent ? OracleFakes.R() : OracleFakes.P();
+        using var cold = new CliInferenceSession(reference, ConcurrentConfig, NullLogger.Instance);
+        for (int i = 0; i < prompts.Length; i++)
+        {
+            Assert.Equal(system.Length, results[i].Completion.PrefixCacheReusedTokens);
+            Assert.Equal(cold.Generate(prompts[i], 4, SamplingConfig.Greedy, cancellationToken: timeout.Token,
+                enablePrefixCache: false).Tokens, results[i].Tokens);
+        }
+        Assert.Equal(3, results.Select(r => r.Sequence.CacheScope).Distinct().Count());
+        Assert.DoesNotContain(consoleScope, results.Select(r => r.Sequence.CacheScope));
+
+        // The console's own bookkeeping is untouched by the agents' requests.
+        Assert.Equal(consoleScope, session.CacheScope);
+        Assert.Equal(consoleCached, session.CachedTokens);
+    }
+
+    [Fact]
+    public async Task ACancelledScopedGenerationThrowsAndLeavesTheEngineUsable()
+    {
+        using var model = OracleFakes.P();
+        using var session = new CliInferenceSession(model, ConcurrentConfig, NullLogger.Instance);
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        int[] prompt = Enumerable.Range(1, 64).ToArray();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => session.GenerateInScopeAsync(
+            prompt, 64, SamplingConfig.Greedy, CliInferenceSession.NewAgentScope(), _ =>
+            {
+                cancellation.Cancel();
+                return true;
+            }, cancellation.Token));
+
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var next = session.Generate(prompt, 3, SamplingConfig.Greedy, cancellationToken: timeout.Token);
+        using var reference = OracleFakes.P();
+        using var cold = new CliInferenceSession(reference, ConcurrentConfig, NullLogger.Instance);
+        Assert.Equal(cold.Generate(prompt, 3, SamplingConfig.Greedy, cancellationToken: timeout.Token).Tokens, next.Tokens);
+    }
+
+    [Fact]
+    public async Task TheFirstConcurrentCallersShareOneEngine()
+    {
+        // Sub-agents and the parent race to create the engine on their first rounds. Two
+        // engines over one model would each drive its state as if it owned it; one engine
+        // proves itself by serving the public prefix the first caller left to the others.
+        using var model = OracleFakes.P();
+        using var session = new CliInferenceSession(model, ConcurrentConfig, NullLogger.Instance);
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        int[] prompt = Enumerable.Range(1, 40).ToArray();
+
+        CliInferenceSession.Result[] first = await Task.WhenAll(Enumerable.Range(0, 4).Select(_ => Task.Run(() =>
+            session.GenerateInScopeAsync(prompt, 2, SamplingConfig.Greedy, CliInferenceSession.NewAgentScope(),
+                cancellationToken: timeout.Token, sharedPrefixTokens: prompt.Length))));
+        Assert.Equal(4, first.Length);
+
+        var after = await session.GenerateInScopeAsync(prompt.Concat(new[] { 90, 91 }).ToArray(), 2,
+            SamplingConfig.Greedy, CliInferenceSession.NewAgentScope(), cancellationToken: timeout.Token,
+            sharedPrefixTokens: prompt.Length);
+        Assert.Equal(prompt.Length, after.Completion.PrefixCacheReusedTokens);
     }
 }

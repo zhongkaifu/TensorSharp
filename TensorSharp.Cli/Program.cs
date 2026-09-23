@@ -17,6 +17,7 @@ using System.Text;
 using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Threading;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using TensorSharp;
@@ -25,6 +26,7 @@ using TensorSharp.Cpu;
 using TensorSharp.Cuda;
 using TensorSharp.Models.Architecture;
 using TensorSharp.Runtime;
+using TensorSharp.AgentHost.Agents;
 using TensorSharp.AgentHost.CodeExec;
 using TensorSharp.AgentHost.Skills;
 using TensorSharp.Runtime.Scheduling;
@@ -216,6 +218,19 @@ namespace TensorSharp.Cli
             }
             codeExecOptions.ApplyEnvironment();
             args = remainingArgs.ToArray();
+
+            // Sub-agents, by the same rule: read by the shared parser and taken out of the
+            // argument list before the switch below. A bad value throws ArgumentException,
+            // which Main reports as a configuration error before any model loads. The
+            // engine's retained-state cap is raised here because it is read when an engine
+            // is constructed, and the first one is built after the model loads.
+            SubAgentOptions subAgentOptions = CliSubAgents.Parse(args, out args);
+            if (subAgentOptions.ApplyEngineDefaults() is { } subAgentEngineDefaults)
+            {
+                _log.LogInformation(LogEventIds.HostConfiguration,
+                    "Sub-agents: {SubAgents} - offered on turns that have tools (skills or --code-exec); {EngineDefaults}",
+                    subAgentOptions.Describe(), subAgentEngineDefaults);
+            }
 
             // Pick up the KV cache dtype from the KV_CACHE_DTYPE environment variable
             // before parsing CLI args. The --kv-cache-dtype flag below overrides this.
@@ -1055,7 +1070,8 @@ namespace TensorSharp.Cli
                     skillOptions,
                     selectedSkills,
                     codeRunner,
-                    codeWorkspace);
+                    codeWorkspace,
+                    subAgentOptions);
                 if (!string.IsNullOrEmpty(systemPrompt))
                     session.SetInitialSystemPrompt(systemPrompt);
                 session.PrefixCacheEnabled = !noPrefixCache;
@@ -1382,6 +1398,20 @@ namespace TensorSharp.Cli
                 };
             }
 
+            // Sub-agents ride the tool channel the turn already has, and only that: they are
+            // declared after every other tool, and a run that offers no tools offers none of
+            // theirs either — which is said, rather than leaving the flag to look accepted.
+            if (skillToolContext != null)
+            {
+                tools = CliSubAgents.AppendAgentTools(tools, subAgentOptions, _log);
+            }
+            else if (subAgentOptions.Enabled)
+            {
+                _log.LogWarning(LogEventIds.HostConfiguration,
+                    "--sub-agents is on, but this run offers the model no tools (no skills and no --code-exec, "
+                    + "or a model family that cannot carry tool declarations), so the sub-agent tools are not offered.");
+            }
+
             // The editing rules, after every path that may have declared the code tools —
             // with skills and without. They were injected only by the SERVER's plan, so a
             // one-shot CLI run was declared all five code tools and told nothing about
@@ -1472,7 +1502,7 @@ namespace TensorSharp.Cli
                     specDraftMax, specDraftConfMin, systemPrompt,
                     skillToolContext, skillOptions.RoundsFor(skillToolContext.CodeRunner is { CanRun: true }),
                     SkillCapabilities.For(model.Config.Architecture).ToolResultsRendered,
-                    clientTools, inference);
+                    clientTools, inference, subAgentOptions);
             }
             else
             {
@@ -2183,13 +2213,21 @@ namespace TensorSharp.Cli
         /// Run skill/tool rounds on one engine, reusing their shared radix prefix and
         /// splicing assistant token IDs into each subsequent prompt.
         /// </summary>
+        /// <param name="subAgents">
+        /// The sub-agent settings. When they are on, the turn gets a
+        /// <see cref="SubAgentRuntime"/>: the agent tools are answered by it, finished
+        /// agents' answers are folded into the next tool result, and an answer written while
+        /// agents are still out is held back until they are collected — the same three
+        /// hooks the server's loop has.
+        /// </param>
         static string RunInferenceWithSkills(
             ModelBase model, string rawText, List<string> imagePaths, int maxTokens,
             List<string> audioPaths, bool isVideo, SamplingConfig samplingConfig,
             bool enableThinking, List<ToolFunction> tools, bool preserveAllInput,
             int specDraftMax, float specDraftConfMin, string systemPrompt,
             SkillToolContext skillContext, int maxRounds, bool toolResultsRendered,
-            List<ToolFunction> clientTools = null, CliInferenceSession inference = null)
+            List<ToolFunction> clientTools = null, CliInferenceSession inference = null,
+            SubAgentOptions subAgents = null)
         {
             var specSettings = SpeculativeDecodingOptions.Resolve(specDraftMax, specDraftConfMin);
             using var ownedInference = inference == null
@@ -2198,6 +2236,31 @@ namespace TensorSharp.Cli
             inference ??= ownedInference;
             var priorTurns = new List<ChatMessage>();
             string result = string.Empty;
+
+            // One runtime for the whole turn, disposed with it. Its sub-agents render with
+            // this path's own renderer and public-prefix computation, so their leading
+            // system message and tool block tokenize exactly as the parent's rounds do.
+            using SubAgentRuntime agentRuntime = subAgents is { Enabled: true }
+                ? CliSubAgents.StartTurn(
+                    subAgents, skillContext,
+                    new CliSubAgentGeneration(
+                        model, CliRoundRenderer.For(model, PromptRenderer, enableThinking), inference,
+                        maxTokens, samplingConfig ?? SamplingConfig.Greedy, enablePrefixCache: true,
+                        CliSubAgents.Memoize((messages, turnTools) =>
+                            ComputeSharedPrefix(model, messages, enableThinking, turnTools)),
+                        _log),
+                    new SkillAgentLoopOptions
+                    {
+                        MaxRounds = maxRounds,
+                        ToolResultsAreRendered = toolResultsRendered,
+                        ClientTools = clientTools,
+                    },
+                    _log, CancellationToken.None)
+                : null;
+            SubAgentScope agents = agentRuntime?.Root;
+            SkillToolContext toolContext = agentRuntime?.RootContext ?? skillContext;
+            List<ChatMessage> Conversation() => BuildInferenceMessages(
+                systemPrompt, rawText, imagePaths, audioPaths, isVideo, priorTurns);
 
             for (int round = 1; round <= Math.Max(1, maxRounds); round++)
             {
@@ -2212,16 +2275,52 @@ namespace TensorSharp.Cli
                     systemPrompt: systemPrompt,
                     priorTurns: priorTurns.Count > 0 ? priorTurns : null,
                     onParsed: p => parsed = p, inference: inference,
-                    onGenerated: (tokens, whitespace) => { rawTokens = tokens; rawTrailingWhitespace = whitespace; });
+                    onGenerated: (tokens, whitespace) => { rawTokens = tokens; rawTrailingWhitespace = whitespace; },
+                    withSubAgents: agentRuntime != null);
 
                 // Three ways, so a name nobody declared is answered here rather than
                 // dropped: returning at this point handed the operator whatever prose
                 // preceded the call, which for a reasoning model is nothing at all.
                 SkillTools.Partition(
                     parsed?.ToolCalls, clientTools,
-                    out var builtInCalls, out _, out var unknownCalls);
+                    out var builtInCalls, out var clientCalls, out var unknownCalls);
                 if (builtInCalls.Count == 0 && unknownCalls.Count == 0)
+                {
+                    // An answer while sub-agents it started are still out. A small model
+                    // forgets to wait, and would answer without results already on their
+                    // way, so the loop collects them and gives it one more round — when
+                    // there is a round left to give. Otherwise they are stopped, and the
+                    // answer says so.
+                    if (clientCalls.Count == 0 && agents is { HasOutstandingWork: true })
+                    {
+                        if (round < maxRounds)
+                        {
+                            string handover = CliSubAgents.CollectOutstanding(
+                                agents, round, _log, CancellationToken.None);
+                            if (handover != null)
+                            {
+                                priorTurns.Add(new ChatMessage
+                                {
+                                    Role = "assistant",
+                                    Content = parsed?.Content ?? string.Empty,
+                                    Thinking = string.IsNullOrEmpty(parsed?.Thinking) ? null : parsed.Thinking,
+                                    RawOutputTokens = rawTokens,
+                                    RawPromptTrailingWhitespace = rawTrailingWhitespace,
+                                });
+                                priorTurns.Add(new ChatMessage { Role = "user", Content = handover });
+                                continue;
+                            }
+                        }
+                        else if (SubAgentConversation.EndWithoutRound(agents) is { } endNote)
+                        {
+                            // Stopped agents, and agents that finished too late to be used:
+                            // both are said, so no result vanishes silently.
+                            Console.Error.WriteLine("[agent] " + endNote);
+                            result = (result ?? string.Empty).TrimEnd() + "\n\n" + endNote;
+                        }
+                    }
                     return result;
+                }
 
                 var calls = parsed.ToolCalls;
 
@@ -2252,30 +2351,42 @@ namespace TensorSharp.Cli
 
                 foreach (var call in builtInCalls)
                 {
-                    var toolResult = SkillTools.Execute(call, skillContext);
+                    var toolResult = CliSubAgents.Execute(
+                        call, toolContext, agents, Conversation, tools, CancellationToken.None);
                     _log.LogInformation(LogEventIds.SkillToolInvoked,
                         "cli.skills.tool round={Round} tool={Tool} skill={SkillId} path={Path} ok={Ok} bytes={Bytes}",
                         round, call.Name, toolResult.SkillId ?? "-", toolResult.ResourcePath ?? "-",
                         toolResult.Ok, toolResult.Content?.Length ?? 0);
-                    Console.Error.WriteLine(
-                        $"[skill] {call.Name} {toolResult.SkillId ?? "?"} {toolResult.ResourcePath ?? string.Empty}"
-                        + (toolResult.Ok ? string.Empty : " (failed)"));
+                    Console.Error.WriteLine(agents != null && SkillToolNames.IsAgentTool(call.Name)
+                        ? CliSubAgents.DescribeCall(call, toolResult)
+                        : $"[skill] {call.Name} {toolResult.SkillId ?? "?"} {toolResult.ResourcePath ?? string.Empty}"
+                          + (toolResult.Ok ? string.Empty : " (failed)"));
                     priorTurns.Add(BuildSkillResultMessage(toolResultsRendered, toolResult.Content, call.Name));
                 }
 
+                // Sub-agents that finished during this round reach the model before its
+                // next generation, folded into the round's last tool result.
+                SubAgentConversation.AppendDeliveries(priorTurns, agents);
             }
 
             _log.LogWarning(LogEventIds.SkillLoopCapped,
                 "cli.skills.loop.capped rounds={Rounds}", maxRounds);
+            // Sub-agents still out are collected first, so the forced answer is written with
+            // their results rather than without them.
+            string limitHandover = agents is { HasOutstandingWork: true }
+                ? CliSubAgents.CollectOutstanding(agents, maxRounds + 1, _log, CancellationToken.None)
+                : null;
             priorTurns.Add(BuildSkillResultMessage(toolResultsRendered,
                 "Error: the limit on skill lookups for this turn has been reached. Answer now using what you "
-                + "have already read, and say which part you could not check.", null));
+                + "have already read, and say which part you could not check."
+                + (limitHandover == null ? string.Empty : "\n\n" + limitHandover), null));
             return RunInference(model, rawText, imagePaths, maxTokens, audioPaths,
                 isVideo: isVideo, samplingConfig: samplingConfig,
                 enableThinking: enableThinking, tools: tools,
                 preserveAllInput: preserveAllInput,
                 specDraftMax: specDraftMax, specDraftConfMin: specDraftConfMin,
-                systemPrompt: systemPrompt, priorTurns: priorTurns, inference: inference);
+                systemPrompt: systemPrompt, priorTurns: priorTurns, inference: inference,
+                withSubAgents: agentRuntime != null);
         }
 
         /// <summary>
@@ -2308,25 +2419,23 @@ namespace TensorSharp.Cli
         /// Receives the final parse, so a caller can inspect tool calls without this
         /// method's string return type changing under every existing caller.
         /// </param>
+        /// <param name="withSubAgents">
+        /// True when this round belongs to a turn whose sub-agents may be generating at the
+        /// same time: the round outranks them for preemption, and its media preparation
+        /// takes the GPU lock the engine's worker holds while it steps them.
+        /// </param>
         static string RunInference(ModelBase model, string rawText, List<string> imagePaths, int maxTokens,
             List<string> audioPaths = null, bool isVideo = false, SamplingConfig samplingConfig = null,
             bool enableThinking = false, List<ToolFunction> tools = null, bool silent = false,
             bool preserveAllInput = false, int specDraftMax = 0, float specDraftConfMin = -1f,
             string systemPrompt = null, List<ChatMessage> priorTurns = null,
             Action<ParsedOutput> onParsed = null, CliInferenceSession inference = null,
-            Action<List<int>, string> onGenerated = null)
+            Action<List<int>, string> onGenerated = null, bool withSubAgents = false)
         {
-            var messages = new List<ChatMessage>();
-            if (!string.IsNullOrWhiteSpace(systemPrompt))
-                messages.Add(new ChatMessage { Role = "system", Content = systemPrompt });
-            messages.Add(new ChatMessage { Role = "user", Content = rawText, ImagePaths = imagePaths, AudioPaths = audioPaths, IsVideo = isVideo });
-            if (priorTurns != null)
-                messages.AddRange(priorTurns);
+            var messages = BuildInferenceMessages(systemPrompt, rawText, imagePaths, audioPaths, isVideo, priorTurns);
 
-            var inputTokens = new KVCachePromptRenderer(PromptRenderer).RenderToTokens(
-                model.Tokenizer, model.Config.ChatTemplate, messages, model.Config.Architecture,
-                addGenerationPrompt: true, out _, out string trailingWhitespace,
-                tools: tools, enableThinking: enableThinking);
+            var inputTokens = CliRoundRenderer.For(model, PromptRenderer, enableThinking)
+                .Render(messages, tools, out string trailingWhitespace);
             var sharedPrefix = ComputeSharedPrefix(model, messages, enableThinking, tools);
             _log.LogDebug(LogEventIds.ChatStarted,
                 "cli.inference prompt tokens={Tokens}", inputTokens.Count);
@@ -2344,7 +2453,7 @@ namespace TensorSharp.Cli
                         "No vision encoder loaded. Use --mmproj <projector.gguf|vision.safetensors> to supply the vision tower.");
                 if (audioPaths is { Count: > 0 } && model is not IAudioCapableModel)
                     _log.LogWarning(LogEventIds.HostConfiguration, "This model has no audio path; the audio input will be ignored.");
-                inputTokens = model.MultimodalInjector.ProcessPromptTokens(messages, inputTokens, requestId);
+                inputTokens = CliSubAgents.PreparePrompt(model, messages, inputTokens, requestId, concurrent: withSubAgents);
                 if (preserveAllInput && model.MaxContextLength > 0
                     && (long)inputTokens.Count + maxTokens > model.MaxContextLength)
                     throw new InvalidOperationException(
@@ -2369,7 +2478,8 @@ namespace TensorSharp.Cli
                 }
                 var result = inference.Generate(inputTokens, maxTokens, cfg, Emit,
                     requestId: requestId, mediaSpans: model.MultimodalInjector.GetPreparedMediaSpans(requestId),
-                    sharedPrefixTokens: CliSharedPrefix.MatchingLength(sharedPrefix, inputTokens));
+                    sharedPrefixTokens: CliSharedPrefix.MatchingLength(sharedPrefix, inputTokens),
+                    priority: withSubAgents ? 1 : 0);
                 onGenerated?.Invoke(result.Tokens, trailingWhitespace);
                 if (!silent)
                 {
@@ -2396,6 +2506,24 @@ namespace TensorSharp.Cli
             {
                 model.MultimodalInjector.ClearPreparedPromptState(requestId);
             }
+        }
+
+        /// <summary>
+        /// The conversation a one-shot round renders: the system prompt, the user's message
+        /// and every turn the tool loop has appended since. Also what that loop's
+        /// sub-agents are bound to, so a spawned agent copies exactly the instructions the
+        /// parent's prompt carries.
+        /// </summary>
+        internal static List<ChatMessage> BuildInferenceMessages(string systemPrompt, string rawText,
+            List<string> imagePaths, List<string> audioPaths, bool isVideo, List<ChatMessage> priorTurns)
+        {
+            var messages = new List<ChatMessage>();
+            if (!string.IsNullOrWhiteSpace(systemPrompt))
+                messages.Add(new ChatMessage { Role = "system", Content = systemPrompt });
+            messages.Add(new ChatMessage { Role = "user", Content = rawText, ImagePaths = imagePaths, AudioPaths = audioPaths, IsVideo = isVideo });
+            if (priorTurns != null)
+                messages.AddRange(priorTurns);
+            return messages;
         }
 
         private static List<int> ComputeSharedPrefix(ModelBase model, IReadOnlyList<ChatMessage> messages,

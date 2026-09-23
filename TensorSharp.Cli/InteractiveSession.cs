@@ -19,6 +19,7 @@ using Microsoft.Extensions.Logging;
 using TensorSharp.Cli.Logging;
 using TensorSharp.Models;
 using TensorSharp.Runtime.Scheduling;
+using TensorSharp.AgentHost.Agents;
 using TensorSharp.AgentHost.Skills;
 using TensorSharp.Runtime.Speculative;
 
@@ -96,6 +97,16 @@ namespace TensorSharp.Cli
         private string _skillSystemBlock;
         private SkillToolContext _skillToolContext;
 
+        /// <summary>The sub-agent settings; off unless <c>--sub-agents</c> was given.</summary>
+        private readonly SubAgentOptions _subAgents;
+
+        /// <summary>
+        /// True while a turn with a live <see cref="SubAgentRuntime"/> is generating: the
+        /// parent's rounds then outrank its agents for preemption, and prepare media under
+        /// the GPU lock the engine's worker holds while it steps them.
+        /// </summary>
+        private bool _subAgentTurn;
+
         /// <summary>
         /// The skill ids a call could reach, so a skill name used as a tool name is
         /// answered with how to reach it rather than "there is no such tool".
@@ -158,7 +169,8 @@ namespace TensorSharp.Cli
             SkillHostOptions skillOptions = null,
             IReadOnlyList<Skill> initialSkills = null,
             ICodeRunner codeRunner = null,
-            SessionWorkspace codeWorkspace = null)
+            SessionWorkspace codeWorkspace = null,
+            SubAgentOptions subAgents = null)
         {
             _model = model ?? throw new ArgumentNullException(nameof(model));
             _originalModel = _model;
@@ -180,7 +192,14 @@ namespace TensorSharp.Cli
             _maxTokens = maxTokens > 0 ? maxTokens : 512;
             _log = log;
             _specSettings = SpeculativeDecodingOptions.Resolve(specDraftMax, specDraftConfMin);
+            _subAgents = subAgents?.Clone();
             RebuildSkillContext();
+            if (_subAgents is { Enabled: true } && _skillToolContext == null)
+            {
+                _log.LogWarning(LogEventIds.HostConfiguration,
+                    "--sub-agents is on, but this session offers the model no tools (no skills and no --code-exec, "
+                    + "or a model family that cannot carry tool declarations), so the sub-agent tools are not offered.");
+            }
         }
 
         /// <summary>
@@ -1163,6 +1182,7 @@ namespace TensorSharp.Cli
         private void RunTurn(string userText)
         {
             var renderHistory = BuildRenderHistory(userText);
+            SubAgentRuntime agentRuntime = null;
 
             try
             {
@@ -1177,6 +1197,14 @@ namespace TensorSharp.Cli
                 int maxRounds = _skillToolContext != null
                     ? Math.Max(1, _skillOptions.RoundsFor(_skillToolContext.CodeRunner is { CanRun: true }))
                     : 1;
+
+                // Sub-agents live for this turn and no longer: Ctrl+C cancels them with the
+                // turn, and the finally below stops any still working however it ends.
+                agentRuntime = StartSubAgentTurn(maxRounds);
+                SubAgentScope agents = agentRuntime?.Root;
+                SkillToolContext toolContext = agentRuntime?.RootContext ?? _skillToolContext;
+                _subAgentTurn = agentRuntime != null;
+
                 for (int round = 1; round <= maxRounds; round++)
                 {
                     List<ToolCall> toolCalls = Stream(renderHistory, _generationCts.Token);
@@ -1193,6 +1221,31 @@ namespace TensorSharp.Cli
                     {
                         foreach (var call in clientCalls.Concat(unknownCalls))
                             Console.WriteLine($"[tool call] {call}");
+
+                        // An answer while sub-agents it started are still out: collect them
+                        // and give the model one more round to use their results, when a
+                        // round is left; otherwise stop them and say so.
+                        if (clientCalls.Count == 0 && agents is { HasOutstandingWork: true })
+                        {
+                            if (round < maxRounds)
+                            {
+                                string handover = CliSubAgents.CollectOutstanding(
+                                    agents, round, _log, _generationCts.Token);
+                                if (handover != null)
+                                {
+                                    // Stream already recorded the assistant turn.
+                                    _history.Add(new ChatMessage { Role = "user", Content = handover });
+                                    renderHistory = BuildRenderHistoryForContinuation();
+                                    continue;
+                                }
+                            }
+                            else if (SubAgentConversation.EndWithoutRound(agents) is { } note)
+                            {
+                                // Stopped agents, and agents that finished too late to be
+                                // used: both are said, so no result vanishes silently.
+                                Console.WriteLine(note);
+                            }
+                        }
                         break;
                     }
 
@@ -1209,16 +1262,28 @@ namespace TensorSharp.Cli
 
                     foreach (var call in skillCalls)
                     {
-                        var result = SkillTools.Execute(call, _skillToolContext);
-                        Console.WriteLine(
-                            $"[skill] {call.Name} {result.SkillId ?? "?"} {result.ResourcePath ?? string.Empty}"
-                            + (result.Ok ? string.Empty : " (failed)"));
+                        var result = CliSubAgents.Execute(
+                            call, toolContext, agents, BuildRenderHistoryForContinuation, _tools, _generationCts.Token);
+                        if (agents != null && SkillToolNames.IsAgentTool(call.Name))
+                        {
+                            Console.Error.WriteLine(CliSubAgents.DescribeCall(call, result));
+                        }
+                        else
+                        {
+                            Console.WriteLine(
+                                $"[skill] {call.Name} {result.SkillId ?? "?"} {result.ResourcePath ?? string.Empty}"
+                                + (result.Ok ? string.Empty : " (failed)"));
+                        }
                         _log.LogInformation(LogEventIds.SkillToolInvoked,
                             "interactive.skills.tool round={Round} tool={Tool} skill={SkillId} path={Path} ok={Ok} bytes={Bytes}",
                             round, call.Name, result.SkillId ?? "-", result.ResourcePath ?? "-",
                             result.Ok, result.Content?.Length ?? 0);
                         _history.Add(BuildSkillResultMessage(result.Content, call.Name));
                     }
+
+                    // Sub-agents that finished during this round reach the model before its
+                    // next generation, folded into the round's last tool result.
+                    SubAgentConversation.AppendDeliveries(_history, agents);
 
                     if (round == maxRounds)
                     {
@@ -1232,9 +1297,15 @@ namespace TensorSharp.Cli
                         // no answer at all — the model was mid-work, was never asked to
                         // wrap up, and never got a turn in which it could.
                         Console.WriteLine("[skill lookup limit reached for this turn — answering now]");
+                        // Sub-agents still out are collected first, so the forced answer is
+                        // written with their results rather than without them.
+                        string limitHandover = agents is { HasOutstandingWork: true }
+                            ? CliSubAgents.CollectOutstanding(agents, maxRounds + 1, _log, _generationCts.Token)
+                            : null;
                         _history.Add(BuildSkillResultMessage(
                             "Error: the limit on tool calls for this turn has been reached. Answer now "
-                            + "using what you have already read, and say which part you could not check.",
+                            + "using what you have already read, and say which part you could not check."
+                            + (limitHandover == null ? string.Empty : "\n\n" + limitHandover),
                             null));
                         Stream(BuildRenderHistoryForContinuation(), _generationCts.Token);
                         break;
@@ -1257,11 +1328,44 @@ namespace TensorSharp.Cli
             }
             finally
             {
+                // Before the token source goes: disposal stops any agent still working and
+                // waits for it to let go of the engine and the workspace.
+                agentRuntime?.Dispose();
+                _subAgentTurn = false;
                 _isGenerating = false;
                 _generationCts?.Dispose();
                 _generationCts = null;
             }
         }
+
+        /// <summary>
+        /// This turn's <see cref="SubAgentRuntime"/>, or null when sub-agents are off or the
+        /// session offers no tools. Its agents render with this session's own renderer,
+        /// token budget, sampling and public prefix, so their leading system message and
+        /// tool block tokenize exactly as this session's rounds do, and they generate
+        /// through this session's engine.
+        /// </summary>
+        private SubAgentRuntime StartSubAgentTurn(int maxRounds)
+        {
+            if (_subAgents is not { Enabled: true } || _skillToolContext == null)
+                return null;
+
+            var generation = new CliSubAgentGeneration(
+                _model, RoundRenderer(), Inference, _maxTokens, _samplingConfig, PrefixCacheEnabled,
+                (_, _) => _sharedPrefix, _log);
+            return CliSubAgents.StartTurn(
+                _subAgents, _skillToolContext, generation,
+                new SkillAgentLoopOptions
+                {
+                    MaxRounds = maxRounds,
+                    ToolResultsAreRendered = SkillCapabilities.For(_model.Config.Architecture).ToolResultsRendered,
+                    ClientTools = _clientTools,
+                },
+                _log, _generationCts.Token);
+        }
+
+        /// <summary>How this session renders a round: its model, its template, its thinking flag.</summary>
+        private CliRoundRenderer RoundRenderer() => CliRoundRenderer.For(_model, _promptRenderer, _enableThinking);
 
         /// <summary>Print the roster and mark which skills this conversation is using.</summary>
         private void ListSkills()
@@ -1370,6 +1474,11 @@ namespace TensorSharp.Cli
                     Workspace = _codeWorkspace,
                 };
             }
+
+            // The sub-agent tools, last, and only on a session that already offers tools —
+            // the server's rule, so a session's tool block only ever grows at its end.
+            if (_skillToolContext != null)
+                _tools = CliSubAgents.AppendAgentTools(_tools, _subAgents, _log);
 
             // The editing rules, on BOTH paths — with skills and without. They were
             // injected only by the server's plan, so a CLI chat was declared all five code
@@ -1559,21 +1668,16 @@ namespace TensorSharp.Cli
         {
             string arch = _model.Config.Architecture;
 
-            var inputTokens = _renderer.RenderToTokens(
-                _model.Tokenizer,
-                _model.Config.ChatTemplate,
-                renderHistory,
-                arch,
-                addGenerationPrompt: true,
-                out _,
-                out string generationPromptTrailingWhitespace,
-                tools: _tools,
-                enableThinking: _enableThinking);
+            // The same renderer a sub-agent of this turn uses, so the two tokenize their
+            // shared system message and tool block identically.
+            var inputTokens = RoundRenderer().Render(
+                renderHistory, _tools, out string generationPromptTrailingWhitespace);
 
             string requestId = $"cli-{Guid.NewGuid():N}";
             try
             {
-                inputTokens = _model.MultimodalInjector.ProcessPromptTokens(renderHistory, inputTokens, requestId);
+                inputTokens = CliSubAgents.PreparePrompt(
+                    _model, renderHistory, inputTokens, requestId, concurrent: _subAgentTurn);
             }
             catch
             {
@@ -1693,7 +1797,8 @@ namespace TensorSharp.Cli
                     EmitToken, cancellationToken, requestId,
                     _model.MultimodalInjector.GetPreparedMediaSpans(requestId),
                     enablePrefixCache: PrefixCacheEnabled,
-                    sharedPrefixTokens: CliSharedPrefix.MatchingLength(_sharedPrefix, inputTokens));
+                    sharedPrefixTokens: CliSharedPrefix.MatchingLength(_sharedPrefix, inputTokens),
+                    priority: _subAgentTurn ? 1 : 0);
             }
             finally
             {
