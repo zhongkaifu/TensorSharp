@@ -288,6 +288,7 @@ New here? The sections above are all you need to get running. Everything else is
 | [Per-model architecture cards](docs/models/README.md) | End-to-end docs of each architecture (forward graph, components, parameters, prefill/decode optimizations) |
 | [Paged attention & continuous batching](docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md) | The vLLM-style paged KV cache, prefix sharing, and iteration-level scheduler |
 | [Agent Skills & agentic work](docs/agent_skills.md) | The `SKILL.md` format, progressive disclosure and its budget, the in-process tool loop, sandboxed code execution, workspaces and artifacts, the path/ZIP/exec security model, and the HTTP + C# surfaces |
+| [Sub-agents](docs/sub_agents.md) | `--sub-agents`: Codex-style `spawn_agent` / `wait_agent` tools, parallel agents on one loaded model sharing its KV prefix, limits, log lines, and where TensorSharp differs from Codex |
 | [Speculative decoding](docs/speculative_decoding.md) | The three-layer design (model adapter / algorithm / speculator weights), the shipped `auto` / `draft-head` / `block` / `ngram` algorithms, and what to write to add a new one |
 | [Environment variable feature matrix](docs/env_var_feature_matrix.md) | Which high-impact runtime flags affect which models, backends, and prompt types |
 | [Engine comparison report](docs/engine_comparison_report.md) | Full per-scenario TensorSharp vs llama.cpp / stable-diffusion.cpp tables |
@@ -305,7 +306,7 @@ Actively developed, and the source tree runs ahead of the published packages. Th
 | Inference hosts | CLI, interactive REPL, ASP.NET Core Web UI, Ollama-style API, OpenAI Chat Completions and Responses APIs, and the TensorAgent iOS/iPadOS app. |
 | Backends | Pure C# CPU, direct CUDA/cuBLAS, MLX Metal, and GGML CPU/Metal/CUDA/Vulkan, with per-architecture exceptions. |
 | Serving features | Continuous batching over a paged, prefix-shared KV cache; speculative decoding; single- and multi-node tensor parallelism; structured output; tool calling. |
-| Agentic work | Agent Skills and an optional bounded in-process tool loop (`--code-exec`) for sandboxed file and shell work. Both off by default. |
+| Agentic work | Agent Skills and an optional bounded in-process tool loop (`--code-exec`) for sandboxed file and shell work. Both off by default. On the server, `--sub-agents` (also off by default) lets the model delegate tasks to parallel [sub-agents](docs/sub_agents.md) on the same loaded model. |
 
 Per-area detail — which architecture runs on which backend, which features each family supports, and the known limits — is in the [status matrix](docs/PROJECT_STATUS.md#status-matrix).
 

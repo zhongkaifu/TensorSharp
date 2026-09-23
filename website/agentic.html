@@ -25,7 +25,7 @@
     <li><h3>Do the work</h3><p>If the operator enabled <code>--code-exec</code>, the model can inspect, edit, create, patch, and test files in a request or chat workspace. Skill scripts can participate too, but only under their separate execution opt-in.</p></li>
     <li><h3>Return an ordinary answer</h3><p>The client receives the final completion rather than TensorSharp's internal tool calls. A caller's own tools are never executed by TensorSharp; those calls are returned normally for the caller to service.</p></li>
   </ol>
-  <div class="callout note"><div class="ic">🎯</div><p><strong>Current scope is one model and one in-process tool loop.</strong> TensorSharp does not spawn multiple agents or delegate to subagents, and it has no interactive approval queue before each command. The operator grants or withholds skills, script execution, code execution, networking, and installation when the CLI or server starts; an internal tool then runs under that policy or refuses.</p></div>
+  <div class="callout note"><div class="ic">🎯</div><p><strong>One loaded model, in-process tool loops.</strong> By default a turn is a single tool loop. When the server is started with <code>--sub-agents</code>, the model can also delegate tasks to <a href="#sub-agents">sub-agents</a>: further tool loops on the same loaded model, each with its own context. There is no interactive approval queue before each command. The operator grants or withholds skills, script execution, code execution, networking, and installation when the CLI or server starts; an internal tool then runs under that policy or refuses.</p></div>
 
   <h2 id="ios">TensorAgent on iPhone and iPad</h2>
   <p><strong>TensorAgent</strong> packages this local chat and agent experience as a .NET MAUI iOS/iPadOS app. The engine is statically linked as an iOS <code>.xcframework</code> and uses <code>ggml_metal</code> on physical devices. The app shares the host-neutral chat pipeline (<code>TensorSharp.Chat</code>) with the CLI and server, but serves the UI through an in-process loopback server because iOS has no ASP.NET Core runtime pack. What it shares is the API, not the document: the phone gets its own page, laid out for a thumb rather than a mouse and a wide window, bound to the same <code>WebUiChatService</code> and <code>SkillsService</code> routes.</p>
@@ -153,6 +153,24 @@
   "stream": true
 }</code></pre>
   <p><code>skills_discovery</code> defaults to <code>true</code>. Code execution has no per-request enable field: the operator either started the host with <code>--code-exec</code> or the four tools are absent. The agent loop allows 8 internal rounds by default, or 24 when code execution is enabled; <code>--skills-max-rounds</code> sets an explicit 1–64 bound.</p>
+
+  <h2 id="sub-agents">Sub-agents (server, off by default)</h2>
+  <p>A sub-agent is another copy of the model that the model itself starts for one task. It has the same tools and works in the same working directory as the agent that started it, but it has its own context: it sees its task, not the conversation. It works in parallel with its parent and hands back one final answer. TensorSharp uses the tool surface OpenAI's Codex uses and runs every sub-agent as an ordinary sequence on the <strong>same loaded model</strong>: the continuous-batching engine decodes the parent and its sub-agents together, and each sub-agent's prompt starts with its parent's exact instructions and tool block, so the engine reuses that cached prefix instead of prefilling it again.</p>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Option</th><th>Default</th><th>Meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>--sub-agents</code></td><td>Off</td><td>Offer the five sub-agent tools on requests that already have tools (skills or <code>--code-exec</code>): Web UI, <code>/v1/chat/completions</code>, <code>/v1/responses</code>, and Ollama's <code>/api/chat</code>. Env: <code>TS_SUB_AGENTS</code> (any value but <code>0</code>).</td></tr>
+      <tr><td><code>--sub-agents-max-threads &lt;n&gt;</code></td><td><code>4</code></td><td>Sub-agents open at once in one turn, 1–16. Starting one more first closes the longest-finished agent whose answer was already delivered; it fails only when every open agent is still working. Env: <code>TS_SUB_AGENTS_MAX_THREADS</code>.</td></tr>
+      <tr><td><code>--sub-agents-max-depth &lt;n&gt;</code></td><td><code>1</code></td><td>How deep sub-agents may nest, 1–4. At <code>1</code> the model may start sub-agents but a sub-agent may not start its own. Env: <code>TS_SUB_AGENTS_MAX_DEPTH</code>.</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>The tools are <code>spawn_agent</code>, <code>send_input</code>, <code>wait_agent</code>, <code>close_agent</code>, and <code>list_agents</code>; their descriptions tell the model to start sub-agents only when the user, or a skill it is following, asks for them. A finished agent's answer reaches the parent exactly once, through <code>wait_agent</code> or a notification in its next tool result, next to the host's own record of the tools the agent ran. Agents share the parent's workspace files, but each has its own shell working directory, exported variables, and read ledger. Sub-agents never outlive the turn: if the model answers while agents are still working, the host collects their results and gives it one more round, and whatever is still running when the request ends is stopped.</p>
+  <p><code>--sub-agents</code> also raises <code>TS_RETAINED_FUSED_CACHE_MAX</code> from 4 to <code>2 × (max-threads + 1)</code> unless it is set explicitly, so a parent keeps its cached conversation while its agents run. The C# client offers the same switch as <code>SkillsChatClientOptions.SubAgents</code>. Full reference, including the KV-cache behaviour, the log lines, and where TensorSharp differs from Codex: <a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/sub_agents.md" target="_blank" rel="noopener">docs/sub_agents.md</a>.</p>
+  <pre data-lang="bash"><code>dotnet run --project TensorSharp.Server.Host -c Release -- \
+  --model models/model.gguf --backend ggml_metal \
+  --code-exec --sub-agents</code></pre>
 
   <h2 id="compatibility">Model-family limits</h2>
   <p>The in-process loop requires a model family that can both carry tool declarations and parse tool calls. Families without that round trip receive selected skill instructions inline as a fallback, but are not offered the four code tools. TensorSharp logs the limitation rather than silently pretending code execution is available.</p>

@@ -604,6 +604,9 @@ Running `TensorSharp.Server` with no arguments prints the full parameter referen
 | `--skills-no-discovery` | Do not advertise unselected skills to the model, so each request sees exactly the skills it named. Per request, `"skills_discovery": false` does the same. |
 | `--skills-allow-exec` | Allow `skills_run`. **Off by default. On a shared server this is a remote code execution primitive** — a skill is content somebody uploaded, and the decision to run one of its scripts is made by a model reading that same person's Markdown. Scripts use only known interpreters without a shell, run from the current Web session or private OpenAI/Ollama request workspace (or per-call scratch without code execution), and see the skill itself read-only. The default required sandbox refuses execution when safe OS confinement is unavailable. Env: `TS_SKILLS_ALLOW_EXEC` (anything but `0` counts as on). |
 | `--skills-max-rounds <n>` | How many times the model may fetch skill content - or run, read and fix code - before it must answer, 1-64 (default: `8`, or `24` when `--code-exec` is on; a value set here is used as given). Each round is a full generation. Env: `TS_SKILLS_MAX_ROUNDS`. |
+| `--sub-agents` | Offer the model the five sub-agent tools — `spawn_agent`, `send_input`, `wait_agent`, `close_agent`, `list_agents` — on requests that already have tools (skills or `--code-exec`). A sub-agent is another copy of the model with the same tools and working directory but its own context; it works on one task in parallel and reports back a final answer. Sub-agents run as separate sequences on the same loaded model, so the engine batches their decoding together and reuses the parent's cached instructions-and-tools prefix. The tool descriptions tell the model to start sub-agents only when the user or a skill asks for them. Sub-agents live for one turn. Also raises `TS_RETAINED_FUSED_CACHE_MAX` from 4 to `2 × (max-threads + 1)` unless it is set explicitly. Off by default. Env: `TS_SUB_AGENTS` (anything but `0` counts as on). See [Sub-agents](docs/sub_agents.md). |
+| `--sub-agents-max-threads <n>` | How many sub-agents may be open at once in one turn, 1-16 (default: `4`). Starting one more first closes the longest-finished agent whose answer was already delivered, and fails only when every open agent is still working. Env: `TS_SUB_AGENTS_MAX_THREADS`. |
+| `--sub-agents-max-depth <n>` | How deep sub-agents may nest, 1-4 (default: `1`: the model may start sub-agents, but a sub-agent may not start its own). Env: `TS_SUB_AGENTS_MAX_DEPTH`. |
 | `--skills-sandbox <off\|preferred\|required>` | How hard to insist on OS isolation for a skill's scripts. `required` (the default) refuses to run them on a host with no safe sandbox rather than running them unconfined; `preferred` explicitly accepts weaker isolation; `off` keeps only the runner's interpreter, environment, time and output limits. macOS uses `sandbox-exec`; Linux requires `bwrap` 0.12.0 or newer. Windows Job Objects bound only the process tree, so `required` refuses there and `preferred` is the explicit weaker-isolation opt-in. Env: `TS_SKILLS_SANDBOX`. |
 | `--skills-allow-network` | Let a sandboxed skill script reach the network. Denied by default. Env: `TS_SKILLS_ALLOW_NETWORK`. |
 | `--code-exec` | Offer the model the `shell`, `read_file`, `write_file` and `apply_patch` tools. `shell` runs a real command line and returns its exit code plus merged stdout/stderr; use `write_file` to create new files and `apply_patch` for every modification to one or multiple existing files. Web UI keeps one workspace per chat session. Every OpenAI Chat, OpenAI Responses, and Ollama HTTP request gets a private workspace across its internal tool rounds and that workspace is deleted after the response. Commands run in a required OS sandbox on macOS/Linux, and the server refuses to run them if confinement is unavailable unless the operator explicitly sets `--code-exec-unconfined`; Windows always needs that escape hatch. Network is denied independently by default and enabled only by `--code-exec-allow-network`. All built-in tools are answered in process rather than returned to the API client. Off by default. Env: `TS_CODE_EXEC` (anything but `0` counts as on). |
@@ -657,6 +660,14 @@ sandbox cannot pin egress to a proxy was the whole internet. The retired
 point at, because a shell reaches every interpreter on PATH, so a deployment
 script carried over from the old surface fails with that in the message instead
 of quietly losing a setting.
+
+**Sub-agents.** With `--sub-agents` as well, the model can hand a task to a
+sub-agent: another copy of itself, on the same loaded model, that shares its
+parent's workspace files but has its own context and its own shell working
+directory, runs in parallel with it, and hands back one final answer. The tool
+descriptions tell the model to delegate only when the user or a skill asks for
+it, and no sub-agent outlives the turn. See [Sub-agents](docs/sub_agents.md) for
+the tools, the KV-cache behaviour and the log lines.
 
 | Option | Description |
 |---|---|
@@ -777,7 +788,7 @@ These can be set with either the `--paged-kv*` / `--continuous-batching` CLI fla
 | `TS_SCHED_STOP_REPETITION` | `0` lets a generation that has locked into a loop run to its token limit instead of being stopped. |
 | `TS_SCHED_DECODE_QUANTUM` | Tokens before a sequence-switch is allowed (default: block size). |
 | `TS_RETAINED_FUSED_CACHE` | `1` (default) retains a finished request's fused holder so an exact-prefix continuation skips re-prefilling it, on models that advertise support (Gemma 4 K/V; Qwen 3.5/3.6 attention K/V plus GatedDeltaNet recurrent state). `0` disables it (VRAM cap / A-B). |
-| `TS_RETAINED_FUSED_CACHE_MAX` | LRU budget of retained fused holders (default: `4`); each pins a complete per-request continuation state. |
+| `TS_RETAINED_FUSED_CACHE_MAX` | LRU budget of retained fused holders (default: `4`); each pins a complete per-request continuation state. `--sub-agents` raises it to `2 × (max-threads + 1)` unless it is set explicitly (see [Sub-agents](docs/sub_agents.md#kv-cache)). |
 | `TS_MM_EMBEDDING_CACHE_MB` | Byte budget of the image/audio embedding cache (default: `512`). Entries are keyed by media content (SHA-256), so an API client resending the same image every turn encodes it once; least-recently-used entries no in-flight prompt references are evicted past the budget. |
 | `TS_PREFIX_CHECKPOINTS` | `1` (default) checkpoints the model state at the end of the prompt every conversation shares — system prompt, tools, skills — and starts each **new** chat from a clone of it, so a new chat re-prefills only its own message. Gemma 4 and Qwen 3.5/3.6 on the GGML backends. `0` disables. |
 | `TS_PREFIX_CHECKPOINTS_MAX` | How many distinct shared prefixes stay checkpointed at once, LRU (default: `2`). Each holds one copy of that prefix's K/V and, on Qwen, its recurrent state. |
@@ -2015,6 +2026,19 @@ provide the filesystem sandbox and therefore still needs
 tools: it is refused by name at startup and has no replacement to point at,
 because a shell reaches every interpreter on PATH, so an operator with an old
 script gets that error instead of watching a setting be ignored.
+
+#### Sub-agents (server-only)
+
+| Feature | Default | Env vars | CLI equivalent |
+|---|---|---|---|
+| The `spawn_agent`, `send_input`, `wait_agent`, `close_agent` and `list_agents` tools (on requests that already have skills or `--code-exec`) | **OFF** | **`TS_SUB_AGENTS=1`** | `--sub-agents` |
+| Sub-agents open at once in one turn | `4` (range 1-16) | `TS_SUB_AGENTS_MAX_THREADS` | `--sub-agents-max-threads N` |
+| Nesting depth | `1` (range 1-4; a sub-agent may not start its own) | `TS_SUB_AGENTS_MAX_DEPTH` | `--sub-agents-max-depth N` |
+
+`TS_SUB_AGENTS` treats any value other than `0` as on. When sub-agents are on,
+the server raises `TS_RETAINED_FUSED_CACHE_MAX` from `4` to
+`2 × (max-threads + 1)` unless it is set explicitly, and says so at startup.
+Full reference: [Sub-agents](docs/sub_agents.md).
 
 #### Sampling defaults (server-only)
 

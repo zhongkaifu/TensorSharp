@@ -571,6 +571,9 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --config config/s
 | `--skills-no-discovery` | 不向模型展示未被选中的技能，于是每个请求只看得到它自己点名的技能。按请求粒度可用 `"skills_discovery": false` 达到同样效果。 |
 | `--skills-allow-exec` | 允许 `skills_run`。**默认关闭。在共享服务器上，这就是一个远程代码执行入口**——技能是别人上传的内容，而决定要不要运行其中某个脚本的，是一个正在读同一个人写的 Markdown 的模型。脚本只经已知解释器直接运行，不经过 shell；工作目录是当前 Web 会话或私有 OpenAI/Ollama 请求工作区（未开启代码执行时为单次调用 scratch 目录），技能目录只读。默认的 required 沙箱在无法提供安全操作系统隔离时拒绝执行。环境变量：`TS_SKILLS_ALLOW_EXEC`（非 `0` 即视为开启）。 |
 | `--skills-max-rounds <n>` | 模型在必须作答前可以取用技能内容——或运行、查看并修正代码——的次数，范围 1-64（默认：`8`；开启 `--code-exec` 时为 `24`；此处显式设定的值按原样使用）。每一轮都是一次完整生成。环境变量：`TS_SKILLS_MAX_ROUNDS`。 |
+| `--sub-agents` | 在已经带有工具（技能或 `--code-exec`）的请求上，向模型提供五个子智能体工具：`spawn_agent`、`send_input`、`wait_agent`、`close_agent`、`list_agents`。子智能体是模型的另一个副本，工具与工作目录和父智能体相同，但拥有自己的上下文；它并行处理一项任务，最后交回一个最终答案。子智能体在**同一个已加载模型**上作为独立序列运行，因此引擎会把它们的解码批在一起，并复用父智能体已缓存的“指令 + 工具”前缀。工具说明会告诉模型：只有用户或某个技能要求时才启动子智能体。子智能体的生命周期只有一轮。开启后还会把 `TS_RETAINED_FUSED_CACHE_MAX` 从 4 提高到 `2 × (max-threads + 1)`，除非该变量已显式设置。默认关闭。环境变量：`TS_SUB_AGENTS`（非 `0` 即视为开启）。见[子智能体](docs/sub_agents_zh-cn.md)。 |
+| `--sub-agents-max-threads <n>` | 一轮中同时打开的子智能体数量上限，范围 1-16（默认：`4`）。再启动一个时，会先关闭答案已交付、且完成时间最早的那个智能体；只有所有已打开的智能体都仍在工作时才会失败。环境变量：`TS_SUB_AGENTS_MAX_THREADS`。 |
+| `--sub-agents-max-depth <n>` | 子智能体可嵌套的深度，范围 1-4（默认：`1`：模型可以启动子智能体，但子智能体不能再启动自己的子智能体）。环境变量：`TS_SUB_AGENTS_MAX_DEPTH`。 |
 | `--skills-sandbox <off\|preferred\|required>` | 对技能脚本要求多强的操作系统级隔离。`required`（默认）在没有安全沙箱的宿主机上拒绝运行；`preferred` 表示显式接受较弱隔离；`off` 只保留解释器、环境、时限与输出限制。macOS 使用 `sandbox-exec`；Linux 要求 `bwrap` 0.12.0 或更高版本。Windows Job Object 只能限制进程树，因此 `required` 会拒绝，必须显式选 `preferred` 才接受较弱隔离。环境变量：`TS_SKILLS_SANDBOX`。 |
 | `--skills-allow-network` | 允许沙箱内的技能脚本联网。默认禁止。环境变量：`TS_SKILLS_ALLOW_NETWORK`。 |
 | `--code-exec` | 向模型提供 `shell`、`read_file`、`write_file` 与 `apply_patch` 工具。`shell` 执行真正的命令行并返回退出码与合并后的 stdout/stderr；`write_file` 仅用于新建文件，已有单个或多个文件的所有修改都使用 `apply_patch`。Web UI 每个聊天会话保留一个工作区；每个 OpenAI Chat、OpenAI Responses 与 Ollama HTTP 请求则在其内部工具轮次间使用一个私有工作区，并在响应结束后删除。macOS / Linux 上命令必须在操作系统沙箱内运行；隔离不可用时，除非运维者显式设置 `--code-exec-unconfined`，服务端会拒绝执行。Windows 始终需要这个逃生开关。联网默认另行禁止，只能用 `--code-exec-allow-network` 开启。所有内置工具都由宿主在进程内应答，不会返回给 API 客户端。默认关闭。环境变量：`TS_CODE_EXEC`（非 `0` 即视为开启）。 |
@@ -614,6 +617,12 @@ Unix IPC 并非完整隔离边界：macOS 为兼容性保留共享临时目录�
 会在启动时被按名字拒绝，并且没有替代品可指，因为 shell 能够到达 PATH 上的每一
 个解释器；于是从旧接口沿用下来的部署脚本得到的是这条报错，而不是一个被悄悄丢掉
 的设置。
+
+**子智能体。** 再加上 `--sub-agents`，模型就可以把任务交给子智能体：它是运行在
+同一个已加载模型上的另一个模型副本，与父智能体共享工作区里的文件，但拥有自己的上下文
+和自己的 shell 工作目录，与父智能体并行运行，最后交回一个最终答案。工具说明会告诉
+模型：只有用户或某个技能要求时才委派任务；任何子智能体都不会活过当前这一轮。工具、
+KV 缓存行为与日志行见[子智能体](docs/sub_agents_zh-cn.md)。
 
 | 参数 | 说明 |
 |---|---|
@@ -729,7 +738,7 @@ Unix IPC 并非完整隔离边界：macOS 为兼容性保留共享临时目录�
 | `TS_SCHED_STOP_REPETITION` | `0` 允许陷入重复循环的生成继续跑到 token 上限，而不是被提前结束。 |
 | `TS_SCHED_DECODE_QUANTUM` | 在允许切换序列前的 token 数（默认与 block size 相同）。 |
 | `TS_RETAINED_FUSED_CACHE` | `1`（默认）在请求结束后保留其融合 holder，使前缀完全一致的续写不必重新 prefill；仅对声明支持的模型有效（Gemma 4 的 K/V；Qwen 3.5/3.6 的注意力 K/V 加 GatedDeltaNet 递归状态）。`0` 关闭（用于限制显存或做 A/B）。 |
-| `TS_RETAINED_FUSED_CACHE_MAX` | 保留的融合 holder 的 LRU 预算（默认 `4`）；每个都钉住一份完整的按请求续写状态。 |
+| `TS_RETAINED_FUSED_CACHE_MAX` | 保留的融合 holder 的 LRU 预算（默认 `4`）；每个都钉住一份完整的按请求续写状态。`--sub-agents` 会把它提高到 `2 × (max-threads + 1)`，除非它已显式设置（见[子智能体](docs/sub_agents_zh-cn.md#kv-缓存)）。 |
 | `TS_MM_EMBEDDING_CACHE_MB` | 图像/音频嵌入缓存的字节预算（默认 `512`）。条目以媒体内容（SHA-256）为键，因此 API 客户端每轮重发同一张图片只编码一次；超出预算后淘汰没有被进行中提示引用的最近最少使用条目。 |
 | `TS_PREFIX_CHECKPOINTS` | `1`（默认）在所有会话共享的那段提示词末尾——系统提示词、工具、技能——对模型状态做 checkpoint，并让每个**新**会话从它的副本开始，因此新会话只需重新 prefill 自己的那条消息。适用于 GGML 后端上的 Gemma 4 与 Qwen 3.5/3.6。`0` 关闭。 |
 | `TS_PREFIX_CHECKPOINTS_MAX` | 同时保留 checkpoint 的不同共享前缀数量，按 LRU 淘汰（默认 `2`）。每个都持有该前缀的一份 K/V，Qwen 上还包括递归状态。 |
@@ -1779,6 +1788,18 @@ macOS 子进程会继承 Seatbelt，普通进程组也会被清理，但主动�
 `--code-exec-languages`：它在启动时会被按名字拒绝，并且没有替代品可指，因为
 shell 能够到达 PATH 上的每一个解释器——于是手上还拿着旧脚本的运维者得到的是这条
 报错，而不是眼看着一个设置被忽略。
+
+#### 子智能体（仅服务端）
+
+| 功能 | 默认 | 环境变量 | CLI 等价参数 |
+|---|---|---|---|
+| `spawn_agent`、`send_input`、`wait_agent`、`close_agent` 与 `list_agents` 工具（仅在已带有技能或 `--code-exec` 的请求上提供） | **关闭** | **`TS_SUB_AGENTS=1`** | `--sub-agents` |
+| 一轮中同时打开的子智能体数 | `4`（范围 1-16） | `TS_SUB_AGENTS_MAX_THREADS` | `--sub-agents-max-threads N` |
+| 嵌套深度 | `1`（范围 1-4；子智能体不能再启动自己的子智能体） | `TS_SUB_AGENTS_MAX_DEPTH` | `--sub-agents-max-depth N` |
+
+`TS_SUB_AGENTS` 只要取值不是 `0` 就算开启。开启子智能体后，除非
+`TS_RETAINED_FUSED_CACHE_MAX` 已显式设置，服务端会把它从 `4` 提高到
+`2 × (max-threads + 1)`，并在启动时说明。完整参考见[子智能体](docs/sub_agents_zh-cn.md)。
 
 #### 采样默认值（仅服务端）
 

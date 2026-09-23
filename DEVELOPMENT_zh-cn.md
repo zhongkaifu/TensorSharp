@@ -250,8 +250,9 @@ TensorSharp/
 │   ├── PrefillChunking.cs       # SWA / 超长 prompt 使用的分块 prefill 辅助
 │   ├── KvBlockHash.cs           # 内容寻址的块哈希，用于跨请求前缀复用
 │   └── Logging/                 # JSON-line 文件日志器 + 每轮遥测
-├── TensorSharp.AgentHost/       # 构建在运行时之上的智能体层：Agent Skills 与代码执行
+├── TensorSharp.AgentHost/       # 构建在运行时之上的智能体层：Agent Skills、代码执行与子智能体
 │   ├── Skills/                  # Agent Skills：SKILL.md frontmatter 解析（YamlFrontmatter、SkillManifest）、发现 / 安装 / 查找（SkillRegistry、SkillArchive）、目录边界约束（SkillPathGuard）、提示词规划（SkillPrompt）、内置的 skills_list / skills_read / skills_run 工具与进程内披露循环（SkillTools、SkillAgentLoop、SkillScriptRunner）、共用的参数解析（SkillHostOptions）以及对外客户端（SkillsChatClient），以及各平台沙箱（SkillSandbox、SkillSandboxWindows）及其违规监视器、会话级工作区（SessionWorkspace）
+│   ├── Agents/                  # 子智能体（--sub-agents）：按轮存在的运行时，负责一轮启动的所有智能体——编号、树结构、上限、状态与结果交付（SubAgentRuntime）；单个智能体持有的运行时句柄，决定一次调用能触及谁的智能体、一次启动会嵌套多深（SubAgentScope）；五个工具声明及其分派（SubAgentTools）；两个宿主共用的参数解析与保留状态默认值（SubAgentOptions）
 │   └── CodeExec/                # 文件工具（read_file、write_file）、shell 与 apply_patch：执行引擎（ShellRunner）、两个工具声明以及小模型所需的宽松参数读取（ShellTools）、command 参数的解读——把一行命令拆成各个简单命令、判定其中哪些是软件包安装（这决定了这一行到底能不能拿到套接字）、并在 shell 看到之前拦截 apply_patch heredoc（ShellCommand）、会话级的工作目录与导出环境变量——因为没有常驻的 shell 进程，它们通过文件持久化（ShellSession）、shell 的发现与方言（ShellProgram）、补丁信封解析（CodePatch）及其匹配引擎——对参考实现 V4A applier 的逐行移植（V4ADiff）、把一次失败改写成下一条该敲的命令（CodeDiagnostics）、当一次运行是因为模型猜错了库的 API 而失败时，直接从已安装的包里读出真实 API（ApiProbe）、检查命令写入或补丁改动后的文件是否仍能解析（SyntaxCheck）、把宿主的绝对路径从命令的全部输出中改写掉（OutputPaths）、发现「为改两行而重打整个文件」的行为（RewriteWatch）、为 import 失败的技能脚本由宿主发起的安装（PackageInstaller）、宿主侧的执行条款（CodeExecOptions）、受限启动——它也可以只启动进程而不等它结束，后台任务即由此实现（ConfinedProcess）、解释器发现（CodeEnvironment）、产物捕获（CodeArtifactStore）、安装期的软件源代理（EgressProxy）、结果记录（CodeExecResult），以及技能层所见的 ICodeRunner 接缝（CodeRunnerAdapter）
 ├── TensorSharp.Models/          # 模型架构实现与多模态编码/注入
 │   ├── Models/<Family>/         # 每个架构一个目录（DeepSeek4、DiffusionGemma、Gemma4、GlmDsa、GptOss、MiniMaxH3、Mistral3、MuseGlimmer、Nemotron、Qwen35、Qwen4Exp、QwenImage、WanVideo）
@@ -349,6 +350,7 @@ TensorSharp/
 │   ├── PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md  # 分页 KV 缓存、前缀共享、调度器、按模型批处理状态
 │   ├── speculative_decoding.md  # 起草-验证设计：ISpeculativeTarget / ISpeculator / IDraftHead 三层，以及 draft-head、block 与 ngram 三种算法
 │   ├── agent_skills.md          # Agent Skills：SKILL.md 格式、渐进式披露与其预算、进程内工具循环、路径 / ZIP / 脚本执行的安全模型，以及 HTTP 与 C# 两套接口
+│   ├── sub_agents.md            # 子智能体：--sub-agents 参数、五个 Codex 风格工具、多个智能体如何共享同一个模型及其 KV 缓存、日志行，以及 TensorSharp 与 Codex 的差异（中文版 sub_agents_zh-cn.md）
 │   └── env_var_feature_matrix.md  # TestMatrix 使用的运行时开关 × 模型/后端/功能覆盖矩阵
 ├── benchmarks/                  # 可重现的基准脚本
 └── ExternalProjects/            # ggml/ 在构建时从 github.com/ggml-org/ggml 克隆（不纳入版本控制）
@@ -417,7 +419,7 @@ TensorSharp 采用分层系统结构：
 
 1. **TensorSharp.Core** 提供核心 `Tensor` 类型、存储抽象和可扩展的操作注册表（`Ops`）。CPU 实现使用 `System.Numerics.Vectors` 进行 SIMD 加速。
 
-2. **TensorSharp.Runtime** 负责运行时契约与通用服务：GGUF 解析、分词（SentencePiece / BPE）、聊天模板渲染、可配置 token 采样、输出解析、分页 KV 缓存（`Runtime/Paged/*`）、连续批处理调度器 / 引擎（`Runtime/Scheduling/*`）、`IKvBlockCodec` 接口及其 `TurboQuantKvCodec` 2-bit / Q4 / Q8 实现，以及 `IModelArchitecture`、`IBatchedPagedModel`、`IPromptRenderer`、`IOutputProtocolParser`、`IMultimodalInjector`、`IKVCachePolicy`、`IBackendExecutionPlan` 等抽象。它刻意不包含智能体层：技能与代码执行位于 **TensorSharp.AgentHost**，该项目引用运行时、且运行时绝不反向引用，因此只需提供 OpenAI / Ollama 聊天补全的宿主可以只依赖运行时，不携带技能注册表、沙箱与代码执行器。（若该方向被反转，`AgentHostLayeringTests` 会失败。）
+2. **TensorSharp.Runtime** 负责运行时契约与通用服务：GGUF 解析、分词（SentencePiece / BPE）、聊天模板渲染、可配置 token 采样、输出解析、分页 KV 缓存（`Runtime/Paged/*`）、连续批处理调度器 / 引擎（`Runtime/Scheduling/*`）、`IKvBlockCodec` 接口及其 `TurboQuantKvCodec` 2-bit / Q4 / Q8 实现，以及 `IModelArchitecture`、`IBatchedPagedModel`、`IPromptRenderer`、`IOutputProtocolParser`、`IMultimodalInjector`、`IKVCachePolicy`、`IBackendExecutionPlan` 等抽象。它刻意不包含智能体层：技能与代码执行位于 **TensorSharp.AgentHost**，该项目引用运行时、且运行时绝不反向引用，因此只需提供 OpenAI / Ollama 聊天补全的宿主可以只依赖运行时，不携带技能注册表、沙箱与代码执行器。子智能体遵循同一规则：其运行时位于 `TensorSharp.AgentHost/Agents/`，宿主只负责提供“一组消息如何变成一次生成”。（若该方向被反转，`AgentHostLayeringTests` 会失败；它的命名空间检查除 `.Skills.` 与 `.CodeExec.` 外也覆盖 `.Agents.`。）
 
 3. **TensorSharp.Models** 实现 `ModelBase` 以及全部 13 个具体模型架构和多模态辅助组件——10 个文本家族（DeepSeek V4 Flash、GLM 5.x、Gemma 4、DiffusionGemma、Qwen 3.5/3.6 系列、Qwen 3.8 Flash Next、GPT OSS、Nemotron-H、Mistral 3、Muse-Glimmer）与 3 个媒体输出家族（Qwen-Image-Edit、MiniMax-H3、Wan 2.1/2.2）。自回归架构提供旧的单序列前向，多数架构还提供面向连续批处理的 `IBatchedPagedModel.ForwardBatch` 实现（`<Family>Model.BatchedForward.cs`）。DiffusionGemma 刻意不同：它不支持 `Forward()`，生成必须通过 `DiffusionGemmaSampler` 在固定长度 canvas 上迭代去噪。Qwen-Image-Edit（`QwenImageModel`）同样非自回归：`Forward()` 抛异常，图像编辑通过 `EditImage()` 进行，由它编排 MMDiT 扩散 Transformer、Qwen-Image VAE 与 Qwen2.5-VL 文本编码器。视频家族更进一步：`MiniMaxH3Model` 与 `WanVideoModel` 的 `ForwardCore()` 都直接抛异常，生成统一走 `GenerateVideo(prompt, VideoGenerationParams)`，其背后是 `Models/Video/` 里共享的 `IVideoGenerationModel` 接缝——CLI 与服务端因此只用一条路径驱动两者（以及日后新增的模型），而不必逐个判断具体模型类型。MiniMax-H3 在同一个打包 latent 里**同时**去噪视频与 32 kHz 立体声音频，共有七张原生整网络计算图（DiT、Qwen3-VL 文本编码器、视觉塔、视频与音频 VAE 的编码与解码）；Wan 2.1/2.2 则是仅视频的家族，其 DiT、UMT5-XXL 编码器与因果 3D VAE 同样以整图方式运行。模型通过 `ModelBase.Create()` 加载，并依据 GGUF 元数据自动识别架构——MiniMax-H3 例外：其公开发布的 GGUF 完全不带元数据，只能依据张量识别（`LooksLikeMiniMaxH3`，经由 `MiniMaxH3Architecture.DetectFromTensors` 接入）。
 
@@ -529,7 +531,7 @@ span 记账、前缀裁剪、截断、切片——并且不再出现任何模型
 
 ### 单元测试（xUnit）
 
-`InferenceWeb.Tests` 覆盖无需启动服务的进程内行为：托管量化算子、可用 CUDA 设备上的 Direct CUDA 后端内核、可用 MLX 时的 MLX 后端内核、分页 KV 缓存调度（`ContinuousBatchSchedulerTests`、`PagedKvCacheTests`、`PagedKvCacheCodecTests`）、批处理执行器正确性（`BatchedExecutorTests`）、按模型批处理前向与旧路径的一致性（`Qwen35BatchedCorrectnessTests`、`Mistral3BatchedForwardTests`、`Gemma4BatchedForwardTests`、`GptOssBatchedCorrectnessTests`、`NemotronBatchedCorrectnessTests`）、MTP / NextN 投机解码正确性与可选端到端探针（`SpeculativeExecutionTests`、`Qwen36SpeculativeTests`、`Gemma4SpeculativeTests`）、DiffusionGemma 去噪 / prompt-KV / 批处理生成探针（`DiffusionGemmaTests`）、按模型批处理性能微基准（`*BatchedPerfBench.cs`）、`TurboQuantKvCodec` 编解码往返、prefill 分块、KV 缓存策略、KV 缓存 Prompt 渲染与多轮集成、聊天会话与 SessionManager 隔离、ModelService 历史跟踪、请求日志中间件与文件日志 Provider、图像预处理、媒体辅助逻辑、结构化输出校验、文本上传辅助、ModelService 上传日志、Web UI 聊天策略、模型上下文长度解析、可用后端发现，服务器 CLI 选项构造（`ServerOptionsBuilderTests`），以及 Agent Skills —— `SKILL.md` frontmatter 解析及其各类告警情形（`SkillManifestParserTests`），与技能注册表的发现、优先级、ZIP 安装防护和路径边界约束（`SkillRegistryTests`）。
+`InferenceWeb.Tests` 覆盖无需启动服务的进程内行为：托管量化算子、可用 CUDA 设备上的 Direct CUDA 后端内核、可用 MLX 时的 MLX 后端内核、分页 KV 缓存调度（`ContinuousBatchSchedulerTests`、`PagedKvCacheTests`、`PagedKvCacheCodecTests`）、批处理执行器正确性（`BatchedExecutorTests`）、按模型批处理前向与旧路径的一致性（`Qwen35BatchedCorrectnessTests`、`Mistral3BatchedForwardTests`、`Gemma4BatchedForwardTests`、`GptOssBatchedCorrectnessTests`、`NemotronBatchedCorrectnessTests`）、MTP / NextN 投机解码正确性与可选端到端探针（`SpeculativeExecutionTests`、`Qwen36SpeculativeTests`、`Gemma4SpeculativeTests`）、DiffusionGemma 去噪 / prompt-KV / 批处理生成探针（`DiffusionGemmaTests`）、按模型批处理性能微基准（`*BatchedPerfBench.cs`）、`TurboQuantKvCodec` 编解码往返、prefill 分块、KV 缓存策略、KV 缓存 Prompt 渲染与多轮集成、聊天会话与 SessionManager 隔离、ModelService 历史跟踪、请求日志中间件与文件日志 Provider、图像预处理、媒体辅助逻辑、结构化输出校验、文本上传辅助、ModelService 上传日志、Web UI 聊天策略、模型上下文长度解析、可用后端发现，服务器 CLI 选项构造（`ServerOptionsBuilderTests`），以及 Agent Skills —— `SKILL.md` frontmatter 解析及其各类告警情形（`SkillManifestParserTests`），与技能注册表的发现、优先级、ZIP 安装防护和路径边界约束（`SkillRegistryTests`），以及无需模型的子智能体测试——用脚本化智能体驱动的按轮运行时（`SubAgentRuntimeTests`）、父智能体的循环及其轮末收集（`SubAgentLoopTests`）、五个工具声明及其分派（`SubAgentToolsTests`）、参数解析、取值范围与环境变量叠加（`SubAgentOptionsTests`），以及按智能体划分的工作区通道（`SessionWorkspaceLaneTests`）。
 
 ```bash
 dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj
@@ -567,6 +569,8 @@ bash TensorSharp.Server/testdata/test_multiturn.sh
 ```
 
 完整测试矩阵见 [TensorSharp.Server.Host/testdata/README.md](TensorSharp.Server.Host/testdata/README.md)。
+
+子智能体有自己的端到端验证脚本：`eng/validation/sub-agents-e2e.py` 通过 `/v1/chat/completions` 驱动一个以 `--code-exec --sub-agents` 启动、正在运行的服务端，可以让同一场景分别以“使用子智能体”和“模型自己完成同样的任务”两种方式运行，并按请求读回服务端日志（见[子智能体](docs/sub_agents_zh-cn.md#可观测性)）。其报告请写入已被忽略的 `artifacts/` 或 `docs/validation/`。
 
 ### 推理矩阵运行器
 

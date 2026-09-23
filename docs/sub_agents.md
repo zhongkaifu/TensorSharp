@@ -1,5 +1,7 @@
 # Sub-agents
 
+[English](sub_agents.md) | [中文](sub_agents_zh-cn.md)
+
 A sub-agent is another copy of the model that the model itself starts for one task.
 It has the same tools and works in the same working directory as the agent that
 started it, but it has **its own context**: it sees its task, not the conversation.

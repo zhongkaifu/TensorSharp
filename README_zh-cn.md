@@ -271,6 +271,7 @@ TensorSharp 在 CUDA 的 prefill / 首 token 延迟上明显领先（多轮 pref
 | [按模型架构卡片](docs/models/README_zh-cn.md) | 各架构端到端文档（前向图、组件、参数、prefill/decode 优化） |
 | [分页注意力 & 连续批处理](docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING_zh-cn.md) | vLLM 风格的分页 KV 缓存、前缀共享与迭代级调度器 |
 | [Agent Skills 与智能体工作](docs/agent_skills.md)（英文） | `SKILL.md` 格式、渐进式披露与其预算、进程内工具循环、沙箱化代码执行、工作区与产物、路径 / ZIP / 执行安全模型，以及 HTTP 与 C# 两套接口 |
+| [子智能体](docs/sub_agents_zh-cn.md) | `--sub-agents`：Codex 风格的 `spawn_agent` / `wait_agent` 等工具、在同一个已加载模型上并行运行并共享其 KV 前缀的多个智能体、各项上限、日志行，以及 TensorSharp 与 Codex 的差异 |
 | [投机解码](docs/speculative_decoding.md)（英文） | 三层设计（模型适配层 / 算法 / 草稿权重）、已内置的 `auto` / `draft-head` / `block` / `ngram` 四种算法，以及新增一种算法需要写什么 |
 | [环境变量功能矩阵](docs/env_var_feature_matrix_zh-cn.md) | 哪些高影响运行时开关影响哪些模型、后端与提示类型 |
 | [引擎对比报告](docs/engine_comparison_report.md) | TensorSharp 对比 llama.cpp / stable-diffusion.cpp 的完整逐场景表格 |
@@ -288,7 +289,7 @@ TensorSharp 在 CUDA 的 prefill / 首 token 延迟上明显领先（多轮 pref
 | 推理宿主 | CLI、交互式 REPL、ASP.NET Core Web UI、Ollama 风格 API、OpenAI Chat Completions 与 Responses 风格 API，以及 TensorAgent iOS/iPadOS 应用。 |
 | 后端 | 纯 C# CPU、Direct CUDA/cuBLAS、MLX Metal，以及 GGML CPU/Metal/CUDA/Vulkan，各架构另有例外。 |
 | 服务能力 | 基于分页、前缀共享 KV 缓存的连续批处理；投机解码；单机与多节点张量并行；结构化输出；工具调用。 |
-| 智能体能力 | Agent Skills，以及可选的有界进程内工具循环（`--code-exec`）用于沙箱内的文件与 shell 操作。两者默认关闭。 |
+| 智能体能力 | Agent Skills，以及可选的有界进程内工具循环（`--code-exec`）用于沙箱内的文件与 shell 操作。两者默认关闭。服务端还可通过 `--sub-agents`（同样默认关闭）让模型把任务委派给运行在同一个已加载模型上的并行[子智能体](docs/sub_agents_zh-cn.md)。 |
 
 逐项细节——哪个架构跑在哪个后端上、各家族分别支持哪些特性，以及已知限制——见[状态矩阵](docs/PROJECT_STATUS_zh-cn.md#状态矩阵)。
 
