@@ -1028,6 +1028,19 @@ namespace TensorSharp.AgentHost.Agents
             return history;
         }
 
+        /// <summary>
+        /// A sub-agent's task, as the first thing said to it.
+        ///
+        /// <para>
+        /// The file-naming rule is here because the shared directory is shared for real:
+        /// measured on gemma-4-E4B, two of four concurrent agents each wrote its program to
+        /// <c>solution.py</c>, the second write replaced the first, and both then ran the
+        /// same program and reported the same (wrong for one of them) number — in all three
+        /// runs. Codex's answer is to tell the model its workers must have disjoint write
+        /// sets; a small model given an abstract rule still reaches for the same generic
+        /// name, while a concrete prefix it can copy removes the collision.
+        /// </para>
+        /// </summary>
         private string Envelope(SubAgent agent, bool forked)
         {
             var sb = new StringBuilder();
@@ -1039,9 +1052,11 @@ namespace TensorSharp.AgentHost.Agents
                     + "your tools: text you write in your answer changes nothing. When you are done, "
                     + "reply with your final answer. It goes back to the agent that started you, not to the user, so "
                     + "make it complete and self-contained: the result itself, the paths of any files you created or "
-                    + "changed, and anything you could not do. Other agents may be working in the same working "
-                    + "directory at the same time: only change the files your task is about, and do not undo changes "
-                    + "you did not make.");
+                    + "changed, and anything you could not do. Other agents are working in the same working directory "
+                    + "at the same time, so start the name of every file you create for your own use - programs, "
+                    + "notes, intermediate output - with your id, like " + agent.Id + "_count.py, so it cannot "
+                    + "collide with theirs; a file your task names keeps that name. Change only the files your task is "
+                    + "about, and do not undo changes you did not make.");
             if (agent.Depth >= _options.MaxDepth)
                 sb.Append(" You cannot start sub-agents of your own; do the work yourself.");
             sb.Append("\n\nTask:\n").Append(agent.Task);

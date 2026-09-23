@@ -68,7 +68,8 @@ public class AgentHostLayeringTests
         string[] strays = Runtime.GetExportedTypes()
             .Select(t => t.FullName ?? string.Empty)
             .Where(n => n.Contains(".Skills.", StringComparison.Ordinal)
-                        || n.Contains(".CodeExec.", StringComparison.Ordinal))
+                        || n.Contains(".CodeExec.", StringComparison.Ordinal)
+                        || n.Contains(".Agents.", StringComparison.Ordinal))
             .ToArray();
 
         Assert.True(strays.Length == 0,
@@ -88,6 +89,9 @@ public class AgentHostLayeringTests
             typeof(TensorSharp.AgentHost.CodeExec.ShellRunner),
             typeof(TensorSharp.AgentHost.CodeExec.ConfinedProcess),
             typeof(TensorSharp.AgentHost.CodeExec.EgressProxy),
+            typeof(TensorSharp.AgentHost.Agents.SubAgentRuntime),
+            typeof(TensorSharp.AgentHost.Agents.SubAgentScope),
+            typeof(TensorSharp.AgentHost.Agents.SubAgentOptions),
         })
         {
             Assert.Equal("TensorSharp.AgentHost", t.Assembly.GetName().Name);
