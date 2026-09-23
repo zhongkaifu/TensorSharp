@@ -156,6 +156,13 @@ namespace TensorSharp.AgentHost.Agents
         private long _finishCounter;
         private bool _disposed;
 
+        /// <summary>
+        /// Makes this turn's workspace lanes distinct from every other turn's: agent ids
+        /// restart at agent_1 each turn, while the workspace — and its lanes — lives as
+        /// long as the conversation.
+        /// </summary>
+        private readonly string _laneTag = Guid.NewGuid().ToString("N").Substring(0, 8);
+
         /// <summary>Create the runtime for one turn.</summary>
         /// <param name="options">Limits. Copied.</param>
         /// <param name="binding">How to generate for an agent.</param>
@@ -636,11 +643,13 @@ namespace TensorSharp.AgentHost.Agents
         private async Task RunAsync(SubAgent agent)
         {
             CancellationToken token = agent.Cts.Token;
-            SkillToolContext context = _baseContext.ForSubAgent(agent.Scope, agent.Id);
             SkillAgentLoopOptions loopOptions = ChildLoopOptions(agent);
 
             try
             {
+                // Inside the try: a workspace released under the turn must fail this
+                // agent visibly, not leave it "running" with a faulted worker forever.
+                SkillToolContext context = _baseContext.ForSubAgent(agent.Scope, agent.Id + "-" + _laneTag);
                 while (true)
                 {
                     token.ThrowIfCancellationRequested();

@@ -1034,9 +1034,27 @@ namespace TensorSharp.AgentHost.Skills
 
         /// <summary>
         /// The context a sub-agent runs its tools in: the same skills, runner and
-        /// attachments as its parent, answering agent tools as <paramref name="agents"/>.
+        /// attachments as its parent, answering agent tools as <paramref name="agents"/>,
+        /// in its own LANE of the parent's workspace — the same files and packages, but its
+        /// own shell working directory, exports and read ledger, so one agent's <c>cd</c>
+        /// cannot move another's next command.
         /// </summary>
-        internal SkillToolContext ForSubAgent(SubAgentScope agents, string agentId) => WithAgents(agents);
+        /// <param name="agents">The sub-agent's handle.</param>
+        /// <param name="laneId">
+        /// Unique across the whole CONVERSATION, not just the turn: a workspace outlives
+        /// the turn, and a later turn's <c>agent_1</c> must not resume an earlier one's cwd.
+        /// </param>
+        internal SkillToolContext ForSubAgent(SubAgentScope agents, string laneId) => new(Reachable, MaxReadBytes)
+        {
+            // Skill scripts keep the runner the parent's plan built. They run from the
+            // shared work directory, never from a shell's cwd, so the lane changes nothing
+            // about where they run; only their read records land in the owner's ledger.
+            ScriptRunner = ScriptRunner,
+            CodeRunner = CodeRunner,
+            CodeInputFiles = CodeInputFiles,
+            Workspace = Workspace?.ForAgent(laneId),
+            Agents = agents,
+        };
 
         /// <summary>Look up a skill by the name the model used, with a message it can act on when there is no match.</summary>
         public bool TryResolve(string name, out Skill? skill, out string? error)
