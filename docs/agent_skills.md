@@ -15,7 +15,7 @@ the server, next to the weights.
 Everything described here lives in `TensorSharp.AgentHost/Skills/` and
 `TensorSharp.AgentHost/CodeExec/` and is shared by the CLI,
 `TensorSharp.Server` and the public C# API. This is one model in a bounded,
-in-process tool loop. On the server, `--sub-agents` (off by default)
+in-process tool loop. In the CLI and the server, `--sub-agents` (off by default)
 additionally lets that model start sub-agents: copies of itself on the same
 loaded model, each running the same tool loop with its own context, in
 parallel; `SkillsChatClientOptions.SubAgents` offers the same tools to the C#

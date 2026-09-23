@@ -282,6 +282,9 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --backend cu
 | `--skills-no-discovery` | 不向模型展示未被选中的技能。不加时，所有已注册技能的名称与描述都会列出，好让模型自己发现你没想到要点名的那个；加上后，本次运行只看得到 `--skill` 选中的技能。 |
 | `--skills-allow-exec` | 允许模型通过 `skills_run` 运行选中技能自带的脚本。**默认关闭；开启后应把每个脚本都当作不受信任代码。**TensorSharp 仅调用已知解释器（`.py`、`.js`/`.mjs`、`.sh`、`.bash`），不经过 shell，并会清理环境、限制运行时间与输出、以只读方式挂载技能目录；工作目录是当前 Web/CLI 会话或 OpenAI/Ollama 请求的工作区（未开启代码执行时则是单次调用 scratch 目录）。默认的 `--skills-sandbox required` 会增加操作系统隔离，无法隔离时拒绝执行；除非另传 `--skills-allow-network`，否则网络仍被禁止。环境变量：`TS_SKILLS_ALLOW_EXEC`（非 `0` 即视为开启）。 |
 | `--skills-max-rounds <n>` | 模型在必须作答前可以取用技能内容——或运行、查看并修正代码——的次数，范围 1-64（默认：`8`；开启 `--code-exec` 时为 `24`，因为写程序、运行它并按回溯修正它比读文件需要更多轮次；此处显式设定的值一律按原样使用）。每一轮都是一次完整生成，因此这一项限制的是那种反复把文件名叫错的模型所能造成的开销。预算用尽时会在对话里告知模型，让它用已读到的内容作答，并说明已经完成了哪些部分。环境变量：`TS_SKILLS_MAX_ROUNDS`。 |
+| `--sub-agents` | 在已经带有工具（技能或 `--code-exec`）的轮次上，向模型提供五个子智能体工具（`spawn_agent`、`send_input`、`wait_agent`、`close_agent`、`list_agents`）：模型可以启动自己的副本，每个副本拥有自己的上下文，在同一个已加载模型上并行处理一项任务，并交回一个最终答案。子智能体只存活一轮；`wait_agent` 期间的活动以 `[agent] ...` 输出到 stderr。关闭时提示词与之前逐字节相同。除非 `TS_RETAINED_FUSED_CACHE_MAX` 已显式设置，还会把它从 4 提高到 `2 × (max-threads + 1)`。默认关闭。环境变量：`TS_SUB_AGENTS`（除 `0` 以外的任何值都视为开启）。见[子智能体](docs/sub_agents_zh-cn.md)。 |
+| `--sub-agents-max-threads <n>` | 一轮中同时打开的子智能体数量上限，范围 1-16（默认：`4`）。环境变量：`TS_SUB_AGENTS_MAX_THREADS`。 |
+| `--sub-agents-max-depth <n>` | 子智能体可嵌套的深度，范围 1-4（默认：`1`：子智能体不能再启动自己的子智能体）。环境变量：`TS_SUB_AGENTS_MAX_DEPTH`。 |
 | `--skills-sandbox <off\|preferred\|required>` | 对技能脚本要求多强的操作系统级隔离。`required`（默认）在没有安全沙箱的宿主机上拒绝运行；`preferred` 表示显式接受较弱隔离；`off` 只保留解释器、环境、时限与输出限制。macOS 使用 `sandbox-exec`；Linux 要求 `bwrap` 0.12.0 或更高版本（旧版存在已知的沙箱搭建阶段符号链接逃逸）。Windows Job Object 只能限制进程树，不能限制文件系统或网络，因此 `required` 会拒绝，必须显式选 `preferred` 才接受这种较弱隔离。环境变量：`TS_SKILLS_SANDBOX`。 |
 | `--skills-allow-network` | 允许沙箱内的技能脚本联网。默认禁止。环境变量：`TS_SKILLS_ALLOW_NETWORK`。 |
 | `--code-exec` | 向模型提供 `shell`、`read_file`、`write_file` 与 `apply_patch` 四个工具。`shell` 执行真正的命令行并返回退出码与合并后的 stdout/stderr；文件工具由宿主完成有界读取、新建文件与原子补丁。`write_file` 仅用于新建文件；修改已有的单个或多个文件一律使用 `apply_patch`，包括单行修改。四个工具在内部 Agent 轮次中共享同一工作区：Web/CLI 按聊天会话保留；每个 OpenAI Chat、OpenAI Responses 或 Ollama HTTP 请求则获得一个私有工作区，响应结束后删除。只有没有提供工作区的底层直接调用者才只会得到 `shell`。所有内置工具均由宿主进程内应答，不会交回 API 客户端。默认关闭。环境变量：`TS_CODE_EXEC`（非 `0` 即视为开启）。 |
@@ -1789,7 +1792,7 @@ macOS 子进程会继承 Seatbelt，普通进程组也会被清理，但主动�
 shell 能够到达 PATH 上的每一个解释器——于是手上还拿着旧脚本的运维者得到的是这条
 报错，而不是眼看着一个设置被忽略。
 
-#### 子智能体（仅服务端）
+#### 子智能体（CLI + 服务端）
 
 | 功能 | 默认 | 环境变量 | CLI 等价参数 |
 |---|---|---|---|
@@ -1798,7 +1801,7 @@ shell 能够到达 PATH 上的每一个解释器——于是手上还拿着旧�
 | 嵌套深度 | `1`（范围 1-4；子智能体不能再启动自己的子智能体） | `TS_SUB_AGENTS_MAX_DEPTH` | `--sub-agents-max-depth N` |
 
 `TS_SUB_AGENTS` 只要取值不是 `0` 就算开启。开启子智能体后，除非
-`TS_RETAINED_FUSED_CACHE_MAX` 已显式设置，服务端会把它从 `4` 提高到
+`TS_RETAINED_FUSED_CACHE_MAX` 已显式设置，两个宿主都会把它从 `4` 提高到
 `2 × (max-threads + 1)`，并在启动时说明。完整参考见[子智能体](docs/sub_agents_zh-cn.md)。
 
 #### 采样默认值（仅服务端）

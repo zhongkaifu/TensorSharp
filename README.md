@@ -306,7 +306,7 @@ Actively developed, and the source tree runs ahead of the published packages. Th
 | Inference hosts | CLI, interactive REPL, ASP.NET Core Web UI, Ollama-style API, OpenAI Chat Completions and Responses APIs, and the TensorAgent iOS/iPadOS app. |
 | Backends | Pure C# CPU, direct CUDA/cuBLAS, MLX Metal, and GGML CPU/Metal/CUDA/Vulkan, with per-architecture exceptions. |
 | Serving features | Continuous batching over a paged, prefix-shared KV cache; speculative decoding; single- and multi-node tensor parallelism; structured output; tool calling. |
-| Agentic work | Agent Skills and an optional bounded in-process tool loop (`--code-exec`) for sandboxed file and shell work. Both off by default. On the server, `--sub-agents` (also off by default) lets the model delegate tasks to parallel [sub-agents](docs/sub_agents.md) on the same loaded model. |
+| Agentic work | Agent Skills and an optional bounded in-process tool loop (`--code-exec`) for sandboxed file and shell work. Both off by default. In the CLI and the server, `--sub-agents` (also off by default) lets the model delegate tasks to parallel [sub-agents](docs/sub_agents.md) on the same loaded model. |
 
 Per-area detail — which architecture runs on which backend, which features each family supports, and the known limits — is in the [status matrix](docs/PROJECT_STATUS.md#status-matrix).
 

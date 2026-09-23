@@ -13,7 +13,8 @@ continuous-batching engine decodes the parent and all its sub-agents together, a
 each sub-agent's prompt starts with its parent's exact instructions and tool block,
 so the engine reuses that cached prefix instead of prefilling it again.
 
-Sub-agents are **off by default**. Turn them on with `--sub-agents`.
+Sub-agents are **off by default**. Turn them on with `--sub-agents`, on the server
+or the CLI.
 
 ## Quick start
 
@@ -21,6 +22,9 @@ Sub-agents are **off by default**. Turn them on with `--sub-agents`.
 TensorSharp.Server --model gemma-4-E4B-it-Q8_0.gguf --backend ggml_metal \
     --code-exec --sub-agents
 ```
+
+The CLI takes the same flags (`TensorSharp.Cli --model ... --code-exec --sub-agents`)
+and prints what its sub-agents do to stderr as `[agent] ...` lines.
 
 Then ask for delegation explicitly — the tool descriptions tell the model to start
 sub-agents only when the user, or a skill it is following, asks for them:
@@ -34,7 +38,8 @@ curl -s http://localhost:5000/v1/chat/completions -H 'Content-Type: application/
 ```
 
 Every chat surface gets the tools: the Web UI, `/v1/chat/completions`,
-`/v1/responses` and Ollama's `/api/chat`. They are offered only on requests that
+`/v1/responses`, Ollama's `/api/chat`, and both CLI modes (one-shot and
+interactive). They are offered only on requests that
 already have tools — Agent Skills or `--code-exec` — because a sub-agent with no
 tools can do nothing its parent could not do itself.
 
@@ -86,10 +91,13 @@ transcript to check it.
 Codex's guidance to its model is "wait for sub-agents before yielding". A small
 local model forgets. So when the model answers while agents it started are still
 working, or have answers it has not seen, the host waits for them, hands their
-results over, and gives the model one more round to use them. The answer written
-without them is not shown. If no round is left, still-working agents are stopped
-and the answer says so. Sub-agents never outlive the turn: whatever is still
-running when the request ends is stopped.
+results over, and gives the model one more round to use them. On the server the
+answer written without them is not shown (the interactive CLI has already printed
+it, and the collected answer follows). If no round is left, still-working agents
+are stopped, and agents that finished too late to be used have their answers shown
+after the reply — the reply says which is which, so no result disappears silently.
+Sub-agents never outlive the turn: whatever is still running when the request
+ends is stopped.
 
 ## How it runs
 
@@ -107,6 +115,10 @@ running when the request ends is stopped.
   (`SessionWorkspace.ForAgent`): its own shell working directory, exported
   variables and read ledger, so one agent's `cd` cannot move another's next
   command. Code tools still take the workspace's execution lock one at a time.
+  Sharing a directory means sharing file *names*: each sub-agent is told to start
+  the name of every file it creates for its own use with its id (`agent_2_count.py`)
+  — without that, measured on gemma-4-E4B, two of four concurrent agents wrote
+  `solution.py`, one overwrote the other, and both reported the same number.
 - **Streaming.** While `wait_agent` runs, the Web UI shows what each agent is
   doing (`agent_1: round 2: shell`) under "Waiting for sub-agents…".
 
@@ -171,7 +183,10 @@ scenarios and reads these lines back per request.
   When the parent must repeat its agents' output verbatim — four paragraphs
   written by four agents, pasted into the answer — the parent's final
   generation is as long as doing the work itself, and delegating is slower.
-- Families that do not batch decode across sequences run agents one step at a
-  time; they still get context isolation, not speed.
+- The speed-up is bounded by how well the loaded model batches decode across
+  sequences (see below). A family that declines batched decode (gemma-4-E2B
+  logs "declined the default batched fused-decode path ... serving sequences
+  round-robin") runs its agents interleaved rather than batched: context
+  isolation, not speed.
 - The TensorAgent app does not enable sub-agents: it keeps one retained
   conversation to fit a phone's memory, which sub-agents would evict.

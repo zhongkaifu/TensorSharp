@@ -25,7 +25,7 @@
     <li><h3>完成实际工作</h3><p>若运维方启用了 <code>--code-exec</code>，模型便可在请求或聊天工作区中检查、编辑、新建、打补丁并测试文件。技能脚本也能参与，但必须单独选择允许执行。</p></li>
     <li><h3>返回普通答案</h3><p>客户端收到最终完成结果，而不是 TensorSharp 内部工具调用。调用方自带的工具绝不会由 TensorSharp 执行；这些调用仍会正常返回给调用方处理。</p></li>
   </ol>
-  <div class="callout note"><div class="ic">🎯</div><p><strong>一个已加载模型，进程内工具循环。</strong>默认情况下，一轮请求就是一条工具循环。服务器以 <code>--sub-agents</code> 启动时，模型还可以把任务委派给<a href="#sub-agents">子智能体</a>：它们是运行在同一个已加载模型上的其他工具循环，各自拥有独立的上下文。每条命令执行前没有交互式审批队列。运维方在 CLI 或服务器启动时授予或拒绝技能、脚本执行、代码执行、联网与安装能力；之后内置工具只能按该策略运行，否则拒绝。</p></div>
+  <div class="callout note"><div class="ic">🎯</div><p><strong>一个已加载模型，进程内工具循环。</strong>默认情况下，一轮请求就是一条工具循环。CLI 或服务器以 <code>--sub-agents</code> 启动时，模型还可以把任务委派给<a href="#sub-agents">子智能体</a>：它们是运行在同一个已加载模型上的其他工具循环，各自拥有独立的上下文。每条命令执行前没有交互式审批队列。运维方在 CLI 或服务器启动时授予或拒绝技能、脚本执行、代码执行、联网与安装能力；之后内置工具只能按该策略运行，否则拒绝。</p></div>
 
   <h2 id="ios">iPhone 与 iPad 上的 TensorAgent</h2>
   <p><strong>TensorAgent</strong> 将本地聊天与智能体体验打包为 .NET MAUI iOS/iPadOS 应用。引擎以 iOS <code>.xcframework</code> 静态链接，在真机上使用 <code>ggml_metal</code>。应用与 CLI、服务端共享与宿主无关的聊天流水线（<code>TensorSharp.Chat</code>）；由于 iOS 没有 ASP.NET Core runtime pack，UI 通过进程内 loopback server 提供。共享的是 API 而不是页面：手机上是它自己的页面，按拇指而不是鼠标与宽窗口来排布，但绑定同一套 <code>WebUiChatService</code> 与 <code>SkillsService</code> 路由。</p>
@@ -154,7 +154,7 @@
 }</code></pre>
   <p><code>skills_discovery</code> 默认为 <code>true</code>。代码执行没有按请求开启的字段：运维方要么以 <code>--code-exec</code> 启动宿主，要么四个工具根本不会出现。智能体循环默认最多 8 个内部轮次；开启代码执行后默认 24 个；<code>--skills-max-rounds</code> 可明确设置 1–64 的上限。</p>
 
-  <h2 id="sub-agents">子智能体（服务器，默认关闭）</h2>
+  <h2 id="sub-agents">子智能体（CLI 与服务器，默认关闭）</h2>
   <p>子智能体是模型为某一项任务自行启动的另一个模型副本。它拥有与启动它的智能体相同的工具，在同一个工作目录中工作，但拥有自己的上下文：它看到的是自己的任务，而不是整段对话。它与父智能体并行工作，最后交回一个最终答案。TensorSharp 采用 OpenAI Codex 使用的那套工具接口，并把每个子智能体作为普通序列运行在<strong>同一个已加载模型</strong>上：连续批处理引擎把父智能体与它的子智能体放在一起解码；每个子智能体的提示词都以父智能体一字不差的指令与工具块开头，因此引擎会复用这段已缓存的前缀，而不必重新预填充。</p>
   <div class="table-scroll">
   <table>

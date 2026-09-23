@@ -403,7 +403,7 @@ dotnet run --project TensorSharp.Cli/TensorSharp.Cli.csproj -- \
   <div class="callout warn"><div class="ic">🔒</div><p><strong>技能属于不受信任的内容。</strong>模型点名的每条路径都经过词法、规范化与符号链接检查，一个技能不能读取另一个技能。脚本执行仍是运维的信任决定：默认要求沙箱，但 macOS 会开放共享的 <code>/private/tmp</code>，且无法保证清理故意脱离的子进程；Windows 必须改用 <code>preferred</code> 才会运行，因为 job object 无法约束文件或网络。不要在面向不可信用户的共享服务上为不可信技能开启它。</p></div>
 
   <h2 id="code-exec">智能体工作与代码执行</h2>
-  <p><code>--code-exec</code> 启用有界的单助手模型 / 工具循环。TensorSharp 声明并执行四个内置工具：<code>read_file</code>、<code>write_file</code>、<code>shell</code> 与原子化的 <code>apply_patch</code>；通过 <code>--tools</code> 提供的调用方工具仍回传调用方处理。这里没有子智能体运行时，也没有逐命令审批提示（服务器通过 <code>--sub-agents</code> 提供子智能体，见<a href="agentic_zh-cn.html#sub-agents">子智能体</a>）；下列启动参数就是运维授权。→ <a href="agentic_zh-cn.html">智能体工作</a></p>
+  <p><code>--code-exec</code> 启用有界的模型 / 工具循环。TensorSharp 声明并执行四个内置工具：<code>read_file</code>、<code>write_file</code>、<code>shell</code> 与原子化的 <code>apply_patch</code>；通过 <code>--tools</code> 提供的调用方工具仍回传调用方处理。加上 <code>--sub-agents</code> 后，模型还可以启动子智能体——拥有自己上下文的模型副本，在同一个已加载模型上并发运行（见<a href="agentic_zh-cn.html#sub-agents">子智能体</a>）。这里没有逐命令审批提示；下列启动参数就是运维授权。→ <a href="agentic_zh-cn.html">智能体工作</a></p>
   <div class="table-scroll">
   <table>
     <thead><tr><th>选项</th><th>说明</th></tr></thead>

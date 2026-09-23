@@ -289,7 +289,7 @@ TensorSharp 在 CUDA 的 prefill / 首 token 延迟上明显领先（多轮 pref
 | 推理宿主 | CLI、交互式 REPL、ASP.NET Core Web UI、Ollama 风格 API、OpenAI Chat Completions 与 Responses 风格 API，以及 TensorAgent iOS/iPadOS 应用。 |
 | 后端 | 纯 C# CPU、Direct CUDA/cuBLAS、MLX Metal，以及 GGML CPU/Metal/CUDA/Vulkan，各架构另有例外。 |
 | 服务能力 | 基于分页、前缀共享 KV 缓存的连续批处理；投机解码；单机与多节点张量并行；结构化输出；工具调用。 |
-| 智能体能力 | Agent Skills，以及可选的有界进程内工具循环（`--code-exec`）用于沙箱内的文件与 shell 操作。两者默认关闭。服务端还可通过 `--sub-agents`（同样默认关闭）让模型把任务委派给运行在同一个已加载模型上的并行[子智能体](docs/sub_agents_zh-cn.md)。 |
+| 智能体能力 | Agent Skills，以及可选的有界进程内工具循环（`--code-exec`）用于沙箱内的文件与 shell 操作。两者默认关闭。CLI 与服务端还可通过 `--sub-agents`（同样默认关闭）让模型把任务委派给运行在同一个已加载模型上的并行[子智能体](docs/sub_agents_zh-cn.md)。 |
 
 逐项细节——哪个架构跑在哪个后端上、各家族分别支持哪些特性，以及已知限制——见[状态矩阵](docs/PROJECT_STATUS_zh-cn.md#状态矩阵)。
 
