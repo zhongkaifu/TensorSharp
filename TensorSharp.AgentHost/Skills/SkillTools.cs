@@ -15,6 +15,8 @@ using System.IO;
 using System.Linq;
 using System.Text;
 using System.Text.Json;
+using System.Threading;
+using TensorSharp.AgentHost.Agents;
 
 using TensorSharp.Runtime;
 namespace TensorSharp.AgentHost.Skills
@@ -75,7 +77,7 @@ namespace TensorSharp.AgentHost.Skills
         /// </para>
         /// </summary>
         public static bool IsBuiltInTool(string? name) =>
-            IsSkillTool(name) || SkillToolNames.IsCodeTool(name);
+            IsSkillTool(name) || SkillToolNames.IsCodeTool(name) || SkillToolNames.IsAgentTool(name);
 
         /// <summary>
         /// Split one round's tool calls three ways: the ones this host answers, the ones
@@ -470,7 +472,9 @@ namespace TensorSharp.AgentHost.Skills
                 // Attachment availability is a property of the whole built-in tool
                 // surface, not just shell. In particular, skills_run launches through
                 // its own runner and would otherwise bypass CodeRunnerAdapter entirely.
-                if (context.Workspace != null && IsBuiltInTool(call.Name))
+                // Not for the agent tools: they touch no file, and a wait_agent that
+                // blocks for minutes must not first take the workspace's staging path.
+                if (context.Workspace != null && IsBuiltInTool(call.Name) && !SkillToolNames.IsAgentTool(call.Name))
                     CodeInputFileStager.Stage(context.CodeInputFiles, context.Workspace);
 
                 return call.Name switch
@@ -486,6 +490,14 @@ namespace TensorSharp.AgentHost.Skills
                     // code tool is one edit, in the place that already holds the names.
                     _ when SkillToolNames.IsCodeTool(call.Name) =>
                         ExecuteCode(call, context, onToolOutput),
+
+                    // The loops await these directly (SubAgentScope.ExecuteAsync), so a
+                    // wait never parks a thread. This synchronous path is for callers that
+                    // have no await, and it is correct there too: the runtime's own turn
+                    // token still bounds the wait.
+                    _ when SkillToolNames.IsAgentTool(call.Name) => context.Agents is { } agents
+                        ? agents.ExecuteAsync(call, onToolOutput, CancellationToken.None).GetAwaiter().GetResult()
+                        : SkillToolResult.Failure("sub-agents are not enabled on this host. Do the task yourself."),
 
                     _ => SkillToolResult.Failure($"'{call.Name}' is not a tool this host answers."),
                 };
@@ -1002,6 +1014,29 @@ namespace TensorSharp.AgentHost.Skills
         /// the original call-scoped scratch.
         /// </summary>
         public SessionWorkspace? Workspace { get; init; }
+
+        /// <summary>
+        /// The calling agent's handle on the turn's sub-agents, when the host enabled them.
+        /// Null — the default — means the agent tools are not offered and, if a model calls
+        /// one anyway, it is told this host does not run sub-agents.
+        /// </summary>
+        public SubAgentScope? Agents { get; init; }
+
+        /// <summary>This context, answering agent tools for <paramref name="agents"/>.</summary>
+        public SkillToolContext WithAgents(SubAgentScope? agents) => new(Reachable, MaxReadBytes)
+        {
+            ScriptRunner = ScriptRunner,
+            CodeRunner = CodeRunner,
+            CodeInputFiles = CodeInputFiles,
+            Workspace = Workspace,
+            Agents = agents,
+        };
+
+        /// <summary>
+        /// The context a sub-agent runs its tools in: the same skills, runner and
+        /// attachments as its parent, answering agent tools as <paramref name="agents"/>.
+        /// </summary>
+        internal SkillToolContext ForSubAgent(SubAgentScope agents, string agentId) => WithAgents(agents);
 
         /// <summary>Look up a skill by the name the model used, with a message it can act on when there is no match.</summary>
         public bool TryResolve(string name, out Skill? skill, out string? error)

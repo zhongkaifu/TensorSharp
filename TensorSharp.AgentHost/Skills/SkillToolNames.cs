@@ -219,5 +219,56 @@ namespace TensorSharp.AgentHost.Skills
             }
             return false;
         }
+
+        /// <summary>
+        /// Start a sub-agent: another copy of the model with its own context, working in
+        /// parallel and reporting a final answer back.
+        ///
+        /// <para>
+        /// The five agent names are Codex's own (<c>spawn_agent</c>, <c>send_input</c>,
+        /// <c>wait_agent</c>, <c>close_agent</c> from its first multi-agent surface and
+        /// <c>list_agents</c> from its second), for the same reason <see cref="Shell"/> is:
+        /// they are the names models have seen and reach for by reflex.
+        /// </para>
+        /// </summary>
+        public const string SpawnAgent = "spawn_agent";
+
+        /// <summary>Give one of the caller's sub-agents a follow-up message.</summary>
+        public const string SendInput = "send_input";
+
+        /// <summary>Block until one of the caller's sub-agents finishes, and collect its answer.</summary>
+        public const string WaitAgent = "wait_agent";
+
+        /// <summary>Stop and discard one of the caller's sub-agents.</summary>
+        public const string CloseAgent = "close_agent";
+
+        /// <summary>List the caller's sub-agents and their status.</summary>
+        public const string ListAgents = "list_agents";
+
+        /// <summary>
+        /// Every tool the sub-agent runtime answers, in declaration order.
+        ///
+        /// <para>
+        /// Matched ORDINALLY and with no aliases, unlike the file tools. These names are
+        /// only ever declared together, by one host feature, so a model that has them has
+        /// just read their exact spelling; and none of them may capture a name a caller's
+        /// own tool could plausibly use, which an alias list would start to do.
+        /// </para>
+        /// </summary>
+        public static readonly IReadOnlyList<string> AgentTools =
+            new[] { SpawnAgent, SendInput, WaitAgent, CloseAgent, ListAgents };
+
+        /// <summary>True when <paramref name="name"/> is one of <see cref="AgentTools"/>.</summary>
+        public static bool IsAgentTool(string? name)
+        {
+            if (string.IsNullOrEmpty(name))
+                return false;
+            for (int i = 0; i < AgentTools.Count; i++)
+            {
+                if (string.Equals(AgentTools[i], name, StringComparison.Ordinal))
+                    return true;
+            }
+            return false;
+        }
     }
 }

@@ -15,6 +15,7 @@ using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 
+using TensorSharp.AgentHost.Agents;
 using TensorSharp.Runtime;
 namespace TensorSharp.AgentHost.Skills
 {
@@ -232,6 +233,11 @@ namespace TensorSharp.AgentHost.Skills
             foreach (ChatMessage message in messages)
                 working.Add(message);
 
+            // A spawned agent copies this conversation's instructions and tool list, so the
+            // runtime has to know which conversation this loop is running.
+            SubAgentScope? agents = context.Agents;
+            agents?.Bind(working, tools);
+
             var invocations = new List<SkillToolInvocation>();
             int maxRounds = Math.Max(1, options.MaxRounds);
             SkillTurnOutput output = default;
@@ -255,22 +261,37 @@ namespace TensorSharp.AgentHost.Skills
 
                 if (skillCalls.Count == 0 && unknownCalls.Count == 0)
                 {
+                    // An answer while sub-agents it started are still out. Codex's own
+                    // guidance is "wait for them before yielding"; a small model forgets,
+                    // and the answer would be written without results already on their
+                    // way. So the loop collects them itself and gives the model one more
+                    // round to use them — when there is a round left to give.
+                    if (clientCalls.Count == 0 && agents is { HasOutstandingWork: true })
+                    {
+                        if (round < maxRounds)
+                        {
+                            string? handover = await agents.CollectOutstandingAsync(
+                                SubAgentConversation.EndOfTurnWait, null, cancellationToken).ConfigureAwait(false);
+                            if (handover != null)
+                            {
+                                working.Add(AssistantTurn(output, calls: null));
+                                working.Add(new ChatMessage { Role = "user", Content = handover });
+                                continue;
+                            }
+                        }
+                        else
+                        {
+                            output = WithStoppedAgentsNote(output, agents.StopOutstanding());
+                        }
+                    }
+
                     return new SkillLoopResult(
                         output, working, round, invocations, HitRoundLimit: false, clientCalls);
                 }
 
                 // Record what the model said, tool calls and raw tokens included, so the
                 // next render splices this turn back rather than re-tokenizing it.
-                working.Add(new ChatMessage
-                {
-                    Role = "assistant",
-                    Content = output.Parsed?.Content ?? string.Empty,
-                    Thinking = string.IsNullOrEmpty(output.Parsed?.Thinking) ? null : output.Parsed!.Thinking,
-                    ToolCalls = new List<ToolCall>(calls),
-                    RawOutputTokens = output.RawTokens != null ? new List<int>(output.RawTokens) : null,
-                    RawPromptTrailingWhitespace = output.RawPromptTrailingWhitespace,
-                    RawGenerationSuffix = output.RawGenerationSuffix,
-                });
+                working.Add(AssistantTurn(output, calls));
 
                 foreach (ToolCall unknownCall in unknownCalls)
                 {
@@ -303,7 +324,11 @@ namespace TensorSharp.AgentHost.Skills
                         continue;
                     }
 
-                    SkillToolResult result = SkillTools.Execute(call, context);
+                    // Agent tools are awaited, not run on this thread: wait_agent can
+                    // block for minutes while the agents it waits on generate.
+                    SkillToolResult result = agents != null && SkillToolNames.IsAgentTool(call.Name)
+                        ? await agents.ExecuteAsync(call, null, cancellationToken).ConfigureAwait(false)
+                        : SkillTools.Execute(call, context);
                     executed++;
 
                     var invocation = new SkillToolInvocation(
@@ -324,14 +349,26 @@ namespace TensorSharp.AgentHost.Skills
                     return new SkillLoopResult(
                         output, working, round, invocations, HitRoundLimit: false, clientCalls);
                 }
+
+                // Sub-agents that finished during this round, and anything this agent's
+                // own parent sent it, reach the model before its next generation.
+                SubAgentConversation.AppendDeliveries(working, agents);
             }
 
             // Out of rounds with the model still asking for files. Tell it so, in the
             // conversation, and let it answer from what it already has — returning the
             // last tool-call-only turn to the user would show them nothing at all.
-            working.Add(BuildResultMessage(options,
-                "Error: the limit on tool calls for this turn has been reached. "
-                + "Answer now using what you have already read, and say which part you could not check."));
+            // Sub-agents still out are collected first, so the forced answer is written
+            // with their results rather than without them.
+            string limitNote = "Error: the limit on tool calls for this turn has been reached. "
+                + "Answer now using what you have already read, and say which part you could not check.";
+            if (agents is { HasOutstandingWork: true }
+                && await agents.CollectOutstandingAsync(
+                    SubAgentConversation.EndOfTurnWait, null, cancellationToken).ConfigureAwait(false) is { } collected)
+            {
+                limitNote += "\n\n" + collected;
+            }
+            working.Add(BuildResultMessage(options, limitNote));
 
             cancellationToken.ThrowIfCancellationRequested();
             output = await generate(working, tools, cancellationToken).ConfigureAwait(false);
@@ -366,10 +403,40 @@ namespace TensorSharp.AgentHost.Skills
         }
 
         /// <summary>
-        /// What to tell the USER when the turn ran out of tool calls with the model still
-        /// working. Never empty: an empty answer is indistinguishable from a crash, and
-        /// the caller has no way to tell that the work was bounded rather than broken.
+        /// The assistant turn a generation produced, as the conversation records it: tool
+        /// calls and raw tokens included, so the next render splices it back rather than
+        /// re-tokenizing it.
         /// </summary>
+        private static ChatMessage AssistantTurn(SkillTurnOutput output, List<ToolCall>? calls) => new()
+        {
+            Role = "assistant",
+            Content = output.Parsed?.Content ?? string.Empty,
+            Thinking = string.IsNullOrEmpty(output.Parsed?.Thinking) ? null : output.Parsed!.Thinking,
+            ToolCalls = calls != null ? new List<ToolCall>(calls) : null,
+            RawOutputTokens = output.RawTokens != null ? new List<int>(output.RawTokens) : null,
+            RawPromptTrailingWhitespace = output.RawPromptTrailingWhitespace,
+            RawGenerationSuffix = output.RawGenerationSuffix,
+        };
+
+        /// <summary>
+        /// The answer, plus what the user must be told when sub-agents were still working
+        /// as the turn ran out of rounds: they were stopped, so the answer may be missing
+        /// what they were doing. Appended, never substituted, and never silent.
+        /// </summary>
+        private static SkillTurnOutput WithStoppedAgentsNote(SkillTurnOutput output, IReadOnlyList<string> stopped)
+        {
+            if (stopped.Count == 0)
+                return output;
+            ParsedOutput parsed = output.Parsed ?? new ParsedOutput();
+            string note = "(Sub-agent" + (stopped.Count == 1 ? " " : "s ") + string.Join(", ", stopped)
+                + (stopped.Count == 1 ? " was" : " were")
+                + " still working when this turn ran out of rounds and " + (stopped.Count == 1 ? "was" : "were")
+                + " stopped; this answer does not include " + (stopped.Count == 1 ? "its" : "their") + " results.)";
+            string said = parsed.Content ?? string.Empty;
+            parsed.Content = said.Length == 0 ? note : said.TrimEnd() + "\n\n" + note;
+            return output with { Parsed = parsed };
+        }
+
         /// <summary>The ids a skill tool call could actually reach this turn.</summary>
         private static IReadOnlyList<string> ReachableSkillIds(SkillToolContext? context)
         {
@@ -379,6 +446,11 @@ namespace TensorSharp.AgentHost.Skills
             return ids;
         }
 
+        /// <summary>
+        /// What to tell the USER when the turn ran out of tool calls with the model still
+        /// working. Never empty: an empty answer is indistinguishable from a crash, and
+        /// the caller has no way to tell that the work was bounded rather than broken.
+        /// </summary>
         private static string DescribeExhaustedTurn(IEnumerable<ToolCall> wanted)
         {
             string[] names = wanted
