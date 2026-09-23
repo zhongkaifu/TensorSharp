@@ -1211,8 +1211,12 @@ namespace TensorSharp.AgentHost.CodeExec
         public ShellScript WriteScript(string command, string? workDirectory)
         {
             int n = Interlocked.Increment(ref _sequence);
+            // The lane's script directory, not the shared state directory: the sequence
+            // is this session's, and a second agent's session counting from 1 in the same
+            // directory would rewrite a script a background job is still executing.
+            // The same directory as before for a workspace with no lanes.
             string path = Path.Combine(
-                _workspace.StateDirectory,
+                _workspace.ShellScriptDirectory,
                 "cmd-" + n.ToString(CultureInfo.InvariantCulture) + _shell.ScriptExtension);
 
             string text = _shell.Kind == ShellKind.PowerShell
@@ -1276,7 +1280,7 @@ namespace TensorSharp.AgentHost.CodeExec
             if (stale < 1)
                 return;
             string path = Path.Combine(
-                _workspace.StateDirectory,
+                _workspace.ShellScriptDirectory,
                 "cmd-" + stale.ToString(CultureInfo.InvariantCulture) + _shell.ScriptExtension);
             try { if (File.Exists(path)) File.Delete(path); }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }

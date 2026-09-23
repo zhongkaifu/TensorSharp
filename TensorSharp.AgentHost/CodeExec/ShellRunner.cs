@@ -245,13 +245,19 @@ namespace TensorSharp.AgentHost.CodeExec
         }
 
         /// <summary>The persisted shell state for one session, created on first use.</summary>
+        /// <remarks>
+        /// Keyed on <see cref="SessionWorkspace.ShellKey"/>, not on the root: each lane of a
+        /// workspace (one per agent, see <see cref="SessionWorkspace.ForAgent"/>) is its own
+        /// shell — its own directory, exports and repeat ledger — over the same files. For
+        /// a workspace with no lanes the key IS the root, as it always was.
+        /// </remarks>
         public ShellSession SessionFor(SessionWorkspace workspace)
         {
             ArgumentNullException.ThrowIfNull(workspace);
             if (_shell == null)
                 throw new InvalidOperationException("no shell is available on this host");
 
-            string key = workspace.Root;
+            string key = workspace.ShellKey;
             if (_sessions.TryGetValue(key, out ShellSession? existing))
                 return existing;
 
@@ -261,8 +267,9 @@ namespace TensorSharp.AgentHost.CodeExec
                 // Forget it when the session ends. Without this the map grows one entry per
                 // conversation for the life of the process — small each, unbounded together,
                 // and on the CLI an ephemeral workspace per call makes it grow per CALL.
+                // A lane registers on its owner, so this runs when the conversation ends.
                 workspace.RegisterCleanup(new Forget(
-                    _sessions, _jobs, _sanitizedCertificateBundles, key));
+                    _sessions, _jobs, _sanitizedCertificateBundles, key, workspace.Root));
                 return created;
             }
             return _sessions[key];
@@ -275,25 +282,33 @@ namespace TensorSharp.AgentHost.CodeExec
             private readonly ConcurrentDictionary<string, BackgroundJobs> _jobs;
             private readonly ConcurrentDictionary<string, ConcurrentDictionary<string, Lazy<string?>>>
                 _certificateBundles;
-            private readonly string _key;
+            private readonly string _shellKey;
+            private readonly string _workspaceKey;
 
+            /// <param name="shellKey">The session's key — per lane.</param>
+            /// <param name="workspaceKey">
+            /// The key of the conversation-wide entries — jobs and CA bundles — which may
+            /// have been created through a lane whose owner never ran a command itself.
+            /// </param>
             public Forget(
                 ConcurrentDictionary<string, ShellSession> sessions,
                 ConcurrentDictionary<string, BackgroundJobs> jobs,
                 ConcurrentDictionary<string, ConcurrentDictionary<string, Lazy<string?>>> certificateBundles,
-                string key)
+                string shellKey,
+                string workspaceKey)
             {
                 _sessions = sessions;
                 _jobs = jobs;
                 _certificateBundles = certificateBundles;
-                _key = key;
+                _shellKey = shellKey;
+                _workspaceKey = workspaceKey;
             }
 
             public void Dispose()
             {
-                _sessions.TryRemove(_key, out _);
-                _jobs.TryRemove(_key, out _);
-                _certificateBundles.TryRemove(_key, out _);
+                _sessions.TryRemove(_shellKey, out _);
+                _jobs.TryRemove(_workspaceKey, out _);
+                _certificateBundles.TryRemove(_workspaceKey, out _);
             }
         }
 
@@ -1392,6 +1407,9 @@ namespace TensorSharp.AgentHost.CodeExec
 
         private string? SanitizedCertificateBundle(SessionWorkspace workspace, string source)
         {
+            // Keyed on the ROOT, not the lane: the bundle is a pure function of the
+            // host's own setting, lives in the shared state directory and is read-only
+            // to every command, so one copy serves every agent in the conversation.
             ConcurrentDictionary<string, Lazy<string?>> bundles =
                 _sanitizedCertificateBundles.GetOrAdd(
                     workspace.Root,
@@ -1648,6 +1666,15 @@ namespace TensorSharp.AgentHost.CodeExec
             }
         }
 
+        /// <remarks>
+        /// Keyed on the ROOT, not the lane: the jobs of every agent in a conversation are
+        /// one table. The ids name log files in the one shared <c>state/.jobs</c>, so a
+        /// per-agent counter would hand two agents <c>job-1</c> and the second log would
+        /// truncate the first while its job was still writing. One counter also keeps an
+        /// id meaning one job when a sub-agent's answer mentions it to its parent. No
+        /// tool lists or stops jobs, so sharing the table exposes nothing; every job ends
+        /// with the conversation either way.
+        /// </remarks>
         private BackgroundJobs JobsFor(SessionWorkspace workspace) =>
             _jobs.GetOrAdd(workspace.Root, _ =>
             {

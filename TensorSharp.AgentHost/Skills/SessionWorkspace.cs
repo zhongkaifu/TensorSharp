@@ -215,15 +215,63 @@ namespace TensorSharp.AgentHost.Skills
         private Action? _releaseWhenIdle;
         private bool _cleanupRegistrationClosed;
 
+        /// <summary>
+        /// The workspace this is a lane of (see <see cref="ForAgent"/>), or null when this
+        /// IS the workspace. Every conversation-wide member forwards to it.
+        /// </summary>
+        private readonly SessionWorkspace? _owner;
+
+        /// <summary>
+        /// The lanes handed out so far, by sanitized id. Owner only, under
+        /// <see cref="_gate"/>, and allocated on the first <see cref="ForAgent"/> — a
+        /// conversation with no sub-agents never has one.
+        /// </summary>
+        private Dictionary<string, SessionWorkspace>? _lanes;
+
+        /// <summary>The directory under <see cref="StateDirectory"/> that holds every lane's own state.</summary>
+        internal const string LanesDirectoryName = "lanes";
+
+        /// <summary>The longest lane id kept; a longer one is truncated to this.</summary>
+        internal const int MaxLaneIdLength = 64;
+
         internal SessionWorkspace(string root, string sessionId = "")
         {
             Id = sessionId;
             Root = root;
+            LaneId = string.Empty;
+            ShellKey = root;
             WorkDirectory = Path.Combine(root, "work");
             EnvDirectory = Path.Combine(root, "env");
             StateDirectory = Path.Combine(root, "state");
+            ShellScriptDirectory = StateDirectory;
             ShellStateDirectory = Path.Combine(StateDirectory, "shell");
             TempDirectory = Path.Combine(root, "tmp");
+            EnsureDirectories();
+            _constructed = true;
+        }
+
+        /// <summary>A lane of <paramref name="owner"/>; see <see cref="ForAgent"/>.</summary>
+        /// <param name="laneId">Already sanitized.</param>
+        private SessionWorkspace(SessionWorkspace owner, string laneId)
+        {
+            _owner = owner;
+
+            // Immutable, so copying them IS sharing them: the lane names exactly the
+            // directories its owner does, and there is nothing to keep in step.
+            Id = owner.Id;
+            Root = owner.Root;
+            WorkDirectory = owner.WorkDirectory;
+            EnvDirectory = owner.EnvDirectory;
+            StateDirectory = owner.StateDirectory;
+            TempDirectory = owner.TempDirectory;
+
+            // The lane's own. The layout under state/lanes/<id> mirrors the owner's under
+            // state/: host-written wrapper scripts at the top (read-only to the sandbox),
+            // and the one writable child the wrapper saves cwd and exports into.
+            LaneId = laneId;
+            ShellKey = owner.Root + "#" + laneId;
+            ShellScriptDirectory = Path.Combine(StateDirectory, LanesDirectoryName, laneId);
+            ShellStateDirectory = Path.Combine(ShellScriptDirectory, "shell");
             EnsureDirectories();
             _constructed = true;
         }
@@ -258,6 +306,9 @@ namespace TensorSharp.AgentHost.Skills
         /// </remarks>
         public bool EnsureDirectories()
         {
+            if (_owner != null)
+                return EnsureLaneDirectories(_owner);
+
             EnsureRealDirectory(Root);
             bool rebuilt = false;
             rebuilt |= CreateIfMissing(WorkDirectory);
@@ -268,17 +319,59 @@ namespace TensorSharp.AgentHost.Skills
             if (rebuilt)
                 WorkspaceOwner.Stamp(Root);
             if (rebuilt && _constructed)
-                Volatile.Write(ref _rebuiltNoticePending, 1);
-            return rebuilt;
-
-            static bool CreateIfMissing(string path)
             {
-                EnsureRealDirectory(path);
-                if (Directory.Exists(path))
-                    return false;
-                Directory.CreateDirectory(path);
-                return true;
+                Volatile.Write(ref _rebuiltNoticePending, 1);
+                NotifyLanesOfRebuild();
             }
+            return rebuilt;
+        }
+
+        /// <summary>
+        /// A lane's form: the owner's layout first — the files are shared, so a lane that
+        /// finds them gone repairs them for everyone — then the lane's own shell state,
+        /// which the owner's pass does not know about.
+        /// </summary>
+        private bool EnsureLaneDirectories(SessionWorkspace owner)
+        {
+            bool rebuilt = owner.EnsureDirectories();
+            bool laneRebuilt = false;
+            laneRebuilt |= CreateIfMissing(Path.Combine(StateDirectory, LanesDirectoryName));
+            laneRebuilt |= CreateIfMissing(ShellScriptDirectory);
+            laneRebuilt |= CreateIfMissing(ShellStateDirectory);
+            if (laneRebuilt && _constructed)
+                Volatile.Write(ref _rebuiltNoticePending, 1);
+            return rebuilt | laneRebuilt;
+        }
+
+        /// <summary>
+        /// Carry a rebuild to every lane's latch as well as the owner's.
+        ///
+        /// <para>
+        /// The latch is consumed by whichever tool result reports it first, and with
+        /// sub-agents that is a race between agents. One latch would tell whichever agent
+        /// happened to run next and leave the others — the parent, typically, which wrote
+        /// most of the files and outlives every sub-agent — to rediscover the loss one
+        /// missing file at a time. Each agent is told once, in its own next result.
+        /// </para>
+        /// </summary>
+        private void NotifyLanesOfRebuild()
+        {
+            lock (_gate)
+            {
+                if (_lanes == null)
+                    return;
+                foreach (SessionWorkspace lane in _lanes.Values)
+                    Volatile.Write(ref lane._rebuiltNoticePending, 1);
+            }
+        }
+
+        private static bool CreateIfMissing(string path)
+        {
+            EnsureRealDirectory(path);
+            if (Directory.Exists(path))
+                return false;
+            Directory.CreateDirectory(path);
+            return true;
         }
 
         private static void EnsureRealDirectory(string path)
@@ -309,6 +402,10 @@ namespace TensorSharp.AgentHost.Skills
         /// model. Reporting it once is the point — the workspace is whole again after the
         /// first repair, and repeating the notice on every later command would tell a
         /// model its files had just vanished when nothing had happened at all.
+        /// <para>
+        /// Per lane: a rebuild is carried to every lane's latch (see
+        /// <see cref="NotifyLanesOfRebuild"/>), so each agent is told once.
+        /// </para>
         /// </remarks>
         public bool ConsumeRebuiltNotice() =>
             Interlocked.Exchange(ref _rebuiltNoticePending, 0) == 1;
@@ -322,6 +419,100 @@ namespace TensorSharp.AgentHost.Skills
             "note: this conversation's working directory was missing and has been recreated - "
             + "something outside this session removed it. Files written by earlier steps are gone; "
             + "installed packages are gone too. Recreate what you still need before using it.";
+
+        /// <summary>
+        /// This workspace as one agent sees it, when several agents — a parent and the
+        /// sub-agents it spawned — work in it at once.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// The agents share the FILES: that is the point of spawning a helper into the
+        /// same conversation, and it is what Codex does. What they must not share is the
+        /// state that belongs to one context window. Before lanes, a sub-agent's
+        /// <c>cd sub</c> silently moved the parent's next command into <c>sub</c>, and a
+        /// file the sub-agent read counted as read by the parent. A lane is a view that
+        /// forwards everything conversation-wide to this workspace and keeps its own
+        /// copy of the rest:
+        /// </para>
+        /// <list type="bullet">
+        /// <item><b>Shared.</b> <see cref="Id"/>, <see cref="Root"/>,
+        /// <see cref="WorkDirectory"/>, <see cref="EnvDirectory"/>,
+        /// <see cref="StateDirectory"/>, <see cref="TempDirectory"/> (the same
+        /// directories); <see cref="RuntimeTempDirectory"/> (one alias of the one temp
+        /// directory); <see cref="EnterExecution"/> (the OWNER's gate, so every agent's
+        /// code tools still run one at a time); <see cref="BeginOperation"/>,
+        /// <see cref="RegisterCleanup"/> and release (one lifetime — a lane is unusable
+        /// once the owner is released); <see cref="IsInstalled"/>,
+        /// <see cref="MarkInstalled"/> and <see cref="TryMarkApplied"/> (one package
+        /// tree); the host-repair-artifact set (one work directory). The file helpers —
+        /// <see cref="TryResolve"/>, <see cref="TryReadFile"/>, <see cref="ListFiles"/>,
+        /// <see cref="SnapshotWorkFiles"/> and the rest — hold no state beyond
+        /// <see cref="WorkDirectory"/> and so answer identically through any lane.</item>
+        /// <item><b>Per lane.</b> <see cref="ShellStateDirectory"/> (the shell's saved
+        /// directory and exports), <see cref="ShellScriptDirectory"/> (its wrapper
+        /// scripts), <see cref="ShellKey"/> (the host's map key for its shell session),
+        /// <see cref="Reads"/> (what this agent has been shown), and the rebuilt-notice
+        /// latch (each agent is told once). <see cref="EnsureDirectories"/> repairs the
+        /// shared layout and then the lane's own.</item>
+        /// </list>
+        /// <para>
+        /// The same id always returns the same lane, so an agent's shell keeps its
+        /// directory from one call to the next. Lanes are flat — asking a lane for a lane
+        /// asks its owner — and live as long as the owner: a host that reuses an id for a
+        /// DIFFERENT agent inherits that agent's shell state and reads, so an id must name
+        /// one agent for the whole conversation. The id is reduced to
+        /// <c>[A-Za-z0-9_-]</c> and 64 characters because it becomes a directory name, and
+        /// compared without regard to case because on macOS and Windows two ids that
+        /// differ only in case would be one directory — ids that reduce to the same thing
+        /// are the same lane rather than two lanes silently sharing a shell.
+        /// </para>
+        /// </remarks>
+        /// <param name="laneId">The agent's id, for example <c>agent_1</c>. The owner itself is the unnamed lane and is not asked for.</param>
+        /// <exception cref="ArgumentException">The id is empty, or has no usable character.</exception>
+        /// <exception cref="ObjectDisposedException">This workspace has been released.</exception>
+        public SessionWorkspace ForAgent(string laneId)
+        {
+            if (_owner != null)
+                return _owner.ForAgent(laneId);
+
+            string sanitized = SanitizeLaneId(laneId);
+            lock (_gate)
+            {
+                // Checked under the same gate release takes to set the flag, and the lane
+                // is built inside it: a lane created after release would recreate
+                // directories under a root that is about to be deleted — or already has
+                // been — and the host would own a stray directory until its next start.
+                if (_releaseRequested)
+                    throw new ObjectDisposedException(nameof(SessionWorkspace));
+                _lanes ??= new Dictionary<string, SessionWorkspace>(StringComparer.OrdinalIgnoreCase);
+                if (!_lanes.TryGetValue(sanitized, out SessionWorkspace? lane))
+                {
+                    lane = new SessionWorkspace(this, sanitized);
+                    _lanes.Add(sanitized, lane);
+                }
+                return lane;
+            }
+        }
+
+        private static string SanitizeLaneId(string laneId)
+        {
+            if (string.IsNullOrWhiteSpace(laneId))
+            {
+                throw new ArgumentException(
+                    "a lane id is required; the workspace itself is the unnamed lane.", nameof(laneId));
+            }
+            string sanitized = new(laneId
+                .Where(c => char.IsAsciiLetterOrDigit(c) || c is '_' or '-')
+                .Take(MaxLaneIdLength)
+                .ToArray());
+            if (sanitized.Length == 0)
+            {
+                throw new ArgumentException(
+                    $"the lane id '{laneId}' has no letter, digit, '_' or '-' to name a directory with.",
+                    nameof(laneId));
+            }
+            return sanitized;
+        }
 
         /// <summary>
         /// The chat session this workspace belongs to — the key
@@ -344,8 +535,51 @@ namespace TensorSharp.AgentHost.Skills
         /// exactly the right lifetime: a conversation's reads are worth nothing to the
         /// next conversation, and the workspace is released with the session.
         /// </para>
+        /// <para>
+        /// Per LANE (see <see cref="ForAgent"/>), not per directory. The ledger records
+        /// what one context window has been shown, and a sub-agent's context is not its
+        /// parent's: a file the sub-agent read must not authorize an edit the parent makes
+        /// blind. The ledger compares content, so a file another agent changed after this
+        /// one read it is caught as stale here exactly as a shell rewrite would be.
+        /// </para>
         /// </summary>
         public FileLedger Reads { get; } = new();
+
+        /// <summary>
+        /// Which agent's view of the workspace this is: empty for the workspace itself
+        /// (the root agent), otherwise the sanitized id <see cref="ForAgent"/> was given.
+        /// </summary>
+        public string LaneId { get; }
+
+        /// <summary>
+        /// The key a host uses for per-AGENT shell state it keeps outside the workspace:
+        /// the persisted shell session and anything that must follow it.
+        ///
+        /// <para>
+        /// <see cref="Root"/> for the workspace itself — the value such maps were keyed on
+        /// before lanes existed, so a host that never calls <see cref="ForAgent"/> keys
+        /// exactly as it did — and <c>Root#laneId</c> for a lane. State that is
+        /// conversation-wide (background jobs, the sanitized CA bundle) stays keyed on
+        /// <see cref="Root"/>.
+        /// </para>
+        /// </summary>
+        public string ShellKey { get; }
+
+        /// <summary>
+        /// Where the shell writes each command's wrapper script: <see cref="StateDirectory"/>
+        /// for the workspace itself, and the lane's own directory under it for a lane.
+        ///
+        /// <para>
+        /// Per lane because the script names are a per-SESSION sequence
+        /// (<c>cmd-1.sh</c>, <c>cmd-2.sh</c>, …). Two shell sessions writing into one
+        /// directory would hand out the same names, and a background job is still
+        /// executing its script after the call that started it returned — so another
+        /// agent's next command would rewrite the file under a running shell. Read-only to
+        /// the sandbox, as <see cref="StateDirectory"/> is: only
+        /// <see cref="ShellStateDirectory"/> beneath it is writable.
+        /// </para>
+        /// </summary>
+        internal string ShellScriptDirectory { get; }
 
         /// <summary>
         /// Where everything runs and every file lives: the shell's starting directory,
@@ -382,6 +616,15 @@ namespace TensorSharp.AgentHost.Skills
         /// directory and exported environment. Sandboxes mount this child writable while
         /// keeping the parent <see cref="StateDirectory"/>, which holds host-authored
         /// scripts and logs, read-only.
+        ///
+        /// <para>
+        /// Per lane: <c>state/shell</c> for the workspace itself,
+        /// <c>state/lanes/&lt;id&gt;/shell</c> for a lane. This is what makes a sub-agent's
+        /// <c>cd sub</c> move only that sub-agent — the directory is the shell's memory,
+        /// and one shared between agents is one shell being driven by all of them. It is
+        /// also exactly the directory a lane's sandbox is granted, so one agent's command
+        /// cannot rewrite another's saved directory or environment.
+        /// </para>
         /// </summary>
         public string ShellStateDirectory { get; }
 
@@ -410,6 +653,10 @@ namespace TensorSharp.AgentHost.Skills
         {
             get
             {
+                // Shared: an alias of the shared temp directory, created once and
+                // cleaned up with the owner.
+                if (_owner != null)
+                    return _owner.RuntimeTempDirectory;
                 EnsureRealDirectory(Root);
                 EnsureRealDirectory(TempDirectory);
                 if (!OperatingSystem.IsMacOS() || Encoding.UTF8.GetByteCount(TempDirectory) <= 48)
@@ -453,6 +700,10 @@ namespace TensorSharp.AgentHost.Skills
         /// </remarks>
         public IDisposable BeginOperation()
         {
+            // Shared: a lane's operation keeps the OWNER alive, and a released owner
+            // refuses its lanes — there is one directory, deleted once.
+            if (_owner != null)
+                return _owner.BeginOperation();
             lock (_gate)
             {
                 if (_releaseRequested)
@@ -472,9 +723,16 @@ namespace TensorSharp.AgentHost.Skills
         /// Monitor ownership is deliberately re-entrant. A skill script holds the lease
         /// while it runs and may synchronously call back into the same code runner to
         /// install a missing dependency on that same thread.
+        /// <para>
+        /// A lane takes its OWNER's gate. Lanes share the files and the package tree, so
+        /// the hazard this exists for — one tool observing another's half-finished write
+        /// or install — is exactly as real between two agents as between two turns.
+        /// </para>
         /// </remarks>
         internal IDisposable EnterExecution()
         {
+            if (_owner != null)
+                return _owner.EnterExecution();
             Monitor.Enter(_executionGate);
             return new ExecutionLease(_executionGate);
         }
@@ -488,6 +746,13 @@ namespace TensorSharp.AgentHost.Skills
         {
             if (relativePaths == null)
                 return;
+
+            // Shared: the paths name files in the shared work directory.
+            if (_owner != null)
+            {
+                _owner.MarkHostRepairArtifacts(relativePaths);
+                return;
+            }
 
             lock (_gate)
             {
@@ -508,6 +773,8 @@ namespace TensorSharp.AgentHost.Skills
         /// <summary>True only for an exact path proven host-created by the method above.</summary>
         internal bool IsHostRepairArtifact(string? relativePath)
         {
+            if (_owner != null)
+                return _owner.IsHostRepairArtifact(relativePath);
             if (string.IsNullOrWhiteSpace(relativePath))
                 return false;
             string normalized = relativePath.Replace('\\', '/');
@@ -552,6 +819,11 @@ namespace TensorSharp.AgentHost.Skills
         internal void ReleaseWhenIdle(Action release)
         {
             ArgumentNullException.ThrowIfNull(release);
+            if (_owner != null)
+            {
+                _owner.ReleaseWhenIdle(release);
+                return;
+            }
             bool releaseNow;
             lock (_gate)
             {
@@ -595,6 +867,9 @@ namespace TensorSharp.AgentHost.Skills
         /// <param name="language">The installer's language, e.g. "python" or "javascript".</param>
         public bool IsInstalled(string language, string package)
         {
+            // Shared, as the package tree it describes is.
+            if (_owner != null)
+                return _owner.IsInstalled(language, package);
             lock (_gate)
                 return _installedPackages.Contains(InstallKey(language, package));
         }
@@ -602,6 +877,11 @@ namespace TensorSharp.AgentHost.Skills
         /// <summary>Record a successful install, against the language that performed it.</summary>
         public void MarkInstalled(string language, IEnumerable<string> packages)
         {
+            if (_owner != null)
+            {
+                _owner.MarkInstalled(language, packages);
+                return;
+            }
             lock (_gate)
             {
                 foreach (string package in packages)
@@ -934,6 +1214,15 @@ namespace TensorSharp.AgentHost.Skills
         public void RegisterCleanup(IDisposable cleanup)
         {
             ArgumentNullException.ThrowIfNull(cleanup);
+
+            // Shared: a lane has no end of its own. What it starts — a background job, a
+            // shell-session map entry — lives until the conversation ends and is stopped
+            // with everything else, before the one directory is deleted.
+            if (_owner != null)
+            {
+                _owner.RegisterCleanup(cleanup);
+                return;
+            }
             bool disposeNow;
             lock (_gate)
             {
@@ -953,6 +1242,11 @@ namespace TensorSharp.AgentHost.Skills
         /// <summary>Run every registered cleanup. Called once, before the directory is deleted.</summary>
         internal void RunCleanups()
         {
+            if (_owner != null)
+            {
+                _owner.RunCleanups();
+                return;
+            }
             IDisposable[] pending;
             lock (_gate)
             {
@@ -981,6 +1275,9 @@ namespace TensorSharp.AgentHost.Skills
         /// </summary>
         public bool TryMarkApplied(string key)
         {
+            // Shared: what was applied went into the shared package tree.
+            if (_owner != null)
+                return _owner.TryMarkApplied(key);
             lock (_gate)
                 return _appliedSetups.Add(key);
         }
