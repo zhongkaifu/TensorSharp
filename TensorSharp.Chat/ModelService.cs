@@ -11,10 +11,15 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Runtime.CompilerServices;
 using System.Threading;
+using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using TensorSharp.Runtime.Scheduling;
+using TensorSharp.AgentHost.Agents;
+using TensorSharp.AgentHost.Skills;
+using TensorSharp.Server.ProtocolAdapters;
 using TensorSharp.Server.Skills;
 
 namespace TensorSharp.Server
@@ -366,17 +371,112 @@ namespace TensorSharp.Server
             SamplingConfig turnSampling =
                 skills.ToolContext?.CodeRunner?.ForCodingTurn(samplingConfig) ?? samplingConfig;
 
-            return SkillChatLoop.RunAsync(
+            IAsyncEnumerable<ChatStreamUpdate> Run(CancellationToken ct) => SkillChatLoop.RunAsync(
                 Architecture,
                 history,
                 skills,
                 enableThinking,
-                (turnMessages, turnTools, ct) => _generation.ChatStreamWithMetricsAsync(
-                    session, turnMessages, maxTokens, ct,
+                (turnMessages, turnTools, roundCt) => _generation.ChatStreamWithMetricsAsync(
+                    session, turnMessages, maxTokens, roundCt,
                     SamplingForDeepSeek41SkillRound(Architecture, turnSampling, samplingConfig), turnTools, enableThinking,
                     turn),
                 logger,
+                ct);
+
+            if (skills.SubAgents == null)
+                return Run(cancellationToken);
+
+            return RunWithSubAgentsAsync(
+                skills, Run,
+                launch => SubAgentGenerator(session, launch, turn, maxTokens, turnSampling, samplingConfig, enableThinking),
+                logger, cancellationToken);
+        }
+
+        /// <summary>
+        /// One turn that offers the sub-agent tools: a <see cref="SubAgentRuntime"/> is
+        /// created when the stream starts, attached to the plan for exactly that turn, and
+        /// disposed when it ends however it ends — so no sub-agent outlives the request
+        /// that could have received its answer.
+        /// </summary>
+        private static async IAsyncEnumerable<ChatStreamUpdate> RunWithSubAgentsAsync(
+            SkillRequestPlan skills,
+            Func<CancellationToken, IAsyncEnumerable<ChatStreamUpdate>> run,
+            Func<SubAgentLaunch, SkillTurnGenerator> createGenerator,
+            ILogger logger,
+            [EnumeratorCancellation] CancellationToken cancellationToken)
+        {
+            using var agents = new SubAgentRuntime(
+                skills.SubAgents,
+                new SubAgentHostBinding
+                {
+                    CreateGenerator = createGenerator,
+                    // A sub-agent's loop is bounded like its parent's and knows which tools
+                    // are the CALLER's, so it can refuse those rather than stall on them.
+                    LoopOptions = skills.LoopOptions.WithClientTools(skills.ClientTools),
+                },
+                skills.ToolContext,
+                logger,
                 cancellationToken);
+            using IDisposable attached = skills.AttachAgents(agents);
+
+            await foreach (ChatStreamUpdate update in run(cancellationToken).WithCancellation(cancellationToken).ConfigureAwait(false))
+                yield return update;
+        }
+
+        /// <summary>
+        /// Generation for one sub-agent: every round of it is an ordinary request to the
+        /// same continuous-batching engine as its parent's, which is what lets several
+        /// agents decode at once on one loaded model.
+        ///
+        /// <para>
+        /// <b>The cache scope is the KV design.</b> A fresh sub-agent gets a scope of its
+        /// own: its prompt starts with its parent's exact instructions and tool block, so it
+        /// reuses the public prefix checkpoint they share, and its later rounds and
+        /// follow-up turns continue its own state. A forked sub-agent runs in the PARENT's
+        /// scope, because its prompt is the parent's conversation plus one tool result — the
+        /// parent's retained state is exactly its prefix, and in any other scope that state
+        /// is out of reach past the public boundary.
+        /// </para>
+        /// </summary>
+        private SkillTurnGenerator SubAgentGenerator(
+            ChatSession session,
+            SubAgentLaunch launch,
+            ChatTurnContext parentTurn,
+            int maxTokens,
+            SamplingConfig turnSampling,
+            SamplingConfig samplingConfig,
+            bool enableThinking)
+        {
+            var agentTurn = new ChatTurnContext
+            {
+                CacheScope = launch.ForkContext && parentTurn.CacheScope != null
+                    ? parentTurn.CacheScope
+                    : ChatSession.NewAgentScope(),
+            };
+            string architecture = Architecture;
+
+            return async (messages, tools, ct) =>
+            {
+                var collected = new ChatStreamCollector();
+                ChatStreamUpdate terminal = default;
+                await foreach (ChatStreamUpdate update in _generation.ChatStreamWithMetricsAsync(
+                    session, messages, maxTokens, ct,
+                    SamplingForDeepSeek41SkillRound(architecture, turnSampling, samplingConfig),
+                    tools, enableThinking, agentTurn).ConfigureAwait(false))
+                {
+                    if (update.Done)
+                        terminal = update;
+                    else
+                        collected.Add(update);
+                }
+
+                ParsedOutput parsed = collected.Resolve(architecture, enableThinking, tools);
+                return new SkillTurnOutput(parsed, terminal.RawOutputTokens)
+                {
+                    RawPromptTrailingWhitespace = terminal.RawPromptTrailingWhitespace,
+                    RawGenerationSuffix = terminal.RawGenerationSuffix,
+                };
+            };
         }
 
         internal static SamplingConfig SamplingForDeepSeek41SkillRound(string architecture,

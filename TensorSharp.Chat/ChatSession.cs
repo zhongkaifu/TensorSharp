@@ -128,6 +128,13 @@ namespace TensorSharp.Server
                 _conversationKey = string.IsNullOrEmpty(conversationKey) ? null : conversationKey;
         }
 
+        /// <summary>
+        /// A cache scope of its own for one sub-agent: opaque like every other scope, and
+        /// never shared, so a fresh sub-agent reuses only the public prefix it has in common
+        /// with its parent and keeps its own rounds' state to itself.
+        /// </summary>
+        internal static string NewAgentScope() => HashScope("agent|" + Guid.NewGuid().ToString("N"));
+
         private static string HashScope(string value)
             => Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(
                 System.Text.Encoding.UTF8.GetBytes(value)), 0, 8).ToLowerInvariant();

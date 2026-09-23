@@ -12,6 +12,7 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using Microsoft.Extensions.Logging;
+using TensorSharp.AgentHost.Agents;
 using TensorSharp.AgentHost.CodeExec;
 using TensorSharp.AgentHost.Skills;
 using TensorSharp.Server.Hosting;
@@ -42,16 +43,21 @@ namespace TensorSharp.Server.Skills
             List<ToolFunction> tools,
             SkillAgentLoopOptions loopOptions,
             bool toolsOffered,
-            IReadOnlyCollection<ToolFunction>? clientTools)
+            IReadOnlyCollection<ToolFunction>? clientTools,
+            SubAgentOptions? subAgents = null)
         {
             Prompt = prompt;
             Selected = selected;
-            ToolContext = toolContext;
+            _toolContext = toolContext;
             Tools = tools;
             LoopOptions = loopOptions;
             ToolsOffered = toolsOffered;
             ClientTools = clientTools ?? Array.Empty<ToolFunction>();
+            SubAgents = subAgents;
         }
+
+        private readonly SkillToolContext _toolContext;
+        private SkillToolContext? _turnToolContext;
 
         /// <summary>The rendered instruction block and what went into it.</summary>
         public SkillPlan Prompt { get; }
@@ -59,8 +65,39 @@ namespace TensorSharp.Server.Skills
         /// <summary>The skills the request named, resolved and sorted.</summary>
         public IReadOnlyList<Skill> Selected { get; }
 
-        /// <summary>The sandbox the built-in tools resolve paths in.</summary>
-        public SkillToolContext ToolContext { get; }
+        /// <summary>
+        /// The sandbox the built-in tools resolve paths in — with the turn's sub-agents
+        /// attached while a turn that offers them is running (see <see cref="AttachAgents"/>).
+        /// </summary>
+        public SkillToolContext ToolContext => _turnToolContext ?? _toolContext;
+
+        /// <summary>
+        /// The sub-agent limits this plan declared the agent tools under, or null when it
+        /// did not declare them. Non-null is the signal for a host to start a
+        /// <see cref="SubAgentRuntime"/> for the turn.
+        /// </summary>
+        public SubAgentOptions? SubAgents { get; }
+
+        /// <summary>
+        /// Run the next turn's tools with <paramref name="runtime"/> answering the agent
+        /// tools. Disposing the result detaches it again, so a plan re-run for a retry gets
+        /// a fresh runtime rather than the finished turn's agents.
+        /// </summary>
+        internal IDisposable AttachAgents(SubAgentRuntime runtime)
+        {
+            ArgumentNullException.ThrowIfNull(runtime);
+            _turnToolContext = runtime.RootContext;
+            return new Detach(this, runtime.RootContext);
+        }
+
+        private sealed class Detach(SkillRequestPlan plan, SkillToolContext attached) : IDisposable
+        {
+            public void Dispose()
+            {
+                if (ReferenceEquals(plan._turnToolContext, attached))
+                    plan._turnToolContext = null;
+            }
+        }
 
         /// <summary>The caller's tools plus the built-in skill tools, or the caller's alone.</summary>
         public List<ToolFunction> Tools { get; }
@@ -259,7 +296,7 @@ namespace TensorSharp.Server.Skills
 
             if (registry == null || options == null || !options.SkillsEnabled)
                 return offerCode
-                    ? CodeOnly(clientTools, architecture, codeRunner!, options, codeInputFiles, workspace)
+                    ? CodeOnly(clientTools, architecture, codeRunner!, options, codeInputFiles, workspace, logger)
                     : null;
 
             // A request that names no skills inherits the operator's --skill selection.
@@ -285,7 +322,7 @@ namespace TensorSharp.Server.Skills
             if (!anythingRequested && (!advertise || registry.Skills.Count == 0))
             {
                 return offerCode
-                    ? CodeOnly(clientTools, architecture, codeRunner!, options, codeInputFiles, workspace)
+                    ? CodeOnly(clientTools, architecture, codeRunner!, options, codeInputFiles, workspace, logger)
                     : null;
             }
 
@@ -331,6 +368,8 @@ namespace TensorSharp.Server.Skills
             if (workspace != null && offerTools)
                 DescribeSharedWorkspace(tools, codeRunner);
 
+            SubAgentOptions? subAgents = offerTools ? AppendAgentTools(ref tools, options, logger) : null;
+
             var context = new SkillToolContext(prompt.Reachable.ToList(), ReadCapFor(contextTokens))
             {
                 ScriptRunner = options.SkillsAllowScripts && offerTools
@@ -373,7 +412,7 @@ namespace TensorSharp.Server.Skills
             // so a family that cannot carry declarations carries neither. There is no case
             // where code execution is offered while the skill tools are withheld.
             return new SkillRequestPlan(
-                prompt, selected, context, tools, loopOptions, offerTools, clientTools);
+                prompt, selected, context, tools, loopOptions, offerTools, clientTools, subAgents);
         }
 
         /// <summary>
@@ -400,7 +439,8 @@ namespace TensorSharp.Server.Skills
             ICodeRunner codeRunner,
             ServerHostingOptions? options,
             IReadOnlyList<CodeInputFile>? codeInputFiles = null,
-            SessionWorkspace? workspace = null)
+            SessionWorkspace? workspace = null,
+            ILogger? logger = null)
         {
             SkillModelCapabilities capabilities = SkillCapabilities.For(architecture);
             if (!capabilities.ToolsRendered)
@@ -414,6 +454,8 @@ namespace TensorSharp.Server.Skills
 
             if (workspace != null)
                 DescribeSharedWorkspace(tools, codeRunner);
+
+            SubAgentOptions? subAgents = AppendAgentTools(ref tools, options, logger);
 
             var context = new SkillToolContext(Array.Empty<Skill>())
             {
@@ -436,7 +478,42 @@ namespace TensorSharp.Server.Skills
                     ToolResultsAreRendered = capabilities.ToolResultsRendered,
                 },
                 toolsOffered: true,
-                clientTools);
+                clientTools,
+                subAgents);
+        }
+
+        /// <summary>
+        /// Declare the sub-agent tools, when the operator enabled them, AFTER everything
+        /// else — so the tool block every existing request renders is unchanged up to that
+        /// point — and return the limits they were declared under (null when they were not).
+        ///
+        /// <para>
+        /// A caller's own tool of the same name wins, as it does for every built-in: the
+        /// caller has an implementation and an expectation. The shadowing is logged, and
+        /// the remaining agent tools are still declared — they are useful without the one
+        /// the caller took, and withholding them all over one name is the per-name mistake
+        /// <see cref="Merge"/> already had to unlearn.
+        /// </para>
+        /// </summary>
+        private static SubAgentOptions? AppendAgentTools(
+            ref List<ToolFunction> tools, ServerHostingOptions? options, ILogger? logger)
+        {
+            if (options?.SubAgents is not { Enabled: true } subAgents)
+                return null;
+
+            var merged = tools != null ? new List<ToolFunction>(tools) : new List<ToolFunction>();
+            foreach (ToolFunction declaration in SubAgentTools.Declare())
+            {
+                if (merged.Any(t => string.Equals(t?.Name, declaration.Name, StringComparison.OrdinalIgnoreCase)))
+                {
+                    logger?.LogWarning(LogEventIds.HostConfiguration,
+                        "agents.tool-shadowed name={ToolName} - the request's own tool definition wins", declaration.Name);
+                    continue;
+                }
+                merged.Add(declaration);
+            }
+            tools = merged;
+            return subAgents.Clone();
         }
 
         /// <summary>

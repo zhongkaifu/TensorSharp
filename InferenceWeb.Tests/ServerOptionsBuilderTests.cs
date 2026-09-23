@@ -8,6 +8,7 @@
 // TensorSharp is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 
+using TensorSharp.AgentHost.Agents;
 using TensorSharp.AgentHost.CodeExec;
 using TensorSharp.Runtime.Scheduling;
 using TensorSharp.Runtime.Scheduling.PrefixCache;
@@ -590,6 +591,8 @@ public class ServerOptionsBuilderTests : IDisposable
         // explicit opt-in the CLI does — and therefore has to document it.
         accepted.AddRange(CodeExecOptions.SwitchFlags);
         accepted.AddRange(CodeExecOptions.ValueFlags);
+        accepted.AddRange(SubAgentOptions.SwitchFlags);
+        accepted.AddRange(SubAgentOptions.ValueFlags);
 
         var missing = accepted.Where(f => !usage.Contains(f, StringComparison.Ordinal)).ToList();
         Assert.True(missing.Count == 0,

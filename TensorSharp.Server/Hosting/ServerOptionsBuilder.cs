@@ -16,6 +16,7 @@ using System.IO;
 using System.Linq;
 using System.Text;
 using TensorSharp.AgentHost.CodeExec;
+using TensorSharp.AgentHost.Agents;
 using TensorSharp.AgentHost.Skills;
 using TensorSharp.Runtime.Scheduling;
 using TensorSharp.Runtime.Speculative;
@@ -140,13 +141,16 @@ public static class ServerOptionsBuilder
         if (skillOptions.Enabled)
             skillOptions.ValidateRoots(createDefault: skillDirectoriesAreDefault);
 
+        // Sub-agents: the same shared reader as the CLI's, then the environment.
+        SubAgentOptions subAgentOptions = SubAgentOptions.Parse(args).ApplyEnvironment();
+
         // TS_NO_WEBUI follows the TENSORSHARP_LOG_FILE convention: set to
         // anything but "0" counts as on.
         string? noWebUiEnv = Environment.GetEnvironmentVariable("TS_NO_WEBUI");
         bool webUiEnabled = !configuredNoWebUi
             && (string.IsNullOrWhiteSpace(noWebUiEnv) || string.Equals(noWebUiEnv.Trim(), "0", StringComparison.Ordinal));
 
-        return new ServerHostingOptions(
+        var hosting = new ServerHostingOptions(
             startupModelPath,
             startupMmProjPath,
             defaultBackend,
@@ -187,6 +191,8 @@ public static class ServerOptionsBuilder
             embeddingsEnabled: embeddingsEnabled,
             embeddingThreads: embeddingThreads,
             embeddingContextSize: embeddingContextSize);
+        hosting.RepointSubAgents(subAgentOptions);
+        return hosting;
     }
 
     private static int ReadEmbeddingIntOption(string[] args, string flag)
@@ -1259,6 +1265,17 @@ public static class ServerOptionsBuilder
                 continue;
             }
 
+            // Sub-agents. Read by SubAgentOptions.Parse above; consumed here, off the
+            // same tables, so the unknown-option trap cannot refuse a documented flag.
+            if (MatchesAny(args[i], SubAgentSwitchFlags))
+            {
+                continue;
+            }
+            if (TryReadAnyOption(args, ref i, SubAgentValueFlags))
+            {
+                continue;
+            }
+
             if (TryReadOption(args, ref i, "--upload-ttl-hours", out string? uploadTtlOption))
             {
                 if (!double.TryParse(uploadTtlOption, NumberStyles.Float, CultureInfo.InvariantCulture, out double parsedTtlHours)
@@ -1510,6 +1527,8 @@ public static class ServerOptionsBuilder
         // knew the names.
         knownFlags.AddRange(CodeExecOptions.SwitchFlags);
         knownFlags.AddRange(CodeExecOptions.ValueFlags);
+        knownFlags.AddRange(SubAgentOptions.SwitchFlags);
+        knownFlags.AddRange(SubAgentOptions.ValueFlags);
         string? best = null;
         int bestDist = int.MaxValue;
         foreach (var flag in knownFlags)
@@ -1542,6 +1561,13 @@ public static class ServerOptionsBuilder
 
     internal static readonly string[] CodeExecValueFlags =
         CodeExecOptions.ValueFlags.ToArray();
+
+    /// <summary>The sub-agent flags, from SubAgentOptions' own tables for the same reason.</summary>
+    internal static readonly string[] SubAgentSwitchFlags =
+        SubAgentOptions.SwitchFlags.ToArray();
+
+    internal static readonly string[] SubAgentValueFlags =
+        SubAgentOptions.ValueFlags.ToArray();
 
     /// <paramref name="flags"/> (case-insensitive). Used to consume the
     /// valueless switches an earlier applier pass already handled.</summary>

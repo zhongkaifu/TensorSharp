@@ -484,6 +484,31 @@ namespace TensorSharp.Server.Host.Hosting
                     "(TS_SKILLS_MAX_ROUNDS env var overrides).",
                     "--skills-max-rounds 4"),
             }),
+            ("Sub-agents (the model starts parallel copies of itself for sub-tasks)", new[]
+            {
+                new OptionHelp("--sub-agents",
+                    "Offer the model Codex's sub-agent tools: spawn_agent starts a sub-agent - another copy of " +
+                    "the model with the same tools and working directory but its own context - that works on one " +
+                    "task in parallel and reports back a final answer; send_input gives one a follow-up, wait_agent " +
+                    "collects answers, close_agent stops one, list_agents shows them. Sub-agents run as separate " +
+                    "sequences on the SAME loaded model, so the engine batches their decoding together, and each " +
+                    "one's prompt starts with the parent's exact instructions and tool list, so they reuse the " +
+                    "parent's cached prefix instead of prefilling it again. Needs a turn that already has tools " +
+                    "(skills or --code-exec). The tool descriptions tell the model to start sub-agents only when " +
+                    "the user or a skill asks for them. Sub-agents live for one turn: any still working when the " +
+                    "turn ends are collected first, or stopped - and the answer says so. Default: off " +
+                    "(TS_SUB_AGENTS env var overrides; any value but 0 turns it on).",
+                    "--sub-agents"),
+                new OptionHelp("--sub-agents-max-threads <N>",
+                    "How many sub-agents may be open at once in one turn (1-16). Starting one more first closes " +
+                    "the longest-finished agent whose answer was already delivered, and fails only when every " +
+                    "open agent is still working. Default: 4 (TS_SUB_AGENTS_MAX_THREADS env var overrides).",
+                    "--sub-agents-max-threads 3"),
+                new OptionHelp("--sub-agents-max-depth <N>",
+                    "How deep sub-agents may nest (1-4). 1, the default, lets the model start sub-agents but " +
+                    "not a sub-agent start its own (TS_SUB_AGENTS_MAX_DEPTH env var overrides).",
+                    "--sub-agents-max-depth 2"),
+            }),
             ("Code execution (the shell tool: commands the MODEL writes, run in a sandbox)", new[]
             {
                 new OptionHelp("--code-exec",

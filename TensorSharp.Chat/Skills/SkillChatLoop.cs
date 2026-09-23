@@ -21,6 +21,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
 using TensorSharp.Runtime.Scheduling;
+using TensorSharp.AgentHost.Agents;
 using TensorSharp.AgentHost.CodeExec;
 using TensorSharp.AgentHost.Skills;
 using TensorSharp.Server.ProtocolAdapters;
@@ -105,6 +106,11 @@ namespace TensorSharp.Server.Skills
             bool guardCompletion = plan.CompletionRequirement != null;
             bool repetitionRetried = false;
 
+            // A spawned sub-agent copies this conversation's instructions and tool list,
+            // so the turn's runtime has to know which conversation this loop is running.
+            SubAgentScope agents = plan.ToolContext?.Agents;
+            agents?.Bind(working, plan.Tools);
+
             int promptTokens = 0;
             int evalTokens = 0;
             int reusedTokens = 0;
@@ -127,6 +133,17 @@ namespace TensorSharp.Server.Skills
                 var thinking = new StringBuilder();
                 var calls = new List<ToolCall>();
                 var heldAnswer = guardCompletion ? new List<ChatStreamUpdate>() : null;
+
+                // While sub-agents are out, this round's ANSWER text is held (its
+                // reasoning still streams). If the round turns out to be a final answer
+                // written without their results, the host collects them and asks again,
+                // and the premature answer is never shown; if it calls tools instead, the
+                // text is released as soon as the round ends. Only a round that STARTS
+                // with agents outstanding can end that way — agents are only spawned by
+                // tool calls, never during a generation.
+                var heldForAgents = !guardCompletion && agents is { HasOutstandingWork: true }
+                    ? new List<ChatStreamUpdate>()
+                    : null;
                 ChatStreamUpdate terminal = default;
                 string toolBeingWritten = null;
                 // The last few kilobytes of the RAW stream, tool markup included. When
@@ -166,6 +183,13 @@ namespace TensorSharp.Server.Skills
                         if (!string.IsNullOrEmpty(delta.Content) || !string.IsNullOrEmpty(delta.Thinking))
                             heldAnswer.Add(ChatStreamUpdate.Parsed(delta.Content, delta.Thinking, null));
                     }
+                    else if (heldForAgents != null)
+                    {
+                        if (!string.IsNullOrEmpty(delta.Thinking))
+                            yield return ChatStreamUpdate.Parsed(null, delta.Thinking, null);
+                        if (!string.IsNullOrEmpty(delta.Content))
+                            heldForAgents.Add(ChatStreamUpdate.Parsed(delta.Content, null, null));
+                    }
                     else if (!string.IsNullOrEmpty(delta.Content) || !string.IsNullOrEmpty(delta.Thinking))
                     {
                         yield return ChatStreamUpdate.Parsed(delta.Content, delta.Thinking, null);
@@ -194,6 +218,13 @@ namespace TensorSharp.Server.Skills
                     if (!string.IsNullOrEmpty(flushed.Content) || !string.IsNullOrEmpty(flushed.Thinking))
                         heldAnswer.Add(ChatStreamUpdate.Parsed(flushed.Content, flushed.Thinking, null));
                 }
+                else if (heldForAgents != null)
+                {
+                    if (!string.IsNullOrEmpty(flushed.Thinking))
+                        yield return ChatStreamUpdate.Parsed(null, flushed.Thinking, null);
+                    if (!string.IsNullOrEmpty(flushed.Content))
+                        heldForAgents.Add(ChatStreamUpdate.Parsed(flushed.Content, null, null));
+                }
                 else if (!string.IsNullOrEmpty(flushed.Content) || !string.IsNullOrEmpty(flushed.Thinking))
                 {
                     yield return ChatStreamUpdate.Parsed(flushed.Content, flushed.Thinking, null);
@@ -208,6 +239,12 @@ namespace TensorSharp.Server.Skills
                 // more, differently; a second loop ends the turn with that explanation.
                 if (FinishReasonMapper.IsRepetition(terminal.FinishReason))
                 {
+                    if (heldForAgents != null)
+                    {
+                        foreach (ChatStreamUpdate held in heldForAgents)
+                            yield return held;
+                        heldForAgents = null;
+                    }
                     string loopNote = DescribeRepetition(rawTail.ToString());
                     logger?.LogWarning(LogEventIds.SkillToolInvoked,
                         "skills.loop.repetition round={Round} retried={Retried}: {What}",
@@ -272,6 +309,61 @@ namespace TensorSharp.Server.Skills
 
                 if (skillCalls.Count == 0 && unknownCalls.Count == 0)
                 {
+                    // An answer while sub-agents this turn started are still out. Codex's
+                    // own guidance is "wait for them before yielding"; a small model
+                    // forgets, and would answer without results already on their way. The
+                    // loop collects them itself and asks once more — when a round is left.
+                    if (clientCalls.Count == 0 && agents is { HasOutstandingWork: true })
+                    {
+                        if (round < maxRounds)
+                        {
+                            string handover = null;
+                            await foreach (ChatStreamUpdate progress in CollectAgentsAsync(
+                                agents, plan, round, h => handover = h, logger, cancellationToken).ConfigureAwait(false))
+                            {
+                                yield return progress;
+                            }
+                            if (handover != null)
+                            {
+                                working.Add(new ChatMessage
+                                {
+                                    Role = "assistant",
+                                    Content = content.ToString(),
+                                    Thinking = thinking.Length == 0 ? null : thinking.ToString(),
+                                    RawOutputTokens = terminal.RawOutputTokens != null
+                                        ? new List<int>(terminal.RawOutputTokens)
+                                        : null,
+                                    RawPromptTrailingWhitespace = terminal.RawPromptTrailingWhitespace,
+                                    RawGenerationSuffix = terminal.RawGenerationSuffix,
+                                });
+                                working.Add(new ChatMessage { Role = "user", Content = handover });
+                                continue;
+                            }
+                        }
+                        else
+                        {
+                            IReadOnlyList<string> stopped = agents.StopOutstanding();
+                            if (heldForAgents != null)
+                            {
+                                foreach (ChatStreamUpdate held in heldForAgents)
+                                    yield return held;
+                                heldForAgents = null;
+                            }
+                            if (stopped.Count > 0)
+                            {
+                                yield return ChatStreamUpdate.Parsed(
+                                    (content.Length == 0 ? string.Empty : "\n\n")
+                                    + "_(" + DescribeStoppedAgents(stopped) + ")_", null, null);
+                            }
+                        }
+                    }
+                    if (heldForAgents != null)
+                    {
+                        foreach (ChatStreamUpdate held in heldForAgents)
+                            yield return held;
+                        heldForAgents = null;
+                    }
+
                     if (guardCompletion && clientCalls.Count == 0)
                     {
                         WorkspaceArtifactCompletionResult completion =
@@ -317,6 +409,15 @@ namespace TensorSharp.Server.Skills
 
                     yield return Combine(terminal, promptTokens, evalTokens, reusedTokens, promptNs, evalNs, totalNs);
                     yield break;
+                }
+
+                // Text the model wrote before its tool calls was held while sub-agents were
+                // out; it is not an answer, so it goes out now, ahead of the tool steps.
+                if (heldForAgents != null)
+                {
+                    foreach (ChatStreamUpdate held in heldForAgents)
+                        yield return held;
+                    heldForAgents = null;
                 }
 
                 working.Add(new ChatMessage
@@ -386,6 +487,10 @@ namespace TensorSharp.Server.Skills
                         finishReason: "stop");
                     yield break;
                 }
+
+                // Sub-agents that finished during this round reach the model before its
+                // next generation, folded into the round's last tool result.
+                SubAgentConversation.AppendDeliveries(working, agents);
             }
 
             // Out of rounds. Tell the model so, in the conversation, and let it answer
@@ -394,9 +499,22 @@ namespace TensorSharp.Server.Skills
             logger?.LogWarning(LogEventIds.SkillLoopCapped,
                 "skills.loop.capped rounds={Rounds} skills={Skills}", maxRounds, plan.DescribeSelection());
 
+            // Sub-agents still out are collected first, so the forced answer is written
+            // with their results rather than without them.
+            string limitHandover = null;
+            if (agents is { HasOutstandingWork: true })
+            {
+                await foreach (ChatStreamUpdate progress in CollectAgentsAsync(
+                    agents, plan, maxRounds + 1, h => limitHandover = h, logger, cancellationToken).ConfigureAwait(false))
+                {
+                    yield return progress;
+                }
+            }
+
             working.Add(BuildResult(plan,
                 "Error: the limit on tool calls for this turn has been reached. Answer now using what you have "
-                + "already read, and say which part you could not check."));
+                + "already read, and say which part you could not check."
+                + (limitHandover == null ? string.Empty : "\n\n" + limitHandover)));
 
             cancellationToken.ThrowIfCancellationRequested();
 
@@ -819,6 +937,14 @@ namespace TensorSharp.Server.Skills
                     // recorded, shown in the trace, and fed back to the model. The
                     // bundled script itself is deliberately never entered.
                     execution = Task.FromResult(prerequisiteFailure);
+                }
+                else if (SkillToolNames.IsAgentTool(call.Name) && plan.ToolContext?.Agents is { } agents)
+                {
+                    // Awaited rather than run on a worker: wait_agent can block for
+                    // minutes while the agents it waits on generate, and a parked thread
+                    // per waiting turn is how a thread pool starves. The heartbeat below
+                    // streams what the sub-agents are doing meanwhile.
+                    execution = agents.ExecuteAsync(call, liveOutput.Add, cancellationToken);
                 }
                 else
                 {
@@ -1337,6 +1463,63 @@ namespace TensorSharp.Server.Skills
                 RawPromptTrailingWhitespace = terminal.RawPromptTrailingWhitespace,
                     RawGenerationSuffix = terminal.RawGenerationSuffix,
             };
+
+        /// <summary>
+        /// Wait for the sub-agents a turn is about to end without, streaming what they do
+        /// the way a <c>wait_agent</c> call streams, and hand the collected results to
+        /// <paramref name="onHandover"/> (null when nothing was outstanding after all).
+        /// Recorded as a <c>wait_agent</c> step, so the trace shows where the time went.
+        /// </summary>
+        private static async IAsyncEnumerable<ChatStreamUpdate> CollectAgentsAsync(
+            SubAgentScope agents,
+            SkillRequestPlan plan,
+            int round,
+            Action<string> onHandover,
+            ILogger logger,
+            [EnumeratorCancellation] CancellationToken cancellationToken)
+        {
+            const string detail = "collecting sub-agent results before answering";
+            var liveOutput = new LiveOutputBuffer();
+            yield return ChatStreamUpdate.ToolProgress("running", SkillToolNames.WaitAgent, detail: detail);
+
+            Task<string> collect = agents.CollectOutstandingAsync(
+                SubAgentConversation.EndOfTurnWait, liveOutput.Add, cancellationToken);
+            var clock = Stopwatch.StartNew();
+            while (await Task.WhenAny(collect, Task.Delay(1000, cancellationToken)).ConfigureAwait(false) != collect)
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                yield return ChatStreamUpdate.ToolProgress(
+                    "running", SkillToolNames.WaitAgent, piece: liveOutput.Drain(),
+                    seconds: clock.Elapsed.TotalSeconds, detail: detail);
+            }
+            string handover = await collect.ConfigureAwait(false);
+            string trailing = liveOutput.Drain();
+            if (!string.IsNullOrEmpty(trailing))
+            {
+                yield return ChatStreamUpdate.ToolProgress(
+                    "running", SkillToolNames.WaitAgent, piece: trailing,
+                    seconds: clock.Elapsed.TotalSeconds, detail: detail);
+            }
+
+            var invocation = new SkillToolInvocation(
+                round, SkillToolNames.WaitAgent, null, null, Ok: handover != null, handover?.Length ?? 0);
+            lock (plan.Invocations)
+                plan.Invocations.Add(invocation);
+            logger?.LogInformation(LogEventIds.SkillToolInvoked,
+                "agents.collect-before-answer round={Round} ms={Ms} delivered={Delivered}",
+                round, (long)clock.Elapsed.TotalMilliseconds, handover != null);
+
+            yield return ChatStreamUpdate.ToolProgress(
+                "finished", SkillToolNames.WaitAgent, seconds: clock.Elapsed.TotalSeconds);
+            onHandover(handover);
+        }
+
+        /// <summary>What the user is told when sub-agents were stopped because the turn ran out of rounds.</summary>
+        private static string DescribeStoppedAgents(IReadOnlyList<string> stopped) =>
+            "Sub-agent" + (stopped.Count == 1 ? " " : "s ") + string.Join(", ", stopped)
+            + (stopped.Count == 1 ? " was" : " were")
+            + " still working when this turn ran out of rounds and " + (stopped.Count == 1 ? "was" : "were")
+            + " stopped; this answer does not include " + (stopped.Count == 1 ? "its" : "their") + " results.";
 
         /// <summary>
         /// Wrap a tool result in the message shape this model family renders. Mistral 3

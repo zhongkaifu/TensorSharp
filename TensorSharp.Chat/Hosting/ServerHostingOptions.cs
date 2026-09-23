@@ -9,6 +9,7 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 
 using System;
+using TensorSharp.AgentHost.Agents;
 using TensorSharp.AgentHost.Skills;
 using System.Collections.Generic;
 
@@ -208,6 +209,21 @@ namespace TensorSharp.Server.Hosting
         /// </para>
         /// </summary>
         public void RepointSkills(bool enabled) => SkillsEnabled = enabled;
+
+        /// <summary>
+        /// The sub-agent tools' switch and limits (<c>--sub-agents</c>). Off unless an
+        /// operator turned it on: declaring the agent tools changes every agentic request's
+        /// tool block, and each spawned agent is another generation loop on the same GPU.
+        /// </summary>
+        public SubAgentOptions SubAgents { get; private set; } = new();
+
+        /// <summary>
+        /// Replace the sub-agent settings. Called once by the server's option builder; an
+        /// app host may call it again from a settings switch, with the same rule as the
+        /// other repoint methods — it moves what the NEXT request is planned against.
+        /// </summary>
+        public void RepointSubAgents(SubAgentOptions options) =>
+            SubAgents = (options ?? throw new ArgumentNullException(nameof(options))).Clone();
 
         /// <summary>
         /// Move the default generation budget, for the same reason and with the same
