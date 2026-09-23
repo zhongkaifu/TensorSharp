@@ -257,8 +257,13 @@ namespace TensorSharp.AgentHost.Agents
                     // learned to call close_agent is not stopped cold by agents it has
                     // finished with. Only agents still working, or holding an answer the
                     // parent has not seen, keep their slot.
+                    // Only from the caller's own subtree: an agent may close only agents it
+                    // started (directly or through its own sub-agents). Evicting a sibling
+                    // would close an agent its real parent still addresses, and tell the
+                    // wrong agent about it.
                     SubAgent? victim = _agents.Values
-                        .Where(a => a.IsOpen && !a.IsWorking && a.Delivered && !HasOpenChildrenLocked(a))
+                        .Where(a => a.IsOpen && !a.IsWorking && a.Delivered && !HasOpenChildrenLocked(a)
+                                    && IsDescendantLocked(a, caller.Self))
                         .OrderBy(a => a.FinishOrder)
                         .FirstOrDefault();
                     if (victim == null)
@@ -282,9 +287,16 @@ namespace TensorSharp.AgentHost.Agents
                     message, fork, _turnCts.Token);
                 agent.Scope = new SubAgentScope(this, agent);
                 agent.Tools = tools;
+                bool forked = false;
                 agent.History = fork
-                    ? BuildForkedHistory(conversation, call, agent, _binding.LoopOptions?.ToolResultsAreRendered ?? true)
+                    ? BuildForkedHistory(conversation, call, agent, _binding.LoopOptions?.ToolResultsAreRendered ?? true, out forked)
                     : BuildFreshHistory(conversation, agent);
+                // A fork whose spawning turn is not in the conversation started fresh.
+                // Say so to the model and to the host: ForkContext would otherwise run a
+                // fresh agent in the parent's cache scope, and the reply would claim
+                // context the agent does not have.
+                fork = forked;
+                agent.Forked = forked;
                 _agents.Add(agent.Id, agent);
             }
             foreach (CancellationTokenSource source in evictedSources)
@@ -519,7 +531,15 @@ namespace TensorSharp.AgentHost.Agents
 
         // ---- loop integration ----------------------------------------------------
 
-        internal SubAgentDeliveries TakePendingDeliveries(SubAgentScope caller)
+        /// <param name="caller">Whose deliveries.</param>
+        /// <param name="includeMessages">
+        /// False takes only finished sub-agents' results and leaves the messages the
+        /// caller's own parent sent it in its inbox, for whoever can put them in the
+        /// conversation as user turns (the next round boundary, or the agent's run loop
+        /// once its turn ends). The end-of-turn handover is one message about results; a
+        /// parent's message drained into it would be dropped.
+        /// </param>
+        internal SubAgentDeliveries TakePendingDeliveries(SubAgentScope caller, bool includeMessages = true)
         {
             lock (_gate)
             {
@@ -538,7 +558,7 @@ namespace TensorSharp.AgentHost.Agents
                 }
 
                 IReadOnlyList<string> messages = Array.Empty<string>();
-                if (caller.Self is { Inbox.Count: > 0 } self)
+                if (includeMessages && caller.Self is { Inbox.Count: > 0 } self)
                 {
                     messages = self.Inbox.Select(FollowUpMessage).ToList();
                     self.Inbox.Clear();
@@ -586,7 +606,9 @@ namespace TensorSharp.AgentHost.Agents
             }
 
             IReadOnlyList<string> stopped = StopOutstanding(caller);
-            SubAgentDeliveries deliveries = TakePendingDeliveries(caller);
+            // Results only: a message this agent's own parent sent meanwhile stays queued,
+            // and RunAsync (or the next round boundary) turns it into a user turn.
+            SubAgentDeliveries deliveries = TakePendingDeliveries(caller, includeMessages: false);
             if (deliveries.Notification == null && stopped.Count == 0)
                 return null;
 
@@ -718,8 +740,11 @@ namespace TensorSharp.AgentHost.Agents
                     if (again)
                         continue;
 
-                    Signal();
+                    // Report before Signal: the signal is what wakes a wait_agent, which
+                    // then unregisters its tap, so the other order lets the one line a
+                    // waiting host most wants to show — this one — miss it.
                     Report(agent, "finished (" + FormatElapsed(agent.StartedAt) + ")");
+                    Signal();
                     _logger?.LogInformation(LogEventIds.SkillToolInvoked,
                         "agents.finish id={Id} status=completed turns={Turns} rounds={Rounds} toolCalls={ToolCalls} ms={Ms} hitRoundLimit={Capped} answerChars={Chars}",
                         agent.Id, agent.Turns, agent.Rounds, agent.ToolCalls,
@@ -749,8 +774,8 @@ namespace TensorSharp.AgentHost.Agents
                     agent.FinishedAt = Stopwatch.GetTimestamp();
                     agent.FinishOrder = ++_finishCounter;
                 }
-                Signal();
                 Report(agent, "failed: " + Abbreviate(ex.Message, 200));
+                Signal();
                 _logger?.LogWarning(LogEventIds.SkillToolInvoked, ex,
                     "agents.finish id={Id} status=errored turns={Turns} error={Error}", agent.Id, agent.Turns, ex.Message);
             }
@@ -939,8 +964,9 @@ namespace TensorSharp.AgentHost.Agents
         /// </para>
         /// </summary>
         private List<ChatMessage> BuildForkedHistory(
-            List<ChatMessage> conversation, ToolCall call, SubAgent agent, bool resultsRendered)
+            List<ChatMessage> conversation, ToolCall call, SubAgent agent, bool resultsRendered, out bool forked)
         {
+            forked = false;
             int spawner = -1;
             for (int i = conversation.Count - 1; i >= 0; i--)
             {
@@ -956,6 +982,7 @@ namespace TensorSharp.AgentHost.Agents
             if (spawner < 0)
                 return BuildFreshHistory(conversation, agent);
 
+            forked = true;
             var history = new List<ChatMessage>(spawner + 8);
             for (int i = 0; i <= spawner; i++)
                 history.Add(CloneMessage(conversation[i]));
@@ -1045,6 +1072,19 @@ namespace TensorSharp.AgentHost.Agents
 
         private bool HasOpenChildrenLocked(SubAgent agent) =>
             _agents.Values.Any(a => a.Parent == agent && a.IsOpen);
+
+        /// <summary>True when <paramref name="agent"/> was started by <paramref name="ancestor"/> or one of its sub-agents; every agent is the top-level agent's (null).</summary>
+        private static bool IsDescendantLocked(SubAgent agent, SubAgent? ancestor)
+        {
+            if (ancestor == null)
+                return true;
+            for (SubAgent? parent = agent.Parent; parent != null; parent = parent.Parent)
+            {
+                if (parent == ancestor)
+                    return true;
+            }
+            return false;
+        }
 
         private bool TryResolveOwnedLocked(SubAgentScope caller, string id, out SubAgent? agent, out string? error)
         {
@@ -1346,7 +1386,7 @@ namespace TensorSharp.AgentHost.Agents
         public SubAgent? Parent { get; }
         public int Depth { get; }
         public string Task { get; }
-        public bool Forked { get; }
+        public bool Forked { get; set; }
         public CancellationTokenSource Cts { get; }
         public SubAgentScope Scope { get; set; } = null!;
         public IReadOnlyList<ToolFunction>? Tools { get; set; }
