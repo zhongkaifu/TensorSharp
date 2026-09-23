@@ -73,9 +73,11 @@ namespace TensorSharp.AgentHost.Agents
                     + "Only start sub-agents when the user, or the instructions of a skill you are following, "
                     + "asks for sub-agents, delegation or parallel work; a request for depth or thoroughness "
                     + "alone is not permission. Give each agent a concrete, self-contained task that includes "
-                    + "everything it needs, because it cannot see this conversation. When agents will change "
-                    + "files, give each one different files. Do not also do a delegated task yourself: work "
-                    + "on something else, and wait only when your next step needs the result.",
+                    + "everything it needs, because it cannot see this conversation. When several tasks are "
+                    + "independent, start all of their agents in the same reply, so they run at the same "
+                    + "time. When agents will change files, give each one different files. Do not also do a "
+                    + "delegated task yourself: work on something else, and wait only when your next step "
+                    + "needs the result.",
                 Parameters = new Dictionary<string, ToolParameter>
                 {
                     ["message"] = new()

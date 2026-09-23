@@ -391,7 +391,7 @@ namespace TensorSharp.Server
 
             return RunWithSubAgentsAsync(
                 skills, Run,
-                launch => SubAgentGenerator(session, launch, turn, maxTokens, turnSampling, samplingConfig, enableThinking),
+                launch => SubAgentGenerator(session, launch, turn, maxTokens, turnSampling, samplingConfig, enableThinking, logger),
                 logger, cancellationToken);
         }
 
@@ -448,7 +448,8 @@ namespace TensorSharp.Server
             int maxTokens,
             SamplingConfig turnSampling,
             SamplingConfig samplingConfig,
-            bool enableThinking)
+            bool enableThinking,
+            ILogger logger)
         {
             var agentTurn = new ChatTurnContext
             {
@@ -472,6 +473,16 @@ namespace TensorSharp.Server
                     else
                         collected.Add(update);
                 }
+
+                // The pipeline's own chat.complete line cannot say whose round it was, and
+                // concurrent agents interleave; this one can, so per-agent KV reuse and
+                // decode speed are readable straight from the log.
+                logger?.LogInformation(LogEventIds.SkillToolInvoked,
+                    "agents.round id={Id} fork={Fork} promptTokens={PromptTokens} kvReused={KvReused} evalTokens={EvalTokens} ttftMs={TtftMs} tokensPerSec={TokensPerSec:F1} finishReason={FinishReason}",
+                    launch.AgentId, launch.ForkContext, terminal.PromptTokens, terminal.KvCacheReusedTokens,
+                    terminal.EvalTokens, terminal.PromptNs / 1_000_000,
+                    terminal.EvalNs > 0 ? terminal.EvalTokens / (terminal.EvalNs / 1e9) : 0.0,
+                    terminal.FinishReason ?? "-");
 
                 ParsedOutput parsed = collected.Resolve(architecture, enableThinking, tools);
                 return new SkillTurnOutput(parsed, terminal.RawOutputTokens)

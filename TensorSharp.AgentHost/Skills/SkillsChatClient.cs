@@ -22,6 +22,7 @@ using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using TensorSharp.Runtime.Logging;
 
+using TensorSharp.AgentHost.Agents;
 using TensorSharp.Runtime;
 namespace TensorSharp.AgentHost.Skills
 {
@@ -85,6 +86,13 @@ namespace TensorSharp.AgentHost.Skills
 
         /// <summary>Loop bounds for local delivery.</summary>
         public SkillAgentLoopOptions LoopOptions { get; init; } = SkillAgentLoopOptions.Default;
+
+        /// <summary>
+        /// Offer the sub-agent tools on locally delivered requests: the model may start
+        /// sub-agents, each running its own tool loop against the same endpoint, concurrently.
+        /// Null or disabled — the default — declares nothing.
+        /// </summary>
+        public SubAgentOptions? SubAgents { get; init; }
 
         /// <summary>Advertise skills the request did not select, so the model can pick one up.</summary>
         public bool Discovery { get; init; } = true;
@@ -340,6 +348,22 @@ namespace TensorSharp.AgentHost.Skills
 
         // ---- local delivery ----------------------------------------------------
 
+        /// <summary>Token usage summed across concurrent generations (a turn and its sub-agents).</summary>
+        private sealed class UsageTally
+        {
+            private int _prompt;
+            private int _completion;
+
+            public int Prompt => Volatile.Read(ref _prompt);
+            public int Completion => Volatile.Read(ref _completion);
+
+            public void Add(int prompt, int completion)
+            {
+                Interlocked.Add(ref _prompt, prompt);
+                Interlocked.Add(ref _completion, completion);
+            }
+        }
+
         private async Task<SkillsChatResponse> CompleteLocallyAsync(
             SkillsChatRequest request,
             CancellationToken cancellationToken)
@@ -374,34 +398,60 @@ namespace TensorSharp.AgentHost.Skills
             List<ToolFunction> tools = SkillTools.Merge(request.Tools, allowScripts: false, out _);
 
             var context = new SkillToolContext(plan.Reachable.ToList());
-            int promptTokens = 0, completionTokens = 0;
+            var usage = new UsageTally();
             string? finishReason = null;
 
-            SkillLoopResult loop = await SkillAgentLoop.RunAsync(
-                messages,
-                tools,
-                context,
-                async (turnMessages, turnTools, ct) =>
-                {
-                    string payload = BuildPayload(
-                        request, turnMessages, turnTools,
-                        includeSkillsField: false,
-                        suppressServerSkills: suppressServerSkills);
-                    OpenAiReply reply = await PostAsync(payload, ct).ConfigureAwait(false);
-                    promptTokens += reply.PromptTokens;
-                    completionTokens += reply.CompletionTokens;
+            // One generation against the endpoint. Sub-agents use the same call — the
+            // endpoint is stateless — and only count toward usage: the finish reason the
+            // caller gets is the top-level agent's own.
+            SkillTurnGenerator Generate(bool topLevel) => async (turnMessages, turnTools, ct) =>
+            {
+                string payload = BuildPayload(
+                    request, turnMessages, turnTools,
+                    includeSkillsField: false,
+                    suppressServerSkills: suppressServerSkills);
+                OpenAiReply reply = await PostAsync(payload, ct).ConfigureAwait(false);
+                usage.Add(reply.PromptTokens, reply.CompletionTokens);
+                if (topLevel)
                     finishReason = reply.FinishReason;
-                    return new SkillTurnOutput(new ParsedOutput
-                    {
-                        Content = reply.Content,
-                        Thinking = reply.Thinking ?? string.Empty,
-                        ToolCalls = reply.ToolCalls.Count > 0 ? reply.ToolCalls.ToList() : null,
-                    });
-                },
-                // The request's OWN tools, so a name the model invented is answered in
-                // the loop rather than returned to a caller that never declared it.
-                _options.LoopOptions.WithClientTools(request.Tools),
-                cancellationToken).ConfigureAwait(false);
+                return new SkillTurnOutput(new ParsedOutput
+                {
+                    Content = reply.Content,
+                    Thinking = reply.Thinking ?? string.Empty,
+                    ToolCalls = reply.ToolCalls.Count > 0 ? reply.ToolCalls.ToList() : null,
+                });
+            };
+
+            // The request's OWN tools, so a name the model invented is answered in the
+            // loop rather than returned to a caller that never declared it.
+            SkillAgentLoopOptions loopOptions = _options.LoopOptions.WithClientTools(request.Tools);
+
+            SubAgentRuntime? agents = null;
+            if (_options.SubAgents is { Enabled: true } subAgentOptions)
+            {
+                foreach (ToolFunction declaration in SubAgentTools.Declare())
+                {
+                    // The caller's own tool of the same name wins, as for every built-in.
+                    if (!tools.Any(t => string.Equals(t?.Name, declaration.Name, StringComparison.OrdinalIgnoreCase)))
+                        tools.Add(declaration);
+                }
+                agents = new SubAgentRuntime(
+                    subAgentOptions,
+                    new SubAgentHostBinding { CreateGenerator = _ => Generate(topLevel: false), LoopOptions = loopOptions },
+                    context,
+                    logger: null,
+                    cancellationToken);
+                context = agents.RootContext;
+            }
+
+            SkillLoopResult loop;
+            using (agents)
+            {
+                loop = await SkillAgentLoop.RunAsync(
+                    messages, tools, context, Generate(topLevel: true), loopOptions, cancellationToken)
+                    .ConfigureAwait(false);
+            }
+            int promptTokens = usage.Prompt, completionTokens = usage.Completion;
 
             ParsedOutput final = loop.Output.Parsed ?? new ParsedOutput();
             loop.Messages.Add(new ChatMessage
