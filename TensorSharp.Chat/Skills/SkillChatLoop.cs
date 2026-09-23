@@ -342,18 +342,17 @@ namespace TensorSharp.Server.Skills
                         }
                         else
                         {
-                            IReadOnlyList<string> stopped = agents.StopOutstanding();
+                            string note = SubAgentConversation.EndWithoutRound(agents);
                             if (heldForAgents != null)
                             {
                                 foreach (ChatStreamUpdate held in heldForAgents)
                                     yield return held;
                                 heldForAgents = null;
                             }
-                            if (stopped.Count > 0)
+                            if (note != null)
                             {
                                 yield return ChatStreamUpdate.Parsed(
-                                    (content.Length == 0 ? string.Empty : "\n\n")
-                                    + "_(" + DescribeStoppedAgents(stopped) + ")_", null, null);
+                                    (content.Length == 0 ? string.Empty : "\n\n") + note, null, null);
                             }
                         }
                     }
@@ -1513,13 +1512,6 @@ namespace TensorSharp.Server.Skills
                 "finished", SkillToolNames.WaitAgent, seconds: clock.Elapsed.TotalSeconds);
             onHandover(handover);
         }
-
-        /// <summary>What the user is told when sub-agents were stopped because the turn ran out of rounds.</summary>
-        private static string DescribeStoppedAgents(IReadOnlyList<string> stopped) =>
-            "Sub-agent" + (stopped.Count == 1 ? " " : "s ") + string.Join(", ", stopped)
-            + (stopped.Count == 1 ? " was" : " were")
-            + " still working when this turn ran out of rounds and " + (stopped.Count == 1 ? "was" : "were")
-            + " stopped; this answer does not include " + (stopped.Count == 1 ? "its" : "their") + " results.";
 
         /// <summary>
         /// Wrap a tool result in the message shape this model family renders. Mistral 3

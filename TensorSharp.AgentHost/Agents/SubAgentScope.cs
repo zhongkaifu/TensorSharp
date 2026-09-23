@@ -121,6 +121,13 @@ namespace TensorSharp.AgentHost.Agents
 
         /// <summary>Stop every sub-agent of this agent that is still working. Returns their ids.</summary>
         public IReadOnlyList<string> StopOutstanding() => _runtime.StopOutstanding(this);
+
+        /// <summary>
+        /// Finished sub-agents' results this agent was never given, as plain text for the
+        /// user, marking them delivered; null when there are none.
+        /// </summary>
+        public string? TakeUndeliveredResultsText(out IReadOnlyList<string> ids) =>
+            _runtime.TakeUndeliveredResultsText(this, out ids);
     }
 
     /// <summary>
@@ -176,6 +183,45 @@ namespace TensorSharp.AgentHost.Agents
             foreach (string message in deliveries.Messages)
                 working.Add(new ChatMessage { Role = "user", Content = message });
             return true;
+        }
+
+        /// <summary>
+        /// A turn that must END with sub-agents outstanding and no round left to hand their
+        /// results to the model: stop the ones still working, take the results of the ones
+        /// that finished but were never given to it, and return what the USER must be told
+        /// about both — or null when nothing was outstanding.
+        /// </summary>
+        /// <remarks>
+        /// The two cases are different facts and the note says which is which: a stopped
+        /// agent's work is missing, while a finished one's work exists and is shown here,
+        /// just not used by the answer above it. Dropping the second silently was the
+        /// original behaviour, and it lost a result that had already been paid for.
+        /// </remarks>
+        public static string? EndWithoutRound(SubAgentScope? scope)
+        {
+            if (scope is not { HasOutstandingWork: true })
+                return null;
+
+            IReadOnlyList<string> stopped = scope.StopOutstanding();
+            string? late = scope.TakeUndeliveredResultsText(out IReadOnlyList<string> lateIds);
+
+            var parts = new List<string>();
+            if (stopped.Count > 0)
+            {
+                bool one = stopped.Count == 1;
+                parts.Add("(Sub-agent" + (one ? " " : "s ") + string.Join(", ", stopped)
+                    + (one ? " was" : " were") + " still working when this turn ran out of rounds and "
+                    + (one ? "was" : "were") + " stopped; this answer does not include "
+                    + (one ? "its" : "their") + " results.)");
+            }
+            if (late != null)
+            {
+                bool one = lateIds.Count == 1;
+                parts.Add("(Sub-agent" + (one ? " " : "s ") + string.Join(", ", lateIds)
+                    + " finished after this answer was written, so this answer does not use "
+                    + (one ? "its" : "their") + " results. " + (one ? "It" : "They") + " reported:)\n" + late);
+            }
+            return parts.Count == 0 ? null : string.Join("\n\n", parts);
         }
 
         /// <summary>

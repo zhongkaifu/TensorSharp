@@ -476,6 +476,7 @@ namespace TensorSharp.AgentHost.Agents
             var stopping = new List<CancellationTokenSource>();
             string closedId;
             int cascaded;
+            string? unseenAnswer = null;
             lock (_gate)
             {
                 if (!TryResolveOwnedLocked(caller, id, out SubAgent? agent, out string? error))
@@ -484,6 +485,10 @@ namespace TensorSharp.AgentHost.Agents
                 previous = agent.Status;
                 if (previous == SubAgentStatus.Closed)
                     return SkillToolResult.Success(closedId + " was already closed.");
+                // An answer the caller has not seen would vanish with the agent. Closing
+                // means "stop working", not "discard what you already produced".
+                if (agent.HasUndeliveredResult)
+                    unseenAnswer = DescribeResultLocked(agent);
                 CloseLocked(agent, stopping);
                 cascaded = stopping.Count - 1;
             }
@@ -500,7 +505,7 @@ namespace TensorSharp.AgentHost.Agents
                 reply += " " + cascaded.ToString(CultureInfo.InvariantCulture)
                        + (cascaded == 1 ? " agent it had started was" : " agents it had started were") + " closed too.";
             }
-            return SkillToolResult.Success(reply);
+            return SkillToolResult.Success(unseenAnswer == null ? reply : unseenAnswer + "\n\n" + reply);
         }
 
         internal SkillToolResult List(SubAgentScope caller)
@@ -567,6 +572,25 @@ namespace TensorSharp.AgentHost.Agents
                 return notification == null && messages.Count == 0
                     ? SubAgentDeliveries.None
                     : new SubAgentDeliveries(notification, messages);
+            }
+        }
+
+        /// <summary>
+        /// The results of the caller's finished sub-agents it has not been given, as plain
+        /// text for a USER to read (no notification tags), marking them delivered; null when
+        /// there are none. For a turn that has no round left to hand them to the model.
+        /// </summary>
+        internal string? TakeUndeliveredResultsText(SubAgentScope caller, out IReadOnlyList<string> ids)
+        {
+            lock (_gate)
+            {
+                List<SubAgent> ready = ChildrenLocked(caller).Where(a => a.HasUndeliveredResult).ToList();
+                ids = ready.Select(a => a.Id).ToList();
+                if (ready.Count == 0)
+                    return null;
+                foreach (SubAgent agent in ready)
+                    _logger?.LogInformation(LogEventIds.SkillToolInvoked, "agents.deliver id={Id} via=answer-note", agent.Id);
+                return string.Join("\n\n", ready.Select(DescribeResultLocked));
             }
         }
 

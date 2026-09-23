@@ -349,8 +349,11 @@ public class SubAgentRuntimeTests
         Assert.True(h.Launches.Single().ForkContext);
         await child.Entered(1).Within();
 
+        // The copied conversation, every call of the spawning turn answered, and then the
+        // task as a USER turn: a model reads a tool result as the end of a step it took,
+        // and a fork whose task arrived there ended its turn on its first token.
         SubAgentGeneration first = child.Call(1);
-        Assert.Equal(new[] { "system", "user", "assistant", "tool", "tool", "tool" }, first.Roles);
+        Assert.Equal(new[] { "system", "user", "assistant", "tool", "tool", "tool", "user" }, first.Roles);
         Assert.Equal("the user's own request", first.Contents[1]);
 
         ChatMessage copied = first.Messages[2];
@@ -366,10 +369,11 @@ public class SubAgentRuntimeTests
         Assert.Equal(before.Id, first.Messages[3].ToolCallId);
         Assert.Equal("lookup result A", first.Contents[3]);
         Assert.Equal(spawn.Id, first.Messages[4].ToolCallId);
-        Assert.StartsWith("You are agent_1, a sub-agent. You were forked from the conversation above", first.Contents[4], StringComparison.Ordinal);
-        Assert.EndsWith("Task:\nFix the parser.", first.Contents[4], StringComparison.Ordinal);
+        Assert.Equal("agent_1 started with a copy of this conversation.", first.Contents[4]);
         Assert.Equal(after.Id, first.Messages[5].ToolCallId);
         Assert.Equal("(The result of this call is not shown to the sub-agent.)", first.Contents[5]);
+        Assert.StartsWith("You are agent_1, a sub-agent. You were forked from the conversation above", first.Contents[6], StringComparison.Ordinal);
+        Assert.EndsWith("Task:\nFix the parser.", first.Contents[6], StringComparison.Ordinal);
     }
 
     [Fact]
@@ -391,8 +395,9 @@ public class SubAgentRuntimeTests
         await child.Entered(1).Within();
 
         SubAgentGeneration first = child.Call(1);
-        Assert.Equal(new[] { "system", "user", "assistant", "user" }, first.Roles);
-        Assert.StartsWith("Result of your spawn_agent call:\n\nYou are agent_1, a sub-agent. You were forked", first.LastContent, StringComparison.Ordinal);
+        Assert.Equal(new[] { "system", "user", "assistant", "user", "user" }, first.Roles);
+        Assert.Equal("Result of your spawn_agent call:\n\nagent_1 started with a copy of this conversation.", first.Contents[3]);
+        Assert.StartsWith("You are agent_1, a sub-agent. You were forked", first.LastContent, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -1039,6 +1044,23 @@ public class SubAgentRuntimeTests
         SkillToolResult spawned = await h.Spawn("two").Within();
         Assert.True(spawned.Ok, spawned.Content);
         Assert.StartsWith("agent_2 started", spawned.Content, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Close_OfAFinishedChildWhoseAnswerWasNeverDelivered_HandsTheAnswerOver()
+    {
+        using var h = new SubAgentHarness();
+        h.Script("agent_1", Steps.Answer("the unseen answer"));
+        await h.Spawn("one").Within();
+        await h.WaitForStatusAsync("agent_1", SubAgentStatus.Completed).Within();
+
+        // Closing means "stop working", not "discard what was already produced".
+        SkillToolResult closed = await h.Root(SkillToolNames.CloseAgent, ("target", "agent_1")).Within(2);
+        Assert.True(closed.Ok, closed.Content);
+        Assert.StartsWith("agent_1 completed in ", closed.Content, StringComparison.Ordinal);
+        Assert.Contains("the unseen answer", closed.Content, StringComparison.Ordinal);
+        Assert.EndsWith("agent_1 closed; it was completed.", closed.Content, StringComparison.Ordinal);
+        Assert.True(h.Runtime.Root.TakePendingDeliveries().IsEmpty);
     }
 
     [Fact]

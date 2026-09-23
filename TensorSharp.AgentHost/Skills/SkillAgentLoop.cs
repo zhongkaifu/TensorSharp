@@ -281,7 +281,7 @@ namespace TensorSharp.AgentHost.Skills
                         }
                         else
                         {
-                            output = WithStoppedAgentsNote(output, agents.StopOutstanding());
+                            output = WithNote(output, SubAgentConversation.EndWithoutRound(agents));
                         }
                     }
 
@@ -419,19 +419,15 @@ namespace TensorSharp.AgentHost.Skills
         };
 
         /// <summary>
-        /// The answer, plus what the user must be told when sub-agents were still working
-        /// as the turn ran out of rounds: they were stopped, so the answer may be missing
-        /// what they were doing. Appended, never substituted, and never silent.
+        /// The answer, plus what the user must be told about sub-agents the turn ended
+        /// without (see <see cref="SubAgentConversation.EndWithoutRound"/>). Appended, never
+        /// substituted, and never silent.
         /// </summary>
-        private static SkillTurnOutput WithStoppedAgentsNote(SkillTurnOutput output, IReadOnlyList<string> stopped)
+        private static SkillTurnOutput WithNote(SkillTurnOutput output, string? note)
         {
-            if (stopped.Count == 0)
+            if (string.IsNullOrEmpty(note))
                 return output;
             ParsedOutput parsed = output.Parsed ?? new ParsedOutput();
-            string note = "(Sub-agent" + (stopped.Count == 1 ? " " : "s ") + string.Join(", ", stopped)
-                + (stopped.Count == 1 ? " was" : " were")
-                + " still working when this turn ran out of rounds and " + (stopped.Count == 1 ? "was" : "were")
-                + " stopped; this answer does not include " + (stopped.Count == 1 ? "its" : "their") + " results.)";
             string said = parsed.Content ?? string.Empty;
             parsed.Content = said.Length == 0 ? note : said.TrimEnd() + "\n\n" + note;
             return output with { Parsed = parsed };

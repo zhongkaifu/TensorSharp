@@ -99,7 +99,7 @@ public class SubAgentLoopTests
 
         Assert.Equal("done", result.Output.Parsed!.Content);
         SubAgentGeneration first = child.Call(1);
-        Assert.Equal(new[] { "system", "developer", "user", "assistant", "tool" }, first.Roles);
+        Assert.Equal(new[] { "system", "developer", "user", "assistant", "tool", "user" }, first.Roles);
         Assert.Equal(SubAgentHarness.UserRequest, first.Contents[2]);
         Assert.Equal(new[] { 7, 8, 9 }, first.Messages[3].RawOutputTokens);
         Assert.Equal("Delegating.", first.Contents[3]);
@@ -191,8 +191,7 @@ public class SubAgentLoopTests
     /// stopped child) or one extra forced generation (as the tool-call round limit already
     /// does) is the author's call; this pins only that the answer is not silent about it.
     /// </summary>
-    [Fact(Skip = "Known defect (reported): SkillAgentLoop's last-round guard only notes STOPPED children; "
-               + "a child that finished during the last generation is silently dropped.")]
+    [Fact]
     public async Task EndOfTurnGuard_WithNoRoundLeft_ACompletedButUnseenChildIsNotDroppedSilently()
     {
         using var h = new SubAgentHarness();
@@ -209,7 +208,12 @@ public class SubAgentLoopTests
 
         SkillLoopResult result = await RunParent(h, parent, new SkillAgentLoopOptions { MaxRounds = 2 }).Within();
 
-        Assert.Contains("agent_1", result.Output.Parsed!.Content, StringComparison.Ordinal);
+        // Its result exists and was paid for: the user is shown it, and told the answer
+        // above does not use it — and it is delivered exactly once, here.
+        string answer = result.Output.Parsed!.Content;
+        Assert.StartsWith("done\n\n(Sub-agent agent_1 finished after this answer was written", answer, StringComparison.Ordinal);
+        Assert.Contains("child answer", answer, StringComparison.Ordinal);
+        Assert.True(h.Runtime.Root.TakePendingDeliveries().IsEmpty);
     }
 
     [Fact]
