@@ -88,6 +88,13 @@ namespace TensorSharp.AgentHost.Agents
         /// rendered, and which tools belong to the caller. Null uses the loop defaults.
         /// </summary>
         public SkillAgentLoopOptions? LoopOptions { get; init; }
+
+        /// <summary>
+        /// Called after each tool call a sub-agent makes, with the agent's id — so a host
+        /// can surface what its agents produced (a Web UI offers their files for download)
+        /// the way it surfaces its own agent's calls. May be called from worker threads.
+        /// </summary>
+        public Action<string, SkillToolInvocation>? OnAgentInvocation { get; init; }
     }
 
     /// <summary>
@@ -131,7 +138,7 @@ namespace TensorSharp.AgentHost.Agents
     /// for whom" answerable at all.
     /// </para>
     /// </summary>
-    public sealed class SubAgentRuntime : IDisposable
+    public sealed class SubAgentRuntime : IDisposable, IAsyncDisposable
     {
         /// <summary>
         /// Longest final answer handed back verbatim. Past it the answer is cut and the
@@ -287,6 +294,7 @@ namespace TensorSharp.AgentHost.Agents
                     message, fork, _turnCts.Token);
                 agent.Scope = new SubAgentScope(this, agent);
                 agent.Tools = tools;
+                agent.LaneId = agent.Id + "-" + _laneTag;
                 bool forked = false;
                 agent.History = fork
                     ? BuildForkedHistory(conversation, call, agent, _binding.LoopOptions?.ToolResultsAreRendered ?? true, out forked)
@@ -488,7 +496,7 @@ namespace TensorSharp.AgentHost.Agents
                 // An answer the caller has not seen would vanish with the agent. Closing
                 // means "stop working", not "discard what you already produced".
                 if (agent.HasUndeliveredResult)
-                    unseenAnswer = DescribeResultLocked(agent);
+                    unseenAnswer = DescribeResultLocked(agent, followUpPossible: false);
                 CloseLocked(agent, stopping);
                 cascaded = stopping.Count - 1;
             }
@@ -590,7 +598,7 @@ namespace TensorSharp.AgentHost.Agents
                     return null;
                 foreach (SubAgent agent in ready)
                     _logger?.LogInformation(LogEventIds.SkillToolInvoked, "agents.deliver id={Id} via=answer-note", agent.Id);
-                return string.Join("\n\n", ready.Select(DescribeResultLocked));
+                return string.Join("\n\n", ready.Select(a => DescribeResultLocked(a, followUpPossible: false)));
             }
         }
 
@@ -681,9 +689,42 @@ namespace TensorSharp.AgentHost.Agents
 
         private void Start(SubAgent agent)
         {
+            // The worker holds the workspace open for as long as it runs. A request that
+            // is abandoned, or a chat that is reset, releases its workspace; without this
+            // the directory was deleted under a sub-agent's running command, and the
+            // agent's next call then recreated it — a workspace the host had already let go.
+            IDisposable? lease = null;
+            try
+            {
+                lease = _baseContext.Workspace?.BeginOperation();
+            }
+            catch (ObjectDisposedException)
+            {
+                lock (_gate)
+                {
+                    agent.Status = SubAgentStatus.Errored;
+                    agent.Result = "this conversation's workspace was released before the agent could start.";
+                    agent.Delivered = false;
+                    agent.FinishedAt = Stopwatch.GetTimestamp();
+                    agent.FinishOrder = ++_finishCounter;
+                }
+                Signal();
+                return;
+            }
+
             // Task.Run, not a bare call: the loop's first await would otherwise run the
             // agent's first generation setup on the parent's tool thread.
-            agent.Worker = Task.Run(() => RunAsync(agent));
+            agent.Worker = Task.Run(async () =>
+            {
+                try
+                {
+                    await RunAsync(agent).ConfigureAwait(false);
+                }
+                finally
+                {
+                    lease?.Dispose();
+                }
+            });
         }
 
         private async Task RunAsync(SubAgent agent)
@@ -695,7 +736,8 @@ namespace TensorSharp.AgentHost.Agents
             {
                 // Inside the try: a workspace released under the turn must fail this
                 // agent visibly, not leave it "running" with a faulted worker forever.
-                SkillToolContext context = _baseContext.ForSubAgent(agent.Scope, agent.Id + "-" + _laneTag);
+                SkillToolContext context = _baseContext.ForSubAgent(agent.Scope, agent.LaneId, token);
+                bool continuation = false;
                 while (true)
                 {
                     token.ThrowIfCancellationRequested();
@@ -705,14 +747,21 @@ namespace TensorSharp.AgentHost.Agents
                         if (agent.Status == SubAgentStatus.Closed)
                             return;
                         agent.Status = SubAgentStatus.Running;
-                        agent.Turns++;
-                        agent.StartedAt = Stopwatch.GetTimestamp();
-                        agent.TurnRounds = 0;
-                        agent.TurnInvocations.Clear();
+                        // A message steered in while the agent finished is the SAME task
+                        // carrying on: its record keeps the rounds and tools already spent,
+                        // or the parent is told a working agent "called no tools".
+                        if (!continuation)
+                        {
+                            agent.Turns++;
+                            agent.StartedAt = Stopwatch.GetTimestamp();
+                            agent.TurnRounds = 0;
+                            agent.TurnInvocations.Clear();
+                        }
                         input = agent.History;
                     }
                     Signal();
-                    Report(agent, agent.Turns == 1 ? "started" : "working on a follow-up");
+                    if (!continuation)
+                        Report(agent, agent.Turns == 1 ? "started" : "working on a follow-up");
 
                     SkillLoopResult result = await SkillAgentLoop.RunAsync(
                         input, agent.Tools?.ToList(), context, agent.Generator!, loopOptions, token).ConfigureAwait(false);
@@ -762,7 +811,10 @@ namespace TensorSharp.AgentHost.Agents
                     }
 
                     if (again)
+                    {
+                        continuation = true;
                         continue;
+                    }
 
                     // Report before Signal: the signal is what wakes a wait_agent, which
                     // then unregisters its tap, so the other order lets the one line a
@@ -846,10 +898,16 @@ namespace TensorSharp.AgentHost.Agents
                         : new ChatMessage { Role = "user", Content = "Result of your " + call.Name + " call:\n\n" + refusal });
                 }
 
-                int rounds = result.Rounds;
-                result = await SkillAgentLoop.RunAsync(
+                // The earlier run's rounds AND tool calls: the record the parent is given,
+                // and the empty-turn check below, both read them.
+                SkillLoopResult previous = result;
+                SkillLoopResult next = await SkillAgentLoop.RunAsync(
                     messages, agent.Tools?.ToList(), context, agent.Generator!, loopOptions, token).ConfigureAwait(false);
-                result = result with { Rounds = result.Rounds + rounds };
+                result = next with
+                {
+                    Rounds = next.Rounds + previous.Rounds,
+                    Invocations = previous.Invocations.Concat(next.Invocations).ToList(),
+                };
             }
             return result;
         }
@@ -910,12 +968,15 @@ namespace TensorSharp.AgentHost.Agents
                 RawPromptTrailingWhitespace = result.Output.RawPromptTrailingWhitespace,
                 RawGenerationSuffix = result.Output.RawGenerationSuffix,
             });
-            messages.Add(new ChatMessage { Role = "user", Content = correction });
+            messages.Add(HostAuthoredUserMessage.Create(correction));
 
-            int rounds = result.Rounds;
             SkillLoopResult corrected = await SkillAgentLoop.RunAsync(
                 messages, agent.Tools?.ToList(), context, agent.Generator!, loopOptions, token).ConfigureAwait(false);
-            return corrected with { Rounds = corrected.Rounds + rounds };
+            return corrected with
+            {
+                Rounds = corrected.Rounds + result.Rounds,
+                Invocations = result.Invocations.Concat(corrected.Invocations).ToList(),
+            };
         }
 
         private SkillAgentLoopOptions ChildLoopOptions(SubAgent agent)
@@ -932,6 +993,8 @@ namespace TensorSharp.AgentHost.Agents
                     Report(agent, "round " + invocation.Round.ToString(CultureInfo.InvariantCulture) + ": "
                         + invocation.Tool + (invocation.Ok ? string.Empty : " (failed)"));
                     baseOptions.OnInvocation?.Invoke(invocation);
+                    try { _binding.OnAgentInvocation?.Invoke(agent.Id, invocation); }
+                    catch (Exception ex) when (ex is not OutOfMemoryException) { /* a host tap must never fail an agent */ }
                 },
             };
         }
@@ -1171,19 +1234,27 @@ namespace TensorSharp.AgentHost.Agents
                 agent.FinishedAt = Stopwatch.GetTimestamp();
         }
 
-        private string DescribeResultLocked(SubAgent agent)
+        /// <param name="agent">A finished agent; marked delivered.</param>
+        /// <param name="followUpPossible">
+        /// False when nobody can act on "ask it again": the agent is being closed, or the
+        /// text goes to the USER, who has no agent tools. Then the answer is not cut down
+        /// to an excerpt that could never be completed, and no hint names a tool.
+        /// </param>
+        private string DescribeResultLocked(SubAgent agent, bool followUpPossible = true)
         {
             agent.Delivered = true;
             string elapsed = FormatSpan(agent.StartedAt, agent.FinishedAt);
             if (agent.Status == SubAgentStatus.Errored)
             {
                 return agent.Id + " failed after " + elapsed + ": " + Abbreviate(agent.Result ?? "unknown error", 900)
-                     + "\nIf you still need its result, give it the task again with " + SkillToolNames.SendInput
-                     + " or do the task yourself.";
+                     + (followUpPossible
+                         ? "\nIf you still need its result, give it the task again with " + SkillToolNames.SendInput
+                           + " or do the task yourself."
+                         : string.Empty);
             }
 
             string answer = agent.Result ?? string.Empty;
-            if (answer.Length > MaxResultChars)
+            if (followUpPossible && answer.Length > MaxResultChars)
             {
                 answer = answer.Substring(0, MaxResultChars)
                     + "\n[... truncated: the full answer is " + agent.Result!.Length.ToString(CultureInfo.InvariantCulture)
@@ -1351,46 +1422,106 @@ namespace TensorSharp.AgentHost.Agents
         }
 
         /// <summary>
-        /// End the turn: stop every agent still working and give them a moment to let go
-        /// of the engine and the workspace before the request that owns both is released.
+        /// End the turn without blocking a thread: stop every agent still working, give
+        /// them a moment to let go of the engine and the workspace, and retire the
+        /// workspace lanes of those that did.
+        /// </summary>
+        public async ValueTask DisposeAsync()
+        {
+            if (!BeginDispose(out Task[] workers, out List<SubAgentSnapshot> summary))
+                return;
+            if (workers.Length > 0)
+            {
+                Task all = Task.WhenAll(workers);
+                await Task.WhenAny(all, Task.Delay(DisposeGrace)).ConfigureAwait(false);
+                // Observe a faulted worker so it cannot surface as unobserved; each
+                // worker records its own outcome.
+                _ = all.ContinueWith(t => _ = t.Exception, TaskScheduler.Default);
+            }
+            CompleteDispose(summary);
+        }
+
+        /// <summary>
+        /// End the turn from a caller that cannot await (the CLI): the same as
+        /// <see cref="DisposeAsync"/>, blocking for at most the grace period.
         /// </summary>
         public void Dispose()
         {
-            Task[] workers;
-            List<SubAgentSnapshot> summary;
-            lock (_gate)
-            {
-                if (_disposed)
-                    return;
-                _disposed = true;
-                workers = _agents.Values.Select(a => a.Worker).Where(t => t != null).Cast<Task>().ToArray();
-                summary = _agents.Values.Select(a => a.ToSnapshot()).ToList();
-            }
-
-            int stillWorking = summary.Count(a => a.Status is SubAgentStatus.Starting or SubAgentStatus.Running);
-            _turnCts.Cancel();
-            Signal();
+            if (!BeginDispose(out Task[] workers, out List<SubAgentSnapshot> summary))
+                return;
             try
             {
                 if (workers.Length > 0)
                     Task.WaitAll(workers, DisposeGrace);
             }
             catch (AggregateException) { /* each worker records its own outcome */ }
+            CompleteDispose(summary);
+        }
 
+        private bool BeginDispose(out Task[] workers, out List<SubAgentSnapshot> summary)
+        {
+            lock (_gate)
+            {
+                if (_disposed)
+                {
+                    workers = Array.Empty<Task>();
+                    summary = new List<SubAgentSnapshot>();
+                    return false;
+                }
+                _disposed = true;
+                workers = _agents.Values.Select(a => a.Worker).Where(t => t != null).Cast<Task>().ToArray();
+                summary = _agents.Values.Select(a => a.ToSnapshot()).ToList();
+            }
+            _turnCts.Cancel();
+            Signal();
+            return true;
+        }
+
+        private void CompleteDispose(List<SubAgentSnapshot> summary)
+        {
+            // A lane lives as long as its workspace, which is the whole conversation, and
+            // every turn's agents get new ones. Retire each finished agent's lane now —
+            // its shell session, read ledger and state directory — or a long chat piles
+            // them up turn after turn. A worker still running past the grace period keeps
+            // its lane; the conversation's release takes it.
+            List<string> retire;
+            lock (_gate)
+            {
+                retire = _agents.Values
+                    .Where(a => a.Worker == null || a.Worker.IsCompleted)
+                    .Select(a => a.LaneId)
+                    .Where(id => id.Length > 0)
+                    .ToList();
+            }
+            if (_baseContext.Workspace is { } workspace)
+            {
+                foreach (string lane in retire)
+                {
+                    try { workspace.RetireLane(lane); }
+                    catch (Exception ex) when (ex is not OutOfMemoryException)
+                    {
+                        _logger?.LogDebug(LogEventIds.SkillToolInvoked, ex, "agents.lane-retire-failed lane={Lane}", lane);
+                    }
+                }
+            }
+
+            int stillWorking = summary.Count(a => a.Status is SubAgentStatus.Starting or SubAgentStatus.Running);
+            int unseen = summary.Count(a => !a.ResultDelivered && a.Status is SubAgentStatus.Completed or SubAgentStatus.Errored);
             if (summary.Count > 0)
             {
                 _logger?.LogInformation(LogEventIds.SkillToolInvoked,
-                    "agents.turn spawned={Spawned} completed={Completed} failed={Failed} closed={Closed} stoppedAtTurnEnd={Stopped}",
+                    "agents.turn spawned={Spawned} completed={Completed} failed={Failed} closed={Closed} stoppedAtTurnEnd={Stopped} undeliveredAtTurnEnd={Unseen}",
                     summary.Count,
                     summary.Count(a => a.Status == SubAgentStatus.Completed),
                     summary.Count(a => a.Status == SubAgentStatus.Errored),
                     summary.Count(a => a.Status == SubAgentStatus.Closed),
-                    stillWorking);
-                if (stillWorking > 0)
+                    stillWorking,
+                    unseen);
+                if (stillWorking > 0 || unseen > 0)
                 {
                     _logger?.LogWarning(LogEventIds.SkillToolInvoked,
-                        "agents.turn-ended-with-work stopped={Stopped} - the turn ended while sub-agents were still working; their results were discarded",
-                        stillWorking);
+                        "agents.turn-ended-with-work stopped={Stopped} undelivered={Unseen} - the turn ended while sub-agents were still working or held answers nobody had read; those results were discarded",
+                        stillWorking, unseen);
                 }
             }
             // _turnCts is deliberately not disposed: a worker that outlived the grace
@@ -1429,6 +1560,9 @@ namespace TensorSharp.AgentHost.Agents
         public CancellationTokenSource Cts { get; }
         public SubAgentScope Scope { get; set; } = null!;
         public IReadOnlyList<ToolFunction>? Tools { get; set; }
+
+        /// <summary>The workspace lane this agent's tools run in; unique across the conversation.</summary>
+        public string LaneId { get; set; } = string.Empty;
         public SkillTurnGenerator? Generator { get; set; }
         public Task? Worker { get; set; }
         public List<ChatMessage> History { get; set; } = new();

@@ -67,6 +67,9 @@ namespace TensorSharp.AgentHost.Skills
         /// </summary>
         private static int s_unconfinedHostWarned;
 
+        /// <summary>Set for a sub-agent's copy: a script whose agent was stopped while it waited never starts.</summary>
+        private readonly CancellationToken _stop;
+
         public SkillScriptRunner(SkillScriptRunnerOptions? options = null, ILogger? logger = null)
         {
             _options = options ?? new SkillScriptRunnerOptions();
@@ -78,6 +81,47 @@ namespace TensorSharp.AgentHost.Skills
             // in-process runtime with honest capabilities satisfy `required`.
             _backend = _options.Backend ?? ProcessShellBackend.Detect(_options.Sandbox, _logger);
             _sandbox = _options.Sandbox == SkillSandboxMode.Off ? null : _backend.Sandbox;
+        }
+
+        private SkillScriptRunner(
+            SkillScriptRunnerOptions options, ILogger logger, IShellBackend backend, ISkillSandbox? sandbox,
+            CancellationToken stop)
+        {
+            _options = options;
+            _logger = logger;
+            _backend = backend;
+            _sandbox = sandbox;
+            _stop = stop;
+        }
+
+        /// <summary>
+        /// This runner as a sub-agent uses it: the same backend and sandbox, with the
+        /// agent's own lane of the workspace — so the rebuilt-directory notice and the
+        /// read records of a script it runs are the agent's, not its parent's — the agent's
+        /// code runner for installs, and its stop token checked once the workspace's
+        /// execution lock is held.
+        /// </summary>
+        internal SkillScriptRunner ForAgent(SessionWorkspace? lane, ICodeRunner? packageInstaller, CancellationToken stop)
+        {
+            var options = new SkillScriptRunnerOptions
+            {
+                Sandbox = _options.Sandbox,
+                Backend = _backend,
+                AllowNetwork = _options.AllowNetwork,
+                Timeout = _options.Timeout,
+                MaxOutputBytes = _options.MaxOutputBytes,
+                ScratchDirectory = _options.ScratchDirectory,
+                DeleteScratchDirectory = _options.DeleteScratchDirectory,
+                ReadablePaths = _options.ReadablePaths,
+                Workspace = lane ?? _options.Workspace,
+                CaptureProducedFiles = _options.CaptureProducedFiles,
+                PackageInstaller = packageInstaller ?? _options.PackageInstaller,
+                MaxAutoInstallAttempts = _options.MaxAutoInstallAttempts,
+                Interpreters = _options.Interpreters,
+                PassThroughEnvironmentVariables = _options.PassThroughEnvironmentVariables,
+                EnvironmentVariables = _options.EnvironmentVariables,
+            };
+            return new SkillScriptRunner(options, _logger, _backend, _sandbox, stop);
         }
 
         /// <summary>The sandbox in force, or null when running unconfined.</summary>
@@ -174,6 +218,11 @@ namespace TensorSharp.AgentHost.Skills
             // dependency/setup/run cycle atomic with respect to a replacement turn; the
             // lease is re-entrant when auto-install calls the code runner below.
             using IDisposable? execution = _options.Workspace?.EnterExecution();
+
+            // Checked with the lock held: a sub-agent's script that waited behind another
+            // agent's command must not start after its agent was stopped.
+            if (_stop.IsCancellationRequested)
+                return SkillToolResult.Failure("this agent was stopped before the script could start, so it did not run.");
 
             if (!CanRun)
                 return SkillToolResult.Failure(UnavailableReason!);

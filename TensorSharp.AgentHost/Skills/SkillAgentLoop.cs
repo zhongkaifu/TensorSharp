@@ -275,7 +275,7 @@ namespace TensorSharp.AgentHost.Skills
                             if (handover != null)
                             {
                                 working.Add(AssistantTurn(output, calls: null));
-                                working.Add(new ChatMessage { Role = "user", Content = handover });
+                                working.Add(HostAuthoredUserMessage.Create(handover));
                                 continue;
                             }
                         }
@@ -286,7 +286,8 @@ namespace TensorSharp.AgentHost.Skills
                     }
 
                     return new SkillLoopResult(
-                        output, working, round, invocations, HitRoundLimit: false, clientCalls);
+                        output, WithHandBackNote(ref output, agents, clientCalls, working), round, invocations,
+                        HitRoundLimit: false, clientCalls);
                 }
 
                 // Record what the model said, tool calls and raw tokens included, so the
@@ -347,7 +348,8 @@ namespace TensorSharp.AgentHost.Skills
                 if (clientCalls.Count > 0)
                 {
                     return new SkillLoopResult(
-                        output, working, round, invocations, HitRoundLimit: false, clientCalls);
+                        output, WithHandBackNote(ref output, agents, clientCalls, working), round, invocations,
+                        HitRoundLimit: false, clientCalls);
                 }
 
                 // Sub-agents that finished during this round, and anything this agent's
@@ -417,6 +419,24 @@ namespace TensorSharp.AgentHost.Skills
             RawPromptTrailingWhitespace = output.RawPromptTrailingWhitespace,
             RawGenerationSuffix = output.RawGenerationSuffix,
         };
+
+        /// <summary>
+        /// A top-level turn that hands tool calls back to the application ends here: its
+        /// sub-agents cannot outlive it, so say what became of them rather than let the
+        /// runtime drop them silently when it is disposed. A sub-agent's own hand-back is
+        /// answered by its runtime and the agent carries on, so only depth 0 applies.
+        /// Returns <paramref name="working"/> for the result.
+        /// </summary>
+        private static List<ChatMessage> WithHandBackNote(
+            ref SkillTurnOutput output, SubAgentScope? agents, List<ToolCall> clientCalls, List<ChatMessage> working)
+        {
+            if (clientCalls.Count > 0 && agents is { Depth: 0 })
+            {
+                output = WithNote(output, SubAgentConversation.EndWithoutRound(
+                    agents, "this turn handed a tool call back to the application"));
+            }
+            return working;
+        }
 
         /// <summary>
         /// The answer, plus what the user must be told about sub-agents the turn ended

@@ -267,12 +267,37 @@ namespace TensorSharp.AgentHost.CodeExec
                 // Forget it when the session ends. Without this the map grows one entry per
                 // conversation for the life of the process — small each, unbounded together,
                 // and on the CLI an ephemeral workspace per call makes it grow per CALL.
-                // A lane registers on its owner, so this runs when the conversation ends.
-                workspace.RegisterCleanup(new Forget(
-                    _sessions, _jobs, _sanitizedCertificateBundles, key, workspace.Root));
+                if (workspace.LaneId.Length == 0)
+                {
+                    workspace.RegisterCleanup(new Forget(
+                        _sessions, _jobs, _sanitizedCertificateBundles, key, workspace.Root));
+                }
+                else
+                {
+                    // A lane's session goes with the lane — retired when its agent is done,
+                    // or with the conversation. The conversation-wide entries a lane may
+                    // have created (jobs, CA bundles) are forgotten once, with the
+                    // conversation, whether or not its owner ever ran a command itself.
+                    workspace.RegisterLaneCleanup(new ForgetSession(_sessions, key));
+                    if (_conversationForgets.TryAdd(workspace.Root, 0))
+                    {
+                        workspace.RegisterCleanup(new Forget(
+                            _sessions, _jobs, _sanitizedCertificateBundles, workspace.Root, workspace.Root,
+                            _conversationForgets));
+                    }
+                }
                 return created;
             }
             return _sessions[key];
+        }
+
+        /// <summary>Conversations whose conversation-wide entries already have a cleanup registered.</summary>
+        private readonly ConcurrentDictionary<string, byte> _conversationForgets = new(StringComparer.Ordinal);
+
+        /// <summary>Removes one lane's shell session when that lane is retired.</summary>
+        private sealed class ForgetSession(ConcurrentDictionary<string, ShellSession> sessions, string shellKey) : IDisposable
+        {
+            public void Dispose() => sessions.TryRemove(shellKey, out _);
         }
 
         /// <summary>Removes one workspace's entries when that workspace is released.</summary>
@@ -284,6 +309,7 @@ namespace TensorSharp.AgentHost.CodeExec
                 _certificateBundles;
             private readonly string _shellKey;
             private readonly string _workspaceKey;
+            private readonly ConcurrentDictionary<string, byte>? _registered;
 
             /// <param name="shellKey">The session's key — per lane.</param>
             /// <param name="workspaceKey">
@@ -295,13 +321,15 @@ namespace TensorSharp.AgentHost.CodeExec
                 ConcurrentDictionary<string, BackgroundJobs> jobs,
                 ConcurrentDictionary<string, ConcurrentDictionary<string, Lazy<string?>>> certificateBundles,
                 string shellKey,
-                string workspaceKey)
+                string workspaceKey,
+                ConcurrentDictionary<string, byte>? registered = null)
             {
                 _sessions = sessions;
                 _jobs = jobs;
                 _certificateBundles = certificateBundles;
                 _shellKey = shellKey;
                 _workspaceKey = workspaceKey;
+                _registered = registered;
             }
 
             public void Dispose()
@@ -309,6 +337,7 @@ namespace TensorSharp.AgentHost.CodeExec
                 _sessions.TryRemove(_shellKey, out _);
                 _jobs.TryRemove(_workspaceKey, out _);
                 _certificateBundles.TryRemove(_workspaceKey, out _);
+                _registered?.TryRemove(_workspaceKey, out _);
             }
         }
 

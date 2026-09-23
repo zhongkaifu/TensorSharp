@@ -445,11 +445,16 @@ namespace TensorSharp.AgentHost.Skills
             }
 
             SkillLoopResult loop;
-            using (agents)
+            try
             {
                 loop = await SkillAgentLoop.RunAsync(
                     messages, tools, context, Generate(topLevel: true), loopOptions, cancellationToken)
                     .ConfigureAwait(false);
+            }
+            finally
+            {
+                if (agents != null)
+                    await agents.DisposeAsync().ConfigureAwait(false);
             }
             int promptTokens = usage.Prompt, completionTokens = usage.Completion;
 

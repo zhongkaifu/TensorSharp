@@ -325,10 +325,15 @@ namespace TensorSharp.Server.Skills
                             }
                             if (handover != null)
                             {
+                                // The premature answer was never shown, so its TEXT must not be
+                                // recorded as something the client received: the transcript
+                                // store would then fail to match the next request's history and
+                                // re-prefill the whole turn. Its raw tokens still render it for
+                                // the model exactly as generated.
                                 working.Add(new ChatMessage
                                 {
                                     Role = "assistant",
-                                    Content = content.ToString(),
+                                    Content = terminal.RawOutputTokens is { Count: > 0 } ? string.Empty : content.ToString(),
                                     Thinking = thinking.Length == 0 ? null : thinking.ToString(),
                                     RawOutputTokens = terminal.RawOutputTokens != null
                                         ? new List<int>(terminal.RawOutputTokens)
@@ -336,25 +341,14 @@ namespace TensorSharp.Server.Skills
                                     RawPromptTrailingWhitespace = terminal.RawPromptTrailingWhitespace,
                                     RawGenerationSuffix = terminal.RawGenerationSuffix,
                                 });
-                                working.Add(new ChatMessage { Role = "user", Content = handover });
+                                working.Add(new HostCompletionCorrectionMessage { Role = "user", Content = handover });
                                 continue;
                             }
                         }
-                        else
-                        {
-                            string note = SubAgentConversation.EndWithoutRound(agents);
-                            if (heldForAgents != null)
-                            {
-                                foreach (ChatStreamUpdate held in heldForAgents)
-                                    yield return held;
-                                heldForAgents = null;
-                            }
-                            if (note != null)
-                            {
-                                yield return ChatStreamUpdate.Parsed(
-                                    (content.Length == 0 ? string.Empty : "\n\n") + note, null, null);
-                            }
-                        }
+                        // With no round left the answer stands. What became of the agents is
+                        // said once, by the host that owns the turn, just before the turn's
+                        // final update — after the answer and any artifact link, on every way
+                        // a turn can end (see ModelService.RunWithSubAgentsAsync).
                     }
                     if (heldForAgents != null)
                     {
@@ -730,7 +724,7 @@ namespace TensorSharp.Server.Skills
         /// anchor. The runtime type is an in-process marker only; renderers still see an
         /// ordinary <see cref="ChatMessage"/> and no wire or persisted shape changes.
         /// </summary>
-        internal sealed class HostCompletionCorrectionMessage : ChatMessage
+        internal sealed class HostCompletionCorrectionMessage : HostAuthoredUserMessage
         {
         }
 

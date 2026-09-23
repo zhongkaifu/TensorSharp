@@ -8,6 +8,7 @@
 // TensorSharp is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
@@ -376,22 +377,35 @@ namespace TensorSharp.Server
                 history,
                 skills,
                 enableThinking,
-                (turnMessages, turnTools, roundCt) => _generation.ChatStreamWithMetricsAsync(
-                    session, turnMessages, maxTokens, roundCt,
-                    SamplingForDeepSeek41SkillRound(Architecture, turnSampling, samplingConfig), turnTools, enableThinking,
-                    turn),
+                (turnMessages, turnTools, roundCt) =>
+                {
+                    // A round submitted while this turn's sub-agents are out outranks them
+                    // for preemption: the parent is what every agent's result waits on.
+                    // Only then — a turn without live agents stays an ordinary request and
+                    // must not outrank other clients' older ones.
+                    turn.Priority = skills.ToolContext?.Agents is { HasOutstandingWork: true } ? 1 : 0;
+                    return _generation.ChatStreamWithMetricsAsync(
+                        session, turnMessages, maxTokens, roundCt,
+                        SamplingForDeepSeek41SkillRound(Architecture, turnSampling, samplingConfig), turnTools, enableThinking,
+                        turn);
+                },
                 logger,
                 ct);
 
             if (skills.SubAgents == null)
                 return Run(cancellationToken);
 
-            // The parent outranks its own sub-agents for preemption; see ChatTurnContext.Priority.
-            turn.Priority = 1;
-
+            // Each agent's turn context, so a fork of a sub-agent continues THAT agent's
+            // cache scope rather than the top-level one.
+            var agentTurns = new ConcurrentDictionary<string, ChatTurnContext>(StringComparer.Ordinal);
             return RunWithSubAgentsAsync(
                 skills, Run,
-                launch => SubAgentGenerator(session, launch, turn, maxTokens, turnSampling, samplingConfig, enableThinking, logger),
+                launch => SubAgentGenerator(
+                    session, launch,
+                    launch.ParentId != null && agentTurns.TryGetValue(launch.ParentId, out ChatTurnContext parentAgent)
+                        ? parentAgent
+                        : turn,
+                    agentTurns, maxTokens, turnSampling, samplingConfig, enableThinking, logger),
                 logger, cancellationToken);
         }
 
@@ -408,7 +422,7 @@ namespace TensorSharp.Server
             ILogger logger,
             [EnumeratorCancellation] CancellationToken cancellationToken)
         {
-            using var agents = new SubAgentRuntime(
+            await using var agents = new SubAgentRuntime(
                 skills.SubAgents,
                 new SubAgentHostBinding
                 {
@@ -416,14 +430,53 @@ namespace TensorSharp.Server
                     // A sub-agent's loop is bounded like its parent's and knows which tools
                     // are the CALLER's, so it can refuse those rather than stall on them.
                     LoopOptions = skills.LoopOptions.WithClientTools(skills.ClientTools),
+                    // Files a sub-agent produced are offered for download like the turn's
+                    // own: the Web UI drains the plan's invocations into its trace.
+                    OnAgentInvocation = (_, invocation) =>
+                    {
+                        if (invocation.Files.Count > 0)
+                        {
+                            lock (skills.Invocations)
+                                skills.Invocations.Add(invocation);
+                        }
+                    },
                 },
                 skills.ToolContext,
                 logger,
                 cancellationToken);
             using IDisposable attached = skills.AttachAgents(agents);
 
-            await foreach (ChatStreamUpdate update in run(cancellationToken).WithCancellation(cancellationToken).ConfigureAwait(false))
+            await foreach (ChatStreamUpdate update in SettleSubAgentsAtEnd(run(cancellationToken), agents.Root)
+                .WithCancellation(cancellationToken).ConfigureAwait(false))
+            {
                 yield return update;
+            }
+        }
+
+        /// <summary>
+        /// Pass a turn's stream through, and just before its final update say what became
+        /// of any sub-agent still out.
+        ///
+        /// <para>
+        /// The final update is the one place every way a turn can end passes through.
+        /// Sub-agents cannot outlive the turn, so whatever is still out — agents working,
+        /// answers nobody read — is settled and SAID here, after the answer and any
+        /// artifact link and before the stream closes. A client-tool hand-back, a
+        /// repetition stop, a verified-artifact finish and the round limit all end this
+        /// way; left to disposal, their agents were dropped silently.
+        /// </para>
+        /// </summary>
+        internal static async IAsyncEnumerable<ChatStreamUpdate> SettleSubAgentsAtEnd(
+            IAsyncEnumerable<ChatStreamUpdate> stream,
+            SubAgentScope root,
+            [EnumeratorCancellation] CancellationToken cancellationToken = default)
+        {
+            await foreach (ChatStreamUpdate update in stream.WithCancellation(cancellationToken).ConfigureAwait(false))
+            {
+                if (update.Done && SubAgentConversation.EndWithoutRound(root, "this turn ended") is { } note)
+                    yield return ChatStreamUpdate.Parsed("\n\n" + note, null, null);
+                yield return update;
+            }
         }
 
         /// <summary>
@@ -445,6 +498,7 @@ namespace TensorSharp.Server
             ChatSession session,
             SubAgentLaunch launch,
             ChatTurnContext parentTurn,
+            ConcurrentDictionary<string, ChatTurnContext> agentTurns,
             int maxTokens,
             SamplingConfig turnSampling,
             SamplingConfig samplingConfig,
@@ -456,7 +510,9 @@ namespace TensorSharp.Server
                 CacheScope = launch.ForkContext && parentTurn.CacheScope != null
                     ? parentTurn.CacheScope
                     : ChatSession.NewAgentScope(),
+                RecordTranscript = false,
             };
+            agentTurns[launch.AgentId] = agentTurn;
             string architecture = Architecture;
 
             return async (messages, tools, ct) =>

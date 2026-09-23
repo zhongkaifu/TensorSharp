@@ -1234,7 +1234,7 @@ namespace TensorSharp.Cli
                                 if (handover != null)
                                 {
                                     // Stream already recorded the assistant turn.
-                                    _history.Add(new ChatMessage { Role = "user", Content = handover });
+                                    _history.Add(HostAuthoredUserMessage.Create(handover));
                                     renderHistory = BuildRenderHistoryForContinuation();
                                     continue;
                                 }
@@ -1245,6 +1245,11 @@ namespace TensorSharp.Cli
                                 // used: both are said, so no result vanishes silently.
                                 Console.WriteLine(note);
                             }
+                        }
+                        else if (clientCalls.Count > 0 && SubAgentConversation.EndWithoutRound(
+                            agents, "this turn handed a tool call back to the operator") is { } handBackNote)
+                        {
+                            Console.WriteLine(handBackNote);
                         }
                         break;
                     }

@@ -254,6 +254,16 @@ namespace TensorSharp.AgentHost.Skills
             }
         }
 
+        /// <summary>Forget everything: for a ledger whose agent has finished for good.</summary>
+        internal void Clear()
+        {
+            lock (_gate)
+            {
+                _entries.Clear();
+                _remembered = 0;
+            }
+        }
+
         /// <summary>How many paths are tracked. For tests and for the structured log line.</summary>
         public int Count
         {

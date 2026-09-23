@@ -2307,7 +2307,7 @@ namespace TensorSharp.Cli
                                     RawOutputTokens = rawTokens,
                                     RawPromptTrailingWhitespace = rawTrailingWhitespace,
                                 });
-                                priorTurns.Add(new ChatMessage { Role = "user", Content = handover });
+                                priorTurns.Add(HostAuthoredUserMessage.Create(handover));
                                 continue;
                             }
                         }
@@ -2318,6 +2318,14 @@ namespace TensorSharp.Cli
                             Console.Error.WriteLine("[agent] " + endNote);
                             result = (result ?? string.Empty).TrimEnd() + "\n\n" + endNote;
                         }
+                    }
+                    else if (clientCalls.Count > 0 && SubAgentConversation.EndWithoutRound(
+                        agents, "this turn handed a tool call back to the operator") is { } handBackNote)
+                    {
+                        // The turn ends on a --tools call the operator answers; agents cannot
+                        // outlive it, so say what became of them.
+                        Console.Error.WriteLine("[agent] " + handBackNote);
+                        result = (result ?? string.Empty).TrimEnd() + "\n\n" + handBackNote;
                     }
                     return result;
                 }

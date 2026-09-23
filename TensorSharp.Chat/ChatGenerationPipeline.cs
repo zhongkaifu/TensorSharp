@@ -233,6 +233,15 @@ namespace TensorSharp.Server
         /// submitted after its agents, the one thing every agent's result is waiting on.
         /// </summary>
         public int Priority { get; set; }
+
+        /// <summary>
+        /// False for a sub-agent's generations. Nothing continues a sub-agent's
+        /// conversation across requests, and recording its rounds did harm: a forked
+        /// agent's history keys to its parent's, so its record could REPLACE the parent's
+        /// in the transcript store and cost the next request its reuse — and every round
+        /// spent the session store's budget on conversations no client will ever send.
+        /// </summary>
+        public bool RecordTranscript { get; set; } = true;
     }
 
     internal sealed class ChatGenerationPipeline : IDisposable
@@ -816,21 +825,24 @@ namespace TensorSharp.Server
             // Record this turn for the next request of the same conversation: the raw
             // tokens the cache holds, and what the client was sent for them - the next
             // request's assistant message must match that to get the tokens back.
-            RecordGeneratedTurn(session, preparedHistory, renderHistory, cacheScope,
-                new ChatMessage
-                {
-                    Role = "assistant",
-                    Content = assistantText,
-                    RawOutputTokens = generatedTokens,
-                    RawPromptTrailingWhitespace = generationPromptTrailingWhitespace,
-                    RawGenerationSuffix = recordedSuffix,
-                },
-                BuildEmittedTurn(arch, assistantText, enableThinking, tools,
-                    // Parsers are primed with the prompt's open channel exactly when this
-                    // pipeline announced it (above); mirror that, or the recorded content
-                    // would differ from what the adapters parsed.
-                    SignalsOpenThoughtChannel(arch, recordedSuffix) ? recordedSuffix : null,
-                    wasCancelled));
+            if (turnContext.RecordTranscript)
+            {
+                RecordGeneratedTurn(session, preparedHistory, renderHistory, cacheScope,
+                    new ChatMessage
+                    {
+                        Role = "assistant",
+                        Content = assistantText,
+                        RawOutputTokens = generatedTokens,
+                        RawPromptTrailingWhitespace = generationPromptTrailingWhitespace,
+                        RawGenerationSuffix = recordedSuffix,
+                    },
+                    BuildEmittedTurn(arch, assistantText, enableThinking, tools,
+                        // Parsers are primed with the prompt's open channel exactly when this
+                        // pipeline announced it (above); mirror that, or the recorded content
+                        // would differ from what the adapters parsed.
+                        SignalsOpenThoughtChannel(arch, recordedSuffix) ? recordedSuffix : null,
+                        wasCancelled));
+            }
 
             if (stopped != null)
             {
@@ -1616,7 +1628,7 @@ namespace TensorSharp.Server
             && index >= 0
             && index < history.Count
             && IsUserRole(history[index]?.Role)
-            && history[index] is not Skills.SkillChatLoop.HostCompletionCorrectionMessage
+            && history[index] is not TensorSharp.AgentHost.Skills.HostAuthoredUserMessage
             && !IsSyntheticToolResult(history, index);
 
         private static bool IsSyntheticToolResult(IReadOnlyList<ChatMessage> history, int index)

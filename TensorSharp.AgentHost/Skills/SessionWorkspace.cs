@@ -1248,14 +1248,98 @@ namespace TensorSharp.AgentHost.Skills
                 return;
             }
             IDisposable[] pending;
+            SessionWorkspace[] lanes;
             lock (_gate)
             {
                 _cleanupRegistrationClosed = true;
                 pending = _cleanups.ToArray();
                 _cleanups.Clear();
+                lanes = _lanes?.Values.ToArray() ?? Array.Empty<SessionWorkspace>();
             }
             foreach (IDisposable cleanup in pending)
                 DisposeCleanup(cleanup);
+            foreach (SessionWorkspace lane in lanes)
+                lane.RunLaneCleanups();
+        }
+
+        /// <summary>
+        /// What only one lane owns — its shell session's map entry — to be let go when that
+        /// lane is retired (<see cref="RetireLane"/>), or with the conversation if it never
+        /// is. On the owner this is an ordinary conversation cleanup.
+        /// </summary>
+        internal void RegisterLaneCleanup(IDisposable cleanup)
+        {
+            ArgumentNullException.ThrowIfNull(cleanup);
+            if (_owner == null)
+            {
+                RegisterCleanup(cleanup);
+                return;
+            }
+            bool disposeNow;
+            lock (_gate)
+            {
+                disposeNow = _laneRetired;
+                if (!disposeNow)
+                    _laneCleanups.Add(cleanup);
+            }
+            if (disposeNow)
+                DisposeCleanup(cleanup);
+        }
+
+        private readonly List<IDisposable> _laneCleanups = new();
+        private bool _laneRetired;
+
+        private void RunLaneCleanups()
+        {
+            IDisposable[] pending;
+            lock (_gate)
+            {
+                _laneRetired = true;
+                pending = _laneCleanups.ToArray();
+                _laneCleanups.Clear();
+            }
+            foreach (IDisposable cleanup in pending)
+                DisposeCleanup(cleanup);
+        }
+
+        /// <summary>
+        /// Let go of one lane for good: its shell session, its read ledger and its state
+        /// directory. For an agent that has finished — a lane otherwise lives as long as the
+        /// conversation, and every turn's agents get new ones, so a long chat would keep
+        /// every agent's ledger (up to 8M characters each) and shell session it ever had.
+        /// </summary>
+        /// <remarks>
+        /// Only the lane's OWN state goes. The conversation-wide job table and CA bundles
+        /// stay: a job started from the lane is still the conversation's job, and its
+        /// numbering must not restart. Deleting the lane directory removes the job's
+        /// wrapper script, which the running shell already has open. A lane asked for again
+        /// after this is a fresh one.
+        /// </remarks>
+        internal void RetireLane(string laneId)
+        {
+            if (_owner != null)
+            {
+                _owner.RetireLane(laneId);
+                return;
+            }
+            string sanitized = SanitizeLaneId(laneId);
+            SessionWorkspace? lane;
+            lock (_gate)
+            {
+                if (_lanes == null || !_lanes.Remove(sanitized, out lane))
+                    return;
+            }
+            lane.RunLaneCleanups();
+            lane.Reads.Clear();
+            try
+            {
+                if (Directory.Exists(lane.ShellScriptDirectory)
+                    && new DirectoryInfo(lane.ShellScriptDirectory).LinkTarget == null)
+                {
+                    Directory.Delete(lane.ShellScriptDirectory, recursive: true);
+                }
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { }
         }
 
         private static void DisposeCleanup(IDisposable cleanup)

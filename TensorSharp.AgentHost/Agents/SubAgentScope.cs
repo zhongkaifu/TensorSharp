@@ -177,7 +177,7 @@ namespace TensorSharp.AgentHost.Agents
                 if (result != null)
                     result.Content = (result.Content ?? string.Empty).TrimEnd() + "\n\n" + deliveries.Notification;
                 else
-                    working.Add(new ChatMessage { Role = "user", Content = deliveries.Notification });
+                    working.Add(HostAuthoredUserMessage.Create(deliveries.Notification));
             }
 
             foreach (string message in deliveries.Messages)
@@ -197,7 +197,10 @@ namespace TensorSharp.AgentHost.Agents
         /// just not used by the answer above it. Dropping the second silently was the
         /// original behaviour, and it lost a result that had already been paid for.
         /// </remarks>
-        public static string? EndWithoutRound(SubAgentScope? scope)
+        /// <param name="scope">The agent whose turn is ending.</param>
+        /// <param name="why">How the turn ended, completing "still working when ..." —
+        /// e.g. "this turn ran out of rounds".</param>
+        public static string? EndWithoutRound(SubAgentScope? scope, string why = "this turn ran out of rounds")
         {
             if (scope is not { HasOutstandingWork: true })
                 return null;
@@ -210,7 +213,7 @@ namespace TensorSharp.AgentHost.Agents
             {
                 bool one = stopped.Count == 1;
                 parts.Add("(Sub-agent" + (one ? " " : "s ") + string.Join(", ", stopped)
-                    + (one ? " was" : " were") + " still working when this turn ran out of rounds and "
+                    + (one ? " was" : " were") + " still working when " + why + " and "
                     + (one ? "was" : "were") + " stopped; this answer does not include "
                     + (one ? "its" : "their") + " results.)");
             }
