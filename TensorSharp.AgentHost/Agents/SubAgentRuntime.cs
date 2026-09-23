@@ -671,7 +671,7 @@ namespace TensorSharp.AgentHost.Agents
                     SkillLoopResult result = await SkillAgentLoop.RunAsync(
                         input, agent.Tools?.ToList(), context, agent.Generator!, loopOptions, token).ConfigureAwait(false);
                     result = await AnswerClientCallsAsync(agent, result, context, loopOptions, token).ConfigureAwait(false);
-                    result = await CorrectUnappliedPatchAsync(agent, result, context, loopOptions, token).ConfigureAwait(false);
+                    result = await CorrectEmptyTurnAsync(agent, result, context, loopOptions, token).ConfigureAwait(false);
 
                     List<ChatMessage> history = result.Messages;
                     ParsedOutput? parsed = result.Output.Parsed;
@@ -806,8 +806,9 @@ namespace TensorSharp.AgentHost.Agents
         }
 
         /// <summary>
-        /// One correction for the clearest false success a sub-agent produces: a task
-        /// "done" by writing a patch envelope as its ANSWER, with no tool run at all.
+        /// One correction for the two clearest non-results a sub-agent produces, both in a
+        /// turn that ran no tool at all: a task "done" by writing a patch envelope as its
+        /// ANSWER, and an answer with nothing in it.
         ///
         /// <para>
         /// Observed on gemma-4-E2B: asked to write a file, the sub-agent's whole reply was
@@ -819,19 +820,35 @@ namespace TensorSharp.AgentHost.Agents
         /// and given the round to make the call. Anything subtler is left to the record
         /// <see cref="DescribeWorkLocked"/> hands the parent.
         /// </para>
+        /// <para>
+        /// The empty answer is the same argument: observed on gemma-4-E2B, a forked agent
+        /// ended its first turn on its first token, and the parent — told only that its
+        /// agent had written nothing — spent two rounds starting another one.
+        /// </para>
         /// </summary>
-        private static async Task<SkillLoopResult> CorrectUnappliedPatchAsync(
+        private static async Task<SkillLoopResult> CorrectEmptyTurnAsync(
             SubAgent agent, SkillLoopResult result, SkillToolContext context,
             SkillAgentLoopOptions loopOptions, CancellationToken token)
         {
             string content = result.Output.Parsed?.Content ?? string.Empty;
-            if (result.Invocations.Count > 0
-                || result.PendingClientToolCalls.Count > 0
-                || !content.Contains("*** Begin Patch", StringComparison.Ordinal)
-                || agent.Tools?.Any(t => string.Equals(t?.Name, SkillToolNames.ApplyPatch, StringComparison.Ordinal)) != true)
-            {
+            if (result.Invocations.Count > 0 || result.PendingClientToolCalls.Count > 0)
                 return result;
+
+            string? correction = null;
+            if (content.Contains("*** Begin Patch", StringComparison.Ordinal)
+                && agent.Tools?.Any(t => string.Equals(t?.Name, SkillToolNames.ApplyPatch, StringComparison.Ordinal)) == true)
+            {
+                correction = "Your answer contains an apply_patch envelope as plain text, and text changes nothing: no "
+                    + "file was created or changed, because you called no tool. To make that change, call the "
+                    + SkillToolNames.ApplyPatch + " tool with the envelope, then reply with your final answer.";
             }
+            else if (string.IsNullOrWhiteSpace(content) && string.IsNullOrWhiteSpace(result.Output.Parsed?.Thinking))
+            {
+                correction = "You ended your turn without doing anything or writing an answer. Do your task now "
+                    + "with your tools, then reply with your final answer.";
+            }
+            if (correction == null)
+                return result;
 
             List<ChatMessage> messages = result.Messages;
             ParsedOutput? parsed = result.Output.Parsed;
@@ -844,13 +861,7 @@ namespace TensorSharp.AgentHost.Agents
                 RawPromptTrailingWhitespace = result.Output.RawPromptTrailingWhitespace,
                 RawGenerationSuffix = result.Output.RawGenerationSuffix,
             });
-            messages.Add(new ChatMessage
-            {
-                Role = "user",
-                Content = "Your answer contains an apply_patch envelope as plain text, and text changes nothing: no "
-                    + "file was created or changed, because you called no tool. To make that change, call the "
-                    + SkillToolNames.ApplyPatch + " tool with the envelope, then reply with your final answer.",
-            });
+            messages.Add(new ChatMessage { Role = "user", Content = correction });
 
             int rounds = result.Rounds;
             SkillLoopResult corrected = await SkillAgentLoop.RunAsync(
@@ -909,13 +920,22 @@ namespace TensorSharp.AgentHost.Agents
 
         /// <summary>
         /// A forked agent's first prompt: the parent's conversation up to and including the
-        /// turn that spawned it, with that turn's calls answered — its own spawn call with
-        /// its task, the others with a placeholder.
+        /// turn that spawned it, with that turn's calls answered, then its task as a user
+        /// message.
         ///
         /// <para>
         /// Unlike Codex, the fork keeps the parent's tool calls. Codex drops them to give the
         /// child a clean transcript; here that would cut the shared prefix at the first
         /// dropped call, and reusing the parent's KV is the only reason to fork at all.
+        /// </para>
+        /// <para>
+        /// The task is a USER turn, not the spawn call's tool result. Measured on
+        /// gemma-4-E2B at temperature 0: with the task inside the tool result, the forked
+        /// agent ended its turn on its very first token in all three runs — a model reads a
+        /// tool result as the end of a step it took, not as a new instruction. The spawn call's result is
+        /// what the parent itself was told, and the task follows as the next thing said to
+        /// it. The shared prefix is the same either way: it ends where the parent's own
+        /// generation ended.
         /// </para>
         /// </summary>
         private List<ChatMessage> BuildForkedHistory(
@@ -947,12 +967,13 @@ namespace TensorSharp.AgentHost.Agents
                     ? null
                     : conversation.Skip(spawner + 1).FirstOrDefault(m => m.Role == "tool" && m.ToolCallId == sibling.Id);
                 string content = own
-                    ? Envelope(agent, forked: true)
+                    ? agent.Id + " started with a copy of this conversation."
                     : existing?.Content ?? "(The result of this call is not shown to the sub-agent.)";
                 history.Add(resultsRendered
                     ? new ChatMessage { Role = "tool", Content = content, ToolCallId = sibling.Id }
                     : new ChatMessage { Role = "user", Content = "Result of your " + sibling.Name + " call:\n\n" + content });
             }
+            history.Add(new ChatMessage { Role = "user", Content = Envelope(agent, forked: true) });
             return history;
         }
 
@@ -961,7 +982,7 @@ namespace TensorSharp.AgentHost.Agents
             var sb = new StringBuilder();
             sb.Append("You are ").Append(agent.Id).Append(", a sub-agent. ");
             sb.Append(forked
-                ? "You were forked from the conversation above to do the task below: you have its context, but you are now a separate agent, and the agent that started you is waiting for your result. "
+                ? "You were forked from the conversation above to do the task below: you have its context, but you are now a separate agent - not the one that started you - and that agent is waiting for your result. "
                 : "Another agent started you to do the task below, and it is waiting for your result. ");
             sb.Append("Work on it on your own, with your tools; you cannot ask the user anything. Do the work by calling "
                     + "your tools: text you write in your answer changes nothing. When you are done, "

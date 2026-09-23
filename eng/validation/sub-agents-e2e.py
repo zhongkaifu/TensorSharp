@@ -11,7 +11,8 @@ their results were delivered, and how much of every prompt the KV cache reused.
 Each scenario can run in two modes over the SAME server (so the tool block, the
 system prompt and the prefix cache are identical):
 
-  parallel  the prompt asks for sub-agents, one per task
+  parallel  the prompt asks for sub-agents, one per task, started together
+  serial    (code4 only) the same sub-agents, but one at a time: the concurrency control
   solo      the prompt asks the model to do the same tasks itself, one after another
 
 Comparing the two is the benchmark: same tasks, same model, same tool surface; the only
@@ -44,6 +45,16 @@ TASKS_COMPUTE3 = [
 
 TOPICS_WRITE4 = ["photosynthesis", "plate tectonics", "the water cycle", "the human immune system"]
 
+# Programming tasks with answers a model cannot recite from memory (checked with an
+# independent program), so each one really is write-a-program, run-it, read-the-output.
+TASKS_CODE4 = [
+    ("how many integers n with 0 <= n < 1000000 have a decimal digit sum of exactly 30", "50877"),
+    ("the sum of all prime numbers below 200000", "1709600813"),
+    ("the number of integer partitions of 90 (ways to write 90 as a sum of positive integers, order ignored)",
+     "56634173"),
+    ("how many integers n with 1 <= n < 100000 are divisible by the sum of their own decimal digits", "11871"),
+]
+
 
 def scenario_prompts(name, mode):
     """(prompt, verifier) for one scenario and mode. The verifier takes the answer text
@@ -59,6 +70,27 @@ def scenario_prompts(name, mode):
 
         def verify(answer, facts):
             return [f"missing {v}" for _, v in TASKS_COMPUTE3 if v not in answer.replace(",", "")]
+        return prompt, verify
+
+    if name == "code4":
+        tasks = "\n".join(f"{i + 1}. Compute {t}." for i, (t, _) in enumerate(TASKS_CODE4))
+        rule = ("For each task, write a python3 program, run it, and take the number it prints; do not "
+                "answer from memory.")
+        if mode == "parallel":
+            prompt = ("Use four sub-agents working in parallel, one per task below, and start all four at "
+                      "once. " + rule + " Wait for all four, then reply with the four numbers, one per line, "
+                      "in task order.\n" + tasks)
+        elif mode == "serial":
+            prompt = ("Use sub-agents one at a time for the tasks below: start the agent for task 1, wait for "
+                      "its result, then start the agent for task 2, and so on - never more than one agent "
+                      "working at once. " + rule + " Then reply with the four numbers, one per line, in task "
+                      "order.\n" + tasks)
+        else:
+            prompt = ("Do the four tasks below yourself, one after another. Do not start sub-agents. " + rule
+                      + " Then reply with the four numbers, one per line, in task order.\n" + tasks)
+
+        def verify(answer, facts):
+            return [f"missing {v}" for _, v in TASKS_CODE4 if v not in answer.replace(",", "")]
         return prompt, verify
 
     if name == "write4":
@@ -243,8 +275,10 @@ def main():
     rows = []
     for scenario in [s for s in args.scenarios.split(",") if s]:
         for mode in [m for m in args.modes.split(",") if m]:
-            if scenario in ("guard", "fork") and mode == "solo":
+            if scenario in ("guard", "fork") and mode != "parallel":
                 continue  # these scenarios exist only to exercise sub-agent mechanics
+            if mode == "serial" and scenario != "code4":
+                continue  # serial is the concurrency control for code4
             for attempt in range(1, args.repeat + 1):
                 prompt, verify = scenario_prompts(scenario, mode)
                 before = log_size(args.server_log)

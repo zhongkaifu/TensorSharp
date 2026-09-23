@@ -1827,6 +1827,11 @@ function activityLabel(tool, phase) {
     case 'skills_list': return writing ? 'Preparing skill lookup…' : 'Checking skills…';
     case 'skills_read': return writing ? 'Preparing skill read…' : 'Reading skill file…';
     case 'skills_run':  return writing ? 'Preparing skill run…' : 'Running skill…';
+    case 'spawn_agent': return writing ? 'Preparing sub-agent task…' : 'Starting sub-agent…';
+    case 'send_input':  return writing ? 'Preparing message…' : 'Messaging sub-agent…';
+    case 'wait_agent':  return writing ? 'Preparing to wait…' : 'Waiting for sub-agents…';
+    case 'close_agent': return writing ? 'Preparing to close…' : 'Closing sub-agent…';
+    case 'list_agents': return writing ? 'Preparing list…' : 'Checking sub-agents…';
     default: {
       const name = tool ? String(tool).replace(/_/g, ' ') : 'operation';
       return (writing ? 'Preparing ' : 'Running ') + name + '…';

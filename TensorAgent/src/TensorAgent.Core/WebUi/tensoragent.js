@@ -323,6 +323,11 @@
     skills_list: ['Preparing lookup', 'Checking skills'],
     skills_read: ['Preparing read', 'Reading skill'],
     skills_run: ['Preparing run', 'Running skill'],
+    spawn_agent: ['Preparing sub-agent', 'Starting sub-agent'],
+    send_input: ['Preparing message', 'Messaging sub-agent'],
+    wait_agent: ['Preparing wait', 'Waiting for sub-agents'],
+    close_agent: ['Preparing close', 'Closing sub-agent'],
+    list_agents: ['Preparing list', 'Checking sub-agents'],
   };
   function labelFor(tool, phase) {
     var pair = TOOL_LABEL[tool];
