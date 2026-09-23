@@ -300,12 +300,14 @@ public class SubAgentWorkspaceReviewFixTests : IDisposable
         Assert.True(Directory.Exists(owner.Root), "the workspace was deleted under a running sub-agent");
         Assert.True(Directory.Exists(owner.WorkDirectory));
 
-        // Nothing new starts in a conversation that has been let go.
+        // Nothing new starts in a conversation that has been let go — and the spawn says
+        // so itself, rather than "started" followed by a failure at the next delivery.
         SkillToolResult late = await h.Spawn("late work").Within();
-        Assert.True(late.Ok, late.Content);
-        await h.WaitForStatusAsync("agent_2", SubAgentStatus.Errored);
-        Assert.Equal("this conversation's workspace was released before the agent could start.",
-            h.Snapshot("agent_2").Result);
+        Assert.False(late.Ok);
+        Assert.Equal("Error: agent_2 could not start: this conversation's workspace was released before the agent could start.",
+            late.Content);
+        Assert.Equal(SubAgentStatus.Errored, h.Snapshot("agent_2").Status);
+        Assert.True(h.Runtime.Root.TakePendingDeliveries().IsEmpty);
         Assert.True(Directory.Exists(owner.Root));
 
         gate.SetResult();

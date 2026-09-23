@@ -331,7 +331,15 @@ namespace TensorSharp.AgentHost.Agents
             _logger?.LogInformation(LogEventIds.SkillToolInvoked,
                 "agents.spawn id={Id} parent={Parent} depth={Depth} fork={Fork} evicted={Evicted} task={Task}",
                 agent.Id, caller.Name, depth, fork, evicted ?? "-", Abbreviate(message, 120));
-            Start(agent);
+            if (!Start(agent))
+            {
+                // Said now, as the spawn's own result, rather than as "started" followed
+                // by a failure at the next delivery.
+                lock (_gate)
+                    agent.Delivered = true;
+                return SkillToolResult.Failure(
+                    agent.Id + " could not start: " + (agent.Result ?? "unknown error"));
+            }
 
             var sb = new StringBuilder();
             sb.Append(agent.Id).Append(" started");
@@ -390,8 +398,8 @@ namespace TensorSharp.AgentHost.Agents
             }
 
             Signal();
-            if (restart)
-                Start(agent);
+            if (restart && !Start(agent))
+                return SkillToolResult.Failure(agent.Id + " could not start again: " + (agent.Result ?? "unknown error"));
 
             string reply = agent.Id + " is working on your message, with its earlier context kept.";
             return SkillToolResult.Success(previousAnswer == null
@@ -687,7 +695,8 @@ namespace TensorSharp.AgentHost.Agents
 
         // ---- running an agent ----------------------------------------------------
 
-        private void Start(SubAgent agent)
+        /// <returns>False when the agent could not start; it is then already marked failed.</returns>
+        private bool Start(SubAgent agent)
         {
             // The worker holds the workspace open for as long as it runs. A request that
             // is abandoned, or a chat that is reset, releases its workspace; without this
@@ -709,7 +718,7 @@ namespace TensorSharp.AgentHost.Agents
                     agent.FinishOrder = ++_finishCounter;
                 }
                 Signal();
-                return;
+                return false;
             }
 
             // Task.Run, not a bare call: the loop's first await would otherwise run the
@@ -725,6 +734,7 @@ namespace TensorSharp.AgentHost.Agents
                     lease?.Dispose();
                 }
             });
+            return true;
         }
 
         private async Task RunAsync(SubAgent agent)
@@ -781,6 +791,7 @@ namespace TensorSharp.AgentHost.Agents
                     });
 
                     bool again = false;
+                    bool stoppedLate = false;
                     lock (_gate)
                     {
                         agent.History = history;
@@ -790,7 +801,14 @@ namespace TensorSharp.AgentHost.Agents
                         agent.TurnInvocations.AddRange(result.Invocations);
                         if (agent.Status == SubAgentStatus.Closed)
                             return;
-                        if (agent.Inbox.Count > 0)
+                        // Stopped (closed, or the turn ended) while its last round was
+                        // still generating: an answer nobody can receive is not a result.
+                        if (token.IsCancellationRequested)
+                        {
+                            MarkClosedLocked(agent);
+                            stoppedLate = true;
+                        }
+                        else if (agent.Inbox.Count > 0)
                         {
                             // A message arrived while the last round was generating. It
                             // was sent expecting an answer that accounts for it, so the
@@ -810,6 +828,11 @@ namespace TensorSharp.AgentHost.Agents
                         }
                     }
 
+                    if (stoppedLate)
+                    {
+                        Signal();
+                        return;
+                    }
                     if (again)
                     {
                         continuation = true;
