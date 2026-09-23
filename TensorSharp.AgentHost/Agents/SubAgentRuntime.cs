@@ -661,6 +661,8 @@ namespace TensorSharp.AgentHost.Agents
                         agent.Status = SubAgentStatus.Running;
                         agent.Turns++;
                         agent.StartedAt = Stopwatch.GetTimestamp();
+                        agent.TurnRounds = 0;
+                        agent.TurnInvocations.Clear();
                         input = agent.History;
                     }
                     Signal();
@@ -669,6 +671,7 @@ namespace TensorSharp.AgentHost.Agents
                     SkillLoopResult result = await SkillAgentLoop.RunAsync(
                         input, agent.Tools?.ToList(), context, agent.Generator!, loopOptions, token).ConfigureAwait(false);
                     result = await AnswerClientCallsAsync(agent, result, context, loopOptions, token).ConfigureAwait(false);
+                    result = await CorrectUnappliedPatchAsync(agent, result, context, loopOptions, token).ConfigureAwait(false);
 
                     List<ChatMessage> history = result.Messages;
                     ParsedOutput? parsed = result.Output.Parsed;
@@ -688,6 +691,8 @@ namespace TensorSharp.AgentHost.Agents
                         agent.History = history;
                         agent.Rounds += result.Rounds;
                         agent.ToolCalls += result.Invocations.Count;
+                        agent.TurnRounds += result.Rounds;
+                        agent.TurnInvocations.AddRange(result.Invocations);
                         if (agent.Status == SubAgentStatus.Closed)
                             return;
                         if (agent.Inbox.Count > 0)
@@ -800,6 +805,59 @@ namespace TensorSharp.AgentHost.Agents
             return result;
         }
 
+        /// <summary>
+        /// One correction for the clearest false success a sub-agent produces: a task
+        /// "done" by writing a patch envelope as its ANSWER, with no tool run at all.
+        ///
+        /// <para>
+        /// Observed on gemma-4-E2B: asked to write a file, the sub-agent's whole reply was
+        /// <c>*** Begin Patch / *** Add File: a.txt / +alpha / *** End Patch</c> as text, in
+        /// one round — nothing was applied, and its parent reported the file as written.
+        /// For a sub-agent that combination is unambiguous: its answer is read by another
+        /// agent, never shown to a user who might have asked to SEE a patch, and a turn that
+        /// ran no tools cannot have made the change it describes. So it is told so, once,
+        /// and given the round to make the call. Anything subtler is left to the record
+        /// <see cref="DescribeWorkLocked"/> hands the parent.
+        /// </para>
+        /// </summary>
+        private static async Task<SkillLoopResult> CorrectUnappliedPatchAsync(
+            SubAgent agent, SkillLoopResult result, SkillToolContext context,
+            SkillAgentLoopOptions loopOptions, CancellationToken token)
+        {
+            string content = result.Output.Parsed?.Content ?? string.Empty;
+            if (result.Invocations.Count > 0
+                || result.PendingClientToolCalls.Count > 0
+                || !content.Contains("*** Begin Patch", StringComparison.Ordinal)
+                || agent.Tools?.Any(t => string.Equals(t?.Name, SkillToolNames.ApplyPatch, StringComparison.Ordinal)) != true)
+            {
+                return result;
+            }
+
+            List<ChatMessage> messages = result.Messages;
+            ParsedOutput? parsed = result.Output.Parsed;
+            messages.Add(new ChatMessage
+            {
+                Role = "assistant",
+                Content = content,
+                Thinking = string.IsNullOrEmpty(parsed?.Thinking) ? null : parsed!.Thinking,
+                RawOutputTokens = result.Output.RawTokens != null ? new List<int>(result.Output.RawTokens) : null,
+                RawPromptTrailingWhitespace = result.Output.RawPromptTrailingWhitespace,
+                RawGenerationSuffix = result.Output.RawGenerationSuffix,
+            });
+            messages.Add(new ChatMessage
+            {
+                Role = "user",
+                Content = "Your answer contains an apply_patch envelope as plain text, and text changes nothing: no "
+                    + "file was created or changed, because you called no tool. To make that change, call the "
+                    + SkillToolNames.ApplyPatch + " tool with the envelope, then reply with your final answer.",
+            });
+
+            int rounds = result.Rounds;
+            SkillLoopResult corrected = await SkillAgentLoop.RunAsync(
+                messages, agent.Tools?.ToList(), context, agent.Generator!, loopOptions, token).ConfigureAwait(false);
+            return corrected with { Rounds = corrected.Rounds + rounds };
+        }
+
         private SkillAgentLoopOptions ChildLoopOptions(SubAgent agent)
         {
             SkillAgentLoopOptions baseOptions = _binding.LoopOptions ?? SkillAgentLoopOptions.Default;
@@ -905,7 +963,8 @@ namespace TensorSharp.AgentHost.Agents
             sb.Append(forked
                 ? "You were forked from the conversation above to do the task below: you have its context, but you are now a separate agent, and the agent that started you is waiting for your result. "
                 : "Another agent started you to do the task below, and it is waiting for your result. ");
-            sb.Append("Work on it on your own, with your tools; you cannot ask the user anything. When you are done, "
+            sb.Append("Work on it on your own, with your tools; you cannot ask the user anything. Do the work by calling "
+                    + "your tools: text you write in your answer changes nothing. When you are done, "
                     + "reply with your final answer. It goes back to the agent that started you, not to the user, so "
                     + "make it complete and self-contained: the result itself, the paths of any files you created or "
                     + "changed, and anything you could not do. Other agents may be working in the same working "
@@ -1030,7 +1089,41 @@ namespace TensorSharp.AgentHost.Agents
                     + "\n[... truncated: the full answer is " + agent.Result!.Length.ToString(CultureInfo.InvariantCulture)
                     + " characters. Ask " + agent.Id + " for the part you need with " + SkillToolNames.SendInput + ".]";
             }
-            return agent.Id + " completed in " + elapsed + ". Its final answer:\n" + answer;
+            return agent.Id + " completed in " + elapsed + " " + DescribeWorkLocked(agent) + ". Its final answer:\n" + answer;
+        }
+
+        /// <summary>
+        /// What the agent actually DID, from the host's own record rather than its words:
+        /// how many rounds, which tools ran, which failed, which files they produced.
+        ///
+        /// <para>
+        /// A sub-agent's answer is a claim, and a small model makes false ones — observed
+        /// on this host: a sub-agent asked to write a file answered with a patch envelope
+        /// as plain TEXT, which applies nothing, and its parent reported the file as
+        /// written. The parent cannot inspect the sub-agent's transcript, so the record
+        /// travels with the claim, and "it called no tools" is there to be read next to
+        /// "I created the file".
+        /// </para>
+        /// </summary>
+        private static string DescribeWorkLocked(SubAgent agent)
+        {
+            string rounds = agent.TurnRounds.ToString(CultureInfo.InvariantCulture)
+                + (agent.TurnRounds == 1 ? " round" : " rounds");
+            List<SkillToolInvocation> calls = agent.TurnInvocations;
+            if (calls.Count == 0)
+                return "(" + rounds + "; it called no tools)";
+
+            var sb = new StringBuilder("(").Append(rounds).Append("; tools it ran: ");
+            sb.Append(string.Join(", ", calls
+                .GroupBy(c => c.Tool, StringComparer.Ordinal)
+                .Select(g => g.Count() == 1 ? g.Key : g.Key + " x" + g.Count().ToString(CultureInfo.InvariantCulture))));
+            int failed = calls.Count(c => !c.Ok);
+            if (failed > 0)
+                sb.Append("; ").Append(failed.ToString(CultureInfo.InvariantCulture)).Append(failed == 1 ? " call failed" : " calls failed");
+            List<string> files = calls.SelectMany(c => c.Files).Select(f => f.Name).Distinct(StringComparer.Ordinal).ToList();
+            if (files.Count > 0)
+                sb.Append("; files produced: ").Append(string.Join(", ", files.Take(12))).Append(files.Count > 12 ? ", ..." : string.Empty);
+            return sb.Append(')').ToString();
         }
 
         private string DescribeReadyLocked(List<SubAgent> ready, List<SubAgent> awaited)
@@ -1246,6 +1339,12 @@ namespace TensorSharp.AgentHost.Agents
         public int Turns { get; set; }
         public int Rounds { get; set; }
         public int ToolCalls { get; set; }
+
+        /// <summary>Rounds of the latest task, follow-ups steered into it included.</summary>
+        public int TurnRounds { get; set; }
+
+        /// <summary>Every tool call of the latest task, for the record the parent is given.</summary>
+        public List<SkillToolInvocation> TurnInvocations { get; } = new();
         public long StartedAt { get; set; } = Stopwatch.GetTimestamp();
         public long FinishedAt { get; set; }
         public long FinishOrder { get; set; }

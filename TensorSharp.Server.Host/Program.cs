@@ -187,6 +187,9 @@ bool redisFlagsApplied = ServerOptionsBuilder.ApplyRedisCliFlags(args);
 // (TS_QWEN35_BATCHED). Must run before InferenceEngine constructs its
 // BatchExecutor and the per-model batched-paged adapters initialise.
 bool continuousBatchingFlagApplied = ServerOptionsBuilder.ApplyContinuousBatchingCliFlag(args);
+// Sub-agents keep several conversations' KV alive at once; raise the engine's
+// retained-state cap before the engine that reads it is constructed.
+string? subAgentEngineDefaults = hostingOptions.SubAgents.ApplyEngineDefaults();
 // Translate --spec / --spec-draft / --spec-pmin / --draft-model into the env vars
 // read by SchedulerConfig.FromEnvironment when the engine is constructed.
 bool specFlagsApplied = ServerOptionsBuilder.ApplySpeculativeCliFlags(args);
@@ -389,6 +392,21 @@ if (pagedKvFlagsApplied)
         pagedCfg.Enabled, pagedCfg.BlockSize, pagedCfg.MaxRamBytes / (1024 * 1024),
         string.IsNullOrEmpty(pagedCfg.SsdDirectory) ? "(disabled)" : pagedCfg.SsdDirectory,
         pagedCfg.MaxSsdBytes / (1024 * 1024));
+}
+
+if (hostingOptions.SubAgents.Enabled)
+{
+    // Said at startup because nothing else would: the tools only appear on requests
+    // that already have tools (skills or --code-exec), and the cap change is invisible.
+    startupLogger.LogInformation(LogEventIds.HostConfiguration,
+        "Sub-agents: {SubAgents} - offered on requests that have tools (skills or --code-exec); {EngineDefaults}",
+        hostingOptions.SubAgents.Describe(), subAgentEngineDefaults);
+    if (!codeExecOptions.Enabled && !hostingOptions.SkillsEnabled)
+    {
+        startupLogger.LogWarning(LogEventIds.HostConfiguration,
+            "--sub-agents is on, but neither skills nor --code-exec is, so no request carries tools and the "
+            + "sub-agent tools are never offered.");
+    }
 }
 
 if (redisFlagsApplied)

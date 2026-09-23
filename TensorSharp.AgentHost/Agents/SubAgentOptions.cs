@@ -152,6 +152,55 @@ namespace TensorSharp.AgentHost.Agents
             return this;
         }
 
+        /// <summary>
+        /// The engine setting that bounds how many conversations' finished KV state is kept
+        /// for reuse. Read once, when the engine is constructed.
+        /// </summary>
+        public const string RetainedStatesVariable = "TS_RETAINED_FUSED_CACHE_MAX";
+
+        /// <summary>
+        /// The retained-state count sub-agents need: two per concurrent conversation (each
+        /// keeps a prompt-end checkpoint and its latest end state) for the parent and every
+        /// open sub-agent.
+        /// </summary>
+        public int RecommendedRetainedStates => 2 * (MaxThreads + 1);
+
+        /// <summary>
+        /// Raise the engine's retained-state cap when sub-agents are on and the operator
+        /// has not chosen one. Must run before the engine is constructed. Returns what was
+        /// done, for the startup log, or null when sub-agents are off.
+        ///
+        /// <para>
+        /// The default cap (4) is sized for conversations taking turns. The cap is one
+        /// global LRU across scopes, and every sub-agent round publishes state into it, so
+        /// with the default a parent waiting on its agents loses its own retained state
+        /// within the agents' first round — measured on gemma-4-E2B: the parent's round
+        /// after <c>wait_agent</c> reused only the public prefix, 3178 of 3690 prompt
+        /// tokens, instead of everything it had already computed.
+        /// </para>
+        /// </summary>
+        public string? ApplyEngineDefaults()
+        {
+            if (!Enabled)
+                return null;
+
+            string? configured = Environment.GetEnvironmentVariable(RetainedStatesVariable);
+            if (!string.IsNullOrWhiteSpace(configured))
+            {
+                return int.TryParse(configured.Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out int set)
+                    && set > 0 && set < RecommendedRetainedStates
+                    ? $"{RetainedStatesVariable}={set} was set explicitly and is kept, though sub-agents need "
+                      + $"{RecommendedRetainedStates} ({MaxThreads} agents + the parent, 2 states each): a parent "
+                      + "may lose its cached state while its agents run and re-prefill its conversation"
+                    : $"{RetainedStatesVariable}={configured.Trim()} was set explicitly and is kept";
+            }
+
+            string value = RecommendedRetainedStates.ToString(CultureInfo.InvariantCulture);
+            Environment.SetEnvironmentVariable(RetainedStatesVariable, value);
+            return $"{RetainedStatesVariable} raised from the default 4 to {value} ({MaxThreads} agents + the parent, "
+                 + "2 retained states each), so a parent keeps its cached conversation while its sub-agents run";
+        }
+
         /// <summary>A copy, so a host can hand one to each request without sharing mutable state.</summary>
         public SubAgentOptions Clone() => new()
         {

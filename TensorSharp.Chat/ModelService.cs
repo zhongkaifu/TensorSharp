@@ -386,6 +386,9 @@ namespace TensorSharp.Server
             if (skills.SubAgents == null)
                 return Run(cancellationToken);
 
+            // The parent outranks its own sub-agents for preemption; see ChatTurnContext.Priority.
+            turn.Priority = 1;
+
             return RunWithSubAgentsAsync(
                 skills, Run,
                 launch => SubAgentGenerator(session, launch, turn, maxTokens, turnSampling, samplingConfig, enableThinking),

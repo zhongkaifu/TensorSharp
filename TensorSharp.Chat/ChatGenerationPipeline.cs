@@ -224,6 +224,15 @@ namespace TensorSharp.Server
         /// <summary>The engine cache scope (<see cref="SequenceState.CacheScope"/>), set by
         /// the first generation of the turn.</summary>
         public string CacheScope { get; set; }
+
+        /// <summary>
+        /// Scheduling priority for every generation of the turn
+        /// (<see cref="SequenceState.Priority"/>). Zero for ordinary turns. A turn that runs
+        /// sub-agents raises its own, because under KV pressure the engine preempts the
+        /// lowest-ranked, newest sequence — which would otherwise be the parent's round
+        /// submitted after its agents, the one thing every agent's result is waiting on.
+        /// </summary>
+        public int Priority { get; set; }
     }
 
     internal sealed class ChatGenerationPipeline : IDisposable
@@ -614,7 +623,10 @@ namespace TensorSharp.Server
                 mediaSpans: mediaSpans,
                 cacheBreakpoints: explicitBreakpoints,
                 sharedPrefixTokens: sharedPrefixTokens,
-                cacheScope: cacheScope);
+                cacheScope: cacheScope)
+            {
+                Priority = turnContext.Priority,
+            };
 
             promptSw.Stop();
             long promptNs = InferenceTelemetry.ToNanos(promptSw.ElapsedTicks);
