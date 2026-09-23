@@ -1046,6 +1046,33 @@ public class SubAgentRuntimeTests
         Assert.StartsWith("agent_2 started", spawned.Content, StringComparison.Ordinal);
     }
 
+    [Theory]
+    [InlineData(24, 12)]
+    [InlineData(8, 8)]
+    [InlineData(16, 8)]
+    [InlineData(40, 20)]
+    [InlineData(4, 4)]
+    [InlineData(1, 1)]
+    public void SubAgentRounds_IsHalfTheParentsBudget_AtLeastEight_NeverMore(int parent, int expected) =>
+        Assert.Equal(expected, SubAgentRuntime.SubAgentRounds(parent));
+
+    [Fact]
+    public async Task AChildThatRunsOutOfRounds_IsReportedAsIncomplete()
+    {
+        // The parent's budget is 24, so the child gets 12: it keeps calling list_agents
+        // with a different argument each round (so the identical-round guard stays out
+        // of it) until the budget runs out.
+        using var h = new SubAgentHarness(loopOptions: new SkillAgentLoopOptions { MaxRounds = 24 });
+        h.Script("agent_1", generation => Task.FromResult(
+            Steps.Turn(string.Empty, Steps.Tool(SkillToolNames.ListAgents, ("attempt", generation.Index)))));
+        await h.Spawn("never finishes").Within();
+        await h.WaitForStatusAsync("agent_1", SubAgentStatus.Completed).Within();
+
+        SkillToolResult waited = await h.Root(SkillToolNames.WaitAgent, ("targets", "agent_1")).Within(2);
+        Assert.Contains("ran out of its round budget", waited.Content, StringComparison.Ordinal);
+        Assert.Equal(13, h.Snapshot("agent_1").Rounds);
+    }
+
     [Fact]
     public async Task Close_OfAFinishedChildWhoseAnswerWasNeverDelivered_HandsTheAnswerOver()
     {

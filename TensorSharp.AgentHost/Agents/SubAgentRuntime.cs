@@ -766,6 +766,7 @@ namespace TensorSharp.AgentHost.Agents
                             agent.StartedAt = Stopwatch.GetTimestamp();
                             agent.TurnRounds = 0;
                             agent.TurnInvocations.Clear();
+                            agent.TurnHitRoundLimit = false;
                         }
                         input = agent.History;
                     }
@@ -799,6 +800,7 @@ namespace TensorSharp.AgentHost.Agents
                         agent.ToolCalls += result.Invocations.Count;
                         agent.TurnRounds += result.Rounds;
                         agent.TurnInvocations.AddRange(result.Invocations);
+                        agent.TurnHitRoundLimit |= result.HitRoundLimit;
                         if (agent.Status == SubAgentStatus.Closed)
                             return;
                         // Stopped (closed, or the turn ended) while its last round was
@@ -1002,12 +1004,29 @@ namespace TensorSharp.AgentHost.Agents
             };
         }
 
+        /// <summary>
+        /// A sub-agent's round budget: half its parent's, at least 8, never more than the
+        /// parent's own.
+        ///
+        /// <para>
+        /// A sub-agent has one scoped task, and the parent's whole turn waits on it: when a
+        /// small model fails that task in a loop, every round it keeps is the parent's time
+        /// too. Measured on Qwen3.5-9B Q8_0 with the parent's 24 rounds: the four agents of
+        /// one turn finished in 3-5 rounds each, and the fifth kept patching and re-running
+        /// a broken program for all 24 — eighteen minutes, with its parent in wait_agent
+        /// for every one of them. Eight covers the write-run-fix cycles a real sub-task
+        /// takes; a task that needs more is one to do in the parent, or to split.
+        /// </para>
+        /// </summary>
+        internal static int SubAgentRounds(int parentRounds) =>
+            Math.Min(Math.Max(1, parentRounds), Math.Max(8, parentRounds / 2));
+
         private SkillAgentLoopOptions ChildLoopOptions(SubAgent agent)
         {
             SkillAgentLoopOptions baseOptions = _binding.LoopOptions ?? SkillAgentLoopOptions.Default;
             return new SkillAgentLoopOptions
             {
-                MaxRounds = baseOptions.MaxRounds,
+                MaxRounds = SubAgentRounds(baseOptions.MaxRounds),
                 MaxCallsPerRound = baseOptions.MaxCallsPerRound,
                 ToolResultsAreRendered = baseOptions.ToolResultsAreRendered,
                 ClientTools = baseOptions.ClientTools,
@@ -1320,6 +1339,8 @@ namespace TensorSharp.AgentHost.Agents
             List<string> files = calls.SelectMany(c => c.Files).Select(f => f.Name).Distinct(StringComparer.Ordinal).ToList();
             if (files.Count > 0)
                 sb.Append("; files produced: ").Append(string.Join(", ", files.Take(12))).Append(files.Count > 12 ? ", ..." : string.Empty);
+            if (agent.TurnHitRoundLimit)
+                sb.Append("; it ran out of its round budget before finishing, so treat the answer as incomplete");
             return sb.Append(')').ToString();
         }
 
@@ -1605,6 +1626,9 @@ namespace TensorSharp.AgentHost.Agents
 
         /// <summary>Every tool call of the latest task, for the record the parent is given.</summary>
         public List<SkillToolInvocation> TurnInvocations { get; } = new();
+
+        /// <summary>True when the latest task ended because it ran out of rounds.</summary>
+        public bool TurnHitRoundLimit { get; set; }
         public long StartedAt { get; set; } = Stopwatch.GetTimestamp();
         public long FinishedAt { get; set; }
         public long FinishOrder { get; set; }
