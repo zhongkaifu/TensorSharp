@@ -122,6 +122,29 @@ ends is stopped.
 - **Streaming.** While `wait_agent` runs, the Web UI shows what each agent is
   doing (`agent_1: round 2: shell`) under "Waiting for sub-agents…".
 
+### Bounds on a sub-agent
+
+A sub-agent's turn is bounded more tightly than its parent's, because the parent's
+whole turn waits on it:
+
+- **Rounds:** half the parent's budget, at least 8 and never more than the
+  parent's own (12 with `--code-exec`, whose parent budget is 24). An agent that
+  runs out is reported as such, so the parent treats the answer as incomplete.
+- **Repeated calls:** a round that repeats the previous round's calls exactly
+  for the third time is answered, not run ("you have made this exact call 3
+  rounds in a row..."); one more identical round ends the agent's task.
+- **Non-results:** a turn that ran no tools and answered with a patch envelope
+  as text, or with nothing at all, gets one correction round.
+
+Both were found by the benchmarks below: on Qwen3.5-9B Q8_0 one agent re-sent
+the same failing `apply_patch` byte for byte for ten consecutive rounds, and in
+another run kept patching and re-running a broken program for all 24 of its
+parent's rounds (18 minutes) while its three siblings finished in 3–5. With the
+budget, the same `code4` turns took 509–551 s instead of 1565–1736 s, and both
+runs answered correctly instead of one — still far slower than the 36 s one agent
+needs on its own for that model and task, which is a property of the model on
+that task: the budget bounds the damage, it does not make delegation pay.
+
 ## KV cache
 
 Two things decide how much a sub-agent costs.
@@ -176,6 +199,51 @@ scenarios and reads these lines back per request.
 | `wait_agent` timeout | default 30 s, 10 s – 1 h | default 300 s, same clamp | returns early anyway; local agents are slower |
 | Forks | drop tool calls from the copied history | keep them | the copied prefix is only worth copying if it matches the parent's KV |
 | End of turn | instructed to wait | host collects outstanding agents | small models forget |
+
+## Measured results
+
+Measured on an Apple M5 Pro (48 GB, Metal) with `eng/validation/sub-agents-e2e.py`
+against a running server started with `--code-exec --sub-agents`, temperature 0.
+Each row is one scenario in three modes over the same server: **parallel** (the
+prompt asks for one sub-agent per task, started together), **serial** (the same
+sub-agents, one at a time — the concurrency control), and **solo** (one agent
+does every task itself). `code4` is four programming tasks whose answers a model
+cannot recite (checked by an independent program); the cell is the median wall
+time and how many runs got all four numbers right.
+
+| Model | parallel | serial | solo | parallel vs serial |
+|---|---|---|---|---|
+| gemma-4-E2B Q8_0 | 15.7 s, 3/3 | 25.9 s, 2/3 | 13.2 s, 1/3 | 1.65× |
+| gemma-4-E4B Q8_0 | 31.0 s, 3/3 | 63.6 s, 3/3 | 23.4 s, 3/3 | 2.05× |
+| Qwen3.5-9B IQ4_XS | 44.9 s, 3/3 | 63.7 s, 3/3 | 22.7 s, 3/3 | 1.42× |
+
+What the numbers say:
+
+- **Running agents concurrently works.** The same delegation done in parallel is
+  1.4–2× faster than done serially, which is the engine batching the agents'
+  decode on one model. It is bounded by how well the model batches: four
+  concurrent gemma-4-E4B streams decoded at ≈68 tok/s together against ≈41 tok/s
+  for one; four Qwen3.5-9B IQ4_XS streams at ≈52 against ≈47.
+- **Delegation has a fixed cost.** The parent writes each task out, and reads and
+  merges each answer. On short tasks like these one agent doing everything is
+  faster; delegation pays when each task is long and its result is short.
+- **It can be more reliable.** On gemma-4-E2B, one agent doing four tasks in one
+  context got all four right in 1 of 3 runs; four focused sub-agents did in 3 of 3.
+- **The prefix is shared.** A sub-agent's first round reused 91–95% of its prompt
+  from the parent's cached instructions-and-tools prefix on every model; forked
+  agents resumed from the parent's own state and prefilled only their task.
+
+Every sub-agent scenario of the harness — parallel computation (`compute3`),
+files written by two agents and read back by the parent (`files2`), a forked
+agent that needs the parent's context (`fork`), agents the model was told not to
+wait for (`guard`, collected by the host), four paragraphs (`write4`) — passes in
+every run on all three models.
+
+**No regression with the feature off.** The unmodified `main` server and this one
+with `--sub-agents` off, same model and requests, 4 runs each: `compute3` 9.11 s
+vs 9.06 s, `files2` 2.81 s vs 2.81 s, `write4` 12.80 s vs 12.78 s, all with
+byte-identical answers, round counts and KV reuse (`code4`'s answers vary from
+run to run in both builds, because tool output contains per-run workspace paths).
 
 ## Limits and caveats
 
