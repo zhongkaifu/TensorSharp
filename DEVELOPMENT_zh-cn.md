@@ -538,7 +538,7 @@ dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj
 
 #### 测试分组（Test lanes）
 
-测试按两个维度打标（声明见 `InferenceWeb.Tests/TestAssemblyConfig.cs`）：`Category=Bench` 用普通 `[Trait]` 标记含时延/吞吐断言的基准测试类；`Requires=Cuda|Mlx|Models` 标记测试对环境的依赖（`Models` = 需要测试模型目录下的真实 GGUF 权重）。依赖环境的测试使用 `InferenceWeb.Tests/GatedFacts.cs` 中的门控特性编写 —— `[CudaFact]`/`[CudaTheory]`、`[MlxFact]`/`[MlxTheory]`、`[ModelFact("ENV_VAR", "gguf-substring")]`/`[ModelTheory(...)]` —— 它们会自动附加对应的 `Requires` trait，并在前提条件缺失时显式跳过。在测试中直接调用 `CudaBackend.IsAvailable()`/`MlxBackend.IsAvailable()` 会产生编译错误（`BannedSymbols.txt`）：请改用门控特性。未打标的 `[Fact]`/`[Theory]` 是自包含的正确性测试，可在任何环境运行。不带过滤器的 `dotnet test` 运行全部测试；用 `--filter` 选择分组：
+测试按两个维度打标（声明见 `InferenceWeb.Tests/TestAssemblyConfig.cs`）：`Category=Bench` 用普通 `[Trait]` 标记含时延/吞吐断言的基准测试类；`Requires=Cuda|Mlx|Models` 标记测试对环境的依赖（`Models` = 需要测试模型目录下的真实 GGUF 权重）。依赖环境的测试使用 `InferenceWeb.Tests/GatedFacts.cs` 中的门控特性编写 —— `[CudaFact]`/`[CudaTheory]`、`[MlxFact]`/`[MlxTheory]`、`[ModelFact("ENV_VAR", "gguf-substring")]`/`[ModelTheory(...)]` —— 它们会自动附加对应的 `Requires` trait，并在前提条件缺失时显式跳过。构造固定 GGML 后端但不需要权重的测试使用 `[GgmlFact(BackendType.GgmlCpu)]`/`[GgmlTheory(...)]`（trait 为 `Requires=GgmlCpu` 等）：原生桥接每个进程只允许一个 GGML 后端，因此除非 `TS_TEST_GGML_BACKEND` 固定为该后端，否则会显式跳过。在测试中直接调用 `CudaBackend.IsAvailable()`/`MlxBackend.IsAvailable()` 会产生编译错误（`BannedSymbols.txt`）：请改用门控特性。未打标的 `[Fact]`/`[Theory]` 是自包含的正确性测试，可在任何环境运行。不带过滤器的 `dotnet test` 运行全部测试；用 `--filter` 选择分组：
 
 ```bash
 # 内循环（边改边测）：与环境无关的正确性测试，任何机器上数秒内跑完。

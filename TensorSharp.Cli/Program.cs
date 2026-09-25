@@ -224,6 +224,24 @@ namespace TensorSharp.Cli
             codeExecOptions.ApplyEnvironment();
             args = remainingArgs.ToArray();
 
+            // LoRA plug-ins (--lora, --lora-scale, --lora-config) are consumed here, in
+            // order, because a scale or a config binds to the --lora before it; the switch
+            // below never sees them. They are resolved (plug-in weights downloaded) only
+            // once the model is known to take them, just before it loads.
+            List<LoraSpec> loraSpecs;
+            try
+            {
+                var withoutLora = new List<string>();
+                loraSpecs = LoraCliFlags.Parse(args, withoutLora);
+                args = withoutLora.ToArray();
+            }
+            catch (ArgumentException ex)
+            {
+                Console.Error.WriteLine("Configuration error: " + ex.Message);
+                Environment.ExitCode = HostExitCodes.ConfigurationError;
+                return;
+            }
+
             // Pick up the KV cache dtype from the KV_CACHE_DTYPE environment variable
             // before parsing CLI args. The --kv-cache-dtype flag below overrides this.
             KvCacheDtypeConfig.ConfigureFromEnvironment();
@@ -794,6 +812,53 @@ namespace TensorSharp.Cli
             ApplyVideoCompanionOverride("--video-text-encoder", videoTextEncoderPath, "TS_VIDEO_TEXT_ENCODER", "TS_WAN_TE");
             ApplyVideoCompanionOverride("--video-dit2", videoDit2Path, "TS_VIDEO_DIT2", "TS_WAN_DIT2");
             ApplyVideoCompanionOverride("--audio-vae", videoAudioVaePath, "TS_VIDEO_AUDIO_VAE");
+
+            // LoRA plug-ins apply to Qwen-Image-2.1's transformer only. Probe the file's
+            // architecture first, so a text or video model is refused before a plug-in
+            // downloads its weights or the model loads, and nothing is applied silently.
+            if (loraSpecs.Count > 0 ||
+                !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable(LoraCliFlags.EnvironmentVariable)))
+            {
+                string loraArchitecture = null;
+                try
+                {
+                    using var probe = new GgufFile(modelPath);
+                    loraArchitecture = ModelArchitectureRegistry.Resolve(probe.GetString("general.architecture"), probe).Id;
+                }
+                catch (Exception)
+                {
+                    // An unreadable or unknown model file is reported by the load itself.
+                }
+                if (loraArchitecture != null && loraArchitecture != "qwen_image")
+                {
+                    if (loraSpecs.Count > 0)
+                    {
+                        Console.Error.WriteLine($"Configuration error: {LoraCliFlags.LoraFlag} applies to Qwen-Image-2.1 models only; " +
+                            $"'{Path.GetFileName(modelPath)}' ({loraArchitecture}) does not take LoRA plug-ins.");
+                        Environment.ExitCode = HostExitCodes.ConfigurationError;
+                        return;
+                    }
+                    _log.LogWarning(LogEventIds.HostConfiguration,
+                        "{EnvVar} names LoRA plug-ins, but {Model} ({Architecture}) does not take them; it runs without them.",
+                        LoraCliFlags.EnvironmentVariable, Path.GetFileName(modelPath), loraArchitecture);
+                }
+                else if (loraSpecs.Count > 0)
+                {
+                    try
+                    {
+                        loraSpecs = LoraCliFlags.Resolve(loraSpecs);
+                    }
+                    catch (Exception ex) when (ex is ArgumentException or IOException)
+                    {
+                        // A missing file, a malformed plug-in, a failed or mismatched download.
+                        Console.Error.WriteLine("Configuration error: " + ex.Message);
+                        Environment.ExitCode = HostExitCodes.ConfigurationError;
+                        return;
+                    }
+                    Environment.SetEnvironmentVariable(LoraCliFlags.EnvironmentVariable, LoraCliFlags.ToJson(loraSpecs));
+                    _log.LogInformation(LogEventIds.HostConfiguration, "LoRA plug-ins: {Loras}", LoraCliFlags.Describe(loraSpecs));
+                }
+            }
 
             if (MoeCpuOffloadConfig.IsEnabled)
             {

@@ -145,6 +145,7 @@ are reused afterward. If you already have a file at that `path`, it is used as-i
 | [`variables.json`](variables.json) | Gemma-4 26B-A4B: model + mmproj + MTP draft | One shared root/repo reused across three related files |
 | [`auto-download.json`](auto-download.json) | Qwen3.5-9B (~8.9 GB) | Auto-download demo using a public GGUF |
 | [`qwen-image-2.1.json`](qwen-image-2.1.json) | Qwen-Image-2.1 Q4_K_M + dedicated VAE + Qwen3-VL-8B + projector | Text-to-image and editing; pinned, checksum-verified downloads |
+| [`lora/qwen-image-2.1-*.json`](lora/) | Twelve Qwen-Image-2.1 LoRA plug-ins (weights only) | `--lora` plug-ins on top of `qwen-image-2.1.json`: step-distilled 4–8-step recipes, styles and editing skills; see [below](#qwen-image-21-lora-plug-ins-lora) |
 | [`minimax-h3-fl2va.json`](minimax-h3-fl2va.json) | MiniMax-H3 FL2VA: DiT + Qwen3-VL-32B + video VAE + audio VAE (~33.5 GB) | **Video and 32 kHz stereo audio in one packed latent**; text-to-video, image-to-video, first/last frame |
 | [`minimax-h3-ref2va.json`](minimax-h3-ref2va.json) | MiniMax-H3 Ref2VA: DiT + Qwen3-VL-32B + video VAE + audio VAE (~33.4 GB) | The same four networks, reference checkpoint: up to nine stills, clips and soundtracks |
 | [`wan-video-ti2v-5b-turbo.json`](wan-video-ti2v-5b-turbo.json) | Wan 2.2 TI2V-5B Turbo: DiT + video VAE + UMT5 (~9.5 GB) | Video only, 4-step distilled, text- **and** image-to-video |
@@ -201,13 +202,59 @@ Notes:
 - **Qwen-Image-2.1** ([`qwen-image-2.1.json`](qwen-image-2.1.json)): `--prompt "…"
   --output out.png` generates an image, and adding `--image in.png` edits it instead.
   `--diffusion-steps` (default 40), `--cfg` (default 1), `--diffusion-seed` and
-  `--width` / `--height` (multiples of 32) are CLI flags. See
+  `--width` / `--height` (multiples of 32) are CLI flags. Add a LoRA plug-in from
+  [`lora/`](#qwen-image-21-lora-plug-ins-lora) with `--lora`. See
   [the Qwen-Image-2.1 guide](../docs/models/qwenimage21.md).
 - **DiffusionGemma** uses the CLI's iterative denoising path; tune it with
   `--diffusion-steps` / `--diffusion-seed` on the command line.
 - To make any of these auto-download on another machine, turn a `"model": "…path…"`
   string into an object: `{ "path": "…", "urls": ["https://…"] }` (see the examples
   above).
+
+## Qwen-Image-2.1 LoRA plug-ins (`lora/`)
+
+The files in [`lora/`](lora/) are **not** host configs: they are LoRA plug-ins that
+you add to a Qwen-Image-2.1 run with `--lora`, on either host. Each one names its
+weights with a pinned URL and SHA-256, downloaded on first use to
+`$TENSORSHARP_MODELS/qwen-image-2.1/loras` (or `models/qwen-image-2.1/loras` in the
+repository when the variable is unset), and may carry a default strength and a
+sampling recipe:
+
+```bash
+TensorSharp.Cli --config config/qwen-image-2.1.json \
+  --lora config/lora/qwen-image-2.1-viggle-turbo.json --prompt "…" --width 1024 --height 1024
+
+TensorSharp.Server --config config/qwen-image-2.1.json --lora config/lora/qwen-image-2.1-pruna-8step.json
+```
+
+| File | Plug-in |
+|------|---------|
+| [`qwen-image-2.1-viggle-turbo.json`](lora/qwen-image-2.1-viggle-turbo.json) | Viggle Turbo step distillation: 6 steps by default (4–8 supported), CFG 1 |
+| [`qwen-image-2.1-pruna-8step.json`](lora/qwen-image-2.1-pruna-8step.json) | Pruna DMD step distillation: 8 steps on fixed sigmas, CFG 1 |
+| [`qwen-image-2.1-pruna-5step.json`](lora/qwen-image-2.1-pruna-5step.json) | Pruna DMD step distillation: 5 steps on fixed sigmas, CFG 1; faster, lower quality than 8 |
+| [`qwen-image-2.1-fun-acc-4step.json`](lora/qwen-image-2.1-fun-acc-4step.json) | Alibaba PAI Fun-Acc PDD bundle: 4 steps with per-step output heads; forwards its `pdd_config.json` |
+| [`qwen-image-2.1-film-stills.json`](lora/qwen-image-2.1-film-stills.json) | Danrisi Film Stills: cinematic 35 mm film-still style, strength 0.7 |
+| [`qwen-image-2.1-grainscape.json`](lora/qwen-image-2.1-grainscape.json) | Danrisi Grainscape: grainy 35 mm colour-negative look, strength 0.7 |
+| [`qwen-image-2.1-fix.json`](lora/qwen-image-2.1-fix.json) | e-n-v-y Qwen-Image-2.1-Fix: a DoRA quality fix |
+| [`qwen-image-2.1-detail-enhancer.json`](lora/qwen-image-2.1-detail-enhancer.json) | elusarca Detail Enhancer (editing): detail, upscaling and restoration |
+| [`qwen-image-2.1-natural-exposure.json`](lora/qwen-image-2.1-natural-exposure.json) | prithivMLmods Natural Exposure (editing): balanced, neutral exposure |
+| [`qwen-image-2.1-anime-consistency.json`](lora/qwen-image-2.1-anime-consistency.json) | WarmBloodAban Anime Consistency: consistent anime characters across edits, strength 0.7 |
+| [`qwen-image-2.1-object-remover.json`](lora/qwen-image-2.1-object-remover.json) | prithivMLmods Object Remover Bbox (editing): removes red-boxed objects |
+| [`qwen-image-2.1-object-mover.json`](lora/qwen-image-2.1-object-mover.json) | prithivMLmods Object Mover Bbox (editing): moves an object from one red box to the other |
+
+Notes:
+
+- **Explicit settings win.** `--diffusion-steps` / `--cfg` (or a server request's
+  `steps` / `cfg`) override a plug-in's recipe; a step count the recipe has no
+  schedule for is refused, naming the supported ones.
+- **Stack by repeating `--lora`**, but only one plug-in per run may carry a
+  sampling recipe. `--lora-scale` after a `--lora` overrides its strength.
+- **Check each license.** Every file's comments cite the model card, any trigger
+  phrase and the license; several are under the Qwen Research License
+  (non-commercial).
+- The plug-in format (`"type": "qwen-image-2.1-lora"`, `weights`, `scale`,
+  `sampling`, or a forwarded `config`) is described in
+  [USAGE.md](../USAGE.md#qwen-image-21-lora-plug-ins).
 
 ## Agent configs
 

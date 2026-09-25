@@ -137,8 +137,16 @@ dotnet run --project TensorSharp.Cli -c Release --no-build -- \
   --image generated.png \
   --prompt 'Change the blue vase to a red vase. Preserve the cat, lighting and composition.' \
   --width 2048 --height 2048 --diffusion-steps 40 --cfg 1 \
-  --diffusion-seed 42 --output edited.png</code></pre>
-  <p>Companions, geometry and the draft settings are on <a href="models-image.html#imagegen">Image Generation</a>.</p>
+  --diffusion-seed 42 --output edited.png
+
+# A LoRA plug-in: config/lora/ plug-ins download their weights on first use, and a
+# step-distilled one brings its sampling recipe (here 6 steps, CFG 1).
+dotnet run --project TensorSharp.Cli -c Release --no-build -- \
+  --config config/qwen-image-2.1.json \
+  --lora config/lora/qwen-image-2.1-viggle-turbo.json \
+  --prompt 'A small orange cat beside a blue ceramic vase, soft daylight, detailed photograph' \
+  --width 1024 --height 1024 --diffusion-seed 42 --output turbo.png</code></pre>
+  <p>Companions, geometry, the draft settings and the <a href="models-image.html#lora">LoRA plug-ins</a> are on <a href="models-image.html#imagegen">Image Generation</a>.</p>
 
   <h3 id="video">Video generation</h3>
   <p><strong>MiniMax-H3</strong> denoises the video and a native 32&nbsp;kHz stereo soundtrack in <em>one</em> packed latent, so the audio comes out of the same forward pass as the picture. It is CFG-distilled, so <code>--cfg 1.0</code> is required — TensorSharp refuses anything higher — and 4–8 steps is the fast operating point against a 20-step default:</p>
@@ -328,9 +336,12 @@ dotnet run --project TensorSharp.Cli/TensorSharp.Cli.csproj -- \
       <tr><td><code>--diffusion-seed &lt;N&gt;</code></td><td>DiffusionGemma deterministic sampler seed (default: 0).</td></tr>
       <tr><td><code>--diffusion-blocks &lt;N&gt;</code></td><td>Block-autoregressive canvas count (<code>0</code> derives it from <code>--max-tokens</code>).</td></tr>
       <tr><td><code>--image &lt;path&gt;</code> / <code>--prompt &lt;text&gt;</code> / <code>--output &lt;path&gt;</code></td><td>Qwen-Image-2.1: reference image for editing (repeatable; omit <code>--image</code> to generate), the prompt, and the output PNG (default <code>generated.png</code>, or <code>edited.png</code> when editing). Reuses <code>--diffusion-steps</code> (default 40) / <code>--diffusion-seed</code>.</td></tr>
-      <tr><td><code>--cfg &lt;F&gt;</code></td><td>Qwen-Image-2.1 true-CFG guidance scale (omit for auto: 1.0, one transformer prediction per step; <code>&lt;= 1</code> disables the negative pass).</td></tr>
+      <tr><td><code>--cfg &lt;F&gt;</code></td><td>Qwen-Image-2.1 true-CFG guidance scale (omit for auto: 1.0, one transformer prediction per step, or a <code>--lora</code> plug-in's recipe; <code>&lt;= 1</code> disables the negative pass).</td></tr>
       <tr><td><code>--qwen-image-vae / --qwen-image-vl / --qwen-image-mmproj &lt;path&gt;</code></td><td>Override the resolved Qwen-Image-2.1 companions (dedicated 2.1 VAE / Qwen3-VL-8B text encoder / Qwen3-VL-8B mmproj).</td></tr>
-      <tr><td><code>--qwen-image-lora</code> · <code>--offload-cpu</code></td><td><strong>Removed and rejected at startup, including as <code>--config</code> keys.</strong> There is no replacement: both served only the earlier Qwen-Image-Edit pipeline, and Qwen-Image-2.1 loads no LoRA adapters and keeps its DiT weights resident.</td></tr>
+      <tr><td><code>--lora &lt;path&gt;</code></td><td>Qwen-Image-2.1 LoRA plug-in: a LoRA <code>.safetensors</code> or a TensorSharp plug-in config <code>.json</code> (see <code>config/lora/</code>). Repeat to stack. Applied unmerged on top of the quantized transformer; refused with any other model. → <a href="models-image.html#lora">LoRA plug-ins</a></td></tr>
+      <tr><td><code>--lora-scale &lt;f&gt;</code></td><td>Strength of the preceding <code>--lora</code> (multiplies alpha / rank). Default: the plug-in config's <code>"scale"</code>, else 1.0.</td></tr>
+      <tr><td><code>--lora-config &lt;path&gt;</code></td><td>Companion config of the preceding <code>--lora</code>: a TensorSharp LoRA config, a PEFT <code>adapter_config.json</code> or a VideoX-Fun <code>pdd_config.json</code>. A plug-in's recipe supplies steps, sigmas and CFG unless <code>--diffusion-steps</code> / <code>--cfg</code> are given.</td></tr>
+      <tr><td><code>--qwen-image-lora</code> · <code>--offload-cpu</code></td><td><strong>Removed and rejected at startup, including as <code>--config</code> keys.</strong> Both served only the earlier Qwen-Image-Edit pipeline. <code>--qwen-image-lora</code> is replaced by <code>--lora</code>; <code>--offload-cpu</code> has no replacement, because Qwen-Image-2.1 keeps its DiT weights resident.</td></tr>
       <tr><td><code>--width &lt;px&gt;</code> / <code>--height &lt;px&gt;</code></td><td>Fixed Qwen-Image-2.1 output size, in multiples of 32 (default <code>0</code> = auto: 2048×2048 for generation, or about that area at the first reference's aspect ratio for editing).</td></tr>
       <tr><td><code>--benchmark</code></td><td>Run a synthetic prefill/decode throughput benchmark.</td></tr>
       <tr><td><code>--bench-prefill / --bench-decode / --bench-runs &lt;N&gt;</code></td><td>Synthetic prefill length, decode length, and run count.</td></tr>

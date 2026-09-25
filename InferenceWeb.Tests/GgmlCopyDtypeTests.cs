@@ -14,7 +14,7 @@ namespace InferenceWeb.Tests;
 // fallback's float* cursor.
 public class GgmlCopyDtypeTests
 {
-    [Fact]
+    [GgmlFact(BackendType.GgmlCpu)]
     public void Copy_Float16_ContiguousTensors_RoundTripsExactBits()
     {
         var context = new GgmlContext(new[] { 0 }, GgmlBackendType.Cpu);
@@ -30,7 +30,7 @@ public class GgmlCopyDtypeTests
         Assert.Equal(expected, actual);
     }
 
-    [Fact]
+    [GgmlFact(BackendType.GgmlCpu)]
     public void Copy_Float16_NarrowedKvCacheLayout_PreservesEachHeadIndependently()
     {
         const int heads = 3;
@@ -83,7 +83,7 @@ public class GgmlCopyDtypeTests
         }
     }
 
-    [Fact]
+    [GgmlFact(BackendType.GgmlCpu)]
     public void Copy_CrossDtype_Throws()
     {
         var context = new GgmlContext(new[] { 0 }, GgmlBackendType.Cpu);

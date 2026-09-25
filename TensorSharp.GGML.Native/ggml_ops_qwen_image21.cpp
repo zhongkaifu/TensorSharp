@@ -28,7 +28,8 @@ namespace {
 struct Upload { ggml_tensor* tensor; const void* data; size_t bytes; };
 struct Resident { const void* key; size_t bytes; ggml_backend_buffer_t buffer; };
 // Per-step inputs: which descriptor array feeds a graph input, and from where.
-enum Field { kImages, kText, kTime, kCos, kSin };
+// kHead is the adapter's per-call output head (F16 or F32); the others are F32.
+enum Field { kImages, kText, kTime, kCos, kSin, kHead };
 struct InputBinding { ggml_tensor* tensor; Field field; size_t offset; };
 enum class Mode { Full, Extract, Cached };
 
@@ -37,15 +38,27 @@ bool option_enabled(const char* name, bool default_value) {
     return value ? value[0] != '0' : default_value;
 }
 
-const float* field_data(const TSGQi21Desc& d, Field field) {
+// Start of an input's data; `offset` counts F32 elements for the F32 fields.
+const void* field_data(const TSGQi21Desc& d, Field field, size_t offset) {
     switch (field) {
-        case kImages: return d.images;
-        case kText: return d.text;
-        case kTime: return d.time_embedding;
-        case kCos: return d.cos;
-        case kSin: return d.sin;
+        case kImages: return d.images + offset;
+        case kText: return d.text + offset;
+        case kTime: return d.time_embedding + offset;
+        case kCos: return d.cos + offset;
+        case kSin: return d.sin + offset;
+        case kHead: return d.adapter ? d.adapter->output_head : nullptr;
     }
     return nullptr;
+}
+
+bool has_update(const TSGQi21Lora& l) { return l.rank > 0 || l.row_scale; }
+
+size_t lora_down_bytes(const TSGQi21Lora& l) {
+    return ggml_row_size(static_cast<ggml_type>(l.type), l.in) * static_cast<size_t>(l.rank);
+}
+
+size_t lora_up_bytes(const TSGQi21Lora& l) {
+    return ggml_row_size(static_cast<ggml_type>(l.type), l.rank) * static_cast<size_t>(l.out);
 }
 
 // Attention reads F16 K/V with flash attention on Metal, and on CUDA unless the
@@ -97,6 +110,15 @@ bool same_segments(const TSGQi21Segment* a, const TSGQi21Segment* b, int count) 
     return true;
 }
 
+// A LoRA's buffers as weight-key entries: a retained graph or stored prefix built with
+// other factors (or none) must never serve this adapter. The shared-shrink layout is
+// derived from these pointers, so it is covered too.
+void append_lora(std::vector<TSGQi21Weight>& key, const TSGQi21Lora& l) {
+    key.push_back({l.down, l.type, l.rank, l.in, l.out, static_cast<int64_t>(l.rank > 0 ? lora_down_bytes(l) : 0)});
+    key.push_back({l.up, l.type, l.rank, l.rank, l.out, static_cast<int64_t>(l.rank > 0 ? lora_up_bytes(l) : 0)});
+    key.push_back({l.row_scale, GGML_TYPE_F32, 0, l.out, 1, l.row_scale ? l.out * int64_t(sizeof(float)) : 0});
+}
+
 std::vector<TSGQi21Weight> weights(const TSGQi21Desc& d) {
     std::vector<TSGQi21Weight> result = {d.image_in, d.text_in, d.text_out,
         d.time_in, d.time_out, d.modulation, d.norm_out, d.proj_out};
@@ -106,6 +128,18 @@ std::vector<TSGQi21Weight> weights(const TSGQi21Desc& d) {
         for (const auto* w : {&b.q, &b.k, &b.v, &b.out, &b.gate, &b.up, &b.down}) result.push_back(*w);
         for (void* p : {b.norm_q, b.norm_k})
             result.push_back({p, GGML_TYPE_F32, 0, d.head_dim, 1, d.head_dim * int64_t(sizeof(float))});
+    }
+    if (const TSGQi21Adapter* a = d.adapter) {
+        for (const auto* l : {&a->image_in, &a->text_in, &a->text_out, &a->time_in, &a->time_out,
+                              &a->modulation, &a->norm_out, &a->proj_out}) append_lora(result, *l);
+        if (a->blocks)
+            for (int i = 0; i < d.num_layers; ++i) {
+                const auto& l = a->blocks[i];
+                for (const auto* u : {&l.q, &l.k, &l.v, &l.out, &l.gate, &l.up, &l.down}) append_lora(result, *u);
+            }
+        // The head's data is a per-call input; only its presence and type shape the graph.
+        if (a->output_head)
+            result.push_back({nullptr, a->output_head_type, 1, d.dim, d.channels, 0});
     }
     return result;
 }
@@ -156,15 +190,77 @@ struct Builder {
         bind(t, p, n * sizeof(float));
         return t;
     }
-    ggml_tensor* input(Field field, size_t offset, int n0, int n1) {
-        auto t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n0, n1);
+    ggml_tensor* input(Field field, size_t offset, int n0, int n1, ggml_type type = GGML_TYPE_F32) {
+        auto t = ggml_new_tensor_2d(ctx, type, n0, n1);
         ggml_set_input(t);
         inputs.push_back({t, field, offset});
         return t;
     }
-    ggml_tensor* linear(const TSGQi21Weight& w, ggml_tensor* x) {
+    // x * factor with F32 accumulation: CUDA would otherwise run an F16 factor's
+    // product in F16 and Metal keeps F32 accumulators anyway.
+    ggml_tensor* lora_product(ggml_tensor* factor, ggml_tensor* x) {
+        auto result = ggml_mul_mat(ctx, factor, x);
+        ggml_prec_set_acc(result, GGML_PREC_F32);
+        return result;
+    }
+    // The down projections of `updates` applied to one shared input: [rank, seq] per
+    // update, null where an update has no low-rank term. Updates whose `down` factors sit
+    // back to back in one allocation run as one stacked shrink (x is read once), and an
+    // update that reuses the previous one's factor (a fused gate_up LoRA seen as its two
+    // halves) reuses its product.
+    std::vector<ggml_tensor*> shrink(std::initializer_list<const TSGQi21Lora*> updates, ggml_tensor* x) {
+        std::vector<const TSGQi21Lora*> list(updates);
+        std::vector<ggml_tensor*> result(list.size(), nullptr);
+        for (size_t i = 0; i < list.size();) {
+            const TSGQi21Lora* first = list[i];
+            if (!first || first->rank <= 0) { ++i; continue; }
+            if (x->ne[0] != first->in) throw std::invalid_argument("QwenImage21: LoRA input shape mismatch");
+            // Extend the run while the next factor starts where this one ends.
+            size_t end = i + 1;
+            int64_t rank = first->rank;
+            const char* next = static_cast<const char*>(first->down) + lora_down_bytes(*first);
+            while (end < list.size() && list[end] && list[end]->rank > 0 && list[end]->type == first->type &&
+                   list[end]->in == first->in && list[end]->down == next) {
+                rank += list[end]->rank;
+                next += lora_down_bytes(*list[end]);
+                ++end;
+            }
+            auto down = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(first->type), first->in, rank);
+            bind(down, first->down, static_cast<size_t>(next - static_cast<const char*>(first->down)));
+            auto t = lora_product(down, x);
+            size_t offset = 0;
+            for (size_t j = i; j < end; ++j) {
+                result[j] = end - i == 1 ? t :
+                    ggml_view_2d(ctx, t, list[j]->rank, t->ne[1], t->nb[1], offset * sizeof(float));
+                offset += static_cast<size_t>(list[j]->rank);
+            }
+            // Shared factor: the same bytes describe the next updates' down projections.
+            if (end - i == 1)
+                while (end < list.size() && list[end] && list[end]->rank > 0 &&
+                       list[end]->down == first->down && list[end]->rank == first->rank &&
+                       list[end]->type == first->type && list[end]->in == first->in)
+                    result[end++] = t;
+            i = end;
+        }
+        return result;
+    }
+    // base (x's projection) plus an update: the DoRA row scale on the base, then the
+    // low-rank term up * shrunk, where shrunk = down * x from shrink().
+    ggml_tensor* adapt(ggml_tensor* base, const TSGQi21Lora& l, ggml_tensor* shrunk) {
+        if (l.out != base->ne[0]) throw std::invalid_argument("QwenImage21: LoRA output shape mismatch");
+        if (l.row_scale) base = ggml_mul(ctx, base, gain(l.row_scale, static_cast<int>(l.out)));
+        if (l.rank <= 0) return base;
+        auto up = ggml_new_tensor_2d(ctx, static_cast<ggml_type>(l.type), l.rank, l.out);
+        bind(up, l.up, lora_up_bytes(l));
+        return ggml_add(ctx, base, lora_product(up, shrunk));
+    }
+    ggml_tensor* linear(const TSGQi21Weight& w, ggml_tensor* x, const TSGQi21Lora* lora = nullptr,
+                        ggml_tensor* shrunk = nullptr) {
         if (x->ne[0] != w.ne0) throw std::invalid_argument("QwenImage21: projection shape mismatch");
-        return ggml_mul_mat(ctx, weight(w), x);
+        auto y = ggml_mul_mat(ctx, weight(w), x);
+        if (!lora || !has_update(*lora)) return y;
+        if (lora->rank > 0 && !shrunk) shrunk = shrink({lora}, x)[0];
+        return adapt(y, *lora, shrunk);
     }
     ggml_tensor* slice(ggml_tensor* x, int start, int length) {
         return ggml_view_2d(ctx, x, x->ne[0], length, x->nb[1], start * x->nb[1]);
@@ -353,6 +449,44 @@ void validate(const TSGQi21Desc* d) {
         if (end != d->total_seq || d->segments[d->num_segments - 1].start != d->prefix_seq ||
             !d->segments[d->num_segments - 1].is_image)
             throw std::invalid_argument("QwenImage21: missing target image segment");
+        if (const TSGQi21Adapter* a = d->adapter) {
+            if (a->struct_bytes != sizeof(TSGQi21Adapter) || a->num_layers != d->num_layers)
+                throw std::invalid_argument("QwenImage21: invalid LoRA adapter descriptor");
+            // Every update must fit the projection it modifies; the graph also checks the
+            // shapes it actually builds, but a bad descriptor should fail before any work.
+            auto check = [](const TSGQi21Lora& l, const TSGQi21Weight& w, const char* what) {
+                if (!has_update(l)) return;
+                const bool typed = l.type == GGML_TYPE_F16 || l.type == GGML_TYPE_F32;
+                if (l.rank < 0 || l.in != w.ne0 || l.out != w.ne1 || !w.data ||
+                    (l.rank > 0 && (!typed || !l.down || !l.up)))
+                    throw std::invalid_argument(std::string("QwenImage21: LoRA update does not fit ") + what);
+            };
+            check(a->image_in, d->image_in, "img_in");
+            check(a->text_in, d->text_in, "txt_in.in_layer");
+            check(a->text_out, d->text_out, "txt_in.out_layer");
+            check(a->time_in, d->time_in, "timestep_embedder.linear_1");
+            check(a->time_out, d->time_out, "timestep_embedder.linear_2");
+            check(a->modulation, d->modulation, "modulation.1");
+            check(a->norm_out, d->norm_out, "norm_out.linear");
+            check(a->proj_out, d->proj_out, "proj_out");
+            if (a->output_head && ((a->output_head_type != GGML_TYPE_F16 && a->output_head_type != GGML_TYPE_F32) ||
+                                   has_update(a->proj_out)))
+                throw std::invalid_argument("QwenImage21: an output head replaces proj_out and cannot carry a LoRA");
+            if (a->blocks)
+                for (int i = 0; i < d->num_layers; ++i) {
+                    const auto& l = a->blocks[i];
+                    const auto& w = d->blocks[i];
+                    check(l.q, w.q, "attn.to_q");
+                    check(l.k, w.k, "attn.to_k");
+                    check(l.v, w.v, "attn.to_v");
+                    check(l.out, w.out, "attn.to_out.0");
+                    check(l.gate, w.gate, "img_mlp gate");
+                    if (w.up.data) check(l.up, w.up, "img_mlp up");
+                    else if (has_update(l.up))
+                        throw std::invalid_argument("QwenImage21: a fused gate_up weight takes its LoRA as one gate update");
+                    check(l.down, w.down, "img_mlp.out");
+                }
+        }
 }
 
 // Retained graphs that read a cache must not outlive it.
@@ -386,7 +520,9 @@ std::unique_ptr<ForwardGraph> build_graph(const TSGQi21Desc* d, bool persistent,
         const int seq = d->total_seq - first;
         const int prefix = cached ? 0 : d->prefix_seq;
         const int num_segments = static_cast<int>(segments.size());
-        size_t nodes = static_cast<size_t>(d->num_layers) * (190 + num_segments * 45) + 1024;
+        // A LoRA adds at most a shrink, a row scale, an expand and an add per projection.
+        size_t nodes = static_cast<size_t>(d->num_layers) * (190 + num_segments * 45 + (d->adapter ? 64 : 0)) + 1024 +
+            (d->adapter ? 128 : 0);
         ggml_init_params init{ggml_tensor_overhead() * (nodes + 1024) + ggml_graph_overhead_custom(nodes, false), nullptr, true};
         result->ctx = ggml_init(init);
         if (!result->ctx) throw std::runtime_error("QwenImage21: graph context allocation failed");
@@ -424,19 +560,25 @@ std::unique_ptr<ForwardGraph> build_graph(const TSGQi21Desc* d, bool persistent,
             b.constants.push_back({mask, data.data(), data.size() * sizeof(ggml_fp16_t)});
             mask_tensors.push_back(mask);
         }
-        time = ggml_silu(ctx, b.linear(d->time_out, ggml_silu(ctx, b.linear(d->time_in, time))));
-        auto mod = b.linear(d->modulation, time);
+        const TSGQi21Adapter* adapter = d->adapter;
+        auto global = [adapter](TSGQi21Lora TSGQi21Adapter::*member) -> const TSGQi21Lora* {
+            return adapter ? &(adapter->*member) : nullptr;
+        };
+        time = ggml_silu(ctx, b.linear(d->time_out,
+            ggml_silu(ctx, b.linear(d->time_in, time, global(&TSGQi21Adapter::time_in))), global(&TSGQi21Adapter::time_out)));
+        auto mod = b.linear(d->modulation, time, global(&TSGQi21Adapter::modulation));
         std::vector<ggml_tensor*> modulation;
         for (int i = 0; i < 4; ++i)
             modulation.push_back(ggml_cont(ctx, ggml_view_2d(ctx, mod, d->dim, 2, mod->nb[1], i * d->dim * sizeof(float))));
-        images = b.linear(d->image_in, images);
+        images = b.linear(d->image_in, images, global(&TSGQi21Adapter::image_in));
         ggml_tensor* joint = nullptr;
         if (cached) {
             joint = images;
         } else {
             auto norm = ggml_scale_bias(ctx, b.gain(d->text_norm, d->text_dim), 1.f, 1.f);
             text = ggml_mul(ctx, ggml_rms_norm(ctx, text, d->eps), norm);
-            text = b.linear(d->text_out, ggml_gelu(ctx, b.linear(d->text_in, text)));
+            text = b.linear(d->text_out, ggml_gelu(ctx, b.linear(d->text_in, text, global(&TSGQi21Adapter::text_in))),
+                global(&TSGQi21Adapter::text_out));
             for (const auto& s : segments) {
                 auto h = b.slice(s.is_image ? images : text, s.source_start, s.end - s.start);
                 joint = joint ? ggml_concat(ctx, joint, h, 1) : h;
@@ -445,10 +587,13 @@ std::unique_ptr<ForwardGraph> build_graph(const TSGQi21Desc* d, bool persistent,
         const ggml_type attn_type = cache ? cache->attn_type : GGML_TYPE_F32;
         for (int i = 0; i < d->num_layers; ++i) {
             const auto& w = d->blocks[i];
+            const TSGQi21BlockLora* l = adapter && adapter->blocks ? &adapter->blocks[i] : nullptr;
             auto h = b.modulate(ggml_norm(ctx, joint, d->eps), modulation[0], prefix, false);
-            auto q = ggml_reshape_3d(ctx, b.linear(w.q, h), d->head_dim, d->heads, seq);
-            auto k = ggml_reshape_3d(ctx, b.linear(w.k, h), d->head_dim, d->heads, seq);
-            auto v = ggml_reshape_3d(ctx, b.linear(w.v, h), d->head_dim, d->heads, seq);
+            // Q, K and V read the same input: one stacked LoRA shrink serves all three.
+            const auto qkv = l ? b.shrink({&l->q, &l->k, &l->v}, h) : std::vector<ggml_tensor*>(3, nullptr);
+            auto q = ggml_reshape_3d(ctx, b.linear(w.q, h, l ? &l->q : nullptr, qkv[0]), d->head_dim, d->heads, seq);
+            auto k = ggml_reshape_3d(ctx, b.linear(w.k, h, l ? &l->k : nullptr, qkv[1]), d->head_dim, d->heads, seq);
+            auto v = ggml_reshape_3d(ctx, b.linear(w.v, h, l ? &l->v : nullptr, qkv[2]), d->head_dim, d->heads, seq);
             q = ggml_mul(ctx, ggml_rms_norm(ctx, q, d->eps), b.gain(w.norm_q, d->head_dim));
             k = ggml_mul(ctx, ggml_rms_norm(ctx, k, d->eps), b.gain(w.norm_k, d->head_dim));
             q = b.rope(q, cos, sin, d->head_dim, d->heads, seq);
@@ -472,13 +617,17 @@ std::unique_ptr<ForwardGraph> build_graph(const TSGQi21Desc* d, bool persistent,
                 kp = ggml_permute(ctx, k, 0, 2, 1, 3);
                 vp = ggml_permute(ctx, v, 0, 2, 1, 3);
             }
-            h = b.linear(w.out, b.attention(qp, kp, vp, first, segments, d->heads, d->head_dim, mask_tensors));
+            // A row-parallel rank adds its partial LoRA term before the all-reduce: the
+            // sum over ranks of up * (down_r * x_r) is the whole update.
+            h = b.linear(w.out, b.attention(qp, kp, vp, first, segments, d->heads, d->head_dim, mask_tensors),
+                l ? &l->out : nullptr);
             if (d->tp_ranks > 1) result->boundaries.push_back(h);
             joint = ggml_add(ctx, joint, b.modulate(h, modulation[1], prefix, true));
             h = b.modulate(ggml_norm(ctx, joint, d->eps), modulation[2], prefix, false);
             ggml_tensor *gate = nullptr, *up = nullptr, *activated = nullptr;
             if (!w.up.data) {
-                auto gu = b.linear(w.gate, h);
+                // A fused projection carries at most one update, sized for both halves.
+                auto gu = b.linear(w.gate, h, l ? &l->gate : nullptr);
                 // The checkpoint stores [gate, up] in one projection. Upstream
                 // SwiGLU reads that layout directly, avoiding two FF-sized
                 // copies and a materialized SiLU activation per layer.
@@ -489,18 +638,31 @@ std::unique_ptr<ForwardGraph> build_graph(const TSGQi21Desc* d, bool persistent,
                     gate = ggml_cont(ctx, ggml_view_2d(ctx, gu, ff, seq, gu->nb[1], 0));
                     up = ggml_cont(ctx, ggml_view_2d(ctx, gu, ff, seq, gu->nb[1], ff * sizeof(float)));
                 }
-            } else { gate = b.linear(w.gate, h); up = b.linear(w.up, h); }
+            } else {
+                const auto gu = l ? b.shrink({&l->gate, &l->up}, h) : std::vector<ggml_tensor*>(2, nullptr);
+                gate = b.linear(w.gate, h, l ? &l->gate : nullptr, gu[0]);
+                up = b.linear(w.up, h, l ? &l->up : nullptr, gu[1]);
+            }
             if (!activated) {
                 auto fused = ggml_swiglu_split(ctx, gate, up);
                 activated = backend_supports_op(fused) ? fused : ggml_mul(ctx, up, ggml_silu(ctx, gate));
             }
-            h = b.linear(w.down, activated);
+            h = b.linear(w.down, activated, l ? &l->down : nullptr);
             if (d->tp_ranks > 1) result->boundaries.push_back(h);
             joint = ggml_add(ctx, joint, b.modulate(h, modulation[3], prefix, true));
         }
         auto target = b.slice(joint, prefix, seq - prefix);
-        auto scale = ggml_scale_bias(ctx, b.linear(d->norm_out, b.slice(time, 0, 1)), 1.f, 1.f);
-        auto output = b.linear(d->proj_out, ggml_mul(ctx, ggml_norm(ctx, target, d->eps), scale));
+        auto scale = ggml_scale_bias(ctx, b.linear(d->norm_out, b.slice(time, 0, 1), global(&TSGQi21Adapter::norm_out)), 1.f, 1.f);
+        auto normalized = ggml_mul(ctx, ggml_norm(ctx, target, d->eps), scale);
+        ggml_tensor* output;
+        if (adapter && adapter->output_head) {
+            // A per-call head replaces proj_out; its data is uploaded with the inputs.
+            auto head = b.input(kHead, 0, d->dim, d->channels, static_cast<ggml_type>(adapter->output_head_type));
+            output = ggml_mul_mat(ctx, head, normalized);
+            ggml_prec_set_acc(output, GGML_PREC_F32);
+        } else {
+            output = b.linear(d->proj_out, normalized, global(&TSGQi21Adapter::proj_out));
+        }
         ggml_set_output(output);
         ggml_build_forward_expand(graph, output);
         if (persistent) {
@@ -554,7 +716,7 @@ void upload_inputs(ForwardGraph& entry, const TSGQi21Desc& d) {
     host_read_barrier();
     for (const auto& input : entry.inputs)
         if (input.tensor->buffer)
-            ggml_backend_tensor_set(input.tensor, field_data(d, input.field) + input.offset, 0, ggml_nbytes(input.tensor));
+            ggml_backend_tensor_set(input.tensor, field_data(d, input.field, input.offset), 0, ggml_nbytes(input.tensor));
 }
 
 void run_graph(ForwardGraph& entry, const TSGQi21Desc& d) {
@@ -826,6 +988,8 @@ TSG_EXPORT int TSGgml_QwenImage21ForwardTp(const TSGQi21Desc* const* descs, int 
                 d.text_seq != a.text_seq || d.total_seq != a.total_seq || d.prefix_seq != a.prefix_seq ||
                 d.num_layers != a.num_layers || d.num_segments != a.num_segments || d.eps != a.eps ||
                 d.prefix_cache_key != a.prefix_cache_key || d.prefix_cache_type != a.prefix_cache_type ||
+                (d.adapter == nullptr) != (a.adapter == nullptr) ||
+                (d.adapter && (d.adapter->output_head == nullptr) != (a.adapter->output_head == nullptr)) ||
                 !same_segments(d.segments, a.segments, a.num_segments))
                 throw std::invalid_argument("QwenImage21: tensor-parallel ranks disagree on the forward shape");
         }

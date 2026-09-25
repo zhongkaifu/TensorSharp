@@ -333,6 +333,21 @@ namespace TensorSharp.Server.Host.Hosting
                 new OptionHelp("--qwen-image-mmproj <path>",
                     "Qwen3-VL-8B vision projector GGUF, required for image editing. Default: same-directory scan.",
                     "--qwen-image-mmproj mmproj-Qwen3VL-8B-Instruct-F16.gguf"),
+                new OptionHelp("--lora <path>",
+                    "Qwen-Image-2.1 LoRA plug-in: a LoRA .safetensors (diffusers/PEFT, ComfyUI, kohya, DiffSynth, DoRA or " +
+                    "VideoX-Fun PDD format) or a TensorSharp plug-in config .json from config/lora/ (downloads its weights on " +
+                    "first use and brings its strength and sampling recipe). Repeat to stack LoRAs. Applied unmerged on top " +
+                    "of the quantized transformer, so small distillation deltas are kept exactly. Default: none.",
+                    "--lora config/lora/qwen-image-2.1-viggle-turbo.json"),
+                new OptionHelp("--lora-scale <f>",
+                    "Strength of the preceding --lora (multiplies alpha / rank). Default: the plug-in config's \"scale\", else 1.0.",
+                    "--lora-scale 0.7"),
+                new OptionHelp("--lora-config <path>",
+                    "Companion config of the preceding --lora: a TensorSharp LoRA config (default strength and the sampling " +
+                    "recipe of a step-distilled LoRA; see config/lora/), a PEFT adapter_config.json or a VideoX-Fun " +
+                    "pdd_config.json. The recipe supplies steps, sigmas and CFG unless you set them. Default: none " +
+                    "(a PDD bundle's pdd_config.json is found next to its weights).",
+                    "--lora-config config/lora/qwen-image-2.1-viggle-turbo.json"),
             }),
             ("Video-generation defaults and companion models", new[]
             {

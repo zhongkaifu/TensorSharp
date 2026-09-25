@@ -9,16 +9,26 @@ namespace InferenceWeb.Tests;
 
 public sealed class NemotronAudioEncoderTests(ITestOutputHelper output)
 {
+    // The managed rows run in every lane. The native rows construct ggml-cpu, and a
+    // process holds one GGML backend, so they run in the lane that pins ggml-cpu and
+    // skip visibly in the others.
     [Theory]
-    [InlineData(false, false, 8)]
-    [InlineData(false, true, 8)]
-    [InlineData(true, false, 8)]
-    [InlineData(true, true, 8)]
-    [InlineData(false, false, 128)]
-    [InlineData(false, true, 128)]
-    [InlineData(true, false, 128)]
-    [InlineData(true, true, 128)]
-    public void OfficialParakeetAndProjection_AllRowsMatch(bool bf16, bool native, int melBins)
+    [InlineData(false, 8)]
+    [InlineData(true, 8)]
+    [InlineData(false, 128)]
+    [InlineData(true, 128)]
+    public void OfficialParakeetAndProjection_AllRowsMatch(bool bf16, int melBins)
+        => CheckOfficialParakeetAndProjection(bf16, native: false, melBins);
+
+    [GgmlTheory(BackendType.GgmlCpu)]
+    [InlineData(false, 8)]
+    [InlineData(true, 8)]
+    [InlineData(false, 128)]
+    [InlineData(true, 128)]
+    public void OfficialParakeetAndProjection_AllRowsMatch_GgmlCpu(bool bf16, int melBins)
+        => CheckOfficialParakeetAndProjection(bf16, native: true, melBins);
+
+    private void CheckOfficialParakeetAndProjection(bool bf16, bool native, int melBins)
     {
         using var json = ReadReference(melBins);
         JsonElement fixture = json.RootElement.GetProperty("fixtures")[bf16 ? 1 : 0];

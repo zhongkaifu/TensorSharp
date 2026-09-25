@@ -284,6 +284,17 @@ namespace TensorSharp.Server
                         Path.GetFileName(attachedDraft));
                 }
 
+                // --lora plug-ins apply to Qwen-Image-2.1's transformer only. Other models
+                // load without them; say so instead of letting the adapter vanish silently.
+                if (_model is not TensorSharp.Models.QwenImage.QwenImageModel &&
+                    TensorSharp.Runtime.LoraCliFlags.FromJson(Environment.GetEnvironmentVariable(
+                        TensorSharp.Runtime.LoraCliFlags.EnvironmentVariable)) is { Count: > 0 } loras)
+                {
+                    _logger.LogWarning(
+                        "LoRA plug-ins ({Loras}) apply to Qwen-Image-2.1 models only; {Model} ({Architecture}) runs without them.",
+                        TensorSharp.Runtime.LoraCliFlags.Describe(loras), LoadedModelName, Architecture ?? "unknown architecture");
+                }
+
                 loadSw.Stop();
                 long modelBytes = SafeGetFileSize(modelPath);
                 long mmProjBytes = SafeGetFileSize(mmProjPath);

@@ -5,6 +5,7 @@
 //
 // TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using TensorSharp.Core;
@@ -126,8 +127,58 @@ namespace TensorSharp.Models.QwenImage
                     using var vision = new GgufFile(_mmprojPath);
                     QwenImage21CompanionValidation.ValidateVision(vision);
                 }
+
+                // LoRA plug-ins from the host (--lora / TS_LORAS). They are loaded and checked
+                // against the transformer now, so a bad adapter fails before any request.
+                // Their configuration mistakes are refusals (one line, exit 2), not crashes.
+                if (!string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("TS_QWEN_IMAGE_LORA")))
+                    throw new ModelLoadRefusedException(
+                        "TS_QWEN_IMAGE_LORA belonged to the retired Qwen-Image-Edit-2511 pipeline. Pass Qwen-Image-2.1 LoRA plug-ins " +
+                        $"with --lora (the hosts publish them as {LoraCliFlags.EnvironmentVariable}) and unset TS_QWEN_IMAGE_LORA.");
+                try
+                {
+                    var specs = LoraCliFlags.FromJson(Environment.GetEnvironmentVariable(LoraCliFlags.EnvironmentVariable));
+                    if (specs.Count > 0) SetLoras(specs);
+                }
+                catch (Exception e) when (e is ArgumentException or System.Text.Json.JsonException or FormatException or
+                    KeyNotFoundException or (InvalidOperationException and not ModelLoadRefusedException))
+                {
+                    // Conflicting or malformed plug-in configs (two recipes, a JSON value of the
+                    // wrong kind) are the operator's to fix, like a bad tensor.
+                    throw new ModelLoadRefusedException("LoRA plug-in refused: " + e.Message, e);
+                }
             }
             catch { Dispose(); throw; }
+        }
+
+        /// <summary>The LoRA plug-ins in use (empty when none).</summary>
+        public IReadOnlyList<LoraSpec> LoraSpecs { get; private set; } = Array.Empty<LoraSpec>();
+
+        internal QwenImage21LoraSet Loras { get; private set; }
+
+        /// <summary>
+        /// Replace the LoRA plug-ins applied to every later request (an empty list removes them).
+        /// The adapters are validated against this transformer immediately; a failure leaves the
+        /// previous set in place.
+        /// </summary>
+        public void SetLoras(IReadOnlyList<LoraSpec> specs)
+        {
+            ArgumentNullException.ThrowIfNull(specs);
+            var resolved = LoraCliFlags.Resolve(specs);
+            QwenImage21LoraSet loaded = null;
+            if (resolved.Count > 0)
+            {
+                var timer = System.Diagnostics.Stopwatch.StartNew();
+                string prefix = _gguf.Tensors.ContainsKey("img_in.weight") ? "" : "model.diffusion_model.";
+                loaded = QwenImage21LoraSet.Load(resolved, _gguf, prefix, _backend, IsTensorParallel ? TpDegree : 1);
+                Console.WriteLine($"Qwen-Image-2.1 LoRA: {resolved.Count} plug-in(s), applied unmerged " +
+                    $"({loaded.FactorBytes / (1024.0 * 1024.0):F0} MiB of factors, loaded in {timer.Elapsed.TotalSeconds:F1}s)");
+                Console.WriteLine(loaded.Summary);
+            }
+            _pipeline21?.ResetTransformer();
+            Loras?.Dispose();
+            Loras = loaded;
+            LoraSpecs = resolved;
         }
 
         private static string ResolveVersion21Companion(string envVar, string dir, Func<string, bool> match)
@@ -188,6 +239,8 @@ namespace TensorSharp.Models.QwenImage
         public override void Dispose()
         {
             _pipeline21?.Dispose();
+            Loras?.Dispose();
+            Loras = null;
             _vaeSafetensors?.Dispose();
             _vaeGguf?.Dispose();
             _teGguf?.Dispose();

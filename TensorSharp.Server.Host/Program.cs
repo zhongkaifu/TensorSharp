@@ -197,8 +197,21 @@ bool continuousBatchingFlagApplied = ServerOptionsBuilder.ApplyContinuousBatchin
 bool specFlagsApplied = ServerOptionsBuilder.ApplySpeculativeCliFlags(args);
 // Translate --qwen-image-vae / --qwen-image-vl / --qwen-image-mmproj into the
 // TS_QWEN_IMAGE_* env vars QwenImageModel reads to locate the Qwen-Image-2.1 VAE,
-// Qwen3-VL-8B text encoder and mmproj. Must run before the startup model is loaded.
-bool qwenImageFlagsApplied = ServerOptionsBuilder.ApplyQwenImageCompanionCliFlags(args);
+// Qwen3-VL-8B text encoder and mmproj, and --lora / --lora-scale / --lora-config into
+// TS_LORAS. Must run before the startup model is loaded.
+bool qwenImageFlagsApplied;
+try
+{
+    qwenImageFlagsApplied = ServerOptionsBuilder.ApplyQwenImageCompanionCliFlags(args);
+}
+catch (Exception ex) when (ex is ArgumentException or IOException)
+{
+    // A missing companion or LoRA file, a --lora-scale without a --lora, a malformed or
+    // undownloadable plug-in: the operator's to fix, reported like Build's errors.
+    Console.Error.WriteLine("Configuration error: " + ex.Message);
+    Environment.ExitCode = HostExitCodes.ConfigurationError;
+    return;
+}
 // Translate --kv-cache-dtype into the process-wide KvCacheDtypeConfig (or honor
 // the KV_CACHE_DTYPE env var) so block-quantized / half-precision KV caches are
 // selectable on the server, mirroring the CLI. The fused native decode path used
@@ -451,6 +464,10 @@ if (qwenImageFlagsApplied)
         Environment.GetEnvironmentVariable("TS_QWEN_IMAGE_VAE") ?? "(scan)",
         Environment.GetEnvironmentVariable("TS_QWEN_IMAGE_TE") ?? "(scan)",
         Environment.GetEnvironmentVariable("TS_QWEN_IMAGE_MMPROJ") ?? "(scan)");
+    var loras = TensorSharp.Runtime.LoraCliFlags.FromJson(Environment.GetEnvironmentVariable(TensorSharp.Runtime.LoraCliFlags.EnvironmentVariable));
+    if (loras.Count > 0)
+        startupLogger.LogInformation(LogEventIds.HostConfiguration,
+            "LoRA plug-ins (applied to Qwen-Image-2.1 models only): {Loras}", TensorSharp.Runtime.LoraCliFlags.Describe(loras));
 }
 
 if (hostingOptions.UploadMaxFileBytes != UploadStoragePolicy.DefaultMaxFileBytes

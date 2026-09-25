@@ -18,6 +18,7 @@ using System.Text;
 using TensorSharp.AgentHost.CodeExec;
 using TensorSharp.AgentHost.Agents;
 using TensorSharp.AgentHost.Skills;
+using TensorSharp.Runtime;
 using TensorSharp.Runtime.Scheduling;
 using TensorSharp.Runtime.Speculative;
 
@@ -877,7 +878,9 @@ public static class ServerOptionsBuilder
     /// (<c>--qwen-image-vae</c> / <c>--qwen-image-vl</c> /
     /// <c>--qwen-image-mmproj</c>) into the env vars that
     /// <c>QwenImageModel</c> reads (<c>TS_QWEN_IMAGE_VAE</c> /
-    /// <c>TS_QWEN_IMAGE_TE</c> / <c>TS_QWEN_IMAGE_MMPROJ</c>) — the existing
+    /// <c>TS_QWEN_IMAGE_TE</c> / <c>TS_QWEN_IMAGE_MMPROJ</c>) and the LoRA plug-ins
+    /// (<c>--lora</c> / <c>--lora-scale</c> / <c>--lora-config</c>, published as
+    /// <c>TS_LORAS</c>) — the existing
     /// override mechanism for the three networks the qwen_image DiT GGUF does
     /// not itself contain — plus the output-size defaults and the video
     /// companions, which use the same env-var mechanism. Each path is validated
@@ -969,6 +972,15 @@ public static class ServerOptionsBuilder
                 changed = true;
                 continue;
             }
+        }
+        // LoRA plug-ins for the Qwen-Image-2.1 transformer, in one ordered pass of their
+        // own: --lora-scale and --lora-config bind to the --lora before them. The files
+        // are checked now, so a typo fails at startup rather than on the first request.
+        var loras = LoraCliFlags.Resolve(LoraCliFlags.Parse(args));
+        if (loras.Count > 0)
+        {
+            Environment.SetEnvironmentVariable(LoraCliFlags.EnvironmentVariable, LoraCliFlags.ToJson(loras));
+            changed = true;
         }
         return changed;
     }
@@ -1445,7 +1457,10 @@ public static class ServerOptionsBuilder
                 || TryReadOption(args, ref i, "--qwen-image-vl", out _)
                 || TryReadOption(args, ref i, "--qwen-image-mmproj", out _)
                 || TryReadOption(args, ref i, "--width", out _)
-                || TryReadOption(args, ref i, "--height", out _))
+                || TryReadOption(args, ref i, "--height", out _)
+                || TryReadOption(args, ref i, LoraCliFlags.LoraFlag, out _)
+                || TryReadOption(args, ref i, LoraCliFlags.ScaleFlag, out _)
+                || TryReadOption(args, ref i, LoraCliFlags.ConfigFlag, out _))
             {
                 continue;
             }
@@ -1537,6 +1552,7 @@ public static class ServerOptionsBuilder
         // knew the names.
         knownFlags.AddRange(CodeExecOptions.SwitchFlags);
         knownFlags.AddRange(CodeExecOptions.ValueFlags);
+        knownFlags.AddRange(LoraCliFlags.Flags);
         string? best = null;
         int bestDist = int.MaxValue;
         foreach (var flag in knownFlags)

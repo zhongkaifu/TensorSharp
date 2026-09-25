@@ -1,0 +1,23 @@
+{
+  // prithivMLmods Object Remover Bbox: removes the object(s) marked with red boxes and fills the background.
+  //
+  //   TensorSharp.Cli --config config/qwen-image-2.1.json --lora config/lora/qwen-image-2.1-object-remover.json --prompt "..."
+  //
+  // Draw a red box around the object on the input image; trigger: "Remove the red highlighted
+  // object from the scene". "turbo" in its name refers to the workflow it was tested with; it is
+  // not a step-distillation LoRA.
+  // Sampling: the checkpoint's own schedule (no recipe); --lora-scale overrides the strength.
+  // Source: https://huggingface.co/prithivMLmods/Qwen-Image-2.1-Object-Remover-Bbox-turbo. License: Qwen Research License (non-commercial).
+  "type": "qwen-image-2.1-lora",
+  "variables": {
+    "root": "${TENSORSHARP_MODELS:-../../models}/qwen-image-2.1/loras"
+  },
+  "weights": {
+    "path": "${root}/Qwen-Image-2.1-Object-Remover-Bbox-turbo-4000.safetensors",
+    "urls": [
+      "https://huggingface.co/prithivMLmods/Qwen-Image-2.1-Object-Remover-Bbox-turbo/resolve/90f708f53feb896a2873378629ffe414e0e584c0/Qwen-Image-2.1-Object-Remover-Bbox-turbo-4000.safetensors"
+    ],
+    "sha256": "7035eba6f25cdbd0c780027372710c9bebebdd814baaa79d48ce9d5ca80d6449"
+  },
+  "scale": 1.0
+}

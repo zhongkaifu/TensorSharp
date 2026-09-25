@@ -24,12 +24,16 @@ internal sealed class QwenImage21DiT : ModelBase
     private readonly QwenImage21ForwardArgs _nativeWeights;
     private readonly string _prefix;
     private readonly LayoutCache _layouts = new();
+    // LoRA plug-ins (owned by QwenImageModel), or null.
+    private readonly QwenImage21LoraSet _lora;
 
     /// <param name="tpGroup">When set, the blocks are sharded Megatron-style over its GPUs:
     /// whole attention heads and MLP columns per rank, two all-reduces per block.</param>
-    public QwenImage21DiT(string ggufPath, BackendType backend, ITensorParallelGroup tpGroup = null)
+    /// <param name="lora">LoRA plug-ins applied unmerged by the native graph, or null.</param>
+    public QwenImage21DiT(string ggufPath, BackendType backend, ITensorParallelGroup tpGroup = null, QwenImage21LoraSet lora = null)
         : base(ggufPath, backend, tpGroup?.Degree ?? 1, tpGroup)
     {
+        _lora = lora;
         try
         {
             if (!IsGgmlBackend) throw new NotSupportedException("Qwen-Image-2.1 requires a GGML backend (ggml-metal, ggml-cuda, ggml-vulkan or ggml-cpu).");
@@ -46,7 +50,7 @@ internal sealed class QwenImage21DiT : ModelBase
                 Modulation = Weight("modulation.1.weight", HiddenSize, 4 * HiddenSize),
                 NormOut = Weight("norm_out.linear.weight", HiddenSize, HiddenSize),
                 ProjOut = Weight("proj_out.weight", HiddenSize, Channels),
-                TextNorm = F32("txt_in.text_norm.weight", TextDim),
+                TextNorm = lora?.TextNorm is { } norm && norm != IntPtr.Zero ? norm : F32("txt_in.text_norm.weight", TextDim),
                 StructBytes = Marshal.SizeOf<QwenImage21ForwardArgs>(),
                 Dim = HiddenSize, Heads = Heads, HeadDim = HeadDim, Channels = Channels, TextDim = TextDim,
                 NumLayers = Layers, Eps = 1e-6f,
@@ -65,9 +69,17 @@ internal sealed class QwenImage21DiT : ModelBase
                     Gate = Weight(p + (fused ? "img_mlp.gate_up.weight" : "img_mlp.gate_layer.weight"), HiddenSize, fused ? 24576 : 12288),
                     Up = fused ? default : Weight(p + "img_mlp.proj.weight", HiddenSize, 12288),
                     Down = Weight(p + "img_mlp.out.weight", 12288, HiddenSize),
-                    NormQ = F32(p + "attn.norm_q.weight", HeadDim),
-                    NormK = F32(p + "attn.norm_k.weight", HeadDim),
+                    NormQ = lora != null && lora.NormQ[i] != IntPtr.Zero ? lora.NormQ[i] : F32(p + "attn.norm_q.weight", HeadDim),
+                    NormK = lora != null && lora.NormK[i] != IntPtr.Zero ? lora.NormK[i] : F32(p + "attn.norm_k.weight", HeadDim),
                 };
+                // A LoRA on the gate or up half of a fused projection: describe the two
+                // halves as row views so each takes its own update before SwiGLU.
+                if (fused && lora != null && lora.SplitGateUp[i])
+                {
+                    var gateUp = _blocks[i].Gate;
+                    _blocks[i].Gate = Rows(gateUp, 0, 12288);
+                    _blocks[i].Up = Rows(gateUp, 12288, 12288);
+                }
             }
             if (_gguf.Tensors.ContainsKey(_prefix + $"transformer_blocks.{Layers}.attn.to_q.weight"))
                 throw new NotSupportedException("Expected a 32-layer Qwen-Image-2.1 transformer.");
@@ -249,9 +261,12 @@ internal sealed class QwenImage21DiT : ModelBase
     /// <param name="imageSlots">One tag per text token: 0=text, 1..N=reference image.
     /// Each contiguous vision-slot run is replaced by four times as many latent tokens.</param>
     /// <param name="prefixCache">Optional cache created for these same conditioning arrays.</param>
+    /// <param name="step">Denoising step index; selects a LoRA bundle's per-step output head.</param>
+    /// <param name="bf16Timestep">Round the timestep as a bf16 pipeline does: sigma*1000 to bf16, then /1000 in bf16.</param>
     internal float[] Predict(float[] targetTokens, int latentH, int latentW, float[] textCond, int textSeq,
         float timestep01, int[] imageSlots = null, float[][] referenceTokens = null,
-        int[] referenceHeights = null, int[] referenceWidths = null, PrefixCache prefixCache = null)
+        int[] referenceHeights = null, int[] referenceWidths = null, PrefixCache prefixCache = null,
+        int step = 0, bool bf16Timestep = false)
     {
         if (latentH <= 0 || latentW <= 0 || targetTokens == null || targetTokens.Length != checked(latentH * latentW * Channels))
             throw new ArgumentException("Target must contain latentH*latentW*64 token-major floats.");
@@ -284,6 +299,8 @@ internal sealed class QwenImage21DiT : ModelBase
             foreach (var reference in referenceTokens) { reference.CopyTo(images, offset); offset += reference.Length; }
             targetTokens.CopyTo(images, offset);
         }
+        if (bf16Timestep) timestep01 = RoundBf16(RoundBf16(timestep01 * 1000f) / 1000f);
+        _lora?.SelectOutputHead(step);
         var time = new float[512];
         for (int i = 0; i < 128; ++i)
         {
@@ -310,6 +327,7 @@ internal sealed class QwenImage21DiT : ModelBase
             args.NumSegments = layout.Segments.Length;
             args.PrefixCacheKey = prefixCache?.Key ?? 0;
             args.PrefixCacheType = prefixCache?.Type ?? QwenImage21PrefixCacheType.Auto;
+            args.Adapter = _lora?.AdapterFor(0) ?? IntPtr.Zero;
             QwenImage21ForwardPath path;
             if (_rankBlocks == null)
                 path = GgmlBasicOps.QwenImage21Forward(in args);
@@ -322,6 +340,7 @@ internal sealed class QwenImage21DiT : ModelBase
                     ranks[r].Blocks = Pin(_rankBlocks[r]);
                     ranks[r].Heads = Heads / ranks.Length;
                     ranks[r].TpRanks = ranks.Length;
+                    ranks[r].Adapter = _lora?.AdapterFor(r) ?? IntPtr.Zero;
                 }
                 path = GgmlBasicOps.QwenImage21ForwardTp(ranks);
             }
@@ -331,6 +350,14 @@ internal sealed class QwenImage21DiT : ModelBase
         if (output.Any(v => !float.IsFinite(v)))
             throw new InvalidOperationException("Qwen-Image-2.1 DiT produced non-finite latent velocities.");
         return output;
+    }
+
+    /// <summary>Round to the nearest bfloat16 (ties to even), as torch's .to(torch.bfloat16).</summary>
+    internal static float RoundBf16(float value)
+    {
+        int bits = BitConverter.SingleToInt32Bits(value);
+        bits += 0x7FFF + ((bits >> 16) & 1);
+        return BitConverter.Int32BitsToSingle(bits & unchecked((int)0xFFFF0000));
     }
 
     /// <summary>Retains at most the two CFG layouts. Keys are copied because callers

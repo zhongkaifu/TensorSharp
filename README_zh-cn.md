@@ -196,7 +196,7 @@ curl http://127.0.0.1:5001/v1/embeddings -H 'Content-Type: application/json' \
 | Hunyuan Dense | 腾讯稠密 Hunyuan GGUF（`hunyuan-dense`），例如 Hy-MT2 系列 | — / — / — | — | — | [hunyuan-dense](docs/models/hunyuan-dense_zh-cn.md) |
 | DiffusionGemma | [diffusiongemma-26B-A4B-it](https://huggingface.co/unsloth/diffusiongemma-26B-A4B-it-GGUF)（视觉塔取自上游 safetensors 分片） | ✅ / — / — | — | — | [diffusiongemma](docs/models/diffusiongemma_zh-cn.md) |
 | Muse-Glimmer | [Muse-Glimmer-30B](https://huggingface.co/unsloth/Muse-Glimmer-30B-GGUF)（+ mmproj） | ✅ / — / — | ✅ | ✅ | [muse-glimmer](docs/models/muse-glimmer_zh-cn.md) |
-| Qwen-Image-2.1 | [Qwen-Image-2.1 GGUF](https://huggingface.co/Abiray/Qwen-Image-2.1-GGUF)（DiT + 专用 2.1 VAE + Qwen3-VL-8B） | 🖼️ 文本→图像、图像编辑；RGBA | — | — | [qwenimage21](docs/models/qwenimage21_zh-cn.md) |
+| Qwen-Image-2.1 | [Qwen-Image-2.1 GGUF](https://huggingface.co/Abiray/Qwen-Image-2.1-GGUF)（DiT + 专用 2.1 VAE + Qwen3-VL-8B） | 🖼️ 文本→图像、图像编辑；RGBA；LoRA 插件（`--lora`，含 4–8 步蒸馏） | — | — | [qwenimage21](docs/models/qwenimage21_zh-cn.md) |
 | MiniMax-H3 音视频 | [unsloth/MiniMax-H3-GGUF](https://huggingface.co/unsloth/MiniMax-H3-GGUF)（去噪器 + Qwen3-VL-32B 文本编码器）+ [Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3)（视频 VAE + 音频 VAE） | 🎬🔊 文本→视频、图像→视频、首尾帧、参考（图像/片段/音轨）→视频，**带立体声音频** | — | — | [minimax-h3](docs/models/minimax-h3_zh-cn.md) |
 | Wan 2.1 / 2.2 视频 | [Wan2.2-TI2V-5B](https://huggingface.co/QuantStack/Wan2.2-TI2V-5B-GGUF)（另有 [T2V-A14B](https://huggingface.co/QuantStack/Wan2.2-T2V-A14B-GGUF)、[I2V-A14B](https://huggingface.co/QuantStack/Wan2.2-I2V-A14B-GGUF)、[Wan2.1-T2V-14B](https://huggingface.co/city96/Wan2.1-T2V-14B-gguf)）+ UMT5-XXL + 视频 VAE · 快速路径：[TI2V-5B-Turbo](https://huggingface.co/hum-ma/Wan2.2-TI2V-5B-Turbo-GGUF)（4 步，DiT 前向次数减少 25×） | 🎬 文本→视频、图像→视频 | — | — | [wan](docs/models/wan_zh-cn.md) |
 
@@ -229,7 +229,7 @@ curl http://127.0.0.1:5001/v1/embeddings -H 'Content-Type: application/json' \
 | Hunyuan Dense | `hunyuan-dense` | 腾讯稠密 Hunyuan 解码器，例如 Hy-MT2（GQA，per-head QK-norm 在 NeoX RoPE **之后**，SwiGLU） | 仅文本 | 不支持 | 不支持 | — | [hunyuan-dense](docs/models/hunyuan-dense_zh-cn.md) |
 | Muse-Glimmer | `muse-glimmer`、`muse_glimmer` | Muse-Glimmer-30B（交错滑动窗口 + NoPE 全注意力层，注意力输出门控） | 图像 | 支持 | 支持（ATEM） | 支持（DFlash 块级草稿，独立 GGUF） | [muse-glimmer](docs/models/muse-glimmer_zh-cn.md) |
 | DiffusionGemma | `diffusion-gemma`、`diffusion_gemma` | diffusion-gemma 文本扩散 GGUF | 图像（聊天与 `/v1/systemone` Jev 判定）；不支持音频与视频 | 不支持 | 不支持 | — | [diffusiongemma](docs/models/diffusiongemma_zh-cn.md) |
-| Qwen-Image-2.1 | `qwen_image`、`qwen-image`（通过张量键识别 2.1） | Qwen-Image-2.1 DiT GGUF（+ 专用 2.1 VAE 与 Qwen3-VL-8B） | 文本→图像与图像编辑，RGBA 输出 | 不支持 | 不支持 | — | [qwenimage21](docs/models/qwenimage21_zh-cn.md) |
+| Qwen-Image-2.1 | `qwen_image`、`qwen-image`（通过张量键识别 2.1） | Qwen-Image-2.1 DiT GGUF（+ 专用 2.1 VAE 与 Qwen3-VL-8B） | 文本→图像与图像编辑，RGBA 输出；LoRA 插件 | 不支持 | 不支持 | — | [qwenimage21](docs/models/qwenimage21_zh-cn.md) |
 | MiniMax-H3 | `minimax-h3`、`minimax_h3`（官方发布的 GGUF 完全没有元数据，因此靠张量表识别） | MiniMax-H3 FL2VA / Ref2VA（193 亿参数的打包音视频 DiT + Qwen3-VL-32B 文本编码器、视频 VAE、音频 VAE） | 视频输出 **+ 32 kHz 立体声音频**（文本→视频、图像→视频、首尾帧、参考→视频） | 不支持 | 不支持 | — | [minimax-h3](docs/models/minimax-h3_zh-cn.md) |
 | Wan 视频 | `wan`、`wan2.1`、`wan2.2` | Wan 2.1 T2V 1.3B/14B、Wan 2.2 TI2V-5B、Wan 2.2 A14B T2V/I2V（双专家） | 视频输出（文本→视频、图像→视频） | 不支持 | 不支持 | — | [wan](docs/models/wan_zh-cn.md) |
 

@@ -1099,13 +1099,13 @@ explicit dimensions take precedence. Editing references are conditioned at
 approximately 1 megapixel each, or the output area if smaller.
 
 Omitted `steps`/`cfg` select 40 Euler steps and CFG 1, following the released
-2.1 model's recommendation. CFG 1 needs one transformer prediction per step;
-`negativePrompt` takes effect only with explicit CFG above 1, which also runs a
-negative prediction. For faster drafts, request 1024×1024 or explicitly select
+2.1 model's recommendation, unless a startup LoRA plug-in supplies its own recipe
+(see [LoRA plug-ins](#qwen-image-21-lora-plug-ins) below). CFG 1 needs one
+transformer prediction per step; `negativePrompt` takes effect only with explicit
+CFG above 1, which also runs a negative prediction. For faster drafts, request 1024×1024 or explicitly select
 25 steps, as in the official ComfyUI workflow; fewer steps can change quality.
 The [model guide](../docs/models/qwenimage21.md) records the official scheduler
-settings, source links and measured validation. Qwen-Image-2.1 does not load
-LoRA adapters.
+settings, source links and measured validation.
 
 ### Image Editing (`/api/image-edit`, Qwen-Image-2.1)
 
@@ -1114,7 +1114,8 @@ When the hosted `--model` is a Qwen-Image-2.1 DiT GGUF (architecture
 `/api/chat`:
 
 ```bash
-# One-shot edit (multipart). steps=0 / cfg=0 mean auto (40 steps / CFG 1).
+# One-shot edit (multipart). steps=0 / cfg=0 mean auto (40 steps / CFG 1, or the
+# startup LoRA plug-in's recipe).
 # Repeat the image part for multiple references.
 curl -X POST http://localhost:5000/api/image-edit \
   -F "image=@photo.png" \
@@ -1151,6 +1152,34 @@ followed by a final
 `{"done": true, "url": "/uploads/edit-<guid>.png", "width": ..., "height": ..., "elapsedSeconds": ...}`.
 Requests against a model that is not Qwen-Image-2.1 return 400; concurrent
 edits are serialized by a process-wide lock.
+
+### Qwen-Image-2.1 LoRA plug-ins
+
+LoRA plug-ins are chosen when the server starts, with the same `--lora`,
+`--lora-scale` and `--lora-config` flags as the CLI. The set applies to every
+generation and edit request; per-request LoRA selection is not implemented.
+
+```bash
+# A step-distillation plug-in: its recipe (8 steps, CFG 1) becomes the default
+# for every image request. Weights download and are hash-checked on first use.
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --config config/qwen-image-2.1.json \
+  --lora config/lora/qwen-image-2.1-pruna-8step.json
+
+# Omitted (or 0) steps / cfg select the plug-in's recipe
+curl --fail-with-body http://localhost:5000/api/image-generate \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"A cat beside a blue vase, soft daylight","width":1024,"height":1024,"seed":42}'
+```
+
+A request's `steps` and `cfg` still override the recipe. A plug-in with a
+schedule runs only the step counts it defines, so any other `steps` value is
+refused with the supported counts named (the Pruna 8-step plug-in supports 8).
+Style and editing plug-ins carry no recipe, so omitted values keep the model
+defaults (40 steps, CFG 1). Repeat `--lora` to stack plug-ins and use
+`--lora-scale` for strength. At startup the server logs
+`LoRA plug-ins (applied to Qwen-Image-2.1 models only): ...`. The flags, the
+shipped plug-ins and the plug-in config format are in
+[USAGE.md](../USAGE.md#qwen-image-21-lora-plug-ins).
 
 ### Video Generation (`/api/video-generate`, `/v1/videos/generations`)
 

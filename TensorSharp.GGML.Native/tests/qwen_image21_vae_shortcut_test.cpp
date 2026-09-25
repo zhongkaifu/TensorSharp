@@ -109,6 +109,15 @@ TSGgmlQwenVaeDesc descriptor(Feature& input, std::vector<float>& output, const s
     desc.struct_bytes = sizeof(desc);
     return desc;
 }
+// Relative bound on the largest error. CPU and Metal's direct convolution keep F32
+// end to end (2e-6). Upstream ggml-cuda runs F32 GEMMs through cuBLAS with
+// CUBLAS_TF32_TENSOR_OP_MATH (and TF32 MMA for small batches) on Ampere and later,
+// and NVIDIA Vulkan multiplies through F16 cooperative-matrix operands after the
+// native power-of-two rescale; both keep F32's exponent range but round operands to
+// 10-11 mantissa bits (~1e-4 relative here). The bound below still fails an F16
+// clip by several orders of magnitude, and the explicit >65504 checks stay exact.
+double g_relative_tolerance = 2e-6;
+
 void check(const std::vector<float>& actual, const std::vector<float>& expected, const std::string& label) {
     require(actual.size() == expected.size(), label + ": size mismatch");
     double maximum = 0, scale = 0;
@@ -117,7 +126,7 @@ void check(const std::vector<float>& actual, const std::vector<float>& expected,
         maximum = std::max(maximum, std::abs(double(actual[i]) - expected[i]));
         scale = std::max(scale, std::abs(double(expected[i])));
     }
-    require(maximum <= 2e-6 * std::max(1.0, scale), label + ": max error=" + std::to_string(maximum));
+    require(maximum <= g_relative_tolerance * std::max(1.0, scale), label + ": max error=" + std::to_string(maximum));
 }
 void run(Feature& input, const Feature& expected, const std::vector<TSGVaeOp>& ops, const std::string& label,
          const std::vector<TSGVaeWeightRef>& weights = {}) {
@@ -127,6 +136,18 @@ void run(Feature& input, const Feature& expected, const std::vector<TSGVaeOp>& o
     if (!TSGgml_QwenVaeRun(&desc))
         throw std::runtime_error(label + ": " + TSGgml_GetLastError());
     check(output, expected.values, label);
+}
+// The fused whole-VAE graph keeps F32 through activations beyond the F16 range on
+// CPU, CUDA and Metal. NVIDIA Vulkan multiplies through F16 cooperative-matrix
+// operands; only the per-convolution path (TSGgml_Conv2dF32) rescales its inputs for
+// that, so TensorSharp never runs the fused graph on Vulkan (QwenImage21Vae), and
+// these fused high-range cases are reported as skipped there, not passed.
+bool g_fused_high_range = true;
+int g_fused_high_range_skipped = 0;
+void run_high_range(Feature& input, const Feature& expected, const std::vector<TSGVaeOp>& ops, const std::string& label,
+                    const std::vector<TSGVaeWeightRef>& weights) {
+    if (!g_fused_high_range) { ++g_fused_high_range_skipped; return; }
+    run(input, expected, ops, label, weights);
 }
 void literal_cases() {
     Feature down(2, 2, 2);
@@ -220,7 +241,7 @@ void high_range_convolution_cases() {
         if (!TSGgml_Conv2dF32(&desc)) throw std::runtime_error(std::string("F32 convolution: ") + TSGgml_GetLastError());
         check(output,expected.values,"standalone convolution preserves values above F16 range");
         require(*std::max_element(output.begin(),output.end()) > 65504.f, "convolution output was clipped to F16 range");
-        run(input,expected,{conv},"fused convolution preserves values above F16 range",weights);
+        run_high_range(input,expected,{conv},"fused convolution preserves values above F16 range",weights);
         auto normalized = expected;
         for (int y = 0; y < input.h; ++y) for (int x = 0; x < input.w; ++x) {
             const double a = expected.at(0,y,x), b = expected.at(1,y,x);
@@ -228,7 +249,7 @@ void high_range_convolution_cases() {
             normalized.at(0,y,x) = static_cast<float>(a * inverse_rms * gamma[0]);
             normalized.at(1,y,x) = static_cast<float>(b * inverse_rms * gamma[1]);
         }
-        run(input,normalized,{conv,norm},"large convolution output followed by channel normalization",weights);
+        run_high_range(input,normalized,{conv,norm},"large convolution output followed by channel normalization",weights);
     }
     // Start with ordinary inputs, create >65504 activations in one projection,
     // consume them in another, then normalize. Input-only range checks cannot
@@ -247,7 +268,7 @@ void high_range_convolution_cases() {
         normalized.at(0,y,x) = static_cast<float>(a * inverse_rms);
         normalized.at(1,y,x) = static_cast<float>(b * inverse_rms);
     }
-    run(small,normalized,{first,second,norm},"internal large activation survives next convolution and normalization",weights);
+    run_high_range(small,normalized,{first,second,norm},"internal large activation survives next convolution and normalization",weights);
 }
 
 void high_range_matrix_convolution_cases() {
@@ -318,7 +339,7 @@ void high_range_matrix_convolution_cases() {
             conv.kh = conv.kw = 3; conv.sh = g.sh; conv.sw = g.sw;
             conv.pl = g.pl; conv.pr = g.pr; conv.pt = g.pt; conv.pb = g.pb;
             conv.aux = 1;
-            run(input, expected, {conv}, std::string("fused ") + g.name, weights);
+            run_high_range(input, expected, {conv}, std::string("fused ") + g.name, weights);
         }
     }
 }
@@ -363,11 +384,14 @@ int main(int argc, char** argv) {
     try {
         const bool cuda = argc >= 2 && std::string(argv[1]) == "cuda";
         const bool metal = argc >= 2 && std::string(argv[1]) == "metal";
+        const bool vulkan = argc >= 2 && std::string(argv[1]) == "vulkan";
         const bool missing_cudnn = argc == 3 && std::string(argv[2]) == "--missing-cudnn-runtime";
-        require(argc <= 3 && (argc == 1 || cuda || metal || std::string(argv[1]) == "cpu") &&
-            (argc < 3 || (cuda && missing_cudnn)), "usage: test [cpu|cuda|metal] [--missing-cudnn-runtime]");
-        const char* backend_name = cuda ? "cuda" : metal ? "metal" : "cpu";
-        if (!TSGgml_IsBackendAvailable(cuda ? 3 : metal ? 1 : 2)) {
+        require(argc <= 3 && (argc == 1 || cuda || metal || vulkan || std::string(argv[1]) == "cpu") &&
+            (argc < 3 || (cuda && missing_cudnn)), "usage: test [cpu|cuda|metal|vulkan] [--missing-cudnn-runtime]");
+        const char* backend_name = cuda ? "cuda" : metal ? "metal" : vulkan ? "vulkan" : "cpu";
+        if (cuda || vulkan) g_relative_tolerance = 1e-3;
+        if (vulkan) g_fused_high_range = false;
+        if (!TSGgml_IsBackendAvailable(cuda ? 3 : metal ? 1 : vulkan ? 4 : 2)) {
             std::printf("SKIP: %s backend unavailable: %s\n", backend_name, TSGgml_GetLastError());
             TSGgml_Shutdown(); return 77;
         }
@@ -400,6 +424,9 @@ int main(int argc, char** argv) {
         if (!metal) high_range_convolution_cases(); // recreate vendor handle after teardown
         high_range_matrix_convolution_cases();
         TSGgml_Shutdown();
+        if (g_fused_high_range_skipped)
+            std::printf("SKIP %s: %d fused whole-VAE high-range case(s); TensorSharp runs the per-convolution path on this "
+                "backend (not counted as coverage)\n", backend_name, g_fused_high_range_skipped);
         std::printf("PASS %s: %sF32 convolution above the F16 range, scratch release and backend recreation\n",
             backend_name, metal ? "" : "VAE2.1 shortcuts, shape/reuse recovery and ");
         return 0;

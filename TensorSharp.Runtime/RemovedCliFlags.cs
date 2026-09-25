@@ -42,7 +42,7 @@ namespace TensorSharp.Runtime
         {
             ("--qwen-image-lora",
                 "it only applied to the retired Qwen-Image-Edit-2511 pipeline. "
-                + "Qwen-Image-2.1 does not use LoRA adapters."),
+                + "Qwen-Image-2.1 takes LoRA plug-ins with --lora <file> (plus --lora-scale and --lora-config)."),
             ("--offload-cpu",
                 "it only applied to the retired Qwen-Image-Edit-2511 DiT. "
                 + "Qwen-Image-2.1 keeps its weights resident; use smaller --width/--height if memory is short."),

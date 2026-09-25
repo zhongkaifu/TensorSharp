@@ -1,0 +1,34 @@
+{
+  // Pruna 5-step v0.1: the faster DMD adapter ("noticeably lower visual quality" than 8-step).
+  //
+  //   TensorSharp.Cli --config config/qwen-image-2.1.json \
+  //       --lora config/lora/qwen-image-2.1-pruna-5step.json --prompt "..." --width 1024 --height 1024
+  //
+  // Recipe (model card; also embedded in the file as inference_sigmas): these sigmas with no
+  // shift, a terminal 0, CFG 1, strength 1 (PEFT alpha 128 / rank 64 = scale 2.0).
+  // License: Qwen Research License (non-commercial).
+  "type": "qwen-image-2.1-lora",
+  "variables": {
+    "root": "${TENSORSHARP_MODELS:-../../models}/qwen-image-2.1/loras"
+  },
+  "weights": {
+    "path": "${root}/p_qwen_image_2.1_5step_v0.1.safetensors",
+    "urls": [
+      "https://huggingface.co/PrunaAI/Pruna-Qwen-Image-2.1/resolve/113e63bb993001b3411eb3470b84fc444040cd7e/p_qwen_image_2.1_5step_v0.1.safetensors"
+    ],
+    "sha256": "021a6228a0fcd217275190b89072416a2f28548e8e18fe049531dc9b77ef89bd"
+  },
+  "scale": 1.0,
+  "sampling": {
+    "steps": 5,
+    "shift": "none",
+    "cfg": 1.0,
+    "sigmas": [
+      1.0,
+      0.94,
+      0.85714287,
+      0.6666667,
+      0.4
+    ]
+  }
+}

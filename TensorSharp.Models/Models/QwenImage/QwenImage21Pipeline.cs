@@ -13,7 +13,7 @@ namespace TensorSharp.Models.QwenImage
         private QwenImage21Vae _vae;
         private QwenImage21DiT _dit;
         private QwenImage21Vae Vae => _vae ??= new QwenImage21Vae(_model);
-        private QwenImage21DiT Dit => _dit ??= new QwenImage21DiT(_model.DitGgufPath, _model.Backend, _model.DitTensorParallelGroup);
+        private QwenImage21DiT Dit => _dit ??= new QwenImage21DiT(_model.DitGgufPath, _model.Backend, _model.DitTensorParallelGroup, _model.Loras);
 
         public QwenImage21Pipeline(QwenImageModel model) => _model = model;
 
@@ -24,18 +24,23 @@ namespace TensorSharp.Models.QwenImage
             ArgumentNullException.ThrowIfNull(p);
             if (p.Steps < 0 || !float.IsFinite(p.CfgScale) || p.CfgScale < 0)
                 throw new ArgumentException("Steps and CFG must be finite and nonnegative (zero selects the model default).");
-            if (!string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("TS_QWEN_IMAGE_LORA")))
-                throw new NotSupportedException("Qwen-Image-2.1 does not support LoRA adapters. Unset TS_QWEN_IMAGE_LORA.");
             foreach (var input in inputs) ArgumentNullException.ThrowIfNull(input);
             if (inputs.Length > 0 && _model.MmprojPath == null)
                 throw new InvalidOperationException("Qwen-Image-2.1 editing requires the Qwen3-VL-8B vision projector; set --qwen-image-mmproj or TS_QWEN_IMAGE_MMPROJ.");
 
             var (width, height) = ResolveDimensions(p, inputs.Length > 0 ? inputs[0] : null);
-            int steps = p.Steps == 0 ? 40 : p.Steps;
+            // A LoRA plug-in's recipe (a step-distilled adapter's trained schedule) supplies
+            // the defaults; explicit steps / CFG still win.
+            var recipe = _model.Loras?.Recipe;
+            int steps = p.Steps != 0 ? p.Steps : recipe is { DefaultSteps: > 0 } ? recipe.DefaultSteps : 40;
             // The released 2.1 checkpoint is intended for sampling without CFG.
             // An explicit value > 1 still opts into the additional negative pass.
-            float cfg = p.CfgScale == 0 ? 1f : p.CfgScale;
+            float cfg = p.CfgScale != 0 ? p.CfgScale : recipe?.Cfg ?? 1f;
             int h = height / 16, w = width / 16, sequence = checked(h * w);
+            // Validate the schedule before any encoder or VAE work.
+            float[] sigmas = recipe is { HasSchedule: true } ? recipe.Sigmas(steps, sequence) : QwenImage21Sampling.Sigmas(steps, sequence);
+            if (_model.Loras is { OutputHeads.Length: > 0 } bundle && bundle.OutputHeads.Length != steps)
+                throw new ArgumentException($"The LoRA bundle has one output head per trained step ({bundle.OutputHeads.Length}); it cannot run {steps} steps.");
             var total = Stopwatch.StartNew();
             var phase = Stopwatch.StartNew();
             void Phase(string name)
@@ -44,6 +49,8 @@ namespace TensorSharp.Models.QwenImage
                 phase.Restart();
             }
             Console.WriteLine($"Qwen-Image-2.1: {width}x{height}, {steps} steps, CFG {cfg}, seed {p.Seed}, {inputs.Length} reference(s)");
+            if (recipe is { HasSchedule: true })
+                Console.WriteLine($"  [lora] sampling recipe ({System.IO.Path.GetFileName(recipe.Source)}): {recipe.Describe(steps, sequence)}");
 
             try
             {
@@ -80,7 +87,6 @@ namespace TensorSharp.Models.QwenImage
                 GgmlBasicOps.ClearHostBufferCache();
 
                 float[] latents = ToTokens(QwenImage21Sampling.Noise(checked(sequence * 64), p.Seed), h, w);
-                float[] sigmas = QwenImage21Sampling.Sigmas(steps, sequence);
                 // Text and reference tokens are modulated at t=0, so their K/V are the
                 // same at every step: the first step stores them per CFG branch and the
                 // rest compute only the target image. Released before VAE decoding.
@@ -92,12 +98,13 @@ namespace TensorSharp.Models.QwenImage
                     for (int step = 0; step < steps; step++)
                     {
                         var timer = Stopwatch.StartNew();
+                        bool bf16Time = recipe?.TimestepBf16 ?? false;
                         float[] velocity = Dit.Predict(latents, h, w, positive, positiveLength, sigmas[step],
-                            positiveSlots, refTokens, refHeights, refWidths, positiveCache);
+                            positiveSlots, refTokens, refHeights, refWidths, positiveCache, step, bf16Time);
                         if (cfg > 1f)
                         {
                             float[] unconditional = Dit.Predict(latents, h, w, negative, negativeLength, sigmas[step],
-                                negativeSlots, refTokens, refHeights, refWidths, negativeCache);
+                                negativeSlots, refTokens, refHeights, refWidths, negativeCache, step, bf16Time);
                             for (int j = 0; j < velocity.Length; j++)
                                 velocity[j] = unconditional[j] + cfg * (velocity[j] - unconditional[j]);
                         }
@@ -244,6 +251,13 @@ namespace TensorSharp.Models.QwenImage
             for (int i = 0; i < count; i++)
                 for (int c = 0; c < 64; c++) result[c * count + i] = tokens[i * 64 + c];
             return result;
+        }
+
+        /// <summary>Release the transformer so the next request rebuilds it (a LoRA change).</summary>
+        internal void ResetTransformer()
+        {
+            _dit?.Dispose();
+            _dit = null;
         }
 
         public void Dispose()

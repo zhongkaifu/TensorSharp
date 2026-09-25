@@ -265,6 +265,13 @@ namespace TensorSharp.Runtime
                     break;
 
                 case JsonValueKind.Array:
+                    // A strength or config binds to the one --lora before it; an array would emit
+                    // them all after the last --lora, and all but the last would be lost.
+                    if (string.Equals(flag, LoraCliFlags.ScaleFlag, StringComparison.OrdinalIgnoreCase) ||
+                        string.Equals(flag, LoraCliFlags.ConfigFlag, StringComparison.OrdinalIgnoreCase))
+                        throw new ArgumentException(
+                            $"Configuration file '{configPath}': \"{key}\" binds to the one --lora before it and cannot be an array. " +
+                            "Stack LoRAs with plug-in .json files that carry their own \"scale\", or give each --lora its own --lora-scale on the command line.");
                     foreach (JsonElement element in value.EnumerateArray())
                         AppendArrayElement(configPath, configDirectory, variables, key, flag, element, output, context);
                     break;
@@ -302,6 +309,45 @@ namespace TensorSharp.Runtime
                 default:
                     throw new ArgumentException(
                         $"Configuration file '{configPath}' option '{key}' has an array element of type {element.ValueKind}; only strings, numbers, and download objects are supported in arrays.");
+            }
+        }
+
+        /// <summary>
+        /// Resolve the file entry <paramref name="key"/> of another JSON document that follows
+        /// this class's conventions (a LoRA plug-in config, say): <c>"variables"</c> and
+        /// <c>${name}</c> substitution, paths relative to the document, and a download spec
+        /// object fetched (and hash-checked) when the file is missing. A plain string is a path.
+        /// Returns null when the document has no such key.
+        /// </summary>
+        /// <exception cref="ArgumentException">The document or the entry is malformed.</exception>
+        /// <exception cref="FileNotFoundException">The file is missing and no URL names it.</exception>
+        /// <exception cref="IOException">No URL could supply the file.</exception>
+        public static string? ResolveFileEntry(string documentPath, string key)
+        {
+            string fullPath = Path.GetFullPath(documentPath);
+            JsonDocument document;
+            try
+            {
+                document = JsonDocument.Parse(File.ReadAllText(fullPath), ParseOptions);
+            }
+            catch (JsonException ex)
+            {
+                throw new ArgumentException($"'{fullPath}' is not valid JSON: {ex.Message}", ex);
+            }
+            using (document)
+            {
+                JsonElement root = document.RootElement;
+                if (root.ValueKind != JsonValueKind.Object || !root.TryGetProperty(key, out JsonElement entry))
+                    return null;
+                var variables = VariableResolver.FromConfig(fullPath, root);
+                string? directory = Path.GetDirectoryName(fullPath);
+                if (entry.ValueKind == JsonValueKind.Object)
+                    return ResolveDownloadSpec(fullPath, directory, variables, key, entry,
+                        new ExpandContext(Console.Error, interactiveProgress: !Console.IsErrorRedirected));
+                if (entry.ValueKind != JsonValueKind.String)
+                    throw new ArgumentException($"'{fullPath}': \"{key}\" must be a path or a download object.");
+                string raw = variables.Substitute(entry.GetString()!);
+                return Path.IsPathRooted(raw) ? Path.GetFullPath(raw) : Path.GetFullPath(Path.Combine(directory ?? ".", raw));
             }
         }
 

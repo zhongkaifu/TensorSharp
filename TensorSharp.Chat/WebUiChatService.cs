@@ -1274,18 +1274,30 @@ namespace TensorSharp.Chat
                 "Image request: prompt='{Prompt}' steps={Steps} cfg={Cfg} images={Count} bytes={Bytes}",
                 prompt, p.Steps, p.CfgScale, imageBytesList.Count, imageBytesList.Sum(b => (long)b.Length));
             var sw = Stopwatch.StartNew();
-            (int w, int h) = await Task.Run(() =>
+            int w, h;
+            try
             {
-                lock (_imageEditLock)
+                (w, h) = await Task.Run(() =>
                 {
-                    cancellationToken.ThrowIfCancellationRequested();
-                    var inputs = imageBytesList.ConvertAll(bytes => TensorSharp.Models.QwenImage.ImageIO.Decode(bytes, preserveAlpha: true));
-                    p.OnStep = (_, _, _) => cancellationToken.ThrowIfCancellationRequested();
-                    var output = generate ? model.GenerateImage(prompt, p) : model.EditImage(prompt, inputs, p);
-                    TensorSharp.Models.QwenImage.ImageIO.SavePng(outPath, output);
-                    return (output.Width, output.Height);
-                }
-            }, cancellationToken);
+                    lock (_imageEditLock)
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+                        var inputs = imageBytesList.ConvertAll(bytes => TensorSharp.Models.QwenImage.ImageIO.Decode(bytes, preserveAlpha: true));
+                        p.OnStep = (_, _, _) => cancellationToken.ThrowIfCancellationRequested();
+                        var output = generate ? model.GenerateImage(prompt, p) : model.EditImage(prompt, inputs, p);
+                        TensorSharp.Models.QwenImage.ImageIO.SavePng(outPath, output);
+                        return (output.Width, output.Height);
+                    }
+                }, cancellationToken);
+            }
+            catch (ArgumentException ex) when (ex is not ArgumentNullException)
+            {
+                // The pipeline refuses request settings before any encoder or DiT work: a step
+                // count a LoRA recipe has no schedule for, a size off the 32-pixel grid. The
+                // client's to fix, so a 400 with the reason rather than a 500.
+                logger.LogWarning(LogEventIds.UploadReceived, "Image request rejected: {Reason}", ex.Message);
+                throw new WebUiRequestRejectedException(400, new { error = ex.Message });
+            }
             sw.Stop();
             _uploads.RecordFile(outPath);
             string url = BuildUploadUrl(outName);

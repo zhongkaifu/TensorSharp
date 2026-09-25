@@ -15,8 +15,11 @@ using Xunit;
 //   Requires=Cuda     needs a CUDA device
 //   Requires=Mlx      needs the MLX native backend (macOS)
 //   Requires=Models   needs real GGUF weights (TS_TEST_MODEL_DIR and friends)
+//   Requires=GgmlCpu  constructs that GGML backend (likewise GgmlMetal/GgmlCuda/
+//                     GgmlVulkan); runs only in the lane whose TS_TEST_GGML_BACKEND
+//                     pins it (cpu by default), skips in the others
 // Requires traits come from the gated attributes in GatedFacts.cs
-// ([CudaFact], [MlxFact], [ModelFact], ...), which also skip visibly when the
+// ([CudaFact], [MlxFact], [ModelFact], [GgmlFact], ...), which also skip visibly when the
 // prerequisite is missing. Untagged tests are self-contained correctness
 // tests that run anywhere.
 // Common lanes:

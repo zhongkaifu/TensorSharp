@@ -148,6 +148,14 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --config config/qwen-image-2.1.js
 dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --config config/qwen-image-2.1.json --image generated.png \
     --prompt "Change the blue vase to a red vase. Preserve the cat, lighting and composition." --output edited.png
 
+# Qwen-Image-2.1 with a LoRA plug-in. config/lora/ holds ready-made ones that download
+# their weights on first use; a step-distilled plug-in also brings its sampling recipe
+# (here 6 steps, CFG 1). See "Qwen-Image-2.1 LoRA plug-ins" below.
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --config config/qwen-image-2.1.json \
+    --lora config/lora/qwen-image-2.1-viggle-turbo.json \
+    --prompt "A small orange cat beside a blue ceramic vase, soft daylight" \
+    --width 1024 --height 1024 --output turbo.png
+
 # MiniMax-H3 video generation with sound (prompt -> H.264 MP4 plus a 32 kHz
 # stereo .wav sidecar). One diffusion transformer denoises a packed video+audio
 # latent, so the soundtrack is model output rather than something dubbed on
@@ -394,17 +402,20 @@ script gets that error instead of watching a setting be ignored.
 | `--test-chunked-prefill` | Run the chunked-prefill correctness check (compares chunked vs non-chunked logits) |
 | `--correct-prefill <N>` | Prompt length used by `--test-chunked-prefill` |
 | `--correct-decode <N>` | Decode length used by `--test-chunked-prefill` |
-| `--diffusion-steps <N>` | DiffusionGemma denoising steps per block (default: 48). For Qwen-Image-2.1, the FlowMatch-Euler step count — omit for auto (40). |
+| `--diffusion-steps <N>` | DiffusionGemma denoising steps per block (default: 48). For Qwen-Image-2.1, the FlowMatch-Euler step count — omit for auto (40, or the step count of a `--lora` plug-in's sampling recipe). |
 | `--diffusion-seed <N>` | Noise seed for the diffusion paths: DiffusionGemma's deterministic sampler and Qwen-Image-2.1 (default: 0), and video generation (Wan, MiniMax-H3), where leaving it out draws a fresh random seed each run. This is the seed that decides what a clip looks like — `--seed` is the text sampling seed and does not affect it. |
 | `--diffusion-blocks <N>` | DiffusionGemma block-autoregressive canvas count. `0` derives the count from `--max-tokens` and the model canvas length. |
 | `--image <path>` | Input image for Qwen-Image-2.1 editing (also the image input for multimodal chat); repeat it for multiple references. Without `--image`, a Qwen-Image-2.1 DiT generates an image from the prompt instead. |
 | `--prompt <text>` | Qwen-Image-2.1 generation prompt or edit instruction (falls back to `--input` file contents if omitted). |
 | `--output <path>` | Qwen-Image-2.1 output PNG path (default: `generated.png` for generation, `edited.png` for editing). |
-| `--cfg <F>` | Qwen-Image-2.1 true-CFG guidance scale (`<= 1` disables the negative pass). Omit for auto: 1.0 for Qwen-Image-2.1 (one transformer prediction per step); a value above 1 adds the negative pass. Shares `--diffusion-steps` / `--diffusion-seed` for step count and seed. On MiniMax-H3 the only accepted value is `1.0` (its default): the checkpoint ships CFG-distilled and anything higher is refused up front rather than run and degraded. `TensorSharp.Server` has no `--cfg` at all — a request body can still carry `cfg`. |
+| `--cfg <F>` | Qwen-Image-2.1 true-CFG guidance scale (`<= 1` disables the negative pass). Omit for auto: 1.0 for Qwen-Image-2.1 (one transformer prediction per step), or the CFG of a `--lora` plug-in's sampling recipe; a value above 1 adds the negative pass. Shares `--diffusion-steps` / `--diffusion-seed` for step count and seed. On MiniMax-H3 the only accepted value is `1.0` (its default): the checkpoint ships CFG-distilled and anything higher is refused up front rather than run and degraded. `TensorSharp.Server` has no `--cfg` at all — a request body can still carry `cfg`. |
 | `--qwen-image-vae <path>` | Override the resolved Qwen-Image-2.1 VAE companion (default: the `qwen_image_2.1_vae*.safetensors` file next to the DiT GGUF). Env: `TS_QWEN_IMAGE_VAE`. |
 | `--qwen-image-vl <path>` | Override the resolved Qwen3-VL-8B text-encoder GGUF (default: a `Qwen3VL-8B` / `Qwen3-VL-8B` GGUF next to the DiT). Env: `TS_QWEN_IMAGE_TE`. |
 | `--qwen-image-mmproj <path>` | Override the resolved Qwen3-VL-8B mmproj (vision grounding for edits) GGUF (default: a matching `mmproj` GGUF next to the DiT). Env: `TS_QWEN_IMAGE_MMPROJ`. |
-| `--qwen-image-lora` / `--offload-cpu` | **Removed and rejected at startup, including as config-file keys; no replacement.** Both served only the earlier Qwen-Image-Edit pipeline: Qwen-Image-2.1 loads no LoRA adapters and keeps its DiT weights resident. |
+| `--lora <path>` | Qwen-Image-2.1 LoRA plug-in: a LoRA `.safetensors` file or a TensorSharp plug-in config `.json` (see [`config/lora/`](config/lora/)). Repeat to stack LoRAs. Applied unmerged on top of the quantized transformer. Refused with any other model. Default: none. See [Qwen-Image-2.1 LoRA plug-ins](#qwen-image-21-lora-plug-ins). |
+| `--lora-scale <f>` | Strength of the preceding `--lora` (multiplies alpha / rank). Default: the plug-in config's `"scale"`, else `1.0`. |
+| `--lora-config <path>` | Companion config of the preceding `--lora`: a TensorSharp LoRA config, a PEFT `adapter_config.json` or a VideoX-Fun `pdd_config.json`. Default: none (a PDD bundle's `pdd_config.json`, and a PEFT `adapter_config.json` beside `adapter_model.safetensors`, are found next to the weights). |
+| `--qwen-image-lora` / `--offload-cpu` | **Removed and rejected at startup, including as config-file keys.** Both served only the earlier Qwen-Image-Edit pipeline. `--qwen-image-lora` is replaced by `--lora` above; `--offload-cpu` has no replacement, because Qwen-Image-2.1 keeps its DiT weights resident. |
 | `--width <px>` / `--height <px>` | Output size for Qwen-Image-2.1 and video generation. Default: `0` — auto (Qwen-Image-2.1: 2048×2048 for generation, or about that area at the first reference's aspect ratio for editing, and explicit sizes must be multiples of 32; MiniMax-H3: 640×384, or that area at the conditioning image's aspect ratio, rounded up to a multiple of 32; Wan: the model's native area at the input image's aspect ratio, 1280×704 for TI2V-5B and 832×480 otherwise). |
 | `--video-frames <N>` | Video frame count, snapped to the model's temporal grid (`4k+1` for Wan; `17k+5` for MiniMax-H3 — 5, 22, 39, 56, 73, 90 …). Default: 33; 49 for Wan2.2-TI2V, 22 for MiniMax-H3. `1` generates a still image where the model supports it (use `--output out.png`). |
 | `--fps <N>` | Playback frame rate of the saved MP4 (default: 16; 24 for Wan2.2-TI2V). Models trained at a fixed rate (MiniMax-H3, 24 fps) override any other value. |
@@ -671,7 +682,8 @@ of quietly losing a setting.
 | `--video-text-encoder <path>` | Override the resolved text-encoder GGUF (UMT5-XXL for Wan, Qwen3-VL-32B for MiniMax-H3). Also spelled `--video-te`. Env: `TS_VIDEO_TEXT_ENCODER`; `--wan-te` still accepted. |
 | `--video-dit2 <path>` | Second diffusion expert on dual-expert models (Wan 2.2 A14B's high/low-noise partner of `--model`). Auto-resolved by name when the pair is co-located. Env: `TS_VIDEO_DIT2`; `--wan-dit2` still accepted. |
 | `--audio-vae <path>` | Audio VAE for models that generate an audio track jointly with the video (`minimax_h3_audio_vae_fp32.safetensors`). Without it such a model still runs and produces video, just no audio. Env: `TS_VIDEO_AUDIO_VAE`. |
-| `--qwen-image-lora` / `--offload-cpu` | **Removed and rejected at startup, including as config-file keys; no replacement.** Both served only the earlier Qwen-Image-Edit pipeline: Qwen-Image-2.1 loads no LoRA adapters and keeps its DiT weights resident. |
+| `--lora <path>` / `--lora-scale <f>` / `--lora-config <path>` | Qwen-Image-2.1 LoRA plug-ins, same spelling and binding rules as on the CLI (repeat `--lora` to stack; scale and config bind to the preceding `--lora`). The files are checked at startup, and the set applies to every image request; a request's `steps` / `cfg` still override a plug-in's sampling recipe. Other models ignore them (the startup log says the plug-ins apply to Qwen-Image-2.1 models only). See [Qwen-Image-2.1 LoRA plug-ins](#qwen-image-21-lora-plug-ins). |
+| `--qwen-image-lora` / `--offload-cpu` | **Removed and rejected at startup, including as config-file keys.** Both served only the earlier Qwen-Image-Edit pipeline. `--qwen-image-lora` is replaced by `--lora` above; `--offload-cpu` has no replacement, because Qwen-Image-2.1 keeps its DiT weights resident. |
 | `--temperature <f>` | Sampling temperature (`0` = greedy) |
 | `--top-k <N>` | Top-K filtering (`0` = disabled) |
 | `--top-p <f>` | Nucleus sampling threshold (`1.0` = disabled) |
@@ -848,6 +860,140 @@ server-wide flags and env vars for parameters it sends, and they still fill in
 the rest. Either way `--stop` sequences pinned on the server stay in force under
 `config` (merged with the request's) and are replaced by the request under
 `request`.
+
+## Qwen-Image-2.1 LoRA plug-ins
+
+`--lora` adds a LoRA to the Qwen-Image-2.1 diffusion transformer: a style, an
+editing skill, or a step-distillation adapter that replaces the 40-step default
+with 4–8 transformer passes. `TensorSharp.Cli` and `TensorSharp.Server` take the
+same three flags, spelled the same way:
+
+| Option | Description |
+|---|---|
+| `--lora <path>` | A LoRA plug-in: a LoRA `.safetensors` file, or a TensorSharp plug-in config `.json` such as those in [`config/lora/`](config/lora/). Repeat it to stack several; each `--lora` starts a new plug-in. |
+| `--lora-scale <f>` | Strength of the preceding `--lora` (it multiplies alpha / rank). Default: the plug-in config's `"scale"`, else `1.0`. |
+| `--lora-config <path>` | Companion config of the preceding `--lora`: a TensorSharp LoRA config (a `config/lora/` plug-in works here too, supplying its strength and recipe, or the third-party config it forwards with `"config"`, while its `weights` entry is ignored), a PEFT `adapter_config.json` (`lora_alpha`, `alpha_pattern`, `use_rslora`) or a VideoX-Fun `pdd_config.json`. When `--lora` itself names a plug-in `.json`, that file is already the config and a `--lora-config` after it is refused. |
+
+`--lora-scale` and `--lora-config` bind to the closest `--lora` before them, and a
+later value replaces an earlier one; either one without a `--lora` before it is a
+configuration error, never ignored. Both hosts check every file at startup, so a
+typo fails before the model loads. A `--config` file's options are expanded ahead
+of the command line, so a command-line `--lora-scale` with no `--lora` of its own
+before it binds to the config file's last plug-in. The hosts hand the parsed list
+to the model as the environment variable `TS_LORAS`, a JSON array of
+`{"path", "scale", "config"}` objects.
+
+The plug-ins apply to Qwen-Image-2.1 only. The CLI refuses `--lora` with any other
+model; the server logs them at startup (`LoRA plug-ins (applied to Qwen-Image-2.1
+models only): ...`) and applies them to every image request. Per-request LoRA
+selection is not implemented. The retired `--qwen-image-lora` is still a removed
+flag, and its error names `--lora`; `TS_QWEN_IMAGE_LORA` is refused at load with
+the same advice.
+
+```bash
+# A ready-made plug-in: the config downloads (and hash-checks) its weights on first
+# use and brings the adapter's sampling recipe, here 6 steps and CFG 1.
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --config config/qwen-image-2.1.json \
+    --lora config/lora/qwen-image-2.1-viggle-turbo.json \
+    --prompt "A small orange cat beside a blue ceramic vase, soft daylight" \
+    --width 1024 --height 1024 --output turbo.png
+
+# Any LoRA file at a chosen strength, stacked with a shipped style plug-in
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --config config/qwen-image-2.1.json \
+    --lora ./loras/my-style.safetensors --lora-scale 0.8 \
+    --lora config/lora/qwen-image-2.1-film-stills.json \
+    --prompt "A lighthouse at dusk" --output styled.png
+
+# A PEFT adapter whose alpha lives in a separate adapter_config.json
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --config config/qwen-image-2.1.json \
+    --lora ./adapter/my-adapter.safetensors --lora-config ./adapter/adapter_config.json \
+    --prompt "..." --output adapted.png
+
+# The server applies its startup set to every image request
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --config config/qwen-image-2.1.json \
+    --lora config/lora/qwen-image-2.1-pruna-8step.json
+```
+
+**Sampling precedence.** Explicit settings win over a plug-in's recipe, and the
+recipe wins over the model defaults (40 steps, CFG 1). Explicit means
+`--diffusion-steps` / `--cfg` on the CLI and a request's `steps` / `cfg` on the
+server, where `0` or an omitted value selects the recipe. A recipe with sigmas has
+a schedule only for the step counts it lists, so any other count is refused with
+the supported ones named rather than resampled. A recipe without sigmas sets only
+the defaults and keeps the checkpoint's own schedule. Two plug-ins that both carry
+a recipe cannot be stacked. Each run logs the resolved recipe and its sigmas
+(`[lora] sampling recipe (...): 6 steps on shifted sigmas [...]`).
+
+**Shipped plug-ins.** Each file in [`config/lora/`](config/lora/) downloads its
+weights to `${TENSORSHARP_MODELS:-<repo>/models}/qwen-image-2.1/loras` on first use.
+Its comments cite the model card, the trigger phrase where there is one, and the
+license; several are under the Qwen Research License (non-commercial).
+
+| Plug-in | What it is | Steps / CFG | Strength |
+|---|---|---|---|
+| `qwen-image-2.1-viggle-turbo.json` | Viggle Turbo v0.2.1, a DMD2 / SenseFlow step-distillation LoRA (the r128 file) | 6 by default, 4–8 supported; raw sigma nodes through the checkpoint's dynamic shift; CFG 1 | 1.0 |
+| `qwen-image-2.1-pruna-8step.json` | Pruna 8-step v0.1, a DMD step-distillation LoRA | 8, fixed sigmas, no shift; CFG 1 | 1.0 (the file's PEFT alpha 128 at rank 64 makes the applied scale 2) |
+| `qwen-image-2.1-pruna-5step.json` | Pruna 5-step v0.1, faster than the 8-step one with lower quality | 5, fixed sigmas, no shift; CFG 1 | 1.0 (applied scale 2, as above) |
+| `qwen-image-2.1-fun-acc-4step.json` | Alibaba PAI Fun-Acc, a parallel decoding distillation (PDD) bundle: rank-64 deltas, four per-step output heads that replace `proj_out`, and replaced Q/K and text norm gains. Forwards its `pdd_config.json` | 4, the bundle's fixed grid, bf16 timesteps; CFG 1 | 1.0 |
+| `qwen-image-2.1-film-stills.json` | Danrisi Film Stills: cinematic 35 mm film-still style | Model defaults | 0.7 |
+| `qwen-image-2.1-grainscape.json` | Danrisi Grainscape: grainy 35 mm colour-negative film look | Model defaults | 0.7 |
+| `qwen-image-2.1-fix.json` | e-n-v-y Qwen-Image-2.1-Fix: a DoRA quality fix | Model defaults | 1.0 |
+| `qwen-image-2.1-detail-enhancer.json` | elusarca Detail Enhancer (editing): detail, upscaling and restoration | Model defaults | 1.0 |
+| `qwen-image-2.1-natural-exposure.json` | prithivMLmods Natural Exposure (editing): balanced, neutral exposure | Model defaults | 1.0 |
+| `qwen-image-2.1-anime-consistency.json` | WarmBloodAban Anime Consistency: keeps anime characters consistent across edits | Model defaults | 0.7 |
+| `qwen-image-2.1-object-remover.json` | prithivMLmods Object Remover Bbox (editing): removes the objects marked with red boxes | Model defaults | 1.0 |
+| `qwen-image-2.1-object-mover.json` | prithivMLmods Object Mover Bbox (editing): moves the object in one red box to the other | Model defaults | 1.0 |
+
+**Plug-in config format.** A plug-in is a JSON file with
+`"type": "qwen-image-2.1-lora"`. It follows the `--config` conventions (comments,
+`"variables"` with `${name:-fallback}`, paths relative to the file), and its
+`"weights"` entry is a download spec that is fetched and SHA-256-checked when the
+file is missing, like a `--config` file entry.
+
+```json
+{
+  "type": "qwen-image-2.1-lora",
+  "variables": { "root": "${TENSORSHARP_MODELS:-../../models}/qwen-image-2.1/loras" },
+  "weights": { "path": "${root}/my-turbo.safetensors", "urls": ["https://..."], "sha256": "..." },
+  "scale": 1.0,
+  "sampling": {
+    "steps": 6,
+    "shift": "dynamic",
+    "cfg": 1.0,
+    "sigmas": { "4": [1.0, 0.75, 0.5, 0.25], "6": [1.0, 0.9375, 0.875, 0.75, 0.5, 0.25] }
+  }
+}
+```
+
+| Key | Meaning |
+|---|---|
+| `weights` | The LoRA `.safetensors`: a path or a download spec (`path`, `urls`, `sha256`). Required. |
+| `scale` | Default strength; `--lora-scale` overrides it. |
+| `alpha`, `use_rslora` | Alpha for a file that carries none. The scale is alpha / rank, or alpha / √rank with rsLoRA. |
+| `sampling.steps` | Default step count. May be omitted when `sigmas` defines a single schedule. |
+| `sampling.sigmas` | The schedule: an array (one step count) or an object keyed by step count. Nodes lie in (0, 1] and strictly decrease; a terminal 0 is appended. Omit it to keep the checkpoint's own schedule. |
+| `sampling.shift` | `none` (default): the nodes are the sigmas. `dynamic`: the nodes are raw positions passed through the checkpoint's resolution-dependent exponential shift, without the terminal stretch. |
+| `sampling.cfg` | Default CFG, at least 1. |
+| `sampling.timestep` | `fp32` (default) or `bf16`, which rounds the transformer's timestep the way a bf16 pipeline does. |
+| `config` | Instead of `sampling`: a third-party companion config to forward (a path or a download spec), such as a PDD `pdd_config.json`. A plug-in takes one or the other, not both. |
+
+**Formats.** Diffusers / PEFT (`transformer.` prefix, `lora_A` / `lora_B`, adapter
+slot names such as `.default`), ComfyUI / ai-toolkit (`diffusion_model.`),
+DiffSynth / ModelScope (no prefix), kohya underscore names, `lora_down` / `lora_up`
+with or without `.weight`, DoRA `dora_scale`, VideoX-Fun PDD bundles, and 1-D
+`.diff` tensors on the norm gains. Alpha comes from `.alpha` tensors, PEFT metadata
+in the safetensors file, or an `adapter_config.json`; otherwise alpha equals the rank
+(kohya's `ss_network_alpha` training metadata is ignored, as in ComfyUI and diffusers).
+LoKr, LoHa, LoCon mid factors, text-encoder LoRAs, bias terms, 2-D full-weight
+diffs and LoRAs made for other models are refused with a message. Every tensor in
+a file is applied or the load fails and names it; nothing is skipped silently.
+
+**How it runs.** The update is applied unmerged, `y = W x + B (A x)`, on top of the
+quantized GGUF weights, because merging a distillation LoRA's small delta into
+Q8_0 or Q4 weights rounds most of it away. It works on `ggml_metal`, `ggml_cuda`,
+`ggml_vulkan` and `ggml_cpu`, with the prefix KV cache, and with `--tp N`. The
+[Qwen-Image-2.1 card](docs/models/qwenimage21.md#lora-plug-ins) covers the formats,
+the packing, tensor parallelism and the limitations in detail.
 
 ## Video generation with audio (MiniMax-H3)
 
@@ -1639,7 +1785,7 @@ must be reachable between all nodes.
 | DeepSeek V4.1 Flash | layer split (+ experimental routed-MoE TP) | Layer placement is the default and the measured path. `TS_DSV41_TP=N` (2-8, and equal to the GPU count selected by `--tp` / `TS_DSV4_NGPU`) shards routed-expert gate/up along the FFN intermediate dimension and down along its input, reducing partials through host-staged F32 buffers; attention, shared experts and caches keep their layer placement. Block-aligned unequal partitions (the 2304-wide intermediate is nine 256-element K-quant blocks: 1280+1024 on two ranks, 768+512+512+512 on four). The first full Q2_K run was slower than the layer split, so treat it as experimental. Attention TP and distributed groups are not implemented |
 | Hunyuan Dense | — | Single device: no TP and no layer split. Startup says so on stderr rather than leaving extra GPUs idle |
 | DiffusionGemma | — | Not applicable (diffusion model) |
-| Qwen-Image-2.1 | — | Not applicable (image generation) |
+| Qwen-Image-2.1 | ✅ (local only, diffusion transformer) | `--tp N` (N = 2, 4 or 8) on `ggml_cuda` / `ggml_vulkan` shards the DiT's attention heads and MLP columns; LoRA plug-ins are sharded with it. The text encoder, vision encoder and VAE stay on the first GPU, and multi-node groups are refused. See the [Qwen-Image-2.1 card](docs/models/qwenimage21.md#cuda-graphs-and-tensor-parallelism) |
 
 ### Backend support
 

@@ -59,7 +59,7 @@ public class GgmlCopyStridedFloat32Tests
         return result;
     }
 
-    [Fact]
+    [GgmlFact(BackendType.GgmlCpu)]
     public void Copy_NarrowOnInnerDim_MatchesElementwiseReference()
     {
         // The prefill QKV split: fused [seq, qDim+kDim+vDim] narrowed on dim 1.
@@ -81,7 +81,7 @@ public class GgmlCopyStridedFloat32Tests
         }
     }
 
-    [Fact]
+    [GgmlFact(BackendType.GgmlCpu)]
     public void Copy_NarrowOnMiddleDim_KvCacheResizeLayout_MatchesReference()
     {
         // [heads, capacity, head_dim] narrowed on the token dim, into a larger
@@ -109,7 +109,7 @@ public class GgmlCopyStridedFloat32Tests
         }
     }
 
-    [Fact]
+    [GgmlFact(BackendType.GgmlCpu)]
     public void Copy_TransposedView_StaysOnTheElementPath_AndIsCorrect()
     {
         // A transpose has stride 1 on NEITHER trailing dim of the destination
@@ -129,7 +129,7 @@ public class GgmlCopyStridedFloat32Tests
                 Assert.Equal(src.GetElementAsFloat(c, r), dst.GetElementAsFloat(r, c));
     }
 
-    [Fact]
+    [GgmlFact(BackendType.GgmlCpu)]
     public void Copy_NarrowedOuterDim_ContiguousInner_MatchesReference()
     {
         // Narrow on dim 0 leaves the whole tail contiguous - the fully
@@ -148,7 +148,7 @@ public class GgmlCopyStridedFloat32Tests
                     Assert.Equal(src.GetElementAsFloat(a + 2, b, c), dst.GetElementAsFloat(a, b, c));
     }
 
-    [Fact]
+    [GgmlFact(BackendType.GgmlCpu)]
     public void Copy_ContiguousToContiguous_IsUnchanged()
     {
         var (alloc, _) = NewCpuAllocator();

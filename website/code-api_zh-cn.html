@@ -158,6 +158,7 @@ RgbImage edited = model.EditImage("Change the blue vase to a red vase.", input, 
 ImageIO.SavePng("edited.png", edited);
 Console.WriteLine($"Saved {edited.Width}x{edited.Height} edited image.");</code></pre>
   <p>若要做实时 UI，设置 <code>p.OnStep = (step, total, preview) =&gt; { … }</code> 与 <code>p.PreviewCount</code>，即可在节流的步上收到部分去噪潜变量解码出的 RGB 预览。<code>RgbImage</code> 暴露 <code>Width</code>、<code>Height</code> 与平面/交错的 <code>Pixels</code> 缓冲；<code>ImageIO</code> 提供 <code>Load</code>、<code>Decode(byte[])</code>、<code>EncodePng</code>、<code>SavePng</code> 及缩放辅助。PNG 输出保留透明度。</p>
+  <p><strong>LoRA 插件。</strong><code>model.SetLoras(new[] { new LoraSpec("config/lora/qwen-image-2.1-viggle-turbo.json") })</code> 替换之后每个请求所用的插件组；<code>LoraSpec(Path, Scale, ConfigPath)</code> 接受与 <code>--lora</code> / <code>--lora-scale</code> / <code>--lora-config</code> 相同的三个值，空列表表示移除插件组。适配器会立即针对 Transformer 校验，失败时保留原来的插件组。当 <code>Steps</code> / <code>CfgScale</code> 为 <code>0</code> 时，由插件的采样配方提供步数与 CFG。见 <a href="models-image_zh-cn.html#lora">LoRA 插件</a>。</p>
   <div class="callout warn"><div class="ic">🖼️</div><p>图像生成计算量大：默认是 2048×2048、40 步。省略 <code>Width</code>/<code>Height</code> 时，生成为 2048×2048，编辑则取与第一张参考图宽高比一致、面积大致相同的尺寸；<code>Width = 1024, Height = 1024</code> 可把潜在图像 token 数降为四分之一，用于出草图。Transformer 以常驻量化权重运行一张 GGML 图，因此请使用 <code>GgmlMetal</code>、<code>GgmlCuda</code>、<code>GgmlVulkan</code> 或 <code>GgmlCpu</code>。伴随文件见<a href="models-image_zh-cn.html#imagegen">图像生成</a>。</p></div>
 
   <h2 id="sampling">SamplingConfig</h2>

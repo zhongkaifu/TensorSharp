@@ -19,6 +19,43 @@ struct TSGQi21Segment {
     std::int32_t start, end, source_start, is_image;
 };
 
+// A LoRA update of one projection, applied unmerged: y = row_scale * (W x) + up (down x).
+// The quantized base weight is never modified. Merging a distillation LoRA's tiny delta
+// into Q8_0 rounds most of it away, so the update keeps its own F16/F32 factors.
+//   down: ggml [ne0 = in,   ne1 = rank] (PyTorch lora_A / lora_down [rank, in])
+//   up:   ggml [ne0 = rank, ne1 = out]  (PyTorch lora_B / lora_up [out, rank]) with every
+//         scale (strength, alpha / rank, DoRA magnitude) already folded in.
+//   row_scale: optional F32 [out] multiplying the base projection (DoRA), else null.
+// Several LoRAs on one projection are concatenated along the rank by the caller. Updates
+// of projections that read the same input may share one contiguous `down` allocation
+// (q, k, v and gate, up): the graph then runs one stacked shrink for all of them.
+struct TSGQi21Lora {
+    void* down;
+    void* up;
+    float* row_scale;
+    std::int32_t type;   // GGML_TYPE_F16 or GGML_TYPE_F32, for both factors
+    std::int32_t rank;   // 0 = no low-rank term
+    std::int64_t in, out;
+};
+struct TSGQi21BlockLora {
+    TSGQi21Lora q, k, v, out, gate, up, down;
+};
+
+// Everything a LoRA plug-in changes in the transformer (TSGQi21Desc::adapter).
+// A fused gate_up weight is described by the caller as its two halves (block
+// weights `gate` and `up` as row views) whenever gate or up carries an update.
+struct TSGQi21Adapter {
+    std::int32_t struct_bytes, num_layers;
+    TSGQi21Lora image_in, text_in, text_out, time_in, time_out, modulation, norm_out, proj_out;
+    const TSGQi21BlockLora* blocks;   // num_layers entries, or null
+    // Optional replacement of proj_out's weight for this call ([in = dim, out = channels],
+    // F16 or F32), e.g. a per-step head of a parallel-decoding distillation. It is uploaded
+    // as an input every call, so switching heads between steps keeps the retained graph
+    // and the prefix cache.
+    const void* output_head;
+    std::int32_t output_head_type, reserved;
+};
+
 // Storage of a prefix KV cache. AUTO stores what the attention kernel consumes
 // (F16 for Metal and CUDA flash attention, F32 otherwise), so reading the cache
 // reproduces the uncached computation. Q8_0 stores K and V in 8 bits and Q8_0_V
@@ -67,6 +104,9 @@ struct TSGQi21Desc {
     // MLP; to_out and img_mlp.out are row-parallel partial sums that the ranks
     // all-reduce, twice per block. Everything outside the blocks is replicated.
     std::int32_t tp_ranks;
+    // Optional LoRA plug-in (null = the checkpoint as stored). Its buffers are keyed like
+    // weights, so a different adapter retires retained graphs and stored prefix K/V.
+    const TSGQi21Adapter* adapter;
 };
 
 // TSGgml_QwenImage21GetPrefixCacheInfo. state: 0 = no cache for the key,
@@ -77,6 +117,10 @@ struct TSGQi21PrefixCacheInfo {
 };
 
 // Pinned by QwenImageNativeAbiTests on the managed side.
-static_assert(sizeof(void*) != 8 || sizeof(TSGQi21Desc) == 464, "QwenImage21ForwardArgs layout");
+static_assert(sizeof(void*) != 8 || sizeof(TSGQi21Desc) == 472, "QwenImage21ForwardArgs layout");
 static_assert(sizeof(void*) != 8 || offsetof(TSGQi21Desc, prefix_cache_key) == 448, "QwenImage21ForwardArgs layout");
+static_assert(sizeof(void*) != 8 || offsetof(TSGQi21Desc, adapter) == 464, "QwenImage21ForwardArgs layout");
+static_assert(sizeof(void*) != 8 || sizeof(TSGQi21Lora) == 48, "QwenImage21Lora layout");
+static_assert(sizeof(void*) != 8 || sizeof(TSGQi21BlockLora) == 336, "QwenImage21BlockLora layout");
+static_assert(sizeof(void*) != 8 || sizeof(TSGQi21Adapter) == 416, "QwenImage21Adapter layout");
 static_assert(sizeof(TSGQi21PrefixCacheInfo) == 24, "QwenImage21PrefixCacheInfo layout");

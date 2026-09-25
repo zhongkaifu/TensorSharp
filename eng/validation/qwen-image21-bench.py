@@ -67,6 +67,17 @@ def qwen21_sigmas(steps, image_tokens):
     return result + [0.0]
 
 
+def recipe_sigmas(nodes, shift, image_tokens):
+    """Match QwenImage21LoraRecipe.Sigmas: raw nodes, optionally through the checkpoint's
+    dynamic exponential shift (no shift_terminal), then a terminal 0, rounded to F32."""
+    f32 = lambda value: struct.unpack("<f", struct.pack("<f", value))[0]
+    exp_mu = math.exp(0.5 + (image_tokens - 256) * (0.9 - 0.5) / (8192 - 256))
+    result = []
+    for t in map(f32, nodes):  # TensorSharp reads the nodes as F32 (GetSingle) before shifting
+        result.append(f32(exp_mu / (exp_mu + (1 / t - 1))) if shift == "dynamic" else t)
+    return result + [0.0]
+
+
 def comparison_notes(args):
     notes = []
     prompts = [args.prompt] + ([args.negative_prompt] if args.cfg > 1 else [])
@@ -196,9 +207,11 @@ def parse_log(engine, text):
             seconds = 1 / rate if unit == "it/s" else rate
             steps.append({"step": int(index), "total": int(count), "seconds": seconds,
                           "reported_value": rate, "reported_unit": unit})
-        marker = "VAE decode failed (likely out of memory); retrying with spatial tiling"
-        if marker in text:
-            after_retry = text.split(marker, 1)[1]
+        # sd.cpp reworded this warning in backend_fit.cpp; accept both spellings.
+        match = re.search(r"VAE decode (?:failed \(likely out of memory\)|ran out of memory); retrying with spatial tiling", text)
+        if match:
+            marker = match[0]
+            after_retry = text[match.end():]
             recovery = re.search(r"decode_first_stage completed, taking [0-9.]+s.*?generate_image completed in [0-9.]+s.*?save result image[^\n]*\(success\)", after_retry, re.S)
             fallbacks.append({"kind": "sd_cpp_vae_spatial_tiling", "trigger": marker,
                               "recovery_confirmed_in_log": bool(recovery),
@@ -236,7 +249,7 @@ def classify_result(result, engine, steps, width, height):
         known_errors = (
             r"wan_vae segment \d+/\d+ \(graph\) failed during weight preparation$",
             r"vae decode compute failed$",
-            r"VAE decode failed \(likely out of memory\); retrying with spatial tiling$",
+            r"VAE decode (?:failed \(likely out of memory\)|ran out of memory); retrying with spatial tiling$",
         )
         if engine != "sd_cpp" or len(fallbacks) != 1 or not fallbacks[0]["recovery_confirmed_in_log"]:
             failures.append("The fallback was not confirmed to recover successfully.")
@@ -442,9 +455,27 @@ def commands(args, models, ts_image, sd_image):
           "--rng", "cuda", "--seed", str(args.seed), "--fa", "-o", str(sd_image)]
     if args.sd_backend:
         sd += ["--backend", args.sd_backend]
-    if args.match_sigmas:
+    if args.sigma_nodes:
+        # A LoRA recipe's schedule; TensorSharp derives the same values from --lora-config.
+        nodes = [float(v) for v in args.sigma_nodes.split(",")]
+        sigmas = recipe_sigmas(nodes, args.sigma_shift, (args.width // 16) * (args.height // 16))
+        sd += ["--sigmas", ",".join(format(value, ".9g") for value in sigmas)]
+    elif args.match_sigmas:
         sigmas = qwen21_sigmas(args.steps, (args.width // 16) * (args.height // 16))
         sd += ["--sigmas", ",".join(format(value, ".9g") for value in sigmas)]
+    if args.lora:
+        ts += ["--lora", str(args.lora)]
+        if args.lora_scale is not None:
+            ts += ["--lora-scale", str(args.lora_scale)]
+        if args.lora_config:
+            ts += ["--lora-config", str(args.lora_config)]
+        # sd.cpp takes the adapter as a prompt tag relative to --lora-model-dir. It does not
+        # read PEFT alpha metadata, so --sd-lora-multiplier must carry alpha / rank when it
+        # differs from 1 (e.g. 2 for the Pruna adapters).
+        multiplier = (args.sd_lora_multiplier if args.sd_lora_multiplier is not None
+                      else args.lora_scale if args.lora_scale is not None else 1.0)
+        sd += ["--lora-model-dir", str(args.lora.parent)]
+        sd[sd.index("-p") + 1] = args.prompt + f"<lora:{args.lora.stem}:{multiplier:g}>"
     if args.negative_prompt:
         ts += ["--negative-prompt", args.negative_prompt]
         sd += ["-n", args.negative_prompt]
@@ -481,6 +512,13 @@ def main():
     parser.add_argument("--sd-backend", help="Explicit sd.cpp assignment; by default matches --backend using metal/cpu/cuda0/vulkan0.")
     parser.add_argument("--match-sigmas", action="store_true",
                         help="Pass TensorSharp's official Qwen 2.1 sigma schedule to sd.cpp via --sigmas; requires sd.cpp with custom-sigma support.")
+    parser.add_argument("--lora", type=Path, help="LoRA weights (.safetensors) for both engines.")
+    parser.add_argument("--lora-config", type=Path, help="TensorSharp --lora-config (the plug-in recipe).")
+    parser.add_argument("--lora-scale", type=float, help="TensorSharp --lora-scale.")
+    parser.add_argument("--sd-lora-multiplier", type=float,
+                        help="sd.cpp <lora:name:multiplier>; defaults to --lora-scale (or 1). sd.cpp ignores PEFT alpha metadata.")
+    parser.add_argument("--sigma-nodes", help="Comma-separated recipe sigma nodes passed to sd.cpp as --sigmas (after --sigma-shift).")
+    parser.add_argument("--sigma-shift", choices=("none", "dynamic"), default="none")
     parser.add_argument("--ts-extra", action="append", default=[], help="Additional TensorSharp argv token; use --ts-extra=--option.")
     parser.add_argument("--sd-extra", action="append", default=[], help="Additional sd.cpp argv token; use --sd-extra=--option.")
     parser.add_argument("--engine-order", choices=("sd-first", "ts-first"), default="sd-first")
@@ -513,10 +551,26 @@ def main():
     args.cli, args.sd_cli, args.sd_repo, args.ggml_repo, args.output = (
         p.resolve() for p in (args.cli, args.sd_cli, args.sd_repo, args.ggml_repo, args.output))
     args.sd_ggml_repo = (args.sd_ggml_repo or args.sd_repo/"ggml").resolve()
+    if (args.lora_config or args.lora_scale is not None or args.sd_lora_multiplier is not None or args.sigma_nodes) and not args.lora \
+            and not args.sigma_nodes:
+        parser.error("--lora-config/--lora-scale/--sd-lora-multiplier require --lora.")
+    if args.lora:
+        args.lora = args.lora.resolve()
+        if args.lora.suffix.lower() != ".safetensors":
+            parser.error("--lora takes the .safetensors weights (sd.cpp cannot read a plug-in .json); "
+                         "pass the TensorSharp plug-in with --lora-config.")
+        if args.lora_config:
+            args.lora_config = args.lora_config.resolve()
+            # A plug-in's own strength applies to TensorSharp; sd.cpp must get the same one.
+            config = json.loads(re.sub(r"(?m)^\s*//.*$", "", args.lora_config.read_text()))  # full-line // comments only
+            if args.lora_scale is None and args.sd_lora_multiplier is None and config.get("scale", 1.0) != 1.0:
+                parser.error(f"{args.lora_config.name} sets strength {config['scale']}; pass --lora-scale (or "
+                             "--sd-lora-multiplier) so sd.cpp gets the same strength.")
     if not args.dry_run:
         binaries = ([args.cli] if args.engine == "tensorsharp" else [args.sd_cli]
                     if args.engine == "sd_cpp" else [args.cli, args.sd_cli])
-        for path in list(models.values()) + args.image + binaries:
+        lora_files = ([args.lora] if args.lora else []) + ([args.lora_config] if args.lora_config else [])
+        for path in list(models.values()) + args.image + binaries + lora_files:
             if not path.is_file():
                 parser.error(f"Required file is missing: {path}")
     args.output.mkdir(parents=True, exist_ok=True)

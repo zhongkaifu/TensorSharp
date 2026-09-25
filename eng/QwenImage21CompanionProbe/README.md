@@ -92,6 +92,8 @@ checkerboard. Both commands reject non-finite results.
 For an independent scalar reference, set `TS_QWEN_VAE_GPU=0` in a fresh process
 and use `Cpu` at 64 by 64 pixels. Compare CUDA results at that same size using
 `compare`. Test `TS_QWEN21_VAE_FUSED=0` and the default fused path separately.
+The probe selects the whole-VAE graph as the model does: by default on CUDA and
+Metal, on CPU only with `TS_QWEN21_VAE_FUSED=1`, and never on Vulkan.
 `TS_QWEN21_VAE_TRACE=1` identifies fused execution or fallback and reports
 per-convolution tensor ranges in the fallback. A fallback does not count as
 validation of the fused graph. Use larger dimensions only after numerical

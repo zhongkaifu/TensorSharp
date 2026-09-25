@@ -135,8 +135,16 @@ dotnet run --project TensorSharp.Cli -c Release --no-build -- \
   --image generated.png \
   --prompt 'Change the blue vase to a red vase. Preserve the cat, lighting and composition.' \
   --width 2048 --height 2048 --diffusion-steps 40 --cfg 1 \
-  --diffusion-seed 42 --output edited.png</code></pre>
-  <p>伴随文件、尺寸与草图设置见<a href="models-image_zh-cn.html#imagegen">图像生成</a>。</p>
+  --diffusion-seed 42 --output edited.png
+
+# LoRA 插件：config/lora/ 中的插件在首次使用时下载权重，步数蒸馏插件还会带上
+# 自己的采样配方（这里是 6 步、CFG 1）。
+dotnet run --project TensorSharp.Cli -c Release --no-build -- \
+  --config config/qwen-image-2.1.json \
+  --lora config/lora/qwen-image-2.1-viggle-turbo.json \
+  --prompt 'A small orange cat beside a blue ceramic vase, soft daylight, detailed photograph' \
+  --width 1024 --height 1024 --diffusion-seed 42 --output turbo.png</code></pre>
+  <p>伴随文件、尺寸、草图设置与 <a href="models-image_zh-cn.html#lora">LoRA 插件</a>见<a href="models-image_zh-cn.html#imagegen">图像生成</a>。</p>
 
   <h3 id="video">视频生成</h3>
   <p><strong>MiniMax-H3</strong> 在<em>同一个</em>打包潜变量里同时去噪视频与原生 32&nbsp;kHz 立体声音轨，所以声音和画面来自同一次前向。它经过 CFG 蒸馏，因此必须传 <code>--cfg 1.0</code>（更高的取值会被直接拒绝），默认 20 步，而 4–8 步是它的快速工作点：</p>
@@ -326,9 +334,12 @@ dotnet run --project TensorSharp.Cli/TensorSharp.Cli.csproj -- \
       <tr><td><code>--diffusion-seed &lt;N&gt;</code></td><td>DiffusionGemma 确定性采样器种子（默认：0）。</td></tr>
       <tr><td><code>--diffusion-blocks &lt;N&gt;</code></td><td>块自回归画布数量（<code>0</code> 由 <code>--max-tokens</code> 推导）。</td></tr>
       <tr><td><code>--image &lt;path&gt;</code> / <code>--prompt &lt;text&gt;</code> / <code>--output &lt;path&gt;</code></td><td>Qwen-Image-2.1：编辑用的参考图（可重复；省略 <code>--image</code> 即为生成）、提示词与输出 PNG（默认 <code>generated.png</code>，编辑时为 <code>edited.png</code>）。复用 <code>--diffusion-steps</code>（默认 40）/ <code>--diffusion-seed</code>。</td></tr>
-      <tr><td><code>--cfg &lt;F&gt;</code></td><td>Qwen-Image-2.1 true-CFG 引导尺度（省略则自动取 1.0，即每步一次 Transformer 预测；<code>&lt;= 1</code> 关闭负向分支）。</td></tr>
+      <tr><td><code>--cfg &lt;F&gt;</code></td><td>Qwen-Image-2.1 true-CFG 引导尺度（省略则自动取 1.0，即每步一次 Transformer 预测，或取 <code>--lora</code> 插件的配方；<code>&lt;= 1</code> 关闭负向分支）。</td></tr>
       <tr><td><code>--qwen-image-vae / --qwen-image-vl / --qwen-image-mmproj &lt;path&gt;</code></td><td>覆盖解析到的 Qwen-Image-2.1 伴随文件（专用 2.1 VAE / Qwen3-VL-8B 文本编码器 / Qwen3-VL-8B mmproj）。</td></tr>
-      <tr><td><code>--qwen-image-lora</code> · <code>--offload-cpu</code></td><td><strong>已移除，启动时（包括作为 <code>--config</code> 键时）会直接拒绝。</strong>没有替代参数：两者只服务于早期的 Qwen-Image-Edit 流水线，而 Qwen-Image-2.1 不加载 LoRA 适配器，DiT 权重始终常驻。</td></tr>
+      <tr><td><code>--lora &lt;path&gt;</code></td><td>Qwen-Image-2.1 LoRA 插件：LoRA <code>.safetensors</code>，或 TensorSharp 插件配置 <code>.json</code>（见 <code>config/lora/</code>）。可重复以叠加。以不合并的方式叠加在量化 Transformer 之上；用于其他模型时会被拒绝。→ <a href="models-image_zh-cn.html#lora">LoRA 插件</a></td></tr>
+      <tr><td><code>--lora-scale &lt;f&gt;</code></td><td>前一个 <code>--lora</code> 的强度（乘以 alpha / rank）。默认：插件配置中的 <code>"scale"</code>，否则为 1.0。</td></tr>
+      <tr><td><code>--lora-config &lt;path&gt;</code></td><td>前一个 <code>--lora</code> 的伴随配置：TensorSharp LoRA 配置、PEFT <code>adapter_config.json</code> 或 VideoX-Fun <code>pdd_config.json</code>。除非给出 <code>--diffusion-steps</code> / <code>--cfg</code>，否则由插件的配方提供步数、sigma 与 CFG。</td></tr>
+      <tr><td><code>--qwen-image-lora</code> · <code>--offload-cpu</code></td><td><strong>已移除，启动时（包括作为 <code>--config</code> 键时）会直接拒绝。</strong>两者只服务于早期的 Qwen-Image-Edit 流水线。<code>--qwen-image-lora</code> 由 <code>--lora</code> 取代；<code>--offload-cpu</code> 没有替代参数，因为 Qwen-Image-2.1 的 DiT 权重始终常驻。</td></tr>
       <tr><td><code>--width &lt;px&gt;</code> / <code>--height &lt;px&gt;</code></td><td>Qwen-Image-2.1 的固定输出尺寸，须为 32 的倍数（默认 <code>0</code> = 自动：生成为 2048×2048，编辑则取与第一张参考图宽高比一致、面积大致相同的尺寸）。</td></tr>
       <tr><td><code>--benchmark</code></td><td>运行合成的 prefill/decode 吞吐基准。</td></tr>
       <tr><td><code>--bench-prefill / --bench-decode / --bench-runs &lt;N&gt;</code></td><td>合成的 prefill 长度、decode 长度与运行次数。</td></tr>

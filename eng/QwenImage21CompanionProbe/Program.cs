@@ -151,8 +151,13 @@ if (args.Length >= 4 && (args[0] == "vae" || args[0] == "vae-encode"))
     if (width <= 0 || height <= 0 || width % 32 != 0 || height % 32 != 0)
         throw new ArgumentException("Positive dimensions divisible by 32 required.");
     GgmlBasicOps.EnsureBackendAvailable(backendName);
-    VaeReferenceMath.UseFusedGraph21 = backendName == GgmlBackendType.Cuda;
-    using var source = new SafetensorsFile(args[1]);
+    // Mirror QwenImage21Vae: fused by default on CUDA and Metal, never on Vulkan.
+    string fused = Environment.GetEnvironmentVariable("TS_QWEN21_VAE_FUSED");
+    VaeReferenceMath.UseFusedGraph21 = backendName != GgmlBackendType.Vulkan &&
+        (fused == "1" || backendName is GgmlBackendType.Cuda or GgmlBackendType.Metal);
+    using var file = new SafetensorsFile(args[1]);
+    // As the model opens it: the published file uses diffusers names (decoder.conv_in, ...).
+    var source = new QwenImage21VaeTensorStore(file);
     QwenImage21CompanionValidation.ValidateVae(source);
     var weights = VaeWeights.Load(source);
     var latent = new VaeLatent(64, height / 16, width / 16,

@@ -146,6 +146,9 @@ public class ConfigFileArgsTests : IDisposable
         "video-vae", "video-text-encoder", "video-te", "video-dit2", "audio-vae",
         "video-width", "video-height", "video-steps", "video-mode", "video-frames", "fps",
         "wan-vae", "wan-te", "wan-dit2", "width", "height",
+        // Qwen-Image-2.1 LoRA plug-ins (LoraCliFlags.Flags): applied by the companion
+        // pass and let through the unknown-option trap, spelled the same by the CLI.
+        "lora", "lora-scale", "lora-config",
         "upload-max-mb", "upload-quota-mb", "upload-ttl-hours",
         "skills-dir", "skill", "list-skills", "no-skills", "skills-no-discovery",
         "skills-allow-exec", "skills-max-rounds", "skills-sandbox", "skills-allow-network",
@@ -911,5 +914,18 @@ public class ConfigFileArgsTests : IDisposable
             try { _listener.Stop(); } catch { }
             try { _listener.Close(); } catch { }
         }
+    }
+
+    [Theory]
+    [InlineData("lora-scale", "[0.5, 0.9]")]
+    [InlineData("lora-config", "[\"a.json\", \"b.json\"]")]
+    public void Expand_ALoraScaleOrConfigArray_IsRefused(string key, string value)
+    {
+        // Each binds to the one --lora before it; an array would bind every value to the last.
+        string config = Path.Combine(_dir, "loras.json");
+        File.WriteAllText(config, "{ \"lora\": [\"a.safetensors\", \"b.safetensors\"], \"" + key + "\": " + value + " }");
+
+        var ex = Assert.Throws<ArgumentException>(() => ConfigFileArgs.Expand(new[] { "--config", config }, TextWriter.Null, false));
+        Assert.Contains("cannot be an array", ex.Message, StringComparison.Ordinal);
     }
 }

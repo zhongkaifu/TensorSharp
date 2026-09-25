@@ -1051,12 +1051,12 @@ curl --fail-with-body http://localhost:5000/api/image-generate \
 `targetArea: 1048576` 选择约 1K 的输出并自动选择宽高比；显式尺寸优先。编辑时每张参考图
 以约 1 百万像素（若输出面积更小，则以输出面积）作为条件输入。
 
-省略 `steps`/`cfg` 时使用 40 步 Euler 和 CFG 1，遵循已发布 2.1 模型的推荐。CFG 1 每步
+省略 `steps`/`cfg` 时使用 40 步 Euler 和 CFG 1，遵循已发布 2.1 模型的推荐，除非启动时的
+LoRA 插件提供了自己的配方（见下文 [LoRA 插件](#qwen-image-21-lora-插件)）。CFG 1 每步
 只需一次 Transformer 预测；`negativePrompt` 只在显式设置大于 1 的 CFG 时生效，此时还会
 运行一次负向预测。需要更快的草图时，请求 1024×1024，或像官方 ComfyUI 工作流那样显式
 选择 25 步；更少的步数可能改变质量。[模型指南](../docs/models/qwenimage21_zh-cn.md)
 记录了官方调度器设置与来源链接，完整的验证记录见[英文版](../docs/models/qwenimage21.md)。
-Qwen-Image-2.1 不加载 LoRA 适配器。
 
 ### 图像编辑（`/api/image-edit`，Qwen-Image-2.1）
 
@@ -1064,7 +1064,8 @@ Qwen-Image-2.1 不加载 LoRA 适配器。
 图像 + 提示词的轮次走图像编辑端点，而不是 `/api/chat`：
 
 ```bash
-# 一次性编辑（multipart）。steps=0 / cfg=0 表示自动（40 步 / CFG 1）。
+# 一次性编辑（multipart）。steps=0 / cfg=0 表示自动（40 步 / CFG 1，或启动时
+# LoRA 插件的配方）。
 # 重复 image 部分即可传入多张参考图。
 curl -X POST http://localhost:5000/api/image-edit \
   -F "image=@photo.png" \
@@ -1095,6 +1096,29 @@ curl -N -X POST http://localhost:5000/api/image-edit/stream \
 （`image` 预览快照只在节流后的步骤上出现，每次编辑最多 8 张），最后是一条
 `{"done": true, "url": "/uploads/edit-<guid>.png", "width": ..., "height": ..., "elapsedSeconds": ...}`。
 对非 Qwen-Image-2.1 模型发起的请求返回 400；并发编辑由进程级锁串行执行。
+
+### Qwen-Image-2.1 LoRA 插件
+
+LoRA 插件在服务端启动时选定，使用与 CLI 相同的 `--lora`、`--lora-scale` 与 `--lora-config`
+参数。这组插件作用于每个生成与编辑请求；尚未实现按请求选择 LoRA。
+
+```bash
+# 步数蒸馏插件：它的配方（8 步、CFG 1）成为每个图像请求的默认值。
+# 权重在首次使用时下载并校验哈希。
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --config config/qwen-image-2.1.json \
+  --lora config/lora/qwen-image-2.1-pruna-8step.json
+
+# 省略（或为 0）的 steps / cfg 使用插件的配方
+curl --fail-with-body http://localhost:5000/api/image-generate \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"A cat beside a blue vase, soft daylight","width":1024,"height":1024,"seed":42}'
+```
+
+请求中的 `steps` 与 `cfg` 仍会覆盖配方。带调度的插件只能以它定义的步数运行，因此其他
+`steps` 值会被拒绝，并列出支持的步数（Pruna 8 步插件只支持 8）。风格与编辑插件不带配方，
+省略时仍使用模型默认值（40 步、CFG 1）。重复 `--lora` 可叠加插件，`--lora-scale` 设置强度。
+服务端启动时会记录 `LoRA plug-ins (applied to Qwen-Image-2.1 models only): ...`。参数、
+随附插件与插件配置格式见 [USAGE_zh-cn.md](../USAGE_zh-cn.md#qwen-image-21-lora-插件)。
 
 ### 视频生成（`/api/video-generate`、`/v1/videos/generations`）
 

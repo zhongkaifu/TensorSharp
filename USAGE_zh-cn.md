@@ -140,6 +140,13 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --config config/qwen-image-2.1.js
 dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --config config/qwen-image-2.1.json --image generated.png \
     --prompt "Change the blue vase to a red vase. Preserve the cat, lighting and composition." --output edited.png
 
+# 带 LoRA 插件的 Qwen-Image-2.1。config/lora/ 中是现成的插件，首次使用时自动下载权重；
+# 步数蒸馏插件还会带上自己的采样配方（这里是 6 步、CFG 1）。见下文“Qwen-Image-2.1 LoRA 插件”。
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --config config/qwen-image-2.1.json \
+    --lora config/lora/qwen-image-2.1-viggle-turbo.json \
+    --prompt "A small orange cat beside a blue ceramic vase, soft daylight" \
+    --width 1024 --height 1024 --output turbo.png
+
 # MiniMax-H3 带声音的视频生成（提示词 -> H.264 MP4，外加一个 32 kHz 立体声 .wav
 # 旁挂文件）。一个扩散 Transformer 在同一条 token 序列上对打包好的“视频+音频”
 # 潜变量一起去噪，因此音轨是模型输出本身，而不是事后配上去的。Qwen3-VL-32B 文本
@@ -364,17 +371,20 @@ Linux 仍隐藏常见的 `/run` 端点，但本地 Unix IPC 并非完整隔离�
 | `--test-chunked-prefill` | 运行分块 prefill 正确性检查（对比分块与非分块 logits） |
 | `--correct-prefill <N>` | `--test-chunked-prefill` 使用的 prompt 长度 |
 | `--correct-decode <N>` | `--test-chunked-prefill` 使用的 decode 长度 |
-| `--diffusion-steps <N>` | DiffusionGemma 每个 block 的去噪步数（默认：48）。对 Qwen-Image-2.1 则是 FlowMatch-Euler 步数——省略时自动选择（40）。 |
+| `--diffusion-steps <N>` | DiffusionGemma 每个 block 的去噪步数（默认：48）。对 Qwen-Image-2.1 则是 FlowMatch-Euler 步数——省略时自动选择（40，或 `--lora` 插件采样配方中的步数）。 |
 | `--diffusion-seed <N>` | 扩散路径的噪声种子：DiffusionGemma 的确定性采样器与 Qwen-Image-2.1（默认：0），以及视频生成（Wan、MiniMax-H3）——视频不传时每次运行都会取一个新的随机种子。决定一段视频长什么样的是这个种子，`--seed` 是文本采样种子，对它没有影响。 |
 | `--diffusion-blocks <N>` | DiffusionGemma block-autoregressive canvas 数量。`0` 表示根据 `--max-tokens` 与模型 canvas 长度推导。 |
 | `--image <path>` | Qwen-Image-2.1 编辑用的输入图像（也是多模态聊天的图像输入）；重复该参数可传入多张参考图。不带 `--image` 时，Qwen-Image-2.1 DiT 改为根据提示词生成图像。 |
 | `--prompt <text>` | Qwen-Image-2.1 的生成提示词或编辑指令（省略时回退到 `--input` 文件内容）。 |
 | `--output <path>` | Qwen-Image-2.1 输出 PNG 路径（默认：生成为 `generated.png`，编辑为 `edited.png`）。 |
-| `--cfg <F>` | Qwen-Image-2.1 true-CFG 引导尺度（`<= 1` 关闭负向分支）。省略时自动选择：Qwen-Image-2.1 为 1.0（每步只做一次 Transformer 预测）；大于 1 的值会增加负向分支。步数与种子复用 `--diffusion-steps` / `--diffusion-seed`。在 MiniMax-H3 上唯一可接受的取值是 `1.0`（也是它的默认值）：该检查点是 CFG 蒸馏的，更高的值会被直接拒绝，而不是照跑然后出劣化结果。`TensorSharp.Server` 根本没有 `--cfg` 参数——但请求体里仍然可以带 `cfg`。 |
+| `--cfg <F>` | Qwen-Image-2.1 true-CFG 引导尺度（`<= 1` 关闭负向分支）。省略时自动选择：Qwen-Image-2.1 为 1.0（每步只做一次 Transformer 预测），或 `--lora` 插件采样配方中的 CFG；大于 1 的值会增加负向分支。步数与种子复用 `--diffusion-steps` / `--diffusion-seed`。在 MiniMax-H3 上唯一可接受的取值是 `1.0`（也是它的默认值）：该检查点是 CFG 蒸馏的，更高的值会被直接拒绝，而不是照跑然后出劣化结果。`TensorSharp.Server` 根本没有 `--cfg` 参数——但请求体里仍然可以带 `cfg`。 |
 | `--qwen-image-vae <path>` | 覆盖解析到的 Qwen-Image-2.1 VAE 伴随文件（默认：DiT GGUF 旁的 `qwen_image_2.1_vae*.safetensors` 文件）。环境变量：`TS_QWEN_IMAGE_VAE`。 |
 | `--qwen-image-vl <path>` | 覆盖解析到的 Qwen3-VL-8B 文本编码器 GGUF（默认：DiT 旁的 `Qwen3VL-8B` / `Qwen3-VL-8B` GGUF）。环境变量：`TS_QWEN_IMAGE_TE`。 |
 | `--qwen-image-mmproj <path>` | 覆盖解析到的 Qwen3-VL-8B mmproj（编辑时的视觉接地）GGUF（默认：DiT 旁匹配的 `mmproj` GGUF）。环境变量：`TS_QWEN_IMAGE_MMPROJ`。 |
-| `--qwen-image-lora` / `--offload-cpu` | **已移除，启动时（包括作为配置文件键时）直接拒绝；没有替代项。** 两者只服务于早期的 Qwen-Image-Edit 流水线：Qwen-Image-2.1 不加载 LoRA 适配器，DiT 权重始终常驻。 |
+| `--lora <path>` | Qwen-Image-2.1 LoRA 插件：LoRA `.safetensors` 文件，或 TensorSharp 插件配置 `.json`（见 [`config/lora/`](config/lora/)）。重复该参数可叠加多个 LoRA。以不合并的方式叠加在量化 Transformer 之上。用于其他模型时会被拒绝。默认：无。见 [Qwen-Image-2.1 LoRA 插件](#qwen-image-21-lora-插件)。 |
+| `--lora-scale <f>` | 前一个 `--lora` 的强度（乘以 alpha / rank）。默认：插件配置中的 `"scale"`，否则为 `1.0`。 |
+| `--lora-config <path>` | 前一个 `--lora` 的伴随配置：TensorSharp LoRA 配置、PEFT `adapter_config.json` 或 VideoX-Fun `pdd_config.json`。默认：无（PDD 包的 `pdd_config.json`，以及与 `adapter_model.safetensors` 同目录的 PEFT `adapter_config.json`，会在权重旁自动找到）。 |
+| `--qwen-image-lora` / `--offload-cpu` | **已移除，启动时（包括作为配置文件键时）直接拒绝。** 两者只服务于早期的 Qwen-Image-Edit 流水线。`--qwen-image-lora` 由上面的 `--lora` 取代；`--offload-cpu` 没有替代项，因为 Qwen-Image-2.1 的 DiT 权重始终常驻。 |
 | `--width <px>` / `--height <px>` | Qwen-Image-2.1 与视频生成的输出尺寸。默认 `0` —— 自动（Qwen-Image-2.1：生成为 2048×2048，编辑则取与第一张参考图宽高比一致、面积大致相同的尺寸，显式尺寸须为 32 的倍数；MiniMax-H3：640×384，有条件图时按该面积取图片宽高比，并向上取整到 32 的倍数；Wan：按输入图的宽高比取模型原生面积，TI2V-5B 为 1280×704，其余为 832×480）。 |
 | `--video-frames <N>` | 视频帧数，会对齐到模型自己的时间网格（Wan 为 `4k+1`；MiniMax-H3 为 `17k+5` —— 5、22、39、56、73、90…）。默认：33；Wan2.2-TI2V 为 49，MiniMax-H3 为 22。`1` 生成一张静态图（配合 `--output out.png`）。 |
 | `--fps <N>` | 保存的 MP4 的播放帧率（默认：16；Wan2.2-TI2V 为 24）。以固定帧率训练的模型（MiniMax-H3，24 fps）会覆盖任何其他取值。 |
@@ -627,7 +637,8 @@ Unix IPC 并非完整隔离边界：macOS 为兼容性保留共享临时目录�
 | `--video-text-encoder <path>` | 覆盖解析到的文本编码器 GGUF（Wan 用 UMT5-XXL，MiniMax-H3 用 Qwen3-VL-32B）。亦可写作 `--video-te`。环境变量：`TS_VIDEO_TEXT_ENCODER`；`--wan-te` 仍然兼容。 |
 | `--video-dit2 <path>` | 双专家模型的第二个扩散专家（Wan 2.2 A14B 中与 `--model` 配对的 high/low-noise 搭档）。两者同目录时按文件名自动解析。环境变量：`TS_VIDEO_DIT2`；`--wan-dit2` 仍然兼容。 |
 | `--audio-vae <path>` | 与视频联合生成音轨的模型所用的音频 VAE（`minimax_h3_audio_vae_fp32.safetensors`）。不提供时该类模型仍能出图，只是没有音频。环境变量：`TS_VIDEO_AUDIO_VAE`。 |
-| `--qwen-image-lora` / `--offload-cpu` | **已移除，启动时（包括作为配置文件键时）直接拒绝；没有替代项。** 两者只服务于早期的 Qwen-Image-Edit 流水线：Qwen-Image-2.1 不加载 LoRA 适配器，DiT 权重始终常驻。 |
+| `--lora <path>` / `--lora-scale <f>` / `--lora-config <path>` | Qwen-Image-2.1 LoRA 插件，拼写与绑定规则都与 CLI 相同（重复 `--lora` 可叠加；强度与配置绑定到前一个 `--lora`）。文件在启动时检查，这组插件作用于每个图像请求；请求中的 `steps` / `cfg` 仍会覆盖插件的采样配方。其他模型会忽略它们（启动日志会说明这些插件只作用于 Qwen-Image-2.1 模型）。见 [Qwen-Image-2.1 LoRA 插件](#qwen-image-21-lora-插件)。 |
+| `--qwen-image-lora` / `--offload-cpu` | **已移除，启动时（包括作为配置文件键时）直接拒绝。** 两者只服务于早期的 Qwen-Image-Edit 流水线。`--qwen-image-lora` 由上面的 `--lora` 取代；`--offload-cpu` 没有替代项，因为 Qwen-Image-2.1 的 DiT 权重始终常驻。 |
 | `--temperature <f>` | 采样温度（`0` = 贪心） |
 | `--top-k <N>` | Top-K 过滤（`0` = 关闭） |
 | `--top-p <f>` | Nucleus 采样阈值（`1.0` = 关闭） |
@@ -795,6 +806,126 @@ Unix IPC 并非完整隔离边界：macOS 为兼容性保留共享临时目录�
 使用 `--sampling-precedence request` 时，第 1~3 步互换：请求中出现的参数优先
 于服务端参数与环境变量，其余参数仍由服务端填充。无论哪种模式，服务端 `--stop`
 在 `config` 下始终生效（与请求的列表合并），在 `request` 下则被请求替换。
+
+## Qwen-Image-2.1 LoRA 插件
+
+`--lora` 把一个 LoRA 加到 Qwen-Image-2.1 扩散 Transformer 上：可以是一种风格、一项编辑
+能力，或者把默认 40 步换成 4–8 次 Transformer 前向的步数蒸馏适配器。`TensorSharp.Cli`
+与 `TensorSharp.Server` 接受同样的三个参数，拼写也相同：
+
+| 参数 | 说明 |
+|---|---|
+| `--lora <path>` | 一个 LoRA 插件：LoRA `.safetensors` 文件，或 TensorSharp 插件配置 `.json`（例如 [`config/lora/`](config/lora/) 中的文件）。重复该参数可叠加多个；每个 `--lora` 开始一个新插件。 |
+| `--lora-scale <f>` | 前一个 `--lora` 的强度（乘以 alpha / rank）。默认：插件配置中的 `"scale"`，否则为 `1.0`。 |
+| `--lora-config <path>` | 前一个 `--lora` 的伴随配置：TensorSharp LoRA 配置（`config/lora/` 中的插件也可用于此处，提供其强度与配方，或通过 `"config"` 转交的第三方配置，而其 `weights` 项会被忽略）、PEFT `adapter_config.json`（`lora_alpha`、`alpha_pattern`、`use_rslora`）或 VideoX-Fun `pdd_config.json`。当 `--lora` 本身指定的是插件 `.json` 时，该文件已经是配置，其后的 `--lora-config` 会被拒绝。 |
+
+`--lora-scale` 与 `--lora-config` 绑定到它前面最近的 `--lora`，后出现的值替换先出现的；
+前面没有 `--lora` 时两者都是配置错误，绝不会被忽略。两个宿主都会在启动时检查每个文件，
+因此拼写错误会在模型加载之前就失败。`--config` 文件中的参数会先于命令行展开，所以命令行上
+的 `--lora-scale` 如果前面没有自己的 `--lora`，会绑定到配置文件中的最后一个插件。宿主通过
+环境变量 `TS_LORAS` 把解析后的列表交给模型，其值是由 `{"path", "scale", "config"}` 对象
+组成的 JSON 数组。
+
+这些插件只作用于 Qwen-Image-2.1。CLI 遇到其他模型时拒绝 `--lora`；服务端在启动时记录它们
+（`LoRA plug-ins (applied to Qwen-Image-2.1 models only): ...`），并把它们应用到每个
+图像请求上。尚未实现按请求选择 LoRA。已退役的 `--qwen-image-lora` 仍是已移除的参数，其报错
+会指明 `--lora`；`TS_QWEN_IMAGE_LORA` 在加载时被拒绝，并给出同样的建议。
+
+```bash
+# 现成的插件：配置在首次使用时下载（并校验哈希）权重，并带上适配器的采样配方，
+# 这里是 6 步、CFG 1。
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --config config/qwen-image-2.1.json \
+    --lora config/lora/qwen-image-2.1-viggle-turbo.json \
+    --prompt "A small orange cat beside a blue ceramic vase, soft daylight" \
+    --width 1024 --height 1024 --output turbo.png
+
+# 任意 LoRA 文件，指定强度，并与一个随附的风格插件叠加
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --config config/qwen-image-2.1.json \
+    --lora ./loras/my-style.safetensors --lora-scale 0.8 \
+    --lora config/lora/qwen-image-2.1-film-stills.json \
+    --prompt "A lighthouse at dusk" --output styled.png
+
+# alpha 存放在单独 adapter_config.json 中的 PEFT 适配器
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --config config/qwen-image-2.1.json \
+    --lora ./adapter/my-adapter.safetensors --lora-config ./adapter/adapter_config.json \
+    --prompt "..." --output adapted.png
+
+# 服务端把启动时的这组插件应用到每个图像请求
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --config config/qwen-image-2.1.json \
+    --lora config/lora/qwen-image-2.1-pruna-8step.json
+```
+
+**采样优先级。** 显式设置优先于插件的配方，配方又优先于模型默认值（40 步、CFG 1）。显式
+设置指 CLI 上的 `--diffusion-steps` / `--cfg`，以及服务端请求中的 `steps` / `cfg`——其中
+`0` 或省略表示使用配方。带 sigma 的配方只对它列出的步数有调度，因此其他步数会被拒绝并列出
+支持的步数，而不是重新采样。不带 sigma 的配方只设定默认值，并沿用检查点自己的调度。两个都带
+配方的插件不能叠加。每次运行都会记录解析出的配方及其 sigma
+（`[lora] sampling recipe (...): 6 steps on shifted sigmas [...]`）。
+
+**随附的插件。** [`config/lora/`](config/lora/) 中的每个文件在首次使用时把权重下载到
+`${TENSORSHARP_MODELS:-<repo>/models}/qwen-image-2.1/loras`。文件注释给出了模型卡、
+触发短语（如果有）与许可证；其中数个采用 Qwen Research License（非商业）。
+
+| 插件 | 说明 | 步数 / CFG | 强度 |
+|---|---|---|---|
+| `qwen-image-2.1-viggle-turbo.json` | Viggle Turbo v0.2.1，DMD2 / SenseFlow 步数蒸馏 LoRA（r128 文件） | 默认 6 步，支持 4–8 步；原始 sigma 节点经过检查点的动态偏移；CFG 1 | 1.0 |
+| `qwen-image-2.1-pruna-8step.json` | Pruna 8-step v0.1，DMD 步数蒸馏 LoRA | 8 步，固定 sigma，不偏移；CFG 1 | 1.0（文件中 PEFT alpha 128、rank 64，实际缩放为 2） |
+| `qwen-image-2.1-pruna-5step.json` | Pruna 5-step v0.1，比 8 步版本更快、质量更低 | 5 步，固定 sigma，不偏移；CFG 1 | 1.0（实际缩放为 2，同上） |
+| `qwen-image-2.1-fun-acc-4step.json` | 阿里巴巴 PAI Fun-Acc，并行解码蒸馏（PDD）包：rank-64 增量、四个替换 `proj_out` 的逐步输出头，以及替换的 Q/K 与文本归一化增益。转发其 `pdd_config.json` | 4 步，包内固定网格，bf16 时间步；CFG 1 | 1.0 |
+| `qwen-image-2.1-film-stills.json` | Danrisi Film Stills：电影感 35 mm 剧照风格 | 模型默认值 | 0.7 |
+| `qwen-image-2.1-grainscape.json` | Danrisi Grainscape：颗粒感 35 mm 彩色负片风格 | 模型默认值 | 0.7 |
+| `qwen-image-2.1-fix.json` | e-n-v-y Qwen-Image-2.1-Fix：DoRA 质量修正 | 模型默认值 | 1.0 |
+| `qwen-image-2.1-detail-enhancer.json` | elusarca Detail Enhancer（编辑）：细节增强、放大与修复 | 模型默认值 | 1.0 |
+| `qwen-image-2.1-natural-exposure.json` | prithivMLmods Natural Exposure（编辑）：均衡、中性的曝光 | 模型默认值 | 1.0 |
+| `qwen-image-2.1-anime-consistency.json` | WarmBloodAban Anime Consistency：在多次编辑间保持动漫角色一致 | 模型默认值 | 0.7 |
+| `qwen-image-2.1-object-remover.json` | prithivMLmods Object Remover Bbox（编辑）：移除用红框标出的物体 | 模型默认值 | 1.0 |
+| `qwen-image-2.1-object-mover.json` | prithivMLmods Object Mover Bbox（编辑）：把一个红框里的物体移到另一个红框处 | 模型默认值 | 1.0 |
+
+**插件配置格式。** 插件是带有 `"type": "qwen-image-2.1-lora"` 的 JSON 文件。它遵循
+`--config` 的约定（注释、带 `${name:-fallback}` 的 `"variables"`、相对于文件的路径），
+其 `"weights"` 项是一个下载描述：文件缺失时下载并校验 SHA-256，与 `--config` 文件中的
+条目相同。
+
+```json
+{
+  "type": "qwen-image-2.1-lora",
+  "variables": { "root": "${TENSORSHARP_MODELS:-../../models}/qwen-image-2.1/loras" },
+  "weights": { "path": "${root}/my-turbo.safetensors", "urls": ["https://..."], "sha256": "..." },
+  "scale": 1.0,
+  "sampling": {
+    "steps": 6,
+    "shift": "dynamic",
+    "cfg": 1.0,
+    "sigmas": { "4": [1.0, 0.75, 0.5, 0.25], "6": [1.0, 0.9375, 0.875, 0.75, 0.5, 0.25] }
+  }
+}
+```
+
+| 键 | 含义 |
+|---|---|
+| `weights` | LoRA `.safetensors`：路径或下载描述（`path`、`urls`、`sha256`）。必需。 |
+| `scale` | 默认强度；`--lora-scale` 会覆盖它。 |
+| `alpha`、`use_rslora` | 文件本身不带 alpha 时使用的 alpha。缩放为 alpha / rank，使用 rsLoRA 时为 alpha / √rank。 |
+| `sampling.steps` | 默认步数。当 `sigmas` 只定义了一个调度时可以省略。 |
+| `sampling.sigmas` | 调度：一个数组（对应一种步数），或以步数为键的对象。节点位于 (0, 1] 且严格递减；末尾会追加 0。省略时沿用检查点自己的调度。 |
+| `sampling.shift` | `none`（默认）：节点就是 sigma。`dynamic`：节点是原始位置，经过检查点随分辨率变化的指数偏移，但不做末端拉伸。 |
+| `sampling.cfg` | 默认 CFG，至少为 1。 |
+| `sampling.timestep` | `fp32`（默认）或 `bf16`，后者像 bf16 流水线那样对 Transformer 的时间步取整。 |
+| `config` | 代替 `sampling`：要转发的第三方伴随配置（路径或下载描述），例如 PDD 的 `pdd_config.json`。插件只能二选一，不能同时使用。 |
+
+**格式。** Diffusers / PEFT（`transformer.` 前缀、`lora_A` / `lora_B`、`.default` 等适配器
+槽名）、ComfyUI / ai-toolkit（`diffusion_model.`）、DiffSynth / ModelScope（无前缀）、kohya
+下划线命名、带或不带 `.weight` 的 `lora_down` / `lora_up`、DoRA `dora_scale`、VideoX-Fun PDD
+包，以及归一化增益上的一维 `.diff` 张量。alpha 来自 `.alpha` 张量、safetensors 文件中的 PEFT
+元数据或 `adapter_config.json`；都没有时 alpha 等于 rank（kohya 的 `ss_network_alpha` 训练元数据会被忽略，与 ComfyUI 和 diffusers 一致）。LoKr、LoHa、LoCon 中间因子、
+文本编码器 LoRA、偏置项、二维全权重差值，以及为其他模型制作的 LoRA 都会被拒绝并给出说明。
+文件中的每个张量要么被应用，要么加载失败并点出它的名字；不会静默跳过任何张量。
+
+**运行方式。** 更新以不合并的方式应用，即 `y = W x + B (A x)`，叠加在量化的 GGUF 权重之上，
+因为把蒸馏 LoRA 的微小增量合并进 Q8_0 或 Q4 权重会让其中大部分被舍入掉。它可在
+`ggml_metal`、`ggml_cuda`、`ggml_vulkan` 与 `ggml_cpu` 上运行，并与前缀 KV 缓存和
+`--tp N` 兼容。格式、打包方式、张量并行与限制的详细说明见
+[Qwen-Image-2.1 卡片](docs/models/qwenimage21_zh-cn.md#lora-插件)。
 
 ## 音视频生成（MiniMax-H3）
 
@@ -1459,7 +1590,7 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --backend cu
 | DeepSeek V4.1 Flash | 按层切分（+ 实验性 routed-MoE TP） | 按层放置是默认路径，也是有实测数据的路径。`TS_DSV41_TP=N`（2–8，且必须等于 `--tp` / `TS_DSV4_NGPU` 选中的 GPU 数）会把路由专家的 gate/up 沿 FFN 中间维、down 沿输入维切分，partial 结果经主机中转的 F32 缓冲归约；注意力、共享专家与各类 cache 仍按层放置。切分按块对齐且不等宽（2304 的中间维是 9 个 256 元素的 K-quant 块：两 rank 为 1280+1024，四 rank 为 768+512+512+512）。首次完整 Q2_K 实测比按层切分更慢，因此仍属实验性。注意力 TP 与分布式组尚未实现 |
 | Hunyuan Dense | — | 单设备：既没有 TP 也没有按层切分。启动时会在 stderr 上明说，而不是让多余的 GPU 闲置 |
 | DiffusionGemma | — | 不适用（扩散模型） |
-| Qwen-Image-2.1 | — | 不适用（图像生成） |
+| Qwen-Image-2.1 | ✅（仅本地，扩散 Transformer） | 在 `ggml_cuda` / `ggml_vulkan` 上，`--tp N`（N = 2、4 或 8）切分 DiT 的注意力头与 MLP 列；LoRA 插件随之切分。文本编码器、视觉编码器与 VAE 留在第一张 GPU 上，不支持多节点组。见 [Qwen-Image-2.1 卡片](docs/models/qwenimage21_zh-cn.md#cuda-graph-与张量并行) |
 
 ### 后端支持
 

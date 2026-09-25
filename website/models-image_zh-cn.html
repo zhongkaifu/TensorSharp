@@ -72,10 +72,31 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model models/qw
     <li><strong>采样默认值。</strong>省略设置时使用 40 步 Euler 和 CFG 1.0，遵循 Qwen 推荐的无引导采样——每步只做一次 Transformer 预测。显式设置大于 1 的 CFG 会增加负向预测并应用 <code>--negative-prompt</code>；在 CFG 1 下负向提示词不起作用。</li>
     <li><strong>尺寸。</strong>省略尺寸时，生成为 2048×2048；编辑则取与第一张参考图宽高比一致、像素面积大致相同的尺寸。要覆盖此行为，请同时设置宽度和高度，且都取 32 的倍数。每张参考图以约 1 百万像素（若输出面积更小，则以输出面积）作为条件输入。</li>
     <li><strong>调度。</strong>遵循官方调度器配置：指数动态偏移（序列长度/偏移锚点为 256/0.5 与 8192/0.9），随后终端拉伸到 0.02，并以最后一个 Euler 步走到零。</li>
-    <li><strong>执行。</strong>扩散 Transformer 以常驻量化权重运行一张完整的 GGML 图，因此需要 GGML 后端（<code>ggml_metal</code>、<code>ggml_cuda</code>、<code>ggml_vulkan</code> 或 <code>ggml_cpu</code>）。CUDA 与 Metal 会在多次预测之间保留这张图（<code>TS_QWEN21_GRAPH_REUSE=1</code>，默认开启）。没有 CPU 权重流式加载模式，也不支持 LoRA；内存不足时请先用较小的尺寸。</li>
+    <li><strong>执行。</strong>扩散 Transformer 以常驻量化权重运行一张完整的 GGML 图，因此需要 GGML 后端（<code>ggml_metal</code>、<code>ggml_cuda</code>、<code>ggml_vulkan</code> 或 <code>ggml_cpu</code>）。CUDA 与 Metal 会在多次预测之间保留这张图（<code>TS_QWEN21_GRAPH_REUSE=1</code>，默认开启）。没有 CPU 权重流式加载模式；内存不足时请先用较小的尺寸。LoRA 插件在这四个后端上都能运行（见<a href="#lora">下文</a>）。</li>
   </ul>
   <p><strong>提速的关键是分辨率和步数。</strong>2K 正方形的潜在图像 token 数是 1K 正方形的四倍，注意力计算也更多，因此 <code>--width 1024 --height 1024</code> 是草图设置。<code>--diffusion-steps 25 --cfg 1</code> 是官方 ComfyUI 生成与编辑工作流使用的更快配置；默认仍为 40 步，更少的步数是质量与速度之间的权衡，并不代表质量相当。CFG 1 本身就意味着每步只做一次 Transformer 前向。快速冒烟测试可用 256×256、一步，它只验证加载和端到端数据通路，不说明图像质量。</p>
   <p>可从 <a href="cli_zh-cn.html#imagegen">CLI</a>（<code>--prompt</code>，编辑时再加 <code>--image</code>）、<a href="server_zh-cn.html#webui">Web UI</a>（不带附件的提示词会生成图像；附加一张或多张图像即可编辑，并有实时去噪预览）、<a href="http-api_zh-cn.html#image-api">HTTP API</a>（<code>/api/image-generate</code> 与 <code>/api/image-edit</code>，各有 <code>/stream</code> 变体），或在进程内从 <a href="code-api_zh-cn.html#imagegen">C# 通过 <code>QwenImageModel.GenerateImage()</code> / <code>EditImage()</code></a> 运行。由于扩散流水线共享可变的工作状态，图像操作会串行执行。完整细节见仓库的 <a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/models/qwenimage21_zh-cn.md" target="_blank" rel="noopener">Qwen-Image-2.1 卡片</a>（验证记录见<a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/models/qwenimage21.md" target="_blank" rel="noopener">英文版</a>）。</p>
+
+  <h3 id="lora">LoRA 插件</h3>
+  <p>CLI 与服务端都可以用 <code>--lora</code> 给扩散 Transformer 加上一个 LoRA：一种风格、一项编辑能力，或者把默认 40 步换成 4–8 次 Transformer 前向的步数蒸馏适配器。重复该参数可叠加插件；<code>--lora-scale</code> 设置前一个 <code>--lora</code> 的强度，<code>--lora-config</code> 指定它的伴随配置（TensorSharp LoRA 配置、PEFT <code>adapter_config.json</code> 或 VideoX-Fun <code>pdd_config.json</code>）。<code>config/lora/</code> 中的十二个现成插件会在首次使用时下载并校验权重哈希，并带有适配器的强度与采样配方。</p>
+  <pre data-lang="bash"><code># Viggle Turbo：插件配方给出 6 步、CFG 1（支持 4–8 步）
+dotnet run --project TensorSharp.Cli -c Release --no-build -- \
+  --config config/qwen-image-2.1.json \
+  --lora config/lora/qwen-image-2.1-viggle-turbo.json \
+  --prompt 'A small orange cat beside a blue ceramic vase, soft daylight, detailed photograph' \
+  --width 1024 --height 1024 --diffusion-seed 42 --output turbo.png
+
+# 服务端把启动时的这组插件应用到每个图像请求
+dotnet run --project TensorSharp.Server.Host -c Release --no-build -- \
+  --config config/qwen-image-2.1.json --lora config/lora/qwen-image-2.1-pruna-8step.json</code></pre>
+  <ul>
+    <li><strong>随附插件。</strong>步数蒸馏：<code>viggle-turbo</code>（6 步，支持 4–8 步）、<code>pruna-8step</code>、<code>pruna-5step</code> 与 <code>fun-acc-4step</code>（带逐步输出头的 PDD 包）。风格与编辑能力：<code>film-stills</code>、<code>grainscape</code>、<code>fix</code>（DoRA）、<code>detail-enhancer</code>、<code>natural-exposure</code>、<code>anime-consistency</code>、<code>object-remover</code> 与 <code>object-mover</code>。每个文件的注释给出了模型卡、触发短语与许可证；其中数个仅限非商业用途。</li>
+    <li><strong>采样优先级。</strong>显式的 <code>--diffusion-steps</code> / <code>--cfg</code>（或请求中的 <code>steps</code> / <code>cfg</code>）优先于插件的配方，配方又优先于模型默认值。配方没有调度的步数会被拒绝并列出支持的步数；每次运行只能有一个插件带配方。</li>
+    <li><strong>格式。</strong>Diffusers / PEFT、ComfyUI / ai-toolkit、DiffSynth / ModelScope 与 kohya 命名；<code>.alpha</code> 张量以及 PEFT 或 kohya 的 alpha 元数据；DoRA；VideoX-Fun PDD 包。LoKr、LoHa、文本编码器 LoRA 以及为其他模型制作的 LoRA 会被拒绝并给出说明；不会静默跳过任何张量。</li>
+    <li><strong>执行。</strong>以不合并的方式应用，即 <code>y = W x + B (A x)</code>，叠加在量化权重之上，因为把蒸馏 LoRA 的微小增量合并进 Q8_0 或 Q4 权重会让其中大部分被舍入掉。与前缀 KV 缓存及 <code>--tp N</code> 兼容，此时每张 GPU 持有自己那部分因子。</li>
+    <li><strong>服务端。</strong>启动时的这组插件作用于每次生成与编辑；尚未实现按请求选择 LoRA。</li>
+  </ul>
+  <p>参数说明与插件配置格式见仓库的 <a href="https://github.com/zhongkaifu/TensorSharp/blob/main/USAGE_zh-cn.md#qwen-image-21-lora-插件" target="_blank" rel="noopener">USAGE_zh-cn.md</a>，打包与张量并行细节见 <a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/models/qwenimage21_zh-cn.md#lora-插件" target="_blank" rel="noopener">Qwen-Image-2.1 卡片</a>。</p>
   <div class="content-footer">
     <a href="models-text_zh-cn.html">← 文本与 LLM 模型</a>
     <a href="models-video_zh-cn.html">下一篇：视频生成 →</a>

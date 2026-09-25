@@ -311,6 +311,51 @@ namespace InferenceWeb.Tests
     }
 
     /// <summary>
+    /// [Fact] that needs no model weights but constructs a fixed GGML backend
+    /// (a GgmlContext, or ModelBase.Create with a Ggml* backend). The native bridge
+    /// allows one GGML backend per process, so the test runs in the lane whose
+    /// TS_TEST_GGML_BACKEND pins that backend (cpu by default) and skips visibly in
+    /// every other lane (<see cref="TestGates.GgmlPinSkip"/>). Carries
+    /// Requires=&lt;backend&gt;, e.g. Requires=GgmlCpu.
+    /// </summary>
+    [TraitDiscoverer("InferenceWeb.Tests.RequiresTraitDiscoverer", "InferenceWeb.Tests")]
+    [AttributeUsage(AttributeTargets.Method)]
+    public sealed class GgmlFactAttribute : FactAttribute, ITraitAttribute
+    {
+        public string RequiresValue { get; }
+
+        /// <summary>The GGML backend the test constructs.</summary>
+        public BackendType GgmlBackend { get; }
+
+        public GgmlFactAttribute(BackendType backend)
+        {
+            GgmlBackend = backend;
+            RequiresValue = backend.ToString();
+            Skip = TestGates.GgmlPinSkip(backend);
+        }
+    }
+
+    /// <summary>[Theory] variant of <see cref="GgmlFactAttribute"/>. A skipped theory
+    /// reports once, not per data row; keep managed rows (which never conflict) in a
+    /// separate plain [Theory] so they run in every lane.</summary>
+    [TraitDiscoverer("InferenceWeb.Tests.RequiresTraitDiscoverer", "InferenceWeb.Tests")]
+    [AttributeUsage(AttributeTargets.Method)]
+    public sealed class GgmlTheoryAttribute : TheoryAttribute, ITraitAttribute
+    {
+        public string RequiresValue { get; }
+
+        /// <summary>The GGML backend the test constructs.</summary>
+        public BackendType GgmlBackend { get; }
+
+        public GgmlTheoryAttribute(BackendType backend)
+        {
+            GgmlBackend = backend;
+            RequiresValue = backend.ToString();
+            Skip = TestGates.GgmlPinSkip(backend);
+        }
+    }
+
+    /// <summary>
     /// [Fact] that needs real GGUF weights: skips visibly when the env var is
     /// unset or the weights are absent, and carries Requires=Models.
     /// </summary>
