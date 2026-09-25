@@ -158,9 +158,10 @@ your own file to host a different variant.
 ## Ready-made configs, one per runnable model
 
 One config per runnable model, with its companions (vision projector, MTP draft
-head) already wired in. Each points at the
-existing local file, so no download happens — just run it. Every file works with
-**both** hosts (only host-recognized keys are used):
+head) already wired in. Every file names each model file's source as a pinned,
+checksum-verified Hugging Face URL, so a missing file downloads on first run and an
+existing one is used as-is. Every file works with **both** hosts (only
+host-recognized keys are used):
 
 ```bash
 TensorSharp.Cli    --config config/qwen3.5-9b-q8.json --input prompt.txt
@@ -207,9 +208,12 @@ Notes:
   [the Qwen-Image-2.1 guide](../docs/models/qwenimage21.md).
 - **DiffusionGemma** uses the CLI's iterative denoising path; tune it with
   `--diffusion-steps` / `--diffusion-seed` on the command line.
-- To make any of these auto-download on another machine, turn a `"model": "…path…"`
-  string into an object: `{ "path": "…", "urls": ["https://…"] }` (see the examples
-  above).
+- **Downloads are pinned to a commit and a SHA-256**, not to `main`, so every
+  machine gets the same bytes. Each pin is the upstream head as of 2026-09-25; to
+  take a later upload, change the commit in the URL and the `sha256` together. The
+  checksum applies only to a new download: a file already at `path` is used as-is
+  and never re-checked, so an older local copy keeps being used until you delete
+  it.
 
 ## Qwen-Image-2.1 LoRA plug-ins (`lora/`)
 
@@ -263,7 +267,8 @@ endpoint: Agent Skills and their bundled scripts, network access for both, the
 `shell` / `read_file` / `write_file` / `apply_patch` tool loop, and
 host-performed `pip` / `npm` installs are all switched on in one file. They point
 at local paths on an Apple Silicon Mac (`ggml_metal`), so change `backend` and the
-`variables` block to run them elsewhere.
+`variables` block to run them elsewhere. A missing model file downloads from its
+upstream repo, pinned by commit and SHA-256.
 
 ```bash
 TensorSharp.Cli    --config config/agent-gemma-4-12b.json --chat
@@ -272,7 +277,7 @@ TensorSharp.Server --config config/agent-qwen3.8-27b.json
 
 | File | Model | Speculative decoding |
 |------|-------|----------------------|
-| [`agent-qwen3.8-27b.json`](agent-qwen3.8-27b.json) | Qwen3.8-27B (UD-Q4_K_XL, 16.7 GB) | Off — the embedded NextN head measured only ~1.04× |
+| [`agent-qwen3.8-27b.json`](agent-qwen3.8-27b.json) | Qwen3.8-27B (UD-Q4_K_XL, 16.4 GB) | Off — the embedded NextN head measured only ~1.04× |
 | [`agent-qwen3.6-35b-a3b.json`](agent-qwen3.6-35b-a3b.json) | Qwen3.6-35B-A3B MoE (UD-IQ2_XXS, 11 GB) | Off — MTP measured **2× slower** on this MoE |
 | [`agent-gemma-4-12b.json`](agent-gemma-4-12b.json) | Gemma-4 12B (QAT UD-Q4_K_XL, 6.3 GB) | **On** — MTP draft head, auto window 7 |
 | [`agent-gemma-4-26b-a4b.json`](agent-gemma-4-26b-a4b.json) | Gemma-4 26B-A4B MoE (QAT UD-Q4_K_XL, 13.3 GB) | Off — no Metal MoE measurement exists yet |

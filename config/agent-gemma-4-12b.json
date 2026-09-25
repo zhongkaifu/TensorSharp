@@ -12,9 +12,15 @@
   // server refuses to start on an unknown option while the CLI silently drops
   // one. Comments are the only way to annotate a config -- any non-reserved
   // key becomes a command-line flag.
+  //
+  // A missing model file downloads from "repo" into ${root}, pinned by commit and
+  // SHA-256. This upload carries Gemma's second-generation chat template, which
+  // TensorSharp renders prompts from; its weights match the earlier upload the
+  // speculative numbers below were measured on, byte for byte.
   "variables": {
     "modelRoot": "${TENSORSHARP_MODELS:-/Users/zhongkaifu/work/models}",
     "root": "${modelRoot}/gemma_mtp/qat",
+    "repo": "https://huggingface.co/unsloth/gemma-4-12B-it-qat-GGUF/resolve/980b060c40a8539ac159e0501a3e0f66a6365af3",
     "skillsRoot": "${TENSORSHARP_SKILLS:-/Users/zhongkaifu/work/TensorSharp/TensorAgent/skills}"
   },
 
@@ -43,7 +49,11 @@
   // the indentation and closing delimiters of generated code.
   "repeat-penalty": 1.0,
 
-  "model": "${root}/gemma-4-12B-it-qat-UD-Q4_K_XL.gguf",
+  "model": {
+    "path": "${root}/gemma-4-12B-it-qat-UD-Q4_K_XL.gguf",
+    "urls": ["${repo}/gemma-4-12B-it-qat-UD-Q4_K_XL.gguf"],
+    "sha256": "90fd44e29e0d7cffeb0fd00dc73cfdab9ed0b0e95306ecf7821ea634c940c370"
+  },
 
   // MTP speculative decoding, lossless, and a measured win on Metal for
   // Gemma-4: 46 -> 92 tok/s at draft window 7, measured on the E4B Q8_0
@@ -56,7 +66,11 @@
   // window is already the measured-optimal 7, and 8 falls off a cliff
   // (69 tok/s against 92) as a ninth verify row tips the verify graph onto
   // ggml's large-batch path. Both hosts honour this.
-  "draft-model": "${root}/gemma-4-12B-it-Q4_0-MTP.gguf",
+  "draft-model": {
+    "path": "${root}/gemma-4-12B-it-Q4_0-MTP.gguf",
+    "urls": ["${repo}/MTP/mtp-gemma-4-12B-it-Q4_0.gguf"],
+    "sha256": "fcb35dea42c71333db904cee11baac525c9ef872818ee3753f6cb156f3c6f4f6"
+  },
 
   // ---- Agent Skills -------------------------------------------------------
   // Without this the agent has zero skills: the default root beside the binary
@@ -118,9 +132,11 @@
   //     downgraded to f16 at load with a note on stderr rather than honoured.
   //     MAX_CONTEXT is the only lever on KV size here.
   //   "mmproj" -- the projector loads eagerly at every startup, 175 MB here,
-  //     even for a pure-text run. Add
-  //     "mmproj": "${root}/gemma-4-12B-mmproj-BF16.gguf" if the agent needs to
-  //     read images; the CLI also auto-detects it when --image is passed.
+  //     even for a pure-text run. If the agent needs to read images, add
+  //       "mmproj": { "path": "${root}/gemma-4-12B-mmproj-BF16.gguf",
+  //                   "urls": ["${repo}/mmproj-BF16.gguf"],
+  //                   "sha256": "dcb8103adad042b1bf99df767aaf34eb37c5a73a4a2f0417e4d7ba557e91664f" }
+  //     The CLI also auto-detects it when --image is passed.
   //   "code-exec-packages" / "code-exec-install-domains" -- defaults already
   //     allow any package from the three default registry hosts (pypi.org,
   //     files.pythonhosted.org, registry.npmjs.org), and installs go to PyPI

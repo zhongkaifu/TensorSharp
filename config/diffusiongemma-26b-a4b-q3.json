@@ -14,7 +14,16 @@
   "backend": "ggml_cuda",
   "max-tokens": 256,
 
-  "model": "${root}/diffusiongemma-26B-A4B-it-Q3_K_M.gguf",
+  // unsloth publishes no Q3_K_M, so this is DevQuasar's. Its tensors and
+  // metadata match the unsloth Q4_K_M; it adds only diffusion.eb_* sampler
+  // hints, which TensorSharp does not read.
+  "model": {
+    "path": "${root}/diffusiongemma-26B-A4B-it-Q3_K_M.gguf",
+    "urls": [
+      "${hf}/DevQuasar/google.diffusiongemma-26B-A4B-it-GGUF/resolve/286a2aae3639db2fe7a6c50401727283e97c5f49/google.diffusiongemma-26B-A4B-it.Q3_K_M.gguf"
+    ],
+    "sha256": "e0c8016fe0d3a3b3dfcb93f9fa5f0b3a6e580161b0103457f063610ab1f6cf5a"
+  },
 
   // Same vision tower as the Q4 config. It is full-precision BF16 and quant
   // independent, so it lives in ${modelRoot} rather than under ${root} (q3/)

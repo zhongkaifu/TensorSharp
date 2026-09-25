@@ -16,9 +16,14 @@
   // the only build of this model on disk and it is an aggressive 2-bit quant.
   // It is the fastest agent here, not the most accurate. For code the model
   // must get right the first time, prefer agent-qwen3.8-27b.json.
+  //
+  // A missing model file downloads from "repo" into ${root}: unsloth's -MTP
+  // build, which carries the embedded NextN block (the plain Qwen3.6-35B-A3B-GGUF
+  // repo is a different, smaller file).
   "variables": {
     "modelRoot": "${TENSORSHARP_MODELS:-/Users/zhongkaifu/work/models}",
     "root": "${modelRoot}/Qwen",
+    "repo": "https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF/resolve/5bc3e238d916f48a861bac2f8a1990a0e9b7e98d",
     "skillsRoot": "${TENSORSHARP_SKILLS:-/Users/zhongkaifu/work/TensorSharp/TensorAgent/skills}"
   },
 
@@ -51,7 +56,11 @@
   // the indentation and closing delimiters of generated code.
   "repeat-penalty": 1.0,
 
-  "model": "${root}/Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf",
+  "model": {
+    "path": "${root}/Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf",
+    "urls": ["${repo}/Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf"],
+    "sha256": "627e2b05f83088448e27861ec392d56efc2b178783cae5adfa4ad2d988441203"
+  },
 
   // ---- Agent Skills -------------------------------------------------------
   // Without this the agent has zero skills: the default root beside the binary
@@ -110,8 +119,10 @@
   //     block while the trunk is only ~3B active. A good acceptance rate is
   //     not evidence of a win here.
   //   "mmproj" -- the vision projector costs ~0.8 GB of the memory the KV
-  //     cache wants. Add "mmproj": "${root}/Qwen3.6-35B-A3B-mmproj-BF16.gguf"
-  //     if the agent needs to read images.
+  //     cache wants. If the agent needs to read images, add
+  //       "mmproj": { "path": "${root}/Qwen3.6-35B-A3B-mmproj-BF16.gguf",
+  //                   "urls": ["${repo}/mmproj-BF16.gguf"],
+  //                   "sha256": "da63cb47a76763c712393f8a017070188a304fa39f8aeea6edc629ed7b975cfa" }
   //   "code-exec-packages" / "code-exec-install-domains" -- defaults already
   //     allow any package from the three default registry hosts (pypi.org,
   //     files.pythonhosted.org, registry.npmjs.org), and installs go to PyPI

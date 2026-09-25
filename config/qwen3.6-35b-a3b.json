@@ -7,7 +7,9 @@
   //   TensorSharp.Server --config config/qwen3.6-35b-a3b.json
   "variables": {
     "modelRoot": "${TENSORSHARP_MODELS:-../models}",
-    "root": "${TENSORSHARP_MODELS:-../models}/mtp"
+    "root": "${TENSORSHARP_MODELS:-../models}/mtp",
+    // unsloth's -MTP build: the one that carries the embedded NextN block.
+    "repo": "https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF/resolve/5bc3e238d916f48a861bac2f8a1990a0e9b7e98d"
   },
 
   "backend": "ggml_cuda",
@@ -19,8 +21,16 @@
   "top-p": 0.8,
   "min-p": 0,
 
-  "model": "${root}/Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf",
-  "mmproj": "${root}/Qwen3.6-35B-A3B-mmproj-BF16.gguf"
+  "model": {
+    "path": "${root}/Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf",
+    "urls": ["${repo}/Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf"],
+    "sha256": "627e2b05f83088448e27861ec392d56efc2b178783cae5adfa4ad2d988441203"
+  },
+  "mmproj": {
+    "path": "${root}/Qwen3.6-35B-A3B-mmproj-BF16.gguf",
+    "urls": ["${repo}/mmproj-BF16.gguf"],
+    "sha256": "da63cb47a76763c712393f8a017070188a304fa39f8aeea6edc629ed7b975cfa"
+  }
 
   // MTP speculative decoding: Qwen3.6 embeds its NextN draft head in the trunk
   // GGUF (no separate draft file). Enable it on either host with:

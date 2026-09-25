@@ -11,9 +11,15 @@
   // CLI silently drops one, so a CLI-only key breaks exactly one of the two.
   // Comments are the only way to annotate a config -- ConfigFileArgs reserves
   // just "variables"/"vars"/"$schema", so any other key becomes a flag.
+  //
+  // A missing model file downloads from "repo" into ${root}, pinned by commit and
+  // SHA-256. This is unsloth's 2026-08-20 imatrix re-quantization of UD-Q4_K_XL,
+  // a different mix of quant types from the earlier upload the speculative-decoding
+  // numbers below were measured on; the embedded NextN head is still there.
   "variables": {
     "modelRoot": "${TENSORSHARP_MODELS:-/Users/zhongkaifu/work/models}",
     "root": "${modelRoot}/Qwen",
+    "repo": "https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/resolve/4ca720788d1e01f1bff70c033e0d0028fd02e502",
     "skillsRoot": "${TENSORSHARP_SKILLS:-/Users/zhongkaifu/work/TensorSharp/TensorAgent/skills}"
   },
 
@@ -56,10 +62,14 @@
   // the indentation and closing delimiters of generated code.
   "repeat-penalty": 1.0,
 
-  // UD-Q4_K_XL (16.7 GB), not Q8_0 (27.1 GB). Q8_0 fits in 48 GB but leaves
+  // UD-Q4_K_XL (16.4 GB), not Q8_0 (27.1 GB). Q8_0 fits in 48 GB but leaves
   // ~11 GB inside Metal's working set for a KV cache that costs roughly
   // 128 KiB/token at f16 -- long agent contexts run out of room, not speed.
-  "model": "${root}/Qwen3.8-27B-UD-Q4_K_XL.gguf",
+  "model": {
+    "path": "${root}/Qwen3.8-27B-UD-Q4_K_XL.gguf",
+    "urls": ["${repo}/Qwen3.8-27B-UD-Q4_K_XL.gguf"],
+    "sha256": "3f227079003add2511437e5b1e94812e363385225bf6a9b47b0054a72bc8b01e"
+  },
 
   // ---- Agent Skills -------------------------------------------------------
   // 12 skills live in TensorAgent/skills. Seven bundle runnable scripts: four
@@ -125,8 +135,10 @@
 
   // Not set, deliberately:
   //   "mmproj" -- the vision projector costs ~0.9 GB of the memory the KV
-  //     cache wants. Add "mmproj": "${root}/Qwen3.8-27B-mmproj-BF16.gguf" if
-  //     the agent needs to read images.
+  //     cache wants. If the agent needs to read images, add
+  //       "mmproj": { "path": "${root}/Qwen3.8-27B-mmproj-BF16.gguf",
+  //                   "urls": ["${repo}/mmproj-BF16.gguf"],
+  //                   "sha256": "83ee4f4f205fa514161778c41df1ea14144faa0f713510893b63c2395f5c2d53" }
   //   "code-exec-packages" / "code-exec-install-domains" -- defaults already
   //     allow any package from pypi.org, files.pythonhosted.org and
   //     registry.npmjs.org, and installs go to PyPI unless
@@ -140,6 +152,7 @@
   //   "code-exec-temperature" -- inert whenever "temperature" is pinned above.
   //   Speculative decoding -- this GGUF does carry a NextN head (spec would
   //     engage with "spec": true) but it measured only ~1.04x on prose, and
-  //     the auto draft window is 3, not the documented 8. "spec-type": "ngram"
+  //     the auto draft window is 3, not the documented 8 (both measured on the
+  //     earlier, pre-imatrix upload). "spec-type": "ngram"
   //     needs no draft file and is the cheaper thing to try first.
 }

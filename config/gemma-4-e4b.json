@@ -18,11 +18,24 @@
   "top-k": 64,
   "top-p": 0.95,
 
-  "model": "${modelRoot}/gemma-4-E4B-it-uncensored-Q8_0.gguf",
-  "mmproj": "${modelRoot}/gemma-4-E4B-mmproj-F16.gguf",
+  "model": {
+    "path": "${modelRoot}/gemma-4-E4B-it-uncensored-Q8_0.gguf",
+    "urls": ["https://huggingface.co/TrevorJS/gemma-4-E4B-it-uncensored-GGUF/resolve/771f130d4c49735ace331f68a80f7ae31387e51c/gemma-4-E4B-it-uncensored-Q8_0.gguf"],
+    "sha256": "96c455818ff64884f0e2ae3bc5517675896c4eae60676cc9135b9bb865eaf15c"
+  },
+  // The stock E4B projector; the uncensored repo ships none.
+  "mmproj": {
+    "path": "${modelRoot}/gemma-4-E4B-mmproj-F16.gguf",
+    "urls": ["https://huggingface.co/unsloth/gemma-4-E4B-it-GGUF/resolve/bfc15c382204943c3a8fff0c750b94ae2364d7a3/mmproj-F16.gguf"],
+    "sha256": "ddf46c21d7078e95338cfc22306b19b276a29a5ad089023449dd54d4b6170a51"
+  },
 
   // MTP speculative decoding (server only): Gemma-4's draft head ships as its
   // own GGUF. Lossless — the verify step guarantees identical output.
   "spec": false,
-  "draft-model": "${modelRoot}/gemma-4-E4B-it-assistant.Q8_0.gguf"
+  "draft-model": {
+    "path": "${modelRoot}/gemma-4-E4B-it-assistant.Q8_0.gguf",
+    "urls": ["https://huggingface.co/AtomicChat/gemma-4-E4B-it-assistant-GGUF/resolve/3a502a4c670c2763d099c587fd42702652f85c49/gemma-4-E4B-it-assistant.Q8_0.gguf"],
+    "sha256": "80291890b359435865beccdbbf1d7932933966f51e4f0fb3abf28f18303eac35"
+  }
 }

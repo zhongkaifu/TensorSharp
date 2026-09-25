@@ -223,6 +223,40 @@ public class ConfigFileArgsTests : IDisposable
         }
     }
 
+    // The test above only sees entries that are already objects. A model file given as
+    // a bare string path escapes it, and that is how fourteen configs shipped with no
+    // source at all: fine on the machine that wrote them, "not found" everywhere else.
+    // These are the options whose value is a model file to load.
+    private static readonly HashSet<string> ModelFileConfigKeys = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "model", "mmproj", "draft-model",
+        "qwen-image-vae", "qwen-image-vl", "qwen-image-mmproj",
+        "video-vae", "video-text-encoder", "video-te", "video-dit2", "audio-vae",
+        "wan-vae", "wan-te", "wan-dit2",
+    };
+
+    [Fact]
+    public void ShippedConfigs_ModelFiles_AreDownloadEntries()
+    {
+        string repoRoot = FindRepoRoot();
+        if (repoRoot is null) return;
+        string configDir = Path.Combine(repoRoot, "config");
+        if (!Directory.Exists(configDir)) return;
+
+        foreach (string path in Directory.GetFiles(configDir, "*.json"))
+        {
+            using JsonDocument doc = ParseConfig(path);
+            foreach (JsonProperty option in doc.RootElement.EnumerateObject())
+            {
+                if (!ModelFileConfigKeys.Contains(option.Name.TrimStart('-'))) continue;
+                Assert.True(
+                    option.Value.ValueKind == JsonValueKind.Object,
+                    $"config/{Path.GetFileName(path)} option {Quote(option.Name)} is a bare path, so it cannot "
+                    + "download on a machine that lacks the file -- write it as { \"path\", \"urls\", \"sha256\" }.");
+            }
+        }
+    }
+
     private static string Quote(string value) => "\"" + value + "\"";
 
     private static bool IsReserved(string key) =>

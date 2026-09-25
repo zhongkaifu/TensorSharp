@@ -21,5 +21,9 @@
   "repeat-penalty": 1.1,
   "repeat-last-n": 64,
 
-  "model": "${modelRoot}/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive-Q8_0.gguf"
+  "model": {
+    "path": "${modelRoot}/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive-Q8_0.gguf",
+    "urls": ["https://huggingface.co/HauhauCS/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive/resolve/0a41c68809d375475f954be12ba7c40efa56c2a9/Qwen3.5-9B-Uncensored-HauhauCS-Aggressive-Q8_0.gguf"],
+    "sha256": "99e7f2201c0046b05d2825e4d8be6a2efad2b87b071cd55d37bdd9fbe201a58b"
+  }
 }
