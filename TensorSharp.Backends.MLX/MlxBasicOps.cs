@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using TensorSharp.Core;
 
 namespace TensorSharp.MLX
@@ -9,7 +10,13 @@ namespace TensorSharp.MLX
         [RegisterOpStorageType("fill", typeof(MlxStorage))]
         public static void Fill(Tensor result, float value)
         {
-            if (!CanUseNativeWriteTarget(result))
+            // F16 counts too: an F16 KV cache is zeroed on every allocation, grow and
+            // reset, and element by element on the host that took seconds at long contexts.
+            bool fillType = result?.Storage is MlxStorage
+                && (result.ElementType == DType.Float32 || result.ElementType == DType.Float16);
+            if (fillType && !result.IsContiguous() && TryFillStridedBox(result, value))
+                return;
+            if (!fillType || !result.IsContiguous())
             {
                 FallbackVoid("fill", result, value);
                 return;
@@ -31,11 +38,39 @@ namespace TensorSharp.MLX
             });
         }
 
+        private static bool TryFillStridedBox(Tensor result, float value)
+        {
+            if (!StridedBoxCopyEnabled
+                || !TryGetStridedBox(result, out int[] parentShape, out int[] starts, out int[] stops))
+                return false;
+
+            MlxStorage storage = (MlxStorage)result.Storage;
+            MlxWorker.Shared.Invoke(() =>
+            {
+                MlxNative.MlxArray filled = default;
+                try
+                {
+                    filled = MlxNative.Full(ToIntArray(result.Sizes), value, result.ElementType);
+                    storage.UpdateDeviceBox(parentShape, starts, stops, filled);
+                }
+                finally
+                {
+                    MlxNative.FreeArray(filled);
+                }
+            });
+            return true;
+        }
+
         [RegisterOpStorageType("copy", typeof(MlxStorage))]
         public static void Copy(Tensor result, Tensor src)
         {
             if (!CanUseNativeCopy(result, src))
             {
+                // A destination that is a box of a row-major tensor — the old rows of a
+                // KV cache copied into the grown one through Narrow(1, 0, n), say — has
+                // a device write path; anything else still goes to the host.
+                if (TryCopyIntoStridedBox(result, src))
+                    return;
                 FallbackVoid("copy", result, src);
                 return;
             }
@@ -528,10 +563,6 @@ namespace TensorSharp.MLX
                 || !IsMlxInt32(positions)
                 || !src.IsContiguous()
                 || !positions.IsContiguous()
-                || extFactor != 0.0f
-                || attnFactor != 1.0f
-                || betaFast != 0.0f
-                || betaSlow != 0.0f
                 || ropeDim <= 0
                 || (ropeDim & 1) != 0)
             {
@@ -583,12 +614,21 @@ namespace TensorSharp.MLX
             bool traditional = (mode & 2) == 0;
             int rows = (int)rowsLong;
             int features = (int)cols;
+            // YaRN (and any attnFactor) is still a rotation linear in the position: pair i
+            // turns by position / wavelength[i] and the rotated values are scaled by mscale.
+            // MLX takes the wavelengths directly (mlx-lm's YarnRoPE does the same), so these
+            // no longer drop to the element-by-element CPU fallback — gpt-oss's attention
+            // RoPE ran there on every layer of every forward.
+            ScaledRope scaled = extFactor != 0.0f || attnFactor != 1.0f
+                ? ScaledRope.Get(ropeDim, features, originalContextLength, freqBase, freqScale, extFactor, attnFactor, betaFast, betaSlow)
+                : null;
             MlxWorker.Shared.Invoke(() =>
             {
                 MlxNative.MlxArray srcView = default;
                 MlxNative.MlxArray positionsView = default;
                 MlxNative.MlxArray flattened = default;
                 MlxNative.MlxArray roped = default;
+                MlxNative.MlxArray scaledRoped = default;
                 MlxNative.MlxArray reshaped = default;
                 MlxNative.MlxArray combined = default;
                 try
@@ -596,7 +636,21 @@ namespace TensorSharp.MLX
                     srcView = GetView(src);
                     positionsView = GetView(positions);
                     flattened = MlxNative.Reshape(srcView, new[] { rows, 1, 1, features });
-                    roped = MlxNative.FastRopeDynamic(flattened, ropeDim, traditional, freqBase, freqScale, positionsView);
+                    if (scaled == null)
+                    {
+                        roped = MlxNative.FastRopeDynamic(flattened, ropeDim, traditional, freqBase, freqScale, positionsView);
+                    }
+                    else
+                    {
+                        roped = MlxNative.FastRopeDynamicWithFreqs(flattened, ropeDim, traditional, 1.0f, positionsView, scaled.Wavelengths);
+                        if (scaled.ColumnScale.IsValid)
+                        {
+                            scaledRoped = MlxNative.Binary(MlxNative.MlxBinaryOp.Mul, roped, scaled.ColumnScale);
+                            MlxNative.FreeArray(roped);
+                            roped = scaledRoped;
+                            scaledRoped = default;
+                        }
+                    }
                     reshaped = MlxNative.Reshape(roped, ToIntArray(src.Sizes));
 
                     if (addToResult && result != null)
@@ -626,11 +680,97 @@ namespace TensorSharp.MLX
                     MlxNative.FreeArray(positionsView);
                     MlxNative.FreeArray(flattened);
                     MlxNative.FreeArray(roped);
+                    MlxNative.FreeArray(scaledRoped);
                     MlxNative.FreeArray(reshaped);
                     MlxNative.FreeArray(combined);
                 }
             });
             return writeTarget;
+        }
+
+        /// <summary>
+        /// The per-pair wavelengths and output scale of a YaRN / attn-factor RoPE, built once
+        /// per parameter set with the same arithmetic as the CPU implementation
+        /// (TensorApplyCPU.RoPEEx): angle_i = position * base^(-2i/d) * (freqScale * (1 - ramp_i)
+        /// + ramp_i), rotated values times mscale. The scale is a per-column vector so the
+        /// columns past ropeDim, which the CPU copies through, stay unscaled.
+        /// </summary>
+        private sealed class ScaledRope
+        {
+            private static readonly Dictionary<(int, int, int, float, float, float, float, float, float), ScaledRope> Cache = new();
+
+            public MlxNative.MlxArray Wavelengths { get; private init; }
+            public MlxNative.MlxArray ColumnScale { get; private init; }
+
+            public static ScaledRope Get(int ropeDim, int features, int nCtxOrig, float freqBase, float freqScale,
+                float extFactor, float attnFactor, float betaFast, float betaSlow)
+            {
+                var key = (ropeDim, features, nCtxOrig, freqBase, freqScale, extFactor, attnFactor, betaFast, betaSlow);
+                lock (Cache)
+                {
+                    if (Cache.TryGetValue(key, out ScaledRope cached))
+                        return cached;
+
+                    int activeRopeDim = Math.Min(ropeDim, features);
+                    int pairCount = activeRopeDim / 2;
+                    bool useYarn = extFactor != 0.0f;
+                    float low = 0, high = 0, mscale = attnFactor;
+                    if (useYarn)
+                    {
+                        if (betaFast == 0.0f && betaSlow == 0.0f)
+                        {
+                            low = float.MaxValue;
+                            high = activeRopeDim / 2 - 1;
+                        }
+                        else
+                        {
+                            low = MathF.Max(0, MathF.Floor(YarnCorrDim(activeRopeDim, nCtxOrig, betaFast, freqBase)));
+                            high = MathF.Min(activeRopeDim / 2 - 1, MathF.Ceiling(YarnCorrDim(activeRopeDim, nCtxOrig, betaSlow, freqBase)));
+                        }
+                        mscale *= 1.0f + 0.1f * MathF.Log(1.0f / freqScale);
+                    }
+
+                    float[] wavelengths = new float[pairCount];
+                    for (int i = 0; i < pairCount; i++)
+                    {
+                        float invFreq = MathF.Pow(freqBase, -2.0f * i / activeRopeDim);
+                        float factor = freqScale;
+                        if (useYarn)
+                        {
+                            float rampY = (i - low) / MathF.Max(0.001f, high - low);
+                            float rampMix = (1.0f - MathF.Min(1.0f, MathF.Max(0.0f, rampY))) * extFactor;
+                            factor = freqScale * (1.0f - rampMix) + rampMix;
+                        }
+                        wavelengths[i] = 1.0f / (invFreq * factor);
+                    }
+
+                    MlxNative.MlxArray columnScale = default;
+                    if (mscale != 1.0f)
+                    {
+                        float[] scale = new float[features];
+                        for (int c = 0; c < features; c++)
+                            scale[c] = c < activeRopeDim ? mscale : 1.0f;
+                        columnScale = NewFloatArray(scale);
+                    }
+
+                    var entry = new ScaledRope { Wavelengths = NewFloatArray(wavelengths), ColumnScale = columnScale };
+                    Cache[key] = entry;
+                    return entry;
+                }
+            }
+
+            private static float YarnCorrDim(int nDims, int nCtxOrig, float nRot, float freqBase)
+                => nDims * MathF.Log(nCtxOrig / (nRot * 2.0f * MathF.PI)) / (2.0f * MathF.Log(freqBase));
+
+            private static unsafe MlxNative.MlxArray NewFloatArray(float[] values)
+            {
+                fixed (float* data = values)
+                {
+                    MlxNative.MlxArray array = MlxNative.NewArrayFromHost((IntPtr)data, new[] { values.Length }, DType.Float32);
+                    MlxNative.Eval(array);
+                    return array;
+                }
+            }
         }
 
         [RegisterOpStorageType("scaled_dot_product_attention", typeof(MlxStorage))]
@@ -1071,6 +1211,93 @@ namespace TensorSharp.MLX
                 MlxNative.FreeArray(halfInput);
                 MlxNative.FreeArray(output);
             }
+        }
+
+        private static readonly bool StridedBoxCopyEnabled =
+            !string.Equals(Environment.GetEnvironmentVariable("TS_MLX_STRIDED_BOX_COPY"), "0", StringComparison.Ordinal);
+
+        private static bool TryCopyIntoStridedBox(Tensor result, Tensor src)
+        {
+            if (!StridedBoxCopyEnabled
+                || result?.Storage is not MlxStorage resultStorage
+                || src?.Storage is not MlxStorage
+                || src.DimensionCount != result.DimensionCount
+                || !TryGetStridedBox(result, out int[] parentShape, out int[] starts, out int[] stops))
+                return false;
+            for (int i = 0; i < result.DimensionCount; i++)
+            {
+                if (src.Sizes[i] != result.Sizes[i])
+                    return false;
+            }
+
+            MlxWorker.Shared.Invoke(() =>
+            {
+                MlxNative.MlxArray srcView = default;
+                MlxNative.MlxArray casted = default;
+                MlxNative.MlxArray contiguous = default;
+                try
+                {
+                    srcView = GetView(src);
+                    MlxNative.MlxArray copySource = srcView;
+                    if (src.ElementType != result.ElementType)
+                    {
+                        casted = MlxNative.Astype(srcView, result.ElementType);
+                        copySource = casted;
+                    }
+
+                    contiguous = MlxNative.Contiguous(copySource);
+                    resultStorage.UpdateDeviceBox(parentShape, starts, stops, contiguous);
+                }
+                finally
+                {
+                    MlxNative.FreeArray(srcView);
+                    MlxNative.FreeArray(casted);
+                    MlxNative.FreeArray(contiguous);
+                }
+            });
+            return true;
+        }
+
+        /// <summary>
+        /// Whether <paramref name="view"/> is a rectangular box of its storage read as a
+        /// row-major array — the shape Narrow/Select leave behind — and if so that array's
+        /// shape and the box's [start, stop) along each axis. Every axis's stride must be
+        /// a whole multiple of the next one's and the innermost stride must be 1.
+        /// </summary>
+        internal static bool TryGetStridedBox(Tensor view, out int[] parentShape, out int[] starts, out int[] stops)
+        {
+            parentShape = starts = stops = null;
+            int n = view.DimensionCount;
+            if (n == 0 || view.Strides[n - 1] != 1)
+                return false;
+            long total = view.Storage.ElementCount;
+            long[] parent = new long[n];
+            for (int i = n - 2; i >= 0; i--)
+            {
+                long outer = view.Strides[i], inner = view.Strides[i + 1];
+                if (inner <= 0 || outer <= 0 || outer % inner != 0)
+                    return false;
+                parent[i + 1] = outer / inner;
+            }
+            if (view.Strides[0] <= 0 || total % view.Strides[0] != 0)
+                return false;
+            parent[0] = total / view.Strides[0];
+
+            parentShape = new int[n];
+            starts = new int[n];
+            stops = new int[n];
+            long remainder = view.StorageOffset;
+            for (int i = 0; i < n; i++)
+            {
+                long start = remainder / view.Strides[i];
+                remainder -= start * view.Strides[i];
+                if (parent[i] > int.MaxValue || start + view.Sizes[i] > parent[i])
+                    return false;
+                parentShape[i] = (int)parent[i];
+                starts[i] = (int)start;
+                stops[i] = (int)(start + view.Sizes[i]);
+            }
+            return remainder == 0;
         }
 
         private static bool CanUseNativeCopy(Tensor result, Tensor src)

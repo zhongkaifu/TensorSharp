@@ -274,6 +274,74 @@ namespace TensorSharp.Runtime
 
         public int LastLockError { get; private set; }
 
+        private readonly List<(IntPtr Address, nuint Length)> _lockedRanges = new();
+
+        /// <summary>
+        /// Pins only these byte ranges of the mapped file (page-aligned and merged), not
+        /// the whole region. Once most tensors have been copied into device buffers and
+        /// their pages released, locking the whole file would fault those pages back in
+        /// and wire every copied byte a second time; the tensors still read straight
+        /// from the mapping are the only ones that need to stay resident.
+        /// Best-effort like <see cref="TryLockMappedRegion"/>: returns false if any range
+        /// could not be locked (the others stay locked), and unlocks them all on dispose.
+        /// </summary>
+        public unsafe bool TryLockRanges(IEnumerable<(IntPtr Address, long Length)> ranges)
+        {
+            long page = Environment.SystemPageSize;
+            var aligned = new List<(long Start, long End)>();
+            foreach (var (address, length) in ranges)
+            {
+                if (address == IntPtr.Zero || length <= 0)
+                    continue;
+                long start = (long)address & ~(page - 1);
+                long end = ((long)address + length + page - 1) & ~(page - 1);
+                aligned.Add((start, end));
+            }
+            aligned.Sort((a, b) => a.Start.CompareTo(b.Start));
+
+            var merged = new List<(long Start, long End)>();
+            foreach (var range in aligned)
+            {
+                if (merged.Count > 0 && range.Start <= merged[^1].End)
+                    merged[^1] = (merged[^1].Start, Math.Max(merged[^1].End, range.End));
+                else
+                    merged.Add(range);
+            }
+
+            bool all = merged.Count > 0;
+            try
+            {
+                foreach (var (start, end) in merged)
+                {
+                    nuint length = (nuint)(end - start);
+                    if (mlock((void*)start, length) == 0)
+                        _lockedRanges.Add(((IntPtr)start, length));
+                    else
+                    {
+                        LastLockError = Marshal.GetLastWin32Error();
+                        all = false;
+                    }
+                }
+            }
+            catch (DllNotFoundException) { return false; }
+            catch (EntryPointNotFoundException) { return false; }
+            if (all)
+                LastLockError = 0;
+            return all;
+        }
+
+        /// <summary>Bytes currently pinned by <see cref="TryLockRanges"/>.</summary>
+        public long LockedRangeBytes
+        {
+            get
+            {
+                long total = 0;
+                foreach (var (_, length) in _lockedRanges)
+                    total += (long)length;
+                return total;
+            }
+        }
+
         private bool _prefaulted;
 
         /// <summary>
@@ -974,6 +1042,11 @@ namespace TensorSharp.Runtime
                 _lockedBase = null;
                 _lockedLength = 0;
             }
+            foreach (var (address, length) in _lockedRanges)
+            {
+                try { _ = munlock((void*)address, length); } catch { }
+            }
+            _lockedRanges.Clear();
             if (_mappedPointerAcquired && _mappedView != null)
             {
                 _mappedView.SafeMemoryMappedViewHandle.ReleasePointer();

@@ -82,9 +82,16 @@ namespace TensorSharp.MLX
         private static MlxFastMetalKernel q6KMatmulKernel;
         private static MlxFastMetalKernel q6KMatmulSimdgroupKernel;
         private static MlxFastMetalKernel q6KMatmul4Kernel;
+        private static MlxFastMetalKernel q6KMatvecKernel;
+        private static MlxFastMetalKernel iq4XsMatvecKernel;
+        private static MlxFastMetalKernel q6KDequantF16Kernel;
+        private static MlxFastMetalKernel iq4XsDequantF16Kernel;
         private static MlxFastMetalKernel q6KGetRowsKernel;
         private static MlxFastMetalKernel gatedDeltaKernel;
         private static MlxFastMetalKernel gatedDeltaT1Kernel;
+        private static MlxFastMetalKernel gatedDeltaBlockedKernel;
+        private static readonly bool GatedDeltaBlockedEnabled =
+            !string.Equals(Environment.GetEnvironmentVariable("TS_MLX_GDN_BLOCKED"), "0", StringComparison.Ordinal);
         private static MlxFastMetalKernel qwen35GdnPreprocessKernel;
         private static MlxFastMetalKernel qwen35GdnPackedPreprocessKernel;
         private static MlxFastMetalKernel qwen35GdnPostprocessKernel;
@@ -141,8 +148,13 @@ namespace TensorSharp.MLX
         private static bool q6KMatmulKernelDisabled;
         private static bool q6KMatmulSimdgroupKernelDisabled;
         private static bool q6KMatmul4KernelDisabled;
+        private static bool q6KMatvecKernelDisabled;
+        private static bool iq4XsMatvecKernelDisabled;
+        private static bool q6KDequantF16KernelDisabled;
+        private static bool iq4XsDequantF16KernelDisabled;
         private static bool q6KGetRowsKernelDisabled;
         private static bool gatedDeltaKernelDisabled;
+        private static bool gatedDeltaBlockedKernelDisabled;
         private static bool gatedDeltaT1KernelDisabled;
         private static bool qwen35GdnPreprocessKernelDisabled;
         private static bool qwen35GdnPackedPreprocessKernelDisabled;
@@ -1179,6 +1191,232 @@ if (tid == 0) {
 }
 ";
 
+        // Q6_K matrix-vector product, a port of ggml-metal's kernel_mul_mv_q6_K_f32
+        // (ggml, MIT License; ExternalProjects/ggml src/ggml-metal/kernels/mul_mv.metal
+        // at 353b63b4): two simdgroups of 32 threads per threadgroup, two output rows
+        // per simdgroup, each thread reading 16 activations and 4 packed bytes per
+        // block half. The kernels above dequantize one element per thread and read
+        // its scale and high bits one at a time, which left Qwen3.8-27B decode at
+        // 8.2 tok/s on Q6_K against 14.0 on the lossy 8-bit regroup. Only the row
+        // guard differs from ggml: MLX buffers are not padded past the last row.
+        // One threadgroup per 4 output rows (grid.x) and one per input row (grid.y).
+        private const string Q6KMatvecSource = @"
+const int nb = in_dim / 256;
+const uint row_bytes = uint(nb) * 210u;
+const int first_row = (int(threadgroup_position_in_grid.x) * 2 + int(simdgroup_index_in_threadgroup)) * 2;
+const uint r1 = threadgroup_position_in_grid.y;
+const ushort tiisg = thread_index_in_simdgroup;
+if (first_row >= out_dim) {
+    return;
+}
+const int nrows = min(2, out_dim - first_row);
+
+device const uint8_t * rows0 = w + uint64_t(first_row) * row_bytes;
+device const float * yy = x + uint64_t(r1) * uint64_t(in_dim);
+
+float sumf[2] = { 0.f, 0.f };
+float yl[16];
+
+const short tid = tiisg / 2;
+const short ix = tiisg % 2;
+const short ip = tid / 8;
+const short il = tid % 8;
+const short l0 = 4 * il;
+const short is = 8 * ip + l0 / 16;
+
+const short y_offset = 128 * ip + l0;
+const short q_offset_l = 64 * ip + l0;
+const short q_offset_h = 32 * ip + l0;
+
+for (int i = ix; i < nb; i += 2) {
+    device const uint8_t * blk = rows0 + uint(i) * 210u;
+    device const uint8_t * q1 = blk + q_offset_l;
+    device const uint8_t * q2 = q1 + 32;
+    device const uint8_t * qh = blk + 128 + q_offset_h;
+    device const int8_t * sc = (device const int8_t *)(blk + 192) + is;
+    device const half * dh = (device const half *)(blk + 208);
+
+    device const float * yb = yy + i * 256 + y_offset;
+    for (short l = 0; l < 4; ++l) {
+        yl[4 * l + 0] = yb[l + 0];
+        yl[4 * l + 1] = yb[l + 32];
+        yl[4 * l + 2] = yb[l + 64];
+        yl[4 * l + 3] = yb[l + 96];
+    }
+
+    for (short row = 0; row < 2; ++row) {
+        if (row < nrows) {
+            float4 sums = { 0.f, 0.f, 0.f, 0.f };
+            for (short l = 0; l < 4; ++l) {
+                sums[0] += yl[4 * l + 0] * ((int8_t)((q1[l] & 0xF) | ((qh[l] & 0x03) << 4)) - 32);
+                sums[1] += yl[4 * l + 1] * ((int8_t)((q2[l] & 0xF) | ((qh[l] & 0x0C) << 2)) - 32);
+                sums[2] += yl[4 * l + 2] * ((int8_t)((q1[l] >> 4) | ((qh[l] & 0x30) << 0)) - 32);
+                sums[3] += yl[4 * l + 3] * ((int8_t)((q2[l] >> 4) | ((qh[l] & 0xC0) >> 2)) - 32);
+            }
+            sumf[row] += float(dh[0]) * (sums[0] * sc[0] + sums[1] * sc[2] + sums[2] * sc[4] + sums[3] * sc[6]);
+        }
+        q1 += row_bytes;
+        q2 += row_bytes;
+        qh += row_bytes;
+        sc += row_bytes;
+        dh += row_bytes / 2;
+    }
+}
+
+for (short row = 0; row < nrows; ++row) {
+    float total = simd_sum(sumf[row]);
+    if (tiisg == 0) {
+        y[uint64_t(r1) * uint64_t(out_dim) + uint64_t(first_row + row)] = total;
+    }
+}
+";
+
+        // IQ4_XS matrix-vector product, a port of ggml-metal's kernel_mul_mv_iq4_xs_f32
+        // (same revision and license as the Q6_K port above): two simdgroups per
+        // threadgroup, two output rows per simdgroup, the 16-entry codebook in
+        // threadgroup memory, and each thread reading 16 activations as float4s and two
+        // packed words per block. The kernels it replaces for decode reached ~72 GB/s on
+        // a 17408x5120 weight (M5 Pro) against ~245 for the other K-quants, which made
+        // IQ4_XS ffn_gate the largest cost of a Qwen3.8-27B UD-Q4_K_XL decode step. As in
+        // the Q6_K port, rows past the matrix end are guarded instead of read.
+        private const string Iq4XsMatvecSource = @"
+threadgroup float codebook[32];
+const ushort tiisg = thread_index_in_simdgroup;
+codebook[tiisg] = kIq4NlValues[tiisg % 16];
+threadgroup_barrier(mem_flags::mem_threadgroup);
+
+const int nb = in_dim / 256;
+const uint row_bytes = uint(nb) * 136u;
+const int first_row = (int(threadgroup_position_in_grid.x) * 2 + int(simdgroup_index_in_threadgroup)) * 2;
+const uint r1 = threadgroup_position_in_grid.y;
+if (first_row >= out_dim) {
+    return;
+}
+const int nrows = min(2, out_dim - first_row);
+
+const short ix = tiisg / 16;
+const short it = tiisg % 16;
+const short ib = it / 2;
+const short il = it % 2;
+
+device const uint8_t * rows0 = w + uint64_t(first_row) * row_bytes;
+device const float * yb = x + uint64_t(r1) * uint64_t(in_dim) + ix * 256 + ib * 32 + il * 8;
+
+float4 yl[4];
+float sumf[2] = { 0.f, 0.f };
+uint32_t aux32[2];
+thread const uint8_t * q8 = (thread const uint8_t *)aux32;
+float4 qf1;
+float4 qf2;
+
+for (int ibl = ix; ibl < nb; ibl += 2) {
+    device const float4 * y4 = (device const float4 *)yb;
+    yl[0] = y4[0];
+    yl[1] = y4[4];
+    yl[2] = y4[1];
+    yl[3] = y4[5];
+
+    for (short row = 0; row < 2; ++row) {
+        if (row < nrows) {
+            device const uint8_t * xb = rows0 + uint(row) * row_bytes + uint(ibl) * 136u;
+            device const uint32_t * q4 = (device const uint32_t *)(xb + 8 + 16 * ib + 8 * il);
+
+            float4 acc1 = { 0.f, 0.f, 0.f, 0.f };
+            float4 acc2 = { 0.f, 0.f, 0.f, 0.f };
+
+            aux32[0] = (q4[0]) & 0x0f0f0f0f;
+            aux32[1] = (q4[0] >> 4) & 0x0f0f0f0f;
+            qf1 = float4(codebook[q8[0]], codebook[q8[1]], codebook[q8[2]], codebook[q8[3]]);
+            qf2 = float4(codebook[q8[4]], codebook[q8[5]], codebook[q8[6]], codebook[q8[7]]);
+            acc1 += yl[0] * qf1;
+            acc2 += yl[1] * qf2;
+
+            aux32[0] = (q4[1]) & 0x0f0f0f0f;
+            aux32[1] = (q4[1] >> 4) & 0x0f0f0f0f;
+            qf1 = float4(codebook[q8[0]], codebook[q8[1]], codebook[q8[2]], codebook[q8[3]]);
+            qf2 = float4(codebook[q8[4]], codebook[q8[5]], codebook[q8[6]], codebook[q8[7]]);
+            acc1 += yl[2] * qf1;
+            acc2 += yl[3] * qf2;
+
+            acc1 += acc2;
+
+            const uint scales_l = xb[4 + ib / 2];
+            const uint scales_h = *(device const uint16_t *)(xb + 2);
+            const int ls = int(((scales_l >> (4 * (ib % 2))) & 0xf) | (((scales_h >> (2 * ib)) & 3) << 4)) - 32;
+            sumf[row] += float(*(device const half *)xb) * float(ls) * (acc1[0] + acc1[1] + acc1[2] + acc1[3]);
+        }
+    }
+
+    yb += 2 * 256;
+}
+
+for (short row = 0; row < nrows; ++row) {
+    float total = simd_sum(sumf[row]);
+    if (tiisg == 0) {
+        y[uint64_t(r1) * uint64_t(out_dim) + uint64_t(first_row + row)] = total;
+    }
+}
+";
+
+        // Q6_K rows [row0, row0 + rows) of a [outDim, inDim] weight to F16, laid out
+        // like ggml's dequantize_row_q6_K: each thread produces the four values of one
+        // (half-block, l) position, so a warp writes 32 consecutive halves per store.
+        // Grid: x over (inDim / 256) * 64 positions per row, y over rows.
+        private const string Q6KDequantF16Source = @"
+const uint gid = thread_position_in_grid.x;
+const uint row = thread_position_in_grid.y;
+const uint nb = uint(in_dim) / 256u;
+if (gid >= nb * 64u) {
+    return;
+}
+const uint b = gid / 64u;
+const uint t = gid % 64u;
+const uint n = t / 32u;
+const uint l = t % 32u;
+device const uint8_t * blk = w + (uint64_t(uint(row0) + row) * uint64_t(nb) + uint64_t(b)) * 210u;
+device const uint8_t * ql = blk + n * 64u;
+device const uint8_t * qh = blk + 128u + n * 32u;
+device const int8_t * sc = (device const int8_t *)(blk + 192u) + n * 8u;
+const float d = float(*(device const half *)(blk + 208u));
+const uint is = l / 16u;
+const int q1 = int((ql[l] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
+const int q2 = int((ql[l + 32u] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
+const int q3 = int((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
+const int q4 = int((ql[l + 32u] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
+device half * o = y + uint64_t(row) * uint64_t(in_dim) + uint64_t(b * 256u + n * 128u + l);
+o[0] = half(d * float(sc[is + 0]) * float(q1));
+o[32] = half(d * float(sc[is + 2]) * float(q2));
+o[64] = half(d * float(sc[is + 4]) * float(q3));
+o[96] = half(d * float(sc[is + 6]) * float(q4));
+";
+
+        // IQ4_XS rows [row0, row0 + rows) to F16, laid out like ggml's
+        // dequantize_row_iq4_xs: each thread decodes one byte of a 32-value sub-block
+        // into its low-nibble value j and high-nibble value j + 16. Grid: x over
+        // (inDim / 256) * 128 bytes per row, y over rows.
+        private const string Iq4XsDequantF16Source = @"
+const uint gid = thread_position_in_grid.x;
+const uint row = thread_position_in_grid.y;
+const uint nb = uint(in_dim) / 256u;
+if (gid >= nb * 128u) {
+    return;
+}
+const uint b = gid / 128u;
+const uint t = gid % 128u;
+const uint ib = t / 16u;
+const uint j = t % 16u;
+device const uint8_t * blk = w + (uint64_t(uint(row0) + row) * uint64_t(nb) + uint64_t(b)) * 136u;
+const float d = float(*(device const half *)blk);
+const uint scales_h = *(device const uint16_t *)(blk + 2);
+const uint scales_l = blk[4u + ib / 2u];
+const int ls = int(((scales_l >> (4u * (ib % 2u))) & 0xfu) | (((scales_h >> (2u * ib)) & 3u) << 4)) - 32;
+const float dl = d * float(ls);
+const uint q = blk[8u + 16u * ib + j];
+device half * o = y + uint64_t(row) * uint64_t(in_dim) + uint64_t(b * 256u + ib * 32u + j);
+o[0] = half(dl * kIq4NlValues[q & 0xfu]);
+o[16] = half(dl * kIq4NlValues[q >> 4]);
+";
+
         private const string Q4KGetRowsSource = @"
 auto col = thread_position_in_grid.x;
 auto out_row = thread_position_in_grid.y;
@@ -1365,6 +1603,116 @@ for (int i = 0; i < n_per_t; ++i) {
 }
 ";
 
+        // Gated DeltaNet prefill: the same sequential recurrence as GatedDeltaSource,
+        // restructured for Apple GPUs. Adapted from omlx's gated_delta_blocked_seq
+        // (omlx/custom_kernels/qwen35_prefill/gdn.py, Apache-2.0, jundot/omlx):
+        //   * one threadgroup per (32 value rows, value head) instead of one
+        //     simdgroup per row, so each q/k row is read from device memory once per
+        //     threadgroup rather than once per value row;
+        //   * q/k/v/g/beta staged into threadgroup memory TB time steps at a time;
+        //   * each thread keeps a 16-wide slice of its state row in registers and
+        //     the dot products reduce across the row's 8 threads with simd shuffles.
+        // Changes for TensorSharp: F32 inputs (TB = 16 keeps the staging under the
+        // 32 KiB threadgroup limit), and value head hv reads key head hv % Hk — the
+        // tiled head order Qwen35GdnPreprocessPacked writes, as GatedDeltaSource
+        // does. T is a runtime scalar, so a new prompt length reuses the compiled
+        // kernel instead of building another. Requires Dk == 128 and Dv % 32 == 0.
+        // Measured on an M5 Pro against GatedDeltaSource (Hk 16, Hv 32, D 128):
+        // 1.09 vs 2.16 ms at T = 512, 6.13 vs 17.44 ms at T = 4096, outputs equal to
+        // 2e-7.
+        private const string GatedDeltaBlockedSource = @"
+constexpr int TB = 16;
+constexpr int DB = 32;
+const int tid = thread_position_in_threadgroup.x;
+const int blk = threadgroup_position_in_grid.x;
+const int hv  = threadgroup_position_in_grid.y;
+const int b   = threadgroup_position_in_grid.z;
+const int hk  = hv % Hk;
+const int dv0 = blk * DB;
+
+const int dv  = tid / 8;
+const int seg = tid % 8;
+const int d0  = seg * 16;
+
+threadgroup float k_s[TB][Dk + 8];
+threadgroup float q_s[TB][Dk + 8];
+threadgroup float v_s[TB][DB + 8];
+threadgroup float g_s[TB];
+threadgroup float b_s[TB];
+
+const device float* k_base = k + ((size_t)b * T * Hk + hk) * Dk;
+const device float* q_base = q + ((size_t)b * T * Hk + hk) * Dk;
+const device float* v_base = v + ((size_t)b * T * Hv + hv) * Dv + dv0;
+const size_t krow = (size_t)Hk * Dk;
+
+float4 st[4];
+{
+    const device float4* S_in = (const device float4*)(
+        state_in + (((size_t)b * Hv + hv) * Dv + dv0 + dv) * Dk + d0);
+    for (int i = 0; i < 4; ++i) st[i] = S_in[i];
+}
+
+device float* y_base = y + ((size_t)b * T * Hv + hv) * Dv + dv0;
+
+for (int t0 = 0; t0 < T; t0 += TB) {
+    const int tt = min(TB, T - t0);
+    for (int p = tid; p < tt * Dk; p += 256) {
+        const int r = p / Dk, d = p % Dk;
+        k_s[r][d] = k_base[(size_t)(t0 + r) * krow + d];
+        q_s[r][d] = q_base[(size_t)(t0 + r) * krow + d];
+    }
+    for (int p = tid; p < tt * DB; p += 256) {
+        const int r = p / DB, d = p % DB;
+        v_s[r][d] = v_base[(size_t)(t0 + r) * Hv * Dv + d];
+    }
+    for (int p = tid; p < tt; p += 256) {
+        g_s[p] = g[((size_t)b * T + t0 + p) * Hv + hv];
+        b_s[p] = beta[((size_t)b * T + t0 + p) * Hv + hv];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int t = 0; t < tt; ++t) {
+        const float gt = g_s[t];
+        const float bt = b_s[t];
+        const threadgroup float4* k4 = (const threadgroup float4*)&k_s[t][d0];
+        const threadgroup float4* q4 = (const threadgroup float4*)&q_s[t][d0];
+        float4 kf[4];
+        for (int i = 0; i < 4; ++i) kf[i] = k4[i];
+        float4 p4 = 0.0f;
+        for (int i = 0; i < 4; ++i) {
+            st[i] *= gt;
+            p4 += st[i] * kf[i];
+        }
+        float part = p4.x + p4.y + p4.z + p4.w;
+        part += simd_shuffle_down(part, 4);
+        part += simd_shuffle_down(part, 2);
+        part += simd_shuffle_down(part, 1);
+        const float kv_mem = simd_shuffle(part, (tid % 32) / 8 * 8);
+        const float delta = (v_s[t][dv] - kv_mem) * bt;
+
+        float4 o4 = 0.0f;
+        for (int i = 0; i < 4; ++i) {
+            st[i] += kf[i] * delta;
+            o4 += st[i] * q4[i];
+        }
+        float out = o4.x + o4.y + o4.z + o4.w;
+        out += simd_shuffle_down(out, 4);
+        out += simd_shuffle_down(out, 2);
+        out += simd_shuffle_down(out, 1);
+        if (seg == 0) {
+            y_base[(size_t)(t0 + t) * Hv * Dv + dv] = out;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
+{
+    device float4* S_out = (device float4*)(
+        state_out + (((size_t)b * Hv + hv) * Dv + dv0 + dv) * Dk + d0);
+    for (int i = 0; i < 4; ++i) S_out[i] = st[i];
+}
+";
+
         private const string ScatterAddWeightedRowsSource = @"
 auto col = thread_position_in_grid.x;
 auto out_row = thread_position_in_grid.y;
@@ -1468,7 +1816,13 @@ int base = row * (HalfDim * 2);
 float gate = gate_up[base + col];
 float up = gate_up[base + HalfDim + col];
 float gate3 = gate * gate * gate;
-float gelu = 0.5f * gate * (1.0f + tanh(0.7978845608f * (gate + 0.044715f * gate3)));
+// Clamped for the same reason as the fused Q8 GELU kernel: from MLX 0.32 on
+// macOS 27 (MSL 4.1), a bare tanh() in a custom kernel is the fast
+// exp-ratio form and returns NaN once |x| passes ~44. Gemma 4 E4B's layer-0
+// FFN reaches |gate| ~ 680 on ordinary prompts. tanh is +/-1 to float
+// precision well before 15, so the clamp is exact under either semantics.
+float inner = clamp(0.7978845608f * (gate + 0.044715f * gate3), -15.0f, 15.0f);
+float gelu = 0.5f * gate * (1.0f + tanh(inner));
 out_y[row * HalfDim + col] = gelu * up;
 ";
 
@@ -3847,6 +4201,23 @@ if (kind == 0) {
             });
         }
 
+        /// <summary>
+        /// A second reference to <paramref name="source"/> (mlx_array_set): the caller
+        /// frees it independently. MLX arrays are immutable, so two references are as
+        /// good as a copy until one side is replaced.
+        /// </summary>
+        internal static MlxArray Retain(MlxArray source)
+        {
+            if (!source.IsValid)
+                return default;
+            return MlxWorker.Shared.Invoke(() =>
+            {
+                MlxArray copy = mlx_array_new();
+                Check(mlx_array_set(ref copy, source), "referencing MLX array");
+                return copy;
+            });
+        }
+
         internal static void CopyArrayToHost(MlxArray array, DType dtype, IntPtr destination, long byteCount)
         {
             if (!array.IsValid)
@@ -4102,7 +4473,12 @@ if (kind == 0) {
             });
         }
 
-        internal static MlxArray FastScaledDotProductAttention(MlxArray query, MlxArray key, MlxArray value, float scale, string maskMode, MlxArray mask)
+        /// <param name="forceFused">Run MLX's fused attention kernel even for a shape it would
+        /// otherwise compute unfused (materialised scores + softmax + matmul).</param>
+        /// <param name="sinks">Optional per-query-head attention sinks (gpt-oss): one extra
+        /// logit per head that joins the softmax denominator but contributes no value. Its
+        /// dtype must promote to the query's.</param>
+        internal static MlxArray FastScaledDotProductAttention(MlxArray query, MlxArray key, MlxArray value, float scale, string maskMode, MlxArray mask, bool forceFused = false, MlxArray sinks = default)
         {
             if (!query.IsValid || !key.IsValid || !value.IsValid)
                 throw new ArgumentException("MLX attention inputs must be valid arrays.");
@@ -4111,7 +4487,7 @@ if (kind == 0) {
             return MlxWorker.Shared.Invoke(() =>
             {
                 MlxArray result;
-                Check(mlx_fast_scaled_dot_product_attention(out result, query, key, value, scale, maskModePtr, mask, default, DefaultStream()), "running MLX scaled dot product attention");
+                Check(mlx_fast_scaled_dot_product_attention(out result, query, key, value, scale, maskModePtr, mask, sinks, forceFused, DefaultStream()), "running MLX scaled dot product attention");
                 return result;
             });
         }
@@ -4234,15 +4610,13 @@ if (kind == 0) {
                 MlxFastMetalKernelConfig config = mlx_fast_metal_kernel_config_new();
                 MlxVectorArray inputs = default;
                 MlxVectorArray outputs = default;
-                MlxArray scaleArray = default;
+                MlxArray scaleArray = default; MlxArray maskStartArray = default; MlxArray attendLenArray = default;
                 try
                 {
                     AddTemplateInt(config, "NumHeads", numHeads);
                     AddTemplateInt(config, "NumKVHeads", numKVHeads);
                     AddTemplateInt(config, "HeadDim", headDim);
                     AddTemplateInt(config, "CacheLen", cacheLen);
-                    AddTemplateInt(config, "MaskStart", attendStart);
-                    AddTemplateInt(config, "AttendLen", attendEnd);
 
                     int[] shape = { 1, numHeads * headDim };
                     Check(mlx_fast_metal_kernel_config_add_output_arg(config, shape, (nuint)shape.Length, ToMlxDtype(DType.Float32)), "configuring decode attention with sinks output");
@@ -4250,7 +4624,9 @@ if (kind == 0) {
                     Check(mlx_fast_metal_kernel_config_set_thread_group(config, 256, 1, 1), "configuring decode attention with sinks threadgroup");
 
                     scaleArray = mlx_array_new_float32(scale);
-                    inputs = CreateVectorArray(qFlat, kCache, vCache, sinks, scaleArray);
+                    maskStartArray = mlx_array_new_int(attendStart);
+                    attendLenArray = mlx_array_new_int(attendEnd);
+                    inputs = CreateVectorArray(qFlat, kCache, vCache, sinks, scaleArray, maskStartArray, attendLenArray);
                     outputs = mlx_vector_array_new();
                     Check(mlx_fast_metal_kernel_apply(ref outputs, kernel, inputs, config, DefaultStream()), "running decode attention with sinks");
                     if (mlx_vector_array_size(outputs) < 1)
@@ -4263,6 +4639,10 @@ if (kind == 0) {
                 {
                     if (scaleArray.IsValid)
                         _ = mlx_array_free(scaleArray);
+                    if (maskStartArray.IsValid)
+                        _ = mlx_array_free(maskStartArray);
+                    if (attendLenArray.IsValid)
+                        _ = mlx_array_free(attendLenArray);
                     if (inputs.IsValid)
                         _ = mlx_vector_array_free(inputs);
                     if (outputs.IsValid)
@@ -4396,15 +4776,13 @@ if (kind == 0) {
                 MlxFastMetalKernelConfig config = mlx_fast_metal_kernel_config_new();
                 MlxVectorArray inputs = default;
                 MlxVectorArray outputs = default;
-                MlxArray scaleArray = default;
+                MlxArray scaleArray = default; MlxArray firstSlotArray = default; MlxArray attendLenArray = default;
                 try
                 {
                     AddTemplateInt(config, "NumHeads", numHeads);
                     AddTemplateInt(config, "NumKVHeads", numKVHeads);
                     AddTemplateInt(config, "HeadDim", headDim);
                     AddTemplateInt(config, "CacheLen", cacheLen);
-                    AddTemplateInt(config, "FirstSlot", firstSlot);
-                    AddTemplateInt(config, "AttendLen", attendLen);
 
                     int[] shape = { 1, numHeads * headDim };
                     Check(mlx_fast_metal_kernel_config_add_output_arg(config, shape, (nuint)shape.Length, ToMlxDtype(DType.Float32)), "configuring circular decode attention output");
@@ -4412,7 +4790,9 @@ if (kind == 0) {
                     Check(mlx_fast_metal_kernel_config_set_thread_group(config, 256, 1, 1), "configuring circular decode attention threadgroup");
 
                     scaleArray = mlx_array_new_float32(scale);
-                    inputs = CreateVectorArray(qFlat, kCache, vCache, scaleArray);
+                    firstSlotArray = mlx_array_new_int(firstSlot);
+                    attendLenArray = mlx_array_new_int(attendLen);
+                    inputs = CreateVectorArray(qFlat, kCache, vCache, scaleArray, firstSlotArray, attendLenArray);
                     outputs = mlx_vector_array_new();
                     Check(mlx_fast_metal_kernel_apply(ref outputs, kernel, inputs, config, DefaultStream()), "running circular decode attention");
                     if (mlx_vector_array_size(outputs) < 1)
@@ -4425,6 +4805,10 @@ if (kind == 0) {
                 {
                     if (scaleArray.IsValid)
                         _ = mlx_array_free(scaleArray);
+                    if (firstSlotArray.IsValid)
+                        _ = mlx_array_free(firstSlotArray);
+                    if (attendLenArray.IsValid)
+                        _ = mlx_array_free(attendLenArray);
                     if (inputs.IsValid)
                         _ = mlx_vector_array_free(inputs);
                     if (outputs.IsValid)
@@ -4455,6 +4839,33 @@ if (kind == 0) {
                     offsets,
                     default,
                     DefaultStream()), "running MLX RoPE");
+                return result;
+            });
+        }
+
+        /// <summary>RoPE with explicit per-pair wavelengths (angle = position * scale /
+        /// freqs[i]) instead of a base, the form MLX takes for YaRN and other scaled
+        /// variants.</summary>
+        internal static MlxArray FastRopeDynamicWithFreqs(MlxArray input, int dims, bool traditional, float scale, MlxArray offsets, MlxArray freqs)
+        {
+            if (!input.IsValid || !offsets.IsValid || !freqs.IsValid)
+                throw new ArgumentException("MLX RoPE inputs must be valid arrays.");
+            if (dims <= 0 || (dims & 1) != 0)
+                throw new ArgumentOutOfRangeException(nameof(dims), "RoPE dimensions must be a positive even number.");
+
+            return MlxWorker.Shared.Invoke(() =>
+            {
+                MlxArray result;
+                Check(mlx_fast_rope_dynamic(
+                    out result,
+                    input,
+                    dims,
+                    traditional,
+                    MlxOptionalFloat.None,
+                    scale,
+                    offsets,
+                    freqs,
+                    DefaultStream()), "running MLX RoPE with frequencies");
                 return result;
             });
         }
@@ -5045,12 +5456,40 @@ if (kind == 0) {
             });
         }
 
+        // Rows up to which IQ4_XS runs as matrix-vector products (the ggml port).
+        // TS_MLX_IQ4XS_MATVEC_MAX_ROWS=0 restores the older kernels. Settable for tests.
+        internal static int Iq4XsMatvecMaxRows = ResolveMatvecMaxRows("TS_MLX_IQ4XS_MATVEC_MAX_ROWS");
+        // Above the matrix-vector rows, IQ4_XS takes the F16 dequantize + GEMM path of
+        // Q6_K (DequantF16Matmul). TS_MLX_IQ4XS_DEQUANT_GEMM=0 keeps the older kernel.
+        private static readonly bool Iq4XsDequantGemm =
+            !string.Equals(Environment.GetEnvironmentVariable("TS_MLX_IQ4XS_DEQUANT_GEMM"), "0", StringComparison.Ordinal);
+
         internal static MlxArray Iq4XsMatmul(MlxArray input, MlxArray rawWeight, int rows, int inDim, int outDim)
         {
             if (!input.IsValid || !rawWeight.IsValid)
                 throw new ArgumentException("IQ4_XS matmul requires valid input and raw weight arrays.");
             if (rows <= 0 || inDim <= 0 || outDim <= 0 || inDim % 256 != 0)
                 throw new ArgumentOutOfRangeException(nameof(inDim), "IQ4_XS matmul requires positive dimensions and input dim aligned to 256.");
+            if (rows <= Iq4XsMatvecMaxRows)
+            {
+                try
+                {
+                    return Iq4XsMatvec(input, rawWeight, rows, inDim, outDim);
+                }
+                catch (NotSupportedException)
+                {
+                }
+            }
+            else if (Iq4XsDequantGemm)
+            {
+                try
+                {
+                    return Iq4XsDequantMatmul(input, rawWeight, rows, inDim, outDim);
+                }
+                catch (NotSupportedException)
+                {
+                }
+            }
             if (rows == 1 && !string.Equals(Environment.GetEnvironmentVariable("TS_MLX_IQ4XS_MATMUL4"), "0", StringComparison.Ordinal))
             {
                 // Two kernels are available for decode (rows==1):
@@ -6171,8 +6610,49 @@ if (kind == 0) {
             return IQuantMatmulSimdgroup(input, rawWeight, rows, inDim, outDim, EnsureQ5KMatmulSimdgroupKernel, "Q5_K");
         }
 
+        // Rows up to which Q6_K runs as matrix-vector products (the ggml port), one
+        // pass over the weight per row. TS_MLX_Q6K_MATVEC_MAX_ROWS=0 restores the
+        // older kernels. Settable so tests can reach those kernels too.
+        internal static int Q6KMatvecMaxRows = ResolveMatvecMaxRows("TS_MLX_Q6K_MATVEC_MAX_ROWS");
+
+        private static int ResolveMatvecMaxRows(string variable)
+        {
+            string value = Environment.GetEnvironmentVariable(variable);
+            return int.TryParse(value, out int rows) && rows >= 0 ? rows : 4;
+        }
+
+        // Above Q6KMatvecMaxRows (and Iq4XsMatvecMaxRows), the raw weight is dequantized
+        // to F16 in slices of at most this many bytes and multiplied by MLX's GEMM.
+        // Against an 8-bit affine quantized_matmul (M5 Pro, MLX 0.32.2): +11-26% per
+        // matmul at 512 rows, 7% faster at 2048. TS_MLX_Q6K_DEQUANT_GEMM=0 keeps the
+        // older Q6_K kernels. Settable so a test can force several slices.
+        internal static long DequantSliceBytes = 256L * 1024 * 1024;
+        private static readonly bool Q6KDequantGemm =
+            !string.Equals(Environment.GetEnvironmentVariable("TS_MLX_Q6K_DEQUANT_GEMM"), "0", StringComparison.Ordinal);
+
         internal static MlxArray Q6KMatmul(MlxArray input, MlxArray rawWeight, int rows, int inDim, int outDim)
         {
+            if (rows >= 1 && rows <= Q6KMatvecMaxRows)
+            {
+                try
+                {
+                    return Q6KMatvec(input, rawWeight, rows, inDim, outDim);
+                }
+                catch (NotSupportedException)
+                {
+                }
+            }
+            else if (rows > Q6KMatvecMaxRows && Q6KDequantGemm)
+            {
+                try
+                {
+                    return Q6KDequantMatmul(input, rawWeight, rows, inDim, outDim);
+                }
+                catch (NotSupportedException)
+                {
+                }
+            }
+
             if (rows == 1 && !string.Equals(Environment.GetEnvironmentVariable("TS_MLX_Q6K_MATMUL4"), "0", StringComparison.Ordinal))
             {
                 try
@@ -6236,6 +6716,184 @@ if (kind == 0) {
                 }
                 finally
                 {
+                    if (inputs.IsValid)
+                        _ = mlx_vector_array_free(inputs);
+                    if (outputs.IsValid)
+                        _ = mlx_vector_array_free(outputs);
+                    if (config.IsValid)
+                        _ = mlx_fast_metal_kernel_config_free(config);
+                }
+            });
+        }
+
+        /// <summary>
+        /// [rows, inDim] x Q6_K [outDim, inDim]^T through an F16 copy of the weight, a
+        /// slice of output rows at a time so the copy stays bounded (a 248k-row output
+        /// head would otherwise be a 2.5 GB temporary).
+        /// </summary>
+        /// <param name="halfOutput">Return the F16 product instead of casting it to F32,
+        /// for a caller that keeps its activations in half precision.</param>
+        internal static MlxArray Q6KDequantMatmul(MlxArray input, MlxArray rawWeight, int rows, int inDim, int outDim, bool halfOutput = false)
+            => DequantF16Matmul(input, rawWeight, rows, inDim, outDim, EnsureQ6KDequantF16Kernel, inDim / 256 * 64, "Q6_K", halfOutput);
+
+        internal static MlxArray Iq4XsDequantMatmul(MlxArray input, MlxArray rawWeight, int rows, int inDim, int outDim, bool halfOutput = false)
+            => DequantF16Matmul(input, rawWeight, rows, inDim, outDim, EnsureIq4XsDequantF16Kernel, inDim / 256 * 128, "IQ4_XS", halfOutput);
+
+        private static MlxArray DequantF16Matmul(
+            MlxArray input, MlxArray rawWeight, int rows, int inDim, int outDim,
+            Func<MlxFastMetalKernel> ensureKernel, int threadsPerRow, string label, bool halfOutput)
+        {
+            if (!input.IsValid || !rawWeight.IsValid)
+                throw new ArgumentException($"{label} dequantized matmul requires valid input and raw weight arrays.");
+            if (rows <= 0 || inDim <= 0 || outDim <= 0 || inDim % 256 != 0)
+                throw new ArgumentOutOfRangeException(nameof(inDim), $"{label} dequantized matmul requires positive dimensions and input dim aligned to 256.");
+
+            int sliceRows = (int)Math.Clamp(DequantSliceBytes / (2L * inDim), 1, outDim);
+            return MlxWorker.Shared.Invoke(() =>
+            {
+                MlxFastMetalKernel kernel = ensureKernel();
+                MlxArray inputHalf = default;
+                MlxArray inDimArray = default;
+                var parts = new List<MlxArray>();
+                MlxVectorArray partVector = default;
+                MlxArray product = default;
+                try
+                {
+                    Check(mlx_astype(out inputHalf, input, ToMlxDtype(DType.Float16), DefaultStream()), $"casting {label} matmul input");
+                    inDimArray = mlx_array_new_int(inDim);
+                    for (int row0 = 0; row0 < outDim; row0 += sliceRows)
+                    {
+                        int count = Math.Min(sliceRows, outDim - row0);
+                        MlxArray weightHalf = default;
+                        MlxArray weightT = default;
+                        MlxArray part = default;
+                        MlxFastMetalKernelConfig config = mlx_fast_metal_kernel_config_new();
+                        MlxVectorArray inputs = default;
+                        MlxVectorArray outputs = default;
+                        MlxArray row0Array = default;
+                        try
+                        {
+                            int[] shape = { count, inDim };
+                            Check(mlx_fast_metal_kernel_config_add_output_arg(config, shape, (nuint)shape.Length, ToMlxDtype(DType.Float16)), $"configuring {label} dequantization output");
+                            Check(mlx_fast_metal_kernel_config_set_grid(config, threadsPerRow, count, 1), $"configuring {label} dequantization grid");
+                            Check(mlx_fast_metal_kernel_config_set_thread_group(config, 256, 1, 1), $"configuring {label} dequantization threadgroup");
+                            row0Array = mlx_array_new_int(row0);
+                            inputs = CreateVectorArray(rawWeight, inDimArray, row0Array);
+                            outputs = mlx_vector_array_new();
+                            Check(mlx_fast_metal_kernel_apply(ref outputs, kernel, inputs, config, DefaultStream()), $"running {label} dequantization");
+                            Check(mlx_vector_array_get(out weightHalf, outputs, 0), $"reading {label} dequantization output");
+                            Check(mlx_transpose_axes(out weightT, weightHalf, new[] { 1, 0 }, 2, DefaultStream()), $"transposing {label} weight");
+                            Check(mlx_matmul(out part, inputHalf, weightT, DefaultStream()), $"running {label} dequantized matmul");
+                            parts.Add(part);
+                            part = default;
+                        }
+                        finally
+                        {
+                            if (part.IsValid) _ = mlx_array_free(part);
+                            if (weightT.IsValid) _ = mlx_array_free(weightT);
+                            if (weightHalf.IsValid) _ = mlx_array_free(weightHalf);
+                            if (row0Array.IsValid) _ = mlx_array_free(row0Array);
+                            if (inputs.IsValid) _ = mlx_vector_array_free(inputs);
+                            if (outputs.IsValid) _ = mlx_vector_array_free(outputs);
+                            if (config.IsValid) _ = mlx_fast_metal_kernel_config_free(config);
+                        }
+                    }
+
+                    if (parts.Count == 1)
+                    {
+                        product = parts[0];
+                        parts.Clear();
+                    }
+                    else
+                    {
+                        partVector = CreateVectorArray(parts.ToArray());
+                        Check(mlx_concatenate_axis(out product, partVector, 1, DefaultStream()), $"joining {label} matmul slices");
+                    }
+
+                    if (halfOutput)
+                    {
+                        MlxArray halfResult = product;
+                        product = default;
+                        return halfResult;
+                    }
+
+                    Check(mlx_astype(out MlxArray result, product, ToMlxDtype(DType.Float32), DefaultStream()), $"casting {label} matmul output");
+                    return result;
+                }
+                finally
+                {
+                    foreach (MlxArray part in parts)
+                        _ = mlx_array_free(part);
+                    if (partVector.IsValid) _ = mlx_vector_array_free(partVector);
+                    if (product.IsValid) _ = mlx_array_free(product);
+                    if (inputHalf.IsValid) _ = mlx_array_free(inputHalf);
+                    if (inDimArray.IsValid) _ = mlx_array_free(inDimArray);
+                }
+            });
+        }
+
+        internal static MlxArray Q6KMatvec(MlxArray input, MlxArray rawWeight, int rows, int inDim, int outDim)
+            => GgmlPortMatvec(input, rawWeight, rows, inDim, outDim, EnsureQ6KMatvecKernel, "Q6_K");
+
+        internal static MlxArray Iq4XsMatvec(MlxArray input, MlxArray rawWeight, int rows, int inDim, int outDim)
+            => GgmlPortMatvec(input, rawWeight, rows, inDim, outDim, EnsureIq4XsMatvecKernel, "IQ4_XS");
+
+        /// <summary>
+        /// Launches one of the ggml-metal matrix-vector ports (<see cref="Q6KMatvecSource"/>,
+        /// <see cref="Iq4XsMatvecSource"/>): 64-thread threadgroups of two simdgroups, four
+        /// output rows per threadgroup (grid.x) and one input row per grid.y, over F32 rows.
+        /// </summary>
+        private static MlxArray GgmlPortMatvec(
+            MlxArray input, MlxArray rawWeight, int rows, int inDim, int outDim,
+            Func<MlxFastMetalKernel> ensureKernel, string label)
+        {
+            if (!input.IsValid || !rawWeight.IsValid)
+                throw new ArgumentException($"{label} matrix-vector product requires valid input and raw weight arrays.");
+            if (rows <= 0 || inDim <= 0 || outDim <= 0 || inDim % 256 != 0)
+                throw new ArgumentOutOfRangeException(nameof(inDim), $"{label} matrix-vector product requires positive dimensions and input dim aligned to 256.");
+
+            return MlxWorker.Shared.Invoke(() =>
+            {
+                MlxFastMetalKernel kernel = ensureKernel();
+                MlxFastMetalKernelConfig config = mlx_fast_metal_kernel_config_new();
+                MlxVectorArray inputs = default;
+                MlxVectorArray outputs = default;
+                MlxArray inputF32 = default;
+                MlxArray inDimArray = default;
+                MlxArray outDimArray = default;
+                try
+                {
+                    int[] shape = { rows, outDim };
+                    Check(mlx_fast_metal_kernel_config_add_output_arg(config, shape, (nuint)shape.Length, ToMlxDtype(DType.Float32)), $"configuring {label} matrix-vector output");
+                    Check(mlx_fast_metal_kernel_config_set_grid(config, 64 * ((outDim + 3) / 4), rows, 1), $"configuring {label} matrix-vector grid");
+                    Check(mlx_fast_metal_kernel_config_set_thread_group(config, 64, 1, 1), $"configuring {label} matrix-vector threadgroup");
+
+                    // The kernels read F32 rows (as float4s in the IQ4_XS port); anything
+                    // else is cast, and a strided view made contiguous, first.
+                    Check(mlx_astype(out inputF32, input, ToMlxDtype(DType.Float32), DefaultStream()), $"casting {label} matrix-vector input");
+                    MlxArray contiguous = default;
+                    Check(mlx_contiguous(out contiguous, inputF32, false, DefaultStream()), $"laying out {label} matrix-vector input");
+                    _ = mlx_array_free(inputF32);
+                    inputF32 = contiguous;
+                    inDimArray = mlx_array_new_int(inDim);
+                    outDimArray = mlx_array_new_int(outDim);
+                    inputs = CreateVectorArray(inputF32, rawWeight, inDimArray, outDimArray);
+                    outputs = mlx_vector_array_new();
+                    Check(mlx_fast_metal_kernel_apply(ref outputs, kernel, inputs, config, DefaultStream()), $"running {label} matrix-vector product");
+                    if (mlx_vector_array_size(outputs) < 1)
+                        throw new InvalidOperationException($"{label} matrix-vector product produced no output.");
+
+                    Check(mlx_vector_array_get(out MlxArray result, outputs, 0), $"reading {label} matrix-vector output");
+                    return result;
+                }
+                finally
+                {
+                    if (inputF32.IsValid)
+                        _ = mlx_array_free(inputF32);
+                    if (inDimArray.IsValid)
+                        _ = mlx_array_free(inDimArray);
+                    if (outDimArray.IsValid)
+                        _ = mlx_array_free(outDimArray);
                     if (inputs.IsValid)
                         _ = mlx_vector_array_free(inputs);
                     if (outputs.IsValid)
@@ -6336,6 +6994,13 @@ if (kind == 0) {
             // product loops. Gated by TS_MLX_DISABLE_GDN_T1=1 for A/B.
             bool useT1Kernel = seqLen == 1
                 && !string.Equals(Environment.GetEnvironmentVariable("TS_MLX_DISABLE_GDN_T1"), "1", StringComparison.Ordinal);
+            // Prefill takes the blocked kernel wherever its fixed thread layout fits
+            // (see GatedDeltaBlockedSource). TS_MLX_GDN_BLOCKED=0 restores the
+            // per-row kernel for A/B.
+            bool useBlockedKernel = seqLen > 1
+                && keyDim == 128
+                && valueDim % 32 == 0
+                && GatedDeltaBlockedEnabled;
 
             MlxArray yResult = default;
             MlxArray stateResult = default;
@@ -6343,15 +7008,19 @@ if (kind == 0) {
             {
                 MlxFastMetalKernel kernel = useT1Kernel
                     ? EnsureGatedDeltaT1Kernel()
-                    : EnsureGatedDeltaKernel();
+                    : useBlockedKernel
+                        ? EnsureGatedDeltaBlockedKernel()
+                        : EnsureGatedDeltaKernel();
                 MlxFastMetalKernelConfig config = mlx_fast_metal_kernel_config_new();
                 MlxVectorArray inputs = default;
                 MlxVectorArray outputs = default;
+                MlxArray length = default;
                 try
                 {
                     // T template is omitted from the T=1 kernel (specialization
-                    // makes it implicit). The general kernel still needs T.
-                    if (!useT1Kernel)
+                    // makes it implicit) and from the blocked kernel (a runtime
+                    // input). The general kernel still needs T.
+                    if (!useT1Kernel && !useBlockedKernel)
                         AddTemplateInt(config, "T", seqLen);
                     AddTemplateInt(config, "Dk", keyDim);
                     AddTemplateInt(config, "Dv", valueDim);
@@ -6361,10 +7030,19 @@ if (kind == 0) {
                     int[] stateShape = { batch, numValueHeads, valueDim, keyDim };
                     Check(mlx_fast_metal_kernel_config_add_output_arg(config, yShape, (nuint)yShape.Length, ToMlxDtype(DType.Float32)), "configuring gated-delta output");
                     Check(mlx_fast_metal_kernel_config_add_output_arg(config, stateShape, (nuint)stateShape.Length, ToMlxDtype(DType.Float32)), "configuring gated-delta state output");
-                    Check(mlx_fast_metal_kernel_config_set_grid(config, 32, valueDim, batch * numValueHeads), "configuring gated-delta grid");
-                    Check(mlx_fast_metal_kernel_config_set_thread_group(config, 32, Math.Min(valueDim, 4), 1), "configuring gated-delta threadgroup");
-
-                    inputs = CreateVectorArray(q, k, v, g, beta, state);
+                    if (useBlockedKernel)
+                    {
+                        Check(mlx_fast_metal_kernel_config_set_grid(config, 256 * (valueDim / 32), numValueHeads, batch), "configuring blocked gated-delta grid");
+                        Check(mlx_fast_metal_kernel_config_set_thread_group(config, 256, 1, 1), "configuring blocked gated-delta threadgroup");
+                        length = mlx_array_new_int(seqLen);
+                        inputs = CreateVectorArray(q, k, v, g, beta, state, length);
+                    }
+                    else
+                    {
+                        Check(mlx_fast_metal_kernel_config_set_grid(config, 32, valueDim, batch * numValueHeads), "configuring gated-delta grid");
+                        Check(mlx_fast_metal_kernel_config_set_thread_group(config, 32, Math.Min(valueDim, 4), 1), "configuring gated-delta threadgroup");
+                        inputs = CreateVectorArray(q, k, v, g, beta, state);
+                    }
                     outputs = mlx_vector_array_new();
                     Check(mlx_fast_metal_kernel_apply(ref outputs, kernel, inputs, config, DefaultStream()), "running gated-delta kernel");
                     if (mlx_vector_array_size(outputs) < 2)
@@ -6375,6 +7053,7 @@ if (kind == 0) {
                 }
                 finally
                 {
+                    FreeArray(length);
                     if (inputs.IsValid)
                         _ = mlx_vector_array_free(inputs);
                     if (outputs.IsValid)
@@ -6565,10 +7244,13 @@ if (kind == 0) {
                 MlxFastMetalKernelConfig config = mlx_fast_metal_kernel_config_new();
                 MlxVectorArray inputs = default;
                 MlxVectorArray outputs = default;
+                MlxArray length = default;
                 try
                 {
                     int tail = convKernel - 1;
-                    AddTemplateInt(config, "T", seqLen);
+                    // The length is a runtime input rather than a template argument:
+                    // every distinct template set compiles its own Metal library, so
+                    // templating on T built a kernel for each new prompt length.
                     AddTemplateInt(config, "Tail", tail);
                     AddTemplateInt(config, "Kernel", convKernel);
                     AddTemplateInt(config, "PackedDim", packedDim);
@@ -6600,7 +7282,8 @@ if (kind == 0) {
                     Check(mlx_fast_metal_kernel_config_set_grid(config, maxX, maxY, 3), "configuring packed Qwen35 GDN preprocess grid");
                     Check(mlx_fast_metal_kernel_config_set_thread_group(config, 256, 1, 1), "configuring packed Qwen35 GDN preprocess threadgroup");
 
-                    inputs = CreateVectorArray(packedRaw, convState, convWeight, dtBias, aLog);
+                    length = mlx_array_new_int(seqLen);
+                    inputs = CreateVectorArray(packedRaw, convState, convWeight, dtBias, aLog, length);
                     outputs = mlx_vector_array_new();
                     Check(mlx_fast_metal_kernel_apply(ref outputs, kernel, inputs, config, DefaultStream()), "running packed Qwen35 GDN preprocess kernel");
                     if (mlx_vector_array_size(outputs) < 7)
@@ -6616,6 +7299,7 @@ if (kind == 0) {
                 }
                 finally
                 {
+                    FreeArray(length);
                     if (inputs.IsValid)
                         _ = mlx_vector_array_free(inputs);
                     if (outputs.IsValid)
@@ -6658,7 +7342,8 @@ if (kind == 0) {
                 MlxVectorArray outputs = default;
                 try
                 {
-                    AddTemplateInt(config, "T", seqLen);
+                    // No T template: the source never reads it, and each distinct
+                    // value compiled another copy of the kernel.
                     AddTemplateInt(config, "ValueDim", valueDim);
                     AddTemplateInt(config, "NumValueHeads", numValueHeads);
                     AddTemplateInt(config, "HeadValueDim", headValueDim);
@@ -7841,6 +8526,106 @@ if (tile_b + TileSize <= InRows && tile_m + TileSize <= OutDim) {
             }
         }
 
+        private static MlxFastMetalKernel EnsureQ6KMatvecKernel()
+        {
+            lock (fastKernelSync)
+            {
+                if (q6KMatvecKernel.IsValid)
+                    return q6KMatvecKernel;
+                if (q6KMatvecKernelDisabled)
+                    throw new NotSupportedException("MLX Q6_K matrix-vector kernel was disabled after initialization failed.");
+
+                q6KMatvecKernel = CreateFastMetalKernel(
+                    "tensorsharp_q6k_matvec",
+                    new[] { "x", "w", "in_dim", "out_dim" },
+                    new[] { "y" },
+                    Q6KMatvecSource,
+                    string.Empty);
+                if (!q6KMatvecKernel.IsValid)
+                {
+                    q6KMatvecKernelDisabled = true;
+                    throw new NotSupportedException("Unable to initialize MLX Q6_K matrix-vector kernel.");
+                }
+
+                return q6KMatvecKernel;
+            }
+        }
+
+        private static MlxFastMetalKernel EnsureIq4XsMatvecKernel()
+        {
+            lock (fastKernelSync)
+            {
+                if (iq4XsMatvecKernel.IsValid)
+                    return iq4XsMatvecKernel;
+                if (iq4XsMatvecKernelDisabled)
+                    throw new NotSupportedException("MLX IQ4_XS matrix-vector kernel was disabled after initialization failed.");
+
+                iq4XsMatvecKernel = CreateFastMetalKernel(
+                    "tensorsharp_iq4xs_matvec",
+                    new[] { "x", "w", "in_dim", "out_dim" },
+                    new[] { "y" },
+                    Iq4XsMatvecSource,
+                    Iq4NlLookupHeader);
+                if (!iq4XsMatvecKernel.IsValid)
+                {
+                    iq4XsMatvecKernelDisabled = true;
+                    throw new NotSupportedException("Unable to initialize MLX IQ4_XS matrix-vector kernel.");
+                }
+
+                return iq4XsMatvecKernel;
+            }
+        }
+
+        private static MlxFastMetalKernel EnsureIq4XsDequantF16Kernel()
+        {
+            lock (fastKernelSync)
+            {
+                if (iq4XsDequantF16Kernel.IsValid)
+                    return iq4XsDequantF16Kernel;
+                if (iq4XsDequantF16KernelDisabled)
+                    throw new NotSupportedException("MLX IQ4_XS F16 dequantization kernel was disabled after initialization failed.");
+
+                iq4XsDequantF16Kernel = CreateFastMetalKernel(
+                    "tensorsharp_iq4xs_dequant_f16",
+                    new[] { "w", "in_dim", "row0" },
+                    new[] { "y" },
+                    Iq4XsDequantF16Source,
+                    Iq4NlLookupHeader);
+                if (!iq4XsDequantF16Kernel.IsValid)
+                {
+                    iq4XsDequantF16KernelDisabled = true;
+                    throw new NotSupportedException("Unable to initialize MLX IQ4_XS F16 dequantization kernel.");
+                }
+
+                return iq4XsDequantF16Kernel;
+            }
+        }
+
+        private static MlxFastMetalKernel EnsureQ6KDequantF16Kernel()
+        {
+            lock (fastKernelSync)
+            {
+                if (q6KDequantF16Kernel.IsValid)
+                    return q6KDequantF16Kernel;
+                if (q6KDequantF16KernelDisabled)
+                    throw new NotSupportedException("MLX Q6_K F16 dequantization kernel was disabled after initialization failed.");
+
+                q6KDequantF16Kernel = CreateFastMetalKernel(
+                    "tensorsharp_q6k_dequant_f16",
+                    new[] { "w", "in_dim", "row0" },
+                    new[] { "y" },
+                    Q6KDequantF16Source,
+                    string.Empty);
+                if (!q6KDequantF16Kernel.IsValid)
+                {
+                    q6KDequantF16KernelDisabled = true;
+                    throw new NotSupportedException("Unable to initialize MLX Q6_K F16 dequantization kernel.");
+                }
+
+                return q6KDequantF16Kernel;
+            }
+        }
+
         private static MlxFastMetalKernel EnsureQ6KGetRowsKernel()
         {
             lock (fastKernelSync)
@@ -7888,6 +8673,31 @@ if (tile_b + TileSize <= InRows && tile_m + TileSize <= OutDim) {
                 }
 
                 return gatedDeltaKernel;
+            }
+        }
+
+        private static MlxFastMetalKernel EnsureGatedDeltaBlockedKernel()
+        {
+            lock (fastKernelSync)
+            {
+                if (gatedDeltaBlockedKernel.IsValid)
+                    return gatedDeltaBlockedKernel;
+                if (gatedDeltaBlockedKernelDisabled)
+                    throw new NotSupportedException("MLX blocked gated-delta kernel was disabled after initialization failed.");
+
+                gatedDeltaBlockedKernel = CreateFastMetalKernel(
+                    "tensorsharp_gated_delta_blocked",
+                    new[] { "q", "k", "v", "g", "beta", "state_in", "T" },
+                    new[] { "y", "state_out" },
+                    GatedDeltaBlockedSource,
+                    string.Empty);
+                if (!gatedDeltaBlockedKernel.IsValid)
+                {
+                    gatedDeltaBlockedKernelDisabled = true;
+                    throw new NotSupportedException("Unable to initialize MLX blocked gated-delta kernel.");
+                }
+
+                return gatedDeltaBlockedKernel;
             }
         }
 
@@ -7952,7 +8762,7 @@ if (tile_b + TileSize <= InRows && tile_m + TileSize <= OutDim) {
 
                 qwen35GdnPackedPreprocessKernel = CreateFastMetalKernel(
                     "tensorsharp_qwen35_gdn_packed_preprocess",
-                    new[] { "packed_raw", "conv_state", "conv_weight", "dt_bias", "a_log" },
+                    new[] { "packed_raw", "conv_state", "conv_weight", "dt_bias", "a_log", "T" },
                     new[] { "q_out", "k_out", "v_out", "g_out", "beta_out", "z_silu", "next_conv" },
                     Qwen35GdnPackedPreprocessSource,
                     string.Empty);
@@ -8027,7 +8837,7 @@ if (tile_b + TileSize <= InRows && tile_m + TileSize <= OutDim) {
 
                 circularDecodeAttentionKernel = CreateFastMetalKernel(
                     "tensorsharp_circular_decode_attention",
-                    new[] { "q", "k_cache", "v_cache", "scale_value" },
+                    new[] { "q", "k_cache", "v_cache", "scale_value", "FirstSlot", "AttendLen" },
                     new[] { "y" },
                     CircularDecodeAttentionSource,
                     string.Empty);
@@ -8052,7 +8862,7 @@ if (tile_b + TileSize <= InRows && tile_m + TileSize <= OutDim) {
 
                 decodeAttentionWithSinksKernel = CreateFastMetalKernel(
                     "tensorsharp_decode_attention_with_sinks",
-                    new[] { "q", "k_cache", "v_cache", "sinks", "scale_value" },
+                    new[] { "q", "k_cache", "v_cache", "sinks", "scale_value", "MaskStart", "AttendLen" },
                     new[] { "y" },
                     DecodeAttentionWithSinksSource,
                     string.Empty);
@@ -8127,7 +8937,7 @@ if (tile_b + TileSize <= InRows && tile_m + TileSize <= OutDim) {
 
                 decodeAttentionHeadDim512Kernel = CreateFastMetalKernel(
                     "tensorsharp_decode_attention_head_dim_512",
-                    new[] { "q", "k_cache", "v_cache", "scale_value" },
+                    new[] { "q", "k_cache", "v_cache", "scale_value", "AttendLen" },
                     new[] { "y" },
                     DecodeAttentionHeadDim512Source,
                     string.Empty);
@@ -8169,14 +8979,13 @@ if (tile_b + TileSize <= InRows && tile_m + TileSize <= OutDim) {
                 MlxFastMetalKernelConfig config = mlx_fast_metal_kernel_config_new();
                 MlxVectorArray inputs = default;
                 MlxVectorArray outputs = default;
-                MlxArray scaleArray = default;
+                MlxArray scaleArray = default; MlxArray attendLenArray = default;
                 try
                 {
                     AddTemplateInt(config, "NumHeads", numHeads);
                     AddTemplateInt(config, "NumKVHeads", numKVHeads);
                     AddTemplateInt(config, "HeadDim", headDim);
                     AddTemplateInt(config, "CacheLen", cacheLen);
-                    AddTemplateInt(config, "AttendLen", attendLen);
 
                     int[] shape = { 1, numHeads * headDim };
                     Check(mlx_fast_metal_kernel_config_add_output_arg(config, shape, (nuint)shape.Length, ToMlxDtype(DType.Float32)), "configuring head_dim=512 decode attention output");
@@ -8184,7 +8993,8 @@ if (tile_b + TileSize <= InRows && tile_m + TileSize <= OutDim) {
                     Check(mlx_fast_metal_kernel_config_set_thread_group(config, headDim, 1, 1), "configuring head_dim=512 decode attention threadgroup");
 
                     scaleArray = mlx_array_new_float32(scale);
-                    inputs = CreateVectorArray(qFlat, kCache, vCache, scaleArray);
+                    attendLenArray = mlx_array_new_int(attendLen);
+                    inputs = CreateVectorArray(qFlat, kCache, vCache, scaleArray, attendLenArray);
                     outputs = mlx_vector_array_new();
                     Check(mlx_fast_metal_kernel_apply(ref outputs, kernel, inputs, config, DefaultStream()), "running head_dim=512 decode attention");
                     if (mlx_vector_array_size(outputs) < 1)
@@ -8196,6 +9006,7 @@ if (tile_b + TileSize <= InRows && tile_m + TileSize <= OutDim) {
                 finally
                 {
                     if (scaleArray.IsValid) _ = mlx_array_free(scaleArray);
+                    if (attendLenArray.IsValid) _ = mlx_array_free(attendLenArray);
                     if (inputs.IsValid) _ = mlx_vector_array_free(inputs);
                     if (outputs.IsValid) _ = mlx_vector_array_free(outputs);
                     if (config.IsValid) _ = mlx_fast_metal_kernel_config_free(config);
@@ -9158,6 +9969,7 @@ if (tile_b + TileSize <= InRows && tile_m + TileSize <= OutDim) {
             }
 
             public static MlxOptionalFloat Some(float value) => new(value, true);
+            public static MlxOptionalFloat None => new(0f, false);
         }
 
         [StructLayout(LayoutKind.Sequential)]
@@ -9303,6 +10115,14 @@ if (tile_b + TileSize <= InRows && tile_m + TileSize <= OutDim) {
         [LibraryImport(LibraryName, EntryPoint = "mlx_array_new_int")]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         private static partial MlxArray mlx_array_new_int(int value);
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_array_new")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial MlxArray mlx_array_new();
+
+        [LibraryImport(LibraryName, EntryPoint = "mlx_array_set")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_array_set(ref MlxArray array, MlxArray source);
 
         [LibraryImport(LibraryName, EntryPoint = "mlx_array_free")]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
@@ -9488,6 +10308,10 @@ if (tile_b + TileSize <= InRows && tile_m + TileSize <= OutDim) {
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         private static partial int mlx_where(out MlxArray result, MlxArray condition, MlxArray whenTrue, MlxArray whenFalse, MlxStream stream);
 
+        [LibraryImport(LibraryName, EntryPoint = "mlx_matmul")]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int mlx_matmul(out MlxArray result, MlxArray a, MlxArray b, MlxStream stream);
+
         [LibraryImport(LibraryName, EntryPoint = "mlx_addmm")]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         private static partial int mlx_addmm(out MlxArray result, MlxArray src, MlxArray m1, MlxArray m2, float alpha, float beta, MlxStream stream);
@@ -9510,7 +10334,7 @@ if (tile_b + TileSize <= InRows && tile_m + TileSize <= OutDim) {
 
         [LibraryImport(LibraryName, EntryPoint = "mlx_fast_scaled_dot_product_attention")]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
-        private static partial int mlx_fast_scaled_dot_product_attention(out MlxArray result, MlxArray query, MlxArray key, MlxArray value, float scale, IntPtr maskMode, MlxArray mask, MlxArray sinks, MlxStream stream);
+        private static partial int mlx_fast_scaled_dot_product_attention(out MlxArray result, MlxArray query, MlxArray key, MlxArray value, float scale, IntPtr maskMode, MlxArray mask, MlxArray sinks, [MarshalAs(UnmanagedType.I1)] bool forceFused, MlxStream stream);
 
         [LibraryImport(LibraryName, EntryPoint = "mlx_fast_rope_dynamic")]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]

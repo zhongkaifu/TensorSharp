@@ -51,8 +51,8 @@ DiffusionGemma 当前不属于已注册的 TestMatrix 功能目录：还没有 d
 | `TS_GPTOSS_BATCHED_ARENA` | `ggml_cuda` / `ggml_vulkan` 上的 GPT OSS | `0` 把批量 decode 的 slot-stable arena 换成按序列窗口的计算图（不支持持久计算图的后端总是走这条路径） | 启用 | 未注册 | 否 |
 | `TS_RETAINED_FUSED_CACHE` | 具有可保留 request-owned fused holder 的模型（Gemma 4；Qwen 3.5/3.6/3.8；Qwen 3.8 Flash Next，另有自己的 `TS_Q4E_RETAINED_CACHE`；DeepSeek V4.1 仅在 `TS_DSV41_RETAINED_CACHE=1` 时）；在 Radix 前缀缓存下还包括原生执行器上的 GLM 5.x（交出一个原生 slot） | 保留已完成请求的 holder，用于精确前缀续接；Qwen holder 同时包含 attention K/V 与匹配的 GatedDeltaNet 递归状态 | 启用 | 未注册 | 否 |
 | `TS_RETAINED_FUSED_CACHE_MAX` | 具有可保留 request-owned fused holder 的模型 | 保留 holder 的 LRU 预算（限制 VRAM；适用时包含递归状态）。在 Radix 前缀缓存下，它是保留的按会话终态（end state）的预算 | `4` | 不适用 | 否 |
-| `TS_PREFIX_CHECKPOINTS` | GGML 后端上的 Gemma 4；`ggml_cuda` / `ggml_metal` 上的 Qwen 3.5/3.6/3.8，即它运行按请求 fused holder 的后端（TP 下不支持）；GGML token-span 路径上的 Qwen 3.8 Flash Next（包括 `--tp N` 按层切分时）。需要开启 `TS_PER_SEQ_FUSED`，legacy 模式下还需要 `TS_RETAINED_FUSED_CACHE` | 在每个会话共享的提示前缀（系统提示、工具、技能）结束处对模型完整状态做检查点，新会话从其副本继续，只需重新预填自己的消息 | 开 | 未注册 | 否 |
-| `TS_PREFIX_CHECKPOINTS_MAX` | 同上 | 同时保留多少个不同共享前缀的检查点（每个占用一份前缀的 K/V，Qwen 还包含递归状态）。在 Radix 前缀缓存下，它是公共检查点的预算 | `2` | 不适用 | 否 |
+| `TS_PREFIX_CHECKPOINTS` | GGML 后端上的 Gemma 4；`ggml_cuda` / `ggml_metal` / `mlx` 上的 Qwen 3.5/3.6/3.8，即它运行按请求 holder 的后端（TP 下不支持）；GGML token-span 路径上的 Qwen 3.8 Flash Next（包括 `--tp N` 按层切分时）。需要开启 `TS_PER_SEQ_FUSED`，legacy 模式下还需要 `TS_RETAINED_FUSED_CACHE` | 在每个会话共享的提示前缀（系统提示、工具、技能）结束处对模型完整状态做检查点，新会话从其副本继续，只需重新预填自己的消息 | 开 | 未注册 | 否 |
+| `TS_PREFIX_CHECKPOINTS_MAX` | 同上 | 同时保留多少个不同共享前缀的检查点（每个占用一份前缀的 K/V，Qwen 还包含递归状态）。在 Radix 前缀缓存下，它是公共检查点的预算；一个提示在每个边界（系统指令、完整共享前缀）各发布一个检查点，因此 4 可覆盖同时预热两种思考模式的主机 | `4` | 不适用 | 否 |
 | `TS_KV_INITIAL_TOKENS` | 通过 `ModelBase.ResolveInitialCacheAllocationLength` 确定缓存大小的模型家族（Qwen 3.5/3.6、Gemma 4、GPT-OSS 等 ModelBase 家族；不含自行确定大小的 DeepSeek V4 / GLM 5.x） | 缓存创建时（加载时的主缓存、每个 per-request holder）在任何请求声明预算之前分配的 K/V token 数；`0` 沿用引擎策略（显式 `MAX_CONTEXT` 时为整个窗口，否则为后端默认值）。缓存仍按需增长。内存受限设备把它设小，因为每个保留的 holder 都按此大小付费，主机副本与设备镜像各一份 | `0` | 不适用 | 否 |
 | `TS_KV_GENERATION_RESERVE_MAX` | 全部 | 请求预先保留的 K/V 中生成部分的上限（prompt + max_new_tokens）；回复上限不小于窗口时否则每个请求都会保留整个窗口。超过上限后缓存按需增长。`0` = 不限制 | `0` | 不适用 | 否 |
 | `TS_KV_HOLDER_POOL_MAX` | 具有 per-request fused holder 的模型（Qwen 3.5/3.6/3.8、Gemma 4、GPT-OSS） | 已释放的 holder 最多可停放多少个以待复用而不是释放；每个停放的 holder 都占用其完整 K/V 分配 | `64` | 不适用 | 否 |
@@ -124,7 +124,19 @@ TensorAgent 在每次加载模型之前写入自己的取值（`EngineMemoryPoli
 | `TS_MLX_DEVICE_ROUTER` | MLX 上的 Qwen 3.5 / 3.6 MoE | 满足前置条件时在 device 上执行 top-K + softmax router | 启用，且会自动回退 | `0`, `1` | 是 |
 | `TS_MLX_PIPELINED_DECODE` | MLX decode 功能 | 模型支持时使用 device-side argmax 的流水化贪心 decode | 满足条件时启用 | `0`, `1` | 是 |
 | `TS_MLX_DEVICE_KV_COPY` | MLX | Device 侧 KV scatter | 启用 | `0`, `1` | 否 |
-| `TS_MLX_QWEN35_GDN_PACKED_KERNELS` | MLX 上的 Qwen 3.5 / 3.6 family | Packed GDN kernel | 关闭 | `0`, `1` | 是 |
+| `TS_MLX_QWEN35_GDN_PACKED_KERNELS` | MLX 上的 Qwen 3.5 / 3.6 family | Packed GDN kernel | 启用 | `0`, `1` | 是 |
+| `TS_MLX_CACHED_ATTENTION` | MLX 上的 Qwen 3.5 / 3.6 / 3.8 family 与 gpt-oss | 注意力层把 K/V 写入模型自身的缓存，并用 MLX fused SDPA 在其上计算注意力（decode 与每个 prefill 分块）；在 gpt-oss 上同时处理 attention sinks 与滑动窗口 mask；`0` 恢复原先的逐层路径 | 启用 | `0`, `1` | 否 |
+| `TS_MLX_GDN_BLOCKED` | MLX 上的 Qwen 3.5 / 3.6 / 3.8 family | 按时间分块的 Gated DeltaNet prefill kernel（head dim 128），长度在运行时传入 | 启用 | `0`, `1` | 否 |
+| `TS_MLX_HALF_MATMUL_MIN_ROWS` | MLX affine 量化 matmul | scales 为 F16 的 matmul 从多少行起使用 F16 激活；`0` 使所有 matmul 保持 F32 | `1`（全部） | `0`, `1`, `32` | 否 |
+| `TS_MLX_KQUANT_AFFINE` | MLX 上的 Q4_K / Q5_K 权重 | 重新打包为 MLX affine（使用 MLX 量化 kernel），而不是原始 K-quant kernel；`0` 恢复原始 kernel | 启用 | `0`, `1` | 否 |
+| `TS_MLX_Q6K_AFFINE8` | MLX 上的 Q6_K 权重 | `1` 把 Q6_K 重新分组为 MLX 8-bit affine（group 32，每个权重误差不超过半个 8-bit 步长），而不是在 TensorSharp 的 Q6_K kernel 上精确运行 | 关闭 | `0`, `1` | 否 |
+| `TS_MLX_Q6K_MATVEC_MAX_ROWS` | MLX 上的精确 Q6_K matmul | 行数不超过该值时，Q6_K 以矩阵-向量乘运行（移植自 ggml-metal 的 `kernel_mul_mv_q6_K_f32`）；`0` 恢复旧 kernel | `4` | 整数 >= 0 | 否 |
+| `TS_MLX_Q6K_DEQUANT_GEMM` | MLX 上的精确 Q6_K matmul | 超过矩阵-向量行数时，把 Q6_K 反量化为 F16（每片不超过 256 MB）并用 MLX 的 GEMM 相乘；`0` 恢复旧 kernel | 启用 | `0`, `1` | 否 |
+| `TS_MLX_IQ4XS_MATVEC_MAX_ROWS` | MLX 上的 IQ4_XS matmul | 行数不超过该值时，IQ4_XS 以矩阵-向量乘运行（移植自 ggml-metal 的 `kernel_mul_mv_iq4_xs_f32`）；`0` 恢复旧 kernel | `4` | 整数 >= 0 | 否 |
+| `TS_MLX_IQ4XS_DEQUANT_GEMM` | MLX 上的 IQ4_XS matmul | 超过矩阵-向量行数时，把 IQ4_XS 反量化为 F16（每片不超过 256 MB）并用 MLX 的 GEMM 相乘；`0` 恢复旧 kernel | 启用 | `0`, `1` | 否 |
+| `TS_MLX_MIXED_GATE_UP_SPLIT` | MLX 上的 Qwen 3.5 / 3.6 / 3.8 family | 混合量化的 `ffn_gate`/`ffn_up`（UD 量化中的 IQ4_XS + Q5_K）保持为两个各自格式的权重，而不是重新量化为同一类型后融合；`0` 像其他后端一样融合 | 启用 | `0`, `1` | 否 |
+| `TS_MLX_DEVICE_MOE_ROUTING` | MLX 上的 gpt-oss MoE decode | 在 device 上执行 top-K + softmax 并直接输入 `gather_qmm`，不在 host 读取 router 分数 | 启用 | `0`, `1` | 否 |
+| `TS_MLX_STRIDED_BOX_COPY` | MLX 中写入 strided view 的 `copy` | 对行主序张量中矩形区域的 copy（KV cache 扩容）使用 device `slice_update`，而不是 host fallback | 启用 | `0`, `1` | 否 |
 
 ## 矩阵外的纯 C# CPU 后端变量
 

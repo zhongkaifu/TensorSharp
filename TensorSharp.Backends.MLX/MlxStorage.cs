@@ -79,6 +79,14 @@ namespace TensorSharp.MLX
             return MlxNative.AsStrided(deviceArray, ToIntArray(tensor.Sizes), ToLongArray(tensor.Strides), tensor.StorageOffset);
         }
 
+        /// <summary>A view of this storage in a shape no TensorSharp tensor describes (an
+        /// extra leading batch axis, say), so it reaches MLX as a view rather than a copy.</summary>
+        internal MlxNative.MlxArray CreateArrayView(int[] shape, long[] strides, long offset)
+        {
+            EnsureDeviceCurrent();
+            return MlxNative.AsStrided(deviceArray, shape, strides, offset);
+        }
+
         internal void ReplaceDeviceArray(MlxNative.MlxArray array)
         {
             if (!array.IsValid)
@@ -151,6 +159,49 @@ namespace TensorSharp.MLX
             {
                 MlxNative.FreeArray(flatUpdate);
                 MlxNative.FreeArray(updatedStorage);
+            }
+        }
+
+        /// <summary>
+        /// Write <paramref name="update"/> into a rectangular box of this storage viewed
+        /// as a row-major array of <paramref name="parentShape"/> (which must cover the
+        /// whole storage): rows [starts[i], starts[i] + update.shape[i]) of every axis.
+        /// One device slice_update, where a strided view (a Narrow along an inner axis,
+        /// say) otherwise has no GPU write path.
+        /// </summary>
+        internal void UpdateDeviceBox(int[] parentShape, int[] starts, int[] stops, MlxNative.MlxArray update)
+        {
+            if (!update.IsValid)
+                throw new ArgumentException("MLX update array is empty.", nameof(update));
+
+            EnsureDeviceCurrent();
+            MlxNative.MlxArray shaped = default;
+            MlxNative.MlxArray updated = default;
+            MlxNative.MlxArray flat = default;
+            try
+            {
+                int[] strides = new int[parentShape.Length];
+                Array.Fill(strides, 1);
+                shaped = MlxNative.Reshape(deviceArray, parentShape);
+                updated = MlxNative.SliceUpdateMulti(shaped, update, starts, stops, strides);
+                flat = MlxNative.Reshape(updated, new[] { (int)ElementCount });
+
+                lock (sync)
+                {
+                    if (deviceArray.IsValid)
+                        MlxNative.FreeArray(deviceArray);
+
+                    deviceArray = flat;
+                    flat = default;
+                    hostDirty = false;
+                    deviceDirty = true;
+                }
+            }
+            finally
+            {
+                MlxNative.FreeArray(shaped);
+                MlxNative.FreeArray(updated);
+                MlxNative.FreeArray(flat);
             }
         }
 

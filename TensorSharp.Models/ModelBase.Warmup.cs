@@ -206,13 +206,20 @@ namespace TensorSharp.Models
                     double prefillMs = (Stopwatch.GetTimestamp() - prefillStart) * 1000.0 / Stopwatch.Frequency;
                     Console.WriteLine($"    Prefill warmup ({warmupLength} tokens): completed in {prefillMs:F1} ms");
                 }
-                catch (Exception ex)
+                // A dead GPU backend is not a skipped warm-up. Swallowing it left the
+                // host serving on a backend that refuses every later graph, and the
+                // first request then died naming its own embedding lookup rather than
+                // the out-of-memory that killed the backend here (issue #226).
+                catch (Exception ex) when (!BackendHasFailed())
                 {
                     Console.WriteLine($"  Prefill warmup skipped: {ex.GetType().Name}: {ex.Message}");
                 }
                 finally
                 {
-                    ResetKVCache();
+                    // Resetting runs device ops too; on a dead backend it would fail
+                    // and replace the exception that says why.
+                    if (!BackendHasFailed())
+                        ResetKVCache();
                 }
 
                 if (_backend == BackendType.Cuda &&

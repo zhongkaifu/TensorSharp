@@ -426,7 +426,6 @@ namespace TensorSharp.Models
                 // no draft features. Ignore all previous head rows by rebasing
                 // its KV to an empty suffix. The full-context trunk stays intact.
                 _mtpCacheStart = checked(startPos + tokens.Length);
-                _mlxAttentionCache?[_mtpLayerIdx]?.Reset();
                 return;
             }
             EnterSpecSession();

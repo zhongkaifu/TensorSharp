@@ -73,11 +73,14 @@ namespace TensorSharp.Runtime.Scheduling
         /// chat from a clone of it. Env: <c>TS_PREFIX_CHECKPOINTS</c> (default on).</summary>
         public bool PrefixCheckpointsEnabled { get; init; } = true;
 
-        /// <summary>How many distinct shared prefixes to keep checkpointed at once —
-        /// two covers a thinking toggle that changes the prefix (Gemma 4 marks it at
-        /// the top of the system turn). Env: <c>TS_PREFIX_CHECKPOINTS_MAX</c>
-        /// (default 2).</summary>
-        public int PrefixCheckpointBudget { get; init; } = 2;
+        /// <summary>How many public checkpoints to keep at once. A prompt now publishes
+        /// one per declared boundary (the end of the system instructions as well as the
+        /// end of the shared prefix; see SequenceState.PublicCheckpointBoundaries), and a
+        /// host that warms both thinking modes, whose prefixes differ from the first
+        /// tokens, needs both of each: at 2 the second warm-up evicted the first mode's
+        /// pair and every new chat in that mode prefilled the whole prompt again.
+        /// Env: <c>TS_PREFIX_CHECKPOINTS_MAX</c> (default 4).</summary>
+        public int PrefixCheckpointBudget { get; init; } = 4;
 
         /// <summary>Tokens of K/V a cache is given when it is CREATED — the model's
         /// primary cache at load, and every per-request holder — before any request
@@ -121,7 +124,7 @@ namespace TensorSharp.Runtime.Scheduling
             RetainedFusedCacheEnabled = ReadFlag("TS_RETAINED_FUSED_CACHE", true),
             RetainedFusedCacheBudget = ReadNonNegativeInt("TS_RETAINED_FUSED_CACHE_MAX", 4),
             PrefixCheckpointsEnabled = ReadFlag("TS_PREFIX_CHECKPOINTS", true),
-            PrefixCheckpointBudget = ReadNonNegativeInt("TS_PREFIX_CHECKPOINTS_MAX", 2),
+            PrefixCheckpointBudget = ReadNonNegativeInt("TS_PREFIX_CHECKPOINTS_MAX", 4),
             KvInitialTokens = ReadNonNegativeInt("TS_KV_INITIAL_TOKENS", 0),
             KvGenerationReserveMax = ReadNonNegativeInt("TS_KV_GENERATION_RESERVE_MAX", 0),
             KvHolderPoolMax = ReadNonNegativeInt("TS_KV_HOLDER_POOL_MAX", 64),
@@ -139,7 +142,7 @@ namespace TensorSharp.Runtime.Scheduling
             if (!RetainedFusedCacheEnabled) parts.Add("TS_RETAINED_FUSED_CACHE=0");
             if (RetainedFusedCacheBudget != 4) parts.Add($"TS_RETAINED_FUSED_CACHE_MAX={RetainedFusedCacheBudget}");
             if (!PrefixCheckpointsEnabled) parts.Add("TS_PREFIX_CHECKPOINTS=0");
-            if (PrefixCheckpointBudget != 2) parts.Add($"TS_PREFIX_CHECKPOINTS_MAX={PrefixCheckpointBudget}");
+            if (PrefixCheckpointBudget != 4) parts.Add($"TS_PREFIX_CHECKPOINTS_MAX={PrefixCheckpointBudget}");
             if (KvInitialTokens != 0) parts.Add($"TS_KV_INITIAL_TOKENS={KvInitialTokens}");
             if (KvGenerationReserveMax != 0) parts.Add($"TS_KV_GENERATION_RESERVE_MAX={KvGenerationReserveMax}");
             if (KvHolderPoolMax != 64) parts.Add($"TS_KV_HOLDER_POOL_MAX={KvHolderPoolMax}");

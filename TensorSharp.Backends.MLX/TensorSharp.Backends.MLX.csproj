@@ -26,6 +26,9 @@
     <ProjectReference Include="..\TensorSharp.Core\TensorSharp.Core.csproj" />
     <ProjectReference Include="..\TensorSharp.Runtime\TensorSharp.Runtime.csproj" />
   </ItemGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="InferenceWeb.Tests" />
+  </ItemGroup>
   <Target Name="BuildMlxNative"
           BeforeTargets="BeforeBuild"
           Condition="'$(MlxNativeBuildScript)' != '' And '$(TensorSharpSkipMlxNative)' != 'true' And '$(TENSORSHARP_MLX_NATIVE_SKIP)' != 'true' And '$(TargetPlatformIdentifier)' != 'ios' And ('$(TensorSharpBuildMlxNative)' == 'true' Or '$(TENSORSHARP_MLX_NATIVE_BUILD)' == 'true' Or !Exists('$(MlxNativeInstallDir)/$(MlxNativeBinaryName)'))">

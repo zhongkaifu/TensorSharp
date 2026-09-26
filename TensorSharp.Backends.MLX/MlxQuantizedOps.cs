@@ -65,6 +65,9 @@ namespace TensorSharp.MLX
             public int GroupSize;
             public int Bits;
             public string Mode = MlxAffineMode;
+            // Affine weight whose scales (and biases) are F16: it can run with F16
+            // activations without casting them. See AffineQuantizedMatmul.
+            public bool HalfAffine;
             public CacheKey Key;
             public IntPtr HostData;
             // True when the entry was created against an offloadable cache key
@@ -180,7 +183,7 @@ namespace TensorSharp.MLX
         /// once at startup, and the OS evicts page-cache pages without
         /// further help. Wrapping those types in the LRU just adds churn.
         /// </summary>
-        public static bool PreloadDuplicatesHostMemory(int ggmlType)
+        public static bool PreloadDuplicatesHostMemory(int ggmlType, long rawBytes = 0)
         {
             switch (ggmlType)
             {
@@ -191,10 +194,14 @@ namespace TensorSharp.MLX
                 case (int)GgmlTensorType.Q8_0:
                 case (int)GgmlTensorType.MXFP4:
                     return true;
+                case (int)GgmlTensorType.Q4_K:
+                    // Repacked to MLX affine by default (PreferAffineKQuant); the raw
+                    // kernel (TS_MLX_KQUANT_AFFINE=0) wraps the mmap zero-copy.
+                    return PreferAffineKQuant;
                 case (int)GgmlTensorType.Q5_K:
-                    // Q5_K is repack-only when the raw kernel is disabled
-                    // (TS_MLX_Q5K_RAW=0). Default is raw=true → zero-copy.
-                    return !UseRawQ5KKernel();
+                    return PreferAffineKQuant || !UseRawQ5KKernel();
+                case (int)GgmlTensorType.Q6_K:
+                    return Q6KUsesAffine8(rawBytes);
                 default:
                     return false;
             }
@@ -497,19 +504,20 @@ namespace TensorSharp.MLX
             return !string.Equals(Environment.GetEnvironmentVariable("TS_MLX_Q5K_RAW"), "0", StringComparison.Ordinal);
         }
 
-        // When true, the K-quant families (Q4_K / Q5_K / Q6_K) preload into MLX-native AFFINE form
-        // (driving the built-in mlx_quantized_matmul / gather_qmm) instead of the raw GGUF custom
-        // Metal kernels. The affine repack is a LOSSLESS reinterpretation of K-quant — each 32-element
-        // group becomes scale = d*scaleByte, bias = -dmin*minByte, which is exactly ggml's K-quant
-        // dequant (w = scale*q + bias) — so accuracy is unchanged. The custom kernels are competitive
-        // for decode (rows == 1, autoregressive models); the affine path is markedly faster in the
-        // MULTI-ROW regime (e.g. DiffusionGemma denoises a C=256 canvas every step, where the raw
-        // kernels are tuned for rows==1 and only reach ~150 GFLOP/s). Default follows
-        // TS_MLX_KQUANT_AFFINE (default off, AR-friendly); DiffusionGemma turns it on at load. The flag
-        // is read only at weight-creation time — the per-matmul path keys off the created weight's Mode,
-        // so once a model's weights are preloaded the choice is fixed for them regardless of later writes.
+        // When true, Q4_K and Q5_K preload into MLX-native AFFINE form (driving the built-in
+        // mlx_quantized_matmul / gather_qmm) instead of the raw GGUF custom Metal kernels. The repack
+        // is a reinterpretation of K-quant, as omlx and mlx-lm store 4/5-bit weights: each 32-element
+        // group becomes scale = d*scaleByte, bias = -dmin*minByte, exactly ggml's dequant (w = scale*q
+        // + bias) up to rounding the group's scale and bias to F16. It is faster in both regimes, not
+        // only for multi-row work: Qwen3.8-27B UD-Q4_K_XL (almost all Q5_K) on an M5 Pro with MLX
+        // 0.32.2 went from 22 to 426 tok/s prefill (pp512) and from 4.1 to 7.6 tok/s decode, with
+        // logits unchanged against ggml_metal (cosine 0.999991 vs 0.999988 raw). The copy costs ~9%
+        // more than the raw bytes and the source pages are released after upload
+        // (PreloadDuplicatesHostMemory). Q6_K stays raw (see below). TS_MLX_KQUANT_AFFINE=0 restores
+        // the raw kernels. The flag is read only at weight-creation time — the per-matmul path keys off
+        // the created weight's Mode, so once a model's weights are preloaded the choice is fixed.
         public static bool PreferAffineKQuant =
-            string.Equals(Environment.GetEnvironmentVariable("TS_MLX_KQUANT_AFFINE"), "1", StringComparison.Ordinal);
+            !string.Equals(Environment.GetEnvironmentVariable("TS_MLX_KQUANT_AFFINE"), "0", StringComparison.Ordinal);
 
         public static bool TryAddmmQuantizedToFloat32(
             Tensor result,
@@ -637,15 +645,7 @@ namespace TensorSharp.MLX
                         }
                     }
 
-                    output = MlxNative.QuantizedMatmul(
-                        inputView,
-                        weight.Weight,
-                        weight.Scales,
-                        weight.Biases,
-                        transpose: true,
-                        weight.GroupSize,
-                        weight.Bits,
-                        weight.Mode);
+                    output = AffineQuantizedMatmul(inputView, weight, rows);
                     // mlx_quantized_matmul returns a row-major contiguous
                     // [rows, outDim] array for the standard 2D matmul case
                     // used by Forward/Decode. Skip the explicit
@@ -673,6 +673,256 @@ namespace TensorSharp.MLX
                 MlxNative.FreeArray(inputView);
                 MlxNative.FreeArray(output);
                 MlxNative.FreeArray(contiguous);
+            }
+        }
+
+        /// <summary>
+        /// residual += down(silu(gate) * up), where [gate | up] = gateUp(rms_norm(residual) * normWeight):
+        /// a whole dense SwiGLU FFN for a prefill-sized block, in half precision.
+        ///
+        /// Running each matmul with F16 activations on its own (AffineQuantizedMatmul)
+        /// still round-trips the [rows, 2 * intermediate] gate/up product and the SwiGLU
+        /// output through F32 between them — about 1 GB per layer at 4096 rows. Here they
+        /// stay F16, as they do in mlx-lm, and only the residual add is F32. Numerically
+        /// it is the per-matmul half path: the SwiGLU output was already cast to F16 before
+        /// the down projection.
+        ///
+        /// Declines (touching nothing) unless both weights are affine with F16 scales and
+        /// the block has at least the half-matmul row threshold.
+        /// </summary>
+        public static bool TryRmsNormSwiGluAddHalf(
+            Tensor residual,
+            Tensor normWeight,
+            float eps,
+            int intermediate,
+            IntPtr gateUpKey, IntPtr gateUpData, int gateUpType, long gateUpNe0, long gateUpNe1, long gateUpRawBytes,
+            IntPtr downKey, IntPtr downData, int downType, long downNe0, long downNe1, long downRawBytes)
+        {
+            if (residual?.Storage is not MlxStorage residualStorage
+                || residual.ElementType != DType.Float32
+                || residual.DimensionCount != 2
+                || !residual.IsContiguous()
+                || residual.StorageOffset != 0
+                || residual.Storage.ElementCount != residual.ElementCount()
+                || residual.Sizes[0] > int.MaxValue)
+                return false;
+            int rows = (int)residual.Sizes[0];
+            long hidden = residual.Sizes[1];
+            if (rows < HalfMatmulMinRows || intermediate <= 0)
+                return false;
+            if (gateUpNe0 != hidden || gateUpNe1 != 2L * intermediate || downNe0 != intermediate || downNe1 != hidden)
+                return false;
+            if (!CanPreloadQuantizedType(gateUpType) || !CanPreloadQuantizedType(downType))
+                return false;
+            if (normWeight?.Storage is not MlxStorage normStorage
+                || normWeight.ElementType != DType.Float32
+                || normWeight.DimensionCount != 1
+                || normWeight.Sizes[0] != hidden)
+                return false;
+
+            DeviceWeight gateUp = EnsureWeight(residualStorage.DeviceId, gateUpKey, gateUpData, gateUpType, gateUpNe0, gateUpNe1, gateUpRawBytes);
+            DeviceWeight down = EnsureWeight(residualStorage.DeviceId, downKey, downData, downType, downNe0, downNe1, downRawBytes);
+            if (!gateUp.HalfAffine || !down.HalfAffine)
+                return false;
+
+            return MlxWorker.Shared.Invoke(() =>
+            {
+                MlxNative.MlxArray input = default;
+                MlxNative.MlxArray norm = default;
+                MlxNative.MlxArray normed = default;
+                MlxNative.MlxArray half = default;
+                MlxNative.MlxArray gateUpOut = default;
+                MlxNative.MlxArray gate = default;
+                MlxNative.MlxArray up = default;
+                MlxNative.MlxArray activated = default;
+                MlxNative.MlxArray downOut = default;
+                MlxNative.MlxArray downF32 = default;
+                MlxNative.MlxArray sum = default;
+                try
+                {
+                    input = residualStorage.CreateArrayView(residual);
+                    norm = normStorage.CreateArrayView(normWeight);
+                    normed = MlxNative.FastRmsNorm(input, norm, eps);
+                    half = MlxNative.Astype(normed, DType.Float16);
+                    gateUpOut = MlxNative.QuantizedMatmul(
+                        half, gateUp.Weight, gateUp.Scales, gateUp.Biases,
+                        transpose: true, gateUp.GroupSize, gateUp.Bits, gateUp.Mode);
+                    gate = MlxNative.Slice(gateUpOut, new[] { 0, 0 }, new[] { rows, intermediate }, new[] { 1, 1 });
+                    up = MlxNative.Slice(gateUpOut, new[] { 0, intermediate }, new[] { rows, 2 * intermediate }, new[] { 1, 1 });
+                    activated = MlxCompiledOps.Disabled
+                        ? SwiGluEager(gate, up)
+                        : MlxCompiledOps.SwiGLU(gate, up);
+                    downOut = MlxNative.QuantizedMatmul(
+                        activated, down.Weight, down.Scales, down.Biases,
+                        transpose: true, down.GroupSize, down.Bits, down.Mode);
+                    downF32 = MlxNative.Astype(downOut, DType.Float32);
+                    sum = MlxNative.Binary(MlxNative.MlxBinaryOp.Add, input, downF32);
+                    SetDeviceResult(residual, sum);
+                    sum = default;
+                    return true;
+                }
+                catch
+                {
+                    return false;
+                }
+                finally
+                {
+                    MlxNative.FreeArray(input);
+                    MlxNative.FreeArray(norm);
+                    MlxNative.FreeArray(normed);
+                    MlxNative.FreeArray(half);
+                    MlxNative.FreeArray(gateUpOut);
+                    MlxNative.FreeArray(gate);
+                    MlxNative.FreeArray(up);
+                    MlxNative.FreeArray(activated);
+                    MlxNative.FreeArray(downOut);
+                    MlxNative.FreeArray(downF32);
+                    MlxNative.FreeArray(sum);
+                }
+            });
+        }
+
+        /// <summary>
+        /// <see cref="TryRmsNormSwiGluAddHalf"/> for a gate and up kept as two weights, as
+        /// mixed-quant GGUFs are on MLX (IQ4_XS ffn_gate with Q5_K ffn_up in Qwen3.8 UD
+        /// quants): each projection runs in its own format with F16 activations and F16
+        /// output, and the SwiGLU stays F16 between them. Each weight may be affine with F16
+        /// scales, raw IQ4_XS, or raw Q6_K; the raw ones go through their F16 dequantize +
+        /// GEMM, so a block no wider than the matrix-vector rows is declined and left to
+        /// the per-matmul path. Declines touching nothing.
+        /// </summary>
+        public static bool TryRmsNormSwiGluAddHalfSplit(
+            Tensor residual,
+            Tensor normWeight,
+            float eps,
+            IntPtr gateKey, IntPtr gateData, int gateType, long gateNe0, long gateNe1, long gateRawBytes,
+            IntPtr upKey, IntPtr upData, int upType, long upNe0, long upNe1, long upRawBytes,
+            IntPtr downKey, IntPtr downData, int downType, long downNe0, long downNe1, long downRawBytes)
+        {
+            if (residual?.Storage is not MlxStorage residualStorage
+                || residual.ElementType != DType.Float32
+                || residual.DimensionCount != 2
+                || !residual.IsContiguous()
+                || residual.StorageOffset != 0
+                || residual.Storage.ElementCount != residual.ElementCount()
+                || residual.Sizes[0] > int.MaxValue)
+                return false;
+            int rows = (int)residual.Sizes[0];
+            long hidden = residual.Sizes[1];
+            if (rows < HalfMatmulMinRows || gateNe1 <= 0 || gateNe1 > int.MaxValue)
+                return false;
+            int intermediate = (int)gateNe1;
+            if (gateNe0 != hidden || upNe0 != hidden || upNe1 != intermediate
+                || downNe0 != intermediate || downNe1 != hidden || hidden > int.MaxValue)
+                return false;
+            if (!CanPreloadQuantizedType(gateType) || !CanPreloadQuantizedType(upType) || !CanPreloadQuantizedType(downType))
+                return false;
+            if (normWeight?.Storage is not MlxStorage normStorage
+                || normWeight.ElementType != DType.Float32
+                || normWeight.DimensionCount != 1
+                || normWeight.Sizes[0] != hidden)
+                return false;
+
+            DeviceWeight gate = EnsureWeight(residualStorage.DeviceId, gateKey, gateData, gateType, gateNe0, gateNe1, gateRawBytes);
+            DeviceWeight up = EnsureWeight(residualStorage.DeviceId, upKey, upData, upType, upNe0, upNe1, upRawBytes);
+            DeviceWeight down = EnsureWeight(residualStorage.DeviceId, downKey, downData, downType, downNe0, downNe1, downRawBytes);
+            if (!CanRunHalfProduct(gate, gateType, rows) || !CanRunHalfProduct(up, upType, rows) || !CanRunHalfProduct(down, downType, rows))
+                return false;
+
+            return MlxWorker.Shared.Invoke(() =>
+            {
+                MlxNative.MlxArray input = default;
+                MlxNative.MlxArray norm = default;
+                MlxNative.MlxArray normed = default;
+                MlxNative.MlxArray half = default;
+                MlxNative.MlxArray gateOut = default;
+                MlxNative.MlxArray upOut = default;
+                MlxNative.MlxArray activated = default;
+                MlxNative.MlxArray downOut = default;
+                MlxNative.MlxArray downF32 = default;
+                MlxNative.MlxArray sum = default;
+                try
+                {
+                    input = residualStorage.CreateArrayView(residual);
+                    norm = normStorage.CreateArrayView(normWeight);
+                    normed = MlxNative.FastRmsNorm(input, norm, eps);
+                    half = MlxNative.Astype(normed, DType.Float16);
+                    gateOut = HalfProduct(half, gate, gateType, rows, (int)hidden, intermediate);
+                    upOut = HalfProduct(half, up, upType, rows, (int)hidden, intermediate);
+                    activated = MlxCompiledOps.Disabled
+                        ? SwiGluEager(gateOut, upOut)
+                        : MlxCompiledOps.SwiGLU(gateOut, upOut);
+                    downOut = HalfProduct(activated, down, downType, rows, intermediate, (int)hidden);
+                    downF32 = MlxNative.Astype(downOut, DType.Float32);
+                    sum = MlxNative.Binary(MlxNative.MlxBinaryOp.Add, input, downF32);
+                    SetDeviceResult(residual, sum);
+                    sum = default;
+                    return true;
+                }
+                catch
+                {
+                    return false;
+                }
+                finally
+                {
+                    MlxNative.FreeArray(input);
+                    MlxNative.FreeArray(norm);
+                    MlxNative.FreeArray(normed);
+                    MlxNative.FreeArray(half);
+                    MlxNative.FreeArray(gateOut);
+                    MlxNative.FreeArray(upOut);
+                    MlxNative.FreeArray(activated);
+                    MlxNative.FreeArray(downOut);
+                    MlxNative.FreeArray(downF32);
+                    MlxNative.FreeArray(sum);
+                }
+            });
+        }
+
+        private static bool IsRawIq4Xs(int ggmlType) => ggmlType == (int)GgmlTensorType.IQ4_XS;
+
+        private static bool IsRawQ6K(DeviceWeight weight, int ggmlType)
+            => ggmlType == (int)GgmlTensorType.Q6_K && string.Equals(weight.Mode, "q6_k", StringComparison.Ordinal);
+
+        private static bool CanRunHalfProduct(DeviceWeight weight, int ggmlType, int rows)
+        {
+            if (weight.HalfAffine)
+                return true;
+            if (IsRawIq4Xs(ggmlType))
+                return rows > MlxNative.Iq4XsMatvecMaxRows;
+            if (IsRawQ6K(weight, ggmlType))
+                return rows > MlxNative.Q6KMatvecMaxRows;
+            return false;
+        }
+
+        // [rows, inDim] F16 x weight^T -> [rows, outDim] F16; see CanRunHalfProduct.
+        private static MlxNative.MlxArray HalfProduct(MlxNative.MlxArray half, DeviceWeight weight, int ggmlType, int rows, int inDim, int outDim)
+        {
+            if (weight.HalfAffine)
+            {
+                return MlxNative.QuantizedMatmul(
+                    half, weight.Weight, weight.Scales, weight.Biases,
+                    transpose: true, weight.GroupSize, weight.Bits, weight.Mode);
+            }
+            return IsRawIq4Xs(ggmlType)
+                ? MlxNative.Iq4XsDequantMatmul(half, weight.Weight, rows, inDim, outDim, halfOutput: true)
+                : MlxNative.Q6KDequantMatmul(half, weight.Weight, rows, inDim, outDim, halfOutput: true);
+        }
+
+        private static MlxNative.MlxArray SwiGluEager(MlxNative.MlxArray gate, MlxNative.MlxArray up)
+        {
+            MlxNative.MlxArray sigmoid = default;
+            MlxNative.MlxArray silu = default;
+            try
+            {
+                sigmoid = MlxNative.Unary(MlxNative.MlxUnaryOp.Sigmoid, gate);
+                silu = MlxNative.Binary(MlxNative.MlxBinaryOp.Mul, gate, sigmoid);
+                return MlxNative.Binary(MlxNative.MlxBinaryOp.Mul, silu, up);
+            }
+            finally
+            {
+                MlxNative.FreeArray(sigmoid);
+                MlxNative.FreeArray(silu);
             }
         }
 
@@ -1307,15 +1557,57 @@ namespace TensorSharp.MLX
             if (ggmlType == (int)GgmlTensorType.Q6_K && string.Equals(weight.Mode, "q6_k", StringComparison.Ordinal))
                 return MlxNative.Q6KMatmul(input, weight.Weight, rows, inDim, outDim);
 
-            return MlxNative.QuantizedMatmul(
-                input,
-                weight.Weight,
-                weight.Scales,
-                weight.Biases,
-                transpose: true,
-                weight.GroupSize,
-                weight.Bits,
-                weight.Mode);
+            return AffineQuantizedMatmul(input, weight, rows);
+        }
+
+        /// <summary>
+        /// Rows from which an affine quantized matmul with F16 scales runs with F16
+        /// activations — by default every matmul, decode included. MLX computes a
+        /// quantized matmul in its activations' dtype, so F32 rows against F16 scales
+        /// promote the product to F32 and cast the weight's whole scale and bias arrays
+        /// to F32 on every call. For prefill that costs the F16 kernels' throughput (M5
+        /// Pro, MLX 0.32.2, 4096 x 12288, 8-bit: F32 17.7-19.3 TFLOP/s against F16
+        /// 23.5-27.0 at 512-2048 rows); for decode it is extra memory traffic on a
+        /// bandwidth-bound step — Qwen3.8-27B Q4_K_M decode went from 8.5 to 14.0 tok/s
+        /// when one-row matmuls cast the row instead of the scales. ggml-metal makes the
+        /// same trade in its mul_mm, which loads F32 activations into half tiles.
+        /// TS_MLX_HALF_MATMUL_MIN_ROWS=N raises the threshold; 0 keeps every matmul F32.
+        /// </summary>
+        // Settable so the kernels' exactness tests can pin F32 activations.
+        internal static int HalfMatmulMinRows = ResolveHalfMatmulMinRows();
+
+        private static int ResolveHalfMatmulMinRows()
+        {
+            string value = Environment.GetEnvironmentVariable("TS_MLX_HALF_MATMUL_MIN_ROWS");
+            if (int.TryParse(value, out int rows))
+                return rows <= 0 ? int.MaxValue : rows;
+            return 1;
+        }
+
+        private static MlxNative.MlxArray AffineQuantizedMatmul(MlxNative.MlxArray input, DeviceWeight weight, int rows)
+        {
+            if (rows < HalfMatmulMinRows || !weight.HalfAffine)
+            {
+                return MlxNative.QuantizedMatmul(
+                    input, weight.Weight, weight.Scales, weight.Biases,
+                    transpose: true, weight.GroupSize, weight.Bits, weight.Mode);
+            }
+
+            MlxNative.MlxArray half = default;
+            MlxNative.MlxArray product = default;
+            try
+            {
+                half = MlxNative.Astype(input, DType.Float16);
+                product = MlxNative.QuantizedMatmul(
+                    half, weight.Weight, weight.Scales, weight.Biases,
+                    transpose: true, weight.GroupSize, weight.Bits, weight.Mode);
+                return MlxNative.Astype(product, DType.Float32);
+            }
+            finally
+            {
+                MlxNative.FreeArray(half);
+                MlxNative.FreeArray(product);
+            }
         }
 
         private static bool MatmulOutputNeedsContiguous()
@@ -1427,11 +1719,12 @@ namespace TensorSharp.MLX
                     (int)GgmlTensorType.Q5_K => (PreferAffineKQuant || !UseRawQ5KKernel())
                         ? CreateQ5KWeight(deviceId, hostData, ne0, ne1, rawBytes)
                         : CreateQ5KRawWeight(deviceId, hostData, ne0, ne1, rawBytes),
-                    // Q6_K stays on the raw custom kernel: its natural affine group size is 16, which MLX's
-                    // built-in quantized kernels don't support (only group ∈ {32,64,128}); the affine repack
-                    // would need a lossy regroup. Q6_K is a minority here (token_embd/lm_head, some attn_v)
-                    // and not the per-layer bottleneck, so keeping it raw is both lossless and sufficient.
-                    (int)GgmlTensorType.Q6_K => CreateQ6KRawWeight(deviceId, hostData, ne0, ne1, rawBytes),
+                    // Q6_K's natural affine group is 16, which MLX's quantized kernels don't support
+                    // (only 32/64/128), so it stays raw on TensorSharp's kernels by default;
+                    // TS_MLX_Q6K_AFFINE8=1 regroups it to 8-bit/32 (CreateQ6KAffine8Weight).
+                    (int)GgmlTensorType.Q6_K => Q6KUsesAffine8(rawBytes)
+                        ? CreateQ6KAffine8Weight(deviceId, hostData, ne0, ne1, rawBytes)
+                        : CreateQ6KRawWeight(deviceId, hostData, ne0, ne1, rawBytes),
                     (int)GgmlTensorType.Q8_0 => CreateQ8Weight(deviceId, hostData, ne0, ne1, rawBytes),
                     (int)GgmlTensorType.IQ2_XXS => CreateIq2XxsRawWeight(deviceId, hostData, ne0, ne1, rawBytes),
                     (int)GgmlTensorType.IQ2_S => CreateIq2SRawWeight(deviceId, hostData, ne0, ne1, rawBytes),
@@ -1472,9 +1765,10 @@ namespace TensorSharp.MLX
 
             int packedWeightBytes = checked(outDim * (inDim / 2));
             int scaleCount = checked(outDim * blocksPerRow);
-            byte[] packedWeights = new byte[packedWeightBytes];
-            System.Half[] scales = new System.Half[scaleCount];
-            System.Half[] biases = new System.Half[scaleCount];
+            using var staging = new AffineStaging(packedWeightBytes, scaleCount);
+            byte* packedWeights = staging.Packed;
+            System.Half* scales = staging.Scales;
+            System.Half* biases = staging.Biases;
 
             byte* src = (byte*)hostData.ToPointer();
             for (int row = 0; row < outDim; row++)
@@ -1526,9 +1820,10 @@ namespace TensorSharp.MLX
 
             int packedWeightBytes = checked(outDim * blocksPerRow * 20);
             int scaleCount = checked(outDim * blocksPerRow);
-            byte[] packedWeights = new byte[packedWeightBytes];
-            System.Half[] scales = new System.Half[scaleCount];
-            System.Half[] biases = new System.Half[scaleCount];
+            using var staging = new AffineStaging(packedWeightBytes, scaleCount);
+            byte* packedWeights = staging.Packed;
+            System.Half* scales = staging.Scales;
+            System.Half* biases = staging.Biases;
             byte[] values = new byte[Q5BlockElements];
 
             byte* src = (byte*)hostData.ToPointer();
@@ -1592,9 +1887,10 @@ namespace TensorSharp.MLX
                 throw new ArgumentException($"Q4_K raw buffer is too small: expected at least {expectedBytes} bytes, got {rawBytes}.", nameof(rawBytes));
 
             int groupsPerRow = superBlocksPerRow * 8;
-            byte[] packedWeights = new byte[checked(outDim * (inDim / 2))];
-            System.Half[] scales = new System.Half[checked(outDim * groupsPerRow)];
-            System.Half[] biases = new System.Half[scales.Length];
+            using var staging = new AffineStaging(checked(outDim * (inDim / 2)), checked(outDim * groupsPerRow));
+            byte* packedWeights = staging.Packed;
+            System.Half* scales = staging.Scales;
+            System.Half* biases = staging.Biases;
             byte[] values = new byte[32];
 
             byte* src = (byte*)hostData.ToPointer();
@@ -1653,9 +1949,10 @@ namespace TensorSharp.MLX
                 throw new ArgumentException($"Q5_K raw buffer is too small: expected at least {expectedBytes} bytes, got {rawBytes}.", nameof(rawBytes));
 
             int groupsPerRow = superBlocksPerRow * 8;
-            byte[] packedWeights = new byte[checked(outDim * superBlocksPerRow * 160)];
-            System.Half[] scales = new System.Half[checked(outDim * groupsPerRow)];
-            System.Half[] biases = new System.Half[scales.Length];
+            using var staging = new AffineStaging(checked(outDim * superBlocksPerRow * 160), checked(outDim * groupsPerRow));
+            byte* packedWeights = staging.Packed;
+            System.Half* scales = staging.Scales;
+            System.Half* biases = staging.Biases;
             byte[] values = new byte[32];
 
             byte* src = (byte*)hostData.ToPointer();
@@ -1800,6 +2097,113 @@ namespace TensorSharp.MLX
                     NativeMemory.AlignedFree(biasesBuffer.ToPointer());
             }
         }
+
+        /// <summary>
+        /// Q6_K as MLX 8-bit affine, group 32. Not lossless: Q6_K scales every 16 values
+        /// independently and MLX's smallest affine group is 32, so each pair of sub-blocks is
+        /// decoded exactly and requantized to 256 levels over the pair's range, which adds at
+        /// most half an 8-bit step (range/510) to each weight — about 3% on the RMS of Q6_K's
+        /// own rounding error. In exchange the matmul runs on MLX's quantized kernels instead
+        /// of the raw Q6_K kernels. Opt-in (TS_MLX_Q6K_AFFINE8=1, and the load says so): it
+        /// was the default until the raw kernels caught up (see PreferAffine8Q6K), and on
+        /// Qwen3.8-27B Q4_K_M it now prefills 2-3% faster but decodes 8% slower than exact
+        /// Q6_K, because 9 bits per weight is more to read than Q6_K's 6.56.
+        /// </summary>
+        private static unsafe DeviceWeight CreateQ6KAffine8Weight(int deviceId, IntPtr hostData, long ne0, long ne1, long rawBytes)
+        {
+            if (ne0 <= 0 || ne1 <= 0 || ne0 > int.MaxValue || ne1 > int.MaxValue || ne0 % QK_K != 0)
+                throw new NotSupportedException($"Q6_K MLX preload requires positive dimensions and input dim aligned to {QK_K}, got [{ne0}, {ne1}].");
+
+            int inDim = checked((int)ne0);
+            int outDim = checked((int)ne1);
+            int superBlocksPerRow = inDim / QK_K;
+            long expectedBytes = (long)outDim * superBlocksPerRow * Q6_KBlockBytes;
+            if (rawBytes < expectedBytes)
+                throw new ArgumentException($"Q6_K raw buffer is too small: expected at least {expectedBytes} bytes, got {rawBytes}.", nameof(rawBytes));
+
+            const int groupSize = 32;
+            int groupsPerRow = inDim / groupSize;
+            using var staging = new AffineStaging((long)outDim * inDim, (long)outDim * groupsPerRow);
+            byte* src = (byte*)hostData.ToPointer();
+            float* values = stackalloc float[groupSize];
+            for (int row = 0; row < outDim; row++)
+            {
+                for (int sb = 0; sb < superBlocksPerRow; sb++)
+                {
+                    byte* block = src + ((long)row * superBlocksPerRow + sb) * Q6_KBlockBytes;
+                    byte* ql = block;
+                    byte* qh = ql + QK_K / 2;
+                    sbyte* blockScales = (sbyte*)(qh + QK_K / 4);
+                    float d = (float)BitConverter.UInt16BitsToHalf((ushort)(((byte*)blockScales)[QK_K / 16] | (((byte*)blockScales)[QK_K / 16 + 1] << 8)));
+
+                    for (int pair = 0; pair < 8; pair++)
+                    {
+                        float min = float.PositiveInfinity, max = float.NegativeInfinity;
+                        for (int half2 = 0; half2 < 2; half2++)
+                        {
+                            int sub = pair * 2 + half2;
+                            int half = sub / 8;
+                            int sh = sub % 8;
+                            int qlOffset = half * 64 + (sh % 4) * 16;
+                            bool isUpper = sh >= 4;
+                            int qhOffset = half * 32 + (sh % 2) * 16;
+                            int qhShift = (sh / 2) * 2;
+                            float scale = d * blockScales[sub];
+                            for (int i = 0; i < 16; i++)
+                            {
+                                int lo4 = isUpper ? (ql[qlOffset + i] >> 4) & 0x0F : ql[qlOffset + i] & 0x0F;
+                                int hi2 = (qh[qhOffset + i] >> qhShift) & 0x03;
+                                float v = scale * ((lo4 | (hi2 << 4)) - 32);
+                                values[half2 * 16 + i] = v;
+                                min = MathF.Min(min, v);
+                                max = MathF.Max(max, v);
+                            }
+                        }
+
+                        System.Half bias = (System.Half)min;
+                        float biasF = (float)bias;
+                        float step = (max - biasF) / 255.0f;
+                        System.Half scaleH = (System.Half)(step > 0 ? step : 1.0f);
+                        float scaleF = (float)scaleH;
+                        long group = (long)row * groupsPerRow + sb * 8 + pair;
+                        staging.Scales[group] = scaleH;
+                        staging.Biases[group] = bias;
+                        byte* dst = staging.Packed + group * groupSize;
+                        for (int i = 0; i < groupSize; i++)
+                            dst[i] = (byte)Math.Clamp((int)MathF.Round((values[i] - biasF) / scaleF), 0, 255);
+                    }
+                }
+            }
+
+            return CreateDeviceWeight(
+                deviceId,
+                (int)GgmlTensorType.Q6_K,
+                ne0,
+                ne1,
+                rawBytes,
+                staging.Packed,
+                staging.Scales,
+                staging.Biases,
+                new[] { outDim, inDim / 4 },
+                new[] { outDim, groupsPerRow },
+                groupSize,
+                8);
+        }
+
+        // Off by default: exact Q6_K now runs on a matrix-vector port of ggml-metal's kernel
+        // for decode and an F16 dequantize + GEMM for prefill (MlxNative.Q6KMatmul), which
+        // on Qwen3.8-27B Q4_K_M decodes at 15.2 tok/s against the regroup's 14.0 and
+        // prefills within 2-3% of it (455/465 vs 470/473 tok/s at pp512/pp4096), in fewer
+        // bytes and without the regroup's rounding. TS_MLX_Q6K_AFFINE8=1 opts back in.
+        // Settable (like PreferAffineKQuant) and read only when a weight is created.
+        public static bool PreferAffine8Q6K =
+            string.Equals(Environment.GetEnvironmentVariable("TS_MLX_Q6K_AFFINE8"), "1", StringComparison.Ordinal);
+
+        /// <summary>
+        /// Whether a Q6_K weight is regrouped to 8-bit affine: when asked to, or when its raw
+        /// bytes pass what one MLX uint8 array can index (the raw kernels' Int32 limit).
+        /// </summary>
+        public static bool Q6KUsesAffine8(long rawBytes) => PreferAffine8Q6K || rawBytes > int.MaxValue;
 
         private static DeviceWeight CreateQ4KRawWeight(int deviceId, IntPtr hostData, long ne0, long ne1, long rawBytes)
         {
@@ -2720,6 +3124,80 @@ namespace TensorSharp.MLX
             });
         }
 
+        /// <summary>
+        /// Native staging for an affine repack: the packed weights, scales and biases the repack
+        /// writes and MLX copies into its own buffers, freed as soon as the copy is made. They
+        /// were managed arrays the GC kept committed long after the upload. Zeroed, because the
+        /// bit packers OR into the destination.
+        /// </summary>
+        private sealed unsafe class AffineStaging : IDisposable
+        {
+            public readonly byte* Packed;
+            public readonly System.Half* Scales;
+            public readonly System.Half* Biases;
+
+            public AffineStaging(long packedBytes, long scaleCount)
+            {
+                try
+                {
+                    Packed = (byte*)HostBuffers.Allocate(packedBytes);
+                    Scales = (System.Half*)HostBuffers.Allocate(scaleCount * sizeof(System.Half));
+                    Biases = (System.Half*)HostBuffers.Allocate(scaleCount * sizeof(System.Half));
+                }
+                catch
+                {
+                    Dispose();
+                    throw;
+                }
+                NativeMemory.Clear(Packed, (nuint)packedBytes);
+            }
+
+            public void Dispose()
+            {
+                HostBuffers.Free((IntPtr)Packed);
+                HostBuffers.Free((IntPtr)Scales);
+                HostBuffers.Free((IntPtr)Biases);
+            }
+        }
+
+        private static unsafe void PackUnsignedBits(byte[] values, int bits, byte* destination, long destinationOffset)
+        {
+            fixed (byte* source = values)
+                PackUnsignedBits(source, values.Length, bits, destination, destinationOffset);
+        }
+
+        private static unsafe DeviceWeight CreateDeviceWeight(
+            int deviceId,
+            int ggmlType,
+            long ne0,
+            long ne1,
+            long rawBytes,
+            byte* packedWeights,
+            System.Half* scales,
+            System.Half* biases,
+            int[] weightShape,
+            int[] scaleShape,
+            int groupSize,
+            int bits)
+        {
+            return CreateDeviceWeightFromHostBuffers(
+                deviceId,
+                ggmlType,
+                ne0,
+                ne1,
+                rawBytes,
+                (IntPtr)packedWeights,
+                (IntPtr)scales,
+                (IntPtr)biases,
+                weightShape,
+                scaleShape,
+                groupSize,
+                bits,
+                scaleDType: DType.Float16,
+                hasBias: true,
+                mode: MlxAffineMode);
+        }
+
         private static unsafe DeviceWeight CreateDeviceWeight(
             int deviceId,
             int ggmlType,
@@ -2801,6 +3279,9 @@ namespace TensorSharp.MLX
                     GroupSize = groupSize,
                     Bits = bits,
                     Mode = mode,
+                    HalfAffine = scaleDType == DType.Float16
+                        && (!hasBias || biasDType == DType.Float16)
+                        && string.Equals(mode, MlxAffineMode, StringComparison.Ordinal),
                 };
                 weight = default;
                 scaleArray = default;

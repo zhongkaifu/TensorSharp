@@ -52,7 +52,7 @@ internal sealed class PrefixTreeOptions
     public int ContextLength { get; init; } = int.MaxValue;
     public long PageHostBytes { get; init; }                           // A1 slab bytes per page (ComputeBlockByteSize)
     public long EngineSerial { get; init; }
-    public int PublicMax { get; init; } = 2;                           // TS_PREFIX_CHECKPOINTS_MAX
+    public int PublicMax { get; init; } = 4;                           // TS_PREFIX_CHECKPOINTS_MAX
     public int ScopedEndStateLeavesMax { get; init; } = 4;             // TS_RETAINED_FUSED_CACHE_MAX; 0 = unlimited
     public bool BatchedPagedEnabled { get; init; }
     public int MinCloneTokens { get; init; }                           // DEC-13; 0 = always clone

@@ -38,6 +38,7 @@ using System;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using TensorSharp.GGML;
+using TensorSharp.MLX;
 using TensorSharp.Runtime.Scheduling;
 
 namespace TensorSharp.Models
@@ -62,6 +63,12 @@ namespace TensorSharp.Models
             public float[][] ConvState;
             public int[] ConvWriteIdx;
             public Tensor[] DeltaState;
+            // MLX keeps the GDN state in its own per-layer caches, not in the host ring
+            // and delta tensor above (which MLX never writes); a holder carries its own
+            // set so swapping holders swaps the recurrence too. Null on other backends.
+            public MlxFusedOps.GatedDeltaNetCache[] MlxGdn;
+            // Bytes those caches hold once they have run (conv tail + delta state).
+            public long MlxGdnStateBytes;
             // Fused-decode conv scratch (ggml [time,channel], cacheable device buffer
             // keyed on this host ptr) + whether this holder's device GDN state is
             // currently seeded (resident) on the device.
@@ -195,6 +202,9 @@ namespace TensorSharp.Models
             if (h.DeltaState != null)
                 foreach (var t in h.DeltaState)
                     if (t != null) Ops.Fill(t, 0);
+            if (h.MlxGdn != null)
+                foreach (var cache in h.MlxGdn)
+                    cache?.Reset();
             // KV rows beyond the written prefix are mask-bounded on every read
             // path, so stale bytes there are safe (same rule as the GPT-OSS
             // holder pool). The old arena slot was discarded before reset.
@@ -234,10 +244,15 @@ namespace TensorSharp.Models
         // it lost its position ("no LastLogits to sample from at position 0"). The
         // fused decode itself leaves the session (ExitSpecSession) when it is next
         // asked to run, so the capability is true whenever the backend supports it.
+        // MLX: the holders carry their own MLX GDN caches (Qwen35KvCacheHolder.MlxGdn)
+        // and the request's forward is the ordinary per-op one, so a swap is the same
+        // reference flip; this is also what lets a new chat start from the shared-prefix
+        // checkpoint instead of prefilling the system prompt again.
         public bool SupportsPerSequenceFusedForward =>
             !IsTensorParallel
             && ((_backend == BackendType.GgmlCuda && _fullDecodeEnabled && !_fdUnsupported)
-                || _backend == BackendType.GgmlMetal);
+                || _backend == BackendType.GgmlMetal
+                || _backend == BackendType.Mlx);
 
         public bool SupportsRetainedFusedCache => true;
 
@@ -256,6 +271,8 @@ namespace TensorSharp.Models
             ConvState = _convState,
             ConvWriteIdx = _convStateWriteIdx,
             DeltaState = _deltaStateTensor,
+            MlxGdn = _mlxGdnCache,
+            MlxGdnStateBytes = _mlxGdnCache == null ? 0 : MlxGdnStateBytesPerHolder(),
             ConvScratch = _fdConvScratch,
             FdStateResident = _fdStateResident,
             GdnHostDirty = _gdnStateHostDirty,
@@ -282,6 +299,7 @@ namespace TensorSharp.Models
             _convState = h.ConvState;
             _convStateWriteIdx = h.ConvWriteIdx;
             _deltaStateTensor = h.DeltaState;
+            _mlxGdnCache = h.MlxGdn;
             _fdConvScratch = h.ConvScratch;
             _fdStateResident = h.FdStateResident;
             _gdnStateHostDirty = h.GdnHostDirty;
@@ -323,6 +341,8 @@ namespace TensorSharp.Models
                 ConvState = new float[numLayers][],
                 ConvWriteIdx = new int[numLayers],
                 DeltaState = new Tensor[numLayers],
+                MlxGdn = _backend == BackendType.Mlx ? new MlxFusedOps.GatedDeltaNetCache[numLayers] : null,
+                MlxGdnStateBytes = _backend == BackendType.Mlx ? MlxGdnStateBytesPerHolder() : 0,
                 KvCapacity = cap,
             };
             bool complete = false;
@@ -344,6 +364,8 @@ namespace TensorSharp.Models
                         holder.DeltaState[l] = AllocateGdnDeltaStateTensor(
                             _allocator, _useMetalGdnInplaceState, _numVHeads, _headVDim, _headKDim);
                         Ops.Fill(holder.DeltaState[l], 0);
+                        if (holder.MlxGdn != null)
+                            holder.MlxGdn[l] = new MlxFusedOps.GatedDeltaNetCache();
                         gdnCount++;
                     }
                 }
@@ -627,7 +649,8 @@ namespace TensorSharp.Models
         /// GatedDeltaNet conv ring and delta state — once every device-resident part
         /// has been brought back to the host. GGML only, and not under tensor
         /// parallelism (the cache lives on the ranks there).</summary>
-        public bool SupportsPrefixCheckpoints => IsGgmlBackend && !IsTensorParallel && _kvCacheK != null;
+        public bool SupportsPrefixCheckpoints =>
+            (IsGgmlBackend || _backend == BackendType.Mlx) && !IsTensorParallel && _kvCacheK != null;
 
         /// <summary>Deep-copy the ACTIVE cache into the retained set under
         /// <paramref name="key"/>. See <see cref="IBatchedPagedModel.TryCheckpointActiveCache"/>.</summary>
@@ -730,7 +753,7 @@ namespace TensorSharp.Models
             var w = new System.IO.BinaryWriter(destination, System.Text.Encoding.UTF8, leaveOpen: true);
             w.Write(CheckpointFileMagic);
             w.Write(CheckpointFileVersion);
-            w.Write(KVStateFingerprint ?? string.Empty);
+            w.Write(CheckpointFingerprint);
             w.Write(numLayers);
             w.Write(rows);
             w.Write(h.RopeDelta);
@@ -744,8 +767,21 @@ namespace TensorSharp.Models
                 w.Write(recurrent);
                 if (!recurrent)
                 {
-                    WriteCacheRows(w, h.K[l], rows);
-                    WriteCacheRows(w, h.V[l], rows);
+                    if (h.K[l].Storage is MlxStorage)
+                    {
+                        WriteMlxCacheRows(w, h.K[l], rows);
+                        WriteMlxCacheRows(w, h.V[l], rows);
+                    }
+                    else
+                    {
+                        WriteCacheRows(w, h.K[l], rows);
+                        WriteCacheRows(w, h.V[l], rows);
+                    }
+                    continue;
+                }
+                if (h.MlxGdn?[l] != null)
+                {
+                    WriteMlxGdnState(w, h.MlxGdn[l]);
                     continue;
                 }
                 float[] conv = h.ConvState[l];
@@ -782,7 +818,7 @@ namespace TensorSharp.Models
             var r = new System.IO.BinaryReader(source, System.Text.Encoding.UTF8, leaveOpen: true);
             if (r.ReadUInt32() != CheckpointFileMagic || r.ReadInt32() != CheckpointFileVersion)
                 return false;
-            if (!string.Equals(r.ReadString(), KVStateFingerprint ?? string.Empty, StringComparison.Ordinal))
+            if (!string.Equals(r.ReadString(), CheckpointFingerprint, StringComparison.Ordinal))
                 return false;
             int numLayers = r.ReadInt32();
             int rows = r.ReadInt32();
@@ -811,10 +847,22 @@ namespace TensorSharp.Models
                         return false;
                     if (!recurrent)
                     {
+                        if (h.K[l].Storage is MlxStorage)
+                        {
+                            if (!ReadMlxCacheRows(r, h.K[l], rows) || !ReadMlxCacheRows(r, h.V[l], rows))
+                                return false;
+                            continue;
+                        }
                         if (!ReadCacheRows(r, h.K[l], rows) || !ReadCacheRows(r, h.V[l], rows))
                             return false;
                         InvalidateTensorDeviceCache(h.K[l]);
                         InvalidateTensorDeviceCache(h.V[l]);
+                        continue;
+                    }
+                    if (h.MlxGdn?[l] != null)
+                    {
+                        if (!ReadMlxGdnState(r, h.MlxGdn[l]))
+                            return false;
                         continue;
                     }
                     int convLen = r.ReadInt32();
@@ -898,6 +946,106 @@ namespace TensorSharp.Models
             return true;
         }
 
+        // A checkpoint file names the backend's state layout as well as the model's K/V
+        // identity: MLX writes its own GDN caches (conv tail oldest-first, write index 0)
+        // and ggml its host ring and in-place delta layout, and neither reads the other's.
+        private string CheckpointFingerprint
+            => (KVStateFingerprint ?? string.Empty) + (_backend == BackendType.Mlx ? "|mlx" : string.Empty);
+
+        /// <summary>Bytes of one holder's MLX GDN caches once they have run: per recurrent
+        /// layer the conv tail [convKernel - 1, qkvDim] and the delta state [Hv, Dv, Dk].</summary>
+        private long MlxGdnStateBytesPerHolder()
+        {
+            if (_isRecurrent == null)
+                return 0;
+            int qkvDim = _headKDim * _numKHeads * 2 + _headVDim * _numVHeads;
+            long perLayer = ((long)Math.Max(0, _convKernel - 1) * qkvDim + (long)_numVHeads * _headVDim * _headKDim) * sizeof(float);
+            long layers = 0;
+            foreach (bool recurrent in _isRecurrent)
+                if (recurrent) layers++;
+            return layers * perLayer;
+        }
+
+        /// <summary><see cref="WriteCacheRows"/> for an MLX cache: the same bytes, read
+        /// through an MLX view so the storage does not gain a host copy.</summary>
+        private static unsafe void WriteMlxCacheRows(System.IO.BinaryWriter w, Tensor t, int rows)
+        {
+            long heads = t.Sizes[0];
+            long cap = t.Sizes[1];
+            long rowBytes = heads * cap == 0 ? 0 : t.Storage.ByteLength / (heads * cap);
+            w.Write((int)heads);
+            w.Write(rowBytes);
+            if (rows == 0 || heads == 0 || rowBytes == 0)
+                return;
+            byte[] bytes = new byte[checked(heads * rows * rowBytes)];
+            using (Tensor box = t.Narrow(1, 0, rows))
+            fixed (byte* p = bytes)
+            {
+                if (!MlxFusedOps.TryCopyViewToHost(box, (IntPtr)p, bytes.Length))
+                    throw new InvalidOperationException("MLX K/V rows could not be read for the checkpoint.");
+            }
+            w.Flush();
+            w.BaseStream.Write(bytes);
+        }
+
+        private static unsafe bool ReadMlxCacheRows(System.IO.BinaryReader r, Tensor t, int rows)
+        {
+            long heads = t.Sizes[0];
+            long cap = t.Sizes[1];
+            long rowBytes = heads * cap == 0 ? 0 : t.Storage.ByteLength / (heads * cap);
+            if (r.ReadInt32() != heads || r.ReadInt64() != rowBytes)
+                return false;
+            if (rows > cap)
+                return false;
+            if (rows == 0 || heads == 0 || rowBytes == 0)
+                return true;
+            byte[] bytes = new byte[checked(heads * rows * rowBytes)];
+            r.BaseStream.ReadExactly(bytes);
+            using Tensor box = t.Narrow(1, 0, rows);
+            fixed (byte* p = bytes)
+                return MlxFusedOps.TryWriteViewFromHost(box, (IntPtr)p, bytes.Length);
+        }
+
+        /// <summary>One recurrent layer's MLX GDN state in the file's per-layer layout:
+        /// conv length and values, write index (0: the tail is stored oldest-first), delta
+        /// byte count and values.</summary>
+        private unsafe void WriteMlxGdnState(System.IO.BinaryWriter w, MlxFusedOps.GatedDeltaNetCache cache)
+        {
+            int qkvDim = _headKDim * _numKHeads * 2 + _headVDim * _numVHeads;
+            float[] conv = new float[Math.Max(0, _convKernel - 1) * qkvDim];
+            float[] delta = new float[checked(_numVHeads * _headVDim * _headKDim)];
+            fixed (float* c = conv)
+            fixed (float* d = delta)
+                cache.ExportState(c, conv.Length, d, delta.Length);
+            w.Write(conv.Length);
+            w.Flush();
+            w.BaseStream.Write(MemoryMarshal.AsBytes(conv.AsSpan()));
+            w.Write(0);
+            w.Write((long)delta.Length * sizeof(float));
+            w.Flush();
+            w.BaseStream.Write(MemoryMarshal.AsBytes(delta.AsSpan()));
+        }
+
+        private unsafe bool ReadMlxGdnState(System.IO.BinaryReader r, MlxFusedOps.GatedDeltaNetCache cache)
+        {
+            int qkvDim = _headKDim * _numKHeads * 2 + _headVDim * _numVHeads;
+            int convTail = Math.Max(0, _convKernel - 1);
+            if (r.ReadInt32() != convTail * qkvDim)
+                return false;
+            float[] conv = new float[convTail * qkvDim];
+            r.BaseStream.ReadExactly(MemoryMarshal.AsBytes(conv.AsSpan()));
+            if (r.ReadInt32() != 0)
+                return false;
+            float[] delta = new float[checked(_numVHeads * _headVDim * _headKDim)];
+            if (r.ReadInt64() != (long)delta.Length * sizeof(float))
+                return false;
+            r.BaseStream.ReadExactly(MemoryMarshal.AsBytes(delta.AsSpan()));
+            fixed (float* c = conv)
+            fixed (float* d = delta)
+                cache.ImportState(c, convTail, qkvDim, d, _numVHeads, _headVDim, _headKDim);
+            return true;
+        }
+
         /// <summary>An independent copy of <paramref name="source"/>, whose host bytes
         /// must be current: fresh tensors sized to the source, every attention K/V
         /// storage and every recurrent layer's conv ring, write index and delta state
@@ -936,6 +1084,17 @@ namespace TensorSharp.Models
                         continue;
                     }
 
+                    if (source.MlxGdn?[l] != null && dst.MlxGdn?[l] != null)
+                    {
+                        // Shares the source's immutable state arrays; see CloneState. On
+                        // MLX these caches are the whole recurrent state: the host ring
+                        // and delta tensors below are never written, and reading them
+                        // would give both storages a host copy for nothing.
+                        dst.MlxGdn[l].Dispose();
+                        dst.MlxGdn[l] = source.MlxGdn[l].CloneState();
+                        continue;
+                    }
+
                     if (source.ConvState[l] != null && dst.ConvState[l] != null)
                         Array.Copy(source.ConvState[l], dst.ConvState[l], Math.Min(source.ConvState[l].Length, dst.ConvState[l].Length));
                     dst.ConvWriteIdx[l] = source.ConvWriteIdx[l];
@@ -957,6 +1116,8 @@ namespace TensorSharp.Models
                             InvalidateGdnDeltaStateDeviceCaches(to);
                     }
                 }
+                if (dst.MlxGdn != null)
+                    MaterializeMlxHolder(dst);
                 dst.CacheSeqLen = source.CacheSeqLen;
                 dst.RopeDelta = source.RopeDelta;
                 dst.MtpCacheStart = source.MtpCacheStart;
@@ -972,6 +1133,22 @@ namespace TensorSharp.Models
             {
                 if (!complete) DisposeHolder(dst);
             }
+        }
+
+        /// <summary>
+        /// Evaluates an MLX holder's K/V copies and GDN states. They are lazy on MLX, and a
+        /// checkpoint kept for the life of the model would otherwise hold the whole graph
+        /// that produced them (the copied-from cache, every layer's activations) alive.
+        /// </summary>
+        private static void MaterializeMlxHolder(Qwen35KvCacheHolder holder)
+        {
+            foreach (Tensor[] set in new[] { holder.K, holder.V })
+                if (set != null)
+                    foreach (Tensor t in set)
+                        if (t != null)
+                            MlxFusedOps.TryEvaluate(t);
+            foreach (var cache in holder.MlxGdn)
+                cache?.TryEvaluateState();
         }
 
         private void DisposeHolder(Qwen35KvCacheHolder holder)
@@ -1023,6 +1200,12 @@ namespace TensorSharp.Models
                         InvalidateGdnDeltaStateDeviceCaches(t);
                     t?.Dispose();
                     holder.DeltaState[i] = null;
+                }
+            if (holder.MlxGdn != null)
+                for (int i = 0; i < holder.MlxGdn.Length; i++)
+                {
+                    holder.MlxGdn[i]?.Dispose();
+                    holder.MlxGdn[i] = null;
                 }
             if (holder.ConvScratch != IntPtr.Zero)
             {

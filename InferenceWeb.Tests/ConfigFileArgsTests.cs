@@ -162,6 +162,9 @@ public class ConfigFileArgsTests : IDisposable
         "code-exec", "code-exec-allow-install", "code-exec-allow-network", "code-exec-unconfined",
         "code-exec-timeout", "code-exec-temperature", "code-exec-install-domains",
         "code-exec-install-index", "code-exec-shell", "code-exec-packages", "code-exec-max-output",
+        // Sub-agents: ServerOptionsBuilder reads it for MultiAgentOptions and lets it
+        // past the unknown-option trap. The CLI has no sub-agents and drops it.
+        "agents-allow-worker-tools",
     };
 
     [Fact]

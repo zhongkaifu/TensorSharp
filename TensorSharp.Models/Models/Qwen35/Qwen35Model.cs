@@ -154,6 +154,11 @@ namespace TensorSharp.Models
         // Set FUSED_ATTN_LAYER_MIN_SEQ_LEN=N to override at runtime for benchmarking.
         private static readonly int FusedAttnLayerDecodeMinSeqLen = ResolveFusedAttnLayerMinSeqLen();
         private static readonly int MlxFlashAttnDecodeMinSeqLen = ResolveMlxFlashAttnDecodeMinSeqLen();
+        // Full-attention layers on MLX write K/V into the model's own cache and attend
+        // over it with MLX's fused SDPA (MlxFusedOps.TryCachedAttention), as mlx-lm does.
+        // TS_MLX_CACHED_ATTENTION=0 restores the previous per-layer paths for A/B.
+        private static readonly bool MlxCachedAttention =
+            !string.Equals(Environment.GetEnvironmentVariable("TS_MLX_CACHED_ATTENTION"), "0", StringComparison.Ordinal);
         private static readonly int MlxEvalEveryNLayers = ResolveMlxEvalEveryNLayers();
         private static readonly bool MlxEvalDecodeLayerBoundaries =
             string.Equals(Environment.GetEnvironmentVariable("TS_MLX_EVAL_DECODE_LAYER_BOUNDARIES"), "1", StringComparison.Ordinal);
@@ -326,7 +331,6 @@ namespace TensorSharp.Models
         // _cacheSeqLen so cache growth and paged snapshots never memcpy stale
         // host bytes (most visibly when a long decode crosses 32K -> 64K).
         private bool _kvCacheHostDirty;
-        private MlxFusedOps.AttentionKvCache[] _mlxAttentionCache;
         private int _kvCacheCapacity;
         // Initial KV capacity captured at InitCaches; fresh per-request fused-cache
         // holders (see Qwen35Model.PerSeqCache) allocate at this size and grow.
@@ -1129,9 +1133,6 @@ namespace TensorSharp.Models
             int numLayers = TotalLayerCount;
             _kvCacheK = new Tensor[numLayers];
             _kvCacheV = new Tensor[numLayers];
-            _mlxAttentionCache = _backend == BackendType.Mlx
-                ? new MlxFusedOps.AttentionKvCache[numLayers]
-                : null;
 
             InitGdnCacheArrays(numLayers);
             int qkvDim = _headKDim * _numKHeads * 2 + _headVDim * _numVHeads;
@@ -1146,8 +1147,6 @@ namespace TensorSharp.Models
                     _kvCacheV[l] = new Tensor(_allocator, kvDtype, Config.NumKVHeads, initialSeqLen, Config.HeadDim);
                     InitializeCacheTensor(_kvCacheK[l]);
                     InitializeCacheTensor(_kvCacheV[l]);
-                    if (_mlxAttentionCache != null)
-                        _mlxAttentionCache[l] = new MlxFusedOps.AttentionKvCache();
                 }
                 else
                 {
@@ -1357,7 +1356,6 @@ namespace TensorSharp.Models
                 {
                     ResetCacheTensor(_kvCacheK[l]);
                     ResetCacheTensor(_kvCacheV[l]);
-                    _mlxAttentionCache?[l]?.Reset();
                 }
                 else
                 {
@@ -1385,6 +1383,8 @@ namespace TensorSharp.Models
         /// unsloth "UD" quant of this family needs it - about half their layers
         /// store ffn_gate and ffn_up in different IQ types.</summary>
         protected override bool SupportsSplitGateUpFfn => true;
+        // FFNCachedFused runs a kept-split pair through MlxQuantizedOps.TryRmsNormSwiGluAddHalfSplit.
+        protected override bool SplitsMixedGateUpOnMlx => true;
 
         /// <summary>
         /// The fused per-rank TP graphs carry the per-projection scale table
@@ -1675,6 +1675,9 @@ namespace TensorSharp.Models
 
         private bool CopyGdnStateOut(int layer, Span<byte> destination, out int written)
         {
+            if (_mlxGdnCache?[layer] != null)
+                return CopyMlxGdnStateOut(layer, destination, out written);
+
             // Reads the host mirrors; see RecurrentBlock.
             DrainDeviceRecurrentState();
 
@@ -1707,6 +1710,9 @@ namespace TensorSharp.Models
 
         private bool CopyGdnStateIn(int layer, ReadOnlySpan<byte> source, out int read)
         {
+            if (_mlxGdnCache?[layer] != null)
+                return CopyMlxGdnStateIn(layer, source, out read);
+
             // Writes the host mirrors, so whatever the device holds is superseded.
             DrainDeviceRecurrentState();
 
@@ -1731,9 +1737,56 @@ namespace TensorSharp.Models
                     Buffer.MemoryCopy(src, (void*)deltaBase, deltaBytes, deltaBytes);
                 }
             }
-            // MLX cache reflects the host-side bytes lazily on next use; resetting
-            // its scratch indices is enough for correctness.
-            _mlxGdnCache?[layer]?.Reset();
+            read = (int)total;
+            return true;
+        }
+
+        // The same block layout as the host-mirror copies above (conv values, write index,
+        // delta values), from and to the MLX GDN cache, which on MLX is the only copy of
+        // the recurrent state: the host ring and delta tensor are never written there, so
+        // a swapped-out sequence used to come back with a zero state.
+        private unsafe bool CopyMlxGdnStateOut(int layer, Span<byte> destination, out int written)
+        {
+            written = 0;
+            int convFloats = _convState[layer].Length;
+            long deltaBytes = GdnDeltaStateBytes(_deltaStateTensor[layer]);
+            long deltaFloats = (long)_numVHeads * _headVDim * _headKDim;
+            if (deltaBytes != deltaFloats * sizeof(float))
+                return false;
+            long total = (long)convFloats * sizeof(float) + sizeof(int) + deltaBytes;
+            if (destination.Length < total) return false;
+            fixed (byte* dst = destination)
+            {
+                float* conv = (float*)dst;
+                float* delta = (float*)(dst + (long)convFloats * sizeof(float) + sizeof(int));
+                _mlxGdnCache[layer].ExportState(conv, convFloats, delta, deltaFloats);
+            }
+            BitConverter.TryWriteBytes(destination.Slice(convFloats * sizeof(float), sizeof(int)), 0);
+            written = (int)total;
+            return true;
+        }
+
+        private unsafe bool CopyMlxGdnStateIn(int layer, ReadOnlySpan<byte> source, out int read)
+        {
+            read = 0;
+            int convFloats = _convState[layer].Length;
+            int qkvDim = _headKDim * _numKHeads * 2 + _headVDim * _numVHeads;
+            int convTail = Math.Max(0, _convKernel - 1);
+            long deltaBytes = GdnDeltaStateBytes(_deltaStateTensor[layer]);
+            if (convFloats != convTail * qkvDim || deltaBytes != (long)_numVHeads * _headVDim * _headKDim * sizeof(float))
+                return false;
+            long total = (long)convFloats * sizeof(float) + sizeof(int) + deltaBytes;
+            if (source.Length < total) return false;
+            // A block written from the host ring (another backend's layout) is not ordered
+            // oldest-first; this path only ever reads its own blocks, written with index 0.
+            if (BitConverter.ToInt32(source.Slice(convFloats * sizeof(float), sizeof(int))) != 0)
+                return false;
+            fixed (byte* src = source)
+            {
+                float* conv = (float*)src;
+                float* delta = (float*)(src + (long)convFloats * sizeof(float) + sizeof(int));
+                _mlxGdnCache[layer].ImportState(conv, convTail, qkvDim, delta, _numVHeads, _headVDim, _headKDim);
+            }
             read = (int)total;
             return true;
         }
@@ -1890,6 +1943,8 @@ namespace TensorSharp.Models
             // whose offset is baked into this one-shot prefill graph. The latter
             // mirrors llama.cpp's linear KV-store path without relying on Metal's
             // problematic multi-dimensional set_rows shape.
+            if (_backend == BackendType.Mlx)
+                return MlxWholeGraphNote();
             if (_backend != BackendType.GgmlCuda && _backend != BackendType.GgmlVulkan
                     && _backend != BackendType.GgmlMetal)
                 return FvBail($"backend {_backend} has no whole-model prefill graph");
@@ -2829,10 +2884,10 @@ namespace TensorSharp.Models
                 if (l < 0)
                     continue;
 
+                // Full-attention layers keep K/V in the model's cache tensors, which
+                // later layers' outputs depend on; only the recurrent state stands apart.
                 if (_isRecurrent[l])
                     evaluated |= _mlxGdnCache?[l]?.TryEvaluateState() == true;
-                else
-                    evaluated |= _mlxAttentionCache?[l]?.TryEvaluateState() == true;
             }
 
             if (evaluated)
@@ -3148,25 +3203,14 @@ namespace TensorSharp.Models
                 // per-token Metal command buffer setup costs more than the saved compute.
                 bool flashOk = false;
                 bool cacheCopied = false;
-                if (_backend == BackendType.Mlx
-                    && headDim == 256
-                    && _mlxAttentionCache?[layer] != null
-                    && _mlxAttentionCache[layer].Length == startPos)
+                if (_backend == BackendType.Mlx && MlxCachedAttention)
                 {
-                    using Tensor qHeads = qTensor.View(numHeads, 1, headDim);
-                    using Tensor kHeads = kTensor.View(numKVHeads, 1, headDim);
-                    using Tensor vHeads = vTensor.View(numKVHeads, 1, headDim);
-                    flashOk = _mlxAttentionCache[layer].TryAttentionHeadDim256(
-                        attnOutput,
-                        qHeads,
-                        kHeads,
-                        vHeads,
-                        numHeads,
-                        numKVHeads,
-                        1,
-                        startPos,
-                        causal: true);
-                    cacheCopied = flashOk;
+                    CopyToCacheDecode(_kvCacheK[layer], kTensor, _kvCacheV[layer], vTensor,
+                        numKVHeads, headDim, startPos);
+                    cacheCopied = true;
+                    flashOk = MlxFusedOps.TryCachedAttention(
+                        attnOutput, qTensor, _kvCacheK[layer], _kvCacheV[layer],
+                        numHeads, numKVHeads, headDim, 1, totalSeqLen, attentionScale);
                 }
                 else if (IsGgmlBackend && totalSeqLen >= FlashAttnDecodeMinSeqLen)
                 {
@@ -3233,49 +3277,33 @@ namespace TensorSharp.Models
                 // ggml_mul_mat_id dispatch. Restrict the continuation fast path to F32
                 // caches and fall back to ExpandKVHeads (which handles F16) otherwise.
                 bool usedFusedAttn = false;
-                bool usedMlxAttentionCache = false;
+                bool cacheWritten = false;
                 bool kvCacheIsF32 = _kvCacheK[layer].ElementType == DType.Float32
                     && _kvCacheV[layer].ElementType == DType.Float32;
                 bool canFuseContinuation = kvCacheIsF32 || startPos == 0;
-                if (_backend == BackendType.Mlx
-                    && headDim == 256
-                    && _mlxAttentionCache?[layer] != null
-                    && _mlxAttentionCache[layer].Length == startPos)
+                if (_backend == BackendType.Mlx && MlxCachedAttention)
                 {
-                    Tensor qHeadsForAttn = null;
-                    try
+                    // Write first, then attend over the cache: every chunk of a chunked
+                    // prefill, not just the first, stays on the device.
+                    CopyToCache(_kvCacheK[layer], kHeads, startPos, seqLen);
+                    CopyToCache(_kvCacheV[layer], vHeads, startPos, seqLen);
+                    cacheWritten = true;
+                    attnOutput = new Tensor(_allocator, DType.Float32, seqLen, numHeads * headDim);
+                    if (MlxFusedOps.TryCachedAttention(
+                        attnOutput, qTensor, _kvCacheK[layer], _kvCacheV[layer],
+                        numHeads, numKVHeads, headDim, seqLen, totalSeqLen, attentionScale))
                     {
-                        attnOutput = new Tensor(_allocator, DType.Float32, seqLen, numHeads * headDim);
-                        qHeadsForAttn = ReshapeToHeads(qTensor, numHeads, seqLen, headDim);
-                        if (_mlxAttentionCache[layer].TryAttentionHeadDim256(
-                            attnOutput,
-                            qHeadsForAttn,
-                            kHeads,
-                            vHeads,
-                            numHeads,
-                            numKVHeads,
-                            seqLen,
-                            startPos,
-                            causal: true))
-                        {
-                            usedFusedAttn = true;
-                            usedMlxAttentionCache = true;
-                            qTensor.Dispose();
-                            kTensor.Dispose();
-                            vTensor.Dispose();
-                        }
-                        else
-                        {
-                            attnOutput.Dispose();
-                            attnOutput = null;
-                        }
+                        usedFusedAttn = true;
+                        qTensor.Dispose();
+                        kTensor.Dispose();
+                        vTensor.Dispose();
                     }
-                    finally
+                    else
                     {
-                        qHeadsForAttn?.Dispose();
+                        attnOutput.Dispose();
+                        attnOutput = null;
                     }
                 }
-
                 bool tryMlxPrefillAttention = _backend == BackendType.Mlx
                     && !usedFusedAttn
                     && (headDim <= 128
@@ -3313,7 +3341,7 @@ namespace TensorSharp.Models
                 // Write to KV cache after the MLX prefill-attention attempt. The
                 // default MLX cache copy uses host pointers for short prompts; doing
                 // that before attention dirties K/V and forces a re-upload.
-                if (!usedMlxAttentionCache)
+                if (!cacheWritten)
                 {
                     CopyToCache(_kvCacheK[layer], kHeads, startPos, seqLen);
                     CopyToCache(_kvCacheV[layer], vHeads, startPos, seqLen);
@@ -3875,6 +3903,63 @@ namespace TensorSharp.Models
                         _linearTicks += Stopwatch.GetTimestamp() - t0;
                         WarnFusedFfnDeclinedOnce(ex.Message);
                     }
+                }
+            }
+
+            // MLX analogue: the whole prefill FFN in one half-precision sub-graph
+            // (MlxQuantizedOps.TryRmsNormSwiGluAddHalf), residual updated in place.
+            if (seqLen > 1
+                && _backend == BackendType.Mlx
+                && postNormW != null
+                && _ffnGateUpQW[layer] != null
+                && _ffnDownQW[layer] != null
+                && _ffnGateUpQW[layer].Scale == 1.0f
+                && _ffnDownQW[layer].Scale == 1.0f
+                && residual.DimensionCount == 2
+                && residual.Sizes[0] == seqLen)
+            {
+                QuantizedWeight gateUpW = _ffnGateUpQW[layer];
+                QuantizedWeight downW = _ffnDownQW[layer];
+                int halfDimFused = intermSize > 0 ? intermSize : (int)(gateUpW.Ne1 / 2);
+                long t0 = Stopwatch.GetTimestamp();
+                if (MlxQuantizedOps.TryRmsNormSwiGluAddHalf(
+                    residual, postNormW, Config.Eps, halfDimFused,
+                    gateUpW.EnsureDeviceCacheKey(), gateUpW.Data, gateUpW.GgmlType, gateUpW.Ne0, gateUpW.Ne1, gateUpW.RawBytes,
+                    downW.EnsureDeviceCacheKey(), downW.Data, downW.GgmlType, downW.Ne0, downW.Ne1, downW.RawBytes))
+                {
+                    _linearTicks += Stopwatch.GetTimestamp() - t0;
+                    return null;
+                }
+            }
+
+            // The same for a mixed-quant gate/up pair MLX keeps as two weights (see
+            // ModelBase.KeepMixedGateUpSplitOnMlx): each projection in its own format, the
+            // SwiGLU in F16 between them.
+            if (seqLen > 1
+                && _backend == BackendType.Mlx
+                && postNormW != null
+                && _ffnGateUpQW[layer] == null
+                && _ffnGateSplitQW[layer] != null
+                && _ffnUpSplitQW[layer] != null
+                && _ffnDownQW[layer] != null
+                && _ffnGateSplitQW[layer].Scale == 1.0f
+                && _ffnUpSplitQW[layer].Scale == 1.0f
+                && _ffnDownQW[layer].Scale == 1.0f
+                && residual.DimensionCount == 2
+                && residual.Sizes[0] == seqLen)
+            {
+                QuantizedWeight gateW = _ffnGateSplitQW[layer];
+                QuantizedWeight upW = _ffnUpSplitQW[layer];
+                QuantizedWeight downW = _ffnDownQW[layer];
+                long t0 = Stopwatch.GetTimestamp();
+                if (MlxQuantizedOps.TryRmsNormSwiGluAddHalfSplit(
+                    residual, postNormW, Config.Eps,
+                    gateW.EnsureDeviceCacheKey(), gateW.Data, gateW.GgmlType, gateW.Ne0, gateW.Ne1, gateW.RawBytes,
+                    upW.EnsureDeviceCacheKey(), upW.Data, upW.GgmlType, upW.Ne0, upW.Ne1, upW.RawBytes,
+                    downW.EnsureDeviceCacheKey(), downW.Data, downW.GgmlType, downW.Ne0, downW.Ne1, downW.RawBytes))
+                {
+                    _linearTicks += Stopwatch.GetTimestamp() - t0;
+                    return null;
                 }
             }
 
@@ -6510,8 +6595,6 @@ namespace TensorSharp.Models
                 foreach (var t in _kvCacheK) t?.Dispose();
             if (_kvCacheV != null)
                 foreach (var t in _kvCacheV) t?.Dispose();
-            if (_mlxAttentionCache != null)
-                foreach (var cache in _mlxAttentionCache) cache?.Dispose();
 
             DisposeGdnState();
             DisposeTpState();
