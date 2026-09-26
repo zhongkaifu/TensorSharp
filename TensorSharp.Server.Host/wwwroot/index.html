@@ -630,6 +630,7 @@ button.primary:hover { background: var(--accent-hover); }
 
 .attachments {
   display: flex;
+  align-items: center;
   gap: 8px;
   margin-bottom: 8px;
   max-width: var(--chat-shell-max-width);
@@ -648,6 +649,15 @@ button.primary:hover { background: var(--accent-hover); }
   border-radius: 20px;
   font-size: 12px;
   color: var(--text2);
+  max-width: 100%;
+}
+
+/* A long unbroken file name must not push the remove control off-screen. */
+.attachment-chip .label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .attachment-chip img {
@@ -662,7 +672,80 @@ button.primary:hover { background: var(--accent-hover); }
   color: var(--danger);
   font-size: 14px;
   margin-left: 2px;
+  padding: 0;
+  border: none;
+  background: none;
+  font-family: inherit;
+  line-height: 1;
 }
+
+.attachment-chip .remove:hover { background: none; }
+
+/* A pending image, video or scanned PDF is shown as a thumbnail rather than a name
+   chip. The name stays in the tile's tooltip and alt text. Top left, .kind marks a
+   video or a PDF; bottom left, .badge is the "Picture N" order a multi-image edit
+   prompt refers to, or a scanned PDF's page count. */
+.attachment-thumb {
+  position: relative;
+  flex: 0 0 auto;
+  width: 64px;
+  height: 64px;
+  border-radius: 10px;
+  overflow: hidden;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+}
+
+.attachment-thumb img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.attachment-thumb .remove,
+.attachment-thumb .kind,
+.attachment-thumb .badge {
+  position: absolute;
+  height: 20px;
+  min-width: 20px;
+  border-radius: 10px;
+  background: rgba(0, 0, 0, 0.65);
+  color: #fff;
+  line-height: 20px;
+  text-align: center;
+}
+
+.attachment-thumb .remove {
+  top: 3px;
+  right: 3px;
+  padding: 0;
+  border: none;
+  font-size: 14px;
+  font-family: inherit;
+}
+
+.attachment-thumb .remove:hover { background: var(--danger); }
+
+.attachment-thumb .kind,
+.attachment-thumb .badge {
+  left: 3px;
+  max-width: calc(100% - 6px);
+  padding: 0 5px;
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  pointer-events: none;
+}
+
+.attachment-thumb .kind { top: 3px; }
+
+.attachment-thumb .badge { bottom: 3px; }
+
+/* A page's heading starts at its top left; centring the crop would cut off the
+   top of a portrait page and the left edge of a landscape one. */
+.attachment-thumb.page img { object-position: left top; }
 
 .empty-state {
   flex: 1;
@@ -1429,7 +1512,7 @@ async function uploadOneFile(file) {
         alert(data.warning);
       } else if (data.renderedAsImages && data.frameUrls) {
         // A complete scanned / image-only PDF was recovered as page images.
-        // The attachment chip keeps the page count visible.
+        // The attachment tile's badge keeps the page count visible.
       }
     } else {
       alert('Upload failed: ' + data.error);
@@ -1439,33 +1522,114 @@ async function uploadOneFile(file) {
   }
 }
 
+// The file name is the client's own and can contain markup, so these builders
+// assign textContent and attributes rather than interpolating into innerHTML.
 function renderAttachments() {
+  // Rebuilding the strip destroys a focused remove control; a keyboard user keeps
+  // their place on the control now in the same slot, or the message box.
+  const focusSlot = Array.from(attachmentsDiv.querySelectorAll('.remove')).indexOf(document.activeElement);
   attachmentsDiv.innerHTML = '';
   let imageNum = 0;
   const totalImages = pendingAttachments.filter(a => a.mediaType === 'image').length;
   pendingAttachments.forEach((att, idx) => {
-    const chip = document.createElement('div');
-    chip.className = 'attachment-chip';
-    let icon = '&#x1F4C4;';
-    let label = att.fileName;
+    const name = String(att.fileName || att.file || '');
+    let icon = '\u{1F4C4}';
+    let label = name;
+    // What a thumbnail tile shows in place of the chip: the picture itself, a
+    // clip's first extracted frame, or a scanned PDF's first page image. Audio,
+    // text, a PDF with a text layer, and a scanned PDF the server could not render
+    // (no vision model, or no page image recovered) have nothing to show and stay
+    // chips. kind marks the tile top-left and badge bottom-left; title is also the
+    // alt text, so it says everything the two marks do.
+    let thumb = null;
     if (att.mediaType === 'image') {
-      icon = '&#x1F5BC;';
       // With several images attached, show the "Picture N" order the edit prompt can reference.
       imageNum++;
-      if (totalImages > 1) label = `${imageNum}⃣ ${att.fileName}`;
-    }
-    else if (att.mediaType === 'video') icon = '&#x1F3AC;';
-    else if (att.mediaType === 'audio') icon = '&#x1F3B5;';
-    else if (att.mediaType === 'text') icon = '&#x1F4DD;';
-    else if (att.mediaType === 'pdf') {
-      icon = '&#x1F4C4;';
-      if (att.renderedAsImages && Number.isInteger(att.extractedPageCount) && Number.isInteger(att.pageCount)) {
-        label = `${att.fileName} (${att.extractedPageCount}/${att.pageCount} pages)`;
+      const order = totalImages > 1 ? imageNum : 0;
+      icon = '\u{1F5BC}';
+      if (order) label = `${order}⃣ ${name}`;
+      thumb = { url: uploadUrlForAttachment(att), badge: order ? String(order) : '',
+        title: order ? `Picture ${order}: ${name}` : name, removeTitle: 'Remove this image' };
+    } else if (att.mediaType === 'video') {
+      icon = '\u{1F3AC}';
+      thumb = { url: (att.frameUrls && att.frameUrls[0]) || '', kind: '▶',
+        title: `Video: ${name}`, removeTitle: 'Remove this video' };
+    } else if (att.mediaType === 'audio') icon = '\u{1F3B5}';
+    else if (att.mediaType === 'text') icon = '\u{1F4DD}';
+    else if (att.mediaType === 'pdf' && att.renderedAsImages) {
+      let pages = '';
+      if (Number.isInteger(att.extractedPageCount) && Number.isInteger(att.pageCount)) {
+        pages = `${att.extractedPageCount}/${att.pageCount}`;
+        label = `${name} (${pages} pages)`;
       }
+      // The bare count fits the badge up to 999/999; a "PDF " prefix would cut off
+      // any two-digit count.
+      thumb = { url: (att.frameUrls && att.frameUrls[0]) || '', kind: 'PDF', badge: pages,
+        title: `Scanned PDF: ${label}`, removeTitle: 'Remove this PDF', page: true };
     }
-    chip.innerHTML = `${icon} ${label} <span class="remove" onclick="removeAttachment(${idx})">&times;</span>`;
-    attachmentsDiv.appendChild(chip);
+    const chip = () => buildAttachmentChip(icon, label, idx, name);
+    attachmentsDiv.appendChild(thumb && thumb.url && !att.thumbFailed
+      ? buildAttachmentThumb(att, idx, name, thumb, chip)
+      : chip());
   });
+  if (focusSlot >= 0) {
+    const removes = attachmentsDiv.querySelectorAll('.remove');
+    (removes[Math.min(focusSlot, removes.length - 1)] || messageInput).focus();
+  }
+}
+
+function buildAttachmentChip(icon, label, idx, name) {
+  const chip = document.createElement('div');
+  chip.className = 'attachment-chip';
+  const text = document.createElement('span');
+  text.className = 'label';
+  text.textContent = icon + ' ' + label;
+  text.title = label;
+  chip.appendChild(text);
+  chip.appendChild(buildAttachmentRemove(idx, name, 'Remove this attachment'));
+  return chip;
+}
+
+function buildAttachmentRemove(idx, name, title) {
+  const remove = document.createElement('button');
+  remove.type = 'button';
+  remove.className = 'remove';
+  remove.textContent = '×';
+  remove.title = title;
+  remove.setAttribute('aria-label', 'Remove ' + name);
+  remove.addEventListener('click', () => removeAttachment(idx));
+  return remove;
+}
+
+// thumb is renderAttachments' { url, kind, badge, title, removeTitle, page } and
+// chip builds the chip this tile stands in for.
+function buildAttachmentThumb(att, idx, name, thumb, chip) {
+  const tile = document.createElement('div');
+  tile.className = thumb.page ? 'attachment-thumb page' : 'attachment-thumb';
+  tile.title = thumb.title;
+  const img = document.createElement('img');
+  img.alt = thumb.title;
+  // An image that does not load (a HEIC whose server-side PNG preview failed,
+  // outside Safari, or a frame or page image that is gone) falls back to the name
+  // chip instead of an empty tile, and is remembered so later re-renders neither
+  // refetch it nor flash a tile.
+  img.addEventListener('error', () => {
+    att.thumbFailed = true;
+    tile.replaceWith(chip());
+  }, { once: true });
+  img.src = thumb.url;
+  tile.appendChild(img);
+  // The marks repeat what the alt text already says, so they are hidden from screen readers.
+  for (const [cls, text] of [['kind', thumb.kind], ['badge', thumb.badge]]) {
+    if (!text) continue;
+    const mark = document.createElement('span');
+    mark.className = cls;
+    mark.textContent = text;
+    mark.setAttribute('aria-hidden', 'true');
+    tile.appendChild(mark);
+  }
+  tile.appendChild(buildAttachmentRemove(idx, name, thumb.removeTitle));
+  return tile;
 }
 
 function removeAttachment(idx) {
