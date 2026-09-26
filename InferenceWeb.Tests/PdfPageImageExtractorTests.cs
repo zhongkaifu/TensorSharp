@@ -111,6 +111,27 @@ public class PdfPageImageExtractorTests
     }
 
     [Fact]
+    public void RasterBudgetRejectsBeforeWritingAndCancellationIsPreserved()
+    {
+        byte[] pdf = BuildImageOnlyPdf(1, w: 96, h: 64);
+        string dir = Path.Combine(Path.GetTempPath(), $"ts-pdfimg-{Guid.NewGuid():N}");
+        try
+        {
+            var error = Assert.Throws<InvalidDataException>(() =>
+                PdfPageImageExtractor.ExtractPageImagesFromBytes(pdf, dir, 0, null, null, maxImagePixels: 96 * 64 - 1, cancellationToken: default));
+            Assert.Contains("pixels", error.Message);
+            Assert.Empty(Directory.GetFiles(dir));
+            var result = PdfPageImageExtractor.ExtractPageImagesFromBytes(pdf, dir, 0, null, null, maxImagePixels: 96 * 64, cancellationToken: default);
+            Assert.Single(result.ImagePaths);
+            using var cancellation = new System.Threading.CancellationTokenSource();
+            cancellation.Cancel();
+            Assert.ThrowsAny<OperationCanceledException>(() =>
+                PdfPageImageExtractor.ExtractPageImagesFromBytes(pdf, dir, 0, null, null, 0, cancellationToken: cancellation.Token));
+        }
+        finally { if (Directory.Exists(dir)) Directory.Delete(dir, recursive: true); }
+    }
+
+    [Fact]
     public void ImageAndTextPdf_IsNotTextless()
     {
         byte[] pdf = BuildImageAndTextPdf("BornDigitalWithFigure");

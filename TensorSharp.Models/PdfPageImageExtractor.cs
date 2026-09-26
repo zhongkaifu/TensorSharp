@@ -11,6 +11,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Text;
+using System.Threading;
 using UglyToad.PdfPig;
 using UglyToad.PdfPig.Content;
 
@@ -48,14 +49,22 @@ namespace TensorSharp.Models
         /// <summary>Extracts page images from a PDF on disk. See <see cref="ExtractPageImagesFromBytes"/>.</summary>
         public static PdfImageResult ExtractPageImages(
             string pdfPath, string outputDirectory, int maxPages = 0, string namePrefix = null, string password = null)
+            => ExtractPageImages(pdfPath, outputDirectory, maxPages, namePrefix, password, 0, default);
+
+        /// <summary>Extract page images with an optional raster budget (zero is unlimited),
+        /// checked before decoding, and cancellation between pages/images.</summary>
+        public static PdfImageResult ExtractPageImages(
+            string pdfPath, string outputDirectory, int maxPages, string namePrefix, string password,
+            long maxImagePixels, CancellationToken cancellationToken)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             if (string.IsNullOrEmpty(pdfPath))
                 throw new ArgumentNullException(nameof(pdfPath));
             if (!File.Exists(pdfPath))
                 throw new FileNotFoundException("PDF file not found.", pdfPath);
 
             byte[] bytes = File.ReadAllBytes(pdfPath);
-            return ExtractPageImagesFromBytes(bytes, outputDirectory, maxPages, namePrefix, password);
+            return ExtractPageImagesFromBytes(bytes, outputDirectory, maxPages, namePrefix, password, maxImagePixels, cancellationToken);
         }
 
         /// <summary>
@@ -70,7 +79,16 @@ namespace TensorSharp.Models
         /// <exception cref="InvalidDataException">The bytes are not a usable PDF.</exception>
         public static PdfImageResult ExtractPageImagesFromBytes(
             byte[] pdfBytes, string outputDirectory, int maxPages = 0, string namePrefix = null, string password = null)
+            => ExtractPageImagesFromBytes(pdfBytes, outputDirectory, maxPages, namePrefix, password, 0, default);
+
+        /// <summary>Byte-array extraction with a raster budget checked before decoding and
+        /// cancellation between pages/images. The legacy overload retains its unlimited budget.</summary>
+        public static PdfImageResult ExtractPageImagesFromBytes(
+            byte[] pdfBytes, string outputDirectory, int maxPages, string namePrefix, string password,
+            long maxImagePixels, CancellationToken cancellationToken)
         {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (maxImagePixels < 0) throw new ArgumentOutOfRangeException(nameof(maxImagePixels));
             if (pdfBytes == null || pdfBytes.Length == 0)
                 throw new ArgumentException("Empty PDF data.", nameof(pdfBytes));
             if (string.IsNullOrEmpty(outputDirectory))
@@ -101,11 +119,12 @@ namespace TensorSharp.Models
                 int limit = maxPages > 0 ? Math.Min(maxPages, total) : total;
                 for (int i = 1; i <= limit; i++)
                 {
+                    cancellationToken.ThrowIfCancellationRequested();
                     Page page;
                     try { page = document.GetPage(i); }
                     catch { continue; }
 
-                    if (TrySaveLargestImage(page, outputDirectory, prefix, i, out string savedPath))
+                    if (TrySaveLargestImage(page, outputDirectory, prefix, i, maxImagePixels, cancellationToken, out string savedPath))
                         paths.Add(savedPath);
                 }
 
@@ -122,7 +141,8 @@ namespace TensorSharp.Models
         // Falls back to the next-largest if the largest can't be decoded to PNG, so a page
         // isn't lost to one odd image encoding.
         private static bool TrySaveLargestImage(
-            Page page, string outputDirectory, string prefix, int pageNumber, out string savedPath)
+            Page page, string outputDirectory, string prefix, int pageNumber,
+            long maxImagePixels, CancellationToken cancellationToken, out string savedPath)
         {
             savedPath = null;
 
@@ -145,6 +165,13 @@ namespace TensorSharp.Models
 
             foreach (IPdfImage img in images)
             {
+                cancellationToken.ThrowIfCancellationRequested();
+                // Check the declared raster dimensions before decompressing a potentially
+                // tiny, highly-compressed image stream into a huge pixel allocation. Reject
+                // instead of falling back to a thumbnail that would omit the page evidence.
+                if (maxImagePixels > 0 && (img.WidthInSamples <= 0 || img.HeightInSamples <= 0 ||
+                    (long)img.WidthInSamples * img.HeightInSamples > maxImagePixels))
+                    throw new InvalidDataException($"PDF page {pageNumber} contains an image exceeding {maxImagePixels} pixels.");
                 byte[] png;
                 try
                 {
@@ -155,6 +182,8 @@ namespace TensorSharp.Models
                 {
                     continue;
                 }
+
+                cancellationToken.ThrowIfCancellationRequested();
 
                 string fileName = $"{prefix}_p{pageNumber:D3}.png";
                 string path = Path.Combine(outputDirectory, fileName);

@@ -46,6 +46,9 @@ namespace TensorSharp.Server.Hosting
                 [".m4a"] = ("audio", "audio/mp4"),
 
                 [".pdf"] = ("pdf", "application/pdf"),
+                [".docx"] = ("document", "application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+                [".xlsx"] = ("document", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+                [".pptx"] = ("document", "application/vnd.openxmlformats-officedocument.presentationml.presentation"),
 
                 [".txt"] = ("text", TextPlain),
                 [".csv"] = ("text", TextPlain),

@@ -1,0 +1,667 @@
+{
+  "version": 1,
+  "description": "Original tiny attachment integration quality screen. Labels are absent from state; decisions require file contents. Not representative task accuracy, video action recognition, or ASR word-error evaluation.",
+  "provenance": {
+    "documents": "Original synthetic support tickets. PDF has a real text layer; DOCX/XLSX/PPTX are minimal OpenXML packages with one paragraph/cell/slide. No macros or external links.",
+    "signal.png": "Existing original docs/examples/jev-traffic-light.json image, green lamp illuminated.",
+    "signal.mp4": "12 identical copies of signal.png encoded by OpenCV 5.0.0 mp4v at 6 fps; a 2 second visual ingestion check, not temporal reasoning.",
+    "ticket.wav": "macOS say Samantha at rate 150; afconvert to 16 kHz mono PCM16. Original transcript: The service is down with a software error. Fix it immediately. I am extremely angry."
+  },
+  "files": {
+    "signal.mp4": {
+      "sha256": "cb35be8e21190085ddd59200d4c684c5fa51e28b6ae3d89197e1c5b03f373f78",
+      "bytes": 9606
+    },
+    "signal.png": {
+      "sha256": "75d9f7d3095c44c43f44eb6c8da18b10cb78a58dfbd853b4d0a78c6f5c379d3a",
+      "bytes": 2173
+    },
+    "ticket.csv": {
+      "sha256": "032a52699cd6fdf7d6fe4e343ec0f287409801098bc40e9bdab592264ed6eae6",
+      "bytes": 111
+    },
+    "ticket.docx": {
+      "sha256": "37c7c2d7cace49690a24da4b9e684e9bc062ec41715fcac414cd1b0d698fb865",
+      "bytes": 1010
+    },
+    "ticket.html": {
+      "sha256": "8a18298c5f4390c50b7550d662de6729b56d53e116d5beee68701e98ca0c0aa9",
+      "bytes": 173
+    },
+    "ticket.json": {
+      "sha256": "92139fb0368c82cb1ae119a1af77309acdabaebf5526614f0dcb72499e3769d9",
+      "bytes": 120
+    },
+    "ticket.pdf": {
+      "sha256": "41d3059386b525ad2d41df6e600d44c735ebfdd3a997059a4cc3368154db4f3d",
+      "bytes": 722
+    },
+    "ticket.txt": {
+      "sha256": "256ae7607da7fcd34d92f8436d96199097578c7c21c1ab7ca22d34004de3bbb7",
+      "bytes": 101
+    },
+    "ticket.wav": {
+      "sha256": "fe5169012373354454e7a4acad7f48b889b0ef7a76321d4d8ecd75f80a9503fd",
+      "bytes": 191246
+    },
+    "outage.txt": {
+      "sha256": "413bd65ba7345147399d6e716ee76cc899b5939e0a95a716fdeabe8d58792d04",
+      "bytes": 85
+    },
+    "ticket.xlsx": {
+      "sha256": "7b9bfeaaa760eed42c276b3c7058898e6b2572148d4330c1e928a17481ea7cd8",
+      "bytes": 1440
+    },
+    "ticket.pptx": {
+      "sha256": "b674e5cb91fa83ebfd06ac591266673fad35d6f2a40d1abe2e5eb80baa3c0eef",
+      "bytes": 1654
+    }
+  },
+  "cases": [
+    {
+      "id": "txt",
+      "requires": [],
+      "attachments": [
+        {
+          "field": "files",
+          "path": "ticket.txt",
+          "kind": "text"
+        }
+      ],
+      "questions": {
+        "department": {
+          "type": "choice",
+          "instructions": "Which team should handle the customer's stated request?",
+          "criteria": {
+            "billing": "Invoices, charges, payments, or refunds",
+            "technical": "Software defects, errors, or unavailable services",
+            "sales": "Buying a new subscription or asking about pricing"
+          }
+        },
+        "urgent": {
+          "type": "noul",
+          "instructions": "Does the customer explicitly request immediate action?",
+          "criteria": {
+            "true": "The customer explicitly asks for action now or immediately.",
+            "false": "The customer says it is not urgent or that there is no hurry."
+          }
+        },
+        "frustration": {
+          "type": "score",
+          "instructions": "Use the customer's explicitly stated emotional state.",
+          "criteria": [
+            "Calm and not upset",
+            "Frustrated but polite",
+            "Extremely angry"
+          ]
+        }
+      },
+      "expected": {
+        "department": "billing",
+        "urgent": false,
+        "frustration": 0
+      }
+    },
+    {
+      "id": "outage",
+      "requires": [],
+      "attachments": [
+        {
+          "field": "files",
+          "path": "outage.txt",
+          "kind": "text"
+        }
+      ],
+      "questions": {
+        "department": {
+          "type": "choice",
+          "instructions": "Which team should handle the customer's stated request?",
+          "criteria": {
+            "billing": "Invoices, charges, payments, or refunds",
+            "technical": "Software defects, errors, or unavailable services",
+            "sales": "Buying a new subscription or asking about pricing"
+          }
+        },
+        "urgent": {
+          "type": "noul",
+          "instructions": "Does the customer explicitly request immediate action?",
+          "criteria": {
+            "true": "The customer explicitly asks for action now or immediately.",
+            "false": "The customer says it is not urgent or that there is no hurry."
+          }
+        },
+        "frustration": {
+          "type": "score",
+          "instructions": "Use the customer's explicitly stated emotional state.",
+          "criteria": [
+            "Calm and not upset",
+            "Frustrated but polite",
+            "Extremely angry"
+          ]
+        }
+      },
+      "expected": {
+        "department": "technical",
+        "urgent": true,
+        "frustration": 2
+      }
+    },
+    {
+      "id": "csv",
+      "requires": [],
+      "attachments": [
+        {
+          "field": "files",
+          "path": "ticket.csv",
+          "kind": "text"
+        }
+      ],
+      "questions": {
+        "department": {
+          "type": "choice",
+          "instructions": "Which team should handle the customer's stated request?",
+          "criteria": {
+            "billing": "Invoices, charges, payments, or refunds",
+            "technical": "Software defects, errors, or unavailable services",
+            "sales": "Buying a new subscription or asking about pricing"
+          }
+        },
+        "urgent": {
+          "type": "noul",
+          "instructions": "Does the customer explicitly request immediate action?",
+          "criteria": {
+            "true": "The customer explicitly asks for action now or immediately.",
+            "false": "The customer says it is not urgent or that there is no hurry."
+          }
+        },
+        "frustration": {
+          "type": "score",
+          "instructions": "Use the customer's explicitly stated emotional state.",
+          "criteria": [
+            "Calm and not upset",
+            "Frustrated but polite",
+            "Extremely angry"
+          ]
+        }
+      },
+      "expected": {
+        "department": "billing",
+        "urgent": false,
+        "frustration": 0
+      }
+    },
+    {
+      "id": "json",
+      "requires": [],
+      "attachments": [
+        {
+          "field": "files",
+          "path": "ticket.json",
+          "kind": "text"
+        }
+      ],
+      "questions": {
+        "department": {
+          "type": "choice",
+          "instructions": "Which team should handle the customer's stated request?",
+          "criteria": {
+            "billing": "Invoices, charges, payments, or refunds",
+            "technical": "Software defects, errors, or unavailable services",
+            "sales": "Buying a new subscription or asking about pricing"
+          }
+        },
+        "urgent": {
+          "type": "noul",
+          "instructions": "Does the customer explicitly request immediate action?",
+          "criteria": {
+            "true": "The customer explicitly asks for action now or immediately.",
+            "false": "The customer says it is not urgent or that there is no hurry."
+          }
+        },
+        "frustration": {
+          "type": "score",
+          "instructions": "Use the customer's explicitly stated emotional state.",
+          "criteria": [
+            "Calm and not upset",
+            "Frustrated but polite",
+            "Extremely angry"
+          ]
+        }
+      },
+      "expected": {
+        "department": "billing",
+        "urgent": false,
+        "frustration": 0
+      }
+    },
+    {
+      "id": "html",
+      "requires": [],
+      "attachments": [
+        {
+          "field": "files",
+          "path": "ticket.html",
+          "kind": "text"
+        }
+      ],
+      "questions": {
+        "department": {
+          "type": "choice",
+          "instructions": "Which team should handle the customer's stated request?",
+          "criteria": {
+            "billing": "Invoices, charges, payments, or refunds",
+            "technical": "Software defects, errors, or unavailable services",
+            "sales": "Buying a new subscription or asking about pricing"
+          }
+        },
+        "urgent": {
+          "type": "noul",
+          "instructions": "Does the customer explicitly request immediate action?",
+          "criteria": {
+            "true": "The customer explicitly asks for action now or immediately.",
+            "false": "The customer says it is not urgent or that there is no hurry."
+          }
+        },
+        "frustration": {
+          "type": "score",
+          "instructions": "Use the customer's explicitly stated emotional state.",
+          "criteria": [
+            "Calm and not upset",
+            "Frustrated but polite",
+            "Extremely angry"
+          ]
+        }
+      },
+      "expected": {
+        "department": "billing",
+        "urgent": false,
+        "frustration": 0
+      }
+    },
+    {
+      "id": "pdf",
+      "requires": [],
+      "attachments": [
+        {
+          "field": "documents",
+          "path": "ticket.pdf",
+          "kind": "pdf"
+        }
+      ],
+      "questions": {
+        "department": {
+          "type": "choice",
+          "instructions": "Which team should handle the customer's stated request?",
+          "criteria": {
+            "billing": "Invoices, charges, payments, or refunds",
+            "technical": "Software defects, errors, or unavailable services",
+            "sales": "Buying a new subscription or asking about pricing"
+          }
+        },
+        "urgent": {
+          "type": "noul",
+          "instructions": "Does the customer explicitly request immediate action?",
+          "criteria": {
+            "true": "The customer explicitly asks for action now or immediately.",
+            "false": "The customer says it is not urgent or that there is no hurry."
+          }
+        },
+        "frustration": {
+          "type": "score",
+          "instructions": "Use the customer's explicitly stated emotional state.",
+          "criteria": [
+            "Calm and not upset",
+            "Frustrated but polite",
+            "Extremely angry"
+          ]
+        }
+      },
+      "expected": {
+        "department": "billing",
+        "urgent": false,
+        "frustration": 0
+      }
+    },
+    {
+      "id": "docx",
+      "requires": [],
+      "attachments": [
+        {
+          "field": "documents",
+          "path": "ticket.docx",
+          "kind": "document"
+        }
+      ],
+      "questions": {
+        "department": {
+          "type": "choice",
+          "instructions": "Which team should handle the customer's stated request?",
+          "criteria": {
+            "billing": "Invoices, charges, payments, or refunds",
+            "technical": "Software defects, errors, or unavailable services",
+            "sales": "Buying a new subscription or asking about pricing"
+          }
+        },
+        "urgent": {
+          "type": "noul",
+          "instructions": "Does the customer explicitly request immediate action?",
+          "criteria": {
+            "true": "The customer explicitly asks for action now or immediately.",
+            "false": "The customer says it is not urgent or that there is no hurry."
+          }
+        },
+        "frustration": {
+          "type": "score",
+          "instructions": "Use the customer's explicitly stated emotional state.",
+          "criteria": [
+            "Calm and not upset",
+            "Frustrated but polite",
+            "Extremely angry"
+          ]
+        }
+      },
+      "expected": {
+        "department": "billing",
+        "urgent": false,
+        "frustration": 0
+      }
+    },
+    {
+      "id": "xlsx",
+      "requires": [],
+      "attachments": [
+        {
+          "field": "documents",
+          "path": "ticket.xlsx",
+          "kind": "document"
+        }
+      ],
+      "questions": {
+        "department": {
+          "type": "choice",
+          "instructions": "Which team should handle the customer's stated request?",
+          "criteria": {
+            "billing": "Invoices, charges, payments, or refunds",
+            "technical": "Software defects, errors, or unavailable services",
+            "sales": "Buying a new subscription or asking about pricing"
+          }
+        },
+        "urgent": {
+          "type": "noul",
+          "instructions": "Does the customer explicitly request immediate action?",
+          "criteria": {
+            "true": "The customer explicitly asks for action now or immediately.",
+            "false": "The customer says it is not urgent or that there is no hurry."
+          }
+        },
+        "frustration": {
+          "type": "score",
+          "instructions": "Use the customer's explicitly stated emotional state.",
+          "criteria": [
+            "Calm and not upset",
+            "Frustrated but polite",
+            "Extremely angry"
+          ]
+        }
+      },
+      "expected": {
+        "department": "billing",
+        "urgent": false,
+        "frustration": 0
+      }
+    },
+    {
+      "id": "pptx",
+      "requires": [],
+      "attachments": [
+        {
+          "field": "documents",
+          "path": "ticket.pptx",
+          "kind": "document"
+        }
+      ],
+      "questions": {
+        "department": {
+          "type": "choice",
+          "instructions": "Which team should handle the customer's stated request?",
+          "criteria": {
+            "billing": "Invoices, charges, payments, or refunds",
+            "technical": "Software defects, errors, or unavailable services",
+            "sales": "Buying a new subscription or asking about pricing"
+          }
+        },
+        "urgent": {
+          "type": "noul",
+          "instructions": "Does the customer explicitly request immediate action?",
+          "criteria": {
+            "true": "The customer explicitly asks for action now or immediately.",
+            "false": "The customer says it is not urgent or that there is no hurry."
+          }
+        },
+        "frustration": {
+          "type": "score",
+          "instructions": "Use the customer's explicitly stated emotional state.",
+          "criteria": [
+            "Calm and not upset",
+            "Frustrated but polite",
+            "Extremely angry"
+          ]
+        }
+      },
+      "expected": {
+        "department": "billing",
+        "urgent": false,
+        "frustration": 0
+      }
+    },
+    {
+      "id": "image",
+      "requires": [
+        "vision"
+      ],
+      "attachments": [
+        {
+          "field": "files",
+          "path": "signal.png",
+          "kind": "image"
+        }
+      ],
+      "questions": {
+        "signal": {
+          "type": "choice",
+          "instructions": "Which traffic-light lamp is brightly illuminated in the attached picture or video?",
+          "criteria": {
+            "red": "The red lamp is lit",
+            "yellow": "The yellow lamp is lit",
+            "green": "The green lamp is lit"
+          }
+        },
+        "stop": {
+          "type": "noul",
+          "instructions": "Does the illuminated lamp tell the approaching vehicle to stop?"
+        }
+      },
+      "expected": {
+        "signal": "green",
+        "stop": false
+      }
+    },
+    {
+      "id": "video",
+      "requires": [
+        "vision"
+      ],
+      "attachments": [
+        {
+          "field": "videos",
+          "path": "signal.mp4",
+          "kind": "video"
+        }
+      ],
+      "questions": {
+        "signal": {
+          "type": "choice",
+          "instructions": "Which traffic-light lamp is brightly illuminated in the attached picture or video?",
+          "criteria": {
+            "red": "The red lamp is lit",
+            "yellow": "The yellow lamp is lit",
+            "green": "The green lamp is lit"
+          }
+        },
+        "stop": {
+          "type": "noul",
+          "instructions": "Does the illuminated lamp tell the approaching vehicle to stop?"
+        }
+      },
+      "expected": {
+        "signal": "green",
+        "stop": false
+      }
+    },
+    {
+      "id": "audio",
+      "requires": [
+        "audio"
+      ],
+      "attachments": [
+        {
+          "field": "audios",
+          "path": "ticket.wav",
+          "kind": "audio"
+        }
+      ],
+      "questions": {
+        "department": {
+          "type": "choice",
+          "instructions": "Which team should handle the customer's stated request?",
+          "criteria": {
+            "billing": "Invoices, charges, payments, or refunds",
+            "technical": "Software defects, errors, or unavailable services",
+            "sales": "Buying a new subscription or asking about pricing"
+          }
+        },
+        "urgent": {
+          "type": "noul",
+          "instructions": "Does the customer explicitly request immediate action?",
+          "criteria": {
+            "true": "The customer explicitly asks for action now or immediately.",
+            "false": "The customer says it is not urgent or that there is no hurry."
+          }
+        },
+        "frustration": {
+          "type": "score",
+          "instructions": "Use the customer's explicitly stated emotional state.",
+          "criteria": [
+            "Calm and not upset",
+            "Frustrated but polite",
+            "Extremely angry"
+          ]
+        }
+      },
+      "expected": {
+        "department": "technical",
+        "urgent": true,
+        "frustration": 2
+      }
+    },
+    {
+      "id": "mixed",
+      "requires": [
+        "vision",
+        "audio"
+      ],
+      "attachments": [
+        {
+          "field": "documents",
+          "path": "ticket.pdf",
+          "kind": "pdf"
+        },
+        {
+          "field": "videos",
+          "path": "signal.mp4",
+          "kind": "video"
+        },
+        {
+          "field": "audios",
+          "path": "ticket.wav",
+          "kind": "audio"
+        }
+      ],
+      "questions": {
+        "document_team": {
+          "type": "choice",
+          "instructions": "Which team should handle the customer request in ticket.pdf? Do not use the audio transcript.",
+          "criteria": {
+            "billing": "Invoices, charges, payments, or refunds",
+            "technical": "Software defects, errors, or unavailable services",
+            "sales": "Buying a new subscription or asking about pricing"
+          }
+        },
+        "audio_team": {
+          "type": "choice",
+          "instructions": "Which team should handle the customer request in the audio transcript of ticket.wav? Do not use the PDF document.",
+          "criteria": {
+            "billing": "Invoices, charges, payments, or refunds",
+            "technical": "Software defects, errors, or unavailable services",
+            "sales": "Buying a new subscription or asking about pricing"
+          }
+        },
+        "signal": {
+          "type": "choice",
+          "instructions": "Which traffic-light lamp is brightly illuminated in the attached picture or video?",
+          "criteria": {
+            "red": "The red lamp is lit",
+            "yellow": "The yellow lamp is lit",
+            "green": "The green lamp is lit"
+          }
+        }
+      },
+      "expected": {
+        "document_team": "billing",
+        "audio_team": "technical",
+        "signal": "green"
+      }
+    },
+    {
+      "id": "plain-control",
+      "requires": [],
+      "attachments": [],
+      "questions": {
+        "department": {
+          "type": "choice",
+          "instructions": "Which team should handle the customer's stated request?",
+          "criteria": {
+            "billing": "Invoices, charges, payments, or refunds",
+            "technical": "Software defects, errors, or unavailable services",
+            "sales": "Buying a new subscription or asking about pricing"
+          }
+        },
+        "urgent": {
+          "type": "noul",
+          "instructions": "Does the customer explicitly request immediate action?",
+          "criteria": {
+            "true": "The customer explicitly asks for action now or immediately.",
+            "false": "The customer says it is not urgent or that there is no hurry."
+          }
+        },
+        "frustration": {
+          "type": "score",
+          "instructions": "Use the customer's explicitly stated emotional state.",
+          "criteria": [
+            "Calm and not upset",
+            "Frustrated but polite",
+            "Extremely angry"
+          ]
+        }
+      },
+      "expected": {
+        "department": "sales",
+        "urgent": false,
+        "frustration": 1
+      },
+      "state": {
+        "message": "I want to buy a new subscription and need pricing. I am frustrated but polite. There is no hurry."
+      }
+    }
+  ]
+}

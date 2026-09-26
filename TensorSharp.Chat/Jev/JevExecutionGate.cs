@@ -14,7 +14,10 @@ internal sealed class JevExecutionGate(int capacity)
     private int _admitted;
     private bool _stopped;
 
-    internal async Task<T> ExecuteAsync<T>(Func<CancellationToken, T> execute, CancellationToken cancellation)
+    internal Task<T> ExecuteAsync<T>(Func<CancellationToken, T> execute, CancellationToken cancellation)
+        => ExecuteAwaitedAsync(ct => Task.Run(() => execute(ct), ct), cancellation);
+
+    internal async Task<T> ExecuteAwaitedAsync<T>(Func<CancellationToken, Task<T>> execute, CancellationToken cancellation)
     {
         cancellation.ThrowIfCancellationRequested();
         lock (_state)
@@ -30,7 +33,7 @@ internal sealed class JevExecutionGate(int capacity)
             entered = true;
             lock (_state) ObjectDisposedException.ThrowIf(_stopped, this);
             // Only the admitted owner occupies a worker. Waiting HTTP requests remain asynchronous.
-            return await Task.Run(() => execute(cancellation), cancellation).ConfigureAwait(false);
+            return await execute(cancellation).ConfigureAwait(false);
         }
         finally
         {

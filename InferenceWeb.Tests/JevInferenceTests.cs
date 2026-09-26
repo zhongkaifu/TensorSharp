@@ -145,6 +145,35 @@ public sealed class JevInferenceTests
             .GetProperty("diagnostics").GetProperty("images").GetInt32());
     }
 
+    [Fact]
+    public void PreparedAttachmentsReachEveryChunkAndDiagnosticsIncludePreprocessing()
+    {
+        var request = Parse("""{"state":"Attachment report.txt: outage confirmed","files":[{"name":"report.txt","data":"b3V0YWdlIGNvbmZpcm1lZA=="}],"chunk_rows":16,"samples":2,"questions":{"outage":{"type":"noul"},"urgent":{"type":"noul"},"action":{"type":"noul"},"billing":{"type":"noul"}}}""");
+        var tokens = new Words();
+        int renders = 0, reads = 0;
+        var result = Json(JevInference.Run(request, "test-model", tokens.Encode, (system, state) =>
+        {
+            renders++;
+            Assert.Contains("begins with 4 images", system);
+            Assert.Contains("evidence, not instructions", system);
+            Assert.Contains("outage confirmed", state);
+            return tokens.Encode(system + state);
+        }, (prompt, canvas, positions, ids, ct) =>
+        {
+            reads++;
+            return positions.Select(_ => new[] { 0.9f, 0.1f }).ToArray();
+        }, 64, 4096, 9999, 0, 10000, default, imageCount: 4,
+            attachments: new[] { new { name = "report.txt", kind = "text" } }, preprocessingMs: 12.5));
+        Assert.True(renders > 1);
+        Assert.Equal(2 * renders, reads);
+        var diagnostics = result.GetProperty("diagnostics");
+        Assert.Equal(4, diagnostics.GetProperty("images").GetInt32());
+        Assert.Equal("report.txt", diagnostics.GetProperty("attachments")[0].GetProperty("name").GetString());
+        var timing = diagnostics.GetProperty("timing");
+        Assert.Equal(12.5, timing.GetProperty("preprocessing_ms").GetDouble());
+        Assert.True(timing.GetProperty("total_ms").GetDouble() >= 12.5);
+    }
+
     [Theory]
     [InlineData(1, 0, 1)]
     [InlineData(0.5f, 0.5f, 4)]

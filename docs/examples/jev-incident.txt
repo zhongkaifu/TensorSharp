@@ -1,0 +1,3 @@
+Incident report
+The production dashboard is unavailable. All customers receive HTTP 503 errors
+and cannot sign in. The incident is ongoing and requires the technical team.

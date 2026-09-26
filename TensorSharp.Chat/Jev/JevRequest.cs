@@ -24,6 +24,9 @@ public sealed record JevRequest(string? Model, string State, string? Instruction
     JevQuestion[] Questions, int Samples, int AutoMax, double AutoThreshold, int Seed,
     int? ChunkRows, bool SharedPrompt, JevImage[] Images)
 {
+    /// <summary>File, document, audio and video inputs, decoded or referring to upload storage.</summary>
+    public JevAttachment[] Attachments { get; init; } = [];
+
     public const int MaxQuestions = 64;
     public const int MaxSamples = 32;
     /// <summary>Images per request. Each one costs its encoder's own soft-token count —
@@ -38,16 +41,11 @@ public sealed record JevRequest(string? Model, string State, string? Instruction
         if (root.ValueKind != JsonValueKind.Object) throw Error("request must be an object");
         Unique(root, "request");
         var supportedKeys = new HashSet<string>(["model", "state", "instructions", "questions", "samples", "auto_max", "auto_threshold",
-            "seed", "chunk_rows", "chunk_prompt", "steps", "think", "images", "ask", "sequential"], StringComparer.Ordinal);
+            "seed", "chunk_rows", "chunk_prompt", "steps", "think", "images", "files", "documents", "videos", "audios", "ask", "sequential"], StringComparer.Ordinal);
         foreach (var property in root.EnumerateObject())
         {
-            // Images are the only media this checkpoint can take: it ships no audio tower
-            // (AudioInputSupport refuses audio for the family) and upstream's video feature
-            // path raises NotImplementedError, so frames can only be sent as plain images.
-            // Name the reason instead of letting the generic "unsupported field" hide it.
-            if (property.Name is "audio" or "audios" or "input_audio" or "video" or "videos")
-                throw Error($"'{property.Name}' is not supported: this checkpoint has an image tower only. " +
-                    "Send image input in 'images'; video frames must be sent as individual images.");
+            if (property.Name is "audio" or "input_audio" or "video")
+                throw Error($"'{property.Name}' is not supported; use the 'audios' or 'videos' attachment array.");
             if (!supportedKeys.Contains(property.Name)) throw Error($"unsupported request field '{property.Name}'");
         }
         if (!root.TryGetProperty("state", out var state) || state.ValueKind == JsonValueKind.Null)
@@ -65,6 +63,7 @@ public sealed record JevRequest(string? Model, string State, string? Instruction
                 images.Add(JevImageInput.Decode(attachment, images.Count));
             }
         }
+        var fileAttachments = JevAttachmentInput.Parse(root, images.Sum(image => (long)image.Bytes.Length));
         string? model = OptionalString(root, "model");
         if (model != null && string.IsNullOrWhiteSpace(model)) throw Error("model must not be empty");
         if (!root.TryGetProperty("questions", out var questions) || questions.ValueKind != JsonValueKind.Object)
@@ -153,7 +152,7 @@ public sealed record JevRequest(string? Model, string State, string? Instruction
                 !(unsupported == "sequential" && value.ValueKind == JsonValueKind.False))
                 throw Error($"'{unsupported}' is not supported by one-step Jev inference");
         return new(model, JsonText(state)!, Text(root, "instructions"), parsed.ToArray(), samples,
-            autoMax, threshold, seed, rows, chunkPrompt == "shared", images.ToArray());
+            autoMax, threshold, seed, rows, chunkPrompt == "shared", images.ToArray()) { Attachments = fileAttachments };
     }
 
     private static string? OptionalString(JsonElement root, string key)

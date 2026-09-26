@@ -5,9 +5,11 @@
 TensorSharp serves a Jev-compatible `POST /v1/systemone` endpoint with the
 DiffusionGemma GGUF. A request supplies state and typed questions; the response
 contains boolean probabilities (`noul`), categorical choices, and expected scores.
-State may be text, images, or both: images travel inline in the request body and
-are read as part of the state, so a typed decision can be made about a picture
-(see [Image input](#image-input)).
+State may combine text with images, uploaded files, documents, sampled video
+frames, and audio transcripts. Attachments can travel inline or reference a file
+returned by `/api/upload` (see [Files, documents, video and audio](#files-documents-video-and-audio)).
+Images use the vision tower; speech uses an explicitly configured transcription
+service, because DiffusionGemma has no audio tower.
 `jev-latest` and `jev-preview` are API aliases for the loaded DiffusionGemma model,
 not separate checkpoints or the proprietary hosted Jev model.
 
@@ -32,8 +34,9 @@ vLLM checkout `0eb42dbbfce96477f4ca174980f4d68336fb1971`, including the
 
 ## Start the server
 
-The supplied Q4_K_M checkpoint needs no tokenizer files. Image input needs the
-vision tower, which the configuration downloads once (2.8 GB); text-only decisions
+The supplied Q4_K_M checkpoint needs no tokenizer files. Images, scanned documents
+and video frames need the vision tower, which the configuration downloads once
+(2.8 GB); text-only decisions
 do not. `--mmproj none` on the command line makes the server run text-only and
 skips the download too, because a command-line `--mmproj` drops the
 configuration's entry before it is resolved. From the repository root, in
@@ -60,8 +63,9 @@ Every published GGUF of this checkpoint is text-only and no mmproj was released
 for it, so the configuration loads the vision tower straight from the upstream
 `model-00011-of-00011.safetensors` shard, which carries all 356 of its tensors.
 It is fetched once and reused. Without it the server still answers text-only
-requests and refuses image ones with HTTP 503 rather than answering from filler
-rows. The same tower serves ordinary DiffusionGemma chat on this server.
+requests and refuses requests needing image rows with HTTP 503 rather than
+answering from filler rows. The same tower serves ordinary DiffusionGemma chat on
+this server.
 
 The recipe reserves 4 GiB of VRAM for activations on a 16 GiB CUDA GPU. A larger
 reserve leaves fewer weights resident but can avoid severe paging on longer
@@ -164,7 +168,11 @@ three levels produce an expected score between 0 and 2.
 | Request field | Default | Meaning |
 |---|---|---|
 | `instructions` | none | Optional request-wide instructions, added to the system text ahead of the questions |
-| `images` | `[]` | Up to 8 inline images, each base64 or a `data:` URL |
+| `images` | `[]` | Existing image input: base64 strings or `data:` URLs |
+| `files` | `[]` | Attachments classified by filename extension; inline data or upload references |
+| `documents` | `[]` | Text/code, PDF, DOCX, XLSX or PPTX attachments |
+| `videos` | `[]` | Videos converted to a bounded set of image frames |
+| `audios` | `[]` | Speech transcribed by the configured companion service |
 | `samples` | `"auto"` | `1` to `32` independent seeded reads, or adaptive reads |
 | `auto_max` | `4` | Total reads when adaptive uncertainty triggers, at most `32` |
 | `auto_threshold` | `0.1` | Conditional-label entropy threshold, in nats |
@@ -187,11 +195,11 @@ surrounding whitespace. Choice names and score descriptions can contain multiple
 tokens: the compiler maps them to short labels and verifies that each label
 occupies one token in the full answer template. Invalid templates and context
 overflow return validation errors. Conditional question dependencies, sequential
-question chaining, additional denoising steps, thought generation, and audio or
-video input are rejected explicitly, each naming its own reason.
+question chaining, additional denoising steps, and thought generation are rejected
+explicitly, each naming its own reason.
 
-The server caps request bodies at 8 MiB, because image bytes travel base64-encoded
-inside the body; `TS_JEV_MAX_BODY_MB` (1 to 64) sets another limit at startup.
+The server caps Jev request bodies at 8 MiB, including inline base64 data;
+`TS_JEV_MAX_BODY_MB` (1 to 64) sets another limit at startup.
 `TS_JEV_MAX_CANVAS` defaults to 64
 tokens (also bounded by the checkpoint's canvas width); schemas exceeding this
 are split into chunks. `TS_JEV_MAX_PENDING` defaults to 32 admitted requests,
@@ -239,7 +247,7 @@ curl http://127.0.0.1:5000/v1/systemone \
   --data-binary @docs/examples/jev-traffic-light.json
 ```
 
-Attaching your own file is base64 and nothing else:
+To attach your own image using the existing inline image field:
 
 ```python
 import base64, json
@@ -287,7 +295,8 @@ prefills that prompt. A schema too wide for the canvas is
 split into chunks, and every chunk prompt carries the images again at its own
 offsets, so `n` chunks cost `n` prefills over the image rows; repeated reads of one
 chunk (fixed `samples` or adaptive extension) reuse its prompt K/V as they do for
-text. `diagnostics.images` reports how many images the answered request received,
+text. `diagnostics.images` reports the effective number of image spans, including
+scanned pages and sampled video frames,
 and `usage.input_tokens` counts the expanded prompt including the soft rows.
 
 Decoded bytes are written content-addressed into the server's upload directory, so
@@ -297,33 +306,144 @@ once and cached (`TS_MM_EMBEDDING_CACHE_MB`, default 512). Image attention insid
 each soft-token span is bidirectional on sliding layers and causal on global ones;
 `DIFFUSION_IMAGE_BIDIRECTIONAL=0` makes it causal everywhere.
 
-### What is refused
+## Files, documents, video and audio
 
-Pixels must arrive inside the request body. Remote URLs are never fetched and
-filesystem paths are never read (HTTP 422), because either would let a client of
-the inference server reach its network or its files; the chat endpoints refuse both
-for the same reason. Multipart bodies are refused with HTTP 415, audio and video
-with HTTP 422 naming the checkpoint's missing towers, and an entry that is not
-valid base64, not a recognized image container (PNG, JPEG, GIF, BMP, WebP, TIFF,
-HEIC) or larger than 16 MiB decoded with HTTP 422. Bytes that carry a container's
-magic but do not decode are refused the same way, with the decoder's reason
-(`images: PNG does not start with IHDR`), rather than as a server error. A request with images on a
-server started without the vision tower receives HTTP 503, not an answer read from
-filler rows. Image bytes count against the 8 MiB body cap; a body over it receives
-HTTP 413, and storage limits answer with the status the upload policy declares
-(413 over the per-file cap, 507 over the quota).
+`files`, `documents`, `videos` and `audios` are arrays with the same entry format.
+Use `files` for mixed inputs; the other arrays require their named media kind.
+Each entry has exactly one source:
 
-Video frames can only be sent as individual images: upstream's video feature path
-for this checkpoint raises `NotImplementedError` and the vocabulary carries no
-video begin/end pair. Audio is not supported at all — the checkpoint has no audio
-weights, so the `<|audio>` ids its tokenizer inherits have nothing behind them.
+```json
+{"name": "incident.txt", "data": "VGhlIHNlcnZpY2UgaXMgZG93bi4="}
+```
+
+or, after uploading to the same server:
+
+```json
+{"file": "SERVER_FILENAME_FROM_UPLOAD.txt", "name": "incident.txt"}
+```
+
+`data` accepts bare base64 or a base64 `data:` URL. Inline entries require `name`
+with a supported extension. `file` is the **bare filename from the upload
+response's `file` property**, not its `url`, a local path or a remote URL. `name`
+is optional for upload references and supplies a display name. The server reads
+only files in its governed upload directory, rejecting paths, traversal and
+symlinks. References remain usable only while the underlying upload exists;
+the storage TTL and quota apply.
+
+The [document request](../examples/jev-document.json) embeds a short incident
+report and can be posted directly:
+
+```bash
+curl http://127.0.0.1:5000/v1/systemone \
+  -H 'Content-Type: application/json' \
+  --data-binary @docs/examples/jev-document.json
+```
+
+The standard-library [attachment client](../examples/jev-attachments.py) reads
+local files on the client and either embeds them or uploads them first. It prints
+the complete decision response, including preprocessing diagnostics:
+
+```bash
+# Inline a text document.
+python docs/examples/jev-attachments.py docs/examples/jev-incident.txt --field documents
+
+# Upload first; only the returned filename is sent in the Jev request.
+python docs/examples/jev-attachments.py report.pdf --upload --field documents
+python docs/examples/jev-attachments.py crossing.mp4 --upload --field videos --question "Is a green traffic light visible?"
+python docs/examples/jev-attachments.py incident.wav --upload --field audios --question "Does the speaker report an active service outage?"
+```
+
+For a manual upload, use `curl -F "file=@report.pdf" http://127.0.0.1:5000/api/upload`,
+then put the returned `file` value in the JSON
+request. `/api/upload` accepts multipart; `/v1/systemone` continues to accept JSON
+only. Uploading avoids base64 overhead and the Jev body limit, but does not bypass
+attachment, context or storage limits.
+
+### What the model receives
+
+| Input | Processing and limits |
+|---|---|
+| Plain-text/code files | UTF-8 text, including CSV, JSON, Markdown and source code, is inserted into the state with its filename. No file tools are executed. |
+| PDF | Text layer only, or the largest embedded image per page for wholly image-only documents, with the vision tower. At most 32 pages; failed page extraction is rejected. This is not a general PDF renderer or OCR engine: figures in text PDFs, vector graphics and composited scan layouts are not rendered. Mixed text/scanned PDFs may need to be supplied as page images. |
+| DOCX / XLSX / PPTX | Text from document paragraphs, spreadsheet cells or slide text. XLSX uses stored values; it does not recalculate formulas. Formatting, charts and embedded pictures are not rendered. Legacy `.doc`, `.xls` and `.ppt` files are unsupported. Office archives are limited to 2,048 entries and 8 MiB expanded data. |
+| Video | MP4, MOV, AVI, MKV or WebM, at most 600 seconds and 16 megapixels per frame; sample at 1 fps and uniformly downselect to at most 4 frames per video within the remaining image budget. Frames enter through the image tower with approximate timestamps. The soundtrack is not transcribed. This cannot guarantee detection of brief events or continuous motion. |
+| Audio | MP3, WAV, OGG, FLAC or M4A sent to the configured ASR service; its speech transcript is inserted into the state. Sounds, music, speaker identity, timing and vocal emotion are not direct model inputs. Actual decoding/language support depends on the transcription service. |
+| Image via `files` | Same vision path as `images`; supported upload image extensions are classified by the file name and checked when decoded. |
+
+There may be at most 8 attachments across the four new arrays, at most 32 MiB per
+attachment, and at most 64 MiB in total decoded/referenced media, including legacy
+inline images. Images in either `images` or `files` must also meet the 16 MiB
+decoded image limit. At most 8 image inputs may reach the model in total, including explicit
+images, scanned pages and extracted video frames. Document/transcript text is
+limited to 32,768 characters per attachment and 65,536 across attachments.
+Byte, document text and PDF page limits reject excess data; they do not silently
+truncate it. Videos are deliberately sampled within the remaining image budget.
+The final expanded prompt plus answer canvas must also fit `MAX_CONTEXT`.
+Video frames and scanned PDF images are limited to 16,777,216 pixels each before
+decoding.
+Video decoding requires the platform's media provider and a supported codec;
+an accepted container extension does not guarantee that every codec inside it
+can be decoded.
+
+The server's `--upload-max-mb`, `--upload-quota-mb` and `--upload-ttl-hours` govern
+stored attachments and derived images. Inline content is stored by content hash;
+repeating the same content reuses its stored file. Prepared attachments and image
+embeddings are cached within bounded budgets. `diagnostics.attachments` records
+what was actually prepared: `name`, `kind`, `textCharacters`, `imageCount`,
+`sampled`, `cacheHit` and `warning`. `cacheHit` describes non-audio extraction;
+it does not expose the companion transcriber's separate cache. Inspect warnings for transformations that
+limit fidelity. `diagnostics.timing.preprocessing_ms` is separate from
+`inference_ms`; `total_ms` is their sum and excludes queuing and the prior upload.
+
+### Configure audio transcription
+
+DiffusionGemma has no audio weights. Configure an operator-controlled HTTP speech
+recognizer before starting TensorSharp. A local companion keeps audio on the
+machine when that service itself runs locally:
+
+```powershell
+# Example: an already running whisper-server service.
+$env:TS_JEV_TRANSCRIPTION_URL = 'http://127.0.0.1:8178/inference'
+$env:TS_JEV_TRANSCRIPTION_TIMEOUT_SECONDS = '120'
+dotnet run --project TensorSharp.Server.Host -c Release -- --config config/jev-diffusiongemma-q4.json
+```
+
+The endpoint must accept multipart fields `file` and `response_format=json`, and
+return a JSON object of at most 1 MiB containing a nonempty `text` string. For an OpenAI-compatible
+speech server, set the full URL ending in `/v1/audio/transcriptions`.
+`TS_JEV_TRANSCRIPTION_MODEL` adds the optional `model` field;
+`TS_JEV_TRANSCRIPTION_API_KEY` adds an optional bearer token. The timeout defaults
+to 120 seconds and accepts 1–600 seconds. Only the operator chooses this URL;
+requests cannot choose where audio is sent. An in-process application can supply
+`ModelService.JevAudioTranscriber` instead. Duplicate audio can reuse the bounded
+transcript cache (16 entries per service, keyed by content hash and extension;
+failed transcriptions are not cached).
+
+Without a configured transcriber, audio requests receive HTTP 503, as do service
+failures or timeouts. Empty speech receives HTTP 422. Neither failure falls back
+to text-only guesses. ASR accuracy is part of the
+end-to-end decision quality: validate transcription and decisions in the intended
+languages and acoustic conditions. A transcript does not establish native audio
+understanding.
+
+### Validation failures
+
+Remote URLs and arbitrary filesystem paths are never fetched or read. Unsupported
+extensions, invalid base64, malformed documents/media, or exceeded attachment
+limits receive HTTP 422. Missing model capabilities, such as a required vision
+tower or audio transcriber, receive HTTP 503. Invalid legacy images also receive
+HTTP 422 with the decoder's reason. Non-JSON Jev requests receive HTTP 415 and
+requests above the body limit receive HTTP 413. Storage policy failures retain
+their declared status (413 for the per-file limit, 507 for the quota).
 
 ## Probability semantics
 
 For each question, the model computes logits `z` for its allowed labels and
 returns `softmax(z)` at temperature 1 after the model's final logit softcap.
-These are probabilities conditional on the listed answers, and — when the request
-carries images — on the encoded image rows in the same prompt. A `noul` value is
+These are probabilities conditional on the listed answers and the prepared state:
+text, extracted document content, transcripts and any encoded image rows. Text
+extraction, video sampling and transcription can discard evidence before the
+model reads it. A `noul` value is
 the probability of the true label. A choice is the highest-probability option;
 a score is the probability-weighted mean of its level indices.
 Choice and score `confidence` is the largest conditional probability, matching
@@ -386,12 +506,36 @@ it is not an image-understanding benchmark and says nothing about calibration on
 visual decisions. Record an independent evaluation before setting confidence
 thresholds on image input.
 
+The attachment suite uses original fixtures in
+[`InferenceWeb.Tests/Fixtures/JevAttachments`](../../InferenceWeb.Tests/Fixtures/JevAttachments/manifest.json)
+for text/code, PDF, DOCX, XLSX, PPTX, images, video, audio and mixed evidence. It exercises
+inline data and the `/api/upload` → file-reference flow; `--modes
+inline,data-url,upload` includes all three transports. Fixture hashes and
+provenance are recorded in the manifest. The video repeats one still and the audio
+is synthetic speech: these check ingestion, not temporal understanding or ASR
+word-error rate. Contrasting documents, concurrent reuse of upload references and
+a subsequent text-only request check evidence isolation.
+
+The benchmark reports upload, client request/end-to-end, server preprocessing and
+inference times separately. Its server must have the vision tower and an actual
+transcription service for full coverage. Unavailable services and skipped cases
+do not count as passing coverage. `--cases txt,pdf,docx` can isolate document
+work, but does not validate all modalities. Set an explicit `--max-p95-ms` budget
+for the hardware and workload before claiming a performance pass. Warm repeated
+fixtures can hit extraction, transcript and embedding caches; measure fresh,
+representative content separately before drawing production throughput claims.
+
 ```powershell
 # Pure protocol/math tests (no model or GPU required).
 dotnet test InferenceWeb.Tests -c Release --filter 'FullyQualifiedName~Jev&Requires!=Models&Requires!=Cuda&Requires!=Mlx'
 
 # Python harness checks use mock responses, without model inference.
 python eng/tests/jev-benchmark-tests.py
+python eng/tests/jev-attachments-benchmark-tests.py
+
+# Full attachment quality/transport screen: server needs vision AND real ASR.
+# Add --max-p95-ms with the latency budget chosen for your deployment.
+python eng/jev-attachments-benchmark.py --endpoint http://127.0.0.1:5000 --modes inline,data-url,upload --repeats 3 --concurrency 1,2 --description 'Record hardware, model, quantization, backend and ASR service' --output artifacts/jev/attachments
 
 # Real GGUF sparse/full projection comparison, including deterministic reuse.
 $env:TS_TEST_MODEL_DIR = 'C:/Works/models'

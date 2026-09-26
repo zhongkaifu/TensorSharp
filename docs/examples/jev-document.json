@@ -1,0 +1,27 @@
+{
+  "model": "jev-latest",
+  "state": "Classify the incident described in the attached document.",
+  "documents": [
+    {
+      "name": "incident.txt",
+      "data": "VGhlIHByb2R1Y3Rpb24gZGFzaGJvYXJkIGlzIHVuYXZhaWxhYmxlLiBBbGwgY3VzdG9tZXJzIHJlY2VpdmUgSFRUUCA1MDMgZXJyb3JzIGFuZCBjYW5ub3Qgc2lnbiBpbi4gVGhlIGluY2lkZW50IGlzIG9uZ29pbmcuCg=="
+    }
+  ],
+  "questions": {
+    "outage": {
+      "type": "noul",
+      "instructions": "Does the attached report describe an active production outage?"
+    },
+    "department": {
+      "type": "choice",
+      "instructions": "Which team should handle the incident?",
+      "criteria": {
+        "billing": "Payment or subscription questions",
+        "technical": "Bugs, outages and integration failures",
+        "sales": "Pricing and purchasing questions"
+      }
+    }
+  },
+  "samples": 1,
+  "seed": 42
+}
