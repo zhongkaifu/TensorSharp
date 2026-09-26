@@ -121,6 +121,23 @@ public class DeepSeek41ArchitectureTests : IDisposable
     }
 
     /// <summary>
+    /// The refusal names ggml_cuda as the one serving backend. It used to file
+    /// the direct-CUDA engine under "serving" too, although that engine has no
+    /// numerical gate yet and the model card calls it a correctness and
+    /// portability path like the two CPU executors.
+    /// </summary>
+    [Fact]
+    public void BackendRefusalNamesOnlyGgmlCudaAsTheServingBackend()
+    {
+        var error = Assert.Throws<NotSupportedException>(() =>
+            DeepSeek41Architecture.ValidateLoad("missing.gguf", BackendType.Mlx, null));
+        Assert.Contains("--backend ggml_cuda (the serving backend)", error.Message);
+        Assert.Contains("--backend cuda (the direct-CUDA engine, not yet held to a numerical gate)", error.Message);
+        Assert.Contains("correctness and portability paths only", error.Message);
+        Assert.DoesNotContain("--backend cuda (serving)", error.Message);
+    }
+
+    /// <summary>
     /// A non-CUDA ggml GPU backend runs V4.1 with this architecture's ops on the
     /// CPU backend: correct, but a host round trip per occurrence. It is opt-in
     /// because what the refusal originally closed was a SILENT fallback onto

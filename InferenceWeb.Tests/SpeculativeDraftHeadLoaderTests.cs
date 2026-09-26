@@ -8,6 +8,7 @@
 // TensorSharp is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 
+using TensorSharp;
 using TensorSharp.Runtime.Speculative;
 
 namespace InferenceWeb.Tests;
@@ -59,6 +60,64 @@ public sealed class SpeculativeDraftHeadLoaderTests : IDisposable
         Assert.Null(error);
     }
 
+    /// <summary>
+    /// Qwen 3.5/3.8 and Muse-Glimmer decline a DFlash drafter in their
+    /// constructors under --tp N (it borrows the sharded LM head and embedding).
+    /// The attach-after-load phase then saw HasDFlash == false and loaded the
+    /// drafter anyway, undoing that decline. It must refuse with a reason.
+    /// </summary>
+    [Fact]
+    public void TryAttachConfiguredDraftHead_DeclinesADFlashDrafterUnderTensorParallelism()
+    {
+        string targetPath = WriteMinimalGguf("target.gguf");
+        string draftPath = WriteArchitectureGguf("drafter-dflash.gguf", DFlashConfig.ArchName);
+        _env.Set(SpeculationEnvVars.DraftModel, draftPath);
+        using var model = new FakeTensorParallelModel(targetPath);
+
+        bool attached = SpeculativeDraftHeadLoader.TryAttachConfiguredDraftHead(model, out string error);
+
+        Assert.False(attached);
+        Assert.NotNull(error);
+        Assert.Contains("drafter-dflash.gguf", error);
+        Assert.Contains("not supported under tensor parallelism", error);
+        // Declined before any load was attempted, not after one failed.
+        Assert.DoesNotContain("Failed to load", error);
+        Assert.False(model.HasDFlash);
+
+        // The model's own decline: no other draft file could attach here, so the server's
+        // fail-fast message must say to drop the flag (or --tp), never to find a "matching"
+        // draft GGUF by its embedding_length_out.
+        Assert.False(SpeculativeDraftHeadLoader.TryAttachConfiguredDraftHead(model, out string again, out bool refusedByModel));
+        Assert.Equal(error, again);
+        Assert.True(refusedByModel);
+        string fatal = TensorSharp.Server.Hosting.SpeculationStartupValidation.GetFatalActivationError(again, refusedByModel);
+        Assert.Contains("run without --tp", fatal);
+        Assert.Contains("drop --draft-model", fatal);
+        Assert.DoesNotContain("embedding_length_out", fatal);
+    }
+
+    private string WriteArchitectureGguf(string name, string architecture)
+    {
+        string path = Path.Combine(_dir, name);
+        using var writer = new BinaryWriter(File.Create(path));
+        void WriteString(string value)
+        {
+            byte[] bytes = System.Text.Encoding.UTF8.GetBytes(value);
+            writer.Write((ulong)bytes.Length);
+            writer.Write(bytes);
+        }
+        writer.Write(0x46554747u); // "GGUF"
+        writer.Write(3u);          // version
+        writer.Write(0UL);         // tensor count
+        writer.Write(1UL);         // metadata count
+        WriteString("general.architecture");
+        writer.Write(8u);          // GGUF string value
+        WriteString(architecture);
+        long pad = (32 - writer.BaseStream.Position % 32) % 32;
+        writer.Write(new byte[pad]); // 32-byte alignment
+        return path;
+    }
+
     private string WriteMinimalGguf(string name)
     {
         string path = Path.Combine(_dir, name);
@@ -69,6 +128,37 @@ public sealed class SpeculativeDraftHeadLoaderTests : IDisposable
         writer.Write(0UL);         // metadata count
         writer.Write(new byte[8]); // 32-byte alignment
         return path;
+    }
+
+    private sealed class FakeTensorParallelModel : ModelBase
+    {
+        public FakeTensorParallelModel(string ggufPath)
+            : base(ggufPath, BackendType.Cpu, 2, new StubTpGroup())
+        {
+        }
+
+        protected override float[] ForwardCore(int[] tokens) => Array.Empty<float>();
+
+        protected override void ResetKVCacheCore()
+        {
+        }
+    }
+
+    /// <summary>A live two-rank group; nothing here issues a collective.</summary>
+    private sealed class StubTpGroup : ITensorParallelGroup
+    {
+        public int Degree => 2;
+        public bool IsActive => true;
+        public int GlobalDegree => 2;
+        public int GlobalRankOffset => 0;
+        public int NodeCount => 1;
+        public IAllocator GetAllocator(int rank) => throw new NotSupportedException();
+        public void AllReduce(Tensor[] tensors) => throw new NotSupportedException();
+        public void Synchronize() { }
+        public void Barrier() { }
+        public void BroadcastControl(int op, int[] payload) => throw new NotSupportedException();
+        public (int op, int[] payload) ReceiveControl() => throw new NotSupportedException();
+        public void Dispose() { }
     }
 
     private sealed class FakeBlockModel : ModelBase, IDraftHead

@@ -24,14 +24,14 @@ using TensorSharp.Runtime.Redis;
 using TensorSharp.Server.Host.Hosting;
 using TensorSharp.Models.Embeddings;
 
-const long MaxRequestBodyBytes = 500L * 1024L * 1024L;
-
 Console.OutputEncoding = System.Text.Encoding.UTF8;
 
 // Merge in options from a --config <file.json> before anything reads argv.
-// File-derived tokens are spliced in ahead of the real command line, so any
-// option also passed on the command line overrides the file (every option
-// pass below is last-one-wins). The --config flag itself is stripped here.
+// File-derived tokens are spliced in ahead of the real command line, and a
+// single-valued option the command line (or a later file) sets is dropped from
+// the earlier file before it is resolved or downloaded, so the command line wins
+// whatever an option reader does with repeats (every option pass below is
+// last-one-wins as well). The --config flag itself is stripped here.
 try
 {
     args = ConfigFileArgs.Expand(args);
@@ -47,7 +47,7 @@ bool showSarah = Array.Exists(args, a => a == "--xzf");
 ConsoleBanner.Print(showSarah);
 
 // Informational invocations print and exit before the web host is built. A
-// bare `TensorSharp.Server` shows the usage page instead of silently starting
+// bare `TensorSharp.Server.Host` shows the usage page instead of silently starting
 // a model-less server. Passing another option can still start a status-only
 // process, but inference requires --model at startup.
 if (args.Length == 0 || ServerUsage.IsHelpRequested(args))
@@ -106,10 +106,11 @@ try
     // why they went and what to do instead. Checked against the ORIGINAL line, like
     // the code-execution family below.
     TensorSharp.Runtime.RemovedCliFlags.RejectRemoved(originalArgs);
-    // Same reason, for the code-execution family: --code-exec-packages and
-    // --code-exec-languages could not be enforced once the tool surface became a shell,
-    // so they are refused by name with a pointer at what replaced them rather than
-    // being silently ignored.
+    // Same reason, for the code-execution family: --code-exec-languages could not be
+    // enforced once the tool surface became a shell (a shell reaches every interpreter
+    // on PATH), so it is refused by name with the reason rather than being silently
+    // ignored. --code-exec-packages is NOT retired: the host performs installs itself,
+    // so it still restricts them, and CodeExecOptions.Parse consumed it above.
     if (CodeExecOptions.RejectRemoved(originalArgs) is { } removedCodeExecFlag)
         throw new ArgumentException(removedCodeExecFlag);
     hostingOptions = ServerOptionsBuilder.Build(args, baseDirectory);
@@ -179,13 +180,15 @@ if (SkillHostOptions.Parse(args).ListOnly)
 
 LogLevel resolvedLogLevel = LoggingSetup.ResolveMinimumLevel();
 string? configuredBackendInput = ServerOptionsBuilder.ReadConfiguredBackendInput(args);
-// Translate --paged-kv* flags into env vars before startup logging reads
-// PagedKvCacheConfig.FromEnvironment().
+// Validate the --paged-kv* flags (a bad value still fails startup) and publish them as
+// the TS_KV_* env vars. Nothing on the serving path reads those: the standalone paged
+// KV cache is built only by TensorSharp.Cli --paged-bench, so startup warns once
+// below rather than logging them as configured.
 bool pagedKvFlagsApplied = ServerOptionsBuilder.ApplyPagedKvCacheCliFlags(args);
 ServerOptionsBuilder.ApplyPrefixCacheCliFlag(args);
-// Translate --redis-url into TS_KV_CACHE_REDIS_URL and
-// TS_RESPONSES_STORE_REDIS_URL so a single flag enables Redis for both the
-// paged KV cache tier and the Responses API store.
+// Translate --redis-url into TS_RESPONSES_STORE_REDIS_URL, which backs the Responses
+// API store with Redis. It also fills in TS_KV_CACHE_REDIS_URL, the standalone paged
+// KV cache's tier, which the server never builds (see above).
 bool redisFlagsApplied = ServerOptionsBuilder.ApplyRedisCliFlags(args);
 // Translate --continuous-batching / --no-continuous-batching into env vars
 // that gate BatchExecutor (TS_SCHED_DISABLE_BATCHED) and Qwen3.5 ForwardBatch
@@ -237,14 +240,22 @@ bool tensorParallelFlagsApplied = ServerOptionsBuilder.ApplyTensorParallelCliFla
 var builder = WebApplication.CreateBuilder(args);
 LoggingSetup.Configure(builder.Logging, hostingOptions, resolvedLogLevel);
 
+// Every route keeps the 500 MB request-body limit: the JSON endpoints buffer the whole
+// body, so raising it for them only raises what one request can pin in memory. The
+// multipart /api/upload route, which streams the file to disk, raises its own limit to
+// the --upload-max-mb cap per request (WebUiAdapter.RaiseUploadRequestBodyLimit), so a
+// larger per-file cap is no longer accepted, logged and then refused by Kestrel before
+// the upload policy saw the file.
+long uploadRequestBodyBytes = ServerOptionsBuilder.ResolveUploadRequestBodyBytes(hostingOptions.UploadMaxFileBytes);
+
 builder.WebHost.ConfigureKestrel(options =>
 {
-    options.Limits.MaxRequestBodySize = MaxRequestBodyBytes;
+    options.Limits.MaxRequestBodySize = ServerOptionsBuilder.DefaultMaxRequestBodyBytes;
 });
 
 builder.Services.Configure<FormOptions>(options =>
 {
-    options.MultipartBodyLengthLimit = MaxRequestBodyBytes;
+    options.MultipartBodyLengthLimit = uploadRequestBodyBytes;
 });
 
 builder.Services.AddSingleton(hostingOptions);
@@ -334,7 +345,22 @@ builder.Services.AddSingleton(sp => new ModelService(sp.GetRequiredService<ILogg
 builder.Services.AddSingleton<InferenceQueue>();
 builder.Services.AddSingleton<SessionManager>();
 if (hostingOptions.EmbeddingsEnabled)
+{
+    // An explicit --backend this machine does not have. The chat path refuses the same
+    // request at its startup load (one line, exit 2); this one used to leave through an
+    // unhandled exception from the registration below, stack trace and all, so it is
+    // resolved first and reported the same way.
+    if (!EmbeddingHosting.TryResolveBackend(hostingOptions, configuredBackendInput, out _, out string? embeddingBackendError))
+    {
+        // Idempotent, and a no-op when the backend probes initialised nothing.
+        if (!hostingOptions.UsesManagedEmbeddingBackend)
+            GgmlBasicOps.Shutdown();
+        Console.Error.WriteLine(ModelLoadRefusal.FormatErrorLine(embeddingBackendError));
+        Environment.ExitCode = HostExitCodes.ModelLoadRefused;
+        return;
+    }
     builder.Services.AddTensorSharpEmbeddings(hostingOptions, configuredBackendInput);
+}
 // Engine is owned by ModelService now (so its lifecycle is tied to the
 // loaded model). Re-export it as a DI service for adapters that wish to
 // submit requests directly.
@@ -399,21 +425,24 @@ if (codeExecOptions.Enabled)
     }
 }
 
-if (pagedKvFlagsApplied)
+// The --paged-kv* flags used to be logged here as "configured", which read as a KV cache
+// tier being active. The server never builds that cache, so an operator is told once, by
+// name, that the flags do nothing here and what serves prefix reuse instead.
+if (pagedKvFlagsApplied
+    && ServerOptionsBuilder.DescribeInertPagedKvFlags(
+        args,
+        hostingOptions.PrefixCacheEnabled
+            && TensorSharp.Runtime.Scheduling.SchedulerConfig.FromEnvironment().EnablePrefixCaching) is { } inertPagedKv)
 {
-    var pagedCfg = PagedKvCacheConfig.FromEnvironment();
-    startupLogger.LogInformation(LogEventIds.HostConfiguration,
-        "paged-kv configured via CLI: enabled={Enabled} blockSize={BlockSize} ramMB={RamMB} ssdDir={SsdDir} maxSsdMB={MaxSsdMB}",
-        pagedCfg.Enabled, pagedCfg.BlockSize, pagedCfg.MaxRamBytes / (1024 * 1024),
-        string.IsNullOrEmpty(pagedCfg.SsdDirectory) ? "(disabled)" : pagedCfg.SsdDirectory,
-        pagedCfg.MaxSsdBytes / (1024 * 1024));
+    startupLogger.LogWarning(LogEventIds.HostConfiguration, "{InertPagedKvFlags}", inertPagedKv);
 }
 
 if (redisFlagsApplied)
 {
     startupLogger.LogInformation(LogEventIds.HostConfiguration,
-        "Redis configured via CLI: kvCacheUrl={KvRedisUrl} responsesStoreUrl={ResponsesRedisUrl}",
-        Environment.GetEnvironmentVariable("TS_KV_CACHE_REDIS_URL") ?? "(disabled)",
+        "Redis configured via --redis-url: the Responses API store uses {ResponsesRedisUrl}. The server has no Redis " +
+        "KV-cache tier (TS_KV_CACHE_REDIS_URL is read only by TensorSharp.Cli --paged-bench); prefix reuse is the " +
+        "in-process radix prefix cache.",
         Environment.GetEnvironmentVariable("TS_RESPONSES_STORE_REDIS_URL") ?? "(disabled)");
 }
 
@@ -429,6 +458,12 @@ if (specFlagsApplied)
             ? schedCfg.Speculation.MinDraftProb.Value.ToString("0.##", System.Globalization.CultureInfo.InvariantCulture)
             : "auto (per algorithm)",
         string.IsNullOrEmpty(blockDraft) ? "(none)" : Path.GetFileName(blockDraft));
+    // --spec-type / --spec-draft / --spec-pmin only TUNE speculation; they do not turn
+    // it on. An operator who wrote `--spec-type ngram` alone asked for something that
+    // will never run, and "enabled=False" in the line above is easy to read past. The
+    // CLI logs the same warning from the same helper.
+    if (TensorSharp.Runtime.Speculative.SpeculativeCliFlags.DescribeInertTuning(specFlagsApplied, schedCfg.Speculation) is { } inertSpeculation)
+        startupLogger.LogWarning(LogEventIds.HostConfiguration, "{Warning}", inertSpeculation);
 }
 
 if (gpuDeviceFlagApplied)
@@ -475,8 +510,10 @@ if (hostingOptions.UploadMaxFileBytes != UploadStoragePolicy.DefaultMaxFileBytes
     || hostingOptions.UploadTtl.HasValue)
 {
     startupLogger.LogInformation(LogEventIds.HostConfiguration,
-        "Upload storage limits: maxFileMB={MaxFileMB} quotaMB={QuotaMB} ttlHours={TtlHours} usedMB={UsedMB}",
+        "Upload storage limits: maxFileMB={MaxFileMB} uploadRequestLimitMB={UploadRequestLimitMB} otherRequestLimitMB={RequestBodyLimitMB} quotaMB={QuotaMB} ttlHours={TtlHours} usedMB={UsedMB}",
         hostingOptions.UploadMaxFileBytes / (1024 * 1024),
+        uploadRequestBodyBytes / (1024 * 1024),
+        ServerOptionsBuilder.DefaultMaxRequestBodyBytes / (1024 * 1024),
         uploadPolicy.QuotaEnabled ? (hostingOptions.UploadQuotaBytes / (1024 * 1024)).ToString() : "(off)",
         hostingOptions.UploadTtl.HasValue ? hostingOptions.UploadTtl.Value.TotalHours.ToString("0.##") : "(off)",
         uploadPolicy.UsedBytes / (1024 * 1024));
@@ -631,6 +668,18 @@ catch (Exception ex) when (ModelLoadRefusal.TryDescribe(ex, out string? loadRefu
             GgmlBasicOps.Shutdown();
     });
     return;
+}
+
+// --width / --height are also the Qwen-Image-2.1 default image size, which needs both
+// and works on multiples of 32. They are the video size aliases too, so neither case is
+// refused; a Qwen-Image server says once what its default size will NOT be instead of
+// leaving an operator to wonder why --width 1000 produced 2048x2048 images. Only a
+// Qwen-Image server: for a video model these warnings would describe a size nothing uses.
+if (!hostingOptions.EmbeddingsEnabled
+    && app.Services.GetRequiredService<ModelService>().Model is TensorSharp.Models.QwenImage.QwenImageModel)
+{
+    foreach (string sizeWarning in ServerOptionsBuilder.DescribeQwenImageSizeDefaultWarnings(args))
+        startupLogger.LogWarning(LogEventIds.HostConfiguration, "{QwenImageSizeDefault}", sizeWarning);
 }
 
 // Prepare the prompt every conversation shares after the container is live, before

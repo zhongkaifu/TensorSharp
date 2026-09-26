@@ -40,7 +40,7 @@ public sealed class LoopbackWebHost : IDisposable
     private readonly Platforms.iOS.ShareInbox _shareInbox;
     private readonly Platforms.iOS.LoopbackLifecycle _loopbackLifecycle;
 
-    /// <param name="webRoot">The bundled copy of TensorSharp.Server/wwwroot.</param>
+    /// <param name="webRoot">The app's own phone Web UI, TensorAgent.Maui/wwwroot, as bundled under webui/.</param>
     /// <param name="loggerFactory">Where the engine logs; console output is what <c>simctl launch --console</c> shows.</param>
     /// <param name="python">The embedded interpreter, when this build has one.</param>
     /// <param name="javaScript">The embedded JavaScript engine, when this build has one.</param>
@@ -57,8 +57,8 @@ public sealed class LoopbackWebHost : IDisposable
             // A bundle with no page is a build problem, and a blank WebView is the
             // worst possible way to learn about it.
             throw new FileNotFoundException(
-                $"The bundled Web UI is missing: expected {index}. The csproj links "
-                + "TensorSharp.Server/wwwroot/** into the bundle as webui/.", index);
+                $"The bundled Web UI is missing: expected {index}. TensorAgent.Maui.csproj links "
+                + "TensorAgent/src/TensorAgent.Maui/wwwroot/** into the bundle as webui/.", index);
         }
 
         // The app, and only the app, installs the process-exit net: ggml-metal's

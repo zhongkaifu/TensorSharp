@@ -1,8 +1,8 @@
 {
   // Qwen3.5-9B (Q8_0) — dense text LLM, highest-quality local quant (~8.9 GB).
   // Run with:
-  //   TensorSharp.Cli    --config config/qwen3.5-9b-q8.json --input prompt.txt
-  //   TensorSharp.Server --config config/qwen3.5-9b-q8.json
+  //   TensorSharp.Cli         --config config/qwen3.5-9b-q8.json --input prompt.txt
+  //   TensorSharp.Server.Host --config config/qwen3.5-9b-q8.json
   // Command-line options override anything here (e.g. --backend ggml_vulkan).
   "variables": {
     "modelRoot": "${TENSORSHARP_MODELS:-../models}"

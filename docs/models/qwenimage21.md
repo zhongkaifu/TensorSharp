@@ -7,7 +7,11 @@ conditioning branch composites the reference over white while the VAE keeps alph
 Earlier Qwen-Image / Qwen-Image-Edit checkpoints (such as Qwen-Image-Edit-2511) are
 no longer supported and are refused at load (exit code 2). The `--qwen-image-lora`
 option was replaced by `--lora` ([LoRA plug-ins](#lora-plug-ins)), and
-`--offload-cpu` was removed.
+`--offload-cpu` was removed; either flag, on the command line or as a config-file
+key, now stops the CLI or server with a configuration error that says what to use
+instead. The old `TS_QWEN_IMAGE_LORA` environment variable is refused at load
+(exit code 2) with the same advice: pass the LoRA with `--lora` and unset the
+variable.
 
 The download configuration is [`config/qwen-image-2.1.json`](../../config/qwen-image-2.1.json).
 It pins repository revisions and SHA-256 checksums for new downloads; existing
@@ -69,13 +73,16 @@ dotnet run --project TensorSharp.Cli -c Release --no-build -- \
 
 No `--image` selects generation; one or more `--image` arguments select editing.
 Repeat `--image first.png --image second.png` for multiple references in that order.
+Each reference is tagged `<image1>`, `<image2>`, … in command-line order ahead of the
+prompt, so the prompt can name a picture by its tag.
 `--input prompt.txt` can supply the prompt instead. Omitted sampling settings
 select **40 Euler steps and CFG 1.0**, following
 [Qwen's recommended unguided sampling](https://github.com/huggingface/diffusers/blob/main/docs/source/en/api/pipelines/qwenimage21.md).
 CFG 1 runs one transformer prediction per step; the previous CFG 6 default ran
 both positive and negative predictions. Explicit CFG above 1 still enables the
-second prediction and applies `--negative-prompt 'blur, low detail'`. Negative
-prompts have no effect at CFG 1.
+second prediction and conditions it on `--negative-prompt` (for example
+`--negative-prompt 'blur, low detail'`; without one, the negative branch uses an
+empty prompt). Negative prompts have no effect at CFG 1.
 
 Omitting dimensions selects **2048×2048 for generation**, or approximately the
 same pixel area with the first reference's aspect ratio for editing. Set width
@@ -163,6 +170,20 @@ Repeat the `image` part for multiple references. Alternatively upload files to
 geometry; explicit dimensions take precedence. Omitting `width`, `height`,
 `targetArea`, `steps` and `cfg` selects the model defaults above. `targetArea: 1048576`
 selects approximately 1K output while retaining automatic aspect-ratio selection.
+
+Starting the server with `--width` and `--height` changes that default size. The
+host publishes them as `TS_QWEN_IMAGE_WIDTH` / `TS_QWEN_IMAGE_HEIGHT`, and every
+image request that sets neither `width`/`height` nor an explicit `targetArea` then
+uses that size, including Web UI requests, which send no size; an edit then no
+longer follows the first reference's aspect ratio. A request that sets its own
+`targetArea` keeps its own geometry. The default needs both flags. A value that is
+not a multiple of 32 is rounded down to one (never below 32), with a one-time
+`[qwen-image] WARNING: … render at WxH instead. Reported once.`; with only one of
+the two set, or an unparsable or negative value, the default is ignored with a
+one-time warning and the automatic size stays. A Qwen-Image server also warns at
+startup in either case, and nothing is refused. A `width` / `height` set in the
+request itself must still be a positive multiple of 32. On the server the same two
+flags are also the aliases of `--video-width` / `--video-height`.
 
 For progress, use the JSON routes `/api/image-generate/stream` and
 `/api/image-edit/stream` with `curl -N`. They emit SSE `data:` frames with
@@ -380,7 +401,8 @@ transformer immediately, and a failure leaves the previous set in place.
 ### Limitations
 
 - The plug-ins apply to Qwen-Image-2.1 only; the CLI refuses `--lora` with any
-  other model.
+  other model, and the server logs a warning and loads the other model without
+  them.
 - Only one plug-in per run can carry a sampling recipe, and a recipe with sigmas
   runs only the step counts it defines.
 - The Qwen-Image-2.1-Fix author's workflow also uses APG, FreSca and the `seeds_2`
@@ -403,7 +425,7 @@ values for the prefix on the device. Every later step runs only the target
 image's tokens and attends over the stored prefix followed by the target. A CFG
 run keeps one cache per branch. The caches are released when denoising ends,
 before VAE decoding. Each step's log line ends with `prefix=extract` or
-`prefix=cached`.
+`prefix=cached` (`prefix=declined` when the cache did not fit; see below).
 
 The cache is on by default; `TS_QWEN21_PREFIX_CACHE=0` turns it off. By default
 it stores exactly what the attention kernel reads: F16 for Metal and CUDA flash
@@ -539,8 +561,10 @@ vLLM-Omni's layout for 2.1:
   collective (NCCL or P2P) does this on the devices when available; otherwise it
   goes through host memory.
 - Each GPU caches the prefix of its own heads, so the cache is split N ways.
-- N must divide 32 and keep quantized blocks whole: 2, 4 or 8 for the published
-  files.
+- N must divide the 32 attention heads — 2, 4, 8 or 16 on one machine, given
+  ggml's 16-device limit — and every weight's quantized blocks must stay whole when
+  it is sharded, which is checked per weight type at load. Only 2 GPUs have been
+  measured.
 - The text encoder, vision encoder and VAE stay on the first GPU. Multi-node
   groups are refused.
 
@@ -708,12 +732,15 @@ checks, not downloaded-model quality or performance measurements. The unchanged
 ggml revision for these checks was `179b60f27b1019d42da01ac532cabdb8f73ba8b7`;
 evidence is in ignored `docs/validation/qwen21-native-metal-report.md`.
 
-CPU and Metal image attention now uses each segment's exact key/value length
-without a dense padding mask. Causal text masks are retained. Metal casts the
-strided key/value tensors directly to F16, and supported backends use upstream
-fused SwiGLU to avoid intermediate feed-forward copies. These operations preserve
-the mathematical computation, with possible floating-point rounding differences;
-other backends retain the padded attention path pending device validation.
+CPU, Metal and CUDA image attention now uses each segment's exact key/value
+length without a dense padding mask; on CUDA, `TS_QWEN21_PAD_MASK=1` restores the
+padded mask as a comparison diagnostic (see
+[`docs/perf/qwen-image21-cuda.md`](../perf/qwen-image21-cuda.md)). Causal text
+masks are retained. Metal casts the strided key/value tensors directly to F16, and
+supported backends use upstream fused SwiGLU to avoid intermediate feed-forward
+copies. These operations preserve the mathematical computation, with possible
+floating-point rounding differences; `ggml_vulkan` still builds padded image
+masks.
 The earlier attention optimization measurements below used unchanged ggml at
 `456172ec733a135778adcd32d00e576a58232e45`.
 

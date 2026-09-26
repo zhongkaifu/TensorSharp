@@ -231,7 +231,8 @@ that expectation set.
 already tested), or block capture (engine≈legacy: 1650 vs 1664 t/s).
 
 (Original Phase-0 cross-check via `GGML_CUDA_DISABLE_GRAPHS` was not runnable — this vendored ggml
-has no such env; graphs only auto-disable on MoE `MUL_MAT_ID` / split buffers.)
+has no such env; graphs only auto-disable on MoE `MUL_MAT_ID` / split buffers. Current upstream
+ggml, which TensorSharp now builds unchanged, does read `GGML_CUDA_DISABLE_GRAPHS`.)
 
 **Phase 1 — ship Option A (safe, ~5–8%)** regardless of Phase 0 outcome. On-GPU mask + host
 overlap. Gate behind `TS_G4_PREFILL_GPU_MASK` / `TS_G4_PREFILL_PIPELINE`.

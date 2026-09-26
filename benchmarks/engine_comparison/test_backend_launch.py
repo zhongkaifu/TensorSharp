@@ -63,6 +63,32 @@ class BackendLaunchTests(unittest.TestCase):
         self.assertEqual(kwargs["env"]["TS_DSV4_UBATCH"], "256")
 
 
+class ListenAddressAndPromptParityTests(unittest.TestCase):
+    """What every TensorSharp launch carries, whatever the axes."""
+
+    def test_the_configured_port_reaches_the_server(self):
+        # The health checks poll 127.0.0.1:<TENSORSHARP_PORT>; before --host/--port
+        # were passed, any port but 5000 polled a port nobody listened on.
+        cmd = tensorsharp_command()
+        self.assertEqual(cmd[cmd.index("--port") + 1], str(engines.config.TENSORSHARP_PORT))
+        self.assertEqual(cmd[cmd.index("--host") + 1], "127.0.0.1")
+
+    def test_a_squatted_port_fails_fast_and_says_how_to_move(self):
+        model = SimpleNamespace(gguf=Path("/tmp/model.gguf"), mmproj=None, is_diffusion=False)
+        spec = engines.config.BackendSpec(
+            backend_id="test_moe", display="test", kind="gpu", ts_backend="ggml_cuda")
+        server = engines.TensorSharpServer(model, "test_moe", Path("/tmp/unused.log"))
+        with patch.object(engines, "_port_open", return_value=True), \
+             patch.object(engines, "_pid_listening", return_value=4242), \
+             patch.object(engines.config, "BACKENDS", {"test_moe": spec}):
+            with self.assertRaises(RuntimeError) as raised:
+                server.start()
+        self.assertIn("BENCH_TS_PORT", str(raised.exception))
+
+    def test_sub_agent_delegation_is_off_so_prompts_match_the_other_engines(self):
+        self.assertIn("--no-multi-agent", tensorsharp_command())
+
+
 class CpuMoeOffloadTests(unittest.TestCase):
     """`--n-cpu-moe N` / `--cpu-moe-threads M` as a launch axis."""
 

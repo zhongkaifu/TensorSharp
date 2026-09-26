@@ -241,6 +241,9 @@ namespace TensorSharp.Server
 
         private volatile SpeculationOptions _pendingSpeculation;
 
+        /// <summary>The switch remembered for the next engine, if any (tests).</summary>
+        internal SpeculationOptions PendingSpeculation => _pendingSpeculation;
+
         public void Reset()
         {
             lock (_gate)
@@ -249,6 +252,12 @@ namespace TensorSharp.Server
                 _engine = null;
                 _fingerprint = null;
                 _engineModel = null;
+                // A remembered switch was made for the model this engine served. The next
+                // engine is for whatever loads next, whose own algorithm the load path has
+                // written to the environment its configuration is read from; handing it the
+                // old model's policy replaced that (a draft head's "auto" became the
+                // previous model's "ngram", or the reverse, which declines speculation).
+                _pendingSpeculation = null;
             }
         }
 

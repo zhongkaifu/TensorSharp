@@ -3,8 +3,8 @@
   // denoises the whole answer iteratively instead of decoding left-to-right.
   // Multimodal: images are supported; audio is not (see the note on "mmproj").
   //
-  //   TensorSharp.Cli    --config config/diffusiongemma-26b-a4b-q4.json --input prompt.txt --image photo.png
-  //   TensorSharp.Server --config config/diffusiongemma-26b-a4b-q4.json
+  //   TensorSharp.Cli         --config config/diffusiongemma-26b-a4b-q4.json --input prompt.txt --image photo.png
+  //   TensorSharp.Server.Host --config config/diffusiongemma-26b-a4b-q4.json
   //
   // The server drives it through the dedicated diffusion scheduler rather than
   // the autoregressive engine; image turns batch alongside text turns. Diffusion
@@ -22,8 +22,9 @@
   "model": {
     "path": "${modelRoot}/diffusiongemma-26B-A4B-it-Q4_K_M.gguf",
     "urls": [
-      "${hf}/unsloth/diffusiongemma-26B-A4B-it-GGUF/resolve/main/diffusiongemma-26B-A4B-it-Q4_K_M.gguf"
-    ]
+      "${hf}/unsloth/diffusiongemma-26B-A4B-it-GGUF/resolve/f4183a2c7a354128d02545752303c4354d165bf0/diffusiongemma-26B-A4B-it-Q4_K_M.gguf"
+    ],
+    "sha256": "24523b6c833c9ce9f5f34f9b333ab1517d73d6f1e76a103645353114c8028bc5"
   },
 
   // Vision tower, loaded straight from the upstream HuggingFace shard — no
@@ -35,8 +36,10 @@
   // and all 356 of its tensors live in this one 2.8 GB shard (of an 11-shard,
   // 51.6 GB checkpoint) — so this downloads that shard alone, not the model.
   //
-  // It is fetched once on first use and reused afterwards. To run text-only and
-  // skip the download entirely, pass --mmproj none on the command line.
+  // It is downloaded on the first run and reused afterwards. To run text-only
+  // and skip the download entirely, pass --mmproj none on the command line
+  // (either host): a command-line value replaces this entry before it is
+  // resolved, so the shard is never fetched, and "none" loads no projector.
   //
   // Audio is NOT supported by this checkpoint: it has no audio_config and no
   // audio weights upstream, so the <|audio|> tokens its tokenizer inherits have
@@ -44,7 +47,7 @@
   "mmproj": {
     "path": "${modelRoot}/diffusiongemma-26B-A4B-it-vision.safetensors",
     "urls": [
-      "${hf}/google/diffusiongemma-26B-A4B-it/resolve/main/model-00011-of-00011.safetensors"
+      "${hf}/google/diffusiongemma-26B-A4B-it/resolve/f7f5b7f5fa82ffc52addd066915886d497f5517b/model-00011-of-00011.safetensors"
     ],
     "sha256": "afec047176bb2a05f078566576aec6bdb71ad4d041275d0d0c89473fda6d6d87"
   }

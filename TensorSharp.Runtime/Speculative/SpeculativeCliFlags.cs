@@ -228,6 +228,28 @@ namespace TensorSharp.Runtime.Speculative
         }
 
         /// <summary>
+        /// The startup warning for a line whose speculative flags only TUNE speculation
+        /// (<c>--spec-type</c>, <c>--spec-draft</c>, <c>--spec-pmin</c>) while nothing turns
+        /// it on - neither <c>--spec</c> nor <c>--draft-model</c>, and <c>TS_SPEC</c> unset.
+        /// Null when there is nothing to say: no speculative flag was applied
+        /// (<paramref name="flagsApplied"/> is <see cref="Apply"/>'s result), speculation is
+        /// on, or it was turned off in words (<c>--no-spec</c>, <c>TS_SPEC=0</c>).
+        /// </summary>
+        /// <remarks>
+        /// Both hosts log it: <c>--spec-type ngram</c> alone asked for something that will
+        /// never run, and the engine's own plan line then says "off (not requested)", the
+        /// opposite of what the operator typed.
+        /// </remarks>
+        public static string? DescribeInertTuning(bool flagsApplied, SpeculationOptions? options)
+        {
+            if (!flagsApplied || options == null || options.Enabled || options.ExplicitlyDisabled)
+                return null;
+            return "Speculative decoding stays OFF: --spec-type, --spec-draft and --spec-pmin only tune it, and "
+                + "neither --spec nor --draft-model was given (TS_SPEC is unset). Add --spec to turn it on; "
+                + "generation uses plain decoding meanwhile.";
+        }
+
+        /// <summary>
         /// Throw for any removed spelling in <paramref name="args"/>, naming its
         /// replacement. Called by <see cref="Apply"/>, so both hosts get it for
         /// free; public so a host that parses independently can reuse it.

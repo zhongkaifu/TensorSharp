@@ -6,7 +6,7 @@
 
 | 属性 | 值 |
 |---|---|
-| GGUF 架构标识 | `muse-glimmer` |
+| GGUF 架构标识 | `muse-glimmer`（也接受 `muse_glimmer`） |
 | 源码类 | [`MuseGlimmerModel`](../../TensorSharp.Models/Models/MuseGlimmer/MuseGlimmerModel.cs)（传统单序列） |
 | 投机草稿模型 | [`MuseGlimmerModel.DFlash.cs`](../../TensorSharp.Models/Models/MuseGlimmer/MuseGlimmerModel.DFlash.cs) + [`DFlashConfig`](../../TensorSharp.Models/Speculative/DFlashConfig.cs) |
 | 视觉编码器 | [`MuseGlimmerVisionEncoder`](../../TensorSharp.Models/Models/MuseGlimmer/MuseGlimmerVisionEncoder.cs) |
@@ -14,17 +14,18 @@
 | 示例模型 | Muse-Glimmer-30B |
 | 模态 | 文本、图像 |
 | 思维链 | 支持（聊天模板会输出 `assistant to=self` 推理通道） |
-| 工具调用 | 支持（聊天模板中的 ATEM XML 标记） |
+| 工具调用 | 支持（聊天模板中的 ATEM XML 标记）；可使用 skills、代码工具以及服务端的[子智能体委派](../multi_agent.md) |
 | 批处理 / 分页前向 | 不支持（传统单序列） |
+| 融合整模型内核 | GGML CUDA / Vulkan / Metal / CPU（四者都有持久化 decode 图） |
 | 张量并行 | 支持 —— GGML CUDA / Vulkan，最高 `--tp 2`（30B 只有 2 个 KV 头） |
 
 ## 快速开始
 
 ```bash
-# 文本
+# 文本（按你的机器选择后端：ggml_cuda、ggml_metal、ggml_cpu、mlx）
 dotnet run --project TensorSharp.Cli -c Release -- \
   --model models/Muse-Glimmer-30B-UD-IQ2_XXS.gguf \
-  --input prompt.txt --backend ggml_cuda --max-tokens 256
+  --input prompt.txt --backend ggml_metal --max-tokens 256
 
 # 图像理解（需要 mmproj）
 dotnet run --project TensorSharp.Cli -c Release -- \
@@ -32,14 +33,15 @@ dotnet run --project TensorSharp.Cli -c Release -- \
   --mmproj models/mmproj-Muse-Glimmer-30B-Q8_0.gguf \
   --image photo.png --input question.txt --backend ggml_cuda --max-tokens 300
 
-# DFlash 投机解码（每个 token 取自主干行；除浮点近平局外与普通贪心一致，见“输出一致性”）
+# DFlash 投机解码（每个 token 取自主干行；除浮点近平局外与普通贪心一致，见第 3 节）
 dotnet run --project TensorSharp.Cli -c Release -- \
   --model models/Muse-Glimmer-30B-UD-IQ2_XXS.gguf \
   --draft-model models/dflash-kquant.gguf \
   --spec-draft 15 --input prompt.txt --backend ggml_cuda
 ```
 
-`--draft-model` 也可以用环境变量 `TS_MUSE_GLIMMER_DFLASH` 指定。
+`--draft-model` 也可以用环境变量 `TS_MUSE_GLIMMER_DFLASH` 指定。这个模型上的投机解码
+离不开该草稿模型：没有它时，`--spec`（包括无权重的 n-gram 草稿器）只提供普通解码。
 
 ### 结构化输出
 
@@ -128,69 +130,203 @@ DFlash 是一个**块级**草稿模型：独立的 5 层 GGUF
 （llama.cpp 的 dflash 图就止于 lm_head 矩阵乘）。argmax 对两者都不变，但接受
 置信度会变，因此交给执行器的逐位置置信度是原始草稿 logits 的 softmax。
 
-验证以贪心方式对齐主干，所以输出的 token 流就是普通贪心 decode 的流
-（浮点意义下的"无损"含义见[输出一致性](#输出一致性)）。
+验证以贪心方式对齐主干，所以除浮点近平局外，输出的 token 流就是普通贪心 decode 的流：
+验证批的 GEMM 与单行 decode 的 GEMM 形状不同，logits 的末位不同，接近平局的位置就可能
+翻转。TensorSharp 与 llama.cpp 在同一语料上都表现出这种现象；这是平局翻转，不是验证 bug。
 
-草稿模型与主干验证都作为融合的、可被 CUDA 图捕获的原生图运行；正是这一点让投机
-从亏损变成了收益。与 llama.cpp 自带 DFlash 实现的最新对比 —— 我们在哪里领先、
-哪里落后、以及原因 —— 见[第 5 节 性能](#5-性能)。
+草稿模型与主干验证都作为融合的原生图运行
+（[`ggml_ops_dflash.cpp`](../../TensorSharp.GGML.Native/ggml_ops_dflash.cpp)），
+在 CUDA / Vulkan / Metal 上是持久化的（CUDA 还会对它们做图捕获）。两张图：
+
+* `TSGgml_DFlashInject` —— `fc` -> RMSNorm -> 每个草稿层
+  {k/v 投影、逐头 k norm、NeoX RoPE、`ggml_set_rows` 写环}。
+  没有 Q、没有注意力、没有 FFN、没有 LM head —— llama.cpp 的 `build_dflash`
+  也在同一点提前返回。
+* `TSGgml_DFlashDraftBlock` —— `[anchor, MASK x (b-1)]` 过完 5 个草稿块，
+  然后是*主干的* LM head（借用，绝不复制）、一次 softmax，以及**设备端 top-1**
+  （`ggml_argmax` 加一次 `get_rows` 取回胜出概率）—— 只下载两个 16 元素的张量，
+  而不是整块 `[202048, 16]` 概率。
+
+让持久化草稿模型保持正确的设计点：
+
+* **注意力读整个环**，`kv_len = ring_rows + b`，跨步固定。注意力在 KV 轴上是
+  置换不变的，所以环的循环顺序无关紧要；一个按槽位位置映射构建的主机侧掩码
+  正好表达了哪些槽位是活的。
+* **掩码的截断点是 ANCHOR 的位置，不是 query 的位置。** 部分拒绝之后，环里仍然
+  留着草稿模型为 anchor 之后的位置写入的 key；那些行已经过期，块内任何 query 都
+  不得看到它们。
+* **在 Metal 上，读取草稿 id 之前先排空队列。** Metal 的 `graph_compute` 返回时
+  GPU 仍在运行，而共享缓冲区上的 `tensor_get` 只是一次裸 memcpy，因此不同步就读取
+  argmax id 会拿到过期的草稿 —— 输出仍然正确（验证会拒绝它们），但接受率会悄悄崩塌。
+
+### 自适应成本调控器
+
+投机永远只是速度优化，因此
+[`SpeculationCostGovernor`](../../TensorSharp.Runtime/Speculative/SpeculationCostGovernor.cs)
+（由 `SpeculativeExecution` 持有）会分别测量带起草与不带起草时每个*输出* token 的 ms，一旦起草更慢就把草稿模型
+**暂停**。当前设计（每一条都是在真实问题里实测出来的）：
+
+* 估计量是**总和之比**（`sum(ticks) / sum(tokens)`），而不是逐步速率的均值 ——
+  一个全部被拒绝的步不能与一个输出了 16 个 token 的步同权；
+* 每一轮探测都**丢弃两侧各自的第一个样本**（吸收任一侧冷启动的建图开销）；
+* **剔除该轮最差的一个投机样本**（吸收探测中途的一次重建）；
+* `SpecWinMargin` 为 1.15，暂停会**退避**（第一次判负暂停 32 步，逐次加倍，最多 256）——
+  紧跟在 prefill 之后的判定最不可信，判错的代价也最小；
+* `Reset()` 会清除判定，因此暂停永远不会泄漏到下一个请求。
+
+置信度下限默认为 `confMin = 0.35`（llama.cpp 这条路径上的 `p_min` 默认是 0）。两种设置
+都不是处处更优；让下限自适应（在 `{0, 0.15, 0.35, 0.6}` 上做一个小型 bandit）是自然的
+下一步。
+
+`SpecPrefillChunkSize`（环境变量 `TS_DFLASH_PREFILL_CHUNK`，默认 1024）设定 DFlash
+prefill 追赶草稿模型时所用的**主干**前向宽度。它会被限制在两个环一次前向能吸收的范围内
+（草稿模型的 `RingRows` = 2080，以及主干 SWA 环的 `rows - n_swa`）。调小它会成倍增加
+长提示需要付出的完整主干前向次数；历史上硬编码的 128 曾是 DFlash prefill 最大的单项开销。
 
 ## 4. 与 llama.cpp 的对齐
 
-`InferenceWeb.Tests/MuseGlimmerParityTests.cs` 用运行同一批 GGUF 的
-`llama-server` 采集的黄金输出来校验实现（`.parity/gen_ref.py`、
-`.parity/gen_ref_vision.py`）：
-
-| 检查项 | 结果 |
-|---|---|
-| 分词器（5 个提示，`add_special`） | token 完全一致 |
-| 贪心续写（5 个提示，每个 26-32 token） | token 完全一致 |
-| 长上下文（4651 token 提示，为滑动窗口的 2.3 倍） | token 完全一致 —— 覆盖 SWA 掩码、填充窗口的翻转与 KV 缓存扩容 |
-| DFlash 贪心续写 | 与非投机路径以及 llama.cpp 均 token 一致 |
-| 图像几何（`ComputeTargetSize` / `ComputeTokenCount`） | 与 `muse_glimmer_grid_size` 一致；1024x1024 -> 1036x1036 -> 1369 token，336x336 -> 144 token（已与 llama-server 的 `prompt_tokens` 核对） |
-| 图像描述 | 近乎逐字一致，包括 OCR 出来的叠加文字 |
-
-重新生成黄金数据：
+`InferenceWeb.Tests/MuseGlimmerParityTests.cs` 用运行同一 GGUF 的 `llama-server`
+采集的黄金输出来校验实现（`.parity/gen_ref.py`、`.parity/gen_ref_long.py`）：
 
 ```bash
-llama-server -m Muse-Glimmer-30B-UD-IQ2_XXS.gguf --mmproj mmproj-Muse-Glimmer-30B-Q8_0.gguf -ngl 99 --port 8899
-python .parity/gen_ref.py http://127.0.0.1:8899 .parity/ref_text.json
-python .parity/gen_ref_vision.py http://127.0.0.1:8899 .parity/ref_vision.json
+llama-server -m Muse-Glimmer-30B-UD-IQ2_XXS.gguf -ngl 99 -c 8192 --port 8899
+python .parity/gen_ref.py      http://127.0.0.1:8899 .parity/ref_text.json
+python .parity/gen_ref_long.py http://127.0.0.1:8899 .parity/ref_text_long.json
+
+TS_TEST_MODEL_DIR=<模型目录> TS_TEST_GGML_BACKEND=metal \
+TS_MUSE_GLIMMER_BACKEND=GgmlMetal \
+dotnet test InferenceWeb.Tests --filter MuseGlimmerParityTests
 ```
 
-然后 `TS_TEST_MODEL_DIR=<模型目录> dotnet test --filter MuseGlimmerParityTests`。
+两个测试工具细节，如果重新踩一遍，每个都要花掉一个下午：
 
-## 5. 性能
+* `TS_MUSE_GLIMMER_BACKEND` 接收的是**枚举名**（`GgmlMetal`、`GgmlCpu`、`Mlx`、
+  `GgmlCuda`），不是 CLI 的写法 —— 无法解析的值会静默回退到 `GgmlCuda`。
+  `TS_TEST_GGML_BACKEND`（`metal`/`cpu`/`cuda`）必须与之一致，因为模块初始化器会在
+  第一个测试之前固定进程全局的 GGML 后端。
+* 采集黄金数据时，贪心就是 `"temperature": 0.0`，**别的什么都不要加**。给
+  llama-server 传 `"samplers": []` 会跳过温度采样器，最后的 dist 抽样就会从原始分布里
+  采样 —— 得到看似通顺但**不确定**的黄金数据（两个相同请求返回不同的 token）。
 
-2026-08-13 重新测量。本节替换了此前在 16 GB 笔记本 GPU 上用 2-bit 量化得到的表格，
-那批数字一个都没有保留。后面的工程小节仍保留其原始 A/B 数据，因为它们记录的是
-某项改动**为什么**要做 —— 每处都注明了测量机器。
+Apple M5 Pro 主机上的结果（2026-08-14，IQ2_XXS，黄金数据来自 llama.cpp b10385）：
 
-### 测试环境
+| 后端 | 分词器 | 5 条贪心续写（28 token） | 长上下文（5062 token 提示） | DFlash 无损 |
+|---|---|---|---|---|
+| Mlx | 一致 | 5/5 token 一致 | token 一致 | 5/5 |
+| GgmlMetal | 一致 | 5/5 token 一致 | 近平局翻转（见下文） | 5/5 |
+| GgmlCpu | 一致 | 3/5 token 一致，另有 2 处近平局翻转，位于第 24/12 个 token | token 一致 | 3/5（翻转的是同样 2 个提示） |
 
-| | |
-|---|---|
-| GPU | 1x **NVIDIA RTX PRO 6000 Blackwell Server Edition**（97,887 MiB），驱动 580.126.20，PCIe 5.0 x16。机器上有两张；除[双 GPU](#双-gpu)一节外所有行都固定 `CUDA_VISIBLE_DEVICES=0` |
-| CPU / 内存 | 2x Intel Xeon 6952P（384 线程），1.5 TiB |
-| 模型 | `Muse-Glimmer-30B-Q8_0.gguf`（27.6 GiB） |
-| 草稿模型 | `dflash-kquant.gguf`（1.5 GiB） |
-| TensorSharp | commit `5098e3f`，内置 ggml `8846b79`（2026-08-12），`--backend ggml_cuda`，原生库以 `-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120-real` 构建 |
-| llama.cpp | master `8e7f22b`（2026-08-13，libggml 0.19.0 —— 与内置 ggml 相差一天以内），相同 CUDA 架构，`-DGGML_CUDA=ON -DLLAMA_CURL=OFF` |
-| 采样 | 两侧都是贪心（llama.cpp 用 `--temp 0`；TensorSharp **不传**任何采样参数） |
-| 生成长度 | 128 token |
-| 批大小 | llama.cpp `-b 2048 -ub 2048`，与 TensorSharp 默认的 `TS_MUSE_GLIMMER_PREFILL_CHUNK` = 2048 对齐 |
-| 重复次数 | 每个点 2 次，**同一上下文内两个引擎交替执行** |
+**近平局翻转不是正确性 bug。** 在长上下文的分叉点，llama.cpp 自己的 top-2 logprob 是
+' rising' −1.5323 对 ' The' −1.5414 —— 只差 0.009 nat。Metal 选了 ' The'，用不同的措辞
+产出了相同的内容（"The population trend was rising"）；逐算子与融合 Metal 路径彼此一致，
+而且用本轮优化之前的内核也能复现这次翻转。IQ2_XXS 在长上下文上本来就会留下近平局，
+不同后端的内核栈会做出不同的选择 —— 这与两个引擎彼此之间表现出的行为相同。CUDA 主机上
+的运行历来与长上下文黄金数据逐 token 一致。
 
-**两个引擎 prefill 的是同一串 token。** TensorSharp 会套用聊天模板而 llama.cpp 的
-`-no-cnv -f` 不会，因此若都喂原始问题，就变成 60 token 的提示对 21 token 的提示。
-做法是先用 `TensorSharp.Cli --dump-prompt` 导出渲染后的提示词，把**那段文本**交给
-`llama-cli`；再用 `llama-tokenize` 确认 token 数与 TensorSharp 报告的一致
-（60 / 501 / 2050 / 16126 / 32274 / 64575 / 123931）。
+视觉几何检查（`ComputeTargetSize` / `ComputeTokenCount` 对照 `muse_glimmer_grid_size`；
+1024x1024 -> 1036x1036 -> 1369 token，336x336 -> 144 token）以及图像描述的近乎逐字一致，
+与 CUDA 主机上的验证结果相同，没有变化。
 
-### 纯文本生成
+## 5. 性能 —— Apple Silicon（2026-08-14）
 
-两次重复的均值，tok/s。比值列是 TensorSharp / llama.cpp，大于 1.00x 表示
-TensorSharp 领先。
+在 Apple **M5 Pro**（6 个 P 核 + 12 个 E 核，48 GB 统一内存，启用了 tensor API 的
+Metal 4）、macOS 26.6 上测量。`Muse-Glimmer-30B-UD-IQ2_XXS.gguf`（10.0 GB），贪心，
+引擎交替执行。llama.cpp `a4a4c51f3`（b10385，2026-08-12）以 Metal 构建，`-fa 1`；
+内置 ggml（`8846b79`）与之字节兼容。TensorSharp 的数字来自 `--benchmark`（prefill
+tok/s；decode tok/s **包含**主机上的贪心采样），llama.cpp 的数字来自 `llama-bench`
+（tg 不含采样），因此 decode 对比略微偏向 llama.cpp。
+
+### ggml_metal 对 llama.cpp Metal
+
+两个引擎在同一会话中背靠背运行（SoC 在长时间会话中会降频，因此跨会话的绝对数字会
+浮动几个百分点；会话内的比值是稳定的 —— llama.cpp 自己的 tg64 在不同会话中重复测得
+22.22 与 22.29）。
+
+| 指标 | llama.cpp | TensorSharp | TS / llama.cpp |
+|---|---:|---:|---:|
+| prefill 512 | 427.2 | 413.6 | 0.97x |
+| prefill 2048 | 407.7 | 392.1 | 0.96x |
+| prefill 16384（整段提示，0→16K） | 区间：407.7（pp2048\@d0）… 286.6（pp8192\@d16K） | 320.9 | 相对区间中点 ≈0.93x |
+| decode，~512 上下文 | 22.29（tg64\@d0） | 21.2 | 0.95x |
+| decode，~2048 上下文 | ≈21.9（d0…d4096 插值） | 20.7 | 0.95x |
+| decode，16384 上下文 | 18.81（tg64\@d16384） | 18.0 | 0.96x |
+
+TensorSharp 的 decode 列*包含*主机贪心采样（llama-bench 的 tg 完全不含采样）；只算
+模型的数字约高 0.5%。本轮优化开始时，decode 比值是 0.94x/0.94x/0.94x，且形状随上下文
+变差（逐 token 的图重建不随任何东西增长，但 O(context) 的掩码重填会）；持久化/重放移植
+是贡献最大的单项 —— 同一二进制、同一会话：2K 上下文时 `TS_MUSE_GLIMMER_PERSIST=0` 的
+decode 为 19.5 tok/s，走重放路径为 21.3（+9%）。
+
+### ggml_cpu 对 llama.cpp CPU
+
+llama.cpp 以 `--device none -ngl 0` 运行（在 Metal 构建上，只给 `-ngl 0` 仍会把
+batch≥32 的矩阵乘按算子卸载到 GPU）。llama.cpp 默认只用 P 核（本机为 `-t 6`）；
+TensorSharp 的 ggml CPU 后端现在默认使用**全部物理核**（这里是 18 个），因为这个负载
+会随 E 核扩展 —— llama.cpp 自己在给 `-t 18` 时 tg 从 3.69 升到 7.87，而它的提示吞吐
+随 E 核*下降*，我们的则上升。
+
+| 指标 | llama.cpp `-t 6`（其默认） | llama.cpp `-t 18` | TensorSharp ggml_cpu（默认） |
+|---|---:|---:|---:|
+| prefill 256 | 25.1 | 23.6 | 8.9–9.2 |
+| decode（短上下文） | 3.69 | 7.87 | 6.8–8.2 |
+
+decode 是重点：**线程数相同时与 llama.cpp 持平（各次探测 0.86–1.04x），约为 llama.cpp
+自身默认配置的 2 倍** —— 起点是逐算子路径 20 分钟都跑不完一次 256/16 基准（每 token
+约 940 次同步图提交，每次都新建一个一次性的 4 线程池）。
+
+**prefill 是一个已知未解决的差距（线程数相同时 ≈0.4x）。** 其特征很明确：TensorSharp
+在每个线程数（1/6/12/18）下每个 prefill token 的开销 ≈ 每个 decode token 的开销，也就是
+说 batch 维度什么都没有摊薄，而 llama.cpp 靠按缓存分块的权重复用拿到 3–7 倍的逐 token
+摊薄。原因不是融合图（逐算子路径测得相同），不是 SWA 环，也不是线程数（都已在同一二进制
+上用直接 A/B 排除）。它被记为下一项 CPU 工作。
+
+纯托管的 `--backend cpu` 是从不触碰原生代码的正确性参照（`NativeDequant.PreferManaged`），
+不是服务后端：它跑这个模型只有 2.7 prefill / 0.2 decode tok/s（IQ2_XXS 在
+`ManagedQuantizedOps` 中没有直接的整数点积方案，因此每次点积都要把权重行重新展开成
+F32）。真正的 CPU 推理请用 `ggml_cpu`。
+
+### mlx 后端
+
+MLX 后端是正确的，并且现在每个 prefill 分块都留在设备上（见改动 8），但它手写的 IQ
+量化矩阵乘内核没有用上 M5 的 tensor API，在两个维度上都是瓶颈。同一台机器、同一 GGUF：
+
+| 指标 | ggml_metal | mlx |
+|---|---:|---:|
+| prefill 512 | 413.6 | 29.0 |
+| prefill 4096（多分块，带状掩码） | ~392 | 27.7 |
+| decode，短上下文（真实生成） | 21.2 | 14.2 |
+| decode，~5K 上下文（真实生成） | ~20 | 11.7 |
+
+MLX 的 decode 数字是真实生成所走的**流水线贪心**路径（设备端 argmax、链式步骤、零逐
+token logits 回读 —— 96 token 的生成中主机拷贝为 0）。`--benchmark` 的 decode 模式测的是
+逐算子 MLX 路径，它在深上下文时会退到主机注意力循环，不具代表性。在 Apple Silicon 上，
+这个模型推荐使用 `--backend ggml_metal`；`--backend mlx` 是接入 MLX 生态的路径（差距在于
+它手写的 IQ 量化矩阵乘内核，而不是它的架构）。
+
+### 这台硬件上的 DFlash
+
+在 M5 Pro 上，短上下文时投机对两个引擎都不划算。同一个 54 token 的提示，256 个贪心 token：
+
+| 引擎 | 普通 decode | DFlash decode |
+|---|---:|---:|
+| llama.cpp（`--spec-type draft-dflash`） | ~22.3 | 8.2（0.37x） |
+| TensorSharp（`--draft-model`） | 20.7 | 13.9（0.67x，接受率 70.9%） |
+
+M5 的 GPU 让验证批与草稿模型自身的前向相对普通 token 而言都很昂贵（构建这项功能所用的
+CUDA 主机比例正好相反，在那里 DFlash 是 1.3–5 倍的收益）。在这里 TensorSharp 的退化比
+llama.cpp 小得多，并且挂上草稿模型之后，自适应调控器能让起草路径保持在它所能达到的最好
+水平约 5% 以内 —— 但如果今天在 Apple Silicon 上在意延迟，请用普通 decode。
+
+### 更早的 CUDA 测量（RTX PRO 6000 Blackwell，2026-08-13）
+
+在下文这一轮优化的前一天测得，此后没有重跑（基准机已下线），因此早于那里列出的所有
+改动。单张 **NVIDIA RTX PRO 6000 Blackwell Server Edition**（97,887 MiB，
+`CUDA_VISIBLE_DEVICES=0`），`Muse-Glimmer-30B-Q8_0.gguf`（27.6 GiB），草稿模型
+`dflash-kquant.gguf`（1.5 GiB）；TensorSharp commit `5098e3f`、内置 ggml `8846b79`，
+`--backend ggml_cuda`，对手是以相同 CUDA 架构构建的 llama.cpp master `8e7f22b`
+（`-b 2048 -ub 2048`）。两侧都是贪心，生成 128 token，每个点重复两次且两个引擎交替执行；
+两个引擎 prefill 的是同一段渲染后的提示词（`TensorSharp.Cli --dump-prompt`，token 数用
+`llama-tokenize` 核对）。两次重复的均值，tok/s；比值为 TensorSharp / llama.cpp：
 
 | 提示 token 数 | llama.cpp prefill | TS prefill | 比值 | llama.cpp decode | TS decode | 比值 |
 |---|---:|---:|---:|---:|---:|---:|
@@ -202,25 +338,9 @@ TensorSharp 领先。
 | 64575 | **1256** | 1150 | 0.92x | **32.4** | 29.1 | 0.90x |
 | 123931 | **1166** | 1073 | 0.92x | **30.7** | 26.6 | 0.86x |
 
-整条阶梯的形状是一致的：TensorSharp 的融合整模型图在短提示上领先 1.16-1.27x，
-两个引擎在 2K 到 16K 之间交叉，再往上 llama.cpp 保持 6-8% 的 prefill 优势。
-decode 在 60 token 上下文时打平，到 128K 降到 0.86x —— 差距随 KV 长度增大，
-指向注意力路径而不是 FFN。
-
-两个引擎都能在单卡上跑满 128K 上下文。
-
-> **关于四行长上下文的说明。** 60 / 501 / 2050 三个提示对两个引擎逐字节一致。
-> 16126 / 32274 / 64575 / 123931 四行是在[基准方法说明](#基准方法说明)中提到的
-> CRLF 归一化之前测的，因此这四个点上 TensorSharp prefill 的是同一文档的 CRLF
-> 形式 —— 同样的文本，多出 1.2% 的 token（16322 / 32666 / 65359 / 125412）。
-> 吞吐是速率，对 tok/s 影响很小，但这四行上两侧生成的续写并不严格可比。
-> 修正后的重跑已排队，但基准机在跑完之前下线了。
-
-### DFlash 投机解码
-
-同一批运行加上 `--draft-model dflash-kquant.gguf --spec-draft 15`，
-对手是 llama.cpp 的 `-md … --spec-type draft-dflash --spec-draft-n-max 15 -ngld 99`。
-单位是 decode tok/s；括号内是两次重复的范围（仅在差距大时给出）。
+同一批运行上的 DFlash decode（`--draft-model dflash-kquant.gguf --spec-draft 15`，对手是
+llama.cpp 的 `-md … --spec-type draft-dflash --spec-draft-n-max 15 -ngld 99`）；括号内是
+两次重复的范围（仅在差距大时给出）：
 
 | 提示 token 数 | llama.cpp | TensorSharp | TS，`--spec-pmin 0` |
 |---|---:|---:|---:|
@@ -232,7 +352,8 @@ decode 在 60 token 上下文时打平，到 128K 降到 0.86x —— 差距随 
 | 64575 | **66.1** | 48.7（34-64） | 49.1 |
 | 123931 | **69.0** | 42.3（30-55） | 59.8 |
 
-投机在两个引擎上都要付出 *prefill* 代价，因为草稿模型的编码器也要过一遍提示词：
+投机在两个引擎上都要付出 *prefill* 代价，因为草稿模型的编码器也要过一遍提示词
+（tok/s，普通 → DFlash）：
 
 | 提示 token 数 | llama.cpp 普通 → DFlash | TensorSharp 普通 → DFlash |
 |---|---:|---:|
@@ -243,52 +364,34 @@ decode 在 60 token 上下文时打平，到 128K 降到 0.86x —— 差距随 
 | 64575 | 1256 → 985（0.78x） | 1150 → 780（0.68x） |
 | 123931 | 1166 → 920（0.79x） | 1073 → 742（0.69x） |
 
-#### 为什么 TensorSharp 那一列是区间而 llama.cpp 不是
+读这几张表时有三点限定。四行长上下文是在 CRLF 归一化之前测的，因此在这四个点上
+TensorSharp 对同样的文本多 prefill 了 1.2% 的 token（16322 / 32666 / 65359 / 125412）。
+TensorSharp DFlash 那些很宽的范围来自成本调控器：在只生成 128 token 的运行里，prefill
+之后紧接着的一次测错的探测就会让草稿模型在大半个运行中处于暂停状态（同一提示、同一二进制
+的两次 16K 重复分别是 36.7 与 74.8 tok/s）。此外，长提示来自一个高度重复的合成语料；501 token 那一点在两个引擎上的接受率都是 100%，因此它的
+DFlash 数字不代表通用的加速比。
 
-TensorSharp 在草稿模型前面放了一个**自适应成本调控器**
-（[`SpeculativeExecution`](../../TensorSharp.Runtime/Speculative/SpeculativeExecution.cs)
-的 `AdaptiveSpeculation`，默认开启）。投机只是速度优化，因此执行器会分别测量
-带起草与不带起草的 ms/token，一旦起草更慢就把草稿模型**暂停**
-`ParkedProbeInterval = 64` 步再重新探测。llama.cpp 没有这套机制 —— 它每步都起草。
-
-在只生成 128 token 的运行里，一次错误的探测就会毁掉一半测量。下面两次 16K
-重复用的是同一个提示、同一个二进制、同一份权重，唯一的差别是调控器的判定：
+两次 16K 重复唯一的差别就是调控器的判定。当时那一版调控器一旦判负就把草稿模型固定暂停
+`ParkedProbeInterval = 64` 步；此后调控器已经重做（见[自适应成本调控器](#自适应成本调控器)）。
 
 | 16K 第几次 | 起草 / 接受 | 验证步数 | 暂停步数 | decode |
 |---|---|---:|---:|---:|
 | 1 | 64 / 48（75%） | 13 | **67** | 36.7 tok/s |
 | 2 | 132 / 103（78%） | 22 | 3 | **74.8 tok/s** |
 
-第 1 次在*暂停之后*的重新探测里测到投机是 **14.0 ms/token，而普通解码是 37.8** ——
-快 2.7 倍 —— 说明当初把它暂停的判定是错的。prefill 之后最初几步投机要为验证批的
-形状付一次性的建图开销，而探测采样到的正是这几步。32K、64K、128K 上被暂停的那些
-重复都有同样的指纹（`drafted` 卡在 64-84：一个探测窗口，然后就没有了）。
+第 1 次在暂停之后的重新探测里测到投机是 **14.0 ms/token，而普通解码是 37.8**，说明当初的
+暂停判错了：prefill 之后最初几步投机要为验证批的形状付一次性的建图开销，而探测采样到的
+正是这几步。32K、64K、128K 上被暂停的那些重复都有同样的指纹（`drafted` 卡在 64-84）。
+若以未被暂停的那次作为稳态，TensorSharp 的融合 DFlash 达到 **16K 时 llama.cpp 的 94%
+（74.8 对 79.8）、64K 时 96%（63.6 对 66.5）**。
 
-若以未被暂停的那次作为稳态，TensorSharp 的融合 DFlash 达到
-**16K 时 llama.cpp 的 94%（74.8 对 79.8）、64K 时 96%（63.6 对 66.5）** ——
-而不是本文档旧版本在另一套硬件上报告的落后 1.6-2.4 倍。修复方式很明确：
-在探测之前先预热验证形状，或者把第一步投机从采样中剔除；目前尚未实现。
+`--spec-pmin 0` 那一列并非一律更好：它在 501 与 128K 上赢，在 16K 与 32K 上输得很惨 ——
+那里接受率从约 75% 掉到 24-42%，而每个被拒绝的行仍然占用一个验证槽位。2K 那一点是
+llama.cpp 的异常：它的 DFlash decode（两次都是 24.9 tok/s）低于它自己的普通 decode（35.0），
+DFlash prefill 塌了 4.4 倍；这个提示停在文档中间，因此续写比其他尺寸上"问题 + 回答"式的
+提示更难预测。
 
-#### 置信度下限
-
-TensorSharp 默认 `confMin = 0.35`；llama.cpp 这条路径上的 `p_min` 默认是 0，
-也就是永远起草满窗口。`--spec-pmin 0` 能让两侧策略可比，但它**并非**
-一律更好：在 501 与 128K 上它赢（180 对 165、60 对 42），在 16K 与 32K 上输得很惨
-（33 对 56、30 对 34）—— 那里接受率从约 75% 掉到 24-42%，而每个被拒绝的行仍然
-占用一个验证槽位。这个下限应该是自适应的，而不是常数 —— 与更早的笔记本测试得到
-的结论一致。
-
-#### 2K 处的异常属于 llama.cpp
-
-在 2050 token 的提示上，llama.cpp 的 DFlash decode（24.9 tok/s，两次都是）
-*低于*它自己的普通 decode（35.0），而它的 DFlash prefill 从 1132 塌到 259 tok/s ——
-4.4 倍的代价，远差于它在 16K 以上付出的 0.75-0.79x。TensorSharp 在同一点付出
-0.53x，decode 为 43.5。这个提示没什么特别，只是它停在文档中间，因此续写比其他
-尺寸上"问题 + 回答"式的提示更难预测。
-
-### 显存峰值
-
-单卡整进程峰值，每 2 秒采样一次（MiB）：
+单卡整进程显存峰值，每 2 秒采样一次（MiB）：
 
 | 提示 token 数 | llama.cpp 普通 | TS 普通 | llama.cpp DFlash | TS DFlash |
 |---|---:|---:|---:|---:|
@@ -298,281 +401,130 @@ TensorSharp 默认 `confMin = 0.35`；llama.cpp 这条路径上的 `p_min` 默�
 | 123931 | 30471 | 33787 | 34641 | 37769 |
 
 普通路径上 TensorSharp 比 llama.cpp 多占 1.3-3.3 GB，加载草稿模型后大约多 3 GB。
-两者在 96 GB 卡上跑 128K 都绰绰有余；在 40 GB 卡上，128K + DFlash 是第一个装不下
-的组合。
 
-### 输出一致性
-
-贪心验证在*精确算术*下让 DFlash 无损 —— 验证批会用主干重新给每个起草行打分，
-只保留主干自己也会产生的前缀。但在浮点下，验证 GEMM 的形状与单行 decode 的 GEMM
-不同，logits 的末位不同，接近平局的位置就可能翻转。这批运行的实测：
+这批运行的输出一致性（贪心验证在浮点近平局之外复现普通贪心的输出，见第 3 节）：
 
 * TensorSharp 是**确定性的**：每个配置与自己的重复运行逐字节一致。
 * TensorSharp 普通 vs TensorSharp DFlash：在 60 / 501 / 2050 / 16126 上完全一致，
   在 32274 上分叉。
 * llama.cpp 普通 vs llama.cpp DFlash：除 2050 外处处一致。
+* 跨引擎对比时，两条续写在前 127-636 个字符内一致，之后分开：同样的权重上不同的内核与
+  不同的归约顺序。
 
-两个引擎在同一语料上表现出同样的行为，因此这是平局翻转，而不是验证 bug。
-跨引擎对比时，两条续写在前 127-636 个字符内一致，之后分开 —— 同样的权重上不同的
-内核与不同的归约顺序，这是预期结果。
+方法说明。每个上下文都按 llama.cpp → TensorSharp → llama.cpp DFlash → TensorSharp DFlash
+的顺序执行，因为先跑完一个引擎的整条阶梯会让另一个偏低。整个测试期间 GPU 一直报告
+`HW Power Brake Slowdown: Active`（2280-2347 MHz，功耗 180-270 W、上限 450 W，温度 28-42 C），
+这是主机层面的功率制动，对两个引擎一视同仁；大约每二十次运行会有一次在 prefill 和 decode
+上同时慢约 40%，且没有任何频率或温度上的痕迹，因此在那台机器上对单次重复的差值要保持怀疑。
 
-### 基准方法说明
+### 2026-08-14 这一轮改了什么
 
-有五件事对数字的影响大于被测效应本身，因此记录在此，免得重新踩：
+下面每一项优化在保留之前都验证过数值中性（同一二进制上，各 A/B 环境变量下的贪心续写
+逐字节一致）。
 
-* **交替执行两个引擎。** 先跑完一个引擎的整条阶梯再跑另一个，会让后者偏低。
-  这里每个上下文都是 llama.cpp → TensorSharp → llama.cpp DFlash → TensorSharp DFlash。
-* **给 llama.cpp 套好模板的提示词**（见上）。在 60 token 那一点，差别是 3 倍的
-  提示长度。
-* **先统一换行符。** 长提示文件原本是 CRLF。把 LF 版本交给 llama.cpp 后，
-  TensorSharp prefill 了 16322 个 token 而 llama.cpp 只有 16126 —— 同样的文本、
-  多 1.2% 的 token、不同的续写。在相信任何长上下文数字之前，先比对两侧报告的
-  提示 token 数。
-* **做投机对比时，两侧都用贪心。** CLI 从 `SamplingConfig.Greedy` 起步，这正
-  对应 llama.cpp 的 `--temp 0`，所以一个采样参数都不要传。投机本身如今可与采样
-  组合（验证会用本次运行自己的采样器抽取每一行），但块级草稿器的提案不带惩罚项，
-  接受率会随之变化——那样得到的就不是一次干净的对照。检查日志里有
-  `cli.inference speculative:` 一行，确认投机确实启用了。
-* **128 个生成 token 对投机对比来说太短。** 它比两个暂停区间还短，一次调控器误判
-  就能让数字差 2 倍（见上面的 16K 两次重复）。
+1. **持久化 decode 图现在覆盖 Metal 与 CPU**（`ggml_ops_muse_glimmer.cpp`，以前只有
+   CUDA/Vulkan）。Metal 没有 CUDA 图那样的机制 —— 每次提交都要重新编码节点 —— 但重放
+   路径仍然去掉了逐 token 的图元数据重建（约 2,000 个节点）、约 790 次张量重新绑定、
+   gallocr 的生命周期重新规划、104 次小 norm 重新上传，以及 O(context) 的整类掩码重新
+   生成（重放改为每 token 只把该掩码延长 2 字节）。Metal 上 2K 上下文的同二进制归因：
+   decode 19.5 -> 21.3 tok/s（+9%）。
+2. **Metal 图会经过后端的 `graph_optimize` 重排**（能识别别名、扩大编码器并发集合的
+   重排），但**只在持久化构建上**：`ggml_backend_sched` 会为 llama.cpp 自动做这件事，
+   直接调用 `graph_compute` 则不会。对每次临时构建都做重排实测是净亏损（重排的开销超过
+   一次提交能省下的时间），因此 prefill 分块跳过它。
+3. **图内 embedding 现在是 Metal 与 CPU 上的默认行为。** 在统一内存上，量化的
+   `token_embd` 从 GGUF mmap 零拷贝绑定，因此独显上的那种取舍（再钉住一个约 1.1 GB 的
+   张量）并不存在。这去掉了每个 decode token 的一次主机逐行反量化、一次张量分配与一次
+   RMSNorm 调度，以及每个 2048 行 prefill 分块 54 MB 的隐状态上传。
+4. **掩码填充改为区间填充并并行化。** `fill_mg_mask` / `fill_mg_ring_mask` 每行写三次
+   块填充，而不是逐元素循环，超过 2M 个元素时最多分给 8 个线程。在没有设备端填充内核的
+   后端（Metal、CPU）上，64K 上下文下一个 2048 行的分块就是 256 MB 的掩码；过去这是每个
+   分块几十毫秒的单线程工作。
+5. **共享的 ggml CPU 后端有了真正的多线程。** 裸的 `ggml_backend_cpu_init()` 使用
+   `GGML_DEFAULT_N_THREADS`（4），并且**每次 graph_compute 都新建一个一次性线程池** ——
+   逐算子路径每个 decode token 要付出约 940 次线程池的创建/回收，而且只用 18 个核中的
+   4 个。后端现在固定一个按全部物理核（`hw.physicalcpu`）设定大小的持久
+   `ggml_threadpool`（llama.cpp 默认只用 P 核，这对该负载的 decode 来说少拿了 2 倍）。
+   `TS_GGML_CPU_THREADS` 可以覆盖。
+6. **融合整模型内核现在也在 GgmlCpu 上运行**（它曾是仓库里唯一排除 CPU 的融合内核；
+   GPT-OSS 与 Gemma 4 早已包含）。每 token 一张图，取代约 940 次同步的逐算子提交。历史上
+   "1024 行融合图在预热时让 CPU 后端崩溃"的问题没有复现 —— 2048 行预热与整套 parity 测试
+   都能通过。`TS_MUSE_GLIMMER_FUSED_CPU=0` 可恢复 CPU 上的逐算子路径。
+7. **GgmlCpu 保留统一尺寸的 KV 缓存（不用 SWA 环）。** 环要整体读取（槽位不按位置
+   顺序），而 ggml-cpu 的 flash-attention 会计算每一个 KV 列，无论是否被掩掉 —— 因此
+   52 层中的 39 层在任何深度都要付出完整 4352 行环的注意力开销，而统一缓存的滑动区间
+   只有在上下文真的那么长时才需要 `pad256(window + chunk)`。GPU 后端保留环：它们固定的
+   图形状正是持久化图（以及 CUDA 捕获）得以成立的前提，而且它们的 flash 内核会跳过完全
+   被掩掉的块。
+8. **MLX prefill 的每个分块都留在设备上。** 快速 SDPA 路径过去只接受第一个 prefill
+   分块；第 2 个及以后的分块会退到一条链：把整个 KV 缓存下载到主机、在 F32 中把 GQA
+   展开 16 倍，并为主机侧掩码往返一个 `[32, seqLen, kvLen]` 的打分张量 —— 每层、每个
+   分块都如此。`MlxFusedOps.TryPrefillAttentionBanded` 现在**在设备上**构建因果（+SWA）
+   带状掩码（两个 arange + 比较 + where，作为数组掩码传给
+   `mlx_fast_scaled_dot_product_attention`），而且滑动窗口层把缓存读取收窄到
+   `[qStart − window + 1, total)`，长 prefill 就不会去给窗口外的 key 打分。第一个分块仍用
+   普通的 `"causal"` 字符串掩码，完全不需要掩码数组。
+9. **修复了两个潜伏的 Metal 竞态**（正确性问题，通过审查发现，两者都早已存在）：Metal
+   的 `graph_compute` 是异步的，而共享缓冲区上的 `tensor_get` 是一次裸 memcpy，因此
+   (a) DFlash 的捕获行与 (b) 草稿模型的 argmax id 都可能在执行中途被读取。(a) 会污染
+   草稿模型的编码器特征；(b) 会悄悄验证过期的草稿 —— 输出仍然正确，但接受率崩塌。两条
+   路径现在都在读取之前同步。
 
-整个测试期间 GPU 一直报告 `HW Power Brake Slowdown: Active`，频率 2280-2347 MHz，
-功耗 180-270 W（上限 450 W），温度 28-42 C —— 这是主机层面的功率制动，不是温度
-降频，而且对两个引擎一视同仁。大约每二十次运行会有一次在 prefill 和 decode 上
-同时慢约 40%，且没有任何频率或温度上的痕迹（llama.cpp 32K DFlash 第 2 次最明显：
-603 / 42.8 对 1017 / 78.6，而两次运行逐字节一致）。在这台机器上，对单次重复的
-差值要保持怀疑。
+### 仍在约束设计的工程笔记
 
-### 语料比引擎更影响数字
-
-长提示来自 `.parity/gen_long_prompts.py`，它生成的是高度重复的合成文档
-（"Chapter *n*. The *n*th study …"），提出的问题的答案几乎逐字引用某一章。
-在这种文本上起草几乎全中 —— 501 token 那一点在**两个引擎上都是 100% 接受率**，
-所以它的 DFlash 数字（117-180 tok/s）是普通 decode 的 3-5 倍，不应被当作通用的
-投机加速比。自然文本上的接受率更接近 16K-128K 各行显示的 55-78%。用这些行来
-比较引擎，但不要把 DFlash 的绝对值当成聊天负载会看到的数字。
-
-### 逐算子路径为什么慢
-
-瓶颈不是算术，是调度。逐算子前向在 52 层上提交约 600 个 GGML 算子，每个都带一次
-主机可见的往返。在 RTX 3080 Laptop 上实测：1 行前向约 262 ms，74 行前向约
-1332 ms，也就是每次前向约 262 ms 的*固定*开销加每行约 14 ms。本仓库里所有达到
-llama.cpp 级 decode 吞吐的模型都是靠同一个办法 —— 一个整模型内核。
-
-### 融合内核
-
-[`ggml_ops_muse_glimmer.cpp`](../../TensorSharp.GGML.Native/ggml_ops_muse_glimmer.cpp)
-导出 `TSGgml_MuseGlimmerModelForward`，把整个模型 —— 全部 52 层、最终 norm、
-LM head、logit 缩放与 tanh 软上限 —— 构建成**一张** ggml 图。它在数值上与
-`TransformerBlock` 是同一条链：相同的算子顺序、相同的 epsilon、同样只在滑动窗口层
-上使用 NORM 风格 RoPE、同样的注意力输出门控。`TS_MUSE_GLIMMER_FUSED=0` 可强制
-走逐算子路径做 A/B。
-
-真正起作用的设计点：
-
-* **持久、可捕获的图。** 图只构建一次且张量地址稳定（用裸 `ggml_init` +
-  `ggml_backend_alloc_ctx_tensors`，而不是会按生命周期重排地址的 gallocr），
-  ggml-cuda 因此可以捕获它，一个 token 就是一次重放。图的拓扑在步与步之间保持
-  逐字节一致：KV 用 `ggml_set_rows` 写入（写入行号是一个 I64 *输入*），读取的是
-  按 256 行对齐填充的窗口，配一个 F16 掩码输入 —— 于是每 256 个 token 才重建一次，
-  而不是每个 token 都重建。
-* **图池的键是 `(模型, KV 持有者, n_tokens)`。** 投机运行会交替 1 行 decode 与
-  k 行验证批，k 还会变；若键里不含 `n_tokens`，这些形状会互相把对方挤出同一个
-  槽位，每一步都要完整重建。
-* **prefill 用共享 gallocr，decode 不用。** prefill 分块的中间结果按行增长 ——
-  仅 `[2*n_ff, n_tokens]` 的 gate/up 在 1024 行时每层就是 163 MB —— 给每个节点
-  单独分配需要约 47 GB。`alloc_graph_reuse_gallocr` 按生命周期打包，这才让多行
-  融合图装得下。
-* **KV 缓存在分配时清零。** `ModelBase.InitializeCacheTensor` 在 GgmlCuda 上跳过
-  清零，因为逐算子注意力只读自己写过的行。融合内核读的是*填充后*的窗口，多出来的
-  行用 `-inf` 掩掉 —— 而 `-inf + NaN` 仍是 NaN，所以那些行必须是有限值。
-* **仅 CUDA / Vulkan。** GgmlCpu 保留逐算子路径：1024 行的融合图在那里会崩，
-  提供优雅回退好过发布一个崩溃。
-* **图内 embedding 是可选项。** 内核可以自己做 embedding gather 与无权重输入 norm，
-  但绑定 202K x 6656 的表会额外钉住约 1.1 GB 张量；在 16 GB 卡上这会挤掉层权重，
-  代价超过省下的两次调度（18.5 -> 16.1 tok/s）。因此只有当 LM head 与该表绑定
-  （本来就常驻）或显式设置 `TS_MUSE_GLIMMER_INGRAPH_EMBED=1` 时才启用。
-
-### 融合的 DFlash 草稿模型
-
-草稿模型曾经是投机亏损的根源：每个投机步，托管实现要为约 2.5 GB 的权重读取发出
-约 150 次 GPU 调度 —— 大约是一次目标前向的四分之一 —— 耗时约 100 ms。
-[`ggml_ops_dflash.cpp`](../../TensorSharp.GGML.Native/ggml_ops_dflash.cpp)
-把它变成两张图：
-
-* `TSGgml_DFlashInject` —— `fc` -> RMSNorm -> 每个草稿层
-  {k/v 投影、逐头 k norm、NeoX RoPE、`ggml_set_rows` 写环}。
-  没有 Q、没有注意力、没有 FFN、没有 LM head。llama.cpp 的 `build_dflash`
-  也在同一点提前返回。
-* `TSGgml_DFlashDraftBlock` —— `[anchor, MASK x (b-1)]` 过完 5 个草稿块，
-  然后是*主干的* LM head（借用，绝不复制）和一次 softmax。
-
-两者都是持久且可捕获的。这里 TensorSharp 与 llama.cpp 分道扬镳：后者在草稿上下文
-上**得不到**任何图复用 —— `gf_res_prev` 是 encode 与 decode 共用的一个槽位，而
-DFlash 的循环 ENCODER -> DECODER(embd) -> DECODER(token) 永远无法满足 `can_reuse`，
-所以这三次调用每步都要重建。llama.cpp 把重建做得很便宜；融合则是彻底避免它。
-
-有两个细节让捕获成为可能：
-
-* **注意力读整个环**，`kv_len = ring_rows + b`，跨步固定。注意力在 KV 轴上是
-  置换不变的，所以环的循环顺序无关紧要，而一个按槽位位置映射构建的主机侧掩码
-  正好表达了哪些槽位是活的。
-* **掩码的截断点是 ANCHOR 的位置，不是 query 的位置。** 部分拒绝之后，环里仍然
-  留着草稿模型为 anchor 之后的位置写入的 key；那些行已经过期，块内任何 query 都
-  不得看到它们，哪怕自身位置更靠后的那些也不行。逐算子路径天然没有这个问题，
-  因为它只会去取 `[winStart, anchor)`。
-
-**设备端 top-1。** llama.cpp 每个起草步都把整块 `[202048, 16]` 概率拉回主机 ——
-12.9 MB 过 PCIe 外加一次 320 万元素的扫描，`common_sampler` 随后还要*为块内每个
-位置*物化一个 202048 项的数组。内核则以 `ggml_argmax` 加一次 `get_rows` 取回胜出
-概率收尾，只返回两个 16 元素张量。argmax 在 softmax 下不变，而胜出概率正是执行器
-要累乘的那个置信度。
-
-在做这项工作的 RTX 3080 Laptop 上，融合草稿模型把 decode 从 15.8-16.4 提到
-26.0-27.0 tok/s，而起草统计（`drafted=96 accepted=75`，78.1% 接受率）与逐算子
-草稿模型逐字节一致 —— 融合改变的是速度，不是任何一个采样出来的 token。
-`TS_DFLASH_FUSED=0` 可强制使用逐算子草稿模型做 A/B。
-
-### 每类注意力一张掩码，而不是每层一张
-
-这就是长上下文 prefill 差距的全部原因。
-
-内核过去在逐层循环**内部**分配 F16 注意力掩码，于是一张图携带 52 个掩码张量 ——
-以及 52 次主机侧拷贝 —— 尽管其内容只取决于 `(window, n_tokens, start_pos)`，
-而所有滑动窗口层共享一个窗口、所有全注意力层共享另一个。真正不同的缓冲区从来
-只有两个；decode 重放路径早就证明了这一点：它只构建两个，然后循环上传到全部 52 个
-张量里。
-
-在 64K、分块 2048 时，这是 13 x [65536, 2048] + 39 x [4352, 2048] 的 F16 =
-**每个分块 3.90 GB 的掩码**，而卡上只有 16 GB 且已被 9.2 GB 权重占用。比常驻更糟的
-是，这些掩码全部由*主机*用逐元素的标量循环生成再推过 PCIe —— 而且在 prefill 路径上
-走的是同步的 `ggml_backend_tensor_set`，每次拷贝后都要完整 `cudaStreamSynchronize`：
-每个分块 52 次停顿，一个 64K 提示就是 1664 次。整个 64K prefill 累计生成并上传了
-约 75 GB 的掩码。
-
-llama.cpp 从来没有这个问题：`build_attn_inp_kv_iswa` 每张图只创建两个掩码
-（`llama-graph.cpp:3266,3276`），逐层选择只是一次指针挑选（`:3042`）。
-
-共享之后 3.90 GB 变成 273 MB，每个分块两次上传。在 RTX 3080 Laptop 的 64K 上实测：
-**prefill 353 -> 486 tok/s，显存峰值 16059 -> 12671 MiB。** 共享是安全的，因为
-没有人写掩码 —— `ggml_flash_attn_ext` 把它当 `src[3]`、`ggml_soft_max_ext` 当
-`src[1]`，两个 CUDA 内核都以 `const` 绑定。
-
-同时落地的还有三件小事：
-
-* **prefill 路径上掩码改为在 GPU 上生成**，直接写进设备缓冲区，彻底去掉主机填充与
-  H2D 上传。因果掩码内核本来就有（`ggml_ops_mask.cu`，为 Gemma 4 验证内核写的）；
-  滑动窗口层需要新增 `tsg_cuda_fill_ring_mask_f16`，因为环的列不按位置顺序排列。
-  decode 仍走 `decode_input_set_async`，那是 CUDA 捕获安全的路径，而且单行本来就
-  很便宜。
-* **SwiGLU 变成单个 `GGML_OP_GLU` 节点**，取代 view + 2x `cont` + `silu` + `mul`。
-  这样每层少了三个 `[n_ff, n_tokens]` 临时量 —— 每行每层约 479 KB 流量，
-  每个 decode token 约 156 次调度。注意 `ggml.h` 对 `ggml_glu` 的注释说门控是
-  后一半，这与内核矛盾；以内核为准（`swapped=false` 对*前*一半施加 SiLU），
-  parity 测试也证实了这一点。
-* **K/V 写入路径上的两次 `ggml_cont` 去掉了。** `ggml_set_rows` 只断言
-  `ggml_is_contiguous_rows` 而不是完全连续，而 `0,2,1,3` 的 permute 已经满足 ——
-  那两次拷贝是纯开销，每个 token 104 次内核。
-
-已经试过并否决的做法，不要再试：**用更小的 prefill 分块来缩小 SWA 环只会更糟。**
-64K 上分块 2048（环 4352）是 475.6 prefill / 16.1 decode；分块 1024（环 3328）是
-443.2 / 15.7；分块 512（环 2816）是 421.9 / 15.1（均为 RTX 3080 Laptop、IQ2_XXS）。
-decode 在这里不是 KV 带宽瓶颈 —— 两个引擎都只跑到峰值带宽的约 35-39%，因为
-IQ2_XXS 的 matvec 是 ALU 瓶颈 —— 所以更小的环没有收益，而更小的分块会损失 GEMM
-效率。llama.cpp 的环更小（2560 行）只是因为它默认 `n_ubatch` 是 512，这不是值得
-照搬的优势。
-
-### 长提示：分块与 SWA 环
-
-在 16K+ 的提示能跑起来（更别说跑得快）之前，有两件事必须先改。
-
-**prefill 是分块的。** `ForwardCore` 把长于 `TS_MUSE_GLIMMER_PREFILL_CHUNK`
-（默认 2048）的输入切块，正如 llama.cpp 在 `n_ubatch` 处切分。不切的话，
-16336 token 的提示会构成一张激活量随行数增长的图，在融合与逐算子两条路径上都会
-分配失败 —— 16K token 的 KV 不到 1 GB，但一张 16K 行的图需要几十 GB。多模态提示
-永远不分块：视觉行按绝对偏移注入，待处理列表要一次性排空。
-
-**滑动窗口层有自己的小环。** 52 层里有 39 层永远不会回看超过 `n_swa`（2048），
-按完整上下文给它们分配缓存等于浪费掉绝大部分。64K 时统一的 F16 KV 是 3.5 GB；
-llama.cpp 只分配 954 MB，因为 `llama_kv_cache_iswa` 把 SWA 缓存定为
-`min(n_ctx, n_swa + n_ubatch)`。在一张已经装着 9.2 GB 权重的 16 GB 卡上，这个差值
-就是全部余量 —— 一次 64K 纯文本运行峰值达到 **16384 中的 16059 MiB**，并因内存压力
-损失吞吐。
-
-TensorSharp 现在给 SWA 层分配 `pad(n_swa + chunk + 1, 256)` 行（默认分块下是
-4352），并按 `position % rows` 索引。64K 时这是 **1049 MB 而不是 3.5 GB
-（统一缓存的 29%）**，在笔记本卡上换来 64K 处 +56% 的 prefill（226 -> 353 tok/s）
-与 +15% 的 decode（13.4 -> 15.4 tok/s）。
-
-值得知道的细节：
-
-* **内核读整个环，而不是一个子区间。** 环的槽位不按位置顺序排列，因此没有可以
-  收窄的连续窗口。读满 `rows` 行让图的形状*固定*，这也是 CUDA 捕获能成立的原因；
-  `fill_mg_ring_mask` 负责承载存活性、因果性与窗口。因此 SWA 层多了一个 I64
-  写入索引输入（`kv_index_swa`），保存 `position % rows`，而全注意力层仍用原始
-  `position`。
-* **那个 `+1` 是有意义的。** 恰好取 `n_swa + chunk`（4096 行）时，一个 4651 token
-  的提示在*第一个 decode 步*就与 llama.cpp 分叉；4352 行是能精确复现 llama.cpp 的
-  最小尺寸。这与 `DFlashConfig.RingRows` 已经使用的余量（`n_swa + block_size + 1`）
-  相同。
-* **只有在融合内核可用时环才会启用**，因为逐算子注意力把缓存行当作绝对位置。
-  如果环已启用而融合前向拒绝执行，逐算子路径会抛异常，而不是悄悄返回错误 logits。
-  `TS_MUSE_GLIMMER_SWA_RING=0` 恢复统一尺寸。
+* **为什么要融合：** 逐算子前向每个 token 提交约 600–940 个 GGML 算子，每个都有主机
+  可见的开销；本仓库中每个达到 llama.cpp 级 decode 的模型，都是每次前向只跑**一张**
+  整模型图（`TSGgml_MuseGlimmerModelForward` —— 全部 52 层、最终 norm、LM head、logit
+  缩放与软上限）。`TS_MUSE_GLIMMER_FUSED=0` 可强制走逐算子路径。
+* **持久、可捕获的图。** decode 图只构建一次且张量地址稳定（用裸 `ggml_init` +
+  `ggml_backend_alloc_ctx_tensors`，而不是会按生命周期打包、移动地址的 gallocr）。拓扑
+  在步与步之间保持逐字节一致：KV 用 `ggml_set_rows` 写入（写入行号是一个 I64 *输入*），
+  读取的是按 256 行对齐填充的窗口，配一个 F16 掩码输入 —— 于是每 256 个 token 才重建
+  一次，而不是每个 token 都重建。在 CUDA 上重放还会被图捕获。图池的键是
+  `(model, KV holder, n_tokens)`，因此 1 行 decode 与 k 行验证的形状永远不会互相挤出。
+* **每类注意力一张掩码，而不是每层一张。** 掩码只取决于 `(window, n_tokens, start_pos)`；
+  所有滑动窗口层共享一个张量，所有全注意力层共享另一个（52 个掩码 -> 2 个）。llama.cpp
+  一直如此（`build_attn_inp_kv_iswa`）。在 CUDA 上 prefill 掩码由设备内核填充；Metal/CPU
+  在主机上填充（已并行化，见上文）。
+* **prefill 是分块的**，分块大小为 `TS_MUSE_GLIMMER_PREFILL_CHUNK`（默认 2048），正如
+  llama.cpp 在 `n_ubatch` 处切分；一张 16K 行的图需要几十 GB 的激活。多模态提示同样
+  分块：`ForwardChunked` 会把待注入的视觉区间重新切分到每个分块上。prefill 走共享的复用 gallocr（按生命周期打包中间结果）；
+  decode 不走（稳定地址更重要）。
+* **SWA 环**（GPU 后端）：52 层中有 39 层永远不会回看超过 2048，因此它们用一个
+  `pad(n_swa + chunk + 1, 256)` = 4352 行、按 `position % rows` 索引的环，而不是完整
+  上下文的缓存 —— 64K 时是统一缓存的 29%。那个 `+1` 是承重的（不加它时，一个 4651 token
+  的提示在第一个 decode 步就与 llama.cpp 分叉）。内核读整个环（槽位不按位置顺序）；由
+  掩码承载存活性。只有在融合内核可用时环才会启用；如果环已启用而融合前向拒绝执行，逐算子
+  路径会抛异常，而不是悄悄返回错误的 logits。`TS_MUSE_GLIMMER_SWA_RING=0` 恢复统一尺寸。
 * **已回卷的环上，回退深度受余量限制。** 截断缓存只移动写入位置；被回卷覆盖的行
   不会回来，而下一个 query 仍要回看新位置之前完整的一个窗口。因此自缓存上次清空以来序列长度
-  一旦超过过环，只有满足 `furthest - target <= rows - n_swa - 1` 时才接受回退，其中 `furthest`
+  一旦超过环的大小，只有满足 `furthest - target <= rows - n_swa - 1` 时才接受回退，其中 `furthest`
   是序列曾达到的最大长度（而不是当前长度：之前的回退可能已把它降回环大小以下）。默认分块下为
   2303 个 token，覆盖引擎 16 token 的 live-cache 回退。更深的回退会被拒绝——
   `CanTruncateKVCache`/`TryTruncateKVCache` 返回否，本轮改为重新 prefill，
   `TruncateKVCache` 抛异常。尚未回卷的环、统一尺寸的缓存以及回退到 0 仍可回退到任意深度
   （`KvBlockTransferRingTests`）。
-* **宽于 `rows - n_swa` 的前向会被拒绝。** 分块从构造上保证文本提示不会超，
-  但多模态提示故意不分块（视觉行按绝对偏移注入），因此它是唯一可能提交超宽批次的
-  路径 —— 那会把两个活跃位置映射到同一个环槽位，静默污染全部 39 个滑动窗口层。
-  `ForwardCore` 选择抛异常。
-
-托管侧同时应用的改动：
-
-* 逐算子 **prefill** 路径上把 `ffn_norm` + gate/up + SiLU-mul + down 合进一张 GGML
-  图（`TryFusedDenseFFNProject`；prefill +53-76%，单行 decode -9%，因此只用于
-  prefill）。这现在是回退路径。
-* 视觉塔保持量化（1.94 GB 而不是 7.4 GB）。
-* 逐算子 decode 注意力支持 F32、F16 与块量化 KV 缓存，因此
-  `ApplyModelAlignedKvCacheDefault` 选择的 F16 会被尊重。
-
-### CUDA 上填充后的 KV 窗口必须物化
-
-ggml-cuda 的 flash-attention **vec** 内核 —— 也就是
-`ggml_cuda_get_best_fattn_kernel` 为单行 query（即每个 decode 步）选中的那个 ——
-在 K/V 是"某个更长轴的*截断前缀*"视图时会返回错误结果。扁平缓存上的填充注意力窗口
-正是这种形状：一个全注意力层从 `cache_size` 行的张量里读 `[0, window_full)` 行，
-于是 KV 头的 stride 会跨过未读的尾部。
-
-一旦看张量就会发现问题一点都不隐晦：在第一个全注意力层（第 3 层），
-**共享同一个 KV 头的 16 个 query 头返回了完全相同的输出向量**，绝对误差最大 4.6。
-用内核收到的那些 `q`/`k`/`v`/`mask` 张量在主机上重算注意力，能复现连续版本的结果
-到 2e-6 —— 输入是对的，内核是错的。误差随后在剩下 49 层里累积成另一条 token 流：
-模型不再复述提示词，而是开始结巴（`请详细介绍详细介绍最终最终幻想幻想7`）。
-
-有三件事把它藏住了：
-
-* **滑动窗口层读的是整个环**（`window == rows`），它们的视图本来就是连续的 ——
-  只有 13 个全注意力层受影响；
-* **prefill 没问题**，因为多于一行 query 会选中 MMA 内核，那个内核确实尊重 stride。
-  prefill 的 logits 与逐算子路径吻合到 4e-4 并选出同一个 top-1 token，所以分叉只在
-  第一个 decode 步之后才显现；
-* **Metal 与逐算子路径都是对的**，这让融合 CUDA 路径显得像个异类，而原因其实与这个
-  内核毫无关系。
-
-在窗口上加一次 `ggml_cont` 就能修好。判定条件必须是"窗口是缓存的一个子区间"，
-**而不是** `ggml_is_contiguous(k_full)`：`ggml_is_contiguous_n` 会跳过 `ne` 为 1 的
-维度，因此在只有一个 KV 头时（`--tp 2` 下每个 rank 正是如此），一个被截断的窗口会
-自称连续，守卫就把坏形状放了过去。在判定停止咨询 `ggml_is_contiguous` 之前，
-`--tp 2` 会复现出一模一样的错误 token 流。
-
-代价测不出来：50 token 提示上 decode 40.5 → 40.5 tok/s、prefill 465 → 465 tok/s；
-12371 token 提示上 prefill 1159 → 1197、decode 38.2 → 37.7（2x RTX PRO 4000
-Blackwell）。只有窗口小于缓存时才会走这次拷贝，而那也正是它便宜的时候。
+* **跨请求的前缀复用**以分页家族的方式走 Radix 前缀缓存（默认模式）：缓存的 KV 块加上
+  常驻的主缓存（`MuseGlimmerModel.PrefixCache.cs`）。常驻缓存的回退最多 16 个 token，
+  并且还必须在上一条所说的环余量之内；带图像的提示不会复用其第一张图像起点之后的任何内容。
+* **只有在 ggml 自己的 flash-attention VEC 内核会被选中时，CUDA 才物化填充后的 KV
+  窗口** —— 该内核会误读被截断前缀的 K/V 视图（共享同一个 KV 头的 16 个 query 头全都
+  返回同一个错误向量）。`kv_window_needs_cuda_flash_attn_copy` 镜像了
+  `ggml_cuda_get_best_fattn_kernel`：当 `gqa_ratio >= 2` 时，在 Turing/Ampere 上直接跳过
+  拷贝，在 Ada+ 上窗口 ≥ 8192 行时跳过（MMA 内核尊重 stride）。若无条件拷贝，每个 decode
+  步要多 26 个 `ggml_cont` 节点，128K 时每 token 高达 3.3 GB 的流量。`TS_KV_FATTN_COPY`
+  （`0`/`force`）可以固定任一行为；每次升级 `ExternalProjects/ggml` 时都要重新核对这个镜像
+  的启发式。Metal 不需要拷贝 —— 它的 flash 内核完全通过 stride 寻址 K/V。
+* **GPU 后端上 KV 缓存在分配时清零**：融合内核读的是*填充后*的窗口，多出来的行用 `-inf`
+  掩掉，而 `-inf + NaN` 仍是 NaN，所以那些行必须是有限值。
+* **SwiGLU 是单个 `GGML_OP_GLU` 节点**（`swapped=false` 对*前*一半施加 SiLU —— 以内核
+  为准，`ggml.h` 的注释不可信，两半弄反时 parity 测试会大声失败）。K/V 写入路径直接在
+  `0,2,1,3` permute 上用 `ggml_set_rows`（真正的前提是 `ggml_is_contiguous_rows`；被它
+  取代的 `ggml_cont` 拷贝纯属开销）。
+* **通过调小 prefill 分块来缩小 SWA 环会让一切更糟**（CUDA 上 64K 实测：分块
+  2048/1024/512 -> prefill 476/443/422，decode 16.1/15.7/15.1 tok/s）。在 IQ2_XXS 上
+  decode 不受 KV 带宽限制 —— matvec 是 ALU 瓶颈 —— 所以更小的环没有收益，而更小的分块会
+  损失 GEMM 效率。
 
 ## 6. 张量并行
 
@@ -590,19 +542,13 @@ Blackwell）。只有窗口小于缓存时才会走这次拷贝，而那也正�
 注意力输出门控与 Q 一起列并行，并在行并行 `o_proj` **之前**、在每个 rank 的区域
 **内部**施加。两个 AllReduce 点都落在原始矩阵乘的输出上，也就是 1e-8 post-norm
 **之前** —— RMSNorm 是非线性的，在它之后归约会产生看似通顺但错误的输出。
-52 层合计每步 104 次归约。
 
 `TSGgml_MuseGlimmerModelForward` 接收一对 `tp_degree` / `tp_plan_out`：在 TP 模式下
 它为每个 rank 构建图并返回 `TpRankPlan` 而不是直接执行，由驱动在段边界带着集合通信
-运行所有 rank。逐算子的 TP 路径作为回退存在，但慢得多（方案文档实测逐算子 TP 只有
-单卡的 0.01–0.04 倍）。
+运行所有 rank。
 
-DFlash 投机解码与分页 KV 块快照只走单卡路径；`--tp` 下的多轮复用来自活跃缓存续接。
-
-### 双 GPU
-
-在 **2x RTX PRO 4000 Blackwell 24 GB（PCIe）** 上测量 —— 与上面单卡表格不是同一台
-机器，且未在 2026-08-13 这一轮中重测。prefill 512 / decode 64，三次取最好：
+在 2× RTX PRO 4000 Blackwell 24 GB（PCIe）上测量，prefill 512 / decode 64，三次取最好
+—— 这是迄今唯一测过 TP 的主机：
 
 | 模型 | | prefill tok/s | decode tok/s | GPU 0 | GPU 1 |
 |---|---|---|---|---|---|
@@ -610,33 +556,39 @@ DFlash 投机解码与分页 KV 块快照只走单卡路径；`--tp` 下的多�
 | 30B-UD-IQ2_XXS | `--tp 2` | **1569**（1.34×） | **63.2**（1.57×） | 5115 MB | 4063 MB |
 | 30B-Q8_0（28.2 GB） | `--tp 2` | 1691 | 34.3 | 15474 MB | 12748 MB |
 
-Q8_0 没有单卡行：28.2 GB 权重在一张 24 GB 卡上根本装不下，`--tp 2` 是唯一能跑起来
-的方式。
+`--tp 2` 在重复运行间逐字节一致，并且与 `--tp 1` 的贪心续写在前 468 / 500 个字符上
+一致，之后在一个无害的改述点分叉（行并行部分和以不同顺序求和）。Q8_0 在那台机器上没有
+单卡行 —— 28.2 GB 装不进一张 24 GB 的卡。
 
-**正确性。** `--tp 2` 在重复运行间逐字节一致（排除了 rank 工作池里的竞态），
-并且与 `--tp 1` 的贪心续写在前 468 / 500 个字符上一致，之后在一个改述点分叉，
-两条续写都通顺 —— 这是行并行部分和以不同顺序求和的预期结果。
+DFlash 投机解码只走单卡路径：`--tp N` > 1 下配置的草稿模型会被拒绝挂载。CLI 会打印警告并按标准解码
+服务；服务端则拒绝启动（退出码 2），因为在服务端无法启用的显式 `--draft-model` 属于致命错误——去掉该参数或
+不用 `--tp` 运行即可。池化的 KV 块快照在
+`--tp` 下同样可用（快照会逐层遍历各 rank 的缓存），因此 `--tp` 下的多轮复用并不只靠
+活跃缓存续接。
 
 ## 7. 环境变量
 
 | 变量 | 作用 |
 |---|---|
-| `TS_MUSE_GLIMMER_FUSED` | `0` = 关闭融合整模型内核（逐算子 A/B） |
-| `TS_MUSE_GLIMMER_PERSIST` | `0` = 关闭持久 / 可捕获图，每次调用重建 |
-| `TS_MUSE_GLIMMER_INGRAPH_EMBED` | `1` = 即使 LM head 未绑定也强制启用图内 embedding 阶段 |
+| `TS_MUSE_GLIMMER_FUSED` | `0` = 在所有后端上关闭融合整模型内核（逐算子 A/B） |
+| `TS_MUSE_GLIMMER_FUSED_CPU` | `0` = 只在 GgmlCpu 上走逐算子路径（2026-08-14 之前的默认行为） |
+| `TS_MUSE_GLIMMER_PERSIST` | `0` = 关闭持久化 / 重放的 decode 图，每次调用重建 |
+| `TS_MUSE_GLIMMER_INGRAPH_EMBED` | `1` = 在任何后端上强制启用图内 embedding 阶段，`0` = 强制关闭（默认：LM head 与 embedding 表绑定时、Metal 与 CPU 上启用） |
 | `TS_MUSE_GLIMMER_DFLASH` | DFlash 草稿模型 GGUF 路径（等同 `--draft-model`） |
 | `TS_MUSE_GLIMMER_VENC_F32` | `1` = 把视觉塔反量化为 F32（A/B；约 7.4 GB） |
-| `TS_MUSE_GLIMMER_VENC_FUSED` | `0` = 关闭 CUDA 融合视觉块 / flash-attention 路径（诊断用回退） |
+| `TS_MUSE_GLIMMER_VENC_FUSED` | `0` = 关闭 CUDA 融合视觉块 / flash-attention 路径 |
 | `TS_MUSE_GLIMMER_GELU_TANH` | `1` = 视觉塔改用 tanh GELU 近似而非精确 erf |
 | `TS_MUSE_GLIMMER_VENC_TRACE` | `1` = 打印视觉残差流的逐阶段校验和 |
-| `TS_MUSE_GLIMMER_LAYER_TRACE` | `1` = 打印*进入*每一层的残差校验和。融合内核与逐算子循环都会输出，因此把融合运行与 `TS_MUSE_GLIMMER_FUSED=0` 运行做 diff 就能把分叉定位到某一层 |
-| `TS_MUSE_GLIMMER_LAYER_TRACE_POS` | 从该绝对位置起追踪第一次前向（跳过启动预热，其 prefill 与 decode 位置无关） |
-| `TS_MUSE_GLIMMER_LAYER_TRACE_N` | 从那里开始连续追踪多少次前向（默认 1） |
-| `TS_MUSE_GLIMMER_LAYER_TRACE_DIR` | 同时把每次追踪的残差以原始 F32 写到 `<dir>/{fused,perop}_S<step>_L<layer>.bin`，用于逐元素 diff —— 只看校验和会漏掉整体很小的分叉 |
-| `TS_MLX_MUSE_GLIMMER_EVAL_EVERY_N_LAYERS` | MLX 惰性图的 flush 间隔（默认 4，`0` 关闭） |
+| `TS_MUSE_GLIMMER_LAYER_TRACE` | `1` = 打印进入每一层的残差校验和（融合与逐算子路径输出相同格式，因此做 diff 就能把分叉定位到某一层） |
+| `TS_MUSE_GLIMMER_LAYER_TRACE_POS` / `_N` / `_DIR` | 第一个追踪的位置 / 追踪多少次前向 / 原始 F32 转储目录 |
+| `TS_MLX_MUSE_GLIMMER_EVAL_EVERY_N_LAYERS` | MLX 逐算子惰性图的 flush 间隔（默认 4，`0` 关闭） |
+| `TS_MLX_PIPELINED_DECODE` | `0` = 关闭 MLX 流水线贪心 decode 快速路径 |
 | `TS_PREFILL_CHUNK` | `ForwardRefill` 的提示分块大小（默认 2048） |
 | `TS_MUSE_GLIMMER_PREFILL_CHUNK` | 每次 prefill 前向的 token 数（默认 2048，`0` 关闭分块） |
-| `TS_MUSE_GLIMMER_SWA_RING` | `0` = 所有层都按完整上下文分配，而不是给 SWA 层用环 |
+| `TS_MUSE_GLIMMER_SWA_RING` | `0` = 所有层都按完整上下文分配，而不是给 SWA 层用环（GPU 后端；GgmlCpu 始终是统一尺寸） |
 | `TS_MUSE_GLIMMER_SWA_ROWS` | 覆盖 SWA 环的行数（诊断用） |
 | `TS_DFLASH_FUSED` | `0` = 关闭融合 DFlash 草稿模型（逐算子 A/B） |
 | `TS_DFLASH_PERSIST` | `0` = 每步重建 DFlash 图，而不是重放 |
+| `TS_DFLASH_PREFILL_CHUNK` | DFlash prefill 追赶草稿模型时每次**主干**前向的 token 数（默认 1024） |
+| `TS_KV_FATTN_COPY` | `0` = 从不物化填充后的 KV 窗口（会复现 ggml-cuda flash-attention **vec** 故障）；`force` = 总是物化 |
+| `TS_GGML_CPU_THREADS` | 共享 ggml CPU 后端的线程数（默认：全部物理核） |

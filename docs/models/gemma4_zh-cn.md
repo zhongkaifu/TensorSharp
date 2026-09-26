@@ -27,7 +27,7 @@
 
 | 模型 | HF 仓库 | 推荐文件 | mmproj（图像 / 视频 / 音频） | MTP 草稿 |
 |---|---|---|---|---|
-| gemma-4-E4B-it | [ggml-org/gemma-4-E4B-it-GGUF](https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF) | `gemma-4-E4B-it-Q8_0.gguf`（8.031 GB；另有 `gemma-4-E4B-it-Q4_K_M.gguf`，5.335 GB） | `mmproj-gemma-4-E4B-it-Q8_0.gguf`（0.560 GB；同仓库；备选：[unsloth/gemma-4-E4B-it-GGUF](https://huggingface.co/unsloth/gemma-4-E4B-it-GGUF) 中的 `mmproj-F16.gguf`，0.990 GB） | 来自 [AtomicChat/gemma-4-E4B-it-assistant-GGUF](https://huggingface.co/AtomicChat/gemma-4-E4B-it-assistant-GGUF) 的 `gemma-4-E4B-it-assistant.Q8_0.gguf`（0.100 GB） |
+| gemma-4-E4B-it | [ggml-org/gemma-4-E4B-it-GGUF](https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF) | `gemma-4-E4B-it-Q8_0.gguf`（8.031 GB；另有 `gemma-4-E4B-it-Q4_0.gguf`，4.588 GB） | `mmproj-gemma-4-E4B-it-Q8_0.gguf`（0.560 GB；同仓库；备选：[unsloth/gemma-4-E4B-it-GGUF](https://huggingface.co/unsloth/gemma-4-E4B-it-GGUF) 中的 `mmproj-F16.gguf`，0.990 GB） | 来自 [AtomicChat/gemma-4-E4B-it-assistant-GGUF](https://huggingface.co/AtomicChat/gemma-4-E4B-it-assistant-GGUF) 的 `gemma-4-E4B-it-assistant.Q8_0.gguf`（0.100 GB） |
 | gemma-4-12B-it（QAT） | [unsloth/gemma-4-12B-it-qat-GGUF](https://huggingface.co/unsloth/gemma-4-12B-it-qat-GGUF) | `gemma-4-12B-it-qat-UD-Q4_K_XL.gguf`（6.716 GB） | `mmproj-BF16.gguf`（0.175 GB；同仓库） | `mtp-gemma-4-12B-it.gguf`（0.254 GB；同仓库根目录；量化变体位于 `MTP/` 下） |
 | gemma-4-26B-A4B-it（MoE，QAT） | [unsloth/gemma-4-26B-A4B-it-qat-GGUF](https://huggingface.co/unsloth/gemma-4-26B-A4B-it-qat-GGUF) | `gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf`（14.249 GB） | `mmproj-BF16.gguf`（1.195 GB；同仓库） | `mtp-gemma-4-26B-A4B-it.gguf`（0.252 GB；同仓库），或来自 [AtomicChat/gemma-4-26B-A4B-it-assistant-GGUF](https://huggingface.co/AtomicChat/gemma-4-26B-A4B-it-assistant-GGUF) 的 `gemma-4-26B-A4B-it-assistant.Q8_0.gguf`（0.462 GB） |
 | gemma-4-26B-A4B-it（MoE） | [ggml-org/gemma-4-26B-A4B-it-GGUF](https://huggingface.co/ggml-org/gemma-4-26B-A4B-it-GGUF) | `gemma-4-26B-A4B-it-Q4_K_M.gguf`（16.796 GB）或 `gemma-4-26B-A4B-it-Q8_0.gguf`（26.860 GB） | `mmproj-gemma-4-26B-A4B-it-Q8_0.gguf`（0.806 GB）/ `mmproj-gemma-4-26B-A4B-it-bf16.gguf`（1.195 GB） | 与 QAT 行相同的草稿 |
@@ -301,7 +301,13 @@ V 投影后，`ApplyUnweightedRMSNorm()` 用全 1 权重张量（`_onesForVNorm`
 
 ### 4.9 视觉管线（图像与视频帧）
 
-`Gemma4VisionEncoder` 是带 2D 位置 embedding、GELU-Tanh MLP 和最终线性投影的 SigLIP 风格 ViT。视频帧从 MP4 中提取（默认通过 OpenCV / SkiaSharp 抽取最多 8 帧、1 fps），每帧独立编码，最终的 embedding 串联起来按顺序注入到连续的 `<|image>` 占位上。
+`Gemma4VisionEncoder` 是 SigLIP 风格 ViT：2D 位置 embedding、门控 GELU-tanh MLP（`gelu_pytorch_tanh`，与视觉配置声明一致；融合原生 block 与托管回退路径都使用它，早期构建用的是 QuickGELU），以及到 LM hidden 维的池化投影：先在视觉 hidden 维上做无权 RMSNorm（`embedding_pre_projection_norm`），再做线性投影。早期构建是在投影之后才做归一化；现在的顺序与上游 `Gemma4MultimodalEmbedder` 一致。
+
+视觉塔可以从 mmproj GGUF 加载，也可以通过同一个 `--mmproj` 选项，从 HuggingFace `.safetensors` 分片加载——分片中的塔位于 `model.encoder.vision_tower.*`，投影器为 `model.encoder.embed_vision.embedding_projection.weight`（[`Gemma4VisionEncoder.Safetensors.cs`](../../TensorSharp.Models/Models/Gemma4/Gemma4VisionEncoder.Safetensors.cs)）。几何尺寸由张量形状推出；池化因子与 RMSNorm epsilon 取自分片旁 `config.json` 中宽度与该塔一致的 `vision_config`，否则使用 Gemma 4 默认值并打印一次警告。这条路径是为没有发布 mmproj 的检查点准备的（最初就是为 [DiffusionGemma](diffusiongemma_zh-cn.md) 编写的）。分片里没有音频塔，因此音频输入仍需要 mmproj GGUF。
+
+视频帧按时间采样从 MP4 中提取（默认通过 OpenCV 每秒一帧，可用 `VIDEO_SAMPLE_FPS` 调整；`VIDEO_MAX_FRAMES` 可额外设置帧数上限），每帧独立编码，最终的 embedding 串联起来按顺序注入到连续的 `<|image>` 占位上。
+
+静态图像的尺寸处理取决于投影器类型。`gemma4v`（SigLIP）视觉塔（例如 E4B 或 DiffusionGemma 的塔）采用参考实现 `Gemma4ImageProcessor` 的尺寸处理：把图像放大或缩小到 280 软 token 预算内、边长为 48 像素倍数（patch 16 × pooling 3）的最大画布，再用带抗锯齿的 bicubic 滤波拉伸填满，不加 letterbox 黑边。早期构建使用的是 llama.cpp smart resize 的 letterbox 移植版，会给图像补黑边；因此连同上面的激活函数与归一化修复，升级后这些视觉塔上的图像回答会发生变化。缩放后的像素与参考实现的 numpy 转写版做过比对（`Gemma4VisionOracleTests`，需要本地 fixture 目录，没有时跳过）。12B 使用的 `gemma4uv` 统一 embedder 是一条无 block 的路径（一个大 patch 卷积、若干 LayerNorm、学习的二维位置 embedding、一次 RMSNorm 与线性投影），而不是上面的 SigLIP 堆叠，它保留了经过验证的旧 letterbox 尺寸处理。视频帧使用固定的 70 软 token 预算，同样采用旧的尺寸处理。
 
 ### 4.10 音频管线
 
@@ -506,19 +512,23 @@ forward 内跨层复用的三类缓存：
 
 SWA 层用 `CopyToCacheCircular()` 在 `pos % cacheSize` 写入新 K/V 槽位，`AttentionDecodeCircular()` 走环形读。SWA 层因此无视上下文长度只分配 `slidingWindow` 个槽位 —— 常驻内存有界。
 
-### 并发请求的 token 批量融合 decode（`Gemma4ModelDecodeBatchedEx`）
+### 并发请求的 token 批量融合 decode（`Gemma4ModelDecodeBatchedEx2`）
 
-N >= 2 个请求同时在线时，引擎不再轮询 N 个单 token 图：`Gemma4Model.TryForwardBatchedFusedDecode` 在**一个**融合图（[`ggml_ops_gemma4_batched.cpp`](../../TensorSharp.GGML.Native/ggml_ops_gemma4_batched.cpp) 中的 `TSGgml_Gemma4ModelDecodeBatchedEx`）里为每个序列各 decode 一个 token，每步每个权重只加载一次、作用于 N 个 token。decode 受带宽限制，聚合吞吐正来自这里。每个序列保留自己的 per-request KV holder；内核以 `[layer * N + seq]` 指针数组接收这些 holder，在 `[hidden, N]` 上跑 projection / FFN / LM head，并对每个序列在其自身 cache 窗口的直接视图上跑一次单行 flash-attention。
+N >= 2 个请求同时在线时，引擎不再轮询 N 个单 token 图：`Gemma4Model.TryForwardBatchedFusedDecode` 在**一个**融合图（[`ggml_ops_gemma4_batched.cpp`](../../TensorSharp.GGML.Native/ggml_ops_gemma4_batched.cpp) 中的 `TSGgml_Gemma4ModelDecodeBatchedEx2`）里为每个序列各 decode 一个 token，每步每个权重只加载一次、作用于 N 个 token。decode 受带宽限制，聚合吞吐正来自这里。每个序列保留自己的 per-request KV holder；内核以 `[layer * N + seq]` 指针数组接收这些 holder，在 `[hidden, N]` 上跑 projection / FFN / LM head，并对每个序列在其自身 cache 窗口的直接视图上跑一次单行 flash-attention。
 
 v1 内核只覆盖无 per-layer embedding、无共享 KV 层、且每个序列都还在 SWA 环内的密集模型，所以 E2B/E4B（PLE 维 256、18 个 KV-donor 层、大多数对话都会超出的 512 槽环）总是拒绝，服务器记录 "The model declined the default batched fused-decode path ... concurrency stays near 1x"。`Ex` 入口补上这三处：
 
 - **逐行 PLE。** per-layer embedding 在图内从常驻的量化 `per_layer_token_embd` 表通过对 N 个 token id 的一次 `get_rows` 收集（再加 `per_layer_model_proj` projection、其 RMSNorm 与 `1/sqrt(2)` 合并，与单 token decode 和 `ComputePLE` 完全一致），按层以 `[ple_dim, N]` 的跨步列切片注入。图内形式不可用时（`CanGatherPleInKernel` 为 false：`get_rows` 不支持的类型或带缩放的 projection），调用方改为上传 `ComputePLE` 的行，PLE 项永远不会被丢掉。
 - **KV-donor 层。** `kv_source_arr[l]` 指明第 `l` 层要 attend 的 cache 所属层。共享层只跑 Q projection，读取 donor 的逐序列窗口与 mask，不写任何东西。
-- **SWA 回绕。** 序列超出环的 local 层写到 `pos % cache_size`，并把整个环平铺读取、所有槽位有效；decode 的 softmax 对 key 的排列不变，因此旋转不需要 concat。全局（线性）层仍必须容纳整个序列；轮询回退会扩容，下一步重新进入批量路径。
+- **SWA 回绕。** 序列超出环的 local 层写到 `pos % cache_size`，并把整个环平铺读取、所有槽位有效；decode 的 softmax 对 key 的排列不变，因此旋转不需要 concat。全局（线性）层仍必须容纳整个序列。需要扩容的序列走一次串行步，其他已就绪的序列可以继续批量执行。
 
-原生侧通过 `TSGgml_Gemma4BatchedDecodeCapabilities()`（位：PLE、KV donor、SWA wrap）报告支持范围。托管侧对已加载原生库缺少的每一位保留 v1 限制，所以旧的 `libGgmlOps`（没有探测符号）行为与以前完全一致，`TSGgml_Gemma4ModelDecodeBatched` 作为薄包装保留 v1 ABI。`TS_GEMMA4_BATCHED_CAPS=0` 可强制 v1 门控做 A/B。
+`Ex2` 还接受每个序列实际的缓存容量 `cache_size_arr[layer * N + seq]`。保留前缀的克隆有意比新建缓存小，而且每个请求独立扩容；旧的统一容量 ABI 即使每个请求都有足够空间，也会拒绝这样的批次。新内核使用每份分配真实的 KV-head 跨步，以及各自补齐后的注意力窗口与 mask，不会把较短的子请求扩展到最大请求的分配大小。共享 KV 层使用同一序列中 donor 的容量。
 
-CUDA-graph 捕获不变：每步的所有输入（hidden 行、position、每 (层, 序列) 的 `set_rows` 写行、每层 F16 mask、PLE token id 或上传的 PLE 行）都是用 `ggml_backend_tensor_set` 刷新的图输入，图位于自己的 context 与独占 buffer 中，重复出现的请求集合在稳定地址上重放捕获的图。MoE 批量内核（`TSGgml_Gemma4MoEModelDecodeBatched`）保持无 PLE / 无 donor 的范围。
+原生侧通过 `TSGgml_Gemma4BatchedDecodeCapabilities()`（位：PLE=1、KV donor=2、SWA wrap=4、逐序列缓存大小=8）报告支持范围。托管侧对已加载原生库缺少的每一位保留 v1 限制，所以旧的 `libGgmlOps`（没有探测符号）行为与以前完全一致，`TSGgml_Gemma4ModelDecodeBatched` 作为薄包装保留 v1 ABI，旧的 `Ex` ABI 也保留其只按层给出的容量数组。`TS_GEMMA4_BATCHED_CAPS=0` 可强制 v1 门控做 A/B；`TS_GEMMA4_BATCHED_CAPS=7` 恢复统一容量门控，同时保留 PLE、共享 KV 与 SWA 回绕支持。这些是诊断用覆盖项，启用批量执行并不需要它们。要使用 `Ex2`，需同时重新构建托管服务端与原生 `GgmlOps` 库；旧的原生库会安全地走回退路径。
+
+每步的所有输入（hidden 行、position、每 (层, 序列) 的 `set_rows` 写行、每个序列的 F16 mask、PLE token id 或上传的 PLE 行）都是通过有序的后端上传刷新的图输入，图位于自己的 context 与独占 buffer 中，重复出现的请求集合在稳定地址上重放捕获的图。捕获标识包含全部 K/V 指针、容量与窗口；缓存扩容会先使已捕获的图失效，再替换存储。MoE 批量内核（`TSGgml_Gemma4MoEModelDecodeBatched`）保持无 PLE / 无 donor 的范围。
+
+服务端会记录第一次成功的融合批次，并为第一次被拒绝的批次给出原因。一次拒绝并不意味着之后每一步都串行。`Gemma4Model.BatchedFusedDecodeSteps` 与 `BatchedFusedDecodeTokens` 只统计成功的原生批量执行；`BatchedFusedDecodeDeclines` 统计被拒绝的尝试。[`eng/validation/Gemma4BatchedCacheProbe`](../../eng/validation/Gemma4BatchedCacheProbe) 中的回归与基准覆盖真实的前缀克隆、不同容量、独立扩容、重新排序的请求以及之后的单独续接。
 
 **已验证**（[`Gemma4BatchedFusedDecodeParityTests`](../../InferenceWeb.Tests/Gemma4BatchedFusedDecodeParityTests.cs)，`TS_TEST_GGML_BACKEND=cuda`，gemma-4-E4B-it-Q8_0）：2、3、4 个并发序列（其中一个 prefill 超过 512 token 的 SWA 环）下，批量路径 12 步的贪心续写与轮询单 token decode 逐 token 一致，且每一步都跑在批量内核上。
 
@@ -545,6 +555,8 @@ CUDA-graph 捕获不变：每步的所有输入（hidden 行、position、每 (�
 
 ### 保留的 holder：一个块的下限
 
+在默认的 radix 前缀缓存（`TS_PREFIX_CACHE_MODE=tree`）下，已完成请求留下什么由前缀树决定，其下限是 32 个 token（`MinRetainTokens`）。下面这条一个块的规则属于旧的保留 holder 路径（`TS_PREFIX_CACHE_MODE=legacy`）。
+
 已完成的并发请求的按请求 holder 只有在至少覆盖一个调度块（默认 256 token）时，才会为其对话的下一轮保留，
 规则与 Qwen 3.5 相同（`BatchExecutor.TryRetainReleasedFusedCache` 与 `DonateFinishedLiveCacheToRetained`）。
 更短的对话在每一轮与其他请求并行运行时都要重新 prefill 整个提示；单独运行的对话从没有这一下限的 live cache
@@ -557,10 +569,10 @@ Qwen 3.5 的 Metal 精确性验证中失败，原因尚未查明，详见 [Qwen 
 Gemma 4 提供完整的 `IBatchedPagedModel.ForwardBatch` 移植
 （[`Gemma4Model.BatchedForward.cs`](../../TensorSharp.Models/Models/Gemma4/Gemma4Model.BatchedForward.cs)），
 通过共享 `InferenceEngine` 连续批处理栈执行
-（[`docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md`](../PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md)）。
+（[`docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING_zh-cn.md`](../PAGED_ATTENTION_AND_CONTINUOUS_BATCHING_zh-cn.md)）。
 与多数批处理移植不同，Gemma 4 **默认启用**；设置 `TS_GEMMA4_BATCHED=0`
-可强制回退到旧单序列 KV 交换路径，用于调试或者旧的融合单调用 decode 更快
-的 batch=1 工作负载。
+可强制回退到旧单序列 KV 交换路径，用于调试。单个请求已经会通过默认的 N=1 快速路径
+（`TS_BATCHED_N1_FAST_PATH=1`）进入融合单图 decode。
 
 Gemma 4 是 TensorSharp 中最难移植到分页批处理的模型，因为它有三种引擎默认
 假设跨层一致而 Gemma 4 实际不一致的异构源：
@@ -612,9 +624,9 @@ Gemma 4 是 TensorSharp 中最难移植到分页批处理的模型，因为它�
 | 4 个并行长 prompt | 4 | 3 293 | 3.4 | 5.4 | **1.61×** |
 
 加速随 batch 大小增长：batch=8 短 prompt 时分页图构建 / gather 开销已被完
-全摊销。单序列是净亏，因为旧的融合单调用 decode 在没有批处理摊销的情况下
-快约 3 倍 —— 这也是 `TS_GEMMA4_BATCHED=0` 存在的原因（用于 batch=1 工作
-负载）。
+全摊销。在这次进程内切换中单序列是净亏，因为旧的融合单调用 decode 在没有批处理
+摊销的情况下快约 3 倍。这些数据早于 N=1 快速路径：开启该路径（默认）后，单个序列
+会走融合单图 decode，而不是批处理逐算子路径。
 
 **移植过程中修复的两个已知 bring-up bug**（现已纳入回归测试）：
 
@@ -676,7 +688,7 @@ KV 缓存，并对每个起草 token 复用相同位置（递归只通过 `h` �
 （[`Gemma4Model.Speculative.cs`](../../TensorSharp.Models/Models/Gemma4/Gemma4Model.Speculative.cs)）
 决定是否真正启用投机：
 
-- **ggml 后端（CUDA / Metal）** —— 运行融合单图内核：多 token 验证
+- **ggml 后端（CUDA / Metal；`ggml_vulkan` 与 `ggml_cpu` 通过同一门控）** —— 运行融合单图内核：多 token 验证
   （`NativeGemma4ModelVerify`，26B-A4B MoE 用 `TryFusedMoEModelVerify`）和融合草稿步
   （`NativeGemma4DraftStep`）。部分接受时用稠密快速回滚避免重跑已保留前缀（逃生开关
   `TS_GMTP_NO_FAST_ROLLBACK=1`）。验证主干对单序列投机默认走线性路径；
@@ -686,7 +698,7 @@ KV 缓存，并对每个起草 token 复用相同位置（递归只通过 `h` �
   设备上读取 donor 缓存注意力，global 验证注意力对每行用 GQA decode 内核打实时缓存，global
   RoPE 用 GPU 内核——因此验证层循环零宿主端同步停顿。在散文 / 聊天负载上有收益，在低接受率的
   贪心解码上约持平。
-- **CPU / MLX** —— 既无融合内核也无驻留 GPU 的逐算子路径，因此投机关闭，引擎走标准融合 decode。
+- **纯 C# `cpu` 与 Apple `mlx`** —— 既无融合内核也无驻留 GPU 的逐算子路径，因此投机关闭，引擎走标准融合 decode。
 
 26B-A4B MoE 目标还需要在 `ggml_cuda` 上修复加载期 OOM（跳过 per-expert 设备预加载）后，MTP
 投机才成为净收益。

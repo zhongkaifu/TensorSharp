@@ -6,11 +6,11 @@
 
 [English](README.md) | [中文](README_zh-cn.md)
 
-**Native .NET LLM inference engine for GGUF models** — autoregressive LLMs *and* DiffusionGemma-style text-diffusion, plus [Qwen-Image-2.1 generation and editing](docs/models/qwenimage21.md) and MiniMax-H3 video with native 32 kHz stereo audio (and Wan 2.1/2.2 for video alone). Ships a console app, a browser chat UI, and Ollama/OpenAI-compatible HTTP APIs. The .NET runtime offers managed CPU and native accelerator backends; published comparisons use identical GGUF files and hardware. The optional `TensorSharp.AgentHost` layer adds Agent Skills and a bounded, in-process model-to-tool loop for sandboxed file and shell work.
+**Native .NET LLM inference engine for GGUF models** — autoregressive LLMs *and* DiffusionGemma-style text-diffusion, plus [Qwen-Image-2.1 generation and editing](docs/models/qwenimage21.md) and MiniMax-H3 video with native 32 kHz stereo audio (and Wan 2.1/2.2 for video alone). Ships a console app, a browser chat UI, and Ollama/OpenAI-compatible HTTP APIs. The .NET runtime offers managed CPU and native accelerator backends; published comparisons use identical GGUF files and hardware. The optional `TensorSharp.AgentHost` layer adds Agent Skills, a bounded, in-process model-to-tool loop for sandboxed file and shell work, and bounded automatic subagent delegation.
 
 ## Supported model families at a glance
 
-- **Text, reasoning, and multimodal LLMs:** [DeepSeek V4 Flash](docs/models/deepseek4.md) / [V4.1 Flash](docs/models/deepseek41.md), [GLM 5.x](docs/models/glm.md), [Gemma 4](docs/models/gemma4.md), [Qwen 3.5 / 3.6](docs/models/qwen35.md), [Qwen 3.8 Flash Next](docs/models/qwen38-flash-next.md), [Bonsai (Qwen family)](docs/models/bonsai.md), [GPT OSS](docs/models/gptoss.md), [Nemotron-H](docs/models/nemotron.md), [Mistral 3](docs/models/mistral3.md), [Hunyuan Dense](docs/models/hunyuan-dense.md), and [Muse-Glimmer](docs/models/muse-glimmer.md).
+- **Text, reasoning, and multimodal LLMs:** [DeepSeek V4 Flash](docs/models/deepseek4.md) / [V4.1 Flash](docs/models/deepseek41.md), [GLM 5.x](docs/models/glm.md), [Gemma 4](docs/models/gemma4.md), [Qwen 3.5 / 3.6 / 3.8 27B](docs/models/qwen35.md), [Qwen 3.8 Flash Next](docs/models/qwen38-flash-next.md), [Bonsai](docs/models/bonsai.md) and [Bonsai2](docs/models/bonsai2.md) (Qwen family), [GPT OSS](docs/models/gptoss.md), [Nemotron-H](docs/models/nemotron.md), [Mistral 3](docs/models/mistral3.md), [Hunyuan Dense](docs/models/hunyuan-dense.md), and [Muse-Glimmer](docs/models/muse-glimmer.md).
 - **Text diffusion:** [DiffusionGemma](docs/models/diffusiongemma.md), including [Jev typed decision inference](docs/models/jev.md) at `/v1/systemone`, over text or image state.
 - **Image generation/editing and video generation:** [Qwen-Image-2.1](docs/models/qwenimage21.md), [MiniMax-H3 (video + stereo audio)](docs/models/minimax-h3.md), and [Wan 2.1 / 2.2](docs/models/wan.md).
 - **Text and code embeddings:** BERT / XLM-R encoders — [Snowflake Arctic Embed L v2.0 and all-MiniLM-L6-v2](docs/embeddings.md).
@@ -35,7 +35,7 @@ Backend, modality, feature support, and validation coverage vary by model. See t
 - **Broad model and media support.** Current source covers modern text models, vision/audio input, PDF, image generation/editing, and video generation; see the [model cards](docs/models/README.md).
 - **Measured performance.** TensorSharp is benchmarked against `llama.cpp` on identical models and hardware. Results are specific to the measured model, backend, and workload. See the [benchmark report](docs/engine_comparison_report.md).
 - **Agentic work, including iOS.** `TensorSharp.AgentHost` adds bounded Agent Skills, code tools, and [automatic subagent delegation](docs/multi_agent.md) with independent contexts and read-only defaults. [TensorAgent](TensorAgent/README.md) brings the same local chat and agent experience to iPhone and iPad using the iOS `ggml_metal` backend.
-- **Production-friendly building blocks.** Continuous batching, paged/prefix-shared KV cache, speculative decoding, tensor parallelism, and configurable security boundaries are available when you need them. See [Features](FEATURES.md), [Usage](USAGE.md), and the [current project status](docs/PROJECT_STATUS.md).
+- **Production-friendly building blocks.** Continuous batching and the paged, Radix prefix-shared KV cache are on by default; speculative decoding, tensor parallelism, and configurable security boundaries are available when you need them. See [Features](FEATURES.md), [Usage](USAGE.md), and the [current project status](docs/PROJECT_STATUS.md).
 
 The detailed implementation notes and historical benchmark claims have moved to the linked documentation so this page stays useful as a starting point.
 
@@ -46,8 +46,11 @@ Prefer a prebuilt application? The [Releases page](https://github.com/zhongkaifu
 **NVIDIA DGX Spark / GB10:** use the separate experimental **CUDA 13, Linux ARM64**
 [Docker build and archive instructions](DEVELOPMENT.md#gb10--dgx-spark-build-container-experimental).
 Its archives end in `linux-arm64-cuda13-GB10`; they target a single GB10, not
-generic ARM64 GPUs. CLI and server text inference have been checked on real
-hardware. The existing x64 CUDA archives are not suitable for the Spark.
+generic ARM64 GPUs. Tagged releases also publish them, built in Docker on a hosted
+ARM64 runner without a GPU. A historical real-hardware check of CLI and server
+text inference predates the upstream reintegration and does not certify the
+current code; hosted CI rechecks only the CPU and archive paths. The existing x64
+CUDA archives are not suitable for the Spark.
 
 Source builds target .NET 10. On a new development machine, install the full **.NET 10 SDK**—the .NET Runtime alone cannot build TensorSharp:
 
@@ -88,11 +91,12 @@ dotnet run --project TensorSharp.Cli -c Release -p:TensorSharpSkipMlxNative=true
 
 Tensor parallelism splits one model across N GPUs. It runs on the direct
 `cuda` backend and on the GGML CUDA / Vulkan backends (`--backend ggml_cuda`,
-`ggml_vulkan`). Qwen 3.8 Flash Next and DeepSeek V4 use the same flag for a
+`ggml_vulkan`). Qwen 3.8 Flash Next and DeepSeek V4 / V4.1 use the same flag for a
 layer split instead: one contiguous run of whole layers per GPU. GLM 5.x also
 layer-splits by default when the flag is omitted, while `--tp N` selects its
-native local tensor-parallel path on the GGML GPU backends. Install the CUDA
-toolkit first, then:
+native local tensor-parallel path on the GGML GPU backends. For Qwen-Image-2.1,
+`--tp N` shards only the diffusion transformer; its text/vision encoders and VAE
+stay on the first GPU. Install the CUDA toolkit first, then:
 
 ```bash
 # On RunPod's Ubuntu 24.04 images, point the loader at the CUDA compat libraries first:
@@ -144,12 +148,15 @@ dotnet run --project TensorSharp.Server.Host -c Release -p:TensorSharpSkipMlxNat
 
 > The server binds `0.0.0.0:5000` by default (change it with `--port` / `--host`, or the `PORT` / `HOST` environment variables; on macOS port 5000 is taken by the AirPlay Receiver) with no built-in auth or TLS — keep it behind a firewall or an authenticated HTTPS reverse proxy. For image/video/audio add the companion [`mmproj-gemma-4-E4B-it-Q8_0.gguf`](https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF/blob/main/mmproj-gemma-4-E4B-it-Q8_0.gguf) with `--mmproj`.
 
-TensorSharp.Server, TensorSharp.Cli, and TensorAgent use the shared engine's Radix
-KV prefix cache by default for supported models. It reuses public prompt prefixes
-and each conversation's private state, respecting model and media boundaries.
+TensorSharp.Server.Host, TensorSharp.Cli, and TensorAgent use the shared engine's Radix
+KV prefix cache by default for every autoregressive family in the tables below
+(not DiffusionGemma or the image/video models). It reuses public prompt prefixes
+and each conversation's private state, respecting model and media boundaries;
+speculative decoding (`--spec`) keeps it on.
 Set `TS_SCHED_PREFIX_CACHE=0` to disable runtime prefix reuse, or
 `TS_PREFIX_CACHE_MODE=legacy` to select the compatibility path for diagnosis.
-Server and CLI `--no-prefix-cache` also disable prefix reuse and startup warmup.
+Server and CLI `--no-prefix-cache` also disable prefix reuse and startup warmup;
+on the server it also turns off the on-disk prefix checkpoints.
 
 Both executables print their full option reference — description, default, range, and an example per flag — when started with no arguments or with `--help`:
 
@@ -185,7 +192,7 @@ Backend support depends on the model architecture. Embedding models support pure
 
 | Your hardware | Recommended backend | Flag | Notes |
 |---|---|---|---|
-| **Apple Silicon (Mac)** | GGML Metal | `--backend ggml_metal` | Default on macOS. `--backend mlx` is an alternative Apple-Silicon GPU path. |
+| **Apple Silicon (Mac)** | GGML Metal | `--backend ggml_metal` | The server's default on macOS; the CLI defaults to `ggml_cpu` on every OS, so pass the flag there. `--backend mlx` is an alternative Apple-Silicon GPU path. |
 | **Windows / Linux + NVIDIA GPU** | GGML CUDA | `--backend ggml_cuda` | Most-tested NVIDIA path. `--backend cuda` is the direct PTX/cuBLAS backend for experimentation. |
 | **Windows / Linux + AMD / Intel / NVIDIA GPU** | GGML Vulkan | `--backend ggml_vulkan` | Vendor-neutral GPU path via ggml-vulkan. Built automatically when a Vulkan runtime is present; `--no-vulkan` opts out. |
 | **No GPU / portability / debugging** | Pure C# CPU | `--backend cpu` | No native dependencies; matmuls run on a multi-core worker pool. Even DeepSeek V4.1 Flash has a whole-model executor here — it runs on the pure-C# `DeepSeek4CpuExecutor` with no ggml and no GPU, held to the PyTorch oracle `eng/dsv41-reference.py` at `atol=rtol=2e-5` on a five-layer F32 fixture (architectural agreement with the oracle, not parity on the real Q2_K weights), as a correctness and portability path rather than a serving one. For faster CPU inference use `--backend ggml_cpu` (native kernels). |
@@ -201,17 +208,18 @@ Implemented and exercised by the test/benchmark matrix. Pick a quantization that
 | DeepSeek V4.1 Flash | [DeepSeek-V4.1-Flash](https://huggingface.co/vcruz305/DeepSeek-V4.1-Flash-GGUF/tree/58d8ac86298fdf85a2440defee08b1abcad32e45) (Q2_K or Q4_K_M shards with embedded Engram; `ggml_cuda` serving path, with `ggml_cpu` a correctness and portability path that still takes the vision companion, and `cuda` and the pure-C# `cpu` executor text-only ones) | ✅ (vision companion) / ✅ (vision companion) / — | ✅ | ✅ | [deepseek41.md](docs/models/deepseek41.md) |
 | DeepSeek V4 Flash | [DeepSeek-V4-Flash-0731](https://huggingface.co/unsloth/DeepSeek-V4-Flash-0731-GGUF) (284B MoE, split GGUF) | — / — / — | ✅ | ✅ | [deepseek4.md](docs/models/deepseek4.md) |
 | GLM 5.x | [GLM-5.2](https://huggingface.co/unsloth/GLM-5.2-GGUF) (744B-A40B MoE, split GGUF), [GLM-5.3](https://huggingface.co/unsloth/GLM-5.3-GGUF) (256 routed experts, text only; one subdirectory per quant, UD-Q2_K_XL is seven shards / 236.4 GiB — point `--model` at the `-00001-of-00007` shard), [GLM-5.3-Flash](https://huggingface.co/unsloth/GLM-5.3-Flash-GGUF) (320B MoE, split GGUF, + mmproj) | ✅ (5.3-Flash only; 5.2 and 5.3 are text only) / — / — | ✅ | ✅ | [glm.md](docs/models/glm.md) |
-| Qwen 3.8 Flash Next | [Qwen3.8-Flash-Next](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) (hybrid GDN + attention MoE, 512 experts, split GGUF, + mmproj) | ✅ / — / — | ✅ | ✅ | [qwen38-flash-next.md](docs/models/qwen38-flash-next.md) |
-| Gemma 4 | [gemma-4-E4B-it](https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF) (also 31B, 26B-A4B MoE) | ✅ / ✅ / ✅ | ✅ | ✅ | [gemma4.md](docs/models/gemma4.md) |
-| Qwen 3.5 / 3.6 | [Qwen3.5-9B](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF) (also 35B-A3B MoE) | ✅ / — / — | ✅ | ✅ | [qwen35.md](docs/models/qwen35.md) |
-| Bonsai Q1_0 | Local hash-pinned `Bonsai-8B-Q1_0.gguf` (dense Qwen 3) and `Bonsai-27B-Q1_0.gguf` (dense Qwen 3.5 hybrid); the supplied GGUFs declare no publisher URL or license | — / — / — | 8B: No (fixed empty block); 27B: ✅ | ✅ | [bonsai.md](docs/models/bonsai.md) |
+| Qwen 3.8 Flash Next | [Qwen3.8-Flash-Next](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) (hybrid GDN + attention MoE, 512 experts, split GGUF, + mmproj) | ✅ / ✅ (`video_url`) / — | ✅ | ✅ | [qwen38-flash-next.md](docs/models/qwen38-flash-next.md) |
+| Gemma 4 | [gemma-4-E4B-it](https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF) (also 12B, 31B, 26B-A4B MoE) | ✅ / ✅ / ✅ | ✅ | ✅ | [gemma4.md](docs/models/gemma4.md) |
+| Qwen 3.5 / 3.6 | [Qwen3.5-9B](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF) (also 35B-A3B MoE, Qwen3.8-27B) | ✅ / — / — | ✅ | ✅ | [qwen35.md](docs/models/qwen35.md) |
+| Bonsai Q1_0 | Local hash-pinned `Bonsai-8B-Q1_0.gguf` (dense Qwen 3) and `Bonsai-27B-Q1_0.gguf` (dense Qwen 3.5 hybrid); their GGUF metadata names no source or license, but hash-identical publisher files are on [prism-ml/Bonsai-8B-gguf](https://huggingface.co/prism-ml/Bonsai-8B-gguf/tree/48516770dd04643643e9f9019a2a349cf26c5dbd) and [prism-ml/Bonsai-27B-gguf](https://huggingface.co/prism-ml/Bonsai-27B-gguf/tree/f10afb355f104535e3e3e98cf7ab7795c72bd292) (Apache-2.0) | — / — / — | 8B: No (fixed empty block); 27B: ✅ | ✅ | [bonsai.md](docs/models/bonsai.md) |
+| Bonsai2 | Local hash-pinned `Ternary-Bonsai-2-27B-PQ2_0.gguf` / `-PTQ1_0.gguf` (dense Qwen 3.5 hybrid with PRISM signed-Hadamard transforms, + mmproj); single-device GGML backends only, validated on Metal | ✅ / — / — | ✅ | ✅ | [bonsai2.md](docs/models/bonsai2.md) |
 | GPT OSS | [gpt-oss-20b](https://huggingface.co/ggml-org/gpt-oss-20b-GGUF) (MoE) | — / — / — | ✅ | ✅ | [gptoss.md](docs/models/gptoss.md) |
 | Nemotron-H | [Nemotron-H-8B](https://huggingface.co/bartowski/nvidia_Nemotron-H-8B-Reasoning-128K-GGUF) (also 47B, Omni) | ✅ (Omni) / — / — | ✅ | ✅ | [nemotron.md](docs/models/nemotron.md) |
 | Mistral 3 | [Mistral-Small-3.1-24B](https://huggingface.co/bartowski/mistralai_Mistral-Small-3.1-24B-Instruct-2503-GGUF) | ✅ / — / — | — | — | [mistral3.md](docs/models/mistral3.md) |
 | Hunyuan Dense | Tencent dense Hunyuan GGUFs (`hunyuan-dense`), e.g. the Hy-MT2 releases | — / — / — | — | — | [hunyuan-dense.md](docs/models/hunyuan-dense.md) |
 | Muse-Glimmer | [Muse-Glimmer-30B](https://huggingface.co/unsloth/Muse-Glimmer-30B-GGUF) (+ mmproj) | ✅ / — / — | ✅ | ✅ | [muse-glimmer.md](docs/models/muse-glimmer.md) |
-| DiffusionGemma | [diffusiongemma-26B-A4B-it](https://huggingface.co/unsloth/diffusiongemma-26B-A4B-it-GGUF) (vision tower from the upstream safetensors shard) | ✅ / — / — | — | — | [diffusiongemma.md](docs/models/diffusiongemma.md) |
-| Qwen-Image-2.1 | [Qwen-Image-2.1 GGUF](https://huggingface.co/Abiray/Qwen-Image-2.1-GGUF) (DiT + dedicated 2.1 VAE + Qwen3-VL-8B) | 🖼️ text→image, image editing; RGBA; LoRA plug-ins (`--lora`, incl. 4–8-step distillation) | — | — | [qwenimage21.md](docs/models/qwenimage21.md) |
+| DiffusionGemma | [diffusiongemma-26B-A4B-it](https://huggingface.co/unsloth/diffusiongemma-26B-A4B-it-GGUF) (vision tower from the upstream safetensors shard) | ✅ / — / — | — (not prompted) | — | [diffusiongemma.md](docs/models/diffusiongemma.md) |
+| Qwen-Image-2.1 | [Qwen-Image-2.1 GGUF](https://huggingface.co/Abiray/Qwen-Image-2.1-GGUF) (DiT + dedicated 2.1 VAE + Qwen3-VL-8B); Unsloth's metadata-free Q8_0 DiT also loads, detected from its tensors (for editing, pass its `mmproj-BF16.gguf` with `--qwen-image-mmproj`) | 🖼️ text→image, image editing; RGBA; LoRA plug-ins (`--lora`, incl. 4–8-step distillation) | — | — | [qwenimage21.md](docs/models/qwenimage21.md) |
 | MiniMax-H3 audio+video | [unsloth/MiniMax-H3-GGUF](https://huggingface.co/unsloth/MiniMax-H3-GGUF) (denoiser + Qwen3-VL-32B encoder) + [Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3) (video + audio VAE) | 🎬🔊 text→video, image→video, first/last frame, reference→video (image/clip/audio), **with stereo audio** | — | — | [minimax-h3.md](docs/models/minimax-h3.md) |
 | Wan 2.1 / 2.2 video | [Wan2.2-TI2V-5B](https://huggingface.co/QuantStack/Wan2.2-TI2V-5B-GGUF) (also [T2V-A14B](https://huggingface.co/QuantStack/Wan2.2-T2V-A14B-GGUF), [I2V-A14B](https://huggingface.co/QuantStack/Wan2.2-I2V-A14B-GGUF), [Wan2.1-T2V-14B](https://huggingface.co/city96/Wan2.1-T2V-14B-gguf)) + UMT5-XXL + video VAE · fast lane: [TI2V-5B-Turbo](https://huggingface.co/hum-ma/Wan2.2-TI2V-5B-Turbo-GGUF) (4-step, 25× fewer DiT passes) | 🎬 text→video, image→video | — | — | [wan.md](docs/models/wan.md) |
 
@@ -219,7 +227,7 @@ Implemented and exercised by the test/benchmark matrix. Pick a quantization that
 
 Start with these choices, in order:
 
-1. **Choose the right checkpoint.** For Wan video, use a Turbo/Lightning/4-step distilled GGUF.
+1. **Choose the right checkpoint.** For Wan video, use a Turbo/Lightning/4-step distilled GGUF. For Qwen-Image-2.1, add a step-distillation [LoRA plug-in](docs/models/qwenimage21.md#lora-plug-ins) from `config/lora/` (4–8 steps instead of the 40-step default).
 2. **Use the matching backend.** NVIDIA: `ggml_cuda`; Apple Silicon and iOS: `ggml_metal`; CPU: `ggml_cpu` (use managed `cpu` for portability).
 3. **Reduce work before tuning flags.** For H3 use `--cfg 1.0` and 4–8 steps; for media, lower resolution, frame count, or steps.
 4. **Then scale or speculate.** Try `--draft-model` / `--spec`, `--n-cpu-moe`, or `--tp N` when the model or workload calls for it.
@@ -231,22 +239,25 @@ See the [performance guide and detailed fast lanes](docs/PROJECT_STATUS.md#make-
 | Architecture | GGUF arch keys | Example Models | Multimodal | Thinking | Tools | MTP spec | Card |
 |---|---|---|---|---|---|---|---|
 | BERT / XLM-R embeddings | `bert` | Snowflake Arctic Embed L v2.0, all-MiniLM-L6-v2 | Text → vectors | — | — | — | [Embedding guide](docs/embeddings.md) |
-| DeepSeek V4.1 Flash | `deepseek41` | DeepSeek-V4.1-Flash (40 layers, 384 routed experts at top-6 plus one shared expert, four residual streams with delayed hyper-connection mixing, Engram n-gram features, 1M declared context) | Text; image and video with the prepared vision companion (`--mmproj`), audio refused | Yes | Yes (spaced DSML, grammar-constrained) | No (V4 drafters are rejected) | [deepseek41.md](docs/models/deepseek41.md) |
+| DeepSeek V4.1 Flash | `deepseek41` | DeepSeek-V4.1-Flash (40 layers, 384 routed experts at top-6 plus one shared expert, four residual streams with delayed hyper-connection mixing, Engram n-gram features, 1M declared context) | Text; image and video with the prepared vision companion (`--mmproj`), audio refused | Yes | Yes (spaced DSML, grammar-constrained) | Experimental: loads a `deepseek41-dspark` drafter (`--draft-model`) on `ggml_cuda`/`ggml_cpu`; validated only on synthetic fixtures, no trained drafter measured (V4 drafters are rejected) | [deepseek41.md](docs/models/deepseek41.md) |
 | DeepSeek V4 Flash | `deepseek4` | DeepSeek-V4-Flash (284B MoE, 256 experts, compressed sparse attention, 1M context) | Text only | Yes | Yes (DSML) | Yes (DSpark block drafter, separate GGUF) | [deepseek4.md](docs/models/deepseek4.md) |
-| GLM 5.x | `glm-dsa`, `glm5next` | GLM-5.2 (744B-A40B MoE, 256 experts, MLA + DeepSeek Sparse Attention, 1M context), [GLM-5.3](docs/models/glm.md#glm-53-glm-dsa) (the same 79-block `glm-dsa` shape as 5.2 — 78 trunk blocks plus one NextN, 256 routed experts at top-8 with one shared expert, MLA with the lightning indexer, rope base 8e6 — so it loads on the GLM-5.2 path with no new code and no new flag; text only), GLM-5.3-Flash (320B MoE, 288 experts, KDA linear attention + NoPE MLA with a pooled indexer) | Text only (5.2 and 5.3), Image (5.3-Flash) | Yes | Yes (XML tool calls) | Yes on GLM-5.2 and GLM-5.3 (embedded NextN block; on 5.3 speculation engages on the default layer split, no `--tp`) | [glm.md](docs/models/glm.md) |
-| Qwen 3.8 Flash Next | `qwen4exp` | Qwen3.8-Flash-Next (hybrid MoE, 512 experts / 10 used, GatedDeltaNet on 36 of 48 layers interleaved with QSA-indexed full attention, PLE n-gram block, ×4 hyper-connections) | Image | Yes | Yes (Qwen XML / JSON tool calls) | — | [qwen38-flash-next.md](docs/models/qwen38-flash-next.md) |
-| Gemma 4 | `gemma4` | gemma-4-E4B, gemma-4-31B, gemma-4-26B-A4B (MoE) | Image, Video, Audio | Yes | Yes | Yes (separate draft GGUF) | [gemma4.md](docs/models/gemma4.md) |
-| Qwen 3.5 / 3.6 family | `qwen35`, `qwen35moe`, `qwen3next` | Qwen3.5-9B (hybrid Attn+Recurrent), Qwen3.5/3.6-35B-A3B (MoE) | Image | Yes | Yes | Yes on Qwen 3.6 (embedded NextN) | [qwen35.md](docs/models/qwen35.md) |
+| GLM 5.x | `glm-dsa`, `glm_dsa`, `glm5next` | GLM-5.2 (744B-A40B MoE, 256 experts, MLA + DeepSeek Sparse Attention, 1M context), [GLM-5.3](docs/models/glm.md#glm-53-glm-dsa) (the same 79-block `glm-dsa` shape as 5.2 — 78 trunk blocks plus one NextN, 256 routed experts at top-8 with one shared expert, MLA with the lightning indexer, rope base 8e6 — so it loads on the GLM-5.2 path with no new code and no new flag; text only), GLM-5.3-Flash (320B MoE, 288 experts, KDA linear attention + NoPE MLA with a pooled indexer) | Text only (5.2 and 5.3), Image (5.3-Flash) | Yes | Yes (XML tool calls) | Yes on GLM-5.2 and GLM-5.3 (embedded NextN block; on 5.3 speculation engages on the default layer split, no `--tp`) | [glm.md](docs/models/glm.md) |
+| Qwen 3.8 Flash Next | `qwen4exp` | Qwen3.8-Flash-Next (hybrid MoE, 512 experts / 10 used, GatedDeltaNet on 36 of 48 layers interleaved with QSA-indexed full attention, PLE n-gram block, ×4 hyper-connections) | Image, video (`video_url`) | Yes | Yes (Qwen XML / JSON tool calls) | Yes (shared MTP head, separate GGUF via `--draft-model`; GGML backends) | [qwen38-flash-next.md](docs/models/qwen38-flash-next.md) |
+| Gemma 4 | `gemma4` | gemma-4-E4B, gemma-4-12B, gemma-4-31B, gemma-4-26B-A4B (MoE) | Image, Video, Audio | Yes | Yes | Yes (separate draft GGUF) | [gemma4.md](docs/models/gemma4.md) |
+| Qwen 3.5 / 3.6 family | `qwen35`, `qwen35moe`, `qwen3next` | Qwen3.5-9B (hybrid Attn+Recurrent), Qwen3.5/3.6-35B-A3B (MoE), Qwen3.8-27B (dense hybrid) | Image | Yes | Yes | Yes: embedded NextN on Qwen 3.6 and Qwen 3.8 27B (`--spec`); DFlash2 block drafter on Qwen 3.8 27B (separate GGUF, `--draft-model`) | [qwen35.md](docs/models/qwen35.md) |
 | Bonsai (Qwen family) | `qwen3` (8B), `qwen35` (27B) | Bonsai-8B (36-layer dense GQA), Bonsai-27B (48 GatedDeltaNet + 16 full-attention layers), both Q1_0 | Text only | 27B yes; 8B template emits a fixed empty think block | Yes | — | [bonsai.md](docs/models/bonsai.md) |
+| Bonsai2 (Qwen family) | `qwen35` with `prism.hadamard.*` metadata and PQ2_0 / PTQ1_0 tensors | Ternary-Bonsai-2-27B PQ2_0 / PTQ1_0 (64-layer dense Qwen 3.5 hybrid; weights repacked losslessly to GGML Q2_0 at load; single-device GGML backends only) | Image (companion mmproj) | Yes | Yes | — | [bonsai2.md](docs/models/bonsai2.md) |
 | GPT OSS | `gptoss`, `gpt-oss` | gpt-oss-20b (MoE) | Text only | Yes (always) | Yes | — | [gptoss.md](docs/models/gptoss.md) |
-| Nemotron-H | `nemotron_h`, `nemotron_h_moe` | Nemotron-H-8B/47B (Hybrid SSM-Transformer, MoE), Nemotron 3 Nano Omni, Nemotron 3.5 Lightning 30B-A3B (23 Mamba-2 + 23 MoE + 6 attention) | Image (Omni) | Yes | Yes | No (refused: verify and decode kernels differ, so speculation would change the output) | [nemotron.md](docs/models/nemotron.md) |
-| Mistral 3 | `mistral3` | Mistral-Small-3.1-24B-Instruct | Image | No | No | — | [mistral3.md](docs/models/mistral3.md) |
+| Nemotron-H | `nemotron_h`, `nemotron_h_moe`, `nemotron_h_omni` | Nemotron-H-8B/47B (Hybrid SSM-Transformer, MoE), Nemotron 3 Nano Omni, Nemotron 3.5 Lightning 30B-A3B (23 Mamba-2 + 23 MoE + 6 attention) | Image (Omni); audio only with a converted Parakeet audio companion GGUF (`--mmproj` or `TS_NEMOTRON_AUDIO_MMPROJ`), otherwise refused | Yes | Yes | No (refused: verify and decode kernels differ, so speculation would change the output) | [nemotron.md](docs/models/nemotron.md) |
+| Mistral 3 | `mistral3`; also [`llama`-labelled Mistral Small 3.x files](docs/models/mistral3.md#llama-labelled-files) (Tekken tokenizer, `[INST]`/`[SYSTEM_PROMPT]` tokens) | Mistral-Small-3.1-24B-Instruct | Image | No | No | — | [mistral3.md](docs/models/mistral3.md) |
 | Hunyuan Dense | `hunyuan-dense` | Tencent dense Hunyuan decoders, e.g. Hy-MT2 (GQA with per-head QK-norm applied *after* NeoX RoPE, SwiGLU) | Text only | No | No | — | [hunyuan-dense.md](docs/models/hunyuan-dense.md) |
 | Muse-Glimmer | `muse-glimmer`, `muse_glimmer` | Muse-Glimmer-30B (interleaved SWA + NoPE full layers, attention output gate) | Image | Yes | Yes (ATEM) | Yes (DFlash block drafter, separate GGUF) | [muse-glimmer.md](docs/models/muse-glimmer.md) |
-| DiffusionGemma | `diffusion-gemma`, `diffusion_gemma` | diffusion-gemma text-diffusion GGUFs | Image (chat and `/v1/systemone` Jev decisions); no audio or video | No | No | — | [diffusiongemma.md](docs/models/diffusiongemma.md) |
-| Qwen-Image-2.1 | `qwen_image`, `qwen-image` (2.1 detected from tensor keys) | Qwen-Image-2.1 DiT GGUFs (+ dedicated 2.1 VAE & Qwen3-VL-8B) | Text→image and image editing, RGBA output; LoRA plug-ins | No | No | — | [qwenimage21.md](docs/models/qwenimage21.md) |
+| DiffusionGemma | `diffusion-gemma`, `diffusion_gemma` | diffusion-gemma text-diffusion GGUFs | Image (chat and `/v1/systemone` Jev decisions); no audio or video | No (not prompted) | No (refused) | — | [diffusiongemma.md](docs/models/diffusiongemma.md) |
+| Qwen-Image-2.1 | `qwen_image`, `qwen-image` (2.1 detected from tensor keys; earlier Qwen-Image / Edit-2511 checkpoints are refused at load) | Qwen-Image-2.1 DiT GGUFs (+ dedicated 2.1 VAE & Qwen3-VL-8B) | Text→image and image editing, RGBA output; LoRA plug-ins; prefix KV cache on by default; DiT tensor parallelism (`--tp`, GGML CUDA/Vulkan; on Vulkan two GPUs measured slower than one) | No | No | — | [qwenimage21.md](docs/models/qwenimage21.md) |
 | MiniMax-H3 | `minimax-h3`, `minimax_h3` (the published GGUFs carry no metadata at all, so they are detected from their tensors) | MiniMax-H3 FL2VA / Ref2VA (19.3B packed audio-video DiT + Qwen3-VL-32B text encoder, video VAE, audio VAE) | Video **+ 32 kHz stereo audio** out (text→video, image→video, first/last frame, reference→video) | No | No | — | [minimax-h3.md](docs/models/minimax-h3.md) |
 | Wan video | `wan`, `wan2.1`, `wan2.2` | Wan 2.1 T2V 1.3B/14B, Wan 2.2 TI2V-5B, Wan 2.2 A14B T2V/I2V (two experts) | Video out (text→video, image→video) | No | No | — | [wan.md](docs/models/wan.md) |
+
+The `qwen3` plug-in that runs Bonsai 8B also registers `qwen2`, `qwen2vl`, and `qwen2_vl`, so dense Qwen 3 (`qwen3`), Qwen 2 / 2.5 (`qwen2`), and Qwen 2.5-VL (`qwen2vl`) GGUFs load as text-only chat (the Qwen 2.5-VL vision tower is not used; Qwen 2 / 2.5 render tools without a thinking channel). MoE variants such as `qwen3moe` / `qwen2moe` are not registered and are refused. No card covers those files; Bonsai 8B is the only checkpoint on this plug-in with documented validation.
 
 End-to-end per-model documentation (origin, forward graph, components, parameters, prefill/decode optimizations): [architecture cards](docs/models/README.md).
 
@@ -269,7 +280,7 @@ TensorSharp’s .NET runtime and native GGML execution are compared with `llama.
 
 TensorSharp pulls clearly ahead on CUDA prefill / first-token latency (multi-turn prefill wins on **every** model, up to **1.49×**), holds decode parity-or-better on CUDA, and wins Vulkan decode on the dense 12B (up to **1.32×** on long context) — even at 2-bit IQ2_XXS quantization. The remaining sub-1.0× cells are active optimization targets. The harness also covers tool-calling, structured-output, MTP on/off, and parallel-request scenarios you can run yourself via [`benchmarks/engine_comparison`](benchmarks/engine_comparison). Every cell is in the [full report](docs/engine_comparison_report.md).
 
-Models too large for that 16 GB rig carry their own head-to-head in their card, measured the same way (both engines, same GGUF, same machine, back to back): [GLM-5.2 744B-A40B on 3x RTX PRO 6000](docs/models/glm.md#performance) — TensorSharp leads prefill from ~1k prompt tokens up (pp2048 **1.20×**, pp4096 **1.21×**) and decode by 1.04×, with llama.cpp a few percent ahead on short prefills. The non-Flash [GLM-5.3](docs/models/glm.md#glm-53-glm-dsa) has its own, on 8× A40 46 GB without NVLink (UD-Q2_K_XL, 10,531-token prompt, 300 decode tokens, median of 3, whole-layer placement): decode is a tie at **20.48** tok/s against llama.cpp's 20.28, TensorSharp prefills at 251.6 tok/s and loads the 236.4 GiB checkpoint **2.9× faster** (264 s against 753 s), and the honest gap is time to first token — 41.9 s against 29.0 s, about **1.4× slower**. llama.cpp's prefill tok/s was not recorded for that cell. Full method and per-repeat numbers: [`docs/validation/cross-engine-2026-09/README.md`](docs/validation/cross-engine-2026-09/README.md). llama.cpp is a valid reference engine for `glm-dsa`, but not for `glm5next` (GLM-5.3-Flash).
+Models too large for that 16 GB rig carry their own head-to-head in their card, measured the same way (both engines, same GGUF, same machine, back to back): [GLM-5.2 744B-A40B on 3x RTX PRO 6000](docs/models/glm.md#performance) — TensorSharp leads prefill from ~1k prompt tokens up (pp2048 **1.20×**, pp4096 **1.21×**) and decode by 1.04×, with llama.cpp a few percent ahead on short prefills. The non-Flash [GLM-5.3](docs/models/glm.md#glm-53-glm-dsa) has its own, on 8× A40 46 GB without NVLink (UD-Q2_K_XL, 10,531-token prompt, 300 decode tokens, median of 3, whole-layer placement): decode is a tie at **20.48** tok/s against llama.cpp's 20.28, TensorSharp prefills at 251.6 tok/s and loads the 236.4 GiB checkpoint **2.9× faster** (264 s against 753 s), and the honest gap is time to first token — 41.9 s against 29.0 s, about **1.4× slower**. llama.cpp's prefill tok/s was not recorded for that cell. Full method and per-repeat numbers: `docs/validation/cross-engine-2026-09/README.md` (local validation evidence, not committed). llama.cpp is a valid reference engine for `glm-dsa`, but not for `glm5next` (GLM-5.3-Flash).
 
 ## Documentation
 
@@ -287,6 +298,7 @@ New here? The sections above are all you need to get running. Everything else is
 | [Paged attention & continuous batching](docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md) | The vLLM-style paged KV cache, prefix sharing, and iteration-level scheduler |
 | [Agent Skills & agentic work](docs/agent_skills.md) | The `SKILL.md` format, progressive disclosure and its budget, the in-process tool loop, sandboxed code execution, workspaces and artifacts, the path/ZIP/exec security model, and the HTTP + C# surfaces |
 | [Multiple agents](docs/multi_agent.md) | Automatic task delegation, isolated child contexts, concurrency and permission limits, server controls, and reproducible evaluation |
+| [Browser automation skill (Playwright)](docs/playwright_agent.md) | Running the bundled `playwright` skill, which drives a browser through `@playwright/cli` via `skills_run`: the flags it needs, the macOS Chromium-sandbox config, account handoff, and TensorAgent desktop hosting (not iOS) |
 | [Speculative decoding](docs/speculative_decoding.md) | The three-layer design (model adapter / algorithm / speculator weights), the shipped `auto` / `draft-head` / `block` / `ngram` algorithms, and what to write to add a new one |
 | [Environment variable feature matrix](docs/env_var_feature_matrix.md) | Which high-impact runtime flags affect which models, backends, and prompt types |
 | [Engine comparison report](docs/engine_comparison_report.md) | Full per-scenario TensorSharp vs llama.cpp tables |
@@ -303,8 +315,8 @@ Actively developed, and the source tree runs ahead of the published packages. Th
 | Models | A dozen autoregressive families plus text-diffusion, image generation/editing, and video-with-audio generation — see [Supported Model Architectures](#supported-model-architectures). |
 | Inference hosts | CLI, interactive REPL, ASP.NET Core Web UI, Ollama-style API, OpenAI Chat Completions and Responses APIs, and the TensorAgent iOS/iPadOS app. |
 | Backends | Pure C# CPU, direct CUDA/cuBLAS, MLX Metal, and GGML CPU/Metal/CUDA/Vulkan, with per-architecture exceptions. |
-| Serving features | Continuous batching over a paged, prefix-shared KV cache; speculative decoding; single- and multi-node tensor parallelism; structured output; tool calling. |
-| Agentic work | Agent Skills and optional sandboxed file/shell tools (`--code-exec`), plus bounded automatic subagents on supported server chat paths (`--no-multi-agent` disables delegation). Subagents are read-only by default. |
+| Serving features | Continuous batching over a paged, prefix-shared KV cache (Radix prefix cache on by default); speculative decoding; single- and multi-node tensor parallelism; structured output; tool calling. |
+| Agentic work | Agent Skills (on by default; `--no-skills` disables them) and optional sandboxed file/shell tools (`--code-exec`), plus bounded automatic subagents, on by default for tool-capable families on the server chat paths and in TensorAgent (`--no-multi-agent` disables delegation on the server, TensorAgent's "Sub-agents" setting in the app; the CLI has none). Subagents are read-only by default. |
 
 Per-area detail — which architecture runs on which backend, which features each family supports, and the known limits — is in the [status matrix](docs/PROJECT_STATUS.md#status-matrix).
 

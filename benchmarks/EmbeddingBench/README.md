@@ -56,8 +56,11 @@ Repeat with `--tensorsharp-first` and a different output directory to check
 engine-order effects. The small retrieval set is a regression smoke test, not
 a retrieval leaderboard or MTEB score. Model-specific tokenizer differences
 must be inspected against an independent tokenizer, not hidden by relaxing
-the vector gate. Model-level CPU/Metal tests and the independent tokenizer
-oracles live in `InferenceWeb.Tests/Embedding*Tests.cs`.
+the vector gate. Model-level CPU/Metal tests live in
+`InferenceWeb.Tests/Embedding*Tests.cs`; the independent tokenizer oracle
+fixtures are
+`InferenceWeb.Tests/Fixtures/EmbeddingTokenizer/huggingface-tokenization.json`
+and `snowflake-tokenization.json` beside it.
 
 Use `--keep-alive` to measure SDK-style persistent HTTP connections. The default
 opens a connection per request, including connection setup and teardown. Both
@@ -79,15 +82,16 @@ with `--reference-min-batch-cosine 0.999`; this changes only llama.cpp's consist
 gate. TensorSharp still requires 0.9999, and both engines' cross-vector and
 independent NumPy checks remain in force. Keep the default for Metal.
 
-See [embedding usage](../../docs/embeddings.md) and
-[recorded validation](../../docs/validation/embeddings-2026-09/README.md).
+See [embedding usage](../../docs/embeddings.md) and the recorded validation in
+`docs/validation/embeddings-2026-09/README.md` (local validation evidence, not committed).
 
 ## Additional long-context cases
 
 Use `--scenario-file cases.json --cases case_name` to measure additional shapes.
 The JSON object maps each distinct case name to an array of input strings. For
-example, the recorded [full-context input](../../docs/validation/embeddings-2026-09/full-context-inputs.json)
-contains one Snowflake input that produces exactly 8192 tokens. The runner still
+example, the recorded full-context input
+`docs/validation/embeddings-2026-09/full-context-inputs.json` (local validation
+evidence, not committed) contains one Snowflake input that produces exactly 8192 tokens. The runner still
 performs the complete short correctness corpus and symmetric runtime prewarm.
 Additional cases also retain their measured output vectors and check unit norms,
 cross-engine cosine, and identical token accounting. For expensive full-context

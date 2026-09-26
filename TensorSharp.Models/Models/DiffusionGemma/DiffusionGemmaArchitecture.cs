@@ -17,6 +17,12 @@ namespace TensorSharp.Models
             DisplayName = "Diffusion Gemma (diffusion LM)",
             Aliases = new[] { "diffusion-gemma", "diffusion_gemma" },
             Factory = c => new DiffusionGemmaModel(c.GgufPath, c.Backend),
+            // The factory never passes the degree or group on, so without this
+            // declaration --tp N was dropped in silence and a distributed group
+            // was left waiting on collectives this rank never issues.
+            MultiGpu = MultiGpuMode.SingleDevice,
+            MultiGpuLimitation =
+                "diffusion-gemma has no tensor-parallel or layer-split path; it runs on one GPU and extra GPUs stay idle.",
         };
     }
 }

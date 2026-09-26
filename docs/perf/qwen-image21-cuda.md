@@ -25,6 +25,20 @@ source offsets; backend identity; and the attention controls below. Host address
 of dynamic inputs are not keys. Images, text conditioning, timestep embeddings,
 and RoPE tables are uploaded from the current caller on every invocation.
 
+The key also records the prefix-cache mode, the cache a graph reads, the
+tensor-parallel rank count, and each applied LoRA's factor buffers (its scales
+are folded into them), so a graph built for another adapter, or for none, is
+never reused. With the default
+[prefix KV cache](../models/qwenimage21.md#prefix-kv-cache)
+(`TS_QWEN21_PREFIX_CACHE=0` disables it), a request's first step runs the whole
+sequence and stores the text and reference-image prefix in a graph that is built
+for that step and freed afterwards; it is never retained. Later steps run only
+the target tokens against that stored prefix in the retained cached-step graph.
+When the cache is declined or disabled, the full-sequence graph is the retained
+one. A CFG run keeps one cache per branch. Under `--tp`, each rank retains its
+own graphs; see
+[CUDA graphs and tensor parallelism](../models/qwenimage21.md#cuda-graphs-and-tensor-parallelism).
+
 Resident weight bindings are checked against the live weight-cache maps before
 reuse. Weights denied a resident-cache allocation remain in that graph's own
 allocation. These constant leaves and masks are marked as outputs as well as
@@ -77,6 +91,7 @@ array directly; editing still assembles reference and target tokens together.
 | `TS_QWEN21_PAD_MASK` | `0` | `1` restores the prior CUDA padded-mask/F32-KV preparation for attention comparisons. |
 | `TS_QWEN21_FLASH` | `1` | `0` uses explicit attention as a numerical reference. |
 | `TS_QWEN21_GRAPH_TRACE` | `0` | `1` logs graph builds, scratch size and execution counts; it is not CUDA capture instrumentation. |
+| `TS_QWEN21_PREFIX_CACHE` | on | `0` recomputes the text/reference prefix on every step instead of storing its keys and values. |
 | `TS_GGML_LOG_DEBUG` | `0` | `1` exposes upstream debug messages, including CUDA graph warmup and reset decisions. |
 | `GGML_CUDA_DISABLE_GRAPHS` | unset | Upstream presence-based switch to disable CUDA graphs independently of TensorSharp graph reuse. |
 
@@ -161,7 +176,8 @@ rounding differences. Raw conditioning agreement alone does not validate image
 quality.
 
 Measured conditioning errors and their limitations are recorded in the ignored
-[validation report](../validation/qwen-image21-cuda/REPORT.md).
+validation report `docs/validation/qwen-image21-cuda/REPORT.md` (local validation
+evidence, not committed).
 
 ## Reference implementations inspected
 
@@ -236,5 +252,6 @@ VAE fallback are recorded separately from runs that completed the requested path
 
 Local measurements, model hashes, images, coverage and known limitations belong
 in ignored `docs/validation/` or `artifacts/`. This session's evidence and results
-are in [docs/validation/qwen-image21-cuda/REPORT.md](../validation/qwen-image21-cuda/REPORT.md).
+are in `docs/validation/qwen-image21-cuda/REPORT.md` (local validation evidence, not
+committed).
 No unavailable model/device scenario counts as a pass.

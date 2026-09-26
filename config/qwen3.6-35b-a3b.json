@@ -3,8 +3,8 @@
   // ~3B active params) plus its vision projector. Trunk + mmproj are co-located
   // under ${modelRoot}/mtp.
   // Run with:
-  //   TensorSharp.Cli    --config config/qwen3.6-35b-a3b.json --image photo.png
-  //   TensorSharp.Server --config config/qwen3.6-35b-a3b.json
+  //   TensorSharp.Cli         --config config/qwen3.6-35b-a3b.json --image photo.png
+  //   TensorSharp.Server.Host --config config/qwen3.6-35b-a3b.json
   "variables": {
     "modelRoot": "${TENSORSHARP_MODELS:-../models}",
     "root": "${TENSORSHARP_MODELS:-../models}/mtp",

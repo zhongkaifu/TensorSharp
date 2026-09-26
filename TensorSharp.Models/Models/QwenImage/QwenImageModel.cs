@@ -62,6 +62,17 @@ namespace TensorSharp.Models.QwenImage
             return new QwenImage21VaeTensorStore(source);
         }
 
+        /// <summary>Why the diffusion transformer cannot shard over <paramref name="ranks"/> GPUs, or
+        /// null when its head layout allows it. Every GPU holds whole attention heads, so the only
+        /// rule here is that the count divides <see cref="QwenImage21DiT.Heads"/> (any such count, not
+        /// just the degrees that have been measured); each weight type's block alignment is checked
+        /// when <see cref="QwenImage21DiT.ShardBlocks"/> splits the blocks.</summary>
+        internal static string DitTensorParallelRefusal(int ranks) =>
+            ranks < 2 || QwenImage21DiT.Heads % ranks == 0
+                ? null
+                : $"Qwen-Image-2.1 tensor parallelism needs a GPU count that divides its {QwenImage21DiT.Heads} " +
+                  $"attention heads, because every GPU holds whole heads; --tp {ranks} does not.";
+
         /// <summary>The group the diffusion transformer shards over, or null on one device.</summary>
         internal ITensorParallelGroup DitTensorParallelGroup => IsTensorParallel ? _tpGroup : null;
 
@@ -87,9 +98,8 @@ namespace TensorSharp.Models.QwenImage
                     throw new ModelLoadRefusedException(
                         "Qwen-Image-2.1 tensor parallelism shards over the GPUs of one machine; a multi-node --tp group is not supported.");
                 // Refuse at load, not after the prompt has been encoded: every GPU holds whole heads.
-                if (IsTensorParallel && QwenImage21DiT.Heads % TpDegree != 0)
-                    throw new ModelLoadRefusedException(
-                        $"Qwen-Image-2.1 tensor parallelism needs a GPU count that divides its {QwenImage21DiT.Heads} attention heads (2, 4 or 8); --tp {TpDegree} does not.");
+                if (IsTensorParallel && DitTensorParallelRefusal(TpDegree) is string tpRefusal)
+                    throw new ModelLoadRefusedException(tpRefusal);
                 Config = new ModelConfig
                 {
                     Architecture = "qwen_image",

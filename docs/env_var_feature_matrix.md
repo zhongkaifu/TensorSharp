@@ -24,7 +24,8 @@ The default sweep list is configured in
   matrix value is authoritative.
 - `--env-vars none` disables sweep cases. If a config file has an empty
   `default_env_vars` list and the CLI does not override it, the runner uses all
-  registered `EnvVarMatrix.All` entries.
+  registered `EnvVarMatrix.All` entries — each still only where it applies, so
+  `TS_KV_PAGED_QUANT_BITS`, which applies to nothing, adds no cells.
 
 The "Runtime baseline" column below describes the behavior when the variable is
 unset. The "Swept by default" column describes the current default config, not
@@ -47,36 +48,56 @@ results as part of the standard matrix.
 | `TS_GEMMA4_BATCHED` | Gemma 4 | Batched paged forward vs per-sequence fallback | ON | `0`, `1` | yes |
 | `TS_NEMOTRON_MAMBA2_BATCHED_NATIVE` | Nemotron-H | Native batched Mamba2 step | OFF | `0`, `1` | no |
 | `TS_BATCHED_N1_FAST_PATH` | all | Fused N=1 fast-path decode for solo sequences; `0` forces those steps onto the fully-batched path | ON | `0`, `1` | yes |
-| `TS_PER_SEQ_FUSED` | fused-capable models (Gemma 4, Qwen 3.5/3.6, DeepSeek V4, GLM 5.x) | Per-request fused Forward for concurrent (N>=2) sequences; `0` forces the op-by-op batched paged path | ON | `0`, `1` | no |
-| `TS_BATCHED_FUSED_DECODE` | fused-capable models | True token-batched fused decode inside the per-seq fused path (one graph for all N). On GLM 5.x this is 1.81x aggregate decode at 4 concurrent requests; on DeepSeek V4.1 Flash at Q4_K_M it is 2.0x (24.3 → 48.9 tok/s), bounded by routing because each token picks its own 6 of 384 experts. Batching changes GEMM shapes and a 2-bit MoE can turn that into different expert picks; set `0` for a serial-path A/B. | ON | `0`, `1` | no |
-| `TS_RETAINED_FUSED_CACHE` | models with retainable request-owned fused holders (Gemma 4; Qwen 3.5/3.6) | Retain a finished holder for exact-prefix continuation. Qwen's holder includes attention K/V and matching GatedDeltaNet recurrent state | ON | `0`, `1` | no |
-| `TS_RETAINED_FUSED_CACHE_MAX` | models with retainable request-owned fused holders | LRU budget of retained holders (VRAM cap; includes recurrent state where applicable) | `4` | n/a | no |
-| `TS_PREFIX_CHECKPOINTS` | Gemma 4; Qwen 3.5/3.6 (GGML backends) | Checkpoint the model's complete state where the prompt every conversation shares ends (system prompt, tools, skills) and start each NEW chat from a clone of it, so a new chat re-prefills only its own message | ON | `0`, `1` | no |
-| `TS_PREFIX_CHECKPOINTS_MAX` | same | How many distinct shared prefixes stay checkpointed (each holds one copy of the prefix's K/V and, for Qwen, recurrent state) | `2` | n/a | no |
+| `TS_PER_SEQ_FUSED` | fused-capable models (Gemma 4, GPT OSS, Qwen 3 / Qwen 2 and Qwen 3.8 Flash Next on GGML backends; Qwen 3.5/3.6/3.8 on `ggml_cuda` / `ggml_metal`; DeepSeek V4 / V4.1 and GLM 5.x on their native executors) | Per-request fused Forward for concurrent (N>=2) sequences; `0` forces the op-by-op batched paged path | ON | not registered | no |
+| `TS_BATCHED_FUSED_DECODE` | models with a token-batched fused decode (Gemma 4, Qwen 3.5/3.6/3.8, GPT OSS, GLM 5.x, DeepSeek V4 / V4.1) | True token-batched fused decode inside the per-seq fused path (one graph for all N). On GLM 5.x this is 1.81x aggregate decode at 4 concurrent requests; on DeepSeek V4.1 Flash at Q4_K_M it is 2.0x (24.3 → 48.9 tok/s), bounded by routing because each token picks its own 6 of 384 experts. Batching changes GEMM shapes and a 2-bit MoE can turn that into different expert picks; set `0` for a serial-path A/B. | ON | not registered | no |
+| `TS_GEMMA4_BATCHED_CAPS` | Gemma 4 token-batched fused decode | Overrides the capability bits the native kernel reports (1 PLE, 2 KV donor, 4 SWA wrap, 8 per-sequence cache capacities, the `TSGgml_Gemma4ModelDecodeBatchedEx2` entry). `0` forces the v1 gates, so E2B/E4B decode round-robin; `7` restores the uniform-capacity gate. Diagnostic only, not needed to enable batching | native probe | not registered | no |
+| `TS_BATCHED_FUSED_MOE` | Gemma 4 MoE | `1` lets Gemma 4 MoE checkpoints take the token-batched fused decode. Off by default: its capture-safe graph, next to the KV holders, filled a 16 GB card and was not faster than round-robin there | OFF | not registered | no |
+| `TS_QWEN35_BATCHED_ARENA` | Qwen 3.5/3.6/3.8 on GGML CUDA / Metal | `0` makes the native slot-stable arena decline every token-batched decode, so concurrent steps run one fused forward per sequence | ON | not registered | no |
+| `TS_GPTOSS_BATCHED_ARENA` | GPT OSS on `ggml_cuda` / `ggml_vulkan` | `0` replaces the slot-stable arena of the batched decode with the per-sequence-window graph (the path backends without persistent graphs always take) | ON | not registered | no |
+| `TS_RETAINED_FUSED_CACHE` | models with retainable request-owned fused holders (Gemma 4; Qwen 3.5/3.6/3.8; Qwen 3.8 Flash Next, which also has `TS_Q4E_RETAINED_CACHE`; DeepSeek V4.1 only with `TS_DSV41_RETAINED_CACHE=1`); under the Radix prefix cache also GLM 5.x on its native executor (one donated native slot) | Retain a finished holder for exact-prefix continuation. Qwen's holder includes attention K/V and matching GatedDeltaNet recurrent state | ON | not registered | no |
+| `TS_RETAINED_FUSED_CACHE_MAX` | models with retainable request-owned fused holders | LRU budget of retained holders (VRAM cap; includes recurrent state where applicable). Under the Radix prefix cache it is the budget of retained per-conversation end states | `4` | n/a | no |
+| `TS_PREFIX_CHECKPOINTS` | Gemma 4 on GGML backends; Qwen 3.5/3.6/3.8 on `ggml_cuda` / `ggml_metal`, the backends where it runs per-request fused holders (not under TP); Qwen 3.8 Flash Next on its GGML token-span path, including under the `--tp N` layer split. Needs `TS_PER_SEQ_FUSED` on, and in legacy mode `TS_RETAINED_FUSED_CACHE` too | Checkpoint the model's complete state where the prompt every conversation shares ends (system prompt, tools, skills) and start each NEW chat from a clone of it, so a new chat re-prefills only its own message | ON | not registered | no |
+| `TS_PREFIX_CHECKPOINTS_MAX` | same | How many distinct shared prefixes stay checkpointed (each holds one copy of the prefix's K/V and, for Qwen, recurrent state). Under the Radix prefix cache it is the budget of public checkpoints | `2` | n/a | no |
 | `TS_KV_INITIAL_TOKENS` | families that size their cache through `ModelBase.ResolveInitialCacheAllocationLength` (Qwen 3.5/3.6, Gemma 4, GPT-OSS and the other ModelBase families; not DeepSeek V4 / GLM 5.x, which size their own) | Tokens of K/V a cache is given when created (the primary cache at load, every per-request holder) before any request declares a budget; `0` keeps the engine policy (whole window when `MAX_CONTEXT` is explicit, else a backend default). The cache still grows on demand. Memory-constrained devices set this small because every kept holder is paid at this size, host and device mirror both | `0` | n/a | no |
 | `TS_KV_GENERATION_RESERVE_MAX` | all | Cap on the generation share of the K/V a request reserves up front (prompt + max_new_tokens); a reply limit at or above the window otherwise reserves the whole window per request. Past the cap the cache grows on demand. `0` = no cap | `0` | n/a | no |
-| `TS_KV_HOLDER_POOL_MAX` | models with per-request fused holders (Qwen 3.5/3.6, GPT-OSS) | How many released holders may be parked for reuse instead of freed; each parked holder costs its whole K/V allocation | `64` | n/a | no |
+| `TS_KV_HOLDER_POOL_MAX` | models with per-request fused holders (Qwen 3.5/3.6/3.8, Gemma 4, GPT-OSS) | How many released holders may be parked for reuse instead of freed; each parked holder costs its whole K/V allocation | `64` | n/a | no |
 | `TS_SCHED_DISABLE_BATCHED` | all | Global per-sequence KV-swap fallback | OFF | `0`, `1` | yes |
+| `TS_SCHED_PREFIX_CACHE` | all autoregressive models | `0` disables every form of admission-time prompt reuse, in either prefix-cache mode. `--no-prefix-cache` (CLI and server) sets it and also skips the startup warm-up of the shared prompt and, on the server, the checkpoint files | ON (`1`) | not registered | no |
+| `TS_PREFIX_CACHE_MODE` | families with a Radix prefix-cache contract (Qwen 3.5/3.6/3.8 incl. `qwen3next`, Gemma 4, GLM 5.x, Qwen 3.8 Flash Next, DeepSeek V4 / V4.1, Qwen 3 / Qwen 2, GPT OSS, Mistral 3, Hunyuan Dense, Muse-Glimmer, Nemotron-H; not DiffusionGemma or the image/video models) | `tree` keeps pages, retained end states and public checkpoints in one radix index; `legacy` selects the older block-hash sharing with separate live-cache, retained-holder and checkpoint paths, for diagnosis. Any other value is rejected | `tree` | not registered | no |
+| `TS_SCHED_MAX_BATCHED_TOKENS` / `TS_SCHED_MAX_RUNNING_SEQS` / `TS_SCHED_PREFILL_CHUNK` / `TS_SCHED_SOLO_PREFILL_CHUNK` / `TS_SCHED_NUM_BLOCKS` / `TS_SCHED_BLOCK_SIZE` / `TS_SCHED_DECODE_QUANTUM` | all | Scheduler budgets: per-step tokens, in-flight sequences, prefill chunk while a decode runs (server `--prefill-chunk-size`), solo prefill chunk, pool blocks, tokens per block, decode quantum. See the [configuration table](PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md#configuration) | `4096` / `16` / `256` / `8192` / `256` / `256` / `256` | not registered | no |
+| `TS_SCHED_STOP_REPETITION` | all | `0` lets a generation that has locked into a loop run to its token limit instead of ending with finish reason `repetition` | ON (`1`) | not registered | no |
 
-All executor-level switches in this section are read through
+The executor-level switches in this section (`TS_SCHED_DISABLE_BATCHED`,
+`TS_BATCHED_N1_FAST_PATH`, `TS_PER_SEQ_FUSED`, `TS_BATCHED_FUSED_DECODE`, the
+retained-holder, checkpoint and `TS_KV_*` budgets) are read through
 `ExecutionOptions.FromEnvironment()` and consumed by `ExecutionPlanner`
 (see `docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md`, "Execution Planning");
-per-model `TS_*_BATCHED` opt-outs surface as the model's declared
-`BatchedForwardAvailable` capability.
+the `TS_SCHED_*` values and `TS_PREFIX_CACHE_MODE` are read by
+`SchedulerConfig.FromEnvironment()`; the arena, MoE and capability switches are
+read by the model or its native kernel. Per-model `TS_*_BATCHED` opt-outs surface
+as the model's declared `BatchedForwardAvailable` capability.
+
+TensorAgent writes its own values before every model load
+(`EngineMemoryPolicy`): `TS_KV_INITIAL_TOKENS=2048`,
+`TS_KV_GENERATION_RESERVE_MAX=1024`, `TS_KV_HOLDER_POOL_MAX=0`,
+`TS_RETAINED_FUSED_CACHE_MAX=1`, and `MAX_CONTEXT` / `KV_CACHE_DTYPE` from the
+catalog entry or the user's setting. The iOS app (`TensorAgent.Maui`) also defaults
+`TS_SCHED_SOLO_PREFILL_CHUNK=1024`, `TS_PREFIX_CHECKPOINTS_MAX=1` and
+`GGML_METAL_NO_RESIDENCY=1` when they are not already set.
 
 ## KV Cache / Context
 
 | Env var | Applies to | Feature impact | Runtime baseline | Sweep values | Swept by default |
 |---|---|---|---|---|---|
 | `KV_CACHE_DTYPE` | all except the DeepSeek V4 / V4.1 executors, which keep F16 caches read by their own attention, gather and compressor kernels: `q8_0` / `q4_0` are **refused at load** with the reason (`NotSupportedException` before the checkpoint is opened), `f32` is announced and reported as `f16` | KV cache element type | auto (model-aligned: `f16` when the model's weights are below F32, else `f32`) | `f32`, `f16`, `q8_0` (runtime also accepts `q4_0`, not swept) | yes |
-| `TS_KV_PAGED_QUANT_BITS` | all paged-KV models (not `glm-dsa`: MLA keeps one compressed 576-wide row per token and the DSA indexer scores that same contiguous history, so there is no paged block layout to quantize) | TurboQuant paged-KV block codec (2-bit uses the affine min+scale layout) | off (`0`) | `0`, `4`, `8` (the runtime also accepts `2`; not swept) | yes |
-| `TS_N_CPU_MOE` | MoE models | Routed experts of the first N layers stay in system RAM: multiplied on the host at decode, streamed to the accelerator for one graph at prefill | off (`0`) | `0`, `16`, `all` | yes (GGML backends, MoE families) |
-| `TS_CPU_MOE` | MoE models | Offload every layer's routed experts (equivalent to `TS_N_CPU_MOE=all`) | off | `0`, `1` | no |
-| `TS_CPU_MOE_THREADS` | MoE models | Worker threads for the host-side expert matmul. Default is half the usable CPU parallelism (hardware threads clamped by the affinity mask and the cgroup CPU quota), capped at 64: the decode-side matmul is one token wide, so past a few dozen workers each extra thread only adds a barrier participant (measured 7x slower at 192 threads than at 32 on a 2-socket Xeon) | min(usable/2, 64) | - | no |
-| `TS_HOST_MOE_DEVICE_MIN_BATCH` | MoE models with offload | Batch size at or above which an offloaded layer is computed on the accelerator with its experts streamed in, rather than on the host. `0` restores host-only offload | `128` | `0`, `32`, `128` | no |
-| `TS_HOST_MOE_PIN` | MoE models with offload | Page-lock (`cudaHostRegister`) the offloaded expert ranges so the streamed prefill DMAs instead of staging through the driver (9.3 -> 55.6 GB/s on PCIe 5.0). `0` disables it for every architecture. DeepSeek V4 / V4.1 are the exception to the default: their loader computes offloaded experts on the CPU backend at every batch size, so nothing streams them, and it pins them only with `1` (pinning 48.2 GiB cost 20.4 s of load on the seven-A40 lane and made those pages unevictable) | ON; off for DeepSeek V4 / V4.1 | `0`, `1` | no |
+| `TS_KV_PAGED_QUANT_BITS` | the standalone `PagedKvCacheManager` only, which CLI `--paged-bench` builds (not `glm-dsa`: MLA keeps one compressed 576-wide row per token and the DSA indexer scores that same contiguous history, so there is no paged block layout to quantize) | TurboQuant paged-KV block codec (2-bit uses the affine min+scale layout). The engine that serves CLI generation, the server and TensorAgent never reads it, so the matrix marks it as applying to nothing and generates no cells for it — not in the default sweep, not from an empty `default_env_vars`, and not when `--env-vars TS_KV_PAGED_QUANT_BITS` names it (the name still resolves) | off (`0`) | `0`, `4`, `8` (the runtime also accepts `2`; not swept) | no |
+| `TS_N_CPU_MOE` | MoE models | Routed experts of the first N layers stay in system RAM: multiplied on the host at decode, streamed to the accelerator for one graph at prefill | off (`0`) | `0`, `16`, `all` | no (registered for the GGML GPU backends and MoE families, but not in the default config's list) |
+| `TS_CPU_MOE` | MoE models | Offload every layer's routed experts (equivalent to `TS_N_CPU_MOE=all`) | off | not registered | no |
+| `TS_CPU_MOE_THREADS` | MoE models | Worker threads for the host-side expert matmul. Above 8 usable CPUs (hardware threads clamped by the affinity mask and the cgroup CPU quota) the default is half of them, capped at 64: the decode-side matmul is one token wide, so past a few dozen workers each extra thread only adds a barrier participant (measured 7x slower at 192 threads than at 32 on a 2-socket Xeon). Smaller hosts keep almost every CPU. DeepSeek V4 / V4.1 default to every usable CPU instead (see below) | 1 at ≤2 usable CPUs, usable−1 at ≤8, else min(usable/2, 64) | - | no |
+| `TS_HOST_MOE_DEVICE_MIN_BATCH` | MoE models with offload | Batch size at or above which an offloaded layer is computed on the accelerator with its experts streamed in, rather than on the host. `0` restores host-only offload | `128` | not registered | no |
+| `TS_HOST_MOE_PIN` | MoE models with offload | Page-lock (`cudaHostRegister`) the offloaded expert ranges so the streamed prefill DMAs instead of staging through the driver (9.3 -> 55.6 GB/s on PCIe 5.0). `0` disables it for every architecture. DeepSeek V4 / V4.1 are the exception to the default: their loader computes offloaded experts on the CPU backend at every batch size, so nothing streams them, and it pins them only with `1` (pinning 48.2 GiB cost 20.4 s of load on the seven-A40 lane and made those pages unevictable) | ON; off for DeepSeek V4 / V4.1 | not registered | no |
 | `TS_HOST_MOE_PIN_MAX_MB` | MoE models with offload | Budget for the pinned expert ranges | 60% of the cgroup/host memory limit | - | no |
-| `TS_HOST_MOE_EXPERT_FILTER` | MoE models with offload | Stream only the experts the batch actually routes to, grouped into consecutive runs | ON | `0`, `1` | no |
+| `TS_HOST_MOE_EXPERT_FILTER` | MoE models with offload | Stream only the experts the batch actually routes to, grouped into consecutive runs | ON | not registered | no |
 | `MAX_CONTEXT` | long text / uploaded text | Hard context cap. Set, it is a requirement: honoured if the caches fit and refused with the numbers if not. Unset, the GGUF's advertised length is a ceiling the loader may cap to what the devices hold — GLM-5.2 advertises 1M tokens, which is ~93 GiB of KV | model default (a ceiling, not a promise) | `4096`, `8192`, `16384` | yes |
 
 ## Prefill / Decode Tuning
@@ -86,14 +107,14 @@ per-model `TS_*_BATCHED` opt-outs surface as the model's declared
 | `TS_PREFILL_CHUNK` | swept on GPT OSS, Qwen 3.5 / 3.6 family long-context features; honored at runtime by Gemma 4, Nemotron-H, and Mistral 3 as well | Chunked prefill block size | architecture default | `256`, `512`, `1024` | yes |
 | `GDN_DISABLE_CHUNKED_PREFILL` | `qwen3next` | Disable GDN chunked prefill | OFF | `0`, `1` | no |
 | `TS_GGML_ASYNC_COMPUTE` | GGML backends | Async compute submission | ON on `ggml_metal` (`0` disables), OFF on other GGML backends | `0`, `1` | yes |
-| `TS_QWEN35_FD_PERSIST` | Qwen 3.5 / 3.6 family on GGML GPU backends | Retain and replay the whole-model single-token decode graph | ON | `0`, `1` | no |
-| `TS_GPTOSS_MODEL_DECODE` | GPT OSS on GGML backends | Run the whole transformer (all layers + MoE + final norm + LM head) as ONE graph per decode token; `0` falls back to the per-layer fused kernels | ON | `0`, `1` | no |
-| `TS_GPTOSS_FD_PERSIST` | GPT OSS on `ggml_cuda` / `ggml_vulkan` | Retain and replay that whole-model decode graph (padded KV window + `set_rows`), which is what lets ggml-cuda capture it | ON | `0`, `1` | no |
-| `TS_NEMOTRON_FLASH_DECODE` | Nemotron-H on GGML backends | Device-side single-token attention against the resident KV cache; `0` restores the host C# decode attention | ON | `0`, `1` | no |
-| `TS_QWEN35_METAL_GDN_INPLACE_STATE` | Qwen 3.5 / 3.6 family on single-device `ggml_metal` | Alias K=1 GatedDeltaNet output and recurrent state, eliminating the per-layer state copy | ON | `0`, `1` | no |
-| `TS_QWEN35_METAL_TOKEN_INPUT` | Qwen 3.5 / 3.6 family on `ggml_metal` | Read token embeddings directly from the quantized table inside the decode graph | ON | `0`, `1` | no |
-| `TS_QWEN35_METAL_KV_CPY` | Qwen 3.5 / 3.6 family on `ggml_metal` | Append K/V through movable `CPY` views instead of indexed scatter | ON | `0`, `1` | no |
-| `TS_QWEN35_METAL_ASYNC_SUBMIT` | Qwen 3.5 / 3.6 family on `ggml_metal` | Submit decode and logits readback before a single synchronization | ON | `0`, `1` | no |
+| `TS_QWEN35_FD_PERSIST` | Qwen 3.5 / 3.6 family on GGML GPU backends | Retain and replay the whole-model single-token decode graph | ON | not registered | no |
+| `TS_GPTOSS_MODEL_DECODE` | GPT OSS on GGML backends | Run the whole transformer (all layers + MoE + final norm + LM head) as ONE graph per decode token; `0` falls back to the per-layer fused kernels | ON | not registered | no |
+| `TS_GPTOSS_FD_PERSIST` | GPT OSS on `ggml_cuda` / `ggml_vulkan` | Retain and replay that whole-model decode graph (padded KV window + `set_rows`), which is what lets ggml-cuda capture it | ON | not registered | no |
+| `TS_NEMOTRON_FLASH_DECODE` | Nemotron-H on GGML backends | Device-side single-token attention against the resident KV cache; `0` restores the host C# decode attention | ON | not registered | no |
+| `TS_QWEN35_METAL_GDN_INPLACE_STATE` | Qwen 3.5 / 3.6 family on single-device `ggml_metal` | Alias K=1 GatedDeltaNet output and recurrent state, eliminating the per-layer state copy | ON | not registered | no |
+| `TS_QWEN35_METAL_TOKEN_INPUT` | Qwen 3.5 / 3.6 family on `ggml_metal` | Read token embeddings directly from the quantized table inside the decode graph | ON | not registered | no |
+| `TS_QWEN35_METAL_KV_CPY` | Qwen 3.5 / 3.6 family on `ggml_metal` | Append K/V through movable `CPY` views instead of indexed scatter | ON | not registered | no |
+| `TS_QWEN35_METAL_ASYNC_SUBMIT` | Qwen 3.5 / 3.6 family on `ggml_metal` | Submit decode and logits readback before a single synchronization | ON | not registered | no |
 
 ## Multimodal
 
@@ -144,15 +165,44 @@ These variables are real runtime knobs, but they are not registered in
 | `DIFFUSION_DEVICE_COPY_BUDGET_MB` | DiffusionGemma on ggml_cuda | Device-copy cache cap when the model does not fit VRAM (prompt K/V, masks, activations) | `768` | not registered | no |
 | `DIFFUSION_SEGMENTED_DECODE` | DiffusionGemma on ggml_cuda | Force per-layer fused decode on (`1`) / off (`0`); auto-selected when the model does not fit VRAM | auto | not registered | no |
 | `DIFFUSION_PIN_STREAMED` | DiffusionGemma on ggml_cuda | Re-home streamed (non-resident) weights into page-locked copies for DMA-speed uploads (costs RAM) | OFF | not registered | no |
+| `DIFFUSION_IMAGE_BIDIRECTIONAL` | DiffusionGemma image input | `0` makes attention inside image soft-token spans plain causal instead of bidirectional on the sliding-window layers | ON | not registered | no |
+| `DIFFUSION_FUSED_PREFILL_ATTN` | DiffusionGemma on GGML backends | Fused prompt-prefill attention kernel. On by default on `ggml_cuda` (`0` restores the per-op reference); `1` opts in on other GGML backends. Image prompts always take the per-op mask path | ON on `ggml_cuda`, else OFF | not registered | no |
+| `DIFFUSION_NO_DEVICE_SAMPLE` / `DIFFUSION_DEVICE_SAMPLE_FORCE` | DiffusionGemma on ggml_cuda | `1` disables on-device sampling (argmax, entropy, sample and self-conditioning top-K on the device logits); `FORCE=1` keeps it on even under segmented decode, where it is otherwise skipped as a measured loss | device sampling ON when the model fits VRAM | not registered | no |
+| `DIFFUSION_ASYNC_COMPUTE` | DiffusionGemma on `ggml_metal` | `1` keeps asynchronous compute on. The model switches it off because Metal's lazy sync has no barrier for a host write followed by a device kernel, which corrupts its per-op prefill and loses the prompt; forcing it back is unsafe and exists only to A/B the cost | OFF | not registered | no |
+
+## Out-of-Matrix Qwen-Image-2.1 Knobs
+
+These tune Qwen-Image-2.1 generation and editing on the CLI and the server. The
+matrix feature catalog has no image-generation feature, so none of them is
+registered in `EnvVarMatrix.All`. The [Qwen-Image-2.1 card](models/qwenimage21.md)
+has the measurements and the remaining diagnostic switches.
+
+| Env var | Applies to | Feature impact | Runtime baseline | Sweep values | Swept by default |
+|---|---|---|---|---|---|
+| `TS_QWEN21_PREFIX_CACHE` | Qwen-Image-2.1 DiT | `0` (or `false` / `off` / `no`) turns off the prefix KV cache, which stores the text and reference-image keys and values at the first denoising step and reuses them at every later step | ON | not registered | no |
+| `TS_QWEN21_PREFIX_CACHE_TYPE` | same | Storage type of the cached prefix: `auto` (what attention reads, so output matches the uncached run), `f16`, `f32`, `q8_0` or `q8_0_v` (the 8-bit settings round the stored prefix). A misspelled value is an error even while the cache is off | `auto` | not registered | no |
+| `TS_QWEN21_PREFIX_CACHE_MAX_MIB` | same | Cap on one cache in MiB, on top of the rule that a cache may use at most half of the device's free memory. A cache that does not fit is declined with a warning, and that request recomputes the prefix every step | unset | not registered | no |
+| `TS_QWEN21_GRAPH_REUSE` | Qwen-Image-2.1 DiT on `ggml_cuda` / `ggml_metal` | Retain the step graphs across denoising steps, which lets ggml-cuda capture them as CUDA graphs; `0` rebuilds the graph for each prediction. CPU and Vulkan always build transient graphs | ON | not registered | no |
+| `TS_QWEN21_FLASH` / `TS_QWEN21_PAD_MASK` | Qwen-Image-2.1 DiT | Diagnostic switches: `TS_QWEN21_FLASH=0` disables flash attention; on `ggml_cuda`, `TS_QWEN21_PAD_MASK=1` restores the padded-mask attention path (other backends ignore it) | ON / OFF | not registered | no |
+| `TS_QWEN21_VAE_FUSED` | Qwen-Image-2.1 VAE | Whole-VAE graph, the default on CUDA and Metal. `0` selects the per-convolution path; `1` forces the graph on another GGML backend except Vulkan, where it is ignored with a warning | ON on CUDA / Metal | not registered | no |
+| `TS_QWEN21_VISION_FUSED` | Qwen-Image-2.1 vision encoder on `ggml_cuda` | `0` restores the previous per-block vision path for A/B runs | ON | not registered | no |
 
 ## Out-of-Matrix Speculative-Decoding Knobs
 
 These gate the optional speculative decode path in `TensorSharp.Cli` and
-`TensorSharp.Server` (Qwen 3.6 / GLM 5.2 embedded NextN block; Gemma 4's separate
-`gemma4-assistant` draft GGUF; DeepSeek V4 DSpark and Muse-Glimmer DFlash block
-drafters; the weight-free n-gram speculator). Speculation engages only for solo
-(non-concurrent) sequences and only where it is profitable (ggml backends and the
-pure-C# `cuda` backend). They are not registered in `EnvVarMatrix.All` and are not
+`TensorSharp.Server` (the NextN block embedded in Qwen 3.6, Qwen 3.8 27B, GLM 5.2
+and GLM-5.3; Gemma 4's separate `gemma4-assistant` draft GGUF; Qwen 3.8 Flash
+Next's shared MTP head GGUF; DeepSeek V4 DSpark and DFlash / DFlash2 block
+drafters for Muse-Glimmer and the Qwen 3.5 family; the experimental DeepSeek V4.1
+DSpark path, validated only on synthetic fixtures; the weight-free n-gram
+speculator). Speculation engages only for solo (non-concurrent) sequences and only
+where the model declares it profitable, which is decided per model: Qwen
+3.5/3.6/3.8 and GLM 5.2 / GLM-5.3 on every backend, GLM-5.3-Flash (n-gram only)
+where its KDA rollback is available, Gemma 4 on the ggml backends and `cuda`, Qwen
+3.8 Flash Next on its GGML token-graph path, DeepSeek V4 / V4.1 and Muse-Glimmer
+only with their drafter loaded. Nemotron-H refuses every speculator, and GPT OSS,
+Mistral 3, Qwen 3 / Qwen 2 and Hunyuan Dense have no speculative trunk, so not even
+n-gram runs there. They are not registered in `EnvVarMatrix.All` and are not
 swept by the default TestMatrix config — the matrix feature catalog has no
 speculative-decode feature today, so use explicit runs to exercise these.
 
@@ -161,17 +211,19 @@ publish **both** when a flag is applied, and readers accept either: the glm-dsa
 **native** loader reads `TS_MTP_SPEC` and `TS_MTP_DRAFT` from C++ while the model
 is loading (it decides whether to page a whole extra 256-expert decoder layer into
 VRAM, and sizes its graph cache), so those names are a cross-language contract
-that cannot simply be renamed. All are also settable via the `--spec*` flags (or
-their `--mtp-*` aliases) on both hosts.
+that cannot simply be renamed. All are also settable via the `--spec*` flags and
+`--draft-model` on both hosts. The old `--mtp-*` flags (and `--spec-draft-model`,
+`--spec-draft-n-max`, `--spec-draft-conf-min`) were removed and now fail at startup
+naming their replacement; only the `TS_MTP_*` environment spellings remain.
 
 | Env var | Legacy spelling | Applies to | Feature impact | Runtime baseline | Sweep values | Swept by default |
 |---|---|---|---|---|---|---|
-| `TS_SPEC` | `TS_MTP_SPEC` | Qwen 3.5/3.6, GLM 5.2, Gemma 4, DeepSeek V4, Muse-Glimmer (CLI + server) | Enable speculative decode for solo sequences | OFF (`0`) | not registered | no |
+| `TS_SPEC` | `TS_MTP_SPEC` | Qwen 3.5/3.6/3.8, GLM 5.2, GLM-5.3, GLM-5.3-Flash (n-gram only), Gemma 4, Qwen 3.8 Flash Next, DeepSeek V4 / V4.1, Muse-Glimmer (CLI + server) | Enable speculative decode for solo sequences | OFF (`0`) | not registered | no |
 | `TS_SPEC_TYPE` | — | all of the above | Speculation algorithm: `auto` \| `draft-head` \| `block` \| `ngram` | `auto` | not registered | no |
 | `TS_SPEC_DRAFT` | `TS_MTP_DRAFT` | all of the above | Max tokens drafted per speculative step (1-64) | `8` | not registered | no |
 | `TS_SPEC_PMIN` | `TS_MTP_PMIN` | all of the above | Draft-confidence gate; meaning is per algorithm | per algorithm (`0.15` / `0.35` / `0`) | not registered | no |
-| `TS_SPEC_DRAFT_MODEL` | `TS_MTP_DRAFT_MODEL` | Gemma 4 (CLI + server) | Path to the separate `gemma4-assistant` draft GGUF | none | not registered | no |
-| `TS_GLM_MTP` | — | GLM 5.2 | Force the NextN block on (`1`) or off (`0`), overriding `TS_SPEC`/`TS_MTP_SPEC` in both directions | unset | not registered | no |
+| `TS_SPEC_DRAFT_MODEL` | `TS_MTP_DRAFT_MODEL` | models whose drafter ships as its own GGUF (CLI + server) | Path to a separate drafter, recognised from the file's architecture: Gemma 4's `gemma4-assistant`, Qwen 3.8 Flash Next's shared MTP head, a DeepSeek V4 DSpark (or experimental V4.1 `deepseek41-dspark`) drafter, or a DFlash / DFlash2 drafter (Muse-Glimmer, Qwen 3.5 family). Set by `--draft-model`, which also enables speculation unless `--no-spec` is given | none | not registered | no |
+| `TS_GLM_MTP` | — | GLM 5.2 / GLM-5.3 (native executor) | Force the NextN block on (any value but `0`) or off (`0`), overriding `TS_SPEC`/`TS_MTP_SPEC` in both directions; those two are read with the scheduler's rule (only `1`, `true`, `yes`, `on` enable), so `TS_SPEC=false` does not page the block in | unset | not registered | no |
 | `TS_GMTP_NO_FUSED` | — | Gemma 4 on ggml backends | Disable fused multi-token-verify / draft-step kernels (per-op fallback) | OFF | not registered | no |
 | `TS_GMTP_NO_FAST_ROLLBACK` | — | Gemma 4 | Restore kept-prefix rollback instead of dense fast rollback on partial accept | OFF | not registered | no |
 | `TS_GMTP_BATCHED_TRUNK` | — | Gemma 4 | Run the verify trunk through the batched paged path instead of the linear trunk | OFF | not registered | no |
@@ -232,7 +284,8 @@ them. The full context is in the [V4 card](models/deepseek4.md) and the
 | `TS_DSV4_THREADS` | V4 and V4.1 | Native thread pool for GPU-only loads. CPU expert offload uses the detected available parallelism instead, and `--cpu-moe-threads N` / `TS_CPU_MOE_THREADS` sets that. On the pure-C# `--backend cpu` executor it sizes that executor's own worker pool and defaults to `ProcessorCount` rather than min(cores, 32) | min(cores, 32) | no |
 | `TS_DSV4_PERF` | V4 and V4.1 | `1` prints per-stage timing | off | no |
 | `TS_DSV4_VRAM_RESERVE_MB` / `TS_DSV4_GRAPH_CACHE` / `TS_DSV4_LOAD_THREADS` / `TS_DSV4_LOAD_CHUNK_MB` / `TS_DSV4_MOE_MMAP` | V4 and V4.1 | Placement headroom, graph-cache depth, weight-load parallelism, and whether host-resident experts are multiplied in place out of the GGUF mapping | see the cards | no |
-| `TS_DSV4_DSPARK` | V4 only | DSpark drafter GGUF, equivalent to `--draft-model`. V4.1 rejects V4 drafters — it has no DSpark path | unset | no |
+| `TS_DSV4_DSPARK` | V4 and V4.1 | DSpark drafter GGUF, used when `--draft-model` is not given. V4.1 accepts only a `deepseek41-dspark` drafter (V4 drafters are rejected) and only on `ggml_cuda` / `ggml_cpu`; that path is experimental, validated only on synthetic fixtures, with no trained V4.1 drafter measured | unset | no |
+| `TS_DSV41_RETAINED_CACHE` / `TS_DSV41_RETAINED_CACHE_MB` | V4.1, native executor | `1` opts in to retaining a finished conversation's native slot and re-binding it to the turn that extends it (not while a DSpark drafter is loaded); the MB value is the budget for retained slots, and `0` or an invalid value declines retention | off / `2048` | no |
 | `TS_DSV41_TP` | V4.1 | `0` disables it; `2`-`8` enables **experimental routed-MoE tensor parallelism** over exactly that many GPUs, which must equal the count `--tp` / `TS_DSV4_NGPU` selected. Gate/up split along the FFN intermediate, down along its input, partials reduced through host-staged F32 buffers. Measured slower than the layer split on the first full Q2_K run | `0` | no |
 | `TS_DSV41_ENGRAM_DEVICE` | V4.1 | `1` requires GPU-resident Engram tables and fails if they do not fit; `0` forces host mappings, which is also what a bit-exact CPU-oracle comparison needs. Unset is automatic and conservative: GPU-resident unless that would force routed-expert CPU offload | auto (GPU-resident when it fits) | no |
 | `TS_DSV41_ENGRAM_WARM` | V4.1, host mappings only | Reads the Engram table pages so a lookup is a RAM read instead of a storage round trip. Unset warms in the BACKGROUND after the model is serving (the default); `1` warms synchronously during load as before; `0` never warms. Worth 200-252 → 452-492 prefill tok/s and 23-26 → 31-33 decode tok/s on eight A40s at Q4_K_M, and irrelevant on the GPU-resident default. Costs the table bytes in host page cache (60 GiB at Q2_K, 103 GiB at Q4_K_M) and the time to read them: the synchronous form took 311.3 s for 103 GiB with the old page walk on the seven-A40 lane; the `pread` warm (`TS_DSV4_WARM_PREAD`) measured 2.24-2.54 GiB/s on that storage, i.e. 41-46 s of reads | background warm | no |
@@ -265,7 +318,7 @@ The tensor-parallel knobs (`TS_GLM_TP_SHARD`, `TS_GLM_TP_OVERSUBSCRIBE`,
 | `TS_GLM_NATIVE` | GLM 5.x | `0` runs the managed per-op path on a GGML backend instead of the native whole-model graph — the A/B that proves the two agree | `1` (native) | `0`, `1` | no |
 | `TS_GLM_NGPU` | GLM 5.x on GGML | How many GPUs the layer split spreads the trunk layers over | `0` (all visible) | `1`, `2`, `3` | no |
 | `TS_GLM_UBATCH` | GLM 5.x | Prefill micro-batch. `2048` is faster on long prompts when VRAM allows: pp2048 1145.8 vs 918.9 t/s on 3x RTX PRO 6000 | `1024` | `512`, `1024`, `2048` | no |
-| `TS_GLM_THREADS` | GLM 5.x on `ggml_cpu` | CPU-backend thread count (the routed-expert matmul takes its own count from `--cpu-moe-threads`) | min(cores, 32) | — | no |
+| `TS_GLM_THREADS` | GLM 5.x on `ggml_cpu` | CPU-backend thread count; every usable CPU instead with `--n-cpu-moe` / `--cpu-moe` or no GPU, and `--cpu-moe-threads` (then an inherited `TS_CPU_MOE_THREADS`) overrides either | min(cores, 32) | — | no |
 | `TS_GLM_FA` | GLM 5.x | `0` disables flash attention and falls back to an explicit `soft_max` chain | `1` (flash) | `0`, `1` | no |
 | `TS_GLM_FUSED_LID` | GLM 5.x | `0` builds the DSA lightning indexer out of primitives instead of the fused `ggml_lightning_indexer` op | `1` (fused) | `0`, `1` | no |
 | `TS_GLM_TOPK` | GLM 5.x | `0` attends densely past the indexer top-k — an A/B for the sparse selection itself, not a production setting | `1` (sparse) | `0`, `1` | no |
@@ -314,7 +367,7 @@ Vulkan backends (`ggml_cuda`, `ggml_vulkan`). `TENSORSHARP_TP_DEGREE`,
 | `TS_GLM_TP_FUSED` | GLM-5.3-Flash local TP on GGML | `0` forces the combined scheduler diagnostic fallback instead of concurrent segmented rank-local graphs. The fallback is also selected automatically by CPU MoE, tensor tracing, partial `TS_GLM_TP_SHARD`, oversubscribed ranks, or a backend without native hyper-connection kernels | auto (segmented when eligible) | `0`, `1` | no |
 | `TS_Q4E_LAYER_SPLIT` | Qwen 3.8 Flash Next (`qwen4exp`) multi-GPU layer split under `--tp N` | Explicit layer counts per GPU, comma-separated (e.g. `20,28`), instead of the automatic VRAM balance; throws rather than silently ignoring a value it cannot honour. `--tp N` on this architecture is a layer split, not tensor parallelism — `qwen4exp` shards no weights | automatic (layers bin-packed to each device's free VRAM) | not registered | no |
 | `TS_Q4E_RETAINED_CACHE` | Qwen 3.8 Flash Next (`qwen4exp`) on the complete GGML token-span path | `0` disables retained-conversation reuse and shared-prefix checkpoints (exact-prefix only) | ON | not registered | no |
-| `TS_Q4E_RETAINED_CACHE_MB` | Qwen 3.8 Flash Next (`qwen4exp`) retained reuse | Byte budget in MiB for retained conversations plus shared-prefix checkpoints, clamped by measured memory headroom; oldest retained conversation evicted first; `0` or an unparsable value declines every retention | `4096` | not registered | no |
+| `TS_Q4E_RETAINED_CACHE_MB` | Qwen 3.8 Flash Next (`qwen4exp`) retained reuse | Byte budget in MiB for retained conversations plus shared-prefix checkpoints, clamped by measured memory headroom. Under the default Radix prefix cache the tree owns eviction and a holder that does not fit is refused (reported once); with `TS_PREFIX_CACHE_MODE=legacy` the oldest retained conversation is evicted first. `0` or an unparsable value declines every retention | `4096` | not registered | no |
 | `GGML_CUDA_ALLREDUCE` | local TP, `ggml_cuda` | `nccl` / `internal` / `none` — passed through to ggml's collective selection; setting it explicitly also skips the pre-flight probe | auto (NCCL when the build finds it and it passes the probe) | not registered | no |
 | `TS_GGML_TP_CUDA_GRAPHS` | local TP, `ggml_cuda` | `0` turns CUDA graph capture off for multi-GPU runs. Capture is ON by default under TP because a tensor-parallel token is dozens of small per-rank submissions that replay far more cheaply than they re-issue (4×A40: Qwen3.5-9B tp4 88 → 128.5 tok/s, Qwen3.5-35B-A3B tp2 71.3 → 104.1). It was historically disabled over a capture-poisoning hazard that no longer applies — ggml captures with `cudaStreamCaptureModeRelaxed`. The opt-out is translated into a native `GGML_CUDA_DISABLE_GRAPHS` before the first backend call, because ggml latches that value on first use | capture enabled | not registered | no |
 | `TS_GGML_TP_AR_PROBE` | local TP, `ggml_cuda` | `0` skips both pre-flight probes; `force` re-probes, ignoring the cached verdicts (`~/.cache/tensorsharp/tp-collective-probe`). Before model load the group checks that peer copies between advertised device pairs actually deliver bytes, and that one small NCCL AllReduce completes end to end — some cloud hosts advertise P2P that never arrives, and NCCL's first collective then spins every GPU forever. A failed peer check keeps NCCL but takes peer transport away from it (`NCCL_P2P_DISABLE=1`), which is what preserves a device collective past 2 GPUs | probes on, verdicts cached per driver/NCCL/GPU set | not registered | no |
@@ -324,17 +377,19 @@ Vulkan backends (`ggml_cuda`, `ggml_vulkan`). `TENSORSHARP_TP_DEGREE`,
 
 ## Out-of-Matrix Redis Shared-State Knobs
 
-These variables configure optional Redis-backed shared state in
-`TensorSharp.Server`: a shared KV cache tier for cross-session reuse and a
-Redis-backed OpenAI Responses API store. They are not registered in
+These variables configure optional Redis-backed state. They are not registered in
 `EnvVarMatrix.All`. `TS_KV_CACHE_REDIS_URL` is also settable via `--redis-url`
 or `--paged-kv-redis-url`; `TS_KV_CACHE_REDIS_TTL_MINUTES` via
 `--paged-kv-redis-ttl`; `TS_RESPONSES_STORE_REDIS_URL` via `--redis-url`.
+Only the Responses API store is live on the server. The Redis KV tier belongs to
+the standalone `PagedKvCacheManager`, which only CLI `--paged-bench` builds: the
+server accepts and logs the KV settings, but its request path keeps KV state in
+the engine and never reads them.
 
 | Env var | Applies to | Feature impact | Runtime baseline | Sweep values | Swept by default |
 |---|---|---|---|---|---|
-| `TS_KV_CACHE_REDIS_URL` | `TensorSharp.Server` | Redis connection string for the shared KV cache tier; when set, KV blocks are persisted to Redis for cross-session reuse | unset (disabled) | not registered | no |
-| `TS_KV_CACHE_REDIS_TTL_MINUTES` | `TensorSharp.Server` | TTL in minutes for Redis KV cache entries; `0` = no TTL | `1440` (24 h) | not registered | no |
+| `TS_KV_CACHE_REDIS_URL` | standalone `PagedKvCacheManager` (CLI `--paged-bench`); inert on the server request path | Redis connection string for that manager's shared KV block tier | unset (disabled) | not registered | no |
+| `TS_KV_CACHE_REDIS_TTL_MINUTES` | same | TTL in minutes for that tier's entries; `0` = no TTL | `1440` (24 h) | not registered | no |
 | `TS_RESPONSES_STORE_REDIS_URL` | `TensorSharp.Server` | Redis connection string for the OpenAI Responses API store; when set, `RedisResponsesStore` replaces the in-memory store | unset (disabled, in-memory) | not registered | no |
 
 ## Out-of-Matrix General Runtime Knobs
@@ -345,6 +400,10 @@ These variables are real runtime knobs, but they are not registered in
 | Env var | Applies to | Feature impact | Runtime baseline | Sweep values | Swept by default |
 |---|---|---|---|---|---|
 | `TENSORSHARP_UPLOAD_DIR` | `TensorSharp.Server` | Directory for uploaded media and extracted video frames; set an absolute path outside the application directory for immutable deployments | `uploads` beside the server binary | not registered | no |
+| `TS_UPLOAD_MAX_MB` / `TS_UPLOAD_QUOTA_MB` / `TS_UPLOAD_TTL_HOURS` | `TensorSharp.Server` (also `--upload-max-mb`, `--upload-quota-mb`, `--upload-ttl-hours`) | Per-file cap on client uploads (HTTP 413 above it), total budget for the upload directory (HTTP 507 when exhausted), and the age after which files there are deleted. Jev's inline images are covered by the same limits | `500` / off / off | not registered | no |
+| `TENSORSHARP_PREFIX_CACHE_DIR` | `TensorSharp.Server` | Root for the shared-prefix checkpoint files that let a restart skip the shared prompt's prefill; each model gets its own `<model-file-stem>-<hash>` subdirectory with at most two files. `--no-prefix-cache` turns persistence off. TensorAgent keeps its own under the app's cache directory; the CLI keeps checkpoints in memory only | `prefix-cache` beside the server binary | not registered | no |
+| `TS_NO_MULTI_AGENT` | `TensorSharp.Server` chat endpoints | Any value except `0` turns off sub-agent delegation, like `--no-multi-agent` | unset (delegation on) | not registered | no |
+| `TS_JEV_MAX_BODY_MB` / `TS_JEV_MAX_CANVAS` / `TS_JEV_MAX_PENDING` | `POST /v1/systemone` (Jev, DiffusionGemma) | Request-body limit in MiB (1-64), answer-canvas width per question chunk in tokens (8-4096, also bounded by the checkpoint), and how many requests may be admitted at once (1-1024) before the endpoint answers HTTP 529. An out-of-range value is an error, not clamped | `8` / `64` / `32` | not registered | no |
 | `TS_NEMOTRON_AUDIO_MMPROJ` | Nemotron-H with an `--mmproj` | Audio companion GGUF (NVIDIA `sound_encoder.*` / `sound_projection.*` tensors) to load the Parakeet audio tower from instead of the `--mmproj` file, so a vision mmproj and an audio companion can be used together. Audio stays refused (HTTP 400) unless the file's tensors validate; see `docs/models/nemotron.md` §4.7 | unset (audio tower read from `--mmproj` when it has the tensors) | not registered | no |
 | `TS_PDF_MAX_PAGES` | PDF document input (CLI `--pdf`, server `/api/upload`) | Cap on the number of PDF pages read for text extraction and page-image rendering | `0` (all pages) | not registered | no |
 | `TS_GGUF_PREFAULT` / `TS_GGUF_PREFAULT_THREADS` | Model load, every architecture that goes through `GgufReader` | `0` skips the parallel page-cache warm-up that runs before the loaders touch the file; the threads variable sets its stream count. The load path itself reads through one or two streams, which caps a cold load at single-stream throughput — on a MooseFS volume that is ~440 MB/s against ~1.8 GB/s at 8-16 streams. The pass skips itself on iOS and on files larger than half of available RAM, and is a no-op on an already-cached file | on, `min(16, cores)` | not registered | no |

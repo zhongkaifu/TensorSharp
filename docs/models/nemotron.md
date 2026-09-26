@@ -1,11 +1,11 @@
 # Nemotron-H
 
-[← back to model index](README.md)
+[← back to model index](README.md) | [中文](nemotron_zh-cn.md)
 
 | Property | Value |
 |---|---|
 | Provider | NVIDIA |
-| GGUF architecture keys | `nemotron_h`, `nemotron_h_moe` |
+| GGUF architecture keys | `nemotron_h`, `nemotron_h_moe`, `nemotron_h_omni` |
 | Source class | [`NemotronModel`](../../TensorSharp.Models/Models/Nemotron/NemotronModel.cs) (legacy per-seq) + [`NemotronModel.BatchedForward.cs`](../../TensorSharp.Models/Models/Nemotron/NemotronModel.BatchedForward.cs) (`IBatchedPagedModel`) |
 | Vision encoder | [`NemotronVisionEncoder`](../../TensorSharp.Models/Models/Nemotron/NemotronVisionEncoder.cs) (RADIO / v2_vl ViT) |
 | Image processor | [`NemotronImageProcessor`](../../TensorSharp.Models/Models/Nemotron/NemotronImageProcessor.cs) |
@@ -14,7 +14,7 @@
 | Example models | Nemotron-H-8B-Reasoning-128K, Nemotron-H-47B-Reasoning-128K, Nemotron 3 Nano Omni |
 | Modalities | Text, image (Omni-class with `mmproj` loaded). Audio only when an audio companion GGUF carrying the Parakeet tower is loaded (§4.7); otherwise audio is **refused** (HTTP 400 / CLI error with `NemotronModel.AudioInputUnsupportedMessage`): the public Omni GGUFs ship no audio tower, only the RADIO vision tower in the `mmproj` (see §4.6). |
 | Thinking mode | Yes (`<think> ... </think>`) |
-| Tool calling | Yes (`<tool_call>{...}</tool_call>`) |
+| Tool calling | Yes (`<tool_call>{...}</tool_call>`); eligible for skills, the code tools and server-side [sub-agent delegation](../multi_agent.md) |
 | Batched / paged forward | **Default ON** — set `TS_NEMOTRON_BATCHED=0` to force the legacy per-sequence KV-swap path for A/B comparison. Per-slot Mamba2 conv + SSM state pool, paged K/V for attention layers. Optional native batched Mamba2 step kernel (`TS_NEMOTRON_MAMBA2_BATCHED_NATIVE=1`). See §11. |
 | Output parser | `ChatMlOutputParser` |
 
@@ -586,9 +586,13 @@ near-peak vector throughput.
   headDim * nHead` floats).
 - `ResetKVCache()` zeroes all three (KV caches, conv states, SSM states).
 - `SupportsKVCacheTruncation` returns **false** because SSM states are
-  sequential and cannot be partially reused. Multi-turn KV-cache reuse
-  therefore is not enabled for Nemotron-H — the server falls back to a full
-  reset between turns.
+  sequential and cannot be rewound. Prefix reuse therefore works at block
+  boundaries rather than by rewinding: each captured KV block bundles the
+  attention layers' K/V rows with every Mamba2 layer's conv and SSM state at
+  the end of that block (`RequiresPerBlockCapture`), and the Radix prefix
+  cache (the default mode) restores the whole blocks a new prompt shares or
+  continues the resident cache when the prompt extends it exactly
+  (`NemotronModel.PrefixCache.cs`).
 
 ## 11. Batched / paged forward (continuous batching)
 

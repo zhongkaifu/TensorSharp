@@ -1,6 +1,6 @@
 # Gemma 4
 
-[← back to model index](README.md)
+[← back to model index](README.md) | [中文](gemma4_zh-cn.md)
 
 > **Looking for the guided, from-scratch journey?** Zhongkai Fu's [From Tensors to Tokens](../BOOK.md) uses Gemma 4 E4B to connect tensor foundations, multimodal model execution, and a complete TensorSharp inference application. [View the paperback on Amazon](https://www.amazon.com/dp/B0H9P44QZZ).
 
@@ -361,12 +361,44 @@ Uses `tanh(logits / cap) * cap` when
 
 ### 4.9 Vision pipeline (images and video frames)
 
-`Gemma4VisionEncoder` is a SigLIP-style ViT with 2D position embeddings,
-GELU-Tanh MLP, and a final linear projector to the LM hidden dim. Video frames
+`Gemma4VisionEncoder` is a SigLIP-style ViT with 2D position embeddings, a
+gated GELU-tanh MLP (`gelu_pytorch_tanh`, as the vision config declares; the
+fused native block and the managed fallback both use it, where earlier builds
+used QuickGELU), and a pooled projection to the LM hidden dim: an unweighted
+RMSNorm over the vision hidden size (`embedding_pre_projection_norm`) followed
+by the linear projector. Earlier builds normalized after the projection
+instead; the order now matches upstream `Gemma4MultimodalEmbedder`.
+
+The tower loads from an mmproj GGUF or, through the same `--mmproj` option,
+from a HuggingFace `.safetensors` shard that holds it under
+`model.encoder.vision_tower.*` with the projector
+`model.encoder.embed_vision.embedding_projection.weight`
+([`Gemma4VisionEncoder.Safetensors.cs`](../../TensorSharp.Models/Models/Gemma4/Gemma4VisionEncoder.Safetensors.cs)).
+Geometry comes from the tensor shapes; the pooling factor and RMSNorm epsilon
+come from a `config.json` beside the shard when its `vision_config` matches the
+tower's width, otherwise from the Gemma 4 defaults with a one-time warning.
+This path exists for checkpoints published without an mmproj
+([DiffusionGemma](diffusiongemma.md) is the case it was written for). A shard
+carries no audio tower, so audio input still needs an mmproj GGUF. Video frames
 are extracted from MP4 inputs using time-based sampling (one frame per second by
 default via OpenCV, configurable with `VIDEO_SAMPLE_FPS`; `VIDEO_MAX_FRAMES` adds
 an optional upper bound) and each frame is encoded independently; the resulting
 embeddings are concatenated and injected at successive `<|image>` markers.
+
+Still images are sized by projector type. A `gemma4v` (SigLIP) tower, such as
+E4B's or DiffusionGemma's, gets the reference `Gemma4ImageProcessor` sizing: the
+image is scaled up or down to the largest canvas within the 280-soft-token budget
+whose sides are multiples of 48 px (patch 16 x pooling 3), then resized with an
+antialiased bicubic filter and stretched to fill, with no letterbox. Earlier
+builds used a letterboxing port of llama.cpp's smart resize that padded the
+picture with black bars, so together with the activation and norm fixes above,
+image answers on these towers change after upgrading. The resized pixels are
+checked against a numpy transcription of the reference (`Gemma4VisionOracleTests`,
+which needs a local fixture directory and is skipped without one). The 12B's
+`gemma4uv` unified embedder, a block-less path (one large-patch conv, LayerNorms,
+learned 2D positions, an RMSNorm and a linear projection) rather than the SigLIP
+stack above, keeps the older letterboxed sizing it was validated on. Video frames
+use a fixed 70-soft-token budget with that older sizing.
 
 ### 4.10 Audio pipeline
 
@@ -841,6 +873,11 @@ scheduling-dependent, so parity has to be judged in-process.
 
 ### Retained holders: the one-block minimum
 
+Under the default radix prefix cache (`TS_PREFIX_CACHE_MODE=tree`) the tree
+decides what a finished request leaves behind, and its minimum is 32 tokens
+(`MinRetainTokens`). The one-block rule below belongs to the legacy
+retained-holder path (`TS_PREFIX_CACHE_MODE=legacy`).
+
 A finished concurrent request's per-request holder is kept for its conversation's next
 turn only when it holds at least one scheduler block (256 tokens by default), by the same
 executor rule Qwen 3.5 uses (`BatchExecutor.TryRetainReleasedFusedCache` and
@@ -861,8 +898,8 @@ that runs through the shared `InferenceEngine` continuous-batching stack
 ([`docs/PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md`](../PAGED_ATTENTION_AND_CONTINUOUS_BATCHING.md)).
 Unlike most batched ports, Gemma 4 is enabled **by default**; set
 `TS_GEMMA4_BATCHED=0` to force the legacy per-seq KV-swap path for
-debugging or for batch-1 workloads where the legacy fused single-graph
-decode is faster.
+debugging. A solo request already reaches the fused single-graph decode
+through the default N=1 fast path (`TS_BATCHED_N1_FAST_PATH=1`).
 
 Gemma 4 is the hardest model TensorSharp ports to paged batching because
 of three sources of per-layer heterogeneity that the engine assumes is
@@ -924,10 +961,11 @@ The remaining batched-path mechanics mirror Mistral 3:
 | 4 long-context prompts parallel | 4 | 3 293 | 3.4 | 5.4 | **1.61×** |
 
 The speedup grows with batch size: at batch=8 short prompts the per-call
-paged graph build / gather cost is fully amortised. Single-sequence is a
-net loss because the legacy fused single-graph decode wins by ~3×
-without any batching to amortise — which is why `TS_GEMMA4_BATCHED=0`
-exists for batch-1 workloads.
+paged graph build / gather cost is fully amortised. Single-sequence was a
+net loss in this in-process toggle because the legacy fused single-graph
+decode won by ~3× without any batching to amortise. These numbers predate
+the N=1 fast path: with it on (the default) a lone sequence runs the fused
+single-graph decode instead of the batched per-op route.
 
 **Two known bring-up bugs fixed during port** (now regressions-tested):
 
@@ -999,7 +1037,8 @@ rather than silently running without speculation.
 ([`Gemma4Model.Speculative.cs`](../../TensorSharp.Models/Models/Gemma4/Gemma4Model.Speculative.cs))
 gates whether speculation actually engages:
 
-- **ggml backends (CUDA / Metal)** — run fused single-graph kernels: a multi-token
+- **ggml backends (CUDA / Metal; `ggml_vulkan` and `ggml_cpu` pass the same
+  gate)** — run fused single-graph kernels: a multi-token
   verify (`NativeGemma4ModelVerify`, or `TryFusedMoEModelVerify` for the 26B-A4B
   MoE) and a fused draft step (`NativeGemma4DraftStep`). On partial acceptance a
   dense fast-rollback avoids re-running the kept prefix (escape hatch
@@ -1012,8 +1051,8 @@ gates whether speculation actually engages:
   cache, and global RoPE uses a GPU kernel — so the verify layer loop issues zero
   host-sync stalls. A win on prose/chat workloads, ~break-even on low-acceptance
   greedy.
-- **CPU / MLX** — no fused kernels and no GPU-resident per-op path, so speculation
-  stays off and the engine serves the standard fused decode.
+- **Pure-C# `cpu` and Apple `mlx`** — no fused kernels and no GPU-resident per-op
+  path, so speculation stays off and the engine serves the standard fused decode.
 
 The 26B-A4B MoE target additionally required a load-time OOM fix on `ggml_cuda`
 (skipping the per-expert device preload) before MTP speculation became a net win.

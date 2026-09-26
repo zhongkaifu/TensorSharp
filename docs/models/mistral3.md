@@ -1,6 +1,6 @@
 # Mistral 3
 
-[← back to model index](README.md)
+[← back to model index](README.md) | [中文](mistral3_zh-cn.md)
 
 | Property | Value |
 |---|---|
@@ -12,7 +12,8 @@
 | Example models | Mistral-Small-3.1-24B-Instruct, Ministral-3-14B-Instruct |
 | Modalities | Text, image |
 | Thinking mode | No |
-| Tool calling | No |
+| Tool calling | No — the renderer declares no tools and drops `role: "tool"` messages, so the code tools and sub-agent delegation are not offered and skills fall back to inlined instructions |
+| Speculative decoding | No — Mistral 3 has no speculative trunk, so `--spec` (the weight-free n-gram drafter included) serves standard decode |
 | Batched / paged forward | **Default** — reference `IBatchedPagedModel.ForwardBatch`. Verified end-to-end on Ministral-3-14B; native paged-attention kernel ~21% faster than legacy on long context. See §11. |
 | Output parser | `PassthroughOutputParser` |
 
@@ -113,8 +114,9 @@ hf download bartowski/mistralai_Mistral-Small-3.1-24B-Instruct-2503-GGUF mistral
 hf download bartowski/mistralai_Mistral-Small-3.1-24B-Instruct-2503-GGUF mmproj-mistralai_Mistral-Small-3.1-24B-Instruct-2503-f16.gguf --local-dir models
 ```
 
-CLI one-shot with an image (Pixtral vision needs `--mmproj`; with `--image`
-and no `--input` a default describe-the-image prompt is used; CLI sampling
+CLI one-shot with an image (Pixtral vision needs the projector; the CLI finds
+a `*mmproj*istral*.gguf` beside the model on its own, otherwise pass `--mmproj`;
+with `--image` and no `--input` a default describe-the-image prompt is used; CLI sampling
 defaults to greedy and `--max-tokens` defaults to 100):
 
 ```bash
@@ -385,7 +387,7 @@ Constructor (`Mistral3Model(string ggufPath, BackendType backend)`):
 `Forward(int[] tokens)` runs the per-op managed loop:
 
 - Embedding lookup.
-- Optional vision injection at `<image_pad>`-marked positions.
+- Optional vision injection at the positions of the expanded `[IMG]` rows.
 - For each layer: RMSNorm, QKV (fused or split), RoPE with YaRN-corrected
   frequencies, optional position-dependent Q scaling, attention, output
   projection + residual, FFN, residual.
@@ -440,7 +442,7 @@ It runs through the shared continuous-batching engine (`InferenceEngine` +
 Key properties:
 
 - **Default-on, no opt-in env var.** Continuous batching for Mistral 3 is
-  always available; the server's `--no-continuous-batching` flag forces the
+  always available; `--no-continuous-batching` (server and CLI) forces the
   legacy per-seq KV-swap path for every model, including Mistral 3.
 - **Per-layer paged K/V buffers** of layout
   `[numBlocks * blockSize * numKvHeads * headDim]`, lazily grown by
@@ -499,18 +501,24 @@ has been building toward.
 **Prefix-cache validation**: in the same long-context run the engine
 shared six full prompt blocks across the four sequences
 (`reused=1536`, `hashedCached=3`), exercising the block-hash prefix
-cache end-to-end on a real GGUF.
+cache end-to-end on a real GGUF. That run predates the Radix prefix cache,
+which is now the default reuse mode (Mistral 3 takes part as a page family);
+the block-hash sharing it measured is still selectable with
+`TS_PREFIX_CACHE_MODE=legacy`.
 
 ## 12. Output parser and chat template
 
 - `PassthroughOutputParser` — Mistral 3 has no thinking / tool-call wire
   format.
-- Chat template uses Mistral's standard chat format
-  (`[INST]...[/INST]<s>...</s>`). Falls back to the hardcoded template when
-  the GGUF lacks a Jinja2 template.
-- The image placeholder is `<image_pad>` and `ChatTemplate.ExpandImageTokens`
-  expands one `<image_pad>` into the right number of placeholder tokens for
-  the corresponding image's encoded length.
+- The chat template is always TensorSharp's own `ChatTemplate.RenderMistral3`
+  (the protocol prefers it over the GGUF's Jinja): a leading system message
+  becomes `[SYSTEM_PROMPT]...[/SYSTEM_PROMPT]`, each user turn
+  `[INST]...[/INST]`, and assistant turns are appended as plain text. Tool
+  declarations and `role: "tool"` messages are not rendered.
+- Each image is one `[IMG]` placeholder emitted before the user text. The
+  injector (`ProcessMistral3History`) expands it into the image's rows of
+  `[IMG]` tokens, each row followed by `[IMG_BREAK]` and the last by
+  `[IMG_END]` (see [llama.cpp projector files](#llamacpp-projector-files)).
 
 ## 13. Optimization opportunities
 

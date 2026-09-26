@@ -1,7 +1,8 @@
 # Grammar-constrained structured output
 
-TensorSharp enforces `response_format` during decoding rather than checking it
-afterwards. The schema is compiled into a grammar, and at every step the tokens
+On `/v1/chat/completions`, TensorSharp enforces `response_format` during
+decoding rather than only checking it afterwards (see
+[Limits worth knowing](#limits-worth-knowing) for `/v1/responses`). The schema is compiled into a grammar, and at every step the tokens
 that would break that grammar are removed from the distribution before sampling.
 Invalid JSON is not repaired — it is never generated.
 
@@ -64,8 +65,12 @@ Three pieces, in `TensorSharp.Runtime/Grammar/`:
 3. **Token masking** (`GrammarTokenVocabulary.cs`, `GrammarConstraint.cs`) — see
    below.
 
-`JsonSchemaGrammarCompiler.cs` compiles JSON Schema to GBNF, and
-`GrammarLibrary.cs` caches the result per (grammar, tokenizer).
+`JsonSchemaGrammarCompiler.cs` compiles JSON Schema to GBNF, with
+`RegexToGbnf.cs` translating the supported `pattern` subset, and
+`GrammarLibrary.cs` caches the result per (grammar, tokenizer). The same
+machinery also constrains DeepSeek V4.1's DSML tool calls on
+`/v1/chat/completions` (`DeepSeek41ToolGrammar.cs`; see the
+[DeepSeek V4.1 card](models/deepseek41.md#chat-tools-and-json)).
 
 ### The masking layer
 
@@ -116,6 +121,31 @@ too loose: it makes valid output unreachable and the request fails mid-string.
 - **`oneOf` is compiled as `anyOf`.** "Exactly one" needs negation.
 - Under `--tp N` and on non-GGML backends the constraint applies normally; it
   operates on logits and is independent of the compute backend.
+- **Only `/v1/chat/completions` attaches the grammar.** On `/v1/responses`,
+  `text.format` gets the same prompt instruction and output validation (HTTP 422
+  on a non-streaming request when the result does not conform; a streamed
+  response ends with `response.failed`), but decoding is not constrained. There,
+  `text.format` cannot be combined with reasoning or with tools (HTTP 400).
+- **`response_format` cannot be combined with active `tools`** (HTTP 400).
+  Sending `"tool_choice": "none"` drops the tools, so a request that still
+  carries its tool catalog can ask for JSON after a tool round. Requested
+  skills are allowed and are written into the prompt instead of being offered
+  as tools. The prompt instruction and output validation still run alongside
+  the grammar, and a non-conforming result returns HTTP 422 on a non-streaming
+  or buffered response (`json_schema`, or `json_object` with
+  `TS_STRUCTURED_STREAM_BUFFER=1`); an unbuffered streamed `json_object` is
+  filtered to the balanced object but not validated.
+- **`response_format` with `"think": true`** is accepted only on families whose
+  protocol declares where the answer starts after reasoning: Gemma 4, Qwen 3.8
+  Flash Next (`qwen4exp`), GPT-OSS, Muse-Glimmer, DeepSeek V4.1, GLM-5.3-Flash
+  (`glm5next`) and Nemotron-H. The grammar stays idle while the model reasons
+  and arms at that marker (for example `</think>`), skipping whitespace after
+  it. Other families return HTTP 400, and so does any `think` request when
+  `TS_JSON_GRAMMAR=0`.
+- **A schema the compiler cannot turn into a grammar** falls back to the
+  first-token nudge, and a warning is logged. The exception is a `think`
+  request on the families above, which fails instead, because the delayed
+  grammar is required there.
 
 ## Controls
 
@@ -123,6 +153,7 @@ too loose: it makes valid output unreachable and the request fails mid-string.
 |---|---|
 | `TS_JSON_GRAMMAR=0` | Fall back to prompt-and-repair (A/B testing) |
 | `TS_JSON_FORCE_OPEN=0` | Disable the first-token nudge used by that fallback |
+| `TS_STRUCTURED_STREAM_BUFFER=1` | Buffer a streamed `json_object` response as well. A streamed `json_schema` response is always buffered and schema-normalized before it is sent; `json_object` streams token by token by default |
 
 ## Using it
 

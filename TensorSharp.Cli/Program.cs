@@ -42,12 +42,18 @@ namespace TensorSharp.Cli
             Console.OutputEncoding = Encoding.UTF8;
 
             // Merge in options from a --config <file.json> before anything reads
-            // argv. File-derived tokens are spliced in ahead of the real
-            // command line, so any option also passed on the command line
-            // overrides the file (both here and in MainCore parse last-wins).
+            // argv. File-derived tokens are spliced in ahead of the real command
+            // line, and a single-valued option the command line (or a later file)
+            // sets is dropped from the earlier file before it is resolved, so the
+            // command line wins without the file's download ever running.
             try
             {
                 args = ConfigFileArgs.Expand(args);
+                // The switch in MainCore matches the exact lower-case spaced spelling only,
+                // while the server, the shared parsers and the --config override all take
+                // --flag=value in any case. Normalising here makes every documented option
+                // mean the same thing on both hosts, instead of being silently dropped.
+                args = CliUsage.NormalizeOptionSpellings(args);
             }
             catch (Exception ex) when (ex is ArgumentException or FileNotFoundException)
             {
@@ -200,7 +206,7 @@ namespace TensorSharp.Cli
             // code the MODEL wrote is its own decision, separate from --skills-allow-exec.
             // Retired spellings are refused first, against the ORIGINAL line: Parse
             // consumes what it recognises, and the CLI's own switch has no unknown-flag
-            // trap at all, so a retired --code-exec-packages would otherwise be silently
+            // trap at all, so a retired --code-exec-languages would otherwise be silently
             // dropped and the operator would never learn their setting stopped applying.
             if (CodeExecOptions.RejectRemoved(args) is { } removedCodeExecFlag)
             {
@@ -258,7 +264,15 @@ namespace TensorSharp.Cli
             // is already set, and sizes its graph cache from TS_SPEC_DRAFT. Parsing
             // these in the switch below would be too late to matter. Shared with
             // the server so the two hosts cannot drift on names or validation.
-            SpeculativeCliFlags.Apply(args);
+            bool specFlagsApplied = SpeculativeCliFlags.Apply(args);
+            // --spec-type / --spec-draft / --spec-pmin alone tune a speculation nothing turned
+            // on. Said once, in the server's words, instead of leaving only the engine's
+            // "off (not requested)" plan line, which reads as the opposite of the command.
+            if (SpeculativeCliFlags.DescribeInertTuning(
+                    specFlagsApplied, SchedulerConfig.FromEnvironment().Speculation) is { } inertSpeculation)
+            {
+                _log.LogWarning(LogEventIds.HostConfiguration, "{Warning}", inertSpeculation);
+            }
 
             string modelPath = null;
             string inputFile = null;
@@ -455,11 +469,9 @@ namespace TensorSharp.Cli
                     case "--paged-bench-prompt": pagedKvBenchPrompt = int.Parse(args[++i]); break;
                     case "--paged-bench-trials": pagedKvBenchTrials = int.Parse(args[++i]); break;
                     case "--paged-kv":
-                    case "--paged-kv-cache":
                         pagedKvEnableOverride = true;
                         break;
                     case "--no-paged-kv":
-                    case "--no-paged-kv-cache":
                         pagedKvEnableOverride = false;
                         break;
                     case "--continuous-batching":
@@ -552,21 +564,22 @@ namespace TensorSharp.Cli
                             systemPrompt = File.ReadAllText(spPath);
                         }
                         break;
-                    case "--temperature": samplingConfig.Temperature = float.Parse(args[++i], System.Globalization.CultureInfo.InvariantCulture); pinnedSampling |= SamplingFields.Temperature; break;
-                    case "--top-k": samplingConfig.TopK = int.Parse(args[++i]); pinnedSampling |= SamplingFields.TopK; break;
-                    case "--top-p": samplingConfig.TopP = float.Parse(args[++i], System.Globalization.CultureInfo.InvariantCulture); pinnedSampling |= SamplingFields.TopP; break;
-                    case "--min-p": samplingConfig.MinP = float.Parse(args[++i], System.Globalization.CultureInfo.InvariantCulture); pinnedSampling |= SamplingFields.MinP; break;
-                    case "--repeat-penalty": samplingConfig.RepetitionPenalty = float.Parse(args[++i], System.Globalization.CultureInfo.InvariantCulture); pinnedSampling |= SamplingFields.RepetitionPenalty; break;
-                    case "--penalty-last-n": samplingConfig.PenaltyLastN = int.Parse(args[++i]); pinnedSampling |= SamplingFields.PenaltyLastN; break;
-                    case "--presence-penalty": samplingConfig.PresencePenalty = float.Parse(args[++i], System.Globalization.CultureInfo.InvariantCulture); pinnedSampling |= SamplingFields.PresencePenalty; break;
-                    case "--frequency-penalty": samplingConfig.FrequencyPenalty = float.Parse(args[++i], System.Globalization.CultureInfo.InvariantCulture); pinnedSampling |= SamplingFields.FrequencyPenalty; break;
-                    case "--seed": samplingConfig.Seed = int.Parse(args[++i]); break;
-                    case "--stop":
-                        samplingConfig.StopSequences ??= new List<string>();
-                        samplingConfig.StopSequences.Add(args[++i]);
+                    default:
+                        // The sampling flags, spelled as the server spells them (see
+                        // TryParseSamplingFlag). Anything else still falls through
+                        // unrecognised, as it always has.
+                        TryParseSamplingFlag(args, ref i, samplingConfig, ref pinnedSampling);
                         break;
                 }
             }
+
+            // `--mmproj none` is the server's spelling for "no projector", and a config
+            // file's keys ARE flags: without this the CLI handed "none" to LoadProjectors
+            // as a file name. It also turns off the companion-file lookup below, so a
+            // command line can override a config that names a projector.
+            bool mmProjDisabled = IsProjectorDisabled(mmProjPath);
+            if (mmProjDisabled)
+                mmProjPath = null;
 
             if (listGpus)
             {
@@ -937,8 +950,8 @@ namespace TensorSharp.Cli
             // Qwen-Image-2.1: prompt -> generated image, or prompt + input image(s) -> edited
             // image (no autoregressive path). Repeat --image for multi-image edits (e.g.
             // --image model.png --image dress.png); the first image drives the output
-            // geometry, the prompt can reference each as "Picture 1", "Picture 2", ... in
-            // listed order.
+            // geometry, and each is tagged <image1>, <image2>, ... ahead of the prompt in
+            // command-line order, so the prompt can refer to them by those tags.
             if (model is TensorSharp.Models.QwenImage.QwenImageModel qwenImageModel)
             {
                 string prompt = editPrompt
@@ -1007,7 +1020,8 @@ namespace TensorSharp.Cli
                     "Loading mmproj projector from {MmProj}", mmProjPath);
                 model.MultimodalInjector.LoadProjectors(mmProjPath);
             }
-            else if (imagePath != null || audioPath != null || videoPath != null)
+            else if (WantsCompanionProjector(mmProjDisabled, imagePath, audioPath, videoPath,
+                         model is IVisionCapableModel, model is IAudioCapableModel))
             {
                 // No --mmproj: look for the family's companion projector beside the
                 // model. Whether to look at all is a capability question (can this model
@@ -1015,18 +1029,13 @@ namespace TensorSharp.Cli
                 // architecture's own business - both answered without naming a single
                 // architecture here. A text-only model declares neither capability and
                 // falls straight through.
-                bool wantsVision = imagePath != null && model is IVisionCapableModel;
-                bool wantsAudio = (audioPath != null || videoPath != null) && model is IAudioCapableModel;
-                if (wantsVision || wantsAudio)
+                string autoMmproj = ModelArchitectureRegistry.FindCompanionProjector(
+                    model.Config.Architecture, modelPath);
+                if (autoMmproj != null)
                 {
-                    string autoMmproj = ModelArchitectureRegistry.FindCompanionProjector(
-                        model.Config.Architecture, modelPath);
-                    if (autoMmproj != null)
-                    {
-                        _log.LogInformation(LogEventIds.HostConfiguration,
-                            "Auto-loading multimodal encoder: {MmProj}", autoMmproj);
-                        model.MultimodalInjector.LoadProjectors(autoMmproj);
-                    }
+                    _log.LogInformation(LogEventIds.HostConfiguration,
+                        "Auto-loading multimodal encoder: {MmProj}", autoMmproj);
+                    model.MultimodalInjector.LoadProjectors(autoMmproj);
                 }
             }
 
@@ -1936,6 +1945,97 @@ namespace TensorSharp.Cli
             return 0;
         }
 
+        /// <summary>The <c>--mmproj</c> value that loads no projector, as on the server.</summary>
+        internal const string NoProjector = "none";
+
+        /// <summary>
+        /// True when the <c>--mmproj</c> value is <see cref="NoProjector"/>: no projector is
+        /// loaded and none is looked up beside the model. Case-insensitive, exactly like the
+        /// server's check, so one config file means the same thing to both hosts.
+        /// </summary>
+        internal static bool IsProjectorDisabled(string mmProjArg)
+            => string.Equals(mmProjArg, NoProjector, StringComparison.OrdinalIgnoreCase);
+
+        /// <summary>
+        /// Whether to look for the model's companion projector when no <c>--mmproj</c> was
+        /// named: never after <c>--mmproj none</c>, and otherwise when an input needs an
+        /// encoder the model declares. A video's frames go to the VISION encoder (and its
+        /// soundtrack to the audio encoder), so <c>--video</c> asks for vision too - it used
+        /// to count only as audio, which left every vision-only family (Qwen 3.5/3.6,
+        /// Mistral 3, GLM-5.x, ...) with "No vision encoder loaded" for its frames.
+        /// </summary>
+        internal static bool WantsCompanionProjector(
+            bool projectorDisabled, string imagePath, string audioPath, string videoPath,
+            bool visionCapable, bool audioCapable)
+        {
+            if (projectorDisabled)
+                return false;
+            bool wantsVision = (imagePath != null || videoPath != null) && visionCapable;
+            bool wantsAudio = (audioPath != null || videoPath != null) && audioCapable;
+            return wantsVision || wantsAudio;
+        }
+
+        /// <summary>
+        /// Apply the sampling flag at <c>args[i]</c> to <paramref name="cfg"/>, advancing
+        /// <paramref name="i"/> past its value and recording the field in
+        /// <paramref name="pinned"/> so chat defaults never overwrite it. Returns false,
+        /// leaving everything untouched, for any other token.
+        ///
+        /// Every name is the server's, and the penalty window is <c>--repeat-last-n</c> like
+        /// the <c>repeat_last_n</c> request field and <c>TENSORSHARP_REPEAT_LAST_N</c>: a
+        /// config file's keys ARE flags and one file is expected to drive either host, so
+        /// the CLI must not be the host that silently drops one. The old CLI-only
+        /// <c>--penalty-last-n</c> is refused up front by <see cref="RemovedCliFlags"/>.
+        /// </summary>
+        internal static bool TryParseSamplingFlag(string[] args, ref int i, SamplingConfig cfg, ref SamplingFields pinned)
+        {
+            // Spaced and lower-case: CliUsage.NormalizeOptionSpellings has already rewritten
+            // --flag=value and any other case to this form before MainCore runs. A missing or
+            // unreadable value is a configuration error, not an unhandled exception.
+            string flag = args[i];
+            switch (flag)
+            {
+                case "--temperature": cfg.Temperature = ReadFloat(args, ref i, flag); pinned |= SamplingFields.Temperature; return true;
+                case "--top-k": cfg.TopK = ReadInt(args, ref i, flag); pinned |= SamplingFields.TopK; return true;
+                case "--top-p": cfg.TopP = ReadFloat(args, ref i, flag); pinned |= SamplingFields.TopP; return true;
+                case "--min-p": cfg.MinP = ReadFloat(args, ref i, flag); pinned |= SamplingFields.MinP; return true;
+                case "--repeat-penalty": cfg.RepetitionPenalty = ReadFloat(args, ref i, flag); pinned |= SamplingFields.RepetitionPenalty; return true;
+                case "--repeat-last-n": cfg.PenaltyLastN = ReadInt(args, ref i, flag); pinned |= SamplingFields.PenaltyLastN; return true;
+                case "--presence-penalty": cfg.PresencePenalty = ReadFloat(args, ref i, flag); pinned |= SamplingFields.PresencePenalty; return true;
+                case "--frequency-penalty": cfg.FrequencyPenalty = ReadFloat(args, ref i, flag); pinned |= SamplingFields.FrequencyPenalty; return true;
+                case "--seed": cfg.Seed = ReadInt(args, ref i, flag); return true;
+                case "--stop":
+                    cfg.StopSequences ??= new List<string>();
+                    cfg.StopSequences.Add(ReadValue(args, ref i, flag));
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
+        private static string ReadValue(string[] args, ref int i, string flag)
+        {
+            if (i + 1 >= args.Length)
+                throw new ArgumentException($"Missing value for option '{flag}'.");
+            return args[++i];
+        }
+
+        private static float ReadFloat(string[] args, ref int i, string flag)
+        {
+            string value = ReadValue(args, ref i, flag);
+            if (!float.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out float parsed) || !float.IsFinite(parsed))
+                throw new ArgumentException($"Invalid value for {flag}: '{value}'. Expected a number.");
+            return parsed;
+        }
+
+        private static int ReadInt(string[] args, ref int i, string flag)
+        {
+            string value = ReadValue(args, ref i, flag);
+            if (!int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out int parsed))
+                throw new ArgumentException($"Invalid value for {flag}: '{value}'. Expected an integer.");
+            return parsed;
+        }
+
         /// <summary>
         /// Resolve the sampling chain an interactive chat turn should use, in the
         /// same precedence order llama.cpp uses (common/common.cpp): built-in chat
@@ -1946,9 +2046,9 @@ namespace TensorSharp.Cli
         /// the chat loop. Greedy decoding with every penalty disabled is why long
         /// answers degenerated into an endless repetition of the same phrase: the
         /// argmax map has fixed cycles, and nothing in the decode loop can leave one.
-        /// Passing <c>--temperature 0</c> restores the old behaviour (and with it the
-        /// argmax-keyed fast paths: pipelined greedy decode and MTP block-speculative
-        /// decoding, both of which require a pure-argmax sampler).
+        /// Passing <c>--temperature 0</c> restores the old behaviour, repetition and
+        /// all. Speculative decoding does not need it: the verify draws every row with
+        /// the request's own sampler, so a sampled chat speculates as well as a greedy one.
         /// </summary>
         internal static void ResolveChatSamplingDefaults(
             SamplingConfig cfg, ref SamplingFields pinned, IModelArchitecture model)
@@ -1992,7 +2092,7 @@ namespace TensorSharp.Cli
                 Console.WriteLine("  NOTE: sampling resolved to greedy; long answers can repeat endlessly.");
         }
 
-        static SamplingConfig ParseSamplingFromJson(JsonElement root, SamplingConfig fallback)
+        internal static SamplingConfig ParseSamplingFromJson(JsonElement root, SamplingConfig fallback)
         {
             bool hasAny = false;
             var cfg = new SamplingConfig
@@ -2002,6 +2102,9 @@ namespace TensorSharp.Cli
                 TopP = fallback.TopP,
                 MinP = fallback.MinP,
                 RepetitionPenalty = fallback.RepetitionPenalty,
+                // Copied like every other field: left out, a line that set any sampling
+                // field silently lost the window --repeat-last-n asked for.
+                PenaltyLastN = fallback.PenaltyLastN,
                 PresencePenalty = fallback.PresencePenalty,
                 FrequencyPenalty = fallback.FrequencyPenalty,
                 Seed = fallback.Seed,
@@ -2013,6 +2116,8 @@ namespace TensorSharp.Cli
             if (root.TryGetProperty("top_p", out var tp)) { cfg.TopP = (float)tp.GetDouble(); hasAny = true; }
             if (root.TryGetProperty("min_p", out var mp)) { cfg.MinP = (float)mp.GetDouble(); hasAny = true; }
             if (root.TryGetProperty("repetition_penalty", out var rp)) { cfg.RepetitionPenalty = (float)rp.GetDouble(); hasAny = true; }
+            // The field name the server's OpenAI and Ollama request parsers read.
+            if (root.TryGetProperty("repeat_last_n", out var rln)) { cfg.PenaltyLastN = rln.GetInt32(); hasAny = true; }
             if (root.TryGetProperty("presence_penalty", out var pp)) { cfg.PresencePenalty = (float)pp.GetDouble(); hasAny = true; }
             if (root.TryGetProperty("frequency_penalty", out var fp)) { cfg.FrequencyPenalty = (float)fp.GetDouble(); hasAny = true; }
             if (root.TryGetProperty("seed", out var sd)) { cfg.Seed = sd.GetInt32(); hasAny = true; }
@@ -2884,30 +2989,6 @@ namespace TensorSharp.Cli
             return sampledTokens;
         }
 
-        /// <summary>
-        /// True when <see cref="TokenSampler.Sample"/> will reduce to a plain
-        /// argmax over the raw logits — which is exactly what the model's
-        /// pipelined device argmax computes.
-        ///
-        /// <see cref="SamplingConfig.IsGreedy"/> is not the right test here: it
-        /// also demands topK &lt;= 0 / topP &gt;= 1 / minP &lt;= 0, but the
-        /// sampler never reaches those stages once temperature &lt;= 0, so the
-        /// very common "--top-k 1" spelling of greedy decoding was silently
-        /// falling off the pipelined path. Conversely IsGreedy ignores the
-        /// penalty and grammar knobs, which DO change the greedy branch's
-        /// result (ArgmaxWithPenaltiesInPlace / grammar masking) and therefore
-        /// have to disqualify the device argmax.
-        /// </summary>
-        static bool IsArgmaxDecode(SamplingConfig cfg)
-        {
-            return cfg.Temperature <= 0f
-                && cfg.RepetitionPenalty == 1f
-                && cfg.PresencePenalty == 0f
-                && cfg.FrequencyPenalty == 0f
-                && cfg.Grammar == null
-                && (cfg.FirstTokenAllowList == null || cfg.FirstTokenAllowList.Count == 0);
-        }
-
         static int SampleGreedyFromLogits(float[] logits, int vocab)
         {
             int idx = 0;
@@ -3156,8 +3237,10 @@ namespace TensorSharp.Cli
             if (promptTokens <= 0) promptTokens = 2048;
 
             // Pick up --paged-kv-block-size / --paged-kv-ram-mb / --paged-kv-ssd-* (or
-            // their env var equivalents) so the bench mirrors what the server
-            // would do at runtime instead of using a hard-coded config.
+            // their env var equivalents) so the bench measures the store the operator
+            // configured instead of a hard-coded one. This bench is the only user of the
+            // standalone PagedKvCacheManager: the server accepts the same flags but never
+            // builds one, and normal generation reuses KV through the engine's Radix cache.
             var envCfg = PagedKvCacheConfig.FromEnvironment();
             int blockSize = envCfg.BlockSize;
             int safeBase = Math.Max(0, 1);
@@ -3207,8 +3290,9 @@ namespace TensorSharp.Cli
                 SsdDirectory = envCfg.SsdDirectory,
                 MaxSsdBytes = envCfg.MaxSsdBytes,
             };
-            // Pick up the TurboQuant codec from TS_KV_PAGED_QUANT_BITS so the
-            // benchmark exercises the same compression path the server uses.
+            // Pick up the TurboQuant codec from TS_KV_PAGED_QUANT_BITS
+            // (--paged-kv-quant-bits) so the benchmark measures the block
+            // compression the operator asked for.
             // FromEnvironment(model) returns null both when the env var is
             // unset and when the model has recurrent SSM state that
             // quantization would corrupt (Qwen3.5/3.6 GatedDeltaNet,

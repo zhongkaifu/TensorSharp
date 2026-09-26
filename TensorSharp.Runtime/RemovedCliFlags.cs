@@ -14,10 +14,13 @@ using System.Collections.Generic;
 namespace TensorSharp.Runtime
 {
     /// <summary>
-    /// Host options whose feature was removed outright, shared by <c>TensorSharp.Cli</c>
-    /// and <c>TensorSharp.Server</c>. The speculative and code-execution families keep
-    /// their own tables (their removed spellings have a survivor to point at); these do
-    /// not, so each entry carries a whole sentence of advice instead of a flag name.
+    /// Host options that were removed, shared by <c>TensorSharp.Cli</c> and
+    /// <c>TensorSharp.Server</c>: features that went outright, a spelling only one host
+    /// accepted, and second spellings of a surviving option, retired so every option has
+    /// one name on both. The speculative and
+    /// code-execution families keep their own tables; entries here carry a whole
+    /// sentence of advice instead of just a flag name, because most have no survivor
+    /// and the one that does needs saying why it changed.
     /// </summary>
     /// <remarks>
     /// <para>
@@ -46,6 +49,17 @@ namespace TensorSharp.Runtime
             ("--offload-cpu",
                 "it only applied to the retired Qwen-Image-Edit-2511 DiT. "
                 + "Qwen-Image-2.1 keeps its weights resident; use smaller --width/--height if memory is short."),
+            // The CLI alone spelled the penalty window this way; the server, the request
+            // field (repeat_last_n) and TENSORSHARP_REPEAT_LAST_N all say repeat-last-n,
+            // so a shared config's "repeat-last-n" key was silently dropped by the CLI.
+            ("--penalty-last-n",
+                "it was the CLI-only name of the repeat-penalty window. Use --repeat-last-n <N> instead, "
+                + "the spelling both hosts and the repeat_last_n request field use."),
+            // Second spellings of the paged-KV switch: one name per option.
+            ("--paged-kv-cache",
+                "it was a second spelling of --paged-kv. Use --paged-kv instead."),
+            ("--no-paged-kv-cache",
+                "it was a second spelling of --no-paged-kv. Use --no-paged-kv instead."),
         };
 
         /// <summary>

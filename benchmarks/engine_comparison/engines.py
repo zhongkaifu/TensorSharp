@@ -725,18 +725,29 @@ class TensorSharpServer(ServerHandle):
 
     def start(self):
         spec = config.BACKENDS[self.backend]
-        # TensorSharp.Server.Host hard-codes its listen address to 0.0.0.0:5000,
-        # so a squatted port cannot be worked around by moving — fail fast and clearly.
+        # The listen address is passed explicitly below, so the configured port
+        # (BENCH_TS_PORT / paths.tensorsharp_port) is the one the health checks
+        # poll, and an inherited PORT / HOST / ASPNETCORE_URLS cannot move the
+        # server. A squatter is usually a leftover server that may still hold
+        # GPU memory, so fail fast rather than benchmark beside it on another
+        # port.
         if _port_open("127.0.0.1", self.port):
             pid = _pid_listening(self.port)
             raise RuntimeError(
-                f"port {self.port} is already in use by PID {pid} and "
-                f"TensorSharp.Server.Host's listen address is hard-coded to "
-                f"0.0.0.0:{self.port}. Stop that process (taskkill /F /PID {pid}); "
-                f"if it will not die (stuck in a GPU-driver call), reboot.")
+                f"port {self.port} is already in use by PID {pid}. Stop that "
+                f"process (taskkill /F /PID {pid}); if it will not die (stuck in "
+                f"a GPU-driver call), reboot. To benchmark on another port, set "
+                f"BENCH_TS_PORT or paths.tensorsharp_port.")
+        # --no-multi-agent: sub-agent delegation is on by default in the server,
+        # and it adds five coordination tools and a coordination prompt to every
+        # request on a tool-capable model. llama.cpp and vLLM never see those, so
+        # prompt tokens, TTFT and output similarity would not be like-for-like.
         cmd = ["dotnet", str(config.TENSORSHARP_SERVER_DLL),
                "--model", str(self.model.gguf),
-               "--backend", spec.ts_backend]
+               "--backend", spec.ts_backend,
+               "--host", "127.0.0.1",
+               "--port", str(self.port),
+               "--no-multi-agent"]
         cmd += [str(a) for a in spec.ts_extra_args]
         cmd += ["--max-tokens", str(self.max_tokens)]
         if self.model.mmproj is not None and self.model.mmproj.exists():

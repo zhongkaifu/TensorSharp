@@ -1,10 +1,11 @@
 # Bonsai Q1_0 模型
 
-[← 返回模型索引](README_zh-cn.md)
+[← 返回模型索引](README_zh-cn.md) | [English](bonsai.md)
 
 TensorSharp 已针对两个本地的、纯文本 Bonsai GGUF 完成验证。它们名字与量化相同，
 但 transformer 架构并不相同：8B 文件是稠密 Qwen 3 解码器，27B 文件则是带
-GatedDeltaNet 循环层的稠密 Qwen 3.5 混合架构。
+GatedDeltaNet 循环层的稠密 Qwen 3.5 混合架构。[Bonsai2 27B](bonsai2_zh-cn.md)（带 PRISM
+Hadamard 旋转的 PQ2_0 / PTQ1_0 文件）是另一种格式，另有单独的卡片。
 
 | 属性 | Bonsai 8B | Bonsai 27B |
 |---|---|---|

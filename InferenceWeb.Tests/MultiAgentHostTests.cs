@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Text.Json;
 using System.Threading;
@@ -65,6 +66,71 @@ public class MultiAgentHostTests
         Assert.Single(client);
         Assert.Empty(unknown);
     }
+
+    /// <summary>
+    /// TensorAgent's Sub-agents switch moves delegation on the running host, the way its
+    /// skills switch does. The next request plan has to see the change, a request still
+    /// cannot turn back on what the host turned off, and every limit has to survive the
+    /// move: a repoint that quietly reset a bound to its default would be a second,
+    /// invisible settings change. Every limit is varied by reflection, so a limit added
+    /// to MultiAgentOptions later is covered without anyone remembering this test.
+    /// </summary>
+    [Fact]
+    public void RepointMultiAgent_ReachesTheNextPlan_AndKeepsEveryLimit()
+    {
+        var configured = new MultiAgentOptions();
+        foreach (PropertyInfo property in typeof(MultiAgentOptions).GetProperties())
+        {
+            if (property.Name == nameof(MultiAgentOptions.Enabled))
+                continue;
+            object value = property.GetValue(configured);
+            if (value is int number)
+                property.SetValue(configured, number + 1);
+            else if (value is bool flag)
+                property.SetValue(configured, !flag);
+            else
+                Assert.Fail($"Teach this test to vary MultiAgentOptions.{property.Name} ({property.PropertyType.Name}).");
+        }
+        configured.Validate();
+        ServerHostingOptions options = HostingOptions(configured);
+        Assert.NotNull(Plan(options));
+
+        options.RepointMultiAgent(true);
+        Assert.Same(configured, options.MultiAgent);
+
+        options.RepointMultiAgent(false);
+        Assert.False(options.MultiAgent.Enabled);
+        Assert.Null(Plan(options));
+        Assert.Null(Plan(options, enabled: true));
+
+        options.RepointMultiAgent(true);
+        SkillRequestPlan plan = Plan(options);
+        Assert.NotNull(plan);
+        Assert.Contains(plan.Tools, tool => tool.Name == MultiAgentTools.Spawn);
+        Assert.Same(options.MultiAgent, plan.MultiAgent);
+        Assert.NotSame(configured, options.MultiAgent);
+        foreach (PropertyInfo property in typeof(MultiAgentOptions).GetProperties())
+            Assert.Equal(property.GetValue(configured), property.GetValue(options.MultiAgent));
+    }
+
+    private static ServerHostingOptions HostingOptions(MultiAgentOptions multiAgent) => new(
+        startupModelPath: null,
+        startupMmProjPath: null,
+        defaultBackend: "ggml_cpu",
+        supportedBackends: Array.Empty<BackendOption>(),
+        defaultMaxTokens: 512,
+        maxTokensPinned: false,
+        defaultVideoFrames: 0,
+        defaultVideoFps: 0,
+        defaultVideoWidth: 0,
+        defaultVideoHeight: 0,
+        defaultVideoSteps: 0,
+        defaultVideoMode: null,
+        uploadDirectory: string.Empty,
+        logDirectory: string.Empty,
+        fileLoggingEnabled: false,
+        samplingDefaults: new SamplingDefaults(new SamplingConfig()),
+        multiAgent: multiAgent);
 
     [Theory]
     [InlineData("--agents-max-concurrent", "0")]

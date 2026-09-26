@@ -13,6 +13,8 @@ optimism:
   * every script it ships is in a language the app can run;
   * every module those scripts import is either in the staged standard library,
     in the staged site packages, or is a sibling file of the skill itself;
+  * no shell script it ships runs a command the in-app shell does not have (a Node
+    package manager or bundler);
   * nothing it ships reaches for a capability iOS does not have.
 
 Run it against the staged runtime:
@@ -31,6 +33,7 @@ import argparse
 import ast
 import json
 import os
+import re
 import sys
 import sysconfig
 from dataclasses import dataclass, field
@@ -53,6 +56,20 @@ UNAVAILABLE = {
 
 # Interpreters the in-process shell can dispatch to.
 RUNNABLE_SUFFIXES = {".py": "python", ".sh": "sh", ".bash": "sh", ".js": "node", ".mjs": "node"}
+
+# Commands a shell script may run that the app's in-process shell does not have. The
+# shell has a JavaScriptCore `node` and no package manager (ShellMissingCommand.cs says
+# npm and npx are missing on the device, and there is no pnpm or yarn builtin), so a
+# script that installs or runs a Node tool fails at its first line on the phone. These
+# are what the Python import check above could never see: a shell wrapper has no imports.
+UNAVAILABLE_COMMANDS = {
+    "npm": "there is no Node package manager in the app",
+    "npx": "there is no Node package manager in the app",
+    "pnpm": "there is no Node package manager in the app",
+    "yarn": "there is no Node package manager in the app",
+    "parcel": "a Node bundler cannot be installed or run in the app",
+    "vite": "a Node bundler cannot be installed or run in the app",
+}
 
 
 @dataclass
@@ -119,6 +136,25 @@ def imports_of(path: Path) -> set[str]:
     return found
 
 
+def commands_of(path: Path) -> set[str]:
+    """Names of UNAVAILABLE_COMMANDS a shell script runs, comments ignored.
+
+    A command counts where one can start: at the beginning of a line or after ;, &, |,
+    (, `, $( or a keyword such as `then`/`do`, and as the argument of `exec`, `command`
+    or `command -v` (a script that checks for pnpm and installs it with npm when it is
+    missing is reaching for both).
+    """
+    found: set[str] = set()
+    names = "|".join(sorted(UNAVAILABLE_COMMANDS))
+    pattern = re.compile(
+        r"(?:^|[;&|(`]|\$\(|\b(?:then|do|else|exec|command(?:\s+-v)?|xargs|env|sudo)\s)\s*(" + names + r")\b")
+    for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = raw.split("#", 1)[0] if not raw.lstrip().startswith("#!") else ""
+        for match in pattern.finditer(line):
+            found.add(match.group(1))
+    return found
+
+
 def inspect(skill: Path, available: set[str]) -> Verdict:
     name = skill.name
     if not (skill / "SKILL.md").is_file():
@@ -158,6 +194,16 @@ def inspect(skill: Path, available: set[str]) -> Verdict:
 
     if verdict.missing:
         verdict.reasons.append("not in the bundled runtime: " + ", ".join(sorted(verdict.missing)))
+
+    # Shell scripts have no imports to check, so check what they run. Every one of these
+    # used to pass unexamined, which is how playwright (npx) and web-artifacts-builder
+    # (pnpm, npm, parcel) were marked as working in the app.
+    for path in scripts:
+        if path.suffix not in (".sh", ".bash"):
+            continue
+        for command in sorted(commands_of(path)):
+            verdict.ok = False
+            verdict.reasons.append(f"{path.relative_to(skill)} runs {command}: {UNAVAILABLE_COMMANDS[command]}")
 
     return verdict
 

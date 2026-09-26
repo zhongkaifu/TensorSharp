@@ -161,19 +161,61 @@ namespace TensorSharp.Server.Host.Hosting
             EmitEndpoints(logger, options, listenAddress);
         }
 
+        /// <summary>
+        /// Say, once and before the startup load, when the backend this server will use is
+        /// not the one that was asked for - and what happens as a result, which depends on
+        /// who asked.
+        /// </summary>
+        /// <remarks>
+        /// This used to print "Requested default backend 'X' is unavailable. Falling back
+        /// to 'Y'" in two cases where it was false. With no <c>--backend</c> at all it
+        /// compared the resolved backend against nothing and fired on every launch, naming
+        /// an empty request. And with an explicit <c>--backend</c> plus <c>--model</c> the
+        /// startup load does NOT fall back - it resolves the requested backend itself and
+        /// refuses the load (exit 2) - so the line promised the opposite of what the next
+        /// one reported. Only a model-less process really falls back; a missing platform
+        /// default is a fallback too, and is named as that.
+        /// </remarks>
         public static void EmitBackendFallback(ILogger logger, ServerHostingOptions options, string? requestedBackendInput)
         {
             if (logger == null) throw new ArgumentNullException(nameof(logger));
             if (options == null) throw new ArgumentNullException(nameof(options));
+            if (string.IsNullOrWhiteSpace(options.DefaultBackend))
+                return;
 
-            string? canonicalRequested = BackendCatalog.Canonicalize(requestedBackendInput);
-            if (!string.Equals(options.DefaultBackend, canonicalRequested, StringComparison.OrdinalIgnoreCase) &&
-                !string.IsNullOrWhiteSpace(options.DefaultBackend))
+            bool explicitRequest = !string.IsNullOrWhiteSpace(requestedBackendInput);
+            string requested = explicitRequest
+                ? BackendCatalog.Canonicalize(requestedBackendInput) ?? requestedBackendInput!
+                : ServerOptionsBuilder.PlatformDefaultBackend;
+            if (string.Equals(options.DefaultBackend, requested, StringComparison.OrdinalIgnoreCase))
+                return;
+
+            string available = options.SupportedBackends.Count == 0
+                ? "none"
+                : string.Join(", ", options.SupportedBackends.Select(b => b.Value));
+
+            if (!explicitRequest)
             {
                 logger.LogWarning(LogEventIds.BackendUnavailable,
-                    "Requested default backend '{RequestedBackend}' is unavailable. Falling back to '{ResolvedBackend}'.",
-                    requestedBackendInput, options.DefaultBackend);
+                    "The platform default backend '{PlatformDefaultBackend}' is unavailable on this machine (available: {AvailableBackends}). " +
+                    "Using '{ResolvedBackend}' instead; pass --backend to choose another.",
+                    requested, available, options.DefaultBackend);
+                return;
             }
+
+            if (!string.IsNullOrWhiteSpace(options.StartupModelPath))
+            {
+                logger.LogWarning(LogEventIds.BackendUnavailable,
+                    "Requested backend '{RequestedBackend}' is not available on this machine (available: {AvailableBackends}). " +
+                    "The startup model is not moved to another backend: its load is refused. Pass one of the available backends with --backend.",
+                    requestedBackendInput, available);
+                return;
+            }
+
+            logger.LogWarning(LogEventIds.BackendUnavailable,
+                "Requested default backend '{RequestedBackend}' is not available on this machine (available: {AvailableBackends}). " +
+                "Falling back to '{ResolvedBackend}' as this model-less server's default backend.",
+                requestedBackendInput, available, options.DefaultBackend);
         }
     }
 }

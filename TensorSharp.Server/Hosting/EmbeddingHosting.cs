@@ -1,4 +1,5 @@
 using System;
+using System.Diagnostics.CodeAnalysis;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
@@ -17,17 +18,46 @@ public static class EmbeddingHosting
     {
         if (!options.EmbeddingsEnabled)
             throw new ArgumentException("Embedding hosting requires EmbeddingsEnabled.", nameof(options));
-        string selectedBackend = options.DefaultBackend;
-        if (!string.IsNullOrWhiteSpace(requestedBackend)
-            && !BackendSelector.TryResolveSupportedBackend(options, requestedBackend, out selectedBackend, out string error))
+        if (!TryResolveBackend(options, requestedBackend, out string? resolvedBackend, out string? error))
             throw new ArgumentException(error, nameof(requestedBackend));
-        string backend = ResolveModelBackend(selectedBackend);
+        string backend = resolvedBackend;
         services.TryAddSingleton(options);
         services.AddSingleton<IEmbeddingModel>(_ => EmbeddingModel.Load(options.StartupModelPath,
             new EmbeddingModelOptions { Backend = backend, Threads = options.EmbeddingThreads,
                 MaxTokens = options.EmbeddingContextSize }));
         services.AddSingleton<EmbeddingAdapter>();
         return services;
+    }
+
+    /// <summary>
+    /// The encoder backend an embedding deployment loads on, or false with the
+    /// operator-facing reason. An explicitly requested backend this machine does not have
+    /// is refused rather than replaced; a null request takes the resolved default. Lets
+    /// the host report that refusal as one line before it registers any service.
+    /// </summary>
+    public static bool TryResolveBackend(ServerHostingOptions options, string? requestedBackend,
+        [NotNullWhen(true)] out string? modelBackend, [NotNullWhen(false)] out string? error)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        modelBackend = null;
+        string selectedBackend = options.DefaultBackend;
+        if (!string.IsNullOrWhiteSpace(requestedBackend)
+            && !BackendSelector.TryResolveSupportedBackend(options, requestedBackend, out selectedBackend, out string selectError))
+        {
+            error = selectError;
+            return false;
+        }
+        try
+        {
+            modelBackend = ResolveModelBackend(selectedBackend);
+        }
+        catch (ArgumentException ex)
+        {
+            error = ex.Message;
+            return false;
+        }
+        error = null;
+        return true;
     }
 
     internal static string ResolveModelBackend(string backend) => BackendCatalog.Canonicalize(backend) switch
@@ -52,9 +82,19 @@ public static class EmbeddingHosting
         await next(context).ConfigureAwait(false);
     });
 
+    /// <summary>
+    /// Every mapped POST route that runs (or loads) a generation model. Kept to routes that
+    /// exist: the image, video and Jev routes were missing, so in embedding mode they fell
+    /// through to adapters that answered "the loaded model is not a Qwen-Image-2.1 model"
+    /// about a server that had loaded an encoder, while a /v1/completions entry guarded a
+    /// route the server never maps.
+    /// </summary>
     internal static bool IsGenerationPath(PathString path) => path.Value?.TrimEnd('/').ToLowerInvariant() is
-        "/v1/chat/completions" or "/v1/completions" or "/v1/responses" or "/v1/videos/generations"
-        or "/api/generate" or "/api/chat" or "/api/chat/ollama" or "/api/models/load";
+        "/v1/chat/completions" or "/v1/responses" or "/v1/systemone" or "/v1/videos/generations"
+        or "/api/generate" or "/api/chat" or "/api/chat/ollama" or "/api/models/load"
+        or "/api/image-generate" or "/api/image-generate/stream"
+        or "/api/image-edit" or "/api/image-edit/stream"
+        or "/api/video-generate" or "/api/video-generate/stream";
 
     internal static Task InvokeAsync(HttpContext context, Func<EmbeddingAdapter, HttpContext, Task> action)
     {

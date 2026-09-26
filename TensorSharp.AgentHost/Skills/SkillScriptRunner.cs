@@ -1752,7 +1752,9 @@ namespace TensorSharp.AgentHost.Skills
             [".js"] = "node",
             [".mjs"] = "node",
             // Bash accepts POSIX scripts and scripts using arrays/pipefail shipped by
-            // many skills. /bin/sh is dash on Linux and cannot run those scripts.
+            // many skills. /bin/sh is not bash everywhere — it is dash on Debian and
+            // Ubuntu and busybox ash on Alpine — and a script that relies on bash
+            // features fails under those shells.
             [".sh"] = "bash",
             [".bash"] = "bash",
         };

@@ -16,7 +16,6 @@
 <main class="content" id="content">
   <div class="breadcrumb"><a href="index_zh-cn.html">首页</a> › 计算后端</div>
   <h1>计算后端</h1>
-  <p class="callout note">TensorAgent 另提供 iOS/iPadOS 应用目标，在真机 Apple 设备上使用 GGML Metal 后端；构建时启用 <code>TensorSharpIosTargets=true</code>。</p>
   <p class="lede">后端通过 <code>--backend</code>（CLI 与服务器）选择，决定由哪种硬件运行数学运算。后端支持取决于模型架构，具体实现与验证范围见对应模型指南。TensorAgent 另提供 iOS/iPadOS 应用目标，在真机 Apple 设备上使用 GGML Metal 后端。</p>
 
   <p><strong>新增句向量编码器：</strong> Snowflake Arctic Embed L v2.0 / all-MiniLM-L6-v2，支持纯 C# CPU 与原生 GGML CPU/Metal/CUDA，通过 <code>--embeddings</code> 提供兼容 OpenAI/Ollama 的 API。 <a href="embeddings_zh-cn.html">嵌入模型、支持的后端与验证 →</a></p>
@@ -26,9 +25,9 @@
   <table>
     <thead><tr><th>你的硬件</th><th>推荐</th><th>参数</th><th>说明</th></tr></thead>
     <tbody>
-      <tr><td><strong>Apple Silicon（Mac）</strong></td><td>GGML Metal</td><td><code>ggml_metal</code></td><td>macOS 默认。<code>mlx</code> 是另一条 Apple Silicon GPU 路径。</td></tr>
-      <tr><td><strong>iPhone / iPad</strong></td><td>TensorAgent 的 GGML Metal</td><td><code>ggml_metal</code></td><td>原生 iOS 目标；使用 <code>TensorSharpIosTargets=true</code> 构建 <code>TensorAgent</code>。不使用 ASP.NET Core host，也不启动子进程。</td></tr>
-      <tr><td><strong>Windows / Linux + NVIDIA</strong></td><td>GGML CUDA</td><td><code>ggml_cuda</code></td><td>测试最充分的 NVIDIA 路径。<code>cuda</code> 是用于实验的直接 PTX/cuBLAS 后端 —— 也是支持<a href="distributed_zh-cn.html">多 GPU 张量并行</a>的那一个。</td></tr>
+      <tr><td><strong>Apple Silicon（Mac）</strong></td><td>GGML Metal</td><td><code>ggml_metal</code></td><td>服务器在 macOS 上的默认后端（CLI 在所有系统上都默认 <code>ggml_cpu</code>，因此 CLI 需显式传 <code>--backend ggml_metal</code>）。<code>mlx</code> 是另一条 Apple Silicon GPU 路径。</td></tr>
+      <tr><td><strong>iPhone / iPad</strong></td><td>TensorAgent 的 GGML Metal</td><td><code>ggml_metal</code></td><td>原生 iOS 目标；使用 <code>TensorSharpIosTargets=true</code> 构建 <code>TensorAgent</code>。要求 iOS 17.0 或更高版本，支持 arm64 的 iPhone 与 iPad（应用、分享扩展与原生 <code>.xcframework</code> 的部署目标都是 17.0）；应用声明了链接 iOS 27 SDK 时所需的单窗口 scene 生命周期。不使用 ASP.NET Core host，也不启动子进程。</td></tr>
+      <tr><td><strong>Windows / Linux + NVIDIA</strong></td><td>GGML CUDA</td><td><code>ggml_cuda</code></td><td>测试最充分的 NVIDIA 路径。<code>cuda</code> 是用于实验的直接 PTX/cuBLAS 后端。<a href="distributed_zh-cn.html">多 GPU 张量并行</a>可运行在 <code>ggml_cuda</code>、<code>ggml_vulkan</code> 与 <code>cuda</code> 上。</td></tr>
       <tr><td><strong>Windows / Linux + AMD / Intel / NVIDIA</strong></td><td>GGML Vulkan</td><td><code>ggml_vulkan</code></td><td>与厂商无关的 GPU 路径（ggml-vulkan，驱动支持时启用 cooperative-matrix 加速）。当主机存在 Vulkan 运行时时会在原生构建时自动启用；用 <code>--no-vulkan</code> 退出。</td></tr>
       <tr><td><strong>无 GPU / 可移植 / 调试</strong></td><td>纯 C# CPU</td><td><code>cpu</code></td><td>无原生依赖，且托管 matmul 现在跑在多核工作线程池上。请按实际负载对比 <code>ggml_cpu</code>（原生内核）。</td></tr>
     </tbody>
@@ -42,7 +41,7 @@
     <tbody>
       <tr><td>直接 CUDA / cuBLAS</td><td><code>cuda</code></td><td>NVIDIA 推理与实验</td></tr>
       <tr><td>MLX Metal</td><td><code>mlx</code></td><td>Apple Silicon（GGML Metal 的替代）</td></tr>
-      <tr><td>GGML Metal</td><td><code>ggml_metal</code></td><td>Apple Silicon（macOS 默认）</td></tr>
+      <tr><td>GGML Metal</td><td><code>ggml_metal</code></td><td>Apple Silicon（macOS 上的服务器默认后端）</td></tr>
       <tr><td>GGML CUDA</td><td><code>ggml_cuda</code></td><td>通过 ggml 的 NVIDIA 推理</td></tr>
       <tr><td>GGML Vulkan</td><td><code>ggml_vulkan</code></td><td>通过 ggml 的厂商无关 GPU 推理（AMD / Intel / NVIDIA）</td></tr>
       <tr><td>GGML CPU</td><td><code>ggml_cpu</code></td><td>原生 CPU 内核</td></tr>
@@ -60,7 +59,7 @@
     <li><strong>GGML Vulkan</strong>（<code>ggml_vulkan</code>，Windows/Linux + AMD/Intel/NVIDIA）—— 与厂商无关的 GPU 路径，支持任何带 Vulkan 1.3 驱动的 GPU，驱动支持时使用 cooperative-matrix（KHR coopmat / NV coopmat2）着色器。权重与 GGML CUDA 一样常驻显存，并复用同样的融合整模型 decode/prefill 图。在多 GPU 主机上（例如同时装有 Intel 集成显卡和 NVIDIA 独立显卡），用 <code>--gpu-device N</code>（或环境变量 <code>TS_GGML_VULKAN_DEVICE</code>）选择设备，用 <code>--list-gpus</code> 列出可见设备。</li>
   </ul>
   <p>三者都在不反量化为 FP32 的情况下运行原生量化 matmul（Q4_K_M、Q8_0 ……），并配有驱动 <code>ggml_flash_attn_ext</code> 的原生分页注意力内核。</p>
-  <p><strong>多 GPU。</strong>GGML CUDA 与 GGML Vulkan 同样支持<a href="distributed_zh-cn.html">张量并行</a>：<code>--tp N</code> 让每个 rank 在自己的 GPU 上拥有独立的 ggml 后端、权重分片与 KV 缓存，由 rank 工作线程池并发驱动，跨 GPU AllReduce 走 ggml 的集合通信（构建时能找到 NCCL 就用 NCCL），小载荷则在主机内存中归约。融合的按 rank block 计算图让 Gemma 4 上 <code>--tp 2</code> 的 decode 快于单卡，也让超出单卡显存的模型能够完整跑在 GPU 上。它们同样承载另一种多 GPU 模式 —— <strong>按层切分</strong>：每张 GPU 拿整层、没有集合通信、不切分任何权重；DeepSeek V4 Flash 与 GLM 5.x 不传 <code>--tp</code> 时自动如此，Qwen 3.8 Flash Next 上的 <code>--tp N</code> 跑的也是它，换来的是容量而非速度。GLM-5.2、GLM-5.3 与 GLM-5.3-Flash 传入 <code>--tp N</code> 时都会选择仅支持本地单进程的原生张量并行 —— 每个 rank 都复制一份 MLA 与 indexer 缓存，因此 KV 占用按 rank 倍增、能装下的上下文变短；GLM-5.3 上的推测解码只在默认按层切分时生效，它在多于一个 rank 时也从未实测过，而跨节点的 <code>--tp-node-id</code> / <code>--tp-peers</code> 对整个家族都会在构建模型之前被拒绝。→ <a href="distributed_zh-cn.html#vs-layer-split">TP 与按层切分</a></p>
+  <p><strong>多 GPU。</strong>GGML CUDA 与 GGML Vulkan 同样支持<a href="distributed_zh-cn.html">张量并行</a>：<code>--tp N</code> 让每个 rank 在自己的 GPU 上拥有独立的 ggml 后端、权重分片与 KV 缓存，由 rank 工作线程池并发驱动，跨 GPU AllReduce 走 ggml 的集合通信（构建时能找到 NCCL 就用 NCCL），小载荷则在主机内存中归约。融合的按 rank block 计算图让 Gemma 4 上 <code>--tp 2</code> 的 decode 快于单卡，也让超出单卡显存的模型能够完整跑在 GPU 上。它们同样承载另一种多 GPU 模式 —— <strong>按层切分</strong>：每张 GPU 拿整层、没有集合通信、不切分任何权重；DeepSeek V4 Flash 与 GLM 5.x 不传 <code>--tp</code> 时自动如此，Qwen 3.8 Flash Next 上的 <code>--tp N</code> 跑的也是它，换来的是容量而非速度。GLM-5.2、GLM-5.3 与 GLM-5.3-Flash 传入 <code>--tp N</code> 时都会选择仅支持本地单进程的原生张量并行 —— 每个 rank 都复制一份 MLA 与 indexer 缓存，因此 KV 占用按 rank 倍增、能装下的上下文变短；GLM-5.3 上的推测解码只在默认按层切分时生效，它在多于一个 rank 时也从未实测过，而跨节点的 <code>--tp-node-id</code> / <code>--tp-peers</code> 对整个家族都会在构建模型之前被拒绝。Qwen-Image-2.1 在 <code>--tp N</code> 下只切分其扩散 Transformer（单机上任何能整除其 32 个注意力头的 GPU 数，并受量化块对齐约束；仅实测过 2 张），文本编码器、视觉编码器与 VAE 留在第一张 GPU 上。→ <a href="distributed_zh-cn.html#vs-layer-split">TP 与按层切分</a></p>
   <div class="callout tip"><div class="ic">⚡</div><p><strong>已验证的 E4B 快路径：</strong>仓库基准已在这些 GGML 原生 GPU 后端上验证 Gemma 4 E4B Q8_0 家族。E4B 的 PLE 与共享 KV 布局会进入融合整模型 prefill/verify 和单图 decode 路径，服务端 N=1 时也会自动选择融合路径。请从 <a href="getting-started_zh-cn.html#e4b-fast-lane">Gemma 4 E4B 指南</a>开始。</p></div>
 
   <h3 id="mlx">MLX Metal</h3>
@@ -75,10 +74,10 @@
     <li><strong>纯 C# CPU</strong>（<code>cpu</code>）—— 无原生依赖的可移植推理，使用托管 GEMM 快路径与融合 SIMD 内核。适合调试与最大可移植性。</li>
     <li><strong>GGML CPU</strong>（<code>ggml_cpu</code>）—— 原生 GGML CPU 内核。权重存储与性能取决于模型执行器；请按实际负载与 <code>cpu</code> 对比。</li>
   </ul>
-  <p><strong>纯 C# 路径现在是多核的。</strong>托管 matmul 不再走每次 matmul 一遍的 <code>Parallel.For</code>，而是交给常驻的自旋-再挂起工作线程池（<code>TensorSharp.Models/CpuWorkerPool.cs</code>），工作项也按实际工作量而非线程数切分。在 gemma-4-E4B-it-Q8_0、122 CPU 配额下，通过 <code>TS_CPU_POOL</code> 在同一个二进制里交替 A/B 实测：相比旧路径 prefill 约 +15%、decode 约 2.8×。线程池<em>刻意</em>不占满所有核心 —— 默认宽度是可用 CPU 的一半，因为自旋的 worker 会饿死仍在用 ThreadPool 的其余 CPU 路径（占满全部核心时同一模型反而更慢）。可用 <code>TS_CPU_THREADS</code>、<code>TS_CPU_POOL</code>、<code>TS_CPU_SPIN</code>、<code>TS_CPU_TASK_BYTES</code> 与 <code>TS_CPU_TASKS_PER_WORKER</code> 调节。</p>
+  <p><strong>纯 C# 路径现在是多核的。</strong>托管 matmul 不再走每次 matmul 一遍的 <code>Parallel.For</code>，而是交给常驻的自旋-再挂起工作线程池（<code>TensorSharp.Models/CpuWorkerPool.cs</code>），工作项也按实际工作量而非线程数切分。在 gemma-4-E4B-it-Q8_0、122 CPU 配额下，通过 <code>TS_CPU_POOL</code> 在同一个二进制里交替 A/B 实测：相比旧路径 prefill 约 +15%、decode 约 2.8×。在大主机上线程池<em>刻意</em>不占满所有核心 —— 默认宽度在 8 核及以下时取全部 CPU，超过 8 核时取一半（且不少于 8），因为自旋的 worker 会饿死仍在用 ThreadPool 的其余 CPU 路径（占满全部核心时同一模型反而更慢）。可用 <code>TS_CPU_THREADS</code>、<code>TS_CPU_POOL</code>、<code>TS_CPU_SPIN</code>、<code>TS_CPU_TASK_BYTES</code> 与 <code>TS_CPU_TASKS_PER_WORKER</code> 调节。</p>
   <p><strong><code>ModelBase</code> 加载器零拷贝映射量化权重。</strong><code>cpu</code> 是最后一个在加载时把每个量化张量复制进新的匿名内存、而不是直接绑定 GGUF 映射的后端 —— GGML 后端一直都是后者。加载器现在会打印它实际拿到的拆分，例如 <code>Quantized: 103255 MB (103255 MB file-backed), F32: 983 MB</code>。任何此前需要复制权重的模型都会加载得更快，越大的量化检查点收益越明显：GLM-5.3-Flash UD-Q2_K_XL 从一次永远无法完成的加载（常驻集 412 GB 且仍在增长）变成约 48 s，其中大部分是页缓存预取。</p>
   <p><strong>托管 i-quant 的覆盖面更宽了。</strong><code>IQ2_XS</code> 与 <code>IQ4_XS</code> 有了托管反量化实现（与 ggml 自己的 <code>dequantize_row_*</code> 对拍过），并进入了 CPU 量化存储矩阵，因此它们在加载时会保持量化，而不再展开成 F32 —— 正是这种展开让 GLM-5.3-Flash 的 2-bit 检查点要求 765 GB。<code>IQ2_XS</code> × <code>Q8_K</code> 与 <code>IQ3_XXS</code> × <code>Q8_K</code> 也有了直接点积内核以及 AVX2 路径（<code>VecDotIq2XsQ8KAvx2</code>、<code>VecDotIq3XxsQ8KAvx2</code>），不必再回落到通用的「反量化整行到暂存区」路径。这两项改动对 <code>--backend cpu</code> 上的任何模型都生效。如果你要再加一个这样的内核，请注意：ggml 是把一个常数折叠进某些 i-quant 点积的<em>结果</em>里（<code>IQ2_XS</code> 为 0.125，<code>IQ3_XXS</code> 为 0.25，<code>IQ3_S</code> 为 1.0），而不是折进每个块的 scale —— 漏掉它就是 8× 的误差，而且不会崩溃，只会产出看起来通顺的垃圾。</p>
-  <p><strong>除 Qwen-Image-2.1 外，每个模型家族都有纯 C# 路径。</strong>Qwen-Image-2.1 运行整张 GGML 计算图，需要 <code>ggml_metal</code>、<code>ggml_cuda</code>、<code>ggml_vulkan</code> 或 <code>ggml_cpu</code>。MiniMax-H3 是最后一个没有纯 C# 路径的视频家族：它此前每个阶段都是无条件的原生 ggml 调用，而现在 <code>--backend cpu</code> 上的 t2v、i2v、fl2v 与参考条件（静图、片段、音轨）都走托管的 DiT、文本编码器、VAE 与视觉塔。输出与 GGML 路径贴合得很紧 —— t2v、i2v 与 ref-audio 的吻合程度甚至高于 GGML 自家 flash 内核与其显式 softmax 回退之间的吻合程度 —— 唯一的例外是视觉塔，其残差比该对照更大，原因尚未查明。速度是有得有失、并非一律更慢：同一段片段上，i2v 为 70 s、<code>ggml_cpu</code> 为 176 s，ref-audio 为 63 s 对 71 s；但 t2v 为 69 s 对 14 s、ref-image 为 112 s 对 20 s —— 视觉塔是托管路径里最贵的一段。→ <a href="models-video_zh-cn.html#minimax-h3">MiniMax-H3</a></p>
+  <p><strong>除 Qwen-Image-2.1 外，每个模型家族都有纯 C# 路径</strong>，但有两个检查点层面的例外：Bonsai2 经 PRISM 旋转的 <code>qwen35</code> 文件需要单设备 GGML 后端；Qwen 3.8 Flash Next 的 Qwen Sparse Attention 层需要 GGML token-span 路径。Qwen-Image-2.1 运行整张 GGML 计算图，需要 <code>ggml_metal</code>、<code>ggml_cuda</code>、<code>ggml_vulkan</code> 或 <code>ggml_cpu</code>。它的 VAE 解码在 <code>ggml_metal</code> 与 <code>ggml_cuda</code> 上默认作为一整张图运行 —— 在 M5 Pro 上 1024×1024 用时 5.0 s，逐卷积路径为 13.0 s —— <code>TS_QWEN21_VAE_FUSED=0</code> 可改回逐卷积路径。<code>ggml_vulkan</code> 上从不使用整图；VAE 在设备上逐个卷积解码，把超出 Vulkan 矩阵单元 F16 范围的输入按比例缩小到该范围内，再把结果按同一比例放大回来。MiniMax-H3 是最后一个没有纯 C# 路径的视频家族：它此前每个阶段都是无条件的原生 ggml 调用，而现在 <code>--backend cpu</code> 上的 t2v、i2v、fl2v 与参考条件（静图、片段、音轨）都走托管的 DiT、文本编码器、VAE 与视觉塔。输出与 GGML 路径贴合得很紧 —— t2v、i2v 与 ref-audio 的吻合程度甚至高于 GGML 自家 flash 内核与其显式 softmax 回退之间的吻合程度 —— 唯一的例外是视觉塔，其残差比该对照更大，原因尚未查明。速度是有得有失、并非一律更慢：同一段片段上，i2v 为 70 s、<code>ggml_cpu</code> 为 176 s，ref-audio 为 63 s 对 71 s；但 t2v 为 69 s 对 14 s、ref-image 为 112 s 对 20 s —— 视觉塔是托管路径里最贵的一段。→ <a href="models-video_zh-cn.html#minimax-h3">MiniMax-H3</a></p>
   <p>Wan 与 MiniMax-H3 的非 ggml 路径共用原语：<code>Direct{Context,Linear,Ops}</code>（<code>TensorSharp.Models/Direct/DirectOps.cs</code>）同时支撑 Wan 视频网络与 MiniMax-H3 的 <code>cpu</code> 与 <code>cuda</code> 路径，其按行循环也走同一个工作线程池。在 CPU 上 <code>DirectLinear</code> 不再于加载时把量化权重展开成 F32，而是保留 GGUF 的存储类型直接参与乘法：一段小型 Wan 渲染（256×160、5 帧、1 步、<code>--backend cpu</code>）实测 80.9 s 对 121.4 s，权重内存少 4×，而且相对原生 <code>ggml_cpu</code> 渲染反而<em>略更接近</em>（43.51 dB 对 43.39 dB）。F16/BF16/F32 权重仍走普通 GEMM；<code>TS_DIRECT_QUANT_WEIGHTS=0</code> 可恢复旧行为。</p>
 
   <p><strong>DeepSeek V4.1 也有一套托管的整模型执行器。</strong><code>deepseek41</code> 在 <code>--backend cpu</code> 上运行纯 C# 的 <code>DeepSeek4CpuExecutor</code> —— ratio-1 与 ratio-2 的 block 压缩器、带 lightning indexer top-k 的共享压缩缓存与 indexer 缓存、候选 block 剪枝、Engram 行 gather、延迟超连接门控，以及检查点自带的训练态缓存量化（原始行 FP8 E4M3、indexer MXFP4、压缩缓存 NVFP4）—— 不用 ggml、不用原生库，也不用 GPU。它以独立的 PyTorch oracle <code>eng/dsv41-reference.py</code> 为准绳，按 <code>atol=rtol=2e-5</code> 加贪心 argmax 完全一致来把关，但对拍用的是一个五层的 F32 夹具模型，而不是真实权重，而且不设 <code>TS_DSV41_FIXTURE_DIR</code> 指向夹具目录时这些测试会静默返回。它直接从 GGUF 读取 Engram；没有视觉能力 —— 视觉伴随模型是原生 ggml 组件，<code>LoadVisionEncoder</code> 在这个后端上会抛异常 —— 而 <code>TS_DSV4_THREADS</code> 在这里默认取 <code>ProcessorCount</code>，而不是别处的 min(核心数, 32)。和 <code>cuda</code> 一样，它是正确性与可移植性通道，而非服务通道：完整 V4.1 检查点在它上面的吞吐、加载时间与常驻内存都没有实测数据，本节上面那些 <code>TS_CPU_THREADS</code> / <code>TS_CPU_SPIN</code> 数字也不属于 V4.1。→ <a href="#deepseek41"><code>deepseek41</code> 的后端</a></p>
@@ -90,9 +89,9 @@
     <li><strong><code>--backend ggml_cuda</code> / <code>ggml_vulkan</code></strong> —— 原生 ggml 执行器：自行加载分片 GGUF，在设备上持有全部 DSV4 KV 状态，并把每个 prefill/decode 微批作为一张计算图执行，配合按形状签名的缓存，使稳态 decode 直接重放已捕获的 CUDA 图。</li>
     <li><strong><code>--backend cpu</code></strong> —— 100% 纯 C# 执行器，零原生依赖，直接从内存映射的 GGUF 分片提供量化权重。</li>
   </ul>
-  <p>三者都会<strong>把权重按层切分到所有可见 GPU</strong>（CPU 那套则从映射分片流式读取），因此远大于单卡显存的模型依然跑得起来；<code>--tp N</code> 或 <code>TS_DSV4_NGPU</code> 用来限制使用几张卡。投机解码（<a href="advanced_zh-cn.html#dspark">DSpark</a>）可用于两个 GPU 引擎。→ <a href="models-text_zh-cn.html#deepseek4">DeepSeek V4 的下载与命令</a></p>
+  <p>三者都会<strong>把权重按层切分到所有可见 GPU</strong>（CPU 那套则从映射分片流式读取），因此远大于单卡显存的模型依然跑得起来；<code>--tp N</code> 或 <code>TS_DSV4_NGPU</code> 用来限制使用几张卡。投机解码（<a href="advanced_zh-cn.html#dspark">DSpark</a>）只在 <code>--backend cuda</code> 与 <code>--backend ggml_cuda</code> 上可用；在 <code>ggml_vulkan</code> 等其他后端上，配置的草稿器只会被报告并忽略。→ <a href="models-text_zh-cn.html#deepseek4">DeepSeek V4 的下载与命令</a></p>
 
-  <p id="deepseek41"><strong><code>deepseek41</code> 的服务后端只有一个。</strong>DeepSeek V4.1 的原生计算图在 <code>--backend ggml_cuda</code> 下运行，这是它的服务路径——只有这条路径为它的融合算子提供了内核。<code>ggml_cpu</code> 用这些算子回退到的标量实现加载同一套图，目的是在没有 GPU 时验证架构，而不是拿来对外服务：这个检查点每层每个 token 要从 246 GiB 中读出 384 个路由专家中的 6 个。<code>TS_DSV41_ALLOW_NON_CUDA_GPU=1</code> 可额外允许 <code>ggml_vulkan</code> 与 <code>ggml_metal</code>：普通计算图仍跑在 GPU 上，只有架构专属算子落到 CPU 后端，每次都要一次主机往返——需要显式开启，因为那道拒绝原本挡住的是<em>静默</em>回退。<code>cpu</code> 运行纯 C# 的 V4.1 执行器，已按 2e-5 对齐 PyTorch 参考实现；<code>cuda</code> 用 Direct CUDA 引擎自己的内核运行 V4.1（不经过 ggml），但尚无数值门禁。两者都是正确性与可移植性通道，而非服务通道。<code>mlx</code> 会在读取权重之前就失败，而不会把 V4.1 的权重塞进并未实现它的图。在 GPU 上，架构专属算子以 <code>GGML_OP_CUSTOM</code> 节点发出，由一个 TensorSharp 后端执行——它<em>包裹</em>所在 GPU 的 CUDA 后端并在调度器中取而代之，因此普通节点仍以图视图的形式在同一条流上交给 CUDA。→ <a href="models-text_zh-cn.html#deepseek41">DeepSeek V4.1</a></p>
+  <p id="deepseek41"><strong><code>deepseek41</code> 的服务后端只有一个。</strong>DeepSeek V4.1 的原生计算图在 <code>--backend ggml_cuda</code> 下运行，这是它的服务路径——只有这条路径为它的融合算子提供了内核。<code>ggml_cpu</code> 用这些算子回退到的标量实现加载同一套图，目的是在没有 GPU 时验证架构，而不是拿来对外服务：这个检查点每层每个 token 要从 246 GiB 中读出 384 个路由专家中的 6 个。<code>TS_DSV41_ALLOW_NON_CUDA_GPU=1</code> 可额外允许 <code>ggml_vulkan</code> 与 <code>ggml_metal</code>：普通计算图仍跑在 GPU 上，只有架构专属算子落到 CPU 后端，每次都要一次主机往返——需要显式开启，因为那道拒绝原本挡住的是<em>静默</em>回退。<code>cpu</code> 运行纯 C# 的 V4.1 执行器，已按 2e-5 对齐 PyTorch 参考实现；<code>cuda</code> 用 Direct CUDA 引擎自己的内核运行 V4.1（不经过 ggml），但尚无数值门禁。两者都是正确性与可移植性通道，而非服务通道。<code>mlx</code> 会在读取权重之前就失败，而不会把 V4.1 的权重塞进并未实现它的图。在 GPU 上，架构专属算子以 <code>GGML_OP_CUSTOM</code> 节点发出，由一个 TensorSharp 后端执行——它<em>包裹</em>所在 GPU 的 CUDA 后端并在调度器中取而代之，因此普通节点仍以图视图的形式在同一条流上交给 CUDA。实验性的 V4.1 DSpark 草稿器（<code>deepseek41-dspark</code>）只能在 <code>ggml_cuda</code> 与 <code>ggml_cpu</code> 上挂载；见 <a href="advanced_zh-cn.html#dspark">DSpark</a>。→ <a href="models-text_zh-cn.html#deepseek41">DeepSeek V4.1</a></p>
 
   <p><code>glm-dsa</code> 那套 744B-A40B 的 MLA + DeepSeek 稀疏注意力结构同样如此，只不过是两套：</p>
   <ul>
@@ -132,6 +131,7 @@ bash build-linux.sh --cuda --cuda-arch='86-real;89-real'</code></pre>
   <p>MLX 后端依赖 <code>libmlxc</code>。一个辅助脚本会获取并构建它：</p>
   <pre data-lang="bash"><code>bash TensorSharp.Backends.MLX/build-native-macos.sh</code></pre>
   <p>它会把库写入 <code>TensorSharp.Backends.MLX/Native/dist/</code>。运行时后端会先探测应用目录；用 <code>TENSORSHARP_MLX_LIBRARY</code> 或 <code>TENSORSHARP_MLX_LIBRARY_DIR</code> 指向别处。</p>
+  <p>macOS 27 SDK 默认按 Metal 4.1 编译着色器，并会拒绝所固定版本的 MLX 内核，因此在该 SDK 下 MLX 构建会设置 <code>CMAKE_OSX_DEPLOYMENT_TARGET=26.2</code> 以选择 Metal 4.0。显式指定的 <code>CMAKE_OSX_DEPLOYMENT_TARGET</code> 或 <code>MACOSX_DEPLOYMENT_TARGET</code> 优先，较旧的 SDK 保持其默认值。</p>
 
   <h3 id="binaries">平台二进制发行状态</h3>
   <p>两个应用均按以下平台/后端矩阵发布：</p>
@@ -144,10 +144,12 @@ bash build-linux.sh --cuda --cuda-arch='86-real;89-real'</code></pre>
       <tr><td><code>linux-x64-cpu</code></td><td>GGML CPU</td><td>.tar.gz</td></tr>
       <tr><td><code>linux-x64-cuda</code></td><td>GGML CUDA + 纯 C# CUDA (PTX) + CUDA 12.x 运行时</td><td>.tar.gz</td></tr>
       <tr><td><code>osx-arm64</code></td><td>GGML Metal + MLX</td><td>.tar.gz</td></tr>
+      <tr><td><code>linux-arm64-cuda13-GB10</code>（实验性）</td><td>面向 SM121a 的 GGML CUDA + 纯 C# CUDA（<code>compute_121</code> PTX）+ CUDA 13 运行时，用于 NVIDIA GB10 / DGX Spark</td><td>.tar.gz</td></tr>
     </tbody>
   </table>
   </div>
   <p class="page-foot-note">每个发行版的每个后缀都有 CLI 与 Server 两个文件。<code>-cuda</code> 归档仍需 NVIDIA GPU 与兼容驱动；macOS 归档需要 Apple Silicon。仍可选择从源码构建。</p>
+  <p class="page-foot-note">GB10 归档由 <code>eng/Dockerfile.gb10</code> 在不带 GPU 的托管 Linux ARM64 runner 上构建：CUDA 13.0.2、.NET SDK 10.0.401，以及一个固定且未修改的 ggml 版本。发布任务在干净的 Ubuntu 24.04 镜像中检查依赖加载与启动，而不做模型推理，并在两个归档旁发布 <code>SHA256SUMS</code> 与一份验证记录。已记录的 GB10 硬件冒烟测试早于上游 ggml 重新集成，不能为当前代码背书。较早的发行版可能不含这些归档，请查看具体发行版的资源列表。本地构建该镜像的方法见仓库中的 <code>DEVELOPMENT.md</code>。</p>
 
   <div class="content-footer">
     <a href="getting-started_zh-cn.html">← 快速开始</a>

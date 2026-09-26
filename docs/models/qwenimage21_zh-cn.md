@@ -7,7 +7,10 @@ Qwen3-VL-8B 文本编码器和专用的 2.1 VAE。原生 RGBA 输入与 PNG 输�
 Qwen3-VL 条件分支把参考图合成到白色背景上，而 VAE 保留 alpha 通道。更早的
 Qwen-Image / Qwen-Image-Edit 检查点（例如 Qwen-Image-Edit-2511）已不再受支持，
 加载时会被拒绝（退出码 2）。`--qwen-image-lora` 选项已由 `--lora` 取代（见
-[LoRA 插件](#lora-插件)），`--offload-cpu` 选项已移除。
+[LoRA 插件](#lora-插件)），`--offload-cpu` 选项已移除；无论写在命令行上还是作为配置文件
+的键，这两个旧选项现在都会让 CLI 或服务端以配置错误退出，错误信息会说明应改用什么。
+旧的 `TS_QWEN_IMAGE_LORA` 环境变量会在加载时被拒绝（退出码 2），并给出同样的建议：
+改用 `--lora` 传入 LoRA，并取消设置该变量。
 
 下载配置为 [`config/qwen-image-2.1.json`](../../config/qwen-image-2.1.json)。
 它固定了仓库修订版本，并为新下载的文件校验 SHA-256；已缓存的文件会直接复用。
@@ -66,12 +69,14 @@ dotnet run --project TensorSharp.Cli -c Release --no-build -- \
 ```
 
 不带 `--image` 时执行生成；带一个或多个 `--image` 参数时执行编辑。重复
-`--image first.png --image second.png` 可按该顺序传入多张参考图。也可以用
+`--image first.png --image second.png` 可按该顺序传入多张参考图。每张参考图按命令行顺序在提示词之前
+标记为 `<image1>`、`<image2>`……，提示词可以用这些标记指代图片。也可以用
 `--input prompt.txt` 提供提示词。省略采样设置时使用 **40 步 Euler、CFG 1.0**，
 遵循 [Qwen 推荐的无引导采样](https://github.com/huggingface/diffusers/blob/main/docs/source/en/api/pipelines/qwenimage21.md)。
 CFG 1 每一步只运行一次 Transformer 预测；此前的默认值 CFG 6 会同时运行正向和
-负向两次预测。显式设置大于 1 的 CFG 仍会启用第二次预测，并应用
-`--negative-prompt 'blur, low detail'`。在 CFG 1 下，负向提示词不起作用。
+负向两次预测。显式设置大于 1 的 CFG 仍会启用第二次预测，并以 `--negative-prompt`
+作为它的条件（例如 `--negative-prompt 'blur, low detail'`；不指定时负向分支使用空提示词）。
+在 CFG 1 下，负向提示词不起作用。
 
 省略尺寸时，**生成默认为 2048×2048**；编辑则使用与第一张参考图宽高比一致、
 像素面积大致相同的尺寸。要覆盖此行为，请同时设置宽度和高度，且都取 32 的倍数。
@@ -154,6 +159,15 @@ curl --fail-with-body http://127.0.0.1:5000/api/image-edit \
 `steps` 和 `cfg` 时使用上文的模型默认值。`targetArea: 1048576` 选择约 1K 的输出，
 同时保留自动宽高比选择。
 
+启动服务端时传入 `--width` 与 `--height` 会改变这个默认尺寸。主机把它们发布为
+`TS_QWEN_IMAGE_WIDTH` / `TS_QWEN_IMAGE_HEIGHT`，之后凡是既没有 `width`/`height`、也没有显式
+`targetArea` 的图像请求都使用该尺寸，包括不发送尺寸的 Web UI 请求；此时编辑也不再沿用第一张参考图的
+宽高比。请求自己设置了 `targetArea` 时保留它自己的几何设置。默认尺寸需要两个参数都设置。不是 32 倍数的
+值会向下取整到 32 的倍数（最小 32），并打印一次 `[qwen-image] WARNING: … render at WxH instead. Reported
+once.`；只设置其一、或值无法解析或为负数时，默认尺寸会被忽略（同样只警告一次），继续使用自动尺寸。
+Qwen-Image 服务端在这两种情况下都会在启动时警告，但不会拒绝任何东西。请求本身设置的 `width` / `height`
+仍必须是 32 的正整数倍。在服务端，这两个参数同时也是 `--video-width` / `--video-height` 的别名。
+
 需要进度时，配合 `curl -N` 使用 JSON 路由 `/api/image-generate/stream` 和
 `/api/image-edit/stream`。它们发出 SSE `data:` 帧，包含 `imageGenerate: true` 或
 `imageEdit: true`、`step` 与 `total`，并可能附带预览 `image` data URL。终止帧包含
@@ -210,7 +224,8 @@ dotnet run --project TensorSharp.Cli -c Release --no-build -- \
   （`lora_adapter_metadata`）、`adapter_config.json`（`lora_alpha`、`alpha_pattern`、
   `use_rslora`）；都没有时 alpha 等于 rank。kohya 的 `ss_network_alpha` 是训练元数据，会被忽略，
   与 ComfyUI 和 diffusers 一致（去掉逐模块 `.alpha` 张量的转换工具已把 alpha 折入因子）。显式配置优先于
-  文件自带的元数据。Pruna 文件记录的是 rank 64 下 alpha 128，因此实际缩放为 2；假定
+  文件自带的元数据；即使另外指定了只含配方的配置，PEFT 目录中的 `adapter_config.json`
+  仍会提供 alpha。Pruna 文件记录的是 rank 64 下 alpha 128，因此实际缩放为 2；假定
   alpha = rank 的加载器只会应用一半的适配器。
 - **DoRA** 的 `dora_scale` 幅值，采用 ComfyUI 在输出轴上的语义：幅值除以检查点自身权重
   （从 GGUF 反量化）的行范数。
@@ -321,7 +336,8 @@ LoRA。请求中的 `steps` 与 `cfg` 仍会覆盖插件的配方。在进程内
 
 ### 限制
 
-- 插件只作用于 Qwen-Image-2.1；CLI 遇到其他模型时拒绝 `--lora`。
+- 插件只作用于 Qwen-Image-2.1；CLI 遇到其他模型时拒绝 `--lora`，服务端则记录一条警告，
+  并在不带插件的情况下加载该模型。
 - 每次运行只能有一个插件带采样配方，而带 sigma 的配方只能以它定义的步数运行。
 - Qwen-Image-2.1-Fix 作者的工作流还使用了 APG、FreSca 以及 CFG 3 下的 `seeds_2` 采样器，
   TensorSharp 没有实现这些；DoRA 本身会被精确应用。
@@ -334,6 +350,11 @@ LoRA。请求中的 `steps` 与 `cfg` 仍会覆盖插件的配方。在进程内
 模式。可用内存不足时，请先使用较小的尺寸。CUDA 与 Vulkan 已在 NVIDIA A40 上验证，
 各项测量见[英文版模型卡](qwenimage21.md#prefix-kv-cache)。
 
+在 CPU、Metal 与 CUDA 上，图像段注意力按每段精确的 K/V 长度计算，不再构建稠密的填充
+掩码（CUDA 上 `TS_QWEN21_PAD_MASK=1` 可恢复填充掩码作对比诊断，见
+[`docs/perf/qwen-image21-cuda.md`](../perf/qwen-image21-cuda.md)）；文本的因果掩码保持
+不变，`ggml_vulkan` 仍构建填充的图像掩码。
+
 ### 前缀 KV 缓存
 
 Qwen-Image-2.1 用 `t = 0` 那一行调制文本与参考图 token，并且其块因果注意力从不
@@ -343,7 +364,7 @@ Qwen-Image-2.1 用 `t = 0` 那一行调制文本与参考图 token，并且其�
 第一步运行整个序列，把每个块前缀部分经过 RoPE 之后的 K 和 V 存到设备上；之后
 每一步只计算目标图像的 token，并对"已存前缀 + 目标"做注意力。CFG 运行为每个
 分支各保留一份缓存。去噪结束、VAE 解码之前释放缓存。每一步的日志行以
-`prefix=extract` 或 `prefix=cached` 结尾。
+`prefix=extract` 或 `prefix=cached` 结尾（缓存放不下时为 `prefix=declined`，见下文）。
 
 缓存默认开启；`TS_QWEN21_PREFIX_CACHE=0` 关闭它。默认情况下它存的正是注意力内核
 读取的类型（Metal 与 CUDA flash attention 为 F16，其他为 F32），所以缓存步复现
@@ -385,7 +406,7 @@ CUDA Graph 解码的效果，无需另写捕获代码。与 vLLM-Omni 一样，�
 Megatron 方式切分到 N 张 GPU：每张卡持有 32/N 个完整注意力头与 12,288/N 个 MLP
 列，其余投影与所有归一化权重复制；每个块的两个行并行乘积在 GPU 之间求和
 （ggml-cuda 有集合通信时在设备上完成，否则经由主机内存）。每张卡缓存自己那些头
-的前缀。N 必须整除 32 且不拆开量化块：对已发布的文件为 2、4 或 8。文本编码器、
+的前缀。N 必须整除 32 个注意力头——单机上受 ggml 16 设备上限约束，即 2、4、8 或 16——而且切分每个权重时都不能拆开它的量化块，加载时会按权重类型逐一检查。实测只覆盖 2 卡。文本编码器、
 视觉编码器与 VAE 留在第一张卡上；不支持多节点组。在两张 A40（NCCL 经共享内存传输）上，1024² 文生图每步
 从 1.107 秒降至 0.823 秒（1.34×），1024² 编辑从 1.326 秒降至 0.934 秒（1.42×），2048²
 文生图与编辑分别为 1.54× 与 1.57×。`ggml_vulkan` 经主机内存归约，双卡反而慢 14%。

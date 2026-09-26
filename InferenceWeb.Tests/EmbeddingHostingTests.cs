@@ -1,4 +1,5 @@
 using Microsoft.Extensions.DependencyInjection;
+using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
 using System.Text.Json;
 using TensorSharp.Models.Embeddings;
@@ -170,6 +171,76 @@ public class EmbeddingHostingTests : IDisposable
     {
         Assert.True(EmbeddingHosting.IsGenerationPath(path));
         Assert.False(EmbeddingHosting.IsGenerationPath("/v1/embeddings"));
+    }
+
+    /// <summary>
+    /// Every mapped generation POST route, image, video and Jev included. Those three
+    /// families were missing, so an embedding server answered them from adapters that
+    /// described a model it had never loaded ("the loaded model is not a Qwen-Image-2.1
+    /// model").
+    /// </summary>
+    [Theory]
+    [InlineData("/v1/responses")]
+    [InlineData("/v1/systemone")]
+    [InlineData("/v1/videos/generations")]
+    [InlineData("/api/chat")]
+    [InlineData("/api/chat/ollama")]
+    [InlineData("/api/image-generate")]
+    [InlineData("/api/image-generate/stream")]
+    [InlineData("/api/image-edit")]
+    [InlineData("/api/image-edit/stream")]
+    [InlineData("/api/video-generate")]
+    [InlineData("/api/video-generate/stream")]
+    public void GenerationGuard_CoversEveryGenerationRoute(string path)
+    {
+        Assert.True(EmbeddingHosting.IsGenerationPath(path));
+    }
+
+    [Theory]
+    [InlineData("/v1/completions")]   // never mapped: guarding it only implied it exists
+    [InlineData("/v1/embeddings")]
+    [InlineData("/api/embed")]
+    [InlineData("/api/embeddings")]
+    [InlineData("/api/upload")]
+    [InlineData("/api/show")]
+    public void GenerationGuard_LeavesOtherRoutesAlone(string path)
+    {
+        Assert.False(EmbeddingHosting.IsGenerationPath(path));
+    }
+
+    [Theory]
+    [InlineData("/api/image-generate", false)]
+    [InlineData("/api/video-generate/stream", false)]
+    [InlineData("/v1/systemone", true)]
+    public async Task GenerationGuard_AnswersImageVideoAndJevWithTheEmbeddingModeError(string path, bool openAIShape)
+    {
+        using var services = new ServiceCollection().AddSingleton(EmbeddingEndpointTests.Options()).BuildServiceProvider();
+        var app = new ApplicationBuilder(services);
+        app.UseEmbeddingModelGuard();
+        bool reachedEndpoint = false;
+        app.Run(_ =>
+        {
+            reachedEndpoint = true;
+            return Task.CompletedTask;
+        });
+        RequestDelegate pipeline = app.Build();
+
+        var context = new DefaultHttpContext { RequestServices = services };
+        context.Request.Method = HttpMethods.Post;
+        context.Request.Path = path;
+        await using var body = new MemoryStream();
+        context.Response.Body = body;
+
+        await pipeline(context);
+
+        Assert.False(reachedEndpoint);
+        Assert.Equal(StatusCodes.Status400BadRequest, context.Response.StatusCode);
+        body.Position = 0;
+        using var json = await JsonDocument.ParseAsync(body);
+        string message = openAIShape
+            ? json.RootElement.GetProperty("error").GetProperty("message").GetString()
+            : json.RootElement.GetProperty("error").GetString();
+        Assert.Contains("hosts an embedding model", message);
     }
 
     [Fact]

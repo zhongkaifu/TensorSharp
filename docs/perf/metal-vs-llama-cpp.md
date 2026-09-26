@@ -220,6 +220,7 @@ its graph say so, and `optimize_graph_for_metal` leaves that graph's order alone
 
 ```bash
 # prefill / decode matrix, both engines interleaved
+# (run_bench.py is a local harness script; it is not committed to this repository)
 python3 run_bench.py --runs 3 --cases pp512,pp2048,pp8192,tg128,tg128@4096 \
     --out results.jsonl --models <gguf> ...
 

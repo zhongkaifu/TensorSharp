@@ -2,13 +2,13 @@
   // MiniMax-H3 — joint video + 32 kHz stereo audio generation. This is the FL2VA
   // checkpoint: text-to-video, image-to-video, and first-and-last-frame.
   //
-  //   TensorSharp.Server --config config/minimax-h3-fl2va.json
+  //   TensorSharp.Server.Host --config config/minimax-h3-fl2va.json
   //
   //   TensorSharp.Cli --config config/minimax-h3-fl2va.json \
   //     --prompt "a red fox trotting through falling snow, cinematic" --output fox.mp4
   //
   // Four networks cooperate, and naming them here is what lets them auto-download
-  // into ${modelRoot} on the first run (~33.5 GB in total) and be reused after:
+  // into ${modelRoot} on the first run (~35.5 GB in total) and be reused after:
   //   1. the denoiser     (model)               the packed audio-video DiT   10.64 GiB
   //   2. Qwen3-VL-32B     (video-text-encoder)  the text encoder, 50 layers  16.97 GiB
   //   3. the video VAE    (video-vae)           16x spatial / 4x temporal     5.21 GB
@@ -20,8 +20,8 @@
   // auto-download can only fill in options that are flags — the tokenizer is not
   // one. Put vocab.json and merges.txt next to the encoder in ${modelRoot} (or point
   // TS_VIDEO_TOKENIZER at whatever folder holds them):
-  //   curl -L -o models/vocab.json https://huggingface.co/MiniMaxAI/MiniMax-H3/resolve/main/processor/vocab.json
-  //   curl -L -o models/merges.txt https://huggingface.co/MiniMaxAI/MiniMax-H3/resolve/main/processor/merges.txt
+  //   curl -L -o models/vocab.json https://huggingface.co/MiniMaxAI/MiniMax-H3/resolve/42ed227ee7df40d41602854ae760620d6eb651fe/processor/vocab.json
+  //   curl -L -o models/merges.txt https://huggingface.co/MiniMaxAI/MiniMax-H3/resolve/42ed227ee7df40d41602854ae760620d6eb651fe/processor/merges.txt
   //
   // Steps and guidance are deliberately NOT set here: a shipped config must parse on
   // both hosts, and the two spell steps differently — --video-steps N on the server,
@@ -34,15 +34,17 @@
   // The frame count snaps to the 17k+5 grid and fps is pinned to 24.
   "variables": {
     // Override the location with the TENSORSHARP_MODELS environment variable;
-    // otherwise a "models" folder next to the repository. Relative paths in a
-    // config are resolved against the config file, so this file needs no editing
-    // on Windows, Linux or macOS.
+    // otherwise ../models, and relative paths in a config resolve against the
+    // config file's folder (not the working directory), so that is a "models"
+    // folder at the repository root. This file needs no editing on Windows,
+    // Linux or macOS.
     "modelRoot": "${TENSORSHARP_MODELS:-../models}",
     "hf": "https://huggingface.co",
     // Both VAEs are mirrored by Comfy-Org, so each lists two sources: if the first
-    // URL fails the next one is tried.
-    "gguf": "${hf}/unsloth/MiniMax-H3-GGUF/resolve/main",
-    "comfy": "${hf}/Comfy-Org/MiniMax-H3/resolve/main"
+    // URL fails the next one is tried. The two mirrors serve byte-identical files,
+    // so one "sha256" checks either.
+    "gguf": "${hf}/unsloth/MiniMax-H3-GGUF/resolve/d629413c2e5b51b38c453668b75ca3b06ca92703",
+    "comfy": "${hf}/Comfy-Org/MiniMax-H3/resolve/bf92c4091e333e69b8ca1998e0a669f15cb0832b"
   },
 
   // Every shipped config names a backend; --backend on the command line wins over
@@ -51,14 +53,18 @@
 
   "model": {
     "path": "${modelRoot}/minimax_h3_fl2va_pruned-Q4_K.gguf",
-    "urls": [ "${gguf}/minimax_h3_fl2va_pruned-Q4_K.gguf" ]
+    "urls": [ "${gguf}/minimax_h3_fl2va_pruned-Q4_K.gguf" ],
+    "sha256": "dd948e08ad0ba3c71bd42f368e283dd82e790f5122a63b276e22a3e0283d0c10"
   },
 
   // Truncated to 50 layers with the final norm removed, and freed before the
-  // denoise starts. Swap in -Q2_K_M.gguf (12.20 GiB) to pair with a smaller denoiser.
+  // denoise starts. Swap in -Q2_K_M.gguf (12.20 GiB) to pair with a smaller denoiser:
+  // change the name in "path" and "urls" and set "sha256" to
+  //   a8ccadccd57ef34c838ffb8a7da8368bb554721b2760274a1d3b0df63960b997
   "video-text-encoder": {
     "path": "${modelRoot}/qwen3vl_32b_minimax_h3-Q4_K_M.gguf",
-    "urls": [ "${gguf}/qwen3vl_32b_minimax_h3-Q4_K_M.gguf" ]
+    "urls": [ "${gguf}/qwen3vl_32b_minimax_h3-Q4_K_M.gguf" ],
+    "sha256": "11e6efe70a57ce7f4838c47bdbd1a1c4b8ce10e2b7747f1b065990b70f4b05fc"
   },
 
   "video-vae": {
@@ -66,7 +72,8 @@
     "urls": [
       "${gguf}/vae/minimax_h3_video_vae_fp16.safetensors",
       "${comfy}/vae/minimax_h3_video_vae_fp16.safetensors"
-    ]
+    ],
+    "sha256": "7c1f131492e7eddacaac9069a61b81bdd39de5cc96561e677c5eab1cdce5e522"
   },
 
   // Decodes the jointly generated audio latent to 32 kHz stereo, written as a
@@ -76,7 +83,8 @@
     "urls": [
       "${gguf}/vae/minimax_h3_audio_vae_fp32.safetensors",
       "${comfy}/vae/minimax_h3_audio_vae_fp32.safetensors"
-    ]
+    ],
+    "sha256": "8e505d95dd1561d47abd43d4238fd40d9bb1ae9e147ed0a4cba778d76ae4db48"
   },
 
   "width": 640,

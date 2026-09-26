@@ -314,6 +314,11 @@
   // see that it read a skill, ran a script and edited a file, without scrolling
   // through the raw output of each. Live status while it runs; one line per step
   // once it is done.
+  //
+  // One entry per tool the host can report progress for. The host names each by its
+  // declared name (an alias it accepts, such as str_replace or apply-patch, is reported
+  // as the tool it runs). edit_file is no longer declared to the model, but the host
+  // still runs it for a model that reaches for it anyway, so its frames still come.
   var TOOL_LABEL = {
     shell: ['Generating code', 'Running code'],
     apply_patch: ['Preparing patch', 'Applying patch'],
@@ -323,6 +328,11 @@
     skills_list: ['Preparing lookup', 'Checking skills'],
     skills_read: ['Preparing read', 'Reading skill'],
     skills_run: ['Preparing run', 'Running skill'],
+    spawn_agent: ['Preparing sub-agent', 'Starting sub-agent'],
+    wait_agent: ['Preparing wait', 'Waiting for sub-agents'],
+    send_input: ['Preparing message', 'Messaging sub-agent'],
+    close_agent: ['Preparing stop', 'Stopping sub-agent'],
+    list_agents: ['Preparing lookup', 'Checking sub-agents'],
   };
   function labelFor(tool, phase) {
     var pair = TOOL_LABEL[tool];

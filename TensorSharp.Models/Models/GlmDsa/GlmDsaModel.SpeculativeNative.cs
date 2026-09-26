@@ -33,16 +33,19 @@ namespace TensorSharp.Models
         /// a deployment exporting the documented TS_SPEC directly does not get a
         /// scheduler that believes speculation is on while the loader never paged
         /// the block in. TS_GLM_MTP overrides either way for A/B runs.
+        ///
+        /// The two enable variables are parsed by <see cref="SpeculationOptions"/>
+        /// itself, not re-derived here: the scheduler decides from the same
+        /// resolution whether to speculate, and a private "anything but 0 is on"
+        /// rule made <c>TS_SPEC=false</c> page the ~3 GiB block in for a
+        /// scheduler that then never drafted with it.
         /// </summary>
-        private static bool NativeMtpRequested()
+        internal static bool NativeMtpRequested()
         {
             string glm = Environment.GetEnvironmentVariable("TS_GLM_MTP");
             if (!string.IsNullOrEmpty(glm))
                 return glm != "0";
-            string spec = Environment.GetEnvironmentVariable(SpeculationEnvVars.Enabled);
-            if (string.IsNullOrEmpty(spec))
-                spec = Environment.GetEnvironmentVariable(SpeculationEnvVars.LegacyEnabled);
-            return !string.IsNullOrEmpty(spec) && spec != "0";
+            return SpeculationOptions.FromEnvironment().Enabled;
         }
 
         private void SpecForwardNative(int[] tokens, float[] hAllOut, float[] logitsOut, bool allLogitsRows)

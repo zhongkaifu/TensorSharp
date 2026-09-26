@@ -9,7 +9,7 @@ bidirectional float32 attention; every token runs through every layer.
 Example:
   PYTHONPATH=/path/to/llama.cpp/gguf-py VECLIB_MAXIMUM_THREADS=1 \
     python eng/embedding-reference.py --model models/encoder.gguf \
-      --tokens docs/validation/embeddings-2026-09/snowflake-tokenization.json \
+      --tokens InferenceWeb.Tests/Fixtures/EmbeddingTokenizer/snowflake-tokenization.json \
       --indices 0,1,2,3,7,8 --http-results path/to/results.json \
       --output path/to/numpy-reference.json
 

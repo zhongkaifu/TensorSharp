@@ -119,8 +119,8 @@ namespace TensorSharp.AgentHost.CodeExec
                 {
                     "npx" or "npm" =>
                         " If you were trying to RUN something rather than install it, run the binary "
-                        + "directly from node_modules/.bin/ — `npx` fetches, and fetching is what cannot "
-                        + "happen here.",
+                        + "directly from node_modules/.bin/ — `npx` fetches the package itself, which would "
+                        + "go around the host's installer.",
                     "uv" or "uvx" or "poetry" or "pipenv" =>
                         " To install a Python package here, write it as a plain `pip install <name>` and "
                         + "the host will perform it. To RUN a script, call the interpreter directly.",
@@ -143,6 +143,7 @@ namespace TensorSharp.AgentHost.CodeExec
             }
 
             var packages = new List<string>();
+            bool subcommandRead = false;
             for (int i = 1; i < words.Count; i++)
             {
                 string word = words[i];
@@ -150,11 +151,23 @@ namespace TensorSharp.AgentHost.CodeExec
                 if (word.Length == 0)
                     continue;
 
-                // The subcommand, which the classifier already checked.
-                if (i == 1 && !word.StartsWith('-'))
+                // The subcommand is the first word that is not an option, which is the rule
+                // the classifier applies (ShellCommand.IsInstallCommand). This used to look
+                // at the second word only, and to know fewer subcommands than the classifier
+                // does, so the two disagreed and every disagreement became a PACKAGE NAME:
+                // `pip -q install x` asked the host for a package called "install", and
+                // `npm update`, `pnpm update`, `yarn up` and `npm exec cowsay hi` asked it
+                // for "update", "up" and "exec" (plus "cowsay" and "hi"). Those names are
+                // valid registry specs, so the host went to the registry for them, reported
+                // the outcome as the install, and substituted the model's command out of the
+                // line — `npm exec` never ran what it named, and `npm update` updated nothing.
+                if (!subcommandRead && !word.StartsWith('-'))
                 {
+                    subcommandRead = true;
                     if (IsSubcommand(word))
                         continue;
+                    error = UnperformableSubcommand(tool, word);
+                    return false;
                 }
 
                 if (word.StartsWith('-'))
@@ -255,8 +268,50 @@ namespace TensorSharp.AgentHost.CodeExec
             return CodeLanguage.Unknown;
         }
 
+        // Only the subcommands whose result IS an install. `pip download` and `pip wheel`
+        // reach the registry too, so the classifier routes them here, but what they produce
+        // is archives in a directory: performing an install instead and reporting success
+        // left the next command looking for files that were never written.
         private static bool IsSubcommand(string word) =>
-            word is "install" or "i" or "add" or "ci" or "download" or "wheel";
+            word is "install" or "i" or "add" or "ci";
+
+        /// <summary>
+        /// The refusal for a subcommand the classifier counts as reaching the registry but
+        /// the host does not perform. Each ends in the form that DOES work here, for the
+        /// same reason the unknown-tool refusal does: a model told only "not supported"
+        /// abandons the step.
+        /// </summary>
+        private static string UnperformableSubcommand(string tool, string subcommand)
+        {
+            string typed = $"{tool} {subcommand}";
+            // pnpm and yarn spell it `add`; pip and npm spell it `install`.
+            string install = tool.Equals("pnpm", StringComparison.OrdinalIgnoreCase)
+                || tool.Equals("yarn", StringComparison.OrdinalIgnoreCase)
+                ? $"{tool} add"
+                : $"{tool} install";
+            return subcommand switch
+            {
+                // Reached only while package runners count as installs (no general network, or
+                // a package allow-list), so the reason is the installer, not the network.
+                "exec" =>
+                    $"`{typed}` fetches a package in order to run it, which would go around the host's "
+                    + "installer — installs here are performed on your behalf, and only by name. Install the "
+                    + $"tool by name first — `{install} <name>` — then run its binary directly from "
+                    + "node_modules/.bin/.",
+                "download" or "wheel" =>
+                    $"`{typed}` writes package archives to a directory, and this host does not fetch archives: "
+                    + "it installs the packages you name into this session's environment, where your code can "
+                    + $"import them. Write `{install} <name>` to use a package; its archive cannot be obtained here.",
+                "update" or "up" =>
+                    $"`{typed}` is not an install this host can perform on your behalf: it installs the "
+                    + "packages you name, and nothing else. To get a newer version, name the package "
+                    + $"and the version — `{install} <name>@latest` — and the host will install that.",
+                _ =>
+                    $"`{typed}` is not an install this host can perform on your behalf: it installs the "
+                    + $"packages you name, and nothing else. Write `{install} <name>` and the host will "
+                    + "perform it.",
+            };
+        }
 
         /// <summary>
         /// Options that change nothing about WHAT is installed or WHERE it comes from, so

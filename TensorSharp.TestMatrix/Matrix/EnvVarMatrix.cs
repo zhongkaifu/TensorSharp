@@ -104,13 +104,19 @@ public static class EnvVarMatrix
                    "q8_0/q4_0 at load (see docs/models/deepseek41.md), so the sweep skips those families.",
             AppliesTo: (m, b, f) => !m.Family.StartsWith("deepseek4", StringComparison.OrdinalIgnoreCase)),
 
+        // Kept registered so an explicit --env-vars naming it still resolves, but it applies
+        // to nothing: its only reader is the TurboQuant codec of TensorSharp.Cli --paged-bench,
+        // and no matrix runner passes --paged-bench, so each cell ran the baseline generation
+        // path under a KV-codec label. A config whose default_env_vars is empty sweeps
+        // EnvVarMatrix.All, which is how the inert cells kept coming back.
         new(
             Name: "TS_KV_PAGED_QUANT_BITS",
             Category: "KvCache",
             Values: new[] { "0", "4", "8" },
             DefaultValue: "0",
-            Notes: "Paged-KV TurboQuant codec bits (0 = off).",
-            AppliesTo: (m, b, f) => true),
+            Notes: "Paged-KV TurboQuant codec bits (0 = off). Read only by TensorSharp.Cli --paged-bench, " +
+                   "which the matrix never runs, so it is never swept.",
+            AppliesTo: (m, b, f) => false),
 
         new(
             Name: "MAX_CONTEXT",

@@ -10,7 +10,7 @@
   // The first expert's VRAM is released when the schedule crosses the boundary,
   // so both fit sequentially on one card rather than needing room for both.
   //
-  //   TensorSharp.Server --config config/wan-video-i2v-a14b.json
+  //   TensorSharp.Server.Host --config config/wan-video-i2v-a14b.json
   //
   // This one REQUIRES an input image — it is image-to-video only (36-channel DiT
   // input: 16 noise + 4 first-frame mask + 16 encoded image). Upload an image in
@@ -20,15 +20,17 @@
   // sit in the same folder, so --video-dit2 below is really just what lets this
   // config DOWNLOAD the second one; it would be found without it.
   //
-  // Downloads ~24 GB (two 9 GB experts + the 6 GB text encoder). TI2V-5B is the
-  // better starting point on a consumer card — see wan-video-ti2v-5b-turbo.json.
+  // Downloads ~25.6 GB (two 9.7 GB experts, the 6.0 GB text encoder and the
+  // 0.25 GB VAE), pinned by commit and SHA-256. TI2V-5B is the better starting
+  // point on a consumer card — see wan-video-ti2v-5b-turbo.json.
   "variables": {
-    // Override with the TENSORSHARP_MODELS environment variable; otherwise a
-    // "models" folder next to the repository. No drive letter is baked in, so the
-    // same file works unmodified on Windows, Linux and macOS.
+    // Override with the TENSORSHARP_MODELS environment variable; otherwise
+    // ../models relative to this config file's folder, i.e. a "models" folder at
+    // the repository root. No drive letter is baked in, so the same file works
+    // unmodified on Windows, Linux and macOS.
     "modelRoot": "${TENSORSHARP_MODELS:-../models}",
     "hf": "https://huggingface.co",
-    "a14b": "${hf}/jayn7/WAN2.2-I2V_A14B-DISTILL-LIGHTX2V-4STEP-GGUF/resolve/main"
+    "a14b": "${hf}/jayn7/WAN2.2-I2V_A14B-DISTILL-LIGHTX2V-4STEP-GGUF/resolve/338fb8eedd8f485c9188cf1b1de541721fc81d66"
   },
 
   "backend": "ggml_cuda",
@@ -39,22 +41,26 @@
 
   "model": {
     "path": "${modelRoot}/wan2.2_i2v_A14b_high_noise_lightx2v_4step-Q4_K_M.gguf",
-    "urls": [ "${a14b}/high_noise/wan2.2_i2v_A14b_high_noise_lightx2v_4step-Q4_K_M.gguf" ]
+    "urls": [ "${a14b}/high_noise/wan2.2_i2v_A14b_high_noise_lightx2v_4step-Q4_K_M.gguf" ],
+    "sha256": "5945a053f65185b47119f53d75b52b95a7cdca7e5e2f8c5d5559d1cbf076c128"
   },
   "video-dit2": {
     "path": "${modelRoot}/wan2.2_i2v_A14b_low_noise_lightx2v_4step-Q4_K_M.gguf",
-    "urls": [ "${a14b}/low_noise/wan2.2_i2v_A14b_low_noise_lightx2v_4step-Q4_K_M.gguf" ]
+    "urls": [ "${a14b}/low_noise/wan2.2_i2v_A14b_low_noise_lightx2v_4step-Q4_K_M.gguf" ],
+    "sha256": "7776878df502c39a815cd6cc6a19b9ff78aa921c3ade88dfc33f62abc129535e"
   },
 
   // A14B uses the Wan 2.1 VAE (16-channel, 8x8x4). Using the 2.2 VAE here fails:
   // it is a different latent space with a different channel count.
   "video-vae": {
     "path": "${modelRoot}/Wan2.1_VAE.safetensors",
-    "urls": [ "${hf}/QuantStack/Wan2.2-I2V-A14B-GGUF/resolve/main/VAE/Wan2.1_VAE.safetensors" ]
+    "urls": [ "${hf}/QuantStack/Wan2.2-I2V-A14B-GGUF/resolve/6c6717459277b9cd1f72579d78a0fd62a79e57dc/VAE/Wan2.1_VAE.safetensors" ],
+    "sha256": "2fc39d31359a4b0a64f55876d8ff7fa8d780956ae2cb13463b0223e15148976b"
   },
 
   "video-text-encoder": {
     "path": "${modelRoot}/umt5-xxl-encoder-Q8_0.gguf",
-    "urls": [ "${hf}/city96/umt5-xxl-encoder-gguf/resolve/main/umt5-xxl-encoder-Q8_0.gguf" ]
+    "urls": [ "${hf}/city96/umt5-xxl-encoder-gguf/resolve/b535255bee98c2b0a59ea7c0ae2dcd0c6657b3b7/umt5-xxl-encoder-Q8_0.gguf" ],
+    "sha256": "2521d4de0bf9e1cc6549866463ceae85e4ec3239bc6063f7488810be39033bbc"
   }
 }

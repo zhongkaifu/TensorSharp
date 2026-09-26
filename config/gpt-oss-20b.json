@@ -1,8 +1,8 @@
 {
   // gpt-oss-20b (Q8_0) — open-weight reasoning LLM (~12 GB), text only.
   // Run with:
-  //   TensorSharp.Cli    --config config/gpt-oss-20b.json --input prompt.txt
-  //   TensorSharp.Server --config config/gpt-oss-20b.json
+  //   TensorSharp.Cli         --config config/gpt-oss-20b.json --input prompt.txt
+  //   TensorSharp.Server.Host --config config/gpt-oss-20b.json
   "variables": {
     "modelRoot": "${TENSORSHARP_MODELS:-../models}"
   },

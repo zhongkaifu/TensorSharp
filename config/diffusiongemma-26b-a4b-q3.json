@@ -33,7 +33,7 @@
   "mmproj": {
     "path": "${modelRoot}/diffusiongemma-26B-A4B-it-vision.safetensors",
     "urls": [
-      "${hf}/google/diffusiongemma-26B-A4B-it/resolve/main/model-00011-of-00011.safetensors"
+      "${hf}/google/diffusiongemma-26B-A4B-it/resolve/f7f5b7f5fa82ffc52addd066915886d497f5517b/model-00011-of-00011.safetensors"
     ],
     "sha256": "afec047176bb2a05f078566576aec6bdb71ad4d041275d0d0c89473fda6d6d87"
   }

@@ -1,10 +1,10 @@
 {
   // Gemma-4 E4B (uncensored, Q8_0) — compact multimodal LLM (~8 GB) with its
   // vision projector, and its MTP "assistant" draft head wired up for
-  // speculative decoding (server only).
+  // speculative decoding on both hosts.
   // Run with:
-  //   TensorSharp.Cli    --config config/gemma-4-e4b.json --image photo.png
-  //   TensorSharp.Server --config config/gemma-4-e4b.json
+  //   TensorSharp.Cli         --config config/gemma-4-e4b.json --image photo.png
+  //   TensorSharp.Server.Host --config config/gemma-4-e4b.json
   "variables": {
     "modelRoot": "${TENSORSHARP_MODELS:-../models}"
   },
@@ -30,9 +30,11 @@
     "sha256": "ddf46c21d7078e95338cfc22306b19b276a29a5ad089023449dd54d4b6170a51"
   },
 
-  // MTP speculative decoding (server only): Gemma-4's draft head ships as its
-  // own GGUF. Lossless — the verify step guarantees identical output.
-  "spec": false,
+  // MTP speculative decoding, on both hosts: Gemma-4's draft head ships as its
+  // own GGUF, and naming it here turns speculation ON by itself — no "spec" key
+  // is needed ("spec": false would do nothing: a JSON false emits no flag).
+  // Lossless — the verify step guarantees identical output. Pass --no-spec on
+  // the command line to decode without it (the draft file is still fetched).
   "draft-model": {
     "path": "${modelRoot}/gemma-4-E4B-it-assistant.Q8_0.gguf",
     "urls": ["https://huggingface.co/AtomicChat/gemma-4-E4B-it-assistant-GGUF/resolve/3a502a4c670c2763d099c587fd42702652f85c49/gemma-4-E4B-it-assistant.Q8_0.gguf"],

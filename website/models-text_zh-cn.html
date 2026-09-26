@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>文本与 LLM 模型 — TensorSharp 维基</title>
-  <meta name="description" content="十二种文本架构的下载与运行示例，以及各家族的多模态输入、思考模式与工具调用说明。">
+  <meta name="description" content="十三种文本架构的下载与运行示例，以及各家族的多模态输入、思考模式与工具调用说明。">
   <link rel="icon" href="assets/logo.svg" type="image/svg+xml">
   <link rel="stylesheet" href="assets/style.css">
   <script>try{var t=localStorage.getItem('ts-theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');document.documentElement.classList.toggle('dark',t==='dark');}catch(e){}</script>
@@ -21,7 +21,7 @@
   <p><strong>新增句向量编码器：</strong> Snowflake Arctic Embed L v2.0 / all-MiniLM-L6-v2，通过 <code>--embeddings</code> 与兼容 OpenAI/Ollama 的 API。 <a href="embeddings_zh-cn.html">嵌入模型、支持的后端与验证 →</a></p>
 
   <h2 id="download-run">下载并运行</h2>
-  <p>运行构建命令前，请先<a href="getting-started_zh-cn.html#install-dotnet">按平台安装并验证 .NET 10 SDK</a>。第一个代码块是已验证的 Gemma 4 E4B 快速上手。所有代码块都使用 Hugging Face CLI（<code>pip install -U huggingface_hub</code>）；其后的各家族代码块假定已完成完整源码构建。从仓库根目录运行；先把问题写入 <code>prompt.txt</code>，并按硬件把 <code>ggml_cuda</code> 换成 <code>ggml_metal</code>、<code>ggml_vulkan</code> 或 <code>ggml_cpu</code>。</p>
+  <p>运行构建命令前，请先<a href="getting-started_zh-cn.html#install-dotnet">按平台安装并验证 .NET 10 SDK</a>。第一个代码块是已验证的 Gemma 4 E4B 快速上手。所有代码块都使用 Hugging Face CLI（<code>pip install -U huggingface_hub</code>）；其后的各家族代码块假定已完成完整源码构建。从仓库根目录运行。CLI 的一次性文本提示从 <code>--input</code> 指定的文件读取（先把问题写入 <code>prompt.txt</code>——<code>--prompt</code> 只用于图像与视频生成模型）。按硬件把 <code>--backend</code> 换成 <code>ggml_metal</code>、<code>ggml_vulkan</code> 或 <code>ggml_cpu</code>（CLI 默认后端为 <code>ggml_cpu</code>）。</p>
 
   <h3 id="gemma4-fast-lane">约 30 秒快速上手：Gemma 4 E4B Q8_0（原生 GGML）</h3>
   <p>复制并运行这些命令约需 30 秒；7.48 GiB 的模型下载与首次 restore/构建耗时更长，取决于网络与机器。仓库基准已经验证 TensorSharp 的 E4B Q8_0 家族与执行路径；链接的公开 <a href="https://huggingface.co/ggml-org/gemma-4-E4B-it-GGUF" target="_blank" rel="noopener">ggml-org 仓库</a>是推荐下载源。下面的代码块面向 Linux + NVIDIA：</p>
@@ -61,7 +61,7 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll \
   <p>仅提供文本服务时，省略视觉准备命令与 <code>--mmproj</code>。下方吞吐数据对应早期二进制与检查点；每次测量的 revision 与覆盖范围见<a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/deepseek41_validation.md">验证报告</a>。</p>
   <p>同一仓库的十一个 Q4_K_M 分片（415 GiB）同样内嵌 Engram 常量。在那里两张 Engram 表各自涨到 51.5 GiB；在八张 46 GB 卡上，这些表留在主机内存映射中，路由专家也需要卸载到 CPU——加载器会打印它需要的 <code>--n-cpu-moe N</code> 并直接拒绝启动，而不是在推理途中耗尽显存。</p>
   <p>Q2_K 的两张 Engram 表在显存足够时<strong>默认驻留 GPU</strong>，在图内用 <code>get_rows</code> 直接对量化行做 gather——因为 TensorSharp 保持检查点自身的量化格式：一行 256 个值的 Q2_K 只有 84 字节，两张 3.84 亿行的表合计 60.1 GiB。历史上的八卡 A40 实测（每次使用冷提示词）：驻留 GPU 为 prefill 532–541 / decode 35.6–35.9 tok/s；主机映射并用 <code>TS_DSV41_ENGRAM_WARM=1</code> 预热为 506–528 / 34.5–35.2；不预热则只有 207–221 / 28.0–29.2。驻留 GPU 还省掉了启动时 130 秒的整表预热，以及预热路径依赖的 60 GiB 主机页缓存。放置策略是保守的：如果把表放上 GPU 会逼出路由专家的 CPU 卸载，它们就留在主机映射上，并在启动时说明。</p>
-  <p>多 GPU 指的是按层切分。<code>TS_DSV41_TP=N</code> 可在同一批 GPU 上打开实验性的 routed-MoE 张量并行——gate/up 沿 FFN 中间维切分，down 沿输入维切分，partial 经主机中转的 F32 缓冲归约——而首次完整 Q2_K 实测比按层切分<em>更慢</em>。并发请求各有独立的序列槽位，但会回退到逐槽前向，因此这里的并发并不等于批处理的 GPU 吞吐。没有 V4.1 的 DSpark：V4 的草稿模型会被拒绝，而不是半加载。带音频的请求以 HTTP 400 拒绝，而不是被悄悄丢掉。哪些已实测、哪些明确未验证，见<a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/deepseek41_validation.md">验证报告</a>。</p>
+  <p>多 GPU 指的是按层切分。<code>TS_DSV41_TP=N</code> 可在同一批 GPU 上打开实验性的 routed-MoE 张量并行——gate/up 沿 FFN 中间维切分，down 沿输入维切分，partial 经主机中转的 F32 缓冲归约——而首次完整 Q2_K 实测比按层切分<em>更慢</em>。并发请求各有独立的序列槽位，但会回退到逐槽前向，因此这里的并发并不等于批处理的 GPU 吞吐。V4.1 的 DSpark 属于实验性支持：加载器在 <code>ggml_cuda</code> 或 <code>ggml_cpu</code> 上可通过 <code>--draft-model</code> 接受 <code>deepseek41-dspark</code> 草稿模型，仅在合成夹具上验证过——尚无经过训练的 V4.1 草稿模型的实测；V4 的草稿模型仍会被拒绝，而不是半加载。带音频的请求以 HTTP 400 拒绝，而不是被悄悄丢掉。哪些已实测、哪些明确未验证，见<a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/deepseek41_validation.md">验证报告</a>。</p>
 
   <h3 id="deepseek4">DeepSeek V4 Flash（284B MoE，文本、思考、工具、DSpark）</h3>
   <p>一个 284B 的专家混合模型，配备 128 token 的原始滑动窗口加块压缩注意力（官方宣称 1M 上下文）。它<em>不</em>走通用的逐算子前向：TensorSharp 通过三套专属的整模型执行器之一运行它 —— <code>--backend cuda</code>（Direct CUDA，不依赖 ggml）、<code>--backend ggml_cuda</code> / <code>ggml_vulkan</code>（原生 ggml），以及 <code>--backend cpu</code>（100% 纯 C#，零原生依赖）。三者都会把权重按层切分到所有可见 GPU，因此远大于单卡显存的模型依然跑得起来；<code>--tp N</code>（或 <code>TS_DSV4_NGPU</code>）用来限制使用几张卡。</p>
@@ -74,7 +74,7 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll \
     --model models/UD-Q8_K_XL/DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00001-of-00005.gguf \
     --backend ggml_cuda --input prompt.txt --max-tokens 200
 
-# DSpark 块级投机解码（decode 约 1.3-1.4×；需要贪心采样）
+# DSpark 块级投机解码（decode 约 1.3-1.4×，以贪心采样实测）
 dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll \
     --model models/UD-Q8_K_XL/DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00001-of-00005.gguf \
     --backend ggml_cuda --draft-model models/DSpark-drafter-Q2K-Q8-0731.gguf \
@@ -84,7 +84,7 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll \
 dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll \
     --model models/UD-Q8_K_XL/DeepSeek-V4-Flash-0731-UD-Q8_K_XL-00001-of-00005.gguf \
     --backend ggml_cuda --tp 4 --draft-model models/DSpark-drafter-Q2K-Q8-0731.gguf</code></pre>
-  <p>DSpark 每步起草一整<em>块</em> token，主干用一次批量前向验证整块，因此贪心输出保持不变。在 CLI 上它需要纯 argmax 采样（任何 temperature、top-k/p 或惩罚项都会将其关闭）；在服务端每一行验证都用该请求自己的采样器，因此可与任意采样设置组合。详见 <a href="advanced_zh-cn.html#dspark">DSpark 投机解码</a>。</p>
+  <p>DSpark 每步起草一整<em>块</em> token，主干用一次批量前向验证整块，因此贪心输出保持不变。无论在 CLI 还是服务端，每一行验证都用本次运行或该请求自己的采样器抽取，因此可与任意采样设置组合；使用重复 / 存在 / 频率惩罚时接受率会下降，因为起草的整块不经过惩罚。详见 <a href="advanced_zh-cn.html#dspark">DSpark 投机解码</a>。</p>
 
   <h3 id="glm">GLM 5.x（744B-A40B MoE，文本、思考、工具）</h3>
   <p>一个 744B 的混合专家模型——256 个路由专家 top-8 加一个共享专家——建立在 <strong>DeepSeek 稀疏注意力</strong>之上：带权重吸收的多头潜在注意力（MLA），使得缓存每 token 每层只占一行 576 宽的数据，再加上一个"lightning indexer"决定每个 query 可以看到哪些历史 token（自报 1M 上下文）。与 DeepSeek V4 一样，它不走通用的逐算子前向：<code>--backend ggml_cuda</code> / <code>ggml_vulkan</code> / <code>ggml_cpu</code> / <code>ggml_metal</code> 走原生整模型 ggml 执行器，把 226 GiB 权重按层切分到所有可见 GPU 上；而 <code>--backend cpu</code>（100% 纯 C#、无原生依赖）与 <code>--backend cuda</code> 走托管逐算子路径。MLX 跑不了它。多分片 GGUF 由 <code>GgufFile</code> 自己读取，所以 <code>--model</code> 指向第一片即可。下面的命令面向 GLM-5.2；<strong>GLM-5.3</strong>（非 Flash）共用同一条 <code>glm-dsa</code> 加载路径，其配方在其后单独给出。</p>
@@ -165,14 +165,15 @@ hf download unsloth/Qwen3.5-9B-GGUF mmproj-F16.gguf --local-dir models
 dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/Qwen3.5-9B-UD-Q4_K_XL.gguf --mmproj models/mmproj-F16.gguf \
     --image photo.png --max-tokens 300 --backend ggml_cuda
 dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model models/Qwen3.5-9B-UD-Q4_K_XL.gguf --mmproj models/mmproj-F16.gguf --backend ggml_cuda</code></pre>
-  <p>Qwen 3.6 NextN 必须从保留该块的 <code>-MTP-</code> 仓库下载，并在<em>服务端</em>加入 <code>--spec</code> —— 该草稿头内嵌在主干 checkpoint 里，加载它要把额外权重调入显存，因此需要显式开启；基础仓库 GGUF 会剥离 NextN 块并回退到标准解码：</p>
+  <p>Qwen 3.6 NextN 必须从保留该块的 <code>-MTP-</code> 仓库下载，并在 CLI 或服务端加入 <code>--spec</code> —— 该草稿头内嵌在主干 checkpoint 里，加载它要把额外权重调入显存，因此需要显式开启；基础仓库 GGUF 会剥离 NextN 块并回退到标准解码：</p>
   <pre data-lang="bash"><code>hf download unsloth/Qwen3.6-35B-A3B-MTP-GGUF Qwen3.6-35B-A3B-UD-Q4_K_M.gguf --local-dir models
 
 dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model models/Qwen3.6-35B-A3B-UD-Q4_K_M.gguf --backend ggml_cuda --spec</code></pre>
+  <p><strong>Qwen3.8-27B</strong> 是稠密模型，走同一个 <code>qwen35</code> 插件——例如 <a href="https://huggingface.co/unsloth/Qwen3.8-27B-GGUF" target="_blank" rel="noopener">unsloth/Qwen3.8-27B-GGUF</a> 的 <code>Qwen3.8-27B-UD-Q4_K_XL.gguf</code>，<code>config/agent-qwen3.8-27b.json</code> 按提交与 SHA-256 钉住该文件，它保留内嵌的 NextN 块，可用于 <code>--spec</code>。它还可以通过 <code>--draft-model</code> 挂上 <strong>DFlash2</strong> 块草稿模型（独立 GGUF：<a href="https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2-GGUF" target="_blank" rel="noopener">z-lab/Qwen3.8-27B-DFlash2-GGUF</a>），挂上后它会取代 NextN 块。收益几乎完全取决于负载：在 RTX 3080 Laptop、UD-IQ3_XXS 上，自由散文快 1.14×，高度可预测的提示快 1.63×——详见 <a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/models/qwen35_zh-cn.md" target="_blank" rel="noopener">Qwen 3.5 卡片</a>第 12.4 节。</p>
 
-  <h3 id="qwen4exp">Qwen 3.8 Flash Next（混合 MoE，文本 + 图像、思考；无法往返工具调用）</h3>
-  <p>一个混合专家模型，GGUF 架构 id 为 <code>qwen4exp</code>：GatedDeltaNet 递归层与全注意力层交错（其中一部分还挂在 Qwen 稀疏注意力的索引器之后），一个 PLE n-gram 嵌入块，×4 的超连接流，以及 512 专家的 MoE。48 层，隐藏维度 2560，24 个 query 头 / 2 个 KV 头、head_dim 256，词表 248,320，每个 token 从 512 个专家里用 10 个，48 层中有 36 层带 GDN，PLE 在第 1 层。在各 ggml 后端上，整个 token（几乎）作为<strong>一张图</strong>跑完——嵌入、图内 PLE、全部 48 层、最后的混合器与 LM 头——并从按形状索引的已捕获图缓存中回放。视觉走 Qwen3.5-VL 塔，使用 (T,H,W) IMRoPE 位置，因此多图提示与多轮图像会话都可用；只要新提示恰好是缓存前缀的延长，跨轮的 KV 就会被复用（GDN 递归无法回退）。并发请求由按序列的状态持有者承载——每个请求拥有自己的注意力 KV 与索引器缓存、自己的 GDN 与 PLE 状态——因此请求之间的切换只是换一个引用。思考可用且始终开启。</p>
-  <div class="callout note"><div class="ic">🧰</div><p><strong>工具状态：</strong><code>qwen4exp</code> 的输出解析器目前无法返回结构化调用，因此不支持通用工具调用。TensorSharp 会对该家族隐藏内置 Agent Skills 与代码执行工具；选中某个 Agent Skill 时，其指令正文会作为回退直接内联到提示词，而不是通过 <code>skills_read</code> 获取。</p></div>
+  <h3 id="qwen4exp">Qwen 3.8 Flash Next（混合 MoE，文本 + 图像/视频、思考、工具、MTP 头）</h3>
+  <p>一个混合专家模型，GGUF 架构 id 为 <code>qwen4exp</code>：GatedDeltaNet 递归层与全注意力层交错（其中一部分还挂在 Qwen 稀疏注意力的索引器之后），一个 PLE n-gram 嵌入块，×4 的超连接流，以及 512 专家的 MoE。48 层，隐藏维度 2560，24 个 query 头 / 2 个 KV 头、head_dim 256，词表 248,320，每个 token 从 512 个专家里用 10 个，48 层中有 36 层带 GDN，PLE 在第 1 层。在各 ggml 后端上，整个 token（几乎）作为<strong>一张图</strong>跑完——嵌入、图内 PLE、全部 48 层、最后的混合器与 LM 头——并从按形状索引的已捕获图缓存中回放。视觉走 Qwen3.5-VL 塔，使用 (T,H,W) IMRoPE 位置，因此多图提示与多轮图像会话都可用。只有新提示恰好是缓存前缀的延长时才会复用该前缀（GDN 递归无法回退），而在默认的基数树前缀缓存（<code>TS_PREFIX_CACHE_MODE=tree</code>）下，这种复用止于对话中第一个图像或视频片段：之后的轮次最多只能恢复一个结束于该附件之前的检查点（通常是系统提示词），其余部分重新 prefill。<code>TS_PREFIX_CACHE_MODE=legacy</code> 选择旧的保留持有者匹配方式，不受此限制。并发请求由按序列的状态持有者承载——每个请求拥有自己的注意力 KV 与索引器缓存、自己的 GDN 与 PLE 状态——因此请求之间的切换只是换一个引用。思考可以开关，与 Qwen 3.5 相同：<code>--think</code> / <code>"think": true</code> 会打开 <code>&lt;think&gt;</code> 块，不开启时发布的模板会渲染一个已闭合的空块。</p>
+  <div class="callout note"><div class="ic">🧰</div><p><strong>工具状态：</strong><code>qwen4exp</code> 通过 Qwen 3.5 解析器返回结构化工具调用——<code>&lt;tool_call&gt;</code> 块内可以是 XML 形式的 <code>&lt;function=…&gt;&lt;parameter=…&gt;</code>，也可以是 JSON，流式输出与开启思考时同样适用——因此客户端工具、内置 Agent Skills 与代码执行工具，以及服务端的<a href="agentic_zh-cn.html#sub-agents">子智能体委派</a>都会提供给它。2026-09-19 在三张 A40、UD-IQ4_XS 上验证：12 个通用工具调用用例全部通过，且每个都完成了一次工具结果往返；技能 / shell / 代码工作流的结果与仍失败的用例见<a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/models/qwen38-flash-next_zh-cn.md#工具调用与-agent-工作流" target="_blank" rel="noopener">模型卡</a>。</p></div>
   <pre data-lang="bash"><code># UD-Q2_K_XL 这一档约 73.4 GiB——想要更大或更小可换一个量化目录
 hf download unsloth/Qwen3.8-Flash-Next-GGUF --include "UD-Q2_K_XL/*" --local-dir models
 hf download unsloth/Qwen3.8-Flash-Next-GGUF mmproj-BF16.gguf --local-dir models
@@ -194,19 +195,38 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll \
     --model models/UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-0000N.gguf \
     --mmproj models/mmproj-BF16.gguf --backend ggml_cuda --tp 2</code></pre>
   <p><code>qwen4exp</code> 上的 <code>--tp N</code> 是<strong>按层切分</strong>：每张 GPU 持有一段连续的完整层。它不切分任何权重，所以并不是张量并行——而且这也是 llama.cpp 为该架构提供的同一种（且唯一的）多卡模式，它的 <code>-sm row</code> 会直接拒绝加载这个模型。请把它当作容量特性而非速度特性。在 2× A100-80GB、Qwen3.8-Flash-Next-UD-Q2_K_XL（73.4 GiB）上：单卡与双卡的贪心输出<strong>逐字节相同</strong>（SHA-256 一致）；显存是 24.2 GB + 26.2 GB，而不是整个模型压在一张卡上；吞吐没有变化——两种跑法都是 prefill 约 1520–1550 t/s、decode 约 56 t/s。作为对照，llama.cpp 在同一台机器上单卡 pp1536 1094 / tg128 61.2，双卡 <code>-sm layer</code> 1200 / 61.5，同样是 prefill 涨约 10%、decode 不涨。启动时会打印实际走的是哪种模式，以及每张卡分到的层数与字节数；<code>TS_Q4E_LAYER_SPLIT=20,28</code> 可以用显式的每卡层数覆盖自动均衡（相当于 llama.cpp 的 <code>--tensor-split</code>），遇到无法满足的值会直接抛错而不是悄悄忽略——这很有用，因为自动均衡只按权重定价，看不到稍后才加载、并且会落在 GPU 0 上的视觉塔。</p>
+  <p><strong>投机解码</strong>使用独立的共享 MTP 头，而不是主干里的张量（已发布的 Q8_0 分片完全不含 <code>nextn</code>/<code>mtp</code> 张量）：在 GGML 后端上用 <code>--draft-model mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf</code>（2,786,568,256 字节；<code>eng/validation/qwen38_mtp_followup/</code> 中的验证包记录它来自 <code>unsloth/Qwen3.8-Flash-Next-GGUF</code> 的修订版本 <code>38bb39ee</code>）挂上它。它只为从位置 0 开始 prefill 的单独请求起草；延续保留持有者或共享前缀克隆的轮次按普通方式解码。在 UD-Q2_K_XL、三张 A40 按层切分、<code>--spec-draft 3</code> 下实测：192 token 的代码复制流与普通贪心逐字相同，在当前的验证行内核下（每个验证行都与其 decode 步逐位相同）为普通 decode 的 1.69×（83.2 对 49.1 tok/s；2026-09-17 改为逐位一致之前为 1.75–1.96×）；但散文并不划算——512 token 的回答解码为 44–46 tok/s，普通解码为 52。详见<a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/models/qwen38-flash-next_zh-cn.md#共享-mtp-头的投机解码" target="_blank" rel="noopener">模型卡</a>。</p>
 
-  <h3 id="bonsai">Bonsai Q1_0（仅文本，本地旁加载——无下载）</h3>
-  <p>两个名字相同但架构不同的 <code>Q1_0</code> 文件：<code>Bonsai-8B-Q1_0.gguf</code> 是稠密 Qwen 3 解码器（<code>qwen3</code>），<code>Bonsai-27B-Q1_0.gguf</code> 是带 GatedDeltaNet 层的稠密 Qwen 3.5 混合架构（<code>qwen35</code>）。它们的 GGUF 元数据里既没有发布方 URL 也没有 license，因此 TensorSharp 只钉住确切字节数与 SHA-256，而不替它们编造——没有可 <code>hf download</code> 的东西。导入前请确认你有权使用该文件；钉住的取值见 <a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/models/bonsai_zh-cn.md" target="_blank" rel="noopener">Bonsai 卡片</a>。</p>
-  <pre data-lang="bash"><code># Apple Silicon 上的 Bonsai 8B
+  <h3 id="bonsai">Bonsai Q1_0（仅文本，固定修订版本下载）</h3>
+  <p>两个名字相同但架构不同的 <code>Q1_0</code> 文件：<code>Bonsai-8B-Q1_0.gguf</code> 是稠密 Qwen 3 解码器（<code>qwen3</code>），<code>Bonsai-27B-Q1_0.gguf</code> 是带 GatedDeltaNet 层的稠密 Qwen 3.5 混合架构（<code>qwen35</code>）。它们的 GGUF 元数据里既没有发布方 URL 也没有 license，但确切的文件发布在 <code>prism-ml/Bonsai-8B-gguf</code> 与 <code>prism-ml/Bonsai-27B-gguf</code>（发布方卡片声明为 Apache-2.0），TensorSharp 钉住它们的修订版本、确切字节数与 SHA-256。导入前请确认你有权使用该文件；钉住的取值见 <a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/models/bonsai_zh-cn.md" target="_blank" rel="noopener">Bonsai 卡片</a>。</p>
+  <pre data-lang="bash"><code>hf download prism-ml/Bonsai-8B-gguf Bonsai-8B-Q1_0.gguf \
+    --revision 48516770dd04643643e9f9019a2a349cf26c5dbd --local-dir models
+hf download prism-ml/Bonsai-27B-gguf Bonsai-27B-Q1_0.gguf \
+    --revision f10afb355f104535e3e3e98cf7ab7795c72bd292 --local-dir models
+
+# Apple Silicon 上的 Bonsai 8B
 MAX_CONTEXT=16384 KV_CACHE_DTYPE=f16 \
-dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model /path/to/Bonsai-8B-Q1_0.gguf \
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/Bonsai-8B-Q1_0.gguf \
     --backend ggml_metal --input prompt.txt --max-tokens 256 --temperature 0.5 --top-k 20 --top-p 0.85
 
 # Bonsai 27B；--think 可显示它的推理流
 MAX_CONTEXT=32768 KV_CACHE_DTYPE=f16 \
-dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model /path/to/Bonsai-27B-Q1_0.gguf \
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/Bonsai-27B-Q1_0.gguf \
     --backend ggml_metal --input prompt.txt --max-tokens 256 --think</code></pre>
   <p><code>Q1_0</code> 是 GGML 张量类型 41——每 128 个值一块，存一个 F16 scale 加 128 个 1 bit 符号位，即每权重 1.125 bit——GGUF 读取器、原生绑定与托管回退路径都识别它。在 M5 Pro 上以同一文件与 llama.cpp 成对运行：8B <strong>pp128 为 1.05×</strong>、tg128 持平；27B 相对热漂移包夹后的 llama.cpp 基线为 <strong>pp512 1.03×</strong>、<strong>pp2048 1.04×</strong>、<strong>tg128 1.15×</strong>。TensorAgent 在 iOS 上也把两者列为仅导入条目。</p>
+
+  <h3 id="bonsai2">Bonsai2 27B（PRISM 三值 Qwen 3.5，文本 + 图像）</h3>
+  <p><code>Ternary-Bonsai-2-27B-PQ2_0.gguf</code> 与 <code>-PTQ1_0.gguf</code> 和 Bonsai 27B 一样声明 <code>general.architecture = qwen35</code>——64 层，其中 48 层 GatedDeltaNet、16 层全注意力——但另外带有 PRISM 带符号 Hadamard 元数据（<code>prism.hadamard.*</code>）以及发布方自定义的张量类型 PQ2_0（142）与 PTQ1_0（143）。TensorSharp 依据这些元数据识别它们，在加载时把权重无损转码为 GGML <code>Q2_0</code>（PQ2_0 约大 6%，PTQ1_0 约大 29%，因此加载后的内存并不等于文件大小），并对投影输入与 embedding 输出施加声明的旋转；不施加这些变换读出的是一个错误的网络。它需要<strong>单设备 GGML 后端</strong>：<code>cpu</code>、<code>cuda</code>、<code>mlx</code> 与 <code>--tp</code> 都会被拒绝，而不是悄悄跳过旋转。配套投影器 <code>Ternary-Bonsai-2-27B-mmproj-BF16.gguf</code> / <code>-mmproj-Q8_0.gguf</code> 提供图像输入——CLI 会在模型旁边查找，服务端只通过 <code>--mmproj</code> 加载。<a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/models/bonsai2_zh-cn.md" target="_blank" rel="noopener">Bonsai2 卡片</a>列出了本地产物的确切字节数与 SHA-256；仓库没有钉住任何下载来源，TensorAgent 也没有 Bonsai2 条目。</p>
+  <pre data-lang="bash"><code># 显式限制上下文，而不是按宣称的 262k 窗口分配
+MAX_CONTEXT=4096 KV_CACHE_DTYPE=f16 \
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model /path/to/Ternary-Bonsai-2-27B-PQ2_0.gguf \
+    --backend ggml_metal --input prompt.txt --max-tokens 128 --temperature 0
+
+# 以服务形式运行，并加载投影器以支持图像输入
+MAX_CONTEXT=4096 KV_CACHE_DTYPE=f16 \
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model /path/to/Ternary-Bonsai-2-27B-PTQ1_0.gguf \
+    --mmproj /path/to/Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf --backend ggml_metal</code></pre>
+  <p>仅在 Metal（M5 Pro）上验证过（2026-09-22）：两种格式在 4 个 32 token 的提示上都逐字复现了发布方 llama.cpp 分支的贪心输出，并通过了 HTTP、JSON、工具调用与图像冒烟测试（属功能性检查，不是质量评估）。与该分支相比，PQ2_0 的 prefill / decode 为 364.05 / 25.50 tok/s，对方为 384.44 / 26.96；PTQ1_0 为 364.49 / 25.53，对方为 357.67 / 26.31——卡片记录的性能目标尚未达成。之后修复了一个仅在 CUDA 上出现的带符号 Hadamard 路径缺陷，但没有提交任何 CUDA 结果：CUDA、Vulkan、iOS 与张量并行执行都尚未验证。</p>
 
   <h3 id="gptoss">GPT OSS（文本、始终思考、工具）</h3>
   <pre data-lang="bash"><code>hf download ggml-org/gpt-oss-20b-GGUF gpt-oss-20b-MXFP4.gguf --local-dir models
@@ -220,8 +240,8 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model models/gp
 dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/nvidia_Nemotron-H-8B-Reasoning-128K-Q4_K_M.gguf --input prompt.txt \
     --think --max-tokens 400 --backend ggml_cuda
 dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model models/nvidia_Nemotron-H-8B-Reasoning-128K-Q4_K_M.gguf --backend ggml_cuda</code></pre>
-  <p>图像输入请改用上表 Nemotron 3 Nano Omni GGUF 与 <code>mmproj-BF16.gguf</code>。当前 GGUF 分发未附真实音频推理所需的 Parakeet audio mmproj。</p>
-  <p><strong>Nemotron 3.5 Lightning 30B-A3B</strong> 走同一条 <code>nemotron_h_moe</code> 路径——23 层 Mamba-2 + 23 层 MoE + 6 层注意力，例如 <a href="https://huggingface.co/unsloth/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF" target="_blank" rel="noopener">unsloth/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF</a> 中的 <code>NVIDIA-Nemotron-3.5-Lightning-30B-A3B-MXFP4_MOE.gguf</code>（约 17 GB）。它是唯一可挂块级草稿器的 Nemotron：NVIDIA 的 DSpark 模块以 <code>dflash</code> 架构 GGUF 导出，用 <code>--draft-model</code> 加载，使它成为第一个运行块级投机解码的递归（Mamba-2）主干。→ <a href="advanced_zh-cn.html#dflash">块级起草的原理</a></p>
+  <p>图像输入请改用上表 Nemotron 3 Nano Omni GGUF 与 <code>mmproj-BF16.gguf</code>。音频需要 Parakeet/FastConformer 音频塔，而任何公开 GGUF 都不带它：TensorSharp 可从另行准备的伴随 GGUF 运行它（转换脚本在 <code>eng/nemotron-audio/</code>），通过 <code>--mmproj</code> 传入，或与视觉投影器并用时通过 <code>TS_NEMOTRON_AUDIO_MMPROJ</code> 指定。没有它时音频会被拒绝（服务端返回 HTTP 400，CLI 报错），而不是被悄悄丢掉。在 CPU 上，该音频塔以 F32 计算（<code>prepare_f32.py</code> 生成的伴随文件）时与参考模块一致；在训练好的权重上，<code>prepare.py</code> 生成的 BF16 计算伴随文件仍未通过该比对。语音问答质量与 GPU 执行尚未验证。</p>
+  <p><strong>Nemotron 3.5 Lightning 30B-A3B</strong> 走同一条 <code>nemotron_h_moe</code> 路径——23 层 Mamba-2 + 23 层 MoE + 6 层注意力，例如 <a href="https://huggingface.co/unsloth/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF" target="_blank" rel="noopener">unsloth/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF</a> 中的 <code>NVIDIA-Nemotron-3.5-Lightning-30B-A3B-MXFP4_MOE.gguf</code>（约 17 GB）。它<strong>不</strong>做投机解码，所有 Nemotron-H 都不做：主干的多 token 验证与单 token 解码走的是不同的注意力与 MoE 内核，投机输出无法与普通贪心解码一致（2026-09-16 用 NVIDIA 为该模型提供的 DSpark 草稿器测试时，每个单独请求都出现了偏离）。<code>--draft-model</code> 会被拒绝——服务端在启动时直接停止——而 <code>--spec</code> 会给出一次性警告并按普通解码运行。→ <a href="advanced_zh-cn.html#dflash">支持块级起草的家族如何工作</a></p>
 
   <h3 id="hunyuan-dense">Hunyuan Dense（仅文本，单设备）</h3>
   <p>腾讯的稠密 Hunyuan 解码器——即 <code>general.architecture</code> 为 <code>hunyuan-dense</code> 的检查点，例如 Hy-MT2 系列。在该架构注册之前，这些官方文件会在加载阶段失败：加载器遇到未知架构选择失败关闭，而不是猜一套相近的图。文本计算图与 llama.cpp 的 <code>hunyuan-vl</code> 文本塔一致——RMSNorm、融合 QKV、NeoX RoPE，然后是 per-head Q/K RMSNorm、GQA 与 SwiGLU。<strong>QK-norm 在 RoPE 之后</strong>，与 Qwen 3.5 相反；搞反了不会加载失败，只会产出流畅但错误的文本，所以这两个 norm 是必需的，缺失即抛异常。</p>
@@ -255,49 +275,62 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/Muse-Glimmer-30B-U
 dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/Muse-Glimmer-30B-UD-IQ2_XXS.gguf \
     --draft-model models/dflash-kquant.gguf --spec-draft 15 --input prompt.txt --backend ggml_cuda</code></pre>
 
-  <h3 id="diffusiongemma">DiffusionGemma（分块文本扩散）</h3>
+  <h3 id="diffusiongemma">DiffusionGemma（分块文本扩散，文本 + 图像）</h3>
   <pre data-lang="bash"><code>hf download unsloth/diffusiongemma-26B-A4B-it-GGUF diffusiongemma-26B-A4B-it-Q4_K_M.gguf --local-dir models
+# 可选，用于图像输入：视觉塔不在任何 GGUF 里，只在这个上游分片中（2.84 GB）
+hf download google/diffusiongemma-26B-A4B-it model-00011-of-00011.safetensors --local-dir models
 
 dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/diffusiongemma-26B-A4B-it-Q4_K_M.gguf --input prompt.txt \
     --max-tokens 256 --diffusion-steps 48 --diffusion-seed 0 --backend ggml_cuda
-dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model models/diffusiongemma-26B-A4B-it-Q4_K_M.gguf --backend ggml_cuda</code></pre>
+# 针对图片提问（多张图片可重复 --image，按顺序）
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/diffusiongemma-26B-A4B-it-Q4_K_M.gguf \
+    --mmproj models/model-00011-of-00011.safetensors --image photo.png --input question.txt \
+    --max-tokens 256 --backend ggml_cuda
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model models/diffusiongemma-26B-A4B-it-Q4_K_M.gguf \
+    --mmproj models/model-00011-of-00011.safetensors --backend ggml_cuda</code></pre>
+  <p>该检查点发布的所有 GGUF 都是纯文本的，因此 Gemma 4 视觉塔（<code>gemma4v</code>）直接从上游 <code>model-00011-of-00011.safetensors</code> 分片加载，也可以来自 mmproj GGUF；两个宿主都不会在模型旁边自动查找它，没有加载时图像请求会被拒绝，而不是在看不到图的情况下作答。<code>config/diffusiongemma-26b-a4b-q4.json</code> 与 <code>-q3.json</code> 会替你下载该分片。音频会被拒绝——检查点没有音频塔——视频同样会被拒绝，请把帧作为单独的图像发送。提示词始终以关闭思考的方式渲染：模型自发写出的思考块只有在 <code>"think": true</code> 时才作为推理内容返回。带工具的请求会以 HTTP 400 拒绝。</p>
+  <p>同一个服务端还在 <code>POST /v1/systemone</code> 上回答<strong>类型化决策</strong>，这是兼容 Jev 的端点：针对文本或图像状态（每个请求最多 8 张图）的 <code>noul</code>（布尔）、<code>choice</code> 与 <code>score</code> 问题，答案取自一次去噪步后的标签概率，而不是解析生成的 JSON。<code>jev-latest</code> 与 <code>jev-preview</code> 是已加载模型的别名，并不是单独的检查点。<code>config/jev-diffusiongemma-q4.json</code> 会下载模型与视觉分片，并在 <code>ggml_cuda</code> 上绑定 <code>127.0.0.1:5000</code>；请求格式见 <a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/models/jev_zh-cn.md" target="_blank" rel="noopener">Jev 卡片</a>。</p>
 
   <h2 id="multimodal">多模态支持</h2>
   <div class="table-scroll">
   <table>
     <thead><tr><th>家族</th><th>输入</th><th>说明</th></tr></thead>
     <tbody>
+      <tr><td>DeepSeek V4.1</td><td>图像 · 视频</td><td>另行准备的视觉伴随文件 <code>deepseek41.vision.gguf</code>（由 <code>eng/dsv41-prepare-vision.py</code> 生成），通过 <code>--mmproj</code> 传入。视频被采样为带时间的帧，走图像路径（OpenAI <code>video_url</code> 内容部分，默认 1 fps、16 帧），而不是时序编码器。该伴随组件是原生 ggml 组件，因此纯 C# 的 <code>cpu</code> 后端仅文本。音频会以 HTTP 400 拒绝。</td></tr>
       <tr><td>Gemma 4</td><td>图像 · 视频 · 音频</td><td>图像 PNG/JPEG/HEIC；视频 MP4（经 OpenCV 以 1 fps 采样）；音频 WAV 16 kHz 单声道 / MP3 / OGG。E4B 投影器：<code>mmproj-gemma-4-E4B-it-Q8_0.gguf</code>。</td></tr>
       <tr><td>Qwen 3.5 / 3.6</td><td>图像</td><td>动态分辨率视觉编码器；9B / 3.6 仓库使用 <code>mmproj-F16.gguf</code>。</td></tr>
-      <tr><td>Qwen 3.8 Flash Next</td><td>图像</td><td>Qwen3.5-VL 视觉塔，使用 (T,H,W) IMRoPE 位置；支持多图提示与多轮图像会话，新提示恰好延长缓存前缀时跨轮复用 KV。投影器：<code>mmproj-BF16.gguf</code>（同仓库）。</td></tr>
+      <tr><td>Bonsai2 27B</td><td>图像</td><td>Qwen 3.5 视觉塔，来自 <code>Ternary-Bonsai-2-27B-mmproj-BF16.gguf</code> 或 <code>-mmproj-Q8_0.gguf</code>；CLI 会在模型旁边查找它们（优先 BF16）。</td></tr>
+      <tr><td>Qwen 3.8 Flash Next</td><td>图像 · 视频</td><td>Qwen3.5-VL 视觉塔，使用 (T,H,W) IMRoPE 位置；支持多图提示与多轮图像会话；在默认的 <code>TS_PREFIX_CACHE_MODE=tree</code> 下，跨轮 KV 复用止于第一个图像或视频片段（<code>legacy</code> 没有此限制）。视频以 OpenAI <code>video_url</code> 内容部分传入（base64 MP4 / WebM / MOV），采样为带时间的帧——每个部分可设 <code>fps</code> 与 <code>max_frames</code>，默认取 <code>VIDEO_SAMPLE_FPS</code> / <code>VIDEO_MAX_FRAMES</code>，否则为 1 fps、16 帧——并按 Qwen-VL 的时间 patch 布局排列。投影器：<code>mmproj-BF16.gguf</code>（同仓库）。</td></tr>
       <tr><td>GLM 5.x（5.3-Flash）</td><td>图像</td><td>GLM-OCR ViT——24 个块作为一张常驻设备的图跑完，投影后的行在原生执行器内部覆盖 <code>&lt;|image|&gt;</code> 占位。支持多图与多轮图像会话。投影器：<code>mmproj-BF16.gguf</code>（同仓库）。GLM-5.2 与 GLM-5.3（<code>glm-dsa</code>）均仅文本：GLM-5.3 仓库在任何量化下都未发布 mmproj，且给 <code>glm-dsa</code> 传入 <code>--mmproj</code> 只会告警并忽略、不会报错，因此仍是一次纯文本运行。只有 <code>glm5next</code> 接受投影器。</td></tr>
       <tr><td>Mistral 3</td><td>图像</td><td>Pixtral 视觉编码器。投影器：<code>mmproj-mistralai_Mistral-Small-3.1-24B-Instruct-2503-f16.gguf</code>。</td></tr>
       <tr><td>Muse-Glimmer</td><td>图像</td><td>50 层稀疏窗口 ViT，采用 2D RoPE 与 2×2 像素混洗；图像按 llama.cpp 相同的方式选定网格后直接拉伸（不填充、不切块）。投影器：<code>mmproj-Muse-Glimmer-30B-Q8_0.gguf</code>。</td></tr>
-      <tr><td>Nemotron-H (Omni)</td><td>图像</td><td>RADIO / v2_vl ViT 编码器。传入匹配的 <code>--mmproj</code>；图像 token 在 <code>&lt;image&gt;</code> 占位处展开。当前 GGUF 分发未附真实音频推理需要的 Parakeet mmproj。</td></tr>
+      <tr><td>Nemotron-H (Omni)</td><td>图像（配伴随文件时支持音频）</td><td>RADIO / v2_vl ViT 编码器。传入匹配的 <code>--mmproj</code>；图像 token 在 <code>&lt;image&gt;</code> 占位处展开。音频只有在加载了另行准备、带 Parakeet 音频塔的伴随 GGUF（<code>--mmproj</code> 或 <code>TS_NEMOTRON_AUDIO_MMPROJ</code>）时才运行；没有公开仓库提供该文件，缺少时音频会被拒绝。</td></tr>
+      <tr><td>DiffusionGemma</td><td>图像</td><td>Gemma 4 的 <code>gemma4v</code> 视觉塔，通过 <code>--mmproj</code> 从上游 <code>model-00011-of-00011.safetensors</code> 分片（或 mmproj GGUF）加载。图像可用于聊天，也可用于 <code>/v1/systemone</code> 决策（每个请求最多 8 张）。音频与视频会被拒绝。</td></tr>
     </tbody>
   </table>
   </div>
-  <p>通过 <a href="cli_zh-cn.html#examples">CLI</a>（<code>--image</code>、<code>--video</code>、<code>--audio</code>、<code>--pdf</code>）、<a href="server_zh-cn.html#webui">Web UI</a> 上传，或 <a href="http-api_zh-cn.html">HTTP API</a>（Ollama 用 base64 <code>images</code> 数组，OpenAI 用 <code>image_url</code> data URI）发送文件。数字版 PDF 会提取文本；扫描版 PDF 会转换为页面图像并需要视觉模型。</p>
+  <p>通过 <a href="cli_zh-cn.html#examples">CLI</a>（<code>--image</code>、<code>--video</code>、<code>--audio</code>、<code>--pdf</code>）、<a href="server_zh-cn.html#webui">Web UI</a> 上传，或 <a href="http-api_zh-cn.html">HTTP API</a>（Ollama 用 base64 <code>images</code> 数组，OpenAI 用 <code>image_url</code> data URI）发送文件。数字版 PDF 会提取完整文本层并内联到提示中；扫描版 PDF 会转换为页面图像，需要支持视觉的模型。CLI 的 <code>--pdf</code> 仅用于一次性模式；CLI 与 Web UI 上传都由 <code>TS_PDF_MAX_PAGES</code> 限制页数（默认读取全部页）。</p>
 
   <h2 id="thinking">思考 / 推理模式</h2>
   <p>具备思考能力的模型（Qwen 3.5/3.6、Qwen 3.8 Flash Next、Gemma 4、GPT OSS、Nemotron-H、DeepSeek V4、DeepSeek V4.1、GLM 5.x、Muse-Glimmer）会在最终答案前产生结构化的思维链。思考内容与可见回复分离，便于客户端显示或隐藏。</p>
   <ul>
     <li><strong>Qwen 3.5/3.6 / Nemotron-H</strong> —— <code>&lt;think&gt;…&lt;/think&gt;</code> 标签。</li>
-    <li><strong>Qwen 3.8 Flash Next</strong> —— 同样是 <code>&lt;think&gt;…&lt;/think&gt;</code> 标签，但始终开启：生成提示会无条件打开该块，没有非思考模式可切。</li>
+    <li><strong>Qwen 3.8 Flash Next</strong> —— 同样是 <code>&lt;think&gt;…&lt;/think&gt;</code> 标签，开关方式也相同：关闭思考时，发布的模板会渲染一个已闭合的空 <code>&lt;think&gt;&lt;/think&gt;</code> 块。</li>
     <li><strong>Gemma 4</strong> —— <code>&lt;|channel&gt;thought …&lt;channel|&gt;</code> 标签。</li>
     <li><strong>GPT OSS</strong> —— Harmony 格式：<code>&lt;|channel|&gt;analysis</code> 用于思考，<code>&lt;|channel|&gt;final</code> 用于答案。</li>
     <li><strong>DeepSeek V4</strong> —— <code>&lt;think&gt;…&lt;/think&gt;</code> 标签；不显式开启思考时聊天模板会立即闭合该块，因此推理是按需启用的。</li>
     <li><strong>DeepSeek V4.1</strong> —— 同样的标签，但带有训练过的收尾转换：达到 <code>TS_THINKING_BUDGET</code> 时模型输出 <code>&lt;/think&gt;</code>，并在原有 <code>max_tokens</code> 之内写完答案。当输出额度不少于 512 token 时，预算默认取 75%。</li>
     <li><strong>GLM 5.x</strong> —— 同样是 <code>&lt;think&gt;…&lt;/think&gt;</code> 标签，也是按需开启：加 <code>--think</code> 会补上 <code>Reasoning Effort: Max</code> 系统行并留下一个未闭合的块由模型自己收尾，不加时提示里写的是空的 <code>&lt;think&gt;&lt;/think&gt;</code>。历史轮次的思考内容始终不会带进提示。<strong>GLM-5.3-Flash 则始终思考</strong>：它的 <code>Reasoning Effort: Max</code> 系统行是无条件的，生成提示总是打开 <code>&lt;think&gt;</code>，历史轮次的思考内容也会保留。</li>
     <li><strong>Muse-Glimmer</strong> —— 聊天模板输出的 <code>assistant to=self</code> 推理通道。</li>
+    <li><strong>DiffusionGemma</strong> —— 不通过提示开启：提示词始终以关闭思考的方式渲染。模型自发写出的思考块会被解析出来，只有在 <code>"think": true</code> 时才作为推理内容返回。</li>
   </ul>
   <p>通过 <code>--think</code>（CLI）、<code>"think": true</code>（Ollama API / Web UI）或浏览器中的思考开关启用。响应会单独暴露推理 —— 例如 Ollama 聊天响应中的 <code>message.thinking</code>。</p>
 
   <h2 id="toolcalling">工具调用 / 函数调用</h2>
   <p>受支持的模型家族可以调用用户自定义工具，并参与多轮工具调用对话。将工具定义为 JSON，通过 <code>--tools</code>（CLI）或 <code>tools</code> 参数（API）传入。每个受支持架构使用各自的线格式，其输出解析器会将调用提取为结构化 <code>tool_calls</code>：</p>
   <ul>
-    <li><strong>Nemotron-H</strong> —— <code>&lt;tool_call&gt;{"name": …, "arguments": {…}}&lt;/tool_call&gt;</code></li>
-    <li><strong>Qwen 3.5 / 3.6</strong> —— 同样是 <code>&lt;tool_call&gt;</code> 块，但内容为 XML：<code>&lt;function=NAME&gt;&lt;parameter=key&gt;value&lt;/parameter&gt;&lt;/function&gt;</code>（JSON 形式仍被接受）。</li>
+    <li><strong>Nemotron-H、Qwen 3（Bonsai 8B）、Qwen 2 / 2.5</strong>（<code>qwen2</code>、<code>qwen2vl</code> 与 <code>qwen2_vl</code> 标签，无思考通道） —— <code>&lt;tool_call&gt;{"name": …, "arguments": {…}}&lt;/tool_call&gt;</code></li>
+    <li><strong>Qwen 3.5 / 3.6、Qwen 3.8 Flash Next</strong> —— 同样是 <code>&lt;tool_call&gt;</code> 块，但内容为 XML：<code>&lt;function=NAME&gt;&lt;parameter=key&gt;value&lt;/parameter&gt;&lt;/function&gt;</code>（JSON 形式仍被接受）。</li>
     <li><strong>Gemma 4</strong> —— <code>&lt;|tool_call&gt;call:function_name{args}&lt;tool_call|&gt;</code></li>
     <li><strong>GPT OSS (Harmony)</strong> —— 工具以 TypeScript 命名空间声明；调用在 commentary 通道发出。</li>
     <li><strong>DeepSeek V4.1</strong> —— <em>带空格的</em> DSML（<code>&lt;｜DSML｜ calls&gt;</code>），与 V4 不带空格的格式不兼容。在 <code>/v1/chat/completions</code> 上，请求级语法在 token 层面强制约束声明的工具：<code>tool_choice</code> 的 auto / required / none / 指定函数，以及 <code>parallel_tool_calls: false</code> 都会被遵守；不支持的 schema 断言在生成前以 HTTP 400 拒绝。</li>
@@ -305,7 +338,7 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model models/di
     <li><strong>GLM 5.x</strong> —— 逐参数标签的 XML：<code>&lt;tool_call&gt;NAME&lt;arg_key&gt;k&lt;/arg_key&gt;&lt;arg_value&gt;v&lt;/arg_value&gt;…&lt;/tool_call&gt;</code>。函数名以裸文本紧跟在开标签之后，每个参数自成一组键值对；模板里用 <code>tojson</code> 渲染过的值会被解析回数字、数组与对象。</li>
     <li><strong>Muse-Glimmer</strong> —— 聊天模板声明的 ATEM XML 标记；解析器会把调用提取成同样的结构化 <code>tool_calls</code>。</li>
   </ul>
-  <p><strong>Qwen 3.8 Flash Next（<code>qwen4exp</code>）不在此列表中：</strong>其输出解析器无法返回工具调用，因此通用客户端工具与内置技能 / 代码工具都会被隐藏；选中的 Agent Skill 指令会作为无工具回退直接内联。</p>
+  <p><strong>Mistral 3、Hunyuan Dense 与 DiffusionGemma 不在此列表中：</strong>前两者既不渲染工具声明也不渲染工具结果，DiffusionGemma 会拒绝带工具的请求，因此客户端工具、内置技能 / 代码工具与子智能体委派都不会提供给它们；选中的 Agent Skill 指令会作为无工具回退直接内联。</p>
   <p>完整的请求/响应示例与续接循环见 <a href="http-api_zh-cn.html#tools">通过 HTTP 进行工具调用</a>。</p>
 
   <div class="content-footer">

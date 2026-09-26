@@ -1464,9 +1464,16 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
     {
         // With --n-cpu-moe (or a GPU-less run) the routed-expert matmuls land
         // here on every token; that is memory-bandwidth bound and wants every
-        // core the process is actually allowed to use.
+        // core the process is actually allowed to use. --cpu-moe-threads
+        // arrives through the native atomic override, never the environment
+        // (.NET's SetEnvironmentVariable does not reach getenv on Linux), so it
+        // must be consulted explicitly or the flag silently does nothing here.
+        // Same precedence as the DSV4 executor: the explicit override applies
+        // next, and an inherited native TS_CPU_MOE_THREADS has final priority.
         int cpu_threads = n_threads > 0 ? n_threads : 16;
         if (n_cpu_moe_req != 0 || n_gpu == 0) cpu_threads = tsg::available_cpu_parallelism();
+        const int explicit_threads = tsg::host_moe_explicit_thread_count();
+        if (explicit_threads > 0) cpu_threads = explicit_threads;
         if (const char * e = getenv("TS_CPU_MOE_THREADS")) { int v = atoi(e); if (v > 0) cpu_threads = v; }
         ggml_backend_cpu_set_n_threads(cpu, cpu_threads);
 
@@ -1476,6 +1483,8 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
         ggml_threadpool_params tpp = ggml_threadpool_params_default(cpu_threads);
         m->cpu_threadpool = ggml_threadpool_new(&tpp);
         if (m->cpu_threadpool) ggml_backend_cpu_set_threadpool(cpu, m->cpu_threadpool);
+        fprintf(stderr, "[glm] CPU worker pool: threads=%d, persistent=%s\n",
+                cpu_threads, m->cpu_threadpool ? "yes" : "no");
     }
     m->backends[n_gpu] = cpu;
     m->n_backends = n_gpu + 1;

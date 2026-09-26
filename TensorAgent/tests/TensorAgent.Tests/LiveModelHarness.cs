@@ -334,7 +334,8 @@ public abstract class LiveModelHarness : IDisposable
     /// <param name="model">The catalog entry whose weights were found.</param>
     /// <param name="weights">Where those weights actually are on this machine.</param>
     /// <param name="skills">
-    /// Bundle the app's twelve skills. Off by default because every skill declares
+    /// Load the skills in TensorAgent/skills (the directory, which also holds the two the
+    /// phone does not bundle). Off by default because every skill declares
     /// itself in the prompt, which costs thousands of tokens on every turn of every
     /// test that has nothing to do with skills.
     /// </param>

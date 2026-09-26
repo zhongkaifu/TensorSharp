@@ -1,37 +1,52 @@
 # Configuration files
 
-Both `TensorSharp.Cli` and `TensorSharp.Server` can read their startup options
-from a JSON file passed with `--config`, in addition to the command line:
+Both `TensorSharp.Cli` and the server, `TensorSharp.Server.Host`, can read their
+startup options from a JSON file passed with `--config`, in addition to the
+command line:
 
 ```bash
-TensorSharp.Server --config config/server-basic.json
-TensorSharp.Cli    --config config/cli-basic.json
+TensorSharp.Server.Host --config config/server-basic.json
+TensorSharp.Cli         --config config/cli-basic.json
 ```
 
-**Command-line options always win.** File values are applied first, then anything
-you also pass on the command line overrides them — so one config file can be
-reused across machines while you override just what differs:
+These are the executables in the release archives (`tensorsharp-server-*` and
+`tensorsharp-cli-*`). From a source build, run
+`dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll` and
+`dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll` in their place; the examples
+below use the short names.
+
+**Command-line options always win.** When the command line sets a single-valued
+option itself, that option's entry in the file is dropped before it is resolved:
+it is not emitted, its `${variables}` are not substituted and its download is never
+attempted — so one config file can be reused across machines while you override
+just what differs:
 
 ```bash
 # Use the file, but force the CPU backend for this run:
-TensorSharp.Server --config config/server-basic.json --backend ggml_cpu
+TensorSharp.Server.Host --config config/server-basic.json --backend ggml_cpu
 ```
 
-You can pass `--config` more than once; later files override earlier ones (and
-the command line still wins over all of them).
+Each override prints one line to standard error:
+
+```text
+[config] --X is set on the command line, so the value from '<file>' is ignored and the command-line value is used instead[; its download entry is skipped, so nothing is fetched for it]
+```
+
+So passing `--model` or `--mmproj` yourself skips the file's own
+[download entry](#auto-download) for that option, and `--mmproj none` runs a
+multimodal config text-only without fetching its projector.
+
+You can pass `--config` more than once; a later file's entry replaces an earlier
+one's the same way (and the command line still wins over all of them). The
+repeatable options — `--stop`, `--skills-dir`, `--skill`, `--lora`,
+`--lora-scale`, `--lora-config`, `--image`, `--ref-image`, `--ref-video`,
+`--ref-audio` and `--ref-video-audio` — keep every file's values and add the
+command line's after them instead, and a download entry under one of them still
+runs. Legacy spellings count as the same option in both directions: `--wan-vae`
+and `--video-vae`; `--wan-te`, `--video-te` and `--video-text-encoder`;
+`--wan-dit2` and `--video-dit2`.
 
 ## File format
-
-Embedding hosts have pinned, checksum-verified download configurations:
-[`embedding-snowflake.json`](embedding-snowflake.json) and
-[`embedding-minilm.json`](embedding-minilm.json). For example:
-
-```bash
-TensorSharp.Server --config config/embedding-snowflake.json --backend ggml_metal
-```
-
-They default to native CPU execution and port 5000. See the
-[embedding guide](../docs/embeddings.md) for API examples and backend support.
 
 The file is a JSON object whose keys are the same long option names each host
 already accepts (listed in `--help`), with or without the leading `--`. Comments
@@ -45,11 +60,24 @@ already accepts (listed in `--help`), with or without the leading `--`. Comments
 | array               | a repeated flag                  | `"stop": ["</s>", "<\|eot\|>"]` → `--stop </s> --stop <\|eot\|>` |
 | object              | a downloadable file (see below)  | `{ "path": "...", "urls": ["..."] }` |
 
+`"variables"` (see below), its alias `"vars"`, and `"$schema"` are reserved and
+never become options. A key that names a removed option is refused with a message
+saying what to use instead, and `lora-scale` / `lora-config` cannot be arrays,
+because each binds to the one `--lora` before it.
+
+**The two hosts treat an unknown key differently.** The server refuses to start
+on an option it does not recognise (suggesting a near match when there is one); the CLI
+silently ignores it. A file meant for both hosts should use only keys both
+accept. The differences that come up in practice are server-only options such as
+`host`, `port`, `embeddings`, `embedding-threads` and `no-webui`. The
+repeat-penalty window is `repeat-last-n` on both hosts; the CLI's former
+`penalty-last-n` is a removed option, refused as a key like any other.
+
 ## Variables
 
 Define shared values once under `"variables"` and reference them with `${name}`
 in any string value. A `${name}` that is not defined there falls back to an
-environment variable of the same name, and variables may reference other
+environment variable of the same name (an empty one counts as unset), and variables may reference other
 variables. `${name:-fallback}` supplies a value for when the name is defined
 nowhere. See [`variables.json`](variables.json).
 
@@ -71,9 +99,9 @@ Every config in this folder resolves its model root the same way:
 
 - Set **`TENSORSHARP_MODELS`** to keep your models wherever you like — a Windows
   path, `/mnt/data/models`, `~/models`. One variable covers every config here.
-- Leave it unset and the models land in a `models/` folder next to the repository
-  (a relative `path` is resolved against the **config file**, not the working
-  directory).
+- Leave it unset and the models land in the `models/` folder at the repository
+  root (gitignored): a relative `path` is resolved against the **config file**, not
+  the working directory, so `../models` from `config/` is `<repo>/models`.
 
 This is not a style preference. A hard-coded `"C:/models/x.gguf"` is **not an
 absolute path on Linux or macOS** — .NET's `Path.IsPathRooted` knows nothing about
@@ -133,10 +161,11 @@ how far along it is. See [`auto-download.json`](auto-download.json).
 
 ## Examples in this folder
 
-Every example uses **real, public, ungated** GGUF URLs, so each one works on a
-fresh machine: the files auto-download to their local `path` on the first run and
-are reused afterward. If you already have a file at that `path`, it is used as-is
-(no download).
+Every example uses **real, public, ungated** Hugging Face URLs, so the files
+auto-download to their local `path` on the first run and are reused afterward.
+The one exception is the MiniMax-H3 tokenizer (`vocab.json` + `merges.txt`),
+which you place by hand; see [below](#video-generation-with-sound-minimax-h3).
+If you already have a file at that `path`, it is used as-is (no download).
 
 | File | Model(s) | Shows |
 |------|----------|-------|
@@ -145,27 +174,41 @@ are reused afterward. If you already have a file at that `path`, it is used as-i
 | [`variables.json`](variables.json) | Gemma-4 26B-A4B: model + mmproj + MTP draft | One shared root/repo reused across three related files |
 | [`auto-download.json`](auto-download.json) | Qwen3.5-9B (~8.9 GB) | Auto-download demo using a public GGUF |
 | [`qwen-image-2.1.json`](qwen-image-2.1.json) | Qwen-Image-2.1 Q4_K_M + dedicated VAE + Qwen3-VL-8B + projector | Text-to-image and editing; pinned, checksum-verified downloads |
-| [`lora/qwen-image-2.1-*.json`](lora/) | Twelve Qwen-Image-2.1 LoRA plug-ins (weights only) | `--lora` plug-ins on top of `qwen-image-2.1.json`: step-distilled 4–8-step recipes, styles and editing skills; see [below](#qwen-image-21-lora-plug-ins-lora) |
-| [`minimax-h3-fl2va.json`](minimax-h3-fl2va.json) | MiniMax-H3 FL2VA: DiT + Qwen3-VL-32B + video VAE + audio VAE (~33.5 GB) | **Video and 32 kHz stereo audio in one packed latent**; text-to-video, image-to-video, first/last frame |
-| [`minimax-h3-ref2va.json`](minimax-h3-ref2va.json) | MiniMax-H3 Ref2VA: DiT + Qwen3-VL-32B + video VAE + audio VAE (~33.4 GB) | The same four networks, reference checkpoint: up to nine stills, clips and soundtracks |
-| [`wan-video-ti2v-5b-turbo.json`](wan-video-ti2v-5b-turbo.json) | Wan 2.2 TI2V-5B Turbo: DiT + video VAE + UMT5 (~9.5 GB) | Video only, 4-step distilled, text- **and** image-to-video |
-| [`wan-video-ti2v-5b.json`](wan-video-ti2v-5b.json) | Wan 2.2 TI2V-5B: DiT + video VAE + UMT5 (~11.4 GB) | Video only, undistilled 50-step reference recipe |
-| [`wan-video-i2v-a14b.json`](wan-video-i2v-a14b.json) | Wan 2.2 I2V-A14B: **two** expert DiTs + Wan 2.1 VAE + UMT5 (~24 GB) | Image-to-video, two-expert schedule |
+| [`lora/qwen-image-2.1-*.json`](lora/) | Twelve Qwen-Image-2.1 LoRA plug-ins (each downloads its weights; Fun-Acc also its `pdd_config.json`) | `--lora` plug-ins on top of `qwen-image-2.1.json`: step-distilled 4–8-step recipes, styles and editing skills; see [below](#qwen-image-21-lora-plug-ins-lora) |
+| [`minimax-h3-fl2va.json`](minimax-h3-fl2va.json) | MiniMax-H3 FL2VA: DiT + Qwen3-VL-32B + video VAE + audio VAE (~35.5 GB) | **Video and 32 kHz stereo audio in one packed latent**; text-to-video, image-to-video, first/last frame |
+| [`minimax-h3-ref2va.json`](minimax-h3-ref2va.json) | MiniMax-H3 Ref2VA: DiT + Qwen3-VL-32B + video VAE + audio VAE (~35.4 GB) | The same four networks, reference checkpoint: up to nine stills, clips and soundtracks |
+| [`wan-video-ti2v-5b-turbo.json`](wan-video-ti2v-5b-turbo.json) | Wan 2.2 TI2V-5B Turbo: DiT + video VAE + UMT5 (~12.9 GB) | Video only, 4-step distilled, text- **and** image-to-video |
+| [`wan-video-ti2v-5b.json`](wan-video-ti2v-5b.json) | Wan 2.2 TI2V-5B: DiT + video VAE + UMT5 (~12.9 GB) | Video only, undistilled 50-step reference recipe |
+| [`wan-video-i2v-a14b.json`](wan-video-i2v-a14b.json) | Wan 2.2 I2V-A14B: **two** expert DiTs + Wan 2.1 VAE + UMT5 (~25.6 GB) | Image-to-video, two-expert schedule |
+| [`embedding-snowflake.json`](embedding-snowflake.json) / [`embedding-minilm.json`](embedding-minilm.json) | Snowflake Arctic Embed L v2.0 / all-MiniLM-L6-v2 (Q8_0) | Embedding server; pinned, checksum-verified downloads |
 
 `server-basic.json` uses the standard `gemma-4-E4B-it` build — point its `path` at
 your own file to host a different variant.
 
+The two embedding configs are server configs: `embeddings`, `embedding-threads`,
+`host`, `port` and `no-webui` are server options. They default to native CPU
+execution (`ggml_cpu`) and port 5000, with no Web UI:
+
+```bash
+TensorSharp.Server.Host --config config/embedding-snowflake.json --backend ggml_metal
+```
+
+See the [embedding guide](../docs/embeddings.md) for API examples and backend support.
+
 ## Ready-made configs, one per runnable model
 
 One config per runnable model, with its companions (vision projector, MTP draft
-head) already wired in. Every file names each model file's source as a pinned,
-checksum-verified Hugging Face URL, so a missing file downloads on first run and an
-existing one is used as-is. Every file works with **both** hosts (only
-host-recognized keys are used):
+head) already wired in. Every file names each model file's Hugging Face source, so
+a missing file downloads on first run and an existing one is used as-is; every one
+pins a commit and a SHA-256. Every key in every file is one the server accepts, and
+a test enforces that. The CLI accepts all of them too except in
+`jev-diffusiongemma-q4.json`, which is a server config (`host`, `port` and the
+`/v1/systemone` endpoint); `qwen3.5-9b-uncensored-q8.json`'s `repeat-last-n` now
+applies on both hosts:
 
 ```bash
-TensorSharp.Cli    --config config/qwen3.5-9b-q8.json --input prompt.txt
-TensorSharp.Server --config config/gemma-4-26b-a4b.json
+TensorSharp.Cli         --config config/qwen3.5-9b-q8.json --input prompt.txt
+TensorSharp.Server.Host --config config/gemma-4-26b-a4b.json
 ```
 
 | File | Model | Kind |
@@ -175,7 +218,7 @@ TensorSharp.Server --config config/gemma-4-26b-a4b.json
 | [`qwen3.5-9b-uncensored-q8.json`](qwen3.5-9b-uncensored-q8.json) | Qwen3.5-9B Uncensored (Q8_0) | Text LLM |
 | [`qwen3.6-27b.json`](qwen3.6-27b.json) | Qwen3.6-27B + vision | Multimodal LLM |
 | [`qwen3.6-35b-a3b.json`](qwen3.6-35b-a3b.json) | Qwen3.6-35B-A3B (MoE) + vision | Multimodal MoE LLM |
-| [`gemma-4-e4b.json`](gemma-4-e4b.json) | Gemma-4 E4B + vision + MTP draft | Multimodal LLM |
+| [`gemma-4-e4b.json`](gemma-4-e4b.json) | Gemma-4 E4B **uncensored** (TrevorJS's community build, Q8_0) + stock unsloth vision projector + AtomicChat MTP draft | Multimodal LLM |
 | [`gemma-4-12b.json`](gemma-4-12b.json) | Gemma-4 12B (QAT) + vision + MTP draft | Multimodal LLM |
 | [`gemma-4-26b-a4b.json`](gemma-4-26b-a4b.json) | Gemma-4 26B-A4B (MoE) + vision + MTP draft | Multimodal MoE LLM |
 | [`gpt-oss-20b.json`](gpt-oss-20b.json) | gpt-oss-20b (Q8_0) | Text reasoning LLM |
@@ -183,8 +226,9 @@ TensorSharp.Server --config config/gemma-4-26b-a4b.json
 | [`diffusiongemma-26b-a4b-q4.json`](diffusiongemma-26b-a4b-q4.json) | DiffusionGemma 26B-A4B (Q4_K_M) | Text diffusion + image input (CLI/server); auto-downloads the vision shard |
 | [`diffusiongemma-26b-a4b-q3.json`](diffusiongemma-26b-a4b-q3.json) | DiffusionGemma 26B-A4B (Q3_K_M) | Text diffusion + image input, smaller; shares the Q4 vision shard |
 
-For the agent-enabled counterparts of four of these models — skills, code execution,
-network and package installs switched on — see [Agent configs](#agent-configs) below.
+For the agent-enabled counterparts of three of these models, plus Qwen3.8-27B — skills,
+code execution, network and package installs switched on — see
+[Agent configs](#agent-configs) below.
 
 Notes:
 
@@ -197,29 +241,52 @@ Notes:
   keys now fail with a message naming the replacement). Any drafter that ships
   as its own GGUF — Gemma's assistant head, a DFlash/DSpark block drafter — is
   named by `"draft-model"`, and naming it is the request: no `"spec": true`
-  needed beside it. Qwen3.6, GLM 5.2 and GLM-5.3 embed theirs in the trunk, so
-  `"spec": true` is all they need. `"spec-type": "ngram"` needs no drafter at
-  all, so it works with any config in this folder.
+  needed beside it. Qwen3.6, Qwen3.8-27B, GLM 5.2 and GLM-5.3 embed theirs in the
+  trunk, so `"spec": true` is all they need. `"spec-type"`, `"spec-draft"` and
+  `"spec-pmin"` only tune speculation and never turn it on. `"spec-type": "ngram"` needs no drafter at
+  all, but it still needs a model that can act as a speculative target: it does
+  not run on `gpt-oss-20b.json` (GPT-OSS is not one), and the diffusion, image,
+  video and embedding configs do not decode token by token at all.
+- **The three `gemma-4-*.json` files speculate by default, on both hosts.**
+  Naming their MTP `"draft-model"` turns speculation on, with no `"spec"` key
+  beside it. Pass `--no-spec` (or add `"no-spec": true`) to decode without it;
+  the draft file is still fetched.
 - **Qwen-Image-2.1** ([`qwen-image-2.1.json`](qwen-image-2.1.json)): `--prompt "…"
   --output out.png` generates an image, and adding `--image in.png` edits it instead.
-  `--diffusion-steps` (default 40), `--cfg` (default 1), `--diffusion-seed` and
-  `--width` / `--height` (multiples of 32) are CLI flags. Add a LoRA plug-in from
+  `--diffusion-steps` (default 40, or the recipe of a step-distillation plug-in),
+  `--cfg` (default 1), `--diffusion-seed` and `--width` / `--height` (multiples of
+  32) are CLI flags. On the server a request carries its own `steps`, `cfg`,
+  `seed`, `width` and `height`; `--width` and `--height` given together at startup
+  set the default size for requests that name neither a size nor an area (a value
+  off the 32-pixel grid is rounded down with a one-time warning, and one of the two
+  alone is ignored with a warning). Add a LoRA plug-in from
   [`lora/`](#qwen-image-21-lora-plug-ins-lora) with `--lora`. See
   [the Qwen-Image-2.1 guide](../docs/models/qwenimage21.md).
-- **DiffusionGemma** uses the CLI's iterative denoising path; tune it with
-  `--diffusion-steps` / `--diffusion-seed` on the command line.
-- **Downloads are pinned to a commit and a SHA-256**, not to `main`, so every
-  machine gets the same bytes. Each pin is the upstream head as of 2026-09-25; to
-  take a later upload, change the commit in the URL and the `sha256` together. The
-  checksum applies only to a new download: a file already at `path` is used as-is
-  and never re-checked, so an older local copy keeps being used until you delete
-  it.
+- **DiffusionGemma** runs its iterative denoising path on both hosts; on the CLI,
+  tune it with `--diffusion-steps` / `--diffusion-seed`. Its `mmproj` entry is the
+  Gemma-4 vision tower, loaded straight from the upstream Hugging Face shard
+  `model-00011-of-00011.safetensors` (2.84 GB), which enables `--image` on the CLI
+  and image input on the server. Audio is refused, and there is no video path: an
+  OpenAI `video_url` part is refused, and a video uploaded in the Web UI reaches
+  the model only as extracted frames, treated as plain images. To run text-only
+  without that download, pass `--mmproj none`: a command-line `--mmproj` drops the
+  file's entry before it is resolved, so the shard is never fetched (this works on
+  the CLI too).
+- **Every download entry in every config in this folder is pinned** to a full
+  commit and a SHA-256, not to `main`, so every machine gets the same bytes; a
+  test enforces it. That covers the basic examples, the Wan and MiniMax-H3
+  configs, and the DiffusionGemma model files and vision shard alike. Each pin is
+  the upstream head as of 2026-09-25; to take a later upload, change the commit in
+  the URL and the `sha256` together. The checksum applies only to a new download: a
+  file already at `path` is used as-is and never re-checked, so an older local copy
+  keeps being used until you delete it.
 
 ## Qwen-Image-2.1 LoRA plug-ins (`lora/`)
 
 The files in [`lora/`](lora/) are **not** host configs: they are LoRA plug-ins that
 you add to a Qwen-Image-2.1 run with `--lora`, on either host. Each one names its
-weights with a pinned URL and SHA-256, downloaded on first use to
+weights with a pinned URL and SHA-256 (the Fun-Acc bundle pins the `pdd_config.json`
+it forwards the same way), downloaded on first use to
 `$TENSORSHARP_MODELS/qwen-image-2.1/loras` (or `models/qwen-image-2.1/loras` in the
 repository when the variable is unset), and may carry a default strength and a
 sampling recipe:
@@ -228,7 +295,7 @@ sampling recipe:
 TensorSharp.Cli --config config/qwen-image-2.1.json \
   --lora config/lora/qwen-image-2.1-viggle-turbo.json --prompt "…" --width 1024 --height 1024
 
-TensorSharp.Server --config config/qwen-image-2.1.json --lora config/lora/qwen-image-2.1-pruna-8step.json
+TensorSharp.Server.Host --config config/qwen-image-2.1.json --lora config/lora/qwen-image-2.1-pruna-8step.json
 ```
 
 | File | Plug-in |
@@ -271,8 +338,8 @@ at local paths on an Apple Silicon Mac (`ggml_metal`), so change `backend` and t
 upstream repo, pinned by commit and SHA-256.
 
 ```bash
-TensorSharp.Cli    --config config/agent-gemma-4-12b.json --chat
-TensorSharp.Server --config config/agent-qwen3.8-27b.json
+TensorSharp.Cli         --config config/agent-gemma-4-12b.json --chat
+TensorSharp.Server.Host --config config/agent-qwen3.8-27b.json
 ```
 
 | File | Model | Speculative decoding |
@@ -282,7 +349,7 @@ TensorSharp.Server --config config/agent-qwen3.8-27b.json
 | [`agent-gemma-4-12b.json`](agent-gemma-4-12b.json) | Gemma-4 12B (QAT UD-Q4_K_XL, 6.3 GB) | **On** — MTP draft head, auto window 7 |
 | [`agent-gemma-4-26b-a4b.json`](agent-gemma-4-26b-a4b.json) | Gemma-4 26B-A4B MoE (QAT UD-Q4_K_XL, 13.3 GB) | Off — no Metal MoE measurement exists yet |
 
-Notes, all of which the files themselves repeat as comments:
+Notes (the files repeat most of these as comments):
 
 - **`--code-exec-allow-network` is the broadest permission here.** Every command
   the model writes gets unrestricted host IP networking, including LAN and
@@ -292,12 +359,19 @@ Notes, all of which the files themselves repeat as comments:
   `"skills-allow-network"` and `"code-exec-allow-network"`, neither implying the
   other. Both are set, because the `research` and `market-data` skills need the
   first and generated code needs the second.
-- **`"skills-dir"` is not optional.** The default root beside the binary is empty,
-  so a config without this key yields an agent with zero skills. These files point
-  at `TensorAgent/skills`: 11 skills, six of which bundle runnable scripts — four
-  Python (`documents`, `research`, `slack-gif-creator`, `market-data`), one shell
-  (`web-artifacts-builder`) and one JS template (`algorithmic-art`). A path that
-  does not exist is a fatal startup error.
+- **`"skills-dir"` is not optional.** Without it (and without the `TS_SKILLS_DIR`
+  environment variable) the host looks only in every `.agents/skills` folder from
+  the working directory up to the Git root and then in the `skills/` folder beside
+  the binary; this repository has no `.agents/skills` and the `skills/` folder
+  beside the binary is empty (the host creates it empty), so a config without this
+  key yields an agent with zero skills. These files point at `TensorAgent/skills`: 12 skills, seven of
+  which bundle runnable scripts — four Python (`documents`, `research`,
+  `slack-gif-creator`, `market-data`), two shell (`web-artifacts-builder` and the
+  `playwright` browser-automation wrapper, which needs Node.js/`npx` on the host;
+  see [the Playwright guide](../docs/playwright_agent.md)) and one JS template
+  (`algorithmic-art`). A path that does not exist is a fatal startup error.
+  `--skills-dir` is repeatable, so one given on the command line adds a root
+  rather than replacing this one; move this one with `TENSORSHARP_SKILLS`.
 - **`"temperature"` must be pinned, or the two hosts disagree.** These GGUFs carry
   `general.sampling.temp = 1.0`, which the CLI's chat path overlays onto any field
   left unset while the server ignores it and falls to its built-in 0.8.
@@ -323,6 +397,15 @@ Notes, all of which the files themselves repeat as comments:
   `"code-exec-packages"` and `"code-exec-install-domains"`. A JSON array becomes a
   repeated flag whose parse is last-one-wins, so only the final entry survives.
 
+One more behaviour the files do not mention: **on the server these models can also
+delegate to sub-agents.** Delegation is on by default on the server's chat endpoints
+for every family that renders tool declarations, which includes all four models here.
+The model decides whether to spawn a helper, and helpers are read-only (only a
+`worker` helper gets write tools, and only with `--agents-allow-worker-tools`); add
+`"no-multi-agent": true` to turn delegation off. The CLI has no sub-agents, and no
+latency or quality numbers are published for delegation. See
+[Multiple agents](../docs/multi_agent.md).
+
 ## Video generation with sound (MiniMax-H3)
 
 MiniMax-H3 denoises video **and 32 kHz stereo audio in one packed latent**, so a run
@@ -330,7 +413,7 @@ writes an `.mp4` and a matching `.wav`. Four networks cooperate — denoiser, te
 encoder, video VAE, audio VAE — which makes a config file the practical way to run it:
 
 ```bash
-TensorSharp.Server --config config/minimax-h3-fl2va.json
+TensorSharp.Server.Host --config config/minimax-h3-fl2va.json
 
 TensorSharp.Cli --config config/minimax-h3-fl2va.json \
   --prompt "a red fox trotting through falling snow, cinematic" --output fox.mp4
@@ -355,7 +438,7 @@ TensorSharp.Cli --config config/minimax-h3-ref2va.json \
 
 Notes:
 
-- **The first run downloads ~33.5 GB** — denoiser 10.64 GiB, text encoder 16.97 GiB,
+- **The first run downloads ~35.5 GB** (~35.4 GB for Ref2VA) — denoiser 10.64 GiB, text encoder 16.97 GiB,
   video VAE 5.21 GB, audio VAE 0.61 GB. All four come from unsloth, with Comfy-Org
   listed as a second source for the two VAEs. Each network is loaded and released in
   turn, so peak VRAM is `max(...)` and not the sum.
@@ -364,13 +447,14 @@ Notes:
 - **The text encoder ships no tokenizer**, and auto-download cannot fill that gap: it
   only resolves options that are flags, and the tokenizer is not one. Put `vocab.json`
   and `merges.txt` from
-  [MiniMaxAI/MiniMax-H3/processor](https://huggingface.co/MiniMaxAI/MiniMax-H3/tree/main/processor)
+  [MiniMaxAI/MiniMax-H3/processor](https://huggingface.co/MiniMaxAI/MiniMax-H3/tree/42ed227ee7df40d41602854ae760620d6eb651fe/processor)
+  (the config comments give pinned `curl` lines)
   next to the encoder GGUF in `${modelRoot}`, or point `TS_VIDEO_TOKENIZER` at the
   folder holding them. Without them the run stops when the encoder loads.
 - **Steps and guidance are host-specific, so no shipped config sets them.** The server
   takes `--video-steps N` and has no `--cfg` at all; the CLI takes `--diffusion-steps N`
   and `--cfg`. A flag the server does not know is not ignored — it refuses to start —
-  so a config carrying a CLI-only key would break `TensorSharp.Server --config`. H3 is
+  so a config carrying a CLI-only key would break `TensorSharp.Server.Host --config`. H3 is
   CFG-distilled and enforces cfg 1.0 itself; its default is 20 steps, and 4-8 is the
   fast operating point.
 - **`video-frames` snaps to the `17k+5` grid** (5, 22, 39, 56, 73, 90 …), not Wan's
@@ -394,7 +478,7 @@ downloads whatever is missing:
 
 ```bash
 # Text-to-video and image-to-video, 4-step distilled. Start here.
-TensorSharp.Server --config config/wan-video-ti2v-5b-turbo.json
+TensorSharp.Server.Host --config config/wan-video-ti2v-5b-turbo.json
 
 TensorSharp.Cli --config config/wan-video-ti2v-5b-turbo.json \
   --prompt "a red fox trotting through falling snow" --output fox.mp4

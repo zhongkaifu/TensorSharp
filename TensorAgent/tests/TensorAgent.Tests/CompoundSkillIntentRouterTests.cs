@@ -7,12 +7,17 @@ using TensorSharp.Runtime;
 namespace TensorAgent.Tests;
 
 /// <summary>
-/// The deterministic front door for the reported research-to-PPTX failure. These are
-/// deliberately model-free: whether a prompt is routed must not depend on sampling.
+/// The deterministic front door for research followed by a PowerPoint deliverable.
+/// These are deliberately model-free: whether a prompt is routed must not depend on
+/// sampling. They are also deliberately subject-free: the route once fired only for
+/// one reported comparison (Apple M6 against M5) and searched a hard-coded English
+/// query, so the same request about anything else fell back to discovery. That
+/// comparison is now one example among several, and every expected query below is
+/// made only of words the user wrote.
 /// </summary>
 public sealed class CompoundSkillIntentRouterTests : IDisposable
 {
-    private const string ExactPrompt = "搜索apple M6的信息，并对比M5芯片，然后生成pptx报告";
+    private const string NeutralPrompt = "搜索量子计算的最新进展，然后生成幻灯片";
     private readonly string _root = Path.Combine(
         Path.GetTempPath(), "tensoragent-compound-router-" + Guid.NewGuid().ToString("N"));
 
@@ -22,12 +27,12 @@ public sealed class CompoundSkillIntentRouterTests : IDisposable
     }
 
     [Fact]
-    public void TheReportedChineseRequestSelectsBothRequiredSkills()
+    public void ACompoundRequestSelectsBothSkillsAndTheSubjectFreeEvidenceContract()
     {
         SkillRegistry registry = Registry(ResearchManifest(), DocumentsManifest());
 
         WebUiSkillRoute? route = TensorAgentSkillRouter.Route(
-            UserTurn(ExactPrompt), requestedSkills: null, registry);
+            UserTurn(NeutralPrompt), requestedSkills: null, registry);
 
         Assert.NotNull(route);
         Assert.Equal(
@@ -36,7 +41,10 @@ public sealed class CompoundSkillIntentRouterTests : IDisposable
         WebUiArtifactRequirement artifact = Assert.IsType<WebUiArtifactRequirement>(route.ArtifactRequirement);
         Assert.Equal(".pptx", artifact.Extension);
         Assert.Equal(4, artifact.MinimumSlides);
-        Assert.Equal(new[] { "M5", "M6" }, artifact.RequiredVisibleTerms);
+        // The deck is checked for structure and for citing this turn's research, never
+        // for naming particular terms: those would only fit one subject.
+        Assert.True(artifact.RequiredVisibleTerms is null or { Count: 0 },
+            "the route demands subject-specific terms: " + string.Join(", ", artifact.RequiredVisibleTerms ?? Array.Empty<string>()));
         Assert.True(artifact.RequireVisibleHttpUrl);
         Assert.Equal("notes.md", artifact.CitationEvidencePath);
         Assert.True(route.RequiresNetwork);
@@ -48,12 +56,7 @@ public sealed class CompoundSkillIntentRouterTests : IDisposable
                 Assert.Equal("scripts/research.py", run.ResourcePath);
                 Assert.False(run.ProducesArtifact);
                 Assert.Equal(
-                    new[]
-                    {
-                        "Apple M6 chip specifications release information compared with Apple M5 chip. "
-                            + "User-requested focus: 搜索apple M6的信息，并对比M5芯片",
-                        "--pages", "3", "--out", "notes.md",
-                    },
+                    new[] { "搜索量子计算的最新进展", "--pages", "3", "--out", "notes.md" },
                     run.DefaultArguments);
                 Assert.True(run.EnforceArguments);
                 Assert.Null(run.RequiredInputPath);
@@ -79,36 +82,143 @@ public sealed class CompoundSkillIntentRouterTests : IDisposable
         Assert.Contains("shared workspace", route.Instructions, StringComparison.Ordinal);
     }
 
-    [Fact]
-    public void TheEquivalentEnglishRequestIsAlsoCompound()
+    /// <summary>
+    /// Any subject, in English or Chinese, routes, and the research query is the
+    /// user's research clause: the trailing connective ("then", "并", "然后") and the
+    /// deck request are cut, nothing is added. A word the user wrote after the format
+    /// name ("report", "报告") stays, because the route cannot tell it from a subject.
+    /// </summary>
+    [Theory]
+    [InlineData(
+        "搜索apple M6的信息，并对比M5芯片，然后生成pptx报告",
+        "搜索apple M6的信息，并对比M5芯片 报告")]
+    [InlineData(
+        "Search for current Apple M6 information, compare it with M5, and create a PowerPoint report.",
+        "Search for current Apple M6 information, compare it with M5 report")]
+    [InlineData(
+        "Search current Rust releases and create a PowerPoint report.",
+        "Search current Rust releases report")]
+    [InlineData(
+        "Research the history of the Roman aqueducts and make a slide deck.",
+        "Research the history of the Roman aqueducts")]
+    [InlineData(
+        "调研一下2026年电动汽车电池技术，并制作演示文稿",
+        "调研一下2026年电动汽车电池技术")]
+    [InlineData(
+        "搜索量子计算的最新进展。生成pptx",
+        "搜索量子计算的最新进展")]
+    public void ACompoundRequestOnAnySubjectSearchesTheUsersOwnWords(string prompt, string expectedQuery)
     {
-        SkillRegistry registry = Registry(ResearchManifest(), DocumentsManifest());
-
-        WebUiSkillRoute? route = TensorAgentSkillRouter.Route(
-            UserTurn("Search for current Apple M6 information, compare it with M5, and create a PowerPoint report."),
-            requestedSkills: null,
-            registry);
-
-        Assert.NotNull(route);
-        Assert.Equal(2, route.Skills.Count);
-    }
-
-    [Fact]
-    public void AnUnrelatedResearchDeckIsNotBroadenedByTheTargetedRoute()
-    {
-        const string prompt = "Search current Rust releases and create a PowerPoint report.";
         SkillRegistry registry = Registry(ResearchManifest(), DocumentsManifest());
 
         WebUiSkillRoute? route = TensorAgentSkillRouter.Route(
             UserTurn(prompt), requestedSkills: null, registry);
 
-        Assert.Null(route);
+        Assert.NotNull(route);
+        Assert.Equal(
+            new[] { TensorAgentSkillRouter.ResearchSkill, TensorAgentSkillRouter.DocumentsSkill },
+            route.Skills);
+        Assert.Equal(expectedQuery, ResearchQueryOf(route));
+    }
+
+    /// <summary>
+    /// The route enforces its research arguments, so a model cannot repair a query
+    /// that lost the subject. The subject survives wherever the request puts it:
+    /// after the deck request, inside it (the usual Chinese order), or everywhere
+    /// but the deck request when that comes first.
+    /// </summary>
+    [Theory]
+    [InlineData(
+        "Search the web and create a PowerPoint about the Roman aqueducts",
+        "Search the web about the Roman aqueducts")]
+    [InlineData(
+        "搜索最新资料，然后生成一份关于量子计算的演示文稿",
+        "搜索最新资料 关于量子计算的")]
+    [InlineData(
+        "Search the web and make me a Rust vs Go presentation",
+        "Search the web Rust vs Go")]
+    [InlineData(
+        "Search the web and create a US election presentation",
+        "Search the web US election")]
+    [InlineData(
+        "Create a PowerPoint deck on the history of Rome after you search the web for sources.",
+        "deck on the history of Rome after you search the web for sources")]
+    public void TheSubjectSurvivesWhereverTheRequestNamesIt(string prompt, string expectedQuery)
+    {
+        SkillRegistry registry = Registry(ResearchManifest(), DocumentsManifest());
+
+        WebUiSkillRoute? route = TensorAgentSkillRouter.Route(
+            UserTurn(prompt), requestedSkills: null, registry);
+
+        Assert.NotNull(route);
+        Assert.Equal(expectedQuery, ResearchQueryOf(route));
+    }
+
+    /// <summary>
+    /// Punctuation marks a new request whether or not a space follows it, as does a
+    /// line break. Before, only "X,create" counted, so the ordinary English "X, create
+    /// a presentation" never routed.
+    /// </summary>
+    [Theory]
+    [InlineData(
+        "Look up recent research on sleep and memory, create a presentation.",
+        "Look up recent research on sleep and memory")]
+    [InlineData(
+        "Search the Rust release notes\n  create a pptx",
+        "Search the Rust release notes")]
+    public void APunctuatedRequestCountsEvenWhenASpaceFollowsThePunctuation(string prompt, string expectedQuery)
+    {
+        SkillRegistry registry = Registry(ResearchManifest(), DocumentsManifest());
+
+        WebUiSkillRoute? route = TensorAgentSkillRouter.Route(
+            UserTurn(prompt), requestedSkills: null, registry);
+
+        Assert.NotNull(route);
+        Assert.Equal(expectedQuery, ResearchQueryOf(route));
+    }
+
+    /// <summary>
+    /// Connectives and creation verbs are whole words: "Poland" does not end in the
+    /// connective "and", and "remake" or "recreate" are not requests to make a deck.
+    /// </summary>
+    [Fact]
+    public void ConnectivesAndCreationVerbsMustBeWholeWords()
+    {
+        SkillRegistry registry = Registry(ResearchManifest(), DocumentsManifest());
+
+        WebUiSkillRoute? route = TensorAgentSkillRouter.Route(
+            UserTurn("Search the history of Poland, create a pptx"), requestedSkills: null, registry);
+
+        Assert.NotNull(route);
+        Assert.Equal("Search the history of Poland", ResearchQueryOf(route));
+        Assert.Null(TensorAgentSkillRouter.Route(
+            UserTurn("Look up why teams remake their slides every quarter"), requestedSkills: null, registry));
+        Assert.Null(TensorAgentSkillRouter.Route(
+            UserTurn("Research how people recreate PowerPoint slides"), requestedSkills: null, registry));
+    }
+
+    /// <summary>
+    /// research.py parses its question with argparse, which reads a one-word argument
+    /// that starts with '-' as an unknown option and fails the run.
+    /// </summary>
+    [Theory]
+    [InlineData("- Search the Rust release notes and create a pptx", "Search the Rust release notes")]
+    [InlineData("-搜索量子计算，然后生成pptx", "搜索量子计算")]
+    public void TheQueryNeverStartsLikeACommandLineOption(string prompt, string expectedQuery)
+    {
+        SkillRegistry registry = Registry(ResearchManifest(), DocumentsManifest());
+
+        WebUiSkillRoute? route = TensorAgentSkillRouter.Route(
+            UserTurn(prompt), requestedSkills: null, registry);
+
+        Assert.NotNull(route);
+        Assert.Equal(expectedQuery, ResearchQueryOf(route));
     }
 
     [Fact]
     public void ALongCompoundRequestProducesABoundedValidResearchArgument()
     {
-        string prompt = "Search Apple M6 information and compare it with M5 " + new string('x', 5_000)
+        string prompt = "Search the history of the Roman aqueducts " + new string('x', 5_000)
             + " and create a PowerPoint report.";
         SkillRegistry registry = Registry(ResearchManifest(), DocumentsManifest());
 
@@ -116,18 +226,36 @@ public sealed class CompoundSkillIntentRouterTests : IDisposable
             UserTurn(prompt), requestedSkills: null, registry);
 
         Assert.NotNull(route);
-        string query = route.ArtifactRequirement.RequiredRuns[0].DefaultArguments[0];
+        string query = ResearchQueryOf(route);
+        Assert.InRange(query.Length, 1, TensorAgentSkillRouter.MaxResearchQueryLength);
+        // The artifact contract refuses a routed argument above 4,096 characters.
         Assert.InRange(query.Length, 1, 4096);
-        Assert.StartsWith(
-            "Apple M6 chip specifications release information compared with Apple M5 chip. "
-                + "User-requested focus: Search Apple M6 information and compare it with M5",
-            query,
-            StringComparison.Ordinal);
+        Assert.StartsWith("Search the history of the Roman aqueducts xxx", query, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void TheBoundNeverSplitsASurrogatePair()
+    {
+        // The emoji's high surrogate lands on the last character the bound keeps.
+        string lead = "Search " + new string('x', TensorAgentSkillRouter.MaxResearchQueryLength - 8);
+        string prompt = lead + "\U0001F600 and more detail, then create a PowerPoint report.";
+        SkillRegistry registry = Registry(ResearchManifest(), DocumentsManifest());
+        Assert.True(char.IsHighSurrogate(prompt[TensorAgentSkillRouter.MaxResearchQueryLength - 1]));
+
+        WebUiSkillRoute? route = TensorAgentSkillRouter.Route(
+            UserTurn(prompt), requestedSkills: null, registry);
+
+        Assert.NotNull(route);
+        string query = ResearchQueryOf(route);
+        Assert.Equal(lead, query);
+        Assert.Equal(query, Encoding.UTF8.GetString(Encoding.UTF8.GetBytes(query)));
     }
 
     [Theory]
     [InlineData("搜索 Apple M6 的信息并与 M5 对比")]
+    [InlineData("Search the latest Rust release notes and summarize them")]
     [InlineData("根据我已经附上的资料生成 pptx 报告")]
+    [InlineData("Create a PowerPoint deck about the Roman aqueducts")]
     [InlineData("Research how to repair a timber slide deck")]
     public void ARequestWithOnlyOneSideOfTheWorkflowIsNotBroadened(string prompt)
     {
@@ -137,13 +265,83 @@ public sealed class CompoundSkillIntentRouterTests : IDisposable
             UserTurn(prompt), requestedSkills: null, registry));
     }
 
+    /// <summary>
+    /// Without a topic gate the cues are what keeps an ordinary request out of a forced,
+    /// network-only workflow (which answers 503 while network access is off). A research
+    /// word must be ASKED for, not merely present; a format name must be a word of its own;
+    /// and it must be what the verb makes, not the subject of something else it makes.
+    /// </summary>
+    [Theory]
+    [InlineData("Create a presentation about our research results")]
+    [InlineData("Search the news and write a summary of recent landslides in Nepal")]
+    [InlineData("Research quantum computing and create a representation of the qubit states")]
+    [InlineData("Search the literature and write a summary of the clinical presentation of Lyme disease")]
+    [InlineData("制作一份关于搜索引擎优化的演示文稿")]
+    [InlineData("Make slides that explain how a web search engine ranks pages")]
+    public void AResearchWordOrAFormatNameThatIsOnlyMentionedDoesNotRoute(string prompt)
+    {
+        SkillRegistry registry = Registry(ResearchManifest(), DocumentsManifest());
+
+        Assert.Null(TensorAgentSkillRouter.Route(UserTurn(prompt), requestedSkills: null, registry));
+    }
+
+    /// <summary>
+    /// Only the connective run directly before the deck request is cut, and never across
+    /// clause punctuation: a CJK connective needs no word boundary, so a looser cut took
+    /// the 请 of 申请 and the 并 of 合并, and an English one took "next" out of the subject.
+    /// </summary>
+    [Theory]
+    [InlineData("搜索美国签证申请，生成pptx", "搜索美国签证申请")]
+    [InlineData("搜索2025年的企业合并，然后生成幻灯片", "搜索2025年的企业合并")]
+    [InlineData("搜索2025年的企业合并然后生成幻灯片", "搜索2025年的企业合并")]
+    [InlineData("Research what Apple will release next, and create a presentation", "Research what Apple will release next")]
+    [InlineData("Research what Apple will release next and create a presentation", "Research what Apple will release next")]
+    [InlineData("Search the Rust release notes and then create a pptx", "Search the Rust release notes")]
+    public void TheSubjectKeepsWordsThatOnlyLookLikeConnectives(string prompt, string expectedQuery)
+    {
+        SkillRegistry registry = Registry(ResearchManifest(), DocumentsManifest());
+
+        WebUiSkillRoute? route = TensorAgentSkillRouter.Route(
+            UserTurn(prompt), requestedSkills: null, registry);
+
+        Assert.NotNull(route);
+        Assert.Equal(expectedQuery, ResearchQueryOf(route));
+    }
+
+    /// <summary>
+    /// research.py reads an argument that starts with http(s):// as a page to read, so a
+    /// URL the user wrote travels as its own argument and never leads the question.
+    /// </summary>
+    [Theory]
+    [InlineData(
+        "https://example.com/post - search it and make slides",
+        new[] { "search it", "https://example.com/post" })]
+    [InlineData(
+        "Research https://example.com/post and the pages it cites, then create a presentation.",
+        new[] { "Research and the pages it cites", "https://example.com/post" })]
+    public void AUrlTheUserWroteIsReadAsAPageNotSearchedAsText(string prompt, string[] expectedPositional)
+    {
+        SkillRegistry registry = Registry(ResearchManifest(), DocumentsManifest());
+
+        WebUiSkillRoute? route = TensorAgentSkillRouter.Route(
+            UserTurn(prompt), requestedSkills: null, registry);
+
+        Assert.NotNull(route);
+        WebUiArtifactRequirement artifact = Assert.IsType<WebUiArtifactRequirement>(route.ArtifactRequirement);
+        WebUiSkillRunRequirement research = Assert.Single(
+            artifact.RequiredRuns, run => run.SkillId == TensorAgentSkillRouter.ResearchSkill);
+        Assert.Equal(
+            expectedPositional.Concat(new[] { "--pages", "3", "--out", "notes.md" }),
+            research.DefaultArguments);
+    }
+
     [Fact]
     public void CuesInDifferentTurnsDoNotBecomeOneCompoundRequest()
     {
         SkillRegistry registry = Registry(ResearchManifest(), DocumentsManifest());
         var messages = new List<ChatMessage>
         {
-            new() { Role = "user", Content = "Search the web for Apple M6." },
+            new() { Role = "user", Content = "Search the web for the latest Rust release notes." },
             new() { Role = "assistant", Content = "Here is what I found." },
             new() { Role = "user", Content = "Summarize the attached notes as a pptx." },
         };
@@ -152,26 +350,26 @@ public sealed class CompoundSkillIntentRouterTests : IDisposable
     }
 
     [Theory]
-    [InlineData("Search Apple M50 and M60 information, compare them, and create a PowerPoint report.")]
-    [InlineData("Search Apple AM5 and XM6 information, compare them, and create a PowerPoint report.")]
-    public void ChipNamesMustBeWholeAsciiTokens(string prompt)
-    {
-        SkillRegistry registry = Registry(ResearchManifest(), DocumentsManifest());
-
-        Assert.Null(TensorAgentSkillRouter.Route(
-            UserTurn(prompt), requestedSkills: null, registry));
-    }
-
-    [Fact]
-    public void AttachedTextCannotActivateTheAutomaticNetworkRoute()
+    [InlineData("attachment")]
+    [InlineData("text")]
+    [InlineData("image")]
+    [InlineData("audio")]
+    public void AttachedContentCannotActivateTheAutomaticNetworkRoute(string kind)
     {
         SkillRegistry registry = Registry(ResearchManifest(), DocumentsManifest());
         var message = new ChatMessage
         {
             Role = "user",
-            Content = "summarize this attachment\n\n" + ExactPrompt,
-            AttachmentPaths = new List<string> { "uploaded.txt" },
+            Content = "summarize this attachment\n\n" + NeutralPrompt,
         };
+        var paths = new List<string> { "uploaded." + kind };
+        switch (kind)
+        {
+            case "attachment": message.AttachmentPaths = paths; break;
+            case "text": message.TextFilePaths = paths; break;
+            case "image": message.ImagePaths = paths; break;
+            default: message.AudioPaths = paths; break;
+        }
 
         Assert.Null(TensorAgentSkillRouter.Route(
             new[] { message }, requestedSkills: null, registry));
@@ -194,7 +392,7 @@ public sealed class CompoundSkillIntentRouterTests : IDisposable
         SkillRegistry registry = Registry(ResearchManifest(), DocumentsManifest());
 
         WebUiSkillRoute? route = TensorAgentSkillRouter.Route(
-            UserTurn(ExactPrompt), new[] { TensorAgentSkillRouter.DocumentsSkill }, registry);
+            UserTurn(NeutralPrompt), new[] { TensorAgentSkillRouter.DocumentsSkill }, registry);
 
         Assert.Null(route);
     }
@@ -205,18 +403,22 @@ public sealed class CompoundSkillIntentRouterTests : IDisposable
         SkillRegistry registry = Registry(ResearchManifest(), DocumentsManifest());
 
         WebUiSkillRoute? route = TensorAgentSkillRouter.Route(
-            UserTurn(ExactPrompt), Array.Empty<string>(), registry);
+            UserTurn(NeutralPrompt), Array.Empty<string>(), registry);
 
         Assert.Null(route);
     }
 
-    [Fact]
-    public void RoutingDoesNotClaimARequiredSkillThatIsNotInstalled()
+    [Theory]
+    [InlineData(TensorAgentSkillRouter.ResearchSkill)]
+    [InlineData(TensorAgentSkillRouter.DocumentsSkill)]
+    public void RoutingDoesNotClaimARequiredSkillThatIsNotInstalled(string missingSkill)
     {
-        SkillRegistry registry = Registry(DocumentsManifest());
+        SkillRegistry registry = missingSkill == TensorAgentSkillRouter.ResearchSkill
+            ? Registry(DocumentsManifest())
+            : Registry(ResearchManifest());
 
         Assert.Null(TensorAgentSkillRouter.Route(
-            UserTurn(ExactPrompt), requestedSkills: null, registry));
+            UserTurn(NeutralPrompt), requestedSkills: null, registry));
     }
 
     [Theory]
@@ -247,7 +449,7 @@ public sealed class CompoundSkillIntentRouterTests : IDisposable
         Assert.True(registry.TryGet(shadowedSkill, out Skill winner));
         Assert.Equal(SkillOrigin.Installed, winner.Origin);
         Assert.Null(TensorAgentSkillRouter.Route(
-            UserTurn(ExactPrompt), requestedSkills: null, registry));
+            UserTurn(NeutralPrompt), requestedSkills: null, registry));
     }
 
     [Theory]
@@ -277,7 +479,7 @@ public sealed class CompoundSkillIntentRouterTests : IDisposable
         Assert.True(registry.TryGet(shadowedSkill, out Skill winner));
         Assert.Equal(SkillOrigin.Installed, winner.Origin);
         Assert.Null(TensorAgentSkillRouter.Route(
-            UserTurn(ExactPrompt), requestedSkills: null, registry));
+            UserTurn(NeutralPrompt), requestedSkills: null, registry));
     }
 
     [Fact]
@@ -289,7 +491,7 @@ public sealed class CompoundSkillIntentRouterTests : IDisposable
         string documents = DocumentsManifest(documentsSentinel + new string('D', 13_000));
         SkillRegistry registry = Registry(research, documents);
         WebUiSkillRoute route = Assert.IsType<WebUiSkillRoute>(TensorAgentSkillRouter.Route(
-            UserTurn(ExactPrompt), requestedSkills: null, registry));
+            UserTurn(NeutralPrompt), requestedSkills: null, registry));
 
         IReadOnlyList<Skill> selected = registry.Resolve(route.Skills, out IReadOnlyList<string> unknown);
         SkillPlan plan = SkillPrompt.Plan(selected, registry.Skills, new SkillPromptOptions
@@ -297,7 +499,7 @@ public sealed class CompoundSkillIntentRouterTests : IDisposable
             ContextTokens = 8_192,
             ToolsAvailable = true,
         });
-        List<ChatMessage> messages = SkillPrompt.Apply(UserTurn(ExactPrompt).ToList(), plan);
+        List<ChatMessage> messages = SkillPrompt.Apply(UserTurn(NeutralPrompt).ToList(), plan);
         messages = SkillPrompt.Apply(messages, route.Instructions);
 
         Assert.Empty(unknown);
@@ -317,6 +519,14 @@ public sealed class CompoundSkillIntentRouterTests : IDisposable
 
     private static IReadOnlyList<ChatMessage> UserTurn(string content) =>
         new[] { new ChatMessage { Role = "user", Content = content } };
+
+    private static string ResearchQueryOf(WebUiSkillRoute route)
+    {
+        WebUiArtifactRequirement artifact = Assert.IsType<WebUiArtifactRequirement>(route.ArtifactRequirement);
+        WebUiSkillRunRequirement research = Assert.Single(
+            artifact.RequiredRuns, run => run.SkillId == TensorAgentSkillRouter.ResearchSkill);
+        return research.DefaultArguments[0];
+    }
 
     private SkillRegistry Registry(params string[] manifests)
     {

@@ -1,19 +1,25 @@
 # TensorAgent
 
-An iPhone and iPad app with the full capability of TensorSharp.Server's Web UI
-chat, running entirely on the device: a .NET MAUI (`net10.0-ios`) head that links
-the TensorSharp engine statically, serves its own phone-shaped page to a WKWebView
-from an in-process loopback HTTP server, and answers that page's API with the same
-chat pipeline the desktop uses.
+An iPhone and iPad app with the capabilities of TensorSharp.Server's Web UI
+chat (the main gaps are named below), running entirely on the device: a .NET
+MAUI (`net10.0-ios`) head that links the TensorSharp engine statically, serves its
+own phone-shaped page to a WKWebView from an in-process loopback HTTP server, and
+answers that page's API with the same chat pipeline the desktop uses.
 
 This is the current source implementation of TensorSharp's iOS/iPadOS target.
 Physical devices use the GGML Metal (`ggml_metal`) backend; build it with
 `TensorSharpIosTargets=true`. It is not a remote client or a separate inference
-engine. The latest tagged desktop release may not include TensorAgent yet, so
+engine. It targets iPhone and iPad (iOS/iPadOS 17.0 or later, arm64 only); the
+only device run recorded below is an iPhone on iOS 26.6.1, and every built-in
+catalog model needs a device in the 12 GB memory tier or above (see the catalog
+below). No release workflow builds, signs or publishes the app, so
 follow the source-build instructions below.
 
-Nothing leaves the phone. The model runs locally, the sandbox has no network unless
-the user grants it, and dictation asks for on-device speech recognition.
+Nothing leaves the phone by default. The model runs locally, the sandbox has no
+network unless the user grants it, and dictation requires on-device speech
+recognition wherever the chosen language's recogniser supports it; for a language
+whose recogniser cannot run on the device, Apple's recogniser may process the audio
+off the device.
 
 ## What it does
 
@@ -30,8 +36,14 @@ What is shared is the API, not the document. The routes under the page —
 `/api/image-edit`, `/api/video-generate` — are bound to the same
 `WebUiChatService` and `SkillsService` the desktop server binds, so streaming,
 tool progress, reasoning blocks, skill steps and artifact links behave
-identically. The app's own client is appended as one script tag at request time;
-the page file itself is never forked.
+identically. The main things the desktop page has that are not here: the phone
+page draws no sub-agent progress panel (it ignores the `agents` field of
+tool-progress frames, and only names the sub-agent tools in words — "Starting
+sub-agent", "Waiting for sub-agents", "Messaging sub-agent", "Stopping sub-agent",
+"Checking sub-agents", or "Preparing …" while the call is being written), it has no image-editing or video-generation UI — those two routes are
+bound, but nothing on the page calls them — and `/api/image-generate`, the route the
+desktop page uses for text-to-image, is not bound at all. The app's own client is
+appended as one script tag at request time; the page file itself is never forked.
 
 **A built-in model catalog.** Six dense entries chosen to fit a phone, with the
 exact byte size and SHA-256 of every file. Four are downloadable; those downloads
@@ -39,19 +51,31 @@ resume from a kept `.part` after an interruption, are verified before use, and
 belong to the APP rather than to the screen that started one — see "Downloads"
 below. The two Bonsai cards are text-only, local-import entries: their GGUFs embed
 no publisher repository or license, so the app offers a file picker instead of
-inventing a download URL and accepts only the exact hash-pinned artifact.
+inventing a download URL and accepts only the exact hash-pinned artifact. Files with
+exactly these hashes are published in the prism-ml Bonsai repositories; the pinned
+revisions and download commands are in [Bonsai](../docs/models/bonsai.md). Download
+one, make it reachable from the Files picker, and import it.
 
 | Model | Modalities | Required artifact(s) | Needs | Source |
 | --- | --- | --- | --- | --- |
 | Gemma 4 E2B (Q8_0) | text, image, audio, video | download: 4,967,497,152-byte main GGUF + 557,368,064-byte projector | 12 GB | `ggml-org/gemma-4-E2B-it-GGUF` |
-| Gemma 4 E4B (IQ4_XS) | text, image, audio, video | download: 4,715,416,704-byte main GGUF + 559,874,816-byte projector; 98,653,280-byte draft optional | 12 GB | `unsloth/gemma-4-E4B-it-GGUF` + `ggml-org/gemma-4-E4B-it-GGUF` projector |
+| Gemma 4 E4B (IQ4_XS) | text, image, audio, video | download: 4,715,416,704-byte main GGUF + 559,874,816-byte projector; 98,653,280-byte draft optional | 12 GB | `unsloth/gemma-4-E4B-it-GGUF` + `ggml-org/gemma-4-E4B-it-GGUF` (projector and draft) |
 | Gemma 4 12B (UD-IQ2_M) | text; image and video with optional projector | download: 4,213,353,280-byte main GGUF; 175,115,840-byte projector and 465,109,248-byte draft optional | 12 GB | `unsloth/gemma-4-12b-it-GGUF` |
 | Bonsai 8B (Q1_0) | text only | local import: `Bonsai-8B-Q1_0.gguf`, exactly 1,158,654,496 bytes | 12 GB | no publisher repo embedded |
 | Bonsai 27B (Q1_0) | text only | local import: `Bonsai-27B-Q1_0.gguf`, exactly 3,803,452,480 bytes | 12 GB | no publisher repo embedded |
 | Qwen3.5 9B (IQ4_XS) | text; image and video with optional projector | download: 5,168,653,536-byte main GGUF; 918,166,080-byte projector optional | 12 GB | `unsloth/Qwen3.5-9B-GGUF` |
 
-The catalog is filtered by the device's own memory, so a phone is never offered a
-model it cannot load.
+Each entry also carries the context window the app loads it with (8,192 tokens for
+Gemma 4 E2B and E4B, 16,384 for Bonsai 8B, 32,768 for the other three), a K/V cache
+precision that the "KV cache precision" setting overrides, and its model card's
+sampling values. Both Bonsai cards are marked Experimental.
+
+The Models page lists every entry, but only one that fits the device's memory tier
+can be loaded: an entry that needs more is shown greyed, marked "Too big" with both
+numbers, rather than hidden. All six need the 12 GB tier or above. For an installed model
+whose optional projector is missing, "Add vision" downloads just the projector (and
+the draft head, when the entry lists one that is not there yet); once it is on the
+device, "Enable vision" reloads the selected model with it.
 
 **Many chats, kept, and one tap away.** The Web UI holds its history in the page and
 nowhere else, which is fine for a desktop tab and useless on a phone that is suspended
@@ -108,7 +132,8 @@ chain or sensitive custom-URL fallback is used.
 **Voice, by gesture.** Hold the message box for half a second and the composer
 becomes one large hold-to-talk button; hold it, speak, release, and the transcription
 lands in the message box for you to read before sending. A keyboard button beside it
-goes back to typing. Recognition is Apple's, asked for on-device.
+goes back to typing. Recognition is Apple's, asked for on-device wherever the
+language supports it.
 
 iOS recognises ONE language per session and cannot detect which is being spoken, so
 the chips beside the button choose it — and "Auto" means the first of *your* preferred
@@ -141,6 +166,12 @@ it, both on by default:
 
 The whole of the reasoning stays one tap away in the collapsed box above.
 
+Tapping a link to a file the model's code produced opens it natively: Quick Look
+(`QLPreviewController`) for anything it can render, the share sheet for anything
+else (`FilePresenter`). The page hands the tap to the app because the WebView cannot
+open it — the artifact route serves program-written files as attachments, and a
+WKWebView with no download delegate drops those.
+
 **A generation that starts repeating itself is stopped, and the stop is named.** A
 4-bit model writing a long block of XML inside a script fell into `","+","+","+"`
 and produced it 230 times over five and a half minutes, ending only when Stop was
@@ -160,17 +191,21 @@ default"), Skills is a ☰ menu item beside Chats and Models, and the dictation 
 appears only in voice mode. Each was a permanent control for something decided rarely,
 on the one row a phone composer has.
 
-**The answer keeps being written while you are somewhere else.** A generation belongs to
-the app, not to the HTTP request that asked for it (`ChatTurnManager`). This is not a
-refinement: iOS suspends a WKWebView's content process the moment its view leaves the
-window, which is what opening the model list does, so the page stops reading — and a
+**The answer keeps being written while you are somewhere else in the app.** A
+generation belongs to the app, not to the HTTP request that asked for it
+(`ChatTurnManager`). This is not a refinement: iOS suspends a WKWebView's content
+process the moment its view leaves the window, which is what opening the model list does, so the page stops reading — and a
 server that took that as "nobody wants this any more" threw away the minute the user had
 just waited. Now the turn runs on, buffers what it produces, and the page ATTACHES to it
-again when it comes back, replaying from the first frame; the display is held awake and
-a background-task assertion is taken for as long as the model is working, both driven by
+again when it comes back, replaying from the first frame; the display is held awake
+(unless `keepAwakeWhileGenerating` is off, see Settings below) and a background-task
+assertion is taken for as long as the model is working, both driven by
 the host's own answer rather than by whichever page happens to be watching. Stopping is
 something the Stop button asks for explicitly. The transcript is written by the turn, so
-an answer that finishes with nobody reading is still there.
+an answer that finishes with nobody reading is still there. Leaving the app itself is
+different: iOS forbids GPU work from the background, so the turn pauses while
+TensorAgent is not in front and carries on from the same token when it returns (see
+"Leaving the APP mid-answer" below).
 
 **The model you last used is loaded at launch.** The app has always remembered the
 choice and then done nothing with it until you went back to the Models list and tapped
@@ -185,23 +220,42 @@ while: 3,204 characters of URL, response fields and a ten-row table, added to ma
 stock-gainers request come out right. It did, and it also made the model reach for
 finance APIs on requests that had nothing to do with finance, because a whole worked
 program in a declaration does not read as guidance, it reads as what code here looks
-like. What is left is 999 characters that are true of any request: prefer the standard
+like. What was left was 999 characters that are true of any request: prefer the standard
 library for a lookup, write multi-line programs as a quoted heredoc rather than
 `python3 -c`, and when a command's output already answers the question, copy it exactly
-and invent nothing. Task-specific help belongs in a skill, which is injected only when it
+and invent nothing. The only sentences added since say what this host cannot do — `node`
+is a JavaScriptCore layer rather than Node.js, and npm/npx, native executables and
+child processes are unavailable — which is just as true of every request here.
+Task-specific help belongs in a skill, which is injected only when it
 is selected. `AgentAppHostTests` fails if any tool description names a vendor or product
 again.
 
-**Every bundled skill reaches the model's catalog.** Six of the thirteen did not. The
-catalog is filled in id order under a budget of about a thousand tokens, the thirteen
-descriptions come to half again as much, and the alphabet decided who was cut:
-`documents` and `research` — the two this app's own router depends on — were both
-below the line, while two entries of nearly a thousand characters each at the head of
-the alphabet took half the budget between them. A model asked to look something up
+**Every bundled skill reaches the model's catalog.** On 2026-09-08, six of the thirteen
+then bundled did not. The catalog was filled in id order under a budget of about a
+thousand tokens, the thirteen descriptions came to half again as much, and the alphabet
+decided who was cut: `documents` and `research` — the two this app's own router
+depends on — were both below the line, while two entries of nearly a thousand
+characters each at the head of the alphabet (both unbundled since) took half the
+budget between them. A model asked to look something up
 listed the skills it could see, found nothing that fetches a page, and refused. The
 catalog now SHORTENS entries rather than dropping them, at the longest of a few fixed
 lengths where everything fits, and charges for the text it actually emits; a catalog
 that already fits is left exactly as it was.
+
+**One compound request is routed, on any subject.** When the skills picker is
+untouched (the request sends no `skills` field) and the latest turn has no attachments,
+a message that asks for research where it is asked for, not merely named (search,
+research, look up, 搜索, 检索, 查找, 调研 …; "our research results" or 搜索引擎 do not
+count), and asks to create a deck (create, make, generate … / 生成, 制作 … followed
+within 96 characters by pptx, PowerPoint, slides, slide deck, presentation, 幻灯片,
+演示文稿 or 演示报告) is routed to the `research` and `documents` skills together. The
+search uses the user's own words minus the deck request, at most 384 characters, with
+each http(s) URL in them passed as its own argument; the turn is complete only when a
+real `.pptx` of at least four slides exists that shows an http(s) URL and cites a
+source from `notes.md`. The route needs the network, so with the Network switch off it
+is refused before anything runs, with the `network_disabled` notice and a "Turn on
+Network" button, and without a usable `skills_run` with `routed_workflow_unavailable`
+and "Open Settings". Everything else goes through ordinary skill discovery.
 
 **The sandbox switches take effect now.** "Run code" and "Allow network access" used to
 apply "the next time TensorAgent starts", which is honest and useless: leaving an iPhone
@@ -213,11 +267,17 @@ host list, and the terms a skill's scripts are planned against). A command alrea
 running keeps the terms it started with.
 
 **Skills.** Bundled and installed skill directories are discovered automatically — see
-"Skills" below for platform requirements. Users can install more from a zip.
+"Skills" below for platform requirements. Users can install more from a `.zip` or from
+a link — one archive, or a plain-text list of links, one per line — and can remove any
+skill, bundled ones included: removing a bundled skill is recorded in
+`removed-skills.txt` in the backed-up data directory, so an app update does not bring it
+back.
 
 **Code, generated and run.** The agent host's shell tool works here, backed by an
 in-process POSIX shell, an embedded CPython 3.13 and JavaScriptCore, because iOS
-allows no child processes at all.
+allows no child processes at all. With "Run code" on, a chat is declared `shell`,
+`read_file`, `apply_patch` and `write_file` (which creates a file and refuses to
+overwrite one); with skills on, `skills_list`, `skills_read` and `skills_run` as well.
 
 A missing command never ends in "command not found" and nothing else. Installing a
 native program is available to nobody here — iOS runs no child processes and will not
@@ -226,11 +286,32 @@ work instead: `$(( ))` and `python3` for `bc`, the interpreters for another lang
 the fact that `apt`/`brew`/`sudo` have no meaning on this device, and that pure-Python
 `none-any` wheels can be installed with `pip` when network access is on. JavaScriptCore's
 `node` command is a compatibility layer; it cannot install npm packages or launch
-native child processes. It also
-catches a transposed name. This is not politeness: a dead end is where a model stops
-using the shell and starts inventing the answer, which is exactly what one did on a
+native child processes. The shell also catches a transposed name. This is not
+politeness: a dead end is where a model stops using the shell and starts inventing
+the answer, which is exactly what one did on a
 phone — reaching for `bc` to subtract two dates, being told 127, and finishing the
 arithmetic in its head with the wrong number and a formula underneath.
+
+**Sub-agents, on by default, with a switch.** Settings > Sandbox > "Sub-agents"
+(`multiAgentEnabled` in `settings.json` and `POST /api/agent/settings`, on by default)
+decides whether delegation is offered; every limit stays at the shared defaults
+(`MultiAgentOptions`: at most three children running at once, eight per request, two
+levels deep, 180 s per child). While it is on, every catalog model renders tool
+declarations, so every chat is also offered `spawn_agent`, `wait_agent`,
+`send_input`, `close_agent` and `list_agents` — even with Skills and "Run code" off.
+Off, those five tools and the coordination prompt are not declared at all, exactly as
+on a server started with `--no-multi-agent`. The change applies to the running app
+(`ServerHostingOptions.RepointMultiAgent`) from the next message, with no restart; a
+turn already delegating finishes under its old terms. Children are read-only: the app
+never sets `AllowWorkerTools`, so a worker gets no mutable tools either. Host tool
+calls in one tree run one at a time. Each child starts a fresh conversation (the
+parent's system instructions and its task, not the parent's transcript) and restores
+its own copy of any matching shared-prefix checkpoint rather than sharing KV pages.
+The app does not read `TS_NO_MULTI_AGENT`, which only `TensorSharp.Server` reads,
+and the phone page never sends `multi_agent: false`; the switch is the way to turn
+delegation off. Nor does the page show a sub-agent progress panel (see above). No
+latency, memory or quality measurement of delegation on a phone exists; the design and
+its limits are in [Multiple agents](../docs/multi_agent.md).
 
 **The first message is as fast as the second, and so is a new chat.** A
 conversation's first turn used to forward several thousand tokens — the system prompt,
@@ -251,8 +332,9 @@ makes new chats fast on the two families that could not be served any other way:
 4's sliding-window layers physically hold only the last 512 positions, so the pooled
 block cache could restore at most one window, and Qwen 3.5's recurrent state cannot be
 rewound at all. Measured with `benchmarks/TensorAgentTtftBench` (below): on Gemma 4 E2B
-a new chat went from 1.5 s / 0% reuse to 0.11 s / 99.6% on a Mac, and the same shape
-holds on the phone, ten times slower in absolute terms. Two more turns that used to
+a new chat went from 1.5 s / 0% reuse to 0.11 s / 99.6% on a Mac; the phone is
+expected to follow the same shape, but no per-shape measurement on the phone is
+recorded (see "What has not been verified"). Two more turns that used to
 re-prefill everything no longer do: a turn after the user tapped Stop (the transcript
 now records the tokens the engine forwarded past the last one streamed), and, on Qwen
 3.5, a turn after the thinking toggle changed (the two thinking modes rendered through
@@ -262,8 +344,26 @@ renderer, and each answer remembers which mode its prompt ended in).
 **A sandbox the user controls.** Two switches, both in Settings, both defaulting to
 the safe answer: code execution on, because an agent that cannot act is not an
 agent, and network off, because a model that can reach the internet from inside a
-sandbox is a different risk entirely. Every setting on that page does something;
-one that could not be enforced was removed rather than left there implying it was.
+sandbox is a different risk entirely. The same section also holds the "Sub-agents"
+switch (on by default; see above), and its note reads "Changes here take effect
+straight away: the sandbox on the next command the model runs, sub-agents on the next
+message." Every setting on that page does something; one that could not be enforced
+was removed rather than left there implying it was.
+
+The rest of Settings, with its defaults: the reply output limit (256 to 262,144 new
+tokens, 2,048 by default); KV cache precision (FP16, Q8 or Q4, Q4 by default — it
+overrides the catalog entry's precision and applies at the next model load, and Gemma 4,
+whose attention cannot read a block-quantized cache, uses FP16 whatever it says); the
+tool timeout (10 to 600 s in steps of 10, 120 by default); "Show reasoning by default"
+(off); "Speculative decoding" (on, applied to the running engine from the next
+reply — see "Speculative decoding" below); "Download over cellular" (off); and "Include optional files", the
+projector and draft head (on). The reply limit and tool timeout apply at once, like the
+sandbox switches. Four settings have no control and can be set only in `settings.json`
+or through `POST /api/agent/settings`: `networkHosts`, a host allow-list for the
+network switch (empty means any host); `contextLength`, an override of the catalog
+entry's window (0 keeps it); `keepAwakeWhileGenerating`, which holds the display awake
+while the model works (on by default); and `defaultSkills`, the skills preselected for
+a new chat (none by default). The Skills master switch is in the page's Skills sheet.
 
 ## Build and run
 
@@ -274,7 +374,7 @@ export DOTNET_ROOT="$HOME/.dotnet"
 export PATH="$HOME/.dotnet:$PATH"
 ```
 
-One-time preparation, both of which produce files that are not in git:
+One-time preparation; all three produce files that are not in git:
 
 ```
 TensorSharp.GGML.Native/build-ios.sh        # GgmlOps.xcframework (device + simulator)
@@ -289,6 +389,17 @@ libxslt and lxml against the embedded CPython for both slices (a few minutes;
 needs a host `python3.13`, CMake and Ninja) and drops the wheels into the same
 cache the BeeWare wheels come from.
 
+`eng/fetch-python-ios.sh` fetches BeeWare's Python-Apple-support 3.13-b14
+(`TENSORAGENT_PYTHON_VERSION`, `TENSORAGENT_PYTHON_BUILD`). The packages
+`prepare-python.sh` stages are listed in the script: numpy 2.5.2.post1 and Pillow
+10.4.0 from BeeWare's index, lxml 6.1.3 built as above, and the pure-Python pypdf,
+openpyxl, et_xmlfile, reportlab, imageio, python-pptx, python-docx, XlsxWriter,
+typing_extensions, charset-normalizer and defusedxml, all pinned to a version, plus
+certifi and PyYAML, which are not pinned, so each run stages whatever version the
+index currently has.
+`TENSORAGENT_PYTHON_PACKAGES` adds more pure-Python packages;
+`TENSORAGENT_PYTHON_NO_WHEELS=1` stages the standard library only.
+
 Then:
 
 ```
@@ -298,24 +409,33 @@ TensorAgent/scripts/verify-sim.sh           # drive the running app's API from t
                                             # (also takes a DEVICE log: a phone's 127.0.0.1
                                             #  is the phone's, so it skips the API half and
                                             #  checks everything the app logged about itself)
-TensorAgent/scripts/deploy-device.sh         # Debug build: auto-sign, install, and launch
+TensorAgent/scripts/build-device.sh          # device build only (SKIP_SIGNING=1: compile/link check)
+TensorAgent/scripts/deploy-device.sh         # Debug by default: auto-sign, install, and launch
 TensorAgent/scripts/verify-background.sh     # send the app away mid-answer and read what happened
+TensorAgent/scripts/verify-share-rule.sh     # check the share extension's activation rule
+TensorAgent/scripts/bench-spec-device.sh     # plain vs speculative decoding on the phone
 ```
 
 `deploy-device.sh` selects the only connected physical iPhone, an installed
 `Apple Development` identity, and a compatible provisioning profile. If more
 than one phone or identity is available, set `DEVICE_ID` or `CODESIGN_KEY`;
-`CODESIGN_PROVISION` can likewise override profile selection. Share-enabled builds
+`CODESIGN_PROVISION` can likewise override profile selection. The app's App ID needs
+the Increased Memory Limit and Extended Virtual Addressing capabilities, which every
+device build requests (`Platforms/iOS/Entitlements.plist` and `Entitlements.Share.plist`);
+without them profile validation fails. Share-enabled builds
 also require the App Group `group.ai.tensorsharp.tensoragent` on both App IDs and an
 independent profile for `ai.tensorsharp.tensoragent.share`; override its selection with
 `CODESIGN_SHARE_PROVISION`. The containing app's exact profile must never be reused
 for the extension. Set `TENSORAGENT_SHARE_EXTENSION=false` only for an intentional
 app-only regression build. The install is an update in place, so existing models,
 conversations, and settings are retained.
-Release deployment rebuilds the native iOS xcframework from the current checkout;
-set `TENSORAGENT_REBUILD_XCFRAMEWORK=0` only when intentionally reusing it.
+`deploy-device.sh` builds Debug unless `CONFIGURATION=Release` is set, and either way
+rebuilds the native iOS xcframework from the current checkout;
+set `TENSORAGENT_REBUILD_XCFRAMEWORK=0` only when intentionally reusing it. Before
+installing, it checks that the built executable still exports
+`TSGgml_IsMetalAvailable`, a sentinel for the engine's `TSGgml_` entry points.
 
-Five environment variables drive a Debug build from a script, because neither
+These environment variables drive a Debug build from a script, because neither
 `simctl` nor `devicectl` can tap or type:
 
 | | |
@@ -329,6 +449,11 @@ Five environment variables drive a Debug build from a script, because neither
 | `TENSORAGENT_NAV_CHECK=1` | leave the chat mid-answer for `TENSORAGENT_NAV_SECONDS` (15) and report whether the answer carried on |
 | `TENSORAGENT_NETWORK_CHECK=1` | flip the network switch both ways and run `curl` after each, then put it back |
 | `TENSORAGENT_DOWNLOAD=<catalog id>` | start a download and log it, stopping after `TENSORAGENT_DOWNLOAD_SECONDS` (60) |
+| `TENSORAGENT_TTFT_CHECK=1` | four turns through `/api/chat` — first chat, follow-up, new chat, follow-up — with one `ttft` line each (also in `logs/ttft.log`) |
+| `TENSORAGENT_BACKGROUND_CHECK=1` | ask the host's own model for a long answer (`TENSORAGENT_BACKGROUND_PROMPT`, `TENSORAGENT_BACKGROUND_TOKENS`, 4096) and trace what happens while the app is away; driven by `verify-background.sh` |
+| `TENSORAGENT_PAGE_BACKGROUND_CHECK=1` | the same, through the page and the `TENSORAGENT_DEMO_PROMPT` it sends (`verify-background.sh` with `CHECK=page`) |
+| `TENSORAGENT_SPEC_BENCH=1` | the plain-vs-speculative benchmark (`TENSORAGENT_SPEC_BENCH_MODES`, `TENSORAGENT_SPEC_BENCH_TOKENS`, 160); a Release build honours this one, and `TENSORAGENT_USE_MODEL` with it |
+| `TENSORAGENT_SKIP_UPLOAD_CHECK=1` | skip the large-upload probe described below |
 
 Two of those exist because the claim they check has no other witness. `TENSORAGENT_NAV_CHECK`
 is the only way to see that a generation survives the chat leaving the screen: iOS suspends
@@ -347,21 +472,41 @@ A device build additionally needs a signing identity and provisioning profile:
 
 ```
 dotnet build TensorAgent/src/TensorAgent.Maui/TensorAgent.Maui.csproj \
-    -f net10.0-ios -r ios-arm64 -c Release \
+    -f net10.0-ios -r ios-arm64 -c Release -m:1 \
     -p:TensorSharpIosTargets=true -p:CodesignKey="Apple Development: ..."
 ```
+
+`-m:1` keeps the build on one MSBuild node: several referenced projects share one
+output directory, and parallel nodes race on its `deps.json`. `build-device.sh`
+passes it too, and besides `SKIP_SIGNING` reads, among others listed in its header,
+`CODESIGN_KEY`, `CODESIGN_PROVISION`, `CLEAN=1` (a targeted clean first),
+`NO_INCREMENTAL=1` and `TENSORAGENT_DOTNET_ARGS` (extra `dotnet build` arguments).
 
 `TensorSharpIosTargets=true` must be on the command line rather than only in the
 csproj: it decides whether `TensorSharp.Models` builds a `net10.0-ios` slice at
 all, and restore resolves a referenced project's target frameworks before a
 `ProjectReference`'s `AdditionalProperties` are applied.
 
+Release device builds keep the engine. It is linked statically and reached through
+`dlsym`, and the Release build's strip step keeps only the symbols on its list, so
+`GgmlExportedSymbols.targets` names each `TSGgml_` export as a `ReferenceNativeSymbol`.
+A new native export has to be added there too; `TensorAgentMauiProjectTests` fails when
+that list and the native export list disagree.
+
+The app and its share extension target iOS 17.0 (`SupportedOSPlatformVersion` in
+their project files), matching the xcframework's `TENSORSHARP_IOS_DEPLOYMENT_TARGET`
+(default 17.0) in `build-ios.sh`. The app uses the UIKit scene
+lifecycle with a single window (`UIApplicationSceneManifest` in `Info.plist` and
+`Platforms/iOS/SceneDelegate.cs`), because a build linked against the iOS 27 SDK crashed
+at launch without it. The device run recorded below is on iOS 26.6.1; no run on iOS 27
+is recorded.
+
 ## Layout
 
 ```
 TensorAgent/
   scripts/          build, run and verify; prepare-python.sh; verify-skills.py
-  skills/           the bundled skills, plus verdicts.json saying why each one is here
+  skills/           the twelve skills (ten go into the app bundle), plus verdicts.json saying which can run on iOS and why
   python-runtime/   staged CPython (not in git; produced by prepare-python.sh)
   src/TensorAgent.Core/
     Catalog/        the model list, the store, install state
@@ -369,11 +514,12 @@ TensorAgent/
     Sessions/       conversations, and the recorder that keeps them in step with the page
     Settings/       the two sandbox switches and the rest
     Hosting/        the loopback server, the route table, and AgentAppHost
-    Shell/          the in-process POSIX shell and the agent host's backend over it
+    Interop/        the one DllImport resolver CPython and JavaScriptCore share
+    Shell/          the in-process POSIX shell and the agent host's backends (in-process, desktop)
     Sandbox/        ExecutionPolicy and ConfinedPaths, shared by all three runtimes
     Python/         embedded CPython and the wheel installer
     JavaScript/     JavaScriptCore over its C API, with Node-shaped globals
-    WebUi/          the script appended to the Server's page
+    WebUi/          the script appended to the app's own page
     Sharing/        durable-inbox import, bounded composer handoff, ACK lifecycle
   src/TensorAgent.Sharing/
                     dependency-free envelope format and prompt composition contract
@@ -381,8 +527,10 @@ TensorAgent/
                     iOS share sheet, NSItemProvider readers, Safari preprocessing
   src/TensorAgent.Maui/
     MainPage        the WebView, the attachment row, dictation
-    Pages/          models, chats, settings
+    Pages/          models, chats, settings, about
     Hosting/        where the files live on this device; the engine and media probes
+    Platforms/iOS/  app and scene lifecycle, background downloads and generation,
+                    loopback probe, dictation, Quick Look, share inbox
   tests/TensorAgent.Tests/
 ```
 
@@ -412,17 +560,27 @@ call consults the policy first. The backend reports that honestly, including the
 one thing it genuinely cannot do — preempt a builtin already inside a long call.
 
 **Native execution when hosted on desktop.** `AgentPaths.ExecutionMode` defaults to
-`Auto`: an `AgentAppHost` running on macOS, Linux or Windows uses TensorSharp's shared
-`ProcessShellBackend`, OS sandbox, shell sessions and package installer. Real Node.js,
-npm/npx, Python and other programs on the host can then run inside the session sandbox.
+`Auto`: an `AgentAppHost` running on macOS, Linux or Windows uses `DesktopShellBackend`
+over TensorSharp's shared `ProcessShellBackend`, OS sandbox, shell sessions and package
+installer. Real Node.js, npm/npx, Python and other programs on the host can then run
+inside the session sandbox.
 The process backend requires an available sandbox; it does not fall back to unrestricted
 execution. Set `AgentExecutionMode.InProcess` when a desktop test is intended to emulate
 the iOS runtimes. Embedded runtime injection is not supported in process mode.
 
-The Playwright skill requires actual Node.js/npm and browser child processes.
-These capabilities are available on the desktop execution path when their dependencies
-are present, but cannot be supplied to the iOS app by widening its sandbox. Installing
-the skill on iOS makes its instructions discoverable, not its dependencies executable.
+The Playwright skill (`skills/playwright`, which drives a browser with `playwright-cli`
+from `@playwright/cli`, run through `npx`) requires actual Node.js/npm and browser child
+processes. These capabilities are available on the desktop execution path when their
+dependencies are present, but cannot be supplied to the iOS app by widening its sandbox.
+The browser workflow has been validated only on macOS arm64: on Linux each command runs
+in its own PID namespace, so a detached `playwright-cli` session cannot be assumed to
+survive between calls, and on Windows the shared process backend lacks the required
+filesystem and network confinement.
+The skill is left out of the iOS app bundle (see "Skills" below), because the app can
+start neither a Node package manager nor a browser; it stays in `TensorAgent/skills` for
+the desktop hosts. Its requirements
+and desktop setup are in
+[Running browser and native-runtime skills](../docs/playwright_agent.md#tensoragent).
 No browser-specific bridge is used. A nonempty `networkHosts` restriction is enforced by
 the embedded backend; the desktop backend refuses network-enabled launches under that
 restriction because its general process sandbox cannot enforce DNS host allow-lists.
@@ -435,9 +593,14 @@ dotnet run --project eng/validation/TensorAgentHost -- \
   --weights /path/to/model.gguf --network --port 5038
 ```
 
-The launcher writes its loopback URL and authentication cookie to
-`artifacts/tensoragent-browser/connection.json`. The browser-workflow validator accepts
-that file via `--connection`. Desktop results do not establish browser support on iOS.
+`--backend` defaults to `ggml_metal` on macOS and `ggml_cpu` elsewhere, `--context` to
+32768 and `--max-tokens` to 4096, `--port 0` picks a free port, and `--web-root` serves
+another copy of the phone page (by default the checkout's
+`TensorAgent/src/TensorAgent.Maui/wwwroot`). The launcher turns speculative decoding off.
+It writes its loopback URL and authentication cookie to
+`artifacts/tensoragent-browser/connection.json`. The browser-workflow validator
+(`eng/validation/validate-browser-skill.py`) accepts that file via `--connection`.
+Desktop results do not establish browser support on iOS.
 
 **The transcript is the host's, and it carries the attachments.** The Web UI keeps
 its history in the page and nowhere else; on a phone the app is suspended and killed
@@ -456,7 +619,11 @@ no file to open.
 **Weights are not backed up.** Models go under `Library/Caches`, excluded from
 iCloud; conversations, settings and installed skills go under
 `Library/Application Support`, which is backed up. A five-gigabyte byte-identical
-copy of a public file has no business in a user's iCloud quota.
+copy of a public file has no business in a user's iCloud quota. The app's own folder
+in Files and Finder (its `Documents` directory) stays empty, because nothing is read
+from or written to it: a sideloaded model comes in through the Files picker on the
+Models page, which copies it into the store, and a generated file goes out through
+QuickLook or the share sheet.
 
 **Downloads outlive the screen that started them.** `ModelDownloadManager` owns every
 transfer for the life of the app: the model list attaches to a running job when it
@@ -614,14 +781,27 @@ not exist puts the user one tap from a load that fails.
 
 ## Skills
 
-`scripts/verify-skills.py` decides what is bundled, by parsing every script and
-resolving each import against the staged interpreter. It refuses anything reaching
-for a capability iOS does not have. Eleven pass and are bundled; `skills/verdicts.json`
-records every verdict.
+`scripts/verify-skills.py` judges which skills can run on the phone, by parsing every
+Python script and resolving each import against the staged interpreter, and by checking
+every `.sh` / `.bash` script for the Node package managers and bundlers (npm, npx, pnpm,
+yarn, parcel, vite) the in-app shell does not have. It refuses anything reaching for a
+capability iOS does not have, and `skills/verdicts.json` records a verdict for each of
+the twelve directories under `skills/`. Ten pass. Two fail, both on shell scripts:
+`playwright`, whose only script execs `npx` to drive a Chromium (it was added for the
+desktop-hosted agent; see "Native execution when hosted on desktop" above), and
+`web-artifacts-builder`, whose two scripts install and run pnpm, npm and parcel.
 
-The upstream ones that do not, and what blocks each (three more — `academy-guide`,
-`discernment-nudge`, `brand-guidelines` — pass the checker and were unbundled anyway,
-because they instruct the model on behalf of another product in every turn):
+The MAUI project excludes both by name, so **the app bundle carries ten skills**;
+`TensorAgentMauiProjectTests` keeps that exclusion list equal to the failing verdicts
+in both directions. The repository's `skills/` directory keeps all twelve, because it
+is also the skill root of the desktop hosts — the server's
+`--skills-dir TensorAgent/skills` and the desktop TensorAgent host's
+`--skills TensorAgent/skills` — where both can run.
+
+The skills that cannot run on the phone, and what blocks each (three more upstream
+ones — `academy-guide`, `discernment-nudge`, `brand-guidelines` — pass the checker and
+were unbundled anyway, because they instruct the model on behalf of another product in
+every turn):
 
 | Skill | Blocked by |
 | --- | --- |
@@ -629,7 +809,8 @@ because they instruct the model on behalf of another product in every turn):
 | pdf | `pdfplumber` is missing, and `pdf2image` shells out to poppler |
 | skill-creator | `subprocess`, `webbrowser` |
 | webapp-testing | `playwright` needs a browser engine |
-| playwright | Node.js/npm and native browser processes; supported by the desktop process backend, unavailable on iOS |
+| playwright | Node.js/npm and native browser processes; supported by the desktop process backend, left out of the app bundle |
+| web-artifacts-builder | pnpm, npm and parcel; left out of the app bundle (the desktop hosts still get it) |
 | mcp-builder | an MCP server needs a process and a socket |
 
 Importable is not the same as usable: `subprocess` is in the standard library and
@@ -650,11 +831,13 @@ only when the request matches it, so it cannot bias the turns that do not.
 
 **The switch.** The skills sheet carries a master toggle above the list. Off is not
 "nothing is ticked": `ServerHostingOptions.SkillsEnabled` makes the request planner
-build no plan at all, so no skill is declared to the model and none is reachable.
-That is what the switch is for — eleven skills announce themselves in every prompt,
-which on a phone is thousands of tokens on every turn of every chat, and a user who
-wants a plain assistant should be able to have one. It applies to the next message,
-not the next launch.
+build no skill plan at all, so no skill is declared to the model and none is reachable.
+That is what the switch is for — every bundled skill (ten) announces itself in every
+prompt, which on a phone is thousands of tokens on every turn of every chat, and a user
+who wants a plain assistant should be able to have one. It removes skills only: the code
+tools stay while "Run code" is on, and the sub-agent tools follow the separate
+"Sub-agents" switch, whatever this one says. It
+applies to the next message, not the next launch.
 
 **`research` was rewritten.** The old one had a search script that was a client for
 an endpoint the user was expected to configure, plus one unauthenticated fallback
@@ -682,7 +865,7 @@ alternative is reporting an engine's own navigation as the user's sources.
 dotnet test TensorAgent/tests/TensorAgent.Tests/TensorAgent.Tests.csproj
 ```
 
-Hermetic by default. Four groups need something the machine may not have and say
+Hermetic by default. These groups need something the machine may not have and say
 so rather than passing silently:
 
 | Set | Enable with |
@@ -690,8 +873,19 @@ so rather than passing silently:
 | Live CPython | `TENSORAGENT_PYTHON_ROOT=<a staged slice or a CPython 3.13 prefix>` |
 | End-to-end chat | `TENSORAGENT_TEST_MODEL_DIR=<a directory of catalog GGUFs>` (and `TENSORAGENT_TEST_MODEL_FILE` for a differently named copy) |
 | Metal lifetime | the same weights, plus a Mac whose GgmlOps was built with ggml_metal |
-| Media parity | the desktop provider's packages |
+| Image, audio and video input | `TENSORAGENT_TEST_MODEL_DIR` holding a multimodal catalog entry and its projector (`TENSORAGENT_TEST_MMPROJ_FILE` for a differently named projector) |
+| Image editing | `TENSORAGENT_TEST_IMAGE_MODEL_DIR=<a Qwen-Image-2.1 DiT GGUF, its VAE, a Qwen3-VL-8B text encoder and its mmproj>` |
+| Video generation | `TENSORAGENT_TEST_VIDEO_MODEL_DIR=<a Wan DiT GGUF, its VAE and a umt5-xxl encoder>` (`TENSORAGENT_TEST_VIDEO_MODEL_FILE` picks one DiT) |
 | The open web | `TENSORAGENT_ALLOW_NETWORK_TESTS=1` — these ask the real internet a real question |
+| Desktop process backend | macOS, Linux or Windows with a working OS sandbox and shell, plus Node.js for three of the four `DesktopAgentHostTests` |
+
+`TENSORAGENT_TEST_BACKEND` chooses the backend for the three media sets: the input
+tests default to the CPU, the image-editing and video-generation ones to Metal.
+
+None of this runs in CI. `.github/workflows/pr-unit-tests.yml` runs `InferenceWeb.Tests`,
+whose `TensorAgentMauiProjectTests` read the MAUI head's project file, `Info.plist`,
+entitlements, share extension and native export manifest; `TensorAgent.Tests` is not run
+there, and no workflow builds the iOS app.
 
 The live-CPython classes share one queue (`LivePythonCollection`). There is exactly
 one interpreter per process and one sandbox policy inside it, so running those
@@ -762,13 +956,20 @@ jetsam report the phone kept showed the app at 2-5 GB with the device at 8-10 GB
 its 12 GB wired.
 
 What the engine holds beyond the cache a turn is using is set in `EngineMemoryPolicy`
-on every load, and each value is measured: caches start at 2,048 tokens and grow;
-a request pre-reserves at most 1,024 tokens of reply beyond its prompt, in 2,048-token
-steps; one finished conversation stays resident, plus the shared-prefix checkpoint;
-nothing is parked. (The reply length setting used to decide the reservation: at its
+on every load, and each value is measured: caches start at 2,048 tokens and grow
+(`TS_KV_INITIAL_TOKENS`); a request pre-reserves at most 1,024 tokens of reply beyond
+its prompt, in 2,048-token steps (`TS_KV_GENERATION_RESERVE_MAX`); one finished
+conversation stays resident (`TS_RETAINED_FUSED_CACHE_MAX=1`), plus the shared-prefix
+checkpoint (`TS_PREFIX_CHECKPOINTS_MAX=1`, set at launch; the engine's default is two);
+nothing is parked (`TS_KV_HOLDER_POOL_MAX=0`). The same call sets `MAX_CONTEXT` and
+`KV_CACHE_DTYPE` from the catalog entry or the user's settings. (The reply length
+setting used to decide the reservation: at its
 top rung, 262,144 tokens, every request reserved the whole 32k window, host copy and
-Metal mirror both.) ggml-metal's residency set is off on the phone, so the weights can
-be reclaimed while a tool runs. TensorSharp shares complete flash-attention
+Metal mirror both.) ggml-metal's residency set is off on the phone
+(`GGML_METAL_NO_RESIDENCY=1`, set at launch unless the launch environment already sets
+it; `0` keeps the set), so the weights can be reclaimed while a tool runs, and a solo
+prompt is prefilled in 1,024-token chunks (`TS_SCHED_SOLO_PREFILL_CHUNK`, also set at
+launch). TensorSharp shares complete flash-attention
 workspaces after their final consumers finish, reducing the persistent graph's
 allocation while building unchanged upstream ggml (see
 [allocation and benchmark details](../docs/perf/ggml-without-patches.md)). The memory warning now asks the engine to release what only
@@ -799,11 +1000,14 @@ taken (`PrefixCheckpointFileStore`) and read back by the next load
 (`IPrefixCheckpointStore`, consulted by the engine at admission), so the first
 message of every later launch clones it like any other new chat. A file is named
 and checked by the model's K/V identity and the exact prefix tokens, written under a
-temporary name and renamed, and at most three are kept per model; one that no
+temporary name and renamed, and at most two are kept per model, the least recently
+used evicted first; one that no
 longer describes its model is deleted and the prefix is prefilled and saved again.
-Deleting a model deletes its checkpoints. The same idea as llama.cpp's prompt-cache
-files, scoped to the one prefix the app cares about. `benchmarks/TensorAgentTtftBench
---scenarios restore`, run twice against the same `--root`, measures the difference;
+Deleting a model deletes its checkpoints. Checkpoints, in memory and on disk, exist
+for the Gemma 4 and `qwen35`-architecture entries (Gemma 4 E2B, E4B and 12B, Qwen3.5
+9B, Bonsai 27B); Bonsai 8B's `qwen3` architecture takes none. The same idea as
+llama.cpp's prompt-cache files, scoped to the one prefix the app cares about.
+`benchmarks/TensorAgentTtftBench --scenarios restore`, run twice against the same `--root`, measures the difference;
 on the Mac (M5 Pro), first message of a launch, no warm-up waited for:
 
 | Model | Cold launch | Next launch | Checkpoint file |
@@ -822,8 +1026,9 @@ from it produces the same tokens as a cold prefill, on Metal, for Qwen 3.5 and G
 ### Speculative decoding
 
 Every turn is decoded speculatively unless the "Speculative decoding" switch in
-Settings is off: a drafter guesses a few tokens ahead and the model verifies them in
-one batched forward, so the answer is exactly what plain decoding would have
+Settings is off, on every catalog model except Bonsai 8B, whose `qwen3` architecture
+is not a speculative target: a drafter guesses a few tokens ahead and the model
+verifies them in one batched forward, so the answer is exactly what plain decoding would have
 produced and it arrives in fewer forwards. The drafter is the model's own draft head
 when the catalog lists one and it is downloaded with the optional files (Gemma 4 E4B
 and 12B; a model installed before this change gets it with its next optional
@@ -834,15 +1039,19 @@ earlier answer. `SpeculationPolicy` hands both to the engine at load time, throu
 the same environment the CLI's `--draft-model` and `--spec` use, and the engine's cost
 governor parks drafting while it measures as a loss. Both catalog families
 speculate on the app's cached-holder path: Gemma 4 with its draft head when the
-optional file is downloaded (n-gram otherwise), Qwen 3.5 with n-gram. Measured on
+optional file is downloaded (n-gram otherwise), Qwen 3.5 (and Bonsai 27B, a `qwen35`
+model) with n-gram. Measured on
 the Mac host with the phone's settings, quoting or echoing text runs 1.6-2.5x plain
 decoding and free prose stays within about 5% (Qwen) to 15% (E4B with the draft
 head) of it. On an iPhone 17 Pro Max (`scripts/bench-spec-device.sh`) quoting runs
 1.2-1.9x, prose 0.8-1.0x, and each turn's first token costs 0.1-0.6 s more with the
 setting on; leave it off for chats that are mostly free prose.
 
-The switch applies at once: the engine keeps running and follows the new policy on
-the next turn (`InferenceEngine.UpdateSpeculation`). To measure it on the phone,
+The switch applies to the running engine at once, from the next reply: the Settings
+page applies it through `AgentAppHost.ApplySettings`, which hands the engine the new
+choice through `UpdateSpeculation`, instead of waiting for the next model load. A
+`TS_SPEC` or `TS_SPEC_TYPE` set in the launch environment still wins over the switch.
+To measure it on the phone,
 `scripts/bench-spec-device.sh` deploys the app, launches it with
 `TENSORAGENT_SPEC_BENCH=1`, and pulls back `Library/Caches/TensorAgent/logs/specbench.log`:
 the same four turns under plain and speculative decoding, twice each, with prefill and
@@ -861,9 +1070,14 @@ stale rows in Gemma 4's sliding-window cache
 ### Every conversation shape, on Metal
 
 `benchmarks/TensorAgentTtftBench` starts the real app host on the Mac with the phone's
-settings (catalog context and K/V budget, 1024-token solo prefill chunks, all eleven
-skills), loads a catalog model on Metal the way tapping "Use" does, and drives
-`/api/chat` exactly as the page does through every shape a conversation takes. It
+settings (catalog context and K/V budget, 1024-token solo prefill chunks, every
+bundled skill — thirteen when the tables below were measured, a different set from
+the twelve in `TensorAgent/skills` today (the bench reads that directory; the app
+bundle carries ten of them): three were unbundled and `market-data` added the next
+day, and `playwright` later; the tool block has changed as well: the five sub-agent tools
+(2026-09-24) and `apply_patch` in place of `edit_file` (2026-09-18) are declared now
+and were not then), loads a catalog model on Metal the way tapping "Use" does, and
+drives `/api/chat` exactly as the page does through every shape a conversation takes. It
 prints, for each turn, the first-token time, the prompt size, how much of it the KV
 cache served, and — next to any turn that reused nothing — the engine's own line
 saying why. Run it with `--model <catalog id> --source <dir with the entry's files>`
@@ -913,7 +1127,9 @@ through the app's own routes, answering through the app's own chat stream:
 
 The transcript was written to the app's container and listed by
 `/api/agent/conversations`. Throughput there is not worth quoting: the simulator
-has no Metal, and the prompt is large because all eleven skills declare themselves.
+has no Metal, and the prompt is large because every bundled skill (twelve at the time,
+a different set from today's) declares itself; the declared tools differed too (the
+five sub-agent tools came later).
 
 ## What has not been verified
 
@@ -921,18 +1137,29 @@ Stated plainly, because the rest of this file is written as though everything wa
 checked and these were not:
 
 - **Downloading in the background.** The manager, the routes and the resume are
-  covered by tests that move real bytes. The iOS half — the background-task assertion
-  and the resume on `willEnterForeground` — is compile-verified only: neither can be
-  exercised in a simulator that is never suspended, and how long iOS actually grants
-  is a property of a real device under real memory pressure.
+  covered by tests that move real bytes. The background-task assertion has run on a
+  device — a download kept arriving after the app was sent to the background (see "On
+  a physical iPhone" below) — but a transfer that iOS actually stops, and the resume on
+  `willEnterForeground` that follows, have not: neither can be exercised in a simulator
+  that is never suspended, and how long iOS actually grants is a property of a real
+  device under real memory pressure.
 - **The native picker's own file names.** `UploadNaming` is tested against the shapes
   iOS produces (a stem with no extension, no content type, HEIC and MP4 bytes behind
   the same absent name), but the picker itself has only been run by hand.
 - **Image editing.** `/api/image-edit` remains bound to the same service the desktop
-  uses, but the built-in catalog offers no image-generation checkpoint and no image
-  has been generated on iOS.
+  uses, but the built-in catalog offers no image-generation checkpoint, the phone page
+  has no control that calls the route, and no image has been generated on iOS.
+  `/api/image-generate`, the desktop page's text-to-image route, is not bound in the
+  app.
 - **Video generation.** The routes exist because they are part of the shared
-  surface. No video model is small enough for the catalog, so nothing offers one.
+  surface. No video model is small enough for the catalog, and the page has no control
+  for it, so nothing offers one.
+- **Sub-agents on the phone.** Delegation is offered in every chat while the
+  "Sub-agents" switch is on (see "Sub-agents, on by default, with a switch"), but no delegated turn on a phone or in the
+  simulator is recorded, and nothing has measured what up to three concurrent
+  children cost in memory or time on a 12 GB device.
+- **iOS 27.** The scene-lifecycle change that fixed the launch crash with the iOS 27
+  SDK is in the build, but the only device run recorded is on iOS 26.6.1.
 - **Package installation.** `WheelInstaller` refuses without the network switch and
   accepts only pure-Python wheels; the accepting path has not run on iOS. A request
   for a package the bundle ships (numpy, Pillow, lxml, python-pptx, python-docx, …)
@@ -940,7 +1167,10 @@ checked and these were not:
 
 - **The first-token numbers ON THE PHONE after the 2026-09-07 cache work.** Every
   figure in "Every conversation shape, on Metal" is from a Mac driving the real app
-  host; the phone was not reachable that day. The Debug build carries a probe for
+  host; the phone was not reachable that day. The phone numbers recorded since are
+  the warm-up and persisted-checkpoint times in "The first message of a launch"
+  (Qwen3.5 9B; Bonsai 27B warm-up only) and the speculation benchmark in
+  "Speculative decoding"; none covers the per-shape table. The Debug build carries a probe for
   exactly this: launch with `TENSORAGENT_TTFT_CHECK=1` (and `TENSORAGENT_USE_MODEL`)
   and read the four `ttft` lines off `devicectl device process launch --console` —
   first chat, follow-up, new chat, follow-up. The shape to expect is the Mac's; the
@@ -1024,11 +1254,17 @@ answer anywhere else. `TENSORAGENT_UI_CHECK=1` synthesises the gestures in the r
 app and logs one line per assertion, which `verify-sim.sh` asserts on:
 
 ```
-ok voice-switch-gone                     ok holding-the-box-gives-hold-to-talk
-ok reasoning-is-a-setting                ok the-keyboard-button-returns
-ok skills-moved-to-the-menu              ok the-menu-comes-from-the-left
-ok activity-above-the-box                ok the-menu-lists-the-saved-chats
-ok a-tap-still-types                     ok a-turn-can-be-taken-back-up
+uicheck voice-switch-gone ok
+uicheck reasoning-is-a-setting ok
+uicheck skills-moved-to-the-menu ok
+uicheck activity-above-the-box ok
+uicheck a-tap-still-types ok
+uicheck holding-the-box-gives-hold-to-talk ok
+uicheck the-keyboard-button-returns ok
+uicheck the-menu-comes-from-the-left ok
+uicheck the-menu-lists-the-saved-chats ok
+uicheck a-turn-can-be-taken-back-up ok
+uicheck skills-have-a-master-switch ok
 ```
 
 The menu is measured rather than asserted about — flush with the left edge, narrower

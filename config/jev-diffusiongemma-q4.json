@@ -20,8 +20,9 @@
   "model": {
     "path": "${modelRoot}/diffusiongemma-26B-A4B-it-Q4_K_M.gguf",
     "urls": [
-      "https://huggingface.co/unsloth/diffusiongemma-26B-A4B-it-GGUF/resolve/main/diffusiongemma-26B-A4B-it-Q4_K_M.gguf"
-    ]
+      "https://huggingface.co/unsloth/diffusiongemma-26B-A4B-it-GGUF/resolve/f4183a2c7a354128d02545752303c4354d165bf0/diffusiongemma-26B-A4B-it-Q4_K_M.gguf"
+    ],
+    "sha256": "24523b6c833c9ce9f5f34f9b333ab1517d73d6f1e76a103645353114c8028bc5"
   },
   // Vision tower for image input. A Jev request may carry images in "images"
   // (base64 or data: URLs); each one is encoded here and read as part of the
@@ -32,15 +33,17 @@
   // Every published GGUF of this checkpoint is TEXT-ONLY, and no mmproj was
   // released for it; the upstream repo does carry the tower, and all 356 of its
   // tensors live in this one 2.8 GB shard (of an 11-shard, 51.6 GB checkpoint),
-  // so this downloads that shard alone. It is fetched once and reused. To run
-  // text-only decisions and skip the download entirely, pass --mmproj none.
+  // so this downloads that shard alone, on the first run, and reuses it. To run
+  // text-only decisions and skip the download entirely, pass --mmproj none on
+  // the command line: a command-line value replaces this entry before it is
+  // resolved, so the shard is never fetched, and "none" loads no projector.
   //
   // Audio is NOT supported by this checkpoint (no audio_config, no audio
   // weights), and neither is video; both are refused by name.
   "mmproj": {
     "path": "${modelRoot}/diffusiongemma-26B-A4B-it-vision.safetensors",
     "urls": [
-      "https://huggingface.co/google/diffusiongemma-26B-A4B-it/resolve/main/model-00011-of-00011.safetensors"
+      "https://huggingface.co/google/diffusiongemma-26B-A4B-it/resolve/f7f5b7f5fa82ffc52addd066915886d497f5517b/model-00011-of-00011.safetensors"
     ],
     "sha256": "afec047176bb2a05f078566576aec6bdb71ad4d041275d0d0c89473fda6d6d87"
   },

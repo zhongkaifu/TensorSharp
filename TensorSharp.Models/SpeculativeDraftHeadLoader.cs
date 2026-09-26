@@ -49,8 +49,19 @@ namespace TensorSharp.Models
         /// decoding rather than fail the load.
         /// </summary>
         public static bool TryAttachConfiguredDraftHead(ModelBase model, out string error)
+            => TryAttachConfiguredDraftHead(model, out error, out _);
+
+        /// <summary>
+        /// As <see cref="TryAttachConfiguredDraftHead(ModelBase, out string)"/>, also saying
+        /// whether the decline is the loaded model's own - true when no other draft file
+        /// could have attached (a trunk that refuses speculation, or a DFlash drafter on a
+        /// tensor-parallel trunk), so a host's remedy is to drop <c>--draft-model</c> or
+        /// <c>--tp</c>, never to find a "matching" draft GGUF.
+        /// </summary>
+        public static bool TryAttachConfiguredDraftHead(ModelBase model, out string error, out bool refusedByModel)
         {
             error = null;
+            refusedByModel = false;
             string draftPath = ConfiguredDraftHeadPath();
             if (draftPath == null)
                 return true;
@@ -60,6 +71,7 @@ namespace TensorSharp.Models
             if (model is ISpeculativeTarget { SpeculationRefusal: { } refusal })
             {
                 error = $"--draft-model '{Path.GetFileName(draftPath)}' is not attached: {refusal}";
+                refusedByModel = true;
                 return false;
             }
 
@@ -110,6 +122,21 @@ namespace TensorSharp.Models
                 }
                 if (model.HasDFlash)
                     return true;
+                // The constructors that host DFlash (Qwen 3.5/3.8, Muse-Glimmer)
+                // decline it under --tp N: the drafter borrows the trunk's LM head
+                // and token embedding, which tensor parallelism shards, and its
+                // residual capture runs the single-device verify. Attaching it here
+                // would undo that decline, so HasDFlash==false is not "not yet
+                // loaded" on a tensor-parallel trunk.
+                if (model.TensorParallelActive)
+                {
+                    error = $"--draft-model '{Path.GetFileName(draftPath)}' is a DFlash drafter, which is not "
+                            + "supported under tensor parallelism (--tp N): it borrows the trunk's LM head and "
+                            + "token embedding, both sharded across the GPUs, and its residual capture runs the "
+                            + "single-device verify. It was not attached; run without --tp to draft with it.";
+                    refusedByModel = true;
+                    return false;
+                }
                 try
                 {
                     model.LoadDFlashDraftWeights(draftPath);
@@ -188,5 +215,13 @@ namespace TensorSharp.Models
         }
 
         private static readonly System.Collections.Generic.HashSet<string> _probeFailureWarned = new(StringComparer.Ordinal);
+    }
+
+    public abstract partial class ModelBase
+    {
+        /// <summary>True when this model runs on a live tensor-parallel group. Exposed for
+        /// <see cref="SpeculativeDraftHeadLoader"/>, which attaches drafters AFTER the
+        /// constructor and must honour the tensor-parallel exclusions the constructors apply.</summary>
+        internal bool TensorParallelActive => IsTensorParallel;
     }
 }

@@ -46,7 +46,9 @@ namespace TensorSharp.Cli
         private readonly record struct OptionHelp(string Flag, string Description, string Example);
 
         // Grouped by task. Keep flags in sync with the switch in
-        // Program.MainCore, with CliLoggingSetup.ParseFromArgs, and with the
+        // Program.MainCore (sampling flags: Program.TryParseSamplingFlag; every documented
+        // flag reaches it in the one spelling NormalizeOptionSpellings writes),
+        // with CliLoggingSetup.ParseFromArgs, and with the
         // shared option parsers that run before the switch: CodeExecOptions.Parse,
         // SkillHostOptions.Parse and SpeculativeCliFlags.Apply. CliUsageTests
         // asserts the constant-table families are all documented here.
@@ -129,17 +131,19 @@ namespace TensorSharp.Cli
                     "--skills-max-rounds 4"),
                 new OptionHelp("--code-exec",
                     "Offer the model a 'shell' tool: it types a command, this host runs it in a sandbox, and " +
-                    "the model reads back the exit code and everything it printed. This is how the model does " +
-                    "all its work with files and code - write one with a heredoc, run it, search it, install " +
-                    "what it needs, check its own output. The working directory PERSISTS for the whole session " +
-                    "and is shared with any skill scripts, so one step's output is the next step's input, and " +
-                    "cd and exported variables survive from call to call (PATH does not, so an activated " +
-                    "virtualenv does not stay activated - installed packages are already on the path); the " +
-                    "directory is released when the CLI exits. One tool comes with it: 'apply_patch', which " +
-                    "creates, updates, deletes and renames several files in one all-or-nothing call, so a " +
-                    "one-line fix costs one line instead of a whole rewritten file - and the host places the " +
-                    "bytes from anchors it either finds or refuses, rather than the model retyping a file it " +
-                    "half-remembers. Separate from --skills-allow-exec on purpose: that runs a script already " +
+                    "the model reads back the exit code and everything it printed - how it runs code, searches, " +
+                    "installs what it needs and checks its own output. Three file tools come with it, so file " +
+                    "contents never have to travel through a shell command: 'read_file' returns a file's current " +
+                    "contents with line numbers; 'write_file' creates a NEW file and refuses a path that already " +
+                    "exists; 'apply_patch' creates, updates, deletes and renames several files in one " +
+                    "all-or-nothing call, so a one-line fix costs one line instead of a whole rewritten file - " +
+                    "and the host places the bytes from anchors it either finds or refuses, rather than the " +
+                    "model retyping a file it half-remembers. The working directory PERSISTS for the whole " +
+                    "session and is shared with any skill scripts, so one step's output is the next step's " +
+                    "input, and cd and exported variables survive from call to call (PATH does not, so an " +
+                    "activated virtualenv does not stay activated - installed packages are already on the " +
+                    "path); the directory is released when the CLI exits. " +
+                    "Separate from --skills-allow-exec on purpose: that runs a script already " +
                     "on disk, this runs commands written during the request. Needs a real sandbox (macOS " +
                     "sandbox-exec, Linux bwrap 0.12.0 or newer); without one the tool refuses rather than running unconfined - " +
                     "see --code-exec-unconfined. Commands cannot reach the network by default; " +
@@ -268,8 +272,9 @@ namespace TensorSharp.Cli
             ("Multimodal input (vision / audio / video models)", new[]
             {
                 new OptionHelp("--image <file>",
-                    "Image input for a vision model (PNG/JPEG/...). Repeatable: for Qwen-Image-2.1 editing each " +
-                    "extra --image adds a reference picture the prompt can refer to as \"Picture 1\", \"Picture 2\", ... " +
+                    "Image input for a vision model (PNG/JPEG/...). Repeatable: for Qwen-Image-2.1 editing every " +
+                    "--image is a reference picture, handed to the text encoder in command-line order and tagged " +
+                    "<image1>, <image2>, ... ahead of the prompt, so the prompt can name a picture by its tag. " +
                     "Default: none.",
                     "--image photo.jpg"),
                 new OptionHelp("--audio <file>",
@@ -278,12 +283,19 @@ namespace TensorSharp.Cli
                 new OptionHelp("--video <file>",
                     "Video input: frames are extracted and fed to the vision encoder. Default: none.",
                     "--video clip.mp4"),
-                new OptionHelp("--mmproj <path>",
+                new OptionHelp("--mmproj <path|none>",
                     "Multimodal projector (vision/audio encoder) that pairs with the model: an mmproj GGUF, or " +
                     "- for the Gemma 4 family - a HuggingFace .safetensors shard holding the vision tower, for " +
-                    "checkpoints published without an mmproj (diffusiongemma-26B-A4B-it). Default: " +
-                    "auto-detected next to the model for known architectures (Gemma 4, Qwen 3.5, Mistral 3, " +
-                    "Nemotron); pass it explicitly for anything else.",
+                    "checkpoints published without an mmproj (diffusiongemma-26B-A4B-it); a shard is never " +
+                    "auto-detected, so name it here. 'none' loads no projector and skips the lookup below. " +
+                    "Default: when --image, --audio or --video is given, looked up next to the model by the " +
+                    "architecture's own file names - Gemma 4: gemma-4-mmproj-F16.gguf; Qwen 3.5 family: " +
+                    "Qwen3.5-mmproj-F16.gguf, or for Bonsai2 Ternary-Bonsai-2-27B-mmproj-BF16.gguf or " +
+                    "Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf; Muse-Glimmer: *mmproj*Muse*Glimmer*.gguf; " +
+                    "GLM-5.x and Qwen 3.8 Flash Next: " +
+                    "*mmproj*.gguf; Mistral 3: mistral3-mmproj.gguf or *mmproj*istral*.gguf; Nemotron-H: " +
+                    "*Nemotron*mmproj*.gguf or *mmproj*Nemotron*.gguf; DeepSeek V4.1: deepseek41.vision.gguf. " +
+                    "Pass it explicitly for anything else.",
                     "--mmproj mmproj-gemma-4-E4B-it-Q8_0.gguf"),
             }),
             ("Compute backend and GPUs", new[]
@@ -348,10 +360,11 @@ namespace TensorSharp.Cli
                     "Multiplicative penalty on recently generated tokens; 1.0 = none, > 1.0 discourages " +
                     "repetition. Typical range: 1.0-1.5. Default: 1.0.",
                     "--repeat-penalty 1.1"),
-                new OptionHelp("--penalty-last-n <N>",
+                new OptionHelp("--repeat-last-n <N>",
                     "How many of the most recent tokens the repeat/presence/frequency penalties consider; " +
-                    "0 disables history penalties, -1 uses the whole history. Default: 64.",
-                    "--penalty-last-n 128"),
+                    "0 disables history penalties, -1 uses the whole history. Spelled as on the server and as " +
+                    "the request field repeat_last_n, so one config key drives both hosts. Default: 64.",
+                    "--repeat-last-n 128"),
                 new OptionHelp("--presence-penalty <f>",
                     "Additive penalty on any token that has already appeared; 0 disables. Typical range: 0.0-2.0. " +
                     "Default: 0.",
@@ -374,23 +387,31 @@ namespace TensorSharp.Cli
                     "Enable/disable speculative decoding: a drafter proposes the next few tokens and the trunk " +
                     "verifies them in ONE batched forward. Every emitted token still comes from a trunk row, so " +
                     "this is a speed path only - the output is what plain decoding would have produced. Needed " +
-                    "only for a drafter EMBEDDED in the checkpoint (GLM-5.2 / Qwen 3.6 NextN): it must be passed " +
-                    "BEFORE the model loads because it is what tells glm-dsa to page its ~3 GiB NextN layer into " +
-                    "VRAM (which also leaves less room for the context), so it stays an explicit choice. A " +
-                    "drafter named on --draft-model engages by itself. Engages on --input, --input-jsonl, " +
-                    "--multi-turn-jsonl and --interactive. Not available under --tp N>1 on a checkpoint whose " +
-                    "draft block borrows the trunk's LM head, which includes GLM-5.2. Default: off; env TS_SPEC " +
+                    "for a drafter EMBEDDED in the checkpoint (the NextN head of Qwen 3.6, Qwen 3.8 27B, GLM-5.2 " +
+                    "and GLM-5.3) and for --spec-type ngram: it must be passed BEFORE the model loads because it " +
+                    "is what tells glm-dsa to page its ~3 GiB NextN layer into VRAM (which also leaves less room " +
+                    "for the context), so it stays an explicit choice. A drafter named on --draft-model engages " +
+                    "by itself. Engages on --input, --input-jsonl, --multi-turn-jsonl and --interactive. Not " +
+                    "available under --tp N>1 on a checkpoint whose draft block borrows the trunk's LM head, " +
+                    "which includes GLM-5.2 and GLM-5.3. Default: off; env TS_SPEC " +
                     "(glm-dsa also honours TS_GLM_MTP=1/0, which overrides it).",
                     "--model GLM-5.2-UD-IQ2_XXS-00001-of-00006.gguf --backend ggml_cuda --spec --chat"),
                 new OptionHelp("--spec-type <name>",
-                    "Which speculation ALGORITHM to draft with. 'auto' (default) uses whatever drafter the " +
-                    "checkpoint carries: a per-token NextN/MTP head (GLM-5.2, Qwen 3.6, Gemma 4's separate " +
-                    "assistant GGUF) or a block drafter (DeepSeek V4 DSpark, DFlash / DFlash2 on Muse-Glimmer and Qwen 3.8). " +
+                    "Which speculation ALGORITHM to draft with. It only chooses the algorithm - it does not turn " +
+                    "speculation on, so pair it with --spec. 'auto' (default) uses whatever drafter the " +
+                    "checkpoint carries: a per-token NextN/MTP head (embedded in Qwen 3.6, Qwen 3.8 27B, GLM-5.2 " +
+                    "and GLM-5.3; Gemma 4's separate assistant GGUF; Qwen 3.8 Flash Next's shared MTP GGUF) or a " +
+                    "block drafter (DeepSeek V4 DSpark, DFlash / DFlash2 on Muse-Glimmer and Qwen 3.8). " +
                     "'draft-head' and 'block' pin one of those explicitly. 'ngram' needs NO trained weights at " +
                     "all - it drafts by finding where the last few tokens occurred earlier in the context and " +
-                    "proposing what followed, so it works on every model and is strong on summarizing, editing, " +
-                    "translating, repetitive structured output and agentic loops, where the answer quotes the " +
-                    "prompt. Env: TS_SPEC_TYPE.",
+                    "proposing what followed, so it is strong on summarizing, editing, translating, repetitive " +
+                    "structured output and agentic loops, where the answer quotes the prompt. It still needs a " +
+                    "model that can verify a draft window in one pass: the Qwen 3.5 family, Gemma 4, GLM-5.x " +
+                    "and Qwen 3.8 Flash Next take it without a drafter (Gemma 4 on the ggml_* and cuda " +
+                    "backends, Qwen 3.8 Flash Next on ggml_* only); DeepSeek V4 / V4.1 and Muse-Glimmer only " +
+                    "with their drafter loaded; GPT-OSS, Mistral 3, Qwen 3 / Qwen 2 (Bonsai 8B included) and " +
+                    "Hunyuan Dense have no speculative path, and Nemotron-H refuses every speculator - those " +
+                    "decode without speculation. Env: TS_SPEC_TYPE.",
                     "--spec --spec-type ngram --spec-draft 8"),
                 new OptionHelp("--spec-draft <N>",
                     "Maximum tokens drafted per speculative step; a block drafter additionally clamps it to its " +
@@ -407,12 +428,16 @@ namespace TensorSharp.Cli
                     "--spec --spec-draft 4 --spec-pmin 0.55"),
                 new OptionHelp("--draft-model <path>",
                     "A drafter that ships as its own GGUF, whatever its kind: DeepSeek V4's DSpark support " +
-                    "module, the DFlash / DFlash2 drafters for Muse-Glimmer and Qwen 3.8, or Gemma 4's " +
-                    "per-token assistant head (gemma4-assistant). The file's own general.architecture decides " +
+                    "module, the DFlash / DFlash2 drafters for Muse-Glimmer and Qwen 3.8, Gemma 4's " +
+                    "per-token assistant head (gemma4-assistant), or Qwen 3.8 Flash Next's shared MTP head " +
+                    "(ggml_* backends only). DeepSeek V4.1 also loads a deepseek41-dspark drafter on ggml_cuda " +
+                    "or ggml_cpu - EXPERIMENTAL: validated only on synthetic fixtures, no trained V4.1 drafter " +
+                    "has been measured. The file's own general.architecture decides " +
                     "how it loads (a block drafter is fused before the layer split, a per-token head attaches " +
                     "after) - never its file name, and never a second flag. Naming the file IS the request: " +
                     "speculation turns on with it, no --spec needed, and an explicit --no-spec vetoes it. " +
-                    "Qwen 3.6 and GLM-5.2 embed their drafter in the trunk and use --spec instead. Every " +
+                    "Qwen 3.6, Qwen 3.8 27B, GLM-5.2 and GLM-5.3 embed their NextN drafter in the trunk and use " +
+                    "--spec instead. Every " +
                     "emitted token is still drawn from a trunk row - with argmax under a greedy config, with " +
                     "your sampler otherwise - so output is unchanged either way. Default: none; env " +
                     "TS_SPEC_DRAFT_MODEL.",
@@ -422,7 +447,8 @@ namespace TensorSharp.Cli
             {
                 new OptionHelp("-i | --interactive | --chat",
                     "Start an interactive multi-turn chat session in the terminal with KV-cache reuse across " +
-                    "turns. In-session commands include /system, /model, /backend, /info, /clear, /exit. Honors " +
+                    "turns. In-session commands include /system, /model, /backend, /info, /reset, /exit; /help " +
+                    "lists them all. Honors " +
                     "--system, --think, --tools, and the sampling flags. Default: off (single-shot generation).",
                     "--model gemma-4-E4B-it-Q8_0.gguf --backend ggml_cuda --chat"),
             }),
@@ -449,20 +475,25 @@ namespace TensorSharp.Cli
                     "Keep the routed MoE expert weights of the first N layers in system RAM and multiply them on " +
                     "the CPU; attention, norms, the router and the shared expert stay on the accelerator. This is " +
                     "what makes a 35B-A3B MoE fit beside a long-context KV cache on a 12-16 GB card. Pass 'all' " +
-                    "for every layer. Default: 0 (everything on the accelerator), except DeepSeek V4 on the GPU " +
-                    "backends, which auto-offloads the fewest layers that fit the visible VRAM (TS_N_CPU_MOE env " +
-                    "var overrides).",
+                    "for every layer. Default: 0 (everything on the accelerator) on every architecture, DeepSeek V4 " +
+                    "included: a DeepSeek V4 load that does not fit the visible VRAM is refused - naming the " +
+                    "fewest layers that would fit, when offloading can make it fit - rather than offloaded on " +
+                    "its own (TS_N_CPU_MOE env var overrides).",
                     "--n-cpu-moe 32"),
                 new OptionHelp("--cpu-moe | -cmoe",
                     "Shorthand for --n-cpu-moe all: every routed expert stays in system RAM. Default: off " +
                     "(TS_CPU_MOE env var overrides).",
                     "--cpu-moe"),
                 new OptionHelp("--cpu-moe-threads <N>",
-                    "Worker threads for the host-side expert matmul. Default: one less than the CPU parallelism " +
-                    "this process can actually use (hardware threads clamped by the affinity mask and the cgroup " +
-                    "CPU quota), leaving a core for accelerator submission. Do not set this above the quota: " +
-                    "ggml's pool spins at its barriers, so oversubscription collapses throughput rather than " +
-                    "degrading it (TS_CPU_MOE_THREADS env var overrides).",
+                    "Worker threads for the host-side expert matmul. Default: sized from the CPUs this process " +
+                    "can actually use (hardware threads clamped by the affinity mask and the cgroup CPU quota) - " +
+                    "1 with 2 or fewer, all but one with 3 to 8, and half above that, capped at 64, leaving the " +
+                    "rest of the process (accelerator submission, the scheduler) room to run; a one-token decode " +
+                    "matmul gains nothing past a few dozen workers. DeepSeek V4 / V4.1 and GLM-5.x on their " +
+                    "native ggml executors instead use every usable CPU once --n-cpu-moe or --cpu-moe is on " +
+                    "(GLM-5.x also on a GPU-less run), because their offloaded layers read several times more " +
+                    "expert bytes per token. Do not set this above the usable " +
+                    "CPUs: extra workers only wait at the pool's barriers (TS_CPU_MOE_THREADS env var overrides).",
                     "--cpu-moe-threads 12"),
             }),
             ("KV cache", new[]
@@ -473,8 +504,8 @@ namespace TensorSharp.Cli
                     "overrides).",
                     "--kv-cache-dtype q8_0"),
                 new OptionHelp("--paged-kv | --no-paged-kv",
-                    "Configure the standalone paged KV store used by --paged-bench (aliases " +
-                    "--paged-kv-cache / --no-paged-kv-cache). Default: off. Normal generation uses the " +
+                    "Configure the standalone paged KV store used by --paged-bench. Default: off. Normal " +
+                    "generation uses the " +
                     "shared inference engine's Radix KV cache by default, independently of this flag.",
                     "--paged-kv"),
                 new OptionHelp("--paged-kv-block-size <N>",
@@ -720,8 +751,11 @@ namespace TensorSharp.Cli
             {
                 new OptionHelp("--config <path>",
                     "Read options from a JSON file whose keys are the same long option names listed here (with or " +
-                    "without the leading --). Anything also passed on the command line overrides the file; when " +
-                    "the flag is repeated, later files win over earlier ones. String/number values map to " +
+                    "without the leading --). A single-valued option passed on the command line replaces the " +
+                    "file's entry, and when the flag is repeated a later file's entry replaces an earlier one's; " +
+                    "the replaced entry is never resolved, so its download is skipped. Repeatable options " +
+                    "(--stop, --skills-dir, --skill, --lora, --lora-scale, --lora-config, --image and the --ref-* " +
+                    "inputs) add to the file's values instead. String/number values map to " +
                     "'--key value', true maps to the bare '--key' switch, and an array maps to a repeated flag " +
                     "(e.g. \"stop\": [..]). A \"variables\" object lets values share ${name} references; a file " +
                     "option may instead be an object { \"path\": \"...\", \"urls\": [ \"...\" ] } that " +
@@ -785,6 +819,94 @@ namespace TensorSharp.Cli
                     }
                 }
             }
+        }
+
+        /// <summary>Every documented long option by name (case-insensitive): its documented
+        /// spelling and whether a value follows it. Read off <see cref="Sections"/>, so the
+        /// usage page is the table: a <c>&lt;placeholder&gt;</c> after a flag means it takes one.</summary>
+        private static readonly Lazy<Dictionary<string, (string Flag, bool TakesValue)>> OptionShapes =
+            new(() =>
+            {
+                var shapes = new Dictionary<string, (string Flag, bool TakesValue)>(StringComparer.OrdinalIgnoreCase);
+                foreach (var (_, options) in Sections)
+                {
+                    foreach (var opt in options)
+                    {
+                        string[] tokens = opt.Flag.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                        for (int t = 0; t < tokens.Length; t++)
+                        {
+                            if (!tokens[t].StartsWith("--", StringComparison.Ordinal))
+                                continue;
+                            bool takesValue = t + 1 < tokens.Length
+                                && tokens[t + 1].StartsWith("<", StringComparison.Ordinal);
+                            shapes.TryAdd(tokens[t], (tokens[t], takesValue));
+                        }
+                    }
+                }
+                return shapes;
+            });
+
+        /// <summary>
+        /// Rewrite every documented option to the one spelling <c>Program.MainCore</c>'s switch
+        /// matches: the documented, lower-case name, with its value as the next token.
+        /// <c>--Repeat-Last-N=128</c> becomes <c>--repeat-last-n 128</c>, and a legacy name
+        /// both hosts read as another option becomes that option (<c>--wan-vae</c> is
+        /// <c>--video-vae</c>).
+        /// </summary>
+        /// <remarks>
+        /// The switch matches the exact lower-case spaced spelling and has no unknown-flag
+        /// trap, while the server, the shared option parsers and the <c>--config</c> override
+        /// accept <c>--flag=value</c> in any case. Without this the CLI dropped those spellings
+        /// in silence - and a <c>--config</c> entry the command line "overrode" that way was
+        /// dropped too, so neither value applied. A value is passed through untouched, even
+        /// one that starts with <c>--</c>. Tokens the page does not document are left alone,
+        /// as before. Two malformed spellings are refused rather than dropped: a switch given
+        /// a value (<c>--think=on</c>) and a value option at the end of the line with none.
+        /// </remarks>
+        /// <exception cref="ArgumentException">A switch carried a value, or a value option had none.</exception>
+        internal static string[] NormalizeOptionSpellings(string[] args)
+        {
+            if (args == null || args.Length == 0)
+                return args;
+
+            var shapes = OptionShapes.Value;
+            var result = new List<string>(args.Length + 4);
+            for (int i = 0; i < args.Length; i++)
+            {
+                string arg = args[i];
+                if (arg == null || arg.Length <= 2 || !arg.StartsWith("--", StringComparison.Ordinal))
+                {
+                    result.Add(arg);
+                    continue;
+                }
+
+                int equals = arg.IndexOf('=');
+                string name = equals >= 0 ? arg.Substring(0, equals) : arg;
+                if (!shapes.TryGetValue(ConfigFileArgs.CanonicalOptionSpelling(name), out var shape))
+                {
+                    result.Add(arg);
+                    continue;
+                }
+
+                result.Add(shape.Flag);
+                if (!shape.TakesValue)
+                {
+                    if (equals >= 0)
+                        throw new ArgumentException(
+                            $"Option '{shape.Flag}' is a switch and takes no value; remove '{arg.Substring(equals)}'.");
+                    continue;
+                }
+
+                if (equals >= 0)
+                {
+                    result.Add(arg.Substring(equals + 1));
+                    continue;
+                }
+                if (i + 1 >= args.Length)
+                    throw new ArgumentException($"Missing value for option '{shape.Flag}'.");
+                result.Add(args[++i]);
+            }
+            return result.ToArray();
         }
 
         public static void PrintUsage(TextWriter writer)

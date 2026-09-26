@@ -1447,11 +1447,11 @@ namespace TensorSharp.Models
                 // MLX path: keep K/V on device, run the sinks-aware decode
                 // attention via a custom Metal kernel. Avoids the per-layer
                 // device→host KV cache pull that AttentionDecodeWithSinks
-                // triggers via GetFloatPtr/GetHalfPointer. Only worth it
-                // for long context — the kernel's per-K-step barriers
-                // outweigh the cache download cost for short kvLen, where
-                // the host SIMD CPU path is faster. Threshold tunable via
-                // TS_MLX_SINKS_ATTN_MIN_KV_LEN (default 2048).
+                // triggers via GetFloatPtr/GetHalfPointer. Used at every
+                // kvLen by default: it measured faster than the host SIMD
+                // path even at short kvLen (see MlxSinksAttnMinKvLen).
+                // Threshold tunable via TS_MLX_SINKS_ATTN_MIN_KV_LEN
+                // (default 1).
                 bool attnOk = false;
                 if (_backend == BackendType.Cuda)
                 {

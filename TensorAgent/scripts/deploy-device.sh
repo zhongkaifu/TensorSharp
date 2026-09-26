@@ -8,9 +8,12 @@
 # is an error rather than a reason to deploy to an arbitrary phone.
 #
 # Env overrides:
-#   CONFIGURATION         Debug (default) | Release. Debug is the working device
-#                         configuration until the Release linker preserves the
-#                         engine's dynamically resolved GGML exports.
+#   CONFIGURATION         Debug (default) | Release. Both carry the engine on a
+#                         device: Release keeps the dynamically resolved GGML
+#                         exports through the ReferenceNativeSymbol list in
+#                         TensorAgent.Maui/GgmlExportedSymbols.targets, and this
+#                         script refuses to install an executable that lost them
+#                         (it looks for _TSGgml_IsMetalAvailable).
 #   DEVICE_ID             CoreDevice identifier, hardware UDID, or exact name
 #   CODESIGN_KEY          Apple Development identity (auto-selected if unique)
 #   CODESIGN_PROVISION    development profile name or UUID for the containing app

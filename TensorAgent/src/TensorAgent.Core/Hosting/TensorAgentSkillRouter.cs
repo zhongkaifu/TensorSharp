@@ -16,7 +16,7 @@ namespace TensorAgent.Core.Hosting;
 
 /// <summary>
 /// Routes the one compound workflow for which discovery alone proved insufficient:
-/// research on the web followed by a real PowerPoint deliverable.
+/// research on the web followed by a real PowerPoint deliverable, on any subject.
 ///
 /// <para>
 /// This is deliberately not a general natural-language classifier. It needs one cue
@@ -24,6 +24,20 @@ namespace TensorAgent.Core.Hosting;
 /// alone, and only returns ids the installed registry actually contains. The normal
 /// skill planner remains responsible for permissions, tool declarations and loading
 /// the full instructions progressively.
+/// </para>
+/// <para>
+/// Nothing here depends on what the deck is about. The research query is the user's
+/// own words, and the evidence contract checks the deck's structure and that it cites
+/// this turn's sources, never that it names particular terms.
+/// </para>
+/// <para>
+/// Precision comes first, because a routed turn is committed to a network-only
+/// workflow (refused outright while network access is off) and a missed one only falls
+/// back to ordinary discovery. So a research word must be asked for where it stands
+/// ("Search X", "can you research", "帮我搜索"), not merely appear ("our research
+/// results", "搜索引擎"); a format name must be a word of its own ("slides", never the
+/// end of "landslides"); and it must be what the verb makes ("create a presentation",
+/// not "write a summary of the clinical presentation").
 /// </para>
 /// </summary>
 internal static class TensorAgentSkillRouter
@@ -62,11 +76,52 @@ internal static class TensorAgentSkillRouter
         + "until a real .pptx exists in the shared workspace and is returned as a downloadable artifact. If the "
         + "spec or run fails, use read_file/apply_patch on only the broken region and rerun; never regenerate it.";
 
+    /// <summary>
+    /// Asking for research in so many words. A cue counts only where it is requested - at
+    /// the start of a clause, after a connective or a lead-in such as "you" or "帮我" - so
+    /// "a presentation about our research" or "关于搜索引擎优化的演示文稿" is a subject, not
+    /// a request to search.
+    /// </summary>
     private static readonly string[] ResearchPhrases =
     {
-        "search", "web search", "research", "look up", "find information", "latest information",
-        "current information", "搜索", "检索", "查找", "查一下", "调研", "研究一下",
+        "search", "web search", "research", "look up", "find information",
+        "搜索", "检索", "查找", "查一下", "调研", "研究一下",
     };
+
+    /// <summary>
+    /// Asking for fresh information by what is wanted rather than by a verb. Specific enough
+    /// to count wherever it appears.
+    /// </summary>
+    private static readonly string[] FreshInformationPhrases =
+    {
+        "latest information", "current information",
+    };
+
+    /// <summary>
+    /// Words after which a research verb is being asked for rather than named: "can you
+    /// search", "I want you to research", "help me look up", "帮我搜索", "先调研".
+    /// </summary>
+    private static readonly string[] ResearchLeadIns =
+    {
+        "you", "to", "me", "us", "first", "pls", "let's", "lets", "kindly",
+        "帮我", "帮忙", "给我", "先", "你", "想", "要", "去",
+    };
+
+    /// <summary>
+    /// Words that, between a creation verb and the format, make the format the subject of
+    /// something else: "write a summary of the clinical presentation" does not ask for a
+    /// presentation.
+    /// </summary>
+    private static readonly string[] DeliverableGapBreakers =
+    {
+        "of", "about", "on", "for", "from", "with", "in", "into", "by", "regarding", "through", "that", "which",
+    };
+
+    /// <summary>
+    /// The most words an English request may put between its verb and the format ("make me
+    /// a Rust vs Go presentation" has five).
+    /// </summary>
+    private const int MaxDeliverableGapWords = 6;
 
     private static readonly string[] PowerPointPhrases =
     {
@@ -84,6 +139,56 @@ internal static class TensorAgentSkillRouter
         "and", "then", "please", "also", "next", "finally",
         "并", "并且", "然后", "请", "再", "同时", "最后",
     };
+
+    /// <summary>
+    /// The connectives that can stand before another one ("and then create", "然后再生成").
+    /// Only these are stripped as a second word before the verb, so "release next and
+    /// create" keeps its "next" and "企业合并然后生成" keeps its 合并. Single-character CJK
+    /// connectives are left out on purpose: they end ordinary words (合并, 申请).
+    /// </summary>
+    private static readonly string[] Coordinators =
+    {
+        "and", "then", "并且", "然后", "同时",
+    };
+
+    /// <summary>At most this many URLs the user wrote are handed to research.py to read.</summary>
+    private const int MaxResearchUrls = 3;
+
+    /// <summary>A URL longer than this is not passed on (the artifact contract caps each argument).</summary>
+    private const int MaxResearchUrlLength = 2048;
+
+    /// <summary>
+    /// Words that only introduce the deck ("make me a presentation", "生成一份演示文稿")
+    /// and would be left dangling in the research query where the deck request is cut.
+    /// </summary>
+    private static readonly string[] DeliverableDeterminers =
+    {
+        "a", "an", "the", "me", "us", "一份", "一个",
+    };
+
+    /// <summary>
+    /// Longest query the route hands research.py. It is a search query, not a document:
+    /// the bound keeps a pasted essay from becoming a command-line argument (attachments
+    /// are rejected anyway) and stays far inside the 4,096 characters the artifact
+    /// contract allows each routed argument.
+    /// </summary>
+    internal const int MaxResearchQueryLength = 384;
+
+    private static readonly char[] ClauseTrim = { ' ', '\t', '\r', '\n', ',', '，', ';', '；' };
+
+    /// <summary>
+    /// Also trims the sentence punctuation left where the deck request was cut, and a
+    /// leading '-': research.py reads its question with argparse, which takes a one-word
+    /// argument that starts with '-' for an unknown option and fails the run.
+    /// </summary>
+    private static readonly char[] QueryTrim =
+    {
+        ' ', '\t', '\r', '\n', ',', '，', ';', '；', '.', '。', '!', '！', '?', '？', ':', '：', '-',
+    };
+
+    /// <summary>Where the requested deck is named: its creation verb and its format.</summary>
+    private readonly record struct PowerPointDeliverable(
+        int ActionStart, int ActionLength, int FormatStart, int FormatLength);
 
     /// <summary>
     /// Return a route only for an unselected, compound latest turn. Null means the Web
@@ -107,10 +212,9 @@ internal static class TensorAgentSkillRouter
         string? latest = latestMessage?.Content;
         if (string.IsNullOrWhiteSpace(latest)
             || HasAttachments(latestMessage)
-            || !ContainsAny(latest, ResearchPhrases)
-            || !ContainsAny(latest, PowerPointPhrases)
-            || !HasPowerPointDeliverableIntent(latest)
-            || !IsAppleM5M6Comparison(latest))
+            || !HasResearchRequest(latest)
+            || !ContainsCue(latest, PowerPointPhrases, allowPlural: true)
+            || !TryFindPowerPointDeliverable(latest, out PowerPointDeliverable deliverable))
         {
             return null;
         }
@@ -140,10 +244,9 @@ internal static class TensorAgentSkillRouter
                     new WebUiSkillRunRequirement(
                         ResearchSkill,
                         "scripts/research.py",
-                        DefaultArguments: new[]
-                        {
-                            ResearchQuery(latest), "--pages", "3", "--out", "notes.md",
-                        },
+                        DefaultArguments: ResearchArguments(latest, deliverable)
+                            .Concat(new[] { "--pages", "3", "--out", "notes.md" })
+                            .ToArray(),
                         EnforceArguments: true),
                     new WebUiSkillRunRequirement(
                         DocumentsSkill,
@@ -157,7 +260,6 @@ internal static class TensorAgentSkillRouter
                         RequiredInputPath: "pptx_spec.json"),
                 },
                 MinimumSlides: 4,
-                RequiredVisibleTerms: new[] { "M5", "M6" },
                 RequireVisibleHttpUrl: true,
                 CitationEvidencePath: "notes.md"),
             RequiresNetwork: true);
@@ -173,40 +275,142 @@ internal static class TensorAgentSkillRouter
                 skill.RootDirectory, relativePath, out _, out _);
     }
 
-    private static string ResearchQuery(string latestUserText)
+    /// <summary>
+    /// research.py's positional arguments: the user's own words with only the request for
+    /// the deck cut out (its creation verb and its format name), then each URL the user
+    /// wrote as an argument of its own. Nothing is added, so the route never steers the
+    /// search toward a subject of its own.
+    /// </summary>
+    /// <remarks>
+    /// The words before that request are the research clause in the usual phrasing
+    /// ("Search X and compare it with Y, then create a PowerPoint report"), but the
+    /// subject can equally sit inside or after it ("Search the web and make a
+    /// presentation about X", "搜索最新资料，然后生成一份关于X的演示文稿"). This route
+    /// enforces its arguments, so a model cannot repair a query that lost the subject;
+    /// keeping the deliverable's other words costs a little noise at most. Cutting the
+    /// format name keeps "PowerPoint" from pulling in pages about making decks. A URL is
+    /// separated out because research.py reads every argument that starts with http(s)://
+    /// as a page to read: a question that began with one used to be taken whole, spaces
+    /// and all, for an address.
+    /// </remarks>
+    private static IEnumerable<string> ResearchArguments(string latestUserText, PowerPointDeliverable deliverable)
     {
-        // Search indexes rank the stable English product terms well, while the bounded
-        // suffix retains any region, benchmark, security, or other focus the user added.
-        // Keeping the suffix bounded also prevents an attachment-sized prompt from
-        // becoming a command-line argument (attachments are rejected above anyway).
-        const string core = "Apple M6 chip specifications release information compared with Apple M5 chip";
-        int deliverableAction = FindPowerPointDeliverableAction(latestUserText);
-        string researchClause = deliverableAction > 0
-            ? latestUserText.Substring(0, deliverableAction)
-            : latestUserText;
-        string focus = string.Join(" ", researchClause
-            .Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries))
-            .Trim(' ', '\t', '\r', '\n', ',', '，', ';', '；');
-        foreach (string connective in CreationConnectives
-                     .OrderByDescending(value => value.Length))
+        int actionEnd = deliverable.ActionStart + deliverable.ActionLength;
+        int formatEnd = deliverable.FormatStart + deliverable.FormatLength;
+        string researchClause = ResearchClause(latestUserText.Substring(0, deliverable.ActionStart));
+        string deliverableWords = WithoutLeadingDeterminers(Words(
+            latestUserText.Substring(actionEnd, deliverable.FormatStart - actionEnd)
+            + " " + latestUserText.Substring(formatEnd)));
+        string words = researchClause + " " + deliverableWords;
+        if (researchClause.Length == 0 && deliverableWords.Length == 0)
+            words = latestUserText;
+
+        var urls = new List<string>();
+        var question = new List<string>();
+        foreach (string word in words.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries))
         {
-            if (focus.EndsWith(connective, StringComparison.OrdinalIgnoreCase))
+            string url = word.TrimEnd('.', ',', ';', ':', '!', '?', ')', ']', '>', '"', '\'', '。', '，', '；', '！', '？');
+            if (url.StartsWith("http://", StringComparison.OrdinalIgnoreCase)
+                || url.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
             {
-                focus = focus.Substring(0, focus.Length - connective.Length)
-                    .Trim(' ', '\t', '\r', '\n', ',', '，', ';', '；');
+                if (url.Length <= MaxResearchUrlLength && urls.Count < MaxResearchUrls && !urls.Contains(url))
+                    urls.Add(url);
+                continue;
+            }
+            question.Add(word);
+        }
+
+        string query = string.Join(" ", question).Trim(QueryTrim);
+        if (query.Length > MaxResearchQueryLength)
+        {
+            // Never split a surrogate pair: half of one cannot reach argv intact.
+            int end = char.IsHighSurrogate(query[MaxResearchQueryLength - 1])
+                ? MaxResearchQueryLength - 1
+                : MaxResearchQueryLength;
+            query = query.Substring(0, end).TrimEnd(QueryTrim);
+        }
+
+        if (query.Length > 0)
+            yield return query;
+        foreach (string url in urls)
+            yield return url;
+    }
+
+    /// <summary>
+    /// The words before the deck request, without the connective that leads into it
+    /// ("Search X and then", "搜索X，然后"). Only the run directly before the verb goes: one
+    /// connective, and one coordinator before that, never across clause punctuation - so
+    /// "搜索美国签证申请，生成" keeps 申请 and "release next, and create" keeps "next".
+    /// </summary>
+    private static string ResearchClause(string prefix)
+    {
+        string clause = prefix.TrimEnd();
+        if (TryFindTrailingConnective(clause, CreationConnectives, out int start))
+        {
+            clause = clause.Substring(0, start).TrimEnd();
+            if (TryFindTrailingConnective(clause, Coordinators, out start))
+                clause = clause.Substring(0, start).TrimEnd();
+        }
+        return Words(clause);
+    }
+
+    private static string Words(string text) =>
+        string.Join(" ", text.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries))
+            .Trim(ClauseTrim);
+
+    /// <summary>"me a Rust vs Go" describes the deck as "Rust vs Go".</summary>
+    private static string WithoutLeadingDeterminers(string words)
+    {
+        bool stripped;
+        do
+        {
+            stripped = false;
+            foreach (string determiner in DeliverableDeterminers)
+            {
+                // An English determiner must be a lower-case word of its own: "an" does
+                // not start "analysis", "a" does not start "A/B", and "US" is a subject.
+                // A CJK one needs no boundary.
+                if (!words.StartsWith(determiner, StringComparison.Ordinal)
+                    || (char.IsAsciiLetter(determiner[0])
+                        && words.Length > determiner.Length
+                        && !char.IsWhiteSpace(words[determiner.Length])))
+                {
+                    continue;
+                }
+
+                words = words.Substring(determiner.Length).Trim(ClauseTrim);
+                stripped = true;
                 break;
             }
         }
-        if (focus.Length > 384)
-            focus = focus.Substring(0, 384);
-        return string.IsNullOrEmpty(focus) ? core : core + ". User-requested focus: " + focus;
+        while (stripped);
+
+        return words;
     }
 
-    private static bool IsAppleM5M6Comparison(string text) =>
-        (text.Contains("apple", StringComparison.OrdinalIgnoreCase)
-         || text.Contains("苹果", StringComparison.Ordinal))
-        && ContainsChipToken(text, "M5")
-        && ContainsChipToken(text, "M6");
+    /// <summary>
+    /// One of <paramref name="connectives"/> that ends <paramref name="text"/> as a word of
+    /// its own: "and" ends "Search X and", but not "Search Poland". CJK connectives need no
+    /// word boundary.
+    /// </summary>
+    private static bool TryFindTrailingConnective(string text, string[] connectives, out int start)
+    {
+        foreach (string connective in connectives)
+        {
+            if (!text.EndsWith(connective, StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            start = text.Length - connective.Length;
+            if (start == 0 || !char.IsAsciiLetterOrDigit(text[start - 1])
+                || !char.IsAsciiLetterOrDigit(connective[0]))
+            {
+                return true;
+            }
+        }
+
+        start = -1;
+        return false;
+    }
 
     private static ChatMessage? LatestUserMessage(IReadOnlyList<ChatMessage> messages)
     {
@@ -230,29 +434,58 @@ internal static class TensorAgentSkillRouter
         || message?.ImagePaths is { Count: > 0 }
         || message?.AudioPaths is { Count: > 0 };
 
-    private static bool ContainsChipToken(string text, string token)
+    /// <summary>
+    /// Where <paramref name="phrase"/> occurs in [<paramref name="start"/>, <paramref name="end"/>)
+    /// as a word of its own, and how long the match is. An ASCII end of a phrase needs a
+    /// word boundary there ("slides" is not in "landslides", "presentation" not in
+    /// "representation", "search" not in "research"); a CJK end needs none. With
+    /// <paramref name="allowPlural"/> a trailing "s" belongs to the match ("presentations").
+    /// </summary>
+    private static bool TryFindCue(
+        string text, string phrase, int start, int end, bool allowPlural, out int index, out int length)
     {
-        int searchFrom = 0;
-        while (searchFrom < text.Length)
+        int from = start;
+        while (from < end)
         {
-            int index = text.IndexOf(token, searchFrom, StringComparison.OrdinalIgnoreCase);
-            if (index < 0)
-                return false;
-            int end = index + token.Length;
-            bool leftBoundary = index == 0 || !char.IsAsciiLetterOrDigit(text[index - 1]);
-            bool rightBoundary = end == text.Length || !char.IsAsciiLetterOrDigit(text[end]);
+            int found = text.IndexOf(phrase, from, end - from, StringComparison.OrdinalIgnoreCase);
+            if (found < 0)
+                break;
+
+            int after = found + phrase.Length;
+            bool leftBoundary = !char.IsAsciiLetterOrDigit(phrase[0])
+                || found == 0
+                || !char.IsAsciiLetterOrDigit(text[found - 1]);
+            int matched = phrase.Length;
+            bool rightBoundary = !char.IsAsciiLetterOrDigit(phrase[^1])
+                || after >= text.Length
+                || !char.IsAsciiLetterOrDigit(text[after]);
+            if (!rightBoundary && allowPlural
+                && (text[after] is 's' or 'S')
+                && (after + 1 >= text.Length || !char.IsAsciiLetterOrDigit(text[after + 1])))
+            {
+                rightBoundary = true;
+                matched++;
+            }
+
             if (leftBoundary && rightBoundary)
+            {
+                index = found;
+                length = matched;
                 return true;
-            searchFrom = end;
+            }
+            from = found + 1;
         }
+
+        index = -1;
+        length = 0;
         return false;
     }
 
-    private static bool ContainsAny(string text, IEnumerable<string> phrases)
+    private static bool ContainsCue(string text, IEnumerable<string> phrases, bool allowPlural)
     {
         foreach (string phrase in phrases)
         {
-            if (text.Contains(phrase, StringComparison.OrdinalIgnoreCase))
+            if (TryFindCue(text, phrase, 0, text.Length, allowPlural, out _, out _))
                 return true;
         }
 
@@ -260,66 +493,153 @@ internal static class TensorAgentSkillRouter
     }
 
     /// <summary>
+    /// The turn asks for research: a research verb where it is requested, or a phrase that
+    /// asks for fresh information.
+    /// </summary>
+    private static bool HasResearchRequest(string text)
+    {
+        if (ContainsCue(text, FreshInformationPhrases, allowPlural: false))
+            return true;
+
+        foreach (string phrase in ResearchPhrases)
+        {
+            int from = 0;
+            while (from < text.Length
+                   && TryFindCue(text, phrase, from, text.Length, allowPlural: false, out int index, out int length))
+            {
+                if (LooksLikeRequestedResearch(text, index))
+                    return true;
+                from = index + length;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// A research verb opens a clause (the start of the turn, a bullet, punctuation, a line
+    /// break, a connective) or follows a lead-in that asks for it ("can you search", "帮我
+    /// 搜索"). Anywhere else it names a subject.
+    /// </summary>
+    private static bool LooksLikeRequestedResearch(string text, int cue)
+    {
+        string prefix = text.Substring(0, cue);
+        string written = prefix.TrimEnd();
+        // Nothing but bullets and punctuation before it: "- Search", "1) Research".
+        if (!written.Any(char.IsLetter))
+            return true;
+        if (prefix.IndexOf('\n', written.Length) >= 0)
+            return true;
+
+        char previous = written[^1];
+        if (previous is ',' or '，' or ';' or '；' or '.' or '。' or '!' or '！' or '?' or '？' or ':' or '：' or '、'
+            or '-' or '–' or '—')
+            return true;
+
+        return TryFindTrailingConnective(written, CreationConnectives, out _)
+            || TryFindTrailingConnective(written, ResearchLeadIns, out _);
+    }
+
+    /// <summary>
     /// Require the creation verb to look like a requested action and to be followed
     /// closely by the presentation format. Three independent substrings are too broad:
     /// “Research why tools generate PowerPoint presentations” discusses generation but
-    /// does not ask this host to create a file.
+    /// does not ask this host to create a file. The earliest such request wins.
     /// </summary>
-    private static bool HasPowerPointDeliverableIntent(string text)
-        => FindPowerPointDeliverableAction(text) >= 0;
-
-    private static int FindPowerPointDeliverableAction(string text)
+    private static bool TryFindPowerPointDeliverable(string text, out PowerPointDeliverable deliverable)
     {
-        int earliest = -1;
+        deliverable = default;
+        bool found = false;
         foreach (string creation in CreationPhrases)
         {
             int searchFrom = 0;
-            while (searchFrom < text.Length)
+            while (searchFrom < text.Length
+                   && TryFindCue(text, creation, searchFrom, text.Length, allowPlural: false, out int action, out _))
             {
-                int action = text.IndexOf(creation, searchFrom, StringComparison.OrdinalIgnoreCase);
-                if (action < 0)
-                    break;
-
                 int afterAction = action + creation.Length;
                 int nearbyEnd = Math.Min(text.Length, afterAction + 96);
-                string nearby = text.Substring(afterAction, nearbyEnd - afterAction);
-                if (LooksLikeRequestedAction(text, action)
-                    && ContainsAny(nearby, PowerPointPhrases)
-                    && (earliest < 0 || action < earliest))
+                if ((!found || action < deliverable.ActionStart)
+                    && LooksLikeRequestedAction(text, action)
+                    && TryFindEarliestPhrase(
+                        text, afterAction, nearbyEnd, PowerPointPhrases,
+                        out int format, out int formatLength)
+                    && FormatIsTheObject(text, creation, afterAction, format))
                 {
-                    earliest = action;
+                    deliverable = new PowerPointDeliverable(action, creation.Length, format, formatLength);
+                    found = true;
                 }
 
                 searchFrom = afterAction;
             }
         }
 
-        return earliest;
+        return found;
+    }
+
+    /// <summary>
+    /// The format is what the verb makes, not the subject of something else it makes. In
+    /// English the words between them are few and none of them is a preposition ("create a
+    /// short PowerPoint", but not "write a summary of the clinical presentation"). Chinese
+    /// puts the whole subject there ("生成一份关于X的演示文稿"), so a CJK verb's gap is free.
+    /// </summary>
+    private static bool FormatIsTheObject(string text, string creation, int afterAction, int format)
+    {
+        if (!char.IsAsciiLetter(creation[0]))
+            return true;
+
+        string[] gap = text.Substring(afterAction, format - afterAction)
+            .Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
+        if (gap.Length > MaxDeliverableGapWords)
+            return false;
+        foreach (string word in gap)
+        {
+            string bare = word.Trim(',', '.', ';', ':', '"', '\'', '(', ')');
+            foreach (string breaker in DeliverableGapBreakers)
+            {
+                if (string.Equals(bare, breaker, StringComparison.OrdinalIgnoreCase))
+                    return false;
+            }
+        }
+        return true;
+    }
+
+    /// <summary>The first phrase wholly inside [start, end) as a word of its own (a plural
+    /// "s" included); the longest one on a tie.</summary>
+    private static bool TryFindEarliestPhrase(
+        string text, int start, int end, IEnumerable<string> phrases, out int index, out int length)
+    {
+        index = -1;
+        length = 0;
+        foreach (string phrase in phrases)
+        {
+            if (TryFindCue(text, phrase, start, end, allowPlural: true, out int found, out int matched)
+                && (index < 0 || found < index || (found == index && matched > length)))
+            {
+                index = found;
+                length = matched;
+            }
+        }
+
+        return index >= 0;
     }
 
     private static bool LooksLikeRequestedAction(string text, int action)
     {
-        if (action == 0 || string.IsNullOrWhiteSpace(text.Substring(0, action)))
+        string prefix = text.Substring(0, action);
+        string written = prefix.TrimEnd();
+        if (written.Length == 0)
             return true;
 
-        char previous = text[action - 1];
-        if (previous is ',' or '，' or ';' or '；' or '.' or '!' or '！' or '?' or '？' or ':' or '\n')
+        // Judge the last character the user wrote, not the space typed after it:
+        // "Search X, create a deck" asks as plainly as "Search X,create a deck". A line
+        // break before the verb starts a new request as well.
+        if (prefix.IndexOf('\n', written.Length) >= 0)
             return true;
 
-        string prefix = text.Substring(0, action).TrimEnd();
-        foreach (string connective in CreationConnectives)
-        {
-            if (!prefix.EndsWith(connective, StringComparison.OrdinalIgnoreCase))
-                continue;
+        char previous = written[^1];
+        if (previous is ',' or '，' or ';' or '；' or '.' or '。' or '!' or '！' or '?' or '？' or ':' or '：')
+            return true;
 
-            int start = prefix.Length - connective.Length;
-            if (start == 0 || !char.IsAsciiLetterOrDigit(prefix[start - 1])
-                || !char.IsAsciiLetterOrDigit(connective[0]))
-            {
-                return true;
-            }
-        }
-
-        return false;
+        return TryFindTrailingConnective(written, CreationConnectives, out _);
     }
 }

@@ -28,10 +28,12 @@ Q4 文件会在加载阶段直接失败，而不会退回到某个相近的系�
 ## 运行
 
 ```bash
+# --input 接收文件路径，提示词从该文件读取
+echo "Translate to French: the harbour was quiet before dawn." > prompt.txt
 dotnet run --project TensorSharp.Cli -- \
     --model models/Hy-MT2-1.8B-Q4_K_M.gguf \
     --backend ggml_metal \
-    --input "Translate to French: the harbour was quiet before dawn."
+    --input prompt.txt
 ```
 
 服务端使用同样的模型参数：
@@ -107,7 +109,7 @@ base。启动日志会打印生效的 base、scale 和 RoPE 维度数，走了�
   设置 `TS_HUNYUAN_BATCHED=0`（或使用块量化 KV cache）时，并发请求通过换入换出
   快照轮流使用同一个 cache；结果正确，但按顺序串行服务。
 
-两条路径都支持前缀复用。批处理路径写入的块在模型的分页存储中被复用；快照路径捕获
+两条路径都支持前缀复用，走 Radix 前缀缓存（默认模式），Hunyuan Dense 以分页家族的身份参与其中。批处理路径写入的块在模型的分页存储中被复用；快照路径捕获
 的块被恢复到线性 cache（见 `KvBlock.HoldsModelPagedKv` / `HoldsSnapshotBytes`）。
 
 ## 对话模板
@@ -129,7 +131,7 @@ Agent Skills 在这里退回到内联指令，与所有没有工具解析器的�
 ## 当前限制
 
 - 仅文本。没有接入投影器，`--image`、`--video`、`--audio` 均不适用。
-- 没有思考通道，没有工具调用解析器。
+- 没有思考通道，没有工具调用解析器，因此不为该模型提供代码工具与子智能体委派。
 - 单设备：没有张量并行、没有按层切分、没有融合整模型计算图、不支持投机解码。
 - Hy-MT2-1.8B 是翻译模型，有自己的输出习惯：对 `What is 17 + 25? Reply with only
   the integer.` 回答 `42.`；在发布翻译夹具上，`structured_json` 与 `||` 分隔词表

@@ -14,7 +14,7 @@ behind the shared `IVideoGenerationModel` seam, so the CLI and the server drive
 H3 and Wan down one path instead of type-testing each concrete model.
 
 ```sh
-tensorsharp --model minimax_h3_fl2va_pruned-Q4_K.gguf --backend ggml_metal \
+TensorSharp.Cli --model minimax_h3_fl2va_pruned-Q4_K.gguf --backend ggml_metal \
   --prompt "a red fox trotting through falling snow, cinematic" \
   --width 640 --height 384 --video-frames 22 --diffusion-steps 8 --cfg 1.0 \
   --output fox.mp4
@@ -175,7 +175,7 @@ TensorSharp encodes H.264 where sd.cpp writes MJPEG + PCM into an AVI, and a .NE
 starts against a native binary.
 
 The two hardware points differ because the CUDA machine is a deliberately hostile one —
-16 GB of VRAM and 31.7 GB of RAM against a 33.5 GB model set, so neither the weights nor
+16 GB of VRAM and 31.7 GB of RAM against a ~35.5 GB model set, so neither the weights nor
 the page cache fit and setup dominates in a way it would not on a card that holds the
 model. Both numbers are real. Which one describes your run depends on how much memory the
 machine has, so check the hardware label before quoting either.
@@ -259,7 +259,7 @@ conditioning it accepts.
 | `minimax_h3_video_vae_fp16.safetensors` | 5.21 GB | [Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3) (also mirrored under `vae/` in the unsloth repo) |
 | `minimax_h3_audio_vae_fp32.safetensors` | 0.61 GB | same repo — omit for silent video |
 
-About 33.5 GB for one set. Each network is loaded and **released** in turn, so
+About 35.5 GB for one set (35.4 GB for Ref2VA). Each network is loaded and **released** in turn, so
 peak VRAM is `max(...)`, not the sum; adding the second denoiser later costs only
 its own ~10.6 GiB, because the encoder and both VAEs are shared.
 
@@ -270,8 +270,8 @@ Two shipped configs download the lot on first run and only differ in their `mode
 entry, so the encoder and the VAEs are fetched once:
 
 ```sh
-TensorSharp.Server --config config/minimax-h3-fl2va.json      # keyframes
-TensorSharp.Cli    --config config/minimax-h3-ref2va.json \
+TensorSharp.Server.Host --config config/minimax-h3-fl2va.json # keyframes
+TensorSharp.Cli         --config config/minimax-h3-ref2va.json \
   --ref-image person.png --prompt "…" --output out.mp4        # references
 ```
 
@@ -284,7 +284,7 @@ server takes no `--cfg` at all — so the model's own defaults apply.
 > **The text-encoder GGUF carries no tokenizer**, and that is the one thing a config
 > cannot fetch for you: auto-download fills in options that are **flags**, and the
 > tokenizer is not one. Put `vocab.json` and `merges.txt`
-> from [MiniMaxAI/MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3/tree/main/processor)
+> from [MiniMaxAI/MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3/tree/42ed227ee7df40d41602854ae760620d6eb651fe/processor)
 > beside it, or point `TS_VIDEO_TOKENIZER` at them. Neither published GGUF has any
 > metadata at all, so TensorSharp identifies H3 by its tensors rather than by an
 > architecture string (arch keys `minimax-h3` / `minimax_h3` are accepted when a
@@ -316,7 +316,7 @@ the same request are refused outright, on either checkpoint.
 ### Text to video
 
 ```sh
-tensorsharp --model minimax_h3_fl2va_pruned-Q4_K.gguf --backend ggml_metal \
+TensorSharp.Cli --model minimax_h3_fl2va_pruned-Q4_K.gguf --backend ggml_metal \
   --prompt "a red fox trotting through falling snow, cinematic" \
   --width 640 --height 384 --video-frames 22 --diffusion-steps 8 --cfg 1.0 \
   --output fox.mp4
@@ -333,23 +333,24 @@ latent alone fades — the clip starts on the image and wanders off within a sec
 or two, which is invisible at 22 frames and obvious at 124.
 
 ```sh
-tensorsharp --model minimax_h3_fl2va_pruned-Q4_K.gguf --backend ggml_metal \
+TensorSharp.Cli --model minimax_h3_fl2va_pruned-Q4_K.gguf --backend ggml_metal \
   --image portrait.jpg \
   --prompt "the person turns toward the camera and smiles, subtle handheld motion" \
   --width 640 --height 384 --video-frames 22 --diffusion-steps 8 --cfg 1.0 \
   --output animated.mp4
 ```
 
-`--video-mode i2v` states it explicitly. The image is resized to the generation
-canvas, so its aspect ratio should match `--width`/`--height` or it will be
-stretched.
+`--video-mode i2v` states it explicitly. The image is fitted to the generation
+canvas; when its aspect ratio differs from `--width`/`--height` it is
+centre-cropped (the run prints a `[h3] conditioning image … centre-cropping to
+fit` line), so leave the size unset to keep the whole image.
 
 ### First and last frame
 
 Both ends are pinned and the model fills in the motion between them.
 
 ```sh
-tensorsharp --model minimax_h3_fl2va_pruned-Q4_K.gguf --backend ggml_metal \
+TensorSharp.Cli --model minimax_h3_fl2va_pruned-Q4_K.gguf --backend ggml_metal \
   --image start.png --end-image end.png \
   --prompt "a slow cinematic push-in" \
   --width 640 --height 384 --video-frames 22 --diffusion-steps 8 --cfg 1.0 \
@@ -368,7 +369,7 @@ This needs the **Ref2VA** checkpoint — `i2v`/`fl2v` and `ref` are separate fil
 not settings.
 
 ```sh
-tensorsharp --model minimax_h3_ref2va_pruned-Q4_K.gguf --backend ggml_metal \
+TensorSharp.Cli --model minimax_h3_ref2va_pruned-Q4_K.gguf --backend ggml_metal \
   --ref-image person.jpg \
   --prompt "the same woman sits at a table in a sunlit cafe by a window, drinking coffee, wide shot" \
   --width 640 --height 384 --video-frames 22 --diffusion-steps 20 --cfg 1.0 \
@@ -379,7 +380,7 @@ Pass `--ref-image` more than once for several references (up to nine), for examp
 a person and the product they are holding:
 
 ```sh
-tensorsharp --model minimax_h3_ref2va_pruned-Q4_K.gguf --backend ggml_metal \
+TensorSharp.Cli --model minimax_h3_ref2va_pruned-Q4_K.gguf --backend ggml_metal \
   --ref-image person.jpg --ref-image bottle.png \
   --prompt "she holds the bottle up to the light on a rooftop at golden hour, slow orbit" \
   --width 640 --height 384 --video-frames 22 --diffusion-steps 20 --cfg 1.0 \
@@ -428,7 +429,7 @@ paired by position with `--ref-video` — a container's audio track is not reada
 through the frame decoder, so the two arrive as separate inputs.
 
 ```sh
-tensorsharp --model minimax_h3_ref2va_pruned-Q4_K.gguf --backend ggml_metal \
+TensorSharp.Cli --model minimax_h3_ref2va_pruned-Q4_K.gguf --backend ggml_metal \
   --ref-video walk.mp4 --ref-video-audio walk.wav \
   --prompt "the same woman walks along a beach at sunset, wide shot, waves behind her" \
   --width 640 --height 384 --video-frames 22 --diffusion-steps 20 --cfg 1.0 \
@@ -438,7 +439,7 @@ tensorsharp --model minimax_h3_ref2va_pruned-Q4_K.gguf --backend ggml_metal \
 A standalone soundtrack, with no picture attached, is a reference too:
 
 ```sh
-tensorsharp --model minimax_h3_ref2va_pruned-Q4_K.gguf --backend ggml_metal \
+TensorSharp.Cli --model minimax_h3_ref2va_pruned-Q4_K.gguf --backend ggml_metal \
   --ref-image singer.jpg --ref-audio song.wav \
   --prompt "she performs on a small club stage under a single spotlight" \
   --width 640 --height 384 --video-frames 22 --diffusion-steps 20 --cfg 1.0 \
@@ -528,10 +529,9 @@ Measured on the same image-to-video request (M5 Pro, `ggml_metal`, seed 42, 22 f
 > for a deployment that only offers one. The server has **no `--cfg`** — there is
 > nothing to set, since H3 enforces 1.0 itself.
 
-> **Forcing a size that does not match your image stretches it.** A 4:3 photo forced
-> into 640×384 is squeezed ~25% horizontally, which is exactly the kind of distortion
-> that makes faces look wrong. Leave width/height unset for image-to-video and the
-> aspect is taken from the image.
+> **Forcing a size that does not match your image crops it.** A 4:3 photo forced
+> into 640×384 loses about 20% of its height, split between top and bottom. Leave
+> width/height unset for image-to-video and the aspect is taken from the image.
 
 > **The soundtrack changed in this revision.** The denoiser emits a whitened audio
 > latent and the decoder wants the VAE's own scale; the un-whitening step was
@@ -556,6 +556,14 @@ Measured on the same image-to-video request (M5 Pro, `ggml_metal`, seed 42, 22 f
   correlation at 22 frames to 0.86 at 90 — so the chunking is a correctness
   requirement, not an optimization.
 
+> **Long clips keep the conditioning image, not necessarily the framing.** A
+> keyframe pins the *start* of the clip. Over 124 frames (5.2 s) a prompt that
+> describes a different shot wins: "a medium shot of two people arguing, handheld"
+> on a photo of an ID card pushed into the card and had become that medium shot by
+> about frame 60. With a prompt that asks for no camera move, the same 124-frame
+> clip stayed at 0.94–0.97 correlation with the source photo throughout. To keep
+> the photo in shot, say so in the prompt or generate a shorter clip.
+
 ## HTTP API
 
 Three routes share one parser: `POST /api/video-generate`,
@@ -563,7 +571,7 @@ Three routes share one parser: `POST /api/video-generate`,
 OpenAI-shaped `POST /v1/videos/generations`.
 
 ```sh
-curl -s localhost:5001/api/video-generate -H 'content-type: application/json' -d '{
+curl -s localhost:5000/api/video-generate -H 'content-type: application/json' -d '{
   "prompt": "a red fox trotting through falling snow, cinematic",
   "width": 640, "height": 384, "frames": 22, "steps": 8, "cfg": 1.0,
   "imagePath": "card.jpeg", "videoMode": "i2v"
@@ -573,7 +581,7 @@ curl -s localhost:5001/api/video-generate -H 'content-type: application/json' -d
 Reference conditioning uses the same route against the Ref2VA checkpoint:
 
 ```sh
-curl -s localhost:5001/api/video-generate -H 'content-type: application/json' -d '{
+curl -s localhost:5000/api/video-generate -H 'content-type: application/json' -d '{
   "prompt": "the same woman sits at a table in a sunlit cafe by a window, wide shot",
   "width": 640, "height": 384, "frames": 22, "steps": 20, "cfg": 1.0,
   "referenceImages": ["person.jpg", "bottle.png"], "videoMode": "ref"
@@ -582,9 +590,11 @@ curl -s localhost:5001/api/video-generate -H 'content-type: application/json' -d
 
 Returns `{ ok, url, audioUrl, width, height, frames, fps, seed, codec, elapsedSeconds }`.
 `audioUrl` is null when the model produced no track. The full field set is `prompt`,
-`width`, `height`, `frames`, `steps`, `cfg`, `fps`, `imagePath`, `videoMode`,
-`generateAudio`, `endImage`, `referenceImages`, `referenceVideos`,
-`referenceAudios`, `referenceVideoAudios`. Most of them are **camelCase only** —
+`width`, `height`, `frames`, `steps`, `cfg`, `fps`, `seed`, `flowShift`,
+`imagePath` (or inline base64 `image`), `videoMode`, `generateAudio`, `endImage`,
+`referenceImages`, `referenceVideos`, `referenceAudios`, `referenceVideoAudios`;
+the Wan fields `negativePrompt`, `sampler`, `cfgCacheStride` and `cfg2` are
+accepted and ignored by H3. Most of them are **camelCase only** —
 `videoMode`, `generateAudio`, `endImage` and the four `reference*` lists are the
 only ones that also accept a snake_case spelling (`video_mode`, `generate_audio`,
 `end_image`, `reference_images`, …), and camelCase wins when both are present.

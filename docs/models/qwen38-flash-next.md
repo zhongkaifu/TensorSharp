@@ -1,6 +1,6 @@
 # Qwen 3.8 Flash Next (`qwen4exp`)
 
-[← back to model index](README.md)
+[← back to model index](README.md) | [中文](qwen38-flash-next_zh-cn.md)
 
 Qwen3.8-Flash-Next is a hybrid MoE: GatedDeltaNet recurrent layers interleaved
 with full-attention layers (some behind Qwen Sparse Attention's indexer), a
@@ -8,7 +8,8 @@ PLE n-gram embedding block, ×4 hyper-connection streams and a 512-expert MoE.
 The GGUF architecture id is `qwen4exp`. Weights:
 [unsloth/Qwen3.8-Flash-Next-GGUF](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF)
 (multi-shard per quant directory; point `--model` at the `-00001-of-` shard;
-`mmproj-BF16.gguf` beside the model enables image input).
+image input needs `mmproj-BF16.gguf`: the CLI loads it from beside the model when
+`--image` is given, and the server needs `--mmproj`).
 
 ## How TensorSharp runs it
 
@@ -19,7 +20,20 @@ per-layer fused kernels, which in turn fall back op-by-op). Vision rides the
 Qwen3.5-VL tower with (T,H,W) IMRoPE positions; multi-image and multi-turn
 image sessions are supported, with KV reuse across turns (the GDN recurrence
 cannot rewind, so a cached prefix is reused only when the new prompt extends
-it exactly; see [Retained-prefix reuse](#retained-prefix-reuse)).
+it exactly; see [Retained-prefix reuse](#retained-prefix-reuse)). With the
+default radix prefix cache (`TS_PREFIX_CACHE_MODE=tree`) that reuse stops at
+the first image or video span of a conversation: the family does not declare
+reuse across a media span (it stores an M-RoPE cache gap that no
+reference-position test covers yet). Because this family resumes only from a
+holder or checkpoint of exactly the matched length, a later turn reuses at most
+a stored checkpoint that ends before the attachment (typically the system
+prompt) and re-prefills the rest.
+`TS_PREFIX_CACHE_MODE=legacy` selects the older retained-holder matching, to
+which this limit does not apply.
+
+Thinking can be switched on or off. With it off, the assistant turn opens with
+the closed, empty `<think>\n\n</think>` block the published template emits,
+and replayed history keeps that exact suffix so cached prefixes still match.
 
 ## Tool calling and agent workflows
 
@@ -40,6 +54,12 @@ body at EOS retains the existing recovery for an omitted outer closing tag.
 Enable skills with `--skills-dir`, skill scripts with `--skills-allow-exec`,
 and workspace file/shell tools with `--code-exec`. Editing uses `apply_patch`.
 See [Agent Skills](../agent_skills.md) for execution and sandbox configuration.
+
+Because the family renders tool declarations and has this parser, it is also
+eligible, on the server, for [sub-agent delegation](../multi_agent.md), which is
+on by default on the chat paths and does not depend on skills or `--code-exec`.
+`--no-multi-agent` (or `multi_agent: false` in a request) turns it off; the CLI
+has no sub-agents. No delegation results are published for this family.
 
 Reusable checks:
 
@@ -204,9 +224,11 @@ Qwen 3.5 and DeepSeek V4 paths have:
   continuation, and every partial match re-prefills.
 - Both retained conversations and checkpoints count against one budget,
   `TS_Q4E_RETAINED_CACHE_MB` (default 4096, clamped by measured memory
-  headroom; `0` or an unparsable value declines every retention), evicting the
-  oldest retained conversation first. `TS_Q4E_RETAINED_CACHE=0` disables the
-  feature.
+  headroom; `0` or an unparsable value declines every retention). Under the
+  default radix prefix cache the tree owns retention and eviction, so this
+  budget only refuses a holder that does not fit (reported once); with
+  `TS_PREFIX_CACHE_MODE=legacy` the model evicts the oldest retained
+  conversation first. `TS_Q4E_RETAINED_CACHE=0` disables the feature.
 - It needs the complete GGML token-span path (every piece of per-sequence state
   device-resident and keyed by the holder) and a GDN state layout the native
   entry can be copied through exactly. Retention works under a layer split;
@@ -234,14 +256,16 @@ measured difference
 ## Speculative decoding with the shared MTP head
 
 `--draft-model mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf` attaches the per-token
-MTP block; it speculates for a solo request that prefilled from position 0
+MTP block (GGML backends only, and the head must be a single GGUF file, attached
+when the model loads); it speculates for a solo request that prefilled from position 0
 (steps shared with other sequences, and turns that continue a retained holder or
 a shared-prefix clone, decode plainly — the head keeps its own K/V and cannot
 draft across positions it never replayed). Measured on UD-Q2_K_XL over a
 three-GPU layer split (A40), `--spec-draft 3`:
 
 - **Parity.** A 192-token code-copy stream is identical to plain greedy at
-  1.75-1.96x (141/141 drafts accepted, no rollbacks); the speculative prefill
+  1.69x plain decode with the current verify-row kernels (1.75-1.96x before the
+  2026-09-17 change below; 141/141 drafts accepted, no rollbacks); the speculative prefill
   (`SpecForward`) is bit-identical to the plain one for the same chunking. Before
   2026-09-17 a 4-row verify did not round like a 1-row decode step and could turn
   a plain-greedy bare JSON object into a fenced ```` ```json ```` answer; verify
@@ -309,7 +333,10 @@ Evidence and the per-assertion diagnosis:
 of whole layers. It is not tensor parallelism — `qwen4exp` shards no weights —
 and it is the same (and only) multi-GPU mode llama.cpp offers this architecture
 (`-sm row` refuses to load it). It is a capacity feature, not a speed feature:
-it is how you fit the model when one card cannot hold it.
+it is how you fit the model when one card cannot hold it. The layer split is
+available on `ggml_cuda` and `ggml_vulkan`; on other backends `--tp N` is
+ignored with a warning and the model runs on a single device, and distributed
+`--tp-node-id`/`--tp-peers` groups are refused.
 
 Measured on 2× A100-80GB, Qwen3.8-Flash-Next-UD-Q2_K_XL (73.4 GiB):
 

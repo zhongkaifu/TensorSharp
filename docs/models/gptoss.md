@@ -1,6 +1,6 @@
 # GPT OSS
 
-[← back to model index](README.md)
+[← back to model index](README.md) | [中文](gptoss_zh-cn.md)
 
 | Property | Value |
 |---|---|
@@ -10,8 +10,9 @@
 | Example models | gpt-oss-20b |
 | Modalities | Text only |
 | Thinking mode | Yes (Harmony format: `<\|channel>analysis ... <\|channel>final`) |
-| Tool calling | Yes (Harmony `commentary` channel — `to=functions.NAME`) |
-| Batched / paged forward | **Default ON** — set `TS_GPTOSS_BATCHED=0` to force the legacy per-sequence KV-swap path for A/B comparison. Per-layer paged K/V plus attention sinks via native `TSGgml_PagedAttentionForwardWithSinks` (or managed C# fallback via `TS_GPTOSS_PAGED_ATTN_MANAGED=1`). See §11. |
+| Tool calling | Yes (Harmony `commentary` channel — `to=functions.NAME`); eligible for skills, the code tools and server-side [sub-agent delegation](../multi_agent.md) |
+| Speculative decoding | No — GPT OSS has no speculative trunk, so `--spec` (the weight-free n-gram drafter included) serves standard decode |
+| Batched / paged forward | **Default ON.** On GGML backends without `--tp`, concurrent requests use per-request KV holders and a token-batched fused decode graph (`TS_PER_SEQ_FUSED=0` turns the holders off). On other backends they use the paged `ForwardBatch` path: per-layer paged K/V plus attention sinks via native `TSGgml_PagedAttentionForwardWithSinks` (or managed C# fallback via `TS_GPTOSS_PAGED_ATTN_MANAGED=1`). Under `--tp` neither route is available and concurrent requests take the legacy per-sequence KV-swap path. `TS_GPTOSS_BATCHED=0` withdraws only the paged path, for A/B comparison. See §11. |
 | Output parser | `HarmonyOutputParser` (always required) |
 
 ## Downloads
@@ -166,10 +167,9 @@ hidden ─► narrow(seq_len-1) if prefill          # GPT OSS narrows BEFORE MoE
   `origCtxLen = Config.OriginalContextLength` (4096), `freqScale = 1 /
   RopeScale`, `beta_fast = 32`, `beta_slow = 1`.
 - **Attention pattern**: even layers ⇒ SWA (window from `_slidingWindow`,
-  default 128); odd layers ⇒ full causal. *(Implementation note: in the
-  current code path all layers attend to `totalSeqLen` — the SWA bound is
-  read from GGUF metadata but not yet used to bound the actual softmax
-  width. This is on the optimization-opportunities list.)*
+  default 128); odd layers ⇒ full causal. Every decode and prefill path bounds
+  the even (SWA) layers to `_slidingWindow`: the managed per-op path, the fused
+  per-layer and whole-model graphs, and the paged path.
 
 ### 4.2 FFN — clamped GLU (`SiLUAlphaLimit`)
 
@@ -311,10 +311,15 @@ Constructor (`GptOssModel(string ggufPath, BackendType backend)`):
   `_moeTokenMap`, `_moeWeightMap`) are reused across tokens.
 - **SIMD-vectorized bias addition and SiLUAlphaLimit activation** in
   `LinearForwardWithBias` and `SiLUAlphaLimitInPlace`.
-- **Attention sinks softmax** runs on CPU (scalar with optional SIMD on the
-  exp-sum). The fused GPU kernel for sinks is on the optimization
-  opportunities list — currently the softmax with sinks is the slow path on
-  Metal / CUDA.
+- **Attention sinks softmax.** On the GGML backends the fused whole-model
+  decode graph below runs SWA-masked flash attention with sinks and
+  `mul_mat_id` experts on the device. On the per-op path, the GGML backends
+  run decode attention in the per-layer fused kernel up to
+  `TS_GPTOSS_FUSED_DECODE_MAX_CTX` (default 4096) tokens of context, `cuda`
+  has a GPU sinks decode kernel (`CudaFusedOps.TryGqaDecodeAttentionWithSinks`)
+  and `mlx` a Metal one; anything else runs the sinks softmax on the CPU
+  (scalar with optional SIMD on the exp-sum). Every one of these bounds the
+  SWA layers to `_slidingWindow`.
 - **MXFP4 expert weights** stay quantized in `_quantWeights`; matmul is
   dispatched through the backend's quantized matmul.
 
@@ -328,7 +333,13 @@ length (133 tok/s at 16K) where the per-layer path collapsed to 2.3. Set
 ## 10. Memory and KV cache strategy
 
 - Per-layer K and V tensors of shape `[NumKVHeads, maxSeqLen, headDim]`. KV
-  dtype is configurable as `f32`, `f16`, or `q8_0`.
+  dtype is `f32` or `f16`. An explicit `q8_0` / `q4_0` request is downgraded to
+  `f16` with a notice on stderr: neither fused graph nor the managed sinks
+  fallback can read a block-quantized cache.
+- Prefix reuse across requests goes through the Radix prefix cache (the default
+  mode) as a page family: cached pages plus the resident primary cache, with
+  exact rewinds of at most 16 tokens, because the sliding window masks a linear cache
+  (`GptOssModel.PrefixCache.cs`).
 - `ResetKVCache()` zeroes everything.
 - The expert FFN weights live in the original 3D
   `ffn_gate_exps.weight` / `ffn_up_exps.weight` / `ffn_down_exps.weight`
@@ -341,10 +352,30 @@ length (133 tok/s at 16K) where the per-layer path collapsed to 2.3. Set
 
 GPT OSS implements `IBatchedPagedModel.ForwardBatch`
 ([`GptOssModel.BatchedForward.cs`](../../TensorSharp.Models/Models/GptOss/GptOssModel.BatchedForward.cs))
-and runs it by default — concurrent requests can only be served truly
-in parallel through the batched path (the per-sequence fallback forwards
-at most one sequence per step). Set `TS_GPTOSS_BATCHED=0` to force the
-legacy per-sequence KV-swap fallback for A/B comparison. The batched port has to
+and keeps it available by default; set `TS_GPTOSS_BATCHED=0` to withdraw it
+for A/B comparison. Where the per-request holders below do not apply, that
+leaves the legacy per-sequence KV-swap fallback; the holders do not read this
+variable.
+
+On the GGML backends without `--tp`, a step with two or more running requests
+does not take this paged path. Each request decodes from its own KV holder,
+swapped in by pointer
+([`GptOssModel.PerSeqCache.cs`](../../TensorSharp.Models/Models/GptOss/GptOssModel.PerSeqCache.cs)),
+through the fused whole-model decode graph of §9, and a decode step shared by
+two or more such requests runs as ONE token-batched fused graph
+(`GgmlBasicOps.TryGptOssModelDecodeBatched`,
+[`ggml_ops_gptoss_batched.cpp`](../../TensorSharp.GGML.Native/ggml_ops_gptoss_batched.cpp))
+that reads every weight once for all of them. The token-batched step is on by
+default (`TS_BATCHED_FUSED_DECODE=0` falls back to one fused forward per request
+per step) and declines the step, and every request falls back to its own fused
+forward, when routed experts are offloaded to the CPU. A request whose holder has
+to grow this step is left out of the batch and decodes on its own while the
+others still batch. The paged path below is the route on non-GGML backends and with
+`TS_PER_SEQ_FUSED=0`. Under `--tp` neither the holders nor the paged path is
+available, so concurrent requests use the legacy KV-swap path. No throughput
+for the token-batched path is recorded in this card.
+
+The batched port has to
 preserve GPT OSS's three architecture-distinguishing features —
 **attention sinks**, **bias on every projection**, and **per-layer
 alternating SWA** — inside the paged scheduling stack:
@@ -451,26 +482,28 @@ alternating SWA** — inside the paged scheduling stack:
 - **Fused per-layer batched kernel** — the legacy path's
   `TryFusedAttnLayerPrefill` does one cgraph per layer (norm + fused
   QKV + RoPE + KV-append + sinks-aware softmax + attn + output proj +
-  residual). The batched path currently issues ~5 graphs per layer.
-  Folding them into one batched cgraph is the largest remaining win
-  for batched GPT OSS perf.
+  residual). The paged `ForwardBatch` path still issues ~5 graphs per
+  layer. On the GGML backends concurrent decode now goes through the
+  per-request holders and the token-batched fused graph instead (§11), so
+  this matters only where the paged path still runs.
 - **Fused QKV in every release** — when the GGUF ships split Q / K / V the
   per-projection bias add still happens after each separate matmul. A
   `FusedQKVWithBias` graph would cut 3 dispatches into 1.
-- **Whole-model decode on the legacy per-seq path** — the fused
-  whole-model decode graph (`GptOssModel.FusedModelDecode.cs`) already
-  covers the batched path; extending the same single-dispatch treatment to
-  the legacy per-sequence path would remove most of its remaining managed
-  overhead.
-- **GPU-fused sinks softmax (legacy)** — the legacy CPU sinks softmax is
-  the per-seq counterpart to the batched native `*_WithSinks` kernel. A
-  custom Metal / CUDA fused kernel for the legacy path would close that
-  gap and let the per-seq path keep up at single-sequence workloads.
-- **Per-expert decode batching** — even with the stacked MoE prefill
-  kernel, decode still runs experts sequentially per token. A batched
-  decode path (analogous to Qwen 3.5's `MoEExpertsSwiGLUResidual`) would
-  collapse `numExpertsUsed` dispatches into one.
-- **SWA bound on even layers** — `_slidingWindow` is read from GGUF
-  metadata but the current attention path does not yet bound the softmax
-  width to it. Wiring it through `AttentionDecodeWithSinks` would lower
-  per-token compute on long contexts.
+- **Whole-model decode on the paged path** — the fused whole-model decode
+  graph (`GptOssModel.FusedModelDecode.cs`) serves single-sequence decode and
+  the per-request holders, and its token-batched variant serves concurrent
+  decode on the GGML backends; the paged `ForwardBatch` route does not use it,
+  and extending the same single-dispatch treatment there would remove most of
+  its remaining managed overhead.
+- **Device sinks attention on the per-op GGML path (legacy)** — this matters
+  only on the per-op path (§9). The fused whole-model decode graph already
+  runs sinks attention on the device, and so do the `cuda` and `mlx` per-op
+  paths. With `TS_GPTOSS_MODEL_DECODE=0`, a GGML backend past
+  `TS_GPTOSS_FUSED_DECODE_MAX_CTX` still falls back to the CPU sinks
+  softmax; lifting that per-layer kernel's context cap would close the gap.
+- **Per-expert decode batching (`cpu` / `cuda`)** — the GGML backends
+  already run single-token MoE as one `mul_mat_id` dispatch and `mlx` as a
+  `gather_qmm` grouped GEMM, but the `cpu` and `cuda` per-op paths still
+  run the experts sequentially per token. A batched decode path there
+  (analogous to Qwen 3.5's `MoEExpertsSwiGLUResidual`) would collapse
+  `numExpertsUsed` dispatches into one.

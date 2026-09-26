@@ -2,13 +2,13 @@
   // Qwen3.8-27B (UD-Q4_K_XL) as an AGENT: skills, skill scripts, network,
   // code generation / editing / execution, and package installs all enabled.
   //
-  //   TensorSharp.Cli    --config config/agent-qwen3.8-27b.json --chat
-  //   TensorSharp.Server --config config/agent-qwen3.8-27b.json
+  //   TensorSharp.Cli         --config config/agent-qwen3.8-27b.json --chat
+  //   TensorSharp.Server.Host --config config/agent-qwen3.8-27b.json
   //
   // Every key here is read by BOTH hosts. Keys the CLI alone accepts (--think,
-  // --tools, --system, --input, --output, --penalty-last-n, --log-*) are left
-  // out on purpose: the server refuses to start on an unknown option, while the
-  // CLI silently drops one, so a CLI-only key breaks exactly one of the two.
+  // --tools, --system, --input, --output, --log-*) are left out on purpose: the
+  // server refuses to start on an unknown option, while the CLI silently drops
+  // one, so a CLI-only key breaks exactly one of the two.
   // Comments are the only way to annotate a config -- ConfigFileArgs reserves
   // just "variables"/"vars"/"$schema", so any other key becomes a flag.
   //
@@ -28,7 +28,7 @@
   // --max-tokens is the GENERATION cap, not the context window, and it also
   // sizes the up-front KV reservation (prompt + max_new_tokens). The context
   // window cannot be set from a config file at all -- MAX_CONTEXT is env-only:
-  //   MAX_CONTEXT=131072 TensorSharp.Server --config config/agent-qwen3.8-27b.json
+  //   MAX_CONTEXT=131072 TensorSharp.Server.Host --config config/agent-qwen3.8-27b.json
   // Keep this in the 16k-32k range. Overshooting degrades before it fails: as
   // the ~40 GB Metal working set gets tight the OS purges wired buffers and
   // long-context decode collapses toward seconds/token, and past it a command
@@ -77,9 +77,11 @@
   // (web-artifacts-builder), the Playwright CLI wrapper, and one JS template
   // (algorithmic-art). Playwright includes macOS sandbox setup and account
   // handoff instructions; a fresh browser does not inherit desktop logins.
-  // The default root (a "skills" folder beside the binary) is empty here, so
-  // without this key the agent silently has zero skills. A path that does not
-  // exist is a fatal startup error, so keep this in step with the checkout.
+  // The default roots (every .agents/skills from the working directory up to
+  // the Git root, then a "skills" folder beside the binary) hold no skills in
+  // this checkout, so without this key the agent silently has zero skills. A
+  // path that does not exist is a fatal startup error, so keep this in step
+  // with the checkout.
   "skills-dir": "${skillsRoot}",
 
   // Let the model run a skill's bundled scripts. Treat every enabled script as
@@ -103,8 +105,8 @@
   "skills-max-rounds": 32,
 
   // ---- Code generation, editing and execution -----------------------------
-  // Offers shell, read_file, edit_file, write_file and apply_patch in one
-  // bounded model-to-tool loop. Commands run under Seatbelt; do NOT add
+  // Offers read_file, apply_patch, write_file (new files only) and shell in
+  // one bounded model-to-tool loop. Commands run under Seatbelt; do NOT add
   // "code-exec-unconfined" on this Mac -- it downgrades confinement to
   // best-effort and lets a failed sandbox wrap fall back to a raw process.
   // Writes are confined to the session workspace and the whole home directory

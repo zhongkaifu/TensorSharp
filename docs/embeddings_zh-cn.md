@@ -21,7 +21,7 @@ curl -fL --retry 3 -o models/embeddings/all-MiniLM-L6-v2-Q8_0.gguf \
   https://huggingface.co/second-state/All-MiniLM-L6-v2-Embedding-GGUF/resolve/544f204f2eaa2d71361ffc74d6df7170285b286a/all-MiniLM-L6-v2-Q8_0.gguf
 ```
 
-两者均采用 Apache-2.0 模型许可证；Snowflake 文件约 635 MB，MiniLM 约 25 MB。[验证清单](validation/embeddings-2026-09/models.json)记录了校验和与 GGUF 元数据。
+两者均采用 Apache-2.0 模型许可证；Snowflake 文件约 635 MB，MiniLM 约 25 MB。验证清单 `docs/validation/embeddings-2026-09/models.json`（本地验证记录，未提交到 Git）记录了校验和与 GGUF 元数据。
 
 当前支持范围是 `general.architecture=bert`，且具备受支持的分词器与池化元数据的 GGUF。解码器嵌入模型、重排序器、稀疏向量和多向量检索属于其他功能。
 
@@ -40,9 +40,9 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll \
   --host 127.0.0.1 --port 5000 --no-webui
 ```
 
-使用 `cpu` 运行 100% 纯 C# 推理，无需原生推理库；使用 `ggml_cpu` 运行原生 CPU 内核；构建时启用 CUDA 后可用 `ggml_cuda`。实际测试的硬件与性能范围见[验证报告](validation/embeddings-2026-09/README.md)。直接 `cuda`、MLX 和 Vulkan 的嵌入路径尚未实现。
+使用 `cpu` 运行 100% 纯 C# 推理，无需原生推理库；使用 `ggml_cpu` 运行原生 CPU 内核；构建时启用 CUDA 后可用 `ggml_cuda`。实际测试的硬件与性能范围见验证报告 `docs/validation/embeddings-2026-09/README.md`（本地验证记录，未提交到 Git）。直接 `cuda`、MLX 和 Vulkan 的嵌入路径尚未实现。
 
-`--embedding-context-size N` 缩小每条输入的上限；`0` 使用模型元数据。每个进程常驻一个编码器；应用同时需要聊天和嵌入时，在不同端口启动两个服务。
+`--embedding-context-size N` 缩小每条输入的上限；`0` 使用模型元数据。每个进程常驻一个编码器；应用同时需要聊天和嵌入时，在不同端口启动两个服务。启用 `--embeddings` 后，对生成类路由（`/v1/chat/completions`、`/v1/responses`、`/v1/systemone`、`/v1/videos/generations`、`/api/generate`、`/api/chat`、`/api/chat/ollama`、`/api/models/load`，以及 `/api/image-generate`、`/api/image-edit`、`/api/video-generate` 与它们的 `/stream` 形式）的 POST 请求返回 HTTP 400 `This server hosts an embedding model. Use /v1/embeddings or /api/embed.`。显式指定本机没有的 `--backend` 时，启动以退出码 2 结束，并打印 `error: model load refused: Backend 'X' is not supported on this machine.`。
 
 C# API 默认使用纯 C# 后端；需要原生 CPU 时须显式指定：
 
@@ -128,7 +128,7 @@ GGUF 的位置容量不等于长文档检索质量保证。MiniLM 上游 sentenc
 
 XLM-R 使用 GGUF 内嵌的 SentencePiece 字符映射与全局最优 unigram 分词；BERT 使用 WordPiece、Unicode NFD 与元数据中的大小写/去重音设置。测试对比两个模型各 30 条独立 HuggingFace/llama.cpp 用例，以及 13 条 Snowflake HTTP 参照用例。
 
-[分词参照文件](validation/embeddings-2026-09/huggingface-tokenization.json)保留了上游差异：Snowflake GGUF 不含字面量 `<mask>`，且按元数据去除多余空白；MiniLM 将垂直制表和换页符视为空白。对于韩文分解及印度文字间距元音，TensorSharp 保留 HuggingFace 的完整 Unicode 规范化行为；llama.cpp 的简化实现会丢掉部分字符。
+[分词参照文件](../InferenceWeb.Tests/Fixtures/EmbeddingTokenizer/huggingface-tokenization.json)（13 条 Snowflake 参照用例位于同目录的 `snowflake-tokenization.json`）保留了上游差异：Snowflake GGUF 不含字面量 `<mask>`，且按元数据去除多余空白；MiniLM 将垂直制表和换页符视为空白。对于韩文分解及印度文字间距元音，TensorSharp 保留 HuggingFace 的完整 Unicode 规范化行为；llama.cpp 的简化实现会丢掉部分字符。
 
 ## C# API 与实现
 
@@ -157,7 +157,7 @@ x86 托管路径通过 [`TensorComputePrimitives`](../TensorSharp.Core/TensorCom
 
 分块保持相同的数学注意力公式和 FP32 精度，但改变浮点归约顺序。[标量编码器测试](../InferenceWeb.Tests/EmbeddingModelTests.cs)验证长序列混合批次与全部池化模式，绝对误差不超过 `2e-6`；该检查验证数值一致性，不代表逐位相同。
 
-[无原生推理库宿主检查](validation/embeddings-2026-09/managed-native-free.json)删除宿主中的自定义原生资源后运行两个下载模型，并在推理后检查实际加载的库。
+无原生推理库宿主检查（`docs/validation/embeddings-2026-09/managed-native-free.json`，本地验证记录，未提交到 Git；可用 `benchmarks/EmbeddingBench/native_free_smoke.py` 重新运行）删除宿主中的自定义原生资源后运行两个下载模型，并在推理后检查实际加载的库。
 
 ### 原生 GGML 执行
 
@@ -165,11 +165,11 @@ x86 托管路径通过 [`TensorComputePrimitives`](../TensorSharp.Core/TensorCom
 
 原生 CPU 投影权重在后端支持时采用优化后的缓冲区布局，保持 GGUF 量化格式。Metal 在分配图内存之前进行图优化，使融合操作与张量生命周期一致。
 
-另有[独立 NumPy 前向验证](validation/embeddings-2026-09/numpy-oracle/README.md)，直接从反量化后的 GGUF 权重计算完整编码器，并分别对照 TensorSharp 的纯 C# CPU、原生 GGML CPU、Metal，以及 llama.cpp 的 CPU/Metal 输出，覆盖两个模型与两种引擎执行顺序。
+另有独立 NumPy 前向验证（[`eng/embedding-reference.py`](../eng/embedding-reference.py)；结果位于 `docs/validation/embeddings-2026-09/numpy-oracle/`，本地验证记录，未提交到 Git），直接从反量化后的 GGUF 权重计算完整编码器，并分别对照 TensorSharp 的纯 C# CPU、原生 GGML CPU、Metal，以及 llama.cpp 的 CPU/Metal 输出，覆盖两个模型与两种引擎执行顺序。
 
 本实现参考了 llama.cpp 的 BERT 图、GGUF 布局、UGM/WordPiece、池化与无 KV 执行，vLLM 的池化模型分离和逐输入元数据，以及 SGLang 的请求校验、批处理与 float32 base64 编码。
 
-参见[可复现 HTTP 基准](../benchmarks/EmbeddingBench/README.md)与[验证结果](validation/embeddings-2026-09/README.md)。这些测试使用相同 GGUF 对比 llama.cpp，不能替代完整的 MTEB 评测。
+参见[可复现 HTTP 基准](../benchmarks/EmbeddingBench/README.md)与验证结果 `docs/validation/embeddings-2026-09/README.md`（本地验证记录，未提交到 Git）。这些测试使用相同 GGUF 对比 llama.cpp，不能替代完整的 MTEB 评测。
 
 ### 并发 API 客户端基准
 
@@ -182,6 +182,6 @@ python3 benchmarks/EmbeddingBench/concurrency_bench.py \
   --output /tmp/minilm-managed-concurrency --require-performance
 ```
 
-重复测试使用新的输出目录；添加 `--tensorsharp-first` 可反转引擎执行顺序。输出记录包含 JSON 解析的逐请求延迟、整轮延迟、每秒请求数、p95、向量、token 计数与二进制哈希。向量验证在每轮计时结束后进行。性能门槛比较与 llama.cpp 的整轮耗时中位数，允许最多 5% 的额外耗时。报告在顶层 `vectors` 表中只存一次完全相同的已解析向量；用 `report["vectors"][request["vector_ref"]]` 读取请求对应的向量。该测试补充单请求与批量输入基准。
+`--base-results` 接收 `embedding_bench.py --output DIR` 写出的 `results.json`；示例路径是已记录的运行（本地验证记录，未提交到 Git）。重复测试使用新的输出目录；添加 `--tensorsharp-first` 可反转引擎执行顺序。输出记录包含 JSON 解析的逐请求延迟、整轮延迟、每秒请求数、p95、向量、token 计数与二进制哈希。向量验证在每轮计时结束后进行。性能门槛比较与 llama.cpp 的整轮耗时中位数，允许最多 5% 的额外耗时。报告在顶层 `vectors` 表中只存一次完全相同的已解析向量；用 `report["vectors"][request["vector_ref"]]` 读取请求对应的向量。该测试补充单请求与批量输入基准。
 
 来源：[Snowflake 模型卡](https://huggingface.co/Snowflake/snowflake-arctic-embed-l-v2.0)、[MiniLM 模型卡](https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2)、[OpenAI embeddings API](https://developers.openai.com/api/reference/resources/embeddings/methods/create)、[Ollama embed API](https://docs.ollama.com/api/embed)。

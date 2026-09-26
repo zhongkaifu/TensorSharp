@@ -152,6 +152,27 @@ public sealed class MultiAgentProgressTests
         Assert.Null(restarted.Tool);
     }
 
+    [Theory]
+    [InlineData("str_replace", "edit_file")]
+    [InlineData("apply-patch", "apply_patch")]
+    [InlineData("create_file", "write_file")]
+    [InlineData("read", "read_file")]
+    [InlineData("shell", "shell")]
+    [InlineData("skills_run", "skills_run")]
+    [InlineData("some_client_tool", "some_client_tool")]
+    public void ToolProgressNamesTheToolThatRuns_NotTheAliasTheModelWrote(string called, string reported)
+    {
+        // The pages label progress by tool name; an accepted alias used to show up raw
+        // ("Running str replace") in the live status and the kept trace line.
+        object frame = WebUiSseEvents.ToolProgress("running", called, null, 1.0, null,
+            [new("/root/a", "/root", "task", "worker", "running", called, "running", null, null, null)]);
+        using JsonDocument json = JsonDocument.Parse(JsonSerializer.Serialize(frame));
+
+        Assert.Equal(reported, json.RootElement.GetProperty("tool").GetString());
+        Assert.Equal(reported, Assert.Single(json.RootElement.GetProperty("agents").EnumerateArray())
+            .GetProperty("tool").GetString());
+    }
+
     [Fact]
     public void ToolProgressSerializesAgentDetailsWithWebUiFieldNames()
     {

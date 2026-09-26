@@ -30,10 +30,12 @@ forward (see [Serving](#serving-continuous-batching)).
 ## Run it
 
 ```bash
+# --input takes a file path; the prompt is read from that file
+echo "Translate to French: the harbour was quiet before dawn." > prompt.txt
 dotnet run --project TensorSharp.Cli -- \
     --model models/Hy-MT2-1.8B-Q4_K_M.gguf \
     --backend ggml_metal \
-    --input "Translate to French: the harbour was quiet before dawn."
+    --input prompt.txt
 ```
 
 The server takes the same model flag:
@@ -118,9 +120,11 @@ the startup prefix-cache warm-up failing the same way. It now offers both:
   cache) concurrent requests take turns on the single cache by swapping
   snapshots; they are served correctly but serially.
 
-Prefix reuse works on both paths. A block the batched path wrote is adopted in
-the model's paged storage; a block the snapshot path captured is restored into
-the linear cache (see `KvBlock.HoldsModelPagedKv` / `HoldsSnapshotBytes`).
+Prefix reuse works on both paths, through the Radix prefix cache (the default
+mode), in which Hunyuan Dense takes part as a page family. A block the batched
+path wrote is adopted in the model's paged storage; a block the snapshot path
+captured is restored into the linear cache (see `KvBlock.HoldsModelPagedKv` /
+`HoldsSnapshotBytes`).
 
 ## Chat template
 
@@ -144,7 +148,8 @@ instructions here, as they do for every family without a tool parser.
 
 - Text only. No projector is wired up, so `--image`, `--video` and `--audio` do
   not apply.
-- No thinking channel and no tool-call parser.
+- No thinking channel and no tool-call parser, so the code tools and
+  sub-agent delegation are not offered for this model.
 - Single device: no tensor parallelism, no layer split, no fused whole-model
   graph, and no speculative decoding.
 - Hy-MT2-1.8B is a translation model and follows its own output habits: it

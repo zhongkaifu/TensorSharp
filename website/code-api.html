@@ -22,30 +22,30 @@
 
   <h2 id="packages">Project and package boundaries</h2>
   <p>The repository is split along publishable package boundaries. The source tree's publish set is <strong>thirteen</strong> packages — every row below — verified by <code>eng/verify-packages.ps1</code>, which gates the release workflow.</p>
-  <p><strong>Verified 2026-09-08:</strong> NuGet.org carries eight of them, at <strong>3.1.2</strong> (July 2026): Tensors, Runtime, Models, the three backends, Server, and Cli. Those lag the current source tree and server release — the published <code>TensorSharp.Server</code> predates the logging and chat splits. The other five (<code>TensorSharp.Runtime.Logging</code>, <code>TensorSharp.AgentHost</code>, <code>TensorSharp.Chat</code>, <code>TensorSharp.Server.Host</code>, <code>TensorSharp.Distributed</code>) are packable and verified but not yet pushed.</p>
+  <p><strong>Checked 2026-09-25:</strong> NuGet.org carries all thirteen at <strong>2026.9.1</strong>, published 2026-09-17 from the <code>v2026.09.01</code> release tag. Work merged after that tag — among it Qwen-Image-2.1 and its LoRA plug-ins, the Jev endpoint, DiffusionGemma image input, and sub-agents — is only in the source tree.</p>
   <div class="table-scroll">
   <table>
     <thead><tr><th>Project / package</th><th>Namespace</th><th>Responsibility</th></tr></thead>
     <tbody>
       <tr><td><code>TensorSharp.Core</code> / <code>TensorSharp.Tensors</code></td><td><code>TensorSharp</code></td><td>Tensor primitives, ops, allocators, storage, device abstraction. The NuGet ID differs from the project name.</td></tr>
-      <tr><td><code>TensorSharp.Runtime.Logging</code></td><td><code>TensorSharp.Runtime.Logging</code></td><td>Logging abstractions and sinks shared by every host, kept out of the engine layers. Not yet on NuGet.org.</td></tr>
+      <tr><td><code>TensorSharp.Runtime.Logging</code></td><td><code>TensorSharp.Runtime.Logging</code></td><td>Logging abstractions and sinks shared by every host, kept out of the engine layers.</td></tr>
       <tr><td><code>TensorSharp.Runtime</code></td><td><code>TensorSharp.Runtime</code></td><td>GGUF parsing, tokenizers, prompt rendering, sampling, paged KV cache, continuous-batching scheduler.</td></tr>
       <tr><td><code>TensorSharp.Models</code></td><td><code>TensorSharp.Models</code></td><td><code>ModelBase</code>, architecture implementations, multimodal encoders, batched/paged forward passes.</td></tr>
       <tr><td><code>TensorSharp.Backends.GGML</code></td><td><code>TensorSharp.GGML</code></td><td>GGML-backed execution and native interop.</td></tr>
       <tr><td><code>TensorSharp.Backends.Cuda</code></td><td><code>TensorSharp.Cuda</code></td><td>Direct CUDA allocator, storage, cuBLAS GEMM, PTX kernels, quantized CUDA ops.</td></tr>
       <tr><td><code>TensorSharp.Backends.MLX</code></td><td><code>TensorSharp.MLX</code></td><td>Apple-Silicon MLX backend (mlx-c / Metal).</td></tr>
-      <tr><td><code>TensorSharp.Chat</code></td><td><code>TensorSharp.Chat</code></td><td>Host-neutral chat pipeline — <code>ModelService</code>, sessions, generation, the skills loop, the Web UI request/stream contract. No ASP.NET Core; shared by the server, the CLI, and the iOS app. Not yet on NuGet.org.</td></tr>
+      <tr><td><code>TensorSharp.Chat</code></td><td><code>TensorSharp.Chat</code></td><td>Host-neutral chat pipeline — <code>ModelService</code>, sessions, generation, the skills loop, the Web UI request/stream contract. No ASP.NET Core; shared by the server, the CLI, and the iOS app.</td></tr>
       <tr><td><code>TensorSharp.Server</code></td><td><code>TensorSharp.Server</code></td><td>ASP.NET Core library: OpenAI/Ollama adapters, HTTP transport over TensorSharp.Chat, web UI assets. A library — it produces no executable on its own.</td></tr>
-      <tr><td><code>TensorSharp.Server.Host</code></td><td><code>TensorSharp.Server.Host</code></td><td>The runnable web application built on that library: <code>Program.cs</code>, host wiring, <code>wwwroot/</code>, and the command line. This is what you run. Not yet on NuGet.org.</td></tr>
+      <tr><td><code>TensorSharp.Server.Host</code></td><td><code>TensorSharp.Server.Host</code></td><td>The runnable web application built on that library: <code>Program.cs</code>, host wiring, <code>wwwroot/</code>, and the command line. This is what you run.</td></tr>
       <tr><td><code>TensorSharp.Cli</code></td><td><code>TensorSharp.Cli</code></td><td>Console host and debugging / batch tooling.</td></tr>
-      <tr><td><code>TensorSharp.AgentHost</code></td><td><code>TensorSharp.AgentHost.*</code></td><td>Skills, bounded agent loop, four code tools, sandboxes, workspaces, and artifacts. Not yet on NuGet.org.</td></tr>
-      <tr><td><code>TensorSharp.Distributed</code></td><td><code>TensorSharp.Distributed</code></td><td>Peer-to-peer TCP distributed tensor parallelism. Not yet on NuGet.org.</td></tr>
+      <tr><td><code>TensorSharp.AgentHost</code></td><td><code>TensorSharp.AgentHost.*</code></td><td>Skills, bounded agent loop, sub-agent coordination, four code tools, sandboxes, workspaces, and artifacts.</td></tr>
+      <tr><td><code>TensorSharp.Distributed</code></td><td><code>TensorSharp.Distributed</code></td><td>Peer-to-peer TCP distributed tensor parallelism.</td></tr>
     </tbody>
   </table>
   </div>
   <p>For a typical embedding scenario, reference <code>TensorSharp.Models.csproj</code>; it already references Core, Runtime, and the backend projects. From a sibling application beside the TensorSharp checkout:</p>
   <pre data-lang="bash"><code>dotnet add reference ../TensorSharp/TensorSharp.Models/TensorSharp.Models.csproj</code></pre>
-  <div class="callout warn"><div class="ic">📦</div><p>NuGet <code>3.1.2</code> is an older snapshot; use project references when you need the current implementation. Runtime.Logging, AgentHost, Chat, Server.Host, and Distributed require source references because they have no published package yet. Source builds compile native GGML/MLX by default; for managed-CPU development pass <code>-p:TensorSharpSkipGgmlNative=true -p:TensorSharpSkipMlxNative=true</code>, or build the native libraries described under <a href="backends.html#native-build">Backends</a>.</p></div>
+  <div class="callout warn"><div class="ic">📦</div><p>The NuGet packages are a snapshot of the <code>v2026.09.01</code> release; use project references when you need the current implementation. Source builds compile native GGML/MLX by default; for managed-CPU development pass <code>-p:TensorSharpSkipGgmlNative=true -p:TensorSharpSkipMlxNative=true</code>, or build the native libraries described under <a href="backends.html#native-build">Backends</a>.</p></div>
 
   <h2 id="quickstart">Minimal example — load, generate, decode</h2>
   <p>Every model is loaded the same way: <code>ModelBase.Create()</code> reads the GGUF metadata and instantiates the right architecture. From there you tokenize, run forward passes, sample, and decode.</p>
@@ -96,8 +96,10 @@ Console.WriteLine($"vocab={model.Config.VocabSize}, tokens={tokenIds.Count}, top
 
   <h2 id="diffusion">DiffusionGemma — text diffusion</h2>
   <p>DiffusionGemma is a <strong>block text-diffusion</strong> model, not an autoregressive one. <code>ModelBase.Create()</code> still loads it (the GGUF architecture is <code>diffusion-gemma</code> / <code>diffusion_gemma</code>) and returns a <code>DiffusionGemmaModel</code>, but its <code>Forward(int[])</code> intentionally throws — generation runs through <code>DiffusionGemmaSampler</code>, which iteratively denoises fixed-length <em>canvas</em> blocks over a <code>[prompt | canvas]</code> sequence. See the <a href="models.html#table">DiffusionGemma model card</a> for the architecture.</p>
-  <pre data-lang="csharp"><code>using TensorSharp.Models;
-using TensorSharp.Models.DiffusionGemma;
+  <pre data-lang="csharp"><code>using System;
+using System.Collections.Generic;
+using System.Linq;
+using TensorSharp.Models;   // DiffusionGemmaModel, DiffusionGemmaSampler, DiffusionEbParams
 using TensorSharp.Runtime;
 
 // Load a diffusion-gemma GGUF — the architecture is auto-detected.
@@ -105,7 +107,8 @@ using var model = (DiffusionGemmaModel)ModelBase.Create("diffusion-gemma.gguf", 
 
 // Render the prompt with the model's chat template, then tokenize.
 var messages = new List&lt;ChatMessage&gt; { new() { Role = "user", Content = "Write a haiku about winter." } };
-string rendered = PromptRenderer.Render(model.Config.ChatTemplate, messages,
+var renderer = new GgufPromptRenderer();
+string rendered = renderer.Render(model.Config.ChatTemplate, messages,
     addGenerationPrompt: true, architecture: model.Config.Architecture);
 int[] promptTokens = model.Tokenizer.Encode(rendered, addSpecial: true).ToArray();
 
@@ -127,6 +130,7 @@ List&lt;int&gt; generated = sampler.Generate(promptTokens, p,
 Console.WriteLine();
 Console.WriteLine(model.Tokenizer.Decode(generated));</code></pre>
   <p>Key parameters on <code>DiffusionEbParams</code>: <code>MaxDenoisingSteps</code> (48), <code>TMin</code>/<code>TMax</code> temperature schedule (0.4 / 0.8), <code>EntropyBound</code> (0.1), <code>StabilityThreshold</code> / <code>ConfidenceThreshold</code> early-stop, <code>Seed</code>, and <code>MaxBlocks</code>. <code>model.CanvasLength</code> reports the per-block canvas size.</p>
+  <p><strong>Image input and typed decisions.</strong> <code>model.LoadVisionEncoder(path)</code> loads the Gemma 4 vision tower from an mmproj GGUF or straight from the Hugging Face shard <code>model-00011-of-00011.safetensors</code>; audio and video are refused. With a tower loaded, set <code>ImagePaths</code> on the user message and pass the tokenized prompt through <code>model.MultimodalInjector.ProcessPromptTokens(messages, tokens)</code> and <code>QueuePromptEmbeddings(0)</code> before <code>Generate</code>, as the CLI does. For Jev-style typed decisions, reference <code>TensorSharp.Chat</code> and call <code>ModelService.JevAsync(JevRequest.Parse(json.RootElement))</code> (namespaces <code>TensorSharp.Server</code> and <code>TensorSharp.Server.Jev</code>) — the validated path behind <code>POST /v1/systemone</code>. The low-level read is <code>DiffusionGemmaModel.ReadStructured(promptTokens, seedCanvas, positions, tokenIds)</code>, called while holding <code>GpuComputeLock</code>. See <a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/models/jev.md" target="_blank" rel="noopener">docs/models/jev.md</a>.</p>
   <div class="callout note"><div class="ic">🌫️</div><p>On GPU backends the prompt K/V is cached once per block and reused across denoising steps; GGML backends default to a fused whole-model decode plus a fused lm-head tail. Tunables (<code>DIFFUSION_STEPS</code>, <code>DIFFUSION_NO_SC</code>, …) are in the <a href="advanced.html">Advanced</a> page.</p></div>
 
   <h2 id="imagegen">Qwen-Image-2.1 — image generation &amp; editing</h2>
@@ -172,6 +176,7 @@ Console.WriteLine($"Saved {edited.Width}x{edited.Height} edited image.");</code>
       <tr><td><code>TopP</code></td><td>float</td><td>0.9</td><td>Nucleus sampling; 1.0 = disabled.</td></tr>
       <tr><td><code>MinP</code></td><td>float</td><td>0</td><td>Minimum probability threshold relative to the max.</td></tr>
       <tr><td><code>RepetitionPenalty</code></td><td>float</td><td>1.1</td><td>Multiplicative penalty; &gt;1 discourages repetition.</td></tr>
+      <tr><td><code>PenaltyLastN</code></td><td>int</td><td>64</td><td>How many recent tokens the repetition / presence / frequency penalties consider (<code>--repeat-last-n</code> on both hosts; request field <code>repeat_last_n</code>).</td></tr>
       <tr><td><code>PresencePenalty</code></td><td>float</td><td>0</td><td>Additive penalty for tokens already present.</td></tr>
       <tr><td><code>FrequencyPenalty</code></td><td>float</td><td>0</td><td>Additive penalty proportional to token frequency.</td></tr>
       <tr><td><code>Seed</code></td><td>int</td><td>-1</td><td>Reproducible sampling; -1 = time-based.</td></tr>
@@ -186,7 +191,7 @@ Console.WriteLine($"Saved {edited.Width}x{edited.Height} edited image.");</code>
   <p>On TensorSharp's tool-capable chat formats, selected and discovered skills begin as metadata only; the model reads instructions and bundled files on demand. If the model has no usable tool parser, TensorSharp instead inlines selected skill bodies and withholds the built-in skill/code tools, so the request remains useful without pretending a tool round trip will work.</p>
   <p>It covers the two situations that actually arise, selected with <code>SkillsChatClientOptions.Delivery</code>.</p>
 
-  <h3>Against TensorSharp.Server — <code>SkillDelivery.Server</code></h3>
+  <h3>Against the TensorSharp server (<code>TensorSharp.Server.Host</code>) — <code>SkillDelivery.Server</code></h3>
   <p>Name the skills and the server does everything, including the progressive-disclosure loop, next to the model. Nothing is uploaded per request and the skill files never leave the server.</p>
   <pre data-lang="csharp"><code>using System;
 using System.Threading.Tasks;
@@ -251,12 +256,13 @@ foreach (SkillToolInvocation call in reply.SkillInvocations)
     <thead><tr><th>Property</th><th>Type</th><th>Default</th><th>Meaning</th></tr></thead>
     <tbody>
       <tr><td><code>Endpoint</code></td><td>string</td><td><em>required</em></td><td>API root, with or without a trailing <code>/v1</code>.</td></tr>
-      <tr><td><code>ApiKey</code></td><td>string?</td><td>null</td><td>Bearer token, when the endpoint wants one. TensorSharp.Server does not.</td></tr>
+      <tr><td><code>ApiKey</code></td><td>string?</td><td>null</td><td>Bearer token, when the endpoint wants one. <code>TensorSharp.Server.Host</code> does not.</td></tr>
       <tr><td><code>DefaultModel</code></td><td>string?</td><td>null</td><td>Model name sent with every request unless one is set per request.</td></tr>
       <tr><td><code>Delivery</code></td><td><code>SkillDelivery</code></td><td><code>Auto</code></td><td>Who resolves skills: <code>Auto</code>, <code>Server</code>, or <code>Local</code>.</td></tr>
       <tr><td><code>Registry</code></td><td><code>SkillRegistry?</code></td><td>null</td><td>The skills used under local delivery. Ignored under server delivery, where the endpoint owns them.</td></tr>
       <tr><td><code>PromptOptions</code></td><td><code>SkillPromptOptions</code></td><td><code>.Default</code></td><td>Prompt budgets for local delivery.</td></tr>
       <tr><td><code>LoopOptions</code></td><td><code>SkillAgentLoopOptions</code></td><td><code>.Default</code></td><td>Loop bounds for local delivery — <code>MaxRounds</code> 8, <code>MaxCallsPerRound</code> 8, and an <code>OnInvocation</code> callback fired after each executed tool call.</td></tr>
+      <tr><td><code>MultiAgent</code></td><td><code>MultiAgentOptions</code></td><td><code>new()</code> (enabled)</td><td>Sub-agent delegation under local delivery: the model may spawn child agents, each run as its own conversation with the same endpoint. <code>LoopOptions.MultiAgent</code>, when set, takes precedence. When the endpoint is detected as TensorSharp or as having a skills API, local delivery sends <code>"multi_agent": false</code> so the server does not delegate as well.</td></tr>
       <tr><td><code>Discovery</code></td><td>bool</td><td>true</td><td>Advertise skills the request did not select, so the model can pick one up. <code>SkillsChatRequest.Discovery</code> overrides it per request.</td></tr>
       <tr><td><code>Timeout</code></td><td><code>TimeSpan</code></td><td>10 minutes</td><td>Per-request timeout. Only used when the client creates its own <code>HttpClient</code> — pass one from <code>IHttpClientFactory</code> to the constructor instead and it is left alone.</td></tr>
     </tbody>
@@ -272,11 +278,12 @@ foreach (SkillToolInvocation call in reply.SkillInvocations)
       <tr><td><code>SkillsChatRequest.Skills</code></td><td><code>List&lt;string&gt;</code></td><td>Skill names to use, as they appear in the registry.</td></tr>
       <tr><td><code>SkillsChatRequest.Tools</code></td><td><code>List&lt;ToolFunction&gt;?</code></td><td>The caller's own tools. Never executed by the client; returned for the caller to service.</td></tr>
       <tr><td><code>SkillsChatRequest.Model</code> · <code>MaxTokens</code> · <code>Temperature</code> · <code>TopP</code> · <code>Think</code> · <code>Discovery</code></td><td>string? · int? · double? · double? · bool · bool?</td><td>Per-request overrides; a null leaves the setting to the endpoint (or, for <code>Discovery</code>, to the client's own option).</td></tr>
+      <tr><td><code>SkillsChatRequest.MultiAgent</code></td><td>bool?</td><td><code>false</code> turns delegation off for this request — locally, or by sending <code>"multi_agent": false</code> under server delivery. Null follows the client's (or server's) policy.</td></tr>
       <tr><td><code>SkillsChatRequest.User(prompt, params skills)</code></td><td>static</td><td>Convenience for the common single-turn case.</td></tr>
       <tr><td><code>SkillsChatResponse.Content</code> · <code>Thinking</code></td><td>string · string?</td><td>The assistant's answer, and its reasoning when the model exposed any.</td></tr>
       <tr><td><code>SkillsChatResponse.ToolCalls</code></td><td><code>IReadOnlyList&lt;ToolCall&gt;</code></td><td>Calls to the caller's own tools, which the client never executes.</td></tr>
       <tr><td><code>SkillsChatResponse.Messages</code></td><td><code>List&lt;ChatMessage&gt;</code></td><td>The full transcript, including anything the disclosure loop appended.</td></tr>
-      <tr><td><code>SkillsChatResponse.SkillInvocations</code></td><td><code>IReadOnlyList&lt;SkillToolInvocation&gt;</code></td><td>Every skill file the model read, in order — <code>Round</code>, <code>Tool</code>, <code>SkillId</code>, <code>ResourcePath</code>, <code>Ok</code>, <code>ResultBytes</code>. Empty under server delivery.</td></tr>
+      <tr><td><code>SkillsChatResponse.SkillInvocations</code></td><td><code>IReadOnlyList&lt;SkillToolInvocation&gt;</code></td><td>Every host tool call, in completion order, across the parent and any sub-agents — <code>Round</code>, <code>Tool</code>, <code>SkillId</code>, <code>ResourcePath</code>, <code>Ok</code>, <code>ResultBytes</code>, and <code>AgentId</code> (<code>/root</code> for the parent). Empty under server delivery.</td></tr>
       <tr><td><code>SkillsChatResponse.FinishReason</code> · <code>PromptTokens</code> · <code>CompletionTokens</code> · <code>Rounds</code></td><td>string? · int · int · int</td><td>Why generation stopped, tokens summed over every round, and how many generations ran. <code>Rounds</code> is 1 when the model answered without reading anything.</td></tr>
     </tbody>
   </table>
@@ -304,8 +311,8 @@ foreach (SkillToolInvocation call in reply.SkillInvocations)
 
   <h2 id="agenthost">AgentHost runtime layer</h2>
   <p><code>TensorSharp.AgentHost</code> is the optional agentic layer over <code>TensorSharp.Runtime</code>; Runtime has no dependency back to it. <code>CodeExecOptions</code>, <code>ShellRunner</code>, and <code>CodeRunnerAdapter</code> implement the four host-owned tools <code>read_file</code>, <code>write_file</code>, <code>shell</code>, and <code>apply_patch</code>. File tools are declared only when the host supplies a persistent workspace; a direct caller without one gets <code>shell</code> alone.</p>
-  <p><code>SkillAgentLoop</code> runs a bounded single-assistant loop, executes only TensorSharp-owned skill/code calls, and returns calls to the application's own tools in <code>SkillLoopResult.PendingClientToolCalls</code>. Hosts default to 8 generations, raised to 24 when code tools are offered unless an operator set the bound. <code>SessionWorkspaceManager</code> gives each server session a private workspace; request-only callers get one workspace for that request. Working files, allowed exported environment state, and installed packages persist in that scope, while <code>PATH</code> is rebuilt for every shell call.</p>
-  <div class="callout warn"><div class="ic">🔒</div><p>Code tools are off by default and sandbox mode defaults to <code>required</code>. macOS Seatbelt cannot guarantee cleanup of a deliberately detached child; Linux needs bubblewrap 0.12+; Windows job objects cannot confine files or sockets, so execution requires explicit unconfined mode. These are startup permissions, not per-command approvals, and the loop does not spawn subagents. Structured-output requests inline selected skills and suppress built-in tools. See <a href="agentic.html">Agentic Work</a> for the complete boundary.</p></div>
+  <p><code>SkillAgentLoop</code> runs a bounded loop, executes only TensorSharp-owned skill/code calls, and returns calls to the application's own tools in <code>SkillLoopResult.PendingClientToolCalls</code>. Setting <code>SkillAgentLoopOptions.MultiAgent</code> together with <code>SubagentGeneratorFactory</code> — a <code>Func&lt;string, SkillTurnGenerator&gt;</code> that returns an independent generator for each child — lets the loop coordinate a request-scoped tree of sub-agents through <code>spawn_agent</code>, <code>wait_agent</code>, <code>send_input</code>, <code>close_agent</code> and <code>list_agents</code>; an enabled <code>MultiAgent</code> (its <code>Enabled</code> defaults to <code>true</code>) without a factory throws <code>ArgumentException</code>. <code>MultiAgentOptions</code> (in <code>TensorSharp.AgentHost.Agents</code>) bounds that tree: <code>MaxConcurrentAgents</code> 3, <code>MaxAgents</code> 8, <code>MaxDepth</code> 2, <code>MaxRoundsPerAgent</code> 8, <code>MaxTotalChildGenerations</code> 48, <code>AgentTimeoutSeconds</code> 180, <code>MaxResultCharacters</code> 8000, <code>MaxTaskCharacters</code> 16000, and <code>AllowWorkerTools</code> off. Callbacks carry <code>SkillToolInvocation.AgentId</code>. Hosts default to 8 generations, raised to 24 when code tools are offered unless an operator set the bound. <code>SessionWorkspaceManager</code> gives each server session a private workspace; request-only callers get one workspace for that request. Working files, allowed exported environment state, and installed packages persist in that scope, while <code>PATH</code> is rebuilt for every shell call.</p>
+  <div class="callout warn"><div class="ic">🔒</div><p>Code tools are off by default and sandbox mode defaults to <code>required</code>. macOS Seatbelt cannot guarantee cleanup of a deliberately detached child; Linux needs bubblewrap 0.12+; Windows job objects cannot confine files or sockets, so execution requires explicit unconfined mode. These are startup permissions, not per-command approvals. Sub-agents are read-only unless <code>AllowWorkerTools</code> is set (and then only <code>worker</code> children gain the parent's mutable tools), never receive the application's own tools, and share one host-tool gate with their parent, so tool calls in a tree run one at a time. Structured-output requests inline selected skills and suppress built-in tools. See <a href="agentic.html">Agentic Work</a> for the complete boundary.</p></div>
 
   <h2 id="namespaces">Key types &amp; interfaces</h2>
   <div class="table-scroll">
@@ -318,17 +325,18 @@ foreach (SkillToolInvocation call in reply.SkillInvocations)
       <tr><td><code>ITokenizer</code></td><td><code>Encode(text, addSpecial)</code>, <code>Decode(ids)</code>, <code>IsEos(id)</code>, <code>EosTokenIds</code> (BPE &amp; SentencePiece implementations).</td></tr>
       <tr><td><code>ModelConfig</code></td><td>Architecture metadata: <code>VocabSize</code>, context length, and more.</td></tr>
       <tr><td><code>IBatchedPagedModel</code></td><td>Optional batched/paged forward (<code>ForwardBatch</code>) implemented by most architectures for continuous batching.</td></tr>
-      <tr><td><code>DiffusionGemmaModel</code> + <code>DiffusionGemmaSampler</code></td><td>Text-diffusion model and its EntropyBound denoising sampler (<code>Generate(promptTokens, DiffusionEbParams, …)</code>). <code>Forward()</code> is unsupported.</td></tr>
+      <tr><td><code>DiffusionGemmaModel</code> + <code>DiffusionGemmaSampler</code></td><td>Text-diffusion model and its EntropyBound denoising sampler (<code>Generate(promptTokens, DiffusionEbParams, …)</code>), with image input through <code>LoadVisionEncoder</code> and one-step Jev reads through <code>ReadStructured</code>. <code>Forward()</code> is unsupported.</td></tr>
       <tr><td><code>QwenImageModel</code> + <code>QwenImageParams</code></td><td>Qwen-Image-2.1 image generator and editor. <code>GenerateImage(prompt, QwenImageParams)</code> and <code>EditImage(prompt, RgbImage or IReadOnlyList&lt;RgbImage&gt;, QwenImageParams)</code> return an <code>RgbImage</code>; <code>ImageIO</code> loads/saves PNG.</td></tr>
       <tr><td><code>SkillsChatClient</code> + <code>SkillsChatClientOptions</code></td><td><a href="#skills">Agent Skills</a> against an OpenAI-compatible endpoint. <code>CompleteAsync(SkillsChatRequest)</code> returns a <code>SkillsChatResponse</code>; <code>SkillDelivery</code> chooses whether the server or this process runs the disclosure loop (in <code>TensorSharp.AgentHost.Skills</code>).</td></tr>
+      <tr><td><code>MultiAgentOptions</code> + <code>MultiAgentSession</code></td><td>Sub-agent limits and the request-scoped agent tree behind <code>spawn_agent</code> / <code>wait_agent</code> / <code>send_input</code> / <code>close_agent</code> / <code>list_agents</code> (in <code>TensorSharp.AgentHost.Agents</code>). Used by <code>SkillAgentLoop</code>, <code>SkillsChatClient</code> and the server's chat paths.</td></tr>
       <tr><td><code>SkillRegistry</code> + <code>SkillRegistryOptions</code></td><td>The set of skills a host knows about: scanning configured roots for <code>SKILL.md</code>, installing from a folder or a <code>.zip</code>, and lookup. The only component that touches skill storage, so containment is enforced in one place.</td></tr>
       <tr><td><code>InferenceEngine</code></td><td>Worker-thread scheduler + paged block pool that powers the server's continuous batching (in <code>TensorSharp.Runtime.Scheduling</code>).</td></tr>
     </tbody>
   </table>
   </div>
-  <p>Other runtime contracts worth knowing: <code>IModelArchitecture</code>, <code>IPromptRenderer</code>, <code>IOutputProtocolParser</code>, <code>IMultimodalInjector</code>, <code>IKvBlockCodec</code> (with the built-in <code>TurboQuantKvCodec</code>), and <code>IKVCachePolicy</code>.</p>
+  <p>Other runtime contracts worth knowing: <code>IModelArchitecture</code>, <code>IPromptRenderer</code> (implemented by <code>GgufPromptRenderer</code>), <code>IOutputProtocolParser</code>, <code>IMultimodalInjector</code>, and <code>IKvBlockCodec</code> (with the built-in <code>TurboQuantKvCodec</code>).</p>
 
-  <div class="callout tip"><div class="ic">💡</div><p>For most applications the easiest integration is to run <a href="server.html">TensorSharp.Server</a> and call it over the <a href="http-api.html">OpenAI-compatible API</a> — you keep your app process clean and get continuous batching for free. Reach for the library API when you need in-process control or custom decoding.</p></div>
+  <div class="callout tip"><div class="ic">💡</div><p>For most applications the easiest integration is to run <a href="server.html">TensorSharp.Server.Host</a> and call it over the <a href="http-api.html">OpenAI-compatible API</a> — you keep your app process clean and get continuous batching for free. Reach for the library API when you need in-process control or custom decoding.</p></div>
 
   <div class="content-footer">
     <a href="http-api.html">← HTTP API</a>

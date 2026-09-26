@@ -1,6 +1,6 @@
 # Qwen 3.5 / 3.6 family
 
-[← back to model index](README.md)
+[← back to model index](README.md) | [中文](qwen35_zh-cn.md)
 
 | Property | Value |
 |---|---|
@@ -9,7 +9,7 @@
 | Source class | [`Qwen35Model`](../../TensorSharp.Models/Models/Qwen35/Qwen35Model.cs) (legacy per-seq) + partial in [`Qwen35Model.GatedDeltaNet.cs`](../../TensorSharp.Models/Models/Qwen35/Qwen35Model.GatedDeltaNet.cs) + [`Qwen35Model.BatchedForward.cs`](../../TensorSharp.Models/Models/Qwen35/Qwen35Model.BatchedForward.cs) (`IBatchedPagedModel`) |
 | Vision encoder | [`Qwen35VisionEncoder`](../../TensorSharp.Models/Models/Qwen35/Qwen35VisionEncoder.cs) |
 | Image processor | [`Qwen35ImageProcessor`](../../TensorSharp.Models/Models/Qwen35/ImageProcessor.cs) |
-| Example models | Qwen3.5-9B (dense hybrid), Qwen3.5-35B-A3B / Qwen3.6-35B-A3B (MoE-family), Qwen3.6-27B (dense) |
+| Example models | Qwen3.5-9B (dense hybrid), Qwen3.5-35B-A3B / Qwen3.6-35B-A3B (MoE-family), Qwen3.6-27B / Qwen3.8-27B (dense); also [Bonsai 27B](bonsai.md) (Q1_0) and [Bonsai2 27B](bonsai2.md) (PRISM PQ2_0 / PTQ1_0) |
 | Modalities | Text, image |
 | Thinking mode | Yes (`<think> ... </think>`) |
 | Tool calling | Yes (`<tool_call>{...}</tool_call>`) |
@@ -33,9 +33,10 @@ name their projector `mmproj-F16.gguf`, so they must not share a directory):
 > `nextn_predict_layers`) is retained **only** in the GGUFs from
 > `unsloth/Qwen3.6-35B-A3B-MTP-GGUF`. The base-repo
 > [unsloth/Qwen3.6-35B-A3B-GGUF](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-GGUF)
-> files (same file names) strip it — on those, `--spec` silently falls back
-> to standard decode (`--spec-type ngram` still works there, since it needs no
-> trained drafter weights).
+> files (same file names) strip it — on those, `--spec` falls back to standard
+> decode, with a one-time warning that the checkpoint carries no draft head
+> (`--spec-type ngram` still works there, since it needs no trained drafter
+> weights).
 
 > **NVFP4 (GGML type 40):** 4-bit E2M1 values with UE4M3 per-16 sub-block
 > scales (36 bytes / 64 weights, 4.5 bpw), NVIDIA's Blackwell-native FP4
@@ -386,9 +387,11 @@ itself. Two things followed:
   cold).
   The measurements below used a real photo (`TS_TEST_QWEN35_IMAGE`). Without one the
   test draws a synthetic picture: 448x336 for the direct comparisons and 896x672 for the
-  concurrent case, because a finished request shorter than one scheduler block (256
+  concurrent case, because under the legacy retained-holder path
+  (`TS_PREFIX_CACHE_MODE=legacy`) a finished request shorter than one scheduler block (256
   tokens in this test) is never retained as a holder, so a 140-token picture left turn 2
-  too short for turn 3 to reuse anything and the concurrent case always failed.
+  too short for turn 3 to reuse anything and the concurrent case always failed (the
+  default radix tree retains from 32 tokens; see §10).
 
 **Logit tolerance.** Reuse and cold are not bit-identical: the reused turn's reply rows
 were written by the decode graph and the cold turn's by the prefill graph (different
@@ -421,7 +424,8 @@ same prompt prefilled cold straight on the model, which must have decoded the sa
 up to that step) and accepts the difference only when their top-2 margin is below the
 backend's logit tolerance; the rest of that request is then not compared. Its text-only
 control opens with a system prompt longer than one block (a 346-token first turn): with
-the one-line prompt every text turn was shorter than a block, no turn was retained, and
+the one-line prompt every text turn was shorter than a block, so under the legacy path
+no turn was retained, and
 the control reused nothing. It must now reuse everything the previous turn left.
 Measured 2026-09-17:
 
@@ -667,7 +671,8 @@ Combined, each vision encoder block goes from ~15 GPU round-trips to 2.
 
 ### Chunked parallel GatedDeltaNet recurrent prefill
 
-For `seqLen ≥ 64` on a GGML backend the per-token recurrent loop is replaced
+For prefills of at least `GDN_CHUNK_PREFILL_MIN_SEQ_LEN` tokens (default 2 on
+ggml_cuda, 6 elsewhere) on a GGML backend the per-token recurrent loop is replaced
 by a fused chunked SSM scan (`GatedDeltaNetChunkedPrefill` →
 `GgmlBasicOps.GatedDeltaNetChunked`, native side
 `TSGgml_GatedDeltaNetChunkedF32` in `ggml_ops_gated_delta_net.cpp`). The
@@ -830,7 +835,7 @@ Allocated once in `InitGDNBuffers()`:
 
 - **FullAttention layers**: standard KV cache `[numKVHeads, maxSeqLen,
   headDim]` per layer. KV dtype configurable via `--kv-cache-dtype` (`f32`,
-  `f16`, `q8_0`).
+  `f16`, `q8_0`, `q4_0`).
 - **GatedDeltaNet layers**: `_convState[layer]` float array of size
   `(convKernel - 1) * qkvDim` for the conv1d sliding window, and
   `_deltaStateTensor[layer]` of shape `[numVHeads, headVDim, headKDim]` for
@@ -850,6 +855,12 @@ Allocated once in `InitGDNBuffers()`:
   scratch the same way. `Qwen35ConvScratchTests` (model-gated) covers it.
 
 ### Retained holders: the one-block minimum
+
+Under the default radix prefix cache (`TS_PREFIX_CACHE_MODE=tree`) the tree
+decides what a finished request leaves behind, and its minimum is 32 tokens
+(`MinRetainTokens`), not one block. The rule and the validation below belong to
+the legacy retained-holder path (`TS_PREFIX_CACHE_MODE=legacy`), where they
+still apply.
 
 A finished request's per-request holder is kept for its conversation's next turn
 (`BatchExecutor.TryRetainReleasedFusedCache`, and `DonateFinishedLiveCacheToRetained` for a
@@ -1018,8 +1029,10 @@ different cache capacities, serial continuation and paired throughput measuremen
 It reports raw logit errors, softmax KL, and argmax changes with their reference
 margins, and counts actual requests rather than padded GPU lanes. Use the
 [two-reviewer HTTP probe](../../eng/validation/probe_qwen35_reviewers.py)
-separately to validate the reported prompt's delegation order and final answer;
-decode-only throughput does not measure a complete agent turn.
+separately to validate a [sub-agent](../multi_agent.md) turn (delegation is on by
+default on the server chat paths): it checks the reported prompt's delegation
+order and final answer; decode-only throughput does not measure a complete agent
+turn.
 
 ## 12. MTP / NextN speculative decoding (Qwen 3.6)
 
@@ -1027,15 +1040,16 @@ Qwen 3.6 GGUFs can ship a **NextN / multi-token-prediction (MTP) draft block** t
 both hosts use for lossless speculative decoding on solo (non-concurrent)
 sequences. Of the public conversions, only
 [unsloth/Qwen3.6-35B-A3B-MTP-GGUF](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF)
-retains the block (see [Downloads](#downloads)); GGUFs without it silently serve
-standard decode. Source:
+retains the block (see [Downloads](#downloads)); GGUFs without it serve standard
+decode after a one-time warning. Source:
 [`Qwen35Model.Speculative.cs`](../../TensorSharp.Models/Models/Qwen35/Qwen35Model.Speculative.cs),
 driven through the shared
 [`SpeculativeExecution`](../../TensorSharp.Runtime/Speculative/SpeculativeExecution.cs)
 draft / verify / rollback core — the `draft-head` algorithm of the pluggable
 `--spec-type` layer, not a Qwen-specific loop. Unlike Gemma 4, no separate draft
-GGUF is needed — the block is embedded in the trunk file, so `--draft-model`
-is not used (explicitly passing one that cannot be
+GGUF is needed — the block is embedded in the trunk file, so the NextN head
+needs no `--draft-model` (that flag is used only to attach a Qwen 3.8 DFlash2
+drafter, §12.4; explicitly passing one that cannot be
 activated on the startup model is a fail-fast startup error).
 
 ### 12.1 Embedded NextN block
@@ -1073,11 +1087,14 @@ Speculation is off by default; enable with `--spec` (env `TS_SPEC`, or the legac
 `TensorSharp.Server` — [`SpeculativeCliFlags`](../../TensorSharp.Runtime/Speculative/SpeculativeCliFlags.cs)
 is shared by both hosts. It engages on solo
 (non-concurrent) sequences whenever the loaded GGUF retains the NextN block; on
-GGUFs without it the engine silently serves standard decode.
-`--spec-draft` (range 1-64, default `8`) bounds the draft
-window and also sizes the native graph cache at load, so it belongs on the same
-command line as `--spec`; `--spec-pmin` (default `0.75` for a
-per-token head — top-1 probability over its top-10 logits) is the minimum draft
+GGUFs without it the engine logs once that speculation is unavailable and
+serves standard decode.
+`--spec-draft` (range 1-64) bounds the draft window and also sizes the native
+graph cache at load, so it belongs on the same command line as `--spec`. The
+shared default is `8`, but this hybrid trunk narrows a window the operator did
+not set to 3 (§12.5); an explicit `--spec-draft` always wins. `--spec-pmin`
+(default `0.15` for a per-token head — top-1 probability over its top-10
+logits, where a completely flat draft scores 0.10) is the minimum draft
 confidence to keep a token (`0` never gates). `--spec-type draft-head` pins this path explicitly;
 `auto` (the default) already selects it from the checkpoint. On `ggml_cuda`, the
 GDN chunked-prefill kernel also speeds the speculative verify: measured on
@@ -1087,6 +1104,22 @@ Qwen3.6-27B IQ2_XXS it cut MTP speculative-verify decode from 217 to 174 ms/toke
 list and the other three algorithms — including `--spec-type ngram`, which needs
 no trained weights at all and therefore also runs on the Qwen 3.5 checkpoints that
 ship no draft block.
+
+**After a reused prefix.** `--spec` does not turn prompt reuse off: the default
+radix prefix cache stays on (only `--no-prefix-cache` or `TS_SCHED_PREFIX_CACHE=0`
+disables it). A sequence
+that starts from a reused prefix (a retained chat turn, a startup-warmed or
+disk-restored shared prefix) has no draft hidden rows for those positions, so
+the NextN head restarts only its own private attention cache at the end of that
+gap (`DraftHeadResumesAfterGap`), keeping absolute rotary positions; the trunk's
+KV and recurrent state are untouched. The first decode step captures a fresh
+trunk hidden row before drafting resumes, so early acceptance can be lower than
+with a fully replayed head. This covers the default fused-verify route for a
+solo request; the paged speculative route selected by disabling fused verify
+still needs a position-zero prefill. A DFlash drafter (§12.4), when attached,
+replaces the NextN head and survives a gap through its own KV ring instead.
+Details:
+[Arming after a reused KV prefix](../speculative_decoding.md#arming-after-a-reused-kv-prefix).
 
 ### 12.4 DFlash2 block drafting (Qwen 3.8)
 

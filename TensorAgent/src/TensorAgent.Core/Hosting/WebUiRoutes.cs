@@ -27,10 +27,12 @@ namespace TensorAgent.Core.Hosting;
 ///
 /// <para>
 /// This is the whole reason the chat pipeline was pulled out of the ASP.NET host:
-/// the page in the WebView is <c>TensorSharp.Server/wwwroot/index.html</c> byte for
-/// byte, so the API underneath it has to answer the same paths, with the same
-/// payload shapes and the same server-sent-event frames, or the page silently
-/// misbehaves in ways no compiler catches. What changes here is only the plumbing —
+/// the page in the WebView (the app's own <c>TensorAgent.Maui/wwwroot</c>, bundled
+/// as <c>webui/</c>, whose behaviour is all in the embedded <c>tensoragent.js</c>)
+/// speaks the same API as the desktop server's Web UI, so the API underneath it has
+/// to answer the same paths, with the same payload shapes and the same
+/// server-sent-event frames, or the page silently misbehaves in ways no compiler
+/// catches. What changes here is only the plumbing —
 /// <see cref="LoopbackServer"/> instead of minimal APIs, because iOS has no ASP.NET
 /// Core runtime pack — and never the contract.
 /// </para>

@@ -9,7 +9,16 @@ model and generation backend.
 Automatic delegation is enabled by default on supported server chat paths.
 The model decides whether to delegate and which task to assign. Enabling the
 feature does not force a fixed number of agents or guarantee a faster or more
-accurate answer.
+accurate answer. No latency, answer-quality or delegation-rate results are
+published for it; the tools under [Validation and performance](#validation-and-performance)
+write their reports to ignored `artifacts/`.
+
+Delegation does not depend on skills or code execution. With `--no-skills` and
+without `--code-exec`, every eligible request still carries the five
+coordination tools and the coordination prompt, merged into the leading
+system/developer message (or added as a new leading system message when the
+request has none). Children in such a request then have no host tools
+besides those five.
 
 ## Choosing work and models
 
@@ -87,17 +96,21 @@ including its capture cost and exact generated-token comparisons. Both arms keep
 ordinary radix caching and the default public checkpoint count of two enabled.
 
 Agents belong to a request-scoped tree with parent identity and depth. Limits
-apply across that tree, including children created by other children. The
+apply across that tree, including children created by other children. Agent IDs
+are paths below `/root`, the parent: a child named `review_api` is
+`/root/review_api`, and its own child adds another segment. The
 runtime manages their background tasks, status, cancellation, and completion;
-the host supplies generation through its existing inference path.
+the host supplies generation through its existing inference path. On the
+server, each child uses the parent's model, token limit, thinking setting, and
+sampling.
 
 The model sees these native tools:
 
 | Tool | Behavior |
 |---|---|
-| `spawn_agent(task_name, task, agent_type?)` | Starts an independent child and immediately returns its ID and status. The task name must use letters, digits, underscores, or hyphens. |
-| `wait_agent(agent_id?, timeout_ms?)` | Waits for the named direct child, or all direct children when the ID is omitted. Default timeout is 10,000 ms; maximum is 60,000 ms. A timeout does not mean the child completed or was cancelled. |
-| `send_input(agent_id, message)` | Queues a message for a running child at its next generation boundary, or starts a follow-up turn on a completed child. |
+| `spawn_agent(task_name, task, agent_type?)` | Starts an independent child and immediately returns its ID and status. The task name must be 1–48 letters, digits, underscores, or hyphens, unique under its parent. `agent_type` defaults to `explorer`. |
+| `wait_agent(agent_id?, timeout_ms?)` | Waits for the named direct child, or all direct children when the ID is omitted. Default timeout is 10,000 ms; maximum is 60,000 ms. Returns each child's `agent_id`, `parent_id`, `status`, `result` and `error`, plus `timed_out`. A timeout does not mean the child completed or was cancelled. |
+| `send_input(agent_id, message)` | Queues a message for a running child at its next generation boundary (at most four queued messages), or starts a follow-up turn on a completed child. |
 | `list_agents()` | Reports direct children and their state. Waiting uses `wait_agent`, rather than repeated listing. |
 | `close_agent(agent_id)` | Cancels a child and its descendants. Cancellation is not successful completion. |
 
@@ -106,18 +119,44 @@ are not delegated: their implementations belong to the caller, and an internal
 child cannot ask that caller to service them. Read-only roles cannot execute
 shell commands, run skill scripts, or modify files. They can analyze evidence
 included in their task and use the parent's `read_file` tool when offered,
-within its existing filesystem restrictions.
+within its existing filesystem restrictions. Their host allowlist is exactly
+`skills_list`, `skills_read` and `read_file`, plus the five coordination tools.
 Enabling worker tools does
 not enable an execution surface that the operator has otherwise disabled.
+Permissions only decrease down the tree: a `worker` receives mutable tools only
+when its parent is the root or is itself a mutable worker, so a read-only child
+cannot spawn a worker to regain them.
+
+Host tool calls from the parent and every child in a request tree pass through
+one shared gate, so they run one at a time. Generation still overlaps across
+agents; tool execution does not. A client tool with the same name as a
+coordination tool takes precedence over the built-in one.
 
 Worker tools share the parent's sandbox and workspace. This version does not
 create Git worktrees or merge independent patches. Assign disjoint file scopes
 when opting into workers; read-only delegation is the default. Agent IDs do not
-grant access to another request's agents or workspace.
+grant access to another request's agents or workspace, and an agent can address
+only its own direct children.
 
 Failures, timeouts, cancellation, and exhausted budgets are reported distinctly
-from completed work. Required child results must be collected before the parent
-claims completion. Request cancellation also stops the request's descendants.
+from completed work. A report's `status` is `completed`, `failed`, `cancelled`
+or `limit_reached`; a child still in flight is reported as `running` (the
+`close_agent` result and the Web UI panel show `cancelling` while a stopped
+child winds down).
+A child generation that stops on a token, thinking-budget or repetition limit
+is `limit_reached`, and so is a child that runs out of rounds or of the shared
+generation budget. A child whose time limit expires is `cancelled`. Reports longer than `--agents-max-result-chars` end with
+`[Report truncated by host result limit]`.
+
+Required child results must be collected before the parent claims completion,
+and the host enforces this. If the parent produces a final answer while a
+direct child's report is still unread, the host holds that answer back, waits
+for the reports, and adds them to the conversation. It then asks the parent to
+integrate them and generates the answer again. It does the same when the
+parent's round limit is reached. Only the parent's text is streamed to the
+client. The final usage totals include the children's prompt, generated and
+cached tokens; total time is the request's elapsed wall time, since child
+generations overlap. Request cancellation also stops the request's descendants.
 Agent state is not a durable cross-request session API.
 
 In the Web UI, click the arrow or `wait_agent` row to expand or collapse its
@@ -127,11 +166,26 @@ status, and available tool activity or result. Details update as the agents work
 without changing whether the panel is expanded. The activity panel is temporary
 and is removed when the current operation or response finishes.
 
+The panel is built from the Web UI stream on `POST /api/chat`. While
+`wait_agent` runs, whether the model called it or the host is collecting reports
+before the final answer, its `tool_progress` frames carry an `agents` array. Each
+entry has `agent_id`, `parent_id`, `task`, `agent_type`, `status`, `tool`,
+`tool_status`, `detail`, `result` and `error`. `skill_step` frames also carry
+`agent_id`. The OpenAI and Ollama streams do not include these snapshots.
+TensorAgent's own chat page does not render an agent panel, even while
+delegation is on there; it only labels the sub-agent tool steps in words
+("Starting sub-agent", "Waiting for sub-agents", "Messaging sub-agent",
+"Stopping sub-agent", "Checking sub-agents").
+
 ## Host controls
 
 The server startup flags below configure the entire request tree. The same
 options are available through `ServerHostingOptions.MultiAgent` and
-`MultiAgentOptions` in C#. Existing server JSON configuration expands to these
+`MultiAgentOptions` in C#. `ServerHostingOptions.MultiAgent` is read again for
+every request, and an embedding host can switch delegation on or off on a running
+host with `ServerHostingOptions.RepointMultiAgent(bool enabled)`, which flips
+`MultiAgentOptions.Enabled` and keeps every limit (TensorAgent's Sub-agents switch
+uses it; the desktop server never calls it). Existing server JSON configuration expands to these
 flags. A request can set the top-level boolean `"multi_agent": false` to use a
 single agent. `true` or an omitted field follows the host policy and cannot
 enable delegation when the host has disabled it. Requests cannot raise host
@@ -157,10 +211,21 @@ cancellation; generation callbacks must honor their cancellation token, and
 host tool execution retains the existing runner's time limits.
 
 The integrated server paths are OpenAI-compatible chat completions and
-Responses, Ollama chat, and the Web UI/TensorAgent chat path. TensorAgent uses
-the host defaults; it does not add a separate settings toggle. Structured-output
-requests that suppress tools, and model families whose templates cannot render
-tools, do not offer coordination tools.
+Responses (`/v1/chat/completions`, `/v1/responses`), Ollama chat
+(`/api/chat/ollama`), and the Web UI/TensorAgent chat path (`/api/chat`).
+Ollama `/api/generate` is not integrated. TensorAgent keeps the default limits
+and has one switch, Settings > Sandbox > "Sub-agents" (`multiAgentEnabled` in its
+settings, on by default): off stops the five coordination tools and the
+coordination prompt from being declared, exactly like `--no-multi-agent`, from the
+next message and without a restart (a turn already delegating finishes under its
+old terms). It does not read `TS_NO_MULTI_AGENT`, which only the server's startup
+options read. Structured-output
+requests, `/v1/chat/completions` requests with `"tool_choice": "none"`, and model
+families that cannot both render tool declarations and parse tool calls do not
+offer coordination tools. That
+excludes Mistral 3, Hunyuan Dense, DiffusionGemma, and any architecture without a
+tool-call parser. There is no model-size gate: every family that can call tools
+receives the same tools and coordination prompt.
 
 Direct C# callers enable `SkillAgentLoopOptions.MultiAgent` and provide
 `SubagentGeneratorFactory`. That factory must allocate independent generation
@@ -169,8 +234,9 @@ session or KV state is not safe. The server integration supplies a separate
 `ChatSession` and generation context per child.
 
 `SkillsChatClient` local delivery supplies independent HTTP conversations
-automatically. Configure `SkillsChatClientOptions.MultiAgent` to set local
-limits, or set `SkillsChatRequest.MultiAgent = false` for a single-agent request.
+automatically. `SkillsChatClientOptions.MultiAgent` is enabled by default;
+configure it to set local limits, or set `SkillsChatRequest.MultiAgent = false`
+for a single-agent request (server delivery forwards that as `"multi_agent": false`).
 Against a detected TensorSharp server, local delivery suppresses server-side
 orchestration so only one host owns the tools. Token usage includes the children;
 `SkillToolInvocation.AgentId` identifies each callback's owner. Callbacks may run
@@ -270,6 +336,10 @@ own orchestration, compare API requests with `multi_agent: false` and
 `multi_agent: true` separately. The harness's nine-fact recall and unsupported-fact
 counts are narrow, reproducible quality proxies; they do not establish
 superiority on general coding or reasoning tasks.
+
+No results from these harnesses are committed to the repository. Their reports
+go to ignored `artifacts/`, and no latency, completed-task score or
+delegation-rate figure is published for any model or device.
 
 Multiple agents can improve coverage and reduce wall time when useful work
 overlaps. They also consume additional generation tokens and context memory.

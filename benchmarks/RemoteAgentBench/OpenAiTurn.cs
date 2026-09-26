@@ -19,7 +19,10 @@ internal sealed class OpenAiTurn(HttpClient client, Options options, CaseResult 
             think = options.Thinking,
             // Explicit caller ownership: never ask the remote server to select or
             // execute local skills. All tool declarations are client-owned there.
-            skills = Array.Empty<string>(), skills_discovery = false,
+            // Delegation is on by default in TensorSharp's server and would add its
+            // own coordination tools and run sub-agents remotely, so opt out of that
+            // too; servers that do not know the field ignore it like the others.
+            skills = Array.Empty<string>(), skills_discovery = false, multi_agent = false,
             messages = messages.Select(Message).ToArray(),
             tools = (tools ?? []).Select(Tool).ToArray(),
         };

@@ -3,8 +3,8 @@
   // 4-bit) with its vision projector and MTP draft head. All three files live
   // under ${modelRoot}/gemma_mtp/qat.
   // Run with:
-  //   TensorSharp.Cli    --config config/gemma-4-12b.json --image photo.png
-  //   TensorSharp.Server --config config/gemma-4-12b.json
+  //   TensorSharp.Cli         --config config/gemma-4-12b.json --image photo.png
+  //   TensorSharp.Server.Host --config config/gemma-4-12b.json
   // Missing files download from unsloth, pinned by commit and SHA-256.
   "variables": {
     "root": "${TENSORSHARP_MODELS:-../models}/gemma_mtp/qat",
@@ -30,8 +30,11 @@
     "sha256": "dcb8103adad042b1bf99df767aaf34eb37c5a73a4a2f0417e4d7ba557e91664f"
   },
 
-  // MTP speculative decoding (server only): separate draft GGUF, lossless.
-  "spec": false,
+  // MTP speculative decoding, on both hosts: Gemma-4's draft head ships as its
+  // own GGUF, and naming it here turns speculation ON by itself -- no "spec" key
+  // is needed ("spec": false would do nothing: a JSON false emits no flag).
+  // Lossless. Pass --no-spec on the command line to decode without it (the
+  // draft file is still fetched).
   "draft-model": {
     "path": "${root}/gemma-4-12B-it-Q4_0-MTP.gguf",
     "urls": ["${repo}/MTP/mtp-gemma-4-12B-it-Q4_0.gguf"],

@@ -84,8 +84,13 @@ public static class SpeculationPolicy
         if (string.IsNullOrWhiteSpace(launchEnabled))
         {
             Environment.SetEnvironmentVariable(EnabledVariable, enabled ? "1" : "0");
-            // Provisionally the weight-free algorithm, which serves every model;
-            // ChooseAlgorithm upgrades it once a draft head has really attached.
+            // Provisionally the weight-free algorithm, because it is the one that
+            // needs no draft head; ChooseAlgorithm upgrades it once a head has really
+            // attached. It does not serve every model: n-gram still needs a target
+            // that can verify a draft window in one pass (not Qwen 3 / Bonsai 8B,
+            // GPT-OSS or Mistral 3, and Nemotron-H refuses every speculator). On those
+            // the engine's capability report and execution plan log the reason and
+            // every reply decodes plainly -- a no-op, not an error.
             if (string.IsNullOrWhiteSpace(LaunchType))
                 Environment.SetEnvironmentVariable(TypeVariable, SpeculatorRegistry.NGram);
             source = enabled ? "on (setting)" : "off (setting)";

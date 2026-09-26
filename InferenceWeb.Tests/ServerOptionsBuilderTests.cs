@@ -438,7 +438,7 @@ public class ServerOptionsBuilderTests : IDisposable
                 "--paged-kv",
                 "--paged-kv-block-size", "128",
                 "--temperature", "0.42",
-                "--no-paged-kv-cache",
+                "--no-paged-kv",
             },
             _baseDir);
         Assert.Equal(0.42f, options.DefaultSamplingConfig.Temperature);
@@ -589,6 +589,9 @@ public class ServerOptionsBuilderTests : IDisposable
         // explicit opt-in the CLI does — and therefore has to document it.
         accepted.AddRange(CodeExecOptions.SwitchFlags);
         accepted.AddRange(CodeExecOptions.ValueFlags);
+        // The paged-KV family, from the tables the parser and the inert-flag warning share.
+        accepted.AddRange(ServerOptionsBuilder.PagedKvSwitchFlags);
+        accepted.AddRange(ServerOptionsBuilder.PagedKvValueFlags);
 
         var missing = accepted.Where(f => !usage.Contains(f, StringComparison.Ordinal)).ToList();
         Assert.True(missing.Count == 0,
@@ -861,15 +864,23 @@ public class ServerOptionsBuilderTests : IDisposable
 
     [Theory]
     [MemberData(nameof(RemovedFlagSpellings))]
-    public void Build_RemovedQwenImageFlags_FailWithWhyAndWhatToDoInstead(string flag, string[] args)
+    public void Build_RemovedFlags_FailWithWhyAndWhatToDoInstead(string flag, string[] args)
     {
-        // Not a bare "Unknown option": the operator needs to know the option went with
-        // the retired pipeline, and that nothing replaces it.
+        // Not a bare "Unknown option": the operator needs to know why the option went
+        // and what to use instead - Qwen-Image-2.1's own options for the retired
+        // pipeline's, the surviving spelling for the CLI-only penalty-window name.
         var ex = Assert.Throws<ArgumentException>(() => ServerOptionsBuilder.Build(args, _baseDir));
 
         Assert.Equal(RemovedCliFlags.Describe(flag), ex.Message);
         Assert.StartsWith(flag + " was removed:", ex.Message, StringComparison.Ordinal);
-        Assert.Contains("Qwen-Image-2.1", ex.Message, StringComparison.Ordinal);
+        string survivor = flag switch
+        {
+            "--penalty-last-n" => "--repeat-last-n",
+            "--paged-kv-cache" => "Use --paged-kv instead",
+            "--no-paged-kv-cache" => "Use --no-paged-kv instead",
+            _ => "Qwen-Image-2.1",
+        };
+        Assert.Contains(survivor, ex.Message, StringComparison.Ordinal);
         Assert.DoesNotContain("Unknown option", ex.Message, StringComparison.Ordinal);
     }
 

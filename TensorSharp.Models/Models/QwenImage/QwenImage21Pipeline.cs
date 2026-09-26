@@ -198,21 +198,89 @@ namespace TensorSharp.Models.QwenImage
             return Vae.Decode(new VaeLatent(64, h, w, pooled));
         }
 
+        internal const string DefaultWidthVariable = "TS_QWEN_IMAGE_WIDTH";
+        internal const string DefaultHeightVariable = "TS_QWEN_IMAGE_HEIGHT";
+
+        // What an omitted targetArea resolves to. The Web UI / API layer resolves it before
+        // the request reaches the pipeline, so this value is indistinguishable from "no area".
+        private static readonly long AutomaticTargetArea = new QwenImageParams().ResolveTargetArea();
+
+        // The default-size configuration last warned about, so each one is reported once.
+        private static string _defaultSizeWarnedFor;
+
         internal static (int Width, int Height) ResolveDimensions(QwenImageParams p, RgbImage reference)
         {
             int width = p.Width, height = p.Height;
-            if (width == 0 && height == 0 &&
-                int.TryParse(Environment.GetEnvironmentVariable("TS_QWEN_IMAGE_WIDTH"), out int envWidth) &&
-                int.TryParse(Environment.GetEnvironmentVariable("TS_QWEN_IMAGE_HEIGHT"), out int envHeight))
-                (width, height) = (envWidth, envHeight);
             if (width != 0 || height != 0)
             {
                 if (width <= 0 || height <= 0 || width % 32 != 0 || height % 32 != 0)
                     throw new ArgumentException("Qwen-Image-2.1 width and height must both be positive multiples of 32.");
                 return (width, height);
             }
+            // The server's default size (--width/--height) stands in only for a request that
+            // named neither a size nor an area; an explicit area keeps its own geometry.
+            bool areaRequested = p.TargetArea > 0 && p.TargetArea != AutomaticTargetArea;
+            if (!areaRequested && DefaultSize() is { } size)
+                return size;
             long area = p.ResolveTargetArea();
             return DimensionsForArea(reference?.Width ?? 1, reference?.Height ?? 1, area);
+        }
+
+        /// <summary>The operator's default output size (TS_QWEN_IMAGE_WIDTH/HEIGHT, which the
+        /// server's --width/--height set), or null when there is none usable. It is a fallback
+        /// for every request that names no size, so a bad value must not fail each of them:
+        /// sides that are not multiples of 32 snap down (minimum 32), and a half-configured or
+        /// unparsable pair is ignored. Either is reported once per configuration.</summary>
+        internal static (int Width, int Height)? DefaultSize()
+        {
+            string rawWidth = Environment.GetEnvironmentVariable(DefaultWidthVariable)?.Trim();
+            string rawHeight = Environment.GetEnvironmentVariable(DefaultHeightVariable)?.Trim();
+            bool hasWidth = !string.IsNullOrEmpty(rawWidth), hasHeight = !string.IsNullOrEmpty(rawHeight);
+            if (!hasWidth && !hasHeight)
+                return null;
+
+            string configuration = rawWidth + "x" + rawHeight;
+            const string automatic = "requests that name no size keep the automatic size " +
+                "(the native 2048x2048 area, following the first reference image's aspect ratio on an edit).";
+            if (hasWidth != hasHeight)
+            {
+                string set = hasWidth ? DefaultWidthVariable : DefaultHeightVariable;
+                string missing = hasWidth ? DefaultHeightVariable : DefaultWidthVariable;
+                WarnDefaultSizeOnce(configuration,
+                    $"{set} is set without {missing}; the default image size needs both (the server's --width " +
+                    $"and --height). Ignoring it: {automatic}");
+                return null;
+            }
+
+            if (!TryParsePixels(rawWidth, out int width) || !TryParsePixels(rawHeight, out int height))
+            {
+                WarnDefaultSizeOnce(configuration,
+                    $"{DefaultWidthVariable}={rawWidth} / {DefaultHeightVariable}={rawHeight} is not a pair of " +
+                    $"positive pixel counts. Ignoring it: {automatic}");
+                return null;
+            }
+
+            int snappedWidth = Math.Max(32, width / 32 * 32), snappedHeight = Math.Max(32, height / 32 * 32);
+            if (snappedWidth != width || snappedHeight != height)
+            {
+                WarnDefaultSizeOnce(configuration,
+                    $"the default image size {width}x{height} ({DefaultWidthVariable}/{DefaultHeightVariable}) " +
+                    $"is not a multiple of 32 on both sides; requests that name no size render at " +
+                    $"{snappedWidth}x{snappedHeight} instead.");
+            }
+            return (snappedWidth, snappedHeight);
+        }
+
+        private static bool TryParsePixels(string raw, out int pixels) =>
+            int.TryParse(raw, System.Globalization.NumberStyles.Integer,
+                System.Globalization.CultureInfo.InvariantCulture, out pixels) && pixels > 0;
+
+        private static void WarnDefaultSizeOnce(string configuration, string message)
+        {
+            if (string.Equals(System.Threading.Interlocked.Exchange(ref _defaultSizeWarnedFor, configuration),
+                    configuration, StringComparison.Ordinal))
+                return;
+            Console.Error.WriteLine($"[qwen-image] WARNING: {message} Reported once.");
         }
 
         private static (int Width, int Height) DimensionsForArea(int sourceWidth, int sourceHeight, long area)

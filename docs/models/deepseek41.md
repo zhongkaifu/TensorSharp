@@ -58,12 +58,12 @@ The same repository also provides eleven Q4_K_M shards (approximately 415 GiB)
 with embedded Engram constants. Change the include pattern to
 `DeepSeek-V4.1-Flash-Q4_K_M-*.gguf` and use its first shard. The two Q4_K_M
 Engram tables are approximately 51.5 GiB each. On eight 46 GB cards they remain
-host mappings, and routed experts need CPU offload. The
-[quantization report](../validation/deepseek41-quants/README.md) records the
-historical tests of that placement.
+host mappings, and routed experts need CPU offload. The quantization report
+`docs/validation/deepseek41-quants/README.md` (local validation evidence, not committed) records the historical tests
+of that placement.
 
-Earlier results in this card and the
-[complete-file SHA-256 record](../validation/deepseek41/checkpoint-sha256.json)
+Earlier results in this card and the complete-file SHA-256 record
+`docs/validation/deepseek41/checkpoint-sha256.json` (local validation evidence, not committed)
 refer to revision `8e0c4de3cb6519bfc11ed69dc87184b457a57bb5` and its older
 first shard. Those hashes and performance results must not be attributed to the
 current files without rerunning the checks. Record the repository revision and
@@ -92,7 +92,8 @@ The preparer downloads the isolated vision shard and small byte ranges for
 the delimiter/router tensors and preserves BF16/F32 storage. It verifies the
 complete isolated vision shard against its LFS SHA-256 and records individual
 range hashes for delimiter/router weights; it does not download or verify the
-entire original text shards. The [companion provenance record](../validation/deepseek41/vision-companion.json)
+entire original text shards. The companion provenance record
+`docs/validation/deepseek41/vision-companion.json` (local validation evidence, not committed)
 contains all 306 tensors, source revisions, ranges, and the output digest.
 The native loader checks the parent tokenizer fingerprint and model
 dimensions before attachment. To enable images, add
@@ -156,8 +157,11 @@ from that request.
 Valid image data URIs retain their existing decoding and upload path. The text
 context budget still applies after expanding every image.
 The final routed-TP host (managed stage 3,651, native `6b3b5ab3…`) passed all
-eight [image rejection checks](../validation/deepseek41/full-checkpoint/tp8-context65536-ubatch1024-cpumoe0-cputhreads32-sparse1-compact1-chunk1024-6b3-final-image-input-rejections.json)
-and four [Responses audio rejection checks](../validation/deepseek41/full-checkpoint/tp8-context65536-ubatch1024-cpumoe0-cputhreads32-sparse1-compact1-chunk1024-6b3-final-audio-input-rejections.json).
+eight image rejection checks
+`docs/validation/deepseek41/full-checkpoint/tp8-context65536-ubatch1024-cpumoe0-cputhreads32-sparse1-compact1-chunk1024-6b3-final-image-input-rejections.json`
+and four Responses audio rejection checks
+`docs/validation/deepseek41/full-checkpoint/tp8-context65536-ubatch1024-cpumoe0-cputhreads32-sparse1-compact1-chunk1024-6b3-final-audio-input-rejections.json`
+(local validation evidence, not committed).
 Streaming and non-streaming requests returned JSON 400 without SSE for remote
 image URLs, malformed image base64, and valid-shaped or malformed audio parts.
 The earlier CPU-offload host's eight image checks remain preserved separately.
@@ -218,7 +222,8 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 MAX_CONTEXT=65536 \
   --host 127.0.0.1 --port 5000 --max-tokens 2048
 ```
 
-The [measured launch record](../validation/deepseek41/full-checkpoint/layer8-context65536-ubatch1024-cpumoe0-cputhreads32-sparse1-compact1-chunk1024-6b3-final-launch.json)
+The measured launch record
+`docs/validation/deepseek41/full-checkpoint/layer8-context65536-ubatch1024-cpumoe0-cputhreads32-sparse1-compact1-chunk1024-6b3-final-launch.json` (local validation evidence, not committed)
 contains the original VM paths, binary hashes and environment. This profile
 passed 138/138 inference cases; its throughput and limits are recorded below.
 Compact gathering remains opt-in, with its documented floating-point
@@ -287,7 +292,7 @@ criterion, records the same-device partitioned evaluation beside it, and
 growth/failure recovery. Nonaligned strip shapes stay on ggml's route. Narrow
 strips are 15-36% slower per MoE call in the recorded microbenchmarks, so this
 is a correctness change, not a speedup; see
-[numerical-tp-chosen-r1](../validation/qualification-2026-09-16/numerical-tp-chosen-r1/README.md).
+`docs/validation/qualification-2026-09-16/numerical-tp-chosen-r1/README.md` (local validation evidence, not committed).
 
 If the weights and context do not fit, add `--n-cpu-moe N` to keep the routed
 experts of the first N layers on the host, or `--cpu-moe` for all routed
@@ -302,11 +307,12 @@ retain whole CPU experts; the remaining layers use the routed-expert shards.
 Native `6b3b5ab3…` explicitly assigns shared gate/up/down projections to the
 layer device. This corrects earlier scheduler placement that could send shared
 gate/up work to CPU after a CPU-offloaded or TP routed branch. The
-[placement and numerical checks](../validation/deepseek41/shared-expert-placement/README.md)
-passed 597/597 on two GPUs. Earlier full-checkpoint placement benchmarks retain
+placement and numerical checks
+(`docs/validation/deepseek41/shared-expert-placement/README.md`, local validation
+evidence, not committed) passed 597/597 on two GPUs. Earlier full-checkpoint placement benchmarks retain
 their original binaries and results. Final CPU-offload, routed-TP and layer-split
-profiles using the corrected placement have completed. See the
-[placement records](../validation/deepseek41/final-placements/README.md).
+profiles using the corrected placement have completed. See the placement
+records in `docs/validation/deepseek41/final-placements/README.md` (local validation evidence, not committed).
 
 For a warm CPU-offload benchmark, read the offloaded expert pages separately
 after model loading and before starting the timed requests:
@@ -431,8 +437,8 @@ existing policy, except for shared boundary pages. Set
 `TS_DSV41_ENGRAM_RANDOM=0` to disable it or `=1` to force it. When unset, a
 one-worker configuration retains the default mapping policy. Unsupported
 platforms and rejected OS hints remain nonfatal. The source comparison and
-paired scratch-file results are in the
-[Engram investigation](../validation/deepseek41/cli-gpu-execution/README.md).
+paired scratch-file results are in the Engram investigation,
+`docs/validation/deepseek41/cli-gpu-execution/README.md` (local validation evidence, not committed).
 
 ### Backends
 
@@ -501,8 +507,9 @@ lookups use host memory only when the tables are host-mapped. Layer split execut
 successive layers on successive GPUs, so low per-device utilization alone does not establish a
 CPU fallback. `TS_DSV4_PERF=2` reports input preparation and graph-compute times;
 `TS_DSV4_PERF=3` additionally logs actual scheduler backend transitions. These
-are diagnostic modes whose logging overhead affects throughput. See the
-[CLI execution investigation](../validation/deepseek41/cli-gpu-execution/README.md).
+are diagnostic modes whose logging overhead affects throughput. See the CLI
+execution investigation, `docs/validation/deepseek41/cli-gpu-execution/README.md`
+(local validation evidence, not committed).
 
 On `ggml_cuda`, V4.1 attention runs TensorSharp's owned F32 kernels (ggml's CUDA
 flash attention narrows Q and the softmax weights to F16, and the cache
@@ -817,6 +824,16 @@ and neither do V4.1's direct-CUDA and pure-C# executors, which have no
 checkpoint. `--think` off needs none of this: without the reasoning drop the
 render is a pure extension of the cache and reuse needs no rewind.
 
+Across requests this reuse is driven by the Radix prefix cache, the default
+mode, with the native executor deciding each rewind. Without further opt-in the
+live cache is what carries over; `TS_DSV41_RETAINED_CACHE=1` additionally keeps
+finished requests' native slots, so more than one conversation can continue
+without a full re-prefill. Retention is bounded by `TS_DSV41_RETAINED_CACHE_MB`
+(default 2048; `0` or an unparsable value declines retention), applies only to
+the native executor — the one that can rewind — and is off while a DSpark
+drafter is loaded. It is off by default, and no measurement of it is recorded
+in this card.
+
 Native V4.1 requests own independent KV slots. The scheduler therefore sizes
 its metadata-only block pool for one context per allowed running request.
 The scheduler default permits 16 running requests; the example explicitly
@@ -897,8 +914,9 @@ current GGUF shards; no separate Engram preparation is needed.
 `TS_DSV4_THREADS` sets the compute thread count, defaulting to at most 32. That
 cap was chosen for GPU runs, where those threads only do auxiliary host work; on
 a CPU-only run they are the whole engine, so set it to the cores the run may
-actually use. `TS_DSV4_UBATCH` (default 256) and `MAX_CONTEXT` (default 65,536)
-behave as they do on CUDA, and both cost host memory rather than VRAM here.
+actually use. `TS_DSV4_UBATCH` (fixed at 256 here unless set, where `ggml_cuda`
+picks the width automatically) and `MAX_CONTEXT` (default 65,536) both cost host
+memory rather than VRAM here.
 
 The options that name GPUs behave as follows:
 
@@ -921,7 +939,10 @@ The options that name GPUs behave as follows:
   all apply on this backend.
 - `TS_DSV4_VRAM_RESERVE_MB` is subtracted from the one device's free memory
   before layers are packed onto it. That device is the host here, so its
-  2048 MiB default holds back 2 GiB of system RAM, and the loader's refusal
+  default reserve (at least 2 GiB; about 2,318 MiB at the 256-token ubatch and
+  65,536 context this path uses, see
+  [Device memory held back for the graph](#device-memory-held-back-for-the-graph))
+  is held back from system RAM, and the loader's refusal
   when the model does not fit is worded for VRAM ("not enough VRAM ... Re-run
   with `--n-cpu-moe N`"). The advice is still the right advice — see below.
 - `TS_DSV41_COMPACT_RAW_GATHER` was measured on CUDA and defaults off; it
@@ -973,9 +994,9 @@ path, not a serving one: no throughput, load time or resident footprint has been
 measured for a full checkpoint on it.
 
 `--backend cuda`, the direct-CUDA engine, also runs V4.1 with its own kernels and
-no ggml. It is not yet held to a numerical gate — see
-[the CUDA backend notes](../validation/deepseek41-cuda-backend/README.md) for what
-has been verified and what blocks the rest. `--backend mlx` remains refused.
+no ggml. It is not yet held to a numerical gate — the CUDA backend notes,
+`docs/validation/deepseek41-cuda-backend/README.md` (local validation evidence, not committed),
+record what has been verified and what blocks the rest. `--backend mlx` remains refused.
 
 ## Forward graph and state
 
@@ -1082,6 +1103,11 @@ These tool-policy and thinking/JSON guarantees apply to `/v1/chat/completions`.
 The existing `/v1/responses` surface does not support the same V4.1 tool-history
 round trips or reasoning-plus-JSON combination.
 
+Because V4.1 renders tool declarations and parses DSML calls, it is also
+eligible for skills, the code tools (`--code-exec`) and, on the server,
+[sub-agent delegation](../multi_agent.md), which is on by default on the chat
+paths. No delegation results are published for V4.1.
+
 For V4.1, reaching `TS_THINKING_BUDGET` emits the trained `</think>` token and
 continues the final answer within the original `max_tokens` limit. The default
 budget is 75% when the requested output allowance is at least 512 tokens.
@@ -1109,11 +1135,21 @@ original output limit retain precedence.
 - Multi-GPU execution defaults to whole-layer placement. `TS_DSV41_TP` enables
   experimental routed-MoE tensor parallelism with host-staged reduction.
   Attention tensor parallelism and distributed groups are not implemented.
-- Concurrent requests have isolated sequence slots. V4.1 currently falls back
-  to per-slot forward calls instead of the V4 fused token-batched graph, so
-  concurrency does not imply batched GPU throughput.
-- V4.1 DSpark speculative decoding is not implemented; V4 draft models are
-  rejected.
+- Concurrent requests have isolated sequence slots. On the native executor
+  with the CUDA fused backend (`--backend ggml_cuda`), their decode steps run
+  as one token-batched graph (see
+  [Token-batched decode](#token-batched-decode)). `--backend ggml_cpu`,
+  `TS_DSV4_FUSED=0`, a loaded DSpark drafter or `TS_BATCHED_FUSED_DECODE=0`
+  keeps them on per-slot forward calls.
+- V4.1 DSpark speculative decoding is experimental. The loader accepts a
+  `deepseek41-dspark` drafter (`--draft-model` / `TS_DSV4_DSPARK`) on
+  `ggml_cuda` and `ggml_cpu` only, refuses it on every other executor, and
+  rejects V4 drafters. It is validated only on synthetic fixtures
+  (`DeepSeek41DsparkIntegrationTests`); no trained V4.1 drafter has been
+  measured, so there is no acceptance or throughput figure for it. While a
+  drafter is loaded, token-batched decode and the retained cache are off.
+  Without a drafter, `--spec` (including `--spec-type ngram`) serves standard
+  decode.
 - The K/V cache is F16 on every executor and `KV_CACHE_DTYPE=q8_0` / `q4_0`
   is **refused at load** (`NotSupportedException`, before the checkpoint is
   opened, from `DeepSeek41Architecture.ValidateLoad`); an explicit `f32` is
@@ -1147,8 +1183,9 @@ original output limit retain precedence.
 - The full-checkpoint numerical smoke produces the expected tokens but fails
   the strict F32-input oracle comparison (relative L2 0.146216, maximum absolute
   error 2.708920). Quantized activation arithmetic differs from that reference;
-  the [retained stage analysis](../validation/deepseek41/smoke18-reference/README.md)
-  does not fully attribute the final discrepancy. Greedy agreement is not
+  the retained stage analysis
+  (`docs/validation/deepseek41/smoke18-reference/README.md`, local validation
+  evidence, not committed) does not fully attribute the final discrepancy. Greedy agreement is not
   strict numerical parity.
 
 Extending tensor parallelism to attention requires rank-local graphs, weight
@@ -1187,11 +1224,15 @@ remain preserved. The inference harness separately passed 33 unit tests locally
 and on the VM; its current scope is listed in the
 [validation report](../deepseek41_validation.md).
 The first image-validation VM attempt
-exposed a [test admission race](../validation/deepseek41/retained-cache-admission/README.md);
+exposed a test admission race
+(`docs/validation/deepseek41/retained-cache-admission/README.md`, local validation
+evidence, not committed);
 the synchronized test class and full lane pass on both hosts with the original
 assertions preserved.
-[Exact commands, exclusions, counters, hashes and the retained intermittent test failure](../validation/deepseek41/managed-correctness/README.md)
-are separate from full-checkpoint quality and performance results.
+Exact commands, exclusions, counters, hashes and the retained intermittent test
+failure (`docs/validation/deepseek41/managed-correctness/README.md`, local
+validation evidence, not committed) are separate from full-checkpoint quality and
+performance results.
 
 The final layer and routed-TP profiles use native `6b3b5ab3…` and managed stage 3,651.
 Layer split passed **138/138 inference cases**; routed TP passed **129/130**.
@@ -1216,18 +1257,19 @@ four, with exactly 512 generated tokens per measured request. Time to first
 token was **19.985 s** for 7,706 input tokens and **80.240 s** for 30,585.
 The concurrent-long phase recorded 153,187 native prefill tokens including
 warmup and zero KV-pool preemptions.
-[Decode results](../validation/deepseek41/full-checkpoint/layer8-context65536-ubatch1024-cpumoe0-cputhreads32-sparse1-compact1-chunk1024-6b3-final-steady.json),
-[single-request long results](../validation/deepseek41/full-checkpoint/layer8-context65536-ubatch1024-cpumoe0-cputhreads32-sparse1-compact1-chunk1024-6b3-final-long.json)
-and [concurrent-long accounting](../validation/deepseek41/full-checkpoint/layer8-context65536-ubatch1024-cpumoe0-cputhreads32-sparse1-compact1-chunk1024-6b3-final-long-parallel-runs.json)
-retain the measured scope and timing evidence.
+The decode results (`layer8-context65536-ubatch1024-cpumoe0-cputhreads32-sparse1-compact1-chunk1024-6b3-final-steady.json`), single-request long results
+(`layer8-context65536-ubatch1024-cpumoe0-cputhreads32-sparse1-compact1-chunk1024-6b3-final-long.json`) and concurrent-long accounting
+(`layer8-context65536-ubatch1024-cpumoe0-cputhreads32-sparse1-compact1-chunk1024-6b3-final-long-parallel-runs.json`), all in `docs/validation/deepseek41/full-checkpoint/`
+(local validation evidence, not committed), retain the measured scope and timing evidence.
 
 The previously failing named-thinking and thinking-agent cases now pass in both
 final profiles. In routed TP, one default-parallel agent request still issued
 `calculate_total` with zero placeholder arguments alongside `read_invoice`,
 before receiving the invoice result. The strict checker rejected it; this
 group changed from the first TP profile's 30/30 to 29/30. Separate serial-policy
-success does not remove that failure. A [local prompt/grammar/parser diagnosis](../validation/deepseek41/parallel-tool-dependency/README.md)
-preserves the model-emitted calls and found no defect forcing the extra call or
+success does not remove that failure. A local prompt/grammar/parser diagnosis
+(`docs/validation/deepseek41/parallel-tool-dependency/README.md`, local validation
+evidence, not committed) preserves the model-emitted calls and found no defect forcing the extra call or
 zero values. The final four-layer CPU-offload profile separately passed 28/30
 default-parallel quality cases, retaining two premature dependent-call failures.
 The layer profile's 30/30 result does not remove either placement's failures.
@@ -1235,24 +1277,27 @@ Native code and launch settings also
 changed, so these results do not isolate the grammar change or establish a
 blanket quality gain. The twelve HTTP input-rejection checks above are separate
 from the inference plans. Exact reports and remaining comparisons are in
-the [final placement records](../validation/deepseek41/final-placements/README.md).
+the final placement records, `docs/validation/deepseek41/final-placements/README.md`
+(local validation evidence, not committed).
 
-Existing-model checks also retain regressions. The final
-[75-case comparison](../validation/deepseek41/existing-model-regressions/final3651-native6b3/README.md)
-passed 39/75 cases and introduced no failures relative to its paired references
+Existing-model checks also retain regressions. The final 75-case comparison
+(`docs/validation/deepseek41/existing-model-regressions/final3651-native6b3/README.md`,
+local validation evidence, not committed) passed 39/75 cases and introduced no failures relative to its paired references
 in that run; separate Unicode JSON coverage passed 15/15. The subsequent
-[repeated JSON comparison](../validation/deepseek41/json-performance/completed-r2/README.md)
-exposed an additional Qwen3 failure for an identical request and recorded slower
+repeated JSON comparison
+(`docs/validation/deepseek41/json-performance/completed-r2/README.md`, local
+validation evidence, not committed) exposed an additional Qwen3 failure for an identical request and recorded slower
 Qwen3.5 first-token latency despite faster short-answer decode. Those results
 remain separate from the earlier run's zero-introduced-failure observation.
 They do not establish a blanket absence of regressions.
 
-A [matched chunk control](../validation/deepseek41/existing-model-regressions/qwen3-json-chunks/README.md)
+A matched chunk control
+(`docs/validation/deepseek41/existing-model-regressions/qwen3-json-chunks/README.md`)
 reproduced the Qwen3 response change in both builds; the original concurrent
-chunk partitions were not recorded. Qwen3.5's shorter
-[alternating control](../validation/deepseek41/json-performance/qwen35-alternating/README.md)
-also showed slower final latency. A later
-[72-request control](../validation/deepseek41/json-performance/qwen35-solo72/README.md)
-held the native library fixed, passed every answer and did not reproduce the
+chunk partitions were not recorded. Qwen3.5's shorter alternating control
+(`docs/validation/deepseek41/json-performance/qwen35-alternating/README.md`)
+also showed slower final latency. A later 72-request control
+(`docs/validation/deepseek41/json-performance/qwen35-solo72/README.md`; all three
+are local validation evidence, not committed) held the native library fixed, passed every answer and did not reproduce the
 slowdown. No production fix was made from these diagnostics; the differing
 results and their limits remain in the validation report.

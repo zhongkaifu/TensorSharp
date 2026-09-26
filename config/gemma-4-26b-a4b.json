@@ -2,8 +2,8 @@
   // Gemma-4 26B-A4B (QAT UD-Q4_K_XL) — Mixture-of-Experts multimodal LLM
   // (~14 GB, ~4B active params) with its vision projector and MTP draft head.
   // Run with:
-  //   TensorSharp.Cli    --config config/gemma-4-26b-a4b.json --image photo.png
-  //   TensorSharp.Server --config config/gemma-4-26b-a4b.json
+  //   TensorSharp.Cli         --config config/gemma-4-26b-a4b.json --image photo.png
+  //   TensorSharp.Server.Host --config config/gemma-4-26b-a4b.json
   // Missing files download from unsloth, pinned by commit and SHA-256.
   "variables": {
     "modelRoot": "${TENSORSHARP_MODELS:-../models}",
@@ -29,8 +29,13 @@
     "sha256": "7b06953ccdbe8cf363f47841a7afaacd2b1c2ff9a8d6b426fdec7521a6878744"
   },
 
-  // MTP speculative decoding (server only): separate draft GGUF, lossless.
-  "spec": false,
+  // MTP speculative decoding, on both hosts: Gemma-4's draft head ships as its
+  // own GGUF, and naming it here turns speculation ON by itself -- no "spec" key
+  // is needed ("spec": false would do nothing: a JSON false emits no flag).
+  // Lossless. The Gemma-4 speed-up was measured on a DENSE checkpoint; none is
+  // recorded for this MoE, and a comparable A3B MoE ran 2x slower with
+  // speculation on, so measure it and pass --no-spec on the command line if it
+  // loses (the draft file is still fetched).
   "draft-model": {
     "path": "${modelRoot}/gemma-4-26B-A4B-it-Q4_0-MTP.gguf",
     "urls": ["${repo}/MTP/mtp-gemma-4-26B-A4B-it-Q4_0.gguf"],

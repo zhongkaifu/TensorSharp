@@ -121,8 +121,12 @@ namespace TensorSharp.Server.Hosting
         /// </summary>
         public string ListenUrls { get; }
 
-        /// <summary>Bounds for model-selected delegation. Disable to retain a single agent.</summary>
-        public MultiAgentOptions MultiAgent { get; }
+        /// <summary>
+        /// Bounds for model-selected delegation. Disable to retain a single agent.
+        /// Read by every request plan, so <see cref="RepointMultiAgent"/> applies to
+        /// the next request.
+        /// </summary>
+        public MultiAgentOptions MultiAgent { get; private set; }
 
         /// <summary>Host an embedding encoder instead of a chat/generation model.</summary>
         public bool EmbeddingsEnabled { get; }
@@ -242,6 +246,41 @@ namespace TensorSharp.Server.Hosting
         {
             if (defaults != null)
                 SamplingDefaults = defaults;
+        }
+
+        /// <summary>
+        /// Turn model-selected delegation on or off, for the same reason as
+        /// <see cref="RepointSkills"/>: on a server <c>--no-multi-agent</c> is decided
+        /// once at startup, and in an app it is a switch a user expects to take effect
+        /// on the next message. The desktop server never calls this.
+        ///
+        /// <para>
+        /// Only <see cref="MultiAgentOptions.Enabled"/> moves; every limit is carried
+        /// over. The options are replaced rather than mutated because they are
+        /// init-only and a request plan keeps the instance it was planned with, so a
+        /// turn that is already delegating finishes under the terms it started with.
+        /// Off is the real thing, as with skills: the next plan declares none of the
+        /// coordination tools and adds no coordination prompt.
+        /// </para>
+        /// </summary>
+        public void RepointMultiAgent(bool enabled)
+        {
+            MultiAgentOptions current = MultiAgent;
+            if (current.Enabled == enabled)
+                return;
+            MultiAgent = new MultiAgentOptions
+            {
+                Enabled = enabled,
+                MaxConcurrentAgents = current.MaxConcurrentAgents,
+                MaxAgents = current.MaxAgents,
+                MaxDepth = current.MaxDepth,
+                MaxRoundsPerAgent = current.MaxRoundsPerAgent,
+                MaxTotalChildGenerations = current.MaxTotalChildGenerations,
+                AgentTimeoutSeconds = current.AgentTimeoutSeconds,
+                MaxResultCharacters = current.MaxResultCharacters,
+                MaxTaskCharacters = current.MaxTaskCharacters,
+                AllowWorkerTools = current.AllowWorkerTools,
+            };
         }
 
         /// <summary>Canonical name of the backend chosen at startup (e.g. <c>ggml_metal</c>).</summary>

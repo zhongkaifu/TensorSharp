@@ -393,6 +393,11 @@ namespace TensorSharp.Models
                 return false;
             if (!TryBuildModelDecodeArgs())
                 return false;
+            // Defensive: SupportsBlockQuantizedKvCache => false already swaps a
+            // requested q8_0/q4_0 cache for f16 when InitKVCache runs, so this
+            // should not fire. It stays because _kvCacheDtype is seeded from the
+            // process-global KvCacheDtypeConfig and the kernel cannot read a
+            // block-quantized cache at all.
             int kvType = _kvCacheDtype.GgmlType();
             if (kvType != 0 /* F32 */ && kvType != 1 /* F16 */)
                 return false;

@@ -2,8 +2,8 @@
   // Qwen3.5-9B Uncensored (HauhauCS-Aggressive, Q8_0) — dense text LLM, an
   // uncensored/abliterated Qwen3.5-9B fine-tune (~8.9 GB).
   // Run with:
-  //   TensorSharp.Cli    --config config/qwen3.5-9b-uncensored-q8.json --input prompt.txt
-  //   TensorSharp.Server --config config/qwen3.5-9b-uncensored-q8.json
+  //   TensorSharp.Cli         --config config/qwen3.5-9b-uncensored-q8.json --input prompt.txt
+  //   TensorSharp.Server.Host --config config/qwen3.5-9b-uncensored-q8.json
   "variables": {
     "modelRoot": "${TENSORSHARP_MODELS:-../models}"
   },

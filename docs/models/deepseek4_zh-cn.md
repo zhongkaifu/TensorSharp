@@ -17,7 +17,17 @@ DeepSeek V4 有三套整模型执行器：
   量化权重从 GGUF 分片直接流式写入按设备的竞技场，并按层切分到所有可见 GPU，
   因此大于单卡显存的模型可以由多张卡共同承载。
 - **GPU 后端**（`--backend ggml_cuda` / `ggml_vulkan`）：下文描述的原生 ggml
-  执行器。
+  执行器。ggml 只为 CPU 与 CUDA 提供了 DeepSeek-V4 的四个架构专属算子（三个
+  hyper-connection 算子与 lightning indexer）。在其他任何后端上，`hc_pre` / `hc_post`
+  改由批量 `mul_mat` 拼出——它们本来就是沿 stream 轴的一次收缩——因此整层都留在
+  加速器上；`hc_comb`（对 4x4 矩阵做 20 次迭代的 Sinkhorn）与 lightning indexer 仍走
+  调度器的 CPU 回退，这就是 Vulkan 与 CUDA 之间剩下的差距。该分解在 Vulkan 上让
+  prefill 提升 34%、decode 提升 14%，由加载时的 `ggml_backend_supports_op` 探测自动
+  选择（`TS_DSV4_HC_NATIVE=0/1` 可做 A/B）。
+- **`--backend ggml_cpu`**：同一个原生 ggml 执行器，只用一个 CPU 计算设备，架构
+  专属算子走各自的标量 CPU 内核。它确实跑在 CPU 上（此前在有 CUDA 的机器上会悄悄
+  改用 GPU），并在 stderr 上说明一次；要用 GPU 请传 `--backend ggml_cuda`。V4 在这个
+  后端上没有测过 CPU 吞吐，本卡片的所有数字都来自 GPU 执行器。
 - **`--backend cpu`**：一个 **100% 纯 C# 的整模型执行器**
   （`TensorSharp.Models/Models/DeepSeek4/DeepSeek4CpuExecutor.cs`）——完全没有
   原生依赖。它直接从内存映射的 GGUF 分片提供量化权重，并用托管 SIMD 代码执行
@@ -38,9 +48,9 @@ MoE 内核——才留在 DeepSeek V4 的文件里。
 
 - 直接加载（分片的）GGUF，并把权重**按层切分到所有可见 CUDA GPU** 上——大于
   单卡显存的模型由所有卡共同承载（128 GiB 的 IQ4_XS 构建需要 2×80GB）。这是
-  **默认行为，不需要任何开关**：把 DSV4 放到多张卡上的并不是 `--tp`，`--tp` 只是
-  把「整层切分」换成层内部的 Megatron 列/行切分。`TS_DSV4_NGPU` 用来限制按层
-  切分使用几张卡。
+  **默认行为，不需要任何开关**：把 DSV4 放到多张卡上的并不是 `--tp`，它也不会在
+  层内部做切分。在这个系列上 `--tp N` 只是把按层切分限制在 N 张卡，作用与
+  `TS_DSV4_NGPU` 相同；两者都设置时以 `TS_DSV4_NGPU` 为准。
 - 在设备上持有全部 DSV4 KV 状态：原始 SWA 环、CSA/HCA 压缩 K 缓存、lightning
   indexer 缓存，以及压缩器状态环。
 - 通过 `ggml_backend_sched` 把 prefill/decode 的每个 ubatch 作为单张 ggml 计算图
@@ -51,6 +61,85 @@ MoE 内核——才留在 DeepSeek V4 的文件里。
 C# 一侧（`TensorSharp.Models/Models/DeepSeek4/DeepSeek4Model.cs`）负责 GGUF
 元数据、`joyai-llm` BPE 预分词器、DeepSeek V4 聊天模板
 （`<｜User｜>…<｜Assistant｜></think>`，`--think` 会改为打开 `<think>`）与采样。
+模板会渲染工具声明，`DeepSeek4OutputParser` 负责解析 DSML 工具调用，因此 V4 可以
+使用基于工具的功能：skills、代码工具（`--code-exec`），以及服务端的
+[子智能体委派](../multi_agent.md)（在服务端的对话路径上默认开启）。本模型没有发布
+任何委派相关的实测结果。
+
+### 装下模型：按显存切分，以及按需开启的 MoE CPU 卸载
+
+两个 GPU 引擎——原生 ggml 执行器与 Direct CUDA 引擎——都按每张卡**此刻实际空闲**的
+显存来确定按层切分，而不是按字节平均分配。由此带来两点。
+
+**切分与预算成比例。** 每张卡都被填到其自身空闲显存的同一比例，扣除为调度器计算
+缓冲区保留的运行时余量，再扣除切分能够精确计算的 KV 缓存与压缩器状态环。原生执行器
+在每次加载时估算这份余量：2 GiB 加上 lightning indexer top-k 的临时开销与一个 ubatch
+的激活，因此它随 `MAX_CONTEXT` 与 `TS_DSV4_UBATCH` 增长。Direct CUDA 引擎每张卡固定
+保留 2048 MiB。`TS_DSV4_VRAM_RESERVE_MB` 可覆盖两者。接了显示器的卡、或已经跑着别的
+进程的卡，会按比例分到更少的层，而不是像按字节平均切分那样直接 OOM。
+
+**路由专家只在你要求时才溢出到系统内存。** V4 Flash checkpoint 的 91% 是路由专家
+权重（UD-Q8_K_XL 下 151 GiB 中占 137 GiB），因此它们是唯一有足够调节范围的旋钮——
+但这里的卸载默认**关闭**，与其他所有架构一样。在显存**确实**够用的机器上悄悄开启它
+是错误的取舍：它会把几十 GiB 的专家挪到 CPU，白白损失大部分 decode 吞吐。
+
+当模型装不下时，加载器会直接说明，并给出能装下的数字，而不是加载到一半因显存不足
+而中止：
+
+```
+[dsv4] not enough VRAM: 150.7 GiB of weights plus this context's KV caches
+       against 152.9 GiB free across 7 device(s). Re-run with --n-cpu-moe 9
+       (moves the routed experts of the first 9 layer(s), 28.7 GiB, to system
+       RAM) or --cpu-moe to offload every layer.
+```
+
+注意这个例子说明的问题：单看权重似乎装得下，实际却不行，因为每张卡还要放它的 KV
+缓存与计算余量（每张卡不少于 2 GiB，7 张卡至少 14 GiB）。
+
+随后 `--n-cpu-moe N` / `--cpu-moe` 会把前 N 层的路由专家（`ffn_gate_exps` /
+`ffn_up_exps` / `ffn_down_exps`）留在主机内存中，并在 ggml CPU 后端上运行它们的
+`mul_mat_id` 链；路由器、norm、注意力栈与始终激活的共享专家留在加速器上，因此每个
+被卸载的层在每个方向上只有 `[n_embd, n_tokens]` 的激活需要过总线。卸载的层数多于
+所需，就是拿 decode 速度换显存。
+
+`--backend cuda` 用自己的内核走同一道接缝：被卸载层的专家由 `ManagedQuantizedOps`
+做乘法，加权求和的收尾仍是设备上的 `moe_scatter_add`，因此一层驻留还是卸载可以互换。
+它的主机 FFN 把每个选中专家的投影在每个阶段合并为一次并行派发——若按（专家，投影）
+逐个派发，花在调度器上的时间比算术本身还多（每 token 226 → 105 ms）。
+
+3×RTX A6000 48 GB 实测（UD-Q8_K_XL，151 GiB 权重对 139 GiB 显存，双路 Xeon Gold
+6342，受 23.8 CPU 的 cgroup 配额限制；`ggml_cuda` 运行期间另有一个进程占用约
+15 GiB）：
+
+| 指标 | `ggml_cuda`（卸载 8 层） | `cuda`（卸载 9 层） | `ggml_vulkan`（卸载 7 层） |
+|---|---|---|---|
+| Decode | 14.7 tok/s | 8.9 tok/s | 6.5 tok/s |
+| Prefill（1024–2048） | 206 tok/s | — | 138 tok/s |
+| Prefill（8.7K） | 195 tok/s | 43.6 tok/s | 73 tok/s |
+| 每个卸载层的主机开销 | ~5.4 ms/token | ~8.3 ms/token | ~5.4 ms/token |
+
+Vulkan 剩下的 decode 差距并不来自专家卸载——而是 `hc_comb` 与 lightning indexer 每层
+一次的 CPU 往返，也就是分解时刻意保留不动的那两个算子（把 20 次迭代的 Sinkhorn 拆开，
+产生的细碎派发比它消除的边界开销还多；而展开 indexer 会物化一个
+`[n_kv, n_head, n_tokens]` 的打分张量，在 1024 token 的 prefill 分块下达 2.2 GB）。
+
+### DSpark 与 MoE CPU 卸载同时使用
+
+两个引擎都能在 MoE 被卸载的同时运行草稿器，自动切分也会计入草稿器自身的显存——加载
+草稿器恰好会让多一层的专家移到主机。投机是否仍然划算取决于主机 MoE 有多快，因为 B 个
+token 的验证批要把 B 行的专家都过一遍主机 MoE：
+
+| 引擎 | 无 DSpark | + DSpark | 接受率 |
+|---|---|---|---|
+| `ggml_cuda` | 14.4 tok/s | **16.7 tok/s（1.16x）** | — |
+| `cuda` | 8.9 tok/s | 6.2 tok/s（0.70x） | 51% |
+
+因此在专家被卸载时，请把 `--draft-model` 与 `--backend ggml_cuda` 搭配使用；在 Direct
+引擎上，托管的主机矩阵乘足够慢，多出的验证行花掉的时间超过了被接受的 token 省下的时间。
+
+每个被卸载的层每 token 要读取约 80 MB 的 MXFP4 专家块，因此加载器只卸载**最少**的
+层数，正是这一点让它仍然可用。**请按进程实际可用的 CPU 数来设定主机线程池，而不是按
+`nproc`**——见下文的 `TS_CPU_MOE_THREADS`。
 
 ## 用法
 
@@ -85,10 +174,11 @@ DSV4 块读取主干在第 40-42 层的 hidden states，每步提议**一整块*
 每个位置被接受的概率。随后主干用**一次**批量前向验证整块，并只保留它自己的
 采样器本来也会抽到的最长前缀——因此投机是加速手段，而不是质量变化。
 
-它作为独立的草稿 GGUF 通过 `--draft-model` 加载，在**两个 GPU 引擎**上对贪心
-（`--temperature 0`）单序列生成生效：`--backend cuda`（Direct CUDA）与
-`--backend ggml_cuda`（原生 ggml 执行器）。`ggml_vulkan` 与 `cpu` 对该架构没有
-投机路径，配置了草稿器时会打印警告。
+它作为独立的草稿 GGUF 通过 `--draft-model` 加载，在**两个 GPU 引擎**上对单序列
+（solo）生成生效：`--backend cuda`（Direct CUDA）与
+`--backend ggml_cuda`（原生 ggml 执行器）。`ggml_vulkan`、`ggml_cpu` 与 `cpu` 对该
+架构没有投机路径，配置了草稿器时会打印警告。没有草稿器时也就无从投机：单独的
+`--spec`（包括 `--spec-type ngram`）在这个系列上只提供普通解码。
 
 所有单序列 CLI 生成路径都会用到它：一次性 `--input`、`--multi-turn-jsonl`，以及
 `--interactive` 聊天 REPL（后者会把被接受的块逐 token 流式输出，并跨轮复用缓存
@@ -112,13 +202,13 @@ argmax，否则就是对话采样器——因此投机可与 REPL 中的 `/temp`
 重复/存在/频率惩罚并不会施加到该提案上，接受率会随着带惩罚的历史增长而下降。
 带图像或音频附件的轮次则完全不使用投机——那些 embedding 只有普通 prefill 能注入。
 
-### 在 TensorSharp.Server 上
+### 在服务端（TensorSharp.Server.Host）上
 
 同一个草稿器也可用于 HTTP API。用 `--draft-model` 传入即可 —— 指定草稿器本身
 就会启用投机（显式 `--no-spec` 可否决）：
 
 ```bash
-TensorSharp.Server --model DeepSeek-V4-Flash-...-00001-of-00005.gguf \
+TensorSharp.Server.Host --model DeepSeek-V4-Flash-...-00001-of-00005.gguf \
     --backend ggml_cuda --tp 4 \
     --draft-model DSpark-drafter-Q2K-Q8-0731.gguf
 ```
@@ -141,7 +231,7 @@ per-sequence slot 以正常 decode 速度服务这一批。并发是安全的，
 | `--draft-model …` | **31.3 – 32.1（1.25–1.28×）** |
 
 `--spec-pmin` 的默认值会匹配所加载的草稿器——块级草稿器为 0.35，逐 token 草稿头
-为 0.75——因此无需调参。显式设置仍可能更优；启动日志会报告当前生效的门限
+为 0.15——因此无需调参。显式设置的值仍然优先；启动日志会报告当前生效的门限
 （`pMin=0.35, draft=block(5)`）。
 
 两个引擎以不同方式实现同一套算法。**ggml** 引擎把草稿器构建为模型计算图中额外的
@@ -254,8 +344,11 @@ Prefill 保持持平（10K 提示词上 831 对 835 tok/s）。接受率——�
 | 环境变量 | 默认值 | 含义 |
 |---|---|---|
 | `MAX_CONTEXT` | 65536 | 上下文窗口（缓存随之伸缩；元数据允许 1M） |
-| `TS_DSV4_UBATCH` | CPU 512 / GPU 1024 | Prefill 微批大小 |
+| `TS_DSV4_UBATCH` | `cpu` 为 512，其他为 1024 | Prefill 微批大小 |
 | `TS_DSV4_NGPU` | 全部 | 按层切分所使用的 GPU 数量（GPU 后端） |
+| `TS_DSV4_VRAM_RESERVE_MB` | 按每次加载估算（至少 2048）；`cuda` 上为 2048 | GPU 后端：覆盖每张卡为调度器计算缓冲区保留的显存。不设置时，ggml 执行器取 2 GiB 加上 lightning indexer top-k 的临时开销与一个 ubatch 的激活，随 `MAX_CONTEXT` 与 `TS_DSV4_UBATCH` 增长；`--backend cuda` 固定为 2048。调低可少卸载几层专家；长提示词分配计算图失败时调高 |
+| `TS_N_CPU_MOE` / `TS_CPU_MOE` | 0（关闭） | 路由专家留在系统内存中的前置层数（等同于 `--n-cpu-moe` / `--cpu-moe`）。默认关闭；放不下的模型会被拒绝，并给出能装下的层数 |
+| `TS_CPU_MOE_THREADS` | 全部可用 CPU（卸载时） | ggml 执行器上主机专家矩阵乘的工作线程数。开启卸载时，线程池取 `hardware_concurrency` 再按亲和性掩码与 cgroup CPU 配额收紧——不像其他 MoE 架构那样减半，因为 DSV4 每个被卸载的层每 token 读取的专家字节远多于它们，且在那之后仍能继续扩展。`--cpu-moe-threads N` 可覆盖它，继承自启动环境的 `TS_CPU_MOE_THREADS` 优先级最高。请按配额而不是 `nproc` 来设：在 23.8 CPU 的配额下，96 线程比 23 线程实测慢 **25 倍**。在服务端部署时要给其他线程留出余地：在 95 CPU 的配额下，gemma-4-26B-A4B（不是 DSV4）上的共享 MoE 线程池在 71 线程时为 8.2 tok/s，64 线程时为 20.7，因此在那种环境下请用 `--cpu-moe-threads` 设一个低于配额的值 |
 | `TS_DSV4_LOAD_THREADS` | 16 | `--backend cuda`：流式写显存加载器的读取线程数 |
 | `TS_DSV4_LOAD_STATS` | 0 | `--backend cuda`：1 = 打印各阶段加载耗时 |
 | `TS_DSV4_STAGED_EXPERTS` | 1 | `--backend cuda`：0 = 逐 token 的专家内核（用于 A/B） |

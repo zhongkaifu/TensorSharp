@@ -95,6 +95,34 @@ public sealed class InferenceEngineHostRebuildTests : IDisposable
         Assert.Same(model, second.Model);
     }
 
+    [Fact]
+    public void ASpeculationSwitchRememberedForOneModel_IsNotHandedToTheNextModelsEngine()
+    {
+        // TensorAgent's settings switch records the policy of the model it was flipped on
+        // when no engine is standing. Before the next model's engine is built, that record
+        // must go: the load path has written the NEW model's algorithm to the environment
+        // the engine reads, and the old record used to overwrite it (an attached draft
+        // head's "auto" replaced by the previous model's "ngram").
+        using var lifecycle = new ModelLifecycleService(NullLogger.Instance,
+            (path, backend, tp, draft) => new SnapshotFakeModel(path, "shape"));
+        using var host = new InferenceEngineHost(lifecycle, NullLogger.Instance)
+        {
+            SchedulerConfigOverride = SmallConfig(),
+        };
+        var ngram = new TensorSharp.Runtime.Speculative.SpeculationOptions
+        {
+            Enabled = true,
+            SpeculatorName = TensorSharp.Runtime.Speculative.SpeculatorRegistry.NGram,
+        };
+
+        Assert.False(host.UpdateSpeculation(ngram));   // nothing standing: remembered
+        Assert.Same(ngram, host.PendingSpeculation);
+
+        host.Reset();   // what ModelService.LoadModel does before the next model loads
+
+        Assert.Null(host.PendingSpeculation);
+    }
+
     private static SchedulerConfig SmallConfig() => new()
     {
         MaxNumBatchedTokens = 64,

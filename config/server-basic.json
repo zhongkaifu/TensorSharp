@@ -1,17 +1,17 @@
 {
-  // Minimal TensorSharp.Server configuration.
-  // Run with:  TensorSharp.Server --config config/server-basic.json
+  // Minimal TensorSharp.Server.Host configuration.
+  // Run with:  TensorSharp.Server.Host --config config/server-basic.json
   // Command-line options still win, so you can reuse this file across hosts and
   // override just the backend:
-  //   TensorSharp.Server --config config/server-basic.json --backend ggml_cpu
+  //   TensorSharp.Server.Host --config config/server-basic.json --backend ggml_cpu
   //
   // Hosts a multimodal Gemma-4 E4B (model + matching vision projector). Both
-  // auto-download into ${modelRoot} on the first run (real, ungated GGUFs) and
-  // are reused afterward. This is the standard -it build; point "path" at your
+  // auto-download into ${modelRoot} on the first run (real, ungated GGUFs,
+  // pinned by commit and SHA-256) and are reused afterward. This is the standard -it build; point "path" at your
   // own file to host a different variant.
   "variables": {
     "modelRoot": "${TENSORSHARP_MODELS:-../models}",
-    "repo": "https://huggingface.co/unsloth/gemma-4-E4B-it-GGUF/resolve/main"
+    "repo": "https://huggingface.co/unsloth/gemma-4-E4B-it-GGUF/resolve/bfc15c382204943c3a8fff0c750b94ae2364d7a3"
   },
 
   "backend": "ggml_cuda",
@@ -24,10 +24,12 @@
 
   "model": {
     "path": "${modelRoot}/gemma-4-E4B-it-Q8_0.gguf",
-    "urls": [ "${repo}/gemma-4-E4B-it-Q8_0.gguf" ]
+    "urls": [ "${repo}/gemma-4-E4B-it-Q8_0.gguf" ],
+    "sha256": "f8854aa4480df62585a279e7ca0a881554fc18a41c59c4f62642d16a2ae47012"
   },
   "mmproj": {
     "path": "${modelRoot}/gemma-4-E4B-mmproj-F16.gguf",
-    "urls": [ "${repo}/mmproj-F16.gguf" ]
+    "urls": [ "${repo}/mmproj-F16.gguf" ],
+    "sha256": "ddf46c21d7078e95338cfc22306b19b276a29a5ad089023449dd54d4b6170a51"
   }
 }

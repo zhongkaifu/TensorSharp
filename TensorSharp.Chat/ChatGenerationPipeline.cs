@@ -193,8 +193,11 @@ namespace TensorSharp.Server
         public double ToolProgressSeconds { get; init; }
 
         /// <summary>
-        /// One human-readable line saying WHAT is being run — "python · 2.1 KB code",
-        /// "scripts/extract.py 2400" — so the user watching the progress knows more
+        /// One human-readable line saying WHAT is being run — a shell call's command
+        /// ("pip install pandas", its first line, cut at 60 characters), a skills_run
+        /// script and its arguments ("scripts/extract.py 2400"), a skills_read file
+        /// ("pdf/SKILL.md"), an apply_patch envelope's size ("812 chars") — so the user
+        /// watching the progress knows more
         /// than the tool's name. Null when there is nothing beyond the name to say.
         /// </summary>
         public string ToolProgressDetail { get; init; }

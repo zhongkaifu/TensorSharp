@@ -2,8 +2,8 @@
   // Qwen3.5-9B (IQ4_XS) — same model as qwen3.5-9b-q8 but a smaller ~5.2 GB
   // quant that fits comfortably on 8 GB GPUs, at a small quality cost.
   // Run with:
-  //   TensorSharp.Cli    --config config/qwen3.5-9b-iq4_xs.json --input prompt.txt
-  //   TensorSharp.Server --config config/qwen3.5-9b-iq4_xs.json
+  //   TensorSharp.Cli         --config config/qwen3.5-9b-iq4_xs.json --input prompt.txt
+  //   TensorSharp.Server.Host --config config/qwen3.5-9b-iq4_xs.json
   "variables": {
     "modelRoot": "${TENSORSHARP_MODELS:-../models}"
   },

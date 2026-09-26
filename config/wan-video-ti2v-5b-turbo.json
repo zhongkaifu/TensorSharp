@@ -8,23 +8,26 @@
   // They are loaded one stage at a time and each is released before the next, so
   // peak VRAM is max(text encoder, DiT + attention, VAE) rather than their sum.
   //
-  //   TensorSharp.Server --config config/wan-video-ti2v-5b-turbo.json
-  //   TensorSharp.Cli    --config config/wan-video-ti2v-5b-turbo.json \
-  //                      --prompt "a red fox trotting through falling snow" --output fox.mp4
+  //   TensorSharp.Server.Host --config config/wan-video-ti2v-5b-turbo.json
+  //   TensorSharp.Cli         --config config/wan-video-ti2v-5b-turbo.json \
+  //                           --prompt "a red fox trotting through falling snow" --output fox.mp4
   //
   // Turbo is step-DISTILLED: TensorSharp detects that from the file name and
   // switches to 4 steps with guidance off, which is ~25x fewer DiT passes than the
   // 50-step base recipe. Do not pass --diffusion-steps/--cfg unless you mean to
   // override that. See config/wan-video-ti2v-5b.json for the undistilled model.
   //
-  // Downloads ~9.5 GB total (DiT 5.4 GB + text encoder 6.0 GB is the bulk; the
-  // Q4_0 DiT is ~3.0 GB if you prefer it — swap the file name in both lines).
+  // Downloads ~12.9 GB total (DiT 5.4 GB, text encoder 6.0 GB, VAE 1.4 GB),
+  // pinned by commit and SHA-256. The Q4_0 DiT is ~3.0 GB if you prefer it: swap
+  // the file name in "path" and "urls" and set "sha256" to
+  //   8aa3a98c254bd02a9cc7e4f1db37720fe291cef8b0c32fb78e7a2391125d6b28
   "variables": {
     // Where the model files live. Portable by design: override the location with
     // the TENSORSHARP_MODELS environment variable, otherwise this resolves to a
-    // "models" folder next to the repository (relative paths in a config are
-    // resolved against the config file, so no drive letter is baked in and the
-    // same file works on Windows, Linux and macOS).
+    // "models" folder at the repository root (../models, and relative paths in a
+    // config are resolved against the config file's folder rather than the
+    // working directory, so no drive letter is baked in and the same file works
+    // on Windows, Linux and macOS).
     "modelRoot": "${TENSORSHARP_MODELS:-../models}",
     "hf": "https://huggingface.co"
   },
@@ -39,20 +42,23 @@
 
   "model": {
     "path": "${modelRoot}/Wan2_2-TI2V-5B-Turbo-Q8_0.gguf",
-    "urls": [ "${hf}/hum-ma/Wan2.2-TI2V-5B-Turbo-GGUF/resolve/main/Wan2_2-TI2V-5B-Turbo-Q8_0.gguf" ]
+    "urls": [ "${hf}/hum-ma/Wan2.2-TI2V-5B-Turbo-GGUF/resolve/9873ba175b4b204a81f4a43c9644e6c385ee4459/Wan2_2-TI2V-5B-Turbo-Q8_0.gguf" ],
+    "sha256": "b4d7d1888d5ec2c29046cc443239faad99614cd3d356c61d8192fcac5f4c98fc"
   },
 
   // The Wan 2.2 VAE (48-channel, 16x16x4 compression). TI2V-5B needs THIS one —
   // the Wan 2.1 VAE is a different latent space and will not load in its place.
   "video-vae": {
     "path": "${modelRoot}/Wan2.2_VAE.safetensors",
-    "urls": [ "${hf}/QuantStack/Wan2.2-TI2V-5B-GGUF/resolve/main/VAE/Wan2.2_VAE.safetensors" ]
+    "urls": [ "${hf}/QuantStack/Wan2.2-TI2V-5B-GGUF/resolve/57437632ddd08bdcbd1508c866aa22e126ed51d2/VAE/Wan2.2_VAE.safetensors" ],
+    "sha256": "e40321bd36b9709991dae2530eb4ac303dd168276980d3e9bc4b6e2b75fed156"
   },
 
   // Shared by every Wan model (2.1 and 2.2 alike), so it is downloaded once and
   // reused by the other Wan configs in this folder.
   "video-text-encoder": {
     "path": "${modelRoot}/umt5-xxl-encoder-Q8_0.gguf",
-    "urls": [ "${hf}/city96/umt5-xxl-encoder-gguf/resolve/main/umt5-xxl-encoder-Q8_0.gguf" ]
+    "urls": [ "${hf}/city96/umt5-xxl-encoder-gguf/resolve/b535255bee98c2b0a59ea7c0ae2dcd0c6657b3b7/umt5-xxl-encoder-Q8_0.gguf" ],
+    "sha256": "2521d4de0bf9e1cc6549866463ceae85e4ec3239bc6063f7488810be39033bbc"
   }
 }

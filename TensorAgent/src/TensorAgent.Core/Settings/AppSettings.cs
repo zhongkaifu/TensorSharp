@@ -76,12 +76,30 @@ public sealed class AppSettings
     /// <para>
     /// Off is not "no skill is ticked": no skill is declared to the model, so a turn
     /// costs nothing for the roster and nothing can decide to read one. That is the
-    /// point — twelve skills announce themselves in every prompt, which is thousands
+    /// point — every bundled skill (ten today) announces itself in every prompt, which is thousands
     /// of tokens on a phone, and a user who wants a plain chat model should be able to
     /// have one.
     /// </para>
     /// </summary>
     [JsonPropertyName("skillsEnabled")] public bool SkillsEnabled { get; set; } = true;
+
+    /// <summary>
+    /// Whether the model may delegate parts of a turn to sub-agents: the
+    /// <c>spawn_agent</c> family of tools and the coordination prompt that comes with
+    /// them.
+    ///
+    /// <para>
+    /// On by default, because that is what the app did before there was a switch. A
+    /// sub-agent is a separate conversation on the loaded model, with its own session
+    /// and generation state beside the chat's, and while this is on every prompt of a
+    /// model that can call tools also declares the five coordination tools, whether or
+    /// not it delegates. On a phone both cost memory and time, and a user who wants a
+    /// single agent should be able to have one. Off means the tools are not declared at
+    /// all, exactly as on a server started with <c>--no-multi-agent</c>. Applied to the
+    /// running app at once; it takes effect on the next message.
+    /// </para>
+    /// </summary>
+    [JsonPropertyName("multiAgentEnabled")] public bool MultiAgentEnabled { get; set; } = true;
 
     /// <summary>Keep the screen awake while generating.</summary>
     /// <summary>
