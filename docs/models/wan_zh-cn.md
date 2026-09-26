@@ -5,7 +5,7 @@
 TensorSharp 原生运行 [Wan 2.1](https://github.com/Wan-Video/Wan2.1) 与
 [Wan 2.2](https://github.com/Wan-Video/Wan2.2) 视频扩散模型：输入提示词
 （Wan 2.2 模型可再加一张首帧图片），输出 H.264 MP4，`TensorSharp.Cli` 与
-`TensorSharp.Server`（OpenAI 风格 API + 自带 Web UI 聊天）均可驱动。
+`TensorSharp.Server.Host`（OpenAI 风格 API + 自带 Web UI 聊天）均可驱动。
 
 > **Wan 是只生成视频的家族。** TensorSharp 中更新的视频模型是
 > [MiniMax-H3](minimax-h3_zh-cn.md)：它在**同一份打包潜变量**里把视频与
@@ -47,8 +47,8 @@ TensorSharp 原生运行 [Wan 2.1](https://github.com/Wan-Video/Wan2.1) 与
 它们会声明全部网络，并在首次运行时自动下载缺失的文件：
 
 ```bash
-# 文生视频 + 图生视频，4 步蒸馏（首次运行约下载 9.5 GB）
-TensorSharp.Server --config config/wan-video-ti2v-5b-turbo.json
+# 文生视频 + 图生视频，4 步蒸馏（首次运行约下载 12.9 GB）
+TensorSharp.Server.Host --config config/wan-video-ti2v-5b-turbo.json
 
 TensorSharp.Cli --config config/wan-video-ti2v-5b-turbo.json \
   --prompt "a red fox trotting through falling snow" --output fox.mp4
@@ -60,12 +60,12 @@ TensorSharp.Cli --config config/wan-video-ti2v-5b-turbo.json \
 
 | 配置文件 | DiT | VAE | 文本编码器 | 支持模式 | 首次下载 |
 |---|---|---|---|---|---|
-| `wan-video-ti2v-5b-turbo.json` | TI2V-5B Turbo（4 步） | Wan 2.2 | UMT5-XXL | 文生 + 图生 | 约 9.5 GB |
-| `wan-video-ti2v-5b.json` | TI2V-5B（50 步） | Wan 2.2 | UMT5-XXL | 文生 + 图生 | 约 11.4 GB |
-| `wan-video-i2v-a14b.json` | A14B 高噪 **+** 低噪 | Wan 2.1 | UMT5-XXL | 仅图生 | 约 24 GB |
+| `wan-video-ti2v-5b-turbo.json` | TI2V-5B Turbo（4 步） | Wan 2.2 | UMT5-XXL | 文生 + 图生 | 约 12.9 GB（DiT 5.4 GB、UMT5 6.0 GB、Wan 2.2 VAE 1.4 GB） |
+| `wan-video-ti2v-5b.json` | TI2V-5B（50 步） | Wan 2.2 | UMT5-XXL | 文生 + 图生 | 约 12.9 GB |
+| `wan-video-i2v-a14b.json` | A14B 高噪 **+** 低噪 | Wan 2.1 | UMT5-XXL | 仅图生 | 约 25.6 GB |
 
-模型存放位置由 `TENSORSHARP_MODELS` 环境变量决定；未设置时存放在仓库同级的
-`models/` 目录。配置文件中不含任何绝对路径，因此同一个文件在 Windows、Linux 与
+模型存放位置由 `TENSORSHARP_MODELS` 环境变量决定；未设置时存放在仓库根目录下的
+`models/` 目录（配置会相对 `config/` 解析 `../models`，即 `<仓库>/models`）。配置文件中不含任何绝对路径，因此同一个文件在 Windows、Linux 与
 macOS 上都能直接使用，无需修改。
 
 **两个 VAE 不可互换**：TI2V-5B 需要 Wan 2.2 VAE（48 通道潜空间，16×16×4 压缩），
@@ -197,7 +197,8 @@ hf download QuantStack/Wan2.2-I2V-A14B-GGUF VAE/Wan2.1_VAE.safetensors --local-d
 是 TI2V-5B 的另一个选择。注意
 [lightx2v/Wan2.2-Lightning](https://huggingface.co/lightx2v/Wan2.2-Lightning)
 只发布 LoRA `.safetensors`，而 TensorSharp 没有 Wan LoRA 选项 —— 请使用上面这些
-已经合并好的 GGUF。
+已经合并好的 GGUF。（`--lora` 只作用于 Qwen-Image-2.1：CLI 遇到 Wan 模型会拒绝它，
+服务端则记录一条警告，并在不带它的情况下加载模型。）
 
 ### 获得好画质
 
@@ -215,7 +216,7 @@ hf download QuantStack/Wan2.2-I2V-A14B-GGUF VAE/Wan2.1_VAE.safetensors --local-d
 ## 服务器
 
 ```bash
-TensorSharp.Server --model Wan2.2-TI2V-5B-Q8_0.gguf --backend ggml_cuda \
+TensorSharp.Server.Host --model Wan2.2-TI2V-5B-Q8_0.gguf --backend ggml_cuda \
   --video-frames 121 --fps 24
 ```
 
@@ -224,14 +225,16 @@ Web UI 不会发送这两个字段，因此上例会以 24 fps 生成 121 帧（
 API 请求显式提供的 `frames` 或 `fps` 会分别覆盖对应的启动默认值；这些值是默认值，
 不是上限。如果启动参数和请求字段均省略，则采用模型配方：TI2V-5B 为 49 帧 / 24 fps，
 其余模型为 33 帧 / 16 fps。帧数会对齐到 `4k+1`。要调整时长，建议保持模型原生
-帧率并修改帧数；仅改变 FPS 会改变播放速度。
+帧率并修改帧数；仅改变 FPS 会改变播放速度。`--video-width` / `--video-height`
+（也可写作 `--width` / `--height`）与 `--video-steps` 同样是服务端全局默认值：请求中的
+`width` / `height`（或 `size`）与 `steps` 会覆盖它们，都未设置时采用模型配方。
 
 步数蒸馏快车道是 `--model` GGUF 自身的属性，而不是请求字段，因此它对 Web UI 和
 所有端点都生效，客户端无需做任何改动 —— 把 `--model` 指向 Turbo/Lightning
 检查点，其余一切照旧：
 
 ```bash
-TensorSharp.Server --model Wan2_2-TI2V-5B-Turbo-Q8_0.gguf --backend ggml_metal \
+TensorSharp.Server.Host --model Wan2_2-TI2V-5B-Turbo-Q8_0.gguf --backend ggml_metal \
   --video-frames 121 --fps 24
 ```
 
@@ -274,9 +277,18 @@ curl http://localhost:5000/v1/videos/generations -H "Content-Type: application/j
   t=0，即 diffusers 的 `expand_timesteps` 语义）—— 注意力仍在完整的联合序列上进行。
 - `TSGgml_WanVaeDecode` —— 因果 3D 视频 VAE 解码器（两代通用），在图内按时间分块
   迭代，因果特征缓存在块之间传递；卷积在一个显存预算下以分带 im2col+GEMM 执行，
-  使峰值显存有界（`TS_WAN_VAE_GEMM_MAX_MB`，默认随设备可用显存自适应，下限
-  384 MB；`0` 强制直接卷积），跨块特征缓存以 F16 存储。Wan 2.2 解码器额外包含
-  无权重的 DupUp3D 残差捷径与最后的 2×2 像素 unpatchify。超过约 0.5 MP 时，解码
+  使峰值显存有界（`TS_WAN_VAE_GEMM_MAX_MB`；CUDA 上为 384 MB —— 按可用显存推算
+  实测**慢 2.2 倍**，因为 scratch 会吃掉图中其余部分所需的余量，WDDM 再把溢出部分
+  换页 —— Metal 上为可用显存的 1/8、限制在 384 MB–8 GB 之间，因为它没有 PCIe 断崖；
+  其他 GGML 后端为 384 MB；`0` 强制直接卷积）。在 Metal 上，这个预算只在
+  `TS_WAN_VAE_MPS_CONV=0` 时生效，因为默认由 MPSGraph 整体执行每个卷积；Metal 4
+  tensor API 生效时（M5 级设备上运行 14B 级模型）默认为 `0`。因果卷积的 kd 个时间
+  抽头共用**一次** im2col，而不是把同样的像素各下降一遍；
+  条带也按数量均分，而不是按固定高度往下走；两者都逐位一致。跨块特征缓存以 F16
+  存储。Wan 2.2 解码器额外包含
+  无权重的 DupUp3D 残差捷径与最后的 2×2 像素 unpatchify。超过每条带的像素预算时
+  （GGML 后端随可用显存缩放：16 GB 可用时约 0.64 MP，最低 0.16 MP；直连
+  `cuda`/`cpu` 后端为 0.3 MP），解码
   会进一步切成全宽横向条带，并在 8 个潜变量行的重叠区上做混合（即 diffusers 的
   `enable_tiling` 方案，相对不分块解码约 59 dB）：否则一个 720p 平面的激活加上
   因果缓存约占 12 GB 设备显存，会把 16 GB 的 WDDM 卡推入共享内存分页
@@ -301,8 +313,15 @@ Wan 2.2 VAE 解码 > 35 dB PSNR（Wan 2.1 解码：59.9 dB）；分词器在英�
 环境变量开关：`TS_WAN_DIT_CAPTURE=0`（关闭常驻捕获的 DiT 图）、
 `TS_WAN_DIT_FLASH=0`（改用材料化注意力）、`TS_WAN_DIT_KV_F16=0`（注意力 K/V 用
 F32 —— 旧的、约慢 2 倍的默认值）、`TS_WAN_HEARTBEAT_S`（进度心跳间隔，默认 30，
-`0` 关闭）、`TS_WAN_VAE_GEMM_MAX_MB`（im2col 预算）、`TS_WAN_VAE_MPS_CONV=0`
+`0` 关闭）、`TS_WAN_VAE_GEMM_MAX_MB`（im2col 预算）、`TS_WAN_DIT_FFN_CHUNK_MB`
+（DiT 前馈按 token 分块的预算，默认 256 MB；`0` 关闭分块）、`TS_WAN_VAE_TAP_SHARE=0`
+（每个时间抽头各做一次 im2col，而不是共用一次 —— 仅用于 A/B；共用的下降逐位一致）、
+`TS_VAE_CUDNN_CONV=1`（在 CUDA 上为 VAE 卷积启用 cuDNN；默认关闭，因为它在短片段上快
+约 1.2 倍、在 121 帧片段上慢约 4.5 倍 —— 每个卷积都在图外运行，主机往返次数随时间分块数
+增长）、`TS_CUDNN_DIR`（要使用的 cuDNN 安装目录）、`TS_WAN_VAE_MPS_CONV=0`
 （Metal 上改用 ggml 的卷积下降而非 MPSGraph）、
+`TS_WAN_METAL_TENSOR_API=1|0`（强制开/关 Metal 4 tensor API；14B 级 DiT 默认开启，
+更小的模型默认关闭 —— 见[下文](#metal-4-tensor-api以及不该怎么测它)）、
 `TS_WAN_VAE`/`TS_WAN_TE`/`TS_WAN_DIT2`（配套文件路径）、`TS_FFMPEG`（MP4 导出用的
 ffmpeg 路径）、`TS_WAN_DIT_TRACE=<file>`（逐阶段激活统计，用于调试）。
 
@@ -317,10 +336,18 @@ RTX 3080 Laptop 16 GB（Windows/WDDM），ggml_cuda：
 
 | 模型 / 工作负载 | 文本编码 | 图像编码 | 去噪 | VAE 解码 | 总计 |
 |---|---|---|---|---|---|
+| **Wan2_2-TI2V-5B-Turbo Q4_0** 图生视频 1088×832×121 帧、4 步（720p，5 秒） | 5.9 s | 6.1 s | 27.8 s/次前向（27 404 token） | 305 s | **429 s** |
 | **Wan2.2-TI2V-5B Q8_0** 图生视频 832×480×81 帧、30 步 | 3.5 s | 8.5 s | 11.5 s/步（CFG ×2，8190 token） | 103 s | 464 s |
 | Wan2.2-TI2V-5B Q8_0 文生视频 640×384×25 帧、20 步 | 3.7 s | — | 1.5 s/步 | 23 s | 65 s |
 | Wan2.2-I2V-A14B Q4_K_M 480×480×9 帧、6 步（冒烟） | 3.4 s | 5 s | 7–8 s/步 + 两次专家加载 | 7.4 s | 89 s |
 | Wan2.1-T2V-1.3B F16 832×480×33 帧、30 步 | 3.1 s | — | 9.4 s/步（CFG ×2） | 51 s | 337 s |
+
+那一行 720p/121 帧在 2026-08 这轮优化之前是 **1 143 s**：DiT 图在 27 404 token 下需要
+11.4 GiB，而这张卡只有 16 GB，整个去噪都跑在装不下的工作集上。对前馈按 token 分块
+（`TS_WAN_DIT_FFN_CHUNK_MB`）把 1.5 GiB 的中间结果移出峰值，每次前向从 110.4 s 降到
+26.1 s；限制 VAE 的 im2col scratch 并在因果抽头之间共用一次下降，把解码从 712 s 降到
+305 s。两者都是精确的：DiT 与 diffusers 的余弦仍为 0.99997，解码仍为 80.2 dB PSNR，
+与之前相同。
 
 TI2V-5B 的 16×16 空间压缩使同分辨率下 DiT token 数约为 Wan 2.1 的 1/2.7 ——
 它是消费级 GPU 上速度最快、质量最高的选择，也是唯一的 720p-24fps 模型。
@@ -434,8 +461,10 @@ MPS 的 NCHW 与 OIHW，而且这里实测 NCHW 与 NHWC 一样快，所以不�
 ggml 的下降路径。
 
 **VAE 卷积的 im2col 预算与分块阈值本身，改由设备显存推算。** 这两者过去在所有
-非 CUDA 后端上都被钉死在一张 16 GB 卡的预算上。Metal 现在像 CUDA 一样按可用显存
-推算（Vulkan 保留下限 —— 它的驱动拒绝多 GB 的竞技场）。更大的 im2col 预算把许多
+非 CUDA 后端上都被钉死在一张 16 GB 卡的预算上。Metal 现在按可用显存推算 im2col
+预算（可用显存的 1/8、上限 8 GB）；CUDA 固定为 384 MB（按可用显存推算在那里实测
+慢 2.2 倍），Vulkan（与 ggml_cpu 一样）固定为 384 MB（其驱动拒绝多 GB 的竞技场）。分块阈值则在
+所有 GGML 后端上都随可用显存缩放。更大的 im2col 预算把许多
 小的分带 GEMM 变成少量大 GEMM：1088×832×9 帧的解码从 56.4 s 降到 49.7 s。而且
 分块并不免费 —— 条带彼此重叠，解码器实际跑的潜变量行数多于平面本身，而且条带
 缓冲要与整幅画布共存。把 1088×832×121 帧**整幅**解码实测既更快又更省：
@@ -465,6 +494,14 @@ API）只有 1.08×：在这个规模上注意力受限于分数矩阵的访存�
 （121.4 → 100.8 s/次前向）、在 VAE 解码上 1.66×，因为它把 `mul_mm` 路由到 Metal 4
 的 tensor 操作 —— 但在 M5 / macOS 26.6 上，它同时会把 VAE 的卷积 GEMM 算错，
 视频输出为一片**纯黑**。
+
+对 A14B 等 14B 级 DiT（patch embedding 宽度 ≥ 5120），它在 M5 级 Mac 上**默认开启**，
+因为那里 DiT 的收益更大：在 M5 Pro 上以 480×480×9 帧实测，A14B 图生视频为 17.1 vs
+30.2 s/步（1.77×）（见 [Wan 视频与 tensor API](../../DEVELOPMENT_zh-cn.md#wan-视频与-tensor-api)）。
+此时 VAE 的卷积不走 tensor API 的 `mul_mm`：默认由 MPSGraph 执行；设置
+`TS_WAN_VAE_MPS_CONV=0` 时改走 ggml 的直接卷积，而不是 im2col+GEMM。
+`TS_WAN_METAL_TENSOR_API=1` / `0` 可为整个进程强制开启或关闭 tensor API，覆盖按模型
+规模选定的默认值。
 
 陷阱在于：这个问题在隔离测试里复现不出来。`WanVideoBench vae-decode` 在五种潜变量
 形状下跑过（包括被记录为最初全 NaN 复现场景的 32×32 布局），在 tensor API 开与关

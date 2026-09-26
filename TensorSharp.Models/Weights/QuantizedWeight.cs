@@ -8,6 +8,7 @@
 // TensorSharp is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 using System;
+using TensorSharp.Runtime;
 using System.Buffers;
 using System.Collections.Generic;
 using System.Diagnostics;
@@ -311,19 +312,11 @@ namespace TensorSharp.Models
             }
         }
 
-        public static unsafe IntPtr AllocateBuffer(long size)
-        {
-            void* ptr = NativeMemory.AlignedAlloc((nuint)size, 64);
-            if (ptr == null)
-                throw new OutOfMemoryException($"Unable to allocate {size} bytes for quantized weight storage.");
-            return (IntPtr)ptr;
-        }
+        // Large buffers are mapped rather than malloc'd on Apple platforms, so the ones
+        // a load frees after uploading them leave the footprint (see HostBuffers).
+        public static IntPtr AllocateBuffer(long size) => HostBuffers.Allocate(size);
 
-        public static unsafe void FreeBuffer(IntPtr ptr)
-        {
-            if (ptr != IntPtr.Zero)
-                NativeMemory.AlignedFree(ptr.ToPointer());
-        }
+        public static void FreeBuffer(IntPtr ptr) => HostBuffers.Free(ptr);
 
         /// <summary>
         /// Hint that a released FILE-MAPPED view's pages can go. Callers must

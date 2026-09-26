@@ -36,7 +36,7 @@ namespace TensorSharp.Server.Hosting
 
             if (string.IsNullOrWhiteSpace(hostedModelPath))
             {
-                error = "No model is hosted by this server. Restart TensorSharp.Server with --model <path.gguf>.";
+                error = "No model is hosted by this server. Restart TensorSharp.Server.Host with --model <path.gguf>.";
                 return false;
             }
 
@@ -48,7 +48,7 @@ namespace TensorSharp.Server.Hosting
 
             if (!MatchesHostedFileRequest(requestedModel, hostedModelPath, allowBareModelId: true))
             {
-                error = $"model '{requestedModel}' is not hosted by this server. Restart TensorSharp.Server with --model <path.gguf> to change it.";
+                error = $"model '{requestedModel}' is not hosted by this server. Restart TensorSharp.Server.Host with --model <path.gguf> to change it.";
                 return false;
             }
 
@@ -84,19 +84,19 @@ namespace TensorSharp.Server.Hosting
                     return true;
                 }
 
-                error = $"This server was started with mmproj '{Path.GetFileName(hostedMmProjPath)}'. Restart TensorSharp.Server without --mmproj to host no projector.";
+                error = $"This server was started with mmproj '{Path.GetFileName(hostedMmProjPath)}'. Restart TensorSharp.Server.Host without --mmproj to host no projector.";
                 return false;
             }
 
             if (string.IsNullOrWhiteSpace(hostedMmProjPath))
             {
-                error = "This server was started without --mmproj. Restart TensorSharp.Server with --mmproj <path.gguf|path.safetensors> to host a projector.";
+                error = "This server was started without --mmproj. Restart TensorSharp.Server.Host with --mmproj <path.gguf|path.safetensors> to host a projector.";
                 return false;
             }
 
             if (!MatchesHostedFileRequest(requestedMmProj, hostedMmProjPath, allowBareModelId: false))
             {
-                error = $"mmproj '{requestedMmProj}' is not hosted by this server. Restart TensorSharp.Server with --mmproj <path.gguf|path.safetensors> to change it.";
+                error = $"mmproj '{requestedMmProj}' is not hosted by this server. Restart TensorSharp.Server.Host with --mmproj <path.gguf|path.safetensors> to change it.";
                 return false;
             }
 

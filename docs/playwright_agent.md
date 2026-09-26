@@ -25,8 +25,10 @@ Use the appropriate model backend for the machine. Open WebUI Chat, select the
 skill, and ask for a concrete browser task. Discovery can also select a skill by
 its description. Without an explicit skills directory, conventional repository
 `.agents/skills` roots are searched from the current directory to the nearest Git
-boundary; binary-adjacent `skills` remains a fallback. Personal skills are not
-implicitly imported into a server.
+boundary, nearest first. On the server, the `skills` directory next to the
+binary is also the upload directory. It is always scanned first, so it wins a
+name clash, and it is kept even with an explicit `--skills-dir` or
+`TS_SKILLS_DIR`, which replaces only the `.agents/skills` defaults. Personal skills are not implicitly imported into a server.
 
 The model reads `SKILL.md`, then calls `skills_run` with the actual skill id and
 bundle-relative script path. For example:
@@ -123,7 +125,11 @@ network host allow-list it cannot enforce; it does not silently broaden it.
 The shipped MAUI UI is iOS-only. Its embedded JavaScript engine is not Node.js,
 and iOS cannot spawn npm, Chromium, or arbitrary native child processes. This
 skill therefore cannot run locally on physical iOS under the no-bridge
-constraint. Desktop-host validation is not an iOS-device pass.
+constraint. The app bundle leaves it out: `TensorAgent.Maui.csproj` excludes
+`playwright` (and `web-artifacts-builder`, whose scripts need pnpm, npm and
+parcel) by name, so the app carries ten of the twelve skills while the repository's
+`TensorAgent/skills` directory keeps all twelve for the desktop hosts.
+Desktop-host validation is not an iOS-device pass.
 
 Linux's required bubblewrap backend gives each command its own PID namespace.
 Detached CLI daemons cannot be assumed to survive across calls. A persistent

@@ -43,7 +43,9 @@ is dropped entirely when that engine produced nothing comparable for the model
 (e.g. an unreachable vLLM endpoint).
 
 Beyond speed, `report.py` also compares **output quality**: both engines decode
-the same GGUF greedily (`temperature=0`), so their outputs should agree closely.
+the same GGUF greedily (`temperature=0`), so their outputs should agree closely
+(with TensorSharp's sub-agent delegation turned off; see
+[the caveat](#choosing-compute-backends---backends)).
 The report's *Output quality* section scores each overlapping
 TensorSharp-vs-llama.cpp cell with a whitespace-normalized text-similarity
 ratio (1.00 = identical), checks the structural scenarios (valid JSON object in
@@ -58,7 +60,7 @@ from the result JSONs alone.
 |---|---|
 | `benchmark_config.json` | **all settings** — host paths, model / scenario / engine / backend registries, run defaults. Edit this, not the code. |
 | `config.py` | loads `benchmark_config.json`, resolves `${var}` paths + env overrides, exposes the registries + applicability gating |
-| `engines.py` | OpenAI streaming client + server lifecycle managers (TensorSharp.Server, llama-server, vLLM connector) |
+| `engines.py` | OpenAI streaming client + server lifecycle managers (TensorSharp.Server.Host, llama-server, vLLM connector) |
 | `scenarios.py` | per-scenario, engine-aware request builders |
 | `run_matrix.py` | orchestrator — launches one server per `(engine, backend, model, mtp, tp, cpu_moe)`, runs scenarios, writes per-cell JSON |
 | `report.py` | aggregates `results/*.json` → `docs/engine_comparison_report.md` + `results/results.csv` |
@@ -105,7 +107,7 @@ Point the harness at an alternate settings file with `--config other.json`
 ## Prerequisites
 
 - **Python 3.10+** with `requests`, `opencv-python` (video frame sampling). Both already present on the dev box.
-- **TensorSharp.Server** built: `TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll` (run with `dotnet`). Build with `dotnet build TensorSharp.Server.Host -c Release` if missing/stale.
+- **TensorSharp.Server.Host** built: `TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll` (run with `dotnet`). Build with `dotnet build TensorSharp.Server.Host -c Release` if missing/stale.
 - **llama.cpp** server binary at `C:/Works/llama.cpp/build-cuda/bin/Release/llama-server.exe` (CUDA build).
   Non-CUDA backend columns use per-backend builds declared in the `backends` registry
   (e.g. a Vulkan build at `build-vulkan/.../llama-server.exe`, overridable via
@@ -231,11 +233,18 @@ back to `paths.llama_server_exe` — and `vllm: true` marks the single column th
 external vLLM endpoint's numbers are comparable on. Add a new backend by adding
 an entry; nothing in the Python needs to change.
 
-Two caveats: **TensorSharp.Server silently falls back** to the first available
-backend when the requested one isn't supported by the build/host (check
-`results/logs/*.log` — the startup banner names the backend actually used — if
-numbers look implausible), and llama.cpp's `cpu` and `ggml_cpu` cells are the
-same engine configuration (`-ngl 0`), since llama.cpp has no pure-C# analogue.
+Two caveats: when the requested backend isn't supported by the build/host,
+**TensorSharp.Server.Host refuses the startup model load** (one error line, exit
+code 2; check `results/logs/*.log`) instead of serving on another backend, and
+llama.cpp's `cpu` and `ggml_cpu` cells are the same engine configuration
+(`-ngl 0`), since llama.cpp has no pure-C# analogue.
+
+Sub-agent delegation is on by default in TensorSharp.Server.Host, so the
+harness always launches it with `--no-multi-agent`. Without that flag every
+TensorSharp request to a tool-capable model would carry five coordination tools
+(`spawn_agent`, `wait_agent`, `send_input`, `close_agent`, `list_agents`) and a
+coordination prompt that llama.cpp and vLLM never see, and prompt tokens, TTFT,
+output similarity and tool-call behaviour would not be like-for-like.
 
 Older configs using the legacy `"backends": ["gpu", "cpu"]` list + `maps`
 form still load unchanged, and result files from old runs (backend ids `gpu` /
@@ -248,8 +257,9 @@ Each mode relaunches the server (it is a load-time flag): `on` adds `--spec`,
 and for Gemma 4 also `--draft-model <draft.gguf>` (Qwen 3.6 embeds its NextN
 block in the trunk, so no extra file is needed — but only GGUFs from the
 `unsloth/Qwen3.6-35B-A3B-MTP-GGUF` repo retain that block; base-repo Qwen3.6
-GGUFs with the same file names strip it and the server silently falls back to
-standard decode, making the `on` and `off` cells measure the same thing). MTP is a TensorSharp feature —
+GGUFs with the same file names strip it; the server then serves standard decode
+and its startup capability report says "no draft head in weights", making the
+`on` and `off` cells measure the same thing). MTP is a TensorSharp feature —
 `on` cells for llama.cpp / vLLM and for the diffusion model are recorded as
 skipped. Gemma 4 drafts are target-paired (an E4B `gemma4-assistant` draft for
 `gemma4-e4b`, a 12B draft for `gemma4-12b`, a 26B-A4B draft for
@@ -374,8 +384,17 @@ therefore the expected shape, and the number you are buying VRAM with.
 multiplies the *offloaded* points — `off` collapses to one baseline cell however
 many thread counts were asked for, because the baseline never runs a host
 matmul. `0` (the default) sends no thread count at all and leaves each engine's
-own default alone; TensorSharp's is half the CPU parallelism the process can
-actually use, and sizing it near the CPU quota is a cliff rather than a slope.
+own default alone. For TensorSharp's shared host-MoE path that default is half
+the CPU parallelism the process can actually use, capped at 64 threads (all but
+one on hosts with at most 8), because sizing that pool near the CPU quota is a
+cliff rather than a slope. The native DeepSeek V4/V4.1 and GLM-5.x whole-model
+executors instead use every CPU the process can use once `--n-cpu-moe` is set.
+The DeepSeek executor honours `--cpu-moe-threads`. The GLM-5.x executor reads
+only a `TS_CPU_MOE_THREADS` inherited from the environment the server was
+launched with, so on GLM models the `--cpu-moe-threads` axis does not change the
+thread count and its cells differ only in their labels. To size that pool,
+export `TS_CPU_MOE_THREADS` in the backend's `tensorsharp.env` and leave the
+axis at `0`.
 
 `off` is the only word for the baseline point (`0` also works because the engine
 flag itself takes it); anything else — `none`, a typo — is an error rather than a
@@ -441,7 +460,10 @@ the response ends — so it can neither be observed round-trip-by-round-trip nor
 carry a file from one request to the next, and llama.cpp and vLLM have no
 equivalent at all. A client-driven loop is the only shape that is both
 measurable and identical on every engine, which is what makes these cells
-comparable.
+comparable, provided TensorSharp's default-on sub-agent delegation is turned off
+(see [the caveat above](#choosing-compute-backends---backends)); otherwise its
+requests also carry the coordination tools, and any sub-agent the model spawns
+runs inside the server.
 
 On TensorSharp's server-owned surface, `apply_patch` handles every modification
 to an existing file, from a single-line change in one file to atomic changes
@@ -508,8 +530,9 @@ so `prefill_tps` there understates and noisily estimates true prompt-processing
 throughput. The `prefill_<N>` scenarios drive the prompt to controlled lengths long
 enough for the per-token prefill cost to separate cleanly from that fixed overhead.
 
-These scenarios are part of the **main `benchmark_config.json`** matrix (which runs
-the 2k/4k/8k sweep by default). For a *focused* prefill run — the full
+These scenarios are declared in the **main `benchmark_config.json`**; its
+`defaults.scenarios` does not run them, so select them with `--scenarios` (below).
+For a *focused* prefill run — the full
 2k → 128k sweep, with the multimodal / diffusion scenarios and models stripped out
 and results written to a separate `results_prefill/` — use the dedicated
 **`benchmark_config_prefill.json`** (its `defaults.scenarios` runs every length
@@ -597,9 +620,12 @@ no offload, `concurrency` 1); non-default cells add a `__mtp`, `__tp<N>`,
   accepts TCP connects into its dead listen backlog, which looks like an
   endless "server not ready" wait. The harness defends itself: llama-server is
   auto-launched on the next free port when its configured port is taken, the
-  TensorSharp group fails fast with the squatter's PID (its 0.0.0.0:5000 listen
-  address is hard-coded), and `wait_ready` aborts with a diagnosis when the
-  port's owner is not the process it launched.
+  TensorSharp group fails fast with the squatter's PID (the harness launches
+  TensorSharp.Server.Host with `--host 127.0.0.1 --port <BENCH_TS_PORT /
+  paths.tensorsharp_port, default 5000>`, so it listens on loopback only; set
+  `BENCH_TS_PORT` or `paths.tensorsharp_port` to benchmark on another port), and
+  `wait_ready` aborts with a diagnosis when the port's owner is not the process it
+  launched.
 - `docs/engine_comparison_report.md` and `results/results.csv` from `report.py`.
 
 The `results/` directory (per-cell JSONs, logs, images, CSV) is generated
@@ -615,7 +641,7 @@ pull request (`gemma4-12b` only; `text_short`, `function_call`, `json_mode`,
 demand via `workflow_dispatch` (inputs select a custom subset) plus a weekly
 schedule. Each run:
 
-1. builds TensorSharp (native GGML CUDA library + `TensorSharp.Server`),
+1. builds TensorSharp (native GGML CUDA library + `TensorSharp.Server.Host`),
 2. clones and builds **llama.cpp** (CUDA, `llama-server`; pick the ref with the
    `llama_ref` input),
 3. downloads the benchmark models via `download_models.py` (from the `source`
@@ -630,6 +656,9 @@ llama.cpp sources/build and the downloaded models live in a persistent
 directory on the runner (`$HOME/tensorsharp-bench`, overridable with the
 `BENCH_HOME` repository variable), so repeat runs only pay incremental costs.
 The run fails if any benchmark cell reports `fail` or nothing ran `ok`.
+The harness passes `--no-multi-agent` to every TensorSharp server it launches,
+`benchmark_config_ci.json` included, so its prompts carry no sub-agent
+coordination tools (see [the caveat](#choosing-compute-backends---backends)).
 
 ### Verifying the macOS / MLX path
 
@@ -700,7 +729,10 @@ workflow, repeated measurements and per-request concurrent correctness. It
 retains full request/response artifacts and refuses to establish parity when
 the reference is missing or invalid. See the
 [validation protocol](../../docs/deepseek41_validation.md) for commands,
-comparison requirements and uncovered capabilities.
+comparison requirements and uncovered capabilities. Start the TensorSharp server
+with `--no-multi-agent` (or `TS_NO_MULTI_AGENT=1`): neither
+`validate_inference.py` nor `validate_deepseek41_tools.py` sends
+`"multi_agent": false`, and sub-agent delegation is on by default.
 
 The sustained `decode`/`decode_8k` scenarios require the full requested output
 token budget and basic hash-table explanatory content. These checks reject

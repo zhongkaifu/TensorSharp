@@ -111,10 +111,16 @@ namespace TensorSharp.Server.ResponseSerializers
             IReadOnlyList<MultiAgentProgress> agents = null) => new
         {
             tool_progress = phase,
-            tool,
+            // The tool that runs, by its declared name: an alias the host accepts
+            // (str_replace, apply-patch, ...) is reported as the tool it dispatches to, so
+            // the pages label it like the real name instead of "Running str replace".
+            tool = SkillToolNames.CanonicalName(tool),
             text,
             seconds,
-            // What is being run, in one line: "python · 2.1 KB", "scripts/extract.py 2400".
+            // What is being run, in one line (SkillChatLoop.DescribeCall): a shell call's
+            // command ("pip install pandas"), a skills_run script and its arguments
+            // ("scripts/extract.py 2400"), a skills_read file ("pdf/SKILL.md"), or an
+            // apply_patch envelope's size ("812 chars").
             detail,
             // Non-observing snapshots refresh the expanded subagent panel during a wait.
             agents = agents?.Select(a => new
@@ -123,8 +129,11 @@ namespace TensorSharp.Server.ResponseSerializers
                 parent_id = a.ParentId,
                 task = a.Task,
                 agent_type = a.AgentType,
+                permissions = a.Permissions,
+                workspace_id = a.WorkspaceId,
+                depends_on = a.DependsOn,
                 status = a.Status,
-                tool = a.Tool,
+                tool = SkillToolNames.CanonicalName(a.Tool),
                 tool_status = a.ToolStatus,
                 detail = a.Detail,
                 result = a.Result,

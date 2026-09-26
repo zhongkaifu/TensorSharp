@@ -3,10 +3,12 @@
   // 4-bit) with its vision projector and MTP draft head. All three files live
   // under ${modelRoot}/gemma_mtp/qat.
   // Run with:
-  //   TensorSharp.Cli    --config config/gemma-4-12b.json --image photo.png
-  //   TensorSharp.Server --config config/gemma-4-12b.json
+  //   TensorSharp.Cli         --config config/gemma-4-12b.json --image photo.png
+  //   TensorSharp.Server.Host --config config/gemma-4-12b.json
+  // Missing files download from unsloth, pinned by commit and SHA-256.
   "variables": {
-    "root": "${TENSORSHARP_MODELS:-../models}/gemma_mtp/qat"
+    "root": "${TENSORSHARP_MODELS:-../models}/gemma_mtp/qat",
+    "repo": "https://huggingface.co/unsloth/gemma-4-12B-it-qat-GGUF/resolve/980b060c40a8539ac159e0501a3e0f66a6365af3"
   },
 
   "backend": "ggml_cuda",
@@ -17,10 +19,25 @@
   "top-k": 64,
   "top-p": 0.95,
 
-  "model": "${root}/gemma-4-12B-it-qat-UD-Q4_K_XL.gguf",
-  "mmproj": "${root}/gemma-4-12B-mmproj-BF16.gguf",
+  "model": {
+    "path": "${root}/gemma-4-12B-it-qat-UD-Q4_K_XL.gguf",
+    "urls": ["${repo}/gemma-4-12B-it-qat-UD-Q4_K_XL.gguf"],
+    "sha256": "90fd44e29e0d7cffeb0fd00dc73cfdab9ed0b0e95306ecf7821ea634c940c370"
+  },
+  "mmproj": {
+    "path": "${root}/gemma-4-12B-mmproj-BF16.gguf",
+    "urls": ["${repo}/mmproj-BF16.gguf"],
+    "sha256": "dcb8103adad042b1bf99df767aaf34eb37c5a73a4a2f0417e4d7ba557e91664f"
+  },
 
-  // MTP speculative decoding (server only): separate draft GGUF, lossless.
-  "spec": false,
-  "draft-model": "${root}/gemma-4-12B-it-Q4_0-MTP.gguf"
+  // MTP speculative decoding, on both hosts: Gemma-4's draft head ships as its
+  // own GGUF, and naming it here turns speculation ON by itself -- no "spec" key
+  // is needed ("spec": false would do nothing: a JSON false emits no flag).
+  // Lossless. Pass --no-spec on the command line to decode without it (the
+  // draft file is still fetched).
+  "draft-model": {
+    "path": "${root}/gemma-4-12B-it-Q4_0-MTP.gguf",
+    "urls": ["${repo}/MTP/mtp-gemma-4-12B-it-Q4_0.gguf"],
+    "sha256": "fcb35dea42c71333db904cee11baac525c9ef872818ee3753f6cb156f3c6f4f6"
+  }
 }

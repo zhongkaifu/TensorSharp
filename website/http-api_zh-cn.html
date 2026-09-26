@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>HTTP API (Ollama / OpenAI) — TensorSharp 维基</title>
-  <meta name="description" content="通过 HTTP 调用 TensorSharp.Server：兼容 Ollama 与 OpenAI 的端点、Web UI SSE 协议、采样、工具、结构化输出与 Python 客户端。">
+  <meta name="description" content="通过 HTTP 调用 TensorSharp.Server.Host：兼容 Ollama 与 OpenAI 的端点（含 Responses API）、Jev 类型化决策、Web UI SSE 协议、采样、工具、子智能体、结构化输出与 Python 客户端。">
   <link rel="icon" href="assets/logo.svg" type="image/svg+xml">
   <link rel="stylesheet" href="assets/style.css">
   <script>try{var t=localStorage.getItem('ts-theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');document.documentElement.classList.toggle('dark',t==='dark');}catch(e){}</script>
@@ -16,21 +16,22 @@
 <main class="content" id="content">
   <div class="breadcrumb"><a href="index_zh-cn.html">首页</a> › HTTP API</div>
   <h1>HTTP API (Ollama / OpenAI)</h1>
-  <p class="lede"><code>TensorSharp.Server</code> 暴露聚焦的 Ollama / OpenAI 兼容子集以及 Web UI 协议，全部位于 <code>http://localhost:5000</code>。OpenAI Chat Completions 客户端可使用 <code>/v1</code> 基址；Ollama 聊天客户端必须改用非标准路径 <code>/api/chat/ollama</code>。</p>
+  <p class="lede"><code>TensorSharp.Server.Host</code>（服务端）暴露聚焦的 Ollama / OpenAI 兼容子集以及 Web UI 协议，全部位于 <code>http://localhost:5000</code>。OpenAI Chat Completions 客户端可使用 <code>/v1</code> 基址；Ollama 聊天客户端必须改用非标准路径 <code>/api/chat/ollama</code>。</p>
 
   <div class="table-scroll">
   <table>
     <thead><tr><th>风格</th><th>端点</th></tr></thead>
     <tbody>
       <tr><td><strong>兼容 Ollama</strong></td><td><code>/api/embed</code>、<code>/api/embeddings</code>、<code>/api/generate</code>、<code>/api/chat/ollama</code>、<code>/api/tags</code>、<code>/api/show</code></td></tr>
-      <tr><td><strong>兼容 OpenAI</strong></td><td><code>/v1/embeddings</code>、<code>/v1/chat/completions</code>、<code>/v1/models</code>、<code>/v1/videos/generations</code>、<code>/v1/skills</code></td></tr>
+      <tr><td><strong>兼容 OpenAI</strong></td><td><code>/v1/embeddings</code>、<code>/v1/chat/completions</code>、<code>/v1/responses</code>、<code>/v1/models</code>、<code>/v1/videos/generations</code>、<code>/v1/skills</code></td></tr>
+      <tr><td><strong>兼容 Jev</strong></td><td><code>/v1/systemone</code>（在托管的 DiffusionGemma 模型上做类型化决策——见<a href="#jev">下文</a>）</td></tr>
       <tr><td><strong>Web UI (SSE)</strong></td><td><code>/api/chat</code>、<code>/api/sessions</code>、<code>/api/models</code>、<code>/api/models/load</code>、<code>/api/upload</code>、<code>/api/image-generate</code>、<code>/api/image-generate/stream</code>、<code>/api/image-edit</code>、<code>/api/image-edit/stream</code>、<code>/api/video-generate</code>、<code>/api/video-generate/stream</code>、<code>/api/skills</code>、<code>/api/code/artifacts</code></td></tr>
-      <tr><td><strong>工具端点</strong></td><td><code>/health</code>、<code>/api/version</code>、<code>/api/queue/status</code></td></tr>
+      <tr><td><strong>工具端点</strong></td><td><code>/health</code>、<code>/api/version</code>、<code>/api/queue/status</code>、<code>/uploads/*</code>（已存储的上传文件与生成文件）</td></tr>
     </tbody>
   </table>
   </div>
   <div class="callout warn"><div class="ic">⚠️</div><p><strong>Ollama 聊天路径：</strong>兼容 Ollama 的聊天端点是 <code>POST /api/chat/ollama</code>，<em>不是</em> <code>/api/chat</code>；后者是 Web UI 的 SSE 端点。<code>/api/generate</code>、<code>/api/tags</code>、<code>/api/show</code> 与 <code>/api/version</code> 使用标准 Ollama 路径。</p></div>
-  <div class="callout note"><div class="ic">📌</div><p>启动时必须传入 <code>--model</code>；视觉 / 音频需要投影器时还要显式传入 <code>--mmproj</code>。请求必须指明该启动 GGUF 文件或其基名。<code>/api/models/load</code> 只能重新加载同一启动模型 / 投影器，不能加载任意路径，也不能给无模型进程添加模型。Ollama / OpenAI 兼容端点省略 <code>max_tokens</code> / <code>num_predict</code> 时默认生成 <strong>200</strong> token（Web UI 使用 <code>--max-tokens</code>，默认 20000）。见<a href="server_zh-cn.html#start">可复制粘贴的服务器快速开始</a>。</p></div>
+  <div class="callout note"><div class="ic">📌</div><p>启动时必须传入 <code>--model</code>；视觉 / 音频需要投影器时还要显式传入 <code>--mmproj</code>。请求必须指明该启动 GGUF 文件或其基名。<code>/api/models/load</code> 只能重新加载同一启动模型 / 投影器，不能加载任意路径，也不能给无模型进程添加模型。请求省略 <code>max_tokens</code> / <code>num_predict</code> / <code>max_output_tokens</code> 时，所有端点——Ollama、OpenAI 与 Web UI 一样——都回落到 <code>--max-tokens</code> / <code>MAX_TOKENS</code>（默认 <strong>20000</strong>）；用该参数或环境变量显式固定的值还会截断要求更多的请求。服务端没有旧式 <code>/v1/completions</code> 路由，也没有 <code>/v1/images/*</code> 路由。见<a href="server_zh-cn.html#start">可复制粘贴的服务器快速开始</a>。</p></div>
   <div class="callout warn"><div class="ic">🔒</div><p>服务没有 API Key 身份验证或内置 TLS，并监听 <code>0.0.0.0:5000</code>。只应在可信网络中使用，或在前方部署带身份验证与 TLS 的反向代理。</p></div>
 
   <h2 id="embeddings">嵌入服务</h2>
@@ -174,8 +175,31 @@ curl -X POST http://localhost:5000/v1/chat/completions \
     \"max_tokens\": 200
   }"</code></pre>
 
+  <h3 id="responses">Responses API（<code>/v1/responses</code>）</h3>
+  <pre data-lang="bash"><code>curl -X POST http://localhost:5000/v1/responses \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen3.5-9B-Q8_0.gguf",
+    "instructions": "You are a helpful assistant.",
+    "input": "What is 2+3?",
+    "max_output_tokens": 50
+  }'</code></pre>
+  <p><code>input</code> 可以是字符串，也可以是消息项数组；只读取消息项，其他类型（<code>function_call</code>、<code>function_call_output</code>、<code>reasoning</code>）会被跳过并记入日志。<code>instructions</code> 成为系统消息，<code>max_output_tokens</code> 省略时回落到 <code>--max-tokens</code>，<code>reasoning</code> 对象开启思考（<code>reasoning.effort</code> 是 <code>reasoning_effort</code> 在 Responses 中的写法），<code>text.format</code> 请求结构化输出。该路由上 <code>text.format</code> 不能与 <code>reasoning</code> 或 <code>tools</code> 同时使用（任何家族都返回 <code>400</code>）；<a href="#structured">§5</a> 中语法延后生效的例外只适用于 Chat Completions 的 <code>response_format</code>。采样字段、<code>tools</code>、<code>skills</code>、<code>skills_discovery</code> 与 <code>multi_agent</code> 的用法与 Chat Completions 相同。<code>"stream": true</code> 时以具名 SSE 事件推送（<code>response.created</code>、<code>response.output_text.delta</code>……<code>response.completed</code>）。服务端按请求无状态：<code>previous_response_id</code> 会以 <code>400</code> 拒绝，因此请把完整对话放进 <code>input</code>。<code>store</code>（默认 <code>true</code>）只是保留已完成的响应，供 <code>GET /v1/responses/{id}</code> 再次取回——存在内存中，设置了 <code>TS_RESPONSES_STORE_REDIS_URL</code>（或 <code>--redis-url</code>）时存在 Redis 中。</p>
+
+  <h3 id="jev">Jev 类型化决策（<code>/v1/systemone</code>）</h3>
+  <p>托管模型为 DiffusionGemma 时，<code>POST /v1/systemone</code> 针对一个 <code>state</code>（字符串、对象或数组）回答 Jev 风格的类型化问题，每个样本只做一次带种子的去噪读取，而不是生成文本：<code>noul</code>（为“是”的概率）、<code>choice</code>（2–26 个具名选项）与 <code>score</code>（有序等级，以从 0 起算的期望下标作答）。每个问题形如 <code>{"type", "instructions", "criteria"}</code>：<code>choice</code> 的 <code>criteria</code> 是选项名到描述的映射，<code>score</code> 的 <code>criteria</code> 是按顺序排列的等级数组，<code>noul</code> 的 <code>criteria</code> 可省略，也可以是 <code>{"true": …, "false": …}</code> 对象；问题中的其他字段返回 <code>422</code>。<code>model</code> 可以写已加载的文件名、<code>jev-latest</code> 或 <code>jev-preview</code>——后两者只是已加载模型的别名，不是另外的检查点。</p>
+  <pre data-lang="bash"><code>curl -X POST http://localhost:5000/v1/systemone \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "jev-latest",
+    "state": "I was charged twice for the same subscription this month.",
+    "questions": { "billing": { "type": "noul", "instructions": "Is this a billing issue?" } },
+    "samples": 1, "seed": 42
+  }'</code></pre>
+  <p>响应包含 <code>answers.&lt;id&gt;</code>（<code>noul</code>；或带 <code>probabilities</code> 与 <code>confidence</code> 的 <code>choice</code> / <code>score</code>）、<code>usage</code> 与 <code>diagnostics</code>。这些概率只是在所列标签上做的 softmax，并不是经过校准的“答对概率”。一个请求最多 64 个问题、最多 8 张内联 <code>images</code>（base64 或 <code>data:</code> URL，按上传限额存储；需要用 <code>--mmproj</code> 传入视觉塔，否则返回 <code>503</code>）；其余字段为 <code>instructions</code>、<code>samples</code>（1–32，或默认的 <code>"auto"</code>）、<code>auto_max</code>、<code>auto_threshold</code>、<code>seed</code>、<code>chunk_rows</code> 与 <code>chunk_prompt</code>，而 <code>steps</code> 与 <code>think</code> 只接受 <code>1</code> 与 <code>0</code>。错误码：<code>Content-Type</code> 不是 <code>application/json</code>（包括 multipart 上传）时 <code>415</code>，JSON 格式错误 <code>400</code>，超过 8 MiB 请求体上限 <code>413</code>（<code>TS_JEV_MAX_BODY_MB</code>，1–64），内联图像超出上传单文件上限或配额时 <code>413</code> / <code>507</code>，请求无效 <code>422</code>（含音频与视频），模型名未知 <code>404</code>，未加载 DiffusionGemma 模型 <code>503</code>；已接纳（运行中或排队）的请求达到 <code>TS_JEV_MAX_PENDING</code>（默认 32）时返回 <code>529</code> 并带 <code>Retry-After: 1</code>。→ <a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/models/jev_zh-cn.md" target="_blank" rel="noopener">Jev 指南</a></p>
+
   <h2 id="tools">3 · 通过 HTTP 进行工具调用</h2>
-  <p>发送一个 <code>tools</code> 数组；服务器会检测该架构的线格式并返回结构化的 <code>tool_calls</code>。</p>
+  <p>发送一个 <code>tools</code> 数组；服务器会检测该架构的线格式并返回结构化的 <code>tool_calls</code>。托管 DiffusionGemma 时模型没有工具调用通道，携带 <code>tools</code> 的请求返回 <code>400</code>；Mistral 3 与 Hunyuan Dense 不渲染工具声明。</p>
   <pre data-lang="bash"><code>curl -X POST http://localhost:5000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
@@ -217,7 +241,7 @@ curl -X POST http://localhost:5000/v1/chat/completions \
   <pre data-lang="json"><code>"skills": ["pdf", "xlsx"],
 "skills_discovery": true</code></pre>
   <p><code>skills_discovery</code> 默认为 <code>true</code>：本次请求<em>没有</em>点名的技能，其名称与描述也会展示给模型，好让它自己发现你没想到要点名的那个。设为 <code>false</code> 则把本次请求限制在它列出的技能上。点名一个服务端没有的技能会返回 <code>400</code> —— 用 <a href="#skills-manage"><code>GET /api/skills</code></a> 查看已注册了哪些。</p>
-  <p>对能调用工具的家族，初始提示词只携带元数据，显式选中的技能也一样；模型激活匹配技能时再用 <code>skills_read</code> 读取 <code>SKILL.md</code>。若一个家族无法同时渲染并解析完整工具往返，则改为内联选中技能正文，并丢弃发现目录；当前 <code>qwen4exp</code> 与 Mistral 3 都走这条路径。</p>
+  <p>对能调用工具的家族，初始提示词只携带元数据，显式选中的技能也一样；模型激活匹配技能时再用 <code>skills_read</code> 读取 <code>SKILL.md</code>。若一个家族无法同时渲染并解析完整工具往返，则改为内联选中技能正文，并丢弃发现目录；当前 Mistral 3、Hunyuan Dense、DiffusionGemma 以及没有注册聊天协议的架构走这条路径。Qwen 3.8 Flash Next（<code>qwen4exp</code>）现已能解析工具调用，走元数据路径。</p>
   <pre data-lang="bash"><code># 兼容 OpenAI
 curl -X POST http://localhost:5000/v1/chat/completions \
   -H "Content-Type: application/json" \
@@ -243,16 +267,21 @@ curl -X POST http://localhost:5000/api/chat/ollama \
 curl -N -X POST http://localhost:5000/api/chat \
   -H "Content-Type: application/json" \
   -d '{"messages": [{"role": "user", "content": "总结这份 PDF。"}], "skills": ["pdf"], "maxTokens": 400}'</code></pre>
-  <p>返回的是一条普通回复。模型通过内置的 <code>skills_list</code> / <code>skills_read</code> 工具取用技能的其余内容，而这两个工具由服务端<strong>自己</strong>在进程内、紧挨着权重应答，因此客户端永远不会收到一个它无法执行的工具调用，现有的 OpenAI SDK 也无需改动（把这两个字段放进 <code>extra_body</code> 即可）。技能还能与你自己的 <code>tools</code> 共存：技能工具会并入你发来的工具列表，服务端只应答属于它自己的那几个，而对<em>你的</em>工具的调用照常回传——此时模型从技能里读到的内容已经在对话中了。</p>
+  <p>返回的是一条普通回复。模型通过内置的 <code>skills_list</code> / <code>skills_read</code> 工具取用技能的其余内容，而这两个工具由服务端<strong>自己</strong>在进程内、紧挨着权重应答，因此客户端永远不会收到一个它无法执行的工具调用，现有的 OpenAI SDK 也无需改动（把这两个字段放进 <code>extra_body</code> 即可）。技能还能与你自己的 <code>tools</code> 共存：技能工具会并入你发来的工具列表，服务端只应答属于它自己的那几个，而对<em>你的</em>工具的调用照常回传——此时模型从技能里读到的内容已经在对话中了。开启脚本执行时，读取带脚本的 <code>SKILL.md</code> 还会附上一段简短的宿主说明，给出现成的 <code>skills_run</code> 示例；<code>skills_run</code> 的 <code>args</code> 可以是字符串组成的 JSON 数组（数组被编码成字符串传来时也可以），也可以是 shell 风格的文本。</p>
   <div class="callout note"><div class="ic">📌</div><p>每次内置读取或代码操作都可能引出一次额外生成，而<strong>每一轮都以流式运行</strong>。服务端吞掉自己的工具标记，同时转发解码中的正文 / 推理，因此客户端收到的是完成后的回答，而不是内部调用。<code>--skills-max-rounds</code> 限制循环：默认 <code>8</code>，提供代码执行时自动变为 <code>24</code>；运维显式设置的值始终原样保留。</p></div>
   <p>Web UI 的流式响应会为每一次已执行的技能工具调用推送一帧，随完成即时送出：</p>
-  <pre data-lang="text"><code>data: {"skill_step":"skills_read","skill":"pdf","detail":"references/forms.md","ok":true,"round":1,"files":null}</code></pre>
-  <p><code>skill_step</code> 是执行过的内置工具，<code>skill</code>/<code>detail</code> 标识目标，<code>ok</code> 表示成功与否，<code>round</code> 从 1 起算；<code>files</code> 以 <code>{name, bytes, url}</code> 携带生成产物。→ <a href="#webui-sse">Web UI SSE 协议</a></p>
+  <pre data-lang="text"><code>data: {"skill_step":"skills_read","agent_id":"/root","skill":"pdf","detail":"references/forms.md","ok":true,"round":1,"files":null}</code></pre>
+  <p><code>skill_step</code> 是执行过的内置工具，<code>agent_id</code> 指明发起调用的智能体（除非是子智能体发起，否则为 <code>/root</code>），<code>skill</code>/<code>detail</code> 标识目标，<code>ok</code> 表示成功与否，<code>round</code> 从 1 起算；<code>files</code> 以 <code>{name, bytes, url}</code> 携带生成产物。→ <a href="#webui-sse">Web UI SSE 协议</a></p>
 
   <h3 id="agentic-http">智能体代码执行</h3>
   <p>代码执行是服务端启动能力，不是逐请求开关。带上 <code>--code-exec</code> 后，每个能调用工具的聊天接口都可以使用四个服务端自有工具：<code>read_file</code>、<code>write_file</code>、<code>shell</code> 与 <code>apply_patch</code>。它们与技能共用同一个有界循环，绝不会转发客户端；调用方定义的工具仍由调用方处理。这里没有逐命令审批 API。→ <a href="agentic_zh-cn.html">参数、沙箱与信任模型</a></p>
   <p>每个 OpenAI 或 Ollama 请求都得到唯一的私有工作区，在内部轮次之间共享，并在完成、取消或失败后删除。具名 Web UI 会话则跨聊天轮次保留工作区；技能脚本与代码工具共用它。保留的产物可通过 <code>GET /api/code/artifacts/{runId}</code> 列出，并从 <code>GET /api/code/artifacts/{runId}/{*path}</code> 下载；下载始终带 attachment 与 <code>nosniff</code>。</p>
   <div class="callout warn"><div class="ic">🔒</div><p>脚本与命令执行都默认关闭，OS 沙箱默认 <code>required</code>（要么隔离，要么拒绝）。macOS Seatbelt 与 Linux bubblewrap 0.12+ 会约束写入、主目录读取与默认关闭的网络，但 macOS 无法保证清理故意脱离的子进程。Windows job object 只约束进程树，不能限制文件或网络，因此代码需要显式 <code>--code-exec-unconfined</code>，技能脚本需要 <code>--skills-sandbox preferred</code>。<code>--code-exec-allow-network</code> 赋予生成命令不受限的宿主 IP 网络访问（含 LAN / loopback）；它与宿主代安装、<code>--skills-allow-network</code> 彼此独立。</p></div>
+
+  <h3 id="sub-agents-http">子智能体（<code>multi_agent</code>）</h3>
+  <p>在能调用工具的家族上——即既渲染工具声明又能解析工具调用的家族，因此不包括 Mistral 3、Hunyuan Dense 与 DiffusionGemma——<code>/v1/chat/completions</code>、<code>/v1/responses</code>、<code>/api/chat/ollama</code> 与 Web UI 的 <code>/api/chat</code> 还会提供五个服务端自有的协调工具：<code>spawn_agent</code>、<code>wait_agent</code>、<code>send_input</code>、<code>close_agent</code> 与 <code>list_agents</code>。模型可以借此把有界的子任务交给在同一个已加载模型上运行的子智能体。该功能默认开启，与技能和代码执行无关，结构化输出请求与 <code>/api/generate</code> 不提供；是否委派由模型决定。<code>explorer</code> 与 <code>reviewer</code> 子智能体只读（<code>skills_list</code>、<code>skills_read</code>、<code>read_file</code> 与协调工具），<code>worker</code> 除非服务端带 <code>--agents-allow-worker-tools</code> 启动，否则同样只读。子智能体永远拿不到客户端自己的工具，同一请求树内的宿主工具调用逐个执行，每个子智能体使用 KV 状态的独立副本。客户端只看到父智能体的回答；上报的 token 用量包含子智能体。目前没有公布委派的时延或质量数据。</p>
+  <pre data-lang="json"><code>"multi_agent": false</code></pre>
+  <p>只有 JSON <code>false</code> 会起作用：它为该请求关闭委派。服务端以 <code>--no-multi-agent</code>（或 <code>TS_NO_MULTI_AGENT</code>）启动时，请求无法把它打开，也不能提高任何 <code>--agents-*</code> 上限。→ <a href="agentic_zh-cn.html#sub-agents">角色与上限</a></p>
 
   <h3 id="skills-manage">管理技能注册表</h3>
   <p>同一份数据有两种形态：只读、偏 OpenAI 风格的 <code>/v1/skills</code>，以及 Web UI 的 <code>/api/skills</code>——后者额外提供加载错误、单文件读取、上传与删除。</p>
@@ -300,11 +329,11 @@ curl -X DELETE http://localhost:5000/api/skills/pdf   # {"removed":true}</code><
   "warnings": [],
   "modified": "2026-08-29T12:00:00Z"
 }</code></pre>
-  <p><code>kind</code> 取值为 <code>script</code> / <code>reference</code> / <code>asset</code> / <code>manifest</code> / <code>other</code>；<code>origin</code> 为 <code>discovered</code> 表示是扫描配置目录发现的，<code>installed</code> 表示是从这里上传的；<code>warnings</code> 收录那些不完全合规但仍然加载成功的问题（<code>name</code> 与目录名不一致、描述超过 1024 字符上限等）。<code>GET /api/models</code> 会以 <code>"skills": {"enabled": true, "installable": true, "count": 7}</code> 报告该功能本身，服务端关闭技能时该字段为 <code>null</code> —— Web UI 正是据此决定要不要显示相关控件。错误遵循服务端按前缀区分的惯例：<code>/v1/*</code> 返回 <code>{"error": {"message": "…", "type": "invalid_request_error"}}</code>，<code>/api/*</code> 返回 <code>{"error": "…"}</code>。</p>
+  <p><code>kind</code> 取值为 <code>script</code> / <code>reference</code> / <code>asset</code> / <code>manifest</code> / <code>other</code>；<code>origin</code> 为 <code>discovered</code> 表示是扫描配置目录发现的，<code>installed</code> 表示是从这里上传的；<code>warnings</code> 收录那些不完全合规但仍然加载成功的问题（<code>name</code> 与目录名不一致、描述超过 1024 字符上限等）。<code>GET /api/models</code> 会以 <code>"skills": {"enabled": true, "installable": true, "allowScripts": false, "count": 7}</code> 报告该功能本身（<code>allowScripts</code> 表示是否提供 <code>skills_run</code>），服务端关闭技能时该字段为 <code>null</code> —— Web UI 正是据此决定要不要显示相关控件。错误遵循服务端按前缀区分的惯例：<code>/v1/*</code> 返回 <code>{"error": {"message": "…", "type": "invalid_request_error"}}</code>，<code>/api/*</code> 返回 <code>{"error": "…"}</code>。</p>
   <div class="callout warn"><div class="ic">🔒</div><p>上传的技能属于不受信任的内容，因此落盘前会校验：ZIP 条目使用与模型读取相同的路径关卡，按解压后大小计数，并限制 4096 个文件、单文件 64 MB、总计 256 MB 与 200× 压缩比。除非服务端带 <code>--skills-allow-exec</code> 启动，否则不会提供 <code>skills_run</code>；在默认 <code>required</code> 策略下，它要么进入合格 OS 沙箱，要么拒绝。这仍是在授权模型选择任意代码，只应放在用户与技能都可信的宿主上。→ <a href="cli_zh-cn.html#skills">技能相关参数</a></p></div>
 
   <h2 id="structured">5 · 结构化输出（JSON schema）</h2>
-  <p>OpenAI 的 <code>response_format</code> 接受 <code>text</code>、<code>json_object</code> 与经过校验的 <code>json_schema</code>。服务器会注入严格的 JSON 指令，并在返回前校验输出。JSON 请求还会把<strong>首个采样 token</strong> 约束为以 <code>{</code> 开头的候选，使爱闲聊的模型无法在 JSON 对象前输出散文，流式首 token 时延因此反映 prefill 延迟（<code>TS_JSON_FORCE_OPEN=0</code> 可关闭）。</p>
+  <p>OpenAI 的 <code>response_format</code> 接受 <code>text</code>、<code>json_object</code> 与经过校验的 <code>json_schema</code>。服务器会注入严格的 JSON 指令，并在返回前校验输出。默认情况下，它还会把 schema（或通用的 JSON 对象语法）编译成<strong>约束解码的语法</strong>，逐 token 生效。<code>TS_JSON_GRAMMAR=0</code> 关闭该语法；此时请求只把<strong>首个采样 token</strong> 约束为以 <code>{</code> 开头的候选，使爱闲聊的模型无法在 JSON 对象前输出散文（<code>TS_JSON_FORCE_OPEN=0</code> 连这一约束也关闭）。</p>
   <pre data-lang="bash"><code>curl -X POST http://localhost:5000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
@@ -331,7 +360,7 @@ curl -X DELETE http://localhost:5000/api/skills/pdf   # {"removed":true}</code><
     },
     "max_tokens": 120
   }'</code></pre>
-  <div class="callout warn"><div class="ic">⚠️</div><p><code>json_schema</code> 不能与调用方的 <code>tools</code> 或 <code>think</code> 同时使用。它可以与 <code>skills</code> 组合，但选中技能正文会被内联，而且该请求不会提供任何内置技能 / 代码工具，因为 schema 约束下无法生成调用标记。无效 schema 返回 HTTP <code>400</code>；校验失败的输出返回 HTTP <code>422</code>。</p></div>
+  <div class="callout warn"><div class="ic">⚠️</div><p><code>json_schema</code> 不能与调用方的 <code>tools</code> 同时使用。<code>think</code> 同样会被拒绝，但语法能等推理结束后再生效的家族除外——Gemma 4、Qwen 3.8 Flash Next、GPT-OSS、Muse-Glimmer、DeepSeek V4.1、<code>glm5next</code> 与 Nemotron-H——在这些家族上语法从推理结束处开始约束；设置 <code>TS_JSON_GRAMMAR=0</code> 时这种组合也会被拒绝。它可以与 <code>skills</code> 组合，但选中技能正文会被内联，而且该请求不会提供任何内置技能 / 代码工具，因为 schema 约束下无法生成调用标记。无效 schema 返回 HTTP <code>400</code>；校验失败的输出返回 HTTP <code>422</code>。</p></div>
 
   <h2 id="webui-sse">6 · Web UI SSE 协议（<code>/api/chat</code>）</h2>
   <p>这是内置聊天 UI 所用的协议；外部 UI 也可接入同一端点。每个事件都是一个 JSON 对象，以单个 <code>data: …</code> SSE 帧传递。</p>
@@ -345,16 +374,16 @@ curl -N -X POST http://localhost:5000/api/chat \
   -d '{ "messages": [{"role": "user", "content": "Hi"}], "maxTokens": 50, "sessionId": null, "newChat": false, "think": false, "tools": [] }'</code></pre>
   <p>复用相同的 <code>sessionId</code> 会在下一轮把之前的助手 token 拼接进 KV 缓存前缀。终止帧会报告复用情况：</p>
   <pre data-lang="text"><code>data: {"done":true,"tokenCount":187,"elapsed":2.143,"tokPerSec":87.23,"promptTokens":512,"kvReusedTokens":420,"kvReusePercent":82.0}</code></pre>
-  <p>事件字段包括 <code>token</code>（内容）、<code>thinking</code>（推理块）、调用方的 <code>tool_calls</code>、<code>replace</code>/<code>diffusionStep</code>（DiffusionGemma 预览）、<code>skill_step</code>（已完成内置工具以及 <code>round</code>/<code>files</code>）、<code>tool_progress</code>（临时的 <code>writing</code> / <code>running</code> / <code>finished</code> 活动，含 <code>tool</code>、<code>text</code>、<code>seconds</code>、<code>detail</code>），以及终止的 <code>done</code> 摘要。浏览器完成后会清除活动状态，不构造工具历史记录，但会保留产物下载标签。</p>
-  <pre data-lang="text"><code>data: {"tool_progress":"writing","tool":"shell","text":"Writing code…","seconds":0,"detail":""}
-data: {"tool_progress":"running","tool":"shell","text":"Running…","seconds":2.0,"detail":"python · 2.1 KB"}
-data: {"tool_progress":"finished","tool":"shell","text":"Finished","seconds":2.4,"detail":"exit 0"}</code></pre>
+  <p>事件字段包括 <code>token</code>（内容）、<code>thinking</code>（推理块）、调用方的 <code>tool_calls</code>、<code>replace</code>/<code>diffusionStep</code>（DiffusionGemma 预览）、<code>skill_step</code>（已完成内置工具以及 <code>round</code>/<code>files</code>）、<code>tool_progress</code>（临时的 <code>writing</code> / <code>running</code> / <code>finished</code> 活动，含 <code>tool</code>、<code>text</code>、<code>seconds</code>、<code>detail</code>、<code>agents</code>），以及终止的 <code>done</code> 摘要。每个 <code>skill_step</code> 帧都带 <code>agent_id</code>：父智能体为 <code>/root</code>（没有委派时所有帧都是这个值），子智能体为 <code>/root/&lt;task_name&gt;</code> 这样的路径。每个 <code>tool_progress</code> 帧都带 <code>agents</code>：只有 <code>wait_agent</code> 运行期间它才是数组，其余时候为 <code>null</code>；数组中本请求的每个子智能体一项（父智能体 <code>/root</code> 不在其中），含 <code>agent_id</code>、<code>parent_id</code>、<code>task</code>、<code>agent_type</code>、<code>status</code>、<code>tool</code>、<code>tool_status</code>、<code>detail</code>、<code>result</code> 与 <code>error</code>——内置 UI 据此渲染实时的子智能体面板。一次性的 <code>{"artifact_verified": true, "files": [{name, bytes, url}]}</code> 帧会在某个生成的交付文件通过宿主检查后给出它。浏览器完成后会清除活动状态，不构造工具历史记录，但会保留产物下载标签。</p>
+  <pre data-lang="text"><code>data: {"tool_progress":"writing","tool":"shell","text":"{\"command\":\"python","seconds":0,"detail":null,"agents":null}
+data: {"tool_progress":"running","tool":"shell","text":"writing report.xlsx\n","seconds":2.1,"detail":"python make_report.py","agents":null}
+data: {"tool_progress":"finished","tool":"shell","text":null,"seconds":2.4,"detail":null,"agents":null}</code></pre>
 
   <h3 id="upload">文件上传（<code>/api/upload</code>）</h3>
-  <p><code>POST /api/upload</code> 接收 multipart 表单（使用第一个文件），返回存储路径 / URL 与该类型的元数据；随后由 <code>/api/chat</code> 消息引用返回的服务端路径（<code>imagePaths</code>、<code>audioPaths</code> 等）。接受的类型包括：<strong>图像</strong>（<code>.png .jpg .jpeg .gif .webp .bmp .heic .heif</code>）、<strong>视频</strong>（<code>.mp4 .mov .avi .mkv .webm</code>，按 <code>VIDEO_SAMPLE_FPS</code> 抽帧）、<strong>音频</strong>（<code>.mp3 .wav .ogg .flac .m4a</code>）、<strong>PDF</strong> 与<strong>文本 / 代码</strong>文件（以 <code>textContent</code> 完整返回）。数字版 PDF 返回完整提取的 <code>textContent</code>；扫描版 PDF 在托管视觉模型时像视频一样返回页面图像，否则给出 <code>needsVision</code> 警告。<code>TS_PDF_MAX_PAGES</code> 限制读取页数（默认全部）。</p>
+  <p><code>POST /api/upload</code> 接收 multipart 表单（使用第一个文件），返回存储路径 / URL 与该类型的元数据；随后由 <code>/api/chat</code> 消息引用返回的服务端路径（<code>imagePaths</code>、<code>audioPaths</code> 等）。接受的类型包括：<strong>图像</strong>（<code>.png .jpg .jpeg .gif .webp .bmp .heic .heif</code>）、<strong>视频</strong>（<code>.mp4 .mov .avi .mkv .webm</code>，按 <code>VIDEO_SAMPLE_FPS</code> 抽帧）、<strong>音频</strong>（<code>.mp3 .wav .ogg .flac .m4a</code>）、<strong>PDF</strong> 与<strong>文本 / 代码</strong>文件（以 <code>textContent</code> 完整返回）。数字版 PDF 返回完整提取的 <code>textContent</code>；扫描版 PDF 在托管视觉模型时像视频一样返回页面图像，否则给出 <code>needsVision</code> 警告。<code>TS_PDF_MAX_PAGES</code> 限制读取页数（默认全部）。文件存放在服务端可执行文件旁的 <code>uploads/</code> 中（<code>TENSORSHARP_UPLOAD_DIR</code> 可改位置），并通过 <code>/uploads/</code> 提供。<code>--upload-max-mb</code> 限制客户端提交的单个文件（上传文件与解码后的 base64 附件都算，默认 500；超出返回 <code>413</code>）；<code>--upload-quota-mb</code> 限制整个目录（含生成的输出，超出返回 <code>507</code>），<code>--upload-ttl-hours</code> 删除过旧的文件——两者默认关闭。</p>
 
   <h3 id="image-api">图像生成与编辑（<code>/api/image-generate</code> · <code>/api/image-edit</code> · <code>/stream</code>）</h3>
-  <p>托管模型为 Qwen-Image-2.1 的 <code>qwen_image</code> DiT 时可用。托管其他模型时，<code>/api/image-edit</code> 返回 <code>400</code> 与 <code>The loaded model is not a Qwen-Image-2.1 model.</code>，<code>/api/image-generate</code> 返回 <code>400</code> 与 <code>Text-to-image generation requires a Qwen-Image-2.1 model.</code>；对应的 <code>/stream</code> 路由则在最终的 <code>{"done": true, "error": …}</code> 事件里给出同一条消息，而不是返回 400。<code>POST /api/image-generate</code> 接收形如 <code>{"prompt": "...", "width": 2048, "height": 2048, "steps": 40, "cfg": 1, "seed": 42}</code> 的 JSON 并生成图像。<code>POST /api/image-edit</code> 执行一次编辑，且至少需要一张参考图：可提交 multipart（一个或多个 <code>image</code> 部分，按参考图顺序，外加 <code>prompt</code>），也可提交 JSON，用 <code>imagePaths</code>（或旧的单个 <code>imagePath</code>）指向上传目录中的文件。两者都接受 <code>negativePrompt</code>、<code>targetArea</code>、<code>width</code>、<code>height</code>、<code>steps</code>、<code>cfg</code> 与 <code>seed</code>：省略的值，或为 <code>0</code> 的 <code>steps</code> / <code>cfg</code>，使用模型默认值（40 步、CFG 1，尺寸为 2048×2048 或与第一张参考图宽高比一致、面积大致相同）；显式尺寸须为 32 的倍数，并优先于 <code>targetArea</code>。两者都返回 <code>{ ok, url, width, height, elapsedSeconds }</code>，PNG 从 <code>/uploads/</code> 提供。<code>POST /api/image-generate/stream</code> 与 <code>POST /api/image-edit/stream</code> 接收相同 JSON，但以 SSE 流式返回去噪进度：每步帧为 <code>{"imageGenerate": true, …}</code> 或 <code>{"imageEdit": true, "step": i, "total": N, "image": "data:image/png;base64,..."}</code>（最多 8 张均匀预览），最后返回 <code>{"done": true, "url": "...", "width": ..., "height": ..., "elapsedSeconds": ...}</code> 或 <code>{"done": true, "error": …}</code>。整个进程中的图像请求串行执行；聊天路由不会运行这个模型。</p>
+  <p>托管模型为 Qwen-Image-2.1 的 <code>qwen_image</code> DiT 时可用。托管其他模型时，<code>/api/image-edit</code> 返回 <code>400</code> 与 <code>The loaded model is not a Qwen-Image-2.1 model.</code>，<code>/api/image-generate</code> 返回 <code>400</code> 与 <code>Text-to-image generation requires a Qwen-Image-2.1 model.</code>；对应的 <code>/stream</code> 路由则在最终的 <code>{"done": true, "error": …}</code> 事件里给出同一条消息，而不是返回 400。<code>POST /api/image-generate</code> 接收形如 <code>{"prompt": "...", "width": 2048, "height": 2048, "steps": 40, "cfg": 1, "seed": 42}</code> 的 JSON 并生成图像。<code>POST /api/image-edit</code> 执行一次编辑，且至少需要一张参考图：可提交 multipart（一个或多个 <code>image</code> 部分，按参考图顺序，外加 <code>prompt</code>），也可提交 JSON，用 <code>imagePaths</code>（或旧的单个 <code>imagePath</code>）指向上传目录中的文件。两者都接受 <code>negativePrompt</code>、<code>targetArea</code>、<code>width</code>、<code>height</code>、<code>steps</code>、<code>cfg</code> 与 <code>seed</code>：省略的值，或为 <code>0</code> 的 <code>steps</code> / <code>cfg</code>，使用模型默认值（40 步、CFG 1，尺寸为 2048×2048 或与第一张参考图宽高比一致、面积大致相同——若服务端启动时同时给了 <code>--width</code> 与 <code>--height</code>，则改用该尺寸，且它优先于 <code>targetArea</code>；该尺寸必须是 32 的倍数，否则这类请求以 <code>400</code> 被拒绝，<code>/stream</code> 路由则在终止错误事件中给出），但服务端启动时加载的、带采样配方的 <code>--lora</code> 插件会以该配方中的步数与 CFG 代替（见 <a href="models-image_zh-cn.html#lora">LoRA 插件</a>）；显式尺寸须为 32 的倍数，并优先于 <code>targetArea</code>。两者都返回 <code>{ ok, url, width, height, elapsedSeconds }</code>，PNG 从 <code>/uploads/</code> 提供。<code>POST /api/image-generate/stream</code> 与 <code>POST /api/image-edit/stream</code> 接收相同 JSON，但以 SSE 流式返回去噪进度：每步帧为 <code>{"imageGenerate": true, …}</code> 或 <code>{"imageEdit": true, "step": i, "total": N, "image": "data:image/png;base64,..."}</code>（最多 8 张均匀预览），最后返回 <code>{"done": true, "url": "...", "width": ..., "height": ..., "elapsedSeconds": ...}</code> 或 <code>{"done": true, "error": …}</code>。整个进程中的图像请求串行执行；聊天路由不会运行这个模型。</p>
 
   <h3 id="video-api">视频生成（<code>/api/video-generate</code> · <code>/api/video-generate/stream</code> · <code>/v1/videos/generations</code>）</h3>
   <p>当托管的模型能生成视频时可用 —— MiniMax-H3，或只生成视频的 Wan。判定依据是 <code>IVideoGenerationModel</code> 接缝而不是架构字符串，因此其他模型会返回 <code>400</code> 与 <code>The loaded model is not a video-generation model.</code>。模型自己拒绝的请求 —— 用 Ref2VA 的输入去跑 FL2VA 权重、在同一个请求体里同时给关键帧与具名参考、模式缺少必需输入 —— 在 <code>/api/video-generate</code> 上以 <code>400</code> 返回模型自己的报错信息，而不是笼统的 500；在流式接口上则以终止帧 <code>{"done": true, "error": …}</code> 返回同一条信息。三个接口共用同一个解析器，因此字段完全一致；视频生成在进程内串行执行。</p>
@@ -383,12 +412,13 @@ curl -s http://localhost:5000/api/video-generate \
   <table>
     <thead><tr><th>参数</th><th>类型</th><th>默认</th><th>说明</th></tr></thead>
     <tbody>
-      <tr><td><code>num_predict</code></td><td>int</td><td>200</td><td>最大生成 token 数</td></tr>
+      <tr><td><code>num_predict</code></td><td>int</td><td><code>--max-tokens</code>（20000）</td><td>最大生成 token 数</td></tr>
       <tr><td><code>temperature</code></td><td>float</td><td>0.8</td><td>采样温度（0 = 贪心）</td></tr>
       <tr><td><code>top_k</code></td><td>int</td><td>40</td><td>Top-K 过滤（0 = 禁用）</td></tr>
       <tr><td><code>top_p</code></td><td>float</td><td>0.9</td><td>核采样阈值（1.0 = 禁用）</td></tr>
       <tr><td><code>min_p</code></td><td>float</td><td>0</td><td>最小概率过滤</td></tr>
       <tr><td><code>repeat_penalty</code></td><td>float</td><td>1.1</td><td>重复惩罚（1.0 = 无）</td></tr>
+      <tr><td><code>repeat_last_n</code></td><td>int</td><td>64</td><td>重复 / 存在 / 频率惩罚回看的最近 token 数</td></tr>
       <tr><td><code>presence_penalty</code> / <code>frequency_penalty</code></td><td>float</td><td>0</td><td>存在 / 频率惩罚</td></tr>
       <tr><td><code>seed</code></td><td>int</td><td>-1</td><td>随机种子（-1 = 随机）</td></tr>
       <tr><td><code>stop</code></td><td>array</td><td>null</td><td>停止序列</td></tr>
@@ -396,7 +426,7 @@ curl -s http://localhost:5000/api/video-generate \
   </table>
   </div>
   <h4>OpenAI 风格（顶层）</h4>
-  <p><code>max_tokens</code>（省略时默认 200）、<code>temperature</code>、<code>top_p</code>、<code>presence_penalty</code>、<code>frequency_penalty</code>、<code>seed</code>、<code>stop</code>（字符串或数组），以及 <code>response_format</code>（<code>text</code> / <code>json_object</code> / <code>json_schema</code>）。注意：OpenAI 接口不解析 <code>top_k</code>、<code>min_p</code> 与 <code>repetition_penalty</code>；这些字段使用服务端默认值。</p>
+  <p><code>max_tokens</code> 或 <code>max_completion_tokens</code>（省略时默认 <code>--max-tokens</code>，即 20000）、<code>temperature</code>、<code>top_p</code>、<code>presence_penalty</code>、<code>frequency_penalty</code>、<code>seed</code>、<code>stop</code>（字符串或数组），以及 <code>response_format</code>（<code>text</code> / <code>json_object</code> / <code>json_schema</code>）。在 OpenAI 规范之外，同一顶层还接受 <code>top_k</code>、<code>min_p</code>、<code>repeat_penalty</code>（或 <code>repetition_penalty</code>）与 <code>repeat_last_n</code>，默认值见上表。</p>
 
   <h2 id="python">8 · Python 客户端示例</h2>
   <h4>使用 <code>requests</code>（Ollama 风格）</h4>

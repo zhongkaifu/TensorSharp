@@ -52,7 +52,7 @@ internal sealed class PrefixTreeOptions
     public int ContextLength { get; init; } = int.MaxValue;
     public long PageHostBytes { get; init; }                           // A1 slab bytes per page (ComputeBlockByteSize)
     public long EngineSerial { get; init; }
-    public int PublicMax { get; init; } = 2;                           // TS_PREFIX_CHECKPOINTS_MAX
+    public int PublicMax { get; init; } = 4;                           // TS_PREFIX_CHECKPOINTS_MAX
     public int ScopedEndStateLeavesMax { get; init; } = 4;             // TS_RETAINED_FUSED_CACHE_MAX; 0 = unlimited
     public bool BatchedPagedEnabled { get; init; }
     public int MinCloneTokens { get; init; }                           // DEC-13; 0 = always clone
@@ -67,7 +67,7 @@ internal sealed class PrefixTreeOptions
     public IPrefixTreePageHost? PageHost { get; init; }
     public IPayloadValidator? PayloadValidator { get; init; }          // null = Legacy/Shadow (no model calls)
     public Func<ResourceClass, long>? QuerySpareBytes { get; init; }   // −1 = unknown
-    public ResourceVector OptionCapBytes { get; init; }                // TS_PREFIX_CACHE_{DEVICE,HOST}_MB; 0 = auto
+    public ResourceVector OptionCapBytes { get; init; }                // 0 = auto; no env var feeds it (tests, RadixTreeBench)
     public long HostRamBytes { get; init; }                            // auto HostKv cap = 25%; 0 = unknown
     public long PoolPagesCap { get; init; }                            // BlockPool.NumBlocks; 0 = unbounded
     public long ScopeIdleMs { get; init; } = 600_000;

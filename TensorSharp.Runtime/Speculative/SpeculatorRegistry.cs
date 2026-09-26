@@ -43,7 +43,12 @@ namespace TensorSharp.Runtime.Speculative
         public const string Block = "block";
 
         /// <summary>Weight-free suffix matching over the sequence's own tokens.
-        /// Works on every model. See <see cref="NGramSpeculator"/>.</summary>
+        /// Needs no draft head, but still needs a trunk that can verify a window:
+        /// it runs only on an <see cref="ISpeculativeTarget"/> that neither refuses
+        /// speculation (<see cref="ISpeculativeTarget.SpeculationRefusal"/>) nor
+        /// reports it unprofitable, and some targets are profitable only with
+        /// their own drafter loaded - so not on every model. See
+        /// <see cref="NGramSpeculator"/>.</summary>
         public const string NGram = "ngram";
 
         /// <summary>Builds an algorithm for one (target model, options) pair, or

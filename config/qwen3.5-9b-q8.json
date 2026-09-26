@@ -1,8 +1,8 @@
 {
   // Qwen3.5-9B (Q8_0) — dense text LLM, highest-quality local quant (~8.9 GB).
   // Run with:
-  //   TensorSharp.Cli    --config config/qwen3.5-9b-q8.json --input prompt.txt
-  //   TensorSharp.Server --config config/qwen3.5-9b-q8.json
+  //   TensorSharp.Cli         --config config/qwen3.5-9b-q8.json --input prompt.txt
+  //   TensorSharp.Server.Host --config config/qwen3.5-9b-q8.json
   // Command-line options override anything here (e.g. --backend ggml_vulkan).
   "variables": {
     "modelRoot": "${TENSORSHARP_MODELS:-../models}"
@@ -18,5 +18,9 @@
   "top-p": 0.8,
   "min-p": 0,
 
-  "model": "${modelRoot}/Qwen3.5-9B-Q8_0.gguf"
+  "model": {
+    "path": "${modelRoot}/Qwen3.5-9B-Q8_0.gguf",
+    "urls": ["https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/3885219b6810b007914f3a7950a8d1b469d598a5/Qwen3.5-9B-Q8_0.gguf"],
+    "sha256": "809626574d0cb43d4becfa56169980da2bb448f2299270f7be443cb89d0a6ae4"
+  }
 }

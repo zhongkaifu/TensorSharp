@@ -150,6 +150,7 @@ public sealed class WebUiAdapter
             return Results.Json(new { error = "Expected multipart form data" }, statusCode: 400);
         }
 
+        RaiseUploadRequestBodyLimit(req.HttpContext, _uploads.MaxFileBytes);
         var form = await req.ReadFormAsync().ConfigureAwait(false);
         var file = form.Files.Count == 0 ? null : form.Files[0];
         if (file == null)
@@ -169,6 +170,26 @@ public sealed class WebUiAdapter
         {
             return Rejected(ex);
         }
+    }
+
+    /// <summary>
+    /// Raise this request's body limit from the server-wide 500 MB to what the upload cap
+    /// needs (<see cref="ServerOptionsBuilder.ResolveUploadRequestBodyBytes"/>). Only this
+    /// route streams its file to disk, so only this route gets the larger limit; every JSON
+    /// route keeps <see cref="ServerOptionsBuilder.DefaultMaxRequestBodyBytes"/>. Must run
+    /// before the body is read. Returns true when the limit was raised.
+    /// </summary>
+    internal static bool RaiseUploadRequestBodyLimit(HttpContext context, long uploadMaxFileBytes)
+    {
+        var feature = context?.Features.Get<Microsoft.AspNetCore.Http.Features.IHttpMaxRequestBodySizeFeature>();
+        if (feature == null || feature.IsReadOnly)
+            return false;
+        long limit = ServerOptionsBuilder.ResolveUploadRequestBodyBytes(uploadMaxFileBytes);
+        // Null is "no limit"; never lower a limit something else already raised.
+        if (feature.MaxRequestBodySize is not long current || current >= limit)
+            return false;
+        feature.MaxRequestBodySize = limit;
+        return true;
     }
 
     // ---- Image editing (Qwen-Image-2.1) ----------------------------------

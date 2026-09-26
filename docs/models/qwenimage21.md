@@ -5,8 +5,13 @@ and image editing. It requires a Qwen3-VL-8B text encoder and the dedicated 2.1
 VAE. Native RGBA input and PNG output preserve transparency; the Qwen3-VL
 conditioning branch composites the reference over white while the VAE keeps alpha.
 Earlier Qwen-Image / Qwen-Image-Edit checkpoints (such as Qwen-Image-Edit-2511) are
-no longer supported and are refused at load (exit code 2); the `--qwen-image-lora`
-and `--offload-cpu` options were removed.
+no longer supported and are refused at load (exit code 2). The `--qwen-image-lora`
+option was replaced by `--lora` ([LoRA plug-ins](#lora-plug-ins)), and
+`--offload-cpu` was removed; either flag, on the command line or as a config-file
+key, now stops the CLI or server with a configuration error that says what to use
+instead. The old `TS_QWEN_IMAGE_LORA` environment variable is refused at load
+(exit code 2) with the same advice: pass the LoRA with `--lora` and unset the
+variable.
 
 The download configuration is [`config/qwen-image-2.1.json`](../../config/qwen-image-2.1.json).
 It pins repository revisions and SHA-256 checksums for new downloads; existing
@@ -68,13 +73,16 @@ dotnet run --project TensorSharp.Cli -c Release --no-build -- \
 
 No `--image` selects generation; one or more `--image` arguments select editing.
 Repeat `--image first.png --image second.png` for multiple references in that order.
+Each reference is tagged `<image1>`, `<image2>`, … in command-line order ahead of the
+prompt, so the prompt can name a picture by its tag.
 `--input prompt.txt` can supply the prompt instead. Omitted sampling settings
 select **40 Euler steps and CFG 1.0**, following
 [Qwen's recommended unguided sampling](https://github.com/huggingface/diffusers/blob/main/docs/source/en/api/pipelines/qwenimage21.md).
 CFG 1 runs one transformer prediction per step; the previous CFG 6 default ran
 both positive and negative predictions. Explicit CFG above 1 still enables the
-second prediction and applies `--negative-prompt 'blur, low detail'`. Negative
-prompts have no effect at CFG 1.
+second prediction and conditions it on `--negative-prompt` (for example
+`--negative-prompt 'blur, low detail'`; without one, the negative branch uses an
+empty prompt). Negative prompts have no effect at CFG 1.
 
 Omitting dimensions selects **2048×2048 for generation**, or approximately the
 same pixel area with the first reference's aspect ratio for editing. Set width
@@ -99,8 +107,9 @@ and [editing](https://github.com/Comfy-Org/workflow_templates/blob/main/template
 workflows. Forty steps remains the default; fewer steps are a quality/speed
 tradeoff, not a claim of equivalent image quality.
 
-Qwen-Image-2.1 does not load LoRA adapters. The CFG 1 speed improvement uses the
-released 2.1 checkpoint directly.
+The CFG 1 speed improvement uses the released 2.1 checkpoint directly.
+Step-distillation LoRA plug-ins reduce the step count further, to 4–8 transformer
+passes; see [LoRA plug-ins](#lora-plug-ins).
 
 For a quick executable smoke test use 256×256 and one step. Such a run verifies
 loading and the end-to-end data path; it does not demonstrate image quality or
@@ -162,6 +171,20 @@ geometry; explicit dimensions take precedence. Omitting `width`, `height`,
 `targetArea`, `steps` and `cfg` selects the model defaults above. `targetArea: 1048576`
 selects approximately 1K output while retaining automatic aspect-ratio selection.
 
+Starting the server with `--width` and `--height` changes that default size. The
+host publishes them as `TS_QWEN_IMAGE_WIDTH` / `TS_QWEN_IMAGE_HEIGHT`, and every
+image request that sets neither `width`/`height` nor an explicit `targetArea` then
+uses that size, including Web UI requests, which send no size; an edit then no
+longer follows the first reference's aspect ratio. A request that sets its own
+`targetArea` keeps its own geometry. The default needs both flags. A value that is
+not a multiple of 32 is rounded down to one (never below 32), with a one-time
+`[qwen-image] WARNING: … render at WxH instead. Reported once.`; with only one of
+the two set, or an unparsable or negative value, the default is ignored with a
+one-time warning and the automatic size stays. A Qwen-Image server also warns at
+startup in either case, and nothing is refused. A `width` / `height` set in the
+request itself must still be a positive multiple of 32. On the server the same two
+flags are also the aliases of `--video-width` / `--video-height`.
+
 For progress, use the JSON routes `/api/image-generate/stream` and
 `/api/image-edit/stream` with `curl -N`. They emit SSE `data:` frames with
 `imageGenerate: true` or `imageEdit: true`, `step` and `total`, optionally a
@@ -176,6 +199,219 @@ weights; there is no CPU weight-streaming mode. Start with smaller dimensions if
 available memory is insufficient. CUDA and Vulkan were exercised on NVIDIA A40s; the
 measurements below record where.
 
+## LoRA plug-ins
+
+TensorSharp applies LoRA adapters to the 2.1 diffusion transformer at run time:
+style and editing LoRAs, DoRA, and step-distillation adapters that replace the
+40-step default with 4–8 transformer passes. Pass them with `--lora` on the CLI or
+the server, and repeat it to stack several. `--lora-scale` sets the strength of the
+preceding `--lora`, and `--lora-config` names its companion config. The plug-ins in
+[`config/lora/`](../../config/lora/) download and hash-check their weights on first
+use and carry the adapter's strength and sampling recipe:
+
+```bash
+dotnet run --project TensorSharp.Cli -c Release --no-build -- \
+  --config config/qwen-image-2.1.json \
+  --lora config/lora/qwen-image-2.1-viggle-turbo.json \
+  --prompt 'A small orange cat beside a blue ceramic vase, soft daylight, detailed photograph' \
+  --width 1024 --height 1024 --diffusion-seed 42 --output turbo.png
+```
+
+The flag reference, the plug-in config format and the table of the twelve shipped
+plug-ins are in [USAGE.md](../../USAGE.md#qwen-image-21-lora-plug-ins).
+
+### Sampling recipes
+
+A step-distillation LoRA is trained for one schedule, so its plug-in records that
+schedule. The shipped recipes follow the adapters' model cards:
+
+- **Viggle Turbo** (6 steps by default, 4–8 supported, CFG 1). The raw nodes, for
+  example `[1, 0.9375, 0.875, 0.75, 0.5, 0.25]` at 6 steps, pass through the
+  checkpoint's resolution-dependent exponential shift (the 256/0.5 and 8192/0.9
+  anchors) but not through the base scheduler's terminal stretch, followed by a
+  final 0 (`"shift": "dynamic"`).
+- **Pruna 8-step and 5-step** (CFG 1). The card's sigmas are used verbatim, with no
+  shift, followed by a final 0 (`"shift": "none"`).
+- **Fun-Acc 4-step** (CFG 1). The PDD bundle's trained grid from `pdd_config.json`
+  is used verbatim at every resolution. The timestep is rounded through bf16, as the
+  reference hook does, and step *i* uses output head *i*.
+
+Explicit settings win over a recipe, and a recipe wins over the model defaults (40
+steps, CFG 1): `--diffusion-steps` / `--cfg` on the CLI, and a request's `steps` /
+`cfg` on the server (`0` or omitted selects the recipe). A step count the recipe
+has no schedule for is refused, and the error lists the supported counts; a PDD
+bundle, which has one output head per trained step, runs only its trained count.
+Two plug-ins that both carry a recipe cannot be stacked. Style and editing
+plug-ins carry no recipe and keep the checkpoint's own schedule. The run logs the
+resolved recipe and its sigmas before denoising.
+
+### Supported formats
+
+- **Tensor names** from diffusers / PEFT (`transformer.` prefix, `lora_A` /
+  `lora_B`, adapter slot names such as `lora_A.default.weight`), ComfyUI and
+  ai-toolkit (`diffusion_model.`), DiffSynth / ModelScope (no prefix), kohya
+  (`lora_unet_transformer_blocks_0_attn_to_q.lora_down.weight`), and `lora_down` /
+  `lora_up` with or without `.weight`.
+- **Alpha** from a per-module `.alpha` tensor, the PEFT config a diffusers saver
+  embeds in the safetensors metadata (`lora_adapter_metadata`), an
+  `adapter_config.json` (`lora_alpha`, `alpha_pattern`, `use_rslora`); otherwise alpha
+  equals the rank. kohya's `ss_network_alpha` is training metadata and is ignored, as
+  in ComfyUI and diffusers (a converter that dropped the per-module `.alpha` tensors
+  folded alpha into the factors). An explicit config wins over the file's own
+  metadata, and a PEFT folder's `adapter_config.json` still supplies alpha beside a
+  recipe-only config. The Pruna files record alpha 128 at rank 64, so their
+  applied scale is 2; a loader that assumes alpha = rank applies half the adapter.
+- **DoRA** `dora_scale` magnitudes, with ComfyUI's semantics on the output axis:
+  the magnitude is divided by the row norms of the checkpoint's own weight,
+  dequantized from the GGUF.
+- **VideoX-Fun PDD bundles**: per-step output heads that replace `proj_out`,
+  replaced norm gains, and the low-rank deltas. The bundle's `pdd_config.json` is
+  read from beside the weights or from `--lora-config`; only `pdd_block_size` 1 (one
+  head per step) is supported.
+- **1-D `.diff` tensors** on the norm gains (`txt_in.text_norm`, `attn.norm_q`,
+  `attn.norm_k`).
+- **Split MLP projections.** Diffusers' separate `img_mlp.gate_layer` and
+  `img_mlp.proj` are the gate and up halves of the checkpoint's fused
+  `img_mlp.gate_up` (gate first), and the loader places them there.
+- **PEFT folders.** An `adapter_model.safetensors` with an `adapter_config.json`
+  beside it picks up that config without `--lora-config`.
+
+Refused, with a message that names the tensor: LoKr, LoHa and LoCon mid factors;
+text-encoder LoRAs; bias terms and `diff_b` (the transformer has no biases); 2-D
+full-weight diffs, and full `.weight` values outside a PDD bundle; convolution
+LoRAs; a file holding several PEFT adapters; and LoRAs made for other models, such
+as the dual-stream 20B Qwen-Image (`add_q_proj`, `txt_mlp` or `img_mod` modules),
+or any factor whose shape does not match the 2.1 projection. Every tensor in a file
+is applied or the load fails; nothing is skipped silently, because a partly applied
+LoRA would not be the adapter that was asked for.
+
+### How the update is applied
+
+The base weights stay quantized as stored, and each adapted projection computes
+`y = W x + B (A x)`. A step-distillation LoRA moves the weights by about 0.1–0.5%,
+which is the size of Q8_0's own rounding step, so dequantizing, adding the delta
+and requantizing loses most of it. On the Pruna adapter's block 0, the delta that
+survived such a merge had a cosine similarity of 0.07 with the intended delta.
+
+- The strength, alpha / rank and any DoRA magnitude are folded into `B` in F32.
+  Each rank component is then rebalanced so that its `A` row and `B` column have
+  equal norms, which leaves the product unchanged, and the factors are stored in
+  F16. A group in which some value would overflow F16 stays in F32.
+- Several LoRAs on one projection are concatenated along the rank, so the graph
+  runs one shrink and one expand per projection whatever the number of plug-ins.
+- Ranks are zero-padded to a multiple of 64 on Metal, whose simdgroup matrix
+  kernel needs K ≥ 64, and to a multiple of 16 elsewhere.
+- Q, K and V read the same input, so their `A` factors are stacked and one shrink
+  serves all three; the gate and up halves share theirs the same way.
+- Adapted projections are the image and text inputs, the timestep embedding, the
+  modulation, `norm_out`, `proj_out`, and in each of the 32 blocks Q, K, V, the
+  attention output, gate, up and down.
+
+This runs on every backend the model runs on: `ggml_metal`, `ggml_cuda`,
+`ggml_vulkan` and `ggml_cpu`. The load logs the plug-in count and the size of the
+packed factors (`Qwen-Image-2.1 LoRA: N plug-in(s), applied unmerged (... MiB of
+factors, ...)`), then one line per file with its update count, ranks and scales.
+
+**Prefix KV cache.** The cache stays on. The first step runs the whole sequence
+through the adapted transformer, so the stored text and reference keys and values
+include the LoRA. Retained graphs and stored prefixes are keyed on the adapter's
+factor buffers, so one built with other factors, or none, is never reused.
+
+**Tensor parallelism.** Under `--tp N`, a column-parallel projection (Q, K, V, gate,
+up) gives each GPU the rows of `B` (and of any DoRA row scale) for its own output
+slice. A row-parallel projection (`to_out`, `img_mlp.out`) gives each GPU the
+columns of `A` for its input slice, and each GPU adds its partial LoRA term before
+the all-reduce, which sums the partial terms to the full update. Replicated
+projections keep the full factors.
+
+### LoRA performance
+
+TensorSharp against stable-diffusion.cpp `19bbbca` on 2026-09-25. Both builds used
+unchanged ggml `353b63b`. Every run was a 1024×1024 text-to-image with the teapot
+prompt, seed 42, CFG 1 and Euler, each engine in a fresh process with a cooldown
+between runs. Both engines received the same F32 sigma vector. Each configuration
+ran twice, once with each engine going first, and the tables show the medians.
+Seconds per step is the steady-state step, excluding the first. PSNR compares the
+two engines' images. Without a step-distillation LoRA, 6 or 8 steps give a blurry
+image by design (the model's default is 40 steps), so the "No LoRA" and Film Stills
+(a style LoRA) rows measure speed, not quality.
+
+Apple M5 Pro, 48 GB, `ggml_metal`:
+
+| Configuration | Steps | s/step TensorSharp | s/step sd.cpp | Denoise speedup | Wall time TensorSharp / sd.cpp | Wall speedup | PSNR |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| No LoRA | 6 | 7.52 | 8.59 | 1.17× | 51.8 / 61.7 s | 1.19× | 63.1 dB |
+| Viggle Turbo r128 | 6 | 7.94 | 9.40 | 1.22× | 54.5 / 67.0 s | 1.23× | 60.4 dB |
+| Viggle Turbo r256 | 6 | 8.03 | 9.52 | 1.23× | 55.8 / 68.7 s | 1.23× | 57.5 dB |
+| Pruna 8-step | 8 | 7.91 | 9.39 | 1.21× | 69.7 / 85.5 s | 1.23× | 53.4 dB |
+| Film Stills, strength 0.7 | 8 | 7.92 | 9.43 | 1.21× | 69.8 / 85.8 s | 1.23× | 63.9 dB |
+
+NVIDIA RTX 4000 Ada, 20 GB, driver 580, `ggml_cuda`:
+
+| Configuration | Steps | s/step TensorSharp | s/step sd.cpp | Denoise speedup | Wall time TensorSharp / sd.cpp | Wall speedup | PSNR |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| No LoRA | 6 | 1.57 | 1.85 | 1.16× | 20.0 / 26.5 s | 1.33× | 46.2 dB |
+| Viggle Turbo r128 | 6 | 1.94 | 2.53 | 1.28× | 23.3 / 32.6 s | 1.40× | 35.2 dB |
+| Viggle Turbo r256 | 6 | 2.00 | 2.55 | 1.25× | 24.5 / 32.7 s | 1.33× | 36.8 dB |
+| Pruna 8-step | 8 | 1.94 | 2.53 | 1.29× | 26.6 / 37.6 s | 1.41× | 35.3 dB |
+| Film Stills, strength 0.7 | 8 | 1.92 | 2.51 | 1.30× | 26.0 / 37.3 s | 1.43× | 47.5 dB |
+
+- **Cost per step.** LoRA adds 5–7% per step on Metal (sd.cpp: 9–11%) and 22–27% on
+  CUDA (sd.cpp: 36–38%). The cost barely depends on the rank: rank 64, 128 and 256 are
+  within 3% of each other. It comes from the extra pass over each adapted
+  projection's output: the low-rank product writes an F32 tensor the size of that
+  output, and the add reads it back. A faster GPU finishes the base step sooner, so
+  the pass is a larger share there. ggml has no matrix product that accumulates
+  into its destination, so this pass cannot be folded into the base projection
+  without changing ggml. On CUDA, forcing cuBLAS to F16 compute
+  (`GGML_CUDA_CUBLAS_COMPUTE_TYPE=f16`) made steps 5% slower, so the F32 products are
+  not what limits it.
+- **Loading.** The factors are read, scaled and packed in parallel at startup. This
+  takes 0.1–0.8 s on the M5 Pro and 0.2–1.3 s on the CUDA machine; the output is
+  bit-identical to a serial load.
+- **VAE decoding.** The whole-VAE graph is now the default on Metal as well as CUDA.
+  It decodes 1024×1024 in 5.0 s on the M5 Pro, where the per-convolution path took
+  13.0 s and sd.cpp takes 7.1 s. At 2048×2048 it takes 24.9 s instead of 85.3 s, with
+  a 45 GB peak memory footprint instead of 64 GB. It never runs on Vulkan, where
+  F16 cooperative-matrix operands overflow in the decoder; setting
+  `TS_QWEN21_VAE_FUSED=1` there prints a warning and decodes per convolution.
+  `TS_QWEN21_VAE_FUSED=0` selects the per-convolution path on any backend.
+- **Why the CUDA images differ more.** On the CUDA machine, sd.cpp keeps the
+  transformer on the GPU and runs out of memory for a whole-image decode, then
+  retries with 256×256 tiles (11.5–13.2 s). Its wall times include that retry.
+  TensorSharp frees the transformer's weights first and decodes in 4.0–4.1 s. Both
+  engines also run F32 matrix products as TF32 on CUDA. For both reasons, the two
+  engines' images agree less closely on CUDA than on Metal. The images were
+  checked visually and match.
+
+The runs used [`eng/validation/qwen-image21-bench.py`](../../eng/validation/qwen-image21-bench.py)
+with `--lora`, `--lora-config` and `--sigma-nodes`/`--sigma-shift` for the recipe
+schedules. sd.cpp was given Pruna at multiplier 2 (`--sd-lora-multiplier 2`)
+because it ignores the alpha stored in `lora_adapter_metadata`.
+
+### Server and C# API
+
+The server loads its `--lora` set at startup and applies it to every generation and
+edit request; per-request LoRA selection is not implemented. A request's `steps`
+and `cfg` still override a plug-in's recipe. In process,
+`QwenImageModel.SetLoras(IReadOnlyList<LoraSpec>)` replaces the set for later
+requests (an empty list removes it). The new set is validated against the
+transformer immediately, and a failure leaves the previous set in place.
+
+### Limitations
+
+- The plug-ins apply to Qwen-Image-2.1 only; the CLI refuses `--lora` with any
+  other model, and the server logs a warning and loads the other model without
+  them.
+- Only one plug-in per run can carry a sampling recipe, and a recipe with sigmas
+  runs only the step counts it defines.
+- The Qwen-Image-2.1-Fix author's workflow also uses APG, FreSca and the `seeds_2`
+  sampler at CFG 3, which TensorSharp does not implement; the DoRA itself is
+  applied exactly.
+- The Pruna adapters were trained at 1K. Fun-Acc was trained at 2048×2048, and its
+  card notes that small dense text and some edits are weaker than the 40-step
+  teacher.
+
 ## Prefix KV cache
 
 Qwen-Image-2.1 modulates the text and reference-image tokens with the `t = 0`
@@ -189,7 +425,7 @@ values for the prefix on the device. Every later step runs only the target
 image's tokens and attends over the stored prefix followed by the target. A CFG
 run keeps one cache per branch. The caches are released when denoising ends,
 before VAE decoding. Each step's log line ends with `prefix=extract` or
-`prefix=cached`.
+`prefix=cached` (`prefix=declined` when the cache did not fit; see below).
 
 The cache is on by default; `TS_QWEN21_PREFIX_CACHE=0` turns it off. By default
 it stores exactly what the attention kernel reads: F16 for Metal and CUDA flash
@@ -325,8 +561,10 @@ vLLM-Omni's layout for 2.1:
   collective (NCCL or P2P) does this on the devices when available; otherwise it
   goes through host memory.
 - Each GPU caches the prefix of its own heads, so the cache is split N ways.
-- N must divide 32 and keep quantized blocks whole: 2, 4 or 8 for the published
-  files.
+- N must divide the 32 attention heads — 2, 4, 8 or 16 on one machine, given
+  ggml's 16-device limit — and every weight's quantized blocks must stay whole when
+  it is sharded, which is checked per weight type at load. Only 2 GPUs have been
+  measured.
 - The text encoder, vision encoder and VAE stay on the first GPU. Multi-node
   groups are refused.
 
@@ -406,6 +644,8 @@ white compositing); both editing outputs changed the teapot to blue. This does
 not establish broad quality or performance superiority. TensorSharp's 1K VAE
 decode remained slower (13.319 s versus 7.270 s), and peak process RSS was higher
 (16.50 GiB versus 13.29 GiB). File-cache and thermal state were uncontrolled.
+The whole-VAE graph has since become the Metal default, and the 1K decode now
+takes 5.0 s; see [LoRA performance](#lora-performance).
 
 The exact files passed 17/17 real-server HTTP cases, including previews,
 multi-reference editing, cancellation and recovery. The managed suite passed
@@ -492,12 +732,15 @@ checks, not downloaded-model quality or performance measurements. The unchanged
 ggml revision for these checks was `179b60f27b1019d42da01ac532cabdb8f73ba8b7`;
 evidence is in ignored `docs/validation/qwen21-native-metal-report.md`.
 
-CPU and Metal image attention now uses each segment's exact key/value length
-without a dense padding mask. Causal text masks are retained. Metal casts the
-strided key/value tensors directly to F16, and supported backends use upstream
-fused SwiGLU to avoid intermediate feed-forward copies. These operations preserve
-the mathematical computation, with possible floating-point rounding differences;
-other backends retain the padded attention path pending device validation.
+CPU, Metal and CUDA image attention now uses each segment's exact key/value
+length without a dense padding mask; on CUDA, `TS_QWEN21_PAD_MASK=1` restores the
+padded mask as a comparison diagnostic (see
+[`docs/perf/qwen-image21-cuda.md`](../perf/qwen-image21-cuda.md)). Causal text
+masks are retained. Metal casts the strided key/value tensors directly to F16, and
+supported backends use upstream fused SwiGLU to avoid intermediate feed-forward
+copies. These operations preserve the mathematical computation, with possible
+floating-point rounding differences; `ggml_vulkan` still builds padded image
+masks.
 The earlier attention optimization measurements below used unchanged ggml at
 `456172ec733a135778adcd32d00e576a58232e45`.
 

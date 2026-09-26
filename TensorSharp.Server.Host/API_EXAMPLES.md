@@ -2,18 +2,19 @@
 
 [English](API_EXAMPLES.md) | [中文](API_EXAMPLES_zh-cn.md)
 
-TensorSharp.Server.Host provides three API styles plus a few utility endpoints:
+TensorSharp.Server.Host provides three API styles, a Jev-compatible decision endpoint, and a few utility endpoints:
 
-- **Ollama-compatible** (`/api/generate`, `/api/chat/ollama`, `/api/tags`, `/api/show`)
-- **OpenAI-compatible** (`/v1/chat/completions`, `/v1/responses`, `/v1/models`)
-- **Web UI** (`/api/chat`, `/api/sessions`, `/api/models`, `/api/models/load`, `/api/upload`, `/api/skills`, `/api/image-edit`, `/api/image-edit/stream`, `/api/image-generate`, `/api/image-generate/stream`)
-- **Utilities** (`/api/version`, `/api/queue/status`)
+- **Ollama-compatible** (`/api/generate`, `/api/chat/ollama`, `/api/tags`, `/api/show`, `/api/embed`, `/api/embeddings`)
+- **OpenAI-compatible** (`/v1/chat/completions`, `/v1/responses`, `GET /v1/responses/{id}`, `/v1/models`, `/v1/embeddings`, `/v1/videos/generations`, `/v1/skills`)
+- **Jev-compatible** typed decisions (`/v1/systemone`, DiffusionGemma only)
+- **Web UI** (`/api/chat`, `/api/sessions`, `/api/models`, `/api/models/load`, `/api/upload`, `/api/skills`, `/api/image-edit`, `/api/image-edit/stream`, `/api/image-generate`, `/api/image-generate/stream`, `/api/video-generate`, `/api/video-generate/stream`)
+- **Utilities** (`/api/version`, `/api/queue/status`, `/health`)
 
 Start the server with the exact hosted model via `--model` and, when needed, the exact projector via `--mmproj`. The projector is **not auto-detected** by `TensorSharp.Server.Host`. The Web UI and compatibility endpoints expose only that startup model/projector pair; `/api/models/load` can reload the same pair on a supported backend, but it cannot choose a model on a model-less server or switch to another file at runtime.
 
 ## Embedding APIs
 
-Start an embedding service with `--model encoder.gguf --embeddings` and pure C# `cpu` or native `ggml_cpu` / `ggml_metal` / `ggml_cuda`. Each process keeps one encoder resident; run chat and embeddings separately. Snowflake Arctic Embed L v2.0 and MiniLM GGUFs are supported, and model metadata endpoints advertise the `embedding` capability.
+Start an embedding service with `--model encoder.gguf --embeddings` and pure C# `cpu` or native `ggml_cpu` / `ggml_metal` / `ggml_cuda`. Each process keeps one encoder resident; run chat and embeddings separately. Snowflake Arctic Embed L v2.0 and MiniLM GGUFs are supported, and model metadata endpoints advertise the `embedding` capability. While `--embeddings` is set, a `POST` to a generation route (`/v1/chat/completions`, `/v1/responses`, `/v1/systemone`, `/v1/videos/generations`, `/api/generate`, `/api/chat`, `/api/chat/ollama`, `/api/models/load`, and `/api/image-generate`, `/api/image-edit` and `/api/video-generate` with their `/stream` forms) is answered with HTTP 400 `This server hosts an embedding model. Use /v1/embeddings or /api/embed.`
 
 ```bash
 curl http://127.0.0.1:5000/v1/embeddings -H 'Content-Type: application/json' \
@@ -39,9 +40,10 @@ See the [embedding guide](../docs/embeddings.md) for all fields, token-ID inputs
 | Uploads | `/api/upload` accepts image / video / audio / text / **PDF** files; born-digital PDFs return extracted text, scanned PDFs return page images for vision-capable models (`TS_PDF_MAX_PAGES` caps pages read) |
 | Image generation and editing | Qwen-Image-2.1 (`qwen_image`) is served through `/api/image-generate`, `/api/image-edit` and their `/stream` variants, not the chat endpoints |
 | Video generation | Any video-generation model — MiniMax-H3 (`minimax-h3`), Wan 2.1 / 2.2 (`wan`) — is served through `/api/video-generate`, `/api/video-generate/stream` and `/v1/videos/generations`; MiniMax-H3 returns a 32 kHz stereo `.wav` sidecar alongside the MP4, and `/api/models` advertises what conditioning the loaded checkpoint takes |
-| Agent Skills | Skill directories from `--skills-dir` (or a `skills` folder beside the binary), listed at `/v1/skills` and `/api/skills` and installable as a `.zip` through `POST /api/skills`. Selected per request with `"skills": [...]` on every chat endpoint. On families with both declaration and output-parser support, including Qwen 3.8 Flash Next (`qwen4exp`), the model's own skill calls are answered inside the server, so clients receive a finished completion. Families without usable tool support receive selected skill instructions inline instead. `skills_run` is off unless the server starts with `--skills-allow-exec`. |
+| Agent Skills | Skill directories: the `skills` folder beside the binary (where skills uploaded through `POST /api/skills` are installed; scanned first, so its skills win a name clash), then `--skills-dir` (by default, every existing `.agents/skills` from the working directory up to the Git root, nearest first), listed at `/v1/skills` and `/api/skills` and installable as a `.zip` through `POST /api/skills`. Selected per request with `"skills": [...]` on every chat endpoint. On families with both declaration and output-parser support, including Qwen 3.8 Flash Next (`qwen4exp`), the model's own skill calls are answered inside the server, so clients receive a finished completion. Families without usable tool support receive selected skill instructions inline instead. `skills_run` is off unless the server starts with `--skills-allow-exec`. |
 | Agentic code execution | `--code-exec` adds the in-process `shell`, `read_file`, `write_file`, and `apply_patch` tools on tool-capable model families. Web UI keeps one workspace per chat session; each OpenAI/Ollama HTTP request gets a private workspace across its internal rounds and the server deletes it after the response. Network and package installation are separate, off-by-default permissions. |
-| Structured outputs | OpenAI `response_format` supports `text`, `json_object`, and `json_schema`; `response_format` (`json_object` / `json_schema`) cannot be combined with `tools`, and combines with `think` only on families that declare where reasoning ends (GPT-OSS, DeepSeek V4.1, Qwen 3.8 Flash Next, Gemma 4, Nemotron-H, Muse-Glimmer) |
+| Sub-agents | On by default on `/v1/chat/completions`, `/v1/responses`, `/api/chat/ollama` and Web UI `/api/chat` for families that render tool declarations and have a tool parser (not Mistral 3, Hunyuan Dense or DiffusionGemma). The model may call `spawn_agent`, `wait_agent`, `send_input`, `close_agent` and `list_agents`; the server runs the children in process on the same loaded model; `explorer` and `reviewer` children are read-only, and a `worker` gets the parent's mutable tools only when the server starts with `--agents-allow-worker-tools`. `--no-multi-agent` disables delegation for the server and `"multi_agent": false` for one request. See [Sub-agents](#sub-agents-multi_agent). |
+| Structured outputs | OpenAI `response_format` supports `text`, `json_object`, and `json_schema`, which `/v1/chat/completions` enforces with a JSON grammar during decoding; `response_format` (`json_object` / `json_schema`) cannot be combined with `tools`, and combines with `think` only on families that declare where reasoning ends (GPT-OSS, DeepSeek V4.1, Qwen 3.8 Flash Next, GLM-5.3-Flash, Gemma 4, Nemotron-H, Muse-Glimmer) |
 
 > **Network safety:** the server listens on `0.0.0.0:5000` and has no API-key
 > authentication or built-in TLS. Keep it on a trusted network or place an
@@ -83,11 +85,11 @@ curl -s http://localhost:5000/v1/chat/completions \
   -d '{"model":"gemma-4-E4B-it-Q8_0.gguf","messages":[{"role":"user","content":"Reply with one short hello."}],"max_tokens":32}'
 ```
 
-Open the bundled UI at **<http://localhost:5000>** — `GET /` serves `index.html` (the explicit `/index.html` URL still works). `GET /health` is the liveness endpoint and returns `"TensorSharp.Server.Host is running"`; `GET /` returns that same response only on headless deployments that ship no `wwwroot` content.
+Open the bundled UI at **<http://localhost:5000>** — `GET /` serves `index.html` (the explicit `/index.html` URL still works). `GET /health` is the liveness endpoint and returns `"TensorSharp.Server is running"`; `GET /` returns that same response only on headless deployments that ship no `wwwroot` content.
 
 ### Already-built or extracted application folder
 
-Run the commands below from the repository root after building, or adapt the DLL path to an extracted release archive; the application folder also contains the native libraries and `wwwroot/`. **Status verified 2026-09-01:** [v3.3.0.0](https://github.com/zhongkaifu/TensorSharp/releases/tag/v3.3.0.0) provides ten prebuilt archives — CLI and Server for Windows x64 (CPU/CUDA), Linux x64 (CPU/CUDA), and macOS arm64. Check the [Releases page](https://github.com/zhongkaifu/TensorSharp/releases) for newer versions.
+Run the commands below from the repository root after building, or, in an extracted release archive, run its `TensorSharp.Server.Host` executable with the same arguments; the application folder also contains the native libraries and `wwwroot/`. **Status verified 2026-09-25:** the newest release, [v2026.09.01](https://github.com/zhongkaifu/TensorSharp/releases/tag/v2026.09.01) (2026-09-17), provides ten prebuilt archives — CLI and Server for Windows x64 (CPU/CUDA), Linux x64 (CPU/CUDA), and macOS arm64 — and its server archives contain `TensorSharp.Server.Host`. Work merged after that tag exists only in source builds until the next release. Releases before v3.4.0.0, such as [v3.3.0.0](https://github.com/zhongkaifu/TensorSharp/releases/tag/v3.3.0.0), predate the Server / Server.Host split, so their server archives contain `TensorSharp.Server` instead. Check the [Releases page](https://github.com/zhongkaifu/TensorSharp/releases) for newer versions.
 
 ```bash
 # Text-only model
@@ -113,9 +115,15 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model ~/work/mo
 DIFFUSION_STEPS=48 DIFFUSION_MAX_BATCH=2 \
   dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model ~/work/model/diffusiongemma-26B-A4B-it-Q4_K_M.gguf --backend ggml_metal
 
+# DiffusionGemma with image input: the Gemma 4 vision tower from the raw HF shard
+# model-00011-of-00011.safetensors (or an mmproj GGUF); audio and video are refused
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model ~/work/model/diffusiongemma-26B-A4B-it-Q4_K_M.gguf \
+    --mmproj ~/work/model/model-00011-of-00011.safetensors --backend ggml_metal
+
 # Override the default token budget (default 20000). It applies to every
 # endpoint — Web UI, Ollama and OpenAI — whenever a request omits max_tokens /
-# num_predict, and caps requests that ask for more.
+# num_predict. Once set with --max-tokens (or MAX_TOKENS) it also caps requests
+# that ask for more; the built-in 20000 default does not.
 dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model ~/work/model/Qwen3.5-9B-Q8_0.gguf --backend ggml_metal --max-tokens 4096
 ```
 
@@ -248,9 +256,10 @@ Response:
 ```
 
 `prompt_cache_hit_tokens` reports how many of the `prompt_eval_count` tokens
-were served straight from the prior turn's KV cache. `/api/generate` always
-resets the session before prefilling, so this value is always `0`; it is
-non-zero on `/api/chat/ollama` when the prompt prefix matches a previous turn.
+were served from cached KV state (the prior turn, or a system/tool prefix shared
+across conversations). `/api/generate` always resets the session before
+prefilling, so this value is always `0`; it is non-zero on `/api/chat/ollama`
+when the prompt prefix matches a previous turn or a shared system/tool prefix.
 
 ### Generate (streaming)
 
@@ -328,10 +337,11 @@ Response:
 ```
 
 `prompt_cache_hit_tokens` and `prompt_cache_hit_ratio` describe how much of the
-prompt was served from the previous turn's KV cache. On the first turn of a
-fresh conversation both values are zero; on a follow-up turn that reuses the
-prior conversation prefix they grow to (often) close to `prompt_eval_count` /
-`1.0`. The same fields appear on the final NDJSON chunk in streaming mode.
+prompt was served from cached KV state. On the first turn of a fresh
+conversation they count only a system/tool prefix shared with an earlier
+conversation or prepared when the server loaded (zero when nothing is shared);
+on a follow-up turn that reuses the prior conversation prefix they grow to
+(often) close to `prompt_eval_count` / `1.0`. The same fields appear on the final NDJSON chunk in streaming mode.
 
 ### Chat (streaming)
 
@@ -383,7 +393,7 @@ curl -X POST http://localhost:5000/api/chat/ollama \
 
 ### Chat with Thinking / Reasoning Mode
 
-Thinking-capable architectures (Qwen 3.5/3.6/3.8-family, Gemma 4, GPT OSS, Nemotron-H) accept `"think": true` and split chain-of-thought from the visible response:
+Thinking-capable architectures (for example Qwen 3, the Qwen 3.5 / 3.6 / 3.8 family including Qwen 3.8 Flash Next, Gemma 4, GPT OSS, Nemotron-H, Muse-Glimmer, DeepSeek V4 / V4.1 and GLM 5.x) accept `"think": true` and split chain-of-thought from the visible response:
 
 ```bash
 curl -X POST http://localhost:5000/api/chat/ollama \
@@ -461,6 +471,8 @@ The response shape (when the model decides to call the tool):
 ```
 
 Continue the conversation by appending the assistant tool call and a `role: "tool"` message containing the function result, then call `/api/chat/ollama` again.
+
+Only the parameters listed in `required` are declared as required to the model. A tool that sends no `required` list declares none of its parameters as required (JSON-schema renderers write `"required": []`), so every one of its parameters stays optional.
 
 ### Chat with Agent Skills
 
@@ -627,7 +639,7 @@ Response:
 
 ### Chat Completions with Structured Outputs (`json_schema`)
 
-TensorSharp.Server.Host accepts the OpenAI Chat Completions `response_format` shape, injects strict JSON instructions into the prompt, and validates the final output before returning it.
+TensorSharp.Server.Host accepts the OpenAI Chat Completions `response_format` shape, injects strict JSON instructions into the prompt, constrains decoding with a JSON grammar built from the schema (on by default; see the notes after the Python examples), and validates the final output before returning it.
 
 ```bash
 curl -X POST http://localhost:5000/v1/chat/completions \
@@ -819,6 +831,179 @@ print(response.choices[0].message.content)
 Design notes — the prompt budget, the disclosure loop and the security model —
 are in [Agent Skills in TensorSharp](../docs/agent_skills.md).
 
+### Responses API (`/v1/responses`)
+
+`POST /v1/responses` takes the OpenAI Responses shape: `input` (a string or an
+array of input items), optional `instructions`, `max_output_tokens`, `stream`,
+`store`, `reasoning` (any object enables thinking; `reasoning.effort` is read as
+the reasoning effort), `tools`, and `text.format` in place of `response_format`.
+The sampling fields are the same top-level fields as Chat Completions, and the
+`skills`, `skills_discovery` and `multi_agent` fields work here too.
+
+```bash
+curl -X POST http://localhost:5000/v1/responses \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen3.5-9B-Q8_0.gguf",
+    "instructions": "You are a helpful assistant.",
+    "input": "What is 2+3?",
+    "max_output_tokens": 50
+  }'
+```
+
+Response (abridged):
+
+```json
+{
+  "id": "resp_...",
+  "object": "response",
+  "status": "completed",
+  "model": "Qwen3.5-9B-Q8_0.gguf",
+  "output": [{
+    "id": "msg_...",
+    "type": "message",
+    "status": "completed",
+    "role": "assistant",
+    "content": [{"type": "output_text", "text": "2 + 3 = 5.", "annotations": []}]
+  }],
+  "store": true,
+  "usage": {
+    "input_tokens": 20,
+    "output_tokens": 8,
+    "total_tokens": 28,
+    "input_tokens_details": {"cached_tokens": 0},
+    "output_tokens_details": {"reasoning_tokens": 0}
+  }
+}
+```
+
+A reply cut off by the token budget has `status: "incomplete"` and
+`incomplete_details: {"reason": "max_output_tokens"}`. With `"stream": true` the
+server sends typed SSE events (`response.created`, `response.output_item.added`,
+`response.output_text.delta`, … `response.completed`, or `response.failed`).
+
+Unless the request sends `"store": false`, the finished response is kept and can
+be fetched again with `GET /v1/responses/{id}` (404 once it is gone). The store
+is in memory, bounded by `TS_RESPONSES_STORE_TTL_MINUTES` (default 60) and
+`TS_RESPONSES_STORE_MAX_ENTRIES` (default 1000), or in Redis when the server
+starts with `--redis-url` or `TS_RESPONSES_STORE_REDIS_URL`. Every request is
+self-contained: `previous_response_id` is refused with HTTP 400, so send the
+earlier turns in `input`. `text.format` cannot be combined with `reasoning` or
+`tools` (HTTP 400).
+
+### Sub-agents (`multi_agent`)
+
+On a family that renders tool declarations and has a tool parser (every chat
+family except Mistral 3, Hunyuan Dense and DiffusionGemma), requests to
+`/v1/chat/completions`, `/v1/responses`, `/api/chat/ollama` and the Web UI's
+`/api/chat` are offered five coordination tools — `spawn_agent`, `wait_agent`,
+`send_input`, `close_agent` and `list_agents` — whether or not skills or
+`--code-exec` are enabled. The model decides whether to delegate. Like the skill
+tools, these calls are executed inside the server, so the client still receives
+one ordinary completion; usage totals include the children's tokens.
+
+Each child runs on the same loaded model with its own conversation. It starts
+from the parent's system/developer instructions and its assigned task, not the
+parent transcript, and it copies rather than shares KV state (the parent's
+shared prefix is checkpointed so siblings can restore it). `explorer` and
+`reviewer` children are read-only; a `worker` is read-only too unless the server
+starts with `--agents-allow-worker-tools`. Client-defined tools are never passed
+to a child. Each child has a private workspace populated from its explicit
+`input_files`; independent child tools can run concurrently. `depends_on` queues
+dependent subtasks until their sibling prerequisites succeed. Changed files are
+exported separately for parent review and integration. Built-in child workers
+use file tools; the parent runs commands because current sandbox profiles do not
+guarantee private-workspace read confinement for child shells. See
+[task graphs and permissions](../docs/multi_agent.md) for the spawn fields and limits.
+
+Send `"multi_agent": false` to keep one request single-agent:
+
+```bash
+curl -X POST http://localhost:5000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen3.5-9B-Q8_0.gguf",
+    "messages": [{"role": "user", "content": "Summarize these release notes in five bullets."}],
+    "multi_agent": false,
+    "max_tokens": 400
+  }'
+```
+
+`true`, an omitted field or a non-boolean value follows the server policy. A
+request cannot enable delegation on a server started with `--no-multi-agent` (or
+`TS_NO_MULTI_AGENT`), raise its limits, or enable worker tools. Requests with a
+`json_object` / `json_schema` `response_format` (or `text.format`), and
+`/v1/chat/completions` requests with
+`"tool_choice": "none"`, are not offered the coordination tools. The
+server limits are `--agents-max-concurrent` (3), `--agents-max-count` (8),
+`--agents-max-depth` (2), `--agents-max-rounds` (8), `--agents-max-generations`
+(48), `--agents-timeout` (180 s) and `--agents-max-result-chars` (8000). On the
+Web UI stream, `wait_agent` progress carries a snapshot of every agent (see
+[Web UI SSE](#3-web-ui-sse-apichat)). No latency, quality or delegation-rate
+measurements are published; the design and the validation harness are described
+in [Multiple agents](../docs/multi_agent.md).
+
+### Jev typed decisions (`/v1/systemone`)
+
+When the hosted model is DiffusionGemma, `POST /v1/systemone` answers typed
+questions about a `state` — `noul` (a probability of true), `choice` and `score`
+— from the label logits of one denoising step instead of generated text.
+`state` may be a string, a JSON object or an array, and `images` adds up to 8
+inline images (base64 or `data:` URLs) when the server loaded the vision tower.
+`jev-latest` and `jev-preview` are aliases for the loaded model. The preset below
+downloads the Q4_K_M model and the vision shard and binds `127.0.0.1:5000` on
+`ggml_cuda`; override `--backend` for other hardware:
+
+```bash
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --config config/jev-diffusiongemma-q4.json
+```
+
+```bash
+curl http://127.0.0.1:5000/v1/systemone \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "jev-latest",
+    "state": "Our production dashboard is down. Every customer gets a 503 error and nobody can sign in.",
+    "questions": {
+      "department": {"type": "choice", "instructions": "Which team should handle this ticket?",
+                     "criteria": {"billing": "Payment, invoice or subscription questions",
+                                  "technical": "Bugs, outages and integration failures",
+                                  "sales": "Pricing and purchasing questions"}},
+      "urgent": {"type": "noul", "instructions": "Does this describe an active production outage?"},
+      "severity": {"type": "score", "instructions": "How severe is the incident?",
+                   "criteria": ["No impact", "Minor inconvenience", "Service unusable"]}
+    },
+    "samples": 1,
+    "seed": 42
+  }'
+```
+
+Response shape:
+
+```text
+{"model": "diffusiongemma-26B-A4B-it-Q4_K_M.gguf",
+ "answers": {
+   "department": {"type": "choice", "choice": ..., "probabilities": {"billing": ..., "technical": ..., "sales": ...}, "confidence": ...},
+   "urgent": {"type": "noul", "noul": ...},
+   "severity": {"type": "score", "score": ..., "legend": {"0": "No impact", "1": "Minor inconvenience", "2": "Service unusable"}, "probabilities": {"0": ..., "1": ..., "2": ...}, "confidence": ...}},
+ "usage": {"input_tokens": ..., "output_tokens": ...},
+ "diagnostics": {"engine": "tensorsharp", "steps": 1, "images": 0, "seed": 42, ...}}
+```
+
+The other request fields are `instructions`, `samples` (1-32, or `"auto"`, the
+default), `auto_max`, `auto_threshold`, `chunk_rows` and `chunk_prompt`; `steps`
+must be 1 and `think` 0. A request allows up to 64 questions with 2 to 26
+alternatives each. Errors use `{"error": {"message", "type"}}`: 415 for a
+content type other than `application/json`, 400 for malformed JSON, 413 over the
+body cap (8 MiB, `TS_JEV_MAX_BODY_MB` 1-64), 422 for a request that fails
+validation, 404 for an unknown `model`, 503 when no DiffusionGemma model (or, for
+images, no vision tower) is loaded, and 529 with `Retry-After: 1` when
+`TS_JEV_MAX_PENDING` (default 32) requests, the running one included, are already
+admitted; requests run one at a time. Image bytes are stored
+under the upload limits, so they can also answer 413 or 507. The
+[Jev guide](../docs/models/jev.md) covers the probability semantics, image
+input, `TS_JEV_MAX_CANVAS` chunking and validation.
+
 ### Utilities
 
 ```bash
@@ -833,7 +1018,7 @@ curl http://localhost:5000/api/version
 curl http://localhost:5000/api/models
 ```
 
-`/api/models` returns the single hosted GGUF (and projector if any), the loaded backend name, the list of available backends, the resolved architecture, and the configured default `max_tokens`. When the hosted model generates video it also returns a `video` object — `family` (`"minimax-h3"`, `"wan"`), `supportsAudio`, `supportsImageConditioning`, `supportsEndImageConditioning`, `supportsReferenceConditioning`, `maxReferenceImages` — and `null` otherwise. That block is how a client learns whether to offer a first frame, a last frame, or up to N references without pattern-matching an architecture string: the same three images are three references on MiniMax-H3's Ref2VA checkpoint and an illegal request on FL2VA. The model entry in `/api/tags`, `/v1/models`, and `/api/show` always reports the file actually launched with `--model`. If a CUDA backend is missing from `supportedBackends`, the host did not detect a usable NVIDIA driver/device or GGML CUDA initialization path at startup; the direct `cuda` backend still needs cuBLAS discoverable when inference runs. If `ggml_vulkan` is missing, the native GGML bridge was not built with Vulkan enabled or no Vulkan 1.3 device/driver was found. If `mlx` is missing, the host did not detect a usable Apple Silicon MLX runtime.
+`/api/models` returns the single hosted GGUF (and projector if any), the loaded backend name, the list of available backends, the resolved architecture, the effective context window (`contextTokens`, with the model file's own window in `modelContextTokens`), whether a vision encoder is loaded (`visionReady`), the configured default `max_tokens`, and the `skills` block described under [Skills](#skills-apiskills). When the hosted model generates video it also returns a `video` object — `family` (`"minimax-h3"`, `"wan"`), `supportsAudio`, `supportsImageConditioning`, `supportsEndImageConditioning`, `supportsReferenceConditioning`, `maxReferenceImages` — and `null` otherwise. That block is how a client learns whether to offer a first frame, a last frame, or up to N references without pattern-matching an architecture string: the same three images are three references on MiniMax-H3's Ref2VA checkpoint and an illegal request on FL2VA. The model entry in `/api/tags`, `/v1/models`, and `/api/show` always reports the file actually launched with `--model`. If a CUDA backend is missing from `supportedBackends`, the host did not detect a usable NVIDIA driver/device or GGML CUDA initialization path at startup; the direct `cuda` backend still needs cuBLAS discoverable when inference runs. If `ggml_vulkan` is missing, the native GGML bridge was not built with Vulkan enabled or no Vulkan 1.3 device/driver was found. If `mlx` is missing, the host did not detect a usable Apple Silicon MLX runtime.
 
 ---
 
@@ -897,29 +1082,36 @@ Event shapes:
 | `replace`, `diffusionStep`, `diffusionTotal`, `preview` | each DiffusionGemma denoising preview and final replacement | replace the whole assistant message body instead of appending a token |
 | `thinking` | each parsed reasoning chunk (only when the model emits one) | streaming chain-of-thought |
 | `tool_calls` | when the model emits a caller-defined tool call | array of `{name, arguments}`; built-in skill/code calls are executed in process instead |
-| `tool_progress`, `tool`, `text`, `seconds`, `detail` | while an in-process skill/code call is being written or run | transient live activity: phase is `writing`, `running`, or `finished`; the bundled Web UI keeps only a bounded current tail and clears it on `finished` |
-| `skill_step`, `skill`, `detail`, `ok`, `round`, `files` | after each in-process skill or code tool call finishes | completion metadata for the tool, target and result; produced artifacts appear as optional `{name, bytes, url}` entries in `files` |
-| `done`, `tokenCount`, `elapsed`, `tokPerSec`, `aborted`, `error`, `sessionId`, `promptTokens`, `kvReusedTokens`, `kvReusePercent` | last frame | terminal summary |
+| `tool_progress`, `tool`, `text`, `seconds`, `detail`, `agents` | while an in-process skill/code/agent call is being written or run | transient live activity: phase is `writing`, `running`, or `finished`; the bundled Web UI keeps only a bounded current tail and clears it on `finished`. While `wait_agent` is `running`, `agents` is a snapshot of every sub-agent in the request (`agent_id`, `parent_id`, `task`, `agent_type`, `status`, `tool`, `tool_status`, `detail`, `result`, `error`); otherwise it is `null` |
+| `skill_step`, `agent_id`, `skill`, `detail`, `ok`, `round`, `files` | after each in-process skill, code or agent tool call finishes | completion metadata for the tool, target and result; `agent_id` names the agent that made the call (`/root` for the main conversation); produced artifacts appear as optional `{name, bytes, url}` entries in `files` |
+| `artifact_verified`, `files` | once, when a routed deliverable workflow (such as a PowerPoint request) proves its output | the one deliverable that passed the host's structural checks, as a single `{name, bytes, url}` entry; `skill_step.files` stays empty on those requests so provisional files are never offered |
+| `done`, `tokenCount`, `elapsed`, `tokPerSec`, `aborted`, `truncated`, `error`, `sessionId`, `promptTokens`, `kvReusedTokens`, `kvReusePercent` | last frame | terminal summary; `truncated` is true when the max-tokens budget ended the answer (not the user; `aborted` covers that) |
 
 Sample terminal frame:
 
 ```
-data: {"done":true,"tokenCount":187,"elapsed":2.143,"tokPerSec":87.23,"aborted":false,"error":null,"sessionId":"a3b...","promptTokens":512,"kvReusedTokens":420,"kvReusePercent":82.0}
+data: {"done":true,"tokenCount":187,"elapsed":2.143,"tokPerSec":87.23,"aborted":false,"truncated":false,"error":null,"sessionId":"a3b...","promptTokens":512,"kvReusedTokens":420,"kvReusePercent":82.0}
 ```
 
 Sample skill-step frame:
 
 ```
-data: {"skill_step":"skills_read","skill":"pdf","detail":"references/forms.md","ok":true}
+data: {"skill_step":"skills_read","agent_id":"/root","skill":"pdf","detail":"references/forms.md","ok":true}
 ```
 
 Sample code-progress and artifact frames:
 
 ```
-data: {"tool_progress":"writing","tool":"shell","text":"{\"command\":\"python","seconds":0,"detail":null}
-data: {"tool_progress":"running","tool":"shell","text":"writing report.xlsx\n","seconds":2.1,"detail":"python · 1.8 KB code"}
-data: {"tool_progress":"finished","tool":"shell","text":"","seconds":2.4,"detail":null}
-data: {"skill_step":"shell","skill":null,"detail":null,"ok":true,"round":2,"files":[{"name":"report.xlsx","bytes":18432,"url":"/api/code/artifacts/7f2.../report.xlsx"}]}
+data: {"tool_progress":"writing","tool":"shell","text":"{\"command\":\"python","seconds":0,"detail":null,"agents":null}
+data: {"tool_progress":"running","tool":"shell","text":"writing report.xlsx\n","seconds":2.1,"detail":"python · 1.8 KB code","agents":null}
+data: {"tool_progress":"finished","tool":"shell","text":"","seconds":2.4,"detail":null,"agents":null}
+data: {"skill_step":"shell","agent_id":"/root","skill":null,"detail":null,"ok":true,"round":2,"files":[{"name":"report.xlsx","bytes":18432,"url":"/api/code/artifacts/7f2.../report.xlsx"}]}
+```
+
+Sample sub-agent snapshot while `wait_agent` runs:
+
+```
+data: {"tool_progress":"running","tool":"wait_agent","text":"","seconds":3,"detail":null,"agents":[{"agent_id":"/root/api_review","parent_id":"/root","task":"Review the API layer for migration risks...","agent_type":"reviewer","status":"running","tool":"read_file","tool_status":"completed","detail":"src/api.cs","result":null,"error":null}]}
 ```
 
 Sample DiffusionGemma preview frame:
@@ -930,8 +1122,9 @@ data: {"replace":"A refined draft of the whole answer","diffusionStep":12,"diffu
 
 Use `kvReusedTokens` / `kvReusePercent` in the same way as the Ollama
 `prompt_cache_hit_*` and OpenAI `usage.prompt_tokens_details.cached_tokens`
-fields - they all measure the same thing (prompt tokens served straight from
-the prior turn's KV cache) for the corresponding session.
+fields - they all measure the same thing (prompt tokens served from cached KV
+state: the session's prior turn, or a system/tool prefix shared across
+conversations).
 
 ### File Uploads (`/api/upload`) — images, video, audio, text, PDF
 
@@ -983,11 +1176,20 @@ curl -N -X POST http://localhost:5000/api/chat \
 Set the `TS_PDF_MAX_PAGES` environment variable to cap the number of PDF pages
 read (default `0` = all pages).
 
+Uploads land in `uploads/` beside the binary (or `TENSORSHARP_UPLOAD_DIR`).
+`--upload-max-mb` caps each client-supplied file (default 500; a larger file gets
+HTTP 413; `POST /api/upload`'s request-body limit follows the cap and never drops
+below 500 MB, while every other route keeps a 500 MB body limit, so a base64
+attachment inside JSON tops out near 375 MB), `--upload-quota-mb` bounds the whole directory (off by default; HTTP
+507 when exhausted) and `--upload-ttl-hours` deletes files older than that (off
+by default). The same limits cover base64 attachments sent to the chat endpoints
+and Jev images.
+
 ### Skills (`/api/skills`)
 
 Manage the Agent Skills registry. Two shapes of the same data are served: the
 OpenAI-flavoured `/v1/skills` (list + one skill, read-only) and the Web UI
-`/api/skills` (adds load errors, upload and delete).
+`/api/skills` (adds load errors, bundled-file reads, rescan, upload and delete).
 
 ```bash
 # Everything the server has registered, plus the directories that looked like a
@@ -996,6 +1198,12 @@ curl http://localhost:5000/api/skills
 
 # One skill, with the SKILL.md body under "instructions".
 curl http://localhost:5000/api/skills/pdf
+
+# One bundled file as plain text (nested paths bind whole).
+curl http://localhost:5000/api/skills/pdf/files/references/forms.md
+
+# Re-scan the configured roots without restarting; returns the /api/skills shape.
+curl -X POST http://localhost:5000/api/skills/rescan
 
 # OpenAI-shaped equivalents.
 curl http://localhost:5000/v1/skills
@@ -1008,6 +1216,9 @@ curl http://localhost:5000/v1/skills/pdf
 {
   "enabled": true,
   "installable": true,
+  "allowScripts": false,
+  "discovery": true,
+  "roots": ["/srv/tensorsharp/skills", "/srv/repo/.agents/skills"],
   "skills": [
     {
       "id": "pdf",
@@ -1033,9 +1244,17 @@ curl http://localhost:5000/v1/skills/pdf
 ```
 
 `/v1/skills` wraps the same objects as `{"object": "list", "data": [...]}`.
-`kind` is one of `script` / `reference` / `asset` / `manifest` / `other`, and
-`origin` is `discovered` for a skill found by scanning a configured directory or
-`installed` for one uploaded here — only the latter can be deleted. `warnings`
+`allowScripts` says whether `skills_run` is enabled (`--skills-allow-exec`),
+`discovery` is the server's default for `skills_discovery`, and `roots` lists the
+directories scanned, in precedence order: first `skills/` beside the binary,
+which is where uploads are installed and is always scanned first, so a skill
+there shadows a same-named skill elsewhere; then the `--skills-dir` values (or
+`TS_SKILLS_DIR`) or, by default, every existing `.agents/skills` from the
+server's working directory up to the Git root (nearest first). `kind` is one of
+`script` / `reference` / `asset` / `manifest` / `other`, and `origin` is
+`discovered` for a skill found by scanning a configured directory or
+`installed` for one in `skills/` beside the binary (uploaded here or placed
+there) — only the latter can be deleted. `warnings`
 carries anything that loaded despite being out of spec (a `name` that disagrees
 with its directory, a description over the 1024-character limit).
 
@@ -1070,11 +1289,12 @@ and `/v1/*` returns `{"error": {"message": "...", "type": "invalid_request_error
 `GET /api/models` reports whether any of this is available:
 
 ```json
-"skills": { "enabled": true, "installable": true, "count": 7 }
+"skills": { "enabled": true, "installable": true, "allowScripts": false, "count": 7 }
 ```
 
 The field is `null` when the server has skills disabled, which is how the Web UI
-decides whether to show the skills control at all.
+decides whether to show the skills control at all. `allowScripts` is `true` only
+when the server started with `--skills-allow-exec` (or `TS_SKILLS_ALLOW_EXEC`).
 
 ### Qwen-Image-2.1 Text-to-Image
 
@@ -1095,17 +1315,22 @@ image-edit routes below for reference-conditioned editing. Set both dimensions
 in multiples of 32. Omitting dimensions selects native 2048×2048 for generation,
 or approximately the same area at the first reference's aspect ratio for editing.
 `targetArea: 1048576` selects approximately 1K output with automatic aspect ratio;
-explicit dimensions take precedence. Editing references are conditioned at
+explicit dimensions take precedence. Starting the server with both `--width` and
+`--height` (multiples of 32) replaces that default for every generation or edit
+request that sends no `width`/`height`, and then also takes precedence over
+`targetArea`; either flag alone leaves image sizes unchanged. The bundled Web UI
+sends no size, so these flags set its output size (they also set the default
+video size). Editing references are conditioned at
 approximately 1 megapixel each, or the output area if smaller.
 
 Omitted `steps`/`cfg` select 40 Euler steps and CFG 1, following the released
-2.1 model's recommendation. CFG 1 needs one transformer prediction per step;
-`negativePrompt` takes effect only with explicit CFG above 1, which also runs a
-negative prediction. For faster drafts, request 1024×1024 or explicitly select
+2.1 model's recommendation, unless a startup LoRA plug-in supplies its own recipe
+(see [LoRA plug-ins](#qwen-image-21-lora-plug-ins) below). CFG 1 needs one
+transformer prediction per step; `negativePrompt` takes effect only with explicit
+CFG above 1, which also runs a negative prediction. For faster drafts, request 1024×1024 or explicitly select
 25 steps, as in the official ComfyUI workflow; fewer steps can change quality.
 The [model guide](../docs/models/qwenimage21.md) records the official scheduler
-settings, source links and measured validation. Qwen-Image-2.1 does not load
-LoRA adapters.
+settings, source links and measured validation.
 
 ### Image Editing (`/api/image-edit`, Qwen-Image-2.1)
 
@@ -1114,7 +1339,8 @@ When the hosted `--model` is a Qwen-Image-2.1 DiT GGUF (architecture
 `/api/chat`:
 
 ```bash
-# One-shot edit (multipart). steps=0 / cfg=0 mean auto (40 steps / CFG 1).
+# One-shot edit (multipart). steps=0 / cfg=0 mean auto (40 steps / CFG 1, or the
+# startup LoRA plug-in's recipe).
 # Repeat the image part for multiple references.
 curl -X POST http://localhost:5000/api/image-edit \
   -F "image=@photo.png" \
@@ -1128,8 +1354,9 @@ Response:
 {"ok": true, "url": "/uploads/edit-<guid>.png", "width": ..., "height": ..., "elapsedSeconds": ...}
 ```
 
-Without explicit `width` / `height`, the output keeps the first reference's aspect
-ratio at approximately 2048×2048 pixels of area.
+Without explicit `width` / `height` (and no server `--width`/`--height` default),
+the output keeps the first reference's aspect ratio at approximately 2048×2048
+pixels of area.
 
 A JSON body `{ "imagePaths": ["<file from /api/upload>"], "prompt": "...",
 "steps": 0, "cfg": 0, "seed": 42 }` is also accepted (`imagePaths` lists the
@@ -1152,6 +1379,34 @@ followed by a final
 Requests against a model that is not Qwen-Image-2.1 return 400; concurrent
 edits are serialized by a process-wide lock.
 
+### Qwen-Image-2.1 LoRA plug-ins
+
+LoRA plug-ins are chosen when the server starts, with the same `--lora`,
+`--lora-scale` and `--lora-config` flags as the CLI. The set applies to every
+generation and edit request; per-request LoRA selection is not implemented.
+
+```bash
+# A step-distillation plug-in: its recipe (8 steps, CFG 1) becomes the default
+# for every image request. Weights download and are hash-checked on first use.
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --config config/qwen-image-2.1.json \
+  --lora config/lora/qwen-image-2.1-pruna-8step.json
+
+# Omitted (or 0) steps / cfg select the plug-in's recipe
+curl --fail-with-body http://localhost:5000/api/image-generate \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"A cat beside a blue vase, soft daylight","width":1024,"height":1024,"seed":42}'
+```
+
+A request's `steps` and `cfg` still override the recipe. A plug-in with a
+schedule runs only the step counts it defines, so any other `steps` value is
+refused with the supported counts named (the Pruna 8-step plug-in supports 8).
+Style and editing plug-ins carry no recipe, so omitted values keep the model
+defaults (40 steps, CFG 1). Repeat `--lora` to stack plug-ins and use
+`--lora-scale` for strength. At startup the server logs
+`LoRA plug-ins (applied to Qwen-Image-2.1 models only): ...`. The flags, the
+shipped plug-ins and the plug-in config format are in
+[USAGE.md](../USAGE.md#qwen-image-21-lora-plug-ins).
+
 ### Video Generation (`/api/video-generate`, `/v1/videos/generations`)
 
 Three endpoints share one parser and one gate: `POST /api/video-generate`,
@@ -1173,7 +1428,7 @@ elsewhere — the encoder additionally needs `vocab.json` and `merges.txt` besid
 it, because its GGUF ships no tokenizer:
 
 ```bash
-TensorSharp.Server.Host --model minimax_h3_fl2va_pruned-Q4_K.gguf --backend ggml_cuda \
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model minimax_h3_fl2va_pruned-Q4_K.gguf --backend ggml_cuda \
   --video-width 640 --video-height 384 --video-steps 20 --video-frames 22
 ```
 
@@ -1255,7 +1510,7 @@ requests that omit `frames`/`fps`. At the model's native 24 fps, 121 frames is
 about five seconds of playback:
 
 ```bash
-TensorSharp.Server.Host --model Wan2.2-TI2V-5B-Q8_0.gguf --backend ggml_cuda \
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model Wan2.2-TI2V-5B-Q8_0.gguf --backend ggml_cuda \
   --video-frames 121 --fps 24
 ```
 
@@ -1352,12 +1607,13 @@ process-wide lock.
 
 | Parameter          | Type    | Default | Description                            |
 | ------------------ | ------- | ------- | -------------------------------------- |
-| `num_predict`      | int     | 200     | Maximum tokens to generate             |
+| `num_predict`      | int     | `--max-tokens` (20000) | Maximum tokens to generate |
 | `temperature`      | float   | 0.8     | Sampling temperature (0 = greedy)      |
 | `top_k`            | int     | 40      | Top-K filtering (0 = disabled)         |
 | `top_p`            | float   | 0.9     | Nucleus sampling threshold             |
 | `min_p`            | float   | 0       | Minimum probability filtering          |
 | `repeat_penalty`   | float   | 1.1     | Repetition penalty (1.0 = none)        |
+| `repeat_last_n`    | int     | 64      | Window of recent generated tokens for the repeat, presence and frequency penalties (0 = off, -1 = whole history) |
 | `presence_penalty` | float   | 0       | Presence penalty                       |
 | `frequency_penalty`| float   | 0       | Frequency penalty                      |
 | `seed`             | int     | -1      | Random seed (-1 = random)              |
@@ -1365,8 +1621,11 @@ process-wide lock.
 
 The defaults are the server's configured sampling defaults (Ollama-compatible).
 They can be changed at startup with the matching server flags (`--temperature`,
-`--top-k`, `--top-p`, `--min-p`, `--repeat-penalty`, `--presence-penalty`,
-`--frequency-penalty`, `--seed`) or `TENSORSHARP_*` environment variables.
+`--top-k`, `--top-p`, `--min-p`, `--repeat-penalty`, `--repeat-last-n`,
+`--presence-penalty`, `--frequency-penalty`, `--seed`) or `TENSORSHARP_*`
+environment variables (for example `TENSORSHARP_REPEAT_LAST_N`). `num_predict`
+falls back to `--max-tokens`; a larger value is capped only when `--max-tokens`
+or `MAX_TOKENS` was set.
 A parameter the operator configured that way wins over the request body by
 default; start the server with `--sampling-precedence request` to let per-request
 values win instead. Parameters the operator did not configure always come from
@@ -1376,19 +1635,29 @@ the request.
 
 | Parameter           | Type        | Default | Description                        |
 | ------------------- | ----------- | ------- | ---------------------------------- |
-| `max_tokens`        | int         | `--max-tokens` (20000) | Maximum tokens to generate; `max_completion_tokens` also accepted |
+| `max_tokens`        | int         | `--max-tokens` (20000) | Maximum tokens to generate; `max_completion_tokens` also accepted; capped by `--max-tokens` only when that flag or `MAX_TOKENS` was set |
 | `temperature`       | float       | 0.8     | Sampling temperature               |
 | `top_p`             | float       | 0.9     | Nucleus sampling threshold         |
+| `top_k`             | int         | 40      | Non-standard: Top-K filtering (0 = disabled) |
+| `min_p`             | float       | 0       | Non-standard: minimum probability filtering |
+| `repeat_penalty`    | float       | 1.1     | Non-standard: repetition penalty; `repetition_penalty` also accepted |
+| `repeat_last_n`     | int         | 64      | Non-standard: penalty window in tokens for the repeat, presence and frequency penalties (0 = off, -1 = whole history) |
 | `presence_penalty`  | float       | 0       | Presence penalty                   |
 | `frequency_penalty` | float       | 0       | Frequency penalty                  |
 | `seed`              | int         | -1      | Random seed                        |
 | `stop`              | string/array| null    | Stop sequences                     |
 | `response_format`   | object      | null    | `text`, `json_object`, or `json_schema` |
 | `think`             | bool        | false   | Non-standard extension: enables thinking/reasoning parsing (returned/streamed as `reasoning_content`) |
+| `reasoning_effort`  | string      | null    | `low`, `medium` or `high`; rendered only by GPT-OSS (Harmony), other families ignore it; any other value is HTTP 400. On GPT-OSS, `"think": false` with no effort means `low` |
+| `tool_choice`       | string/object | `auto` | Chat Completions: `auto`, `none` (offers no tools, including the built-in skill, code and sub-agent tools), `required`, or `{"type": "function", "function": {"name": ...}}`; the last two must name client-declared `tools` (HTTP 400 otherwise). Only DeepSeek V4.1 enforces them with a tool-call grammar; other families accept them but can still answer without calling the tool |
+| `parallel_tool_calls` | bool      | null    | Chat Completions: must be a boolean (HTTP 400 otherwise). Only DeepSeek V4.1 honors `false` (its tool grammar then allows a single call); other families accept and ignore it |
 
-`top_k`, `min_p`, and `repetition_penalty` are **not parsed** on the OpenAI
-surface — the server's configured defaults apply for those. Use the Ollama or
-Web UI endpoints if a request needs to set them per call.
+`top_k`, `min_p`, `repeat_penalty` / `repetition_penalty` and `repeat_last_n` are
+not part of the OpenAI specification; they are read from the top level the way
+llama.cpp and vLLM expose them, so an OpenAI-shaped client can pass them through
+`extra_body`. `/v1/responses` reads the same sampling fields, with
+`max_output_tokens` in place of `max_tokens`. The `--sampling-precedence` rule
+above applies to every surface.
 
 ---
 
@@ -1514,8 +1783,8 @@ print()
 
 Notes:
 
-- `response_format` (`json_object` or `json_schema`) cannot be combined with `tools` (HTTP `400`). It combines with `"think": true` only on families whose protocol declares where reasoning ends, so the JSON grammar can arm there: GPT-OSS (`final<|message|>`), DeepSeek V4.1 and Qwen 3.8 Flash Next (`</think>`), Gemma 4 (`<channel|>`), Nemotron-H (`</think>`) and Muse-Glimmer (`to=user<|message|>`). Every other family returns HTTP `400` for that combination.
-- `json_object` / `json_schema` requests constrain the **first sampled token** to a `{`-opening candidate (the same effect llama.cpp gets from its JSON grammar), so chatty models cannot emit prose before the object and streamed time-to-first-token reflects prefill latency instead of suppressed preamble. Subsequent tokens sample normally. Set `TS_JSON_FORCE_OPEN=0` to disable.
+- `response_format` (`json_object` or `json_schema`) cannot be combined with `tools` (HTTP `400`). It combines with `"think": true` only on families whose protocol declares where reasoning ends, so the JSON grammar can arm there: GPT-OSS (`final<|message|>`), DeepSeek V4.1, Qwen 3.8 Flash Next and GLM-5.3-Flash (`</think>`), Gemma 4 (`<channel|>`), Nemotron-H (`</think>`) and Muse-Glimmer (`to=user<|message|>`). Every other family returns HTTP `400` for that combination, and so does `TS_JSON_GRAMMAR=0`, which removes the delayed grammar that combination needs.
+- `json_object` / `json_schema` requests on `/v1/chat/completions` decode under a **JSON grammar** built from the tokenizer (and, for `json_schema`, from the schema), so tokens that would break the object cannot be sampled and chatty models cannot emit prose before it. On the families above, a `think: true` request arms the grammar only after the reasoning block closes. With `TS_JSON_GRAMMAR=0`, or when no grammar can be built for a schema (on a request without `think`; a `think: true` request on the families above fails instead), the server falls back to the older constraint that restricts only the **first sampled token** to a `{`-opening candidate; `TS_JSON_FORCE_OPEN=0` disables that fallback too. `/v1/responses` `text.format` requests rely on the prompt instruction and validation only.
 - Streaming `json_object` requests stream the JSON object token-by-token (code fences and stray tags are stripped on the fly), so time-to-first-token reflects prefill latency. Streaming `json_schema` (strict) requests are still buffered and schema-normalized before the single chunk is emitted. Set `TS_STRUCTURED_STREAM_BUFFER=1` to force the legacy buffer-everything behavior for both. Non-streaming requests are always normalized.
 - Invalid schemas return HTTP `400`; non-streaming / `json_schema` responses that still fail validation return HTTP `422` (a `json_object` stream that has already started cannot change its status code).
 
@@ -1523,7 +1792,7 @@ Notes:
 
 ## 6. Running Test Requests
 
-The `test_requests.jsonl` file contains sample requests for all endpoints. Run them with:
+[`TensorSharp.Server/test_requests.jsonl`](../TensorSharp.Server/test_requests.jsonl) contains sample requests for `/api/tags`, `/api/version`, `/api/generate`, `/api/chat/ollama` and `/v1/chat/completions`; every POST request names `Qwen3.5-9B-Q8_0.gguf`, so host that file. Run them from the repository root with:
 
 ```bash
 while IFS= read -r line; do
@@ -1540,5 +1809,5 @@ while IFS= read -r line; do
       -d "$BODY" | head -c 500
   fi
   echo -e "\n"
-done < test_requests.jsonl
+done < TensorSharp.Server/test_requests.jsonl
 ```

@@ -34,7 +34,10 @@ namespace TensorSharp.Models
             {
                 Class = FamilyClass.R,
                 Readiness = PrefixCacheMode.Tree,
-                NamespaceFingerprint = KVStateFingerprint,
+                // Backend-qualified on MLX (see CheckpointFingerprint): the checkpoint files
+                // are named from it, and an MLX run must not replace a ggml checkpoint of the
+                // same prompt that it cannot read, or the other way round.
+                NamespaceFingerprint = CheckpointFingerprint,
                 EndState = holders ? EndStateSupport.CopyAndDonate : EndStateSupport.None,
                 // False under tensor parallelism (the cache lives on the ranks).
                 CanCaptureCopy = holders && SupportsPrefixCheckpoints,
@@ -84,6 +87,8 @@ namespace TensorSharp.Models
             if (!TryGetRetained(payloadKey, out var holder)) return false;
             if (!(holder.KvHostDirty || holder.GdnHostDirty || holder.ArenaStateResident || holder.FdStateResident))
                 return true;
+            // MLX never sets those flags (its holders' K/V and GDN caches are the only
+            // copies), so a flagged holder there has nothing this could settle.
             if (!IsGgmlBackend || IsTensorParallel || _isRecurrent == null) return false;
             Qwen35KvCacheHolder previous = SnapshotActiveCache();
             LoadCacheHolder(holder);
@@ -252,7 +257,7 @@ namespace TensorSharp.Models
             long writeIndices = holder.ConvWriteIdx == null ? 0 : (long)holder.ConvWriteIdx.Length * sizeof(int);
             long scratch = holder.ConvScratch != IntPtr.Zero ? rings : 0;
             long logits = holder.Logits == null ? 0 : (long)holder.Logits.Length * sizeof(float);
-            stateBytes = checked(delta + rings + writeIndices + scratch + logits);
+            stateBytes = checked(delta + rings + writeIndices + scratch + logits + holder.MlxGdnStateBytes);
             deviceBytes = checked(kvBytes + delta + scratch);
         }
 

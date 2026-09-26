@@ -11,7 +11,7 @@ VAE 各自的编码与解码——权重直接从 GGUF / safetensors 的 mmap �
 而不必逐个判断具体模型类型。
 
 ```sh
-tensorsharp --model minimax_h3_fl2va_pruned-Q4_K.gguf --backend ggml_metal \
+TensorSharp.Cli --model minimax_h3_fl2va_pruned-Q4_K.gguf --backend ggml_metal \
   --prompt "a red fox trotting through falling snow, cinematic" \
   --width 640 --height 384 --video-frames 22 --diffusion-steps 8 --cfg 1.0 \
   --output fox.mp4
@@ -147,7 +147,7 @@ NaN，输出每个像素全黑、每个音频采样被削平，而同一请求�
 sd.cpp 只是把 MJPEG + PCM 写进 AVI，另外还有 .NET 进程相对原生二进制的启动时间。
 
 两组硬件之所以给出不同结论，是因为这台 CUDA 机器是刻意挑来“难为”引擎的：16 GB 显存、
-31.7 GB 内存，面对一套 33.5 GB 的模型——权重装不下，页缓存也装不下，于是启动开销成了
+31.7 GB 内存，面对一套约 35.5 GB 的模型——权重装不下，页缓存也装不下，于是启动开销成了
 主导项；换成一张装得下模型的卡就不会这样。两组数字都是真实的，究竟哪一组描述的是你的
 运行，取决于机器有多少内存，所以引用任何一组之前请先看清硬件标注。
 
@@ -221,7 +221,7 @@ CUDA 的 GGML 后端一律不动——统一内存设备没有什么可交还的
 | `minimax_h3_video_vae_fp16.safetensors` | 5.21 GB | [Comfy-Org/MiniMax-H3](https://huggingface.co/Comfy-Org/MiniMax-H3)（unsloth 仓库的 `vae/` 下也有镜像） |
 | `minimax_h3_audio_vae_fp32.safetensors` | 0.61 GB | 同上；不给则输出无声视频 |
 
-一套约 33.5 GB。每个网络都是依次加载并**释放**的，所以显存峰值是 `max(...)` 而不是
+一套约 35.5 GB（Ref2VA 为 35.4 GB）。每个网络都是依次加载并**释放**的，所以显存峰值是 `max(...)` 而不是
 总和；之后再补第二个去噪器只多花它自身约 10.6 GiB，因为编码器和两个 VAE 是共用的。
 
 伴随文件会在去噪器旁自动解析，也可用 `--video-vae`、`--video-text-encoder`、
@@ -231,8 +231,8 @@ CUDA 的 GGML 后端一律不动——统一内存设备没有什么可交还的
 所以文本编码器和两个 VAE 只会下载一次：
 
 ```sh
-TensorSharp.Server --config config/minimax-h3-fl2va.json      # 关键帧
-TensorSharp.Cli    --config config/minimax-h3-ref2va.json \
+TensorSharp.Server.Host --config config/minimax-h3-fl2va.json # 关键帧
+TensorSharp.Cli         --config config/minimax-h3-ref2va.json \
   --ref-image person.png --prompt "…" --output out.mp4        # 参考
 ```
 
@@ -243,7 +243,7 @@ TensorSharp.Cli    --config config/minimax-h3-ref2va.json \
 
 > **文本编码器的 GGUF 不带分词器**，而这恰恰是配置文件唯一没法替你下载的东西：
 > 自动下载只能补齐那些**以命令行选项形式存在**的文件，而分词器不是选项。请把
-> [MiniMaxAI/MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3/tree/main/processor)
+> [MiniMaxAI/MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3/tree/42ed227ee7df40d41602854ae760620d6eb651fe/processor)
 > 里的 `vocab.json` 和 `merges.txt` 放到它旁边，或用 `TS_VIDEO_TOKENIZER` 指向它们。
 > 两个已发布的 GGUF **完全没有元数据**，因此 TensorSharp 靠张量而不是架构字符串来识别
 > H3（文件里确实写了架构名时，接受 `minimax-h3` / `minimax_h3`）。
@@ -272,7 +272,7 @@ TensorSharp.Cli    --config config/minimax-h3-ref2va.json \
 ### 文生视频
 
 ```sh
-tensorsharp --model minimax_h3_fl2va_pruned-Q4_K.gguf --backend ggml_metal \
+TensorSharp.Cli --model minimax_h3_fl2va_pruned-Q4_K.gguf --backend ggml_metal \
   --prompt "a red fox trotting through falling snow, cinematic" \
   --width 640 --height 384 --video-frames 22 --diffusion-steps 8 --cfg 1.0 \
   --output fox.mp4
@@ -287,22 +287,23 @@ tensorsharp --model minimax_h3_fl2va_pruned-Q4_K.gguf --backend ggml_metal \
 图片会成为**第一帧**，提示词决定后续发生什么。
 
 ```sh
-tensorsharp --model minimax_h3_fl2va_pruned-Q4_K.gguf --backend ggml_metal \
+TensorSharp.Cli --model minimax_h3_fl2va_pruned-Q4_K.gguf --backend ggml_metal \
   --image portrait.jpg \
   --prompt "the person turns toward the camera and smiles, subtle handheld motion" \
   --width 640 --height 384 --video-frames 22 --diffusion-steps 8 --cfg 1.0 \
   --output animated.mp4
 ```
 
-加 `--video-mode i2v` 可显式声明。图片会被缩放到生成画布，所以它的宽高比最好与
-`--width`/`--height` 一致，否则会被拉伸。
+加 `--video-mode i2v` 可显式声明。图片会适配到生成画布；宽高比与 `--width`/`--height`
+不一致时会被居中裁剪（运行时会打印一行 `[h3] conditioning image … centre-cropping to fit`
+提示），想保留整张图就不要指定尺寸。
 
 ### 首尾帧
 
 两端都被钉住，模型补出中间的运动。
 
 ```sh
-tensorsharp --model minimax_h3_fl2va_pruned-Q4_K.gguf --backend ggml_metal \
+TensorSharp.Cli --model minimax_h3_fl2va_pruned-Q4_K.gguf --backend ggml_metal \
   --image start.png --end-image end.png \
   --prompt "a slow cinematic push-in" \
   --width 640 --height 384 --video-frames 22 --diffusion-steps 8 --cfg 1.0 \
@@ -319,7 +320,7 @@ Ref2VA 把图片当作身份与外观的**参考**，而不是画面帧。第一
 这需要 **Ref2VA** 检查点——`i2v`/`fl2v` 与 `ref` 是两个不同的文件，不是一个开关。
 
 ```sh
-tensorsharp --model minimax_h3_ref2va_pruned-Q4_K.gguf --backend ggml_metal \
+TensorSharp.Cli --model minimax_h3_ref2va_pruned-Q4_K.gguf --backend ggml_metal \
   --ref-image person.jpg \
   --prompt "the same woman sits at a table in a sunlit cafe by a window, drinking coffee, wide shot" \
   --width 640 --height 384 --video-frames 22 --diffusion-steps 20 --cfg 1.0 \
@@ -329,7 +330,7 @@ tensorsharp --model minimax_h3_ref2va_pruned-Q4_K.gguf --backend ggml_metal \
 多次传入 `--ref-image` 可以给出多张参考（最多九张），例如一个人物加上她手中的产品：
 
 ```sh
-tensorsharp --model minimax_h3_ref2va_pruned-Q4_K.gguf --backend ggml_metal \
+TensorSharp.Cli --model minimax_h3_ref2va_pruned-Q4_K.gguf --backend ggml_metal \
   --ref-image person.jpg --ref-image bottle.png \
   --prompt "she holds the bottle up to the light on a rooftop at golden hour, slow orbit" \
   --width 640 --height 384 --video-frames 22 --diffusion-steps 20 --cfg 1.0 \
@@ -368,7 +369,7 @@ tensorsharp --model minimax_h3_ref2va_pruned-Q4_K.gguf --backend ggml_metal \
 容器里的音轨无法通过帧解码器读取，所以两者是分开的输入。
 
 ```sh
-tensorsharp --model minimax_h3_ref2va_pruned-Q4_K.gguf --backend ggml_metal \
+TensorSharp.Cli --model minimax_h3_ref2va_pruned-Q4_K.gguf --backend ggml_metal \
   --ref-video walk.mp4 --ref-video-audio walk.wav \
   --prompt "the same woman walks along a beach at sunset, wide shot, waves behind her" \
   --width 640 --height 384 --video-frames 22 --diffusion-steps 20 --cfg 1.0 \
@@ -378,7 +379,7 @@ tensorsharp --model minimax_h3_ref2va_pruned-Q4_K.gguf --backend ggml_metal \
 不带画面的独立音频同样可以作为参考：
 
 ```sh
-tensorsharp --model minimax_h3_ref2va_pruned-Q4_K.gguf --backend ggml_metal \
+TensorSharp.Cli --model minimax_h3_ref2va_pruned-Q4_K.gguf --backend ggml_metal \
   --ref-image singer.jpg --ref-audio song.wav \
   --prompt "she performs on a small club stage under a single spotlight" \
   --width 640 --height 384 --video-frames 22 --diffusion-steps 20 --cfg 1.0 \
@@ -454,8 +455,8 @@ tensorsharp --model minimax_h3_ref2va_pruned-Q4_K.gguf --backend ggml_metal \
 > 只提供一种模式的部署固定条件模式。服务端**没有 `--cfg`**——也没什么可设的，
 > 因为 H3 自己就把它锁在 1.0。
 
-> **强行指定与图片不匹配的尺寸会拉伸画面。** 4:3 的照片被塞进 640×384 会被水平压缩约 25%，
-> 而这正是让人脸"看起来不对"的那种形变。做图生视频时不指定宽高，就会按图片的宽高比来。
+> **强行指定与图片不匹配的尺寸会裁掉画面。** 4:3 的照片被放进 640×384 会损失约 20% 的高度，
+> 由上下两边分摊。做图生视频时不指定宽高，就会按图片的宽高比来。
 
 > **本次修订改变了音轨输出。** 去噪器输出的是白化后的音频潜变量，而解码器需要 VAE
 > 自身的尺度；此前缺少了反白化这一步，因此每一条生成的音轨都是从一个约小 1.9 倍的
@@ -487,7 +488,7 @@ tensorsharp --model minimax_h3_ref2va_pruned-Q4_K.gguf --backend ggml_metal \
 `POST /v1/videos/generations`。
 
 ```sh
-curl -s localhost:5001/api/video-generate -H 'content-type: application/json' -d '{
+curl -s localhost:5000/api/video-generate -H 'content-type: application/json' -d '{
   "prompt": "a red fox trotting through falling snow, cinematic",
   "width": 640, "height": 384, "frames": 22, "steps": 8, "cfg": 1.0,
   "imagePath": "card.jpeg", "videoMode": "i2v"
@@ -497,7 +498,7 @@ curl -s localhost:5001/api/video-generate -H 'content-type: application/json' -d
 参考条件走同一个路由，只是换成 Ref2VA 检查点：
 
 ```sh
-curl -s localhost:5001/api/video-generate -H 'content-type: application/json' -d '{
+curl -s localhost:5000/api/video-generate -H 'content-type: application/json' -d '{
   "prompt": "the same woman sits at a table in a sunlit cafe by a window, wide shot",
   "width": 640, "height": 384, "frames": 22, "steps": 20, "cfg": 1.0,
   "referenceImages": ["person.jpg", "bottle.png"], "videoMode": "ref"
@@ -506,8 +507,10 @@ curl -s localhost:5001/api/video-generate -H 'content-type: application/json' -d
 
 返回 `{ ok, url, audioUrl, width, height, frames, fps, seed, codec, elapsedSeconds }`。
 模型没有产出音轨时 `audioUrl` 为 null。完整字段为 `prompt`、`width`、`height`、`frames`、
-`steps`、`cfg`、`fps`、`imagePath`、`videoMode`、`generateAudio`、`endImage`、
-`referenceImages`、`referenceVideos`、`referenceAudios`、`referenceVideoAudios`。其中大多数
+`steps`、`cfg`、`fps`、`seed`、`flowShift`、`imagePath`（或内联 base64 的 `image`）、
+`videoMode`、`generateAudio`、`endImage`、`referenceImages`、`referenceVideos`、
+`referenceAudios`、`referenceVideoAudios`；Wan 的 `negativePrompt`、`sampler`、
+`cfgCacheStride` 和 `cfg2` 字段会被接受，但 H3 会忽略它们。其中大多数
 **只接受 camelCase**——只有 `videoMode`、`generateAudio`、`endImage` 以及四个 `reference*`
 列表同时接受 snake_case 拼法（`video_mode`、`generate_audio`、`end_image`、
 `reference_images` 等），两种拼法同时出现时以 camelCase 为准。写成 `image_path` 或

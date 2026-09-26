@@ -15,4 +15,9 @@ public sealed record MultiAgentProgress(
     string? ToolStatus,
     string? Detail,
     string? Result,
-    string? Error);
+    string? Error)
+{
+    public string? WorkspaceId { get; init; }
+    public string Permissions { get; init; } = "read-only";
+    public System.Collections.Generic.IReadOnlyList<string> DependsOn { get; init; } = System.Array.Empty<string>();
+}

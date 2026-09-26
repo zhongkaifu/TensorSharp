@@ -233,7 +233,7 @@ from **4,094,385,400 to 4,078,132,496 bytes** (4.094 → 4.078 GB, -0.40%).
 ### Saved evidence
 
 The local validation artifacts are in
-[`TestResults/ggml-without-patches-2026-09-10`](../../TestResults/ggml-without-patches-2026-09-10/README.md).
+`TestResults/ggml-without-patches-2026-09-10/` (local validation evidence, not committed).
 They include successful final comparisons, every preceding benchmark probe
 (including failed comparisons), build/test logs, and token/timing JSON. The
 artifact README identifies final result files and the native binary hashes.

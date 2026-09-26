@@ -37,8 +37,15 @@ namespace TensorSharp.MLX
             }
         }
 
+        // Fallbacks taken on this thread (ops call Invoke on the caller's thread), so a
+        // test can assert that an op stayed on the GPU while other tests run in parallel.
+        [ThreadStatic]
+        private static long invocationsOnThread;
+        internal static long InvocationsOnThisThread => invocationsOnThread;
+
         public static object Invoke(string opName, MlxFallbackReturnKind returnKind, int[] modifiedTensorIndexes, object[] args)
         {
+            invocationsOnThread++;
             if (string.Equals(opName, "SiLUMulSplit", StringComparison.Ordinal))
             {
                 WarnFallback(opName, "an unfused two-op decomposition (slower than the fused kernel)");

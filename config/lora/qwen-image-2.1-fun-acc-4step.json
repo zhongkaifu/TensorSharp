@@ -1,0 +1,33 @@
+{
+  // Alibaba PAI Fun-Acc 4-step: a Parallel Decoding Distillation (PDD) bundle for Qwen-Image-2.1,
+  // text-to-image and editing in 4 transformer passes, CFG off. It is more than a LoRA: rank-64
+  // deltas on every projection, four per-step output heads that replace proj_out (step i uses
+  // head i) and replaced q/k and text norm gains. Its pdd_config.json carries the trained sigma
+  // grid (used verbatim at every resolution, never shifted), alpha, and the replaced parameters;
+  // the reference hook also rounds the timestep through bf16, which the recipe reproduces.
+  //
+  //   TensorSharp.Cli --config config/qwen-image-2.1.json \
+  //       --lora config/lora/qwen-image-2.1-fun-acc-4step.json --prompt "..."
+  //
+  // Trained at 2048x2048 (the grid is the 2048x2048 base schedule); the card notes small dense
+  // text and some edits (slightly darker/blurrier) are weaker than the 40-step teacher.
+  // License: Qwen Research License (non-commercial); inference code Apache-2.0.
+  "type": "qwen-image-2.1-lora",
+  "variables": {
+    "root": "${TENSORSHARP_MODELS:-../../models}/qwen-image-2.1/loras"
+  },
+  "weights": {
+    "path": "${root}/Qwen-Image-2.1-Fun-Acc-4Step.safetensors",
+    "urls": [
+      "https://huggingface.co/alibaba-pai/Qwen-Image-2.1-Fun-Acc-LoRAs/resolve/f7545234760e1847cd8e89e52bd951cb0b7e327f/models/Qwen-Image-2.1-Fun-Acc-4Step.safetensors"
+    ],
+    "sha256": "764c56ae94f330b6d06ccc322f95e1b8ce46424ddde5899a15432f95f720d558"
+  },
+  "config": {
+    "path": "${root}/pdd_config.json",
+    "urls": [
+      "https://huggingface.co/alibaba-pai/Qwen-Image-2.1-Fun-Acc-LoRAs/resolve/f7545234760e1847cd8e89e52bd951cb0b7e327f/models/pdd_config.json"
+    ],
+    "sha256": "f798c4a8e9225350e9c46be7a60f397df35e6bb90965d64be76d11e51fd41b97"
+  }
+}

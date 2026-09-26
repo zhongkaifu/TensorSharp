@@ -58,6 +58,12 @@ namespace TensorSharp.Models
         // path scales linearly with kvLen on the multi-GB cache download.
         // Override via TS_MLX_SINKS_ATTN_MIN_KV_LEN if a workload regresses.
         private static readonly int MlxSinksAttnMinKvLen = ResolveMlxSinksAttnMinKvLen();
+        // On MLX, attention reads K/V straight out of the cache with MLX's fused SDPA
+        // (sinks + sliding window), as mlx-lm does: prefill no longer materialises the
+        // scores for a host sinks softmax, and decode uses MLX's split-K vector kernel.
+        // TS_MLX_CACHED_ATTENTION=0 restores the previous paths for A/B.
+        private static readonly bool MlxCachedAttention =
+            !string.Equals(Environment.GetEnvironmentVariable("TS_MLX_CACHED_ATTENTION"), "0", StringComparison.Ordinal);
         private static int ResolveMlxSinksAttnMinKvLen()
         {
             string env = Environment.GetEnvironmentVariable("TS_MLX_SINKS_ATTN_MIN_KV_LEN");
@@ -934,6 +940,8 @@ namespace TensorSharp.Models
 
         protected override float[] ForwardRefillCore(int[] tokens)
         {
+            if (RunOnMlxWorker)
+                return MlxWorker.Shared.Invoke(() => ForwardRefillCore(tokens));
             if (tokens == null || tokens.Length <= 1)
                 return ForwardCore(tokens);
 
@@ -1023,8 +1031,19 @@ namespace TensorSharp.Models
             return WillUseFusedModelPrefill(2) ? 2048 : FusedAttnMaxSeqLen;
         }
 
+        // On MLX every op is a hand-off to the MLX worker thread (MlxWorker.Invoke: a queue
+        // push and a wait, ~5-25 us), and a decode token issues roughly a thousand of them —
+        // a Metal trace of gpt-oss-20b decode showed the GPU busy 42% of the time. Running
+        // the whole forward as ONE hand-off lets every nested op run inline on the worker,
+        // as Gemma4Model does. The parallel host loops in this forward (CPU attention, F16
+        // dequant) touch only raw pointers, never MLX, so they cannot wait on the worker.
+        private bool RunOnMlxWorker =>
+            _backend == BackendType.Mlx && !IsTensorParallel && !MlxWorker.Shared.IsOnWorkerThread;
+
         protected override float[] ForwardCore(int[] tokens)
         {
+            if (RunOnMlxWorker)
+                return MlxWorker.Shared.Invoke(() => ForwardCore(tokens));
             if (IsTensorParallel)
                 return ForwardTP(tokens);
 
@@ -1447,11 +1466,11 @@ namespace TensorSharp.Models
                 // MLX path: keep K/V on device, run the sinks-aware decode
                 // attention via a custom Metal kernel. Avoids the per-layer
                 // device→host KV cache pull that AttentionDecodeWithSinks
-                // triggers via GetFloatPtr/GetHalfPointer. Only worth it
-                // for long context — the kernel's per-K-step barriers
-                // outweigh the cache download cost for short kvLen, where
-                // the host SIMD CPU path is faster. Threshold tunable via
-                // TS_MLX_SINKS_ATTN_MIN_KV_LEN (default 2048).
+                // triggers via GetFloatPtr/GetHalfPointer. Used at every
+                // kvLen by default: it measured faster than the host SIMD
+                // path even at short kvLen (see MlxSinksAttnMinKvLen).
+                // Threshold tunable via TS_MLX_SINKS_ATTN_MIN_KV_LEN
+                // (default 1).
                 bool attnOk = false;
                 if (_backend == BackendType.Cuda)
                 {
@@ -1465,7 +1484,22 @@ namespace TensorSharp.Models
                         attendStart, attendLen, _kvCacheCapacity,
                         circular: false, scale);
                 }
-                if (_backend == BackendType.Mlx
+                if (_backend == BackendType.Mlx && MlxCachedAttention)
+                {
+                    // MLX's SDPA vector kernel splits a long cache across threadgroups
+                    // (two-pass); the one-threadgroup-per-head sinks kernel below fell
+                    // to 15 tok/s at a 4k context.
+                    Tensor sinksMlx = sinks != null ? GetOrCreateSinksMlxTensor(layer, sinks, numHeads) : null;
+                    if (sinks == null || sinksMlx != null)
+                    {
+                        attnOk = MlxFusedOps.TryCachedAttention(
+                            attnResult, qTensor, _kvCacheK[layer], _kvCacheV[layer],
+                            numHeads, numKVHeads, headDim, 1, totalSeqLen, scale,
+                            sinksMlx, isSWA ? _slidingWindow : 0);
+                    }
+                }
+                if (!attnOk
+                    && _backend == BackendType.Mlx
                     && sinks != null
                     && totalSeqLen >= MlxSinksAttnMinKvLen)
                 {
@@ -1495,8 +1529,6 @@ namespace TensorSharp.Models
             }
 
             // Prefill path
-            Tensor qHeads = ReshapeToHeads(qTensor, numHeads, seqLen, headDim);
-            qTensor.Dispose();
             Tensor kHeads = ReshapeToHeads(kTensor, numKVHeads, seqLen, headDim);
             kTensor.Dispose();
             Tensor vHeads = ReshapeToHeads(vTensor, numKVHeads, seqLen, headDim);
@@ -1506,6 +1538,29 @@ namespace TensorSharp.Models
             CopyToCache(_kvCacheV[layer], vHeads, startPos, seqLen);
             kHeads.Dispose();
             vHeads.Dispose();
+
+            if (_backend == BackendType.Mlx && MlxCachedAttention)
+            {
+                Tensor sinksMlx = sinks != null ? GetOrCreateSinksMlxTensor(layer, sinks, numHeads) : null;
+                var cachedAttention = new Tensor(_allocator, DType.Float32, seqLen, numHeads * headDim);
+                if ((sinks == null || sinksMlx != null)
+                    && MlxFusedOps.TryCachedAttention(
+                        cachedAttention, qTensor, _kvCacheK[layer], _kvCacheV[layer],
+                        numHeads, numKVHeads, headDim, seqLen, totalSeqLen, scale,
+                        sinksMlx, isSWA ? _slidingWindow : 0))
+                {
+                    qTensor.Dispose();
+                    _attnTicks += Stopwatch.GetTimestamp() - t0;
+
+                    Tensor cachedOutput = LinearForwardWithBias(cachedAttention, wn[3], wn[4]);
+                    cachedAttention.Dispose();
+                    return cachedOutput;
+                }
+                cachedAttention.Dispose();
+            }
+
+            Tensor qHeads = ReshapeToHeads(qTensor, numHeads, seqLen, headDim);
+            qTensor.Dispose();
 
             if (_backend == BackendType.Cuda)
             {
@@ -1827,6 +1882,12 @@ namespace TensorSharp.Models
         private unsafe Tensor MoEForward(Tensor hiddenState, int layer, int seqLen)
         {
             string[] wn = _layerNames[layer];
+            if (seqLen == 1 && _backend == BackendType.Mlx)
+            {
+                Tensor routed = TryMoEForwardDeviceRoutedMlx(hiddenState, layer, wn);
+                if (routed != null)
+                    return routed;
+            }
             var (routingWeights, selectedExperts) = MoERoute(hiddenState, wn[6], wn[7], seqLen);
 
             int hiddenDim = (int)hiddenState.Sizes[1];
@@ -2279,6 +2340,103 @@ namespace TensorSharp.Models
                 // because it is much slower and --n-cpu-moe is the real answer.
                 WarnMoEFusedUnavailable(ex.Message);
                 return false;
+            }
+        }
+
+        // Decode MoE on MLX without leaving the device. MoERoute reads the router scores back
+        // to pick the experts on the host, which drains the GPU once per MoE layer — 24 times a
+        // token on gpt-oss-20b, with the GPU idle while the host sorts and builds the rest of
+        // the layer. Here the top-K, the softmax over the selected logits (MoERoute's
+        // semantics) and the expert indices stay on the device and feed gather_qmm directly,
+        // as omlx / mlx-lm route. TS_MLX_DEVICE_MOE_ROUTING=0 restores host routing.
+        private static readonly bool MlxDeviceMoeRouting =
+            !string.Equals(Environment.GetEnvironmentVariable("TS_MLX_DEVICE_MOE_ROUTING"), "0", StringComparison.Ordinal);
+        private Tensor _moeDecodeRowZeros;   // [K] int32: every pair reads row 0 (the one token)
+        private Tensor _moeDecodeArange;     // [K] int32: pair k is row k
+
+        private Tensor TryMoEForwardDeviceRoutedMlx(Tensor hiddenState, int layer, string[] wn)
+        {
+            if (!MlxDeviceMoeRouting || MlxMoeGqmmMode != 1 || _layerStackedReady == 0)
+                return null;
+            var gateW = _layerStackedGate?[layer];
+            var upW = _layerStackedUp?[layer];
+            var downW = _layerStackedDown?[layer];
+            if (gateW == null || upW == null || downW == null
+                || !MlxQuantizedOps.SupportsStackedAffine(gateW.GgmlType)
+                || !MlxQuantizedOps.SupportsStackedAffine(upW.GgmlType)
+                || !MlxQuantizedOps.SupportsStackedAffine(downW.GgmlType)
+                || _layerGateUpBiasStacked == null || _layerGateUpBiasStacked[layer] == null
+                || MoeCpuOffloadConfig.IsLayerOnCpu(layer))
+                return null;
+
+            int E = _numExperts;
+            int K = _numExpertsUsed;
+            int ff = _expertFfnLength;
+            int hiddenDim = (int)hiddenState.Sizes[1];
+            if (E <= 0 || K <= 0 || K >= E || ff <= 0)
+                return null;
+
+            EnsureMoeMlxBiasTensors(layer, E, ff, hiddenDim);
+            _moeDecodeRowZeros ??= CreateIntTensor(new int[K], K);
+            if (_moeDecodeArange == null)
+            {
+                int[] arange = new int[K];
+                for (int i = 0; i < K; i++) arange[i] = i;
+                _moeDecodeArange = CreateIntTensor(arange, K);
+            }
+
+            Tensor output = null;
+            try
+            {
+                using var scores = LinearForwardWithBias(hiddenState, wn[6], wn[7]);
+                using var experts = new Tensor(_allocator, DType.Int32, K);
+                using var weights = new Tensor(_allocator, DType.Float32, 1, K);
+                if (!MlxFusedOps.TryMoeRouterTopKSoftmax(scores, experts, weights))
+                    return null;
+
+                // Explicit row indices keep MLX on its per-row gather_qmv kernel, which
+                // is what a K-row decode batch runs anyway (see TryMoEMlxGatherQmm), so the
+                // unsorted top-K order needs no sort.
+                using var x3 = hiddenState.View(1, 1, hiddenDim);
+                using var gate = new Tensor(_allocator, DType.Float32, K, ff);
+                if (!MlxQuantizedOps.TryGatherQmm(gate, x3, _moeDecodeRowZeros, experts,
+                        gateW.Data, gateW.Data, gateW.GgmlType, gateW.PerExpertNe0, gateW.PerExpertNe1, E, gateW.TotalRawBytes,
+                        sortedIndices: false))
+                    return null;
+                using var up = new Tensor(_allocator, DType.Float32, K, ff);
+                if (!MlxQuantizedOps.TryGatherQmm(up, x3, _moeDecodeRowZeros, experts,
+                        upW.Data, upW.Data, upW.GgmlType, upW.PerExpertNe0, upW.PerExpertNe1, E, upW.TotalRawBytes,
+                        sortedIndices: false))
+                    return null;
+                using var act = new Tensor(_allocator, DType.Float32, K, ff);
+                if (!MlxFusedOps.TrySwiGluOaiGatherBias(act, gate, up,
+                        _moeGateBiasMlx[layer], _moeUpBiasMlx[layer], experts, SiluAlpha, SiluLimit))
+                    return null;
+                using var act3 = act.View(K, 1, ff);
+                using var down = new Tensor(_allocator, DType.Float32, K, hiddenDim);
+                if (!MlxQuantizedOps.TryGatherQmm(down, act3, _moeDecodeArange, experts,
+                        downW.Data, downW.Data, downW.GgmlType, downW.PerExpertNe0, downW.PerExpertNe1, E, downW.TotalRawBytes,
+                        sortedIndices: false))
+                    return null;
+
+                using var pairWeights = weights.View(K);
+                output = new Tensor(_allocator, DType.Float32, 1, hiddenDim);
+                if (!MlxFusedOps.TryMoeBiasWeightedSum(output, down,
+                        _moeDownBiasMlx != null ? _moeDownBiasMlx[layer] : null,
+                        experts, _moeDecodeArange, pairWeights, K))
+                {
+                    output.Dispose();
+                    return null;
+                }
+                Tensor result = output;
+                output = null;
+                return result;
+            }
+            catch (Exception)
+            {
+                output?.Dispose();
+                WarnMoEFusedUnavailable("MLX device-routed MoE decode failed");
+                return null;
             }
         }
 
@@ -2812,9 +2970,29 @@ namespace TensorSharp.Models
 
                 int seqLen = (int)result.Sizes[0];
                 int outDim = (int)result.Sizes[1];
+                int biasDim = (int)bias.ElementCount();
+
+                // On MLX the host loop below forces a device sync for every
+                // projection (the matmul result has to be read back before the
+                // bias can be added), which left decode host-bound. Broadcast
+                // the bias over the rows and add it on the device instead.
+                if (_backend == BackendType.Mlx && biasDim == outDim)
+                {
+                    using var biasRow = bias.View(1, outDim);
+                    if (seqLen == 1)
+                    {
+                        Ops.Add(result, result, biasRow);
+                    }
+                    else
+                    {
+                        using var expanded = biasRow.Expand(seqLen, outDim);
+                        Ops.Add(result, result, expanded);
+                    }
+                    return result;
+                }
+
                 float* rPtr = GetFloatPtr(result);
                 float* bPtr = GetFloatPtr(bias);
-                int biasDim = (int)bias.ElementCount();
                 int dim = Math.Min(outDim, biasDim);
 
                 for (int s = 0; s < seqLen; s++)
@@ -2833,6 +3011,8 @@ namespace TensorSharp.Models
             if (_kvCacheV != null)
                 foreach (var t in _kvCacheV) t?.Dispose();
             DisposeGptOssTpState();
+            _moeDecodeRowZeros?.Dispose();
+            _moeDecodeArange?.Dispose();
             if (_layerSinksMlx != null)
                 foreach (var t in _layerSinksMlx) t?.Dispose();
             if (_moeGateBiasMlx != null)

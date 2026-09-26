@@ -1395,6 +1395,27 @@ namespace TensorSharp.Models
             return false;
         }
 
+        // The ggml whole-model graphs exist to remove per-operation dispatch: on the ggml
+        // backends every op of the per-op path is its own graph build and submission. MLX
+        // has nothing of that to remove - each op only appends to MLX's lazy graph, the
+        // step's whole forward is evaluated as one graph, and the layer loop hands MLX
+        // work while earlier layers already run (Qwen3.8-27B decode on an M5 Pro: GPU
+        // busy 99%, the per-token forward within 1% of the pipelined one). So the MLX
+        // path is not a fallback and says so once, instead of FdBail's "10x slower".
+        private bool _mlxGraphNotePrinted;
+
+        private bool MlxWholeGraphNote()
+        {
+            if (!_mlxGraphNotePrinted)
+            {
+                _mlxGraphNotePrinted = true;
+                Console.Error.WriteLine(
+                    "[qwen35] MLX evaluates each step's whole forward as one lazy MLX graph; " +
+                    "the ggml whole-model decode/prefill graphs do not apply and nothing falls back.");
+            }
+            return false;
+        }
+
         private unsafe bool TryFullModelDecodeCore(
             Tensor hidden, int tokenId, int position, float[] logitsOut)
         {
@@ -1418,6 +1439,8 @@ namespace TensorSharp.Models
             // A decode outside the speculative session ends it (the drain below and
             // the re-seed make the host mirrors authoritative again).
             ExitSpecSession();
+            if (_backend == BackendType.Mlx)
+                return MlxWholeGraphNote();
             if (_backend != BackendType.GgmlCuda && _backend != BackendType.GgmlMetal
                 && _backend != BackendType.GgmlVulkan)
                 return FdBail($"backend {_backend} has no fused whole-model decode graph");

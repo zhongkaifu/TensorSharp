@@ -21,6 +21,7 @@ using TensorAgent.Core.Sharing;
 using TensorAgent.Core.Settings;
 using TensorAgent.Core.Sandbox;
 using TensorAgent.Core.Shell;
+using TensorSharp.AgentHost.Agents;
 using TensorSharp.AgentHost.CodeExec;
 using TensorSharp.AgentHost.Skills;
 using TensorSharp.Chat;
@@ -2000,6 +2001,10 @@ public sealed class AgentAppHost : IDisposable
 
         Options.RepointSandboxPermissions(settings.AllowCodeExecution, settings.AllowNetwork);
         Options.RepointSkills(settings.SkillsEnabled);
+        // Not a permission -- a sub-agent gets no filesystem or network access its
+        // parent lacks -- but planned per request like the skills switch, so it moves
+        // with it and the next message is planned with or without delegation.
+        Options.RepointMultiAgent(settings.MultiAgentEnabled);
         ApplySpeculationSetting(settings);
         _loggerFactory.CreateLogger("TensorAgent.Host").LogInformation("settings applied: {Engine}", DescribeEngine());
     }
@@ -2282,7 +2287,10 @@ public sealed class AgentAppHost : IDisposable
         // argument selects the constructor's literal default of 8 and marks it as an
         // explicit cap, which cut Qwen off while it was still retrieving the answer.
         skillsMaxRounds: 0,
-        skillsAllowNetwork: settings.AllowNetwork);
+        skillsAllowNetwork: settings.AllowNetwork,
+        // The user's own switch, not the server's default. Only Enabled is chosen
+        // here; the limits stay MultiAgentOptions' defaults, as they always were.
+        multiAgent: new MultiAgentOptions { Enabled = settings.MultiAgentEnabled });
 
     /// <summary>
     /// Wait until the engine has nothing in flight.
@@ -2473,6 +2481,10 @@ public sealed class AgentAppHost : IDisposable
                         // decided here, from whether the draft head really attached.
                         bool draftAttached = ModelService.Model is IDraftHead { HasDraftHead: true };
                         string algorithm = SpeculationPolicy.ChooseAlgorithm(draftAttached);
+                        // Also hand it to the engine host: a settings switch flipped while this
+                        // model was loading was remembered with the algorithm chosen before the
+                        // draft head was known, and must not outlive this decision.
+                        ModelService.EngineHost.UpdateSpeculation(SpeculationOptions.FromEnvironment());
                         if (draftHead is not null && !draftAttached)
                             HostLog.LogWarning("{Model}: the draft head {File} did not attach ({Reason}); speculating with {Algorithm} instead",
                                 model.Id, Path.GetFileName(draftHead), ModelService.DraftHeadActivationError ?? "no reason given", algorithm);

@@ -27,6 +27,36 @@ public struct QwenImage21Segment
     public int Start, End, SourceStart, IsImage;
 }
 
+/// <summary>A LoRA update of one projection, applied unmerged (TSGQi21Lora):
+/// y = RowScale * (W x) + Up (Down x). Down is ggml [In, Rank] (PyTorch lora_A),
+/// Up is ggml [Rank, Out] (PyTorch lora_B) with every scale folded in.</summary>
+[StructLayout(LayoutKind.Sequential)]
+public struct QwenImage21Lora
+{
+    public IntPtr Down, Up, RowScale;
+    /// <summary>GGML type of both factors: 1 = F16, 0 = F32.</summary>
+    public int Type, Rank;
+    public long In, Out;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+public struct QwenImage21BlockLora
+{
+    public QwenImage21Lora Q, K, V, Out, Gate, Up, Down;
+}
+
+/// <summary>A LoRA plug-in's changes to the transformer (TSGQi21Adapter).</summary>
+[StructLayout(LayoutKind.Sequential)]
+public struct QwenImage21Adapter
+{
+    public int StructBytes, NumLayers;
+    public QwenImage21Lora ImageIn, TextIn, TextOut, TimeIn, TimeOut, Modulation, NormOut, ProjOut;
+    public IntPtr Blocks;
+    /// <summary>Optional per-call replacement of proj_out ([dim, channels]), uploaded as an input.</summary>
+    public IntPtr OutputHead;
+    public int OutputHeadType, Reserved;
+}
+
 [StructLayout(LayoutKind.Sequential)]
 public struct QwenImage21ForwardArgs
 {
@@ -41,6 +71,8 @@ public struct QwenImage21ForwardArgs
     public QwenImage21PrefixCacheType PrefixCacheType;
     /// <summary>Ranks the block weights are sharded over (0/1 = none); see QwenImage21ForwardTp.</summary>
     public int TpRanks;
+    /// <summary>Optional <see cref="QwenImage21Adapter"/> (a LoRA plug-in), or zero.</summary>
+    public IntPtr Adapter;
 }
 
 /// <summary>Storage of the prefix KV cache. <see cref="Auto"/> stores what attention reads

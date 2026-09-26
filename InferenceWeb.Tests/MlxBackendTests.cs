@@ -804,6 +804,41 @@ public class MlxBackendTests
         }, actual);
     }
 
+    [MlxTheory]
+    [InlineData(2, 64, 64)]   // NeoX over the whole row: gpt-oss attention
+    [InlineData(0, 32, 48)]   // traditional, with columns past ropeDim left alone
+    public void MlxRoPEEx_YarnMatchesTheCpuImplementation(int mode, int ropeDim, int cols)
+    {
+        // gpt-oss's YaRN parameters. These used to take the element-by-element CPU fallback;
+        // the device path must reproduce the CPU arithmetic, mscale included, and leave the
+        // columns past ropeDim exactly as they were.
+        const int rows = 7;
+        const int nCtxOrig = 4096;
+        const float freqBase = 150000f, freqScale = 1f / 32f, extFactor = 1f, attnFactor = 1f, betaFast = 32f, betaSlow = 1f;
+        float[,] source = new float[rows, cols];
+        for (int r = 0; r < rows; r++)
+            for (int c = 0; c < cols; c++)
+                source[r, c] = MathF.Sin((r + 1) * 0.37f + (c + 1) * 0.11f);
+        int[] positions = { 0, 1, 2, 17, 511, 4095, 20000 };
+
+        var cpu = new TensorSharp.Cpu.CpuAllocator(BlasEnum.DotNet);
+        using var cpuInput = Tensor.FromArray(cpu, source);
+        using var cpuPositions = Tensor.FromArray(cpu, positions);
+        using var expected = Ops.RoPEEx(null, cpuInput, cpuPositions, ropeDim, mode, nCtxOrig, freqBase, freqScale, extFactor, attnFactor, betaFast, betaSlow);
+
+        using var allocator = new MlxAllocator();
+        using var input = Tensor.FromArray(allocator, source);
+        using var positionTensor = Tensor.FromArray(allocator, positions);
+        using var actual = Ops.RoPEEx(null, input, positionTensor, ropeDim, mode, nCtxOrig, freqBase, freqScale, extFactor, attnFactor, betaFast, betaSlow);
+
+        float[] want = expected.GetElementsAsFloat(rows * cols);
+        float[] got = actual.GetElementsAsFloat(rows * cols);
+        AssertClose(want, got, 2e-3f);
+        for (int r = 0; r < rows; r++)
+            for (int c = ropeDim; c < cols; c++)
+                Assert.Equal(source[r, c], got[r * cols + c]);
+    }
+
     [MlxFact]
     public void MlxRoPEEx_NeoXDynamicPositions_MatchesReference()
     {
@@ -854,6 +889,7 @@ public class MlxBackendTests
     [MlxFact]
     public void MlxQuantizedMatmul_Q80MatchesDequantizedReference()
     {
+        using var exact = new ExactMlxMatmul();
         const int rows = 3;
         const int inDim = 64;
         const int outDim = 4;
@@ -895,6 +931,7 @@ public class MlxBackendTests
     [InlineData(true)]
     public void MlxQuantizedMatmul_Q4MatchesDequantizedReference(bool hasExplicitBias)
     {
+        using var exact = new ExactMlxMatmul();
         const int rows = 2;
         const int inDim = 64;
         const int outDim = 3;
@@ -942,6 +979,7 @@ public class MlxBackendTests
     [InlineData(true)]
     public void MlxQuantizedMatmul_Q5MatchesDequantizedReference(bool hasExplicitBias)
     {
+        using var exact = new ExactMlxMatmul();
         const int rows = 2;
         const int inDim = 64;
         const int outDim = 3;
@@ -990,6 +1028,7 @@ public class MlxBackendTests
     [InlineData((int)GgmlTensorType.Q6_K)]
     public void MlxQuantizedMatmul_KQuantsMatchDequantizedReference(int ggmlType)
     {
+        using var exact = new ExactMlxMatmul();
         const int rows = 2;
         const int inDim = 256;
         const int outDim = 2;
@@ -1041,6 +1080,7 @@ public class MlxBackendTests
     [MlxFact]
     public void MlxQuantizedMatmul_Q6KSingleRowMatchesDequantizedReference()
     {
+        using var exact = new ExactMlxMatmul();
         const int rows = 1;
         const int inDim = 256;
         const int outDim = 5;
@@ -1052,8 +1092,11 @@ public class MlxBackendTests
         float[] expected = DequantizedMatmulK(weights, outDim, inDim, input, DequantizeQ6KRow);
         IntPtr host = Marshal.AllocHGlobal(weights.Length);
         string previousOptIn = Environment.GetEnvironmentVariable("TS_MLX_Q6K_MATMUL4");
+        int previousMatvecRows = MlxNative.Q6KMatvecMaxRows;
         try
         {
+            // The 4-column kernel, not the matrix-vector port that now takes one row.
+            MlxNative.Q6KMatvecMaxRows = 0;
             Environment.SetEnvironmentVariable("TS_MLX_Q6K_MATMUL4", "1");
             Marshal.Copy(weights, 0, host, weights.Length);
             using var allocator = new MlxAllocator();
@@ -1074,7 +1117,155 @@ public class MlxBackendTests
         }
         finally
         {
+            MlxNative.Q6KMatvecMaxRows = previousMatvecRows;
             Environment.SetEnvironmentVariable("TS_MLX_Q6K_MATMUL4", previousOptIn);
+            Marshal.FreeHGlobal(host);
+        }
+    }
+
+    [MlxTheory]
+    [InlineData(1, 256, 13)]    // one block per row; a last threadgroup with one valid row
+    [InlineData(1, 768, 16)]    // odd block count: the two half-simdgroups take 2 and 1 blocks
+    [InlineData(3, 512, 13)]
+    [InlineData(4, 1024, 6)]
+    public void MlxQuantizedMatmul_Q6KMatvecMatchesDequantizedReference(int rows, int inDim, int outDim)
+    {
+        // Exact Q6_K (no 8-bit regroup) at the row counts the ggml matrix-vector port serves.
+        using var exact = new ExactMlxMatmul();
+        Assert.True(rows <= MlxNative.Q6KMatvecMaxRows);
+        byte[] weights = CreateQ6KRows(outDim, inDim);
+        float[,] input = new float[rows, inDim];
+        for (int r = 0; r < rows; r++)
+            for (int c = 0; c < inDim; c++)
+                input[r, c] = MathF.Cos((c + 1) * 0.017f + r * 0.61f) * (1f + r);
+
+        float[] expected = DequantizedMatmulK(weights, outDim, inDim, input, DequantizeQ6KRow);
+        IntPtr host = Marshal.AllocHGlobal(weights.Length);
+        try
+        {
+            Marshal.Copy(weights, 0, host, weights.Length);
+            using var allocator = new MlxAllocator();
+            using var inputTensor = Tensor.FromArray(allocator, input);
+            using var outputTensor = new Tensor(allocator, DType.Float32, rows, outDim);
+
+            Assert.True(MlxQuantizedOps.TryAddmmQuantizedToFloat32(
+                outputTensor, inputTensor, host, host, (int)GgmlTensorType.Q6_K, inDim, outDim, weights.Length));
+
+            AssertRelativelyClose(expected, outputTensor.GetElementsAsFloat(rows * outDim), 1e-5f);
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(host);
+        }
+    }
+
+    [MlxTheory]
+    [InlineData(1, 256, 13)]    // one block per row; a last threadgroup with one valid row
+    [InlineData(1, 768, 16)]    // odd block count: the two half-simdgroups take 2 and 1 blocks
+    [InlineData(3, 512, 13)]
+    [InlineData(4, 1024, 6)]
+    public void MlxQuantizedMatmul_Iq4XsMatvecMatchesDequantizedReference(int rows, int inDim, int outDim)
+    {
+        Assert.True(rows <= MlxNative.Iq4XsMatvecMaxRows);
+        byte[] weights = CreateIq4XsRows(outDim, inDim);
+        float[,] input = new float[rows, inDim];
+        for (int r = 0; r < rows; r++)
+            for (int c = 0; c < inDim; c++)
+                input[r, c] = MathF.Cos((c + 1) * 0.017f + r * 0.61f) * (1f + r);
+
+        float[] expected = DequantizedMatmulIq4Xs(weights, outDim, inDim, input);
+        IntPtr host = Marshal.AllocHGlobal(weights.Length);
+        try
+        {
+            Marshal.Copy(weights, 0, host, weights.Length);
+            using var allocator = new MlxAllocator();
+            using var inputTensor = Tensor.FromArray(allocator, input);
+            using var outputTensor = new Tensor(allocator, DType.Float32, rows, outDim);
+
+            Assert.True(MlxQuantizedOps.TryAddmmQuantizedToFloat32(
+                outputTensor, inputTensor, host, host, (int)GgmlTensorType.IQ4_XS, inDim, outDim, weights.Length));
+
+            AssertRelativelyClose(expected, outputTensor.GetElementsAsFloat(rows * outDim), 1e-5f);
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(host);
+        }
+    }
+
+    [MlxTheory]
+    [InlineData(8, 512, 13, false)]
+    [InlineData(37, 768, 16, false)]
+    [InlineData(8, 512, 13, true)]      // three slices of five output rows
+    public void MlxQuantizedMatmul_Iq4XsPrefillThroughF16MatchesDequantizedReference(int rows, int inDim, int outDim, bool slices)
+    {
+        Assert.True(rows > MlxNative.Iq4XsMatvecMaxRows);
+        byte[] weights = CreateIq4XsRows(outDim, inDim);
+        float[,] input = new float[rows, inDim];
+        for (int r = 0; r < rows; r++)
+            for (int c = 0; c < inDim; c++)
+                input[r, c] = MathF.Sin((c + 3) * 0.013f + r * 0.37f);
+
+        float[] expected = DequantizedMatmulIq4Xs(weights, outDim, inDim, input);
+        IntPtr host = Marshal.AllocHGlobal(weights.Length);
+        long previousSlice = MlxNative.DequantSliceBytes;
+        try
+        {
+            if (slices)
+                MlxNative.DequantSliceBytes = 5L * 2 * inDim;
+            Marshal.Copy(weights, 0, host, weights.Length);
+            using var allocator = new MlxAllocator();
+            using var inputTensor = Tensor.FromArray(allocator, input);
+            using var outputTensor = new Tensor(allocator, DType.Float32, rows, outDim);
+
+            Assert.True(MlxQuantizedOps.TryAddmmQuantizedToFloat32(
+                outputTensor, inputTensor, host, host, (int)GgmlTensorType.IQ4_XS, inDim, outDim, weights.Length));
+
+            AssertRelativelyClose(expected, outputTensor.GetElementsAsFloat(rows * outDim), 2e-3f);
+        }
+        finally
+        {
+            MlxNative.DequantSliceBytes = previousSlice;
+            Marshal.FreeHGlobal(host);
+        }
+    }
+
+    [MlxTheory]
+    [InlineData(8, 512, 13, false)]
+    [InlineData(37, 768, 16, false)]
+    [InlineData(8, 512, 13, true)]      // three slices of five output rows
+    public void MlxQuantizedMatmul_Q6KPrefillThroughF16MatchesDequantizedReference(int rows, int inDim, int outDim, bool slices)
+    {
+        // Past the matrix-vector rows, exact Q6_K is dequantized to F16 and multiplied
+        // by MLX's GEMM: the weight and the rows are rounded to F16, the sums are F32.
+        using var exact = new ExactMlxMatmul();
+        Assert.True(rows > MlxNative.Q6KMatvecMaxRows);
+        byte[] weights = CreateQ6KRows(outDim, inDim);
+        float[,] input = new float[rows, inDim];
+        for (int r = 0; r < rows; r++)
+            for (int c = 0; c < inDim; c++)
+                input[r, c] = MathF.Sin((c + 3) * 0.013f + r * 0.37f);
+
+        float[] expected = DequantizedMatmulK(weights, outDim, inDim, input, DequantizeQ6KRow);
+        IntPtr host = Marshal.AllocHGlobal(weights.Length);
+        long previousSlice = MlxNative.DequantSliceBytes;
+        try
+        {
+            if (slices)
+                MlxNative.DequantSliceBytes = 5L * 2 * inDim;
+            Marshal.Copy(weights, 0, host, weights.Length);
+            using var allocator = new MlxAllocator();
+            using var inputTensor = Tensor.FromArray(allocator, input);
+            using var outputTensor = new Tensor(allocator, DType.Float32, rows, outDim);
+
+            Assert.True(MlxQuantizedOps.TryAddmmQuantizedToFloat32(
+                outputTensor, inputTensor, host, host, (int)GgmlTensorType.Q6_K, inDim, outDim, weights.Length));
+
+            AssertRelativelyClose(expected, outputTensor.GetElementsAsFloat(rows * outDim), 2e-3f);
+        }
+        finally
+        {
+            MlxNative.DequantSliceBytes = previousSlice;
             Marshal.FreeHGlobal(host);
         }
     }
@@ -1082,6 +1273,7 @@ public class MlxBackendTests
     [MlxFact]
     public void MlxQuantizedMatmul_Q5KSingleRow4ColumnMatchesDequantizedReference()
     {
+        using var exact = new ExactMlxMatmul();
         const int rows = 1;
         const int inDim = 256;
         const int outDim = 5;
@@ -1123,6 +1315,7 @@ public class MlxBackendTests
     [MlxFact]
     public void MlxQuantizedMatmul_RmsNormFusedMatchesReference()
     {
+        using var exact = new ExactMlxMatmul();
         const int rows = 2;
         const int inDim = 256;
         const int outDim = 3;
@@ -1180,6 +1373,7 @@ public class MlxBackendTests
     [MlxFact]
     public void MlxQuantizedMatmul_AddIntoFusedMatchesReference()
     {
+        using var exact = new ExactMlxMatmul();
         const int rows = 2;
         const int inDim = 256;
         const int outDim = 4;
@@ -1703,6 +1897,670 @@ public class MlxBackendTests
         finally
         {
             Marshal.FreeHGlobal(host);
+        }
+    }
+
+    // --- Prefill/decode paths ported from omlx/mlx-lm (see MlxFusedOps.TryCachedAttention,
+    // MlxQuantizedOps.AffineQuantizedMatmul / TryRmsNormSwiGluAddHalf, GatedDeltaBlockedSource,
+    // MlxBasicOps.TryCopyIntoStridedBox). ---
+
+    [MlxFact]
+    public void MlxCachedAttention_DecodeReadsOnlyTheWrittenRowsOfAFloat16Cache()
+    {
+        const int heads = 4, kvHeads = 2, dim = 256, capacity = 16, kvLen = 11;
+        const float scale = 0.0625f;
+        float[,,] q = BuildHeadFirstInput(heads, 1, dim, 0.041f, useCos: false);
+        // Rows past kvLen hold other values: reading them would change the answer.
+        float[,,] kAll = BuildHeadFirstInput(kvHeads, capacity, dim, 0.025f, useCos: true);
+        float[,,] vAll = BuildHeadFirstInput(kvHeads, capacity, dim, 0.017f, useCos: false);
+
+        using var allocator = new MlxAllocator();
+        using var qTensor = Tensor.FromArray(allocator, FlattenHeadFirstSingleToken(q)).View(1, heads * dim);
+        using var kCache = new Tensor(allocator, DType.Float16, kvHeads, capacity, dim);
+        using var vCache = new Tensor(allocator, DType.Float16, kvHeads, capacity, dim);
+        using (var kSrc = Tensor.FromArray(allocator, kAll)) Ops.Copy(kCache, kSrc);
+        using (var vSrc = Tensor.FromArray(allocator, vAll)) Ops.Copy(vCache, vSrc);
+        using var actual = new Tensor(allocator, DType.Float32, 1, heads * dim);
+
+        Assert.True(MlxFusedOps.TryCachedAttention(actual, qTensor, kCache, vCache, heads, kvHeads, dim, 1, kvLen, scale));
+
+        float[] expected = HeadFirstAttentionReference(q, SliceSeq(kAll, kvLen), SliceSeq(vAll, kvLen), scale, causal: false);
+        AssertClose(expected, actual.GetElementsAsFloat(heads * dim), 2e-3f);
+    }
+
+    [MlxFact]
+    public void MlxCachedAttention_ChunkAfterAPrefixIsCausalFromItsOwnStart()
+    {
+        // A second prefill chunk: rows [7, 11) attend to the 7 cached rows and to
+        // their own lower triangle, as mlx-lm's "causal" mask aligned to the last key.
+        const int heads = 4, kvHeads = 2, dim = 256, capacity = 16, start = 7, chunk = 4;
+        const int kvLen = start + chunk;
+        const float scale = 0.0625f;
+        float[,,] q = BuildHeadFirstInput(heads, chunk, dim, 0.037f, useCos: false);
+        float[,,] kAll = BuildHeadFirstInput(kvHeads, capacity, dim, 0.023f, useCos: true);
+        float[,,] vAll = BuildHeadFirstInput(kvHeads, capacity, dim, 0.019f, useCos: false);
+        float[] qRows = new float[chunk * heads * dim];
+        for (int t = 0; t < chunk; t++)
+            for (int h = 0; h < heads; h++)
+                for (int d = 0; d < dim; d++)
+                    qRows[(t * heads + h) * dim + d] = q[h, t, d];
+
+        using var allocator = new MlxAllocator();
+        using var qTensor = Tensor.FromArray(allocator, qRows).View(chunk, heads * dim);
+        using var kCache = new Tensor(allocator, DType.Float16, kvHeads, capacity, dim);
+        using var vCache = new Tensor(allocator, DType.Float16, kvHeads, capacity, dim);
+        using (var kSrc = Tensor.FromArray(allocator, kAll)) Ops.Copy(kCache, kSrc);
+        using (var vSrc = Tensor.FromArray(allocator, vAll)) Ops.Copy(vCache, vSrc);
+        using var actual = new Tensor(allocator, DType.Float32, chunk, heads * dim);
+
+        Assert.True(MlxFusedOps.TryCachedAttention(actual, qTensor, kCache, vCache, heads, kvHeads, dim, chunk, kvLen, scale));
+
+        float[] expected = HeadFirstAttentionReference(q, SliceSeq(kAll, kvLen), SliceSeq(vAll, kvLen), scale, causal: true);
+        AssertClose(expected, actual.GetElementsAsFloat(chunk * heads * dim), 2e-3f);
+    }
+
+    [MlxTheory]
+    [InlineData(0, 9, 5, DType.Float16)]    // prefill longer than the window: explicit mask
+    [InlineData(7, 4, 5, DType.Float16)]    // chunk after a prefix: the view skips the first rows
+    [InlineData(13, 1, 5, DType.Float16)]   // decode past the window: view only, no mask
+    [InlineData(0, 4, 5, DType.Float16)]    // everything inside the window: plain causal
+    [InlineData(7, 4, 5, DType.Float32)]
+    [InlineData(7, 4, 0, DType.Float16)]    // a full-attention layer: sinks only
+    [InlineData(13, 1, 0, DType.Float16)]
+    public void MlxCachedAttention_SinksAndSlidingWindowMatchTheReference(int start, int chunk, int window, DType cacheType)
+    {
+        // gpt-oss attention: a per-head sink logit in the softmax and, on alternate
+        // layers, a sliding window of the last `window` positions (the query's own included).
+        const int heads = 4, kvHeads = 2, dim = 64, capacity = 24;
+        int kvLen = start + chunk;
+        const float scale = 0.125f;
+        float[] sinks = { 0.7f, -1.3f, 2.1f, 0.05f };
+        float[,,] q = BuildHeadFirstInput(heads, chunk, dim, 0.037f, useCos: false);
+        float[,,] kAll = BuildHeadFirstInput(kvHeads, capacity, dim, 0.023f, useCos: true);
+        float[,,] vAll = BuildHeadFirstInput(kvHeads, capacity, dim, 0.019f, useCos: false);
+        float[] qRows = new float[chunk * heads * dim];
+        for (int t = 0; t < chunk; t++)
+            for (int h = 0; h < heads; h++)
+                for (int d = 0; d < dim; d++)
+                    qRows[(t * heads + h) * dim + d] = q[h, t, d];
+
+        using var allocator = new MlxAllocator();
+        using var qTensor = Tensor.FromArray(allocator, qRows).View(chunk, heads * dim);
+        using var kCache = new Tensor(allocator, cacheType, kvHeads, capacity, dim);
+        using var vCache = new Tensor(allocator, cacheType, kvHeads, capacity, dim);
+        using (var kSrc = Tensor.FromArray(allocator, kAll)) Ops.Copy(kCache, kSrc);
+        using (var vSrc = Tensor.FromArray(allocator, vAll)) Ops.Copy(vCache, vSrc);
+        using var sinkTensor = Tensor.FromArray(allocator, sinks);
+        using var actual = new Tensor(allocator, DType.Float32, chunk, heads * dim);
+
+        Assert.True(MlxFusedOps.TryCachedAttention(actual, qTensor, kCache, vCache, heads, kvHeads, dim,
+            chunk, kvLen, scale, sinkTensor, window));
+
+        float[] expected = HeadFirstAttentionReference(q, SliceSeq(kAll, kvLen), SliceSeq(vAll, kvLen), scale,
+            causal: true, sinks, window);
+        AssertClose(expected, actual.GetElementsAsFloat(chunk * heads * dim), cacheType == DType.Float32 ? 1e-4f : 2e-3f);
+    }
+
+    [MlxFact]
+    public void MlxCopyIntoAnInnerAxisNarrow_WritesTheBoxOnDevice()
+    {
+        // The KV-cache growth copy: old rows into Narrow(1, 0, n) of the grown cache.
+        using var allocator = new MlxAllocator();
+        using var grown = new Tensor(allocator, DType.Float16, 2, 6, 4);
+        Ops.Fill(grown, -1f);
+        float[,,] old = new float[2, 3, 4];
+        for (int h = 0; h < 2; h++)
+            for (int t = 0; t < 3; t++)
+                for (int d = 0; d < 4; d++)
+                    old[h, t, d] = h * 100 + t * 10 + d;
+        using var src = Tensor.FromArray(allocator, old);
+        using (var box = grown.Narrow(1, 2, 3))
+        {
+            Assert.True(MlxBasicOps.TryGetStridedBox(box, out int[] parent, out int[] starts, out int[] stops));
+            Assert.Equal(new[] { 2, 6, 4 }, parent);
+            Assert.Equal(new[] { 0, 2, 0 }, starts);
+            Assert.Equal(new[] { 2, 5, 4 }, stops);
+            Ops.Copy(box, src);
+        }
+
+        float[] actual = grown.GetElementsAsFloat(48);
+        for (int h = 0; h < 2; h++)
+            for (int t = 0; t < 6; t++)
+                for (int d = 0; d < 4; d++)
+                {
+                    float expected = t >= 2 && t < 5 ? h * 100 + (t - 2) * 10 + d : -1f;
+                    Assert.Equal(expected, actual[(h * 6 + t) * 4 + d]);
+                }
+    }
+
+    [MlxFact]
+    public void MlxFill_Float16AndBoxViewsStayOnTheDevice()
+    {
+        // An F16 KV cache is zeroed on every allocation and reset; that used to go
+        // element by element through the host.
+        using var allocator = new MlxAllocator();
+        long before = MlxCpuFallback.InvocationsOnThisThread;
+        using var half = new Tensor(allocator, DType.Float16, 2, 6, 4);
+        Ops.Fill(half, 3f);
+        using (var box = half.Narrow(1, 2, 3))
+            Ops.Fill(box, -1f);
+        using var single = new Tensor(allocator, DType.Float32, 3, 5);
+        Ops.Fill(single, 0.5f);
+        using (var tail = single.Narrow(0, 1, 2))
+            Ops.Fill(tail, 2f);
+        Assert.Equal(before, MlxCpuFallback.InvocationsOnThisThread);
+
+        float[] h = half.GetElementsAsFloat(48);
+        for (int a = 0; a < 2; a++)
+            for (int t = 0; t < 6; t++)
+                for (int d = 0; d < 4; d++)
+                    Assert.Equal(t >= 2 && t < 5 ? -1f : 3f, h[(a * 6 + t) * 4 + d]);
+        float[] f = single.GetElementsAsFloat(15);
+        for (int i = 0; i < 15; i++)
+            Assert.Equal(i < 5 ? 0.5f : 2f, f[i]);
+    }
+
+    [MlxFact]
+    public void MlxStridedBox_RejectsViewsThatAreNotABox()
+    {
+        using var allocator = new MlxAllocator();
+        using var tensor = new Tensor(allocator, DType.Float32, 3, 4);
+        using var transposed = tensor.Transpose();
+        Assert.False(MlxBasicOps.TryGetStridedBox(transposed, out _, out _, out _));
+        using var expanded = Tensor.FromArray(allocator, new float[] { 1, 2, 3 }).View(1, 3).Expand(4, 3);
+        Assert.False(MlxBasicOps.TryGetStridedBox(expanded, out _, out _, out _));
+    }
+
+    [MlxFact]
+    public void MlxQuantizedMatmul_Q80PrefillRowsMatchTheDequantizedReference()
+    {
+        // 48 rows takes the half-precision path (AffineQuantizedMatmul): F16 activations,
+        // F32 accumulation, like ggml-metal's mul_mm.
+        const int rows = 48, inDim = 128, outDim = 24;
+        byte[] weights = CreateQ80Rows(outDim, inDim, (r, c) => (sbyte)(((r + 2) * (c - 23)) % 57), r => 0.02f + r * 0.004f);
+        float[,] input = new float[rows, inDim];
+        for (int r = 0; r < rows; r++)
+            for (int c = 0; c < inDim; c++)
+                input[r, c] = MathF.Sin((r + 1) * (c + 3) * 0.037f);
+        float[] expected = DequantizedMatmulQ80(weights, outDim, inDim, input);
+
+        IntPtr host = Marshal.AllocHGlobal(weights.Length);
+        try
+        {
+            Marshal.Copy(weights, 0, host, weights.Length);
+            using var allocator = new MlxAllocator();
+            using var inputTensor = Tensor.FromArray(allocator, input);
+            using var outputTensor = new Tensor(allocator, DType.Float32, rows, outDim);
+            Assert.True(MlxQuantizedOps.TryAddmmQuantizedToFloat32(
+                outputTensor, inputTensor, host, host, (int)GgmlTensorType.Q8_0, inDim, outDim, weights.Length));
+
+            AssertRelativelyClose(expected, outputTensor.GetElementsAsFloat(rows * outDim), 3e-3f);
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(host);
+        }
+    }
+
+    [MlxFact]
+    public void MlxHalfSwiGluFfn_MatchesTheF32Reference()
+    {
+        const int rows = 40, hidden = 64, inter = 96;
+        const float eps = 1e-6f;
+        byte[] gateUp = CreateQ80Rows(2 * inter, hidden, (r, c) => (sbyte)(((r * 7 + c * 3) % 61) - 30), r => 0.01f + (r % 5) * 0.002f);
+        byte[] down = CreateQ80Rows(hidden, inter, (r, c) => (sbyte)(((r * 5 - c * 11) % 53) - 26), r => 0.012f + (r % 3) * 0.003f);
+        float[,] residual = new float[rows, hidden];
+        for (int r = 0; r < rows; r++)
+            for (int c = 0; c < hidden; c++)
+                residual[r, c] = MathF.Cos((r + 2) * (c + 1) * 0.029f) * 2f;
+        float[] norm = new float[hidden];
+        for (int c = 0; c < hidden; c++)
+            norm[c] = 0.8f + (c % 9) * 0.05f;
+
+        // Reference: rms_norm -> gate|up -> silu(gate) * up -> down -> + residual, all F32.
+        float[,] normed = new float[rows, hidden];
+        for (int r = 0; r < rows; r++)
+        {
+            double ss = 0;
+            for (int c = 0; c < hidden; c++) ss += residual[r, c] * residual[r, c];
+            float inv = 1f / MathF.Sqrt((float)(ss / hidden) + eps);
+            for (int c = 0; c < hidden; c++) normed[r, c] = residual[r, c] * inv * norm[c];
+        }
+        float[] gu = DequantizedMatmulQ80(gateUp, 2 * inter, hidden, normed);
+        float[,] act = new float[rows, inter];
+        for (int r = 0; r < rows; r++)
+            for (int c = 0; c < inter; c++)
+            {
+                float g = gu[r * 2 * inter + c], u = gu[r * 2 * inter + inter + c];
+                act[r, c] = g / (1f + MathF.Exp(-g)) * u;
+            }
+        float[] dn = DequantizedMatmulQ80(down, hidden, inter, act);
+        float[] expected = new float[rows * hidden];
+        for (int r = 0; r < rows; r++)
+            for (int c = 0; c < hidden; c++)
+                expected[r * hidden + c] = residual[r, c] + dn[r * hidden + c];
+
+        IntPtr gateUpHost = Marshal.AllocHGlobal(gateUp.Length);
+        IntPtr downHost = Marshal.AllocHGlobal(down.Length);
+        try
+        {
+            Marshal.Copy(gateUp, 0, gateUpHost, gateUp.Length);
+            Marshal.Copy(down, 0, downHost, down.Length);
+            using var allocator = new MlxAllocator();
+            using var residualTensor = Tensor.FromArray(allocator, residual);
+            using var normTensor = Tensor.FromArray(allocator, norm);
+
+            Assert.True(MlxQuantizedOps.TryRmsNormSwiGluAddHalf(
+                residualTensor, normTensor, eps, inter,
+                gateUpHost, gateUpHost, (int)GgmlTensorType.Q8_0, hidden, 2 * inter, gateUp.Length,
+                downHost, downHost, (int)GgmlTensorType.Q8_0, inter, hidden, down.Length));
+
+            AssertRelativelyClose(expected, residualTensor.GetElementsAsFloat(rows * hidden), 5e-3f);
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(gateUpHost);
+            Marshal.FreeHGlobal(downHost);
+        }
+    }
+
+    [MlxFact]
+    public void MlxHalfSwiGluSplitFfn_MixedFormatsMatchTheF32Reference()
+    {
+        // A mixed-quant pair kept as two weights (IQ4_XS gate, affine Q8_0 up) and a raw
+        // Q6_K down: two of the three go through the F16 dequantize + GEMM path.
+        const int rows = 40, hidden = 256, inter = 256;
+        const float eps = 1e-6f;
+        byte[] gate = CreateIq4XsRows(inter, hidden);
+        byte[] up = CreateQ80Rows(inter, hidden, (r, c) => (sbyte)(((r * 7 + c * 3) % 61) - 30), r => 0.01f + (r % 5) * 0.002f);
+        byte[] down = CreateQ6KRows(hidden, inter);
+        float[,] residual = new float[rows, hidden];
+        for (int r = 0; r < rows; r++)
+            for (int c = 0; c < hidden; c++)
+                residual[r, c] = MathF.Cos((r + 2) * (c + 1) * 0.029f) * 2f;
+        float[] norm = new float[hidden];
+        for (int c = 0; c < hidden; c++)
+            norm[c] = (0.8f + (c % 9) * 0.05f) * 0.01f;   // these test weights are large; keep F16 in range
+
+        float[,] normed = new float[rows, hidden];
+        for (int r = 0; r < rows; r++)
+        {
+            double ss = 0;
+            for (int c = 0; c < hidden; c++) ss += residual[r, c] * residual[r, c];
+            float inv = 1f / MathF.Sqrt((float)(ss / hidden) + eps);
+            for (int c = 0; c < hidden; c++) normed[r, c] = residual[r, c] * inv * norm[c];
+        }
+        float[] g = DequantizedMatmulIq4Xs(gate, inter, hidden, normed);
+        float[] u = DequantizedMatmulQ80(up, inter, hidden, normed);
+        float[,] act = new float[rows, inter];
+        for (int r = 0; r < rows; r++)
+            for (int c = 0; c < inter; c++)
+            {
+                float gv = g[r * inter + c];
+                act[r, c] = gv / (1f + MathF.Exp(-gv)) * u[r * inter + c];
+            }
+        float[] dn = DequantizedMatmulK(down, hidden, inter, act, DequantizeQ6KRow);
+        // The FFN has to move the residual by far more than the tolerance, or a broken
+        // one would pass.
+        Assert.True(dn.Max(MathF.Abs) > 2f, $"FFN contribution too small to test: {dn.Max(MathF.Abs)}");
+        float[] expected = new float[rows * hidden];
+        for (int r = 0; r < rows; r++)
+            for (int c = 0; c < hidden; c++)
+                expected[r * hidden + c] = residual[r, c] + dn[r * hidden + c];
+
+        using var exact = new ExactMlxMatmul();   // raw Q6_K, not the 8-bit regroup
+        IntPtr gateHost = Marshal.AllocHGlobal(gate.Length);
+        IntPtr upHost = Marshal.AllocHGlobal(up.Length);
+        IntPtr downHost = Marshal.AllocHGlobal(down.Length);
+        try
+        {
+            Marshal.Copy(gate, 0, gateHost, gate.Length);
+            Marshal.Copy(up, 0, upHost, up.Length);
+            Marshal.Copy(down, 0, downHost, down.Length);
+            using var allocator = new MlxAllocator();
+            using var residualTensor = Tensor.FromArray(allocator, residual);
+            using var normTensor = Tensor.FromArray(allocator, norm);
+
+            MlxQuantizedOps.HalfMatmulMinRows = 1;
+            Assert.True(MlxQuantizedOps.TryRmsNormSwiGluAddHalfSplit(
+                residualTensor, normTensor, eps,
+                gateHost, gateHost, (int)GgmlTensorType.IQ4_XS, hidden, inter, gate.Length,
+                upHost, upHost, (int)GgmlTensorType.Q8_0, hidden, inter, up.Length,
+                downHost, downHost, (int)GgmlTensorType.Q6_K, inter, hidden, down.Length));
+
+            AssertRelativelyClose(expected, residualTensor.GetElementsAsFloat(rows * hidden), 5e-3f);
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(gateHost);
+            Marshal.FreeHGlobal(upHost);
+            Marshal.FreeHGlobal(downHost);
+        }
+    }
+
+    [MlxFact]
+    public unsafe void MlxGatedDeltaNetCache_ExportsImportsAndClonesItsState()
+    {
+        // The recurrent state a Qwen 3.5 holder carries on MLX: conv tail [convTail, qkvDim]
+        // oldest-first, delta [Hv, Dv, Dk]. Checkpoints and swaps move it through these.
+        const int convTail = 3, qkvDim = 40, hv = 2, dv = 4, dk = 8;
+        float[] conv = new float[convTail * qkvDim];
+        float[] delta = new float[hv * dv * dk];
+        for (int i = 0; i < conv.Length; i++) conv[i] = i * 0.5f - 7f;
+        for (int i = 0; i < delta.Length; i++) delta[i] = MathF.Sin(i * 0.3f);
+
+        using var cache = new MlxFusedOps.GatedDeltaNetCache();
+        Assert.False(cache.HasState);
+        fixed (float* c = conv)
+        fixed (float* d = delta)
+            cache.ImportState(c, convTail, qkvDim, d, hv, dv, dk);
+        Assert.True(cache.HasState);
+
+        using var clone = cache.CloneState();
+        cache.Reset();
+
+        float[] convOut = new float[conv.Length];
+        float[] deltaOut = new float[delta.Length];
+        fixed (float* c = convOut)
+        fixed (float* d = deltaOut)
+            clone.ExportState(c, convOut.Length, d, deltaOut.Length);
+        Assert.Equal(conv, convOut);
+        Assert.Equal(delta, deltaOut);
+
+        // A reset cache exports the implicit zero state.
+        Array.Fill(convOut, 1f);
+        Array.Fill(deltaOut, 1f);
+        fixed (float* c = convOut)
+        fixed (float* d = deltaOut)
+            cache.ExportState(c, convOut.Length, d, deltaOut.Length);
+        Assert.All(convOut, v => Assert.Equal(0f, v));
+        Assert.All(deltaOut, v => Assert.Equal(0f, v));
+    }
+
+    [MlxFact]
+    public unsafe void MlxViewHostCopies_RoundTripACacheBox()
+    {
+        using var allocator = new MlxAllocator();
+        using var cache = new Tensor(allocator, DType.Float16, 2, 8, 4);
+        Ops.Fill(cache, 0f);
+        float[] rows = new float[2 * 3 * 4];
+        for (int i = 0; i < rows.Length; i++) rows[i] = i - 5;
+        System.Half[] half = rows.Select(v => (System.Half)v).ToArray();
+        using (var box = cache.Narrow(1, 0, 3))
+        fixed (System.Half* p = half)
+            Assert.True(MlxFusedOps.TryWriteViewFromHost(box, (IntPtr)p, half.Length * sizeof(System.Half)));
+
+        System.Half[] back = new System.Half[half.Length];
+        using (var box = cache.Narrow(1, 0, 3))
+        fixed (System.Half* p = back)
+            Assert.True(MlxFusedOps.TryCopyViewToHost(box, (IntPtr)p, back.Length * sizeof(System.Half)));
+        Assert.Equal(half, back);
+
+        float[] all = cache.GetElementsAsFloat(2 * 8 * 4);
+        for (int h = 0; h < 2; h++)
+            for (int t = 0; t < 8; t++)
+                for (int d = 0; d < 4; d++)
+                    Assert.Equal(t < 3 ? rows[(h * 3 + t) * 4 + d] : 0f, all[(h * 8 + t) * 4 + d]);
+    }
+
+    [MlxFact]
+    public void MlxQwen35PackedGdnPrefill_MatchesTokenByTokenDecode()
+    {
+        // Qwen3.5-shaped heads (128) take the blocked prefill kernel; 37 tokens leave a
+        // partial 16-step block, and two key heads shared by four value heads exercise
+        // the tiled head mapping (value head hv reads key head hv % Hk). The reference
+        // is the same layer fed one token at a time, which runs the T = 1 kernel, and
+        // then one more token through each cache to compare the carried state.
+        string previousNative = Environment.GetEnvironmentVariable("TS_MLX_GDN_NATIVE");
+        Environment.SetEnvironmentVariable("TS_MLX_GDN_NATIVE", null);
+        try
+        {
+            const int seqLen = 37, numKeyHeads = 2, numValueHeads = 4, headDim = 128, convKernel = 4;
+            const int keyDim = numKeyHeads * headDim, valueDim = numValueHeads * headDim;
+            const int qkvDim = keyDim * 2 + valueDim, packedDim = qkvDim + valueDim + numValueHeads * 2;
+            float[,] packed = new float[seqLen + 1, packedDim];
+            for (int t = 0; t <= seqLen; t++)
+                for (int i = 0; i < packedDim; i++)
+                    packed[t, i] = MathF.Sin((t + 1) * 0.31f + (i + 1) * 0.013f) * (i < qkvDim ? 0.6f : 0.4f);
+            float[,] convWeight = new float[qkvDim, convKernel];
+            for (int i = 0; i < qkvDim; i++)
+                for (int k = 0; k < convKernel; k++)
+                    convWeight[i, k] = 0.15f + 0.1f * k + (i % 5) * 0.01f;
+            float[] dtBias = new float[numValueHeads], aLog = new float[numValueHeads], norm = new float[headDim];
+            for (int h = 0; h < numValueHeads; h++) { dtBias[h] = 0.05f * h; aLog[h] = -0.3f - 0.1f * h; }
+            Array.Fill(norm, 1.0f);
+
+            using var allocator = new MlxAllocator();
+            using var conv = Tensor.FromArray(allocator, convWeight);
+            using var dt = Tensor.FromArray(allocator, dtBias);
+            using var a = Tensor.FromArray(allocator, aLog);
+            using var n = Tensor.FromArray(allocator, norm);
+            using var prefillCache = new MlxFusedOps.GatedDeltaNetCache();
+            using var stepCache = new MlxFusedOps.GatedDeltaNetCache();
+
+            float[] RunRows(MlxFusedOps.GatedDeltaNetCache cache, int first, int count)
+            {
+                float[,] rows = new float[count, packedDim];
+                for (int t = 0; t < count; t++)
+                    for (int i = 0; i < packedDim; i++)
+                        rows[t, i] = packed[first + t, i];
+                using var input = Tensor.FromArray(allocator, rows);
+                using var output = new Tensor(allocator, DType.Float32, count, valueDim);
+                Assert.True(cache.TryRunQwen35Packed(output, input, conv, dt, a, n,
+                    count, packedDim, qkvDim, keyDim, valueDim, numKeyHeads, numValueHeads, headDim, headDim, convKernel, 1e-6f));
+                return output.GetElementsAsFloat(count * valueDim);
+            }
+
+            float[] prefill = RunRows(prefillCache, 0, seqLen);
+            float[] stepped = new float[seqLen * valueDim];
+            for (int t = 0; t < seqLen; t++)
+                Array.Copy(RunRows(stepCache, t, 1), 0, stepped, t * valueDim, valueDim);
+            AssertClose(stepped, prefill, 2e-4f);
+
+            AssertClose(RunRows(stepCache, seqLen, 1), RunRows(prefillCache, seqLen, 1), 2e-4f);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("TS_MLX_GDN_NATIVE", previousNative);
+        }
+    }
+
+    [MlxFact]
+    public void MlxGeluMulSplit_StaysFiniteForLargeGates()
+    {
+        // From MLX 0.32 on macOS 27 a bare tanh() in a custom kernel is the fast form,
+        // which returns NaN past |x| ~ 44; Gemma 4 E4B's layer-0 FFN gates reach ~680
+        // and every logit went NaN. gelu(x) -> x for large x, gelu(x) -> 0 for very
+        // negative x.
+        float[] gates = { -700f, -60f, -8f, -1f, 0f, 0.5f, 3f, 12f, 60f, 700f };
+        float[,] gateUp = new float[1, gates.Length * 2];
+        float[] expected = new float[gates.Length];
+        for (int i = 0; i < gates.Length; i++)
+        {
+            float g = gates[i];
+            float up = 0.25f + i * 0.1f;
+            gateUp[0, i] = g;
+            gateUp[0, gates.Length + i] = up;
+            double inner = 0.7978845608 * (g + 0.044715 * g * g * g);
+            expected[i] = (float)(0.5 * g * (1.0 + Math.Tanh(inner)) * up);
+        }
+
+        using var allocator = new MlxAllocator();
+        using var input = Tensor.FromArray(allocator, gateUp);
+        using var output = new Tensor(allocator, DType.Float32, 1, gates.Length);
+        Assert.True(MlxFusedOps.TryGeluMulSplit(output, input, gates.Length));
+
+        float[] actual = output.GetElementsAsFloat(gates.Length);
+        Assert.All(actual, v => Assert.True(float.IsFinite(v), $"non-finite GELU output {v}"));
+        AssertRelativelyClose(expected, actual, 1e-4f);
+    }
+
+    [MlxFact]
+    public void MlxQuantizedMatmul_Q6KRegroupedToAffine8StaysWithinItsBound()
+    {
+        // The default regroups Q6_K (16-value scales) to MLX 8-bit affine over 32 values, so
+        // each weight may move by up to half an 8-bit step of its group, plus the F16
+        // rounding of the group's scale and bias. On top of that the activations and the
+        // output are F16 (HalfMatmulMinRows). The bound is computed from the data.
+        const int rows = 3, inDim = 512, outDim = 8, group = 32;
+        const float half = 1f / 2048f;
+        byte[] weights = CreateQ6KRows(outDim, inDim);
+        float[,] input = new float[rows, inDim];
+        for (int r = 0; r < rows; r++)
+            for (int c = 0; c < inDim; c++)
+                input[r, c] = MathF.Cos((r + 1) * (c + 1) * 0.017f);
+        float[] expected = DequantizedMatmulK(weights, outDim, inDim, input, DequantizeQ6KRow);
+
+        float[] dense = new float[outDim * inDim];
+        for (int o = 0; o < outDim; o++)
+            DequantizeQ6KRow(weights, o, inDim, dense, o * inDim);
+        float[] weightError = new float[dense.Length];
+        for (int o = 0; o < outDim; o++)
+            for (int g = 0; g < inDim; g += group)
+            {
+                float min = float.PositiveInfinity, max = float.NegativeInfinity;
+                for (int i = 0; i < group; i++)
+                {
+                    min = MathF.Min(min, dense[o * inDim + g + i]);
+                    max = MathF.Max(max, dense[o * inDim + g + i]);
+                }
+                float step = (max - min) / 255f;
+                float err = 0.5f * step + (MathF.Abs(min) + 255f * step) * half;
+                for (int i = 0; i < group; i++)
+                    weightError[o * inDim + g + i] = err;
+            }
+
+        IntPtr host = Marshal.AllocHGlobal(weights.Length);
+        bool previous = MlxQuantizedOps.PreferAffine8Q6K;
+        try
+        {
+            MlxQuantizedOps.PreferAffine8Q6K = true;
+            MlxQuantizedOps.ClearDeviceCache(0);
+            Marshal.Copy(weights, 0, host, weights.Length);
+            using var allocator = new MlxAllocator();
+            using var inputTensor = Tensor.FromArray(allocator, input);
+            using var outputTensor = new Tensor(allocator, DType.Float32, rows, outDim);
+            Assert.True(MlxQuantizedOps.TryAddmmQuantizedToFloat32(
+                outputTensor, inputTensor, host, host, (int)GgmlTensorType.Q6_K, inDim, outDim, weights.Length));
+            float[] actual = outputTensor.GetElementsAsFloat(rows * outDim);
+
+            for (int r = 0; r < rows; r++)
+                for (int o = 0; o < outDim; o++)
+                {
+                    double bound = 1e-4;
+                    for (int i = 0; i < inDim; i++)
+                    {
+                        float x = MathF.Abs(input[r, i]);
+                        bound += x * (weightError[o * inDim + i] + 2 * MathF.Abs(dense[o * inDim + i]) * half);
+                    }
+                    float want = expected[r * outDim + o];
+                    bound += MathF.Abs(want) * 2 * half;
+                    Assert.True(MathF.Abs(actual[r * outDim + o] - want) <= bound,
+                        $"[{r},{o}] expected {want}, actual {actual[r * outDim + o]}, bound {bound}");
+                }
+        }
+        finally
+        {
+            MlxQuantizedOps.PreferAffine8Q6K = previous;
+            MlxQuantizedOps.ClearDeviceCache(0);
+            Marshal.FreeHGlobal(host);
+        }
+    }
+
+    [MlxFact]
+    public void MlxQuantizedMatmul_HalfPrecisionRowsStayWithinF16OfTheReference()
+    {
+        // A two-row affine matmul takes the default half-precision path (one row would take
+        // the custom Q8_0 kernel): F16 activations and output, F32 accumulation. Each term
+        // may move by one F16 rounding of its activation, and the result by one of its own.
+        const int rows = 2, inDim = 256, outDim = 16;
+        const float half = 1f / 2048f;
+        byte[] weights = CreateQ80Rows(outDim, inDim, (r, c) => (sbyte)(((r + 3) * (c - 41)) % 113), r => 0.03f + r * 0.01f);
+        float[,] input = new float[rows, inDim];
+        for (int r = 0; r < rows; r++)
+            for (int c = 0; c < inDim; c++)
+                input[r, c] = MathF.Sin((r + 2) * (c + 5) * 0.023f) * 3f;
+        float[] expected = DequantizedMatmulQ80(weights, outDim, inDim, input);
+        float[] dense = new float[outDim * inDim];
+        for (int o = 0; o < outDim; o++)
+            DequantizeQ80Row(weights, o, inDim, dense, o * inDim);
+
+        IntPtr host = Marshal.AllocHGlobal(weights.Length);
+        try
+        {
+            Marshal.Copy(weights, 0, host, weights.Length);
+            using var allocator = new MlxAllocator();
+            using var inputTensor = Tensor.FromArray(allocator, input);
+            using var outputTensor = new Tensor(allocator, DType.Float32, rows, outDim);
+            Assert.True(MlxQuantizedOps.TryAddmmQuantizedToFloat32(
+                outputTensor, inputTensor, host, host, (int)GgmlTensorType.Q8_0, inDim, outDim, weights.Length));
+            float[] actual = outputTensor.GetElementsAsFloat(rows * outDim);
+
+            for (int r = 0; r < rows; r++)
+                for (int o = 0; o < outDim; o++)
+                {
+                    double bound = 1e-4;
+                    for (int i = 0; i < inDim; i++)
+                        bound += MathF.Abs(input[r, i] * dense[o * inDim + i]) * 2 * half;
+                    float want = expected[r * outDim + o];
+                    bound += MathF.Abs(want) * 2 * half;
+                    Assert.True(MathF.Abs(actual[r * outDim + o] - want) <= bound,
+                        $"[{r},{o}] expected {want}, actual {actual[r * outDim + o]}, bound {bound}");
+                }
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(host);
+        }
+    }
+
+    /// <summary>
+    /// The kernels' exactness tests compare against an F32 dequantized reference, so they pin
+    /// the configuration that reference describes: F32 activations and the lossless Q6_K
+    /// kernel. The defaults (half-precision activations, Q6_K regrouped to 8-bit) have their
+    /// own tests with their own bounds. Clears the weight cache on both edges so no weight
+    /// built under one setting is served under the other.
+    /// </summary>
+    private sealed class ExactMlxMatmul : IDisposable
+    {
+        private readonly int _halfMinRows = MlxQuantizedOps.HalfMatmulMinRows;
+        private readonly bool _q6kAffine8 = MlxQuantizedOps.PreferAffine8Q6K;
+
+        public ExactMlxMatmul()
+        {
+            MlxQuantizedOps.HalfMatmulMinRows = int.MaxValue;
+            MlxQuantizedOps.PreferAffine8Q6K = false;
+            MlxQuantizedOps.ClearDeviceCache(0);
+        }
+
+        public void Dispose()
+        {
+            MlxQuantizedOps.HalfMatmulMinRows = _halfMinRows;
+            MlxQuantizedOps.PreferAffine8Q6K = _q6kAffine8;
+            MlxQuantizedOps.ClearDeviceCache(0);
+        }
+    }
+
+    private static float[,,] SliceSeq(float[,,] input, int length)
+    {
+        float[,,] result = new float[input.GetLength(0), length, input.GetLength(2)];
+        for (int h = 0; h < input.GetLength(0); h++)
+            for (int t = 0; t < length; t++)
+                for (int d = 0; d < input.GetLength(2); d++)
+                    result[h, t, d] = input[h, t, d];
+        return result;
+    }
+
+    private static void AssertRelativelyClose(IReadOnlyList<float> expected, IReadOnlyList<float> actual, float relative)
+    {
+        Assert.Equal(expected.Count, actual.Count);
+        float scaleRef = 0;
+        foreach (float e in expected) scaleRef = MathF.Max(scaleRef, MathF.Abs(e));
+        for (int i = 0; i < expected.Count; i++)
+        {
+            float bound = relative * MathF.Max(scaleRef, 1f);
+            Assert.True(MathF.Abs(expected[i] - actual[i]) <= bound,
+                $"index {i}: expected {expected[i]}, actual {actual[i]} (bound {bound})");
         }
     }
 
@@ -2951,7 +3809,8 @@ public class MlxBackendTests
         return result;
     }
 
-    private static float[] HeadFirstAttentionReference(float[,,] q, float[,,] k, float[,,] v, float scale, bool causal)
+    private static float[] HeadFirstAttentionReference(float[,,] q, float[,,] k, float[,,] v, float scale, bool causal,
+        float[] sinks = null, int window = 0)
     {
         int heads = q.GetLength(0);
         int seqQ = q.GetLength(1);
@@ -2970,7 +3829,8 @@ public class MlxBackendTests
                 float max = float.NegativeInfinity;
                 for (int tk = 0; tk < seqK; tk++)
                 {
-                    bool masked = causal && tk > tq + (seqK - seqQ);
+                    int queryPos = tq + (seqK - seqQ);
+                    bool masked = (causal && tk > queryPos) || (window > 0 && queryPos - tk >= window);
                     float score = masked ? float.NegativeInfinity : 0f;
                     if (!masked)
                     {
@@ -2983,7 +3843,9 @@ public class MlxBackendTests
                     max = MathF.Max(max, score);
                 }
 
-                float denom = 0;
+                if (sinks != null)
+                    max = MathF.Max(max, sinks[h]);
+                float denom = sinks != null ? MathF.Exp(sinks[h] - max) : 0f;
                 for (int tk = 0; tk < seqK; tk++)
                 {
                     scores[tk] = float.IsNegativeInfinity(scores[tk])

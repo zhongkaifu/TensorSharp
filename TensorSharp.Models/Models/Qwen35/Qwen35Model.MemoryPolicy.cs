@@ -81,6 +81,8 @@ namespace TensorSharp.Models
                     if (state != null) bytes = checked(bytes + (long)state.Length * sizeof(float));
             if (holder.ConvWriteIdx != null) bytes = checked(bytes + (long)holder.ConvWriteIdx.Length * sizeof(int));
             if (holder.Logits != null) bytes = checked(bytes + (long)holder.Logits.Length * sizeof(float));
+            // MLX GDN caches (conv tail + delta state per recurrent layer).
+            bytes = checked(bytes + holder.MlxGdnStateBytes);
             // ConvScratch contains the same number of floats as the host conv rings.
             if (holder.ConvScratch != IntPtr.Zero && holder.ConvState != null)
                 foreach (float[] state in holder.ConvState)

@@ -64,7 +64,8 @@ public class WebUiChatServiceTests : IDisposable
     private ServerHostingOptions Options(
         bool skillsAllowScripts = false,
         bool skillsAllowNetwork = false,
-        SkillSandboxMode skillsSandbox = SkillSandboxMode.Required) => new(
+        SkillSandboxMode skillsSandbox = SkillSandboxMode.Required,
+        bool skillsEnabled = true) => new(
         startupModelPath: Path.Combine(_baseDir, "models", "foo.gguf"),
         startupMmProjPath: Path.Combine(_baseDir, "models", "mmproj-foo.gguf"),
         defaultBackend: "ggml_cpu",
@@ -81,6 +82,7 @@ public class WebUiChatServiceTests : IDisposable
         logDirectory: Path.Combine(_baseDir, "logs"),
         fileLoggingEnabled: false,
         samplingDefaults: null,
+        skillsEnabled: skillsEnabled,
         skillsAllowScripts: skillsAllowScripts,
         skillsSandbox: skillsSandbox,
         skillsAllowNetwork: skillsAllowNetwork);
@@ -450,6 +452,110 @@ public class WebUiChatServiceTests : IDisposable
         // model check, so a New Chat on a model-less server still clears the desk.
         Assert.Equal(400, ex.StatusCode);
         Assert.Equal(0, session.TrackedTurnCount);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task StatelessCodeRequestsStageInputsInDistinctWorkspacesAndReleaseThem(bool newChat)
+    {
+        string modelPath = WriteMinimalGguf("stateless-workspace.gguf");
+        using var model = new ModelService(NullLogger<ModelService>.Instance,
+            (path, _, _, _) => new ContextReportingModel(path, 8192, 8192));
+        model.LoadModel(modelPath, null, "cpu");
+        string workspaceRoot = Path.Combine(_baseDir, "stateless-workspaces");
+        var manager = new SessionWorkspaceManager(workspaceRoot);
+        var runner = new WorkspaceDeclarationRunner();
+        File.WriteAllText(Path.Combine(_baseDir, "seed.txt"), "selected request input");
+        var service = new WebUiChatService(model, new SessionManager(), Options(skillsEnabled: false),
+            new UploadStoragePolicy(_baseDir), new SkillRegistry(new SkillRegistryOptions { Roots = [] }),
+            runner, manager, codeArtifacts: null, NullLoggerFactory.Instance);
+        var roots = new List<string>();
+        service.OnChatRequest = (_, _) =>
+        {
+            Assert.True(runner.Persists);
+            Assert.Contains(SkillToolNames.ReadFile, runner.DeclaredNames);
+            Assert.Contains(SkillToolNames.ApplyPatch, runner.DeclaredNames);
+            Assert.Contains(SkillToolNames.WriteFile, runner.DeclaredNames);
+            string liveRoot = Assert.Single(Directory.GetDirectories(workspaceRoot, SessionWorkspace.DirectoryPrefix + "*"));
+            roots.Add(liveRoot);
+            string staged = Assert.Single(Directory.GetFiles(liveRoot, "seed.txt", SearchOption.AllDirectories));
+            Assert.Equal("selected request input", File.ReadAllText(staged));
+            string marker = Path.Combine(Path.GetDirectoryName(staged)!, "prior-request.txt");
+            Assert.False(File.Exists(marker));
+            File.WriteAllText(marker, "must not survive this request");
+            // Stop after real planning and input staging, before the fixture's absent engine.
+            throw new StopBeforeGenerationException();
+        };
+        JsonElement body = Json(JsonSerializer.Serialize(new
+        {
+            newChat,
+            messages = new[] { new { role = "user", content = "Inspect the staged input.", textFilePaths = new[] { "seed.txt" } } },
+        }));
+        for (int attempt = 0; attempt < 2; attempt++)
+        {
+            await Assert.ThrowsAsync<StopBeforeGenerationException>(async () =>
+            {
+                await foreach (object _ in service.ChatStreamAsync(body, CancellationToken.None)) { }
+            });
+            Assert.Empty(Directory.GetDirectories(workspaceRoot, SessionWorkspace.DirectoryPrefix + "*"));
+        }
+        Assert.Equal(2, roots.Distinct(StringComparer.Ordinal).Count());
+    }
+
+    [Fact]
+    public async Task NamedCodeRequestReusesItsSessionWorkspaceWithoutRequestCleanup()
+    {
+        string modelPath = WriteMinimalGguf("named-workspace.gguf");
+        using var model = new ModelService(NullLogger<ModelService>.Instance,
+            (path, _, _, _) => new ContextReportingModel(path, 8192, 8192));
+        model.LoadModel(modelPath, null, "cpu");
+        var sessions = new SessionManager();
+        ChatSession session = sessions.CreateSession();
+        string workspaceRoot = Path.Combine(_baseDir, "named-workspaces");
+        var manager = new SessionWorkspaceManager(workspaceRoot);
+        SessionWorkspace workspace = manager.GetOrCreate(session.Id);
+        Assert.True(workspace.TryWriteFile("existing.txt", "prior turn", out string error), error);
+        var runner = new WorkspaceDeclarationRunner();
+        var service = new WebUiChatService(model, sessions, Options(skillsEnabled: false),
+            new UploadStoragePolicy(_baseDir), new SkillRegistry(new SkillRegistryOptions { Roots = [] }),
+            runner, manager, codeArtifacts: null, NullLoggerFactory.Instance);
+        service.OnChatRequest = (_, _) =>
+        {
+            Assert.True(runner.Persists);
+            Assert.Same(workspace, manager.GetOrCreate(session.Id));
+            Assert.Equal(workspace.Root, Assert.Single(Directory.GetDirectories(workspaceRoot, SessionWorkspace.DirectoryPrefix + "*")));
+            throw new StopBeforeGenerationException();
+        };
+        await Assert.ThrowsAsync<StopBeforeGenerationException>(async () =>
+        {
+            await foreach (object _ in service.ChatStreamAsync(Json($$"""{"sessionId":"{{session.Id}}","messages":[{"role":"user","content":"Continue."}]}"""), CancellationToken.None)) { }
+        });
+        Assert.True(workspace.TryReadFile("existing.txt", out string content, out error), error);
+        Assert.Equal("prior turn", content);
+        manager.Release(session.Id);
+    }
+
+    private sealed class StopBeforeGenerationException : Exception { }
+
+    private sealed class WorkspaceDeclarationRunner : ICodeRunner
+    {
+        public bool CanRun => true;
+        public string UnavailableReason => null;
+        public bool Persists { get; private set; }
+        public string[] DeclaredNames { get; private set; } = [];
+        public ToolFunction Declare() => new() { Name = SkillToolNames.Shell };
+        public IReadOnlyList<ToolFunction> DeclareTools(bool persists)
+        {
+            Persists = persists;
+            DeclaredNames = persists
+                ? [SkillToolNames.ReadFile, SkillToolNames.ApplyPatch, SkillToolNames.WriteFile, SkillToolNames.Shell]
+                : [SkillToolNames.Shell];
+            return DeclaredNames.Select(name => new ToolFunction { Name = name }).ToArray();
+        }
+        public SkillToolResult Execute(ToolCall call, IReadOnlyList<CodeInputFile> inputFiles = null,
+            Action<string> onOutput = null, SessionWorkspace workspace = null, IReadOnlyList<string> skillDirectories = null) =>
+            throw new InvalidOperationException("No inference runs in these request-lifetime tests.");
     }
 
     // ---- sessions and models ---------------------------------------------------

@@ -5,7 +5,7 @@
 
 ## Embedding service
 
-Host a BERT/XLM-R GGUF with `--model encoder.gguf --embeddings`. Select pure C# `cpu` or native `ggml_cpu`, `ggml_metal`, or `ggml_cuda`; each process keeps one encoder resident, and a chat service uses a separate port. `--embedding-threads N` configures CPU execution on `cpu` and `ggml_cpu`; `--embedding-context-size N` reduces the per-input token limit (`0` uses model metadata).
+Host a BERT/XLM-R GGUF with `--model encoder.gguf --embeddings`. Select pure C# `cpu` or native `ggml_cpu`, `ggml_metal`, or `ggml_cuda`; each process keeps one encoder resident, and a chat service uses a separate port. `--embedding-threads N` configures CPU execution on `cpu` and `ggml_cpu`; `--embedding-context-size N` reduces the per-input token limit (default: the model's context length). Both take positive integers only.
 
 - OpenAI: `POST /v1/embeddings`, single/batched strings or token IDs, `encoding_format` of `float` / `base64`, optional `dimensions`.
 - Ollama: `POST /api/embed`, a string or string array; `truncate` defaults to `true`. Legacy `POST /api/embeddings` accepts one `prompt`.
@@ -19,7 +19,7 @@ Downloads, curl, C#, retrieval quality, and validation are in the [full embeddin
 |---|---|---|---|
 | Direct CUDA/cuBLAS | `--backend cuda` | NVIDIA inference and experimentation | Uses the CUDA Driver API, cuBLAS GEMM, PTX kernels for common float32 ops (fill, unary, binary, ternary, activations, RMSNorm, softmax, RoPE/RoPEEx, SDPA, GQA prefill/decode, causal mask, gather/concat), and native quantized matmul/get-rows for supported GGUF quant types. Unsupported ops route through CPU fallbacks while preserving tensor semantics. |
 | MLX Metal | `--backend mlx` | Apple Silicon (alternative to GGML Metal) | GPU-accelerated path built on [mlx-c](https://github.com/ml-explore/mlx-c). Implements quantized ops (Q4_K_M, Q8_0, Q5_K, Q6_K, IQ2_XXS, IQ4_XS, IQ4_NL, MXFP4, etc.) without dequantizing to FP32, fused decode/prefill Metal kernels (fused QKV preprocess, fused gate+up+SiLUMul MoE, fused multi-dim KV write), compiled-graph kernels, async worker dispatch with periodic `async_eval` to overlap GPU/CPU work, batched MoE decode with stacked expert weight slabs, MoE expert offload, GGUF mmap pinned in physical RAM via `mlock(2)`, host-derived allocator caps (`TS_MLX_MEMORY_LIMIT_MB` / `TS_MLX_CACHE_LIMIT_MB` / `TS_MLX_WIRED_LIMIT_MB`), and a CPU fallback for ops that aren't yet wired up. Requires `libmlxc` (built locally by `TensorSharp.Backends.MLX/build-native-macos.sh` or located via `TENSORSHARP_MLX_LIBRARY` / `TENSORSHARP_MLX_LIBRARY_DIR`). |
-| GGML Metal | `--backend ggml_metal` | Apple Silicon (default on macOS) | GPU-accelerated via Apple Metal. Quantized weights are mapped zero-copy from the GGUF file into Metal command buffers via host-pointer buffers, so the resident set stays close to the on-disk model size. |
+| GGML Metal | `--backend ggml_metal` | Apple Silicon (the server's default on macOS; the CLI defaults to `ggml_cpu` everywhere) | GPU-accelerated via Apple Metal. Quantized weights are mapped zero-copy from the GGUF file into Metal command buffers via host-pointer buffers, so the resident set stays close to the on-disk model size. |
 | GGML CUDA | `--backend ggml_cuda` | NVIDIA inference through ggml | GPU-accelerated via GGML CUDA on Windows or Linux. Quantized weights are uploaded to device memory once at load time and the host copy is released afterwards. |
 | GGML Vulkan | `--backend ggml_vulkan` | Vendor-neutral GPU inference through ggml | GPU-accelerated via GGML Vulkan on Windows or Linux — runs on AMD, Intel, and NVIDIA GPUs with a Vulkan 1.3 driver, using cooperative-matrix shaders (KHR coopmat / NV coopmat2) where the driver supports them. Weights are device-resident like GGML CUDA and the same fused whole-model decode/prefill graphs are used. Enabled automatically at native build time when the machine has a Vulkan runtime (loader installed); the build downloads a portable Vulkan toolchain (headers, glslc, SPIRV-Headers, and on Windows a loader import lib) via `eng/fetch-vulkan-toolchain.ps1` / `eng/fetch-vulkan-toolchain.sh` when no Vulkan SDK or distro dev packages are installed. Opt out with `--no-vulkan` (or `TENSORSHARP_GGML_NATIVE_ENABLE_VULKAN=OFF`). |
 | GGML CPU | `--backend ggml_cpu` | Native CPU kernels | CPU inference using native GGML with optimized kernels. Quantized weights are mapped zero-copy from the GGUF file. |
@@ -35,7 +35,7 @@ Downloads, curl, C#, retrieval quality, and validation are in the [full embeddin
 
 ## Configuration file (CLI + Server)
 
-Both `TensorSharp.Cli` and `TensorSharp.Server` can read their options from a JSON
+Both `TensorSharp.Cli` and `TensorSharp.Server.Host` can read their options from a JSON
 file passed with `--config`, instead of (or in addition to) a long command line:
 
 ```bash
@@ -43,13 +43,31 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --config config/s
 dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll       --config config/cli-basic.json
 ```
 
-**Command-line options always win.** File values are applied first, then anything
-you also pass on the command line overrides them — so one file can be reused across
-machines while you override just what differs (`--config config/server-basic.json --backend ggml_cpu`).
-Repeat `--config` to layer files; later files win over earlier ones.
+**Command-line options always win.** When the command line sets a single-valued
+option itself, that option's entry in the file is dropped before it is resolved: it
+is not emitted, its `${variables}` are not substituted and its download is never
+attempted — so one file can be reused across machines while you override just what
+differs (`--config config/server-basic.json --backend ggml_cpu`). Each override
+prints one line to stderr, e.g. `[config] --mmproj is set on the command line, so the
+value from 'diffusiongemma-26b-a4b-q4.json' is ignored and the command-line value is
+used instead; its download entry is skipped, so nothing is fetched for it.` Repeat
+`--config` to layer files; a later file's entry replaces an earlier one's the same
+way. The repeatable options — `--stop`, `--skills-dir`, `--skill`, `--lora`,
+`--lora-scale`, `--lora-config`, `--image`, `--ref-image`, `--ref-video`,
+`--ref-audio` and `--ref-video-audio` — instead keep the file's values and add the
+command line's after them, and a download entry under one of them still runs.
+Legacy spellings count as the same option in both directions: `--wan-vae` and
+`--video-vae`; `--wan-te`, `--video-te` and `--video-text-encoder`; `--wan-dit2`
+and `--video-dit2`.
 
 The keys are the same long option names listed below (with or without the leading
-`--`). Comments (`//`, `/* */`) and trailing commas are allowed.
+`--`). Comments (`//`, `/* */`) and trailing commas are allowed. `variables` (alias
+`vars`) and `$schema` are reserved keys rather than options. A removed option is
+refused as a key too, exactly as on the command line. A key only the other host
+understands is not checked here: the server rejects an unknown option, while the
+CLI silently ignores one (a CLI run of a file that carries the server-only `port`
+simply drops it). The penalty window is `repeat-last-n` on both hosts, so that key
+applies to either.
 
 | JSON value | Becomes | Example |
 |---|---|---|
@@ -59,39 +77,65 @@ The keys are the same long option names listed below (with or without the leadin
 | array | a repeated flag | `"stop": ["</s>", "<\|eot\|>"]` → `--stop </s> --stop <\|eot\|>` |
 | object | a downloadable file (see below) | `{ "path": "...", "urls": ["..."] }` |
 
+`lora-scale` and `lora-config` are the exception to the array rule: each binds to
+the one `--lora` before it, so an array of either is refused (give each plug-in its
+own `"scale"` in its `.json` instead).
+
 **Variables.** Define shared values once under `"variables"` and reference them
-with `${name}` in any string value. A `${name}` not defined there falls back to an
-environment variable of the same name, and variables may reference other variables.
-Declare as many roots as you need — models in different folders each get their own.
+with `${name}` in any string value, or with `${name:-fallback}` to give an optional
+value a default. A `${name}` not defined there falls back to an environment variable
+of the same name (an empty variable counts as unset), and variables may reference
+other variables; a cycle, or an undefined name with no fallback, is a configuration
+error. Declare as many roots as you need — models in different folders each get
+their own.
 
 ```json
 {
-  "variables": { "modelRoot": "C:/models" },
+  "variables": { "modelRoot": "${TENSORSHARP_MODELS:-../models}" },
   "backend": "ggml_cuda",
   "model": "${modelRoot}/Qwen3.5-9B-Q8_0.gguf",
   "mmproj": "${modelRoot}/Qwen3.5-mmproj-F16.gguf"
 }
 ```
 
+Write roots this way rather than as `C:/models`: a drive-letter path is not rooted on
+Linux or macOS, so it would be treated as a relative path there. Where a relative
+value resolves depends on where it appears. A download entry's `path` (below)
+resolves against the config file's directory; a plain string option such as the
+`"model"` above is passed to the host unchanged and resolves against the working
+directory. Use the download-object form when the files should live relative to the
+config. Either way the `TENSORSHARP_MODELS` environment variable redirects the root,
+so one file works unmodified on every OS.
+
 **Auto-download.** Any file option can be an object with a local `path` and one or
-more `urls` instead of a plain string. If `path` is missing it is downloaded from
-the first working URL (mirrors are tried in order), saved there, and reused on every
+more `urls` (or a single `url`) instead of a plain string. A relative `path` resolves
+against the config file's directory. If `path` is missing it is downloaded from the
+first working URL (mirrors are tried in order), saved there, and reused on every
 later run; download progress is printed to stderr. An optional `sha256` verifies a
-freshly downloaded file.
+freshly downloaded file; a file that already exists is used without a hash check.
+A download entry whose option the command line (or a later `--config` file) also
+sets is dropped before it is resolved, so nothing is fetched for it — `--mmproj none`
+on the command line skips a configured projector's download.
 
 ```json
 {
   "backend": "ggml_cuda",
   "model": {
-    "path": "C:/models/Qwen3.5-9B-Q8_0.gguf",
-    "urls": [ "https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-Q8_0.gguf" ]
+    "path": "${TENSORSHARP_MODELS:-../models}/Qwen3.5-9B-Q8_0.gguf",
+    "urls": [ "https://huggingface.co/unsloth/Qwen3.5-9B-GGUF/resolve/3885219b6810b007914f3a7950a8d1b469d598a5/Qwen3.5-9B-Q8_0.gguf" ],
+    "sha256": "809626574d0cb43d4becfa56169980da2bb448f2299270f7be443cb89d0a6ae4"
   }
 }
 ```
 
 Ready-to-use examples live in [`config/`](config/) (`cli-basic.json`,
 `server-basic.json`, `variables.json`, `auto-download.json`, `qwen-image-2.1.json`)
-— each uses real, public, ungated URLs, so it works on a fresh machine. See
+— each uses real, public, ungated URLs, so it works on a fresh machine. The same
+directory also holds presets for chat models (`gemma-4-*`, `qwen3.5-9b-*`,
+`qwen3.6-*`, `gpt-oss-20b`), agent hosting (`agent-*`), embedding services
+(`embedding-*`), DiffusionGemma and Jev (`diffusiongemma-*`,
+`jev-diffusiongemma-q4`) and video (`minimax-h3-*`, `wan-video-*`), and
+[`config/lora/`](config/lora/) holds twelve Qwen-Image-2.1 LoRA plug-ins. See
 [`config/README.md`](config/README.md) for the full reference.
 
 ## Console Application
@@ -147,6 +191,14 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --config config/qwen-image-2.1.js
     --prompt "A small orange cat beside a blue ceramic vase, soft daylight" --output generated.png
 dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --config config/qwen-image-2.1.json --image generated.png \
     --prompt "Change the blue vase to a red vase. Preserve the cat, lighting and composition." --output edited.png
+
+# Qwen-Image-2.1 with a LoRA plug-in. config/lora/ holds ready-made ones that download
+# their weights on first use; a step-distilled plug-in also brings its sampling recipe
+# (here 6 steps, CFG 1). See "Qwen-Image-2.1 LoRA plug-ins" below.
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --config config/qwen-image-2.1.json \
+    --lora config/lora/qwen-image-2.1-viggle-turbo.json \
+    --prompt "A small orange cat beside a blue ceramic vase, soft daylight" \
+    --width 1024 --height 1024 --output turbo.png
 
 # MiniMax-H3 video generation with sound (prompt -> H.264 MP4 plus a 32 kHz
 # stereo .wav sidecar). One diffusion transformer denoises a packed video+audio
@@ -261,6 +313,11 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --backend cu
 
 **Command-line options:**
 
+The options below are case-insensitive and also accept `--option=value`, as on the
+server (a switch given a value, or a value option with nothing after it, is a
+configuration error). The CLI still ignores a token it does not know, so copy
+option names carefully.
+
 | Option | Description |
 |---|---|
 | `--model <path>` | Path to a GGUF model file (required) |
@@ -272,14 +329,14 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --backend cu
 | `--video <path>` | Video file for video inference |
 | `--audio <path>` | Audio file (WAV, MP3, OGG) for audio inference |
 | `--pdf <path>` | PDF document input (one-shot mode). Born-digital PDFs have their complete text layer extracted and inlined into the prompt (page cap via `TS_PDF_MAX_PAGES`); scanned PDFs are rasterized to page images and require a vision model (`--mmproj` or a built-in vision encoder). `--input` text becomes the instruction over the document. |
-| `--mmproj <path>` | Path to the multimodal projector GGUF file |
+| `--mmproj <path\|none>` | Path to the multimodal projector: an mmproj GGUF, or — for the Gemma 4 family — a HuggingFace `.safetensors` shard holding the vision tower, for checkpoints published without an mmproj (DiffusionGemma's `model-00011-of-00011.safetensors`). A safetensors shard supplies image input only. `none` (any case) loads no projector and skips the lookup below, as on the server. Without `--mmproj`, the CLI looks for a companion projector next to the model only when `--image`, `--audio` or `--video` is given (a video asks for the vision projector as well as the audio one), by the architecture's own file names: Gemma 4 `gemma-4-mmproj-F16.gguf`; Qwen 3.5 family `Qwen3.5-mmproj-F16.gguf`, or for Bonsai2 `Ternary-Bonsai-2-27B-mmproj-BF16.gguf` / `Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf`; Muse-Glimmer `*mmproj*Muse*Glimmer*.gguf`; GLM-5.x and Qwen 3.8 Flash Next `*mmproj*.gguf`; Mistral 3 `mistral3-mmproj.gguf` or `*mmproj*istral*.gguf`; Nemotron-H `*Nemotron*mmproj*.gguf` or `*mmproj*Nemotron*.gguf`; DeepSeek V4.1 `deepseek41.vision.gguf`. A Gemma 4 `.safetensors` vision shard is never auto-detected. |
 | `--max-tokens <N>` | Maximum tokens to generate (default: 100) |
-| `--backend <type>` | Compute backend: `cpu`, `cuda`, `mlx`, `ggml_cpu`, `ggml_metal`, `ggml_cuda`, or `ggml_vulkan` |
+| `--backend <type>` | Compute backend: `cpu`, `cuda`, `mlx`, `ggml_cpu`, `ggml_metal`, `ggml_cuda`, or `ggml_vulkan` (default: `ggml_cpu`, on every OS including macOS) |
 | `--gpu-device <N>` | Vulkan device index for the `ggml_vulkan` backend on multi-GPU hosts (e.g. an integrated Intel GPU next to a discrete NVIDIA one). Defaults to device 0; use `--list-gpus` to see the indices. Also settable via the `TS_GGML_VULKAN_DEVICE` env var. |
 | `--list-gpus` | List the Vulkan devices ggml-vulkan can see (index + adapter name) and exit |
 | `--n-cpu-moe <N>` / `-ncmoe <N>` | Keep the routed Mixture-of-Experts weights of the first N layers in system RAM and multiply them on the CPU; attention, norms, the router and the always-active shared expert stay on the accelerator (llama.cpp's `--n-cpu-moe` equivalent). This is what lets a 35B-A3B MoE fit beside a long-context KV cache on a 12-16 GB card. Pass `all` for every layer. Default: 0 on every architecture, DeepSeek V4 and GLM 5.x included — a model that does not fit is refused at load with the number of layers that would make it fit, rather than silently offloaded (env `TS_N_CPU_MOE`). |
 | `--cpu-moe` / `-cmoe` | Shorthand for `--n-cpu-moe all`. Default: off (env `TS_CPU_MOE`). |
-| `--cpu-moe-threads <N>` | Worker threads for the host-side expert matmul. Default: **half** the CPU parallelism this process can actually use (`hardware_concurrency` clamped by the scheduler affinity mask and the cgroup CPU quota) on hosts with more than 8, all but one below that. The other half is not waste — the accelerator submission threads, and in `TensorSharp.Server` Kestrel and the scheduler, have to be schedulable too, and .NET sizes its own pool from the machine's CPU count rather than the cgroup quota. Sizing this near the quota is a cliff, not a slope: on a 95-CPU quota the hosted 26B MoE measured 20.7 tok/s at 64 threads and 8.2 at 71. Raise it on a dedicated box (env `TS_CPU_MOE_THREADS`). |
+| `--cpu-moe-threads <N>` | Worker threads for the host-side expert matmul. Default: **half** the CPU parallelism this process can actually use (`hardware_concurrency` clamped by the scheduler affinity mask and the cgroup CPU quota), **capped at 64**, on hosts with more than 8; all but one with 3 to 8; one with 2 or fewer. DeepSeek V4 / V4.1 and GLM-5.x on their native ggml executors use every usable CPU once `--n-cpu-moe` / `--cpu-moe` is on (GLM-5.x also on a GPU-less run). The other half is not waste — the accelerator submission threads, and in `TensorSharp.Server.Host` Kestrel and the scheduler, have to be schedulable too, and .NET sizes its own pool from the machine's CPU count rather than the cgroup quota. Sizing this near the quota is a cliff, not a slope: on a 95-CPU quota the hosted 26B MoE measured 20.7 tok/s at 64 threads and 8.2 at 71. Raise it on a dedicated box (env `TS_CPU_MOE_THREADS`). |
 
 **Backend support.** MoE CPU offload is implemented on the GGML backends
 (`ggml_cuda`, `ggml_vulkan`, `ggml_metal`, `ggml_cpu`) for every MoE
@@ -289,14 +346,17 @@ else. Asking for offload on a combination that does not implement it prints a
 `[moe-offload] WARNING` and proceeds without saving VRAM, rather than failing
 quietly. Measured on gemma-4-26B-A4B (`--cpu-moe`, peak VRAM): `ggml_cuda`
 15244 → 5756 MiB; `cuda` 14261 → 14253 MiB (no-op, warns).
+
+| Option | Description |
+|---|---|
 | `--kv-cache-dtype <type>` | KV cache precision: `f32`, `f16`, `q8_0`, or `q4_0` (default: auto — the backend/model pick; env `KV_CACHE_DTYPE`). Half-precision / quantized KV caches reduce memory at the cost of small numerical drift; `q4_0` (~0.56 bytes/elem, ~1/7 of f32) is the most aggressive tier for very long (128K–256K) contexts where the KV cache dominates memory. Block-quantized caches (`q8_0`/`q4_0`) require the native GGML flash path; DeepSeek V4 / V4.1 refuse them at load (their executors keep F16 caches read by their own kernels) and report `f16` for an explicit `f32`. |
 | `--interactive` / `-i` / `--chat` | Start an interactive REPL chat session (turn-by-turn input/output) with KV cache reuse, slash commands, hot-swappable model/backend/projector, file attachments (image, audio, video, text) and live sampling tuning. See the **Interactive REPL commands** section below for the full list. |
-| `--no-prefix-cache` | Disable runtime prefix reuse and interactive system/tool prompt warmup. Radix caching is enabled by default for normal CLI generation, including interactive, JSONL, and skill/tool requests. Unrelated to `--warmup-runs`, which warms compute kernels. |
+| `--no-prefix-cache` | Disable runtime prefix reuse (it sets `TS_SCHED_PREFIX_CACHE=0`) and interactive system/tool prompt warmup. Radix caching is enabled by default for normal CLI generation, including single-shot, interactive, JSONL, and skill/tool requests. The CLI's cache lives in memory only, so every new process starts cold. Unrelated to `--warmup-runs`, which warms compute kernels. |
 | `--system <text>` | System prompt to seed the interactive session (overridden inside the REPL by `/system`) |
 | `--system-file <path>` | Read the initial system prompt from a UTF-8 text file (alternative to `--system`) |
-| `--think` | Enable thinking/reasoning mode (chain-of-thought). Opt-in on every family, GLM 5.x included: without it the GLM template closes the reasoning block immediately (`<think></think>`) so the model answers directly, and with it the prompt carries `Reasoning Effort: Max` and leaves the block open for the model to close. `/think on\|off` toggles it inside the REPL. |
+| `--think` | Enable thinking/reasoning mode (chain-of-thought). Opt-in on every family but GPT-OSS, GLM 5.x included — without it the GLM template closes the reasoning block immediately (`<think></think>`) so the model answers directly, and with it the prompt carries `Reasoning Effort: Max` and leaves the block open for the model to close. GPT-OSS always reasons before it answers, with or without the flag: its Harmony prompt has no "thinking off", and the CLI renders its `Reasoning:` line at `medium`. `/think on\|off` toggles it inside the REPL. |
 | `--tools <path>` | JSON file with tool/function definitions. Wire formats differ by family and the parser is picked from the architecture — GLM 5.x emits XML (`<tool_call>NAME<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>`, one element per argument, values `tojson`-encoded when they are not plain strings) rather than a JSON body, and the server parses that back into the usual OpenAI tool-call fields so clients see the standard shape. |
-| `--skills-dir <path>` | Directory to scan for Agent Skills (a folder holding `SKILL.md` files, or a single skill directory). Repeatable; scanned in the order given, up to three levels deep. Without it, a `skills` directory beside the binary is used and created if missing. A path that does not exist is a startup error naming the flag. Env: `TS_SKILLS_DIR` (a path-separator-separated list). |
+| `--skills-dir <path>` | Directory to scan for Agent Skills (a folder holding `SKILL.md` files, or a single skill directory). Repeatable; scanned in the order given, up to three levels deep. Without it, every existing `.agents/skills` directory from the working directory up to its Git repository root is used (nearest first; outside a repository only the working directory is checked), followed by a `skills` directory beside the binary, which is created if missing. Explicit roots replace these defaults, and personal/global skill directories are never loaded automatically. A path that does not exist is a startup error naming the flag. Env: `TS_SKILLS_DIR` (a path-separator-separated list). |
 | `--skill <name>` | Select a skill for this run, by the name in its `SKILL.md` (which is also its directory name). Repeatable. On tool-capable model families, selection advertises the skill's metadata and scopes the built-in skill tools to it; it does **not** inline the `SKILL.md` body. The body is inlined only as the fallback for a family/request that cannot use tool declarations (including structured-output requests), when it fits the prompt budget. |
 | `--list-skills` | Print the skill registry — name, description, origin, bundled files, size, and any load warnings or errors — and exit. |
 | `--no-skills` | Turn Agent Skills off entirely: no scanning, no prompt block, no tools. Env: `TS_NO_SKILLS` (anything but `0` counts as on). |
@@ -317,17 +377,28 @@ quietly. Measured on gemma-4-26B-A4B (`--cpu-moe`, peak VRAM): `ggml_cuda`
 | `--code-exec-max-output <bytes>` | How much of one command's output is kept and shown to the model (default `32768`). What does not fit is dropped from the **middle**, keeping the head and the tail: the end of a build or a test run is where the failure is, and head-only truncation discards exactly the part that was wanted. |
 | `--code-exec-unconfined` | Run model-authored commands even where the OS cannot confine them. The CLI and server both accept this explicit escape hatch. Windows requires it because a job object bounds the process tree but cannot restrict filesystem or network access; commands there consequently run with this process account's access to both, regardless of the narrower macOS/Linux network switch. Do not enable it on a server reachable by users you do not trust. |
 
-**How the shell is used, and what it may reach.** The model does all its work
-through that one command line: it writes a file with a heredoc, runs it, greps
-it, reads its own traceback and fixes it — which is why `--skills-max-rounds`
-rises from 8 to 24 when this is on. Web/CLI keeps one filesystem workspace for
+**How the shell is used, and what it may reach.** With a workspace, the shell is
+for running programs, searching files and checking results. The model reads a file
+with `read_file`, creates one with `write_file` (create-only) and changes an existing
+one only with `apply_patch`; then it runs the code, reads its own traceback and
+fixes it — which is why `--skills-max-rounds` rises from 8 to 24 when this is on.
+Web/CLI keeps one filesystem workspace for
 the whole chat session; each OpenAI Chat, OpenAI Responses, or Ollama HTTP
 request gets a private workspace across its internal tool rounds and deletes it
 after the response. Skill scripts share that workspace when code execution is
 enabled, so files and host-installed packages remain available for the applicable
 session or request. Every shell call is nevertheless a fresh confined process;
 do not rely on virtualenv activation, PATH changes, or a resident shell carrying
-from one call to the next. The network rule is the
+from one call to the next. What every call does get is the workspace's own tool
+directories ahead of the host PATH — its shim, virtualenv and environment `bin`
+directories, `node_modules/.bin` and the work directory's `.local/bin` — and on the
+desktop hosts an interpreter installed in `.local/bin` is preferred over the host's.
+The host installer takes pip requirements and npm registry names, optionally scoped
+and versioned (`@scope/tool@1.2.3`); URL, local-path and alias specs are refused.
+`npx` and `uvx` fetch a tool and run it in one step, so they run as ordinary
+commands only when `--code-exec-allow-network` and `--code-exec-allow-install` are
+both on and no `--code-exec-packages` list is set; otherwise they go through the
+host's install handling like any other install request. The network rule is the
 host's, not the model's: commands are offline by default, and only the operator's
 `--code-exec-allow-network` (or `TS_CODE_EXEC_ALLOW_NETWORK`) opt-in gives every
 model-authored command unrestricted host IP-network access, including LAN/loopback
@@ -363,17 +434,17 @@ script gets that error instead of watching a setting be ignored.
 
 | Option | Description |
 |---|---|
-| `--spec` / `--no-spec` | Enable speculative decoding (default off). `--spec` is the explicit opt-in for drafters embedded in the trunk checkpoint — GLM 5.2's NextN block, GLM-5.3's and Qwen 3.6's, with nothing extra to download — because loading them pages extra weights into VRAM; a drafter that ships as its own GGUF is enabled by `--draft-model` alone, and an explicit `--no-spec` vetoes either. The head drafts up to `--spec-draft` tokens and the trunk verifies them in one batched forward; every emitted token still comes from a trunk row, so the stream is the one plain decoding would have produced (argmax under a greedy config, in distribution under a sampler) and this is a speed path only. "The one plain decoding would have produced" holds up to floating point: a multi-row verify and a one-row decode run different kernels, and a greedy token whose top two logits are closer than their disagreement can come out differently (measured and explained in [what greedy parity delivers](docs/speculative_decoding.md#what-greedy-parity-delivers)). Engages on every single-sequence path (`--input`, `--input-jsonl`, `--multi-turn-jsonl`, `--interactive`). **Must be on the command line before the model loads**: for glm-dsa it is what tells the native loader to page the ~3 GiB NextN layer into VRAM, and that layer competes with the KV cache for the memory the context is sized against. Refused under `--tp N>1` on a checkpoint whose draft block borrows the trunk's LM head, which includes GLM 5.2 and GLM-5.3 — on those, speculation engages on the default layer split (no `--tp`). Env: `TS_SPEC` (legacy `TS_MTP_SPEC`, still read by the glm-dsa native loader; glm-dsa also honours `TS_GLM_MTP=1`/`0`, which overrides both, for A/B runs). |
-| `--spec-type <name>` | Speculation **algorithm**: `auto` (default, use the checkpoint's own drafter), `draft-head`, `block`, or `ngram`. `ngram` needs no trained weights and works on every model — it drafts by finding where the last few tokens occurred earlier in the context and proposing what followed, so it is strong wherever the answer quotes its input (summarizing, editing, translating, repetitive structured output, agentic loops) and falls back to plain decode elsewhere. Measured 45.2 tok/s against 31.4 plain (1.44x) on Qwen3.5-9B (Q8_0, `ggml_metal`, M5 Pro) — a checkpoint that ships no draft head at all — with byte-identical output. Env: `TS_SPEC_TYPE`. See [Speculative Decoding in TensorSharp](docs/speculative_decoding.md). |
+| `--spec` / `--no-spec` | Enable speculative decoding (default off). `--spec` is the explicit opt-in for drafters embedded in the trunk checkpoint — the NextN block of Qwen 3.6, Qwen 3.8 27B, GLM 5.2 and GLM-5.3, with nothing extra to download — and for `--spec-type ngram`, because loading them pages extra weights into VRAM; a drafter that ships as its own GGUF is enabled by `--draft-model` alone, and an explicit `--no-spec` vetoes either. The head drafts up to `--spec-draft` tokens and the trunk verifies them in one batched forward; every emitted token still comes from a trunk row, so the stream is the one plain decoding would have produced (argmax under a greedy config, in distribution under a sampler) and this is a speed path only. "The one plain decoding would have produced" holds up to floating point: a multi-row verify and a one-row decode run different kernels, and a greedy token whose top two logits are closer than their disagreement can come out differently (measured and explained in [what greedy parity delivers](docs/speculative_decoding.md#what-greedy-parity-delivers)). Engages on every single-sequence path (`--input`, `--input-jsonl`, `--multi-turn-jsonl`, `--interactive`). **Must be on the command line before the model loads**: for glm-dsa it is what tells the native loader to page the ~3 GiB NextN layer into VRAM, and that layer competes with the KV cache for the memory the context is sized against. Refused under `--tp N>1` on a checkpoint whose draft block borrows the trunk's LM head, which includes GLM 5.2 and GLM-5.3 — on those, speculation engages on the default layer split (no `--tp`). GLM-5.3-Flash (`glm5next`) builds no draft head (its NextN block is not implemented), so `--spec` alone serves standard decode there; `--spec --spec-type ngram` engages the weight-free n-gram drafter, with the KDA recurrent state snapshotted before every verify and restored on a partial rejection (default window 3; see the [GLM card](docs/models/glm.md#speculative-decoding-on-glm-53-flash)). Env: `TS_SPEC` (legacy `TS_MTP_SPEC`, still read by the glm-dsa native loader, which parses both the way the scheduler does: only `1`, `true`, `yes` or `on` enable, so `TS_SPEC=false` no longer pages the NextN block in; glm-dsa also honours `TS_GLM_MTP`, where any value but `0` forces it on and `0` forces it off, overriding both, for A/B runs). |
+| `--spec-type <name>` | Speculation **algorithm**: `auto` (default, use the checkpoint's own drafter), `draft-head`, `block`, or `ngram`. It only picks the algorithm and does not turn speculation on, so pair it with `--spec`: given without `--spec` or `--draft-model` (and with `TS_SPEC` unset), it — like `--spec-draft` and `--spec-pmin` — leaves speculation off and startup logs a warning that says so. `ngram` needs no trained weights — it drafts by finding where the last few tokens occurred earlier in the context and proposing what followed, so it is strong wherever the answer quotes its input (summarizing, editing, translating, repetitive structured output, agentic loops) and falls back to plain decode elsewhere. It still needs a trunk that can verify a draft, so it is not universal: it runs on the Qwen 3.5 / 3.6 / 3.8 family, GLM 5.x, Gemma 4 (GGML backends and direct `cuda`) and Qwen 3.8 Flash Next (GGML backends); GPT-OSS, Mistral 3, Qwen 3 / Qwen 2 (Bonsai 8B included) and Hunyuan Dense have no speculative path at all; DeepSeek V4 / V4.1 and Muse-Glimmer serve plain decode unless their own drafter is loaded; and Nemotron-H refuses every speculator. Measured 45.2 tok/s against 31.4 plain (1.44x) on Qwen3.5-9B (Q8_0, `ggml_metal`, M5 Pro) — a checkpoint that ships no draft head at all — with byte-identical output. Env: `TS_SPEC_TYPE`. See [Speculative Decoding in TensorSharp](docs/speculative_decoding.md). |
 | `--spec-draft <N>` | Maximum tokens drafted per speculative step (range 1-64, default `8`). Also sizes the native graph cache at load, so pass it alongside `--spec` rather than relying on the default. A block drafter additionally clamps it to its trained block size, which is also its default there — 5 for DSpark, 15 for Muse-Glimmer's DFlash, 7 for Qwen 3.8's DFlash2. On a **recurrent** trunk (Qwen 3.5/3.8's GatedDeltaNet layers) a narrow window is worth far more than a wide one: it bounds both the verify width and the rollback re-forward, and `--spec-draft 3` was 1.6x faster than the default on Qwen3.8-27B. On Qwen 3.5 under the GGML backends a typed value of 8 or more is also a known **correctness** bug — nine verify rows diverge from plain greedy — so stay at 7 or lower there; see [speculative decoding](docs/speculative_decoding.md). Env: `TS_SPEC_DRAFT` (or `TS_MTP_DRAFT`). |
 | `--spec-pmin <f>` | Draft-confidence gate in `[0, 1]`; drafting stops at the first token below it, and `0` means never gate. What the number MEANS is the algorithm's business, so each brings its own default: `0.15` for a per-token head (top-1 probability over its top-10 logits), `0.35` for a block drafter (the CUMULATIVE prefix probability — the product of the confidence head's per-position estimates, so the same number is far stricter; lower drafts further and rolls back more, higher falls back to plain decode more often), `0` for n-gram (where it scales the required match length instead). Env: `TS_SPEC_PMIN` (or `TS_MTP_PMIN`). |
-| `--draft-model <path>` | Speculative-decoding drafter GGUF, for every drafter that ships as its own file — DeepSeek V4's DSpark support module (see [DeepSeek V4](docs/models/deepseek4.md#dspark-speculative-decoding)), Muse-Glimmer's DFlash and Qwen 3.8's DFlash2 block drafters (see [Muse-Glimmer](docs/models/muse-glimmer.md#3-dflash-speculative-decoding); env `TS_MUSE_GLIMMER_DFLASH`), and Gemma 4's `gemma4-assistant` per-token head. The file's own `general.architecture` decides how it loads — you never pick a mechanism. Naming a file here enables speculation by itself; no `--spec` is needed beside it, and an explicit `--no-spec` vetoes it. The draft's hidden size must match the target (pair the 12B target with its 12B draft, not the 26B-A4B one); a mismatched, missing, or incomplete draft GGUF fails fast at startup. Qwen 3.6, GLM 5.2 and GLM-5.3 embed their NextN block in the trunk GGUF and need no such flag — they take `--spec` instead. A block drafter drafts a whole block per step and the trunk verifies it in one batched forward. Every emitted token is still drawn from a trunk row — with argmax under a greedy config, with the run's own sampler otherwise — so the output stream is unchanged either way, up to floating-point near-ties between the verify and decode kernels ([what greedy parity delivers](docs/speculative_decoding.md#what-greedy-parity-delivers)). Block drafting engages on every single-sequence path (`--input`, `--multi-turn-jsonl`, `--interactive`) with `--backend cuda` or `--backend ggml_cuda`. Env: `TS_SPEC_DRAFT_MODEL`, `TS_DSV4_DSPARK`. **Nemotron-H refuses it:** a DSpark drafter for Nemotron 3.5 Lightning is recognized but not attached, and `--spec`/`--spec-type ngram` serve plain decoding with a one-time warning, because that trunk's verify and decode kernels disagree and speculation would change the output (see [speculative decoding](docs/speculative_decoding.md#nemotron-h-refuses-speculation)). |
+| `--draft-model <path>` | Speculative-decoding drafter GGUF, for every drafter that ships as its own file — DeepSeek V4's DSpark support module (see [DeepSeek V4](docs/models/deepseek4.md#dspark-speculative-decoding)), Muse-Glimmer's DFlash and Qwen 3.8's DFlash2 block drafters (see [Muse-Glimmer](docs/models/muse-glimmer.md#3-dflash-speculative-decoding); env `TS_MUSE_GLIMMER_DFLASH`), Gemma 4's `gemma4-assistant` per-token head, and Qwen 3.8 Flash Next's shared MTP head (`mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf`, GGML backends only; it drafts only for a solo request that prefilled from position 0, not after a reused prefix — see [its card](docs/models/qwen38-flash-next.md#speculative-decoding-with-the-shared-mtp-head)). DeepSeek V4.1 accepts a `deepseek41-dspark` drafter on `ggml_cuda` / `ggml_cpu` only; that path is experimental — validated only on synthetic fixtures, with no trained drafter measured. The file's own `general.architecture` decides how it loads — you never pick a mechanism. Naming a file here enables speculation by itself; no `--spec` is needed beside it, and an explicit `--no-spec` vetoes it. The draft's hidden size must match the target (pair the 12B target with its 12B draft, not the 26B-A4B one); a mismatched, missing, or incomplete draft GGUF fails fast at startup. Qwen 3.6, Qwen 3.8 27B, GLM 5.2 and GLM-5.3 embed their NextN block in the trunk GGUF and need no such flag — they take `--spec` instead. A block drafter drafts a whole block per step and the trunk verifies it in one batched forward. Every emitted token is still drawn from a trunk row — with argmax under a greedy config, with the run's own sampler otherwise — so the output stream is unchanged either way, up to floating-point near-ties between the verify and decode kernels ([what greedy parity delivers](docs/speculative_decoding.md#what-greedy-parity-delivers)). Block drafting engages on every single-sequence path (`--input`, `--multi-turn-jsonl`, `--interactive`). DeepSeek V4's DSpark needs `--backend cuda` or `--backend ggml_cuda`; the DFlash / DFlash2 drafters (Muse-Glimmer, Qwen 3.8) run as one fused GGML graph per pass on CUDA, Vulkan and Metal ([where it runs](docs/speculative_decoding.md#where-it-runs)), on one GPU: under `--tp N` > 1 the CLI declines a DFlash / DFlash2 drafter with a warning and serves standard decoding. Env: `TS_SPEC_DRAFT_MODEL`, `TS_DSV4_DSPARK`. **Nemotron-H refuses it:** a DSpark drafter for Nemotron 3.5 Lightning is recognized but not attached, and `--spec`/`--spec-type ngram` serve plain decoding with a one-time warning, because that trunk's verify and decode kernels disagree and speculation would change the output (see [speculative decoding](docs/speculative_decoding.md#nemotron-h-refuses-speculation)). |
 | `--temperature <f>` | Sampling temperature (0 = greedy) |
 | `--top-k <N>` | Top-K filtering (0 = disabled) |
 | `--top-p <f>` | Nucleus sampling threshold (1.0 = disabled) |
 | `--min-p <f>` | Minimum probability filtering (0 = disabled) |
 | `--repeat-penalty <f>` | Repetition penalty (1.0 = none) |
-| `--penalty-last-n <N>` | How many of the most recent tokens the repeat / presence / frequency penalties consider. `0` disables history penalties, `-1` uses the whole history (default: 64) |
+| `--repeat-last-n <N>` | How many of the most recent tokens the repeat / presence / frequency penalties consider. `0` disables history penalties, `-1` uses the whole history (default: 64). The same spelling as the server and the `repeat_last_n` request field, so one config key drives both hosts; the former CLI-only `--penalty-last-n` is removed (see below). |
 | `--presence-penalty <f>` | Presence penalty (0 = disabled) |
 | `--frequency-penalty <f>` | Frequency penalty (0 = disabled) |
 | `--seed <N>` | Random seed for **text** sampling (-1 = non-deterministic). Image and video generation take their noise from `--diffusion-seed` instead. |
@@ -394,17 +465,21 @@ script gets that error instead of watching a setting be ignored.
 | `--test-chunked-prefill` | Run the chunked-prefill correctness check (compares chunked vs non-chunked logits) |
 | `--correct-prefill <N>` | Prompt length used by `--test-chunked-prefill` |
 | `--correct-decode <N>` | Decode length used by `--test-chunked-prefill` |
-| `--diffusion-steps <N>` | DiffusionGemma denoising steps per block (default: 48). For Qwen-Image-2.1, the FlowMatch-Euler step count — omit for auto (40). |
+| `--diffusion-steps <N>` | DiffusionGemma denoising steps per block (default: 48). For Qwen-Image-2.1, the FlowMatch-Euler step count — omit for auto (40, or the step count of a `--lora` plug-in's sampling recipe). |
 | `--diffusion-seed <N>` | Noise seed for the diffusion paths: DiffusionGemma's deterministic sampler and Qwen-Image-2.1 (default: 0), and video generation (Wan, MiniMax-H3), where leaving it out draws a fresh random seed each run. This is the seed that decides what a clip looks like — `--seed` is the text sampling seed and does not affect it. |
 | `--diffusion-blocks <N>` | DiffusionGemma block-autoregressive canvas count. `0` derives the count from `--max-tokens` and the model canvas length. |
-| `--image <path>` | Input image for Qwen-Image-2.1 editing (also the image input for multimodal chat); repeat it for multiple references. Without `--image`, a Qwen-Image-2.1 DiT generates an image from the prompt instead. |
+| `--image <path>` | Input image for Qwen-Image-2.1 editing (also the image input for multimodal chat); repeat it for multiple references. Every `--image` is a reference, tagged `<image1>`, `<image2>`, … in command-line order ahead of the prompt, so the prompt can name a picture by its tag. Without `--image`, a Qwen-Image-2.1 DiT generates an image from the prompt instead. |
 | `--prompt <text>` | Qwen-Image-2.1 generation prompt or edit instruction (falls back to `--input` file contents if omitted). |
 | `--output <path>` | Qwen-Image-2.1 output PNG path (default: `generated.png` for generation, `edited.png` for editing). |
-| `--cfg <F>` | Qwen-Image-2.1 true-CFG guidance scale (`<= 1` disables the negative pass). Omit for auto: 1.0 for Qwen-Image-2.1 (one transformer prediction per step); a value above 1 adds the negative pass. Shares `--diffusion-steps` / `--diffusion-seed` for step count and seed. On MiniMax-H3 the only accepted value is `1.0` (its default): the checkpoint ships CFG-distilled and anything higher is refused up front rather than run and degraded. `TensorSharp.Server` has no `--cfg` at all — a request body can still carry `cfg`. |
+| `--cfg <F>` | Qwen-Image-2.1 true-CFG guidance scale (`<= 1` disables the negative pass). Omit for auto: 1.0 for Qwen-Image-2.1 (one transformer prediction per step), or the CFG of a `--lora` plug-in's sampling recipe; a value above 1 adds the negative pass. Shares `--diffusion-steps` / `--diffusion-seed` for step count and seed. On MiniMax-H3 the only accepted value is `1.0` (its default): the checkpoint ships CFG-distilled and anything higher is refused up front rather than run and degraded. `TensorSharp.Server.Host` has no `--cfg` at all — a request body can still carry `cfg`. |
 | `--qwen-image-vae <path>` | Override the resolved Qwen-Image-2.1 VAE companion (default: the `qwen_image_2.1_vae*.safetensors` file next to the DiT GGUF). Env: `TS_QWEN_IMAGE_VAE`. |
 | `--qwen-image-vl <path>` | Override the resolved Qwen3-VL-8B text-encoder GGUF (default: a `Qwen3VL-8B` / `Qwen3-VL-8B` GGUF next to the DiT). Env: `TS_QWEN_IMAGE_TE`. |
 | `--qwen-image-mmproj <path>` | Override the resolved Qwen3-VL-8B mmproj (vision grounding for edits) GGUF (default: a matching `mmproj` GGUF next to the DiT). Env: `TS_QWEN_IMAGE_MMPROJ`. |
-| `--qwen-image-lora` / `--offload-cpu` | **Removed and rejected at startup, including as config-file keys; no replacement.** Both served only the earlier Qwen-Image-Edit pipeline: Qwen-Image-2.1 loads no LoRA adapters and keeps its DiT weights resident. |
+| `--lora <path>` | Qwen-Image-2.1 LoRA plug-in: a LoRA `.safetensors` file or a TensorSharp plug-in config `.json` (see [`config/lora/`](config/lora/)). Repeat to stack LoRAs. Applied unmerged on top of the quantized transformer. Refused with any other model. Default: none. See [Qwen-Image-2.1 LoRA plug-ins](#qwen-image-21-lora-plug-ins). |
+| `--lora-scale <f>` | Strength of the preceding `--lora` (multiplies alpha / rank). Default: the plug-in config's `"scale"`, else `1.0`. |
+| `--lora-config <path>` | Companion config of the preceding `--lora`: a TensorSharp LoRA config, a PEFT `adapter_config.json` or a VideoX-Fun `pdd_config.json`. Default: none (a PDD bundle's `pdd_config.json`, and a PEFT `adapter_config.json` beside `adapter_model.safetensors`, are found next to the weights). |
+| `--qwen-image-lora` / `--offload-cpu` | **Removed and rejected at startup, including as config-file keys.** Both served only the earlier Qwen-Image-Edit pipeline. `--qwen-image-lora` is replaced by `--lora` above; `--offload-cpu` has no replacement, because Qwen-Image-2.1 keeps its DiT weights resident. |
+| `--penalty-last-n` / `--paged-kv-cache` / `--no-paged-kv-cache` | **Removed and rejected at startup, including as config-file keys** (exit code 1, `Configuration error: --penalty-last-n was removed: …`). `--penalty-last-n` was the CLI-only name of the repeat-penalty window: use `--repeat-last-n <N>`, the spelling both hosts and the `repeat_last_n` request field use. `--paged-kv-cache` / `--no-paged-kv-cache` were second spellings of `--paged-kv` / `--no-paged-kv`. |
 | `--width <px>` / `--height <px>` | Output size for Qwen-Image-2.1 and video generation. Default: `0` — auto (Qwen-Image-2.1: 2048×2048 for generation, or about that area at the first reference's aspect ratio for editing, and explicit sizes must be multiples of 32; MiniMax-H3: 640×384, or that area at the conditioning image's aspect ratio, rounded up to a multiple of 32; Wan: the model's native area at the input image's aspect ratio, 1280×704 for TI2V-5B and 832×480 otherwise). |
 | `--video-frames <N>` | Video frame count, snapped to the model's temporal grid (`4k+1` for Wan; `17k+5` for MiniMax-H3 — 5, 22, 39, 56, 73, 90 …). Default: 33; 49 for Wan2.2-TI2V, 22 for MiniMax-H3. `1` generates a still image where the model supports it (use `--output out.png`). |
 | `--fps <N>` | Playback frame rate of the saved MP4 (default: 16; 24 for Wan2.2-TI2V). Models trained at a fixed rate (MiniMax-H3, 24 fps) override any other value. |
@@ -425,7 +500,7 @@ script gets that error instead of watching a setting be ignored.
 | `--ref-audio <file>` | Reference audio clip. Repeatable; referred to as `<Audio 1>`, `<Audio 2>`, … Resampled to the audio VAE's 32 kHz stereo and truncated to the generated clip's duration. |
 | `--no-audio` | Skip audio decoding on models that generate an audio track jointly with the video (MiniMax-H3), saving the audio VAE's time and memory. Ignored by video-only models. |
 | _(renamed flags)_ | `--wan-vae`, `--wan-te` and `--wan-dit2` became `--video-vae`, `--video-text-encoder` and `--video-dit2` when video generation stopped being Wan-only. The old spellings are still accepted everywhere — on the CLI, on the server, and as config-file keys — so existing configs keep working unchanged. |
-| `--tp <N>` | Multi-GPU degree — how many GPUs to spread the model over in a single process (default: `1`). Which of the two multi-GPU modes you get is the architecture's business, not yours: **tensor parallelism** (the weights split *inside* every layer) where it is implemented, and a **layer split** (whole layers per GPU — capacity, not speed) on Qwen 3.8 Flash Next (`qwen4exp`) and DeepSeek V4. GLM 5.x layer-splits when this flag is omitted; on GGML GPU backends the flag selects its native local/single-process TP path for GLM-5.2, GLM-5.3 and GLM-5.3-Flash alike (on GLM-5.3 that is an accepted mode rather than a validated configuration — the caches replicate per rank — and `--spec` is refused there whenever `--tp N>1`, so speculation engages on the default layer split). On Qwen-Image-2.1 it shards the diffusion transformer (32/N heads and 12288/N MLP columns per GPU, N = 2, 4 or 8); the text encoder, vision encoder and VAE stay on the first GPU. An architecture that supports neither says so on stderr and runs on one GPU. Requires `--backend cuda`, `ggml_cuda`, or `ggml_vulkan`. See [Tensor Parallelism & Distributed Inference](#tensor-parallelism--distributed-inference). |
+| `--tp <N>` | Multi-GPU degree — how many GPUs to spread the model over in a single process (default: `1`). Which of the two multi-GPU modes you get is the architecture's business, not yours: **tensor parallelism** (the weights split *inside* every layer) where it is implemented, and a **layer split** (whole layers per GPU — capacity, not speed) on Qwen 3.8 Flash Next (`qwen4exp`) and DeepSeek V4. GLM 5.x layer-splits when this flag is omitted; on GGML GPU backends the flag selects its native local/single-process TP path for GLM-5.2, GLM-5.3 and GLM-5.3-Flash alike (on GLM-5.3 that is an accepted mode rather than a validated configuration — the caches replicate per rank — and `--spec` is refused there whenever `--tp N>1`, so speculation engages on the default layer split). On Qwen-Image-2.1 it shards the diffusion transformer (32/N heads and 12288/N MLP columns per GPU, for any GPU count that divides the 32 attention heads — 2, 4, 8 or 16 on one machine, given ggml's 16-device limit — subject to each weight type's block alignment when it is sharded; measured on 2 GPUs); the text encoder, vision encoder and VAE stay on the first GPU, and on `ggml_vulkan` it was measured slower than one GPU. An architecture that supports neither says so on stderr and runs on one GPU — DiffusionGemma, Wan and MiniMax-H3 included, which print `WARNING: --tp N ignored` — and a distributed group (`--tp-node-id` / `--tp-peers`) on such an architecture is refused at load (exit code 2). Requires `--backend cuda`, `ggml_cuda`, or `ggml_vulkan`. See [Tensor Parallelism & Distributed Inference](#tensor-parallelism--distributed-inference). |
 | `--tp-node-id <N>` | This node's 0-based ID for multi-node (distributed) tensor parallelism. Requires `--tp-peers`. |
 | `--tp-peers <list>` | Comma-separated `host:port` list of all nodes in the distributed TP cluster (e.g. `192.168.1.10:9500,192.168.1.11:9500`). Requires `--tp-node-id`. |
 | `--test` | Run built-in tokenizer, ChatML-template, and Ollama-comparison tests |
@@ -436,11 +511,13 @@ script gets that error instead of watching a setting be ignored.
 | `--log-file <0\|1>` | Disable (`0`) or enable (`1`) the file logger (default: enabled) |
 | `--log-console <0\|1>` | Disable (`0`) or enable (`1`) the console logger (default: enabled) |
 
-The CLI recognizes a small set of legacy projector filenames beside the model, but current repositories often use different names. Pass the downloaded file explicitly with `--mmproj` for reliable multimodal runs. `TensorSharp.Server` never auto-detects the projector.
+The CLI's companion lookup knows only the file names listed under `--mmproj`, and current repositories often use different ones, so pass the downloaded file explicitly with `--mmproj` for reliable multimodal runs. `TensorSharp.Server.Host` never auto-detects the projector.
+
+**Sampling defaults.** One-shot, JSONL and benchmark runs start greedy (temperature 0, top-k 0, top-p 1, repeat penalty 1.0), so they stay reproducible. `--interactive` does not: it starts from temperature 0.8, top-k 40, top-p 0.95, min-p 0.05 and `--repeat-last-n 64` (the repeat penalty stays at 1.0), then applies the GGUF's own `general.sampling.*` recommendations on top, and prints the chain it resolved. Any sampling flag you pass wins over both; `--temperature 0` gives greedy chat back.
 
 **JSONL input format:**
 
-Each line is a JSON object with `messages`, optional `prompt`, and optional sampling parameters:
+Each line is a JSON object with `messages`, optional `prompt`, and optional sampling parameters (`temperature`, `top_k`, `top_p`, `min_p`, `repetition_penalty`, `repeat_last_n`, `presence_penalty`, `frequency_penalty`, `seed`, `stop`). A field a line leaves out keeps the command-line value, the `--repeat-last-n` window included:
 
 ```json
 {"id": "q1", "messages": [{"role": "user", "content": "What is 2+3?"}], "max_tokens": 50}
@@ -459,7 +536,7 @@ Conversation:
 |---|---|
 | `/help`, `/?` | Show all interactive commands |
 | `/exit`, `/quit` | Leave the session |
-| `/reset`, `/new` | Clear conversation history and KV cache |
+| `/reset`, `/new` | Start a new conversation: clears the history and attachments; the shared system/tool prefix stays cached for reuse |
 | `/history` | Print the conversation history |
 | `/save <file>` | Append the current transcript to a UTF-8 file |
 | `/system <text>` | Set the system prompt (empty argument clears it). Resets KV cache. |
@@ -474,8 +551,8 @@ Model and runtime:
 |---|---|
 | `/info`, `/status` | Show the loaded model, backend, architecture, context/vocab size, projector, conversation depth, and pending attachments |
 | `/model <path>` | Load a different `.gguf` model on the current backend (resets the session) |
-| `/backend <name>` | Reload the current model on a different backend: `cpu`, `cuda`, `mlx`, `ggml_cpu`, `ggml_metal`, `ggml_cuda`, or `ggml_vulkan` |
-| `/mmproj <path>` | Load (or replace) the multimodal projector for the current model. Aliases: `/projector` |
+| `/backend <name>` | Reload the current model on a different backend: `cpu`, `cuda`, `ggml_cpu`, `ggml_metal`, `ggml_cuda`, or `ggml_vulkan` |
+| `/mmproj <path>` | Load (or replace) the multimodal projector for the current model. Aliases: `/projector`. Unloading one takes a reload: `/model <path>` |
 
 Sampling (live, persists across turns):
 
@@ -519,7 +596,7 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model ./models/
 
 # Web research through model-authored code. Network access is deliberately a
 # separate opt-in; --skills-allow-network would control bundled skill scripts instead.
-./TensorSharp.Server --model ~/work/models/Qwen/Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf \
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model ./models/Qwen3.6-35B-A3B-UD-IQ2_XXS.gguf \
     --backend ggml_metal --port 5001 --skills-allow-exec --code-exec \
     --code-exec-allow-install --code-exec-allow-network --max-tokens 256000
 
@@ -570,38 +647,45 @@ Open `http://localhost:5000` in your browser — the root URL serves the chat UI
 - Per-tab chat sessions: each browser tab owns its own tracked conversation history; KV blocks are owned by the inference engine
 - A single hosted GGUF selected explicitly with `--model`
 - An explicit hosted multimodal projector via `--mmproj` when needed
-- Full text and PDF document uploads, plus image, video, and audio uploads for multimodal inference (up to 500 MB)
+- Full text and PDF document uploads, plus image, video, and audio uploads for multimodal inference (500 MB per file by default; see `--upload-max-mb`)
 - Thinking/reasoning mode toggle
 - Tool calling with function definitions
-- Agent Skills: a picker for the skills the server has registered, and a live trace of every skill file the model reads while answering (hidden when the server reports no skills)
+- Agent Skills: a picker for the skills the server has registered (hidden when the server reports no skills)
+- One live activity panel for the tool step running now, replaced in place and removed when the reply finishes — completed steps are not kept as a transcript. While the model waits on sub-agents (`wait_agent`), the panel shows a collapsible "wait_agent · N sub-agents" section; expanded, it lists one card per sub-agent in the request's tree (id, role, status, task, current tool, result or error)
+- Download chips on the reply for files a `--code-exec` command produced, so getting a file never depends on the model repeating its link
 - Streaming token generation via Server-Sent Events
 - DiffusionGemma denoising previews when a `diffusion-gemma` GGUF is hosted (the UI replaces the whole assistant message on each denoising step, then emits the final answer)
+- Qwen-Image-2.1 image generation and editing when a `qwen_image` GGUF is hosted: a prompt alone generates an image, a prompt with attached images edits them, and the picture refreshes in place while it denoises. With a MiniMax-H3 or Wan model hosted, a prompt (plus an optional attached image) generates a video instead of chat text
 - Backward-compatible queue-status events (the engine itself handles concurrency)
 - Message editing and deletion with regeneration from any point in the conversation
 - Free scrolling: scroll up to read earlier replies while new tokens stream in; the chat auto-scrolls again as soon as the user scrolls back to the bottom
 
-Use `--model` to choose the hosted GGUF file and `--mmproj` to choose the hosted projector. `TensorSharp.Server` no longer scans a `MODEL_DIR`.
+Use `--model` to choose the hosted GGUF file and `--mmproj` to choose the hosted projector. `TensorSharp.Server.Host` no longer scans a `MODEL_DIR`.
 
 **Server command-line options:**
 
-Running `TensorSharp.Server` with no arguments prints the full parameter reference (description, default, and an example per option) and exits; `--help` does the same. Pass `--model` at startup for inference. Other options can start a model-less status process, but `/api/models/load` cannot select a GGUF that was not supplied at startup.
+Running `TensorSharp.Server.Host` (`dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll`) with no arguments prints the full parameter reference (description, default, and an example per option) and exits; `--help` does the same. Pass `--model` at startup for inference. Other options can start a model-less status process, but `/api/models/load` cannot select a GGUF that was not supplied at startup.
 
 | Option | Description |
 |---|---|
 | `--model <path>` | GGUF file to host (required for inference; when other options are passed without it, the server starts but `/api/models/load` will report no hosted model) |
-| `--mmproj <path>` | Multimodal projector GGUF (resolved relative to the model directory when only a filename is given; pass `none` to disable). Requires `--model`. |
-| `--backend <type>` | Default compute backend: `cpu`, `cuda`, `mlx`, `ggml_cpu`, `ggml_metal`, `ggml_cuda`, or `ggml_vulkan` |
-| `--tp <N>` | Multi-GPU degree — how many local GPUs to spread the hosted model over (default: `1`). Tensor parallelism where the architecture implements it; a layer split (whole layers per GPU — capacity, not speed) on Qwen 3.8 Flash Next (`qwen4exp`) and DeepSeek V4. GLM 5.x layer-splits when this flag is omitted; on GGML GPU backends the flag selects its native local/single-process TP path for GLM-5.2, GLM-5.3 and GLM-5.3-Flash alike (on GLM-5.3 an accepted mode rather than a validated configuration — the caches replicate per rank, so `--tp` multiplies the KV footprint). On Qwen-Image-2.1 it shards the diffusion transformer (32/N heads and 12288/N MLP columns per GPU, N = 2, 4 or 8); the encoders and VAE stay on the first GPU. Requires `--backend cuda`, `ggml_cuda`, or `ggml_vulkan`. Env: `TENSORSHARP_TP_DEGREE`. See [Tensor Parallelism & Distributed Inference](#tensor-parallelism--distributed-inference). |
+| `--mmproj <path>` | Multimodal projector: an mmproj GGUF, or — for the Gemma 4 family — a HuggingFace `.safetensors` shard holding the vision tower, for checkpoints published without an mmproj (DiffusionGemma's `model-00011-of-00011.safetensors`). Resolved relative to the model directory when only a filename is given; pass `none` to disable. Requires `--model`. A configured projector's download entry is skipped when `--mmproj` is given on the command line. |
+| `--embeddings` | Host a BERT/XLM-R GGUF embedding encoder instead of a chat model (see [Embedding service](#embedding-service)). Requires `--model` and refuses `--mmproj`; backends `cpu`, `ggml_cpu`, `ggml_metal` or `ggml_cuda`. The generation routes — chat, Responses, Ollama, `/v1/systemone`, and `/api/image-generate`, `/api/image-edit` and `/api/video-generate` with their `/stream` forms — answer 400 `This server hosts an embedding model. Use /v1/embeddings or /api/embed.` An explicit `--backend` this machine does not have exits 2 with `error: model load refused: Backend 'X' is not supported on this machine.` |
+| `--embedding-threads <N>` / `--embedding-context-size <N>` | CPU threads for the encoder (default: the backend chooses) and the per-input token limit (default: the model's context length; cannot exceed it). Positive integers only. Require `--embeddings`. |
+| `--port <N>` / `--host <address>` | Listen port and bind interface (defaults: `5000`, `0.0.0.0` — every interface). On macOS port 5000 is taken by the AirPlay Receiver, so pick another port or turn that off. Env: `PORT` / `HOST`. |
+| `--urls <urls>` | Full listen URL(s), semicolon-separated, for what `--port`/`--host` cannot express (HTTPS, several endpoints). `--port`/`--host` win when both are given. Without any of the three, `PORT`/`HOST` apply, then `ASPNETCORE_URLS`. |
+| `--backend <type>` | Default compute backend: `cpu`, `cuda`, `mlx`, `ggml_cpu`, `ggml_metal`, `ggml_cuda`, or `ggml_vulkan` (default `ggml_metal` on macOS, `ggml_cpu` elsewhere). Omitted on a machine that has the platform default, it logs nothing; if the platform default is missing, startup warns `The platform default backend 'X' is unavailable on this machine (available: …). Using 'Y' instead`. An explicit backend the machine lacks refuses the startup model's load (exit code 2); a model-less server warns and falls back to an available one. |
+| `--tp <N>` | Multi-GPU degree — how many local GPUs to spread the hosted model over (default: `1`). Tensor parallelism where the architecture implements it; a layer split (whole layers per GPU — capacity, not speed) on Qwen 3.8 Flash Next (`qwen4exp`) and DeepSeek V4. GLM 5.x layer-splits when this flag is omitted; on GGML GPU backends the flag selects its native local/single-process TP path for GLM-5.2, GLM-5.3 and GLM-5.3-Flash alike (on GLM-5.3 an accepted mode rather than a validated configuration — the caches replicate per rank, so `--tp` multiplies the KV footprint). On Qwen-Image-2.1 it shards the diffusion transformer (32/N heads and 12288/N MLP columns per GPU, for any GPU count that divides the 32 attention heads — 2, 4, 8 or 16 on one machine — subject to block alignment when the weights are sharded; measured on 2 GPUs); the encoders and VAE stay on the first GPU, and on `ggml_vulkan` it was measured slower than one GPU. DiffusionGemma, Wan and MiniMax-H3 have no multi-GPU path: `--tp N` prints `WARNING: --tp N ignored` and they run on one GPU, and a distributed group is refused at load. Requires `--backend cuda`, `ggml_cuda`, or `ggml_vulkan`. Env: `TENSORSHARP_TP_DEGREE`. See [Tensor Parallelism & Distributed Inference](#tensor-parallelism--distributed-inference). |
 | `--tp-node-id <N>` | This node's 0-based ID for multi-node (distributed) tensor parallelism. The server can only be node `0` (the driver that serves HTTP); start worker nodes with `TensorSharp.Cli`. Requires `--tp-peers`. Env: `TENSORSHARP_TP_NODE_ID`. |
 | `--tp-peers <list>` | Comma-separated `host:port` list of all nodes in the distributed TP cluster, ordered by node ID (e.g. `192.168.1.10:9500,192.168.1.11:9500`). Requires `--tp-node-id`. Env: `TENSORSHARP_TP_PEERS`. |
 | `--gpu-device <N>` | Vulkan device index for the `ggml_vulkan` backend on multi-GPU hosts (e.g. an integrated Intel GPU next to a discrete NVIDIA one). Defaults to device 0; use `--list-gpus` to see the indices. Also settable via the `TS_GGML_VULKAN_DEVICE` env var. |
 | `--list-gpus` | List the Vulkan devices ggml-vulkan can see (index + adapter name) and exit |
 | `--help` | Print the parameter reference (also shown when the server is started with no arguments) and exit |
-| `--max-tokens <N>` | Maximum tokens to generate: fills in when a request omits its own limit, and caps a request that asks for more. Applies to every endpoint (Web UI, `/api/chat`, `/api/generate`, `/v1/chat/completions`, `/v1/responses`). Default: `20000`, which is a plain default and does not cap. Env: `MAX_TOKENS`. |
-| `--skills-dir <path>` | Directory to scan for Agent Skills. Repeatable; scanned in the order given, up to three levels deep. Without it, a `skills` directory beside the binary is used and created if missing, which is also where `POST /api/skills` uploads land. A path that does not exist is a startup error. Env: `TS_SKILLS_DIR` (a path-separator-separated list). |
+| `--max-tokens <N>` | Maximum tokens to generate: fills in when a request omits its own limit, and caps a request that asks for more. Applies to every endpoint (Web UI `/api/chat`, Ollama `/api/chat/ollama` and `/api/generate`, `/v1/chat/completions`, `/v1/responses`). Default: `20000`, which is a plain default and does not cap. Env: `MAX_TOKENS`. |
+| `--skills-dir <path>` | Directory to scan for Agent Skills. Repeatable; scanned in the order given, up to three levels deep; an earlier root wins a name clash. Without it, every existing `.agents/skills` directory from the working directory up to its Git repository root is used (nearest first; outside a repository only the working directory is checked), followed by a `skills` directory beside the binary, which is created if missing. That `skills` directory beside the binary is also where `POST /api/skills` uploads land, and the server always scans it first, even when `--skills-dir` is given, so a skill there wins a name clash with any other root. Explicit roots replace only the `.agents/skills` defaults, and personal/global skill directories are never loaded automatically. A path that does not exist is a startup error. Env: `TS_SKILLS_DIR` (a path-separator-separated list). |
 | `--skill <name>` | Make a skill active for every request that does not name its own. Repeatable. A request's `skills` array overrides it. |
 | `--list-skills` | Print the skill registry — names, descriptions, files, warnings and load errors — and exit. |
-| `--no-skills` | Turn Agent Skills off: `/v1/skills` and `/api/skills` report the feature as disabled and a request's `skills` field is inert. Env: `TS_NO_SKILLS` (anything but `0` counts as on). |
+| `--no-skills` | Turn Agent Skills off: no skill is offered to the model, the `/v1/skills` and `/api/skills` routes are not mapped at all, and an OpenAI, Responses or Ollama chat request that names `skills` is rejected with HTTP 400 (`Agent skills are disabled on this server (--no-skills).`) rather than silently ignored. Env: `TS_NO_SKILLS` (anything but `0` counts as on). |
 | `--skills-no-discovery` | Do not advertise unselected skills to the model, so each request sees exactly the skills it named. Per request, `"skills_discovery": false` does the same. |
 | `--skills-allow-exec` | Allow `skills_run`. **Off by default. On a shared server this is a remote code execution primitive** — a skill is content somebody uploaded, and the decision to run one of its scripts is made by a model reading that same person's Markdown. Scripts use only known interpreters without a shell, run from the current Web session or private OpenAI/Ollama request workspace (or per-call scratch without code execution), and see the skill itself read-only. The default required sandbox refuses execution when safe OS confinement is unavailable. Env: `TS_SKILLS_ALLOW_EXEC` (anything but `0` counts as on). |
 | `--skills-max-rounds <n>` | How many times the model may fetch skill content - or run, read and fix code - before it must answer, 1-64 (default: `8`, or `24` when `--code-exec` is on; a value set here is used as given). Each round is a full generation. Env: `TS_SKILLS_MAX_ROUNDS`. |
@@ -619,10 +703,11 @@ Running `TensorSharp.Server` with no arguments prints the full parameter referen
 | `--code-exec-max-output <bytes>` | How much of one command's output is kept and shown to the model (default `32768`). What does not fit is dropped from the **middle**, keeping the head and the tail: the end of a build or a test run is where the failure is, and head-only truncation discards exactly the part that was wanted. |
 | `--code-exec-unconfined` | Run model-authored commands even where the OS cannot confine them. The server and CLI both accept this explicit escape hatch. Windows requires it and consequently leaves filesystem and network access unconfined; do not enable it on a server reachable by users you do not trust. |
 
-**How the shell is used, and what it may reach.** Everything the model does
-with files and code goes through that one command line — write, run, grep, read
-the traceback, fix — which is why `--skills-max-rounds` rises from 8 to 24 when
-this is on. Web UI keeps one filesystem workspace per chat session. Each OpenAI
+**How the shell is used, and what it may reach.** The shell runs programs,
+searches files and checks results; the model reads a file with `read_file`,
+creates one with `write_file` (create-only) and changes an existing one only with
+`apply_patch`, then runs the code, reads the traceback and fixes it — which is why
+`--skills-max-rounds` rises from 8 to 24 when this is on. Web UI keeps one filesystem workspace per chat session. Each OpenAI
 Chat, OpenAI Responses, or Ollama HTTP request instead gets a private workspace
 across its internal tool rounds, and the server deletes it after the response.
 Files and host-installed packages remain available within that lifetime, but
@@ -671,13 +756,16 @@ of quietly losing a setting.
 | `--video-text-encoder <path>` | Override the resolved text-encoder GGUF (UMT5-XXL for Wan, Qwen3-VL-32B for MiniMax-H3). Also spelled `--video-te`. Env: `TS_VIDEO_TEXT_ENCODER`; `--wan-te` still accepted. |
 | `--video-dit2 <path>` | Second diffusion expert on dual-expert models (Wan 2.2 A14B's high/low-noise partner of `--model`). Auto-resolved by name when the pair is co-located. Env: `TS_VIDEO_DIT2`; `--wan-dit2` still accepted. |
 | `--audio-vae <path>` | Audio VAE for models that generate an audio track jointly with the video (`minimax_h3_audio_vae_fp32.safetensors`). Without it such a model still runs and produces video, just no audio. Env: `TS_VIDEO_AUDIO_VAE`. |
-| `--qwen-image-lora` / `--offload-cpu` | **Removed and rejected at startup, including as config-file keys; no replacement.** Both served only the earlier Qwen-Image-Edit pipeline: Qwen-Image-2.1 loads no LoRA adapters and keeps its DiT weights resident. |
+| `--qwen-image-vae <path>` / `--qwen-image-vl <path>` / `--qwen-image-mmproj <path>` | Override the Qwen-Image-2.1 companions the server otherwise finds next to the DiT GGUF: the VAE, the Qwen3-VL-8B text encoder and its vision projector (needed for editing). Checked at startup. Env: `TS_QWEN_IMAGE_VAE`, `TS_QWEN_IMAGE_TE`, `TS_QWEN_IMAGE_MMPROJ`. |
+| `--width <px>` / `--height <px>` | Default Qwen-Image-2.1 output size for an image request that names neither a size nor an area (the Web UI sends none); a request that sets its own width/height or target area keeps its own geometry. The default needs both values. A side that is not a multiple of 32 is rounded down to one (never below 32) with a one-time `[qwen-image] WARNING`; with only one side given, or an unparsable or negative value, the default is ignored with a one-time warning and the automatic size (a 2048×2048 area) stays. A Qwen-Image server also warns at startup in either case; nothing is refused. A width/height set in the request itself must still be a positive multiple of 32. Env: `TS_QWEN_IMAGE_WIDTH` / `TS_QWEN_IMAGE_HEIGHT`. They are also aliases of `--video-width` / `--video-height`. |
+| `--lora <path>` / `--lora-scale <f>` / `--lora-config <path>` | Qwen-Image-2.1 LoRA plug-ins, same spelling and binding rules as on the CLI (repeat `--lora` to stack; scale and config bind to the preceding `--lora`). The files are checked at startup, and the set applies to every image request; a request's `steps` / `cfg` still override a plug-in's sampling recipe. Other models ignore them (the startup log says the plug-ins apply to Qwen-Image-2.1 models only). See [Qwen-Image-2.1 LoRA plug-ins](#qwen-image-21-lora-plug-ins). |
+| `--qwen-image-lora` / `--offload-cpu` | **Removed and rejected at startup, including as config-file keys.** Both served only the earlier Qwen-Image-Edit pipeline. `--qwen-image-lora` is replaced by `--lora` above; `--offload-cpu` has no replacement, because Qwen-Image-2.1 keeps its DiT weights resident. |
 | `--temperature <f>` | Sampling temperature (`0` = greedy) |
 | `--top-k <N>` | Top-K filtering (`0` = disabled) |
 | `--top-p <f>` | Nucleus sampling threshold (`1.0` = disabled) |
 | `--min-p <f>` | Min-p filtering (`0` = disabled) |
 | `--repeat-penalty <f>` | Repetition penalty (`1.0` = none) |
-| `--penalty-last-n <N>` | Tokens of history the repeat / presence / frequency penalties look back over. `0` disables them, `-1` uses the whole history (default: 64) |
+| `--repeat-last-n <N>` | Tokens of history the repeat / presence / frequency penalties look back over. `0` disables them, `-1` uses the whole history (default: 64). The CLI uses the same spelling; the former CLI-only `--penalty-last-n` is removed and refused at startup on both hosts, also as a config key. Env: `TENSORSHARP_REPEAT_LAST_N`. |
 | `--presence-penalty <f>` | Presence penalty (`0` = disabled) |
 | `--frequency-penalty <f>` | Frequency penalty (`0` = disabled) |
 | `--seed <N>` | Random seed (`-1` = non-deterministic) |
@@ -685,29 +773,32 @@ of quietly losing a setting.
 | `--sampling-precedence <config\|request>` | Who wins when a request also carries a sampling parameter you set above. `config` (default) keeps your value — clients such as VS Code Copilot Chat hardcode `temperature`/`top_p` into every request and would otherwise silently override your configuration; parameters you did **not** set still come from the request. `request` restores client-always-wins. Env: `TENSORSHARP_SAMPLING_PRECEDENCE`. |
 | `--n-cpu-moe <N>` / `-ncmoe <N>` | Keep the routed MoE weights of the first N layers in system RAM and run their FFN on the CPU (see **Mixture-of-Experts CPU offload** above). `all` offloads every layer. Default: 0 on every architecture, DeepSeek V4 and GLM 5.x included; a model that does not fit is refused at load with the number of layers that would make it fit. Env: `TS_N_CPU_MOE`. |
 | `--cpu-moe` / `-cmoe` | Shorthand for `--n-cpu-moe all`. Default: off. Env: `TS_CPU_MOE`. |
-| `--cpu-moe-threads <N>` | Worker threads for the host-side expert matmul. Default: half the usable CPU parallelism (`hardware_concurrency` clamped by the affinity mask and the cgroup CPU quota) on hosts with more than 8 cores. The server needs the other half for Kestrel, the scheduler and the accelerator submission threads; sizing this near the quota collapses throughput rather than degrading (20.7 tok/s at 64 threads vs 8.2 at 71 on a 95-CPU quota). Env: `TS_CPU_MOE_THREADS`. |
+| `--cpu-moe-threads <N>` | Worker threads for the host-side expert matmul. Default: half the usable CPU parallelism (`hardware_concurrency` clamped by the affinity mask and the cgroup CPU quota), capped at 64, on hosts with more than 8; all but one with 3 to 8; one with 2 or fewer (DeepSeek V4 / V4.1 and GLM-5.x on their native executors use every usable CPU once experts are offloaded, and GLM-5.x also on a GPU-less run). The server needs the other half for Kestrel, the scheduler and the accelerator submission threads; sizing this near the quota collapses throughput rather than degrading (20.7 tok/s at 64 threads vs 8.2 at 71 on a 95-CPU quota). Env: `TS_CPU_MOE_THREADS`. |
 | `--kv-cache-dtype <type>` | KV cache precision for the hosted model: `f32`, `f16`, `q8_0`, or `q4_0` (quantized caches trade small numerical drift for memory; see the CLI table above for the tier trade-offs). Default: auto — the backend/model pick. Env: `KV_CACHE_DTYPE`. |
 | `--continuous-batching` / `--no-continuous-batching` | Enable (default) or disable iteration-level paged-batching. When enabled the server admits / preempts sequences mid-batch and packs them into one forward pass on models that implement `IBatchedPagedModel`. `--no-continuous-batching` falls back to per-sequence KV-swap for every model. Alias: `--paged-batching` / `--no-paged-batching`. |
 | `--no-webui` | Do not serve the bundled web UI; `GET /` answers the plain liveness text instead. Every HTTP API endpoint, `/uploads` included, stays up. Env: `TS_NO_WEBUI` |
-| `--no-prefix-cache` | Disable runtime radix prefix reuse, startup shared-prompt warmup, and persistence between launches. Caching is enabled by default; the server warms and saves the shared prompt so later launches can restore it. |
+| `--upload-max-mb <N>` | Per-file cap on client-originated writes: multipart `/api/upload` files and base64 attachments decoded out of chat or Jev requests (default: `500`). The request-body limit of `POST /api/upload` follows the cap and never drops below 500 MB, so raising the cap is how a larger file gets in: upload it there and reference it by path. Every other route keeps the 500 MB request-body limit, and a base64 file grows by about a third on the wire, so an attachment inside a JSON request tops out near 375 MB whatever the cap. Env: `TS_UPLOAD_MAX_MB`. |
+| `--upload-quota-mb <N>` | Total budget for the upload directory — client uploads, decoded attachments and generated outputs (edited images, videos). A request that would exceed it is rejected before any model work runs. Default: off. Env: `TS_UPLOAD_QUOTA_MB`. |
+| `--upload-ttl-hours <N>` | Delete upload-directory files older than this many hours (fractions allowed). Default: off, because chat sessions reference attachments by path and may reuse them; enable it on a server untrusted clients can reach. Env: `TS_UPLOAD_TTL_HOURS`. |
+| `--no-prefix-cache` | Disable runtime radix prefix reuse (it sets `TS_SCHED_PREFIX_CACHE=0`), startup shared-prompt warmup, and persistence between launches. Caching is enabled by default; the server forwards the shared prompt once at startup and saves the result, so the first message of a process costs the same as any other (measured 21.8s → 0.7s on an agent configuration), and a later launch restores it. The files live in `prefix-cache/<model>/` beside the binary, at most two per model; `TENSORSHARP_PREFIX_CACHE_DIR` moves the root. |
 | `--prefill-chunk-size <N>` | Maximum prefill tokens per request in a mixed prefill+decode step, so active streams get frequent GPU turns (default: `256`). Prefill-only batches still divide and consume the full device token budget. Env: `TS_SCHED_PREFILL_CHUNK`. |
-| `--spec` / `--no-spec` | Enable speculative decoding (default off). `--spec` is the explicit opt-in for drafters embedded in the trunk checkpoint (Qwen 3.6's, GLM 5.2's and GLM-5.3's NextN blocks), because loading them pages extra weights into VRAM; a drafter that ships as its own GGUF is enabled by `--draft-model` alone, and an explicit `--no-spec` vetoes either. Engages for solo (non-concurrent) sequences: the draft head proposes up to `--spec-draft` tokens per step and the trunk verifies them in one batched forward, with the request's own sampler (penalties included) driving both drafting and verification, so output matches standard decode up to floating-point near-ties between the verify and decode kernels ([what greedy parity delivers](docs/speculative_decoding.md#what-greedy-parity-delivers)). Engaged automatically only where profitable: Qwen 3.6 reports its embedded NextN block profitable on every backend, while Gemma 4's separate draft head engages on the ggml backends and on the direct `cuda` backend only. CPU / GGML CPU / MLX serve standard decode. GLM-5.3-Flash (`glm5next`) builds no draft head (its NextN block is not implemented), so `--spec` alone serves standard decode there; `--spec --spec-type ngram` engages the weight-free n-gram drafter, with the KDA recurrent state snapshotted before every verify and restored on a partial rejection (default window 3; see the [GLM card](docs/models/glm.md#speculative-decoding-on-glm-53-flash)). Env: `TS_SPEC` (legacy `TS_MTP_SPEC`). |
-| `--spec-type <name>` | Speculation algorithm: `auto` (default) / `draft-head` / `block` / `ngram`. `ngram` needs no trained weights and works on every model — it drafts by finding where the last few tokens occurred earlier in the context and proposing what followed, so it is strong wherever the answer quotes its input. Env: `TS_SPEC_TYPE`. |
+| `--spec` / `--no-spec` | Enable speculative decoding (default off). `--spec` is the explicit opt-in for drafters embedded in the trunk checkpoint (the NextN blocks of Qwen 3.6, Qwen 3.8 27B, GLM 5.2 and GLM-5.3) and for `--spec-type ngram`, because loading them pages extra weights into VRAM; a drafter that ships as its own GGUF is enabled by `--draft-model` alone, and an explicit `--no-spec` vetoes either. Engages for solo (non-concurrent) sequences: the draft head proposes up to `--spec-draft` tokens per step and the trunk verifies them in one batched forward, with the request's own sampler (penalties included) driving both drafting and verification, so output matches standard decode up to floating-point near-ties between the verify and decode kernels ([what greedy parity delivers](docs/speculative_decoding.md#what-greedy-parity-delivers)). Engaged automatically only where profitable: Qwen 3.6 reports its embedded NextN block profitable on every backend, while Gemma 4's separate draft head engages on the ggml backends (`ggml_cpu` included) and on the direct `cuda` backend only, so Gemma 4 on `cpu` or `mlx` serves standard decode. `--spec` does not turn off radix prefix reuse. GLM-5.3-Flash (`glm5next`) builds no draft head (its NextN block is not implemented), so `--spec` alone serves standard decode there; `--spec --spec-type ngram` engages the weight-free n-gram drafter, with the KDA recurrent state snapshotted before every verify and restored on a partial rejection (default window 3; see the [GLM card](docs/models/glm.md#speculative-decoding-on-glm-53-flash)). Env: `TS_SPEC` (legacy `TS_MTP_SPEC`). |
+| `--spec-type <name>` | Speculation algorithm: `auto` (default) / `draft-head` / `block` / `ngram`. It never turns speculation on — neither do `--spec-draft` and `--spec-pmin` — so pair it with `--spec` (or a `--draft-model`); given without either, and with `TS_SPEC` unset, the server logs a startup WARNING that speculation stays off. `ngram` needs no trained weights — it drafts by finding where the last few tokens occurred earlier in the context and proposing what followed, so it is strong wherever the answer quotes its input. It still needs a family that can verify a draft: not GPT-OSS, Mistral 3, Qwen 3 / Qwen 2 or Hunyuan Dense (no speculative path), not DeepSeek V4 / V4.1 or Muse-Glimmer without their drafter loaded, and never Nemotron-H (see the CLI table above). Env: `TS_SPEC_TYPE`. |
 | `--spec-draft <N>` | Maximum tokens drafted per speculative step (default `8`; a block drafter clamps it to its trained block size, which is also its default there). On Qwen 3.5 under the GGML backends, keep a typed value at 7 or lower — nine verify rows are a known correctness bug. Env: `TS_SPEC_DRAFT` (or `TS_MTP_DRAFT`). |
 | `--spec-pmin <f>` | Draft-confidence gate in `[0, 1]`; drafting stops at the first token below it, and `0` means never gate. Default per algorithm — `0.15` for a per-token draft head (top-1 probability over its top-10 logits), `0.35` for a block drafter (the CUMULATIVE prefix probability, so far stricter), `0` for n-gram. Env: `TS_SPEC_PMIN` (or `TS_MTP_PMIN`). |
-| `--draft-model <path>` | Speculative-decoding draft model, for every drafter that ships as its own file: DeepSeek V4's DSpark support GGUF (see [DeepSeek V4](docs/models/deepseek4.md#dspark-speculative-decoding)), Muse-Glimmer's DFlash and Qwen 3.8's DFlash2 block drafters (see [Muse-Glimmer](docs/models/muse-glimmer.md#3-dflash-speculative-decoding), env `TS_MUSE_GLIMMER_DFLASH`), and Gemma 4's `gemma4-assistant` per-token head. The file's own `general.architecture` decides how it loads — the operator never picks a mechanism — and naming a file here enables speculation by itself, with an explicit `--no-spec` as the veto. The draft's hidden size must match the target (e.g. pair the 12B target with its 12B draft, not the 26B-A4B draft); a mismatched or incomplete draft fails fast at startup with a remediation hint. Qwen 3.6, GLM 5.2 and GLM-5.3 embed their NextN block in the trunk GGUF and need no such flag — they take `--spec` instead. A block drafter drafts a whole block per step and the trunk verifies it in one batched forward. Every emitted token is still drawn from a trunk row — with argmax under a greedy config, with the run's own sampler otherwise — so the output stream is unchanged either way, up to floating-point near-ties between the verify and decode kernels ([what greedy parity delivers](docs/speculative_decoding.md#what-greedy-parity-delivers)). Block drafting engages with `--backend cuda` or `--backend ggml_cuda` (on the CLI, on every single-sequence path — `--input`, `--multi-turn-jsonl` and `--interactive`). One caveat under a penalized sampler: a block drafter proposes its whole block in one pass, so the repetition/presence/frequency penalties that verification applies are not applied to the proposal, and acceptance falls as the penalized history grows. A per-token head does not have that problem — its drafts are penalized with the same history. Env: `TS_SPEC_DRAFT_MODEL` (legacy `TS_MTP_DRAFT_MODEL`), `TS_DSV4_DSPARK`. **Nemotron-H refuses it:** an explicit `--draft-model` (such as Nemotron 3.5 Lightning's DSpark GGUF) stops server startup with the model's reason and says to drop the flag, and `--spec`/`--spec-type ngram` serve plain decoding with a one-time warning, because that trunk's verify and decode kernels disagree and speculation would change the output (see [speculative decoding](docs/speculative_decoding.md#nemotron-h-refuses-speculation)). |
-| `--paged-kv` / `--no-paged-kv` | Legacy compatibility flags for the removed per-session paged-KV manager. Current server KV state is engine-owned; use continuous-batching / `TS_SCHED_*` knobs for the engine. Aliases: `--paged-kv-cache` / `--no-paged-kv-cache`. |
-| `--paged-kv-block-size <N>` | Legacy standalone paged-KV block size. The current server engine uses `TS_SCHED_BLOCK_SIZE`. |
-| `--paged-kv-ram-mb <N>` | Legacy standalone paged-KV RAM-tier cap. |
-| `--paged-kv-ssd-dir <dir>` | Legacy standalone paged-KV SSD cold-tier directory. |
-| `--paged-kv-ssd-mb <N>` | Legacy standalone paged-KV SSD cap. |
-| `--paged-kv-quant-bits <0\|4\|8>` | Legacy standalone paged-KV block quantization accepted by the server (`4`/`8` = symmetric). The runtime env var also accepts `2` for affine min+scale, and the CLI accepts `0\|2\|4\|8`. |
-| `--redis-url <url>` | Redis connection string enabling both the shared KV cache tier and the Responses API store (e.g. `localhost:6379`). Sets both `TS_KV_CACHE_REDIS_URL` and `TS_RESPONSES_STORE_REDIS_URL`. |
-| `--paged-kv-redis-url <url>` | Redis connection string for the shared KV cache tier only (e.g. `localhost:6379`). Env: `TS_KV_CACHE_REDIS_URL`. |
-| `--paged-kv-redis-ttl <min>` | TTL in minutes for Redis KV cache entries; `0` = no TTL (default: `1440`, i.e. 24 hours). Env: `TS_KV_CACHE_REDIS_TTL_MINUTES`. |
+| `--draft-model <path>` | Speculative-decoding draft model, for every drafter that ships as its own file: DeepSeek V4's DSpark support GGUF (see [DeepSeek V4](docs/models/deepseek4.md#dspark-speculative-decoding)), Muse-Glimmer's DFlash and Qwen 3.8's DFlash2 block drafters (see [Muse-Glimmer](docs/models/muse-glimmer.md#3-dflash-speculative-decoding), env `TS_MUSE_GLIMMER_DFLASH`), Gemma 4's `gemma4-assistant` per-token head, and Qwen 3.8 Flash Next's shared MTP head (GGML backends only; it drafts only for a solo request that prefilled from position 0 — see [its card](docs/models/qwen38-flash-next.md#speculative-decoding-with-the-shared-mtp-head)). DeepSeek V4.1 accepts a `deepseek41-dspark` drafter on `ggml_cuda` / `ggml_cpu` only — experimental, validated only on synthetic fixtures, with no trained drafter measured. The file's own `general.architecture` decides how it loads — the operator never picks a mechanism — and naming a file here enables speculation by itself, with an explicit `--no-spec` as the veto. The draft's hidden size must match the target (e.g. pair the 12B target with its 12B draft, not the 26B-A4B draft); a mismatched or incomplete draft fails fast at startup with a remediation hint. Qwen 3.6, Qwen 3.8 27B, GLM 5.2 and GLM-5.3 embed their NextN block in the trunk GGUF and need no such flag — they take `--spec` instead. A block drafter drafts a whole block per step and the trunk verifies it in one batched forward. Every emitted token is still drawn from a trunk row — with argmax under a greedy config, with the run's own sampler otherwise — so the output stream is unchanged either way, up to floating-point near-ties between the verify and decode kernels ([what greedy parity delivers](docs/speculative_decoding.md#what-greedy-parity-delivers)). DeepSeek V4's DSpark block drafting needs `--backend cuda` or `--backend ggml_cuda`; the DFlash / DFlash2 drafters (Muse-Glimmer, Qwen 3.8) run as one fused GGML graph per pass on CUDA, Vulkan and Metal ([where it runs](docs/speculative_decoding.md#where-it-runs)), on one GPU: under `--tp N` > 1 a DFlash / DFlash2 drafter cannot activate, so an explicit one stops server startup (exit code 2) with a message saying to drop `--draft-model`. One caveat under a penalized sampler: a block drafter proposes its whole block in one pass, so the repetition/presence/frequency penalties that verification applies are not applied to the proposal, and acceptance falls as the penalized history grows. A per-token head does not have that problem — its drafts are penalized with the same history. Env: `TS_SPEC_DRAFT_MODEL` (legacy `TS_MTP_DRAFT_MODEL`), `TS_DSV4_DSPARK`. **Nemotron-H refuses it:** an explicit `--draft-model` (such as Nemotron 3.5 Lightning's DSpark GGUF) stops server startup with the model's reason and says to drop the flag, and `--spec`/`--spec-type ngram` serve plain decoding with a one-time warning, because that trunk's verify and decode kernels disagree and speculation would change the output (see [speculative decoding](docs/speculative_decoding.md#nemotron-h-refuses-speculation)). |
+| `--paged-kv` / `--no-paged-kv` | Legacy flags of the standalone `PagedKvCacheManager` (RAM / SSD / Redis tiers, TurboQuant codec), which only the CLI's `--paged-bench` builds (with its RAM / SSD tiers only). The server accepts them (their values are still validated) and sets the matching `TS_KV_*` variables, but **no server request uses them**: request KV state is engine-owned, so use the continuous-batching / `TS_SCHED_*` knobs. Startup logs one WARNING naming every such flag it was given, and names `--paged-bench` and the radix prefix cache as what serves reuse. The rows below are inert on the serving path in the same way, except the Responses-store half of `--redis-url`. The former aliases `--paged-kv-cache` / `--no-paged-kv-cache` are removed and refused at startup on both hosts, also as config keys. |
+| `--paged-kv-block-size <N>` | Legacy standalone paged-KV block size (inert on the server). The engine uses `TS_SCHED_BLOCK_SIZE`. |
+| `--paged-kv-ram-mb <N>` | Legacy standalone paged-KV RAM-tier cap (inert on the server). |
+| `--paged-kv-ssd-dir <dir>` | Legacy standalone paged-KV SSD cold-tier directory (inert on the server). |
+| `--paged-kv-ssd-mb <N>` | Legacy standalone paged-KV SSD cap (inert on the server). |
+| `--paged-kv-quant-bits <0\|2\|4\|8>` | Legacy standalone paged-KV block quantization (`2` = affine min+scale, `4`/`8` = symmetric), the same set the CLI takes. Inert on the server. |
+| `--redis-url <url>` | Redis connection string (e.g. `localhost:6379`) for the Responses API store (`--help` lists it under "Responses API store"). Sets `TS_RESPONSES_STORE_REDIS_URL`, which moves that store to Redis (an already-set `TS_RESPONSES_STORE_REDIS_URL` wins; in-memory otherwise), and `TS_KV_CACHE_REDIS_URL`, which the server never reads (see [Redis-backed shared state](#redis-backed-shared-state)). Startup logs `Redis configured via --redis-url: the Responses API store uses <url>.` |
+| `--paged-kv-redis-url <url>` | Legacy: Redis connection string for the standalone manager's KV tier. Accepted and logged, inert on the server. Env: `TS_KV_CACHE_REDIS_URL`. |
+| `--paged-kv-redis-ttl <min>` | Legacy: TTL in minutes for that tier's entries; `0` = no TTL (default: `1440`). Inert on the server. Env: `TS_KV_CACHE_REDIS_TTL_MINUTES`. |
 
 Per-request fields in the chat / generate JSON payloads (e.g. `temperature`,
-`top_p`, `top_k`, `min_p`, `repeat_penalty`, `presence_penalty`,
+`top_p`, `top_k`, `min_p`, `repeat_penalty`, `repeat_last_n`, `presence_penalty`,
 `frequency_penalty`, `seed`, `stop`/`stop_sequences`) fill in every parameter
 you did **not** configure above. For a parameter you *did* configure, the
 default `--sampling-precedence config` keeps your value and ignores the
@@ -716,6 +807,38 @@ with no way for the end user to change them, so an unconfigured server-side
 value is the only one a request can move. Pass `--sampling-precedence request`
 for the inverse (clients always win), which is what versions before this flag
 did unconditionally.
+
+**Sub-agents (multi-agent delegation).** On the server's chat paths —
+`/v1/chat/completions`, `/v1/responses`, Ollama `/api/chat/ollama` and the Web
+UI's `/api/chat` — a model can hand independent parts of a request to bounded
+child agents through five built-in tools (`spawn_agent`, `wait_agent`,
+`send_input`, `close_agent`, `list_agents`) and then combine their reports into one
+answer. It is on by default and the model decides whether to delegate; nothing
+forces a spawn. It does not depend on `--code-exec` or Agent Skills. Every family
+that renders tool declarations and has a tool parser takes part — not Mistral 3,
+Hunyuan Dense or DiffusionGemma — and there is no model-size gate. A child runs on
+the same model and sampling as its parent with its own copy of the KV state; the
+parent's shared prompt prefix is checkpointed so siblings restore it instead of
+prefilling it again. `explorer` and `reviewer` children are always read-only, a
+`worker` is read-only unless `--agents-allow-worker-tools` is set, host tool calls
+across one request's tree run one at a time, and client-supplied tools are never
+passed to a child. A request can send `"multi_agent": false` to opt out; it cannot
+turn delegation on where the host turned it off, raise a limit, or enable worker
+tools. TensorAgent enables delegation the same way; the CLI has no sub-agents. No
+latency, quality or delegation-rate measurements are published. Full design:
+[Multiple agents](docs/multi_agent.md).
+
+| Option | Description |
+|---|---|
+| `--no-multi-agent` | Disable delegation. Env: `TS_NO_MULTI_AGENT` (any non-empty value other than `0`). |
+| `--agents-max-concurrent <N>` | Child agents active at once across a request's tree, the root excluded (default `3`, range 1-32). |
+| `--agents-max-count <N>` | Child agents created per request (default `8`, range 1-128). |
+| `--agents-max-depth <N>` | Delegation depth; the root's children are depth 1, so grandchildren are allowed by default (default `2`, range 1-8). |
+| `--agents-max-rounds <N>` | Tool-loop rounds per child turn (default `8`, range 1-64). |
+| `--agents-max-generations <N>` | Generation budget shared by all descendants of one request (default `48`, range 1-1024). |
+| `--agents-timeout <seconds>` | Time limit of one child run (default `180`, range 1-3600). |
+| `--agents-max-result-chars <N>` | Characters of one child report handed back to the parent (default `8000`, range 256-64000). |
+| `--agents-allow-worker-tools` | Let `worker` children use the parent's permitted mutable tools (the shell, file writes and patches, `skills_run`). Explorers and reviewers stay read-only. Off by default. |
 
 **Runtime environment variables:**
 
@@ -733,6 +856,7 @@ did unconditionally.
 | `TENSORSHARP_TOP_P` | Top-P when `--top-p` is not passed (same precedence rule) |
 | `TENSORSHARP_MIN_P` | Min-P when `--min-p` is not passed (same precedence rule) |
 | `TENSORSHARP_REPEAT_PENALTY` | Repetition penalty when `--repeat-penalty` is not passed (same precedence rule) |
+| `TENSORSHARP_REPEAT_LAST_N` | Penalty window when `--repeat-last-n` is not passed (same precedence rule) |
 | `TENSORSHARP_PRESENCE_PENALTY` | Presence penalty when `--presence-penalty` is not passed (same precedence rule) |
 | `TENSORSHARP_FREQUENCY_PENALTY` | Frequency penalty when `--frequency-penalty` is not passed (same precedence rule) |
 | `TENSORSHARP_SEED` | Random seed when `--seed` is not passed (same precedence rule) |
@@ -741,7 +865,10 @@ did unconditionally.
 | `TENSORSHARP_LOG_DIR` | Directory the JSON-line file logger writes to (default: `<binDir>/logs`). Also honored by `TensorSharp.Cli`. |
 | `TENSORSHARP_LOG_FILE` | Set to `0` to disable the file logger and keep only the console output (default: enabled). Also honored by `TensorSharp.Cli`. |
 | `TENSORSHARP_UPLOAD_DIR` | Directory for uploaded media and extracted video frames (default: `<binDir>/uploads`); point it outside the application directory for read-only or pinned deployments. Server only. |
-| `TENSORSHARP_TP_DEGREE` | Multi-GPU degree — number of local GPUs to spread the model over (default: `1`). Fallback in `ModelBase.Create` when no `--tp` flag is passed; both `TensorSharp.Cli` and `TensorSharp.Server` expose it as `--tp <N>`. Requires `--backend cuda`, `ggml_cuda`, or `ggml_vulkan`. On the architectures that run a layer split instead of tensor parallelism (`qwen4exp`, DeepSeek V4) it is a device count, not a shard count. |
+| `TS_UPLOAD_MAX_MB` / `TS_UPLOAD_QUOTA_MB` / `TS_UPLOAD_TTL_HOURS` | Upload per-file cap (default `500`), directory quota (default off) and file lifetime (default off) when `--upload-max-mb` / `--upload-quota-mb` / `--upload-ttl-hours` are not passed. Server only. |
+| `TENSORSHARP_PREFIX_CACHE_DIR` | Root of the persisted shared-prefix checkpoints (default: `<binDir>/prefix-cache`, one subdirectory per model). Server only; `--no-prefix-cache` turns persistence off. |
+| `TS_NO_MULTI_AGENT` | Any non-empty value other than `0` disables sub-agent delegation, like `--no-multi-agent`. Server only. |
+| `TENSORSHARP_TP_DEGREE` | Multi-GPU degree — number of local GPUs to spread the model over (default: `1`). Fallback in `ModelBase.Create` when no `--tp` flag is passed; both `TensorSharp.Cli` and `TensorSharp.Server.Host` expose it as `--tp <N>`. Requires `--backend cuda`, `ggml_cuda`, or `ggml_vulkan`. On the architectures that run a layer split instead of tensor parallelism (`qwen4exp`, DeepSeek V4) it is a device count, not a shard count. |
 | `TENSORSHARP_TP_DEVICES` | GPU ordinals the TP ranks map to, comma-separated (e.g. `0,2`; default `0..tp-1`). Used by TP on the GGML backends. |
 | `TS_Q4E_LAYER_SPLIT` | Explicit per-GPU layer counts for the Qwen 3.8 Flash Next (`qwen4exp`) multi-GPU layer split, comma-separated (e.g. `20,28`), replacing the automatic VRAM balance. Throws rather than silently ignoring a value it cannot honour. |
 | `TENSORSHARP_TP_NODE_ID` | This node's 0-based ID for multi-node distributed tensor parallelism. Must be set together with `TENSORSHARP_TP_PEERS`. |
@@ -750,11 +877,14 @@ did unconditionally.
 | `TENSORSHARP_TP_RECV_TIMEOUT_SECONDS` | Per-receive timeout for a blocking read from a peer (default: `300`). A stalled peer fails the collective instead of hanging on the OS TCP keepalive (often 2+ hours). |
 | `TENSORSHARP_TP_DISABLE_P2P` | Set to `1` to force every cross-GPU transfer through host staging instead of CUDA peer-to-peer DMA. Slower, but reproduces the code path taken by hardware without peer access (A16 vGPU profiles, some consumer cards) and isolates P2P-specific defects. |
 | `TENSORSHARP_TP_HOST_ALLREDUCE` | Set to `1` to run the local AllReduce through host memory (device→host, sum, host→device) instead of the device-to-device P2P path. Diagnostic fallback that mirrors the known-good multi-node reduce. |
-| `TS_KV_CACHE_REDIS_URL` | Redis connection string for the shared KV cache tier (e.g. `localhost:6379`). When set, KV cache blocks are persisted to Redis for cross-session reuse. CLI: `--redis-url` or `--paged-kv-redis-url`. |
-| `TS_KV_CACHE_REDIS_TTL_MINUTES` | TTL in minutes for Redis KV cache entries; `0` = no TTL (default: `1440`). CLI: `--paged-kv-redis-ttl`. |
-| `TS_RESPONSES_STORE_REDIS_URL` | Redis connection string for the OpenAI Responses API store. When set, `RedisResponsesStore` replaces the in-memory store. CLI: `--redis-url`. |
+| `TS_KV_CACHE_REDIS_URL` | Legacy: Redis connection string for the Redis tier of the standalone `PagedKvCacheManager`. No shipped path builds that tier: the server never creates the manager, and the CLI's `--paged-bench` builds it from the RAM / SSD settings only. It has no effect; `--redis-url` / `--paged-kv-redis-url` set it and the server only logs it at startup. |
+| `TS_KV_CACHE_REDIS_TTL_MINUTES` | Legacy: TTL in minutes for that tier's entries; `0` = no TTL (default: `1440`). Inert, like `TS_KV_CACHE_REDIS_URL`. Server flag: `--paged-kv-redis-ttl`. |
+| `TS_RESPONSES_STORE_REDIS_URL` | Redis connection string for the OpenAI Responses API store. When set, `RedisResponsesStore` replaces the in-memory store. Server flag: `--redis-url`. |
 | `DIFFUSION_STEPS` | Server-side DiffusionGemma denoising steps per block (default: `48`; CLI equivalent is `--diffusion-steps`) |
 | `DIFFUSION_MAX_BATCH` | Maximum concurrent DiffusionGemma requests batched by the Web UI diffusion scheduler (default: `2`) |
+| `TS_JEV_MAX_BODY_MB` | Request-body cap of the Jev endpoint `POST /v1/systemone`, 1-64 (default: `8`), because inline images travel base64-encoded in the body |
+| `TS_JEV_MAX_CANVAS` | Largest Jev answer canvas in tokens, 8-4096 (default: `64`, also bounded by the checkpoint's canvas width); a larger question schema is split into chunks |
+| `TS_JEV_MAX_PENDING` | Jev requests admitted at once, the running one included, 1-1024 (default: `32`); the next one gets HTTP 529 with `Retry-After: 1` |
 
 **Paged KV cache & continuous-batching tunables (read at process / model start)**
 
@@ -762,7 +892,7 @@ These can be set with either the `--paged-kv*` / `--continuous-batching` CLI fla
 
 | Variable | Description |
 |---|---|
-| `TS_KV_PAGED_CACHE` | Legacy compatibility switch for the standalone `PagedKvCacheManager`; current `TensorSharp.Server` request KV state is engine-owned. The CLI shortcuts are `--paged-kv` / `--no-paged-kv`. |
+| `TS_KV_PAGED_CACHE` | Legacy compatibility switch for the standalone `PagedKvCacheManager`; the server's current request KV state is engine-owned. The CLI shortcuts are `--paged-kv` / `--no-paged-kv`. |
 | `TS_KV_BLOCK_SIZE` | Legacy standalone paged-KV block size. The engine uses `TS_SCHED_BLOCK_SIZE`. |
 | `TS_KV_CACHE_MAX_RAM_MB` | Legacy standalone paged-KV RAM-tier cap. |
 | `TS_KV_CACHE_SSD_DIR` | Legacy standalone paged-KV SSD cold-tier directory. |
@@ -781,7 +911,7 @@ These can be set with either the `--paged-kv*` / `--continuous-batching` CLI fla
 | `TS_RETAINED_FUSED_CACHE` | `1` (default) retains a finished request's fused holder so an exact-prefix continuation skips re-prefilling it, on models that advertise support (Gemma 4 K/V; Qwen 3.5/3.6 attention K/V plus GatedDeltaNet recurrent state). `0` disables it (VRAM cap / A-B). |
 | `TS_RETAINED_FUSED_CACHE_MAX` | LRU budget of retained fused holders (default: `4`); each pins a complete per-request continuation state. |
 | `TS_MM_EMBEDDING_CACHE_MB` | Byte budget of the image/audio embedding cache (default: `512`). Entries are keyed by media content (SHA-256), so an API client resending the same image every turn encodes it once; least-recently-used entries no in-flight prompt references are evicted past the budget. |
-| `TS_PREFIX_CHECKPOINTS` | `1` (default) checkpoints the model state at the end of the prompt every conversation shares — system prompt, tools, skills — and starts each **new** chat from a clone of it, so a new chat re-prefills only its own message. Gemma 4 and Qwen 3.5/3.6 on the GGML backends. `0` disables. |
+| `TS_PREFIX_CHECKPOINTS` | `1` (default) checkpoints the model state at the end of the prompt every conversation shares — system prompt, tools, skills — and starts each **new** chat from a clone of it, so a new chat re-prefills only its own message. Gemma 4 and the Qwen 3.5 / 3.6 / 3.8-27B family on the GGML backends, and Qwen 3.8 Flash Next; the Qwen models not under tensor parallelism. `0` disables. |
 | `TS_PREFIX_CHECKPOINTS_MAX` | How many distinct shared prefixes stay checkpointed at once, LRU (default: `2`). Each holds one copy of that prefix's K/V and, on Qwen, its recurrent state. |
 | `TS_KV_INITIAL_TOKENS` | Tokens of K/V a cache is given when it is created — the primary cache at load and every per-request holder — before any request declares a budget. `0` (default) keeps the engine policy: the whole window when `MAX_CONTEXT` is explicit, otherwise a backend default. The cache still grows on demand, so a memory-constrained device sets this small because every kept holder is paid at this size, host copy and device mirror both. |
 | `TS_KV_GENERATION_RESERVE_MAX` | Caps the generation share of the K/V a request reserves up front (prompt + `max_new_tokens`). Without it, a reply limit at or above the context window reserves the whole window per request. Past the cap the cache grows on demand. `0` (default) = uncapped. |
@@ -797,7 +927,7 @@ These can be set with either the `--paged-kv*` / `--continuous-batching` CLI fla
 | `TS_MAMBA2_PREFILL_CACHE_MB` | Nemotron-H: device memory (MiB) the cached native Mamba2 prefill graphs may hold, least recently used first out (default 1024). A graph larger than the budget serves its call and is released. |
 | `TS_PAGED_ATTN_KERNEL` | Paged-attention dispatch kernel for `Mistral3Model.BatchedForward` and `HunyuanDenseModel.BatchedForward`: `native` (default), `tensor` (C# Tensor-based), or `managed` (pure C# scalar). |
 | `TS_HUNYUAN_BATCHED` | Set to `0` to force Hunyuan Dense onto the per-sequence KV-snapshot swap path (default: batched/paged; a block-quantized KV cache always uses the snapshot path). |
-| `TS_MLX_PIPELINED_DECODE` | `1` (default) enables pipelined greedy decode on the MLX backend when the request is greedy, has no stop sequences, and the model supports device-side argmax / next-embedding lookup. Set to `0` to disable. CLI only. |
+| `TS_MLX_PIPELINED_DECODE` | `1` (default) lets the CLI's `--benchmark` decode loop use pipelined greedy decode on the MLX backend when the model supports device-side argmax / next-embedding lookup; `0` forces the host-sync path. Normal generation does not read it. |
 | `TS_MLX_MLOCK_GGUF` | `1` (default) pins the GGUF mmap region in physical RAM via `mlock(2)` so model weights stay resident between forward passes. Set to `0` to skip (use if the process `memlock` rlimit is too low or you want the OS to manage paging). MLX backend only. |
 | `TS_MLX_FUSED_KV_WRITE` | `1` (default) uses a single multi-dim `slice_update` to write the per-token KV block. Set to `0` to revert to the per-head loop (A/B testing / regression isolation). |
 | `TS_MLX_BATCHED_MOE_DECODE` | `1` (default) collapses K per-expert decode dispatches to one batched dispatch per (gate/up/down) kind for Qwen 3.5/3.6 MoE. Set to `0` on memory-constrained machines (saves ~weight-doubling overhead from the stacked weight slabs). |
@@ -817,7 +947,7 @@ These gate the optional speculative decode path (see [Speculative Decoding](FEAT
 | `TS_SPEC_TYPE` | Speculation algorithm: `auto` (default) / `draft-head` / `block` / `ngram`. CLI: `--spec-type`. |
 | `TS_SPEC_DRAFT` *(legacy `TS_MTP_DRAFT`)* | Maximum tokens drafted per speculative step (default `8`). CLI: `--spec-draft`. |
 | `TS_SPEC_PMIN` *(legacy `TS_MTP_PMIN`)* | Draft-confidence gate in `[0, 1]`, `0` = never gate (default per algorithm: `0.15` per-token head, `0.35` block, `0` n-gram). CLI: `--spec-pmin`. |
-| `TS_SPEC_DRAFT_MODEL` *(legacy `TS_MTP_DRAFT_MODEL`)* | Path to the separate Gemma 4 `gemma4-assistant` draft GGUF. CLI: `--draft-model`. Ignored by Qwen 3.6 (embedded NextN). |
+| `TS_SPEC_DRAFT_MODEL` *(legacy `TS_MTP_DRAFT_MODEL`)* | Path to a drafter that ships as its own GGUF — Gemma 4's `gemma4-assistant` head, a DSpark or DFlash / DFlash2 drafter, or Qwen 3.8 Flash Next's shared MTP head; the file's architecture decides how it loads. CLI: `--draft-model`. Not needed for Qwen 3.6 / GLM 5.2 / GLM-5.3 (embedded NextN). |
 | `TS_GMTP_NO_FUSED` | `1` disables the Gemma 4 fused multi-token-verify / draft-step GGML kernels and falls back to the per-op path (A/B testing on ggml backends). |
 | `TS_GMTP_NO_FAST_ROLLBACK` | `1` restores the kept-prefix rollback path instead of the dense exact-match fast rollback used on partial draft acceptance. |
 | `TS_GMTP_BATCHED_TRUNK` | `1` opts the Gemma 4 verify trunk back into the batched paged path; the default runs the faster linear trunk for solo speculation. |
@@ -833,6 +963,14 @@ These gate the optional speculative decode path (see [Speculative Decoding](FEAT
 | `DIFFUSION_NO_FUSED_LMHEAD_TAIL` | Set to `1` to disable the fused output-norm + lm-head + softcap tail. |
 | `DIFFUSION_BATCHED_FORWARD` | Set to `1` to use true batched `DecodeCanvasBatched` for active diffusion canvases; default time-slices the faster fused single-canvas path. |
 | `DIFFUSION_LMHEAD_BATCH_CAP_MB` | Memory cap for batched diffusion lm-head logits before falling back to per-sequence lm-head (default: `300`). |
+| `DIFFUSION_IMAGE_BIDIRECTIONAL` | Image soft-token spans attend bidirectionally on the sliding-window layers (default on); `0` makes them plain causal, which is what HuggingFace's own DiffusionGemma effectively runs. |
+| `DIFFUSION_FUSED_PREFILL_ATTN` | Fused GGML prompt-prefill attention: on by default on `ggml_cuda`, `1` opts another GGML backend in, `0` restores the per-op reference. Always off for a prompt that carries an image, because the fused kernel cannot express the bidirectional image mask. |
+| `DIFFUSION_VRAM_HEADROOM_MB` | `ggml_cuda`: VRAM left free for activations when deciding which weights stay device-resident (default: `2048`); what does not fit streams per step. |
+| `DIFFUSION_DEVICE_COPY_BUDGET_MB` | `ggml_cuda`: cap on incidental device copies (prompt K/V, masks, activations) once the weights do not all fit (default: `768`). |
+| `DIFFUSION_SEGMENTED_DECODE` | `ggml_cuda`: run each layer as its own fused graph so streamed weights share one bounded staging buffer. Chosen automatically when the model does not fit; `1` / `0` forces it on / off. |
+| `DIFFUSION_PIN_STREAMED` | `ggml_cuda`: `1` copies the streamed weights into page-locked host memory, costing RAM equal to the streamed bytes (default off: measured neutral on Windows, where the pageable upload already runs near DMA speed once the file cache is warm; it may help on Linux). |
+| `DIFFUSION_NO_DEVICE_SAMPLE` | `ggml_cuda`: `1` disables on-device sampling (argmax, entropy, sample and self-conditioning top-K computed on the device logits). It is on by default only while the weights are fully resident; `DIFFUSION_DEVICE_SAMPLE_FORCE=1` keeps it on under segmented decode too, for experiments. |
+| `DIFFUSION_ASYNC_COMPUTE` | `1` forces async GGML compute back on for DiffusionGemma. **Unsafe** — it reintroduces corrupted, off-topic answers — and exists only to A/B the cost of the synchronize. |
 
 Sampling parameter precedence (highest wins), with the default
 `--sampling-precedence config`:
@@ -848,6 +986,140 @@ server-wide flags and env vars for parameters it sends, and they still fill in
 the rest. Either way `--stop` sequences pinned on the server stay in force under
 `config` (merged with the request's) and are replaced by the request under
 `request`.
+
+## Qwen-Image-2.1 LoRA plug-ins
+
+`--lora` adds a LoRA to the Qwen-Image-2.1 diffusion transformer: a style, an
+editing skill, or a step-distillation adapter that replaces the 40-step default
+with 4–8 transformer passes. `TensorSharp.Cli` and `TensorSharp.Server.Host` take the
+same three flags, spelled the same way:
+
+| Option | Description |
+|---|---|
+| `--lora <path>` | A LoRA plug-in: a LoRA `.safetensors` file, or a TensorSharp plug-in config `.json` such as those in [`config/lora/`](config/lora/). Repeat it to stack several; each `--lora` starts a new plug-in. |
+| `--lora-scale <f>` | Strength of the preceding `--lora` (it multiplies alpha / rank). Default: the plug-in config's `"scale"`, else `1.0`. |
+| `--lora-config <path>` | Companion config of the preceding `--lora`: a TensorSharp LoRA config (a `config/lora/` plug-in works here too, supplying its strength and recipe, or the third-party config it forwards with `"config"`, while its `weights` entry is ignored), a PEFT `adapter_config.json` (`lora_alpha`, `alpha_pattern`, `use_rslora`) or a VideoX-Fun `pdd_config.json`. When `--lora` itself names a plug-in `.json`, that file is already the config and a `--lora-config` after it is refused. |
+
+`--lora-scale` and `--lora-config` bind to the closest `--lora` before them, and a
+later value replaces an earlier one; either one without a `--lora` before it is a
+configuration error, never ignored. Both hosts check every file at startup, so a
+typo fails before the model loads. A `--config` file's options are expanded ahead
+of the command line, so a command-line `--lora-scale` with no `--lora` of its own
+before it binds to the config file's last plug-in. The hosts hand the parsed list
+to the model as the environment variable `TS_LORAS`, a JSON array of
+`{"path", "scale", "config"}` objects.
+
+The plug-ins apply to Qwen-Image-2.1 only. The CLI refuses `--lora` with any other
+model; the server logs them at startup (`LoRA plug-ins (applied to Qwen-Image-2.1
+models only): ...`) and applies them to every image request. Per-request LoRA
+selection is not implemented. The retired `--qwen-image-lora` is still a removed
+flag, and its error names `--lora`; `TS_QWEN_IMAGE_LORA` is refused at load with
+the same advice.
+
+```bash
+# A ready-made plug-in: the config downloads (and hash-checks) its weights on first
+# use and brings the adapter's sampling recipe, here 6 steps and CFG 1.
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --config config/qwen-image-2.1.json \
+    --lora config/lora/qwen-image-2.1-viggle-turbo.json \
+    --prompt "A small orange cat beside a blue ceramic vase, soft daylight" \
+    --width 1024 --height 1024 --output turbo.png
+
+# Any LoRA file at a chosen strength, stacked with a shipped style plug-in
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --config config/qwen-image-2.1.json \
+    --lora ./loras/my-style.safetensors --lora-scale 0.8 \
+    --lora config/lora/qwen-image-2.1-film-stills.json \
+    --prompt "A lighthouse at dusk" --output styled.png
+
+# A PEFT adapter whose alpha lives in a separate adapter_config.json
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --config config/qwen-image-2.1.json \
+    --lora ./adapter/my-adapter.safetensors --lora-config ./adapter/adapter_config.json \
+    --prompt "..." --output adapted.png
+
+# The server applies its startup set to every image request
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --config config/qwen-image-2.1.json \
+    --lora config/lora/qwen-image-2.1-pruna-8step.json
+```
+
+**Sampling precedence.** Explicit settings win over a plug-in's recipe, and the
+recipe wins over the model defaults (40 steps, CFG 1). Explicit means
+`--diffusion-steps` / `--cfg` on the CLI and a request's `steps` / `cfg` on the
+server, where `0` or an omitted value selects the recipe. A recipe with sigmas has
+a schedule only for the step counts it lists, so any other count is refused with
+the supported ones named rather than resampled. A recipe without sigmas sets only
+the defaults and keeps the checkpoint's own schedule. Two plug-ins that both carry
+a recipe cannot be stacked. Each run logs the resolved recipe and its sigmas
+(`[lora] sampling recipe (...): 6 steps on shifted sigmas [...]`).
+
+**Shipped plug-ins.** Each file in [`config/lora/`](config/lora/) downloads its
+weights to `${TENSORSHARP_MODELS:-<repo>/models}/qwen-image-2.1/loras` on first use.
+Its comments cite the model card, the trigger phrase where there is one, and the
+license; several are under the Qwen Research License (non-commercial).
+
+| Plug-in | What it is | Steps / CFG | Strength |
+|---|---|---|---|
+| `qwen-image-2.1-viggle-turbo.json` | Viggle Turbo v0.2.1, a DMD2 / SenseFlow step-distillation LoRA (the r128 file) | 6 by default, 4–8 supported; raw sigma nodes through the checkpoint's dynamic shift; CFG 1 | 1.0 |
+| `qwen-image-2.1-pruna-8step.json` | Pruna 8-step v0.1, a DMD step-distillation LoRA | 8, fixed sigmas, no shift; CFG 1 | 1.0 (the file's PEFT alpha 128 at rank 64 makes the applied scale 2) |
+| `qwen-image-2.1-pruna-5step.json` | Pruna 5-step v0.1, faster than the 8-step one with lower quality | 5, fixed sigmas, no shift; CFG 1 | 1.0 (applied scale 2, as above) |
+| `qwen-image-2.1-fun-acc-4step.json` | Alibaba PAI Fun-Acc, a parallel decoding distillation (PDD) bundle: rank-64 deltas, four per-step output heads that replace `proj_out`, and replaced Q/K and text norm gains. Forwards its `pdd_config.json` | 4, the bundle's fixed grid, bf16 timesteps; CFG 1 | 1.0 |
+| `qwen-image-2.1-film-stills.json` | Danrisi Film Stills: cinematic 35 mm film-still style | Model defaults | 0.7 |
+| `qwen-image-2.1-grainscape.json` | Danrisi Grainscape: grainy 35 mm colour-negative film look | Model defaults | 0.7 |
+| `qwen-image-2.1-fix.json` | e-n-v-y Qwen-Image-2.1-Fix: a DoRA quality fix | Model defaults | 1.0 |
+| `qwen-image-2.1-detail-enhancer.json` | elusarca Detail Enhancer (editing): detail, upscaling and restoration | Model defaults | 1.0 |
+| `qwen-image-2.1-natural-exposure.json` | prithivMLmods Natural Exposure (editing): balanced, neutral exposure | Model defaults | 1.0 |
+| `qwen-image-2.1-anime-consistency.json` | WarmBloodAban Anime Consistency: keeps anime characters consistent across edits | Model defaults | 0.7 |
+| `qwen-image-2.1-object-remover.json` | prithivMLmods Object Remover Bbox (editing): removes the objects marked with red boxes | Model defaults | 1.0 |
+| `qwen-image-2.1-object-mover.json` | prithivMLmods Object Mover Bbox (editing): moves the object in one red box to the other | Model defaults | 1.0 |
+
+**Plug-in config format.** A plug-in is a JSON file with
+`"type": "qwen-image-2.1-lora"`. It follows the `--config` conventions (comments,
+`"variables"` with `${name:-fallback}`, paths relative to the file), and its
+`"weights"` entry is a download spec that is fetched and SHA-256-checked when the
+file is missing, like a `--config` file entry.
+
+```json
+{
+  "type": "qwen-image-2.1-lora",
+  "variables": { "root": "${TENSORSHARP_MODELS:-../../models}/qwen-image-2.1/loras" },
+  "weights": { "path": "${root}/my-turbo.safetensors", "urls": ["https://..."], "sha256": "..." },
+  "scale": 1.0,
+  "sampling": {
+    "steps": 6,
+    "shift": "dynamic",
+    "cfg": 1.0,
+    "sigmas": { "4": [1.0, 0.75, 0.5, 0.25], "6": [1.0, 0.9375, 0.875, 0.75, 0.5, 0.25] }
+  }
+}
+```
+
+| Key | Meaning |
+|---|---|
+| `weights` | The LoRA `.safetensors`: a path or a download spec (`path`, `urls`, `sha256`). Required. |
+| `scale` | Default strength; `--lora-scale` overrides it. |
+| `alpha`, `use_rslora` | Alpha for a file that carries none. The scale is alpha / rank, or alpha / √rank with rsLoRA. |
+| `sampling.steps` | Default step count. May be omitted when `sigmas` defines a single schedule. |
+| `sampling.sigmas` | The schedule: an array (one step count) or an object keyed by step count. Nodes lie in (0, 1] and strictly decrease; a terminal 0 is appended. Omit it to keep the checkpoint's own schedule. |
+| `sampling.shift` | `none` (default): the nodes are the sigmas. `dynamic`: the nodes are raw positions passed through the checkpoint's resolution-dependent exponential shift, without the terminal stretch. |
+| `sampling.cfg` | Default CFG, at least 1. |
+| `sampling.timestep` | `fp32` (default) or `bf16`, which rounds the transformer's timestep the way a bf16 pipeline does. |
+| `config` | Instead of `sampling`: a third-party companion config to forward (a path or a download spec), such as a PDD `pdd_config.json`. A plug-in takes one or the other, not both. |
+
+**Formats.** Diffusers / PEFT (`transformer.` prefix, `lora_A` / `lora_B`, adapter
+slot names such as `.default`), ComfyUI / ai-toolkit (`diffusion_model.`),
+DiffSynth / ModelScope (no prefix), kohya underscore names, `lora_down` / `lora_up`
+with or without `.weight`, DoRA `dora_scale`, VideoX-Fun PDD bundles, and 1-D
+`.diff` tensors on the norm gains. Alpha comes from `.alpha` tensors, PEFT metadata
+in the safetensors file, or an `adapter_config.json`; otherwise alpha equals the rank
+(kohya's `ss_network_alpha` training metadata is ignored, as in ComfyUI and diffusers).
+LoKr, LoHa, LoCon mid factors, text-encoder LoRAs, bias terms, 2-D full-weight
+diffs and LoRAs made for other models are refused with a message. Every tensor in
+a file is applied or the load fails and names it; nothing is skipped silently.
+
+**How it runs.** The update is applied unmerged, `y = W x + B (A x)`, on top of the
+quantized GGUF weights, because merging a distillation LoRA's small delta into
+Q8_0 or Q4 weights rounds most of it away. It works on `ggml_metal`, `ggml_cuda`,
+`ggml_vulkan` and `ggml_cpu`, with the prefix KV cache, and with `--tp N`. The
+[Qwen-Image-2.1 card](docs/models/qwenimage21.md#lora-plug-ins) covers the formats,
+the packing, tensor parallelism and the limitations in detail.
 
 ## Video generation with audio (MiniMax-H3)
 
@@ -868,7 +1140,7 @@ is still ahead on that card (3.325 s against 3.338 s by the 8-vs-16-step slope);
 it loses is fixed setup cost, and roughly 3 s of the residual 3.9 s is not inference at
 all — H.264 encoding, where stable-diffusion.cpp writes MJPEG+PCM into an AVI, plus
 .NET process startup against a native binary. That machine holds 16 GB of VRAM and
-31.7 GB of RAM against a 33.5 GB model set, so neither the weights nor the page cache
+31.7 GB of RAM against a ~35.5 GB model set, so neither the weights nor the page cache
 fit and setup dominates the wall clock; peak VRAM was 15 780 MiB against
 stable-diffusion.cpp's 12 035 MiB on a 16 384 MiB card. stable-diffusion.cpp ran with
 `--auto-fit --stream-layers --diffusion-fa --rng cpu`, because its default
@@ -898,7 +1170,7 @@ decode to save its time and memory; on Ref2VA that same VAE's encoder is what a
 `--ref-audio` goes through, so dropping it costs reference soundtracks as well as the
 generated one. The text encoder ships **no tokenizer**, so
 `vocab.json` and `merges.txt` from
-[MiniMaxAI/MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3/tree/main/processor)
+[MiniMaxAI/MiniMax-H3](https://huggingface.co/MiniMaxAI/MiniMax-H3/tree/42ed227ee7df40d41602854ae760620d6eb651fe/processor)
 must be beside it (or point `TS_VIDEO_TOKENIZER` at them).
 
 **What a 16 GB card does with them.** Two behaviours matter once the set stops fitting.
@@ -923,22 +1195,22 @@ prefault, every denoise step, VAE open / decode — which is where those seconds
 on your own card.
 
 The two shipped configs name all four networks, which is what lets them auto-download
-into `${modelRoot}` on the first run (~33.5 GB, or ~33.4 GB for the Ref2VA set) and be
+into `${modelRoot}` on the first run (~35.5 GB, or ~35.4 GB for the Ref2VA set) and be
 reused after. Only the denoiser differs between them, so running the second one
 downloads nothing but its own DiT:
 
 ```bash
 # Keyframes: text-to-video, image-to-video, first-and-last-frame
-tensorsharp --config config/minimax-h3-fl2va.json \
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --config config/minimax-h3-fl2va.json \
   --prompt "a red fox trotting through falling snow, cinematic" --output fox.mp4
 
 # References: same subject, brand-new scene
-tensorsharp --config config/minimax-h3-ref2va.json \
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --config config/minimax-h3-ref2va.json \
   --ref-image person.png --ref-image jacket.png \
   --prompt "she walks through a night market, neon reflections" --output market.mp4
 
 # Either file also hosts the server
-./TensorSharp.Server --config config/minimax-h3-fl2va.json
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --config config/minimax-h3-fl2va.json
 ```
 
 Both configs pin `"backend": "ggml_cuda"` and `640×384 × 22` frames at 24 fps;
@@ -950,7 +1222,7 @@ model's own defaults apply.
 **Text to video.** Writes `fox.mp4` plus `fox.wav` with the generated soundtrack:
 
 ```bash
-tensorsharp --model minimax_h3_fl2va_pruned-Q4_K.gguf --backend ggml_metal \
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model minimax_h3_fl2va_pruned-Q4_K.gguf --backend ggml_metal \
   --prompt "a red fox trotting through falling snow, cinematic" \
   --width 640 --height 384 --video-frames 22 --diffusion-steps 8 --cfg 1.0 \
   --output fox.mp4
@@ -960,7 +1232,7 @@ tensorsharp --model minimax_h3_fl2va_pruned-Q4_K.gguf --backend ggml_metal \
 prompt drives what happens next:
 
 ```bash
-tensorsharp --model minimax_h3_fl2va_pruned-Q4_K.gguf --backend ggml_metal \
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model minimax_h3_fl2va_pruned-Q4_K.gguf --backend ggml_metal \
   --image portrait.jpg \
   --prompt "the person turns toward the camera and smiles, subtle handheld motion" \
   --width 640 --height 384 --video-frames 22 --diffusion-steps 8 --cfg 1.0 \
@@ -970,7 +1242,7 @@ tensorsharp --model minimax_h3_fl2va_pruned-Q4_K.gguf --backend ggml_metal \
 **First and last frame.** Both ends are pinned and the model fills in the motion:
 
 ```bash
-tensorsharp --model minimax_h3_fl2va_pruned-Q4_K.gguf --backend ggml_metal \
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model minimax_h3_fl2va_pruned-Q4_K.gguf --backend ggml_metal \
   --image start.png --end-image end.png --prompt "a slow cinematic push-in" \
   --width 640 --height 384 --video-frames 22 --diffusion-steps 8 --cfg 1.0 \
   --output morph.mp4
@@ -1000,7 +1272,7 @@ background and composition come from the prompt, and the first frame need not
 resemble the reference at all:
 
 ```bash
-tensorsharp --model minimax_h3_ref2va_pruned-Q4_K.gguf --backend ggml_metal \
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model minimax_h3_ref2va_pruned-Q4_K.gguf --backend ggml_metal \
   --ref-image person.jpg --ref-image bottle.png \
   --prompt "she holds the bottle up to the light on a rooftop at golden hour, slow orbit" \
   --width 640 --height 384 --video-frames 22 --diffusion-steps 20 --cfg 1.0 \
@@ -1018,7 +1290,7 @@ with `--ref-video-audio`, paired by position, because a container's audio track 
 not readable through the frame decoder:
 
 ```bash
-tensorsharp --model minimax_h3_ref2va_pruned-Q4_K.gguf --backend ggml_metal \
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model minimax_h3_ref2va_pruned-Q4_K.gguf --backend ggml_metal \
   --ref-video walk.mp4 --ref-video-audio walk.wav \
   --prompt "the same woman walks along a beach at sunset, wide shot" \
   --width 640 --height 384 --video-frames 22 --diffusion-steps 20 --cfg 1.0 \
@@ -1065,7 +1337,7 @@ conditioning the hosted checkpoint advertises — a first frame, a last frame, o
 the server defaults:
 
 ```bash
-./TensorSharp.Server --model minimax_h3_fl2va_pruned-Q4_K.gguf --backend ggml_metal \
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model minimax_h3_fl2va_pruned-Q4_K.gguf --backend ggml_metal \
   --video-width 640 --video-height 384 --video-steps 20 --video-frames 22 --port 5001
 ```
 
@@ -1629,17 +1901,20 @@ must be reachable between all nodes.
 | Architecture | TP status | Notes |
 |---|---|---|
 | Mistral 3 | ✅ | Fused/separate QKV, YaRN RoPE |
+| Qwen 3 / Qwen 2 (`qwen3`, `qwen2`, `qwen2vl`) | ✅ | Megatron column/row split of the attention heads and FFN; each rank keeps its own share of the KV heads. The fused QKV / gate-up weights are sharded segment by segment, and checkpoints whose Q/K/V quant types differ (so nothing was fused) are sharded from the separate tensors. With Mistral 3, the only architecture whose continuous-batching forward also runs under TP |
 | Gemma 4 | ✅ | Dense TP + MoE. On GGML the fused whole-model MoE trunk splits *inside* each expert (gate/up column-parallel, down row-parallel) so global expert ids keep working; `TS_GEMMA4_TP_FUSED_MOE=0` falls back to the whole-expert per-op path. Per-expert slicing on direct CUDA |
-| Qwen 3.5 / 3.6 family | ✅ | GatedDeltaNet SSM with per-rank V-head ownership; expert-parallel MoE on GGML (whole experts per rank, Megatron-split shared expert), expert slicing on direct CUDA. Runs on both `cuda` and `ggml_cuda` / `ggml_vulkan` — the GGML path uses the packed per-rank GDN kernel (`TSGgml_Qwen35GdnLayerTP`) with device-resident recurrent state |
+| Qwen 3.5 / 3.6 family | ✅ | GatedDeltaNet SSM with per-rank V-head ownership; expert-parallel MoE on GGML (whole experts per rank, Megatron-split shared expert) with a column-parallel (vocabulary-sharded) LM head unless the head is tied to the embedding or its vocabulary rows do not divide by the local TP degree (it then stays replicated on rank 0), expert slicing and a replicated LM head on direct CUDA. Runs on both `cuda` and `ggml_cuda` / `ggml_vulkan` — the GGML path uses the packed per-rank GDN kernel (`TSGgml_Qwen35GdnLayerTP`) with device-resident recurrent state. [Bonsai2](docs/models/bonsai2.md) (`qwen35` files with PRISM PQ2_0 / PTQ1_0 tensors) is the exception: single-device GGML backends only, so `--tp` is refused |
 | Qwen 3.8 Flash Next | layer split | Not tensor parallelism: `--tp N` gives each GPU a contiguous run of whole layers, which is also the only multi-GPU mode llama.cpp offers `qwen4exp` (`-sm row` refuses to load it). Capacity, not speed — 2× A100-80GB on Qwen3.8-Flash-Next-UD-Q2_K_XL (73.4 GiB): greedy output byte-identical to the 1-GPU run (same SHA-256), VRAM 24.2 + 26.2 GB instead of one card holding everything, prefill ~1520-1550 t/s and decode ~56 t/s either way. `TS_Q4E_LAYER_SPLIT=20,28` sets the per-GPU layer counts by hand |
 | GPT OSS | ✅ | Attention sinks, YaRN. Runs on `cuda` and the GGML backends; the GGML path is expert-parallel (whole experts per rank, one batched `ggml_mul_mat_id` dispatch per projection per layer) and falls back to per-expert slicing only when the expert count does not divide the TP degree |
 | Nemotron-H | ✅ | Mamba2 replicated on rank 0, MoE expert slicing. Still walks experts per token per rank on GGML (no expert parallelism yet) |
+| Muse-Glimmer | ✅ (`--tp 2` at most) | Its 2 KV heads cap the degree at 2; GGML CUDA / Vulkan only, and a DFlash drafter is declined under TP — the CLI warns and decodes plainly, the server refuses to start (see [Constraints](#constraints)) |
 | GLM 5.x | ✅ (local only) | GGML GPU backends only; the native TP path is local/single-process for GLM-5.2, GLM-5.3 and GLM-5.3-Flash alike (`--tp-node-id` / `--tp-peers` are hard-refused for the whole family). GLM-5.2 shards MLA heads and hidden rows inside every routed expert. GLM-5.3-Flash also head-shards KDA with per-rank recurrent state; its MLA heads and routed-expert hidden rows are sharded likewise. Attention partials reduce before each nonlinear Sinkhorn hyper-connection. On GLM-5.3-Flash's eligible segmented fast path, routed-MoE partials reduce first, then each rank computes/adds the replicated shared expert locally; hyper-connections, pooled indexer, router, norms, dense layers and embedding also remain unsharded and execute per rank, while output norm / LM head stay on rank 0. CPU MoE, tracing, partial `TS_GLM_TP_SHARD`, oversubscription, or missing native hyper-connection kernels use the combined scheduler fallback, where the shared expert runs once on rank 0; `TS_GLM_TP_FUSED=0` forces that fallback for diagnostics. Plain GLM-5.3 accepts `--tp N` on the same local terms and replicates the MLA and indexer caches on every rank, so `--tp` multiplies the KV footprint; nothing has ever been run on it at `--tp N>1` — the only recorded arithmetic is a non-fit, `--tp 8` wanting 41.7 GiB per rank against 46 GB cards — so treat it as an accepted mode rather than a validated configuration, and note that `--spec` is refused there whenever `--tp N>1`. Omitting `--tp` keeps the default layer split |
 | DeepSeek V4 Flash | layer split | Not tensor parallelism: the whole-model executors bin-pack contiguous runs of whole layers against each device's free VRAM, and `--tp N` (or `TS_DSV4_NGPU`) only caps how many GPUs that split uses |
 | DeepSeek V4.1 Flash | layer split (+ experimental routed-MoE TP) | Layer placement is the default and the measured path. `TS_DSV41_TP=N` (2-8, and equal to the GPU count selected by `--tp` / `TS_DSV4_NGPU`) shards routed-expert gate/up along the FFN intermediate dimension and down along its input, reducing partials through host-staged F32 buffers; attention, shared experts and caches keep their layer placement. Block-aligned unequal partitions (the 2304-wide intermediate is nine 256-element K-quant blocks: 1280+1024 on two ranks, 768+512+512+512 on four). The first full Q2_K run was slower than the layer split, so treat it as experimental. Attention TP and distributed groups are not implemented |
 | Hunyuan Dense | — | Single device: no TP and no layer split. Startup says so on stderr rather than leaving extra GPUs idle |
-| DiffusionGemma | — | Not applicable (diffusion model) |
-| Qwen-Image-2.1 | — | Not applicable (image generation) |
+| DiffusionGemma | — | Single device: `--tp N` prints `WARNING: --tp N ignored` and runs on one GPU; a distributed group is refused at load (exit code 2) |
+| Wan 2.1 / 2.2, MiniMax-H3 | — | Single device, the same way: `--tp N` is ignored with a warning and a distributed group is refused at load |
+| Qwen-Image-2.1 | ✅ (local only, diffusion transformer) | `--tp N` (any GPU count that divides the 32 attention heads — 2, 4, 8 or 16 on one machine — subject to block alignment when the weights are sharded) on `ggml_cuda` / `ggml_vulkan` shards the DiT's attention heads and MLP columns; LoRA plug-ins are sharded with it. Measured 1.34-1.57× on 2× A40 with `ggml_cuda`, but slower than one GPU on `ggml_vulkan` (0.86×, host reduction). The text encoder, vision encoder and VAE stay on the first GPU, and multi-node groups are refused. See the [Qwen-Image-2.1 card](docs/models/qwenimage21.md#cuda-graphs-and-tensor-parallelism) |
 
 ### Backend support
 
@@ -1720,8 +1995,8 @@ for the combined numbers.
 
 - `numHeads`, `numKVHeads`, and `intermediateSize` must be divisible by the TP degree.
 - Quantized row-parallel splits require `ne0` divisible by `tp × blockSize`.
-- Batched/continuous-batching forward under TP is implemented for Mistral 3; MoE models (Gemma 4, Qwen 3.5/3.6, GPT OSS, Nemotron-H) fall back to per-sequence forward under TP.
-- **Muse-Glimmer** caps at `--tp 2`: it has 2 KV heads, and no model here replicates KV heads when `numKVHeads < tp`. Its DFlash drafter and pooled KV-block snapshots stay single-GPU under TP (multi-turn reuse comes from live-cache continuation instead), and it requires the GGML CUDA/Vulkan backends — the fused per-rank plan needs a device collective that ggml-metal does not provide.
+- Batched/continuous-batching forward under TP is implemented for Mistral 3 and Qwen 3; MoE models (Gemma 4, Qwen 3.5/3.6, GPT OSS, Nemotron-H) fall back to per-sequence forward under TP.
+- **Muse-Glimmer** caps at `--tp 2`: it has 2 KV heads, and no model here replicates KV heads when `numKVHeads < tp`. A DFlash drafter is declined under TP (the CLI warns and decodes plainly; the server refuses to start, exit code 2), its pooled KV-block snapshots stay single-GPU under TP (multi-turn reuse comes from live-cache continuation instead), and it requires the GGML CUDA/Vulkan backends — the fused per-rank plan needs a device collective that ggml-metal does not provide.
 
 ### Cluster tuning & diagnostics
 
@@ -1747,18 +2022,28 @@ Startup logs make the topology explicit: the local group prints
 
 ### Redis-backed shared state
 
-The server can optionally persist KV cache blocks and the OpenAI Responses API
-store to Redis, enabling cross-session KV reuse and durable response storage:
+On the server, Redis backs one thing: the OpenAI Responses API store — the
+completed responses (`"store"` defaults to true) that `GET /v1/responses/{id}`
+returns — which is otherwise a bounded in-memory cache. It is retrieval only:
+`previous_response_id` chaining is rejected with HTTP 400 either way.
 
 ```bash
-# Enable Redis for both KV cache and Responses API
+# Responses API store in Redis
 dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model <model.gguf> --backend cuda \
     --redis-url localhost:6379
-
-# KV cache tier only, with a 12-hour TTL
-dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model <model.gguf> --backend cuda \
-    --paged-kv-redis-url localhost:6379 --paged-kv-redis-ttl 720
 ```
+
+An already-set `TS_RESPONSES_STORE_REDIS_URL` wins over `--redis-url`, and startup
+logs `Redis configured via --redis-url: the Responses API store uses <url>. The server
+has no Redis KV-cache tier …`. `--redis-url` also sets `TS_KV_CACHE_REDIS_URL`, and the
+server still accepts `--paged-kv-redis-url` and `--paged-kv-redis-ttl` (with a startup
+WARNING that they have no effect), but that KV half is inert:
+the Redis KV tier belongs to the standalone `PagedKvCacheManager`, which the server
+never builds (and the CLI's `--paged-bench` builds without that tier), so the server
+only logs those settings at startup.
+Cross-request KV reuse on the server comes from the engine's in-process radix
+prefix cache and, for the shared system prompt, from the checkpoints persisted
+under `prefix-cache/` (see `--no-prefix-cache`).
 
 ## Feature × environment variable matrix
 
@@ -1769,10 +2054,10 @@ Quick reference for which environment variables (and matching CLI flags) gate ea
 | Feature | Default | Env vars | CLI equivalent |
 |---|---|---|---|
 | Continuous-batching engine (`InferenceEngine` + scheduler) | ON in Server, CLI generation, and TensorAgent | `TS_SCHED_DISABLE_BATCHED=1` to force per-seq fallback | `--no-continuous-batching` / `--continuous-batching` |
-| Legacy per-session paged-KV manager | removed from Server request path | `TS_KV_PAGED_CACHE` (`0` / `1`), `TS_KV_BLOCK_SIZE` retained for compatibility / standalone tests | `--paged-kv` / `--no-paged-kv`, `--paged-kv-block-size N` |
+| Legacy per-session paged-KV manager | not on the Server request path; only the CLI's `--paged-bench` builds it (the server accepts and logs the flags) | `TS_KV_PAGED_CACHE` (`0` / `1`), `TS_KV_BLOCK_SIZE` retained for compatibility / standalone tests | `--paged-kv` / `--no-paged-kv`, `--paged-kv-block-size N` |
 | Legacy paged-KV SSD spillover (standalone manager) | OFF | `TS_KV_CACHE_MAX_RAM_MB`, `TS_KV_CACHE_SSD_DIR`, `TS_KV_CACHE_MAX_SSD_MB` | `--paged-kv-ram-mb`, `--paged-kv-ssd-dir`, `--paged-kv-ssd-mb` |
 | Legacy paged-KV block quantization (standalone manager) | OFF (`0` = passthrough) | `TS_KV_PAGED_QUANT_BITS` (`0` / `2` / `4` / `8`) | `--paged-kv-quant-bits` |
-| Radix KV prefix reuse | ON for supported models | `TS_SCHED_PREFIX_CACHE=0` disables reuse; `TS_PREFIX_CACHE_MODE=legacy` selects the compatibility path | `--no-prefix-cache` also disables warmup |
+| Radix KV prefix reuse | ON for supported models | `TS_SCHED_PREFIX_CACHE=0` disables reuse; `TS_PREFIX_CACHE_MODE=legacy` selects the compatibility path (default `tree`) | `--no-prefix-cache` also disables warmup |
 | Scheduler tunables (per-step token budget, max in-flight seqs, prefill chunks, block pool size, decode quantum) | engine defaults | `TS_SCHED_MAX_BATCHED_TOKENS`, `TS_SCHED_MAX_RUNNING_SEQS`, `TS_SCHED_PREFILL_CHUNK`, `TS_SCHED_SOLO_PREFILL_CHUNK`, `TS_SCHED_NUM_BLOCKS`, `TS_SCHED_BLOCK_SIZE`, `TS_SCHED_DECODE_QUANTUM` | — |
 
 Radix keeps page snapshots, model-paged blocks, and model-owned continuation states
@@ -1780,7 +2065,11 @@ in one prefix index. Reuse respects conversation scopes, explicit cache markers,
 media identities, and each model's resumable boundaries. Public prefix checkpoints
 remain eligible for disk persistence. Engine API callers should supply a stable
 `SequenceState.CacheScope` for conversation reuse; an unscoped request shares only
-its declared `SharedPrefixTokens` in Radix mode.
+its declared `SharedPrefixTokens` in Radix mode. The families that take part: the
+Qwen 3.5 / 3.6 / 3.8-27B family (`qwen35*`, `qwen3next`), Gemma 4, GLM 5.x, Qwen 3.8
+Flash Next and DeepSeek V4 / V4.1 (holder / end-state reuse), and Qwen 3, GPT-OSS,
+Mistral 3, Hunyuan Dense, Muse-Glimmer and Nemotron-H (page reuse); DiffusionGemma
+and the media-generation models do not. `--spec` does not turn it off.
 
 Startup warmup makes the common system/developer messages and tool declarations
 available to new chats as a public prefix. Server warms its configured startup
@@ -1813,6 +2102,7 @@ continues to measure its direct backend decode paths, including MLX pipelining.
 | Model | Default state | Env var to flip default | Native-kernel sub-toggle |
 |---|---|---|---|
 | Mistral 3 | ON | — | `TS_PAGED_ATTN_KERNEL` = `native` (default) / `tensor` / `managed` |
+| Qwen 3 / Qwen 2 (`qwen3`, `qwen2`, `qwen2vl`) | ON when the KV cache is not block-quantized and Q/K/V are fused (also under local TP, where the sharded projections replace the fused-Q/K/V requirement; not multi-node) | — (`TS_SCHED_DISABLE_BATCHED=1` / `--no-continuous-batching`) | — |
 | Hunyuan Dense | ON (off for a block-quantized KV cache) | `TS_HUNYUAN_BATCHED=0` to force the KV-snapshot swap path | `TS_PAGED_ATTN_KERNEL` = `native` (default) / `tensor` / `managed` |
 | Gemma 4 | ON | `TS_GEMMA4_BATCHED=0` to force legacy per-seq | `TS_GEMMA4_BATCHED_CAPS=0` forces the v1 gates of the token-batched fused decode kernel (PLE / shared-KV / wrapped-SWA models such as E2B/E4B then decode round-robin) |
 | Qwen 3.5 / 3.6 family | ON | `TS_QWEN35_BATCHED=0` to force legacy per-seq (or `--no-continuous-batching`) | `TS_QWEN35_BATCHED_GDN_NATIVE=1` enables native batched GDN kernel; `FUSED_ATTN_LAYER_MIN_SEQ_LEN=N` overrides fused-attention engage threshold (default 4096) |
@@ -1829,7 +2119,8 @@ continues to measure its direct backend decode paths, including MLX pipelining.
 | Speculation algorithm | `auto` | `TS_SPEC_TYPE` | `--spec-type auto\|draft-head\|block\|ngram` |
 | Max tokens drafted per step | `8` | `TS_SPEC_DRAFT` (legacy `TS_MTP_DRAFT`) | `--spec-draft N` |
 | Draft-confidence gate | per algorithm (`0.15` / `0.35` / `0`) | `TS_SPEC_PMIN` (legacy `TS_MTP_PMIN`) | `--spec-pmin X` |
-| Gemma 4 separate draft GGUF (`gemma4-assistant`) | none | `TS_SPEC_DRAFT_MODEL` (legacy `TS_MTP_DRAFT_MODEL`) | `--draft-model <path>` |
+| Separate drafter GGUF (Gemma 4 `gemma4-assistant`, DSpark, DFlash / DFlash2, Qwen 3.8 Flash Next shared MTP head) | none | `TS_SPEC_DRAFT_MODEL` (legacy `TS_MTP_DRAFT_MODEL`) | `--draft-model <path>` |
+| DeepSeek V4 DSpark drafter GGUF (V4.1: experimental `deepseek41-dspark` on `ggml_cuda` / `ggml_cpu` only) | none | `TS_DSV4_DSPARK` | `--draft-model <path>` |
 | Muse-Glimmer DFlash / DFlash2 drafter GGUF | none | `TS_MUSE_GLIMMER_DFLASH` | `--draft-model <path>` |
 | Qwen 3.5 / 3.8 DFlash2 drafter GGUF | none | `TS_QWEN35_DFLASH` | `--draft-model <path>` |
 | Fused DFlash graphs (ggml) | ON | `TS_DFLASH_FUSED=0` falls back to the per-op drafter | — |
@@ -1875,7 +2166,7 @@ The full picture, including the native loader's own knobs, is in the
 | Embedded Engram | Read directly from the GGUF on every backend, `--backend cpu` included | `TS_DSV41_ENGRAM_DEVICE` must be `0` on `--backend cpu` (any other value is refused before a weight is read); `TS_DSV41_ENGRAM_WARM` / `_THREADS` / `_RANDOM` are native-loader-only and inert there | — |
 | Routed-MoE tensor parallelism | OFF | `TS_DSV41_TP=N` on the native path; any non-zero value is refused on `--backend cpu`, as are distributed TP groups | `--tp N` |
 | Native-loader-only attention / gather knobs | — | `TS_DSV41_SPARSE_FA`, `TS_DSV41_COMPACT_RAW_GATHER` — inert on `--backend cpu` | — |
-| Speculative drafting | none exists for V4.1 on any backend | `TS_DSV4_DSPARK` is a hard refusal on V4.1, not the warn-and-continue DeepSeek V4 does | `--draft-model` (refused too) |
+| Speculative drafting | experimental: a `deepseek41-dspark` drafter loads on `ggml_cuda` / `ggml_cpu` only, validated only on synthetic fixtures — no trained V4.1 drafter, acceptance rate or throughput has been measured | `TS_DSV4_DSPARK`; a drafter of any other architecture, or any drafter on a backend other than `ggml_cuda` / `ggml_cpu`, is refused before a weight is read | `--draft-model <deepseek41-dspark.gguf>` |
 | Vision companion | a native ggml component | — | not available on `--backend cpu`, where `--mmproj` throws; `--backend ggml_cpu` is the CPU backend the companion follows the text model onto |
 | Context window on `--backend cpu` | `MAX_CONTEXT` caps it to `65,536`, and every compressed-cache row lives in host memory, so the advertised 1M is not reachable there | `MAX_CONTEXT=N` | — (env only) |
 | Multi-turn KV prefix reuse and per-sequence slots on `--backend cpu` | neither: every diverging turn re-prefills and concurrent requests serialize | — | — |
@@ -1893,6 +2184,15 @@ The full picture, including the native loader's own knobs, is in the
 | Execution path | seven native whole-network ggml graphs | — | `--backend cpu` runs the same pipeline in pure C# instead (t2v, i2v, fl2v and reference conditioning) |
 | Managed-vs-GGML parity diagnostics | OFF | `TS_H3_DUMP_TE`, `TS_H3_DUMP_VEL_V`, `TS_H3_DUMP_VEL_A`, `TS_H3_DUMP_VIS` write those tensors to disk so ONE forward can be compared across the two paths; `TS_H3_DIT_LAYERS=N` truncates the trunk on BOTH paths, turning the comparison into an error-vs-depth curve; `TS_H3_NO_FLASH=1` runs GGML's explicit-softmax attention instead of its flash kernel | — |
 | Companion network + tokenizer overrides | resolved next to the denoiser | `TS_VIDEO_TEXT_ENCODER`, `TS_VIDEO_VAE`, `TS_VIDEO_AUDIO_VAE`, `TS_VIDEO_TOKENIZER` | `--video-te`, `--video-vae`, `--audio-vae` |
+
+#### Qwen-Image-2.1
+
+| Feature | Default | Env vars | CLI equivalent |
+|---|---|---|---|
+| Prefix KV cache (the text and reference-image keys and values are stored at the first denoising step and reused at every later one) | ON | `TS_QWEN21_PREFIX_CACHE=0` (or `false` / `off` / `no`) turns it off | — |
+| Prefix KV cache storage type | `auto` — what the attention kernel reads, so cached steps reproduce the uncached run | `TS_QWEN21_PREFIX_CACHE_TYPE` = `auto` / `f16` / `f32` / `q8_0` / `q8_0_v` (the 8-bit types round the stored prefix; a misspelled value is an error even while the cache is off) | — |
+| Prefix KV cache size limit | at most half of the memory the device reports free | `TS_QWEN21_PREFIX_CACHE_MAX_MIB` caps one cache further; a cache that does not fit is declined with a warning, and that request recomputes the prefix every step | — |
+| Companion overrides | resolved next to the DiT GGUF | `TS_QWEN_IMAGE_VAE`, `TS_QWEN_IMAGE_TE`, `TS_QWEN_IMAGE_MMPROJ` | `--qwen-image-vae`, `--qwen-image-vl`, `--qwen-image-mmproj` |
 
 #### Tensor parallelism & distributed inference
 
@@ -1912,18 +2212,18 @@ The full picture, including the native loader's own knobs, is in the
 
 | Feature | Default | Env vars | CLI equivalent |
 |---|---|---|---|
-| Redis KV cache tier | OFF | **`TS_KV_CACHE_REDIS_URL`** | `--redis-url` or `--paged-kv-redis-url` |
-| Redis KV cache entry TTL | `1440` min (24 h) | `TS_KV_CACHE_REDIS_TTL_MINUTES` (`0` = no TTL) | `--paged-kv-redis-ttl` |
+| Redis KV cache tier | legacy, inert (nothing builds the Redis tier; the CLI's `--paged-bench` uses only RAM / SSD) | `TS_KV_CACHE_REDIS_URL` | `--redis-url` or `--paged-kv-redis-url` (accepted and logged) |
+| Redis KV cache entry TTL | `1440` min (24 h); inert on the server like the tier itself | `TS_KV_CACHE_REDIS_TTL_MINUTES` (`0` = no TTL) | `--paged-kv-redis-ttl` |
 | Redis Responses API store | OFF (in-memory) | **`TS_RESPONSES_STORE_REDIS_URL`** | `--redis-url` |
 
 #### Backends
 
 | Feature | Default | Env vars | CLI equivalent |
 |---|---|---|---|
-| Default compute backend | `ggml_metal` (macOS), `ggml_cpu` (Windows/Linux) | `BACKEND` | `--backend` |
+| Default compute backend | server: `ggml_metal` (macOS), `ggml_cpu` elsewhere; CLI: `ggml_cpu` on every OS | `BACKEND` (server only) | `--backend` |
 | First-forward logit dump (backend A/B) | OFF | `TS_DUMP_LOGITS=<path>` writes the first REAL forward's logits there once, as raw float32, and deliberately skips the warm-up forwards (`WarmUpKernels` runs its own throwaway decode and prefill first, so dumping those compares two executors on a meaningless token). Lets two backends be compared by logit vector instead of by generated text, where greedy decoding turns a near-tie into a visibly different sentence | — |
 | MLX backend library lookup | probe app dir | `TENSORSHARP_MLX_LIBRARY` (full path to `libmlxc`), `TENSORSHARP_MLX_LIBRARY_DIR` (directory) | — |
-| MLX pipelined greedy decode (CLI only) | ON when eligible | `TS_MLX_PIPELINED_DECODE=0` disables | — |
+| MLX pipelined greedy decode (CLI `--benchmark` only) | ON when eligible | `TS_MLX_PIPELINED_DECODE=0` disables | — |
 | MLX `mlock(2)` of GGUF mmap so weights stay resident | ON | `TS_MLX_MLOCK_GGUF=0` to disable | — |
 | MLX fused multi-dim KV write (single `slice_update` per cache block) | ON | `TS_MLX_FUSED_KV_WRITE=0` to revert to per-head loop | — |
 | MLX batched MoE decode (Qwen 3.5/3.6 MoE) | ON | `TS_MLX_BATCHED_MOE_DECODE=0` for legacy per-expert path | — |
@@ -1969,8 +2269,8 @@ full checkpoint here; its compute width comes from `TS_DSV4_THREADS`, not
 
 | Feature | Default | Env vars | CLI equivalent |
 |---|---|---|---|
-| Agent Skills | ON (a `skills` directory beside the binary, created if missing) | `TS_NO_SKILLS=1` disables the feature | `--no-skills` |
-| Skill directories to scan | `<binDir>/skills` | `TS_SKILLS_DIR` (path-separator-separated list) | `--skills-dir <path>` (repeatable) |
+| Agent Skills | ON | `TS_NO_SKILLS=1` disables the feature | `--no-skills` |
+| Skill directories to scan | every existing `.agents/skills` from the working directory up to the Git repository root (nearest first), then `<binDir>/skills` (created if missing); the server also scans `<binDir>/skills` first as its upload directory, even with `--skills-dir` | `TS_SKILLS_DIR` (path-separator-separated list; replaces the defaults) | `--skills-dir <path>` (repeatable; replaces the defaults) |
 | Skills active up front | none | — | `--skill <name>` (repeatable); per request, `"skills": [...]` |
 | Advertising unselected skills to the model | ON | — | `--skills-no-discovery`; per request, `"skills_discovery": false` |
 | `skills_run` (executing a skill's scripts) | **OFF** | **`TS_SKILLS_ALLOW_EXEC=1`** | `--skills-allow-exec` |
@@ -2018,6 +2318,17 @@ tools: it is refused by name at startup and has no replacement to point at,
 because a shell reaches every interpreter on PATH, so an operator with an old
 script gets that error instead of watching a setting be ignored.
 
+#### Sub-agents (server)
+
+| Feature | Default | Env vars | CLI equivalent |
+|---|---|---|---|
+| Model-selected delegation on the chat endpoints (tool-capable families) | ON | `TS_NO_MULTI_AGENT` (any non-empty value other than `0`) disables it | `--no-multi-agent`; per request, `"multi_agent": false` |
+| Delegation limits: concurrent / total children, depth, rounds per child, shared generations, child timeout, report size | `3` / `8`, `2`, `8`, `48`, `180` s, `8000` chars | — | `--agents-max-concurrent`, `--agents-max-count`, `--agents-max-depth`, `--agents-max-rounds`, `--agents-max-generations`, `--agents-timeout`, `--agents-max-result-chars` |
+| Mutable tools for `worker` children | **OFF** (every child read-only) | — | `--agents-allow-worker-tools` |
+
+The CLI has no sub-agents. See the sub-agent options under
+[Web Application](#web-application) and [Multiple agents](docs/multi_agent.md).
+
 #### Sampling defaults (server-only)
 
 These fill in fields the request body omits. CLI flags win over env vars, and
@@ -2031,6 +2342,7 @@ with `--sampling-precedence request` (see [Web Application](#web-application)).
 | `top_p` | `TENSORSHARP_TOP_P` | `--top-p` |
 | `min_p` | `TENSORSHARP_MIN_P` | `--min-p` |
 | `repeat_penalty` | `TENSORSHARP_REPEAT_PENALTY` | `--repeat-penalty` |
+| `repeat_last_n` | `TENSORSHARP_REPEAT_LAST_N` | `--repeat-last-n` (same spelling on the CLI) |
 | `presence_penalty` | `TENSORSHARP_PRESENCE_PENALTY` | `--presence-penalty` |
 | `frequency_penalty` | `TENSORSHARP_FREQUENCY_PENALTY` | `--frequency-penalty` |
 | `seed` | `TENSORSHARP_SEED` | `--seed` |
@@ -2043,6 +2355,11 @@ with `--sampling-precedence request` (see [Web Application](#web-application)).
 | Feature | Default | Env vars |
 |---|---|---|
 | ASP.NET Core listener | `http://0.0.0.0:5000` | `--port` / `--host` / `--urls`, then `PORT` / `HOST`, then `ASPNETCORE_URLS` |
+| Bundled Web UI | ON | `TS_NO_WEBUI` (any value other than `0` turns it off; `--no-webui`) |
+| Upload per-file cap / directory quota / file lifetime | `500` MB / off / off | `TS_UPLOAD_MAX_MB`, `TS_UPLOAD_QUOTA_MB`, `TS_UPLOAD_TTL_HOURS` (`--upload-max-mb`, `--upload-quota-mb`, `--upload-ttl-hours`) |
+| Upload directory | `<binDir>/uploads` | `TENSORSHARP_UPLOAD_DIR` |
+| Persisted shared-prefix checkpoints | ON, `<binDir>/prefix-cache/<model>/` | `TENSORSHARP_PREFIX_CACHE_DIR` moves the root; `--no-prefix-cache` turns caching off |
+| Jev endpoint limits (`POST /v1/systemone`) | 8 MiB body, 64-token canvas, 32 admitted requests | `TS_JEV_MAX_BODY_MB`, `TS_JEV_MAX_CANVAS`, `TS_JEV_MAX_PENDING` |
 | Text and born-digital PDF uploads | Full extracted content; the final rendered prompt must fit the loaded model context | — |
 | Video-frame extraction | 1 fps (time-based, no cap). An OpenAI `video_url` part (DeepSeek V4.1, Qwen 3.8 Flash Next) may set its own `fps` / `max_frames` and caps at 16 frames when `VIDEO_MAX_FRAMES` is unset; Qwen 3.8 merges the sampled frames in pairs with Qwen-VL temporal coordinates (see [its card](docs/models/qwen38-flash-next.md#video-input)) | `VIDEO_SAMPLE_FPS`, `VIDEO_MAX_FRAMES` |
 | DiffusionGemma Web UI denoising | 48 steps, max batch 2 | `DIFFUSION_STEPS`, `DIFFUSION_MAX_BATCH` |
@@ -2051,9 +2368,9 @@ with `--sampling-precedence request` (see [Web Application](#web-application)).
 
 | Feature | Default | Env vars | CLI equivalent |
 |---|---|---|---|
-| Console + file log minimum level | `Information` | `TENSORSHARP_LOG_LEVEL` | `--log-level` |
-| File logger output directory | `<binDir>/logs` | `TENSORSHARP_LOG_DIR` | `--log-dir` |
-| File logger enabled | ON | `TENSORSHARP_LOG_FILE=0` to disable | `--log-file 0\|1` |
+| Console + file log minimum level | `Information` | `TENSORSHARP_LOG_LEVEL` | `--log-level` (CLI only; the server has no `--log-*` flags) |
+| File logger output directory | `<binDir>/logs` | `TENSORSHARP_LOG_DIR` | `--log-dir` (CLI only) |
+| File logger enabled | ON | `TENSORSHARP_LOG_FILE=0` to disable | `--log-file 0\|1` (CLI only) |
 | Console logger enabled | ON | — | `--log-console 0\|1` (CLI only) |
 
 #### Native build (compile-time only)
@@ -2071,14 +2388,14 @@ These are read by `build-linux.sh` / `build-windows.ps1` / the auto-build during
 
 ## Exit codes (CLI + Server)
 
-`TensorSharp.Cli` and `TensorSharp.Server` leave with the same documented codes, so
+`TensorSharp.Cli` and `TensorSharp.Server.Host` leave with the same documented codes, so
 a script or supervisor can tell "fix the command line" from "this model does not
 load here" from "this is a bug":
 
 | Code | Meaning | What stderr shows |
 |---|---|---|
 | `0` | Success: the run finished, `--help` / `--list-skills` printed, or the server shut down cleanly. | — |
-| `1` | Configuration error: an unknown or removed flag, a bad value, an unreadable `--config` file. | `Configuration error: <what is wrong>` |
+| `1` | Configuration error: a removed flag, an unknown flag on the server (the CLI ignores flags it does not know), a bad value, a switch given a value (`--think=on`) or a value option with nothing after it, an unreadable `--config` file. | `Configuration error: <what is wrong>` |
 | `2` | Model load refused. | Exactly one line, the last one: `error: model load refused: <reason>` |
 | anything else | Not a refusal: a bug or a crash. An unhandled .NET exception prints its stack trace and, on Linux and macOS, exits `134` (SIGABRT); a process the OS killed reports its signal (`137` for an out-of-memory kill). | The stack trace. Report it. |
 
@@ -2089,8 +2406,10 @@ devices cannot hold, a KV cache dtype the architecture does not support (for
 example `KV_CACHE_DTYPE=q8_0` on DeepSeek V4.1), a backend the model or this
 machine does not support, a `qwen_image` GGUF that is not a Qwen-Image-2.1
 diffusion transformer, a missing, truncated or non-GGUF model file, missing or
-invalid DeepSeek V4.1 Engram metadata, or an explicit `--draft-model`
-that cannot be activated. The native loaders' own diagnostic lines (`[dsv4] ...`,
+invalid DeepSeek V4.1 Engram metadata, a distributed `--tp-node-id` / `--tp-peers`
+group on an architecture with no multi-GPU path (DiffusionGemma, Wan, MiniMax-H3), or
+an explicit `--draft-model` that cannot be activated (a DFlash / DFlash2 drafter under
+`--tp N` > 1 on the server, for example). The native loaders' own diagnostic lines (`[dsv4] ...`,
 `[glm] ...`) may still appear above the error line; the error line repeats the
 reason so it is readable on its own. Anything else that fails during a load — a
 `NullReferenceException`, a CUDA error, an out-of-memory abort — is not a refusal
@@ -2157,7 +2476,9 @@ inline (e.g. `187 tokens · 2.1s · 87.2 tok/s · KV 420/512 (82%)`).
 
 ## HTTP APIs
 
-TensorSharp.Server exposes three API styles. See [API_EXAMPLES.md](TensorSharp.Server.Host/API_EXAMPLES.md) for full documentation with curl and Python examples.
+`TensorSharp.Server.Host` exposes three API styles — Ollama-compatible, OpenAI-compatible, and the Web UI's own SSE routes — plus the Jev typed-decision endpoint `POST /v1/systemone` for DiffusionGemma. See [API_EXAMPLES.md](TensorSharp.Server.Host/API_EXAMPLES.md) for full documentation with curl and Python examples.
+
+Image and video models are served on routes of their own, not on the chat endpoints. Qwen-Image-2.1 answers `POST /api/image-generate` (text to image) and `POST /api/image-edit` (prompt plus reference images), each with a `/stream` SSE variant that reports denoising progress; there is no `/v1/images/*` route. Video models use the routes described in [Video generation with audio (MiniMax-H3)](#video-generation-with-audio-minimax-h3).
 
 **Ollama-compatible API:**
 
@@ -2186,8 +2507,11 @@ curl -X POST http://localhost:5000/api/chat/ollama \
   -d '{"model": "gemma-4-E4B-it-Q8_0.gguf", "messages": [{"role": "user", "content": "What is the weather?"}], "tools": [{"function": {"name": "get_weather", "description": "Get current weather", "parameters": {"properties": {"city": {"type": "string"}}, "required": ["city"]}}}], "stream": false}'
 
 # Chat with Agent Skills. "skills" is accepted on every chat surface
-# (/v1/chat/completions, /v1/responses, /api/chat Ollama and Web UI); optional
-# "skills_discovery": false restricts the request to exactly the skills it names.
+# (/v1/chat/completions, /v1/responses, Ollama /api/chat/ollama and the Web UI's
+# /api/chat). On a server started with --no-skills the OpenAI, Responses and Ollama
+# routes answer such a request with 400, while the Web UI's /api/chat ignores the
+# field. Optional "skills_discovery": false restricts the request to exactly the
+# skills it names.
 # The model's skills_read calls are answered inside the server, so the response is
 # an ordinary completion rather than a tool call the client has to service.
 curl -X POST http://localhost:5000/api/chat/ollama \
@@ -2207,6 +2531,20 @@ curl http://localhost:5000/v1/skills
 curl -X POST http://localhost:5000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model": "gemma-4-E4B-it-Q8_0.gguf", "messages": [{"role": "user", "content": "Hi"}], "max_tokens": 50}'
+
+# Opt one request out of sub-agent delegation, which is on by default for
+# tool-capable models. "multi_agent": false can only turn it off, never on.
+curl -X POST http://localhost:5000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "gemma-4-E4B-it-Q8_0.gguf", "messages": [{"role": "user", "content": "Compare these two designs."}], "multi_agent": false}'
+
+# Responses API. "input" is a string or an item array, "instructions" the system
+# text, "max_output_tokens" the limit; the completed response is stored (unless
+# "store": false) and GET /v1/responses/{id} returns it. Each request stands alone:
+# previous_response_id is rejected with 400.
+curl -X POST http://localhost:5000/v1/responses \
+  -H "Content-Type: application/json" \
+  -d '{"model": "gemma-4-E4B-it-Q8_0.gguf", "input": "Name three prime numbers.", "max_output_tokens": 128}'
 
 # Reasoning effort (GPT-OSS / Harmony). The model always reasons before it
 # answers; reasoning_effort ("low" | "medium" | "high", default "medium",
@@ -2273,9 +2611,31 @@ response = client.chat.completions.create(
 print(response.choices[0].message.content)
 ```
 
+**Jev typed decisions (DiffusionGemma):**
+
+```bash
+# POST /v1/systemone answers typed questions -- boolean ("noul"), choice and score --
+# about a text and/or image state with probabilities read from one denoising step,
+# instead of generated text. It needs a hosted DiffusionGemma GGUF
+# (config/jev-diffusiongemma-q4.json); "jev-latest" and "jev-preview" are aliases of
+# the loaded model. Up to 8 images travel inline as base64 or data: URLs.
+curl http://localhost:5000/v1/systemone \
+  -H 'Content-Type: application/json' \
+  --data-binary @docs/examples/jev-ticket.json
+```
+
+The body must be `application/json` (415 otherwise) and is capped at 8 MiB
+(`TS_JEV_MAX_BODY_MB`; 413 above it). Malformed JSON answers 400, a request that
+fails validation 422, an unknown model 404, a server without DiffusionGemma — or an
+image request without its vision tower — 503, and a full queue (`TS_JEV_MAX_PENDING`,
+default 32) 529 with `Retry-After: 1`. Inline images count against the upload limits:
+an image over `--upload-max-mb` answers 413, one that would exceed
+`--upload-quota-mb` 507. Request format, probability semantics and validation are in
+the [Jev guide](docs/models/jev.md).
+
 **Queue status:**
 
 ```bash
 curl http://localhost:5000/api/queue/status
-# {"busy":false,"pending_requests":0,"total_processed":42}
+# {"busy":false,"processing":0,"pending_requests":0,"total_processed":42}
 ```

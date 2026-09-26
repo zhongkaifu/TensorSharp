@@ -2,18 +2,24 @@
   // Qwen3.8-27B (UD-Q4_K_XL) as an AGENT: skills, skill scripts, network,
   // code generation / editing / execution, and package installs all enabled.
   //
-  //   TensorSharp.Cli    --config config/agent-qwen3.8-27b.json --chat
-  //   TensorSharp.Server --config config/agent-qwen3.8-27b.json
+  //   TensorSharp.Cli         --config config/agent-qwen3.8-27b.json --chat
+  //   TensorSharp.Server.Host --config config/agent-qwen3.8-27b.json
   //
   // Every key here is read by BOTH hosts. Keys the CLI alone accepts (--think,
-  // --tools, --system, --input, --output, --penalty-last-n, --log-*) are left
-  // out on purpose: the server refuses to start on an unknown option, while the
-  // CLI silently drops one, so a CLI-only key breaks exactly one of the two.
+  // --tools, --system, --input, --output, --log-*) are left out on purpose: the
+  // server refuses to start on an unknown option, while the CLI silently drops
+  // one, so a CLI-only key breaks exactly one of the two.
   // Comments are the only way to annotate a config -- ConfigFileArgs reserves
   // just "variables"/"vars"/"$schema", so any other key becomes a flag.
+  //
+  // A missing model file downloads from "repo" into ${root}, pinned by commit and
+  // SHA-256. This is unsloth's 2026-08-20 imatrix re-quantization of UD-Q4_K_XL,
+  // a different mix of quant types from the earlier upload the speculative-decoding
+  // numbers below were measured on; the embedded NextN head is still there.
   "variables": {
     "modelRoot": "${TENSORSHARP_MODELS:-/Users/zhongkaifu/work/models}",
     "root": "${modelRoot}/Qwen",
+    "repo": "https://huggingface.co/unsloth/Qwen3.8-27B-GGUF/resolve/4ca720788d1e01f1bff70c033e0d0028fd02e502",
     "skillsRoot": "${TENSORSHARP_SKILLS:-/Users/zhongkaifu/work/TensorSharp/TensorAgent/skills}"
   },
 
@@ -22,7 +28,7 @@
   // --max-tokens is the GENERATION cap, not the context window, and it also
   // sizes the up-front KV reservation (prompt + max_new_tokens). The context
   // window cannot be set from a config file at all -- MAX_CONTEXT is env-only:
-  //   MAX_CONTEXT=131072 TensorSharp.Server --config config/agent-qwen3.8-27b.json
+  //   MAX_CONTEXT=131072 TensorSharp.Server.Host --config config/agent-qwen3.8-27b.json
   // Keep this in the 16k-32k range. Overshooting degrades before it fails: as
   // the ~40 GB Metal working set gets tight the OS purges wired buffers and
   // long-context decode collapses toward seconds/token, and past it a command
@@ -56,10 +62,14 @@
   // the indentation and closing delimiters of generated code.
   "repeat-penalty": 1.0,
 
-  // UD-Q4_K_XL (16.7 GB), not Q8_0 (27.1 GB). Q8_0 fits in 48 GB but leaves
+  // UD-Q4_K_XL (16.4 GB), not Q8_0 (27.1 GB). Q8_0 fits in 48 GB but leaves
   // ~11 GB inside Metal's working set for a KV cache that costs roughly
   // 128 KiB/token at f16 -- long agent contexts run out of room, not speed.
-  "model": "${root}/Qwen3.8-27B-UD-Q4_K_XL.gguf",
+  "model": {
+    "path": "${root}/Qwen3.8-27B-UD-Q4_K_XL.gguf",
+    "urls": ["${repo}/Qwen3.8-27B-UD-Q4_K_XL.gguf"],
+    "sha256": "3f227079003add2511437e5b1e94812e363385225bf6a9b47b0054a72bc8b01e"
+  },
 
   // ---- Agent Skills -------------------------------------------------------
   // 12 skills live in TensorAgent/skills. Seven bundle runnable scripts: four
@@ -67,9 +77,11 @@
   // (web-artifacts-builder), the Playwright CLI wrapper, and one JS template
   // (algorithmic-art). Playwright includes macOS sandbox setup and account
   // handoff instructions; a fresh browser does not inherit desktop logins.
-  // The default root (a "skills" folder beside the binary) is empty here, so
-  // without this key the agent silently has zero skills. A path that does not
-  // exist is a fatal startup error, so keep this in step with the checkout.
+  // The default roots (every .agents/skills from the working directory up to
+  // the Git root, then a "skills" folder beside the binary) hold no skills in
+  // this checkout, so without this key the agent silently has zero skills. A
+  // path that does not exist is a fatal startup error, so keep this in step
+  // with the checkout.
   "skills-dir": "${skillsRoot}",
 
   // Let the model run a skill's bundled scripts. Treat every enabled script as
@@ -93,13 +105,19 @@
   "skills-max-rounds": 32,
 
   // ---- Code generation, editing and execution -----------------------------
-  // Offers shell, read_file, edit_file, write_file and apply_patch in one
-  // bounded model-to-tool loop. Commands run under Seatbelt; do NOT add
+  // Offers read_file, apply_patch, write_file (new files only) and shell in
+  // one bounded model-to-tool loop. Commands run under Seatbelt; do NOT add
   // "code-exec-unconfined" on this Mac -- it downgrades confinement to
   // best-effort and lets a failed sandbox wrap fall back to a raw process.
   // Writes are confined to the session workspace and the whole home directory
   // is unreadable, so the agent works in its workspace, not in this repo.
   "code-exec": true,
+
+  // Implementation subtasks may edit their private workspace. Their selected
+  // inputs are copied and results return separately for parent integration.
+  // Explorer/reviewer children remain read-only; child command execution also
+  // requires a backend that guarantees private-workspace read confinement.
+  "agents-allow-worker-tools": true,
 
   // Host-performed pip/npm installs into the session workspace, wheels only,
   // with install scripts disabled. Does NOT by itself give generated code
@@ -125,8 +143,10 @@
 
   // Not set, deliberately:
   //   "mmproj" -- the vision projector costs ~0.9 GB of the memory the KV
-  //     cache wants. Add "mmproj": "${root}/Qwen3.8-27B-mmproj-BF16.gguf" if
-  //     the agent needs to read images.
+  //     cache wants. If the agent needs to read images, add
+  //       "mmproj": { "path": "${root}/Qwen3.8-27B-mmproj-BF16.gguf",
+  //                   "urls": ["${repo}/mmproj-BF16.gguf"],
+  //                   "sha256": "83ee4f4f205fa514161778c41df1ea14144faa0f713510893b63c2395f5c2d53" }
   //   "code-exec-packages" / "code-exec-install-domains" -- defaults already
   //     allow any package from pypi.org, files.pythonhosted.org and
   //     registry.npmjs.org, and installs go to PyPI unless
@@ -140,6 +160,7 @@
   //   "code-exec-temperature" -- inert whenever "temperature" is pinned above.
   //   Speculative decoding -- this GGUF does carry a NextN head (spec would
   //     engage with "spec": true) but it measured only ~1.04x on prose, and
-  //     the auto draft window is 3, not the documented 8. "spec-type": "ngram"
+  //     the auto draft window is 3, not the documented 8 (both measured on the
+  //     earlier, pre-imatrix upload). "spec-type": "ngram"
   //     needs no draft file and is the cheaper thing to try first.
 }

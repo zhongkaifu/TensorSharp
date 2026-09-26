@@ -1,0 +1,21 @@
+{
+  // Danrisi Grainscape: grainy 35mm colour-negative / high-ISO film photography style.
+  //
+  //   TensorSharp.Cli --config config/qwen-image-2.1.json --lora config/lora/qwen-image-2.1-grainscape.json --prompt "..."
+  //
+  // The card: "Use it with strength 0.7".
+  // Sampling: the checkpoint's own schedule (no recipe); --lora-scale overrides the strength.
+  // Source: https://huggingface.co/Danrisi/grainscape_qwen2.1. License: Qwen Research License (non-commercial).
+  "type": "qwen-image-2.1-lora",
+  "variables": {
+    "root": "${TENSORSHARP_MODELS:-../../models}/qwen-image-2.1/loras"
+  },
+  "weights": {
+    "path": "${root}/grainscape_qwen21.safetensors",
+    "urls": [
+      "https://huggingface.co/Danrisi/grainscape_qwen2.1/resolve/bc903faddb7b6106650859c7ddd34610d014ae8e/grainscape_qwen21.safetensors"
+    ],
+    "sha256": "b04b226561c5c3cc65a8e5f79a63a831ffb068d8bd3f156271650cb46e1dc2bf"
+  },
+  "scale": 0.7
+}

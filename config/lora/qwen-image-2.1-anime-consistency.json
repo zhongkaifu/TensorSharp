@@ -1,0 +1,21 @@
+{
+  // WarmBloodAban Anime Consistency (experimental): keeps anime characters consistent across edits.
+  //
+  //   TensorSharp.Cli --config config/qwen-image-2.1.json --lora config/lora/qwen-image-2.1-anime-consistency.json --prompt "..."
+  //
+  // The card: start testing between strength 0.6 and 0.8, with the base model's own settings.
+  // Sampling: the checkpoint's own schedule (no recipe); --lora-scale overrides the strength.
+  // Source: https://huggingface.co/WarmBloodAban/Qwen-Image-2.1-LoRAs. License: Apache-2.0.
+  "type": "qwen-image-2.1-lora",
+  "variables": {
+    "root": "${TENSORSHARP_MODELS:-../../models}/qwen-image-2.1/loras"
+  },
+  "weights": {
+    "path": "${root}/Qwen2.1_Anime_consistency.safetensors",
+    "urls": [
+      "https://huggingface.co/WarmBloodAban/Qwen-Image-2.1-LoRAs/resolve/90abd1e7f590fc8ba052e0d2e6de9dc01730e260/Qwen2.1_Anime_consistency.safetensors"
+    ],
+    "sha256": "0c171eb802ea8051b511f2d93c1743eeadd030316255aa98fa65d40809366752"
+  },
+  "scale": 0.7
+}

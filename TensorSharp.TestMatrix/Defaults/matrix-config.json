@@ -34,7 +34,6 @@
         "TS_BATCHED_N1_FAST_PATH",
         "TS_SCHED_DISABLE_BATCHED",
         "KV_CACHE_DTYPE",
-        "TS_KV_PAGED_QUANT_BITS",
         "MAX_CONTEXT",
         "TS_PREFILL_CHUNK",
         "TS_GGML_ASYNC_COMPUTE",

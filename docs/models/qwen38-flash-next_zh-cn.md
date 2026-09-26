@@ -7,8 +7,9 @@ Qwen3.8-Flash-Next 是一个混合型 MoE：GatedDeltaNet 递归层与全注意�
 PLE n-gram 嵌入块、×4 hyper-connection 流以及 512 专家的 MoE。GGUF 架构 id 是
 `qwen4exp`。权重：
 [unsloth/Qwen3.8-Flash-Next-GGUF](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF)
-（每个量化档一个子目录、均为多分片；`--model` 指向 `-00001-of-` 那一片；把
-`mmproj-BF16.gguf` 放在模型旁边即可启用图像输入）。
+（每个量化档一个子目录、均为多分片；`--model` 指向 `-00001-of-` 那一片；图像输入
+需要 `mmproj-BF16.gguf`：CLI 在给出 `--image` 时会从模型旁边自动加载，服务端则需要显式传
+`--mmproj`）。
 
 ## TensorSharp 如何运行它
 
@@ -16,7 +17,9 @@ PLE n-gram 嵌入块、×4 hyper-connection 流以及 512 专家的 MoE。GGUF �
 最后的 mixer 以及 LM head——并配一个按形状索引的已捕获图缓存
 （`TS_Q4E_TOKEN_GRAPH=0` 回退到逐层融合 kernel，后者再逐算子回退）。视觉沿用
 Qwen3.5-VL 塔，位置用 (T,H,W) IMRoPE；支持多图与多轮图像会话，并在轮次之间复用
-KV（GDN 递归无法回退，因此只有当新 prompt **恰好扩展**已缓存前缀时才复用；见[保留前缀复用](#保留前缀复用)）。
+KV（GDN 递归无法回退，因此只有当新 prompt **恰好扩展**已缓存前缀时才复用；见[保留前缀复用](#保留前缀复用)）。在默认的 radix 前缀缓存（`TS_PREFIX_CACHE_MODE=tree`）下，这种复用止于会话中第一个图像或视频 span：该系列尚未声明可跨媒体 span 复用（它保存了一段 M-RoPE 缓存间隙，目前还没有参照位置测试覆盖）。由于该系列只能从长度与匹配长度完全一致的 holder 或检查点续接，之后的轮次最多复用附件之前已存储的检查点（通常是系统提示词），其余部分重新 prefill。`TS_PREFIX_CACHE_MODE=legacy` 选择旧的保留 holder 匹配，这一限制对它不适用。
+
+思考模式可以开启或关闭。关闭时，助手轮次以已发布模板输出的闭合空块 `<think>\n\n</think>` 开头，重放历史时也保留这一确切后缀，因此缓存前缀仍能匹配。
 
 ## 工具调用与 Agent 工作流
 
@@ -33,6 +36,11 @@ XML 参数按工具声明的 schema 解析：字符串 `123`、`true` 与 JSON �
 使用 `--skills-dir` 启用技能目录，`--skills-allow-exec` 启用技能脚本，
 `--code-exec` 启用工作区文件与 shell 工具；编辑工具为 `apply_patch`。
 执行与沙箱配置见 [Agent Skills](../agent_skills.md)。
+
+由于该系列会渲染工具声明并带有这个解析器，它在服务端也可以使用
+[子智能体委派](../multi_agent.md)（在对话路径上默认开启，与 skills 和 `--code-exec` 无关）。
+`--no-multi-agent`（或请求中的 `multi_agent: false`）可将其关闭；CLI 没有子智能体。
+该系列没有发布任何委派相关的实测结果。
 
 可复用验证脚本：`eng/validation/validate-qwen38-tool-calls.py` 检查通用 API 的
 流式/非流式、思考开/关与工具结果回传；`validate-release-agent-workflows.py`
@@ -138,7 +146,9 @@ MP4、WebM 或 MOV data URI（不会抓取远程 URL）：
 - 复用**仅限精确前缀**（`IExactFusedCacheReuse`）：新 prompt 没有逐 token 复现到最后一个的 holder
   不是它的延续，任何部分匹配都会重新 prefill。
 - 保留的会话与检查点共用一个预算 `TS_Q4E_RETAINED_CACHE_MB`（默认 4096，并受实测内存余量限制；
-  `0` 或无法解析的值会拒绝所有保留），先驱逐最早保留的会话。`TS_Q4E_RETAINED_CACHE=0` 关闭该功能。
+  `0` 或无法解析的值会拒绝所有保留）。在默认的 radix 前缀缓存下，保留与驱逐由前缀树负责，这个预算只会拒绝放不下的
+  holder（只报告一次）；使用 `TS_PREFIX_CACHE_MODE=legacy` 时，模型会先驱逐最早保留的会话。
+  `TS_Q4E_RETAINED_CACHE=0` 关闭该功能。
 - 它需要完整的 GGML token-span 路径（每一份逐序列状态都驻留在设备上并以 holder 为键），以及原生
   条目可以精确拷贝的 GDN 状态布局。保留在按层切分下可用；检查点在按层切分下被接受，在张量并行下
   被拒绝。
@@ -158,13 +168,13 @@ kernel 按批宽度选择：`SharedPrefixChunking_…` 在 CUDA 上把差异上�
 
 ## 共享 MTP 头的投机解码
 
-`--draft-model mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf` 挂上逐 token 的 MTP 块；它只为从位置 0 开始
+`--draft-model mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf` 挂上逐 token 的 MTP 块（仅限 GGML 后端；该头必须是单个 GGUF 文件，并在模型加载时挂上）；它只为从位置 0 开始
 prefill 的单独请求做投机（与其他序列共享的步，以及延续保留 holder 或共享前缀克隆的轮次，都按普通
 方式解码——草稿头有自己的 K/V，无法跨越它从未重放过的位置起草）。在 UD-Q2_K_XL、三 GPU 按层切分
 （A40）上以 `--spec-draft 3` 实测：
 
-- **一致性。** 192 token 的代码复制流与普通贪心完全一致，速度 1.75-1.96 倍（141/141 草稿被接受，
-  无回滚）；投机 prefill（`SpecForward`）在相同分块下与普通 prefill 逐位一致。2026-09-17 之前，4 行
+- **一致性。** 192 token 的代码复制流与普通贪心完全一致，在当前的验证行 kernel 下速度为普通 decode 的
+  1.69 倍（2026-09-17 下文改动之前为 1.75-1.96 倍；141/141 草稿被接受，无回滚）；投机 prefill（`SpecForward`）在相同分块下与普通 prefill 逐位一致。2026-09-17 之前，4 行
   verify 的舍入与 1 行 decode 步不同，可能把普通贪心写出的裸 JSON 对象变成 ```` ```json ```` 围栏
   回答；现在验证行使用单 token kernel（见下文）。
 - **散文不划算。** 18 个散文请求的接受率为 68-70%（每次 verify 3.0 个 token），但一次 verify 约 45 ms，
@@ -210,7 +220,8 @@ KV 状态相同，logits 仍与逐 token decode 不同。启用 CPU 路径后严
 `qwen4exp` 上的 `--tp N` 跑的是**按层切分**：每张 GPU 持有一段连续的完整层。它不是
 张量并行——`qwen4exp` 不切分任何权重——而且这也正是 llama.cpp 为该架构提供的
 （唯一）多 GPU 模式（`-sm row` 直接拒绝加载）。它是**容量**特性，不是速度特性：
-单卡装不下时靠它把模型装下。
+单卡装不下时靠它把模型装下。按层切分仅在 `ggml_cuda` 与 `ggml_vulkan` 上可用；其他后端会
+忽略 `--tp N` 并打印警告、只在单个设备上运行；分布式的 `--tp-node-id`/`--tp-peers` 组会被拒绝。
 
 实测：2× A100-80GB，Qwen3.8-Flash-Next-UD-Q2_K_XL（73.4 GiB）：
 

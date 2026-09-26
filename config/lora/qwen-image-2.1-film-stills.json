@@ -1,0 +1,21 @@
+{
+  // Danrisi Film Stills: a cinematic 35mm film-still style LoRA (text-to-image and editing).
+  //
+  //   TensorSharp.Cli --config config/qwen-image-2.1.json --lora config/lora/qwen-image-2.1-film-stills.json --prompt "..."
+  //
+  // The card: "Use it with strength 0.7". No trigger word; describe a film still.
+  // Sampling: the checkpoint's own schedule (no recipe); --lora-scale overrides the strength.
+  // Source: https://huggingface.co/Danrisi/filmstills_qwen2.1. License: Qwen Research License (non-commercial).
+  "type": "qwen-image-2.1-lora",
+  "variables": {
+    "root": "${TENSORSHARP_MODELS:-../../models}/qwen-image-2.1/loras"
+  },
+  "weights": {
+    "path": "${root}/filmstills_qwen21.safetensors",
+    "urls": [
+      "https://huggingface.co/Danrisi/filmstills_qwen2.1/resolve/29242138fcc2eea95970fe7b66e6e17c4bb373a8/filmstills_qwen21.safetensors"
+    ],
+    "sha256": "ad4812903c6f6b8966885d09dff23344422d0d1f8b2bebad038f8a802f55e30a"
+  },
+  "scale": 0.7
+}

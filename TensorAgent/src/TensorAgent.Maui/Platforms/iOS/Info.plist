@@ -67,8 +67,13 @@
 	<key>NSSpeechRecognitionUsageDescription</key>
 	<string>TensorAgent transcribes your dictation into the message box.</string>
 
-	<!-- Expose the app's Documents folder in Files / Finder so models and
-	     session exports can be copied in and out without a special tool. -->
+	<!-- These show the app's Documents folder in Files and Finder, and that folder
+	     is empty: nothing in the app reads or writes Documents. Conversations,
+	     settings and installed skills live in Library/Application Support; model
+	     weights, uploads, workspaces, generated files and logs in Library/Caches.
+	     Files shows neither. A sideloaded model comes in through the Files picker
+	     on the Models page, which copies it into the store, and a generated file
+	     goes out through QuickLook or the share sheet. -->
 	<key>UIFileSharingEnabled</key>
 	<true/>
 	<key>LSSupportsOpeningDocumentsInPlace</key>

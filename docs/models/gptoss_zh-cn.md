@@ -10,8 +10,9 @@
 | 示例模型 | gpt-oss-20b |
 | 模态 | 仅文本 |
 | 思维链模式 | 是（Harmony 格式：`<\|channel>analysis ... <\|channel>final`） |
-| 工具调用 | 是（Harmony `commentary` channel —— `to=functions.NAME`） |
-| 批处理 / 分页前向 | **默认启用** —— 设置 `TS_GPTOSS_BATCHED=0` 可强制走旧的按序列 KV-swap 路径用于 A/B 对比。每层分页 K/V，注意力 sinks 通过原生 `TSGgml_PagedAttentionForwardWithSinks`（或托管 C# 回退 `TS_GPTOSS_PAGED_ATTN_MANAGED=1`）。详见 §11。 |
+| 工具调用 | 是（Harmony `commentary` channel —— `to=functions.NAME`）；可使用 skills、代码工具以及服务端的[子智能体委派](../multi_agent.md) |
+| 投机解码 | 否 —— GPT OSS 没有投机主干，因此 `--spec`（包括无权重的 n-gram 草稿器）只提供普通解码 |
+| 批处理 / 分页前向 | **默认启用。** 在不带 `--tp` 的 GGML 后端上，并发请求使用按请求的 KV holder 与按 token 批处理的融合 decode 图（`TS_PER_SEQ_FUSED=0` 关闭 holder）。其他后端走分页 `ForwardBatch` 路径：每层分页 K/V，注意力 sinks 通过原生 `TSGgml_PagedAttentionForwardWithSinks`（或托管 C# 回退 `TS_GPTOSS_PAGED_ATTN_MANAGED=1`）。`--tp` 下两条路径都不可用，并发请求走旧的按序列 KV-swap 路径。`TS_GPTOSS_BATCHED=0` 只撤下分页路径，用于 A/B 对比。详见 §11。 |
 | 输出解析器 | `HarmonyOutputParser`（始终启用） |
 
 ## 下载
@@ -144,7 +145,7 @@ hidden ─► narrow(seq_len-1) if prefill          # GPT OSS 在最后一层 Mo
 - **没有 QK-norm**：与 Gemma / Qwen 不同，GPT OSS 跳过 per-head Q/K 归一。
 - **Attention sinks**：per-head bias `attn_sinks.weight`（形状 `[numHeads]`）。在 softmax 中作为虚 token：参与 max 计算与 exp 求和，相当于多了一个永远在的 attention 目标。在 `ApplySoftmaxWithSinks()` 与 `AttentionDecodeWithSinks()` 实现。
 - **RoPE**：NeoX 风格 + YaRN scaling。`Ops.RoPEEx` 调用时传入 `origCtxLen = Config.OriginalContextLength`（4096）、`freqScale = 1 / RopeScale`、`beta_fast = 32`、`beta_slow = 1`。
-- **Attention pattern**：偶数层 ⇒ SWA（窗口取自 `_slidingWindow`，默认 128）；奇数层 ⇒ 全因果。*（实现注：当前代码路径下所有层都对 `totalSeqLen` 做 attention —— SWA 边界从 GGUF 元数据读到了，但 softmax 宽度尚未受其约束。这条在「优化机会」清单里。）*
+- **Attention pattern**：偶数层 ⇒ SWA（窗口取自 `_slidingWindow`，默认 128）；奇数层 ⇒ 全因果。所有 decode / prefill 路径都会把偶数层（SWA）限制在 `_slidingWindow` 之内：托管 per-op 路径、逐层融合图与整模型融合图、以及分页路径。
 
 ### 4.2 FFN —— Clamped GLU（`SiLUAlphaLimit`）
 
@@ -246,14 +247,15 @@ blk.{L}.ffn_down_exps.{E}.bias                     # expert down bias
 
 - **每步路由 buffer**（`_moeExpertCounts`、`_moeExpertOffsets`、`_moeTokenMap`、`_moeWeightMap`）跨 token 复用。
 - **SIMD 向量化的 bias 加法与 SiLUAlphaLimit 激活** 在 `LinearForwardWithBias` 与 `SiLUAlphaLimitInPlace`。
-- **Sinks softmax** 跑在 CPU（标量 + 可选 SIMD 求 exp-sum）。GPU 融合 sinks kernel 在「优化机会」清单上 —— 当前 sinks softmax 是 Metal / CUDA 上的慢路径。
+- **Sinks softmax。** 在 GGML 后端上，下文的融合整模型 decode 图在设备上执行带 SWA 掩码与 sinks 的 flash attention 以及 `mul_mat_id` 专家。在 per-op 路径上，GGML 后端在上下文不超过 `TS_GPTOSS_FUSED_DECODE_MAX_CTX`（默认 4096）个 token 时用逐层融合内核做 decode 注意力，`cuda` 有 GPU sinks decode 内核（`CudaFusedOps.TryGqaDecodeAttentionWithSinks`），`mlx` 有对应的 Metal 内核；其余情况下 sinks softmax 跑在 CPU（标量 + 可选 SIMD 求 exp-sum）。这些路径都会把 SWA 层限制在 `_slidingWindow` 之内。
 - **MXFP4 expert 权重** 量化保留在 `_quantWeights`，matmul 由后端的量化 matmul 派发。
 
 GPT OSS 已经把**整个 decode token 作为一次 GGML 图派发**执行 —— 每一层、MoE 路由与专家、最后的 norm 与 LM head 全部在 `GptOssModel.FusedModelDecode.cs` 的同一张图里，这也是 ggml-cuda 能把它整体捕获成 CUDA graph 的原因。A40 实测：decode 从 24 → 154 tok/s，并且随上下文长度基本持平（16K 时仍有 133 tok/s），而逐层路径在同样长度下已经掉到 2.3。设 `TS_GPTOSS_MODEL_DECODE=0` 可退回 per-op 派发。
 
 ## 10. 内存与 KV cache 策略
 
-- 每层 K、V tensor 形状 `[NumKVHeads, maxSeqLen, headDim]`。KV dtype 可配置 `f32` / `f16` / `q8_0`。
+- 每层 K、V tensor 形状 `[NumKVHeads, maxSeqLen, headDim]`。KV dtype 为 `f32` 或 `f16`；显式请求 `q8_0` / `q4_0` 时会在 stderr 上提示并降为 `f16`（两张融合图与托管 sinks 回退都读不了块量化 cache）。
+- 跨请求的前缀复用以分页家族的方式走 Radix 前缀缓存（默认模式）：缓存的页加上常驻的主缓存，回退是精确的（最多 16 个 token），因为滑动窗口只是在线性 cache 上做掩码（`GptOssModel.PrefixCache.cs`）。
 - `ResetKVCache()` 全部清零。
 - Expert FFN 权重在 `ModelBase` 加载的原始 3D `ffn_gate_exps.weight` / `ffn_up_exps.weight` / `ffn_down_exps.weight` 块中。`FuseExpertGateUpWeights()` 只 dispose per-expert *view*，不动底层大缓冲。这样融合 MoE prefill kernel 仍能通过 `_layerStackedGate` / `_layerStackedUp` / `_layerStackedDown` 直接寻址原始块。
 
@@ -261,9 +263,23 @@ GPT OSS 已经把**整个 decode token 作为一次 GGML 图派发**执行 —�
 
 GPT OSS 实现了 `IBatchedPagedModel.ForwardBatch`
 （[`GptOssModel.BatchedForward.cs`](../../TensorSharp.Models/Models/GptOss/GptOssModel.BatchedForward.cs)）
-并默认启用 —— 只有走批处理路径才能让并发请求真正并行（按序列回退每步至多
-推进一个序列）。设置 `TS_GPTOSS_BATCHED=0` 可强制回到旧的按序列 KV-swap
-路径用于 A/B 对比。该批处理移植需要在分页调度栈内保留 GPT OSS 三大架构特征
+并默认保持可用；设置 `TS_GPTOSS_BATCHED=0` 可撤下它用于 A/B 对比。在下文按请求的
+holder 不适用的地方，剩下的就是旧的按序列 KV-swap 回退；holder 本身不读这个变量。
+
+在不带 `--tp` 的 GGML 后端上，有两个及以上运行中请求的步骤并不走这条分页路径。每个
+请求从自己的 KV holder 解码，holder 通过指针切换换入
+（[`GptOssModel.PerSeqCache.cs`](../../TensorSharp.Models/Models/GptOss/GptOssModel.PerSeqCache.cs)），
+走 §9 的融合整模型 decode 图；由两个及以上这样的请求共享的 decode 步则作为**一张**按
+token 批处理的融合图执行（`GgmlBasicOps.TryGptOssModelDecodeBatched`，
+[`ggml_ops_gptoss_batched.cpp`](../../TensorSharp.GGML.Native/ggml_ops_gptoss_batched.cpp)），
+所有请求只读一遍权重。按 token 批处理的步骤默认开启（`TS_BATCHED_FUSED_DECODE=0` 退回
+每步每个请求各跑一次融合前向）；当路由专家被卸载到 CPU 时拒绝该步，每个请求各自跑一次
+融合前向；某个请求的 holder 在这一步需要扩容时，只有它退出批处理单独 decode，其余请求仍一起
+批处理。非 GGML 后端（以及设置
+`TS_PER_SEQ_FUSED=0` 时）走下面的分页路径。`--tp` 下 holder 与分页路径都不可用，
+并发请求走旧的 KV-swap 路径。本卡片没有记录按 token 批处理路径的吞吐。
+
+该批处理移植需要在分页调度栈内保留 GPT OSS 三大架构特征
 —— **注意力 sinks**、**每个投影都有 bias**、**逐层交替 SWA**：
 
 - **每层分页 K/V**，布局 `[numBlocks * blockSize * numKvHeads * headDim]`，
@@ -319,17 +335,18 @@ GPT OSS 实现了 `IBatchedPagedModel.ForwardBatch`
 
 - **融合 per-layer 批处理内核** —— 旧路径的 `TryFusedAttnLayerPrefill` 每
   层只发一张 cgraph（norm + 融合 QKV + RoPE + KV-append + 带 sinks 的
-  softmax + attn + output proj + residual）。批处理路径目前每层要发 ~5
-  张图。把它们合并成一张批处理 cgraph 是 GPT OSS 批处理性能最大的剩余优
-  化点。
+  softmax + attn + output proj + residual）。分页 `ForwardBatch` 路径目前每层
+  仍要发 ~5 张图。GGML 后端上的并发 decode 如今改走按请求的 holder 与按 token
+  批处理的融合图（§11），因此这一点只在仍然使用分页路径的地方有意义。
 - **任何发布版都用融合 QKV** —— 当 GGUF 拆分 Q / K / V 时，每次单独 matmul
   后还是要单独 bias add。`FusedQKVWithBias` 图能把 3 次派发合 1。
-- **把整模型 decode 铺到旧的单序列路径** —— 融合的整模型 decode 图
-  （`GptOssModel.FusedModelDecode.cs`）目前覆盖的是批处理路径；把同样的
-  单次派发做法延伸到旧的单序列路径，能消除它剩下的大部分托管开销。
-- **旧路径上的 GPU 融合 sinks softmax** —— 旧的 CPU sinks softmax 是批处理
-  路径下原生 `*_WithSinks` 内核的单序列对照。给旧路径写一份自定义 Metal /
-  CUDA 融合内核能缩小这段差距，让单序列路径在 single-sequence 工作负载下
-  保持竞争力。
-- **per-expert decode 批处理** —— 即使有 stacked MoE prefill kernel，decode 仍然每 token 顺序枚举 expert。引入批量 decode 路径（类比 Qwen 3.5 的 `MoEExpertsSwiGLUResidual`）能把 `numExpertsUsed` 次派发合并为 1 次。
-- **偶数层 SWA 边界生效** —— `_slidingWindow` 已经从 GGUF 读入，但当前 attention 路径还没用它来限制 softmax 宽度。把它接入 `AttentionDecodeWithSinks` 能在长上下文上降低 per-token 计算量。
+- **把整模型 decode 铺到分页路径** —— 融合的整模型 decode 图
+  （`GptOssModel.FusedModelDecode.cs`）服务单序列 decode 与按请求的 holder，
+  它的按 token 批处理变体服务 GGML 后端上的并发 decode；分页 `ForwardBatch` 路径
+  没有用到它，把同样的单次派发做法延伸过去，能消除该路径剩下的大部分托管开销。
+- **per-op GGML 路径上的设备端 sinks 注意力（旧路径）** —— 这只与 per-op 路径（§9）
+  有关。融合整模型 decode 图已经在设备上执行 sinks 注意力，`cuda` 与 `mlx` 的 per-op
+  路径也是如此。设置 `TS_GPTOSS_MODEL_DECODE=0` 时，GGML 后端在上下文超过
+  `TS_GPTOSS_FUSED_DECODE_MAX_CTX` 后仍会退回 CPU sinks softmax；放开该逐层内核的
+  上下文上限即可补上这段差距。
+- **per-expert decode 批处理（`cpu` / `cuda`）** —— GGML 后端已经把单 token MoE 作为一次 `mul_mat_id` 派发执行，`mlx` 用 `gather_qmm` 分组 GEMM，但 `cpu` 与 `cuda` 的 per-op 路径仍然每 token 顺序枚举 expert。在那里引入批量 decode 路径（类比 Qwen 3.5 的 `MoEExpertsSwiGLUResidual`）能把 `numExpertsUsed` 次派发合并为 1 次。

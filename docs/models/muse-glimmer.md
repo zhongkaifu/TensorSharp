@@ -1,10 +1,10 @@
 # Muse-Glimmer
 
-[← back to model index](README.md)
+[← back to model index](README.md) | [中文](muse-glimmer_zh-cn.md)
 
 | Property | Value |
 |---|---|
-| GGUF architecture key | `muse-glimmer` |
+| GGUF architecture key | `muse-glimmer` (also `muse_glimmer`) |
 | Source class | [`MuseGlimmerModel`](../../TensorSharp.Models/Models/MuseGlimmer/MuseGlimmerModel.cs) (legacy per-seq) |
 | Speculative drafter | [`MuseGlimmerModel.DFlash.cs`](../../TensorSharp.Models/Models/MuseGlimmer/MuseGlimmerModel.DFlash.cs) + [`DFlashConfig`](../../TensorSharp.Models/Speculative/DFlashConfig.cs) |
 | Vision encoder | [`MuseGlimmerVisionEncoder`](../../TensorSharp.Models/Models/MuseGlimmer/MuseGlimmerVisionEncoder.cs) |
@@ -12,7 +12,7 @@
 | Example models | Muse-Glimmer-30B |
 | Modalities | Text, image |
 | Thinking mode | Yes (the chat template emits an `assistant to=self` reasoning channel) |
-| Tool calling | Yes (ATEM XML markup in the chat template) |
+| Tool calling | Yes (ATEM XML markup in the chat template); eligible for skills, the code tools and server-side [sub-agent delegation](../multi_agent.md) |
 | Batched / paged forward | No (legacy per-seq) |
 | Fused whole-model kernel | GGML CUDA / Vulkan / Metal / CPU (persistent decode graph on all four) |
 | Tensor parallelism | Yes — GGML CUDA / Vulkan, `--tp 2` max (the 30B has 2 KV heads) |
@@ -38,7 +38,9 @@ dotnet run --project TensorSharp.Cli -c Release -- \
   --spec-draft 15 --input prompt.txt --backend ggml_cuda
 ```
 
-`--draft-model` can also be supplied as `TS_MUSE_GLIMMER_DFLASH`.
+`--draft-model` can also be supplied as `TS_MUSE_GLIMMER_DFLASH`. Speculation
+on this model needs that drafter: without it, `--spec` (the weight-free n-gram
+drafter included) serves standard decode.
 
 ### Structured output
 
@@ -199,8 +201,8 @@ Design points that make the persistent drafter correct:
 ### The adaptive cost governor
 
 Speculation is only ever a speed optimization, so
-[`SpeculativeExecution`](../../TensorSharp.Runtime/Speculative/SpeculativeExecution.cs)
-measures ms per *emitted* token with drafting and without, and **parks** the
+[`SpeculationCostGovernor`](../../TensorSharp.Runtime/Speculative/SpeculationCostGovernor.cs)
+(owned by `SpeculativeExecution`) measures ms per *emitted* token with drafting and without, and **parks** the
 drafter when drafting loses. Current design (all measured-in-anger):
 
 * the estimator is a **ratio of sums** (`sum(ticks) / sum(tokens)`), not a mean
@@ -210,8 +212,8 @@ drafter when drafting loses. Current design (all measured-in-anger):
   cold graph builds on either side);
 * the **worst speculative sample of the round is trimmed** (absorbs a mid-probe
   rebuild);
-* `SpecWinMargin` is 1.15, and a park **backs off** (16 steps for the first
-  losing verdict, doubling to 64) — the verdict right after a prefill is the
+* `SpecWinMargin` is 1.15, and a park **backs off** (32 steps for the first
+  losing verdict, doubling up to 256) — the verdict right after a prefill is the
   least trustworthy and also the cheapest to get wrong;
 * `Reset()` clears the verdict so a park never leaks into the next request.
 
@@ -385,6 +387,121 @@ less than llama.cpp does here, and the adaptive governor keeps the drafted
 path within ~5% of the best it can reach once a drafter is attached — but if
 latency matters on Apple Silicon today, run plain decode.
 
+### Earlier CUDA measurement (RTX PRO 6000 Blackwell, 2026-08-13)
+
+Taken the day before the pass below and not re-run since (the host went
+offline), so it predates every change listed there. One **NVIDIA RTX PRO 6000
+Blackwell Server Edition** (97,887 MiB, `CUDA_VISIBLE_DEVICES=0`),
+`Muse-Glimmer-30B-Q8_0.gguf` (27.6 GiB), drafter `dflash-kquant.gguf` (1.5 GiB);
+TensorSharp commit `5098e3f` with vendored ggml `8846b79` on
+`--backend ggml_cuda`, against llama.cpp master `8e7f22b` built for the same CUDA
+architecture (`-b 2048 -ub 2048`). Greedy on both sides, 128 generated tokens,
+two repeats per point with the engines alternating; both engines prefill the
+same rendered prompt (`TensorSharp.Cli --dump-prompt`, token counts confirmed
+with `llama-tokenize`). Mean of two repeats, tok/s; the ratio is TensorSharp /
+llama.cpp:
+
+| Prompt tokens | llama.cpp prefill | TS prefill | ratio | llama.cpp decode | TS decode | ratio |
+|---|---:|---:|---:|---:|---:|---:|
+| 60 | 362 | **459** | 1.27x | 34.7 | **35.0** | 1.01x |
+| 501 | 927 | **1135** | 1.23x | **36.2** | 34.3 | 0.95x |
+| 2050 | 1132 | **1317** | 1.16x | **35.0** | 33.5 | 0.96x |
+| 16126 | **1325** | 1249 | 0.94x | **32.2** | 30.9 | 0.96x |
+| 32274 | **1303** | 1211 | 0.93x | **32.1** | 29.9 | 0.93x |
+| 64575 | **1256** | 1150 | 0.92x | **32.4** | 29.1 | 0.90x |
+| 123931 | **1166** | 1073 | 0.92x | **30.7** | 26.6 | 0.86x |
+
+DFlash decode on the same runs (`--draft-model dflash-kquant.gguf --spec-draft 15`
+against llama.cpp's `-md … --spec-type draft-dflash --spec-draft-n-max 15 -ngld 99`);
+parentheses give the two-repeat range where it is wide:
+
+| Prompt tokens | llama.cpp | TensorSharp | TS, `--spec-pmin 0` |
+|---|---:|---:|---:|
+| 60 | 45.5 | **50.9** | 43.5 |
+| 501 | 117.5 | 164.6 (150-179) | **180.3** |
+| 2050 | 24.9 | **43.5** (30-57) | 34.7 |
+| 16126 | **80.2** | 55.8 (37-75) | 33.2 |
+| 32274 | **60.7** (43-79) | 33.8 (31-36) | 29.9 |
+| 64575 | **66.1** | 48.7 (34-64) | 49.1 |
+| 123931 | **69.0** | 42.3 (30-55) | 59.8 |
+
+Speculation costs *prefill* on both engines, because the drafter's encoder also
+has to see the prompt (tok/s, plain → DFlash):
+
+| Prompt tokens | llama.cpp plain → DFlash | TensorSharp plain → DFlash |
+|---|---:|---:|
+| 60 | 362 → 203 (0.56x) | 459 → 341 (0.74x) |
+| 501 | 927 → 495 (0.53x) | 1135 → 700 (0.62x) |
+| 2050 | 1132 → 259 (0.23x) | 1317 → 703 (0.53x) |
+| 16126 | 1325 → 988 (0.75x) | 1249 → 826 (0.66x) |
+| 64575 | 1256 → 985 (0.78x) | 1150 → 780 (0.68x) |
+| 123931 | 1166 → 920 (0.79x) | 1073 → 742 (0.69x) |
+
+Three things qualify these tables. The four long rows were taken before a CRLF
+normalization, so on them TensorSharp prefilled 1.2% more tokens for the same
+text (16322 / 32666 / 65359 / 125412). The wide TensorSharp DFlash ranges are the
+cost governor: in a 128-token run, one probe mis-measured right after prefill
+parks the drafter for most of the run (two 16K repeats on the same prompt and
+binary gave 36.7 and 74.8 tok/s). And the long prompts come from a highly
+repetitive synthetic corpus; the 501-token point drafts at 100% acceptance on
+both engines, so its DFlash figures are not a general speed-up.
+
+The two 16K repeats differ only in the governor's verdict. The governor of that
+build parked the drafter for a fixed `ParkedProbeInterval = 64` steps; it has
+since been reworked (see [The adaptive cost governor](#the-adaptive-cost-governor)).
+
+| 16K repeat | drafted / accepted | verify steps | parked steps | decode |
+|---|---|---:|---:|---:|
+| 1 | 64 / 48 (75%) | 13 | **67** | 36.7 tok/s |
+| 2 | 132 / 103 (78%) | 22 | 3 | **74.8 tok/s** |
+
+Repeat 1's re-probe after the park measured speculation at **14.0 ms/token
+against 37.8** for plain decode, so the park was wrong: the probe had sampled
+the first speculative steps after prefill, which pay a one-off graph build for
+the verify shape. The parked repeats at 32K, 64K and 128K carry the same
+fingerprint (`drafted` stuck at 64-84). Taking the unparked repeats as steady
+state, TensorSharp's fused DFlash reached **94% of llama.cpp at 16K (74.8 vs
+79.8) and 96% at 64K (63.6 vs 66.5)**.
+
+The `--spec-pmin 0` column is not uniformly better: it wins at 501 and 128K and
+loses badly at 16K and 32K, where acceptance fell from about 75% to 24-42% while
+every rejected row still took a verify slot. The 2K point is a llama.cpp
+anomaly: its DFlash decode (24.9 tok/s on both repeats) is below its own plain
+decode (35.0) and its DFlash prefill collapses 4.4x; that prompt stops
+mid-document, so its continuation is harder to predict than the
+question-and-answer prompts at the other sizes.
+
+Whole-process VRAM peak on the one card, sampled every 2 s (MiB):
+
+| Prompt tokens | llama.cpp plain | TS plain | llama.cpp DFlash | TS DFlash |
+|---|---:|---:|---:|---:|
+| 501 | 28329 | 29655 | 31881 | 29887 |
+| 16126 | 28585 | 30567 | 32191 | 34089 |
+| 64575 | 29401 | 32003 | 33007 | 35809 |
+| 123931 | 30471 | 33787 | 34641 | 37769 |
+
+TensorSharp held 1.3-3.3 GB more than llama.cpp on the plain path and about
+3 GB more with the drafter loaded.
+
+Output consistency on these runs (greedy verification reproduces the plain
+stream up to floating-point near-ties, see section 3):
+
+* TensorSharp was **deterministic**: every configuration matched its own repeat
+  byte for byte.
+* TensorSharp plain vs TensorSharp DFlash: identical at 60 / 501 / 2050 / 16126,
+  diverged at 32274.
+* llama.cpp plain vs llama.cpp DFlash: identical everywhere except 2050.
+* Across engines the continuations agreed for the first 127-636 characters,
+  then parted: different kernels and reduction orders on the same weights.
+
+Method notes. Each context ran llama.cpp → TensorSharp → llama.cpp DFlash →
+TensorSharp DFlash, because running one engine's whole ladder first biases the
+other. The GPU reported `HW Power Brake Slowdown: Active` throughout (2280-2347
+MHz, 180-270 W of a 450 W cap, 28-42 C), a host-level power brake that affected
+both engines alike; about one run in twenty was ~40% slower in both prefill and
+decode with no clock or thermal trace, so single-repeat differences on that host
+deserve suspicion.
+
 ### What the 2026-08-14 pass changed
 
 Every optimization below was verified numerics-neutral (byte-identical greedy
@@ -476,9 +593,10 @@ continuations across the A/B envs on the same binary) before it was kept.
   device kernel; Metal/CPU fill on the host (parallelized, see above).
 * **Prefill is chunked** at `TS_MUSE_GLIMMER_PREFILL_CHUNK` (default 2048),
   exactly as llama.cpp splits at `n_ubatch`; one 16K-row graph would need tens
-  of GB of activations. Multimodal prompts are never chunked (vision rows are
-  injected at absolute offsets). Prefill goes through the shared reuse-gallocr
-  (lifetime-packed intermediates); decode does not (stable addresses win).
+  of GB of activations. Multimodal prompts are chunked too: `ForwardChunked`
+  re-slices the pending vision spans onto each chunk. Prefill goes through the
+  shared reuse-gallocr (lifetime-packed intermediates); decode does not (stable
+  addresses win).
 * **The SWA ring** (GPU backends): 39 of 52 layers never look back past 2048,
   so they get a `pad(n_swa + chunk + 1, 256)` = 4352-row ring indexed by
   `position % rows` instead of full-context caches — 29% of a uniform cache at
@@ -499,6 +617,11 @@ continuations across the A/B envs on the same binary) before it was kept.
   — `CanTruncateKVCache`/`TryTruncateKVCache` say no and the turn re-prefills,
   `TruncateKVCache` throws. An unwrapped ring, a uniform cache and a drop to 0
   rewind to any depth, as before (`KvBlockTransferRingTests`).
+* **Prefix reuse across requests** goes through the Radix prefix cache (the
+  default mode) as a page family: cached KV blocks plus the resident primary
+  cache (`MuseGlimmerModel.PrefixCache.cs`). A rewind of the resident cache is
+  capped at 16 tokens and must also stay within the ring slack described above,
+  and a prompt with an image reuses nothing past the start of its first image.
 * **The padded KV window is materialized on CUDA only where ggml's own
   flash-attention VEC kernel would be selected** — that kernel misreads a
   truncated-prefix K/V view (all 16 query heads sharing a KV head return the
@@ -551,19 +674,24 @@ so the driver runs all ranks with the collectives at the segment boundaries.
 Measured on 2× RTX PRO 4000 Blackwell 24 GB (PCIe), prefill 512 / decode 64,
 best of 3 — the only TP host measured to date:
 
-| Model | | prefill tok/s | decode tok/s |
-|---|---|---|---|
-| 30B-UD-IQ2_XXS (10.2 GB) | `--tp 1` | 1171 | 40.2 |
-| 30B-UD-IQ2_XXS | `--tp 2` | **1569** (1.34×) | **63.2** (1.57×) |
-| 30B-Q8_0 (28.2 GB) | `--tp 2` | 1691 | 34.3 |
+| Model | | prefill tok/s | decode tok/s | GPU 0 | GPU 1 |
+|---|---|---|---|---|---|
+| 30B-UD-IQ2_XXS (10.2 GB) | `--tp 1` | 1171 | 40.2 | 9178 MB | — |
+| 30B-UD-IQ2_XXS | `--tp 2` | **1569** (1.34×) | **63.2** (1.57×) | 5115 MB | 4063 MB |
+| 30B-Q8_0 (28.2 GB) | `--tp 2` | 1691 | 34.3 | 15474 MB | 12748 MB |
 
 `--tp 2` is byte-identical across repeat runs and tracks the `--tp 1` greedy
 continuation for 468 of 500 characters before a benign paraphrase divergence
 (row-parallel partials sum in a different order). The Q8_0 has no single-GPU row
 on that machine — 28.2 GB does not fit one 24 GB card.
 
-DFlash speculative decoding and pooled KV block snapshots follow the single-GPU
-path only; multi-turn reuse under `--tp` comes from live-cache continuation.
+DFlash speculative decoding follows the single-GPU path only: a configured
+drafter is declined under `--tp N` > 1. The CLI warns and serves standard
+decoding; the server refuses to start (exit code 2), because an explicit
+`--draft-model` that cannot activate is fatal there — drop the flag or run without
+`--tp`. Pooled KV block snapshots work under `--tp`
+too (the snapshot walks each layer's per-rank caches), so multi-turn reuse
+there is not limited to live-cache continuation.
 
 ## 7. Environment variables
 

@@ -121,6 +121,7 @@
     <ReferenceNativeSymbol Include="TSGgml_Gemma4BatchedDecodeCapabilities" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Gemma4ModelDecodeBatched" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Gemma4ModelDecodeBatchedEx" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_Gemma4ModelDecodeBatchedEx2" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Gemma4ModelVerify" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Gemma4ReleaseVerifyTpGraphs" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Gemma4ResetBatchedDecodeCache" SymbolType="Function" />
@@ -222,8 +223,10 @@
     <ReferenceNativeSymbol Include="TSGgml_Qwen3ModelPrefill" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Qwen3ResetDecodeCache" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Qwen35ArenaDecodeBatched" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_Qwen35ArenaDecodeBatchedHidden" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Qwen35ArenaDiscardHostPointer" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Qwen35ArenaFlushHostPointer" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_Qwen35ArenaHiddenDecodeAbi" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Qwen35ArenaResetBatchedDecodeCache" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Qwen35AttentionLayerDecode" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Qwen35AttentionLayerPrefill" SymbolType="Function" />

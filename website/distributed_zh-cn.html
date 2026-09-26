@@ -18,7 +18,7 @@
   <h1>多 GPU 与多节点</h1>
   <p class="lede">一个模型，多张 GPU——当一台机器不够用时，还可以是多台机器。TensorSharp 按 Megatron-LM 列/行并行范式实现了<strong>张量并行</strong>，并通过点对点 TCP 网格把它扩展到多台主机。对于不切分权重的架构，同一个 <code>--tp N</code> 参数运行的是<strong>按层切分</strong> —— 那是容量特性，而不是速度特性。</p>
 
-  <div class="callout note"><div class="ic">🧭</div><p><strong>一句话上手：</strong>加上 <code>--tp N</code> 即可在本机 N 张 GPU 上运行 —— 架构支持时切分每一层，不支持时则按整层把模型摊开；在此基础上再加 <code>--tp-node-id</code> 与 <code>--tp-peers</code> 就能跨机器扩展。<code>TensorSharp.Cli</code> 与 <code>TensorSharp.Server</code> 都支持这些参数，可运行在 Direct <a href="backends_zh-cn.html#cuda"><code>cuda</code></a> 后端以及 <a href="backends_zh-cn.html#ggml">GGML CUDA / Vulkan</a> 后端上。</p></div>
+  <div class="callout note"><div class="ic">🧭</div><p><strong>一句话上手：</strong>加上 <code>--tp N</code> 即可在本机 N 张 GPU 上运行 —— 架构支持时切分每一层，不支持时则按整层把模型摊开；在此基础上再加 <code>--tp-node-id</code> 与 <code>--tp-peers</code> 就能跨机器扩展。<code>TensorSharp.Cli</code> 与 <code>TensorSharp.Server.Host</code> 都支持这些参数，可运行在 Direct <a href="backends_zh-cn.html#cuda"><code>cuda</code></a> 后端以及 <a href="backends_zh-cn.html#ggml">GGML CUDA / Vulkan</a> 后端上。</p></div>
 
   <h2 id="why">什么时候需要它？</h2>
   <ul>
@@ -96,22 +96,26 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model model.gguf --backend cuda
   <p>节点通常由人工间隔数秒到数分钟启动，因此先起来的节点会持续重试对外连接（最长 120 秒），而不是在第一次连接被拒绝时就失败。网格建立完成后，每个节点会打印 <code>[TcpCommunicator] Rank r/N connected to all peers.</code>。</p>
 
   <h2 id="architectures">支持的架构</h2>
-  <p>TensorSharp 中几乎每一种自回归架构都可以在 TP 下运行；异构层各有自己的切分策略。<code>--tp</code> 含义不同的那几个会单独标注。本表描述本地支持；GLM 5.x 没有任何一个版本声明支持分布式/跨节点 TP —— GLM-5.2、GLM-5.3 与 GLM-5.3-Flash 都会在模型构建之前直接拒绝 <code>--tp-node-id</code>/<code>--tp-peers</code>。</p>
+  <p>TensorSharp 中几乎每一种自回归架构都可以在 TP 下运行，Qwen-Image-2.1 的扩散 Transformer 也可以；异构层各有自己的切分策略。<code>--tp</code> 含义不同的那几个会单独标注。本表描述本地支持；GLM 5.x 没有任何一个版本声明支持分布式/跨节点 TP —— GLM-5.2、GLM-5.3 与 GLM-5.3-Flash 都会在模型构建之前直接拒绝 <code>--tp-node-id</code>/<code>--tp-peers</code>。</p>
   <div class="table-scroll">
   <table>
     <thead><tr><th>架构</th><th>TP</th><th>策略 / 说明</th></tr></thead>
     <tbody>
       <tr><td>Mistral 3</td><td class="yes">✅</td><td>融合与分离两种 QKV 布局，YaRN RoPE。</td></tr>
+      <tr><td>Qwen 3 / Qwen 2</td><td class="yes">✅</td><td><code>qwen3</code>、<code>qwen2</code> 与 <code>qwen2vl</code> 文件：注意力头与 FFN 中间维按 Megatron 方式切分，每张 GPU 持有自己的那部分 KV 头，因此 KV 缓存也分摊到各设备上。它与 Mistral 3 是仅有的两个在 TP 下也支持批处理前向的架构。</td></tr>
       <tr><td>Gemma 4</td><td class="yes">✅</td><td>稠密与 MoE、逐层 head 维度；多模态嵌入会注入 TP 路径，因此视觉 / 音频提示不会丢失。GGML 上融合的整模 MoE 主干在<em>每个专家内部</em>切分（gate/up 列并行、down 行并行），从而保留全局专家 id —— <code>TS_GEMMA4_TP_FUSED_MOE=0</code> 可回退到逐算子的整专家路径。Direct CUDA 使用逐专家切分。</td></tr>
-      <tr><td>Qwen 3.5 / 3.6 family</td><td class="yes">✅</td><td>GatedDeltaNet 循环层采用块循环 V-head 归属 —— 每个 rank 维护自己的、常驻设备的 delta/conv 状态，循环路径无需跨 rank 通信。GGML 上整个 GDN block 作为一个打包的按 rank 内核运行，MoE 采用专家并行（每个 rank 持有整个专家，shared expert 按 Megatron 切分），LM head 为列并行且完全不需要集合通信。Direct CUDA 使用专家切分。</td></tr>
+      <tr><td>Qwen 3.5 / 3.6 family</td><td class="yes">✅</td><td>GatedDeltaNet 循环层采用块循环 V-head 归属 —— 每个 rank 维护自己的、常驻设备的 delta/conv 状态，循环路径无需跨 rank 通信。GGML 上整个 GDN block 作为一个打包的按 rank 内核运行，MoE 采用专家并行（每个 rank 持有整个专家，shared expert 按 Megatron 切分），LM head 为列并行且完全不需要集合通信。Direct CUDA 使用专家切分。例外是 Bonsai2 经 PRISM 旋转的 <code>qwen35</code> 文件：它们需要单设备 GGML 后端，会拒绝 <code>--tp</code>。</td></tr>
       <tr><td>Qwen 3.8 Flash Next</td><td class="yes">✅（按层切分）</td><td>机制不同：<code>qwen4exp</code> 不切分任何权重。<code>--tp N</code> 给每张 GPU 一段连续的完整层 —— 整 token 的计算图在设备边界处切开，隐状态在卡之间传递 —— 这也是 llama.cpp 为该架构提供的唯一多 GPU 模式（<code>-sm row</code> 拒绝加载它）。贪心输出与单卡运行逐字节一致、吞吐也没有变化，因此它是容量特性；见<a href="#perf-layer-split">按层切分的实测</a>。<code>TS_Q4E_LAYER_SPLIT=20,28</code> 可用明确的每卡层数覆盖自动均衡，遇到无法满足的取值会抛错而不是忽略。</td></tr>
       <tr><td>GPT OSS</td><td class="yes">✅</td><td>MoE 专家切分、attention sink、YaRN。GGML 后端同样可运行，但 GGML 上的 MoE 路径目前仍按 token 逐个遍历专家，尚未使用专家并行。</td></tr>
       <tr><td>Nemotron-H</td><td class="yes">✅</td><td>MoE 专家切分；Mamba2 SSM 层在 rank 0 上计算后广播。GGML 上的 MoE 限制与 GPT OSS 相同。</td></tr>
+      <tr><td>Muse-Glimmer</td><td class="yes">✅</td><td>稠密模型，但有三处形状需要小心：融合的 <code>[gate|up]</code> 按段切分（连续切分会悄悄把整个 <em>gate</em> 交给一个 rank）；逐头的 QK RMSNorm 是一维的 <code>[head_dim]</code> 向量，保持<strong>复制</strong>（Q norm 还折叠了 <code>qk_scale_factor</code>）；注意力输出门按头列并行，并在按 rank 的区域内应用。两次 AllReduce 都作用在 matmul 的原始输出上，位于 1e-8 的 post-norm <em>之前</em> —— 在非线性 norm 之后再归约，会产生通顺但错误的输出。<strong>2 个 KV 头把并行度上限定为 <code>--tp 2</code>。</strong></td></tr>
       <tr><td>DeepSeek V4.1 Flash</td><td class="yes">✅（按层切分，+ 实验性 routed-MoE TP）</td><td>按层放置是默认路径，也是有实测数据的路径，按每张卡的空闲显存分配；<code>--tp N</code> / <code>TS_DSV4_NGPU</code> 限制卡数。<code>TS_DSV41_TP=N</code>（2–8，且必须等于该卡数）还会把路由专家的 gate/up 沿 FFN 中间维、down 沿输入维切分，partial 经主机中转的 F32 缓冲归约；注意力、共享专家与各类 cache 仍按层放置。切分按块对齐且不等宽——2304 的中间维是 9 个 256 元素的 K-quant 块，两 rank 取 1280+1024，四 rank 取 768+512+512+512。首次完整 Q2_K 实测比按层切分更慢。注意力 TP 与分布式组尚未实现。在 <code>--backend cpu</code> 上（纯 C# 的 <code>DeepSeek4CpuExecutor</code>，它是正确性与可移植性路径，而非服务路径），分布式 TP 组以及任何非 <code>0</code> 的 <code>TS_DSV41_TP</code> 都会在读取任何一个权重之前被拒绝。</td></tr>
       <tr><td>DeepSeek V4 Flash</td><td class="yes">✅（按层切分）</td><td>机制不同：DSV4 的整模型执行器是把模型<em>按层</em>切分到各 GPU，而不是切分每个权重，因此没有逐层 AllReduce。<code>--tp N</code> 只是限制切分使用几张 GPU（等同 <code>TS_DSV4_NGPU</code>）；不传参数时使用全部可见设备。切分以单卡最大负载为优化目标，并按各设备固定常驻项的实际落点计入——embedding 表在第一张卡，输出头与整个 DSpark 草稿器在最后一张卡。</td></tr>
       <tr><td>GLM 5.x</td><td class="yes">✅（仅本地）</td><td>仅限 GGML GPU 后端；整个家族 —— GLM-5.2、GLM-5.3 与 GLM-5.3-Flash —— 的原生 TP 都只支持本地单进程。GLM-5.2 切 MLA head 与每个路由专家内的隐藏行。GLM-5.3（非 Flash）与 5.2 是同一套 79 block 的 <code>glm-dsa</code> 结构 —— 256 个路由专家取 top-8 外加一个共享专家、带 lightning indexer 的 MLA、rope base 8e6 —— 因此它在 GLM-5.2 的路径上原样接受 <code>--tp N</code>，不需要新代码也不需要新参数；它的 MLA 与 indexer cache 是<strong>每个 rank 各复制一份</strong>，所以 KV 占用随 <code>N</code> 倍增，能装下的上下文也相应变短。它在大于 1 的并行度下从未跑过 —— 唯一有记录的算术是一台 8× A40 46 GB 机器上 <code>--tp 8</code> 每 rank 需要 41.7 GiB、装不下 —— 因此请把它当作一个被接受的模式，而不是一个已验证的配置。GLM-5.3-Flash 还会切 KDA head 并让每个 rank 持有对应的递归状态；其 MLA head 与路由专家隐藏行同样切分。注意力局部输出会在每次非线性 Sinkhorn 超连接之前归约。在 GLM-5.3-Flash 满足条件的分段快路径上，路由 MoE 局部输出先归约，随后每个 rank 在本地计算并加入其复制的共享专家；超连接、池化 indexer、router、norm、稠密层与 embedding 保持不切分并按 rank 执行，output norm / LM head 留在 rank 0。分段快路径与 <code>TS_GLM_TP_FUSED</code> 都由 Flash 这个布尔开关控制，因此 GLM-5.3（非 Flash）始终走组合调度器。对 Flash 而言，CPU MoE、tracing、部分 <code>TS_GLM_TP_SHARD</code> 切分、超额 rank 或缺少原生超连接内核时选择组合调度器回退，其中共享专家只在 rank 0 运行一次；<code>TS_GLM_TP_FUSED=0</code> 可强制该诊断回退。不传 <code>--tp</code> 仍默认按层切分。</td></tr>
-      <tr><td>DiffusionGemma</td><td class="no">—</td><td>不适用（文本扩散采样器，非自回归 decode）。</td></tr>
-      <tr><td>Qwen-Image-2.1</td><td class="no">—</td><td>不适用（扩散图像生成）。</td></tr>
+      <tr><td>Hunyuan Dense</td><td class="no">—</td><td>单设备。<code>hunyuan-dense</code> 还没有张量并行或按层切分路径：<code>--tp N</code> 会打印告警并只用一张 GPU，分布式并行组会被拒绝。</td></tr>
+      <tr><td>DiffusionGemma</td><td class="no">—</td><td>单设备（文本扩散采样器，非自回归 decode）：<code>--tp N</code> 会打印 <code>WARNING: --tp N ignored</code> 并只用一张 GPU 运行；分布式组在加载时被拒绝（退出码 2）。</td></tr>
+      <tr><td>Qwen-Image-2.1</td><td class="yes">✅（仅本地，扩散 Transformer）</td><td>在 <code>ggml_cuda</code> / <code>ggml_vulkan</code> 上，<code>--tp N</code> 按 Megatron 方式切分扩散 Transformer：每张 GPU 持有 32/N 个完整注意力头与 12,288/N 个 MLP 列，每个 block 中两次行并行乘积在各 GPU 间求和。LoRA 因子随其权重一起切分，每张 GPU 只缓存自己那部分头的前缀。N 必须整除 32 个头——单机上为 2、4、8 或 16——且切分每个权重时都不能拆开它的量化块，加载时会按权重类型逐一检查；仅实测过 2 张 GPU。文本编码器、视觉编码器与 VAE 留在第一张 GPU 上，多节点并行组会被拒绝。见<a href="#perf-qwen-image">下文实测</a>。</td></tr>
+      <tr><td>Wan / MiniMax-H3（视频）</td><td class="no">—</td><td>未实现：视频管线没有多卡路径，<code>--tp N</code> 会被忽略并打印警告，只用一张 GPU 运行；分布式组在加载时被拒绝。</td></tr>
     </tbody>
   </table>
   </div>
@@ -121,7 +125,7 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model model.gguf --backend cuda
   <ul>
     <li><strong>仅限 GPU 后端。</strong>TP 可运行在 <code>cuda</code>、<code>ggml_cuda</code> 与 <code>ggml_vulkan</code> 上；MLX 与 CPU 后端为单设备。</li>
     <li><strong>整除性。</strong><code>numHeads</code>、<code>numKVHeads</code> 与 <code>intermediateSize</code> 都必须能被 TP 度整除；量化权重的行并行切分还要求 <code>ne0</code> 能被 <code>tp × blockSize</code> 整除。</li>
-    <li><strong>TP 下的批处理前向</strong>目前实现于 Mistral 3。MoE 模型（Gemma 4、Qwen 3.5/3.6、GPT OSS、Nemotron-H）在 TP 激活时回退到按序列前向，因此连续批处理在这些模型上的增益较小。</li>
+    <li><strong>TP 下的批处理前向</strong>目前实现于 Mistral 3 与 Qwen 3。MoE 模型（Gemma 4、Qwen 3.5/3.6、GPT OSS、Nemotron-H）在 TP 激活时回退到按序列前向，因此连续批处理在这些模型上的增益较小。</li>
     <li><strong>本地并行度 ≤ 可见 GPU 数。</strong>请求的 rank 数超过主机设备数时，启动阶段就会直接失败。</li>
     <li><strong>多节点仍走逐算子前向。</strong>融合的整模 TP 计算图是按 rank、单进程的；分布式运行会回退到逐算子执行。</li>
   </ul>
@@ -136,9 +140,14 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model model.gguf --backend cuda
       <tr><td>Gemma 4 26B-A4B IQ4_XS</td><td>1845 / 48.5</td><td>2537 / <strong>51.2</strong></td></tr>
       <tr><td>Qwen 3.5-9B Q8_0</td><td>1461 / 23.1</td><td>399 / <strong>24.4</strong></td></tr>
       <tr><td>Qwen 3.5-35B-A3B IQ4_XS</td><td>装不下</td><td><strong>184 / 18.1</strong></td></tr>
+      <tr><td>Muse-Glimmer 30B UD-IQ2_XXS <sup>†</sup></td><td>1171 / 40.2</td><td><strong>1569 / 63.2</strong></td></tr>
+      <tr><td>Muse-Glimmer 30B Q8_0，28.2 GB <sup>†</sup></td><td>装不下</td><td><strong>1691 / 34.3</strong></td></tr>
     </tbody>
   </table>
   </div>
+  <p class="page-foot-note"><sup>†</sup> 测于 2× RTX PRO 4000 Blackwell（各 24 GB，PCIe），而不是其他各行所用的那对 RTX 2000 Ada —— 两套硬件之间不能直接比较，只能各行与自己的单卡列比较。Muse-Glimmer 是这里唯一在两个阶段上<em>都</em>快过单卡的模型（prefill 1.34×、decode 1.57×）；它的 Q8_0 没有单卡数字，因为 28.2 GB 的权重根本装不进 24 GB 的卡。</p>
+
+  <p>但这并不普适。在 3× RTX PRO 6000（PCIe，无 NVLink）上，GLM-5.2 UD-IQ2_XXS 以 prefill 2048 / decode 64 测得：按层切分 <strong>915.9 / 43.9</strong> tok/s，而 <code>--tp 3</code> 只有 <strong>505.6 / 17.6</strong>——78 层里每层都要对 <code>[6144, n_tokens]</code> 的隐状态做两次 all-reduce，在 PCIe 主机上这笔开销超过了拆分省下的算力。TP 还要求每个 rank 各自持有一份全长缓存，能装下的上下文因此从 342,272 掉到 91,136 token；它也改变了归约顺序——对着录制的 llama.cpp 金标准，2-bit MoE 在 <code>--tp 3</code> 下复现 3/6 条提示，而按层切分复现 5/6。那里的 TP 是容量特性而非延迟特性。TP 能带来多少，取决于互连带宽以及一层里究竟有多少能拆。</p>
   <p>Decode —— TP 本该受益的访存瓶颈部分 —— 在 Gemma 4 E4B 上达到单卡的 1.39×，在 Qwen 3.5-9B 上为 1.06×，且两个 Gemma 4 模型的输出与单卡运行<strong>逐字节一致</strong>。Prefill 受计算约束且要承担集合通信开销，因此在单卡装得下的模型上持平或略低于单卡。Qwen 3.5-35B-A3B 在 16 GB 卡上根本装不下 —— 只有 TP 能跑，两张卡上的显存占用为 9.4 + 8.0 GB。</p>
   <h3 id="perf-layer-split">按层切分的实测</h3>
   <p>按层切分不切分任何权重，因此它既不该有开销，也不该有收益 —— 实测正是如此。2× A100-80GB，Qwen3.8-Flash-Next-UD-Q2_K_XL（73.4 GiB），<code>--tp 2</code> 对比单卡：</p>
@@ -155,8 +164,21 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model model.gguf --backend cuda
   </div>
   <p>llama.cpp 在同一台机器上表现相同：<code>-sm layer</code> 把 pp1536 / tg128 从单卡的 1094 / 61.2 提到双卡的 1200 / 61.5 —— prefill 约 10%，decode 几乎为零 —— 而 <code>-sm row</code> 干脆拒绝加载这个架构。所以这里传 <code>--tp N</code> 的理由是权重、缓存与上下文装不进一张卡，而不是吞吐。启动时会打印实际使用的模式与每张 GPU 的层数 / 字节划分。<code>TS_Q4E_LAYER_SPLIT=20,28</code> 可为每张 GPU 指定明确的层数（精神上等同 llama.cpp 的 <code>--tensor-split</code>），遇到无法满足的取值会抛错而不是默默忽略 —— 这很有用，因为自动均衡只按权重计价，看不到稍后才加载、并落在 GPU 0 上的视觉塔。</p>
 
-  <p>但这并不普适。在 3× RTX PRO 6000（PCIe，无 NVLink）上，GLM-5.2 UD-IQ2_XXS 以 prefill 2048 / decode 64 测得：按层切分 <strong>915.9 / 43.9</strong> tok/s，而 <code>--tp 3</code> 只有 <strong>505.6 / 17.6</strong>——78 层里每层都要对 <code>[6144, n_tokens]</code> 的隐状态做两次 all-reduce，在 PCIe 主机上这笔开销超过了拆分省下的算力。TP 还要求每个 rank 各自持有一份全长缓存，能装下的上下文因此从 342,272 掉到 91,136 token；它也改变了归约顺序——对着录制的 llama.cpp 金标准，2-bit MoE 在 <code>--tp 3</code> 下复现 3/6 条提示，而按层切分复现 5/6。那里的 TP 是容量特性而非延迟特性。TP 能带来多少，取决于互连带宽以及一层里究竟有多少能拆。</p>
-
+  <h3 id="perf-qwen-image">TP 下的 Qwen-Image-2.1 扩散 Transformer</h3>
+  <p>两张分属不同 CPU 插槽的 NVIDIA A40（各 46 GB），它们之间的 peer access 不可用，NCCL 走的是共享内存传输。前缀缓存开启，步时不含第 1 步：</p>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>负载</th><th>单 GPU 每步</th><th>双 GPU 每步</th><th>加速</th></tr></thead>
+    <tbody>
+      <tr><td>生成 1024²，40 步</td><td>1.107 s</td><td>0.823 s</td><td><span class="yes">1.34×</span></td></tr>
+      <tr><td>编辑，1 张参考图，1024²，40 步</td><td>1.326 s</td><td>0.934 s</td><td><span class="yes">1.42×</span></td></tr>
+      <tr><td>生成 2048²，20 步</td><td>6.817 s</td><td>4.436 s</td><td><span class="yes">1.54×</span></td></tr>
+      <tr><td>编辑，1 张参考图，2048²，20 步</td><td>7.612 s</td><td>4.849 s</td><td><span class="yes">1.57×</span></td></tr>
+      <tr><td><code>ggml_vulkan</code> 编辑，1024²，20 步（主机归约）</td><td>2.670 s</td><td>3.092 s</td><td>0.86×</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>在 Vulkan 上归约要经过主机内存，其开销超过了切分省下的时间，因此在这套硬件上 <code>--tp</code> 反而更慢。TP 改变了每个 block 部分和的相加顺序，因此图像与单卡结果并不逐位一致（在 CUDA 上与单卡图像相比 PSNR 为 34.2–51.5 dB）：构图与质量保持不变，但细节可能移动。细节见仓库中的 <code>docs/models/qwenimage21_zh-cn.md</code> 卡片。</p>
   <h3 id="perf-graphs">TP 下的 CUDA 图捕获</h3>
   <p>一个张量并行 token 是几十次按 rank 的小提交，重放它们值约 <strong>45% 的 decode 吞吐</strong> —— 因此 TP 下图捕获保持<em>开启</em>（用 <code>TS_GGML_TP_CUDA_GRAPHS=0</code> 关闭）。4×A40 实测：</p>
   <div class="table-scroll">
@@ -197,18 +219,14 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model model.gguf --backend cuda
   <p>启动日志会明确给出拓扑：本地并行组打印 <code>Tensor parallelism: N GPUs (&lt;设备名&gt;)</code>，设备对被降级时打印 <code>TP: P2P disabled…</code> 或自检告警，每个节点在网格建立完成后打印一条 <code>[TcpCommunicator] Rank r/N connected to all peers.</code>。</p>
 
   <h2 id="shared-state">集群内的共享状态</h2>
-  <p>当多个服务端进程共同承载同一批负载时，服务端可以选择把两类状态放到 Redis，而不是各自的进程内存中：</p>
+  <p>当多个服务端进程共同承载同一批负载时，有一类状态可以放到 Redis，而不是各自的进程内存中：</p>
   <ul>
-    <li><strong>KV 缓存层</strong>——分页 KV 块被持久化，因此某个进程算出的前缀可以被另一个进程复用（<code>--redis-url</code> / <code>--paged-kv-redis-url</code>，环境变量 <code>TS_KV_CACHE_REDIS_URL</code>；条目在 <code>TS_KV_CACHE_REDIS_TTL_MINUTES</code> 后过期，默认 24 小时）。</li>
-    <li><strong>Responses API 存储</strong>——OpenAI Responses 存储从内存变为持久化且共享（<code>TS_RESPONSES_STORE_REDIS_URL</code>；<code>--redis-url</code> 一次性设置这两项）。</li>
+    <li><strong>Responses API 存储</strong>——OpenAI Responses 存储从内存变为持久化且共享（<code>--redis-url</code>，环境变量 <code>TS_RESPONSES_STORE_REDIS_URL</code>）。</li>
+    <li><strong>没有共享的 KV 缓存层</strong>——服务端目前没有经 Redis 的跨进程 KV 复用。<code>--redis-url</code> 也会设置 <code>TS_KV_CACHE_REDIS_URL</code>，<code>--paged-kv-redis-url</code> / <code>--paged-kv-redis-ttl</code> 也仍被接受，但服务器只会把它们记入日志：Redis KV 层属于独立的 <code>PagedKvCacheManager</code>，而只有 CLI 的 <code>--paged-bench</code> 微基准会构建它。每个进程各自维护 radix 前缀缓存，其前缀 checkpoint 持久化在各自二进制旁的 <code>prefix-cache/</code> 下。</li>
   </ul>
-  <pre data-lang="bash"><code># 两个层共用一个 Redis
+  <pre data-lang="bash"><code># Responses 存储放在一个共享 Redis 上
 dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model model.gguf --backend cuda \
-    --redis-url localhost:6379
-
-# 仅 KV 缓存，TTL 12 小时
-dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model model.gguf --backend cuda \
-    --paged-kv-redis-url localhost:6379 --paged-kv-redis-ttl 720</code></pre>
+    --redis-url localhost:6379</code></pre>
 
   <h2 id="troubleshooting">故障排查</h2>
   <div class="table-scroll">
@@ -216,7 +234,7 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model model.ggu
     <thead><tr><th>现象</th><th>可能原因与处理</th></tr></thead>
     <tbody>
       <tr><td>启动失败：请求的 TP 度超过设备数</td><td>进程看到的 CUDA 设备少于 <code>--tp</code> 所要求的数量。检查 <code>CUDA_VISIBLE_DEVICES</code> 与驱动。</td></tr>
-      <tr><td>指定了 <code>--tp 2</code>，模型却只加载到一张 GPU</td><td>后端是 <code>mlx</code>、<code>cpu</code> 或 <code>ggml_cpu</code>/<code>ggml_metal</code>。TP 适用于 <code>cuda</code>、<code>ggml_cuda</code> 与 <code>ggml_vulkan</code>。若后端没问题，请看 stderr：既不支持张量并行也不支持按层切分的架构会打印一条提示并只用一张 GPU，而不是直接失败。</td></tr>
+      <tr><td>指定了 <code>--tp 2</code>，模型却只加载到一张 GPU</td><td>后端是 <code>mlx</code>、<code>cpu</code> 或 <code>ggml_cpu</code>/<code>ggml_metal</code>。TP 适用于 <code>cuda</code>、<code>ggml_cuda</code> 与 <code>ggml_vulkan</code>。若后端没问题，请看 stderr：既不支持张量并行也不支持按层切分的架构会打印一条提示并只用一张 GPU，而不是直接失败。DiffusionGemma 以及 Wan、MiniMax-H3 视频管线没有多卡路径：它们会打印 <code>WARNING: --tp N ignored</code> 并只用一张 GPU 运行。</td></tr>
       <tr><td>某个维度无法被 TP 度整除</td><td>选择能整除 <code>numHeads</code>、<code>numKVHeads</code> 与 <code>intermediateSize</code> 的并行度，通常取 2 的幂。</td></tr>
       <tr><td>节点一直等待 peer</td><td>各节点的 peer 列表、顺序或端口不一致，或者防火墙拦截了该端口。若只是节点启动间隔较久，调大 <code>TENSORSHARP_TP_CONNECT_TIMEOUT_SECONDS</code>。</td></tr>
       <tr><td>只有多 GPU 时输出乱码</td><td>怀疑 P2P DMA 路径。先用 <code>TENSORSHARP_TP_HOST_ALLREDUCE=1</code> 重跑，再试 <code>TENSORSHARP_TP_DISABLE_P2P=1</code>；如果输出恢复正常，问题出在该拓扑的 peer DMA 上。</td></tr>

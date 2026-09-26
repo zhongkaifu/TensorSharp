@@ -114,10 +114,22 @@ public sealed class SettingsPage : ContentPage
             settings.AllowNetwork,
             on => Apply(s => s.AllowNetwork = on)));
 
+        // Here rather than under Generation because it decides what the model may do,
+        // like the two above. There was no switch at all: delegation was simply on, on
+        // a phone where every sub-agent is another conversation held in memory.
+        _body.Add(Switch(
+            "Sub-agents",
+            "Let the model hand self-contained parts of a request to helper agents that run "
+            + "on the same model and report back. Each helper is a separate conversation held "
+            + "in memory, and while this is on every prompt also declares the tools for it.",
+            settings.MultiAgentEnabled,
+            on => Apply(s => s.MultiAgentEnabled = on)));
+
         // It used to say "the next time TensorAgent starts", which on a phone is not an
         // instruction anybody follows -- leaving an app does not restart it -- so the
-        // switch read as one that did nothing. Both now take effect on the next command.
-        _body.Add(Note("Sandbox changes take effect straight away, on the next command the model runs."));
+        // switch read as one that did nothing. All three now take effect at once.
+        _body.Add(Note("Changes here take effect straight away: the sandbox on the next command "
+            + "the model runs, sub-agents on the next message."));
         _engine = new Label
         {
             Text = "Now: " + DescribeEngineSafely(),
@@ -164,12 +176,17 @@ public sealed class SettingsPage : ContentPage
             "Start each chat with the model's thinking visible.",
             settings.ThinkByDefault,
             on => { AppSettings s = _app.Settings.Load(); s.ThinkByDefault = on; _app.Settings.Save(s); }));
+        // Through Apply like the sandbox switches. It used to save the file and nothing
+        // else, so the engine that was standing kept the old policy until the next model
+        // load, while AgentAppHost.ApplySpeculationSetting -- written to move the running
+        // engine -- was only ever reached when some OTHER switch was flipped.
         _body.Add(Switch("Speculative decoding",
             "Guess a few tokens ahead and check them in one pass: the same answer, faster on "
             + "code and on replies that quote a file. The engine switches it off by itself "
-            + "while it is not paying.",
+            + "while it is not paying, and some models cannot do it at all. Applies from the "
+            + "next reply.",
             settings.SpeculativeDecoding,
-            on => { AppSettings s = _app.Settings.Load(); s.SpeculativeDecoding = on; _app.Settings.Save(s); }));
+            on => Apply(s => s.SpeculativeDecoding = on)));
 
         _body.Add(Section("Downloads"));
         _body.Add(Switch("Download over cellular",

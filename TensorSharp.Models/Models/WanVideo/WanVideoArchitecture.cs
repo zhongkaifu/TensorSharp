@@ -20,6 +20,12 @@ namespace TensorSharp.Models.WanVideo
             Aliases = new[] { "wan", "wan2.1", "wan2.2" },
             Factory = c => new WanVideoModel(c.GgufPath, c.Backend),
             ApplyNativeTunables = ApplyMetalTunables,
+            // The factory never passes the degree or group on, so without this
+            // declaration --tp N was dropped in silence and a distributed group
+            // was left waiting on collectives this rank never issues.
+            MultiGpu = MultiGpuMode.SingleDevice,
+            MultiGpuLimitation =
+                "wan has no tensor-parallel or layer-split path; it runs on one GPU and extra GPUs stay idle.",
         };
 
         /// <summary>Process-wide ggml-metal switch this family needs set before its

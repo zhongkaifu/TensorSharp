@@ -1,0 +1,21 @@
+{
+  // prithivMLmods Natural Exposure (preview): re-exposes an input image to balanced, neutral exposure.
+  //
+  //   TensorSharp.Cli --config config/qwen-image-2.1.json --lora config/lora/qwen-image-2.1-natural-exposure.json --prompt "..."
+  //
+  // Trigger: "Transform the image with balanced neutral exposure"; give the image with --image.
+  // Sampling: the checkpoint's own schedule (no recipe); --lora-scale overrides the strength.
+  // Source: https://huggingface.co/prithivMLmods/Qwen-Image-2.1-Natural-Exposure-LoRA. License: Qwen Research License (non-commercial).
+  "type": "qwen-image-2.1-lora",
+  "variables": {
+    "root": "${TENSORSHARP_MODELS:-../../models}/qwen-image-2.1/loras"
+  },
+  "weights": {
+    "path": "${root}/Qwen-Image-2.1-Natural-Exposure-LoRA-4000.safetensors",
+    "urls": [
+      "https://huggingface.co/prithivMLmods/Qwen-Image-2.1-Natural-Exposure-LoRA/resolve/382d066d079854a86c9513f3c5a4026ada21ddbe/Qwen-Image-2.1-Natural-Exposure-LoRA-4000.safetensors"
+    ],
+    "sha256": "a8edea397ce55ae6e1a442f3ba963eb78beeb515d4fe7d217d496542317292b1"
+  },
+  "scale": 1.0
+}

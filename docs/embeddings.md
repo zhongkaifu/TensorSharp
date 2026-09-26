@@ -26,8 +26,8 @@ curl -fL --retry 3 -o models/embeddings/all-MiniLM-L6-v2-Q8_0.gguf \
 ```
 
 Both are Apache-2.0 models. The first download is about 635 MB; MiniLM is about
-25 MB. Checksums and GGUF metadata are in
-[the validation manifest](validation/embeddings-2026-09/models.json).
+25 MB. Checksums and GGUF metadata are in the validation manifest
+`docs/validation/embeddings-2026-09/models.json` (local validation evidence, not committed).
 Model architecture support is specifically GGUF `bert` with supported tokenizer
 and pooling metadata. Decoder embedding architectures, rerankers, sparse
 embeddings, and multi-vector retrieval are separate features.
@@ -54,7 +54,8 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll \
 Use `cpu` for 100% pure C# execution without native inference libraries,
 `ggml_cpu` for native CPU execution, or `ggml_cuda` with a CUDA-enabled
 native build. Only the backends actually benchmarked on available hardware
-have measured performance claims; see [validation](validation/embeddings-2026-09/README.md).
+have measured performance claims; see the validation report
+`docs/validation/embeddings-2026-09/README.md` (local validation evidence, not committed).
 The direct `cuda`, MLX, and Vulkan embedding paths are not
 implemented. `--embedding-context-size N` reduces the per-input limit; zero
 uses model metadata.
@@ -85,7 +86,15 @@ On the managed backend, `0` selects four threads; a positive value is the total
 number of computation threads, including the calling thread.
 
 The process keeps one encoder resident. Run chat and embedding services on
-different ports when an application needs both. Set `--host 0.0.0.0` to listen
+different ports when an application needs both. With `--embeddings`, POST requests
+to the generation routes (`/v1/chat/completions`, `/v1/responses`,
+`/v1/systemone`, `/v1/videos/generations`, `/api/generate`, `/api/chat`,
+`/api/chat/ollama`, `/api/models/load`, and `/api/image-generate`,
+`/api/image-edit` and `/api/video-generate` with their `/stream` forms) return
+HTTP 400 `This server hosts an embedding model. Use /v1/embeddings or /api/embed.`
+An explicit `--backend` that this machine does not have stops startup with exit
+code 2 and `error: model load refused: Backend 'X' is not supported on this
+machine.` Set `--host 0.0.0.0` to listen
 on network interfaces, and use the deployment's existing TLS and authentication
 gateway for public access. `/v1/models`, `/api/tags`, and `/api/show` identify
 the hosted model and its embedding capability. Requests name the model's GGUF
@@ -184,7 +193,8 @@ unigram segmentation. BERT uses WordPiece with Unicode NFD and the declared
 case/accent settings. Tests cover 30 independent HuggingFace/llama.cpp cases per
 model plus 13 Snowflake HTTP reference cases.
 
-The [tokenizer oracle fixture](validation/embeddings-2026-09/huggingface-tokenization.json)
+The [tokenizer oracle fixture](../InferenceWeb.Tests/Fixtures/EmbeddingTokenizer/huggingface-tokenization.json)
+(the 13 Snowflake reference cases are in `snowflake-tokenization.json` beside it)
 retains upstream differences: this Snowflake GGUF omits literal `<mask>` and
 removes extra whitespace according to its metadata; MiniLM treats vertical-tab
 and form-feed as whitespace. For decomposed Korean syllables and Indic spacing
@@ -274,8 +284,9 @@ changing the reduction order. [Scalar encoder fixtures](../InferenceWeb.Tests/Em
 check long mixed batches and all pooling modes within `2e-6` absolute error;
 this is a numerical agreement check, not a claim of bitwise identity.
 
-The [native-free host check](validation/embeddings-2026-09/managed-native-free.json)
-exercises both downloaded models after removing the host's custom native assets
+The native-free host check (`docs/validation/embeddings-2026-09/managed-native-free.json`,
+local validation evidence, not committed; `benchmarks/EmbeddingBench/native_free_smoke.py`
+reruns it) exercises both downloaded models after removing the host's custom native assets
 and inspects its loaded libraries after inference.
 
 ### Native GGML execution
@@ -309,9 +320,12 @@ Design references reviewed for this implementation:
   response encoding.
 
 See [the reproducible HTTP benchmark](../benchmarks/EmbeddingBench/README.md)
-and [validation results](validation/embeddings-2026-09/README.md). These checks
-compare identical GGUFs against llama.cpp, with an additional
-[independent NumPy forward check](validation/embeddings-2026-09/numpy-oracle/README.md).
+and the validation results in `docs/validation/embeddings-2026-09/README.md`
+(local validation evidence, not committed). These checks
+compare identical GGUFs against llama.cpp, with an additional independent NumPy
+forward check ([`eng/embedding-reference.py`](../eng/embedding-reference.py); its
+results are in `docs/validation/embeddings-2026-09/numpy-oracle/`, local validation
+evidence, not committed).
 The latter covers both models on pure C# CPU, native GGML CPU, and Metal in both
 engine orders. These fixtures are not an MTEB evaluation.
 
@@ -330,7 +344,9 @@ python3 benchmarks/EmbeddingBench/concurrency_bench.py \
   --output /tmp/minilm-managed-concurrency --require-performance
 ```
 
-Use a new output directory for a repeat; add `--tensorsharp-first` to reverse
+`--base-results` takes the `results.json` that `embedding_bench.py --output DIR`
+writes; the path shown is the recorded run (local validation evidence, not
+committed). Use a new output directory for a repeat; add `--tensorsharp-first` to reverse
 engine order. The output records per-request latency through JSON parsing,
 whole-round latency, requests/second, p95, vectors, token accounting, and binary
 hashes. Vector validation runs after each measured round. The performance gate

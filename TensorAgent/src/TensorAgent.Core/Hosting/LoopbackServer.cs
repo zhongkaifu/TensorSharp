@@ -284,12 +284,13 @@ public static class SseFraming
     ///
     /// <para>
     /// Nulls are WRITTEN, deliberately: this has to stay byte-identical to
-    /// TensorSharp.Server's SSE writer, because the same Web UI page reads both and
-    /// LoopbackServerTests pins the parity. Omitting them here looked like the tidy fix
-    /// for a saved conversation's <c>"imagePaths": null</c> coming back into the page's
-    /// history and stopping the next request in the parser -- but the parser is where
-    /// that belongs (ChatMessageParser.StringList), and it is fixed there. A body a page
-    /// sends must not be able to depend on what a route chose to omit.
+    /// TensorSharp.Server's SSE writer, because both Web UI pages read the same frame
+    /// format and LoopbackServerTests pins the parity. Omitting them
+    /// here looked like the tidy fix for a saved conversation's
+    /// <c>"imagePaths": null</c> coming back into the page's history and stopping the
+    /// next request in the parser -- but the parser is where that belongs
+    /// (ChatMessageParser.StringList), and it is fixed there. A body a page sends must
+    /// not be able to depend on what a route chose to omit.
     /// </para>
     /// </summary>
     public static readonly JsonSerializerOptions JsonOptions = new(JsonSerializerDefaults.General);
@@ -817,11 +818,11 @@ public sealed class LoopbackServer : IDisposable
         if (!File.Exists(full))
             return null;
 
-        // index.html is TensorSharp.Server's, byte for byte, and must stay that way:
-        // forking it would mean every future change to the Web UI had to be made
-        // twice. Everything the app needs on top of it — resuming a saved
-        // conversation, native attachments, dictated text, the copy that only makes
-        // sense on a server — is added by appending one script tag on the way out.
+        // index.html is the app's own phone page (TensorAgent.Maui/wwwroot, bundled as
+        // webui/), and it carries only markup and styles. Everything the page DOES —
+        // the chat, resuming a saved conversation, native attachments, dictated text —
+        // is the companion script above, added by appending one script tag on the way
+        // out, so the behaviour ships in this assembly with the routes it talks to.
         if (relative.Equals("index.html", StringComparison.OrdinalIgnoreCase))
             return LoopbackResponse.Bytes(WithCompanionScript(full), "text/html; charset=utf-8");
 
@@ -852,9 +853,8 @@ public sealed class LoopbackServer : IDisposable
     /// <para>
     /// Bytes, not text. Reading the file into a string and writing it back re-encodes
     /// it — a byte-order mark is dropped, and any encoding the file uses is
-    /// normalised — so the page the WebView receives would no longer be the Server's
-    /// file. It has to be, because that identity is the reason there is no second
-    /// copy of index.html to keep in step.
+    /// normalised — so the page the WebView receives would no longer be the bundled
+    /// file with one tag added, which is all this is meant to do to it.
     /// </para>
     /// </summary>
     private static byte[] WithCompanionScript(string indexPath)

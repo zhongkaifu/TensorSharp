@@ -1,0 +1,22 @@
+{
+  // elusarca Detail Enhancer: detail enhancement, creative upscaling and photo restoration (edit).
+  //
+  //   TensorSharp.Cli --config config/qwen-image-2.1.json --lora config/lora/qwen-image-2.1-detail-enhancer.json --prompt "..."
+  //
+  // Trigger: start the prompt with "enhance this image" and describe what to improve; give the
+  // image to enhance with --image.
+  // Sampling: the checkpoint's own schedule (no recipe); --lora-scale overrides the strength.
+  // Source: https://huggingface.co/reverentelusarca/elusarcas-qwen-2.1-detail-enhancer-lora. License: not stated on the model card.
+  "type": "qwen-image-2.1-lora",
+  "variables": {
+    "root": "${TENSORSHARP_MODELS:-../../models}/qwen-image-2.1/loras"
+  },
+  "weights": {
+    "path": "${root}/elusarcas-qwen2-1-detailer-v1.safetensors",
+    "urls": [
+      "https://huggingface.co/reverentelusarca/elusarcas-qwen-2.1-detail-enhancer-lora/resolve/aedadc6b65a15e6b261c0ec61a4587c3e7119514/elusarcas-qwen2-1-detailer-v1.safetensors"
+    ],
+    "sha256": "c1298f51eb090473f924314475952710a2f0322f1df65c0290f3e14997244f96"
+  },
+  "scale": 1.0
+}

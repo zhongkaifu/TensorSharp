@@ -82,10 +82,10 @@ Shipped implementations:
 
 | Name | Class | Weights | Notes |
 | --- | --- | --- | --- |
-| `draft-head` | `DraftHeadSpeculator` | required | One token per pass, chaining its own hidden output: NextN/MTP (Qwen 3.6, GLM 5.2, GLM-5.3, Gemma 4's separate assistant GGUF). EAGLE-shaped heads fit here unchanged. |
-| `block` | `BlockDraftSpeculator` | required | A whole block per pass with a confidence head: DeepSeek V4 DSpark, DFlash and DFlash2 (Muse-Glimmer, Qwen 3.8). |
-| `ngram` | `NGramSpeculator` | **none** | Suffix matching over the sequence's own tokens (prompt-lookup decoding). Works on every model. |
-| `auto` | — | — | Default: use whatever drafter the checkpoint carries. |
+| `draft-head` | `DraftHeadSpeculator` | required | One token per pass, chaining its own hidden output: NextN/MTP embedded in the trunk (Qwen 3.6, Qwen 3.8 27B, GLM 5.2, GLM-5.3), Gemma 4's separate assistant GGUF, and Qwen 3.8 Flash Next's shared MTP head (a separate GGUF on `--draft-model`). EAGLE-shaped heads fit here unchanged. |
+| `block` | `BlockDraftSpeculator` | required | A whole block per pass with a confidence head: DeepSeek V4 DSpark, DFlash and DFlash2 (Muse-Glimmer, Qwen 3.8). DeepSeek V4.1 DSpark is experimental: the loader accepts a `deepseek41-dspark` drafter on `ggml_cuda` / `ggml_cpu`, validated only on synthetic fixtures; no trained V4.1 drafter has been measured. |
+| `ngram` | `NGramSpeculator` | **none** | Suffix matching over the sequence's own tokens (prompt-lookup decoding). Needs no weights, but only runs on a model that can speculate at all (see [Adding a new model](#adding-a-new-model)): not on GPT-OSS, Mistral 3, Qwen 3 / Qwen 2 (including Bonsai 8B) or Hunyuan Dense, never on Nemotron-H, and on DeepSeek V4 / V4.1 and Muse-Glimmer only while their drafter is loaded. |
+| `auto` | — | — | Default: use whatever drafter the checkpoint carries. A checkpoint without one declines, and the reason names `--spec-type ngram`. |
 
 ### Layer 3 — the weights (`IDraftHead`)
 
@@ -130,8 +130,8 @@ which algorithms exist.
 
 ### Arming after a reused KV prefix
 
-A sequence can begin from a KV prefix it never processed itself — the block-hash
-prefix cache handed it over, or it is simply the next turn of a chat. The executor
+A sequence can begin from a KV prefix it never processed itself — the prefix
+cache (the Radix tree by default) handed it over, or it is simply the next turn of a chat. The executor
 used to refuse to arm speculation on any such sequence, because a learned
 per-position draft head (NextN/MTP) chains its state token by token and cannot
 read an unwritten cache prefix safely. Without an explicit restart that is true, but it was applied to
@@ -152,7 +152,14 @@ chat path: 1.02x → 1.85x.
 
 A per-token head can opt in too, through its weights adapter:
 `IDraftHead.DraftHeadResumesAfterGap`. Stateful heads without a suffix restart
-keep it false. Qwen 3.5/3.6/3.8 NextN/MTP opts in by restarting only its private
+keep it false. Qwen 3.8 Flash Next's shared MTP head is one of them: it keeps
+its own K/V, so it speculates only for a solo request that prefilled from
+position 0, and a turn that continues a retained holder or a shared-prefix clone
+decodes plainly (the head ships as
+`--draft-model mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf`; parity and throughput
+measurements are on the
+[Qwen 3.8 Flash Next card](models/qwen38-flash-next.md#speculative-decoding-with-the-shared-mtp-head)).
+Qwen 3.5/3.6/3.8 NextN/MTP opts in by restarting only its private
 attention cache at the end of a missing-hidden-state gap. Its compact KV indices
 retain absolute rotary positions; the trunk's complete Radix KV/recurrent state
 is unchanged. This covers startup-warmed and disk-restored shared prefixes,
@@ -274,11 +281,14 @@ same class (there is an `ISpeculativeModel` alias for the pair) and report the
 matching `DraftHeadKind`.
 
 One caveat worth stating: some models' `SpecForward` is not drafter-independent
-— Muse-Glimmer and DeepSeek V4 share the fused verify kernel with their drafter
+— Muse-Glimmer and DeepSeek V4 / V4.1 share the fused verify kernel with their drafter
 and refuse to run without it. Those report `SpeculationProfitable` as false when
 no drafter is loaded, so weight-free speculation is declined rather than
-crashed. Qwen 3.5/3.6, GLM 5.2, GLM-5.3, GLM-5.3-Flash and Gemma 4 have
-drafter-independent trunks and accept `--spec-type ngram` on any checkpoint (for
+crashed. Qwen 3.5/3.6/3.8, GLM 5.2, GLM-5.3, GLM-5.3-Flash, Qwen 3.8 Flash Next and Gemma 4 have
+drafter-independent trunks and accept `--spec-type ngram` on any checkpoint,
+within each trunk's own backend gate: Gemma 4 on the ggml backends (`ggml_cpu`
+included) and on `cuda`, Qwen 3.8 Flash Next on its GGML token-graph path, and
+GLM-5.3-Flash where its recurrent-state rollback is available (for
 GLM-5.3-Flash it is the only drafter: its NextN block is not built, and its KDA
 recurrent state is snapshotted and restored the way Qwen's GDN state is - see
 [rejection on a recurrent trunk](#rejection-on-a-recurrent-trunk)). (Gemma 4 used to be gated on its
@@ -286,6 +296,11 @@ assistant GGUF too; the gate was an artifact — its multi-row verify is the sam
 fused whole-model kernel its prefill runs, and the hidden-state capture is only
 filled when a speculator asks for it. TensorAgent ships the assistant GGUF as an
 optional download, so this is what makes speculation reachable there at all.)
+
+Families that do not implement `ISpeculativeTarget` have no speculative trunk
+for any algorithm, n-gram included: GPT-OSS, Mistral 3, Qwen 3 / Qwen 2
+(including Bonsai 8B) and Hunyuan Dense decode plainly whatever `--spec` or
+`--spec-type` says.
 
 A model can also refuse speculation outright. `ISpeculativeTarget.SpeculationRefusal`
 is a correctness verdict, not a speed one: a non-null reason makes the planner,
@@ -303,12 +318,20 @@ trunk's verify cannot reproduce its own decode (see
 --spec-draft <N>                max tokens drafted per step (1-64, default 8)
 --spec-pmin <f>                 confidence gate (default: per algorithm)
 --draft-model <path>            a drafter that ships as its own GGUF: Gemma 4's
-                                draft head, or a block drafter resident before
-                                the layer split
+                                draft head, Qwen 3.8 Flash Next's shared MTP
+                                head, or a block drafter resident before the
+                                layer split; naming one enables speculation
+                                unless --no-spec is given
 ```
 
-The historical `--mtp-spec`, `--mtp-draft`, `--mtp-pmin` and `--mtp-draft-model`
-spellings (and the old `--spec-draft-model` alias) have been removed: each fails
+`--spec-type`, `--spec-draft` and `--spec-pmin` only tune speculation. Given
+without `--spec` or `--draft-model`, and with `TS_SPEC` unset, they leave it off,
+and both hosts log one startup warning that says so (`Speculative decoding stays
+OFF: …`) rather than leaving only the engine's "off (not requested)" plan line.
+
+The historical `--mtp-spec`, `--no-mtp-spec`, `--mtp-draft`, `--mtp-pmin`,
+`--mtp-type` and `--mtp-draft-model` spellings (and the old `--spec-draft-model`,
+`--spec-draft-n-max` and `--spec-draft-conf-min` aliases) have been removed: each fails
 with an error naming its replacement, never a silent ignore, because the CLI's
 argument switch drops unknown flags and "speculation quietly off" is exactly the
 failure that would produce. Environment variables are published under both
@@ -680,10 +703,17 @@ greedy, 160 tokens, plain 46 tok/s):
 | 3 | 4 | 38 | 80 | 66 |
 
 Gemma 4 therefore prefers a window of 7 on the ggml backends
-(`SpecPreferredDraftWindow`), the way Qwen 3.5/3.8 prefer 3 for their recurrent
-state, and the preference now applies to every algorithm — n-gram used to take
-the raw option and verified 9 rows on trunks that had asked for 3 or 7. An
-explicit `--spec-draft` still wins.
+(`SpecPreferredDraftWindow`), or 2 for a dense checkpoint on `ggml_metal` whose
+matrix weights are mostly IQ4_XS (see
+[Building against unchanged ggml](perf/ggml-without-patches.md)), the way Qwen
+3.5/3.8 prefer 3 for their recurrent state, and the preference now applies to
+every algorithm — n-gram used to take the raw option and verified 9 rows on
+trunks that had asked for 3 or 7. N-gram
+can also carry a preference of its own (`SpecPreferredNGramDraftWindow`): on
+`ggml_metal` a dense Qwen 3.5-family trunk whose matrices are mostly IQ4_XS
+drafts 12, a 13-row verify that crosses into the large-batch GEMM on purpose (see
+[Building against unchanged ggml](perf/ggml-without-patches.md)). An explicit
+`--spec-draft` still wins.
 
 Two more things were hiding in the 8-row verify, both found with the phase
 counters (`TS_GMTP_PROFILE=1`) on the real TensorAgent host path:
@@ -848,10 +878,11 @@ large that disagreement is per backend, and what it does to a long greedy
 stream, is measured in [What greedy parity delivers](#what-greedy-parity-delivers).
 
 A holder can only be speculated on by a trunk that forwards on the BOUND cache
-(`ISpeculativeTarget.SpecTrunkFollowsBoundCache`; Gemma 4 and Qwen 3.5 both
-declare it, the default is false and the executor warns once for a model that
-does not). Qwen 3.5 used to lose the request at position 0 when tried: not
-because its state went to the wrong cache - every field the speculative trunk
+(`ISpeculativeTarget.SpecTrunkFollowsBoundCache`; Gemma 4, the Qwen 3.5 family,
+Qwen 3.8 Flash Next and GLM 5.x on its native executor declare it, the default is
+false and the executor warns once for a model that does not). Qwen 3.5 used to
+lose the request at position 0 when tried: not because its state went to the
+wrong cache - every field the speculative trunk
 touches is what `BindSequenceCache` swapped in, and a holder switch drains the
 verify graph's device-live recurrent state into the outgoing holder first - but
 because entering its speculative session flipped `SupportsPerSequenceFusedForward`
@@ -941,7 +972,7 @@ forward - a verify, a kept-prefix re-forward, and the plain path's own two-token
 prefill forward - lands 0.40-0.65 logits away (`--spec-diagnostic-rowcheck`),
 insensitive to the KV dtype (f16 and f32 give identical rows), the persistent
 decode graph and the in-kernel PLE gather. An op probe on the A40
-([`batch_probe.cpp`](validation/campaign-2026-09-16/spec-parity/batch_probe.cpp))
+(`docs/validation/campaign-2026-09-16/spec-parity/batch_probe.cpp` (local validation evidence, not committed))
 finds the batch-shape dependence in ggml-cuda's matmul kernels, not in
 attention: a row of a BF16 matmul computed with others differs from the same row
 alone by up to 8.3e-3 on values of ~4 (the one-row result matches a float64
@@ -969,8 +1000,12 @@ every step from then on without rebuilding the engine: queued like a trim, appli
 on the engine thread between steps, the executor drops its armed contexts and
 re-arms under the new policy on the next turn (`BatchExecutor.SetSpeculation`).
 `InferenceEngineHost.UpdateSpeculation` hands it to the standing engine. It exists
-for a settings switch — TensorAgent's applies at once through it — and for an A/B
-that must not reload the model between its passes.
+for a settings switch and for an A/B that must not reload the model between its
+passes. TensorAgent calls it whenever it applies its settings
+(`AgentAppHost.ApplySettings` → `ApplySpeculationSetting`) and from the on-device
+benchmark between its passes. The Speculative decoding switch on the app's native
+Settings page only saves the setting, so on its own it takes effect at the next
+model load, or when another settings change is applied.
 
 ## The 2026-09 ggml_cuda regression, and what is left
 
@@ -1086,12 +1121,17 @@ The culprit is the per-row recurrent-state snapshot path. `TS_Q35_VERIFY_SNAPSHO
 at draft window 8 produces an identical stream; leaving it on diverges. Nine rows
 is also where ggml's 2..8-row matvec kernels give way to the large-batch path,
 which is the same boundary Gemma 4 already avoids for speed
-(`Gemma4Model.SpecPreferredDraftWindow => 7`).
+(`Gemma4Model.SpecPreferredDraftWindow`: 7, or 2 for a dense, mostly IQ4_XS
+checkpoint on `ggml_metal`).
 
-**The default is not affected.** `Qwen35Model.SpecPreferredDraftWindow` is 3 on a
-recurrent trunk, and a preferred window narrows the DEFAULT only - it never
-overrides a number the operator typed. So this is reachable by passing
-`--spec-draft 8` or wider, and not otherwise.
+**The default on `ggml_cuda` is not affected.** `Qwen35Model.SpecPreferredDraftWindow` is 3 on a
+recurrent trunk, and a preferred window replaces the DEFAULT only - it never
+overrides a number the operator typed. So on `ggml_cuda` this is reachable by passing
+`--spec-draft 8` or wider, and not otherwise. On `ggml_metal`, n-gram's default
+for a dense, mostly IQ4_XS Qwen 3.5-family trunk is 12 drafts, a 13-row verify;
+that Metal path keeps only the last three recurrent states rather than one per
+row, and its recorded before/after comparison produced identical tokens (see
+[Building against unchanged ggml](perf/ggml-without-patches.md)).
 
 **Workaround until it is fixed:** `--spec-draft 7` or lower, or
 `TS_Q35_VERIFY_SNAPSHOTS=0`.
@@ -1281,7 +1321,8 @@ still prefilling; the gate is "alone in the engine".
 
 ## Where n-gram pays
 
-`--spec-type ngram` needs no trained weights, so it works on every checkpoint,
+`--spec-type ngram` needs no trained weights, so it works on any checkpoint of a
+family that can speculate (see [Adding a new model](#adding-a-new-model)),
 including those that ship no speculator at all. It drafts by finding where the
 last few tokens occurred earlier in the context and proposing what followed, so
 it is strong exactly where the answer quotes its input: summarizing, editing,

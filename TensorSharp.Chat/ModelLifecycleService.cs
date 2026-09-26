@@ -271,17 +271,30 @@ namespace TensorSharp.Server
                 // gemma4-assistant draft head) are attached here, by the same
                 // shared loader the CLI uses. DraftHeadActivationError was
                 // cleared when the previous model was unloaded.
-                if (!SpeculativeDraftHeadLoader.TryAttachConfiguredDraftHead(_model, out string draftError))
+                if (!SpeculativeDraftHeadLoader.TryAttachConfiguredDraftHead(_model, out string draftError, out bool draftRefusedByModel))
                 {
                     DraftHeadActivationError = draftError;
-                    DraftHeadRefusedByModel =
-                        _model is TensorSharp.Runtime.Speculative.ISpeculativeTarget { SpeculationRefusal: not null };
+                    // The model's own decline (a trunk that refuses speculation, a DFlash
+                    // drafter under --tp): the startup error then says to drop the flag
+                    // rather than to go looking for a matching draft GGUF.
+                    DraftHeadRefusedByModel = draftRefusedByModel;
                     _logger.LogWarning("{Error}; speculation disabled.", draftError);
                 }
                 else if (SpeculativeDraftHeadLoader.ConfiguredDraftHeadPath() is { } attachedDraft)
                 {
                     _logger.LogInformation("Loaded draft head {Draft} (HasDraftHead=True)",
                         Path.GetFileName(attachedDraft));
+                }
+
+                // --lora plug-ins apply to Qwen-Image-2.1's transformer only. Other models
+                // load without them; say so instead of letting the adapter vanish silently.
+                if (_model is not TensorSharp.Models.QwenImage.QwenImageModel &&
+                    TensorSharp.Runtime.LoraCliFlags.FromJson(Environment.GetEnvironmentVariable(
+                        TensorSharp.Runtime.LoraCliFlags.EnvironmentVariable)) is { Count: > 0 } loras)
+                {
+                    _logger.LogWarning(
+                        "LoRA plug-ins ({Loras}) apply to Qwen-Image-2.1 models only; {Model} ({Architecture}) runs without them.",
+                        TensorSharp.Runtime.LoraCliFlags.Describe(loras), LoadedModelName, Architecture ?? "unknown architecture");
                 }
 
                 loadSw.Stop();

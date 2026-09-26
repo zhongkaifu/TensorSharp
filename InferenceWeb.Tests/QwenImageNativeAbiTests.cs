@@ -48,17 +48,51 @@ public sealed class QwenImageNativeAbiTests
         Assert.Equal(40, Marshal.SizeOf<QwenImage21Weight>());      // TSGQi21Weight
         Assert.Equal(296, Marshal.SizeOf<QwenImage21Block>());      // TSGQi21Block
         Assert.Equal(16, Marshal.SizeOf<QwenImage21Segment>());     // TSGQi21Segment
-        Assert.Equal(464, Marshal.SizeOf<QwenImage21ForwardArgs>()); // TSGQi21Desc
+        Assert.Equal(472, Marshal.SizeOf<QwenImage21ForwardArgs>()); // TSGQi21Desc
         Assert.Equal(376, (int)Marshal.OffsetOf<QwenImage21ForwardArgs>(nameof(QwenImage21ForwardArgs.Blocks)));
         Assert.Equal(440, (int)Marshal.OffsetOf<QwenImage21ForwardArgs>(nameof(QwenImage21ForwardArgs.Eps)));
         Assert.Equal(448, (int)Marshal.OffsetOf<QwenImage21ForwardArgs>(nameof(QwenImage21ForwardArgs.PrefixCacheKey)));
         Assert.Equal(456, (int)Marshal.OffsetOf<QwenImage21ForwardArgs>(nameof(QwenImage21ForwardArgs.PrefixCacheType)));
+        Assert.Equal(460, (int)Marshal.OffsetOf<QwenImage21ForwardArgs>(nameof(QwenImage21ForwardArgs.TpRanks)));
+        Assert.Equal(464, (int)Marshal.OffsetOf<QwenImage21ForwardArgs>(nameof(QwenImage21ForwardArgs.Adapter)));
         Assert.Equal(24, Marshal.SizeOf<QwenImage21PrefixCacheInfo>()); // TSGQi21PrefixCacheInfo
         Assert.Equal(16, (int)Marshal.OffsetOf<QwenImage21PrefixCacheInfo>(nameof(QwenImage21PrefixCacheInfo.Bytes)));
         // Enum values are part of the ABI (TSGQi21PrefixCacheType / TSGQi21ForwardPath).
         Assert.Equal(4, (int)QwenImage21PrefixCacheType.Q8_0V);
         Assert.Equal(3, (int)QwenImage21ForwardPath.Cached);
         Assert.Equal(4, (int)QwenImage21ForwardPath.Declined);
+    }
+
+    [Fact]
+    public void LoraAdapterStructsKeepTheirNativeLayout()
+    {
+        // Mirrored by static_asserts in ggml_ops_qwen_image21.h (TSGQi21Lora,
+        // TSGQi21BlockLora, TSGQi21Adapter). The adapter carries its own StructBytes;
+        // the per-layer block array is not size-checked natively, so a one-sided change
+        // would mis-stride every block's updates.
+        Assert.Equal(8, IntPtr.Size);
+        Assert.Equal(48, Marshal.SizeOf<QwenImage21Lora>());            // TSGQi21Lora
+        Assert.Equal(0, (int)Marshal.OffsetOf<QwenImage21Lora>(nameof(QwenImage21Lora.Down)));
+        Assert.Equal(8, (int)Marshal.OffsetOf<QwenImage21Lora>(nameof(QwenImage21Lora.Up)));
+        Assert.Equal(16, (int)Marshal.OffsetOf<QwenImage21Lora>(nameof(QwenImage21Lora.RowScale)));
+        Assert.Equal(24, (int)Marshal.OffsetOf<QwenImage21Lora>(nameof(QwenImage21Lora.Type)));
+        Assert.Equal(28, (int)Marshal.OffsetOf<QwenImage21Lora>(nameof(QwenImage21Lora.Rank)));
+        Assert.Equal(32, (int)Marshal.OffsetOf<QwenImage21Lora>(nameof(QwenImage21Lora.In)));
+        Assert.Equal(40, (int)Marshal.OffsetOf<QwenImage21Lora>(nameof(QwenImage21Lora.Out)));
+
+        Assert.Equal(336, Marshal.SizeOf<QwenImage21BlockLora>());      // TSGQi21BlockLora
+        Assert.Equal(0, (int)Marshal.OffsetOf<QwenImage21BlockLora>(nameof(QwenImage21BlockLora.Q)));
+        Assert.Equal(144, (int)Marshal.OffsetOf<QwenImage21BlockLora>(nameof(QwenImage21BlockLora.Out)));
+        Assert.Equal(288, (int)Marshal.OffsetOf<QwenImage21BlockLora>(nameof(QwenImage21BlockLora.Down)));
+
+        Assert.Equal(416, Marshal.SizeOf<QwenImage21Adapter>());        // TSGQi21Adapter
+        Assert.Equal(0, (int)Marshal.OffsetOf<QwenImage21Adapter>(nameof(QwenImage21Adapter.StructBytes)));
+        Assert.Equal(4, (int)Marshal.OffsetOf<QwenImage21Adapter>(nameof(QwenImage21Adapter.NumLayers)));
+        Assert.Equal(8, (int)Marshal.OffsetOf<QwenImage21Adapter>(nameof(QwenImage21Adapter.ImageIn)));
+        Assert.Equal(344, (int)Marshal.OffsetOf<QwenImage21Adapter>(nameof(QwenImage21Adapter.ProjOut)));
+        Assert.Equal(392, (int)Marshal.OffsetOf<QwenImage21Adapter>(nameof(QwenImage21Adapter.Blocks)));
+        Assert.Equal(400, (int)Marshal.OffsetOf<QwenImage21Adapter>(nameof(QwenImage21Adapter.OutputHead)));
+        Assert.Equal(408, (int)Marshal.OffsetOf<QwenImage21Adapter>(nameof(QwenImage21Adapter.OutputHeadType)));
     }
 
     [Fact]

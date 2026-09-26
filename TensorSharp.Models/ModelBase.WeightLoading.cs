@@ -342,6 +342,8 @@ namespace TensorSharp.Models
             long fallbackExpertBytes = 0;
             int fallbackExpertCount = 0;
             int mappedHostViews = 0;
+            long regroupedQ6KBytes = 0;
+            int regroupedQ6KCount = 0;
             foreach (QuantizedWeight qw in _quantWeights.Values)
             {
                 if (qw.HasExternalHostView)
@@ -367,7 +369,7 @@ namespace TensorSharp.Models
 
                 bool isExpert = offloadEnabled && MoeExpertOffload.IsExpertWeightName(weightName);
                 bool canPreload = MlxQuantizedOps.CanPreloadQuantizedType(qw.GgmlType);
-                bool preloadCopies = canPreload && MlxQuantizedOps.PreloadDuplicatesHostMemory(qw.GgmlType);
+                bool preloadCopies = canPreload && MlxQuantizedOps.PreloadDuplicatesHostMemory(qw.GgmlType, qw.RawBytes);
 
                 if (isExpert && !canPreload)
                 {
@@ -437,6 +439,11 @@ namespace TensorSharp.Models
 
                 preloadedBytes += qw.RawBytes;
                 preloadedCount++;
+                if (qw.GgmlType == (int)GgmlTensorType.Q6_K && MlxQuantizedOps.Q6KUsesAffine8(qw.RawBytes))
+                {
+                    regroupedQ6KBytes += qw.RawBytes;
+                    regroupedQ6KCount++;
+                }
 
                 // Repack quants (Q4_0/Q4_1/Q5_0/Q5_1/Q8_0/MXFP4/Q5_K-repack)
                 // were materialised into a fresh MLX-allocator MTLBuffer in
@@ -474,6 +481,14 @@ namespace TensorSharp.Models
                     MoeExpertOffload.RegisterOffloadable(stacked.Data);
             }
 
+            if (regroupedQ6KCount > 0)
+            {
+                // Not a lossless reinterpretation like the other repacks; say so.
+                Console.WriteLine(
+                    $"  Q6_K: {regroupedQ6KCount} tensors ({regroupedQ6KBytes / 1024 / 1024} MB) regrouped to MLX 8-bit affine " +
+                    "for MLX's quantized kernels, within half an 8-bit step per weight (TS_MLX_Q6K_AFFINE8=1, or past the raw kernels' 2 GB limit; otherwise Q6_K stays exact).");
+            }
+
             _mlxQuantWeightsPrepared = true;
             // Keep the GGUF mmap alive whenever any quantized weight still has a
             // file-backed view — both the existing fallback path (unpreloadable
@@ -494,11 +509,26 @@ namespace TensorSharp.Models
                 // residency, not arbitrary mmap'd pages, so MTLBuffer-backed
                 // zero-copy wrappers (CreateIq4XsRawWeight etc.) need this
                 // explicit mlock too. Opt out via TS_MLX_MLOCK_GGUF=0.
-                bool locked = _gguf.TryLockMappedRegion();
+                // Only the tensors MLX still reads from the file: those preloaded
+                // into device buffers had their pages released above, and locking
+                // the whole file would fault them back in and wire them twice.
+                var retained = new List<(IntPtr, long)>();
+                foreach (QuantizedWeight weight in _quantWeights.Values)
+                {
+                    if (weight.HasExternalHostView)
+                        retained.Add((weight.Data, weight.RawBytes));
+                }
+                foreach (StackedExpertWeights stacked in _stackedExpertWeights.Values)
+                {
+                    if (stacked.IsExternalView)
+                        retained.Add((stacked.Data, stacked.TotalRawBytes));
+                }
+                bool locked = _gguf.TryLockRanges(retained);
                 if (locked)
                 {
                     Console.WriteLine(
-                        "  GGUF mmap pinned via mlock (model weights stay resident; set TS_MLX_MLOCK_GGUF=0 to disable).");
+                        $"  GGUF mmap pinned via mlock: {_gguf.LockedRangeBytes / 1024 / 1024} MB still read from the file " +
+                        "(set TS_MLX_MLOCK_GGUF=0 to disable).");
                 }
                 else
                 {
@@ -989,6 +1019,22 @@ namespace TensorSharp.Models
 
         protected virtual bool SupportsSplitGateUpFfn => false;
 
+        // On MLX a mixed-quant gate/up pair (IQ4_XS ffn_gate + Q5_K ffn_up in Qwen3.8
+        // UD quants) stays two weights in their own formats instead of the gate being
+        // requantized to Q5_K and fused. MLX runs Q5_K as 6-bit affine, so the fused
+        // gate read 6 bits a weight where IQ4_XS reads 4.25, and the requantization
+        // rounded the gate a second time. Qwen3.8-27B UD-Q4_K_XL on an M5 Pro, fused ->
+        // split: decode 13.1 -> 13.9 tok/s, prefill 443 -> 432 (pp512) and 444 -> 454
+        // (pp4096) tok/s, resident weights 17.9 -> 17.1 GB. Needs a family that can run
+        // the pair as two matmuls (SupportsSplitGateUpFfn) and has a half-precision split
+        // prefill FFN on MLX (SplitsMixedGateUpOnMlx; without one, prefill lost ~7%).
+        // TS_MLX_MIXED_GATE_UP_SPLIT=0 fuses them as on the other backends.
+        protected virtual bool SplitsMixedGateUpOnMlx => false;
+
+        private bool KeepMixedGateUpSplitOnMlx =>
+            _backend == BackendType.Mlx && SupportsSplitGateUpFfn && SplitsMixedGateUpOnMlx
+            && !string.Equals(Environment.GetEnvironmentVariable("TS_MLX_MIXED_GATE_UP_SPLIT"), "0", StringComparison.Ordinal);
+
         protected unsafe void FuseGateUpWeights(int numLayers = 0)
         {
             if (numLayers <= 0)
@@ -1000,6 +1046,7 @@ namespace TensorSharp.Models
             // DIFFERENT combination has to be diagnosed from.
             var splitLayers = new List<string>();
             var requantLayers = new List<string>();
+            var keptMixedLayers = new List<string>();
             for (int l = 0; l < numLayers; l++)
             {
                 string gateName = $"blk.{l}.ffn_gate.weight";
@@ -1028,6 +1075,13 @@ namespace TensorSharp.Models
                     }
 
                     QuantizedWeight gateSrc = gw, upSrc = uw, requant = null;
+                    if (gw.GgmlType != uw.GgmlType && KeepMixedGateUpSplitOnMlx)
+                    {
+                        keptMixedLayers.Add(
+                            $"{l}:{(Runtime.GgmlTensorType)(uint)gw.GgmlType}+" +
+                            $"{(Runtime.GgmlTensorType)(uint)uw.GgmlType}");
+                        continue;
+                    }
                     if (gw.GgmlType != uw.GgmlType)
                     {
                         requant = TryRequantizeForFusion(gw, uw, out bool requantIsGate);
@@ -1129,6 +1183,12 @@ namespace TensorSharp.Models
                         "ffn_gate and ffn_up share a quant type - most non-UD quants do.");
                 }
                 Console.WriteLine($"    Layers: {string.Join(", ", splitLayers)}");
+            }
+            if (keptMixedLayers.Count > 0)
+            {
+                Console.WriteLine(
+                    $"  Split projections: {keptMixedLayers.Count} of {numLayers} mixed-quant ffn_gate/ffn_up pairs run " +
+                    "as two matmuls in their own types on MLX (no requantization; TS_MLX_MIXED_GATE_UP_SPLIT=0 fuses them).");
             }
             ReportDeclinedFusionCopies();
         }

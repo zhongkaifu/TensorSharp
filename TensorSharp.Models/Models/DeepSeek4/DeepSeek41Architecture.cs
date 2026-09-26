@@ -33,8 +33,9 @@ namespace TensorSharp.Models
             // owns its own kernels and does not go through ggml at all),
             // ggml_cpu (the ggml cpu_only branch, where the architecture's fused
             // ops fall back to their scalar implementations) and `cpu` (the pure
-            // C# executor). The last two are correctness and portability paths,
-            // not serving paths.
+            // C# executor). Only ggml_cuda is a serving path; the other three
+            // are correctness and portability paths (the direct-CUDA engine is
+            // not yet held to a numerical gate).
             // A non-CUDA ggml GPU backend can run V4.1 the same way ggml_cpu
             // does -- its architecture-specific ops fall to the CPU backend's
             // scalar implementations -- but at a host round trip per occurrence.
@@ -47,8 +48,9 @@ namespace TensorSharp.Models
             if (backend != BackendType.GgmlCuda && backend != BackendType.Cuda &&
                 backend != BackendType.GgmlCpu && backend != BackendType.Cpu && !nonCudaGpuAllowed)
                 throw new NotSupportedException(
-                    "DeepSeek V4.1 Flash requires --backend ggml_cuda or --backend cuda (serving), or " +
-                    "--backend ggml_cpu or --backend cpu (portability/correctness only). " +
+                    "DeepSeek V4.1 Flash requires --backend ggml_cuda (the serving backend), or " +
+                    "--backend cuda (the direct-CUDA engine, not yet held to a numerical gate), --backend ggml_cpu " +
+                    "or --backend cpu (correctness and portability paths only). " +
                     "TS_DSV41_ALLOW_NON_CUDA_GPU=1 additionally permits ggml_vulkan/ggml_metal, whose "
                     + "architecture-specific ops run on the CPU backend.");
             // A q8_0/q4_0 cache cannot be honoured on any V4.1 executor; refuse it

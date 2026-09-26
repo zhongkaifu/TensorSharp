@@ -49,7 +49,7 @@ public class NemotronConvTests
             Assert.True(Math.Abs(expected[i] - actual[i]) < 1e-6f, $"index {i}: expected {expected[i]}, actual {actual[i]}");
     }
 
-    [Fact]
+    [GgmlFact(BackendType.GgmlCpu)]
     public void NativeMamba2Prefill_MatchesManagedReferenceOnCpu()
     {
         const int seqLen = 5;
@@ -132,7 +132,7 @@ public class NemotronConvTests
         }
     }
 
-    [Fact]
+    [GgmlFact(BackendType.GgmlCpu)]
     public void NativeMamba2Decode_PersistentStateMatchesManagedReferenceOnCpu()
     {
         const int seqLen = 2;

@@ -1,0 +1,22 @@
+{
+  // prithivMLmods Object Mover Bbox (preview): moves the object in one red box to the other red box.
+  //
+  //   TensorSharp.Cli --config config/qwen-image-2.1.json --lora config/lora/qwen-image-2.1-object-mover.json --prompt "..."
+  //
+  // Trigger: "Move the object highlighted in the red box to the location indicated by the other
+  // red box in the scene." Complex backgrounds, reflections and transparent objects may show artifacts.
+  // Sampling: the checkpoint's own schedule (no recipe); --lora-scale overrides the strength.
+  // Source: https://huggingface.co/prithivMLmods/Qwen-Image-2.1-Object-Mover-Bbox-Preview. License: Qwen Research License (non-commercial).
+  "type": "qwen-image-2.1-lora",
+  "variables": {
+    "root": "${TENSORSHARP_MODELS:-../../models}/qwen-image-2.1/loras"
+  },
+  "weights": {
+    "path": "${root}/Qwen-Image-2.1-Object-Mover-Bbox-Preview-5000.safetensors",
+    "urls": [
+      "https://huggingface.co/prithivMLmods/Qwen-Image-2.1-Object-Mover-Bbox-Preview/resolve/fdae922a766c3cdae63a28caa8a123ad82f1f29f/Qwen-Image-2.1-Object-Mover-Bbox-Preview-5000.safetensors"
+    ],
+    "sha256": "b596b5c81ea254b22acecc1801f24f3b42700c954f7ac7a333f644d217c32dcd"
+  },
+  "scale": 1.0
+}

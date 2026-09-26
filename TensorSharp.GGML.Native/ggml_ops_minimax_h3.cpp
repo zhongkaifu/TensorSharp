@@ -158,13 +158,17 @@ float h3_flash_v_scale(int keys)
 // attention never materializes it, so one call covers the whole frame with no tile
 // seams. K/V are cast to F16 because that is what the kernel takes.
 //
-// THE ACCUMULATE IS NOT F32, whatever ggml_prec_set_acc below looks
-// like it asks for. Every flash-attention kernel in the vendored ggml keeps the
-// softmax NUMERATOR -- sum_j exp(s_j - max) * V_j -- in FP16 registers
-// (T_C_VKQ = tile<16, 8, half2>, ggml-cuda/fattn-mma-f16.cuh), and nothing under
-// ggml-cuda/ or ggml-metal/ ever reads op_params for GGML_OP_FLASH_ATTN_EXT, so
-// the prec request is inert. What the kernel does give the accumulator is three
-// bits of headroom: FATTN_KQ_MAX_OFFSET (ggml-cuda/fattn-common.cuh) inflates the
+// THE ACCUMULATE IS NOT RELIABLY F32, whatever ggml_prec_set_acc below looks
+// like it asks for. ggml-cuda's tensor-core kernel keeps the softmax NUMERATOR
+// -- sum_j exp(s_j - max) * V_j -- in FP16 registers (T_C_VKQ = tile<16, 8,
+// half2>, ggml-cuda/fattn-mma-f16.cuh), and neither ggml-cuda nor ggml-metal
+// reads the precision slot of GGML_OP_FLASH_ATTN_EXT (op_params[3]; they read
+// only scale, max_bias, logit_softcap and n_kv_max), so the request cannot move
+// them. ggml-metal's F16 kernels accumulate in float anyway (FA_TYPES,
+// ggml-metal/kernels/fa.metal); ggml-vulkan is the one backend that honours the
+// request and switches to an F32 accumulator. (Checked against the vendored ggml
+// at 353b63b.) What the CUDA kernel does give its accumulator is three bits of
+// headroom: FATTN_KQ_MAX_OFFSET (ggml-cuda/fattn-common.cuh) inflates the
 // running maximum by log(8), capping every softmax weight at 1/8. A row of N keys
 // therefore reaches N/8 * |V| and overflows to Inf once N * |V| > 8 * 65504.
 //
@@ -206,9 +210,10 @@ ggml_tensor* h3_attend(ggml_context* ctx, ggml_backend_t backend,
         ggml_tensor* out = ggml_flash_attn_ext(ctx, qp, kf, vf, nullptr, scale, 0.0f, 0.0f);
         if (out != nullptr && ggml_backend_supports_op(backend, out))
         {
-            // Inert on every backend built here (see the note above the function);
-            // kept because the request is the right one and costs nothing, but the
-            // V pre-scale is what actually keeps the accumulator finite.
+            // Inert on ggml-cuda and ggml-metal, honoured only by ggml-vulkan (see
+            // the note above the function); kept because the request is the right
+            // one and costs nothing, but the V pre-scale is what actually keeps the
+            // FP16 accumulator finite.
             ggml_prec_set_acc(out, GGML_PREC_F32);
             // [hd, heads, seq] contiguous -> [inner, seq].
             ggml_tensor* merged = ggml_reshape_2d(ctx, ggml_cont(ctx, out), hd * heads, seq);

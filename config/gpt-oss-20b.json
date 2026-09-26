@@ -1,8 +1,8 @@
 {
   // gpt-oss-20b (Q8_0) — open-weight reasoning LLM (~12 GB), text only.
   // Run with:
-  //   TensorSharp.Cli    --config config/gpt-oss-20b.json --input prompt.txt
-  //   TensorSharp.Server --config config/gpt-oss-20b.json
+  //   TensorSharp.Cli         --config config/gpt-oss-20b.json --input prompt.txt
+  //   TensorSharp.Server.Host --config config/gpt-oss-20b.json
   "variables": {
     "modelRoot": "${TENSORSHARP_MODELS:-../models}"
   },
@@ -15,5 +15,9 @@
   "temperature": 1.0,
   "top-p": 1.0,
 
-  "model": "${modelRoot}/gpt-oss-20b-Q8_0.gguf"
+  "model": {
+    "path": "${modelRoot}/gpt-oss-20b-Q8_0.gguf",
+    "urls": ["https://huggingface.co/unsloth/gpt-oss-20b-GGUF/resolve/d449b42d93e1c2c7bda5312f5c25c8fb91dfa9b4/gpt-oss-20b-Q8_0.gguf"],
+    "sha256": "bcd455d4034ec02f71a875b46cb17df44a97911d7258291973be4d21f98329f3"
+  }
 }

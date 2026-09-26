@@ -1,0 +1,23 @@
+{
+  // e-n-v-y Qwen-Image-2.1-Fix: a DoRA (magnitude + direction) quality-fix LoRA on blocks 0-21.
+  //
+  //   TensorSharp.Cli --config config/qwen-image-2.1.json --lora config/lora/qwen-image-2.1-fix.json --prompt "..."
+  //
+  // TensorSharp applies the DoRA magnitudes the way ComfyUI does (output-axis norm of the base
+  // weight). The author's full workflow also uses APG, FreSca and the seeds_2 sampler at CFG 3,
+  // which TensorSharp does not implement; the LoRA itself is applied exactly.
+  // Sampling: the checkpoint's own schedule (no recipe); --lora-scale overrides the strength.
+  // Source: https://huggingface.co/e-n-v-y/Qwen-Image-2.1-Fix. License: not stated on the model card.
+  "type": "qwen-image-2.1-lora",
+  "variables": {
+    "root": "${TENSORSHARP_MODELS:-../../models}/qwen-image-2.1/loras"
+  },
+  "weights": {
+    "path": "${root}/qwen-image-2.1-fix-1.0-comfy.safetensors",
+    "urls": [
+      "https://huggingface.co/e-n-v-y/Qwen-Image-2.1-Fix/resolve/5b2c7be6ced92cc2e09f9309ad00567b3a3bb6ce/qwen-image-2.1-fix-1.0-comfy.safetensors"
+    ],
+    "sha256": "e4a369158b957aee3a8316d94dbe00c98f7d648ef3d1926ccf7283915b6db60c"
+  },
+  "scale": 1.0
+}

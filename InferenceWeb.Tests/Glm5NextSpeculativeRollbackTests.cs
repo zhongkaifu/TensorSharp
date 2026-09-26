@@ -250,26 +250,35 @@ public sealed class Glm5NextSpeculativeRollbackTests : IDisposable
         AssertClose(plainAfterProbe, specAfterProbe, 1e-3, "continuation logits after a probe token");
     }
 
+    // Each check runs on the managed per-op path (a plain [Theory] row, every lane)
+    // and on the native executor (the _GgmlCpu facts). The native ones construct
+    // ggml-cpu, and a process holds one GGML backend, so they run in the lane that
+    // pins ggml-cpu and skip visibly in the others.
     [Theory]
     [InlineData(BackendType.Cpu)]
-    [InlineData(BackendType.GgmlCpu)]
     public void NGramSpeculativeGreedy_MatchesPlainGreedy_AndRollsBack(BackendType backend)
     {
         RunAndCheck(backend, (t, _) => NGram(t, maxDraft: 4), requireRollback: true, "ngram");
     }
 
+    [GgmlFact(BackendType.GgmlCpu)]
+    public void NGramSpeculativeGreedy_MatchesPlainGreedy_AndRollsBack_GgmlCpu()
+        => NGramSpeculativeGreedy_MatchesPlainGreedy_AndRollsBack(BackendType.GgmlCpu);
+
     [Theory]
     [InlineData(BackendType.Cpu)]
-    [InlineData(BackendType.GgmlCpu)]
     public void EveryWindowPartiallyRejected_StillMatchesPlainGreedy(BackendType backend)
     {
         RunAndCheck(backend, (t, vocab) => new PartiallyWrongDrafter(NGram(t, maxDraft: 4), vocab),
                     requireRollback: true, "wrong-tail");
     }
 
+    [GgmlFact(BackendType.GgmlCpu)]
+    public void EveryWindowPartiallyRejected_StillMatchesPlainGreedy_GgmlCpu()
+        => EveryWindowPartiallyRejected_StillMatchesPlainGreedy(BackendType.GgmlCpu);
+
     [Theory]
     [InlineData(BackendType.Cpu)]
-    [InlineData(BackendType.GgmlCpu)]
     public void SnapshotVerifyRestoreRewind_EqualsAPlainDecodeOfTheAcceptedPrefix(BackendType backend)
     {
         using var env = EnvironmentForFixture();
@@ -329,6 +338,10 @@ public sealed class Glm5NextSpeculativeRollbackTests : IDisposable
         AssertClose(sequential[2], next2, 1e-3, "continuation after the second rollback");
     }
 
+    [GgmlFact(BackendType.GgmlCpu)]
+    public void SnapshotVerifyRestoreRewind_EqualsAPlainDecodeOfTheAcceptedPrefix_GgmlCpu()
+        => SnapshotVerifyRestoreRewind_EqualsAPlainDecodeOfTheAcceptedPrefix(BackendType.GgmlCpu);
+
     [GlmNativeCudaFact]
     public void CudaNgramRollback()
         => NGramSpeculativeGreedy_MatchesPlainGreedy_AndRollsBack(BackendType.GgmlCuda);
@@ -341,7 +354,7 @@ public sealed class Glm5NextSpeculativeRollbackTests : IDisposable
     public void CudaSnapshotVerifyRestoreRewind()
         => SnapshotVerifyRestoreRewind_EqualsAPlainDecodeOfTheAcceptedPrefix(BackendType.GgmlCuda);
 
-    [Fact]
+    [GgmlFact(BackendType.GgmlCpu)]
     public void BoundSlots_AbaRollbackPreservesEachContinuation()
         => CheckBoundSlotsAbaRollback(BackendType.GgmlCpu);
 
@@ -389,7 +402,7 @@ public sealed class Glm5NextSpeculativeRollbackTests : IDisposable
         model.OnSequenceReleased("B");
     }
 
-    [Fact]
+    [GgmlFact(BackendType.GgmlCpu)]
     public void ManagedAndNativeSpecForward_AgreeRowForRow()
     {
         using var env = EnvironmentForFixture();

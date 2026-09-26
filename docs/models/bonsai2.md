@@ -1,6 +1,6 @@
 # Bonsai2 27B
 
-[← back to model index](README.md)
+[← back to model index](README.md) | [中文](bonsai2_zh-cn.md)
 
 Bonsai2 uses the dense Qwen 3.5 hybrid architecture with PRISM's signed
 Hadamard rotations and custom low-bit GGUF encodings. It is distinct from
@@ -16,8 +16,10 @@ and embedding outputs must also receive the declared transforms.
 | `Ternary-Bonsai-2-27B-PTQ1_0.gguf` | 5,946,648,928 | `53107f530aa52eb00912263ab1ee29bd199261c87cd7b4ad4ca1318c1fe33ee3` |
 
 The companion files are `Ternary-Bonsai-2-27B-mmproj-BF16.gguf` and
-`Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf`. Pass `--mmproj` to select one
-explicitly when comparing image quality or memory use.
+`Ternary-Bonsai-2-27B-mmproj-Q8_0.gguf`. When an image is given, the CLI looks
+for them beside the model (BF16 first); the server loads a projector only
+through `--mmproj`. Pass `--mmproj` to select one explicitly when comparing
+image quality or memory use.
 
 Both language-model files declare `general.architecture=qwen35`, 64 layers,
 hidden width 5,120, FFN width 17,408, vocabulary 248,320, and a 262,144-token
@@ -80,6 +82,8 @@ The initial integration requires a single-device GGML backend. Pure managed
 CPU, direct CUDA, MLX, and tensor-parallel configurations are rejected instead
 of silently omitting the rotations. Device-specific end-to-end validation is
 separate from that loader eligibility; see the validation procedure below.
+Bonsai2 has no TensorAgent catalog entry; the app's two Bonsai entries are the
+[Q1_0 files](bonsai.md#tensoragent-sideload).
 
 Use an explicit context cap rather than allocating for the entire advertised
 262k window:
@@ -167,3 +171,23 @@ for PQ2 and 3.0% slower for PTQ1, and PQ2 concurrency-four HTTP throughput is
 artifact identities, and test limitations. The broader native CPU suite also
 has one DeepSeek41 tolerance failure reproduced from unchanged TensorSharp
 HEAD; it is not counted as a passing test.
+
+### CUDA status after that run
+
+A CUDA-only defect in the signed-Hadamard path was fixed afterwards. The
+rotation matmul asks the backend to run its own fast Walsh-Hadamard transform
+over the input; ggml-cuda's kernel does not check the input type and read an
+F16 row as F32. In the inverse direction that gave a maximum absolute error of
+16.0 against the dense oracle on an A5000, while the CPU backend was correct.
+[ggml_ops_bonsai.cpp](../../TensorSharp.GGML.Native/ggml_ops_bonsai.cpp) now
+widens the transform input to F32 before that node. Model activations were
+already F32, so the model's own paths gain no node.
+
+[`bonsai2-reference-comparison.sh`](../../eng/validation/bonsai2-reference-comparison.sh)
+is the reference-engine harness for an A5000 CUDA host. It records the
+upstream llama.cpp refusals for PQ2_0/PTQ1_0, builds the PrismML fork at the
+pinned commit in a separate tree while asserting that TensorSharp's ggml
+checkout stays unchanged, measures model-only and HTTP (concurrency 1 and 4)
+throughput on the same GGUF, runs a projector smoke, and writes its output under
+ignored `artifacts/`. No results from it are committed, so CUDA model execution
+remains unvalidated as stated above.

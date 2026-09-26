@@ -11,6 +11,7 @@
 using System;
 using System.IO;
 using System.Linq;
+using System.Text.Json;
 using System.Text.RegularExpressions;
 using System.Xml.Linq;
 using Xunit;
@@ -477,6 +478,77 @@ public class TensorAgentMauiProjectTests
             Csproj.Descendants(Ns + "BundleResource"),
             e => e.Attribute("Include")!.Value.Replace('\\', '/')
                 .Contains("TensorSharp.Server/wwwroot", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void Head_BundlesExactlyTheSkillsTheVerifierPassed()
+    {
+        // TensorAgent/skills is shared with the desktop hosts, so it holds skills the
+        // phone cannot run. Playwright and web-artifacts-builder were bundled for a while:
+        // their shell scripts run npx, pnpm and npm, the app has no Node package manager,
+        // and a skill the model is offered but cannot run fails in front of the user on
+        // its first step. The csproj excludes such a skill by name because MSBuild cannot
+        // read verdicts.json; this keeps the two equal.
+        XElement bundle = Assert.Single(Csproj.Descendants(Ns + "BundleResource"),
+            e => e.Attribute("Include")!.Value.Replace('\\', '/') == "../../skills/**/*");
+        Assert.StartsWith("skills/", bundle.Attribute("Link")?.Value.Replace('\\', '/'));
+
+        string[] excludes = (bundle.Attribute("Exclude")?.Value ?? string.Empty)
+            .Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(pattern => pattern.Replace('\\', '/'))
+            .ToArray();
+        Assert.Contains("../../skills/verdicts.json", excludes);
+        Assert.Contains("../../skills/**/__pycache__/**/*", excludes);
+
+        var wholeSkill = new Regex(@"^\.\./\.\./skills/([^/*]+)/\*\*/\*$", RegexOptions.CultureInvariant);
+        string[] excluded = excludes
+            .Select(pattern => wholeSkill.Match(pattern))
+            .Where(match => match.Success)
+            .Select(match => match.Groups[1].Value)
+            .OrderBy(name => name, StringComparer.Ordinal)
+            .ToArray();
+
+        string skillsDir = Path.Combine(RepoRoot, "TensorAgent", "skills");
+        string[] skills = Directory.EnumerateDirectories(skillsDir)
+            .Where(dir => File.Exists(Path.Combine(dir, "SKILL.md")))
+            .Select(dir => Path.GetFileName(dir))
+            .OrderBy(name => name, StringComparer.Ordinal)
+            .ToArray();
+
+        using JsonDocument verdicts = JsonDocument.Parse(File.ReadAllText(Path.Combine(skillsDir, "verdicts.json")));
+        string[] passed = verdicts.RootElement.EnumerateArray()
+            .Where(verdict => verdict.GetProperty("ok").GetBoolean())
+            .Select(verdict => verdict.GetProperty("name").GetString()!)
+            .OrderBy(name => name, StringComparer.Ordinal)
+            .ToArray();
+
+        Assert.Contains("playwright", skills);
+        Assert.Contains("playwright", excluded);
+        // The same blind spot let web-artifacts-builder through: its scripts install and run
+        // pnpm, npm and parcel, none of which the in-app shell has.
+        Assert.Contains("web-artifacts-builder", excluded);
+
+        var isSkill = new HashSet<string>(skills, StringComparer.Ordinal);
+        var didPass = new HashSet<string>(passed, StringComparer.Ordinal);
+        foreach (string name in excluded)
+        {
+            Assert.True(isSkill.Contains(name),
+                $"The csproj excludes skills/{name}, which is not a skill directory any more; drop the stale exclusion.");
+            Assert.False(didPass.Contains(name),
+                $"verdicts.json says '{name}' works in the app, but the csproj keeps it out of the bundle.");
+        }
+
+        string[] bundled = skills.Except(excluded, StringComparer.Ordinal).ToArray();
+        foreach (string name in bundled)
+        {
+            Assert.True(didPass.Contains(name),
+                $"skills/{name} ships in the iOS bundle but verdicts.json has no passing verdict for it. " +
+                "Run scripts/verify-skills.py against the staged runtime and record the verdict, or exclude " +
+                "the directory in TensorAgent.Maui.csproj if it cannot run on a phone.");
+        }
+
+        // And the other direction: a skill the verifier passed must actually ship.
+        Assert.Equal(passed, bundled);
     }
 
     [Fact]

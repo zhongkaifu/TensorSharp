@@ -34,7 +34,7 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll \
   --model models/embeddings/snowflake-arctic-embed-l-v2.0-q8_0.gguf \
   --embeddings --backend cpu --embedding-threads 8 \
   --host 127.0.0.1 --port 5000 --no-webui</code></pre>
-  <p><code>--embedding-context-size N</code> 可缩小每条输入的 token 上限；0 使用模型元数据。 <code>/v1/models</code>、<code>/api/tags</code>、<code>/api/show</code> 报告当前模型与嵌入能力。</p>
+  <p><code>--embedding-context-size N</code> 可缩小每条输入的 token 上限；0 使用模型元数据。 <code>/v1/models</code>、<code>/api/tags</code>、<code>/api/show</code> 报告当前模型与嵌入能力。嵌入服务不做生成：向 <code>/v1/chat/completions</code>、<code>/v1/responses</code>、<code>/v1/systemone</code>、<code>/v1/videos/generations</code>、<code>/api/generate</code>、<code>/api/chat</code>、<code>/api/chat/ollama</code>、<code>/api/models/load</code>，或 <code>/api/image-generate</code>、<code>/api/image-edit</code>、<code>/api/video-generate</code>（及其 <code>/stream</code> 形式）发送 POST 会返回 HTTP 400，并提示改用 <code>/v1/embeddings</code> 或 <code>/api/embed</code>。显式指定本机没有的 <code>--backend</code> 时以退出码 2 结束，并打印 <code>error: model load refused: …</code>。<code>--embeddings</code> 还要求提供 <code>--model</code>，且不接受 <code>--mmproj</code>。</p>
   <h2 id="api">HTTP API</h2>
   <pre data-lang="bash"><code>curl http://127.0.0.1:5000/v1/embeddings \
   -H &#x27;Content-Type: application/json&#x27; \
@@ -54,7 +54,7 @@ curl http://127.0.0.1:5000/api/embeddings \
   <p>Snowflake 查询添加 <code>query: </code> 前缀，文档不添加。向量作 L2 归一化，可直接用点积计算余弦相似度。<code>dimensions</code> 截取前若干维后重新归一化；Snowflake 的 Matryoshka 训练支持缩减到 256 维，任意缩减其他模型的维数可能降低质量。MiniLM 上游默认句长短于此 GGUF 的 512 位置容量。代码宜按函数/类边界分块，换模型或分块策略后重建索引。</p>
   <p>两种实现都使用完整双向注意力与模型指定的池化。每个纯 C# 模型拥有常驻工作线程池；ARM Q8 投影使用四 token × 四输出的有符号点积 SIMD 块。托管 FP32 注意力转置 key，在 SIMD 通道内按相邻 key 同时计算四个 query，并将 value 按通道块打包（ARM 上每块四个通道）以进行融合乘加。便携向量宽度与四 query 点积回退适配其他处理器及 head 维度，带 padding 的 key 跨度处理尾部；长序列路径采用 64 query × 128 key 分块、ARM 四 query × 十六输出 SIMD 复用与在线 FP32 softmax，每个 head 的临时空间有界。短序列与回退路径保留四行临时分数。原生执行器对 GPU 异长序列打包并用掩码隔离各序列，CPU 投影紧凑打包而注意力独立 padding，并复用计算图。</p>
   <p>分词经过独立 HuggingFace 与 llama.cpp 参照验证，包括多语言 Unicode；完整指南记录了上游差异。无原生推理库宿主检查会删除自定义原生资源，并在推理后检查加载的库。托管 x86 路径在硬件支持时使用 AVX/AVX2/AVX-512；四 query × 十六列内核专用于 ARM。当前耗时证据来自 Apple Silicon，尚未测量 x86 性能。性能结论以相同 GGUF、同一硬件和相同请求的实测为准。</p>
-  <p><a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/validation/embeddings-2026-09/README.md">验证结果与限制</a> · <a href="https://github.com/zhongkaifu/TensorSharp/blob/main/benchmarks/EmbeddingBench/README.md">复现 HTTP 基准</a></p>
+  <p>验证结果与限制：<code>docs/validation/embeddings-2026-09/README.md</code>（本地验证记录，未提交到 Git） · <a href="https://github.com/zhongkaifu/TensorSharp/blob/main/benchmarks/EmbeddingBench/README.md">复现 HTTP 基准</a></p>
   <h2 id="csharp">C# 集成</h2>
   <p><code>Backend = &quot;CPU&quot;</code> 默认选择纯 C# 编码器；<code>&quot;GGML_CPU&quot;</code> 选择原生 CPU，<code>&quot;METAL&quot;</code> 选择原生 Metal，<code>&quot;CUDA&quot;</code> 选择原生 CUDA。</p>
   <pre data-lang="csharp"><code>using TensorSharp.Models.Embeddings;

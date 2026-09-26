@@ -15,7 +15,7 @@ namespace TensorSharp.Server.Host.Hosting
 {
     /// <summary>
     /// Informational entry points that print and exit before the web host is
-    /// built: the full usage page (shown for a bare <c>TensorSharp.Server</c>
+    /// built: the full usage page (shown for a bare <c>TensorSharp.Server.Host</c>
     /// invocation or <c>--help</c>) and the Vulkan GPU listing
     /// (<c>--list-gpus</c>). Kept out of <see cref="ServerOptionsBuilder"/> so
     /// the option parser stays pure and testable.
@@ -230,9 +230,14 @@ namespace TensorSharp.Server.Host.Hosting
                     "(TS_CPU_MOE env var overrides).",
                     "--cpu-moe"),
                 new OptionHelp("--cpu-moe-threads <N>",
-                    "Worker threads for the host-side expert matmul. Default: one less than the CPU parallelism " +
+                    "Worker threads for the host-side expert matmul. Default: sized from the CPU parallelism " +
                     "this process can actually use (hardware threads clamped by the affinity mask and the cgroup " +
-                    "CPU quota), leaving a core for accelerator submission. Do not set this above the quota: " +
+                    "CPU quota) - 1 thread on 2 or fewer usable CPUs, all but one on 3 to 8, and half of them, " +
+                    "capped at 64, above 8, because a one-token expert matmul is memory-bound and extra " +
+                    "workers only add barrier participants while the server's own threads need room. The native " +
+                    "DeepSeek V4 / V4.1 and GLM-5.x executors are the exceptions: with offload on (and, for " +
+                    "GLM-5.x, on a GPU-less run) they use every usable CPU by default, since their offloaded " +
+                    "layers read far more expert weight per token. Do not set this above the quota: " +
                     "ggml's pool spins at its barriers, so oversubscription collapses throughput rather than " +
                     "degrading it (TS_CPU_MOE_THREADS env var overrides).",
                     "--cpu-moe-threads 12"),
@@ -244,35 +249,54 @@ namespace TensorSharp.Server.Host.Hosting
                     "memory. Default: auto — the backend/model pick (KV_CACHE_DTYPE env var overrides).",
                     "--kv-cache-dtype q8_0"),
             }),
-            ("Cross-session paged KV cache", new[]
+            // Accepted, because config files and command lines in the wild carry them and a
+            // refusal would stop those servers starting - but no server request path builds
+            // the cache they configure, so the page says so rather than advertising a feature,
+            // and startup warns once naming each one it was given.
+            ("Standalone paged KV cache (accepted, NO EFFECT on the server - only TensorSharp.Cli --paged-bench builds it)", new[]
             {
                 new OptionHelp("--paged-kv | --no-paged-kv",
-                    "Enable/disable the cross-session paged KV cache (prefix reuse across requests). Default: off.",
+                    "Enable/disable the standalone paged KV cache (RAM/SSD/Redis block tiers with an optional " +
+                    "TurboQuant codec). Accepted for compatibility and inert here: the server never builds that " +
+                    "cache, so no request reads or fills it, and startup logs a warning naming every flag in this " +
+                    "section it was given. Prefix reuse across requests is served by the radix prefix cache, " +
+                    "on by default (see --no-prefix-cache). Default: off.",
                     "--paged-kv"),
                 new OptionHelp("--paged-kv-block-size <N>",
-                    "Tokens per KV block. Default: 256.",
+                    "Tokens per KV block of the standalone cache. No effect on the server. Default: 256.",
                     "--paged-kv-block-size 128"),
                 new OptionHelp("--paged-kv-ram-mb <N>",
-                    "RAM budget for evicted KV blocks, in MB. Default: 1024.",
+                    "RAM budget for evicted KV blocks, in MB. No effect on the server. Default: 1024.",
                     "--paged-kv-ram-mb 2048"),
                 new OptionHelp("--paged-kv-ssd-dir <path>",
-                    "Directory for the SSD spill tier. Default: disabled.",
+                    "Directory for the SSD spill tier. No effect on the server. Default: disabled.",
                     "--paged-kv-ssd-dir D:\\ts-kv-spill"),
                 new OptionHelp("--paged-kv-ssd-mb <N>",
-                    "SSD budget for spilled KV blocks, in MB. Default: 16384.",
+                    "SSD budget for spilled KV blocks, in MB. No effect on the server. Default: 16384.",
                     "--paged-kv-ssd-mb 32768"),
                 new OptionHelp("--paged-kv-quant-bits <b>",
-                    "Quantize spilled KV blocks with the TurboQuant codec: 0 (off), 2, 4, or 8 bits per element. " +
-                    "2-bit uses an affine min+scale layout (~4x smaller than the f16 payload). Default: 0.",
+                    "Quantize spilled KV blocks with the TurboQuant codec: 0 (off), 2, 4, or 8 bits per element " +
+                    "(2-bit uses an affine min+scale layout, ~4x smaller than the f16 payload). Validated, then " +
+                    "no effect on the server. Default: 0.",
                     "--paged-kv-quant-bits 8"),
                 new OptionHelp("--paged-kv-redis-url <url>",
-                    "Redis connection string for a shared KV cache tier (e.g. localhost:6379). Default: disabled.",
+                    "Redis connection string for the standalone cache's shared KV tier (e.g. localhost:6379). " +
+                    "No effect on the server. Default: disabled.",
                     "--paged-kv-redis-url localhost:6379"),
                 new OptionHelp("--paged-kv-redis-ttl <min>",
-                    "TTL in minutes for Redis KV entries (0 = no TTL). Default: 1440.",
+                    "TTL in minutes for that tier's Redis entries (0 = no TTL). No effect on the server. " +
+                    "Default: 1440.",
                     "--paged-kv-redis-ttl 60"),
+            }),
+            ("Responses API store", new[]
+            {
                 new OptionHelp("--redis-url <url>",
-                    "Redis connection string for both the KV cache tier and the Responses API store.",
+                    "Redis connection string for the Responses API store - the stored responses GET " +
+                    "/v1/responses/{id} and previous_response_id read back - so they survive a restart and can " +
+                    "be shared by several server instances. Without it the store is a bounded in-memory cache. " +
+                    "An already-set TS_RESPONSES_STORE_REDIS_URL env var wins. The flag also fills in the " +
+                    "standalone KV cache's Redis URL (TS_KV_CACHE_REDIS_URL), which the server does not use " +
+                    "(see above). Default: in-memory store.",
                     "--redis-url localhost:6379"),
             }),
             ("Scheduling", new[]
@@ -291,16 +315,23 @@ namespace TensorSharp.Server.Host.Hosting
                 new OptionHelp("--spec | --no-spec",
                     "Enable/disable speculative decoding: a drafter proposes the next few tokens and the trunk " +
                     "verifies them in one batched forward. Every emitted token still comes from a trunk row, so " +
-                    "the output is what standard decoding would have produced. Needed only for a drafter EMBEDDED " +
-                    "in the checkpoint (Qwen 3.6 / GLM 5.2 NextN) - it pages extra weights into VRAM, so it stays " +
-                    "an explicit choice; a drafter named on --draft-model engages by itself. Engages for solo " +
-                    "(non-concurrent) sequences. Default: off.",
+                    "the output is what standard decoding would have produced. Needed for a drafter EMBEDDED in " +
+                    "the checkpoint (the NextN block of Qwen 3.6, Qwen 3.8 27B, GLM-5.2 and GLM-5.3) - it pages " +
+                    "extra weights into VRAM, so it stays an explicit choice - and for --spec-type ngram; a " +
+                    "drafter named on --draft-model engages by itself. Engages for solo (non-concurrent) " +
+                    "sequences. Nemotron-H refuses every speculator: under --spec it serves plain decoding and " +
+                    "says so once, and a --draft-model makes its startup load fail. Default: off.",
                     "--spec"),
                 new OptionHelp("--spec-type <name>",
-                    "Speculation algorithm: 'auto' (default) uses whatever drafter the checkpoint carries; " +
-                    "'draft-head' and 'block' pin one explicitly; 'ngram' needs no trained weights at all and " +
-                    "works on every model, drafting by suffix match over the context (strong when the answer " +
-                    "quotes its input: summarizing, editing, structured output, agentic loops).",
+                    "Speculation algorithm. It only picks the algorithm and does not turn speculation on: pair " +
+                    "it with --spec (or a --draft-model). 'auto' (default) uses whatever drafter the checkpoint " +
+                    "carries; 'draft-head' and 'block' pin one explicitly; 'ngram' needs no trained weights, " +
+                    "drafting by suffix match over the context (strong when the answer quotes its input: " +
+                    "summarizing, editing, structured output, agentic loops). N-gram still needs a trunk that " +
+                    "can verify a draft window: Qwen 3.5/3.6/3.8, Qwen 3.8 Flash Next, Gemma 4 and GLM-5.x have " +
+                    "one; DeepSeek V4/V4.1 and Muse-Glimmer only while their --draft-model drafter is loaded; " +
+                    "GPT-OSS, Mistral 3, Qwen 3 / Qwen 2 (Bonsai 8B included) and Hunyuan Dense have no " +
+                    "speculative path at all; Nemotron-H refuses every speculator.",
                     "--spec --spec-type ngram"),
                 new OptionHelp("--spec-draft <N>",
                     "Maximum draft tokens per step (1-64). Default: 8.",
@@ -313,12 +344,15 @@ namespace TensorSharp.Server.Host.Hosting
                     "--spec-pmin 0.6"),
                 new OptionHelp("--draft-model <path>",
                     "A drafter that ships as its own GGUF, whatever its kind: DeepSeek V4's DSpark, the DFlash / " +
-                    "DFlash2 drafters for Muse-Glimmer and Qwen 3.8, or Gemma 4's per-token assistant head. " +
+                    "DFlash2 drafters for Muse-Glimmer and Qwen 3.8 27B, Qwen 3.8 Flash Next's (qwen4exp) shared " +
+                    "MTP head, Gemma 4's per-token assistant head, or - experimental - a deepseek41-dspark " +
+                    "drafter for DeepSeek V4.1 (ggml_cuda and ggml_cpu only; validated on synthetic fixtures " +
+                    "only, no trained V4.1 drafter measured). " +
                     "The file's own general.architecture decides how it loads (a block drafter is fused before " +
                     "the layer split, a per-token head attaches after) - never its file name, and never a " +
                     "second flag. Naming the file IS the request: speculation turns on with it, no --spec " +
-                    "needed, and an explicit --no-spec vetoes it. Qwen 3.6 and GLM 5.2 embed their drafter in " +
-                    "the trunk and use --spec instead. Default: none.",
+                    "needed, and an explicit --no-spec vetoes it. Qwen 3.6, Qwen 3.8 27B, GLM-5.2 and GLM-5.3 " +
+                    "embed a NextN drafter in the trunk and use --spec instead. Default: none.",
                     "--draft-model Qwen3.8-27B-DFlash2-Q4_K_M.gguf"),
             }),
             ("Qwen-Image-2.1 companion models", new[]
@@ -333,19 +367,41 @@ namespace TensorSharp.Server.Host.Hosting
                 new OptionHelp("--qwen-image-mmproj <path>",
                     "Qwen3-VL-8B vision projector GGUF, required for image editing. Default: same-directory scan.",
                     "--qwen-image-mmproj mmproj-Qwen3VL-8B-Instruct-F16.gguf"),
+                new OptionHelp("--lora <path>",
+                    "Qwen-Image-2.1 LoRA plug-in: a LoRA .safetensors (diffusers/PEFT, ComfyUI, kohya, DiffSynth, DoRA or " +
+                    "VideoX-Fun PDD format) or a TensorSharp plug-in config .json from config/lora/ (downloads its weights on " +
+                    "first use and brings its strength and sampling recipe). Repeat to stack LoRAs. Applied unmerged on top " +
+                    "of the quantized transformer, so small distillation deltas are kept exactly. Default: none.",
+                    "--lora config/lora/qwen-image-2.1-viggle-turbo.json"),
+                new OptionHelp("--lora-scale <f>",
+                    "Strength of the preceding --lora (multiplies alpha / rank). Default: the plug-in config's \"scale\", else 1.0.",
+                    "--lora-scale 0.7"),
+                new OptionHelp("--lora-config <path>",
+                    "Companion config of the preceding --lora: a TensorSharp LoRA config (default strength and the sampling " +
+                    "recipe of a step-distilled LoRA; see config/lora/), a PEFT adapter_config.json or a VideoX-Fun " +
+                    "pdd_config.json. The recipe supplies steps, sigmas and CFG unless you set them. Default: none " +
+                    "(a PDD bundle's pdd_config.json is found next to its weights).",
+                    "--lora-config config/lora/qwen-image-2.1-viggle-turbo.json"),
             }),
             ("Video-generation defaults and companion models", new[]
             {
                 new OptionHelp("--video-width <px>",
                     "Default output width when a request omits 'width'. THE main quality lever: " +
                     "the Web UI sends no size of its own, so without this every clip is generated " +
-                    "at the model's default. 640x384 is a good starting point for MiniMax-H3; " +
-                    "--width is accepted as an alias. Rounded up to the model's grid.",
+                    "at the model's default. 640x384 is a good starting point for MiniMax-H3. " +
+                    "Rounded up to the model's grid. --width is accepted as an alias, and --width / --height " +
+                    "ALSO set the Qwen-Image-2.1 default image size (TS_QWEN_IMAGE_WIDTH / " +
+                    "TS_QWEN_IMAGE_HEIGHT) for image requests that name neither a size nor an area: that " +
+                    "default needs BOTH, and Qwen-Image-2.1 works on multiples of 32, so a value off that grid " +
+                    "is snapped down to a multiple of 32 (never below 32). With only one given, or without " +
+                    "either, such requests keep the automatic size (a 2048x2048 area, at the reference image's " +
+                    "aspect ratio for an edit). A Qwen-Image server warns once " +
+                    "at startup about either case.",
                     "--video-width 640"),
                 new OptionHelp("--video-height <px>",
-                    "Default output height when a request omits 'height'. Alias: --height. " +
-                    "If only one of width/height is given, MiniMax-H3 takes the other from the " +
-                    "conditioning image's aspect ratio.",
+                    "Default output height when a request omits 'height'. Alias: --height, which also sets " +
+                    "the Qwen-Image-2.1 default image height (see --video-width). If only one of width/height " +
+                    "is given, MiniMax-H3 takes the other from the conditioning image's aspect ratio.",
                     "--video-height 384"),
                 new OptionHelp("--video-steps <N>",
                     "Default denoising steps when a request omits 'steps'. The quality/time " +
@@ -403,8 +459,13 @@ namespace TensorSharp.Server.Host.Hosting
             {
                 new OptionHelp("--upload-max-mb <N>",
                     "Per-file cap in MB on client-originated writes: multipart /api/upload files and base64 " +
-                    "attachments decoded out of chat requests. Default: 500, the request-body limit " +
-                    "(TS_UPLOAD_MAX_MB env var overrides).",
+                    "attachments decoded out of chat requests. The request-body limit of POST /api/upload follows " +
+                    "it and never drops below 500 MB, so raising the cap is how a larger file gets in: upload it " +
+                    "there and reference it by path. Every other route keeps the 500 MB request-body limit, " +
+                    "because those requests are JSON the server buffers whole. A file sent base64 inside a JSON " +
+                    "request grows by a third on the wire, so a base64 attachment is limited to about 375 MB " +
+                    "whatever this cap is, and lowering the cap still leaves the 500 MB body limit for requests " +
+                    "that are large for other reasons. Default: 500 (TS_UPLOAD_MAX_MB env var overrides).",
                     "--upload-max-mb 25"),
                 new OptionHelp("--upload-quota-mb <N>",
                     "Total budget in MB for the upload directory, counting client uploads, decoded attachments, " +
@@ -427,18 +488,22 @@ namespace TensorSharp.Server.Host.Hosting
                 new OptionHelp("--agents-max-generations <N>", "Shared generation budget for all descendants. Default: 48.", "--agents-max-generations 24"),
                 new OptionHelp("--agents-timeout <seconds>", "Child lifetime limit. Default: 180 seconds.", "--agents-timeout 300"),
                 new OptionHelp("--agents-max-result-chars <N>", "Maximum returned characters per child report. Default: 8000.", "--agents-max-result-chars 4000"),
-                new OptionHelp("--agents-allow-worker-tools", "Allow explicit worker agents to use the parent's permitted mutable tools. Explorers and reviewers remain read-only.", "--agents-allow-worker-tools"),
+                new OptionHelp("--agents-allow-worker-tools", "Allow worker agents to edit private workspaces using permitted tools. Child shell execution requires workspace read confinement. Explorers and reviewers remain read-only.", "--agents-allow-worker-tools"),
             }),
             ("Agent skills (SKILL.md bundles; repository and configured skill directories)", new[]
             {
                 new OptionHelp("--skills-dir <path>",
                     "Directory to scan for skills. A root may hold one skill (it contains SKILL.md) or many, " +
                     "nested up to three levels, so a checkout of a skills repository works as-is. Repeat the " +
-                    "flag for several; earlier roots take precedence on a name clash. Default: existing " +
-                    ".agents/skills directories from the working directory up to its Git repository root " +
-                    "(nearest first), then skills/ next to the binary, created on startup. Outside a repository " +
-                    "only the working directory is considered. Explicit roots or path-separated TS_SKILLS_DIR " +
-                    "replace these defaults; personal skill directories are not loaded automatically.",
+                    "flag for several; on a name clash the root scanned first wins. The server ALWAYS scans " +
+                    "skills/ next to the binary first - it is where POST /api/skills installs uploads - even " +
+                    "when roots are given here, so an uploaded skill shadows a same-named one in any other " +
+                    "root. After it come the roots given here, in order, or by default every existing " +
+                    ".agents/skills directory from the working directory up to its Git repository root " +
+                    "(nearest first; outside a repository only the working directory is considered). Explicit " +
+                    "roots or path-separated TS_SKILLS_DIR replace the .agents/skills defaults, never the " +
+                    "install directory, which is created on startup when no roots are given and on the first " +
+                    "upload otherwise. Personal skill directories are not loaded automatically.",
                     "--skills-dir ./skills"),
                 new OptionHelp("--skill <name>",
                     "Give EVERY request this skill, instead of waiting for a client to name it in the request's " +
@@ -491,18 +556,21 @@ namespace TensorSharp.Server.Host.Hosting
             {
                 new OptionHelp("--code-exec",
                     "Offer the model a 'shell' tool: it types a command, this host runs it in a sandbox, and " +
-                    "the model reads back the exit code and everything it printed. This is how the model does " +
-                    "all its work with files and code - write one with a heredoc, run it, search it, install " +
-                    "what it needs, check its own output - which is the shape Codex and Claude Code use. Files " +
-                    "it writes are kept and handed to the user as download links, and the working directory " +
-                    "PERSISTS for the rest of that chat session, so one step's output is the next step's input " +
-                    "and cd and exported variables survive from call to call (PATH does not, so an activated " +
-                    "virtualenv does not stay activated - installed packages are already on the path). One " +
-                    "tool comes with it: 'apply_patch', Codex's patch envelope, which creates, updates, deletes " +
-                    "and renames SEVERAL files in one all-or-nothing call. It is there because a heredoc " +
-                    "rewrites a whole file while a patch changes three lines of it, and because the HOST places " +
-                    "the bytes - from anchors it either finds or refuses to guess at - rather than the model " +
-                    "retyping a file it half-remembers. Separate from --skills-allow-exec on purpose: that runs " +
+                    "the model reads back the exit code and everything it printed. This is how the model runs " +
+                    "and checks its work - run a program, search the tree, install what it needs, check its " +
+                    "own output - which is the shape Codex and Claude Code use. Three file tools come with it: " +
+                    "'read_file', which shows a file's current contents with line numbers; 'apply_patch', " +
+                    "Codex's patch envelope, which creates, updates, deletes and renames SEVERAL files in one " +
+                    "all-or-nothing call; and 'write_file', which only CREATES a file and refuses a path that " +
+                    "already exists. The model is steered to write files with those rather than a shell heredoc " +
+                    "(and told, with the numbers, when a command re-typed a whole file to change a few lines), " +
+                    "because a rewrite retypes a whole file where a patch changes three lines of it, and the HOST " +
+                    "places the bytes - from anchors it either finds or refuses to guess at - rather than the " +
+                    "model retyping a file it half-remembers. Files it writes are kept and handed to the user " +
+                    "as download links, and the working directory PERSISTS for the rest of that chat session, " +
+                    "so one step's output is the next step's input and cd and exported variables survive from " +
+                    "call to call (PATH does not, so an activated virtualenv does not stay activated - " +
+                    "installed packages are already on the path). Separate from --skills-allow-exec on purpose: that runs " +
                     "a script an operator put on disk, this runs commands written during the request. The " +
                     "sandbox is required, not optional - on a host that cannot confine a process (no " +
                     "sandbox-exec on macOS, no safe bwrap (0.12.0+) on Linux, and Windows job objects, which bound CPU but not " +
@@ -647,8 +715,11 @@ namespace TensorSharp.Server.Host.Hosting
             {
                 new OptionHelp("--config <path>",
                     "Read options from a JSON file whose keys are the same long option names listed here (with or " +
-                    "without the leading --). Anything also passed on the command line overrides the file; when the " +
-                    "flag is repeated, later files win over earlier ones. String/number values map to '--key value', " +
+                    "without the leading --). A single-valued option passed on the command line replaces the " +
+                    "file's entry, and when the flag is repeated a later file's entry replaces an earlier one's; " +
+                    "the replaced entry is never resolved, so its download is skipped. Repeatable options " +
+                    "(--stop, --skills-dir, --skill, --lora, --lora-scale, --lora-config, --image and the --ref-* " +
+                    "inputs) add to the file's values instead. String/number values map to '--key value', " +
                     "true maps to the bare '--key' switch, and an array maps to a repeated flag (e.g. \"stop\": [..]). " +
                     "A \"variables\" object lets values share ${name} references; a file option may instead be an " +
                     "object { \"path\": \"...\", \"urls\": [ \"...\" ] } that auto-downloads on first run. See the " +
@@ -788,15 +859,15 @@ namespace TensorSharp.Server.Host.Hosting
 
             writer.WriteLine();
             writer.WriteLine("Examples:");
-            writer.WriteLine("  TensorSharp.Server --model C:\\models\\gemma-4-E4B-it-Q8_0.gguf --backend ggml_cpu");
-            writer.WriteLine("  TensorSharp.Server --model gemma-4-E4B-it-Q8_0.gguf --mmproj mmproj-gemma-4-E4B-it-Q8_0.gguf --backend ggml_cuda");
-            writer.WriteLine("  TensorSharp.Server --model diffusiongemma-26B-A4B-it-Q4_K_M.gguf --mmproj diffusiongemma-vision/model-00011-of-00011.safetensors --backend ggml_metal    (vision tower straight from the HF shard)");
-            writer.WriteLine("  TensorSharp.Server --model Qwen3.5-35B-A3B-Q4_K_M.gguf --backend ggml_cuda --tp 2    (split across 2 GPUs)");
-            writer.WriteLine("  TensorSharp.Server --config config/qwen-image-2.1.json    (Qwen-Image-2.1 generation and editing)");
-            writer.WriteLine("  TensorSharp.Server --model Wan2.2-TI2V-5B-Q8_0.gguf --backend ggml_cuda --video-frames 121 --fps 24");
-            writer.WriteLine("  TensorSharp.Server --backend ggml_cpu    (model-less status process; inference unavailable)");
-            writer.WriteLine("  TensorSharp.Server --config server.json    (read options from a file)");
-            writer.WriteLine("  TensorSharp.Server --config server.json --backend ggml_cuda    (file, but override the backend)");
+            writer.WriteLine("  TensorSharp.Server.Host --model C:\\models\\gemma-4-E4B-it-Q8_0.gguf --backend ggml_cpu");
+            writer.WriteLine("  TensorSharp.Server.Host --model gemma-4-E4B-it-Q8_0.gguf --mmproj mmproj-gemma-4-E4B-it-Q8_0.gguf --backend ggml_cuda");
+            writer.WriteLine("  TensorSharp.Server.Host --model diffusiongemma-26B-A4B-it-Q4_K_M.gguf --mmproj diffusiongemma-vision/model-00011-of-00011.safetensors --backend ggml_metal    (vision tower straight from the HF shard)");
+            writer.WriteLine("  TensorSharp.Server.Host --model Qwen3.5-35B-A3B-Q4_K_M.gguf --backend ggml_cuda --tp 2    (split across 2 GPUs)");
+            writer.WriteLine("  TensorSharp.Server.Host --config config/qwen-image-2.1.json    (Qwen-Image-2.1 generation and editing)");
+            writer.WriteLine("  TensorSharp.Server.Host --model Wan2.2-TI2V-5B-Q8_0.gguf --backend ggml_cuda --video-frames 121 --fps 24");
+            writer.WriteLine("  TensorSharp.Server.Host --backend ggml_cpu    (model-less status process; inference unavailable)");
+            writer.WriteLine("  TensorSharp.Server.Host --config server.json    (read options from a file)");
+            writer.WriteLine("  TensorSharp.Server.Host --config server.json --backend ggml_cuda    (file, but override the backend)");
             writer.WriteLine();
             writer.WriteLine("Logging env vars: TENSORSHARP_LOG_LEVEL (Information), TENSORSHARP_LOG_DIR (./logs),");
             writer.WriteLine("TENSORSHARP_LOG_FILE=0 disables file logging.");

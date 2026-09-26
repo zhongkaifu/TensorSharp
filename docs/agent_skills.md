@@ -17,7 +17,10 @@ Everything described here lives in `TensorSharp.AgentHost/Skills/` and
 `TensorSharp.Server` and the public C# API. Skills run in a bounded, in-process
 tool loop. Supported server chat paths also provide [multiple agents](multi_agent.md):
 the model can delegate independent tasks to children with separate conversations,
-bounded lifecycle tools, and read-only access by default. The operator grants
+bounded lifecycle tools, and read-only access by default. Delegation is on by
+default for tool-capable families and does not depend on this page's features: a
+request still carries the five coordination tools with `--no-skills` and without
+`--code-exec`. The operator grants
 execution surfaces at startup; there is no interactive per-command approval queue.
 
 ## What a skill is
@@ -143,28 +146,38 @@ TensorSharp used to inline every selected body. Measured on a four-skill request
 (`doc-coauthoring`, `internal-comms`, `pdf`, `pptx`): the block cost **12,848
 tokens**, 52% of it for skills the model never referenced, and the model called
 `skills_read` for the largest one anyway — re-sending 20,675 bytes it already
-had, visible as a KV-reuse drop to 79% and 5,570 re-prefilled tokens. The same
-block now costs **1,050 tokens**.
+had, visible as a KV-reuse drop to 79% and 5,570 re-prefilled tokens. Once
+bodies were deferred, the same block cost **1,050 tokens**.
 
 ### The injected block
 
 `SkillPrompt.Plan` decides what goes in front of the model and
-`SkillPrompt.Apply` puts it there. The block opens with `## Agent skills` and
-has up to four parts:
+`SkillPrompt.Apply` puts it there. On a family that can call tools, the block
+starts with a short paragraph that tells the model to settle the user's request
+before it picks a tool. It says to use a skill the user names, or one whose
+description matches the request. It says to ask one focused question when
+required information or a choice is missing, and to wait for the answer before
+dependent actions. It says to resume the pending task once the user supplies that
+information or confirms a handoff. Then comes `## Agent skills`, with up to four
+parts:
 
 1. one sentence defining what a skill is and that its instructions outrank the
-   model's default approach for the task it covers;
+   model's default approach for the task it covers, and that a listed or
+   selected skill is not relevant to every request;
 2. **Skills selected for this conversation** — one `- name: description` line
    per skill, plus its approximate instruction size and the `skills_read` call
    that loads it;
 3. **Other available skills** — the discovery catalog, one `name: description`
    line per skill, with an instruction to load one with `skills_read` if it fits
    the task better;
-4. **How to use a skill** — the operating rules (read the whole `SKILL.md`
-   before acting; treat relative paths as paths *inside the skill*, never host
-   paths; prefer a shipped script over retyping its logic; do not load a
-   reference the task does not call for; continue from the reported offset when
-   a file comes back truncated).
+4. **How to use a skill** — the operating rules (use a skill requested by name,
+   including `$name`, or one whose scope matches, and do not call the skill tools
+   just to start a turn; read the whole `SKILL.md` before acting; treat relative
+   paths as paths *inside the skill*, never host paths, and another agent's
+   example install paths as examples; run a bundled script through `skills_run`
+   rather than copying it; prefer a shipped script over retyping its logic; do
+   not load a reference the task does not call for; continue from the reported
+   offset when a file comes back truncated).
 
 A host that knows its model will not make the extra call can set
 `SkillPromptOptions.InlineSelectedBodies` and get the old behaviour back; it is
@@ -235,6 +248,13 @@ multiple files. It also supports creating, renaming, and deleting files.
 `write_file` is reserved for creating new files. Read the relevant contents first,
 then send the smallest anchored patch in a `*** Begin Patch` / `*** End Patch`
 envelope; each existing file being modified has its own `*** Update File:` section.
+`write_file` refuses a path that already exists and points the model to
+`apply_patch`. The earlier `edit_file` tool is no longer declared. A call a model
+still makes to it, or to a common alias such as `str_replace`, is accepted for
+compatibility, and so is a legacy `overwrite: true` argument on `write_file`.
+Without a persistent workspace, only `shell` is declared, because there is
+nothing for the file tools to read or keep. The CLI, the Web UI and each
+OpenAI or Ollama request all have one.
 
 `skills_read` returns at most 48 KB per call by default, with a header naming
 the skill, the file and the byte range, and a footer that spells out the exact
@@ -244,13 +264,28 @@ follow-up call when there is more:
 [Truncated. Continue with skills_read(skill="pdf", path="references/api.md", offset=49152).]
 ```
 
-**The declarations are deliberately flat.** A tool parameter in TensorSharp
-carries a type name, a description and an enum, and nothing else: nested
-`properties`, `items` and the rest of JSON Schema are dropped when a tool is
-parsed and cannot be re-emitted, and the Harmony renderer degrades an `array`
-parameter to `any[]`. So every parameter here is a string or an integer. The
+When `skills_run` is enabled (`--skills-allow-exec`), a complete `SKILL.md`
+read (the last page when it is paged) of a skill that ships a text script also
+gets a short block appended. It is labelled
+`[TensorSharp host execution guidance; not part of SKILL.md]` and holds a
+ready-made `skills_run` argument example for the skill's first bundled script. The
+block exists because portable skills often show another agent's install path
+(`$CODEX_HOME/skills/...`), and a shell cannot find the bundle there. `skills_run`
+resolves the registered skill directory itself.
+
+**The declarations are deliberately flat.** A `ToolParameter` carries a type
+name, a description and an enum, and nothing else. A caller's original JSON
+Schema is kept only as raw text (`ParametersSchemaJson`), and only the DeepSeek
+V4.1 renderer and its DSML grammar re-emit it; every other family sees the flat
+parameters, and the Harmony renderer degrades an `array` parameter to `any[]`.
+The built-in tools are declared without a raw schema, so every parameter here
+is a string or an integer. The
 tool names use underscores rather than dots because several families splice a
-tool's name into their markup unescaped.
+tool's name into their markup unescaped. A declaration's `required` list is
+rendered as given. When a template renders the JSON schema, an empty list comes
+out as `"required": []`, so a tool whose parameters are all optional (such as
+`wait_agent()`) is not turned into one that requires all of them. This applies
+to a caller's own tools too.
 
 The tools are also written to survive the ways models get them slightly wrong.
 `skills_read` with no `path` is answered with `SKILL.md`; `path="pdf/api.md"`
@@ -308,7 +343,7 @@ Bounds:
 
 | Bound | Default | Why |
 |---|---|---|
-| Rounds per turn | 8, or 24 with `--code-exec` (`--skills-max-rounds`, 1–64) | Eight covers the realistic reading case — read a skill, read two references, page through a long one — while bounding a model that loops on a file it keeps mis-naming. Once the same counter also gates writing a file with `shell`, running it, reading the traceback and fixing it, eight is not enough: a README → internal-comms doc → slide deck run spent three rounds reading skills, two producing the document and three on a deck it was still debugging. An operator's own number is used as given. Each round is a full generation. |
+| Rounds per turn | 8, or 24 with `--code-exec` (`--skills-max-rounds`, 1–64) | Eight covers the realistic reading case — read a skill, read two references, page through a long one — while bounding a model that loops on a file it keeps mis-naming. Once the same counter also gates writing a file with `write_file`, running it with `shell`, reading the traceback and patching it with `apply_patch`, eight is not enough: a README → internal-comms doc → slide deck run spent three rounds reading skills, two producing the document and three on a deck it was still debugging. An operator's own number is used as given. Each round is a full generation. |
 | Skill tool calls per round | 8 | A model emitting fifty reads in one turn is malfunctioning, and answering all of them would blow the context before the next generation. |
 
 When the round budget runs out the model is told so *in the conversation*
@@ -333,7 +368,11 @@ forwards the *separated* pieces rather than the raw text: content as content,
 reasoning as reasoning, tool markup not at all. Its updates carry `IsParsed`, and
 an adapter that sees that flag skips its own `IOutputParser` and emits the pieces
 directly. Every round streams, including the ones that end in a lookup, and the
-markup a client cannot service never leaves the server.
+markup a client cannot service never leaves the server. An exception: a parent
+round that starts while a [sub-agent](multi_agent.md#context-tools-and-lifecycle)
+report is still unread is buffered until it ends. If that round is a final
+answer, it is withheld while the host collects the reports and the parent
+answers again.
 
 That indirection is the point. The first implementation buffered each round and
 replayed only the last, and it cost a skills request its whole stream: measured
@@ -368,8 +407,8 @@ execution history. Produced files remain visible as artifact download chips.
 ### What a round costs
 
 The loop records each assistant turn with the **raw tokens** the model emitted,
-and `SkillPrompt` clones messages completely rather than dropping
-`RawOutputTokens` and `TextFilePaths` the way `StructuredOutputPrompt` does.
+and `SkillPrompt` clones messages completely, `RawOutputTokens` and
+`TextFilePaths` included.
 `KVCachePromptRenderer` splices those tokens back into the next render instead
 of re-tokenizing the text, so the re-rendered prefix stays byte-identical from
 round to round — and the KV cache follows it.
@@ -438,10 +477,13 @@ done, which is the one kind of result a model cannot recover from because nothin
 contradicts it: a refused install left `false | tail -5` running and answered
 `exit 0`, and a redirection (`2>&1`) was read as a package name.
 
-**None of it touches the prompt.** Every message above rides on a tool result or
-on a tool's own top-level description, so the injected block stays a pure
-function of the selection and the options and the KV prefix is untouched — see
-the next section for why that matters.
+**None of the recoveries touch the prompt.** Every message above rides on a tool
+result or on a tool's own top-level description. The only prompt-side part, the
+`CodePrompt` block (`## Working with files`) that makes `apply_patch` the editing
+tool and `write_file` create-only, is fixed text that depends only on which file
+tools are declared. So the injected block stays a pure function of the selection
+and the options and the KV prefix is untouched — see the next section for why
+that matters.
 
 #### Measured against Codex and Claude Code, item by item
 
@@ -486,15 +528,17 @@ and silently changes the entire prompt format. Merging into the first message is
 the one injection point every chat template in the repository handles.
 
 **Every byte of the block is a pure function of the sorted selection and the
-options.** The prefix cache chains a SHA-256 over 256-token blocks starting at
-block 0 and stops adopting at the first mismatch, and this block sits at the very
+options.** The prefix cache reuses a prompt only up to its first difference from
+what is cached. The default radix tree matches token by token, and the legacy
+mode (`TS_PREFIX_CACHE_MODE=legacy`) chains a SHA-256 over 256-token blocks
+starting at block 0. Either way it stops adopting at the first mismatch, and this block sits at the very
 front of the prompt. A timestamp, an absolute path, a "3 skills registered"
 counter, or a selection rendered in whatever order the caller's JSON happened to
-list it would change block 0 on *every* turn and drop prefix reuse to zero for
+list it would change the start of the prompt on *every* turn and drop prefix reuse to zero for
 the whole conversation — not merely for the part that changed. So skills are
 sorted by id with an ordinal comparison, separators are fixed, and nothing
 environment-derived is rendered. The same conversation with the same skills
-re-hashes identically turn after turn.
+renders to the same leading tokens turn after turn.
 
 ## Security model
 
@@ -584,8 +628,11 @@ guarantee.
 
 **Two layers.** In process, always: the path resolves through `SkillPathGuard` so
 only files inside the skill can be named; the interpreter comes from an
-allow-list rather than from a shebang (`.py` → `python3`, `.js`/`.mjs` → `node`,
-`.sh` → `/bin/sh`, `.bash` → `bash`, all replaceable or removable); the
+allow-list rather than from a shebang (`.py` → the same newest Python the shell
+resolves, `python3` if none is found and `python` on Windows; `.js`/`.mjs` → `node`,
+`.sh` and `.bash` → `bash`, because many skills use arrays or `pipefail` and
+`/bin/sh` is often a minimal POSIX shell (for example `dash` on Debian and
+Ubuntu); all replaceable or removable); the
 interpreter is exec'd directly, with no shell parsing the argument list, so `;`,
 `|`, `>`, `$` and backticks in an argument are data rather than syntax; the
 environment is reduced to `PATH`, `LANG`, `LC_ALL`, `TZ` and the Windows
@@ -596,7 +643,14 @@ private workspace, the same directory `shell` commands run in, so one step's
 output is the next step's input, and otherwise a per-call scratch deleted when
 the call returns; stdin is closed; the process is
 killed at a 60-second deadline; and stdout and stderr are each captured up to
-32 KB.
+32 KB. `HOME` and `PWD` point at the script's working directory, and so does
+`TMPDIR` unless a `--code-exec` workspace supplies its own (below). Inside a
+`--code-exec` workspace a script also gets that session's
+environment. `PATH` puts the session's package directories and
+`<work>/.local/bin` ahead of the host's. `TMPDIR`, `TEMP` and `TMP` point at a
+short per-session temp directory. `PYTHONPATH` and `NODE_PATH` expose the
+session's installed packages. So a tool or runtime that an earlier call
+installed into the session is found.
 
 In the OS, through `--skills-sandbox`:
 
@@ -707,11 +761,37 @@ npm accept and saying so: an option that changes where a package comes from
 so is an installer the host cannot perform on your behalf (`uv`, `poetry`, `gem`,
 `cargo`) — ignoring either would install something other than what was asked for
 and report success. A `-r requirements.txt` is honoured by reading the file and
-validating each line. It is also what brought `--code-exec-packages` back: the
+validating each line. An npm request may name a registry package with a scope
+and a version (`@scope/tool@1.2.3`, `typescript@latest`); URL, Git, local-path
+and alias specs are refused. It is also what brought `--code-exec-packages` back: the
 host builds the install, so a name allow-list applies to a recognised request
 however the model spelled it. Once unrestricted command networking is enabled, neither
 that package list nor the install-domain list is a security boundary: generated
 code can fetch or execute an artifact without using TensorSharp's host installer.
+Package runners (`npx`, `uvx`, `npm exec`) fetch on their own, so they run as
+ordinary commands only when `--code-exec-allow-network` and
+`--code-exec-allow-install` are both on and no `--code-exec-packages` list is
+set. Otherwise they are treated as install requests. With installs off, the
+refusal is the generic one that installing is not enabled. With installs on,
+`npx` and `uvx` are refused as installers the host cannot perform, with a hint
+to run an installed binary from `node_modules/.bin` or to call the interpreter
+directly. `npm exec …` in any form is refused by name: it fetches a package in
+order to run it, which would go around the host's installer, so the refusal says
+to install the tool by name first (`npm install <name>`) and then run its binary
+from `node_modules/.bin/`; nothing is installed and nothing runs. `npm update`,
+`pnpm update` and `yarn up` (with or without names) are refused the same way,
+with a hint to name the package and version instead
+(`<tool> install|add <name>@latest`), and `pip download` / `pip wheel` are refused
+because the host installs packages rather than producing archives. Harmless
+options before the subcommand are read the way the shell classifier reads them,
+so `pip -q install x`, `python3 -m pip --disable-pip-version-check install x` and
+`npm --silent install x` install exactly `x`; an option outside that list (such as
+`npm -g install x`) is still refused by name. A bare `--version` or
+`--help` probe of an installer or runner is not treated as an install.
+Shell commands and skill scripts share a session `PATH` with `<work>/.local/bin`
+ahead of the host's, and (except on a host with an embedded runtime) the host
+installer resolves its Python or Node there before the host's own, so a runtime
+the model unpacked into the session is the one packages are installed for.
 
 **"Writes confined" has one deliberate exception: the shared system temp.** On
 macOS `/private/tmp` is readable and writable. A whole class of tools a skill
@@ -724,9 +804,19 @@ recalculate a sheet under the sandbox. It is not much of a hole: `/private/tmp` 
 world-writable already (mode 1777, shared by every process on the host), what
 matters stays closed — the home directory is still unreadable and the network
 remains under its separate, denied-by-default policy — and the session's own
-files live under the scratch root, never there. The per-user Darwin temp
-(`/var/folders/…/T`) is still denied; nothing
-needed it once `/private/tmp` was open. On Linux nothing had to be opened:
+files live under the scratch root, never there. The per-user Darwin temp is now
+open on the same terms, because native macOS programs ask the OS for it and
+ignore `TMPDIR`. Only the exact directory the OS reports
+(`confstr(_CS_DARWIN_USER_TEMP_DIR)`, a `/private/var/folders/…/T` path) is
+admitted, never the rest of `/var/folders`. Like `/private/tmp`, it is shared
+temporary storage, not a per-session boundary. For native and multi-process
+programs such as a headed browser, the profile also allows three narrow things.
+Mach names that end in a process ID may be registered. The
+`RootDomainUserClient` and `IOSurfaceRootUserClient` IOKit clients may be
+opened; without the second, a headed Chrome window was drawn fully transparent.
+Signals and process-info queries are allowed within the same sandbox. In the
+other direction, a granted writable root may not itself be unlinked, so a
+child cannot swap it for a symlink that a later launch would follow. On Linux nothing had to be opened:
 bubblewrap 0.12.0 is the minimum accepted version: older releases have a published
 [setup-time symlink traversal](https://github.com/containers/bubblewrap/security/advisories/GHSA-pxhw-h44j-8pfx) that can escape a sandbox built over attacker-controlled
 paths. TensorSharp refuses those releases rather than silently weakening `required`.
@@ -831,8 +921,9 @@ protocol registry, so a new family with an unusual renderer gets it right for fr
 
 | Family | Tool declarations rendered? | `role: "tool"` rendered? | What happens |
 |---|---|---|---|
-| Qwen 3.5 / 3.6, Qwen 3.8 Flash Next (`qwen4exp`), Gemma 4, GPT OSS, Nemotron-H, Muse-Glimmer, DeepSeek V4, GLM 5.x | yes | yes | Full progressive disclosure |
-| **Mistral 3** | no | **no** | No tools are offered; selected skill bodies are written into the prompt up front, and any tool result the loop does produce is fed back as a `user` turn rather than a `tool` turn |
+| Qwen 3.5 / 3.6 / 3.8-27B (`qwen35*`, `qwen3next`, `qwen3vl*`; includes Bonsai 27B and Bonsai2), Qwen 3.8 Flash Next (`qwen4exp`), Qwen 3 / Qwen 2 (`qwen3`, `qwen2`; includes Bonsai 8B), Gemma 4, GPT OSS, Nemotron-H, Muse-Glimmer, DeepSeek V4 / V4.1, GLM 5.x | yes | yes | Full progressive disclosure |
+| **Mistral 3**, **Hunyuan Dense** | no | **no** | No tools are offered; selected skill bodies are written into the prompt up front, and any tool result the loop does produce is fed back as a `user` turn rather than a `tool` turn |
+| **DiffusionGemma** | no | n/a | No tools are offered. On the OpenAI, Responses and Ollama routes, selected skill bodies are written into the prompt up front; the Web UI `/api/chat` diffusion path and the CLI's one-shot diffusion run do not apply skills at all. A block-diffusion turn has no tool-call loop, and a request that sends its own `tools` is refused |
 | **Any family without a tool-output parser**, including architectures with no registry entry | withheld | n/a | Selected skill bodies are written into the prompt up front and the catalog is dropped |
 
 That last row is the one worth understanding, because it is the one that was wrong.
@@ -895,7 +986,7 @@ front of the prompt.
 
 | Flag | Env var | Meaning |
 |---|---|---|
-| `--skills-dir <path>` (repeatable) | `TS_SKILLS_DIR` (path-separator list) | Directories to scan. Default: a `skills` directory next to the binary, created if missing. |
+| `--skills-dir <path>` (repeatable) | `TS_SKILLS_DIR` (path-separator list) | Directories to scan; explicit roots replace the defaults. Default: every existing `.agents/skills` directory from the working directory up to the Git repository root (nearest first; outside a repository only the working directory is checked), then a `skills` directory next to the binary, created if missing. On the server this binary-adjacent `skills` directory is also the upload directory, which is always scanned first and kept even with explicit roots; the CLI has no upload directory. Personal skill directories are never loaded implicitly. |
 | `--skill <name>` (repeatable) | — | Select a skill for this run. |
 | `--list-skills` | — | Print the registry and exit. |
 | `--no-skills` | `TS_NO_SKILLS` (anything but `0`) | Turn the feature off entirely. |
@@ -905,11 +996,14 @@ front of the prompt.
 | `--skills-allow-network` | `TS_SKILLS_ALLOW_NETWORK` | Let bundled `skills_run` scripts reach the network. Off by default; separate from code execution. |
 | `--skills-max-rounds <n>` | `TS_SKILLS_MAX_ROUNDS` | Skill lookups — and shell commands — per turn, 1–64. Default 8, or 24 with `--code-exec`, where one fix is a write, a run, a read of the traceback and a patch. |
 
-`TensorSharp.Server` accepts exactly the same spellings, and a config-file key
+The server (`TensorSharp.Server.Host`) accepts exactly the same spellings, and a config-file key
 *is* a CLI flag (`"skills-dir": ["/srv/skills"]`), so one config file drives
 either host. A root that does not exist is a startup error naming the flag —
 a mistyped path fails before a model loads, not on the first request. Roots are
-scanned in precedence order with the install directory first, and a name
+scanned in precedence order with the install directory first (on the server,
+the `skills` directory next to the binary, which therefore outranks the
+`.agents/skills` roots), then the configured
+or default roots in the order listed above, and a name
 collision between two roots is reported as an error rather than resolved by
 renaming: the name is what a user types and what a `SKILL.md` cross-references,
 and it must not change when an unrelated root is added.
@@ -924,7 +1018,8 @@ Every chat surface takes the same two optional fields:
 ```
 
 `skills_discovery` defaults to `true`; `false` restricts the request to exactly
-the skills it named.
+the skills it named. The same requests also accept `"multi_agent": false`, which
+turns off [sub-agent delegation](multi_agent.md) for that request only.
 
 ```bash
 # OpenAI-compatible
@@ -960,8 +1055,12 @@ Web UI stream additionally carries skill completion metadata; the UI renders
 transient current activity rather than retaining a durable execution trace:
 
 ```
-data: {"skill_step":"skills_read","skill":"pdf","detail":"references/forms.md","ok":true}
+data: {"skill_step":"skills_read","agent_id":"/root","skill":"pdf","detail":"references/forms.md","ok":true,"round":1}
 ```
+
+`agent_id` names the agent that made the call (`/root` for the parent; a
+child's path during [delegation](multi_agent.md)), and `round` is the 1-based
+tool-loop round.
 
 With `--code-exec`, `tool_progress` frames report `writing`, `running`, and
 `finished`; the finished event may include generated files. The server retains
@@ -979,6 +1078,12 @@ curl http://localhost:5000/v1/skills/pdf          # adds "instructions": the SKI
 # Web UI shape, with load errors included
 curl http://localhost:5000/api/skills
 curl http://localhost:5000/api/skills/pdf
+
+# One bundled file as plain text (nested paths bind whole)
+curl http://localhost:5000/api/skills/pdf/files/references/forms.md
+
+# Re-scan the configured roots without restarting
+curl -X POST http://localhost:5000/api/skills/rescan
 
 # Install from a ZIP (of the skill folder, or of its contents)
 curl -X POST http://localhost:5000/api/skills -F "file=@pdf.zip" -F "overwrite=true"
@@ -1036,7 +1141,7 @@ control entirely rather than showing an empty picker.
 `SkillsChatClient` is how a .NET application gets skills, and it covers the two
 situations that actually arise.
 
-**Against TensorSharp.Server** — name the skills and the server does everything,
+**Against a TensorSharp server** (`TensorSharp.Server.Host`) — name the skills and the server does everything,
 including the disclosure loop, next to the model. Nothing is uploaded per
 request and the skill files never leave the server.
 
@@ -1111,6 +1216,19 @@ the model's reads, and the transcript the client returns would be missing the
 fetches the server made. The suppression is sent only when the one-time probe
 showed the endpoint understands those fields, because some OpenAI-compatible
 servers reject request fields they do not recognise.
+
+Local delivery also delegates by default. `SkillsChatClientOptions.MultiAgent`
+is an enabled `MultiAgentOptions`, and each child runs as its own HTTP
+conversation. `SkillsChatRequest.MultiAgent = false` turns delegation off for one
+request; under server delivery it is forwarded as `"multi_agent": false`. Against
+a TensorSharp server, local delivery also sends `"multi_agent": false`, so only one
+side runs the coordination tools. `SkillToolInvocation.AgentId` names the agent
+that made each call (`/root` for the parent), and callbacks from children may run
+concurrently. A direct `SkillAgentLoop` caller turns delegation on with
+`SkillAgentLoopOptions.MultiAgent`. It must also supply a
+`SubagentGeneratorFactory` that gives every child independent generation state;
+setting the first without the second throws. See
+[Multiple agents](multi_agent.md).
 
 ## Writing a good skill
 
@@ -1191,7 +1309,11 @@ as a string, because `ToolParameter` cannot express an array; the model passed a
 array anyway, because that is what an argument list looks like. The read returned
 nothing, the model gave up on the tool and did the arithmetic in its head, and
 produced **1235.89** — a wrong number that looked entirely plausible. Accepting
-both shapes fixed it. The lesson generalises: a tool declaration is a hint, not a
+both shapes fixed it. A third shape turned up later: Qwen's XML tool-call format
+can deliver the array as JSON text inside a string parameter. `skills_run` now
+decodes that too, and keeps argument boundaries and empty strings without any
+shell evaluation. A string that starts with `[` but is not a valid array of
+strings returns an error that says how to quote it. The lesson generalises: a tool declaration is a hint, not a
 contract the model is bound by, so the reading end has to accept what models
 actually emit.
 
@@ -1218,11 +1340,12 @@ Three differences are deliberate and asserted as such:
 - **Underscores, not a dotted namespace.** Several chat templates splice a tool's
   name into their markup unescaped — Gemma 4 writes
   `<|tool>declaration:{name}{`, GLM writes `<tool_call>{name}<arg_key>`, Harmony
-  writes `type {name} =`. A dot is not safe in that position across all eleven
-  protocols. The capability is identical; only the spelling differs.
+  writes `type {name} =`. A dot is not safe in that position across every
+  registered protocol. The capability is identical; only the spelling differs.
 - **Flat tool parameters.** `ToolParameter` carries `{Type, Description, Enum}`
-  and nothing else; `items` and nested `properties` are dropped when a tool is
-  parsed and cannot be re-emitted. So every parameter is a scalar — and the
+  and nothing else; `items` and nested `properties` are not modelled by
+  `ToolParameter`, and only DeepSeek V4.1 re-emits a caller's raw schema. So
+  every parameter of the built-in tools is a scalar — and the
   reading end compensates, as the `args` bug above shows it must.
 - **Nobody to ask, so the sandbox is mandatory.** TensorSharp has a general shell
   tool as well — `--code-exec` declares the file tools, `shell` and `apply_patch`, and a skill's
@@ -1285,3 +1408,8 @@ pedantry:
 
 Both load and both work — which is precisely the behaviour the forgiving reader
 exists for.
+
+This repository ships its own bundle under `TensorAgent/skills`, including a
+`playwright` skill that drives a real browser through `@playwright/cli` from
+`skills_run`. It runs on desktop hosts only. The flags it needs and its macOS
+setup are in [Running browser and native-runtime skills](playwright_agent.md).

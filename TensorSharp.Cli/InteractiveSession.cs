@@ -479,10 +479,10 @@ namespace TensorSharp.Cli
             Console.WriteLine("  /info, /status         Show the loaded model, backend, and projector.");
             Console.WriteLine("  /model <path>          Load a different .gguf model (resets the session).");
             Console.WriteLine("  /backend <name>        Reload the current model on a different backend");
-            Console.WriteLine("                         (cpu | cuda | ggml_cpu | ggml_metal | ggml_cuda).");
+            Console.WriteLine($"                         ({string.Join(" | ", BackendNames)}).");
             Console.WriteLine("  /mmproj <path>         Load a multimodal projector for the current model:");
             Console.WriteLine("                         an mmproj .gguf, or a Gemma 4 vision .safetensors shard");
-            Console.WriteLine("                         (pass an empty value to clear).");
+            Console.WriteLine("                         (unloading one takes a reload: /model <path>).");
             Console.WriteLine();
             Console.WriteLine("Sampling:");
             Console.WriteLine("  /sampling, /show       Print the current sampling configuration.");
@@ -834,12 +834,12 @@ namespace TensorSharp.Cli
             string requested = (arg ?? "").Trim().ToLowerInvariant();
             if (string.IsNullOrEmpty(requested))
             {
-                Console.WriteLine($"Current backend: {_backend}. Usage: /backend cpu|cuda|ggml_cpu|ggml_metal|ggml_cuda");
+                Console.WriteLine($"Current backend: {_backend}. Usage: /backend {string.Join("|", BackendNames)}");
                 return;
             }
             if (!TryParseBackend(requested, out BackendType target))
             {
-                Console.WriteLine($"Unknown backend '{requested}'. Use: cpu, cuda, ggml_cpu, ggml_metal, ggml_cuda");
+                Console.WriteLine($"Unknown backend '{requested}'. Use: {string.Join(", ", BackendNames)}");
                 return;
             }
             if (target == _backend)
@@ -1026,7 +1026,18 @@ namespace TensorSharp.Cli
             }
         }
 
-        private static bool TryParseBackend(string raw, out BackendType backend)
+        /// <summary>
+        /// The backend names <c>/backend</c> takes, as <c>/help</c> and its own errors list
+        /// them. Kept beside <see cref="TryParseBackend"/>, which also accepts the hyphenated
+        /// and alias spellings: the three hand-typed lists here once left out ggml_vulkan,
+        /// telling a Vulkan user their backend did not exist.
+        /// </summary>
+        internal static readonly string[] BackendNames =
+        {
+            "cpu", "cuda", "ggml_cpu", "ggml_metal", "ggml_cuda", "ggml_vulkan",
+        };
+
+        internal static bool TryParseBackend(string raw, out BackendType backend)
         {
             switch ((raw ?? string.Empty).Trim().ToLowerInvariant())
             {

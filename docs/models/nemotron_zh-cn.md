@@ -5,7 +5,7 @@
 | 属性 | 值 |
 |---|---|
 | 提供方 | NVIDIA |
-| GGUF 架构标识 | `nemotron_h`、`nemotron_h_moe` |
+| GGUF 架构标识 | `nemotron_h`、`nemotron_h_moe`、`nemotron_h_omni` |
 | 模型类 | [`NemotronModel`](../../TensorSharp.Models/Models/Nemotron/NemotronModel.cs)（旧单序列路径）+ [`NemotronModel.BatchedForward.cs`](../../TensorSharp.Models/Models/Nemotron/NemotronModel.BatchedForward.cs)（`IBatchedPagedModel`） |
 | 视觉编码器 | [`NemotronVisionEncoder`](../../TensorSharp.Models/Models/Nemotron/NemotronVisionEncoder.cs)（RADIO / v2_vl ViT） |
 | 图像处理器 | [`NemotronImageProcessor`](../../TensorSharp.Models/Models/Nemotron/NemotronImageProcessor.cs) |
@@ -14,7 +14,7 @@
 | 示例模型 | Nemotron-H-8B-Reasoning-128K、Nemotron-H-47B-Reasoning-128K、Nemotron 3 Nano Omni |
 | 模态 | 文本、图像（Omni 版本配合 `mmproj`）。只有加载了带 Parakeet 音频塔的配套 GGUF 时才支持音频（§4.7）；否则音频会被**拒绝**（HTTP 400 / CLI 错误，消息为 `NemotronModel.AudioInputUnsupportedMessage`）：公开的 Omni GGUF 不带音频塔，`mmproj` 里只有 RADIO 视觉塔（见 §4.6）。 |
 | 思维链模式 | 是（`<think> ... </think>`） |
-| 工具调用 | 是（`<tool_call>{...}</tool_call>`） |
+| 工具调用 | 是（`<tool_call>{...}</tool_call>`）；可使用 skills、代码工具以及服务端的[子智能体委派](../multi_agent.md) |
 | 批处理 / 分页前向 | **默认启用** —— 设置 `TS_NEMOTRON_BATCHED=0` 可强制走旧的按序列 KV-swap 路径用于 A/B 对比。每槽位 Mamba2 conv + SSM 状态池，注意力层使用分页 K/V。可选的原生批处理 Mamba2 步内核（`TS_NEMOTRON_MAMBA2_BATCHED_NATIVE=1`）。详见 §11。 |
 | 输出解析器 | `ChatMlOutputParser` |
 
@@ -401,7 +401,7 @@ decode 热路径上的小算子（RMSNorm、residual add、expert / router matmu
 - **Attention 层**：标准 KV cache `[numKVHeads, maxSeqLen, headDim]`。
 - **Mamba2 层**：`_convState[layer]`（大小 `(convKernel - 1) * (dInner + 2 * nGroup * dState)` floats）与 `_ssmState[layer]`（大小 `dState * headDim * nHead` floats）。
 - `ResetKVCache()` 同时清零三类缓存（KV cache、conv state、SSM state）。
-- `SupportsKVCacheTruncation` 返回 **false**，因为 SSM 状态是顺序的，不能部分复用。Nemotron-H 因此不启用多轮 KV cache 复用 —— 服务器在轮次之间回退到完整 reset。
+- `SupportsKVCacheTruncation` 返回 **false**，因为 SSM 状态是顺序的，无法回退。因此前缀复用以块边界为单位进行，而不是靠回退：每个被捕获的 KV 块把注意力层的 K/V 行与每个 Mamba2 层在该块末尾的 conv 状态和 SSM 状态打包在一起（`RequiresPerBlockCapture`），Radix 前缀缓存（默认模式）恢复新提示词与之共享的完整块，或在提示词恰好扩展常驻缓存时直接续接（`NemotronModel.PrefixCache.cs`）。
 
 ## 11. 批处理 / 分页前向（连续批处理）
 

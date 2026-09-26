@@ -51,6 +51,11 @@ namespace TensorSharp.AgentHost.Skills
         /// program working from anchors it either finds or refuses, never by a model
         /// re-typing a file it half-remembers.
         /// </para>
+        /// <para>
+        /// It is the one ADVERTISED way to change a file that already exists, from a
+        /// one-line fix to an atomic multi-file change; <see cref="EditFile"/> is no longer
+        /// declared and <see cref="WriteFile"/> only creates.
+        /// </para>
         /// </summary>
         public const string ApplyPatch = "apply_patch";
 
@@ -78,26 +83,28 @@ namespace TensorSharp.AgentHost.Skills
         /// Claude Code's <c>Edit</c>: replace one exact string in one file.
         ///
         /// <para>
-        /// The default way to change code here, and deliberately the simplest thing on
-        /// the surface: two byte strings and no envelope. The reference that ships the
-        /// strongest coding model emits no diff at all, and Anthropic's published
-        /// <c>str_replace_based_edit_tool</c> has this same shape — which matters most
-        /// for the small local models this host serves, because a V4A envelope has half a
-        /// dozen ways to be malformed and every one of them costs a round.
+        /// A compatibility name, not part of the advertised surface. The tool list the
+        /// model is given no longer declares it — <see cref="ApplyPatch"/> is the edit
+        /// tool — but a call that uses it, or one of the <c>str_replace</c> spellings
+        /// models reach for by reflex, is still dispatched and performed rather than
+        /// handed to a client that implements no tools. Refusing it would spend a round
+        /// on a spelling and teach nothing.
         /// </para>
         /// </summary>
         public const string EditFile = "edit_file";
 
         /// <summary>
-        /// Claude Code's <c>Write</c>: create a file, or deliberately replace one whole.
+        /// Claude Code's <c>Write</c>, restricted to creating a file.
         ///
         /// <para>
-        /// It exists even though a whole-file write is the thing being discouraged, and
-        /// for two reasons. Creating a file is a legitimate operation that
-        /// <see cref="EditFile"/> structurally cannot do. And it is the SANCTIONED
-        /// rewrite path, which is the only place a rewrite can be noticed by
-        /// construction rather than by scanning a command line for a redirect — the
-        /// scanning approach is what left half a dozen ways to rewrite a file invisible.
+        /// Create-only as the model sees it: a path that already exists is refused before
+        /// a byte changes, and the refusal points at <see cref="ApplyPatch"/>. Treating an
+        /// omitted flag as permission to replace made this the easiest escape hatch after
+        /// a failed edit — every correct line re-typed, the old file destroyed, and only
+        /// then the explanation that a patch would have been cheaper. Replacing survives
+        /// only where it is asked for explicitly: a call that carries the undeclared
+        /// <c>overwrite: true</c>, or host code building a <c>WriteRequest</c> directly,
+        /// whose <c>Overwrite</c> defaults to true.
         /// </para>
         /// </summary>
         public const string WriteFile = "write_file";
@@ -192,6 +199,22 @@ namespace TensorSharp.AgentHost.Skills
                 }
             }
             return null;
+        }
+
+        /// <summary>
+        /// The declared name of a code tool the host accepts under another spelling
+        /// (<c>str_replace</c> is <see cref="EditFile"/>, <c>apply-patch</c> is
+        /// <see cref="ApplyPatch"/>); any other name comes back unchanged. For what the user
+        /// is SHOWN - progress frames name the tool that runs, not the spelling the model
+        /// happened to reach for.
+        /// </summary>
+        public static string? CanonicalName(string? name)
+        {
+            if (string.IsNullOrEmpty(name))
+                return name;
+            if (IsApplyPatchAlias(name))
+                return ApplyPatch;
+            return ResolveFileTool(name) ?? name;
         }
 
         /// <summary>True when <paramref name="name"/> is one of <see cref="CodeTools"/>.</summary>

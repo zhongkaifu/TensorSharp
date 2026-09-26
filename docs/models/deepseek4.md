@@ -62,9 +62,10 @@ The native whole-model executor
 - Loads the (split) GGUF directly and **layer-splits the weights across every
   visible CUDA GPU** — a model larger than one GPU's VRAM is hosted across all
   of them (the 128 GiB IQ4_XS build needs 2×80GB). This happens **by default,
-  with no flag**: `--tp` is not what puts DSV4 on several cards, it switches the
-  split from whole layers to Megatron column/row sharding within each layer.
-  `TS_DSV4_NGPU` caps how many devices the layer split uses.
+  with no flag**: `--tp` is not what puts DSV4 on several cards, and it does
+  not shard inside a layer either. On this family `--tp N` only caps the layer
+  split at N devices, exactly like `TS_DSV4_NGPU`, which wins when both are
+  set.
 - Owns all DSV4 KV state on-device: raw SWA ring, CSA/HCA compressed-K caches,
   lightning-indexer cache, and the compressor state rings.
 - Executes prefill/decode ubatches as single ggml graphs via
@@ -75,6 +76,11 @@ The native whole-model executor
 The C# side (`TensorSharp.Models/Models/DeepSeek4/DeepSeek4Model.cs`) handles
 GGUF metadata, the `joyai-llm` BPE pre-tokenizer, the DeepSeek V4 chat template
 (`<｜User｜>…<｜Assistant｜></think>`, `--think` opens `<think>`), and sampling.
+The template renders tool declarations and `DeepSeek4OutputParser` parses the
+DSML tool calls back, so V4 is eligible for the tool-based features: skills,
+the code tools (`--code-exec`) and, on the server, [sub-agent
+delegation](../multi_agent.md), which is on by default on its chat paths. No
+delegation results are published for this model.
 
 ### Fitting the model: VRAM-aware split, and MoE CPU offload when you ask for it
 
@@ -83,9 +89,12 @@ layer split against the VRAM each device *actually has free right now*, not
 against an equal share of the bytes. Two things follow from that.
 
 **The split is budget-proportional.** Every device is filled to the same
-fraction of its own free VRAM, minus a run-time reserve (the scheduler's
-compute buffers, `TS_DSV4_VRAM_RESERVE_MB`, default 2048 MiB per device) and
-minus the KV caches and compressor state rings the split can compute exactly.
+fraction of its own free VRAM, minus a run-time reserve for the scheduler's
+compute buffers and minus the KV caches and compressor state rings the split
+can compute exactly. The native executor estimates that reserve per load: 2 GiB
+plus the lightning-indexer top-k transient and one ubatch of activations, so it
+grows with `MAX_CONTEXT` and `TS_DSV4_UBATCH`. The direct-CUDA engine holds back
+a flat 2048 MiB per device. `TS_DSV4_VRAM_RESERVE_MB` overrides either.
 A device with a display attached, or one already hosting another process, gets
 proportionally fewer layers instead of the OOM an equal-bytes split would hand
 it.
@@ -108,8 +117,8 @@ work, instead of loading into an out-of-memory abort:
 ```
 
 Note what that example shows: the weights alone can look like they fit and still
-not, because each device also holds its KV caches and the `TS_DSV4_VRAM_RESERVE_MB`
-compute reserve (2048 MiB per device by default — 14 GiB across 7).
+not, because each device also holds its KV caches and the compute reserve
+(never less than 2 GiB per device, so at least 14 GiB across 7).
 
 `--n-cpu-moe N` / `--cpu-moe` then keep the routed experts (`ffn_gate_exps` /
 `ffn_up_exps` / `ffn_down_exps`) of the first N layers in host RAM and run their
@@ -127,8 +136,7 @@ the scheduler than in the arithmetic (226 → 105 ms per token).
 
 Measured on 3×RTX A6000 48 GB (UD-Q8_K_XL, 151 GiB of weights against 139 GiB
 of VRAM, 2-socket Xeon Gold 6342 under a 23.8-CPU cgroup quota; another process
-held ~15 GiB during the `ggml_cuda` runs, which is why it offloaded 13 layers
-against the direct engine's 9):
+held ~15 GiB during the `ggml_cuda` runs):
 
 | Metric | `ggml_cuda` (8 offloaded) | `cuda` (9 offloaded) | `ggml_vulkan` (7 offloaded) |
 |---|---|---|---|
@@ -202,10 +210,12 @@ verifies the block in ONE batched forward and keeps the longest prefix its own
 sampler would have drawn, so speculation is a speed path, not a quality change.
 
 It is loaded as a separate drafter GGUF with `--draft-model` and engages for
-greedy (`--temperature 0`) single-sequence generation on **both GPU engines** —
+single-sequence (solo) generation on **both GPU engines** —
 `--backend cuda` (direct-CUDA) and `--backend ggml_cuda` (the native ggml
-executor). `ggml_vulkan` and `cpu` have no speculative path for this
-architecture and log a warning if a drafter is configured.
+executor). `ggml_vulkan`, `ggml_cpu` and `cpu` have no speculative path for this
+architecture and log a warning if a drafter is configured. Without a drafter
+there is nothing to speculate with: `--spec` alone, `--spec-type ngram`
+included, serves standard decode on this family.
 
 Every single-sequence CLI generation path uses it: one-shot `--input`,
 `--multi-turn-jsonl`, and the `--interactive` chat REPL (which streams the
@@ -233,18 +243,18 @@ the proposal, and acceptance falls as the penalized history grows. Speculation
 stays off entirely for a turn carrying an image or audio attachment, whose
 embeddings only the plain prefill can inject.
 
-### On TensorSharp.Server
+### On the server (TensorSharp.Server.Host)
 
 The same drafter serves the HTTP API. Pass it with `--draft-model` — naming
 the drafter enables speculation by itself (an explicit `--no-spec` vetoes it):
 
 ```bash
-TensorSharp.Server --model DeepSeek-V4-Flash-...-00001-of-00005.gguf \
+TensorSharp.Server.Host --model DeepSeek-V4-Flash-...-00001-of-00005.gguf \
     --backend ggml_cuda --tp 4 \
     --draft-model DSpark-drafter-Q2K-Q8-0731.gguf
 ```
 
-Unlike the CLI, the engine draws every verify row with the **request's own
+As on the CLI, the engine draws every verify row with the **request's own
 sampler**, so speculation composes with any sampling settings and the output is
 whatever that sampler would have produced anyway. Penalties only cost
 acceptance, and measurably little: the same prompt at `repeat_penalty` 1.1 vs
@@ -266,7 +276,7 @@ Measured on 4×A40 (`--tp 4`, 300-token OpenAI chat completion):
 | `--draft-model …` | **31.3 – 32.1 (1.25–1.28x)** |
 
 `--spec-pmin` defaults to the value matching the loaded drafter — 0.35 for a
-block drafter, 0.75 for a per-token draft head — so it needs no tuning. Setting
+block drafter, 0.15 for a per-token draft head — so it needs no tuning. Setting
 it explicitly still wins; the startup line reports which gate is in force
 (`pMin=0.35, draft=block(5)`).
 
@@ -393,11 +403,11 @@ confidence gate is what keeps that trade positive.
 | Env | Default | Meaning |
 |---|---|---|
 | `MAX_CONTEXT` | 65536 | Context window (caches scale with it; metadata allows 1M) |
-| `TS_DSV4_UBATCH` | 512 CPU / 1024 GPU | Prefill micro-batch |
+| `TS_DSV4_UBATCH` | 512 on `cpu` / 1024 otherwise | Prefill micro-batch |
 | `TS_DSV4_NGPU` | all | Number of GPUs to layer-split across (GPU backends) |
-| `TS_DSV4_VRAM_RESERVE_MB` | 2048 | GPU backends: VRAM held back per device for the scheduler's compute buffers. Lower it to offload fewer expert layers; raise it if a long prompt fails to allocate its graph |
+| `TS_DSV4_VRAM_RESERVE_MB` | estimated per load (at least 2048); 2048 on `cuda` | GPU backends: overrides the VRAM held back per device for the scheduler's compute buffers. Unset, the ggml executor uses 2 GiB plus the lightning-indexer top-k transient and one ubatch of activations, so it grows with `MAX_CONTEXT` and `TS_DSV4_UBATCH`; `--backend cuda` uses a flat 2048. Lower it to offload fewer expert layers; raise it if a long prompt fails to allocate its graph |
 | `TS_N_CPU_MOE` / `TS_CPU_MOE` | 0 (off) | Leading layers whose routed experts stay in system RAM (same as `--n-cpu-moe` / `--cpu-moe`). Off by default; a model that does not fit is refused with the number that would work |
-| `TS_CPU_MOE_THREADS` | half the usable CPUs | Worker threads for the host expert matmul. `hardware_concurrency` clamped by the affinity mask and the cgroup CPU quota, then halved on hosts with more than 8 — the accelerator submission threads (and, when hosted, Kestrel and the scheduler) have to be schedulable too. Sizing this near the quota collapses rather than degrades: 96 threads on a 23.8-CPU quota measured **25x** slower than 23, and on a 95-CPU quota a hosted MoE ran 8.2 tok/s at 71 threads against 20.7 at 64 |
+| `TS_CPU_MOE_THREADS` | all usable CPUs (when offloading) | Worker threads for the host expert matmul on the ggml executors. With offload on, the pool takes `hardware_concurrency` clamped by the affinity mask and the cgroup CPU quota — not the halved default the other MoE architectures use, because a DSV4 offloaded layer reads far more expert bytes per token than theirs do and keeps scaling past that point. `--cpu-moe-threads N` overrides it, and an inherited `TS_CPU_MOE_THREADS` has the final say. Size it to the quota, not to `nproc`: 96 threads on a 23.8-CPU quota measured **25x** slower than 23. On a hosted server, leave the other threads room: the shared MoE pool on gemma-4-26B-A4B (not DSV4) ran 8.2 tok/s at 71 threads against 20.7 at 64 on a 95-CPU quota, so pass `--cpu-moe-threads` below the quota there |
 | `TS_DSV4_LOAD_THREADS` | 16 | `--backend cuda`: reader threads for the stream-to-VRAM loader |
 | `TS_DSV4_LOAD_STATS` | 0 | `--backend cuda`: 1 = per-stage loader timings |
 | `TS_DSV4_STAGED_EXPERTS` | 1 | `--backend cuda`: 0 = per-token expert kernels (A/B) |

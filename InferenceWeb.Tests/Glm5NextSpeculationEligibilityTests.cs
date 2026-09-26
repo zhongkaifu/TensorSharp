@@ -41,9 +41,12 @@ public sealed class Glm5NextSpeculationEligibilityTests : IDisposable
         return env;
     }
 
+    // Each check runs on the managed per-op path (a plain [Theory] row, every lane)
+    // and on the native executor (the _GgmlCpu fact). The native one constructs
+    // ggml-cpu, and a process holds one GGML backend, so it runs in the lane that
+    // pins ggml-cpu and skips visibly in the others.
     [Theory]
     [InlineData(BackendType.Cpu)]
-    [InlineData(BackendType.GgmlCpu)]
     public void ActualKdaCheckpoint_IsEligibleForNgram_OnTheRecurrentContract(BackendType backend)
     {
         using var env = EnvironmentForFixture();
@@ -75,9 +78,12 @@ public sealed class Glm5NextSpeculationEligibilityTests : IDisposable
         Assert.Contains(ExecutionPathKind.SpeculativePerSequence, plan.Candidates);
     }
 
+    [GgmlFact(BackendType.GgmlCpu)]
+    public void ActualKdaCheckpoint_IsEligibleForNgram_OnTheRecurrentContract_GgmlCpu()
+        => ActualKdaCheckpoint_IsEligibleForNgram_OnTheRecurrentContract(BackendType.GgmlCpu);
+
     [Theory]
     [InlineData(BackendType.Cpu)]
-    [InlineData(BackendType.GgmlCpu)]
     public void ArbitraryRewind_IsRefusedWithoutMutatingTheContinuation(BackendType backend)
     {
         // A KDA state cannot be rewound to an arbitrary position: the only exact
@@ -105,9 +111,12 @@ public sealed class Glm5NextSpeculationEligibilityTests : IDisposable
         Assert.Equal(expected, actual); // Entire vocabulary, not only argmax.
     }
 
+    [GgmlFact(BackendType.GgmlCpu)]
+    public void ArbitraryRewind_IsRefusedWithoutMutatingTheContinuation_GgmlCpu()
+        => ArbitraryRewind_IsRefusedWithoutMutatingTheContinuation(BackendType.GgmlCpu);
+
     [Theory]
     [InlineData(BackendType.Cpu)]
-    [InlineData(BackendType.GgmlCpu)]
     public async Task SchedulerRequestedNgram_ArmsAndPreservesThePlainStream(BackendType backend)
     {
         using var env = EnvironmentForFixture();
@@ -145,6 +154,10 @@ public sealed class Glm5NextSpeculationEligibilityTests : IDisposable
         // declined outright on this architecture).
         Assert.NotNull(requested.sequence.SpecStats);
     }
+
+    [GgmlFact(BackendType.GgmlCpu)]
+    public Task SchedulerRequestedNgram_ArmsAndPreservesThePlainStream_GgmlCpu()
+        => SchedulerRequestedNgram_ArmsAndPreservesThePlainStream(BackendType.GgmlCpu);
 
     [Fact]
     public void OrdinaryGlmDsa_RetainsItsSpeculativeTrunk()

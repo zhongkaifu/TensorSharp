@@ -3,20 +3,26 @@
   // ~4B active params, 13.3 GB of weights. Skills, skill scripts, network,
   // code generation / editing / execution and package installs all enabled.
   //
-  //   TensorSharp.Cli    --config config/agent-gemma-4-26b-a4b.json --chat
-  //   TensorSharp.Server --config config/agent-gemma-4-26b-a4b.json
+  //   TensorSharp.Cli         --config config/agent-gemma-4-26b-a4b.json --chat
+  //   TensorSharp.Server.Host --config config/agent-gemma-4-26b-a4b.json
   //
   // Every key here is read by BOTH hosts; CLI-only keys (--think, --tools,
-  // --system, --input, --output, --penalty-last-n) are left out because the
-  // server refuses to start on an unknown option while the CLI silently drops
-  // one. Comments are the only way to annotate a config -- any non-reserved
-  // key becomes a command-line flag.
+  // --system, --input, --output) are left out because the server refuses to
+  // start on an unknown option while the CLI silently drops one. Comments are
+  // the only way to annotate a config -- any non-reserved key becomes a
+  // command-line flag.
   //
   // Note the model root: all six Gemma files live under gemma_mtp/qat, which
   // is the subdirectory the shipped config/gemma-4-26b-a4b.json omits.
+  //
+  // A missing model file downloads from "repo" into ${root}, pinned by commit and
+  // SHA-256. This upload carries Gemma's second-generation chat template, which
+  // TensorSharp renders prompts from; its weights match the earlier upload byte
+  // for byte.
   "variables": {
     "modelRoot": "${TENSORSHARP_MODELS:-/Users/zhongkaifu/work/models}",
     "root": "${modelRoot}/gemma_mtp/qat",
+    "repo": "https://huggingface.co/unsloth/gemma-4-26B-A4B-it-qat-GGUF/resolve/7b92b5b28818151e8669af2e45e88d6086f490dd",
     "skillsRoot": "${TENSORSHARP_SKILLS:-/Users/zhongkaifu/work/TensorSharp/TensorAgent/skills}"
   },
 
@@ -24,7 +30,7 @@
 
   // Generation cap, NOT the context window, and it sizes the up-front KV
   // reservation (prompt + max_new_tokens). The window is env-only:
-  //   MAX_CONTEXT=131072 TensorSharp.Server --config config/agent-gemma-4-26b-a4b.json
+  //   MAX_CONTEXT=131072 TensorSharp.Server.Host --config config/agent-gemma-4-26b-a4b.json
   "max-tokens": 16384,
 
   "continuous-batching": true,
@@ -44,11 +50,17 @@
   // the indentation and closing delimiters of generated code.
   "repeat-penalty": 1.0,
 
-  "model": "${root}/gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf",
+  "model": {
+    "path": "${root}/gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf",
+    "urls": ["${repo}/gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf"],
+    "sha256": "a7c5bc715f5ff8e99a3e8901ce7d2b42b402c669bf24f7c5250747633d0f5891"
+  },
 
   // ---- Agent Skills -------------------------------------------------------
-  // Without this the agent has zero skills: the default root beside the binary
-  // is empty. A path that does not exist is a fatal startup error.
+  // Without this the agent has zero skills here: the default roots -- every
+  // .agents/skills from the working directory up to the Git root, then a
+  // "skills" folder beside the binary -- hold none in this checkout. A path that
+  // does not exist is a fatal startup error.
   "skills-dir": "${skillsRoot}",
 
   // Run a skill's bundled scripts. Treat every enabled script as untrusted
@@ -70,8 +82,8 @@
   "skills-max-rounds": 32,
 
   // ---- Code generation, editing and execution -----------------------------
-  // shell, read_file, edit_file, write_file and apply_patch in one bounded
-  // model-to-tool loop, under Seatbelt. Do NOT add "code-exec-unconfined" on
+  // read_file, apply_patch, write_file (new files only) and shell in one
+  // bounded model-to-tool loop, under Seatbelt. Do NOT add "code-exec-unconfined" on
   // this Mac: it downgrades confinement to best-effort and lets a failed
   // sandbox wrap fall back to a raw process. Writes are confined to the
   // session workspace and the home directory is unreadable, so the agent works
@@ -108,8 +120,10 @@
   //     downgraded to f16 at load with a note on stderr rather than honoured.
   //     MAX_CONTEXT is the only lever on KV size here.
   //   Speculative decoding. The MTP draft head is on disk and would be enabled
-  //     by adding, on its own line:
-  //       "draft-model": "${root}/gemma-4-26B-A4B-it-Q4_0-MTP.gguf"
+  //     by adding:
+  //       "draft-model": { "path": "${root}/gemma-4-26B-A4B-it-Q4_0-MTP.gguf",
+  //                        "urls": ["${repo}/MTP/mtp-gemma-4-26B-A4B-it-Q4_0.gguf"],
+  //                        "sha256": "7272d97595f0d4c74bd7b623492b7dbdaafd8b7c72f329a8270ba4eca68f768a" }
   //     Naming the file IS the request -- no "spec": true beside it, and
   //     "spec": false would be dead text since a JSON false emits no flag.
   //     It is left off here because the win measured for Gemma-4 on Metal
@@ -119,9 +133,11 @@
   //     only 131072 context against the target's 262144, so verify behaviour
   //     before pushing MAX_CONTEXT past 131072 with it attached.
   //   "mmproj" -- the projector loads eagerly at every startup, 1.19 GB here,
-  //     even for a pure-text run. Add
-  //     "mmproj": "${root}/gemma-4-26B-A4B-mmproj-BF16.gguf" if the agent needs
-  //     to read images; the CLI also auto-detects it when --image is passed.
+  //     even for a pure-text run. If the agent needs to read images, add
+  //       "mmproj": { "path": "${root}/gemma-4-26B-A4B-mmproj-BF16.gguf",
+  //                   "urls": ["${repo}/mmproj-BF16.gguf"],
+  //                   "sha256": "7b06953ccdbe8cf363f47841a7afaacd2b1c2ff9a8d6b426fdec7521a6878744" }
+  //     The CLI also auto-detects it when --image is passed.
   //   "code-exec-packages" / "code-exec-install-domains" -- defaults already
   //     allow any package from the three default registry hosts (pypi.org,
   //     files.pythonhosted.org, registry.npmjs.org), and installs go to PyPI

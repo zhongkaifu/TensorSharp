@@ -1,9 +1,9 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <!-- TensorAgent iOS head: a .NET MAUI app that statically links TensorSharp's
-       GgmlOps.xcframework and hosts the TensorSharp.Server Web UI in a WKWebView
-       behind an in-process loopback HTTP server. Build only with the user-local
-       SDK that carries the maui-ios workload (see ../../README.md). -->
+       GgmlOps.xcframework and hosts its own phone Web UI (wwwroot/, below) in a
+       WKWebView behind an in-process loopback HTTP server. Build only with the
+       user-local SDK that carries the maui-ios workload (see ../../README.md). -->
 
   <PropertyGroup>
     <TargetFramework>net10.0-ios</TargetFramework>
@@ -198,16 +198,30 @@
          <bundle>/skills/, which is one of the two roots the registry scans (the
          other is the writable directory the user installs into). The selection is
          not a judgement call in this file: scripts/verify-skills.py checks every
-         script's imports against the staged interpreter and refuses anything that
-         reaches for a process, a browser or a package that is not there, and
-         skills/verdicts.json records what it decided and why.
+         Python script's imports against the staged interpreter, and every shell
+         script for the Node package managers and bundlers the in-app shell does not
+         have, and refuses anything that reaches for a process, a browser or a
+         package that is not there; skills/verdicts.json records what it decided and
+         why.
+
+         TensorAgent/skills is also the skill directory the desktop hosts are pointed
+         at (the server's skills-dir, the desktop TensorAgent host), so it holds
+         skills the phone cannot run, and MSBuild cannot read the verdicts. Every
+         skill directory without a passing verdict is therefore excluded by name
+         below, and TensorAgentMauiProjectTests keeps that list equal to
+         verdicts.json in both directions. Two fail today, both on shell scripts the
+         verifier used to pass unexamined: playwright's only script execs npx to drive
+         a Chromium, and web-artifacts-builder's two scripts install and run pnpm,
+         npm and parcel. The app can start neither a Node package manager nor a
+         browser, so bundled, either would be offered to the model and fail on its
+         first step.
 
          Bytecode is excluded on purpose: running a skill's scripts on a
          development machine leaves __pycache__ beside them, and a .pyc compiled
          by a different CPython than the one in this bundle is either ignored or
          wrong. The interpreter compiles from source at run time instead. -->
     <BundleResource Include="../../skills/**/*"
-                    Exclude="../../skills/verdicts.json;../../skills/**/__pycache__/**/*"
+                    Exclude="../../skills/verdicts.json;../../skills/**/__pycache__/**/*;../../skills/playwright/**/*;../../skills/web-artifacts-builder/**/*"
                     Link="skills/%(RecursiveDir)%(Filename)%(Extension)" />
   </ItemGroup>
 

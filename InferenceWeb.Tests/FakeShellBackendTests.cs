@@ -441,6 +441,33 @@ public sealed class FakeShellBackendTests : IDisposable
     }
 
     [Fact]
+    public void ARegistrySubcommandTheHostDoesNotPerform_ReachesNeitherTheInstallerNorTheBackend()
+    {
+        // Both are classified as installs, and the reader used to take the subcommand for
+        // a package name: the installer was asked for "update" (or "exec", "cowsay",
+        // "hi"), the result reported that as the install, and the segment was substituted
+        // out — so `echo after` ran on a line whose update never happened, and cowsay
+        // never ran at all. Refused by name now, before anything is installed or run.
+        foreach ((string command, string named) in new[]
+                 {
+                     ("npm update && echo after", "`npm update`"),
+                     ("npm exec cowsay hi", "`npm exec`"),
+                 })
+        {
+            FakeShellBackend backend = Backend();
+            var installer = new RecordingInstaller();
+            using var runner = Runner(backend, o => o.AllowInstall = true, installer);
+
+            CodeExecResult result = runner.Run(new ShellRequest(command), Workspace());
+
+            Assert.False(result.Ok, command);
+            Assert.StartsWith("The command was not run: " + named, result.Content, StringComparison.Ordinal);
+            Assert.Empty(installer.Requests);
+            Assert.Empty(backend.Launches);
+        }
+    }
+
+    [Fact]
     public void ARefusedInstall_BecomesFalse_AndTheCallIsNotOk_WhateverTheRestOfTheLineExited()
     {
         FakeShellBackend backend = Backend();

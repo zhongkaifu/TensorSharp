@@ -12,7 +12,8 @@
 | 示例模型 | Mistral-Small-3.1-24B-Instruct、Ministral-3-14B-Instruct |
 | 模态 | 文本、图像 |
 | 思维链模式 | 否 |
-| 工具调用 | 否 |
+| 工具调用 | 否 —— 渲染器不声明工具，也会丢弃 `role: "tool"` 消息，因此不提供代码工具和子智能体委派，skills 退回到内联指令 |
+| 投机解码 | 否 —— Mistral 3 没有投机主干，因此 `--spec`（包括无权重的 n-gram 草稿器）只提供普通解码 |
 | 批处理 / 分页前向 | **默认启用** —— `IBatchedPagedModel.ForwardBatch` 的参考实现。已在 Ministral-3-14B 上完成端到端验证；原生分页注意力内核在长上下文下比旧路径快约 21%。详见 §11。 |
 | 输出解析器 | `PassthroughOutputParser` |
 
@@ -100,7 +101,8 @@ hf download bartowski/mistralai_Mistral-Small-3.1-24B-Instruct-2503-GGUF mistral
 hf download bartowski/mistralai_Mistral-Small-3.1-24B-Instruct-2503-GGUF mmproj-mistralai_Mistral-Small-3.1-24B-Instruct-2503-f16.gguf --local-dir models
 ```
 
-CLI 单次推理带图像（Pixtral 视觉需要 `--mmproj`；只给 `--image` 而不给
+CLI 单次推理带图像（Pixtral 视觉需要投影器；CLI 会自动找到模型旁的
+`*mmproj*istral*.gguf`，否则请传 `--mmproj`；只给 `--image` 而不给
 `--input` 时会使用默认的描述图片提示词；CLI 采样默认为 greedy，
 `--max-tokens` 默认为 100）：
 
@@ -334,7 +336,7 @@ mm.linear_2.weight                         # projector linear 2
 `Forward(int[] tokens)` 跑 per-op 托管循环：
 
 - Embedding lookup。
-- `<image_pad>` 标记位置可选视觉注入。
+- 在展开后的 `[IMG]` 行所在位置可选视觉注入。
 - 每层：RMSNorm，QKV（融合或拆开），带 YaRN 校正频率的 RoPE，可选位置相关 Q 缩放，attention，输出投影 + residual，FFN，residual。
 - prefill 时 residual 在 `output_norm` 之前 narrow 到最后一个 token，让 LM head matmul 只产出一行。
 - 最终 RMSNorm、LM head、拷贝到 `_logitsBuffer`。
@@ -372,9 +374,9 @@ Mistral 3 是 TensorSharp 中 `IBatchedPagedModel.ForwardBatch` 的**参考实�
 
 关键特性：
 
-- **默认启用，无需 opt-in 环境变量。** Mistral 3 的连续批处理始终可用；服务的
-  `--no-continuous-batching` 会强制所有模型（包括 Mistral 3）走旧的单序列
-  KV 交换路径。
+- **默认启用，无需 opt-in 环境变量。** Mistral 3 的连续批处理始终可用；
+  `--no-continuous-batching`（服务端与 CLI 均支持）会强制所有模型（包括 Mistral 3）
+  走旧的单序列 KV 交换路径。
 - **每层分页 K/V 缓冲区**，布局 `[numBlocks * blockSize * numKvHeads * headDim]`，
   由 `EnsurePagedBuffersAllocated` 按需扩容。"扩容"路径会把已有 K/V 拷贝到新
   缓冲区，避免已经在调度中的序列丢失状态。
@@ -422,13 +424,14 @@ Mistral 3 是 TensorSharp 中 `IBatchedPagedModel.ForwardBatch` 的**参考实�
 
 **前缀缓存验证**：在同一组长上下文运行中，引擎在 4 个序列间共享了 6 个完整
 prompt 块（`reused=1536`、`hashedCached=3`），首次在真实 GGUF 上端到端验证
-前缀缓存路径。
+前缀缓存路径。该运行早于 Radix 前缀缓存；Radix 如今是默认的复用模式（Mistral 3 以
+分页家族的身份参与），当时测到的块级哈希共享仍可用 `TS_PREFIX_CACHE_MODE=legacy` 选择。
 
 ## 12. 输出解析器与聊天模板
 
 - `PassthroughOutputParser` —— Mistral 3 没有思维链 / 工具调用 wire 格式。
-- 聊天模板使用 Mistral 标准格式（`[INST]...[/INST]<s>...</s>`）。GGUF 缺少 Jinja2 模板时回退到内置硬编码模板。
-- 图像占位符为 `<image_pad>`，`ChatTemplate.ExpandImageTokens` 把每个 `<image_pad>` 展开为对应图像所需 token 数。
+- 聊天模板始终使用 TensorSharp 自己的 `ChatTemplate.RenderMistral3`（协议优先于 GGUF 的 Jinja）：开头的 system 消息渲染为 `[SYSTEM_PROMPT]...[/SYSTEM_PROMPT]`，每个 user 轮次渲染为 `[INST]...[/INST]`，assistant 轮次以纯文本追加。工具声明与 `role: "tool"` 消息都不会被渲染。
+- 每张图像在用户文本之前是一个 `[IMG]` 占位符。注入器（`ProcessMistral3History`）把它展开为该图像按行排列的 `[IMG]` token，每行之后跟 `[IMG_BREAK]`，最后一行之后跟 `[IMG_END]`（见 [llama.cpp 投影器文件](#llamacpp-投影器文件)）。
 
 ## 13. 优化机会
 

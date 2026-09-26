@@ -117,7 +117,7 @@ public sealed class KvStateFingerprintNonEmptyTests
         Assert.NotEqual(dsa, nativeDsa);
     }
 
-    [Fact]
+    [GgmlFact(BackendType.GgmlCpu)]
     public void Glm_SyntheticCheckpoints_ReportDistinctNonEmptyFingerprints()
     {
         // End to end through the real constructors: the tiny glm-dsa and glm5next

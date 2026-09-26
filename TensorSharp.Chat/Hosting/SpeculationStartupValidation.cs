@@ -33,8 +33,9 @@ namespace TensorSharp.Server.Hosting
         /// draft loaded successfully or no draft was requested.
         /// </param>
         /// <param name="refusedByModel">
-        /// True when the loaded model refuses speculation itself; the hint then
-        /// says to drop the flag instead of suggesting another draft file.
+        /// True when the loaded model refuses the drafter itself (it refuses
+        /// speculation, or it is tensor-parallel and the drafter is DFlash); the hint
+        /// then says to drop the flag instead of suggesting another draft file.
         /// </param>
         public static string GetFatalActivationError(string activationError, bool refusedByModel = false)
         {
@@ -44,8 +45,8 @@ namespace TensorSharp.Server.Hosting
             if (refusedByModel)
             {
                 return "Speculative decoding was requested via --draft-model but the loaded model refuses it: " +
-                       activationError + " No draft GGUF changes that; drop --draft-model to serve this model " +
-                       "with plain decoding.";
+                       activationError + " No other draft GGUF changes that; drop --draft-model to serve this " +
+                       "model with plain decoding.";
             }
 
             return "Speculative decoding was requested via --draft-model but the draft head " +

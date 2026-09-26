@@ -16,7 +16,7 @@
 <main class="content" id="content">
   <div class="breadcrumb"><a href="index_zh-cn.html">首页</a> › 智能体工作流</div>
   <h1>智能体工作流</h1>
-  <p class="lede">TensorSharp.AgentHost 把本地模型的一次回复变成有界的<strong>生成 → 检查 → 运行 → 修复 → 回答</strong>循环。它只在需要时加载 Agent Skills（智能体技能），通过四个内置代码工具处理文件，在操作系统沙箱中运行检查，并向普通 CLI、Web UI、Ollama 或 OpenAI 客户端返回完成的产物。</p>
+  <p class="lede">TensorSharp.AgentHost 把本地模型的一次回复变成有界的<strong>生成 → 检查 → 运行 → 修复 → 回答</strong>循环。它只在需要时加载 Agent Skills（智能体技能），通过四个内置代码工具处理文件，在操作系统沙箱中运行检查，把服务端请求中相互独立的部分交给有界子智能体，并向普通 CLI、Web UI、Ollama 或 OpenAI 客户端返回完成的产物。</p>
 
   <h2 id="flow">一轮请求里发生什么</h2>
   <ol class="steps">
@@ -25,22 +25,30 @@
     <li><h3>完成实际工作</h3><p>若运维方启用了 <code>--code-exec</code>，模型便可在请求或聊天工作区中检查、编辑、新建、打补丁并测试文件。技能脚本也能参与，但必须单独选择允许执行。</p></li>
     <li><h3>返回普通答案</h3><p>客户端收到最终完成结果，而不是 TensorSharp 内部工具调用。调用方自带的工具绝不会由 TensorSharp 执行；这些调用仍会正常返回给调用方处理。</p></li>
   </ol>
-  <div class="callout note"><div class="ic">🎯</div><p><strong>当前范围是单个模型与单条进程内工具循环。</strong>TensorSharp 不会生成多个智能体，也不会把任务委派给子智能体；每条命令执行前也没有交互式审批队列。运维方在 CLI 或服务器启动时授予或拒绝技能、脚本执行、代码执行、联网与安装能力；之后内置工具只能按该策略运行，否则拒绝。</p></div>
+  <div class="callout note"><div class="ic">🎯</div><p><strong>同一个已加载模型、进程内工具，以及有界子智能体。</strong>在服务端聊天路径上，支持工具的模型还可以把独立的工作委派给运行在同一个已加载模型上的<a href="#sub-agents">子智能体</a>；CLI 只运行单个智能体。每条命令执行前没有交互式审批队列。运维方在 CLI 或服务器启动时授予或拒绝技能、脚本执行、代码执行、联网与安装能力；之后内置工具只能按该策略运行，否则拒绝。</p></div>
 
   <h2 id="ios">iPhone 与 iPad 上的 TensorAgent</h2>
-  <p><strong>TensorAgent</strong> 将本地聊天与智能体体验打包为 .NET MAUI iOS/iPadOS 应用。引擎以 iOS <code>.xcframework</code> 静态链接，在真机上使用 <code>ggml_metal</code>。应用与 CLI、服务端共享与宿主无关的聊天流水线（<code>TensorSharp.Chat</code>）；由于 iOS 没有 ASP.NET Core runtime pack，UI 通过进程内 loopback server 提供。共享的是 API 而不是页面：手机上是它自己的页面，按拇指而不是鼠标与宽窗口来排布，但绑定同一套 <code>WebUiChatService</code> 与 <code>SkillsService</code> 路由。</p>
+  <p><strong>TensorAgent</strong> 将本地聊天与智能体体验打包为 .NET MAUI iOS/iPadOS 应用。引擎以 iOS <code>.xcframework</code> 静态链接，在真机上使用 <code>ggml_metal</code>，真机上的备选后端是 <code>ggml_cpu</code>，模拟器上也只有 <code>ggml_cpu</code>；iOS 端不构建 MLX。应用与服务端共享与宿主无关的聊天流水线（<code>TensorSharp.Chat</code>）；由于 iOS 没有 ASP.NET Core runtime pack，UI 通过进程内 loopback server 提供。共享的是 API 而不是页面：手机上是它自己的页面，按拇指而不是鼠标与宽窗口来排布，但绑定同一套 <code>WebUiChatService</code> 与 <code>SkillsService</code> 路由。</p>
   <p>模型支持断点续传与 SHA-256 校验并下载到设备；会话可跨应用重启保留；照片、相机、视频、文件和听写使用同一套聊天附件流程。由于 iOS 不能启动子进程，TensorAgent 的 shell、Python 与 JavaScript 集成由运行时提供，并明确报告能力边界。</p>
   <p>手机相对桌面多出三条约束，以及应用对每一条的处理：</p>
   <div class="table-scroll">
   <table>
     <thead><tr><th>约束</th><th>应用的处理</th></tr></thead>
     <tbody>
-      <tr><td>回答过程中屏幕被切走</td><td>生成过程归宿主侧的管理器所有，而不属于 WebView——视图离开窗口后 WebKit 会挂起该页面。应用切到后台时这一轮继续生成，返回时页面重新挂接上去。</td></tr>
+      <tr><td>回答过程中屏幕被切走</td><td>生成过程归宿主侧的管理器所有，而不属于 WebView——视图离开窗口后 WebKit 会挂起该页面。在应用内切换到其他页面时，这一轮继续生成。应用离开前台时，由于 iOS 禁止后台 GPU 工作，引擎会在步与步之间暂停；这一轮保留自己的进度与缓存，应用回到前台后继续生成，页面也会重新挂接上去。</td></tr>
       <tr><td>每次启动的第一条消息都要为整段共享前缀买单</td><td>所有会话共享的那段提示词末尾的状态，会按模型持久化到磁盘，并在下次启动时于准入阶段恢复。在 iPhone 17 Pro Max 上以 Qwen3.5 9B 实测：原本 54 秒的冷启动首条消息，变成 1.2 秒预热加约 0.6 秒的首条消息。</td></tr>
       <tr><td>iOS jetsam 杀进程时既无栈也无消息</td><td>引擎的内存策略按 jetsam 实际计费的口径设定——被 wire 住的文件页算在设备头上而不是进程头上——因此缓存从小起步按需增长，单个请求只预留有界的回复长度，收到内存警告时释放那些只为下一次请求提速的部分。</td></tr>
     </tbody>
   </table>
   </div>
+  <p>应用面向 iPhone 与 iPad（arm64，iOS 17.0 及以上）。它采用 scene 生命周期——用 iOS 27 SDK 构建时必须如此才能启动；已记录的真机运行均在 iOS 26.6.1 上。内置模型目录——Gemma 4 E2B、E4B 与 12B、Qwen3.5 9B，以及仅支持本地导入、标为实验性的 Bonsai 8B 与 27B——只向 12 GB 及以上内存档位的设备提供。以下几点与桌面宿主不同：</p>
+  <ul>
+    <li><strong>推测解码默认开启</strong>——Gemma 4 E4B 与 12B 在已下载草稿头时使用草稿头，否则在模型支持推测解码时使用 n-gram 查找。修改该设置会从下一条回复起作用于正在运行的引擎。</li>
+    <li><strong>子智能体委派默认开启，并有开关</strong>（<a href="#sub-agents">见下文</a>）。设置 &gt; Sandbox &gt;“Sub-agents”可从下一条消息起关闭它，像 <code>--no-multi-agent</code> 一样不再声明协调工具；上限保持宿主默认值，手机页面也不显示子智能体面板。</li>
+    <li><strong>生成的文件用 Quick Look 打开</strong>，无法预览时回退到分享面板。</li>
+    <li><strong>“Ask TensorAgent” 分享扩展</strong>可把其他应用中的网页、照片、文件或文本带进聊天，并提供 Summarize、Key points、Translate 等预设。</li>
+  </ul>
+  <p>同一个 <code>AgentAppHost</code> 也能运行在 macOS、Linux 与 Windows 上。在这些平台上，<code>AgentExecutionMode.Auto</code>（或 <code>Process</code>）会以原生进程、在桌面 OS 沙箱中运行命令与技能脚本，而不是使用内嵌运行时。设置了 <code>networkHosts</code> 白名单时，这一桌面后端会拒绝需要联网的启动，而不是放宽它无法强制执行的访问范围。</p>
   <p>构建、模拟器、真机与验证步骤见 <a href="https://github.com/zhongkaifu/TensorSharp/blob/main/TensorAgent/README.md" target="_blank" rel="noopener">TensorAgent README</a>。</p>
 
   <h2 id="skills">Agent Skills 与渐进式披露</h2>
@@ -66,6 +74,8 @@
   </div>
   <p>正常元数据块约使用上下文窗口的 2%，并限制在大约 1,024–10,000 token。旧版“把所有选中技能正文预先内联”的行为默认关闭。无法携带并解析工具声明的模型家族没有机会调用 <code>skills_read</code>，因此 TensorSharp 会在有界回退预算内直接内联所选技能正文，同时不再宣传根本无法加载的技能。</p>
   <p>内置技能工具是 <code>skills_list</code> 与 <code>skills_read</code>。只有传入 <code>--skills-allow-exec</code> 才会出现第三个工具 <code>skills_run</code>。技能脚本默认不允许运行，并且始终与模型生成代码的执行权限分开控制。</p>
+  <h3 id="skill-roots">技能从哪里来</h3>
+  <p><code>--skills-dir</code>（可重复）或 <code>TS_SKILLS_DIR</code> 显式指定技能根目录。两者都未给出时，CLI 与服务端会从当前工作目录向上直到 Git 仓库根目录，依次查找每个已存在的 <code>.agents/skills</code> 目录（离得最近的优先；不在仓库内时只检查当前工作目录），另外还有二进制文件旁边的 <code>skills</code> 目录（不存在时自动创建）。CLI 最后才查找这个目录。在服务端，它同时是上传目录，因此总会被扫描，而且最先扫描：同名时上传的技能优先；即使用 <code>--skills-dir</code> 或 <code>TS_SKILLS_DIR</code> 替换了 <code>.agents/skills</code> 默认根，它也仍在列表中。个人或全局技能目录绝不会被隐式导入。</p>
 
   <h2 id="code-tools">四个代码工具，默认关闭</h2>
   <p><code>--code-exec</code> 会加入一套补丁优先的代码工作面。它不要求安装技能；仅安装或选中技能也不会自动开启它。</p>
@@ -74,7 +84,7 @@
     <thead><tr><th>工具</th><th>用途</th><th>关键边界</th></tr></thead>
     <tbody>
       <tr><td><code>read_file</code></td><td>按行号读取工作区中的真实字节。</td><td>输出有界；路径必须留在工作区内。</td></tr>
-      <tr><td><code>write_file</code></td><td>新建文件。</td><td>限制在工作区内；已有文件使用 <code>apply_patch</code> 修改。</td></tr>
+      <tr><td><code>write_file</code></td><td>新建文件。</td><td>限制在工作区内；路径已存在时会被拒绝，已有文件通过 <code>apply_patch</code> 修改。</td></tr>
       <tr><td><code>apply_patch</code></td><td>通过带锚点的 hunk 修改单个或多个文件，包括单行修改；也支持新建、重命名与删除文件。</td><td>原子操作：全部 hunk 成功，否则一个也不落地。</td></tr>
       <tr><td><code>shell</code></td><td>运行测试、命令与生成的程序。</td><td>有超时与输出上限；受支持主机上必须沙箱化，否则拒绝。</td></tr>
     </tbody>
@@ -108,7 +118,7 @@
     </tbody>
   </table>
   </div>
-  <div class="callout warn"><div class="ic">⚠️</div><p><strong>沙箱并不等于一次性虚拟机。</strong>macOS 为兼容性有意保留共享 <code>/private/tmp</code> 与部分本地 Unix IPC。Seatbelt 限制会传递给子进程，普通进程组也会被停止，但有意脱离的子进程可能活过本次请求；每次工具结果都会报告这一缺口。Linux 即使禁止 IP 网络，也仍共享宿主网络命名空间的某些部分。每项平台缺口都必须认真对待。不要在他人可访问的服务器上启用非受限执行。</p></div>
+  <div class="callout warn"><div class="ic">⚠️</div><p><strong>沙箱并不等于一次性虚拟机。</strong>macOS 为兼容性有意保留对共享 <code>/private/tmp</code> 与每用户 Darwin 临时目录的访问，以及部分本地 Unix IPC。Seatbelt 限制会传递给子进程，普通进程组也会被停止，但有意脱离的子进程可能活过本次请求；每次工具结果都会报告这一缺口。Linux 即使禁止 IP 网络，也仍共享宿主网络命名空间的某些部分。每项平台缺口都必须认真对待。不要在他人可访问的服务器上启用非受限执行。</p></div>
 
   <h3 id="network">网络与软件包安装是彼此独立的授权</h3>
   <div class="table-scroll">
@@ -122,6 +132,15 @@
   </table>
   </div>
   <p><code>--code-exec-packages</code>、<code>--code-exec-install-index</code> 与 <code>--code-exec-install-domains</code> 约束的是宿主安装器。一旦开放模型命令的无限制网络，它们就不再是安全边界，因为生成代码可以直接下载产物。技能脚本与代码工具的网络开关有意彼此独立。</p>
+
+  <h2 id="playwright">浏览器自动化：Playwright 技能</h2>
+  <p>浏览器“computer use”是一个技能，而不是运行时功能：没有屏幕或鼠标工具，也没有浏览器桥接。<code>TensorAgent/skills</code> 中的 <code>playwright</code> 技能包通过 <code>skills_run</code> 和一个包装脚本驱动真实浏览器，该脚本用 <code>npx</code> 运行固定版本的 <code>@playwright/cli</code>。它的说明涵盖导航、填写表单、快照、截图与数据提取，在信息缺失时向用户询问，以及遇到登录或 CAPTCHA 时把有界面的持久化浏览器交给用户处理。</p>
+  <pre data-lang="bash"><code>dotnet run --project TensorSharp.Server.Host -c Release -- \
+  --model models/model.gguf --backend ggml_metal --host 127.0.0.1 \
+  --skills-dir ./TensorAgent/skills \
+  --skills-allow-exec --skills-allow-network \
+  --code-exec --code-exec-allow-install --code-exec-allow-network</code></pre>
+  <p>除这些授权外，宿主上还需要真实的 Node.js、npm 与 npx。在 macOS 上，技能会让模型用 <code>write_file</code> 创建 <code>.playwright/cli.config.json</code> 来关闭 Chromium 自己的沙箱，因为已被 Seatbelt 约束的进程无法再启动第二层沙箱；外层 Seatbelt 沙箱仍然开启。它只在 macOS arm64 上验证过，未在 Linux 或 Windows 上验证。iOS 应用包不包含它，因为 iOS 没有子进程，也没有 Node.js；<code>TensorAgent/skills</code> 仍为桌面宿主保留它。配置、账号交接与实测记录见 <a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/playwright_agent.md" target="_blank" rel="noopener">docs/playwright_agent.md</a>。</p>
 
   <h2 id="start">启动一个智能体会话</h2>
   <p>使用技能并不要求执行代码：</p>
@@ -154,8 +173,42 @@
 }</code></pre>
   <p><code>skills_discovery</code> 默认为 <code>true</code>。代码执行没有按请求开启的字段：运维方要么以 <code>--code-exec</code> 启动宿主，要么四个工具根本不会出现。智能体循环默认最多 8 个内部轮次；开启代码执行后默认 24 个；<code>--skills-max-rounds</code> 可明确设置 1–64 的上限。</p>
 
+  <h2 id="sub-agents">子智能体：有界委派</h2>
+  <p>在服务端聊天路径上——OpenAI <code>/v1/chat/completions</code> 与 <code>/v1/responses</code>、Ollama <code>/api/chat/ollama</code>，以及 Web UI 的 <code>/api/chat</code>——支持工具的模型可以把请求中相互独立的部分交给子智能体，再把它们的报告整合成一个答案。委派默认开启，是否使用由模型决定；不会强制生成子智能体。它既不依赖技能，也不依赖 <code>--code-exec</code>：五个协调工具会单独提供。</p>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>工具</th><th>行为</th></tr></thead>
+    <tbody>
+      <tr><td><code>spawn_agent(task_name, task, agent_type?)</code></td><td>启动一个子智能体并立即返回其 ID。<code>agent_type</code> 为 <code>explorer</code>（默认）、<code>reviewer</code> 或 <code>worker</code>。</td></tr>
+      <tr><td><code>wait_agent(agent_id?, timeout_ms?)</code></td><td>等待某个直接子智能体；省略 ID 时等待全部直接子智能体。默认 10,000 ms，最长 60,000 ms。超时并不代表已完成。</td></tr>
+      <tr><td><code>send_input(agent_id, message)</code></td><td>为运行中的子智能体排入一条后续消息，在其下一个生成边界送达；对已完成的子智能体则开始新的一轮。</td></tr>
+      <tr><td><code>close_agent(agent_id)</code></td><td>取消一个子智能体及其所有后代。</td></tr>
+      <tr><td><code>list_agents()</code></td><td>报告直接子智能体及其状态。</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>每个子智能体都运行在同一个已加载模型上，沿用父智能体的 token 上限、思考模式与采样设置。它从父智能体的 system/developer 指令和一份自包含的任务开始，拿不到父智能体的对话记录与附件，并返回一份有界报告。<code>explorer</code> 与 <code>reviewer</code> 始终只读：除五个协调工具外（因此子智能体可在 <code>--agents-max-depth</code> 范围内继续委派），只能使用 <code>skills_list</code>、<code>skills_read</code>，以及父智能体拥有时的 <code>read_file</code>。<code>worker</code> 默认同样只读；只有服务端以 <code>--agents-allow-worker-tools</code> 启动、且它的父级是根智能体或另一个可写的 <code>worker</code> 时，它才能使用父智能体已启用的可写工具，因此委派永远不会扩大权限。可写的 <code>worker</code> 与父智能体共享工作区与沙箱，只读子智能体读取的也是同一个工作区；不创建 Git worktree，也不做合并。调用方自己的工具绝不会传给子智能体；同一请求树中的宿主工具调用一次只执行一个。每个子智能体得到的是 KV 状态的独立副本，而不是共享页面。父智能体 prefill 之前，宿主会先为它与子智能体共享的前缀建立检查点，子智能体可以直接恢复这段前缀，而不必重新计算。</p>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>服务端选项</th><th>默认</th><th>范围与含义</th></tr></thead>
+    <tbody>
+      <tr><td><code>--no-multi-agent</code></td><td>委派开启</td><td>关闭委派。把 <code>TS_NO_MULTI_AGENT</code> 设为 <code>0</code> 以外的任意值效果相同。</td></tr>
+      <tr><td><code>--agents-max-concurrent</code></td><td>3</td><td>1–32 个同时活跃的后代，不含根智能体</td></tr>
+      <tr><td><code>--agents-max-count</code></td><td>8</td><td>每棵请求树 1–128 个子智能体</td></tr>
+      <tr><td><code>--agents-max-depth</code></td><td>2</td><td>根以下 1–8 层</td></tr>
+      <tr><td><code>--agents-max-rounds</code></td><td>8</td><td>每个子智能体每轮 1–64 个工具回合</td></tr>
+      <tr><td><code>--agents-max-generations</code></td><td>48</td><td>每个请求 1–1024 次子智能体生成</td></tr>
+      <tr><td><code>--agents-timeout</code></td><td>180 秒</td><td>每次子智能体运行 1–3600 秒</td></tr>
+      <tr><td><code>--agents-max-result-chars</code></td><td>8000</td><td>每份报告 256–64000 个字符</td></tr>
+      <tr><td><code>--agents-allow-worker-tools</code></td><td>关闭</td><td>允许 <code>worker</code> 使用父智能体已启用的可写工具</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>请求可以用 <code>"multi_agent": false</code> 退出委派；但它不能在宿主已关闭委派时重新开启，也不能提高任何上限或启用 worker 工具。<code>wait_agent</code> 运行期间，Web UI 的活动行带有一个可展开的面板，为每个子智能体显示一张实时卡片（任务、状态、当前工具、结果）。OpenAI 与 Ollama 响应只包含父智能体的文本。CLI 与 Ollama <code>/api/generate</code> 不做委派。TensorAgent 沿用宿主的默认上限，设置中有一个“Sub-agents”开关（默认开启），可从下一条消息起关闭委派。</p>
+  <p>只有能渲染工具声明并解析工具调用的家族才会得到这些工具——Mistral 3、Hunyuan Dense 与 DiffusionGemma 不会——结构化输出请求也永远不会。没有按模型大小设置的门槛。项目没有发布任何延迟、质量或委派率的测量数据。委派会额外消耗 token 与上下文，是否有益取决于具体工作负载。详见 <a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/multi_agent.md" target="_blank" rel="noopener">docs/multi_agent.md</a>。</p>
+
   <h2 id="compatibility">模型家族限制</h2>
-  <p>进程内循环要求模型家族既能携带工具声明，也能解析工具调用。不支持这种往返的家族会以内联方式获得选中的技能说明作为回退，但不会得到四个代码工具。TensorSharp 会记录这一限制，而不是假装代码执行可用。</p>
+  <p>进程内循环要求模型家族既能携带工具声明，也能解析工具调用。不支持这种往返的家族会以内联方式获得选中的技能说明作为回退，但不会得到四个代码工具或子智能体工具；在受支持的家族中，这包括 Mistral 3、Hunyuan Dense 与 DiffusionGemma。Qwen 3.8 Flash Next 现已能完成这种往返。TensorSharp 会记录这一限制，而不是假装代码执行可用。</p>
 
   <div class="content-footer">
     <a href="server_zh-cn.html">← 服务器与 Web UI</a>

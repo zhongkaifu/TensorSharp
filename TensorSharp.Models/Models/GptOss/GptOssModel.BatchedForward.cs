@@ -23,7 +23,7 @@
 //   - Per-layer paged K/V buffers (single kvDim — GptOss doesn't vary per layer)
 //   - Batched attention with sinks via ManagedPagedAttention.ForwardWithSinks
 //   - Batched MoE via MoEForward(numTokens) (matches Nemotron Phase 7 pattern)
-//   - Opt-in via TS_GPTOSS_BATCHED env var (default OFF)
+//   - Default ON; TS_GPTOSS_BATCHED=0 withdraws it for A/B comparison
 using System;
 using System.Collections.Generic;
 using TensorSharp;
@@ -36,10 +36,13 @@ namespace TensorSharp.Models
 {
     public partial class GptOssModel : IBatchedPagedModel
     {
-        // Default ON. The batched paged-attention path is the only way two
-        // concurrent requests can be served truly in parallel on this model
-        // (the per-sequence fallback forwards at most one sequence per step,
-        // so a second request stalls until the first releases the executor).
+        // Default ON. On GGML backends without tensor parallelism concurrent
+        // requests are served by the per-request KV holders and the
+        // token-batched fused decode (GptOssModel.PerSeqCache.cs), which do not
+        // read this switch. Elsewhere this batched paged-attention path is the
+        // only way two concurrent requests run truly in parallel: the legacy
+        // per-sequence fallback forwards at most one sequence per step, so a
+        // second request stalls until the first releases the executor.
         // Correctness was previously validated against the legacy path by
         // GptOssBatchedCorrectnessTests with TS_GPTOSS_BATCHED=1. Set
         // TS_GPTOSS_BATCHED=0 (or "false") to force the legacy fallback for

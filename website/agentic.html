@@ -16,7 +16,7 @@
 <main class="content" id="content">
   <div class="breadcrumb"><a href="index.html">Home</a> › Agentic Work</div>
   <h1>Agentic Work</h1>
-  <p class="lede">TensorSharp.AgentHost turns a local model response into a bounded <strong>generate → inspect → run → repair → answer</strong> loop. It can load Agent Skills only when they are needed, work with files through four built-in code tools, run checks inside an OS sandbox, and return finished artifacts to an ordinary CLI, Web UI, Ollama, or OpenAI client.</p>
+  <p class="lede">TensorSharp.AgentHost turns a local model response into a bounded <strong>generate → inspect → run → repair → answer</strong> loop. It can load Agent Skills only when they are needed, work with files through four built-in code tools, run checks inside an OS sandbox, hand independent parts of a server request to bounded sub-agents, and return finished artifacts to an ordinary CLI, Web UI, Ollama, or OpenAI client.</p>
 
   <h2 id="flow">What happens in one turn</h2>
   <ol class="steps">
@@ -25,22 +25,30 @@
     <li><h3>Do the work</h3><p>If the operator enabled <code>--code-exec</code>, the model can inspect, edit, create, patch, and test files in a request or chat workspace. Skill scripts can participate too, but only under their separate execution opt-in.</p></li>
     <li><h3>Return an ordinary answer</h3><p>The client receives the final completion rather than TensorSharp's internal tool calls. A caller's own tools are never executed by TensorSharp; those calls are returned normally for the caller to service.</p></li>
   </ol>
-  <div class="callout note"><div class="ic">🎯</div><p><strong>Current scope is one model and one in-process tool loop.</strong> TensorSharp does not spawn multiple agents or delegate to subagents, and it has no interactive approval queue before each command. The operator grants or withholds skills, script execution, code execution, networking, and installation when the CLI or server starts; an internal tool then runs under that policy or refuses.</p></div>
+  <div class="callout note"><div class="ic">🎯</div><p><strong>One loaded model, in-process tools, and bounded sub-agents.</strong> On the server's chat paths a tool-capable model can also delegate independent work to <a href="#sub-agents">sub-agents</a> that run on the same loaded model; the CLI runs a single agent. There is no interactive approval queue before each command. The operator grants or withholds skills, script execution, code execution, networking, and installation when the CLI or server starts; an internal tool then runs under that policy or refuses.</p></div>
 
   <h2 id="ios">TensorAgent on iPhone and iPad</h2>
-  <p><strong>TensorAgent</strong> packages this local chat and agent experience as a .NET MAUI iOS/iPadOS app. The engine is statically linked as an iOS <code>.xcframework</code> and uses <code>ggml_metal</code> on physical devices. The app shares the host-neutral chat pipeline (<code>TensorSharp.Chat</code>) with the CLI and server, but serves the UI through an in-process loopback server because iOS has no ASP.NET Core runtime pack. What it shares is the API, not the document: the phone gets its own page, laid out for a thumb rather than a mouse and a wide window, bound to the same <code>WebUiChatService</code> and <code>SkillsService</code> routes.</p>
+  <p><strong>TensorAgent</strong> packages this local chat and agent experience as a .NET MAUI iOS/iPadOS app. The engine is statically linked as an iOS <code>.xcframework</code> and uses <code>ggml_metal</code> on physical devices, with <code>ggml_cpu</code> as the alternative there and the only backend in the simulator; MLX is not built for iOS. The app shares the host-neutral chat pipeline (<code>TensorSharp.Chat</code>) with the server, but serves the UI through an in-process loopback server because iOS has no ASP.NET Core runtime pack. What it shares is the API, not the document: the phone gets its own page, laid out for a thumb rather than a mouse and a wide window, bound to the same <code>WebUiChatService</code> and <code>SkillsService</code> routes.</p>
   <p>Models download to the device with resume and SHA-256 verification; conversations survive app restarts; photos, camera, video, files, and dictation use the same chat attachment flow. Since iOS cannot start child processes, TensorAgent's shell, Python, and JavaScript integrations are runtime-backed and report their limits explicitly.</p>
   <p>Three constraints a phone imposes that a desktop does not, and what the app does about each:</p>
   <div class="table-scroll">
   <table>
     <thead><tr><th>Constraint</th><th>What the app does</th></tr></thead>
     <tbody>
-      <tr><td>The screen goes away mid-answer</td><td>Generation belongs to a host-side manager, not to the WebView — WebKit suspends a page whose view left the window. A turn continues while the app is backgrounded and the page re-attaches to it on return.</td></tr>
+      <tr><td>The screen goes away mid-answer</td><td>Generation belongs to a host-side manager, not to the WebView — WebKit suspends a page whose view left the window. A turn keeps running while you move to another screen in the app. When the app leaves the foreground the engine pauses between steps, because iOS forbids GPU work in the background; the turn keeps its place and its cache, resumes when the app is active again, and the page re-attaches to it.</td></tr>
       <tr><td>The first message of a launch pays for the whole shared prefix</td><td>The state at the end of the prompt every chat shares is checkpointed to disk per model and restored at admission on the next launch. Measured on iPhone 17 Pro Max with Qwen3.5 9B: a 54 s cold first message becomes a 1.2 s warm-up and a ~0.6 s first message.</td></tr>
       <tr><td>iOS jetsam kills without a stack or a message</td><td>The engine's memory policy is sized against what jetsam charges — wired file pages count against the device, not the process — so caches start small and grow, a request reserves a bounded reply, and a memory warning releases what only serves the next request's speed.</td></tr>
     </tbody>
   </table>
   </div>
+  <p>The app targets iPhone and iPad (arm64, iOS 17.0 or later). It uses the scene lifecycle, which a build against the iOS 27 SDK needs in order to launch; the recorded physical-device runs are on iOS 26.6.1. Its built-in catalog — Gemma 4 E2B, E4B and 12B, Qwen3.5 9B, and the sideload-only, experimental Bonsai 8B and 27B — is offered on devices in the 12 GB memory tier and above. Several behaviors differ from the desktop hosts:</p>
+  <ul>
+    <li><strong>Speculative decoding is on by default</strong> — a draft head for Gemma 4 E4B and 12B when one was downloaded, n-gram lookup otherwise where the model supports speculation. Changing the setting applies to the running engine from the next reply.</li>
+    <li><strong>Sub-agent delegation is on by default, with a switch</strong> (<a href="#sub-agents">see below</a>). Settings &gt; Sandbox &gt; "Sub-agents" turns it off from the next message, withholding the coordination tools as <code>--no-multi-agent</code> does; the limits stay at the host defaults, and the phone page shows no sub-agent panel.</li>
+    <li><strong>Generated files open in Quick Look</strong>, with the share sheet as the fallback.</li>
+    <li><strong>An “Ask TensorAgent” share extension</strong> brings a web page, photo, file, or text from another app into a chat, with presets such as Summarize, Key points, and Translate.</li>
+  </ul>
+  <p>The same <code>AgentAppHost</code> also runs on macOS, Linux, and Windows. There, <code>AgentExecutionMode.Auto</code> (or <code>Process</code>) runs commands and skill scripts as native processes under the desktop OS sandbox instead of the embedded runtimes. When a <code>networkHosts</code> allow-list is set, that desktop backend refuses network-enabled launches rather than broadening access it cannot enforce.</p>
   <p>See the <a href="https://github.com/zhongkaifu/TensorSharp/blob/main/TensorAgent/README.md" target="_blank" rel="noopener">TensorAgent README</a> for build, simulator, device, and verification instructions.</p>
 
   <h2 id="skills">Agent Skills and progressive disclosure</h2>
@@ -66,6 +74,8 @@
   </div>
   <p>The normal metadata block uses about 2% of the context window, clamped to roughly 1,024–10,000 tokens. The old behavior that inlined every selected body is off by default. A model family that cannot carry and parse tool declarations has no opportunity to call <code>skills_read</code>, so TensorSharp instead inlines selected skill bodies within a bounded fallback budget and does not advertise skills it cannot load.</p>
   <p>The built-in skill tools are <code>skills_list</code> and <code>skills_read</code>. A third tool, <code>skills_run</code>, appears only with <code>--skills-allow-exec</code>. Script execution is off by default and remains separate from model-authored code execution.</p>
+  <h3 id="skill-roots">Where skills come from</h3>
+  <p><code>--skills-dir</code> (repeatable) or <code>TS_SKILLS_DIR</code> names the roots explicitly. Without either, the CLI and server search every existing <code>.agents/skills</code> directory from the working directory up to the Git repository root, nearest first (outside a repository, only the working directory), plus the <code>skills</code> folder beside the binary, which is created if it is missing. The CLI searches that folder last. On the server it is also the upload directory, so it is always scanned, and scanned first: an uploaded skill wins a name clash, and it stays in the list even when <code>--skills-dir</code> or <code>TS_SKILLS_DIR</code> replaces the <code>.agents/skills</code> defaults. Personal or global skill folders are never imported implicitly.</p>
 
   <h2 id="code-tools">Four code tools, off by default</h2>
   <p><code>--code-exec</code> adds a patch-first coding surface. It does not require a skill, and merely installing or selecting a skill does not turn it on.</p>
@@ -74,7 +84,7 @@
     <thead><tr><th>Tool</th><th>Purpose</th><th>Important bound</th></tr></thead>
     <tbody>
       <tr><td><code>read_file</code></td><td>Read real workspace bytes with line numbers.</td><td>Bounded output; paths stay inside the workspace.</td></tr>
-      <tr><td><code>write_file</code></td><td>Create a new file.</td><td>Confined to the workspace; use <code>apply_patch</code> for existing files.</td></tr>
+      <tr><td><code>write_file</code></td><td>Create a new file.</td><td>Confined to the workspace; an existing path is refused, so existing files change through <code>apply_patch</code>.</td></tr>
       <tr><td><code>apply_patch</code></td><td>Modify one file or multiple files by anchored hunks, including a single-line change; also create, rename, or delete files.</td><td>Atomic: all hunks apply or none do.</td></tr>
       <tr><td><code>shell</code></td><td>Run tests, commands, and generated programs.</td><td>Timeout and output caps; sandbox-or-refuse on supported hosts.</td></tr>
     </tbody>
@@ -108,7 +118,7 @@
     </tbody>
   </table>
   </div>
-  <div class="callout warn"><div class="ic">⚠️</div><p><strong>Sandboxed does not mean a disposable VM.</strong> macOS deliberately retains shared <code>/private/tmp</code> compatibility and some local Unix IPC. Seatbelt restrictions pass to children and ordinary process groups are stopped, but a deliberately detached child can outlive the request; every tool result reports that gap. Linux shares parts of the host network namespace even while IP networking is denied. Every reported platform gap matters. Do not enable unconfined execution on a server other people can reach.</p></div>
+  <div class="callout warn"><div class="ic">⚠️</div><p><strong>Sandboxed does not mean a disposable VM.</strong> macOS deliberately retains access to shared <code>/private/tmp</code> and the per-user Darwin temp directory for compatibility, plus some local Unix IPC. Seatbelt restrictions pass to children and ordinary process groups are stopped, but a deliberately detached child can outlive the request; every tool result reports that gap. Linux shares parts of the host network namespace even while IP networking is denied. Every reported platform gap matters. Do not enable unconfined execution on a server other people can reach.</p></div>
 
   <h3 id="network">Network and package installation are separate opt-ins</h3>
   <div class="table-scroll">
@@ -122,6 +132,15 @@
   </table>
   </div>
   <p><code>--code-exec-packages</code>, <code>--code-exec-install-index</code>, and <code>--code-exec-install-domains</code> constrain the host installer. They are not a security boundary after unrestricted command networking is enabled, because generated code can download an artifact directly. The script and code network switches are intentionally independent.</p>
+
+  <h2 id="playwright">Browser automation: the Playwright skill</h2>
+  <p>Browser “computer use” is a skill, not a runtime feature: there is no screen or mouse tool and no browser bridge. The <code>playwright</code> bundle in <code>TensorAgent/skills</code> drives a real browser through <code>skills_run</code> and a wrapper script that runs a pinned <code>@playwright/cli</code> with <code>npx</code>. Its instructions cover navigation, form filling, snapshots, screenshots, and data extraction, asking the user for missing information, and handing a headed persistent browser to the user for a login or CAPTCHA.</p>
+  <pre data-lang="bash"><code>dotnet run --project TensorSharp.Server.Host -c Release -- \
+  --model models/model.gguf --backend ggml_metal --host 127.0.0.1 \
+  --skills-dir ./TensorAgent/skills \
+  --skills-allow-exec --skills-allow-network \
+  --code-exec --code-exec-allow-install --code-exec-allow-network</code></pre>
+  <p>Besides those opt-ins it needs real Node.js, npm, and npx on the host. On macOS the skill has the model create <code>.playwright/cli.config.json</code> with <code>write_file</code> to turn off Chromium's own sandbox, because a process already confined by Seatbelt cannot start a second one; the outer Seatbelt sandbox stays on. It has been validated on macOS arm64 only, not on Linux or Windows. It is left out of the iOS app bundle, because iOS has no child processes or Node.js; <code>TensorAgent/skills</code> keeps it for the desktop hosts. Setup, account handoff, and recorded runs are in <a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/playwright_agent.md" target="_blank" rel="noopener">docs/playwright_agent.md</a>.</p>
 
   <h2 id="start">Start an agentic session</h2>
   <p>Skills can be used without executing code:</p>
@@ -154,8 +173,42 @@
 }</code></pre>
   <p><code>skills_discovery</code> defaults to <code>true</code>. Code execution has no per-request enable field: the operator either started the host with <code>--code-exec</code> or the four tools are absent. The agent loop allows 8 internal rounds by default, or 24 when code execution is enabled; <code>--skills-max-rounds</code> sets an explicit 1–64 bound.</p>
 
+  <h2 id="sub-agents">Sub-agents: bounded delegation</h2>
+  <p>On the server's chat paths — OpenAI <code>/v1/chat/completions</code> and <code>/v1/responses</code>, Ollama <code>/api/chat/ollama</code>, and the Web UI's <code>/api/chat</code> — a tool-capable model can hand independent parts of a request to sub-agents and combine their reports into one answer. Delegation is on by default, and the model decides whether to use it; nothing forces a spawn. It needs neither skills nor <code>--code-exec</code>: the five coordination tools are offered on their own.</p>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Tool</th><th>Behavior</th></tr></thead>
+    <tbody>
+      <tr><td><code>spawn_agent(task_name, task, agent_type?)</code></td><td>Starts a child and returns its ID immediately. <code>agent_type</code> is <code>explorer</code> (the default), <code>reviewer</code>, or <code>worker</code>.</td></tr>
+      <tr><td><code>wait_agent(agent_id?, timeout_ms?)</code></td><td>Waits for one direct child, or for all of them when the ID is omitted: 10,000 ms by default, 60,000 ms at most. A timeout is not completion.</td></tr>
+      <tr><td><code>send_input(agent_id, message)</code></td><td>Queues a follow-up for a running child at its next generation boundary, or starts another turn on a completed one.</td></tr>
+      <tr><td><code>close_agent(agent_id)</code></td><td>Cancels a child and its descendants.</td></tr>
+      <tr><td><code>list_agents()</code></td><td>Reports the direct children and their status.</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>Every child runs on the same loaded model with the parent's token limit, thinking mode, and sampling. It starts from the parent's system/developer instructions and its own self-contained task, not the parent's transcript or attachments, and it returns a bounded report. <code>explorer</code> and <code>reviewer</code> children are always read-only: besides the five coordination tools (so a child can delegate further, within <code>--agents-max-depth</code>), they get <code>skills_list</code>, <code>skills_read</code>, and <code>read_file</code> when the parent has it. A <code>worker</code> is read-only too unless the server was started with <code>--agents-allow-worker-tools</code> and its parent is the root or another mutable worker; it then gets the parent's enabled mutable tools, so delegation never widens permissions. A mutable worker shares the parent's workspace and sandbox, and read-only children read that same workspace; there are no Git worktrees or merging. Caller-owned tools are never passed to a child, and host tool calls anywhere in one request's tree run one at a time. Each child gets its own copy of the KV state rather than shared pages. Before the parent prefills, the host checkpoints the prefix it shares with its children, so a child can restore that prefix instead of computing it again.</p>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Server option</th><th>Default</th><th>Range and meaning</th></tr></thead>
+    <tbody>
+      <tr><td><code>--no-multi-agent</code></td><td>Delegation on</td><td>Turns delegation off. <code>TS_NO_MULTI_AGENT</code> set to any value other than <code>0</code> does the same.</td></tr>
+      <tr><td><code>--agents-max-concurrent</code></td><td>3</td><td>1–32 active descendants, not counting the root</td></tr>
+      <tr><td><code>--agents-max-count</code></td><td>8</td><td>1–128 children per request tree</td></tr>
+      <tr><td><code>--agents-max-depth</code></td><td>2</td><td>1–8 levels below the root</td></tr>
+      <tr><td><code>--agents-max-rounds</code></td><td>8</td><td>1–64 tool rounds per child turn</td></tr>
+      <tr><td><code>--agents-max-generations</code></td><td>48</td><td>1–1024 child generations per request</td></tr>
+      <tr><td><code>--agents-timeout</code></td><td>180 s</td><td>1–3600 seconds per child run</td></tr>
+      <tr><td><code>--agents-max-result-chars</code></td><td>8000</td><td>256–64000 characters per report</td></tr>
+      <tr><td><code>--agents-allow-worker-tools</code></td><td>Off</td><td>Lets <code>worker</code> children use the parent's enabled mutable tools</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>A request can opt out with <code>"multi_agent": false</code>. It cannot turn delegation on when the host has turned it off, raise a limit, or enable worker tools. While <code>wait_agent</code> runs, the Web UI's activity row carries an expandable panel with a live card for each sub-agent (task, status, current tool, result). OpenAI and Ollama responses carry only the parent's text. The CLI and Ollama <code>/api/generate</code> do not delegate. TensorAgent uses the host's default limits and has a "Sub-agents" switch in Settings (on by default) that turns delegation off from the next message.</p>
+  <p>The tools are offered only to families that render tool declarations and parse tool calls — not Mistral 3, Hunyuan Dense, or DiffusionGemma — and never on structured-output requests. There is no model-size gate. No latency, quality, or delegation-rate measurements are published. Delegation spends extra tokens and context, and whether it helps depends on the workload. Details: <a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/multi_agent.md" target="_blank" rel="noopener">docs/multi_agent.md</a>.</p>
+
   <h2 id="compatibility">Model-family limits</h2>
-  <p>The in-process loop requires a model family that can both carry tool declarations and parse tool calls. Families without that round trip receive selected skill instructions inline as a fallback, but are not offered the four code tools. TensorSharp logs the limitation rather than silently pretending code execution is available.</p>
+  <p>The in-process loop requires a model family that can both carry tool declarations and parse tool calls. Families without that round trip receive selected skill instructions inline as a fallback, but are not offered the four code tools or the sub-agent tools; among the supported families that is Mistral 3, Hunyuan Dense, and DiffusionGemma. Qwen 3.8 Flash Next now completes the round trip. TensorSharp logs the limitation rather than silently pretending code execution is available.</p>
 
   <div class="content-footer">
     <a href="server.html">← Server &amp; Web UI</a>

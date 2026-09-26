@@ -132,7 +132,7 @@ RESULTS_DIR = _path(_paths.get("results_dir"), "BENCH_RESULTS") or (HERE / "resu
 TENSORSHARP_SERVER_DLL = (
     _path(_paths.get("tensorsharp_server_dll"), "BENCH_TS_SERVER_DLL")
     or (REPO_ROOT / "TensorSharp.Server.Host" / "bin" / "TensorSharp.Server.Host.dll"))
-# TensorSharp.Server.Host hard-codes its listen address to 0.0.0.0:5000.
+# Passed to the server as --port (with --host 127.0.0.1); the health checks poll this port.
 TENSORSHARP_PORT = int(_env_or("BENCH_TS_PORT", _paths.get("tensorsharp_port", 5000)))
 
 LLAMA_SERVER_EXE = (

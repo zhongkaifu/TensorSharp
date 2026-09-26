@@ -53,7 +53,7 @@ public sealed class GlmTruncateRefusalTests : IDisposable
         ModelBase.Create(GlmDsaSyntheticModelBuilder.WriteGlm5NextTpFixture(
             Path.Combine(_dir, "next.gguf"), numHeads: 4, quantizeAttentionOutput: false, numLayers: 2), BackendType.GgmlCpu);
 
-    [Fact]
+    [GgmlFact(BackendType.GgmlCpu)]
     public void GlmDsa_NativeRefusal_IsReportedAndLeavesTheHead()
     {
         using var model = LoadGlmDsa();
@@ -67,7 +67,7 @@ public sealed class GlmTruncateRefusalTests : IDisposable
         Assert.Equal(Prompt.Length, model.CacheSeqLen);
     }
 
-    [Fact]
+    [GgmlFact(BackendType.GgmlCpu)]
     public void GlmDsa_AcceptedRewind_MovesTheHead_AndContinuesExactly()
     {
         using var model = LoadGlmDsa();
@@ -86,7 +86,7 @@ public sealed class GlmTruncateRefusalTests : IDisposable
         Assert.Equal(cold, resumed);
     }
 
-    [Fact]
+    [GgmlFact(BackendType.GgmlCpu)]
     public void Glm5Next_NativeRefusesAMidSequenceRewind_AndTheTrunkIsUntouched()
     {
         using var model = LoadGlm5Next();
@@ -104,7 +104,7 @@ public sealed class GlmTruncateRefusalTests : IDisposable
         Assert.Equal(expected, model.Forward(new[] { 70 }));
     }
 
-    [Fact]
+    [GgmlFact(BackendType.GgmlCpu)]
     public void Glm5Next_RewindToTheHeadOrToZero_IsStillAccepted()
     {
         using var model = LoadGlm5Next();
@@ -116,7 +116,7 @@ public sealed class GlmTruncateRefusalTests : IDisposable
         Assert.Equal(0, model.CacheSeqLen);
     }
 
-    [Fact]
+    [GgmlFact(BackendType.GgmlCpu)]
     public void Glm_VoidTruncate_ThrowsOnARefusal_InsteadOfReturningWithAStaleHead()
     {
         using var model = LoadGlm5Next();

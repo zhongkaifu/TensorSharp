@@ -18,6 +18,7 @@ using System.Text;
 using TensorSharp.AgentHost.CodeExec;
 using TensorSharp.AgentHost.Agents;
 using TensorSharp.AgentHost.Skills;
+using TensorSharp.Runtime;
 using TensorSharp.Runtime.Scheduling;
 using TensorSharp.Runtime.Speculative;
 
@@ -78,7 +79,7 @@ public static class ServerOptionsBuilder
             throw new ArgumentException("--embedding-threads and --embedding-context-size require --embeddings.");
 
         string? backendInput = configuredBackend ?? Environment.GetEnvironmentVariable("BACKEND");
-        string requestedBackend = backendInput ?? (OperatingSystem.IsMacOS() ? "ggml_metal" : "ggml_cpu");
+        string requestedBackend = backendInput ?? PlatformDefaultBackend;
         if (embeddingsEnabled)
             EmbeddingHosting.ResolveModelBackend(requestedBackend);
 
@@ -306,6 +307,14 @@ public static class ServerOptionsBuilder
         return (safe.Length == 0 ? "model" : safe.ToString()) + "-" + suffix;
     }
 
+    /// <summary>
+    /// The backend asked for when neither <c>--backend</c> nor <c>BACKEND</c> names one:
+    /// ggml_metal on macOS, ggml_cpu elsewhere. <see cref="Build"/> still falls back from it
+    /// to a backend this machine actually has; the startup banner compares against it to
+    /// say so.
+    /// </summary>
+    public static string PlatformDefaultBackend => OperatingSystem.IsMacOS() ? "ggml_metal" : "ggml_cpu";
+
     /// <summary>Backend originally requested via <c>--backend</c> / <c>BACKEND</c> (without the OS-default fallback).</summary>
     public static string? ReadConfiguredBackendInput(string[] args)
     {
@@ -320,6 +329,33 @@ public static class ServerOptionsBuilder
         public int? QuotaMb;
         public double? TtlHours;
     }
+
+    /// <summary>
+    /// The request-body limit every route has: 500 MB, the size the server has always
+    /// accepted. The JSON endpoints (chat, Ollama, Responses, image and video requests)
+    /// buffer the whole body and decode a base64 attachment out of one .NET string, so a
+    /// bigger limit there buys memory pressure and a 500 at the string-length ceiling, not
+    /// a bigger usable attachment. Only <c>POST /api/upload</c> goes above it (see
+    /// <see cref="ResolveUploadRequestBodyBytes"/>).
+    /// </summary>
+    public const long DefaultMaxRequestBodyBytes = UploadStoragePolicy.DefaultMaxFileBytes;
+
+    /// <summary>
+    /// The request-body limit of the multipart <c>POST /api/upload</c> route (and the
+    /// multipart body limit) for a per-file upload cap: the cap itself, never below
+    /// <see cref="DefaultMaxRequestBodyBytes"/>. That route streams the file to disk, so
+    /// it is the one place a larger cap can be honoured.
+    /// </summary>
+    /// <remarks>
+    /// The limit used to be a hard-coded 500 MB everywhere, so <c>--upload-max-mb 2000</c>
+    /// was accepted, logged and then unreachable: Kestrel refused every body over 500 MB
+    /// before the upload policy ever saw the file. Raising it server-wide instead let every
+    /// JSON request buffer up to the cap. The floor stays because lowering the per-FILE cap
+    /// is not a statement about request size, and because at the default the two were
+    /// always equal, which keeps the default deployment exactly as it was.
+    /// </remarks>
+    public static long ResolveUploadRequestBodyBytes(long uploadMaxFileBytes)
+        => Math.Max(DefaultMaxRequestBodyBytes, uploadMaxFileBytes);
 
     /// <summary>Resolve one MB-denominated upload limit: CLI flag, then env var, then <paramref name="fallbackBytes"/>.</summary>
     private static long ResolveUploadMb(int? cliMb, string envVar, long fallbackBytes)
@@ -515,6 +551,10 @@ public static class ServerOptionsBuilder
         if (args == null || args.Length == 0)
             return false;
 
+        // Last one wins, like every other option: a --config file's tokens come first and
+        // the command line's after them, so stopping at the first occurrence let a file
+        // beat the command line.
+        bool applied = false;
         for (int i = 0; i < args.Length; i++)
         {
             if (TryReadOption(args, ref i, "--kv-cache-dtype", out string? dtypeOpt))
@@ -523,10 +563,10 @@ public static class ServerOptionsBuilder
                     throw new ArgumentException(
                         $"Unknown --kv-cache-dtype value '{dtypeOpt}'. Valid: f32, f16, q8_0, q4_0.");
                 TensorSharp.Models.KvCacheDtypeConfig.Set(dtype);
-                return true;
+                applied = true;
             }
         }
-        return false;
+        return applied;
     }
 
     /// <summary>
@@ -591,6 +631,8 @@ public static class ServerOptionsBuilder
         if (args == null || args.Length == 0)
             return false;
 
+        // Last one wins (see ApplyKvCacheDtypeCliFlag).
+        bool applied = false;
         for (int i = 0; i < args.Length; i++)
         {
             if (TryReadOption(args, ref i, "--gpu-device", out string? gpuOpt))
@@ -600,10 +642,10 @@ public static class ServerOptionsBuilder
                 Environment.SetEnvironmentVariable(
                     TensorSharp.GGML.GgmlBasicOps.VulkanDeviceEnvVar,
                     gpuIndex.ToString(CultureInfo.InvariantCulture));
-                return true;
+                applied = true;
             }
         }
-        return false;
+        return applied;
     }
 
     /// <summary>
@@ -692,10 +734,12 @@ public static class ServerOptionsBuilder
     /// Translate <c>--spec</c> / <c>--no-spec</c> /
     /// <c>--spec-draft N</c> / <c>--spec-pmin X</c> / <c>--draft-model PATH</c> into the
     /// env vars read by <c>SchedulerConfig.FromEnvironment</c> when the
-    /// inference engine is constructed. NextN/MTP speculative decoding only
-    /// engages on models that ship a draft head (Qwen3.6) and is off by
-    /// default. Returns true when at least one flag was applied so the
-    /// caller can emit a startup-log line.
+    /// inference engine is constructed. Speculation is off by default; it
+    /// engages for a drafter the checkpoint embeds (<c>--spec</c>), one named on
+    /// <c>--draft-model</c>, or the weight-free n-gram algorithm
+    /// (<c>--spec --spec-type ngram</c>) on a trunk that can verify a draft
+    /// window - <c>--spec-type</c> alone turns nothing on. Returns true when at
+    /// least one flag was applied so the caller can emit a startup-log line.
     /// </summary>
     public static bool ApplySpeculativeCliFlags(string[] args)
     {
@@ -738,13 +782,37 @@ public static class ServerOptionsBuilder
     }
 
     /// <summary>
-    /// Translate <c>--paged-kv*</c> CLI flags into the env vars consumed by
-    /// <see cref="PagedKvCacheConfig.FromEnvironment"/>. Returns true when at
-    /// least one flag was applied so the caller can emit a startup-log line.
-    /// These flags are retained for CLI compatibility with older server
-    /// builds; the continuous-batching engine reads its scheduler knobs
-    /// from <c>TS_SCHED_*</c>.
+    /// The valueless <c>--paged-kv*</c> spellings <see cref="ApplyPagedKvCacheCliFlags"/>
+    /// accepts. One table, read by the applier's skip in <see cref="ParseArgs"/> and by
+    /// <see cref="DescribeInertPagedKvFlags"/>, so the warning cannot miss a spelling the
+    /// parser accepts.
     /// </summary>
+    internal static readonly string[] PagedKvSwitchFlags =
+    {
+        "--paged-kv", "--no-paged-kv",
+    };
+
+    /// <summary>The <c>--paged-kv* VALUE</c> options; see <see cref="PagedKvSwitchFlags"/>.</summary>
+    internal static readonly string[] PagedKvValueFlags =
+    {
+        "--paged-kv-block-size", "--paged-kv-ram-mb", "--paged-kv-ssd-dir", "--paged-kv-ssd-mb",
+        "--paged-kv-quant-bits", "--paged-kv-redis-url", "--paged-kv-redis-ttl",
+    };
+
+    /// <summary>
+    /// Translate <c>--paged-kv*</c> CLI flags into the env vars consumed by
+    /// <see cref="PagedKvCacheConfig.FromEnvironment"/>, validating each value. Returns
+    /// true when at least one flag was applied.
+    /// </summary>
+    /// <remarks>
+    /// Nothing on the server reads those variables: the standalone
+    /// <c>PagedKvCacheManager</c> they configure (RAM/SSD/Redis block tiers, the
+    /// TurboQuant codec) is built only by <c>TensorSharp.Cli --paged-bench</c>, and the
+    /// serving path's prefix reuse is the scheduler's radix prefix cache. The flags stay
+    /// accepted - refusing them would stop existing command lines and config files from
+    /// starting - and the host warns once through <see cref="DescribeInertPagedKvFlags"/>
+    /// rather than logging them as configured.
+    /// </remarks>
     public static bool ApplyPagedKvCacheCliFlags(string[] args)
     {
         if (args == null || args.Length == 0)
@@ -754,15 +822,13 @@ public static class ServerOptionsBuilder
         for (int i = 0; i < args.Length; i++)
         {
             string a = args[i];
-            if (string.Equals(a, "--paged-kv", StringComparison.OrdinalIgnoreCase) ||
-                string.Equals(a, "--paged-kv-cache", StringComparison.OrdinalIgnoreCase))
+            if (string.Equals(a, "--paged-kv", StringComparison.OrdinalIgnoreCase))
             {
                 Environment.SetEnvironmentVariable("TS_KV_PAGED_CACHE", "1");
                 changed = true;
                 continue;
             }
-            if (string.Equals(a, "--no-paged-kv", StringComparison.OrdinalIgnoreCase) ||
-                string.Equals(a, "--no-paged-kv-cache", StringComparison.OrdinalIgnoreCase))
+            if (string.Equals(a, "--no-paged-kv", StringComparison.OrdinalIgnoreCase))
             {
                 Environment.SetEnvironmentVariable("TS_KV_PAGED_CACHE", "0");
                 changed = true;
@@ -833,6 +899,61 @@ public static class ServerOptionsBuilder
         return changed;
     }
 
+    /// <summary>
+    /// The startup warning for <c>--paged-kv*</c> flags, or null when none was given.
+    /// Names every such flag on the line, says that the server never builds the cache they
+    /// configure, and says what serves prefix reuse instead - so an operator who set them
+    /// is told once, instead of reading "configured" and assuming a cache tier exists.
+    /// </summary>
+    /// <param name="args">The command line, after config-file expansion.</param>
+    /// <param name="prefixCacheEnabled">Whether the radix prefix cache is on for this
+    /// process (<c>--no-prefix-cache</c> and <c>TS_SCHED_PREFIX_CACHE=0</c> turn it off).</param>
+    public static string? DescribeInertPagedKvFlags(string[] args, bool prefixCacheEnabled)
+    {
+        if (args == null || args.Length == 0)
+            return null;
+
+        var named = new List<string>();
+        for (int i = 0; i < args.Length; i++)
+        {
+            string? flag = null;
+            foreach (string candidate in PagedKvSwitchFlags)
+            {
+                if (string.Equals(args[i], candidate, StringComparison.OrdinalIgnoreCase))
+                {
+                    flag = candidate;
+                    break;
+                }
+            }
+            if (flag == null)
+            {
+                foreach (string candidate in PagedKvValueFlags)
+                {
+                    if (TryReadOption(args, ref i, candidate, out _))
+                    {
+                        flag = candidate;
+                        break;
+                    }
+                }
+            }
+            if (flag != null && !named.Contains(flag))
+                named.Add(flag);
+        }
+
+        if (named.Count == 0)
+            return null;
+
+        string reuse = prefixCacheEnabled
+            ? "Prefix reuse across requests is served by the radix prefix cache, which is on (--no-prefix-cache turns it off)."
+            : "Prefix reuse across requests is served by the radix prefix cache, and --no-prefix-cache / "
+              + "TS_SCHED_PREFIX_CACHE=0 has turned that off, so this server reuses no prefix at all.";
+        return $"{string.Join(", ", named)} {(named.Count == 1 ? "has" : "have")} no effect on this server: "
+            + "it never builds the standalone paged KV cache these configure (only TensorSharp.Cli --paged-bench "
+            + "does), so no request reads or fills it. "
+            + reuse
+            + " Remove the flag(s) to silence this warning.";
+    }
+
     /// <summary>Disable scheduler prefix reuse when the host's prefix-cache opt-out
     /// is present. Startup preparation and persistence use the same parsed flag.</summary>
     public static bool ApplyPrefixCacheCliFlag(string[] args)
@@ -844,10 +965,13 @@ public static class ServerOptionsBuilder
     }
 
     /// <summary>
-    /// Translate <c>--redis-url &lt;url&gt;</c> into both
-    /// <c>TS_KV_CACHE_REDIS_URL</c> and
-    /// <c>TS_RESPONSES_STORE_REDIS_URL</c> so a single flag enables Redis
-    /// for both the paged KV cache tier and the Responses API store.
+    /// Translate <c>--redis-url &lt;url&gt;</c> into
+    /// <c>TS_RESPONSES_STORE_REDIS_URL</c>, which backs the Responses API store with
+    /// Redis instead of the bounded in-memory cache - the one thing the flag does on the
+    /// server. It also fills in <c>TS_KV_CACHE_REDIS_URL</c>, the Redis tier of the
+    /// standalone paged KV cache, which only <c>TensorSharp.Cli --paged-bench</c> builds:
+    /// no server request path reads that variable, so that half of the flag is inert here
+    /// (see <see cref="ApplyPagedKvCacheCliFlags"/>).
     /// If either env var is already set, it is left untouched so that
     /// split configurations (different Redis instances per subsystem)
     /// are preserved.
@@ -858,18 +982,22 @@ public static class ServerOptionsBuilder
         if (args == null || args.Length == 0)
             return false;
 
+        // Last one wins (see ApplyKvCacheDtypeCliFlag): the value is chosen first and
+        // applied once, because applying each occurrence would let the first fill the
+        // variables the later ones then leave alone.
+        string? redisUrl = null;
         for (int i = 0; i < args.Length; i++)
         {
-            if (TryReadOption(args, ref i, "--redis-url", out string? redisUrl))
-            {
-                if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("TS_KV_CACHE_REDIS_URL")))
-                    Environment.SetEnvironmentVariable("TS_KV_CACHE_REDIS_URL", redisUrl);
-                if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("TS_RESPONSES_STORE_REDIS_URL")))
-                    Environment.SetEnvironmentVariable("TS_RESPONSES_STORE_REDIS_URL", redisUrl);
-                return true;
-            }
+            if (TryReadOption(args, ref i, "--redis-url", out string? value))
+                redisUrl = value;
         }
-        return false;
+        if (redisUrl == null)
+            return false;
+        if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("TS_KV_CACHE_REDIS_URL")))
+            Environment.SetEnvironmentVariable("TS_KV_CACHE_REDIS_URL", redisUrl);
+        if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("TS_RESPONSES_STORE_REDIS_URL")))
+            Environment.SetEnvironmentVariable("TS_RESPONSES_STORE_REDIS_URL", redisUrl);
+        return true;
     }
 
     /// <summary>
@@ -877,7 +1005,9 @@ public static class ServerOptionsBuilder
     /// (<c>--qwen-image-vae</c> / <c>--qwen-image-vl</c> /
     /// <c>--qwen-image-mmproj</c>) into the env vars that
     /// <c>QwenImageModel</c> reads (<c>TS_QWEN_IMAGE_VAE</c> /
-    /// <c>TS_QWEN_IMAGE_TE</c> / <c>TS_QWEN_IMAGE_MMPROJ</c>) — the existing
+    /// <c>TS_QWEN_IMAGE_TE</c> / <c>TS_QWEN_IMAGE_MMPROJ</c>) and the LoRA plug-ins
+    /// (<c>--lora</c> / <c>--lora-scale</c> / <c>--lora-config</c>, published as
+    /// <c>TS_LORAS</c>) — the existing
     /// override mechanism for the three networks the qwen_image DiT GGUF does
     /// not itself contain — plus the output-size defaults and the video
     /// companions, which use the same env-var mechanism. Each path is validated
@@ -953,22 +1083,37 @@ public static class ServerOptionsBuilder
                 changed = true;
                 continue;
             }
-            // Default output size for image requests that name none. Read by
-            // QwenImage21Pipeline.ResolveDimensions as TS_QWEN_IMAGE_WIDTH/HEIGHT, which
-            // requires both, each a multiple of 32. Per-request sizes from the Web UI / API
-            // still override this default.
+            // Default output size for image requests that name neither a size nor a
+            // target area of their own. Read by QwenImage21Pipeline.ResolveDimensions as
+            // TS_QWEN_IMAGE_WIDTH/HEIGHT, which needs both (a half-set or unparsable pair is
+            // ignored with a warning) and snaps an off-grid side down to a multiple of 32,
+            // never below 32, warning once. Per-request sizes and areas from the Web UI /
+            // API still override this default. Neither half is refused here: --width/--height
+            // are also the video size aliases (ParseArgs), and video rounds to its own grid
+            // and takes a missing side from the conditioning image. What the image default
+            // makes of an incomplete or off-grid pair is said once at startup instead
+            // (DescribeQwenImageSizeDefaultWarnings).
             if (TryReadOption(args, ref i, "--width", out string? widthOpt))
             {
-                SetQwenImageSizeEnv("--width", "TS_QWEN_IMAGE_WIDTH", widthOpt);
+                SetQwenImageSizeEnv("--width", QwenImageWidthEnvVar, widthOpt);
                 changed = true;
                 continue;
             }
             if (TryReadOption(args, ref i, "--height", out string? heightOpt))
             {
-                SetQwenImageSizeEnv("--height", "TS_QWEN_IMAGE_HEIGHT", heightOpt);
+                SetQwenImageSizeEnv("--height", QwenImageHeightEnvVar, heightOpt);
                 changed = true;
                 continue;
             }
+        }
+        // LoRA plug-ins for the Qwen-Image-2.1 transformer, in one ordered pass of their
+        // own: --lora-scale and --lora-config bind to the --lora before them. The files
+        // are checked now, so a typo fails at startup rather than on the first request.
+        var loras = LoraCliFlags.Resolve(LoraCliFlags.Parse(args));
+        if (loras.Count > 0)
+        {
+            Environment.SetEnvironmentVariable(LoraCliFlags.EnvironmentVariable, LoraCliFlags.ToJson(loras));
+            changed = true;
         }
         return changed;
     }
@@ -980,6 +1125,87 @@ public static class ServerOptionsBuilder
         if (!int.TryParse(value, CultureInfo.InvariantCulture, out int px) || px <= 0)
             throw new ArgumentException($"Option '{flag}' needs a positive integer (pixels), got '{value}'.");
         Environment.SetEnvironmentVariable(envVar, px.ToString(CultureInfo.InvariantCulture));
+    }
+
+    /// <summary>The Qwen-Image-2.1 default-size variables <c>--width</c> / <c>--height</c> publish.</summary>
+    internal const string QwenImageWidthEnvVar = "TS_QWEN_IMAGE_WIDTH";
+
+    /// <inheritdoc cref="QwenImageWidthEnvVar"/>
+    internal const string QwenImageHeightEnvVar = "TS_QWEN_IMAGE_HEIGHT";
+
+    /// <summary>
+    /// What <c>--width</c> / <c>--height</c> will NOT do as the Qwen-Image-2.1 default image
+    /// size, one warning per problem, or none. The host logs these once at startup when
+    /// the hosted model is a Qwen-Image model.
+    /// </summary>
+    /// <remarks>
+    /// Warned rather than refused: both flags are also the video size aliases, and video
+    /// legitimately takes one side alone (MiniMax-H3 fills the other from the conditioning
+    /// image) and rounds to its own grid. For the image default, though, an incomplete pair
+    /// is ignored outright and an off-grid value cannot be used as given - and neither used
+    /// to be said anywhere, so an operator who set <c>--width 1000</c> saw 2048x2048 images
+    /// (or a refused request) with no clue why. The other half may come from the
+    /// environment variable, which the pipeline reads the same way.
+    /// </remarks>
+    public static IReadOnlyList<string> DescribeQwenImageSizeDefaultWarnings(string[] args)
+    {
+        var warnings = new List<string>();
+        if (args == null || args.Length == 0)
+            return warnings;
+
+        // Last one wins, as in ApplyQwenImageCompanionCliFlags, which already validated
+        // each value as a positive integer.
+        string? widthFlag = null;
+        string? heightFlag = null;
+        for (int i = 0; i < args.Length; i++)
+        {
+            if (TryReadOption(args, ref i, "--width", out string? w))
+                widthFlag = w;
+            else if (TryReadOption(args, ref i, "--height", out string? h))
+                heightFlag = h;
+        }
+        if (widthFlag == null && heightFlag == null)
+            return warnings;
+
+        int? width = ParsePixels(widthFlag ?? Environment.GetEnvironmentVariable(QwenImageWidthEnvVar));
+        int? height = ParsePixels(heightFlag ?? Environment.GetEnvironmentVariable(QwenImageHeightEnvVar));
+        if (width == null || height == null)
+        {
+            string given = width != null ? "--width" : "--height";
+            string missing = width != null ? "--height" : "--width";
+            warnings.Add(
+                $"{given} was given without {missing}: the Qwen-Image-2.1 default image size needs both, so "
+                + $"{given} is ignored for images, and image requests that name neither a size nor an area keep "
+                + $"the automatic size (a 2048x2048 area). Pass {missing} as well to set it (video requests still use "
+                + $"{given} on its own).");
+            return warnings;
+        }
+
+        foreach ((string flag, string? raw, int px) in new[]
+                 {
+                     ("--width", widthFlag, width.Value),
+                     ("--height", heightFlag, height.Value),
+                 })
+        {
+            if (raw == null || px % 32 == 0)
+                continue;
+            // The pipeline's own rule for an off-grid default: down to the grid, and never
+            // below one 32-pixel tile.
+            string outcome = px >= 32
+                ? "snapped down to a multiple of 32 (" + (px / 32 * 32).ToString(CultureInfo.InvariantCulture) + ")"
+                : "raised to 32, the smallest size";
+            warnings.Add(
+                $"{flag} {px.ToString(CultureInfo.InvariantCulture)} is not a multiple of 32, which Qwen-Image-2.1 "
+                + $"requires: as its default image size it is {outcome} for image requests that name neither a "
+                + "size nor an area. Pass a multiple of 32 to get exactly that size (video requests round it to "
+                + "their own grid either way).");
+        }
+        return warnings;
+
+        static int? ParsePixels(string? value) =>
+            int.TryParse(value?.Trim(), NumberStyles.Integer, CultureInfo.InvariantCulture, out int parsed) && parsed > 0
+                ? parsed
+                : null;
     }
 
     private static void SetQwenImageCompanionEnv(string flag, string envVar, string path)
@@ -1315,11 +1541,9 @@ public static class ServerOptionsBuilder
             // Paged-KV flags are consumed by ApplyPagedKvCacheCliFlags(args)
             // in a separate earlier pass. They still appear in args[] when
             // ParseArgs walks the list, so recognise + skip them here to
-            // keep them out of the unknown-arg trap below.
-            if (string.Equals(args[i], "--paged-kv", StringComparison.OrdinalIgnoreCase) ||
-                string.Equals(args[i], "--paged-kv-cache", StringComparison.OrdinalIgnoreCase) ||
-                string.Equals(args[i], "--no-paged-kv", StringComparison.OrdinalIgnoreCase) ||
-                string.Equals(args[i], "--no-paged-kv-cache", StringComparison.OrdinalIgnoreCase))
+            // keep them out of the unknown-arg trap below. (Accepted but inert
+            // on the server; the host warns about them once at startup.)
+            if (MatchesAny(args[i], PagedKvSwitchFlags))
             {
                 continue;
             }
@@ -1337,13 +1561,7 @@ public static class ServerOptionsBuilder
             {
                 continue;
             }
-            if (TryReadOption(args, ref i, "--paged-kv-block-size", out _)
-                || TryReadOption(args, ref i, "--paged-kv-ram-mb", out _)
-                || TryReadOption(args, ref i, "--paged-kv-ssd-dir", out _)
-                || TryReadOption(args, ref i, "--paged-kv-ssd-mb", out _)
-                || TryReadOption(args, ref i, "--paged-kv-quant-bits", out _)
-                || TryReadOption(args, ref i, "--paged-kv-redis-url", out _)
-                || TryReadOption(args, ref i, "--paged-kv-redis-ttl", out _))
+            if (TryReadAnyOption(args, ref i, PagedKvValueFlags))
             {
                 continue;
             }
@@ -1445,7 +1663,10 @@ public static class ServerOptionsBuilder
                 || TryReadOption(args, ref i, "--qwen-image-vl", out _)
                 || TryReadOption(args, ref i, "--qwen-image-mmproj", out _)
                 || TryReadOption(args, ref i, "--width", out _)
-                || TryReadOption(args, ref i, "--height", out _))
+                || TryReadOption(args, ref i, "--height", out _)
+                || TryReadOption(args, ref i, LoraCliFlags.LoraFlag, out _)
+                || TryReadOption(args, ref i, LoraCliFlags.ScaleFlag, out _)
+                || TryReadOption(args, ref i, LoraCliFlags.ConfigFlag, out _))
             {
                 continue;
             }
@@ -1503,7 +1724,7 @@ public static class ServerOptionsBuilder
             "--temperature", "--top-k", "--top-p", "--min-p",
             "--repeat-penalty", "--repeat-last-n", "--presence-penalty", "--frequency-penalty",
             "--seed", "--stop", "--sampling-precedence",
-            "--paged-kv", "--paged-kv-cache", "--no-paged-kv", "--no-paged-kv-cache",
+            "--paged-kv", "--no-paged-kv",
             "--paged-kv-block-size", "--paged-kv-ram-mb",
             "--paged-kv-ssd-dir", "--paged-kv-ssd-mb", "--paged-kv-quant-bits",
             "--continuous-batching", "--no-continuous-batching",
@@ -1537,6 +1758,7 @@ public static class ServerOptionsBuilder
         // knew the names.
         knownFlags.AddRange(CodeExecOptions.SwitchFlags);
         knownFlags.AddRange(CodeExecOptions.ValueFlags);
+        knownFlags.AddRange(LoraCliFlags.Flags);
         string? best = null;
         int bestDist = int.MaxValue;
         foreach (var flag in knownFlags)

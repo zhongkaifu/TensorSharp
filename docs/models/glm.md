@@ -1,12 +1,12 @@
 # GLM-5.x (`glm-dsa`, `glm5next`)
 
-[← back to model index](README.md)
+[← back to model index](README.md) | [中文](glm_zh-cn.md)
 
 GLM-5.2 is a 744B-parameter MoE (256 routed experts, top-8, plus one shared
 expert) built on **DeepSeek Sparse Attention**: Multi-head Latent Attention with
 weight absorption, and a "lightning indexer" that decides which cached tokens
 each query may attend to. Advertised context: 1M tokens. The GGUF architecture
-id is `glm-dsa`. **GLM-5.3** is the same block shape under a newer release and
+id is `glm-dsa` (the loader also accepts `glm_dsa`). **GLM-5.3** is the same block shape under a newer release and
 shares this whole page - see [its section below](#glm-53-glm-dsa). **GLM-5.3-Flash**
 (`glm5next`) runs through the same executor - see
 [its section below](#glm-53-flash-glm5next).
@@ -106,7 +106,8 @@ That is why the greedy text differs (`Simple arithmetic question, user wants a
 brief answer.</think>2+2 = ` against `This is a simple arithmetic question. The
 user wants a brief answer. 2`) while the reasoning is the same. At 2 bits the
 per-op and fused executors pick different experts from small numerical
-differences, the same effect that keeps `TS_BATCHED_FUSED_DECODE` off by default.
+differences, the same effect that makes batched fused decode differ from serial
+decode (see [Serving concurrent requests](#serving-concurrent-requests)).
 A cosine of 0.96 is consistent with that but does not prove it: it is lower than
 the ~0.999 a higher-precision checkpoint would be expected to give, and no
 higher-precision GLM-5.3-Flash GGUF was available to use as a control. Treat the
@@ -129,12 +130,6 @@ every one of N GPUs and splits the weights *inside* each layer, so decode reads
 1/N of the weights per device instead of walking all of them in sequence. The split follows the
 Megatron column/row pattern used by the rest of the repo:
 
-The native GLM 5.x tensor-parallel executor is **local and single-process** for
-GLM-5.2, GLM-5.3 and GLM-5.3-Flash alike. It does not join the cross-node
-`ITensorParallelGroup`, so `--tp-node-id` / `--tp-peers` do not make this path
-distributed — they are refused for the whole GLM family before the model is
-built.
-
 | Piece | Split | Collective |
 |---|---|---|
 | Attention heads | column-parallel `attn_q_b` / `attn_k_b` / `attn_v_b`, row-parallel `attn_output` | one all-reduce per layer |
@@ -155,6 +150,12 @@ keeps its experts intact and splits only the heads (still exact, just slower).
 `TS_GLM_TP_SHARD` selects the halves independently (1 = heads, 2 = experts,
 3 = both) and `TS_GLM_TP_OVERSUBSCRIBE=1` lets several ranks share one GPU,
 which is how the split is checked for correctness on a single-GPU machine.
+
+The native GLM 5.x tensor-parallel executor is **local and single-process** for
+GLM-5.2, GLM-5.3 and GLM-5.3-Flash alike. It does not join the cross-node
+`ITensorParallelGroup`, so `--tp-node-id` / `--tp-peers` do not make this path
+distributed — they are refused for the whole GLM family before the model is
+built.
 
 ### Serving concurrent requests
 
@@ -177,10 +178,13 @@ between them instead of N times. Measured on the 3-GPU box, four concurrent
 200-token completions: **75.2 tok/s aggregate against 41.6 solo** (1.81x), each
 stream at 18.8 tok/s.
 
-`TS_BATCHED_FUSED_DECODE=1` turns it on, and it is off by default here for the
-same reason it is off everywhere else in the project. Batching changes the shape
-of every GEMM, so CUDA picks different kernels and the result differs in the last
-bits: the first divergence against the one-at-a-time path shows up at layer 1 at
+It is on by default, as it is for the other families that implement it;
+`TS_BATCHED_FUSED_DECODE=0` turns it off (and `TS_GLM_BATCHED_DECODE=0` makes the
+native side decline it). The batched graph is single-rank, so under `--tp` it
+declines and requests decode one sequence at a time. What it costs is exactness.
+Batching changes the shape of every GEMM, so CUDA picks different kernels and the
+result differs in the last bits: the first divergence against the one-at-a-time
+path shows up at layer 1 at
 2e-8 relative. In a dense model that would stay invisible, but 75 of these 78
 layers pick 8 of 256 experts by a top-k over near-tied scores, so a last-bit
 difference flips a marginal expert, and by the LM head the logits differ by
@@ -188,10 +192,18 @@ O(1) — on a 2-bit checkpoint that is a visibly different continuation, not a
 rounding wobble. On the CPU backend, whose kernels do not switch on batch size,
 batched and serial decode are bitwise identical.
 
-Without the flag, concurrency still works and is exact: the engine interleaves
-whole-graph per-sequence forwards, and four concurrent completions come back
-byte-identical to running the same four prompts one after another. It just
-re-reads the weights once per sequence.
+With `TS_BATCHED_FUSED_DECODE=0`, concurrency still works and is exact: the
+engine interleaves whole-graph per-sequence forwards, and four concurrent
+completions come back byte-identical to running the same four prompts one after
+another. It just re-reads the weights once per sequence.
+
+Prefix reuse across requests goes through the Radix prefix cache, the default
+mode. On the native executor a finished request's slot can stay behind as one
+retained entry, which a later request that starts with the same tokens adopts
+instead of re-prefilling: glm-dsa may rewind such a slot by up to 16 tokens,
+while glm5next reuses only an exact prefix, because its KDA state cannot be
+rewound (see [GLM-5.3-Flash](#glm-53-flash-glm5next)). `--no-prefix-cache` turns
+all of it off.
 
 ### The sparse-attention path
 
@@ -273,8 +285,10 @@ IQ2_XXS — competing for the VRAM the loader sizes the context against, so the
 native loader only pages it in when `--spec` (env `TS_SPEC`, legacy `TS_MTP_SPEC`) was set before
 the model loaded. That is why the flag has to be on the command line rather than
 toggled later, and why adding it to a command that already just fit can shorten
-the context the loader settles on. `TS_GLM_MTP=1` / `0` overrides either way for
-an A/B.
+the context the loader settles on. The loader reads `TS_SPEC` / `TS_MTP_SPEC` with
+the scheduler's rule — only `1`, `true`, `yes` or `on` enable — so `TS_SPEC=false`
+does not page the block in. `TS_GLM_MTP` overrides either way for an A/B: any value
+but `0` forces it on, and `0` forces it off.
 
 ### Measured
 
@@ -288,7 +302,7 @@ one round is not enough to tell a 5% tuning effect from that noise.
 | Configuration | Decode (5 runs) | vs plain | Draft acceptance | Drafted per verify |
 |---|---|---|---|---|
 | plain greedy | 17.96 / 18.33 / 20.42 / 20.37 / 18.56 tok/s | 1.00x | — | — |
-| `--spec` (the defaults: k=8, pMin 0.75) | 20.50 / 25.68 / 25.83 / 25.85 / 23.52 tok/s | 1.14 / 1.40 / 1.27 / 1.27 / 1.27x — **median 1.27x** | 93.8% | 1.59 |
+| `--spec` (k=8, pMin 0.75 — the defaults when measured) | 20.50 / 25.68 / 25.83 / 25.85 / 23.52 tok/s | 1.14 / 1.40 / 1.27 / 1.27 / 1.27x — **median 1.27x** | 93.8% | 1.59 |
 | `--spec --spec-draft 4 --spec-pmin 0.55` | 22.35 / 26.99 / 25.86 / 26.81 / 25.89 tok/s | 1.24 / 1.47 / 1.27 / 1.32 / 1.39x — median 1.32x | 75.0% | 2.04 |
 
 **On tuning.** A narrower window with a lower gate was best or tied-best in
@@ -329,6 +343,11 @@ experts on the host):
 Heavier offload slows the 1-row baseline more than it slows a wide verify, so
 the curve flattens (a 2-row verify is 1.16x a 1-row decode there, not 1.27x) and
 the configurations converge.
+
+These runs predate the current per-token gate: `--spec-pmin` now defaults to
+0.15 for a per-token draft head such as this NextN block (it was 0.75 when the
+tables above were measured), and GLM-5.2 has not been re-measured at 0.15. The
+"defaults" rows are the k=8, pMin 0.75 configuration.
 
 ### Greedy output and floating point
 
@@ -445,9 +464,10 @@ split itself is the same either way.
 ## Running it
 
 ```bash
-# 3 GPUs, layer split (the default: every visible GPU)
+# 3 GPUs, layer split (the default: every visible GPU); --input reads the prompt from a file
+echo "Explain MLA in one paragraph." > prompt.txt
 dotnet run --project TensorSharp.Cli -- --model GLM-5.2-UD-IQ2_XXS-00001-of-00006.gguf \
-    --backend ggml_cuda --prompt "Explain MLA in one paragraph."
+    --backend ggml_cuda --input prompt.txt
 
 # Fewer GPUs, or a specific count
 TS_GLM_NGPU=2 dotnet run --project TensorSharp.Cli -- --model ... --backend ggml_cuda
@@ -472,6 +492,14 @@ RAM and no host time, and a strided strip cannot be served in place from the GGU
 mapping — it would turn a mapped file into a 200 GiB private copy), so rank 0
 evaluates those layers while the GPU-resident ones stay split. `--n-cpu-moe 30`
 on its own reproduces llama.cpp 3/3.
+
+The host-side expert matmuls run on the executor's CPU worker pool. Its size is
+`TS_GLM_THREADS` (or min(cores, 32)) by default, and every usable CPU once
+`--n-cpu-moe` / `--cpu-moe` is on or no GPU is present; `--cpu-moe-threads N` then
+replaces it, on Linux as well, and a `TS_CPU_MOE_THREADS` exported before the
+process starts still wins over the flag — the same precedence as the DeepSeek V4
+executor. The load log prints the result as `[glm] CPU worker pool: threads=N,
+persistent=yes`.
 
 ### Context length
 
@@ -521,7 +549,7 @@ as its last stderr line and exits with code 2 (USAGE.md, "Exit codes").
 |---|---|---|
 | `TS_GLM_NGPU` | 0 (all) | GPUs to spread the layers over |
 | `TS_GLM_UBATCH` | 1024 | prefill micro-batch; 2048 is faster on long prompts if VRAM allows |
-| `TS_GLM_THREADS` | min(cores, 32) | CPU-backend threads (the routed-expert matmul overrides this from `--cpu-moe-threads`) |
+| `TS_GLM_THREADS` | min(cores, 32) | CPU-backend threads; every usable CPU instead with `--n-cpu-moe` / `--cpu-moe` or no GPU, and `--cpu-moe-threads` (then an inherited `TS_CPU_MOE_THREADS`) overrides either |
 | `TS_GLM_NATIVE` | 1 | 0 runs the managed per-op path on a GGML backend |
 | `TS_GLM_FA` | 1 | 0 disables flash attention (falls back to soft_max) |
 | `TS_GLM_FUSED_LID` | 1 | 0 builds the indexer out of primitives instead of `ggml_lightning_indexer` |
@@ -553,7 +581,11 @@ request), as on every other family here. Turning it on adds the
 dropped from the prompt, matching the template's `clear_thinking` default. Tool calls come back as
 `<tool_call>NAME<arg_key>k</arg_key><arg_value>v</arg_value>...</tool_call>`,
 one XML element per argument (values that were rendered with `tojson` are parsed
-back into numbers / arrays / objects).
+back into numbers / arrays / objects). Because the family renders tool
+declarations and has this parser, GLM 5.x (GLM-5.3-Flash included) is eligible
+for skills, the code tools (`--code-exec`) and, on the server, [sub-agent
+delegation](../multi_agent.md), which is on by default on the chat paths. No
+delegation results are published for this family.
 
 Generation also stops on `<|observation|>` (the GGUF's
 `tokenizer.ggml.eom_token_id`, which llama.cpp folds into its end-of-generation
@@ -639,7 +671,8 @@ because that llama.cpp cell ran before the client asked for usage in the stream
 and so has no prompt-token count of its own: TensorSharp reaches first token in
 **41.9 s** (41.85 / 41.86 / 42.07) against llama.cpp's **29.0 s** (29.01 /
 29.05 / 31.23), about **1.4x slower**. Full record and method in the
-[cross-engine report](../validation/cross-engine-2026-09/README.md).
+cross-engine report, `docs/validation/cross-engine-2026-09/README.md`
+(local validation evidence, not committed).
 
 ## GLM-5.3-Flash (`glm5next`)
 
@@ -709,9 +742,9 @@ expert once on rank 0. `TS_GLM_TP_FUSED=0` forces the fallback for diagnostics.
   omitting the flag keeps the default layer split.
 - **`--cpu-moe` / `--n-cpu-moe N`** host-resident experts: works (measured
   ~35–40 t/s decode with the first 10 layers' experts on the host).
-- **Serving**: per-sequence native slots, concurrent requests decode
-  round-robin (the fused one-graph-per-step batched decode declines glm5next
-  for now and the engine falls back automatically).
+- **Serving**: per-sequence native slots plus the fused batched decode (see
+  [Continuous batching (glm5next)](#continuous-batching-glm5next)); under `--tp`
+  the batched graph declines and concurrent requests decode round-robin.
 - **Vision**: `--image` / multi-image / multi-turn image sessions through the
   managed `GlmNextVisionEncoder` (the GLM-OCR ViT: RMS norms, fused QKV,
   per-head q/k RMS norms, 2D vision RoPE, SwiGLU-clamp MLP, 2×2 conv merger).
@@ -791,9 +824,9 @@ native library built with test hooks, whose fault injector
 `TSGgml_GlmTestKdaSnapshotFault` is a `TSG_TEST_EXPORT` kept out of the iOS
 export list) injects `std::bad_alloc` and a non-standard exception into capture
 and mid-restore on CPU and CUDA and checks that a checked reset recovers the
-full-vocabulary logits. Recorded runs:
-[`glm5next-cuda-r4`](../validation/qualification-2026-09-16/glm5next-cuda-r4/README.md)
-(original 22/22 and expanded 26/26 on one A40, no skips).
+full-vocabulary logits. Recorded runs (original 22/22 and expanded 26/26 on one
+A40, no skips): `docs/validation/qualification-2026-09-16/glm5next-cuda-r4/README.md`
+(local validation evidence, not committed).
 
 ### Measured
 

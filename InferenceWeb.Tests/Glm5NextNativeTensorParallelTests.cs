@@ -46,7 +46,7 @@ public sealed class Glm5NextNativeTensorParallelTests : IDisposable
         return env;
     }
 
-    [Fact]
+    [GgmlFact(BackendType.GgmlCpu)]
     public void NativeLoader_AcceptsGlm5NextWithTwoAlignedTpRanks()
     {
         string path = GlmDsaSyntheticModelBuilder.WriteGlm5NextTpFixture(
@@ -76,7 +76,7 @@ public sealed class Glm5NextNativeTensorParallelTests : IDisposable
         AssertLogitsClose(parallelRefill, afterReset, 1e-6f);
     }
 
-    [Fact]
+    [GgmlFact(BackendType.GgmlCpu)]
     public void NativeLoader_RejectsTpPartitionThatCutsAQuantizationHeadGroup()
     {
         string path = GlmDsaSyntheticModelBuilder.WriteGlm5NextTpFixture(

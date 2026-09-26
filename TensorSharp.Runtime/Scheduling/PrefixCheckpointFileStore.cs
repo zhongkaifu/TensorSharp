@@ -52,9 +52,11 @@ public sealed class PrefixCheckpointFileStore : IPrefixCheckpointStore
     private const int Version = 1;
     private const string Extension = ".ckpt";
 
-    /// <summary>Files kept per model (a prefix changes with the thinking default, the
-    /// tools and the skills; two covers a toggle). Older ones go when a new one is saved.</summary>
-    public const int MaxFilesPerModel = 2;
+    /// <summary>Files kept per model: a prompt saves one per public checkpoint boundary
+    /// (two, the system instructions and the whole shared prefix) and a host warms both
+    /// thinking modes, so four keep a restart from prefilling either mode again (at two,
+    /// the second mode's pair evicted the first's). Older ones go when a new one is saved.</summary>
+    public const int MaxFilesPerModel = 4;
 
     private readonly ILogger _log;
 

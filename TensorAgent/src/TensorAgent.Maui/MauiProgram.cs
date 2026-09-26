@@ -144,8 +144,8 @@ public static class MauiProgram
         MauiAppBuilder builder = MauiApp.CreateBuilder();
         builder.UseMauiApp<App>();
 
-        // The Web UI is TensorSharp.Server/wwwroot linked into the bundle as
-        // webui/ (see the BundleResource item in the csproj).
+        // The Web UI is the app's own phone page, TensorAgent.Maui/wwwroot, linked
+        // into the bundle as webui/ (see the BundleResource item in the csproj).
         string webRoot = Path.Combine(NSBundle.MainBundle.BundlePath, "webui");
         // Console logging is what `simctl launch --console` shows and what a device log
         // capture picks up -- while something is attached to it. A device console

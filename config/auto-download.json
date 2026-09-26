@@ -10,7 +10,7 @@
   //
   // The URL below is a real, public, ungated GGUF (Qwen3.5-9B, ~8.9 GB Q8_0),
   // so this file works as-is:
-  //   TensorSharp.Server --config config/auto-download.json --backend ggml_cuda
+  //   TensorSharp.Server.Host --config config/auto-download.json --backend ggml_cuda
   // downloads the model into ${modelRoot} on the first run and reuses the local
   // copy afterward. ${modelRoot} is written portably below: it takes the
   // TENSORSHARP_MODELS environment variable when that is set, and otherwise a
@@ -27,9 +27,10 @@
   "model": {
     "path": "${modelRoot}/Qwen3.5-9B-Q8_0.gguf",
     "urls": [
-      "${hf}/unsloth/Qwen3.5-9B-GGUF/resolve/main/Qwen3.5-9B-Q8_0.gguf"
-    ]
-    // Optional integrity check for a freshly downloaded file:
-    // "sha256": "0123456789abcdef..."
+      "${hf}/unsloth/Qwen3.5-9B-GGUF/resolve/3885219b6810b007914f3a7950a8d1b469d598a5/Qwen3.5-9B-Q8_0.gguf"
+    ],
+    // Optional integrity check for a freshly downloaded file (a file already on
+    // disk is used as-is). The URL above pins a commit, so this hash stays true.
+    "sha256": "809626574d0cb43d4becfa56169980da2bb448f2299270f7be443cb89d0a6ae4"
   }
 }

@@ -767,9 +767,10 @@ namespace TensorSharp.Models
 
             // The SWA ring holds sliding_window + chunk + 1 rows, so a forward wider
             // than (rows - sliding_window) would alias two live positions onto one slot
-            // and silently corrupt all 39 sliding-window layers. Chunking keeps text
-            // prompts under the limit by construction; a multimodal prompt skips
-            // chunking, so it is the one way to get here oversized.
+            // and silently corrupt all 39 sliding-window layers. Chunking keeps every
+            // prompt, text or multimodal, under the limit by construction; only
+            // chunking switched off (TS_MUSE_GLIMMER_PREFILL_CHUNK=0) or a ring forced
+            // smaller than window + chunk (TS_MUSE_GLIMMER_SWA_ROWS) gets here oversized.
             if (_kvSwaRows > 0 && tokens.Length > _kvSwaRows - _slidingWindow)
             {
                 throw new InvalidOperationException(

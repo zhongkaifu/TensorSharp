@@ -6,7 +6,7 @@
   //   2. the Wan 2.2 VAE   (--video-vae)   pixels <-> the 48-channel video latent
   //   3. UMT5-XXL          (--video-text-encoder)    the text encoder
   //
-  //   TensorSharp.Server --config config/wan-video-ti2v-5b.json
+  //   TensorSharp.Server.Host --config config/wan-video-ti2v-5b.json
   //
   // This is the REFERENCE recipe: 50 steps with classifier-free guidance, i.e.
   // 100 DiT passes, against Turbo's 4. It is the quality baseline the oracle
@@ -14,12 +14,14 @@
   // start with config/wan-video-ti2v-5b-turbo.json unless you specifically want
   // the undistilled sampler.
   //
-  // Downloads ~11.4 GB (DiT 5.4 GB, text encoder 6.0 GB, VAE 0.25 GB).
+  // Downloads ~12.9 GB (DiT 5.4 GB, text encoder 6.0 GB, VAE 1.4 GB), pinned by
+  // commit and SHA-256.
   "variables": {
     // Override the location with the TENSORSHARP_MODELS environment variable;
-    // otherwise a "models" folder next to the repository. Relative paths in a
-    // config are resolved against the config file, so this file needs no editing
-    // on Windows, Linux or macOS.
+    // otherwise ../models, and relative paths in a config resolve against the
+    // config file's folder (not the working directory), so that is a "models"
+    // folder at the repository root. This file needs no editing on Windows,
+    // Linux or macOS.
     "modelRoot": "${TENSORSHARP_MODELS:-../models}",
     "hf": "https://huggingface.co"
   },
@@ -34,16 +36,19 @@
 
   "model": {
     "path": "${modelRoot}/Wan2.2-TI2V-5B-Q8_0.gguf",
-    "urls": [ "${hf}/QuantStack/Wan2.2-TI2V-5B-GGUF/resolve/main/Wan2.2-TI2V-5B-Q8_0.gguf" ]
+    "urls": [ "${hf}/QuantStack/Wan2.2-TI2V-5B-GGUF/resolve/57437632ddd08bdcbd1508c866aa22e126ed51d2/Wan2.2-TI2V-5B-Q8_0.gguf" ],
+    "sha256": "57bece983817ab2f957546683bb670f13be7d99022d45674840cd999a050ea8f"
   },
 
   "video-vae": {
     "path": "${modelRoot}/Wan2.2_VAE.safetensors",
-    "urls": [ "${hf}/QuantStack/Wan2.2-TI2V-5B-GGUF/resolve/main/VAE/Wan2.2_VAE.safetensors" ]
+    "urls": [ "${hf}/QuantStack/Wan2.2-TI2V-5B-GGUF/resolve/57437632ddd08bdcbd1508c866aa22e126ed51d2/VAE/Wan2.2_VAE.safetensors" ],
+    "sha256": "e40321bd36b9709991dae2530eb4ac303dd168276980d3e9bc4b6e2b75fed156"
   },
 
   "video-text-encoder": {
     "path": "${modelRoot}/umt5-xxl-encoder-Q8_0.gguf",
-    "urls": [ "${hf}/city96/umt5-xxl-encoder-gguf/resolve/main/umt5-xxl-encoder-Q8_0.gguf" ]
+    "urls": [ "${hf}/city96/umt5-xxl-encoder-gguf/resolve/b535255bee98c2b0a59ea7c0ae2dcd0c6657b3b7/umt5-xxl-encoder-Q8_0.gguf" ],
+    "sha256": "2521d4de0bf9e1cc6549866463ceae85e4ec3239bc6063f7488810be39033bbc"
   }
 }

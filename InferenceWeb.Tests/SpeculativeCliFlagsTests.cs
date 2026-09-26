@@ -453,6 +453,84 @@ public sealed class SpeculativeCliFlagsTests : IDisposable
     }
 
     [Fact]
+    public void SpecType_Alone_ChoosesTheAlgorithmButDoesNotTurnSpeculationOn()
+    {
+        // What --help promises: --spec-type picks WHICH algorithm, and --spec (or a named
+        // --draft-model) is what engages one. `--spec-type ngram` on its own therefore
+        // decodes plainly, which the usage page must keep saying.
+        Assert.True(SpeculativeCliFlags.Apply(new[] { "--spec-type", SpeculatorRegistry.NGram }));
+
+        var speculation = SchedulerConfig.FromEnvironment().Speculation;
+        Assert.Equal(SpeculatorRegistry.NGram, speculation.SpeculatorName);
+        Assert.False(speculation.Enabled);
+        Assert.Null(Environment.GetEnvironmentVariable(SpeculationEnvVars.Enabled));
+    }
+
+    /// <summary>
+    /// Tuning flags alone are said to do nothing, by both hosts (one helper), and nothing
+    /// is said when speculation is on or was turned off in words. The CLI used to say
+    /// nothing at all, so `--spec-type ngram` left only the engine's "off (not requested)".
+    /// </summary>
+    [Theory]
+    [InlineData("--spec-type", "ngram")]
+    [InlineData("--spec-draft", "4")]
+    [InlineData("--spec-pmin=0.3")]
+    public void TuningFlagsAlone_AreReportedAsInert(params string[] args)
+    {
+        bool applied = SpeculativeCliFlags.Apply(args);
+
+        string warning = SpeculativeCliFlags.DescribeInertTuning(applied, SchedulerConfig.FromEnvironment().Speculation);
+
+        Assert.NotNull(warning);
+        Assert.StartsWith("Speculative decoding stays OFF", warning, StringComparison.Ordinal);
+        Assert.Contains("Add --spec", warning, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("--spec-type", "ngram", "--spec")]
+    [InlineData("--spec-type", "ngram", "--no-spec")]
+    [InlineData("--no-spec")]
+    [InlineData]
+    public void SpeculationTurnedOnOrOffInWords_IsNotReportedAsInert(params string[] args)
+    {
+        bool applied = SpeculativeCliFlags.Apply(args);
+
+        Assert.Null(SpeculativeCliFlags.DescribeInertTuning(applied, SchedulerConfig.FromEnvironment().Speculation));
+    }
+
+    [Fact]
+    public void AnExportedTsSpecZero_IsAnExplicitOffAndNotReportedAsInert()
+    {
+        _env.Set(SpeculationEnvVars.Enabled, "0");
+
+        bool applied = SpeculativeCliFlags.Apply(new[] { "--spec-type", "ngram" });
+
+        Assert.Null(SpeculativeCliFlags.DescribeInertTuning(applied, SchedulerConfig.FromEnvironment().Speculation));
+    }
+
+    [Fact]
+    public void BothHosts_LogTheInertSpeculationWarningFromTheSharedHelper()
+    {
+        // The two call sites are top-level code with no seam of their own, so the guard is
+        // on their source: dropping either call brings the silent host back.
+        string root = FindRepoRoot();
+        foreach (string host in new[] { "TensorSharp.Cli/Program.cs", "TensorSharp.Server.Host/Program.cs" })
+        {
+            string source = File.ReadAllText(Path.Combine(root, host));
+            Assert.True(source.Contains("SpeculativeCliFlags.DescribeInertTuning(", StringComparison.Ordinal),
+                $"{host} no longer warns when the speculative flags only tune a speculation nothing turned on.");
+        }
+    }
+
+    private static string FindRepoRoot()
+    {
+        var here = new DirectoryInfo(AppContext.BaseDirectory);
+        while (here != null && !Directory.Exists(Path.Combine(here.FullName, "TensorSharp.Runtime")))
+            here = here.Parent;
+        return here?.FullName ?? throw new DirectoryNotFoundException("no repository root above " + AppContext.BaseDirectory);
+    }
+
+    [Fact]
     public void DraftModel_DoesNotCollideWithSpecDraft()
     {
         // --spec-draft once had longer siblings (--spec-draft-model and friends);

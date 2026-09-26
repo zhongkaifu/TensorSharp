@@ -1,5 +1,7 @@
 # Jev decision inference
 
+[← back to model index](README.md) | [中文](jev_zh-cn.md)
+
 TensorSharp serves a Jev-compatible `POST /v1/systemone` endpoint with the
 DiffusionGemma GGUF. A request supplies state and typed questions; the response
 contains boolean probabilities (`noul`), categorical choices, and expected scores.
@@ -32,7 +34,10 @@ vLLM checkout `0eb42dbbfce96477f4ca174980f4d68336fb1971`, including the
 
 The supplied Q4_K_M checkpoint needs no tokenizer files. Image input needs the
 vision tower, which the configuration downloads once (2.8 GB); text-only decisions
-do not, and `--mmproj none` skips it. From the repository root, in PowerShell:
+do not. `--mmproj none` on the command line makes the server run text-only and
+skips the download too, because a command-line `--mmproj` drops the
+configuration's entry before it is resolved. From the repository root, in
+PowerShell:
 
 ```powershell
 $env:TENSORSHARP_MODELS = 'C:/Works/models'
@@ -158,6 +163,7 @@ three levels produce an expected score between 0 and 2.
 
 | Request field | Default | Meaning |
 |---|---|---|
+| `instructions` | none | Optional request-wide instructions, added to the system text ahead of the questions |
 | `images` | `[]` | Up to 8 inline images, each base64 or a `data:` URL |
 | `samples` | `"auto"` | `1` to `32` independent seeded reads, or adaptive reads |
 | `auto_max` | `4` | Total reads when adaptive uncertainty triggers, at most `32` |
@@ -165,7 +171,7 @@ three levels produce an expected score between 0 and 2.
 | `seed` | `42` | Repeatable canvas noise on the same .NET runtime/backend |
 | `steps` | `1` | Only one-step structured reads are supported |
 | `think` | `0` | Thought generation is not part of this endpoint |
-| `chunk_rows` | server canvas limit | Optional maximum canvas width per question chunk |
+| `chunk_rows` | server canvas limit | Optional maximum canvas width per question chunk, `8` to `4096` |
 | `chunk_prompt` | `"own"` | Include each chunk's questions, or `"shared"` to repeat all questions |
 
 Adaptive mode starts with one read and uses `auto_max` total reads if any
@@ -189,7 +195,8 @@ inside the body; `TS_JEV_MAX_BODY_MB` (1 to 64) sets another limit at startup.
 `TS_JEV_MAX_CANVAS` defaults to 64
 tokens (also bounded by the checkpoint's canvas width); schemas exceeding this
 are split into chunks. `TS_JEV_MAX_PENDING` defaults to 32 admitted requests,
-including the active request. Excess requests receive HTTP 529. Invalid
+including the active request. Excess requests receive HTTP 529 with
+`Retry-After: 1`. Invalid
 requests receive HTTP 422, unknown model names receive HTTP 404, and
 unavailable/non-diffusion models receive HTTP 503. Malformed JSON receives HTTP
 400, oversized bodies receive HTTP 413, and non-JSON media types receive HTTP
@@ -270,8 +277,10 @@ temporary path, named once in the log.
 Each image renders as one `<|image>` marker on the user turn, ahead of the state
 text, and is expanded into `[BOI]` + soft rows + `[EOI]` before the context check
 runs. The row count is the encoder's own output for that picture, not a constant:
-it is `min(patches / 9, 280)`, so a small image costs fewer rows (the 192x384
-traffic-light example produces 253). Budget roughly 282 prompt tokens of
+every picture is resized, up or down, to the largest canvas within the 280-row
+budget whose sides are multiples of 48 px, so the count depends on its aspect
+ratio, not its size (the 192x384 traffic-light example is upscaled to 528x1104
+and produces 253). Budget roughly 282 prompt tokens of
 `MAX_CONTEXT` per image, plus one sentence of system text naming the attachments.
 The encoded rows are installed on the model immediately before the forward that
 prefills that prompt. A schema too wide for the canvas is
@@ -347,9 +356,10 @@ workload before choosing confidence thresholds.
 The answer canvas is sized to the schema, rounded to a 16-token boundary within
 the model's maximum canvas width. Multiple questions share the transformer
 forward. The output head operates on requested label rows instead of allocating
-the full canvas-by-vocabulary logits tensor. GGML GPU execution uses the existing
-DiffusionGemma prompt K/V and fused decode paths; other backends use the unified
-prompt-plus-canvas forward. The model execution lock serializes access to shared
+the full canvas-by-vocabulary logits tensor. `ggml_cuda` and `ggml_metal` use the
+existing DiffusionGemma prompt K/V and fused decode paths; other backends,
+`ggml_vulkan`, `mlx` and `cuda` included, use the unified prompt-plus-canvas
+forward. The model execution lock serializes access to shared
 GPU state with ordinary diffusion chat requests.
 
 GGML CUDA uses fused prompt attention by default, keeping attention operations

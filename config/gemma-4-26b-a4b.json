@@ -2,10 +2,12 @@
   // Gemma-4 26B-A4B (QAT UD-Q4_K_XL) — Mixture-of-Experts multimodal LLM
   // (~14 GB, ~4B active params) with its vision projector and MTP draft head.
   // Run with:
-  //   TensorSharp.Cli    --config config/gemma-4-26b-a4b.json --image photo.png
-  //   TensorSharp.Server --config config/gemma-4-26b-a4b.json
+  //   TensorSharp.Cli         --config config/gemma-4-26b-a4b.json --image photo.png
+  //   TensorSharp.Server.Host --config config/gemma-4-26b-a4b.json
+  // Missing files download from unsloth, pinned by commit and SHA-256.
   "variables": {
-    "modelRoot": "${TENSORSHARP_MODELS:-../models}"
+    "modelRoot": "${TENSORSHARP_MODELS:-../models}",
+    "repo": "https://huggingface.co/unsloth/gemma-4-26B-A4B-it-qat-GGUF/resolve/7b92b5b28818151e8669af2e45e88d6086f490dd"
   },
 
   "backend": "ggml_cuda",
@@ -16,10 +18,27 @@
   "top-k": 64,
   "top-p": 0.95,
 
-  "model": "${modelRoot}/gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf",
-  "mmproj": "${modelRoot}/gemma-4-26B-A4B-mmproj-BF16.gguf",
+  "model": {
+    "path": "${modelRoot}/gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf",
+    "urls": ["${repo}/gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf"],
+    "sha256": "a7c5bc715f5ff8e99a3e8901ce7d2b42b402c669bf24f7c5250747633d0f5891"
+  },
+  "mmproj": {
+    "path": "${modelRoot}/gemma-4-26B-A4B-mmproj-BF16.gguf",
+    "urls": ["${repo}/mmproj-BF16.gguf"],
+    "sha256": "7b06953ccdbe8cf363f47841a7afaacd2b1c2ff9a8d6b426fdec7521a6878744"
+  },
 
-  // MTP speculative decoding (server only): separate draft GGUF, lossless.
-  "spec": false,
-  "draft-model": "${modelRoot}/gemma-4-26B-A4B-it-Q4_0-MTP.gguf"
+  // MTP speculative decoding, on both hosts: Gemma-4's draft head ships as its
+  // own GGUF, and naming it here turns speculation ON by itself -- no "spec" key
+  // is needed ("spec": false would do nothing: a JSON false emits no flag).
+  // Lossless. The Gemma-4 speed-up was measured on a DENSE checkpoint; none is
+  // recorded for this MoE, and a comparable A3B MoE ran 2x slower with
+  // speculation on, so measure it and pass --no-spec on the command line if it
+  // loses (the draft file is still fetched).
+  "draft-model": {
+    "path": "${modelRoot}/gemma-4-26B-A4B-it-Q4_0-MTP.gguf",
+    "urls": ["${repo}/MTP/mtp-gemma-4-26B-A4B-it-Q4_0.gguf"],
+    "sha256": "7272d97595f0d4c74bd7b623492b7dbdaafd8b7c72f329a8270ba4eca68f768a"
+  }
 }

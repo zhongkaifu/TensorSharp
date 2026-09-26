@@ -64,7 +64,7 @@ Put this at the top of the Space's `README.md`. In the current server contract,
 `GET /` serves the chat UI, so the bare Space root
 (`https://<user>-<space>.hf.space/`) is the UI link; `/index.html` still works
 as an explicit alias. The plain liveness response
-(`"TensorSharp.Server.Host is running"`) lives at `/health`.
+(`"TensorSharp.Server is running"`) lives at `/health`.
 
 ```yaml
 ---
@@ -118,7 +118,7 @@ Model sizing guidance:
 |---|---|---|
 | **gemma-4-E2B-it (abliterated, QAT)** (default) | ~3.4 GB | Multimodal; decodes acceptably on CPU |
 | gemma-4-12B-it (abliterated) | ~7.4 GB | Higher quality; slow to decode on CPU — prefer `cpu-upgrade` |
-| Qwen3.5-9B Q8_0 | ~8.9 GB | Text-only; highest-quality local quant, but slow on CPU — prefer GPU acceleration |
+| Qwen3.5-9B Q8_0 | ~8.9 GB | Text-only unless `MMPROJ_URL`/`MMPROJ_FILE` point at `mmproj-F16.gguf` from [unsloth/Qwen3.5-9B-GGUF](https://huggingface.co/unsloth/Qwen3.5-9B-GGUF), which adds image input; highest-quality local quant, but slow on CPU — prefer GPU acceleration |
 
 The default gemma-4-E2B image already downloads the `mmproj` projector and passes
 `--mmproj` in the `CMD`, so vision input works out of the box. To host a
@@ -126,20 +126,35 @@ text-only server, build with `--build-arg MMPROJ_FILE=` (empty) so the projector
 download and `--mmproj` flag are dropped. For real multimodal throughput, use a
 paid GPU hardware tier — base the image on a CUDA runtime, build the native
 bridge with `bash build-linux.sh --cuda`, and run with `--backend ggml_cuda`.
-For a DiffusionGemma GGUF, also leave `MMPROJ_FILE` empty; the Web UI exposes
-live denoising previews while the compatibility APIs return final text.
+For a DiffusionGemma GGUF, leave `MMPROJ_FILE` empty for a text-only build. No
+published DiffusionGemma GGUF carries the vision tower; for image input, point
+`MMPROJ_URL`/`MMPROJ_FILE` at the upstream shard `model-00011-of-00011.safetensors`
+from [google/diffusiongemma-26B-A4B-it](https://huggingface.co/google/diffusiongemma-26B-A4B-it)
+(2.84 GB), which the server loads directly as `--mmproj` (keep the
+`.safetensors` extension in `MMPROJ_FILE`; the loader dispatches on it). Audio
+and video input are refused.
+The Web UI exposes live denoising previews while the compatibility APIs return
+final text.
 
-## Space root shows "TensorSharp.Server.Host is running"
+## Space root shows "TensorSharp.Server is running"
 
-That means the image is serving without the Web UI assets: `GET /` sends
+Usually that means the image is serving without the Web UI assets: `GET /` sends
 `wwwroot/index.html` when it is present and falls back to the liveness response
 when it is not. Check that `wwwroot/` was published into the application
 directory the container launches from, as both Dockerfiles do — static
 image/CSS paths depend on the same thing. The liveness response is always
 available at `/health`.
 
-Also note `GET /api/chat` returns 404 in a browser because it is a **POST**-only
-endpoint — the web UI calls it with POST; it is not a deployment error.
+It also happens when the Web UI is switched off with `--no-webui` or the
+`TS_NO_WEBUI` environment variable (any non-empty value except `0`): then `GET /` always
+answers the liveness text and paths with no matching route return 404, even
+when `wwwroot/index.html` is present.
+
+Also note that opening `/api/chat` in a browser does not call the API: it is a
+**POST**-only endpoint (the web UI calls it with POST), so a browser `GET` gets
+the same fallback as any path with no matching route — the chat page when
+`wwwroot/index.html` is present, a 404 when it is not or when the Web UI is
+disabled. It is not a deployment error.
 
 ## Verifying locally
 

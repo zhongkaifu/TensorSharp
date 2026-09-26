@@ -1028,6 +1028,12 @@ namespace TensorSharp.AgentHost.Skills
     /// </summary>
     public interface ISkillScriptRunner
     {
+        /// <summary>Whether this runner can preserve confinement in a child workspace.</summary>
+        bool CanForkForWorkspace => false;
+
+        /// <summary>Clone the runner with a child workspace and no broader permissions.</summary>
+        ISkillScriptRunner? ForkForWorkspace(SessionWorkspace workspace, ICodeRunner? packageInstaller) => null;
+
         /// <summary>
         /// Run <paramref name="relativePath"/> inside <paramref name="skill"/>.
         /// Implementations must resolve the path through

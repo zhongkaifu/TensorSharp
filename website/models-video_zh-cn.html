@@ -35,7 +35,7 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/minimax_h3_fl2va_p
     --backend ggml_metal --prompt "a red fox trotting through falling snow, cinematic" \
     --width 640 --height 384 --video-frames 22 --diffusion-steps 8 --cfg 1.0 --output fox.mp4</code></pre>
 
-  <p>也可以把四个网络都写进配置文件，让第一次运行自动下载——<code>config/minimax-h3-fl2va.json</code> 用于关键帧，<code>config/minimax-h3-ref2va.json</code> 用于参考。两者只有 <code>model</code> 一项不同，因此文本编码器与两个 VAE 只下载一次并共用（总计约 33.5 GB）。上面那对分词器文件是自动下载唯一补不上的东西，因为它不是一个命令行选项：</p>
+  <p>也可以把四个网络都写进配置文件，让第一次运行自动下载——<code>config/minimax-h3-fl2va.json</code> 用于关键帧，<code>config/minimax-h3-ref2va.json</code> 用于参考。两者只有 <code>model</code> 一项不同，因此文本编码器与两个 VAE 只下载一次并共用（总计约 35.5 GB）。上面那对分词器文件是自动下载唯一补不上的东西，因为它不是一个命令行选项：</p>
   <pre data-lang="bash"><code>dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --config config/minimax-h3-fl2va.json \
     --prompt "a red fox trotting through falling snow, cinematic" --output fox.mp4
 dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --config config/minimax-h3-ref2va.json</code></pre>
@@ -92,7 +92,7 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/minimax_h3_ref2va_
 
   <h3 id="h3-length">长度、尺寸，以及长片段的上限</h3>
   <p>宽高向<strong>上</strong>取整到 32 的倍数。帧数向上对齐到 <code>17k+5</code> 网格——5、22、39、56、73、90……——这来自视频 VAE 的时间分块，而不是随意选定的；fps 无论请求写什么都固定为 24。任意网格长度的片段都能正确解码：VAE 每次跑 5 个潜变量帧、带 2 帧前瞻，并对接缝做交叉淡化。反过来，一次性解码长片段会让细节被逐渐冲淡——对着条件照片测量，第 0 帧的相关度从 22 帧时的 0.97 掉到 90 帧时的 0.86——所以分块是正确性要求，而不是优化。只想要画面时用 <code>--no-audio</code> 跳过音频解码，省下音频 VAE 的时间与内存。</p>
-  <div class="callout warn"><div class="ic">⚠️</div><p><strong>长片段过去会整片全黑。</strong>H3 在一条不加掩码的打包序列上做双向注意力，因此它的 key 数量就是整段片段——22 帧是 2364 个 token，107 帧是 8646——而所有内置的 ggml flash attention 内核都把 softmax 分子保持在 FP16，只留三个比特的余量。107 帧的片段在第一个去噪步就溢出成 NaN，回来时每个像素全黑、每个音频采样被削平，而同一条请求在 73 帧下却完全正常。现在 <code>h3_attend</code> 会按 key 数量取一个 2 的幂预先缩放 V，并在输出上还原——由于注意力对 V 是线性的，这一步是精确的；采样器也不再保存已经发散的片段，而是让请求失败并指出是哪一步，不再写出一个全黑文件。设 <code>TS_H3_TRACE=1</code> 可打印每一步的潜变量与速度幅值。</p></div>
+  <div class="callout warn"><div class="ic">⚠️</div><p><strong>长片段过去会整片全黑。</strong>H3 在一条不加掩码的打包序列上做双向注意力，因此它的 key 数量就是整段片段——22 帧是 2364 个 token，107 帧是 8646——而所有上游 ggml flash attention 内核都把 softmax 分子保持在 FP16，只留三个比特的余量。107 帧的片段在第一个去噪步就溢出成 NaN，回来时每个像素全黑、每个音频采样被削平，而同一条请求在 73 帧下却完全正常。现在 <code>h3_attend</code> 会按 key 数量取一个 2 的幂预先缩放 V，并在输出上还原——由于注意力对 V 是线性的，这一步是精确的；采样器也不再保存已经发散的片段，而是让请求失败并指出是哪一步，不再写出一个全黑文件。设 <code>TS_H3_TRACE=1</code> 可打印每一步的潜变量与速度幅值。</p></div>
   <div class="callout note"><div class="ic">💡</div><p>音频写成 MP4 旁边的 <code>.wav</code> 独立文件，而不是混流进去，因为混流需要一个未必装了的编码器；用 <code>ffmpeg -i fox.mp4 -i fox.wav -c:v copy -c:a aac fox_with_audio.mp4</code> 合并。完整说明见 <a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/models/minimax-h3_zh-cn.md">MiniMax-H3 模型卡</a>。</p></div>
 
   <h3 id="h3-speed">两台机器上的速度</h3>
@@ -106,7 +106,7 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model models/minimax_h3_ref2va_
     </tbody>
   </table>
   </div>
-  <p>按<em>单个去噪步</em>算，在这台 CUDA 机器上 TensorSharp 依然更快——3.325 s 对 3.338 s，由 8 步与 16 步的斜率求得——所以 640×384 上落后的那 3.9 s 全在固定的启动开销上，而其中约 3 s 根本不是推理：TensorSharp 编码 H.264，而 <code>stable-diffusion.cpp</code> 把 MJPEG+PCM 写进 AVI；此外还有 .NET 进程启动对原生二进制的差距。两台机器结论相反，是因为 3080 这台刻意很紧张——16 384 MiB 显存、31.7 GB 内存，对着一套 33.5 GB 的模型文件，权重装不下、页缓存也装不下，于是在一分钟量级的运行里启动开销占了主导。那台机器上的显存峰值，TensorSharp 是 15 780 MiB，<code>stable-diffusion.cpp</code> 是 12 035 MiB，后者用的是 <code>--auto-fit --stream-layers --diffusion-fa --rng cpu</code>；它默认的 <code>--offload-to-cpu</code> 路径在这台机器上根本跑不了这个模型，因为它要把 17.7 GB 锁进只有 12.3 GB 空闲的内存里。</p>
+  <p>按<em>单个去噪步</em>算，在这台 CUDA 机器上 TensorSharp 依然更快——3.325 s 对 3.338 s，由 8 步与 16 步的斜率求得——所以 640×384 上落后的那 3.9 s 全在固定的启动开销上，而其中约 3 s 根本不是推理：TensorSharp 编码 H.264，而 <code>stable-diffusion.cpp</code> 把 MJPEG+PCM 写进 AVI；此外还有 .NET 进程启动对原生二进制的差距。两台机器结论相反，是因为 3080 这台刻意很紧张——16 384 MiB 显存、31.7 GB 内存，对着一套约 35.5 GB 的模型文件，权重装不下、页缓存也装不下，于是在一分钟量级的运行里启动开销占了主导。那台机器上的显存峰值，TensorSharp 是 15 780 MiB，<code>stable-diffusion.cpp</code> 是 12 035 MiB，后者用的是 <code>--auto-fit --stream-layers --diffusion-fa --rng cpu</code>；它默认的 <code>--offload-to-cpu</code> 路径在这台机器上根本跑不了这个模型，因为它要把 17.7 GB 锁进只有 12.3 GB 空闲的内存里。</p>
   <p><strong>在装不下整个模型的显卡上，现在有两件事会自动发生。</strong>其一，当去噪器与视频 VAE 放不下时，去噪器的设备驻留会在视频 VAE 加载<em>之前</em>先交还：已经跑完的 10.6 GB 去噪器加上 5.2 GB 的 VAE，在 16 GB 卡上是 15.8 GB，而 WDDM 不会让这次分配失败——它会悄悄用主机内存兜住溢出部分，于是整个解码都以 PCIe 的速度跑。解码期间的显存峰值从 16 041 MiB 降到约 5 600 MiB，在 640×384 上值 <strong>22 s</strong>。其二，去噪器文件现在会被顺序读一遍，并与它自己的上传流水化：权重是以指针形式绑定到 mmap 的 GGUF 上的，所以第一次上传原本会<em>在</em>主机到设备的拷贝<em>内部</em>把每一页从磁盘缺页读进来——0.91 GB/s，正是驱动最糟的情形，而页面驻留后是 5.97 GB/s。第一个去噪步 14.87 s → 约 10.2 s。两者合起来，让这台 RTX 3080 Laptop 在 640×384 上从 89.0 s 降到 <strong>63.7 s</strong>，在 256×256 上从 67.2 s 降到 <strong>43.6 s</strong>；prefault 开与关的输出逐字节相同。两者的判据并不相同——释放常驻看的是实测空闲显存，预读看的是空闲主存——各自在对应资源充裕时自动让路，因此资源够用的机器行为完全不变。</p>
   <div class="table-scroll">
   <table>
@@ -202,7 +202,7 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll \
   <ul>
     <li><strong>UMT5-XXL 文本编码器</strong> —— 提示词 → 条件向量（<code>--video-text-encoder</code> / <code>TS_WAN_TE</code>）。去噪开始前即从显存释放。</li>
     <li><strong>因果 3D 视频 VAE</strong> —— 潜变量 ↔ 帧（<code>--video-vae</code> / <code>TS_WAN_VAE</code>）。需要哪一个由 DiT 自身读出，不用你指定：Wan 2.1 与 A14B 使用 <code>wan_2.1_vae</code>，TI2V-5B 使用 <code>Wan2.2_VAE</code>。</li>
-    <li><strong>A14B 的第二个专家</strong> —— 两个 14B 专家必须同时存在。把它们放在同一目录，或放进 <code>HighNoise/</code> 与 <code>LowNoise/</code> 子目录，加载器会依据文件名配对（<code>TS_WAN_DIT2</code> 可覆盖；没有对应的 CLI 参数）。</li>
+    <li><strong>A14B 的第二个专家</strong> —— 两个 14B 专家必须同时存在。把它们放在同一目录，或放进 <code>HighNoise/</code> 与 <code>LowNoise/</code> 子目录，加载器会依据文件名配对（可用 CLI / 服务端参数 <code>--video-dit2</code> 或 <code>TS_WAN_DIT2</code> 覆盖；旧写法 <code>--wan-dit2</code> 仍可使用）。</li>
   </ul>
   <div class="table-scroll">
   <table>

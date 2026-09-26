@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>基准测试 — TensorSharp 维基</title>
-  <meta name="description" content="TensorSharp 对比 llama.cpp 与 stable-diffusion.cpp 的基准测试结果、MiniMax-H3 与 Wan 的视频提速杠杆，以及测试框架如何运作。">
+  <meta name="description" content="TensorSharp 对比 llama.cpp 与 stable-diffusion.cpp 的基准测试结果、Qwen-Image-2.1 的 LoRA 与前缀缓存结果、MiniMax-H3 与 Wan 的视频提速杠杆，以及测试框架如何运作。">
   <link rel="icon" href="assets/logo.svg" type="image/svg+xml">
   <link rel="stylesheet" href="assets/style.css">
   <script>try{var t=localStorage.getItem('ts-theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');document.documentElement.classList.toggle('dark',t==='dark');}catch(e){}</script>
@@ -16,7 +16,7 @@
 <main class="content" id="content">
   <div class="breadcrumb"><a href="index_zh-cn.html">首页</a> › 基准测试</div>
   <h1>基准测试</h1>
-  <p class="lede">TensorSharp 在相同模型与硬件上与其他推理引擎的对比 —— 文本对比 <code>llama.cpp</code>，视频生成对比 <code>stable-diffusion.cpp</code> —— 以及守护正确性的测试框架。</p>
+  <p class="lede">TensorSharp 在相同模型与硬件上与其他推理引擎的对比 —— 文本对比 <code>llama.cpp</code>，图像与视频生成对比 <code>stable-diffusion.cpp</code> —— 以及守护正确性的测试框架。</p>
 
   <h2 id="head-to-head">同台对比：TensorSharp vs llama.cpp</h2>
   <p><strong>TensorSharp 的 .NET 运行时与原生 GGML 执行路径对比 <code>llama.cpp</code></strong> —— 相同 GGUF、相同 <strong>NVIDIA RTX 3080 Laptop GPU（16 GB）</strong>、统一的 OpenAI <code>/v1/chat/completions</code> 接口，且<strong>两个引擎均分别在 GGML CUDA 与 GGML Vulkan 构建上测量</strong>，覆盖短提示、长上下文与多轮对话场景。下方数据来自当前签入的 <code>benchmarks/engine_comparison</code> harness 运行（<code>docs/engine_comparison_report.md</code>），可在自己的硬件上复现。</p>
@@ -46,7 +46,7 @@
   </div>
   <p>这些领先来自 TensorSharp 的架构专属快路径：融合的整模型 prefill/verify 图（配以融合的 FFN / attention 内核）、融合的整模型 decode，以及 vLLM 式<a href="advanced_zh-cn.html#continuous-batching">带跨请求前缀共享的分页 KV 缓存</a>。即便在极限量化下引擎也不落下风：在 2-bit IQ2_XXS 权重上，dense Qwen 3.6 27B 的 decode 快 1.07×（CUDA）/ 1.02×（Vulkan），35B-A3B MoE 的 prefill 快 1.28×——这些结果对应所测模型与原生 GGML 后端。剩余低于 1.0× 的项——主要是 Qwen 3.6 35B-A3B 在 Vulkan 上的 decode（0.87×）、Qwen 3.6 27B dense 的 prefill（CUDA 0.96× / Vulkan 0.85×）以及 E4B 在 Vulkan 上的长提示 prefill（0.71×）——仍是正在优化的目标，而非最终结果。</p>
 
-  <p><strong>文本场景之外</strong> —— harness 还支持工具调用、结构化输出（JSON）、图像 / 音频 / 视频、MTP 开/关与并发扩展等场景。Qwen-Image-2.1 另有自己的 TensorSharp 对比 <code>stable-diffusion.cpp</code> 的运行脚本 <code>eng/validation/qwen-image21-bench.py</code>。这些 cell 可通过 <code>benchmarks/engine_comparison</code> 中记录的 harness 参数启用。</p>
+  <p><strong>文本场景之外</strong> —— harness 还支持工具调用、结构化输出（JSON）、图像 / 音频 / 视频、MTP 开/关与并发扩展等场景。Qwen-Image-2.1 另有自己的 TensorSharp 对比 <code>stable-diffusion.cpp</code> 的运行脚本 <code>eng/validation/qwen-image21-bench.py</code>（<a href="#qwen-image21">结果见下文</a>）。这些 cell 可通过 <code>benchmarks/engine_comparison</code> 中记录的 harness 参数启用。</p>
 
   <div class="callout note"><div class="ic">⚖️</div><p>诚实的对比会同时展示胜势与差距。这些数字来自单台机器（RTX 3080 Laptop、单流）；你的硬件、模型与量化都会改变它们。请在你自己的机器上运行内置基准与引擎对比框架，得到对你而言真正有意义的数字。</p></div>
 
@@ -67,8 +67,21 @@
   <p>比值为 TensorSharp 相对 llama.cpp，<strong>&gt; 1.0× 表示 TensorSharp 更快</strong>。这轮测量在 TensorSharp 一侧找出四处计算图构建上的差距——残差 add 的写法让 ggml 的 norm+add 融合无法生效、融合 QKV 用拷贝而不是带步长的视图来切分、以及饱和后的滑动窗口被旋转读取并逐 token 重建——单个单元最高收益 <strong>+12.6%</strong>（gemma-4-E4B tg128@4096），且没有任何单元回退。文中还记录了两项<em>没有</em>收益的改动，以免重复尝试。完整方法、逐单元数据与过程中发现的一处正确性 bug：<a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/perf/metal-vs-llama-cpp.md" target="_blank" rel="noopener"><code>docs/perf/metal-vs-llama-cpp.md</code></a>。</p>
   <div class="callout note"><div class="ic">🔬</div><p>此处两个引擎带的 <code>ggml</code> checkout 并不相同（TensorSharp 的新约两周）。这个混淆因素对 TensorSharp 有利，因此该文档的结论只针对 TensorSharp 自身的计算图构建，而不是针对 <code>ggml</code>。</p></div>
 
+  <h3>Bonsai2 对比发布方的 llama.cpp</h3>
+  <p>Bonsai2 经 PRISM 旋转的 <code>qwen35</code> 检查点（<code>PQ2_0</code> 与 <code>PTQ1_0</code>，加载时转码为 <code>Q2_0</code>）对比的是发布方自己的 llama.cpp checkout，也就是其模型卡为这两种格式采用的基线。在 Apple M5 Pro（48 GiB）验证机上使用 <code>ggml_metal</code>，单位 tokens/s，TensorSharp / 发布方 llama.cpp：</p>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>格式</th><th>Prefill 512</th><th>Decode 64</th><th>HTTP，并发 4</th></tr></thead>
+    <tbody>
+      <tr><td><code>PQ2_0</code></td><td>364.05 / 384.44</td><td>25.50 / 26.96</td><td>28.40 / 32.57</td></tr>
+      <tr><td><code>PTQ1_0</code></td><td>364.49 / 357.67</td><td>25.53 / 26.31</td><td>28.17 / 16.15</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>模型本身的速率是上下文深度为零时三次预热运行的均值；HTTP 速率是三次运行的中位数，每个请求生成 64 个 token。两个引擎分开运行，没有温度遥测，也没有交替重复，因此细小差异不能证明任何一方普遍更快。验证只覆盖 Metal：CUDA、Vulkan、iOS 与张量并行执行均未验证。详见 <a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/models/bonsai2_zh-cn.md" target="_blank" rel="noopener"><code>docs/models/bonsai2_zh-cn.md</code></a>。</p>
+
   <h2 id="muse-glimmer">Muse-Glimmer 30B，带与不带 DFlash</h2>
-  <p>这是在另一套硬件上单独手工执行的对比：<strong>单张 RTX PRO 6000 Blackwell（96 GB）</strong>，<code>Muse-Glimmer-30B-Q8_0</code>，两侧都是贪心，生成 128 token，两次重复且两个引擎交替执行；关键在于<strong>两侧 prefill 的是同一串 token</strong>（把 TensorSharp 渲染后的聊天提示交给 <code>llama-cli -no-cnv</code>，再用 <code>llama-tokenize</code> 确认 token 数一致）。llama.cpp 为 master <code>8e7f22b</code>，与 TensorSharp 内置的 ggml 相差一天以内。</p>
+  <p>这是在另一套硬件上单独手工执行的对比：<strong>单张 RTX PRO 6000 Blackwell（96 GB）</strong>，<code>Muse-Glimmer-30B-Q8_0</code>，两侧都是贪心，生成 128 token，两次重复且两个引擎交替执行；关键在于<strong>两侧 prefill 的是同一串 token</strong>（把 TensorSharp 渲染后的聊天提示交给 <code>llama-cli -no-cnv</code>，再用 <code>llama-tokenize</code> 确认 token 数一致）。llama.cpp 为 master <code>8e7f22b</code>，与 TensorSharp 构建时使用的 ggml checkout 相差一天以内。</p>
   <div class="table-scroll">
   <table>
     <thead><tr><th>提示 token 数</th><th>prefill（llama.cpp → TS）</th><th>decode（llama.cpp → TS）</th><th>DFlash decode（llama.cpp → TS）</th></tr></thead>
@@ -113,7 +126,34 @@
     </tbody>
   </table>
   </div>
-  <p>Decode 在 1% 以内打平，而 TensorSharp 加载这份 236.4 GiB 的权重快 <strong>2.9×</strong>。诚实的差距在首 token 时延：41.9 s 对 29.0 s，约<strong>慢 1.4×</strong>，这也是那轮对比中最值得动手的一处。llama.cpp 的 prefill 单元是故意留空的：那次运行早于客户端在流里索取 usage，因此它没有自己的提示 token 计数，也就没有可记录的 tok/s 数字。两个引擎跑的都是整层切分放置（TensorSharp 用 <code>--tp 1</code> 选它）；<code>--tp 8</code> 在这个模型上意味着真正的张量并行、每个 rank 都跑每一层，需要<strong>每个 rank 41.7 GiB</strong>，装不进 46 GB 的卡 —— 它是一个被接受的模式，加载时会把这笔算术连同办法一起打印出来，但并不是一份已实测的配置。方法、模型来源与该矩阵的其余部分：<a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/validation/cross-engine-2026-09/README.md" target="_blank" rel="noopener"><code>docs/validation/cross-engine-2026-09/README.md</code></a>。</p>
+  <p>Decode 在 1% 以内打平，而 TensorSharp 加载这份 236.4 GiB 的权重快 <strong>2.9×</strong>。诚实的差距在首 token 时延：41.9 s 对 29.0 s，约<strong>慢 1.4×</strong>，这也是那轮对比中最值得动手的一处。llama.cpp 的 prefill 单元是故意留空的：那次运行早于客户端在流里索取 usage，因此它没有自己的提示 token 计数，也就没有可记录的 tok/s 数字。两个引擎跑的都是整层切分放置（TensorSharp 用 <code>--tp 1</code> 选它）；<code>--tp 8</code> 在这个模型上意味着真正的张量并行、每个 rank 都跑每一层，需要<strong>每个 rank 41.7 GiB</strong>，装不进 46 GB 的卡 —— 它是一个被接受的模式，加载时会把这笔算术连同办法一起打印出来，但并不是一份已实测的配置。方法、模型来源与该矩阵的其余部分：<code>docs/validation/cross-engine-2026-09/README.md</code>（本地验证记录，未提交到 Git）。</p>
+
+  <h2 id="qwen-image21">Qwen-Image-2.1：LoRA 插件与前缀缓存</h2>
+  <p>2026-09-25 对 <strong><code>stable-diffusion.cpp</code></strong> <code>19bbbca</code> 手工执行的图像对比，两个引擎都基于未修改的 ggml <code>353b63b</code>。每次运行都是 1024×1024 文生图，提示词相同、种子 42、CFG 1、Euler，并使用同一个 F32 sigma 向量，每个引擎各自在全新进程中运行；每种配置跑两次、两个引擎轮流先跑，表中为中位数。每步秒数取稳态步，不含第一步。不使用步数蒸馏 LoRA 时，6 步本来就会得到模糊图像（模型默认 40 步），因此「无 LoRA」一行只衡量速度，不衡量质量。</p>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>配置</th><th>步数</th><th>M5 Pro <code>ggml_metal</code> 秒/步（TS / sd.cpp）</th><th>M5 Pro 总耗时</th><th>RTX 4000 Ada <code>ggml_cuda</code> 秒/步（TS / sd.cpp）</th><th>RTX 4000 Ada 总耗时</th></tr></thead>
+    <tbody>
+      <tr><td>无 LoRA</td><td>6</td><td><span class="yes">7.52</span> / 8.59</td><td><span class="yes">51.8</span> / 61.7 s</td><td><span class="yes">1.57</span> / 1.85</td><td><span class="yes">20.0</span> / 26.5 s</td></tr>
+      <tr><td>Viggle Turbo r128</td><td>6</td><td><span class="yes">7.94</span> / 9.40</td><td><span class="yes">54.5</span> / 67.0 s</td><td><span class="yes">1.94</span> / 2.53</td><td><span class="yes">23.3</span> / 32.6 s</td></tr>
+      <tr><td>Pruna 8-step</td><td>8</td><td><span class="yes">7.91</span> / 9.39</td><td><span class="yes">69.7</span> / 85.5 s</td><td><span class="yes">1.94</span> / 2.53</td><td><span class="yes">26.6</span> / 37.6 s</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>LoRA 在 Metal 上每步增加 5–7%（sd.cpp：9–11%），在 CUDA 上增加 22–27%（sd.cpp：36–38%），rank 64、128 与 256 之间相差不到 3%。整图 VAE 现在是 Metal 与 CUDA 上的默认路径，在 M5 Pro 上解码 1024×1024 用时 5.0 s，逐卷积路径为 13.0 s，sd.cpp 为 7.1 s。在 CUDA 机器上，sd.cpp 做整图解码时显存不足，会改用 256×256 分块重试，其总耗时包含这次重试。步数蒸馏插件位于 <code>config/lora/</code>，自带采样配方；见<a href="models-image_zh-cn.html">图像模型</a>。</p>
+  <h3 id="qwen-image21-prefix-cache">前缀 KV 缓存</h3>
+  <p>文本与参考图 token 在去噪步之间不会变化，因此第 1 步保存它们的 K/V，之后各步只计算目标图像（默认开启；<code>TS_QWEN21_PREFIX_CACHE=0</code> 关闭）。下表每张输出 PNG 都与无缓存构建的结果逐字节一致。每步耗时取第 2 步起，使用 Q4_K_M 文件：</p>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>负载</th><th>M5 Pro <code>ggml_metal</code></th><th>A40 <code>ggml_cuda</code></th></tr></thead>
+    <tbody>
+      <tr><td>生成 1024²，40 步</td><td>7.91 → 7.84 s（1.01×）</td><td>1.151 → 1.113 s（1.03×）</td></tr>
+      <tr><td>编辑，1 张参考图，1024²，40 步</td><td>17.97–18.00 → 9.65–10.38 s（<span class="yes">1.73–1.86×</span>）</td><td>2.547 → 1.328 s（<span class="yes">1.92×</span>）</td></tr>
+      <tr><td>编辑，2 张参考图，1024²，40 步</td><td>33.32 → 11.46 s（<span class="yes">2.91×</span>）</td><td>4.106 → 1.538 s（<span class="yes">2.67×</span>）</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>缓存的收益与前缀在序列中所占比例成正比：生成任务的前缀只有提示词，收益 1–3%；编辑任务收益最大。单张 A40 在 <code>ggml_vulkan</code> 上，单参考图 1024² 编辑从每步 4.93 s 降到 2.67 s。在两张 A40 上用 <code>--tp 2</code> 时，扩散 Transformer 每步在 CUDA 上快 1.34–1.57×，在 Vulkan 上为 0.86× —— 见<a href="distributed_zh-cn.html#perf-qwen-image">多 GPU</a>。完整表格（包括 8 位缓存存储）见仓库中英文版的 <code>docs/models/qwenimage21.md</code> 卡片（中文摘要见 <code>docs/models/qwenimage21_zh-cn.md</code>）。</p>
 
   <h2 id="minimax-h3">MiniMax-H3：视频与音频一次生成</h2>
   <p>MiniMax-H3 在同一个打包潜变量里对画面和原生 <strong>32&nbsp;kHz 立体声</strong>音轨一起去噪，因此下面每个数字都是同时产出两者的一次完整运行。同一条 22 帧、8 步的请求在两台机器上对 <strong><code>stable-diffusion.cpp</code></strong> 做过测量，而<strong>两者的结论并不一致</strong>。两组数据都列在下面，各自标明硬件；它们互不取代，把两者平均出来的数字不对应任何一台真实存在的机器。</p>
@@ -132,7 +172,7 @@
   <p>应当以第二行为准：<strong>人脸需要像素</strong>，所以 640×384 才是起点，256×256 只是让倍数好看的那个角落，而不是真正拿来出片的尺寸。两行都是同一条 22 帧、8 步的请求；由于权重是 CFG 蒸馏的，这 8 步就是 8 次 DiT 前向，而不是 16 次。→ <a href="models-video_zh-cn.html#minimax-h3">MiniMax-H3 下载与模式</a></p>
 
   <h3>RTX 3080 Laptop 16 GB、<code>ggml_cuda</code></h3>
-  <p>同一条请求，换到一台刻意被内存卡死的机器上 —— <strong>16,384 MiB 显存、31.7 GB 内存，面对 33.5 GB 的模型集合</strong>（DiT 10.64 GiB、Qwen3-VL-32B 16.97 GiB、视频 VAE 4.85 GiB、音频 VAE 0.56 GiB，两个引擎用的是同一批权重文件）。22 帧、8 步、同一随机种子、三次取最好，发布构建；对手是 <code>stable-diffusion.cpp</code> <code>97d2990</code>（ggml <code>8e800ce</code>），按 <code>SD_CUDA=ON</code>、arch 86 重新编译。在这台机器上，整体耗时是 <code>stable-diffusion.cpp</code> 更快：</p>
+  <p>同一条请求，换到一台刻意被内存卡死的机器上 —— <strong>16,384 MiB 显存、31.7 GB 内存，面对约 35.5 GB 的模型集合</strong>（DiT 10.64 GiB、Qwen3-VL-32B 16.97 GiB、视频 VAE 4.85 GiB、音频 VAE 0.56 GiB，两个引擎用的是同一批权重文件）。22 帧、8 步、同一随机种子、三次取最好，发布构建；对手是 <code>stable-diffusion.cpp</code> <code>97d2990</code>（ggml <code>8e800ce</code>），按 <code>SD_CUDA=ON</code>、arch 86 重新编译。在这台机器上，整体耗时是 <code>stable-diffusion.cpp</code> 更快：</p>
   <div class="table-scroll">
   <table>
     <thead><tr><th>分辨率</th><th><code>stable-diffusion.cpp</code></th><th>TensorSharp</th><th>端到端</th></tr></thead>
@@ -242,13 +282,15 @@
   <p><code>InferenceWeb.Tests</code> 测试无需运行服务器的进程内行为：托管量化运算、直接 CUDA 与 MLX 后端内核（在硬件可用时）、分页 KV 调度、批量执行器正确性、各模型批量前向与 legacy 路径的一致性、MTP / NextN 推测解码正确性、纯 C# DeepSeek V4.1 执行器对独立 PyTorch 参考实现的数值门控、DiffusionGemma 探针、编解码器往返、提示词渲染，以及服务器 CLI 选项构建器。</p>
   <p>其中 V4.1 那一项值得展开说。<code>InferenceWeb.Tests.Dsv41CpuExecutorTests</code> 把 <code>DeepSeek4CpuExecutor</code>（<code>--backend cpu</code> 跑 DeepSeek V4.1 Flash 所用的 100% 纯 C# 执行器，不依赖 ggml、不依赖原生库、不依赖 GPU）对齐到独立的 PyTorch 参考实现 <code>eng/dsv41-reference.py</code>，容差 <code>atol=rtol=2e-5</code>，并要求贪心 argmax 完全一致，覆盖一次性 prefill、分块 prefill（块大小 1/3/5/8，逐位置检查）与 reset。有两条注意事项必须一起交代：这些测试在<strong>未设置 <code>TS_DSV41_FIXTURE_DIR</code> 时会静默返回</strong>；而 fixture 是刻意做小的 —— 五层、256 隐藏维、16 token 的 F32 合成模型 —— 因此它证明的是与参考实现的架构级一致，而不是真实 246 GiB Q2_K 权重上的 CPU/CUDA 一致性。它是正确性与可移植性路径，而非服务路径，这也是它只出现在这里、不出现在上面任何表格里的原因：<code>--backend cpu</code> 上跑完整 V4.1 权重的吞吐、加载时间与常驻内存都从未测量过。</p>
   <pre data-lang="bash"><code>dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj</code></pre>
+  <p>Pull request 的 CI 在 GitHub 托管的 x64（<code>ubuntu-latest</code>）与 ARM64（<code>ubuntu-24.04-arm</code>）runner 上运行该测试集中与环境无关的那一档：它强制关闭 GPU 原生构建（CUDA、Vulkan 与 cuDNN），固定 <code>TS_TEST_GGML_BACKEND=cpu</code>，先运行不需要 GPU 的 GB10 容器契约检查 <code>eng/tests/gb10-container.py</code>，全程不需要 GPU，也不下载模型。在本地运行同一档：</p>
+  <pre data-lang="bash"><code>dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj --filter "Category!=Bench&amp;Requires!=Cuda&amp;Requires!=Mlx&amp;Requires!=Models"</code></pre>
 
   <h3>服务器集成测试</h3>
-  <p><code>TensorSharp.Server/testdata/</code> 中的集成测试覆盖全部三种 API 风格（Web UI SSE、Ollama、OpenAI）、多轮对话、思考模式、工具调用、结构化输出、队列状态兼容、并发请求与中止支持。架构相关功能会自动检测，并在当前模型不支持时跳过。</p>
-  <pre data-lang="bash"><code># 先启动 TensorSharp.Server，然后运行：
-python3 TensorSharp.Server/testdata/test_multiturn.py
+  <p><code>TensorSharp.Server.Host/testdata/</code> 中的集成测试覆盖全部三种 API 风格（Web UI SSE、Ollama、OpenAI）、多轮对话、思考模式、工具调用、结构化输出、队列状态兼容、并发请求与中止支持。架构相关功能会自动检测，并在当前模型不支持时跳过。</p>
+  <pre data-lang="bash"><code># 先启动 TensorSharp.Server.Host，然后运行：
+python3 TensorSharp.Server.Host/testdata/test_multiturn.py
 # 或
-bash TensorSharp.Server/testdata/test_multiturn.sh</code></pre>
+bash TensorSharp.Server.Host/testdata/test_multiturn.sh</code></pre>
 
   <h3>推理矩阵运行器</h3>
   <p><code>TensorSharp.TestMatrix</code> 是更广泛的、由 CLI 驱动的长时段 模型 × 后端 × 功能 × 环境变量 覆盖框架。它发现 GGUF 文件、过滤不可用后端与不支持的提示类型、运行基线加环境变量扫描的各个 cell、为每个 cell 写一份 JSON 结果、生成聚合 Markdown 报告，并与各主机基线对比。</p>

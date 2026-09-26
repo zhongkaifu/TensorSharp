@@ -5,7 +5,7 @@
 GLM-5.2 是一个 744B 参数的 MoE 模型（256 个路由专家，top-8，外加 1 个共享专家），
 构建在 **DeepSeek 稀疏注意力**之上：带权重吸收的 Multi-head Latent Attention，
 再加一个 "lightning indexer"，由它决定每个 query 可以看见哪些已缓存的 token。
-官方宣称上下文：1M token。GGUF 架构 id 是 `glm-dsa`。**GLM-5.3** 是同一套层结构的
+官方宣称上下文：1M token。GGUF 架构 id 是 `glm-dsa`（加载器也接受 `glm_dsa`）。**GLM-5.3** 是同一套层结构的
 新版本，整页内容对它同样适用——见[下文专节](#glm-53glm-dsa)。**GLM-5.3-Flash**
 （`glm5next`）复用同一个执行器——见[下文专节](#glm-53-flashglm5next)。
 
@@ -91,7 +91,7 @@ token 上比较两个执行器）：
 这就是贪心解码文本不同（`Simple arithmetic question, user wants a brief answer.</think>2+2 = `
 对 `This is a simple arithmetic question. The user wants a brief answer. 2`）而推理内容
 一致的原因。在 2 bit 下，逐算子执行器与融合执行器会因为很小的数值差异选到不同的专家，
-这与 `TS_BATCHED_FUSED_DECODE` 默认关闭是同一个效应。0.96 的余弦与这个解释相符，但并不
+这与批量融合 decode 同逐条 decode 结果不同是同一个效应（见[并发请求的服务方式](#并发请求的服务方式)）。0.96 的余弦与这个解释相符，但并不
 构成证明：它低于更高精度 checkpoint 应有的 ~0.999，而机器上没有更高精度的
 GLM-5.3-Flash GGUF 可作对照。请把托管路径当作用于 A/B 的参考实现，而不是逐位对齐的实现。
 
@@ -109,11 +109,6 @@ GLM-5.3-Flash GGUF 可作对照。请把托管路径当作用于 A/B 的参考�
 `--tp N`（或 `TENSORSHARP_TP_DEGREE`）是另一种模式：让**每一层都跑在每一张 GPU 上**，
 切分的是层*内部*的权重，于是 decode 时每张卡只需要读 1/N 的权重，而不是依次走完全部。
 切分方式沿用仓库其它模型一致的 Megatron column/row 模式：
-
-GLM 5.x 的原生张量并行执行器对 GLM-5.2、GLM-5.3 与 GLM-5.3-Flash
-**都只支持本地单进程**。它不会加入跨节点的 `ITensorParallelGroup`，因此
-`--tp-node-id` / `--tp-peers` 不能让这条路径变成分布式运行——整个 GLM 系列都会在
-构建模型之前直接拒绝这两个参数。
 
 | 部件 | 切法 | 集合通信 |
 |---|---|---|
@@ -133,6 +128,11 @@ GLM 5.x 的原生张量并行执行器对 GLM-5.2、GLM-5.3 与 GLM-5.3-Flash
 `TS_GLM_TP_OVERSUBSCRIBE=1` 允许多个 rank 共用一张 GPU —— 单卡机器上就是这样验证
 切分正确性的。
 
+GLM 5.x 的原生张量并行执行器对 GLM-5.2、GLM-5.3 与 GLM-5.3-Flash
+**都只支持本地单进程**。它不会加入跨节点的 `ITensorParallelGroup`，因此
+`--tp-node-id` / `--tp-peers` 不能让这条路径变成分布式运行——整个 GLM 系列都会在
+构建模型之前直接拒绝这两个参数。
+
 ### 并发请求的服务方式
 
 原生执行器把所有缓存都留在设备上，所以一个请求的状态就是一个原生 **slot** ——
@@ -148,15 +148,23 @@ LM head 在整批上只跑一次，只有写缓存、indexer 打分和 softmax �
 N 个并发请求之间只读一遍权重，而不是各读一遍。在这台 3 卡机器上实测：四个并发的
 200 token 补全，**合计 75.2 tok/s，而单流为 41.6**（1.81×），每条流 18.8 tok/s。
 
-`TS_BATCHED_FUSED_DECODE=1` 打开它；默认关闭的原因与项目其它地方一致：批处理改变
+它默认开启，与其他实现了它的系列一致；`TS_BATCHED_FUSED_DECODE=0` 可将其关闭（设置
+`TS_GLM_BATCHED_DECODE=0` 则让原生侧拒绝它）。批量图只在单个 rank 上运行，因此在 `--tp`
+下它会拒绝，请求改为逐序列 decode。它的代价是精确性：批处理改变
 了每个 GEMM 的形状，CUDA 因此选择不同 kernel，结果的最后几位会不同——与逐条路径的
 首个偏差出现在第 1 层，相对量级 2e-8。稠密模型里这点差别看不见，但这 78 层里有 75
 层要在几乎并列的分数上做 256 选 8 的 top-k，最后一位的差别会翻转边缘专家，到 LM
 head 时 logits 已经差到 O(1)——在 2 bit 权重上这就是肉眼可见的另一段续写，而不是
 舍入抖动。在 CPU 后端（kernel 不随批大小切换）上，批量与逐条 decode 逐位相同。
 
-不开这个开关时并发依然可用而且精确：引擎交替执行每个序列的整图前向，四个并发补全
-的结果与依次执行同样四个提示逐字节相同，只是权重要按序列各读一遍。
+设置 `TS_BATCHED_FUSED_DECODE=0` 时并发依然可用而且精确：引擎交替执行每个序列的整图
+前向，四个并发补全的结果与依次执行同样四个提示逐字节相同，只是权重要按序列各读一遍。
+
+跨请求的前缀复用走 Radix 前缀缓存（默认模式）。在原生执行器上，已结束请求的 slot 可以
+作为一个保留项留下来，之后以相同 token 开头的请求直接接管它，而不必重新 prefill：glm-dsa
+最多可以把这样的 slot 回退 16 个 token，glm5next 则只复用完全一致的前缀，因为它的 KDA
+状态无法回退（见 [GLM-5.3-Flash](#glm-53-flashglm5next)）。`--no-prefix-cache` 会关闭
+这一切。
 
 ### 稀疏注意力这条路
 
@@ -223,7 +231,9 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll \
 loader 用来确定上下文长度的同一块显存，因此原生 loader 只在模型加载前设置了
 `--spec`（环境变量 `TS_SPEC`，旧名 `TS_MTP_SPEC`）时才加载它。这也是为什么这个开关必须写在命令行上、而不能
 事后再切换，以及为什么把它加到一条本来刚好放得下的命令上，会让 loader 最终确定的上下文
-变短。`TS_GLM_MTP=1` / `0` 可以双向覆盖，便于 A/B。
+变短。loader 与调度器用同一条规则读取 `TS_SPEC` / `TS_MTP_SPEC`——只有 `1`、`true`、`yes` 或 `on`
+表示开启——因此 `TS_SPEC=false` 不会把该块调入显存。`TS_GLM_MTP` 可以双向覆盖，便于 A/B：除 `0`
+以外的任何值都强制开启，`0` 强制关闭。
 
 ### 实测
 
@@ -235,7 +245,7 @@ loader 用来确定上下文长度的同一块显存，因此原生 loader 只�
 | 配置 | decode（5 轮） | 相对基线 | 草稿接受率 | 每次验证的草稿数 |
 |---|---|---|---|---|
 | 纯贪心 | 17.96 / 18.33 / 20.42 / 20.37 / 18.56 tok/s | 1.00x | — | — |
-| `--spec`（默认值：k=8，pMin 0.75） | 20.50 / 25.68 / 25.83 / 25.85 / 23.52 tok/s | 1.14 / 1.40 / 1.27 / 1.27 / 1.27x，**中位数 1.27x** | 93.8% | 1.59 |
+| `--spec`（k=8，pMin 0.75——实测时的默认值） | 20.50 / 25.68 / 25.83 / 25.85 / 23.52 tok/s | 1.14 / 1.40 / 1.27 / 1.27 / 1.27x，**中位数 1.27x** | 93.8% | 1.59 |
 | `--spec --spec-draft 4 --spec-pmin 0.55` | 22.35 / 26.99 / 25.86 / 26.81 / 25.89 tok/s | 1.24 / 1.47 / 1.27 / 1.32 / 1.39x，中位数 1.32x | 75.0% | 2.04 |
 
 整套基准跑了五轮：一轮不足以把 5% 的调优效果和噪声区分开。
@@ -271,6 +281,10 @@ k=8 时，四轮里赢三轮输三轮。这两个参数是相互作用的，要�
 
 卸载得越多，1 行基线被拖慢的幅度大于宽验证被拖慢的幅度，曲线因此变平（那里 2 行验证是
 1 行 decode 的 1.16 倍，而不是 1.27 倍），各配置随之收敛。
+
+这些运行早于当前的逐 token 阈值：对这个 NextN 块这样的逐 token 草稿头，`--spec-pmin`
+现在默认为 0.15（上面几张表实测时为 0.75），而 GLM-5.2 尚未在 0.15 下重新实测。表中的
+“默认值”行指的是 k=8、pMin 0.75 的配置。
 
 ### 贪心输出与浮点
 
@@ -365,12 +379,16 @@ llama.cpp 那几个百分点就来自这里。decode 受显存带宽限制，两
 ## 怎么跑
 
 ```bash
-# 3 张 GPU，按层切分（默认行为：用上每一张可见 GPU）
+# 3 张 GPU，按层切分（默认行为：用上每一张可见 GPU）；--input 从文件读取提示词
+echo "用一段话解释 MLA。" > prompt.txt
 dotnet run --project TensorSharp.Cli -- --model GLM-5.2-UD-IQ2_XXS-00001-of-00006.gguf \
-    --backend ggml_cuda --prompt "用一段话解释 MLA。"
+    --backend ggml_cuda --input prompt.txt
 
 # 指定 GPU 数量
 TS_GLM_NGPU=2 dotnet run --project TensorSharp.Cli -- --model ... --backend ggml_cuda
+
+# 用 3 张 GPU 做张量并行，而不是按层切分
+dotnet run --project TensorSharp.Cli -- --model ... --backend ggml_cuda --tp 3
 
 # 显存不足：把路由专家（占 checkpoint 的 92%）留在系统内存里
 dotnet run --project TensorSharp.Cli -- --model ... --backend ggml_cuda --cpu-moe
@@ -386,6 +404,11 @@ offload 与张量并行可以叠加：`--n-cpu-moe 30 --tp 2` 能正常加载，
 保持专家完整（切开它们既省不了主机内存也省不了主机时间，而且跨步切片没法直接由 GGUF
 映射就地提供——那会把一个映射文件变成 200 GiB 的私有副本），于是这些层由 rank 0 计算，
 而留在 GPU 上的层照常切分。单独用 `--n-cpu-moe 30` 时与 llama.cpp 3/3 一致。
+
+主机侧的专家矩阵乘运行在执行器的 CPU 工作线程池上。默认大小为 `TS_GLM_THREADS`（或 min(核数, 32)），
+开启 `--n-cpu-moe` / `--cpu-moe` 或没有 GPU 时改为全部可用 CPU；随后由 `--cpu-moe-threads N`
+取代（Linux 上同样生效），而在进程启动前导出的 `TS_CPU_MOE_THREADS` 仍优先于该参数——与 DeepSeek V4
+执行器的优先级相同。加载日志会打印结果：`[glm] CPU worker pool: threads=N, persistent=yes`。
 
 ### 上下文长度
 
@@ -427,7 +450,7 @@ GLM-5.3-Flash UD-Q2_K_XL 实测的输出（行已截短）：
 |---|---|---|
 | `TS_GLM_NGPU` | 0（全部） | 分摊层的 GPU 数 |
 | `TS_GLM_UBATCH` | 1024 | prefill micro-batch；显存允许时 2048 在长 prompt 上更快 |
-| `TS_GLM_THREADS` | min(核数, 32) | CPU 后端线程数（路由专家矩阵乘由 `--cpu-moe-threads` 覆盖） |
+| `TS_GLM_THREADS` | min(核数, 32) | CPU 后端线程数；开启 `--n-cpu-moe` / `--cpu-moe` 或没有 GPU 时改为全部可用 CPU，`--cpu-moe-threads`（其后是继承来的 `TS_CPU_MOE_THREADS`）可覆盖两者 |
 | `TS_GLM_NATIVE` | 1 | 置 0 则在 GGML 后端上改走托管逐算子路径 |
 | `TS_GLM_FA` | 1 | 置 0 关闭 flash attention（回落到 soft_max） |
 | `TS_GLM_FUSED_LID` | 1 | 置 0 用基础算子拼出 indexer，而不用 `ggml_lightning_indexer` |
@@ -457,7 +480,10 @@ GLM-5.3-Flash UD-Q2_K_XL 实测的输出（行已截短）：
 `<think>`，由模型自己闭合；不开启时提示里写的是 `<think></think>`，模型于是直接
 作答。历史轮次的思考内容始终不会带进提示，与模板 `clear_thinking` 的默认行为一致。工具调用回来的形式是
 `<tool_call>NAME<arg_key>k</arg_key><arg_value>v</arg_value>...</tool_call>`，
-每个参数一个 XML 元素（用 `tojson` 渲染的值会被解析回数字 / 数组 / 对象）。
+每个参数一个 XML 元素（用 `tojson` 渲染的值会被解析回数字 / 数组 / 对象）。由于该系列
+会渲染工具声明并带有这个解析器，GLM 5.x（包括 GLM-5.3-Flash）可以使用 skills、代码工具
+（`--code-exec`），以及服务端的[子智能体委派](../multi_agent.md)（在对话路径上默认开启）。
+该系列没有发布任何委派相关的实测结果。
 
 生成遇到 `<|observation|>` 也会停止（即 GGUF 的 `tokenizer.ggml.eom_token_id`，
 llama.cpp 同样把它并入生成结束集合）：模型在工具调用之后紧接着写出它，不停下来的话
@@ -534,7 +560,8 @@ UD-Q2_K_XL 量化下 checkpoint 为 7 个分片共 236.4 GiB，因此需要一�
 是首 token 时延而非 tok/s：那次 llama.cpp 的运行发生在客户端尚未在流中请求 usage
 之前，因此没有自己的提示 token 计数。同一条提示上 TensorSharp 的首 token 为
 **41.9 s**（41.85 / 41.86 / 42.07），llama.cpp 为 **29.0 s**（29.01 / 29.05 /
-31.23），约**慢 1.4 倍**。完整记录与方法见[跨引擎报告](../validation/cross-engine-2026-09/README.md)。
+31.23），约**慢 1.4 倍**。完整记录与方法见跨引擎报告
+`docs/validation/cross-engine-2026-09/README.md`（本地验证记录，未提交到 Git）。
 
 ## GLM-5.3-Flash（`glm5next`）
 
@@ -593,8 +620,8 @@ GLM-5.3-Flash 在默认的完整切分（head 与路由专家隐藏行都切）�
 - **原生本地张量并行**：在 GGML GPU 后端上，传入 `--tp N`；省略该参数仍走默认按层切分。
 - **`--cpu-moe` / `--n-cpu-moe N`** 专家驻留主机内存：可用（前 10 层专家在主机时
   实测解码约 35–40 t/s）。
-- **服务化**：原生逐序列 slot；并发请求轮询式解码（fused 批量解码对 glm5next
-  暂时拒绝，引擎自动回退）。
+- **服务化**：原生逐序列 slot，外加 fused 批量解码（见[连续批处理（glm5next）](#连续批处理glm5next)）；
+  在 `--tp` 下批量图会拒绝，并发请求改为轮询式解码。
 - **视觉**：`--image` / 多图 / 多轮图像会话，经 `GlmNextVisionEncoder`
   （GLM-OCR ViT：RMS 归一、fused QKV、逐头 q/k RMS 归一、2D 视觉 RoPE、
   SwiGLU-截断 MLP、2×2 卷积 merger）。24 个 block 作为一张设备驻留 GGML 图执行
@@ -650,9 +677,8 @@ C ABI 上的失败会被隔离而不是向外传播。抛异常的捕获（arena
 绑定 slot 回滚；`Glm5NextNativeSnapshotBoundaryTests`（`TS_TEST_GLM_SNAPSHOT_BOUNDARY=1`，需要带
 测试钩子构建的原生库，其故障注入器 `TSGgml_GlmTestKdaSnapshotFault` 是 `TSG_TEST_EXPORT`，不进入
 iOS 导出列表）在 CPU 与 CUDA 上向捕获与恢复中途注入 `std::bad_alloc` 和非标准异常，并检查一次
-checked reset 能恢复完整词表的 logits。已记录的运行：
-[`glm5next-cuda-r4`](../validation/qualification-2026-09-16/glm5next-cuda-r4/README.md)
-（单张 A40 上原始 22/22 与扩展 26/26，无跳过）。
+checked reset 能恢复完整词表的 logits。已记录的运行（单张 A40 上原始 22/22 与扩展 26/26，
+无跳过）：`docs/validation/qualification-2026-09-16/glm5next-cuda-r4/README.md`（本地验证记录，未提交到 Git）。
 
 ### 实测
 
@@ -687,6 +713,14 @@ GLM-5.3-Flash 的模板始终思考：`<|system|>Reasoning Effort: Max` 无条�
 工具调用与 GLM-5.2 相同的 XML 元素形式。图像渲染为
 `<|begin_of_image|><|image|><|end_of_image|>`，宿主把 `<|image|>` 展开为合并
 patch 的 token 数。
+
+### 连续批处理（glm5next）
+
+glm5next 通过与 GLM-5.2 相同的原生逐序列 slot 服务并发请求，**外加一条 fused 批量
+decode**：一张图在每步为 2-16 个序列各解码一个 token，逐 token 的 KDA 递归作用在各 slot
+自己的持久状态上，池化 indexer 打分与注意力也按 token 进行，而投影、超连接、router、
+专家与 LM head 在整批上只跑一次。串行与批量的等价性由 `benchmarks/ParityHarness --batched`
+验证：3 个并发序列，每一步都走 fused 路径，与串行 decode 逐 token 一致。
 
 ## 基准矩阵
 

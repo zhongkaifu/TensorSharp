@@ -244,10 +244,13 @@ namespace TensorSharp.Models
         private int _nativeUBatch = 512;
 
         /// <summary>
-        /// The DSpark drafter is implemented inside the direct-CUDA engine
-        /// (Dsv4CudaEngine.Dspark.cs), on top of that engine's own kernels and
-        /// cache rings. Every other executor serves plain decode, so say so
-        /// instead of silently ignoring the drafter the operator asked for.
+        /// The DSpark drafter is implemented twice: inside the direct-CUDA engine
+        /// (Dsv4CudaEngine.Dspark.cs, on that engine's own kernels and cache
+        /// rings), and inside the native ggml executor
+        /// (<c>LoadModelWithDspark</c>), which this constructor hands it on
+        /// ggml_cuda and, for V4.1, on ggml_cpu. Every other executor/backend
+        /// pairing serves plain decode, so say so instead of silently ignoring
+        /// the drafter the operator asked for.
         /// </summary>
         private static void WarnDsparkUnavailable(string draftModelPath, BackendType backend)
         {

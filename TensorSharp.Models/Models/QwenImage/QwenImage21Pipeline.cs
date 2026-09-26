@@ -13,7 +13,7 @@ namespace TensorSharp.Models.QwenImage
         private QwenImage21Vae _vae;
         private QwenImage21DiT _dit;
         private QwenImage21Vae Vae => _vae ??= new QwenImage21Vae(_model);
-        private QwenImage21DiT Dit => _dit ??= new QwenImage21DiT(_model.DitGgufPath, _model.Backend, _model.DitTensorParallelGroup);
+        private QwenImage21DiT Dit => _dit ??= new QwenImage21DiT(_model.DitGgufPath, _model.Backend, _model.DitTensorParallelGroup, _model.Loras);
 
         public QwenImage21Pipeline(QwenImageModel model) => _model = model;
 
@@ -24,18 +24,23 @@ namespace TensorSharp.Models.QwenImage
             ArgumentNullException.ThrowIfNull(p);
             if (p.Steps < 0 || !float.IsFinite(p.CfgScale) || p.CfgScale < 0)
                 throw new ArgumentException("Steps and CFG must be finite and nonnegative (zero selects the model default).");
-            if (!string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("TS_QWEN_IMAGE_LORA")))
-                throw new NotSupportedException("Qwen-Image-2.1 does not support LoRA adapters. Unset TS_QWEN_IMAGE_LORA.");
             foreach (var input in inputs) ArgumentNullException.ThrowIfNull(input);
             if (inputs.Length > 0 && _model.MmprojPath == null)
                 throw new InvalidOperationException("Qwen-Image-2.1 editing requires the Qwen3-VL-8B vision projector; set --qwen-image-mmproj or TS_QWEN_IMAGE_MMPROJ.");
 
             var (width, height) = ResolveDimensions(p, inputs.Length > 0 ? inputs[0] : null);
-            int steps = p.Steps == 0 ? 40 : p.Steps;
+            // A LoRA plug-in's recipe (a step-distilled adapter's trained schedule) supplies
+            // the defaults; explicit steps / CFG still win.
+            var recipe = _model.Loras?.Recipe;
+            int steps = p.Steps != 0 ? p.Steps : recipe is { DefaultSteps: > 0 } ? recipe.DefaultSteps : 40;
             // The released 2.1 checkpoint is intended for sampling without CFG.
             // An explicit value > 1 still opts into the additional negative pass.
-            float cfg = p.CfgScale == 0 ? 1f : p.CfgScale;
+            float cfg = p.CfgScale != 0 ? p.CfgScale : recipe?.Cfg ?? 1f;
             int h = height / 16, w = width / 16, sequence = checked(h * w);
+            // Validate the schedule before any encoder or VAE work.
+            float[] sigmas = recipe is { HasSchedule: true } ? recipe.Sigmas(steps, sequence) : QwenImage21Sampling.Sigmas(steps, sequence);
+            if (_model.Loras is { OutputHeads.Length: > 0 } bundle && bundle.OutputHeads.Length != steps)
+                throw new ArgumentException($"The LoRA bundle has one output head per trained step ({bundle.OutputHeads.Length}); it cannot run {steps} steps.");
             var total = Stopwatch.StartNew();
             var phase = Stopwatch.StartNew();
             void Phase(string name)
@@ -44,6 +49,8 @@ namespace TensorSharp.Models.QwenImage
                 phase.Restart();
             }
             Console.WriteLine($"Qwen-Image-2.1: {width}x{height}, {steps} steps, CFG {cfg}, seed {p.Seed}, {inputs.Length} reference(s)");
+            if (recipe is { HasSchedule: true })
+                Console.WriteLine($"  [lora] sampling recipe ({System.IO.Path.GetFileName(recipe.Source)}): {recipe.Describe(steps, sequence)}");
 
             try
             {
@@ -80,7 +87,6 @@ namespace TensorSharp.Models.QwenImage
                 GgmlBasicOps.ClearHostBufferCache();
 
                 float[] latents = ToTokens(QwenImage21Sampling.Noise(checked(sequence * 64), p.Seed), h, w);
-                float[] sigmas = QwenImage21Sampling.Sigmas(steps, sequence);
                 // Text and reference tokens are modulated at t=0, so their K/V are the
                 // same at every step: the first step stores them per CFG branch and the
                 // rest compute only the target image. Released before VAE decoding.
@@ -92,12 +98,13 @@ namespace TensorSharp.Models.QwenImage
                     for (int step = 0; step < steps; step++)
                     {
                         var timer = Stopwatch.StartNew();
+                        bool bf16Time = recipe?.TimestepBf16 ?? false;
                         float[] velocity = Dit.Predict(latents, h, w, positive, positiveLength, sigmas[step],
-                            positiveSlots, refTokens, refHeights, refWidths, positiveCache);
+                            positiveSlots, refTokens, refHeights, refWidths, positiveCache, step, bf16Time);
                         if (cfg > 1f)
                         {
                             float[] unconditional = Dit.Predict(latents, h, w, negative, negativeLength, sigmas[step],
-                                negativeSlots, refTokens, refHeights, refWidths, negativeCache);
+                                negativeSlots, refTokens, refHeights, refWidths, negativeCache, step, bf16Time);
                             for (int j = 0; j < velocity.Length; j++)
                                 velocity[j] = unconditional[j] + cfg * (velocity[j] - unconditional[j]);
                         }
@@ -191,21 +198,89 @@ namespace TensorSharp.Models.QwenImage
             return Vae.Decode(new VaeLatent(64, h, w, pooled));
         }
 
+        internal const string DefaultWidthVariable = "TS_QWEN_IMAGE_WIDTH";
+        internal const string DefaultHeightVariable = "TS_QWEN_IMAGE_HEIGHT";
+
+        // What an omitted targetArea resolves to. The Web UI / API layer resolves it before
+        // the request reaches the pipeline, so this value is indistinguishable from "no area".
+        private static readonly long AutomaticTargetArea = new QwenImageParams().ResolveTargetArea();
+
+        // The default-size configuration last warned about, so each one is reported once.
+        private static string _defaultSizeWarnedFor;
+
         internal static (int Width, int Height) ResolveDimensions(QwenImageParams p, RgbImage reference)
         {
             int width = p.Width, height = p.Height;
-            if (width == 0 && height == 0 &&
-                int.TryParse(Environment.GetEnvironmentVariable("TS_QWEN_IMAGE_WIDTH"), out int envWidth) &&
-                int.TryParse(Environment.GetEnvironmentVariable("TS_QWEN_IMAGE_HEIGHT"), out int envHeight))
-                (width, height) = (envWidth, envHeight);
             if (width != 0 || height != 0)
             {
                 if (width <= 0 || height <= 0 || width % 32 != 0 || height % 32 != 0)
                     throw new ArgumentException("Qwen-Image-2.1 width and height must both be positive multiples of 32.");
                 return (width, height);
             }
+            // The server's default size (--width/--height) stands in only for a request that
+            // named neither a size nor an area; an explicit area keeps its own geometry.
+            bool areaRequested = p.TargetArea > 0 && p.TargetArea != AutomaticTargetArea;
+            if (!areaRequested && DefaultSize() is { } size)
+                return size;
             long area = p.ResolveTargetArea();
             return DimensionsForArea(reference?.Width ?? 1, reference?.Height ?? 1, area);
+        }
+
+        /// <summary>The operator's default output size (TS_QWEN_IMAGE_WIDTH/HEIGHT, which the
+        /// server's --width/--height set), or null when there is none usable. It is a fallback
+        /// for every request that names no size, so a bad value must not fail each of them:
+        /// sides that are not multiples of 32 snap down (minimum 32), and a half-configured or
+        /// unparsable pair is ignored. Either is reported once per configuration.</summary>
+        internal static (int Width, int Height)? DefaultSize()
+        {
+            string rawWidth = Environment.GetEnvironmentVariable(DefaultWidthVariable)?.Trim();
+            string rawHeight = Environment.GetEnvironmentVariable(DefaultHeightVariable)?.Trim();
+            bool hasWidth = !string.IsNullOrEmpty(rawWidth), hasHeight = !string.IsNullOrEmpty(rawHeight);
+            if (!hasWidth && !hasHeight)
+                return null;
+
+            string configuration = rawWidth + "x" + rawHeight;
+            const string automatic = "requests that name no size keep the automatic size " +
+                "(the native 2048x2048 area, following the first reference image's aspect ratio on an edit).";
+            if (hasWidth != hasHeight)
+            {
+                string set = hasWidth ? DefaultWidthVariable : DefaultHeightVariable;
+                string missing = hasWidth ? DefaultHeightVariable : DefaultWidthVariable;
+                WarnDefaultSizeOnce(configuration,
+                    $"{set} is set without {missing}; the default image size needs both (the server's --width " +
+                    $"and --height). Ignoring it: {automatic}");
+                return null;
+            }
+
+            if (!TryParsePixels(rawWidth, out int width) || !TryParsePixels(rawHeight, out int height))
+            {
+                WarnDefaultSizeOnce(configuration,
+                    $"{DefaultWidthVariable}={rawWidth} / {DefaultHeightVariable}={rawHeight} is not a pair of " +
+                    $"positive pixel counts. Ignoring it: {automatic}");
+                return null;
+            }
+
+            int snappedWidth = Math.Max(32, width / 32 * 32), snappedHeight = Math.Max(32, height / 32 * 32);
+            if (snappedWidth != width || snappedHeight != height)
+            {
+                WarnDefaultSizeOnce(configuration,
+                    $"the default image size {width}x{height} ({DefaultWidthVariable}/{DefaultHeightVariable}) " +
+                    $"is not a multiple of 32 on both sides; requests that name no size render at " +
+                    $"{snappedWidth}x{snappedHeight} instead.");
+            }
+            return (snappedWidth, snappedHeight);
+        }
+
+        private static bool TryParsePixels(string raw, out int pixels) =>
+            int.TryParse(raw, System.Globalization.NumberStyles.Integer,
+                System.Globalization.CultureInfo.InvariantCulture, out pixels) && pixels > 0;
+
+        private static void WarnDefaultSizeOnce(string configuration, string message)
+        {
+            if (string.Equals(System.Threading.Interlocked.Exchange(ref _defaultSizeWarnedFor, configuration),
+                    configuration, StringComparison.Ordinal))
+                return;
+            Console.Error.WriteLine($"[qwen-image] WARNING: {message} Reported once.");
         }
 
         private static (int Width, int Height) DimensionsForArea(int sourceWidth, int sourceHeight, long area)
@@ -244,6 +319,13 @@ namespace TensorSharp.Models.QwenImage
             for (int i = 0; i < count; i++)
                 for (int c = 0; c < 64; c++) result[c * count + i] = tokens[i * 64 + c];
             return result;
+        }
+
+        /// <summary>Release the transformer so the next request rebuilds it (a LoRA change).</summary>
+        internal void ResetTransformer()
+        {
+            _dit?.Dispose();
+            _dit = null;
         }
 
         public void Dispose()

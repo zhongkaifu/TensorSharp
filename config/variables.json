@@ -7,11 +7,12 @@
   //
   // Here "gemmaBase" and "repo" are reused for the model, its vision projector,
   // and its MTP speculative-decoding draft head — three related files that each
-  // auto-download into ${modelRoot} on the first run and are reused afterward.
+  // auto-download into ${modelRoot} on the first run (pinned by the commit in
+  // "repo" and by SHA-256) and are reused afterward.
   "variables": {
     "modelRoot": "${TENSORSHARP_MODELS:-../models}",
     "gemmaBase": "${modelRoot}/gemma-4-26B-A4B",
-    "repo": "https://huggingface.co/unsloth/gemma-4-26B-A4B-it-qat-GGUF/resolve/main"
+    "repo": "https://huggingface.co/unsloth/gemma-4-26B-A4B-it-qat-GGUF/resolve/7b92b5b28818151e8669af2e45e88d6086f490dd"
   },
 
   "backend": "ggml_cuda",
@@ -19,17 +20,20 @@
 
   "model": {
     "path": "${gemmaBase}-it-qat-UD-Q4_K_XL.gguf",
-    "urls": [ "${repo}/gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf" ]
+    "urls": [ "${repo}/gemma-4-26B-A4B-it-qat-UD-Q4_K_XL.gguf" ],
+    "sha256": "a7c5bc715f5ff8e99a3e8901ce7d2b42b402c669bf24f7c5250747633d0f5891"
   },
   "mmproj": {
     "path": "${gemmaBase}-mmproj-BF16.gguf",
-    "urls": [ "${repo}/mmproj-BF16.gguf" ]
+    "urls": [ "${repo}/mmproj-BF16.gguf" ],
+    "sha256": "7b06953ccdbe8cf363f47841a7afaacd2b1c2ff9a8d6b426fdec7521a6878744"
   },
 
   // MTP speculative decoding: Gemma-4's draft head ships as its own GGUF.
   "spec": true,
   "draft-model": {
     "path": "${gemmaBase}-it-Q4_0-MTP.gguf",
-    "urls": [ "${repo}/MTP/mtp-gemma-4-26B-A4B-it-Q4_0.gguf" ]
+    "urls": [ "${repo}/MTP/mtp-gemma-4-26B-A4B-it-Q4_0.gguf" ],
+    "sha256": "7272d97595f0d4c74bd7b623492b7dbdaafd8b7c72f329a8270ba4eca68f768a"
   }
 }

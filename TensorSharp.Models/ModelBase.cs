@@ -187,6 +187,28 @@ namespace TensorSharp.Models
             _kvCacheDtype = KvCacheDtypeConfig.Current;
         }
 
+        /// <summary>
+        /// MLX keeps the K/V cache as MLX arrays, which have no block-quantized type, and
+        /// MLX has no fused attention over a quantized cache (mlx-lm's materialises the
+        /// whole score matrix), so an explicit q8_0 / q4_0 request - carried over from a
+        /// ggml_metal config, say - becomes f16 with a line on stderr instead of an
+        /// unhandled "MLX dtype mapping does not support Q8_0" at the first cache write.
+        /// The memory the request was after is mostly still there: ggml-metal holds a
+        /// host tensor and a Metal mirror of the cache, MLX one device array.
+        /// </summary>
+        private void UseFloatKvCacheOnMlx()
+        {
+            if (_backend != BackendType.Mlx) return;
+            KvCacheDtype requested = KvCacheDtypeConfig.Current;
+            if (requested != KvCacheDtype.Q8_0 && requested != KvCacheDtype.Q4_0) return;
+
+            Console.Error.WriteLine(
+                $"[kv-cache] the MLX backend has no {requested.ToShortString()} K/V cache; using f16 "
+                + "(one device copy, where ggml_metal keeps a host tensor and a Metal mirror).");
+            KvCacheDtypeConfig.Set(KvCacheDtype.F16);
+            _kvCacheDtype = KvCacheDtypeConfig.Current;
+        }
+
         public KvCacheDtype KvCacheDtype => _kvCacheDtype;
 
         /// <summary>
@@ -255,6 +277,7 @@ namespace TensorSharp.Models
         {
             LayerSplitDegree = Math.Max(1, layerSplitDegree);
             _backend = backend;
+            UseFloatKvCacheOnMlx();
             // The pure-C# CPU backend must never touch native (ggml P/Invoke) dequant — route
             // every dequant/row-size through the managed implementation (bit-exact vs native,
             // verified). Other backends keep native dequant (faster load; their runtime quant
@@ -2041,6 +2064,15 @@ namespace TensorSharp.Models
                 throw new ArgumentOutOfRangeException(nameof(rows), $"{rows} rows exceed a capacity of {Math.Min(sourceCap, destCap)}");
             if (rows == 0 || heads == 0)
                 return;
+            if (source.Storage is TensorSharp.MLX.MlxStorage && destination.Storage is TensorSharp.MLX.MlxStorage)
+            {
+                // On the device: the host route below would download both caches, keep
+                // those host copies alive, and re-upload the whole source on its next use.
+                using Tensor from = source.Narrow(1, 0, rows);
+                using Tensor to = destination.Narrow(1, 0, rows);
+                Ops.Copy(to, from);
+                return;
+            }
             long rowBytes = source.Storage.ByteLength / (heads * sourceCap);
             if (rowBytes * heads * destCap != destination.Storage.ByteLength)
                 throw new InvalidOperationException("cache tensors differ in bytes per row");
@@ -2170,8 +2202,11 @@ namespace TensorSharp.Models
 
         public float[] Forward(int[] tokens)
         {
+            ThrowIfBackendFailed();
             if (_distributedDriver) _tpGroup.BroadcastControl(TpControlForward, tokens);
-            float[] logits = ForwardCore(tokens);
+            float[] logits;
+            try { logits = ForwardCore(tokens); }
+            catch (Exception symptom) when (BackendHasFailed()) { throw BackendFailure(symptom); }
             ThrowIfBackendFailed();
             return DumpLogitsIfRequested(logits);
         }
@@ -2188,19 +2223,64 @@ namespace TensorSharp.Models
         /// get_rows, typically, since that is the first op of the next forward) and
         /// every forward in between produced quietly wrong logits.
         ///
-        /// One P/Invoke reading one atomic per forward, and only on the GGML
+        /// Checked on the way IN as well as out. A caller that caught the first
+        /// report and carried on — the prefill warm-up used to — otherwise got the
+        /// bystander back on its next forward (issue #226); and a fused path that
+        /// fails over to the per-op one inside a forward surfaces the per-op op's
+        /// error, so any exception thrown while the backend is dead is reported as
+        /// the backend failure, with that error kept as the inner exception.
+        ///
+        /// One P/Invoke reading one atomic per check, and only on the GGML
         /// backends — nothing measurable next to the forward itself.
         /// </summary>
         private void ThrowIfBackendFailed()
         {
+            if (BackendHasFailed())
+                throw BackendFailure(null);
+        }
+
+        private bool BackendHasFailed() => TryGetBackendFailure(out _);
+
+        /// <summary>
+        /// Whether the GGML backend has latched a GPU execution failure, and what ggml
+        /// said about it. Virtual so a test can stand in for a GPU that died; nothing
+        /// short of a real out-of-memory command buffer latches the native flag.
+        /// </summary>
+        internal virtual bool TryGetBackendFailure(out string detail)
+        {
+            detail = null;
             if (!IsGgmlBackend || !GgmlBasicOps.HasBackendFailure())
-                return;
-            string detail = GgmlBasicOps.BackendFailureText();
-            throw new InvalidOperationException(
+                return false;
+            detail = GgmlBasicOps.BackendFailureText();
+            return true;
+        }
+
+        private InvalidOperationException BackendFailure(Exception symptom)
+        {
+            TryGetBackendFailure(out string detail);
+            return new InvalidOperationException(
                 $"The GGML {_backend} backend failed during GPU execution and cannot recover in this " +
                 "process — the results of this and any preceding forward are undefined. Restart the host. " +
-                (string.IsNullOrWhiteSpace(detail) ? string.Empty : $"ggml reported: {detail}"));
+                (ReportsOutOfMemory(detail) ? GpuOutOfMemoryAdvice : string.Empty) +
+                (string.IsNullOrWhiteSpace(detail) ? string.Empty : $"ggml reported: {detail}"),
+                symptom);
         }
+
+        // Metal fails a command buffer with kIOGPUCommandBufferCallbackErrorOutOfMemory when
+        // the memory its buffers need cannot be made resident at that moment. That is a
+        // property of the whole machine, not of the model file: the same model runs where
+        // other processes leave it room (issue #226 ran on an identical 48 GB M5 Pro).
+        internal const string GpuOutOfMemoryAdvice =
+            "The GPU ran out of memory: the weights, KV cache and compute buffers could not all be " +
+            "made resident. Other applications' memory counts against the same budget, so close " +
+            "GPU- or memory-heavy ones, or reduce this process's share: a smaller MAX_CONTEXT or " +
+            "--max-tokens, --kv-cache-dtype q8_0, or a smaller quantization. ";
+
+        internal static bool ReportsOutOfMemory(string detail) =>
+            !string.IsNullOrEmpty(detail)
+            && (detail.Contains("OutOfMemory", StringComparison.OrdinalIgnoreCase)
+                || detail.Contains("Insufficient Memory", StringComparison.OrdinalIgnoreCase)
+                || detail.Contains("out of memory", StringComparison.OrdinalIgnoreCase));
 
         /// <summary>
         /// Write the FIRST forward's logits to TS_DUMP_LOGITS when set, then stop.
@@ -2231,8 +2311,11 @@ namespace TensorSharp.Models
 
         public float[] ForwardRefill(int[] tokens)
         {
+            ThrowIfBackendFailed();
             if (_distributedDriver) _tpGroup.BroadcastControl(TpControlForwardRefill, tokens);
-            float[] logits = ForwardRefillCore(tokens);
+            float[] logits;
+            try { logits = ForwardRefillCore(tokens); }
+            catch (Exception symptom) when (BackendHasFailed()) { throw BackendFailure(symptom); }
             ThrowIfBackendFailed();
             return logits;
         }

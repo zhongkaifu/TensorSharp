@@ -1,6 +1,6 @@
 # DiffusionGemma
 
-[← back to model index](README.md)
+[← back to model index](README.md) | [中文](diffusiongemma_zh-cn.md)
 
 ## Status snapshot
 
@@ -10,7 +10,7 @@
 | Source class | [`DiffusionGemmaModel`](../../TensorSharp.Models/Models/DiffusionGemma/DiffusionGemmaModel.cs) |
 | Sampler | [`DiffusionGemmaSampler`](../../TensorSharp.Models/Models/DiffusionGemma/DiffusionGemmaSampler.cs) |
 | Modalities | Text + **image** (audio is not supported: the checkpoint has no audio tower) |
-| Thinking / tools | Thought channel parsed out (returned only on `"think": true`); tools/tool_choice refused with HTTP 400 |
+| Thinking / tools | Thinking is not prompted: the prompt always renders with thinking off. A thought block the model writes anyway is parsed out and returned as reasoning only on `"think": true`; a canvas that holds nothing but a thought block is returned as the answer (§6). Tools/tool_choice refused with HTTP 400 |
 | Generation mode | Block text diffusion, not autoregressive token decode |
 | CLI support | `TensorSharp.Cli` detects `DiffusionGemmaModel` and uses diffusion run mode |
 | Server support | Web UI chat stream with live denoising previews; Ollama/OpenAI compatibility endpoints use append-oriented response shapes and return the final text only (no denoising previews) |
@@ -24,7 +24,10 @@ Verified GGUF pointers:
 |---|---|---|---|
 | diffusiongemma-26B-A4B-it | [unsloth/diffusiongemma-26B-A4B-it-GGUF](https://huggingface.co/unsloth/diffusiongemma-26B-A4B-it-GGUF) | `diffusiongemma-26B-A4B-it-Q4_K_M.gguf` (16.807 GB); also `Q5_K_M`, `Q6_K`, `Q8_0`, `BF16` | GGUF `general.architecture` = `diffusion-gemma`. Official upstream weights: [google/diffusiongemma-26B-A4B-it](https://huggingface.co/google/diffusiongemma-26B-A4B-it) |
 
-`Q4_K_M` is the smallest published quant.
+`Q4_K_M` is the smallest quant in the unsloth repo. For tighter VRAM,
+`config/diffusiongemma-26b-a4b-q3.json` pins DevQuasar's `Q3_K_M` (~13.3 GB;
+unsloth publishes no Q3_K_M). Its metadata matches the unsloth file apart from
+`diffusion.eb_*` sampler hints, which TensorSharp does not read.
 
 **For image input you also need the vision tower, and it is NOT in any GGUF.**
 Every published GGUF of this checkpoint is text-only — the conversion drops the
@@ -40,9 +43,28 @@ checkpoint, and TensorSharp loads that shard directly (no conversion step):
 hf download google/diffusiongemma-26B-A4B-it model-00011-of-00011.safetensors --local-dir models
 ```
 
-Or let the config fetch it on first use — `config/diffusiongemma-26b-a4b-q4.json`
-declares it under `mmproj` with a SHA-256, so it downloads once and is reused
-afterwards. Pass `--mmproj none` to run text-only and skip the download.
+Or let the config fetch it on first use — `config/diffusiongemma-26b-a4b-q4.json`,
+`config/diffusiongemma-26b-a4b-q3.json` and `config/jev-diffusiongemma-q4.json`
+declare it under `mmproj` with a SHA-256, so it downloads once and is reused
+afterwards. To run text-only without the shard, add `--mmproj none` on the command
+line: a command-line `--mmproj` drops the configuration's entry before it is
+resolved, so the shard is never fetched, and `none` loads no projector — on the
+server and the CLI alike (text-only requests work; image requests are refused).
+
+To get an ordinary mmproj GGUF instead,
+[`eng/diffusiongemma-mmproj.py`](../../eng/diffusiongemma-mmproj.py) converts the
+shard with numpy alone (no torch or gguf package) into a single-file `gemma4v`
+projector whose 2-D matmul weights are F16 (`--dtype f32` keeps them F32):
+
+```bash
+python3 eng/diffusiongemma-mmproj.py --src models/model-00011-of-00011.safetensors --out models/mmproj-diffusiongemma-26B-A4B-it-F16.gguf
+```
+
+Pass the result to `--mmproj` like any projector.
+`Gemma4VisionOracleTests.MmprojTower_AgreesWithSafetensorsTower` checks that it
+encodes like the shard; it needs a local fixture directory
+(`TS_DIFFUSIONGEMMA_VISION_DIR`) and skips without one. The script also targets
+llama.cpp's clip loader, but no llama.cpp run of its output is recorded.
 
 Audio is **not** supported and no projector can add it: the upstream config has
 no `audio_config` and the weights contain no audio tower, so the `<|audio|>`
@@ -63,6 +85,11 @@ dotnet run --project TensorSharp.Cli -c Release -- --model models/diffusiongemma
   --backend ggml_cuda --max-tokens 256 --diffusion-steps 48 --diffusion-seed 0 --diffusion-blocks 1
 ```
 
+To ask about a picture, add `--mmproj models/model-00011-of-00011.safetensors`
+and `--image photo.png` (repeat `--image` for several pictures, in order). The
+CLI does not look for this shard beside the model, and without a loaded tower it
+refuses an image rather than answering without it.
+
 Server (the Web UI at `http://localhost:5000/index.html` streams live denoising previews —
 each step repaints the whole message via `replace` SSE frames; the Ollama/OpenAI
 compatibility endpoints return the final text only):
@@ -70,6 +97,9 @@ compatibility endpoints return the final text only):
 ```bash
 dotnet run --project TensorSharp.Server.Host -c Release -- --model models/diffusiongemma-26B-A4B-it-Q4_K_M.gguf --backend ggml_cuda
 ```
+
+Add `--mmproj models/model-00011-of-00011.safetensors` to accept images in chat
+requests; the server never auto-detects a projector.
 
 ## 1. Origin and intent
 
@@ -125,8 +155,9 @@ canvas decodes:
    for every denoising step.
 3. The sampler accepts low-entropy positions, re-noises the rest, and repeats.
 
-Prompt-KV caching is enabled on device-glue backends and bypassed on the pure
-CPU path.
+Prompt-KV caching is enabled on the device-glue backends (`ggml_metal`,
+`ggml_cuda`, `mlx`, `cuda`); on `cpu`, `ggml_cpu` and `ggml_vulkan` every step
+runs the unified `[prefix|canvas]` forward instead.
 
 ## 3. Sampler contract
 
@@ -177,7 +208,8 @@ Diffusion-specific metadata includes:
 
 Current optimized paths include:
 
-- Prompt-KV cache for GPU backends.
+- Prompt-KV cache on `ggml_metal`, `ggml_cuda`, `mlx` and `cuda` (not
+  `ggml_vulkan`).
 - Self-conditioning enabled by default; disable with `DIFFUSION_NO_SC=1`.
 - GGML fused decode layer, fused whole-model decode, and fused lm-head tail.
 - CUDA VRAM residency planning: when the model is larger than VRAM, weights are
@@ -214,6 +246,11 @@ Important toggles:
 | `DIFFUSION_DEVICE_COPY_BUDGET_MB` | ggml_cuda: device-copy cache cap when the model spills VRAM, default 768 |
 | `DIFFUSION_SEGMENTED_DECODE` | ggml_cuda: force per-layer fused decode `1`/`0` (auto when the model spills VRAM) |
 | `DIFFUSION_PIN_STREAMED=1` | ggml_cuda: page-locked copies of streamed weights for DMA uploads (costs RAM) |
+| `DIFFUSION_FUSED_PREFILL_ATTN` | Fused GGML prompt attention: on by default for `ggml_cuda` (`0` restores the per-op reference), `1` opts in on other GGML backends without implying they were validated; always off for image prompts, which need the bidirectional image-span mask |
+| `DIFFUSION_NO_DEVICE_SAMPLE=1` | ggml_cuda: disable on-device argmax / entropy / sampling / self-conditioning top-K (default on while the model fits in VRAM) |
+| `DIFFUSION_DEVICE_SAMPLE_FORCE=1` | ggml_cuda: keep device sampling even when the model spills VRAM (segmented decode), where the host sampler is normally used; for experiments |
+| `DIFFUSION_IMAGE_BIDIRECTIONAL=0` | Make image soft-token spans causal; by default attention inside a span is bidirectional on sliding layers |
+| `DIFFUSION_ASYNC_COMPUTE=1` | ggml_metal: keep Metal's lazy-sync async compute on (GGML enables it only on Metal). The model turns it off at load because its per-op paths write tensors from the CPU (MoE expert inputs, embeddings, masks, self-conditioning, the re-noised canvas) and Metal has no host-write barrier, so the prompt K/V cached for the whole turn could be corrupted and answers came back fluent but off-topic. Unsafe; only for measuring the cost of the synchronization |
 
 ## 6. Server behavior
 
@@ -225,9 +262,17 @@ When the Web UI hosts a DiffusionGemma GGUF:
 - A final replacement is emitted before the `done` event.
 - Concurrent requests share one background diffusion scheduler and are admitted
   between blocks.
-- On backends without prompt-KV caching (`cpu`, `ggml_cpu`) the scheduler runs
+- On backends without prompt-KV caching (`cpu`, `ggml_cpu`, `ggml_vulkan`) the scheduler runs
   each sequence's step through the unified `[prefix|canvas]` forward instead of
   prefill + canvas decode; behavior and output are identical.
+- Image turns need the vision tower loaded with `--mmproj`. Each image is
+  expanded into its soft-token span before the context check. The encoded spans
+  belong to the sequence in the scheduler and are re-applied whenever its prompt
+  is prefilled (once per block, or at every step on backends without prompt-KV
+  caching), so image and text requests batch together. Audio is refused. There
+  is no video path: an OpenAI `video_url` part is refused, and a video uploaded
+  in the Web UI reaches the model only as its extracted frames, each rendered as
+  a plain `<|image>` (no `<|video>` marker and no frame timestamps).
 
 The Ollama and OpenAI compatibility adapters still use append-oriented response
 shapes through `ChatStreamWithMetricsAsync`. They can surface the final
@@ -244,14 +289,23 @@ reasoning (`"think": true` returns it as `reasoning_content`), and the channel
 markers never reach a client. Before this the raw canvas was delivered verbatim
 and OpenAI answers began with the literal `<|channel>thought` marker.
 
+This checkpoint often answers inside the thought block and never writes the
+closing `<channel|>`. A finished canvas is not a truncated thought, so when it
+parses to no answer but a thought block, that text is returned as the answer
+(and not repeated as reasoning). Without this, 3 of 6 one-line questions on the
+Q4_K_M file came back empty. Likewise, when the only thing on the canvas is a
+tool call the model wrote anyway, that call is shown as text rather than
+returning an empty answer; next to other answer text it is dropped.
+
 Tool calling is refused up front: `/v1/chat/completions` answers HTTP 400
 (`{"error": ...}`, `invalid_request_error`) to any request that carries `tools`
 or a `tool_choice` other than `"none"` while a DiffusionGemma model is loaded,
 because a block-diffusion turn has no tool loop to feed a result back into.
-`/v1/responses` and Ollama's `/api/chat` refuse `tools` the same way. The
-built-in skills / code-execution tools are never offered to this family either
-(the protocol entry declares `RendersToolDeclarations = false`), so `--code-exec`
-and skills discovery leave a diffusion request exactly as it was before.
+`/v1/responses` and the Ollama endpoint `/api/chat/ollama` refuse `tools` the
+same way. The built-in skills / code-execution tools and the sub-agent
+coordination tools are never offered to this family either (the protocol entry
+declares `RendersToolDeclarations = false`), so `--code-exec`, skills discovery
+and sub-agent delegation leave a diffusion request exactly as it was before.
 
 ## 7. Test coverage
 
@@ -264,6 +318,20 @@ opt-in on real GGUFs via `TS_TEST_MODEL_DIR`. It covers:
 - Regression guards for repeated-token output and device-memory retention.
 - Batched decode equivalence and two-request generation through the scheduler
   style used by the server.
+
+[`DiffusionGemmaProtocolTests`](../../InferenceWeb.Tests/DiffusionGemmaProtocolTests.cs)
+needs no weights and pins the channel parsing: a thought block is dropped unless
+requested, an unterminated one is the answer, and a spontaneous tool call
+surfaces as text.
+
+Image input has two more suites.
+[`DiffusionGemmaVisionConcurrencyTests`](../../InferenceWeb.Tests/DiffusionGemmaVisionConcurrencyTests.cs)
+needs no weights and pins that image spans belong to a sequence, so two image
+requests in flight cannot overwrite each other.
+[`Gemma4VisionOracleTests`](../../InferenceWeb.Tests/Gemma4VisionOracleTests.cs)
+(opt-in via `TS_DIFFUSIONGEMMA_VISION_DIR`) compares the tower loaded from the
+shard against a NumPy transcription of the Hugging Face reference
+(`eng/diffusiongemma-vision-oracle.py`).
 
 ## 8. Remaining work
 

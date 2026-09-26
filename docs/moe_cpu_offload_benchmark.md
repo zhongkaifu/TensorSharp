@@ -411,7 +411,7 @@ all three GPU backends: **182 checks, all passing** — 110 through the server a
 
 ### Server
 
-Nineteen configurations (`TensorSharp.Server`, OpenAI-compatible endpoint) × six
+Nineteen configurations (`TensorSharp.Server.Host`, OpenAI-compatible endpoint) × six
 capabilities, with and without offload and with tensor parallelism:
 
 | Configuration | short text | long text | multi-turn | tools | JSON mode | image |
@@ -697,7 +697,7 @@ TensorSharp.Cli --model <model.gguf> --backend ggml_cuda \
 ```
 
 The server sweep is a per-host script rather than a checked-in harness: it starts
-`TensorSharp.Server` per configuration and drives `/v1/chat/completions` for the
+`TensorSharp.Server.Host` per configuration and drives `/v1/chat/completions` for the
 six capabilities. `--env-vars none` on the matrix runner turns off the offload
 cross-product, which the server sweep already covers.
 

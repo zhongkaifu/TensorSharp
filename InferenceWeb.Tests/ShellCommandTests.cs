@@ -293,6 +293,52 @@ public class ShellCommandTests
         Assert.True(ShellCommand.ContainsInstall("npm install example-package", includePackageRunners: false));
     }
 
+    [Theory]
+    [InlineData("npm update", "`npm update`", "`npm install <name>@latest`")]
+    [InlineData("npm update lodash", "`npm update`", "`npm install <name>@latest`")]
+    [InlineData("pnpm update", "`pnpm update`", "`pnpm add <name>@latest`")]
+    [InlineData("yarn up lodash", "`yarn up`", "`yarn add <name>@latest`")]
+    [InlineData("npm exec cowsay hi", "`npm exec`", "node_modules/.bin/")]
+    [InlineData("npm exec -- tool", "`npm exec`", "node_modules/.bin/")]
+    // These reach the registry but produce ARCHIVES: an install instead, reported as
+    // success, left the next command looking for files that were never written.
+    [InlineData("pip download requests", "`pip download`", "`pip install <name>`")]
+    [InlineData("pip3 wheel numpy && ls *.whl", "`pip3 wheel`", "`pip3 install <name>`")]
+    [InlineData("python3 -m pip download -d wheels pandas", "`pip download`", "`pip install <name>`")]
+    public void ARegistrySubcommandTheHostDoesNotPerform_IsRefusedByName_NotReadAsAPackage(
+        string command, string named, string instead)
+    {
+        // The classifier routes these to the host's installer, and the reader used to take
+        // the subcommand for a PACKAGE: `npm update` asked the registry for a package called
+        // "update", and `npm exec cowsay hi` asked for "exec", "cowsay" and "hi" and then
+        // substituted the command out of the line, so cowsay never ran.
+        Assert.True(ShellCommand.ContainsInstall(command), command);
+
+        Assert.False(ShellInstall.TryRead(
+            command, null, out IReadOnlyList<ShellInstallRequest> requests, out string? error));
+        Assert.Empty(requests);
+        Assert.Contains(named, error!, StringComparison.Ordinal);
+        Assert.Contains(instead, error!, StringComparison.Ordinal);
+        // The refusal is reached with general network access on, too (a package allow-list
+        // keeps runners classified), so it must not claim that nothing can fetch here.
+        Assert.DoesNotContain("cannot fetch", error!, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("pip -q install requests", "requests")]
+    [InlineData("python3 -m pip --disable-pip-version-check install pandas", "pandas")]
+    [InlineData("npm --silent install left-pad", "left-pad")]
+    public void AnOptionBeforeTheSubcommand_DoesNotTurnTheSubcommandIntoAPackage(string command, string package)
+    {
+        // The classifier takes the first word that is not an option as the subcommand, and
+        // the reader took the SECOND word — so `pip -q install x` also asked for "install".
+        Assert.True(ShellCommand.ContainsInstall(command), command);
+
+        Assert.True(ShellInstall.TryRead(
+            command, null, out IReadOnlyList<ShellInstallRequest> requests, out string? error), error);
+        Assert.Equal(new[] { package }, Assert.Single(requests).Packages);
+    }
+
     [Fact]
     public void AFetcher_IsNotAPackageManager()
     {

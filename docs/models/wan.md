@@ -3,7 +3,7 @@
 TensorSharp runs the [Wan 2.1](https://github.com/Wan-Video/Wan2.1) and
 [Wan 2.2](https://github.com/Wan-Video/Wan2.2) video diffusion models natively:
 prompt (plus an optional first-frame image on the Wan 2.2 models) in, H.264 MP4
-out, from both `TensorSharp.Cli` and `TensorSharp.Server` (OpenAI-style API +
+out, from both `TensorSharp.Cli` and `TensorSharp.Server.Host` (OpenAI-style API +
 the bundled Web UI chat).
 
 > **Wan is the video-only family.** The newer video model in TensorSharp is
@@ -48,8 +48,8 @@ Because several files have to line up, the ready-made configs in
 download whatever is missing on the first run:
 
 ```bash
-# Text-to-video AND image-to-video, 4-step distilled (~9.5 GB on first run).
-TensorSharp.Server --config config/wan-video-ti2v-5b-turbo.json
+# Text-to-video AND image-to-video, 4-step distilled (~12.9 GB on first run).
+TensorSharp.Server.Host --config config/wan-video-ti2v-5b-turbo.json
 
 TensorSharp.Cli --config config/wan-video-ti2v-5b-turbo.json \
   --prompt "a red fox trotting through falling snow" --output fox.mp4
@@ -61,13 +61,14 @@ TensorSharp.Cli --config config/wan-video-ti2v-5b-turbo.json \
 
 | Config | DiT | VAE | Text encoder | Modes | First-run download |
 |---|---|---|---|---|---|
-| `wan-video-ti2v-5b-turbo.json` | TI2V-5B Turbo (4-step) | Wan 2.2 | UMT5-XXL | T2V + I2V | ~9.5 GB |
-| `wan-video-ti2v-5b.json` | TI2V-5B (50-step) | Wan 2.2 | UMT5-XXL | T2V + I2V | ~11.4 GB |
-| `wan-video-i2v-a14b.json` | A14B high **+** low noise | Wan 2.1 | UMT5-XXL | I2V only | ~24 GB |
+| `wan-video-ti2v-5b-turbo.json` | TI2V-5B Turbo (4-step) | Wan 2.2 | UMT5-XXL | T2V + I2V | ~12.9 GB (DiT 5.4 GB, UMT5 6.0 GB, Wan 2.2 VAE 1.4 GB) |
+| `wan-video-ti2v-5b.json` | TI2V-5B (50-step) | Wan 2.2 | UMT5-XXL | T2V + I2V | ~12.9 GB |
+| `wan-video-i2v-a14b.json` | A14B high **+** low noise | Wan 2.1 | UMT5-XXL | I2V only | ~25.6 GB |
 
-The models are stored wherever `TENSORSHARP_MODELS` points, or in a `models/`
-folder next to the repository when it is unset — the configs contain no absolute
-paths, so the same file works on Windows, Linux and macOS.
+The models are stored wherever `TENSORSHARP_MODELS` points, or in the
+repository's own `models/` folder when it is unset (the configs resolve
+`../models` relative to `config/`, giving `<repository>/models`) — the configs
+contain no absolute paths, so the same file works on Windows, Linux and macOS.
 
 **The two VAEs are not interchangeable**: TI2V-5B needs the Wan 2.2 VAE
 (48-channel latent, 16×16×4), while A14B and the Wan 2.1 models need the Wan 2.1
@@ -212,7 +213,9 @@ carries the Lightning distillation already merged into both experts, Q8_0
 is a second TI2V-5B option. Note that
 [lightx2v/Wan2.2-Lightning](https://huggingface.co/lightx2v/Wan2.2-Lightning)
 publishes LoRA `.safetensors` only, and TensorSharp has no Wan LoRA option — use
-the pre-merged GGUFs above.
+the pre-merged GGUFs above. (`--lora` applies to Qwen-Image-2.1 only: the CLI
+refuses it with a Wan model, and the server logs a warning and loads the model
+without it.)
 
 ### Getting good quality
 
@@ -232,7 +235,7 @@ the pre-merged GGUFs above.
 ## Server
 
 ```bash
-TensorSharp.Server --model Wan2.2-TI2V-5B-Q8_0.gguf --backend ggml_cuda \
+TensorSharp.Server.Host --model Wan2.2-TI2V-5B-Q8_0.gguf --backend ggml_cuda \
   --video-frames 121 --fps 24
 ```
 
@@ -244,7 +247,10 @@ default independently; these are defaults, not caps. If the flags and request
 fields are both omitted, the model recipes apply: 49 frames at 24 fps for
 TI2V-5B, and 33 frames at 16 fps otherwise. Frame counts are snapped to `4k+1`.
 Keep the model's native FPS and adjust the frame count when changing duration;
-changing only FPS changes playback speed.
+changing only FPS changes playback speed. `--video-width` / `--video-height`
+(also accepted as `--width` / `--height`) and `--video-steps` are server-wide
+defaults in the same way: a request's `width` / `height` (or `size`) and `steps`
+override them, and without them the model recipe applies.
 
 The step-distilled fast lane is a property of the `--model` GGUF, not of the
 request, so it applies to the Web UI and to every endpoint with no client-side
@@ -252,7 +258,7 @@ change at all — point `--model` at a Turbo/Lightning checkpoint and nothing el
 moves:
 
 ```bash
-TensorSharp.Server --model Wan2_2-TI2V-5B-Turbo-Q8_0.gguf --backend ggml_metal \
+TensorSharp.Server.Host --model Wan2_2-TI2V-5B-Turbo-Q8_0.gguf --backend ggml_metal \
   --video-frames 121 --fps 24
 ```
 
@@ -304,14 +310,20 @@ The networks each run as ONE resident-weight ggml graph per invocation
   between chunks; convs run as banded im2col+GEMM under a scratch budget so
   peak VRAM stays bounded (`TS_WAN_VAE_GEMM_MAX_MB`; 384 MB on CUDA — sizing it
   from free memory measured **2.2x slower**, because the scratch then eats the
-  headroom the rest of the graph needs and WDDM pages the overflow — and free/8
-  capped at 8 GB on Metal, which has no PCIe cliff; `0` forces direct
-  convolution). The kd temporal taps of a causal conv share ONE im2col instead
-  of lowering the same pixels once each, and bands are split evenly rather than
-  walked at a fixed height; both are bit-identical. With the
-  cross-chunk feature caches stored F16. The Wan 2.2 decoder adds the
-  weight-free DupUp3D residual shortcuts and the final 2×2 pixel unpatchify.
-  Above ~0.5 MP the decode is additionally tiled into full-width horizontal
+  headroom the rest of the graph needs and WDDM pages the overflow — free/8
+  clamped to 384 MB–8 GB on Metal, which has no PCIe cliff, and 384 MB on the
+  other GGML backends; `0` forces direct convolution). On Metal the budget
+  applies only with `TS_WAN_VAE_MPS_CONV=0`, because by default MPSGraph runs
+  each convolution whole; while the Metal 4 tensor API is active (M5-class
+  devices running a 14B-class model) it defaults to `0`. The kd temporal taps
+  of a causal conv share ONE im2col instead of lowering the same pixels once
+  each, and bands are split evenly rather than walked at a fixed height; both
+  are bit-identical. The cross-chunk feature caches are stored in F16. The
+  Wan 2.2 decoder adds the weight-free DupUp3D residual shortcuts and the final
+  2×2 pixel unpatchify. Above a per-band pixel budget (on the GGML backends it
+  scales with free device memory: about 0.64 MP at 16 GB free, never below
+  0.16 MP; the direct `cuda`/`cpu` backends use 0.3 MP), the decode is
+  additionally tiled into full-width horizontal
   bands blended over an 8-latent-row overlap (the diffusers `enable_tiling`
   approach, ~59 dB vs the untiled decode): a 720p plane's activations plus
   causal caches are otherwise ~12 GB device-resident, which pushes 16 GB
@@ -353,6 +365,9 @@ default because it wins ~1.2x on a short clip and loses ~4.5x on a 121-frame one
 the temporal chunk count), `TS_CUDNN_DIR` (cuDNN install to use),
 `TS_WAN_VAE_MPS_CONV=0`
 (ggml conv lowering instead of MPSGraph on Metal),
+`TS_WAN_METAL_TENSOR_API=1|0` (force the Metal 4 tensor API on or off; default on
+for 14B-class DiTs, off for smaller ones — see
+[below](#the-metal-4-tensor-api-and-how-not-to-test-it)),
 `TS_WAN_VAE`/`TS_WAN_TE`/`TS_WAN_DIT2` (companion paths), `TS_FFMPEG` (ffmpeg
 path for MP4 export), `TS_WAN_DIT_TRACE=<file>` (per-stage activation stats for
 debugging).
@@ -507,8 +522,11 @@ over a whole decode. `TS_WAN_VAE_MPS_CONV=0` restores the ggml lowering.
 
 **VAE conv im2col budget, and the tiling threshold itself, sized from device
 memory.** Both were pinned at a 16 GB card's budget on every non-CUDA backend.
-Metal now derives them from free device memory like CUDA does (Vulkan keeps the
-floor — its drivers reject multi-GB arenas). A bigger im2col budget turns many
+Metal now sizes the im2col budget from free device memory (free/8, capped at
+8 GB); CUDA keeps a fixed 384 MB, because sizing it from free memory measured
+2.2x slower there, and Vulkan (like ggml_cpu) keeps a fixed 384 MB because its
+drivers reject multi-GB arenas. The tiling threshold now scales with free device memory on
+every GGML backend. A bigger im2col budget turns many
 small banded GEMMs into few large ones: 56.4 s → 49.7 s for a 1088×832×9f
 decode. And tiling is not free — the bands overlap, so the decoder runs more
 latent rows than the plane has, and the band buffer lives alongside the canvas.
@@ -540,6 +558,15 @@ The most tempting knob here, and it stays **off** for TI2V-5B. It measures 1.20�
 on the DiT (121.4 → 100.8 s/pass) and 1.66× on the VAE decode, because it routes
 `mul_mm` through Metal 4 tensor operations — but on M5 / macOS 26.6 it also
 miscomputes the VAE's conv GEMMs and the video comes out uniformly **black**.
+
+For A14B and other 14B-class DiTs (patch-embedding width ≥ 5120) it is **on** by
+default on M5-class Macs, because the DiT gain is larger there: A14B I2V measured
+17.1 vs 30.2 s/step (1.77×) at 480×480×9f on an M5 Pro
+([Wan video and the tensor API](../../DEVELOPMENT.md#wan-video-and-the-tensor-api)).
+The VAE's convolutions are kept off the tensor-API `mul_mm` in that case: they run
+on MPSGraph (the default), or on ggml's direct convolution instead of im2col+GEMM
+when `TS_WAN_VAE_MPS_CONV=0`. `TS_WAN_METAL_TENSOR_API=1` / `0` forces the tensor
+API on or off for the process, overriding the model-class default.
 
 The trap is that this does not reproduce in isolation. `WanVideoBench
 vae-decode` was run at five latent shapes, including the 32×32 layout recorded

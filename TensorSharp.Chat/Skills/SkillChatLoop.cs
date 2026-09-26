@@ -1325,6 +1325,11 @@ namespace TensorSharp.Server.Skills
 
             switch (call.Name)
             {
+                case SkillToolNames.ReadFile:
+                case SkillToolNames.WriteFile:
+                case SkillToolNames.EditFile:
+                    return Arg("path") is { } filePath ? Truncate(filePath, 256) : null;
+
                 case "skills_run":
                     string script = Arg("path") ?? Arg("script");
                     string args = Arg("args");

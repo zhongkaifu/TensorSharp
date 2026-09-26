@@ -19,7 +19,20 @@ namespace TensorSharp.Models.QwenImage
             bool ggml = model.Backend is BackendType.GgmlCpu or BackendType.GgmlCuda or BackendType.GgmlMetal
                 or BackendType.GgmlVulkan;
             VaeReferenceMath.UseGpuConv = ggml && Environment.GetEnvironmentVariable("TS_QWEN_VAE_GPU") != "0";
-            VaeReferenceMath.UseFusedGraph21 = model.Backend == BackendType.GgmlCuda;
+            // The whole-VAE graph, by default on CUDA and Metal. On an M5 Pro at 2048x2048 it
+            // decodes in 25 s instead of 85 s with a 45 GB instead of 64 GB peak footprint,
+            // at 97-100 dB PSNR to the per-op path (1024x1024: 5 s instead of 13-15 s, where
+            // stable-diffusion.cpp takes 7 s). TS_QWEN21_VAE_FUSED=1 forces it on another GGML
+            // backend, =0 turns it off.
+            // Never on Vulkan: NVIDIA Vulkan multiplies through F16 cooperative-matrix
+            // operands and only the per-convolution path rescales for that (the fused graph
+            // turns the decoder's >65504 activations into NaN there).
+            string fused = Environment.GetEnvironmentVariable("TS_QWEN21_VAE_FUSED");
+            if (fused == "1" && model.Backend == BackendType.GgmlVulkan)
+                Console.WriteLine("  [vae21] TS_QWEN21_VAE_FUSED=1 ignored on Vulkan: the whole-VAE graph overflows F16 " +
+                    "cooperative-matrix operands there; decoding per convolution instead.");
+            VaeReferenceMath.UseFusedGraph21 = model.Backend != BackendType.GgmlVulkan &&
+                (fused == "1" || (fused != "0" && model.Backend is BackendType.GgmlCuda or BackendType.GgmlMetal));
             if (ggml) GgmlBasicOps.EnsureBackendAvailable(model.Backend switch
             {
                 BackendType.GgmlCuda => GgmlBackendType.Cuda,

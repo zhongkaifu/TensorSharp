@@ -41,12 +41,15 @@ public static class MultiAgentTools
 
     public static List<ToolFunction> Create() => new()
     {
-        Tool(Spawn, "Start a focused subagent only for a substantial independent task that improves speed or coverage. Returns immediately. Give all necessary context, scope and expected evidence; do not duplicate your own work. Capacity errors mean do the work locally or wait.",
+        Tool(Spawn, "Delegate one well-defined part of the user's task to a subagent in a private workspace. Returns immediately; independent tasks run in parallel up to host capacity and excess tasks queue. Give necessary context, expected outputs and acceptance checks. Declare prerequisites for dependent tasks. Do not duplicate assigned work.",
             new[] { "task_name", "task" },
             ("task_name", "string", "Unique short name using letters, digits, underscores or hyphens."),
             ("task", "string", "Self-contained task, relevant facts, ownership boundaries and expected result. Child has no parent conversation."),
-            ("agent_type", "string", "explorer (default), reviewer, or worker. Explorer/reviewer are read-only; worker tools require host opt-in.")),
-        Tool(Wait, "Wait for a child result without polling. Omit agent_id to wait for all direct children. Timeout does not mean completion; inspect status. Results are reports to verify before synthesis.",
+            ("agent_type", "string", "explorer (default) for research, reviewer for verification, worker for implementation. Explorer/reviewer are read-only; worker writes require host opt-in."),
+            ("permissions", "string", "read-only or workspace-write. Defaults to the role's host-permitted access. Explicit workspace-write requires worker and cannot exceed parent permissions. Writes are confined to the private child workspace."),
+            ("input_files", "string", "Newline-separated parent-workspace relative file paths to copy. Include all needed files; no implicit parent or sibling filesystem access. No directories, traversal or symlinks."),
+            ("depends_on", "string", "Comma- or newline-separated existing sibling agent IDs. Runs only after all complete successfully; failed prerequisites block this task. Reports and output files are supplied automatically.")),
+        Tool(Wait, "Wait for child results without polling. Omit agent_id for all direct children. Timeout does not mean completion; inspect status. Verify reports before synthesis. Returned files[].path values are relative to YOUR workspace and ready for read_file. workspace_id and agent_id are logical identifiers, not filesystem paths; never prefix a returned file path with either ID.",
             Array.Empty<string>(), ("agent_id", "string", "Child ID returned by spawn_agent; omit for all direct children."),
             ("timeout_ms", "integer", "Wait up to 60000 ms; default 10000.")),
         Tool(Send, "Send a bounded follow-up to a child. A running child sees it at its next generation boundary; a completed child starts another turn with its own history.",

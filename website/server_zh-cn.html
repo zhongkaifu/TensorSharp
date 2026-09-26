@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>服务器与 Web UI — TensorSharp 维基</title>
-  <meta name="description" content="启动 TensorSharp.Server：浏览器聊天界面、兼容 Ollama/OpenAI 的 HTTP 端点、Agent Skills、沙箱化代码执行与批处理调参。">
+  <meta name="description" content="启动 TensorSharp.Server.Host：浏览器聊天界面、兼容 Ollama/OpenAI 的 HTTP 端点、Agent Skills、沙箱化代码执行与批处理调参。">
   <link rel="icon" href="assets/logo.svg" type="image/svg+xml">
   <link rel="stylesheet" href="assets/style.css">
   <script>try{var t=localStorage.getItem('ts-theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');document.documentElement.classList.toggle('dark',t==='dark');}catch(e){}</script>
@@ -16,10 +16,13 @@
 <main class="content" id="content">
   <div class="breadcrumb"><a href="index_zh-cn.html">首页</a> › 服务器与 Web UI</div>
   <h1>服务器与 Web UI</h1>
-  <p class="lede"><code>TensorSharp.Server</code> 是一个 ASP.NET Core 应用，托管单个 GGUF 模型，并在同一端口上暴露浏览器聊天 UI 以及兼容 Ollama 和 OpenAI 的 REST API。连续批处理引擎负责并发。</p>
+  <p class="lede"><code>TensorSharp.Server.Host</code>（基于 <code>TensorSharp.Server</code> 库）是一个 ASP.NET Core 应用，托管单个 GGUF 模型，并在同一端口上暴露浏览器聊天 UI 以及兼容 Ollama 和 OpenAI 的 REST API。连续批处理引擎负责并发。</p>
 
   <h2 id="embeddings">嵌入服务</h2>
   <p>使用 <code>--model encoder.gguf --embeddings</code>，托管 Snowflake Arctic Embed L v2.0 或 MiniLM。 <code>POST /v1/embeddings</code>、<code>POST /api/embed</code>、<code>POST /api/embeddings</code> 返回归一化向量；后端为纯 C# <code>cpu</code> 与原生 <code>ggml_cpu</code> / <code>ggml_metal</code> / <code>ggml_cuda</code>。<a href="embeddings_zh-cn.html">下载、API、截断规则与检索质量 →</a></p>
+
+  <h2 id="jev">Jev 类型化决策</h2>
+  <p>托管一个 DiffusionGemma GGUF（例如使用 <code>config/jev-diffusiongemma-q4.json</code>），<code>POST /v1/systemone</code> 就会应答与 Jev 兼容的类型化决策请求：请求体携带状态与类型化问题（<code>noul</code>、<code>choice</code>、<code>score</code>），响应返回在一次去噪步之后读出的概率、选项与期望分数。<code>model</code> 可以写已加载模型的名称，或别名 <code>jev-latest</code> / <code>jev-preview</code>（它们不是独立的权重）。请求只接受 JSON；用 <code>--mmproj</code> 加载视觉塔后，请求还可以在 <code>images</code> 数组中内联最多 8 张图像（base64 或 <code>data:</code> URL）。<code>TS_JEV_MAX_BODY_MB</code>（默认 8，1–64）、<code>TS_JEV_MAX_CANVAS</code>（默认 64，8–4096）与 <code>TS_JEV_MAX_PENDING</code>（默认可接纳 32 个请求，1–1024）限定工作量。<a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/models/jev_zh-cn.md" target="_blank" rel="noopener">字段、限制与状态码 →</a></p>
 
   <h2 id="start">启动服务器</h2>
   <h3 id="e4b-fast-lane">约 30 秒快速开始（Gemma 4 E4B）</h3>
@@ -54,7 +57,7 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model ./models/
 dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model ./models/model.gguf --mmproj ./models/mmproj.gguf --backend ggml_cuda</code></pre>
 
   <h3>服务器级默认采样</h3>
-  <p>默认值会填补请求未提供的任何字段。你显式配置过的参数还会<em>覆盖</em>客户端为其发来的值 —— 很多聊天客户端（如 VS Code Copilot Chat）会把 <code>temperature</code>/<code>top_p</code> 硬编码进每一次请求。加上 <code>--sampling-precedence request</code> 可把控制权交还给客户端。</p>
+  <p>默认值会填补请求未提供的任何字段。开箱即用的默认值与 Ollama 一致：temperature <code>0.8</code>、top-k <code>40</code>、top-p <code>0.9</code>、min-p <code>0</code>、在最近 <code>64</code> 个 token 上的重复惩罚 <code>1.1</code>、存在/频率惩罚 <code>0</code>、seed <code>-1</code>。你显式配置过的参数还会<em>覆盖</em>客户端为其发来的值 —— 很多聊天客户端（如 VS Code Copilot Chat）会把 <code>temperature</code>/<code>top_p</code> 硬编码进每一次请求。加上 <code>--sampling-precedence request</code> 可把控制权交还给客户端。</p>
   <pre data-lang="bash"><code>dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model ./models/model.gguf --backend ggml_metal \
     --temperature 0.7 --top-p 0.9 --top-k 40 --repeat-penalty 1.1 \
     --presence-penalty 0.0 --frequency-penalty 0.0 --seed 42 \
@@ -65,19 +68,21 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model ./models/
   <ul>
     <li>多轮对话，带流式 token 生成（SSE）。</li>
     <li>每标签页独立的聊天会话 —— 每个标签页拥有自己的跟踪对话历史；请求 KV 块与前缀复用由推理引擎管理。</li>
-    <li>用于多模态推理的图像、视频、音频、PDF 与文本 / 代码上传（最大 500 MB）。</li>
+    <li>用于多模态推理的图像、视频、音频、PDF 与文本 / 代码上传（默认每个文件最大 500 MB；<code>--upload-max-mb</code> 调整单文件上限，<code>POST /api/upload</code> 的请求体上限会随之调高——见下方上传选项）。</li>
     <li>PDF 文档：原生数字 PDF 会完整抽取文本层并内联到提示词；扫描 PDF 在视觉模型上回退为逐页图像（<code>TS_PDF_MAX_PAGES</code> 限制读取页数）。最终渲染的提示词会根据模型的实际上下文窗口进行检查。</li>
     <li>思考 / 推理模式开关，以及带函数定义的工具调用。</li>
+    <li>智能体轮次的实时活动行；<code>wait_agent</code> 运行期间会出现可展开的 <code>wait_agent · N sub-agents</code> 列表，每个<a href="#agentic">子智能体</a>一张原位更新的卡片（任务、状态、当前工具、结果）。</li>
     <li>消息编辑与删除，并可从对话中任意位置重新生成。</li>
     <li>当托管 <code>diffusion-gemma</code> GGUF 时，提供 DiffusionGemma 去噪预览（每步替换整条助手消息，最后定稿）。</li>
-    <li>托管 <code>qwen_image</code> DiT 时提供 Qwen-Image-2.1：不带附件的提示词会生成图像，附加一张或多张图像则进行编辑；最多 8 帧实时去噪预览会原位刷新，最终 PNG 提供下载链接。</li>
+    <li>托管 <code>qwen_image</code> DiT 时提供 Qwen-Image-2.1：不带附件的提示词会生成图像，附加一张或多张图像则进行编辑；最多 8 帧实时去噪预览会原位刷新，最终 PNG 提供下载链接。浏览器不发送尺寸，因此两者都设置时输出使用 <code>--width</code> / <code>--height</code>，否则使用模型的自动尺寸。</li>
     <li>托管视频生成模型（MiniMax-H3 或 Wan）时提供视频生成：输入提示词，附上所加载权重声明支持的条件输入，浏览器通过 SSE 实时显示逐步去噪进度，直到 MP4 出现并提供下载链接。在 MiniMax-H3 上还会同时返回一条 32&nbsp;kHz 立体声音轨 —— 它与画面出自同一次生成。<strong>所有数值仍然来自启动参数</strong> —— 详见下文<a href="#video">视频生成</a>。</li>
     <li>自由滚动 —— 在新 token 流式输出时阅读较早的回复；自动滚动会在回到底部时恢复。</li>
   </ul>
 
   <h2 id="agentic">Agentic Work 与代码执行</h2>
-  <p>在能够完整往返工具调用的模型家族上，服务器可让<strong>单个模型</strong>在进程内执行「生成 → 工具 → 再生成」循环。Agent Skills 可以在不执行脚本的情况下被发现与读取；运维者需另行传入 <code>--skills-allow-exec</code> 才允许运行技能自带脚本。<code>--code-exec</code> 则显式开启由宿主处理的 <code>read_file</code>、<code>write_file</code>、<code>apply_patch</code> 与沙箱化 <code>shell</code> 工具。Web UI 聊天会话会在各轮之间保留私有工作区；无状态 API 请求各自获得隔离的请求工作区，并在结束后删除。</p>
-  <div class="callout warn"><div class="ic">🔒</div><p>执行类工具在运维者开启前保持关闭，但一旦开启，系统不会再逐条命令弹出审批。沙箱模式默认是 <code>required</code>，无法安全隔离时直接拒绝：macOS 使用 Seatbelt，Linux 要求 bubblewrap 0.12.0 或更新版本。Windows Job Object 只能约束后代进程，不能隔离文件系统或网络，因此技能脚本需要显式选择更弱的沙箱模式，而模型生成的命令需要 <code>--code-exec-unconfined</code>。这是 agentic 工具循环，并非多智能体编排。完整参数、模型家族限制、工作区生命周期与安全边界见 <a href="agentic_zh-cn.html">Agentic Work、Skills 与沙箱</a>。</p></div>
+  <p>在能够完整往返工具调用的模型家族上，服务器让已加载的模型在进程内执行「生成 → 工具 → 再生成」循环。Agent Skills 可以在不执行脚本的情况下被发现与读取；运维者需另行传入 <code>--skills-allow-exec</code> 才允许运行技能自带脚本。<code>--code-exec</code> 则显式开启由宿主处理的 <code>read_file</code>、<code>write_file</code>、<code>apply_patch</code> 与沙箱化 <code>shell</code> 工具。Web UI 聊天会话会在各轮之间保留私有工作区；无状态 API 请求各自获得隔离的请求工作区，并在结束后删除。</p>
+  <p>同一个模型还可以委派任务：在 <code>/v1/chat/completions</code>、<code>/v1/responses</code>、<code>/api/chat/ollama</code> 与 Web UI 的 <code>/api/chat</code> 上，对能渲染工具声明并解析工具调用的家族（Mistral 3、Hunyuan Dense 与 DiffusionGemma 除外），子智能体委派<strong>默认开启</strong>。是否调用 <code>spawn_agent</code>、<code>wait_agent</code>、<code>send_input</code>、<code>close_agent</code> 与 <code>list_agents</code> 由模型决定；它既不依赖技能，也不依赖 <code>--code-exec</code>。每个子智能体都是同一模型上的独立对话，拥有自己的 KV 状态副本；explorer 与 reviewer 子智能体只读。<code>--no-multi-agent</code> 可关闭委派，下方的 <code>--agents-*</code> 选项为它设定上限，请求也可以用 <code>"multi_agent": false</code> 退出。项目没有发布它的延迟或质量测量数据。→ <a href="agentic_zh-cn.html#sub-agents">子智能体</a></p>
+  <div class="callout warn"><div class="ic">🔒</div><p>执行类工具在运维者开启前保持关闭，但一旦开启，系统不会再逐条命令弹出审批。沙箱模式默认是 <code>required</code>，无法安全隔离时直接拒绝：macOS 使用 Seatbelt，Linux 要求 bubblewrap 0.12.0 或更新版本。Windows Job Object 只能约束后代进程，不能隔离文件系统或网络，因此技能脚本需要显式选择更弱的沙箱模式，而模型生成的命令需要 <code>--code-exec-unconfined</code>。同一请求的子智能体树中，宿主工具调用一次只执行一个；<code>worker</code> 子智能体只有在 <code>--agents-allow-worker-tools</code> 下才能使用父智能体的可写工具。完整参数、模型家族限制、工作区生命周期与安全边界见 <a href="agentic_zh-cn.html">Agentic Work、Skills 与沙箱</a>。</p></div>
 
   <h2 id="video">视频生成：网页界面能设什么，什么只能靠 API</h2>
   <p>托管一个视频生成模型（MiniMax-H3 或 Wan），网页界面就变成了一个视频生成器。这些接口判断的是 <code>IVideoGenerationModel</code> 接缝而不是架构字符串，因此其他模型会返回 <code>400</code> 与 <code>The loaded model is not a video-generation model.</code>。有必要清楚地知道浏览器实际控制了请求中多小的一部分：一次视频任务可能跑几分钟，也可能跑几小时，而浏览器在任务开始后无法再改变这一点。</p>
@@ -124,15 +129,15 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll \
   <div class="callout tip"><div class="ic">💡</div><p><strong>开跑长任务之前，先估算规模。</strong>开销主要由 DiT token 数决定（<code>latent_frames × (h/2) × (w/2)</code>），而自注意力是 O(token²)，因此帧数与帧面积的影响远大于步数。在 MiniMax-H3 上的顺序是分辨率、帧数、步数 —— 它本来就不用引导，没有蒸馏杠杆可拉。在 Wan 上：换用步数蒸馏权重、减少帧数、减小帧面积（但不要低于约 0.3 MP）、在基础权重上减少步数，最后是 <code>"cfgCacheStride": 2</code> 或 <code>3</code>（1.30× / 1.43×）。480p（约 0.4 MP）是 Wan 训练过的分辨率，属于真正的输出档位，而非降级模式。</p></div>
 
   <h2 id="config">配置文件（<code>--config</code>）</h2>
-  <p>可以用 <code>--config</code> 传入一个 JSON 文件，取代冗长的命令行；<a href="cli_zh-cn.html">CLI</a> 读取相同格式。<strong>命令行参数始终优先</strong>——先应用文件中的值，命令行上再次给出的参数会覆盖它们，因此可以在多台主机上复用同一个文件，只覆盖需要变化的部分。<code>--config</code> 可重复以叠加多个文件（后者优先）。允许注释与尾随逗号。</p>
+  <p>可以用 <code>--config</code> 传入一个 JSON 文件，取代冗长的命令行；<a href="cli_zh-cn.html">CLI</a> 读取相同格式。<strong>命令行参数始终优先</strong>——命令行自己设置了某个单值参数时，文件中该参数的条目会在解析之前被丢弃（不展开、不替换其中的变量、也永远不会发起其下载），因此可以在多台主机上复用同一个文件，只覆盖需要变化的部分。每个被覆盖的参数会在 stderr 上打印一行 <code>[config] --X is set on the command line, so the value from '&lt;file&gt;' is ignored …</code>。<code>--gpu-device</code> 与 <code>--kv-cache-dtype</code> 同样如此。<code>--config</code> 可重复以叠加多个文件（后出现的文件中的条目以同样方式取代先前的条目）。可重复的参数——<code>--stop</code>、<code>--skills-dir</code>、<code>--skill</code>、<code>--lora</code>、<code>--lora-scale</code>、<code>--lora-config</code>、<code>--image</code> 与各个 <code>--ref-*</code> 输入——则保留文件中的值并把命令行的值追加在后面。旧拼写（<code>--wan-vae</code>、<code>--wan-te</code> / <code>--video-te</code>、<code>--wan-dit2</code>）与对应的 <code>--video-*</code> 名称算作同一个参数。允许注释与尾随逗号。</p>
   <pre data-lang="bash"><code># 从文件读取全部参数；本次仅覆盖后端
 dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --config config/server-basic.json
 dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --config config/server-basic.json --backend ggml_cpu</code></pre>
-  <p>键名与下方长选项名相同（可带或不带前缀 <code>--</code>）。字符串/数字展开为 <code>--key value</code>，<code>true</code> 展开为裸开关 <code>--key</code>，数组展开为重复的标志（如 <code>"stop": ["&lt;/s&gt;", "&lt;|eot|&gt;"]</code>）。</p>
-  <p><strong>变量。</strong> 在 <code>"variables"</code> 中定义一次共享值，用 <code>${name}</code> 在任意字符串值中引用（未定义的名称回退到同名环境变量）。可以定义任意多个根路径——位于不同目录的模型各用一个。</p>
-  <p><strong>自动下载。</strong> 任何文件参数都可以写成带本地 <code>path</code> 与一个或多个 <code>urls</code> 的对象。若 <code>path</code> 不存在，则从第一个可用 URL 下载（镜像按顺序尝试），保存到该路径，之后复用；进度打印到 stderr，可选的 <code>sha256</code> 用于校验。</p>
+  <p>键名与下方长选项名相同（可带或不带前缀 <code>--</code>）。字符串/数字展开为 <code>--key value</code>，<code>true</code> 展开为裸开关 <code>--key</code>，数组展开为重复的标志（如 <code>"stop": ["&lt;/s&gt;", "&lt;|eot|&gt;"]</code>）。<code>false</code> 与 <code>null</code> 不产生任何参数，因此要关闭默认开启的选项，请写它的否定形式（<code>"no-continuous-batching": true</code>）。<code>lora-scale</code> 与 <code>lora-config</code> 不能写成数组，已移除的选项作为键也会被拒绝。由于服务端会拒绝未知选项，仅 CLI 使用的键（如 <code>interactive</code> 或 <code>input</code>）会让它在启动时报错；惩罚窗口在两个宿主上都叫 <code>repeat-last-n</code>。</p>
+  <p><strong>变量。</strong> 在 <code>"variables"</code>（别名 <code>"vars"</code>）中定义一次共享值，用 <code>${name}</code> 在任意字符串值中引用，或用 <code>${name:-fallback}</code> 附带默认值（未定义的名称回退到同名环境变量）。可以定义任意多个根路径——位于不同目录的模型各用一个。</p>
+  <p><strong>自动下载。</strong> 任何文件参数都可以写成带本地 <code>path</code> 与一个或多个 <code>urls</code>（或单个 <code>url</code>）的对象。相对 <code>path</code> 以配置文件所在目录为基准解析。若 <code>path</code> 不存在，则从第一个可用 URL 下载（镜像按顺序尝试），保存到该路径，之后复用；进度打印到 stderr，可选的 <code>sha256</code> 只校验新下载的文件（已存在的文件直接使用）。命令行（或后出现的文件）也设置了同一参数的下载条目，会在解析之前被丢弃，因此在命令行上传 <code>--mmproj none</code> 既会停用已配置的投影器，也会跳过它的下载。</p>
   <pre data-lang="json"><code>{
-  "variables": { "modelRoot": "C:/models", "repo": "https://huggingface.co/unsloth/gemma-4-E4B-it-GGUF/resolve/main" },
+  "variables": { "modelRoot": "C:/models", "repo": "https://huggingface.co/unsloth/gemma-4-E4B-it-GGUF/resolve/bfc15c382204943c3a8fff0c750b94ae2364d7a3" },
   "backend": "ggml_cuda",
   "max-tokens": 4096,
   "continuous-batching": true,
@@ -143,37 +148,50 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --config config/s
   <p>开箱即用的示例见仓库 <code>config/</code> 目录（<code>cli-basic.json</code>、<code>server-basic.json</code>、<code>variables.json</code>、<code>auto-download.json</code>、<code>qwen-image-2.1.json</code>）——每个都使用真实、公开、无需授权的 URL，因此在全新机器上也能直接运行。完整说明见 <code>config/README.md</code>。</p>
 
   <h2 id="options">服务器选项</h2>
+  <p>选项不区分大小写，也接受 <code>--option=value</code> 形式。与 CLI 不同，服务端遇到未知选项或多余的位置参数会拒绝启动；若有已知选项与之相差不超过两处编辑，还会提示最接近的那个。</p>
   <div class="table-scroll">
   <table>
     <thead><tr><th>选项</th><th>说明</th></tr></thead>
     <tbody>
       <tr><td><code>--model &lt;path&gt;</code></td><td>要托管的 GGUF 文件（推理必需）。</td></tr>
-      <tr><td><code>--mmproj &lt;path&gt;</code></td><td>显式多模态投影器 GGUF；只写文件名时相对于模型目录解析（传 <code>none</code> 可禁用）。需要 <code>--model</code>；不会自动扫描投影器。</td></tr>
-      <tr><td><code>--backend &lt;type&gt;</code></td><td>默认后端：<code>cpu</code>、<code>cuda</code>、<code>mlx</code>、<code>ggml_cpu</code>、<code>ggml_metal</code>、<code>ggml_cuda</code>、<code>ggml_vulkan</code>。</td></tr>
-      <tr><td><code>--tp &lt;N&gt;</code></td><td>张量并行度 —— 把托管的模型切分到本机 N 张 GPU 上（默认：1；环境变量 <code>TENSORSHARP_TP_DEGREE</code>）。需要 <code>--backend cuda</code>、<code>ggml_cuda</code> 或 <code>ggml_vulkan</code>。→ <a href="distributed_zh-cn.html">多 GPU 与多节点</a></td></tr>
+      <tr><td><code>--mmproj &lt;path|none&gt;</code></td><td>显式多模态投影器：mmproj GGUF；对 Gemma 4 家族（包括 DiffusionGemma）也可以是存放视觉塔的 HuggingFace <code>.safetensors</code> 分片（<code>diffusiongemma-26B-A4B-it</code> 没有发布 mmproj）。只写文件名时相对于模型目录解析；传 <code>none</code> 可禁用。需要 <code>--model</code>；不会自动扫描投影器。</td></tr>
+      <tr><td><code>--embeddings</code> · <code>--embedding-threads &lt;N&gt;</code> · <code>--embedding-context-size &lt;N&gt;</code></td><td>托管 GGUF 嵌入编码器而不是聊天模型（见<a href="#embeddings">嵌入服务</a>）；需要 <code>--model</code>，不能与 <code>--mmproj</code> 同用，支持 <code>cpu</code>、<code>ggml_cpu</code>、<code>ggml_metal</code> 与 <code>ggml_cuda</code>。生成类路由（聊天、Responses、Ollama、<code>/v1/systemone</code>，以及 <code>/api/image-generate</code>、<code>/api/image-edit</code>、<code>/api/video-generate</code> 与它们的 <code>/stream</code> 形式）返回 400 <code>This server hosts an embedding model. Use /v1/embeddings or /api/embed.</code>；显式指定本机没有的 <code>--backend</code> 时以退出码 2 结束，并打印 <code>error: model load refused: Backend 'X' is not supported on this machine.</code>。后两个参数设置编码器的 CPU 线程数与每条输入的最大 token 数，且需要 <code>--embeddings</code>。</td></tr>
+      <tr><td><code>--backend &lt;type&gt;</code></td><td>默认后端：<code>cpu</code>、<code>cuda</code>、<code>mlx</code>、<code>ggml_cpu</code>、<code>ggml_metal</code>、<code>ggml_cuda</code>、<code>ggml_vulkan</code>（默认：macOS 上为 <code>ggml_metal</code>，其他平台为 <code>ggml_cpu</code>；环境变量 <code>BACKEND</code>）。</td></tr>
+      <tr><td><code>--tp &lt;N&gt;</code></td><td>张量并行度 —— 把托管的模型切分到本机 N 张 GPU 上（默认：1；环境变量 <code>TENSORSHARP_TP_DEGREE</code>）。需要 <code>--backend cuda</code>、<code>ggml_cuda</code> 或 <code>ggml_vulkan</code>。在 Qwen-Image-2.1 上只切分扩散 Transformer，且只能用同一台机器上、数量能整除其 32 个注意力头的 GPU；文本编码器、视觉编码器与 VAE 留在第一张 GPU 上。DiffusionGemma、Wan 与 MiniMax-H3 没有多卡路径：<code>--tp N</code> 会打印 <code>WARNING: --tp N ignored</code> 并只用一张 GPU 运行。→ <a href="distributed_zh-cn.html">多 GPU 与多节点</a></td></tr>
       <tr><td><code>--tp-node-id &lt;N&gt;</code> / <code>--tp-peers &lt;list&gt;</code></td><td>加入多节点 TP 集群：本节点的 0 起始编号，以及所有节点共享且顺序一致的 <code>host:port</code> 列表。服务端只能是节点 <code>0</code>（负责采样并对外提供 HTTP 的 driver）；其余节点运行 <code>TensorSharp.Cli</code> worker。</td></tr>
       <tr><td><code>--gpu-device &lt;N&gt;</code></td><td><code>ggml_vulkan</code> 后端在多 GPU 主机上使用的 Vulkan 设备索引（默认：0；环境变量 <code>TS_GGML_VULKAN_DEVICE</code>）。</td></tr>
       <tr><td><code>--list-gpus</code></td><td>列出 ggml-vulkan 可见的 Vulkan 设备（索引 + 显卡名称）后退出。</td></tr>
+      <tr><td><code>--port &lt;N&gt;</code> · <code>--host &lt;address&gt;</code> · <code>--urls &lt;urls&gt;</code></td><td>监听端口（默认 <code>5000</code>；环境变量 <code>PORT</code>）、绑定地址（默认 <code>0.0.0.0</code>；环境变量 <code>HOST</code>），或以分号分隔的完整监听 URL，用于前两者无法表达的情形（回退到 <code>ASPNETCORE_URLS</code>；同时给出时以 <code>--port</code> / <code>--host</code> 为准）。</td></tr>
+      <tr><td><code>--no-webui</code></td><td>不提供内置 Web UI；<code>GET /</code> 返回纯文本存活响应。所有 API 端点（包括 <code>/uploads</code>）照常可用。环境变量：<code>TS_NO_WEBUI</code>（非 <code>0</code> 即开启）。</td></tr>
       <tr><td><code>--help</code></td><td>打印完整参数说明后退出；不带任何参数时也会显示。推理始终需要启动参数 <code>--model</code>。</td></tr>
       <tr><td><code>--config &lt;path&gt;</code></td><td>从 JSON <a href="#config">配置文件</a>读取参数（命令行参数会覆盖它）。支持 <code>${变量}</code> 与通过 <code>{ "path": ..., "urls": [...] }</code> 自动下载模型。可重复。</td></tr>
       <tr><td><code>--max-tokens &lt;N&gt;</code></td><td>所有端点（Web UI、Ollama、OpenAI）的生成上限：请求未指定时用它填充，请求要求更多时按它截断（默认：<code>20000</code>，该默认值只填充、不截断）。</td></tr>
       <tr><td><code>--temperature / --top-k / --top-p / --min-p</code></td><td>采样值（默认 <code>0.8</code> / <code>40</code> / <code>0.9</code> / <code>0</code>）。</td></tr>
       <tr><td><code>--repeat-penalty / --presence-penalty / --frequency-penalty / --seed</code></td><td>惩罚与随机种子（默认 <code>1.1</code> / <code>0</code> / <code>0</code> / <code>-1</code>）。</td></tr>
+      <tr><td><code>--repeat-last-n &lt;N&gt;</code></td><td>惩罚考虑最近多少个 token（默认 <code>64</code>；<code>0</code> 关闭，<code>-1</code> 使用全部；环境变量 <code>TENSORSHARP_REPEAT_LAST_N</code>）。请求中写作 <code>repeat_last_n</code>。CLI 使用同样的拼写；原先 CLI 独有的 <code>--penalty-last-n</code> 已移除，两个宿主都会拒绝它。</td></tr>
       <tr><td><code>--stop &lt;string&gt;</code></td><td>停止序列（可重复）。在 <code>config</code> 优先级下与逐请求的 <code>stop</code> 列表合并；在 <code>request</code> 下被其替换。</td></tr>
       <tr><td><code>--sampling-precedence &lt;config|request&gt;</code></td><td>当请求同时携带了你在上面配置过的采样参数时以谁为准：<code>config</code>（默认）保留你的取值，<code>request</code> 让客户端的取值优先。你未配置过的参数始终取请求中的值。环境变量：<code>TENSORSHARP_SAMPLING_PRECEDENCE</code>。</td></tr>
-      <tr><td><code>--continuous-batching</code> / <code>--no-continuous-batching</code></td><td>启用（默认）或禁用迭代级分页批处理。别名：<code>--paged-batching</code>。</td></tr>
-      <tr><td><code>--spec</code> / <code>--no-spec</code></td><td>启用 / 禁用 NextN / MTP 推测解码（默认关闭）—— 对内嵌在主干 checkpoint 里的草稿器，这是显式的开启开关，因为加载它们会把额外权重调入显存。只在模型确实带有 MTP/NextN 草稿头时生效。GLM-5.2 与 GLM-5.3 的草稿头本来就在主干 GGUF 里，没有额外文件要下载，但该参数仍必须在模型加载之前出现在命令行上：正是它让 glm-dsa 把 NextN 层调入显存（GLM-5.2 的 IQ2_XXS 下约 3 GiB），同时也挤掉了一部分上下文空间。在 <code>--tp N&gt;1</code> 下它会被拒绝 —— 那时草稿块只能借用按列切分的主干 LM head —— 因此这两个版本上的投机只在不传 <code>--tp</code> 的默认按层切分下生效。→ <a href="advanced_zh-cn.html#mtp">MTP</a></td></tr>
+      <tr><td><code>--continuous-batching</code> / <code>--no-continuous-batching</code></td><td>启用（默认）或禁用迭代级分页批处理。别名：<code>--paged-batching</code> / <code>--no-paged-batching</code>。</td></tr>
+      <tr><td><code>--no-prefix-cache</code></td><td>关闭运行时前缀复用（Radix 前缀缓存，默认开启）、启动时对共享系统/工具提示词的预处理，以及跨次启动的持久化；它也会设置 <code>TS_SCHED_PREFIX_CACHE=0</code>。开启时，服务端在启动时对共享提示词预填充一次并保存结果，因此进程的第一条消息与其他消息开销相同（在一个智能体配置上实测从 21.8 秒降到 0.7 秒）；代价是提示词、技能或模型变化后的首次启动要等这一步完成才开放端口。检查点位于二进制旁的 <code>prefix-cache/&lt;model&gt;/</code>，每个模型两个文件；<code>TENSORSHARP_PREFIX_CACHE_DIR</code> 可移动其根目录。</td></tr>
+      <tr><td><code>--spec</code> / <code>--no-spec</code></td><td>启用 / 禁用投机解码（默认关闭）—— 对内嵌在主干 checkpoint 里的草稿器，这是显式的开启开关，因为加载它们会把额外权重调入显存；<code>--spec-type ngram</code> 也要靠它开启。默认的 <code>auto</code> 类型下，只在权重自带草稿器时生效 —— 对 Qwen 3.6 而言，这意味着要用保留了 NextN 块的 GGUF（例如 <code>-MTP-</code> 仓库）；基础仓库的 GGUF 已把它剥掉，会静默退回普通解码。Qwen 3.8 27B、GLM-5.2 与 GLM-5.3 的草稿头本来就在主干 GGUF 里，没有额外文件要下载，但该参数仍必须在模型加载之前出现在命令行上：正是它让 glm-dsa 把 NextN 层调入显存（GLM-5.2 的 IQ2_XXS 下约 3 GiB），同时也挤掉了一部分上下文空间。在 <code>--tp N&gt;1</code> 下它会被拒绝 —— 那时草稿块只能借用按列切分的主干 LM head —— 因此这两个 GLM 版本上的投机只在不传 <code>--tp</code> 的默认按层切分下生效。Nemotron-H 拒绝一切投机方式：在 <code>--spec</code> 下它按普通解码服务，并提示一次。→ <a href="advanced_zh-cn.html#mtp">MTP</a></td></tr>
+      <tr><td><code>--spec-type &lt;name&gt;</code></td><td>投机算法：<code>auto</code>（默认）使用权重自带的草稿器；<code>draft-head</code> 与 <code>block</code> 显式钉住其中之一；<code>ngram</code> 不需要训练权重，靠在上下文中做后缀匹配来起草。但它仍需要主干支持投机验证，因此无法在 GPT-OSS、Mistral 3、Qwen 3 / Qwen 2（含 Bonsai 8B）与 Hunyuan Dense 上运行；DeepSeek V4 / V4.1 与 Muse-Glimmer 只能通过各自的块级草稿器验证，因此只有用 <code>--draft-model</code> 加载了该草稿器时它才会运行；而 Nemotron-H 会拒绝所有投机方式。<code>--spec-type</code> 只选择算法 —— 开启 n-gram 要写 <code>--spec --spec-type ngram</code>。若没有 <code>--spec</code> 或 <code>--draft-model</code>（且未设置 <code>TS_SPEC</code>），它与 <code>--spec-draft</code>、<code>--spec-pmin</code> 都不会开启投机，服务端会在启动时打印一条说明此事的 WARNING。环境变量：<code>TS_SPEC_TYPE</code>。</td></tr>
       <tr><td><code>--spec-draft &lt;N&gt;</code></td><td>每个推测步草拟的最大 token 数（默认 <code>8</code>；块级草稿器默认取其训练块大小，并会把取值压到该块大小）。</td></tr>
-      <tr><td><code>--spec-pmin &lt;f&gt;</code></td><td>保留某 token 所需的最低草稿置信度；<code>0</code> 表示完全不设门限。默认值取决于草稿器类型：逐 token 草稿头为 <code>0.15</code>，块级草稿器为 <code>0.35</code>（后者的门限是<em>累积</em>前缀概率，因此同一个数字要严格得多）。</td></tr>
-      <tr><td><code>--draft-model &lt;path&gt;</code></td><td>所有以独立文件发布的草稿器共用的 GGUF 参数 —— DeepSeek V4 的 DSpark 支持模块、Muse-Glimmer 的 DFlash、Gemma 4 的 <code>gemma4-assistant</code> 草稿头。由文件自身的 <code>general.architecture</code> 决定加载方式，写出这个文件本身就会启用投机 —— 不需要再加 <code>--spec</code>（显式的 <code>--no-spec</code> 可将其否决）。Qwen 3.6、GLM-5.2 与 GLM-5.3 的 NextN 都位于主干 GGUF 中，不需要此参数 —— GLM-5.3 在 <code>blk.78</code> 上带的是完整的一块，由 <code>--spec</code> 负责启用；显式草稿无法激活时启动会失败。DSpark 在 <code>cuda</code> 与 <code>ggml_cuda</code> 后端上对单序列请求生效。每一行验证都用该请求自己的采样器，因此可与任意采样设置组合。环境变量：<code>TS_DSV4_DSPARK</code>。→ <a href="advanced_zh-cn.html#dspark">DSpark</a></td></tr>
+      <tr><td><code>--spec-pmin &lt;f&gt;</code></td><td>保留某 token 所需的最低草稿置信度；<code>0</code> 表示完全不设门限。默认值取决于算法：逐 token 草稿头为 <code>0.15</code>，块级草稿器为 <code>0.35</code>（后者的门限是<em>累积</em>前缀概率，因此同一个数字要严格得多），<code>ngram</code> 为 <code>0</code>（在那里它改为缩放所需的匹配长度）。</td></tr>
+      <tr><td><code>--draft-model &lt;path&gt;</code></td><td>所有以独立文件发布的草稿器共用的 GGUF 参数 —— DeepSeek V4 的 DSpark 支持模块、Muse-Glimmer 与 Qwen 3.8 的 DFlash / DFlash2 草稿器、Gemma 4 的 <code>gemma4-assistant</code> 草稿头，以及 Qwen 3.8 Flash Next 的共享 MTP 头（GGML 后端）。由文件自身的 <code>general.architecture</code> 决定加载方式，写出这个文件本身就会启用投机 —— 不需要再加 <code>--spec</code>（显式的 <code>--no-spec</code> 可将其否决）。Qwen 3.6、Qwen 3.8 27B、GLM-5.2 与 GLM-5.3 的 NextN 都位于主干 GGUF 中，不需要此参数 —— GLM-5.3 在 <code>blk.78</code> 上带的是完整的一块，由 <code>--spec</code> 负责启用；显式草稿无法激活时启动会失败（退出码 2）——例如 <code>--tp N</code> &gt; 1 下的 DFlash / DFlash2 草稿器，或 Nemotron-H 上的任何草稿器。DeepSeek V4 的 DSpark 在 <code>cuda</code> 与 <code>ggml_cuda</code> 后端上对单序列请求生效；DeepSeek V4.1 仅在 <code>ggml_cuda</code> / <code>ggml_cpu</code> 上接受 <code>deepseek41-dspark</code> 草稿器，这条路径属于实验性质，只在合成测试夹具上验证过，尚无训练好的草稿器实测数据。每一行验证都用该请求自己的采样器，因此可与任意采样设置组合。环境变量：<code>TS_DSV4_DSPARK</code>。→ <a href="advanced_zh-cn.html#dspark">DSpark</a></td></tr>
       <tr><td><code>--prefill-chunk-size &lt;N&gt;</code></td><td>每个调度步的最大 prefill token 数（设置 <code>TS_SCHED_PREFILL_CHUNK</code>）。</td></tr>
-      <tr><td><code>--kv-cache-dtype &lt;type&gt;</code></td><td>KV 缓存精度：<code>f32</code>、<code>f16</code>、<code>q8_0</code> 或 <code>q4_0</code>（默认自动，由后端 / 模型选择；环境变量 <code>KV_CACHE_DTYPE</code>）。</td></tr>
-      <tr><td><code>--paged-kv</code> / <code>--no-paged-kv</code></td><td>独立 <code>PagedKvCacheManager</code> 的旧兼容开关，不在当前服务请求路径上；活跃请求 KV 由引擎管理。</td></tr>
-      <tr><td><code>--paged-kv-block-size / --paged-kv-ram-mb / --paged-kv-ssd-dir / --paged-kv-ssd-mb</code></td><td>旧的独立 paged-KV 调参。当前服务请求请使用下方 <code>TS_SCHED_*</code> 引擎设置。</td></tr>
-      <tr><td><code>--paged-kv-quant-bits &lt;b&gt;</code></td><td>旧的独立 TurboQuant 设置；服务端参数接受 <code>0</code>、<code>4</code> 或 <code>8</code>（运行时环境变量与 CLI 还接受 <code>2</code>）。</td></tr>
+      <tr><td><code>--kv-cache-dtype &lt;type&gt;</code></td><td>KV 缓存精度：<code>f32</code>、<code>f16</code>、<code>q8_0</code> 或 <code>q4_0</code>（默认自动，由后端 / 模型选择；环境变量 <code>KV_CACHE_DTYPE</code>；<code>q4_0</code> 面向 128K–256K 的超长上下文）。</td></tr>
+      <tr><td><code>--n-cpu-moe &lt;N|all&gt;</code> / <code>-ncmoe</code> · <code>--cpu-moe</code> / <code>-cmoe</code> · <code>--cpu-moe-threads &lt;N&gt;</code></td><td>MoE CPU 卸载，与 <a href="cli_zh-cn.html#options">CLI</a> 相同：把前 N 层（或全部层）的路由专家留在系统内存中并在 CPU 上做乘法。所有架构默认 <code>0</code>。主机线程数默认：可用 CPU 不超过 2 个时为 <code>1</code>，不超过 8 个时为减一，更多时取一半且上限 <code>64</code>；DeepSeek V4 / V4.1 与 GLM-5.x 的原生执行器在卸载专家后使用全部可用 CPU（GLM-5.x 在无 GPU 的运行中也是如此）。环境变量：<code>TS_N_CPU_MOE</code>、<code>TS_CPU_MOE</code>、<code>TS_CPU_MOE_THREADS</code>。</td></tr>
+      <tr><td><code>--paged-kv</code> / <code>--no-paged-kv</code></td><td>独立 <code>PagedKvCacheManager</code> 的旧兼容开关。会被接受（这一组参数的取值仍会校验），但在服务端不起作用：请求路径上没有任何地方构建该管理器，活跃请求 KV 由引擎管理。<code>--help</code> 把这一组标为“accepted, NO EFFECT on the server”，启动时会打印一条 WARNING，列出收到的每一个此类参数。原先的别名 <code>--paged-kv-cache</code> / <code>--no-paged-kv-cache</code> 已移除，启动时会被拒绝。</td></tr>
+      <tr><td><code>--paged-kv-block-size / --paged-kv-ram-mb / --paged-kv-ssd-dir / --paged-kv-ssd-mb</code></td><td>旧的独立 paged-KV 调参，同样被接受但在服务端不生效（该存储只由 CLI 的 <code>--paged-bench</code> 使用）。当前服务请求请使用下方 <code>TS_SCHED_*</code> 引擎设置。</td></tr>
+      <tr><td><code>--paged-kv-quant-bits &lt;b&gt;</code></td><td>旧的独立 TurboQuant 设置：<code>0</code>、<code>2</code>、<code>4</code> 或 <code>8</code>。会被接受，但在服务端不生效。</td></tr>
+      <tr><td><code>--paged-kv-redis-url &lt;url&gt;</code> / <code>--paged-kv-redis-ttl &lt;min&gt;</code></td><td>为独立存储的 Redis 层设置 <code>TS_KV_CACHE_REDIS_URL</code> / <code>TS_KV_CACHE_REDIS_TTL_MINUTES</code>（TTL 默认 <code>1440</code>，<code>0</code> = 不过期）。会被接受（并触发上面那条启动警告），但服务端不会把任何 KV 块写入 Redis。</td></tr>
+      <tr><td><code>--redis-url &lt;url&gt;</code></td><td>用 Redis（<code>TS_RESPONSES_STORE_REDIS_URL</code>）而非进程内存承载 OpenAI Responses API 存储。它也会设置 <code>TS_KV_CACHE_REDIS_URL</code>，服务端从不读取后者。环境中已设置的这两个变量保持不变。<code>--help</code> 把它列在“Responses API store”一节，启动日志会打印 <code>Redis configured via --redis-url: the Responses API store uses &lt;url&gt;.</code></td></tr>
       <tr><td><code>--qwen-image-vae / --qwen-image-vl / --qwen-image-mmproj &lt;path&gt;</code></td><td>覆盖解析到的 Qwen-Image-2.1 伴随文件（专用 2.1 VAE / Qwen3-VL-8B 文本编码器 / Qwen3-VL-8B mmproj）。</td></tr>
-      <tr><td><code>--qwen-image-lora</code> · <code>--offload-cpu</code></td><td><strong>已移除，启动时（包括作为 <code>--config</code> 键时）会直接拒绝。</strong>没有替代参数：两者只服务于早期的 Qwen-Image-Edit 流水线，而 Qwen-Image-2.1 不加载 LoRA 适配器，DiT 权重始终常驻。</td></tr>
-      <tr><td><code>--video-width &lt;px&gt;</code> / <code>--video-height &lt;px&gt;</code></td><td>请求未带 <code>width</code>/<code>height</code> 时的默认输出尺寸。<strong>视频最主要的画质杠杆</strong>，因为网页界面自己不发送尺寸；MiniMax-H3 的推荐起点是 640×384，只给出宽高之一时 H3 会按条件图像的宽高比推出另一个。别名：<code>--width</code> / <code>--height</code>。</td></tr>
+      <tr><td><code>--lora &lt;path&gt;</code> / <code>--lora-scale &lt;f&gt;</code> / <code>--lora-config &lt;path&gt;</code></td><td>Qwen-Image-2.1 LoRA 插件，拼写与绑定规则都与 CLI 相同（重复 <code>--lora</code> 可叠加；强度与配置绑定到前一个 <code>--lora</code>）。启动时检查，并应用到每个图像请求；尚未实现按请求选择 LoRA。请求中的 <code>steps</code> / <code>cfg</code> 仍会覆盖插件的采样配方。→ <a href="models-image_zh-cn.html#lora">LoRA 插件</a></td></tr>
+      <tr><td><code>--width &lt;px&gt;</code> / <code>--height &lt;px&gt;</code></td><td>图像请求既未给出尺寸也未给出面积时（所有 Web UI 请求都是如此）Qwen-Image-2.1 的默认输出尺寸（设置 <code>TS_QWEN_IMAGE_WIDTH</code> / <code>TS_QWEN_IMAGE_HEIGHT</code>）；请求自带尺寸或目标面积时保留它自己的几何设置。默认尺寸需要两个值：不在 32 像素网格上的值会向下取整到 32 的倍数（最小 32），并警告一次；只设一边（或值无法解析、为负数）时默认尺寸会被忽略并警告一次，继续使用自动尺寸（2048×2048 面积）。Qwen-Image 服务端在这两种情况下都会在启动时警告，但不会拒绝启动。这两个参数同时也是 <code>--video-width</code> / <code>--video-height</code> 的别名。</td></tr>
+      <tr><td><code>--qwen-image-lora</code> · <code>--offload-cpu</code></td><td><strong>已移除，启动时（包括作为 <code>--config</code> 键时）会直接拒绝。</strong>两者只服务于早期的 Qwen-Image-Edit 流水线。<code>--qwen-image-lora</code> 由 <code>--lora</code> 取代；<code>--offload-cpu</code> 没有替代参数，因为 Qwen-Image-2.1 的 DiT 权重始终常驻。</td></tr>
+      <tr><td><code>--penalty-last-n</code> · <code>--paged-kv-cache</code> · <code>--no-paged-kv-cache</code></td><td><strong>已移除，启动时（包括作为 <code>--config</code> 键时）会直接拒绝</strong>（退出码 1，<code>--help</code> 在“Removed options”下列出）。<code>--penalty-last-n</code> 是 CLI 独有的重复惩罚窗口名：请改用 <code>--repeat-last-n &lt;N&gt;</code>。另外两个是 <code>--paged-kv</code> / <code>--no-paged-kv</code> 的第二种拼写。</td></tr>
+      <tr><td><code>--video-width &lt;px&gt;</code> / <code>--video-height &lt;px&gt;</code></td><td>请求未带 <code>width</code>/<code>height</code> 时的默认输出尺寸。<strong>视频最主要的画质杠杆</strong>，因为网页界面自己不发送尺寸；MiniMax-H3 的推荐起点是 640×384，只给出宽高之一时 H3 会按条件图像的宽高比推出另一个。别名：<code>--width</code> / <code>--height</code>（它们同时设置 Qwen-Image-2.1 的默认尺寸）。</td></tr>
       <tr><td><code>--video-steps &lt;N&gt;</code></td><td>请求未带 <code>steps</code> 时的默认去噪步数。MiniMax-H3 默认 20 步；4–8 步是快速工作点，16–24 步明显更干净，超过约 30 步收益很小。</td></tr>
       <tr><td><code>--video-mode &lt;mode&gt;</code></td><td>请求未带 <code>videoMode</code> 时的默认条件模式：<code>t2v</code>、<code>i2v</code>、<code>fl2v</code> 或 <code>ref</code>。不传它，每个请求会按自身携带的内容推断模式，通常这才是你想要的。</td></tr>
       <tr><td><code>--video-frames &lt;N&gt;</code></td><td>请求未带 <code>frames</code> 时的默认输出帧数，会对齐到模型自身的时间网格（Wan 为 <code>4k+1</code>，MiniMax-H3 为 <code>17k+5</code>）。模型默认 33，Wan2.2-TI2V 为 49，MiniMax-H3 为 22。请求值会覆盖它 —— 这是默认值，不是上限。</td></tr>
@@ -181,6 +199,15 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --config config/s
       <tr><td><code>--video-vae &lt;path&gt;</code></td><td>视频 VAE —— <code>wan_2.1_vae.safetensors</code>，TI2V-5B 用 <code>Wan2.2_VAE.safetensors</code>，MiniMax-H3 用 <code>minimax_h3_video_vae_fp16.safetensors</code>。默认在 DiT 同目录扫描，包含 <code>VAE/</code> 子目录。环境变量：<code>TS_VIDEO_VAE</code>；旧写法 <code>--wan-vae</code> 仍被接受。</td></tr>
       <tr><td><code>--video-text-encoder &lt;path&gt;</code></td><td>文本编码器 GGUF —— Wan 用 UMT5-XXL，MiniMax-H3 用 Qwen3-VL-32B。默认在同目录扫描（环境变量 <code>TS_VIDEO_TEXT_ENCODER</code>；也可写作 <code>--video-te</code>，旧写法为 <code>--wan-te</code>）。当 Wan 2.2 A14B 的两个专家不在一起时，用 <code>--video-dit2</code> / <code>TS_VIDEO_DIT2</code> 指定第二个 high/low noise 专家。</td></tr>
       <tr><td><code>--audio-vae &lt;path&gt;</code></td><td>与视频联合生成音轨的模型所用的音频 VAE（<code>minimax_h3_audio_vae_fp32.safetensors</code>）。不传它这类模型照样能跑并产出视频，只是没有声音。环境变量：<code>TS_VIDEO_AUDIO_VAE</code>。</td></tr>
+      <tr><td><code>--upload-max-mb &lt;N&gt;</code></td><td>客户端写入的单文件上限（MB）：multipart <code>/api/upload</code> 文件，以及从聊天请求中解码出的 base64 附件（默认 <code>500</code>；环境变量 <code>TS_UPLOAD_MAX_MB</code>）。<code>POST /api/upload</code> 的请求体上限跟随该值且不低于 500 MB，因此调大上限就能在那里上传更大的文件，之后按路径引用。其他路由保持 500 MB 的请求体上限；base64 编码会让文件增大约三分之一，所以 JSON 请求中的附件无论上限多大，最多约 375 MB。</td></tr>
+      <tr><td><code>--upload-quota-mb &lt;N&gt;</code></td><td>上传目录的总预算（MB），生成的图像与视频也计入；会超出预算的请求在任何模型计算之前就被拒绝。默认关闭；环境变量 <code>TS_UPLOAD_QUOTA_MB</code>。</td></tr>
+      <tr><td><code>--upload-ttl-hours &lt;N&gt;</code></td><td>删除上传目录中早于这么多小时的文件（允许小数）。默认关闭，因为聊天会话按路径引用附件；服务可被不可信客户端访问时请开启。环境变量：<code>TS_UPLOAD_TTL_HOURS</code>。目录默认为二进制旁的 <code>uploads/</code>，可用 <code>TENSORSHARP_UPLOAD_DIR</code> 移动。</td></tr>
+      <tr><td><code>--skills-dir</code> · <code>--skill</code> · <code>--list-skills</code> · <code>--no-skills</code> · <code>--skills-no-discovery</code> · <code>--skills-allow-exec</code> · <code>--skills-sandbox</code> · <code>--skills-allow-network</code> · <code>--skills-max-rounds</code></td><td>Agent Skills，拼写、默认值与环境变量都与 <a href="cli_zh-cn.html#skills">CLI</a> 相同（默认根目录：从工作目录向上直到 Git 根目录的每个 <code>.agents/skills</code>，再加上二进制旁的 <code>skills/</code>）。在服务端，二进制旁的 <code>skills/</code>（<code>POST /api/skills</code> 安装上传技能的位置）总是最先扫描，即使指定了根目录也是如此，因此同名时它胜出；显式根目录与 <code>TS_SKILLS_DIR</code> 只替换 <code>.agents/skills</code> 默认值。同样在服务端，<code>--skill</code> 为每个请求选中技能，除非请求自己指定了技能；上传的技能落在二进制旁的 <code>skills/</code>；<code>--no-skills</code> 时不映射 <code>/v1/skills</code> 与 <code>/api/skills</code>，指定了技能的请求会得到 HTTP 400。</td></tr>
+      <tr><td><code>--code-exec</code> 及其 <code>--code-exec-*</code> 选项</td><td>内置代码工具及其安装、网络、超时、输出、shell、温度与隔离设置，拼写与默认值都与 <a href="cli_zh-cn.html#code-exec">CLI</a> 相同。<code>--code-exec-languages</code> 已移除，启动时会被拒绝。</td></tr>
+      <tr><td><code>--no-multi-agent</code></td><td>关闭子智能体委派；它对支持工具的家族默认开启（见<a href="#agentic">上文</a>）。环境变量：把 <code>TS_NO_MULTI_AGENT</code> 设为 <code>0</code> 以外的任意值。</td></tr>
+      <tr><td><code>--agents-max-concurrent</code> · <code>--agents-max-count</code> · <code>--agents-max-depth</code></td><td>请求树中同时活跃的后代数，不含根（默认 <code>3</code>，范围 1–32）· 每棵请求树创建的子智能体数（<code>8</code>，1–128）· 根以下的委派深度（<code>2</code>，1–8）。</td></tr>
+      <tr><td><code>--agents-max-rounds</code> · <code>--agents-max-generations</code> · <code>--agents-timeout</code> · <code>--agents-max-result-chars</code></td><td>每个子智能体每轮的工具回合数（默认 <code>8</code>，范围 1–64）· 整个请求共享的子智能体生成次数（<code>48</code>，1–1024）· 每次子智能体运行的秒数（<code>180</code>，1–3600）· 每份子智能体报告的字符数（<code>8000</code>，256–64000）。</td></tr>
+      <tr><td><code>--agents-allow-worker-tools</code></td><td>允许 <code>worker</code> 子智能体使用父智能体已启用的可写工具。默认关闭；<code>explorer</code> 与 <code>reviewer</code> 子智能体始终只读。</td></tr>
     </tbody>
   </table>
   </div>
@@ -198,14 +225,16 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --config config/s
       <tr><td><code>VIDEO_SAMPLE_FPS</code> / <code>VIDEO_MAX_FRAMES</code></td><td>每秒视频采样的帧数 / 可选的抽帧上限。</td></tr>
       <tr><td><code>TS_FUSED_QKNORM_ROPE</code></td><td>Direct <code>cuda</code> 后端上 Qwen 3.5/3.6 文本 prefill 的融合 QK-Norm + RoPE CUDA 内核（默认开启；<code>0</code> 关闭）。</td></tr>
       <tr><td><code>TENSORSHARP_TEMPERATURE</code>、<code>…_TOP_K</code>、<code>…_TOP_P</code>、<code>…_MIN_P</code></td><td>当参数与请求体都未设置时的默认采样值。</td></tr>
-      <tr><td><code>TENSORSHARP_REPEAT_PENALTY</code>、<code>…_PRESENCE_PENALTY</code>、<code>…_FREQUENCY_PENALTY</code>、<code>…_SEED</code></td><td>默认惩罚与随机种子。</td></tr>
-      <tr><td><code>TENSORSHARP_LOG_LEVEL</code> / <code>…_LOG_DIR</code> / <code>…_LOG_FILE</code></td><td>日志级别、目录与文件开关（CLI 同样遵循）。</td></tr>
+      <tr><td><code>TENSORSHARP_REPEAT_PENALTY</code>、<code>…_REPEAT_LAST_N</code>、<code>…_PRESENCE_PENALTY</code>、<code>…_FREQUENCY_PENALTY</code>、<code>…_SEED</code></td><td>默认惩罚、惩罚窗口与随机种子。</td></tr>
+      <tr><td><code>TENSORSHARP_LOG_LEVEL</code> / <code>…_LOG_DIR</code> / <code>…_LOG_FILE</code></td><td>日志级别、目录与文件开关 —— 这是配置服务端日志的唯一方式，服务端没有 <code>--log-*</code> 参数（CLI 也会遵循它们，作为自身参数的默认值）。</td></tr>
+      <tr><td><code>TENSORSHARP_PREFIX_CACHE_DIR</code></td><td>服务端持久化前缀检查点的根目录（默认为二进制旁的 <code>prefix-cache/</code>）；每个模型各有一个子目录。见 <code>--no-prefix-cache</code>。</td></tr>
+      <tr><td><code>TENSORSHARP_UPLOAD_DIR</code></td><td>上传目录（默认为二进制旁的 <code>uploads/</code>），通过 <code>/uploads/</code> 对外提供。</td></tr>
       <tr><td><code>DIFFUSION_STEPS</code> / <code>DIFFUSION_MAX_BATCH</code></td><td>DiffusionGemma 每块去噪步数 / 批处理的最大并发扩散请求数。</td></tr>
       <tr><td><code>TENSORSHARP_TP_DEGREE</code></td><td>把托管模型切分到本机多少张 GPU 上（默认：<code>1</code>）；服务端也支持 <code>--tp N</code> 参数。需要 <code>--backend cuda</code>、<code>ggml_cuda</code> 或 <code>ggml_vulkan</code>。→ <a href="distributed_zh-cn.html">多 GPU 与多节点</a></td></tr>
       <tr><td><code>TENSORSHARP_TP_DEVICES</code></td><td>各 TP rank 使用的 GPU 序号，例如 <code>0,2</code>（默认 <code>0..tp-1</code>）。用于 GGML 后端。</td></tr>
-      <tr><td><code>TENSORSHARP_TP_NODE_ID</code> / <code>TENSORSHARP_TP_PEERS</code></td><td>把张量并行扩展到多台机器：本节点的 0 起始编号，以及所有节点共用的逗号分隔 <code>host:port</code> 列表。两者必须同时设置。</td></tr>
-      <tr><td><code>TS_KV_CACHE_REDIS_URL</code> / <code>TS_KV_CACHE_REDIS_TTL_MINUTES</code></td><td>把分页 KV 块持久化到 Redis，实现跨会话（乃至跨进程）复用，以及条目 TTL（分钟，默认 <code>1440</code>；<code>0</code> = 不过期）。CLI：<code>--redis-url</code> / <code>--paged-kv-redis-url</code> / <code>--paged-kv-redis-ttl</code>。</td></tr>
-      <tr><td><code>TS_RESPONSES_STORE_REDIS_URL</code></td><td>用 Redis 而非进程内存承载 OpenAI Responses API 存储。CLI：<code>--redis-url</code>。</td></tr>
+      <tr><td><code>TENSORSHARP_TP_NODE_ID</code> / <code>TENSORSHARP_TP_PEERS</code></td><td>把张量并行扩展到多台机器：本节点的 0 起始编号，以及所有节点共用的逗号分隔 <code>host:port</code> 列表（也可用 <code>--tp-node-id</code> / <code>--tp-peers</code>）。两者必须同时设置。服务端只能是节点 <code>0</code>（对外提供 HTTP 的 driver）；其余节点运行 <code>TensorSharp.Cli</code> worker。</td></tr>
+      <tr><td><code>TS_KV_CACHE_REDIS_URL</code> / <code>TS_KV_CACHE_REDIS_TTL_MINUTES</code></td><td>独立分页 KV 存储的 Redis 层与条目 TTL（分钟，默认 <code>1440</code>；<code>0</code> = 不过期）。在服务端会被接受但不生效：请求路径上没有任何地方构建该存储，因此不会有 KV 块写入 Redis。服务端参数：<code>--paged-kv-redis-url</code> / <code>--paged-kv-redis-ttl</code>，以及 <code>--redis-url</code>。</td></tr>
+      <tr><td><code>TS_RESPONSES_STORE_REDIS_URL</code></td><td>用 Redis 而非进程内存承载 OpenAI Responses API 存储。服务端参数：<code>--redis-url</code>。</td></tr>
     </tbody>
   </table>
   </div>
@@ -224,7 +253,8 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --config config/s
       <tr><td><code>TS_SCHED_SOLO_PREFILL_CHUNK</code></td><td>系统中最多一个序列时的 prefill 分块大小，会限制所有独占 prefill 分块（默认 <code>8192</code>）。</td></tr>
       <tr><td><code>TS_SCHED_DECODE_QUANTUM</code></td><td>切换序列前的 decode token 数（默认 <code>256</code> = 块大小）。</td></tr>
       <tr><td><code>TS_SCHED_NUM_BLOCKS</code> / <code>TS_SCHED_BLOCK_SIZE</code></td><td>引擎池中的物理块数（默认 <code>256</code>） / 每块 token 数（默认 <code>256</code>）。</td></tr>
-      <tr><td><code>TS_SCHED_PREFIX_CACHE</code></td><td><code>0</code> 禁用跨请求的块哈希前缀共享。</td></tr>
+      <tr><td><code>TS_SCHED_PREFIX_CACHE</code></td><td><code>0</code> 禁用所有跨请求的运行时前缀复用，两种缓存模式都适用（= <code>--no-prefix-cache</code> 所设置的值）。</td></tr>
+      <tr><td><code>TS_PREFIX_CACHE_MODE</code></td><td><code>tree</code>（默认）为 Radix 前缀缓存；<code>legacy</code> 选择旧的块哈希前缀共享。其他取值会被拒绝。</td></tr>
       <tr><td><code>TS_BATCHED_FUSED_DECODE</code></td><td>原生槽位路径（DeepSeek V4、GLM 5.x）默认启用批处理融合解码：一张图、每个序列一个 token，整批只读一次权重——GLM-5.2 在 4 路并发下总解码吞吐 1.81 倍。设为 <code>0</code> 可切回串行融合 decode；<code>TS_GLM_BATCHED_DECODE=0</code> 也会让 GLM 原生侧拒绝批处理。批处理会改变 GEMM 形状，而 2-bit MoE 可能把这点差异放大成不同的专家选择。</td></tr>
       <tr><td><code>TS_&lt;FAMILY&gt;_BATCHED=0</code></td><td>逐模型的逃生口（如 <code>TS_GEMMA4_BATCHED=0</code>），回退到逐序列 KV 交换。</td></tr>
     </tbody>

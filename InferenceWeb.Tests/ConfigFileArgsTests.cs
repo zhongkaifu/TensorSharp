@@ -12,6 +12,7 @@ using System;
 using System.IO;
 using System.Linq;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using TensorSharp.Runtime;
 using TensorSharp.Server.Hosting;
 
@@ -137,7 +138,7 @@ public class ConfigFileArgsTests : IDisposable
         "repeat-penalty", "repeat-last-n", "presence-penalty", "frequency-penalty",
         "continuous-batching", "no-continuous-batching", "paged-batching", "no-paged-batching",
         "prefill-chunk-size", "kv-cache-dtype", "gpu-device", "tp", "tp-node-id", "tp-peers",
-        "paged-kv", "paged-kv-cache", "no-paged-kv", "no-paged-kv-cache", "paged-kv-block-size",
+        "paged-kv", "no-paged-kv", "paged-kv-block-size",
         "paged-kv-ram-mb", "paged-kv-ssd-dir", "paged-kv-ssd-mb", "paged-kv-quant-bits",
         "paged-kv-redis-url", "paged-kv-redis-ttl", "redis-url",
         "cpu-moe", "n-cpu-moe", "cpu-moe-threads",
@@ -146,6 +147,9 @@ public class ConfigFileArgsTests : IDisposable
         "video-vae", "video-text-encoder", "video-te", "video-dit2", "audio-vae",
         "video-width", "video-height", "video-steps", "video-mode", "video-frames", "fps",
         "wan-vae", "wan-te", "wan-dit2", "width", "height",
+        // Qwen-Image-2.1 LoRA plug-ins (LoraCliFlags.Flags): applied by the companion
+        // pass and let through the unknown-option trap, spelled the same by the CLI.
+        "lora", "lora-scale", "lora-config",
         "upload-max-mb", "upload-quota-mb", "upload-ttl-hours",
         "skills-dir", "skill", "list-skills", "no-skills", "skills-no-discovery",
         "skills-allow-exec", "skills-max-rounds", "skills-sandbox", "skills-allow-network",
@@ -158,6 +162,9 @@ public class ConfigFileArgsTests : IDisposable
         "code-exec", "code-exec-allow-install", "code-exec-allow-network", "code-exec-unconfined",
         "code-exec-timeout", "code-exec-temperature", "code-exec-install-domains",
         "code-exec-install-index", "code-exec-shell", "code-exec-packages", "code-exec-max-output",
+        // Sub-agents: ServerOptionsBuilder reads it for MultiAgentOptions and lets it
+        // past the unknown-option trap. The CLI has no sub-agents and drops it.
+        "agents-allow-worker-tools",
     };
 
     [Fact]
@@ -218,6 +225,128 @@ public class ConfigFileArgsTests : IDisposable
                     $"{where} names no urls, so it cannot download on a machine that lacks the file.");
             }
         }
+    }
+
+    // The test above only sees entries that are already objects. A model file given as
+    // a bare string path escapes it, and that is how fourteen configs shipped with no
+    // source at all: fine on the machine that wrote them, "not found" everywhere else.
+    // These are the options whose value is a model file to load.
+    private static readonly HashSet<string> ModelFileConfigKeys = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "model", "mmproj", "draft-model",
+        "qwen-image-vae", "qwen-image-vl", "qwen-image-mmproj",
+        "video-vae", "video-text-encoder", "video-te", "video-dit2", "audio-vae",
+        "wan-vae", "wan-te", "wan-dit2",
+    };
+
+    [Fact]
+    public void ShippedConfigs_ModelFiles_AreDownloadEntries()
+    {
+        string repoRoot = FindRepoRoot();
+        if (repoRoot is null) return;
+        string configDir = Path.Combine(repoRoot, "config");
+        if (!Directory.Exists(configDir)) return;
+
+        foreach (string path in Directory.GetFiles(configDir, "*.json"))
+        {
+            using JsonDocument doc = ParseConfig(path);
+            foreach (JsonProperty option in doc.RootElement.EnumerateObject())
+            {
+                if (!ModelFileConfigKeys.Contains(option.Name.TrimStart('-'))) continue;
+                Assert.True(
+                    option.Value.ValueKind == JsonValueKind.Object,
+                    $"config/{Path.GetFileName(path)} option {Quote(option.Name)} is a bare path, so it cannot "
+                    + "download on a machine that lacks the file -- write it as { \"path\", \"urls\", \"sha256\" }.");
+            }
+        }
+    }
+
+    // Every download entry is pinned twice over: its URLs name a full commit, so what
+    // they serve cannot move under the config, and its sha256 proves the bytes that
+    // arrive. A "resolve/main" URL is a moving target -- the next upload silently
+    // changes what the config downloads, and a re-quantized file is a different model
+    // -- and an unhashed entry trusts whatever the first working URL returns. Pin new
+    // entries at the upstream head (a bare LFS-skipping clone gives each file's
+    // sha256 without the rate-limited API).
+    private static readonly Regex PinnedHuggingFaceUrl =
+        new(@"^https://huggingface\.co/[^/]+/[^/]+/resolve/[0-9a-f]{40}/", RegexOptions.Compiled);
+
+    private static readonly Regex Sha256Hex = new("^[0-9a-f]{64}$", RegexOptions.Compiled);
+
+    // ConfigFileArgs' ${name} / ${name:-default} syntax. A default always stands in for
+    // a name the file does not define, so the check never depends on this machine's
+    // environment.
+    private static readonly Regex VariableReference =
+        new(@"\$\{([A-Za-z0-9_.\-]+)(?::-((?:[^{}]|\$\{[^{}]*\})*))?\}", RegexOptions.Compiled);
+
+    [Fact]
+    public void ShippedConfigs_Downloads_ArePinnedToACommitAndHashed()
+    {
+        string repoRoot = FindRepoRoot();
+        if (repoRoot is null) return;
+        string configDir = Path.Combine(repoRoot, "config");
+        if (!Directory.Exists(configDir)) return;
+
+        foreach (string path in Directory.GetFiles(configDir, "*.json"))
+        {
+            using JsonDocument doc = ParseConfig(path);
+            var variables = new Dictionary<string, string>(StringComparer.Ordinal);
+            foreach (JsonProperty option in doc.RootElement.EnumerateObject())
+            {
+                if ((option.Name.Equals("variables", StringComparison.OrdinalIgnoreCase)
+                     || option.Name.Equals("vars", StringComparison.OrdinalIgnoreCase))
+                    && option.Value.ValueKind == JsonValueKind.Object)
+                {
+                    foreach (JsonProperty variable in option.Value.EnumerateObject())
+                        variables[variable.Name] = variable.Value.ToString();
+                }
+            }
+
+            foreach (JsonProperty option in doc.RootElement.EnumerateObject())
+            {
+                if (option.Value.ValueKind != JsonValueKind.Object || IsReserved(option.Name)) continue;
+
+                string where = $"config/{Path.GetFileName(path)} option {Quote(option.Name)}";
+                Assert.True(
+                    option.Value.TryGetProperty("sha256", out JsonElement sha)
+                    && sha.ValueKind == JsonValueKind.String
+                    && Sha256Hex.IsMatch(sha.GetString()),
+                    $"{where} has no lowercase-hex \"sha256\", so a download is trusted unchecked.");
+
+                foreach (string url in DownloadUrls(option.Value))
+                {
+                    string resolved = ResolveVariables(url, variables);
+                    Assert.True(
+                        PinnedHuggingFaceUrl.IsMatch(resolved),
+                        $"{where} downloads {resolved}, which is not pinned to a full commit "
+                        + "(https://huggingface.co/<owner>/<repo>/resolve/<40-hex commit>/<file>).");
+                }
+            }
+        }
+    }
+
+    private static IEnumerable<string> DownloadUrls(JsonElement entry)
+    {
+        if (entry.TryGetProperty("urls", out JsonElement urls) && urls.ValueKind == JsonValueKind.Array)
+        {
+            foreach (JsonElement url in urls.EnumerateArray())
+                yield return url.GetString();
+        }
+        if (entry.TryGetProperty("url", out JsonElement single) && single.ValueKind == JsonValueKind.String)
+            yield return single.GetString();
+    }
+
+    private static string ResolveVariables(string value, IReadOnlyDictionary<string, string> variables)
+    {
+        // Variables may reference variables; a few passes reach the fixed point.
+        for (int pass = 0; pass < 8 && value.Contains("${", StringComparison.Ordinal); pass++)
+        {
+            value = VariableReference.Replace(value, match =>
+                variables.TryGetValue(match.Groups[1].Value, out string defined) ? defined
+                : match.Groups[2].Success ? match.Groups[2].Value
+                : match.Value);
+        }
+        return value;
     }
 
     private static string Quote(string value) => "\"" + value + "\"";
@@ -329,12 +458,151 @@ public class ConfigFileArgsTests : IDisposable
         { "model": "from-config.gguf", "backend": "ggml_cpu" }
         """);
 
-        var result = ConfigFileArgs.Expand(new[] { "--config", cfg, "--backend", "ggml_cuda" });
+        var result = ConfigFileArgs.Expand(new[] { "--config", cfg, "--max-tokens", "512" });
 
         // File tokens first, then the pass-through command-line tokens.
         Assert.Equal(
-            new[] { "--model", "from-config.gguf", "--backend", "ggml_cpu", "--backend", "ggml_cuda" },
+            new[] { "--model", "from-config.gguf", "--backend", "ggml_cpu", "--max-tokens", "512" },
             result);
+    }
+
+    // ----- The command line overrides a config entry -----
+    // A single-valued option the command line sets itself is dropped from the file
+    // before it is resolved: the command-line value wins anyway, and resolving a
+    // download spec would fetch a file nothing loads. `--mmproj none` beside a
+    // DiffusionGemma config used to pull the 2.8 GB vision shard first.
+
+    [Fact]
+    public void Expand_CommandLineOverride_DropsTheConfigEntry_AndSaysSoOnce()
+    {
+        string a = WriteConfig("""{ "backend": "ggml_cpu", "max-tokens": 10 }""", "a.json");
+        string b = WriteConfig("""{ "backend": "ggml_vulkan" }""", "b.json");
+
+        var sink = new StringWriter();
+        var result = ConfigFileArgs.Expand(
+            new[] { "--config", a, "--config", b, "--backend", "ggml_cuda" }, sink, interactiveProgress: false);
+
+        Assert.Equal(new[] { "--max-tokens", "10", "--backend", "ggml_cuda" }, result);
+        string[] notices = sink.ToString()
+            .Split('\n', StringSplitOptions.RemoveEmptyEntries)
+            .Where(line => line.StartsWith("[config] --backend", StringComparison.Ordinal))
+            .ToArray();
+        string notice = Assert.Single(notices);
+        Assert.Contains("a.json", notice, StringComparison.Ordinal);
+        Assert.Contains("command-line value is used instead", notice, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("--mmproj", "none")]
+    [InlineData("--mmproj=none")]
+    [InlineData("--MMPROJ", "none")]
+    public void Expand_CommandLineOverride_SkipsTheConfigDownload(params string[] overrideArgs)
+    {
+        using var server = new TinyHttpServer();
+        server.AddFile("/vision.safetensors", new byte[] { 1, 2, 3 });
+        string vision = Path.Combine(_dir, "vision.safetensors");
+        string cfg = WriteConfig($$"""
+        {
+          "model": "text.gguf",
+          "mmproj": { "path": {{JsonQuote(vision)}}, "urls": [ {{JsonQuote(server.UrlFor("/vision.safetensors"))}} ] }
+        }
+        """);
+
+        var sink = new StringWriter();
+        var result = ConfigFileArgs.Expand(
+            new[] { "--config", cfg }.Concat(overrideArgs).ToArray(), sink, interactiveProgress: false);
+
+        Assert.Equal(new[] { "--model", "text.gguf" }.Concat(overrideArgs).ToArray(), result);
+        Assert.Equal(0, server.RequestCount("/vision.safetensors"));
+        Assert.False(File.Exists(vision));
+        string log = sink.ToString();
+        // Named as the command line spelled it (--MMPROJ stays --MMPROJ).
+        Assert.Contains("[config] --mmproj is set on the command line", log, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("nothing is fetched", log, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Expand_CommandLineOverride_UnderALegacySpelling_SkipsTheConfigDownload()
+    {
+        // Both hosts read --wan-vae as --video-vae, so it overrides the entry just the same.
+        using var server = new TinyHttpServer();
+        server.AddFile("/vae.safetensors", new byte[] { 1, 2, 3 });
+        string vae = Path.Combine(_dir, "vae.safetensors");
+        string cfg = WriteConfig($$"""
+        { "video-vae": { "path": {{JsonQuote(vae)}}, "urls": [ {{JsonQuote(server.UrlFor("/vae.safetensors"))}} ] } }
+        """);
+
+        var result = ConfigFileArgs.Expand(
+            new[] { "--config", cfg, "--wan-vae", "mine.safetensors" }, TextWriter.Null, interactiveProgress: false);
+
+        Assert.Equal(new[] { "--wan-vae", "mine.safetensors" }, result);
+        Assert.Equal(0, server.RequestCount("/vae.safetensors"));
+        Assert.False(File.Exists(vae));
+    }
+
+    [Fact]
+    public void Expand_OverriddenEntry_IsNeverResolved()
+    {
+        // Not even its variables: the entry is gone before anything reads it.
+        string cfg = WriteConfig("""
+        { "model": "${TS_CFG_NO_SUCH_VAR_67890}/a.gguf", "backend": "ggml_cpu" }
+        """);
+
+        var result = ConfigFileArgs.Expand(
+            new[] { "--config", cfg, "--model", "mine.gguf" }, TextWriter.Null, interactiveProgress: false);
+
+        Assert.Equal(new[] { "--backend", "ggml_cpu", "--model", "mine.gguf" }, result);
+    }
+
+    [Fact]
+    public void Expand_CommandLineOverride_OfADisabledSwitch_IsNotReported()
+    {
+        // A false switch emits nothing, so dropping it changes nothing worth a line.
+        string cfg = WriteConfig("""{ "no-prefix-cache": false }""");
+        var sink = new StringWriter();
+
+        var result = ConfigFileArgs.Expand(
+            new[] { "--config", cfg, "--no-prefix-cache" }, sink, interactiveProgress: false);
+
+        Assert.Equal(new[] { "--no-prefix-cache" }, result);
+        Assert.DoesNotContain("[config]", sink.ToString(), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Expand_AccumulatingOptions_KeepTheConfigEntries()
+    {
+        // Every --stop, --skills-dir and --lora counts, so the command line adds to the
+        // file's values instead of replacing them -- and a --lora's download still runs.
+        using var server = new TinyHttpServer();
+        server.AddFile("/style.safetensors", new byte[] { 7, 8, 9 });
+        string lora = Path.Combine(_dir, "style.safetensors");
+        string cfg = WriteConfig($$"""
+        {
+          "stop": ["</s>"],
+          "skills-dir": "skills-a",
+          "lora": { "path": {{JsonQuote(lora)}}, "urls": [ {{JsonQuote(server.UrlFor("/style.safetensors"))}} ] },
+          "lora-scale": 0.7
+        }
+        """);
+
+        var sink = new StringWriter();
+        var result = ConfigFileArgs.Expand(
+            new[]
+            {
+                "--config", cfg,
+                "--stop", "<|eot|>", "--skills-dir", "skills-b", "--lora", "other.safetensors", "--lora-scale", "0.5",
+            },
+            sink, interactiveProgress: false);
+
+        Assert.Equal(
+            new[]
+            {
+                "--stop", "</s>", "--skills-dir", "skills-a", "--lora", Path.GetFullPath(lora), "--lora-scale", "0.7",
+                "--stop", "<|eot|>", "--skills-dir", "skills-b", "--lora", "other.safetensors", "--lora-scale", "0.5",
+            },
+            result);
+        Assert.Equal(1, server.RequestCount("/style.safetensors"));
+        Assert.DoesNotContain("[config]", sink.ToString(), StringComparison.Ordinal);
     }
 
     [Fact]
@@ -355,12 +623,82 @@ public class ConfigFileArgsTests : IDisposable
         string a = WriteConfig("""{ "backend": "ggml_cpu", "max-tokens": 10 }""", "a.json");
         string b = WriteConfig("""{ "backend": "ggml_cuda" }""", "b.json");
 
-        var result = ConfigFileArgs.Expand(new[] { "--config", a, "--config", b });
+        var sink = new StringWriter();
+        var result = ConfigFileArgs.Expand(new[] { "--config", a, "--config", b }, sink, interactiveProgress: false);
 
-        // a's tokens, then b's tokens (b overrides a for backend under last-wins).
-        Assert.Equal(
-            new[] { "--backend", "ggml_cpu", "--max-tokens", "10", "--backend", "ggml_cuda" },
-            result);
+        // b's backend replaces a's outright: only the winning entry reaches the hosts, so
+        // no option reader's first-or-last rule can pick the loser.
+        Assert.Equal(new[] { "--max-tokens", "10", "--backend", "ggml_cuda" }, result);
+        string notice = Assert.Single(sink.ToString().Split('\n', StringSplitOptions.RemoveEmptyEntries),
+            line => line.StartsWith("[config] --backend", StringComparison.Ordinal));
+        Assert.Contains("'b.json'", notice, StringComparison.Ordinal);
+        Assert.Contains("'a.json' is ignored", notice, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Expand_LaterFileOverride_SkipsTheEarlierFilesDownload()
+    {
+        // --config diffusiongemma-q4.json --config textonly.json with "mmproj": "none" in the
+        // second must not first pull the first file's vision shard.
+        using var server = new TinyHttpServer();
+        server.AddFile("/vision.safetensors", new byte[] { 1, 2, 3 });
+        string vision = Path.Combine(_dir, "vision.safetensors");
+        string a = WriteConfig($$"""
+        {
+          "model": "text.gguf",
+          "mmproj": { "path": {{JsonQuote(vision)}}, "urls": [ {{JsonQuote(server.UrlFor("/vision.safetensors"))}} ] }
+        }
+        """, "a.json");
+        string b = WriteConfig("""{ "mmproj": "none" }""", "b.json");
+
+        var sink = new StringWriter();
+        var result = ConfigFileArgs.Expand(new[] { "--config", a, "--config", b }, sink, interactiveProgress: false);
+
+        Assert.Equal(new[] { "--model", "text.gguf", "--mmproj", "none" }, result);
+        Assert.Equal(0, server.RequestCount("/vision.safetensors"));
+        Assert.False(File.Exists(vision));
+        string log = sink.ToString();
+        Assert.Contains("[config] --mmproj is set again by the later 'b.json'", log, StringComparison.Ordinal);
+        Assert.Contains("nothing is fetched", log, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Expand_ALaterFilesDisabledSwitch_DoesNotBeatAnEarlierValue()
+    {
+        // A false switch emits nothing, so it sets nothing and cannot win.
+        string a = WriteConfig("""{ "think": true }""", "a.json");
+        string b = WriteConfig("""{ "think": false }""", "b.json");
+
+        var result = ConfigFileArgs.Expand(new[] { "--config", a, "--config", b }, TextWriter.Null, interactiveProgress: false);
+
+        Assert.Equal(new[] { "--think" }, result);
+    }
+
+    [Fact]
+    public void Expand_OverrideNotice_NamesTheCommandLinesSpelling_AndEverySkippedDownload()
+    {
+        // The file wrote the legacy key; the command line the current one. The notice names
+        // what the user typed, and the skipped download of the second file is not lost
+        // behind the first file's plain path.
+        using var server = new TinyHttpServer();
+        server.AddFile("/vae.safetensors", new byte[] { 1, 2, 3 });
+        string vae = Path.Combine(_dir, "vae.safetensors");
+        string a = WriteConfig("""{ "wan-vae": "local-vae.safetensors" }""", "a.json");
+        string b = WriteConfig($$"""
+        { "video-vae": { "path": {{JsonQuote(vae)}}, "urls": [ {{JsonQuote(server.UrlFor("/vae.safetensors"))}} ] } }
+        """, "b.json");
+
+        var sink = new StringWriter();
+        var result = ConfigFileArgs.Expand(
+            new[] { "--config", a, "--config", b, "--video-vae", "mine.safetensors" }, sink, interactiveProgress: false);
+
+        Assert.Equal(new[] { "--video-vae", "mine.safetensors" }, result);
+        Assert.Equal(0, server.RequestCount("/vae.safetensors"));
+        string notice = Assert.Single(sink.ToString().Split('\n', StringSplitOptions.RemoveEmptyEntries),
+            line => line.StartsWith("[config] ", StringComparison.Ordinal));
+        Assert.StartsWith("[config] --video-vae is set on the command line", notice, StringComparison.Ordinal);
+        Assert.Contains("'a.json' and 'b.json' are ignored", notice, StringComparison.Ordinal);
+        Assert.Contains("the download entry in 'b.json' is skipped", notice, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -911,5 +1249,18 @@ public class ConfigFileArgsTests : IDisposable
             try { _listener.Stop(); } catch { }
             try { _listener.Close(); } catch { }
         }
+    }
+
+    [Theory]
+    [InlineData("lora-scale", "[0.5, 0.9]")]
+    [InlineData("lora-config", "[\"a.json\", \"b.json\"]")]
+    public void Expand_ALoraScaleOrConfigArray_IsRefused(string key, string value)
+    {
+        // Each binds to the one --lora before it; an array would bind every value to the last.
+        string config = Path.Combine(_dir, "loras.json");
+        File.WriteAllText(config, "{ \"lora\": [\"a.safetensors\", \"b.safetensors\"], \"" + key + "\": " + value + " }");
+
+        var ex = Assert.Throws<ArgumentException>(() => ConfigFileArgs.Expand(new[] { "--config", config }, TextWriter.Null, false));
+        Assert.Contains("cannot be an array", ex.Message, StringComparison.Ordinal);
     }
 }

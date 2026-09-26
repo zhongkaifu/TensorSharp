@@ -50,9 +50,9 @@ python3 -m venv /workspace/dsv41-tools
 同一仓库也提供内嵌 Engram 常量的十一个 Q4_K_M 分片（约 415 GiB）。把 include 模式改为
 `DeepSeek-V4.1-Flash-Q4_K_M-*.gguf` 并使用该量化的第一个分片即可。Q4_K_M 的两张
 Engram 表各约 51.5 GiB。在八张 46 GB 显卡上，这些表保留在主机内存映射中，部分路由
-专家需要卸载到 CPU。[量化报告](../validation/deepseek41-quants/README.md)保留了该放置方式的历史测试。
+专家需要卸载到 CPU。量化报告 `docs/validation/deepseek41-quants/README.md`（本地验证记录，未提交到 Git）保留了该放置方式的历史测试。
 
-本卡片中的早期结果与[整文件 SHA-256 记录](../validation/deepseek41/checkpoint-sha256.json)
+本卡片中的早期结果与整文件 SHA-256 记录 `docs/validation/deepseek41/checkpoint-sha256.json`（本地验证记录，未提交到 Git）
 对应旧 revision `8e0c4de3cb6519bfc11ed69dc87184b457a57bb5` 及其旧版第一个分片。
 未经重新验证，不应把这些哈希或性能结果视为当前文件的结果。新的验证记录应包含仓库 revision
 及所有分片的哈希。
@@ -78,7 +78,7 @@ Engram 表各约 51.5 GiB。在八张 46 GB 显卡上，这些表保留在主机
 该脚本下载独立的视觉分片，以及分隔符/路由张量所需的少量字节范围，并保留 BF16/F32
 存储。它会用 LFS 的 SHA-256 校验完整的独立视觉分片，并记录分隔符/路由权重各自的
 范围哈希；它不会下载或校验完整的原始文本分片。
-[伴随文件溯源记录](../validation/deepseek41/vision-companion.json)
+伴随文件溯源记录 `docs/validation/deepseek41/vision-companion.json`（本地验证记录，未提交到 Git）
 包含全部 306 个张量、来源 revision、字节范围与输出摘要。
 原生加载器在挂载前会检查父模型的分词器指纹与模型维度。要启用图像，在下文的服务命令
 中加上 `--mmproj /workspace/models/deepseek41-q2/deepseek41.vision.gguf`。
@@ -128,8 +128,8 @@ WebM 或 MOV 采样。例如，消息的 content 数组里可以包含：
 合法的图像 data URI 保持既有的解码与上传路径。展开所有图像之后，文本上下文预算依然
 适用。
 最终的 routed-TP 主机（托管侧 stage 3,651，原生 `6b3b5ab3…`）通过了全部八项
-[图像拒绝检查](../validation/deepseek41/full-checkpoint/tp8-context65536-ubatch1024-cpumoe0-cputhreads32-sparse1-compact1-chunk1024-6b3-final-image-input-rejections.json)
-与四项 [Responses 音频拒绝检查](../validation/deepseek41/full-checkpoint/tp8-context65536-ubatch1024-cpumoe0-cputhreads32-sparse1-compact1-chunk1024-6b3-final-audio-input-rejections.json)。
+图像拒绝检查 `docs/validation/deepseek41/full-checkpoint/tp8-context65536-ubatch1024-cpumoe0-cputhreads32-sparse1-compact1-chunk1024-6b3-final-image-input-rejections.json`
+与四项 Responses 音频拒绝检查 `docs/validation/deepseek41/full-checkpoint/tp8-context65536-ubatch1024-cpumoe0-cputhreads32-sparse1-compact1-chunk1024-6b3-final-audio-input-rejections.json`（本地验证记录，未提交到 Git）。
 无论流式还是非流式请求，对远程图像 URL、格式错误的图像 base64、以及形状合法或格式
 错误的音频部分，都返回 JSON 400 且不产生 SSE。更早的 CPU-offload 主机的八项图像检查
 另行保留。
@@ -184,7 +184,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 MAX_CONTEXT=65536 \
   --host 127.0.0.1 --port 5000 --max-tokens 2048
 ```
 
-[实测启动记录](../validation/deepseek41/full-checkpoint/layer8-context65536-ubatch1024-cpumoe0-cputhreads32-sparse1-compact1-chunk1024-6b3-final-launch.json)
+实测启动记录 `docs/validation/deepseek41/full-checkpoint/layer8-context65536-ubatch1024-cpumoe0-cputhreads32-sparse1-compact1-chunk1024-6b3-final-launch.json`（本地验证记录，未提交到 Git）
 保留了原始 VM 路径、二进制哈希与环境。该配置通过了 138/138 项推理用例；其吞吐与限制
 记录在下文。紧凑 gather 仍是可选项，并带有已记录的浮点差异。该记录中的
 `TS_DSV41_SPARSE_FA=1` 选择的是 ggml 的掩码压缩 flash-attention 内核：这些结果是在最初的
@@ -232,7 +232,7 @@ TensorSharp 默认按可用显存分配整层。
 记录同设备按分区求值的结果，`--cuda 1 --quant-strip-only` 检查 gate/up 逐位相等以及 scratch
 增长/失败恢复。非对齐的分片形状仍走 ggml 路径。已记录的微基准中窄分片每次 MoE 调用慢
 15-36%，因此这是正确性修复而非加速；见
-[numerical-tp-chosen-r1](../validation/qualification-2026-09-16/numerical-tp-chosen-r1/README.md)。
+`docs/validation/qualification-2026-09-16/numerical-tp-chosen-r1/README.md`（本地验证记录，未提交到 Git）。
 
 如果权重与上下文放不下，加上 `--n-cpu-moe N` 把前 N 层的路由专家留在主机上，或者用
 `--cpu-moe` 卸载全部路由专家。注意力、路由与共享专家仍在 GPU 上。
@@ -243,11 +243,11 @@ TensorSharp 默认按可用显存分配整层。
 
 原生版本 `6b3b5ab3…` 显式把共享专家的 gate/up/down 投影指派到该层所在设备。这修正了
 更早的调度器放置问题：在经过 CPU 卸载或 TP routed 分支之后，共享的 gate/up 计算可能被
-送到 CPU。相关的
-[放置与数值检查](../validation/deepseek41/shared-expert-placement/README.md)
+送到 CPU。相关的放置与数值检查
+（`docs/validation/deepseek41/shared-expert-placement/README.md`，本地验证记录，未提交到 Git）
 在两张 GPU 上通过了 597/597。更早的完整检查点放置基准仍保留其原始二进制与结果。
-使用修正后放置的最终 CPU-offload、routed-TP 与按层切分配置均已完成，见
-[放置记录](../validation/deepseek41/final-placements/README.md)。
+使用修正后放置的最终 CPU-offload、routed-TP 与按层切分配置均已完成，见放置记录
+`docs/validation/deepseek41/final-placements/README.md`（本地验证记录，未提交到 Git）。
 
 要做热态的 CPU 卸载基准，请在模型加载之后、开始计时请求之前，单独把被卸载的专家页读入：
 
@@ -343,7 +343,7 @@ staging 以 64 MiB 为单位分组；单张更大的表沿用此前的一表分�
 该提示在可选的整表预热之后应用，除共享的边界页之外，不改变其他张量区间的策略。设置
 `TS_DSV41_ENGRAM_RANDOM=0` 可关闭它，`=1` 可强制开启。不设置时，单线程配置保持默认的
 映射策略。不支持的平台与被 OS 拒绝的提示都是非致命的。源码对比与配对的 scratch 文件
-结果见 [Engram 调查](../validation/deepseek41/cli-gpu-execution/README.md)。
+结果见 Engram 调查 `docs/validation/deepseek41/cli-gpu-execution/README.md`（本地验证记录，未提交到 Git）。
 
 ### 后端
 
@@ -397,7 +397,8 @@ attention 减少的是 attention 计算量，并不消除 prefill 期间共享�
 微批。不设置时，V4.1 在 ggml GPU 后端上由加载器选择：1024、512 或 256 中所需路由专家 CPU
 层数不多于 256 的最宽者，记录为 `[dsv4] prefill ubatch: N (auto; ...)`（见
 [为图保留的设备内存](#为图保留的设备内存)）。CPU 执行器与 direct CUDA 引擎保持 256。任何
-显式值都原样使用；`TS_DSV4_UBATCH=256` 恢复此前固定的默认值。
+显式值都原样使用；`TS_DSV4_UBATCH=256` 恢复此前固定的默认值。模型声明的窗口更大，并不意味着
+某个具体的 GPU 配置能分配或高效服务那么长的上下文。
 
 ### 每张 GPU 一个后端
 
@@ -425,13 +426,7 @@ hyper-connection 门控、top-k 掩码）以 `GGML_OP_CUSTOM` 节点发出，由
 推理。Engram 仅在表使用主机映射时才从主机查表。按层切分会让相邻的层落在相邻的 GPU 上，因此仅凭
 单卡利用率低并不能断定发生了 CPU 回退。`TS_DSV4_PERF=2` 报告输入准备与图计算耗时；
 `TS_DSV4_PERF=3` 还会记录调度器实际的后端切换。它们是诊断模式，其日志开销会影响吞吐。
-见 [CLI 执行调查](../validation/deepseek41/cli-gpu-execution/README.md)。
-
-`TS_DSV41_SPARSE_FA=1` 为单 token 批次、或缓存 key 不少于 16,384 时启用 CUDA 掩码压缩
-flash attention。它最多注意 128 个原始窗口 key 加 512 个选中的压缩 key。较短的 prefill
-仍用稠密 flash attention，因为在测试用的 A40 上其共享 KV tile 更快。实测的完整检查点
-配置显式启用了该选项，但它的默认值仍是关闭。这个选项减少的是注意力计算量；它并不能
-消除 prefill 期间共享压缩缓存的跨 GPU 拷贝。
+见 CLI 执行调查 `docs/validation/deepseek41/cli-gpu-execution/README.md`（本地验证记录，未提交到 Git）。
 
 `TS_DSV41_COMPACT_RAW_GATHER=1` 为稀疏的单 token decode 启用原始窗口压缩。它先在持有
 这些行的 GPU 上把 128 行可见的原始行 gather 起来，再搬到持有共享压缩缓存的 GPU。被
@@ -439,10 +434,6 @@ flash attention。它最多注意 128 个原始窗口 key 加 512 个选中的�
 的对齐要求。物理 ring、prefill 路径以及不做 gather 的 decode 均保持不变。该选项默认
 关闭。在约 8k 提示词下的限定 Q2_K 对比中，并发 1 与 4 的持续 decode 都提升了 13.7%；
 严格的 flash 算术差异与完整测量设置见验证报告。
-
-默认上下文分配上限为 65,536 token，除非提供 `MAX_CONTEXT`。`TS_DSV4_UBATCH` 控制前向
-微批，V4.1 默认为 256。模型声明的窗口更大，并不意味着某个具体的 GPU 配置能分配或高效
-服务那么长的上下文。
 
 ### token 批量 decode
 
@@ -505,6 +496,53 @@ token 下每个分块耗时 35.3–35.7 / 36.9–37.2 / 38.9–39.1 ms，1024 �
 会先释放最久未使用的条目，直到每张卡都能再放下一个与已缓存的最大条目同样大的图，外加一个
 底线。`TS_DSV4_GRAPH_CACHE_HEADROOM_MB` 设定这个底线（默认 1024）；设为 `0` 回到纯条目数
 上限。
+
+### 多轮 KV 复用
+
+第二轮渲染出的提示词并不是第一轮缓存的延续。普通对话会丢弃上一轮 assistant 的推理
+内容，因此渲染结果恰好在上一轮 `<｜Assistant｜>` 之后一个 token 处与缓存分叉：缓存里
+是 `<think>`，渲染出的是 `</think>`。分叉点之前的内容仍然一致，而从第三轮起，那就是
+上一轮的**整个**提示词。
+
+因此原生执行器支持部分复用：`TSGgml_Dsv4Truncate` 把槽位的 head 回退到匹配前缀的末尾，
+只前向新的后缀，于是每轮的 prefill 取决于最新的回答，而不是整段对话。两个条件约束它
+（见 `dsv41_truncate.h`）：
+
+* **对齐。** 目标位置必须是最大压缩比（已发布检查点为 2）的整数倍，使任何压缩块都不
+  跨越新的 head；调用方把复用长度向下对齐，最多损失一个 token。
+* **深度。** 原始滑动窗口存放在 `pad64(n_swa + n_ubatch, 256)` 个位置的环里（已发布
+  检查点为 512，窗口 128），所以从当前状态最多只能回退 385 个位置。生成回答会让 head
+  远远越过下一轮需要的提示词边界，因此每个槽位都保留一份**回退检查点**：在每次多
+  token 前向结束（即提示词边界）时，对两个按模寻址的环（原始窗口与压缩器状态）做影子
+  拷贝，decode 步刻意不移动它。它每层每个槽位占 `n_embd_head x ring_raw x 2` 字节
+  （已发布检查点约 21 MiB）；`TS_DSV41_REWIND_CHECKPOINT=0` 将其关闭，此后超出活动环的
+  回退会被拒绝。
+
+在八张 A40、Q4_K_M 上实测（`--n-cpu-moe 2`，贪心，提示词后接两轮 `continue`，
+`TS_KV_DEBUG=1`）。分叉点正好落在策略预期的位置——两轮中缓存在那里都是 token 128821
+（`<think>`），而渲染结果是 128822（`</think>`），恰在 `<｜Assistant｜>` 之后一个 token：
+
+| 轮次 | 提示词 token | 匹配前缀 | 计划 | prefill |
+|---:|---:|---:|---|---:|
+| 1 | 38 | 0（冷启动） | Reset | 970 ms |
+| 2 | 2,056 | 37，对齐到 36 | PartialReuse | 8,399 ms |
+| 3 | 5,841 | 2,055，对齐到 2,054 | PartialReuse | 17,058 ms |
+
+第 2 轮只能收回一个常量——system 块、问题与 assistant 头——因为该点之后的缓存是带着
+推理内容的第一轮回答，而提示词里已经没有它了。第 3 轮收回第 2 轮的整个提示词，此后的
+占比会继续增长：匹配前缀随对话增长，而需要重新前向的后缀始终只有一个回答那么长。两次
+回退都远超活动环（第 3 轮为 6,529 个位置），由检查点提供。
+
+回退被拒绝是正常结果而不是错误：调用方会 reset 并重新 prefill。普通 `deepseek4` 完全
+不做截断（它的压缩器块相互重叠，对齐 head 不足以保证正确），V4.1 的 direct CUDA 与纯 C#
+执行器也不做（它们没有检查点）。关闭 `--think` 时这一切都不需要：没有推理内容被丢弃，
+渲染结果就是缓存的纯追加，复用无需回退。
+
+跨请求时，这种复用由默认模式的 Radix 前缀缓存驱动，每次回退都由原生执行器决定。不额外
+开启时，延续下去的是活动缓存；`TS_DSV41_RETAINED_CACHE=1` 还会保留已结束请求的原生槽位，
+使多个会话都能继续而无需完整重新 prefill。保留量受 `TS_DSV41_RETAINED_CACHE_MB`
+（默认 2048；`0` 或无法解析的值表示不保留）约束，只适用于能够回退的原生执行器，加载了
+DSpark 草稿器时不生效。它默认关闭，本卡片没有记录它的任何实测。
 
 原生 V4.1 请求各自拥有独立的 KV 槽位。因此调度器按"每个允许运行的请求一个上下文"来
 计算它那份仅含元数据的块池。调度器默认允许 16 个运行中的请求；示例显式设置
@@ -659,8 +697,8 @@ CPU 后端与 CUDA 一样，直接读取内嵌的 Engram 元数据。下载当�
 
 `TS_DSV4_THREADS` 设置计算线程数，默认上限为 32。那个上限是为 GPU 运行选的——在那里
 这些线程只做辅助性的主机工作；而在纯 CPU 运行里它们就是整个引擎，所以请把它设为本次
-运行真正可以使用的核心数。`TS_DSV4_UBATCH`（默认 256）与 `MAX_CONTEXT`（默认 65,536）
-的行为与 CUDA 上一致，只不过在这里消耗的是主机内存而不是显存。
+运行真正可以使用的核心数。`TS_DSV4_UBATCH`（这里未设置时固定为 256，而 `ggml_cuda`
+会自动选择宽度）与 `MAX_CONTEXT`（默认 65,536）在这里消耗的都是主机内存而不是显存。
 
 那些以 GPU 命名的选项在这里的行为如下：
 
@@ -678,7 +716,9 @@ CPU 后端与 CUDA 一样，直接读取内嵌的 Engram 元数据。下载当�
   `TS_DSV41_ENGRAM_WARM`、`TS_DSV41_ENGRAM_THREADS`、`TS_DSV41_ENGRAM_RANDOM`——
   在这个后端上全部有效。
 - `TS_DSV4_VRAM_RESERVE_MB` 会在往这个唯一设备上装层之前，从它的空闲内存里扣除。
-  这里那个设备就是主机，所以它 2048 MiB 的默认值会保留 2 GiB 系统内存；而模型装不下
+  这里那个设备就是主机，所以它的默认保留量（至少 2 GiB；在这条路径使用的 256 ubatch、
+  65,536 上下文下约 2,318 MiB，见[为图保留的设备内存](#为图保留的设备内存)）是从系统
+  内存中扣除的；而模型装不下
   时加载器的拒绝信息是按显存措辞的（"not enough VRAM ... Re-run with
   `--n-cpu-moe N`"）。那条建议本身仍然正确——见下文。
 - `TS_DSV41_COMPACT_RAW_GATHER` 是在 CUDA 上测的，默认关闭；它改的是计算图而不是内核，
@@ -718,8 +758,8 @@ fixture 规模的——一个五层、hidden 256、16 token 的 F32 合成模型
 上面的吞吐、加载时间与常驻内存占用都没有测过。
 
 Direct CUDA 引擎 `--backend cuda` 也用自己的内核、不经 ggml 运行 V4.1。它还没有数值
-门禁——已经验证了什么、还有什么挡着，见
-[CUDA 后端说明](../validation/deepseek41-cuda-backend/README.md)。`--backend mlx`
+门禁——已经验证了什么、还有什么挡着，见 CUDA 后端说明
+`docs/validation/deepseek41-cuda-backend/README.md`（本地验证记录，未提交到 Git）。`--backend mlx`
 仍然被拒绝。
 
 ## 前向计算图与状态
@@ -778,7 +818,7 @@ enum/const，以及递归定义的对象/数组。它按 schema 顺序发出参�
 另一套既有的编译器。
 
 普通字符串可以使用训练过的原始 `string="true"` 表示。包含 DSML 保留分隔符的字符串仍可
-通过 `string="false"` 加 JSON 字符串来表达：诸如 `<` 这样的 JSON 转义能在不闭合
+通过 `string="false"` 加 JSON 字符串来表达：诸如 `\u003c` 这样的 JSON 转义能在不闭合
 外围工具标记的前提下保留精确的解码值。当已解析的调用被渲染进后续工具历史时（包括嵌套
 JSON 中的字符串与键），同样的保护依然有效。普通历史的格式化保持不变。原始字符串还保留
 了 `<param`、`</param`、`<invoke` 与 `</invoke` 这几个标签族，使得写错的工具标签无法把
@@ -799,6 +839,10 @@ JSON 中的字符串与键），同样的保护依然有效。普通历史的格
 这些工具策略与"思考 + JSON"保证适用于 `/v1/chat/completions`。既有的 `/v1/responses`
 接口不支持同样的 V4.1 工具历史往返或"推理加 JSON"组合。
 
+由于 V4.1 会渲染工具声明并解析 DSML 调用，它同样可以使用 skills、代码工具
+（`--code-exec`），以及服务端的[子智能体委派](../multi_agent.md)（在对话路径上默认开启）。
+V4.1 没有发布任何委派相关的实测结果。
+
 对 V4.1 而言，达到 `TS_THINKING_BUDGET` 会发出训练过的 `</think>` token，并在原有
 `max_tokens` 限制之内继续写最终答案。当请求的输出额度不少于 512 token 时，默认预算为
 75%。额度更小时没有自动的思考预算；显式设置为正的 `TS_THINKING_BUDGET` 仍然生效。
@@ -818,9 +862,16 @@ JSON 中的字符串与键），同样的保护依然有效。普通历史的格
   之前失败，而不会把 V4.1 的权重塞进并未实现它的计算图。
 - 多 GPU 执行默认按整层放置。`TS_DSV41_TP` 启用实验性的 routed-MoE 张量并行，归约经
   主机中转。注意力张量并行与分布式组尚未实现。
-- 并发请求拥有隔离的序列槽位。V4.1 目前回退到逐槽前向调用，而不是 V4 的融合按 token
-  批处理计算图，因此并发并不意味着批处理的 GPU 吞吐。
-- V4.1 的 DSpark 投机解码尚未实现；V4 的草稿模型会被拒绝。
+- 并发请求拥有隔离的序列槽位。在带 CUDA 融合后端的原生执行器上（`--backend ggml_cuda`），
+  它们的 decode 步作为一张按 token 批处理的计算图执行（见[token 批量 decode](#token-批量-decode)）。
+  `--backend ggml_cpu`、`TS_DSV4_FUSED=0`、加载了 DSpark 草稿器或设置
+  `TS_BATCHED_FUSED_DECODE=0` 时，仍走逐槽前向调用。
+- V4.1 的 DSpark 投机解码属于实验性功能。加载器只在 `ggml_cuda` 与 `ggml_cpu` 上接受
+  `deepseek41-dspark` 草稿器（`--draft-model` / `TS_DSV4_DSPARK`），在其他执行器上拒绝，
+  V4 的草稿模型也会被拒绝。它只在合成 fixture 上验证过（`DeepSeek41DsparkIntegrationTests`），
+  没有实测过任何训练好的 V4.1 草稿器，因此没有接受率或吞吐数据。加载草稿器期间，按 token
+  批量 decode 与保留缓存都不生效。没有草稿器时，`--spec`（包括 `--spec-type ngram`）
+  只提供普通解码。
 - K/V cache 在每个执行器上都是 F16，`KV_CACHE_DTYPE=q8_0` / `q4_0` 会在**加载时被拒绝**
   （`DeepSeek41Architecture.ValidateLoad` 在打开检查点之前抛 `NotSupportedException`）；
   显式的 `f32` 会在 stderr 上被告知并按 `f16` 报告。以前它是被静默接受的：原生计算图照样
@@ -841,8 +892,8 @@ JSON 中的字符串与键），同样的保护依然有效。普通历史的格
   只增加了转换支持。缺少参考实现并不能确立质量或性能的对等。
 - 完整检查点的数值 smoke 能产出预期 token，但未通过严格的 F32 输入 oracle 对比（相对
   L2 0.146216，最大绝对误差 2.708920）。量化激活的算术与该参考不同；
-  [保留的分阶段分析](../validation/deepseek41/smoke18-reference/README.md)
-  未能完全归因最终的差异。贪心结果一致不等于严格的数值一致。
+  保留的分阶段分析（`docs/validation/deepseek41/smoke18-reference/README.md`，
+  本地验证记录，未提交到 Git）未能完全归因最终的差异。贪心结果一致不等于严格的数值一致。
 
 把张量并行扩展到注意力，需要 rank 局部的计算图、权重分片与 cache 状态，并在进入下一个
 非线性残差算子之前对注意力输出做一次归约。现有的 GLM 支持
@@ -858,3 +909,74 @@ rank 局部的专家计算图。
 
 短提示、长提示、JSON、工具往返、agent 工作流、并发、放置以及既有模型回归检查的完整
 流程，见[验证协议](../deepseek41_validation.md)。未支持的场景保持明确的未验证状态。
+
+最新的托管阶段**在本地与指定 VM 上都通过了 3,651/3,651 项测试**，没有跳过，其中包括在
+两台主机上都运行的 84 项音频/图像/API 专项检查。覆盖范围包括工具历史分隔符的往返、合法的
+部分 Unicode token、畸形 UTF-8 的拒绝，以及在开始流式输出之前对图像/音频请求的校验。
+之前的图像验证阶段在两台主机上都通过了 3,635/3,635 项测试，其中包括本地 91 项专项检查。
+每个 Runtime DLL 都与其已验证的 3,597 项测试的原始 tag-family 序列化阶段保持一致。最初的
+匹配放置基线使用的是更早的 3,566 阶段主机；那些测量以及中间 3,582 阶段的检查都仍然保留。
+推理测试工具另外在本地与 VM 上通过了 33 项单元测试；其当前范围列在
+[验证报告](../deepseek41_validation.md)中。
+第一次图像验证的 VM 尝试暴露了一个测试准入竞争
+（`docs/validation/deepseek41/retained-cache-admission/README.md`，本地验证记录，未提交到
+Git）；同步化后的测试类与完整测试通道在两台主机上都通过，原有断言保持不变。
+确切的命令、排除项、计数器、哈希以及保留下来的间歇性测试失败
+（`docs/validation/deepseek41/managed-correctness/README.md`，本地验证记录，未提交到 Git）
+与完整检查点的质量和性能结果分开记录。
+
+最终的按层与 routed-TP 配置使用原生 `6b3b5ab3…` 与托管侧 stage 3,651。
+按层切分通过了 **138/138 项推理用例**；routed TP 通过了 **129/130**。
+按层计划还包含八个并发长上下文用例：
+
+| 场景组 | 按层切分 | Routed TP |
+|---|---:|---:|
+| 短提示、JSON、schema、历史与默认并行的工具工作流 | 30/30 | 29/30 |
+| required、named、none、串行与并行工具策略 | 30/30 | 30/30 |
+| 思考工作流 | 4/4 | 4/4 |
+| 非流式工作流 | 4/4 | 4/4 |
+| 图像与抽样的视频帧 | 25/25 | 25/25 |
+| 中文与 Unicode JSON | 10/10 | 10/10 |
+| 单独配置的串行工具工作流 | 10/10 | 10/10 |
+| 持续 decode | 15/15 | 15/15 |
+| 约 8k 与 32k 输入 token 的长文检索 | 2/2 | 2/2 |
+| 每种长上下文尺寸下的四个并发请求 | 8/8 | 不在该配置中 |
+
+在八卡 A40 VM 上，按层配置的持续 decode 中位数为单请求 **34.83 tokens/s**、并发 4 时
+**每请求 8.46 tokens/s**，每个被测请求恰好生成 512 个 token。首 token 时间在 7,706 个输入
+token 时为 **19.985 s**，在 30,585 个时为 **80.240 s**。
+并发长上下文阶段记录了 153,187 个原生 prefill token（含预热），KV 池抢占为零。
+decode 结果（`layer8-context65536-ubatch1024-cpumoe0-cputhreads32-sparse1-compact1-chunk1024-6b3-final-steady.json`）、单请求长上下文结果
+（`layer8-context65536-ubatch1024-cpumoe0-cputhreads32-sparse1-compact1-chunk1024-6b3-final-long.json`）与并发长上下文统计
+（`layer8-context65536-ubatch1024-cpumoe0-cputhreads32-sparse1-compact1-chunk1024-6b3-final-long-parallel-runs.json`）都在 `docs/validation/deepseek41/full-checkpoint/`
+下（本地验证记录，未提交到 Git），保留了测量范围与计时证据。
+
+之前失败的 named-thinking 与 thinking-agent 用例在两个最终配置中都已通过。在 routed TP 下，
+仍有一个默认并行的 agent 请求在拿到发票结果之前，就与 `read_invoice` 一起发出了参数全为
+零占位值的 `calculate_total`。严格检查器拒绝了它；该组因此从第一次 TP 配置的 30/30 变为
+29/30。串行策略单独成功并不能抵消这次失败。一次本地的提示词/语法/解析器诊断
+（`docs/validation/deepseek41/parallel-tool-dependency/README.md`，本地验证记录，未提交到
+Git）保留了模型发出的调用，没有发现任何迫使多出这次调用或产生零值的缺陷。最终的四层
+CPU 卸载配置另外通过了 28/30 个默认并行质量用例，保留了两次过早发出依赖调用的失败。
+按层配置的 30/30 结果并不能抵消另外两种放置的失败。原生代码与启动设置也有变化，因此
+这些结果既不能单独归因于语法改动，也不能证明质量的全面提升。上文的十二项 HTTP 输入
+拒绝检查与推理计划相互独立。确切的报告与其余对比记录在最终放置记录
+`docs/validation/deepseek41/final-placements/README.md`（本地验证记录，未提交到 Git）中。
+
+既有模型的检查同样保留了回归。最终的 75 用例对比
+（`docs/validation/deepseek41/existing-model-regressions/final3651-native6b3/README.md`，
+本地验证记录，未提交到 Git）通过了 39/75 个用例，并且在那一轮中相对其配对参考没有引入新的
+失败；单独的 Unicode JSON 覆盖通过了 15/15。随后重复进行的 JSON 对比
+（`docs/validation/deepseek41/json-performance/completed-r2/README.md`，本地验证记录，
+未提交到 Git）暴露了 Qwen3 在同一请求上的又一次失败，并记录到 Qwen3.5 的首 token 延迟变慢，
+尽管其短回答的 decode 更快。这些结果与前一轮“没有引入新失败”的观察分开记录，并不能证明
+完全不存在回归。
+
+一次匹配分块的对照
+（`docs/validation/deepseek41/existing-model-regressions/qwen3-json-chunks/README.md`）
+在两个构建中都复现了 Qwen3 的响应变化；最初并发时的分块划分没有被记录。Qwen3.5 较短的
+交替对照（`docs/validation/deepseek41/json-performance/qwen35-alternating/README.md`）同样
+显示最终延迟变慢。之后一次 72 请求的对照
+（`docs/validation/deepseek41/json-performance/qwen35-solo72/README.md`；以上三项均为本地
+验证记录，未提交到 Git）固定了原生库，所有回答都通过，也没有复现这次变慢。这些诊断没有
+促成任何生产代码修复；不一致的结果及其局限仍记录在验证报告中。

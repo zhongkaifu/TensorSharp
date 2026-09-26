@@ -2,18 +2,19 @@
 
 [English](API_EXAMPLES.md) | [中文](API_EXAMPLES_zh-cn.md)
 
-TensorSharp.Server.Host 提供三种 API 风格以及若干工具型接口：
+TensorSharp.Server.Host 提供三种 API 风格、一个兼容 Jev 的判定端点以及若干工具型接口：
 
-- **兼容 Ollama**（`/api/generate`、`/api/chat/ollama`、`/api/tags`、`/api/show`）
-- **兼容 OpenAI**（`/v1/chat/completions`、`/v1/responses`、`/v1/models`）
-- **Web UI**（`/api/chat`、`/api/sessions`、`/api/models`、`/api/models/load`、`/api/upload`、`/api/skills`、`/api/image-edit`、`/api/image-edit/stream`、`/api/image-generate`、`/api/image-generate/stream`）
-- **工具型接口**（`/api/version`、`/api/queue/status`）
+- **兼容 Ollama**（`/api/generate`、`/api/chat/ollama`、`/api/tags`、`/api/show`、`/api/embed`、`/api/embeddings`）
+- **兼容 OpenAI**（`/v1/chat/completions`、`/v1/responses`、`GET /v1/responses/{id}`、`/v1/models`、`/v1/embeddings`、`/v1/videos/generations`、`/v1/skills`）
+- **兼容 Jev** 的类型化判定（`/v1/systemone`，仅限 DiffusionGemma）
+- **Web UI**（`/api/chat`、`/api/sessions`、`/api/models`、`/api/models/load`、`/api/upload`、`/api/skills`、`/api/image-edit`、`/api/image-edit/stream`、`/api/image-generate`、`/api/image-generate/stream`、`/api/video-generate`、`/api/video-generate/stream`）
+- **工具型接口**（`/api/version`、`/api/queue/status`、`/health`）
 
 启动服务时通过 `--model` 指定承载的模型文件，必要时通过 `--mmproj` **显式**指定多模态投影器；`TensorSharp.Server.Host` 不会自动探测投影器。Web UI 与兼容接口仅暴露启动时指定的模型 / 投影器组合；`/api/models/load` 可以用受支持的后端重新加载同一组合，但无模型启动时不能用它选择模型，也不能在运行时切换到其他文件。
 
 ## 嵌入 API
 
-使用 `--model encoder.gguf --embeddings` 启动嵌入服务，后端选择纯 C# `cpu` 或原生 `ggml_cpu` / `ggml_metal` / `ggml_cuda`。一个进程常驻一个编码器；聊天与嵌入分别运行。支持 Snowflake Arctic Embed L v2.0 与 MiniLM GGUF，模型信息接口报告 `embedding` 能力。
+使用 `--model encoder.gguf --embeddings` 启动嵌入服务，后端选择纯 C# `cpu` 或原生 `ggml_cpu` / `ggml_metal` / `ggml_cuda`。一个进程常驻一个编码器；聊天与嵌入分别运行。支持 Snowflake Arctic Embed L v2.0 与 MiniLM GGUF，模型信息接口报告 `embedding` 能力。启用 `--embeddings` 时，发往生成类路由（`/v1/chat/completions`、`/v1/responses`、`/v1/systemone`、`/v1/videos/generations`、`/api/generate`、`/api/chat`、`/api/chat/ollama`、`/api/models/load`，以及 `/api/image-generate`、`/api/image-edit`、`/api/video-generate` 与它们的 `/stream` 形式）的 `POST` 请求会收到 HTTP 400 `This server hosts an embedding model. Use /v1/embeddings or /api/embed.`
 
 ```bash
 curl http://127.0.0.1:5000/v1/embeddings -H 'Content-Type: application/json' \
@@ -39,9 +40,10 @@ curl http://127.0.0.1:5000/api/embeddings -H 'Content-Type: application/json' \
 | 上传 | `/api/upload` 接受图像 / 视频 / 音频 / 文本 / **PDF** 文件；原生数字 PDF 返回抽取出的文本，扫描版 PDF 在加载了具备视觉能力的模型时返回逐页图像（`TS_PDF_MAX_PAGES` 限制读取页数） |
 | 图像生成与编辑 | Qwen-Image-2.1（`qwen_image`）通过 `/api/image-generate`、`/api/image-edit` 及其 `/stream` 变体提供服务，而不是聊天端点 |
 | 视频生成 | 任何视频生成模型 —— MiniMax-H3（`minimax-h3`）、Wan 2.1 / 2.2（`wan`）—— 都通过 `/api/video-generate`、`/api/video-generate/stream` 与 `/v1/videos/generations` 提供服务；MiniMax-H3 在 MP4 之外还会返回一个 32 kHz 立体声 `.wav` 旁挂文件，`/api/models` 会告知当前加载的检查点接受哪些条件输入 |
-| Agent Skills | 技能目录来自 `--skills-dir`（或二进制文件旁的 `skills` 目录），在 `/v1/skills` 与 `/api/skills` 列出，也可通过 `POST /api/skills` 以 `.zip` 安装。所有聊天端点都可用 `"skills": [...]` 按请求选中。对同时支持工具声明与输出解析的模型族（包括 Qwen 3.8 Flash Next，`qwen4exp`），模型自己的技能调用在服务端内部应答，因此客户端拿到完整回复；不支持完整工具闭环的模型族则以内联方式获得选中技能说明。`skills_run` 只有在服务启动时传入 `--skills-allow-exec` 才可用。 |
+| Agent Skills | 技能目录：首先是二进制文件旁的 `skills` 目录（通过 `POST /api/skills` 上传的技能安装在此处；最先扫描，因此同名时其中的技能优先），然后是 `--skills-dir`（默认为从工作目录向上直到 Git 根目录的每个已存在的 `.agents/skills`，由近及远），在 `/v1/skills` 与 `/api/skills` 列出，也可通过 `POST /api/skills` 以 `.zip` 安装。所有聊天端点都可用 `"skills": [...]` 按请求选中。对同时支持工具声明与输出解析的模型族（包括 Qwen 3.8 Flash Next，`qwen4exp`），模型自己的技能调用在服务端内部应答，因此客户端拿到完整回复；不支持完整工具闭环的模型族则以内联方式获得选中技能说明。`skills_run` 只有在服务启动时传入 `--skills-allow-exec` 才可用。 |
 | Agent 式代码执行 | `--code-exec` 会为支持工具调用的模型族加入进程内执行的 `shell`、`read_file`、`write_file` 与 `apply_patch`。Web UI 每个聊天会话保留一个工作区；每个 OpenAI/Ollama HTTP 请求在内部轮次间使用私有工作区，响应结束后由服务删除。联网与安装软件包是相互独立且默认关闭的权限。 |
-| 结构化输出 | OpenAI `response_format` 支持 `text`、`json_object`、`json_schema`；`response_format`（`json_object` / `json_schema`）不能与 `tools` 同时使用；只有声明了推理结束位置的模型家族（GPT-OSS、DeepSeek V4.1、Qwen 3.8 Flash Next、Gemma 4、Nemotron-H、Muse-Glimmer）允许与 `think` 同时使用 |
+| 子智能体 | 在 `/v1/chat/completions`、`/v1/responses`、`/api/chat/ollama` 与 Web UI `/api/chat` 上，对能渲染工具声明且有工具解析器的模型族（Mistral 3、Hunyuan Dense 与 DiffusionGemma 除外）默认开启。模型可以调用 `spawn_agent`、`wait_agent`、`send_input`、`close_agent` 与 `list_agents`；子智能体由服务端在进程内用同一个已加载模型运行；`explorer` 与 `reviewer` 子智能体只读，`worker` 只有在服务启动时传入 `--agents-allow-worker-tools` 时才获得父级的可写工具。`--no-multi-agent` 为整个服务关闭委派，`"multi_agent": false` 为单个请求关闭。见[子智能体](#子智能体multi_agent)。 |
+| 结构化输出 | OpenAI `response_format` 支持 `text`、`json_object`、`json_schema`，`/v1/chat/completions` 在解码时用 JSON 语法约束它们；`response_format`（`json_object` / `json_schema`）不能与 `tools` 同时使用；只有声明了推理结束位置的模型家族（GPT-OSS、DeepSeek V4.1、Qwen 3.8 Flash Next、GLM-5.3-Flash、Gemma 4、Nemotron-H、Muse-Glimmer）允许与 `think` 同时使用 |
 
 > **网络安全：**服务监听 `0.0.0.0:5000`，没有 API Key 身份验证或内置 TLS。
 > 只应在可信网络中使用，或在前方部署带身份验证与 TLS 的反向代理。
@@ -80,11 +82,11 @@ curl -s http://localhost:5000/v1/chat/completions \
   -d '{"model":"gemma-4-E4B-it-Q8_0.gguf","messages":[{"role":"user","content":"Reply with one short hello."}],"max_tokens":32}'
 ```
 
-内置 UI 的地址是 **<http://localhost:5000>** —— `GET /` 直接返回 `index.html`（显式的 `/index.html` 地址同样可用）。`GET /health` 是存活检查接口，返回 `"TensorSharp.Server.Host is running"`；只有在没有 `wwwroot` 内容的无界面部署中，`GET /` 才会返回同样的响应。
+内置 UI 的地址是 **<http://localhost:5000>** —— `GET /` 直接返回 `index.html`（显式的 `/index.html` 地址同样可用）。`GET /health` 是存活检查接口，返回 `"TensorSharp.Server is running"`；只有在没有 `wwwroot` 内容的无界面部署中，`GET /` 才会返回同样的响应。
 
 ### 已构建或已解压的应用目录
 
-构建完成后可从仓库根目录运行下面的命令，也可把 DLL 路径改为解压后的发行归档；应用目录同时包含原生库与 `wwwroot/`。**状态核验于 2026-09-01：**[v3.3.0.0](https://github.com/zhongkaifu/TensorSharp/releases/tag/v3.3.0.0) 提供十个预构建归档——Windows x64（CPU/CUDA）、Linux x64（CPU/CUDA）与 macOS arm64 各有 CLI 和 Server。更新版本请查看 [Releases 页面](https://github.com/zhongkaifu/TensorSharp/releases)。
+构建完成后可从仓库根目录运行下面的命令；在解压后的发行归档中，则用相同参数运行其中的 `TensorSharp.Server.Host` 可执行文件；应用目录同时包含原生库与 `wwwroot/`。**状态核验于 2026-09-25：**最新发行版 [v2026.09.01](https://github.com/zhongkaifu/TensorSharp/releases/tag/v2026.09.01)（2026-09-17）提供十个预构建归档——Windows x64（CPU/CUDA）、Linux x64（CPU/CUDA）与 macOS arm64 各有 CLI 和 Server，其服务端归档包含的是 `TensorSharp.Server.Host`。该标签之后合入的改动在下一个发行版之前只存在于源码构建中。v3.4.0.0 之前的发行版（例如 [v3.3.0.0](https://github.com/zhongkaifu/TensorSharp/releases/tag/v3.3.0.0)）早于 Server / Server.Host 拆分，因此其服务端归档包含的是 `TensorSharp.Server`。更新版本请查看 [Releases 页面](https://github.com/zhongkaifu/TensorSharp/releases)。
 
 ```bash
 # 仅文本模型
@@ -110,9 +112,15 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model ~/work/mo
 DIFFUSION_STEPS=48 DIFFUSION_MAX_BATCH=2 \
   dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model ~/work/model/diffusiongemma-26B-A4B-it-Q4_K_M.gguf --backend ggml_metal
 
+# 支持图像输入的 DiffusionGemma：Gemma 4 视觉塔取自 HF 原始分片
+# model-00011-of-00011.safetensors（或 mmproj GGUF）；音频与视频会被拒绝
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model ~/work/model/diffusiongemma-26B-A4B-it-Q4_K_M.gguf \
+    --mmproj ~/work/model/model-00011-of-00011.safetensors --backend ggml_metal
+
 # 覆盖默认 token 预算（默认 20000）。它对每个端点都生效 —— Web UI、Ollama
-# 与 OpenAI —— 只要请求省略了 max_tokens / num_predict 就采用该值，并且会把
-# 要得更多的请求钳制到该值。
+# 与 OpenAI —— 只要请求省略了 max_tokens / num_predict 就采用该值。一旦通过
+# --max-tokens（或 MAX_TOKENS）设置，它还会把要得更多的请求钳制到该值；
+# 内置的 20000 默认值不会钳制。
 dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model ~/work/model/Qwen3.5-9B-Q8_0.gguf --backend ggml_metal --max-tokens 4096
 ```
 
@@ -237,9 +245,10 @@ curl -X POST http://localhost:5000/api/generate \
 ```
 
 `prompt_cache_hit_tokens` 表示在 `prompt_eval_count` 个 token 中，有多少 token
-是直接从上一轮的 KV 缓存中读取的。`/api/generate` 在每次 prefill 之前都会重置
-会话，因此该字段始终为 `0`；在 `/api/chat/ollama` 上，当本次请求的 prompt 前
-缀与上一轮匹配时，该字段会变为非 0。
+是从已缓存的 KV 状态中读取的（上一轮，或多个会话共享的 system/工具前缀）。
+`/api/generate` 在每次 prefill 之前都会重置会话，因此该字段始终为 `0`；在
+`/api/chat/ollama` 上，当本次请求的 prompt 前缀与上一轮或共享的 system/工具前缀
+匹配时，该字段会变为非 0。
 
 ### 生成（流式）
 
@@ -317,8 +326,8 @@ curl -X POST http://localhost:5000/api/chat/ollama \
 ```
 
 `prompt_cache_hit_tokens` 与 `prompt_cache_hit_ratio` 表示有多少 prompt token
-是直接复用了上一轮的 KV 缓存。新会话的第一轮两个值都是 0；在复用上一轮
-prefix 的后续轮次中，它们会接近 `prompt_eval_count` / `1.0`。流式模式下末尾
+复用了已缓存的 KV 状态。新会话的第一轮只计入与先前会话共享、或服务加载时已准备好
+的 system/工具前缀（没有共享前缀时为 0）；在复用上一轮 prefix 的后续轮次中，它们会接近 `prompt_eval_count` / `1.0`。流式模式下末尾
 chunk 同样携带这些字段。
 
 ### 聊天（流式）
@@ -371,7 +380,7 @@ curl -X POST http://localhost:5000/api/chat/ollama \
 
 ### 聊天 + 思维链 / 推理模式
 
-支持思维链的架构（Qwen 3.5/3.6/3.8-family、Gemma 4、GPT OSS、Nemotron-H）可接受 `"think": true`，并将思考过程与可见回答分开返回：
+支持思维链的架构（例如 Qwen 3、包括 Qwen 3.8 Flash Next 在内的 Qwen 3.5 / 3.6 / 3.8 系列、Gemma 4、GPT OSS、Nemotron-H、Muse-Glimmer、DeepSeek V4 / V4.1 与 GLM 5.x）可接受 `"think": true`，并将思考过程与可见回答分开返回：
 
 ```bash
 curl -X POST http://localhost:5000/api/chat/ollama \
@@ -449,6 +458,8 @@ curl -X POST http://localhost:5000/api/chat/ollama \
 ```
 
 继续会话时，把 assistant 的 tool call 与一条 `role: "tool"` 的消息（包含函数返回结果）追加到 messages，再次请求 `/api/chat/ollama` 即可。
+
+只有 `required` 中列出的参数才会以必填形式声明给模型。没有发送 `required` 列表的工具不会把任何参数声明为必填（以 JSON schema 渲染的模板写为 `"required": []`），其所有参数都保持可选。
 
 ### 聊天 + Agent Skills
 
@@ -607,7 +618,7 @@ curl -X POST http://localhost:5000/v1/chat/completions \
 
 ### Chat Completions + 结构化输出（`json_schema`）
 
-TensorSharp.Server.Host 接收 OpenAI Chat Completions 的 `response_format` 形式，会向 prompt 中注入严格 JSON 指令，并在返回前对最终输出进行校验。
+TensorSharp.Server.Host 接收 OpenAI Chat Completions 的 `response_format` 形式，会向 prompt 中注入严格 JSON 指令，在解码时用依据 schema 构建的 JSON 语法约束输出（默认开启；见 Python 示例之后的注意事项），并在返回前对最终输出进行校验。
 
 ```bash
 curl -X POST http://localhost:5000/v1/chat/completions \
@@ -793,6 +804,160 @@ print(response.choices[0].message.content)
 提示词预算、披露循环与安全模型等设计说明见
 [Agent Skills in TensorSharp](../docs/agent_skills.md)（英文）。
 
+### Responses API（`/v1/responses`）
+
+`POST /v1/responses` 接受 OpenAI Responses 形式：`input`（字符串或输入项数组），以及可选的
+`instructions`、`max_output_tokens`、`stream`、`store`、`reasoning`（任意对象即开启思维链；
+`reasoning.effort` 作为推理强度读取）、`tools`，并以 `text.format` 代替 `response_format`。
+采样字段与 Chat Completions 的顶层字段相同，`skills`、`skills_discovery` 与 `multi_agent`
+字段在这里同样可用。
+
+```bash
+curl -X POST http://localhost:5000/v1/responses \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen3.5-9B-Q8_0.gguf",
+    "instructions": "You are a helpful assistant.",
+    "input": "What is 2+3?",
+    "max_output_tokens": 50
+  }'
+```
+
+响应（节选）：
+
+```json
+{
+  "id": "resp_...",
+  "object": "response",
+  "status": "completed",
+  "model": "Qwen3.5-9B-Q8_0.gguf",
+  "output": [{
+    "id": "msg_...",
+    "type": "message",
+    "status": "completed",
+    "role": "assistant",
+    "content": [{"type": "output_text", "text": "2 + 3 = 5.", "annotations": []}]
+  }],
+  "store": true,
+  "usage": {
+    "input_tokens": 20,
+    "output_tokens": 8,
+    "total_tokens": 28,
+    "input_tokens_details": {"cached_tokens": 0},
+    "output_tokens_details": {"reasoning_tokens": 0}
+  }
+}
+```
+
+因 token 预算用尽而被截断的回复带有 `status: "incomplete"` 与
+`incomplete_details: {"reason": "max_output_tokens"}`。设置 `"stream": true` 时，服务端发送
+带类型的 SSE 事件（`response.created`、`response.output_item.added`、
+`response.output_text.delta`……`response.completed`，失败时为 `response.failed`）。
+
+除非请求发送 `"store": false`，完成的响应都会被保存，可通过 `GET /v1/responses/{id}` 再次
+获取（响应已不在存储中时返回 404）。存储默认在内存中，受 `TS_RESPONSES_STORE_TTL_MINUTES`（默认 60）与
+`TS_RESPONSES_STORE_MAX_ENTRIES`（默认 1000）限制；服务启动时传入 `--redis-url` 或设置
+`TS_RESPONSES_STORE_REDIS_URL` 则改存 Redis。每个请求都是自包含的：`previous_response_id`
+会以 HTTP 400 拒绝，请在 `input` 中带上之前的轮次。`text.format` 不能与 `reasoning` 或
+`tools` 同时使用（HTTP 400）。
+
+### 子智能体（`multi_agent`）
+
+对能渲染工具声明且有工具解析器的模型族（除 Mistral 3、Hunyuan Dense 与 DiffusionGemma 之外的
+所有聊天模型族），`/v1/chat/completions`、`/v1/responses`、`/api/chat/ollama` 与 Web UI 的
+`/api/chat` 请求都会获得五个协调工具 —— `spawn_agent`、`wait_agent`、`send_input`、
+`close_agent` 与 `list_agents` —— 无论是否启用了技能或 `--code-exec`。是否委派由模型决定。
+与技能工具一样，这些调用在服务端内部执行，因此客户端拿到的仍是一条普通回复；用量统计包含
+子智能体的 token。
+
+每个子智能体都用同一个已加载模型运行，并拥有自己的对话。它从父级的 system/developer 指令与
+分配给它的任务开始，拿不到父级的对话记录；KV 状态是复制而非共享的（父级的共享前缀会被做成
+检查点，供兄弟子智能体恢复）。`explorer` 与 `reviewer` 子智能体只读；`worker` 同样只读，
+除非服务启动时传入 `--agents-allow-worker-tools`。调用者定义的工具绝不会传给子智能体。
+每个子智能体拥有独立工作区，只复制 `input_files` 明确指定的文件；相互独立的子智能体工具可以并行运行。
+`depends_on` 指定兄弟任务依赖，只有前置任务全部成功才开始执行。修改结果单独导出，由父智能体审查并整合。
+内置子智能体目前使用文件读写工具，命令由父智能体执行，因为现有沙箱不能保证子进程对其他工作区的读取隔离。
+完整字段与限制见[任务依赖和权限说明](../docs/multi_agent.md)。
+
+发送 `"multi_agent": false` 可让单个请求保持单智能体：
+
+```bash
+curl -X POST http://localhost:5000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen3.5-9B-Q8_0.gguf",
+    "messages": [{"role": "user", "content": "用五个要点总结这些发布说明。"}],
+    "multi_agent": false,
+    "max_tokens": 400
+  }'
+```
+
+`true`、省略该字段或非布尔值都遵循服务端策略。请求不能在以 `--no-multi-agent`（或
+`TS_NO_MULTI_AGENT`）启动的服务上开启委派，也不能提高限额或开启 worker 工具。带
+`json_object` / `json_schema` 类型 `response_format`（或 `text.format`）的请求，以及带
+`"tool_choice": "none"` 的
+`/v1/chat/completions` 请求，不会获得协调工具。服务端限额为
+`--agents-max-concurrent`（3）、`--agents-max-count`（8）、`--agents-max-depth`（2）、
+`--agents-max-rounds`（8）、`--agents-max-generations`（48）、`--agents-timeout`（180 秒）
+与 `--agents-max-result-chars`（8000）。在 Web UI 流中，`wait_agent` 的进度帧会携带所有
+子智能体的快照（见 [Web UI SSE](#3-web-ui-sseapichat)）。目前没有发布任何延迟、质量或委派率
+测量数据；设计与验证工具见 [Multiple agents](../docs/multi_agent.md)（英文）。
+
+### Jev 类型化判定（`/v1/systemone`）
+
+当承载模型是 DiffusionGemma 时，`POST /v1/systemone` 针对一个 `state` 回答类型化问题 ——
+`noul`（为真的概率）、`choice` 与 `score` —— 答案取自一步去噪的标签 logits，而不是生成的文本。
+`state` 可以是字符串、JSON 对象或数组；服务端加载了视觉塔时，`images` 还可附带最多 8 张内联
+图像（base64 或 `data:` URL）。`jev-latest` 与 `jev-preview` 是已加载模型的别名。下面的预设会
+下载 Q4_K_M 模型与视觉分片，并在 `ggml_cuda` 上绑定 `127.0.0.1:5000`；其他硬件请覆盖
+`--backend`：
+
+```bash
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --config config/jev-diffusiongemma-q4.json
+```
+
+```bash
+curl http://127.0.0.1:5000/v1/systemone \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model": "jev-latest",
+    "state": "Our production dashboard is down. Every customer gets a 503 error and nobody can sign in.",
+    "questions": {
+      "department": {"type": "choice", "instructions": "Which team should handle this ticket?",
+                     "criteria": {"billing": "Payment, invoice or subscription questions",
+                                  "technical": "Bugs, outages and integration failures",
+                                  "sales": "Pricing and purchasing questions"}},
+      "urgent": {"type": "noul", "instructions": "Does this describe an active production outage?"},
+      "severity": {"type": "score", "instructions": "How severe is the incident?",
+                   "criteria": ["No impact", "Minor inconvenience", "Service unusable"]}
+    },
+    "samples": 1,
+    "seed": 42
+  }'
+```
+
+响应结构：
+
+```text
+{"model": "diffusiongemma-26B-A4B-it-Q4_K_M.gguf",
+ "answers": {
+   "department": {"type": "choice", "choice": ..., "probabilities": {"billing": ..., "technical": ..., "sales": ...}, "confidence": ...},
+   "urgent": {"type": "noul", "noul": ...},
+   "severity": {"type": "score", "score": ..., "legend": {"0": "No impact", "1": "Minor inconvenience", "2": "Service unusable"}, "probabilities": {"0": ..., "1": ..., "2": ...}, "confidence": ...}},
+ "usage": {"input_tokens": ..., "output_tokens": ...},
+ "diagnostics": {"engine": "tensorsharp", "steps": 1, "images": 0, "seed": 42, ...}}
+```
+
+其余请求字段有 `instructions`、`samples`（1–32，或默认的 `"auto"`）、`auto_max`、
+`auto_threshold`、`chunk_rows` 与 `chunk_prompt`；`steps` 必须为 1，`think` 必须为 0。
+每个请求最多 64 个问题，每个问题 2 到 26 个选项。错误使用 `{"error": {"message", "type"}}`：
+内容类型不是 `application/json` 时返回 415，JSON 格式错误返回 400，超过请求体上限（8 MiB，
+`TS_JEV_MAX_BODY_MB` 可设为 1–64）返回 413，未通过校验返回 422，`model` 未知返回 404，
+未加载 DiffusionGemma 模型（或带图像时未加载视觉塔）返回 503；已接纳的请求（含正在运行的
+那一个）达到 `TS_JEV_MAX_PENDING`（默认 32）时返回 529 并带 `Retry-After: 1`，请求逐个执行。
+图像字节按上传限额存储，因此也可能返回 413 或 507。概率语义、图像输入、`TS_JEV_MAX_CANVAS`
+分块与验证见 [Jev 指南](../docs/models/jev_zh-cn.md)。
+
 ### 工具型接口
 
 ```bash
@@ -807,7 +972,7 @@ curl http://localhost:5000/api/version
 curl http://localhost:5000/api/models
 ```
 
-`/api/models` 返回唯一承载的 GGUF（如有投影器一并返回），加载后的后端名、可用后端列表、解析出的架构以及配置好的默认 `max_tokens`。当承载模型会生成视频时，它还会返回一个 `video` 对象 —— `family`（`"minimax-h3"`、`"wan"`）、`supportsAudio`、`supportsImageConditioning`、`supportsEndImageConditioning`、`supportsReferenceConditioning`、`maxReferenceImages` —— 其他模型下该字段为 `null`。客户端正是靠这一块判断该不该提供首帧、尾帧或最多 N 个参考，而不必去匹配架构字符串：同样三张图片，在 MiniMax-H3 的 Ref2VA 检查点上是三个参考，在 FL2VA 上则是一个非法请求。`/api/tags`、`/v1/models`、`/api/show` 中的模型条目始终汇报通过 `--model` 实际启动的文件。如果某个 CUDA 后端没有出现在 `supportedBackends` 中，说明服务启动时未检测到可用的 NVIDIA 驱动/设备或 GGML CUDA 初始化路径；Direct `cuda` 后端在实际推理时仍需要能找到 cuBLAS。如果 `ggml_vulkan` 缺失，说明原生 GGML 桥接库未启用 Vulkan 构建，或未找到支持 Vulkan 1.3 的设备/驱动。如果 `mlx` 缺失，说明主机未检测到可用的 Apple Silicon MLX 运行时。
+`/api/models` 返回唯一承载的 GGUF（如有投影器一并返回），加载后的后端名、可用后端列表、解析出的架构、实际生效的上下文窗口（`contextTokens`，模型文件自身的窗口见 `modelContextTokens`）、是否已加载视觉编码器（`visionReady`）、配置好的默认 `max_tokens`，以及[技能](#技能apiskills)一节介绍的 `skills` 块。当承载模型会生成视频时，它还会返回一个 `video` 对象 —— `family`（`"minimax-h3"`、`"wan"`）、`supportsAudio`、`supportsImageConditioning`、`supportsEndImageConditioning`、`supportsReferenceConditioning`、`maxReferenceImages` —— 其他模型下该字段为 `null`。客户端正是靠这一块判断该不该提供首帧、尾帧或最多 N 个参考，而不必去匹配架构字符串：同样三张图片，在 MiniMax-H3 的 Ref2VA 检查点上是三个参考，在 FL2VA 上则是一个非法请求。`/api/tags`、`/v1/models`、`/api/show` 中的模型条目始终汇报通过 `--model` 实际启动的文件。如果某个 CUDA 后端没有出现在 `supportedBackends` 中，说明服务启动时未检测到可用的 NVIDIA 驱动/设备或 GGML CUDA 初始化路径；Direct `cuda` 后端在实际推理时仍需要能找到 cuBLAS。如果 `ggml_vulkan` 缺失，说明原生 GGML 桥接库未启用 Vulkan 构建，或未找到支持 Vulkan 1.3 的设备/驱动。如果 `mlx` 缺失，说明主机未检测到可用的 Apple Silicon MLX 运行时。
 
 ---
 
@@ -866,29 +1031,36 @@ curl -N -X POST http://localhost:5000/api/chat \
 | `replace`、`diffusionStep`、`diffusionTotal`、`preview` | 每个 DiffusionGemma 去噪预览与最终替换 | 替换整条 assistant 消息，而不是追加 token |
 | `thinking` | 解析到的思维链片段（仅当模型输出含思维链时） | 流式思维链 |
 | `tool_calls` | 模型输出调用者定义的工具调用 | `{name, arguments}` 数组；内置技能/代码调用改由服务端进程内执行 |
-| `tool_progress`、`tool`、`text`、`seconds`、`detail` | 进程内技能/代码调用正在写出或运行时 | 短暂的实时活动：阶段为 `writing`、`running` 或 `finished`；内置 Web UI 只保留有界的当前尾部，并在 `finished` 时清除 |
-| `skill_step`、`skill`、`detail`、`ok`、`round`、`files` | 每次进程内技能或代码工具调用完成后 | 工具、目标与结果的完成元数据；生成的制品以可选的 `{name, bytes, url}` 条目出现在 `files` 中 |
-| `done`、`tokenCount`、`elapsed`、`tokPerSec`、`aborted`、`error`、`sessionId`、`promptTokens`、`kvReusedTokens`、`kvReusePercent` | 末尾帧 | 终态汇总 |
+| `tool_progress`、`tool`、`text`、`seconds`、`detail`、`agents` | 进程内技能/代码/子智能体调用正在写出或运行时 | 短暂的实时活动：阶段为 `writing`、`running` 或 `finished`；内置 Web UI 只保留有界的当前尾部，并在 `finished` 时清除。`wait_agent` 处于 `running` 时，`agents` 是本请求中所有子智能体的快照（`agent_id`、`parent_id`、`task`、`agent_type`、`status`、`tool`、`tool_status`、`detail`、`result`、`error`），其他情况下为 `null` |
+| `skill_step`、`agent_id`、`skill`、`detail`、`ok`、`round`、`files` | 每次进程内技能、代码或子智能体工具调用完成后 | 工具、目标与结果的完成元数据；`agent_id` 指明发起调用的智能体（主对话为 `/root`）；生成的制品以可选的 `{name, bytes, url}` 条目出现在 `files` 中 |
+| `artifact_verified`、`files` | 路由式交付工作流（例如 PowerPoint 请求）证明其产出时，仅一次 | 通过宿主结构校验的那一个交付物，以单个 `{name, bytes, url}` 条目给出；这类请求的 `skill_step.files` 保持为空，临时文件因此永远不会被提供下载 |
+| `done`、`tokenCount`、`elapsed`、`tokPerSec`、`aborted`、`truncated`、`error`、`sessionId`、`promptTokens`、`kvReusedTokens`、`kvReusePercent` | 末尾帧 | 终态汇总；`truncated` 为 true 表示回答因 max-tokens 预算用尽而中断（用户中止用 `aborted` 表示） |
 
 末尾帧示例：
 
 ```
-data: {"done":true,"tokenCount":187,"elapsed":2.143,"tokPerSec":87.23,"aborted":false,"error":null,"sessionId":"a3b...","promptTokens":512,"kvReusedTokens":420,"kvReusePercent":82.0}
+data: {"done":true,"tokenCount":187,"elapsed":2.143,"tokPerSec":87.23,"aborted":false,"truncated":false,"error":null,"sessionId":"a3b...","promptTokens":512,"kvReusedTokens":420,"kvReusePercent":82.0}
 ```
 
 技能步骤帧示例：
 
 ```
-data: {"skill_step":"skills_read","skill":"pdf","detail":"references/forms.md","ok":true}
+data: {"skill_step":"skills_read","agent_id":"/root","skill":"pdf","detail":"references/forms.md","ok":true}
 ```
 
 代码进度与制品帧示例：
 
 ```
-data: {"tool_progress":"writing","tool":"shell","text":"{\"command\":\"python","seconds":0,"detail":null}
-data: {"tool_progress":"running","tool":"shell","text":"writing report.xlsx\n","seconds":2.1,"detail":"python · 1.8 KB code"}
-data: {"tool_progress":"finished","tool":"shell","text":"","seconds":2.4,"detail":null}
-data: {"skill_step":"shell","skill":null,"detail":null,"ok":true,"round":2,"files":[{"name":"report.xlsx","bytes":18432,"url":"/api/code/artifacts/7f2.../report.xlsx"}]}
+data: {"tool_progress":"writing","tool":"shell","text":"{\"command\":\"python","seconds":0,"detail":null,"agents":null}
+data: {"tool_progress":"running","tool":"shell","text":"writing report.xlsx\n","seconds":2.1,"detail":"python · 1.8 KB code","agents":null}
+data: {"tool_progress":"finished","tool":"shell","text":"","seconds":2.4,"detail":null,"agents":null}
+data: {"skill_step":"shell","agent_id":"/root","skill":null,"detail":null,"ok":true,"round":2,"files":[{"name":"report.xlsx","bytes":18432,"url":"/api/code/artifacts/7f2.../report.xlsx"}]}
+```
+
+`wait_agent` 运行期间的子智能体快照示例：
+
+```
+data: {"tool_progress":"running","tool":"wait_agent","text":"","seconds":3,"detail":null,"agents":[{"agent_id":"/root/api_review","parent_id":"/root","task":"Review the API layer for migration risks...","agent_type":"reviewer","status":"running","tool":"read_file","tool_status":"completed","detail":"src/api.cs","result":null,"error":null}]}
 ```
 
 DiffusionGemma 预览帧示例：
@@ -899,7 +1071,8 @@ data: {"replace":"A refined draft of the whole answer","diffusionStep":12,"diffu
 
 `kvReusedTokens` / `kvReusePercent` 与 Ollama 的 `prompt_cache_hit_*` 以及
 OpenAI 的 `usage.prompt_tokens_details.cached_tokens` 含义一致 —— 都表示有多
-少 prompt token 直接复用了对应会话上一轮的 KV 缓存。
+少 prompt token 复用了已缓存的 KV 状态（对应会话的上一轮，或多个会话共享的
+system/工具前缀）。
 
 ### 文件上传（`/api/upload`）—— 图像、视频、音频、文本、PDF
 
@@ -944,11 +1117,17 @@ curl -N -X POST http://localhost:5000/api/chat \
 
 设置 `TS_PDF_MAX_PAGES` 环境变量可限制读取的 PDF 页数（默认 `0` = 全部页面）。
 
+上传文件存放在二进制文件旁的 `uploads/`（或 `TENSORSHARP_UPLOAD_DIR`）中。`--upload-max-mb`
+限制每个客户端上传文件的大小（默认 500；超出返回 HTTP 413；`POST /api/upload` 的请求体上限跟随该值且不低于
+500 MB，其他路由保持 500 MB 的请求体上限，因此 JSON 中的 base64 附件最多约 375 MB），`--upload-quota-mb` 限制整个目录
+的总量（默认关闭；用尽时返回 HTTP 507），`--upload-ttl-hours` 删除超过该时长的文件（默认关闭）。
+发给聊天端点的 base64 附件与 Jev 图像同样受这些限额约束。
+
 ### 技能（`/api/skills`）
 
 管理 Agent Skills 注册表。同一份数据有两种形态：偏 OpenAI 风格的 `/v1/skills`
 （列表 + 单个技能，只读），以及 Web UI 风格的 `/api/skills`（额外提供加载错误、
-上传与删除）。
+随附文件读取、重新扫描、上传与删除）。
 
 ```bash
 # 服务端已注册的全部技能，外加那些“看起来像技能却加载失败”的目录，
@@ -957,6 +1136,12 @@ curl http://localhost:5000/api/skills
 
 # 单个技能，`instructions` 字段里是 SKILL.md 正文。
 curl http://localhost:5000/api/skills/pdf
+
+# 单个随附文件，以纯文本返回（嵌套路径整体绑定）。
+curl http://localhost:5000/api/skills/pdf/files/references/forms.md
+
+# 无需重启即可重新扫描配置的目录；返回与 /api/skills 相同的结构。
+curl -X POST http://localhost:5000/api/skills/rescan
 
 # OpenAI 风格的等价接口。
 curl http://localhost:5000/v1/skills
@@ -969,6 +1154,9 @@ curl http://localhost:5000/v1/skills/pdf
 {
   "enabled": true,
   "installable": true,
+  "allowScripts": false,
+  "discovery": true,
+  "roots": ["/srv/tensorsharp/skills", "/srv/repo/.agents/skills"],
   "skills": [
     {
       "id": "pdf",
@@ -993,10 +1181,15 @@ curl http://localhost:5000/v1/skills/pdf
 }
 ```
 
-`/v1/skills` 把同样的对象包成 `{"object": "list", "data": [...]}`。`kind` 取值为
+`/v1/skills` 把同样的对象包成 `{"object": "list", "data": [...]}`。`allowScripts` 表示
+`skills_run` 是否可用（`--skills-allow-exec`），`discovery` 是服务端对 `skills_discovery`
+的默认值，`roots` 按优先级列出扫描过的目录：首先是二进制文件旁的 `skills/`——上传的技能
+安装在这里，它总是最先扫描，因此其中的技能会覆盖其他目录中的同名技能；然后是
+`--skills-dir` 的值（或 `TS_SKILLS_DIR`），默认则是从服务端工作目录向上直到 Git 根目录的
+每个已存在的 `.agents/skills`（由近及远）。`kind` 取值为
 `script` / `reference` / `asset` / `manifest` / `other`；`origin` 为 `discovered`
-表示它是扫描配置目录时发现的，为 `installed` 表示它是从这里上传安装的——只有后者
-可以被删除。`warnings` 里是那些“不完全合规但仍然加载成功”的问题（`name` 与目录名
+表示它是扫描配置目录时发现的，为 `installed` 表示它位于二进制文件旁的 `skills/`（从这里
+上传安装或直接放在那里）——只有后者可以被删除。`warnings` 里是那些“不完全合规但仍然加载成功”的问题（`name` 与目录名
 不一致、description 超过 1024 字符上限等）。
 
 安装与删除：
@@ -1027,10 +1220,11 @@ curl -X DELETE http://localhost:5000/api/skills/pdf
 `GET /api/models` 会报告以上功能是否可用：
 
 ```json
-"skills": { "enabled": true, "installable": true, "count": 7 }
+"skills": { "enabled": true, "installable": true, "allowScripts": false, "count": 7 }
 ```
 
-服务端关闭了技能功能时该字段为 `null`，Web UI 据此决定是否显示技能控件。
+服务端关闭了技能功能时该字段为 `null`，Web UI 据此决定是否显示技能控件。只有服务以
+`--skills-allow-exec`（或 `TS_SKILLS_ALLOW_EXEC`）启动时，`allowScripts` 才为 `true`。
 
 ### Qwen-Image-2.1 文生图
 
@@ -1048,15 +1242,18 @@ curl --fail-with-body http://localhost:5000/api/image-generate \
 （`imageGenerate: true`）以及最终的 `done: true` 结果。需要以参考图为条件的编辑时，
 使用下文的图像编辑路由。宽高须同时设置，且都取 32 的倍数。省略尺寸时，生成为原生
 2048×2048，编辑则取与第一张参考图宽高比一致、面积大致相同的尺寸。
-`targetArea: 1048576` 选择约 1K 的输出并自动选择宽高比；显式尺寸优先。编辑时每张参考图
+`targetArea: 1048576` 选择约 1K 的输出并自动选择宽高比；显式尺寸优先。服务启动时同时传入
+`--width` 与 `--height`（32 的倍数）会替换这一默认值：所有未发送 `width`/`height` 的生成与编辑
+请求都改用该尺寸，此时它也优先于 `targetArea`；只传其中一个则不影响图像尺寸。内置 Web UI 不发送
+尺寸，因此这两个参数决定它的输出尺寸（它们同时也设置默认视频尺寸）。编辑时每张参考图
 以约 1 百万像素（若输出面积更小，则以输出面积）作为条件输入。
 
-省略 `steps`/`cfg` 时使用 40 步 Euler 和 CFG 1，遵循已发布 2.1 模型的推荐。CFG 1 每步
+省略 `steps`/`cfg` 时使用 40 步 Euler 和 CFG 1，遵循已发布 2.1 模型的推荐，除非启动时的
+LoRA 插件提供了自己的配方（见下文 [LoRA 插件](#qwen-image-21-lora-插件)）。CFG 1 每步
 只需一次 Transformer 预测；`negativePrompt` 只在显式设置大于 1 的 CFG 时生效，此时还会
 运行一次负向预测。需要更快的草图时，请求 1024×1024，或像官方 ComfyUI 工作流那样显式
 选择 25 步；更少的步数可能改变质量。[模型指南](../docs/models/qwenimage21_zh-cn.md)
 记录了官方调度器设置与来源链接，完整的验证记录见[英文版](../docs/models/qwenimage21.md)。
-Qwen-Image-2.1 不加载 LoRA 适配器。
 
 ### 图像编辑（`/api/image-edit`，Qwen-Image-2.1）
 
@@ -1064,7 +1261,8 @@ Qwen-Image-2.1 不加载 LoRA 适配器。
 图像 + 提示词的轮次走图像编辑端点，而不是 `/api/chat`：
 
 ```bash
-# 一次性编辑（multipart）。steps=0 / cfg=0 表示自动（40 步 / CFG 1）。
+# 一次性编辑（multipart）。steps=0 / cfg=0 表示自动（40 步 / CFG 1，或启动时
+# LoRA 插件的配方）。
 # 重复 image 部分即可传入多张参考图。
 curl -X POST http://localhost:5000/api/image-edit \
   -F "image=@photo.png" \
@@ -1078,7 +1276,7 @@ curl -X POST http://localhost:5000/api/image-edit \
 {"ok": true, "url": "/uploads/edit-<guid>.png", "width": ..., "height": ..., "elapsedSeconds": ...}
 ```
 
-不显式指定 `width` / `height` 时，输出保持第一张参考图的宽高比，面积约为 2048×2048 像素。
+不显式指定 `width` / `height`（且服务端没有 `--width`/`--height` 默认值）时，输出保持第一张参考图的宽高比，面积约为 2048×2048 像素。
 
 也接受 JSON body `{ "imagePaths": ["<file from /api/upload>"], "prompt": "...",
 "steps": 0, "cfg": 0, "seed": 42 }`（`imagePaths` 按参考图顺序列出先前上传文件的服务端文件名；
@@ -1095,6 +1293,29 @@ curl -N -X POST http://localhost:5000/api/image-edit/stream \
 （`image` 预览快照只在节流后的步骤上出现，每次编辑最多 8 张），最后是一条
 `{"done": true, "url": "/uploads/edit-<guid>.png", "width": ..., "height": ..., "elapsedSeconds": ...}`。
 对非 Qwen-Image-2.1 模型发起的请求返回 400；并发编辑由进程级锁串行执行。
+
+### Qwen-Image-2.1 LoRA 插件
+
+LoRA 插件在服务端启动时选定，使用与 CLI 相同的 `--lora`、`--lora-scale` 与 `--lora-config`
+参数。这组插件作用于每个生成与编辑请求；尚未实现按请求选择 LoRA。
+
+```bash
+# 步数蒸馏插件：它的配方（8 步、CFG 1）成为每个图像请求的默认值。
+# 权重在首次使用时下载并校验哈希。
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --config config/qwen-image-2.1.json \
+  --lora config/lora/qwen-image-2.1-pruna-8step.json
+
+# 省略（或为 0）的 steps / cfg 使用插件的配方
+curl --fail-with-body http://localhost:5000/api/image-generate \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"A cat beside a blue vase, soft daylight","width":1024,"height":1024,"seed":42}'
+```
+
+请求中的 `steps` 与 `cfg` 仍会覆盖配方。带调度的插件只能以它定义的步数运行，因此其他
+`steps` 值会被拒绝，并列出支持的步数（Pruna 8 步插件只支持 8）。风格与编辑插件不带配方，
+省略时仍使用模型默认值（40 步、CFG 1）。重复 `--lora` 可叠加插件，`--lora-scale` 设置强度。
+服务端启动时会记录 `LoRA plug-ins (applied to Qwen-Image-2.1 models only): ...`。参数、
+随附插件与插件配置格式见 [USAGE_zh-cn.md](../USAGE_zh-cn.md#qwen-image-21-lora-插件)。
 
 ### 视频生成（`/api/video-generate`、`/v1/videos/generations`）
 
@@ -1116,7 +1337,7 @@ MiniMax-H3 把视频和 32 kHz 立体声音轨当作同一个打包潜变量一�
 `merges.txt` 放在它旁边：
 
 ```bash
-TensorSharp.Server.Host --model minimax_h3_fl2va_pruned-Q4_K.gguf --backend ggml_cuda \
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model minimax_h3_fl2va_pruned-Q4_K.gguf --backend ggml_cuda \
   --video-width 640 --video-height 384 --video-steps 20 --video-frames 22
 ```
 
@@ -1191,7 +1412,7 @@ Wan 2.2 TI2V-5B 或 Wan 2.2 A14B）时，输入提示词即可生成 H.264 MP4�
 24 fps 生成 121 帧，播放时长约为五秒：
 
 ```bash
-TensorSharp.Server.Host --model Wan2.2-TI2V-5B-Q8_0.gguf --backend ggml_cuda \
+dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model Wan2.2-TI2V-5B-Q8_0.gguf --backend ggml_cuda \
   --video-frames 121 --fps 24
 ```
 
@@ -1278,12 +1499,13 @@ camelCase 和 snake_case 两种拼写（两者同时出现时以 camelCase 为�
 
 | 参数               | 类型    | 默认值  | 描述                                   |
 | ------------------ | ------- | ------- | -------------------------------------- |
-| `num_predict`      | int     | 200     | 生成的最大 token 数                    |
+| `num_predict`      | int     | `--max-tokens`（20000） | 生成的最大 token 数 |
 | `temperature`      | float   | 0.8     | 采样温度（0 = 贪心）                   |
 | `top_k`            | int     | 40      | Top-K 过滤（0 = 关闭）                 |
 | `top_p`            | float   | 0.9     | 核采样阈值                             |
 | `min_p`            | float   | 0       | 最小概率过滤                           |
 | `repeat_penalty`   | float   | 1.1     | 重复惩罚（1.0 = 不惩罚）               |
+| `repeat_last_n`    | int     | 64      | 重复、出现与频率惩罚回看的最近生成 token 数（0 = 关闭，-1 = 全部历史） |
 | `presence_penalty` | float   | 0       | 出现惩罚                               |
 | `frequency_penalty`| float   | 0       | 频率惩罚                               |
 | `seed`             | int     | -1      | 随机种子（-1 = 不指定）                |
@@ -1291,8 +1513,9 @@ camelCase 和 snake_case 两种拼写（两者同时出现时以 camelCase 为�
 
 这些默认值是服务端配置的采样默认值（与 Ollama 兼容）。可在启动时通过对应的服
 务器标志（`--temperature`、`--top-k`、`--top-p`、`--min-p`、`--repeat-penalty`、
-`--presence-penalty`、`--frequency-penalty`、`--seed`）或 `TENSORSHARP_*` 环境
-变量修改。默认情况下，运维方以这种方式配置过的参数优先于请求体；若希望请求中
+`--repeat-last-n`、`--presence-penalty`、`--frequency-penalty`、`--seed`）或
+`TENSORSHARP_*` 环境变量（例如 `TENSORSHARP_REPEAT_LAST_N`）修改。`num_predict`
+缺省时取 `--max-tokens`；只有设置了 `--max-tokens` 或 `MAX_TOKENS` 时，更大的值才会被钳制。默认情况下，运维方以这种方式配置过的参数优先于请求体；若希望请求中
 的值优先，请以 `--sampling-precedence request` 启动服务。运维方未配置过的参数
 始终取请求中的值。
 
@@ -1300,19 +1523,27 @@ camelCase 和 snake_case 两种拼写（两者同时出现时以 camelCase 为�
 
 | 参数                | 类型        | 默认值  | 描述                                |
 | ------------------- | ----------- | ------- | ----------------------------------- |
-| `max_tokens`        | int         | `--max-tokens`（20000） | 生成的最大 token 数；同时接受 `max_completion_tokens` |
+| `max_tokens`        | int         | `--max-tokens`（20000） | 生成的最大 token 数；同时接受 `max_completion_tokens`；只有设置了 `--max-tokens` 或 `MAX_TOKENS` 时才会被其钳制 |
 | `temperature`       | float       | 0.8     | 采样温度                            |
 | `top_p`             | float       | 0.9     | 核采样阈值                          |
+| `top_k`             | int         | 40      | 非标准：Top-K 过滤（0 = 关闭）      |
+| `min_p`             | float       | 0       | 非标准：最小概率过滤                |
+| `repeat_penalty`    | float       | 1.1     | 非标准：重复惩罚；同时接受 `repetition_penalty` |
+| `repeat_last_n`     | int         | 64      | 非标准：重复、出现与频率惩罚的窗口（token 数；0 = 关闭，-1 = 全部历史） |
 | `presence_penalty`  | float       | 0       | 出现惩罚                            |
 | `frequency_penalty` | float       | 0       | 频率惩罚                            |
 | `seed`              | int         | -1      | 随机种子                            |
 | `stop`              | string/array| null    | 停止序列                            |
 | `response_format`   | object      | null    | `text`、`json_object` 或 `json_schema` |
 | `think`             | bool        | false   | 非标准扩展：启用思维链 / 推理解析（以 `reasoning_content` 返回 / 流式输出） |
+| `reasoning_effort`  | string      | null    | `low`、`medium` 或 `high`；只有 GPT-OSS（Harmony）会渲染，其他模型族忽略；其他取值返回 HTTP 400。在 GPT-OSS 上，`"think": false` 且未指定强度时按 `low` 处理 |
+| `tool_choice`       | string/object | `auto` | Chat Completions：`auto`、`none`（不提供任何工具，包括内置技能、代码与子智能体工具）、`required`，或 `{"type": "function", "function": {"name": ...}}`；后两者须指向客户端声明的 `tools`（否则返回 HTTP 400），且只有 DeepSeek V4.1 会用工具调用语法强制执行，其他模型族接受该值但仍可能不调用工具直接作答 |
+| `parallel_tool_calls` | bool      | null    | Chat Completions：必须是布尔值（否则返回 HTTP 400）；只有 DeepSeek V4.1 会遵循 `false`（其工具调用语法只允许一次调用），其他模型族接受但忽略 |
 
-`top_k`、`min_p` 与 `repetition_penalty` 在 OpenAI 接口上**不会被解析** ——
-这些参数使用服务端配置的默认值。如果请求需要按调用设置它们，请改用 Ollama 或
-Web UI 端点。
+`top_k`、`min_p`、`repeat_penalty` / `repetition_penalty` 与 `repeat_last_n` 不属于 OpenAI
+规范；服务端按 llama.cpp 与 vLLM 的做法从顶层读取它们，因此 OpenAI 形态的客户端可以通过
+`extra_body` 传入。`/v1/responses` 读取相同的采样字段，只是用 `max_output_tokens` 代替
+`max_tokens`。上文的 `--sampling-precedence` 规则对所有接口都适用。
 
 ---
 
@@ -1438,8 +1669,8 @@ print()
 
 注意事项：
 
-- `response_format`（`json_object` 或 `json_schema`）不能与 `tools` 同时使用（HTTP `400`）。只有协议声明了推理结束位置、使 JSON 语法能在该处启用的家族才允许与 `"think": true` 同时使用：GPT-OSS（`final<|message|>`）、DeepSeek V4.1 与 Qwen 3.8 Flash Next（`</think>`）、Gemma 4（`<channel|>`）、Nemotron-H（`</think>`）和 Muse-Glimmer（`to=user<|message|>`）。其他家族对该组合返回 HTTP `400`。
-- `json_object` / `json_schema` 请求会把**首个采样 token** 约束为以 `{` 开头的候选（效果等同于 llama.cpp 的 JSON grammar），使爱闲聊的模型无法在 JSON 对象前输出散文，流式首 token 时延（TTFT）因此反映 prefill 延迟而不是被过滤掉的前导文本。后续 token 正常采样。设置 `TS_JSON_FORCE_OPEN=0` 可关闭。
+- `response_format`（`json_object` 或 `json_schema`）不能与 `tools` 同时使用（HTTP `400`）。只有协议声明了推理结束位置、使 JSON 语法能在该处启用的家族才允许与 `"think": true` 同时使用：GPT-OSS（`final<|message|>`）、DeepSeek V4.1、Qwen 3.8 Flash Next 与 GLM-5.3-Flash（`</think>`）、Gemma 4（`<channel|>`）、Nemotron-H（`</think>`）和 Muse-Glimmer（`to=user<|message|>`）。其他家族对该组合返回 HTTP `400`；设置 `TS_JSON_GRAMMAR=0` 时同样返回 `400`，因为它去掉了该组合所需的延迟语法。
+- `/v1/chat/completions` 上的 `json_object` / `json_schema` 请求在**JSON 语法**约束下解码（语法依据分词器构建，`json_schema` 还依据 schema），会破坏对象的 token 无法被采样，爱闲聊的模型也无法在对象前输出散文。对上述家族，`think: true` 请求要等推理块结束后才启用语法。设置 `TS_JSON_GRAMMAR=0`，或无法为某个 schema 构建语法时（仅限未开启 `think` 的请求；上述家族的 `think: true` 请求会直接失败），服务端回退到旧约束：只把**首个采样 token** 限制为以 `{` 开头的候选；`TS_JSON_FORCE_OPEN=0` 连这一回退也关闭。`/v1/responses` 的 `text.format` 请求只依靠 prompt 指令与校验。
 - 流式 `json_object` 请求会逐 token 流式返回 JSON 对象（自动剥离 Markdown 代码围栏和多余标签），因此首 token 时延（TTFT）反映的是 prefill 延迟。流式 `json_schema`（strict）请求仍会先在服务端缓存并按 schema 归一化，再以单个 chunk 发出。设置 `TS_STRUCTURED_STREAM_BUFFER=1` 可对两者强制使用旧的“全部缓存”行为。非流式请求始终归一化。
 - 非法 schema 返回 HTTP `400`；非流式 / `json_schema` 输出未能通过校验则返回 HTTP `422`（已经开始的 `json_object` 流无法再更改状态码）。
 
@@ -1447,7 +1678,7 @@ print()
 
 ## 6. 运行示例请求
 
-`test_requests.jsonl` 文件包含针对所有接口的示例请求。可通过下面的脚本批量运行：
+[`TensorSharp.Server/test_requests.jsonl`](../TensorSharp.Server/test_requests.jsonl) 包含针对 `/api/tags`、`/api/version`、`/api/generate`、`/api/chat/ollama` 与 `/v1/chat/completions` 的示例请求，其中所有 POST 请求都使用 `Qwen3.5-9B-Q8_0.gguf`，因此服务需承载该文件。可在仓库根目录通过下面的脚本批量运行：
 
 ```bash
 while IFS= read -r line; do
@@ -1464,5 +1695,5 @@ while IFS= read -r line; do
       -d "$BODY" | head -c 500
   fi
   echo -e "\n"
-done < test_requests.jsonl
+done < TensorSharp.Server/test_requests.jsonl
 ```

@@ -22,6 +22,13 @@ namespace TensorSharp.Models.MiniMaxH3
             // all - so they have to be recognised by their tensors. Without this detector,
             // architecture resolution fails closed.
             DetectFromTensors = MiniMaxH3Model.LooksLikeMiniMaxH3,
+
+            // The factory never passes the degree or group on, so without this
+            // declaration --tp N was dropped in silence and a distributed group
+            // was left waiting on collectives this rank never issues.
+            MultiGpu = MultiGpuMode.SingleDevice,
+            MultiGpuLimitation =
+                "minimax-h3 has no tensor-parallel or layer-split path; it runs on one GPU and extra GPUs stay idle.",
         };
     }
 }

@@ -86,6 +86,35 @@ namespace TensorSharp.AgentHost.Skills
         /// <summary>What runs each script: a confined child process, or the host's own runtime.</summary>
         public IShellBackend Backend => _backend;
 
+        /// <inheritdoc/>
+        public bool CanForkForWorkspace => CanRun
+            && _options.Sandbox == SkillSandboxMode.Required && Confines(_sandbox)
+            && _sandbox?.Capabilities.ConfinesWorkspaceReads == true;
+
+        /// <inheritdoc/>
+        public ISkillScriptRunner? ForkForWorkspace(SessionWorkspace workspace, ICodeRunner? packageInstaller)
+        {
+            if (!CanForkForWorkspace) return null;
+            return new SkillScriptRunner(new SkillScriptRunnerOptions
+            {
+                Sandbox = _options.Sandbox,
+                Backend = _backend,
+                AllowNetwork = _options.AllowNetwork,
+                Timeout = _options.Timeout,
+                MaxOutputBytes = _options.MaxOutputBytes,
+                ScratchDirectory = _options.ScratchDirectory,
+                DeleteScratchDirectory = _options.DeleteScratchDirectory,
+                ReadablePaths = Array.Empty<string>(),
+                Workspace = workspace,
+                CaptureProducedFiles = _options.CaptureProducedFiles,
+                PackageInstaller = _options.PackageInstaller != null ? packageInstaller : null,
+                MaxAutoInstallAttempts = _options.MaxAutoInstallAttempts,
+                Interpreters = new Dictionary<string, string>(_options.Interpreters, StringComparer.OrdinalIgnoreCase),
+                PassThroughEnvironmentVariables = _options.PassThroughEnvironmentVariables.ToArray(),
+                EnvironmentVariables = new Dictionary<string, string>(_options.EnvironmentVariables, StringComparer.Ordinal),
+            }, _logger);
+        }
+
         /// <summary>
         /// True when this runner will actually run anything. False when the host
         /// demanded a sandbox and none is available — in which case
@@ -1752,7 +1781,9 @@ namespace TensorSharp.AgentHost.Skills
             [".js"] = "node",
             [".mjs"] = "node",
             // Bash accepts POSIX scripts and scripts using arrays/pipefail shipped by
-            // many skills. /bin/sh is dash on Linux and cannot run those scripts.
+            // many skills. /bin/sh is not bash everywhere — it is dash on Debian and
+            // Ubuntu and busybox ash on Alpine — and a script that relies on bash
+            // features fails under those shells.
             [".sh"] = "bash",
             [".bash"] = "bash",
         };

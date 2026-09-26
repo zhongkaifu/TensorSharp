@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Benchmarks & Testing — TensorSharp Wiki</title>
-  <meta name="description" content="TensorSharp benchmark results vs llama.cpp and stable-diffusion.cpp, the MiniMax-H3 and Wan video speed levers, and how the test harness works.">
+  <meta name="description" content="TensorSharp benchmark results vs llama.cpp and stable-diffusion.cpp, the Qwen-Image-2.1 LoRA and prefix-cache results, the MiniMax-H3 and Wan video speed levers, and how the test harness works.">
   <link rel="icon" href="assets/logo.svg" type="image/svg+xml">
   <link rel="stylesheet" href="assets/style.css">
   <script>try{var t=localStorage.getItem('ts-theme')||(matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light');document.documentElement.classList.toggle('dark',t==='dark');}catch(e){}</script>
@@ -16,7 +16,7 @@
 <main class="content" id="content">
   <div class="breadcrumb"><a href="index.html">Home</a> › Benchmarks &amp; Testing</div>
   <h1>Benchmarks &amp; Testing</h1>
-  <p class="lede">How TensorSharp measures up against other inference engines on the same models and hardware — <code>llama.cpp</code> on text, <code>stable-diffusion.cpp</code> on video generation — plus the test harness that guards correctness.</p>
+  <p class="lede">How TensorSharp measures up against other inference engines on the same models and hardware — <code>llama.cpp</code> on text, <code>stable-diffusion.cpp</code> on image and video generation — plus the test harness that guards correctness.</p>
 
   <h2 id="head-to-head">Head-to-head: TensorSharp vs llama.cpp</h2>
   <p><strong>TensorSharp’s .NET runtime with native GGML execution compared with <code>llama.cpp</code></strong> — same GGUF files, same <strong>NVIDIA RTX 3080 Laptop GPU (16 GB)</strong>, one uniform OpenAI <code>/v1/chat/completions</code> surface, and <strong>both engines measured on their GGML CUDA and GGML Vulkan builds</strong> across short-prompt, long-context, and multi-turn chat scenarios. The figures below are the current checked-in run of the <code>benchmarks/engine_comparison</code> harness (<code>docs/engine_comparison_report.md</code>), reproducible on your own hardware.</p>
@@ -46,7 +46,7 @@
   </div>
   <p>The headline wins come from TensorSharp's architecture-specific fast paths: fused whole-model prefill/verify graphs with fused FFN / attention kernels, fused whole-model decode, and the vLLM-style <a href="advanced.html#continuous-batching">paged KV cache with cross-request prefix sharing</a>. Even at extreme quantization the engine holds its own: on 2-bit IQ2_XXS weights the dense Qwen 3.6 27B decodes 1.07× (CUDA) / 1.02× (Vulkan) faster and the 35B-A3B MoE out-prefills llama.cpp by 1.28× — a result specific to these models and native GGML backends. The remaining sub-1.0× cells — chiefly Qwen 3.6 35B-A3B decode on Vulkan (0.87×), Qwen 3.6 27B dense prefill (0.96× CUDA / 0.85× Vulkan), and E4B long-prompt prefill on Vulkan (0.71×) — are active optimization targets rather than finished results.</p>
 
-  <p><strong>Beyond the text scenarios</strong> — the harness also supports tool-calling, structured-output (JSON), image / audio / video, MTP on/off, and parallel-request-scaling scenarios against the same servers. Qwen-Image-2.1 has its own TensorSharp vs <code>stable-diffusion.cpp</code> runner, <code>eng/validation/qwen-image21-bench.py</code>. Enable any of these cells with the harness flags documented in <code>benchmarks/engine_comparison</code>.</p>
+  <p><strong>Beyond the text scenarios</strong> — the harness also supports tool-calling, structured-output (JSON), image / audio / video, MTP on/off, and parallel-request-scaling scenarios against the same servers. Qwen-Image-2.1 has its own TensorSharp vs <code>stable-diffusion.cpp</code> runner, <code>eng/validation/qwen-image21-bench.py</code> (<a href="#qwen-image21">results below</a>). Enable any of these cells with the harness flags documented in <code>benchmarks/engine_comparison</code>.</p>
 
   <div class="callout note"><div class="ic">⚖️</div><p>An honest comparison shows the gaps as well as the wins. These figures are one machine (RTX 3080 Laptop, single-stream); your hardware, model, and quantization will shift them. Run the built-in benchmark and the engine-comparison harness on your own box for the numbers that matter to you.</p></div>
 
@@ -67,8 +67,21 @@
   <p>Ratios are TensorSharp relative to llama.cpp; <strong>&gt; 1.0× means TensorSharp is faster</strong>. The run found four graph-construction gaps on TensorSharp's side — a residual add written in the order that declines ggml's norm+add fusion, a fused QKV split with copies instead of strided views, and a saturated sliding window read rotated and rebuilt every token — worth up to <strong>+12.6%</strong> on a single cell (gemma-4-E4B tg128@4096) with no cell regressing. It also records two changes that did <em>not</em> pay, so they are not retried. Full method, per-cell numbers, and the correctness bug found on the way: <a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/perf/metal-vs-llama-cpp.md" target="_blank" rel="noopener"><code>docs/perf/metal-vs-llama-cpp.md</code></a>.</p>
   <div class="callout note"><div class="ic">🔬</div><p>The two engines carry different <code>ggml</code> checkouts here (TensorSharp's is ~2 weeks newer). That confound favours TensorSharp, which is why the conclusions in that note are about TensorSharp's own graph construction rather than about <code>ggml</code>.</p></div>
 
+  <h3>Bonsai2 against the publisher's llama.cpp</h3>
+  <p>Bonsai2's PRISM-rotated <code>qwen35</code> checkpoints (<code>PQ2_0</code> and <code>PTQ1_0</code>, transcoded to <code>Q2_0</code> at load) are measured against the publisher's own llama.cpp checkout, the baseline its model card uses for these formats. On the Apple M5 Pro (48 GiB) validation host with <code>ggml_metal</code>, in tokens/s, TensorSharp / publisher llama.cpp:</p>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Format</th><th>Prefill 512</th><th>Decode 64</th><th>HTTP, concurrency 4</th></tr></thead>
+    <tbody>
+      <tr><td><code>PQ2_0</code></td><td>364.05 / 384.44</td><td>25.50 / 26.96</td><td>28.40 / 32.57</td></tr>
+      <tr><td><code>PTQ1_0</code></td><td>364.49 / 357.67</td><td>25.53 / 26.31</td><td>28.17 / 16.15</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>Model-only rates are means of three warmed runs at context depth zero; HTTP rates are medians of three runs with 64 generated tokens per request. The engines ran separately, without thermal telemetry or interleaved repetitions, so small differences are not evidence of a general advantage either way. Validation is Metal-only: CUDA, Vulkan, iOS and tensor-parallel execution were not validated. Details: <a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/models/bonsai2.md" target="_blank" rel="noopener"><code>docs/models/bonsai2.md</code></a>.</p>
+
   <h2 id="muse-glimmer">Muse-Glimmer 30B, with and without DFlash</h2>
-  <p>A separate, hand-run comparison on different hardware: <strong>one RTX PRO 6000 Blackwell (96 GB)</strong>, <code>Muse-Glimmer-30B-Q8_0</code>, greedy on both sides, 128 generated tokens, two reps with the engines alternating, and — importantly — <strong>the same token sequence on both sides</strong> (TensorSharp's rendered chat prompt is handed to <code>llama-cli -no-cnv</code>, and <code>llama-tokenize</code> confirms the counts match). llama.cpp is master <code>8e7f22b</code>, within a day of TensorSharp's vendored ggml.</p>
+  <p>A separate, hand-run comparison on different hardware: <strong>one RTX PRO 6000 Blackwell (96 GB)</strong>, <code>Muse-Glimmer-30B-Q8_0</code>, greedy on both sides, 128 generated tokens, two reps with the engines alternating, and — importantly — <strong>the same token sequence on both sides</strong> (TensorSharp's rendered chat prompt is handed to <code>llama-cli -no-cnv</code>, and <code>llama-tokenize</code> confirms the counts match). llama.cpp is master <code>8e7f22b</code>, within a day of the ggml checkout TensorSharp was built against.</p>
   <div class="table-scroll">
   <table>
     <thead><tr><th>Prompt tokens</th><th>prefill (llama.cpp → TS)</th><th>decode (llama.cpp → TS)</th><th>DFlash decode (llama.cpp → TS)</th></tr></thead>
@@ -113,7 +126,34 @@
     </tbody>
   </table>
   </div>
-  <p>Decode is a tie inside a percent, and TensorSharp loads the 236.4 GiB checkpoint <strong>2.9×</strong> faster. The honest gap is time to first token — 41.9 s against 29.0 s, about <strong>1.4× slower</strong> — and it is the clearest actionable finding of that comparison. The llama.cpp prefill cell is deliberately blank: that run predates the client asking for usage in the stream, so it carries no prompt-token count of its own and no tokens-per-second figure is recorded for it. Whole-layer placement is what both engines ran (TensorSharp selects it with <code>--tp 1</code>); <code>--tp 8</code> on this model means genuine tensor parallelism with every rank running every layer, which needs <strong>41.7 GiB per rank</strong> and does not fit a 46 GB card — an accepted mode whose arithmetic and remedy the loader prints at load time, not a configuration that has been measured. Method, provenance and the rest of the matrix: <a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/validation/cross-engine-2026-09/README.md" target="_blank" rel="noopener"><code>docs/validation/cross-engine-2026-09/README.md</code></a>.</p>
+  <p>Decode is a tie inside a percent, and TensorSharp loads the 236.4 GiB checkpoint <strong>2.9×</strong> faster. The honest gap is time to first token — 41.9 s against 29.0 s, about <strong>1.4× slower</strong> — and it is the clearest actionable finding of that comparison. The llama.cpp prefill cell is deliberately blank: that run predates the client asking for usage in the stream, so it carries no prompt-token count of its own and no tokens-per-second figure is recorded for it. Whole-layer placement is what both engines ran (TensorSharp selects it with <code>--tp 1</code>); <code>--tp 8</code> on this model means genuine tensor parallelism with every rank running every layer, which needs <strong>41.7 GiB per rank</strong> and does not fit a 46 GB card — an accepted mode whose arithmetic and remedy the loader prints at load time, not a configuration that has been measured. Method, provenance and the rest of the matrix: <code>docs/validation/cross-engine-2026-09/README.md</code> (local validation evidence, not committed).</p>
+
+  <h2 id="qwen-image21">Qwen-Image-2.1: LoRA plug-ins and the prefix cache</h2>
+  <p>A hand-run image comparison against <strong><code>stable-diffusion.cpp</code></strong> <code>19bbbca</code> on 2026-09-25, both engines on unchanged ggml <code>353b63b</code>. Every run is a 1024×1024 text-to-image with the same prompt, seed 42, CFG 1, Euler and the same F32 sigma vector, each engine in a fresh process; each configuration ran twice with the engines alternating first, and the medians are shown. Seconds per step is the steady-state step, excluding the first. Without a step-distillation LoRA, 6 steps give a blurry image by design (the model's default is 40), so the "No LoRA" row measures speed, not quality.</p>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Configuration</th><th>Steps</th><th>M5 Pro <code>ggml_metal</code> s/step (TS / sd.cpp)</th><th>M5 Pro wall</th><th>RTX 4000 Ada <code>ggml_cuda</code> s/step (TS / sd.cpp)</th><th>RTX 4000 Ada wall</th></tr></thead>
+    <tbody>
+      <tr><td>No LoRA</td><td>6</td><td><span class="yes">7.52</span> / 8.59</td><td><span class="yes">51.8</span> / 61.7 s</td><td><span class="yes">1.57</span> / 1.85</td><td><span class="yes">20.0</span> / 26.5 s</td></tr>
+      <tr><td>Viggle Turbo r128</td><td>6</td><td><span class="yes">7.94</span> / 9.40</td><td><span class="yes">54.5</span> / 67.0 s</td><td><span class="yes">1.94</span> / 2.53</td><td><span class="yes">23.3</span> / 32.6 s</td></tr>
+      <tr><td>Pruna 8-step</td><td>8</td><td><span class="yes">7.91</span> / 9.39</td><td><span class="yes">69.7</span> / 85.5 s</td><td><span class="yes">1.94</span> / 2.53</td><td><span class="yes">26.6</span> / 37.6 s</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>A LoRA adds 5–7% per step on Metal (sd.cpp: 9–11%) and 22–27% on CUDA (sd.cpp: 36–38%), with rank 64, 128 and 256 within 3% of each other. The whole-VAE graph, now the default on Metal and CUDA, decodes 1024×1024 in 5.0 s on the M5 Pro, where the per-convolution path took 13.0 s and sd.cpp takes 7.1 s. On the CUDA machine sd.cpp runs out of memory for a whole-image decode and retries with 256×256 tiles, and its wall times include that retry. The step-distillation plug-ins ship in <code>config/lora/</code> and bring their own sampling recipe; see <a href="models-image.html">Image models</a>.</p>
+  <h3 id="qwen-image21-prefix-cache">The prefix KV cache</h3>
+  <p>The text and reference-image tokens do not change between denoising steps, so step 1 stores their keys and values and later steps compute only the target image (on by default; <code>TS_QWEN21_PREFIX_CACHE=0</code> turns it off). Every output PNG below is byte-identical to the uncached build's. Per-step times, steps 2 onward, Q4_K_M files:</p>
+  <div class="table-scroll">
+  <table>
+    <thead><tr><th>Workload</th><th>M5 Pro <code>ggml_metal</code></th><th>A40 <code>ggml_cuda</code></th></tr></thead>
+    <tbody>
+      <tr><td>Generate 1024², 40 steps</td><td>7.91 → 7.84 s (1.01×)</td><td>1.151 → 1.113 s (1.03×)</td></tr>
+      <tr><td>Edit, 1 reference, 1024², 40 steps</td><td>17.97–18.00 → 9.65–10.38 s (<span class="yes">1.73–1.86×</span>)</td><td>2.547 → 1.328 s (<span class="yes">1.92×</span>)</td></tr>
+      <tr><td>Edit, 2 references, 1024², 40 steps</td><td>33.32 → 11.46 s (<span class="yes">2.91×</span>)</td><td>4.106 → 1.538 s (<span class="yes">2.67×</span>)</td></tr>
+    </tbody>
+  </table>
+  </div>
+  <p>The cache helps in proportion to the prefix's share of the sequence: generation, whose prefix is only the prompt, gains 1–3%, and editing gains the most. On one A40 under <code>ggml_vulkan</code> the single-reference 1024² edit went from 4.93 to 2.67 s per step. Under <code>--tp 2</code> on two A40s the diffusion transformer runs 1.34–1.57× faster per step on CUDA and 0.86× on Vulkan — see <a href="distributed.html#perf-qwen-image">Multi-GPU</a>. Full tables, including 8-bit cache storage: the repository's <code>docs/models/qwenimage21.md</code> card.</p>
 
   <h2 id="minimax-h3">MiniMax-H3: video and audio in one pass</h2>
   <p>MiniMax-H3 denoises the picture and a native <strong>32&nbsp;kHz stereo</strong> soundtrack together in one packed latent, so every figure below is for a run that produces both. Two machines have been measured against <strong><code>stable-diffusion.cpp</code></strong> on the same 22-frame, 8-step request, and <strong>they do not agree</strong>. Both are below, each labelled with its hardware; neither replaces the other, and an average of the two would describe no machine that exists.</p>
@@ -132,7 +172,7 @@
   <p>Read the second row as the real one: <strong>faces need pixels</strong>, so 640×384 is the starting point and 256×256 is a corner the ratio flatters rather than a size to generate at. Both rows are the same 22-frame, 8-step request, and because the checkpoint is CFG-distilled those 8 steps are 8 DiT passes rather than 16. → <a href="models-video.html#minimax-h3">MiniMax-H3 downloads and modes</a></p>
 
   <h3>RTX 3080 Laptop 16 GB, <code>ggml_cuda</code></h3>
-  <p>The same request on a deliberately memory-starved box — <strong>16,384 MiB of VRAM and 31.7 GB of RAM against a 33.5 GB model set</strong> (DiT 10.64 GiB, Qwen3-VL-32B 16.97 GiB, video VAE 4.85 GiB, audio VAE 0.56 GiB, the identical files on both engines). 22 frames, 8 steps, identical seed, best of three, shipped build, against <code>stable-diffusion.cpp</code> <code>97d2990</code> with ggml <code>8e800ce</code> rebuilt <code>SD_CUDA=ON</code> for arch 86. Here <code>stable-diffusion.cpp</code> takes the wall clock:</p>
+  <p>The same request on a deliberately memory-starved box — <strong>16,384 MiB of VRAM and 31.7 GB of RAM against a ~35.5 GB model set</strong> (DiT 10.64 GiB, Qwen3-VL-32B 16.97 GiB, video VAE 4.85 GiB, audio VAE 0.56 GiB, the identical files on both engines). 22 frames, 8 steps, identical seed, best of three, shipped build, against <code>stable-diffusion.cpp</code> <code>97d2990</code> with ggml <code>8e800ce</code> rebuilt <code>SD_CUDA=ON</code> for arch 86. Here <code>stable-diffusion.cpp</code> takes the wall clock:</p>
   <div class="table-scroll">
   <table>
     <thead><tr><th>Resolution</th><th><code>stable-diffusion.cpp</code></th><th>TensorSharp</th><th>End to end</th></tr></thead>
@@ -242,13 +282,15 @@
   <p><code>InferenceWeb.Tests</code> exercises in-process behavior that doesn't require a running server: managed quantized ops, direct CUDA and MLX backend kernels (when the hardware is available), paged-KV scheduling, batched-executor correctness, per-model batched-forward correctness against the legacy path, MTP / NextN speculative-decoding correctness, the pure-C# DeepSeek V4.1 executor's numerical gate against an independent PyTorch oracle, DiffusionGemma probes, codec round-trips, prompt rendering, and the server CLI options builder.</p>
   <p>The V4.1 gate in that list is worth spelling out. <code>InferenceWeb.Tests.Dsv41CpuExecutorTests</code> holds <code>DeepSeek4CpuExecutor</code> — the 100% pure-C# executor that <code>--backend cpu</code> runs DeepSeek V4.1 Flash on, with no ggml, no native library and no GPU — to the independent PyTorch oracle <code>eng/dsv41-reference.py</code> at <code>atol=rtol=2e-5</code> plus exact greedy-argmax agreement, over one-shot prefill, chunked prefill at 1/3/5/8 checked at every position, and reset. Two caveats travel with it: the tests <strong>return silently unless <code>TS_DSV41_FIXTURE_DIR</code> is set</strong>, and the fixture is small by design — a five-layer, 256-hidden, 16-token F32 synthetic model — so what it establishes is architectural agreement with the oracle, not CPU/CUDA parity on the real 246 GiB Q2_K weights. It is a correctness and portability path rather than a serving one, which is why it appears here and in no table above: no throughput, load time or resident footprint has been measured for a full V4.1 checkpoint on <code>--backend cpu</code>.</p>
   <pre data-lang="bash"><code>dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj</code></pre>
+  <p>Pull-request CI runs the environment-independent lane of that suite on GitHub-hosted x64 (<code>ubuntu-latest</code>) and ARM64 (<code>ubuntu-24.04-arm</code>) runners. It forces the GPU native builds off (CUDA, Vulkan and cuDNN), pins <code>TS_TEST_GGML_BACKEND=cpu</code>, first runs the GPU-free GB10 container-contract check <code>eng/tests/gb10-container.py</code>, and needs no GPU and no model downloads. The same lane runs locally with:</p>
+  <pre data-lang="bash"><code>dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj --filter "Category!=Bench&amp;Requires!=Cuda&amp;Requires!=Mlx&amp;Requires!=Models"</code></pre>
 
   <h3>Server integration tests</h3>
-  <p>Integration tests in <code>TensorSharp.Server/testdata/</code> cover all three API styles (Web UI SSE, Ollama, OpenAI), multi-turn conversations, thinking mode, tool calling, structured outputs, queue-status compatibility, concurrent requests, and abort support. Architecture-specific features are auto-detected and skipped when the active model doesn't support them.</p>
-  <pre data-lang="bash"><code># Start TensorSharp.Server, then run:
-python3 TensorSharp.Server/testdata/test_multiturn.py
+  <p>Integration tests in <code>TensorSharp.Server.Host/testdata/</code> cover all three API styles (Web UI SSE, Ollama, OpenAI), multi-turn conversations, thinking mode, tool calling, structured outputs, queue-status compatibility, concurrent requests, and abort support. Architecture-specific features are auto-detected and skipped when the active model doesn't support them.</p>
+  <pre data-lang="bash"><code># Start TensorSharp.Server.Host, then run:
+python3 TensorSharp.Server.Host/testdata/test_multiturn.py
 # or
-bash TensorSharp.Server/testdata/test_multiturn.sh</code></pre>
+bash TensorSharp.Server.Host/testdata/test_multiturn.sh</code></pre>
 
   <h3>Inference matrix runner</h3>
   <p><code>TensorSharp.TestMatrix</code> is the broader CLI-driven harness for long-running model × backend × feature × env-var coverage. It discovers GGUF files, filters unavailable backends and unsupported prompt types, runs baseline plus env-var sweep cells, writes one JSON result per cell, emits an aggregate Markdown report, and compares against per-host baselines.</p>

@@ -1,11 +1,12 @@
 # Bonsai Q1_0 models
 
-[← back to model index](README.md)
+[← back to model index](README.md) | [中文](bonsai_zh-cn.md)
 
 TensorSharp has been validated against two local, text-only Bonsai GGUFs. They
 share a name and quantization, but not a transformer architecture: the 8B file
 is a dense Qwen 3 decoder, while the 27B file is a dense Qwen 3.5 hybrid with
-GatedDeltaNet recurrent layers.
+GatedDeltaNet recurrent layers. [Bonsai2 27B](bonsai2.md) (PQ2_0 / PTQ1_0 files
+with PRISM Hadamard rotations) is a different format and has its own card.
 
 | Property | Bonsai 8B | Bonsai 27B |
 |---|---|---|

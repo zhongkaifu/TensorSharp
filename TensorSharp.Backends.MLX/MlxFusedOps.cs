@@ -1065,197 +1065,6 @@ namespace TensorSharp.MLX
             });
         }
 
-        public sealed class AttentionKvCache : IDisposable
-        {
-            private MlxNative.MlxArray kCache;
-            private MlxNative.MlxArray vCache;
-            private int length;
-
-            public int Length => length;
-
-            public bool TryEvaluateState()
-            {
-                try
-                {
-                    bool evaluated = Materialize(ref kCache);
-                    evaluated |= Materialize(ref vCache);
-                    return evaluated;
-                }
-                catch
-                {
-                    return false;
-                }
-            }
-
-            public void Reset()
-            {
-                MlxNative.FreeArray(kCache);
-                MlxNative.FreeArray(vCache);
-                kCache = default;
-                vCache = default;
-                length = 0;
-            }
-
-            public bool TryAttentionHeadDim256(
-                Tensor result,
-                Tensor qHeads,
-                Tensor kHeads,
-                Tensor vHeads,
-                int numHeads,
-                int numKVHeads,
-                int seqLen,
-                int startPos,
-                bool causal,
-                float scale = 0.0625f)
-            {
-                if (result == null || qHeads == null || kHeads == null || vHeads == null)
-                    return false;
-                if (seqLen <= 0
-                    || startPos < 0
-                    || startPos != length
-                    || numHeads <= 0
-                    || numKVHeads <= 0
-                    || numHeads % numKVHeads != 0
-                    || !CanUseResult(result)
-                    || !CanUseAttentionTensor(qHeads)
-                    || !CanUseAttentionTensor(kHeads)
-                    || !CanUseAttentionTensor(vHeads)
-                    || qHeads.ElementType != DType.Float32
-                    || kHeads.ElementType != DType.Float32
-                    || vHeads.ElementType != DType.Float32
-                    || qHeads.DimensionCount != 3
-                    || kHeads.DimensionCount != 3
-                    || vHeads.DimensionCount != 3
-                    || qHeads.Sizes[0] != numHeads
-                    || qHeads.Sizes[1] != seqLen
-                    || qHeads.Sizes[2] != 256
-                    || kHeads.Sizes[0] != numKVHeads
-                    || kHeads.Sizes[1] != seqLen
-                    || kHeads.Sizes[2] != 256
-                    || vHeads.Sizes[0] != numKVHeads
-                    || vHeads.Sizes[1] != seqLen
-                    || vHeads.Sizes[2] != 256
-                    || result.DimensionCount != 2
-                    || result.Sizes[0] != seqLen
-                    || result.Sizes[1] != (long)numHeads * 256)
-                {
-                    return false;
-                }
-
-                return MlxWorker.Shared.Invoke(() =>
-                {
-                    MlxNative.MlxArray qView = default;
-                    MlxNative.MlxArray qCompact = default;
-                    MlxNative.MlxArray nextK = default;
-                    MlxNative.MlxArray nextV = default;
-                    MlxNative.MlxArray attention = default;
-                    try
-                    {
-                        qView = GetView(qHeads);
-                        qCompact = qHeads.IsContiguous() ? qView : MlxNative.Contiguous(qView);
-                        if (qHeads.IsContiguous())
-                            qView = default;
-
-                        if (!TryBuildUpdatedCache(kHeads, vHeads, out nextK, out nextV))
-                            return false;
-
-                        int nextLength = length + seqLen;
-                        attention = MlxNative.HeadDim256Attention(
-                            qCompact,
-                            nextK,
-                            nextV,
-                            numHeads,
-                            numKVHeads,
-                            seqLen,
-                            nextLength,
-                            startPos,
-                            causal,
-                            scale);
-                        SetDeviceResult(result, attention);
-                        attention = default;
-
-                        MlxNative.FreeArray(kCache);
-                        MlxNative.FreeArray(vCache);
-                        kCache = nextK;
-                        vCache = nextV;
-                        nextK = default;
-                        nextV = default;
-                        length = nextLength;
-                        return true;
-                    }
-                    catch (Exception)
-                    {
-                        return false;
-                    }
-                    finally
-                    {
-                        MlxNative.FreeArray(qView);
-                        MlxNative.FreeArray(qCompact);
-                        MlxNative.FreeArray(nextK);
-                        MlxNative.FreeArray(nextV);
-                        MlxNative.FreeArray(attention);
-                    }
-                });
-            }
-
-            private bool TryBuildUpdatedCache(Tensor kHeads, Tensor vHeads,
-                out MlxNative.MlxArray nextK, out MlxNative.MlxArray nextV)
-            {
-                nextK = default;
-                nextV = default;
-                MlxNative.MlxArray kView = default;
-                MlxNative.MlxArray vView = default;
-                MlxNative.MlxArray kCompact = default;
-                MlxNative.MlxArray vCompact = default;
-                MlxNative.MlxArray concatK = default;
-                MlxNative.MlxArray concatV = default;
-                try
-                {
-                    kView = GetView(kHeads);
-                    vView = GetView(vHeads);
-                    kCompact = kHeads.IsContiguous() ? kView : MlxNative.Contiguous(kView);
-                    vCompact = vHeads.IsContiguous() ? vView : MlxNative.Contiguous(vView);
-                    if (kHeads.IsContiguous())
-                        kView = default;
-                    if (vHeads.IsContiguous())
-                        vView = default;
-
-                    if (length == 0)
-                    {
-                        nextK = kCompact;
-                        nextV = vCompact;
-                        kCompact = default;
-                        vCompact = default;
-                        return true;
-                    }
-
-                    if (!kCache.IsValid || !vCache.IsValid)
-                        return false;
-
-                    concatK = MlxNative.ConcatenateAxis(kCache, kCompact, 1);
-                    concatV = MlxNative.ConcatenateAxis(vCache, vCompact, 1);
-                    nextK = concatK;
-                    nextV = concatV;
-                    concatK = default;
-                    concatV = default;
-                    return true;
-                }
-                finally
-                {
-                    MlxNative.FreeArray(kView);
-                    MlxNative.FreeArray(vView);
-                    MlxNative.FreeArray(kCompact);
-                    MlxNative.FreeArray(vCompact);
-                    MlxNative.FreeArray(concatK);
-                    MlxNative.FreeArray(concatV);
-                }
-            }
-
-            public void Dispose()
-            {
-                Reset();
-            }
-        }
 
         public sealed class GatedDeltaNetCache : IDisposable
         {
@@ -1272,6 +1081,75 @@ namespace TensorSharp.MLX
                 MlxNative.FreeArray(deltaState);
                 convState = default;
                 deltaState = default;
+            }
+
+            /// <summary>Whether a step has run since the last <see cref="Reset"/>; before
+            /// that the state is implicitly zero.</summary>
+            public bool HasState => convState.IsValid || deltaState.IsValid;
+
+            /// <summary>
+            /// An independent cache holding the same recurrent state. Every step replaces
+            /// the state arrays instead of writing into them, so the copy can share them:
+            /// the two diverge on the next step either takes.
+            /// </summary>
+            public GatedDeltaNetCache CloneState()
+            {
+                var copy = new GatedDeltaNetCache();
+                copy.convState = MlxNative.Retain(convState);
+                copy.deltaState = MlxNative.Retain(deltaState);
+                return copy;
+            }
+
+            /// <summary>
+            /// Copies the state to the host: the conv tail as [convTail, qkvDim] (oldest row
+            /// first) and the delta state as [valueHeads, valueDim, keyDim]. A cache that has
+            /// not run yet writes zeros.
+            /// </summary>
+            public unsafe void ExportState(float* conv, long convFloats, float* delta, long deltaFloats)
+            {
+                ExportArray(convState, conv, convFloats);
+                ExportArray(deltaState, delta, deltaFloats);
+            }
+
+            /// <summary>Replaces the state with host values in <see cref="ExportState"/>'s layout.</summary>
+            public unsafe void ImportState(float* conv, int convTail, int qkvDim, float* delta, int valueHeads, int valueDim, int keyDim)
+            {
+                MlxNative.MlxArray newConv = MlxNative.NewArrayFromHost((IntPtr)conv, new[] { 1, convTail, qkvDim }, DType.Float32);
+                MlxNative.MlxArray newDelta = default;
+                try
+                {
+                    newDelta = MlxNative.NewArrayFromHost((IntPtr)delta, new[] { 1, valueHeads, valueDim, keyDim }, DType.Float32);
+                }
+                catch
+                {
+                    MlxNative.FreeArray(newConv);
+                    throw;
+                }
+                Reset();
+                convState = newConv;
+                deltaState = newDelta;
+            }
+
+            private static unsafe void ExportArray(MlxNative.MlxArray state, float* destination, long floats)
+            {
+                if (floats <= 0)
+                    return;
+                if (!state.IsValid)
+                {
+                    new Span<float>(destination, checked((int)floats)).Clear();
+                    return;
+                }
+                // The conv tail is a slice of the step's concatenation; the host copy
+                // reads the data pointer, so lay the array out first.
+                MlxNative.MlxArray contiguous = MlxNative.Contiguous(state);
+                try
+                {
+                    MlxNative.CopyArrayToHost(contiguous, DType.Float32, (IntPtr)destination, floats * sizeof(float));
+                }
+                finally
+                {
+                    MlxNative.FreeArray(contiguous);
+                }
             }
 
             public bool TryEvaluateState()
@@ -2050,6 +1928,278 @@ namespace TensorSharp.MLX
             {
                 MlxNative.FreeArray(contiguous);
             }
+        }
+
+        /// <summary>
+        /// Copies an MLX tensor or view (a box of a cache, say) to host memory in row-major
+        /// order, without giving its storage a host copy: reading a cache through
+        /// Storage.PtrAtElement keeps a full host duplicate alive and re-uploads the whole
+        /// buffer on the next device use. False when the tensor is not on MLX or
+        /// <paramref name="byteCount"/> is not its size.
+        /// </summary>
+        public static bool TryCopyViewToHost(Tensor view, IntPtr destination, long byteCount)
+        {
+            if (view?.Storage is not MlxStorage storage || destination == IntPtr.Zero)
+                return false;
+            if (byteCount != view.ElementCount() * view.ElementType.Size())
+                return false;
+            return MlxWorker.Shared.Invoke(() =>
+            {
+                MlxNative.MlxArray array = default;
+                MlxNative.MlxArray contiguous = default;
+                try
+                {
+                    array = storage.CreateArrayView(view);
+                    contiguous = MlxNative.Contiguous(array);
+                    MlxNative.CopyArrayToHost(contiguous, view.ElementType, destination, byteCount);
+                    return true;
+                }
+                finally
+                {
+                    MlxNative.FreeArray(array);
+                    MlxNative.FreeArray(contiguous);
+                }
+            });
+        }
+
+        /// <summary>
+        /// Writes row-major host values of <paramref name="view"/>'s shape into it, on the
+        /// device. The view must be a box of its storage (a whole tensor, or Narrow/Select
+        /// of one). The counterpart of <see cref="TryCopyViewToHost"/>.
+        /// </summary>
+        public static bool TryWriteViewFromHost(Tensor view, IntPtr source, long byteCount)
+        {
+            if (view?.Storage is not MlxStorage storage || source == IntPtr.Zero)
+                return false;
+            if (byteCount != view.ElementCount() * view.ElementType.Size())
+                return false;
+            if (!MlxBasicOps.TryGetStridedBox(view, out int[] parentShape, out int[] starts, out int[] stops))
+                return false;
+            int[] shape = new int[view.DimensionCount];
+            for (int i = 0; i < shape.Length; i++)
+                shape[i] = checked((int)view.Sizes[i]);
+            return MlxWorker.Shared.Invoke(() =>
+            {
+                MlxNative.MlxArray update = default;
+                try
+                {
+                    update = MlxNative.NewArrayFromHost(source, shape, view.ElementType);
+                    storage.UpdateDeviceBox(parentShape, starts, stops, update);
+                    return true;
+                }
+                finally
+                {
+                    MlxNative.FreeArray(update);
+                }
+            });
+        }
+
+        /// <summary>
+        /// Attention for <paramref name="seqLen"/> new query rows over a head-first
+        /// [kvHeads, capacity, headDim] K/V cache whose rows [0, kvLen) the caller has
+        /// already written — the new rows last. This is the call mlx-lm makes
+        /// (KVCache.update_and_fetch, then mx.fast.scaled_dot_product_attention), and
+        /// it serves decode and every prefill chunk alike.
+        ///
+        /// The cache is read through a strided view of its storage, in its own dtype:
+        /// nothing narrows and copies the live prefix, up-casts the whole cache to F32,
+        /// or keeps a second copy of K/V that snapshots of the model's cache would
+        /// miss. The query is cast to the cache's dtype, so an F16 cache runs the
+        /// half-precision kernels; scores still accumulate in F32 inside them.
+        /// </summary>
+        /// <param name="query">[seqLen, numHeads * headDim], F32, contiguous.</param>
+        /// <param name="result">[seqLen, numHeads * headDim], F32, contiguous.</param>
+        public static bool TryCachedAttention(
+            Tensor result,
+            Tensor query,
+            Tensor kCache,
+            Tensor vCache,
+            int numHeads,
+            int numKVHeads,
+            int headDim,
+            int seqLen,
+            int kvLen,
+            float scale,
+            Tensor sinks = null,
+            int slidingWindow = 0)
+        {
+            if (seqLen <= 0 || kvLen < seqLen || numHeads <= 0 || numKVHeads <= 0
+                || numHeads % numKVHeads != 0 || headDim <= 0 || slidingWindow < 0)
+                return false;
+            if (sinks != null && (sinks.ElementType != DType.Float32
+                || sinks.ElementCount() != numHeads || !(sinks.Storage is MlxStorage)))
+                return false;
+            if (!CanUseResult(result) || !CanUseResult(query)
+                || result.ElementCount() != (long)seqLen * numHeads * headDim
+                || query.ElementCount() != (long)seqLen * numHeads * headDim)
+                return false;
+            if (!IsWholeHeadFirstCache(kCache, numKVHeads, headDim, kvLen)
+                || !IsWholeHeadFirstCache(vCache, numKVHeads, headDim, kvLen)
+                || kCache.ElementType != vCache.ElementType
+                || kCache.Sizes[1] != vCache.Sizes[1])
+                return false;
+
+            DType cacheType = kCache.ElementType;
+            int capacity = (int)kCache.Sizes[1];
+
+            // A sliding window only ever reaches back slidingWindow - 1 rows from the
+            // chunk's first query, so the keys before that are left out of the view.
+            // Within it, "causal" is still exact unless a later query of the chunk has
+            // a window that starts past the view's first key; only then is an explicit
+            // [seqLen, keys] mask needed.
+            int firstPos = kvLen - seqLen;
+            int kvStart = slidingWindow > 0 ? Math.Max(0, firstPos - slidingWindow + 1) : 0;
+            int keyCount = kvLen - kvStart;
+            bool windowMask = slidingWindow > 0 && seqLen > 1 && kvLen - slidingWindow > kvStart;
+
+            int[] cacheShape = { 1, numKVHeads, keyCount, headDim };
+            long[] cacheStrides = { (long)numKVHeads * capacity * headDim, (long)capacity * headDim, headDim, 1 };
+            long cacheOffset = (long)kvStart * headDim;
+
+            return MlxWorker.Shared.Invoke(() =>
+            {
+                MlxNative.MlxArray qFlat = default;
+                MlxNative.MlxArray qRows = default;
+                MlxNative.MlxArray qHeads = default;
+                MlxNative.MlxArray qTyped = default;
+                MlxNative.MlxArray k = default;
+                MlxNative.MlxArray v = default;
+                MlxNative.MlxArray sinksView = default;
+                MlxNative.MlxArray sinksTyped = default;
+                MlxNative.MlxArray attention = default;
+                MlxNative.MlxArray rowsFirst = default;
+                MlxNative.MlxArray rowsTyped = default;
+                MlxNative.MlxArray flat = default;
+                try
+                {
+                    qFlat = GetView(query);
+                    qRows = MlxNative.Reshape(qFlat, new[] { 1, seqLen, numHeads, headDim });
+                    qHeads = MlxNative.Transpose(qRows, new[] { 0, 2, 1, 3 });
+                    MlxNative.MlxArray q = qHeads;
+                    if (cacheType != DType.Float32)
+                    {
+                        qTyped = MlxNative.Astype(qHeads, cacheType);
+                        q = qTyped;
+                    }
+                    k = ((MlxStorage)kCache.Storage).CreateArrayView(cacheShape, cacheStrides, cacheOffset);
+                    v = ((MlxStorage)vCache.Storage).CreateArrayView(cacheShape, cacheStrides, cacheOffset);
+                    if (sinks != null)
+                    {
+                        // SDPA wants sinks that promote to the query dtype, so an F16
+                        // cache takes F16 sinks.
+                        sinksView = GetView(sinks);
+                        sinksTyped = cacheType != DType.Float32
+                            ? MlxNative.Astype(sinksView, cacheType)
+                            : sinksView;
+                    }
+
+                    // "causal" is aligned to the LAST key, so a chunk that starts at
+                    // kvLen - seqLen sees every earlier row and its own lower triangle.
+                    attention = windowMask
+                        ? MlxNative.FastScaledDotProductAttention(
+                            q, k, v, scale, string.Empty,
+                            SlidingWindowMask(firstPos, seqLen, kvStart, kvLen, slidingWindow),
+                            sinks: sinksTyped)
+                        : MlxNative.FastScaledDotProductAttention(
+                            q, k, v, scale, seqLen == 1 ? string.Empty : "causal", default,
+                            sinks: sinksTyped);
+                    rowsFirst = MlxNative.Transpose(attention, new[] { 0, 2, 1, 3 });
+                    // The cast (or, in F32, the explicit copy) lays the rows out
+                    // contiguously, so the reshape below is metadata only.
+                    rowsTyped = cacheType != DType.Float32
+                        ? MlxNative.Astype(rowsFirst, DType.Float32)
+                        : MlxNative.Contiguous(rowsFirst);
+                    flat = MlxNative.Reshape(rowsTyped, new[] { seqLen, numHeads * headDim });
+                    SetDeviceResult(result, flat);
+                    flat = default;
+                    return true;
+                }
+                catch
+                {
+                    return false;
+                }
+                finally
+                {
+                    MlxNative.FreeArray(qFlat);
+                    MlxNative.FreeArray(qRows);
+                    MlxNative.FreeArray(qHeads);
+                    MlxNative.FreeArray(qTyped);
+                    MlxNative.FreeArray(k);
+                    MlxNative.FreeArray(v);
+                    if (sinksTyped.Ctx != sinksView.Ctx)
+                        MlxNative.FreeArray(sinksTyped);
+                    MlxNative.FreeArray(sinksView);
+                    MlxNative.FreeArray(attention);
+                    MlxNative.FreeArray(rowsFirst);
+                    MlxNative.FreeArray(rowsTyped);
+                    MlxNative.FreeArray(flat);
+                }
+            });
+        }
+
+        // Every sliding-window layer of one forward shares the same mask, so the last
+        // one built is kept (only ever touched on the MLX worker thread).
+        private static (int FirstPos, int SeqLen, int KvStart, int KvLen, int Window) _windowMaskKey;
+        private static MlxNative.MlxArray _windowMask;
+
+        /// <summary>
+        /// Boolean [seqLen, kvLen - kvStart] mask: query row i (absolute position
+        /// firstPos + i) keeps key column j (absolute position kvStart + j) when
+        /// 0 &lt;= (firstPos + i) - (kvStart + j) &lt; window. The caller borrows it.
+        /// </summary>
+        private static MlxNative.MlxArray SlidingWindowMask(int firstPos, int seqLen, int kvStart, int kvLen, int window)
+        {
+            var key = (firstPos, seqLen, kvStart, kvLen, window);
+            if (_windowMask.IsValid && _windowMaskKey == key)
+                return _windowMask;
+
+            MlxNative.MlxArray rows = default, rowsColumn = default, cols = default, colsRow = default;
+            MlxNative.MlxArray distance = default, minusOne = default, width = default;
+            MlxNative.MlxArray notFuture = default, inWindow = default;
+            try
+            {
+                rows = MlxNative.Arange(firstPos, firstPos + seqLen, 1, DType.Int32);
+                rowsColumn = MlxNative.Reshape(rows, new[] { seqLen, 1 });
+                cols = MlxNative.Arange(kvStart, kvLen, 1, DType.Int32);
+                colsRow = MlxNative.Reshape(cols, new[] { 1, kvLen - kvStart });
+                distance = MlxNative.Binary(MlxNative.MlxBinaryOp.Sub, rowsColumn, colsRow);
+                minusOne = MlxNative.NewScalar(-1);
+                width = MlxNative.NewScalar(window);
+                notFuture = MlxNative.Greater(distance, minusOne);
+                inWindow = MlxNative.Greater(width, distance);
+                MlxNative.MlxArray mask = MlxNative.Where(notFuture, inWindow, notFuture);
+
+                MlxNative.FreeArray(_windowMask);
+                _windowMask = mask;
+                _windowMaskKey = key;
+                return mask;
+            }
+            finally
+            {
+                MlxNative.FreeArray(rows);
+                MlxNative.FreeArray(rowsColumn);
+                MlxNative.FreeArray(cols);
+                MlxNative.FreeArray(colsRow);
+                MlxNative.FreeArray(distance);
+                MlxNative.FreeArray(minusOne);
+                MlxNative.FreeArray(width);
+                MlxNative.FreeArray(notFuture);
+                MlxNative.FreeArray(inWindow);
+            }
+        }
+
+        private static bool IsWholeHeadFirstCache(Tensor cache, int numKVHeads, int headDim, int kvLen)
+        {
+            return cache != null
+                && cache.Storage is MlxStorage
+                && (cache.ElementType == DType.Float16 || cache.ElementType == DType.Float32)
+                && cache.DimensionCount == 3
+                && cache.Sizes[0] == numKVHeads
+                && cache.Sizes[2] == headDim
+                && cache.Sizes[1] >= kvLen
+                && cache.StorageOffset == 0
+                && cache.IsContiguous()
+                && cache.Storage.ElementCount == cache.ElementCount();
         }
 
         public static bool TryPrefillAttention(

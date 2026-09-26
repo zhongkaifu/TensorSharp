@@ -18,7 +18,8 @@ namespace TensorSharp.Server.RequestParsers
     ///
     /// <para>
     /// The field is spelled identically on every surface — <c>/v1/chat/completions</c>,
-    /// <c>/v1/responses</c>, Ollama's <c>/api/chat</c> and the Web UI's — so unlike
+    /// <c>/v1/responses</c>, the Ollama-compatible <c>/api/chat/ollama</c> and the Web
+    /// UI's <c>/api/chat</c> — so unlike
     /// <see cref="ToolFunctionParser"/> there is nothing per-protocol to vary and one
     /// reader serves all four. It is a top-level array of strings, sitting alongside
     /// <c>tools</c>:

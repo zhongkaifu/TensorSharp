@@ -18,6 +18,7 @@ stream is compared against plain greedy token for token.
 | `spec` | plain greedy vs n-gram vs the checkpoint's own drafter, then the tool rounds under n-gram |
 | `json` | grammar-constrained JSON, plain vs n-gram |
 | `conc` | N concurrent requests on one engine, then a solo request after them |
+| `image` | a turn carrying an image plus a code snippet to repeat, plain vs n-gram; needs `--mmproj <gguf> --image <file>`, is skipped without them, and is not in the default scenario list |
 
 `--spec-engine ngram|auto` enables speculation on ordinary scenario engines.
 The explicitly labeled plain controls in `spec`, `json`, `newchat` and `image`

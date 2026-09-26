@@ -1,10 +1,12 @@
-# Explicit Prompt Cache Markers - TensorSharp2 Implementation Design
+# Explicit Prompt Cache Markers - TensorSharp Implementation Design
 
-This document outlines the design for implementing explicit prompt-cache markers in TensorSharp2, ensuring full compatibility with explicit caching specifications based on `cache_control` markers.
+This document outlines the design for implementing explicit prompt-cache markers in TensorSharp, ensuring full compatibility with explicit caching specifications based on `cache_control` markers.
+
+> **Status.** The markers are implemented, but not everywhere as designed below. The opt-in headers were not built, and the serving prefix cache enforces the boundaries instead of `PagedKvCacheManager`. Section 4.2's retention priority exists in the default radix prefix cache for families that restore from state checkpoints. [Section 7](#7-implementation-status) records what the code does today.
 
 ## 1. Overview
 
-TensorSharp2 currently relies on implicit, automatic prefix caching via `PagedKvCacheManager`, which splits prompts into fixed-size blocks and hashes them. This design introduces support for **explicit caching**, where the client dictates the exact boundaries of cacheable segments using `cache_control` markers.
+When this design was written, TensorSharp relied on implicit, automatic prefix caching that split prompts into fixed-size blocks and hashed them; the design named `PagedKvCacheManager` as that cache. On the serving path, prefix reuse is now done by the continuous-batching scheduler's prefix cache. By default that cache is a radix tree (`TS_PREFIX_CACHE_MODE=tree`); `legacy` selects the older block-hash sharing. The standalone `PagedKvCacheManager` is used only by the CLI's `--paged-bench`. This design introduces support for **explicit caching**, where the client dictates the exact boundaries of cacheable segments using `cache_control` markers.
 
 The implementation will span the API layer (headers and JSON parsing), the prompt rendering layer (tracking markers to exact token indices without leaking them into the prompt), the caching layer (prioritizing/capturing based on markers), and the response serialization layer (reporting `cached_tokens`).
 
@@ -23,7 +25,7 @@ The implementation will span the API layer (headers and JSON parsing), the promp
 
 ### 2.2 Opt-In Semantics
 * A request is considered to have explicit caching enabled if the header is present (`enable`), OR if any `cache_control` or `prompt_cache_breakpoint` marker is found during request parsing.
-* If explicit caching is enabled, TensorSharp2 will transition from *automatic* caching (capturing everything) to *explicit* caching (capturing only up to marked boundaries) for that request.
+* If explicit caching is enabled, TensorSharp will transition from *automatic* caching (capturing everything) to *explicit* caching (capturing only up to marked boundaries) for that request.
 
 ## 3. Prompt Rendering & Marker Tracking
 
@@ -83,3 +85,16 @@ Client applications and agents rely on `cached_tokens` to measure cache effectiv
 3. **Engine Layer**: Update `SequenceState` to carry `CacheBreakpoints`. Modify `InferenceEngine` to pass these breakpoints to `PagedKvCacheManager.Capture`.
 4. **Serialization Layer**: Update `OpenAIResponseFactory` and streaming writers to format the `prompt_tokens_details.cached_tokens` block accurately.
 5. **Tests**: Add unit tests replicating the conformance vectors (V1-V8) from the specification.
+
+## 7. Implementation status
+
+This section describes the current code. Where it differs from the plan above, the code is authoritative.
+
+* **Accepted markers**: `"cache_control": {"type": "ephemeral"}` or `"prompt_cache_breakpoint": true` (`TensorSharp.Chat/RequestParsers/CacheControlParser.cs`). A marker may sit on a message or a text content part in `/v1/chat/completions` messages and `/v1/responses` input items. It may also sit on a tool declaration in OpenAI chat, Responses and Ollama requests. A marker on any tool marks the whole rendered tool block. Ollama chat messages are not parsed for markers. An unrecognised `type` is kept verbatim and acts as a plain breakpoint.
+* **Headers (§2.1)**: not implemented. `X-Prompt-Cache-Control` and `X-DashScope-CacheControl` are not read. A request switches to explicit caching only by carrying at least one marker.
+* **Rendering (§3.1)**: implemented as designed. `KVCachePromptRenderer` inserts `\uE001` breakpoint sentinels, records their token offsets, and strips them, so the rendered prompt is unchanged. The offsets reach the engine as `SequenceState.CacheBreakpoints`; when the prompt is truncated, they move with it.
+* **Capture and reuse (§4.1)**: the scheduler's prefix cache enforces the boundaries, not `PagedKvCacheManager`. A marked request neither registers nor adopts cached state past its last breakpoint. An explicit policy with no usable breakpoint (an empty list, or a sole breakpoint at 0) disables prefix reuse for that request. Blocks are floored as in Option A in the legacy block-hash mode and for the radix tree's paged families. For families that restore from state checkpoints, the radix tree ends a prefill chunk at each breakpoint and captures a checkpoint there, so the marked prefix is restorable exactly.
+* **Other reuse paths**: a marked request is served only through that prefix cache. Live-cache continuation, retained fused-cache holders and the shared-prefix checkpoint store are skipped for it, and its finished state is not retained. None of these paths can then reuse past a client's boundary.
+* **Retention priority (§4.2)**: implemented in the radix tree for checkpoint families only. A checkpoint captured at an explicit breakpoint is placed in the `Breakpoint` eviction tier, which is evicted after retired and ordinary entries. Page-family captures (Qwen 3, GPT-OSS, Mistral 3, Hunyuan, Muse-Glimmer, Nemotron) and the legacy block-hash mode have no such priority.
+* **Usage reporting (§5)**: chat completions report `usage.prompt_tokens_details.cached_tokens` on the non-streaming response and on the final streaming chunk. Responses report `usage.input_tokens_details.cached_tokens`. Both are always present, including when the value is 0.
+* **Tests (§6)**: `KVCachePromptRendererTests` covers marker tracking. The `Scheduler_Explicit*` cases in `ContinuousBatchSchedulerTests` cover block registration, adoption and the cache-none policy in the legacy block-hash mode. The radix path is covered by `RadixHolderEngineTests` (breakpoint-aligned prefill and capture), `PrefixTreeEvictionTests` (the `Breakpoint` tier) and `RetainedFusedCacheTests.SingleStream_ExplicitBoundary_DoesNotReusePastClientLimit`. None are organised as the specification's V1–V8 vectors.

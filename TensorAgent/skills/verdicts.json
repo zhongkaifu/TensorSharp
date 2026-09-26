@@ -49,6 +49,15 @@
     "reasons": []
   },
   {
+    "name": "playwright",
+    "ok": false,
+    "kind": "scripts",
+    "scripts": 1,
+    "reasons": [
+      "scripts/playwright_cli.sh runs npx: there is no Node package manager in the app"
+    ]
+  },
+  {
     "name": "research",
     "ok": true,
     "kind": "scripts",
@@ -71,9 +80,14 @@
   },
   {
     "name": "web-artifacts-builder",
-    "ok": true,
+    "ok": false,
     "kind": "scripts",
     "scripts": 2,
-    "reasons": []
+    "reasons": [
+      "scripts/bundle-artifact.sh runs parcel: a Node bundler cannot be installed or run in the app",
+      "scripts/bundle-artifact.sh runs pnpm: there is no Node package manager in the app",
+      "scripts/init-artifact.sh runs npm: there is no Node package manager in the app",
+      "scripts/init-artifact.sh runs pnpm: there is no Node package manager in the app"
+    ]
   }
 ]
