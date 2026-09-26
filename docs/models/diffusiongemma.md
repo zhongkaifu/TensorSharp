@@ -9,7 +9,7 @@
 | GGUF architecture keys | `diffusion-gemma`, `diffusion_gemma` |
 | Source class | [`DiffusionGemmaModel`](../../TensorSharp.Models/Models/DiffusionGemma/DiffusionGemmaModel.cs) |
 | Sampler | [`DiffusionGemmaSampler`](../../TensorSharp.Models/Models/DiffusionGemma/DiffusionGemmaSampler.cs) |
-| Modalities | Text + **image** (audio is not supported: the checkpoint has no audio tower) |
+| Modalities | Native text + **image**; [Jev](jev.md) adds document extraction, sampled video frames and speech via a configured ASR companion |
 | Thinking / tools | Thinking is not prompted: the prompt always renders with thinking off. A thought block the model writes anyway is parsed out and returned as reasoning only on `"think": true`; a canvas that holds nothing but a thought block is returned as the answer (§6). Tools/tool_choice refused with HTTP 400 |
 | Generation mode | Block text diffusion, not autoregressive token decode |
 | CLI support | `TensorSharp.Cli` detects `DiffusionGemmaModel` and uses diffusion run mode |
@@ -66,7 +66,7 @@ encodes like the shard; it needs a local fixture directory
 (`TS_DIFFUSIONGEMMA_VISION_DIR`) and skips without one. The script also targets
 llama.cpp's clip loader, but no llama.cpp run of its output is recorded.
 
-Audio is **not** supported and no projector can add it: the upstream config has
+Native audio is **not** supported and no projector can add it: the upstream config has
 no `audio_config` and the weights contain no audio tower, so the `<|audio|>`
 tokens the tokenizer inherits from Gemma 4 have nothing behind them.
 
@@ -106,8 +106,9 @@ requests; the server never auto-detects a projector.
 For typed decisions (`noul`, `choice`, `score`) use the native
 [`/v1/systemone` Jev endpoint](jev.md). It reads label probabilities from a seeded
 canvas in one denoising step, with a sparse output projection and no generated
-JSON parsing. Its state may carry images as well as text, through the same vision
-tower this page describes. Start with
+JSON parsing. Its state supports uploaded text/documents, images, sampled video
+frames through the vision tower, and audio transcripts from a configured ASR
+companion. These preprocessing paths are described in the Jev guide. Start with
 [`jev-diffusiongemma-q4.json`](../../config/jev-diffusiongemma-q4.json).
 
 DiffusionGemma is a block text-diffusion language model built on a Gemma-4-style
@@ -269,10 +270,12 @@ When the Web UI hosts a DiffusionGemma GGUF:
   expanded into its soft-token span before the context check. The encoded spans
   belong to the sequence in the scheduler and are re-applied whenever its prompt
   is prefilled (once per block, or at every step on backends without prompt-KV
-  caching), so image and text requests batch together. Audio is refused. There
-  is no video path: an OpenAI `video_url` part is refused, and a video uploaded
+  caching), so image and text requests batch together. Ordinary chat refuses
+  audio. It has no native video path: an OpenAI `video_url` part is refused, and a video uploaded
   in the Web UI reaches the model only as its extracted frames, each rendered as
-  a plain `<|image>` (no `<|video>` marker and no frame timestamps).
+  a plain `<|image>` (no `<|video>` marker and no frame timestamps). The separate
+  [Jev endpoint](jev.md#files-documents-video-and-audio) accepts uploaded video
+  through bounded frame sampling and speech through an ASR companion.
 
 The Ollama and OpenAI compatibility adapters still use append-oriented response
 shapes through `ChatStreamWithMetricsAsync`. They can surface the final

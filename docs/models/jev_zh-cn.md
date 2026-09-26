@@ -4,8 +4,9 @@
 
 TensorSharp 使用 DiffusionGemma GGUF 提供与 Jev 兼容的 `POST /v1/systemone` 端点。请求提供
 状态（state）与类型化问题；响应包含布尔概率（`noul`）、分类选择与期望得分。状态可以是文本、
-图像或两者兼有：图像以内联方式放在请求体中，并作为状态的一部分被读取，因此可以针对一张图片
-做类型化判定（见[图像输入](#图像输入)）。
+图像、上传的文件和文档、抽样的视频帧，以及音频转录。附件可内联传入，也可引用 `/api/upload` 返回的
+文件名（见[文件、文档、视频与音频](#文件文档视频与音频)）。图像使用视觉塔；语音使用显式配置的
+转录服务，因为 DiffusionGemma 本身没有音频塔。
 `jev-latest` 与 `jev-preview` 是指向已加载 DiffusionGemma 模型的 API 别名，不是独立的检查点，
 也不是专有的托管 Jev 模型。
 
@@ -26,7 +27,7 @@ TensorSharp 使用 DiffusionGemma GGUF 提供与 Jev 兼容的 `POST /v1/systemo
 
 ## 启动服务端
 
-随附的 Q4_K_M 检查点不需要额外的 tokenizer 文件。图像输入需要视觉塔，配置会下载一次
+随附的 Q4_K_M 检查点不需要额外的 tokenizer 文件。图像、扫描文档与视频帧需要视觉塔，配置会下载一次
 （2.8 GB）；纯文本判定不需要它。在命令行上传 `--mmproj none` 会让服务端只跑纯文本，也会跳过
 这次下载，因为命令行上的 `--mmproj` 会在解析之前丢弃配置中的条目。在仓库根目录下，用 PowerShell：
 
@@ -46,7 +47,7 @@ CPU 执行可覆盖为 `--backend ggml_cpu`，受支持的 Mac 上可用 `--back
 
 该检查点已发布的 GGUF 全部是纯文本的，也没有发布过 mmproj，因此配置直接从上游
 `model-00011-of-00011.safetensors` 分片加载视觉塔——它的全部 356 个张量都在这个分片里。该文件只
-下载一次，之后复用。没有它时，服务端仍会回答纯文本请求，对图像请求返回 HTTP 503，而不是用填充行
+下载一次，之后复用。没有它时，服务端仍会回答纯文本请求，对需要图像行的请求返回 HTTP 503，而不是用填充行
 作答。同一个视觉塔也服务于该服务端上的普通 DiffusionGemma 聊天。
 
 这份配置方案在 16 GiB CUDA GPU 上为激活保留 4 GiB 显存。更大的保留量会让常驻的权重更少，但可以
@@ -135,7 +136,11 @@ tokenIds)`，其中 positions 是从零开始的 canvas 下标，`tokenIds` 的�
 | 请求字段 | 默认值 | 含义 |
 |---|---|---|
 | `instructions` | 无 | 可选的请求级说明，加在问题之前的系统文本中 |
-| `images` | `[]` | 至多 8 张内联图像，每张为 base64 或 `data:` URL |
+| `images` | `[]` | 原有图像输入：base64 字符串或 `data:` URL |
+| `files` | `[]` | 按扩展名识别类型的附件；内联数据或上传引用 |
+| `documents` | `[]` | 文本/代码、PDF、DOCX、XLSX 或 PPTX 附件 |
+| `videos` | `[]` | 提取有限数量的图像帧供模型读取 |
+| `audios` | `[]` | 由配置的配套服务转录的语音 |
 | `samples` | `"auto"` | `1` 到 `32` 次独立的带种子读取，或自适应读取 |
 | `auto_max` | `4` | 触发自适应不确定性时的总读取次数，至多 `32` |
 | `auto_threshold` | `0.1` | 条件标签熵阈值，单位为 nat |
@@ -153,9 +158,9 @@ state 或 schema 会替换该缓存。
 请求最多支持 64 个问题，每个问题 2 到 26 个备选项。问题 ID 必须为 1 到 128 个字符，不能包含冒号、控制
 字符或首尾空白。选项名称与得分描述可以包含多个 token：编译器会把它们映射为短标签，并验证每个标签在完整
 答案模板中只占一个 token。无效模板与上下文溢出会返回校验错误。条件性问题依赖、顺序问题串联、额外的去噪
-步、思考生成以及音频或视频输入都会被明确拒绝，并各自说明原因。
+步与思考生成都会被明确拒绝，并各自说明原因。
 
-由于图像字节以 base64 编码放在请求体内，服务端把请求体上限设为 8 MiB；`TS_JEV_MAX_BODY_MB`（1 到 64）
+服务端把 Jev 请求体（包括内联 base64 数据）的上限设为 8 MiB；`TS_JEV_MAX_BODY_MB`（1 到 64）
 可在启动时设定其他上限。`TS_JEV_MAX_CANVAS` 默认为 64 个 token（同时受检查点 canvas 宽度限制）；超出的
 schema 会被切成多个分块。`TS_JEV_MAX_PENDING` 默认允许 32 个已接纳请求，包括正在执行的请求。超出的请求
 收到 HTTP 529，并带 `Retry-After: 1`。无效请求收到 HTTP 422，未知模型名收到 HTTP 404，模型不可用或不是
@@ -195,7 +200,7 @@ curl http://127.0.0.1:5000/v1/systemone \
   --data-binary @docs/examples/jev-traffic-light.json
 ```
 
-附加你自己的文件只需要 base64 编码：
+使用原有内联图像字段附加自己的图片：
 
 ```python
 import base64, json
@@ -235,7 +240,7 @@ print(answer["answers"]["legible"]["noul"], answer["answers"]["kind"]["choice"])
 `MAX_CONTEXT` 中的 282 个提示 token 预算，另加一句说明附件的系统文本。编码后的行在预填充该提示的前向
 之前才安装到模型上。对 canvas 来说过宽的 schema 会被切成分块，每个分块的提示都会在各自的偏移处再次携带
 这些图像，所以 `n` 个分块要对图像行做 `n` 次 prefill；同一分块的重复读取（固定 `samples` 或自适应扩展）
-与文本一样复用其 prompt K/V。`diagnostics.images` 报告被回答的请求收到了几张图像，`usage.input_tokens`
+与文本一样复用其 prompt K/V。`diagnostics.images` 报告有效图像 span 数（包括扫描页与视频帧），`usage.input_tokens`
 统计包括软 token 行在内的展开后提示。
 
 解码后的字节以内容寻址的方式写入服务端的上传目录，因此受 `--upload-max-mb`、`--upload-quota-mb` 与
@@ -243,25 +248,112 @@ print(answer["answers"]["legible"]["noul"], answer["answers"]["kind"]["choice"])
 （`TS_MM_EMBEDDING_CACHE_MB`，默认 512）。每个软 token span 内部的图像注意力在滑动窗口层上是双向的，
 在全局层上是因果的；`DIFFUSION_IMAGE_BIDIRECTIONAL=0` 让它在所有层上都变为因果。
 
-### 哪些输入会被拒绝
+## 文件、文档、视频与音频
 
-像素必须放在请求体内。远程 URL 从不抓取，文件系统路径从不读取（HTTP 422），因为两者都会让推理服务的
-客户端触及服务端的网络或文件；聊天端点出于同样原因拒绝两者。multipart 请求体以 HTTP 415 拒绝；音频与
-视频以 HTTP 422 拒绝，并指出该检查点缺少相应的塔；不是有效 base64、不是可识别的图像容器（PNG、JPEG、GIF、
-BMP、WebP、TIFF、HEIC）或解码后大于 16 MiB 的条目以 HTTP 422 拒绝。带有容器魔数但无法解码的字节同样
-被拒绝，并附上解码器给出的原因（`images: PNG does not start with IHDR`），而不是作为服务端错误。在未
-加载视觉塔的服务端上，带图像的请求收到 HTTP 503，而不是用填充行读出的答案。图像字节计入 8 MiB 的请求体
-上限；超过上限的请求体收到 HTTP 413，存储限制则按上传策略声明的状态码返回（超过单文件上限为 413，超过
-配额为 507）。
+`files`、`documents`、`videos` 与 `audios` 使用相同的数组项格式。混合类型可用 `files`；其余数组
+要求附件属于对应的媒体类型。每项只能指定一种数据来源：
 
-视频帧只能作为单独的图像发送：上游针对该检查点的视频特征路径会抛出 `NotImplementedError`，词表中也
-没有视频的开始 / 结束标记对。音频完全不受支持——该检查点没有音频权重，因此其 tokenizer 继承来的
-`<|audio>` id 背后什么都没有。
+```json
+{"name": "incident.txt", "data": "VGhlIHNlcnZpY2UgaXMgZG93bi4="}
+```
+
+或者先上传到同一服务端，再引用返回的文件：
+
+```json
+{"file": "SERVER_FILENAME_FROM_UPLOAD.txt", "name": "incident.txt"}
+```
+
+`data` 接受裸 base64 或 base64 `data:` URL。内联项必须提供带受支持扩展名的 `name`。
+`file` 是**上传响应中 `file` 属性返回的纯文件名**，不是 `url`、本地路径或远程 URL。上传引用的
+`name` 可省略，提供时用作显示名称。服务端只读取受管理上传目录中的文件，拒绝路径、目录穿越与符号链接。
+引用仅在原始上传文件仍存在时有效，受存储 TTL 与配额约束。
+
+[文档请求示例](../examples/jev-document.json)已嵌入一份简短的故障报告，可直接发送：
+
+```bash
+curl http://127.0.0.1:5000/v1/systemone \
+  -H 'Content-Type: application/json' \
+  --data-binary @docs/examples/jev-document.json
+```
+
+只依赖标准库的[附件客户端](../examples/jev-attachments.py)在客户端读取本地文件，然后内联传入或先上传。
+它会输出完整的判定响应，包括预处理诊断信息：
+
+```bash
+# 内联传入文本文件。
+python docs/examples/jev-attachments.py docs/examples/jev-incident.txt --field documents
+
+# 先上传，再把服务端返回的文件名放入 Jev 请求。
+python docs/examples/jev-attachments.py report.pdf --upload --field documents
+python docs/examples/jev-attachments.py crossing.mp4 --upload --field videos --question "Is a green traffic light visible?"
+python docs/examples/jev-attachments.py incident.wav --upload --field audios --question "Does the speaker report an active service outage?"
+```
+
+手动上传可用 `curl -F "file=@report.pdf" http://127.0.0.1:5000/api/upload`，然后将响应中的 `file`
+值放进 JSON 请求。`/api/upload` 接受 multipart；`/v1/systemone` 仍只接受 JSON。先上传可以避免
+base64 开销与 Jev 请求体上限，但不会绕过附件、上下文或存储限制。
+
+### 模型实际读取什么
+
+| 输入 | 处理方式与限制 |
+|---|---|
+| 纯文本/代码文件 | UTF-8 文本（包括 CSV、JSON、Markdown 和源代码）随文件名插入 state，不执行文件工具。 |
+| PDF | 只读取文本层，或针对完全由图像组成的文档提取每页最大的内嵌图像并交给视觉塔。最多 32 页；页面提取失败会被拒绝。这不是通用 PDF 渲染器或 OCR 引擎：不会渲染文本 PDF 中的插图、矢量图形或由多个元素合成的扫描页。混合文本与扫描页的 PDF 可能需要改为上传页面图像。 |
+| DOCX / XLSX / PPTX | 读取文档段落、单元格或幻灯片文本。XLSX 使用已保存的值，不重算公式。不会渲染格式、图表或内嵌图片。不支持旧版 `.doc`、`.xls`、`.ppt`。Office 压缩包最多 2,048 个条目，展开数据最多 8 MiB。 |
+| 视频 | MP4、MOV、AVI、MKV 或 WebM，最长 600 秒，每帧最多约 1,600 万像素；按 1 fps 抽帧，在剩余图像预算内均匀选出每段最多 4 帧，并附上近似时间戳。帧通过视觉塔进入模型，不转录音轨。无法保证检测短暂事件或连续运动。 |
+| 音频 | MP3、WAV、OGG、FLAC 或 M4A 发送给配置的 ASR 服务，将语音转录插入 state。声音、音乐、说话人身份、时间信息和语气情绪不是直接模型输入。实际解码与语言支持取决于转录服务。 |
+| 通过 `files` 传入的图像 | 使用与 `images` 相同的视觉通路；按文件名识别受支持的上传图像扩展名，并在解码时校验。 |
+
+四个新数组合计最多 8 个附件，每个最多 32 MiB；包括原有内联图像在内，解码/引用的媒体总量最多 64 MiB。
+`images` 或 `files` 中的图像还须满足每张解码后最多 16 MiB 的限制。模型实际读取的图像总数最多 8 张，
+包括显式图像、扫描页和视频帧。每个附件的文档/转录文本最多 32,768 字符，所有附件合计最多 65,536 字符。
+超出字节数、文档文本或 PDF 页数限制会拒绝，不会静默截断；视频则按设计在剩余图像预算内抽样。
+最终展开的提示与答案 canvas 还必须放进 `MAX_CONTEXT`。视频帧和扫描 PDF 图像在解码前检查，
+每张最多 16,777,216 像素。视频解码需要平台媒体提供程序和受支持的 codec；
+接受某种容器扩展名并不保证能解码其中的任意编码格式。
+
+服务端的 `--upload-max-mb`、`--upload-quota-mb` 与 `--upload-ttl-hours` 管理保存的附件和派生图像。
+内联内容按内容哈希存储，重复内容复用同一文件；预处理附件与图像 embedding 使用有界缓存。
+`diagnostics.attachments` 记录实际处理结果：`name`、`kind`、`textCharacters`、`imageCount`、`sampled`、
+`cacheHit` 与 `warning`。`cacheHit` 只描述非音频提取缓存，不展示转录器的独立缓存。请查看警告，了解哪些转换
+限制了保真度。`diagnostics.timing.preprocessing_ms`
+与 `inference_ms` 分别报告预处理和推理耗时；`total_ms` 为两者之和，不包括排队与此前的上传。
+
+### 配置音频转录
+
+DiffusionGemma 没有音频权重。启动 TensorSharp 前，需配置由部署方控制的 HTTP 语音识别服务。
+如果配套服务自身在本机运行，音频就可留在本机：
+
+```powershell
+# 示例：已运行的 whisper-server 服务。
+$env:TS_JEV_TRANSCRIPTION_URL = 'http://127.0.0.1:8178/inference'
+$env:TS_JEV_TRANSCRIPTION_TIMEOUT_SECONDS = '120'
+dotnet run --project TensorSharp.Server.Host -c Release -- --config config/jev-diffusiongemma-q4.json
+```
+
+端点必须接受 multipart 字段 `file` 与 `response_format=json`，返回包含非空 `text` 字符串且不超过 1 MiB 的 JSON 对象。
+兼容 OpenAI 的语音服务可使用以 `/v1/audio/transcriptions` 结尾的完整 URL。
+`TS_JEV_TRANSCRIPTION_MODEL` 添加可选的 `model` 字段，`TS_JEV_TRANSCRIPTION_API_KEY` 添加可选的
+bearer token。超时默认为 120 秒，允许 1–600 秒。只有部署方能配置该 URL，请求无法选择音频发送目的地。
+进程内应用也可以提供 `ModelService.JevAudioTranscriber`。重复音频可复用有界转录缓存：每个服务最多 16 项，
+以内容哈希与扩展名作为键；不缓存失败的转录。
+
+未配置转录器、服务失败或超时时，音频请求返回 HTTP 503；空语音返回 HTTP 422。两类失败都不会退回到忽略音频的猜测。
+ASR 准确率属于端到端判定质量的一部分：需要在目标语言和声学环境中同时验证转录与判定。转录路径不代表
+模型具备原生音频理解能力。
+
+### 校验失败
+
+远程 URL 与任意文件系统路径都不会被抓取或读取。不支持的扩展名、无效 base64、损坏的文档/媒体，或超出附件
+限制，返回 HTTP 422。缺少所需视觉塔或音频转录器等能力，返回 HTTP 503。无效的原有图像同样返回带解码原因
+的 HTTP 422。非 JSON 的 Jev 请求返回 HTTP 415；超出请求体上限返回 HTTP 413。存储策略失败保留原有状态码
+（超过单文件上限为 413，超过配额为 507）。
 
 ## 概率语义
 
 对每个问题，模型计算其允许标签的 logits `z`，在模型最终的 logit softcap 之后以温度 1 返回
-`softmax(z)`。这些概率是以所列答案为条件的，而当请求携带图像时，也以同一提示中编码后的图像行为条件。
+`softmax(z)`。这些概率以所列答案及预处理后的 state 为条件，包括文本、提取的文档内容、语音转录和
+编码后的图像行。文本提取、视频抽样与转录可能在模型读取前丢失证据。
 `noul` 的值是 true 标签的概率。选择题取概率最高的选项；得分题取其档位下标的概率加权平均。
 选择题与得分题的 `confidence` 是最大的条件概率，与 vLLM 原型一致。LocalJev 使用的是 1 减去归一化熵，
 因此两者的置信度数值不应直接比较。诊断信息会说明条件熵的语义，并给出读取次数、canvas 宽度以及重复
@@ -301,12 +393,29 @@ attention，也没有常驻的注意力图缓存，因此 prompt 内存仍按平
 视觉塔的运行中服务端，并筛查一张含义明确的合成图片。这项筛查证明像素到达了读取，而不是图像理解基准，
 也说明不了视觉判定上的校准。在为图像输入设置置信度阈值之前，请记录一次独立评估。
 
+附件测试集使用
+[`InferenceWeb.Tests/Fixtures/JevAttachments`](../../InferenceWeb.Tests/Fixtures/JevAttachments/manifest.json)
+中的原创文本/代码、PDF、DOCX、XLSX、PPTX、图像、视频、音频和混合证据样例。它同时运行内联数据与
+`/api/upload` → 文件引用通路；`--modes inline,data-url,upload` 覆盖三种传输形式。manifest 记录了
+文件哈希与来源。视频只重复一张静态图，音频是合成语音，因此检查的是输入是否到达模型，而不是时序理解或
+ASR 词错误率。内容相反的文档、并发复用上传引用，以及随后执行的纯文本请求用于检查证据隔离。
+
+基准分别报告上传、客户端请求/端到端、服务端预处理和推理耗时。完整覆盖要求服务端加载视觉塔，并连接
+真实的转录服务。缺失服务和跳过用例不计为通过的覆盖范围。`--cases txt,pdf,docx` 可单独运行
+文档用例，但不代表验证了所有模态。只有为目标硬件与负载显式设置 `--max-p95-ms` 预算，才能据此判断性能
+是否达标。重复预热的样例可能命中提取、转录与 embedding 缓存；要评估生产吞吐量，还应单独测量新的代表性内容。
+
 ```powershell
 # Pure protocol/math tests (no model or GPU required).
 dotnet test InferenceWeb.Tests -c Release --filter 'FullyQualifiedName~Jev&Requires!=Models&Requires!=Cuda&Requires!=Mlx'
 
 # Python harness checks use mock responses, without model inference.
 python eng/tests/jev-benchmark-tests.py
+python eng/tests/jev-attachments-benchmark-tests.py
+
+# Full attachment quality/transport screen: server needs vision AND real ASR.
+# Add --max-p95-ms with the latency budget chosen for your deployment.
+python eng/jev-attachments-benchmark.py --endpoint http://127.0.0.1:5000 --modes inline,data-url,upload --repeats 3 --concurrency 1,2 --description 'Record hardware, model, quantization, backend and ASR service' --output artifacts/jev/attachments
 
 # Real GGUF sparse/full projection comparison, including deterministic reuse.
 $env:TS_TEST_MODEL_DIR = 'C:/Works/models'

@@ -222,7 +222,7 @@ TensorSharp.Server.Host --config config/gemma-4-26b-a4b.json
 | [`gemma-4-12b.json`](gemma-4-12b.json) | Gemma-4 12B (QAT) + vision + MTP draft | Multimodal LLM |
 | [`gemma-4-26b-a4b.json`](gemma-4-26b-a4b.json) | Gemma-4 26B-A4B (MoE) + vision + MTP draft | Multimodal MoE LLM |
 | [`gpt-oss-20b.json`](gpt-oss-20b.json) | gpt-oss-20b (Q8_0) | Text reasoning LLM |
-| [`jev-diffusiongemma-q4.json`](jev-diffusiongemma-q4.json) | DiffusionGemma 26B-A4B (Q4_K_M) + vision | [Jev typed decisions](../docs/models/jev.md) over text or image state, native `/v1/systemone` server |
+| [`jev-diffusiongemma-q4.json`](jev-diffusiongemma-q4.json) | DiffusionGemma 26B-A4B (Q4_K_M) + vision | [Jev typed decisions](../docs/models/jev.md) over text, images, documents, sampled video and configured ASR transcripts, native `/v1/systemone` server |
 | [`diffusiongemma-26b-a4b-q4.json`](diffusiongemma-26b-a4b-q4.json) | DiffusionGemma 26B-A4B (Q4_K_M) | Text diffusion + image input (CLI/server); auto-downloads the vision shard |
 | [`diffusiongemma-26b-a4b-q3.json`](diffusiongemma-26b-a4b-q3.json) | DiffusionGemma 26B-A4B (Q3_K_M) | Text diffusion + image input, smaller; shares the Q4 vision shard |
 
@@ -266,12 +266,14 @@ Notes:
   tune it with `--diffusion-steps` / `--diffusion-seed`. Its `mmproj` entry is the
   Gemma-4 vision tower, loaded straight from the upstream Hugging Face shard
   `model-00011-of-00011.safetensors` (2.84 GB), which enables `--image` on the CLI
-  and image input on the server. Audio is refused, and there is no video path: an
+  and image input on the server. Ordinary chat refuses audio and has no native video path: an
   OpenAI `video_url` part is refused, and a video uploaded in the Web UI reaches
   the model only as extracted frames, treated as plain images. To run text-only
   without that download, pass `--mmproj none`: a command-line `--mmproj` drops the
   file's entry before it is resolved, so the shard is never fetched (this works on
-  the CLI too).
+  the CLI too). The [Jev endpoint](../docs/models/jev.md#files-documents-video-and-audio)
+  additionally accepts uploaded documents, sampled video frames and audio through
+  an explicitly configured transcription service.
 - **Every download entry in every config in this folder is pinned** to a full
   commit and a SHA-256, not to `main`, so every machine gets the same bytes; a
   test enforces it. That covers the basic examples, the Wan and MiniMax-H3

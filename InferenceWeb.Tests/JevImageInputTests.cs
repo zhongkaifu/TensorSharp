@@ -118,14 +118,12 @@ public sealed class JevImageInputTests : IDisposable
 
     [Theory]
     [InlineData("audio")]
-    [InlineData("audios")]
     [InlineData("video")]
-    [InlineData("videos")]
-    public void NamesTheReasonAudioAndVideoAreRefused(string field)
+    public void NamesTheSupportedArrayForSingularMediaFields(string field)
     {
         using var document = JsonDocument.Parse(
             "{\"state\":\"x\",\"questions\":{\"a\":{\"type\":\"noul\"}},\"" + field + "\":[\"anything\"]}");
-        Assert.Contains("image tower only",
+        Assert.Contains("attachment array",
             Assert.Throws<JevValidationException>(() => JevRequest.Parse(document.RootElement)).Message);
     }
 }

@@ -16,7 +16,8 @@ internal static class JevInference
 
     internal static object Run(JevRequest request, string modelName, Func<string, int[]> encode,
         Func<string, string, int[]> renderPrompt, Read read, int maxWidth, int maxContext,
-        int eos, int pad, int vocabSize, CancellationToken ct)
+        int eos, int pad, int vocabSize, CancellationToken ct,
+        int? imageCount = null, object? attachments = null, double preprocessingMs = 0)
     {
         ct.ThrowIfCancellationRequested();
         var timer = Stopwatch.StartNew();
@@ -24,7 +25,7 @@ internal static class JevInference
         // Validate every prompt before executing any model work. Context is never truncated:
         // truncation could silently drop a question or change the meaning of the state.
         var prompts = templates.Select(t => renderPrompt(JevCompiler.SystemText(request,
-            request.SharedPrompt ? request.Questions : t.Questions, request.SharedPrompt && templates.Count > 1), request.State)).ToArray();
+            request.SharedPrompt ? request.Questions : t.Questions, request.SharedPrompt && templates.Count > 1, imageCount), request.State)).ToArray();
         for (int i = 0; i < prompts.Length; ++i)
             if ((long)prompts[i].Length + templates[i].CanvasWidth > maxContext)
                 throw new JevValidationException($"state and question prompt need {prompts[i].Length + templates[i].CanvasWidth} tokens; model context holds {maxContext}");
@@ -77,6 +78,7 @@ internal static class JevInference
                 first_read_conditional_entropy = draws[0].Select(Entropy).ToArray() });
         }
         ct.ThrowIfCancellationRequested();
+        double inferenceMs = timer.Elapsed.TotalMilliseconds;
         return new
         {
             model = modelName,
@@ -85,13 +87,15 @@ internal static class JevInference
             diagnostics = new
             {
                 engine = "tensorsharp", steps = 1,
-                images = request.Images.Length,
+                images = imageCount ?? request.Images.Length,
+                attachments = attachments ?? Array.Empty<object>(),
                 probability_semantics = "conditional_label_softmax_temperature_1",
                 entropy_semantics = "conditional_label_entropy_nats",
                 seed = request.Seed,
                 samples = new { policy = request.Samples == 0 ? "auto" : "fixed", n = request.Samples == 0 ? (int?)null : request.Samples,
                     auto_max = request.AutoMax, auto_threshold = request.AutoThreshold },
-                timing = new { total_ms = timer.Elapsed.TotalMilliseconds, reads = totalReads },
+                timing = new { total_ms = inferenceMs + preprocessingMs,
+                    preprocessing_ms = preprocessingMs, inference_ms = inferenceMs, reads = totalReads },
                 chunks = groups,
                 questions = diagnostics,
             },

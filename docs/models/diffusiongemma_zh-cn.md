@@ -9,7 +9,7 @@
 | GGUF 架构标识 | `diffusion-gemma`、`diffusion_gemma` |
 | 模型类 | [`DiffusionGemmaModel`](../../TensorSharp.Models/Models/DiffusionGemma/DiffusionGemmaModel.cs) |
 | 采样器 | [`DiffusionGemmaSampler`](../../TensorSharp.Models/Models/DiffusionGemma/DiffusionGemmaSampler.cs) |
-| 模态 | 文本 + **图像**（不支持音频：该检查点没有音频塔） |
+| 模态 | 原生文本 + **图像**；[Jev](jev_zh-cn.md) 另支持文档提取、抽样视频帧，以及已配置 ASR 配套服务的语音转录 |
 | 思维链 / 工具调用 | 不提示思考：提示词始终以关闭思考的方式渲染。模型自行写出的思维块会被解析剥离，仅在 `"think": true` 时作为推理返回；若 canvas 只有思维块，这段文本会作为答案返回（见 §6）。tools/tool_choice 以 HTTP 400 拒绝 |
 | 生成方式 | 分块文本扩散，不是自回归 token decode |
 | CLI 支持 | `TensorSharp.Cli` 检测到 `DiffusionGemmaModel` 后进入 diffusion 运行模式 |
@@ -63,13 +63,14 @@ python3 eng/diffusiongemma-mmproj.py --src models/model-00011-of-00011.safetenso
 该测试需要本地 fixture 目录（`TS_DIFFUSIONGEMMA_VISION_DIR`），没有时会跳过。脚本同样面向
 llama.cpp 的 clip 加载器编写，但没有记录过用 llama.cpp 运行其输出的结果。
 
-音频**不受支持**，任何 projector 也补不上：上游 config 没有 `audio_config`，
+原生音频**不受支持**，任何 projector 也补不上：上游 config 没有 `audio_config`，
 权重里也没有音频塔，因此 tokenizer 从 Gemma 4 继承来的 `<|audio|>` token 背后
 什么都没有。
 
 类型化判定（`noul`、`choice`、`score`）请使用原生 [`/v1/systemone` Jev 端点](jev_zh-cn.md)：
 它在一次去噪步中从带种子的 canvas 读取标签概率，使用稀疏输出投影，不解析生成的 JSON。
-其状态同样可以携带图像，并使用本页描述的同一个视觉塔。可从
+其状态支持上传文本/文档、通过视觉塔读取的图像与抽样视频帧，以及由配置的 ASR 配套服务提供的音频转录。
+这些预处理通路详见 Jev 指南。可从
 [`jev-diffusiongemma-q4.json`](../../config/jev-diffusiongemma-q4.json) 开始。
 
 命令行下载（每个文件一行；需要先 `pip install -U huggingface_hub`）：
@@ -248,9 +249,10 @@ Diffusion 专属元数据：
 - 图像回合需要用 `--mmproj` 加载视觉塔。每张图片在上下文检查之前展开为其软 token
   span；编码后的 span 归 scheduler 中的该序列所有，每次 prefill 该序列的提示时都会
   重新应用（每个 block 一次；在没有 prompt-KV 缓存的后端上则是每一步），因此图像请求
-  与文本请求可以一起批处理。音频会被拒绝。没有视频通路：OpenAI 的 `video_url` 会被拒绝；
+  与文本请求可以一起批处理。普通聊天拒绝音频，没有原生视频通路：OpenAI 的 `video_url` 会被拒绝；
   在 Web UI 中上传的视频只以抽取出的帧送入模型，每帧按普通 `<|image>` 渲染（没有
-  `<|video>` 标记，也没有帧时间戳）。
+  `<|video>` 标记，也没有帧时间戳）。独立的 [Jev 端点](jev_zh-cn.md#文件文档视频与音频)支持
+  有界视频抽帧，以及 ASR 配套服务的语音转录。
 
 Ollama 与 OpenAI 兼容适配器仍通过 `ChatStreamWithMetricsAsync` 使用 append-oriented
 响应形状。它们可以返回 DiffusionGemma 的最终文本，但实时去噪预览与 `replace`

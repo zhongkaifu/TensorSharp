@@ -15,7 +15,7 @@ namespace TensorSharp.Server.ProtocolAdapters;
 public static class JevAdapter
 {
     /// <summary>
-    /// Request-body ceiling. Images travel base64-encoded inside the JSON body, which is why the
+    /// Request-body ceiling. Inline attachments travel base64-encoded inside the JSON body, so the
     /// default is megabytes rather than the kilobytes a typed text decision needs;
     /// <c>TS_JEV_MAX_BODY_MB</c> (1 to 64) sets it for an operator who wants it tighter.
     /// </summary>
@@ -43,7 +43,7 @@ public static class JevAdapter
             {
                 await Error(context, 415, "unsupported_media_type",
                     "Jev requests must use application/json; multipart uploads are not supported. " +
-                    "Send images inline in 'images' as base64 or a data: URL.");
+                    "Send inline attachments as base64, or upload to /api/upload and send its 'file' reference in files/documents/videos/audios.");
                 return;
             }
             using var document = await ReadBody(context).ConfigureAwait(false);
@@ -67,7 +67,7 @@ public static class JevAdapter
         }
         catch (UploadLimitExceededException error)
         {
-            // Image storage is governed by the operator's upload limits; answer with the
+            // Attachment storage is governed by the operator's upload limits; answer with the
             // status those limits declare (413 over the per-file cap, 507 over the quota).
             await Error(context, error.StatusCode, "invalid_request_error", error.Message);
         }
@@ -101,7 +101,8 @@ public static class JevAdapter
             if (buffer.Length + count > MaxRequestBodyBytes) throw new JevBodyTooLargeException();
             buffer.Write(chunk, 0, count);
         }
-        return JsonDocument.Parse(buffer.ToArray(), new JsonDocumentOptions { MaxDepth = 64 });
+        return JsonDocument.Parse(buffer.GetBuffer().AsMemory(0, checked((int)buffer.Length)),
+            new JsonDocumentOptions { MaxDepth = 64 });
     }
 
     private static Task Error(HttpContext context, int status, string type, string message)

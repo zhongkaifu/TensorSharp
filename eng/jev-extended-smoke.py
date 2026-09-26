@@ -317,6 +317,14 @@ def main():
     remote = dict(base, samples=1, images=["https://example.com/receipt.png"])
     suite.run("image-remote-url-refused", remote, error_validator(422))
 
+    # Named attachment arrays use the object schema, never arbitrary URL strings.
+    # End-to-end supported media and upload references are exercised separately by
+    # eng/jev-attachments-benchmark.py with real document/video/audio fixtures.
+    for field in ("files", "documents", "videos", "audios"):
+        suite.run(field + "-remote-url-refused", dict(base, **{field: ["https://example.com/media"]}), error_validator(422))
+    for field in ("audio", "video", "document", "file"):
+        suite.run(field + "-singular-field-refused", dict(base, **{field: "unsupported"}), error_validator(422))
+
     if args.image:
         image_body, image_gold = image_payload(args.model, args.image_request)
 

@@ -22,6 +22,9 @@ public class UploadContentPolicyTests
     [InlineData(".mp4", "video")]
     [InlineData(".mp3", "audio")]
     [InlineData(".pdf", "pdf")]
+    [InlineData(".docx", "document")]
+    [InlineData(".xlsx", "document")]
+    [InlineData(".pptx", "document")]
     [InlineData(".txt", "text")]
     [InlineData(".html", "text")]
     [InlineData(".cs", "text")]
@@ -34,7 +37,6 @@ public class UploadContentPolicyTests
     [InlineData(".svg")]
     [InlineData(".exe")]
     [InlineData(".xhtml")]
-    [InlineData(".docx")]
     [InlineData("")]
     public void Classify_UnlistedExtensions_AreUnknown(string ext)
     {

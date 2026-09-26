@@ -6,8 +6,10 @@
   // use another model directory, then run:
   // dotnet run --project TensorSharp.Server.Host -c Release -- --config config/jev-diffusiongemma-q4.json
   // Sampling/read controls belong in the JSON request, not chat sampler flags.
-  // Image input travels inside the request body; TS_JEV_MAX_BODY_MB (default 8)
-  // caps that body.
+  // "files", "documents", "videos" and "audios" accept {name,data} inline
+  // base64 or {file} references returned by POST /api/upload. The existing
+  // "images" base64 array remains supported. TS_JEV_MAX_BODY_MB (default 8)
+  // caps the JSON body; upload references avoid base64/body overhead.
   // MAX_CONTEXT is environment-only and limits prompt + canvas tokens. Set it
   // before launch for your memory budget (for example, $env:MAX_CONTEXT='4096').
   // On a 16 GiB CUDA GPU, reserve activation space before launch with
@@ -24,11 +26,10 @@
     ],
     "sha256": "24523b6c833c9ce9f5f34f9b333ab1517d73d6f1e76a103645353114c8028bc5"
   },
-  // Vision tower for image input. A Jev request may carry images in "images"
-  // (base64 or data: URLs); each one is encoded here and read as part of the
-  // state, and the label logits are then conditioned on the pixels as well as
-  // the text. Without this entry the server still answers text-only requests
-  // and refuses image ones with 503 rather than guessing.
+  // Vision tower for images, scanned document pages and sampled video frames.
+  // Each image is encoded here and read as part of the state. Without this
+  // entry, text/documents with extractable text still work, but requests
+  // needing image rows receive 503 rather than answers that ignore the pixels.
   //
   // Every published GGUF of this checkpoint is TEXT-ONLY, and no mmproj was
   // released for it; the upstream repo does carry the tower, and all 356 of its
@@ -38,8 +39,14 @@
   // the command line: a command-line value replaces this entry before it is
   // resolved, so the shard is never fetched, and "none" loads no projector.
   //
-  // Audio is NOT supported by this checkpoint (no audio_config, no audio
-  // weights), and neither is video; both are refused by name.
+  // Video uses up to four sampled frames per clip; soundtrack is not read.
+  // Audio needs a separately running ASR service: set TS_JEV_TRANSCRIPTION_URL
+  // to its full endpoint (e.g. http://127.0.0.1:8178/inference) before launch.
+  // It must accept multipart file,response_format=json and return {"text":...}.
+  // Optional: TS_JEV_TRANSCRIPTION_MODEL, TS_JEV_TRANSCRIPTION_API_KEY,
+  // TS_JEV_TRANSCRIPTION_TIMEOUT_SECONDS (default 120). Only speech transcripts
+  // reach this model; it has no audio tower. Missing ASR returns 503.
+  // See docs/models/jev.md for formats, limits, examples and validation.
   "mmproj": {
     "path": "${modelRoot}/diffusiongemma-26B-A4B-it-vision.safetensors",
     "urls": [

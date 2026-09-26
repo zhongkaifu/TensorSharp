@@ -92,7 +92,7 @@ internal static class JevImageInput
     /// dispatches decoding; this check only fails a non-image fast, with a 422 naming the
     /// reason, instead of letting it reach the vision tower as a decode failure.
     /// </summary>
-    private static string SniffFormat(ReadOnlySpan<byte> d)
+    internal static string SniffFormat(ReadOnlySpan<byte> d)
     {
         if (d.Length >= 8 && d[0] == 0x89 && d[1] == 0x50 && d[2] == 0x4E && d[3] == 0x47 &&
             d[4] == 0x0D && d[5] == 0x0A && d[6] == 0x1A && d[7] == 0x0A) return "png";
