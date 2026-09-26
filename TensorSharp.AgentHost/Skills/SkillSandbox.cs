@@ -105,6 +105,11 @@ namespace TensorSharp.AgentHost.Skills
         bool ConfinesHomeReads,
         bool BoundsProcessTree)
     {
+        /// <summary>True only when reads are restricted to the supplied workspace,
+        /// declared readable paths, and system runtime files. Hiding home alone does
+        /// not qualify: a delegated script must not read sibling workspaces in temp.</summary>
+        public bool ConfinesWorkspaceReads { get; init; }
+
         /// <summary>The properties this sandbox does NOT provide, phrased for a human.</summary>
         public IReadOnlyList<string> Gaps()
         {

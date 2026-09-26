@@ -10,6 +10,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using TensorSharp.AgentHost.Skills;
 using TensorSharp.Runtime;
 
@@ -90,6 +91,24 @@ namespace TensorSharp.AgentHost.CodeExec
 
         /// <inheritdoc/>
         public string? UnavailableReason => _runner.UnavailableReason;
+
+        /// <inheritdoc/>
+        public IReadOnlyList<ToolFunction> DeclareWorkspaceTools(bool allowWrite) =>
+            DeclareTools(persists: true).Where(tool =>
+                tool.Name == SkillToolNames.ReadFile
+                || (allowWrite && tool.Name != SkillToolNames.Shell)
+                || (allowWrite && CanConfineChildExecution)).ToArray();
+
+        private bool CanConfineChildExecution => _runner.CanRun
+            && !_runner.Options.Unconfined
+            && _runner.Options.Sandbox == SkillSandboxMode.Required
+            && _runner.Sandbox?.Capabilities.ConfinesWrites == true
+            && _runner.Sandbox.Capabilities.ConfinesWorkspaceReads
+            && (_runner.Options.AllowNetwork || _runner.Sandbox.Capabilities.ConfinesNetwork);
+
+        /// <inheritdoc/>
+        public ICodeRunner ForkForWorkspace(SessionWorkspace workspace, bool allowWrite) =>
+            new WorkspaceCodeRunner(this, workspace, allowWrite);
 
         /// <inheritdoc/>
         [return: System.Diagnostics.CodeAnalysis.NotNullIfNotNull(nameof(requested))]

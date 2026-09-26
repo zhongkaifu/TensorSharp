@@ -203,6 +203,8 @@ public sealed class MultiAgentProgressTests
         public bool CanRun => true;
         public string? UnavailableReason => null;
         public ToolFunction Declare() => new() { Name = "shell" };
+        public IReadOnlyList<ToolFunction> DeclareWorkspaceTools(bool allowWrite) => allowWrite ? [Declare()] : [];
+        public ICodeRunner? ForkForWorkspace(SessionWorkspace workspace, bool allowWrite) => allowWrite ? new ScopedRunner(this, workspace) : null;
         public SkillToolResult Execute(ToolCall call, IReadOnlyList<CodeInputFile>? inputFiles = null,
             Action<string>? onOutput = null, SessionWorkspace? workspace = null,
             IReadOnlyList<string>? skillDirectories = null)
@@ -210,6 +212,21 @@ public sealed class MultiAgentProgressTests
             Started.TrySetResult(true);
             Release.Task.WaitAsync(TimeSpan.FromSeconds(5)).GetAwaiter().GetResult();
             return new(true, "fixture output", null, "fixture.txt");
+        }
+
+        private sealed class ScopedRunner(BlockingRunner owner, SessionWorkspace scope) : ICodeRunner
+        {
+            public bool CanRun => true;
+            public string? UnavailableReason => null;
+            public ToolFunction Declare() => owner.Declare();
+            public SkillToolResult Execute(ToolCall call, IReadOnlyList<CodeInputFile>? inputFiles = null,
+                Action<string>? onOutput = null, SessionWorkspace? workspace = null,
+                IReadOnlyList<string>? skillDirectories = null)
+            {
+                Assert.Same(scope, workspace);
+                Assert.Equal("shell", call.Name);
+                return owner.Execute(call, onOutput: onOutput, workspace: scope);
+            }
         }
     }
 }

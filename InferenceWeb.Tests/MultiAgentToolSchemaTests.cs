@@ -44,7 +44,7 @@ public sealed class MultiAgentToolSchemaTests
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
-    public async Task ParentAndReadOnlyProfilesShareAllToolDeclarationsWithoutGrantingMutation(bool allowWorkerTools)
+    public async Task ProfilesPreserveReadOnlyToolPrefixAndWithholdUnscopedMutation(bool allowWorkerTools)
     {
         var tools = SkillTools.BuiltIn(allowScripts: true);
         tools.Add(new() { Name = SkillToolNames.Shell, Description = "Execute a workspace command." });
@@ -63,8 +63,8 @@ public sealed class MultiAgentToolSchemaTests
             if (!readOnly)
             {
                 Assert.True(allowWorkerTools);
-                Assert.Contains(profile.Tools, tool => tool.Name == SkillTools.RunToolName);
-                Assert.Contains(profile.Tools, tool => tool.Name == SkillToolNames.Shell);
+                // A declaration alone cannot authorize execution in a child workspace.
+                Assert.DoesNotContain(profile.Tools, tool => tool.Name is SkillTools.RunToolName or SkillToolNames.Shell);
                 continue;
             }
             Assert.DoesNotContain(profile.Tools, tool => tool.Name is SkillTools.RunToolName or SkillToolNames.Shell);
@@ -153,5 +153,11 @@ public sealed class MultiAgentToolSchemaTests
         Assert.Equal(new[] { "task_name", "task" }, spawn.GetProperty("required")
             .EnumerateArray().Select(parameter => parameter.GetString()).ToArray());
         Assert.True(spawn.GetProperty("properties").TryGetProperty("agent_type", out _));
+        Assert.Equal("string", spawn.GetProperty("properties").GetProperty("depends_on").GetProperty("type").GetString());
+        JsonElement permissions = spawn.GetProperty("properties").GetProperty("permissions");
+        Assert.Equal("string", permissions.GetProperty("type").GetString());
+        Assert.Contains("read-only", permissions.GetProperty("description").GetString());
+        Assert.Contains("workspace-write", permissions.GetProperty("description").GetString());
+        Assert.Equal("string", spawn.GetProperty("properties").GetProperty("input_files").GetProperty("type").GetString());
     }
 }

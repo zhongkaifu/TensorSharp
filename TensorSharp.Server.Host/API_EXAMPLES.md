@@ -908,7 +908,13 @@ parent transcript, and it copies rather than shares KV state (the parent's
 shared prefix is checkpointed so siblings can restore it). `explorer` and
 `reviewer` children are read-only; a `worker` is read-only too unless the server
 starts with `--agents-allow-worker-tools`. Client-defined tools are never passed
-to a child, and host tool calls within one request run one at a time.
+to a child. Each child has a private workspace populated from its explicit
+`input_files`; independent child tools can run concurrently. `depends_on` queues
+dependent subtasks until their sibling prerequisites succeed. Changed files are
+exported separately for parent review and integration. Built-in child workers
+use file tools; the parent runs commands because current sandbox profiles do not
+guarantee private-workspace read confinement for child shells. See
+[task graphs and permissions](../docs/multi_agent.md) for the spawn fields and limits.
 
 Send `"multi_agent": false` to keep one request single-agent:
 

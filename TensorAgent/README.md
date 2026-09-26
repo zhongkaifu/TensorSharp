@@ -303,9 +303,12 @@ Off, those five tools and the coordination prompt are not declared at all, exact
 on a server started with `--no-multi-agent`. The change applies to the running app
 (`ServerHostingOptions.RepointMultiAgent`) from the next message, with no restart; a
 turn already delegating finishes under its old terms. Children are read-only: the app
-never sets `AllowWorkerTools`, so a worker gets no mutable tools either. Host tool
-calls in one tree run one at a time. Each child starts a fresh conversation (the
-parent's system instructions and its task, not the parent's transcript) and restores
+never sets `AllowWorkerTools`, so a worker gets no mutable tools either. Children
+use private workspaces with explicitly selected input files. Independent tasks
+and permitted tools can overlap; declared dependencies wait for successful
+prerequisites, and extra tasks queue within the shared limits. Each child starts
+a fresh conversation (the parent's system instructions and its task, not the
+parent's transcript) and restores
 its own copy of any matching shared-prefix checkpoint rather than sharing KV pages.
 The app does not read `TS_NO_MULTI_AGENT`, which only `TensorSharp.Server` reads,
 and the phone page never sends `multi_agent: false`; the switch is the way to turn

@@ -488,7 +488,7 @@ namespace TensorSharp.Server.Host.Hosting
                 new OptionHelp("--agents-max-generations <N>", "Shared generation budget for all descendants. Default: 48.", "--agents-max-generations 24"),
                 new OptionHelp("--agents-timeout <seconds>", "Child lifetime limit. Default: 180 seconds.", "--agents-timeout 300"),
                 new OptionHelp("--agents-max-result-chars <N>", "Maximum returned characters per child report. Default: 8000.", "--agents-max-result-chars 4000"),
-                new OptionHelp("--agents-allow-worker-tools", "Allow explicit worker agents to use the parent's permitted mutable tools. Explorers and reviewers remain read-only.", "--agents-allow-worker-tools"),
+                new OptionHelp("--agents-allow-worker-tools", "Allow worker agents to edit private workspaces using permitted tools. Child shell execution requires workspace read confinement. Explorers and reviewers remain read-only.", "--agents-allow-worker-tools"),
             }),
             ("Agent skills (SKILL.md bundles; repository and configured skill directories)", new[]
             {

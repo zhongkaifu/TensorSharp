@@ -2037,6 +2037,13 @@ namespace TensorSharp.Chat
             IReadOnlyList<CodeInputFile> sourceCodeInputFiles = CollectCodeInputFiles(messages);
             IReadOnlyList<CodeInputFile> codeInputFiles = ReadableCodeInputFiles(sourceCodeInputFiles);
             SessionWorkspace workspace = WorkspaceFor(chatSession);
+            // Stateless callers use the shared default chat session, never its files.
+            // Keep one private workspace alive across this request's tool/agent rounds,
+            // matching the other protocol adapters; iteration disposal releases it.
+            using RequestWorkspaceLease workspaceLease = workspace == null
+                ? RequestWorkspaceLease.Acquire(_workspaces, _codeRunner, _svc.Architecture)
+                : null;
+            workspace ??= workspaceLease?.Workspace;
             var skillPlan = SkillRequestPlan.Create(
                 _skills, requestedSkills, requestedDiscovery, uiTools,
                 _svc.Architecture, _svc.ContextTokens, _options, out var unknownSkills, codeRunner: _codeRunner,
@@ -2346,7 +2353,7 @@ namespace TensorSharp.Chat
                                 update.ToolProgressPhase, update.ToolProgressName,
                                 update.ToolProgressPiece, update.ToolProgressSeconds,
                                 update.ToolProgressDetail,
-                                update.ToolProgressPhase == "running" && update.ToolProgressName == MultiAgentTools.Wait
+                                update.ToolProgressPhase is "running" or "finished" && update.ToolProgressName == MultiAgentTools.Wait
                                     ? skillPlan?.Agents?.GetProgress() : null);
                         continue;
                     }
@@ -2480,7 +2487,7 @@ namespace TensorSharp.Chat
                                 update.ToolProgressPhase, update.ToolProgressName,
                                 update.ToolProgressPiece, update.ToolProgressSeconds,
                                 update.ToolProgressDetail,
-                                update.ToolProgressPhase == "running" && update.ToolProgressName == MultiAgentTools.Wait
+                                update.ToolProgressPhase is "running" or "finished" && update.ToolProgressName == MultiAgentTools.Wait
                                     ? skillPlan?.Agents?.GetProgress() : null);
                     }
                 }

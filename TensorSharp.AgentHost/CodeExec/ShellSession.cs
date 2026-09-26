@@ -205,6 +205,28 @@ namespace TensorSharp.AgentHost.CodeExec
             }
         }
 
+        /// <summary>Read bounded binary input using the same anchored, no-follow handles
+        /// as diagnostic reads. Used when copying files between agent workspaces.</summary>
+        internal static byte[] ReadBoundedRegularBytesUnderRoot(string root, string path, int maxBytes)
+        {
+            using SafeFileHandle? handle = OpenFileUnderRootNoFollow(root, path);
+            if (handle == null || handle.IsInvalid
+                || !TryGetRegularFileSnapshot(handle, out RegularFileSnapshot before)
+                || before.Length < 0 || before.Length > maxBytes || before.Length >= int.MaxValue)
+                throw new IOException("Input must be a regular file within the workspace and transfer size limit.");
+            byte[] bytes = new byte[checked((int)before.Length)];
+            int total = 0;
+            while (total < bytes.Length)
+            {
+                int read = RandomAccess.Read(handle, bytes.AsSpan(total), total);
+                if (read == 0) throw new IOException("Input changed during transfer.");
+                total += read;
+            }
+            if (!TryGetRegularFileSnapshot(handle, out RegularFileSnapshot after) || after != before)
+                throw new IOException("Input changed during transfer.");
+            return bytes;
+        }
+
         private static bool TryReadBoundedRegularText(
             SafeFileHandle handle, int maxBytes, out string text)
         {

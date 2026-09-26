@@ -131,6 +131,14 @@ namespace TensorSharp.AgentHost.Skills
         /// </summary>
         IReadOnlyList<ToolFunction> DeclareTools(bool persists) => DeclareTools();
 
+        /// <summary>Tools that can be safely bound to a separate child workspace.
+        /// Custom runners must opt in; declarations and execution must enforce the same scope.</summary>
+        IReadOnlyList<ToolFunction> DeclareWorkspaceTools(bool allowWrite) => Array.Empty<ToolFunction>();
+
+        /// <summary>Create a runner permanently bound to this workspace, preserving or
+        /// narrowing the host's permissions. Null withholds execution from children.</summary>
+        ICodeRunner? ForkForWorkspace(SessionWorkspace workspace, bool allowWrite) => null;
+
         /// <summary>Run what the call asks for and return the tool result.</summary>
         /// <param name="inputFiles">
         /// Files from the conversation to place in the program's working directory before

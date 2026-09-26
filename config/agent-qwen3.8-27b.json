@@ -113,6 +113,12 @@
   // is unreadable, so the agent works in its workspace, not in this repo.
   "code-exec": true,
 
+  // Implementation subtasks may edit their private workspace. Their selected
+  // inputs are copied and results return separately for parent integration.
+  // Explorer/reviewer children remain read-only; child command execution also
+  // requires a backend that guarantees private-workspace read confinement.
+  "agents-allow-worker-tools": true,
+
   // Host-performed pip/npm installs into the session workspace, wheels only,
   // with install scripts disabled. Does NOT by itself give generated code
   // network access. Installs are fixed at a 120 s timeout with no operator

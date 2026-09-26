@@ -22,13 +22,20 @@ besides those five.
 
 ## Choosing work and models
 
-The coordination prompt asks the model to identify a substantial, independent
-task with a concrete expected result before spawning. Suitable examples include
-analyzing separate documents, investigating distinct components, and reviewing
-a complex result independently. Short requests, sequential dependencies, and
-tasks competing over the same mutable resource should stay with the parent.
-The parent should continue useful independent work, avoid repeating delegated
-work, and verify important claims before combining the results.
+The coordination prompt asks the model to analyze the user's request, identify
+concrete subtasks and their dependencies, and delegate useful bounded work.
+Each assignment includes the necessary context, expected output, role, and file
+access. Independent tasks run concurrently within the host's capacity limit;
+a task with prerequisites waits for their successful completion. Suitable examples
+include analyzing separate documents, implementing distinct components, and
+reviewing completed work. Short requests and tightly coupled work may stay
+local when delegation would only add overhead.
+
+Decomposition and role selection are model decisions, rather than a fixed
+keyword-based splitter. The host enforces the resulting task graph, permissions,
+and lifecycle; it cannot guarantee that a model has correctly understood an
+assignment. The parent continues useful independent work, avoids repeating
+assignments, verifies important claims, and integrates the results.
 
 Each child uses the same model as the parent. `agent_type` chooses instructions
 and tool access, not another set of model weights:
@@ -37,7 +44,14 @@ and tool access, not another set of model weights:
 |---|---|---|
 | `explorer` | Focused investigation; default role | Advertised skill listing and reading; `read_file` when the parent offers it |
 | `reviewer` | Independent checks and evidence | Advertised skill listing and reading; `read_file` when the parent offers it |
-| `worker` | Bounded implementation work | Read-only by default; mutable host tools require explicit operator opt-in |
+| `worker` | Bounded implementation work | Mutable tools in its private workspace when host and parent permit them; explicit `read-only` narrows access |
+
+With the built-in OS runners, workers can use scoped file reads, writes, and
+patches but cannot run child shell commands or skill scripts: those sandboxes do
+not yet advertise the stronger workspace read-isolation guarantee required for
+child execution. The parent runs builds and tests after reviewing and integrating
+worker outputs. A custom backend can opt into child execution only when it
+enforces both read and write boundaries.
 
 There is no automatic selection among local or remote models in this version.
 Sharing the loaded model avoids loading a separate copy of its weights for each
@@ -50,9 +64,11 @@ Each child starts with governing system/developer instructions and a
 self-contained task supplied by the parent. It does not receive the parent's
 conversation transcript or attachments. Task text
 must therefore include the facts, scope, ownership boundaries, and expected
-evidence needed for the assignment. Follow-up turns reuse the child's own
-conversation. The parent receives bounded result reports rather than the
-child's full tool transcript.
+evidence needed for the assignment. `input_files` selects explicit files to copy
+from the parent's workspace; dependency outputs are staged separately. Follow-up
+turns reuse the child's own conversation and workspace. The parent receives
+bounded result reports and exported output paths rather than the child's full
+tool transcript.
 
 Children with the same role, governing instructions, and offered tools share a
 stable system/tool prefix. Their unique agent IDs and assignments follow it in
@@ -108,18 +124,52 @@ The model sees these native tools:
 
 | Tool | Behavior |
 |---|---|
-| `spawn_agent(task_name, task, agent_type?)` | Starts an independent child and immediately returns its ID and status. The task name must be 1–48 letters, digits, underscores, or hyphens, unique under its parent. `agent_type` defaults to `explorer`. |
-| `wait_agent(agent_id?, timeout_ms?)` | Waits for the named direct child, or all direct children when the ID is omitted. Default timeout is 10,000 ms; maximum is 60,000 ms. Returns each child's `agent_id`, `parent_id`, `status`, `result` and `error`, plus `timed_out`. A timeout does not mean the child completed or was cancelled. |
+| `spawn_agent(task_name, task, agent_type?, permissions?, input_files?, depends_on?)` | Registers a child and immediately returns its ID and state. The task name must be 1–48 letters, digits, underscores, or hyphens, unique under its parent. `agent_type` defaults to `explorer`. Jobs queue when capacity is full. |
+| `wait_agent(agent_id?, timeout_ms?)` | Waits for the named direct child, or all direct children when the ID is omitted. Default timeout is 10,000 ms; maximum is 60,000 ms. Returns child status, reports, effective permissions, `workspace_id`, `depends_on`, and exported `files` (`path`, `bytes`), plus `timed_out`. A timeout does not mean the child completed or was cancelled. |
 | `send_input(agent_id, message)` | Queues a message for a running child at its next generation boundary (at most four queued messages), or starts a follow-up turn on a completed child. |
 | `list_agents()` | Reports direct children and their state. Waiting uses `wait_agent`, rather than repeated listing. |
 | `close_agent(agent_id)` | Cancels a child and its descendants. Cancellation is not successful completion. |
+
+The optional spawn fields use flat strings for local-model tool compatibility:
+
+| Field | Meaning |
+|---|---|
+| `permissions` | Omit to use the role's host-permitted access. `read-only` narrows it; explicit `workspace-write` requires the `worker` role, host opt-in, and a parent that has mutable access, otherwise spawning fails. Writes stay inside the child's private workspace. |
+| `input_files` | Newline-separated relative paths from the parent's workspace or named authorized attachments. Only selected bounded file snapshots are copied; directories, absolute paths, traversal, and symlink escapes are rejected. |
+| `depends_on` | Comma- or newline-separated IDs of existing direct children of the same parent. The new task waits for every listed prerequisite to complete successfully. |
+
+Dependencies must refer to already-created siblings, so self references, forward
+references, cross-tree references, and cycles cannot enter the graph. A failed,
+cancelled, blocked, or budget-exhausted prerequisite blocks dependent work before
+its generation starts. Prerequisite reports are supplied as evidence, and their
+exported files are staged under `dependencies/<task_name>/` in the dependent
+workspace. A dependent task should still explain how to use and verify those
+inputs. Create all independent tasks first, then dependent tasks, and collect the
+results after other useful parent work.
+
+Prerequisites initialize a child's first execution: their completed reports and
+outputs are captured once. A follow-up reuses that child's existing history and
+workspace; it does not rerun prerequisites or import newer outputs. Create a new
+child to consume refreshed prerequisite results. While a dependent task remains
+unfinished, `send_input` rejects attempts to change its prerequisite's assignment.
+
+For example, these consecutive spawn calls allow two investigations to overlap
+and schedule a review after both finish:
+
+```json
+[
+  {"task_name":"api","task":"Inspect api.md and report compatibility risks with evidence.","agent_type":"explorer","permissions":"read-only","input_files":"api.md"},
+  {"task_name":"storage","task":"Inspect storage.md and report migration risks with evidence.","agent_type":"explorer","permissions":"read-only","input_files":"storage.md"},
+  {"task_name":"review","task":"Check both prerequisite reports for conflicting assumptions and prioritize the supported risks.","agent_type":"reviewer","depends_on":"/root/api,/root/storage"}
+]
+```
 
 Children inherit only permitted host-owned tools. Client-owned function tools
 are not delegated: their implementations belong to the caller, and an internal
 child cannot ask that caller to service them. Read-only roles cannot execute
 shell commands, run skill scripts, or modify files. They can analyze evidence
-included in their task and use the parent's `read_file` tool when offered,
-within its existing filesystem restrictions. Their host allowlist is exactly
+included in their task and use `read_file` when offered, within their private
+workspace and the host's authorized skill resources. Their host allowlist is exactly
 `skills_list`, `skills_read` and `read_file`, plus the five coordination tools.
 Enabling worker tools does
 not enable an execution surface that the operator has otherwise disabled.
@@ -127,22 +177,46 @@ Permissions only decrease down the tree: a `worker` receives mutable tools only
 when its parent is the root or is itself a mutable worker, so a read-only child
 cannot spawn a worker to regain them.
 
-Host tool calls from the parent and every child in a request tree pass through
-one shared gate, so they run one at a time. Generation still overlaps across
-agents; tool execution does not. A client tool with the same name as a
+Each child has its own workspace, forked runner/tool context, and tool gate.
+Host calls remain serialized within one agent's mutable context, while separate
+agents can execute independent tools concurrently. Generation also overlaps
+when the inference backend permits it. A client tool with the same name as a
 coordination tool takes precedence over the built-in one.
 
-Worker tools share the parent's sandbox and workspace. This version does not
-create Git worktrees or merge independent patches. Assign disjoint file scopes
-when opting into workers; read-only delegation is the default. Agent IDs do not
-grant access to another request's agents or workspace, and an agent can address
-only its own direct children.
+Private workspaces use bounded snapshots of selected inputs rather than a full
+repository checkout or Git worktree. Creating a workspace does not authorize
+new tools, network access, or access outside the parent's existing sandbox.
+Input and changed-output transfers are limited to 128 files and 64 MiB per
+transfer. Output inspection also stops at 4,096 workspace files. Exceeding a
+limit fails the operation rather than silently truncating it.
+The model's role label and task text cannot grant permissions: the executor
+checks effective tool access and confines mutable tools to the child workspace.
+No child can regain permissions its parent lacks.
+
+Changed output files are handed back under a unique parent-relative directory,
+`agent-results-<agent_id>-<unique_id>/`. These outputs do not overwrite the parent's source
+files. The parent reviews the exported paths, resolves conflicts, and applies
+accepted changes to its own workspace. Deletions are not automatically applied;
+workers must report intended deletions for the parent to review. Assign disjoint
+final file ownership even when workers execute in separate directories. Agent IDs do not grant access to
+another request's agents or workspace, and an agent can address only its own
+direct children.
+
+The concurrency limit controls runnable children across the entire tree.
+Dependency waits and capacity queues do not consume execution slots. A child
+waiting for its own descendants temporarily yields its slot and reacquires
+capacity before continuing, so nested delegation also progresses with a limit
+of one. A wait's timeout bounds the wait for results; a child may then queue for
+a resume slot before the tool returns and generation continues. The root does
+not need a resume slot. The parent must not treat an accepted spawn as proof that
+execution has already begun.
 
 Failures, timeouts, cancellation, and exhausted budgets are reported distinctly
-from completed work. A report's `status` is `completed`, `failed`, `cancelled`
-or `limit_reached`; a child still in flight is reported as `running` (the
-`close_agent` result and the Web UI panel show `cancelling` while a stopped
-child winds down).
+from completed work. Terminal states are `completed`, `failed`, `cancelled`,
+`limit_reached`, and `blocked`. In-flight work can be `queued`, `waiting`, or
+`running`; cancellation can show `cancelling` while a stopped child winds down.
+`blocked` means a required predecessor did not complete successfully; its report
+identifies the prerequisite rather than claiming the dependent task ran.
 A child generation that stops on a token, thinking-budget or repetition limit
 is `limit_reached`, and so is a child that runs out of rounds or of the shared
 generation budget. A child whose time limit expires is `cancelled`. Reports longer than `--agents-max-result-chars` end with
@@ -170,7 +244,8 @@ The panel is built from the Web UI stream on `POST /api/chat`. While
 `wait_agent` runs, whether the model called it or the host is collecting reports
 before the final answer, its `tool_progress` frames carry an `agents` array. Each
 entry has `agent_id`, `parent_id`, `task`, `agent_type`, `status`, `tool`,
-`tool_status`, `detail`, `result` and `error`. `skill_step` frames also carry
+`tool_status`, `detail`, `result`, `error`, `workspace_id`, `permissions`, and
+`depends_on`. `skill_step` frames also carry
 `agent_id`. The OpenAI and Ollama streams do not include these snapshots.
 TensorAgent's own chat page does not render an agent panel, even while
 delegation is on there; it only labels the sub-agent tool steps in words
@@ -194,21 +269,23 @@ limits or enable worker tools.
 | Flag | Default | Allowed range or meaning |
 |---|---|---|
 | `--no-multi-agent` | Absent | Disables coordination tools and automatic delegation. `TS_NO_MULTI_AGENT` set to a nonempty value other than `0` also disables it. |
-| `--agents-max-concurrent` | `3` | `1`–`32` active descendants; excludes the root |
+| `--agents-max-concurrent` | `3` | `1`–`32` executing descendants; excludes the root and children waiting for dependencies or child results |
 | `--agents-max-count` | `8` | `1`–`128` total children across the tree |
 | `--agents-max-depth` | `2` | `1`–`8` child levels below the root |
 | `--agents-max-rounds` | `8` | `1`–`64` tool-loop rounds per child turn; a capped loop permits one final answer generation |
 | `--agents-max-generations` | `48` | `1`–`1024` child generations across the request |
 | `--agents-timeout` | `180` | `1`–`3600` seconds per child run, reset for a follow-up turn |
 | `--agents-max-result-chars` | `8000` | `256`–`64000` characters per result report |
-| `--agents-allow-worker-tools` | Absent | Allows the `worker` role to use the parent's enabled mutable host tools |
+| `--agents-allow-worker-tools` | Absent | Allows `worker` agents to use enabled mutable host tools in private workspaces; `permissions: "read-only"` still narrows access |
 
 `MultiAgentOptions.MaxTaskCharacters` bounds task and message text, defaults to
 16,000, and permits values from 256 through 64,000. It is a C# option, without a
 dedicated startup flag. These limits bound orchestration; existing context,
 generation, skill, and code-execution limits still apply. Timeouts signal
 cancellation; generation callbacks must honor their cancellation token, and
-host tool execution retains the existing runner's time limits.
+host tool execution retains the existing runner's time limits. The child timeout
+starts when its turn is registered, so time in the capacity queue or waiting for
+prerequisites counts toward it.
 
 The integrated server paths are OpenAI-compatible chat completions and
 Responses (`/v1/chat/completions`, `/v1/responses`), Ollama chat
@@ -232,6 +309,18 @@ Direct C# callers enable `SkillAgentLoopOptions.MultiAgent` and provide
 state for each child ID; passing callbacks that capture the root's mutable
 session or KV state is not safe. The server integration supplies a separate
 `ChatSession` and generation context per child.
+
+Custom `ICodeRunner` implementations must opt into workspace delegation through
+`DeclareWorkspaceTools(bool allowWrite)` and `ForkForWorkspace(...)`, enforcing
+the declared scope during execution. The default interface implementation offers
+no child tools and no runner. Custom skill script runners likewise opt into
+`CanForkForWorkspace` and `ForkForWorkspace(...)`. Child shell and script
+execution also requires a backend that explicitly
+advertises workspace read isolation as well as write confinement. Existing
+built-in OS sandbox profiles do not make that stronger guarantee, so their child
+runners expose permitted file tools but withhold shell and script execution.
+Worker opt-in does not bypass this restriction; a host providing a backend with
+those guarantees must also keep its runner declarations and execution consistent.
 
 `SkillsChatClient` local delivery supplies independent HTTP conversations
 automatically. `SkillsChatClientOptions.MultiAgent` is enabled by default;
@@ -269,29 +358,49 @@ claim follows from the shared TensorAgent integration.
 The user-provided [TensorSharp design discussion](https://chatgpt.com/share/6ab43386-9464-83e8-828a-a1e97583bee4)
 proposed independent agent sessions, a runtime manager, tree-wide bounds,
 lifecycle tools, and a read-only first stage integrated with existing skills.
-Its later-stage proposals include isolated workspaces, heterogeneous models,
-task DAGs, and KV-cache-aware context forks. Those later features are not
-implemented by this change.
+The current implementation adds isolated workspaces and dependency scheduling.
+Heterogeneous model selection and conversation-history forks remain outside
+this coordinator's API.
 
 Implementation and prompt design were compared with the unchanged public
-[OpenAI Codex checkout](https://github.com/openai/codex/tree/12fd929f724371104a1dea7c14930b078d6b4a18),
-pinned at `12fd929f724371104a1dea7c14930b078d6b4a18` on 2026-09-24.
+[OpenAI Codex checkout](https://github.com/openai/codex/tree/e72da2b53805894878023d01949a25a082e0a5cb),
+pinned at `e72da2b53805894878023d01949a25a082e0a5cb` on 2026-09-25.
 TensorSharp adapts these ideas to its existing C# host and local-model tools:
 
 | Codex reference at the pinned revision | Design applied here |
 |---|---|
-| [Delegation guidance](https://github.com/openai/codex/blob/12fd929f724371104a1dea7c14930b078d6b4a18/codex-rs/core/src/tools/handlers/multi_agents_spec.rs#L711) | Bounded independent tasks, useful parent work during delegation, distinct ownership, and evidence-based synthesis |
-| [Proactive mode instructions](https://github.com/openai/codex/blob/12fd929f724371104a1dea7c14930b078d6b4a18/codex-rs/prompts/src/model_messages/multi_agent.rs) | Explicit prompting for the model's delegation decision |
-| [Shared agent registry](https://github.com/openai/codex/blob/12fd929f724371104a1dea7c14930b078d6b4a18/codex-rs/core/src/agent/registry.rs) | Tree identity, depth, and shared capacity accounting |
-| [Child configuration](https://github.com/openai/codex/blob/12fd929f724371104a1dea7c14930b078d6b4a18/codex-rs/core/src/agent/child_config.rs) | Inheriting effective runtime permissions and model settings |
-| [Completion routing](https://github.com/openai/codex/blob/12fd929f724371104a1dea7c14930b078d6b4a18/codex-rs/core/src/agent/control/completion.rs) | Separate child context and parent result delivery |
-| [Wait handling](https://github.com/openai/codex/blob/12fd929f724371104a1dea7c14930b078d6b4a18/codex-rs/core/src/tools/handlers/multi_agents_v2/wait.rs) | Bounded asynchronous waiting and explicit timeout state |
+| [Delegation guidance](https://github.com/openai/codex/blob/e72da2b53805894878023d01949a25a082e0a5cb/codex-rs/core/src/tools/handlers/multi_agents_spec.rs#L711) | Bounded independent tasks, useful parent work during delegation, distinct ownership, and evidence-based synthesis |
+| [Proactive mode instructions](https://github.com/openai/codex/blob/e72da2b53805894878023d01949a25a082e0a5cb/codex-rs/prompts/src/model_messages/multi_agent.rs) | Explicit prompting for the model's delegation decision |
+| [Shared agent registry](https://github.com/openai/codex/blob/e72da2b53805894878023d01949a25a082e0a5cb/codex-rs/core/src/agent/registry.rs) | Tree identity, depth, and shared capacity accounting |
+| [Child configuration](https://github.com/openai/codex/blob/e72da2b53805894878023d01949a25a082e0a5cb/codex-rs/core/src/agent/child_config.rs) | Inheriting effective runtime permissions and model settings |
+| [Completion routing](https://github.com/openai/codex/blob/e72da2b53805894878023d01949a25a082e0a5cb/codex-rs/core/src/agent/control/completion.rs) | Separate child context and parent result delivery |
+| [Wait handling](https://github.com/openai/codex/blob/e72da2b53805894878023d01949a25a082e0a5cb/codex-rs/core/src/tools/handlers/multi_agents_v2/wait.rs) | Bounded asynchronous waiting and explicit timeout state |
 
-This is not a claim of API compatibility with Codex. In particular, this version
-uses fresh child contexts and the five tools listed above, rather than exposing
-all of Codex's history-fork, messaging, and resume options.
+Codex delegates task decomposition and role selection to the model and enforces
+runtime limits and inherited authority in host code. Its current V2
+[workspace instructions](https://github.com/openai/codex/blob/e72da2b53805894878023d01949a25a082e0a5cb/codex-rs/prompts/src/multi_agent_instructions.rs#L13)
+explicitly describe a shared filesystem and working directory. TensorSharp's
+private selected-file workspaces, output handoff, and dependency-ready queue are
+TensorSharp additions, not claims about Codex's workspace isolation or an
+upstream automatic DAG planner.
+
+This is not a claim of API compatibility with Codex. TensorSharp uses fresh
+child contexts and the five tools listed above, rather than exposing all of
+Codex's history-fork, messaging, and resume options. Codex's
+[typed role overrides](https://github.com/openai/codex/blob/e72da2b53805894878023d01949a25a082e0a5cb/codex-rs/core/src/agent/role.rs#L36)
+and parent-derived runtime policy inform the rule that delegation cannot expand
+authority.
 
 ## Validation and performance
+
+The [dependency scheduler benchmark](../eng/validation/MultiAgentSchedulerBench/README.md)
+compares one and three execution slots on a ten-task graph, checking dependency
+order, result handoff, completion counts and observed concurrency. Its zero-delay
+arm measures orchestration overhead. The [workspace server probe](../eng/validation/probe_multi_agent_workspaces.py)
+exercises model-created workers, private file edits, dependent review and parent
+integration through the real Web UI API, with downloaded JSON artifact checks.
+Both write generated evidence to ignored directories; neither substitutes for
+representative model/device benchmarks.
 
 The [Web UI activity regression](../eng/validation/validate-webui-agent-activity.py)
 serves the shipped chat page with controlled SSE frames and synthetic agents.

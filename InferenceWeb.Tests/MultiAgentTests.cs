@@ -58,7 +58,7 @@ public sealed class MultiAgentTests
     }
 
     [Fact]
-    public async Task IndependentChildrenOverlap_AndConcurrencyLimitRejectsExtraWork()
+    public async Task IndependentChildrenOverlap_AndConcurrencyLimitQueuesExtraWork()
     {
         var release = Signal();
         var bothStarted = Signal();
@@ -77,13 +77,13 @@ public sealed class MultiAgentTests
         try
         {
             await bothStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
-            Assert.False((await session.ExecuteAsync(Spawn("third"))).Ok);
+            Assert.Equal("queued", Json(await session.ExecuteAsync(Spawn("third"))).GetProperty("status").GetString());
             Assert.Equal(2, Volatile.Read(ref maximum));
         }
         finally { release.TrySetResult(true); }
 
         JsonElement results = await Wait(session);
-        Assert.Equal(2, results.GetProperty("agents").GetArrayLength());
+        Assert.Equal(3, results.GetProperty("agents").GetArrayLength());
         Assert.All(results.GetProperty("agents").EnumerateArray(), item =>
         {
             Assert.Equal("completed", item.GetProperty("status").GetString());
@@ -166,8 +166,8 @@ public sealed class MultiAgentTests
         string secondTask = Assert.Single(b.Messages, m => m.Role == "user").Content!;
         Assert.Contains($"Your agent ID is {first}. Your parent is /root.", firstTask);
         Assert.Contains($"Your agent ID is {second}. Your parent is /root.", secondTask);
-        Assert.EndsWith("Sell 120 units at $25. Costs: $13 per unit and $300 fixed. Claimed profit: $1,300.", firstTask);
-        Assert.EndsWith("Serve 200 customers paying $18. Costs: $7 per customer and $400 fixed. Claimed profit: $1,900.", secondTask);
+        Assert.Contains("[Assigned task]\nSell 120 units at $25. Costs: $13 per unit and $300 fixed. Claimed profit: $1,300.\n\n[Workspace]", firstTask);
+        Assert.Contains("[Assigned task]\nServe 200 customers paying $18. Costs: $7 per customer and $400 fixed. Claimed profit: $1,900.\n\n[Workspace]", secondTask);
         Assert.DoesNotContain(second, firstTask);
         Assert.DoesNotContain(first, secondTask);
         Assert.DoesNotContain("Parent private", prefix + firstTask + secondTask);
@@ -231,7 +231,8 @@ public sealed class MultiAgentTests
         Assert.Contains("role reviewer.", readOnly.Messages[0].Content);
         Assert.Contains("You are read-only.", readOnly.Messages[0].Content);
         Assert.Contains("role worker.", mutable.Messages[0].Content);
-        Assert.Contains("Edit only files explicitly assigned to you", mutable.Messages[0].Content);
+        Assert.Contains("Edit only assigned files.", mutable.Messages[0].Content);
+        Assert.Contains("private workspace", mutable.Messages[0].Content);
         Assert.NotEqual(readOnly.Messages[0].Content, mutable.Messages[0].Content);
         Assert.DoesNotContain(readOnly.Tools, t => t.Name == "shell");
         Assert.Contains(mutable.Tools, t => t.Name == "shell");
@@ -255,7 +256,7 @@ public sealed class MultiAgentTests
     }
 
     [Fact]
-    public async Task SharedWorkerAndParentHostToolsAreSerialized()
+    public async Task IsolatedWorkerToolsCanOverlapWithParentHostTools()
     {
         var runner = new CountingRunner(delayMilliseconds: 35);
         await using var session = Session(_ =>
@@ -270,7 +271,7 @@ public sealed class MultiAgentTests
         await Wait(session);
         Assert.True((await parent).Ok);
         Assert.Equal(3, runner.Calls);
-        Assert.Equal(1, runner.MaximumActive);
+        Assert.InRange(runner.MaximumActive, 2, 3);
     }
 
     [Fact]
@@ -515,7 +516,7 @@ public sealed class MultiAgentTests
         JsonElement result = (await Wait(session, child)).GetProperty("agents")[0];
         Assert.Equal("Report: Check the edge case", result.GetProperty("result").GetString());
         Assert.Contains(resumed!, m => m.Role == "assistant"
-            && m.Content!.EndsWith("[Assigned task]\nInitial inspection", StringComparison.Ordinal));
+            && m.Content!.Contains("[Assigned task]\nInitial inspection\n\n[Workspace]", StringComparison.Ordinal));
         ChatMessage initialTask = Assert.Single(resumed!, m => m.Role == "user"
             && m.Content!.Contains("[TensorSharp subagent identity]", StringComparison.Ordinal));
         Assert.Contains($"Your agent ID is {child}. Your parent is /root.", initialTask.Content);
@@ -726,6 +727,9 @@ public sealed class MultiAgentTests
         public bool CanRun => true;
         public string? UnavailableReason => null;
         public ToolFunction Declare() => new() { Name = "shell" };
+        public IReadOnlyList<ToolFunction> DeclareWorkspaceTools(bool allowWrite) => allowWrite
+            ? [Declare(), new() { Name = "read_file" }] : [new() { Name = "read_file" }];
+        public ICodeRunner ForkForWorkspace(SessionWorkspace workspace, bool allowWrite) => new ScopedRunner(this, workspace, allowWrite);
         public SkillToolResult Execute(ToolCall call, IReadOnlyList<CodeInputFile>? inputFiles = null,
             Action<string>? onOutput = null, SessionWorkspace? workspace = null,
             IReadOnlyList<string>? skillDirectories = null)
@@ -738,6 +742,22 @@ public sealed class MultiAgentTests
                 return new(true, "fixture output", null, null);
             }
             finally { Interlocked.Decrement(ref _active); }
+        }
+
+        private sealed class ScopedRunner(CountingRunner owner, SessionWorkspace scope, bool allowWrite) : ICodeRunner
+        {
+            public bool CanRun => true;
+            public string? UnavailableReason => null;
+            public ToolFunction Declare() => DeclareTools()[0];
+            public IReadOnlyList<ToolFunction> DeclareTools() => owner.DeclareWorkspaceTools(allowWrite);
+            public SkillToolResult Execute(ToolCall call, IReadOnlyList<CodeInputFile>? inputFiles = null,
+                Action<string>? onOutput = null, SessionWorkspace? workspace = null,
+                IReadOnlyList<string>? skillDirectories = null)
+            {
+                if (!ReferenceEquals(workspace, scope) || (!allowWrite && call.Name != "read_file"))
+                    return SkillToolResult.Failure("Fixture scope or permission mismatch.");
+                return owner.Execute(call, onOutput: onOutput, workspace: scope);
+            }
         }
     }
 
