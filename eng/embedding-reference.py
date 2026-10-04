@@ -96,23 +96,56 @@ def gelu(hidden, mode):
 
 
 def encode(weights, token_rows, activation):
-    dim = int(weights.metadata("bert.embedding_length"))
-    heads = int(weights.metadata("bert.attention.head_count"))
-    layers = int(weights.metadata("bert.block_count"))
-    epsilon = float(weights.metadata("bert.attention.layer_norm_epsilon"))
-    pooling = int(weights.metadata("bert.pooling_type"))
-    if weights.metadata("general.architecture") != "bert" or dim % heads:
-        raise ValueError("Only GGUF BERT/XLM-R with evenly sized attention heads is supported.")
+    arch = weights.metadata("general.architecture")
+    is_nomic = arch == "nomic-bert"
+    prefix = "nomic-bert." if is_nomic else "bert."
+    dim = int(weights.metadata(prefix + "embedding_length"))
+    heads = int(weights.metadata(prefix + "attention.head_count"))
+    layers = int(weights.metadata(prefix + "block_count"))
+    epsilon = float(weights.metadata(prefix + "attention.layer_norm_epsilon"))
+    pooling = int(weights.metadata(prefix + "pooling_type"))
+    if arch not in ("bert", "nomic-bert") or dim % heads:
+        raise ValueError("Only GGUF BERT/XLM-R/Nomic-BERT with evenly sized attention heads is supported.")
     lengths = [len(ids) for ids in token_rows]
     offsets = np.cumsum([0] + lengths)
     head_dim = dim // heads
     # Only selected embedding rows are materialized; the full vocabulary is not.
     tokens = np.concatenate([np.asarray(ids, dtype=np.int64) for ids in token_rows])
     positions = np.concatenate([np.arange(length, dtype=np.int64) for length in lengths])
-    hidden = weights.rows("token_embd.weight", tokens) + weights.rows("position_embd.weight", positions)
+    hidden = weights.rows("token_embd.weight", tokens)
+    if not is_nomic:
+        hidden += weights.rows("position_embd.weight", positions)
     if "token_types.weight" in weights.tensors:
         hidden += weights.rows("token_types.weight", [0])
     hidden = weights.layer_norm(hidden, "token_embd_norm", epsilon)
+    # Precompute RoPE cos/sin for all positions up to max length
+    rope_cos = None
+    rope_sin = None
+    if is_nomic:
+        max_pos = int(np.max(positions)) + 1
+        theta = 1000.0 ** (-2.0 * np.arange(0, head_dim // 2, dtype=np.float64) / head_dim)
+        pos_theta = np.outer(np.arange(max_pos, dtype=np.float64), theta)
+        rope_cos = np.cos(pos_theta).astype(np.float32)
+        rope_sin = np.sin(pos_theta).astype(np.float32)
+
+    def apply_rope(q_or_k, pos_indices):
+        """Apply RoPE to Q or K [tokens, dim] reshaped to [tokens, heads, head_dim]."""
+        t = q_or_k.shape[0]
+        qk = q_or_k.reshape(t, heads, head_dim)
+        for i in range(t):
+            p = pos_indices[i]
+            for h in range(heads):
+                hh = head_dim // 2
+                cos = rope_cos[p]
+                sin = rope_sin[p]
+                h_start = h * head_dim
+                for j in range(hh):
+                    x0 = qk[i, h, 2*j]
+                    x1 = qk[i, h, 2*j + 1]
+                    qk[i, h, 2*j] = x0 * cos[j] - x1 * sin[j]
+                    qk[i, h, 2*j + 1] = x1 * cos[j] + x0 * sin[j]
+        return qk.reshape(t, dim)
+
     layer_seconds = []
     for layer in range(layers):
         started = time.monotonic()
@@ -124,6 +157,9 @@ def encode(weights, token_rows, activation):
             query = weights.linear(hidden, prefix + "attn_q")
             key = weights.linear(hidden, prefix + "attn_k")
             value = weights.linear(hidden, prefix + "attn_v")
+        if is_nomic:
+            query = apply_rope(query, positions)
+            key = apply_rope(key, positions)
         attended = np.empty_like(hidden)
         for first, last in zip(offsets[:-1], offsets[1:]):
             length = int(last - first)
@@ -138,7 +174,13 @@ def encode(weights, token_rows, activation):
         del query, key, value
         hidden = weights.layer_norm(hidden + weights.linear(attended, prefix + "attn_output"),
                                     prefix + "attn_output_norm", epsilon)
-        feed_forward = gelu(weights.linear(hidden, prefix + "ffn_up"), activation)
+        if is_nomic:
+            up = weights.linear(hidden, prefix + "ffn_up")
+            gate = weights.linear(hidden, prefix + "ffn_gate")
+            silu_gate = gate / (np.float32(1) + np.exp(-gate))
+            feed_forward = silu_gate * up
+        else:
+            feed_forward = gelu(weights.linear(hidden, prefix + "ffn_up"), activation)
         hidden = weights.layer_norm(hidden + weights.linear(feed_forward, prefix + "ffn_down"),
                                     prefix + "layer_output_norm", epsilon)
         del attended, feed_forward

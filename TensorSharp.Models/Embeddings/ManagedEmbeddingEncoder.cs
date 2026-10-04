@@ -118,9 +118,9 @@ internal sealed class ManagedEmbeddingEncoder : IDisposable
     }
 
     private sealed record Norm(float[] Weight, float[] Bias);
-    private sealed record Layer(Matrix Qkv, Matrix Q, Matrix K, Matrix V, Matrix Attention, Matrix Up, Matrix Down, Norm AttentionNorm, Norm OutputNorm);
+    private sealed record Layer(Matrix Qkv, Matrix Q, Matrix K, Matrix V, Matrix Attention, Matrix Up, Matrix Gate, Matrix Down, Norm AttentionNorm, Norm OutputNorm);
     private readonly int _dim, _heads, _head, _ff, _pooling;
-    private readonly bool _packedValues;
+    private readonly bool _packedValues, _usesRoPE;
     private readonly float _epsilon;
     private readonly CpuWorkerPool _pool;
     private CancellationToken _cancellationToken;
@@ -133,20 +133,24 @@ internal sealed class ManagedEmbeddingEncoder : IDisposable
 
     public ManagedEmbeddingEncoder(GgufFile file, int threads)
     {
-        _dim = Positive(file, "bert.embedding_length");
-        _heads = Positive(file, "bert.attention.head_count");
-        _ff = Positive(file, "bert.feed_forward_length");
-        int context = Positive(file, "bert.context_length");
-        int layers = Positive(file, "bert.block_count");
-        if (_dim > 16384 || _dim % _heads != 0 || layers > 128 || _ff > 65536 || context > 65536)
+        bool isNomicBert = file.GetString("general.architecture") == "nomic-bert";
+        _usesRoPE = isNomicBert;
+        string prefix = isNomicBert ? "nomic-bert." : "bert.";
+        _dim = Positive(file, prefix + "embedding_length");
+        _heads = Positive(file, prefix + "attention.head_count");
+        int ffRaw = Positive(file, prefix + "feed_forward_length");
+        int context = Positive(file, prefix + "context_length");
+        int layers = Positive(file, prefix + "block_count");
+        _ff = isNomicBert ? _dim : ffRaw;
+        if (_dim > 16384 || _dim % _heads != 0 || layers > 128 || ffRaw > 65536 || context > 65536)
             throw new InvalidDataException("Invalid embedding dimensions: maximum hidden size 16384, layers 128, feed-forward size 65536, and context 65536; hidden size must be divisible by head count.");
         _head = _dim / _heads;
         _packedValues = _head % ManagedEmbeddingMath.ValueWidth == 0;
-        _epsilon = file.GetFloat32("bert.attention.layer_norm_epsilon", 1e-12f);
+        _epsilon = file.GetFloat32(prefix + "attention.layer_norm_epsilon", 1e-12f);
         if (!float.IsFinite(_epsilon) || _epsilon <= 0) throw new InvalidDataException("Invalid embedding layer normalization epsilon.");
-        _pooling = checked((int)file.GetUint32("bert.pooling_type"));
+        _pooling = checked((int)file.GetUint32(prefix + "pooling_type"));
         _tokens = ReadMatrix(file, "token_embd.weight", _dim);
-        _positions = ReadMatrix(file, "position_embd.weight", _dim, context);
+        _positions = file.Tensors.ContainsKey("position_embd.weight") ? ReadMatrix(file, "position_embd.weight", _dim, context) : null;
         _embeddingNorm = ReadNorm(file, "token_embd_norm");
         if (file.Tensors.ContainsKey("token_types.weight"))
         {
@@ -156,15 +160,15 @@ internal sealed class ManagedEmbeddingEncoder : IDisposable
         _layers = new Layer[layers];
         for (int i = 0; i < layers; ++i)
         {
-            string prefix = $"blk.{i}.";
+            string blk = $"blk.{i}.";
             Matrix qkv = null, q = null, k = null, v = null;
-            if (file.Tensors.ContainsKey(prefix + "attn_qkv.weight"))
-                qkv = ReadProjection(file, prefix + "attn_qkv", _dim, checked(3 * _dim));
+            if (file.Tensors.ContainsKey(blk + "attn_qkv.weight"))
+                qkv = ReadProjection(file, blk + "attn_qkv", _dim, checked(3 * _dim));
             else
             {
-                q = ReadProjection(file, prefix + "attn_q", _dim, _dim);
-                k = ReadProjection(file, prefix + "attn_k", _dim, _dim);
-                v = ReadProjection(file, prefix + "attn_v", _dim, _dim);
+                q = ReadProjection(file, blk + "attn_q", _dim, _dim);
+                k = ReadProjection(file, blk + "attn_k", _dim, _dim);
+                v = ReadProjection(file, blk + "attn_v", _dim, _dim);
                 if (q.Type == k.Type && q.Type == v.Type)
                 {
                     var bytes = new byte[checked(q.Data.Length * 3)];
@@ -179,13 +183,15 @@ internal sealed class ManagedEmbeddingEncoder : IDisposable
                     q = k = v = null;
                 }
             }
+            Matrix up = ReadProjection(file, blk + "ffn_up", _dim, isNomicBert ? _dim : _ff);
+            Matrix gate = isNomicBert ? ReadProjection(file, blk + "ffn_gate", _dim, _dim) : null;
+            Matrix down = ReadProjection(file, blk + "ffn_down", isNomicBert ? _dim : _ff, _dim);
             _layers[i] = new Layer(qkv, q, k, v,
-                ReadProjection(file, prefix + "attn_output", _dim, _dim),
-                ReadProjection(file, prefix + "ffn_up", _dim, _ff),
-                ReadProjection(file, prefix + "ffn_down", _ff, _dim),
-                ReadNorm(file, prefix + "attn_output_norm"), ReadNorm(file, prefix + "layer_output_norm"));
+                ReadProjection(file, blk + "attn_output", _dim, _dim),
+                up, gate, down,
+                ReadNorm(file, blk + "attn_output_norm"), ReadNorm(file, blk + "layer_output_norm"));
             foreach (var projection in new[] { _layers[i].Qkv, _layers[i].Q, _layers[i].K, _layers[i].V,
-                _layers[i].Attention, _layers[i].Up, _layers[i].Down }) projection?.PrepareProjection();
+                _layers[i].Attention, _layers[i].Up, _layers[i].Gate, _layers[i].Down }) projection?.PrepareProjection();
         }
         // Start owned workers only after all model validation/loading succeeds.
         _pool = new CpuWorkerPool(threads == 0 ? 4 : threads);
@@ -258,9 +264,12 @@ internal sealed class ManagedEmbeddingEncoder : IDisposable
         ForRows(count, row =>
         {
             _tokens.Row(tokens[row], _x, row * _dim);
-            _positions.Row(positions[row], _next, row * _dim);
             var x = _x.AsSpan(row * _dim, _dim);
-            TensorPrimitives.Add(x, _next.AsSpan(row * _dim, _dim), x);
+            if (_positions != null)
+            {
+                _positions.Row(positions[row], _next, row * _dim);
+                TensorPrimitives.Add(x, _next.AsSpan(row * _dim, _dim), x);
+            }
             if (_type != null) TensorPrimitives.Add(x, _type, x);
         });
         NormalizeRows(_x, count, _embeddingNorm);
@@ -281,6 +290,7 @@ internal sealed class ManagedEmbeddingEncoder : IDisposable
                     Array.Copy(_projected, row * _dim, _qkv, row * _dim * 3 + 2 * _dim, _dim);
                 }
             }
+            if (_usesRoPE) RotateQkv(count, positions);
             bool select = layerIndex == _layers.Length - 1 && _pooling != 1;
             int rows = select ? lengths.Length : count;
             Attention(lengths, starts, queryRows, querySequences, count, select, cancellationToken);
@@ -291,8 +301,17 @@ internal sealed class ManagedEmbeddingEncoder : IDisposable
                 TensorPrimitives.Add(_next.AsSpan(row * _dim, _dim), _x.AsSpan(source * _dim, _dim), _next.AsSpan(row * _dim, _dim));
             }
             NormalizeRows(_next, rows, layer.AttentionNorm);
-            layer.Up.Multiply(_next, rows, _ffn, _pool, cancellationToken);
-            Gelu(rows);
+            if (layer.Gate != null)
+            {
+                layer.Up.Multiply(_next, rows, _ffn, _pool, cancellationToken);
+                layer.Gate.Multiply(_next, rows, _projected, _pool, cancellationToken);
+                SwiGlu(rows);
+            }
+            else
+            {
+                layer.Up.Multiply(_next, rows, _ffn, _pool, cancellationToken);
+                Gelu(rows);
+            }
             layer.Down.Multiply(_ffn, rows, _x, _pool, cancellationToken);
             TensorPrimitives.Add(_x.AsSpan(0, rows * _dim), _next.AsSpan(0, rows * _dim), _x.AsSpan(0, rows * _dim));
             NormalizeRows(_x, rows, layer.OutputNorm);
@@ -469,6 +488,55 @@ internal sealed class ManagedEmbeddingEncoder : IDisposable
             TensorPrimitives.Add(y, 1.0f, y);
             TensorPrimitives.Multiply(x, y, x);
             TensorPrimitives.Multiply(x, 0.5f, x);
+        });
+    }
+
+    private void SwiGlu(int rows)
+    {
+        // SwiGLU: ffn = silu(gate) * up
+        // silu(x) = x * sigmoid(x).
+        // gate is in _projected, up is in _ffn; result stays in _ffn.
+        ForRows(rows, row =>
+        {
+            var gate = _projected.AsSpan(row * _ff, _ff);
+            var up = _ffn.AsSpan(row * _ff, _ff);
+            for (int i = 0; i < _ff; ++i)
+            {
+                float g = gate[i];
+                float sigmoid = 1.0f / (1.0f + MathF.Exp(-g));
+                up[i] *= g * sigmoid;
+            }
+        });
+    }
+
+    private void RotateQkv(int count, int[] positions)
+    {
+        // Apply RoPE to Q and K portions of _qkv in-place.
+        // _qkv layout: [token * 3 * _dim] where [0:_dim]=Q, [_dim:2*_dim]=K, [2*_dim:3*_dim]=V.
+        // Each head's Q/K has _head dimensions; RoPE rotates pairs (2j, 2j+1) by pos * theta_base^(-2j/_head).
+        int halfHead = _head / 2;
+        float[] qkv = _qkv;
+        ForRows(count, row =>
+        {
+            int pos = positions[row];
+            var qRow = qkv.AsSpan(row * 3 * _dim, _dim);
+            var kRow = qkv.AsSpan(row * 3 * _dim + _dim, _dim);
+            for (int h = 0; h < _heads; ++h)
+            {
+                var qHead = qRow.Slice(h * _head, _head);
+                var kHead = kRow.Slice(h * _head, _head);
+                for (int j = 0; j < halfHead; ++j)
+                {
+                    float theta = pos * MathF.Pow(1000.0f, -2.0f * j / _head);
+                    float cos = MathF.Cos(theta), sin = MathF.Sin(theta);
+                    float q0 = qHead[2 * j], q1 = qHead[2 * j + 1];
+                    qHead[2 * j] = q0 * cos - q1 * sin;
+                    qHead[2 * j + 1] = q1 * cos + q0 * sin;
+                    float k0 = kHead[2 * j], k1 = kHead[2 * j + 1];
+                    kHead[2 * j] = k0 * cos - k1 * sin;
+                    kHead[2 * j + 1] = k1 * cos + k0 * sin;
+                }
+            }
         });
     }
 

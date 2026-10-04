@@ -70,13 +70,15 @@ public sealed class EmbeddingModel : IEmbeddingModel
             throw new ArgumentOutOfRangeException(nameof(options.Device), "The managed CPU embedding backend supports device 0 only.");
         using var file = new GgufFile(path);
         Architecture = file.GetString("general.architecture") ?? string.Empty;
-        if (Architecture != "bert")
-            throw new NotSupportedException($"Embedding architecture '{Architecture}' is not supported. Expected a BERT or XLM-RoBERTa GGUF with architecture 'bert'.");
-        uint pooling = file.GetUint32("bert.pooling_type", 0);
+        bool isNomicBert = Architecture == "nomic-bert";
+        if (Architecture != "bert" && !isNomicBert)
+            throw new NotSupportedException($"Embedding architecture '{Architecture}' is not supported. Expected a BERT, XLM-RoBERTa, or Nomic BERT GGUF with architecture 'bert' or 'nomic-bert'.");
+        string prefix = isNomicBert ? "nomic-bert." : "bert.";
+        uint pooling = file.GetUint32(prefix + "pooling_type", 0);
         if (pooling is < 1 or > 3)
-            throw new NotSupportedException("Embedding GGUF must specify mean, CLS, or last-token pooling in bert.pooling_type.");
-        Dimensions = checked((int)file.GetUint32("bert.embedding_length"));
-        int modelContext = checked((int)file.GetUint32("bert.context_length"));
+            throw new NotSupportedException($"Embedding GGUF must specify mean, CLS, or last-token pooling in {prefix}pooling_type.");
+        Dimensions = checked((int)file.GetUint32(prefix + "embedding_length"));
+        int modelContext = checked((int)file.GetUint32(prefix + "context_length"));
         if (Dimensions <= 0 || modelContext <= 0) throw new InvalidDataException("Embedding GGUF is missing valid dimensions or context length.");
         if (options.MaxTokens > modelContext)
             throw new ArgumentOutOfRangeException(nameof(options.MaxTokens), $"The context limit must not exceed the model's {modelContext} tokens.");

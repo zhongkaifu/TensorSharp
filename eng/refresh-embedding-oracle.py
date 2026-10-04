@@ -22,6 +22,7 @@ def plans(results: Path, models: Path):
     for model, filename, tokens in [
         ("snowflake", "snowflake-arctic-embed-l-v2.0-q8_0.gguf", "snowflake-tokenization.json"),
         ("minilm", "all-MiniLM-L6-v2-Q8_0.gguf", "numpy-minilm-tokens.json"),
+        ("nomic", "nomic-embed-text-v1.5.Q8_0.gguf", "nomic-tokenization.json"),
     ]:
         for backend in ("managed", "cpu", "metal"):
             for order in ("", "-reverse"):

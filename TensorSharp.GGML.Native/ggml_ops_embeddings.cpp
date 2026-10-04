@@ -43,6 +43,7 @@ float number(gguf_context * file, const std::string & name, float fallback) {
 struct encoder {
     int dim = 0, heads = 0, layers = 0, ff = 0, context = 0, vocab = 0, pooling = 0;
     float eps = 0;
+    bool nomic_bert = false;
     ggml_backend_t backend = nullptr;
     ggml_threadpool_t threadpool = nullptr;
     ggml_context * weights_ctx = nullptr;
@@ -101,19 +102,23 @@ struct encoder {
     }
     void validate() const {
         weight("token_embd.weight", dim, vocab);
-        weight("position_embd.weight", dim, context);
+        if (!nomic_bert) weight("position_embd.weight", dim, context);
         weight("token_embd_norm.weight", dim, 1); weight("token_embd_norm.bias", dim, 1);
         if (find("token_types.weight")) weight("token_types.weight", dim);
         auto projection = [&](const std::string & name, int input, int output) {
             weight(name + ".weight", input, output);
             if (find(name + ".bias")) weight(name + ".bias", output, 1);
         };
+        int ffn_input = nomic_bert ? dim : dim;
+        int ffn_output = nomic_bert ? dim : ff;
         for (int l = 0; l < layers; ++l) {
             const auto p = "blk." + std::to_string(l) + ".";
             if (find(p + "attn_qkv.weight")) projection(p + "attn_qkv", dim, 3 * dim);
             else for (const auto * part : {"attn_q", "attn_k", "attn_v"}) projection(p + part, dim, dim);
             projection(p + "attn_output", dim, dim);
-            projection(p + "ffn_up", dim, ff); projection(p + "ffn_down", ff, dim);
+            projection(p + "ffn_up", dim, ffn_output);
+            if (nomic_bert) projection(p + "ffn_gate", dim, dim);
+            projection(p + "ffn_down", ffn_output, dim);
             for (const auto * part : {"attn_output_norm", "layer_output_norm"}) {
                 weight(p + part + ".weight", dim, 1); weight(p + part + ".bias", dim, 1);
             }
@@ -176,7 +181,7 @@ struct encoder {
             if (first_type->type != GGML_TYPE_F32) first_type = ggml_cast(ctx, first_type, GGML_TYPE_F32);
             x = ggml_add(ctx, x, first_type);
         }
-        x = ggml_add(ctx, ggml_get_rows(ctx, weight("position_embd.weight"), g->positions), x);
+        if (!nomic_bert) x = ggml_add(ctx, ggml_get_rows(ctx, weight("position_embd.weight"), g->positions), x);
         x = norm(ctx, x, "token_embd_norm");
         if (pooling == 2 || pooling == 3) {
             g->selected = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, sequences);
@@ -197,6 +202,15 @@ struct encoder {
                 q = ggml_reshape_4d(ctx, linear(ctx, x, p + "attn_q"), head, heads, length, batch);
                 k = ggml_reshape_4d(ctx, linear(ctx, x, p + "attn_k"), head, heads, length, batch);
                 v = ggml_reshape_4d(ctx, linear(ctx, x, p + "attn_v"), head, heads, length, batch);
+            }
+            if (nomic_bert) {
+                // RoPE: rotate Q and K pairs within each head by position-dependent angles.
+                // rope_type=2 (NeoX-style) rotates pairs [0,1], [2,3], ... within each head.
+                auto * pos_4d = ggml_reshape_4d(ctx, g->positions, 1, 1, length, batch);
+                q = ggml_rope_ext(ctx, q, pos_4d, nullptr, head, 2, 0, 1000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+                k = ggml_rope_ext(ctx, k, pos_4d, nullptr, head, 2, 0, 1000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+                // RoPE must be done before attention; if the graph optimizer fused RoPE
+                // with the downstream cast/permute the backend must still support it.
             }
             if (segments.empty()) x = attention(ctx, q, k, v, g->mask, length, batch);
             else {
@@ -227,7 +241,13 @@ struct encoder {
             }
             x = norm(ctx, ggml_add(ctx, linear(ctx, x, p + "attn_output"), residual), p + "attn_output_norm");
             residual = x;
-            x = ggml_gelu(ctx, linear(ctx, x, p + "ffn_up"));
+            if (nomic_bert) {
+                auto * up = linear(ctx, x, p + "ffn_up");
+                auto * gate = linear(ctx, x, p + "ffn_gate");
+                x = ggml_mul(ctx, ggml_gelu(ctx, gate), up);
+            } else {
+                x = ggml_gelu(ctx, linear(ctx, x, p + "ffn_up"));
+            }
             x = norm(ctx, ggml_add(ctx, linear(ctx, x, p + "ffn_down"), residual), p + "layer_output_norm");
         }
         if (pooling == 1) {
@@ -366,13 +386,17 @@ std::unique_ptr<encoder> load(const char * path, const char * backend_name, int 
     require(source.file != nullptr, "cannot read model GGUF");
     auto * file = source.file;
     const auto arch_key = gguf_find_key(file, "general.architecture");
-    require(arch_key >= 0 && gguf_get_kv_type(file, arch_key) == GGUF_TYPE_STRING &&
-            std::string(gguf_get_val_str(file, arch_key)) == "bert", "supported encoder architecture is bert");
+    require(arch_key >= 0 && gguf_get_kv_type(file, arch_key) == GGUF_TYPE_STRING, "missing architecture key");
+    std::string arch = gguf_get_val_str(file, arch_key);
+    bool is_nomic = arch == "nomic-bert";
+    require(arch == "bert" || is_nomic, "supported encoder architecture is bert or nomic-bert");
+    std::string prefix = is_nomic ? "nomic-bert." : "bert.";
     auto e = std::make_unique<encoder>();
-    e->dim = integer(file, "bert.embedding_length"); e->heads = integer(file, "bert.attention.head_count");
-    e->layers = integer(file, "bert.block_count"); e->ff = integer(file, "bert.feed_forward_length");
-    e->context = integer(file, "bert.context_length"); e->pooling = integer(file, "bert.pooling_type");
-    e->eps = number(file, "bert.attention.layer_norm_epsilon", 1e-12f);
+    e->nomic_bert = is_nomic;
+    e->dim = integer(file, prefix + "embedding_length"); e->heads = integer(file, prefix + "attention.head_count");
+    e->layers = integer(file, prefix + "block_count"); e->ff = integer(file, prefix + "feed_forward_length");
+    e->context = integer(file, prefix + "context_length"); e->pooling = integer(file, prefix + "pooling_type");
+    e->eps = number(file, prefix + "attention.layer_norm_epsilon", 1e-12f);
     auto * tok = ggml_get_tensor(source.tensors, "token_embd.weight");
     require(tok != nullptr && tok->ne[1] <= INT32_MAX, "missing or invalid token embeddings"); e->vocab = int(tok->ne[1]);
     require(e->dim > 0 && e->dim <= 16384 && e->heads > 0 && e->dim % e->heads == 0 && e->layers > 0 &&

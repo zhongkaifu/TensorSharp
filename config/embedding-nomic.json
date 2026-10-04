@@ -1,0 +1,14 @@
+{
+  "variables": { "modelRoot": "${TENSORSHARP_MODELS:-../models}" },
+  "model": {
+    "path": "${modelRoot}/embeddings/nomic-embed-text-v1.5.Q8_0.gguf",
+    "urls": ["https://huggingface.co/nomic-ai/nomic-embed-text-v1.5-GGUF/resolve/0188c9bf409793f810680a5a431e7b899c46104c/nomic-embed-text-v1.5.Q8_0.gguf"],
+    "sha256": "3e24342164b3d94991ba9692fdc0dd08e3fd7362e0aacc396a9a5c54a544c3b7"
+  },
+  "embeddings": true,
+  "backend": "ggml_cpu",
+  "embedding-threads": 8,
+  "host": "127.0.0.1",
+  "port": 5000,
+  "no-webui": true
+}
