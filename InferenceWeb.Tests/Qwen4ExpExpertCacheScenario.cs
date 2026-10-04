@@ -23,10 +23,40 @@ internal static class Qwen4ExpExpertCacheScenario
     internal static string MappedNativePath()
     {
         string[] names = { "GgmlOps.dll", "libGgmlOps.so", "libGgmlOps.dylib" };
-        return Process.GetCurrentProcess().Modules.Cast<ProcessModule>()
-            .Where(module => names.Contains(Path.GetFileName(module.FileName), StringComparer.OrdinalIgnoreCase))
-            .Select(module => Path.GetFullPath(module.FileName)).Distinct().Single();
+        // Process.Modules omits dlopen-loaded images on macOS. Observe dyld's
+        // actual image table there; a guessed on-disk path cannot prove which
+        // native binary performed a validation run.
+        IEnumerable<string> paths;
+        if (OperatingSystem.IsMacOS())
+            paths = MacMappedImagePaths();
+        else
+        {
+            using var process = Process.GetCurrentProcess();
+            paths = process.Modules.Cast<ProcessModule>().Select(module => module.FileName).ToArray();
+        }
+        string[] matches = paths
+            .Where(path => names.Contains(Path.GetFileName(path), StringComparer.OrdinalIgnoreCase))
+            .Select(Path.GetFullPath).Distinct(StringComparer.Ordinal).ToArray();
+        if (matches.Length != 1)
+            throw new InvalidOperationException($"Expected one mapped GgmlOps library; observed {matches.Length}: {string.Join(", ", matches)}");
+        return matches[0];
     }
+
+    private static IEnumerable<string> MacMappedImagePaths()
+    {
+        uint count = DyldImageCount();
+        for (uint index = 0; index < count; ++index)
+        {
+            string path = Marshal.PtrToStringUTF8(DyldGetImageName(index));
+            if (!string.IsNullOrEmpty(path)) yield return path;
+        }
+    }
+
+    [DllImport("/usr/lib/libSystem.B.dylib", EntryPoint = "_dyld_image_count")]
+    private static extern uint DyldImageCount();
+
+    [DllImport("/usr/lib/libSystem.B.dylib", EntryPoint = "_dyld_get_image_name")]
+    private static extern IntPtr DyldGetImageName(uint index);
 
     internal static Stats CacheStats()
     {

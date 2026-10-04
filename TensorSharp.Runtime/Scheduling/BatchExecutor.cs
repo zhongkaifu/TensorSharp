@@ -8,6 +8,7 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
+using System.Linq;
 using System.Text;
 using System.Threading;
 using Microsoft.Extensions.Logging;
@@ -1176,115 +1177,138 @@ namespace TensorSharp.Runtime.Scheduling
                     var reqIds = new string[dn];
                     var btokens = new int[dn];
                     var bpositions = new int[dn];
-                    bool allGreedy = true;
-                    for (int i = 0; i < dn; i++)
+                    try
                     {
-                        var seq = decodeWork[i].Sequence;
-                        // Peek-sample (deterministic for greedy); do NOT append or
-                        // consume the device-sampled stash yet, so a decline below
-                        // leaves the round-robin fallback a valid token source
-                        // (device-sampled sequences have no LastLogits to re-sample).
-                        btokens[i] = PeekPendingOrSample(seq);
-                        bpositions[i] = seq.NumComputedTokens;
-                        reqIds[i] = seq.RequestId;
-                        if (allGreedy && !seq.GetOrCreateSampler().IsPlainGreedyArgmax)
-                            allGreedy = false;
-                    }
-                    if (allGreedy)
-                    {
-                        // Device-sampled fast path: no host logits at all. The
-                        // model returns each sequence's NEXT token (argmax of
-                        // this step's logits); it is stashed on the sequence and
-                        // consumed by TakePendingOrSample at the next step.
-                        var nextTokens = new int[dn];
-                        long batchStarted = Stopwatch.GetTimestamp();
-                        bool sampledBatchSucceeded = fused.TryForwardBatchedFusedDecodeSampled(reqIds, btokens, bpositions, nextTokens);
-                        long batchTicksPerSequence = (Stopwatch.GetTimestamp() - batchStarted) / dn;
-                        if (sampledBatchSucceeded)
+                        bool allGreedy = true;
+                        for (int i = 0; i < dn; i++)
                         {
-                            ReportBatchedFusedDecodeSuccess(dn);
-                            for (int i = 0; i < dn; i++)
+                            var seq = decodeWork[i].Sequence;
+                            // Peek-sample (deterministic for greedy); do NOT append or
+                            // consume the device-sampled stash yet, so a decline below
+                            // leaves the round-robin fallback a valid token source
+                            // (device-sampled sequences have no LastLogits to re-sample).
+                            btokens[i] = PeekPendingOrSample(seq);
+                            bpositions[i] = seq.NumComputedTokens;
+                            reqIds[i] = seq.RequestId;
+                            if (allGreedy && !seq.GetOrCreateSampler().IsPlainGreedyArgmax)
+                                allGreedy = false;
+                        }
+                        if (allGreedy)
+                        {
+                            // Device-sampled fast path: no host logits at all. The
+                            // model returns each sequence's NEXT token (argmax of
+                            // this step's logits); it is stashed on the sequence and
+                            // consumed by TakePendingOrSample at the next step.
+                            var nextTokens = new int[dn];
+                            long batchStarted = Stopwatch.GetTimestamp();
+                            bool sampledBatchSucceeded = fused.TryForwardBatchedFusedDecodeSampled(reqIds, btokens, bpositions, nextTokens);
+                            long batchTicksPerSequence = (Stopwatch.GetTimestamp() - batchStarted) / dn;
+                            if (sampledBatchSucceeded)
                             {
-                                var seq = decodeWork[i].Sequence;
-                                seq.AppendOutputToken(btokens[i]);
-                                seq.LastLogits = null;
-                                seq.AdvanceComputedTokens(1);
-                                seq.PendingDeviceToken = nextTokens[i];   // replaces the consumed stash
-                                seq.PendingDevicePosition = seq.NumComputedTokens;
-                                if (!seq.FirstTokenAt.HasValue) seq.FirstTokenAt = DateTime.UtcNow;
-                                results.Add(new SequenceStepResult
+                                ReportBatchedFusedDecodeSuccess(dn);
+                                for (int i = 0; i < dn; i++)
                                 {
-                                    Sequence = seq,
-                                    TokensForwarded = 1,
-                                    SampledToken = btokens[i],
-                                    IsPrefill = false,
-                                    FullBlocksCaptured = 0,
-                                    ForwardElapsedTicks = batchTicksPerSequence,
-                                });
+                                    var seq = decodeWork[i].Sequence;
+                                    seq.AppendOutputToken(btokens[i]);
+                                    seq.LastLogits = null;
+                                    seq.AdvanceComputedTokens(1);
+                                    seq.PendingDeviceToken = nextTokens[i];   // replaces the consumed stash
+                                    seq.PendingDevicePosition = seq.NumComputedTokens;
+                                    if (!seq.FirstTokenAt.HasValue) seq.FirstTokenAt = DateTime.UtcNow;
+                                    results.Add(new SequenceStepResult
+                                    {
+                                        Sequence = seq,
+                                        TokensForwarded = 1,
+                                        SampledToken = btokens[i],
+                                        IsPrefill = false,
+                                        FullBlocksCaptured = 0,
+                                        ForwardElapsedTicks = batchTicksPerSequence,
+                                    });
+                                }
+                                if (dn == n)
+                                    return results;
+                                handledBatched = new HashSet<string>(reqIds);
                             }
-                            if (dn == n)
-                                return results;
-                            handledBatched = new HashSet<string>(reqIds);
+                            // else: fall through to the logits variant below.
                         }
-                        // else: fall through to the logits variant below.
-                    }
-                    if (handledBatched == null)
-                    {
-                        var outLogits = new float[dn][];
-                        long batchStarted = Stopwatch.GetTimestamp();
-                        bool logitsBatchSucceeded = fused.TryForwardBatchedFusedDecode(reqIds, btokens, bpositions, outLogits);
-                        long batchTicksPerSequence = (Stopwatch.GetTimestamp() - batchStarted) / dn;
-                        if (logitsBatchSucceeded)
+                        if (handledBatched == null)
                         {
-                            ReportBatchedFusedDecodeSuccess(dn);
-                            for (int i = 0; i < dn; i++)
+                            var outLogits = new float[dn][];
+                            long batchStarted = Stopwatch.GetTimestamp();
+                            bool logitsBatchSucceeded = fused.TryForwardBatchedFusedDecode(reqIds, btokens, bpositions, outLogits);
+                            long batchTicksPerSequence = (Stopwatch.GetTimestamp() - batchStarted) / dn;
+                            if (logitsBatchSucceeded)
                             {
-                                var seq = decodeWork[i].Sequence;
-                                seq.AppendOutputToken(btokens[i]);
-                                seq.PendingDeviceToken = null;   // consumed by this step
-                                seq.LastLogits = outLogits[i];
-                                seq.AdvanceComputedTokens(1);
-                                if (!seq.FirstTokenAt.HasValue) seq.FirstTokenAt = DateTime.UtcNow;
-                                results.Add(new SequenceStepResult
+                                ReportBatchedFusedDecodeSuccess(dn);
+                                for (int i = 0; i < dn; i++)
                                 {
-                                    Sequence = seq,
-                                    TokensForwarded = 1,
-                                    SampledToken = btokens[i],
-                                    IsPrefill = false,
-                                    FullBlocksCaptured = 0,
-                                    ForwardElapsedTicks = batchTicksPerSequence,
-                                });
+                                    var seq = decodeWork[i].Sequence;
+                                    seq.AppendOutputToken(btokens[i]);
+                                    seq.PendingDeviceToken = null;   // consumed by this step
+                                    seq.LastLogits = outLogits[i];
+                                    seq.AdvanceComputedTokens(1);
+                                    if (!seq.FirstTokenAt.HasValue) seq.FirstTokenAt = DateTime.UtcNow;
+                                    results.Add(new SequenceStepResult
+                                    {
+                                        Sequence = seq,
+                                        TokensForwarded = 1,
+                                        SampledToken = btokens[i],
+                                        IsPrefill = false,
+                                        FullBlocksCaptured = 0,
+                                        ForwardElapsedTicks = batchTicksPerSequence,
+                                    });
+                                }
+                                if (dn == n)
+                                    return results;
+                                handledBatched = new HashSet<string>(reqIds);
                             }
-                            if (dn == n)
-                                return results;
-                            handledBatched = new HashSet<string>(reqIds);
-                        }
-                        else
-                        {
-                            // The peek above may have advanced a stochastic
-                            // sampler. Preserve that exact draw for the serial
-                            // fallback; sampling again would advance its RNG a
-                            // second time and change the seeded output stream.
-                            // This also leaves an existing device-sampled token
-                            // intact at the same position.
-                            for (int i = 0; i < dn; i++)
+                            else
                             {
-                                var seq = decodeWork[i].Sequence;
-                                seq.PendingDeviceToken = btokens[i];
-                                seq.PendingDevicePosition = bpositions[i];
+                                // The peek above may have advanced a stochastic
+                                // sampler. Preserve that exact draw for the serial
+                                // fallback; sampling again would advance its RNG a
+                                // second time and change the seeded output stream.
+                                // This also leaves an existing device-sampled token
+                                // intact at the same position.
+                                for (int i = 0; i < dn; i++)
+                                {
+                                    var seq = decodeWork[i].Sequence;
+                                    seq.PendingDeviceToken = btokens[i];
+                                    seq.PendingDevicePosition = bpositions[i];
+                                }
+                            }
+                            // Otherwise nothing was appended; fall through to the
+                            // round-robin loop. A successful mixed-step batch sets
+                            // handledBatched, so only warn when logits batching declined.
+                            if (handledBatched == null && !_fusedBatchedDeclineWarned)
+                            {
+                                _fusedBatchedDeclineWarned = true;
+                                _logger.LogWarning(
+                                    "The model declined the default batched fused-decode path for " +
+                                    "a {Count}-sequence decode step; serving sequences round-robin on the " +
+                                    "serial fused path for this step. Reason: {Reason}. Reported once.",
+                                    dn, fused.BatchedFusedDecodeDeclineReason ?? "model did not provide a reason");
                             }
                         }
-                        // Otherwise nothing was appended; fall through to the
-                        // round-robin loop. A successful mixed-step batch sets
-                        // handledBatched, so only warn when logits batching declined.
-                        if (handledBatched == null && !_fusedBatchedDeclineWarned)
+                    }
+                    catch (Exception ex)
+                    {
+                        // A throwing kernel may already have written some caches.
+                        // Fail its entire decode subset; retrying them serially
+                        // would consume a token against partially advanced state.
+                        // Prefills and other requests remain independently runnable.
+                        // Sampling can fail before every reqIds entry was filled.
+                        // Use the scheduled subset rather than that partial array.
+                        handledBatched = new HashSet<string>(decodeWork.Select(work => work.Sequence.RequestId));
+                        results.RemoveAll(result => handledBatched.Contains(result.Sequence.RequestId));
+                        _logger.LogError(ex,
+                            "Batched fused decode failed for {Count} sequences; failing the affected requests without retrying the batch.",
+                            dn);
+                        foreach (var work in decodeWork)
                         {
-                            _fusedBatchedDeclineWarned = true;
-                            _logger.LogWarning(
-                                "The model declined the default batched fused-decode path for " +
-                                "a {Count}-sequence decode step; serving sequences round-robin on the " +
-                                "serial fused path for this step. Reason: {Reason}. Reported once.",
-                                dn, fused.BatchedFusedDecodeDeclineReason ?? "model did not provide a reason");
+                            var seq = work.Sequence;
+                            seq.Error = ex;
+                            results.Add(new SequenceStepResult { Sequence = seq, Error = ex });
                         }
                     }
                 }

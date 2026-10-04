@@ -51,11 +51,22 @@ internal static class Qwen4ExpSyntheticModelBuilder
 
     /// <summary>Write the checkpoint to <paramref name="path"/>; returns the path.
     /// <paramref name="q2kxlExperts"/> stores the experts as the UD-Q2_K_XL file does instead:
-    /// IQ2_XS gate/up (IQ3_XXS in layer 2) over IQ4_NL down.</summary>
-    public static string Write(string path, int indexerTopK = 16, int contextLength = 4096, bool q2kxlExperts = false)
+    /// IQ2_XS gate/up (IQ3_XXS in layer 2) over IQ4_NL down. Convolution types and
+    /// <paramref name="matrixNormType"/> exercise converter differences for coefficients
+    /// consumed as F32; a matrix norm preserves the ordinary flat scale values.
+    /// Optional expert counts exercise router reductions at the trained model's width.</summary>
+    public static string Write(string path, int indexerTopK = 16, int contextLength = 4096, bool q2kxlExperts = false,
+        GgmlType pleConvType = GgmlType.F32, GgmlType ssmConvType = GgmlType.F32,
+        GgmlType? matrixNormType = null, bool qsa = true, int expertCount = Experts, int expertUsedCount = ExpertsUsed)
     {
+        if (expertCount < 1 || expertUsedCount < 1 || expertUsedCount > expertCount)
+            throw new System.ArgumentOutOfRangeException(nameof(expertUsedCount), "Expert counts must be positive, and selected experts cannot exceed total experts.");
         const int hcDim = Hc * Hidden;
         const int keyDim = StateSize * KHeads, valueDim = StateSize * VHeads, convDim = 2 * keyDim + valueDim;
+        // Block-quantized rows must contain a whole block; the ordinary floating-point
+        // fixtures retain the shipped four-tap convolution layout.
+        int pleConvKernel = pleConvType == GgmlType.Q8_0 ? 32 : ConvKernel;
+        int ssmConvKernel = ssmConvType == GgmlType.Q8_0 ? 32 : ConvKernel;
         var t = new List<Tensor>();
 
         // A projection y[out] = W[out, in] x[in] of unit-sized outputs for unit-sized inputs; a block's
@@ -77,14 +88,29 @@ internal static class Qwen4ExpSyntheticModelBuilder
         {
             if (type == GgmlType.Q8_0)
             {
-                var w = Gen(name, gain * 1.5f / System.MathF.Sqrt(inDim), inDim, outDim, Experts);
+                var w = Gen(name, gain * 1.5f / System.MathF.Sqrt(inDim), inDim, outDim, expertCount);
                 w.Type = GgmlType.Q8_0;
                 return w;
             }
-            return Blocks(name, type, gain * 0.8f / System.MathF.Sqrt(inDim), inDim, outDim, Experts);
+            return Blocks(name, type, gain * 0.8f / System.MathF.Sqrt(inDim), inDim, outDim, expertCount);
         }
         const float OutGain = 0.25f;
-        Tensor Norm(string name, int n) => GenAround(name, 1f, 0.1f, n);
+        Tensor Norm(string name, int n)
+        {
+            Tensor norm = GenAround(name, 1f, 0.1f, n);
+            if (matrixNormType is { } type)
+            {
+                norm.Type = type;
+                norm.Dims = n == hcDim ? new ulong[] { Hidden, Hc } : new ulong[] { (ulong)n, 1 };
+            }
+            return norm;
+        }
+        Tensor Conv(string name, GgmlType type, int kernel, int channels)
+        {
+            Tensor conv = Gen(name, 0.5f, kernel, channels);
+            conv.Type = type;
+            return conv;
+        }
 
         var embd = Gen("token_embd.weight", 1.0f, Hidden, Vocab);
         embd.Type = GgmlType.Q8_0;
@@ -115,7 +141,7 @@ internal static class Qwen4ExpSyntheticModelBuilder
                 t.Add(Proj(p + "attn_gate.weight", Hidden, valueDim));
                 t.Add(Proj(p + "ssm_alpha.weight", Hidden, VHeads, GgmlType.F32));
                 t.Add(Proj(p + "ssm_beta.weight", Hidden, VHeads, GgmlType.F32));
-                t.Add(Gen(p + "ssm_conv1d.weight", 0.5f, ConvKernel, convDim));
+                t.Add(Conv(p + "ssm_conv1d.weight", ssmConvType, ssmConvKernel, convDim));
                 t.Add(Gen(p + "ssm_dt.bias", 0.5f, VHeads));
                 // ssm_a ships pre-negated (-exp(A_log)): the recurrence decays.
                 t.Add(GenAround(p + "ssm_a", -0.9f, 0.3f, VHeads));
@@ -138,7 +164,7 @@ internal static class Qwen4ExpSyntheticModelBuilder
 
             if (il == PleLayer)
             {
-                t.Add(Gen(p + "ple_conv1d.weight", 0.5f, ConvKernel, hcDim));
+                t.Add(Conv(p + "ple_conv1d.weight", pleConvType, pleConvKernel, hcDim));
                 t.Add(Proj(p + "ple_key.weight", Hidden, hcDim));
                 t.Add(Proj(p + "ple_value.weight", Hidden, Hidden, gain: OutGain));
                 t.Add(Norm(p + "ple_norm_key.weight", hcDim));
@@ -155,7 +181,7 @@ internal static class Qwen4ExpSyntheticModelBuilder
                 gateUp = il == 2 ? GgmlType.IQ3_XXS : GgmlType.IQ2_XS;
                 down = GgmlType.IQ4_NL;
             }
-            t.Add(Proj(p + "ffn_gate_inp.weight", Hidden, Experts, GgmlType.F32));
+            t.Add(Proj(p + "ffn_gate_inp.weight", Hidden, expertCount, GgmlType.F32));
             t.Add(Experts3(p + "ffn_gate_exps.weight", Hidden, ExpertFf, gateUp));
             t.Add(Experts3(p + "ffn_up_exps.weight", Hidden, ExpertFf, gateUp));
             t.Add(Experts3(p + "ffn_down_exps.weight", ExpertFf, Hidden, down, gain: OutGain));
@@ -182,13 +208,13 @@ internal static class Qwen4ExpSyntheticModelBuilder
             new I32Arr { Key = a + "rope.dimension_sections", V = new[] { 11, 11, 10, 0 } },
             new F32 { Key = a + "rope.freq_base", V = 1e7f },
             new F32 { Key = a + "attention.layer_norm_rms_epsilon", V = 1e-6f },
-            new U32 { Key = a + "expert_count", V = Experts },
-            new U32 { Key = a + "expert_used_count", V = ExpertsUsed },
+            new U32 { Key = a + "expert_count", V = (uint)expertCount },
+            new U32 { Key = a + "expert_used_count", V = (uint)expertUsedCount },
             new U32 { Key = a + "attention.key_length", V = HeadDim },
             new U32 { Key = a + "attention.value_length", V = HeadDim },
             new U32 { Key = a + "expert_feed_forward_length", V = ExpertFf },
             new U32 { Key = a + "expert_shared_feed_forward_length", V = SharedFf },
-            new U32 { Key = a + "ssm.conv_kernel", V = ConvKernel },
+            new U32 { Key = a + "ssm.conv_kernel", V = (uint)ssmConvKernel },
             new U32 { Key = a + "ssm.state_size", V = StateSize },
             new U32 { Key = a + "ssm.group_count", V = KHeads },
             new U32 { Key = a + "ssm.time_step_rank", V = VHeads },
@@ -200,11 +226,11 @@ internal static class Qwen4ExpSyntheticModelBuilder
             new U32 { Key = a + "attention.indexer.head_count", V = IndexerHeads },
             new U32 { Key = a + "attention.indexer.key_length", V = IndexerDim },
             new U32 { Key = a + "attention.indexer.top_k", V = (uint)indexerTopK },
-            new I32Arr { Key = a + "attention.compress_ratios", V = ratios },
+            new I32Arr { Key = a + "attention.compress_ratios", V = qsa ? ratios : new int[Layers] },
             new I32Arr { Key = a + "ple.layers", V = new[] { PleLayer } },
             new U32 { Key = a + "ple.ngram_size", V = PleNgram },
             new U32 { Key = a + "ple.heads_per_ngram", V = PleHeadsPerNgram },
-            new U32 { Key = a + "ple.conv_kernel", V = ConvKernel },
+            new U32 { Key = a + "ple.conv_kernel", V = (uint)pleConvKernel },
             new U32 { Key = a + "ple.eos_token_id", V = EosToken },
             new U32 { Key = a + "embedding_length_per_layer_input", V = PleHeadDim },
             // The shipped multipliers: the hash is exercised at its real 64-bit width.

@@ -148,6 +148,7 @@ namespace TensorSharp.Models
 
         public unsafe void SpecSnapshotRecurrentState()
         {
+            FlushArenaCache(_kCache);
             _specMetadata = null; // a partial capture must never restore an older window
             _specRecurrentRestored = false;
             if (!SpeculationProfitable || !EnsureGdnArgs() || !EnsureAttnArgs() || !EnsurePleArgs())
@@ -203,6 +204,7 @@ namespace TensorSharp.Models
 
         public void SpecRestoreRecurrentState()
         {
+            FlushArenaCache(_kCache);
             ValidateSpecMetadata(_specMetadata);
             // Reserve before native ownership changes; metadata publication after
             // a successful restore cannot fail from growing the history list.

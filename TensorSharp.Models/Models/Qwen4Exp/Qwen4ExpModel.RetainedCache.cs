@@ -446,6 +446,7 @@ namespace TensorSharp.Models
         private void SyncHolderKvToHost(Qwen4ExpKvCacheHolder holder)
         {
             if (!holder.KvHostStale || !IsGgmlBackend || holder.K == null) return;
+            FlushArenaCache(holder.K);
             for (int l = 0; l < Config.NumLayers; l++)
             {
                 if (holder.K[l] != null) SyncTensorHostCache(holder.K[l]);

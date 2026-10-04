@@ -67,7 +67,8 @@
 	<key>NSSpeechRecognitionUsageDescription</key>
 	<string>TensorAgent transcribes your dictation into the message box.</string>
 
-	<!-- No App Sandbox, deliberately, and so no Entitlements.plist beside this file. The
+	<!-- No App Sandbox, deliberately. Entitlements.plist grants the JIT permission for
+	     Developer ID builds using the hardened runtime. The
 	     Mac app runs the model's code the way the desktop hosts do: as real python3,
 	     node and npm processes, each confined by TensorSharp's own Seatbelt profile to
 	     the chat's workspace. macOS refuses to apply a Seatbelt profile inside the App

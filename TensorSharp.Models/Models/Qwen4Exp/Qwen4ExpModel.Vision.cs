@@ -17,8 +17,8 @@ namespace TensorSharp.Models
     {
         // Qwen3.8-Flash-Next ships the same qwen3vl_merger vision tower as
         // Qwen3.5-VL - identical tensor names, spatial merge, projector MLP and
-        // (in this checkpoint) no active deepstack layers - so the proven Qwen3.5
-        // encoder runs it as is.
+        // (in this checkpoint) no active deepstack layers. The shared encoder
+        // keeps the block MLP's tanh GELU and can select erf GELU for the merger.
         public Qwen35VisionEncoder VisionEncoder { get; private set; }
 
         // The GDN recurrence, the PLE conv history and the n-gram history cannot be
@@ -47,7 +47,12 @@ namespace TensorSharp.Models
 
         public void LoadVisionEncoder(string mmProjPath)
         {
-            VisionEncoder = new Qwen35VisionEncoder(mmProjPath, _allocator);
+            // The published Qwen4ExpVisionPatchMerger uses nn.GELU() (erf),
+            // independently of the block MLP's gelu_pytorch_tanh. Preserve the
+            // supplied GGUF path's existing tanh default; erf is an explicit
+            // fidelity experiment until matching trained-image controls qualify it.
+            bool mergerErf = Environment.GetEnvironmentVariable("TS_Q4E_VISION_MERGER_ERF") == "1";
+            VisionEncoder = new Qwen35VisionEncoder(mmProjPath, _allocator, mergerGeluErf: mergerErf);
             VisionEncoder.SetHostModel(this);
         }
 

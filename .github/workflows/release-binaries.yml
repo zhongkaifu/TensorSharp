@@ -17,7 +17,8 @@ name: Release Binaries
 #   - osx-arm64        libGgmlOps.dylib (Metal) + MLX dylibs   -> .tar.gz
 #   - TensorAgent Desktop osx-arm64 (Metal/CPU)               -> .dmg/.pkg/.zip
 #   - TensorAgent Desktop win-x64-cpu / win-x64-cuda          -> .msi/.zip
-# Desktop packages are ad-hoc signed on macOS and unsigned on Windows. They
+# TensorAgent macOS packages require Developer ID signing and notarization;
+# Windows packages are unsigned. Desktop packages
 # bundle .NET/native runtimes, but models and optional Python/Node are separate.
 # Windows requires Evergreen WebView2. See docs/tensoragent_desktop.md.
 #   - linux-arm64-cuda13-GB10  SM121a GGML + PTX + CUDA 13 redist -> .tar.gz
@@ -117,6 +118,157 @@ jobs:
         with:
           # ggml is not a submodule; the native build scripts fetch it.
           submodules: false
+
+      - name: Set up TensorAgent Developer ID signing and notarization
+        if: ${{ runner.os == 'macOS' }}
+        shell: bash
+        env:
+          DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+          TENSORAGENT_MACOS_APPLICATION_P12_BASE64: ${{ secrets.TENSORAGENT_MACOS_APPLICATION_P12_BASE64 }}
+          TENSORAGENT_MACOS_APPLICATION_P12_PASSWORD: ${{ secrets.TENSORAGENT_MACOS_APPLICATION_P12_PASSWORD }}
+          TENSORAGENT_MACOS_INSTALLER_P12_BASE64: ${{ secrets.TENSORAGENT_MACOS_INSTALLER_P12_BASE64 }}
+          TENSORAGENT_MACOS_INSTALLER_P12_PASSWORD: ${{ secrets.TENSORAGENT_MACOS_INSTALLER_P12_PASSWORD }}
+          TENSORAGENT_MACOS_PROVISION_PROFILE_BASE64: ${{ secrets.TENSORAGENT_MACOS_PROVISION_PROFILE_BASE64 }}
+          TENSORAGENT_MACOS_NOTARY_APPLE_ID: ${{ secrets.TENSORAGENT_MACOS_NOTARY_APPLE_ID }}
+          TENSORAGENT_MACOS_NOTARY_APP_PASSWORD: ${{ secrets.TENSORAGENT_MACOS_NOTARY_APP_PASSWORD }}
+          TENSORAGENT_MACOS_TEAM_ID: ${{ secrets.TENSORAGENT_MACOS_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          # Public releases must never fall back to ad-hoc signing. Check secrets
+          # before installing workloads or compiling native dependencies.
+          for credential in TENSORAGENT_MACOS_APPLICATION_P12_BASE64 \
+                            TENSORAGENT_MACOS_APPLICATION_P12_PASSWORD \
+                            TENSORAGENT_MACOS_INSTALLER_P12_BASE64 \
+                            TENSORAGENT_MACOS_INSTALLER_P12_PASSWORD \
+                            TENSORAGENT_MACOS_PROVISION_PROFILE_BASE64 \
+                            TENSORAGENT_MACOS_NOTARY_APPLE_ID \
+                            TENSORAGENT_MACOS_NOTARY_APP_PASSWORD \
+                            TENSORAGENT_MACOS_TEAM_ID; do
+            if [ -z "${!credential}" ]; then
+              echo "::error::Required macOS release secret is missing: $credential" >&2
+              exit 1
+            fi
+          done
+          umask 077
+          signing_dir="$RUNNER_TEMP/tensoragent-signing-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          mkdir -p "$signing_dir"
+          keychain="$signing_dir/release.keychain-db"
+          # Register cleanup paths before performing any import or network work.
+          {
+            echo "TENSORAGENT_SIGNING_DIR=$signing_dir"
+            echo "TENSORAGENT_SIGNING_KEYCHAIN=$keychain"
+            echo "TENSORAGENT_NOTARY_PROFILE=tensoragent-notary-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          } >> "$GITHUB_ENV"
+          export TENSORAGENT_SIGNING_DIR="$signing_dir"
+          security list-keychains -d user > "$signing_dir/keychains.before"
+          python3 - <<'PY'
+          import base64
+          import os
+          from pathlib import Path
+          import re
+
+          directory = Path(os.environ["TENSORAGENT_SIGNING_DIR"])
+          for name, secret in (
+              ("application.p12", "TENSORAGENT_MACOS_APPLICATION_P12_BASE64"),
+              ("installer.p12", "TENSORAGENT_MACOS_INSTALLER_P12_BASE64"),
+              ("provisioning.mobileprovision", "TENSORAGENT_MACOS_PROVISION_PROFILE_BASE64"),
+          ):
+              try:
+                  data = base64.b64decode(re.sub(r"\s", "", os.environ[secret]), validate=True)
+              except ValueError:
+                  raise SystemExit(f"Invalid base64 in macOS release secret: {secret}")
+              if not data:
+                  raise SystemExit(f"Empty macOS release credential: {secret}")
+              (directory / name).write_bytes(data)
+          PY
+          keychain_password="$(openssl rand -hex 32)"
+          echo "::add-mask::$keychain_password"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$signing_dir/application.p12" -k "$keychain" \
+            -P "$TENSORAGENT_MACOS_APPLICATION_P12_PASSWORD" -T /usr/bin/codesign -T /usr/bin/security
+          security import "$signing_dir/installer.p12" -k "$keychain" \
+            -P "$TENSORAGENT_MACOS_INSTALLER_P12_PASSWORD" -T /usr/bin/productbuild \
+            -T /usr/bin/productsign -T /usr/bin/security
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s \
+            -k "$keychain_password" "$keychain" > /dev/null
+          python3 - "$keychain" <<'PY'
+          import os
+          from pathlib import Path
+          import shlex
+          import subprocess
+          import sys
+
+          original = shlex.split((Path(os.environ["TENSORAGENT_SIGNING_DIR"]) / "keychains.before").read_text())
+          subprocess.run(["security", "list-keychains", "-d", "user", "-s", sys.argv[1], *original], check=True)
+          PY
+          security find-identity -v -p codesigning "$keychain" > "$signing_dir/application-identities.txt"
+          security find-identity -v -p basic "$keychain" > "$signing_dir/installer-identities.txt"
+          security cms -D -i "$signing_dir/provisioning.mobileprovision" > "$signing_dir/profile.plist"
+          python3 - <<'PY'
+          from datetime import datetime, timezone
+          import fnmatch
+          import os
+          from pathlib import Path
+          import plistlib
+          import re
+          import subprocess
+
+          directory = Path(os.environ["TENSORAGENT_SIGNING_DIR"])
+          team = os.environ["TENSORAGENT_MACOS_TEAM_ID"]
+          if not re.fullmatch(r"[A-Z0-9]{10}", team):
+              raise SystemExit("TENSORAGENT_MACOS_TEAM_ID must be a ten-character Apple team ID")
+          identities = {}
+          for kind, filename in (("Application", "application-identities.txt"), ("Installer", "installer-identities.txt")):
+              names = re.findall(r'^\s*\d+\)\s+[A-Fa-f0-9]{40}\s+"([^"]+)"',
+                                 (directory / filename).read_text(), re.MULTILINE)
+              matches = [name for name in names if name.startswith(f"Developer ID {kind}: ") and name.endswith(f"({team})")]
+              if len(matches) != 1:
+                  raise SystemExit(f"Expected exactly one valid Developer ID {kind} identity for the configured team")
+              identities[kind] = matches[0]
+          profile = plistlib.loads((directory / "profile.plist").read_bytes())
+          uuid = profile.get("UUID", "")
+          if not re.fullmatch(r"[A-Fa-f0-9-]{36}", uuid):
+              raise SystemExit("Developer ID provisioning profile has no valid UUID")
+          if team not in profile.get("TeamIdentifier", []):
+              raise SystemExit("Developer ID provisioning profile belongs to another team")
+          expiry = profile.get("ExpirationDate")
+          if not isinstance(expiry, datetime) or expiry.replace(tzinfo=timezone.utc) <= datetime.now(timezone.utc):
+              raise SystemExit("Developer ID provisioning profile has expired")
+          entitlements = profile.get("Entitlements", {})
+          identifier = entitlements.get("application-identifier", entitlements.get("com.apple.application-identifier", ""))
+          if not fnmatch.fnmatchcase(f"{team}.ai.tensorsharp.tensoragent", identifier):
+              raise SystemExit("Developer ID provisioning profile does not authorize TensorAgent's bundle ID")
+          if "OSX" not in profile.get("Platform", []) or profile.get("ProvisionedDevices") or entitlements.get("get-task-allow"):
+              raise SystemExit("A Mac Catalyst Developer ID distribution provisioning profile is required")
+          certificate = subprocess.check_output(["security", "find-certificate", "-c", identities["Application"], "-p",
+                                                 str(directory / "release.keychain-db")])
+          der = subprocess.check_output(["openssl", "x509", "-outform", "DER"], input=certificate)
+          if der not in profile.get("DeveloperCertificates", []):
+              raise SystemExit("Developer ID profile does not include the imported application certificate")
+          # Xcode 16+ and older .NET SDKs search different profile directories.
+          destinations = [Path.home() / "Library/Developer/Xcode/UserData/Provisioning Profiles" / f"{uuid}.provisionprofile",
+                          Path.home() / "Library/MobileDevice/Provisioning Profiles" / f"{uuid}.provisionprofile"]
+          if any(path.exists() for path in destinations):
+              raise SystemExit("Refusing to overwrite an existing provisioning profile on the runner")
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as output:
+              output.write(f"TENSORAGENT_APPLICATION_IDENTITY={identities['Application']}\n")
+              output.write(f"TENSORAGENT_INSTALLER_IDENTITY={identities['Installer']}\n")
+              output.write(f"TENSORAGENT_PROVISION_UUID={uuid}\n")
+              output.write(f"TENSORAGENT_PROVISION_PATH={destinations[0]}\n")
+              output.write(f"TENSORAGENT_LEGACY_PROVISION_PATH={destinations[1]}\n")
+          data = (directory / "provisioning.mobileprovision").read_bytes()
+          for path in destinations:
+              path.parent.mkdir(parents=True, exist_ok=True)
+              path.write_bytes(data)
+          PY
+          xcrun notarytool store-credentials "tensoragent-notary-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
+            --keychain "$keychain" --apple-id "$TENSORAGENT_MACOS_NOTARY_APPLE_ID" \
+            --team-id "$TENSORAGENT_MACOS_TEAM_ID" --password "$TENSORAGENT_MACOS_NOTARY_APP_PASSWORD"
+          # Keep raw secrets and decoded profile data out of diagnostic artifacts.
+          rm -f "$signing_dir/application.p12" "$signing_dir/installer.p12" \
+            "$signing_dir/provisioning.mobileprovision" "$signing_dir/profile.plist"
 
       - uses: actions/setup-dotnet@v4
         with:
@@ -260,7 +412,12 @@ jobs:
             dotnet publish "$project" -c Release -f net10.0-maccatalyst \
               -r maccatalyst-arm64 --self-contained true -m:1 -p:Version="$V" \
               -p:ApplicationDisplayVersion="$APP_VERSION" -p:ApplicationVersion="$APP_BUILD" \
-              -p:TensorSharpAppleTargets=true -p:CreatePackage=false -p:CodesignKey=-
+              -p:TensorSharpAppleTargets=true -p:CreatePackage=false -p:EnableCodeSigning=true \
+              -p:CodesignKey="$TENSORAGENT_APPLICATION_IDENTITY" \
+              -p:CodesignKeychain="$TENSORAGENT_SIGNING_KEYCHAIN" \
+              -p:CodesignProvision="$TENSORAGENT_PROVISION_UUID" \
+              -p:CodesignEntitlements=Platforms/MacCatalyst/Entitlements.plist \
+              -p:UseHardenedRuntime=true
           fi
 
       - name: Stage GGML native library
@@ -408,6 +565,13 @@ jobs:
         env:
           V: ${{ steps.ver.outputs.version }}
         run: |
+          set -euo pipefail
+          # Identities, notary profile and keychain come from the mandatory setup
+          # step via GITHUB_ENV. The packager rejects unnotarized release output.
+          : "${TENSORAGENT_APPLICATION_IDENTITY:?Developer ID setup did not complete}"
+          : "${TENSORAGENT_INSTALLER_IDENTITY:?Developer ID setup did not complete}"
+          : "${TENSORAGENT_NOTARY_PROFILE:?Notarization setup did not complete}"
+          : "${TENSORAGENT_SIGNING_KEYCHAIN:?Developer ID setup did not complete}"
           bash eng/package-tensoragent-macos.sh \
             TensorAgent/src/TensorAgent.Maui/bin/Release/net10.0-maccatalyst/maccatalyst-arm64/TensorAgent.app \
             "$V" artifacts
@@ -439,12 +603,14 @@ jobs:
             echo "Unmodified upstream ggml: $(git -C ExternalProjects/ggml rev-parse HEAD)"
             echo "Coverage: packaging contract tests, publish, required payload checks, archive/checksum verification."
             if [ "$RUNNER_OS" = macOS ]; then
-              echo "Verified code signatures, ARM64 architecture, macOS 14 deployment floor, DMG and PKG structure."
+              echo "Verified Developer ID signatures and timestamps, hardened runtime/JIT entitlement, ARM64 architecture, macOS 14 deployment floor, DMG and PKG structure."
+              echo "Apple notarization accepted; stapled tickets validated for app, DMG and PKG; Gatekeeper assessed app and release containers."
+              echo "Signing: Developer ID Application (app/DMG), Developer ID Installer (PKG); notarized and stapled."
             else
               echo "Verified every ZIP/MSI payload hash after administrative extraction."
+              echo "Signing: Windows unsigned."
             fi
             echo "Not covered: clean-machine installation, UI launch, model inference, GPU devices or benchmarks."
-            echo "Signing: macOS ad-hoc (not notarized); Windows unsigned."
           } > "artifacts/tensoragent-desktop-$V-$VARIANT-BUILD.txt"
 
       - name: Archive (Unix)
@@ -480,6 +646,48 @@ jobs:
           if-no-files-found: error
           compression-level: 0
           retention-days: 14
+
+      - name: Upload macOS notarization diagnostics
+        if: ${{ always() && runner.os == 'macOS' }}
+        uses: actions/upload-artifact@v4
+        with:
+          # Deliberately does not match release-*; the publish job only downloads
+          # release artifacts, so generated evidence is never a release asset.
+          name: notarization-${{ matrix.name }}-${{ github.run_attempt }}
+          path: artifacts/notarization/
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Remove temporary macOS signing credentials
+        if: ${{ always() && runner.os == 'macOS' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cleanup_status=0
+          if [ -n "${TENSORAGENT_PROVISION_PATH:-}" ]; then
+            rm -f "$TENSORAGENT_PROVISION_PATH" || cleanup_status=1
+          fi
+          if [ -n "${TENSORAGENT_LEGACY_PROVISION_PATH:-}" ]; then
+            rm -f "$TENSORAGENT_LEGACY_PROVISION_PATH" || cleanup_status=1
+          fi
+          if [ -n "${TENSORAGENT_SIGNING_DIR:-}" ]; then
+            if [ -f "$TENSORAGENT_SIGNING_DIR/keychains.before" ]; then
+              python3 - <<'PY' || cleanup_status=1
+          import os
+          from pathlib import Path
+          import shlex
+          import subprocess
+
+          original = shlex.split((Path(os.environ["TENSORAGENT_SIGNING_DIR"]) / "keychains.before").read_text())
+          subprocess.run(["security", "list-keychains", "-d", "user", "-s", *original], check=True)
+          PY
+            fi
+            if [ -f "${TENSORAGENT_SIGNING_KEYCHAIN:-}" ]; then
+              security delete-keychain "$TENSORAGENT_SIGNING_KEYCHAIN" || cleanup_status=1
+            fi
+            rm -rf "$TENSORAGENT_SIGNING_DIR" || cleanup_status=1
+          fi
+          exit "$cleanup_status"
 
   build-gb10:
     name: Build linux-arm64-cuda13-GB10
@@ -661,6 +869,6 @@ jobs:
 
             [Download, installation, setup and first-chat guide](https://tensorsharp.ai/tensoragent.html) · [Guide at this release tag](https://github.com/${{ github.repository }}/blob/${{ steps.ver.outputs.tag }}/docs/tensoragent_desktop.md)
 
-            Models are downloaded in the app. Windows requires WebView2; CUDA also requires an NVIDIA driver. Packages include .NET/native runtimes; Python/Node.js for skills are optional separate installs. macOS packages are ad-hoc signed and not notarized; Windows packages are unsigned. See the guide for platform prompts and SHA-256 verification. BUILD files record dependency revision and actual validation coverage.
+            Models are downloaded in the app. Windows requires WebView2; CUDA also requires an NVIDIA driver. Packages include .NET/native runtimes; Python/Node.js for skills are optional separate installs. TensorAgent macOS packages are Developer ID signed, Apple-notarized and stapled; Windows packages are unsigned. See the guide for installation and SHA-256 verification. BUILD files record dependency revision and actual validation coverage; clean-machine installation, UI launch, model inference and device benchmarks are not exercised by this packaging workflow.
           fail_on_unmatched_files: true
           files: dist/**/*

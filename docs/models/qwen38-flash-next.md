@@ -8,14 +8,15 @@ PLE n-gram embedding block, ×4 hyper-connection streams and a 512-expert MoE.
 The GGUF architecture id is `qwen4exp`. Weights:
 [unsloth/Qwen3.8-Flash-Next-GGUF](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF)
 (multi-shard per quant directory; point `--model` at the `-00001-of-` shard;
-image input needs `mmproj-BF16.gguf`: the CLI loads it from beside the model when
+image input needs its matching vision projector, such as `mmproj-BF16.gguf` or
+`mmproj-F16.gguf`: the CLI loads it from beside the model when
 `--image` is given, and the server needs `--mmproj`).
 
 ## How TensorSharp runs it
 
 On the GGML backends the whole token runs as (almost) one graph — embedding,
 PLE (in-graph), all 48 layers, the final mixer and the LM head — with a
-shape-keyed cache of captured graphs (where the span declines, per-layer fused
+shape-keyed cache of reusable ggml graphs (where the span declines, per-layer fused
 kernels run instead, and those in turn fall back op-by-op). Vision rides the
 Qwen3.5-VL tower with (T,H,W) IMRoPE positions; multi-image and multi-turn
 image sessions are supported, with KV reuse across turns (the GDN recurrence
@@ -30,6 +31,19 @@ needs to displace it.
 Thinking can be switched on or off. With it off, the assistant turn opens with
 the closed, empty `<think>\n\n</think>` block the published template emits,
 and replayed history keeps that exact suffix so cached prefixes still match.
+
+The published Qwen4Exp vision patch merger uses GELU(erf), separately from the
+transformer blocks' `gelu_pytorch_tanh`, matching the
+[Transformers v5.16.1 reference](https://github.com/huggingface/transformers/blob/v5.16.1/src/transformers/models/qwen4_exp/modeling_qwen4_exp.py#L1705).
+The supplied GGUF path retains its existing tanh merger default. Set
+`TS_Q4E_VISION_MERGER_ERF=1` before loading the projector to select the published
+erf merger independently of the block activation. The delivered base-model default
+passes 12/12 image cases, reproducing all 16 earlier tanh answers. The full erf
+trial passed 10/12; a subsequent same-build C=1 OCR control passes 2/2 with tanh
+and 1/2 with erf, which reads blue `9364` as `9334`. These scoped checks support
+preserving the compatibility default; they do not explain the recognition
+difference or establish broader activation quality. See the
+[image validation guide](../../eng/validation/qwen38-parallel-vision.md).
 
 ## Vision encoder memory and validation
 
@@ -213,20 +227,104 @@ answered, and every conversation reused its previous turn (turn 3: 1564-3482 of
 
 Concurrent requests are served through **per-sequence state holders**: each
 in-flight request owns its attention KV + QSA indexer caches, its GDN conv +
-delta-net state, its PLE conv history and n-gram window, and its pinned kernel
-descriptors. The native kernel keys its device-resident recurrent state by the
-holder's host seed pointers and its cached graphs by the descriptor addresses,
-so switching requests is a reference swap — no state download/upload, no graph
-rebuild — and each sequence decodes through its own captured single-graph
-fused decode. The engine round-robins sequences per step
-(`SupportsPerSequenceFusedForward`); a fused N-way batched decode is a future
-optimization.
+delta-net state, its PLE conv history and n-gram window, its M-RoPE gap and
+coordinate history, and its pinned kernel descriptors. Sampling and logits
+belong to each request; the executor detaches borrowed solo logits before a
+second request can overwrite the model's output buffer. Immutable PLE
+convolution coefficients remain owned by the model throughout every holder's
+lifetime.
 
-**Concurrent greedy output can differ from solo, and the reason is the prefill
-shape.** The scheduler prefills a lone request in one large chunk (the smaller
+**Concurrent decode uses the fused arena by default.** On a single-device GGML
+CPU, Metal or CUDA backend with F16 KV caches and initialized span state, two
+or more ready decoders run together in one reusable ggml graph. When routed
+experts are offloaded to the host, execution crosses host-expert seams between
+backend graph segments. This is a shared graph on Metal; CUDA graph capture is
+a separate backend mechanism. Attention/QSA and GDN keep separate slot state.
+Projections, routed/shared experts and the language head participate in the
+shared graph; operations whose backend arithmetic depends on row geometry keep
+the solo reductions instead of requiring a multi-row kernel for every node.
+Each attention lane uses its solo padded KV window and
+mask, rather than the longest request's window. Router softmax also keeps the
+solo row reduction, because changing Metal's thread count with the total batch
+size changes routing weights. A mixed scheduler step batches
+its ready decode subset and runs new requests' prefill chunks through their own
+holders. Arrivals, departures, cache growth and a return to solo execution
+flush or retire the corresponding arena slot before another path reads its
+state. Image requests join this path after media prefill; their compacted
+rotary positions and QSA coordinate history stay with their holder.
+
+Tensor parallelism, layer splitting, other KV dtypes and unavailable span or
+backend geometry continue through the per-sequence fused path when supported.
+GPU arena execution requires upstream flash attention support for its head
+geometry; CPU uses the corresponding attention fallback. Every participating
+holder must have authoritative initialized state, a matching position and room
+for the next cache row. A holder needing growth takes the solo path before it
+can rejoin the batch.
+One ready decoder uses solo fused decode. `TS_BATCHED_FUSED_DECODE=0` provides
+the round-robin control for comparisons. A native execution failure fails the
+affected requests; partially advanced recurrent state is not retried as a solo
+step. This implementation lives in TensorSharp-owned code and uses unchanged
+upstream ggml. Source support alone does not establish throughput gains or
+trained-model quality on every backend.
+
+Reusable checks: [parallel text and request isolation](../../eng/validation/qwen4exp-concurrent-http.md)
+and [parallel image content, attachment order and history](../../eng/validation/qwen38-parallel-vision.md).
+The image guide includes pinned projector sources and hashes. Keep generated
+reports in ignored `docs/validation/` or `artifacts/`; failed, skipped or
+unavailable model/device cases are not passing validation.
+
+### Local Metal validation, 2026-10-04
+
+Both requested checkpoints were exercised on an Apple M5 Pro with 48 GiB unified
+memory, using unchanged ggml revision
+`353b63b439f27ab2cc19dac97ab1681ba6d2d084`. The
+[native probe](../../eng/validation/qwen4exp-batched-decode-probe.md) covered
+widths 2, 3 and 4, 64 teacher-forced decode steps and two repetitions. All 4,728
+retained prefill/decode/continuation comparisons measured max |Δlogit| = 0 and
+zero greedy differences. Raw logit bitwise identity was not separately checked.
+The aggregate native decode measurements were:
+
+| Checkpoint | Fused decode tokens/s | Gain versus round-robin | Delivered image cases |
+| --- | ---: | ---: | ---: |
+| Base UD-Q2_K_XL | 23.86–25.61 | 17.37–50.77% | 12/12 passed |
+| Uncensored IQ2_XXS | 18.70–26.82 | 15.04–35.36% | 4/12 passed; suite failed |
+
+Matched two-request HTTP topic answers and exact markers agree between enabled
+and round-robin configurations, with runtime evidence of fused execution. Across
+two repetitions, topic throughput improved 7.01% for base and 8.18% for
+uncensored; uncensored markers improved 0.71%. Base marker results were mixed:
+the cold-first, prefix-cache-off pair was 3.08% slower, while the delivered
+serial-before-parallel, prefix-cache-on pair was 11.705% faster in one repetition.
+All matched requests in the latter pair reported zero cached prompt tokens;
+workload order does not establish a cache-hit or warming cause. These measurements
+support no uniform speedup or no-regression guarantee.
+
+The delivered tanh-default image checks reproduce all earlier default answers:
+16 completed base turns and 14 completed uncensored turns. Exact C=1/C=2 parity
+holds for all eight base and seven uncensored completed turn pairs. The
+uncensored checkpoint reads blue `9364` as `9324` in single-image OCR and also
+fails both attachment-order checks. Its two blue-image follow-up requests were
+unreached after incorrect initial OCR; they are untested and not passing. Exact
+parallel parity therefore does not establish image-quality acceptance. These
+two-card OCR/color/order/history checks and the text relevance/marker checks
+cover a limited quality scope.
+
+Evidence is retained in ignored `docs/validation/qwen38-parallel/` and
+`artifacts/validation/qwen38-locality-{base,uncensored}-native/`. Native, paired
+HTTP and delivered vision runs have distinct managed build identities; the
+final native library is unchanged across those phases. Native rates exclude
+HTTP/prefill, while HTTP rates include admission and prefill. The model files
+exceed physical RAM, so paging, process/cache state and short measurements limit
+performance conclusions. This validation does not qualify other devices,
+CUDA/TP execution, broad factual/visual quality or long-context performance.
+The image harness compares assembled content and request hashes; its raw SSE
+framing and completion IDs remain unverified.
+
+**Prefill shape remains a separate numerical caveat.** The scheduler prefills
+a lone request in one large chunk (the smaller
 of `TS_SCHED_SOLO_PREFILL_CHUNK` and `TS_SCHED_MAX_BATCHED_TOKENS`) and
 concurrent requests in shares of the step budget, and this model's logits
-depend on the chunk size. Measured with `benchmarks/ChunkParityProbe` on
+can depend on the chunk size. Historical CUDA checks with `benchmarks/ChunkParityProbe` on
 UD-Q2_K_XL over a three-GPU layer split, a 19,121-token prompt: the same 4096
 chunking reproduces itself bit for bit (max |Δlogit| 0), while 1024- and
 512-token chunks move the logits by up to 1.3 and flip greedy decoding at
@@ -235,8 +333,9 @@ heading's first word). Holding the shape equal removes the effect: four
 concurrent requests x three waves of a 2,928-token prompt that every request
 prefills in one chunk (`TS_SCHED_PREFILL_CHUNK=4096`,
 `TS_SCHED_MAX_BATCHED_TOKENS=16384`) came back byte-identical to solo, 12/12
-over 512 tokens, so no state leaks between the per-sequence holders and the
-round-robin decode does not depend on concurrency. Prefill shape is not promised
+over 512 tokens. Those results qualified the earlier round-robin workload and
+settings; they do not qualify the new arena or every concurrent workload.
+Prefill shape is not promised
 to be width-invariant on CUDA, so the fixture's chunked-versus-whole gate bounds
 that difference instead of requiring bit equality; see
 [Retained-prefix reuse](#retained-prefix-reuse).
@@ -254,7 +353,7 @@ Qwen 3.5 and DeepSeek V4 paths have:
   A refused or failed conversion makes that request prefill normally.
 - A finished conversation's whole per-sequence holder is **retained** and
   re-keyed for the turn that extends it exactly. Nothing moves: the native
-  state entries keyed on the holder, its captured graphs and the draft head's
+  state entries keyed on the holder, its cached graphs and the draft head's
   private K/V stay where they are.
 - The state at the end of the prompt every chat shares is **checkpointed** as a
   host-authoritative deep copy (attention K/V, QSA raw keys and positions,

@@ -47,7 +47,18 @@ namespace TensorSharp.Models
         private void ApplyVisionGelu(Tensor tensor)
         {
             if (!_qwenImage21) { Ops.GELU(tensor, tensor); return; }
-            if (UseFusedVision21)
+            ApplyVisionGeluErf(tensor);
+        }
+
+        private void ApplyVisionMergerGelu(Tensor tensor)
+        {
+            if (!_mergerGeluErf) { ApplyVisionGelu(tensor); return; }
+            ApplyVisionGeluErf(tensor);
+        }
+
+        private void ApplyVisionGeluErf(Tensor tensor)
+        {
+            if (UseFusedVision21 || (!_qwenImage21 && _useNativeAttention))
             {
                 GgmlBasicOps.GELUErf(tensor, tensor);
                 return;
@@ -57,7 +68,8 @@ namespace TensorSharp.Models
                 GeluErfInPlace(tensor);
                 return;
             }
-            // Qwen3-VL uses GELU(erf); Ops.GELU uses the tanh approximation.
+            // Ops.GELU uses the tanh approximation, so an erf activation needs
+            // an explicit path on backends without the native erf unary op.
             var values = tensor.GetElementsAsFloat((int)tensor.ElementCount());
             System.Threading.Tasks.Parallel.For(0, values.Length, i =>
             {

@@ -466,6 +466,80 @@ public class BatchedExecutorTests
             Assert.Equal(baseline.outputs[i], declined.outputs[i]);
     }
 
+    [Theory]
+    [InlineData("sampled")]
+    [InlineData("logits")]
+    [InlineData("sampling")]
+    public void BatchExecutor_FusedBatchException_FailsOnlyAffectedDecodersWithoutRetrying(string batchPath)
+    {
+        using var model = new PerSeqFusedStubModel("fp-fused-batch-error", throwBatchPath: batchPath);
+        var cfg = SmallConfig();
+        var pool = new BlockPool(cfg.NumBlocks, cfg.BlockSize, model.ComputeKVBlockByteSize(cfg.BlockSize));
+        var scheduler = new ContinuousBatchScheduler(cfg, pool, NullLogger.Instance);
+        var executor = new BatchExecutor(model, pool, scheduler, NullLogger.Instance);
+        var step = new SchedulerOutput();
+        var decoders = new List<SequenceState>();
+        foreach (int index in new[] { 0, 1 })
+        {
+            var seq = new SequenceState($"failed-decoder-{index}", new List<int> { 1, 2, 3, 4 },
+                maxNewTokens: 4, BlockSize, SamplingConfig.Greedy);
+            foreach (var block in pool.AllocateNew(1)!) seq.BlockTable.AppendBlock(block);
+            Assert.True(model.BindSequenceCache(seq.RequestId));
+            seq.AdvanceComputedTokens(4);
+            seq.Status = SequenceStatus.Running;
+            seq.LastLogits = Enumerable.Repeat(1f, VocabSize).ToArray();
+            // Device-sampled tokens must remain unconsumed on failure. A retry
+            // would also advance a possibly partially written native cache.
+            seq.PendingDeviceToken = 6 + index;
+            seq.PendingDevicePosition = 4;
+            if (batchPath == "sampling" && index == 1)
+            {
+                // The first request ID has been copied when preparing this row
+                // throws. Both decoders still must be excluded from retry.
+                seq.PendingDeviceToken = null;
+                seq.LastLogits = null;
+            }
+            decoders.Add(seq);
+            step.ScheduledWork.Add(new ScheduledSequenceWork(seq, 1, isNewAdmission: false, isPrefill: false));
+        }
+        var newcomer = new SequenceState("unaffected-prefill", new List<int> { 2, 3, 4, 5 },
+            maxNewTokens: 4, BlockSize, SamplingConfig.Greedy);
+        foreach (var block in pool.AllocateNew(1)!) newcomer.BlockTable.AppendBlock(block);
+        newcomer.Status = SequenceStatus.Running;
+        model.PeakForRequest[newcomer.RequestId] = 9;
+        step.ScheduledWork.Add(new ScheduledSequenceWork(newcomer, 4, isNewAdmission: true, isPrefill: true));
+
+        var results = executor.ExecuteStep(step);
+
+        Assert.Equal(3, results.Count);
+        Assert.Equal(batchPath == "sampling" ? 0 : 1, model.ThrowingBatchCalls);
+        if (batchPath != "sampling") Assert.Equal(new[] { 6, 7 }, model.LastThrowingBatchTokens);
+        foreach (var seq in decoders)
+        {
+            var result = Assert.Single(results, result => result.Sequence == seq);
+            Assert.Same(seq.Error, result.Error);
+            Assert.IsType<InvalidOperationException>(result.Error);
+            Assert.Empty(seq.OutputTokens);
+            Assert.Equal(4, seq.NumComputedTokens);
+            int index = decoders.IndexOf(seq);
+            Assert.Equal(batchPath == "sampling" && index == 1 ? null : (int?)(6 + index), seq.PendingDeviceToken);
+            Assert.Equal(4, seq.PendingDevicePosition);
+            Assert.Equal(0, result.TokensForwarded);
+        }
+        var prefill = Assert.Single(results, result => result.Sequence == newcomer);
+        Assert.Null(prefill.Error);
+        Assert.True(prefill.IsPrefill);
+        Assert.Equal(4, newcomer.NumComputedTokens);
+        Assert.Equal(1, model.NumForwardCalls); // no serial retry of either failed decoder
+
+        var next = new SchedulerOutput();
+        next.ScheduledWork.Add(new ScheduledSequenceWork(newcomer, 1, isNewAdmission: false, isPrefill: false));
+        var healthy = Assert.Single(executor.ExecuteStep(next));
+        Assert.Null(healthy.Error);
+        Assert.Equal(9, healthy.SampledToken);
+        Assert.Equal(5, newcomer.NumComputedTokens);
+    }
+
     [Fact]
     public async Task BatchExecutor_PerSeqFused_ServesConcurrentSequencesViaForwardNotForwardBatch()
     {
@@ -1183,6 +1257,7 @@ public class BatchedExecutorTests
         private readonly bool _requiresPerBlockCapture;
         private readonly bool _canBatchDecode;
         private readonly bool _samplingLogits;
+        private readonly string _throwBatchPath;
         private string _activeReqId;
         private readonly HashSet<string> _liveCaches = new(StringComparer.Ordinal);
 
@@ -1191,13 +1266,15 @@ public class BatchedExecutorTests
             bool supportsCrossSequenceReuse = true,
             bool requiresPerBlockCapture = false,
             bool canBatchDecode = true,
-            bool samplingLogits = false)
+            bool samplingLogits = false,
+            string throwBatchPath = null)
         {
             _fp = fp;
             _supportsCrossSequenceReuse = supportsCrossSequenceReuse;
             _requiresPerBlockCapture = requiresPerBlockCapture;
             _canBatchDecode = canBatchDecode;
             _samplingLogits = samplingLogits;
+            _throwBatchPath = throwBatchPath;
             Tokenizer = new StubTokenizer(VocabSize);
         }
 
@@ -1208,6 +1285,8 @@ public class BatchedExecutorTests
         public int LastPreparedContext { get; private set; }
         public int MaxConcurrentBoundCaches { get; private set; }
         public int BatchedFusedDecodeDeclines { get; private set; }
+        public int ThrowingBatchCalls { get; private set; }
+        public int[] LastThrowingBatchTokens { get; private set; }
         public HashSet<string> BoundRequestIds { get; } = new(StringComparer.Ordinal);
 
         public ModelConfig Config { get; } = new ModelConfig { VocabSize = VocabSize };
@@ -1264,8 +1343,23 @@ public class BatchedExecutorTests
         public bool TryForwardBatchedFusedDecode(
             IReadOnlyList<string> requestIds, int[] tokens, int[] positions, float[][] outLogits)
         {
+            if (_throwBatchPath == "logits") ThrowBatch(tokens);
             BatchedFusedDecodeDeclines++;
             return false;
+        }
+
+        public bool TryForwardBatchedFusedDecodeSampled(
+            IReadOnlyList<string> requestIds, int[] tokens, int[] positions, int[] output)
+        {
+            if (_throwBatchPath == "sampled") ThrowBatch(tokens);
+            return false;
+        }
+
+        private void ThrowBatch(int[] tokens)
+        {
+            ThrowingBatchCalls++;
+            LastThrowingBatchTokens = (int[])tokens.Clone();
+            throw new InvalidOperationException("A native batch failed after it may have modified sequence caches.");
         }
 
         public bool BindSequenceCache(string requestId)

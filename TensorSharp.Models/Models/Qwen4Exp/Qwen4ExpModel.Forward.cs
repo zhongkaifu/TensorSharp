@@ -179,6 +179,10 @@ namespace TensorSharp.Models
         {
             if (!_kvCacheHostStale || !IsGgmlBackend || _kCache == null)
                 return;
+            // Batched decode's newest rows live in its arena. Retire this
+            // holder's slot before synchronizing the older solo cache mirrors;
+            // otherwise a grow/checkpoint would copy a stale attention prefix.
+            FlushArenaCache(_kCache);
             for (int l = 0; l < Config.NumLayers; l++)
             {
                 if (_kCache[l] != null) SyncTensorHostCache(_kCache[l]);
@@ -186,6 +190,28 @@ namespace TensorSharp.Models
                 if (_idxKCache[l] != null) SyncQsaCache(l);
             }
             _kvCacheHostStale = false;
+        }
+
+        private void FlushArenaCache(Tensor[] caches)
+        {
+            if (!IsGgmlBackend || caches == null) return;
+            foreach (Tensor cache in caches)
+                if (cache != null)
+                {
+                    // Every registered cache/state pointer retires the entire
+                    // holder slot, including QSA and GDN/PLE recurrence.
+                    if (GgmlBasicOps.Qwen4ExpArenaFlushHostPointerStatus(TensorComputePrimitives.GetStoragePointer(cache)) == 1)
+                        return;
+                    if (ReferenceEquals(caches, _kCache)) _specStateFailed = true;
+                    if (_fusedHolders != null)
+                        foreach (var holder in _fusedHolders.Values)
+                            if (ReferenceEquals(caches, holder.K)) holder.SpecStateFailed = true;
+                    if (_retainedFusedHolders != null)
+                        foreach (var holder in _retainedFusedHolders.Values)
+                            if (ReferenceEquals(caches, holder.K)) holder.SpecStateFailed = true;
+                    throw new InvalidOperationException(
+                        "qwen4exp: arena state flush failed; reset this conversation before reuse. " + GgmlBasicOps.LastNativeError());
+                }
         }
 
         private unsafe void InvalidateActiveSeqState()
@@ -261,6 +287,10 @@ namespace TensorSharp.Models
                 throw new InvalidOperationException("qwen4exp: the active conversation has failed speculative state; reset it before forwarding.");
             try
             {
+                // Global native weight eviction can retire the arena before
+                // this holder runs again. Check its flush status before a
+                // fused-kernel fallback can consume any older solo state.
+                if (_kvCacheHostStale) FlushArenaCache(_kCache);
                 return ForwardCoreInner(tokens);
             }
             catch
@@ -302,11 +332,21 @@ namespace TensorSharp.Models
             // the bus twice instead of 192 times. Anything the span declines falls
             // back to the per-layer loop below.
             long tSpan = Stopwatch.GetTimestamp();
-            bool spanDone = TryFusedTokenSpans(res, tokens, seqLen, startPos);
+            bool spanDone;
+            try
+            {
+                spanDone = TryFusedTokenSpans(res, tokens, seqLen, startPos);
+            }
+            catch
+            {
+                res.Dispose();
+                throw;
+            }
             if (!spanDone && (IsTensorParallel || _specForwardActive || HasQsa))
             {
                 res.Dispose();
-                throw new InvalidOperationException("qwen4exp: speculative token span failed; reset this conversation before retrying.");
+                throw new InvalidOperationException(
+                    "qwen4exp: required token-span path declined; this configuration cannot use the per-layer fallback.");
             }
             if (spanDone) Q4eSpanTicks += Stopwatch.GetTimestamp() - tSpan;
             if (!spanDone && LayerSplitDegree > 1)
@@ -1082,11 +1122,18 @@ namespace TensorSharp.Models
             // ple_conv1d is [channels, kern] with the taps fastest; the graph wants a
             // contiguous per-channel column per tap, so transpose once. PINNED: the
             // kernel binds this address for the graph's lifetime.
-            _pleConvWT = GC.AllocateArray<float>(_hcDim * kern, pinned: true);
-            float* wp = GetFloatPtr(convW);
-            for (int c = 0; c < _hcDim; c++)
-                for (int kk = 0; kk < kern; kk++)
-                    _pleConvWT[(long)kk * _hcDim + c] = wp[(long)c * kern + kk];
+            // The transpose is immutable model data shared by every holder's
+            // descriptor. Replacing this sole managed owner when a new request
+            // binds would leave older pinned descriptors with a dangling pointer
+            // after a collection (pinning does not keep an array alive).
+            if (_pleConvWT == null)
+            {
+                _pleConvWT = GC.AllocateArray<float>(_hcDim * kern, pinned: true);
+                float* wp = GetFloatPtr(convW);
+                for (int c = 0; c < _hcDim; c++)
+                    for (int kk = 0; kk < kern; kk++)
+                        _pleConvWT[(long)kk * _hcDim + c] = wp[(long)c * kern + kk];
+            }
 
             var args = GC.AllocateArray<Qwen4ExpPleArgs>(1, pinned: true);
             args[0].KeyW = kw; args[0].KeyType = kwT; args[0].KeyBytes = kwB;
@@ -1347,6 +1394,14 @@ namespace TensorSharp.Models
             catch (Exception ex)
             {
                 _tokenGraphUnsupported = true;
+                if (IsTensorParallel || _specForwardActive || HasQsa
+                    || LayerSplitDegree > 1 || _pendingMRoPEPositions != null)
+                {
+                    // Preserve the cause, and do not promise a fallback whose state
+                    // cannot represent this configuration (notably QSA).
+                    throw new InvalidOperationException(
+                        "qwen4exp: required token-span path failed; this configuration cannot use the per-layer fallback.", ex);
+                }
                 WarnFusedPathDisabled("token-graph", ex);
                 return false;
             }
@@ -1662,6 +1717,12 @@ namespace TensorSharp.Models
         {
             DisposeMtpHead();
             ReleaseSpecSnapshot();
+            // DisposeAllFusedHolders leaves the checked-out holder to the
+            // direct tensor disposal below. Drop its native registration first:
+            // a failed arena fence intentionally survives global state release,
+            // but must never survive this owner's pooled/freed host pointers.
+            if (IsGgmlBackend)
+                GgmlBasicOps.Qwen4ExpReleaseSeqState(HolderStateKeys(SnapshotActiveCache()));
             DisposeAllFusedHolders();
             if (IsGgmlBackend)
                 GgmlBasicOps.Qwen4ExpReleaseAllSeqState();
