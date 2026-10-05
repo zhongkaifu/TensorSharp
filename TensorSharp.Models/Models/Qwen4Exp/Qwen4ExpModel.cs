@@ -515,6 +515,29 @@ namespace TensorSharp.Models
             }
         }
 
+        protected override bool IsQuantizedLinearWeight(GgufTensorInfo info)
+        {
+            // Storage type and rank do not determine the operation: converters can
+            // store depthwise coefficients as F16/BF16 (or quantized blocks), and
+            // scale vectors as [n, 1]. These consumers read F32 coefficients directly,
+            // so let LoadWeights normalize them instead of retaining matrix bytes.
+            // Projections, including HC inject and SSM alpha/beta, stay compressed.
+            string name = info.Name;
+            if (name.EndsWith(".ple_conv1d.weight", StringComparison.Ordinal)
+                || name.EndsWith(".ssm_conv1d.weight", StringComparison.Ordinal)
+                || name.EndsWith("_norm.weight", StringComparison.Ordinal)
+                || name.EndsWith(".ple_norm_key.weight", StringComparison.Ordinal)
+                || name.EndsWith(".ple_norm_query.weight", StringComparison.Ordinal)
+                || name.EndsWith(".ple_norm_conv.weight", StringComparison.Ordinal)
+                || name.EndsWith(".ssm_dt.bias", StringComparison.Ordinal)
+                || name.EndsWith(".ssm_a", StringComparison.Ordinal)
+                || name.EndsWith(".ffn_gate_inp_shexp.weight", StringComparison.Ordinal))
+            {
+                return false;
+            }
+            return base.IsQuantizedLinearWeight(info);
+        }
+
         // Names are checked up front rather than on first use: a missing hyper-connection
         // tensor otherwise surfaces as a null dereference 40 layers into the first
         // forward, long after the useful context is gone.
@@ -554,6 +577,10 @@ namespace TensorSharp.Models
                     Need($"blk.{il}.attn_qkv.weight");
                     Need($"blk.{il}.attn_gate.weight");
                     Need($"blk.{il}.ssm_conv1d.weight");
+                    Need($"blk.{il}.ssm_alpha.weight");
+                    Need($"blk.{il}.ssm_beta.weight");
+                    Need($"blk.{il}.ssm_dt.bias");
+                    Need($"blk.{il}.ssm_a");
                     Need($"blk.{il}.ssm_norm.weight");
                     Need($"blk.{il}.ssm_out.weight");
                 }

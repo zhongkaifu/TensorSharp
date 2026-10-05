@@ -19,10 +19,9 @@
 // switching requests is a cheap reference swap - no state download/upload, no
 // graph invalidation.
 //
-// Each sequence then decodes through the proven single-graph fused Forward;
-// concurrency is served by the engine's per-sequence round-robin. The N==1
-// path is untouched: it keeps the model's primary cache, reinstated by
-// RestorePrimaryCache() after any multi-sequence episode.
+// Prefill runs through the single-sequence span and concurrent decode joins
+// these holders into the fused arena graph. Native coherence hooks preserve
+// their state when a request switches between solo and batched execution.
 using System;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
@@ -46,6 +45,7 @@ namespace TensorSharp.Models
             public int KvCapacity;
             public int CacheSeqLen;
             public bool KvHostStale;
+            public float[] Logits;
             // GDN state: host ring (op-by-op path) + the fused path's seed
             // tensors, whose HOST pointers key the native device-state entries.
             public float[][] GdnConvState;
@@ -89,6 +89,7 @@ namespace TensorSharp.Models
         private Dictionary<string, Qwen4ExpKvCacheHolder> _fusedHolders;
         private string _activeFusedKey;
         private Qwen4ExpKvCacheHolder _primaryHolder;
+        private float[] _holderLogits;
         // Span graph-slot base of the ACTIVE holder (0 = primary).
         private int _seqSlotBase;
         // Span slot bases in use (multiples of 16 up to the native slot count).
@@ -120,11 +121,6 @@ namespace TensorSharp.Models
             => throw new NotSupportedException(
                 "qwen4exp serves concurrency through per-sequence state holders, not ForwardBatch.");
 
-        /// <summary>No token-batched decode exists for qwen4exp (TryForwardBatchedFusedDecode keeps the
-        /// interface's decline); the executor's once-per-run warning quotes this instead of "no reason".</summary>
-        public string BatchedFusedDecodeDeclineReason =>
-            "Qwen3.8-Flash-Next has no token-batched decode yet; each sequence decodes through its own captured graph";
-
         /// <summary>Per-sequence holders need the GGML fused span path: it is
         /// where the per-holder graph/state keying lives. The managed op-by-op
         /// path shares scratch that is not per-sequence.</summary>
@@ -143,6 +139,7 @@ namespace TensorSharp.Models
             KvCapacity = _kvCacheCapacity,
             CacheSeqLen = _cacheSeqLen,
             KvHostStale = _kvCacheHostStale,
+            Logits = _holderLogits,
             GdnConvState = _gdnConvState,
             GdnConvWriteIdx = _gdnConvWriteIdx,
             GdnConvStateT = _gdnConvStateT,
@@ -169,6 +166,7 @@ namespace TensorSharp.Models
             _kvCacheCapacity = h.KvCapacity;
             _cacheSeqLen = h.CacheSeqLen;
             _kvCacheHostStale = h.KvHostStale;
+            _holderLogits = h.Logits;
             _gdnConvState = h.GdnConvState;
             _gdnConvWriteIdx = h.GdnConvWriteIdx;
             _gdnConvStateT = h.GdnConvStateT;
@@ -368,6 +366,12 @@ namespace TensorSharp.Models
         private unsafe IntPtr[] HolderStateKeys(Qwen4ExpKvCacheHolder holder)
         {
             var keys = new List<IntPtr>();
+            // ReleaseSeqState also drops arena registrations for every key.
+            // Include the arena identity even when no QSA/recurrent/PLE state
+            // was initialized; absent seq-state entries are harmless to release.
+            if (holder.K != null)
+                foreach (var t in holder.K)
+                    if (t != null) { keys.Add(TensorComputePrimitives.GetStoragePointer(t)); break; }
             if (holder.IdxK != null)
                 foreach (var t in holder.IdxK)
                     if (t != null) keys.Add(TensorComputePrimitives.GetStoragePointer(t));

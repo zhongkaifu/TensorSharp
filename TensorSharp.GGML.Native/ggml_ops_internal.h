@@ -877,6 +877,7 @@ namespace tsg
         int num_experts = 0;
         int n_used = 0;
         int seq_len = 1;             // 1 for autoregressive decode, C for DiffusionGemma blocks
+        bool independent_decode_rows = false; // preserve scalar expert arithmetic in a decode batch
         int hidden = 0;
         int n_ff = 0;
 
@@ -1255,6 +1256,11 @@ namespace tsg
     // turns it off for A/B runs.
     bool host_moe_decode_experts(const HostMoeSegment& hm, const float* x, const std::int32_t* ids,
                                  const float* weights, float* out);
+    // Bounded independent decode rows (1..8), one team dispatch per layer.
+    // Dot products and expert summation order remain identical to solo decode.
+    // Unsupported input returns false without writing any output row.
+    bool host_moe_decode_experts_rows(const HostMoeSegment& hm, const float* x, const std::int32_t* ids,
+                                     const float* weights, float* out);
     // Opt-in Qwen4Exp CUDA expert tier: 1 computed, 0 unsupported/disabled,
     // -1 execution failed. Owns bounded compact quantized slots and graphs.
     // x/weights both null reads hm.moe_in/hm.weights through CUDA row copies;
@@ -1825,6 +1831,9 @@ Q4eSeqStateEntry* q4e_seq_state_find(const void* key);
 int q4e_resolve_device(int device);
 // ggml-cuda flash-attention eligibility for this family's KV type/head size.
 bool q4e_flash_attn_ok(int kv_type, int head_dim);
+// Independent decode rows keep the solo projection/expert reductions while
+// sharing a graph. Prefill and single-sequence decode leave this disabled.
+void q4e_independent_decode_rows(int rows);
 // Drop (graph only - state kept) every cached per-layer/span graph built from
 // the given holder descriptor arrays, on every device. The arena flush calls
 // this after invalidating a holder's resident KV copies: captured solo graphs

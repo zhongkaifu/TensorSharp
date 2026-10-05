@@ -44,6 +44,16 @@ namespace TensorSharp.Models
         /// </summary>
         private int[] ComputePleRows(int[] tokens, int startPos)
         {
+            int[] rows = ComputePleRows(tokens, startPos, _pleHistory, _pleNextPos);
+            CommitPleHistory(_pleHistory, tokens, startPos, _pleNextPos);
+            _pleNextPos = startPos + tokens.Length;
+            return rows;
+        }
+
+        // The arena must peek all requests before native admission; a decline
+        // leaves each request's n-gram history unchanged for its solo retry.
+        private int[] ComputePleRows(int[] tokens, int startPos, List<int> history, int nextPos)
+        {
             int n = tokens.Length;
             int nGram = _pleNgram;
             int eos = _pleEosTokenId;
@@ -51,11 +61,7 @@ namespace TensorSharp.Models
 
             // Snapshot the incoming history first: reading and updating in one pass
             // would let an early token in this batch pick up a later one as context.
-            if (_pleNextPos != startPos)
-            {
-                _pleHistory.Clear();
-            }
-            var hist = new List<int>(_pleHistory);
+            var hist = nextPos == startPos ? new List<int>(history) : new List<int>();
             while (hist.Count < nGram - 1) hist.Insert(0, eos);
 
             var ctx = new long[nGram];
@@ -106,12 +112,15 @@ namespace TensorSharp.Models
                 }
             }
 
-            foreach (int t in tokens) _pleHistory.Add(t);
-            if (_pleHistory.Count > nGram - 1)
-                _pleHistory.RemoveRange(0, _pleHistory.Count - (nGram - 1));
-            _pleNextPos = startPos + n;
-
             return rows;
+        }
+
+        private void CommitPleHistory(List<int> history, int[] tokens, int startPos, int nextPos)
+        {
+            if (nextPos != startPos) history.Clear();
+            history.AddRange(tokens);
+            if (history.Count > _pleNgram - 1)
+                history.RemoveRange(0, history.Count - (_pleNgram - 1));
         }
 
         /// <summary>

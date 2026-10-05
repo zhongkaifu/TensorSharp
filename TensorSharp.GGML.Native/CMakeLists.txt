@@ -453,6 +453,7 @@ set_target_properties(GgmlOps PROPERTIES
 
 if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
     set_property(SOURCE ggml_ops_qwen4exp.cpp APPEND PROPERTY COMPILE_DEFINITIONS TSG_GGML_TEST_HOOKS)
+    set_property(SOURCE ggml_ops_qwen4exp_arena.cpp APPEND PROPERTY COMPILE_DEFINITIONS TSG_GGML_TEST_HOOKS)
     add_executable(GgmlOpsQwen4ExpQsaPlanTest tests/qwen4exp_qsa_plan_test.cpp)
     target_include_directories(GgmlOpsQwen4ExpQsaPlanTest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     if (MSVC)
@@ -592,6 +593,13 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
     target_include_directories(GgmlOpsHostMoeExpertCacheTest PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/src")
     target_link_libraries(GgmlOpsHostMoeExpertCacheTest PRIVATE ggml-cpu ggml-base)
+    add_executable(GgmlOpsHostMoeDecodeRowsTest
+        tests/host_moe_decode_rows_test.cpp ggml_ops_host_moe_decode.cpp)
+    target_include_directories(GgmlOpsHostMoeDecodeRowsTest PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/src")
+    target_link_libraries(GgmlOpsHostMoeDecodeRowsTest PRIVATE ggml-cpu ggml-base)
+    add_test(NAME host-moe-decode-independent-rows COMMAND GgmlOpsHostMoeDecodeRowsTest)
+    set_tests_properties(host-moe-decode-independent-rows PROPERTIES RUN_SERIAL TRUE TIMEOUT 120)
     add_test(NAME host-moe-expert-cache-cpu-fallback COMMAND GgmlOpsHostMoeExpertCacheTest --cpu)
     add_test(NAME host-moe-expert-cache-invalid-budget-sign
         COMMAND GgmlOpsHostMoeExpertCacheTest --invalid-budget "+8192")

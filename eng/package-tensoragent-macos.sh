@@ -1,11 +1,17 @@
 #!/usr/bin/env bash
-# Package a published, ad-hoc signed Mac Catalyst app without changing its signature.
-# Usage: bash eng/package-tensoragent-macos.sh APP VERSION [OUTPUT_DIRECTORY]
+# Package a Developer ID signed Mac Catalyst app; notarize every distribution.
+# Usage: bash eng/package-tensoragent-macos.sh APP VERSION [OUTPUT_DIRECTORY] [--ad-hoc]
+# --ad-hoc is only for local testing, never for public releases.
 set -euo pipefail
 
 APP="${1:?Supply the path to TensorAgent.app}"
 VERSION="${2:?Supply the release version without a leading v}"
 OUTPUT="${3:-artifacts}"
+MODE="${4:-}"
+[[ $# -le 4 && ( -z "$MODE" || "$MODE" == --ad-hoc ) ]] || {
+    echo "Usage: $0 APP VERSION [OUTPUT_DIRECTORY] [--ad-hoc]" >&2; exit 1;
+}
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 [[ "$(uname -s)" == Darwin ]] || { echo "macOS packaging requires macOS." >&2; exit 1; }
 [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?(\+[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]] || {
     echo "Expected a three-part release version (for example 2026.10.03 or 2.8.6)." >&2; exit 1;
@@ -18,6 +24,20 @@ done
 EXECUTABLE="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP/Contents/Info.plist")"
 [[ -x "$APP/Contents/MacOS/$EXECUTABLE" ]] || { echo "Missing app executable." >&2; exit 1; }
 codesign --verify --deep --strict "$APP"
+if [[ "$MODE" != --ad-hoc ]]; then
+    [[ "${TENSORAGENT_APPLICATION_IDENTITY:-}" == "Developer ID Application: "* ]] || {
+        echo "Set TENSORAGENT_APPLICATION_IDENTITY to a Developer ID Application identity." >&2; exit 1;
+    }
+    [[ "${TENSORAGENT_INSTALLER_IDENTITY:-}" == "Developer ID Installer: "* ]] || {
+        echo "Set TENSORAGENT_INSTALLER_IDENTITY to a Developer ID Installer identity." >&2; exit 1;
+    }
+    [[ -n "${TENSORAGENT_NOTARY_PROFILE:-}" ]] || {
+        echo "Set TENSORAGENT_NOTARY_PROFILE to credentials stored by xcrun notarytool store-credentials." >&2; exit 1;
+    }
+    python3 "$SCRIPT_DIR/verify-tensoragent-macos-signing.py" "$APP"
+else
+    echo "LOCAL TEST PACKAGE: ad-hoc signing does not satisfy Gatekeeper; do not publish." >&2
+fi
 # Xcode 26.6 treats every argument after -verify_arch as an architecture.
 lipo "$APP/Contents/MacOS/$EXECUTABLE" -verify_arch arm64
 lipo "$APP/Contents/MonoBundle/libGgmlOps.dylib" -verify_arch arm64
@@ -56,9 +76,69 @@ OUTPUT="$(cd "$OUTPUT" && pwd)"
 STEM="tensoragent-desktop-$VERSION-osx-arm64"
 WORK="$(mktemp -d "$OUTPUT/.tensoragent-macos.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
-mkdir -p "$WORK/disk" "$WORK/root/Applications"
+mkdir -p "$WORK/disk" "$WORK/root/Applications" "$WORK/packages"
+PACKAGES="$WORK/packages"
 ditto "$APP" "$WORK/disk/TensorAgent.app"
 ln -s /Applications "$WORK/disk/Applications"
+if [[ "$MODE" != --ad-hoc ]]; then
+    mkdir -p "$OUTPUT/notarization"
+    NOTARY_ARGS=(--keychain-profile "$TENSORAGENT_NOTARY_PROFILE")
+    KEYCHAIN_ARGS=()
+    if [[ -n "${TENSORAGENT_SIGNING_KEYCHAIN:-}" ]]; then
+        NOTARY_ARGS+=(--keychain "$TENSORAGENT_SIGNING_KEYCHAIN")
+        KEYCHAIN_ARGS=(--keychain "$TENSORAGENT_SIGNING_KEYCHAIN")
+    fi
+
+    notarize() {
+        local file="$1" label="$2" result="$OUTPUT/notarization/$STEM-$2-submit.json"
+        local log="$OUTPUT/notarization/$STEM-$2-log.json" status=0 submission_id
+        xcrun notarytool submit "$file" "${NOTARY_ARGS[@]}" --wait \
+            --timeout "${TENSORAGENT_NOTARY_TIMEOUT:-30m}" --output-format json > "$result" || status=$?
+        submission_id="$(python3 - "$result" <<'PY'
+import json
+from pathlib import Path
+import sys
+import uuid
+
+try:
+    print(uuid.UUID(json.loads(Path(sys.argv[1]).read_text())["id"]))
+except (ValueError, KeyError):
+    pass
+PY
+)"
+        if [[ -n "$submission_id" ]]; then
+            xcrun notarytool log "$submission_id" "${NOTARY_ARGS[@]}" "$log" \
+                || echo "Could not retrieve notarization log for $label ($submission_id)." >&2
+        fi
+        # notarytool may exit successfully with an Invalid submission status.
+        # An upload or a timeout must never count as accepted notarization.
+        python3 - "$result" "$status" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+try:
+    result = json.loads(path.read_text())
+except ValueError:
+    raise SystemExit(f"Notary service returned no valid result; see {path}")
+if sys.argv[2] != "0" or result.get("status") != "Accepted" or not result.get("id"):
+    raise SystemExit(f"Notarization was not accepted ({result.get('status', 'unknown')}); see {path}")
+print(f"Accepted notarization: {result['id']}")
+PY
+    }
+
+    staple() {
+        xcrun stapler staple "$1"
+        xcrun stapler validate "$1"
+    }
+
+    # ZIP has no place for a ticket; staple the app before making final archives.
+    ditto -c -k --sequesterRsrc --keepParent "$WORK/disk/TensorAgent.app" "$WORK/notarize-app.zip"
+    notarize "$WORK/notarize-app.zip" app
+    staple "$WORK/disk/TensorAgent.app"
+    spctl --assess --type execute --verbose=4 "$WORK/disk/TensorAgent.app"
+fi
 cat > "$WORK/disk/INSTALL.txt" <<'EOF'
 TensorAgent Desktop for Apple Silicon (macOS 14 or later)
 
@@ -66,10 +146,6 @@ DMG: drag TensorAgent.app to Applications, eject the disk, then open TensorAgent
 ZIP: extract, move TensorAgent.app to Applications, then open TensorAgent.
 PKG: open the installer and follow the prompts to install into /Applications.
 Quit TensorAgent before updating. Models and chats are stored outside the app.
-
-These community packages are ad-hoc signed, not Developer ID signed/notarized.
-After checking the official release and SHA-256, attempt to open the app, then
-use System Settings > Privacy & Security > Open Anyway if macOS blocks it.
 
 Open menu > Models, choose a model that fits your RAM, Download, then Use.
 Model files are separate multi-GB downloads; .NET and Metal/CPU are bundled.
@@ -79,11 +155,22 @@ Download, installation, first chat and troubleshooting guide:
 https://tensorsharp.ai/tensoragent.html
 https://github.com/zhongkaifu/TensorSharp/releases
 EOF
+if [[ "$MODE" == --ad-hoc ]]; then
+    cat >> "$WORK/disk/INSTALL.txt" <<'EOF'
+
+LOCAL TEST BUILD: ad-hoc signed, not Developer ID signed or notarized.
+macOS will block this build under normal Gatekeeper policy. For a build you trust,
+attempt to open it, then use System Settings > Privacy & Security > Open Anyway.
+Do not distribute these local test packages as public releases.
+EOF
+else
+    echo 'Developer ID signed and Apple-notarized; tickets are stapled for offline installation.' >> "$WORK/disk/INSTALL.txt"
+fi
 
 # ditto preserves executable permissions, symlinks and the bundle signature.
-ditto -c -k --sequesterRsrc --keepParent "$WORK/disk/TensorAgent.app" "$OUTPUT/$STEM.zip"
-hdiutil create -volname TensorAgent -srcfolder "$WORK/disk" -format UDZO -ov "$OUTPUT/$STEM.dmg"
-ditto "$APP" "$WORK/root/Applications/TensorAgent.app"
+ditto -c -k --sequesterRsrc --keepParent "$WORK/disk/TensorAgent.app" "$PACKAGES/$STEM.zip"
+hdiutil create -volname TensorAgent -srcfolder "$WORK/disk" -format UDZO -ov "$PACKAGES/$STEM.dmg"
+ditto "$WORK/disk/TensorAgent.app" "$WORK/root/Applications/TensorAgent.app"
 # Explicitly disable bundle relocation: Installer must update /Applications,
 # rather than a developer's bin/ tree or a copy mounted on the DMG.
 pkgbuild --analyze --root "$WORK/root" "$WORK/components.plist"
@@ -113,18 +200,46 @@ cat > "$WORK/requirements.plist" <<'EOF'
 <key>arch</key><array><string>arm64</string></array>
 </dict></plist>
 EOF
-productbuild --product "$WORK/requirements.plist" --package "$WORK/component.pkg" "$OUTPUT/$STEM.pkg"
+PRODUCT_SIGN_ARGS=()
+if [[ "$MODE" != --ad-hoc ]]; then
+    # macOS still ships Bash 3.2, where empty arrays are unbound under set -u.
+    PRODUCT_SIGN_ARGS=(--sign "$TENSORAGENT_INSTALLER_IDENTITY" --timestamp ${KEYCHAIN_ARGS[@]+"${KEYCHAIN_ARGS[@]}"})
+fi
+productbuild --product "$WORK/requirements.plist" --package "$WORK/component.pkg" \
+    ${PRODUCT_SIGN_ARGS[@]+"${PRODUCT_SIGN_ARGS[@]}"} "$PACKAGES/$STEM.pkg"
+
+if [[ "$MODE" != --ad-hoc ]]; then
+    codesign --sign "$TENSORAGENT_APPLICATION_IDENTITY" --timestamp \
+        ${KEYCHAIN_ARGS[@]+"${KEYCHAIN_ARGS[@]}"} "$PACKAGES/$STEM.dmg"
+    codesign --verify --strict "$PACKAGES/$STEM.dmg"
+    pkgutil --check-signature "$PACKAGES/$STEM.pkg"
+    notarize "$PACKAGES/$STEM.dmg" dmg
+    staple "$PACKAGES/$STEM.dmg"
+    spctl --assess --type open --context context:primary-signature --verbose=4 "$PACKAGES/$STEM.dmg"
+    notarize "$PACKAGES/$STEM.pkg" pkg
+    staple "$PACKAGES/$STEM.pkg"
+    spctl --assess --type install --verbose=4 "$PACKAGES/$STEM.pkg"
+fi
 
 # Validate the actual archives, including the signature after ZIP extraction.
 mkdir -p "$WORK/extracted"
-ditto -x -k "$OUTPUT/$STEM.zip" "$WORK/extracted"
+ditto -x -k "$PACKAGES/$STEM.zip" "$WORK/extracted"
 codesign --verify --deep --strict "$WORK/extracted/TensorAgent.app"
-hdiutil verify "$OUTPUT/$STEM.dmg"
-pkgutil --expand "$OUTPUT/$STEM.pkg" "$WORK/pkg-expanded"
+if [[ "$MODE" != --ad-hoc ]]; then
+    python3 "$SCRIPT_DIR/verify-tensoragent-macos-signing.py" "$WORK/extracted/TensorAgent.app"
+    xcrun stapler validate "$WORK/extracted/TensorAgent.app"
+    spctl --assess --type execute --verbose=4 "$WORK/extracted/TensorAgent.app"
+fi
+hdiutil verify "$PACKAGES/$STEM.dmg"
+pkgutil --expand "$PACKAGES/$STEM.pkg" "$WORK/pkg-expanded"
 test -s "$WORK/pkg-expanded/Distribution"
 (
-    cd "$OUTPUT"
+    cd "$PACKAGES"
     shasum -a 256 "$STEM.dmg" "$STEM.pkg" "$STEM.zip" > "SHA256SUMS-$STEM.txt"
     shasum -a 256 -c "SHA256SUMS-$STEM.txt"
 )
-echo "Packaged TensorAgent Desktop $VERSION for osx-arm64 in $OUTPUT"
+# Promote only complete, validated artifacts. Diagnostics remain under ignored artifacts/.
+for file in "$STEM.dmg" "$STEM.pkg" "$STEM.zip" "SHA256SUMS-$STEM.txt"; do
+    mv "$PACKAGES/$file" "$OUTPUT/$file"
+done
+echo "Packaged TensorAgent Desktop $VERSION for osx-arm64 in $OUTPUT (mode: ${MODE:-Developer ID + notarization})"

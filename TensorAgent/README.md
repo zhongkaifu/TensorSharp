@@ -59,10 +59,14 @@ followed by the release version and platform:
 
 Desktop packages carry their .NET runtime and native engine. Windows WebView2 is
 a separate prerequisite; Python/Node are optional system tools for skills, rather
-than bundled desktop interpreters. Packages currently use ad hoc Mac signing and
-an unsigned Windows installer. See the [installation guide](../docs/tensoragent_desktop.md#2-install-and-open)
-for verification and platform prompts. Old release pages may contain only CLI/server
-archives; the workflow change does not add Desktop files to past releases.
+than bundled desktop interpreters. Earlier Mac packages used ad hoc signing without
+Apple notarization, which can produce the “Apple could not verify TensorAgent is free
+of malware” launch warning. The updated Mac release pipeline requires Developer ID
+signing and notarization; a corrected download still needs a successful release run
+with the maintainer's Apple credentials. Existing downloads remain unchanged.
+Windows installers are unsigned. See the [installation guide](../docs/tensoragent_desktop.md#2-install-and-open)
+for verification and the per-app macOS opening procedure. Old release pages may
+contain only CLI/server archives; workflow changes do not add Desktop files to past releases.
 
 After opening the app, choose **☰ → Models → Download → Use**, wait for loading,
 and type your first message. Model weights are separate downloads, and catalog
@@ -83,16 +87,104 @@ MAUI workloads for restore, and builds the native macOS engine with a 14.0
 deployment floor. Local builds still need a workload/Xcode combination that matches
 their installed Xcode.
 
-The [Mac packager](../eng/package-tensoragent-macos.sh) preserves the published
-bundle's ad hoc signature and creates DMG/PKG/ZIP packages. The
-[Windows packager](../eng/package-tensoragent-windows.ps1) and
+The [Mac packager](../eng/package-tensoragent-macos.sh) requires a Developer ID
+Application signature and Hardened Runtime by default. It notarizes and staples
+the app before creating ZIP/DMG/PKG packages, signs and notarizes the DMG and PKG,
+staples their tickets, and checks Gatekeeper acceptance before writing checksums.
+The ZIP contains the stapled app. Missing credentials or rejected notarization
+fail packaging; there is no automatic ad hoc fallback. Follow Apple's
+[notarization requirements](https://developer.apple.com/documentation/security/notarizing-macos-software-before-distribution)
+when obtaining Developer ID certificates and a provisioning profile matching the
+app's bundle identifier.
+
+Configure these **GitHub Actions repository secrets** before running the Mac release job:
+
+| Secret | Value |
+|---|---|
+| `TENSORAGENT_MACOS_APPLICATION_P12_BASE64` | Base64-encoded Developer ID Application certificate and private key export (`.p12`). |
+| `TENSORAGENT_MACOS_APPLICATION_P12_PASSWORD` | Password for that application certificate export. |
+| `TENSORAGENT_MACOS_INSTALLER_P12_BASE64` | Base64-encoded Developer ID Installer certificate and private key export (`.p12`). |
+| `TENSORAGENT_MACOS_INSTALLER_P12_PASSWORD` | Password for that installer certificate export. |
+| `TENSORAGENT_MACOS_PROVISION_PROFILE_BASE64` | Base64-encoded Developer ID provisioning profile for TensorAgent. |
+| `TENSORAGENT_MACOS_NOTARY_APPLE_ID` | Apple Account used for notarization. |
+| `TENSORAGENT_MACOS_NOTARY_APP_PASSWORD` | App-specific password for that account. |
+| `TENSORAGENT_MACOS_TEAM_ID` | Developer Program team ID matching both certificates and the provisioning profile. |
+
+The workflow imports certificates into a temporary keychain, derives signing
+identities from them, installs the provisioning profile, stores notarization
+credentials, and removes the temporary keychain and profile after the job.
+Notarization diagnostics are workflow artifacts, separate from release assets.
+These settings apply to future successful release runs; this source change does
+not establish that a signed replacement DMG has already been published.
+
+For a local distribution build, install the same certificates and profile, then
+publish with their identity and profile UUID. Replace the sample version and build
+number with the values for your release:
+
+```bash
+export MACOSX_DEPLOYMENT_TARGET=14.0
+export TENSORAGENT_APPLICATION_IDENTITY="Developer ID Application: Your Name (TEAMID)"
+dotnet publish TensorAgent/src/TensorAgent.Maui/TensorAgent.Maui.csproj \
+  -c Release -f net10.0-maccatalyst -r maccatalyst-arm64 --self-contained true \
+  -p:Version=2.8.6 -p:ApplicationDisplayVersion=2.8.6 -p:ApplicationVersion=1 \
+  -p:TensorSharpAppleTargets=true -p:CreatePackage=false \
+  -p:UseHardenedRuntime=true \
+  -p:CodesignKey="$TENSORAGENT_APPLICATION_IDENTITY" \
+  -p:CodesignProvision="DEVELOPER_ID_PROFILE_UUID" \
+  -p:CodesignEntitlements=Platforms/MacCatalyst/Entitlements.plist
+
+# Store the notarization credentials in Keychain; enter the app-specific password when prompted.
+xcrun notarytool store-credentials TensorAgent \
+  --apple-id "your-apple-account@example.com" --team-id TEAMID
+export TENSORAGENT_INSTALLER_IDENTITY="Developer ID Installer: Your Name (TEAMID)"
+export TENSORAGENT_NOTARY_PROFILE=TensorAgent
+bash eng/package-tensoragent-macos.sh \
+  TensorAgent/src/TensorAgent.Maui/bin/Release/net10.0-maccatalyst/maccatalyst-arm64/TensorAgent.app \
+  2.8.6 artifacts
+```
+
+The packager requires `TENSORAGENT_APPLICATION_IDENTITY`,
+`TENSORAGENT_INSTALLER_IDENTITY` and `TENSORAGENT_NOTARY_PROFILE`. For a custom
+keychain, also set `TENSORAGENT_SIGNING_KEYCHAIN`, store the notary credentials in
+that keychain with `notarytool store-credentials --keychain`, and pass its path as
+`CodesignKeychain` when publishing.
+
+To produce only a DMG while resuming an existing app ZIP notarization submission,
+use the [DMG finalizer](../eng/finalize-tensoragent-dmg.py). Supply the matching
+Developer ID Application-signed app and stored notary profile; no Developer ID
+Installer certificate is needed:
+
+```bash
+python3 eng/finalize-tensoragent-dmg.py \
+  --app "/path/to/TensorAgent.app" --version "<version>" \
+  --identity "Developer ID Application: <name> (<team-id>)" \
+  --notary-profile "<stored-profile>" \
+  --app-submission-id "<existing-submission-uuid>" \
+  --output artifacts/tensoragent-dmg-final --timeout 48h
+```
+
+Keep the output directory after a timeout: its receipts and checkpoints allow
+you to rerun the same command to resume. The finalizer promotes the DMG and writes
+its checksum only after notarization, stapled-ticket validation and Gatekeeper
+checks pass for both the app and disk image.
+
+Use `--ad-hoc` only for local packaging tests, as the fourth argument after the
+output directory: `bash eng/package-tensoragent-macos.sh APP VERSION artifacts --ad-hoc`.
+It accepts a local ad hoc bundle, skips distribution signing, notarization and
+Gatekeeper acceptance, and emits a warning. These test packages can trigger the
+same macOS warning when copied to another machine; do not publish them as a
+Gatekeeper-ready release.
+
+The [Windows packager](../eng/package-tensoragent-windows.ps1) and
 [WiX generator](../eng/generate-tensoragent-wix.py) validate a self-contained
-publish folder and create MSI/ZIP packages, including per-user installation and a
-Start menu shortcut. Distribution signing and notarization are not configured.
+publish folder and create unsigned MSI/ZIP packages, including per-user
+installation and a Start menu shortcut.
 Each release includes `SHA256SUMS-tensoragent-desktop-<version>-<variant>.txt` and
 `tensoragent-desktop-<version>-<variant>-BUILD.txt`. BUILD records the unchanged
-upstream ggml revision and actual packaging checks: Mac signatures/architecture
-and archive structure, Windows ZIP/MSI payload hashes, and package checksums.
+upstream ggml revision and actual packaging checks: Mac signatures/architecture,
+notarization/stapling and Gatekeeper checks for distribution packages, archive
+structure, Windows ZIP/MSI payload hashes, and package checksums. Ad hoc packaging
+skips notarization and Gatekeeper acceptance; those checks must be recorded as skipped.
 Those checks do not establish clean-machine installation, GUI launch, model
 inference, GPU coverage or benchmark results. Keep any additional generated
 validation evidence under ignored `docs/validation/` or `artifacts/`.
@@ -860,9 +952,11 @@ skipped, never as passed.
   nothing, and a library older than the native sources beside it is never shipped.
 - **No App Sandbox.** The app runs the model's code as real processes and confines each
   with TensorSharp's Seatbelt profile, which macOS will not apply inside the App Sandbox.
-  So there is no `Platforms/MacCatalyst/Entitlements.plist`, and the build is not a Mac
-  App Store build. Local Debug/Release builds and the default Desktop release
-  packages are signed ad hoc, rather than with a notarized Developer ID signature.
+  The build is for distribution outside the Mac App Store.
+  `Platforms/MacCatalyst/Entitlements.plist` supplies the runtime entitlements for
+  Developer ID distribution while keeping App Sandbox off. Local Debug/Release
+  builds use ad hoc signing unless you supply a signing identity; release packaging
+  requires Developer ID signing and notarization as described above.
 - **Debug and Release are two apps with one set of data.** `bin/Debug/.../TensorAgent.app`
   and `bin/Release/.../TensorAgent.app` share `~/Library/Application Support/TensorAgent`
   and `~/Library/Caches/TensorAgent`, but each offers only the catalog it was compiled

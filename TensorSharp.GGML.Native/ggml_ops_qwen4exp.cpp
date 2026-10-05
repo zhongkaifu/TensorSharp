@@ -188,6 +188,24 @@ namespace
         }
         return out;
     }
+
+    ggml_tensor* q4e_soft_max(ggml_context* ctx, ggml_tensor* x)
+    {
+        const int rows = g_q4e_row_kernels.rows;
+        if (rows < 2 || x->ne[1] != rows || x->ne[2] != 1 || x->ne[3] != 1)
+            return ggml_soft_max(ctx, x);
+        // Metal sizes its softmax reduction from the TOTAL row count. Four
+        // router rows use fewer threads than one, changing routing weights.
+        // Preserve the solo reduction within this one shared decode graph.
+        ggml_tensor* out = nullptr;
+        for (int r = 0; r < rows; ++r)
+        {
+            auto* row = ggml_view_2d(ctx, x, x->ne[0], 1, x->nb[1], (size_t)r * x->nb[1]);
+            auto* part = ggml_soft_max(ctx, row);
+            out = out ? ggml_concat(ctx, out, part, 1) : part;
+        }
+        return out;
+    }
 }
 
 #include "ggml_ops_qwen4exp_qsa.inc"
@@ -422,6 +440,11 @@ bool q4e_flash_attn_ok(int kv_type, int head_dim)
     }
 }
 
+void q4e_independent_decode_rows(int rows)
+{
+    g_q4e_row_kernels = Q4eRowKernels{rows, 0, rows > 0};
+}
+
 namespace
 {
 
@@ -446,6 +469,7 @@ namespace
     bool q4e_row_kernels_enabled()
     {
         if (ggml_backend_is_cpu(g_backend)) return true;
+        if (g_backend_type == BACKEND_TYPE_METAL) return true;
 #ifdef TSG_GGML_USE_CUDA
         if (!ggml_backend_is_cuda(g_backend)) return false;
 #ifdef TSG_GGML_TEST_HOOKS
@@ -937,7 +961,7 @@ ggml_tensor* q4e_nodes_ffn(
     // weights - llama.cpp's build_moe_ffn with norm_w.
     ggml_tensor* logits = q4e_mul_mat(ctx, w_router, mixed);      // [n_expert, T]
     ggml_set_name(logits, "q4e.ffn.router");
-    ggml_tensor* probs = ggml_soft_max(ctx, logits);
+    ggml_tensor* probs = q4e_soft_max(ctx, logits);
     // ggml_argsort_top_k, not ggml_top_k: this is the exact node shape llama.cpp's
     // build_moe_ffn emits, and ggml-cuda's topk_moe fusion matches on the node
     // sequence rather than on intent.
@@ -1429,14 +1453,18 @@ ggml_tensor* q4e_nodes_attn(
     // ---- append to the cache ----
     ggml_tensor* k_write = ggml_cont(ctx, ggml_permute(ctx, k, 0, 2, 1, 3)); // [hd, T, kvH]
     ggml_tensor* v_write = ggml_cont(ctx, ggml_permute(ctx, v, 0, 2, 1, 3));
-    ggml_tensor* k_full = ggml_view_3d(ctx, k_cache, head_dim, n_kv_pad, n_head_kv,
+    // Use the scatter RESULT as the attention source. Cache aliasing alone
+    // is not a dataflow edge and Metal can otherwise run reads before writes.
+    ggml_tensor* k_written = ggml_set_rows(ctx, k_cache, k_write, kv_idx);
+    ggml_tensor* v_written = ggml_set_rows(ctx, v_cache, v_write, kv_idx);
+    ggml_tensor* k_full = ggml_view_3d(ctx, k_written, head_dim, n_kv_pad, n_head_kv,
             k_cache->nb[1], k_cache->nb[2], 0);
-    ggml_tensor* v_full = ggml_view_3d(ctx, v_cache, head_dim, n_kv_pad, n_head_kv,
+    ggml_tensor* v_full = ggml_view_3d(ctx, v_written, head_dim, n_kv_pad, n_head_kv,
             v_cache->nb[1], v_cache->nb[2], 0);
 
     // The KV write goes into the graph FIRST - see the function comment.
-    ggml_build_forward_expand(graph, ggml_set_rows(ctx, k_cache, k_write, kv_idx));
-    ggml_build_forward_expand(graph, ggml_set_rows(ctx, v_cache, v_write, kv_idx));
+    ggml_build_forward_expand(graph, k_written);
+    ggml_build_forward_expand(graph, v_written);
 
     // ---- attention ----
     ggml_tensor* q_attn = ggml_cont(ctx, ggml_permute(ctx, q, 0, 2, 1, 3));  // [hd, T, nH]
@@ -1448,8 +1476,8 @@ ggml_tensor* q4e_nodes_attn(
         for (int r = 0; r < T; ++r)
         {
             const int nk = q4e_pad_kv(g_q4e_row_kernels.n_kv - T + r + 1, kv_capacity, use_flash);
-            ggml_tensor* kr = ggml_view_3d(ctx, k_cache, head_dim, nk, n_head_kv, k_cache->nb[1], k_cache->nb[2], 0);
-            ggml_tensor* vr = ggml_view_3d(ctx, v_cache, head_dim, nk, n_head_kv, v_cache->nb[1], v_cache->nb[2], 0);
+            ggml_tensor* kr = ggml_view_3d(ctx, k_written, head_dim, nk, n_head_kv, k_cache->nb[1], k_cache->nb[2], 0);
+            ggml_tensor* vr = ggml_view_3d(ctx, v_written, head_dim, nk, n_head_kv, v_cache->nb[1], v_cache->nb[2], 0);
             ggml_tensor* mr = ggml_cont(ctx, ggml_view_2d(ctx, mask, nk, 1, mask->nb[1], (std::size_t)r * mask->nb[1]));
             ggml_tensor* qr = ggml_cont(ctx, ggml_view_3d(ctx, q_attn, head_dim, 1, n_head,
                     q_attn->nb[1], q_attn->nb[2], (std::size_t)r * q_attn->nb[1]));
@@ -2804,7 +2832,9 @@ static int q4e_token_span_impl(
                 ggml_backend_tensor_get(trace_res[i], buf.data(), 0, buf.size() * sizeof(float));
                 double n2 = 0.0; bool bad = false;
                 for (float f : buf) { n2 += (double)f * f; if (!std::isfinite(f)) bad = true; }
-                fprintf(stderr, " %zu:%.4e%s", i, std::sqrt(n2), bad ? "!NAN" : "");
+                uint64_t hash = 1469598103934665603ULL;
+                for (float f : buf) { uint32_t bits; std::memcpy(&bits, &f, sizeof(bits)); hash = (hash ^ bits) * 1099511628211ULL; }
+                fprintf(stderr, " %zu:%.9e%s@%016llx", i, std::sqrt(n2), bad ? "!NAN" : "", (unsigned long long)hash);
             }
             fprintf(stderr, "\n");
         }
@@ -2955,6 +2985,7 @@ TSG_EXPORT int TSGgml_Qwen4ExpCopyQsaCache(const void* key, void* destination, l
 {
     try
     {
+        tsg_q4earena::on_external_touch(key);
         if (!key || !destination || bytes <= 0) throw std::invalid_argument("qwen4exp QSA: invalid cache copy");
         tsg::ScopedRank rank(q4e_resolve_device(device));
         auto* state = q4e_seq_state_find(key);

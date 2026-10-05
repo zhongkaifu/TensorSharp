@@ -12,6 +12,7 @@ public sealed class NativeGgmlIdentityTests
         // a model or selecting a GPU. The identity helper must find that mapping.
         Assert.Equal(0, GgmlDeepSeek4Native.NPast(IntPtr.Zero));
         string mapped = TestGates.MappedNativeGgmlOpsPath();
+        Assert.Equal(mapped, Qwen4ExpExpertCacheScenario.MappedNativePath());
         Assert.True(Path.IsPathFullyQualified(mapped), mapped);
         Assert.True(File.Exists(mapped), mapped);
 

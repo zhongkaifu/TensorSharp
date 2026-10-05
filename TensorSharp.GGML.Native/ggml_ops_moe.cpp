@@ -2003,6 +2003,22 @@ namespace tsg
             return cached > 0;
         if (host_moe_decode_experts(hm, s_moe_in.data(), s_ids.data(), s_weights.data(), out.data()))
             return true;
+        if (hm.independent_decode_rows && hm.seq_len > 1)
+        {
+            if (host_moe_decode_experts_rows(hm, s_moe_in.data(), s_ids.data(), s_weights.data(), out.data()))
+                return true;
+            // Concurrent decode rows have independent routing and must retain
+            // the solo expert dot products. A multi-token prefill kernel can
+            // choose different reductions, as well as miss the fast decode team.
+            HostMoeSegment row = hm;
+            row.seq_len = 1;
+            bool all_rows = true;
+            for (int i = 0; i < hm.seq_len; ++i)
+                if (!host_moe_decode_experts(row, s_moe_in.data() + (size_t)i * hm.hidden,
+                    s_ids.data() + (size_t)i * hm.n_used, s_weights.data() + (size_t)i * hm.n_used,
+                    out.data() + (size_t)i * hm.hidden)) { all_rows = false; break; }
+            if (all_rows) return true;
+        }
 
         const bool ok = moe_ffn_host_experts(
             s_moe_in.data(), out.data(),

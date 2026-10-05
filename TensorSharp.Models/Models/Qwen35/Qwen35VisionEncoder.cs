@@ -31,6 +31,9 @@ namespace TensorSharp.Models
         private readonly IAllocator _allocator;
         private readonly bool _useNativeAttention;
         private readonly bool _qwenImage21;
+        // Qwen4Exp's transformer MLPs use tanh GELU, but its final patch merger
+        // uses GELU(erf). Keep that contract separate from the block activation.
+        private readonly bool _mergerGeluErf;
         // Pure-C# CPU backend (CpuAllocator): load-time dequant stays managed and the linear
         // layers run on the packed SGEMM against weights packed once (see CpuLinear).
         private readonly bool _cpuManaged;
@@ -76,9 +79,11 @@ namespace TensorSharp.Models
         /// </summary>
         public int TemporalPatchSize => _weights.ContainsKey("v.patch_embd.weight.1") ? 2 : 1;
 
-        public Qwen35VisionEncoder(string mmProjPath, IAllocator allocator, bool qwenImage21 = false)
+        public Qwen35VisionEncoder(string mmProjPath, IAllocator allocator, bool qwenImage21 = false,
+            bool mergerGeluErf = false)
         {
             _qwenImage21 = qwenImage21;
+            _mergerGeluErf = mergerGeluErf;
             _allocator = allocator;
             _useNativeAttention = allocator is GgmlAllocator;
             _cudaDirect = allocator is TensorSharp.Cuda.CudaAllocator;
@@ -304,7 +309,7 @@ namespace TensorSharp.Models
 
             using var fc1 = LinearForwardWithBias(mergedContig, "mm.0.weight", "mm.0.bias");
             mergedContig.Dispose();
-            ApplyVisionGelu(fc1);
+            ApplyVisionMergerGelu(fc1);
 
             var projected = LinearForwardWithBias(fc1, "mm.2.weight", "mm.2.bias");
 

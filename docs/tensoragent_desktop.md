@@ -68,8 +68,11 @@ shasum -a 256 "tensoragent-desktop-VERSION-osx-arm64.dmg"
 Get-FileHash ".\tensoragent-desktop-VERSION-win-x64-cpu.msi" -Algorithm SHA256
 ```
 
-The packages currently use an ad hoc Mac signature and an unsigned Windows
-installer. They are not Apple-notarized or publisher-certified Windows packages.
+Earlier Mac packages used ad hoc signing without Apple notarization. The updated
+Mac release pipeline requires Developer ID signing and notarization, but publishing
+a corrected download requires a successful run with the maintainer's Apple
+credentials. Existing release assets are unchanged; check the release notes and
+`BUILD.txt` for the package you downloaded. Windows installers remain unsigned.
 A matching hash checks the download against the release's checksum; it does not
 replace a trusted publisher signature.
 
@@ -79,10 +82,18 @@ replace a trusted publisher signature.
 
 1. Download the **DMG**, open it and drag **TensorAgent.app** onto **Applications**.
 2. Eject the disk image. Open **TensorAgent** from Applications or Spotlight.
-3. If macOS blocks this downloaded app because the developer cannot be verified,
-   first check that it came from the project's release page. After attempting to
-   open it, go to **System Settings → Privacy & Security → Open Anyway** and follow
-   macOS's confirmation. This is Apple's [procedure for an app you trust](https://support.apple.com/en-us/102445).
+3. If an older, unnotarized download shows **“Apple could not verify TensorAgent is
+   free of malware”**, verify its source and checksum. For a copy you trust, try
+   opening it once, then go to **System Settings → Privacy & Security**, scroll
+   down and choose **Open Anyway**. Choose **Open** in the confirmation. This is
+   Apple's [procedure for an app you trust](https://support.apple.com/en-us/102445)
+   and creates an exception for this app. A future signed and notarized release
+   should use the normal downloaded-app confirmation instead.
+
+This procedure lets you open an existing trusted copy; it does not notarize it or
+replace the download. If **Open Anyway** is unavailable on a managed Mac, ask your
+administrator. If the alert instead says the app **will damage your computer** or
+is **damaged**, use Apple's linked guidance and obtain a fresh trusted download.
 
 The **PKG** is an alternative: open it and follow Installer to install
 `/Applications/TensorAgent.app`; macOS may request administrator authorization.

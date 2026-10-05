@@ -8,18 +8,30 @@ PLE n-gram 嵌入块、×4 hyper-connection 流以及 512 专家的 MoE。GGUF �
 `qwen4exp`。权重：
 [unsloth/Qwen3.8-Flash-Next-GGUF](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF)
 （每个量化档一个子目录、均为多分片；`--model` 指向 `-00001-of-` 那一片；图像输入
-需要 `mmproj-BF16.gguf`：CLI 在给出 `--image` 时会从模型旁边自动加载，服务端则需要显式传
+需要匹配的视觉 projector，例如 `mmproj-BF16.gguf` 或 `mmproj-F16.gguf`：CLI 在给出
+`--image` 时会从模型旁边自动加载，服务端则需要显式传
 `--mmproj`）。
 
 ## TensorSharp 如何运行它
 
 在 GGML 后端上，整个 token（几乎）只跑一张图——嵌入、PLE（在图内）、全部 48 层、
-最后的 mixer 以及 LM head——并配一个按形状索引的已捕获图缓存
+最后的 mixer 以及 LM head——并配一个按形状索引的可复用 ggml 图缓存
 （span 放弃时改走逐层融合 kernel，后者再逐算子回退）。视觉沿用
 Qwen3.5-VL 塔，位置用 (T,H,W) IMRoPE；支持多图与多轮图像会话，并在轮次之间复用
 KV（GDN 递归无法回退，因此只有当新 prompt **恰好扩展**已缓存前缀时才复用；见[保留前缀复用](#保留前缀复用)）。radix 复用可以越过相同的图像或视频 span：完整状态保存 M-RoPE 缓存间隙与 QSA 位置历史，键同时校验媒体身份、span 边界与 token。结束的主缓存留在原处供下一轮精确续接；只有其他请求需要替换它时，才转换为保留 holder。
 
 思考模式可以开启或关闭。关闭时，助手轮次以已发布模板输出的闭合空块 `<think>\n\n</think>` 开头，重放历史时也保留这一确切后缀，因此缓存前缀仍能匹配。
+
+已发布的 Qwen4Exp 视觉塔最终 patch merger 使用 GELU(erf)，与 transformer block 的
+`gelu_pytorch_tanh` 分开，符合
+[Transformers v5.16.1 参考实现](https://github.com/huggingface/transformers/blob/v5.16.1/src/transformers/models/qwen4_exp/modeling_qwen4_exp.py#L1705)。
+所提供 GGUF 路径保留既有的 tanh merger 默认行为。在加载 projector 前设置
+`TS_Q4E_VISION_MERGER_ERF=1`，可单独为 merger 选择参考实现的 erf，而 block 激活不变。
+交付构建的 base 模型默认路径通过 12/12 项图像检查，16 个回答均复现先前 tanh 运行。
+完整 erf 试验通过 10/12；随后同一构建的 C=1 OCR 对照中，tanh 通过 2/2，erf 通过
+1/2，把蓝色 `9364` 识别为 `9334`。这些限定范围的检查支持保留兼容默认值，尚未解释
+识别差异的原因，也不能确立更广泛的激活函数质量结论。详见
+[图像验证指南](../../eng/validation/qwen38-parallel-vision.md)。
 
 ## 工具调用与 Agent 工作流
 
@@ -121,21 +133,82 @@ MP4、WebM 或 MOV data URI（不会抓取远程 URL）：
 
 并发请求通过**逐序列状态持有者**（per-sequence state holders）来服务：每个在飞请求
 各自拥有自己的注意力 KV 与 QSA indexer 缓存、GDN 卷积与 delta-net 状态、PLE 卷积
-历史与 n-gram 窗口，以及固定下来的 kernel 描述符。原生 kernel 用持有者的 host 种子
-指针作为设备驻留递归状态的键，用描述符地址作为已缓存图的键，所以切换请求只是一次
-引用交换——不需要状态下载 / 上传，也不需要重建图——每个序列都在自己那张已捕获的
-单图融合 decode 上解码。引擎按步在各序列间轮询（`SupportsPerSequenceFusedForward`）；
-融合的 N 路批量 decode 属于后续优化。
+历史与 n-gram 窗口、M-RoPE 缓存间隙与坐标历史，以及固定下来的 kernel 描述符。
+采样和 logits 属于各自的请求；第二个请求覆盖模型的共享输出缓冲区之前，执行器会复制
+首个请求借用的 solo logits。不可变的 PLE 卷积系数由模型持有，覆盖所有 holder 的生命周期。
 
-**并发时的贪心输出可能与单独运行不同，原因在于 prefill 的分块形状。** 调度器对单独一个请求用
+**并发 decode 默认使用融合 arena。** 单设备 GGML CPU、Metal 或 CUDA 后端，在 F16 KV
+缓存和 span 状态已初始化、几何受支持时，两个或更多就绪的 decode 请求一起执行一张可复用的
+ggml 图。路由专家卸载到主机时，执行会在后端图分段之间跨越主机专家接缝。
+Metal 使用共享 ggml 图；CUDA graph capture 是另一项后端机制。
+Attention/QSA 与 GDN 保留各自的 slot 状态。投影、路由 / 共享专家及语言 head 位于共享图中；
+后端数值行为依赖行几何的算子保留 solo 的归约方式，并不要求每个节点都使用多行 kernel。
+每条 attention lane 使用自己 solo 路径的填充 KV 窗口和 mask，不使用最长请求的窗口。
+Router softmax 同样保留 solo 的逐行归约，因为 Metal 按批量总行数改变线程数量会改变路由权重。
+混合调度步会批量处理就绪的 decode 子集，同时通过各自 holder 执行新请求的
+prefill 分块。请求加入、退出、缓存增长及返回 solo 路径时，先刷新或退役对应的 arena slot，
+再由另一条路径读取其状态。图像请求完成媒体 prefill 后也能加入批量 decode；压缩后的
+旋转位置与 QSA 坐标历史随自己的 holder 保存。
+
+张量并行、按层切分、其他 KV dtype，以及 span / 后端几何不可用的配置，在支持时仍使用
+逐序列融合路径。GPU arena 要求上游 flash attention 支持对应的 head 几何；CPU 使用相应
+attention 回退。参与批量执行的每个 holder 必须已有初始化的权威状态、位置相符，并能容纳
+下一行缓存。需要增长的 holder 先走 solo 路径，再加入批量执行。
+只有一个就绪 decoder 时使用 solo 融合 decode。
+`TS_BATCHED_FUSED_DECODE=0` 可作为轮询对照。原生执行失败会使受影响的请求失败，
+不会把递归状态可能已经部分推进的批量步骤改为 solo 重试。实现位于 TensorSharp 自有代码，
+上游 ggml 保持未修改；源码支持不等于所有后端都已证明性能提升或真实模型质量。
+
+可复用检查：[并发文本与请求隔离](../../eng/validation/qwen4exp-concurrent-http.md)，以及
+[并发图像内容、附件顺序与历史](../../eng/validation/qwen38-parallel-vision.md)。图像指南包括
+固定 revision 的 projector 来源和哈希。生成报告应保留在被忽略的 `docs/validation/` 或
+`artifacts/`；失败、跳过或不可用的模型 / 设备场景不计入验证通过。
+
+### 本机 Metal 验证，2026-10-04
+
+两个指定 checkpoint 均在 Apple M5 Pro、48 GiB 统一内存上实测，上游 ggml 保持未修改，
+revision 为 `353b63b439f27ab2cc19dac97ab1681ba6d2d084`。
+[原生 probe](../../eng/validation/qwen4exp-batched-decode-probe.md) 覆盖宽度 2、3、4，
+64 个 teacher-forced decode 步和两次重复。保留的 4,728 条 prefill / decode / 续接对照
+均测得 max |Δlogit| = 0，贪心 token 差异为 0；未另行检查原始 logit 的逐位一致性。
+合并两次重复后的原生 decode 测量如下：
+
+| Checkpoint | 融合 decode tokens/s | 相对轮询提升 | 交付默认图像检查 |
+| --- | ---: | ---: | ---: |
+| Base UD-Q2_K_XL | 23.86–25.61 | 17.37–50.77% | 12/12 通过 |
+| Uncensored IQ2_XXS | 18.70–26.82 | 15.04–35.36% | 4/12 通过，整套失败 |
+
+匹配的两个并发 HTTP 主题回答和精确 marker，在批量开启与轮询配置间一致，运行日志也记录了
+融合执行。两次重复合并后，主题吞吐在 base 上提升 7.01%，uncensored 上提升 8.18%；
+uncensored marker 提升 0.71%。Base marker 结果有快有慢：先运行并发且 prefix cache
+关闭的对照慢 3.08%；交付构建中先串行、再并发且 prefix cache 开启的一次对照快 11.705%。
+后者所有匹配请求都报告 0 个 cached prompt token；运行顺序并不能确立缓存命中或预热的
+因果解释。这些测量不能支持一致加速或全场景无回归承诺。
+
+交付的 tanh 默认图像检查复现先前默认路径的全部回答：base 完成 16 轮，uncensored
+完成 14 轮；C=1/C=2 的 8 对 base 和 7 对 uncensored 已完成轮次均精确一致。
+Uncensored 单图 OCR 把蓝色 `9364` 读成 `9324`，两种附件顺序检查也失败。
+它的两个蓝图后续请求因首轮 OCR 错误而未发送，不计入测试通过。并发答案一致因此不等于
+图像质量验收通过。两张卡片的 OCR / 颜色 / 顺序 / 历史检查，以及文本相关性和 marker
+检查，只覆盖有限的质量范围。
+
+证据保存在被忽略的 `docs/validation/qwen38-parallel/` 和
+`artifacts/validation/qwen38-locality-{base,uncensored}-native/`。原生、成对 HTTP 和交付
+图像运行的托管构建身份不同；这些阶段的最终原生库保持相同。原生速率不含 HTTP / prefill，
+HTTP 速率包含 admission 与 prefill。模型文件超过物理内存，分页、进程 / 缓存状态和短时
+测量均限制性能结论。本次结果不覆盖其他设备、CUDA / TP、更广泛的事实或视觉质量、长上下文
+性能。图像工具比较拼接后的内容和请求哈希，未验证原始 SSE framing 或 completion ID。
+
+**Prefill 的分块形状仍是独立的数值限制。** 调度器对单独一个请求用
 一个大块 prefill（`TS_SCHED_SOLO_PREFILL_CHUNK` 与 `TS_SCHED_MAX_BATCHED_TOKENS` 中较小者），对并发
-请求则按步预算分份，而本模型的 logits 依赖分块大小。在 UD-Q2_K_XL、三 GPU 按层切分上用
+请求则按步预算分份，而本模型的 logits 可能依赖分块大小。历史 CUDA 检查在 UD-Q2_K_XL、三 GPU 按层切分上用
 `benchmarks/ChunkParityProbe` 对一个 19,121 token 的 prompt 实测：重复同样的 4096 分块逐位一致
 （max |Δlogit| 为 0）；1024 与 512 token 的分块让 logits 最多偏移 1.3，并在近似平局处翻转贪心解码——
 最早在第 9 个输出 token，top-2 差值为 0.002（标题的第一个词）。保持分块形状相同就消除了这一效应：
 一个 2,928 token 的 prompt，每个请求都一次 prefill 完（`TS_SCHED_PREFILL_CHUNK=4096`、
-`TS_SCHED_MAX_BATCHED_TOKENS=16384`），4 路并发 × 3 轮的输出与单独运行逐字节一致（512 token，12/12），
-所以逐序列 holder 之间没有状态泄漏，轮询 decode 也不依赖并发度。CUDA 上不承诺 prefill 形状的宽度不变性，
+`TS_SCHED_MAX_BATCHED_TOKENS=16384`），4 路并发 × 3 轮的输出与单独运行逐字节一致（512 token，12/12）。
+这些结果验证的是先前轮询路径的特定负载与配置，不能视为新 arena 或所有并发场景的验证。
+CUDA 上不承诺 prefill 形状的宽度不变性，
 所以 fixture 的分块与整段关卡给差异设上界，而不是要求逐位一致；见 [保留前缀复用](#保留前缀复用)。
 
 ## 保留前缀复用
@@ -146,7 +219,7 @@ MP4、WebM 或 MOV data URI（不会抓取远程 URL）：
   直接使用同一缓存，不分配替代缓存；树中的标记不增加保留状态字节。只有其他请求需要替换主缓存时，
   才尝试转换为 holder。转换被拒绝或失败时，新请求正常重新 prefill。
 - 结束的会话的整个逐序列 holder 会被**保留**，并为恰好扩展它的下一轮重新设键。什么都不移动：以该
-  holder 为键的原生状态条目、它的已捕获图以及草稿头的私有 K/V 都留在原处。
+  holder 为键的原生状态条目、它的缓存图以及草稿头的私有 K/V 都留在原处。
 - 所有聊天共享的 prompt 结尾处的状态会被**检查点**为以主机为准的深拷贝（注意力 K/V、QSA 原始 key
   与位置、GDN/PLE 递归状态、私有 MTP 状态），并**克隆**进每个新聊天。缺少权威原生状态时，克隆会
   拒绝执行，而不是拷贝陈旧的主机种子。
