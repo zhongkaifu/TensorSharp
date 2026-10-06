@@ -562,8 +562,8 @@ namespace TensorSharp.Chat
         ///
         /// <para>
         /// The reply shape depends on what the file is: an image (HEIC/HEIF gain a PNG
-        /// <c>previewUrl</c> and a full-resolution <c>editUrl</c> within the selection
-        /// editor's limits because browsers cannot render them), a video (frames are
+        /// <c>previewUrl</c> and a full-resolution <c>editUrl</c> because browsers
+        /// cannot render them), a video (frames are
         /// extracted next to it, named after its GUID, so the Web UI can reference them
         /// by bare name), a text file (full content, never truncated, except CSV tables,
         /// which stay file-backed), or a PDF (its text layer; a scanned PDF falls back
@@ -961,7 +961,6 @@ namespace TensorSharp.Chat
                 string editName = Path.GetFileNameWithoutExtension(safeFileName) + "-edit.png";
                 string editPath = Path.Combine(_options.UploadDirectory, editName);
                 string editSourceName = null;
-                string editUnavailableReason = null;
                 try
                 {
                     await Task.Run(() =>
@@ -973,14 +972,10 @@ namespace TensorSharp.Chat
                             ? TensorSharp.Models.QwenImage.ImageIO.ResizeToArea(img, previewArea, multiple: 1)
                             : img;
                         TensorSharp.Models.QwenImage.ImageIO.SavePng(previewPath, preview);
-                        if (SupportsImageSelectionSize(img.Width, img.Height))
-                        {
-                            // Reuse the full decode already needed for the thumbnail.
-                            // Small photos can use that same PNG without another file.
-                            if (resizePreview) TensorSharp.Models.QwenImage.ImageIO.SavePng(editPath, img);
-                            editSourceName = resizePreview ? editName : previewName;
-                        }
-                        else editUnavailableReason = ImageSelectionSizeLimitMessage;
+                        // Reuse the full decode already needed for the thumbnail.
+                        // Small photos can use that same PNG without another file.
+                        if (resizePreview) TensorSharp.Models.QwenImage.ImageIO.SavePng(editPath, img);
+                        editSourceName = resizePreview ? editName : previewName;
                     }, cancellationToken);
                     cancellationToken.ThrowIfCancellationRequested();
                 }
@@ -1016,7 +1011,7 @@ namespace TensorSharp.Chat
                     url = uploadUrl,
                     previewUrl = BuildUploadUrl(previewName),
                     editUrl = editSourceName == null ? null : BuildUploadUrl(editSourceName),
-                    editUnavailableReason,
+                    editUnavailableReason = (string)null,
                     mediaType,
                     fileName = originalFileName,
                 }, storedFiles);
@@ -1631,14 +1626,6 @@ namespace TensorSharp.Chat
             catch (Exception ex) when (ex is not OutOfMemoryException and not OperationCanceledException)
             { throw new WebUiRequestRejectedException(400, new { error = $"Cannot decode {field} image: {ex.Message}" }); }
         }
-
-        // Keep these bounds aligned with WebUi/mask-editor.js before allocating
-        // a native-resolution browser canvas or creating its HEIC companion PNG.
-        internal const string ImageSelectionSizeLimitMessage =
-            "The selection editor supports images up to 16 megapixels and 8192 pixels per side.";
-
-        internal static bool SupportsImageSelectionSize(int width, int height) =>
-            width > 0 && height > 0 && width <= 8192 && height <= 8192 && (long)width * height <= 16777216;
 
         private static void ValidateImageMaskGeometry(TensorSharp.Models.QwenImage.QwenImageParams p,
             IReadOnlyList<TensorSharp.Models.QwenImage.RgbImage> images)

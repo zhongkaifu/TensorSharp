@@ -16,6 +16,7 @@ using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Routing;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
+using TensorSharp.Server.Hosting;
 
 namespace TensorSharp.Server.Endpoints;
 
@@ -84,6 +85,7 @@ public static class HealthEndpoints
         if (!File.Exists(indexPath))
             return false;
 
+        WebUiStaticFiles.RequireRevalidation(ctx.Response);
         ctx.Response.ContentType = "text/html";
         await ctx.Response.SendFileAsync(indexPath).ConfigureAwait(false);
         return true;

@@ -38,6 +38,12 @@ public sealed class Qwen4ExpTensorParallelTests
     [InlineData(2, false, 64, 12)] // Q4_0 gate/up
     [InlineData(2, true, 640, 8)] // Actual model FFN width, quant-block-aligned TP2
     [InlineData(14, true, 512, 8)] // Q6_K down, complete 256-element blocks
+    [InlineData(13, false, 256, 12)] // Q5_K gate/up
+    [InlineData(16, false, 256, 12)] // IQ2_XXS gate/up
+    [InlineData(17, false, 2560, 640)] // Target model IQ2_XS gate/up; keep its 2560-element dots intact
+    [InlineData(18, false, 2560, 640)] // Target model IQ3_XXS gate/up
+    [InlineData(19, false, 256, 12)] // IQ1_S gate/up
+    [InlineData(22, false, 256, 12)] // IQ2_S gate/up
     public void ExpertShardsPartitionEverySourceByte(int type, bool rowParallel, int ne0, int ne1)
     {
         const int degree = 2, experts = 3;
@@ -80,11 +86,25 @@ public sealed class Qwen4ExpTensorParallelTests
     }
 
     [Theory]
-    [InlineData(2)]
-    [InlineData(4)]
-    public void MmqEdgeTilesRetainExactSourceRowsAndCoverEveryLogicalChannel(int degree)
+    [InlineData(13, 2)]
+    [InlineData(13, 4)]
+    [InlineData(16, 2)]
+    [InlineData(16, 4)]
+    [InlineData(17, 2)]
+    [InlineData(17, 4)]
+    [InlineData(18, 2)]
+    [InlineData(18, 4)]
+    [InlineData(19, 2)]
+    [InlineData(19, 4)]
+    [InlineData(21, 2)]
+    [InlineData(21, 4)]
+    [InlineData(22, 2)]
+    [InlineData(22, 4)]
+    public void MmqEdgeTilesRetainExactSourceRowsAndCoverEveryLogicalChannel(int type, int degree)
     {
-        const int type = 21, input = 256, output = 640, experts = 3;
+        const int input = 256, output = 640, experts = 3;
+        int alignment = Qwen4ExpModel.Qwen4ExpMmqRowAlignment(type, output);
+        Assert.Equal(128, alignment);
         long row = NativeDequant.RowSize(type, input);
         byte[] bytes = Enumerable.Range(0, checked((int)(row * output * experts)))
             .Select(i => (byte)((i * 37 + i / 113) % 256)).ToArray();
@@ -95,12 +115,12 @@ public sealed class Qwen4ExpTensorParallelTests
         {
             for (int rank = 0; rank < degree; ++rank)
             {
-                var range = Qwen4ExpModel.Qwen4ExpOutputRowRange(output, rank, degree, 128);
+                var range = Qwen4ExpModel.Qwen4ExpOutputRowRange(output, rank, degree, alignment);
                 Assert.Equal(0, range.First % 128);
                 Assert.Equal(0, range.Count % 128);
                 Assert.InRange(rank * output / degree - range.First, 0, 127);
                 Assert.True(range.First + range.Count >= (rank + 1) * output / degree);
-                var shard = Qwen4ExpModel.SliceTensorParallelExpert(source, rank, degree, false, 128);
+                var shard = Qwen4ExpModel.SliceTensorParallelExpert(source, rank, degree, false, alignment);
                 try
                 {
                     Assert.Equal(input, shard.PerExpertNe0);
@@ -148,9 +168,17 @@ public sealed class Qwen4ExpTensorParallelTests
     [InlineData(0, false, 8, 5, 2)] // Output tail cannot be dropped.
     [InlineData(2, true, 96, 8, 2)] // 48 is not a whole Q4_0 block.
     [InlineData(14, true, 768, 8, 2)] // 384 is not a whole Q6_K block.
+    [InlineData(17, false, 640, 8, 2)] // Output-row slicing still needs complete source IQ2_XS blocks.
+    [InlineData(17, true, 768, 8, 2)] // Input slices cannot split a 256-element IQ2_XS block.
     public void UnsupportedSlicesFailBeforeReadingOrAllocating(int type, bool rowParallel, int ne0, int ne1, int degree)
     {
         var weight = new StackedExpertWeights(IntPtr.Zero, type, ne0, ne1, 3, 0, true, null!, IntPtr.Zero);
         Assert.Throws<NotSupportedException>(() => Qwen4ExpModel.SliceTensorParallelExpert(weight, 0, degree, rowParallel));
     }
+
+    [Theory]
+    [InlineData(29, 640)] // IQ1_M has no upstream MMQ kernel.
+    [InlineData(17, 608)] // Source output rows must form whole 128-row MMQ tiles.
+    public void UnsupportedMmqLayoutsDoNotRequestOverlappingTiles(int type, int rows)
+        => Assert.Equal(1, Qwen4ExpModel.Qwen4ExpMmqRowAlignment(type, rows));
 }

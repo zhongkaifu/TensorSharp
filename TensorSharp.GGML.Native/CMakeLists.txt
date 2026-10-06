@@ -686,6 +686,7 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
     target_include_directories(GgmlOpsMatmulPrecisionCpuTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
     target_link_libraries(GgmlOpsMatmulPrecisionCpuTest PRIVATE ggml-cpu ggml-base)
     add_test(NAME cpu-explicit-f32-matmul COMMAND GgmlOpsMatmulPrecisionCpuTest)
+    add_test(NAME cpu-quantized-ffn-strip COMMAND GgmlOpsMatmulPrecisionCpuTest --quant-strip-only)
     add_executable(GgmlOpsAttentionPrecisionCpuTest tests/attention_precision_test.cpp
         ggml_ops_attention_precision.cpp ggml_ops_matmul_precision.cpp)
     target_include_directories(GgmlOpsAttentionPrecisionCpuTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
@@ -716,12 +717,14 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
             "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/src")
         target_link_libraries(GgmlOpsCudaMatmulPrecisionTest PRIVATE ggml-cuda ggml-cpu ggml-base CUDA::cublas)
         add_test(NAME cuda-explicit-f32-matmul COMMAND GgmlOpsCudaMatmulPrecisionTest)
+        add_test(NAME cuda-quantized-ffn-strip COMMAND GgmlOpsCudaMatmulPrecisionTest --quant-strip-only --inner 2560)
         # Measurement probe (not a test): which CUDA kernels a qwen4exp verify
         # row shares with the one-token decode graph, and at what cost.
         add_executable(GgmlOpsQwen4ExpRowKernelProbe tests/qwen4exp_row_kernel_probe.cpp)
         target_compile_definitions(GgmlOpsQwen4ExpRowKernelProbe PRIVATE TSG_GGML_USE_CUDA=1)
         target_link_libraries(GgmlOpsQwen4ExpRowKernelProbe PRIVATE ggml-cuda ggml-cpu ggml-base)
         set_tests_properties(cuda-explicit-f32-matmul PROPERTIES SKIP_RETURN_CODE 77)
+        set_tests_properties(cuda-quantized-ffn-strip PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
         add_executable(GgmlOpsCudaAttentionPrecisionTest tests/attention_precision_test.cpp
             ggml_ops_attention_precision.cpp ggml_ops_attention_precision.cu
             ggml_ops_matmul_precision.cpp ggml_ops_matmul_precision.cu ggml_ops_dsv4_fused.cu

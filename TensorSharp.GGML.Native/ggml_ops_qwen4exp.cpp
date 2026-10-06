@@ -2931,13 +2931,8 @@ TSG_EXPORT int TSGgml_Qwen4ExpTpWeightSupported(int type, int input, int rows, i
     try
     {
 #ifdef TSG_GGML_USE_CUDA
-        switch ((ggml_type)type)
-        {
-            case GGML_TYPE_Q2_K: case GGML_TYPE_Q3_K: case GGML_TYPE_Q4_K: case GGML_TYPE_Q6_K:
-            case GGML_TYPE_IQ3_S: case GGML_TYPE_IQ4_XS: case GGML_TYPE_IQ4_NL: case GGML_TYPE_Q8_0:
-                break;
-            default: throw std::invalid_argument("qwen4exp TP: only Q2_K/Q3_K/Q4_K/Q6_K/IQ3_S/IQ4_XS/IQ4_NL/Q8_0 FFNs have exact CUDA strip kernels");
-        }
+        if (!tsg_matmul_id_quant_strip_type_supported((ggml_type)type))
+            throw std::invalid_argument("qwen4exp TP: FFN dtype has no exact CUDA MMQ output-strip kernel");
         if (input <= 0 || input % ggml_blck_size((ggml_type)type) || rows <= 0 || rows % 128
             || experts <= 0 || degree <= 1 || rows % degree || degree != tsg::g_device_count.load())
             throw std::invalid_argument("qwen4exp TP: unsupported FFN dimensions");

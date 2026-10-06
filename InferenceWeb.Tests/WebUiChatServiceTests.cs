@@ -10,6 +10,7 @@
 
 using System.Text;
 using System.Text.Json;
+using ImageMagick;
 using Microsoft.Extensions.Logging.Abstractions;
 using TensorSharp.AgentHost.Skills;
 using TensorSharp.Chat;
@@ -865,33 +866,35 @@ public class WebUiChatServiceTests : IDisposable
         Assert.Equal(0, f.Uploads.UsedBytes);
     }
 
-    [Fact]
-    public async Task UploadHeic_OverSelectionLimitKeepsThumbnailAndExplainsRefusal()
+    [Theory]
+    [InlineData(8193, 1)]
+    [InlineData(1, 8193)]
+    [InlineData(4096, 4097)]
+    public async Task UploadHeic_LargeImagesKeepFullResolutionEditingImages(int width, int height)
     {
-        // PNG bytes make this geometry boundary independent of HEIC encoder support;
+        // PNG bytes make these geometry cases independent of HEIC encoder support;
         // the real HEIC decoder is exercised by UploadHeic_UsesOriginalPixelsForEditing.
-        byte[] bytes = TensorSharp.Models.QwenImage.ImageIO.EncodePng(
-            new TensorSharp.Models.QwenImage.RgbImage(8193, 1, new float[8193 * 3]));
+        byte[] bytes;
+        using (var image = new MagickImage(MagickColors.Black, (uint)width, (uint)height))
+            bytes = image.ToByteArray(MagickFormat.Png);
         Fixture f = Build();
         using var stream = new MemoryStream(bytes);
-        var result = JsonSerializer.SerializeToElement(await f.Service.UploadAsync(stream, "wide.heic", bytes.Length, CancellationToken.None));
+        object response = await f.Service.UploadAsync(stream, "large.heic", bytes.Length, CancellationToken.None);
+        var result = JsonSerializer.SerializeToElement(response);
         Assert.True(result.GetProperty("ok").GetBoolean());
         Assert.NotEmpty(result.GetProperty("previewUrl").GetString()!);
-        Assert.Equal(JsonValueKind.Null, result.GetProperty("editUrl").ValueKind);
-        Assert.Contains("8192", result.GetProperty("editUnavailableReason").GetString());
-        Assert.Equal(2, Directory.GetFiles(_baseDir).Length);
-        Assert.Empty(Directory.GetFiles(_baseDir, "*-edit.png"));
+        string editPath = Path.Combine(_baseDir, Path.GetFileName(result.GetProperty("editUrl").GetString()!));
+        var editInfo = new MagickImageInfo(editPath);
+        Assert.Equal(((uint)width, (uint)height), (editInfo.Width, editInfo.Height));
+        Assert.Equal(JsonValueKind.Null, result.GetProperty("editUnavailableReason").ValueKind);
+        bool hasSeparateEdit = (long)width * height > 768L * 768;
+        Assert.Equal(hasSeparateEdit ? 3 : 2, Directory.GetFiles(_baseDir).Length);
+        Assert.Equal(hasSeparateEdit ? 1 : 0, Directory.GetFiles(_baseDir, "*-edit.png").Length);
+        Assert.Equal(Directory.GetFiles(_baseDir).Sum(path => new FileInfo(path).Length), f.Uploads.UsedBytes);
+        Assert.True(f.Service.DiscardUpload(response));
+        Assert.Empty(Directory.GetFiles(_baseDir));
+        Assert.Equal(0, f.Uploads.UsedBytes);
     }
-
-    [Theory]
-    [InlineData(4096, 4096, true)]
-    [InlineData(8192, 2048, true)]
-    [InlineData(4096, 4097, false)]
-    [InlineData(8193, 1, false)]
-    [InlineData(1, 8193, false)]
-    [InlineData(0, 64, false)]
-    public void SelectionImageBoundsMatchTheSharedEditor(int width, int height, bool expected) =>
-        Assert.Equal(expected, WebUiChatService.SupportsImageSelectionSize(width, height));
 
     [Fact]
     public async Task UploadPng_KeepsOriginalFileWithoutAdditionalBrowserConversions()

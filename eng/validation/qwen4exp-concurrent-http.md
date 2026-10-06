@@ -82,8 +82,11 @@ timing differences to a change. Model IDs alone do not establish that identity.
 Before comparing an external report, the runner recomputes its retained request
 and answer hashes, checks its declared workload and unique group/request coverage,
 recomputes completed-answer quality, reconstructs answers and completion/token
-metadata from retained SSE events, and checks finite wall times and internally
-consistent group token/throughput metrics. Corrupt or
+and model-delta timing metadata from retained SSE events, and checks finite wall
+times and internally consistent group token/throughput/overlap metrics. Declared
+follow-up requests undergo the same request/hash/SSE/quality/usage checks;
+declared server health checks require matching coverage and the served model.
+Corrupt or
 incomplete stored evidence fails comparison. The exact compared report file path
 and SHA-256 are retained even if integrity validation fails. This validates the
 report's internal evidence; it does not authenticate its author or bind the model
@@ -122,8 +125,61 @@ makes four requests. Omitted marker, staggered, cancellation, or vision scenario
 are recorded as omitted coverage. Run a separate vision validation with the model's
 compatible projector; this runner covers text only.
 
+For the Qwen3.8 CUDA sparse-attention boundary regression, use long topic
+requests and explicitly require actual prompt-plus-completion usage to exceed
+the model's QSA top-k boundary. A token cap alone does not establish coverage:
+an answer that stops early fails this gate. For a model with QSA top-k 2048:
+
+```sh
+python3 eng/validation/qwen4exp-concurrent-http.py \
+  --url http://127.0.0.1:5288 --groups topics --modes parallel,staggered \
+  --concurrent-only --max-tokens 4096 --min-topic-total-tokens 2050 \
+  --repeats 2 --require-generation-overlap --check-server-health --follow-up \
+  --progress-every-deltas 128 \
+  --output docs/validation/qwen38-cuda-concurrent.json
+```
+
+The gate uses 2050 because the final sampled completion token may not itself
+enter a forward graph; one extra token establishes that the forwarded sequence
+crossed 2048.
+
+`--require-generation-overlap` requires overlap between the first and last
+nonempty model deltas of concurrent streams. It is stronger than overlapping
+HTTP connection spans, but it does not prove simultaneous kernel execution;
+use the native fused-decode log gate for execution-path evidence.
+`--check-server-health` queries `/v1/models` after every group and requires the
+served model to remain available. `--follow-up` ends with a fresh independent
+arithmetic request whose exact answer is checked, so a successful stress run
+also establishes subsequent inference usability. The retained report records
+these optional checks separately from the benchmark groups.
+`--progress-every-deltas` prints live counts of nonempty SSE events and answer
+characters. Event counts provide progress; final token usage supplies the
+token-boundary coverage check.
+
+Raw topic answers can stop before both sequences enter sparse attention.
+`--topic-system-prompt-file` adds retained system context only to the topic
+requests, while preserving each exact Chinese user prompt. The reusable neutral
+fixture is `InferenceWeb.Tests/Fixtures/Qwen4ExpServing/sparse-qsa-context.txt`.
+Use it for supplemental simultaneous sparse coverage, record actual prompt
+usage, and retain a separate raw-prompt control. The report labels the variant
+and stores the prefix text, source path, and SHA-256; it never treats a contextual
+run as the same request as an unmodified raw prompt. Marker and follow-up tasks
+omit this prefix.
+
+The supplemental fixture run can use a shorter completion cap:
+
+```sh
+python3 eng/validation/qwen4exp-concurrent-http.py \
+  --url http://127.0.0.1:5288 --groups topics --modes parallel --concurrent-only \
+  --max-tokens 1536 --min-topic-total-tokens 2050 \
+  --topic-system-prompt-file InferenceWeb.Tests/Fixtures/Qwen4ExpServing/sparse-qsa-context.txt \
+  --require-generation-overlap --check-server-health --follow-up \
+  --progress-every-deltas 128 \
+  --output docs/validation/qwen38-cuda-context-concurrent.json
+```
+
 Local runner tests use a threaded HTTP fixture, without loading a model:
 
 ```sh
-python3 -m unittest eng/validation/tests/test_qwen4exp_concurrent_http.py
+python3 -X utf8 -m unittest eng/validation/tests/test_qwen4exp_concurrent_http.py
 ```

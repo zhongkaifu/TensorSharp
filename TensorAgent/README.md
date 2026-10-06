@@ -327,8 +327,9 @@ region only** reduces model work for small selections, with less surrounding con
 The result keeps the source dimensions and exact protected RGBA pixels. Each message
 edits one target; only its selection is sent and saved with the conversation.
 **Compare original** toggles the result, and **Edit again** restores the target,
-selection, references, other attachments and instruction. The browser editor accepts images up to
-16 megapixels and 8192 pixels per side; larger images produce an explicit error.
+selection, references, other attachments and instruction. The browser editor has no
+fixed megapixel or per-side limit; available browser memory and canvas support
+determine the practical maximum image size.
 HEIC/HEIF photos use a full-resolution PNG for editing and comparison while their
 small preview remains in the attachment list. Reattach older HEIC/HEIF uploads if
 the editor asks for a full-resolution source.

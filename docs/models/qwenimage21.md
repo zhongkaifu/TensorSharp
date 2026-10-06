@@ -290,9 +290,9 @@ the protected source pixels, just like the final image.
 
 HEIC/HEIF uploads retain a small thumbnail and a separate full-resolution PNG
 for painting and reopening selections. The original photo remains the model's
-source. The browser editor supports up to 16 megapixels and 8192 pixels per side;
-larger HEIC/HEIF photos show a selection-limit message instead of painting a
-mask on a reduced thumbnail.
+source. The browser editor has no fixed megapixel or per-side limit and exports
+selections at the source dimensions. Available browser memory and canvas support
+determine the practical maximum image size.
 
 The mask is enforced by TensorSharp's sampling and compositing code; it does not
 add an annotation image or a dedicated mask channel to Qwen's conditioning.

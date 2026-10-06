@@ -26,7 +26,6 @@
   "mask.action.remove": "Remove selection",
   "mask.action.use": "Use selection",
   "mask.error.alreadyOpen": "An image selection is already open.",
-  "mask.error.tooLarge": "The selection editor supports images up to 16 megapixels and 8192 pixels per side.",
   "mask.error.maskSize": "The saved selection does not match the image dimensions.",
   "mask.error.maskUnreadable": "The saved selection could not be opened.",
   "mask.error.imageUnreadable": "The image could not be opened for selection."

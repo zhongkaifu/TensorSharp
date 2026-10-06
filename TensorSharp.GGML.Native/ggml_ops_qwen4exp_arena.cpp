@@ -9,8 +9,12 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 #include "ggml_ops_internal.h"
 #include "ggml_ops_attention_alloc.h"
+#include "ggml_ops_dsv4_fused.h"
 #include "ggml_ops_transformer_common.h"
 #include "ggml_ops_qwen4exp_qsa.h"
+#ifdef TSG_GGML_USE_CUDA
+#include "ggml-cuda.h"
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -127,6 +131,7 @@ namespace
         ggml_backend_buffer_t buffer = nullptr;
         ggml_gallocr_t alloc = nullptr;
         ggml_cgraph* graph = nullptr;
+        ggml_backend_t precise_backend = nullptr;
         ggml_tensor* token_in = nullptr;        // I32 [n_slots]
         ggml_tensor* embedding_in = nullptr;    // optional host-gathered F32 [H, n_slots]
         ggml_tensor* local_idx_in = nullptr;    // I64 [n_slots], holder-relative row
@@ -171,6 +176,12 @@ namespace
 
         void release_graph()
         {
+            if (precise_backend != nullptr)
+            {
+                ggml_backend_synchronize(precise_backend);
+                ggml_backend_free(precise_backend);
+                precise_backend = nullptr;
+            }
             if (alloc != nullptr) { ggml_gallocr_free(alloc); alloc = nullptr; }
             buffer = nullptr;
             if (ctx != nullptr) { ggml_free(ctx); ctx = nullptr; }
@@ -183,6 +194,11 @@ namespace
             host_moe.clear(); host_moe_seg_end.clear();
             trace_res.clear();
             valid = false;
+        }
+
+        ggml_backend_t execution_backend() const
+        {
+            return precise_backend != nullptr ? precise_backend : g_backend;
         }
     };
 
@@ -1117,6 +1133,24 @@ TSG_EXPORT int TSGgml_Qwen4ExpArenaDecodeBatched(
             if (e.has_argmax)
                 ggml_build_forward_expand(e.graph, amax);
 
+#ifdef TSG_GGML_USE_CUDA
+            if (ggml_backend_is_cuda(g_backend))
+            {
+                // QSA starts using owned F32 matmuls when the attention window
+                // reaches its sparse selector. Select the same execution
+                // backend as the solo span from the completed graph, so dense
+                // short-context arenas keep upstream's uninterrupted CUDA graph.
+                for (int i = 0; i < ggml_graph_n_nodes(e.graph); ++i)
+                {
+                    if (ggml_graph_node(e.graph, i)->op != GGML_OP_CUSTOM) continue;
+                    e.precise_backend = tsg_dsv4_fused_backend_init(g_backend);
+                    if (e.precise_backend == nullptr)
+                        return abort_build("precise backend creation failed.");
+                    break;
+                }
+            }
+#endif
+
             if (token_embd_t) binder.add(token_embd_t, const_cast<void*>(token_embd_data),
                 static_cast<std::size_t>(token_embd_bytes));
             if (!host_moe_build_segment_ends(e.graph, e.host_moe, e.host_moe_seg_end, kQ4abKernel))
@@ -1147,6 +1181,23 @@ TSG_EXPORT int TSGgml_Qwen4ExpArenaDecodeBatched(
 
             host_read_barrier();
             binder.flush();
+
+#ifdef TSG_GGML_USE_CUDA
+            if (ggml_backend_is_cuda(g_backend))
+            {
+                // Direct graph execution does not consult supports_op. Reject
+                // an unsupported graph before joining slots or advancing any
+                // recurrent state, preserving the caller's solo fallback.
+                for (int i = 0; i < ggml_graph_n_nodes(e.graph); ++i)
+                {
+                    const auto* node = ggml_graph_node(e.graph, i);
+                    if (ggml_backend_supports_op(e.execution_backend(), node)) continue;
+                    const auto message = std::string("backend does not support ") +
+                        node->name + " (" + ggml_op_name(node->op) + ").";
+                    return abort_build(message.c_str());
+                }
+            }
+#endif
 
             e.tok_stage.assign(n_slots, 0);
             e.pos_stage.assign(n_slots, 0);
@@ -1542,9 +1593,10 @@ TSG_EXPORT int TSGgml_Qwen4ExpArenaDecodeBatched(
         }
 
         compute_started = true;
+        const auto execution_backend = e.execution_backend();
         const bool succeeded = e.host_moe.empty()
-            ? tsg::graph_compute_profiled(g_backend, e.graph, kQ4abKernel) == GGML_STATUS_SUCCESS
-            : host_moe_execute_segments(e.graph, e.host_moe, e.host_moe_seg_end, kQ4abKernel);
+            ? tsg::graph_compute_profiled(execution_backend, e.graph, kQ4abKernel) == GGML_STATUS_SUCCESS
+            : host_moe_execute_segments(e.graph, e.host_moe, e.host_moe_seg_end, kQ4abKernel, execution_backend);
         if (!succeeded)
         {
             set_last_error("qwen4exp arena batched decode: graph execution failed.");

@@ -26,7 +26,6 @@
   "mask.action.remove": "Auswahl entfernen",
   "mask.action.use": "Auswahl verwenden",
   "mask.error.alreadyOpen": "Eine Bildauswahl ist bereits geöffnet.",
-  "mask.error.tooLarge": "Der Auswahleditor unterstützt Bilder bis zu 16 Megapixeln und 8192 Pixeln pro Seite.",
   "mask.error.maskSize": "Die gespeicherte Auswahl passt nicht zu den Bildmaßen.",
   "mask.error.maskUnreadable": "Die gespeicherte Auswahl konnte nicht geöffnet werden.",
   "mask.error.imageUnreadable": "Das Bild konnte nicht zur Auswahl geöffnet werden."

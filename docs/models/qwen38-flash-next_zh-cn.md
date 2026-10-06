@@ -478,8 +478,9 @@ Qwen/MoE 回归通过 CUDA 327 项（跳过 17）和 CPU 319 项（跳过 22）�
 kernel，仍以捕获的 CUDA 图运行；prefill 则把这两种布局解码进它的 tensor-core 与寄存器暂存
 （register-staged）分组 kernel。在分组 kernel 接手之前，它对这个文件的 prefill 走最慢的回退路径，
 约 500 tok/s。该引擎没有主机专家接缝，所以 `--n-cpu-moe` 在它上面只打印警告，专家仍留在 GPU 上。
-`--tp N` 会以退出码 2 拒绝这种量化，因为 `ggml_cuda` 的 TP FFN 路径只接受 [多 GPU](#多-gpu) 一节列出的类型；
-请改用 `--layer-split N`。
+直接 `cuda` 引擎使用 `--layer-split N` 分配多个 GPU，并拒绝 `--tp N`。
+`ggml_cuda` 已支持对 UD-Q2_K_XL 使用 `--tp 2`，保留原始量化权重；支持的格式及设备/布局要求见
+[多 GPU](#多-gpu)。
 
 两张 A40、热态，同样的 1,818 token prompt 与 256 个贪心 token。TensorSharp 以
 `TensorSharp.Server.Host` 加 `--no-multi-agent --no-skills` 运行，每个进程三个请求，每个请求的首行各不相同，
@@ -513,13 +514,16 @@ FFN 中间宽度和输出宽度必须能被并行度整除；投影按完整输�
 量化 prefill 保留原始 MMQ tile 和归约几何，gate/up 切片保留重叠的 128 行边界 tile，再裁剪输出。
 在中间宽度 640 的检查点上，TP2 每个 rank 为逻辑 320 行保存 384 行，TP4 为逻辑 160 行保存 256 行。
 不支持的配置会在批量加载权重前依据 GGUF 元数据拒绝。当前模型路径要求 CUDA MMQ stream-K，
-FFN 类型限于 Q2_K、Q3_K、Q4_K、Q6_K、IQ3_S、IQ4_XS、IQ4_NL 和 Q8_0；完整输出行数及 down 输出切片须为 128 的倍数。
-其他 FFN 类型（包括 F32/F16/BF16）、设备或无法保持归约顺序的布局会明确拒绝；物理 GPU 验证使用 NVIDIA A40。
+FFN 类型限于 Q2_K、Q3_K、Q4_K、Q5_K、Q6_K、IQ2_XXS、IQ2_XS、IQ2_S、IQ3_XXS、IQ1_S、IQ3_S、IQ4_XS、IQ4_NL 和 Q8_0。
+这包含 UD-Q2_K_XL 的 IQ2_XS/IQ3_XXS 路由 gate/up 权重、Q5_K/Q6_K 共享权重和 IQ4_NL/Q8_0 down 权重。
+完整输出行数及 down 输出切片须为 128 的倍数。IQ1_M 仍被拒绝，因为上游 ggml 没有该格式的 MMQ tile kernel。
+其他 FFN 类型（包括 F32/F16/BF16）、设备或无法保持归约顺序的布局会明确拒绝。
+下述历史物理 GPU 验证使用 NVIDIA A40，量化格式以各次运行的说明为准。
 专家切片目前另占总路由专家字节数及重叠行的
 主机缓冲区，并保留至模型释放。加载时不再预读整个稀疏 PLE 表，所需行按需读取。
 
-`--layer-split N` 仍表示按完整层连续分配至多个 GPU，仅适用于 `ggml_cuda` 和
-`ggml_vulkan`。不得同时使用 `--tp` 与 `--layer-split`。
+`--layer-split N` 仍表示按完整层连续分配至多个 GPU，适用于 `ggml_cuda`、
+`ggml_vulkan` 和直接 `cuda` 引擎。不得同时使用 `--tp` 与 `--layer-split`。
 `eng/tests/qwen4exp-tensor-parallel.py` 验证两层 prefill、重放、QSA、多轴 RoPE、
 全部 logits 和多 rank 状态回滚。量化模式
 （`--quantized-ffn --tokens 1,2,3,4,5,6,7,8 --rollback-width 8`）在 CUDA TP2 与 TP4 上均通过全部 102 项检查，
@@ -532,6 +536,63 @@ IQ3_S/IQ4_NL 与 IQ4_XS/Q8_0 gate/down、Q8_0 共享专家及宽度 1 至 8、17
 CUDA TP2 在 `--require-bitwise` 下逐位一致。
 `eng/ForcedLogitProbe` 在固定相同 token 历史下比较完整模型 logits，避免早期贪心
 分歧掩盖后续 decode 的数值误差。
+
+### UD-Q2_K_XL 的 TP2 验证，2026-10-05
+
+提供的检查点现可在两张 NVIDIA A40 上使用 `--backend ggml_cuda --tp 2`，
+保留原始量化字节及上游 MMQ 算术。部署的原生库 SHA-256 为
+`a7d30f8ac0648372b8fd63881b9a2c915032b75ee2e51299265d61349d793301`；
+上游 ggml 保持未修改，revision 为
+`ffa4e8b80930029a35991f94e7c8a93cd67730ab`。
+该 VM 的 CUDA peer access 行为探测失败，F32 FFN 汇集使用 NCCL 共享内存传输。
+
+- 托管 TP 测试全部 39 项通过，无失败或跳过。
+- 原生 strip 检查通过 410 项 CPU 比较和 820 项 CUDA 比较，覆盖全部 14 种支持格式，
+  每张 A40 各 410 项。CUDA gate/up 输入宽度为 2560；token 宽度包含
+  1、4、8、9、17、31 和 129。
+  其中 524 项使用自有 MMQ strip 路径，296 项使用小形状下选择的上游 CUDA 路径。
+- 26 项完整合成 FFN 比较均逐位一致，hidden 宽度 2560、FFN 宽度 640、16 个专家且选择 10 个。
+  覆盖 IQ2_XS/IQ4_NL 路由 gate/down 与 Q5_K/Q8_0 共享权重组合，以及
+  IQ3_XXS/IQ4_NL 与 Q6_K/Q8_0；宽度为 1 至 9、17、31、128 和 129。
+- 5 个完整模型固定历史案例，每例 24 行，共 29,798,400 个 F32 logits，
+  与原始 layer-split-2 二进制逐字节一致。5 个贪心回答通过算术、提取、Python 行为、
+  有序平方数和思考检查；回答也与候选构建的 layer-split-2 逐字节一致。
+- 精确使用 `--interactive --think --max-tokens 20000`，配合本模型及
+  `--backend ggml_cuda --tp 2`，完成两轮并以 EOS 结束，回答分别为 `703`、`720`。
+  实际生成 163、76 个 token，报告速率为 46.1、45.4 token/s；第二轮复用 256 个提示 token 中的 232 个。
+
+启用 CUDA 图的数值检查通过。针对 Q5_K、使用 `GGML_CUDA_DISABLE_GRAPHS=1` 的
+memcheck 报告零错误；启用图的 sanitizer 尝试报告已处理的 CUDA 图更新 API 状态 910，
+不计为干净的图捕获 sanitizer 验证。这两轮短交互不验证完整的 20,000-token 生成；
+本轮未评估长上下文、视觉、困惑度、TP4 或其他设备。生成证据保存在被忽略的
+`docs/validation/qwen38-q2-tp/`；可复用回答检查工具为
+`eng/validation/validate-qwen4exp-tp-answers.py`，请求夹具为
+`InferenceWeb.Tests/Fixtures/Qwen4Exp/tp-quality-requests.jsonl`。
+
+四次新 CLI 启动按 layer2、TP2、TP2、layer2 的顺序比较，使用 F16 KV、上下文 4096、
+两个 CPU 线程及固定输入 pp512/tg128。每次均正常预热内核，再计时四轮。
+吞吐单元格依次为**首轮 / 第 2–4 轮中位数 / 全部四轮范围**，单位 token/s；加载不含预热。
+
+| 模式 / 启动序号 | 加载（秒） | 预热（秒） | pp512：首轮 / 中位数 / 范围 | tg128：首轮 / 中位数 / 范围 |
+| --- | ---: | ---: | --- | --- |
+| layer2 / 1 | 20.49 | 138.68 | 942.0 / 998.6 / 942.0–1010.6 | 53.6 / 53.9 / 53.6–54.1 |
+| TP2 / 2 | 46.56 | 2.47 | 806.8 / 882.2 / 806.8–884.6 | 49.4 / 51.5 / 49.4–52.2 |
+| TP2 / 3 | 48.42 | 2.43 | 797.2 / 824.8 / 797.2–841.8 | 48.5 / 50.3 / 48.5–51.4 |
+| layer2 / 4 | 19.51 | 138.08 | 942.2 / 986.2 / 942.2–998.1 | 52.8 / 53.4 / 52.8–53.6 |
+
+合并每种模式的六个后续轮次，中位数为 TP2 **848.0 pp / 51.4 tg**，
+layer2 **997.4 pp / 53.65 tg** token/s；该负载下 TP2 的 prefill 慢 15.0%，decode 慢 4.2%。
+在此 VM 上追求本轮实测最高吞吐时，使用 `--layer-split 2`。
+TP2 需要额外计算重叠边界行、复制注意力，并在每层 FFN 做两次 F32 汇集；本轮未单独隔离各项开销。
+两种模式在不同启动阶段上传权重，评估启动耗时时需同时看加载和预热。
+
+四次不计时的完整贪心序列（prefill 加 128 个 decode token）均一致，运行二进制哈希及
+干净上游身份在前后保持不变。计时使用重复的 17-token 输入周期，可能受益于 PLE 行和专家局部性；
+未清除 OS 缓存，GPU 时钟未锁定。结果不含自然对话格式化、HTTP、调度或采样，
+不代表真实文本、长上下文或冷存储吞吐。完整日志、计时和身份快照保存在被忽略的
+`docs/validation/qwen38-q2-tp/benchmark-20261006T010554Z-21317/` 目录。
+
+### 先前的 UD-IQ4_XS 验证
 
 UD-IQ4_XS 检查点在 NVIDIA A40 上，TP2、TP4 各有 120 行完整词表 logits 与稳定舍入后的普通 layer2 执行逐字节一致：
 三个文本 prompt、一个单 token 合成 prompt、一个 128 token 合成 prefill，每例固定历史运行 24 步。

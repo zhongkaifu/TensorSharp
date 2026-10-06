@@ -26,7 +26,6 @@
   "mask.action.remove": "선택 영역 제거",
   "mask.action.use": "선택 영역 사용",
   "mask.error.alreadyOpen": "이미지 선택 창이 이미 열려 있습니다.",
-  "mask.error.tooLarge": "선택 영역 편집기는 최대 1,600만 화소, 한 변당 8,192픽셀의 이미지를 지원합니다.",
   "mask.error.maskSize": "저장된 선택 영역이 이미지 크기와 일치하지 않습니다.",
   "mask.error.maskUnreadable": "저장된 선택 영역을 열 수 없습니다.",
   "mask.error.imageUnreadable": "선택 영역을 지정할 이미지를 열 수 없습니다."

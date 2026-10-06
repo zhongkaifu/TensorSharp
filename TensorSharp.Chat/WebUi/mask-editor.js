@@ -71,19 +71,19 @@
       var zoom = range(tr('mask.tool.zoom', 'Zoom (%)'), 25, 1600, 100, 25);
       var undo = button(tr('mask.tool.undo', 'Undo'), function () {
         if (!ready || saving || pointer !== null) return;
-        if (operations.length) redoOperations.push(operations.pop()); redraw();
+        if (operations.length) redoOperations.push(operations.pop()); redrawSafely();
       });
       var redo = button(tr('mask.tool.redo', 'Redo'), function () {
         if (!ready || saving || pointer !== null) return;
-        if (redoOperations.length) operations.push(redoOperations.pop()); redraw();
+        if (redoOperations.length) operations.push(redoOperations.pop()); redrawSafely();
       });
       button(tr('mask.tool.clear', 'Clear'), function () {
         if (!ready || saving || pointer !== null) return;
-        redoOperations = []; operations.push({ clear: true }); redraw();
+        redoOperations = []; operations.push({ clear: true }); redrawSafely();
       });
       button(tr('mask.tool.invert', 'Invert'), function () {
         if (!ready || saving || pointer !== null) return;
-        redoOperations = []; operations.push({ invert: true }); redraw();
+        redoOperations = []; operations.push({ invert: true }); redrawSafely();
       });
 
       var viewport = node('div', 'ts-mask-viewport');
@@ -93,7 +93,7 @@
       var canvas = node('canvas', 'ts-mask-canvas');
       canvas.setAttribute('aria-label', tr('mask.canvas.paint', 'Paint or erase the selected image area'));
       stage.appendChild(source); stage.appendChild(canvas); viewport.appendChild(stage); panel.appendChild(viewport);
-      var context = canvas.getContext('2d');
+      var context = null, baseContext = null;
       var base = document.createElement('canvas');
       var status = node('p', 'ts-mask-status', tr('mask.status.loading', 'Loading image…')); status.setAttribute('role', 'status');
       panel.appendChild(status);
@@ -117,6 +117,22 @@
         canvas.width = base.width = 0;
         if (previousFocus && previousFocus.focus) previousFocus.focus();
         if (error) reject(error); else resolve(value);
+      }
+      function imageUnreadable() {
+        finish(null, new Error(tr('mask.error.imageUnreadable', 'The image could not be opened for selection.')));
+      }
+      function prepareCanvas(element, width, height) {
+        element.width = width; element.height = height;
+        // Use the readback-oriented store from the first draw so later mask reads
+        // do not change rasterization, including antialiased Undo/Redo edges.
+        var ctx = element.getContext('2d', { willReadFrequently: true });
+        if (!ctx || element.width !== width || element.height !== height) throw new Error('Canvas unavailable');
+        // Canvas dimensions alone do not prove its backing store was allocated.
+        // Probe the actual store without imposing a fixed image-size limit.
+        ctx.fillStyle = '#fff'; ctx.fillRect(width - 1, height - 1, 1, 1);
+        if (ctx.getImageData(width - 1, height - 1, 1, 1).data[3] !== 255) throw new Error('Canvas unavailable');
+        ctx.clearRect(width - 1, height - 1, 1, 1);
+        return ctx;
       }
       var cancel = action(tr('mask.action.cancel', 'Cancel'), function () { if (!saving) finish(null); });
       if (options.maskUrl) action(tr('mask.action.remove', 'Remove selection'), function () { if (!saving) finish({ remove: true }); });
@@ -190,6 +206,11 @@
         undo.disabled = !operations.length;
         redo.disabled = !redoOperations.length;
       }
+      function redrawSafely() {
+        try { redraw(); }
+        // A failed replay may leave a partial selection, so do not let it save.
+        catch (error) { imageUnreadable(); }
+      }
       function point(event) {
         var rect = canvas.getBoundingClientRect();
         return { x: Math.max(0, Math.min(canvas.width, (event.clientX - rect.left) * canvas.width / rect.width)),
@@ -201,7 +222,9 @@
         if (pan) { panStart = { x: event.clientX, y: event.clientY, left: viewport.scrollLeft, top: viewport.scrollTop }; return; }
         redoOperations = []; redo.disabled = true;
         currentStroke = { erase: erase || event.button === 5, size: Number(brush.value), points: [point(event)] };
-        operations.push(currentStroke); drawStroke(currentStroke); undo.disabled = false;
+        operations.push(currentStroke);
+        try { drawStroke(currentStroke); undo.disabled = false; }
+        catch (error) { imageUnreadable(); }
       });
       canvas.addEventListener('pointermove', function (event) {
         if (pointer !== event.pointerId) return;
@@ -213,12 +236,14 @@
         if (!currentStroke) return;
         var events = event.getCoalescedEvents ? event.getCoalescedEvents() : [event];
         if (!events.length) events = [event];
-        events.forEach(function (sample) {
-          var p = point(sample), previous = currentStroke.points[currentStroke.points.length - 1];
-          currentStroke.points.push(p);
-          // Paint only the new segment. No full-image reads or redraws while dragging.
-          drawStroke({ erase: currentStroke.erase, size: currentStroke.size, points: [previous, p] });
-        });
+        try {
+          events.forEach(function (sample) {
+            var p = point(sample), previous = currentStroke.points[currentStroke.points.length - 1];
+            currentStroke.points.push(p);
+            // Paint only the new segment. No full-image reads or redraws while dragging.
+            drawStroke({ erase: currentStroke.erase, size: currentStroke.size, points: [previous, p] });
+          });
+        } catch (error) { imageUnreadable(); }
       });
       function endStroke(event) {
         if (pointer !== event.pointerId) return;
@@ -230,22 +255,31 @@
         if (!ready || saving || pointer !== null) return;
         var radius = Number(feather.value);
         if (!Number.isInteger(radius) || radius < 0 || radius > 64) { status.textContent = tr('mask.status.featherRange', 'Edge softness must be a whole number from 0 to 64.'); return; }
-        var pixels = context.getImageData(0, 0, canvas.width, canvas.height);
-        var selected = false;
-        for (var i = 0; i < pixels.data.length; i += 4) {
-          var alpha = pixels.data[i + 3];
-          if (alpha) selected = true;
-          pixels.data[i] = pixels.data[i + 1] = pixels.data[i + 2] = alpha; pixels.data[i + 3] = 255;
+        var output = null;
+        function saveFailed() {
+          if (output) output.width = 0;
+          saving = false; apply.disabled = cancel.disabled = false;
+          status.textContent = tr('mask.status.saveFailed', 'Could not save the selection. Please try again.');
         }
-        if (!selected) { status.textContent = tr('mask.status.nothingPainted', 'Paint an area before using the selection.'); return; }
-        saving = true; apply.disabled = cancel.disabled = true; status.textContent = tr('mask.status.preparing', 'Preparing selection…');
-        var output = document.createElement('canvas'); output.width = canvas.width; output.height = canvas.height;
-        output.getContext('2d').putImageData(pixels, 0, 0);
-        output.toBlob(function (blob) {
-          output.width = 0;
-          if (!blob) { saving = false; apply.disabled = cancel.disabled = false; status.textContent = tr('mask.status.saveFailed', 'Could not save the selection. Please try again.'); return; }
-          finish({ blob: blob, maskFeather: radius, maskCrop: crop.checked });
-        }, 'image/png');
+        try {
+          var pixels = context.getImageData(0, 0, canvas.width, canvas.height);
+          var selected = false;
+          for (var i = 0; i < pixels.data.length; i += 4) {
+            var alpha = pixels.data[i + 3];
+            if (alpha) selected = true;
+            pixels.data[i] = pixels.data[i + 1] = pixels.data[i + 2] = alpha; pixels.data[i + 3] = 255;
+          }
+          if (!selected) { status.textContent = tr('mask.status.nothingPainted', 'Paint an area before using the selection.'); return; }
+          saving = true; apply.disabled = cancel.disabled = true; status.textContent = tr('mask.status.preparing', 'Preparing selection…');
+          output = document.createElement('canvas');
+          prepareCanvas(output, canvas.width, canvas.height).putImageData(pixels, 0, 0);
+          pixels = null;
+          output.toBlob(function (blob) {
+            output.width = 0;
+            if (!blob) { saveFailed(); return; }
+            finish({ blob: blob, maskFeather: radius, maskCrop: crop.checked });
+          }, 'image/png');
+        } catch (error) { saveFailed(); }
       }
       function loaded() {
         ready = true; apply.disabled = false; undo.disabled = redo.disabled = true;
@@ -255,30 +289,37 @@
       source.onload = function () {
         if (!root.parentNode) return;
         var w = source.naturalWidth, h = source.naturalHeight;
-        if (!w || !h || w > 8192 || h > 8192 || w * h > 16777216) {
-          finish(null, new Error(tr('mask.error.tooLarge', 'The selection editor supports images up to 16 megapixels and 8192 pixels per side.'))); return;
+        if (!w || !h) { imageUnreadable(); return; }
+        try {
+          context = prepareCanvas(canvas, w, h);
+          baseContext = prepareCanvas(base, w, h);
+          refit();
+        } catch (error) {
+          imageUnreadable(); return;
         }
-        canvas.width = base.width = w; canvas.height = base.height = h;
-        refit();
         if (!options.maskUrl) { loaded(); return; }
         var mask = new Image();
         mask.onload = function () {
           if (!root.parentNode) return;
           if (mask.naturalWidth !== w || mask.naturalHeight !== h) { finish(null, new Error(tr('mask.error.maskSize', 'The saved selection does not match the image dimensions.'))); return; }
-          var baseContext = base.getContext('2d'); baseContext.drawImage(mask, 0, 0);
-          var pixels = baseContext.getImageData(0, 0, w, h);
-          for (var i = 0; i < pixels.data.length; i += 4) {
-            var amount = options.maskMode === 'alpha' ? 255 - pixels.data[i + 3]
-              : Math.round((77 * pixels.data[i] + 150 * pixels.data[i + 1] + 29 * pixels.data[i + 2]) / 256);
-            if (options.maskInvert) amount = 255 - amount;
-            pixels.data[i] = 237; pixels.data[i + 1] = 71; pixels.data[i + 2] = 124; pixels.data[i + 3] = amount;
+          try {
+            baseContext.drawImage(mask, 0, 0);
+            var pixels = baseContext.getImageData(0, 0, w, h);
+            for (var i = 0; i < pixels.data.length; i += 4) {
+              var amount = options.maskMode === 'alpha' ? 255 - pixels.data[i + 3]
+                : Math.round((77 * pixels.data[i] + 150 * pixels.data[i + 1] + 29 * pixels.data[i + 2]) / 256);
+              if (options.maskInvert) amount = 255 - amount;
+              pixels.data[i] = 237; pixels.data[i + 1] = 71; pixels.data[i + 2] = 124; pixels.data[i + 3] = amount;
+            }
+            baseContext.putImageData(pixels, 0, 0); redraw(); loaded();
+          } catch (error) {
+            finish(null, new Error(tr('mask.error.maskUnreadable', 'The saved selection could not be opened.')));
           }
-          baseContext.putImageData(pixels, 0, 0); redraw(); loaded();
         };
         mask.onerror = function () { if (root.parentNode) finish(null, new Error(tr('mask.error.maskUnreadable', 'The saved selection could not be opened.'))); };
         mask.src = options.maskUrl;
       };
-      source.onerror = function () { if (root.parentNode) finish(null, new Error(tr('mask.error.imageUnreadable', 'The image could not be opened for selection.'))); };
+      source.onerror = function () { if (root.parentNode) imageUnreadable(); };
       source.src = options.sourceUrl;
     });
   }
