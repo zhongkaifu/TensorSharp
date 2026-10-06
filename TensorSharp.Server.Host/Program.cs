@@ -593,14 +593,7 @@ app.UseEmbeddingModelGuard();
 // because the image and video APIs return result URLs under it.
 if (hostingOptions.WebUiEnabled)
 {
-    // Shared editor assets are linked into the build/publish output. Source-tree
-    // launches can resolve index.html from the project's physical wwwroot instead.
-    app.MapGet("/mask-editor.js", () => Results.File(
-        Path.Combine(baseDirectory, "wwwroot", "mask-editor.js"), "text/javascript; charset=utf-8"));
-    app.MapGet("/mask-editor.css", () => Results.File(
-        Path.Combine(baseDirectory, "wwwroot", "mask-editor.css"), "text/css; charset=utf-8"));
-    app.UseDefaultFiles();
-    app.UseStaticFiles();
+    app.UseWebUiStaticFiles(baseDirectory);
 }
 else
 {

@@ -26,7 +26,6 @@
   "mask.action.remove": "移除选区",
   "mask.action.use": "使用选区",
   "mask.error.alreadyOpen": "已有一个图像选区打开。",
-  "mask.error.tooLarge": "选区编辑器支持最多 1600 万像素、每边不超过 8192 像素的图像。",
   "mask.error.maskSize": "已保存的选区与图像尺寸不符。",
   "mask.error.maskUnreadable": "无法打开已保存的选区。",
   "mask.error.imageUnreadable": "无法打开图像以创建选区。"

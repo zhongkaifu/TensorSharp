@@ -147,12 +147,6 @@ void reserve_scratch(tsg_matmul_cuda_state * state, size_t needed) {
     state->capacity = needed;
 }
 
-bool quant_strip_type(ggml_type type) {
-    return type == GGML_TYPE_Q2_K || type == GGML_TYPE_Q3_K || type == GGML_TYPE_Q4_K ||
-           type == GGML_TYPE_Q6_K || type == GGML_TYPE_IQ3_S || type == GGML_TYPE_IQ4_XS ||
-           type == GGML_TYPE_IQ4_NL || type == GGML_TYPE_Q8_0;
-}
-
 void compute_quant_strip(tsg_matmul_cuda_state * state, ggml_tensor * dst) {
     ggml_custom_op_params params;
     std::memcpy(&params, dst->op_params, sizeof(params));
@@ -168,8 +162,11 @@ void compute_quant_strip(tsg_matmul_cuda_state * state, ggml_tensor * dst) {
     const size_t output_offset = align(size_t(selected_rows) * sizeof(int32_t));
     const size_t bounds_offset = output_offset * 2;
     const size_t quant_offset = bounds_offset + align(size_t(w->ne[2] + 1) * sizeof(int32_t));
+    // MMQ loads a complete J tile even when the final sorted expert slice
+    // has fewer columns. Reserve upstream's tail padding outside the fixup
+    // scratch so these loads neither overrun nor race with partial writes.
     const size_t quant_bytes = size_t(selected_rows) * padded * sizeof(block_q8_1_mmq) / QK8_1_MMQ
-        + ggml_cuda_mmq_get_J_max(w->type, false, cc, 1) * sizeof(block_q8_1_mmq);
+        + ggml_cuda_mmq_get_J_max(w->type, false, cc, tokens) * sizeof(block_q8_1_mmq);
     const size_t partial_offset = quant_offset + align(quant_bytes);
     quant_strip_args a{static_cast<const char *>(w->data), nullptr, nullptr, nullptr,
         static_cast<float *>(dst->data), nullptr, desc->i0, desc->i1, int(w->ne[1]),
@@ -210,7 +207,13 @@ void compute_quant_strip(tsg_matmul_cuda_state * state, ggml_tensor * dst) {
         TSG_STRIP_TYPE(GGML_TYPE_Q2_K)
         TSG_STRIP_TYPE(GGML_TYPE_Q3_K)
         TSG_STRIP_TYPE(GGML_TYPE_Q4_K)
+        TSG_STRIP_TYPE(GGML_TYPE_Q5_K)
         TSG_STRIP_TYPE(GGML_TYPE_Q6_K)
+        TSG_STRIP_TYPE(GGML_TYPE_IQ1_S)
+        TSG_STRIP_TYPE(GGML_TYPE_IQ2_XXS)
+        TSG_STRIP_TYPE(GGML_TYPE_IQ2_XS)
+        TSG_STRIP_TYPE(GGML_TYPE_IQ2_S)
+        TSG_STRIP_TYPE(GGML_TYPE_IQ3_XXS)
         TSG_STRIP_TYPE(GGML_TYPE_IQ3_S)
         TSG_STRIP_TYPE(GGML_TYPE_IQ4_XS)
         TSG_STRIP_TYPE(GGML_TYPE_IQ4_NL)
@@ -223,7 +226,7 @@ void compute_quant_strip(tsg_matmul_cuda_state * state, ggml_tensor * dst) {
 
 bool tsg_matmul_id_quant_strip_supported(ggml_backend_t backend, const ggml_tensor * w,
         int64_t tokens, int64_t full_rows, int64_t first_row) {
-    if (!ggml_backend_is_cuda(backend) || !quant_strip_type(w->type) ||
+    if (!ggml_backend_is_cuda(backend) || !tsg_matmul_id_quant_strip_type_supported(w->type) ||
         !ggml_is_contiguous(w) || tokens <= 0 || tokens > INT_MAX || w->ne[0] > INT_MAX ||
         full_rows <= 0 || full_rows > INT_MAX || first_row < 0 || first_row + w->ne[1] > full_rows ||
         w->ne[2] > INT_MAX / tokens || w->ne[0] > INT_MAX - MATRIX_ROW_PADDING ||
@@ -272,7 +275,7 @@ void tsg_matmul_cuda_compute(tsg_matmul_cuda_state * state, ggml_tensor * dst) {
     const auto * b = dst->src[1];
     GGML_ASSERT(ggml_is_contiguous(dst));
     CUDA_CHECK(cudaSetDevice(state->device));
-    if (quant_strip_type(a->type)) {
+    if (tsg_matmul_id_quant_strip_type_supported(a->type)) {
         compute_quant_strip(state, dst);
         return;
     }

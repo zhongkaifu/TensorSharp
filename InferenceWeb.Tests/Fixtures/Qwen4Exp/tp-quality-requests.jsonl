@@ -1,0 +1,5 @@
+{"id":"arithmetic","messages":[{"role":"user","content":"What is 37 times 19? Reply only with the integer."}],"temperature":0,"max_tokens":128}
+{"id":"extraction","messages":[{"role":"user","content":"Extract the email address from this text. Reply only with the address: Meeting moved to Tuesday; contact maya.chen@example.org for details."}],"temperature":0,"max_tokens":128}
+{"id":"python","messages":[{"role":"user","content":"Write a Python function named squares(n) that returns a list of the squares of integers 1 through n inclusive. Give only the Python code."}],"temperature":0,"max_tokens":256}
+{"id":"squares","messages":[{"role":"user","content":"List the squares of the integers 1 through 20 in order. Reply only with the comma-separated integers."}],"temperature":0,"max_tokens":256}
+{"id":"thinking","messages":[{"role":"user","content":"A store discounts an $80 jacket by 25%, then applies 10% sales tax. What is the final price? State it clearly."}],"temperature":0,"enable_thinking":true,"max_tokens":512}

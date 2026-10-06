@@ -15,6 +15,31 @@ extern "C" ggml_tensor * tsg_matmul_id_f32(ggml_context *, ggml_tensor *, ggml_t
 extern "C" void tsg_matmul_require_f32(ggml_context *, ggml_tensor *);
 
 struct tsg_dsv4_fused_desc;
+// Keep construction and device qualification on the same quantization set.
+// Every type here has upstream MMQ tile arithmetic; the owned strip changes
+// row ownership only and consumes the checkpoint's original quantized bytes.
+// IQ1_M has MMVQ support but no MMQ tiles and is deliberately absent.
+constexpr bool tsg_matmul_id_quant_strip_type_supported(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q2_K:
+        case GGML_TYPE_Q3_K:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+        case GGML_TYPE_IQ1_S:
+        case GGML_TYPE_IQ2_XXS:
+        case GGML_TYPE_IQ2_XS:
+        case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_IQ3_XXS:
+        case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_IQ4_XS:
+        case GGML_TYPE_IQ4_NL:
+        case GGML_TYPE_Q8_0:
+            return true;
+        default:
+            return false;
+    }
+}
 // The descriptor must outlive the graph. CUDA support is checked before
 // construction; the CPU callback provides a portable quantized fallback.
 ggml_tensor * tsg_matmul_id_quant_strip(ggml_context *, ggml_tensor *, ggml_tensor *,

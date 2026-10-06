@@ -3,8 +3,8 @@
 
 Uses a loopback fixture for uploads/SSE; no model inference is claimed. Checks
 native-size grayscale export, brush/erase/undo, touch coordinates, pan, per-photo
-selection reuse, transactional target changes and request wiring. Real model
-tests use qwen-image21-mask-bench.py.
+selection reuse, transactional target changes, large images and request wiring.
+Real model tests use qwen-image21-mask-bench.py.
 """
 import argparse
 from contextlib import contextmanager
@@ -17,7 +17,7 @@ from pathlib import Path
 import threading
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageOps
 from playwright.sync_api import expect, sync_playwright
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -83,8 +83,8 @@ def fixture():
                         preview_name = filename + '-preview.png'
                         uploads[preview_name] = preview.getvalue()
                         uploaded['previewUrl'] = '/uploads/' + preview_name
-                        if filename == 'oversize.heic':
-                            uploaded['editUnavailableReason'] = 'The selection editor supports images up to 16 megapixels and 8192 pixels per side.'
+                        if filename == 'unavailable.heic':
+                            uploaded['editUnavailableReason'] = 'A full-resolution image for area selection could not be prepared. Reattach this photo as PNG or JPEG.'
                         else:
                             edit_name = filename + '-edit.png'
                             uploads[edit_name] = uploads[filename]
@@ -415,7 +415,7 @@ def exercise_converted_photos(browser, url, uploads, requests, mobile, out):
 
     # Many photos must scroll within the composer, keeping input/Send reachable.
     files = [{'name': f'extra-{index}.png', 'mimeType': 'image/png', 'buffer': uploads['source.png']} for index in range(10)]
-    files.append({'name': 'oversize.heic', 'mimeType': 'image/heic', 'buffer': source.getvalue()})
+    files.append({'name': 'unavailable.heic', 'mimeType': 'image/heic', 'buffer': source.getvalue()})
     page.locator('#file-input').set_input_files(files)
     expect(page.locator('.image-edit-attachment')).to_have_count(12)
     strip = page.locator('#attachments')
@@ -425,8 +425,8 @@ def exercise_converted_photos(browser, url, uploads, requests, mobile, out):
     for control in [page.locator('#message-input'), page.locator('#btn-send')]:
         box = control.bounding_box()
         assert box['y'] >= 0 and box['y'] + box['height'] <= page.viewport_size['height'], box
-    page.locator('.image-edit-attachment[data-file="oversize.heic"] .image-selection-button').click()
-    assert alerts and '8192' in alerts[-1]
+    page.locator('.image-edit-attachment[data-file="unavailable.heic"] .image-selection-button').click()
+    assert alerts and 'could not be prepared' in alerts[-1]
     expect(dialog).not_to_be_visible()
     assert page.locator('.image-edit-attachment').first.get_attribute('data-file') == 'camera.heic'
     page.screenshot(path=str(out / (name + '-many-photos.png')))
@@ -461,29 +461,203 @@ def exercise_converted_photos(browser, url, uploads, requests, mobile, out):
     context.close()
     return {'surface': name, 'status': 'passed', 'native_dimensions': [1200, 800],
             'checks': ['full-resolution edit source differs from thumbnail', 'original target path on wire',
-                       'full-resolution compare and selection reopen', 'oversize conversion refusal',
+                       'full-resolution compare and selection reopen', 'unavailable conversion refusal',
                        '12-photo composer scrolling and reachable Send/input', 'late upload after removal',
                        'late upload after New Chat'],
             'limitations': 'Converted URL routing fixture; HEIC codec tested separately in managed/live validation.'}
+
+
+def exercise_large_photos(browser, url, uploads, requests, mobile, out, source_file=None):
+    name = 'mobile-large' if mobile else 'desktop-large'
+    results = []
+    # Cross each former limit independently, including both side orientations.
+    # HEIC here is only a converted-source routing fixture, not a codec test.
+    cases = [('large-area.png', (6000, 4000)), ('wide.png', (9000, 1000)), ('tall.heic', (1000, 9000))]
+    source_bytes = None
+    mime_type = 'image/png'
+    if source_file is not None:
+        source_bytes = source_file.read_bytes()
+        with Image.open(io.BytesIO(source_bytes)) as source:
+            cases = [(source_file.name, ImageOps.exif_transpose(source).size)]
+            mime_type = Image.MIME.get(source.format, 'application/octet-stream')
+    for filename, (width, height) in cases:
+        context = browser.new_context(viewport={'width': 390 if mobile else 1280, 'height': 844 if mobile else 900},
+                                      is_mobile=mobile, has_touch=mobile)
+        page = context.new_page()
+        errors, alerts = [], []
+        page.on('pageerror', lambda error: errors.append(str(error)))
+        page.on('dialog', lambda dialog: (alerts.append(dialog.message), dialog.accept()))
+        page.goto(url)
+        if source_bytes is None:
+            source = io.BytesIO()
+            Image.new('RGB', (width, height), (90, 130, 180)).save(source, format='PNG')
+            image_bytes = source.getvalue()
+        else:
+            image_bytes = source_bytes
+        page.locator('#file-input').set_input_files({'name': filename,
+            'mimeType': 'image/heic' if filename.endswith('.heic') else mime_type, 'buffer': image_bytes})
+        photo = page.locator(f'.image-edit-attachment[data-file="{filename}"]')
+        photo.get_by_role('button', name='Select area', exact=True).click()
+        dialog = page.get_by_role('dialog', name='Select image area to edit')
+        canvas = dialog.locator('canvas.ts-mask-canvas')
+
+        def ready():
+            expect(dialog.get_by_role('button', name='Use selection')).to_be_enabled()
+            expect(canvas).to_have_attribute('width', str(width))
+            expect(canvas).to_have_attribute('height', str(height))
+
+        def save():
+            with page.expect_response(lambda response: response.url.endswith('/api/upload')) as response:
+                dialog.get_by_role('button', name='Use selection').click()
+            assert response.value.ok
+            expect(dialog).not_to_be_visible()
+            page.wait_for_function('pendingUploadCount === 0')
+            return response.value.json()['file']
+
+        ready()
+        stroke(page, canvas, (.25, .5), (.75, .5), mobile)
+        painted = canvas.evaluate('(canvas) => canvas.toDataURL()')
+        dialog.get_by_role('button', name='Erase', exact=True).click()
+        stroke(page, canvas, (.5, .48), (.5, .52), mobile)
+        erased = canvas.evaluate('(canvas) => canvas.toDataURL()')
+        assert erased != painted
+        dialog.get_by_role('button', name='Undo', exact=True).click()
+        assert canvas.evaluate('(canvas) => canvas.toDataURL()') == painted
+        dialog.get_by_role('button', name='Redo', exact=True).click()
+        assert canvas.evaluate('(canvas) => canvas.toDataURL()') == erased
+        dialog.get_by_role('button', name='Undo', exact=True).click()
+        # Do not retain screenshots of user-supplied photos in validation evidence.
+        if source_file is None:
+            page.screenshot(path=str(out / (name + '-' + filename + '.png')))
+        mask_path = save()
+        with Image.open(io.BytesIO(uploads[mask_path])) as mask:
+            assert mask.size == (width, height), mask.size
+            assert mask.convert('RGBA').getpixel((width // 2, height // 2)) == (255, 255, 255, 255)
+            assert mask.convert('RGBA').getpixel((20, 20)) == (0, 0, 0, 255)
+
+        # Reopen the native-size mask and export its inversion at the same size.
+        photo.get_by_role('button', name='Edit selection', exact=True).click()
+        ready()
+        dialog.get_by_role('button', name='Invert', exact=True).click()
+        inverted_path = save()
+        with Image.open(io.BytesIO(uploads[inverted_path])) as mask:
+            assert mask.size == (width, height), mask.size
+            assert mask.convert('RGBA').getpixel((width // 2, height // 2)) == (0, 0, 0, 255)
+            assert mask.convert('RGBA').getpixel((20, 20)) == (255, 255, 255, 255)
+        page.locator('#message-input').fill('Edit the large image selection.')
+        page.locator('#btn-send').click()
+        expect(page.get_by_role('button', name='Edit again', exact=True)).to_be_visible()
+        assert requests[-1]['imagePaths'] == [filename] and requests[-1]['maskPath'] == inverted_path
+        assert not errors, errors
+        assert not alerts, alerts
+        results.append({'file': filename, 'native_dimensions': [width, height], 'status': 'passed'})
+        context.close()
+    return {'surface': name, 'status': 'passed', 'images': results,
+            'input': 'touch' if mobile else 'mouse',
+            'checks': (['above former megapixel limit', 'above former width/height limits'] if source_file is None else ['supplied photo']) +
+                      ['paint/erase', 'pixel-identical undo/redo', 'native-size grayscale export',
+                       'native-size reopen/invert', 'original reference and mask request wiring'],
+            'limitations': ('HEIC converted-source routing fixture; no real HEIC codec or model inference.' if source_file is None
+                            else 'Supplied photo decoded by browser; upload and inference routes are fixture responses.')}
+
+
+def exercise_canvas_failures(browser, url, uploads):
+    context = browser.new_context(viewport={'width': 1280, 'height': 900})
+    page = context.new_page()
+    errors, alerts = [], []
+    page.on('pageerror', lambda error: errors.append(str(error)))
+    page.on('dialog', lambda dialog: (alerts.append(dialog.message), dialog.accept()))
+    page.add_init_script('''
+      window.maskFailure = null;
+      const read = CanvasRenderingContext2D.prototype.getImageData;
+      CanvasRenderingContext2D.prototype.getImageData = function (...args) {
+        if (window.maskFailure === 'read' && this.canvas.classList.contains('ts-mask-canvas'))
+          throw new Error('Simulated canvas backing store failure');
+        if (window.maskFailure === 'maskRead' && !this.canvas.classList.contains('ts-mask-canvas') && args[2] > 1)
+          throw new Error('Simulated saved mask readback failure');
+        return read.apply(this, args);
+      };
+      const blob = HTMLCanvasElement.prototype.toBlob;
+      HTMLCanvasElement.prototype.toBlob = function (callback, ...args) {
+        if (window.maskFailure === 'export') throw new Error('Simulated PNG export failure');
+        if (window.maskFailure === 'emptyExport') { callback(null); return; }
+        return blob.call(this, callback, ...args);
+      };
+    ''')
+    page.goto(url)
+    page.locator('#file-input').set_input_files({'name': 'source.png', 'mimeType': 'image/png', 'buffer': uploads['source.png']})
+    dialog = page.get_by_role('dialog', name='Select image area to edit')
+    page.evaluate("window.maskFailure = 'read'")
+    page.get_by_role('button', name='Select area', exact=True).click()
+    expect(dialog).not_to_be_visible()
+    assert alerts == ['Selection error: The image could not be opened for selection.'], alerts
+    page.evaluate('window.maskFailure = null')
+    page.get_by_role('button', name='Select area', exact=True).click()
+    expect(dialog.get_by_role('button', name='Use selection')).to_be_enabled()
+    stroke(page, dialog.locator('canvas.ts-mask-canvas'), (.25, .5), (.75, .5), False)
+    for failure in ('read', 'export', 'emptyExport'):
+        page.evaluate('(failure) => window.maskFailure = failure', failure)
+        dialog.get_by_role('button', name='Use selection').click()
+        expect(dialog.get_by_role('status')).to_contain_text('Could not save the selection')
+        expect(dialog.get_by_role('button', name='Use selection')).to_be_enabled()
+        expect(dialog.get_by_role('button', name='Cancel', exact=True)).to_be_enabled()
+    page.evaluate('window.maskFailure = null')
+    with page.expect_response(lambda response: response.url.endswith('/api/upload')) as response:
+        dialog.get_by_role('button', name='Use selection').click()
+    assert response.value.ok
+    mask_path = response.value.json()['file']
+    expect(dialog).not_to_be_visible()
+    expect(page.get_by_role('button', name='Edit selection', exact=True)).to_be_visible()
+    page.evaluate("window.maskFailure = 'maskRead'")
+    page.get_by_role('button', name='Edit selection', exact=True).click()
+    expect(dialog).not_to_be_visible()
+    assert alerts[-1] == 'Selection error: The saved selection could not be opened.', alerts
+    page.evaluate('window.maskFailure = null')
+    page.get_by_role('button', name='Edit selection', exact=True).click()
+    expect(dialog.get_by_role('button', name='Use selection')).to_be_enabled()
+    page.evaluate("window.maskFailure = 'read'")
+    dialog.get_by_role('button', name='Invert', exact=True).click()
+    expect(dialog).not_to_be_visible()
+    assert alerts[-1] == 'Selection error: The image could not be opened for selection.', alerts
+    assert page.evaluate('pendingAttachments[0].maskPath') == mask_path
+    page.evaluate('window.maskFailure = null')
+    page.get_by_role('button', name='Edit selection', exact=True).click()
+    expect(dialog.get_by_role('button', name='Use selection')).to_be_enabled()
+    dialog.get_by_role('button', name='Cancel', exact=True).click()
+    assert not errors, errors
+    context.close()
+    return {'surface': 'desktop-resource-failures', 'status': 'passed',
+            'checks': ['canvas allocation refusal closes editor', 'subsequent open succeeds',
+                       'readback/export/null-blob failures restore controls', 'retry saves original selection',
+                       'saved mask and invert failures preserve attachment selection and allow reopening'],
+            'limitations': 'Injected canvas API failures; not an out-of-memory stress benchmark.'}
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--browser', default='C:/Program Files/Google/Chrome/Application/chrome.exe')
     parser.add_argument('--out', type=Path, default=ROOT / 'docs/validation/qwen-image21-mask/browser')
+    parser.add_argument('--source-file', type=Path,
+                        help='Check this photo on desktop and touch emulation instead of synthetic suites; no photo screenshots are saved.')
     args = parser.parse_args()
     args.out.mkdir(parents=True, exist_ok=True)
     results = []
     with fixture() as (url, uploads, requests), sync_playwright() as playwright:
         browser = playwright.chromium.launch(executable_path=args.browser, headless=True)
+        browser_version = browser.version
         try:
             for mobile in (False, True):
-                results.append(exercise(browser, url, uploads, requests, mobile, args.out))
-                results.append(exercise_multiple_photos(browser, url, uploads, requests, mobile, args.out))
-                results.append(exercise_converted_photos(browser, url, uploads, requests, mobile, args.out))
+                if args.source_file is None:
+                    results.append(exercise(browser, url, uploads, requests, mobile, args.out))
+                    results.append(exercise_multiple_photos(browser, url, uploads, requests, mobile, args.out))
+                    results.append(exercise_converted_photos(browser, url, uploads, requests, mobile, args.out))
+                results.append(exercise_large_photos(browser, url, uploads, requests, mobile, args.out, args.source_file))
+            if args.source_file is None:
+                results.append(exercise_canvas_failures(browser, url, uploads))
         finally:
             browser.close()
-    report = {'runs': results, 'limitations': 'Loopback fixture with mocked inference; mobile is Chromium touch emulation, not MAUI/iOS/Android device validation.'}
+    report = {'browser': {'engine': 'Chromium', 'version': browser_version}, 'runs': results,
+              'limitations': 'Loopback fixture with mocked inference; mobile is Chromium touch emulation, not MAUI/iOS/Android device validation.'}
     (args.out / 'report.json').write_text(json.dumps(report, indent=2), encoding='utf8')
     print(json.dumps(report, indent=2))
 

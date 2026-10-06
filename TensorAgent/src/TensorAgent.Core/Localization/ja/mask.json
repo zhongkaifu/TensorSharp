@@ -26,7 +26,6 @@
   "mask.action.remove": "選択範囲を削除",
   "mask.action.use": "選択範囲を使う",
   "mask.error.alreadyOpen": "画像の選択画面はすでに開いています。",
-  "mask.error.tooLarge": "選択範囲エディターで扱える画像は、最大 1,600 万画素、各辺 8,192 ピクセルまでです。",
   "mask.error.maskSize": "保存された選択範囲と画像のサイズが一致しません。",
   "mask.error.maskUnreadable": "保存された選択範囲を開けませんでした。",
   "mask.error.imageUnreadable": "選択範囲を指定するために画像を開けませんでした。"

@@ -2,10 +2,10 @@
 // Licensed under the BSD-3-Clause license in the repository root.
 #include "ggml_ops_matmul_precision.h"
 #include "ggml_ops_precision_policy.h"
+#include "ggml_ops_dsv4_fused.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #ifdef TSG_GGML_USE_CUDA
-#include "ggml_ops_dsv4_fused.h"
 #include "ggml-cuda.h"
 #else
 #include "ggml-cpu.h"
@@ -19,9 +19,246 @@
 #include <cstdlib>
 #include <cstring>
 #include <random>
+#include <string>
 #include <vector>
 
 #include "precision_test_utils.h"
+
+// Quantize the source once, then retain complete source rows for each shard.
+// Tile-specific data catches a wrong global row offset; expert-specific data
+// catches a wrong indexed weight stride. Repeating sixteen distinct rows per
+// tile keeps the IQ quantizer setup small without making different tiles equal.
+struct quantized_fixture
+{
+    ggml_type type;
+    int inner, rows, experts;
+    size_t row_bytes;
+    std::vector<unsigned char> gate, up;
+
+    quantized_fixture(ggml_type kind, int width, int height, int count)
+        : type(kind), inner(width), rows(height), experts(count), row_bytes(ggml_row_size(kind, width))
+    {
+        ggml_quantize_init(type);
+        std::vector<float> importance(inner, 1.0f);
+        auto generate = [&](std::vector<unsigned char> & packed, uint32_t seed)
+        {
+            packed.resize(row_bytes * rows * experts);
+            std::mt19937 random(seed);
+            std::normal_distribution<float> normal(0.0f, 1.0f / std::sqrt(float(inner)));
+            std::vector<float> values(size_t(inner) * 16);
+            std::vector<unsigned char> tile(row_bytes * 16);
+            for (int expert = 0; expert < experts; ++expert)
+            for (int first = 0; first < rows; first += 128)
+            {
+                for (float & value : values) value = normal(random);
+                require(ggml_quantize_chunk(type, values.data(), tile.data(), 0, 16, inner,
+                    ggml_quantize_requires_imatrix(type) ? importance.data() : nullptr) == tile.size(),
+                    "Cannot quantize original FFN fixture");
+                for (int row = first; row < std::min(first + 128, rows); ++row)
+                    std::memcpy(packed.data() + (size_t(expert) * rows + row) * row_bytes,
+                        tile.data() + ((row - first) % 16) * row_bytes, row_bytes);
+            }
+        };
+        generate(gate, 73918); generate(up, 94713);
+    }
+
+    std::vector<unsigned char> slice(const std::vector<unsigned char> & source, int first, int count) const
+    {
+        std::vector<unsigned char> result(row_bytes * count * experts);
+        for (int expert = 0; expert < experts; ++expert)
+            std::memcpy(result.data() + size_t(expert) * count * row_bytes,
+                source.data() + (size_t(expert) * rows + first) * row_bytes, size_t(count) * row_bytes);
+        return result;
+    }
+};
+
+static void check_quantized_strip(ggml_backend_t allocator, ggml_backend_t backend,
+    const quantized_fixture & data, int tokens, bool down)
+{
+    const int used = std::min(4, data.experts), slots = down ? used : 1;
+    auto * ctx = ggml_init({4 * 1024 * 1024, nullptr, true});
+    require(ctx != nullptr, "Cannot create quantized FFN context");
+    auto * gate = ggml_new_tensor_3d(ctx, data.type, data.inner, data.rows, data.experts);
+    auto * up = ggml_new_tensor_3d(ctx, data.type, data.inner, data.rows, data.experts);
+    auto * input = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, data.inner, slots, tokens);
+    auto * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, used, tokens);
+    auto * plain_gate = ggml_mul_mat_id(ctx, gate, input, ids);
+    auto * plain_up = ggml_mul_mat_id(ctx, up, input, ids);
+    auto * graph = ggml_new_graph(ctx);
+    ggml_build_forward_expand(graph, plain_gate); ggml_build_forward_expand(graph, plain_up);
+    struct shard
+    {
+        int first, count;
+        ggml_tensor * gate, * up, * gate_output, * up_output, * pair = nullptr;
+        std::vector<unsigned char> gate_bytes, up_bytes;
+        tsg_dsv4_fused_desc gate_desc, up_desc, pair_desc;
+        bool owned = false;
+    };
+    std::array<shard, 2> shards;
+    for (int rank = 0; rank < 2; ++rank)
+    {
+        auto & s = shards[rank];
+        // 640-wide gate/up slices retain overlapping MMQ tiles around the
+        // logical 320-row boundary, exactly as Qwen4Exp's loader does.
+        s.first = down ? rank * data.rows / 2 : rank * 256;
+        s.count = down ? data.rows / 2 : 384;
+        s.gate = ggml_new_tensor_3d(ctx, data.type, data.inner, s.count, data.experts);
+        s.up = ggml_new_tensor_3d(ctx, data.type, data.inner, s.count, data.experts);
+        s.gate_bytes = data.slice(data.gate, s.first, s.count);
+        s.up_bytes = data.slice(data.up, s.first, s.count);
+#ifdef TSG_GGML_USE_CUDA
+        s.owned = tsg_matmul_id_quant_strip_supported(allocator, s.gate, tokens, data.rows, s.first);
+        require(tokens != 129 || s.owned, "Prefill fixture did not engage the owned CUDA strip kernel");
+#else
+        s.owned = true;
+#endif
+        if (s.owned)
+        {
+            s.gate_desc.kind = s.up_desc.kind = TSG_MATMUL_ID_QUANT_STRIP;
+            s.gate_desc.i0 = s.up_desc.i0 = data.rows;
+            s.gate_desc.i1 = s.up_desc.i1 = s.first;
+            s.gate_output = tsg_matmul_id_quant_strip(ctx, s.gate, input, ids, &s.gate_desc);
+            s.up_output = tsg_matmul_id_quant_strip(ctx, s.up, input, ids, &s.up_desc);
+            if (!down)
+            {
+                s.pair_desc.kind = TSG_MATMUL_ID_QUANT_PAIR;
+                s.pair_desc.i0 = data.rows; s.pair_desc.i1 = s.first;
+                s.pair = tsg_matmul_id_quant_pair(ctx, s.gate, s.up, input, ids, &s.pair_desc);
+            }
+        }
+        else
+        {
+            s.gate_output = ggml_mul_mat_id(ctx, s.gate, input, ids);
+            s.up_output = ggml_mul_mat_id(ctx, s.up, input, ids);
+        }
+        ggml_build_forward_expand(graph, s.gate_output); ggml_build_forward_expand(graph, s.up_output);
+        if (s.pair) ggml_build_forward_expand(graph, s.pair);
+    }
+    auto * buffer = ggml_backend_alloc_ctx_tensors(ctx, allocator);
+    require(buffer != nullptr, "Cannot allocate quantized FFN graph");
+    ggml_backend_tensor_set(gate, data.gate.data(), 0, data.gate.size());
+    ggml_backend_tensor_set(up, data.up.data(), 0, data.up.size());
+    for (const auto & s : shards)
+    {
+        ggml_backend_tensor_set(s.gate, s.gate_bytes.data(), 0, s.gate_bytes.size());
+        ggml_backend_tensor_set(s.up, s.up_bytes.data(), 0, s.up_bytes.size());
+    }
+    std::mt19937 random(38910);
+    std::normal_distribution<float> normal(0.0f, 0.4f);
+    std::vector<float> activations(ggml_nelements(input));
+    std::vector<int32_t> selected(used * tokens);
+    auto get = [](ggml_tensor * tensor)
+    {
+        std::vector<float> result(ggml_nelements(tensor));
+        ggml_backend_tensor_get(tensor, result.data(), 0, result.size() * sizeof(float));
+        for (float value : result) require(std::isfinite(value), "Nonfinite quantized FFN projection");
+        return result;
+    };
+    for (int reuse = 0; reuse < 2; ++reuse)
+    {
+        for (float & value : activations) value = normal(random);
+        for (int token = 0; token < tokens; ++token)
+        for (int slot = 0; slot < used; ++slot)
+            selected[token * used + slot] = (3 * token + 2 * slot + reuse) % data.experts;
+        ggml_backend_tensor_set(input, activations.data(), 0, activations.size() * sizeof(float));
+        ggml_backend_tensor_set(ids, selected.data(), 0, selected.size() * sizeof(int32_t));
+        require(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS, "Quantized FFN graph compute failed");
+        const auto expected_gate = get(plain_gate), expected_up = get(plain_up);
+        size_t compared = 0;
+        for (const auto & s : shards)
+        {
+            const auto actual_gate = get(s.gate_output), actual_up = get(s.up_output);
+            for (int column = 0; column < tokens * used; ++column)
+            {
+                const size_t full = size_t(column) * data.rows + s.first, part = size_t(column) * s.count;
+                require(std::memcmp(actual_gate.data() + part, expected_gate.data() + full, s.count * sizeof(float)) == 0,
+                    "Quantized gate/down row slice differs from untouched upstream projection");
+                require(std::memcmp(actual_up.data() + part, expected_up.data() + full, s.count * sizeof(float)) == 0,
+                    "Quantized up/down row slice differs from untouched upstream projection");
+                compared += 2 * s.count;
+            }
+            if (s.pair)
+            {
+                const auto paired = get(s.pair);
+                require(std::memcmp(paired.data(), actual_gate.data(), actual_gate.size() * sizeof(float)) == 0,
+                    "Paired quantized gate differs from independent gate strip");
+                require(std::memcmp(paired.data() + actual_gate.size(), actual_up.data(), actual_up.size() * sizeof(float)) == 0,
+                    "Paired quantized up differs from independent up strip");
+            }
+        }
+        // Independent CPU dequantization + FP64 products expose arithmetic
+        // error without reproducing the CUDA row/expert address calculation.
+        // Backend activation quantization is intentionally reported separately
+        // from the exact upstream-versus-shard acceptance check above.
+        std::vector<float> decoded(data.inner);
+        double max_abs = 0, squared_error = 0, squared_reference = 0;
+        size_t samples = 0;
+        for (int token : {0, tokens - 1}) for (int slot = 0; slot < used; ++slot)
+        for (int row : {0, 255, data.rows / 2, data.rows - 1})
+        {
+            const int expert = selected[token * used + slot];
+            const float * x = activations.data() + (size_t(token) * slots + (down ? slot : 0)) * data.inner;
+            for (int matrix = 0; matrix < 2; ++matrix)
+            {
+                const auto & packed = matrix ? data.up : data.gate;
+                const auto & expected = matrix ? expected_up : expected_gate;
+                ggml_get_type_traits(data.type)->to_float(packed.data() + (size_t(expert) * data.rows + row) * data.row_bytes,
+                    decoded.data(), data.inner);
+                double reference = 0;
+                for (int k = 0; k < data.inner; ++k) reference += double(decoded[k]) * x[k];
+                const double actual = expected[(size_t(token) * used + slot) * data.rows + row];
+                require(std::isfinite(reference), "Nonfinite independent FP64 quantized projection");
+                const double error = actual - reference;
+                max_abs = std::max(max_abs, std::abs(error));
+                squared_error += error * error; squared_reference += reference * reference; ++samples;
+            }
+        }
+        std::printf("%s QUANT_FFN role=%s weights=%s inner=%d rows=%d tokens=%d used=%d reuse=%d owned=%d bit_identical_values=%zu f64_samples=%zu f64_max_abs=%.8g f64_rel_l2=%.8g\n",
+            ggml_backend_name(backend), down ? "down" : "gate/up/pair", ggml_type_name(data.type),
+            data.inner, data.rows, tokens, used, reuse, shards[0].owned, compared, samples, max_abs,
+            std::sqrt(squared_error / std::max(1e-30, squared_reference)));
+    }
+    auto unchanged = [](ggml_tensor * tensor, const std::vector<unsigned char> & expected)
+    {
+        std::vector<unsigned char> actual(expected.size());
+        ggml_backend_tensor_get(tensor, actual.data(), 0, actual.size());
+        require(actual == expected, "Quantized FFN execution changed original weight bytes");
+    };
+    unchanged(gate, data.gate); unchanged(up, data.up);
+    for (const auto & s : shards) { unchanged(s.gate, s.gate_bytes); unchanged(s.up, s.up_bytes); }
+    ggml_backend_buffer_free(buffer); ggml_free(ctx);
+}
+
+static void run_quantized(ggml_backend_t allocator, ggml_backend_t backend, const std::string & only_type, int inner)
+{
+    const auto lowercase = [](std::string value) {
+        for (char & c : value) if (c >= 'A' && c <= 'Z') c = char(c + ('a' - 'A'));
+        return value;
+    };
+    bool selected = false;
+    for (ggml_type type : {GGML_TYPE_Q2_K, GGML_TYPE_Q3_K, GGML_TYPE_Q4_K, GGML_TYPE_Q5_K,
+        GGML_TYPE_Q6_K, GGML_TYPE_Q8_0, GGML_TYPE_IQ1_S, GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ2_XS,
+        GGML_TYPE_IQ2_S, GGML_TYPE_IQ3_XXS, GGML_TYPE_IQ3_S, GGML_TYPE_IQ4_NL, GGML_TYPE_IQ4_XS})
+    {
+        if (!only_type.empty() && lowercase(only_type) != lowercase(ggml_type_name(type))) continue;
+        selected = true;
+        quantized_fixture gate_up(type, inner, 640, 8);
+        quantized_fixture down(type, type == GGML_TYPE_Q8_0 || type == GGML_TYPE_IQ4_NL ? 640 : 768, 2560, 8);
+        for (int tokens : {1, 4, 8, 9, 17, 31, 129})
+        {
+            check_quantized_strip(allocator, backend, gate_up, tokens, false);
+            check_quantized_strip(allocator, backend, down, tokens, true);
+        }
+        if (type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K || type == GGML_TYPE_Q8_0)
+        {
+            // Shared FFNs are one-expert graphs. Incomplete J tiles at9/129
+            // columns exercise the MMQ input padding before partial scratch.
+            quantized_fixture shared(type, inner, 640, 1);
+            for (int tokens : {9, 17, 129}) check_quantized_strip(allocator, backend, shared, tokens, false);
+        }
+    }
+    require(selected, "Unknown --type (use the upstream ggml lowercase type name)");
+}
 
 enum class pattern { random, activation_residual, large_activation, weight_residual };
 
@@ -268,9 +505,22 @@ static void run(ggml_backend_t allocator, ggml_backend_t backend)
     }
 }
 
-int main()
+int main(int argc, char ** argv)
 {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
+    bool quantized = false;
+    std::string only_type;
+    int inner = 256;
+    for (int arg = 1; arg < argc; ++arg)
+    {
+        const std::string option(argv[arg]);
+        if (option == "--quant-strip-only") quantized = true;
+        else if (option == "--type" && arg + 1 < argc) only_type = argv[++arg];
+        else if (option == "--inner" && arg + 1 < argc) inner = std::atoi(argv[++arg]);
+        else require(false, "Usage: [--quant-strip-only [--type iq2_xs] [--inner 2560]]");
+    }
+    require(inner > 0 && inner % 256 == 0, "Quantized --inner must be a positive multiple of256");
+    require(quantized || (only_type.empty() && inner == 256), "--type/--inner require --quant-strip-only");
 #ifdef TSG_GGML_USE_CUDA
     const int devices = ggml_backend_cuda_get_device_count();
     if (devices == 0) return 77;
@@ -280,7 +530,8 @@ int main()
         require(cuda != nullptr, "Cannot initialize a visible CUDA device");
         auto * backend = tsg_dsv4_fused_backend_init(cuda);
         require(backend != nullptr, "Cannot initialize TensorSharp CUDA precision backend");
-        run(cuda, backend);
+        if (quantized) run_quantized(cuda, backend, only_type, inner);
+        else run(cuda, backend);
         ggml_backend_free(backend);
         ggml_backend_free(cuda);
     }
@@ -288,7 +539,8 @@ int main()
     auto * backend = ggml_backend_cpu_init();
     require(backend != nullptr, "Cannot initialize CPU precision backend");
     ggml_backend_cpu_set_n_threads(backend, 4);
-    run(backend, backend);
+    if (quantized) run_quantized(backend, backend, only_type, inner);
+    else run(backend, backend);
     ggml_backend_free(backend);
 #endif
     return 0;

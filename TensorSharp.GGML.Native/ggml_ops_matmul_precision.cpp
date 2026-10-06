@@ -151,10 +151,7 @@ extern "C" void tsg_matmul_require_f32(ggml_context * ctx, ggml_tensor * node) {
 ggml_tensor * tsg_matmul_id_quant_strip(ggml_context * ctx, ggml_tensor * a, ggml_tensor * b,
         ggml_tensor * ids, tsg_dsv4_fused_desc * desc) {
     GGML_ASSERT(desc && desc->kind == TSG_MATMUL_ID_QUANT_STRIP);
-    GGML_ASSERT(a && b && ids && (a->type == GGML_TYPE_Q2_K || a->type == GGML_TYPE_Q3_K ||
-                                a->type == GGML_TYPE_Q4_K || a->type == GGML_TYPE_Q6_K ||
-                                a->type == GGML_TYPE_IQ3_S || a->type == GGML_TYPE_IQ4_XS ||
-                                a->type == GGML_TYPE_IQ4_NL || a->type == GGML_TYPE_Q8_0));
+    GGML_ASSERT(a && b && ids && tsg_matmul_id_quant_strip_type_supported(a->type));
     GGML_ASSERT(b->type == GGML_TYPE_F32 && b->ne[0] == a->ne[0] &&
                 (b->ne[1] == 1 || b->ne[1] == ids->ne[0]));
     GGML_ASSERT(a->ne[3] == 1 && b->ne[3] == 1 && b->nb[0] == sizeof(float));
@@ -171,10 +168,7 @@ ggml_tensor * tsg_matmul_id_quant_pair(ggml_context * ctx, ggml_tensor * gate, g
     GGML_ASSERT(desc && desc->kind == TSG_MATMUL_ID_QUANT_PAIR);
     GGML_ASSERT(gate && up && input && ids);
     GGML_ASSERT(gate->type == up->type && ggml_are_same_shape(gate, up));
-    GGML_ASSERT(gate->type == GGML_TYPE_Q2_K || gate->type == GGML_TYPE_Q3_K ||
-                gate->type == GGML_TYPE_Q4_K || gate->type == GGML_TYPE_Q6_K ||
-                gate->type == GGML_TYPE_IQ3_S || gate->type == GGML_TYPE_IQ4_XS ||
-                gate->type == GGML_TYPE_IQ4_NL || gate->type == GGML_TYPE_Q8_0);
+    GGML_ASSERT(tsg_matmul_id_quant_strip_type_supported(gate->type));
     GGML_ASSERT(ggml_is_contiguous(gate) && ggml_is_contiguous(up));
     GGML_ASSERT(input->type == GGML_TYPE_F32 && input->ne[0] == gate->ne[0] && input->ne[1] == 1);
     GGML_ASSERT(gate->ne[3] == 1 && input->ne[3] == 1 && input->nb[0] == sizeof(float));

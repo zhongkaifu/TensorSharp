@@ -110,7 +110,12 @@ namespace TensorSharp.Models
         // complete 128-row tiles around a rank's logical slice, then crop their
         // outputs in the native graph. Neighboring ranks may share edge rows.
         internal static int Qwen4ExpMmqRowAlignment(int type, long rows)
-            => rows % 128 == 0 && type is 8 or 10 or 11 or 12 or 14 or 20 or 21 or 23 ? 128 : 1;
+            => rows % 128 == 0 && (GgmlTensorType)type is
+                GgmlTensorType.Q8_0 or GgmlTensorType.Q2_K or GgmlTensorType.Q3_K or
+                GgmlTensorType.Q4_K or GgmlTensorType.Q5_K or GgmlTensorType.Q6_K or
+                GgmlTensorType.IQ2_XXS or GgmlTensorType.IQ2_XS or GgmlTensorType.IQ3_XXS or
+                GgmlTensorType.IQ1_S or GgmlTensorType.IQ4_NL or GgmlTensorType.IQ3_S or
+                GgmlTensorType.IQ2_S or GgmlTensorType.IQ4_XS ? 128 : 1;
 
         internal static (long First, long Count) Qwen4ExpOutputRowRange(
             long rows, int rank, int degree, int alignment = 1)
@@ -156,7 +161,7 @@ namespace TensorSharp.Models
             long block = GgufFile.GetBlockSize((GgmlTensorType)source.GgmlType);
             long dimension = rowParallel ? source.PerExpertNe0 : source.PerExpertNe1;
             long alignment = rowParallel ? block * degree : degree;
-            if (block <= 0 || dimension % alignment != 0)
+            if (block <= 0 || source.PerExpertNe0 % block != 0 || dimension % alignment != 0)
                 throw new NotSupportedException($"Qwen4Exp expert dimension {dimension} cannot be divided across {degree} ranks with block size {block}.");
         }
 

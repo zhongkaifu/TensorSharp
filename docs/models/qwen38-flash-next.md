@@ -766,9 +766,10 @@ ported from ggml's dot products for decode, which still runs as a captured CUDA 
 the same two layouts decoded into its tensor-core and register-staged grouped kernels for
 prefill. Before the grouped kernels took them, its prefill of this file ran on the slowest
 fallback at about 500 tok/s. The engine has no host-expert seam, so `--n-cpu-moe` there
-prints a warning and keeps the experts on the GPU. `--tp N` refuses this quant with exit
-code 2, because `ggml_cuda`'s TP FFN path takes only the types listed under
-[Multi-GPU](#multi-gpu); use `--layer-split N`.
+prints a warning and keeps the experts on the GPU. The direct `cuda` engine uses
+`--layer-split N` for multiple GPUs and refuses `--tp N`. On `ggml_cuda`,
+UD-Q2_K_XL supports `--tp 2` with its original quantized weights; see
+[Multi-GPU](#multi-gpu) for the supported formats and device/layout requirements.
 
 Both A40s, warm, the same 1,818-token prompt and 256 greedy tokens. TensorSharp ran as
 `TensorSharp.Server.Host` with `--no-multi-agent --no-skills`, three requests per process,
@@ -813,18 +814,23 @@ For the checkpoint's 640 intermediate channels, TP2 stores 384 rows per rank
 for each logical 320-row slice; TP4 stores 256 for each logical 160-row slice.
 Unsupported degrees are refused from GGUF
 metadata before bulk weight loading. The current model path requires CUDA MMQ
-stream-K support and FFN weights in Q2_K, Q3_K, Q4_K, Q6_K, IQ3_S, IQ4_XS,
-IQ4_NL or Q8_0. Full output row counts must be multiples of 128, and down
-output slices must also be multiples of 128. Other FFN types, including
-F32/F16/BF16, and devices/layouts without exact strip kernels are refused;
-the physical device qualification uses NVIDIA A40 GPUs. The expert slices currently require host
+stream-K support and FFN weights in Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, IQ2_XXS,
+IQ2_XS, IQ2_S, IQ3_XXS, IQ1_S, IQ3_S, IQ4_XS, IQ4_NL or Q8_0. This includes
+UD-Q2_K_XL's IQ2_XS/IQ3_XXS routed gate/up weights, Q5_K/Q6_K shared weights,
+and IQ4_NL/Q8_0 down weights. Full output row counts must be multiples of 128,
+and down output slices must also be multiples of 128. IQ1_M remains refused
+because upstream ggml has no MMQ tile kernel for it. Other FFN types, including
+F32/F16/BF16, and devices/layouts without exact strip kernels are refused.
+The historical physical GPU validation below uses NVIDIA A40 GPUs and the
+formats identified for each run. The expert slices currently require host
 buffers totaling the routed-expert bytes plus these overlapping rows, in addition to the mapped checkpoint;
 these buffers remain alive while the model runs. Loading skips a full prefault
 of the sparse PLE table, whose rows are gathered on demand.
 
 `--layer-split N` remains a separate option: each GPU holds a contiguous run of
-whole layers. It is available on `ggml_cuda` and `ggml_vulkan`. Do not combine
-`--tp` and `--layer-split`; distributed `--tp-node-id`/`--tp-peers` groups are
+whole layers. It is available on `ggml_cuda`, `ggml_vulkan` and the direct `cuda`
+engine. Do not combine `--tp` and `--layer-split`; distributed
+`--tp-node-id`/`--tp-peers` groups are
 unsupported. Older layer-split commands should use `--layer-split N` or
 `TENSORSHARP_LAYER_SPLIT_DEGREE=N`.
 
@@ -844,6 +850,79 @@ Q8_0 shared weights, and widths 1 through 8, 17, 31 and 128; CUDA TP2 results ar
 bitwise identical with `--require-bitwise`. `eng/ForcedLogitProbe` compares full-model
 logits while forcing identical token histories, so an early greedy mismatch
 cannot hide the numerical error of subsequent decode steps.
+
+### UD-Q2_K_XL TP2 validation, 2026-10-05
+
+The supplied checkpoint runs with `--backend ggml_cuda --tp 2` on two NVIDIA
+A40 GPUs, retaining its original quantized bytes and upstream MMQ arithmetic.
+The deployed native SHA-256 is
+`a7d30f8ac0648372b8fd63881b9a2c915032b75ee2e51299265d61349d793301`;
+upstream ggml remains unchanged at
+`ffa4e8b80930029a35991f94e7c8a93cd67730ab`.
+This VM's behavioral CUDA peer-access probe fails, so NCCL uses shared-memory
+transport for the F32 FFN gathers.
+
+- All 39 managed TP tests passed, with no failures or skips.
+- Native strip checks passed 410 CPU comparisons and 820 CUDA comparisons
+  across all 14 supported formats, with 410 checks on each A40. CUDA gate/up
+  inputs have width 2560; token widths include 1, 4, 8, 9, 17, 31 and 129.
+  Of the CUDA checks, 524 use the owned MMQ strip path and 296 use the upstream
+  CUDA path selected for smaller shapes.
+- All 26 complete synthetic FFN comparisons were bit-identical at hidden
+  width 2560 / FFN width 640, with 16 experts and 10 selected experts. They
+  cover IQ2_XS/IQ4_NL routed gate/down with Q5_K/Q8_0 shared weights, and
+  IQ3_XXS/IQ4_NL with Q6_K/Q8_0, at widths 1 through 9, 17, 31, 128 and 129.
+- Five full-model forced-history cases, with 24 rows each, produced
+  29,798,400 F32 logits byte-identical to the original layer-split-2 binary.
+  Five greedy answer cases passed arithmetic, extraction, Python behavior,
+  ordered-square and thinking checks; their outputs also match the candidate
+  layer-split-2 outputs byte-for-byte.
+- The exact interactive options `--interactive --think --max-tokens 20000`
+  with this model and `--backend ggml_cuda --tp 2` completed two turns at EOS,
+  answering `703` then `720`, generating 163 and 76 tokens at 46.1 and 45.4
+  tokens/s. The second turn reused 232 of 256 prompt tokens.
+
+CUDA graph-enabled numerical checks passed. Targeted Q5_K memcheck with
+`GGML_CUDA_DISABLE_GRAPHS=1` reported zero errors. The graph-enabled sanitizer
+attempt reported handled CUDA graph-update API status 910 and is not counted
+as a clean sanitized capture run. The short interactive turns do not validate
+a full 20,000-token generation. Long context, vision, perplexity, TP4 and other
+devices were not evaluated in this campaign. Generated evidence stays in
+ignored `docs/validation/qwen38-q2-tp/`; reusable answer validation is
+`eng/validation/validate-qwen4exp-tp-answers.py`, with requests in
+`InferenceWeb.Tests/Fixtures/Qwen4Exp/tp-quality-requests.jsonl`.
+
+Four fresh CLI starts compared layer2, TP2, TP2, layer2 with F16 KV, context
+4096, two CPU threads and fixed-input pp512/tg128. Each start performed normal
+kernel warmup and four timed repetitions. Throughput cells show **first /
+median of repetitions 2–4 / range of all four**, in tokens/s; load excludes
+kernel warmup.
+
+| Mode / start | Load (s) | Warmup (s) | pp512: first / median / range | tg128: first / median / range |
+| --- | ---: | ---: | --- | --- |
+| layer2 / 1 | 20.49 | 138.68 | 942.0 / 998.6 / 942.0–1010.6 | 53.6 / 53.9 / 53.6–54.1 |
+| TP2 / 2 | 46.56 | 2.47 | 806.8 / 882.2 / 806.8–884.6 | 49.4 / 51.5 / 49.4–52.2 |
+| TP2 / 3 | 48.42 | 2.43 | 797.2 / 824.8 / 797.2–841.8 | 48.5 / 50.3 / 48.5–51.4 |
+| layer2 / 4 | 19.51 | 138.08 | 942.2 / 986.2 / 942.2–998.1 | 52.8 / 53.4 / 52.8–53.6 |
+
+Pooling the six later repetitions per mode gives TP2 **848.0 pp / 51.4 tg**
+versus layer2 **997.4 pp / 53.65 tg** tokens/s: TP2 is 15.0% slower for prefill
+and 4.2% slower for decode in this workload. Use `--layer-split 2` for the
+highest measured throughput here. TP2 performs additional overlapping edge-row
+work, replicates attention and uses two F32 gathers per FFN. These measurements
+do not isolate each cost. Weight uploads occur during different startup stages
+in the two modes, so compare load together with warmup when assessing startup.
+
+All four untimed greedy chains (prefill plus 128 decode tokens) were identical;
+runtime binary hashes and clean upstream identity stayed unchanged. Timings
+use a repeating 17-token input cycle that can favor hot PLE rows and expert
+locality. OS caches were not cleared and GPU clocks were not locked. Results
+exclude natural chat formatting, HTTP, scheduling and sampling, and do not
+establish real-text, long-context or cold-storage throughput. Complete logs,
+timings and identity snapshots are in the ignored
+`docs/validation/qwen38-q2-tp/benchmark-20261006T010554Z-21317/` directory.
+
+### Earlier UD-IQ4_XS validation
 
 On the UD-IQ4_XS checkpoint and NVIDIA A40, TP2 and TP4 each match the stabilized
 plain layer2 execution byte-for-byte over 120 full-vocabulary rows: three text
