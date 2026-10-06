@@ -26,8 +26,16 @@ class Handler(BaseHTTPRequestHandler):
     step_delay = .003
     finish_in_first_delta = False
     entire_answer_first_delta = False
+    get_count = 0
+    fail_get_after = None
 
     def do_GET(self):
+        Handler.get_count += 1
+        if self.fail_get_after is not None and Handler.get_count > self.fail_get_after:
+            self.send_response(503)
+            self.end_headers()
+            self.wfile.write(b'{"error":"unhealthy"}')
+            return
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
@@ -35,7 +43,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
-        prompt = body["messages"][0]["content"]
+        prompt = next(message["content"] for message in body["messages"] if message["role"] == "user")
         fixture = next((item for item in bench.FIXTURES.values() if item["prompt"] == prompt), None)
         answer = fixture["expected"] if fixture["kind"] == "exact" else FF7 if "最终幻想" in prompt else TIME
         self.send_response(200)
@@ -62,7 +70,7 @@ class Handler(BaseHTTPRequestHandler):
                             "prompt_tokens_details": {"cached_tokens": 0}}})
             if not self.omit_done:
                 send("[DONE]")
-        except (BrokenPipeError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             # An actual intentional client disconnect reaches this handler.
             pass
 
@@ -75,6 +83,8 @@ class Qwen4ExpConcurrentHttpTests(unittest.TestCase):
         Handler.omit_done = False
         Handler.finish_in_first_delta = False
         Handler.entire_answer_first_delta = False
+        Handler.get_count = 0
+        Handler.fail_get_after = None
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -132,6 +142,102 @@ class Qwen4ExpConcurrentHttpTests(unittest.TestCase):
             self.assertFalse(report["fused_decode_evidence"]["new_acceptance_observed"])
             self.assertIn("without [DONE]", report["groups"][0]["requests"][0]["error"])
             self.assertFalse(report["groups"][1]["serial_comparison"]["performance_qualified"])
+
+    def test_long_context_overlap_health_and_follow_up_gates(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "artifacts" / "long-context.json"
+            argv = ["--url", self.url, "--output", str(output), "--groups", "topics",
+                    "--modes", "parallel", "--concurrent-only", "--min-topic-total-tokens", "100",
+                    "--require-generation-overlap", "--check-server-health", "--follow-up"]
+            with patch.object(bench, "ROOT", root), patch("builtins.print"):
+                self.assertEqual(bench.main(argv), 0)
+                report = json.loads(output.read_text(encoding="utf-8"))
+                self.assertTrue(report["groups"][0]["metrics"]["client_generation_spans_overlap"])
+                self.assertEqual(bench.verify_report_integrity(report)["retained_groups"], 1)
+                unexercised = copy.deepcopy(report)
+                unexercised["configuration"]["min_topic_total_tokens"] = 10000
+                with self.assertRaisesRegex(ValueError, "unexercised long-context"):
+                    bench.verify_report_integrity(unexercised)
+                self.assertEqual(report["follow_up"]["answer"], "EXACT_GAMMA=81")
+                self.assertEqual([item["status"] for item in report["server_health_checks"]], ["passed", "passed"])
+                context = root / "system-context.txt"
+                context.write_text("A retained neutral context prefix.", encoding="utf-8")
+                self.assertEqual(bench.main(argv + ["--topic-system-prompt-file", str(context)]), 0)
+                contextual = json.loads(output.read_text(encoding="utf-8"))
+                self.assertEqual(contextual["coverage"]["topic_prompt_variant"], "contextual_system_prefix")
+                self.assertEqual(contextual["groups"][0]["requests"][0]["request"]["messages"], [
+                    {"role": "system", "content": context.read_text(encoding="utf-8")},
+                    {"role": "user", "content": bench.FIXTURES["ff7"]["prompt"]}])
+                self.assertEqual(len(contextual["follow_up"]["request"]["messages"]), 1)
+                self.assertEqual(bench.verify_report_integrity(contextual)["retained_groups"], 1)
+                self.assertEqual(bench.main(argv + ["--min-topic-total-tokens", "10000"]), 1)
+                failed = json.loads(output.read_text(encoding="utf-8"))
+                self.assertIn("coverage was not exercised", failed["groups"][0]["requests"][0]["error"])
+                Handler.entire_answer_first_delta = True
+                self.assertEqual(bench.main(argv), 1)
+                failed = json.loads(output.read_text(encoding="utf-8"))
+                self.assertEqual(failed["groups"][0]["requests"][0]["status"], "passed")
+                self.assertFalse(failed["groups"][0]["metrics"]["client_generation_spans_overlap"])
+                self.assertIn("generation spans did not overlap", failed["groups"][0]["error"])
+
+    def test_health_failure_after_completed_streams_fails_report(self):
+        Handler.fail_get_after = 1
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "artifacts" / "unhealthy.json"
+            log = root / "server.log"
+            log.write_text("Startup log before the probe.\n", encoding="utf-8")
+            with patch.object(bench, "ROOT", root), patch("builtins.print"):
+                result = bench.main(["--url", self.url, "--output", str(output), "--groups", "markers",
+                                     "--modes", "parallel", "--concurrent-only", "--check-server-health",
+                                     "--server-log", str(log)])
+            report = json.loads(output.read_text(encoding="utf-8"))
+            self.assertEqual(result, 1)
+            self.assertEqual(report["groups"][0]["status"], "passed")
+            self.assertEqual(report["server_health_checks"][0]["status"], "failed")
+            self.assertIn("HTTP 503", report["failures"][0])
+            self.assertFalse(report["fused_decode_evidence"]["new_acceptance_observed"])
+
+    def test_integrity_rejects_missing_optional_checks_and_forged_overlap(self):
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            output = root / "artifacts" / "integrity-gates.json"
+            with patch.object(bench, "ROOT", root), patch("builtins.print"):
+                self.assertEqual(bench.main(["--url", self.url, "--output", str(output), "--groups", "topics",
+                                             "--modes", "parallel", "--concurrent-only", "--follow-up",
+                                             "--check-server-health", "--require-generation-overlap"]), 0)
+            original = json.loads(output.read_text(encoding="utf-8"))
+            self.assertTrue(bench.verify_report_integrity(original)["follow_up_verified"])
+            changes = [lambda report: report.pop("follow_up"),
+                       lambda report: report.pop("server_health_checks"),
+                       lambda report: report["follow_up"].update(status="failed", done=False),
+                       lambda report: report["follow_up"].update(answer="EXACT_GAMMA=wrong"),
+                       lambda report: report["server_health_checks"].pop(),
+                       lambda report: report["server_health_checks"][0].update(status="failed", error="unavailable"),
+                       lambda report: report["server_health_checks"][0].update(models=[{"id": "wrong-model"}])]
+            for index, change in enumerate(changes):
+                corrupt = copy.deepcopy(original)
+                change(corrupt)
+                with self.subTest(mutation=index), self.assertRaises(ValueError):
+                    bench.verify_report_integrity(corrupt)
+            forged = copy.deepcopy(original)
+            group = forged["groups"][0]
+            first, second = group["requests"]
+            second["started_monotonic_s"] = first["ended_monotonic_s"] + 1
+            second["ended_monotonic_s"] = second["started_monotonic_s"] + second["elapsed_ms"] / 1000
+            first["last_delta_ms"] = (second["ended_monotonic_s"] - first["started_monotonic_s"] + 1) * 1000
+            group["metrics"] = bench.group_metrics(group["requests"], group["metrics"]["wall_ms"])
+            self.assertFalse(group["metrics"]["client_generation_spans_overlap"])
+            with self.assertRaisesRegex(ValueError, "last_delta_ms disagrees with SSE"):
+                bench.verify_report_integrity(forged)
+            legacy = copy.deepcopy(original)
+            for key in ("follow_up", "check_server_health", "require_generation_overlap", "min_topic_total_tokens", "topic_system_prompt"):
+                legacy["configuration"].pop(key, None)
+            legacy.pop("follow_up")
+            legacy.pop("server_health_checks")
+            legacy["groups"][0]["metrics"].pop("client_generation_spans_overlap")
+            self.assertEqual(bench.verify_report_integrity(legacy)["status"], "verified")
 
     def test_concurrent_only_omits_local_controls_and_rejects_unavailable_gates(self):
         with TemporaryDirectory() as directory:

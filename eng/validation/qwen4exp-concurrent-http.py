@@ -101,13 +101,14 @@ def quality_check(fixture, answer):
 
 
 class Client:
-    def __init__(self, url, timeout):
+    def __init__(self, url, timeout, progress_every_deltas=0):
         self.url = urlsplit(url)
         require(self.url.scheme in ("http", "https") and self.url.hostname,
                 "--url must be an HTTP(S) server URL")
         require(not self.url.username and not self.url.query and not self.url.fragment,
                 "--url cannot contain credentials, query or fragment")
         self.timeout = timeout
+        self.progress_every_deltas = progress_every_deltas
 
     def connection(self):
         cls = http.client.HTTPSConnection if self.url.scheme == "https" else http.client.HTTPConnection
@@ -180,6 +181,10 @@ class Client:
                             row["last_delta_ms"] = elapsed
                 if emitted:
                     delta_count += 1
+                    if self.progress_every_deltas and delta_count % self.progress_every_deltas == 0:
+                        print(f"{row.get('fixture', 'request')}: streamed_deltas={delta_count} "
+                              f"answer_chars={len(row['answer'])} reasoning_chars={len(row['reasoning'])} "
+                              f"elapsed={elapsed / 1000:.1f}s", flush=True)
                 if cancel_after_deltas is not None and delta_count >= cancel_after_deltas:
                     require(row["finish_reason"] is None, "Request reached a finish reason before intentional cancellation")
                     row["cancelled"] = True
@@ -211,7 +216,11 @@ class Client:
 
 def body_for(args, fixture_name):
     fixture = FIXTURES[fixture_name]
-    return {"model": args.model, "messages": [{"role": "user", "content": fixture["prompt"]}],
+    messages = [{"role": "user", "content": fixture["prompt"]}]
+    topic_system_prompt = getattr(args, "topic_system_prompt", None)
+    if fixture["kind"] == "topic" and topic_system_prompt:
+        messages.insert(0, {"role": "system", "content": topic_system_prompt})
+    return {"model": args.model, "messages": messages,
             "stream": True, "stream_options": {"include_usage": True},
             "max_tokens": fixture.get("max_tokens", args.max_tokens), "think": False,
             "temperature": 0, "top_k": 1, "top_p": 1, "min_p": 0,
@@ -228,6 +237,13 @@ def run_request(args, client, fixture_name, first_delta=None, cancel_after_delta
         if cancel_after_deltas is None:
             row["quality"] = quality_check(FIXTURES[fixture_name], row["answer"])
             require(row["quality"]["passed"], "Answer failed task/relevance/isolation checks")
+            if FIXTURES[fixture_name]["kind"] == "topic" and getattr(args, "min_topic_total_tokens", 0):
+                row["long_context_coverage"] = {
+                    "required_total_tokens": args.min_topic_total_tokens,
+                    "actual_total_tokens": row["prompt_tokens"] + row["completion_tokens"],
+                }
+                require(row["long_context_coverage"]["actual_total_tokens"] >= args.min_topic_total_tokens,
+                        "Topic request finished before the required total-token boundary; long-context coverage was not exercised")
         elif FIXTURES[fixture_name]["kind"] == "exact":
             normalized = "\n".join(line.strip() for line in row["answer"].strip().splitlines())
             require(normalized != FIXTURES[fixture_name]["expected"], "Complete task answer arrived before intentional cancellation")
@@ -242,6 +258,26 @@ def run_request(args, client, fixture_name, first_delta=None, cancel_after_delta
     return row
 
 
+def stream_delta_timing(events):
+    """Recover model-delta timing from retained SSE, excluding empty headers."""
+    first_delta = first_answer = last_delta = None
+    for entry in events:
+        event = entry.get("data")
+        if not isinstance(event, dict):
+            continue
+        elapsed = entry.get("elapsed_ms")
+        emitted = False
+        for choice in event.get("choices", []):
+            delta = choice.get("delta", {})
+            if delta.get("content"):
+                first_answer = elapsed if first_answer is None else first_answer
+            emitted = emitted or bool(delta.get("content") or delta.get("reasoning_content"))
+        if emitted:
+            first_delta = elapsed if first_delta is None else first_delta
+            last_delta = elapsed
+    return {"ttft_ms": first_delta, "first_answer_ms": first_answer, "last_delta_ms": last_delta}
+
+
 def group_metrics(rows, wall_ms):
     completed = [row for row in rows if row.get("done") and row.get("completion_tokens") is not None]
     tokens = sum(row["completion_tokens"] for row in completed)
@@ -249,10 +285,19 @@ def group_metrics(rows, wall_ms):
     spans = [(row["started_monotonic_s"], row["ended_monotonic_s"]) for row in rows
              if "started_monotonic_s" in row and "ended_monotonic_s" in row]
     overlap = any(max(a[0], b[0]) < min(a[1], b[1]) for index, a in enumerate(spans) for b in spans[index + 1:])
+    generation_spans = []
+    for row in rows:
+        timing = stream_delta_timing(row.get("events", []))
+        if timing["ttft_ms"] is not None and "started_monotonic_s" in row:
+            generation_spans.append((row["started_monotonic_s"] + timing["ttft_ms"] / 1000,
+                                     row["started_monotonic_s"] + timing["last_delta_ms"] / 1000))
+    generation_overlap = any(max(a[0], b[0]) < min(a[1], b[1])
+                             for index, a in enumerate(generation_spans) for b in generation_spans[index + 1:])
     return {"wall_ms": wall_ms, "completed_requests": len(completed), "completion_tokens": tokens,
             "aggregate_completion_tokens_per_s": tokens * 1000 / wall_ms if wall_ms > 0 else None,
             "ttft_median_ms": statistics.median(ttfts) if ttfts else None,
-            "ttft_max_ms": max(ttfts) if ttfts else None, "client_request_spans_overlap": overlap}
+            "ttft_max_ms": max(ttfts) if ttfts else None, "client_request_spans_overlap": overlap,
+            "client_generation_spans_overlap": generation_overlap}
 
 
 def run_group(args, client, name, mode, repetition):
@@ -283,6 +328,10 @@ def run_group(args, client, name, mode, repetition):
     if mode == "parallel" and not group["metrics"]["client_request_spans_overlap"]:
         group["status"] = "failed"
         group["error"] = "Simultaneous request spans did not overlap; parallel coverage was not exercised"
+    if mode != "serial" and getattr(args, "require_generation_overlap", False) \
+            and not group["metrics"]["client_generation_spans_overlap"]:
+        group["status"] = "failed"
+        group["error"] = "Streamed generation spans did not overlap; simultaneous generation coverage was not exercised"
     if mode == "staggered":
         first, second = rows
         group["admitted_during_generation"] = (
@@ -347,6 +396,11 @@ def verify_report_integrity(report):
     require(isinstance(config.get("seed"), int) and not isinstance(config["seed"], bool) and
             isinstance(config.get("max_tokens"), int) and not isinstance(config["max_tokens"], bool) and config["max_tokens"] > 0,
             "Baseline omitted valid sampling/token configuration")
+    token_boundary = config.get("min_topic_total_tokens", 0)
+    require(isinstance(token_boundary, int) and not isinstance(token_boundary, bool) and token_boundary >= 0,
+            "Baseline declared an invalid long-context token boundary")
+    for field in ("follow_up", "check_server_health", "require_generation_overlap"):
+        require(isinstance(config.get(field, False), bool), f"Baseline declared an invalid {field} flag")
     groups = report.get("groups")
     require(isinstance(groups, list) and groups, "Baseline omitted its retained groups")
     keys = [(group.get("name"), group.get("mode"), group.get("repetition")) for group in groups]
@@ -355,13 +409,28 @@ def verify_report_integrity(report):
         expected.add(("cancellation_slot_reuse", "parallel", None))
     require(len(keys) == len(set(keys)), "Baseline retained duplicate group evidence")
     require(set(keys) == expected, "Baseline retained group coverage differs from its declared configuration")
-    request_args = SimpleNamespace(model=report["model"], seed=config["seed"], max_tokens=config["max_tokens"])
-    for group in groups:
+    request_args = SimpleNamespace(model=report["model"], seed=config["seed"], max_tokens=config["max_tokens"],
+                                   topic_system_prompt=config.get("topic_system_prompt"))
+    validation_groups = list(groups)
+    if config.get("follow_up"):
+        follow_up = report.get("follow_up")
+        require(isinstance(follow_up, dict) or report.get("status") != "passed",
+                "Baseline omitted declared follow-up evidence")
+        if isinstance(follow_up, dict):
+            require(follow_up.get("fixture") == "marker_reuse", "Baseline retained an invalid follow-up fixture")
+            wall_ms = follow_up.get("elapsed_ms")
+            require(isinstance(wall_ms, (float, int)) and math.isfinite(wall_ms) and wall_ms > 0,
+                    "Baseline retained invalid follow-up wall time")
+            validation_groups.append({"name": "follow_up", "mode": "serial", "requests": [follow_up],
+                                      "status": "passed" if follow_up.get("status") == "passed" else "failed",
+                                      "metrics": group_metrics([follow_up], wall_ms)})
+    for group in validation_groups:
         rows = group.get("requests")
         require(isinstance(rows, list) and rows, "Baseline omitted retained request evidence")
         fixtures = [row.get("fixture") for row in rows]
         require(len(fixtures) == len(set(fixtures)), "Baseline retained duplicate request evidence")
-        expected_fixtures = ["marker_long", "ff7", "marker_reuse"] if group["name"] == "cancellation_slot_reuse" else GROUPS[group["name"]]
+        expected_fixtures = ["marker_reuse"] if group["name"] == "follow_up" else \
+            ["marker_long", "ff7", "marker_reuse"] if group["name"] == "cancellation_slot_reuse" else GROUPS[group["name"]]
         require(set(fixtures) == set(expected_fixtures), "Baseline retained request coverage differs from its declared fixture group")
         for row in rows:
             body, answer = row.get("request"), row.get("answer")
@@ -399,6 +468,8 @@ def verify_report_integrity(report):
                     "Baseline retained answer/reasoning disagrees with SSE deltas")
             require(done_count == int(row.get("done") is True) and finish == row.get("finish_reason") and
                     deltas == row.get("nonempty_delta_events"), "Baseline retained completion/cancellation metadata disagrees with SSE events")
+            for field, actual in stream_delta_timing(events).items():
+                require(row.get(field) == actual, f"Baseline retained {field} disagrees with SSE delta timing")
             if row.get("status") == "passed":
                 require(row.get("done") is True and row.get("cancelled") is False and row.get("finish_reason") in ("stop", "length"),
                         "Baseline marks an unfinished/cancelled request as passed")
@@ -410,6 +481,11 @@ def verify_report_integrity(report):
                     value = row.get(field)
                     require(isinstance(value, int) and not isinstance(value, bool) and value > 0 and usage.get(field) == value,
                             "Baseline retained token counts disagree with final usage")
+                if token_boundary and FIXTURES[row["fixture"]]["kind"] == "topic":
+                    actual_total = row["prompt_tokens"] + row["completion_tokens"]
+                    require(actual_total >= token_boundary and row.get("long_context_coverage") == {
+                        "required_total_tokens": token_boundary, "actual_total_tokens": actual_total},
+                        "Baseline marked an unexercised long-context token boundary as passed")
             elif row.get("status") == "cancelled_as_requested":
                 require(group["name"] == "cancellation_slot_reuse" and row["fixture"] == "marker_long" and
                         row.get("cancelled") is True and row.get("done") is False and row.get("finish_reason") is None,
@@ -424,6 +500,9 @@ def verify_report_integrity(report):
         measured = group_metrics(rows, metrics["wall_ms"])
         for field in ("completed_requests", "completion_tokens", "client_request_spans_overlap"):
             require(metrics.get(field) == measured[field], f"Baseline retained inconsistent {field} metrics")
+        if "client_generation_spans_overlap" in metrics:
+            require(metrics["client_generation_spans_overlap"] == measured["client_generation_spans_overlap"],
+                    "Baseline retained inconsistent client_generation_spans_overlap metrics")
         throughput = metrics.get("aggregate_completion_tokens_per_s")
         require(isinstance(throughput, (float, int)) and math.isfinite(throughput) and
                 math.isclose(throughput, measured["aggregate_completion_tokens_per_s"], rel_tol=1e-10, abs_tol=1e-12),
@@ -431,6 +510,9 @@ def verify_report_integrity(report):
         if group.get("status") == "passed":
             require(all(row.get("status") == ("cancelled_as_requested" if group["name"] == "cancellation_slot_reuse" and
                        row["fixture"] == "marker_long" else "passed") for row in rows), "Baseline passed group contains failed request evidence")
+            if config.get("require_generation_overlap") and group["mode"] != "serial":
+                require(measured["client_generation_spans_overlap"],
+                        "Baseline marked concurrent generation without streamed overlap as passed")
             if group["name"] == "cancellation_slot_reuse":
                 by_fixture = {row["fixture"]: row for row in rows}
                 survivor, reuse = by_fixture["ff7"], by_fixture["marker_reuse"]
@@ -442,8 +524,29 @@ def verify_report_integrity(report):
                         "Baseline cancellation and survivor did not overlap")
         else:
             require(group.get("status") == "failed" and report.get("status") != "passed", "Baseline passed report contains invalid group status")
+    if config.get("check_server_health"):
+        checks = report.get("server_health_checks")
+        require(isinstance(checks, list), "Baseline omitted declared server health evidence")
+        expected_health = {"cancellation_slot_reuse" if group["name"] == "cancellation_slot_reuse" else
+                           f"{group['name']}/{group['mode']}/{group['repetition']}" for group in groups}
+        if config.get("follow_up"):
+            expected_health.add("follow_up")
+        after_keys = [check.get("after") for check in checks if isinstance(check, dict)]
+        require(len(after_keys) == len(checks) == len(set(after_keys)) and set(after_keys) <= expected_health,
+                "Baseline retained invalid or duplicate server health coverage")
+        if report.get("status") == "passed":
+            require(set(after_keys) == expected_health, "Baseline server health coverage differs from its declared workload")
+        for check in checks:
+            if check.get("status") == "passed":
+                models = check.get("models")
+                require(isinstance(models, list) and any(isinstance(model, dict) and model.get("id") == report["model"] for model in models),
+                        "Baseline passed health check omitted the served model")
+            else:
+                require(check.get("status") == "failed" and report.get("status") != "passed" and isinstance(check.get("error"), str),
+                        "Baseline passed report contains a failed or invalid health check")
     return {"status": "verified", "retained_groups": len(groups), "retained_requests": sum(len(group["requests"]) for group in groups),
-            "checks": "Retained request/answer hashes, declared workload and duplicate coverage, answer/finish/token metadata from SSE, answer quality, finite wall time and recomputed group token/throughput metrics"}
+            "follow_up_verified": bool(config.get("follow_up") and isinstance(report.get("follow_up"), dict)),
+            "checks": "Retained request/answer hashes, declared workload and duplicate coverage, answer/finish/token/timing metadata from SSE, answer quality, finite wall time and recomputed group token/throughput metrics, declared follow-up and server health evidence"}
 
 
 def compare_group(serial, concurrent, require_exact):
@@ -543,6 +646,18 @@ def parse_args(argv=None):
                         help="Skip local serial controls; run only concurrent modes, optionally comparing against --compare-with")
     parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument("--max-tokens", type=int, default=384, help="Topic-answer cap; marker tasks have fixed caps")
+    parser.add_argument("--min-topic-total-tokens", type=int, default=0,
+                        help="Fail topic requests unless prompt plus completion usage reaches this long-context boundary")
+    parser.add_argument("--topic-system-prompt-file", type=Path,
+                        help="Add this UTF-8 system context to topics only; exact user prompts stay unchanged and context is retained")
+    parser.add_argument("--require-generation-overlap", action="store_true",
+                        help="Require first-to-last streamed model-delta spans to overlap for concurrent groups")
+    parser.add_argument("--check-server-health", action="store_true",
+                        help="Require /v1/models to retain the served model after every group and follow-up")
+    parser.add_argument("--follow-up", action="store_true",
+                        help="Finish with an independent exact arithmetic request to verify inference remains usable")
+    parser.add_argument("--progress-every-deltas", type=int, default=0,
+                        help="Print live progress after this many nonempty SSE delta events (0 disables)")
     parser.add_argument("--seed", type=int, default=12345)
     parser.add_argument("--timeout", type=float, default=1800)
     parser.add_argument("--admission-delay-ms", type=float, default=25,
@@ -570,6 +685,10 @@ def parse_args(argv=None):
     if not args.concurrent_only and "serial" not in args.modes:
         args.modes.insert(0, "serial")
     require(1 <= args.repeats <= 20 and 1 <= args.max_tokens <= 4096, "Use 1..20 repeats and 1..4096 topic max tokens")
+    require(args.min_topic_total_tokens >= 0, "--min-topic-total-tokens must be nonnegative")
+    args.topic_system_prompt = args.topic_system_prompt_file.read_text(encoding="utf-8") if args.topic_system_prompt_file else None
+    require(args.topic_system_prompt is None or args.topic_system_prompt.strip(), "Topic system context must be nonempty")
+    require(args.progress_every_deltas >= 0, "--progress-every-deltas must be nonnegative")
     require(math.isfinite(args.timeout) and args.timeout > 0, "--timeout must be finite and positive")
     require(math.isfinite(args.admission_delay_ms) and 0 <= args.admission_delay_ms <= 60000, "Invalid admission delay")
     require(not args.require_fused or args.server_log, "--require-fused requires --server-log")
@@ -589,12 +708,16 @@ def main(argv=None):
     args = parse_args(argv)
     report = {"schema": 1, "label": args.label, "url": args.url,
               "started_utc": datetime.now(timezone.utc).isoformat(), "status": "failed", "failures": [], "groups": [],
-              "configuration": {name: getattr(args, name) for name in ("groups", "modes", "concurrent_only", "repeats", "max_tokens", "seed", "admission_delay_ms", "cancellation", "require_exact_parity", "require_fused", "min_parallel_speedup", "min_baseline_speedup")},
+              "configuration": {name: getattr(args, name) for name in ("groups", "modes", "concurrent_only", "repeats", "max_tokens", "min_topic_total_tokens", "topic_system_prompt", "require_generation_overlap", "check_server_health", "follow_up", "seed", "admission_delay_ms", "cancellation", "require_exact_parity", "require_fused", "min_parallel_speedup", "min_baseline_speedup")},
               "coverage": {"selected_groups": args.groups, "omitted_groups": sorted(set(GROUPS) - set(args.groups)),
                            "cancellation_selected": args.cancellation, "local_serial_controls_run": not args.concurrent_only,
-                           "vision": "not covered by this text-only runner"},
+                           "vision": "not covered by this text-only runner",
+                           "topic_prompt_variant": "contextual_system_prefix" if args.topic_system_prompt else "raw_exact_user_prompts"},
               "limitations": "Loading/warmup is excluded. Default local serial and concurrent controls use the same live host, so prefix/cache warmth may differ; cached_tokens is preserved per request. Concurrent-only omits local serial controls and has no local serial text-parity or speedup claim. Greedy sampling fixes temperature/top-k/penalties and seed, but HTTP exposes text rather than token IDs/logits. Topic checks measure relevance and obvious leakage, not complete factual accuracy. Capped outputs may be truncated. Throughput is completion usage tokens divided by complete group wall time, including admission, prefill, and HTTP; it is not a pure native decode rate. Parallel speedup is qualified only for successful identical requests with equal completion token counts and finish reasons. No omitted or unavailable scenario counts as passed. Supply model/device/build/upstream provenance separately."}
     log_offset = args.server_log.stat().st_size if args.server_log else None
+    if args.topic_system_prompt_file:
+        report["topic_system_prompt_file"] = {"path": str(args.topic_system_prompt_file.resolve()),
+                                             "sha256": sha256(args.topic_system_prompt.encode())}
     def save():
         args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     try:
@@ -602,7 +725,7 @@ def main(argv=None):
             raw = args.provenance.read_bytes()
             report["provenance"] = json.loads(raw)
             report["provenance_sha256"] = sha256(raw)
-        client = Client(args.url, args.timeout)
+        client = Client(args.url, args.timeout, args.progress_every_deltas)
         models = client.models()
         require(isinstance(models, list) and models, "Server has no available models")
         if args.model is None:
@@ -610,6 +733,17 @@ def main(argv=None):
             args.model = models[0]["id"]
         require(any(model.get("id") == args.model for model in models), "Requested model is absent from /v1/models")
         report.update(model=args.model, server_models=models)
+        def check_health(after):
+            health = {"after": after, "status": "failed"}
+            report.setdefault("server_health_checks", []).append(health)
+            try:
+                health["models"] = client.models()
+                require(any(model.get("id") == args.model for model in health["models"]),
+                        "Served model is absent after workload")
+                health["status"] = "passed"
+            except Exception as error:
+                health["error"] = f"{type(error).__name__}: {error}"
+                raise
         for repetition in range(1, args.repeats + 1):
             for name in args.groups:
                 serial = None
@@ -637,12 +771,23 @@ def main(argv=None):
                           f"wall={group['metrics']['wall_ms']:.1f} ms "
                           f"tokens={group['metrics']['completion_tokens']} "
                           f"aggregate={group['metrics']['aggregate_completion_tokens_per_s']:.2f} tok/s", flush=True)
+                    if args.check_server_health:
+                        check_health(f"{name}/{mode}/{repetition}")
                     save()
         if args.cancellation:
             group = cancellation_and_reuse(args, client)
             report["groups"].append(group)
             if group["status"] != "passed":
                 report["failures"].append("Cancellation, survivor, or reuse request failed")
+            if args.check_server_health:
+                check_health("cancellation_slot_reuse")
+            save()
+        if args.follow_up:
+            report["follow_up"] = run_request(args, client, "marker_reuse")
+            if report["follow_up"]["status"] != "passed":
+                report["failures"].append("Independent follow-up inference failed")
+            if args.check_server_health:
+                check_health("follow_up")
             save()
         if args.server_log:
             report["fused_decode_evidence"] = log_evidence(args.server_log, log_offset)
@@ -654,6 +799,14 @@ def main(argv=None):
     except Exception as error:
         report["failures"].append(f"{type(error).__name__}: {error}")
     finally:
+        # A native abort can make the post-workload health check fail before
+        # reaching normal log collection. Preserve the executed path's log
+        # slice even when the server has already exited.
+        if args.server_log and "fused_decode_evidence" not in report:
+            try:
+                report["fused_decode_evidence"] = log_evidence(args.server_log, log_offset)
+            except Exception as error:
+                report["failures"].append(f"Server log evidence: {type(error).__name__}: {error}")
         if args.compare_with:
             try:
                 baseline_raw = args.compare_with.read_bytes()

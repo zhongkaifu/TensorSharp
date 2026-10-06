@@ -47,11 +47,99 @@ public sealed class Qwen4ExpBatchedDecodeTests(ITestOutputHelper output) : IDisp
     public void HostOffloadedArenaParity_Metal(int offloadLayers)
         => RunArenaParity(BackendType.GgmlMetal, 3, true, offloadLayers);
 
+    [GgmlTheory(BackendType.GgmlCuda)]
+    [InlineData(2)] [InlineData(8)]
+    public void HostOffloadedArenaParity_Cuda(int offloadLayers)
+        => RunArenaParity(BackendType.GgmlCuda, 3, true, offloadLayers);
+
     [GgmlFact(BackendType.GgmlCpu)]
     public void DenseArenaWithoutQsa_Cpu() => RunArenaParity(BackendType.GgmlCpu, 3, false, qsa: false);
 
     [GgmlFact(BackendType.GgmlMetal)]
     public void DenseArenaWithoutQsa_Metal() => RunArenaParity(BackendType.GgmlMetal, 3, false, qsa: false);
+
+    [GgmlFact(BackendType.GgmlCuda)]
+    public void DenseArenaWithoutQsa_Cuda() => RunArenaParity(BackendType.GgmlCuda, 3, false, qsa: false);
+
+    [GgmlFact(BackendType.GgmlCpu)]
+    public void ArenaCrossesSparseQsaThresholdAfterDenseReplay_Cpu()
+        => RunSparseThresholdTransition(BackendType.GgmlCpu);
+
+    [GgmlFact(BackendType.GgmlCuda)]
+    public void ArenaCrossesSparseQsaThresholdAfterDenseReplay_Cuda()
+        => RunSparseThresholdTransition(BackendType.GgmlCuda);
+
+    private void RunSparseThresholdTransition(BackendType backend)
+    {
+        const int topK = 16;
+        const int sparseWidth = topK + Qwen4ExpSyntheticModelBuilder.CompressRatio - 1;
+        string path = Fixture(indexerTopK: topK);
+        using var model = new Qwen4ExpModel(path, backend);
+        using var reference = new Qwen4ExpModel(path, backend);
+        string[] ids = ["threshold-a", "threshold-b"];
+        for (int i = 0; i < ids.Length; ++i)
+        {
+            model.BindSequenceCache(ids[i]); reference.BindSequenceCache(ids[i]);
+            Assert.Equal(reference.Forward(Prompt(i, 8)), model.Forward(Prompt(i, 8)));
+            Assert.Equal(reference.Forward([197]), model.Forward([197]));
+            Assert.Equal(9, model.CacheSeqLen);
+            Assert.Equal(16, Field<int>(model, "_kvCacheCapacity"));
+            Assert.True(Field<int>(model, "_kvCacheCapacity") <= sparseWidth);
+        }
+        model.RestorePrimaryCache(); reference.RestorePrimaryCache();
+        long before = model.ArenaBatchedDecodeSteps;
+        double worst = 0;
+        for (int round = 0; round < 12; ++round)
+        {
+            int position = 9 + round;
+            int[] tokens = [17 + round, 53 + round];
+            var expected = new float[ids.Length][];
+            for (int i = 0; i < ids.Length; ++i)
+            {
+                reference.BindSequenceCache(ids[i]);
+                expected[i] = (float[])reference.Forward([tokens[i]]).Clone();
+            }
+            reference.RestorePrimaryCache();
+            var rows = new float[ids.Length][];
+            if (round == 7)
+            {
+                // Seven dense arena executions have filled the 16-row caches.
+                // Growth flushes them and solo decode expands each cache to 32.
+                // The next arena graph now contains the CUDA precision CUSTOM
+                // node used by sparse QSA, reproducing the delayed failure.
+                Assert.False(model.TryForwardBatchedFusedDecode(ids, tokens, [position, position], rows));
+                Assert.Contains("needs cache growth", model.BatchedFusedDecodeDeclineReason);
+                Assert.All(rows, Assert.Null);
+                for (int i = 0; i < ids.Length; ++i)
+                {
+                    model.BindSequenceCache(ids[i]);
+                    Assert.Equal(position, model.CacheSeqLen);
+                    worst = Math.Max(worst, AssertClose(expected[i], model.Forward([tokens[i]]), "threshold growth " + i));
+                    Assert.Equal(32, Field<int>(model, "_kvCacheCapacity"));
+                    Assert.True(Field<int>(model, "_kvCacheCapacity") > sparseWidth);
+                }
+                model.RestorePrimaryCache();
+            }
+            else
+            {
+                int[] order = round % 2 == 0 ? [0, 1] : [1, 0];
+                Assert.True(model.TryForwardBatchedFusedDecode(order.Select(i => ids[i]).ToArray(),
+                    order.Select(i => tokens[i]).ToArray(), [position, position], rows),
+                    model.BatchedFusedDecodeDeclineReason);
+                for (int i = 0; i < ids.Length; ++i)
+                    worst = Math.Max(worst, AssertClose(expected[order[i]], rows[i], $"threshold round {round}, row {i}"));
+            }
+        }
+        Assert.Equal(11, model.ArenaBatchedDecodeSteps - before);
+        for (int i = 0; i < ids.Length; ++i)
+        {
+            model.BindSequenceCache(ids[i]); reference.BindSequenceCache(ids[i]);
+            Assert.Equal(21, model.CacheSeqLen);
+            Assert.Equal(21, Field<int>(model, "_qsaPositionCount"));
+            worst = Math.Max(worst, AssertClose(reference.Forward([113]), model.Forward([113]), "threshold final solo " + i));
+        }
+        output.WriteLine($"{backend}: 7 dense and 4 sparse arena steps across cache growth and request reordering; final solo state matched; worst |dlogit|={worst:G6}.");
+    }
 
     [Qwen4ExpArenaCopyFaultFact]
     [Trait("Requires", "GgmlCpu")]
@@ -282,7 +370,7 @@ public sealed class Qwen4ExpBatchedDecodeTests(ITestOutputHelper output) : IDisp
         public void Dispose() { _set(0); NativeLibrary.Free(_module); }
     }
 
-    private string Fixture(bool q2kxl = false, bool qsa = true)
+    private string Fixture(bool q2kxl = false, bool qsa = true, int indexerTopK = 16)
     {
         Directory.CreateDirectory(_directory);
         _environment.Set("MAX_CONTEXT", "128");
@@ -291,7 +379,8 @@ public sealed class Qwen4ExpBatchedDecodeTests(ITestOutputHelper output) : IDisp
         _environment.Set("TS_Q4E_DISABLE_ARENA_DECODE", null);
         _environment.ClearSpeculationVars();
         MoeCpuOffloadConfig.Reset();
-        return Qwen4ExpSyntheticModelBuilder.Write(Path.Combine(_directory, "fixture.gguf"), q2kxlExperts: q2kxl, qsa: qsa);
+        return Qwen4ExpSyntheticModelBuilder.Write(Path.Combine(_directory, "fixture.gguf"),
+            indexerTopK: indexerTopK, q2kxlExperts: q2kxl, qsa: qsa);
     }
 
     private void RunArenaParity(BackendType backend, int width, bool q2kxl, int offloadLayers = 0, bool qsa = true)
@@ -427,10 +516,19 @@ public sealed class Qwen4ExpBatchedDecodeTests(ITestOutputHelper output) : IDisp
     public Task ContinuousBatching_ParallelGreedyStreamsMatchSerial_Metal()
         => RunEngine(BackendType.GgmlMetal);
 
+    [GgmlFact(BackendType.GgmlCuda)]
+    public Task ContinuousBatching_ParallelGreedyStreamsMatchSerial_Cuda()
+        => RunEngine(BackendType.GgmlCuda);
+
     [GgmlTheory(BackendType.GgmlMetal)]
     [InlineData(2)] [InlineData(8)]
     public Task HostOffloadedContinuousBatching_MatchesSerial_Metal(int offloadLayers)
         => RunEngine(BackendType.GgmlMetal, offloadLayers);
+
+    [GgmlTheory(BackendType.GgmlCuda)]
+    [InlineData(2)] [InlineData(8)]
+    public Task HostOffloadedContinuousBatching_MatchesSerial_Cuda(int offloadLayers)
+        => RunEngine(BackendType.GgmlCuda, offloadLayers);
 
     private async Task RunEngine(BackendType backend, int offloadLayers = 0)
     {
@@ -440,6 +538,7 @@ public sealed class Qwen4ExpBatchedDecodeTests(ITestOutputHelper output) : IDisp
         const int count = 8;
         int[][] prompts = [Prompt(3, 28), Prompt(7, 33), Prompt(11, 39)];
         var expected = new List<int>[prompts.Length];
+        var serialLogits = new float[prompts.Length][][];
         foreach (int i in Enumerable.Range(0, prompts.Length))
         {
             model.ResetKVCache();
@@ -447,8 +546,10 @@ public sealed class Qwen4ExpBatchedDecodeTests(ITestOutputHelper output) : IDisp
             for (int start = 0; start < prompts[i].Length; start += 8)
                 logits = model.Forward(prompts[i].Skip(start).Take(8).ToArray());
             expected[i] = new List<int>();
+            serialLogits[i] = new float[count][];
             for (int t = 0; t < count; ++t)
             {
+                serialLogits[i][t] = (float[])logits.Clone();
                 int token = ArgMax(logits); expected[i].Add(token);
                 if (t + 1 < count) logits = model.Forward([token]);
             }
@@ -456,7 +557,11 @@ public sealed class Qwen4ExpBatchedDecodeTests(ITestOutputHelper output) : IDisp
         model.ResetKVCache();
         var config = new SchedulerConfig
         {
-            MaxNumBatchedTokens = 64, MaxNumRunningSequences = 4,
+            // CUDA greedy parity compares the same eight-token prefill shapes.
+            // The aggregate budget also bounds concurrent prefills: a 64-token
+            // budget permits larger chunks despite MaxPrefillChunkSize below.
+            MaxNumBatchedTokens = backend == BackendType.GgmlCuda ? 8 : 64,
+            MaxNumRunningSequences = 4,
             MaxPrefillChunkSize = 8, SoloPrefillChunkSize = 8,
             NumBlocks = 128, BlockSize = 8, EnablePrefixCaching = false, DecodeQuantumTokens = 1,
         };
@@ -464,7 +569,20 @@ public sealed class Qwen4ExpBatchedDecodeTests(ITestOutputHelper output) : IDisp
         var handles = prompts.Select((prompt, i) => engine.SubmitRequest(new SequenceState(
             "engine-" + i, prompt.ToList(), count, config.BlockSize, SamplingConfig.Greedy))).ToArray();
         var streams = await Task.WhenAll(handles.Select(Drain));
-        for (int i = 0; i < streams.Length; ++i) Assert.Equal(expected[i], streams[i]);
+        for (int i = 0; i < streams.Length; ++i)
+        {
+            for (int t = 0; t < Math.Min(expected[i].Count, streams[i].Count); ++t)
+            {
+                if (expected[i][t] == streams[i][t]) continue;
+                float[] logits = serialLogits[i][t];
+                int[] top = Enumerable.Range(0, logits.Length).OrderByDescending(j => logits[j]).Take(5).ToArray();
+                output.WriteLine($"Stream {i} first mismatch at {t}: expected={expected[i][t]}, actual={streams[i][t]}, " +
+                    $"serial margin={logits[top[0]] - logits[top[1]]:R}, actual token serial score={logits[streams[i][t]]:R}; " +
+                    "serial top5=" + string.Join(", ", top.Select(j => $"{j}:{logits[j]:R}")));
+                break;
+            }
+            Assert.Equal(expected[i], streams[i]);
+        }
         Assert.True(model.ArenaBatchedDecodeSteps > 0, "Parallel requests never executed a batched graph.");
         output.WriteLine($"{backend}, hostLayers={offloadLayers}: three parallel 8-token streams matched independent serial greedy; {model.ArenaBatchedDecodeSteps} arena steps.");
     }
