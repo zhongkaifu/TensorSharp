@@ -39,7 +39,8 @@ namespace TensorSharp.Models
             {
                 BackendType.Cuda => new Qwen4ExpCudaModel(c.GgufPath, c.TpDegree, c.TpGroup, c.LayerSplitDegree, c.DraftModelPath),
                 BackendType.Mlx => throw new NotSupportedException(MlxRefusal),
-                _ => new Qwen4ExpModel(c.GgufPath, c.Backend, c.TpDegree, c.TpGroup, c.LayerSplitDegree, c.DraftModelPath),
+                _ => new Qwen4ExpModel(c.GgufPath, c.Backend, c.TpDegree, c.TpGroup, c.LayerSplitDegree, c.DraftModelPath,
+                    c.ProjectorPath),
             },
             ProjectorFileHints = new[] { "*mmproj*.gguf" },
 

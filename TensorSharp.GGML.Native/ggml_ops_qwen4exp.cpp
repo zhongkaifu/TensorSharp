@@ -243,6 +243,9 @@ namespace
     constexpr int kQwen4ExpSpanSlots = 128;
     // A 48-layer span builds ~150 nodes a layer; 16384 leaves headroom.
     constexpr int kQwen4ExpSpanGraphSize = 16384;
+    // Span width from which a host-routed layer's seam reuses one buffer for its
+    // input and output instead of holding both for the whole pass (q4e_nodes_ffn).
+    constexpr int kQ4eSeamReuseMinTokens = 64;
 
     // Q4eCachedBind (a cache-resolved weight binding a REPLAY can re-resolve)
     // lives in ggml_ops_internal.h, shared with the arena kernel.
@@ -772,7 +775,18 @@ void Q4eBinder::add(ggml_tensor* tgt, void* data, std::size_t bytes,
                 if (try_bind_cached_tensor(g_backend, dev, tgt, data, bytes, needs_upload, usage))
                 {
                     cached.push_back({tgt, data, bytes, usage});
-                    if (needs_upload) upload_list.push_back({tgt, data, bytes});
+                    // Fill a fresh cache entry HERE, not in flush(). It is already
+                    // published in the process-wide resident cache and marked
+                    // initialized, so a build abandoned before flush() - a gallocr,
+                    // KV or seq-state allocation failing later in this span, which a
+                    // VRAM-tight layer split makes an ordinary event - would leave it
+                    // holding whatever the driver handed back, and the NEXT build would
+                    // attach it without an upload and compute with garbage weights (the
+                    // CONTRACT on try_get_cacheable_tensor_buffer; WanBind::bind fills
+                    // inline for the same reason). resolve_upload_source as in flush():
+                    // a quantized weight's "pointer" is a CacheKey, not memory.
+                    if (needs_upload)
+                        ggml_backend_tensor_set(tgt, resolve_upload_source(data), 0, bytes);
                     return;
                 }
                 ggml_backend_buffer_t buf = nullptr;
@@ -1000,7 +1014,21 @@ ggml_tensor* q4e_nodes_ffn(
         };
         tsg::HostMoeSegment hm;
         hm.layer = layer;
-        hm.moe_in = boundary(mixed);                                               // [n_embd, T]
+        // Wide spans hand the host a COPY of the input and take the result back in
+        // the same bytes. ggml-alloc never frees a graph output, nor a node nothing
+        // consumes, and it places every input leaf before the first node - so the
+        // direct hand-off below holds moe_in and moe_out (and the ids and weights)
+        // for the whole pass: 20 KB a token per host-routed layer, 3.3 GB of a
+        // 4096-token span with 40 such layers, enough to push a 16 GB card into
+        // WDDM paging. As a view of the copy, moe_out is consumed by the node that
+        // adds the shared expert, and the copy is freed right after it: the span
+        // holds one layer's seam at a time. Sharing the bytes is safe because the
+        // host reads every input (staged through host memory, or uploaded into the
+        // stream graph's own tensors) before it writes moe_out. Narrow spans keep
+        // the direct hand-off: the opt-in expert cache reads moe_in on the device
+        // for T <= 8, and a copy per host-routed layer is not worth a few KB.
+        const bool reuse_seam = T >= kQ4eSeamReuseMinTokens;
+        hm.moe_in = reuse_seam ? ggml_cont(ctx, mixed) : boundary(mixed);          // [n_embd, T]
         hm.sel_ids = boundary(sel);                                                // [n_used, T] i32
         hm.weights = boundary(ggml_reshape_2d(ctx, w_sel, n_expert_used, T));      // [n_used, T]
         // The segment ends right after these three. Expand them NOW, before any
@@ -1010,11 +1038,19 @@ ggml_tensor* q4e_nodes_ffn(
         ggml_build_forward_expand(graph, hm.sel_ids);
         ggml_build_forward_expand(graph, hm.weights);
 
-        // Written by the host between segments: an input (no producer) that is
-        // also an output, so ggml-alloc keeps it for the whole pass.
-        hm.moe_out = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, T);
-        ggml_set_input(hm.moe_out);
-        ggml_set_output(hm.moe_out);
+        if (reuse_seam)
+        {
+            // Written by the host between segments over the copy it just read.
+            hm.moe_out = ggml_view_2d(ctx, hm.moe_in, n_embd, T, hm.moe_in->nb[1], 0);
+        }
+        else
+        {
+            // Written by the host between segments: an input (no producer) that is
+            // also an output, so ggml-alloc keeps it for the whole pass.
+            hm.moe_out = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, T);
+            ggml_set_input(hm.moe_out);
+            ggml_set_output(hm.moe_out);
+        }
 
         hm.gate_data = a->gate_exps; hm.gate_type = a->gate_exps_type;
         hm.gate_ne0 = n_embd; hm.gate_ne1 = n_ff; hm.gate_bytes = a->gate_exps_bytes;
@@ -2711,6 +2747,13 @@ static int q4e_token_span_impl(
         {
             set_last_error("qwen4exp token span: failed to allocate graph tensors.");
             return 0;
+        }
+        if (vram_log_enabled())
+        {
+            char tag[64];
+            std::snprintf(tag, sizeof(tag), "q4e-span [%d,%d) T=%d host=%zu",
+                layer_begin, layer_end, T, cpu_moe_layers.size());
+            vram_log(tag, static_cast<std::int64_t>(ggml_gallocr_get_buffer_size(alloc, 0)));
         }
         const double t_gal = q4e_phase_log() ? q4e_now_ms() : 0.0;
 

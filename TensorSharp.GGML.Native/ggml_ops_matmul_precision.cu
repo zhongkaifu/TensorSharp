@@ -278,7 +278,7 @@ bool tsg_matmul_id_quant_strip_supported(ggml_backend_t backend, const ggml_tens
 tsg_matmul_cuda_state * tsg_matmul_cuda_init(ggml_backend_t backend) {
     GGML_ASSERT(ggml_backend_is_cuda(backend));
     auto * context = static_cast<ggml_backend_cuda_context *>(backend->context);
-    CUDA_CHECK(cudaSetDevice(context->device));
+    ggml_cuda_set_device(context->device);
     auto * state = new tsg_matmul_cuda_state;
     state->device = context->device;
     state->stream = context->stream(context->device, 0);
@@ -292,7 +292,7 @@ tsg_matmul_cuda_state * tsg_matmul_cuda_init(ggml_backend_t backend) {
 
 void tsg_matmul_cuda_free(tsg_matmul_cuda_state * state) {
     if (!state) return;
-    CUDA_CHECK(cudaSetDevice(state->device));
+    ggml_cuda_set_device(state->device);
     CUDA_CHECK(cudaStreamSynchronize(state->stream));
     if (state->scratch) CUDA_CHECK(cudaFree(state->scratch));
     CUBLAS_CHECK(cublasDestroy(state->handle));
@@ -303,7 +303,7 @@ void tsg_matmul_cuda_compute(tsg_matmul_cuda_state * state, ggml_tensor * dst) {
     const auto * a = dst->src[0];
     const auto * b = dst->src[1];
     GGML_ASSERT(ggml_is_contiguous(dst));
-    CUDA_CHECK(cudaSetDevice(state->device));
+    ggml_cuda_set_device(state->device);
     if (tsg_matmul_id_quant_strip_type_supported(a->type)) {
         compute_quant_strip(state, dst);
         return;

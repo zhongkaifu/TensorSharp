@@ -8,6 +8,7 @@
 // TensorSharp is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using TensorSharp.Core;
 using TensorSharp.GGML;
@@ -291,6 +292,15 @@ namespace TensorSharp.Models
                 // this holder runs again. Check its flush status before a
                 // fused-kernel fallback can consume any older solo state.
                 if (_kvCacheHostStale) FlushArenaCache(_kCache);
+                // The VRAM plan reserved span scratch for at most _spanTokenCap
+                // tokens, narrowing as the KV the span reads grows. The scheduler
+                // hands whole prompt chunks (up to 4096+ tokens) straight here, so
+                // the width has to be enforced here, for image and speculative
+                // forwards too. Consecutive spans are exact: causal attention plus
+                // recurrent state carried in the cache.
+                if (tokens != null && tokens.Length > 1 && _spanTokenCap != int.MaxValue
+                    && tokens.Length > SpanTokensAt(_cacheSeqLen, _spanTokenCap, _spanKvRowTokenBudget, _maxContextLength))
+                    return ForwardInSpans(tokens);
                 return ForwardCoreInner(tokens);
             }
             catch
@@ -303,6 +313,65 @@ namespace TensorSharp.Models
                 foreach (var (emb, _) in _visionEmbeddingsList) emb?.Dispose();
                 _visionEmbeddingsList.Clear();
                 throw;
+            }
+        }
+
+        /// <summary>
+        /// Run one forward as consecutive spans no wider than the plan reserved for.
+        /// Per-forward state is cut with the tokens: an image prompt's (T,H,W)
+        /// position table is sliced, each queued image embedding is narrowed to the
+        /// rows that fall in the span, and a speculative forward's hidden and logits
+        /// outputs are written through offset pointers, so the result is the same as
+        /// the uncut forward's (logits for the last token, or every row).
+        /// </summary>
+        private float[] ForwardInSpans(int[] tokens)
+        {
+            int[] positions = _pendingMRoPEPositions;
+            if (positions != null && positions.Length < 3 * tokens.Length)
+                positions = null;   // ForwardCoreInner would ignore a short table too
+            var images = _visionEmbeddingsList.Count == 0
+                ? null
+                : new List<(Tensor Embeddings, int StartPosition)>(_visionEmbeddingsList);
+            _visionEmbeddingsList.Clear();
+            IntPtr hidden = _specHiddenOutput, logits = _specLogitsOutput;
+            bool allRows = _specForwardActive && _specAllLogitsRows;
+            try
+            {
+                float[] result = null;
+                for (int start = 0; start < tokens.Length;)
+                {
+                    int width = Math.Min(tokens.Length - start,
+                        SpanTokensAt(_cacheSeqLen, _spanTokenCap, _spanKvRowTokenBudget, _maxContextLength));
+                    int end = start + width;
+                    _pendingMRoPEPositions = positions?[(3 * start)..(3 * end)];
+                    if (images != null)
+                    {
+                        foreach (var (embeddings, at) in images)
+                        {
+                            if (embeddings == null || at < 0) continue;
+                            int lo = Math.Max(at, start), hi = Math.Min(at + (int)embeddings.Sizes[0], end);
+                            if (lo < hi)
+                                _visionEmbeddingsList.Add((embeddings.Narrow(0, lo - at, hi - lo), lo - start));
+                        }
+                    }
+                    if (_specForwardActive)
+                    {
+                        if (hidden != IntPtr.Zero)
+                            _specHiddenOutput = hidden + checked((nint)((long)start * SpecFeatureSize * sizeof(float)));
+                        if (allRows)
+                            _specLogitsOutput = logits + checked((nint)((long)start * Config.VocabSize * sizeof(float)));
+                    }
+                    result = ForwardCoreInner(tokens[start..end]);
+                    start = end;
+                }
+                return result;
+            }
+            finally
+            {
+                _specHiddenOutput = hidden;
+                _specLogitsOutput = logits;
+                if (images != null)
+                    foreach (var (embeddings, _) in images) embeddings?.Dispose();
             }
         }
 

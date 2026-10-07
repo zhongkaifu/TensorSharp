@@ -905,7 +905,11 @@ namespace TensorSharp.Cli
             {
                 Console.WriteLine($"Loading {Path.GetFileName(modelPath)} on {backend}...");
                 var sw = Stopwatch.StartNew();
-                var loaded = CreateModelForReload(modelPath, backend);
+                // The projector loads after the model, but a model that places its
+                // weights against free VRAM has to reserve room for it now.
+                (ModelBase Model, string DraftHeadError) loaded;
+                using (ModelBase.ExpectProjector(!string.IsNullOrEmpty(mmProjPath) && File.Exists(mmProjPath) ? mmProjPath : null))
+                    loaded = CreateModelForReload(modelPath, backend);
                 newModel = loaded.Model;
                 string draftHeadError = loaded.DraftHeadError;
                 if (draftHeadError != null)

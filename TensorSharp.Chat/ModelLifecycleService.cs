@@ -31,7 +31,7 @@ namespace TensorSharp.Server
         }
 
         /// <summary>Test seam: <paramref name="createModel"/> stands in for
-        /// <see cref="ModelBase.Create(string, BackendType, int, ITensorParallelGroup, string, int)"/>.</summary>
+        /// <see cref="ModelBase.Create(string, BackendType, int, ITensorParallelGroup, string, int, string)"/>.</summary>
         internal ModelLifecycleService(ILogger logger, Func<string, BackendType, ITensorParallelGroup, string, ModelBase> createModel)
         {
             _logger = logger ?? Microsoft.Extensions.Logging.Abstractions.NullLogger.Instance;
@@ -244,7 +244,10 @@ namespace TensorSharp.Server
                 // afterwards like Gemma 4's draft head: their weights have to be
                 // counted by the layer split and uploaded with the trunk.
                 string blockDraftPath = SpeculativeDraftHeadLoader.ConfiguredDraftHeadPath();
-                _model = _createModel(modelPath, _backend, tpGroup, blockDraftPath);
+                // The projector is loaded below, after the model exists; models that
+                // size their placement against device memory reserve room for it.
+                using (ModelBase.ExpectProjector(!string.IsNullOrEmpty(mmProjPath) && File.Exists(mmProjPath) ? mmProjPath : null))
+                    _model = _createModel(modelPath, _backend, tpGroup, blockDraftPath);
 
                 // A worker node (--tp-node-id > 0) spends its life blocked in a
                 // mirror loop and cannot also serve HTTP requests, so the server

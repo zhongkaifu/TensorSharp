@@ -458,8 +458,10 @@ namespace tsg
             if (dev != nullptr)
                 ggml_backend_dev_memory(dev, &free_b, &total_b);
         }
-        std::fprintf(stderr, "[TSVRAM] %-32s %9.1f MB | dev free %9.1f / %9.1f MB\n",
-            tag, bytes / (1024.0 * 1024.0),
+        // The rank names the device under a layer split, where every rank
+        // logs the same tags and the free figures would otherwise be anonymous.
+        std::fprintf(stderr, "[TSVRAM] %-32s %9.1f MB | dev%d free %9.1f / %9.1f MB\n",
+            tag, bytes / (1024.0 * 1024.0), ::tsg::g_active_rank,
             free_b / (1024.0 * 1024.0), total_b / (1024.0 * 1024.0));
         std::fflush(stderr);
     }

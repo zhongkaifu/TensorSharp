@@ -981,7 +981,7 @@ static void tsg_dsv4_backend_event_wait(ggml_backend_t backend, ggml_backend_eve
 static void tsg_dsv4_backend_synchronize(ggml_backend_t backend)
 {
     auto * c = (tsg_dsv4_backend_ctx *) backend->context;
-    CUDA_CHECK(cudaSetDevice(c->device));
+    ggml_cuda_set_device(c->device);
     // A successful submission does not guarantee successful execution. Surface
     // asynchronous kernel errors here instead of losing them until a later
     // peer copy or request touches this CUDA context.
@@ -1021,7 +1021,7 @@ tsg_dsv4_fused_counters tsg_dsv4_fused_counters_read()
 static enum ggml_status tsg_dsv4_backend_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph)
 {
     auto * c = (tsg_dsv4_backend_ctx *) backend->context;
-    CUDA_CHECK(cudaSetDevice(c->device));
+    ggml_cuda_set_device(c->device);
     cudaStream_t stream = tsg_dsv4_backend_stream(c);
     static const bool stats = []() { const char * e = getenv("TS_DSV4_PERF"); return e && atoi(e) >= 3; }();
     const auto submit_t0 = std::chrono::steady_clock::now();
