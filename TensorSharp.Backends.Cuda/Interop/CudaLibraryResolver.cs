@@ -4,22 +4,21 @@ using System.IO;
 using System.Linq;
 using System.Reflection;
 using System.Runtime.InteropServices;
-using System.Threading;
 
 namespace TensorSharp.Cuda.Interop
 {
     internal static class CudaLibraryResolver
     {
-        private static int registered;
-
-        public static void Register()
+        // Concurrent first callers must wait for installation to complete before
+        // entering P/Invoke; publishing a flag before SetDllImportResolver races.
+        private static readonly Lazy<bool> registration = new Lazy<bool>(() =>
         {
-            if (Interlocked.Exchange(ref registered, 1) != 0)
-                return;
-
             NativeLibrary.SetDllImportResolver(typeof(CudaLibraryResolver).Assembly, Resolve);
             EnsureWindowsCudaPath();
-        }
+            return true;
+        });
+
+        public static void Register() => _ = registration.Value;
 
         private static IntPtr Resolve(string libraryName, Assembly assembly, DllImportSearchPath? searchPath)
         {

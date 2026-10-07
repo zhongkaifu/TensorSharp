@@ -113958,3 +113958,165 @@ $L__BB148_11:
 	ret;
 
 }
+	// .globl	ts_silu_mul_clamp_quantize_q8_1_f32
+.visible .entry ts_silu_mul_clamp_quantize_q8_1_f32(
+	.param .u64 ts_silu_mul_clamp_quantize_q8_1_f32_param_0,
+	.param .u64 ts_silu_mul_clamp_quantize_q8_1_f32_param_1,
+	.param .u64 ts_silu_mul_clamp_quantize_q8_1_f32_param_2,
+	.param .u64 ts_silu_mul_clamp_quantize_q8_1_f32_param_3,
+	.param .u32 ts_silu_mul_clamp_quantize_q8_1_f32_param_4,
+	.param .u32 ts_silu_mul_clamp_quantize_q8_1_f32_param_5,
+	.param .f32 ts_silu_mul_clamp_quantize_q8_1_f32_param_6
+)
+{
+	.reg .pred 	%p<19>;
+	.reg .b16 	%rs<5>;
+	.reg .b32 	%r<38>;
+	.reg .f32 	%f<48>;
+	.reg .b64 	%rd<26>;
+
+	ld.param.u64 	%rd7, [ts_silu_mul_clamp_quantize_q8_1_f32_param_0];
+	ld.param.u64 	%rd8, [ts_silu_mul_clamp_quantize_q8_1_f32_param_1];
+	ld.param.u64 	%rd10, [ts_silu_mul_clamp_quantize_q8_1_f32_param_2];
+	ld.param.u64 	%rd9, [ts_silu_mul_clamp_quantize_q8_1_f32_param_3];
+	ld.param.u32 	%r4, [ts_silu_mul_clamp_quantize_q8_1_f32_param_4];
+	ld.param.u32 	%r5, [ts_silu_mul_clamp_quantize_q8_1_f32_param_5];
+	ld.param.f32 	%f2, [ts_silu_mul_clamp_quantize_q8_1_f32_param_6];
+	cvta.to.global.u64 	%rd1, %rd10;
+	mov.u32 	%r6, %tid.x;
+	and.b32  	%r1, %r6, 31;
+	mov.u32 	%r7, %ctaid.x;
+	mov.u32 	%r8, %ntid.x;
+	mul.wide.u32 	%rd11, %r7, %r8;
+	cvt.u64.u32 	%rd12, %r6;
+	add.s64 	%rd2, %rd11, %rd12;
+	shr.u64 	%rd3, %rd2, 5;
+	shr.s32 	%r9, %r4, 31;
+	shr.u32 	%r10, %r9, 27;
+	add.s32 	%r11, %r4, %r10;
+	shr.s32 	%r12, %r11, 5;
+	mul.wide.s32 	%rd13, %r5, %r12;
+	setp.ge.s64 	%p1, %rd3, %rd13;
+	@%p1 bra 	$L__BB149_6;
+	cvta.to.global.u64 	%rd14, %rd7;
+	cvta.to.global.u64 	%rd15, %rd8;
+	and.b64  	%rd16, %rd2, 8796093022176;
+	cvt.u64.u32 	%rd4, %r1;
+	or.b64  	%rd5, %rd16, %rd4;
+	shl.b64 	%rd17, %rd5, 2;
+	add.s64 	%rd18, %rd14, %rd17;
+	ld.global.f32 	%f3, [%rd18];
+	add.s64 	%rd19, %rd15, %rd17;
+	ld.global.f32 	%f4, [%rd19];
+	setp.gt.f32 	%p2, %f2, 0f00000000;
+	neg.f32 	%f5, %f2;
+	max.f32 	%f6, %f4, %f5;
+	min.f32 	%f7, %f6, %f2;
+	min.f32 	%f8, %f3, %f2;
+	selp.f32 	%f9, %f8, %f3, %p2;
+	selp.f32 	%f10, %f7, %f4, %p2;
+	fma.rn.f32 	%f11, %f9, 0fBBBB989D, 0f3F000000;
+	cvt.sat.f32.f32 	%f12, %f11;
+	mov.f32 	%f13, 0f4B400001;
+	mov.f32 	%f14, 0f437C0000;
+	fma.rm.f32 	%f15, %f12, %f14, %f13;
+	add.f32 	%f16, %f15, 0fCB40007F;
+	neg.f32 	%f17, %f16;
+	fma.rn.f32 	%f18, %f9, 0fBFB8AA3B, %f17;
+	fma.rn.f32 	%f19, %f9, 0fB2A57060, %f18;
+	mov.b32 	%r13, %f15;
+	shl.b32 	%r14, %r13, 23;
+	mov.b32 	%f20, %r14;
+	ex2.approx.ftz.f32 	%f21, %f19;
+	fma.rn.f32 	%f22, %f21, %f20, 0f3F800000;
+	div.rn.f32 	%f23, %f9, %f22;
+	mul.rn.f32 	%f24, %f10, %f23;
+	st.global.f32 	[%rd18], %f24;
+	abs.f32 	%f25, %f24;
+	max.f32 	%f26, %f25, 0f00000000;
+	mov.b32 	%r15, %f26;
+	shfl.sync.down.b32	%r16|%p3, %r15, 16, 31, -1;
+	mov.b32 	%f27, %r16;
+	max.f32 	%f28, %f26, %f27;
+	mov.b32 	%r17, %f28;
+	shfl.sync.down.b32	%r18|%p4, %r17, 8, 31, -1;
+	mov.b32 	%f29, %r18;
+	max.f32 	%f30, %f28, %f29;
+	mov.b32 	%r19, %f30;
+	shfl.sync.down.b32	%r20|%p5, %r19, 4, 31, -1;
+	mov.b32 	%f31, %r20;
+	max.f32 	%f32, %f30, %f31;
+	mov.b32 	%r21, %f32;
+	shfl.sync.down.b32	%r22|%p6, %r21, 2, 31, -1;
+	mov.b32 	%f33, %r22;
+	max.f32 	%f34, %f32, %f33;
+	mov.b32 	%r23, %f34;
+	shfl.sync.down.b32	%r24|%p7, %r23, 1, 31, -1;
+	mov.b32 	%f35, %r24;
+	max.f32 	%f36, %f34, %f35;
+	mov.b32 	%r25, %f36;
+	shfl.sync.idx.b32	%r26|%p8, %r25, 0, 31, -1;
+	mov.b32 	%f37, %r26;
+	setp.gt.f32 	%p9, %f37, 0f00000000;
+	div.rn.f32 	%f38, %f37, 0f42FE0000;
+	selp.f32 	%f1, %f38, 0f00000000, %p9;
+	setp.gt.f32 	%p10, %f1, 0f00000000;
+	rcp.rn.f32 	%f39, %f1;
+	selp.f32 	%f40, %f39, 0f00000000, %p10;
+	mul.f32 	%f41, %f24, %f40;
+	cvt.rni.f32.f32 	%f42, %f41;
+	cvt.rzi.s32.f32 	%r27, %f42;
+	min.s32 	%r28, %r27, 127;
+	max.s32 	%r2, %r28, -127;
+	setp.eq.s64 	%p11, %rd9, 0;
+	@%p11 bra 	$L__BB149_4;
+	add.s64 	%rd20, %rd1, %rd5;
+	st.global.u8 	[%rd20], %r2;
+	setp.ne.s32 	%p12, %r1, 0;
+	@%p12 bra 	$L__BB149_6;
+	// begin inline asm
+	{  cvt.rn.f16.f32 %rs1, %f1;}
+
+	// end inline asm
+	// begin inline asm
+	{  cvt.f32.f16 %f44, %rs1;}
+
+	// end inline asm
+	cvta.to.global.u64 	%rd21, %rd9;
+	shl.b64 	%rd22, %rd3, 2;
+	add.s64 	%rd23, %rd21, %rd22;
+	st.global.f32 	[%rd23], %f44;
+	bra.uni 	$L__BB149_6;
+$L__BB149_4:
+	mul.lo.s64 	%rd24, %rd3, 36;
+	add.s64 	%rd6, %rd1, %rd24;
+	add.s64 	%rd25, %rd4, %rd6;
+	st.global.u8 	[%rd25+4], %r2;
+	shfl.sync.down.b32	%r29|%p13, %r2, 16, 31, -1;
+	add.s32 	%r30, %r29, %r2;
+	shfl.sync.down.b32	%r31|%p14, %r30, 8, 31, -1;
+	add.s32 	%r32, %r31, %r30;
+	shfl.sync.down.b32	%r33|%p15, %r32, 4, 31, -1;
+	add.s32 	%r34, %r33, %r32;
+	shfl.sync.down.b32	%r35|%p16, %r34, 2, 31, -1;
+	add.s32 	%r36, %r35, %r34;
+	shfl.sync.down.b32	%r37|%p17, %r36, 1, 31, -1;
+	add.s32 	%r3, %r37, %r36;
+	setp.ne.s32 	%p18, %r1, 0;
+	@%p18 bra 	$L__BB149_6;
+	// begin inline asm
+	{  cvt.rn.f16.f32 %rs3, %f1;}
+
+	// end inline asm
+	st.global.u16 	[%rd6], %rs3;
+	cvt.rn.f32.s32 	%f47, %r3;
+	mul.f32 	%f46, %f1, %f47;
+	// begin inline asm
+	{  cvt.rn.f16.f32 %rs4, %f46;}
+
+	// end inline asm
+	st.global.u16 	[%rd6+2], %rs4;
+$L__BB149_6:
+	ret;
+
+}

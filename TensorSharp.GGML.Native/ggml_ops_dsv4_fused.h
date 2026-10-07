@@ -60,6 +60,9 @@ enum tsg_dsv4_fused_kind : int32_t
     // Unmasked F32 vision attention. Inputs [D,N,H,B], output [D,H,N,B].
     // Cooperatively stage K/V tiles across queries; softmax stays F32.
     TSG_ATTN_VISION_F32         = 24,
+    // Qwen4Exp prefill: sum_k round(expert[k] * route[k]) in expert order.
+    // Separate F32 multiplies/adds match its materialized upstream graph.
+    TSG_Q4E_EXPERT_REDUCE       = 25,
 };
 
 #define TSG_DSV4_FUSED_MAGIC 0x5453445356344655ull  // "TSDSV4FU"

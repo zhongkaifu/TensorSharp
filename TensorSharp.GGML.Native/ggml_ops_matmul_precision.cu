@@ -109,7 +109,7 @@ struct tsg_matmul_cuda_state {
 };
 
 namespace {
-void reserve_scratch(tsg_matmul_cuda_state * state, size_t needed) {
+void reserve_scratch(tsg_matmul_cuda_state * state, size_t needed, const ggml_tensor * node) {
     if (needed <= state->capacity) return;
     // Fused nodes run between captured graph views. Scratch belongs to this
     // TensorSharp backend and persists across nodes; no ggml private pool or
@@ -120,6 +120,12 @@ void reserve_scratch(tsg_matmul_cuda_state * state, size_t needed) {
     CUDA_CHECK(cudaStreamSynchronize(state->stream));
     size_t requested = needed;
 #if defined(TSG_GGML_TEST_HOOKS)
+    if (const char * limit = std::getenv("TS_TP_TEST_MAX_SCRATCH")) {
+        const auto maximum = std::strtoull(limit, nullptr, 10);
+        if (maximum && needed > maximum)
+            throw std::runtime_error("TensorSharp CUDA matmul scratch exceeds test ceiling: requested="
+                + std::to_string(needed) + "; maximum=" + std::to_string(maximum));
+    }
     if (const char * fault = std::getenv("TS_TP_TEST_FAIL_SCRATCH_GROWTH"))
         if (fault[0] == '1') throw std::runtime_error("Injected TensorSharp CUDA matmul scratch growth failure");
     if (const char * fault = std::getenv("TS_TP_TEST_EXHAUST_SCRATCH")) {
@@ -140,7 +146,23 @@ void reserve_scratch(tsg_matmul_cuda_state * state, size_t needed) {
         // exception boundary. Leave the old allocation usable on retry and
         // do not let the handled error poison the next kernel's error check.
         cudaGetLastError();
-        throw std::runtime_error(std::string("Cannot grow TensorSharp CUDA matmul scratch: ") + cudaGetErrorString(status));
+        size_t available = 0, total = 0;
+        const auto info_status = cudaMemGetInfo(&available, &total);
+        if (info_status != cudaSuccess) cudaGetLastError();
+        const auto * weights = node->src[0];
+        const auto * input = node->src[1];
+        throw std::runtime_error(std::string("Cannot grow TensorSharp CUDA matmul scratch: ") + cudaGetErrorString(status)
+            + "; device=" + std::to_string(state->device)
+            + "; requested=" + std::to_string(requested)
+            + "; retained=" + std::to_string(state->capacity)
+            + "; free=" + std::to_string(available)
+            + "; total=" + std::to_string(total)
+            + "; node=" + node->name
+            + "; weights=" + ggml_type_name(weights->type)
+            + "[" + std::to_string(weights->ne[0]) + "," + std::to_string(weights->ne[1])
+            + "," + std::to_string(weights->ne[2]) + "," + std::to_string(weights->ne[3]) + "]"
+            + "; input=[" + std::to_string(input->ne[0]) + "," + std::to_string(input->ne[1])
+            + "," + std::to_string(input->ne[2]) + "," + std::to_string(input->ne[3]) + "]");
     }
     if (state->scratch) CUDA_CHECK(cudaFree(state->scratch));
     state->scratch = replacement;
@@ -175,8 +197,15 @@ void compute_quant_strip(tsg_matmul_cuda_state * state, ggml_tensor * dst) {
         init_fastdiv_values((tokens + width - 1) / width)};
     const int blocks = quant_strip_active_blocks(a, config, state->device);
     const int matrices = dst->src[3] ? 2 : 1;
-    const size_t partial_bytes = size_t(blocks) * width * config.I * sizeof(float);
-    reserve_scratch(state, partial_offset + matrices * partial_bytes);
+    // At high tile occupancy the launch assigns complete tiles to blocks.
+    // Neither the main kernel nor the fixup then touches partial storage.
+    // Allocating it unconditionally scales as tokens * ALL experts * rows,
+    // costing gigabytes for a 512-expert image prefill despite sparse routing.
+    // Match the launcher's fixup condition (and unchanged upstream MMQ).
+    const int tiles = (a.full_rows / config.I) * a.ntx.z * a.experts;
+    const bool needs_partial = tiles % a.virtual_blocks != 0;
+    const size_t partial_bytes = needs_partial ? size_t(blocks) * width * config.I * sizeof(float) : 0;
+    reserve_scratch(state, partial_offset + matrices * partial_bytes, dst);
     auto * scratch = reinterpret_cast<char *>(state->scratch);
     auto * input_ids = reinterpret_cast<int32_t *>(scratch + input_offset);
     auto * output_ids = reinterpret_cast<int32_t *>(scratch + output_offset);
@@ -196,11 +225,11 @@ void compute_quant_strip(tsg_matmul_cuda_state * state, ggml_tensor * dst) {
     a.input = reinterpret_cast<const int *>(scratch + quant_offset);
     a.ids = output_ids;
     a.bounds = bounds;
-    a.partial = reinterpret_cast<float *>(scratch + partial_offset);
+    a.partial = needs_partial ? reinterpret_cast<float *>(scratch + partial_offset) : nullptr;
     if (matrices == 2) {
         a.weights2 = static_cast<const char *>(dst->src[3]->data);
         a.out2 = reinterpret_cast<float *>(static_cast<char *>(dst->data)+dst->nb[3]);
-        a.partial2 = reinterpret_cast<float *>(scratch + partial_offset + partial_bytes);
+        a.partial2 = needs_partial ? reinterpret_cast<float *>(scratch + partial_offset + partial_bytes) : nullptr;
     }
     switch (w->type) {
 #define TSG_STRIP_TYPE(TYPE) case TYPE: dispatch_quant_strip<TYPE>(state->device, state->stream, width, a); break;
@@ -311,7 +340,7 @@ void tsg_matmul_cuda_compute(tsg_matmul_cuda_state * state, ggml_tensor * dst) {
     const size_t count_a = pack_a ? (size_t(ggml_nelements(a)) + 63) / 64 * 64 : 0;
     const size_t count_b = pack_b ? size_t(ggml_nelements(b)) : 0;
     const size_t needed = (count_a + count_b) * sizeof(float);
-    reserve_scratch(state, needed);
+    reserve_scratch(state, needed, dst);
     auto prepare = [&](const ggml_tensor * t, bool pack, float * scratch, tensor_layout & l) -> const char * {
         l = layout(t);
         if (!pack) return static_cast<const char *>(t->data);

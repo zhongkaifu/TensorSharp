@@ -845,16 +845,21 @@ namespace TensorSharp.Cuda
                 kernels.LaunchMoEExpertGateUpVecF32(upPtrTable, selPtr, moeInPtr, uPtr, gateUpType, hiddenDim, nFf, nUsed, stream);
             }
 
-            kernels.LaunchSiluMulF32(gPtr, gPtr, uPtr, (long)nUsed * nFf, stream);
-
             if (downDp4a)
             {
                 IntPtr hQ8 = DeviceBufferOf(gateOutQ8);
-                kernels.LaunchQuantizeQ81Rows(gPtr, hQ8, nFf, nUsed, stream, warpCooperative: true);
+                if (CudaKernels.MoeFusionEnabled && kernels.SupportsFusedMoeQuantize)
+                    kernels.LaunchSiluMulClampQuantizeQ81(gPtr, uPtr, hQ8, IntPtr.Zero, nFf, nUsed, 0f, stream);
+                else
+                {
+                    kernels.LaunchSiluMulF32(gPtr, gPtr, uPtr, (long)nUsed * nFf, stream);
+                    kernels.LaunchQuantizeQ81Rows(gPtr, hQ8, nFf, nUsed, stream, warpCooperative: true);
+                }
                 kernels.LaunchMoEExpertDownDp4a(downPtrTable, selPtr, rwPtr, hQ8, outPtr, downType, nFf, hiddenDim, nUsed, stream);
             }
             else
             {
+                kernels.LaunchSiluMulF32(gPtr, gPtr, uPtr, (long)nUsed * nFf, stream);
                 kernels.LaunchMoEExpertDownAccumF32(downPtrTable, selPtr, rwPtr, gPtr, outPtr, downType, nFf, hiddenDim, nUsed, stream);
             }
 
@@ -972,16 +977,21 @@ namespace TensorSharp.Cuda
                 kernels.LaunchMoEExpertGateUpBatchedVec(upPtrTable, selPtr, moeInPtr, uPtr, gateUpType, hiddenDim, nFf, nUsed, numTokens, stream);
             }
 
-            kernels.LaunchSiluMulF32(gPtr, gPtr, uPtr, (long)numTokens * nUsed * nFf, stream);
-
             if (downDp4a)
             {
                 IntPtr hQ8 = DeviceBufferOf(gateOutQ8);
-                kernels.LaunchQuantizeQ81Rows(gPtr, hQ8, nFf, numTokens * nUsed, stream, warpCooperative: true);
+                if (CudaKernels.MoeFusionEnabled && kernels.SupportsFusedMoeQuantize)
+                    kernels.LaunchSiluMulClampQuantizeQ81(gPtr, uPtr, hQ8, IntPtr.Zero, nFf, numTokens * nUsed, 0f, stream);
+                else
+                {
+                    kernels.LaunchSiluMulF32(gPtr, gPtr, uPtr, (long)numTokens * nUsed * nFf, stream);
+                    kernels.LaunchQuantizeQ81Rows(gPtr, hQ8, nFf, numTokens * nUsed, stream, warpCooperative: true);
+                }
                 kernels.LaunchMoEExpertDownBatchedDp4a(downPtrTable, selPtr, rwPtr, hQ8, outPtr, downType, nFf, hiddenDim, nUsed, numTokens, stream);
             }
             else
             {
+                kernels.LaunchSiluMulF32(gPtr, gPtr, uPtr, (long)numTokens * nUsed * nFf, stream);
                 kernels.LaunchMoEExpertDownBatchedAccum(downPtrTable, selPtr, rwPtr, gPtr, outPtr, downType, nFf, hiddenDim, nUsed, numTokens, stream);
             }
 

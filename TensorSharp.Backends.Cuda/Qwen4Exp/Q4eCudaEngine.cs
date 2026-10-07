@@ -394,7 +394,7 @@ namespace TensorSharp.Cuda
             b += nt * ((long)ConvDim + 3L * ValueDim) * 4 + nt * m.GdnVHeads * (4L * Q4eKernels.GdnHeadDim + 1) * 4;
             b += nt * (long)m.NHead * m.HeadDim * 4 * 5;
             b += nt * (long)(m.NCtx / 4 + m.IdxTopK + 4) * 4;
-            b += CudaMoeScratch.Bytes(m.NUbatch, m.NExpertUsed, m.NEmbd, Math.Max(m.NFfExp, 1));
+            b += CudaMoeScratch.Bytes(m.NUbatch, m.NExpertUsed, m.NEmbd, Math.Max(m.NFfExp, 1), m.NExpert);
             b += 3 * nt * (long)m.NFfShexp * 4;
             return b + (256L << 20);
         }

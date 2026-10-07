@@ -44,7 +44,7 @@ do not attribute differences in these Agent image timings to encoder cache reuse
 
 | scenario | what it sends |
 | --- | --- |
-| `short` | a tiny prompt with a one-line system prompt |
+| `short` | a tiny prompt with a one-line system prompt; `--short-prompt <text>` overrides the default "Say the single word: apple." |
 | `long` | an agent system prompt plus a long pasted source file (`--long`, default 4096 tokens) |
 | `tool` | a turn, the same conversation extended by a `--tool`-token tool result (default 3000), then a short follow-up — rendered through the chat template with the model's raw output tokens spliced in, as the server does |
 | `newchat` | two conversations sharing the system prompt (the shared-prefix checkpoint) |

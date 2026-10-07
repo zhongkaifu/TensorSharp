@@ -141,6 +141,11 @@ namespace TensorSharp.Cuda
         private readonly IntPtr quantMatmulQ80Dp4aF32;
         private readonly IntPtr quantizeQ81RowsF32;
         private readonly IntPtr quantizeQ81RowsWarpF32;
+        private readonly IntPtr siluMulClampQuantizeQ81F32;
+
+        // Process-wide A/B switch: also restores independent MoE scratch buffers.
+        internal static bool MoeFusionEnabled { get; } =
+            Environment.GetEnvironmentVariable("TENSORSHARP_CUDA_MOE_FUSION") != "0";
         private readonly IntPtr dequantWeightF16;
         private readonly IntPtr dequantWeightQ80F16;
         private readonly IntPtr convertF32F16;
@@ -303,6 +308,9 @@ namespace TensorSharp.Cuda
             quantMatmulQ80Dp4aF32 = module.GetFunction("ts_quant_matmul_q8_0_dp4a_f32");
             quantizeQ81RowsF32 = module.GetFunction("ts_quantize_q8_1_rows_f32");
             quantizeQ81RowsWarpF32 = module.GetFunction("ts_quantize_q8_1_rows_warp_f32");
+            // Older deployed PTX can still run the two-launch implementation.
+            try { siluMulClampQuantizeQ81F32 = module.GetFunction("ts_silu_mul_clamp_quantize_q8_1_f32"); }
+            catch (CudaException ex) when (ex.ErrorCode == 500) { } // CUDA_ERROR_NOT_FOUND
             quantizeQ81SplitRowsF32 = module.GetFunction("ts_quantize_q8_1_split_rows_f32");
             dequantWeightF16 = module.GetFunction("ts_dequant_weight_f16");
             dequantWeightQ80F16 = module.GetFunction("ts_dequant_weight_q8_0_f16");
@@ -2842,6 +2850,32 @@ namespace TensorSharp.Cuda
             Launch(
                 warpCooperative ? quantizeQ81RowsWarpF32 : quantizeQ81RowsF32,
                 grid, 1, 1, BlockSize, 1, 1, 0, stream, args);
+        }
+
+        /// <summary>Clamped SwiGLU plus q8_1 quantization. Updates gate in place.
+        /// A nonzero scales pointer selects dense split output, otherwise interleaved.
+        /// The optional override supports bitwise parity checks without changing global state.</summary>
+        internal bool SupportsFusedMoeQuantize => siluMulClampQuantizeQ81F32 != IntPtr.Zero;
+
+        public void LaunchSiluMulClampQuantizeQ81(IntPtr gate, IntPtr up, IntPtr output, IntPtr scales,
+            int inDim, int rows, float limit, IntPtr stream, bool? fused = null)
+        {
+            if (inDim <= 0 || inDim % 32 != 0)
+                throw new ArgumentOutOfRangeException(nameof(inDim), "q8_1 rows must contain complete 32-value blocks.");
+            if (rows < 0) throw new ArgumentOutOfRangeException(nameof(rows));
+            if (rows == 0) return;
+            if (!(fused ?? MoeFusionEnabled) || !SupportsFusedMoeQuantize)
+            {
+                LaunchSiluMulClampF32(gate, gate, up, (long)inDim * rows, limit, stream);
+                if (scales == IntPtr.Zero)
+                    LaunchQuantizeQ81Rows(gate, output, inDim, rows, stream, warpCooperative: true);
+                else
+                    LaunchQuantizeQ81SplitRows(gate, output, scales, inDim, rows, stream);
+                return;
+            }
+            void** args = stackalloc void*[] { &gate, &up, &output, &scales, &inDim, &rows, &limit };
+            uint grid = checked((uint)(((long)rows * inDim + BlockSize - 1) / BlockSize));
+            Launch(siluMulClampQuantizeQ81F32, grid, 1, 1, BlockSize, 1, 1, 0, stream, args);
         }
 
         // Split-layout q8_1 quantization (dense qs rows + separate float scales)
