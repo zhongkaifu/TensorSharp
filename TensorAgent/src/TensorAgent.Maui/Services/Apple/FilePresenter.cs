@@ -37,6 +37,29 @@ namespace TensorAgent.Maui.Services;
 /// </summary>
 internal static class FilePresenter
 {
+    /// <summary>Export a copy of an image to Files on iOS or a chosen folder on Mac.</summary>
+    public static async Task<string?> SaveAsync(string fullPath)
+    {
+        if (string.IsNullOrEmpty(fullPath) || !File.Exists(fullPath))
+            return Loc.T("app.openFile.missing");
+
+        try
+        {
+            UIViewController host = TopViewController()
+                ?? throw new InvalidOperationException("The save dialog could not find an active window.");
+            // Exporting as a copy preserves the cached result that saved chats use.
+            // A share sheet on Mac Catalyst does not necessarily offer Save to Files.
+            var picker = new UIDocumentPickerViewController([NSUrl.FromFilename(fullPath)], true);
+            await host.PresentViewControllerAsync(picker, true);
+            return null;
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"TensorAgent: saving {Path.GetFileName(fullPath)} failed: {ex.Message}");
+            return ex.Message;
+        }
+    }
+
     /// <summary>
     /// Preview <paramref name="fullPath"/>, or share it when it cannot be previewed.
     /// Returns the failure to report, or null when something was presented.

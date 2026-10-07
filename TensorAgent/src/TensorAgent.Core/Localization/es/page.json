@@ -50,6 +50,8 @@
   "page.trace.seconds": "{seconds} s",
   "page.trace.unnamedFile": "archivo",
   "page.trace.kilobytes": "{size} KB",
+  "page.image.download": "Descargar",
+  "page.image.downloadFailed": "No se pudo descargar la imagen: {error}",
   "page.image.generatedAlt": "imagen generada",
   "page.image.compareOriginal": "Comparar con el original",
   "page.image.showResult": "Mostrar resultado",
