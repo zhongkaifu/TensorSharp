@@ -2381,7 +2381,23 @@
       }
       autoGrow(); paintChips(); text.focus();
     });
-    actions.appendChild(again); bubble.appendChild(actions);
+    actions.appendChild(again);
+    // Keep the finished file's URL even while Compare original changes the preview.
+    // Browsers can download this same-origin link; the app's WebView needs a native
+    // save/share picker, since it has no browser download manager.
+    var download = el('a', 'filechip image-download', t('page.image.download'));
+    download.href = resultUrl;
+    download.download = uploadName(resultUrl);
+    download.addEventListener('click', function (ev) {
+      if (!state.native || ev.defaultPrevented || ev.button) return;
+      ev.preventDefault();
+      post('/api/agent/events', { type: 'save-image', url: resultUrl, name: download.download })
+        .catch(function (error) {
+          notice(t('page.image.downloadFailed', { error: (error && error.message) || error }), 'error');
+        });
+    });
+    actions.appendChild(download);
+    bubble.appendChild(actions);
   }
 
   function selectImageArea(attachment) {

@@ -50,6 +50,8 @@
   "page.trace.seconds": "{seconds} 秒",
   "page.trace.unnamedFile": "文件",
   "page.trace.kilobytes": "{size} KB",
+  "page.image.download": "下载",
+  "page.image.downloadFailed": "无法下载图像：{error}",
   "page.image.generatedAlt": "生成的图像",
   "page.image.compareOriginal": "对比原图",
   "page.image.showResult": "显示结果",

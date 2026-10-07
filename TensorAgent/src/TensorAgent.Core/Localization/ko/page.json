@@ -50,6 +50,8 @@
   "page.trace.seconds": "{seconds}초",
   "page.trace.unnamedFile": "파일",
   "page.trace.kilobytes": "{size} KB",
+  "page.image.download": "다운로드",
+  "page.image.downloadFailed": "이미지를 다운로드하지 못했습니다: {error}",
   "page.image.generatedAlt": "생성된 이미지",
   "page.image.compareOriginal": "원본과 비교",
   "page.image.showResult": "결과 표시",

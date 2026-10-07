@@ -111,7 +111,8 @@ public sealed partial class WebUiPageTests
         Assert.Equal("mask.png", message.GetProperty("maskPath").GetString());
         Assert.Equal(new[] { "source.png" }, Strings(message, "stillImagePaths"));
         Assert.Contains("Drawing with Film Stills… step 1 of 6", Strings(result, "progress"));
-        Assert.Equal("/uploads/result.png", Assert.Single(result.GetProperty("media").EnumerateArray()).GetProperty("src").GetString());
+        JsonElement picture = Assert.Single(result.GetProperty("media").EnumerateArray(), m => m.GetProperty("tag").GetString() == "IMG");
+        Assert.Equal("/uploads/result.png", picture.GetProperty("src").GetString());
         Assert.Empty(Strings(result, "errors"));
     }
 
