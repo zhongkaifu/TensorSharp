@@ -8091,3 +8091,55 @@ extern "C" __global__ void ts_wan_upsample2x_f32(
     const int c = (int)(idx / ((long long)W2 * 2 * H));
     dst[idx] = src[((size_t)c * H + (oy >> 1)) * W + (ox >> 1)];
 }
+
+// Fused expert activation + quantization, inspired by Strata's grouped expert
+// path. Each warp owns one complete 32-value block; trailing warps return as a
+// unit so the full shuffle mask remains valid. Input widths are multiples of 32.
+// Keep the activated gate for callers that inspect/reuse it. The explicit
+// rounded product preserves the store/load boundary in the two-kernel path.
+extern "C" __global__ void ts_silu_mul_clamp_quantize_q8_1_f32(
+    float* gate, const float* up, void* output, float* scales,
+    int in_dim, int rows, float limit)
+{
+    int lane = threadIdx.x & 31;
+    long long block = (((long long)blockIdx.x * blockDim.x) + threadIdx.x) >> 5;
+    if (block >= (long long)rows * (in_dim / TS_QK8_1))
+        return;
+    size_t i = (size_t)block * TS_QK8_1 + lane;
+    float g = gate[i], u = up[i];
+    if (limit > 0.0f)
+    {
+        u = fminf(fmaxf(u, -limit), limit);
+        g = fminf(g, limit);
+    }
+    float x = __fmul_rn(u, silu(g));
+    gate[i] = x;
+    float amax = fmaxf(0.0f, fabsf(x));
+#pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1)
+        amax = fmaxf(amax, __shfl_down_sync(0xFFFFFFFF, amax, offset));
+    amax = __shfl_sync(0xFFFFFFFF, amax, 0);
+    float d = amax > 0.0f ? amax / 127.0f : 0.0f;
+    float id = d > 0.0f ? 1.0f / d : 0.0f;
+    int q = max(-127, min(127, (int)rintf(x * id)));
+    if (scales != nullptr)
+    {
+        ((int8_t*)output)[i] = (int8_t)q;
+        if (lane == 0)
+            scales[block] = __half2float(__float2half_rn(d));
+    }
+    else
+    {
+        ts_block_q8_1* dst = (ts_block_q8_1*)output + block;
+        dst->qs[lane] = (int8_t)q;
+        int sum = q;
+#pragma unroll
+        for (int offset = 16; offset > 0; offset >>= 1)
+            sum += __shfl_down_sync(0xFFFFFFFF, sum, offset);
+        if (lane == 0)
+        {
+            dst->d = __float2half_rn(d);
+            dst->s = __float2half_rn(d * (float)sum);
+        }
+    }
+}

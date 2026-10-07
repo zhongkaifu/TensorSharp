@@ -10,6 +10,7 @@
 #include "ggml_ops_internal.h"
 #include "ggml-impl.h"
 #include "ggml_ops_qwen4exp_qsa.h"
+#include "ggml_ops_qwen4exp_reduce.h"
 #include "ggml_ops_matmul_precision.h"
 #include "ggml_ops_dsv4_fused.h"
 #include "ggml_ops_precision_policy.h"
@@ -98,6 +99,9 @@ namespace
         bool keep_fusion_inputs = false;  // graph of at most TSG_PRECISION_DECODE_COLUMNS tokens
     };
     thread_local Q4eRowKernels g_q4e_row_kernels;
+    // Set only by a token-span builder paired with the owned CUDA backend.
+    // Standalone half-layer and arena graphs keep their existing ggml nodes.
+    thread_local bool g_q4e_prefill_combine = false;
     // Populated only while building a tensor-sliced FFN span.
     thread_local std::vector<ggml_tensor*>* g_q4e_tp_partials = nullptr;
     thread_local std::deque<tsg_dsv4_fused_desc>* g_q4e_tp_matmuls = nullptr;
@@ -1078,29 +1082,34 @@ ggml_tensor* q4e_nodes_ffn(
         }
         ggml_tensor* experts = q4e_tp_projection(ctx, w_down_e, par, sel, n_embd, output_rows, rank * output_rows);
         ggml_set_name(experts, "q4e.ffn.expert_down");
-        q4e_keep_fusion_input(experts);   // weighted-reduction fusion inputs: see Q4eRowKernels
-        experts = ggml_mul(ctx, experts, w_sel);
-#ifdef TSG_GGML_USE_CUDA
-        if (ggml_backend_is_cuda(g_backend) && T > TSG_PRECISION_DECODE_COLUMNS)
+        if (g_q4e_prefill_combine)
+            moe_out = tsg_q4e_prefill_expert_reduce(ctx, experts, w_sel);
+        if (moe_out == nullptr)
         {
-            // Span cuts and TP gathers change buffer lifetimes and can enable
-            // CUDA's MoE multiply/add fusion where another layout executes separate
-            // operations. That introduces FMAs and changes rounding before the
-            // next quantized activation. Materialize weighted experts in every
-            // prefill layout so the sum always uses separate multiplies and
-            // sequential adds, independently of allocation and sharding.
-            // CONT is a liveness barrier only here, not a graph-lifetime output.
-            experts = ggml_cont(ctx, experts);
-        }
+            q4e_keep_fusion_input(experts);   // weighted-reduction fusion inputs: see Q4eRowKernels
+            experts = ggml_mul(ctx, experts, w_sel);
+#ifdef TSG_GGML_USE_CUDA
+            if (ggml_backend_is_cuda(g_backend) && T > TSG_PRECISION_DECODE_COLUMNS)
+            {
+                // Span cuts and TP gathers change buffer lifetimes and can enable
+                // CUDA's MoE multiply/add fusion where another layout executes separate
+                // operations. That introduces FMAs and changes rounding before the
+                // next quantized activation. Materialize weighted experts in every
+                // prefill layout so the sum always uses separate multiplies and
+                // sequential adds, independently of allocation and sharding.
+                // CONT is a liveness barrier only here, not a graph-lifetime output.
+                experts = ggml_cont(ctx, experts);
+            }
 #endif
 
-        moe_out = ggml_view_2d(ctx, experts, output_rows, T,
+            moe_out = ggml_view_2d(ctx, experts, output_rows, T,
                 experts->nb[2], 0);
-        for (int k = 1; k < n_expert_used; ++k)
-        {
-            ggml_tensor* s = ggml_view_2d(ctx, experts, output_rows, T,
+            for (int k = 1; k < n_expert_used; ++k)
+            {
+                ggml_tensor* s = ggml_view_2d(ctx, experts, output_rows, T,
                     experts->nb[2], (std::size_t)k * experts->nb[1]);
-            moe_out = ggml_add(ctx, moe_out, s);
+                moe_out = ggml_add(ctx, moe_out, s);
+            }
         }
     }
 
@@ -2363,7 +2372,9 @@ static int q4e_token_span_impl(
         const int row_kv_count = verify_rows && has_attn ? T : 0;
         for (int r = 0; r < row_kv_count; ++r)
             row_kv[r] = q4e_pad_kv(n_kv - T + r + 1, kv_capacity, use_flash);
-        struct RowKernelScope { ~RowKernelScope() { g_q4e_row_kernels = Q4eRowKernels{}; } } row_kernel_scope;
+        struct RowKernelScope {
+            ~RowKernelScope() { g_q4e_row_kernels = Q4eRowKernels{}; g_q4e_prefill_combine = false; }
+        } row_kernel_scope;
         if (!q4e_dump_nodes
             && slot->valid && slot->tp_plan.valid() == tp_mode
             && slot->row_scope == row_scope && slot->row_kv_count == row_kv_count
@@ -2431,6 +2442,19 @@ static int q4e_token_span_impl(
         slot->reset_graph();
         if (tp_mode) g_q4e_tp_matmuls = &slot->tp_matmuls;
         g_q4e_row_kernels.keep_fusion_inputs = row_scope;
+#ifdef TSG_GGML_USE_CUDA
+        static const bool prefill_combine_enabled = [] {
+            const char* e = std::getenv("TS_Q4E_PREFILL_COMBINE");
+            return e == nullptr || std::strcmp(e, "0") != 0;
+        }();
+        // cpu_moe_layers contains only this span's [layer_begin, layer_end)
+        // layers. An entirely host-routed span has no combine node to replace.
+        // Full-engine measurements qualify spans of at least 64 tokens. For
+        // smaller prompts, extra custom-op dispatch can outweigh kernel savings.
+        g_q4e_prefill_combine = prefill_combine_enabled && T >= 64 && T <= 65535
+            && cpu_moe_layers.size() < (std::size_t)(layer_end - layer_begin)
+            && ggml_backend_is_cuda(g_backend);
+#endif
         if (verify_rows)
         {
             g_q4e_row_kernels.rows = T;
@@ -2502,7 +2526,7 @@ static int q4e_token_span_impl(
             slot->qsa_inputs.push_back(in);
         }
 #ifdef TSG_GGML_USE_CUDA
-        if ((!qsa_plans.empty() || tp_mode) && ggml_backend_is_cuda(g_backend))
+        if ((!qsa_plans.empty() || tp_mode || g_q4e_prefill_combine) && ggml_backend_is_cuda(g_backend))
         {
             slot->precise_backend = tsg_dsv4_fused_backend_init(g_backend);
             if (!slot->precise_backend) throw std::runtime_error("qwen4exp QSA: precise backend creation failed");

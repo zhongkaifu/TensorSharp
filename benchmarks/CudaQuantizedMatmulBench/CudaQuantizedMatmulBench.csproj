@@ -7,6 +7,7 @@
     <Description>Benchmark harness for TensorSharp direct CUDA quantized matmul paths.</Description>
   </PropertyGroup>
   <ItemGroup>
+    <Compile Include="..\..\eng\validation\CudaMoeFusionBench.cs" Link="MoeFusionBench.cs" />
     <ProjectReference Include="..\..\TensorSharp.Core\TensorSharp.Core.csproj" />
     <ProjectReference Include="..\..\TensorSharp.Backends.Cuda\TensorSharp.Backends.Cuda.csproj" />
   </ItemGroup>

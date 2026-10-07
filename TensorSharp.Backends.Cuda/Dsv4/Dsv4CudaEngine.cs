@@ -1838,8 +1838,8 @@ namespace TensorSharp.Cuda
             {
                 dev.DK.MoeGateUpDecode(l.GateExps.Ptr, l.UpExps.Ptr, dev.ActQ8A, dev.Sel,
                     dev.ExpGate, dev.ExpUp, guType, ff, e, l.GateExps.RowBytes, nt, nUsed, dev.Stream);
-                SwigluClamp(dev.ExpGate, dev.ExpUp, (long)s * ff, l.ClampExp);
-                QuantizeQ81(dev, dev.ExpGate, dev.ActQ8B, ff, s);
+                CudaMoe.SwigluQuantize(dev.Alloc.Kernels, dev.ExpGate, dev.ExpUp, dev.ActQ8B, null,
+                    ff, s, l.ClampExp, dev.Stream);
                 dev.DK.MoeDownDecode(l.DownExps.Ptr, dev.ActQ8B, dev.Sel, dev.ExpDown,
                     downType, e, ff, l.DownExps.RowBytes, s, dev.Stream);
                 dev.DK.MoeScatterAdd(dev.ExpDown, null, dev.SelW, dev.ShDown, dev.FfnOut, nt, nUsed, e, dev.Stream);
@@ -1869,8 +1869,8 @@ namespace TensorSharp.Cuda
                     dev.DK.MoeGateUpStaged(l.GateExps.Ptr, l.UpExps.Ptr, dev.SplitQsA, dev.SplitDA,
                         dev.Counts, dev.Offsets, dev.SlotToken,
                         dev.ExpGate, dev.ExpUp, guType, ff, e, l.GateExps.RowBytes, nEx, dev.Stream);
-                    SwigluClamp(dev.ExpGate, dev.ExpUp, (long)s * ff, l.ClampExp);
-                    QuantizeQ81Split(dev, dev.ExpGate, dev.SplitQsB, dev.SplitDB, ff, s);
+                    CudaMoe.SwigluQuantize(dev.Alloc.Kernels, dev.ExpGate, dev.ExpUp, dev.SplitQsB, dev.SplitDB,
+                        ff, s, l.ClampExp, dev.Stream);
                     dev.DK.MoeDownStaged(l.DownExps.Ptr, dev.SplitQsB, dev.SplitDB, dev.Counts, dev.Offsets, dev.ExpDown,
                         downType, e, ff, l.DownExps.RowBytes, nEx, dev.Stream);
                 }
@@ -1878,8 +1878,8 @@ namespace TensorSharp.Cuda
                 {
                     dev.DK.MoeGateUp(l.GateExps.Ptr, l.UpExps.Ptr, dev.ActQ8A, dev.Counts, dev.Offsets, dev.SlotToken,
                         dev.ExpGate, dev.ExpUp, guType, ff, e, l.GateExps.RowBytes, nEx, dev.Stream);
-                    SwigluClamp(dev.ExpGate, dev.ExpUp, (long)s * ff, l.ClampExp);
-                    QuantizeQ81(dev, dev.ExpGate, dev.ActQ8B, ff, s);
+                    CudaMoe.SwigluQuantize(dev.Alloc.Kernels, dev.ExpGate, dev.ExpUp, dev.ActQ8B, null,
+                        ff, s, l.ClampExp, dev.Stream);
                     dev.DK.MoeDown(l.DownExps.Ptr, dev.ActQ8B, dev.Counts, dev.Offsets, dev.ExpDown,
                         downType, e, ff, l.DownExps.RowBytes, nEx, dev.Stream);
                 }
