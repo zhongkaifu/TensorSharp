@@ -24,13 +24,15 @@ namespace TensorSharp.Cuda
         // The grouping plan: per-expert histogram, its exclusive scan and fill cursors, and each
         // (token, selection) slot's row in expert order and the token of each such row.
         public readonly Tensor Counts, Offsets, Cursors, RowOfSlot, SlotToken;
-        // q8_1 activations: token rows into gate/up (A), expert hidden rows into down (B), and the
-        // split layout the register-staged kernels read.
+        // Gate/up (A) and down (B) execute sequentially on one stream. Their quantized
+        // activations have disjoint lifetimes; interleaved and split are exclusive paths.
+        // These fields can therefore refer to the same capacity-sized allocation.
         public readonly Tensor ActQ8A, ActQ8B, SplitQsA, SplitDA, SplitQsB, SplitDB;
         /// <summary>Expert outputs per slot row [nt * nUsed, width].</summary>
         public readonly Tensor ExpGate, ExpUp, ExpDown;
 
-        public CudaMoeScratch(Func<DType, long[], Tensor> alloc, int nUbatch, int nExpert, int nUsed, int e, int ff)
+        public CudaMoeScratch(Func<DType, long[], Tensor> alloc, int nUbatch, int nExpert, int nUsed, int e, int ff,
+            bool? shareActivations = null)
         {
             long nt = nUbatch, s = (long)nUbatch * nUsed;
             Sel = alloc(DType.Int32, new[] { nt, nUsed });
@@ -42,23 +44,36 @@ namespace TensorSharp.Cuda
             Cursors = alloc(DType.Int32, new[] { (long)nExpert });
             RowOfSlot = alloc(DType.Int32, new[] { s });
             SlotToken = alloc(DType.Int32, new[] { s });
-            ActQ8A = alloc(DType.UInt8, new[] { nt, (long)(e / 32) * Q81BlockBytes });
-            ActQ8B = alloc(DType.UInt8, new[] { s, (long)(ff / 32) * Q81BlockBytes });
-            SplitQsA = alloc(DType.UInt8, new[] { nt, (long)e });
-            SplitDA = alloc(DType.Float32, new[] { nt, (long)e / 32 });
-            SplitQsB = alloc(DType.UInt8, new[] { s, (long)ff });
-            SplitDB = alloc(DType.Float32, new[] { s, (long)ff / 32 });
+            if (shareActivations ?? CudaKernels.MoeFusionEnabled)
+            {
+                long blocks = Math.Max(nt * (e / 32), s * (ff / 32));
+                ActQ8A = ActQ8B = SplitQsA = SplitQsB = alloc(DType.UInt8, new[] { blocks * Q81BlockBytes });
+                SplitDA = SplitDB = alloc(DType.Float32, new[] { blocks });
+            }
+            else
+            {
+                ActQ8A = alloc(DType.UInt8, new[] { nt, (long)(e / 32) * Q81BlockBytes });
+                ActQ8B = alloc(DType.UInt8, new[] { s, (long)(ff / 32) * Q81BlockBytes });
+                SplitQsA = alloc(DType.UInt8, new[] { nt, (long)e });
+                SplitDA = alloc(DType.Float32, new[] { nt, (long)e / 32 });
+                SplitQsB = alloc(DType.UInt8, new[] { s, (long)ff });
+                SplitDB = alloc(DType.Float32, new[] { s, (long)ff / 32 });
+            }
             ExpGate = alloc(DType.Float32, new[] { s, (long)ff });
             ExpUp = alloc(DType.Float32, new[] { s, (long)ff });
             ExpDown = alloc(DType.Float32, new[] { s, (long)e });
         }
 
         /// <summary>Bytes of scratch a device needs for these shapes, for placement.</summary>
-        public static long Bytes(int nUbatch, int nUsed, int e, int ff)
+        public static long Bytes(int nUbatch, int nUsed, int e, int ff, int nExpert = 0, bool? shareActivations = null)
         {
             long s = (long)nUbatch * nUsed;
+            long aBlocks = (long)nUbatch * (e / 32), bBlocks = s * (ff / 32);
+            long activations = (shareActivations ?? CudaKernels.MoeFusionEnabled)
+                ? Math.Max(aBlocks, bBlocks) * (Q81BlockBytes + 4)
+                : (aBlocks + bBlocks) * (Q81BlockBytes + 32 + 4);
             return 2 * s * ff * 4 + s * e * 4           // ExpGate / ExpUp / ExpDown
-                + nUbatch * (long)e * 2 + s * ff * 2;    // q8_1 and split activations
+                + activations + 16 * s + 12L * nExpert; // activations, router and grouping plan
         }
     }
 
@@ -102,7 +117,7 @@ namespace TensorSharp.Cuda
         public static void Experts(Dsv4Kernels dk, CudaKernels kernels, CudaMoeScratch s,
             in DeviceWeight gate, in DeviceWeight up, in DeviceWeight down,
             Tensor cur, Tensor shDown, Tensor ffnOut, int nt, int nUsed, int nExpert, int e, int ff, float clamp,
-            int perSlotMaxRows, IntPtr stream)
+            int perSlotMaxRows, IntPtr stream, bool? fused = null)
         {
             int guType = gate.Type, downType = down.Type;
             int slots = nt * nUsed;
@@ -122,8 +137,7 @@ namespace TensorSharp.Cuda
             {
                 dk.MoeGateUpDecode(gate.Ptr, up.Ptr, s.ActQ8A, s.Sel, s.ExpGate, s.ExpUp, guType, ff, e, gate.RowBytes,
                     nt, nUsed, stream);
-                SwigluClamp(s.ExpGate, s.ExpUp, (long)slots * ff, clamp);
-                QuantizeQ81(kernels, s.ExpGate, s.ActQ8B, ff, slots, stream);
+                SwigluQuantize(kernels, s.ExpGate, s.ExpUp, s.ActQ8B, null, ff, slots, clamp, stream, fused);
                 dk.MoeDownDecode(down.Ptr, s.ActQ8B, s.Sel, s.ExpDown, downType, e, ff, down.RowBytes, slots, stream);
                 dk.MoeScatterAdd(s.ExpDown, null, s.SelW, shDown, ffnOut, nt, nUsed, e, stream);
                 return;
@@ -149,8 +163,7 @@ namespace TensorSharp.Cuda
                 // reuse it across the expert's member tokens.
                 dk.MoeGateUpStaged(gate.Ptr, up.Ptr, s.SplitQsA, s.SplitDA, s.Counts, s.Offsets, s.SlotToken,
                     s.ExpGate, s.ExpUp, guType, ff, e, gate.RowBytes, nExpert, stream);
-                SwigluClamp(s.ExpGate, s.ExpUp, (long)slots * ff, clamp);
-                QuantizeQ81Split(kernels, s.ExpGate, s.SplitQsB, s.SplitDB, ff, slots, stream);
+                SwigluQuantize(kernels, s.ExpGate, s.ExpUp, s.SplitQsB, s.SplitDB, ff, slots, clamp, stream, fused);
                 dk.MoeDownStaged(down.Ptr, s.SplitQsB, s.SplitDB, s.Counts, s.Offsets, s.ExpDown,
                     downType, e, ff, down.RowBytes, nExpert, stream);
             }
@@ -158,8 +171,7 @@ namespace TensorSharp.Cuda
             {
                 dk.MoeGateUp(gate.Ptr, up.Ptr, s.ActQ8A, s.Counts, s.Offsets, s.SlotToken,
                     s.ExpGate, s.ExpUp, guType, ff, e, gate.RowBytes, nExpert, stream);
-                SwigluClamp(s.ExpGate, s.ExpUp, (long)slots * ff, clamp);
-                QuantizeQ81(kernels, s.ExpGate, s.ActQ8B, ff, slots, stream);
+                SwigluQuantize(kernels, s.ExpGate, s.ExpUp, s.ActQ8B, null, ff, slots, clamp, stream, fused);
                 dk.MoeDown(down.Ptr, s.ActQ8B, s.Counts, s.Offsets, s.ExpDown,
                     downType, e, ff, down.RowBytes, nExpert, stream);
             }
@@ -174,6 +186,12 @@ namespace TensorSharp.Cuda
             using Tensor u = Flat(up, n);
             Ops.SiLUMulClamp(g, g, u, limit);
         }
+
+        internal static void SwigluQuantize(CudaKernels kernels, Tensor gate, Tensor up, Tensor output, Tensor scales,
+            int inDim, int rows, float limit, IntPtr stream, bool? fused = null)
+            => kernels.LaunchSiluMulClampQuantizeQ81(Dsv4CudaEngine.Ptr(gate), Dsv4CudaEngine.Ptr(up),
+                Dsv4CudaEngine.Ptr(output), scales == null ? IntPtr.Zero : Dsv4CudaEngine.Ptr(scales),
+                inDim, rows, limit, stream, fused);
 
         private static Tensor Flat(Tensor t, long n)
         {

@@ -575,6 +575,46 @@ static __global__ void tsg_dsv41_candidate_mask_f16(const float * pooled, const 
     }
 }
 
+// Strata's vectorized MoE combine motivates this single-pass reduction, but
+// Qwen4Exp's prefill contract rounds every product before its sequential sum.
+// Explicit round-to-nearest operations prevent contraction across that boundary.
+template<bool VECTOR>
+static __global__ void tsg_q4e_expert_reduce_f32(
+    const float * __restrict__ experts, const float * __restrict__ routes,
+    float * __restrict__ dst, int64_t width, int used,
+    size_t expert_stride, size_t token_stride, size_t route_stride, size_t route_token_stride)
+{
+    const int64_t token = blockIdx.y;
+    const int64_t col = ((int64_t)blockIdx.x * blockDim.x + threadIdx.x) * (VECTOR ? 4 : 1);
+    if (col >= width) return;
+    const float * x = experts + token * token_stride + col;
+    const float * w = routes + token * route_token_stride;
+    if constexpr (VECTOR)
+    {
+        const float4 first = *reinterpret_cast<const float4 *>(x);
+        const float weight = w[0];
+        float4 sum = make_float4(__fmul_rn(first.x, weight), __fmul_rn(first.y, weight),
+            __fmul_rn(first.z, weight), __fmul_rn(first.w, weight));
+        for (int k = 1; k < used; ++k)
+        {
+            const float4 next = *reinterpret_cast<const float4 *>(x + (size_t)k * expert_stride);
+            const float wk = w[(size_t)k * route_stride];
+            sum.x = __fadd_rn(sum.x, __fmul_rn(next.x, wk));
+            sum.y = __fadd_rn(sum.y, __fmul_rn(next.y, wk));
+            sum.z = __fadd_rn(sum.z, __fmul_rn(next.z, wk));
+            sum.w = __fadd_rn(sum.w, __fmul_rn(next.w, wk));
+        }
+        *reinterpret_cast<float4 *>(dst + token * width + col) = sum;
+    }
+    else
+    {
+        float sum = __fmul_rn(x[0], w[0]);
+        for (int k = 1; k < used; ++k)
+            sum = __fadd_rn(sum, __fmul_rn(x[(size_t)k * expert_stride], w[(size_t)k * route_stride]));
+        dst[token * width + col] = sum;
+    }
+}
+
 static void tsg_dsv4_fused_launch(const tsg_dsv4_fused_desc * d, ggml_tensor * dst, cudaStream_t stream)
 {
     switch (d->kind)
@@ -805,6 +845,26 @@ static void tsg_dsv4_fused_launch(const tsg_dsv4_fused_desc * d, ggml_tensor * d
             tsg_dsv4_kgather_f16<<<n_rows, 256, 0, stream>>>(
                 (const half *) ring->data, (const half *) comp->data,
                 (const int32_t *) topk->data, (half *) dst->data, head, ring_rows);
+        } break;
+
+        case TSG_Q4E_EXPERT_REDUCE:
+        {
+            const ggml_tensor * experts = dst->src[0], * routes = dst->src[1];
+            const int64_t width = dst->ne[0];
+            const bool vector = width % 4 == 0 && experts->nb[1] % 16 == 0 && experts->nb[2] % 16 == 0
+                && reinterpret_cast<uintptr_t>(experts->data) % 16 == 0
+                && reinterpret_cast<uintptr_t>(dst->data) % 16 == 0;
+            const dim3 grid((unsigned int)((width / (vector ? 4 : 1) + 255) / 256), (unsigned int)dst->ne[1], 1);
+            if (vector)
+                tsg_q4e_expert_reduce_f32<true><<<grid, 256, 0, stream>>>(
+                    (const float *)experts->data, (const float *)routes->data, (float *)dst->data,
+                    width, (int)experts->ne[1], experts->nb[1] / 4, experts->nb[2] / 4,
+                    routes->nb[1] / 4, routes->nb[2] / 4);
+            else
+                tsg_q4e_expert_reduce_f32<false><<<grid, 256, 0, stream>>>(
+                    (const float *)experts->data, (const float *)routes->data, (float *)dst->data,
+                    width, (int)experts->ne[1], experts->nb[1] / 4, experts->nb[2] / 4,
+                    routes->nb[1] / 4, routes->nb[2] / 4);
         } break;
 
         default:

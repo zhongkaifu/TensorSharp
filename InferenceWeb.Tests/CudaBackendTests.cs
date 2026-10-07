@@ -2754,6 +2754,16 @@ public class CudaBackendTests
 
     [CudaFact]
     public void CudaMoEDecode_MixedIq2StagesMatchQuantizedCpuReference()
+        => CheckMixedIq2MoeAgainstCpu(rows: 1, batched: false);
+
+    [CudaTheory]
+    [InlineData(1)]
+    [InlineData(3)]
+    [InlineData(7)]
+    public void CudaMoEPrefill_MixedIq2StagesMatchQuantizedCpuReference(int rows)
+        => CheckMixedIq2MoeAgainstCpu(rows, batched: true);
+
+    private static void CheckMixedIq2MoeAgainstCpu(int rows, bool batched)
     {
         const int hiddenDim = 256;
         const int nFf = 256;
@@ -2784,6 +2794,13 @@ public class CudaBackendTests
         try
         {
             using var allocator = new CudaAllocator();
+            // These exact formats and widths select both dp4a stages. With
+            // TENSORSHARP_CUDA_MOE_FUSION=1 the public decode/prefill dispatch
+            // must therefore exercise the fused activation kernel.
+            Assert.True(allocator.Kernels?.SupportsFusedMoeQuantize,
+                "Compile current CUDA kernels before running MoE fusion coverage.");
+            Assert.True(CudaFusedOps.IsMoeDp4aDimensionSupported(16, hiddenDim));
+            Assert.True(CudaFusedOps.IsMoeDp4aDimensionSupported(22, nFf));
             var resident = new IntPtr[weights.Length];
             for (int i = 0; i < weights.Length; i++)
             {
@@ -2809,42 +2826,74 @@ public class CudaBackendTests
 
             try
             {
-                float[,] inputHost = new float[1, hiddenDim];
-                for (int i = 0; i < hiddenDim; i++)
-                    inputHost[0, i] = 0.35f * MathF.Sin((i + 1) * 0.037f)
-                        + 0.15f * MathF.Cos((i + 3) * 0.019f);
+                float[,] inputHost = new float[rows, hiddenDim];
+                float[,] logitsHost = new float[rows, numExperts];
+                for (int r = 0; r < rows; r++)
+                {
+                    for (int i = 0; i < hiddenDim; i++)
+                        inputHost[r, i] = 0.35f * MathF.Sin((i + 1) * 0.037f + r * 0.13f)
+                            + 0.15f * MathF.Cos((i + 3) * 0.019f + r * 0.07f);
+                    // Alternate which expert has the larger weight so a token
+                    // indexing bug cannot repeat the first row's routing weights.
+                    logitsHost[r, 0] = r % 2 == 0 ? 0.7f + r * 0.1f : -0.2f;
+                    logitsHost[r, 1] = r % 2 == 0 ? -0.2f : 0.7f + r * 0.1f;
+                }
 
-                using var logits = Tensor.FromArray(allocator, new float[,] { { 0.7f, -0.2f } });
+                using var logits = Tensor.FromArray(allocator, logitsHost);
                 using var input = Tensor.FromArray(allocator, inputHost);
-                using var output = new Tensor(allocator, DType.Float32, 1, hiddenDim);
-                using var selected = new Tensor(allocator, DType.Int32, nUsed);
-                using var routeWeights = new Tensor(allocator, DType.Float32, nUsed);
-                using var gate = new Tensor(allocator, DType.Float32, nUsed, nFf);
-                using var up = new Tensor(allocator, DType.Float32, nUsed, nFf);
+                using var output = new Tensor(allocator, DType.Float32, rows, hiddenDim);
+                using var selected = new Tensor(allocator, DType.Int32, rows * nUsed);
+                using var routeWeights = new Tensor(allocator, DType.Float32, rows * nUsed);
+                using var gate = new Tensor(allocator, DType.Float32, rows * nUsed, nFf);
+                using var up = new Tensor(allocator, DType.Float32, rows * nUsed, nFf);
                 using var inputQ8 = new Tensor(
                     allocator, DType.UInt8,
-                    (long)(hiddenDim / 32) * CudaFusedOps.Q81BlockBytes);
+                    (long)rows * (hiddenDim / 32) * CudaFusedOps.Q81BlockBytes);
                 using var hiddenQ8 = new Tensor(
                     allocator, DType.UInt8,
-                    (long)nUsed * (nFf / 32) * CudaFusedOps.Q81BlockBytes);
+                    (long)rows * nUsed * (nFf / 32) * CudaFusedOps.Q81BlockBytes);
 
-                Assert.True(CudaFusedOps.TryMoEExpertFFNDecodeSwiGLU(
+                bool ran = batched ? CudaFusedOps.TryMoEExpertFFNPrefillSwiGLU(
+                    logits, input, output, selected, routeWeights, gate, up,
+                    IntPtr.Zero, gateTable, upTable, downTable,
+                    gateUpType: 16, downType: 22,
+                    numExperts, nUsed, hiddenDim, nFf, numTokens: rows,
+                    sharedDown: null, sharedGateVecPtr: IntPtr.Zero,
+                    inputQ8, hiddenQ8,
+                    useGateUpDp4a: true, useDownDp4a: true)
+                    : CudaFusedOps.TryMoEExpertFFNDecodeSwiGLU(
                     logits, input, output, selected, routeWeights, gate, up,
                     IntPtr.Zero, gateTable, upTable, downTable,
                     gateUpType: 16, downType: 22,
                     numExperts, nUsed, hiddenDim, nFf,
                     sharedDown: null, sharedGateVecPtr: IntPtr.Zero,
                     inputQ8, hiddenQ8,
-                    useGateUpDp4a: true, useDownDp4a: true));
+                    useGateUpDp4a: true, useDownDp4a: true);
+                Assert.True(ran);
 
-                Assert.Equal(new[] { 0, 1 }, selected.GetElementsAsInt(nUsed));
-                float exp0 = MathF.Exp(0.7f);
-                float exp1 = MathF.Exp(-0.2f);
-                float[] expectedRoute = { exp0 / (exp0 + exp1), exp1 / (exp0 + exp1) };
-                AssertClose(expectedRoute, routeWeights.GetElementsAsFloat(nUsed), 2e-5f);
+                var expectedSelected = new int[rows * nUsed];
+                var expectedRoute = new float[rows * nUsed];
+                var expertProbability = new float[rows, numExperts];
+                for (int r = 0; r < rows; r++)
+                {
+                    float exp0 = MathF.Exp(logitsHost[r, 0]), exp1 = MathF.Exp(logitsHost[r, 1]);
+                    expertProbability[r, 0] = exp0 / (exp0 + exp1);
+                    expertProbability[r, 1] = exp1 / (exp0 + exp1);
+                    for (int slot = 0; slot < nUsed; slot++)
+                    {
+                        // The router retains replacement-slot order, not score
+                        // order. With top-k == expert count, slots are filled
+                        // in expert-ID order even when their scores reverse.
+                        int expert = slot;
+                        expectedSelected[r * nUsed + slot] = expert;
+                        expectedRoute[r * nUsed + slot] = expertProbability[r, expert];
+                    }
+                }
+                Assert.Equal(expectedSelected, selected.GetElementsAsInt(rows * nUsed));
+                AssertClose(expectedRoute, routeWeights.GetElementsAsFloat(rows * nUsed), 2e-5f);
 
                 float[,] qInput = QuantizeDequantizeQ8_1StoredScale(inputHost);
-                var expected = new float[hiddenDim];
+                var expected = new float[rows * hiddenDim];
                 for (int expert = 0; expert < numExperts; expert++)
                 {
                     float[] gateProjected = DequantizedMatmulNative(
@@ -2853,32 +2902,39 @@ public class CudaBackendTests
                     float[] upProjected = DequantizedMatmulNative(
                         weights[2 + expert], GgmlTensorType.IQ2_XXS,
                         nFf, hiddenDim, qInput);
-                    var activated = new float[1, nFf];
-                    for (int i = 0; i < nFf; i++)
-                    {
-                        float x = gateProjected[i];
-                        activated[0, i] = x / (1.0f + MathF.Exp(-x)) * upProjected[i];
-                    }
+                    var activated = new float[rows, nFf];
+                    for (int r = 0; r < rows; r++)
+                        for (int i = 0; i < nFf; i++)
+                        {
+                            float x = gateProjected[r * nFf + i];
+                            activated[r, i] = x / (1.0f + MathF.Exp(-x)) * upProjected[r * nFf + i];
+                        }
 
                     float[,] qActivated = QuantizeDequantizeQ8_1StoredScale(activated);
                     float[] projectedDown = DequantizedMatmulNative(
                         weights[4 + expert], GgmlTensorType.IQ2_S,
                         hiddenDim, nFf, qActivated);
-                    for (int i = 0; i < hiddenDim; i++)
-                        expected[i] += expectedRoute[expert] * projectedDown[i];
+                    for (int r = 0; r < rows; r++)
+                        for (int i = 0; i < hiddenDim; i++)
+                            expected[r * hiddenDim + i] += expertProbability[r, expert] * projectedDown[r * hiddenDim + i];
                 }
 
-                float[] actual = output.GetElementsAsFloat(hiddenDim);
-                float maxExpected = 0.0f;
-                float maxError = 0.0f;
-                for (int i = 0; i < hiddenDim; i++)
+                float[] actual = output.GetElementsAsFloat(rows * hiddenDim);
+                Assert.All(actual, value => Assert.True(float.IsFinite(value)));
+                for (int r = 0; r < rows; r++)
                 {
-                    maxExpected = MathF.Max(maxExpected, MathF.Abs(expected[i]));
-                    maxError = MathF.Max(maxError, MathF.Abs(actual[i] - expected[i]));
+                    float maxExpected = 0.0f;
+                    float maxError = 0.0f;
+                    for (int i = 0; i < hiddenDim; i++)
+                    {
+                        int index = r * hiddenDim + i;
+                        maxExpected = MathF.Max(maxExpected, MathF.Abs(expected[index]));
+                        maxError = MathF.Max(maxError, MathF.Abs(actual[index] - expected[index]));
+                    }
+                    Assert.True(
+                        maxError <= MathF.Max(0.05f, maxExpected * 0.003f),
+                        $"Mixed MoE row {r} max error {maxError} for max reference magnitude {maxExpected}.");
                 }
-                Assert.True(
-                    maxError <= MathF.Max(0.05f, maxExpected * 0.003f),
-                    $"Mixed MoE max error {maxError} for max reference magnitude {maxExpected}.");
             }
             finally
             {

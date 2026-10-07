@@ -207,6 +207,19 @@ public sealed class MainPage : ContentPage
             await DisplayAlert(Loc.T("app.openFile.alert.title"), failure, Loc.T("common.ok"));
     }
 
+    /// <summary>Save the full-resolution image already shown in the conversation.</summary>
+    private async Task SaveImageAsync(string url)
+    {
+        string? failure;
+        if (!Core.Hosting.ImageDownload.TryResolve(_host.App.Paths.UploadsDirectory, url, _host.EntryUrl, out string? full))
+            failure = Loc.T("app.openFile.missing");
+        else
+            failure = await Services.FilePresenter.SaveAsync(full!);
+
+        if (failure is not null)
+            await DisplayAlert(Loc.T("app.openFile.alert.title"), failure, Loc.T("common.ok"));
+    }
+
 #if DEBUG
     /// <summary>
     /// Device E2E hook (Debug builds only): start downloading the catalog entry named
@@ -2190,6 +2203,22 @@ public sealed class MainPage : ContentPage
                 {
                     try { await OpenArtifactAsync(PathOf(fileUrl), fileName); }
                     catch (Exception ex) { Console.WriteLine("TensorAgent: open-file failed: " + ex.Message); }
+                });
+                return;
+
+            // Image results live under /uploads rather than the code artifact store.
+            // A WebView cannot honor their download link, so present the native save UI.
+            case "save-image":
+                string imageUrl = message.TryGetProperty("url", out System.Text.Json.JsonElement image)
+                    ? image.GetString() ?? string.Empty : string.Empty;
+                MainThread.BeginInvokeOnMainThread(async () =>
+                {
+                    try { await SaveImageAsync(imageUrl); }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine("TensorAgent: save-image failed: " + ex.Message);
+                        await DisplayAlert(Loc.T("app.openFile.alert.title"), ex.Message, Loc.T("common.ok"));
+                    }
                 });
                 return;
         }

@@ -50,6 +50,8 @@
   "page.trace.seconds": "{seconds}秒",
   "page.trace.unnamedFile": "ファイル",
   "page.trace.kilobytes": "{size} KB",
+  "page.image.download": "ダウンロード",
+  "page.image.downloadFailed": "画像をダウンロードできませんでした：{error}",
   "page.image.generatedAlt": "生成された画像",
   "page.image.compareOriginal": "元の画像と比較",
   "page.image.showResult": "結果を表示",

@@ -279,6 +279,7 @@ set(TSG_GGMLOPS_SOURCES
     ggml_ops_gptoss_batched.cpp
     ggml_ops_qwen35_batched_arena.cpp
     ggml_ops_qwen4exp.cpp
+    ggml_ops_qwen4exp_reduce.cpp
     ggml_ops_qwen4exp_mtp.cpp
     ggml_ops_qwen4exp_arena.cpp
     ggml_ops_gptoss_prefill.cpp
@@ -712,12 +713,13 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
         add_executable(GgmlOpsCudaMatmulPrecisionTest tests/cuda_matmul_precision_test.cpp
             ggml_ops_matmul_precision.cpp ggml_ops_matmul_precision.cu ggml_ops_dsv4_fused.cu
             ggml_ops_attention_precision.cu ggml_ops_q8_precision.cu)
-        target_compile_definitions(GgmlOpsCudaMatmulPrecisionTest PRIVATE TSG_GGML_USE_CUDA=1)
+        target_compile_definitions(GgmlOpsCudaMatmulPrecisionTest PRIVATE TSG_GGML_USE_CUDA=1 TSG_GGML_TEST_HOOKS)
         target_include_directories(GgmlOpsCudaMatmulPrecisionTest PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/src")
         target_link_libraries(GgmlOpsCudaMatmulPrecisionTest PRIVATE ggml-cuda ggml-cpu ggml-base CUDA::cublas)
         add_test(NAME cuda-explicit-f32-matmul COMMAND GgmlOpsCudaMatmulPrecisionTest)
         add_test(NAME cuda-quantized-ffn-strip COMMAND GgmlOpsCudaMatmulPrecisionTest --quant-strip-only --inner 2560)
+        add_test(NAME cuda-quantized-ffn-wide-scratch COMMAND GgmlOpsCudaMatmulPrecisionTest --quant-strip-wide-only)
         # Measurement probe (not a test): which CUDA kernels a qwen4exp verify
         # row shares with the one-token decode graph, and at what cost.
         add_executable(GgmlOpsQwen4ExpRowKernelProbe tests/qwen4exp_row_kernel_probe.cpp)
@@ -725,6 +727,7 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
         target_link_libraries(GgmlOpsQwen4ExpRowKernelProbe PRIVATE ggml-cuda ggml-cpu ggml-base)
         set_tests_properties(cuda-explicit-f32-matmul PROPERTIES SKIP_RETURN_CODE 77)
         set_tests_properties(cuda-quantized-ffn-strip PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+        set_tests_properties(cuda-quantized-ffn-wide-scratch PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 600)
         add_executable(GgmlOpsCudaAttentionPrecisionTest tests/attention_precision_test.cpp
             ggml_ops_attention_precision.cpp ggml_ops_attention_precision.cu
             ggml_ops_matmul_precision.cpp ggml_ops_matmul_precision.cu ggml_ops_dsv4_fused.cu
@@ -744,6 +747,15 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
         target_link_libraries(GgmlOpsCudaQ8PrecisionTest PRIVATE ggml-cuda ggml-cpu ggml-base CUDA::cublas)
         add_test(NAME cuda-q8-f32-projection COMMAND GgmlOpsCudaQ8PrecisionTest)
         set_tests_properties(cuda-q8-f32-projection PROPERTIES SKIP_RETURN_CODE 77)
+        add_executable(GgmlOpsQwen4ExpReduceTest tests/qwen4exp_reduce_test.cpp
+            ggml_ops_qwen4exp_reduce.cpp ggml_ops_matmul_precision.cu
+            ggml_ops_attention_precision.cu ggml_ops_q8_precision.cu ggml_ops_dsv4_fused.cu)
+        target_compile_definitions(GgmlOpsQwen4ExpReduceTest PRIVATE TSG_GGML_USE_CUDA=1)
+        target_include_directories(GgmlOpsQwen4ExpReduceTest PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/src")
+        target_link_libraries(GgmlOpsQwen4ExpReduceTest PRIVATE ggml-cuda ggml-cpu ggml-base CUDA::cublas)
+        add_test(NAME qwen4exp-prefill-combine-cuda COMMAND GgmlOpsQwen4ExpReduceTest cuda)
+        set_tests_properties(qwen4exp-prefill-combine-cuda PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
         # Explicit performance control: includes transient conversion costs,
         # independent sampled numerical checks and a scratch-reuse guard.
         # Never register benchmarks in the automatic correctness CTest lane.
@@ -757,6 +769,11 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
         target_link_libraries(GgmlOpsQ8ProjectionBench PRIVATE ggml-cuda ggml-cpu ggml-base CUDA::cublas)
 
     endif()
+
+    add_executable(GgmlOpsQwen4ExpReduceCpuTest tests/qwen4exp_reduce_test.cpp ggml_ops_qwen4exp_reduce.cpp)
+    target_include_directories(GgmlOpsQwen4ExpReduceCpuTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    target_link_libraries(GgmlOpsQwen4ExpReduceCpuTest PRIVATE ggml-cpu ggml-base)
+    add_test(NAME qwen4exp-prefill-combine-cpu COMMAND GgmlOpsQwen4ExpReduceCpuTest cpu)
 
     add_executable(GgmlOpsAttentionAllocTest
         tests/attention_alloc_test.cpp ggml_ops_attention_alloc.cpp)

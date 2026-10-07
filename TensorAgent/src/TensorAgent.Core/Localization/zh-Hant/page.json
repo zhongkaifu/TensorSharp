@@ -50,6 +50,8 @@
   "page.trace.seconds": "{seconds} 秒",
   "page.trace.unnamedFile": "檔案",
   "page.trace.kilobytes": "{size} KB",
+  "page.image.download": "下載",
+  "page.image.downloadFailed": "無法下載影像：{error}",
   "page.image.generatedAlt": "生成的影像",
   "page.image.compareOriginal": "對比原圖",
   "page.image.showResult": "顯示結果",

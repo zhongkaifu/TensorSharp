@@ -30,6 +30,7 @@
 //       [--backend ggml_metal|ggml_cuda|ggml_cpu] [--draft-model <gguf>] [--mmproj <gguf> --image <file>]
 //       [--kv f16|q8_0|q4_0]
 //       [--chunk 1024] [--max-batched 4096] [--long 4096] [--tool 3000] [--new 32]
+//       [--short-prompt <text>]
 //       [--spec-new 192] [--spec-file 600] [--spec-minimal-system] [--spec-engine ngram|auto] [--conc 2,4] [--conc-stagger 400] [--conc-gate] [--scenarios short,long,tool,newchat,spec,json,conc]
 //       [--warmup 0] [--measure-passes 1] [--out rows.json] [--verbose]
 using System.Diagnostics;
@@ -188,6 +189,7 @@ internal sealed class Options
     public int Long = 4096;
     public int Tool = 3000;
     public int New = 32;
+    public string ShortPrompt = "Say the single word: apple.";
     public int SpecNew = 192;
     public int SpecFile = 600;
     public int ImageNew = 160;
@@ -253,6 +255,7 @@ internal sealed class Options
                     case "--long": o.Long = int.Parse(Next(), CultureInfo.InvariantCulture); break;
                     case "--tool": o.Tool = int.Parse(Next(), CultureInfo.InvariantCulture); break;
                     case "--new": o.New = int.Parse(Next(), CultureInfo.InvariantCulture); break;
+                    case "--short-prompt": o.ShortPrompt = Next(); break;
                     case "--spec-new": o.SpecNew = int.Parse(Next(), CultureInfo.InvariantCulture); break;
                     case "--spec-file": o.SpecFile = int.Parse(Next(), CultureInfo.InvariantCulture); break;
                     case "--image-new": o.ImageNew = int.Parse(Next(), CultureInfo.InvariantCulture); break;
@@ -398,7 +401,7 @@ internal sealed class Bench
     private async Task ShortAsync()
     {
         using var engine = NewEngine();
-        List<int> prompt = Render(Corpus.MinimalSystemPrompt, "Say the single word: apple.");
+        List<int> prompt = Render(Corpus.MinimalSystemPrompt, _o.ShortPrompt);
         await RunAsync(engine, "short", "turn 1", prompt, _o.New, SamplingConfig.Greedy, expectBatched: true);
     }
 

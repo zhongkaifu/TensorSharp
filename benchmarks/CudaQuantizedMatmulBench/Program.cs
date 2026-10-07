@@ -28,6 +28,12 @@ var cases = new[]
 using var allocator = new CudaAllocator();
 Console.WriteLine($"CUDA quantized matmul benchmark, iterations={iterations}, warmup={warmup}");
 
+if (HasArg("--moe-fusion"))
+{
+    MoeFusionBench.Run(allocator, warmup, iterations);
+    return 0;
+}
+
 if (qwenKernelsOnly)
 {
     DecodeKernelBench.RunQwen(allocator, warmup, iterations);
