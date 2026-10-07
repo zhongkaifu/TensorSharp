@@ -346,7 +346,8 @@ namespace TensorSharp.Models
             {
                 res.Dispose();
                 throw new InvalidOperationException(
-                    "qwen4exp: required token-span path declined; this configuration cannot use the per-layer fallback.");
+                    "qwen4exp: required token-span path declined; this configuration cannot use the per-layer fallback. "
+                    + _tokenGraphDeclineReason);
             }
             if (spanDone) Q4eSpanTicks += Stopwatch.GetTimestamp() - tSpan;
             if (!spanDone && LayerSplitDegree > 1)
@@ -357,17 +358,20 @@ namespace TensorSharp.Models
                 // running it would silently compute against the wrong device's state -
                 // the same class of failure as the mid-sequence QSA fallback that used
                 // to collapse generation. Refuse instead.
+                res.Dispose();
                 throw new NotSupportedException(
                     "qwen4exp: the token-span path declined while a layer split is active. "
                     + "The per-layer fallback is single-GPU only, so it cannot run here. "
-                    + "Re-run without --layer-split to use the fallback.");
+                    + _tokenGraphDeclineReason);
             }
             if (!spanDone && _pendingMRoPEPositions != null)
             {
                 // The fallback paths rotate with scalar positions only; running an
                 // image prompt through them would be silently wrong.
+                res.Dispose();
                 throw new NotSupportedException(
-                    "qwen4exp image prompts need the token-span path, which declined this forward.");
+                    "qwen4exp image prompts need the token-span path, which declined this forward. "
+                    + _tokenGraphDeclineReason);
             }
 
             for (int il = spanDone ? Config.NumLayers : 0; il < Config.NumLayers; il++)
@@ -1089,6 +1093,14 @@ namespace TensorSharp.Models
         }
 
         private bool _tokenGraphUnsupported;
+        private string _tokenGraphDeclineReason;
+
+        private bool DeclineTokenGraph(string reason)
+        {
+            _tokenGraphUnsupported = true;
+            _tokenGraphDeclineReason = reason;
+            return false;
+        }
         private byte[] _layerKinds;
         // The final mixer + LM head riding the last span. _spanLogits holds the
         // downloaded [vocab] row when the head was fused this forward.
@@ -1182,14 +1194,16 @@ namespace TensorSharp.Models
 
         private unsafe bool TryFusedTokenSpans(Tensor res, int[] tokens, int seqLen, int startPos)
         {
-            if (_tokenGraphUnsupported || !IsGgmlBackend
-                || _fusedGateUpExperts
-                || _fusedFfnUnsupported || _fusedGdnUnsupported || _fusedAttnUnsupported
-                || _gdnVerify)
-            {
-                return false;
-            }
-
+            if (_tokenGraphUnsupported) return false;
+            if (!IsGgmlBackend)
+                return DeclineTokenGraph("The token span requires a GGML backend.");
+            if (_fusedGateUpExperts)
+                return DeclineTokenGraph("The token span requires separate gate/up expert tensors.");
+            if (_fusedFfnUnsupported || _fusedGdnUnsupported || _fusedAttnUnsupported)
+                return DeclineTokenGraph(_tokenGraphDeclineReason
+                    ?? $"A fused block was disabled (FFN={_fusedFfnUnsupported}, GDN={_fusedGdnUnsupported}, attention={_fusedAttnUnsupported}).");
+            if (_gdnVerify)
+                return DeclineTokenGraph("TS_Q4E_GDN_VERIFY disables the token span; unset it for this configuration.");
 
             // QSA stays inside the same span as recurrent state, including the
             // first token crossing its sparse width. A fallback cannot reseed it.
@@ -1341,17 +1355,23 @@ namespace TensorSharp.Models
                             if (ok && last) _spanLogitsValid = true;
                             if (!ok)
                             {
-                                _tokenGraphUnsupported = true;
+                                // Read the native error before any cleanup or another native
+                                // call can replace it. Managed descriptor failures never read
+                                // this thread-local value: it may belong to an earlier call.
+                                string failure = $"Native token span layers [{begin}, {il}) on device {DeviceForLayer(begin)} "
+                                    + $"failed at position {startPos}, tokens {seqLen}: "
+                                    + GgmlBasicOps.LastNativeError("no native error was provided");
+                                DeclineTokenGraph(failure);
                                 if (ranAnything)
                                 {
                                     // Layers [0, begin) already advanced the KV cache
                                     // and the recurrent state; re-running them would
                                     // apply the token twice. Fail loudly instead of
-                                    // quietly double-stepping the model; the next
-                                    // forward takes the per-layer fallback.
+                                    // quietly double-stepping the model. A required
+                                    // span cannot promise a fallback on the next forward.
                                     throw new InvalidOperationException(
-                                        "qwen4exp token span failed mid-token; the per-layer " +
-                                        "fallback takes over on the next forward.");
+                                        "qwen4exp token span failed mid-token; earlier layers have already advanced their state. "
+                                        + failure);
                                 }
                                 return false;
                             }
@@ -1393,7 +1413,7 @@ namespace TensorSharp.Models
             }
             catch (Exception ex)
             {
-                _tokenGraphUnsupported = true;
+                DeclineTokenGraph(ex.Message);
                 if (IsTensorParallel || _specForwardActive || HasQsa
                     || LayerSplitDegree > 1 || _pendingMRoPEPositions != null)
                 {
@@ -1415,7 +1435,14 @@ namespace TensorSharp.Models
             for (int l = 0; l < Config.NumLayers; l++)
             {
                 if (_isRecurrent[l]) continue;
-                if (!TryFillAttnArgs(l, ref args[l])) { _fusedAttnUnsupported = true; return false; }
+                if (!TryFillAttnArgs(l, ref args[l]))
+                {
+                    _fusedAttnUnsupported = true;
+                    _tokenGraphDeclineReason = $"Could not build attention descriptors for layer {l} "
+                        + $"(K={_kCache[l]?.ElementType}, V={_vCache[l]?.ElementType}). "
+                        + "The token span requires available projection weights and an f16 or f32 K/V cache.";
+                    return false;
+                }
             }
             _attnArgs = args;
             return true;
@@ -1442,7 +1469,13 @@ namespace TensorSharp.Models
                     _gdnConvStateT[l] = new Tensor(_allocator, DType.Float32, _convKernel - 1, _convDim);
                     Ops.Fill(_gdnConvStateT[l], 0f);
                 }
-                if (!TryFillGdnArgs(l, ref args[l])) { _fusedGdnUnsupported = true; return false; }
+                if (!TryFillGdnArgs(l, ref args[l]))
+                {
+                    _fusedGdnUnsupported = true;
+                    _tokenGraphDeclineReason = $"Could not build GDN descriptors for layer {l}; "
+                        + "check the projection weights and F32 ssm_conv1d.weight coefficients.";
+                    return false;
+                }
             }
             _gdnArgs = args;
             return true;
@@ -1456,7 +1489,13 @@ namespace TensorSharp.Models
             // the graph each time - exactly the cost the cache exists to remove.
             var args = GC.AllocateArray<Qwen4ExpFfnArgs>(Config.NumLayers, pinned: true);
             for (int l = 0; l < Config.NumLayers; l++)
-                if (!TryFillFfnArgs(l, ref args[l])) { _fusedFfnUnsupported = true; return false; }
+                if (!TryFillFfnArgs(l, ref args[l]))
+                {
+                    _fusedFfnUnsupported = true;
+                    _tokenGraphDeclineReason = $"Could not build FFN descriptors for layer {l}; "
+                        + "check the separate gate/up/down expert tensors and shared projections.";
+                    return false;
+                }
             _ffnArgs = args;
             return true;
         }
