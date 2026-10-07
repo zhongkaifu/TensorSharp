@@ -73,9 +73,9 @@ struct quantized_fixture
 };
 
 static void check_quantized_strip(ggml_backend_t allocator, ggml_backend_t backend,
-    const quantized_fixture & data, int tokens, bool down)
+    const quantized_fixture & data, int tokens, bool down, int selected_experts = 4)
 {
-    const int used = std::min(4, data.experts), slots = down ? used : 1;
+    const int used = std::min(selected_experts, data.experts), slots = down ? used : 1;
     auto * ctx = ggml_init({4 * 1024 * 1024, nullptr, true});
     require(ctx != nullptr, "Cannot create quantized FFN context");
     auto * gate = ggml_new_tensor_3d(ctx, data.type, data.inner, data.rows, data.experts);
@@ -108,7 +108,7 @@ static void check_quantized_strip(ggml_backend_t allocator, ggml_backend_t backe
         s.up_bytes = data.slice(data.up, s.first, s.count);
 #ifdef TSG_GGML_USE_CUDA
         s.owned = tsg_matmul_id_quant_strip_supported(allocator, s.gate, tokens, data.rows, s.first);
-        require(tokens != 129 || s.owned, "Prefill fixture did not engage the owned CUDA strip kernel");
+        require(tokens < 129 || s.owned, "Prefill fixture did not engage the owned CUDA strip kernel");
 #else
         s.owned = true;
 #endif
@@ -228,6 +228,42 @@ static void check_quantized_strip(ggml_backend_t allocator, ggml_backend_t backe
     for (const auto & s : shards) { unchanged(s.gate, s.gate_bytes); unchanged(s.up, s.up_bytes); }
     ggml_backend_buffer_free(buffer); ggml_free(ctx);
 }
+
+#if defined(TSG_GGML_USE_CUDA) && defined(TSG_GGML_TEST_HOOKS)
+// Qwen3.8-Flash-Next's image-prefill shape: 512 experts, 10 selected,
+// 2560 embedding channels and a 640-channel FFN. An unconditional partial
+// buffer formerly reserved gigabytes even though complete-tile launches do
+// not use it. The ceiling checks the actual CUDA allocation request, while
+// every gate/up/down/pair output remains bit-identical to upstream MMQ.
+static void run_wide_quantized(ggml_backend_t allocator, ggml_backend_t backend)
+{
+#if defined(_WIN32)
+    _putenv_s("TS_TP_TEST_MAX_SCRATCH", "67108864");
+#else
+    setenv("TS_TP_TEST_MAX_SCRATCH", "67108864", 1);
+#endif
+    for (ggml_type type : {GGML_TYPE_IQ4_XS, GGML_TYPE_Q6_K})
+    {
+        {
+            quantized_fixture gate_up(type, 2560, 640, 512);
+            for (int tokens : {129, 2048})
+                check_quantized_strip(allocator, backend, gate_up, tokens, false, 10);
+        }
+        {
+            quantized_fixture down(type, 768, 2560, 512);
+            for (int tokens : {129, 2048})
+                check_quantized_strip(allocator, backend, down, tokens, true, 10);
+        }
+    }
+#if defined(_WIN32)
+    _putenv_s("TS_TP_TEST_MAX_SCRATCH", "");
+#else
+    unsetenv("TS_TP_TEST_MAX_SCRATCH");
+#endif
+    std::printf("%s QUANT_FFN_WIDE experts=512 used=10 tokens=129,2048 scratch_ceiling=67108864 passed\n",
+        ggml_backend_name(backend));
+}
+#endif
 
 static void run_quantized(ggml_backend_t allocator, ggml_backend_t backend, const std::string & only_type, int inner)
 {
@@ -508,19 +544,24 @@ static void run(ggml_backend_t allocator, ggml_backend_t backend)
 int main(int argc, char ** argv)
 {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
-    bool quantized = false;
+    bool quantized = false, wide_quantized = false;
     std::string only_type;
     int inner = 256;
     for (int arg = 1; arg < argc; ++arg)
     {
         const std::string option(argv[arg]);
         if (option == "--quant-strip-only") quantized = true;
+        else if (option == "--quant-strip-wide-only") wide_quantized = true;
         else if (option == "--type" && arg + 1 < argc) only_type = argv[++arg];
         else if (option == "--inner" && arg + 1 < argc) inner = std::atoi(argv[++arg]);
-        else require(false, "Usage: [--quant-strip-only [--type iq2_xs] [--inner 2560]]");
+        else require(false, "Usage: [--quant-strip-only [--type iq2_xs] [--inner 2560]] | --quant-strip-wide-only");
     }
     require(inner > 0 && inner % 256 == 0, "Quantized --inner must be a positive multiple of256");
     require(quantized || (only_type.empty() && inner == 256), "--type/--inner require --quant-strip-only");
+    require(!(quantized && wide_quantized), "Select one quantized test mode");
+#if !defined(TSG_GGML_USE_CUDA) || !defined(TSG_GGML_TEST_HOOKS)
+    if (wide_quantized) return 77;
+#endif
 #ifdef TSG_GGML_USE_CUDA
     const int devices = ggml_backend_cuda_get_device_count();
     if (devices == 0) return 77;
@@ -530,7 +571,12 @@ int main(int argc, char ** argv)
         require(cuda != nullptr, "Cannot initialize a visible CUDA device");
         auto * backend = tsg_dsv4_fused_backend_init(cuda);
         require(backend != nullptr, "Cannot initialize TensorSharp CUDA precision backend");
-        if (quantized) run_quantized(cuda, backend, only_type, inner);
+        if (wide_quantized) {
+#if defined(TSG_GGML_TEST_HOOKS)
+            run_wide_quantized(cuda, backend);
+#endif
+        }
+        else if (quantized) run_quantized(cuda, backend, only_type, inner);
         else run(cuda, backend);
         ggml_backend_free(backend);
         ggml_backend_free(cuda);

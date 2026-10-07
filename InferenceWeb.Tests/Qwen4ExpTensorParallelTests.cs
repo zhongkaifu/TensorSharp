@@ -44,6 +44,8 @@ public sealed class Qwen4ExpTensorParallelTests
     [InlineData(18, false, 2560, 640)] // Target model IQ3_XXS gate/up
     [InlineData(19, false, 256, 12)] // IQ1_S gate/up
     [InlineData(22, false, 256, 12)] // IQ2_S gate/up
+    [InlineData(23, false, 2560, 640)] // IQ4_XS Flash Next gate/up
+    [InlineData(23, true, 512, 8)] // IQ4_XS down, complete 256-element blocks
     public void ExpertShardsPartitionEverySourceByte(int type, bool rowParallel, int ne0, int ne1)
     {
         const int degree = 2, experts = 3;
@@ -100,6 +102,8 @@ public sealed class Qwen4ExpTensorParallelTests
     [InlineData(21, 4)]
     [InlineData(22, 2)]
     [InlineData(22, 4)]
+    [InlineData(23, 2)]
+    [InlineData(23, 4)]
     public void MmqEdgeTilesRetainExactSourceRowsAndCoverEveryLogicalChannel(int type, int degree)
     {
         const int input = 256, output = 640, experts = 3;

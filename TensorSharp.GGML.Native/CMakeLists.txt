@@ -713,12 +713,13 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
         add_executable(GgmlOpsCudaMatmulPrecisionTest tests/cuda_matmul_precision_test.cpp
             ggml_ops_matmul_precision.cpp ggml_ops_matmul_precision.cu ggml_ops_dsv4_fused.cu
             ggml_ops_attention_precision.cu ggml_ops_q8_precision.cu)
-        target_compile_definitions(GgmlOpsCudaMatmulPrecisionTest PRIVATE TSG_GGML_USE_CUDA=1)
+        target_compile_definitions(GgmlOpsCudaMatmulPrecisionTest PRIVATE TSG_GGML_USE_CUDA=1 TSG_GGML_TEST_HOOKS)
         target_include_directories(GgmlOpsCudaMatmulPrecisionTest PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/src")
         target_link_libraries(GgmlOpsCudaMatmulPrecisionTest PRIVATE ggml-cuda ggml-cpu ggml-base CUDA::cublas)
         add_test(NAME cuda-explicit-f32-matmul COMMAND GgmlOpsCudaMatmulPrecisionTest)
         add_test(NAME cuda-quantized-ffn-strip COMMAND GgmlOpsCudaMatmulPrecisionTest --quant-strip-only --inner 2560)
+        add_test(NAME cuda-quantized-ffn-wide-scratch COMMAND GgmlOpsCudaMatmulPrecisionTest --quant-strip-wide-only)
         # Measurement probe (not a test): which CUDA kernels a qwen4exp verify
         # row shares with the one-token decode graph, and at what cost.
         add_executable(GgmlOpsQwen4ExpRowKernelProbe tests/qwen4exp_row_kernel_probe.cpp)
@@ -726,6 +727,7 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
         target_link_libraries(GgmlOpsQwen4ExpRowKernelProbe PRIVATE ggml-cuda ggml-cpu ggml-base)
         set_tests_properties(cuda-explicit-f32-matmul PROPERTIES SKIP_RETURN_CODE 77)
         set_tests_properties(cuda-quantized-ffn-strip PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+        set_tests_properties(cuda-quantized-ffn-wide-scratch PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 600)
         add_executable(GgmlOpsCudaAttentionPrecisionTest tests/attention_precision_test.cpp
             ggml_ops_attention_precision.cpp ggml_ops_attention_precision.cu
             ggml_ops_matmul_precision.cpp ggml_ops_matmul_precision.cu ggml_ops_dsv4_fused.cu
