@@ -49,6 +49,9 @@ public static class DiffusionCompanions
         // A folder, not a file: MiniMaxH3TextEncoder reads vocab.json, merges.txt and
         // tokenizer_config.json from it.
         (CatalogFamily.MiniMaxH3, CatalogFileRole.Tokenizer, "TS_VIDEO_TOKENIZER"),
+        (CatalogFamily.Wan, CatalogFileRole.TextEncoder, "TS_VIDEO_TEXT_ENCODER"),
+        (CatalogFamily.Wan, CatalogFileRole.Vae, "TS_VIDEO_VAE"),
+        (CatalogFamily.Wan, CatalogFileRole.SecondaryWeights, "TS_VIDEO_DIT2"),
     ];
 
     /// <summary>
@@ -63,12 +66,17 @@ public static class DiffusionCompanions
         ArgumentNullException.ThrowIfNull(store);
 
         var published = new Dictionary<string, string>(StringComparer.Ordinal);
-        foreach ((CatalogFamily family, CatalogFileRole role, string variable) in Published)
+        // Several families share the video variables. Resolve the selected family first,
+        // then write each variable once so another family's row cannot clear its path.
+        foreach (var group in Published.GroupBy(p => p.Variable))
         {
-            string? path = model is not null && model.Family == family ? PathOf(model, role, store) : null;
-            Environment.SetEnvironmentVariable(variable, path);
+            string? path = null;
+            if (model is not null)
+                foreach (var entry in group.Where(p => p.Family == model.Family))
+                    path = PathOf(model, entry.Role, store);
+            Environment.SetEnvironmentVariable(group.Key, path);
             if (path is not null)
-                published[variable] = path;
+                published[group.Key] = path;
         }
         return published;
     }

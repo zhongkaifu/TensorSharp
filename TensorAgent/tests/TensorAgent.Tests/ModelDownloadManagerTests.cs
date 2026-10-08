@@ -304,6 +304,46 @@ public sealed class ModelDownloadManagerTests : IDisposable
         }
     }
 
+    [Theory]
+    [InlineData(CatalogFileRole.Projector, CatalogFileRole.Draft)]
+    [InlineData(CatalogFileRole.Draft, CatalogFileRole.Projector)]
+    public async Task AnInstalledModelCanDownloadEachCompanionIndependently(
+        CatalogFileRole requested, CatalogFileRole other)
+    {
+        byte[] weights = Body(128 * 1024);
+        byte[] companion = Body(256 * 1024);
+        using var weightsServer = new RangeServer(weights);
+        using var companionServer = new RangeServer(companion);
+        using var otherServer = new RangeServer(Body(512 * 1024));
+        CatalogModel original = Entry("companions", weightsServer);
+        CatalogFile chosen = new(requested, "chosen.gguf", companionServer.Url,
+            companion.Length, Convert.ToHexStringLower(SHA256.HashData(companion)), Optional: true);
+        CatalogFile unchosen = new(other, "unchosen.gguf", otherServer.Url,
+            otherServer.Body.Length, Convert.ToHexStringLower(SHA256.HashData(otherServer.Body)), Optional: true);
+        CatalogModel model = original with { Files = new[] { original.Weights, chosen, unchosen } };
+        ModelStore store = Store("independent");
+        Directory.CreateDirectory(store.DirectoryFor(model));
+        await File.WriteAllBytesAsync(store.PathFor(model, model.Weights), weights);
+        // The action's byte estimate includes an interrupted companion transfer.
+        await File.WriteAllBytesAsync(ResumableDownloader.PartPath(store.PathFor(model, chosen)), companion[..1024]);
+        Assert.Equal(companion.Length - 1024, store.RemainingBytes(model, new[] { requested }));
+        Assert.Equal(InstallState.Installed, store.StateOf(model));
+
+        using var downloads = new ModelDownloadManager(store);
+        downloads.Start(model, new[] { requested });
+        ModelDownloadStatus completed = await WaitForEnd(downloads, model.Id);
+
+        Assert.Equal(DownloadState.Completed, completed.State);
+        Assert.True(completed.RequestsOnly(requested));
+        Assert.Equal(companion, await File.ReadAllBytesAsync(store.CompanionPath(model, requested)!));
+        Assert.Null(store.CompanionPath(model, other));
+        Assert.Equal(0, store.RemainingBytes(model, new[] { requested }));
+        Assert.Equal(0, weightsServer.Requests);
+        Assert.Equal(0, otherServer.Requests);
+        Assert.Equal(1, companionServer.Requests);
+        Assert.Contains("bytes=1024-", companionServer.RangeHeaders);
+    }
+
     // ---- the route over it ----------------------------------------------------------
 
     [Fact]

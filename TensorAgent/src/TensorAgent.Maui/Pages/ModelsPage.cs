@@ -37,7 +37,26 @@ public sealed class ModelsPage : ContentPage
 
     /// <summary>The running app, so the debug reproduction hook can drive the same path a tap does.</summary>
     internal AgentAppHost Host => _app;
+    // Keep every row alive, including collapsed/filtered models: a background download
+    // must still update its state and complete through the same selection path.
     private readonly ObservableCollection<ModelRow> _rows = new();
+    private readonly ObservableCollection<object> _items = new();
+    private readonly Dictionary<string, ModelFamilyRow> _families = new(StringComparer.Ordinal);
+    private readonly HashSet<string> _expandedFamilies = new(StringComparer.Ordinal);
+    private readonly Dictionary<ModelBrowseFilter, Button> _filterButtons = new();
+    private ModelBrowseFilter _filter;
+    private string _query = string.Empty;
+    private bool _initializedExpansion;
+    private bool _selecting;
+    private string? _loadingModelId;
+    private CollectionView _list = null!;
+    private SearchBar _search = null!;
+    private Label _summary = null!;
+    private Button _expandAll = null!;
+    private Button _selected = null!;
+    private Button _clearSearch = null!;
+    private Microsoft.Maui.Dispatching.IDispatcherTimer? _searchTimer;
+    private IReadOnlyList<ModelFamilyGroup> _shownGroups = Array.Empty<ModelFamilyGroup>();
     // A normal Download tap means "use this when it finishes" only while the user
     // remains on this page and has not chosen another model in the meantime.
     private string? _pendingAutoSelectId;
@@ -80,14 +99,17 @@ public sealed class ModelsPage : ContentPage
 
     private void Build()
     {
+        _searchTimer?.Stop();
         Title = Loc.T("models.title");
 
-        var list = new CollectionView
+        _list = new CollectionView
         {
-            ItemsSource = _rows,
-            ItemTemplate = new DataTemplate(BuildCell),
+            AutomationId = "ModelsList",
+            ItemsSource = _items,
+            ItemTemplate = new BrowserTemplateSelector(new DataTemplate(BuildCell), new DataTemplate(BuildFamilyCell)),
             SelectionMode = SelectionMode.None,
             BackgroundColor = Theme.Background,
+            EmptyView = EmptyResults(),
         };
 
         Content = new Grid
@@ -97,7 +119,7 @@ public sealed class ModelsPage : ContentPage
             Children =
             {
                 Header(),
-                list,
+                _list,
             },
         };
         Grid.SetRow((View)((Grid)Content).Children[1], 1);
@@ -105,14 +127,123 @@ public sealed class ModelsPage : ContentPage
 
     private View Header()
     {
-        var label = new Label
+        var header = new VerticalStackLayout { Spacing = 6, Padding = new Thickness(16, 8, 16, 4) };
+        header.Children.Add(new Label
         {
             Text = Loc.T("models.header", ("memory", _app.Paths.DeviceMemoryGB)),
             TextColor = Theme.Muted,
             FontSize = 13,
-            Padding = new Thickness(16, 12, 16, 8),
+        });
+        _search = new SearchBar
+        {
+            AutomationId = "ModelSearch",
+            Placeholder = Loc.T("models.search.placeholder"),
+            Text = _query,
+            TextColor = Theme.Text,
+            PlaceholderColor = Theme.Muted,
+            CancelButtonColor = Theme.Accent,
+            BackgroundColor = Theme.Surface,
+            MinimumHeightRequest = 44,
         };
-        return label;
+        SemanticProperties.SetHint(_search, Loc.T("models.search.hint"));
+        _searchTimer = Dispatcher.CreateTimer();
+        _searchTimer.Interval = TimeSpan.FromMilliseconds(150);
+        _searchTimer.IsRepeating = false;
+        _searchTimer.Tick += (_, _) => ApplyBrowser(scrollToTop: true);
+        _search.TextChanged += (_, e) =>
+        {
+            _query = e.NewTextValue ?? string.Empty;
+            _searchTimer.Stop();
+            if (string.IsNullOrWhiteSpace(_query)) ApplyBrowser(scrollToTop: true);
+            else _searchTimer.Start();
+        };
+        // Enter reveals results; only an explicit Download/Use action starts work.
+        _search.SearchButtonPressed += (_, _) =>
+        {
+            ApplyBrowser(scrollToTop: true);
+            _search.Unfocus();
+        };
+        header.Children.Add(_search);
+
+        _filterButtons.Clear();
+        var filters = new FlexLayout { Wrap = Microsoft.Maui.Layouts.FlexWrap.Wrap };
+        foreach (var option in new[]
+        {
+            (ModelBrowseFilter.All, "models.filter.all"),
+            (ModelBrowseFilter.Compatible, "models.filter.compatible"),
+            (ModelBrowseFilter.Downloaded, "models.filter.downloaded"),
+        })
+        {
+            Button button = BrowserButton(Loc.T(option.Item2));
+            button.AutomationId = "ModelFilter" + option.Item1;
+            button.Margin = new Thickness(0, 0, 6, 0);
+            button.Clicked += (_, _) =>
+            {
+                _filter = option.Item1;
+                ApplyBrowser(scrollToTop: true);
+            };
+            filters.Children.Add(button);
+            _filterButtons.Add(option.Item1, button);
+        }
+        header.Children.Add(filters);
+
+        _selected = BrowserButton(string.Empty);
+        _selected.AutomationId = "ShowSelectedModel";
+        _selected.HorizontalOptions = LayoutOptions.Start;
+        SemanticProperties.SetHint(_selected, Loc.T("models.browser.showSelected"));
+        _selected.Clicked += (_, _) => ShowSelected();
+        header.Children.Add(_selected);
+
+        _summary = new Label { FontSize = 12, TextColor = Theme.Muted, VerticalOptions = LayoutOptions.Center };
+        _expandAll = BrowserButton(Loc.T("models.browser.expandAll"));
+        _expandAll.AutomationId = "ModelExpandAll";
+        _expandAll.Clicked += (_, _) =>
+        {
+            bool collapse = _shownGroups.All(g => _expandedFamilies.Contains(g.Id));
+            foreach (var group in _shownGroups)
+                if (collapse) _expandedFamilies.Remove(group.Id); else _expandedFamilies.Add(group.Id);
+            ApplyBrowser();
+        };
+        _clearSearch = BrowserButton(Loc.T("models.search.clear"));
+        _clearSearch.AutomationId = "ClearModelSearch";
+        _clearSearch.Clicked += (_, _) => _search.Text = string.Empty;
+        var actions = new HorizontalStackLayout { Children = { _expandAll, _clearSearch } };
+        var summary = new Grid { ColumnDefinitions = { new ColumnDefinition(GridLength.Star), new ColumnDefinition(GridLength.Auto) } };
+        summary.Children.Add(_summary);
+        summary.Children.Add(actions);
+        Grid.SetColumn(actions, 1);
+        header.Children.Add(summary);
+        return header;
+    }
+
+    private static Button BrowserButton(string text) => new()
+    {
+        Text = text, FontSize = 12, TextColor = Theme.Muted, BackgroundColor = Theme.Surface,
+        CornerRadius = 8, Padding = new Thickness(10, 5), MinimumHeightRequest = 44,
+    };
+
+    private View EmptyResults()
+    {
+        var reset = BrowserButton(Loc.T("models.browser.reset"));
+        reset.TextColor = Theme.Accent;
+        reset.AutomationId = "ResetModelSearch";
+        reset.Clicked += (_, _) =>
+        {
+            _filter = ModelBrowseFilter.All;
+            _search.Text = string.Empty;
+            ApplyBrowser(scrollToTop: true);
+        };
+        return new VerticalStackLayout
+        {
+            Spacing = 12, Padding = new Thickness(24), HorizontalOptions = LayoutOptions.Center,
+            VerticalOptions = LayoutOptions.Center,
+            Children =
+            {
+                new Label { Text = Loc.T("models.browser.empty.title"), TextColor = Theme.Text, FontSize = 18, HorizontalTextAlignment = TextAlignment.Center },
+                new Label { Text = Loc.T("models.browser.empty.hint"), TextColor = Theme.Muted, HorizontalTextAlignment = TextAlignment.Center },
+                reset,
+            },
+        };
     }
 
     protected override void OnAppearing()
@@ -142,6 +273,7 @@ public sealed class ModelsPage : ContentPage
     {
         base.OnDisappearing();
         _visible = false;
+        _searchTimer?.Stop();
         _pendingAutoSelectId = null;
         _app.Downloads.Changed -= OnDownloadChanged;
     }
@@ -166,31 +298,40 @@ public sealed class ModelsPage : ContentPage
             switch (status.State)
             {
                 case DownloadState.Running:
+                    if (!row.IsBusy) row.BeginDownload();
                     row.Report(status.Progress);
+                    UpdateFamilyActivity(row.Model);
                     return;
                 case DownloadState.Completed:
-                    bool visionOnly = status.RequestsOnly(CatalogFileRole.Projector);
+                    bool companionOnly = status.RequestsOnly(CatalogFileRole.Projector)
+                        || status.RequestsOnly(CatalogFileRole.Draft);
                     bool selectedNow = string.Equals(
                         _app.Settings.Load().SelectedModelId, row.Model.Id, StringComparison.Ordinal);
-                    bool autoSelect = !visionOnly && string.Equals(
+                    bool autoSelect = !companionOnly && string.Equals(
                         _pendingAutoSelectId, row.Model.Id, StringComparison.Ordinal);
                     if (autoSelect)
                         _pendingAutoSelectId = null;
                     row.Finish(_app.Models);
-                    if (_visible && (autoSelect || (visionOnly && selectedNow)))
+                    // A result hidden by a new search/filter or collapsed family must
+                    // not interrupt browsing when its background transfer finishes.
+                    if (_visible && _items.Contains(row) && (autoSelect || (companionOnly && selectedNow)))
                         Select(row);
-                    else if (_visible && visionOnly && row.IsSelected != selectedNow)
+                    else if (_visible && companionOnly)
                         Refresh();
+                    else
+                        ApplyBrowser();
                     return;
                 case DownloadState.Cancelled:
                     if (string.Equals(_pendingAutoSelectId, row.Model.Id, StringComparison.Ordinal))
                         _pendingAutoSelectId = null;
                     row.Cancelled(_app.Models);
+                    ApplyBrowser();
                     return;
                 default:
                     if (string.Equals(_pendingAutoSelectId, row.Model.Id, StringComparison.Ordinal))
                         _pendingAutoSelectId = null;
                     row.Failed(_app.Models, status.Error ?? Loc.T("models.status.downloadFailed"));
+                    ApplyBrowser();
                     return;
             }
         });
@@ -222,12 +363,150 @@ public sealed class ModelsPage : ContentPage
         {
             _rows.Add(new ModelRow(
                 model, _app.Models, selected, deviceGB, _app.Downloads.StatusOf(model.Id),
-                loadedModel, visionReady));
+                loadedModel, visionReady, _app.CatalogDraftHeadAttached));
         }
+        if (_loadingModelId is not null)
+            _rows.FirstOrDefault(r => r.Model.Id == _loadingModelId)?.BeginLoading();
+        foreach (ModelRow row in _rows) row.SelectionInProgress = _selecting;
+        if (!_initializedExpansion)
+        {
+            // Open the current family's branch on first visit; otherwise begin with a
+            // compact family overview. Searching never changes these saved choices.
+            if (ModelCatalog.Find(selected ?? string.Empty) is { } model)
+                _expandedFamilies.Add(ModelBrowser.FamilyId(model));
+            _initializedExpansion = true;
+        }
+        ApplyBrowser();
+    }
+
+    private void ApplyBrowser(bool scrollToTop = false)
+    {
+        if (_summary is null) return;
+        _searchTimer?.Stop();
+        bool searching = !string.IsNullOrWhiteSpace(_query);
+        string? selectedId = _app.Settings.Load().SelectedModelId;
+        var installed = _rows.Where(r => r.IsInstalled).Select(r => r.Model.Id).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        _shownGroups = ModelBrowser.Browse(_rows.Select(r => r.Model), _query, _filter,
+            _app.Paths.DeviceMemoryGB, installed, selectedId);
+        var byId = _rows.ToDictionary(r => r.Model.Id, StringComparer.OrdinalIgnoreCase);
+        var visible = new List<object>();
+        if (searching)
+        {
+            foreach (CatalogModel model in ModelBrowser.Search(_rows.Select(r => r.Model), _query, _filter,
+                         _app.Paths.DeviceMemoryGB, installed, selectedId))
+                visible.Add(byId[model.Id]);
+        }
+        else
+        {
+            foreach (ModelFamilyGroup group in _shownGroups)
+            {
+                if (!_families.TryGetValue(group.Id, out ModelFamilyRow? family))
+                    _families[group.Id] = family = new ModelFamilyRow(group.Id, group.DisplayName);
+                family.Update(group.Models.Select(m => byId[m.Id]).ToArray(), _expandedFamilies.Contains(group.Id));
+                visible.Add(family);
+                if (family.IsExpanded)
+                    visible.AddRange(family.Rows);
+            }
+        }
+        // Retain row/header instances and change only the affected branch. Clearing the
+        // collection for a disclosure tap loses scroll position and keyboard focus.
+        for (int i = 0; i < visible.Count; i++)
+        {
+            if (i < _items.Count && ReferenceEquals(_items[i], visible[i])) continue;
+            int existing = _items.IndexOf(visible[i]);
+            if (existing >= 0) _items.Move(existing, i); else _items.Insert(i, visible[i]);
+        }
+        while (_items.Count > visible.Count) _items.RemoveAt(_items.Count - 1);
+
+        int count = _shownGroups.Sum(g => g.Models.Count);
+        _summary.Text = searching
+            ? Loc.Plural("models.browser.results", count)
+            : Loc.T("models.browser.summary", ("models", count), ("families", _shownGroups.Count));
+        _expandAll.IsVisible = !searching && _shownGroups.Count > 0;
+        _expandAll.Text = Loc.T(_shownGroups.All(g => _expandedFamilies.Contains(g.Id))
+            ? "models.browser.collapseAll" : "models.browser.expandAll");
+        _clearSearch.IsVisible = searching;
+        CatalogModel? selectedModel = ModelCatalog.Find(selectedId ?? string.Empty);
+        _selected.IsVisible = selectedModel is not null;
+        _selected.Text = selectedModel is null ? string.Empty : Loc.T("models.browser.current", ("model", selectedModel.DisplayName));
+        foreach (var pair in _filterButtons)
+        {
+            pair.Value.BackgroundColor = pair.Key == _filter ? Theme.Accent : Theme.Surface;
+            pair.Value.TextColor = pair.Key == _filter ? Colors.White : Theme.Muted;
+            pair.Value.FontAttributes = pair.Key == _filter ? FontAttributes.Bold : FontAttributes.None;
+            SemanticProperties.SetDescription(pair.Value, pair.Value.Text
+                + (pair.Key == _filter ? " · " + Loc.T("models.action.selected") : string.Empty));
+        }
+        if (scrollToTop && _items.Count > 0)
+            _list.ScrollTo(0, position: ScrollToPosition.Start, animate: false);
+    }
+
+    private void ShowSelected()
+    {
+        string? id = _app.Settings.Load().SelectedModelId;
+        ModelRow? row = _rows.FirstOrDefault(r => r.Model.Id == id);
+        if (row is null) return;
+        _filter = ModelBrowseFilter.All;
+        _expandedFamilies.Add(ModelBrowser.FamilyId(row.Model));
+        _search.Text = string.Empty;
+        ApplyBrowser();
+        _search.Unfocus();
+        _list.ScrollTo(row, position: ScrollToPosition.Center, animate: true);
+    }
+
+    private void UpdateFamilyActivity(CatalogModel model)
+    {
+        if (_families.TryGetValue(ModelBrowser.FamilyId(model), out ModelFamilyRow? family))
+            family.UpdateActivity();
+    }
+
+    private View BuildFamilyCell()
+    {
+        var disclosure = BrowserButton(string.Empty);
+        disclosure.FontSize = 17;
+        disclosure.FontAttributes = FontAttributes.Bold;
+        disclosure.TextColor = Colors.Transparent;
+        disclosure.BackgroundColor = Colors.Transparent;
+        disclosure.HorizontalOptions = LayoutOptions.Fill;
+        disclosure.VerticalOptions = LayoutOptions.Fill;
+        disclosure.SetBinding(Button.TextProperty, nameof(ModelFamilyRow.Title));
+        disclosure.SetBinding(AutomationIdProperty, nameof(ModelFamilyRow.AutomationId));
+        disclosure.SetBinding(SemanticProperties.DescriptionProperty, nameof(ModelFamilyRow.AccessibleLabel));
+        disclosure.SetBinding(SemanticProperties.HintProperty, nameof(ModelFamilyRow.Summary));
+        disclosure.Clicked += (_, _) =>
+        {
+            if (disclosure.BindingContext is not ModelFamilyRow family) return;
+            if (!_expandedFamilies.Remove(family.Id)) _expandedFamilies.Add(family.Id);
+            ApplyBrowser();
+        };
+        var title = new Label { FontSize = 17, FontAttributes = FontAttributes.Bold, TextColor = Theme.Text };
+        title.SetBinding(Label.TextProperty, nameof(ModelFamilyRow.Title));
+        var summary = new Label { FontSize = 12, TextColor = Theme.Muted, Margin = new Thickness(22, 0, 0, 0) };
+        summary.SetBinding(Label.TextProperty, nameof(ModelFamilyRow.Summary));
+        var activity = new Label { FontSize = 12, TextColor = Theme.Accent, Margin = new Thickness(22, 0, 0, 0) };
+        activity.SetBinding(Label.TextProperty, nameof(ModelFamilyRow.Activity));
+        activity.SetBinding(IsVisibleProperty, nameof(ModelFamilyRow.IsDownloading));
+        var labels = new VerticalStackLayout
+        {
+            InputTransparent = true, Padding = new Thickness(14, 12), Spacing = 4,
+            Children = { title, summary, activity },
+        };
+        // Native button underneath provides keyboard activation and one accessible
+        // expand/collapse action; the labels provide a left-aligned, wrapping layout.
+        AutomationProperties.SetExcludedWithChildren(labels, true);
+        return new Border
+        {
+            BackgroundColor = Theme.Surface, StrokeThickness = 0,
+            StrokeShape = new Microsoft.Maui.Controls.Shapes.RoundRectangle { CornerRadius = 12 },
+            Margin = new Thickness(12, 8, 12, 2),
+            Content = new Grid { Children = { disclosure, labels } },
+        };
     }
 
     private View BuildCell()
     {
+        var family = new Label { FontSize = 11, TextColor = Theme.Muted };
+        family.SetBinding(Label.TextProperty, nameof(ModelRow.FamilyAndMemory));
         var title = new Label { FontSize = 16, TextColor = Theme.Text, FontAttributes = FontAttributes.Bold };
         title.SetBinding(Label.TextProperty, nameof(ModelRow.Title));
 
@@ -248,9 +527,12 @@ public sealed class ModelsPage : ContentPage
             BackgroundColor = Theme.Accent,
             TextColor = Colors.White,
             CornerRadius = 8,
+            MinimumHeightRequest = 44,
         };
         action.SetBinding(Button.TextProperty, nameof(ModelRow.ActionLabel));
-        action.SetBinding(IsEnabledProperty, nameof(ModelRow.Runnable));
+        action.SetBinding(SemanticProperties.DescriptionProperty, nameof(ModelRow.ActionDescription));
+        action.SetBinding(IsEnabledProperty, nameof(ModelRow.CanAct));
+        action.SetBinding(AutomationIdProperty, nameof(ModelRow.ActionAutomationId));
         action.SetBinding(Button.BackgroundColorProperty, nameof(ModelRow.ActionColor));
         action.Clicked += (s, _) => OnAction(((Button)s!).BindingContext as ModelRow);
 
@@ -266,6 +548,19 @@ public sealed class ModelsPage : ContentPage
         addVision.SetBinding(IsVisibleProperty, nameof(ModelRow.CanAddVision));
         addVision.Clicked += (s, _) => OnVisionAction(((Button)s!).BindingContext as ModelRow);
 
+        var addDraft = new Button
+        {
+            FontSize = 14,
+            Margin = new Thickness(0, 0, 8, 8),
+            Padding = new Thickness(14, 6),
+            BackgroundColor = Theme.Accent,
+            TextColor = Colors.White,
+            CornerRadius = 8,
+        };
+        addDraft.SetBinding(Button.TextProperty, nameof(ModelRow.AddDraftLabel));
+        addDraft.SetBinding(IsVisibleProperty, nameof(ModelRow.CanAddDraft));
+        addDraft.Clicked += (s, _) => OnDraftAction(((Button)s!).BindingContext as ModelRow);
+
         var remove = new Button
         {
             Text = Loc.T("models.action.delete"),
@@ -278,26 +573,33 @@ public sealed class ModelsPage : ContentPage
         remove.SetBinding(IsVisibleProperty, nameof(ModelRow.CanDelete));
         remove.Clicked += (s, _) => OnDelete(((Button)s!).BindingContext as ModelRow);
 
-        var buttons = new HorizontalStackLayout { Spacing = 8, Children = { action, addVision, remove } };
+        // Companion choices wrap on a phone and when translated labels are wider.
+        foreach (Button button in new[] { action, addVision, remove })
+            button.Margin = new Thickness(0, 0, 8, 8);
+        var buttons = new FlexLayout { Wrap = Microsoft.Maui.Layouts.FlexWrap.Wrap,
+            Children = { action, addVision, addDraft, remove } };
 
-        return new Border
+        var card = new Border
         {
-            Margin = new Thickness(12, 6),
+            Margin = new Thickness(26, 5, 12, 5),
             Padding = new Thickness(14),
             BackgroundColor = Theme.Surface,
-            StrokeThickness = 0,
+            StrokeThickness = 1,
             StrokeShape = new Microsoft.Maui.Controls.Shapes.RoundRectangle { CornerRadius = 12 },
             Content = new VerticalStackLayout
             {
                 Spacing = 6,
-                Children = { title, subtitle, status, progress, buttons },
+                Children = { family, title, subtitle, status, progress, buttons },
             },
         };
+        card.SetBinding(Border.StrokeProperty, nameof(ModelRow.CardStroke));
+        card.SetBinding(AutomationIdProperty, nameof(ModelRow.AutomationId));
+        return card;
     }
 
     private async void OnAction(ModelRow? row)
     {
-        if (row is null)
+        if (row is null || !row.Runnable)
             return;
 
         if (_app.Downloads.StatusOf(row.Model.Id) is { IsRunning: true })
@@ -309,7 +611,7 @@ public sealed class ModelsPage : ContentPage
         // Downloads expose a Stop action above. Loads and local imports do not:
         // accepting a second tap would queue another multi-gigabyte import behind the
         // store lock or race another model load.
-        if (row.IsBusy)
+        if (row.IsBusy || _selecting)
             return;
 
         if (row.IsInstalled)
@@ -377,7 +679,7 @@ public sealed class ModelsPage : ContentPage
     /// </summary>
     private async void OnVisionAction(ModelRow? row)
     {
-        if (row is null || !row.NeedsVisionProjector)
+        if (row is null || !row.CanAddVision)
             return;
 
         AppSettings settings = _app.Settings.Load();
@@ -394,14 +696,32 @@ public sealed class ModelsPage : ContentPage
         }
 
         row.BeginVisionDownload();
-        // The draft head rides along when the model lists one and it is not here yet:
-        // a model installed before the draft was fetched at all has no other way to
-        // get it, and the manager skips files already complete.
-        var roles = new List<CatalogFileRole> { CatalogFileRole.Projector };
-        if (row.Model.Files.Any(f => f.Role == CatalogFileRole.Draft)
-            && _app.Models.CompanionPath(row.Model, CatalogFileRole.Draft) is null)
-            roles.Add(CatalogFileRole.Draft);
-        _app.Downloads.Start(row.Model, roles);
+        _app.Downloads.Start(row.Model, new[] { CatalogFileRole.Projector });
+    }
+
+    /// <summary>Add a draft independently, including to a text-only model or one whose
+    /// projector was already downloaded. The global optional-file preference applies
+    /// to the initial download; this button explicitly chooses this companion.</summary>
+    private async void OnDraftAction(ModelRow? row)
+    {
+        if (row is null || !row.CanAddDraft)
+            return;
+
+        AppSettings settings = _app.Settings.Load();
+        if (!settings.AllowCellularDownloads && Services.DeviceState.IsOnCellularOnly())
+        {
+            await DisplayAlert(
+                Loc.T("models.alert.cellular.title"),
+                Loc.T("models.alert.cellular.draft",
+                    ("model", row.Model.DisplayName),
+                    ("size", (row.DraftBytesRemaining / 1e9).ToString("0.0", Loc.Culture)),
+                    ("setting", Loc.T("settings.downloads.cellular.title"))),
+                Loc.T("common.ok"));
+            return;
+        }
+
+        row.BeginDownload();
+        _app.Downloads.Start(row.Model, new[] { CatalogFileRole.Draft });
     }
 
     /// <summary>
@@ -423,6 +743,11 @@ public sealed class ModelsPage : ContentPage
     /// </summary>
     private async void Select(ModelRow row)
     {
+        if (_selecting || !row.Runnable || !row.IsInstalled) return;
+        _selecting = true;
+        _loadingModelId = row.Model.Id;
+        foreach (ModelRow item in _rows) item.SelectionInProgress = true;
+        _search.Unfocus();
         // Choosing any model supersedes a promise to auto-select a different download
         // that happens to finish while this load is in flight.
         _pendingAutoSelectId = null;
@@ -430,6 +755,7 @@ public sealed class ModelsPage : ContentPage
         try
         {
             string backend = await Task.Run(() => _app.UseModel(row.Model));
+            _loadingModelId = null;
             Refresh();
             // Only if this is still the screen the user is looking at. Loading takes
             // twenty seconds and nobody is made to wait here for it: they can go back to
@@ -442,9 +768,16 @@ public sealed class ModelsPage : ContentPage
         }
         catch (Exception ex)
         {
+            _loadingModelId = null;
             row.Failed(_app.Models, ex.Message);
             await DisplayAlert(Loc.T("models.alert.useFailed.title"), ex.Message, Loc.T("common.ok"));
             Refresh();
+        }
+        finally
+        {
+            _selecting = false;
+            _loadingModelId = null;
+            foreach (ModelRow item in _rows) item.SelectionInProgress = false;
         }
     }
 
@@ -471,7 +804,7 @@ public sealed class ModelsPage : ContentPage
 
     private async void OnDelete(ModelRow? row)
     {
-        if (row is null)
+        if (row is null || !row.CanDelete)
             return;
         string message = row.Model.SideloadOnly
             ? Loc.T("models.alert.delete.messageLocal", ("model", row.Model.DisplayName))
@@ -486,13 +819,58 @@ public sealed class ModelsPage : ContentPage
     }
 }
 
+internal sealed class BrowserTemplateSelector(DataTemplate model, DataTemplate family) : DataTemplateSelector
+{
+    protected override DataTemplate OnSelectTemplate(object item, BindableObject container) =>
+        item is ModelFamilyRow ? family : model;
+}
+
+/// <summary>A disclosure row has its own identity so progress updates do not rebuild
+/// the tree or reopen a family the user collapsed.</summary>
+internal sealed class ModelFamilyRow(string id, string name) : BindableObject
+{
+    public string Id { get; } = id;
+    public string Name { get; } = name;
+    public string AutomationId => "ModelFamily-" + Id;
+    public IReadOnlyList<ModelRow> Rows { get; private set; } = Array.Empty<ModelRow>();
+    public bool IsExpanded { get; private set; }
+    public string Title => (IsExpanded ? "▾  " : "▸  ") + Name;
+    public string AccessibleLabel => Loc.T(IsExpanded ? "models.family.collapse" : "models.family.expand", ("family", Name));
+    public string Summary => Loc.Plural("models.family.summary", Rows.Count,
+        ("installed", Rows.Count(r => r.IsInstalled)), ("compatible", Rows.Count(r => r.Runnable)));
+    public bool IsDownloading => _downloads > 0;
+    public string Activity => Loc.T("models.family.downloading", ("count", _downloads));
+    private int _downloads;
+
+    public void Update(IReadOnlyList<ModelRow> rows, bool expanded)
+    {
+        Rows = rows;
+        IsExpanded = expanded;
+        OnPropertyChanged(nameof(Title));
+        OnPropertyChanged(nameof(AccessibleLabel));
+        OnPropertyChanged(nameof(Summary));
+        UpdateActivity();
+    }
+
+    public void UpdateActivity()
+    {
+        int downloads = Rows.Count(r => r.IsDownloading);
+        if (_downloads == downloads) return;
+        _downloads = downloads;
+        OnPropertyChanged(nameof(IsDownloading));
+        OnPropertyChanged(nameof(Activity));
+    }
+}
+
 /// <summary>One row of the model list, and the only place its display state lives.</summary>
 public sealed class ModelRow : BindableObject
 {
     private string _status;
     private double _fraction;
     private bool _busy;
+    private bool _downloading;
     private string _actionLabel;
+    private bool _selectionInProgress;
 
     /// <param name="download">
     /// What this launch's download manager is doing with the entry, or null when it has
@@ -504,7 +882,7 @@ public sealed class ModelRow : BindableObject
     public ModelRow(
         CatalogModel model, ModelStore store, string? selectedId, int deviceMemoryGB,
         ModelDownloadStatus? download = null, string? loadedModelName = null,
-        bool loadedVisionReady = false)
+        bool loadedVisionReady = false, bool loadedDraftReady = false)
     {
         Model = model;
         Runnable = model.MinDeviceMemoryGB <= deviceMemoryGB;
@@ -517,9 +895,15 @@ public sealed class ModelRow : BindableObject
             && store.CompanionPath(model, CatalogFileRole.Projector) is not null
             && string.Equals(model.Weights.FileName, loadedModelName, StringComparison.OrdinalIgnoreCase)
             && !loadedVisionReady;
+        DraftActivationRequired = IsSelected
+            && IsInstalled
+            && store.CompanionPath(model, CatalogFileRole.Draft) is not null
+            && string.Equals(model.Weights.FileName, loadedModelName, StringComparison.OrdinalIgnoreCase)
+            && !loadedDraftReady;
         _status = DescribeState(store);
         _actionLabel = !Runnable ? Loc.T("models.action.tooBig")
             : VisionActivationRequired ? Loc.T("models.action.enableVision")
+            : DraftActivationRequired ? Loc.T("models.action.loadDraft")
             : IsInstalled ? (IsSelected ? Loc.T("models.action.selected") : Loc.T("models.action.use"))
             : model.SideloadOnly ? Loc.T("models.action.import")
             : Loc.T("models.action.download");
@@ -540,6 +924,29 @@ public sealed class ModelRow : BindableObject
     }
 
     public CatalogModel Model { get; }
+    public string AutomationId => "Model-" + Model.Id;
+    public string ActionAutomationId => "ModelAction-" + Model.Id;
+    public Brush CardStroke => IsSelected ? new SolidColorBrush(Theme.Accent) : Brush.Transparent;
+    public string FamilyAndMemory => ModelBrowser.FamilyName(Model) + " · "
+        + Loc.T("models.row.requiredMemory", ("memory", Model.MinDeviceMemoryGB));
+    public bool SelectionInProgress
+    {
+        get => _selectionInProgress;
+        set
+        {
+            _selectionInProgress = value;
+            OnPropertyChanged(nameof(CanAct));
+            OnPropertyChanged(nameof(CanDelete));
+            OnPropertyChanged(nameof(CanAddVision));
+            OnPropertyChanged(nameof(CanAddDraft));
+        }
+    }
+    public bool CanAct => Runnable && (IsDownloading || (!SelectionInProgress && !IsBusy));
+    public bool IsDownloading
+    {
+        get => _downloading;
+        private set { _downloading = value; OnPropertyChanged(); OnPropertyChanged(nameof(CanAct)); }
+    }
 
     /// <summary>Whether this device has the memory the entry asks for.</summary>
     public bool Runnable { get; }
@@ -553,6 +960,10 @@ public sealed class ModelRow : BindableObject
     public long VisionBytesRemaining { get; private set; }
     /// <summary>The projector arrived after this selected model was loaded text-only.</summary>
     public bool VisionActivationRequired { get; }
+    public bool NeedsDraft { get; private set; }
+    public long DraftBytesRemaining { get; private set; }
+    public bool DraftActivationRequired { get; }
+    public string AddDraftLabel => Loc.T("models.action.addDraft", ("size", Gb(DraftBytesRemaining)));
 
     public string Title => IsSelected ? Loc.T("models.row.inUse", ("model", Model.DisplayName)) : Model.DisplayName;
 
@@ -583,7 +994,7 @@ public sealed class ModelRow : BindableObject
             if (Model.Modalities.HasFlag(CatalogModalities.Audio)) parts.Add(Loc.T("models.row.input.audio"));
             if (Model.Modalities.HasFlag(CatalogModalities.Video)) parts.Add(Loc.T("models.row.input.video"));
             string separator = Loc.T("models.row.input.separator");
-            if (Model.Kind != CatalogArchitectureKind.Diffusion)
+            if ((Model.Modalities & (CatalogModalities.ImageOutput | CatalogModalities.VideoOutput)) == 0)
                 return Loc.T("models.row.reads", ("inputs", string.Join(separator, parts)));
             // What it reads and what it makes is one sentence, so each kind is a whole line,
             // with and without inputs beyond the prompt.
@@ -611,13 +1022,16 @@ public sealed class ModelRow : BindableObject
 
     public string Status { get => _status; private set { _status = value; OnPropertyChanged(); } }
     public double Fraction { get => _fraction; private set { _fraction = value; OnPropertyChanged(); } }
-    public bool IsBusy { get => _busy; private set { _busy = value; OnPropertyChanged(); OnPropertyChanged(nameof(CanDelete)); OnPropertyChanged(nameof(CanAddVision)); } }
-    public string ActionLabel { get => _actionLabel; private set { _actionLabel = value; OnPropertyChanged(); } }
-    public bool CanDelete => IsInstalled && !IsBusy;
-    public bool CanAddVision => Runnable && NeedsVisionProjector && !IsBusy;
+    public bool IsBusy { get => _busy; private set { _busy = value; OnPropertyChanged(); OnPropertyChanged(nameof(CanAct)); OnPropertyChanged(nameof(CanDelete)); OnPropertyChanged(nameof(CanAddVision)); OnPropertyChanged(nameof(CanAddDraft)); } }
+    public string ActionLabel { get => _actionLabel; private set { _actionLabel = value; OnPropertyChanged(); OnPropertyChanged(nameof(ActionDescription)); } }
+    public string ActionDescription => ActionLabel + ": " + Model.DisplayName + " · " + Model.Quantization;
+    public bool CanDelete => IsInstalled && !IsBusy && !SelectionInProgress;
+    public bool CanAddVision => Runnable && NeedsVisionProjector && !IsBusy && !SelectionInProgress;
+    public bool CanAddDraft => Runnable && NeedsDraft && !IsBusy && !SelectionInProgress;
 
     public void BeginDownload()
     {
+        IsDownloading = true;
         IsBusy = true;
         ActionLabel = Loc.T("models.action.stop");
         Status = Loc.T("models.status.starting");
@@ -625,6 +1039,7 @@ public sealed class ModelRow : BindableObject
 
     public void BeginVisionDownload()
     {
+        IsDownloading = true;
         IsBusy = true;
         ActionLabel = Loc.T("models.action.stop");
         Status = Loc.T("models.status.startingVision");
@@ -632,6 +1047,7 @@ public sealed class ModelRow : BindableObject
 
     public void BeginImport()
     {
+        IsDownloading = false;
         IsBusy = true;
         ActionLabel = Loc.T("models.action.importing");
         Status = Loc.T("models.status.importing");
@@ -646,6 +1062,7 @@ public sealed class ModelRow : BindableObject
     /// <summary>Loading the weights, which is seconds rather than instant.</summary>
     public void BeginLoading()
     {
+        IsDownloading = false;
         IsBusy = true;
         ActionLabel = Loc.T("models.action.loading");
         Status = Loc.T("models.status.loading");
@@ -672,37 +1089,47 @@ public sealed class ModelRow : BindableObject
 
     public void Finish(ModelStore store)
     {
+        IsDownloading = false;
         IsBusy = false;
         RefreshInstallState(store);
         Fraction = 1;
-        ActionLabel = IsSelected ? Loc.T("models.action.selected") : Loc.T("models.action.use");
+        ActionLabel = InstalledActionLabel;
         Status = DescribeState(store);
         OnPropertyChanged(nameof(CanDelete));
         OnPropertyChanged(nameof(CanAddVision));
+        OnPropertyChanged(nameof(CanAddDraft));
     }
 
     public void Cancelled(ModelStore store)
     {
+        IsDownloading = false;
         IsBusy = false;
         RefreshInstallState(store);
         ActionLabel = IsInstalled
-            ? (VisionActivationRequired ? Loc.T("models.action.enableVision") : IsSelected ? Loc.T("models.action.selected") : Loc.T("models.action.use"))
+            ? InstalledActionLabel
             : Loc.T("models.action.resume");
         Status = Loc.T("models.status.stopped", ("state", DescribeState(store)));
         OnPropertyChanged(nameof(CanAddVision));
+        OnPropertyChanged(nameof(CanAddDraft));
     }
 
     public void Failed(ModelStore store, string message)
     {
+        IsDownloading = false;
         IsBusy = false;
         RefreshInstallState(store);
         ActionLabel = IsInstalled
-            ? (VisionActivationRequired ? Loc.T("models.action.enableVision") : IsSelected ? Loc.T("models.action.selected") : Loc.T("models.action.use"))
+            ? InstalledActionLabel
             : Model.SideloadOnly ? Loc.T("models.action.import")
             : Loc.T("models.action.retry");
         Status = message;
         OnPropertyChanged(nameof(CanAddVision));
+        OnPropertyChanged(nameof(CanAddDraft));
     }
+
+    private string InstalledActionLabel => VisionActivationRequired ? Loc.T("models.action.enableVision")
+        : DraftActivationRequired ? Loc.T("models.action.loadDraft")
+        : IsSelected ? Loc.T("models.action.selected") : Loc.T("models.action.use");
 
     private string DescribeState(ModelStore store)
     {
@@ -722,6 +1149,9 @@ public sealed class ModelRow : BindableObject
         {
             return Loc.T("models.status.visionDownloaded", ("action", Loc.T("models.action.enableVision")), ("license", Model.License));
         }
+
+        if (DraftActivationRequired)
+            return Loc.T("models.status.draftDownloaded", ("action", Loc.T("models.action.loadDraft")), ("license", Model.License));
 
         if (Model.SideloadOnly && store.StateOf(Model) != InstallState.Installed)
         {
@@ -750,13 +1180,14 @@ public sealed class ModelRow : BindableObject
             && Model.Modalities.HasFlag(CatalogModalities.Image)
             && store.CompanionPath(Model, CatalogFileRole.Projector) is null;
 
-        VisionBytesRemaining = 0;
-        if (!NeedsVisionProjector || projector is null)
-            return;
-
-        string part = ResumableDownloader.PartPath(store.PathFor(Model, projector));
-        long have = File.Exists(part) ? Math.Min(new FileInfo(part).Length, projector.Bytes) : 0;
-        VisionBytesRemaining = projector.Bytes - have;
+        VisionBytesRemaining = NeedsVisionProjector
+            ? store.RemainingBytes(Model, new[] { CatalogFileRole.Projector }) : 0;
+        NeedsDraft = IsInstalled
+            && Model.Files.Any(f => f.Role == CatalogFileRole.Draft && f.Optional)
+            && store.CompanionPath(Model, CatalogFileRole.Draft) is null;
+        DraftBytesRemaining = NeedsDraft
+            ? store.RemainingBytes(Model, new[] { CatalogFileRole.Draft }) : 0;
+        OnPropertyChanged(nameof(AddDraftLabel));
     }
 
     private static string Gb(long bytes) => (bytes / 1e9).ToString("0.00", Loc.Culture);

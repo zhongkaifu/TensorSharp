@@ -22,6 +22,31 @@ public sealed class CatalogTests
             "qwen-image-2.1-q4km",
             "minimax-h3-fl2va-q4k",
             "minimax-h3-ref2va-q4k",
+            "gemma-4-26b-a4b-qat-q4kxl",
+            "gemma-4-31b-q4-0",
+            "qwen3.5-35b-a3b-q4km",
+            "qwen3.6-35b-a3b-q4km",
+            "qwen3.6-27b-q4km",
+            "gpt-oss-20b-mxfp4",
+            "nemotron-h-8b-q4km",
+            "nemotron-h-47b-q4km",
+            "nemotron-3-nano-omni-30b-a3b-q4kxl",
+            "nemotron-3.5-lightning-30b-a3b-mxfp4",
+            "mistral-small-3.1-24b-q4km",
+            "hy-mt2-1.8b-q4km",
+            "deepseek-v4-flash-0731-q2kxl",
+            "deepseek-v4.1-flash-engramq5-q2k",
+            "glm-5.2-iq2xxs",
+            "glm-5.3-q2kxl",
+            "glm-5.3-flash-q2kxl",
+            "diffusiongemma-26b-a4b-q4km",
+            "wan2.1-t2v-1.3b-q8",
+            "wan2.1-t2v-14b-q4km",
+            "wan2.2-ti2v-5b-q8",
+            "wan2.2-ti2v-5b-turbo-q8",
+            "wan2.2-t2v-a14b-q4km",
+            "wan2.2-i2v-a14b-q4km",
+            "wan2.2-i2v-a14b-lightx2v-q4km",
         };
 
         Assert.Equal(expected, ModelCatalog.BuiltIn.Select(m => m.Id).ToArray());
@@ -48,7 +73,7 @@ public sealed class CatalogTests
                 else
                 {
                     Assert.StartsWith("https://huggingface.co/", f.Url);
-                    Assert.EndsWith("/resolve/main/" + f.Url.Split("/resolve/main/")[1], f.Url);
+                    Assert.Matches(@"/resolve/(main|[0-9a-f]{40})/[^\s]+$", f.Url);
                 }
                 // A size read from a pointer file (~130 bytes) instead of the object is the
                 // mistake this catches. Loose tokenizer files are genuinely small - MiniMax-H3's
@@ -61,7 +86,7 @@ public sealed class CatalogTests
             // Keep the recognized tiers narrow so a typo cannot silently expose an
             // entry on an unintended device class. 24, 32 and 48 are the desktop's: no
             // phone or tablet reaches them, so those entries stay off every one.
-            Assert.Contains(m.MinDeviceMemoryGB, new[] { 6, 8, 12, 16, 24, 32, 48 });
+            Assert.Contains(m.MinDeviceMemoryGB, new[] { 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024 });
             // A later shard of a split GGUF is required and carries shard 1's gguf-split
             // name with its own number: the engine finds it beside shard 1 by that name.
             var shards = m.Files.Where(f => f.Role == CatalogFileRole.WeightsShard).ToList();
@@ -227,10 +252,10 @@ public sealed class CatalogTests
         Assert.Empty(ModelCatalog.ForDevice(8));
         // Bonsai 2 27B is the one 16 GB entry: its repacked weights do not fit a 12 GB phone.
         Assert.Equal(
-            ModelCatalog.BuiltIn.Where(m => m.Id != "bonsai-2-27b-ptq1-0" && !DesktopOnly.Contains(m.Id)).Select(m => m.Id),
+            ModelCatalog.BuiltIn.Where(m => m.MinDeviceMemoryGB <= 12).Select(m => m.Id),
             ModelCatalog.ForDevice(12).Select(m => m.Id));
         Assert.Equal(
-            ModelCatalog.BuiltIn.Where(m => !DesktopOnly.Contains(m.Id)).Select(m => m.Id),
+            ModelCatalog.BuiltIn.Where(m => m.MinDeviceMemoryGB <= 16).Select(m => m.Id),
             ModelCatalog.ForDevice(16).Select(m => m.Id));
     }
 
@@ -301,7 +326,9 @@ public sealed class CatalogTests
     [Fact]
     public void ADesktopIsOfferedEverythingASmallerDeviceIs()
     {
-        Assert.Equal(ModelCatalog.BuiltIn.Select(m => m.Id), ModelCatalog.ForDevice(48).Select(m => m.Id));
+        foreach (int tier in new[] { 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024 })
+            Assert.All(ModelCatalog.ForDevice(tier), model => Assert.Contains(model, ModelCatalog.ForDevice(1024)));
+        Assert.Equal(ModelCatalog.BuiltIn.Select(m => m.Id), ModelCatalog.ForDevice(1024).Select(m => m.Id));
     }
 
     /// <summary>
@@ -397,8 +424,8 @@ public sealed class CatalogTests
         Assert.Equal(15_878_222_368, muse.Weights.Bytes);
         Assert.Equal("82bece304887a313ece08400bc030f6066c7bff5b906b0cd40308ec8a409fd38", muse.Weights.Sha256);
         Assert.True(muse.Projector is { Optional: true });
-        // The DFlash drafter verifies greedily and the app samples, so it is not offered.
-        Assert.DoesNotContain(muse.Files, f => f.Role == CatalogFileRole.Draft);
+        Assert.True(Assert.Single(muse.Files, f => f.Role == CatalogFileRole.Draft).Optional);
+        Assert.True(Assert.Single(qwen.Files, f => f.Role == CatalogFileRole.Draft).Optional);
     }
 
     [Theory]
@@ -574,6 +601,31 @@ public sealed class CatalogTests
         "minimax-h3-ref2va-q4k",
         "qwen3.8-flash-next-q2kxl",
         "qwen3.8-flash-next-iq1m",
+        "gemma-4-26b-a4b-qat-q4kxl",
+        "gemma-4-31b-q4-0",
+        "qwen3.5-35b-a3b-q4km",
+        "qwen3.6-35b-a3b-q4km",
+        "qwen3.6-27b-q4km",
+        "gpt-oss-20b-mxfp4",
+        "nemotron-h-8b-q4km",
+        "nemotron-h-47b-q4km",
+        "nemotron-3-nano-omni-30b-a3b-q4kxl",
+        "nemotron-3.5-lightning-30b-a3b-mxfp4",
+        "mistral-small-3.1-24b-q4km",
+        "hy-mt2-1.8b-q4km",
+        "deepseek-v4-flash-0731-q2kxl",
+        "deepseek-v4.1-flash-engramq5-q2k",
+        "glm-5.2-iq2xxs",
+        "glm-5.3-q2kxl",
+        "glm-5.3-flash-q2kxl",
+        "diffusiongemma-26b-a4b-q4km",
+        "wan2.1-t2v-1.3b-q8",
+        "wan2.1-t2v-14b-q4km",
+        "wan2.2-ti2v-5b-q8",
+        "wan2.2-ti2v-5b-turbo-q8",
+        "wan2.2-t2v-a14b-q4km",
+        "wan2.2-i2v-a14b-q4km",
+        "wan2.2-i2v-a14b-lightx2v-q4km",
     };
 
     /// <summary>

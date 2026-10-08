@@ -161,6 +161,16 @@ how far along it is. See [`auto-download.json`](auto-download.json).
 
 `url` (singular) is accepted as a shorthand for a single-entry `urls`.
 
+Split GGUF models need every shard beside the first. Add the remaining shards
+under the primary download object's `files` array, each with its own `path`,
+`urls` and `sha256`, as in [`qwen3.8-flash-next.json`](qwen3.8-flash-next.json).
+The hosts download every missing shard and emit just one `--model` argument
+pointing to the primary `path`. Cached shards are reused independently. Paths
+inside `files` are relative to the config file, just like the primary path;
+`--model` on the command line skips the entire configured download group.
+Use separate `mmproj` and `draft-model` options for optional companions so they
+can be selected independently of the required shards.
+
 ## Examples in this folder
 
 Every example uses **real, public, ungated** Hugging Face URLs, so the files
@@ -220,6 +230,7 @@ TensorSharp.Server.Host --config config/gemma-4-26b-a4b.json
 | [`qwen3.5-9b-uncensored-q8.json`](qwen3.5-9b-uncensored-q8.json) | Qwen3.5-9B Uncensored (Q8_0) | Text LLM |
 | [`qwen3.6-27b.json`](qwen3.6-27b.json) | Qwen3.6-27B + vision | Multimodal LLM |
 | [`qwen3.6-35b-a3b.json`](qwen3.6-35b-a3b.json) | Qwen3.6-35B-A3B (MoE) + vision | Multimodal MoE LLM |
+| [`qwen3.8-flash-next.json`](qwen3.8-flash-next.json) | Qwen3.8 Flash Next (UD-Q2_K_XL, three shards) + vision | Multimodal MoE LLM; optional shared MTP head |
 | [`gemma-4-e4b.json`](gemma-4-e4b.json) | Gemma-4 E4B **uncensored** (TrevorJS's community build, Q8_0) + stock unsloth vision projector + AtomicChat MTP draft | Multimodal LLM |
 | [`gemma-4-12b.json`](gemma-4-12b.json) | Gemma-4 12B (QAT) + vision + MTP draft | Multimodal LLM |
 | [`gemma-4-26b-a4b.json`](gemma-4-26b-a4b.json) | Gemma-4 26B-A4B (MoE) + vision + MTP draft | Multimodal MoE LLM |
@@ -236,6 +247,16 @@ Notes:
 
 - **Multimodal** configs load a vision projector, so add `--image photo.png` to ask
   about a picture.
+- **Qwen3.8 Flash Next** downloads about 78.9 GB of weights across three shards
+  and a 0.9 GB BF16 projector. It defaults to `ggml_cuda` with F16 KV; pass
+  `--backend ggml_metal` on Apple Silicon. Expert and PLE paging can keep the
+  resident working set below the download size, with device- and SSD-dependent
+  performance. Pass `--mmproj none` to skip vision. The commented `draft-model`
+  entry enables the separate 2.8 GB shared Q8_0 MTP head on GGML backends;
+  uncomment it to download and use that head. Speculation applies to solo
+  requests prefilling from position zero; retained-prefix and concurrent
+  requests decode plainly. See the [model guide](../docs/models/qwen38-flash-next.md)
+  for supported execution paths and measured limits.
 - **Speculative decoding** is lossless and works on **both** hosts — a key here
   becomes the matching flag, and `TensorSharp.Cli` honours every one of them.
   There is one spelling per option: `"spec"`, `"spec-type"`, `"spec-draft"`,

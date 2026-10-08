@@ -2095,6 +2095,11 @@ public sealed class AgentAppHost : IDisposable
     /// <summary>True when the loaded model carries a usable draft head.</summary>
     public bool DraftHeadAttached => ModelService.Model is IDraftHead { HasDraftHead: true };
 
+    /// <summary>Whether the completed load attached the catalog's downloaded draft,
+    /// rather than only a head already embedded in the target weights.</summary>
+    public bool CatalogDraftHeadAttached => _loadedCatalogDraftPath is not null && DraftHeadAttached
+        && ModelService.DraftHeadActivationError is null;
+
     /// <summary>
     /// Switch speculation on or off for the running engine without touching the saved
     /// settings - what the on-device benchmark does between its passes. Returns a
@@ -2118,8 +2123,8 @@ public sealed class AgentAppHost : IDisposable
             ? InstalledDraftPath(loadedModel, Path.GetDirectoryName(ModelService.LoadedModelPath)!)
             : model is null ? null : Models.CompanionPath(model, CatalogFileRole.Draft);
         string note = SpeculationPolicy.PrepareLoad(settings, draftHead);
-        bool draftAttached = SpeculationPolicy.SpeculatesWithDraftHead(
-            draftHead, ModelService.Model is IDraftHead { HasDraftHead: true });
+        bool draftAttached = CatalogDraftHeadAttached
+            && string.Equals(_loadedCatalogDraftPath, draftHead, StringComparison.Ordinal);
         string algorithm = SpeculationPolicy.ChooseAlgorithm(draftAttached);
         bool live = ModelService.EngineHost.UpdateSpeculation(SpeculationOptions.FromEnvironment());
         string account = $"{note}; algorithm {algorithm}; {(live ? "applied to the running engine" : "no engine standing, applies at the next load")}";
@@ -2504,6 +2509,8 @@ public sealed class AgentAppHost : IDisposable
                 return current;
             });
             string weights = Paths.SelectedModelPath(settings);
+            string? projector = Models.CompanionPath(model, CatalogFileRole.Projector);
+            string? draftHead = Models.CompanionPath(model, CatalogFileRole.Draft);
 
             // The model that is asked for is the one already standing: nothing to load.
             // Two callers reach here for the same model at launch -- the startup load of
@@ -2513,6 +2520,8 @@ public sealed class AgentAppHost : IDisposable
             // trusted; a failed one is retried by loading again.
             if (ModelLoad == ModelLoadState.Loaded
                 && string.Equals(ModelService.LoadedModelPath, weights, StringComparison.Ordinal)
+                && string.Equals(ModelService.LoadedMmProjPath, projector, StringComparison.Ordinal)
+                && string.Equals(_loadedCatalogDraftPath, draftHead, StringComparison.Ordinal)
                 && ModelService.LoadedBackend is { Length: > 0 } standing)
             {
                 HostLog.LogInformation("{Model} is already loaded on {Backend}; not loading it again", model.Id, standing);
@@ -2552,7 +2561,6 @@ public sealed class AgentAppHost : IDisposable
                 // leave a truncated destination behind. Only a catalog-size-complete
                 // projector is safe to hand to the engine. Optional projectors may be
                 // absent for text-only use; required ones make the install incomplete.
-                string? projector = Models.CompanionPath(model, CatalogFileRole.Projector);
                 if (model.Projector is { Optional: false } requiredProjector && projector is null)
                 {
                     string path = Models.PathFor(model, requiredProjector);
@@ -2608,7 +2616,6 @@ public sealed class AgentAppHost : IDisposable
                 // Speculative decoding, and the draft head that makes it best: the
                 // catalog's optional companion, handed to the loader the way the CLI's
                 // --draft-model is. Before the load for the same reason as the budget.
-                string? draftHead = Models.CompanionPath(model, CatalogFileRole.Draft);
                 HostLog.LogInformation("{Model}: {Speculation}", model.Id, SpeculationPolicy.PrepareLoad(settings, draftHead));
 
                 // The entry's own card values, for the same reason and in the same place.
@@ -2651,7 +2658,8 @@ public sealed class AgentAppHost : IDisposable
                         // attached (a head built into the weights file does not count:
                         // see SpeculationPolicy.SpeculatesWithDraftHead).
                         bool draftAttached = SpeculationPolicy.SpeculatesWithDraftHead(
-                            draftHead, ModelService.Model is IDraftHead { HasDraftHead: true });
+                            draftHead, ModelService.Model is IDraftHead { HasDraftHead: true })
+                            && ModelService.DraftHeadActivationError is null;
                         string algorithm = SpeculationPolicy.ChooseAlgorithm(draftAttached);
                         // Also hand it to the engine host: a settings switch flipped while this
                         // model was loading was remembered with the algorithm chosen before the
@@ -2663,6 +2671,7 @@ public sealed class AgentAppHost : IDisposable
                         _loggerFactory.CreateLogger("TensorAgent.Host").LogInformation(
                             "using {Model} on {Backend} (speculation: {Algorithm})", model.Id, backend.Value, algorithm);
                         LogMemory($"after loading {model.Id}");
+                        _loadedCatalogDraftPath = draftAttached ? draftHead : null;
                         SetModelLoad(ModelLoadState.Loaded, null);
                         loaded = backend.Value;
                         break;
@@ -2700,6 +2709,9 @@ public sealed class AgentAppHost : IDisposable
     }
 
     private readonly object _modelGate = new();
+    // Companion identity belongs to the completed load. A projector or draft downloaded
+    // later must reload even when the selected weights path has not changed.
+    private string? _loadedCatalogDraftPath;
 
     /// <summary>
     /// What <see cref="WaitForTheEngineToStop"/> polls, and the only thing that decides

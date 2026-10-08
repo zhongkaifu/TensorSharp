@@ -61,6 +61,9 @@ public enum CatalogFileRole
     /// others from the same folder by their exact gguf-split names, so every shard is required
     /// and stored under its published name.</summary>
     WeightsShard,
+    /// <summary>The second Wan A14B denoiser, loaded after the first expert's stage.
+    /// This is an independent GGUF, not a shard of the primary weights.</summary>
+    SecondaryWeights,
 }
 
 /// <summary>One downloadable artifact of a catalog entry.</summary>
@@ -84,7 +87,12 @@ public sealed record CatalogFile(
 
 /// <summary>Model families the catalog knows; used for grouping in the UI and for
 /// family-specific defaults (thinking, sampling).</summary>
-public enum CatalogFamily { Gemma4, Qwen35, Qwen36, Qwen38, QwenImage, GptOss, Bonsai, MuseGlimmer, MiniMaxH3, Qwen38FlashNext }
+public enum CatalogFamily
+{
+    // Append new families: the numeric values are part of persisted catalog data.
+    Gemma4, Qwen35, Qwen36, Qwen38, QwenImage, GptOss, Bonsai, MuseGlimmer, MiniMaxH3, Qwen38FlashNext,
+    DeepSeek4, DeepSeek41, Glm5, Nemotron, Mistral3, HunyuanDense, DiffusionGemma, Wan,
+}
 
 /// <summary>Dense or mixture-of-experts.</summary>
 public enum CatalogArchitectureKind { Dense, MixtureOfExperts, Diffusion }

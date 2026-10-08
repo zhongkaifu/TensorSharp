@@ -86,9 +86,8 @@ public sealed class EngineMemoryPolicyTests : IDisposable
     [Fact]
     public void AnEntryThatAsksForLeanCachesKeepsThePhonesBudgetOnTheDesktop()
     {
-        foreach (string id in new[] { "qwen3.8-27b-q4kxl", "muse-glimmer-30b-q4kxl", "qwen3.8-flash-next-q2kxl", "qwen3.8-flash-next-iq1m" })
+        foreach (CatalogModel model in ModelCatalog.BuiltIn.Where(m => m.LeanCaches))
         {
-            CatalogModel model = Entry(id);
             Assert.True(model.LeanCaches);
             EngineMemoryPolicy.Apply(model, AppSettings.DesktopDefaults(), DeviceClass.Desktop);
 
@@ -103,8 +102,10 @@ public sealed class EngineMemoryPolicyTests : IDisposable
         EngineMemoryPolicy.Apply(Entry("qwen3.5-9b-iq4xs"), AppSettings.DesktopDefaults(), DeviceClass.Desktop);
         Assert.Null(Environment.GetEnvironmentVariable(EngineMemoryPolicy.KvInitialTokensVariable));
         Assert.Null(Environment.GetEnvironmentVariable(EngineMemoryPolicy.RetainedFusedCacheMaxVariable));
-        Assert.Equal(new[] { "muse-glimmer-30b-q4kxl", "qwen3.8-27b-q4kxl", "qwen3.8-flash-next-iq1m", "qwen3.8-flash-next-q2kxl" },
-            ModelCatalog.BuiltIn.Where(m => m.LeanCaches).Select(m => m.Id).OrderBy(id => id));
+        foreach (string id in new[] { "muse-glimmer-30b-q4kxl", "qwen3.8-27b-q4kxl", "qwen3.8-flash-next-iq1m", "qwen3.8-flash-next-q2kxl" })
+            Assert.True(Entry(id).LeanCaches);
+        Assert.All(ModelCatalog.BuiltIn.Where(m => m.Experimental && m.MinDeviceMemoryGB >= 24),
+            m => Assert.True(m.LeanCaches));
     }
 
     [Fact]
@@ -322,7 +323,7 @@ public sealed class EngineMemoryPolicyTests : IDisposable
     {
         // Qwen 3.8 runs the same qwen35 graphs.
         List<CatalogModel> qwen = ModelCatalog.BuiltIn
-            .Where(m => m.Family is CatalogFamily.Qwen35 or CatalogFamily.Qwen38)
+            .Where(m => m.Family is CatalogFamily.Qwen35 or CatalogFamily.Qwen36 or CatalogFamily.Qwen38)
             .ToList();
 
         Assert.NotEmpty(qwen);

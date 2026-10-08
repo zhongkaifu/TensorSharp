@@ -17,7 +17,7 @@ using TensorSharp.Models.Video;
 namespace TensorAgent.Core.Hosting;
 
 /// <summary>
-/// A chat turn when the loaded model makes video clips (MiniMax-H3).
+/// A chat turn when the loaded model makes video clips (MiniMax-H3 or Wan).
 ///
 /// <para>
 /// The same arrangement as <see cref="ImageTurns"/>: the page's one route for a turn,
@@ -51,6 +51,9 @@ public static class VideoTurns
     /// subjects that is gone by 20.</para>
     /// </summary>
     public const int DefaultFrames = 22;
+
+    /// <summary>Wan uses a 4k+1 frame grid; keep its default short too.</summary>
+    public const int DefaultWanFrames = 21;
 
     /// <summary>
     /// Run the turn <paramref name="body"/> describes and yield its chat frames.
@@ -209,7 +212,11 @@ public static class VideoTurns
         string[] clips = Paths(user, "videoFilePaths");
         string[] sounds = Paths(user, "audioPaths");
 
-        var payload = new Dictionary<string, object> { ["prompt"] = prompt, ["frames"] = DefaultFrames };
+        var payload = new Dictionary<string, object>
+        {
+            ["prompt"] = prompt,
+            ["frames"] = model.VideoModelFamily == "wan" ? DefaultWanFrames : DefaultFrames,
+        };
 
         if (model.SupportsReferenceConditioning)
         {

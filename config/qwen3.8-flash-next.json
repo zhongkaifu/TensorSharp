@@ -1,0 +1,61 @@
+{
+  // Qwen3.8 Flash Next (UD-Q2_K_XL), all three GGUF shards (~78.9 GB)
+  // plus the BF16 vision projector (~0.9 GB). TensorSharp opens the other
+  // shards beside the first one; all three must be present before loading.
+  //   TensorSharp.Cli         --config config/qwen3.8-flash-next.json --chat
+  //   TensorSharp.Server.Host --config config/qwen3.8-flash-next.json
+  // Use --backend ggml_metal on Apple Silicon, or ggml_cpu for CPU execution.
+  // Expert/PLE disk paging permits a smaller resident working set than the
+  // download size; memory use and throughput depend on the device and SSD.
+  "variables": {
+    "modelRoot": "${TENSORSHARP_MODELS:-../models}",
+    "root": "${modelRoot}/qwen3.8-flash-next",
+    "repo": "https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/resolve/766911a6b7369840a91dbcd95f9f997acaab6cd6"
+  },
+
+  "backend": "ggml_cuda",
+  "max-tokens": 4096,
+  "continuous-batching": true,
+  // Sparse attention requires F16/F32 KV; quantized KV is not supported here.
+  "kv-cache-dtype": "f16",
+  "temperature": 1.0,
+  "top-k": 20,
+  "top-p": 0.95,
+  "min-p": 0,
+  "repeat-penalty": 1.0,
+
+  "model": {
+    "path": "${root}/Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf",
+    "urls": ["${repo}/UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00001-of-00003.gguf"],
+    "sha256": "a4f3b21e77353999829f2f767e9ac21ce9c71d29a74f2cc9eda48c9bf23c8b86",
+    "files": [
+      {
+        "path": "${root}/Qwen3.8-Flash-Next-UD-Q2_K_XL-00002-of-00003.gguf",
+        "urls": ["${repo}/UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00002-of-00003.gguf"],
+        "sha256": "2e3bf1ee7d2a04e261e9f342a2d968f696cce5941d082b0e434deb9b1edc12c6"
+      },
+      {
+        "path": "${root}/Qwen3.8-Flash-Next-UD-Q2_K_XL-00003-of-00003.gguf",
+        "urls": ["${repo}/UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00003-of-00003.gguf"],
+        "sha256": "ec8c106759fdf4f463039c34c0707718d7d8908d53d892bd4f002e71620803f9"
+      }
+    ]
+  },
+  // Pass --mmproj none to run text-only and skip the projector download.
+  "mmproj": {
+    "path": "${root}/mmproj-BF16.gguf",
+    "urls": ["${repo}/mmproj-BF16.gguf"],
+    "sha256": "2e788f8c511d8093c7b43cb87b2fd7e14228340318057f8fb20c86df2efe2355"
+  }
+
+  // Optional learned speculative decoding: uncomment the following entry
+  // (including the leading comma) to download the shared Q8_0 MTP head
+  // (~2.8 GB) and enable it on GGML backends. It is not embedded in the trunk.
+  // Speedups depend on the request; retained-prefix and concurrent requests
+  // decode plainly. See docs/models/qwen38-flash-next.md for measured limits.
+  // ,"draft-model": {
+  //   "path": "${root}/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf",
+  //   "urls": ["${repo}/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf"],
+  //   "sha256": "5ff54097406a905cf3a724c709124ceb0e3e10235ee862298969e91c96fa96e6"
+  // }
+}

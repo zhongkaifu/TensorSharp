@@ -24,10 +24,10 @@ setup and your first chat. The updated Release Binaries workflow publishes Deskt
 DMG/PKG/ZIP and MSI/ZIP assets; historical releases may lack them. iPhone/iPad still
 use the [source-build instructions](#build-and-run).
 
-**Model and validation scope.** All twelve catalog entries need
-at least the 12 GB system RAM tier; seven need 24 GB or more. Qwen3.8 Flash Next has an
-experimental UD-IQ1_M entry from 32 GB and a text-only UD-Q2_K_XL entry from 48 GB,
-both with SSD-backed weights. These eligibility tiers describe physical system RAM,
+**Model and validation scope.** The 37 catalog entries start at the 12 GB system
+RAM tier, with larger models requiring higher tiers. Qwen3.8 Flash Next has an
+experimental UD-IQ1_M entry from 32 GB and a UD-Q2_K_XL entry from 48 GB,
+both with SSD-backed weights and optional vision and draft companions. These eligibility tiers describe physical system RAM,
 including unified memory on Apple devices; storage size and GPU VRAM are separate.
 Image/video generation has been measured in the Mac app, with no recorded
 iOS media generation or Windows image/audio/video generation. The physical-phone run recorded
@@ -224,9 +224,10 @@ message itself asks for a picture or a clip, through `/api/chat` (`ImageTurns`,
 at all. The app's own client is appended as one script tag at request time; the page
 file itself is never forked.
 
-**A built-in model catalog.** Twelve entries with the exact byte size and SHA-256 of every
-file: five chosen for phone/tablet memory tiers, and seven requiring desktop memory tiers.
-All twelve are downloadable; those downloads
+**A built-in model catalog.** Downloadable checkpoints cover TensorSharp’s supported
+chat, image and video generation families, with the exact byte size and SHA-256 of
+every file. Models are offered in phone/tablet and desktop/workstation memory tiers.
+Downloads
 resume from a kept `.part` after an interruption, are verified before use, and
 belong to the APP rather than to the screen that started one — see "Downloads"
 below. Bonsai 2 27B is the one entry that needs the 16 GB tier (iPads and Macs)
@@ -241,11 +242,11 @@ offered at four where the memory exists; Qwen-Image 2.1 makes and edits pictures
 two MiniMax-H3 entries, one model in two checkpoints, make short videos with their own
 soundtrack, one from a description or a starting photo, the other around the photos,
 clips and recordings it is given. Qwen3.8 Flash Next, a 125B mixture of experts (about 6B
-active per token), has two catalog quantizations. UD-Q2_K_XL remains text-only at the
+active per token), has two catalog quantizations. UD-Q2_K_XL starts at the
 48 GB system RAM tier; in the recorded Mac run the engine kept 18.3 GB of its 78.9 GB
 package resident and read the rest from SSD as tokens needed it. UD-IQ1_M starts at an
-experimental 32 GB system RAM tier and supports image questions with an optional BF16
-projector. Its three weight shards need 74,538,755,776 bytes of storage (74.54 GB), or
+experimental 32 GB system RAM tier. Both variants offer an optional BF16 vision
+projector for images/video frames and a shared Q8_0 MTP draft head. Its three weight shards need 74,538,755,776 bytes of storage (74.54 GB), or
 75,446,298,720 bytes (75.45 GB) with the projector. SSD paging allows these packages to
 exceed RAM; the engine plans expert placement for the available accelerator memory.
 See [The desktop's larger models](#the-desktops-larger-models) for the historical Mac measurements.
@@ -259,14 +260,34 @@ See [The desktop's larger models](#the-desktops-larger-models) for the historica
 | Qwen3.5 9B (IQ4_XS) | text; image and video with optional projector | download: 5,168,653,536-byte main GGUF; 918,166,080-byte projector optional | 12 GB | `unsloth/Qwen3.5-9B-GGUF` |
 | Qwen3.8 27B (UD-Q4_K_XL) | text; image and video with optional projector | download: 17,559,178,144-byte main GGUF; 927,607,488-byte projector optional | 32 GB | `unsloth/Qwen3.8-27B-GGUF` |
 | Muse-Glimmer 30B (UD-Q4_K_XL) | text; image with optional projector | download: 15,878,222,368-byte main GGUF; 2,051,685,088-byte projector optional | 32 GB | `unsloth/Muse-Glimmer-30B-GGUF` |
-| Qwen3.8 Flash Next (UD-Q2_K_XL) | text | download: three shards of 10,946,624, 49,979,779,296 and 28,878,402,944 bytes (78.9 GB) | 48 GB | `unsloth/Qwen3.8-Flash-Next-GGUF` |
-| Qwen3.8 Flash Next (UD-IQ1_M) | text; image with optional projector | download: three shards of 10,946,624, 49,988,981,792 and 24,538,827,360 bytes (74.54 GB total); 907,542,944-byte `mmproj-BF16.gguf` optional | 32 GB, experimental | `unsloth/Qwen3.8-Flash-Next-GGUF` |
+| Qwen3.8 Flash Next (UD-Q2_K_XL) | text; images/video with optional projector | download: three shards of 10,946,624, 49,979,779,296 and 28,878,402,944 bytes (78.9 GB); 907,542,944-byte projector and 2,786,568,256-byte shared MTP head optional | 48 GB | `unsloth/Qwen3.8-Flash-Next-GGUF` |
+| Qwen3.8 Flash Next (UD-IQ1_M) | text; images/video with optional projector | download: three shards of 10,946,624, 49,988,981,792 and 24,538,827,360 bytes (74.54 GB total); 907,542,944-byte projector and 2,786,568,256-byte shared MTP head optional | 32 GB, experimental | `unsloth/Qwen3.8-Flash-Next-GGUF` |
 | Qwen-Image 2.1 (Q4_K_M) | text or a photo in, a picture out | download: 4,189,343,904-byte DiT + 5,027,784,800-byte Qwen3-VL-8B text encoder + 675,509,688-byte VAE + 1,159,029,824-byte vision projector | 24 GB | `Abiray/Qwen-Image-2.1-GGUF` + `Qwen/Qwen3-VL-8B-Instruct-GGUF` + `Comfy-Org/Qwen-Image-2.1` |
 | MiniMax-H3 (Q4_K) | text, or one or two photos as the first and last frames, in; a video with its soundtrack out | download: 11,420,663,904-byte denoiser + 18,218,065,024-byte Qwen3-VL-32B text encoder + 5,207,808,496-byte video VAE + 605,254,808-byte audio VAE + 2,776,833-byte `vocab.json`, 1,671,839-byte `merges.txt` and 11,003-byte `tokenizer_config.json` | 32 GB | `unsloth/MiniMax-H3-GGUF` + `MiniMaxAI/MiniMax-H3` (tokenizer files) |
 | MiniMax-H3 References (Q4_K) | text with up to nine photos, clips and recordings to feature in; a video with its soundtrack out | download: 11,381,096,544-byte denoiser, plus the same four companions as MiniMax-H3 (six files, 24.0 GB), linked from it when it is installed rather than downloaded again | 32 GB | `unsloth/MiniMax-H3-GGUF` + `MiniMaxAI/MiniMax-H3` (tokenizer files) |
 
+Additional entries in [ModelCatalog.Extended.cs](src/TensorAgent.Core/Catalog/ModelCatalog.Extended.cs)
+cover Gemma 4 26B/31B, Qwen 3.5/3.6, GPT-OSS, DeepSeek V4/V4.1 Flash,
+GLM 5.2/5.3/5.3 Flash, Nemotron, Mistral 3, Hunyuan translation, DiffusionGemma,
+and Wan 2.1/2.2 (including Turbo and dual-expert variants). Each includes every
+required shard and network; supported vision and speculative companions are optional.
+Qwen3.8 27B offers DFlash2 and Muse-Glimmer offers DFlash. Wan downloads its UMT5
+encoder, matching VAE and, for A14B, both denoisers. DiffusionGemma’s optional
+vision tower is a safetensors shard rather than an mmproj GGUF.
+
+These additions are **experimental**: published file identities and catalog wiring
+have been checked, but their RAM tiers are conservative estimates, not new app/device
+benchmarks. See the [model cards](../docs/models/README.md) for supported backends and
+actual inference coverage. DeepSeek V4.1’s public `clip` projector and `dflash` DSpark
+exports do not match TensorSharp’s required formats; its catalog entry is text-only.
+Its converted vision/DSpark companions remain available through the model card’s
+CLI/server instructions. Nemotron audio likewise needs a separately converted tower.
+Embedding encoders are served through TensorSharp’s embedding API/configs, not selected
+as conversation models in TensorAgent. The catalog chooses representative quantizations
+for the supported model families, rather than listing every publisher’s quantization.
+
 Each chat entry also carries the context window the app loads it with (8,192 tokens for
-Gemma 4 E2B and E4B, 32,768 for the others), a K/V cache
+Gemma 4 E2B and E4B; other entries carry their own limits), a K/V cache
 precision that the "KV cache precision" setting overrides, and its model card's
 sampling values (for Bonsai 2 27B, the publisher's thinking-mode recommendation:
 temperature 1.0, top-k 20, top-p 0.95, min-p 0.05; for Qwen3.8 Flash Next, the
@@ -291,16 +312,25 @@ against source. These checks do not cover WinUI clicks, Mac/Metal, CPU-only devi
 or performance comparisons between quantizations. Generated evidence is kept in
 ignored `docs/validation/tensoragent-qwen-iq1m/`.
 
-The Models page lists every entry, but only one that fits the device's memory tier
+The Models page groups entries into expandable model families. Search shows matching
+models directly, ranked by relevance, and accepts names, sizes, quantizations,
+capabilities, and companion names such as `mmproj` or `dflash`. **Can run here**
+filters by the device's memory tier; **Downloaded** shows installed weights. Clear
+search to return to the previous expanded families, or use the selected-model shortcut
+to find the current model. Downloads keep progressing while their family is collapsed
+or a different search is shown. A hidden download finishing does not interrupt browsing.
+
+The list includes every entry, but only one that fits the device's memory tier
 can be loaded: an entry that needs more is shown greyed, marked "Too big" with both
 numbers, rather than hidden. Bonsai 2 27B needs the 16 GB tier, Qwen-Image 2.1 the 24 GB
 tier, Qwen3.8 27B, Muse-Glimmer 30B, both MiniMax-H3 entries and Qwen3.8 Flash Next
-UD-IQ1_M the 32 GB tier, and Flash Next UD-Q2_K_XL the 48 GB tier; the other four
-need the 12 GB tier or above. Eligibility uses system RAM on both Mac and Windows;
+UD-IQ1_M the 32 GB tier, and Flash Next UD-Q2_K_XL the 48 GB tier. Larger entries
+use workstation tiers up to 512 GB; the card shows the requirement. Eligibility uses system RAM on both Mac and Windows;
 it does not certify every backend or device at that tier. For an installed model
-whose optional projector is missing, "Add vision" downloads just the projector (and
-the draft head, when the entry lists one that is not there yet); once it is on the
-device, "Enable vision" reloads the selected model with it.
+whose optional projector is missing, **Add vision** downloads just the projector.
+**Add draft** independently downloads its optional speculative model. Adding a companion
+to the selected model reloads it so the new file is used; speculation still follows the
+Speculative decoding setting and the engine’s backend/sampler capability checks.
 
 **Pictures.** With Qwen-Image 2.1 loaded, a message is a description of a picture, or,
 with a photo attached, what to change about it. It is the same `/api/chat` turn, under

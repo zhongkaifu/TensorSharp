@@ -54,7 +54,7 @@ namespace TensorAgent.Core.Catalog;
 /// compute buffers and headroom for paging determine RAM needs, separately from storage size.
 /// </para>
 /// </summary>
-public static class ModelCatalog
+public static partial class ModelCatalog
 {
     private const string GemmaLicense = "catalog.license.gemma";
     private const string ApacheLicense = "Apache-2.0";
@@ -86,6 +86,9 @@ public static class ModelCatalog
                 new CatalogFile(CatalogFileRole.Projector, "mmproj-gemma-4-E2B-it-Q8_0.gguf",
                     Hf("ggml-org/gemma-4-E2B-it-GGUF", "mmproj-gemma-4-E2B-it-Q8_0.gguf"),
                     557_368_064, "9406f99c16d68cda4f1f0552192dcc99021ea1fc6d2fd50b1dc3ccf30d04b292"),
+                new CatalogFile(CatalogFileRole.Draft, "mtp-gemma-4-E2B-it-Q8_0.gguf",
+                    "https://huggingface.co/ggml-org/gemma-4-E2B-it-GGUF/resolve/b4243c156154b6dca9324415f8c7ccc098b4aed1/mtp-gemma-4-E2B-it-Q8_0.gguf",
+                    97_817_696, "c4fba8d43b40c9fab8c3db15ca6ef00fd28192208753f1f038269c176437068a", Optional: true),
             },
             Modalities = CatalogModalities.Image | CatalogModalities.Audio | CatalogModalities.Video,
             MinDeviceMemoryGB = 12,
@@ -279,6 +282,10 @@ public static class ModelCatalog
                 new CatalogFile(CatalogFileRole.Projector, "mmproj-F16.gguf",
                     Hf("unsloth/Qwen3.8-27B-GGUF", "mmproj-F16.gguf"),
                     927_607_488, "cbb841a9ee0636b2ec172f5bb8df2ea8dfeb01e90fe7c6126581d662a0b4e43e", Optional: true),
+                // z-lab revision 2d9571f8ce46e151f61c6499c99dee6079e1d610, verified 2026-10-07.
+                new CatalogFile(CatalogFileRole.Draft, "Qwen3.8-27B-DFlash2-Q8_0.gguf",
+                    "https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2-GGUF/resolve/2d9571f8ce46e151f61c6499c99dee6079e1d610/Qwen3.8-27B-DFlash2-Q8_0.gguf",
+                    2_056_414_816, "c18e800daedc59ca68fd13b6a856d795746af6d399a9279ac6a277d1d422f87e", Optional: true),
             },
             Modalities = CatalogModalities.Image | CatalogModalities.Video,
             // 32, not 24: the weights are mapped, not charged, but a dense model reads all
@@ -321,9 +328,10 @@ public static class ModelCatalog
                 new CatalogFile(CatalogFileRole.Projector, "mmproj-Muse-Glimmer-30B-Q8_0.gguf",
                     Hf("unsloth/Muse-Glimmer-30B-GGUF", "mmproj-Muse-Glimmer-30B-Q8_0.gguf"),
                     2_051_685_088, "01ff73c95108e1754a4c145176c6d3ba44338942285cb87dcac7f4f193192ea2", Optional: true),
-                // No draft entry: its DFlash drafter verifies greedily against the model,
-                // and the app samples at the card's temperature, so the drafter would buy
-                // nothing here.
+                // DFlash is optional: acceleration depends on backend and sampler.
+                new CatalogFile(CatalogFileRole.Draft, "dflash-kquant.gguf",
+                    "https://huggingface.co/unsloth/Muse-Glimmer-30B-GGUF/resolve/faa5b025c584459c13febfa5c59883516710ae39/dflash-kquant.gguf",
+                    1_631_205_312, "27d9a805fa29b943cfb6ad4843367cd4eaaaf06bd452d8cc3e00a2cd18a677bc", Optional: true),
             },
             Modalities = CatalogModalities.Image,
             // 32 for the same reason as Qwen3.8 27B: a dense 15.9 GB read for every token
@@ -364,8 +372,10 @@ public static class ModelCatalog
                 new CatalogFile(CatalogFileRole.WeightsShard, "Qwen3.8-Flash-Next-UD-Q2_K_XL-00003-of-00003.gguf",
                     Hf("unsloth/Qwen3.8-Flash-Next-GGUF", "UD-Q2_K_XL/Qwen3.8-Flash-Next-UD-Q2_K_XL-00003-of-00003.gguf"),
                     28_878_402_944, "ec8c106759fdf4f463039c34c0707718d7d8908d53d892bd4f002e71620803f9"),
+                FlashNextProjector(),
+                FlashNextDraft(),
             },
-            Modalities = CatalogModalities.Text,
+            Modalities = CatalogModalities.Image | CatalogModalities.Video,
             // 78.9 GB of weights on a 48 GB Mac, by design: a token reads 16 rows of the 28.8 GB
             // n-gram table and 10 of each layer's 512 experts, and the engine reads exactly those
             // from the SSD. On a 48 GiB Mac its planner keeps 15 layers' experts on the GPU and
@@ -410,11 +420,10 @@ public static class ModelCatalog
                 new CatalogFile(CatalogFileRole.WeightsShard, "Qwen3.8-Flash-Next-UD-IQ1_M-00003-of-00003.gguf",
                     Hf("unsloth/Qwen3.8-Flash-Next-GGUF", "UD-IQ1_M/Qwen3.8-Flash-Next-UD-IQ1_M-00003-of-00003.gguf"),
                     24_538_827_360, "ae757ff9347651adacc7746f137d8c29b51f25cf6bb27cd49086ef45bd8cc203"),
-                new CatalogFile(CatalogFileRole.Projector, "mmproj-BF16.gguf",
-                    Hf("unsloth/Qwen3.8-Flash-Next-GGUF", "mmproj-BF16.gguf"),
-                    907_542_944, "2e788f8c511d8093c7b43cb87b2fd7e14228340318057f8fb20c86df2efe2355", Optional: true),
+                FlashNextProjector(),
+                FlashNextDraft(),
             },
-            Modalities = CatalogModalities.Image,
+            Modalities = CatalogModalities.Image | CatalogModalities.Video,
             // Validated with 32 GB system RAM and 16 GB CUDA VRAM. These are mixed
             // quantizations; 74.5 GB is storage, not a requirement to keep every byte in RAM.
             // On that device 40/48 expert layers (34,668,544,000 bytes, summed from GGUF
@@ -493,7 +502,17 @@ public static class ModelCatalog
             // Photos, clips and recordings are references for a new scene, up to nine.
             modalities: CatalogModalities.Image | CatalogModalities.Video | CatalogModalities.Audio,
             notes: "catalog.model.minimaxH3Ref2va.notes"),
-    };
+    }.Concat(ExtendedModels()).ToArray();
+
+    private static CatalogFile FlashNextProjector() => new(CatalogFileRole.Projector, "mmproj-BF16.gguf",
+        Hf("unsloth/Qwen3.8-Flash-Next-GGUF", "mmproj-BF16.gguf"),
+        907_542_944, "2e788f8c511d8093c7b43cb87b2fd7e14228340318057f8fb20c86df2efe2355", Optional: true);
+
+    // The shared-vocabulary head is supported; the repository's other MTP exports are not interchangeable.
+    // Verified against upstream revision 766911a6b7369840a91dbcd95f9f997acaab6cd6 on 2026-10-07.
+    private static CatalogFile FlashNextDraft() => new(CatalogFileRole.Draft, "mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf",
+        "https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/resolve/766911a6b7369840a91dbcd95f9f997acaab6cd6/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf",
+        2_786_568_256, "5ff54097406a905cf3a724c709124ceb0e3e10235ee862298969e91c96fa96e6", Optional: true);
 
     /// <summary>
     /// A MiniMax-H3 entry: one of its two denoisers (it is two checkpoints, not a setting)
@@ -609,7 +628,7 @@ public static class ModelCatalog
     public static int DeviceMemoryTier(long physicalMemoryBytes)
     {
         double gb = physicalMemoryBytes / 1_000_000_000.0;
-        int[] tiers = { 4, 6, 8, 12, 16, 24, 32, 48, 64, 128 };
+        int[] tiers = { 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024 };
         int best = tiers[0];
         foreach (int t in tiers)
         {

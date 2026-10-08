@@ -197,14 +197,22 @@ public sealed class ModelStore
     /// rather than fetching it: with one MiniMax-H3 entry installed, the other is an 11.4 GB
     /// download, not 35 GB. <see cref="CatalogModel.TotalBytes"/> stays the entry's own size.
     /// </summary>
-    public long RemainingBytes(CatalogModel model, bool includeOptional = false)
+    public long RemainingBytes(CatalogModel model, bool includeOptional = false) =>
+        RemainingBytes(model, file => !file.Optional || includeOptional);
+
+    /// <summary>Bytes to fetch for the same required and explicitly chosen optional
+    /// files as <see cref="DownloadAsync"/>, including resumable and shared copies.</summary>
+    public long RemainingBytes(CatalogModel model, IReadOnlyCollection<CatalogFileRole> optionalRoles) =>
+        RemainingBytes(model, file => !file.Optional || optionalRoles.Contains(file.Role));
+
+    private long RemainingBytes(CatalogModel model, Func<CatalogFile, bool> include)
     {
         string root = Root;
         string directory = Path.Combine(root, model.Id);
         long remaining = 0;
         foreach (CatalogFile file in model.Files)
         {
-            if (file.Optional && !includeOptional)
+            if (!include(file))
                 continue;
             string path = Path.Combine(directory, file.FileName);
             if (IsComplete(path, file) || SharedCopy(model, file, root) is not null)

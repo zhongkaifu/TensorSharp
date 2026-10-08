@@ -1475,7 +1475,7 @@ public sealed class AgentAppHostTests : IDisposable
         JsonElement iq1m = Assert.Single(models, m => m.GetProperty("id").GetString() == "qwen3.8-flash-next-iq1m");
         Assert.Equal(32, iq1m.GetProperty("minDeviceMemoryGB").GetInt32());
         Assert.Equal("UD-IQ1_M", iq1m.GetProperty("quantization").GetString());
-        Assert.Equal("Image", iq1m.GetProperty("modalities").GetString());
+        Assert.Equal("Image, Video", iq1m.GetProperty("modalities").GetString());
         Assert.True(iq1m.GetProperty("experimental").GetBoolean());
         Assert.Equal(32768, iq1m.GetProperty("contextLength").GetInt32());
         Assert.Equal(74_538_755_776, iq1m.GetProperty("totalBytes").GetInt64());
