@@ -116,6 +116,11 @@ try
     native = Process.GetCurrentProcess().Modules.Cast<ProcessModule>()
         .Where(m => Path.GetFileName(m.FileName).Contains("GgmlOps", StringComparison.OrdinalIgnoreCase))
         .Select(m => new { Path = m.FileName, Sha256 = Hash(m.FileName) }).ToArray();
+    // Persist identities before generation too: an external timeout or native
+    // crash cannot execute this program's finally block.
+    Write("execution-started.json", new { Mode = mode, Backend = backendName, Native = native,
+        ModelsSha256 = Hash(typeof(ModelBase).Assembly.Location), ProbeSha256 = Hash(typeof(Program).Assembly.Location),
+        RuntimeSha256 = Hash(typeof(InferenceEngine).Assembly.Location), ProcessId = Environment.ProcessId });
     if (mode == "engine")
     {
         // Exercise the production scheduler, but expose rather than hide loops.
@@ -125,7 +130,17 @@ try
         using var engine = new InferenceEngine(model, cfg);
         var sequence = new SequenceState("gemma-repetition", promptTokens.ToList(), maxNew, engine.PoolStats.blockSize,
             samplingConfig: samplingConfig);
-        await foreach (int token in engine.SubmitRequest(sequence).Tokens.ReadAllAsync()) tokens.Add(token);
+        await foreach (int token in engine.SubmitRequest(sequence).Tokens.ReadAllAsync())
+        {
+            tokens.Add(token);
+            if (tokens.Count % 32 == 0)
+            {
+                Write("tokens.json", tokens);
+                File.WriteAllText(Path.Combine(output, "output.partial.txt"), tokenizer.Decode(tokens));
+                Write("progress.json", new { GeneratedTokens = tokens.Count, ElapsedMilliseconds = timer.Elapsed.TotalMilliseconds,
+                    Complete = false, Qualification = "Partial stream; not a completed quality validation." });
+            }
+        }
         if (sequence.Error != null) throw sequence.Error;
         engineCompletion = new { sequence.FinishReason, SequenceOutputTokens = sequence.OutputTokens.ToArray(),
             StopToken = sequence.FinishReason == "eos" && sequence.OutputTokens.Count > 0 ? (int?)sequence.OutputTokens[^1] : null };
@@ -164,7 +179,11 @@ try
                 RepeatedSuffix = Repetition(tokens),
             });
             // Checkpoint every 32 rows preserves the onset if later native work fails.
-            if ((step + 1) % 32 == 0) { Write("steps.json", steps); Write("tokens.json", tokens); }
+            if ((step + 1) % 32 == 0)
+            {
+                Write("steps.json", steps); Write("tokens.json", tokens);
+                File.WriteAllText(Path.Combine(output, "output.partial.txt"), tokenizer.Decode(tokens));
+            }
             if (tokenizer.IsEos(chosen)) { stop = "eos"; break; }
         }
     }
@@ -193,6 +212,7 @@ finally
         ModelsSha256 = Hash(typeof(ModelBase).Assembly.Location), ProbeSha256 = Hash(typeof(Program).Assembly.Location),
         Sampling = sampling == "raw" ? "raw argmax diagnostic; bypasses model generation exclusions; not a production quality baseline"
             : "production sampling (or exact teacher tokens); GGUF generation exclusions enabled; repetition/presence/frequency penalties disabled; engine repetition stop disabled; speculative decode disabled",
+        LogitStatisticsScope = "Direct-mode Top, EntropyNats and ChosenProbability describe raw pre-suppression logits. Production exclusions apply to sampled token selection.",
         SamplingParameters = new { Temperature = temperature, TopK = topK, TopP = topP, MinP = 0, Seed = seed,
             RepetitionPenalty = 1, PresencePenalty = 0, FrequencyPenalty = 0 },
         ModelSuppressedTokenIds = tokenizer.SuppressedTokenIds,
