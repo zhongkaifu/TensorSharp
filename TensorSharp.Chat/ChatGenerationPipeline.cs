@@ -427,6 +427,11 @@ namespace TensorSharp.Server
                 maxTokens,
                 preserveAttachedDocuments,
                 CountPromptTokens);
+            if (window.ReplyReserve > 0)
+            {
+                requestedReserve = window.ReplyReserve;
+                targetPromptLimit = contextLimit - requestedReserve;
+            }
             bool historyCompacted = window.RemovedMessages > 0;
             if (window.RemovedMessages > 0)
             {
@@ -510,11 +515,14 @@ namespace TensorSharp.Server
                         && inputTokens.Count > targetPromptLimit
                         && unexpandedTokens.Count > adjustedPromptLimit)
                     {
-                        ContextHistoryWindow mediaWindow = CompactHistoryForContext(
+                        ContextHistoryWindow mediaWindow = CompactHistoryForReplyReserve(
                             renderHistory,
                             unexpandedTokens.Count,
-                            adjustedPromptLimit,
+                            contextLimit - expansionOverhead,
+                            requestedReserve,
                             CountPromptTokens);
+                        requestedReserve = mediaWindow.ReplyReserve;
+                        targetPromptLimit = contextLimit - requestedReserve;
                         if (mediaWindow.RemovedMessages > 0
                             && mediaWindow.FinalPromptTokens <= hardPromptLimit)
                         {
@@ -1425,12 +1433,19 @@ namespace TensorSharp.Server
             List<ChatMessage> History,
             int OriginalPromptTokens,
             int FinalPromptTokens,
-            int RemovedMessages);
+            int RemovedMessages)
+        {
+            // Non-positional so existing construction/deconstruction stays intact.
+            public int ReplyReserve { get; init; }
+        }
 
         /// <summary>
         /// How much of the window the compactor sets aside for the reply BEFORE it
         /// starts removing history: the requested reply length, but never more than a
         /// quarter of the window (a 1,024-token floor where the window allows).
+        /// This is a preference: if the protected policy and repair context make
+        /// that target unreachable, compaction shares the remaining capacity
+        /// between earlier history and the reply instead of deleting every round.
         ///
         /// <para>
         /// The reply length is a ceiling the user chose for the answer, not a claim on
@@ -1478,9 +1493,8 @@ namespace TensorSharp.Server
             }
 
             int reserve = HistoryCompactionReserve(requestedGenerationTokens, contextLimit);
-            int promptLimit = contextLimit - reserve;
-            ContextHistoryWindow window = CompactHistoryForContext(
-                history, originalPromptTokens, promptLimit, countPromptTokens);
+            ContextHistoryWindow window = CompactHistoryForReplyReserve(
+                history, originalPromptTokens, contextLimit, reserve, countPromptTokens);
             int hardPromptLimit = contextLimit - 1;
             if (window.FinalPromptTokens > hardPromptLimit)
             {
@@ -1498,7 +1512,34 @@ namespace TensorSharp.Server
             return window.RemovedMessages > 0
                 ? window
                 : new ContextHistoryWindow(
-                    history, originalPromptTokens, originalPromptTokens, RemovedMessages: 0);
+                    history, originalPromptTokens, originalPromptTokens, RemovedMessages: 0)
+                    { ReplyReserve = window.ReplyReserve };
+        }
+
+        internal static ContextHistoryWindow CompactHistoryForReplyReserve(
+            List<ChatMessage> history, int originalPromptTokens, int contextLimit,
+            int preferredReserve, Func<List<ChatMessage>, int> countPromptTokens)
+        {
+            int reserve = contextLimit > 1
+                ? Math.Clamp(preferredReserve, 1, contextLimit - 1)
+                : Math.Max(1, preferredReserve);
+            int promptLimit = Math.Max(1, contextLimit - reserve);
+            ContextHistoryWindow window = CompactHistoryForContext(
+                history, originalPromptTokens, promptLimit, countPromptTokens);
+            if (window.FinalPromptTokens > promptLimit && window.FinalPromptTokens < contextLimit)
+            {
+                // The first compaction measured the protected minimum: policy,
+                // current user task and latest repair round alone exceed the
+                // preferred target. Repeatedly dropping every older round cannot
+                // meet that target (e.g. 6.3k tool policy inside an 8k window).
+                // Share the remaining room between history and generation instead.
+                // Keep the user's generation ceiling; ClampGenerationReserve later
+                // gives generation all capacity left by the actual kept prompt.
+                reserve = Math.Min(reserve, Math.Max(1, (contextLimit - window.FinalPromptTokens) / 2));
+                window = CompactHistoryForContext(history, originalPromptTokens,
+                    contextLimit - reserve, countPromptTokens);
+            }
+            return window with { ReplyReserve = reserve };
         }
 
         /// <summary>

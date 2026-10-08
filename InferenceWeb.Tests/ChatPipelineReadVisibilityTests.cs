@@ -11,6 +11,54 @@ public sealed class ChatPipelineReadVisibilityTests
     [Theory]
     [InlineData(false)]
     [InlineData(true)]
+    public async Task UnreachableReplyPreferenceKeepsEarlierToolBodyThroughActualPreparation(bool media)
+    {
+        string path = Path.Combine(Path.GetTempPath(), "ts-reply-budget-" + Guid.NewGuid().ToString("N") + ".gguf");
+        BackendFailureWarmupTests.WriteProbeGguf(path);
+        try
+        {
+            ProbeModel model = null!;
+            using var lifecycle = new ModelLifecycleService(NullLogger.Instance,
+                (file, backend, tp, draft) => model = new ProbeModel(file, media ? 1224 : 1024));
+            lifecycle.LoadModel(path, null, "cpu");
+            using var host = new InferenceEngineHost(lifecycle, NullLogger.Instance)
+            {
+                SchedulerConfigOverride = new SchedulerConfig
+                {
+                    BlockSize = 8, NumBlocks = 256, MaxNumRunningSequences = 1,
+                    MaxNumBatchedTokens = 128, MaxPrefillChunkSize = 128, SoloPrefillChunkSize = 128,
+                    EnablePrefixCaching = false, Speculation = SpeculationOptions.Disabled,
+                },
+            };
+            using var pipeline = new ChatGenerationPipeline(lifecycle, host, new KVCachePromptRenderer(new Renderer()),
+                new InferenceTelemetry(NullLogger.Instance), NullLogger.Instance);
+            using var session = new ChatSession();
+            const string body = "OLD_FILE_BODY_IS_STILL_NEEDED";
+            var history = new List<ChatMessage>
+            {
+                new() { Role = "system", Content = new string('p', 610) },
+                new() { Role = "user", Content = "repair", ImagePaths = media ? new List<string> { "synthetic-image.png" } : null },
+                new() { Role = "assistant", Content = "read_file" },
+                new() { Role = "tool", Content = body },
+                new() { Role = "assistant", Content = "test" },
+                new() { Role = "tool", Content = "exit zero" },
+            };
+            bool generated = false;
+            await foreach (var update in pipeline.ChatStreamWithMetricsAsync(session, history, 400, CancellationToken.None))
+            {
+                Assert.False(update.HistoryCompacted);
+                if (update.Piece.Length > 0) { generated = true; break; }
+            }
+            Assert.True(generated);
+            Assert.Contains(body, model.InputText);
+            Assert.Equal(media ? 1 : 0, model.Expansions);
+        }
+        finally { File.Delete(path); }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
     public async Task ActualTextOrMediaCompactionSignalsBeforeSubmittingGeneration(bool media)
     {
         string path = Path.Combine(Path.GetTempPath(), "ts-compaction-" + Guid.NewGuid().ToString("N") + ".gguf");
@@ -67,11 +115,13 @@ public sealed class ChatPipelineReadVisibilityTests
     {
         public int Forwards { get; private set; }
         public int Expansions { get; private set; }
-        public ProbeModel(string path) : base(path, BackendType.Cpu)
+        private readonly System.Collections.Concurrent.ConcurrentQueue<int> _input = new();
+        public string InputText => new(_input.ToArray().Select(token => (char)token).ToArray());
+        public ProbeModel(string path, int context = 256) : base(path, BackendType.Cpu)
         {
             Config = new ModelConfig { Architecture = "probe", VocabSize = 128, NumLayers = 1 };
             Tokenizer = new CharacterTokenizer();
-            _maxContextLength = 256;
+            _maxContextLength = context;
         }
         public override bool SupportsKVStateSnapshot => true;
         public override bool SupportsCrossSequenceKvReuse => false;
@@ -81,6 +131,7 @@ public sealed class ChatPipelineReadVisibilityTests
         protected override float[] ForwardCore(int[] tokens)
         {
             Forwards++;
+            foreach (int token in tokens) _input.Enqueue(token);
             var logits = new float[128]; logits['X'] = 10; return logits;
         }
         protected override void ResetKVCacheCore() { }
