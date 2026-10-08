@@ -2217,20 +2217,31 @@ namespace
                 ggml_backend_tensor_get(tensor, values.data(), 0, values.size() * sizeof(float));
                 const std::string path = std::string(diagnostic_directory) + "/fused." + name + ".f32";
                 FILE* file = std::fopen(path.c_str(), "wb");
-                if (file == nullptr) throw std::runtime_error("Cannot create diagnostic tensor " + path);
+                // The graph has already advanced recurrent state. An optional
+                // dump failure must not trigger the managed fallback and run
+                // the same token again.
+                if (file == nullptr)
+                {
+                    std::fprintf(stderr, "[Qwen35 diagnostic] Cannot create tensor '%s'\n", path.c_str());
+                    return false;
+                }
                 const auto written = std::fwrite(values.data(), sizeof(float), values.size(), file);
                 const int closed = std::fclose(file);
                 if (written != values.size() || closed != 0)
-                    throw std::runtime_error("Cannot write diagnostic tensor " + path);
+                {
+                    std::fprintf(stderr, "[Qwen35 diagnostic] Cannot write tensor '%s'\n", path.c_str());
+                    return false;
+                }
+                return true;
             };
-            dump(diagnostic_embedding, "embedding");
-            for (std::size_t l = 0; l < diagnostic_layers.size(); ++l)
+            bool dump_ok = dump(diagnostic_embedding, "embedding");
+            for (std::size_t l = 0; dump_ok && l < diagnostic_layers.size(); ++l)
             {
                 char name[32];
                 std::snprintf(name, sizeof(name), "layer%02d", static_cast<int>(l));
-                dump(diagnostic_layers[l], name);
+                dump_ok = dump(diagnostic_layers[l], name);
                 std::snprintf(name, sizeof(name), "layer%02d.block", static_cast<int>(l));
-                dump(diagnostic_blocks[l], name);
+                if (dump_ok) dump_ok = dump(diagnostic_blocks[l], name);
             }
         }
 

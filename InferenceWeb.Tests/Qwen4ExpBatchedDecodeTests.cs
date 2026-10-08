@@ -557,10 +557,11 @@ public sealed class Qwen4ExpBatchedDecodeTests(ITestOutputHelper output) : IDisp
         model.ResetKVCache();
         var config = new SchedulerConfig
         {
-            // CUDA greedy parity compares the same eight-token prefill shapes.
+            // Greedy parity bounds prefill to the serial oracle's eight-token
+            // graph width on every backend, including ARM64 quantized CPU kernels.
             // The aggregate budget also bounds concurrent prefills: a 64-token
             // budget permits larger chunks despite MaxPrefillChunkSize below.
-            MaxNumBatchedTokens = backend == BackendType.GgmlCuda ? 8 : 64,
+            MaxNumBatchedTokens = 8,
             MaxNumRunningSequences = 4,
             MaxPrefillChunkSize = 8, SoloPrefillChunkSize = 8,
             NumBlocks = 128, BlockSize = 8, EnablePrefixCaching = false, DecodeQuantumTokens = 1,

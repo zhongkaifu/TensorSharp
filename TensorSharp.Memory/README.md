@@ -236,10 +236,11 @@ including an independent CUDA Runtime control, and are not enabled by default.
 See [`UnifiedMemory.CudaProbe`](../eng/validation/UnifiedMemory.CudaProbe/README.md).
 
 [`UnifiedMemory.ModelProbe`](../eng/validation/UnifiedMemory.ModelProbe/README.md)
-compares actual Gemma 4 E2B Q4_K_M generated tokens at concurrency 1/2/4/8/16 and
-complete teacher-forced logit rows after file-backed snapshot restoration. It also
-checks a longer bounded-window case and explicit refusal of unsafe Qwen 3.5 host
-snapshots. These do not establish whole-model weight streaming, media support or
+compares actual Gemma 4 E2B Q4_K_M and dense Qwen 3.5 0.8B Q8_0 generated tokens
+against independent requests and complete teacher-forced logit rows after repeated
+file-backed snapshot restoration. Qwen support is limited to a single CUDA rank
+without MTP layers; unsupported model/backend capabilities still fail explicitly.
+These do not establish whole-model weight streaming, media support or
 tensor-parallel snapshot coverage. The design records exact executed coverage,
 known failures and benchmark limitations; generated evidence stays in ignored
 `artifacts/` and is not committed.

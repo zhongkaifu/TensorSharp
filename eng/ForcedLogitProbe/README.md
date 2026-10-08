@@ -109,11 +109,42 @@ Validation on 2026-10-07 (2026-10-08 UTC) used Ubuntu 24.04, two NVIDIA A40 GPUs
 driver 570.211.01, CUDA 12.8.93, .NET SDK 10.0.401, and an unchanged ggml checkout
 at `ffa4e8b80930029a35991f94e7c8a93cd67730ab`. The model SHA-256 was
 `0ad885ffd4bb022fc4f0d33a3308fa108ef8613159d3b3a67e23abca056b7a6c`.
-The final TensorSharp native library SHA-256 was
-`c798d3e5b3d5675843aa59096af6887d6211c99e327d3a8c3c029e91f7bf4cb4`.
+The TensorSharp native library SHA-256 after the precision fix was
+`0146374922609a3f88038c61540467db26dc05dbf8098b128a87e6d2eacc5cfc`.
+That library also underlies the full Qwen snapshot width matrix. A subsequent
+diagnostic I/O safety change produced
+`5bd4436676564091850c8862ed50e971ad8924147399742e4299fcf895d1c941`.
+The complete TP comparison was repeated with that library and passed; all ten
+logit files were byte-identical to the earlier run. The snapshot width matrix
+was not repeated after this diagnostic-only change.
 
-TP1 and TP2 each executed 120 rows of 248,320 logits (29,798,400 values). TP2
-**failed** the unchanged full-logit gate: maximum relative L2 was
+The default dense Qwen CUDA policy now registers model-owned Q8_0 weight keys for
+the existing TensorSharp Q8×F32 projection kernel. It retains F32 activations and
+quantized weight storage, with no full F32 weight cache. This applies consistently
+to the fused TP1 and sharded TP2 paths, including prefill and decode. Other model
+families, CPU execution and unregistered weights retain their previous policy.
+
+With this policy, TP1 versus TP2 **passed** all unchanged gates for the complete
+five-case, 24-step run: 120 rows of 248,320 logits (29,798,400 values), all finite,
+with all 120 top-1 tokens equal. Maximum relative L2 was
+`0.0005205465902312378`, minimum cosine was `0.9999998736272625`, and maximum
+absolute error was `0.006324291229248047`. Both processes exited normally with
+code 0. The candidate used both physical GPUs, with the sharding and per-rank
+residency described below.
+
+The precision choice has a cost. The same five prompts and identical generated
+token histories took about 4.03 → 9.65 seconds for TP1 and 7.56 → 10.16 seconds
+for TP2 in the recorded cold validation processes. These are launch-to-observed-
+exit intervals from the sampling harness, whose polling interval was 0.5 seconds;
+they include model loading, file output and comparison work. Native compilation
+also ran during the final trial. They show an observed validation-time tradeoff,
+not a controlled serving-throughput benchmark.
+
+### Historical failure and localization
+
+Before the precision fix, TP2 **failed** the same full-logit gate. The native
+library was `c798d3e5b3d5675843aa59096af6887d6211c99e327d3a8c3c029e91f7bf4cb4`.
+Maximum relative L2 was
 `0.041408444438891134`, minimum cosine was `0.9991471466963167`, and maximum
 absolute error was `0.6113646030426025`. All values were finite and all 120 top-1
 tokens matched. Differences began at step zero. TP2 loaded 97 quantized weights
@@ -125,14 +156,77 @@ and CUDA graphs did not alter any TP2 logit bytes. The fused-matmul switch likew
 did not alter TP2 output. This tied-embedding model uses the per-operation TP
 decode fallback because its LM head is not column-sharded; the whole-model TP
 decode path was unavailable and is not counted as tested. These controls narrow
-the discrepancy but do not establish its cause or qualify TP2 accuracy.
+the discrepancy but did not establish its cause or qualify that implementation.
 
-The final native cache tests passed 3/3, including exact streamed/cached F32 and
+Full intermediate tensors then localized the first substantial discrepancy for
+the synthetic one-token prompt. Embeddings were byte-identical, and residuals
+through layer 6 differed by only about `1e-7` relative L2. Layer 7's normalized
+QKV input still differed by only `1.244878e-7`, but its quantized projection
+differed by `0.000330994`. Reproducing the activation quantization from those
+inputs showed a Q8_1 activation rounding from -27 to -26 because a block maximum
+changed by two F32 ULPs. `q8-rounding-control.cpp` confirmed this with the actual
+unchanged ggml CUDA quantizer on the A40: maxima `3.11877036` and `3.11877084`
+produce different quantized values for the same activation `-0.650767148`.
+The projected error then grew through later blocks.
+Keeping activations in F32 removes that discontinuity; the independent Q8/F32
+kernel tests compare against a double-precision decoded-weight oracle.
+
+The final native cache tests passed 4/4, including shared-budget permit lifetime,
+exact streamed/cached F32 and
 Q8_0 results, quota fallback, per-rank accounting, and deliberately poisoned
 abandoned cache initialization. Releasing retained TP graphs during cache cleanup
-removed an observed CUDA shutdown abort. Final TP2 exits normally with code 1 for
-the numerical gate. Before/after full logit files were byte-identical, so these
-cache fixes did not resolve the TP numerical discrepancy.
+removed an observed CUDA shutdown abort. TP2 then exited normally with code 1 for
+the numerical gate in the historical run. Before/after cache-fix logit files
+were byte-identical. The later precision-policy fix resolves the strict TP gate.
+The independent Q8/F32 CPU projection test and CUDA projection test passed;
+the CUDA test ran on physical GPU 1 with 86 cases, each executed twice. Three
+real-native weight-registration lifetime tests also passed, including rollback
+after injected registration failure.
+
+### Optional intermediate-tensor evidence
+
+`TS_QWEN35_TENSOR_DUMP` writes raw F32 embeddings, per-layer residuals, and
+post-attention/GDN residuals before the FFN. Use a fresh process and a one-token
+first forward: the native fused capture covers the initial one-token graph,
+while the managed TP capture covers its first forward. These diagnostics are off
+by default. They add downloads and retain intermediates, so never enable them
+for performance measurements. Filesystem failures are logged and leave the
+successful forward intact. With the final library, an intentionally invalid
+directory was tested on both TP1 and TP2: each logged the failure, exited normally,
+and produced byte-identical logits to its same-arm baseline for all 24 steps
+(5,959,680 values per arm), preserving recurrent state progression.
+For example, after the setup above:
+
+```sh
+printf '[{"name":"synthetic_single","prompt_tokens":[1]}]\n' > "$OUT/trace-cases.json"
+mkdir -p "$OUT/trace1/tensors" "$OUT/trace2/tensors"
+TENSORSHARP_TP_DEGREE=1 TS_QWEN35_TENSOR_DUMP="$OUT/trace1/tensors" \
+  dotnet "$PROBE/ForcedLogitProbe.dll" "$MODEL" "$OUT/trace1" ggml_cuda \
+  --cases "$OUT/trace-cases.json" --steps 1
+TENSORSHARP_TP_DEGREE=2 TS_QWEN35_TENSOR_DUMP="$OUT/trace2/tensors" \
+  dotnet "$PROBE/ForcedLogitProbe.dll" "$MODEL" "$OUT/trace2" ggml_cuda \
+  --reference "$OUT/trace1"
+python3 eng/ForcedLogitProbe/compare-tensors.py \
+  "$OUT/trace1/tensors" "$OUT/trace2/tensors" > "$OUT/tensor-comparison.json"
+```
+
+The one-step diagnostic does not replace the full qualification run.
+The comparer exits nonzero for missing, empty, truncated, unreadable, or
+nonfinite tensor data. Finite numerical differences are reported without a
+failing exit code: this tool localizes differences and does not qualify them.
+
+The small rounding control uses a dependency-internal launcher whose signature
+is pinned to the recorded ggml revision. Build it separately from TensorSharp:
+
+```sh
+g++ -std=c++17 eng/ForcedLogitProbe/q8-rounding-control.cpp \
+  -IExternalProjects/ggml/include -I/usr/local/cuda-12.8/include \
+  -L/usr/local/cuda-12.8/lib64 -lcudart -L"$NATIVE" -lGgmlOps \
+  -Wl,-rpath,"$NATIVE" -o "$OUT/q8-rounding-control"
+CUDA_VISIBLE_DEVICES=0 "$OUT/q8-rounding-control"
+```
+
+This reports rounding sensitivity and is not another passing model test.
 
 This is one model, quantization, topology and batch width, with no multi-node,
 NCCL, direct-peer, production concurrency, endurance or throughput qualification.

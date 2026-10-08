@@ -150,9 +150,20 @@ namespace TensorSharp.Models
         {
             string directory = Environment.GetEnvironmentVariable("TS_QWEN35_TENSOR_DUMP");
             if (string.IsNullOrEmpty(directory) || _layerTraceForwards > 0) return;
-            System.IO.Directory.CreateDirectory(directory);
-            using var file = System.IO.File.Create(System.IO.Path.Combine(directory, name + ".f32"));
-            file.Write(new ReadOnlySpan<byte>(GetFloatPtr(tensor), checked((int)tensor.ElementCount() * sizeof(float))));
+            // Materialize the tensor before the I/O-only catch: compute failures
+            // must still propagate, but diagnostic output must not abort a
+            // forward after its recurrent state has already advanced.
+            var bytes = new ReadOnlySpan<byte>(GetFloatPtr(tensor), checked((int)tensor.ElementCount() * sizeof(float)));
+            try
+            {
+                System.IO.Directory.CreateDirectory(directory);
+                using var file = System.IO.File.Create(System.IO.Path.Combine(directory, name + ".f32"));
+                file.Write(bytes);
+            }
+            catch (Exception error) when (error is System.IO.IOException || error is UnauthorizedAccessException)
+            {
+                Console.Error.WriteLine($"[Qwen35 diagnostic] Cannot write tensor {name} to '{directory}': {error.Message}");
+            }
         }
 
         private unsafe void TraceLayer(Tensor hidden, int layer, string tag)

@@ -21,22 +21,34 @@ def read(path):
     return values
 
 results = []
+invalid = False
 for source in sorted(args.reference.glob(args.reference_prefix + "*.f32")):
     name = source.name[len(args.reference_prefix):]
     target = args.candidate / (args.candidate_prefix + name)
     if not target.exists():
         results.append({"tensor": name, "missing_candidate": True})
+        invalid = True
         continue
-    x, y = read(source), read(target)
-    if len(x) != len(y):
+    try:
+        x, y = read(source), read(target)
+    except (OSError, ValueError) as error:
+        results.append({"tensor": name, "read_error": str(error)})
+        invalid = True
+        continue
+    if not x or len(x) != len(y):
         results.append({"tensor": name, "reference_length": len(x), "candidate_length": len(y)})
+        invalid = True
+        continue
+    if not all(math.isfinite(v) for values in (x, y) for v in values):
+        results.append({"tensor": name, "elements": len(x), "finite": False})
+        invalid = True
         continue
     square_error = math.fsum((a - b) ** 2 for a, b in zip(x, y))
     norm_x = math.fsum(a * a for a in x)
     norm_y = math.fsum(b * b for b in y)
     results.append({
         "tensor": name, "elements": len(x),
-        "finite": all(math.isfinite(v) for v in (*x, *y)),
+        "finite": True,
         "equal_elements": sum(a == b for a, b in zip(x, y)),
         "max_abs": max((abs(a - b) for a, b in zip(x, y)), default=0),
         "relative_l2": math.sqrt(square_error / max(norm_x, 1e-300)),
@@ -45,3 +57,4 @@ for source in sorted(args.reference.glob(args.reference_prefix + "*.f32")):
 print(json.dumps(results, indent=2, allow_nan=False))
 if not results:
     raise SystemExit("No matching reference tensors")
+raise SystemExit(1 if invalid else 0)
