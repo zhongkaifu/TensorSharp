@@ -62,12 +62,35 @@ stopwatches, but the resulting run is diagnostic and is not a quiet performance
 measurement. An interrupted run preserves its completed row index; that does not
 turn the incomplete model report into a pass.
 
+Compare two routes' matched captures, including the initial prefill row:
+
+```powershell
+python eng/validation/qwen38-compare-captures.py --left artifacts/flash-cpu/logits/rows.json --right artifacts/flash-device/logits/rows.json --left-report artifacts/flash-cpu/model.json --right-report artifacts/flash-device/model.json --output artifacts/flash-routes.json
+```
+
+Every captured row must meet relative L2 `1e-6` and equal argmax. Both bound model
+reports must have completed and physically cleaned up successfully. The comparator
+checks requested iteration/decode counts, every successive input history, model
+geometry, checkpoint identity, complete file layout and the final prediction hash.
+Available rows from incomplete executions may produce diagnostic differences,
+but cannot produce a passing comparison, even if both files are equally truncated.
+
+For a real checkpoint, pass `--model-identity-report <integrity.json>` to each
+probe run. This accepts the completed publisher-hash report from the local
+multimodal preflight tool, requires all GGUF shards, and checks their current
+size and nanosecond mtime before loading. The probe records the manifest hash and
+each verified shard hash without re-reading tens of GB during every arm. This
+reuses earlier full verification; metadata equality is not a new content hash.
+Reverify a checkpoint after modification. Synthetic checkpoints record their
+complete file hash directly. Actual native and managed hashes remain in both
+final reports; route agreement is not a claim of identical engine versions.
+
 For an independent matched-history diagnostic, start an unchanged llama.cpp
 server on the same verified GGUF and retain its revision, binary hash, backend,
 placement flags and logs. Then replay the captures without retokenizing:
 
 ```powershell
-python eng/validation/qwen38-llama-teacher.py --logits-index artifacts/flash-cpu/logits/rows.json --server http://127.0.0.1:5099 --output artifacts/flash-llama-teacher
+python eng/validation/qwen38-llama-teacher.py --logits-index artifacts/flash-cpu/logits/rows.json --model-report artifacts/flash-cpu/model.json --server http://127.0.0.1:5099 --output artifacts/flash-llama-teacher
 python -m unittest discover -s eng/validation/tests -p test_qwen38_llama_teacher.py
 ```
 
@@ -99,8 +122,9 @@ For a complete real GGUF checkpoint, `--model <first-shard>` measures CPU-offloa
 decode with and without the cache and skips the all-device load. It does not
 run the synthetic diagnostics. Transfer variants and cache budgets must agree on
 the complete final vocabulary row at relative L2 `1e-6`, equal argmax and exact
-prompt, forced and generated token IDs. This checks the final row only; it does
-not capture every decode row or claim trained quality. Every real greedy warmup
+prompt, forced and generated token IDs. The default wrapper checks the final
+row; opt into `--logits-dir` and the separate capture comparison above to check
+every decode row. Neither numerical comparison claims trained quality. Every real greedy warmup
 and timed repetition must finish at EOS with consistent generated IDs. The CPU
 baseline is reported separately from the strict cached-variant comparisons.
 Use matching

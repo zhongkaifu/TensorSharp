@@ -9,6 +9,7 @@ the softmax normalization constant is observable. Retain server identity/logs.
 import argparse
 import array
 import hashlib
+import importlib.util
 import json
 import math
 from pathlib import Path
@@ -59,7 +60,7 @@ def compare(logits, completion):
     difference = math.fsum((a - b) ** 2 for a, b in zip(left, right))
     denominator = math.fsum(value * value for value in right)
     return {"elements": len(logits), "reference_token": reference, "argmax": [ours, reference],
-            "relative_l2_after_common_token_offset": math.sqrt(difference / max(denominator, 1e-300)),
+            "relative_l2_after_common_token_offset": math.sqrt(difference) / max(math.sqrt(denominator), 1e-150),
             "max_abs_pairwise_logit_error": max(abs(a - b) for a, b in zip(left, right)),
             "limitation": "HTTP log probabilities include float32 softmax/log rounding; raw logits are not exposed."}
 
@@ -67,12 +68,17 @@ def compare(logits, completion):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--logits-index", type=Path, required=True)
+    parser.add_argument("--model-report", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--server", default="http://127.0.0.1:5099")
     parser.add_argument("--iteration", type=int, default=0)
     parser.add_argument("--timeout", type=float, default=1800)
     parser.add_argument("--prepare-only", action="store_true")
     args = parser.parse_args()
+    spec = importlib.util.spec_from_file_location("qwen38_evidence", Path(__file__).with_name("qwen38_capture_evidence.py"))
+    evidence = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(evidence)
+    execution_identity = evidence.validate(args.logits_index, args.model_report)
     index = json.loads(args.logits_index.read_text(encoding="utf-8-sig"))
     if index.get("format") != "f32le":
         raise ValueError("Expected f32le diagnostic captures")
@@ -82,6 +88,7 @@ def main():
         raise ValueError("No completed rows for the requested iteration")
     args.output.mkdir(parents=True, exist_ok=False)
     report = {"run_complete": False, "prepare_only": args.prepare_only,
+              "execution_identity": execution_identity,
               "index_sha256": hashlib.sha256(args.logits_index.read_bytes()).hexdigest(), "rows": [],
               "qualification": "Matched-history diagnostic; no engine is assumed to be ground truth.",
               "limitations": ["Record actual server checkpoint/backend/binary identities separately.",

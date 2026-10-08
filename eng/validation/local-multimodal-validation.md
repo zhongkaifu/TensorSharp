@@ -62,7 +62,11 @@ the binary/DLL hashes, compiler version, architecture and CUDA Flash Attention
 settings. Do not replace another experiment's reference binary.
 
 The reference's `--cpu-moe`/`--n-cpu-moe` flags place expert tensors on CPU.
-They do not enable TensorSharp's compact selected-expert GPU cache. Its Flash
+They do not by themselves force host computation: the scheduler can offload
+CPU-resident expert operations to CUDA above its batch threshold. Use
+`--no-op-offload` for an explicit host-expert arithmetic control, and keep the
+default offload policy as a separately labelled arm when needed. Neither mode
+enables TensorSharp's compact selected-expert GPU cache. Its Flash
 Next PLE table uses lazy mapped row access. A useful baseline keeps the same
 GGUF, CPU-thread count, F16 KV cache, context, no speculation and exact prompt
 tokens, while reporting the placement/cache policy difference explicitly.
@@ -74,7 +78,7 @@ For a TensorSharp trained sample, run the existing expert-cache probe with
 > storage, input, and output in five connected paragraphs with a concrete example.
 
 After starting the qualified reference server on port 5099 with the same first
-shard, `--cpu-moe --n-gpu-layers all --ctx-size 512 --parallel 1` and explicit
+shard, `--cpu-moe --no-op-offload --n-gpu-layers all --ctx-size 512 --parallel 1` and explicit
 thread counts, replay the measured TensorSharp report:
 
 ```powershell

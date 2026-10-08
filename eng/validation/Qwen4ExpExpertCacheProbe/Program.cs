@@ -64,6 +64,8 @@ MemoryBudget? sharedBudget = null;
 GgmlCacheBudgetScope? cacheScope = null;
 ModelBase? model = null;
 object? completedReport = null;
+object? checkpointIdentity = null;
+object? modelGeometry = null;
 string? failure = null;
 string? observedNativePath = null;
 string? observedNativeHash = null;
@@ -111,6 +113,8 @@ void WriteEvidence(bool complete)
     node["run_complete"] = complete;
     node["requested_options"] = JsonSerializer.SerializeToNode(options);
     node["model_path"] = modelPath;
+    node["checkpoint_identity"] = JsonSerializer.SerializeToNode(checkpointIdentity);
+    node["model_geometry"] = JsonSerializer.SerializeToNode(modelGeometry);
     node["model_sha256"] = synthetic && File.Exists(modelPath) ? Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(modelPath))).ToLowerInvariant() : null;
     node["native_path"] = observedNativePath;
     node["native_sha256"] = observedNativeHash;
@@ -170,9 +174,15 @@ if (synthetic)
 
 MoeCpuOffloadConfig.Reset();
 if (host) MoeCpuOffloadConfig.SetAllLayers();
+if (options.TryGetValue("model-identity-report", out string? identityReport))
+    checkpointIdentity = ProbeCheckpointIdentity.Read(modelPath, identityReport);
 var load = Stopwatch.StartNew();
 model = ModelBase.Create(modelPath, backend);
 load.Stop();
+modelGeometry = new { architecture = model.Config.Architecture, hidden_size = model.Config.HiddenSize,
+    layers = model.Config.NumLayers, heads = model.Config.NumHeads, kv_heads = model.Config.NumKVHeads,
+    key_length = model.Config.KeyLength, value_length = model.Config.ValueLength,
+    vocabulary = model.Config.VocabSize, context_limit = model.MaxContextLength, kv_dtype = "f16" };
 ObserveBudget("model-loaded");
 string nativePath = Qwen4ExpExpertCacheScenario.MappedNativePath();
 string nativeHash = Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(nativePath))).ToLowerInvariant();
@@ -275,7 +285,7 @@ for (int i = -warmups; i < iterations; i++)
     if (referenceHash != hash) throw new InvalidOperationException("Identical repeated inputs changed final logits.");
     finalLogits = (float[])logits.Clone();
     finalGenerated = generated.ToArray();
-    var row = new { warmup = i < 0, iteration = i < 0 ? i + warmups : i, prefill_tokens = prompt.Length,
+    var row = new { warmup = i < 0, iteration = i, prefill_tokens = prompt.Length,
         decode_tokens = forwardSteps, generated_tokens = finalGenerated,
         selected_text = generation == "greedy" ? DecodeGeneration(generated) : null,
         finish_reason = generation == "greedy" ? (eos ? "eos" : "length") : "teacher-forced",
