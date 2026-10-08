@@ -17,7 +17,7 @@ namespace TensorSharp.Models
             DisplayName = "Gemma 4",
             Aliases = new[] { "gemma4" },
             SupportsWeightStreaming = true,
-            Factory = c => new Gemma4Model(c.GgufPath, c.Backend, c.TpDegree, c.TpGroup, c.WeightStreaming, c.DraftModelPath),
+            Factory = c => new Gemma4Model(c.GgufPath, c.Backend, c.TpDegree, c.TpGroup, c.WeightStreaming, c.DraftModelPath, c.MemoryPolicy),
             ProjectorFileHints = new[] { "gemma-4-mmproj-F16.gguf" },
         };
     }

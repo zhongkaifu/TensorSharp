@@ -242,7 +242,7 @@ namespace {
             }
         }
 
-        BufferHandle buffer(ggml_backend_alloc_ctx_tensors(context.value, g_backend));
+        BufferHandle buffer(tsg::alloc_ctx_tensors_budgeted(context.value, g_backend));
         if (buffer.value == nullptr)
         {
             set_last_error("Failed to allocate ggml backend buffer.");
@@ -524,7 +524,7 @@ namespace {
                 ggml_build_forward_expand(graph, grad_beta_output);
             }
 
-            BufferHandle buffer(ggml_backend_alloc_ctx_tensors(context.value, g_backend));
+            BufferHandle buffer(tsg::alloc_ctx_tensors_budgeted(context.value, g_backend));
             if (buffer.value == nullptr)
             {
                 set_last_error("Failed to allocate ggml backend buffer.");
@@ -686,7 +686,7 @@ namespace {
             ggml_build_forward_expand(graph, grad_beta_output);
         }
 
-        BufferHandle buffer(ggml_backend_alloc_ctx_tensors(context.value, g_backend));
+        BufferHandle buffer(tsg::alloc_ctx_tensors_budgeted(context.value, g_backend));
         if (buffer.value == nullptr)
         {
             set_last_error("Failed to allocate ggml backend buffer.");
@@ -872,7 +872,7 @@ namespace {
 
         ggml_build_forward_expand(graph, output_tensor);
 
-        BufferHandle buffer(ggml_backend_alloc_ctx_tensors(context.value, g_backend));
+        BufferHandle buffer(tsg::alloc_ctx_tensors_budgeted(context.value, g_backend));
         if (buffer.value == nullptr)
         {
             set_last_error("Failed to allocate ggml backend buffer.");
@@ -1064,7 +1064,7 @@ namespace {
 
         ggml_build_forward_expand(graph, output_tensor);
 
-        BufferHandle buffer(ggml_backend_alloc_ctx_tensors(context.value, g_backend));
+        BufferHandle buffer(tsg::alloc_ctx_tensors_budgeted(context.value, g_backend));
         if (buffer.value == nullptr)
         {
             set_last_error("Failed to allocate ggml backend buffer.");
@@ -1238,7 +1238,7 @@ namespace {
 
         ggml_build_forward_expand(graph, output_tensor);
 
-        BufferHandle buffer(ggml_backend_alloc_ctx_tensors(context.value, g_backend));
+        BufferHandle buffer(tsg::alloc_ctx_tensors_budgeted(context.value, g_backend));
         if (buffer.value == nullptr)
         {
             set_last_error("Failed to allocate ggml backend buffer.");
@@ -1508,7 +1508,7 @@ namespace {
 
         ggml_build_forward_expand(graph, output_tensor);
 
-        BufferHandle buffer(ggml_backend_alloc_ctx_tensors(context.value, g_backend));
+        BufferHandle buffer(tsg::alloc_ctx_tensors_budgeted(context.value, g_backend));
         if (buffer.value == nullptr)
         {
             set_last_error("Failed to allocate ggml backend buffer.");
@@ -1637,7 +1637,7 @@ namespace {
 
         ggml_build_forward_expand(graph, output_tensor);
 
-        BufferHandle buffer(ggml_backend_alloc_ctx_tensors(context.value, g_backend));
+        BufferHandle buffer(tsg::alloc_ctx_tensors_budgeted(context.value, g_backend));
         if (buffer.value == nullptr)
         {
             set_last_error("Failed to allocate ggml backend buffer.");
@@ -1817,7 +1817,7 @@ namespace {
         }
         ggml_build_forward_expand(graph, output);
 
-        BufferHandle buffer(ggml_backend_alloc_ctx_tensors(ctx, g_backend));
+        BufferHandle buffer(tsg::alloc_ctx_tensors_budgeted(ctx, g_backend));
         if (buffer.value == nullptr)
         {
             set_last_error("Failed to allocate backend buffer in SoftmaxWithSinks.");
@@ -2008,7 +2008,7 @@ namespace {
 
         ggml_build_forward_expand(graph, output_tensor);
 
-        BufferHandle buffer(ggml_backend_alloc_ctx_tensors(context.value, g_backend));
+        BufferHandle buffer(tsg::alloc_ctx_tensors_budgeted(context.value, g_backend));
         if (buffer.value == nullptr)
         {
             set_last_error("Failed to allocate ggml backend buffer.");
@@ -2339,7 +2339,7 @@ namespace
 
         void destroy()
         {
-            if (buffer != nullptr) { ggml_backend_buffer_free(buffer); buffer = nullptr; }
+            if (buffer != nullptr) { tsg::graph_budget_free_buffer(buffer); buffer = nullptr; }
             if (ctx != nullptr) { ggml_free(ctx); ctx = nullptr; }
             ctx_mem.reset();
             q_in = k_in = v_in = mask = result = nullptr;
@@ -2433,7 +2433,7 @@ namespace
         s.graph = ggml_new_graph(s.ctx);
         ggml_build_forward_expand(s.graph, out);
 
-        s.buffer = ggml_backend_alloc_ctx_tensors(s.ctx, g_backend);
+        s.buffer = tsg::alloc_ctx_tensors_budgeted(s.ctx, g_backend);
         if (s.buffer == nullptr)
         {
             set_last_error("prefill-attn session: backend buffer alloc failed.");
@@ -2620,7 +2620,7 @@ namespace
         ggml_cgraph* graph = ggml_new_graph(ctx);
         ggml_build_forward_expand(graph, output);
 
-        BufferHandle buffer(ggml_backend_alloc_ctx_tensors(ctx, g_backend));
+        BufferHandle buffer(tsg::alloc_ctx_tensors_budgeted(ctx, g_backend));
         if (buffer.value == nullptr)
         {
             set_last_error("Failed to allocate backend buffer for flash prefill attention.");
@@ -2817,7 +2817,7 @@ TSG_EXPORT int TSGgml_StreamingNormRoPE(
         ggml_set_output(rotated);
         auto* graph = ggml_new_graph(ctx);
         ggml_build_forward_expand(graph, rotated);
-        BufferHandle buffer(ggml_backend_alloc_ctx_tensors(ctx, g_backend));
+        BufferHandle buffer(tsg::alloc_ctx_tensors_budgeted(ctx, g_backend));
         if (!buffer.value)
         {
             set_last_error("Failed to allocate streaming norm/RoPE activation buffer.");
@@ -2880,7 +2880,7 @@ TSG_EXPORT int TSGgml_StreamingNormResidual(
         ggml_set_output(added);
         auto* graph = ggml_new_graph(ctx);
         ggml_build_forward_expand(graph, added);
-        BufferHandle buffer(ggml_backend_alloc_ctx_tensors(ctx, g_backend));
+        BufferHandle buffer(tsg::alloc_ctx_tensors_budgeted(ctx, g_backend));
         if (!buffer.value)
         {
             set_last_error("Failed to allocate streaming norm/residual activation buffer.");
@@ -3100,7 +3100,7 @@ TSG_EXPORT int TSGgml_FusedPrefillAttentionF32(
         ggml_cgraph* graph = ggml_new_graph(ctx);
         ggml_build_forward_expand(graph, output);
 
-        BufferHandle buffer(ggml_backend_alloc_ctx_tensors(ctx, g_backend));
+        BufferHandle buffer(tsg::alloc_ctx_tensors_budgeted(ctx, g_backend));
         if (buffer.value == nullptr)
         {
             set_last_error("Failed to allocate backend buffer for fused prefill attention.");
@@ -3283,7 +3283,7 @@ TSG_EXPORT int TSGgml_FusedPrefillAttentionF16KV(
         ggml_cgraph* graph = ggml_new_graph(ctx);
         ggml_build_forward_expand(graph, output);
 
-        BufferHandle buffer(ggml_backend_alloc_ctx_tensors(ctx, g_backend));
+        BufferHandle buffer(tsg::alloc_ctx_tensors_budgeted(ctx, g_backend));
         if (buffer.value == nullptr)
         {
             set_last_error("Failed to allocate backend buffer for fused prefill attention (F16 KV).");

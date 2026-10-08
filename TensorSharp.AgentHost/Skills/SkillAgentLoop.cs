@@ -51,6 +51,10 @@ namespace TensorSharp.AgentHost.Skills
         /// <summary>What the round's generation prompt ended with; see
         /// <see cref="ChatMessage.RawGenerationSuffix"/>.</summary>
         public string? RawGenerationSuffix { get; init; }
+
+        /// <summary>History was compacted before this generation; cached file bodies
+        /// can no longer be assumed visible in this agent's context.</summary>
+        public bool HistoryCompacted { get; init; }
     }
 
     /// <summary>
@@ -275,6 +279,8 @@ namespace TensorSharp.AgentHost.Skills
                 cancellationToken.ThrowIfCancellationRequested();
                 output = await generate(working, tools, cancellationToken).ConfigureAwait(false);
                 cancellationToken.ThrowIfCancellationRequested();
+                if (output.HistoryCompacted)
+                    context.Workspace?.Reads.InvalidateReadVisibility();
 
                 List<ToolCall> calls = output.Parsed?.ToolCalls ?? new List<ToolCall>();
 
@@ -404,6 +410,8 @@ namespace TensorSharp.AgentHost.Skills
             cancellationToken.ThrowIfCancellationRequested();
             output = await generate(working, tools, cancellationToken).ConfigureAwait(false);
             cancellationToken.ThrowIfCancellationRequested();
+            if (output.HistoryCompacted)
+                context.Workspace?.Reads.InvalidateReadVisibility();
 
             // Only the caller's OWN tools may ride back out: there is no round left in
             // which the model could recover from a name nobody declared.

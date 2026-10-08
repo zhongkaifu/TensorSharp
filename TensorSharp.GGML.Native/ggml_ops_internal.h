@@ -35,6 +35,7 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "ggml-alloc.h"
+#include "ggml_ops_graph_budget.h"
 #if defined(TSG_GGML_USE_METAL)
 #include "ggml-metal.h"
 #endif
@@ -326,6 +327,11 @@ namespace tsg
     // Active rank for the calling thread. Per-thread so a rank worker pool can
     // drive several GPUs concurrently without stepping on each other.
     extern thread_local int g_active_rank;
+
+    inline ggml_backend_buffer_t alloc_ctx_tensors_budgeted(ggml_context* context, ggml_backend_t backend)
+    {
+        return graph_budget_alloc_ctx_tensors(context, backend, g_active_rank);
+    }
 
     // Cluster-wide tensor-parallel geometry, for a run split across NODES.
     // g_device_count is this process's share; these two describe the whole
@@ -671,7 +677,7 @@ namespace tsg
         ~BufferHandle()
         {
             if (value != nullptr)
-                ggml_backend_buffer_free(value);
+                graph_budget_free_buffer(value);
         }
 
         BufferHandle(const BufferHandle&) = delete;
@@ -687,7 +693,7 @@ namespace tsg
             if (this != &other)
             {
                 if (value != nullptr)
-                    ggml_backend_buffer_free(value);
+                    graph_budget_free_buffer(value);
                 value = other.value;
                 other.value = nullptr;
             }

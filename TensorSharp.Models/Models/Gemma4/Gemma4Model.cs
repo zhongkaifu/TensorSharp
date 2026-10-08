@@ -372,12 +372,19 @@ namespace TensorSharp.Models
 
         public Gemma4Model(string ggufPath, BackendType backend, int tpDegree = 1, ITensorParallelGroup tpGroup = null,
             WeightStreamingOptions weightStreaming = null, string draftModelPath = null)
-            : base(ggufPath, backend, tpDegree, tpGroup, weightStreaming: weightStreaming)
+            : this(ggufPath, backend, tpDegree, tpGroup, weightStreaming, draftModelPath, null)
+        {
+        }
+
+        public Gemma4Model(string ggufPath, BackendType backend,
+            int tpDegree, ITensorParallelGroup tpGroup,
+            WeightStreamingOptions weightStreaming, string draftModelPath, ModelMemoryPolicy memoryPolicy)
+            : base(ggufPath, backend, tpDegree, tpGroup, 1, weightStreaming, memoryPolicy)
         {
             try { InitializeGemma4Model(draftModelPath); }
             catch
             {
-                if (weightStreaming != null)
+                if (weightStreaming != null || memoryPolicy != null)
                     CleanUpFailedBonsaiConstruction(DisposeGemma4Resources, () => base.Dispose());
                 throw;
             }
@@ -1946,6 +1953,7 @@ namespace TensorSharp.Models
         // Shared by ForwardRefill and the MTP speculative prefill (SpecForward).
         internal int ComputePrefillChunkSize()
         {
+            if (MemoryPolicy != null) return MemoryPolicy.PrefillChunkTokens;
             // 2048 is the memory-safe ceiling for the full-attention score tensor
             // (~numHeads ├ù chunk ├ù totalKv ├ù 4B). We floor at it (not window*2) so a
             // single start_pos==0 chunk covers typical long prompts even on

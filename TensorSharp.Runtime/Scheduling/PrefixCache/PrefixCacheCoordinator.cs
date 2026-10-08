@@ -363,18 +363,24 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
             publicBoundary ? length : sequence.SharedPrefixTokens,
             explicitBoundary ? NodeFlags.EndsAtBreakpoint : promptBoundary ? NodeFlags.PromptEnd : NodeFlags.None,
             GetSpans(sequence));
+        // A media-key collision can stop insertion before this exact state boundary.
+        // Never associate the full state with a shallower prefix (including Root).
+        if (node.Depth != length) return;
         if (node.EndState is not null) return;
-        string key = _tree.MintKey();
-        bool captured = _cacheModel.TryCaptureCopy(sequence.RequestId, key, out var footprint);
-        if (!captured && ReleaseOldestScopedPayload())
-            captured = _cacheModel.TryCaptureCopy(sequence.RequestId, key, out footprint);
-        if (!captured)
+        // Releasing a deeper retained state may otherwise collect this still-empty
+        // ancestor and recycle its object before the capture retry publishes it.
+        LockReceipt publication = _tree.AcquirePath(node);
+        try
         {
-            _tree.CollectIfEmpty(node);
-            return;
+            string key = _tree.MintKey();
+            bool captured = _cacheModel.TryCaptureCopy(sequence.RequestId, key, out var footprint);
+            if (!captured && ReleaseOldestScopedPayload())
+                captured = _cacheModel.TryCaptureCopy(sequence.RequestId, key, out footprint);
+            if (!captured) return;
+            if (Publish(node, key, footprint, length, PayloadOrigin.CaptureCopy) && publicBoundary)
+                SaveCheckpoint(sequence, key, length);
         }
-        if (Publish(node, key, footprint, length, PayloadOrigin.CaptureCopy) && publicBoundary)
-            SaveCheckpoint(sequence, key, length);
+        finally { _tree.Release(ref publication); }
         Trim();
     }
 
@@ -386,50 +392,56 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
         KeyRope key = GetKey(sequence);
         RadixNode node = _tree.Insert(key, length, GetScope(sequence), sequence.SharedPrefixTokens,
             NodeFlags.None, GetSpans(sequence));
+        if (node.Depth != length) return false;
         if (node.EndState is not null) return false;
-        string payloadKey = _tree.MintKey();
-        if (primary && _tree.Caps.DeferPrimaryConversion)
+        LockReceipt publication = _tree.AcquirePath(node);
+        try
         {
-            RegisterPrimary(node, payloadKey, length);
-            return false; // The live primary still belongs to the executor, not a retained holder.
-        }
-        bool captured = RetentionEnabled && _tree.Caps.EndState != EndStateSupport.None
-            && _cacheModel.TryCaptureDonate(sequence.RequestId, payloadKey, length, out _);
-        if (!captured && RetentionEnabled && _tree.Caps.EndState != EndStateSupport.None
-            && _model is IBatchedPagedModel holder && holder.HasFusedSequenceCache(sequence.RequestId)
-            && ReleaseOldestScopedPayload())
-            captured = _cacheModel.TryCaptureDonate(sequence.RequestId, payloadKey, length, out _);
-        PayloadOrigin origin = PayloadOrigin.Donation;
-        bool conversionFailed = false;
-        if (!captured && RetentionEnabled && primary && _tree.Caps.AdoptPrimaryOnDisplacement)
-        {
-            captured = _cacheModel.TryConvertPrimary(payloadKey, length, out _);
-            if (!captured && ReleaseOldestScopedPayload())
+            string payloadKey = _tree.MintKey();
+            if (primary && _tree.Caps.DeferPrimaryConversion)
+            {
+                RegisterPrimary(node, payloadKey, length);
+                return false; // The live primary still belongs to the executor, not a retained holder.
+            }
+            bool captured = RetentionEnabled && _tree.Caps.EndState != EndStateSupport.None
+                && _cacheModel.TryCaptureDonate(sequence.RequestId, payloadKey, length, out _);
+            if (!captured && RetentionEnabled && _tree.Caps.EndState != EndStateSupport.None
+                && _model is IBatchedPagedModel holder && holder.HasFusedSequenceCache(sequence.RequestId)
+                && ReleaseOldestScopedPayload())
+                captured = _cacheModel.TryCaptureDonate(sequence.RequestId, payloadKey, length, out _);
+            PayloadOrigin origin = PayloadOrigin.Donation;
+            bool conversionFailed = false;
+            if (!captured && RetentionEnabled && primary && _tree.Caps.AdoptPrimaryOnDisplacement)
+            {
                 captured = _cacheModel.TryConvertPrimary(payloadKey, length, out _);
-            origin = PayloadOrigin.PrimaryConversion;
-            conversionFailed = !captured;
-        }
-        if (captured)
-        {
-            bool published = Publish(node, payloadKey, _cacheModel.MeasureEndState(payloadKey), length, origin);
-            Trim();
-            return published;
-        }
-        // A conversion can fail AFTER adopting the primary: the holder adapter then releases what it
-        // adopted, and DeepSeek V4.1 resets a released slot to position 0. Advertising that primary let an
-        // exact continuation keep it (no rewind, so nothing asks the model) and decode from an empty cache.
-        // Keep it only while the model still reports this sequence's length.
-        if (conversionFailed && _cacheModel is IPrefixCacheModelDiagnostics diagnostics
-            && diagnostics.PrimaryCacheLength != length)
-        {
-            InvalidatePrimary();
-            _tree.CollectIfEmpty(node);
+                if (!captured && ReleaseOldestScopedPayload())
+                    captured = _cacheModel.TryConvertPrimary(payloadKey, length, out _);
+                origin = PayloadOrigin.PrimaryConversion;
+                conversionFailed = !captured;
+            }
+            if (captured)
+            {
+                bool published = Publish(node, payloadKey, _cacheModel.MeasureEndState(payloadKey), length, origin);
+                Trim();
+                return published;
+            }
+            // A conversion can fail AFTER adopting the primary: the holder adapter then releases what it
+            // adopted, and DeepSeek V4.1 resets a released slot to position 0. Advertising that primary let an
+            // exact continuation keep it (no rewind, so nothing asks the model) and decode from an empty cache.
+            // Keep it only while the model still reports this sequence's length.
+            if (conversionFailed && _cacheModel is IPrefixCacheModelDiagnostics diagnostics
+                && diagnostics.PrimaryCacheLength != length)
+            {
+                InvalidatePrimary();
+                _tree.CollectIfEmpty(node);
+                return false;
+            }
+            if (primary && _tree.Caps.PrimaryResident)
+                RegisterPrimary(node, payloadKey, length);
+            else _tree.CollectIfEmpty(node);
             return false;
         }
-        if (primary && _tree.Caps.PrimaryResident)
-            RegisterPrimary(node, payloadKey, length);
-        else _tree.CollectIfEmpty(node);
-        return false;
+        finally { _tree.Release(ref publication); }
     }
 
     private void RegisterPrimary(RadixNode node, string payloadKey, int length)

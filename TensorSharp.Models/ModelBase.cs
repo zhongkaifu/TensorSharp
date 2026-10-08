@@ -252,11 +252,21 @@ namespace TensorSharp.Models
         /// </summary>
         protected int LayerSplitDegree { get; }
 
+        protected ModelMemoryPolicy MemoryPolicy { get; }
+
         protected ModelBase(string ggufPath, BackendType backend, int tpDegree = 1,
             ITensorParallelGroup tpGroup = null, int layerSplitDegree = 1,
             WeightStreamingOptions weightStreaming = null)
+            : this(ggufPath, backend, tpDegree, tpGroup, layerSplitDegree, weightStreaming, null)
+        {
+        }
+
+        protected ModelBase(string ggufPath, BackendType backend, int tpDegree,
+            ITensorParallelGroup tpGroup, int layerSplitDegree,
+            WeightStreamingOptions weightStreaming, ModelMemoryPolicy memoryPolicy)
         {
             WeightStreaming = weightStreaming;
+            MemoryPolicy = memoryPolicy;
             if (tpDegree < 1) throw new ArgumentOutOfRangeException(nameof(tpDegree));
             if (layerSplitDegree < 1) throw new ArgumentOutOfRangeException(nameof(layerSplitDegree));
             if (layerSplitDegree > 1 && (tpDegree > 1 || tpGroup != null))
@@ -514,9 +524,9 @@ namespace TensorSharp.Models
 
         protected int ResolveConfiguredContextLength(int fallback = 4096)
         {
-            int? explicitOverride = null;
+            int? explicitOverride = MemoryPolicy?.ContextTokens;
             string ctxEnv = Environment.GetEnvironmentVariable("MAX_CONTEXT");
-            if (!string.IsNullOrWhiteSpace(ctxEnv) && int.TryParse(ctxEnv, out int envCtx) && envCtx > 0)
+            if (!explicitOverride.HasValue && !string.IsNullOrWhiteSpace(ctxEnv) && int.TryParse(ctxEnv, out int envCtx) && envCtx > 0)
                 explicitOverride = envCtx;
 
             string architecture = MetadataArchitecture
@@ -537,7 +547,7 @@ namespace TensorSharp.Models
 
             if (explicitOverride.HasValue)
                 Console.WriteLine(
-                    $"Context length: using MAX_CONTEXT={resolved}; model declares "
+                    $"Context length: using {(MemoryPolicy != null ? "memory policy" : "MAX_CONTEXT")}={resolved}; model declares "
                     + (modelSource == "fallback"
                         ? "no context metadata."
                         : $"{modelSource}={modelContextLength}."));
@@ -1146,6 +1156,16 @@ namespace TensorSharp.Models
             }
 
             var tokenTypes = gguf.GetInt32Array("tokenizer.ggml.token_type");
+            // The checkpoint's generation contract is distinct from token_type:
+            // tool/channel/EOG control tokens can be legal generated output.
+            // Match llama.cpp's explicit metadata contract, dropping out-of-range ids.
+            IReadOnlyList<int> suppressed = Array.Empty<int>();
+            if (gguf.Metadata.TryGetValue("tokenizer.ggml.suppress_tokens", out var suppressedMetadata))
+            {
+                if (suppressedMetadata is not int[] suppressedIds)
+                    throw new System.IO.InvalidDataException("tokenizer.ggml.suppress_tokens must be an INT32 array.");
+                suppressed = Array.AsReadOnly(suppressedIds.Where(id => id >= 0 && id < vocabTokens.Length).Distinct().ToArray());
+            }
             int bosId = (int)gguf.GetUint32("tokenizer.ggml.bos_token_id");
             int eosId = (int)gguf.GetUint32("tokenizer.ggml.eos_token_id");
             bool addBosMetadata = gguf.GetBool("tokenizer.ggml.add_bos_token", false);
@@ -1193,7 +1213,7 @@ namespace TensorSharp.Models
             {
                 var scores = gguf.GetFloatArray("tokenizer.ggml.scores");
                 return new SentencePieceTokenizer(vocabTokens, tokenTypes, scores,
-                    bosId, eosIds.ToArray(), addBos, addEos);
+                    bosId, eosIds.ToArray(), addBos, addEos) { SuppressedTokenIds = suppressed };
             }
 
             var merges = gguf.GetStringArray("tokenizer.ggml.merges");
@@ -1210,7 +1230,7 @@ namespace TensorSharp.Models
                 ? "gemma4"
                 : gguf.GetString("tokenizer.ggml.pre", null);
             return new BpeTokenizer(vocabTokens, tokenTypes, merges,
-                bosId, eosIds.ToArray(), addBos, addEos, preType);
+                bosId, eosIds.ToArray(), addBos, addEos, preType) { SuppressedTokenIds = suppressed };
         }
 
         protected virtual bool IsQuantizedLinearWeight(GgufTensorInfo info)
@@ -2643,16 +2663,17 @@ namespace TensorSharp.Models
 
         public int SampleGreedy(float[] logits)
         {
+            var suppressed = Tokenizer?.SuppressedTokenIds;
+            if (suppressed != null)
+                for (int j = 0; j < suppressed.Count; j++)
+                    if ((uint)suppressed[j] < (uint)logits.Length)
+                        logits[suppressed[j]] = float.NegativeInfinity;
             int maxIdx = 0;
             float maxVal = logits[0];
             for (int i = 1; i < logits.Length; i++)
-            {
-                if (logits[i] > maxVal)
-                {
-                    maxVal = logits[i];
-                    maxIdx = i;
-                }
-            }
+                if (logits[i] > maxVal) { maxVal = logits[i]; maxIdx = i; }
+            if (suppressed is { Count: > 0 } && float.IsNegativeInfinity(maxVal))
+                throw new InvalidOperationException("No generation token remains after model constraints.");
             return maxIdx;
         }
 
@@ -2663,19 +2684,7 @@ namespace TensorSharp.Models
         /// </summary>
         public int Sample(float[] logits, SamplingConfig config, IList<int> generatedTokenIds = null)
         {
-            if (config == null || config.IsGreedy)
-            {
-                // The greedy shortcut skips TokenSampler, so the grammar mask has
-                // to be applied here too. Structured output is very often run at
-                // temperature 0, which is exactly this branch -- leaving it out
-                // would make constrained decoding silently do nothing in the case
-                // that needs it most.
-                var g = config?.Grammar;
-                if (g != null && !g.IsDead)
-                    g.ApplyMask(logits, allowEos: g.IsComplete);
-                return SampleGreedy(logits);
-            }
-            var sampler = new TokenSampler(config);
+            var sampler = new TokenSampler(config ?? SamplingConfig.Greedy, Tokenizer?.SuppressedTokenIds);
             return sampler.Sample(logits, generatedTokenIds);
         }
 
@@ -2821,6 +2830,12 @@ namespace TensorSharp.Models
         /// ignored by architectures that have no drafter.</param>
         public static ModelBase Create(string ggufPath, BackendType backend, int tpDegree = 1, ITensorParallelGroup tpGroup = null,
             string draftModelPath = null, int layerSplitDegree = 1, WeightStreamingOptions weightStreaming = null)
+            => Create(ggufPath, backend, tpDegree, tpGroup, draftModelPath, layerSplitDegree, weightStreaming, null);
+
+        /// <summary>Create a model with explicit per-model memory geometry.</summary>
+        public static ModelBase Create(string ggufPath, BackendType backend, int tpDegree,
+            ITensorParallelGroup tpGroup, string draftModelPath,
+            int layerSplitDegree, WeightStreamingOptions weightStreaming, ModelMemoryPolicy memoryPolicy)
         {
             if (tpGroup == null && tpDegree <= 1)
                 tpDegree = ReadParallelDegree("TENSORSHARP_TP_DEGREE", tpDegree);
@@ -2832,9 +2847,13 @@ namespace TensorSharp.Models
             if (weightStreaming != null && !architecture.SupportsWeightStreaming)
                 throw new NotSupportedException($"Architecture '{architecture.Id}' has no bounded weight streaming adapter.");
 
+            if (memoryPolicy != null && (architecture.Id is not ("gemma4" or "qwen35")
+                || backend != BackendType.GgmlCuda || tpDegree != 1 || tpGroup != null || layerSplitDegree != 1))
+                throw new NotSupportedException("The per-model memory policy currently requires dense Gemma4/Qwen35 on one GGML CUDA device.");
+
             tpDegree = ResolveTensorParallelSupport(architecture, backend, tpDegree, ref tpGroup,
                 out int layerSplit, layerSplitDegree);
-            var context = new ModelCreateContext(ggufPath, backend, probe, tpDegree, tpGroup, draftModelPath, layerSplit, weightStreaming);
+            var context = new ModelCreateContext(ggufPath, backend, probe, tpDegree, tpGroup, draftModelPath, layerSplit, weightStreaming, memoryPolicy);
             architecture.ApplyNativeTunables?.Invoke(context);
             ModelBase model = architecture.Factory(context);
             model.VerifyTensorParallelShardedWeights(architecture.Id);

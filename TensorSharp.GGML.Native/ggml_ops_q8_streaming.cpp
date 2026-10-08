@@ -90,6 +90,7 @@ struct session {
     void* f16_state = nullptr;
     bool ready = false;
     bool full_shape = false, projected = false;
+    bool input_quantized = false;
     int uploaded_rows = 0, uploaded_columns = 0;
 };
 bool checked(cudaError_t error, const char* operation) {
@@ -134,8 +135,10 @@ int create_session(int rank, int weight_type, std::int64_t inner, int rows, int 
     if (full_shape) {
         // Only padding requires initialization; consecutive host row uploads
         // replace every real weight row before the first projection.
-        if (!checked(cudaMemsetAsync(static_cast<char*>(value->allocation) + bytes.input, 0, bytes.weights,
-                value->stream), "initialize complete weight arena") ||
+        const std::size_t payload = bytes.row_bytes * rows;
+        if ((bytes.weights > payload && !checked(cudaMemsetAsync(
+                static_cast<char*>(value->allocation) + bytes.input + payload, 0, bytes.weights - payload,
+                value->stream), "initialize complete weight padding")) ||
             !checked(cudaStreamSynchronize(value->stream), "finish complete weight initialization")) return 0;
     } else if (!checked(cudaMemcpy(value->allocation, input, std::size_t(inner) * columns * sizeof(float),
             cudaMemcpyHostToDevice), "upload input") ||
@@ -195,6 +198,7 @@ TSG_EXPORT int TSGgml_WeightStreamingUploadInput(void* handle, const float* inpu
         // The payload layout and allocation remain at their original capacity;
         // only the valid column count changes after the upload has completed.
         value->columns = columns;
+        value->input_quantized = false;
         value->ready = true;
         return 1;
 #else
@@ -219,8 +223,13 @@ TSG_EXPORT int TSGgml_WeightStreamingExecute(void* handle, const void* weights, 
     auto* device_weights = static_cast<char*>(value->allocation) + value->bytes.input;
     auto* device_output = reinterpret_cast<float*>(device_weights + value->bytes.weights);
     auto* scratch = reinterpret_cast<char*>(device_output) + value->bytes.output;
+    const std::size_t valid_weight_bytes = value->bytes.row_bytes * rows;
+    // Upload overwrites every real row. Only the tail (including stale rows
+    // after a short final tile) needs zeroing for upstream MMVQ/MMQ overreads.
     if (value->arithmetic == 1 && value->weight_type == GGML_TYPE_Q8_0 &&
-        !checked(cudaMemsetAsync(device_weights, 0, value->bytes.weights, nullptr), "clear padded weight tile")) return 0;
+        value->bytes.weights > valid_weight_bytes &&
+        !checked(cudaMemsetAsync(device_weights + valid_weight_bytes, 0,
+            value->bytes.weights - valid_weight_bytes, nullptr), "clear padded weight tail")) return 0;
     // Synchronous H2D consumes the caller's host tile before kernel submission;
     // even a later launch/sync failure cannot leave CUDA reading a reused tile.
     if (!checked(cudaMemcpy(device_weights, weights, value->bytes.row_bytes * rows,
@@ -231,7 +240,9 @@ TSG_EXPORT int TSGgml_WeightStreamingExecute(void* handle, const void* weights, 
     if (value->arithmetic == 1 && value->weight_type == GGML_TYPE_Q8_0) {
         output_rows = tsg_q8_resident_output_rows(rows);
         tsg_q8_resident_launch(value->device, device_weights, static_cast<const float*>(value->allocation), device_output,
-            scratch, value->bytes.scratch, value->inner, rows, value->columns, value->logical_columns, value->logical_rows, value->stream);
+            scratch, value->bytes.scratch, value->inner, rows, value->columns, value->logical_columns, value->logical_rows,
+            value->stream, value->input_quantized);
+        value->input_quantized = true;
     } else if (value->arithmetic == 1) {
         if (!tsg_f16_resident_launch(value->f16_state, device_weights, static_cast<const float*>(value->allocation),
             device_output, rows, value->columns)) {

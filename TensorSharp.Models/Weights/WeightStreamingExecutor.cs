@@ -1,16 +1,20 @@
 // Copyright (c) Zhongkai Fu. Licensed under the BSD-3-Clause license.
 using System;
 using System.Buffers;
+using System.Collections.Generic;
 using System.Linq;
 using System.Runtime.InteropServices;
+using System.Threading;
+using System.Threading.Tasks;
 using TensorSharp.GGML;
 using TensorSharp.Memory;
 using TensorSharp.Runtime;
 
 namespace TensorSharp.Models;
 
-/// <summary>One fixed file-read tile; no tensor-sized host copy, mmap, weight
-/// cache key or retained graph. Operations are synchronous before buffers recycle.</summary>
+/// <summary>One or two charged file-read tiles; no tensor-sized host copy, mmap,
+/// weight cache key or retained graph. Read-ahead overlaps the next storage read
+/// with the current operation; all pending reads finish before storage recycles.</summary>
 internal sealed class WeightStreamingExecutor : IDisposable
 {
     private readonly object _gate = new();
@@ -18,11 +22,13 @@ internal sealed class WeightStreamingExecutor : IDisposable
     private readonly GgmlWeightStreamingArithmetic _arithmetic;
     private readonly GgufMemoryCatalog _catalog;
     private readonly StreamingHostBuffer _weights;
+    private readonly StreamingHostBuffer _readAheadWeights;
     private GgmlWeightStreamingSession _activeSession;
     private GgmlResidentWeightSession _activeResidentSession;
     private bool _disposed;
     private long _weightBytes, _readBytes, _linearTiles, _embeddingRows, _peakHost, _peakDevice;
     private long _sessionCreations, _inputUploads, _matrixProjections;
+    private long _readAheadOperations;
 
     internal WeightStreamingExecutor(GgufFile gguf, WeightStreamingOptions options,
         GgmlWeightStreamingArithmetic arithmetic = GgmlWeightStreamingArithmetic.FullPrecision)
@@ -33,9 +39,18 @@ internal sealed class WeightStreamingExecutor : IDisposable
         try
         {
             _weights = new StreamingHostBuffer(options, options.TileBytes);
-            _peakHost = _weights.AllocatedBytes;
+            // Leave output staging space. The layout search still uses actual
+            // remaining shared capacity, and racing owners are settled by reserve.
+            if (options.ReadAhead && !options.DevicePools.Contains(options.HostPool)
+                && options.Budget.Snapshot().Single(p => p.Pool == options.HostPool).Available
+                >= options.TileBytes + (4L << 20))
+            {
+                try { _readAheadWeights = new StreamingHostBuffer(options, options.TileBytes); }
+                catch (MemoryPressureException) { /* Another owner won; one tile is still valid. */ }
+            }
+            _peakHost = HostReadBytes;
         }
-        catch { _catalog.Dispose(); throw; }
+        catch { ((IDisposable)_readAheadWeights)?.Dispose(); ((IDisposable)_weights)?.Dispose(); _catalog.Dispose(); throw; }
     }
 
     internal QuantizedWeight CreateWeight(GgufTensorInfo info)
@@ -56,8 +71,10 @@ internal sealed class WeightStreamingExecutor : IDisposable
     internal WeightStreamingStatistics Statistics
     {
         get { lock (_gate) return new(_weightBytes, _readBytes, _linearTiles, _embeddingRows, _peakHost, _peakDevice,
-            _sessionCreations, _inputUploads, _matrixProjections); }
+            _sessionCreations, _inputUploads, _matrixProjections) { ReadAheadOperations = _readAheadOperations }; }
     }
+
+    private long HostReadBytes => checked(_weights.AllocatedBytes + (_readAheadWeights?.AllocatedBytes ?? 0));
 
     internal unsafe void Linear(QuantizedWeight weight, IntPtr input, IntPtr output, int tokens, int rank = 0)
     {
@@ -81,7 +98,7 @@ internal sealed class WeightStreamingExecutor : IDisposable
             // Packed output is copied into its strided destination before the next
             // tile. This buffer is separate from, and charged alongside, file reads.
             using var tileOutput = new StreamingHostBuffer(_options, checked(tileRows * tokenRows * sizeof(float)));
-            _peakHost = Math.Max(_peakHost, checked(_weights.AllocatedBytes + tileOutput.AllocatedBytes));
+            _peakHost = Math.Max(_peakHost, checked(HostReadBytes + tileOutput.AllocatedBytes));
             try
             {
                 _activeSession = new GgmlWeightStreamingSession(_options.Budget, _options.DevicePools,
@@ -107,12 +124,11 @@ internal sealed class WeightStreamingExecutor : IDisposable
                         _activeSession.UploadInput(input + checked((nint)((long)token * weight.Ne0 * sizeof(float))), count);
                         _inputUploads++;
                     }
-                    for (long row = 0; row < weight.Ne1; row += tileRows)
+                    foreach (var tile in ReadTiles(weight, tileRows))
                     {
-                        int rows = checked((int)Math.Min(tileRows, weight.Ne1 - row));
-                        int bytes = checked((int)(rows * rowBytes));
-                        Read(weight, checked(row * rowBytes), bytes);
-                        _activeSession.Execute(_weights.Pointer, rows, tileOutput.Pointer);
+                        long row = tile.FirstRow;
+                        int rows = tile.Rows;
+                        _activeSession.Execute(tile.Pointer, rows, tileOutput.Pointer);
                         for (int t = 0; t < count; t++)
                         {
                             long dst = checked(((long)(token + t) * weight.Ne1 + row) * sizeof(float));
@@ -141,7 +157,7 @@ internal sealed class WeightStreamingExecutor : IDisposable
         var (tileRows, tokenRows) = SelectTileLayout(_options, weight.Ne0, weight.Ne1, tokens,
             (_, _, _) => payload, weight.GgmlType);
         using var tileOutput = new StreamingHostBuffer(_options, checked(tileRows * tokenRows * sizeof(float)));
-        _peakHost = Math.Max(_peakHost, checked(_weights.AllocatedBytes + tileOutput.AllocatedBytes));
+        _peakHost = Math.Max(_peakHost, checked(HostReadBytes + tileOutput.AllocatedBytes));
         try
         {
             _activeResidentSession = new GgmlResidentWeightSession(_options.Budget, _options.DevicePools,
@@ -156,13 +172,10 @@ internal sealed class WeightStreamingExecutor : IDisposable
         _peakDevice = Math.Max(_peakDevice, _activeResidentSession.PayloadBytes);
         try
         {
-            for (int row = 0; row < outputRows;)
+            foreach (var tile in ReadTiles(weight, tileRows))
             {
-                int count = Math.Min(tileRows, outputRows - row);
-                Read(weight, checked((long)row * weight.StreamingRowBytes), checked((int)(count * weight.StreamingRowBytes)));
-                _activeResidentSession.UploadWeightRows(_weights.Pointer, row, count);
+                _activeResidentSession.UploadWeightRows(tile.Pointer, checked((int)tile.FirstRow), tile.Rows);
                 _linearTiles++;
-                row = checked(row + count);
             }
             for (int token = 0; token < tokens;)
             {
@@ -219,6 +232,54 @@ internal sealed class WeightStreamingExecutor : IDisposable
     {
         weight.FileSource.ReadAsync(offset, _weights.Memory[..bytes]).AsTask().GetAwaiter().GetResult();
         _readBytes = checked(_readBytes + bytes);
+    }
+
+    internal readonly record struct ReadTile(IntPtr Pointer, long FirstRow, int Rows);
+
+    internal IEnumerable<ReadTile> ReadTiles(QuantizedWeight weight, int tileRows)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(tileRows);
+        if (checked(tileRows * weight.StreamingRowBytes) > _options.TileBytes)
+            throw new ArgumentOutOfRangeException(nameof(tileRows));
+        StreamingHostBuffer current = _weights, next = _readAheadWeights;
+        Task pending = null;
+        try
+        {
+            for (long row = 0; row < weight.Ne1;)
+            {
+                int rows = checked((int)Math.Min(tileRows, weight.Ne1 - row));
+                int bytes = checked((int)(rows * weight.StreamingRowBytes));
+                pending ??= ReadInto(current, checked(row * weight.StreamingRowBytes), bytes);
+                pending.GetAwaiter().GetResult();
+                pending = null;
+                long following = checked(row + rows);
+                if (next != null && following < weight.Ne1)
+                {
+                    int followingRows = checked((int)Math.Min(tileRows, weight.Ne1 - following));
+                    pending = ReadInto(next, checked(following * weight.StreamingRowBytes),
+                        checked((int)(followingRows * weight.StreamingRowBytes)));
+                    _readAheadOperations++;
+                }
+                yield return new(current.Pointer, row, rows);
+                if (next != null) (current, next) = (next, current);
+                row = following;
+            }
+        }
+        finally
+        {
+            // Disposing the iterator after a native failure must not free/reuse
+            // a tile still owned by RandomAccess.ReadAsync. The original operation
+            // failure takes precedence over an abandoned speculative read error;
+            // normal iteration observes every read error above.
+            if (pending != null)
+                try { pending.GetAwaiter().GetResult(); } catch { }
+        }
+
+        async Task ReadInto(StreamingHostBuffer target, long offset, int bytes)
+        {
+            await weight.FileSource.ReadAsync(offset, target.Memory[..bytes]).ConfigureAwait(false);
+            Interlocked.Add(ref _readBytes, bytes);
+        }
     }
 
     // Use remaining shared capacity, not a private subquota. Reduce output rows
@@ -314,6 +375,7 @@ internal sealed class WeightStreamingExecutor : IDisposable
         {
             if (_disposed) return;
             ReleaseSession();
+            ((IDisposable)_readAheadWeights)?.Dispose();
             ((IDisposable)_weights).Dispose();
             _catalog.Dispose();
             _disposed = true;

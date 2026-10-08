@@ -348,7 +348,14 @@ namespace TensorSharp.Models
         /// own NextN/MTP block as the drafter.</param>
         public Qwen35Model(string ggufPath, BackendType backend, int tpDegree = 1, ITensorParallelGroup tpGroup = null,
             string draftModelPath = null, WeightStreamingOptions weightStreaming = null)
-            : base(ggufPath, backend, tpDegree, tpGroup, weightStreaming: weightStreaming)
+            : this(ggufPath, backend, tpDegree, tpGroup, draftModelPath, weightStreaming, null)
+        {
+        }
+
+        public Qwen35Model(string ggufPath, BackendType backend,
+            int tpDegree, ITensorParallelGroup tpGroup,
+            string draftModelPath, WeightStreamingOptions weightStreaming, ModelMemoryPolicy memoryPolicy)
+            : base(ggufPath, backend, tpDegree, tpGroup, 1, weightStreaming, memoryPolicy)
         {
             _useMetalGdnInplaceState = ShouldUseMetalGdnInplaceState(backend, IsTensorParallel);
 
@@ -358,7 +365,7 @@ namespace TensorSharp.Models
             }
             catch
             {
-                if (HasBonsaiCheckpointMetadata || weightStreaming != null)
+                if (HasBonsaiCheckpointMetadata || weightStreaming != null || memoryPolicy != null)
                 {
                     // Reuse the ordinary cleanup without virtual dispatch into
                     // a subclass whose constructor has not completed. A missing
@@ -1803,6 +1810,7 @@ namespace TensorSharp.Models
 
         private int ComputePrefillChunkSize()
         {
+            if (MemoryPolicy != null) return MemoryPolicy.PrefillChunkTokens;
             string env = Environment.GetEnvironmentVariable("TS_PREFILL_CHUNK");
             if (!string.IsNullOrEmpty(env) && int.TryParse(env, out int v) && v > 0)
                 return v;

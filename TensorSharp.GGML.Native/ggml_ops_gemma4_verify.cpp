@@ -572,6 +572,13 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
         // unaligned KV without a slow path — keep other backends' graphs
         // unchanged.
         const bool pad_flash_kv = g_backend_type == BACKEND_TYPE_VULKAN;
+        // Opt-in arithmetic diagnosis: match llama.cpp's minimum 256-row KV
+        // geometry for local CUDA prefill. Only the physical view changes;
+        // get_causal_mask still excludes every row beyond attendLen. Read per
+        // invocation, and leave the normal backend dispatch unchanged.
+        const char* diagnostic_pad_local_env = std::getenv("TS_GEMMA4_DIAGNOSTIC_PAD_LOCAL_KV");
+        const bool diagnostic_pad_local_kv = g_backend_type == BACKEND_TYPE_CUDA
+            && diagnostic_pad_local_env != nullptr && std::strcmp(diagnostic_pad_local_env, "1") == 0;
         // 64 covers every FA pipeline's block_cols on the shapes used here.
         auto flash_pad_len = [pad_flash_kv](int len) {
             return pad_flash_kv ? ((len + 63) & ~63) : len;
@@ -916,6 +923,13 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
                 // overflow goes through swaFresh/swaPrev above), so a padded view
                 // never crosses the circular boundary.
                 attnKvLen = flash_attn_kv_length(attendLen, info.cacheSize, info.hd);
+                if (diagnostic_pad_local_kv && info.isLocal && activeStart == 0)
+                {
+                    const std::int64_t padded =
+                        ((static_cast<std::int64_t>(attendLen) + kFlashAttnKvStride - 1) / kFlashAttnKvStride)
+                        * kFlashAttnKvStride;
+                    attnKvLen = static_cast<int>(std::min<std::int64_t>(info.cacheSize, padded));
+                }
                 if (pad_flash_kv)
                     attnKvLen = std::min(info.cacheSize, std::max(attnKvLen, flash_pad_len(attendLen)));
                 maskWindow = 0;                 // window already enforced by the cache view
@@ -1249,7 +1263,7 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
         }
         else if (!alloc_ctx_tensors_reuse(ctx, graph))
         {
-            buffer.value = ggml_backend_alloc_ctx_tensors(ctx, g_backend);
+            buffer.value = tsg::alloc_ctx_tensors_budgeted(ctx, g_backend);
             if (buffer.value == nullptr)
             {
                 set_last_error("Failed to allocate backend buffer for Gemma4 model verify.");
@@ -1646,7 +1660,7 @@ TSG_EXPORT int TSGgml_Gemma4DraftStep(
         BufferHandle buffer(nullptr);
         if (!alloc_ctx_tensors_reuse(ctx, graph))
         {
-            buffer.value = ggml_backend_alloc_ctx_tensors(ctx, g_backend);
+            buffer.value = tsg::alloc_ctx_tensors_budgeted(ctx, g_backend);
             if (buffer.value == nullptr) { set_last_error("Failed to allocate backend buffer for Gemma4 draft step."); return 0; }
         }
 

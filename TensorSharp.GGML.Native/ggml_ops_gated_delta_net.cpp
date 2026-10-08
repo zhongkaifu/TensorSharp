@@ -560,7 +560,7 @@ TSG_EXPORT int TSGgml_GatedDeltaNetChunkedF32(
             ggml_build_forward_expand(new_entry->graph, out_cpy);
             ggml_build_forward_expand(new_entry->graph, state_cpy);
 
-            BufferHandle buffer(ggml_backend_alloc_ctx_tensors(ctx, g_backend));
+            BufferHandle buffer(tsg::alloc_ctx_tensors_budgeted(ctx, g_backend));
             if (!buffer.value)
             {
                 set_last_error("GatedDeltaNetChunked: buffer alloc failed.");

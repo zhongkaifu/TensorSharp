@@ -259,6 +259,8 @@ namespace TensorSharp.Runtime.Scheduling
             // ggml_metal_synchronize aborts the process.
             lock (_model.GpuComputeLock)
             {
+                foreach (var work in output.ScheduledWork)
+                    work.Sequence.BindGenerationVocabulary(_model.Tokenizer);
                 if (RadixCache != null)
                 {
                     RadixCache.Drain();
@@ -2126,7 +2128,10 @@ namespace TensorSharp.Runtime.Scheduling
                 // same penalized distribution verification draws from, or
                 // acceptance decays toward zero as the output history grows.
                 adjustDraftLogits: (draftLogits, pendingDrafts) =>
-                    penaltySampler.ApplyPenalties(draftLogits, seq.OutputTokens, pendingDrafts),
+                {
+                    penaltySampler.ApplyModelSuppression(draftLogits);
+                    penaltySampler.ApplyPenalties(draftLogits, seq.OutputTokens, pendingDrafts);
+                },
                 onDraftAccepted: d =>
                 {
                     seq.AppendOutputToken(d);

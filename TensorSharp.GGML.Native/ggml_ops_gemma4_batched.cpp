@@ -51,7 +51,7 @@ namespace
 
         void reset()
         {
-            if (buffer != nullptr) { ggml_backend_buffer_free(buffer); buffer = nullptr; }
+            if (buffer != nullptr) { tsg::graph_budget_free_buffer(buffer); buffer = nullptr; }
             if (galloc != nullptr) { ggml_gallocr_free(galloc); galloc = nullptr; }
             if (ctx != nullptr) { ggml_free(ctx); ctx = nullptr; }
             graph = nullptr; valid = false;
@@ -849,7 +849,7 @@ static int gemma4_model_decode_batched_impl(
         {
             persist_buf = (g_backend_type == BACKEND_TYPE_METAL
                 ? alloc_ctx_tensors_with_attention_reuse(ctx, graph, g_backend)
-                : ggml_backend_alloc_ctx_tensors(ctx, g_backend));
+                : tsg::alloc_ctx_tensors_budgeted(ctx, g_backend));
             if (persist_buf == nullptr)
             {
                 set_last_error("Gemma4 batched decode: failed to allocate persist buffer.");
@@ -860,7 +860,7 @@ static int gemma4_model_decode_batched_impl(
         {
             buffer.value = (g_backend_type == BACKEND_TYPE_METAL
                 ? alloc_ctx_tensors_with_attention_reuse(ctx, graph, g_backend)
-                : ggml_backend_alloc_ctx_tensors(ctx, g_backend));
+                : tsg::alloc_ctx_tensors_budgeted(ctx, g_backend));
             if (buffer.value == nullptr)
             {
                 set_last_error("Gemma4 batched decode: failed to allocate backend buffer.");
@@ -897,7 +897,7 @@ static int gemma4_model_decode_batched_impl(
         if (status != GGML_STATUS_SUCCESS)
         {
             set_last_error("Gemma4 batched decode: graph compute failed.");
-            if (can_persist) ggml_backend_buffer_free(persist_buf);
+            if (can_persist) tsg::graph_budget_free_buffer(persist_buf);
             return 0;
         }
 
@@ -1425,14 +1425,14 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelDecodeBatched(
         {
             persist_buf = (g_backend_type == BACKEND_TYPE_METAL
                 ? alloc_ctx_tensors_with_attention_reuse(ctx, graph, g_backend)
-                : ggml_backend_alloc_ctx_tensors(ctx, g_backend));
+                : tsg::alloc_ctx_tensors_budgeted(ctx, g_backend));
             if (persist_buf == nullptr) { set_last_error("Gemma4 MoE batched decode: persist alloc failed."); ggml_free(ctx); return 0; }
         }
         else if (!alloc_ctx_tensors_reuse(ctx, graph))
         {
             buffer.value = (g_backend_type == BACKEND_TYPE_METAL
                 ? alloc_ctx_tensors_with_attention_reuse(ctx, graph, g_backend)
-                : ggml_backend_alloc_ctx_tensors(ctx, g_backend));
+                : tsg::alloc_ctx_tensors_budgeted(ctx, g_backend));
             if (buffer.value == nullptr) { set_last_error("Gemma4 MoE batched decode: buffer alloc failed."); return 0; }
         }
 
@@ -1447,7 +1447,7 @@ TSG_EXPORT int TSGgml_Gemma4MoEModelDecodeBatched(
 
         ggml_status status = tsg::compute_graph(g_backend, graph);
         if (status != GGML_STATUS_SUCCESS)
-        { set_last_error("Gemma4 MoE batched decode: graph compute failed."); if (can_persist) { ggml_backend_buffer_free(persist_buf); ggml_free(ctx); } return 0; }
+        { set_last_error("Gemma4 MoE batched decode: graph compute failed."); if (can_persist) { tsg::graph_budget_free_buffer(persist_buf); ggml_free(ctx); } return 0; }
 
         finalize_compute_with_download(logits_out, logits_data, static_cast<std::size_t>(vocab_size) * n_seqs * sizeof(float));
         // Unconditional: logits_data is the caller's host buffer and on Metal

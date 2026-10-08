@@ -1443,7 +1443,7 @@ namespace
             : alloc_graph_reuse_gallocr(graph);
         if (!graph_allocated)
         {
-            backend_buffer.value = ggml_backend_alloc_ctx_tensors(ctx, g_backend);
+            backend_buffer.value = graph_budget_alloc_ctx_tensors(ctx, g_backend, g_active_rank);
             if (backend_buffer.value == nullptr)
             {
                 set_last_error("MoE prefill: failed to allocate backend buffer for graph tensors.");

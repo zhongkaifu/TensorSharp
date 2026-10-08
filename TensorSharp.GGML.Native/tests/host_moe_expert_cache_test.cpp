@@ -3,6 +3,7 @@
 // The optional expert tier against an independent full-resident CUDA graph.
 #include "ggml_ops_internal.h"
 #include "ggml_ops_precision_policy.h"
+#include "ggml_ops_shared_cache_budget.h"
 #include "ggml-impl.h"
 #ifdef TSG_GGML_USE_CUDA
 #include "ggml-cuda.h"
@@ -10,6 +11,7 @@
 #include <array>
 #include <cstdio>
 #include <cstdlib>
+#include <map>
 #include <stdexcept>
 
 extern "C" int TSGgml_HostMoeExpertCacheStats(std::int64_t*, std::int64_t*,
@@ -25,6 +27,11 @@ namespace tsg
     std::atomic<bool> g_backend_compute_failed{false};
     std::uint64_t g_test_prefetch_calls = 0;
     void set_last_error(const std::string& message) { std::fprintf(stderr, "%s\n", message.c_str()); }
+    // Expert tensors in this fixture have no registered dense-Qwen precision
+    // policy. Keep their ordinary unchanged ggml CUDA dispatch.
+    ggml_backend_t q8_f32_execution_backend(ggml_backend_t backend, ggml_cgraph*) { return backend; }
+    void host_moe_expert_cache_test_fail_next(int stage);
+    std::size_t host_moe_expert_cache_test_physical_bytes();
 #ifdef TSG_GGML_USE_CUDA
     void host_pin_split(const void*, std::size_t bytes,
         std::vector<std::pair<std::size_t, std::size_t>>& pieces)
@@ -81,6 +88,83 @@ namespace
     };
 
     constexpr int hidden = 256, ff = 256, experts = 16, used = 2;
+
+    struct SharedLedger
+    {
+        struct Allocation { std::int64_t bytes; bool committed = false; };
+        std::int64_t capacity = 2 << 20, pending = 0, committed = 0;
+        std::uint64_t next = 0, reserve_calls = 0, commit_calls = 0, release_calls = 0;
+        bool fail_commit = false, valid = true, attached = false;
+        std::map<std::uint64_t, Allocation> allocations;
+
+        ~SharedLedger()
+        {
+            // Keep callback context alive during exception unwinding too.
+            if (attached)
+            {
+                tsg::host_moe_expert_cache_release();
+                tsg::SharedCacheCharge::detach(this);
+            }
+        }
+
+        static std::uint64_t reserve(void* context, int rank, int kind, std::int64_t bytes)
+        {
+            auto& l = *static_cast<SharedLedger*>(context);
+            ++l.reserve_calls;
+            if (rank != 0 || kind != 1 || bytes <= 0) { l.valid = false; return 0; }
+            if (bytes > l.capacity - l.pending - l.committed) return 0;
+            const auto token = ++l.next;
+            l.allocations.emplace(token, Allocation{bytes});
+            l.pending += bytes;
+            return token;
+        }
+        static int commit(void* context, std::uint64_t token)
+        {
+            auto& l = *static_cast<SharedLedger*>(context);
+            ++l.commit_calls;
+            auto found = l.allocations.find(token);
+            if (found == l.allocations.end() || found->second.committed
+                || tsg::host_moe_expert_cache_test_physical_bytes() == 0) { l.valid = false; return 0; }
+            if (l.fail_commit) return 0;
+            auto& allocation = found->second;
+            l.pending -= allocation.bytes;
+            l.committed += allocation.bytes;
+            allocation.committed = true;
+            return 1;
+        }
+        static void release(void* context, std::uint64_t token)
+        {
+            auto& l = *static_cast<SharedLedger*>(context);
+            ++l.release_calls;
+            auto found = l.allocations.find(token);
+            // These ownership fixtures keep one cache entry alive at a time;
+            // the separate full-resident oracle is not charged to this cache.
+            if (found == l.allocations.end() || tsg::host_moe_expert_cache_test_physical_bytes() != 0)
+            { l.valid = false; return; }
+            auto& allocation = found->second;
+            (allocation.committed ? l.committed : l.pending) -= allocation.bytes;
+            l.allocations.erase(found);
+        }
+        bool attach()
+        {
+            const bool result = tsg::SharedCacheCharge::attach(this, reserve, commit, release);
+            if (result) attached = true;
+            return result;
+        }
+        bool detach()
+        {
+            if (!tsg::SharedCacheCharge::detach(this)) return false;
+            attached = false;
+            return true;
+        }
+        void check_empty()
+        {
+            require(valid && allocations.empty() && pending == 0 && committed == 0,
+                "Expert-cache shared credit escaped physical ownership or rollback");
+            require(tsg::host_moe_expert_cache_test_physical_bytes() == 0 && Stats().reserved == 0,
+                "Expert-cache rollback retained physical or private-accounted storage");
+        }
+    };
 
     struct Weights
     {
@@ -229,6 +313,68 @@ namespace
             return result;
         }
     };
+
+    void shared_budget_checks(Weights& weights)
+    {
+        using tsg::SharedCacheCharge;
+        SharedLedger ledger;
+        std::array<float, hidden> x{}, output{};
+        std::array<std::int32_t, used> ids{0, 1};
+        std::array<float, used> routes{0.6f, 0.4f};
+        auto call = [&] {
+            return tsg::host_moe_cached_experts(weights.segment, x.data(), ids.data(), routes.data(),
+                output.data(), "qwen4exp fused token span");
+        };
+        require(call() == 1 && Stats().reserved > 0, "Unconfigured expert cache did not engage");
+        require(!ledger.attach(), "Budget attach adopted an already-live uncharged expert graph");
+        tsg::host_moe_expert_cache_release();
+        require(ledger.attach(), "Could not attach budget after expert-cache physical teardown");
+
+        // Quota refusal must precede even the first native-allocation hook.
+        ledger.capacity = 0;
+        output.fill(-999.0f);
+        tsg::host_moe_expert_cache_test_fail_next(1);
+        require(call() == 0, "Shared quota refusal did not retain the normal fallback");
+        ledger.check_empty();
+        require(std::all_of(output.begin(), output.end(), [](float value) { return value == -999.0f; }),
+            "Refused expert-cache creation overwrote caller output");
+        ledger.capacity = 2 << 20;
+        require(call() == 0, "Denied quota consumed the later allocation-failure hook");
+        ledger.check_empty();
+
+        for (int stage : {1, 2, 3})
+        {
+            tsg::host_moe_expert_cache_test_fail_next(stage);
+            require(call() == 0, "Injected expert-cache allocation/publication failure was ignored");
+            ledger.check_empty();
+        }
+        ledger.fail_commit = true;
+        require(call() == 0, "Refused shared commit published an expert-cache entry");
+        ledger.check_empty();
+        ledger.fail_commit = false;
+
+        require(call() == 1, "Budgeted expert cache did not recover after allocation rollback");
+        const auto initial = Stats();
+        require(ledger.valid && ledger.pending == 0 && ledger.committed >= initial.reserved,
+            "Committed expert graph is not covered by shared device credit");
+        require(!ledger.detach(), "Detached callbacks with a live expert graph");
+        const auto reservations = ledger.reserve_calls;
+        const auto commits = ledger.commit_calls;
+        require(call() == 1 && ledger.reserve_calls == reservations && ledger.commit_calls == commits,
+            "Warm expert reuse acquired duplicate shared reservations");
+        const auto exact_bytes = ledger.committed;
+        tsg::host_moe_expert_cache_on_drop(weights.segment.gate_data);
+        ledger.check_empty();
+        ledger.capacity = exact_bytes - 1;
+        require(call() == 0, "Expert-cache graph exceeded shared capacity by one byte");
+        ledger.check_empty();
+        ledger.capacity = exact_bytes;
+        require(call() == 1, "Budgeted expert graph failed to reload after invalidation");
+        tsg::host_moe_expert_cache_release();
+        ledger.check_empty();
+        require(ledger.detach(), "Cannot detach after all expert-cache buffers were freed");
+        std::puts("PASS: expert shared quota, reserve-before-allocation, rollback, commit, reuse, invalidation and physical-free order");
+    }
 
     void cuda_checks(Weights& weights)
     {
@@ -452,6 +598,7 @@ int main(int argc, char** argv)
             }
             g_backend = ggml_backend_cuda_init(0);
             require(g_backend != nullptr, "Could not initialize CUDA backend");
+            shared_budget_checks(weights);
             cuda_checks(weights);
             require(prefetch == (tsg::g_test_prefetch_calls > 0),
                 "Opt-in raw expert prefetch did not match its requested mode");
@@ -465,6 +612,8 @@ int main(int argc, char** argv)
 #endif
         g_backend = ggml_backend_cpu_init();
         require(g_backend != nullptr, "Could not initialize CPU backend");
+        SharedLedger ledger;
+        require(ledger.attach(), "Could not attach the CPU fallback budget fixture");
         fallback_checks(weights);
         std::array<float, hidden> x{}, out{};
         std::array<std::int32_t, used> ids{0, 1};
@@ -473,6 +622,9 @@ int main(int argc, char** argv)
             "qwen4exp fused token span") == 0, "CPU backend incorrectly engaged the CUDA expert cache");
         require(Stats().reserved == 0 && Stats().calls == 0, "Fallback path allocated CUDA cache state");
         tsg::host_moe_expert_cache_release();
+        ledger.check_empty();
+        require(ledger.reserve_calls == 0 && ledger.detach(),
+            "CPU fallback touched shared CUDA expert credit or prevented detach");
         ggml_backend_free(g_backend);
         g_backend = nullptr;
         std::puts("PASS: disabled/non-CUDA and unsupported expert-cache shapes fall back");

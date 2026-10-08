@@ -11,5 +11,5 @@ tsg_q8_resident_layout tsg_q8_resident_sizes(int device, int inner, int rows, in
 int tsg_q8_resident_output_rows(int rows);
 void tsg_q8_resident_launch(int device, const void* weights, const float* input, float* output,
     void* scratch, std::size_t scratch_bytes, int inner, int rows, int columns,
-    int logical_columns, std::int64_t logical_rows, void* stream);
+    int logical_columns, std::int64_t logical_rows, void* stream, bool input_quantized = false);
 #endif

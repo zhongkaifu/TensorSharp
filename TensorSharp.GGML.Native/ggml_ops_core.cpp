@@ -1787,7 +1787,7 @@ namespace tsg
             std::lock_guard<std::mutex> lock(slot.mutex);
             if (slot.buf != nullptr)
             {
-                ggml_backend_buffer_free(slot.buf);
+                graph_budget_free_buffer(slot.buf);
                 slot.buf = nullptr;
             }
             slot.size = 0;
@@ -1806,7 +1806,7 @@ namespace tsg
                 std::lock_guard<std::mutex> lock(slot.mutex);
                 if (slot.gallocr != nullptr)
                 {
-                    ggml_gallocr_free(slot.gallocr);
+                    graph_budget_gallocr_free(slot.gallocr);
                     slot.gallocr = nullptr;
                 }
                 slot.backend = nullptr;
@@ -1848,13 +1848,13 @@ namespace tsg
         }
         if (slot.gallocr == nullptr)
         {
-            slot.gallocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(g_backend));
+            slot.gallocr = graph_budget_gallocr_new(ggml_backend_get_default_buffer_type(g_backend), g_active_rank);
             if (slot.gallocr == nullptr)
                 return false;
         }
         // ggml_gallocr_alloc_graph reuses the existing buffer when the new graph
         // fits and grows (reallocates) it only when a larger graph appears.
-        bool ok = ggml_gallocr_alloc_graph(slot.gallocr, graph);
+        bool ok = graph_budget_gallocr_alloc_graph(slot.gallocr, graph);
         if (!ok)
         {
             // A FAILED alloc leaves the allocator POISONED, and because this one
@@ -1876,7 +1876,7 @@ namespace tsg
             // allocator; the next call builds a fresh one and re-reserves from
             // scratch. The failed reserve already freed the buffer this owned,
             // so nothing extra is lost by throwing away the bookkeeping.
-            ggml_gallocr_free(slot.gallocr);
+            graph_budget_gallocr_free(slot.gallocr);
             slot.gallocr = nullptr;
             return false;
         }
@@ -2011,8 +2011,8 @@ namespace tsg
                 if (alloc_size > max_size) alloc_size = max_size; // never exceed a single buffer
                 if (alloc_size < required_bytes) alloc_size = required_bytes;
                 if (g_reuse_compute_buf != nullptr)
-                    ggml_backend_buffer_free(g_reuse_compute_buf);
-                g_reuse_compute_buf = ggml_backend_buft_alloc_buffer(buft, alloc_size);
+                    graph_budget_free_buffer(g_reuse_compute_buf);
+                g_reuse_compute_buf = graph_budget_alloc_buffer(buft, alloc_size, g_active_rank);
                 if (g_reuse_compute_buf == nullptr)
                 {
                     g_reuse_compute_size = 0;
@@ -3197,6 +3197,15 @@ TSG_EXPORT void TSGgml_ClearHostBufferCache()
     // Drop any persistent whole-model graphs first: they bind weights resident by
     // GGUF pointer (shared via these caches), so freeing the caches below would leave
     // their captured graphs pointing at freed device memory.
+    // A solo Gemma decode has no per-sequence holder to retire its graph. Its
+    // owned activation buffer must be freed here as well, before the weights
+    // it captures and before a model's shared budget can detach.
+    TSGgml_Gemma4ReleaseVerifyTpGraphs();
+    TSGgml_Gemma4MoEReleaseVerifyTpGraphs();
+    TSGgml_Gemma4ResetDecodeCache();
+    TSGgml_Gemma4ResetBatchedDecodeCache();
+    TSGgml_Gemma4MoEResetDecodeCache();
+    TSGgml_Gemma4ResetMoEBatchedDecodeCache();
     TSGgml_WanResetForwardCache();
     TSGgml_Qwen35ResetDecodeCache();
     // A process-global host-weight eviction must retire every verify graph/TP
@@ -3838,6 +3847,18 @@ TSG_TEST_EXPORT int TSGgml_TestAbandonCachedWeight(void* key, void* host, int ty
         return 0;
     return buffer != nullptr && address != nullptr && tensor->buffer == nullptr && tensor->data == nullptr;
 }
+TSG_TEST_EXPORT void* TSGgml_TestGraphBudgetAllocate(int rank, int64_t bytes)
+{
+    if (rank < 0 || rank >= tsg::g_device_count.load() || bytes <= 0) return nullptr;
+    tsg::ScopedRank scoped(rank);
+    if (!ensure_backend()) return nullptr;
+    return tsg::graph_budget_alloc_buffer(ggml_backend_get_default_buffer_type(g_backend),
+        static_cast<std::size_t>(bytes), rank);
+}
+TSG_TEST_EXPORT void TSGgml_TestGraphBudgetFree(void* buffer)
+{
+    tsg::graph_budget_free_buffer(static_cast<ggml_backend_buffer_t>(buffer));
+}
 #undef TSG_TEST_EXPORT
 #endif
 
@@ -3854,6 +3875,16 @@ TSG_EXPORT int TSGgml_AttachSharedCacheBudget(void* context,
 TSG_EXPORT int TSGgml_DetachSharedCacheBudget(void* context)
 {
     return tsg::SharedCacheCharge::detach(context) ? 1 : 0;
+}
+
+// New entry point preserves the old cache-only ABI and admission behavior.
+// Graph coverage is limited to TensorSharp's explicitly routed owned lifetimes.
+TSG_EXPORT int TSGgml_AttachSharedCacheBudgetEx(void* context,
+    tsg::SharedCacheCharge::Reserve reserve, tsg::SharedCacheCharge::Commit commit,
+    tsg::SharedCacheCharge::Release release, int include_graph_buffers)
+{
+    if (include_graph_buffers != 0 && include_graph_buffers != 1) return 0;
+    return tsg::SharedCacheCharge::attach(context, reserve, commit, release, include_graph_buffers != 0) ? 1 : 0;
 }
 
 // Cache payload accounting only: graph arenas, KV slots, backend pools and driver

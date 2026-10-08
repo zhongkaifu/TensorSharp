@@ -153,3 +153,17 @@ The optional snapshots pin native fusion-boundary tensors and synchronize
 streamed intermediates. They are diagnostic runs, not performance measurements.
 The JSON records diagnostic/fusion overrides and each returned Forward call,
 including a call whose subsequent strict comparison failed.
+
+Use `--read-ahead false` as the sequential control for the optional second host
+tile. With `true`, the executor reserves that tile only when the shared host
+budget has enough space; a tight or shared RAM/device pool keeps one buffer.
+`ReadAheadOperations` counts reads launched before consuming the previous tile.
+Pending reads drain before disposal/refund. This overlaps file reads with the
+current operation; CUDA transfers remain synchronous.
+
+The 2026-10-08 E4B short check with 16 MiB tiles, 128 MiB host and 256 MiB device
+quota executed 1,704 read-ahead operations and matched all eight full logit rows
+byte-for-byte. Peak charged host/device payload was 34,343,936 / 117,170,176 bytes,
+and logical file reads were 39,681,038,976 bytes. Concurrent native compilation
+makes its timings unsuitable for a speedup claim. Evidence remains ignored at
+`artifacts/unified-memory-adaptive/e4b-read-ahead-v5.json`.

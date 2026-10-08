@@ -132,6 +132,13 @@ namespace TensorSharp.Server
         public string? RawGenerationSuffix { get; init; }
 
         /// <summary>
+        /// Non-text control signal sent before generation when history or prompt tokens
+        /// were removed. Tool loops must stop referring to cached file-read bodies that
+        /// may no longer be visible to the model.
+        /// </summary>
+        public bool HistoryCompacted { get; init; }
+
+        /// <summary>
         /// Reasoning text decoded since the last update, already separated from
         /// <see cref="Piece"/>. Only meaningful when <see cref="IsParsed"/> is true.
         /// </summary>
@@ -420,6 +427,7 @@ namespace TensorSharp.Server
                 maxTokens,
                 preserveAttachedDocuments,
                 CountPromptTokens);
+            bool historyCompacted = window.RemovedMessages > 0;
             if (window.RemovedMessages > 0)
             {
                 renderHistory = window.History;
@@ -563,6 +571,7 @@ namespace TensorSharp.Server
                                         0, inputTokens.Count - unexpandedTokens.Count);
                                 }
                             }
+                            historyCompacted |= mediaWindow.RemovedMessages > 0;
                             _logger.LogWarning(LogEventIds.PromptTruncated,
                                 "prompt.multimodal_history_compacted from {OriginalTokens} to {KeptTokens} unexpanded tokens by removing {RemovedMessages} old messages after accounting for {MediaTokens} media-expansion tokens (contextLimit={ContextLimit}, sessionId={SessionId})",
                                 mediaWindow.OriginalPromptTokens,
@@ -581,12 +590,14 @@ namespace TensorSharp.Server
                     // removed while retaining explicit-cache mode.
                     RetainCacheBreakpointsInUnchangedPrefix(
                         unexpandedTokens, inputTokens, explicitBreakpoints);
+                    int tokensBeforeTrim = inputTokens.Count;
                     inputTokens = TruncatePromptToContext(
                         session, inputTokens, maxTokens, out effectiveMaxTokens, requestId,
                         preserveAllInput: true,
                         executionContextLimit: engineContextLimit,
                         explicitBreakpoints: explicitBreakpoints,
                         preservedInputKind: preserveAttachedDocuments ? "document and media input" : "media input");
+                    historyCompacted |= inputTokens.Count < tokensBeforeTrim;
 
                     // Where each image/audio span landed and what it is, after any trim:
                     // the engine compares these positionally when it reuses a prefix.
@@ -595,10 +606,12 @@ namespace TensorSharp.Server
             }
             else
             {
+                int tokensBeforeTrim = inputTokens.Count;
                 inputTokens = TruncatePromptToContext(
                     session, inputTokens, maxTokens, out effectiveMaxTokens, null,
                     preserveAllInput: preserveAttachedDocuments,
                     executionContextLimit: engineContextLimit, explicitBreakpoints: explicitBreakpoints);
+                historyCompacted |= inputTokens.Count < tokensBeforeTrim;
             }
 
             int promptTokenCount = inputTokens.Count;
@@ -635,6 +648,8 @@ namespace TensorSharp.Server
                 publicCheckpointBoundaries: publicCheckpointBoundaries);
 
             string recordedSuffix = RecordedGenerationSuffix(model.Tokenizer, inputTokens, arch, enableThinking);
+            if (historyCompacted)
+                yield return ChatStreamUpdate.Text(string.Empty) with { HistoryCompacted = true };
             if (SignalsOpenThoughtChannel(arch, recordedSuffix))
                 yield return ChatStreamUpdate.Text(string.Empty) with { RawGenerationSuffix = recordedSuffix };
 

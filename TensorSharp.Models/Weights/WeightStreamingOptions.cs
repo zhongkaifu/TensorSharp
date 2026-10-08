@@ -16,6 +16,10 @@ public sealed class WeightStreamingOptions
 {
     public WeightStreamingOptions(MemoryBudget budget, string hostPool,
         IEnumerable<string> devicePools, int tileBytes = 1 << 20, int tokenTileRows = 32)
+        : this(budget, hostPool, devicePools, tileBytes, tokenTileRows, readAhead: true) { }
+
+    public WeightStreamingOptions(MemoryBudget budget, string hostPool,
+        IEnumerable<string> devicePools, int tileBytes, int tokenTileRows, bool readAhead)
     {
         Budget = budget ?? throw new ArgumentNullException(nameof(budget));
         ArgumentException.ThrowIfNullOrWhiteSpace(hostPool);
@@ -33,6 +37,7 @@ public sealed class WeightStreamingOptions
         DevicePools = Array.AsReadOnly(pools);
         TileBytes = tileBytes;
         TokenTileRows = tokenTileRows;
+        ReadAhead = readAhead;
     }
 
     public MemoryBudget Budget { get; }
@@ -45,10 +50,17 @@ public sealed class WeightStreamingOptions
     /// may reduce it to fit shared capacity. Resident-compatible matrix arithmetic
     /// can additionally require a charged device workspace for the full logical N.</summary>
     public int TokenTileRows { get; }
+    /// <summary>When shared RAM permits a second charged tile plus output staging,
+    /// start the next file read before computing the current tile. A smaller budget
+    /// retains one-buffer execution. This does not imply asynchronous CUDA copies.</summary>
+    public bool ReadAhead { get; }
 }
 
 /// <summary>Payload and I/O counters, not process RSS or total CUDA consumption.</summary>
 public readonly record struct WeightStreamingStatistics(long FileBackedWeightBytes,
     long FileBytesRead, long LinearTiles, long EmbeddingRows, long PeakHostStagingBytes,
     long PeakDeviceWorkspaceBytes, long DeviceSessionCreations = 0, long InputUploads = 0,
-    long CompleteMatrixProjections = 0);
+    long CompleteMatrixProjections = 0)
+{
+    public long ReadAheadOperations { get; init; }
+}

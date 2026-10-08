@@ -263,6 +263,7 @@ endif()
 set(TSG_GGMLOPS_SOURCES
     bonsai_quant.cpp
     ggml_ops_core.cpp
+    ggml_ops_graph_budget.cpp
     ggml_ops_graph_optimize.cpp
     ggml_ops_bonsai.cpp
     ggml_ops_attention_alloc.cpp
@@ -492,6 +493,12 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
     target_link_libraries(GgmlOpsSharedCacheBudgetTest PRIVATE Threads::Threads)
     add_test(NAME shared-cache-budget-lifetime COMMAND GgmlOpsSharedCacheBudgetTest)
     set_tests_properties(shared-cache-budget-lifetime PROPERTIES TIMEOUT 30)
+    add_executable(GgmlOpsGraphBudgetTest tests/graph_budget_test.cpp ggml_ops_graph_budget.cpp)
+    target_include_directories(GgmlOpsGraphBudgetTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/src")
+    target_link_libraries(GgmlOpsGraphBudgetTest PRIVATE ggml-cpu ggml-base Threads::Threads)
+    add_test(NAME graph-buffer-budget-lifetime COMMAND GgmlOpsGraphBudgetTest)
+    set_tests_properties(graph-buffer-budget-lifetime PROPERTIES TIMEOUT 30)
     if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
         set_property(SOURCE ggml_ops_core.cpp APPEND PROPERTY COMPILE_DEFINITIONS TSG_GGML_TEST_HOOKS)
         add_executable(GgmlOpsCacheMemoryIntegrationTest tests/cache_memory_integration_test.cpp)
@@ -639,6 +646,7 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
 
     add_executable(GgmlOpsHostMoeExpertCacheTest
         tests/host_moe_expert_cache_test.cpp ggml_ops_host_moe_cache.cpp)
+    target_compile_definitions(GgmlOpsHostMoeExpertCacheTest PRIVATE TSG_GGML_TEST_HOOKS)
     target_include_directories(GgmlOpsHostMoeExpertCacheTest PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/src")
     target_link_libraries(GgmlOpsHostMoeExpertCacheTest PRIVATE ggml-cpu ggml-base)
@@ -881,6 +889,10 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
     if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
         add_test(NAME moe-fused-bias-alias-cuda COMMAND GgmlOpsMoeFusedBiasAliasTest cuda)
         set_tests_properties(moe-fused-bias-alias-cuda PROPERTIES SKIP_RETURN_CODE 77)
+        add_executable(GgmlOpsMoeStreamBudgetTest tests/moe_stream_budget_test.cpp)
+        target_link_libraries(GgmlOpsMoeStreamBudgetTest PRIVATE GgmlOps)
+        add_test(NAME moe-stream-shared-budget-cuda COMMAND GgmlOpsMoeStreamBudgetTest)
+        set_tests_properties(moe-stream-shared-budget-cuda PROPERTIES SKIP_RETURN_CODE 77)
     endif()
     if (APPLE AND TENSORSHARP_GGML_NATIVE_ENABLE_METAL)
         add_test(NAME moe-fused-bias-alias-metal COMMAND GgmlOpsMoeFusedBiasAliasTest metal)

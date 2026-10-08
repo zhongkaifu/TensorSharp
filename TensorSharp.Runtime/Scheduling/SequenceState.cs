@@ -157,11 +157,21 @@ namespace TensorSharp.Runtime.Scheduling
         /// <c>new TokenSampler()</c> allocations (~3 MB LOH at 262K vocab).
         /// Lazily initialized from <see cref="SamplingConfig"/>.</summary>
         internal TokenSampler? CachedSampler { get; private set; }
+        private IReadOnlyList<int>? _modelSuppressedTokens;
+
+        internal void BindGenerationVocabulary(ITokenizer? tokenizer)
+        {
+            var suppressed = tokenizer?.SuppressedTokenIds;
+            if (ReferenceEquals(_modelSuppressedTokens, suppressed)) return;
+            _modelSuppressedTokens = suppressed;
+            CachedSampler = null;
+            PendingDeviceToken = null;
+        }
 
         internal TokenSampler GetOrCreateSampler()
         {
             if (CachedSampler == null)
-                CachedSampler = new TokenSampler(SamplingConfig);
+                CachedSampler = new TokenSampler(SamplingConfig, _modelSuppressedTokens);
             return CachedSampler;
         }
 

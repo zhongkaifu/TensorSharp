@@ -34,6 +34,7 @@
     <ReferenceNativeSymbol Include="TSGgml_AlignedAlloc" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_AlignedFree" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_AttachSharedCacheBudget" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_AttachSharedCacheBudgetEx" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_AttentionSoftmaxWithSinksF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_BinaryScalarF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_BinaryTensorF32" SymbolType="Function" />

@@ -20,6 +20,7 @@ namespace TensorSharp.Runtime
     {
         private readonly SamplingConfig _config;
         private readonly Random _rng;
+        private readonly HashSet<int> _suppressedTokens;
         private float[]? _scoreBuffer;
         private int[]? _indexBuffer;
         // Reused top-k heap. Sized k (typically 20-40), so this is only about
@@ -38,10 +39,14 @@ namespace TensorSharp.Runtime
         private bool _channelOpen;
         private int _channelStart;
 
-        public TokenSampler(SamplingConfig config)
+        public TokenSampler(SamplingConfig config) : this(config, null) { }
+
+        /// <summary>Create a sampler that always respects the model's generation exclusions.</summary>
+        public TokenSampler(SamplingConfig config, IReadOnlyList<int>? suppressedTokenIds)
         {
             _config = config ?? SamplingConfig.Default;
             _rng = config?.Seed >= 0 ? new Random(config.Seed) : new Random();
+            _suppressedTokens = suppressedTokenIds == null ? new HashSet<int>() : new HashSet<int>(suppressedTokenIds);
         }
 
         /// <summary>
@@ -58,16 +63,19 @@ namespace TensorSharp.Runtime
         /// ordinary greedy decoding need not materialize host logits.</summary>
         internal bool IsPlainGreedyArgmax =>
             _config.Temperature <= 0f && _config.Grammar == null && !HasPenalties()
-            && _config.ThinkingBudget?.SuppressUnopenedEnd != true;
+            && _config.ThinkingBudget?.SuppressUnopenedEnd != true && _suppressedTokens.Count == 0;
 
         public int Sample(float[] logits, IList<int>? generatedTokenIds = null)
         {
             int vocabSize = logits.Length;
+            ApplyModelSuppression(logits);
 
             if (TryGetForcedThinkingToken(generatedTokenIds, out int thinkingEnd))
             {
                 if (thinkingEnd >= vocabSize)
                     throw new InvalidOperationException("Thinking end token is outside the model vocabulary.");
+                if (_suppressedTokens.Contains(thinkingEnd))
+                    throw new InvalidOperationException("The requested thinking token is suppressed by the model.");
                 return thinkingEnd;
             }
 
@@ -100,12 +108,16 @@ namespace TensorSharp.Runtime
                 int best = -1;
                 foreach (int id in allow)
                 {
-                    if (id < 0 || id >= vocabSize) continue;
+                    if (id < 0 || id >= vocabSize || float.IsNegativeInfinity(logits[id])) continue;
                     if (best < 0 || logits[id] > logits[best]) best = id;
                 }
                 if (best >= 0)
-                    return best;
+                    return ValidateSelectedToken(best, logits);
+                throw new InvalidOperationException("No first-token candidate remains after model and grammar constraints.");
             }
+
+            if (_suppressedTokens.Count > 0 && !Array.Exists(logits, value => value > float.NegativeInfinity))
+                throw new InvalidOperationException("No generation token remains after model and grammar constraints.");
 
             // Greedy (temperature <= 0) reduces to an argmax over the penalized
             // logits — top-k / top-p / min-p are never applied on this branch.
@@ -120,7 +132,7 @@ namespace TensorSharp.Runtime
             {
                 bool hasHistory = generatedTokenIds != null && generatedTokenIds.Count > 0;
                 if (!HasPenalties() || !hasHistory)
-                    return Argmax(logits);
+                    return ValidateSelectedToken(Argmax(logits), logits);
                 return ArgmaxWithPenaltiesInPlace(logits, generatedTokenIds!);
             }
 
@@ -142,7 +154,18 @@ namespace TensorSharp.Runtime
             candidates = ApplyMinP(scores, candidates);
             ApplyTemperature(scores, candidates, _config.Temperature);
 
-            return SampleFromCandidates(scores, candidates);
+            return ValidateSelectedToken(SampleFromCandidates(scores, candidates), scores);
+        }
+
+        private int ValidateSelectedToken(int token, float[] scores)
+        {
+            // Penalties or temperature can overflow an otherwise finite legal
+            // score to -inf after the initial mask check. An all-masked argmax
+            // or probability fallback must never reintroduce a forbidden id.
+            if (_suppressedTokens.Count > 0 && ((uint)token >= (uint)scores.Length
+                || _suppressedTokens.Contains(token) || !(scores[token] > float.NegativeInfinity)))
+                throw new InvalidOperationException("No legal generation token remains after sampling transformations.");
+            return token;
         }
 
         /// <summary>
@@ -188,7 +211,16 @@ namespace TensorSharp.Runtime
             for (int i = 0; intact && i < written; i++)
                 intact = tokens![(int)closingFrom + i] == text[i];
             token = intact ? text[(int)written] : budget.EndTokenId;
+            if (_suppressedTokens.Contains(token))
+                throw new InvalidOperationException("The requested thinking token is suppressed by the model.");
             return true;
+        }
+
+        /// <summary>Also applied to speculative draft logits before their argmax.</summary>
+        internal void ApplyModelSuppression(float[] logits)
+        {
+            foreach (int id in _suppressedTokens)
+                if ((uint)id < (uint)logits.Length) logits[id] = float.NegativeInfinity;
         }
 
         /// <summary>Request a normal sampled closing token after a detected
@@ -259,7 +291,7 @@ namespace TensorSharp.Runtime
             // not allocate a dictionary on every decoded token.
             var counts = CollectPenaltyCounts(logits.Length, generatedTokenIds, null);
             if (counts.Count == 0)
-                return Argmax(logits);
+                return ValidateSelectedToken(Argmax(logits), logits);
 
             float repPenalty = _config.RepetitionPenalty > 0f ? _config.RepetitionPenalty : 1.0f;
             float presPenalty = _config.PresencePenalty;
@@ -288,12 +320,17 @@ namespace TensorSharp.Runtime
                 logits[tokenId] = v;
             }
 
-            int best = Argmax(logits);
-
-            for (int i = 0; i < si; i++)
-                logits[tokenBuffer[i]] = originalBuffer[i];
-
-            return best;
+            try
+            {
+                // Check the penalized score before restoring it. Validation can
+                // throw, but the caller's legal logits must still be restored.
+                return ValidateSelectedToken(Argmax(logits), logits);
+            }
+            finally
+            {
+                for (int i = 0; i < si; i++)
+                    logits[tokenBuffer[i]] = originalBuffer[i];
+            }
         }
 
         /// <summary>

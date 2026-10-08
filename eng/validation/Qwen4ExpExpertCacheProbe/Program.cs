@@ -2,8 +2,12 @@
 // Licensed under the BSD-3-Clause license in the repository root.
 using System.Diagnostics;
 using System.Security.Cryptography;
+using System.Runtime.InteropServices;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using InferenceWeb.Tests;
+using TensorSharp.GGML;
+using TensorSharp.Memory;
 using TensorSharp.Models;
 using TensorSharp.Runtime;
 
@@ -52,6 +56,104 @@ foreach (string name in TensorSharp.Runtime.Speculative.SpeculationEnvVars.Remov
 Environment.SetEnvironmentVariable("MAX_CONTEXT", Value("max-context", Math.Max(256, prefill + decode + 16).ToString()));
 KvCacheDtypeConfig.Set(KvCacheDtype.F16);
 string modelPath = synthetic ? Path.Combine(Path.GetDirectoryName(output)!, "fixture.gguf") : Path.GetFullPath(options["model"]);
+long? deviceBudgetBytes = options.TryGetValue("device-budget-bytes", out string? budgetText)
+    ? long.Parse(budgetText, System.Globalization.CultureInfo.InvariantCulture) : null;
+if (deviceBudgetBytes.HasValue && (deviceBudgetBytes.Value <= 0 || backend != BackendType.GgmlCuda))
+    throw new ArgumentException("--device-budget-bytes requires a positive capacity and ggml_cuda.");
+MemoryBudget? sharedBudget = null;
+GgmlCacheBudgetScope? cacheScope = null;
+ModelBase? model = null;
+object? completedReport = null;
+string? failure = null;
+string? observedNativePath = null;
+string? observedNativeHash = null;
+var cleanupErrors = new List<string>();
+var budgetObservations = new List<object>();
+var rowCaptures = new List<object>();
+FileStream? logitsStream = null;
+string? logitsPath = null;
+string? logitsIndexPath = null;
+string[] benchmarkEnvironmentNames = ["CUDA_VISIBLE_DEVICES", "NVIDIA_TF32_OVERRIDE", "MAX_CONTEXT", "OMP_NUM_THREADS",
+    "TENSORSHARP_TP_DEGREE", "TS_CPU_MOE", "TS_N_CPU_MOE", "TS_CPU_MOE_THREADS", "TS_GGML_CPU_THREADS",
+    "TS_HOST_MOE_DEVICE_MIN_BATCH", "TS_HOST_MOE_EXPERT_CACHE_MB", "TS_HOST_MOE_EXPERT_CACHE_LAYERS",
+    "TS_HOST_MOE_EXPERT_CACHE_DIAGNOSTICS", "TS_HOST_MOE_EXPERT_CACHE_PREFETCH", "TS_HOST_MOE_EXPERT_CACHE_BRIDGE",
+    "TS_HOST_MOE_EXPERT_CACHE_OUTPUT_BRIDGE", "TS_HOST_MOE_PIN", "TS_HOST_MOE_PIN_MAX_MB", "TS_HOST_MOE_TIMING",
+    "TS_HOST_MOE_DEBUG", "TS_HOST_MOE_VERIFY", "TS_HOST_MOE_EXPERT_FILTER", "GGML_CUDA_ALLREDUCE", "NCCL_P2P_DISABLE",
+    "TS_GGML_MEMORY_BUDGET", "TS_GGML_MEMORY_BUDGET_MB"];
+bool modelDisposed = false, cacheCleared = false, reuseReleased = false, scopeDetached = false, shutdown = false;
+void CaptureLogits(float[] logits, string stage, int iteration, IReadOnlyList<int> history)
+{
+    if (logitsStream == null) return;
+    if (logits.Length == 0 || logits.Any(value => !float.IsFinite(value)))
+        throw new InvalidOperationException($"Empty/nonfinite logits at {stage}, iteration {iteration}.");
+    var bytes = MemoryMarshal.AsBytes(logits.AsSpan());
+    long offset = logitsStream.Position;
+    logitsStream.Write(bytes);
+    logitsStream.Flush();
+    rowCaptures.Add(new { stage, iteration, warmup = iteration < 0, input_tokens = history.ToArray(),
+        byte_offset = offset, elements = logits.Length, sha256 = Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant(),
+        argmax = Enumerable.Range(0, logits.Length).MaxBy(index => logits[index]) });
+    File.WriteAllText(logitsIndexPath!, JsonSerializer.Serialize(new { format = "f32le", data_path = logitsPath,
+        rows = rowCaptures, limitations = "Diagnostic capture I/O is outside forward timers; this is not a quiet performance run." },
+        new JsonSerializerOptions { WriteIndented = true }) + Environment.NewLine);
+}
+void ObserveBudget(string stage)
+{
+    if (sharedBudget == null) return;
+    budgetObservations.Add(new { stage, pools = sharedBudget.Snapshot(), active_allocations = cacheScope?.ActiveAllocations,
+        callback_error = cacheScope?.CallbackError?.ToString() });
+}
+void WriteEvidence(bool complete)
+{
+    var node = completedReport == null ? new JsonObject() : JsonSerializer.SerializeToNode(completedReport)!.AsObject();
+    node["schema_version"] = 2;
+    node["passed"] = complete && failure == null && cleanupErrors.Count == 0;
+    node["run_complete"] = complete;
+    node["requested_options"] = JsonSerializer.SerializeToNode(options);
+    node["model_path"] = modelPath;
+    node["model_sha256"] = synthetic && File.Exists(modelPath) ? Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(modelPath))).ToLowerInvariant() : null;
+    node["native_path"] = observedNativePath;
+    node["native_sha256"] = observedNativeHash;
+    node["managed_assemblies_sha256"] = JsonSerializer.SerializeToNode(AppDomain.CurrentDomain.GetAssemblies()
+        .Where(a => a.GetName().Name?.StartsWith("TensorSharp", StringComparison.Ordinal) == true && !a.IsDynamic)
+        .Select(a => a.Location).Where(File.Exists).Distinct().OrderBy(path => path)
+        .ToDictionary(path => path, path => Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(path))).ToLowerInvariant()));
+    node["environment"] = JsonSerializer.SerializeToNode(benchmarkEnvironmentNames
+        .Where(name => Environment.GetEnvironmentVariable(name) != null)
+        .ToDictionary(name => name, Environment.GetEnvironmentVariable));
+    node["device_budget_bytes"] = deviceBudgetBytes;
+    node["budget_scope"] = deviceBudgetBytes.HasValue ? "rank0 cache, preload, and explicitly routed graph buffers; not all driver/host/KV allocations" : "disabled";
+    node["budget_observations"] = JsonSerializer.SerializeToNode(budgetObservations);
+    node["logit_captures"] = JsonSerializer.SerializeToNode(new { format = "f32le", data_path = logitsPath,
+        index_path = logitsIndexPath, rows = rowCaptures });
+    node["error"] = failure;
+    node["cleanup"] = JsonSerializer.SerializeToNode(new { model_disposed = modelDisposed, cache_cleared = cacheCleared,
+        reuse_released = reuseReleased, scope_detached = scopeDetached, native_shutdown = shutdown,
+        retained_model_owner = model != null, retained_scope_owner = cacheScope != null, errors = cleanupErrors });
+    File.WriteAllText(output, node.ToJsonString(new JsonSerializerOptions { WriteIndented = true }) + Environment.NewLine);
+}
+try
+{
+GgmlBasicOps.EnsureBackendAvailable(backend == BackendType.GgmlCuda ? GgmlBackendType.Cuda : GgmlBackendType.Cpu);
+observedNativePath = Qwen4ExpExpertCacheScenario.MappedNativePath();
+observedNativeHash = Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(observedNativePath))).ToLowerInvariant();
+if (options.TryGetValue("logits-dir", out string? captureDirectory))
+{
+    if (!BitConverter.IsLittleEndian) throw new PlatformNotSupportedException("Diagnostic capture requires little-endian float32.");
+    captureDirectory = Path.GetFullPath(captureDirectory);
+    Directory.CreateDirectory(captureDirectory);
+    logitsPath = Path.Combine(captureDirectory, "rows.f32");
+    logitsIndexPath = Path.Combine(captureDirectory, "rows.json");
+    if (File.Exists(logitsIndexPath)) throw new IOException("Logit index already exists; use a fresh capture directory.");
+    logitsStream = new FileStream(logitsPath, FileMode.CreateNew, FileAccess.Write, FileShare.Read);
+}
+if (deviceBudgetBytes.HasValue)
+{
+    sharedBudget = new MemoryBudget([new MemoryCharge("gpu0", deviceBudgetBytes.Value)]);
+    cacheScope = new GgmlCacheBudgetScope(sharedBudget, [["gpu0"]], includeGraphBuffers: true);
+    ObserveBudget("attached-before-model-load");
+}
+WriteEvidence(false);
 Dictionary<string, float[][]>? captures = null;
 if (synthetic)
 {
@@ -69,8 +171,9 @@ if (synthetic)
 MoeCpuOffloadConfig.Reset();
 if (host) MoeCpuOffloadConfig.SetAllLayers();
 var load = Stopwatch.StartNew();
-using var model = ModelBase.Create(modelPath, backend);
+model = ModelBase.Create(modelPath, backend);
 load.Stop();
+ObserveBudget("model-loaded");
 string nativePath = Qwen4ExpExpertCacheScenario.MappedNativePath();
 string nativeHash = Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(nativePath))).ToLowerInvariant();
 var managedAssemblies = AppDomain.CurrentDomain.GetAssemblies()
@@ -123,14 +226,24 @@ for (int i = -warmups; i < iterations; i++)
     var timer = Stopwatch.StartNew();
     float[] logits = model.ForwardRefill(prompt);
     timer.Stop();
+    ObserveBudget($"iteration-{i}-prefill-complete");
     double prefillMs = timer.Elapsed.TotalMilliseconds;
+    var inputHistory = new List<int>(prompt);
+    CaptureLogits(logits, "prefill", i, inputHistory);
     var generated = new List<int>();
     bool eos = false;
     int forwardSteps = 0;
     timer.Restart();
     if (generation == "teacher-forced")
     {
-        foreach (int token in forced) logits = model.Forward(new[] { token });
+        foreach (int token in forced)
+        {
+            logits = model.Forward(new[] { token });
+            timer.Stop();
+            inputHistory.Add(token);
+            CaptureLogits(logits, "decode", i, inputHistory);
+            timer.Start();
+        }
         forwardSteps = forced.Length;
     }
     else
@@ -141,10 +254,18 @@ for (int i = -warmups; i < iterations; i++)
             for (int j = 1; j < logits.Length; j++) if (logits[j] > logits[token]) token = j;
             generated.Add(token);
             if (model.Tokenizer.IsEos(token)) { eos = true; break; }
-            if (position + 1 < decode) { logits = model.Forward(new[] { token }); forwardSteps++; }
+            if (position + 1 < decode)
+            {
+                logits = model.Forward(new[] { token }); forwardSteps++;
+                timer.Stop();
+                inputHistory.Add(token);
+                CaptureLogits(logits, "decode", i, inputHistory);
+                timer.Start();
+            }
         }
     }
     timer.Stop();
+    ObserveBudget($"iteration-{i}-decode-complete");
     if (logits.Length == 0 || logits.Any(v => !float.IsFinite(v)))
         throw new InvalidOperationException("The benchmark returned empty or nonfinite final logits.");
     byte[] bytes = new byte[logits.Length * sizeof(float)];
@@ -177,7 +298,7 @@ if (backend == BackendType.GgmlCuda)
 }
 using var process = Process.GetCurrentProcess();
 process.Refresh();
-var report = new
+completedReport = new
 {
     schema_version = 1,
     passed = true,
@@ -216,5 +337,47 @@ var report = new
         "The cache is opt-in; eligible bias-free SiLU expert paths with one through eight rows engage it."
     }
 };
-File.WriteAllText(output, JsonSerializer.Serialize(report, new JsonSerializerOptions { WriteIndented = true }) + Environment.NewLine);
+}
+catch (Exception error)
+{
+    failure = error.ToString();
+    Console.Error.WriteLine(failure);
+    ObserveBudget("operation-failed-before-cleanup");
+}
+finally
+{
+    try { logitsStream?.Dispose(); logitsStream = null; }
+    catch (Exception error) { cleanupErrors.Add("logit capture.Dispose: " + error); }
+    // Preserve both physical owners and callback roots if a cleanup step fails.
+    // A failed scope detach must not turn into a successful zero-budget result.
+    try { model?.Dispose(); model = null; modelDisposed = true; }
+    catch (Exception error) { cleanupErrors.Add("model.Dispose: " + error); }
+    if (modelDisposed)
+    {
+        try { GgmlBasicOps.ClearHostBufferCache(); cacheCleared = true; }
+        catch (Exception error) { cleanupErrors.Add("ClearHostBufferCache: " + error); }
+        try { GgmlBasicOps.ReleaseReuseComputeBuffers(); reuseReleased = true; }
+        catch (Exception error) { cleanupErrors.Add("ReleaseReuseComputeBuffers: " + error); }
+    }
+    ObserveBudget("after-physical-cleanup-before-detach");
+    if (cacheScope != null)
+    {
+        if (cacheScope.CallbackError != null) cleanupErrors.Add("budget callback: " + cacheScope.CallbackError);
+        if (cacheScope.ActiveAllocations != 0 || sharedBudget!.Snapshot().Any(pool => pool.Reserved != 0 || pool.Committed != 0))
+            cleanupErrors.Add("Covered native allocations retain budget credit after physical cleanup.");
+        else if (cleanupErrors.Count == 0)
+        {
+            try { cacheScope.Dispose(); cacheScope = null; scopeDetached = true; }
+            catch (Exception error) { cleanupErrors.Add("budget scope.Dispose: " + error); }
+        }
+    }
+    WriteEvidence(false); // Keep ownership evidence even if a native shutdown aborts.
+    if (cleanupErrors.Count == 0 && cacheScope == null)
+    {
+        try { GgmlBasicOps.Shutdown(); shutdown = true; }
+        catch (Exception error) { cleanupErrors.Add("native Shutdown: " + error); }
+    }
+    WriteEvidence(true);
+}
 Console.WriteLine("report=" + output);
+Environment.ExitCode = failure == null && cleanupErrors.Count == 0 ? 0 : 1;

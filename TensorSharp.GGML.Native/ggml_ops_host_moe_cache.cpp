@@ -6,6 +6,7 @@
 // compute the complete routed FFN. No CPU/GPU partial-sum split is involved.
 #include "ggml_ops_internal.h"
 #include "ggml_ops_precision_policy.h"
+#include "ggml_ops_shared_cache_budget.h"
 #include "ggml-impl.h"
 #ifdef TSG_GGML_USE_CUDA
 #include "ggml-cuda.h"
@@ -31,6 +32,15 @@ namespace tsg
         std::mutex g_cache_mutex;
         std::size_t g_reserved = 0;
         std::uint64_t g_hits = 0, g_misses = 0, g_calls = 0;
+#if defined(TSG_GGML_TEST_HOOKS)
+        std::atomic<int> g_test_failure_stage{0};
+        std::atomic<std::size_t> g_test_physical_bytes{0};
+        bool test_failure(int stage)
+        {
+            int expected = stage;
+            return g_test_failure_stage.compare_exchange_strong(expected, 0);
+        }
+#endif
 
         std::size_t read_positive_size(const char* name, std::size_t fallback)
         {
@@ -97,6 +107,13 @@ namespace tsg
             ggml_tensor* ids = nullptr;
             ggml_tensor* routes = nullptr;
             ggml_tensor* output = nullptr;
+            // The complete compact graph (weights, routing/activation payload,
+            // padding and the existing workspace allowance) is one kind-1 owner.
+            // This allocator deliberately does not use the kind-2 graph wrapper.
+            std::shared_ptr<SharedCacheCharge> shared_charge;
+#if defined(TSG_GGML_TEST_HOOKS)
+            std::size_t test_physical_bytes = 0;
+#endif
 
             ~CacheEntry()
             {
@@ -107,8 +124,16 @@ namespace tsg
                 {
                     sync_backend(backend);
                     ggml_gallocr_free(allocator);
+                    allocator = nullptr;
+#if defined(TSG_GGML_TEST_HOOKS)
+                    g_test_physical_bytes.fetch_sub(test_physical_bytes);
+                    test_physical_bytes = 0;
+#endif
                 }
                 if (ctx != nullptr) ggml_free(ctx);
+                // ggml's free is void/fatal on unrecoverable CUDA errors. Never
+                // refund before it returns, including allocation/commit rollback.
+                shared_charge.reset();
             }
 
             bool matches(const HostMoeSegment& hm, ggml_backend_t b) const
@@ -258,20 +283,38 @@ namespace tsg
             ggml_backend_dev_memory(ggml_backend_get_device(entry.backend), &free_bytes, &total_bytes);
             if (total_bytes == 0 || free_bytes <= kDeviceHeadroom
                 || entry.bytes > free_bytes - kDeviceHeadroom) return false;
+            entry.shared_charge = SharedCacheCharge::reserve(g_active_rank, 1, entry.bytes);
+            if (!entry.shared_charge) return false;
+#if defined(TSG_GGML_TEST_HOOKS)
+            if (test_failure(1)) return false;
+#endif
             // Size-only reservation above creates a valid allocation plan with
             // no backing buffers. alloc_graph alone sees the matching plan and
             // does not allocate them; explicitly materialize that reservation.
-            if (!ggml_gallocr_reserve(entry.allocator, entry.graph)
-                || !ggml_gallocr_alloc_graph(entry.allocator, entry.graph)) return false;
+            if (!ggml_gallocr_reserve(entry.allocator, entry.graph)) return false;
+#if defined(TSG_GGML_TEST_HOOKS)
+            entry.test_physical_bytes = ggml_gallocr_get_buffer_size(entry.allocator, 0);
+            g_test_physical_bytes.fetch_add(entry.test_physical_bytes);
+            if (test_failure(2)) return false;
+#endif
+            if (!ggml_gallocr_alloc_graph(entry.allocator, entry.graph)) return false;
             const std::size_t actual = ggml_gallocr_get_buffer_size(entry.allocator, 0);
             if (actual > entry.bytes - kWorkspaceAllowance) return false;
             entry.bytes = actual + kWorkspaceAllowance;
             // CUDA initializes each quantized tensor's over-read tail at alloc.
             // Clear its complete payload as well: unused slots must never hold
             // stale NaNs from a prior graph allocation.
+            const auto errors_before = g_ggml_error_count.load(std::memory_order_acquire);
             for (auto* w : entry.weight) ggml_backend_tensor_memset(w, 0, 0, ggml_nbytes(w));
             entry.expert_for_slot.assign(entry.capacity, -1);
             entry.last_used.assign(entry.capacity, 0);
+            sync_backend(entry.backend);
+            if (g_ggml_error_count.load(std::memory_order_acquire) != errors_before
+                || g_backend_compute_failed.load(std::memory_order_acquire)
+                || !entry.shared_charge->commit(entry.bytes)) return false;
+#if defined(TSG_GGML_TEST_HOOKS)
+            if (test_failure(3)) return false;
+#endif
             return true;
         }
 
@@ -362,16 +405,21 @@ namespace tsg
             if (!entry) return 0;
             while (g_reserved > budget - entry->bytes && !g_entries.empty())
             {
-                g_reserved -= g_entries.back()->bytes;
+                const auto retired_bytes = g_entries.back()->bytes;
                 g_entries.pop_back();
+                g_reserved -= retired_bytes;
             }
             if (g_reserved > budget - entry->bytes || !allocate_entry(*entry)) return 0;
-            g_reserved += entry->bytes;
+            const auto bytes = entry->bytes;
+            // A list-node allocation can throw. Publish before changing private
+            // accounting so unique_ptr rollback still owns every physical byte.
+            g_entries.push_front(std::move(entry));
+            g_reserved += bytes;
+            const auto& published = *g_entries.front();
             if (diagnostics()) std::fprintf(stderr,
                 "[HOSTMOE-CACHE] layer=%d slots=%d reserved=%zu budget=%zu graph=%zu workspace_allowance=%zu input_bridge=%s\n",
-                hm.layer, entry->capacity, g_reserved, budget,
-                entry->bytes - kWorkspaceAllowance, kWorkspaceAllowance, device_inputs ? "device" : "host");
-            g_entries.push_front(std::move(entry));
+                hm.layer, published.capacity, g_reserved, budget,
+                published.bytes - kWorkspaceAllowance, kWorkspaceAllowance, device_inputs ? "device" : "host");
         }
         else
         {
@@ -502,8 +550,9 @@ namespace tsg
             const auto& entry = **it;
             if (entry.source[0] == ptr || entry.source[1] == ptr || entry.source[2] == ptr)
             {
-                g_reserved -= entry.bytes;
+                const auto retired_bytes = entry.bytes;
                 it = g_entries.erase(it);
+                g_reserved -= retired_bytes;
             }
             else ++it;
         }
@@ -531,6 +580,12 @@ namespace tsg
         *misses = static_cast<std::int64_t>(g_misses);
         *calls = static_cast<std::int64_t>(g_calls);
     }
+
+#if defined(TSG_GGML_TEST_HOOKS)
+    // Linked only into the standalone cache fixture, never a production export.
+    void host_moe_expert_cache_test_fail_next(int stage) { g_test_failure_stage.store(stage); }
+    std::size_t host_moe_expert_cache_test_physical_bytes() { return g_test_physical_bytes.load(); }
+#endif
 }
 
 TSG_EXPORT int TSGgml_HostMoeExpertCacheStats(std::int64_t* reserved, std::int64_t* budget,

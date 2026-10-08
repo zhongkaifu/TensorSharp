@@ -11,8 +11,8 @@ using TensorSharp.Runtime;
 var options = new Dictionary<string, string>(StringComparer.Ordinal);
 for (int i = 0; i < args.Length; i += 2)
 {
-    if (i + 1 == args.Length || args[i] is not ("--model" or "--json" or "--steps" or "--prompt-tokens" or "--tile-bytes" or "--token-rows" or "--host-bytes" or "--device-bytes" or "--cycles" or "--prefill" or "--prefill-chunk"))
-        throw new ArgumentException("Use --model PATH --json PATH --steps 4 --prompt-tokens 32 --tile-bytes 1048576 --token-rows 32 --host-bytes 2097152 --device-bytes 2097152 [--prefill forward|refill] [--prefill-chunk TOKENS].");
+    if (i + 1 == args.Length || args[i] is not ("--model" or "--json" or "--steps" or "--prompt-tokens" or "--tile-bytes" or "--token-rows" or "--host-bytes" or "--device-bytes" or "--cycles" or "--prefill" or "--prefill-chunk" or "--read-ahead"))
+        throw new ArgumentException("Use --model PATH --json PATH --steps 4 --prompt-tokens 32 --tile-bytes 1048576 --token-rows 32 --host-bytes 2097152 --device-bytes 2097152 [--prefill forward|refill] [--prefill-chunk TOKENS] [--read-ahead true|false].");
     options.Add(args[i], args[i + 1]);
 }
 string modelPath = Path.GetFullPath(options["--model"]);
@@ -24,6 +24,7 @@ int tileBytes = int.Parse(options.GetValueOrDefault("--tile-bytes", "1048576"));
 int tokenRows = int.Parse(options.GetValueOrDefault("--token-rows", "32"));
 long hostBytes = long.Parse(options.GetValueOrDefault("--host-bytes", "2097152"));
 long deviceBytes = long.Parse(options.GetValueOrDefault("--device-bytes", "2097152"));
+bool readAhead = bool.Parse(options.GetValueOrDefault("--read-ahead", "true"));
 string prefillEntry = options.GetValueOrDefault("--prefill", "forward");
 if (steps is < 2 or > 32 || promptMinimum is < 1 or > 896 || cycles is < 1 or > 8
     || prefillEntry is not ("forward" or "refill"))
@@ -41,7 +42,7 @@ Environment.SetEnvironmentVariable("KV_CACHE_DTYPE", "f16");
 KvCacheDtypeConfig.ConfigureFromEnvironment();
 
 var budget = new MemoryBudget(new[] { new MemoryCharge("weights/host", hostBytes), new MemoryCharge("weights/gpu0", deviceBytes) });
-var streamingOptions = new WeightStreamingOptions(budget, "weights/host", new[] { "weights/gpu0" }, tileBytes, tokenRows);
+var streamingOptions = new WeightStreamingOptions(budget, "weights/host", new[] { "weights/gpu0" }, tileBytes, tokenRows, readAhead: readAhead);
 var cases = new List<Case>();
 var references = new List<float[][]>();
 var metrics = new List<object>();
@@ -286,7 +287,7 @@ File.WriteAllText(reportPath, JsonSerializer.Serialize(new {
     BackendSha256 = Hash(typeof(GgmlBasicOps).Assembly.Location), MemorySha256 = Hash(typeof(MemoryBudget).Assembly.Location),
     Gate = new { MaxRelativeL2 = 0.001, MinCosine = 0.999999, RequireIdenticalTop1 = true },
     Steps = steps, Cycles = cycles, CompletedCycles = cycleResults.Count, MinimumPromptTokens = promptMinimum, TileBytes = tileBytes, TokenRows = tokenRows,
-    HostBytes = hostBytes, DeviceBytes = deviceBytes, ExpectedFileBytes = expectedFileBytes,
+    HostBytes = hostBytes, DeviceBytes = deviceBytes, ReadAhead = readAhead, ExpectedFileBytes = expectedFileBytes,
     ResidentParameterBytes = residentParameterBytes, Cases = cases, Metrics = metrics, Usage = usage,
     CycleResults = cycleResults, TotalFileBytesRead = totalFileBytesRead, TotalLinearTiles = totalLinearTiles,
     ForwardTimings = forwardTimings, TotalForwardMilliseconds = totalForwardMilliseconds,

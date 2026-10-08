@@ -327,7 +327,7 @@ namespace
 
         BufferHandle buffer((g_backend_type == BACKEND_TYPE_METAL
                 ? alloc_ctx_tensors_with_attention_reuse(ctx, graph, g_backend)
-                : ggml_backend_alloc_ctx_tensors(ctx, g_backend)));
+                : tsg::alloc_ctx_tensors_budgeted(ctx, g_backend)));
         if (buffer.value == nullptr)
         {
             set_last_error("Failed to allocate backend buffer for Qwen3.5 attention layer decode.");
@@ -492,7 +492,7 @@ namespace
 
         void reset()
         {
-            if (buffer != nullptr) { ggml_backend_buffer_free(buffer); buffer = nullptr; }
+            if (buffer != nullptr) { tsg::graph_budget_free_buffer(buffer); buffer = nullptr; }
             if (ctx != nullptr) { ggml_free(ctx); ctx = nullptr; }
             graph = nullptr; valid = false;
             hidden_t = token_t = hidden_out = pos_tensor = kv_index = attn_mask = nullptr;
@@ -1990,7 +1990,7 @@ namespace
             vram_log_ctx_breakdown("q35-decode-persist", ctx, 12);
             persist_buf = (g_backend_type == BACKEND_TYPE_METAL
                 ? alloc_ctx_tensors_with_attention_reuse(ctx, graph, g_backend)
-                : ggml_backend_alloc_ctx_tensors(ctx, g_backend));
+                : tsg::alloc_ctx_tensors_budgeted(ctx, g_backend));
             if (persist_buf == nullptr)
             {
                 set_last_error("Qwen3.5 model decode: failed to allocate persist backend buffer.");
@@ -2016,7 +2016,7 @@ namespace
             // no in-place recurrent state) and keeps the reuse gallocr.
             buffer.value = (g_backend_type == BACKEND_TYPE_METAL
                 ? alloc_ctx_tensors_with_attention_reuse(ctx, graph, g_backend)
-                : ggml_backend_alloc_ctx_tensors(ctx, g_backend));
+                : tsg::alloc_ctx_tensors_budgeted(ctx, g_backend));
             if (buffer.value == nullptr)
             {
                 set_last_error("Qwen3.5 model decode: failed to allocate backend buffer.");
@@ -2121,7 +2121,7 @@ namespace
             if (!tp_plan_segments(slot->tp_plan, tp_boundary))
             {
                 slot->tp_plan.clear();
-                ggml_backend_buffer_free(persist_buf);
+                tsg::graph_budget_free_buffer(persist_buf);
                 ggml_free(ctx);
                 slot->ctx = nullptr; slot->buffer = nullptr; slot->graph = nullptr; slot->valid = false;
                 return 0;
@@ -2193,7 +2193,7 @@ namespace
                 set_last_error("Qwen3.5 model decode: graph execution failed.");
             if (persist)
             {
-                ggml_backend_buffer_free(persist_buf);
+                tsg::graph_budget_free_buffer(persist_buf);
                 ggml_free(ctx);
             }
             return 0;
@@ -2948,7 +2948,7 @@ namespace
         {
             buffer.value = (g_backend_type == BACKEND_TYPE_METAL
                 ? alloc_ctx_tensors_with_attention_reuse(ctx, graph, g_backend)
-                : ggml_backend_alloc_ctx_tensors(ctx, g_backend));
+                : tsg::alloc_ctx_tensors_budgeted(ctx, g_backend));
             if (buffer.value == nullptr)
             {
                 set_last_error("Qwen3.5 batched decode: failed to allocate backend buffer.");

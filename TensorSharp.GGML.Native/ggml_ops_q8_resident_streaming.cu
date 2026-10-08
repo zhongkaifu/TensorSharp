@@ -167,15 +167,17 @@ tsg_q8_resident_layout tsg_q8_resident_sizes(int device, int inner, int rows, in
 
 void tsg_q8_resident_launch(int device, const void* weights, const float* input, float* output,
         void* scratch, std::size_t scratch_bytes, int inner, int rows, int columns,
-        int logical_columns, std::int64_t logical_rows, void* stream_pointer) {
+        int logical_columns, std::int64_t logical_rows, void* stream_pointer, bool input_quantized) {
     const auto expected = tsg_q8_resident_sizes(device, inner, rows, columns, logical_columns, logical_rows);
     if (!scratch || scratch_bytes < expected.scratch_bytes) throw std::invalid_argument("Resident Q8 scratch is not fully reserved.");
     const int padded = (inner + 511) / 512 * 512, padded_rows = tsg_q8_resident_output_rows(rows);
     const auto stream = static_cast<cudaStream_t>(stream_pointer);
     if (logical_columns <= 8) {
-        quantize_vector<<<dim3(unsigned(padded / 256), unsigned(columns)), 256, 0, stream>>>(input,
-            static_cast<block_q8_1*>(scratch), inner, padded);
-        checked(cudaGetLastError());
+        if (!input_quantized) {
+            quantize_vector<<<dim3(unsigned(padded / 256), unsigned(columns)), 256, 0, stream>>>(input,
+                static_cast<block_q8_1*>(scratch), inner, padded);
+            checked(cudaGetLastError());
+        }
 #define VECTOR_CASE(N) case N: launch_vector<N>(weights, static_cast<const block_q8_1*>(scratch), output, inner, padded, padded_rows, logical_columns, stream); break
         switch (columns) { VECTOR_CASE(1); VECTOR_CASE(2); VECTOR_CASE(3); VECTOR_CASE(4); VECTOR_CASE(5); VECTOR_CASE(6); VECTOR_CASE(7); VECTOR_CASE(8); }
 #undef VECTOR_CASE
@@ -183,9 +185,11 @@ void tsg_q8_resident_launch(int device, const void* weights, const float* input,
     } else {
         // This upstream helper only submits quantization; it allocates nothing
         // and has no CUDA_CHECK host wrapper. Preconditions were checked above.
-        quantize_mmq_q8_1_cuda(input, nullptr, scratch, GGML_TYPE_Q8_0, inner, inner,
-            std::int64_t(inner) * columns, std::int64_t(inner) * columns, padded, columns, 1, 1, stream);
-        checked(cudaGetLastError());
+        if (!input_quantized) {
+            quantize_mmq_q8_1_cuda(input, nullptr, scratch, GGML_TYPE_Q8_0, inner, inner,
+                std::int64_t(inner) * columns, std::int64_t(inner) * columns, padded, columns, 1, 1, stream);
+            checked(cudaGetLastError());
+        }
         const bool fallback = logical_rows % 128 != 0;
         const int J = select_J(device, logical_columns, fallback);
         auto* fixup = reinterpret_cast<float*>(static_cast<char*>(scratch) + quantized_bytes(inner, columns));

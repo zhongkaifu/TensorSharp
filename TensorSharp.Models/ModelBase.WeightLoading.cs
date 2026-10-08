@@ -121,13 +121,17 @@ namespace TensorSharp.Models
                             // the cost of an extra strong reference held by the
                             // stacked weight (no memory duplication).
                             IntPtr bulkPtr = QuantizedWeight.AllocateBuffer(byteCount);
-                            _gguf.ReadTensorDataToNative(info, bulkPtr, byteCount);
-
-                            var stacked = new StackedExpertWeights(
-                                bulkPtr, (int)info.Type, ne0, ne1, numExperts,
-                                byteCount, isExternalView: false, ownerToken: null,
-                                ownedBuffer: bulkPtr);
-                            _stackedExpertWeights[info.Name] = stacked;
+                            StackedExpertWeights stacked;
+                            try
+                            {
+                                _gguf.ReadTensorDataToNative(info, bulkPtr, byteCount);
+                                stacked = new StackedExpertWeights(
+                                    bulkPtr, (int)info.Type, ne0, ne1, numExperts,
+                                    byteCount, isExternalView: false, ownerToken: null,
+                                    ownedBuffer: bulkPtr);
+                                _stackedExpertWeights[info.Name] = stacked;
+                            }
+                            catch { QuantizedWeight.FreeBuffer(bulkPtr); throw; }
 
                             for (int e = 0; e < numExperts; e++)
                             {
@@ -152,8 +156,18 @@ namespace TensorSharp.Models
                         else
                         {
                             IntPtr ptr = QuantizedWeight.AllocateBuffer(byteCount);
-                            _gguf.ReadTensorDataToNative(info, ptr, byteCount);
-                            _quantWeights[info.Name] = new QuantizedWeight(ptr, byteCount, (int)info.Type, ne0, ne1);
+                            QuantizedWeight loaded = null;
+                            try
+                            {
+                                _gguf.ReadTensorDataToNative(info, ptr, byteCount);
+                                loaded = new QuantizedWeight(ptr, byteCount, (int)info.Type, ne0, ne1);
+                                _quantWeights[info.Name] = loaded;
+                            }
+                            catch
+                            {
+                                if (loaded != null) loaded.Dispose(); else QuantizedWeight.FreeBuffer(ptr);
+                                throw;
+                            }
                         }
                         countQuant++;
                         totalQuantBytes += byteCount;
@@ -172,24 +186,28 @@ namespace TensorSharp.Models
                         tsShape[i] = ggufShape[ggufShape.Length - 1 - i];
 
                     var tensor = new Tensor(_allocator, DType.Float32, tsShape);
-                    IntPtr destPtr = GetStoragePtr(tensor);
+                    try
+                    {
+                        IntPtr destPtr = GetStoragePtr(tensor);
 
-                    if (info.Type == GgmlTensorType.F32)
-                    {
-                        _gguf.ReadTensorDataToFloat32Native(info, destPtr, numElements);
-                    }
-                    else
-                    {
-                        IntPtr tempPtr = QuantizedWeight.AllocateBuffer(byteCount);
-                        try
+                        if (info.Type == GgmlTensorType.F32)
                         {
-                            _gguf.ReadTensorDataToNative(info, tempPtr, byteCount);
-                            NativeDequant.DequantizeToFloat32Native((int)info.Type, tempPtr, destPtr, numElements);
+                            _gguf.ReadTensorDataToFloat32Native(info, destPtr, numElements);
                         }
-                        finally { QuantizedWeight.FreeBuffer(tempPtr); }
-                    }
+                        else
+                        {
+                            IntPtr tempPtr = QuantizedWeight.AllocateBuffer(byteCount);
+                            try
+                            {
+                                _gguf.ReadTensorDataToNative(info, tempPtr, byteCount);
+                                NativeDequant.DequantizeToFloat32Native((int)info.Type, tempPtr, destPtr, numElements);
+                            }
+                            finally { QuantizedWeight.FreeBuffer(tempPtr); }
+                        }
 
-                    _weights[info.Name] = tensor;
+                        _weights[info.Name] = tensor;
+                    }
+                    catch { tensor.Dispose(); throw; }
 
                     countF32++;
                     totalF32Bytes += numElements * 4;
@@ -748,6 +766,8 @@ namespace TensorSharp.Models
         // after preload (symptom: memcpy access violation on first forward).
         private static readonly bool s_retainAllHostQuantWeights =
             Environment.GetEnvironmentVariable("TS_GGML_RETAIN_HOST_WEIGHTS") == "1";
+
+        internal static bool RetainsAllHostQuantizedWeights => s_retainAllHostQuantWeights;
 
         protected virtual bool ShouldRetainCudaHostQuantWeight(string weightName)
         {

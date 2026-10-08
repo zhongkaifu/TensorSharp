@@ -1,0 +1,237 @@
+// Copyright (c) Zhongkai Fu. Licensed under the BSD-3-Clause license.
+#nullable enable
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Runtime.InteropServices;
+using TensorSharp.GGML;
+using TensorSharp.Memory;
+using TensorSharp.Memory.Planning;
+using TensorSharp.Runtime;
+
+namespace TensorSharp.Models;
+
+/// <summary>One sequential text execution lane. Context includes generated tokens.
+/// Limits are operator ceilings, not a fraction of a model's file size.</summary>
+public sealed record AdaptiveModelMemoryOptions(int ContextTokens, int PrefillTokens)
+{
+    public long MaximumHostBytes { get; init; } = long.MaxValue;
+    public long MaximumDeviceBytes { get; init; } = long.MaxValue;
+    public long? HostHeadroomBytes { get; init; }
+    public long? DeviceHeadroomBytes { get; init; }
+    public int MaximumPrefillChunkTokens { get; init; } = 2048;
+    public bool AllowWeightStreaming { get; init; } = true;
+    public int StreamingTileBytes { get; init; } = 16 << 20;
+}
+
+public readonly record struct InferenceHardwareMemory(long HostTotal, long HostAvailable,
+    long DeviceTotal, long DeviceAvailable)
+{
+    /// <summary>Read physical availability, not GC heap usage or an earlier budget.
+    /// Unknown measurements fail closed. Initializing the CUDA backend is explicit.</summary>
+    public static InferenceHardwareMemory CaptureCuda()
+    {
+        GgmlBasicOps.EnsureBackendAvailable(GgmlBackendType.Cuda);
+        if (!GgmlBasicOps.TryGetDeviceMemoryInfo(out long free, out long total) || total <= 0)
+            throw new NotSupportedException("The backend did not report device memory availability.");
+        var host = CaptureHost();
+        return new(host.Total, host.Available, total, free);
+    }
+
+    internal static (long Total, long Available) CaptureHost()
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            var status = new MemoryStatus { Length = (uint)Marshal.SizeOf<MemoryStatus>() };
+            if (!GlobalMemoryStatusEx(ref status))
+                throw new IOException("GlobalMemoryStatusEx could not read physical memory.");
+            return (checked((long)status.TotalPhysical), checked((long)status.AvailablePhysical));
+        }
+        if (OperatingSystem.IsLinux())
+            return HostMemoryAvailability.CaptureLinux();
+        throw new PlatformNotSupportedException("An available-physical-memory provider is required for this host.");
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct MemoryStatus
+    {
+        public uint Length, Load;
+        public ulong TotalPhysical, AvailablePhysical, TotalPageFile, AvailablePageFile,
+            TotalVirtual, AvailableVirtual, AvailableExtendedVirtual;
+    }
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GlobalMemoryStatusEx(ref MemoryStatus status);
+}
+
+/// <summary>Hardware/request-aware loading for dense Gemma4/Qwen35 on one CUDA
+/// device. A legal resident graph is preferred to row streaming, so adding a
+/// budget does not force every token through SSD/PCIe. Model geometry estimates
+/// are admission forecasts; only allocations instrumented by the GGML scope and
+/// streaming allocator are enforced. OS page cache, driver pools and managed
+/// objects are not a hard RSS quota. Do not share process-global GGML caches
+/// with another model while this session is alive.</summary>
+public sealed class AdaptiveModelSession : IDisposable
+{
+    public const string HostPool = "adaptive/ram";
+    public const string DevicePool = "adaptive/cuda0";
+    private readonly AdaptiveModelMemoryOptions _options;
+    private readonly GgmlCacheBudgetScope _nativeBudget;
+    private bool _disposed;
+
+    private AdaptiveModelSession(ModelBase model, MemoryBudget budget, GgmlCacheBudgetScope nativeBudget,
+        InferenceMemoryPlan plan, AdaptiveModelMemoryOptions options)
+    { Model = model; Budget = budget; _nativeBudget = nativeBudget; Plan = plan; _options = options; }
+
+    public ModelBase Model { get; }
+    public MemoryBudget Budget { get; }
+    public InferenceMemoryPlan Plan { get; }
+    public Exception? AccountingError => _nativeBudget.CallbackError;
+
+    public static AdaptiveModelSession Create(string path, AdaptiveModelMemoryOptions options)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        Validate(options);
+        using var gguf = new GgufFile(path);
+        var profile = DenseMemoryProfile.Read(gguf, options, ModelBase.RetainsAllHostQuantizedWeights);
+        var hardware = InferenceHardwareMemory.CaptureCuda();
+        var budget = new MemoryBudget([new(HostPool, 0), new(DevicePool, 0)]);
+        var plan = PlanLoad(profile, options, hardware, budget);
+        if (!plan.Accepted)
+            throw new MemoryPressureException(string.Join(Environment.NewLine, plan.Rejections.Select(r => r.Reason).Distinct()));
+        foreach (var capacity in plan.Capacities)
+            if (!budget.TrySetCapacity(capacity.Pool, capacity.ProtectedCapacity))
+                throw new MemoryPressureException("Memory owners changed during load admission.");
+
+        // Install before model preload. Callback reservations arbitrate actual
+        // buffer sizes/rounding, rather than committing the whole forecast and
+        // charging those same bytes a second time in allocation callbacks.
+        var nativeBudget = new GgmlCacheBudgetScope(budget, new[] { new[] { DevicePool } }, includeGraphBuffers: true);
+        try
+        {
+            WeightStreamingOptions? streaming = plan.SelectedCandidate!.Placement == InferenceWeightPlacement.SsdStreaming
+                ? new(budget, HostPool, [DevicePool], options.StreamingTileBytes, Math.Min(32, plan.SelectedChunkTokens)) : null;
+            var policy = new ModelMemoryPolicy(options.ContextTokens, plan.SelectedChunkTokens);
+            var model = ModelBase.Create(path, BackendType.GgmlCuda, 1, null!, null!, 1, streaming!, policy);
+            return new(model, budget, nativeBudget, plan, options);
+        }
+        catch (Exception creation)
+        {
+            // Constructors with a memory policy unwind their owned resources.
+            // Never detach a callback with a live native allocation.
+            try { nativeBudget.Dispose(); }
+            catch (Exception cleanup)
+            {
+                throw new AdaptiveModelAllocationException(nativeBudget, budget, new AggregateException(creation, cleanup));
+            }
+            throw;
+        }
+    }
+
+    /// <summary>Refresh at a quiescent request boundary. Shrinking does not revoke
+    /// live owners or discard KV. False means stop new admission; release work or
+    /// reload a smaller supported placement. Do not vary graph shapes per token.</summary>
+    public bool RefreshCapacity()
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        var hw = InferenceHardwareMemory.CaptureCuda();
+        bool admitted = true;
+        foreach (var pool in Pools(hw, Budget, _options))
+        {
+            var owners = checked(pool.Accounting.Reserved + pool.Accounting.Committed);
+            var physical = Math.Min((decimal)pool.TotalBytes, (decimal)pool.Accounting.Committed + pool.AvailableBytes);
+            long desired = (long)Math.Max(0, Math.Min(pool.MaximumBudgetBytes, physical - pool.HeadroomBytes));
+            admitted &= desired >= owners;
+            admitted &= Budget.TrySetCapacity(pool.Pool, Math.Max(owners, desired));
+        }
+        return admitted && AccountingError == null;
+    }
+
+    public void Dispose()
+    {
+        if (_disposed) return;
+        Model.Dispose();
+        _nativeBudget.Dispose();
+        _disposed = true;
+    }
+
+    internal static InferenceMemoryPlan PlanLoad(DenseMemoryProfile profile, AdaptiveModelMemoryOptions options,
+        InferenceHardwareMemory hardware, MemoryBudget budget)
+    {
+        Validate(options);
+        var candidates = new List<InferenceExecutionCandidate>();
+        int maximum = Math.Min(options.PrefillTokens, options.MaximumPrefillChunkTokens);
+        for (int chunk = maximum; chunk > 0; chunk = chunk == 1 ? 0 : Math.Max(1, chunk / 2))
+        {
+            var workspace = profile.Workspace(chunk, options.ContextTokens);
+            candidates.Add(new()
+            {
+                Name = $"resident-{chunk}", Placement = InferenceWeightPlacement.Resident,
+                PrefillChunkTokens = chunk, PreservesExecutionGraph = true,
+                // Residency in discrete VRAM does not require a second full
+                // anonymous RAM copy. The loader retains demand-paged file views
+                // for row lookups; these are OS cache, not owned host payload.
+                // Retained F32/explicitly retained quantized copies remain host
+                // owners; fusion is only the extra construction peak.
+                KeepResidentHostWeights = false,
+                Persistent = new(Host: profile.ResidentHostWeightBytes),
+                LoadingWorkspace = new(Host: checked(profile.FusionBytes + (128L << 20))),
+                PrefillWorkspace = workspace, DecodeWorkspace = profile.Workspace(1, options.ContextTokens)
+            });
+            if (options.AllowWeightStreaming)
+                candidates.Add(new()
+                {
+                    Name = $"ssd-{chunk}", Placement = InferenceWeightPlacement.SsdStreaming,
+                    PrefillChunkTokens = chunk, CapabilityRefusal = profile.StreamingRefusal,
+                    // One tile is required. The executor may reserve a second
+                    // tile from otherwise available host quota for read-ahead;
+                    // tight quotas retain the single-buffer execution path.
+                    TransferBuffer = new(Host: options.StreamingTileBytes + (4L << 20)), TransferBufferCount = 1,
+                    LoadingWorkspace = new(Host: 128L << 20),
+                    PrefillWorkspace = workspace with { Device = checked(workspace.Device + profile.LargestProjectionBytes) },
+                    DecodeWorkspace = profile.Workspace(1, options.ContextTokens) with
+                    { Device = checked(profile.Workspace(1, options.ContextTokens).Device + options.StreamingTileBytes * 2L) }
+                });
+        }
+        return InferenceMemoryPlanner.Plan(new()
+        {
+            Pools = Pools(hardware, budget, options), HostPools = [HostPool], DevicePools = [DevicePool],
+            Model = profile.Model, Workload = new(options.ContextTokens, options.PrefillTokens, 1, 1), Candidates = candidates
+        });
+    }
+
+    private static InferenceMemoryPool[] Pools(InferenceHardwareMemory hw, MemoryBudget budget, AdaptiveModelMemoryOptions o)
+    {
+        var snapshots = budget.Snapshot().ToDictionary(p => p.Pool);
+        return
+        [
+            new(HostPool, hw.HostTotal, hw.HostAvailable, o.HostHeadroomBytes ?? Math.Max(512L << 20, hw.HostTotal / 16),
+                snapshots[HostPool], o.MaximumHostBytes),
+            new(DevicePool, hw.DeviceTotal, hw.DeviceAvailable, o.DeviceHeadroomBytes ?? GpuMemoryBudget.ResolveHeadroomBytes(hw.DeviceTotal),
+                snapshots[DevicePool], o.MaximumDeviceBytes)
+        ];
+    }
+
+    private static void Validate(AdaptiveModelMemoryOptions o)
+    {
+        if (o.ContextTokens <= 0 || o.PrefillTokens <= 0 || o.PrefillTokens > o.ContextTokens
+            || o.MaximumPrefillChunkTokens <= 0 || o.StreamingTileBytes <= 0
+            || o.MaximumHostBytes < 0 || o.MaximumDeviceBytes < 0
+            || o.HostHeadroomBytes < 0 || o.DeviceHeadroomBytes < 0)
+            throw new ArgumentOutOfRangeException(nameof(o));
+    }
+}
+
+/// <summary>Construction could not release every native owner. Callbacks stay
+/// rooted and credit remains charged. After resolving/releasing those owners,
+/// retry UnreleasedBudgetScope.Dispose; never create a replacement ledger that
+/// forgets the still-live allocation.</summary>
+public sealed class AdaptiveModelAllocationException : InvalidOperationException
+{
+    internal AdaptiveModelAllocationException(GgmlCacheBudgetScope scope, MemoryBudget budget, Exception inner)
+        : base("Adaptive model construction failed with live native budget owners; accounting remains attached.", inner)
+    { UnreleasedBudgetScope = scope; Budget = budget; }
+    public GgmlCacheBudgetScope UnreleasedBudgetScope { get; }
+    public MemoryBudget Budget { get; }
+}

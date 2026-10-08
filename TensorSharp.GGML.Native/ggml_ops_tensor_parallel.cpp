@@ -112,7 +112,7 @@ namespace tsg
             AllReduceScratch& s = g_ar_scratch[rank];
             if (s.buffer != nullptr)
             {
-                ggml_backend_buffer_free(s.buffer);
+                tsg::graph_budget_free_buffer(s.buffer);
                 s.buffer = nullptr;
             }
             if (s.ctx != nullptr)
@@ -166,7 +166,7 @@ namespace tsg
                 free_ar_scratch_locked(rank);
                 return nullptr;
             }
-            s.buffer = ggml_backend_alloc_ctx_tensors(s.ctx, g_backend);
+            s.buffer = tsg::alloc_ctx_tensors_budgeted(s.ctx, g_backend);
             if (s.buffer == nullptr)
             {
                 free_ar_scratch_locked(rank);
@@ -1070,8 +1070,8 @@ namespace tsg
                 }
                 else
                 {
-                    if (result_buf != nullptr) ggml_backend_buffer_free(result_buf);
-                    if (input_buf != nullptr) ggml_backend_buffer_free(input_buf);
+                    if (result_buf != nullptr) tsg::graph_budget_free_buffer(result_buf);
+                    if (input_buf != nullptr) tsg::graph_budget_free_buffer(input_buf);
                 }
             }
 
@@ -1137,7 +1137,7 @@ namespace tsg
             }
             ggml_build_forward_expand(graph, out);
 
-            rg.owned_buffer = BufferHandle(ggml_backend_alloc_ctx_tensors(ctx, g_backend));
+            rg.owned_buffer = BufferHandle(tsg::alloc_ctx_tensors_budgeted(ctx, g_backend));
             if (rg.owned_buffer.value == nullptr)
             {
                 set_last_error("Failed to allocate the multi-rank matmul backend buffer.");

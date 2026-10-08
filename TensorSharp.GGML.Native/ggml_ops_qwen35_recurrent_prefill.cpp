@@ -339,7 +339,7 @@ TSG_EXPORT int TSGgml_Qwen35RecurrentLayerPrefill(
                 set_last_error("RecPrefill: weight bind failed."); return 0;
             }
 
-            BufferHandle buffer(ggml_backend_alloc_ctx_tensors(ctx, g_backend));
+            BufferHandle buffer(tsg::alloc_ctx_tensors_budgeted(ctx, g_backend));
             if (!buffer.value) { set_last_error("RecPrefill: buffer alloc failed."); return 0; }
             ne->buffer = std::move(buffer);
 

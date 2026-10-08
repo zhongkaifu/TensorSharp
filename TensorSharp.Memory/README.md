@@ -118,12 +118,14 @@ reports the entire shared budget, including other owners. It may remain nonzero
 after one engine is disposed. Do not also reserve these same cache/snapshot bytes
 in a request envelope: this integration owns their allocation charges directly.
 
-The native scope covers lazy device-copy and explicit preload caches only. Graph
-scratch, live model KV, backend pools and streaming fallback remain outside it;
-cache admission refusal is not a whole-model allocation limit. Attaching after
-native cache allocation or detaching while allocations remain is rejected. Stop
-model work and call `GgmlBasicOps.ClearHostBufferCache()` before disposing the
-scope; failed disposal keeps callbacks and charges alive for a later retry.
+The default native scope covers lazy device-copy, explicit preload and selected
+expert caches. Pass `includeGraphBuffers: true` to additionally cover the wired
+context buffers and reuse gallocr arenas in common operators and the Gemma4/Qwen35
+graphs. Other executors, some live KV/holders, backend pools and driver overhead
+remain outside it; this is not a whole-model allocation limit. Attaching after
+covered allocation or detaching while allocations remain is rejected. Stop model
+work, dispose models and release covered native caches/compute buffers before
+scope disposal; failed disposal keeps callbacks and charges alive for a retry.
 
 RAM includes one full capture scratch, fixed staging and resident snapshot pages.
 It must fit at least one resident page plus scratch and staging, each rounded to
@@ -216,8 +218,41 @@ file bytes read, executed tiles and workspace peaks;
 F32 constants separately. Other quantization formats, tensor parallelism,
 multimodal execution, speculation (including weight-free N-gram), MTP/draft and
 unadapted model families are rejected rather
-than silently loading all weights. This synchronous implementation establishes
-the execution seam; it does not claim I/O overlap or a throughput improvement.
+than silently loading all weights. Optional read-ahead reserves a second host
+tile and starts the next file read before consuming the current tile. Small or
+shared host/device quotas retain single-buffer execution, and disposal drains
+pending reads before refunding their memory. CUDA copies remain synchronous;
+read-ahead counters alone do not establish a throughput improvement.
+
+## Adaptive dense loading
+
+`TensorSharp.Models.AdaptiveModelSession` is an explicit single-CUDA execution
+lane for dense Gemma4/Qwen35. It forecasts weights in their actual representations,
+fusion peaks, KV/state and per-phase workspaces from model geometry and the
+admitted context/prefill. It prefers the existing resident graph, then smaller
+prefill chunks, and only then a supported file-streaming path. Hardware observation
+uses available physical memory; Linux also observes the process's visible cgroup
+hierarchy. Operator ceilings and headroom are independent controls.
+
+```csharp
+using var session = AdaptiveModelSession.Create(modelPath,
+    new AdaptiveModelMemoryOptions(ContextTokens: 4096, PrefillTokens: 1024)
+    { MaximumDeviceBytes = 12L << 30 });
+// At an idle request boundary; false means stop admission and release/replan.
+if (!session.RefreshCapacity()) throw new MemoryPressureException("Memory pressure");
+float[] logits = session.Model.ForwardRefill(promptTokenIds);
+int nextToken = session.Model.SampleGreedy(logits);
+```
+
+Do not share process-global GGML caches with another model during the session.
+The session installs graph-budget hooks before loading and disposes its model
+before detaching them. Host estimates are not an enforced RSS cap; mappings,
+unhooked native pools and other processes still require headroom. Container
+namespaces can hide further parent limits. Unsupported architectures, quantized
+streaming layouts, speculation and multi-device configurations are not silently
+substituted. A new request geometry needs a new plan at an idle boundary.
+See [AdaptiveMemoryProbe](../eng/validation/AdaptiveMemoryProbe/README.md) for
+actual resident comparisons and their model/device limits.
 
 ## Ownership and failure rules
 

@@ -12,10 +12,13 @@ namespace TensorSharp.GGML;
 /// and explicit-preload cache allocations. Install before those allocations exist.
 /// Each rank maps to one or more existing budget pools; listing RAM and GPU for
 /// UMA applies two constraints to one allocation, not two physical copies.
-/// Graph scratch, live KV outside these caches, host-pointer wrappers, backend
-/// pools, allocator rounding and driver overhead are not covered. Cache refusal
-/// can use unbudgeted per-graph streaming; this is not a whole-model memory cap.
-/// Dispose only after model work has stopped and its caches have been cleared.
+/// With includeGraphBuffers=true, additionally charge the explicitly routed
+/// TensorSharp-owned context buffers and shared reuse graph allocators. Buffers
+/// retain their original native backend interfaces. Other allocator paths, live KV
+/// outside these buffers, host-pointer wrappers, backend pools, allocator rounding
+/// and driver overhead are not covered; this is not a whole-model memory cap.
+/// Cache-only refusal can use unbudgeted per-graph streaming. Dispose only after
+/// model work has stopped and all covered caches/graphs have been released.
 /// Failed disposal keeps callbacks rooted and accounting active for a retry.</summary>
 public sealed class GgmlCacheBudgetScope : IDisposable
 {
@@ -39,10 +42,14 @@ public sealed class GgmlCacheBudgetScope : IDisposable
     private bool _disposed;
 
     public GgmlCacheBudgetScope(MemoryBudget budget, IEnumerable<IEnumerable<string>> rankPools)
+        : this(budget, rankPools, includeGraphBuffers: false) { }
+
+    public GgmlCacheBudgetScope(MemoryBudget budget, IEnumerable<IEnumerable<string>> rankPools, bool includeGraphBuffers)
     {
         ArgumentNullException.ThrowIfNull(budget);
         ArgumentNullException.ThrowIfNull(rankPools);
         _budget = budget;
+        IncludesGraphBuffers = includeGraphBuffers;
         _rankPools = rankPools.Select(pools => pools?.ToArray()
             ?? throw new ArgumentException("Every rank needs a pool mapping.", nameof(rankPools))).ToArray();
         if (_rankPools.Length == 0 || _rankPools.Any(p => p.Length == 0 || p.Distinct(StringComparer.Ordinal).Count() != p.Length))
@@ -52,10 +59,15 @@ public sealed class GgmlCacheBudgetScope : IDisposable
         _handle = GCHandle.Alloc(this);
         try
         {
-            if (GgmlNative.AttachSharedCacheBudget(GCHandle.ToIntPtr(_handle),
-                Marshal.GetFunctionPointerForDelegate(ReserveRoot), Marshal.GetFunctionPointerForDelegate(CommitRoot),
-                Marshal.GetFunctionPointerForDelegate(ReleaseRoot)) != 1)
-                throw new InvalidOperationException("Install the GGML cache budget before cache allocations, with no other active cache budget scope.");
+            IntPtr context = GCHandle.ToIntPtr(_handle);
+            IntPtr reserve = Marshal.GetFunctionPointerForDelegate(ReserveRoot);
+            IntPtr commit = Marshal.GetFunctionPointerForDelegate(CommitRoot);
+            IntPtr release = Marshal.GetFunctionPointerForDelegate(ReleaseRoot);
+            int attached = includeGraphBuffers
+                ? GgmlNative.AttachSharedCacheBudgetEx(context, reserve, commit, release, 1)
+                : GgmlNative.AttachSharedCacheBudget(context, reserve, commit, release);
+            if (attached != 1)
+                throw new InvalidOperationException("Install the GGML budget before covered cache/graph allocations, with no other active budget scope.");
         }
         catch
         {
@@ -68,6 +80,7 @@ public sealed class GgmlCacheBudgetScope : IDisposable
     /// the unmanaged boundary. Ordinary quota rejection is not an error.</summary>
     public Exception? CallbackError { get { lock (_gate) return _callbackError; } }
     public int ActiveAllocations { get { lock (_gate) return _allocations.Count; } }
+    public bool IncludesGraphBuffers { get; }
 
     public void Dispose()
     {
@@ -78,9 +91,9 @@ public sealed class GgmlCacheBudgetScope : IDisposable
             if (_disposed) return;
             lock (_gate)
                 if (_allocations.Count != 0)
-                    throw new InvalidOperationException("GGML cache allocations still own budget credit. Stop model work and clear its caches before disposing the budget scope.");
+                    throw new InvalidOperationException("GGML allocations still own budget credit. Stop model work and release covered caches/graphs before disposing the budget scope.");
             if (GgmlNative.DetachSharedCacheBudget(GCHandle.ToIntPtr(_handle)) != 1)
-                throw new InvalidOperationException("A GGML cache allocation is still in flight. Retry disposal after model work and cache cleanup finish.");
+                throw new InvalidOperationException("A covered GGML allocation is still in flight. Retry disposal after model work and cleanup finish.");
             _handle.Free(); // Native detach proves no callback can still use it.
             _disposed = true;
         }
@@ -96,7 +109,8 @@ public sealed class GgmlCacheBudgetScope : IDisposable
             BudgetReservation? reservation = null;
             try
             {
-                if ((uint)rank >= (uint)owner._rankPools.Length || bytes <= 0 || (kind != 0 && kind != 1)) return 0;
+                if ((uint)rank >= (uint)owner._rankPools.Length || bytes <= 0
+                    || (kind != 0 && kind != 1 && !(kind == 2 && owner.IncludesGraphBuffers))) return 0;
                 reservation = owner._budget.TryReserve(owner._rankPools[rank].Select(pool => new MemoryCharge(pool, bytes)));
                 if (reservation == null) return 0;
                 ulong token = checked(++owner._nextToken);

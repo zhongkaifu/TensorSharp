@@ -35,6 +35,52 @@ allowance; these statistics are the cache reservation rather than total VRAM.
 Native provenance is the actual mapped library path and SHA-256, and ggml must
 remain unchanged.
 
+Pass `--device-budget-bytes <positive-int64>` with `--backend ggml_cuda` to
+attach a shared rank-0 `MemoryBudget` before loading the model. This opts into
+cache/preload and TensorSharp's explicitly routed graph-buffer charges. It is
+not a cap on every CUDA driver/backend allocation, CPU memory, or OS mmap page.
+The final report retains accounting snapshots, actual loaded binary hashes,
+environment overrides, operation errors, and cleanup errors. It can pass only
+after model disposal, host-cache clearing and reuse-buffer release return all
+covered reservations and allocations to zero, the scope detaches, and native
+shutdown completes. Failure to release physical ownership leaves the scope
+rooted and the report failed rather than refunding live memory.
+
+For a controlled prefill comparison, retain the first run's prompt IDs using
+`--prompt-tokens-output <file>`, then provide that exact file through
+`--tokens-file <file>` in both new processes. Compare explicit
+`TS_HOST_MOE_DEVICE_MIN_BATCH=9` and `=0` while keeping model, shared capacity,
+private expert-cache cap, generation inputs and native binary identical. These
+are opt-in diagnostics; the probe does not change the product's default policy.
+
+Add `--logits-dir <fresh-directory>` to retain the full vocabulary prediction
+after the prompt and after each consumed teacher/generated token. `rows.f32`
+contains contiguous little-endian float32 rows; `rows.json` records byte offsets,
+element counts, SHA-256, argmax, iteration and the exact input history for each
+row. Empty/nonfinite rows fail immediately. Capture I/O is outside the forward
+stopwatches, but the resulting run is diagnostic and is not a quiet performance
+measurement. An interrupted run preserves its completed row index; that does not
+turn the incomplete model report into a pass.
+
+For an independent matched-history diagnostic, start an unchanged llama.cpp
+server on the same verified GGUF and retain its revision, binary hash, backend,
+placement flags and logs. Then replay the captures without retokenizing:
+
+```powershell
+python eng/validation/qwen38-llama-teacher.py --logits-index artifacts/flash-cpu/logits/rows.json --server http://127.0.0.1:5099 --output artifacts/flash-llama-teacher
+python -m unittest discover -s eng/validation/tests -p test_qwen38_llama_teacher.py
+```
+
+The HTTP reference exposes float32 pre-sampling log probabilities rather than
+raw logits. The tool compares values after subtracting the same reference
+token's value in both engines, preserving pairwise logit differences while
+removing the unobservable normalization constant. It requires a complete,
+finite vocabulary and rejects softmax underflow/clipping; partial probabilities
+cannot establish full-logit agreement. Raw responses and every exact request
+history are retained. This is a localization tool, with no assumption that
+either engine is ground truth and no automatic model-quality pass.
+`--prepare-only` validates the TS captures and writes requests without inference.
+
 Run the focused managed regressions in a fresh process:
 
 ```powershell

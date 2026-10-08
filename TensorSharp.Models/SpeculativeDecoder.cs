@@ -325,6 +325,24 @@ namespace TensorSharp.Models
         private void GenerateFrom(float[] promptLogits, int position, int maxNewTokens,
             TokenSampler sampler, Func<int, bool> isStopToken, Func<int, bool> onToken, List<int> output)
         {
+            // Standalone callers can supply an unbound sampler, or no sampler for
+            // greedy generation. Model exclusions apply to both, as in the engine.
+            var suppressed = _model.Tokenizer?.SuppressedTokenIds;
+            bool hasSuppression = suppressed is { Count: > 0 };
+            void Mask(float[] logits)
+            {
+                if (!hasSuppression) return;
+                for (int i = 0; i < suppressed.Count; i++)
+                    if ((uint)suppressed[i] < (uint)logits.Length)
+                        logits[suppressed[i]] = float.NegativeInfinity;
+            }
+            bool IsSuppressed(int token)
+            {
+                if (hasSuppression)
+                    for (int i = 0; i < suppressed.Count; i++)
+                        if (suppressed[i] == token) return true;
+                return false;
+            }
             var sw = System.Diagnostics.Stopwatch.StartNew();
             try
             {
@@ -374,9 +392,11 @@ namespace TensorSharp.Models
                 // instead — they were drawn by the DRAFT head, not from this row.
                 int Draw(float[] rowLogits)
                 {
-                    if (sampler == null)
-                        return Argmax(rowLogits, _vocab);
-                    return sampler.Sample(rowLogits, history);
+                    Mask(rowLogits);
+                    int token = sampler == null ? Argmax(rowLogits, _vocab) : sampler.Sample(rowLogits, history);
+                    if (IsSuppressed(token) || (hasSuppression && float.IsNegativeInfinity(rowLogits[token])))
+                        throw new InvalidOperationException("No permitted generation token was selected; model exclusions cannot be overridden by a forced token or other sampler constraint.");
+                    return token;
                 }
 
                 // Appends a token to the result and reports whether generation
@@ -411,10 +431,13 @@ namespace TensorSharp.Models
                         // Penalty-aligned drafting: the draft head must argmax the
                         // same penalized distribution verification draws from, or
                         // acceptance decays toward zero as the history grows.
-                        adjustDraftLogits: sampler == null
+                        adjustDraftLogits: sampler == null && !hasSuppression
                             ? null
                             : (draftLogits, pendingDrafts) =>
-                                sampler.ApplyPenalties(draftLogits, history, pendingDrafts),
+                            {
+                                Mask(draftLogits);
+                                sampler?.ApplyPenalties(draftLogits, history, pendingDrafts);
+                            },
                         onDraftAccepted: d =>
                         {
                             history?.Add(d);
