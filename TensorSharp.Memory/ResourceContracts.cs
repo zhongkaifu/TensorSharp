@@ -11,6 +11,7 @@ public readonly record struct ResourceKey(string Owner, long Epoch, string Name)
 
 /// <summary>Placement is identified by node and device/NUMA location, not a model name.</summary>
 public readonly record struct MemoryLocation(string Node, string Device, MemoryTier Tier);
+public readonly record struct ResourcePlacement(ResourceKey Resource, MemoryLocation Location);
 
 public sealed record MemoryResource(ResourceKey Key, long ByteLength, ResourceKind Kind,
     bool Mutable = false, string Layout = "opaque", double ReloadCost = 1)
@@ -50,6 +51,15 @@ public interface IMemoryBackend
     /// constraints. No allocation may exceed this bound; driver overhead is headroom.</summary>
     IReadOnlyList<MemoryCharge> GetAllocationCharges(long byteLength);
     ValueTask<IResourceBuffer> AllocateAsync(long byteLength, CancellationToken cancellationToken = default);
+}
+
+/// <summary>Optional device-to-device route. Both allocations remain leased during
+/// this call. Return false without writing when unsupported; successful and failed
+/// operations must quiesce before returning. Sources with integrity checks still
+/// use the checked staging path.</summary>
+public interface IDirectCopyTarget
+{
+    ValueTask<bool> TryCopyFromAsync(IResourceSource source, CancellationToken cancellationToken = default);
 }
 
 public readonly record struct ResidencySnapshot(ResourceKey Resource, MemoryLocation Location,

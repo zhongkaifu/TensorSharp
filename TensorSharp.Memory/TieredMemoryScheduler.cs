@@ -330,14 +330,22 @@ public sealed class TieredMemoryScheduler : IAsyncDisposable
     /// <summary>All-or-nothing lease set for one operator/batch. A pressure failure
     /// releases partial leases, allowing the caller to queue, microbatch or stream
     /// smaller partitions without deadlocking on resources it already holds.</summary>
-    public async ValueTask<ResourceLeaseSet> AcquireReadSetAsync(IEnumerable<ResourceKey> keys, MemoryLocation location,
+    public ValueTask<ResourceLeaseSet> AcquireReadSetAsync(IEnumerable<ResourceKey> keys, MemoryLocation location,
         CancellationToken cancellationToken = default)
+        => AcquireReadSetAsync(keys.Select(key => new ResourcePlacement(key, location)), cancellationToken);
+
+    /// <summary>One execution working set can span multiple devices. Failure releases
+    /// every acquired pin; callers retry the whole set without holding half a collective.</summary>
+    public async ValueTask<ResourceLeaseSet> AcquireReadSetAsync(IEnumerable<ResourcePlacement> placements,
+        CancellationToken cancellationToken = default, BudgetReservation? allocationEnvelope = null)
     {
+        ArgumentNullException.ThrowIfNull(placements);
         var leases = new List<ResourceLease>();
         try
         {
-            foreach (var key in keys.Distinct())
-                leases.Add(await AcquireCoreAsync(key, location, ResourceAccess.Read, true, cancellationToken,
+            foreach (var placement in placements.Distinct())
+                leases.Add(await AcquireCoreAsync(placement.Resource, placement.Location, ResourceAccess.Read, true, cancellationToken,
+                    allocationEnvelope,
                     waitForConflicts: false).ConfigureAwait(false));
             return new ResourceLeaseSet(leases);
         }
@@ -444,5 +452,14 @@ public sealed class ResourceLeaseSet : IDisposable
 {
     internal ResourceLeaseSet(List<ResourceLease> leases) => Leases = leases.AsReadOnly();
     public IReadOnlyList<ResourceLease> Leases { get; }
+    /// <summary>The fence must cover every participating rank/stream. A failed fence
+    /// leaves all leases owned; callers must synchronize/recover before releasing.</summary>
+    public async ValueTask ReleaseAfterAsync(Task executionFence)
+    {
+        ArgumentNullException.ThrowIfNull(executionFence);
+        // Each lease enters its retiring state before waiting, so Dispose cannot
+        // free a device's memory while a collective is still in flight.
+        await Task.WhenAll(Leases.Select(lease => lease.ReleaseAfterAsync(executionFence).AsTask())).ConfigureAwait(false);
+    }
     public void Dispose() { foreach (var lease in Leases) lease.Dispose(); }
 }

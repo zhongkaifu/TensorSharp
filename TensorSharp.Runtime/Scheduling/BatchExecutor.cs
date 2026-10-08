@@ -2755,8 +2755,7 @@ namespace TensorSharp.Runtime.Scheduling
                 long expectedBytes = _model.ComputeKVBlockByteSize(tokensInBlock);
                 if (expectedBytes <= 0) break;
 
-                EnsureScratch((int)expectedBytes);
-                var dst = _scratch.AsSpan(0, (int)expectedBytes);
+                var dst = CaptureScratch(checked((int)expectedBytes));
                 if (!_model.TryExtractKVBlock(startToken, tokensInBlock, dst))
                 {
                     // For SWA-bounded models (e.g. Gemma 4) blocks whose positions
@@ -2775,8 +2774,8 @@ namespace TensorSharp.Runtime.Scheduling
                 // not confused with full-block layout). For the trailing
                 // partial block we use the partial-byte size; the storage slab
                 // is sized for one full block so partial fits.
-                var slab = _pool.Storage.GetSpan(block.Id);
-                dst.CopyTo(slab);
+                using var snapshot = _pool.Storage.Acquire(block.Id, TensorSharp.Memory.ResourceAccess.Write);
+                dst.CopyTo(snapshot.Span);
                 block.Used = tokensInBlock;
                 block.HoldsSnapshotBytes = tokensInBlock == _blockSize;
             }
@@ -2822,7 +2821,8 @@ namespace TensorSharp.Runtime.Scheduling
                 long expectedBytes = _model.ComputeKVBlockByteSize(tokensInBlock);
                 if (expectedBytes <= 0) break;
 
-                var src = _pool.Storage.GetReadOnlySpan(block.Id);
+                using var snapshot = _pool.Storage.Acquire(block.Id);
+                var src = snapshot.ReadOnlySpan;
                 if (src.Length < expectedBytes)
                 {
                     _logger.LogWarning(
@@ -2831,7 +2831,15 @@ namespace TensorSharp.Runtime.Scheduling
                     break;
                 }
                 var slice = src[..(int)expectedBytes];
-                if (!_model.TryInjectKVBlock(startToken, tokensInBlock, slice))
+                // Best effort: overlap the next SSD page read with this model
+                // injection if a second resident page fits. Never evict demand
+                // data to prefetch, and join before any storage may be recycled.
+                var prefetch = b + 1 < blocks && startToken + tokensInBlock < tokensToInject
+                    ? _pool.Storage.TryPrefetch(seq.BlockTable.Blocks[b + 1].Id) : null;
+                bool accepted;
+                try { accepted = _model.TryInjectKVBlock(startToken, tokensInBlock, slice); }
+                finally { prefetch?.GetAwaiter().GetResult(); }
+                if (!accepted)
                 {
                     _logger.LogWarning(
                         "Inject failed for sequence {RequestId} block {Block} at {Start}",
@@ -2974,11 +2982,11 @@ namespace TensorSharp.Runtime.Scheduling
 
                 int startToken = b * _blockSize;
                 long bytes = _model.ComputeKVBlockByteSize(_blockSize);
-                EnsureScratch((int)bytes);
-                var dst = _scratch.AsSpan(0, (int)bytes);
+                var dst = CaptureScratch(checked((int)bytes));
                 if (!_model.TryExtractKVBlock(startToken, _blockSize, dst))
                     break;
-                dst.CopyTo(_pool.Storage.GetSpan(block.Id));
+                using var snapshot = _pool.Storage.Acquire(block.Id, TensorSharp.Memory.ResourceAccess.Write);
+                dst.CopyTo(snapshot.Span);
                 block.Used = _blockSize;
                 block.HoldsSnapshotBytes = true;
                 block.IsRestorablePrefixEnd = !_model.RequiresPerBlockCapture
@@ -3012,10 +3020,12 @@ namespace TensorSharp.Runtime.Scheduling
             return Math.Min(fullBlocks, cap / _blockSize);
         }
 
-        private void EnsureScratch(int bytes)
+        private Span<byte> CaptureScratch(int bytes)
         {
+            if (_pool.Storage.UsesTieredSnapshots) return _pool.Storage.CaptureScratch(bytes);
             if (_scratch == null || _scratch.Length < bytes)
                 _scratch = new byte[bytes];
+            return _scratch.AsSpan(0, bytes);
         }
 
         /// <summary>Reset internal state. Called by the engine on model reload.</summary>

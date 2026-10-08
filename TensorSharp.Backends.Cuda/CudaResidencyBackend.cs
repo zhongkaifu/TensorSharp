@@ -17,13 +17,22 @@ public sealed class CudaResidencyBackend : IMemoryBackend
     private readonly CudaContext _context;
     private readonly string _pool;
     private readonly long _allocationGranularity;
-    public CudaResidencyBackend(CudaContext context, string pool, string node = "local", long allocationGranularity = 2L << 20)
+    private readonly bool _enablePeerCopies;
+    private long _deviceCopies, _peerCopies;
+    public long DeviceCopyCount => Interlocked.Read(ref _deviceCopies);
+    public long PeerCopyCount => Interlocked.Read(ref _peerCopies);
+    public CudaResidencyBackend(CudaContext context, string pool, string node = "local", long allocationGranularity = 2L << 20,
+        bool enablePeerCopies = false)
     {
         _context = context ?? throw new ArgumentNullException(nameof(context));
         ArgumentException.ThrowIfNullOrWhiteSpace(pool);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(allocationGranularity);
         _pool = pool;
         _allocationGranularity = allocationGranularity;
+        // Some PCIe/IOMMU topologies advertise P2P but corrupt transfers. The
+        // safe default is bounded host staging; opt in only after the directed
+        // pair checks in UnifiedMemory.CudaProbe pass on the actual deployment.
+        _enablePeerCopies = enablePeerCopies;
         Location = new(node, $"cuda:{context.DeviceId}", MemoryTier.Accelerator);
     }
     public MemoryLocation Location { get; }
@@ -36,16 +45,24 @@ public sealed class CudaResidencyBackend : IMemoryBackend
     {
         cancellationToken.ThrowIfCancellationRequested();
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(byteLength);
-        return ValueTask.FromResult<IResourceBuffer>(new Buffer(_context, byteLength));
+        return ValueTask.FromResult<IResourceBuffer>(new Buffer(_context, byteLength, _enablePeerCopies, peer =>
+        {
+            if (peer) Interlocked.Increment(ref _peerCopies);
+            else Interlocked.Increment(ref _deviceCopies);
+        }));
     }
 
-    private sealed class Buffer : IResourceBuffer
+    private sealed class Buffer : IResourceBuffer, IDirectCopyTarget
     {
         private readonly CudaContext _context;
         private nint _pointer;
-        internal Buffer(CudaContext context, long bytes)
+        private readonly bool _enablePeerCopies;
+        private readonly Action<bool> _recordCopy;
+        internal Buffer(CudaContext context, long bytes, bool enablePeerCopies, Action<bool> recordCopy)
         {
             _context = context;
+            _enablePeerCopies = enablePeerCopies;
+            _recordCopy = recordCopy;
             ByteLength = bytes;
             context.MakeCurrent();
             CudaDriverApi.cuMemAlloc(out _pointer, checked((nuint)bytes)).ThrowOnError();
@@ -82,6 +99,37 @@ public sealed class CudaResidencyBackend : IMemoryBackend
             // Publish residency only after the default-stream copy has completed.
             CudaDriverApi.cuStreamSynchronize(IntPtr.Zero).ThrowOnError();
             return ValueTask.CompletedTask;
+        }
+        public ValueTask<bool> TryCopyFromAsync(IResourceSource source, CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (source is not Buffer other) return ValueTask.FromResult(false);
+            if (other.ByteLength != ByteLength) throw new ArgumentException("Device copy lengths differ.");
+            _context.MakeCurrent();
+            if (_context.DeviceId == other._context.DeviceId)
+            {
+                CudaDriverApi.cuMemcpyDtoD(Pointer, other.Pointer, (nuint)ByteLength).ThrowOnError();
+                CudaDriverApi.cuStreamSynchronize(IntPtr.Zero).ThrowOnError();
+                _recordCopy(false);
+                return ValueTask.FromResult(true);
+            }
+            if (!_enablePeerCopies) return ValueTask.FromResult(false);
+            CudaDriverApi.cuDeviceGet(out int destinationDevice, _context.DeviceId).ThrowOnError();
+            CudaDriverApi.cuDeviceGet(out int sourceDevice, other._context.DeviceId).ThrowOnError();
+            CudaDriverApi.cuDeviceCanAccessPeer(out int accessible, destinationDevice, sourceDevice).ThrowOnError();
+            if (accessible == 0) return ValueTask.FromResult(false);
+            int enable = CudaDriverApi.cuCtxEnablePeerAccess(other._context.Handle, 0);
+            // CUDA_ERROR_PEER_ACCESS_ALREADY_ENABLED. Do not disable shared primary
+            // context access when this adapter ends; other TensorSharp paths use it.
+            if (enable != 0 && enable != 704) return ValueTask.FromResult(false);
+            try
+            {
+                CudaDriverApi.cuMemcpyPeerAsync(Pointer, _context.Handle, other.Pointer,
+                    other._context.Handle, (nuint)ByteLength, IntPtr.Zero).ThrowOnError();
+            }
+            finally { CudaDriverApi.cuStreamSynchronize(IntPtr.Zero).ThrowOnError(); }
+            _recordCopy(true);
+            return ValueTask.FromResult(true);
         }
         public void Dispose()
         {

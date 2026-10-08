@@ -28,6 +28,13 @@ var tests = new (string Name, Func<Task> Run)[]
     ("split GGUF catalog resolves actual shard and quantized bytes", Cases.GgufCatalog),
     ("existing placement policy regression vectors", Cases.Placement),
     ("batched streaming F32 matvec equals full mathematical reference", Cases.StreamingMatvec),
+    ("runtime KV snapshots spill/restore and epoch-safe reuse", Cases.KvSnapshots),
+    ("prefix references and active KV leases prevent premature recycling", Cases.KvPoolOwnership),
+    ("runtime full SSD preserves authoritative KV page", Cases.KvFullDisk),
+    ("continuous scheduler reserves multi-pool request peaks through release", Cases.SchedulerMemoryAdmission),
+    ("continuous scheduler rejects impossible/full queues and cancels waiters", Cases.SchedulerMemoryRejection),
+    ("budget change signal wakes blocked admission", Cases.BudgetWakeup),
+    ("multi-location working set and collective fence [simulated accelerator]", Cases.MultipleLocations),
 };
 var results = new List<object>();
 int failed = 0;

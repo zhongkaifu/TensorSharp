@@ -45,6 +45,12 @@ public sealed class BoundedTransfers : IDisposable
     {
         if (source.ByteLength != target.ByteLength) throw new ArgumentException("Source and target lengths differ.");
         using var slot = await RentAsync(cancellationToken).ConfigureAwait(false);
+        if (source is not IChecksummedSource && target is IDirectCopyTarget direct
+            && await direct.TryCopyFromAsync(source, cancellationToken).ConfigureAwait(false))
+        {
+            Interlocked.Add(ref _bytesCopied, source.ByteLength);
+            return;
+        }
         using var hash = source is IChecksummedSource ? IncrementalHash.CreateHash(HashAlgorithmName.SHA256) : null;
         for (long offset = 0; offset < source.ByteLength;)
         {

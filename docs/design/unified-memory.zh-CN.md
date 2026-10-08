@@ -6,19 +6,20 @@
 
 目标是让模型的**可执行工作集**适配硬件，而不是要求整个模型同时驻留 VRAM 或 RAM。系统统一管理权重、专家、KV、循环状态、前缀缓存、LoRA、多模态中间结果与临时工作区，保留原有模型计算语义，并根据请求并发程度选择驻留、搬运、计算和排队方案。
 
-本次已经构建可运行的调度基础库、RAM/文件搬运与状态回写、请求预算、GGUF 分片目录、CUDA 分配适配器，并将 Qwen4Exp 原有放置算法抽出后接回原路径。**尚未完成全部模型的原生执行图、KV 和媒体流水线接入；不能把本次实现描述为“所有模型已自动支持三层调度”。** 当前 CLI、Server、TensorAgent 没有一个新开关可以开启完整功能。
+本次已经构建可运行的调度基础库、RAM/文件搬运与状态回写、请求预算、GGUF 分片目录、CUDA 分配适配器，并将 Qwen4Exp 原有放置算法抽出后接回原路径。**尚未完成全部模型的原生执行图、KV 和媒体流水线接入；不能把本次实现描述为“所有模型已自动支持三层调度”。** CLI、Server、TensorAgent 的公共引擎已可通过环境变量启用有预算的主机 KV 快照换页，但没有一个开关可以开启完整的全模型三层调度。
 
 | 范围 | 本次状态 |
 | --- | --- |
 | 模型无关预算、驻留目录、租约、版本、LRU、固定搬运缓冲 | 已实现并测试 |
 | 真正的 RAM 分配、文件按区间读取、可变状态 SSD 回写/恢复 | 已实现并测试；存储介质类型未作 NVMe 假设 |
-| 请求完整峰值预留、FIFO 队列、取消、预留向实际分配转账 | 已实现并测试；尚未接管现有服务的全部请求 |
+| 请求完整峰值预留、FIFO 队列、取消、预留向实际分配转账 | 已接入 ContinuousBatchScheduler/InferenceEngine；由执行器显式提供成本，未自动启用全部旧模型 |
 | GGUF / split GGUF 权重目录和不改量化格式的切片 | 已实现并测试；旧加载器未整体切换 |
 | Qwen CUDA/UMA 静态放置算法通用化 | 已接入原模型路径；保持原调优参数 |
-| CUDA 原始分配/读写/释放适配器 | 已编译；GPU 运行和性能未验证 |
+| 主机 KV 快照、前缀页、循环状态快照 | 已接入实际捕获/恢复路径，支持 RAM/SSD；不接管原生 holder/device arena |
+| CUDA 原始分配/读写/释放、真实 event fence、可选 P2P | 已编译；GPU 运行和性能未验证，P2P 默认关闭 |
 | GGML/Metal/Vulkan/MLX 原生图、分页 KV、全部融合算子 | 接口与迁移方案已设计，适配仍待实现 |
-| 多卡预算向量、带节点/设备标识的资源位置 | 数据结构已支持；实际多卡执行未验证 |
-| 多机协调、远程内存、P2P、异步 DMA 重叠、自适应成本策略 | 设计阶段，未实现 |
+| 多卡预算向量、带节点/设备标识的资源位置 | 已支持多位置工作集租约和全 rank fence；实际多卡执行未验证 |
+| 多机协调、远程内存、异步 DMA 重叠、自适应成本策略 | 设计阶段，未实现 |
 
 “高速”必须相对于模型、量化、工作集、带宽和 SLO 定义。容量虚拟化能让更多模型运行，但无法让每个 token 都要读取几十 GB 冷权重的 dense 模型获得全驻留 GPU 的延迟。
 
@@ -181,7 +182,7 @@ $$z=e^{m_a-m}z_a+e^{m_b-m}z_b,\qquad o=z/l.$$
 
 ## 10. 当前所有模型族的接入清单
 
-以下来自基线 `BuiltInArchitectures.cs` 及其模型目录，不依据宣传名称推断已经兼容。所有条目的通用登记/搬运数据结构可复用；除 Qwen 放置策略抽取之外，下表的执行适配仍是待完成工作。
+以下来自基线 `BuiltInArchitectures.cs` 及其模型目录，不依据宣传名称推断已经兼容。所有条目的通用登记/搬运数据结构可复用；Qwen 放置策略和公共主机 KV 快照路径已经接入；下表的各模型原生执行、holder/arena、媒体资源适配仍是待完成工作，不能用公共路径测试代替每个模型的验收。
 
 | 注册族/目录 | 必须申报和适配的资源 | 关键验收 |
 | --- | --- | --- |
@@ -248,11 +249,11 @@ CLI、HTTP API、Web Chat、TensorAgent 最终应共享一套 engine 配置。�
 
 本次环境为 Linux x64、.NET SDK 10.0.401。`TensorSharp.Memory`、Runtime 和 CUDA 托管适配器已编译。原生 GGML 构建因为缺少 CMake 未完成；后续托管测试明确使用 `TensorSharpSkipGgmlNative=true`，不是把原生场景记成通过。
 
-新增独立 harness 当前 **23/23 通过**：原子预算/UMA、并发额度、请求 envelope、队列取消、真实文件大工作集、single-flight、写独占/版本、SSD 无损回写、损坏校验、SSD 配额耗尽、I/O/分配失败和取消回滚、完成事件、部分工作集回滚、预取、主机降级、生命周期、并发状态更新、split GGUF、原策略回归和流式矩阵计算。
+新增独立 harness 当前 **30/30 通过**：原子预算/UMA、并发额度、请求 envelope、队列取消、真实文件大工作集、single-flight、写独占/版本、SSD 无损回写、损坏校验、SSD 配额耗尽、I/O/分配失败和取消回滚、完成事件、部分工作集回滚、预取、主机降级、生命周期、并发状态更新、split GGUF、原策略回归和流式矩阵计算；追加了实际 KV 存储换页、block id 复用、前缀引用释放、SSD 满保留状态、真实调度器准入/取消、预算唤醒及多位置租约测试。
 
 真实文件工作集测试：1 MiB 权重文件，在 12 KiB 的受管 payload/staging 预算下循环读取。流式计算测试：512 KiB F32 矩阵，在 20 KiB 的受管 payload/staging 预算下分块，8 个请求共享一次权重读取，4,096 个结果与同运算顺序的参考计算逐位一致。输入/输出、.NET 运行时和 OS page cache 不属于这个 payload 预算；这些不是低 RAM 完整 LLM 的 benchmark。
 
-现有 `Qwen4ExpCudaPlacementTests`、`SchedulerCapacityAdmissionTests` 及 `Qwen4ExpExpertOffloadTests.Plan_` 的四个 UMA 放置用例：**41/41 通过，0 skipped**。Memory、Runtime、CUDA 三个 NuGet 包已本地打包，并检查程序集与依赖关系；未发布包。硬件 CUDA/Metal/Vulkan、真实完整 LLM、图像/音频/视频质量、多 GPU 和多机推理：**未运行**。模拟 accelerator 的测试只验证状态机，绝不替代硬件测试。
+`ContinuousBatchSchedulerTests`、`Qwen4ExpCudaPlacementTests`、`SchedulerCapacityAdmissionTests` 和 `Qwen4ExpExpertOffloadTests.Plan_`：**66/66 通过，0 skipped**。新增公共引擎测试用依赖完整历史状态的确定性模型逐 token 比较换页前后并发输出，并验证循环状态 checkpoint、外部预算释放唤醒及取消。Memory、Runtime、CUDA 三个 NuGet 包已本地打包，并检查程序集与依赖关系；未发布包。硬件 CUDA/Metal/Vulkan、真实完整 LLM、图像/音频/视频质量、多 GPU 和多机推理：**未运行**。模拟 accelerator 的测试只验证状态机，绝不替代硬件测试。
 
 复现命令：
 
@@ -262,8 +263,8 @@ dotnet run --project eng/tests/unified-memory/UnifiedMemory.Tests.csproj -c Rele
 
 dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj -c Release -m:1 \
   -p:BuildInParallel=false -p:TensorSharpSkipGgmlNative=true -p:TensorSharpSkipMlxNative=true \
-  --filter 'FullyQualifiedName~Qwen4ExpCudaPlacementTests|FullyQualifiedName~SchedulerCapacityAdmissionTests|FullyQualifiedName~Qwen4ExpExpertOffloadTests.Plan_' \
-  --logger 'trx;LogFileName=unified-memory-regression.trx' \
+  --filter 'FullyQualifiedName~ContinuousBatchSchedulerTests|FullyQualifiedName~Qwen4ExpCudaPlacementTests|FullyQualifiedName~SchedulerCapacityAdmissionTests|FullyQualifiedName~Qwen4ExpExpertOffloadTests.Plan_' \
+  --logger 'trx;LogFileName=unified-memory-followup.trx' \
   --results-directory artifacts/unified-memory
 ```
 
@@ -271,7 +272,29 @@ dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj -c Release -m:1 \
 
 记录 p50/p95/p99 TTFT、TPOT、每请求与聚合吞吐、模型质量/完整 logits、实际 VRAM/RSS/pinned 峰值、每层有效字节、SSD IOPS/带宽/写放大、cache 命中、重复 prefill 和队列等待。比较必须保持 checkpoint、量化、上下文、路由、输出长度和服务质量设定一致，不能把所有请求聚合 throughput 当成单请求速度。
 
-## 15. 外部工程依据
+## 15. 后续实际接入与硬件验证入口
+
+`PagedKvStorage` 的 `Acquire` 返回有生命周期的 span 租约；`BatchExecutor` 的捕获、尾页刷新、恢复全部使用该 API。底层将一个页面视为不解释布局的可变资源，按原字节回写/恢复。前缀引用继续保留逻辑页，最后一个引用消失才注销；id 再次分配时增加 epoch。失败的释放不把页面放回 free queue。捕获 scratch 和固定搬运缓冲在启动时预留，单个模型必须能容纳一个合法完整快照页。恢复阶段可在有空闲驻留容量时预取下一页，与当前注入操作重叠；停止/回收前等待预取结束。
+
+公共引擎的可用配置：
+
+```sh
+export TS_SCHED_KV_RAM_BYTES=1073741824
+export TS_SCHED_KV_SSD_BYTES=8589934592
+export TS_SCHED_KV_SPILL_DIRECTORY=/path/on/ssd/tensorsharp-kv
+```
+
+这些是**每个引擎的主机快照预算**，包含其 scratch/staging；不是总 RSS、模型权重、原生设备 KV 或 holder 的上限。多引擎部署须保证这些独立配额总和适合机器容量。若所选执行路径不导出主机快照，配置不会将原生状态自动换出。更大的原生 attention/KV/holder 适配仍需对应实现。
+
+`SchedulerConfig.MemoryAdmission` 已接入实际调度器：执行器提供每请求完整增量峰值，按多 pool 原子预留；准入先于前缀物化，取消/结束/抢占的额度在模型释放完成后才归还。`SequenceState.MemoryEnvelope` 用于实际分配，防止双重计账；缓存存活的子分配继续计费。共享权重、池化 arena 和保留前缀必须采用自己的生命周期额度。预算耗尽且当前引擎无运行请求时，worker 在模型锁外等待预算变化或新命令，不忙轮询。尚未为所有旧模型自动推导成本。
+
+多卡 `ResourcePlacement` 工作集失败时释放所有部分 pin，`ResourceLeaseSet.ReleaseAfterAsync` 接受全 rank fence。CUDA 实现真实 event fence 与可选 P2P；默认跨设备走有界主机中转。仓库既有 P2P 通信实现记录了部分云端 PCIe/IOMMU 拓扑传输损坏，故新接口也不能只凭 `cuDeviceCanAccessPeer` 就默认启用。
+
+硬件验证工具：[UnifiedMemory.CudaProbe](../../eng/validation/UnifiedMemory.CudaProbe/README.md)。它在每个选中 GPU 上实际执行整数内核，检查全量结果、事件生命周期、VRAM/RAM 压力下的 SSD 恢复、16 个并发读取者、逐方向 GPU 复制、部分工作集回滚与所有 rank fence。指定 P2P 却未走 peer 路径时返回失败；没有驱动或设备时返回 unavailable，不算通过。
+
+本次给定 VM 的 SSH 尝试受到执行环境限制：指定私钥不存在，网络连接返回 `Network is unreachable`。本地硬件探针报告 `hardware unavailable`（没有 CUDA driver），完成 0 个硬件场景。没有修改 VM。工具已编译，真实 GPU/多 GPU、真实完整模型及多机验收仍待具备访问条件后执行。
+
+## 16. 外部工程依据
 
 以下只用于设计取舍，没有把别人的性能数字当作 TensorSharp 成绩：
 

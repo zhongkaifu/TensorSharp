@@ -28,6 +28,19 @@ public sealed class MemoryBudget
     }
     private readonly object _gate = new();
     private readonly Dictionary<string, Pool> _pools = new(StringComparer.Ordinal);
+    private TaskCompletionSource _changed = NewSignal();
+    private static TaskCompletionSource NewSignal() => new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    /// <summary>Capture BEFORE trying admission, then wait if it fails. The signal
+    /// completes when releases/capacity changes could allow progress; no polling or
+    /// callbacks under the accounting lock are required.</summary>
+    public Task ChangeSignal { get { lock (_gate) return _changed.Task; } }
+    private void Pulse()
+    {
+        var old = _changed;
+        _changed = NewSignal();
+        old.TrySetResult();
+    }
 
     public MemoryBudget(IEnumerable<MemoryCharge> capacities)
     {
@@ -93,6 +106,7 @@ public sealed class MemoryBudget
             var p = _pools[pool];
             if (capacity < p.Reserved + p.Committed) return false;
             p.Capacity = capacity;
+            Pulse();
             return true;
         }
     }
@@ -133,6 +147,7 @@ public sealed class MemoryBudget
                 }
             }
             reservation.State = 2;
+            Pulse();
         }
     }
 

@@ -69,39 +69,47 @@ namespace TensorSharp.Runtime.Scheduling
 
             long blockBytes = ComputeBlockByteSize(model, cfg.BlockSize);
             int numBlocks = ResolveEffectiveNumBlocks(model, cfg, _logger);
-            _pool = new BlockPool(numBlocks, cfg.BlockSize, blockBytes);
-            _scheduler = new ContinuousBatchScheduler(cfg, _pool, logger,
-                supportsCrossSequenceKvReuse: model.SupportsCrossSequenceKvReuse,
-                requiresPerBlockCapture: model.RequiresPerBlockCapture);
-            _executor = new BatchExecutor(model, _pool, _scheduler, logger);
-            _executor.InitializeRadixCache(cfg);
-            // So admission can say WHY a turn reused nothing.
-            _scheduler.AttachReuseDiagnostics(() => _executor.LastFusedContinuationDeclineReason);
-            // Shared-prefix checkpoints: end a prefill chunk exactly where the chat
-            // layer says the shared prompt ends, so the executor can copy the model's
-            // state there and start every later new chat from that copy.
-            if (_executor.PrefixCheckpointsSupported)
-                _scheduler.EnablePrefixCheckpoints();
-
-            // One-time capability report: which execution paths are statically
-            // available for this model+backend under the current configuration,
-            // and why the unavailable ones are unavailable. Per-step routing
-            // (selected path, fallback chain, rejection reasons) is logged by
-            // BatchExecutor whenever the plan changes.
-            _logger.LogInformation(
-                "InferenceEngine[{Arch}] execution capability report:\n{Report}",
-                model.Config?.Architecture ?? "model",
-                ExecutionPlanner.BuildCapabilityReport(
-                    ExecutionCapabilities.FromModel(model),
-                    ExecutionOptions.FromEnvironment(),
-                    cfg));
-
-            _worker = new Thread(WorkerLoop)
+            _pool = new BlockPool(numBlocks, cfg.BlockSize, blockBytes, cfg.KvSnapshots);
+            try
             {
-                IsBackground = true,
-                Name = $"TensorSharp.InferenceEngine[{model.Config?.Architecture ?? "model"}]",
-            };
-            _worker.Start();
+                _scheduler = new ContinuousBatchScheduler(cfg, _pool, logger,
+                    supportsCrossSequenceKvReuse: model.SupportsCrossSequenceKvReuse,
+                    requiresPerBlockCapture: model.RequiresPerBlockCapture);
+                _executor = new BatchExecutor(model, _pool, _scheduler, logger);
+                _executor.InitializeRadixCache(cfg);
+                // So admission can say WHY a turn reused nothing.
+                _scheduler.AttachReuseDiagnostics(() => _executor.LastFusedContinuationDeclineReason);
+                // Shared-prefix checkpoints: end a prefill chunk exactly where the chat
+                // layer says the shared prompt ends, so the executor can copy the model's
+                // state there and start every later new chat from that copy.
+                if (_executor.PrefixCheckpointsSupported)
+                    _scheduler.EnablePrefixCheckpoints();
+
+                // One-time capability report: which execution paths are statically
+                // available for this model+backend under the current configuration,
+                // and why the unavailable ones are unavailable. Per-step routing
+                // (selected path, fallback chain, rejection reasons) is logged by
+                // BatchExecutor whenever the plan changes.
+                _logger.LogInformation(
+                    "InferenceEngine[{Arch}] execution capability report:\n{Report}",
+                    model.Config?.Architecture ?? "model",
+                    ExecutionPlanner.BuildCapabilityReport(
+                        ExecutionCapabilities.FromModel(model),
+                        ExecutionOptions.FromEnvironment(),
+                        cfg));
+
+                _worker = new Thread(WorkerLoop)
+                {
+                    IsBackground = true,
+                    Name = $"TensorSharp.InferenceEngine[{model.Config?.Architecture ?? "model"}]",
+                };
+                _worker.Start();
+            }
+            catch
+            {
+                _pool.Storage.Dispose();
+                throw;
+            }
         }
 
         public IModelArchitecture Model => _model;
@@ -113,6 +121,8 @@ namespace TensorSharp.Runtime.Scheduling
             (double)Interlocked.Read(ref _totalForwardTicks) * 1000.0 / System.Diagnostics.Stopwatch.Frequency);
         public int RunningCount => _scheduler.RunningCount;
         public int WaitingCount => _scheduler.WaitingCount;
+        public IReadOnlyList<TensorSharp.Memory.MemoryPoolSnapshot>? SnapshotMemoryUsage => _pool.Storage.MemoryUsage;
+        public TensorSharp.Memory.MemorySchedulerStats? SnapshotResidencyStats => _pool.Storage.ResidencyStats;
 
         /// <summary>
         /// Whether the step loop may run right now, or null for "always".
@@ -174,6 +184,10 @@ namespace TensorSharp.Runtime.Scheduling
                     throw new InvalidOperationException(
                         $"Sequence {seq.RequestId} is already submitted.");
                 }
+
+                if (_scheduler.Config.MemoryAdmission is { } admission
+                    && _handles.Count >= (long)admission.MaxQueuedRequests + Math.Max(1, _scheduler.Config.MaxNumRunningSequences))
+                    throw new TensorSharp.Memory.MemoryPressureException("The engine's bounded request admission queue is full.");
 
                 var handle = new InferenceRequestHandle(seq, this, ct);
                 if (!_handles.TryAdd(seq.RequestId, handle))
@@ -285,6 +299,7 @@ namespace TensorSharp.Runtime.Scheduling
                     }
                     _executor.Reset();
                     _executor.RadixCache?.Detach();
+                    _pool.Storage.Dispose();
                 }
             }
         }
@@ -292,8 +307,23 @@ namespace TensorSharp.Runtime.Scheduling
         private void WorkerLoop()
         {
             var sw = new System.Diagnostics.Stopwatch();
+            Task? memoryWait = null;
             while (!_shutdownCts.IsCancellationRequested)
             {
+                // External engines may share this budget. Wait outside the model
+                // lock, and also wake for submit/abort/shutdown commands.
+                if (memoryWait != null)
+                {
+                    using var wake = CancellationTokenSource.CreateLinkedTokenSource(_shutdownCts.Token);
+                    try
+                    {
+                        Task.WhenAny(memoryWait, _commands.Reader.WaitToReadAsync(wake.Token).AsTask())
+                            .WaitAsync(_shutdownCts.Token).GetAwaiter().GetResult();
+                    }
+                    catch (OperationCanceledException) { break; }
+                    finally { wake.Cancel(); }
+                    memoryWait = null;
+                }
                 // Drain queued commands (non-blocking).
                 while (_commands.Reader.TryRead(out var cmd))
                 {
@@ -338,10 +368,12 @@ namespace TensorSharp.Runtime.Scheduling
                     List<SequenceStepResult> results;
                     try
                     {
+                        memoryWait = _scheduler.Config.MemoryAdmission?.Budget.ChangeSignal;
                         output = _scheduler.Schedule();
                     }
                     catch (Exception ex)
                     {
+                        memoryWait = null;
                         FailStepSequences(ex, output, "scheduler");
                         continue;
                     }
@@ -363,8 +395,11 @@ namespace TensorSharp.Runtime.Scheduling
                         if (_scheduler.RunningCount > 0
                             && output.PreemptedRequestIds.Count == 0)
                             FailStalledSequences();
+                        if (!_scheduler.MemoryAdmissionBlocked || _scheduler.RunningCount > 0 || _scheduler.WaitingCount == 0)
+                            memoryWait = null;
                         continue;
                     }
+                    memoryWait = null;
 
                     try
                     {
@@ -595,6 +630,7 @@ namespace TensorSharp.Runtime.Scheduling
             {
                 batched?.OnSequenceReleased(requestId);
                 _executor.RadixCache?.Drain();
+                _scheduler.NotifyMemoryReleased(requestId);
             }
             catch (Exception ex)
             {

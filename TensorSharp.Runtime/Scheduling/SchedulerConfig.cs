@@ -6,6 +6,7 @@
 // TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
 using TensorSharp.Runtime.Speculative;
 using TensorSharp.Runtime.Scheduling.PrefixCache;
+using TensorSharp.Runtime.Paged;
 
 namespace TensorSharp.Runtime.Scheduling
 {
@@ -16,6 +17,10 @@ namespace TensorSharp.Runtime.Scheduling
     /// </summary>
     public sealed class SchedulerConfig
     {
+        /// <summary>Optional RAM/SSD budgets for model snapshot bytes only.</summary>
+        public KvSnapshotOptions? KvSnapshots { get; init; }
+        public RequestMemoryAdmission? MemoryAdmission { get; init; }
+
         /// <summary>Maximum tokens forwarded across all sequences per step.
         /// Equivalent to vLLM's <c>max_num_batched_tokens</c>. Default 4096.</summary>
         public int MaxNumBatchedTokens { get; init; } = 4096;
@@ -123,6 +128,8 @@ namespace TensorSharp.Runtime.Scheduling
             StopRepetition = StopRepetition,
             DecodeQuantumTokens = DecodeQuantumTokens,
             Speculation = speculation,
+            KvSnapshots = KvSnapshots,
+            MemoryAdmission = MemoryAdmission,
         };
 
         public static SchedulerConfig FromEnvironment()
@@ -143,6 +150,7 @@ namespace TensorSharp.Runtime.Scheduling
                 StopRepetition = ReadBool("TS_SCHED_STOP_REPETITION", true),
                 DecodeQuantumTokens = ReadInt("TS_SCHED_DECODE_QUANTUM", 256),
                 Speculation = SpeculationOptions.FromEnvironment(),
+                KvSnapshots = KvSnapshotOptions.FromEnvironment(),
             };
             return cfg;
         }

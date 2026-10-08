@@ -21,6 +21,10 @@ namespace TensorSharp.Runtime.Scheduling
     /// </summary>
     public sealed class SequenceState
     {
+        /// <summary>Request peak credit owned by the engine until model release
+        /// completes. Model adapters borrow it for allocations; they must not dispose it.</summary>
+        public TensorSharp.Memory.BudgetReservation? MemoryEnvelope { get; internal set; }
+
         private static long _counter;
 
         public SequenceState(

@@ -6,6 +6,8 @@
 // TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
 using System;
 using System.Collections.Generic;
+using System.Linq;
+using TensorSharp.Memory;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using TensorSharp.Runtime.Paged;
@@ -54,6 +56,8 @@ namespace TensorSharp.Runtime.Scheduling
         // Request ids survive additions/removals better than a numeric cursor.
         private string? _nextPrefillRequestId;
         private readonly ILogger _logger;
+        private readonly Dictionary<string, MemoryCharge[]> _memoryPeaks = new(StringComparer.Ordinal);
+        private readonly Dictionary<string, SequenceState> _memoryOwners = new(StringComparer.Ordinal);
 
         public ContinuousBatchScheduler(
             SchedulerConfig cfg,
@@ -132,6 +136,7 @@ namespace TensorSharp.Runtime.Scheduling
 
         public int WaitingCount => _waiting.Count;
         public int RunningCount => _running.Count;
+        public bool MemoryAdmissionBlocked { get; private set; }
         public BlockPool Pool => _pool;
         public SchedulerConfig Config => _cfg;
 
@@ -187,6 +192,8 @@ namespace TensorSharp.Runtime.Scheduling
             if (seq == null) throw new ArgumentNullException(nameof(seq));
             if (_waitingIndex.ContainsKey(seq.RequestId) || _running.ContainsKey(seq.RequestId))
                 throw new InvalidOperationException($"Sequence {seq.RequestId} is already submitted.");
+            if (_memoryOwners.ContainsKey(seq.RequestId))
+                throw new InvalidOperationException("The previous request with this id has not released its physical memory.");
 
             // A single request can eventually reclaim blocks from other requests
             // through preemption, but it can never exceed the pool's physical
@@ -208,6 +215,15 @@ namespace TensorSharp.Runtime.Scheduling
                 throw ex;
             }
 
+            if (_cfg.MemoryAdmission is { } admission)
+            {
+                if (_waiting.Count >= admission.MaxQueuedRequests)
+                    throw new MemoryPressureException("The memory admission queue is full.");
+                var peak = admission.EstimatePeak(seq).ToArray();
+                if (!admission.Budget.CanEverFit(peak))
+                    throw new MemoryPressureException("Request peak exceeds a configured physical memory pool even in isolation.");
+                _memoryPeaks.Add(seq.RequestId, peak);
+            }
             var node = _waiting.AddLast(seq);
             _waitingIndex[seq.RequestId] = node;
             seq.Status = SequenceStatus.Waiting;
@@ -233,6 +249,7 @@ namespace TensorSharp.Runtime.Scheduling
         /// </summary>
         public SchedulerOutput Schedule()
         {
+            MemoryAdmissionBlocked = false;
             var output = new SchedulerOutput();
             int tokenBudget = _cfg.MaxNumBatchedTokens;
 
@@ -373,6 +390,13 @@ namespace TensorSharp.Runtime.Scheduling
                 // Try prefix cache lookup before allocating blocks (only for
                 // brand-new sequences; preempted ones already had their blocks
                 // freed and need a fresh re-prefill, no shortcut).
+                if (_cfg.MemoryAdmission is { } admission && seq.MemoryEnvelope == null)
+                {
+                    var envelope = admission.Budget.TryReserve(_memoryPeaks[seq.RequestId]);
+                    if (envelope == null) { MemoryAdmissionBlocked = true; break; }
+                    seq.MemoryEnvelope = envelope;
+                    _memoryOwners.Add(seq.RequestId, seq);
+                }
                 bool soleAdmission = false;
                 if (seq.BlockTable.NumBlocks == 0 && PrefixCachingActive)
                 {
@@ -600,8 +624,24 @@ namespace TensorSharp.Runtime.Scheduling
 
             if (_running.Remove(seq.RequestId))
                 _runningOrder.Remove(seq);
+            _memoryPeaks.Remove(seq.RequestId);
 
             return true;
+        }
+
+        /// <summary>Call only AFTER model release/fences, including preemption and
+        /// cancellation. Retained allocations drawn from the envelope remain charged.
+        /// A failing release hook must leave its envelope reserved for recovery.</summary>
+        public void NotifyMemoryReleased(string requestId)
+        {
+            if (_memoryOwners.TryGetValue(requestId, out var seq))
+            {
+                if (seq.Status == SequenceStatus.Running)
+                    throw new InvalidOperationException("Cannot release a running request's memory envelope.");
+                seq.MemoryEnvelope!.Dispose();
+                seq.MemoryEnvelope = null;
+                _memoryOwners.Remove(requestId);
+            }
         }
 
         /// <summary>Make sure the sequence has block table capacity for

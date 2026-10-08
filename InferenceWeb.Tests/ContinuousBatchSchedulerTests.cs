@@ -9,6 +9,8 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using System.IO;
+using TensorSharp.Memory;
 using Microsoft.Extensions.Logging.Abstractions;
 using TensorSharp;
 using TensorSharp.Runtime.Paged;
@@ -474,12 +476,17 @@ public class ContinuousBatchSchedulerTests
         Assert.Equal("eos", completion.FinishReason);
     }
 
-    [Fact]
-    public void Executor_RecurrentOwnerSwap_PreservesFullCheckpoints_AndRefreshesPartialTail()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Executor_RecurrentOwnerSwap_PreservesFullCheckpoints_AndRefreshesPartialTail(bool tiered)
     {
         var model = new RecurrentStubModel("fp-recurrent-swap", peakToken: 3);
         var cfg = RecurrentConfig();
-        var pool = NewPool(numBlocks: cfg.NumBlocks);
+        using var directory = new SnapshotTestDirectory();
+        var pool = new BlockPool(cfg.NumBlocks, BlockSize, model.ComputeKVBlockByteSize(BlockSize),
+            tiered ? new KvSnapshotOptions(192, 128 * 4096, directory.Path, 64) : null);
+        using var storage = pool.Storage;
         var sched = new ContinuousBatchScheduler(cfg, pool, NullLogger.Instance,
             requiresPerBlockCapture: true);
         var executor = new BatchExecutor(model, pool, sched, NullLogger.Instance);
@@ -510,6 +517,68 @@ public class ContinuousBatchSchedulerTests
         Assert.Equal(
             new[] { (5 * BlockSize, 5), (0, BlockSize) },
             model.ExtractCalls.Skip(5).ToArray());
+        if (tiered) Assert.True(storage.ResidencyStats!.Value.Spills > 0);
+    }
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    public async Task Engine_TieredKv_ConcurrentOutputsMatchResidentStatefulModel(int residentPages)
+    {
+        using var directory = new SnapshotTestDirectory();
+        async Task<int[][]> Run(bool tiered)
+        {
+            using var model = new StubModel("fp-tiered", 7, stateDependent: true);
+            long blockBytes = model.ComputeKVBlockByteSize(BlockSize);
+            var cfg = new SchedulerConfig { NumBlocks = 64, BlockSize = BlockSize,
+                MaxNumBatchedTokens = 32, MaxPrefillChunkSize = 8, SoloPrefillChunkSize = 32,
+                DecodeQuantumTokens = 1, EnablePrefixCaching = true, StopRepetition = false,
+                KvSnapshots = tiered ? new((1 + residentPages) * blockBytes + 64, 128 * 4096, directory.Path, 64) : null };
+            using var engine = new InferenceEngine(model, cfg);
+            var handles = Enumerable.Range(0, 4).Select(i => engine.SubmitRequest(new SequenceState(
+                $"stateful-{i}", Enumerable.Range(0, 24 + i).Select(t => (t + i) % 15 + 1).ToArray(),
+                12, BlockSize, SamplingConfig.Greedy))).ToArray();
+            await Task.WhenAll(handles.Select(h => h.Completion)).WaitAsync(TimeSpan.FromSeconds(15));
+            foreach (var handle in handles) Assert.Equal(SequenceStatus.FinishedLengthCapped, handle.Sequence.Status);
+            if (tiered)
+            {
+                Assert.True(engine.SnapshotResidencyStats!.Value.Spills > 0);
+                Assert.All(engine.SnapshotMemoryUsage!, p => Assert.True(p.Reserved + p.Committed <= p.Capacity));
+            }
+            return handles.Select(h => h.Sequence.OutputTokens.ToArray()).ToArray();
+        }
+        var expected = await Run(false);
+        var actual = await Run(true);
+        for (int i = 0; i < expected.Length; i++) Assert.Equal(expected[i], actual[i]);
+        Assert.Empty(Directory.EnumerateFiles(directory.Path, "*", SearchOption.AllDirectories));
+    }
+
+    [Fact]
+    public async Task Engine_MemoryAdmission_WakesOnExternalRelease_AndCancellation()
+    {
+        var budget = new MemoryBudget(new[] { new MemoryCharge("gpu", 100) });
+        using var outside = budget.Reserve(new[] { new MemoryCharge("gpu", 100) });
+        using var model = new StubModel("fp-budget", 7);
+        using var engine = new InferenceEngine(model, new SchedulerConfig { BlockSize = BlockSize, NumBlocks = 32,
+            StopRepetition = false, MemoryAdmission = new(budget, _ => new[] { new MemoryCharge("gpu", 100) }) });
+        var first = engine.SubmitRequest(NewSequence("cancelled", 8, 3));
+        var second = engine.SubmitRequest(NewSequence("resume", 8, 3));
+        engine.Abort(first.RequestId);
+        var cancelled = await first.Completion.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(SequenceStatus.FinishedAborted, cancelled.Status);
+        Assert.Equal(0, engine.TotalStepsRun);
+        outside.Dispose();
+        var finished = await second.Completion.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(SequenceStatus.FinishedLengthCapped, finished.Status);
+        engine.Dispose();
+        Assert.All(budget.Snapshot(), p => Assert.Equal(p.Capacity, p.Available));
+    }
+
+    private sealed class SnapshotTestDirectory : IDisposable
+    {
+        public string Path { get; } = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "ts-runtime-kv-" + Guid.NewGuid().ToString("N"));
+        public SnapshotTestDirectory() => Directory.CreateDirectory(Path);
+        public void Dispose() => Directory.Delete(Path, recursive: true);
     }
 
     [Fact]
@@ -716,17 +785,20 @@ public class ContinuousBatchSchedulerTests
         private int _eos = -1;
         private readonly ManualResetEventSlim? _forwardEntered;
         private readonly ManualResetEventSlim? _releaseForward;
+        private readonly bool _stateDependent;
 
         public StubModel(
             string fingerprint,
             int peakToken,
             ManualResetEventSlim? forwardEntered = null,
-            ManualResetEventSlim? releaseForward = null)
+            ManualResetEventSlim? releaseForward = null,
+            bool stateDependent = false)
         {
             _fp = fingerprint;
             _peak = peakToken;
             _forwardEntered = forwardEntered;
             _releaseForward = releaseForward;
+            _stateDependent = stateDependent;
             Tokenizer = new StubTokenizer(VocabSize, this);
         }
 
@@ -763,7 +835,15 @@ public class ContinuousBatchSchedulerTests
             _cacheSeqLen += tokens.Length;
 
             var logits = new float[VocabSize];
-            logits[_peak] = 10.0f;
+            int peak = _peak;
+            if (_stateDependent)
+            {
+                int digest = 0;
+                for (int t = 0; t < _cacheSeqLen; t++)
+                    digest = ((digest * 7) ^ _state[(int)ComputeKVBlockByteSize(t)]) % (VocabSize - 1);
+                peak = digest + 1;
+            }
+            logits[peak] = 10.0f;
             return logits;
         }
 
