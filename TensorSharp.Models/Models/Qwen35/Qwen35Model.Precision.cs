@@ -21,7 +21,8 @@ public partial class Qwen35Model
                 foreach (var weight in pair.Value) if (weight != null) weights.Add(weight);
         try
         {
-            foreach (var weight in weights) weight.EnableQ8F32Activations();
+            foreach (var weight in weights)
+                if (!weight.IsStreamed) weight.EnableQ8F32Activations();
         }
         catch
         {

@@ -254,6 +254,8 @@ namespace TensorSharp.Models
 
         public IntPtr EnsureDeviceCacheKey()
         {
+            if (IsStreamed)
+                throw new InvalidOperationException("A streamed file region cannot become a persistent device-cache key.");
             if (_ownsCacheKeyHandle)
                 return CacheKey;
 

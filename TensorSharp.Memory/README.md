@@ -134,9 +134,11 @@ Do not sum independently configured engine budgets beyond the machine's availabl
 capacity. Native model KV, holders, weights, activations and process overhead still
 need their own accounting/adapters. Construction rejects a model without complete,
 cross-sequence-restorable host snapshots, a zero-size snapshot, or a block larger
-than its restorable window. Qwen 3.5 currently rejects this mode because it declares
-cross-sequence byte snapshots unsafe; its existing complete-holder route remains
-available when this mode is unset. These flags do not virtualize native device state.
+than its restorable window. Qwen 3.5 enables this mode for the validated dense,
+no-MTP, single-rank GGML CUDA path, including GDN recurrent state and attention KV;
+its MoE, MTP, tensor-parallel and other backend paths still reject this mode.
+The existing complete-holder route remains available when this mode is unset.
+These flags do not virtualize native device state.
 With prefix caching disabled, a lone request never swaps and produces no snapshots;
 that case cannot establish spill/restore coverage.
 
@@ -175,6 +177,47 @@ some PCIe/IOMMU topologies advertise support but corrupt data; unsupported route
 use the existing bounded host transfer slots. Before passing `enablePeerCopies:
 true`, run the directed-pair validation on that machine. This is not a distributed
 transaction coordinator or automatic tensor-parallel model integration.
+
+## Explicit Qwen3.5 weight streaming
+
+`TensorSharp.Models.WeightStreamingOptions` opts the dense, text-only Qwen3.5
+GGML CUDA adapter into file-backed Q8_0 projections and embeddings:
+
+```csharp
+var budget = new MemoryBudget(new[] {
+    new MemoryCharge("ram", 2L << 20),
+    new MemoryCharge("gpu0", 2L << 20),
+});
+var streaming = new WeightStreamingOptions(budget, "ram", new[] { "gpu0" },
+    tileBytes: 1 << 20, tokenTileRows: 32);
+using var model = ModelBase.Create(modelPath, BackendType.GgmlCuda,
+    weightStreaming: streaming);
+```
+
+This mode reads original GGUF ranges without full-file prefault, mmap, copied
+fusion packs or weight preloads. A fixed host tile contains complete Q8_0 output
+rows; each CUDA session owns only its aligned input, weight tile and output tile.
+Rows and token batches shrink to fit the remaining shared constraints. A complete
+input/reduction axis always stays together. Embeddings read only requested rows.
+No tile pointer becomes a native cache key or captured graph input. Synchronous
+completion makes it safe to overwrite the tile. Failed physical cleanup retains
+the native handle and its reservation for a later disposal retry.
+If a forward fails, earlier layers may already have changed KV/recurrent state.
+Another `Forward`/`ForwardRefill` is refused until `ResetKVCache` succeeds; replay
+the entire request after reset. An operator pressure error is not an atomic
+rollback of the whole model step.
+
+The example's 2 MiB capacities cover **streamed weight staging and operation
+workspaces**, not the whole process or all device memory. Existing activations,
+live KV/recurrent state, bounded resident F32 parameters, runtime/driver overhead
+and the OS file cache require separate headroom. `StreamingWeightUsage` reports
+file bytes read, executed tiles and workspace peaks;
+`Qwen35Model.StreamingResidentParameterBytes` reports the explicitly whitelisted
+F32 constants separately. Other quantization formats, tensor parallelism,
+multimodal execution, speculation (including weight-free N-gram), MTP/draft and
+unadapted model families are rejected rather
+than silently loading all weights. This synchronous implementation establishes
+the execution seam; it does not claim I/O overlap or a throughput improvement.
 
 ## Ownership and failure rules
 

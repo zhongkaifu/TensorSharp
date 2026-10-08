@@ -272,6 +272,7 @@ set(TSG_GGMLOPS_SOURCES
     ggml_ops_matmul_precision.cpp
     ggml_ops_q8_precision.cpp
     ggml_ops_q8_weight_policy.cpp
+    ggml_ops_q8_streaming.cpp
     ggml_ops_elementwise.cpp
     ggml_ops_norm_attn.cpp
     ggml_ops_training.cpp
@@ -457,6 +458,24 @@ set_target_properties(GgmlOps PROPERTIES
 
 if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
     set_property(SOURCE ggml_ops_q8_weight_policy.cpp APPEND PROPERTY COMPILE_DEFINITIONS TSG_GGML_TEST_HOOKS)
+    set_property(SOURCE ggml_ops_q8_streaming.cpp APPEND PROPERTY COMPILE_DEFINITIONS TSG_GGML_TEST_HOOKS)
+    set_property(SOURCE ggml_ops_gated_delta_net.cpp ggml_ops_qwen35_recurrent_prefill.cpp
+        APPEND PROPERTY COMPILE_DEFINITIONS TSG_GGML_TEST_HOOKS)
+    add_executable(GgmlOpsGdnCacheLifecycleTest tests/gdn_cache_lifecycle_test.cpp)
+    target_link_libraries(GgmlOpsGdnCacheLifecycleTest PRIVATE GgmlOps)
+    if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
+        add_test(NAME cuda-gdn-cache-lifecycle COMMAND GgmlOpsGdnCacheLifecycleTest)
+        set_tests_properties(cuda-gdn-cache-lifecycle PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 60)
+    endif()
+    add_executable(GgmlOpsQ8StreamingTest tests/q8_streaming_test.cpp)
+    target_include_directories(GgmlOpsQ8StreamingTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    target_link_libraries(GgmlOpsQ8StreamingTest PRIVATE GgmlOps)
+    add_test(NAME q8-streaming-contract COMMAND GgmlOpsQ8StreamingTest --contract)
+    if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
+        add_test(NAME cuda-q8-streaming COMMAND GgmlOpsQ8StreamingTest)
+        add_test(NAME cuda-q8-streaming-singleton COMMAND GgmlOpsQ8StreamingTest --singleton)
+        set_tests_properties(cuda-q8-streaming cuda-q8-streaming-singleton PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
+    endif()
     add_executable(GgmlOpsCacheBudgetTest tests/cache_budget_test.cpp)
     target_include_directories(GgmlOpsCacheBudgetTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
     target_link_libraries(GgmlOpsCacheBudgetTest PRIVATE Threads::Threads)

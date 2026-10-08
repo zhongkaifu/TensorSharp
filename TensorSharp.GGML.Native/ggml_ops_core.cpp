@@ -3146,6 +3146,10 @@ TSG_EXPORT void TSGgml_AlignedFree(void* ptr)
 // Defined in ggml_ops_wan.cpp; drops the persistent Wan DiT graphs whose resident
 // weights live in the caches cleared below.
 extern "C" void TSGgml_WanResetForwardCache();
+namespace tsg {
+    void release_gdn_chunked_cache();
+    void release_qwen35_recurrent_prefill_cache();
+}
 
 // Tensor-parallel graphs held across calls, defined in their own kernels.
 // TSGgml_Shutdown releases them while the backends are still alive.
@@ -3202,6 +3206,10 @@ TSG_EXPORT void TSGgml_ClearHostBufferCache()
     TSGgml_Qwen35ReleaseVerifyGraphsPreserveState();
     TSGgml_Qwen35ReleaseAttentionTpGraphs();
     TSGgml_Qwen35GdnDropTpGraphs();
+    // Per-op GDN prefill uses separate shape caches. Their backend buffers
+    // must not survive model disposal and reach late CUDA static destruction.
+    tsg::release_gdn_chunked_cache();
+    tsg::release_qwen35_recurrent_prefill_cache();
     TSGgml_ReleaseFusedFfnTpGraphs();
     TSGgml_ReleaseFusedMatmulAddTpGraphs();
     tsg::clear_q8_f32_backends();
@@ -3282,6 +3290,8 @@ TSG_EXPORT void TSGgml_Shutdown()
     tp_comm_free();
     TSGgml_Qwen35ResetDecodeCache();
     TSGgml_Qwen35ReleaseVerifyTpGraphs();
+    tsg::release_gdn_chunked_cache();
+    tsg::release_qwen35_recurrent_prefill_cache();
     forget_cache_keys();
 
     const int ranks = tsg::g_device_count.load(std::memory_order_acquire);

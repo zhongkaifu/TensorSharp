@@ -253,8 +253,10 @@ namespace TensorSharp.Models
         protected int LayerSplitDegree { get; }
 
         protected ModelBase(string ggufPath, BackendType backend, int tpDegree = 1,
-            ITensorParallelGroup tpGroup = null, int layerSplitDegree = 1)
+            ITensorParallelGroup tpGroup = null, int layerSplitDegree = 1,
+            WeightStreamingOptions weightStreaming = null)
         {
+            WeightStreaming = weightStreaming;
             if (tpDegree < 1) throw new ArgumentOutOfRangeException(nameof(tpDegree));
             if (layerSplitDegree < 1) throw new ArgumentOutOfRangeException(nameof(layerSplitDegree));
             if (layerSplitDegree > 1 && (tpDegree > 1 || tpGroup != null))
@@ -1399,6 +1401,17 @@ namespace TensorSharp.Models
 
             if (_quantWeights.TryGetValue("token_embd.weight", out var qw))
             {
+                if (qw.IsStreamed)
+                {
+                    var streamed = new Tensor(_allocator, DType.Float32, tokens.Length, dim);
+                    try
+                    {
+                        _weightStreamingExecutor.Embedding(qw, tokens, (IntPtr)GetFloatPtr(streamed));
+                        InvalidateTensorDeviceCache(streamed);
+                        return streamed;
+                    }
+                    catch { streamed.Dispose(); throw; }
+                }
                 if (IsGgmlBackend)
                 {
                     bool canUseGgmlLookup = CanUseGgmlQuantizedGetRows(qw.GgmlType);
@@ -1453,10 +1466,8 @@ namespace TensorSharp.Models
                 int seqLen = (int)input.Sizes[0];
                 int outDim = (int)qw.Ne1;
                 result = new Tensor(_allocator, DType.Float32, seqLen, outDim);
-                if (IsGgmlBackend)
-                    GgmlBasicOps.AddmmQuant(result, input, qw.CacheKey, qw.GgmlType, qw.Ne0, qw.Ne1, qw.RawBytes);
-                else
-                    AddmmQuantManaged(result, input, qw);
+                try { ExecuteQuantizedLinear(result, input, qw); }
+                catch { result.Dispose(); throw; }
                 // NVFP4 scale2 sidecar ("<base>.scale"): the true weight is
                 // (quantized blocks) x Scale, so the projection output is scaled
                 // here, once, for every consumer that runs through the generic
@@ -2181,13 +2192,16 @@ namespace TensorSharp.Models
 
         public float[] Forward(int[] tokens)
         {
+            ThrowIfStreamingStateFailed();
             ThrowIfBackendFailed();
             if (_distributedDriver) _tpGroup.BroadcastControl(TpControlForward, tokens);
             float[] logits;
             try { logits = ForwardCore(tokens); }
             catch (Exception symptom) when (BackendHasFailed()) { throw BackendFailure(symptom); }
+            catch { if (HasStreamingWeights) _streamingForwardFailed = true; throw; }
             ThrowIfBackendFailed();
-            return DumpLogitsIfRequested(logits);
+            try { return DumpLogitsIfRequested(logits); }
+            catch { if (HasStreamingWeights) _streamingForwardFailed = true; throw; }
         }
 
         /// <summary>
@@ -2290,19 +2304,23 @@ namespace TensorSharp.Models
 
         public float[] ForwardRefill(int[] tokens)
         {
+            ThrowIfStreamingStateFailed();
             ThrowIfBackendFailed();
             if (_distributedDriver) _tpGroup.BroadcastControl(TpControlForwardRefill, tokens);
             float[] logits;
             try { logits = ForwardRefillCore(tokens); }
             catch (Exception symptom) when (BackendHasFailed()) { throw BackendFailure(symptom); }
+            catch { if (HasStreamingWeights) _streamingForwardFailed = true; throw; }
             ThrowIfBackendFailed();
             return logits;
         }
 
         public void ResetKVCache()
         {
+            if (HasStreamingWeights) _streamingForwardFailed = true;
             if (_distributedDriver) _tpGroup.BroadcastControl(TpControlReset, Array.Empty<int>());
             ResetKVCacheCore();
+            _streamingForwardFailed = false;
         }
 
         protected abstract float[] ForwardCore(int[] tokens);
@@ -2660,6 +2678,10 @@ namespace TensorSharp.Models
 
         public virtual void Dispose()
         {
+            // A failed device release retains its owner and budget for a retry;
+            // do not tear down the backend beneath a live streaming session.
+            _weightStreamingExecutor?.Dispose();
+            _weightStreamingExecutor = null;
             // Release any distributed worker nodes before tearing down the TP
             // group, so every driver exit path (normal or exception) lets the
             // workers leave their loops cleanly.
@@ -2795,7 +2817,7 @@ namespace TensorSharp.Models
         /// model (DeepSeek V4's DSpark support GGUF, Muse-Glimmer's DFlash block);
         /// ignored by architectures that have no drafter.</param>
         public static ModelBase Create(string ggufPath, BackendType backend, int tpDegree = 1, ITensorParallelGroup tpGroup = null,
-            string draftModelPath = null, int layerSplitDegree = 1)
+            string draftModelPath = null, int layerSplitDegree = 1, WeightStreamingOptions weightStreaming = null)
         {
             if (tpGroup == null && tpDegree <= 1)
                 tpDegree = ReadParallelDegree("TENSORSHARP_TP_DEGREE", tpDegree);
@@ -2804,10 +2826,12 @@ namespace TensorSharp.Models
 
             using var probe = new GgufFile(ggufPath);
             var architecture = ModelArchitectureRegistry.Resolve(probe.GetString("general.architecture"), probe);
+            if (weightStreaming != null && !architecture.SupportsWeightStreaming)
+                throw new NotSupportedException($"Architecture '{architecture.Id}' has no bounded weight streaming adapter.");
 
             tpDegree = ResolveTensorParallelSupport(architecture, backend, tpDegree, ref tpGroup,
                 out int layerSplit, layerSplitDegree);
-            var context = new ModelCreateContext(ggufPath, backend, probe, tpDegree, tpGroup, draftModelPath, layerSplit);
+            var context = new ModelCreateContext(ggufPath, backend, probe, tpDegree, tpGroup, draftModelPath, layerSplit, weightStreaming);
             architecture.ApplyNativeTunables?.Invoke(context);
             ModelBase model = architecture.Factory(context);
             model.VerifyTensorParallelShardedWeights(architecture.Id);

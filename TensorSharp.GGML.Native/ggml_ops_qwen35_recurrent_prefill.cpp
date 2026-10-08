@@ -140,6 +140,29 @@ namespace
     }
 }
 
+namespace tsg {
+// This cached graph binds live model weight buffers. Retire it before those
+// buffers are released, while the backend/driver still exists.
+void release_qwen35_recurrent_prefill_cache()
+{
+    std::lock_guard<std::mutex> lock(g_q35_rec_prefill_mutex);
+    g_q35_rec_prefill_cache.clear();
+}
+}
+
+#if defined(TSG_GGML_TEST_HOOKS)
+#define TSG_Q35_PREFILL_TEST_EXPORT TSG_EXPORT
+TSG_Q35_PREFILL_TEST_EXPORT std::int64_t TSGgml_TestQwen35RecurrentPrefillCacheBytes()
+{
+    std::lock_guard<std::mutex> lock(g_q35_rec_prefill_mutex);
+    std::int64_t bytes = 0;
+    for (const auto& item : g_q35_rec_prefill_cache)
+        if (item.second->buffer.value) bytes += std::int64_t(ggml_backend_buffer_get_size(item.second->buffer.value));
+    return bytes;
+}
+#undef TSG_Q35_PREFILL_TEST_EXPORT
+#endif
+
 TSG_EXPORT int TSGgml_Qwen35RecurrentLayerPrefill(
     void* hidden_data, int hidden_size, int N,
     void* attn_norm_w_data,

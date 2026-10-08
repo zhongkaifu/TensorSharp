@@ -42,7 +42,10 @@ namespace TensorSharp.Models
             // otherwise reads the file at one-or-two-stream speed, which is the
             // whole cold-load time on network-backed model storage.
             ReadBonsaiMetadata();
-            _gguf.PrefaultFileCache(ShouldPrefaultWeight);
+            if (HasStreamingWeights)
+                _weightStreamingExecutor = new WeightStreamingExecutor(_gguf, WeightStreaming);
+            else
+                _gguf.PrefaultFileCache(ShouldPrefaultWeight);
             Console.Write("Loading model weights...");
             int countF32 = 0;
             int countQuant = 0;
@@ -54,6 +57,14 @@ namespace TensorSharp.Models
             {
                 var info = kv.Value;
                 long byteCount = _gguf.GetTensorByteCount(info);
+
+                if (HasStreamingWeights && IsQuantizedLinearWeight(info))
+                {
+                    _quantWeights[info.Name] = _weightStreamingExecutor.CreateWeight(info);
+                    countQuant++;
+                    totalQuantBytes += byteCount;
+                    continue;
+                }
 
                 if (info.Type is GgmlTensorType.PQ2_0 or GgmlTensorType.PTQ1_0)
                 {
@@ -197,6 +208,8 @@ namespace TensorSharp.Models
 
         protected void PrepareCudaQuantizedWeightsForInference()
         {
+            if (HasStreamingWeights)
+                throw new InvalidOperationException("File-backed streamed weights cannot be preloaded.");
             if (_backend == BackendType.Mlx)
             {
                 PrepareMlxQuantizedWeightsForInference();

@@ -70,15 +70,28 @@ __global__ void q8_f32_tiled(const char * weights, const char * input, float * o
 }
 
 template<int Columns>
-void launch(ggml_tensor * dst, cudaStream_t stream) {
-    const auto * w = dst->src[0];
-    const auto * x = dst->src[1];
-    const dim3 grid(unsigned((w->ne[1] + 63) / 64), unsigned((x->ne[1] + Columns - 1) / Columns));
-    q8_f32_tiled<Columns><<<grid, 128, 0, stream>>>(static_cast<const char *>(w->data),
-        static_cast<const char *>(x->data), static_cast<float *>(dst->data), int(w->ne[0]),
-        int(w->ne[1]), int(x->ne[1]), w->nb[1], x->nb[0], x->nb[1]);
+void launch(const void * weights, const void * input, float * output,
+        int inner, int rows, int columns, size_t weight_stride, size_t input_inner_stride,
+        size_t input_column_stride, cudaStream_t stream) {
+    const dim3 grid(unsigned((int64_t(rows) + 63) / 64), unsigned((columns + Columns - 1) / Columns));
+    q8_f32_tiled<Columns><<<grid, 128, 0, stream>>>(static_cast<const char *>(weights),
+        static_cast<const char *>(input), output, inner, rows, columns,
+        weight_stride, input_inner_stride, input_column_stride);
 }
 } // namespace
+
+int tsg_matmul_q8_cuda_launch(const void * weights, const void * input, float * output,
+        int inner, int rows, int columns, size_t weight_stride, size_t input_inner_stride,
+        size_t input_column_stride, void * stream_pointer) {
+    const auto stream = static_cast<cudaStream_t>(stream_pointer);
+    if (columns <= 8) launch<8>(weights, input, output, inner, rows, columns,
+        weight_stride, input_inner_stride, input_column_stride, stream);
+    else if (columns <= 16) launch<16>(weights, input, output, inner, rows, columns,
+        weight_stride, input_inner_stride, input_column_stride, stream);
+    else launch<32>(weights, input, output, inner, rows, columns,
+        weight_stride, input_inner_stride, input_column_stride, stream);
+    return int(cudaGetLastError());
+}
 
 void tsg_matmul_q8_cuda_compute(ggml_tensor * dst, ggml_backend_t cuda_backend) {
     GGML_ASSERT(ggml_backend_is_cuda(cuda_backend) && ggml_is_contiguous(dst));
@@ -89,8 +102,9 @@ void tsg_matmul_q8_cuda_compute(ggml_tensor * dst, ggml_backend_t cuda_backend) 
     auto * context = static_cast<ggml_backend_cuda_context *>(cuda_backend->context);
     CUDA_CHECK(cudaSetDevice(context->device));
     const cudaStream_t stream = context->stream(context->device, 0);
-    if (dst->ne[1] <= 8) launch<8>(dst, stream);
-    else if (dst->ne[1] <= 16) launch<16>(dst, stream);
-    else launch<32>(dst, stream);
-    CUDA_CHECK(cudaGetLastError());
+    const auto * w = dst->src[0];
+    const auto * x = dst->src[1];
+    CUDA_CHECK(static_cast<cudaError_t>(tsg_matmul_q8_cuda_launch(w->data, x->data,
+        static_cast<float *>(dst->data), int(w->ne[0]), int(w->ne[1]), int(x->ne[1]),
+        w->nb[1], x->nb[0], x->nb[1], stream)));
 }

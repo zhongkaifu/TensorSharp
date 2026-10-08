@@ -347,8 +347,8 @@ namespace TensorSharp.Models
         /// (general.architecture = "dflash"). When present it replaces the trunk's
         /// own NextN/MTP block as the drafter.</param>
         public Qwen35Model(string ggufPath, BackendType backend, int tpDegree = 1, ITensorParallelGroup tpGroup = null,
-            string draftModelPath = null)
-            : base(ggufPath, backend, tpDegree, tpGroup)
+            string draftModelPath = null, WeightStreamingOptions weightStreaming = null)
+            : base(ggufPath, backend, tpDegree, tpGroup, weightStreaming: weightStreaming)
         {
             _useMetalGdnInplaceState = ShouldUseMetalGdnInplaceState(backend, IsTensorParallel);
 
@@ -358,7 +358,7 @@ namespace TensorSharp.Models
             }
             catch
             {
-                if (HasBonsaiCheckpointMetadata)
+                if (HasBonsaiCheckpointMetadata || weightStreaming != null)
                 {
                     // Reuse the ordinary cleanup without virtual dispatch into
                     // a subclass whose constructor has not completed. A missing
@@ -464,10 +464,14 @@ namespace TensorSharp.Models
                     MoeCpuOffloadConfig.WarnUnsupportedBackend("qwen35moe", _backend.ToString());
             }
 
+            ValidateStreamingWeightConfiguration(draftModelPath);
             LoadWeights();
-            FuseAttentionProjectionWeights();
-            FuseRecurrentInputWeights();
-            FuseGateUpWeights(TotalLayerCount);
+            if (!HasStreamingWeights)
+            {
+                FuseAttentionProjectionWeights();
+                FuseRecurrentInputWeights();
+                FuseGateUpWeights(TotalLayerCount);
+            }
             RegisterBonsaiWeightTransforms(_headVDim, _numKHeads, _numVHeads);
             DetectMoeLayers();
             BuildLayerKeys();
@@ -480,7 +484,7 @@ namespace TensorSharp.Models
                 ShardQwen35WeightsForTP();
                 PrepareCudaQuantizedWeightsForInferenceTP();
             }
-            else
+            else if (!HasStreamingWeights)
             {
                 PrepareCudaQuantizedWeightsForInference();
             }
@@ -2640,6 +2644,8 @@ namespace TensorSharp.Models
         // building the layer graph.
         public override Tensor SubmitGreedyDecodeStep(int? firstTokenForBegin)
         {
+            if (HasStreamingWeights)
+                throw new NotSupportedException("File-backed Qwen35 weights require Forward or ForwardRefill; pipelined execution is unsupported.");
             _forwardSw.Start();
             int seqLen = 1;
             int startPos = _cacheSeqLen;
@@ -2873,7 +2879,7 @@ namespace TensorSharp.Models
             // Fused outproj+FFN for attention layers: when the fused attention layer
             // decode is NOT used and the layer is dense FFN (not MoE), fuse the attention
             // output projection + residual + FFN into one GPU dispatch.
-            bool canFuseAttnOutFFN = !fusedDecodeApplied && IsGgmlBackend
+            bool canFuseAttnOutFFN = !HasStreamingWeights && !fusedDecodeApplied && IsGgmlBackend
                 && !(_isMoeLayer != null && _isMoeLayer[layer])
                 && _attnOutputQW[layer] != null
                 && _postAttnNormW[layer] != null
@@ -3784,6 +3790,11 @@ namespace TensorSharp.Models
         /// </summary>
         private Tensor FFNCachedFused(Tensor residual, Tensor postNormW, int layer, int seqLen)
         {
+            if (HasStreamingWeights)
+            {
+                using var normed = RMSNormOpCached(residual, postNormW);
+                return FFNCached(normed, layer, seqLen);
+            }
             int intermSize = Config.IntermediateSize;
 
             // Prefill fast path: collapse the entire dense SwiGLU FFN
@@ -4028,7 +4039,7 @@ namespace TensorSharp.Models
         private Tensor FusedNormLinear(Tensor input, Tensor normW, QuantizedWeight qw, Tensor wF32)
         {
             // Fused path: needs GGML backend, a quantized weight, and a 2D input view.
-            if (IsGgmlBackend && qw != null && normW != null && input.DimensionCount == 2)
+            if (!HasStreamingWeights && IsGgmlBackend && qw != null && normW != null && input.DimensionCount == 2)
             {
                 long t0 = Stopwatch.GetTimestamp();
                 int seqLen = (int)input.Sizes[0];
@@ -4083,6 +4094,7 @@ namespace TensorSharp.Models
         /// </summary>
         private Tensor TryFusedNormLinearInto(Tensor output, Tensor input, Tensor normW, QuantizedWeight qw)
         {
+            if (HasStreamingWeights) return null;
             if (qw == null || normW == null
                 || input.DimensionCount != 2 || output == null
                 || output.DimensionCount != 2 || output.Sizes[1] != qw.Ne1
@@ -4133,6 +4145,7 @@ namespace TensorSharp.Models
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private bool TryLinearAddInto(Tensor residual, Tensor input, QuantizedWeight qw)
         {
+            if (HasStreamingWeights) return false;
             if (qw == null || input.DimensionCount != 2 || residual.DimensionCount != 2)
                 return false;
 
@@ -4235,6 +4248,7 @@ namespace TensorSharp.Models
         /// </summary>
         private unsafe bool TryFusedAttnLayerPrefill(Tensor hidden, int layer, int seqLen, int startPos)
         {
+            if (HasStreamingWeights) return false;
             if (!IsGgmlBackend) return false;
             if (hidden == null || hidden.DimensionCount != 2 || hidden.ElementType != DType.Float32)
                 return false;
@@ -4308,6 +4322,7 @@ namespace TensorSharp.Models
 
         private bool TryFusedAttnLayerDecode(Tensor residual, int layer, int position)
         {
+            if (HasStreamingWeights) return false;
             if (!IsGgmlBackend)
                 return false;
             if (residual == null || residual.DimensionCount != 2 || residual.ElementType != DType.Float32)
@@ -6171,10 +6186,8 @@ namespace TensorSharp.Models
                 int seqLen = (int)input.Sizes[0];
                 int outDim = (int)qw.Ne1;
                 result = new Tensor(_allocator, DType.Float32, seqLen, outDim);
-                if (IsGgmlBackend)
-                    GgmlBasicOps.AddmmQuant(result, input, qw.CacheKey, qw.GgmlType, qw.Ne0, qw.Ne1, qw.RawBytes);
-                else
-                    AddmmQuantManaged(result, input, qw);
+                try { ExecuteQuantizedLinear(result, input, qw); }
+                catch { result.Dispose(); throw; }
                 if (qw.Scale != 1.0f)
                     Ops.Mul(result, result, qw.Scale); // sidecar per-tensor scale2
             }
@@ -6303,12 +6316,16 @@ namespace TensorSharp.Models
 
         public void LoadVisionEncoder(string mmProjPath)
         {
+            if (HasStreamingWeights)
+                throw new NotSupportedException("File-backed Qwen35 weight execution currently supports text-only inference; vision weights are not streamed.");
             VisionEncoder = new Qwen35VisionEncoder(mmProjPath, _allocator);
             VisionEncoder.SetHostModel(this);
         }
 
         public void SetVisionEmbeddings(Tensor visionEmbeddings, int startPosition)
         {
+            if (HasStreamingWeights)
+                throw new NotSupportedException("File-backed Qwen35 weight execution currently supports text-only inference.");
             _visionEmbeddingsList.Add((visionEmbeddings, startPosition));
         }
 

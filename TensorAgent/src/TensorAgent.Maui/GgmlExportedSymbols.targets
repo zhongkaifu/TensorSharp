@@ -275,6 +275,10 @@
     <ReferenceNativeSymbol Include="TSGgml_RegisterOffloadable" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_RegisterPinnedHostBuffer" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_RegisterQ8F32Weight" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_Q8StreamingPayloadBytes" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_Q8StreamingCreate" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_Q8StreamingExecute" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_Q8StreamingDestroy" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_ReleaseFusedFfnTpGraphs" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_ReleaseFusedMatmulAddTpGraphs" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_ReleaseReuseComputeBuffers" SymbolType="Function" />
