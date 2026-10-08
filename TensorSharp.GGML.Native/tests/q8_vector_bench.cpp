@@ -105,6 +105,9 @@ void measure(int k, int m) {
 
 int main(int argc, char ** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
+    const char * experimental = std::getenv("TS_GGML_Q8_PARALLEL_VECTOR");
+    require(!experimental || std::strcmp(experimental, "1") != 0,
+        "Unset TS_GGML_Q8_PARALLEL_VECTOR: this benchmark compares the qualified K-ordered kernel");
     if (argc < 2 || std::string(argv[1]) != "--benchmark" || (argc != 2 && argc != 4)) {
         std::fprintf(stderr, "Opt-in: --benchmark [K M]; synthetic inputs at model matrix shapes.\n"); return 2;
     }

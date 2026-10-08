@@ -295,6 +295,14 @@ namespace
             // is therefore bounded by the largest single layer, not the model.
             if (stream_only)
             {
+                // Unlike resident weights, these leafs live in graph compute
+                // memory. Keep them live for the whole graph: CUDA may fuse
+                // gate/up/GLU into one MMVQ kernel, while the graph allocator
+                // otherwise reuses a consumed weight's storage for its output.
+                // The upstream fusion overlap check assumes leaf weights are
+                // externally owned and skips them. No upstream patch is needed.
+                ggml_set_input(tensor);
+                ggml_set_output(tensor);
                 uploads.push_back({tensor, host_data, bytes, true});
                 return true;
             }
@@ -332,6 +340,10 @@ namespace
             }
 
             // Fall back to deferred upload after backend buffer allocation.
+            // This fallback is also graph-owned and has the same fused-kernel
+            // lifetime as the explicit streaming branch above.
+            ggml_set_input(tensor);
+            ggml_set_output(tensor);
             uploads.push_back({tensor, host_data, bytes, true});
             return true;
         }

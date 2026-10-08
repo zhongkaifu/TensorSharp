@@ -5,8 +5,48 @@
 #include "ggml-cuda.h"
 #include "ggml-cuda/common.cuh"
 #include <cstdint>
+#include <cstdlib>
+#include <cstdio>
+#include <cstring>
 
 namespace {
+// Diagnostic opt-in while model/prefill/decode qualification is in progress.
+// Fix the policy at first use: changing an environment variable must not mix
+// arithmetic inside already captured CUDA graphs. The qualified default below
+// retains its K-increasing sum and cross-column bitwise contract.
+bool parallel_vector_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("TS_GGML_Q8_PARALLEL_VECTOR");
+        const bool selected = value && std::strcmp(value, "1") == 0;
+        if (selected)
+            std::fprintf(stderr, "[q8-f32] Experimental parallel-K F32 vector selected (N=1); N>1 retains K-ordered arithmetic.\n");
+        return selected;
+    }();
+    return enabled;
+}
+
+// One full warp per output row. The decoded Q8 product and F32 activation are
+// unchanged; the lane sums and five shuffle additions deliberately use a new
+// reduction order. No atomics, staging allocation or input narrowing. A final
+// partial CTA may contain unused whole warps, never a partial active warp.
+__global__ void q8_f32_vector_parallel(const char * weights, const char * input, float * output,
+        int inner, int rows, size_t weight_stride, size_t input_inner_stride) {
+    const int lane = int(threadIdx.x) & 31;
+    const int row = int(blockIdx.x) * 4 + int(threadIdx.x) / 32;
+    if (row >= rows) return;
+    float sum = 0.0f;
+    for (int block = 0; block < inner / 32; ++block) {
+        const char * source = weights + size_t(row) * weight_stride + size_t(block) * 34;
+        const float scale = __half2float(*reinterpret_cast<const half *>(source));
+        const float weight = scale * float(*reinterpret_cast<const int8_t *>(source + 2 + lane));
+        const float activation = *reinterpret_cast<const float *>(input + size_t(block * 32 + lane) * input_inner_stride);
+        sum = fmaf(weight, activation, sum);
+    }
+    for (int shift = 16; shift > 0; shift /= 2)
+        sum += __shfl_down_sync(0xffffffffu, sum, shift);
+    if (lane == 0) output[row] = sum;
+}
+
 // Decode has only one activation column. The matrix kernel below would still
 // compute eight columns (seven zero-filled), leaving only 16 of 128 threads
 // contributing useful results. Threads cooperatively decode 64 weight rows,
@@ -133,7 +173,12 @@ int tsg_matmul_q8_cuda_launch(const void * weights, const void * input, float * 
         int inner, int rows, int columns, size_t weight_stride, size_t input_inner_stride,
         size_t input_column_stride, void * stream_pointer) {
     const auto stream = static_cast<cudaStream_t>(stream_pointer);
-    if (columns == 1) {
+    if (columns == 1 && parallel_vector_enabled()) {
+        const unsigned blocks = unsigned((int64_t(rows) + 3) / 4);
+        q8_f32_vector_parallel<<<blocks, 128, 0, stream>>>(static_cast<const char *>(weights),
+            static_cast<const char *>(input), output, inner, rows, weight_stride, input_inner_stride);
+    }
+    else if (columns == 1) {
         const unsigned blocks = unsigned((int64_t(rows) + 63) / 64);
         q8_f32_vector<<<blocks, 128, 0, stream>>>(static_cast<const char *>(weights),
             static_cast<const char *>(input), output, inner, rows, weight_stride, input_inner_stride);

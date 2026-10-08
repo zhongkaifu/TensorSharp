@@ -804,6 +804,8 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
         target_link_libraries(GgmlOpsCudaQ8PrecisionTest PRIVATE ggml-cuda ggml-cpu ggml-base CUDA::cublas)
         add_test(NAME cuda-q8-f32-projection COMMAND GgmlOpsCudaQ8PrecisionTest)
         set_tests_properties(cuda-q8-f32-projection PROPERTIES SKIP_RETURN_CODE 77)
+        add_test(NAME cuda-q8-f32-parallel-vector COMMAND GgmlOpsCudaQ8PrecisionTest --parallel-vector)
+        set_tests_properties(cuda-q8-f32-parallel-vector PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
         # Opt-in synthetic-data timing with byte-exact previous-kernel control
         # and independent sampled FP64 oracle; never a performance assertion.
         add_executable(GgmlOpsQ8VectorBench tests/q8_vector_bench.cpp ggml_ops_q8_precision.cu)
@@ -811,6 +813,14 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
         target_include_directories(GgmlOpsQ8VectorBench PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/src")
         target_link_libraries(GgmlOpsQ8VectorBench PRIVATE ggml-cuda ggml-base CUDA::cudart)
+        # Timing alternatives against an independent FP64 oracle. The F32
+        # reduction also has an explicit diagnostic production opt-in; the
+        # benchmark-only F64 route is not selected by production dispatch.
+        add_executable(GgmlOpsQ8ParallelVectorBench tests/q8_parallel_vector_bench.cu ggml_ops_q8_precision.cu)
+        target_compile_definitions(GgmlOpsQ8ParallelVectorBench PRIVATE TSG_GGML_USE_CUDA=1)
+        target_include_directories(GgmlOpsQ8ParallelVectorBench PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/src")
+        target_link_libraries(GgmlOpsQ8ParallelVectorBench PRIVATE ggml-cuda ggml-base CUDA::cudart)
         add_executable(GgmlOpsQwen4ExpReduceTest tests/qwen4exp_reduce_test.cpp
             ggml_ops_qwen4exp_reduce.cpp ggml_ops_matmul_precision.cu
             ggml_ops_attention_precision.cu ggml_ops_q8_precision.cu ggml_ops_dsv4_fused.cu)
@@ -896,6 +906,8 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
     if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
         add_test(NAME moe-fused-bias-alias-cuda COMMAND GgmlOpsMoeFusedBiasAliasTest cuda)
         set_tests_properties(moe-fused-bias-alias-cuda PROPERTIES SKIP_RETURN_CODE 77)
+        add_test(NAME moe-stream-weight-alias-cuda COMMAND GgmlOpsMoeFusedBiasAliasTest cuda stream)
+        set_tests_properties(moe-stream-weight-alias-cuda PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
         add_executable(GgmlOpsMoeStreamBudgetTest tests/moe_stream_budget_test.cpp)
         target_link_libraries(GgmlOpsMoeStreamBudgetTest PRIVATE GgmlOps)
         add_test(NAME moe-stream-shared-budget-cuda COMMAND GgmlOpsMoeStreamBudgetTest)
