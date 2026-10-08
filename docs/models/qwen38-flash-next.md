@@ -930,6 +930,17 @@ buffers totaling the routed-expert bytes plus these overlapping rows, in additio
 these buffers remain alive while the model runs. Loading skips a full prefault
 of the sparse PLE table, whose rows are gathered on demand.
 
+**Fit.** Under `--tp N` every routed expert stays on the GPUs, split N ways, and every GPU
+also holds its own copy of the attention, recurrent and PLE weights, the head and the caches;
+experts cannot be offloaded in this mode. A checkpoint that cannot fit that way is refused at
+load, before the experts are sliced into host buffers, with each GPU's need and free memory
+(exit code 2). The 97 GB IQ4_XS checkpoint (three shards) carries about 61 GiB of routed experts, so on
+2x 20 GB GPUs each would need over 30 GiB: use `--layer-split 2` there, which keeps what fits
+on the GPUs and runs the rest of the experts from system RAM. Tensor parallelism with
+offloaded experts would not be faster on such a host anyway: replicating attention and caches
+on both GPUs leaves less room for experts than a layer split, and the host-resident experts set
+the decode speed either way.
+
 `--layer-split N` remains a separate option: each GPU holds a contiguous run of
 whole layers. It is available on `ggml_cuda`, `ggml_vulkan` and the direct `cuda`
 engine. On `ggml_cuda` the runs and the routed-expert offload are sized together against

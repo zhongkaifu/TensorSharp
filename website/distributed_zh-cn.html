@@ -207,8 +207,9 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model model.gguf --backend cuda
       <tr><td><code>TS_GGML_TP_CUDA_GRAPHS</code></td><td>开启</td><td><code>0</code> 关闭多 GPU 运行下的 CUDA 图捕获。默认开启，因为一个张量并行 token 是几十次按 rank 的小提交，重放远比重新下发便宜（见<a href="#perf-graphs">上文</a>）。该开关会在首次调用后端之前被翻译成原生的 <code>GGML_CUDA_DISABLE_GRAPHS</code>，因为 ggml 在首次使用时就会锁定该值。</td></tr>
       <tr><td><code>TS_GEMMA4_TP_FUSED_MOE</code></td><td>开启</td><td><code>0</code> 表示 Gemma 4 从融合的 MoE 主干回退到逐算子的整专家路径。</td></tr>
       <tr><td><code>GGML_CUDA_ALLREDUCE</code></td><td>自动</td><td><code>nccl</code> / <code>internal</code> / <code>none</code>，直接透传给 ggml 的集合通信选择。显式设置会同时跳过 NCCL 启动前探测。</td></tr>
-      <tr><td><code>TS_GGML_TP_AR_PROBE</code></td><td>开</td><td>模型加载前对 NCCL 集合通信做行为探测：一些云主机声称支持 GPU P2P 但数据永远送不到，NCCL 的第一次 AllReduce 会让两块 GPU 永远空转——典型症状是 TP 模型加载卡死在 kernel warmup。探测失败时 TensorSharp 自动改走 ggml 的钉页主机内存 <code>internal</code> 管线。<code>0</code> 跳过探测；<code>force</code> 忽略缓存的按主机判定（<code>~/.cache/tensorsharp/tp-collective-probe</code>）。</td></tr>
-      <tr><td><code>TS_GGML_TP_AR_PROBE_MS</code></td><td><code>10000</code></td><td>探测 AllReduce 的完成期限，超时即判定集合通信不可用；<code>0</code> 关闭探测。</td></tr>
+      <tr><td><code>TS_GGML_TP_AR_PROBE</code></td><td>开</td><td>模型加载前对 NCCL 集合通信做行为探测：一些云主机声称支持 GPU P2P 但数据永远送不到，NCCL 的第一次 AllReduce 会让两块 GPU 永远空转——典型症状是 TP 模型加载卡死在 kernel warmup。探测失败时 TensorSharp 自动改走 ggml 的钉页主机内存 <code>internal</code> 管线。两张 GPU 且没有可用 NCCL 时（所有 Windows 主机），还会再探测两块 GPU 能否像该管线的 kernel 那样经由钉页主机内存会合，无法会合时回退到主机归约。<code>0</code> 跳过这些探测；<code>force</code> 忽略缓存的按主机判定（<code>~/.cache/tensorsharp/tp-collective-probe</code>）。</td></tr>
+      <tr><td><code>TS_GGML_TP_AR_PROBE_MS</code></td><td><code>10000</code></td><td>探测 AllReduce 的完成期限，超时即判定集合通信不可用；<code>0</code> 关闭探测。它也约束一次运行的第一次集合通信：未完成时以拒绝加载并说明调整办法结束，而不是卡住。</td></tr>
+      <tr><td><code>TS_GGML_TP_WDDM_FLUSH</code></td><td>开启（Windows）</td><td>每次 AllReduce 之后提交各 GPU 已排队的 launch。WDDM 会把 launch 暂存在软件队列中，而双 GPU 的 <code>internal</code> AllReduce 在 kernel 内部会合，没有这一步时一块 GPU 的那一半可能永远不被提交：即 issue #256 中 <code>--tp 2</code> 的启动卡死。<code>0</code> 仅供诊断。</td></tr>
       <tr><td><code>GGML_CUDA_AR_BF16_THRESHOLD</code></td><td><code>1 MB</code></td><td>ggml 在多大载荷以上把 F32 集合通信转成 BF16。TensorSharp 提高了 ggml 自身的默认值（总是转换），使 decode 规模的归约保持精确；设为 <code>0</code> 则完全禁用转换。</td></tr>
     </tbody>
   </table>

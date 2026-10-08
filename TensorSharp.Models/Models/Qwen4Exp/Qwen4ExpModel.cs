@@ -129,6 +129,9 @@ namespace TensorSharp.Models
                 // VRAM-aware layer split below has to price before anything uploads.
                 int maxContextLength = ResolveConfiguredContextLength();
                 int initialCacheLength = ResolveInitialCacheAllocationLength(maxContextLength);
+                // Tensor parallelism keeps every expert on the GPUs; refuse a model that
+                // cannot fit that way before slicing and uploading tens of gigabytes.
+                RefuseUnfitTensorParallel(initialCacheLength);
                 // The layer -> GPU map has to exist BEFORE the preload: that is what
                 // decides which device each weight is uploaded to, and the preload frees
                 // the host copy immediately afterwards so there is no second chance.

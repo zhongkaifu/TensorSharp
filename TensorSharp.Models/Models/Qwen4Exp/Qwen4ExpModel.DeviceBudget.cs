@@ -271,6 +271,91 @@ namespace TensorSharp.Models
         }
 
         /// <summary>
+        /// The GPU that cannot hold its share of a tensor-parallel placement, or -1.
+        /// Every rank holds the replicated bytes and an even share of the routed
+        /// experts; rank 0 also holds <paramref name="rank0OnlyBytes"/>. The sum is a
+        /// lower bound (no prefill scratch beyond <paramref name="reserveBytes"/>), so a
+        /// rank it rejects cannot be made to fit by anything the load does later.
+        /// </summary>
+        internal static int FindUnfitTensorParallelRank(long replicatedBytes, long expertBytes, long rank0OnlyBytes,
+            long reserveBytes, long[] available, out long need)
+        {
+            int ranks = available.Length;
+            long share = (expertBytes + ranks - 1) / ranks;
+            int worst = -1;
+            long worstDeficit = 0;
+            need = 0;
+            for (int r = 0; r < ranks; r++)
+            {
+                long rankNeed = checked(replicatedBytes + share + reserveBytes + (r == 0 ? rank0OnlyBytes : 0));
+                long deficit = rankNeed - available[r];
+                if (deficit > worstDeficit)
+                {
+                    worstDeficit = deficit;
+                    worst = r;
+                    need = rankNeed;
+                }
+            }
+            return worst;
+        }
+
+        /// <summary>
+        /// Under --tp every routed expert stays on the GPUs - qwen4exp cannot run them
+        /// from the host in that mode - split evenly across the ranks, and everything
+        /// else (attention, recurrent and PLE weights, the head, every cache) is held by
+        /// every GPU. A model that cannot fit that way is refused here, before the
+        /// expert slicing copies every expert into per-rank host buffers and before the
+        /// preload, naming the mode that does fit: on 2x 20 GB a 62 GiB expert set would
+        /// otherwise run the host out of RAM and then the GPUs out of VRAM.
+        /// </summary>
+        private void RefuseUnfitTensorParallel(int initialCacheLength)
+        {
+            if (!IsTensorParallel || !IsGgmlBackend)
+                return;
+            int ranks = TpDegree;
+            var free = new long[ranks];
+            var available = new long[ranks];
+            for (int r = 0; r < ranks; r++)
+            {
+                if (!TryGetRankMemory(r, out free[r], out long total))
+                    return;     // nothing to measure against; warmup reports a real shortfall
+                available[r] = Math.Max(0, free[r] - GpuMemoryBudget.ResolveHeadroomBytes(total));
+            }
+
+            int n = Config.NumLayers, kvElement = PlannedKvElementBytes();
+            var dense = new long[n];
+            long first = 0, last = _mtpResidentBytes;
+            AccumulateDeviceWeightBytes(dense, ref first, ref last, floatsOnly: false);
+            long weights = first + last, caches = 0, experts = 0;
+            for (int l = 0; l < n; l++)
+            {
+                weights += dense[l];
+                caches += LayerCacheBytes(l, initialCacheLength, kvElement);
+                experts += LayerExpertBytes(l);
+            }
+            // The shared experts are sliced across the ranks too.
+            foreach (var kv in _quantWeights)
+                if (kv.Key.EndsWith("_shexp.weight", StringComparison.Ordinal) && ShouldPreloadCudaQuantWeightToDevice(kv.Key))
+                {
+                    weights -= kv.Value.RawBytes;
+                    experts += kv.Value.RawBytes;
+                }
+            int rank = FindUnfitTensorParallelRank(weights + caches, experts, _visionReserveBytes,
+                Qwen4ExpSpanScratch.FixedBytes, available, out long need);
+            if (rank < 0)
+                return;
+
+            long share = (experts + ranks - 1) / ranks;
+            throw new ModelLoadRefusedException(
+                $"qwen4exp: --tp {ranks} cannot hold this model. Under tensor parallelism every routed expert stays "
+                + $"on the GPUs ({GiB(experts)} of them, {GiB(share)} per GPU) and every GPU also holds its own copy "
+                + $"of the other weights ({GiB(weights)}) and of the caches ({GiB(caches)} at {initialCacheLength} "
+                + $"tokens), so each GPU needs at least {GiB(need)}; GPU {rank} has {GiB(available[rank])} after "
+                + $"headroom ({GiB(free[rank])} free). Use --layer-split {ranks} instead: it keeps what fits on the "
+                + "GPUs and runs the remaining experts from system RAM. Or use GPUs with that much memory free each.");
+        }
+
+        /// <summary>
         /// Phase one of a ggml_cuda layer split, before anything uploads: measure every
         /// GPU, price every layer, and choose the runs and the host set together. The
         /// runs are final once the preload starts; the host set is re-fitted against

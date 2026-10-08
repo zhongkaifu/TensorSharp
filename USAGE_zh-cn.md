@@ -1773,7 +1773,9 @@ tg64 17.6，而按层切分是 915.9 / 43.9——78 层里每一层都要对 `[6
 只在带 NVLink 的机器上、或者模型没有别的办法装下时才用它。
 
 在支持此组合的架构上，TP 可以与 MoE CPU 卸载组合：`--tp N --n-cpu-moe M` 保留多 rank 融合图，并把被卸载层的专家字节
-从每个 rank 的显存中去掉。组合后的实测数据见[混合专家 CPU 卸载](#混合专家-cpu-卸载--n-cpu-moe)。Qwen 3.8 Flash Next 在 TP 下拒绝专家卸载。
+从每个 rank 的显存中去掉。组合后的实测数据见[混合专家 CPU 卸载](#混合专家-cpu-卸载--n-cpu-moe)。Qwen 3.8 Flash Next 在 TP 下拒绝专家卸载：所有路由专家都留在 GPU 上并平均切分，同时每张 GPU 还各自持有
+其余权重与缓存的完整副本。无法这样放下的检查点会在加载时、切分专家之前被拒绝，列出每张 GPU 所需与空闲的
+显存，并建议改用 `--layer-split N`——它会把放不下的专家放到系统内存中运行。
 
 | 变量 | 作用 |
 |---|---|
@@ -1786,7 +1788,8 @@ tg64 17.6，而按层切分是 915.9 / 43.9——78 层里每一层都要对 `[6
 | `TS_GEMMA4_TP_FUSED_MOE=0` | 仅 Gemma 4：从融合的整模 MoE 主干（专家内部 Megatron 切分）回退到逐算子的整专家路径。融合路径在 26B 上加载时会物化约 10.5 GB 的专家分片（约 36 秒），换来约 10× 的 decode。被 `--n-cpu-moe` 卸载的层不参与这次物化——它们从不在加速器上运行——因此 `--cpu-moe` 也会去掉这笔加载开销 |
 | `GGML_CUDA_AR_BF16_THRESHOLD` | ggml-cuda 集合通信在多大载荷以上把 F32 转成 BF16 再归约。TensorSharp 把 ggml 的默认值（1 字节，即总是转换）提高到 1 MB，使 decode 规模的集合通信精确归约；设为 `0` 则完全禁用转换 |
 | `TS_QWEN35_LAYER_TRACE=1` | 打印首次前向的逐层残差流摘要，单卡与 TP 两条路径都会输出（诊断用） |
-| `GGML_CUDA_ALLREDUCE` | `nccl` / `internal` / `none`，直接透传给 ggml |
+| `GGML_CUDA_ALLREDUCE` | `nccl` / `internal` / `none`，直接透传给 ggml。未设置时 Linux 使用 NCCL，其他平台（Windows）使用钉页主机内存的 `internal` 管线，该管线只支持正好 2 张 GPU |
+| `TS_GGML_TP_WDDM_FLUSH=0` | 仅 Windows：停止在每次 AllReduce 之后提交各 GPU 已排队的 launch（诊断用；见下文） |
 
 ### 约束
 
@@ -1796,6 +1799,15 @@ tg64 17.6，而按层切分是 915.9 / 43.9——78 层里每一层都要对 `[6
 - **Muse-Glimmer** 最多 `--tp 2`：它只有 2 个 KV head，而这里没有任何模型会在 `numKVHeads < tp` 时复制 KV head。TP 下 DFlash 草稿器会被拒绝挂载（CLI 打印警告并按普通解码运行；服务端拒绝启动，退出码 2），KV 块页面在 TP 下同样可用（快照会遍历每层的按 rank 缓存），并且需要 GGML CUDA/Vulkan 后端——融合的按 rank 计划需要一个 ggml-metal 不提供的设备集合通信。
 
 ### 集群调优与诊断
+
+Windows 上没有 NCCL，两张 GPU 通过 ggml 的钉页主机内存 `internal` 管线归约，其 kernel 在 GPU 内部会合：
+各自在钉页主机内存中写入一个令牌，然后自旋等待读到对方的令牌。WDDM（Windows 驱动模型）会把 kernel launch
+暂存在每个设备的软件队列中，而后半段从未提交的会合永远不会完成。这就是 issue #256 中 `--tp 2` 的启动卡死
+（Windows 10 上的 2× RTX 3080，停在 `[TP] GGML tensor parallelism: 2 device(s), AllReduce=device` 之后，
+CPU 与 GPU 都空闲）。TensorSharp 现在会在自己发起的每次 AllReduce 之后提交两张 GPU 的队列；启动时用 3 秒后
+自行放弃的 kernel 检查这种会合（两张 GPU 无法会合时回退到主机归约并打印说明）；并用 `TS_GGML_TP_AR_PROBE_MS`
+（10 秒）约束第一次集合通信：始终未完成时拒绝加载（退出码 2），并给出 `GGML_CUDA_ALLREDUCE=none` 与
+`--layer-split N` 两种办法，而不是卡住。
 
 本地 AllReduce 优先使用 CUDA 点对点（P2P）DMA。启动时，并行组会为每一对报告支持
 P2P 的设备启用 peer access，随后做一次往返自检：部分拓扑（挂在某些 PCIe 交换机

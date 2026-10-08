@@ -334,4 +334,38 @@ public sealed class Qwen4ExpDevicePlanTests
         Assert.Equal(Layers, Qwen4ExpModel.PlanCudaDeviceExpertLayers(layers, GiB, everything, headroom, 0,
             spanScratch: Scratch(4096)));
     }
+
+    [Fact]
+    public void TensorParallel_Issue256_TwoTwentyGigabyteGpusCannotHoldTheExperts()
+    {
+        // --tp 2 keeps all 61 GiB of experts on the GPUs, half on each: no headroom
+        // or context choice makes 30.5 GiB fit a 20 GB card.
+        long experts = Layers * ExpertLayer;
+        long replicated = Layers * 46 * MiB + 3 * GiB;      // dense weights + a long-context cache
+        long[] available = { 18 * GiB, 18 * GiB };
+        int rank = Qwen4ExpModel.FindUnfitTensorParallelRank(replicated, experts, 1400 * MiB,
+            Qwen4ExpSpanScratch.FixedBytes, available, out long need);
+        Assert.Equal(0, rank);                              // GPU 0 also carries the projector
+        Assert.Equal(replicated + (experts + 1) / 2 + Qwen4ExpSpanScratch.FixedBytes + 1400 * MiB, need);
+        Assert.True(need > available[0]);
+    }
+
+    [Fact]
+    public void TensorParallel_FitsWhenTheShareAndTheReplicasFit()
+    {
+        long[] available = { 40 * GiB, 40 * GiB, 40 * GiB, 40 * GiB };
+        Assert.Equal(-1, Qwen4ExpModel.FindUnfitTensorParallelRank(5 * GiB, Layers * ExpertLayer, GiB,
+            Qwen4ExpSpanScratch.FixedBytes, available, out long need));
+        Assert.Equal(0, need);
+    }
+
+    [Fact]
+    public void TensorParallel_NamesTheGpuWithTheLargestShortfall()
+    {
+        // Rank 1 has the least room; rank 0's projector share is not enough to make it worse.
+        long[] available = { 20 * GiB, 12 * GiB };
+        int rank = Qwen4ExpModel.FindUnfitTensorParallelRank(4 * GiB, 20 * GiB, 512 * MiB, 0, available, out long need);
+        Assert.Equal(1, rank);
+        Assert.Equal(14 * GiB, need);
+    }
 }

@@ -2003,7 +2003,11 @@ Reach for it there on an NVLink host, or when a model fits no other way.
 On architectures that support the combination, TP composes with MoE CPU offload: `--tp N --n-cpu-moe M` keeps the fused
 multi-rank graph and drops the offloaded layers' expert bytes from every rank's
 VRAM. See [Mixture-of-Experts CPU offload](#mixture-of-experts-cpu-offload---n-cpu-moe)
-for the combined numbers. Qwen 3.8 Flash Next refuses expert offload under TP.
+for the combined numbers. Qwen 3.8 Flash Next refuses expert offload under TP: every routed expert
+stays on the GPUs, split evenly, and every GPU also holds its own copy of the other weights and of
+the caches. A checkpoint that cannot fit that way is refused at load, before the experts are sliced,
+with each GPU's need against its free memory, and pointed at `--layer-split N`, which runs the
+experts that do not fit from system RAM.
 
 | Variable | Effect |
 |---|---|
@@ -2016,7 +2020,8 @@ for the combined numbers. Qwen 3.8 Flash Next refuses expert offload under TP.
 | `TS_GEMMA4_TP_FUSED_MOE=0` | Gemma 4 only: fall back from the fused whole-model MoE trunk (Megatron split inside each expert) to the whole-expert per-op path. The fused path materializes ~10.5 GB of expert slices at load on the 26B (~36 s) in exchange for a ~10× decode. Layers offloaded by `--n-cpu-moe` are skipped by that materialization — they never run on the accelerator — so `--cpu-moe` also removes the load-time cost |
 | `GGML_CUDA_AR_BF16_THRESHOLD` | Payload size above which ggml-cuda's collective converts F32 to BF16 before reducing. TensorSharp raises ggml's default (1 byte — i.e. always) to 1 MB so decode-sized collectives reduce exactly; `0` disables the conversion entirely |
 | `TS_QWEN35_LAYER_TRACE=1` | Print a per-layer residual-stream summary for the first forward, from both the single-GPU and TP loops (diagnostic) |
-| `GGML_CUDA_ALLREDUCE` | `nccl` / `internal` / `none`, passed through to ggml |
+| `GGML_CUDA_ALLREDUCE` | `nccl` / `internal` / `none`, passed through to ggml. Unset, Linux uses NCCL and every other platform (Windows) the pinned-host `internal` pipeline, which supports exactly 2 GPUs |
+| `TS_GGML_TP_WDDM_FLUSH=0` | Windows only: stop submitting each GPU's queued launches after every AllReduce (diagnostic; see below) |
 
 ### Constraints
 
@@ -2041,6 +2046,18 @@ stages through host memory from the start.
 | `TENSORSHARP_TP_HOST_ALLREDUCE=1` | off | Run the local AllReduce as device→host, sum on the CPU, host→device. Slower, but matches the multi-node reduce exactly — useful for isolating P2P correctness issues. |
 | `TENSORSHARP_TP_CONNECT_TIMEOUT_SECONDS=N` | `120` | How long a node retries outbound connections to its peers. Nodes are usually launched by hand seconds or minutes apart, so a peer's listener may not be up yet; raise this for slow orchestrators. |
 | `TENSORSHARP_TP_RECV_TIMEOUT_SECONDS=N` | `300` | Per-receive timeout on a peer socket. Without it a stalled peer would block on the OS TCP keepalive (often 2+ hours) instead of failing the collective. |
+
+On Windows there is no NCCL, so two GPUs reduce through ggml's pinned-host `internal`
+pipeline, whose kernels meet inside the GPUs: each publishes a token in pinned host memory
+and spins until it reads the other's. WDDM, the Windows driver model, holds kernel launches
+in a per-device software queue, and a rendezvous whose second half was never submitted never
+completes. That was the `--tp 2` startup hang of issue #256 (2x RTX 3080 under Windows 10,
+stuck after `[TP] GGML tensor parallelism: 2 device(s), AllReduce=device` with CPU and GPUs
+idle). TensorSharp now submits both GPUs' queues after every AllReduce it issues, checks the
+rendezvous at startup with kernels that give up after 3 s (falling back to the host reduction,
+with a message, when the two GPUs cannot meet), and bounds the first collective by
+`TS_GGML_TP_AR_PROBE_MS` (10 s): one that never completes refuses the load (exit code 2) and
+names `GGML_CUDA_ALLREDUCE=none` and `--layer-split N` instead of hanging.
 
 Startup logs make the topology explicit: the local group prints
 `Tensor parallelism: N GPUs (<device names>)`, P2P demotions print a
