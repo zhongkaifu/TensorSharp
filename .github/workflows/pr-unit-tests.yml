@@ -56,3 +56,8 @@ jobs:
         run: >
           dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj
           --filter "Category!=Bench&Requires!=Cuda&Requires!=Mlx&Requires!=Models"
+
+      - name: Run unified memory state and real-file pressure tests
+        run: >
+          dotnet run --project eng/tests/unified-memory/UnifiedMemory.Tests.csproj
+          -c Release -- --json artifacts/unified-memory/results.json
