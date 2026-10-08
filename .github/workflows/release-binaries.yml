@@ -794,10 +794,10 @@ jobs:
           name: release-linux-arm64-cuda13-GB10
           path: artifacts/gb10/*
           if-no-files-found: error
-          # The tarballs are already compressed; avoid a second compression pass
-          # and retain this large handoff only long enough to publish the release.
+          # The tarballs are already compressed; avoid a second compression pass.
           compression-level: 0
-          retention-days: 1
+          # Match the other platforms so release retries can reuse GB10 artifacts.
+          retention-days: 14
 
   release:
     name: Publish GitHub Release
