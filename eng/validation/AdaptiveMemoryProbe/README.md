@@ -76,3 +76,36 @@ measurements. The earlier forced 256 MiB streaming result has a different capaci
 constraint and is not used as the resident baseline. Generated reports: ignored
 `artifacts/unified-memory-adaptive/{e4b,qwen08}-abba-v2-*`; prior `v1` evidence is
 retained separately and has an older assembly/native identity.
+
+## Single-token Q8 projection comparison
+
+`compare-native-runs.py` compares two resident binary directories with identical
+managed assemblies and checkpoint, allowing only the native-library identity to
+differ. Use `--control` for the first/last reports and `--candidate` for the middle
+two reports in a control/candidate/candidate/control sequence. It requires full
+raw-logit equality, excluded warmups and at least two fresh processes per arm.
+
+On the same hardware and Qwen checkpoint above, context 2048, 643 prompt tokens
+and 63 decode calls per request, the N=1 specialization keeps the previous
+K-ordered FMA but skips seven unused activation columns. Native control SHA is
+`cf1e969d8f5618734ea43484f96f5485b6fc005ea59a2d0572dc59af4d9078d0`;
+candidate SHA is
+`aad101dc524c20388a351e6b0b7bd05e4ee4901d41ab00b2655d55e4e6a8981d`.
+Managed Models remains `4f264ce3...` as recorded above. Six measured requests per
+arm, with no concurrent inference, build or download, gave:
+
+| Native | Prefill median (range), tokens/s | Decode median (range), tokens/s |
+| --- | ---: | ---: |
+| Previous | 2174.71 (2130.12–2194.91) | 18.374 (18.354–18.390) |
+| N=1 specialization | 2203.59 (2180.33–2234.07) | 20.122 (20.088–20.191) |
+
+All complete raw-logit histories match bitwise and all four processes exit zero.
+Decode improves 9.51% in this fixture; prefill ranges overlap and its kernel is
+unchanged. This is still below the requested overall performance goal and is
+not an independent-engine comparison. Resident mode has no shared-budget ledger,
+so these runs do not establish allocation-owner release. Native tests separately
+cover 96 shapes twice, independent FP64 checks, old/new N=1 byte equality, tail
+canaries and both FullPrecision streaming entry paths. Evidence is ignored under
+`artifacts/unified-memory-adaptive/q8-vector-native-abba-v1/` and
+`q8-vector-*-v2*`. The opt-in `GgmlOpsQ8VectorBench --benchmark` uses synthetic
+weights and reports projection timings separately; those are not model speeds.

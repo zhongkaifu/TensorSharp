@@ -5,6 +5,7 @@
 #ifdef TSG_GGML_USE_CUDA
 #include "ggml_ops_dsv4_fused.h"
 #include "ggml-cuda.h"
+#include <cuda_runtime_api.h>
 #else
 #include "ggml-cpu.h"
 #endif
@@ -124,11 +125,22 @@ std::vector<float> check(ggml_backend_t allocator, ggml_backend_t backend, const
         ? std::array<int64_t, 4>{c.columns, c.inner, 1, 1} : std::array<int64_t, 4>{c.inner, c.columns, 1, 1};
     input_tensor input(leaves, GGML_TYPE_F32, input_shape, c.padded, c.interleaved);
     if (c.transposed) input.tensor = ggml_transpose(leaves, input.tensor);
+#if defined(TSG_GGML_USE_CUDA) && defined(TSG_GGML_TEST_HOOKS)
+    auto * baseline = c.columns == 1 ? ggml_new_tensor_1d(leaves, GGML_TYPE_F32, c.rows + 2) : nullptr;
+#endif
     auto * leaf_buffer = ggml_backend_alloc_ctx_tensors(leaves, allocator);
     require(leaf_buffer != nullptr, "Cannot allocate Q8 projection inputs");
     auto * activation = c.pipeline ? ggml_scale(ctx, input.tensor, 2.0f) : input.tensor;
     auto * projected = tsg_matmul_q8_f32(ctx, weights.tensor, activation);
     require(projected && projected->op == GGML_OP_CUSTOM, "Q8 F32 projection must use the owned operation");
+#if defined(TSG_GGML_USE_CUDA) && defined(TSG_GGML_TEST_HOOKS)
+    if (baseline) {
+        // The old/new comparison runs after this graph. Do not let a later
+        // in-place scale overwrite either the actual input or projected result.
+        ggml_set_output(activation);
+        ggml_set_output(projected);
+    }
+#endif
     auto * output = c.pipeline ? ggml_scale(ctx, projected, 0.5f) : projected;
     ggml_set_output(output);
     auto * graph = ggml_new_graph(ctx);
@@ -142,6 +154,36 @@ std::vector<float> check(ggml_backend_t allocator, ggml_backend_t backend, const
         require(ggml_backend_graph_compute(backend, graph) == GGML_STATUS_SUCCESS, "Q8 projection compute failed");
         std::vector<float> result(size_t(c.rows) * c.columns);
         ggml_backend_tensor_get(output, result.data(), 0, result.size() * sizeof(float));
+#if defined(TSG_GGML_USE_CUDA) && defined(TSG_GGML_TEST_HOOKS)
+        if (baseline) {
+            const float canary = -12345.625f;
+            std::vector<float> reference(size_t(c.rows) + 2, canary), actual(size_t(c.rows));
+            ggml_backend_tensor_set(baseline, reference.data(), 0, reference.size() * sizeof(float));
+            require(tsg_matmul_q8_cuda_launch_reference(weights.tensor->data, activation->data,
+                static_cast<float *>(baseline->data) + 1, c.inner, c.rows, 1,
+                weights.tensor->nb[1], activation->nb[0], activation->nb[1], nullptr) == 0,
+                "Previous Q8 decode launch failed");
+            require(cudaDeviceSynchronize() == cudaSuccess, "Previous Q8 decode synchronization failed");
+            ggml_backend_tensor_get(baseline, reference.data(), 0, reference.size() * sizeof(float));
+            ggml_backend_tensor_get(projected, actual.data(), 0, actual.size() * sizeof(float));
+            require(reference.front() == canary && reference.back() == canary, "Q8 reference output canary changed");
+            require(std::memcmp(reference.data() + 1, actual.data(), actual.size() * sizeof(float)) == 0,
+                "Single-column Q8 kernel differs bitwise from previous K-ordered kernel");
+            // Exercise the new raw launcher with output guards as well: graph
+            // buffers alone would not catch a one-row tail overwrite.
+            std::fill(reference.begin(), reference.end(), canary);
+            ggml_backend_tensor_set(baseline, reference.data(), 0, reference.size() * sizeof(float));
+            require(tsg_matmul_q8_cuda_launch(weights.tensor->data, activation->data,
+                static_cast<float *>(baseline->data) + 1, c.inner, c.rows, 1,
+                weights.tensor->nb[1], activation->nb[0], activation->nb[1], nullptr) == 0,
+                "Single-column Q8 guarded launch failed");
+            require(cudaDeviceSynchronize() == cudaSuccess, "Single-column Q8 guarded synchronization failed");
+            ggml_backend_tensor_get(baseline, reference.data(), 0, reference.size() * sizeof(float));
+            require(reference.front() == canary && reference.back() == canary, "Single-column Q8 output canary changed");
+            require(std::memcmp(reference.data() + 1, actual.data(), actual.size() * sizeof(float)) == 0,
+                "Guarded single-column Q8 launch changed output bytes");
+        }
+#endif
         double error_squared = 0, reference_squared = 0, maximum_error = 0;
         size_t failures = 0;
         for (int col = 0; col < c.columns; ++col) {
@@ -181,6 +223,16 @@ std::vector<float> check(ggml_backend_t allocator, ggml_backend_t backend, const
 void run(ggml_backend_t allocator, ggml_backend_t backend) {
     int cases = 0;
     auto execute = [&](const test_case & c) { ++cases; return check(allocator, backend, c); };
+    // Single-column warp boundaries/tails and noncontiguous source strides.
+    // Every output is checked against an independent FP64 dot product; CUDA
+    // additionally compares every N=1 projection with the previous kernel.
+    for (int rows : {1, 15, 16, 17, 31, 32, 33, 64, 127, 129}) {
+        test_case c;
+        c.inner = 1024; c.rows = rows; c.columns = 1;
+        c.padded = c.interleaved = true;
+        c.data = pattern::non_power_scale;
+        execute(c);
+    }
     // CTA row, column and activation-stride boundaries, including graph reuse.
     for (int columns : {1, 4, 8, 9, 16, 17, 31, 32, 33, 65}) {
         test_case c;

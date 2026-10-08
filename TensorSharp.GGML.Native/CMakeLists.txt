@@ -798,12 +798,19 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
         add_executable(GgmlOpsCudaQ8PrecisionTest tests/q8_precision_test.cpp
             ggml_ops_q8_precision.cpp ggml_ops_q8_precision.cu ggml_ops_matmul_precision.cu
             ggml_ops_attention_precision.cu ggml_ops_dsv4_fused.cu)
-        target_compile_definitions(GgmlOpsCudaQ8PrecisionTest PRIVATE TSG_GGML_USE_CUDA=1)
+        target_compile_definitions(GgmlOpsCudaQ8PrecisionTest PRIVATE TSG_GGML_USE_CUDA=1 TSG_GGML_TEST_HOOKS)
         target_include_directories(GgmlOpsCudaQ8PrecisionTest PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/src")
         target_link_libraries(GgmlOpsCudaQ8PrecisionTest PRIVATE ggml-cuda ggml-cpu ggml-base CUDA::cublas)
         add_test(NAME cuda-q8-f32-projection COMMAND GgmlOpsCudaQ8PrecisionTest)
         set_tests_properties(cuda-q8-f32-projection PROPERTIES SKIP_RETURN_CODE 77)
+        # Opt-in synthetic-data timing with byte-exact previous-kernel control
+        # and independent sampled FP64 oracle; never a performance assertion.
+        add_executable(GgmlOpsQ8VectorBench tests/q8_vector_bench.cpp ggml_ops_q8_precision.cu)
+        target_compile_definitions(GgmlOpsQ8VectorBench PRIVATE TSG_GGML_USE_CUDA=1 TSG_GGML_TEST_HOOKS)
+        target_include_directories(GgmlOpsQ8VectorBench PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/src")
+        target_link_libraries(GgmlOpsQ8VectorBench PRIVATE ggml-cuda ggml-base CUDA::cudart)
         add_executable(GgmlOpsQwen4ExpReduceTest tests/qwen4exp_reduce_test.cpp
             ggml_ops_qwen4exp_reduce.cpp ggml_ops_matmul_precision.cu
             ggml_ops_attention_precision.cu ggml_ops_q8_precision.cu ggml_ops_dsv4_fused.cu)

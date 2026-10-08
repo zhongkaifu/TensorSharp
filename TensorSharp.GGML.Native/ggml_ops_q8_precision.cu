@@ -7,6 +7,55 @@
 #include <cstdint>
 
 namespace {
+// Decode has only one activation column. The matrix kernel below would still
+// compute eight columns (seven zero-filled), leaving only 16 of 128 threads
+// contributing useful results. Threads cooperatively decode 64 weight rows,
+// then one half warp owns four independent row accumulators per lane. All
+// other threads skip the otherwise redundant seven columns while helping the
+// coalesced weight loads. Shared-memory transposition
+// keeps both the Q8 loads and the per-K row reads coalesced/bank-conflict free.
+// Keep exactly the existing scale multiplication followed by K-increasing
+// fmaf: no parallel-K reduction, activation narrowing or extra payload buffer.
+__global__ void q8_f32_vector(const char * weights, const char * input, float * output,
+        int inner, int rows, size_t weight_stride, size_t input_inner_stride) {
+    constexpr int TileRows = 64, TileInner = 32;
+    __shared__ float ws[TileInner][TileRows + 1];
+    __shared__ float xs[TileInner];
+    const int lane = int(threadIdx.x);
+    const int row_base = int(blockIdx.x) * TileRows;
+    float sums[4] = {};
+    for (int base = 0; base < inner; base += TileInner) {
+        for (int index = lane; index < TileRows * TileInner; index += 128) {
+            const int row = index / TileInner, k = index % TileInner;
+            float value = 0.0f;
+            if (row_base + row < rows) {
+                const char * block = weights + size_t(row_base + row) * weight_stride + size_t(base / 32) * 34;
+                const float scale = __half2float(*reinterpret_cast<const half *>(block));
+                value = scale * float(*reinterpret_cast<const int8_t *>(block + 2 + k));
+            }
+            ws[k][row] = value;
+        }
+        if (lane < TileInner)
+            xs[lane] = *reinterpret_cast<const float *>(input + size_t(base + lane) * input_inner_stride);
+        __syncthreads();
+        if (lane < 16) {
+#pragma unroll
+            for (int k = 0; k < TileInner; ++k) {
+                const float x = xs[k];
+#pragma unroll
+                for (int row = 0; row < 4; ++row)
+                    sums[row] = fmaf(ws[k][lane + row * 16], x, sums[row]);
+            }
+        }
+        __syncthreads();
+    }
+    if (lane < 16) {
+#pragma unroll
+        for (int row = 0; row < 4; ++row)
+            if (row_base + lane + row * 16 < rows) output[row_base + lane + row * 16] = sums[row];
+    }
+}
+
 // Each CTA owns a 64-row output tile. Its 128 threads each accumulate four
 // rows and Columns/8 columns. Weight blocks widen once into shared memory and
 // are reused across the entire column tile, preserving quantized residency.
@@ -84,6 +133,27 @@ int tsg_matmul_q8_cuda_launch(const void * weights, const void * input, float * 
         int inner, int rows, int columns, size_t weight_stride, size_t input_inner_stride,
         size_t input_column_stride, void * stream_pointer) {
     const auto stream = static_cast<cudaStream_t>(stream_pointer);
+    if (columns == 1) {
+        const unsigned blocks = unsigned((int64_t(rows) + 63) / 64);
+        q8_f32_vector<<<blocks, 128, 0, stream>>>(static_cast<const char *>(weights),
+            static_cast<const char *>(input), output, inner, rows, weight_stride, input_inner_stride);
+    }
+    else if (columns <= 8) launch<8>(weights, input, output, inner, rows, columns,
+        weight_stride, input_inner_stride, input_column_stride, stream);
+    else if (columns <= 16) launch<16>(weights, input, output, inner, rows, columns,
+        weight_stride, input_inner_stride, input_column_stride, stream);
+    else launch<32>(weights, input, output, inner, rows, columns,
+        weight_stride, input_inner_stride, input_column_stride, stream);
+    return int(cudaGetLastError());
+}
+
+#if defined(TSG_GGML_TEST_HOOKS)
+// Keep the previous implementation available only to native correctness tests;
+// no runtime switch or additional public C ABI changes production dispatch.
+int tsg_matmul_q8_cuda_launch_reference(const void * weights, const void * input, float * output,
+        int inner, int rows, int columns, size_t weight_stride, size_t input_inner_stride,
+        size_t input_column_stride, void * stream_pointer) {
+    const auto stream = static_cast<cudaStream_t>(stream_pointer);
     if (columns <= 8) launch<8>(weights, input, output, inner, rows, columns,
         weight_stride, input_inner_stride, input_column_stride, stream);
     else if (columns <= 16) launch<16>(weights, input, output, inner, rows, columns,
@@ -92,6 +162,7 @@ int tsg_matmul_q8_cuda_launch(const void * weights, const void * input, float * 
         weight_stride, input_inner_stride, input_column_stride, stream);
     return int(cudaGetLastError());
 }
+#endif
 
 void tsg_matmul_q8_cuda_compute(ggml_tensor * dst, ggml_backend_t cuda_backend) {
     GGML_ASSERT(ggml_backend_is_cuda(cuda_backend) && ggml_is_contiguous(dst));
