@@ -156,6 +156,25 @@ protected RGBA pixels** on a real edit, using the same source image and an expli
 mask. That exact invariant does not prove that the selected area was edited well.
 No external reference-engine parity is claimed by `--engine tensorsharp`.
 
+The actual 2026-10-08 banner edit above completed at 512×512, 40 steps and seed42
+with exit0, but **failed the original semantic preservation requirement**. The
+blue sky, recognizable person and `TensorSharp` title were retained; the subtitle
+`Open-Source Deep Learning/AI C# Library` became visibly garbled. Do not count this
+as a passing editing-quality case or repair the text before assessment. Source
+1253×836 was conditioned near 640×416, with a square output; person preservation
+was judged semantically, not by pixel identity. The saved image is unmodified.
+
+Native SHA was `4bd1fbae1ba3a7e8422f9169527a64277b56c6f008ef159e067f347287320233`
+and Models SHA was `c45d4849de3ccbce89eb6f8e34297441d5605e98d34d51340d9c2c42820beae7`.
+Wall time was 37.063 s; process peak working set was 13,804,077,056 bytes and
+sampled whole-device VRAM peaked at 7,902 MiB. Concurrent small CPU validation
+and one sample prevent a throughput qualification; these are observed resource
+and latency values only. Evidence is ignored under
+`artifacts/multimodal-local-runs/image-edit-banner-v1/`, including the strict
+`visual-assessment.json`. The earlier complete 512² text-to-image case also used
+native4BD; nativeF612 was used only by the 256² one-step smoke. Their managed
+identities are recorded separately and are not assumed identical.
+
 ## Agent actions
 
 Use the running Flash Next server. Generic declared tool calls are tested with
