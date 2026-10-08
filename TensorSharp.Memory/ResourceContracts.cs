@@ -50,7 +50,23 @@ public interface IMemoryBackend
     /// <summary>Upper bound on physical charges, including alignment, mirrors and UMA
     /// constraints. No allocation may exceed this bound; driver overhead is headroom.</summary>
     IReadOnlyList<MemoryCharge> GetAllocationCharges(long byteLength);
+    /// <summary>Return a zero-initialized allocation. On failure, release all physical
+    /// memory or throw ResourceAllocationException with the still-owned buffer so
+    /// the scheduler can retain its charge and quarantine it for cleanup.</summary>
     ValueTask<IResourceBuffer> AllocateAsync(long byteLength, CancellationToken cancellationToken = default);
+}
+
+/// <summary>An allocation failed to initialize and could not be physically freed.
+/// Ownership of UnreleasedBuffer transfers to the caller, which must retain its
+/// budget until disposal succeeds. The buffer must never be published for use.</summary>
+public sealed class ResourceAllocationException : InvalidOperationException
+{
+    public ResourceAllocationException(IResourceBuffer unreleasedBuffer, Exception innerException)
+        : base("Allocation initialization and cleanup failed; the buffer must remain quarantined and charged.", innerException)
+    {
+        UnreleasedBuffer = unreleasedBuffer ?? throw new ArgumentNullException(nameof(unreleasedBuffer));
+    }
+    public IResourceBuffer UnreleasedBuffer { get; }
 }
 
 /// <summary>Optional device-to-device route. Both allocations remain leased during

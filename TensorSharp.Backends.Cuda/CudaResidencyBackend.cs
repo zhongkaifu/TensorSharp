@@ -71,7 +71,18 @@ public sealed class CudaResidencyBackend : IMemoryBackend
                 CudaDriverApi.cuMemsetD8(_pointer, 0, checked((nuint)bytes)).ThrowOnError();
                 CudaDriverApi.cuStreamSynchronize(IntPtr.Zero).ThrowOnError();
             }
-            catch { Dispose(); throw; }
+            catch (Exception initializationFailure)
+            {
+                try { Dispose(); }
+                catch (Exception cleanupFailure)
+                {
+                    // The scheduler must retain both this allocation and its
+                    // budget charge until a later cleanup attempt succeeds.
+                    throw new ResourceAllocationException(this,
+                        new AggregateException(initializationFailure, cleanupFailure));
+                }
+                throw;
+            }
         }
         public long ByteLength { get; }
         public nint Pointer { get { ObjectDisposedException.ThrowIf(_pointer == 0, this); return _pointer; } }

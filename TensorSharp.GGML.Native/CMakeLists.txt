@@ -160,7 +160,9 @@ if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
     set(GGML_CUDA_FORCE_MMQ OFF CACHE BOOL "" FORCE)
     set(GGML_CUDA_FORCE_CUBLAS OFF CACHE BOOL "" FORCE)
     set(GGML_CUDA_NO_VMM OFF CACHE BOOL "" FORCE)
-    set(GGML_CUDA_NO_PEER_COPY OFF CACHE BOOL "" FORCE)
+    # Cloud PCIe/IOMMU routes can advertise peer access but corrupt transfers.
+    # Preserve an explicit host-staging deployment choice without patching ggml.
+    set(GGML_CUDA_NO_PEER_COPY OFF CACHE BOOL "Disable CUDA peer copies and use host staging")
     set(GGML_CUDA_DEBUG OFF CACHE BOOL "" FORCE)
     # NCCL powers the cross-GPU AllReduce on the tensor-parallel path
     # (ggml-cuda's comm backend prefers it over the P2P pipeline and the
@@ -453,6 +455,20 @@ set_target_properties(GgmlOps PROPERTIES
 )
 
 if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
+    add_executable(GgmlOpsCacheBudgetTest tests/cache_budget_test.cpp)
+    target_include_directories(GgmlOpsCacheBudgetTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    target_link_libraries(GgmlOpsCacheBudgetTest PRIVATE Threads::Threads)
+    add_test(NAME cache-allocation-budget COMMAND GgmlOpsCacheBudgetTest)
+    set_tests_properties(cache-allocation-budget PROPERTIES TIMEOUT 30)
+    if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
+        set_property(SOURCE ggml_ops_core.cpp APPEND PROPERTY COMPILE_DEFINITIONS TSG_GGML_TEST_HOOKS)
+        add_executable(GgmlOpsCacheMemoryIntegrationTest tests/cache_memory_integration_test.cpp)
+        target_link_libraries(GgmlOpsCacheMemoryIntegrationTest PRIVATE GgmlOps)
+        add_test(NAME cuda-cache-memory-single COMMAND GgmlOpsCacheMemoryIntegrationTest 1)
+        add_test(NAME cuda-cache-memory-multi COMMAND GgmlOpsCacheMemoryIntegrationTest 2)
+        set_tests_properties(cuda-cache-memory-single cuda-cache-memory-multi PROPERTIES
+            SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 120)
+    endif()
     set_property(SOURCE ggml_ops_qwen4exp.cpp APPEND PROPERTY COMPILE_DEFINITIONS TSG_GGML_TEST_HOOKS)
     set_property(SOURCE ggml_ops_qwen4exp_arena.cpp APPEND PROPERTY COMPILE_DEFINITIONS TSG_GGML_TEST_HOOKS)
     add_executable(GgmlOpsQwen4ExpQsaPlanTest tests/qwen4exp_qsa_plan_test.cpp)

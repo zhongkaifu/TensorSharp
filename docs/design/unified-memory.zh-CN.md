@@ -1,6 +1,6 @@
 # TensorSharp 统一 VRAM / RAM / SSD 调度系统
 
-源码基线：`f5b1eefb6cf378ed19c9a33178be84c818f7fc4b`。设计与首批实现：2026-10-08 UTC。
+源码基线：`f5b1eefb6cf378ed19c9a33178be84c818f7fc4b`；本轮续作基于 `a52e4a1849ce94035c89c58c788e78bccaa88a37`。设计、实现与硬件续验：2026-10-08 UTC。
 
 ## 1. 交付状态与目标
 
@@ -15,10 +15,11 @@
 | 请求完整峰值预留、FIFO 队列、取消、预留向实际分配转账 | 已接入 ContinuousBatchScheduler/InferenceEngine；由执行器显式提供成本，未自动启用全部旧模型 |
 | GGUF / split GGUF 权重目录和不改量化格式的切片 | 已实现并测试；旧加载器未整体切换 |
 | Qwen CUDA/UMA 静态放置算法通用化 | 已接入原模型路径；保持原调优参数 |
-| 主机 KV 快照、前缀页、循环状态快照 | 已接入实际捕获/恢复路径，支持 RAM/SSD；不接管原生 holder/device arena |
-| CUDA 原始分配/读写/释放、真实 event fence、可选 P2P | 已编译；GPU 运行和性能未验证，P2P 默认关闭 |
-| GGML/Metal/Vulkan/MLX 原生图、分页 KV、全部融合算子 | 接口与迁移方案已设计，适配仍待实现 |
-| 多卡预算向量、带节点/设备标识的资源位置 | 已支持多位置工作集租约和全 rank fence；实际多卡执行未验证 |
+| 主机 KV 快照、前缀页、循环状态快照 | 显式启用时选择可恢复的逐序列路径，不再被融合路径绕过；Gemma 真实模型 RAM/文件换页已验证；不接管原生 holder/device arena |
+| CUDA 原始分配/读写/释放、真实 event fence、可选 P2P | 两张 A40 上单卡和主机中转多卡通过；本 VM 的直接 P2P 数据损坏，保持默认关闭 |
+| GGML lazy device-copy/preload cache | 新增并发分配预留与按 rank 的 payload 观测；显式预载独立计账，不代表整个 native 内存纳入 MemoryBudget |
+| GGML/Metal/Vulkan/MLX 原生图、分页 KV、全部融合算子 | 全面适配仍待实现；本轮没有 Metal/Vulkan/MLX 硬件验收 |
+| 多卡预算向量、带节点/设备标识的资源位置 | 已支持多位置工作集租约和全 rank fence；两张 A40 上实际内核、双向中转和释放验证通过 |
 | 多机协调、远程内存、异步 DMA 重叠、自适应成本策略 | 设计阶段，未实现 |
 
 “高速”必须相对于模型、量化、工作集、带宽和 SLO 定义。容量虚拟化能让更多模型运行，但无法让每个 token 都要读取几十 GB 冷权重的 dense 模型获得全驻留 GPU 的延迟。
@@ -41,7 +42,11 @@
 
 原生执行图里缓存了原始地址。只增加一个“LRU + memcpy”会产生 use-after-free 或读到旧版本。必须在算子、图或原生 slot 的生命周期上持有租约。对于捕获图，采用固定地址的 slot arena，或在地址/布局版本改变时失效并重建图。模型名字不应进入驻留管理器。
 
-本次未修改 upstream ggml，也未修改 TensorSharp 原生 C++ 文件。构建过程获取的 upstream checkout 为 `ffa4e8b80930029a35991f94e7c8a93cd67730ab`，工作树未作修改；本环境缺少 CMake，原生构建未完成。
+本次原生改动全部位于 TensorSharp 自有 C++ 文件。upstream ggml 固定为 `ffa4e8b80930029a35991f94e7c8a93cd67730ab`，本地和 VM checkout 均保持原样。CUDA 12.8 / sm_86 原生构建及缓存预算测试已完成。对该 VM 使用 ggml 已有的 `GGML_CUDA_NO_PEER_COPY=ON`；TensorSharp 的 CMake 不再强制覆盖用户选项，没有修改 upstream 实现。
+
+lazy device-copy cache 在分配前原子预留、成功发布后转为 committed，使用 ggml 报告的 buffer 字节数；显式 preload 单独记录 reserved/committed。`GgmlBasicOps.TryGetCacheMemoryUsage` 提供每 rank 诊断。该计数不包括 graph arena、KV、backend pool、allocator/driver 开销，不是进程 VRAM 硬上限，尚未与托管 `MemoryBudget` 合并。
+
+首次 DeviceCopy 上传现在在发布前同步完成，随后图构建因 scratch 分配失败而退出，也不会留下未初始化的缓存命中。CPU/UMA host-pointer 路径不变；冷 miss 增加 descriptor 和同步成本，尚未测量其性能影响，不能宣传为提速。设备回归覆盖 F32、Q8_0、opaque host key 和放弃图构建后重试；没有 Metal/Vulkan 运行验证。
 
 ## 3. 系统分层
 
@@ -247,13 +252,27 @@ CLI、HTTP API、Web Chat、TensorAgent 最终应共享一套 engine 配置。�
 
 ## 14. 验证与本次证据
 
-本次环境为 Linux x64、.NET SDK 10.0.401。`TensorSharp.Memory`、Runtime 和 CUDA 托管适配器已编译。原生 GGML 构建因为缺少 CMake 未完成；后续托管测试明确使用 `TensorSharpSkipGgmlNative=true`，不是把原生场景记成通过。
+本轮 VM 环境为 Ubuntu 24.04 x64、.NET SDK 10.0.401、CUDA 12.8.93、驱动 570.211.01，两张 NVIDIA A40（各 46,068 MiB）。`/workspace` 是网络文件系统，本轮文件换页不代表本地 NVMe 性能。使用未修改的上述 ggml revision 完成 CUDA 原生构建。
 
-新增独立 harness 当前 **30/30 通过**：原子预算/UMA、并发额度、请求 envelope、队列取消、真实文件大工作集、single-flight、写独占/版本、SSD 无损回写、损坏校验、SSD 配额耗尽、I/O/分配失败和取消回滚、完成事件、部分工作集回滚、预取、主机降级、生命周期、并发状态更新、split GGUF、原策略回归和流式矩阵计算；追加了实际 KV 存储换页、block id 复用、前缀引用释放、SSD 满保留状态、真实调度器准入/取消、预算唤醒及多位置租约测试。
+独立 Linux harness **43/43 通过**，覆盖原子预算/UMA、并发额度、请求 envelope、队列取消、真实文件大工作集、single-flight、写独占/版本、SSD 无损回写、损坏校验、SSD 配额耗尽、I/O/分配失败和取消回滚、完成事件、部分工作集回滚、预取、主机降级、生命周期、并发状态更新、split GGUF、原策略回归和流式矩阵计算。本轮增加分配与清理同时失败时的隔离、降级清理失败、预算缩减后的队列拒绝、真实 engine 的路径选择、完整页写放大与释放重试回归。释放中途失败时 worker 停止继续生成，完成所有等待 handle，保留未释放页面和额度；多请求 Dispose 中已经完成的释放不会因下一个请求失败而丢失。Windows 的同一 harness 为 **42/43**：文件共享语义不允许注入的损坏场景不可用，不能计为通过。
 
 真实文件工作集测试：1 MiB 权重文件，在 12 KiB 的受管 payload/staging 预算下循环读取。流式计算测试：512 KiB F32 矩阵，在 20 KiB 的受管 payload/staging 预算下分块，8 个请求共享一次权重读取，4,096 个结果与同运算顺序的参考计算逐位一致。输入/输出、.NET 运行时和 OS page cache 不属于这个 payload 预算；这些不是低 RAM 完整 LLM 的 benchmark。
 
-`ContinuousBatchSchedulerTests`、`Qwen4ExpCudaPlacementTests`、`SchedulerCapacityAdmissionTests` 和 `Qwen4ExpExpertOffloadTests.Plan_`：**66/66 通过，0 skipped**。新增公共引擎测试用依赖完整历史状态的确定性模型逐 token 比较换页前后并发输出，并验证循环状态 checkpoint、外部预算释放唤醒及取消。Memory、Runtime、CUDA 三个 NuGet 包已本地打包，并检查程序集与依赖关系；未发布包。硬件 CUDA/Metal/Vulkan、真实完整 LLM、图像/音频/视频质量、多 GPU 和多机推理：**未运行**。模拟 accelerator 的测试只验证状态机，绝不替代硬件测试。
+公共引擎测试用依赖完整历史状态的确定性模型逐 token 比较换页前后并发输出，并验证循环状态 checkpoint、外部预算释放唤醒、前缀回收和取消。原有调度、Qwen 放置与专家计划回归，加上执行计划、有预算快照、prefix 回收与并发对话回归，在 Linux 上 **140/140 通过，0 skipped**，与 harness 分开运行。此前三个 NuGet 包已本地打包；本轮没有发布包。
+
+真实 CUDA residency：GPU 0、GPU 1 各 **5/5**，双 GPU 主机中转 **11/11**，包括两方向全量数据、事件、SSD 恢复和请求物理释放。直接 P2P 的两个方向均失败；独立 CUDA Runtime 控制程序的同步/异步、两个方向共 **4/4 失败**。这是部署上的传输问题证据，不推断具体驱动/平台原因，也不算 P2P 通过。
+
+原生缓存 CTest **3/3 通过，0 skipped**：并发预留/回滚、CUDA 单卡和双卡实际缓存预算与 F32/Q8_0 计算、显式 preload 独立计账、释放归零。放弃图构建用例先将新 allocation 填入测试值，再要求其后缓存命中与强制流式参考逐元素一致。Q8_0 用可精确量化的激活输入，避免把 CUDA Q8_1 的输入舍入误判为缓存损坏；没有放宽比较容差。
+
+真实 Gemma 4 E2B IT Q4_K_M：完整聊天模板下并发 **1/2/4/8/16**、每请求 8 个生成 token，原有快照和受限 RAM/文件换页路径输出、结束原因一致；并发大于 1 必须实际发生 spill/load。另比较两个真实历史恢复后 **4,194,304** 个 logits，最大误差 **0**、argmax 无差异。仅验证文本和模型可恢复窗口内的状态；Qwen 3.5 0.8B Q8_0 尚未声明安全跨序列快照，实测启用时明确拒绝，不能计作支持。checkpoint hash、复现方式见 [ModelProbe](../../eng/validation/UnifiedMemory.ModelProbe/README.md)。最初未使用完整聊天模板的高并发用例发生早停，已保留为失败证据，不能与纠正后的固定输出用例混算。
+
+Gemma 较长用例实际为两个 **271 token** 完整 prompt，每请求生成 **16 token**；输出一致，换页恢复后 **8,388,608** 个 logits 最大误差仍为 **0**。engine 的 snapshot RAM 配额为 **655,360 字节**，含一个 294,912 字节驻留页及 capture/transfer scratch；权重、设备上的活跃 KV 和 OS page cache 在该配额之外。该上下文仍在模型的 512-token 可恢复窗口内。
+
+真实 Qwen 3.5 0.8B Q8_0 的 TP1/TP2 比较执行了 5 个用例 × 24 行、共 **29,798,400** 个 logits。日志、每 rank 缓存计数与设备观测确认两个 rank 实际参与。TP2 全部有限且 **120/120 argmax 相同**，但严格数值门槛仍然**失败**：最大 relative L2 为 **0.04140844**（限 0.001），最小 cosine 为 **0.99914715**（限 0.999999），最大绝对误差 **0.61136460**。不能据此宣称 TP2 已通过完整 logits 验收。
+
+定位控制：同一 TP1 路径在物理 GPU 0/1 上的全部 logits 逐位相等；关闭 TP 并行/CUDA graph，或启用 `TS_GGML_TP_FUSED_MATMUL=1`，均未消除 TP2 差异。差异从单 token 的第一行就出现，尚未定位到具体算子。TP2 原有退出时 CUDA driver shutdown abort 已通过补齐 fused TP 图释放修复，最终进程正常以数值门槛失败码 1 退出。命令与限制见 [ForcedLogitProbe](../../eng/ForcedLogitProbe/README.md)。测试使用 host reduction 和关闭 P2P 的 ggml 构建，不代表 NCCL/P2P 或吞吐验收。
+
+真实媒体输入/生成、全部其他模型族、Metal/Vulkan/MLX、多机以及“权重同时大于 RAM/VRAM”的完整模型测试：**未运行**。模拟 accelerator 只验证状态机。文件换页增加时延，本轮单次观测不是性能提升、p95/p99 或异步重叠证明。
 
 复现命令：
 
@@ -263,7 +282,7 @@ dotnet run --project eng/tests/unified-memory/UnifiedMemory.Tests.csproj -c Rele
 
 dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj -c Release -m:1 \
   -p:BuildInParallel=false -p:TensorSharpSkipGgmlNative=true -p:TensorSharpSkipMlxNative=true \
-  --filter 'FullyQualifiedName~ContinuousBatchSchedulerTests|FullyQualifiedName~Qwen4ExpCudaPlacementTests|FullyQualifiedName~SchedulerCapacityAdmissionTests|FullyQualifiedName~Qwen4ExpExpertOffloadTests.Plan_' \
+  --filter 'FullyQualifiedName~ContinuousBatchSchedulerTests|FullyQualifiedName~Qwen4ExpCudaPlacementTests|FullyQualifiedName~SchedulerCapacityAdmissionTests|FullyQualifiedName~Qwen4ExpExpertOffloadTests.Plan_|FullyQualifiedName~ExecutionPlannerTests|FullyQualifiedName~BoundedSnapshotEngineTests|FullyQualifiedName~ReclaimQueueFailureTests|FullyQualifiedName~PrefixTreeEvictionTests|FullyQualifiedName~ParallelConversationReuseTests|FullyQualifiedName~RadixPagedEngineTests' \
   --logger 'trx;LogFileName=unified-memory-followup.trx' \
   --results-directory artifacts/unified-memory
 ```
@@ -284,7 +303,7 @@ export TS_SCHED_KV_SSD_BYTES=8589934592
 export TS_SCHED_KV_SPILL_DIRECTORY=/path/on/ssd/tensorsharp-kv
 ```
 
-这些是**每个引擎的主机快照预算**，包含其 scratch/staging；不是总 RSS、模型权重、原生设备 KV 或 holder 的上限。多引擎部署须保证这些独立配额总和适合机器容量。若所选执行路径不导出主机快照，配置不会将原生状态自动换出。更大的原生 attention/KV/holder 适配仍需对应实现。
+这些是**每个引擎的主机快照预算**，包含其 scratch/staging；不是总 RSS、模型权重、原生设备 KV 或 holder 的上限。多引擎部署须保证这些独立配额总和适合机器容量。显式配置后，planner 使用逐序列主机快照路径；不支持安全跨序列恢复、零字节布局或快照页大于可恢复窗口的模型在创建 engine 时明确拒绝。单请求直接执行可不捕获快照，更大的原生 attention/KV/holder 适配仍需对应实现。
 
 `SchedulerConfig.MemoryAdmission` 已接入实际调度器：执行器提供每请求完整增量峰值，按多 pool 原子预留；准入先于前缀物化，取消/结束/抢占的额度在模型释放完成后才归还。`SequenceState.MemoryEnvelope` 用于实际分配，防止双重计账；缓存存活的子分配继续计费。共享权重、池化 arena 和保留前缀必须采用自己的生命周期额度。预算耗尽且当前引擎无运行请求时，worker 在模型锁外等待预算变化或新命令，不忙轮询。尚未为所有旧模型自动推导成本。
 
@@ -292,7 +311,7 @@ export TS_SCHED_KV_SPILL_DIRECTORY=/path/on/ssd/tensorsharp-kv
 
 硬件验证工具：[UnifiedMemory.CudaProbe](../../eng/validation/UnifiedMemory.CudaProbe/README.md)。它在每个选中 GPU 上实际执行整数内核，检查全量结果、事件生命周期、VRAM/RAM 压力下的 SSD 恢复、16 个并发读取者、逐方向 GPU 复制、部分工作集回滚与所有 rank fence。指定 P2P 却未走 peer 路径时返回失败；没有驱动或设备时返回 unavailable，不算通过。
 
-本次给定 VM 的 SSH 尝试受到执行环境限制：指定私钥不存在，网络连接返回 `Network is unreachable`。本地硬件探针报告 `hardware unavailable`（没有 CUDA driver），完成 0 个硬件场景。没有修改 VM。工具已编译，真实 GPU/多 GPU、真实完整模型及多机验收仍待具备访问条件后执行。
+本轮已使用给定 SSH 访问 VM、安装隔离的 .NET SDK、构建 CUDA 原生库并运行上述真实硬件和模型用例。历史环境的 unavailable 结果仍是历史记录，不能与本轮完成的场景混算。生成的日志、JSON、TRX、模型探针输出均保留在忽略的 `artifacts/unified-memory/` 和 `artifacts/unified-memory-continuation/`，不提交 Git。
 
 ## 16. 外部工程依据
 

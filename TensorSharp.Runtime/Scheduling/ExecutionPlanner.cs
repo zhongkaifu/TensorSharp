@@ -45,7 +45,8 @@ namespace TensorSharp.Runtime.Scheduling
             bool mtpUnprofitable = false;
             string? speculationRefusal = null;
 
-            bool batchedEnabled = !options.BatchedPathDisabled;
+            bool boundedSnapshots = config.KvSnapshots != null;
+            bool batchedEnabled = !options.BatchedPathDisabled && !boundedSnapshots;
             bool batchedImpl = caps.SupportsBatchedPagedAttention;
             bool solo = features.SequenceCount == 1;
             // A solo sequence resident in a per-request fused cache must stay
@@ -196,7 +197,9 @@ namespace TensorSharp.Runtime.Scheduling
             else if (batchedImpl && !batchedEnabled)
             {
                 rejections.Add(new ExecutionPathRejection(
-                    ExecutionPathKind.BatchedPaged, "disabled via TS_SCHED_DISABLE_BATCHED"));
+                    ExecutionPathKind.BatchedPaged, boundedSnapshots
+                        ? "bounded KV snapshots require the per-sequence host snapshot route"
+                        : "disabled via TS_SCHED_DISABLE_BATCHED"));
             }
             else if (batchedImpl && multimodalCount > 0)
             {
@@ -222,9 +225,16 @@ namespace TensorSharp.Runtime.Scheduling
         {
             var sb = new StringBuilder();
 
+            if (config.KvSnapshots is { } snapshots)
+                sb.Append("bounded host KV snapshots: enabled; per-sequence snapshot/swap route; RAM=")
+                    .Append(snapshots.RamBytes).Append(" SSD=").Append(snapshots.SsdBytes)
+                    .Append(" bytes (live device KV, weights and model scratch are not covered)\n");
+
             sb.Append("batched paged attention: ");
             if (!caps.SupportsBatchedPagedAttention)
                 sb.Append("unavailable (model does not implement IBatchedPagedModel)");
+            else if (config.KvSnapshots != null)
+                sb.Append("disabled (bounded host KV snapshots)");
             else if (options.BatchedPathDisabled)
                 sb.Append("disabled (TS_SCHED_DISABLE_BATCHED)");
             else if (!caps.BatchedForwardAvailable)
@@ -237,6 +247,8 @@ namespace TensorSharp.Runtime.Scheduling
             sb.Append("\nper-sequence fused concurrent decode: ");
             if (!caps.SupportsPerSequenceFusedForward)
                 sb.Append("unavailable (model/backend does not opt in)");
+            else if (config.KvSnapshots != null)
+                sb.Append("disabled (bounded host KV snapshots)");
             else if (!options.PerSeqFusedEnabled)
                 sb.Append("disabled (TS_PER_SEQ_FUSED=0)");
             else
@@ -247,6 +259,8 @@ namespace TensorSharp.Runtime.Scheduling
             sb.Append("\nN=1 single-sequence fused fast path: ");
             if (!caps.SupportsBatchedPagedAttention)
                 sb.Append("n/a (no batched contract)");
+            else if (config.KvSnapshots != null)
+                sb.Append("disabled (bounded host KV snapshots)");
             else if (!caps.SupportsLinearKvMigration)
                 sb.Append("unavailable (no linear->paged KV migration)");
             else
@@ -285,6 +299,8 @@ namespace TensorSharp.Runtime.Scheduling
             sb.Append("\nretained fused-cache continuation: ");
             if (!caps.SupportsPerSequenceFusedForward)
                 sb.Append("n/a for this model");
+            else if (config.KvSnapshots != null)
+                sb.Append("off (bounded host KV snapshots)");
             else if (!caps.SupportsRetainedFusedCache)
                 sb.Append("unavailable (model does not support retained holders)");
             else if (options.RetainedFusedCacheBudget == 0)

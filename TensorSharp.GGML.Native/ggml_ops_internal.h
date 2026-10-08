@@ -309,7 +309,12 @@ namespace tsg
         std::int64_t offloadable_budget = 0;
 
         std::int64_t device_copy_resident_bytes = 0;
+        std::int64_t device_copy_reserved_bytes = 0;
         std::int64_t device_copy_budget_bytes = 0;
+        // Explicit preloads retain their existing admission policy; they are
+        // measured separately and do not consume the lazy device-copy quota.
+        std::int64_t preload_resident_bytes = 0;
+        std::int64_t preload_reserved_bytes = 0;
     };
 
     extern DeviceState g_device_states[TSG_MAX_DEVICES];

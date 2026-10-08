@@ -38,12 +38,13 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
         _cacheModel = (IPrefixCacheModel)model;
         _logger = logger;
         var options = ExecutionOptions.FromEnvironment();
+        bool batchedEnabled = !options.BatchedPathDisabled && scheduler.Config.KvSnapshots == null;
         // A materialized holder is only readable through the fused per-request route, a paged end state only
         // through the batched route. Without that route (--no-continuous-batching, TS_PER_SEQ_FUSED=0, or a model
         // that lacks it) no placeholder blocks may be adopted for it.
         bool endStateRoute = capabilities.PagedEndStates
-            ? !options.BatchedPathDisabled && model is IBatchedPagedModel { BatchedForwardAvailable: true }
-            : !options.BatchedPathDisabled && options.PerSeqFusedEnabled
+            ? batchedEnabled && model is IBatchedPagedModel { BatchedForwardAvailable: true }
+            : batchedEnabled && options.PerSeqFusedEnabled
               && model is IBatchedPagedModel { SupportsPerSequenceFusedForward: true };
         if (!endStateRoute)
             capabilities = capabilities with
@@ -62,7 +63,7 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
             PageHost = new PageHost(pool),
             PageHostBytes = InferenceEngine.ComputeBlockByteSize(model, pool.BlockSize),
             PoolPagesCap = pool.NumBlocks,
-            BatchedPagedEnabled = !options.BatchedPathDisabled,
+            BatchedPagedEnabled = batchedEnabled,
             PayloadValidator = this,
             QuerySpareBytes = _cacheModel.QuerySpareBytes,
             HostRamBytes = GC.GetGCMemoryInfo().TotalAvailableMemoryBytes,
@@ -147,7 +148,7 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
     private ExpectedRoute PredictRoute()
     {
         var options = ExecutionOptions.FromEnvironment();
-        if (!options.BatchedPathDisabled && options.PerSeqFusedEnabled
+        if (_scheduler.Config.KvSnapshots == null && !options.BatchedPathDisabled && options.PerSeqFusedEnabled
             && _model is IBatchedPagedModel { SupportsPerSequenceFusedForward: true })
             return ExpectedRoute.PerSequenceFused;
         return ExpectedRoute.Primary;

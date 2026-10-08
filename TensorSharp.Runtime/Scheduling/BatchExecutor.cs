@@ -2744,6 +2744,15 @@ namespace TensorSharp.Runtime.Scheduling
                     && RadixCache != null && RadixCache.Tree.TryGetBlockOwner(block, out _))
                     continue;
 
+                // A completed page is immutable even when only this request owns
+                // it. Rewriting every full page on each dense-model decode swap
+                // needlessly restores old SSD pages, invalidates their backing
+                // versions and spills them again. Keep their published snapshot;
+                // only the still-growing partial tail needs a fresh extraction.
+                if (_pool.Storage.UsesTieredSnapshots && tokensInBlock == _blockSize
+                    && block.Used == _blockSize && block.HoldsSnapshotBytes)
+                    continue;
+
                 // A recurrent full block was captured at the exact Forward
                 // boundary where it first became available. Re-extracting it on
                 // a later owner swap would overwrite that checkpoint with the

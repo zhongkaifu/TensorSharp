@@ -392,7 +392,17 @@ namespace TensorSharp.Runtime.Scheduling
                 // freed and need a fresh re-prefill, no shortcut).
                 if (_cfg.MemoryAdmission is { } admission && seq.MemoryEnvelope == null)
                 {
-                    var envelope = admission.Budget.TryReserve(_memoryPeaks[seq.RequestId]);
+                    var peak = _memoryPeaks[seq.RequestId];
+                    // A budget can shrink while a request is queued. Waiting on its
+                    // change signal cannot help an envelope that no longer fits even
+                    // in isolation; reject just this request and visit the next one.
+                    if (!admission.Budget.CanEverFit(peak))
+                    {
+                        NotifyError(seq, new MemoryPressureException(
+                            "Request peak exceeds a physical memory pool after its capacity changed."), output);
+                        continue;
+                    }
+                    var envelope = admission.Budget.TryReserve(peak);
                     if (envelope == null) { MemoryAdmissionBlocked = true; break; }
                     seq.MemoryEnvelope = envelope;
                     _memoryOwners.Add(seq.RequestId, seq);
@@ -608,8 +618,7 @@ namespace TensorSharp.Runtime.Scheduling
                     or SequenceStatus.FinishedAborted)
                 _radixCache.RetainPagedFinished(seq);
 
-            var freed = seq.BlockTable.Clear();
-            if (freed.Count > 0) _pool.Free(freed);
+            seq.BlockTable.ReleaseAll(_pool);
 
             seq.Status = finalStatus;
             seq.FinishReason = reason;
@@ -824,8 +833,7 @@ namespace TensorSharp.Runtime.Scheduling
         private void PreemptSequence(SequenceState victim)
         {
             CacheFullBlocksForSequence(victim);
-            var freed = victim.BlockTable.Clear();
-            if (freed.Count > 0) _pool.Free(freed);
+            victim.BlockTable.ReleaseAll(_pool);
 
             _running.Remove(victim.RequestId);
             _runningOrder.Remove(victim);

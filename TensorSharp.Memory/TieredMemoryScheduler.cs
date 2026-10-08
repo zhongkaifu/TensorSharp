@@ -20,6 +20,9 @@ public sealed class TieredMemoryScheduler : IAsyncDisposable
         public readonly MemoryResource Resource = resource;
         public readonly IResourceSource? Source = source;
         public readonly Dictionary<MemoryLocation, Replica> Replicas = new();
+        // Failed rollback allocations are not valid replicas, but still own physical
+        // memory and budget. Keep them reachable for a later Unregister retry.
+        public readonly List<Replica> QuarantinedAllocations = new();
         public SsdSpillStore.Snapshot? Spill;
         public long Version;
         public bool Writer;
@@ -139,24 +142,11 @@ public sealed class TieredMemoryScheduler : IAsyncDisposable
                 {
                     var reservation = await ReserveWithEvictionAsync(backend.GetAllocationCharges(entry.Resource.ByteLength),
                         allowEviction, cancellationToken, allocationEnvelope).ConfigureAwait(false);
-                    IResourceBuffer? buffer = null;
-                    try
-                    {
-                        buffer = await backend.AllocateAsync(entry.Resource.ByteLength, cancellationToken).ConfigureAwait(false);
-                        if (buffer.ByteLength != entry.Resource.ByteLength) throw new InvalidOperationException("Backend allocation length mismatch.");
-                        reservation.Commit();
-                        if (source != null) await _transfers.CopyAsync(source, buffer, cancellationToken).ConfigureAwait(false);
-                        else if (entry.Version != 0) throw new InvalidOperationException("Mutable resource has lost its authoritative data.");
-                        // Backends initialize new allocations to zero. This is the only
-                        // source-less state: a newly registered mutable resource.
-                        provisional = target = new Replica(buffer, reservation);
-                    }
-                    catch
-                    {
-                        buffer?.Dispose();
-                        reservation.Dispose();
-                        throw;
-                    }
+                    provisional = target = await AllocateReplicaAsync(entry, backend, reservation, cancellationToken).ConfigureAwait(false);
+                    if (source != null) await _transfers.CopyAsync(source, target.Buffer, cancellationToken).ConfigureAwait(false);
+                    else if (entry.Version != 0) throw new InvalidOperationException("Mutable resource has lost its authoritative data.");
+                    // Backends initialize new allocations to zero. This is the only
+                    // source-less state: a newly registered mutable resource.
                 }
                 cancellationToken.ThrowIfCancellationRequested();
                 if (access == ResourceAccess.Write)
@@ -186,9 +176,9 @@ public sealed class TieredMemoryScheduler : IAsyncDisposable
                     return lease;
                 }
             }
-            catch
+            catch (Exception error)
             {
-                try { if (provisional != null) FreeReplica(entry, provisional); }
+                try { if (provisional != null) RollbackAllocation(entry, provisional, error); }
                 finally { lock (_gate) EndTransition(entry); }
                 throw;
             }
@@ -274,21 +264,25 @@ public sealed class TieredMemoryScheduler : IAsyncDisposable
             var charge = _budget.TryReserve(_host.GetAllocationCharges(entry.Resource.ByteLength));
             if (charge != null)
             {
-                IResourceBuffer? buffer = null;
+                Replica? provisional = null;
                 try
                 {
-                    buffer = await _host.AllocateAsync(entry.Resource.ByteLength, cancellationToken).ConfigureAwait(false);
-                    if (buffer.ByteLength != entry.Resource.ByteLength) throw new InvalidOperationException("Backend allocation length mismatch.");
-                    charge.Commit();
-                    await _transfers.CopyAsync(replica.Buffer, buffer, cancellationToken).ConfigureAwait(false);
+                    provisional = await AllocateReplicaAsync(entry, _host, charge, cancellationToken).ConfigureAwait(false);
+                    await _transfers.CopyAsync(replica.Buffer, provisional.Buffer, cancellationToken).ConfigureAwait(false);
                     lock (_gate)
                     {
-                        var demoted = new Replica(buffer, charge) { LastUse = ++_clock };
+                        var demoted = provisional;
+                        demoted.LastUse = ++_clock;
                         entry.Replicas.Add(_host.Location, demoted);
                         demoted.LruNode = _lru.AddLast((entry, _host.Location, demoted));
+                        provisional = null;
                     }
                 }
-                catch { buffer?.Dispose(); charge.Dispose(); throw; }
+                catch (Exception error)
+                {
+                    if (provisional != null) RollbackAllocation(entry, provisional, error);
+                    throw;
+                }
             }
         }
         bool hasRecovery = entry.Replicas.Count > 1 || entry.Spill != null || (entry.Version == 0 && entry.Source != null);
@@ -312,6 +306,51 @@ public sealed class TieredMemoryScheduler : IAsyncDisposable
         {
             if (replica.LruNode is { } node) _lru.Remove(node);
             replica.LruNode = null;
+        }
+    }
+
+    private async ValueTask<Replica> AllocateReplicaAsync(Entry entry, IMemoryBackend backend,
+        BudgetReservation reservation, CancellationToken cancellationToken)
+    {
+        IResourceBuffer? buffer = null;
+        try
+        {
+            buffer = await backend.AllocateAsync(entry.Resource.ByteLength, cancellationToken).ConfigureAwait(false);
+            reservation.Commit();
+            if (buffer.ByteLength != entry.Resource.ByteLength) throw new InvalidOperationException("Backend allocation length mismatch.");
+            return new Replica(buffer, reservation);
+        }
+        catch (ResourceAllocationException error) when (buffer == null)
+        {
+            reservation.Commit();
+            QuarantineAllocation(entry, new Replica(error.UnreleasedBuffer, reservation), error);
+            throw;
+        }
+        catch (Exception error)
+        {
+            if (buffer == null) reservation.Dispose();
+            else RollbackAllocation(entry, new Replica(buffer, reservation), error);
+            throw;
+        }
+    }
+
+    private void QuarantineAllocation(Entry entry, Replica replica, Exception error)
+    {
+        lock (_gate)
+        {
+            entry.QuarantinedAllocations.Add(replica);
+            entry.Fault = error;
+        }
+    }
+
+    private void RollbackAllocation(Entry entry, Replica replica, Exception cause)
+    {
+        try { FreeReplica(entry, replica); }
+        catch (Exception cleanupError)
+        {
+            var error = new AggregateException("Resource operation and allocation cleanup failed.", cause, cleanupError);
+            QuarantineAllocation(entry, replica, error);
+            throw error;
         }
     }
 
@@ -382,6 +421,11 @@ public sealed class TieredMemoryScheduler : IAsyncDisposable
             {
                 FreeReplica(entry, replica.Value);
                 lock (_gate) entry.Replicas.Remove(replica.Key);
+            }
+            foreach (var replica in entry.QuarantinedAllocations.ToArray())
+            {
+                FreeReplica(entry, replica);
+                lock (_gate) entry.QuarantinedAllocations.Remove(replica);
             }
             entry.Spill?.Dispose();
             lock (_gate) _entries.Remove(key);

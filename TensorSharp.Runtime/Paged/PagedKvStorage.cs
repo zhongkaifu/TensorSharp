@@ -41,6 +41,8 @@ namespace TensorSharp.Runtime.Paged
             // BatchExecutor) is gated on SupportsKVStateSnapshot, so the
             // zero-length slabs are never read or written.
             if (blockByteSize < 0) throw new ArgumentOutOfRangeException(nameof(blockByteSize));
+            if (snapshotOptions != null && blockByteSize == 0)
+                throw new NotSupportedException("Bounded KV snapshots require a model with a nonempty, restorable block snapshot.");
 
             _numBlocks = numBlocks;
             _blockByteSize = blockByteSize;

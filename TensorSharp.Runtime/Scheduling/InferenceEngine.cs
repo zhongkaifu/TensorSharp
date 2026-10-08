@@ -52,6 +52,9 @@ namespace TensorSharp.Runtime.Scheduling
         private long _totalSubmitted;
         private long _totalStepsRun;
         private long _totalForwardTicks;
+        private readonly object _disposalGate = new();
+        private readonly Dictionary<string, Exception> _failedSequenceReleases = new(StringComparer.Ordinal);
+        private bool _stopping;
         private bool _disposed;
 
         /// <summary>Whether the radix prefix cache serves this loaded model (prefix
@@ -68,6 +71,14 @@ namespace TensorSharp.Runtime.Scheduling
             _nativeSlotContextLimit = UsesNativeDeepSeek41Slots(model) ? Math.Max(0, model.MaxContextLength) : 0;
 
             long blockBytes = ComputeBlockByteSize(model, cfg.BlockSize);
+            if (cfg.KvSnapshots != null && (!model.SupportsKVStateSnapshot
+                || !model.SupportsCrossSequenceKvReuse || blockBytes <= 0))
+                throw new NotSupportedException(
+                    "Bounded KV snapshots require complete block snapshots that can be restored into a fresh sequence. " +
+                    "This model cannot use the host RAM/SSD snapshot route.");
+            if (cfg.KvSnapshots != null && model.MaxReusablePrefixTokens < cfg.BlockSize)
+                throw new NotSupportedException(
+                    "The configured KV block size exceeds this model's restorable snapshot window. Reduce the block size.");
             int numBlocks = ResolveEffectiveNumBlocks(model, cfg, _logger);
             _pool = new BlockPool(numBlocks, cfg.BlockSize, blockBytes, cfg.KvSnapshots);
             try
@@ -178,7 +189,7 @@ namespace TensorSharp.Runtime.Scheduling
             if (seq == null) throw new ArgumentNullException(nameof(seq));
             lock (_submissionGate)
             {
-                ObjectDisposedException.ThrowIf(_disposed, this);
+                ObjectDisposedException.ThrowIf(_stopping || _disposed, this);
                 if (_handles.ContainsKey(seq.RequestId))
                 {
                     throw new InvalidOperationException(
@@ -257,54 +268,93 @@ namespace TensorSharp.Runtime.Scheduling
 
         public void Dispose()
         {
-            lock (_submissionGate)
+            lock (_disposalGate)
             {
                 if (_disposed) return;
-                _disposed = true;
-                _shutdownCts.Cancel();
-                _commands.Writer.TryComplete();
-            }
-            // Wait for the worker to actually leave its step. The caller is about to
-            // free the model's buffers and, on a recovery, the GPU backend itself; a
-            // worker still inside a graph compute when that happens is a use-after-free
-            // in a kernel, not an error. A step is bounded (one decode, or one prefill
-            // chunk), so this returns; the cap only stops a wedged native call from
-            // holding a shutdown forever. A worker parked on the compute gate leaves at
-            // once, because the gate wait uses the shutdown token.
-            if (_worker.IsAlive && Thread.CurrentThread != _worker)
-            {
-                bool left;
-                try { left = _worker.Join(TimeSpan.FromSeconds(60)); } catch { left = true; }
-                if (!left)
-                    _logger.LogWarning("InferenceEngine worker did not leave its step within 60s of shutdown; releasing anyway");
-            }
-            // Nobody is going to finish these now. A consumer awaiting one of them --
-            // another conversation's turn, on a phone -- would otherwise wait forever.
-            var abandoned = new ObjectDisposedException(nameof(InferenceEngine),
-                "The inference engine was shut down while this request was in flight.");
-            foreach (var entry in _handles)
-            {
-                if (_handles.TryRemove(entry.Key, out var handle))
-                    handle.CompleteWithError(abandoned);
-            }
-            if (!_worker.IsAlive)
-            {
+                lock (_submissionGate)
+                {
+                    if (!_stopping)
+                    {
+                        _stopping = true;
+                        _shutdownCts.Cancel();
+                        _commands.Writer.TryComplete();
+                    }
+                }
+                // Disposal must never authorize the caller to free a model while
+                // native work still uses it. A failure leaves shutdown requested
+                // and permits another Dispose call after the worker/release recovers.
+                if (Thread.CurrentThread == _worker)
+                    throw new InvalidOperationException("Dispose the engine from outside its worker thread after the current model step returns.");
+                if (_worker.IsAlive && !_worker.Join(TimeSpan.FromSeconds(60)))
+                    throw new TimeoutException("InferenceEngine worker did not finish within 60s. Model buffers remain owned; retry disposal after the worker stops.");
+
+                var abandoned = new ObjectDisposedException(nameof(InferenceEngine),
+                    "The inference engine was shut down while this request was in flight.");
+                foreach (var entry in _handles)
+                {
+                    if (_handles.TryRemove(entry.Key, out var handle))
+                        handle.CompleteWithError(abandoned);
+                }
                 lock (_model.GpuComputeLock)
                 {
+                    // Finished requests no longer appear in the scheduler's active
+                    // snapshot, but a failed release still owns its model state and
+                    // admission envelope. Retry each release once per Dispose call.
+                    var releaseIds = new HashSet<string>(_failedSequenceReleases.Keys, StringComparer.Ordinal);
                     foreach (var sequence in _scheduler.GetInFlightSequencesSnapshot())
                     {
                         _scheduler.Abort(sequence.RequestId);
+                        // Once Abort removes this owner from the scheduler, finish
+                        // its handoff before another owner's page release can fail.
                         NotifyReleasedSequence(_model as IBatchedPagedModel, sequence.RequestId,
                             seen: null, retainFusedCache: false);
+                        releaseIds.Remove(sequence.RequestId);
                     }
+                    foreach (string requestId in releaseIds)
+                        NotifyReleasedSequence(_model as IBatchedPagedModel, requestId,
+                            seen: null, retainFusedCache: false);
+                    if (_failedSequenceReleases.Count > 0)
+                        throw new AggregateException(
+                            "Model sequence release failed; admission envelopes remain charged. Retry Dispose after the release failure is resolved.",
+                            _failedSequenceReleases.Values);
                     _executor.Reset();
                     _executor.RadixCache?.Detach();
                     _pool.Storage.Dispose();
                 }
+                _shutdownCts.Dispose();
+                _disposed = true;
             }
         }
 
         private void WorkerLoop()
+        {
+            try
+            {
+                RunWorkerLoop();
+            }
+            catch (Exception ex)
+            {
+                // A failed cleanup may have released only part of a block table.
+                // Keep its remaining ownership for Dispose and never forward again.
+                lock (_submissionGate)
+                {
+                    _stopping = true;
+                    _shutdownCts.Cancel();
+                    _commands.Writer.TryComplete();
+                }
+                _logger.LogError(ex, "Inference worker stopped after an unrecoverable lifecycle failure; dispose the engine to retry cleanup.");
+                foreach (var entry in _handles)
+                {
+                    if (_handles.TryRemove(entry.Key, out var handle))
+                    {
+                        handle.CompleteWithError(ex);
+                        Interlocked.Increment(ref _totalCompleted);
+                    }
+                }
+            }
+        }
+
+        private void RunWorkerLoop()
         {
             var sw = new System.Diagnostics.Stopwatch();
             Task? memoryWait = null;
@@ -415,15 +465,16 @@ namespace TensorSharp.Runtime.Scheduling
                     Interlocked.Add(ref _totalForwardTicks, sw.ElapsedTicks);
 
                     // Post-step: emit tokens, detect stop conditions, finish sequences.
-                    ApplyResults(results, output);
-
-                    // Notify the model about sequences whose per-request state can
-                    // now be reclaimed (finished, preempted, errored). Hybrid
-                    // models (Nemotron-H, Qwen 3.5) allocate Mamba2 / GatedDeltaNet
-                    // recurrent-state slots keyed by RequestId; without this
-                    // notification the slot pool grows unbounded and slot indices
-                    // get reused incorrectly across abandoned sequences.
-                    NotifyReleasedSequences(output);
+                    try
+                    {
+                        ApplyResults(results, output);
+                    }
+                    finally
+                    {
+                        // Even if a later sequence fails cleanup, earlier finished
+                        // owners have left the scheduler and still need their hooks.
+                        NotifyReleasedSequences(output);
+                    }
                 }
             }
         }
@@ -435,7 +486,18 @@ namespace TensorSharp.Runtime.Scheduling
             if (output.FinishedRequestIds != null)
             {
                 foreach (var id in output.FinishedRequestIds)
+                {
+                    // Admission can fail after a capacity change without executing a
+                    // model step. Complete those handles too; ApplyResults only sees
+                    // requests that produced a SequenceStepResult.
+                    if (_handles.TryGetValue(id, out var pending) && pending.Sequence.Error is { } error
+                        && _handles.TryRemove(id, out var failed))
+                    {
+                        failed.CompleteWithError(error);
+                        Interlocked.Increment(ref _totalCompleted);
+                    }
                     NotifyReleasedSequence(batched, id, seen);
+                }
             }
             if (output.PreemptedRequestIds != null)
             {
@@ -464,6 +526,7 @@ namespace TensorSharp.Runtime.Scheduling
                 stalled.Count, _pool.NumFreeBlocks, _pool.NumBlocks);
 
             var released = new HashSet<string>(StringComparer.Ordinal);
+            Exception? releaseFailure = null;
             foreach (var seq in stalled)
             {
                 if (seq == null) continue;
@@ -475,6 +538,7 @@ namespace TensorSharp.Runtime.Scheduling
                 }
                 catch (Exception cleanupEx)
                 {
+                    releaseFailure ??= cleanupEx;
                     _logger.LogError(
                         cleanupEx,
                         "Failed to release scheduler state for stalled sequence {RequestId}",
@@ -491,6 +555,8 @@ namespace TensorSharp.Runtime.Scheduling
             }
 
             NotifyReleasedSequences(released);
+            if (releaseFailure != null)
+                throw new AggregateException("Failed to release a stalled sequence; generation cannot safely continue.", ex, releaseFailure);
         }
 
         private void FailStepSequences(Exception ex, SchedulerOutput? output, string phase)
@@ -511,6 +577,7 @@ namespace TensorSharp.Runtime.Scheduling
                 affected.Count);
 
             var released = new HashSet<string>(StringComparer.Ordinal);
+            Exception? releaseFailure = null;
             if (output?.PreemptedRequestIds != null)
             {
                 foreach (var id in output.PreemptedRequestIds)
@@ -531,6 +598,7 @@ namespace TensorSharp.Runtime.Scheduling
                 }
                 catch (Exception cleanupEx)
                 {
+                    releaseFailure ??= cleanupEx;
                     _logger.LogError(
                         cleanupEx,
                         "Failed to release scheduler state for errored sequence {RequestId}",
@@ -556,6 +624,8 @@ namespace TensorSharp.Runtime.Scheduling
             }
 
             NotifyReleasedSequences(released);
+            if (releaseFailure != null)
+                throw new AggregateException("Failed to release an errored sequence; generation cannot safely continue.", ex, releaseFailure);
         }
 
         private List<SequenceState> GetAffectedSequences(SchedulerOutput? output)
@@ -631,9 +701,11 @@ namespace TensorSharp.Runtime.Scheduling
                 batched?.OnSequenceReleased(requestId);
                 _executor.RadixCache?.Drain();
                 _scheduler.NotifyMemoryReleased(requestId);
+                _failedSequenceReleases.Remove(requestId);
             }
             catch (Exception ex)
             {
+                _failedSequenceReleases[requestId] = ex;
                 _logger.LogWarning(ex, "Model release hook failed for sequence {RequestId}", requestId);
             }
         }

@@ -61,3 +61,9 @@ jobs:
         run: >
           dotnet run --project eng/tests/unified-memory/UnifiedMemory.Tests.csproj
           -c Release -- --json artifacts/unified-memory/results.json
+
+      - name: Check native cache admission under concurrent allocation
+        run: |
+          mkdir -p artifacts/unified-memory
+          c++ -std=c++17 -O2 -pthread -I TensorSharp.GGML.Native TensorSharp.GGML.Native/tests/cache_budget_test.cpp -o artifacts/unified-memory/cache-budget-test
+          artifacts/unified-memory/cache-budget-test

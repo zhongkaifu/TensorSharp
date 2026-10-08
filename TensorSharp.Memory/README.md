@@ -76,8 +76,11 @@ KV growth, recurrent state, scratch and temporaries, with allocator alignment.
 
 ## Runtime integration
 
-`SchedulerConfig.KvSnapshots` enables bounded host snapshot storage in the existing
-`InferenceEngine` and `BatchExecutor` capture/inject path. CLI inference sessions,
+`SchedulerConfig.KvSnapshots` selects bounded host snapshot storage in the existing
+`InferenceEngine` and `BatchExecutor` per-sequence capture/inject path. Model-owned
+paged arrays, per-request fused holders and retained end states are disabled for
+this engine so those routes cannot silently bypass the configured storage. Linear
+model forwards still use the backend's available GPU kernels. CLI inference sessions,
 Server/Chat and TensorAgent engine hosts that use `SchedulerConfig.FromEnvironment`
 can configure it without model-name switches:
 
@@ -89,26 +92,43 @@ export TS_SCHED_KV_SPILL_DIRECTORY=/path/on/ssd/tensorsharp-kv
 
 These are **per-engine host-snapshot budgets**, not whole-model VRAM/RAM limits.
 RAM includes one full capture scratch, fixed staging and resident snapshot pages.
-It must fit at least one resident page plus scratch and staging. SSD bytes default
-to zero; an exhausted store reports pressure and preserves the authoritative page.
+It must fit at least one resident page plus scratch and staging, each rounded to
+64-byte allocation alignment. SSD bytes default to zero; each spilled page is
+charged at 4096-byte file allocation alignment. An exhausted store reports pressure
+and preserves the authoritative page.
 Do not sum independently configured engine budgets beyond the machine's available
 capacity. Native model KV, holders, weights, activations and process overhead still
-need their own accounting/adapters. Models that do not export host snapshots have
-no data on this path; the flags do not virtualize their native device state.
+need their own accounting/adapters. Construction rejects a model without complete,
+cross-sequence-restorable host snapshots, a zero-size snapshot, or a block larger
+than its restorable window. Qwen 3.5 currently rejects this mode because it declares
+cross-sequence byte snapshots unsafe; its existing complete-holder route remains
+available when this mode is unset. These flags do not virtualize native device state.
+With prefix caching disabled, a lone request never swaps and produces no snapshots;
+that case cannot establish spill/restore coverage.
 
 `PagedKvStorage.Acquire` returns a scoped `KvSnapshotLease`. Raw `GetSpan` calls are
 rejected for tiered storage. Prefix references retain logical pages while their
 payload may be spilled; the final release removes the resource, and block-id reuse
-gets a new epoch. The model's synchronous extract/inject contracts, partial-tail
+gets a new epoch. Failed page cleanup retains the unreleased sequence references;
+failed retained-payload release retains its queued keys and accounting for an
+idempotent retry. The model's synchronous extract/inject contracts, partial-tail
 layout and recurrent-prefix boundary rules remain unchanged. Capture uses a
 pre-reserved scratch so a declined extraction cannot corrupt a prior snapshot.
+Ownership swaps preserve published full pages and refresh only the mutable partial
+tail; immutable pages do not incur a new SSD write on each decode turn.
 Next-page prefetch only uses spare residency and is joined before recycling state.
 
 An executor can set `SchedulerConfig.MemoryAdmission` to a `RequestMemoryAdmission`
 with a shared `MemoryBudget` and a conservative request-cost function. This reserves
 all declared pool peaks before prefix adoption or forwarding, bounds the waiting
-queue, rejects impossible requests, and retains reservations through finish,
+queue, rejects impossible requests (including queued peaks that become impossible
+after a capacity reduction), and retains reservations through finish,
 preemption and cancellation until the engine's model-release hook succeeds.
+Failed model release hooks retain their request ownership and charges, even after
+generation has finished. `InferenceEngine.Dispose` retries these releases, reports
+failures without declaring cleanup complete, and may be retried after recovery.
+If its worker does not quiesce before the shutdown timeout, disposal also fails
+instead of authorizing the caller to free buffers still used by a native step.
 `SequenceState.MemoryEnvelope` lends allocation credit to request-owned resources.
 Retained allocations must be charged separately or drawn from that envelope so
 closing the request does not forget live memory. Estimates are not inferred from
@@ -130,6 +150,10 @@ transaction coordinator or automatic tensor-parallel model integration.
   unchanged until all registrations using them are removed.
 - Allocate/copy methods must quiesce before returning or throwing. Buffers must report
   every budget pool they consume, including host mirrors. New buffers must be zeroed.
+- An allocation whose initialization and physical cleanup both fail must be returned
+  through `ResourceAllocationException`. Failed initialization or transfer rollback
+  keeps the allocation quarantined and charged; `Unregister` retries its cleanup.
+  Failed partial copies are never published as usable replicas.
 - A lease is a single-consumer handle. Await its I/O before releasing it. Native GPU
   use needs a real completion fence, not the task that merely submitted the kernel.
 - `ReleaseAfterAsync` does not release on a failed fence. Recover/synchronize the
@@ -171,10 +195,17 @@ and ARM64. No hardware/model case is counted as a passing test without running i
 The design document records current test results, remaining integrations and the
 quality/latency matrix required before enabling this core for production models.
 
-The follow-up implementation passes 30 standalone cases and 66 selected runtime /
-placement regression cases, including state-dependent token parity between resident
-and spilling concurrent inference and recurrent checkpoint preservation. These use
-synthetic models, not production model files. The hardware probe is documented in
-[`eng/validation/UnifiedMemory.CudaProbe`](../eng/validation/UnifiedMemory.CudaProbe/README.md).
-It compiles; the development session has neither a CUDA driver nor access to the
-offered SSH VM, so real single-/multi-GPU validation remains pending.
+The follow-up validation on the supplied two-A40 VM includes the Linux standalone
+harness, runtime/placement/prefix regressions, five real CUDA checks on each GPU
+and eleven two-device host-staged checks. Direct peer copies fail on this machine,
+including an independent CUDA Runtime control, and are not enabled by default.
+See [`UnifiedMemory.CudaProbe`](../eng/validation/UnifiedMemory.CudaProbe/README.md).
+
+[`UnifiedMemory.ModelProbe`](../eng/validation/UnifiedMemory.ModelProbe/README.md)
+compares actual Gemma 4 E2B Q4_K_M generated tokens at concurrency 1/2/4/8/16 and
+complete teacher-forced logit rows after file-backed snapshot restoration. It also
+checks a longer bounded-window case and explicit refusal of unsafe Qwen 3.5 host
+snapshots. These do not establish whole-model weight streaming, media support or
+tensor-parallel snapshot coverage. The design records exact executed coverage,
+known failures and benchmark limitations; generated evidence stays in ignored
+`artifacts/` and is not committed.

@@ -7,6 +7,8 @@ namespace TensorSharp.Runtime.Paged;
 
 /// <summary>Bounds the executor's host KV snapshots, capture scratch and spill staging.
 /// Does not include the model's live device KV, native holders, weights or OS page cache.</summary>
+/// <remarks>When configured on an engine, selects the per-sequence snapshot/swap route.
+/// Model-owned paged arrays and per-request fused holders cannot use this storage.</remarks>
 public sealed record KvSnapshotOptions(long RamBytes, long SsdBytes, string SpillDirectory,
     int TransferBytes = 1 << 20)
 {

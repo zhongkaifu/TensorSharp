@@ -269,9 +269,12 @@ public class PrefixTreeEvictionTests
         Assert.Equal(0, q.Drain(null));
         q.Enqueue("pc:0:3", ReleaseReason.Evicted, default);
         Assert.Equal(1, q.Drain(null));                // a null sink drops the batch
-        // A sink that throws still clears the queue.
+        // A failed release keeps ownership for a later idempotent retry.
         q.Enqueue("pc:0:4", ReleaseReason.Evicted, default);
         Assert.Throws<InvalidOperationException>(() => q.Drain((k, r) => throw new InvalidOperationException()));
+        Assert.Equal(1, q.Count);
+        Assert.True(q.Contains("pc:0:4"));
+        Assert.Equal(1, q.Drain((keys, _) => Assert.Equal("pc:0:4", keys[0])));
         Assert.Equal(0, q.Count);
     }
 

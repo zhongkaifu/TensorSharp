@@ -48,11 +48,19 @@ public sealed class MemoryRequestQueue
         }
     }
 
+    /// <summary>Rejects and removes a head request that no longer fits after a
+    /// capacity reduction, so it cannot permanently block the remaining queue.</summary>
     public AdmittedMemoryRequest? TryAdmit()
     {
         lock (_gate)
         {
             if (_waiting.First is not { } first) return null;
+            if (!_budget.CanEverFit(first.Value.Charges))
+            {
+                _waiting.RemoveFirst();
+                _index.Remove(first.Value.Id);
+                throw new MemoryPressureException($"Request '{first.Value.Id}' peak exceeds the reduced capacity even in isolation.");
+            }
             var reservation = _budget.TryReserve(first.Value.Charges);
             if (reservation == null) return null;
             _waiting.RemoveFirst();
