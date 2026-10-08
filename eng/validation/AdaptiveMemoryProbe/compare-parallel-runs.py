@@ -16,7 +16,7 @@ import re
 import statistics
 
 FLAG = "TS_GGML_Q8_PARALLEL_VECTOR"
-MARKER = "[q8-f32] Experimental parallel-K F32 vector selected (N=1); N>1 retains K-ordered arithmetic."
+MARKER = "[q8-f32] Experimental parallel-K F32 vector selected (N=1)"
 
 
 def require(value, message):
@@ -54,6 +54,7 @@ def load(execution_path, arm):
     require(isinstance(report.get("RequestedOptions"), dict), "Missing original probe options")
     env = report.get("Environment", {})
     require(env.get(FLAG) == ("0" if arm == "serial" else "1"), "Experimental flag selection differs from the assigned arm")
+    require(env.get("TS_GGML_Q8_PARALLEL_SMALL_BATCH") in (None, "0"), "Small-batch arithmetic must be disabled in the vector-only comparison")
     log_path = execution_path.parent / "process.log"
     log = log_path.read_text(encoding="utf-8-sig", errors="replace")
     require(log.count(MARKER) == (0 if arm == "serial" else 1), "Actual native experimental-selection log is missing or inconsistent")

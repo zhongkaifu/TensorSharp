@@ -18,6 +18,8 @@
 
 namespace {
 bool parallel_vector = false;
+bool parallel_small_batch = false;
+bool parallel_columns(int columns) { return (parallel_vector && columns == 1) || (parallel_small_batch && columns >= 2 && columns <= 8); }
 enum class pattern { random, residual, large, subnormal, non_power_scale, decoded_weight_residual, long_cancellation };
 
 double parallel_rounding_bound(int inner, double absolute_products) {
@@ -141,7 +143,7 @@ std::vector<float> check(ggml_backend_t allocator, ggml_backend_t backend, const
     input_tensor input(leaves, GGML_TYPE_F32, input_shape, c.padded, c.interleaved);
     if (c.transposed) input.tensor = ggml_transpose(leaves, input.tensor);
 #if defined(TSG_GGML_USE_CUDA) && defined(TSG_GGML_TEST_HOOKS)
-    auto * baseline = c.columns == 1 ? ggml_new_tensor_1d(leaves, GGML_TYPE_F32, c.rows + 2) : nullptr;
+    auto * baseline = c.columns <= 8 ? ggml_new_tensor_1d(leaves, GGML_TYPE_F32, int64_t(c.rows) * c.columns + 2) : nullptr;
 #endif
     auto * leaf_buffer = ggml_backend_alloc_ctx_tensors(leaves, allocator);
     require(leaf_buffer != nullptr, "Cannot allocate Q8 projection inputs");
@@ -172,17 +174,17 @@ std::vector<float> check(ggml_backend_t allocator, ggml_backend_t backend, const
 #if defined(TSG_GGML_USE_CUDA) && defined(TSG_GGML_TEST_HOOKS)
         if (baseline) {
             const float canary = -12345.625f;
-            std::vector<float> reference(size_t(c.rows) + 2, canary), actual(size_t(c.rows));
+            std::vector<float> reference(size_t(c.rows) * c.columns + 2, canary), actual(size_t(c.rows) * c.columns);
             ggml_backend_tensor_set(baseline, reference.data(), 0, reference.size() * sizeof(float));
             require(tsg_matmul_q8_cuda_launch_reference(weights.tensor->data, activation->data,
-                static_cast<float *>(baseline->data) + 1, c.inner, c.rows, 1,
+                static_cast<float *>(baseline->data) + 1, c.inner, c.rows, c.columns,
                 weights.tensor->nb[1], activation->nb[0], activation->nb[1], nullptr) == 0,
                 "Previous Q8 decode launch failed");
             require(cudaDeviceSynchronize() == cudaSuccess, "Previous Q8 decode synchronization failed");
             ggml_backend_tensor_get(baseline, reference.data(), 0, reference.size() * sizeof(float));
             ggml_backend_tensor_get(projected, actual.data(), 0, actual.size() * sizeof(float));
             require(reference.front() == canary && reference.back() == canary, "Q8 reference output canary changed");
-            if (!parallel_vector)
+            if (!parallel_columns(c.columns))
                 require(std::memcmp(reference.data() + 1, actual.data(), actual.size() * sizeof(float)) == 0,
                     "Single-column Q8 kernel differs bitwise from previous K-ordered kernel");
             // Exercise the new raw launcher with output guards as well: graph
@@ -190,7 +192,7 @@ std::vector<float> check(ggml_backend_t allocator, ggml_backend_t backend, const
             std::fill(reference.begin(), reference.end(), canary);
             ggml_backend_tensor_set(baseline, reference.data(), 0, reference.size() * sizeof(float));
             require(tsg_matmul_q8_cuda_launch(weights.tensor->data, activation->data,
-                static_cast<float *>(baseline->data) + 1, c.inner, c.rows, 1,
+                static_cast<float *>(baseline->data) + 1, c.inner, c.rows, c.columns,
                 weights.tensor->nb[1], activation->nb[0], activation->nb[1], nullptr) == 0,
                 "Single-column Q8 guarded launch failed");
             require(cudaDeviceSynchronize() == cudaSuccess, "Single-column Q8 guarded synchronization failed");
@@ -217,7 +219,7 @@ std::vector<float> check(ggml_backend_t allocator, ggml_backend_t backend, const
                 const double error = std::abs(double(actual) - expected);
                 const double tolerance = random_activations(c.data) ? 0.0001 + 0.000006 * std::abs(expected) : 0;
                 if (!std::isfinite(actual) || error > tolerance) ++failures;
-                if (parallel_vector && c.columns == 1) {
+                if (parallel_columns(c.columns)) {
                     // Independent scalar FP64 reference, plus a tighter
                     // shape-derived error bound for the new reduction tree.
                     // Q8 half-scale * signed-byte is exactly representable in
@@ -273,6 +275,27 @@ void run(ggml_backend_t allocator, ggml_backend_t backend) {
         cancellation.data = pattern::long_cancellation;
         cancellation.padded = cancellation.interleaved = true;
         execute(cancellation); // Serial K-order returns 1, independent FP64 is 2048.
+    }
+    if (parallel_small_batch) {
+        for (int columns : {2, 3, 4, 5, 7, 8}) {
+            for (const auto shape : {std::array<int, 2>{32, 3}, {1024, 5}, {3584, 129}, {1024, 6144}}) {
+                test_case c;
+                c.inner = shape[0]; c.rows = shape[1]; c.columns = columns;
+                c.padded = c.interleaved = true; c.transposed = columns % 2 != 0;
+                c.data = pattern::non_power_scale;
+                execute(c);
+                c.padded = c.interleaved = c.transposed = false; c.pipeline = true;
+                execute(c);
+            }
+            for (pattern data : {pattern::residual, pattern::large, pattern::subnormal,
+                                  pattern::decoded_weight_residual, pattern::long_cancellation}) {
+                test_case c;
+                c.inner = data == pattern::long_cancellation ? 4096 : 64;
+                c.rows = 5; c.columns = columns; c.data = data;
+                c.padded = c.interleaved = true;
+                execute(c);
+            }
+        }
     }
     // CTA row, column and activation-stride boundaries, including graph reuse.
     for (int columns : {1, 4, 8, 9, 16, 17, 31, 32, 33, 65}) {
@@ -338,7 +361,7 @@ void run(ggml_backend_t allocator, ggml_backend_t backend) {
             c.target_column = position;
             c.padded = c.interleaved = true;
             const auto result = execute(c);
-            if (!parallel_vector)
+            if (!parallel_vector || (parallel_small_batch && columns <= 8))
                 require(std::memcmp(reference.data(), result.data() + size_t(position) * c.rows,
                                     size_t(c.rows) * sizeof(float)) == 0,
                         "Q8 projection changed a column when packed with different companions");
@@ -362,7 +385,7 @@ void run(ggml_backend_t allocator, ggml_backend_t backend) {
 }
 
 #if defined(TSG_GGML_USE_CUDA)
-void check_parallel_underflow(ggml_backend_t allocator) {
+void check_parallel_underflow(ggml_backend_t allocator, int columns) {
     // Every product is exactly halfway between zero and min-subnormal F32.
     // Correct round-to-nearest-even lane FMAs produce zero, so an FP64 relative
     // gate is inappropriate. Check the exact IEEE result AND the global
@@ -370,46 +393,50 @@ void check_parallel_underflow(ggml_backend_t allocator) {
     auto * context = ggml_init({1024 * 1024, nullptr, true});
     require(context != nullptr, "Cannot allocate underflow fixture metadata");
     auto * weight = ggml_new_tensor_2d(context, GGML_TYPE_Q8_0, 32, 5);
-    auto * input = ggml_new_tensor_1d(context, GGML_TYPE_F32, 32);
-    auto * output = ggml_new_tensor_1d(context, GGML_TYPE_F32, 7);
+    auto * input = ggml_new_tensor_2d(context, GGML_TYPE_F32, 32, columns);
+    auto * output = ggml_new_tensor_1d(context, GGML_TYPE_F32, 5 * columns + 2);
     auto * buffer = ggml_backend_alloc_ctx_tensors(context, allocator);
     require(buffer != nullptr, "Cannot allocate underflow fixture payload");
     std::vector<unsigned char> weights(34 * 5, 1);
     for (int row = 0; row < 5; ++row) {
         weights[size_t(row) * 34] = 1; weights[size_t(row) * 34 + 1] = 0; // half 2^-24
     }
-    std::vector<float> activations(32, std::ldexp(1.0f, -126));
-    std::vector<float> result(7, -12345.625f);
+    std::vector<float> activations(32 * columns, std::ldexp(1.0f, -126));
+    std::vector<float> result(5 * columns + 2, -12345.625f);
     ggml_backend_tensor_set(weight, weights.data(), 0, weights.size());
     ggml_backend_tensor_set(input, activations.data(), 0, activations.size() * sizeof(float));
     ggml_backend_tensor_set(output, result.data(), 0, result.size() * sizeof(float));
     require(tsg_matmul_q8_cuda_launch(weight->data, input->data, static_cast<float *>(output->data) + 1,
-        32, 5, 1, 34, sizeof(float), 32 * sizeof(float), nullptr) == 0, "Underflow fixture launch failed");
+        32, 5, columns, 34, sizeof(float), 32 * sizeof(float), nullptr) == 0, "Underflow fixture launch failed");
     require(cudaDeviceSynchronize() == cudaSuccess, "Underflow fixture synchronization failed");
     ggml_backend_tensor_get(output, result.data(), 0, result.size() * sizeof(float));
     const double expected = 32 * std::ldexp(1.0, -150);
     require(result.front() == -12345.625f && result.back() == -12345.625f, "Underflow fixture output canary changed");
-    for (int row = 0; row < 5; ++row) {
+    for (int row = 0; row < 5 * columns; ++row) {
         require(result[size_t(row) + 1] == 0.0f, "Half-min-subnormal tie did not round to even zero");
         require(expected <= parallel_rounding_bound(32, expected), "Parallel absolute underflow bound lost lane contributions");
         require(expected > 6 * std::ldexp(1.0, -150), "Underflow fixture no longer rejects a depth-only bound");
     }
     ggml_backend_buffer_free(buffer); ggml_free(context);
-    std::puts("Parallel Q8 subnormal tie fixture: 5 rows, exact IEEE rounding, global absolute bound and canaries passed.");
+    std::printf("Parallel Q8 subnormal tie fixture: 5 rows x %d columns, exact IEEE rounding, global absolute bound and canaries passed.\n", columns);
 }
 #endif
 } // namespace
 
 int main(int argc, char ** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
-    require(argc == 1 || (argc == 2 && std::string(argv[1]) == "--parallel-vector"), "Unexpected Q8 precision arguments");
+    require(argc == 1 || (argc == 2 && (std::string(argv[1]) == "--parallel-vector" || std::string(argv[1]) == "--parallel-small-batch")), "Unexpected Q8 precision arguments");
     parallel_vector = argc == 2;
+    parallel_small_batch = argc == 2 && std::string(argv[1]) == "--parallel-small-batch";
 #ifdef _WIN32
     require(_putenv_s("TS_GGML_Q8_PARALLEL_VECTOR", parallel_vector ? "1" : "0") == 0, "Cannot configure Q8 test arithmetic");
+    require(_putenv_s("TS_GGML_Q8_PARALLEL_SMALL_BATCH", parallel_small_batch ? "1" : "0") == 0, "Cannot configure Q8 batch arithmetic");
 #else
     require(setenv("TS_GGML_Q8_PARALLEL_VECTOR", parallel_vector ? "1" : "0", 1) == 0, "Cannot configure Q8 test arithmetic");
+    require(setenv("TS_GGML_Q8_PARALLEL_SMALL_BATCH", parallel_small_batch ? "1" : "0", 1) == 0, "Cannot configure Q8 batch arithmetic");
 #endif
     std::printf("Q8 test arithmetic: %s\n", parallel_vector ? "experimental parallel-K vector; serial prefill" : "qualified K-ordered");
+    if (parallel_small_batch) std::puts("Q8 test arithmetic: experimental parallel-K small batches N=2..8.");
 #ifdef TSG_GGML_USE_CUDA
     const int devices = ggml_backend_cuda_get_device_count();
     if (devices == 0) return 77;
@@ -420,7 +447,8 @@ int main(int argc, char ** argv) {
         auto * wrapped = tsg_dsv4_fused_backend_init(raw);
         require(wrapped != nullptr, "Cannot initialize owned Q8 CUDA wrapper");
         run(raw, wrapped);
-        if (parallel_vector) check_parallel_underflow(raw);
+        if (parallel_vector) check_parallel_underflow(raw, 1);
+        if (parallel_small_batch) for (int columns : {2, 3, 4, 5, 7, 8}) check_parallel_underflow(raw, columns);
         ggml_backend_free(wrapped);
         ggml_backend_free(raw);
     }

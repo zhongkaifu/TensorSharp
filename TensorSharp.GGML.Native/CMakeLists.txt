@@ -806,6 +806,8 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
         set_tests_properties(cuda-q8-f32-projection PROPERTIES SKIP_RETURN_CODE 77)
         add_test(NAME cuda-q8-f32-parallel-vector COMMAND GgmlOpsCudaQ8PrecisionTest --parallel-vector)
         set_tests_properties(cuda-q8-f32-parallel-vector PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+        add_test(NAME cuda-q8-f32-parallel-small-batch COMMAND GgmlOpsCudaQ8PrecisionTest --parallel-small-batch)
+        set_tests_properties(cuda-q8-f32-parallel-small-batch PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
         # Opt-in synthetic-data timing with byte-exact previous-kernel control
         # and independent sampled FP64 oracle; never a performance assertion.
         add_executable(GgmlOpsQ8VectorBench tests/q8_vector_bench.cpp ggml_ops_q8_precision.cu)
@@ -821,6 +823,13 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
         target_include_directories(GgmlOpsQ8ParallelVectorBench PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/src")
         target_link_libraries(GgmlOpsQ8ParallelVectorBench PRIVATE ggml-cuda ggml-base CUDA::cudart)
+        # Standalone bounded row-dequantization + pedantic SGEMM exploration.
+        # No model dispatch changes and no unconditional performance assertion.
+        add_executable(GgmlOpsQ8PrefillBench tests/q8_prefill_bench.cu ggml_ops_q8_precision.cu)
+        target_compile_definitions(GgmlOpsQ8PrefillBench PRIVATE TSG_GGML_USE_CUDA=1)
+        target_include_directories(GgmlOpsQ8PrefillBench PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/src")
+        target_link_libraries(GgmlOpsQ8PrefillBench PRIVATE ggml-cuda ggml-base CUDA::cublas)
         add_executable(GgmlOpsQwen4ExpReduceTest tests/qwen4exp_reduce_test.cpp
             ggml_ops_qwen4exp_reduce.cpp ggml_ops_matmul_precision.cu
             ggml_ops_attention_precision.cu ggml_ops_q8_precision.cu ggml_ops_dsv4_fused.cu)

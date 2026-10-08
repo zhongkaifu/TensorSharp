@@ -19,7 +19,18 @@ bool parallel_vector_enabled() {
         const char * value = std::getenv("TS_GGML_Q8_PARALLEL_VECTOR");
         const bool selected = value && std::strcmp(value, "1") == 0;
         if (selected)
-            std::fprintf(stderr, "[q8-f32] Experimental parallel-K F32 vector selected (N=1); N>1 retains K-ordered arithmetic.\n");
+            std::fprintf(stderr, "[q8-f32] Experimental parallel-K F32 vector selected (N=1).\n");
+        return selected;
+    }();
+    return enabled;
+}
+
+bool parallel_small_batch_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("TS_GGML_Q8_PARALLEL_SMALL_BATCH");
+        const bool selected = value && std::strcmp(value, "1") == 0;
+        if (selected)
+            std::fprintf(stderr, "[q8-f32] Experimental parallel-K F32 small batch selected (2<=N<=8).\n");
         return selected;
     }();
     return enabled;
@@ -29,11 +40,18 @@ bool parallel_vector_enabled() {
 // unchanged; the lane sums and five shuffle additions deliberately use a new
 // reduction order. No atomics, staging allocation or input narrowing. A final
 // partial CTA may contain unused whole warps, never a partial active warp.
+template<bool Batched>
 __global__ void q8_f32_vector_parallel(const char * weights, const char * input, float * output,
-        int inner, int rows, size_t weight_stride, size_t input_inner_stride) {
+        int inner, int rows, size_t weight_stride, size_t input_inner_stride, size_t input_column_stride) {
     const int lane = int(threadIdx.x) & 31;
     const int row = int(blockIdx.x) * 4 + int(threadIdx.x) / 32;
     if (row >= rows) return;
+    // Independent columns use the same lane/FMA/shuffle order as N=1. No
+    // staging, duplicated weight ownership or extra device allocation.
+    if constexpr (Batched) {
+        input += size_t(blockIdx.y) * input_column_stride;
+        output += size_t(blockIdx.y) * rows;
+    }
     float sum = 0.0f;
     for (int block = 0; block < inner / 32; ++block) {
         const char * source = weights + size_t(row) * weight_stride + size_t(block) * 34;
@@ -175,13 +193,18 @@ int tsg_matmul_q8_cuda_launch(const void * weights, const void * input, float * 
     const auto stream = static_cast<cudaStream_t>(stream_pointer);
     if (columns == 1 && parallel_vector_enabled()) {
         const unsigned blocks = unsigned((int64_t(rows) + 3) / 4);
-        q8_f32_vector_parallel<<<blocks, 128, 0, stream>>>(static_cast<const char *>(weights),
-            static_cast<const char *>(input), output, inner, rows, weight_stride, input_inner_stride);
+        q8_f32_vector_parallel<false><<<blocks, 128, 0, stream>>>(static_cast<const char *>(weights),
+            static_cast<const char *>(input), output, inner, rows, weight_stride, input_inner_stride, input_column_stride);
     }
     else if (columns == 1) {
         const unsigned blocks = unsigned((int64_t(rows) + 63) / 64);
         q8_f32_vector<<<blocks, 128, 0, stream>>>(static_cast<const char *>(weights),
             static_cast<const char *>(input), output, inner, rows, weight_stride, input_inner_stride);
+    }
+    else if (columns <= 8 && parallel_small_batch_enabled()) {
+        const dim3 grid(unsigned((int64_t(rows) + 3) / 4), unsigned(columns));
+        q8_f32_vector_parallel<true><<<grid, 128, 0, stream>>>(static_cast<const char *>(weights),
+            static_cast<const char *>(input), output, inner, rows, weight_stride, input_inner_stride, input_column_stride);
     }
     else if (columns <= 8) launch<8>(weights, input, output, inner, rows, columns,
         weight_stride, input_inner_stride, input_column_stride, stream);

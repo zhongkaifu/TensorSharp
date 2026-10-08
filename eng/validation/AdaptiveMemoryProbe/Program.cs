@@ -40,7 +40,7 @@ Environment.SetEnvironmentVariable("KV_CACHE_DTYPE", "f16");
 KvCacheDtypeConfig.ConfigureFromEnvironment();
 foreach (string variable in new[] { "TENSORSHARP_TP_DEGREE", "TENSORSHARP_LAYER_SPLIT_DEGREE", "TS_SPEC", "SPECULATIVE_DECODING", "TS_MTP" })
     Environment.SetEnvironmentVariable(variable, null);
-string[] benchmarkVariables = ["TS_GGML_Q8_PARALLEL_VECTOR", "CUDA_VISIBLE_DEVICES", "NVIDIA_TF32_OVERRIDE",
+string[] benchmarkVariables = ["TS_GGML_Q8_PARALLEL_VECTOR", "TS_GGML_Q8_PARALLEL_SMALL_BATCH", "CUDA_VISIBLE_DEVICES", "NVIDIA_TF32_OVERRIDE",
     "GGML_CUDA_DISABLE_FUSION", "GGML_CUDA_DISABLE_GRAPHS", "GGML_CUDA_FORCE_MMQ", "GGML_CUDA_FORCE_CUBLAS",
     "OMP_NUM_THREADS", "TS_GGML_CPU_THREADS", "KV_CACHE_DTYPE", "MAX_CONTEXT"];
 var benchmarkEnvironment = benchmarkVariables.ToDictionary(name => name, Environment.GetEnvironmentVariable);

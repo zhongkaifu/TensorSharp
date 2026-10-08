@@ -71,6 +71,17 @@ class ParallelPerformanceEvidence(unittest.TestCase):
                 (paths["parallel"][0].parent / "process.log").write_text(text)
                 self.assertFalse(module.compare(**paths)["ComparableForTiming"])
 
+    def test_small_batch_flag_cannot_hide_in_vector_only_comparison(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = self.fixture(Path(temporary))
+            # Even enabling it in every arm is outside this comparator's
+            # vector-only qualification and must not be accepted as equal.
+            for executions in paths.values():
+                for path in executions:
+                    self.mutate(path.parent / "report.json",
+                        lambda data: data["Environment"].update(TS_GGML_Q8_PARALLEL_SMALL_BATCH="1"))
+            self.assertFalse(module.compare(**paths)["ComparableForTiming"])
+
     def test_capture_or_changed_runtime_knob_or_same_bin_refuses_timing(self):
         for mode in ("capture", "env", "binary"):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temporary:
