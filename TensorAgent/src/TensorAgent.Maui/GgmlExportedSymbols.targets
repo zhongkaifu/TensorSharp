@@ -21,7 +21,7 @@
     with SIGABRT inside load_aot_module, before any managed code runs. Measured on
     device.
 
-    Names carry no leading underscore: the linker adds one for -u. Native source export manifest; 309 symbols.
+    Names carry no leading underscore: the linker adds one for -u. Native source export manifest; 315 symbols.
   -->
   <ItemGroup Condition="'$(RuntimeIdentifier)' == 'ios-arm64'">
     <ReferenceNativeSymbol Include="TSGgml_ActivationGradF32" SymbolType="Function" />
@@ -33,6 +33,7 @@
     <ReferenceNativeSymbol Include="TSGgml_AddmmQuantF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_AlignedAlloc" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_AlignedFree" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_AttachSharedCacheBudget" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_AttentionSoftmaxWithSinksF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_BinaryScalarF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_BinaryTensorF32" SymbolType="Function" />
@@ -49,6 +50,7 @@
     <ReferenceNativeSymbol Include="TSGgml_DFlashInject" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_DFlashResetCaches" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_DequantizeToF32" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_DetachSharedCacheBudget" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_DeviceCopyCacheResidentBytes" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_DeviceMemoryInfo" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_DiffusionDecodeLayer" SymbolType="Function" />
@@ -126,6 +128,7 @@
     <ReferenceNativeSymbol Include="TSGgml_GetAsyncCompute" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GetBackendFailureText" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GetBackendMemory" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_GetCacheMemoryUsage" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GetGpuDeviceCount" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GetGpuDeviceDescription" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_GetLastError" SymbolType="Function" />
@@ -237,6 +240,7 @@
     <ReferenceNativeSymbol Include="TSGgml_Qwen35VisionEncoderF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpArenaDecodeBatched" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpArenaFlushHostPointer" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpArenaFlushHostPointerStatus" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpArenaResetBatchedDecodeCache" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpAttnBlock" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Qwen4ExpFfnBlock" SymbolType="Function" />
@@ -270,6 +274,7 @@
     <ReferenceNativeSymbol Include="TSGgml_ReduceLastDimF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_RegisterOffloadable" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_RegisterPinnedHostBuffer" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_RegisterQ8F32Weight" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_ReleaseFusedFfnTpGraphs" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_ReleaseFusedMatmulAddTpGraphs" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_ReleaseReuseComputeBuffers" SymbolType="Function" />
@@ -306,6 +311,7 @@
     <ReferenceNativeSymbol Include="TSGgml_TranscodeBonsaiToQ2_0" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_UnaryF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_UnregisterPinnedHostBuffer" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_UnregisterQ8F32Weight" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_WanDitForward" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_WanResetForwardCache" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_WanT5Encode" SymbolType="Function" />

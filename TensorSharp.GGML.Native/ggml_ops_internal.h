@@ -250,6 +250,7 @@ namespace tsg
         DeviceCopy,
     };
 
+    class SharedCacheCharge;
     struct CachedHostBuffer {
         ggml_backend_buffer_t buffer = nullptr;
         std::size_t bytes = 0;
@@ -272,6 +273,8 @@ namespace tsg
         // or the host pointer for a zero-copy wrap). Recording it lets a repeat
         // bind attach with two assignments and no backend calls at all.
         void* bound_addr = nullptr;
+        // Declared after the payload fields; release only after buffer_free.
+        std::shared_ptr<SharedCacheCharge> shared_charge;
     };
 
     // --- Multi-device (tensor-parallel) state -------------------------------
@@ -478,8 +481,12 @@ namespace tsg
     // belongs to that command buffer, so latch it. The flag is sticky because the
     // backend is — ggml-metal clears has_error only by being recreated. That is what
     // TSGgml_RecreateBackend exists for, and it is the only thing that clears this.
+    ggml_backend_t q8_f32_execution_backend(ggml_backend_t backend, ggml_cgraph* graph);
+    void clear_q8_f32_backends();
+
     inline ggml_status compute_graph(ggml_backend_t backend, ggml_cgraph* graph)
     {
+        backend = q8_f32_execution_backend(backend, graph);
         const std::uint64_t before = g_ggml_error_count.load(std::memory_order_acquire);
         const ggml_status status = ggml_backend_graph_compute(backend, graph);
         if (g_ggml_error_count.load(std::memory_order_acquire) != before)

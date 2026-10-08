@@ -1185,6 +1185,15 @@ namespace
         ggml_tensor* hidden = token_input
             ? ggml_reshape_1d(ctx, tsg::bonsai_get_rows(ctx, token_embd_t, token_t, token_embd_data), H)
             : hidden_t;
+        // Opt-in first-token evidence retains the real fused arithmetic while
+        // exposing full residual vectors for comparison with the managed TP loop.
+        const char* diagnostic_directory = position == 0 && !tp_mode
+            ? std::getenv("TS_QWEN35_TENSOR_DUMP") : nullptr;
+        if (diagnostic_directory != nullptr && *diagnostic_directory == '\0') diagnostic_directory = nullptr;
+        std::vector<ggml_tensor*> diagnostic_layers;
+        std::vector<ggml_tensor*> diagnostic_blocks;
+        ggml_tensor* diagnostic_embedding = hidden;
+        if (diagnostic_directory != nullptr) ggml_set_output(diagnostic_embedding);
         for (int l = 0; l < num_layers; l++)
         {
             const TSGgmlQwen35LayerDesc& d = layers[l];
@@ -1514,6 +1523,11 @@ namespace
             }
 
             ggml_tensor* residual1 = ggml_add(ctx, hidden, block_out);
+            if (diagnostic_directory != nullptr)
+            {
+                ggml_set_output(residual1);
+                diagnostic_blocks.push_back(residual1);
+            }
 
             // ===== FFN =====
             ggml_tensor* ffn_normed = ggml_mul(ctx, ggml_rms_norm(ctx, residual1, eps), t.post_attn_norm_w);
@@ -1684,6 +1698,11 @@ namespace
             }
 
             hidden = ggml_add(ctx, residual1, ffn_down);
+            if (diagnostic_directory != nullptr)
+            {
+                ggml_set_output(hidden);
+                diagnostic_layers.push_back(hidden);
+            }
         }
 
         ggml_tensor* hidden_out;
@@ -2190,6 +2209,30 @@ namespace
         // Metal async mode the download above is only QUEUED, so the gallocr path
         // (persist == false, buffer.value == nullptr) would return stale bytes.
         host_read_barrier();
+
+        if (diagnostic_directory != nullptr)
+        {
+            auto dump = [&](ggml_tensor* tensor, const std::string& name) {
+                std::vector<float> values(static_cast<std::size_t>(ggml_nelements(tensor)));
+                ggml_backend_tensor_get(tensor, values.data(), 0, values.size() * sizeof(float));
+                const std::string path = std::string(diagnostic_directory) + "/fused." + name + ".f32";
+                FILE* file = std::fopen(path.c_str(), "wb");
+                if (file == nullptr) throw std::runtime_error("Cannot create diagnostic tensor " + path);
+                const auto written = std::fwrite(values.data(), sizeof(float), values.size(), file);
+                const int closed = std::fclose(file);
+                if (written != values.size() || closed != 0)
+                    throw std::runtime_error("Cannot write diagnostic tensor " + path);
+            };
+            dump(diagnostic_embedding, "embedding");
+            for (std::size_t l = 0; l < diagnostic_layers.size(); ++l)
+            {
+                char name[32];
+                std::snprintf(name, sizeof(name), "layer%02d", static_cast<int>(l));
+                dump(diagnostic_layers[l], name);
+                std::snprintf(name, sizeof(name), "layer%02d.block", static_cast<int>(l));
+                dump(diagnostic_blocks[l], name);
+            }
+        }
 
         if (persist && dcb != nullptr)
         {

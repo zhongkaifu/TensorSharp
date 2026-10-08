@@ -37,6 +37,9 @@ Each case uses a complete rendered chat template and distinct counting prompts.
 `--prompt-tokens` is a minimum, not a truncation length; the report contains the
 actual tokens. Both arms disable batched execution and prefix reuse, warm the
 same model, use identical prompts and greedy sampling, and alternate run order.
+Each distinct prompt also runs alone as an independent reference. Both concurrent
+arms must match that isolated output, so a shared snapshot bug cannot pass merely
+because managed and tiered storage produce the same wrong tokens.
 The candidate budget holds one resident snapshot page plus capture/transfer
 scratch. Concurrency greater than one must actually spill and reload. The
 single-request route is a control and need not capture snapshots.
@@ -44,25 +47,42 @@ single-request route is a control and need not capture snapshots.
 Passing requires identical generated tokens, termination reasons and request
 status, the requested output length without early EOS, and zero charged bytes
 after physical cleanup. A second test captures two real model histories, forces
-their pages through file storage, restores them, and compares every logit at
-every teacher-forced step. The numerical gate is
+their pages through file storage, and alternately restores both histories three
+times. Each restored snapshot must export byte-identically before decoding, and
+every logit at every teacher-forced step must match an uninterrupted reference.
+The numerical gate is
 `abs(actual-reference) <= 1e-4 + 1e-4*abs(reference)` with finite logits and
 identical argmax. Failure to clean up safely stops subsequent arms.
 
 Use `--prompt-tokens 256 --steps 16 --widths 2` for a longer bounded-window case.
 These cases remain within the model's declared restorable window; they do not
-prove long-context attention beyond that window. A model which does not declare
-safe cross-sequence snapshots must be tested as an explicit rejection:
+prove long-context attention beyond that window.
+
+Dense Qwen 3.5 on single-rank GGML CUDA now supports this route when the checkpoint
+has no MTP layers. Its snapshot includes attention K/V, every GDN convolution
+ring and write index, the delta state, and the M-RoPE position delta. Export
+settles device-authoritative state; import validates every recurrent layout
+before changing a layer and invalidates captured native graph bindings. Recurrent
+pages captured before the current model head cannot be used as independent
+resume checkpoints after a partial restore.
 
 ```sh
 dotnet eng/validation/UnifiedMemory.ModelProbe/bin/Release/net10.0/UnifiedMemory.ModelProbe.dll \
   --model /workspace/models/Qwen3.5-0.8B-Q8_0.gguf \
-  --expect-unsupported true --json artifacts/unified-memory/qwen-snapshot-refusal.json
+  --widths 1,2,4,8,16 --steps 8 --prompt-tokens 64 \
+  --json artifacts/unified-memory/qwen-snapshots.json
 ```
 
-Successful rejection is a capability check, never positive snapshot coverage for
-that model. JSON records model/assembly/native hashes, capability declarations,
-prompts, tokens, spill counts, budgets, single-sample timings and native per-rank
+Qwen MoE, checkpoints with MTP layers, tensor-parallel caches and other Qwen
+backends remain outside the supported snapshot scope. For those cases use
+`--expect-unsupported true`: successful rejection is a capability check, never
+positive snapshot coverage. Existing device-resident holder routes remain
+available according to their own capabilities. Complete GDN state is repeated
+in each snapshot page, so a one-page budget can cause substantial I/O; this tool
+does not claim a speedup.
+
+JSON records model/assembly/native hashes, capability declarations, isolated
+references, prompts, tokens, spill counts, budgets, single-sample timings and native per-rank
 cache payload counters when available. Native counters exclude graph/KV arenas,
 backend pools and driver overhead. Timings include storage overhead and are not
 repeat-sampled throughput or latency percentiles.

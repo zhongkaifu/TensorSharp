@@ -67,3 +67,5 @@ jobs:
           mkdir -p artifacts/unified-memory
           c++ -std=c++17 -O2 -pthread -I TensorSharp.GGML.Native TensorSharp.GGML.Native/tests/cache_budget_test.cpp -o artifacts/unified-memory/cache-budget-test
           artifacts/unified-memory/cache-budget-test
+          c++ -std=c++17 -O2 -pthread -I TensorSharp.GGML.Native TensorSharp.GGML.Native/tests/shared_cache_budget_test.cpp -o artifacts/unified-memory/shared-cache-budget-test
+          artifacts/unified-memory/shared-cache-budget-test

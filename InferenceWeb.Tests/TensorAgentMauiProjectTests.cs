@@ -694,10 +694,16 @@ public class TensorAgentMauiProjectTests
             Assert.Contains($"<key>{key}</key>", plist);
         }
 
-        // An Entitlements.plist beside it is what MAUI signs the app with, and the App
-        // Sandbox there would stop every command: a process inside the App Sandbox
-        // cannot apply the Seatbelt profile the desktop backend confines code with.
-        Assert.False(File.Exists(Path.Combine(MauiDir, "Platforms", "MacCatalyst", "Entitlements.plist")));
+        // Hardened-runtime entitlements enable JIT and existing capture features.
+        // App Sandbox is a separate entitlement: it would prevent the desktop
+        // backend from applying its own Seatbelt profile to skill processes.
+        var entitlements = XDocument.Load(Path.Combine(MauiDir, "Platforms", "MacCatalyst", "Entitlements.plist"));
+        Assert.Contains(entitlements.Descendants("key"),
+            key => key.Value == "com.apple.security.cs.allow-jit"
+                && key.ElementsAfterSelf().First().Name.LocalName == "true");
+        Assert.DoesNotContain(entitlements.Descendants("key"),
+            key => key.Value == "com.apple.security.app-sandbox"
+                && key.ElementsAfterSelf().First().Name.LocalName == "true");
         Assert.DoesNotContain(Csproj.Descendants(Ns + "CodesignEntitlements"),
             e => e.Value.Contains("MacCatalyst", StringComparison.Ordinal));
         foreach (string file in new[] { "AppDelegate.cs", "Program.cs", "SceneDelegate.cs" })

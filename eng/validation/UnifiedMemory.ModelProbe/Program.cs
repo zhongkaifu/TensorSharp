@@ -43,6 +43,7 @@ foreach (string name in new[] { "TS_SPEC", "SPECULATIVE_DECODING", "TS_MTP", "TS
     Environment.SetEnvironmentVariable(name, null);
 KvCacheDtypeConfig.ConfigureFromEnvironment();
 var runs = new List<EngineRun>();
+var isolatedRuns = new List<EngineRun>();
 var failures = new List<string>();
 object? snapshotReplay = null;
 object? capabilities = null;
@@ -104,6 +105,12 @@ try
         int[] Prompt(int index) => promptFixtures[index].Tokens;
         // Warm native graph creation separately from the measured storage comparisons.
         model.ResetKVCache(); model.Forward(Prompt(0)); model.Forward(new[] { pool[0] }); model.ResetKVCache();
+        for (int rank = 0; rank < widths.Max(); rank++)
+        {
+            int request = rank;
+            var isolated = await RunAndRecord(model, 1, null, $"isolated-{rank}", _ => Prompt(request), isolatedRuns);
+            Require(isolated.Error == null, $"Isolated reference {rank} failed: {isolated.Error}");
+        }
         foreach (int width in widths)
         {
             EngineRun baseline, tiered;
@@ -123,10 +130,15 @@ try
                 continue;
             }
             for (int rank = 0; rank < width; rank++)
+            {
                 if (!baseline.Requests[rank].Tokens.SequenceEqual(tiered.Requests[rank].Tokens)
                     || baseline.Requests[rank].Status != tiered.Requests[rank].Status
                     || baseline.Requests[rank].FinishReason != tiered.Requests[rank].FinishReason)
                     failures.Add($"width {width}, request {rank}: managed/tiered output mismatch.");
+                foreach (var arm in new[] { baseline, tiered })
+                    if (!arm.Requests[rank].Tokens.SequenceEqual(isolatedRuns[rank].Requests[0].Tokens))
+                        failures.Add($"width {width}, request {rank}, {arm.Mode}: output differs from its isolated reference.");
+            }
             // A solo request never swaps with prefix capture disabled. It is a
             // timing/output control, and cannot count as spill/restore coverage.
             if (width > 1 && tiered.Residency is not { Spills: > 0, Loads: > 0 })
@@ -158,12 +170,22 @@ try
                 "Model refused snapshot capture.");
         }
         long compared = 0; double maxError = 0; int argmaxDifferences = 0; long outsideTolerance = 0;
+        const int replayPasses = 3;
+        int byteExactRestores = 0;
+        for (int pass = 0; pass < replayPasses; pass++)
         for (int rank = 0; rank < 2; rank++)
         {
             model.ResetKVCache();
             using (var lease = storage.Acquire(rank))
+            {
                 Require(model.TryInjectKVBlock(0, prefixes[rank].Length, lease.ReadOnlySpan[..checked((int)replaySizes[rank])]),
                     "Model refused snapshot restoration.");
+                byte[] roundTrip = new byte[checked((int)replaySizes[rank])];
+                Require(model.TryExtractKVBlock(0, prefixes[rank].Length, roundTrip)
+                    && lease.ReadOnlySpan[..roundTrip.Length].SequenceEqual(roundTrip),
+                    "Restored attention/recurrent snapshot did not round-trip byte exactly.");
+                byteExactRestores++;
+            }
             for (int step = 0; step < forced.Length; step++)
             {
                 float[] actual = model.Forward(new[] { forced[step] });
@@ -185,6 +207,7 @@ try
         }
         snapshotReplay = new { Prefixes = prefixes, ForcedTokens = forced, ComparedLogits = compared,
             MaxAbsoluteError = maxError, OutsideTolerance = outsideTolerance, ArgmaxDifferences = argmaxDifferences,
+            ReplayPasses = replayPasses, ByteExactRestores = byteExactRestores,
             Tolerance = "1e-4 + 1e-4 * abs(reference)", Residency = storage.ResidencyStats };
         Require(storage.ResidencyStats is { Spills: > 0, Loads: >= 4 }, "Teacher-forced replay did not restore both snapshots from SSD.");
         Require(outsideTolerance == 0 && argmaxDifferences == 0, "Snapshot replay logit parity failed.");
@@ -216,7 +239,7 @@ await File.WriteAllTextAsync(output, JsonSerializer.Serialize(new
     MinimumPromptTokens = promptTokens, PromptFixtures = promptFixtures,
     ExpectedUnsupported = expectUnsupported, RejectedUnsupported = rejectedUnsupported,
     ModelCleanupDeferred = modelCleanupDeferred,
-    Runs = runs, SnapshotReplay = snapshotReplay,
+    IsolatedRuns = isolatedRuns, Runs = runs, SnapshotReplay = snapshotReplay,
     NativeCacheSamples = nativeCacheSamples,
     NativeCacheScope = "GGML-reported lazy-copy and explicit-preload payload per rank; excludes graph arenas, device KV, backend pools and physical driver allocation overhead. Availability is false with an older native binary.",
     Limitations = "Real model host snapshot RAM/SSD validation on the declared Backend. Model weights and live device KV remain resident and outside snapshot budget. Width 1 is an output/timing control only: no ownership swap or host snapshot occurs. Rendered chat fixtures test isolation and exact managed/tiered generated tokens, not semantic quality. Full-logit tolerance replay uses two complete short chat prompts and forced tokens. No whole-model out-of-core, multimodal, MTP, tensor-parallel snapshot, HTTP latency or speedup claim. Timings include engine I/O/compute, exclude load/compilation, and have one sample per width/arm. OS page cache is not bounded; physical filesystem medium is not assumed to be NVMe."
@@ -280,8 +303,10 @@ async Task<EngineRun> RunEngine(ModelBase model, int width, KvSnapshotOptions? s
     Console.WriteLine($"{mode}: width={width} elapsed_ms={result.Milliseconds:F1} spills={result.Residency?.Spills}");
     return result;
 }
-async Task<EngineRun> RunAndRecord(ModelBase model, int width, KvSnapshotOptions? snapshot, string mode, Func<int, int[]> prompt)
+async Task<EngineRun> RunAndRecord(ModelBase model, int width, KvSnapshotOptions? snapshot, string mode, Func<int, int[]> prompt,
+    List<EngineRun>? destination = null)
 {
+    destination ??= runs;
     EngineRun result;
     try { result = await RunEngine(model, width, snapshot, mode, prompt); }
     catch (Exception ex)
@@ -290,10 +315,10 @@ async Task<EngineRun> RunAndRecord(ModelBase model, int width, KvSnapshotOptions
         // An escaping error may be failed disposal: preserve evidence and stop
         // before another arm can reuse a model whose old work/state still lives.
         modelCleanupDeferred = true;
-        runs.Add(new EngineRun(mode, width, 0, Array.Empty<RequestRun>(), null, null, null, ex.ToString()));
+        destination.Add(new EngineRun(mode, width, 0, Array.Empty<RequestRun>(), null, null, null, ex.ToString()));
         throw;
     }
-    runs.Add(result);
+    destination.Add(result);
     return result;
 }
 record RequestRun(int[] Prompt, int[] Tokens, string Status, string? FinishReason, double? TtftMilliseconds, string? Error);

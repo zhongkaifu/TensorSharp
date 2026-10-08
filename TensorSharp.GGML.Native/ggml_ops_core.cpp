@@ -12,6 +12,7 @@
 #include "bonsai_quant.h"
 #include "ggml_ops_graph_optimize.h"
 #include "ggml_ops_cache_budget.h"
+#include "ggml_ops_shared_cache_budget.h"
 
 #if defined(TSG_GGML_USE_METAL)
 #include "ggml-backend-impl.h"
@@ -1214,7 +1215,16 @@ namespace tsg
     {
         offloadable_lru_remove_locked(key);
         g_offloadable_lru.push_front(key);
-        g_offloadable_lru_map[key] = g_offloadable_lru.begin();
+        try { g_offloadable_lru_map.emplace(key, g_offloadable_lru.begin()); }
+        catch (...) { g_offloadable_lru.pop_front(); throw; }
+    }
+
+    void free_cached_host_buffer(CachedHostBuffer& cached)
+    {
+        ggml_backend_buffer_free(cached.buffer);
+        cached.buffer = nullptr;
+        // Physical destruction precedes release into the shared managed budget.
+        cached.shared_charge.reset();
     }
 
     // Drop an offloadable LRU entry: removes the cache entry, frees the
@@ -1234,7 +1244,7 @@ namespace tsg
             return 0;
         std::size_t freed = cit->second.bytes;
         device_copy_account_remove_locked(cit->second);
-        ggml_backend_buffer_free(cit->second.buffer);
+        free_cached_host_buffer(cit->second);
         g_host_buffer_cache.erase(cit);
         advise_pages_dont_need(key, freed);
         if (g_offloadable_resident_bytes >= static_cast<std::int64_t>(freed))
@@ -1244,12 +1254,15 @@ namespace tsg
         return freed;
     }
 
-    void offloadable_evict_to_budget_locked()
+    void offloadable_evict_to_budget_locked(void* protected_key = nullptr)
     {
         if (g_offloadable_budget <= 0)
             return;
         while (g_offloadable_resident_bytes > g_offloadable_budget && !g_offloadable_lru.empty())
         {
+            // The graph being built already borrowed this new wrapper. An
+            // individual tensor larger than the LRU quota must remain usable.
+            if (g_offloadable_lru.back() == protected_key) break;
             if (offloadable_evict_one_locked() == 0)
                 break;
         }
@@ -1267,7 +1280,7 @@ namespace tsg
             auto it = g_preloaded_buffer_cache.find(data);
             if (it != g_preloaded_buffer_cache.end())
             {
-                ggml_backend_buffer_free(it->second.buffer);
+                free_cached_host_buffer(it->second);
                 preload_account_remove_locked(it->second);
                 g_preloaded_buffer_cache.erase(it);
                 return true;
@@ -1288,7 +1301,7 @@ namespace tsg
                     g_offloadable_resident_bytes = 0;
             }
             device_copy_account_remove_locked(it->second);
-            ggml_backend_buffer_free(it->second.buffer);
+            free_cached_host_buffer(it->second);
             g_host_buffer_cache.erase(it);
         }
         return true;
@@ -1322,21 +1335,31 @@ namespace tsg
             }
         }
 
-        out_buffer = ggml_backend_dev_buffer_from_host_ptr(dev, data, bytes, bytes);
-        if (out_buffer == nullptr)
+        std::unique_ptr<ggml_backend_buffer, decltype(&ggml_backend_buffer_free)> allocation(
+            ggml_backend_dev_buffer_from_host_ptr(dev, data, bytes, bytes), ggml_backend_buffer_free);
+        if (!allocation)
             return false;
 
         if (cacheable)
         {
             std::lock_guard<std::mutex> lock(g_host_buffer_cache_mutex);
-            g_host_buffer_cache[data] = {
-                out_buffer, bytes,
-                ggml_backend_buffer_get_size(out_buffer),
+            const auto inserted = g_host_buffer_cache.emplace(data, CachedHostBuffer{
+                allocation.get(), bytes,
+                ggml_backend_buffer_get_size(allocation.get()),
                 CachedBufferMode::HostPtr
-            };
+            });
+            // A concurrent bind or incompatible existing entry keeps its physical
+            // buffer and charge. Never overwrite ownership with a host wrapper.
+            if (!inserted.second) return false;
             if (g_offloadable_keys.count(data))
             {
-                offloadable_lru_insert_front_locked(data);
+                try { offloadable_lru_insert_front_locked(data); }
+                catch (...) {
+                    // Keep the unpublished wrapper owned by allocation while
+                    // rolling back the cache record before the wrapper is freed.
+                    g_host_buffer_cache.erase(inserted.first);
+                    throw;
+                }
                 g_offloadable_resident_bytes += static_cast<std::int64_t>(bytes);
                 // Evict from the tail of the LRU; the just-inserted entry is
                 // at the front and is safe (it's the one the caller will use
@@ -1344,10 +1367,11 @@ namespace tsg
                 // entries frees their MTLBuffer wrappers; any kernel whose
                 // graph computed earlier has already released the references
                 // it captured at build time.
-                offloadable_evict_to_budget_locked();
+                offloadable_evict_to_budget_locked(data);
             }
         }
 
+        out_buffer = allocation.release();
         return true;
     }
 
@@ -1375,6 +1399,16 @@ namespace tsg
 
 #if defined(TSG_GGML_TEST_HOOKS)
     static thread_local bool g_test_poison_cache_allocation = false;
+    static thread_local int g_test_cache_failure_kind = -1;
+    static thread_local int g_test_cache_failure_stage = 0;
+    bool test_cache_failure(int kind, int stage)
+    {
+        if (g_test_cache_failure_kind != kind || g_test_cache_failure_stage != stage) return false;
+        g_test_cache_failure_kind = -1;
+        g_test_cache_failure_stage = 0;
+        set_last_error("Injected cache allocation failure.");
+        return true;
+    }
 #endif
 
     bool try_get_cacheable_tensor_buffer(
@@ -1432,7 +1466,7 @@ namespace tsg
                         it->second.bytes, it->second.buffer_size, bytes, required_size);
                     std::fflush(stderr);
                 }
-                ggml_backend_buffer_free(it->second.buffer);
+                free_cached_host_buffer(it->second);
                 preload_account_remove_locked(it->second);
                 g_preloaded_buffer_cache.erase(it);
             }
@@ -1457,7 +1491,7 @@ namespace tsg
                     return true;
                 }
                 device_copy_account_remove_locked(it->second);
-                ggml_backend_buffer_free(it->second.buffer);
+                free_cached_host_buffer(it->second);
                 g_host_buffer_cache.erase(it);
             }
         }
@@ -1482,6 +1516,12 @@ namespace tsg
                 state.device_copy_budget_bytes, alloc_size);
             if (!reservation) return false;
 
+            auto shared_charge = SharedCacheCharge::reserve(g_active_rank, 0, alloc_size);
+            if (!shared_charge) return false;
+#if defined(TSG_GGML_TEST_HOOKS)
+            if (test_cache_failure(0, 1)) return false;
+#endif
+
             std::unique_ptr<ggml_backend_buffer, decltype(&ggml_backend_buffer_free)> allocation(
                 ggml_backend_buft_alloc_buffer(buft, alloc_size), ggml_backend_buffer_free);
             if (!allocation)
@@ -1491,6 +1531,7 @@ namespace tsg
             if (address == nullptr) return false;
             const auto actual_size = ggml_backend_buffer_get_size(allocation.get());
 #if defined(TSG_GGML_TEST_HOOKS)
+            if (test_cache_failure(0, 2)) return false;
             // Make the abandoned-graph regression independent of allocator reuse.
             if (g_test_poison_cache_allocation)
                 ggml_backend_buffer_clear(allocation.get(), 0xa5);
@@ -1514,11 +1555,16 @@ namespace tsg
 
             std::lock_guard<std::mutex> lock(g_host_buffer_cache_mutex);
             if (!reservation.fits_locked(actual_size)) return false;
+            if (!shared_charge->commit(actual_size)) return false;
+#if defined(TSG_GGML_TEST_HOOKS)
+            if (test_cache_failure(0, 3)) return false;
+#endif
             const auto inserted = g_host_buffer_cache.emplace(data, CachedHostBuffer{
                 allocation.get(), bytes, actual_size, CachedBufferMode::DeviceCopy, alloc_size });
             // Another graph may have published the same key during allocation.
             // Keep its live buffer; this caller can use its per-graph fallback.
             if (!inserted.second) return false;
+            inserted.first->second.shared_charge = shared_charge;
             reservation.publish_locked(actual_size);
             out_buffer = allocation.release();
             out_addr = address;
@@ -2829,6 +2875,7 @@ namespace tsg
 
     ggml_status graph_compute_profiled(ggml_backend_t backend, ggml_cgraph* graph, const char* tag)
     {
+        backend = q8_f32_execution_backend(backend, graph);
         // TS_GGML_NODE_PROFILE_TAG=<substring> profiles only the graphs whose tag
         // contains it (e.g. "verify"), so a decode-dominated run does not bury
         // the graph of interest; the others run unprofiled.
@@ -3157,6 +3204,7 @@ TSG_EXPORT void TSGgml_ClearHostBufferCache()
     TSGgml_Qwen35GdnDropTpGraphs();
     TSGgml_ReleaseFusedFfnTpGraphs();
     TSGgml_ReleaseFusedMatmulAddTpGraphs();
+    tsg::clear_q8_f32_backends();
     // The vendor convolution library holds a handle, its engine tables and a
     // workspace on the device. The VAE ENCODER runs before the DiT, so leaving them
     // resident charges the whole denoise for memory only the decode needs.
@@ -3180,7 +3228,7 @@ TSG_EXPORT void TSGgml_ClearHostBufferCache()
         {
             std::lock_guard<std::mutex> lock(g_preloaded_buffer_cache_mutex);
             for (auto& [ptr, cached] : g_preloaded_buffer_cache)
-                ggml_backend_buffer_free(cached.buffer);
+                free_cached_host_buffer(cached);
             g_preloaded_buffer_cache.clear();
             dev().preload_resident_bytes = 0;
         }
@@ -3188,7 +3236,7 @@ TSG_EXPORT void TSGgml_ClearHostBufferCache()
         {
             std::lock_guard<std::mutex> lock(g_host_buffer_cache_mutex);
             for (auto& [ptr, cached] : g_host_buffer_cache)
-                ggml_backend_buffer_free(cached.buffer);
+                free_cached_host_buffer(cached);
             g_host_buffer_cache.clear();
             g_offloadable_lru.clear();
             g_offloadable_lru_map.clear();
@@ -3243,7 +3291,7 @@ TSG_EXPORT void TSGgml_Shutdown()
         {
             std::lock_guard<std::mutex> lock(g_preloaded_buffer_cache_mutex);
             for (auto& [ptr, cached] : g_preloaded_buffer_cache)
-                ggml_backend_buffer_free(cached.buffer);
+                free_cached_host_buffer(cached);
             g_preloaded_buffer_cache.clear();
             dev().preload_resident_bytes = 0;
         }
@@ -3251,7 +3299,7 @@ TSG_EXPORT void TSGgml_Shutdown()
         {
             std::lock_guard<std::mutex> lock(g_host_buffer_cache_mutex);
             for (auto& [ptr, cached] : g_host_buffer_cache)
-                ggml_backend_buffer_free(cached.buffer);
+                free_cached_host_buffer(cached);
             g_host_buffer_cache.clear();
             g_offloadable_keys.clear();
             g_offloadable_lru.clear();
@@ -3299,6 +3347,7 @@ TSG_EXPORT void TSGgml_Shutdown()
     TSGgml_MuseGlimmerResetDecodeCache();
     TSGgml_DFlashResetCaches();
     TSGgml_WanResetForwardCache();
+    tsg::clear_q8_f32_backends();
 #if defined(TSG_GGML_USE_METAL)
     // MPS owns a separate command queue, staging buffers and compiled graphs.
     // Its release function waits for its mutex-protected synchronous invocation
@@ -3748,9 +3797,16 @@ TSG_EXPORT int64_t TSGgml_DeviceCopyCacheResidentBytes()
 }
 
 #if defined(TSG_GGML_TEST_HOOKS)
+#define TSG_TEST_EXPORT TSG_EXPORT
+TSG_TEST_EXPORT void TSGgml_TestCacheAllocationFailure(int kind, int stage)
+{
+    tsg::g_test_cache_failure_kind = kind;
+    tsg::g_test_cache_failure_stage = stage;
+}
+
 // Stop exactly where a graph builder can fail before its deferred upload loop.
 // No caller-side bind, upload or compute follows the shared cache lookup.
-TSG_EXPORT int TSGgml_TestAbandonCachedWeight(void* key, void* host, int type,
+TSG_TEST_EXPORT int TSGgml_TestAbandonCachedWeight(void* key, void* host, int type,
     int64_t ne0, int64_t ne1, int64_t bytes)
 {
     if (!ensure_backend() || key == nullptr || host == nullptr || bytes <= 0)
@@ -3772,7 +3828,23 @@ TSG_EXPORT int TSGgml_TestAbandonCachedWeight(void* key, void* host, int type,
         return 0;
     return buffer != nullptr && address != nullptr && tensor->buffer == nullptr && tensor->data == nullptr;
 }
+#undef TSG_TEST_EXPORT
 #endif
+
+// Install only when no direct-cache/preload allocation is live or in flight.
+// Static managed delegates remain rooted until detach succeeds. Callbacks must
+// only perform bookkeeping, must not throw, and must not re-enter native APIs.
+TSG_EXPORT int TSGgml_AttachSharedCacheBudget(void* context,
+    tsg::SharedCacheCharge::Reserve reserve, tsg::SharedCacheCharge::Commit commit,
+    tsg::SharedCacheCharge::Release release)
+{
+    return tsg::SharedCacheCharge::attach(context, reserve, commit, release) ? 1 : 0;
+}
+
+TSG_EXPORT int TSGgml_DetachSharedCacheBudget(void* context)
+{
+    return tsg::SharedCacheCharge::detach(context) ? 1 : 0;
+}
 
 // Cache payload accounting only: graph arenas, KV slots, backend pools and driver
 // overhead remain outside these counters. Explicit preloads keep their independent
@@ -3932,7 +4004,7 @@ TSG_EXPORT int TSGgml_PreloadQuantizedWeight(
                     clear_last_error();
                     return 1;
                 }
-                ggml_backend_buffer_free(it->second.buffer);
+                free_cached_host_buffer(it->second);
                 preload_account_remove_locked(it->second);
                 g_preloaded_buffer_cache.erase(it);
             }
@@ -3955,6 +4027,15 @@ TSG_EXPORT int TSGgml_PreloadQuantizedWeight(
             set_last_error("Quantized weight preload accounting exceeds the supported byte range.");
             return 0;
         }
+        auto shared_charge = SharedCacheCharge::reserve(g_active_rank, 1, alloc_size);
+        if (!shared_charge)
+        {
+            set_last_error("Shared cache memory budget refused quantized weight preload.");
+            return 0;
+        }
+#if defined(TSG_GGML_TEST_HOOKS)
+        if (test_cache_failure(1, 1)) return 0;
+#endif
         std::unique_ptr<ggml_backend_buffer, decltype(&ggml_backend_buffer_free)> allocation(
             ggml_backend_buft_alloc_buffer(buft, alloc_size), ggml_backend_buffer_free);
         ggml_backend_buffer_t buffer = allocation.get();
@@ -3977,6 +4058,9 @@ TSG_EXPORT int TSGgml_PreloadQuantizedWeight(
             set_last_error("Failed to allocate GGML backend buffer for quantized weight preload.");
             return 0;
         }
+#if defined(TSG_GGML_TEST_HOOKS)
+        if (test_cache_failure(1, 2)) return 0;
+#endif
 
         ggml_backend_buffer_set_usage(buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
         void* addr = ggml_backend_buffer_get_base(buffer);
@@ -4004,6 +4088,14 @@ TSG_EXPORT int TSGgml_PreloadQuantizedWeight(
                 set_last_error("Quantized weight preload accounting exceeds the supported byte range.");
                 return 0;
             }
+            if (!shared_charge->commit(actual_size))
+            {
+                set_last_error("Shared cache memory budget could not commit quantized weight preload.");
+                return 0;
+            }
+#if defined(TSG_GGML_TEST_HOOKS)
+            if (test_cache_failure(1, 3)) return 0;
+#endif
             const auto inserted = g_preloaded_buffer_cache.emplace(cache_key, CachedHostBuffer{
                 buffer, bytes, actual_size, CachedBufferMode::DeviceCopy });
             if (!inserted.second)
@@ -4018,6 +4110,7 @@ TSG_EXPORT int TSGgml_PreloadQuantizedWeight(
                 return 1; // Existing completed upload wins; RAII frees this duplicate.
             }
             reservation.publish_locked(actual_size);
+            inserted.first->second.shared_charge = shared_charge;
             allocation.release();
         }
 

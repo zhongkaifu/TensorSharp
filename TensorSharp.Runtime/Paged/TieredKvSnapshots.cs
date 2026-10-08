@@ -12,7 +12,7 @@ internal sealed class TieredKvSnapshots : IDisposable
 {
     private readonly string _owner = "kv/" + Guid.NewGuid().ToString("N");
     private readonly Dictionary<int, ResourceKey> _keys = new();
-    private readonly HostMemoryBackend _host = new("kv/ram");
+    private readonly HostMemoryBackend _host;
     private readonly BoundedTransfers _transfers;
     private readonly SsdSpillStore _spill;
     private readonly IResourceBuffer _scratch;
@@ -28,11 +28,16 @@ internal sealed class TieredKvSnapshots : IDisposable
     {
         options.Validate(blockBytes);
         _blockBytes = checked((int)blockBytes);
-        Budget = new(new[] { new MemoryCharge("kv/ram", options.RamBytes), new MemoryCharge("kv/ssd", options.SsdBytes) });
-        _transfers = new(Budget, "kv/ram", options.TransferBytes, 1);
+        Budget = options.SharedBudget ?? new(new[]
+        {
+            new MemoryCharge(options.RamPool, options.RamBytes),
+            new MemoryCharge(options.SsdPool, options.SsdBytes),
+        });
+        _host = new(options.RamPool);
+        _transfers = new(Budget, options.RamPool, options.TransferBytes, 1);
         try
         {
-            _spill = new(Budget, "kv/ssd", options.SpillDirectory, _transfers);
+            _spill = new(Budget, options.SsdPool, options.SpillDirectory, _transfers);
             try
             {
                 _scratchCharge = Budget.Reserve(_host.GetAllocationCharges(blockBytes));

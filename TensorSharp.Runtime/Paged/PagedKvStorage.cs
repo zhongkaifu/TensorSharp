@@ -58,6 +58,8 @@ namespace TensorSharp.Runtime.Paged
         /// <summary>Logical page capacity, not committed RAM. Use MemoryUsage for tiered charges.</summary>
         public long ReservedBytes => (long)_numBlocks * _blockByteSize;
         public bool UsesTieredSnapshots => _tiered != null;
+        /// <summary>Budget counters. With a shared budget, includes every owner
+        /// of its pools, not only this storage instance.</summary>
         public IReadOnlyList<MemoryPoolSnapshot>? MemoryUsage => _tiered?.Budget.Snapshot();
         public MemorySchedulerStats? ResidencyStats => _tiered?.Scheduler.GetStats();
 

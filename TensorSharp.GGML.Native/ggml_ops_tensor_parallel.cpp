@@ -38,6 +38,7 @@
 //     submit-all-then-sync structure ggml's meta backend uses.
 // ---------------------------------------------------------------------------
 #include "ggml_ops_internal.h"
+#include "ggml_ops_q8_weight_policy.h"
 // ggml_graph_view: the segment executor runs [i0, i1) of an already-built graph
 // without copying it, exactly as ggml_backend_sched does for its splits.
 #include "ggml-impl.h"
@@ -859,7 +860,7 @@ namespace tsg
                 if (end <= begin)
                     continue;
                 ggml_cgraph view = ggml_graph_view(plans[r]->graph, begin, end);
-                if (ggml_backend_graph_compute_async(plans[r]->backend ? plans[r]->backend : g_backend, &view) != GGML_STATUS_SUCCESS)
+                if (ggml_backend_graph_compute_async(q8_f32_execution_backend(plans[r]->backend ? plans[r]->backend : g_backend, &view), &view) != GGML_STATUS_SUCCESS)
                 {
                     set_last_error("Tensor-parallel segment execution failed.");
                     return false;
@@ -1113,7 +1114,7 @@ namespace tsg
                 }
             }
 
-            ggml_tensor* mm = ggml_mul_mat(ctx, w_tensor, input_binding.tensor);
+            ggml_tensor* mm = tsg::weight_mul_mat(ctx, w_tensor, input_binding.tensor, weight.data);
             if (mm == nullptr)
             {
                 set_last_error("Failed to create the multi-rank matmul node.");
@@ -1244,7 +1245,7 @@ TSG_EXPORT int TSGgml_TensorParallelMatmul(
                     cgraphs[static_cast<std::size_t>(r)], device_reduce))
                 return 0;
 
-            if (ggml_backend_graph_compute_async(g_backend, cgraphs[static_cast<std::size_t>(r)]) != GGML_STATUS_SUCCESS)
+            if (ggml_backend_graph_compute_async(tsg::q8_f32_execution_backend(g_backend, cgraphs[static_cast<std::size_t>(r)]), cgraphs[static_cast<std::size_t>(r)]) != GGML_STATUS_SUCCESS)
             {
                 tsg::set_last_error("Tensor-parallel matmul graph execution failed.");
                 return 0;

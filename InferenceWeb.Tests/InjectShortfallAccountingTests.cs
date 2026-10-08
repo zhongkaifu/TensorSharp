@@ -233,6 +233,50 @@ public sealed class InjectShortfallAccountingTests
         Assert.True(a.ReplayDecodeElapsedTicks + b.ReplayDecodeElapsedTicks > 0);
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task RecurrentSwapWithoutPrefixCaching_RefusedTailCannotResumeFromAMidChunkState(bool tiered)
+    {
+        int[][] prompts =
+        {
+            Enumerable.Range(1, 27).ToArray(),
+            Enumerable.Range(41, 29).ToArray(),
+        };
+        var expected = new List<int[]>();
+        foreach (var prompt in prompts)
+        {
+            using var cold = new InferenceEngine(new RecurrentHashModel(),
+                Config(prefixCaching: false, decodeQuantum: 1, prefillChunk: 24));
+            expected.Add((await RunAsync(cold, "cold", prompt, 6)).OutputTokens.ToArray());
+        }
+        string root = Path.Combine(Path.GetTempPath(), "ts-recurrent-endpoint-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            var model = new RecurrentHashModel { RefuseInjectAt = 2 * BlockSize };
+            using var engine = new InferenceEngine(model, new SchedulerConfig
+            {
+                BlockSize = BlockSize, NumBlocks = 32, MaxNumRunningSequences = 2,
+                MaxNumBatchedTokens = 64, MaxPrefillChunkSize = 24, SoloPrefillChunkSize = 24,
+                DecodeQuantumTokens = 1, EnablePrefixCaching = false, StopRepetition = false,
+                KvSnapshots = tiered ? new(192, 32 * 4096, root, 64) : null,
+            });
+            var gate = new ComputeGate(); gate.Close(); engine.ComputeGate = gate;
+            var sequences = prompts.Select((p, i) => new SequenceState($"swap-{i}", p, 6, BlockSize, SamplingConfig.Greedy)).ToArray();
+            var handles = sequences.Select(s => engine.SubmitRequest(s)).ToArray();
+            gate.Open();
+            await Task.WhenAll(handles.Select(h => h.Completion)).WaitAsync(TimeSpan.FromSeconds(20));
+            Assert.Equal(1, model.RefusedInjects);
+            for (int i = 0; i < sequences.Length; i++)
+            {
+                Assert.Equal(SequenceStatus.FinishedLengthCapped, sequences[i].Status);
+                Assert.Equal(expected[i], sequences[i].OutputTokens.ToArray());
+            }
+            if (tiered) Assert.True(engine.SnapshotResidencyStats!.Value.Loads > 0);
+        }
+        finally { if (Directory.Exists(root)) Directory.Delete(root, recursive: true); }
+    }
+
     private static async Task<(HistoryHashModel Model, SequenceState A, SequenceState B,
         InferenceCompletion CompletionA, InferenceCompletion CompletionB)> RunConcurrentAsync(
         int[] promptA, int[] promptB, int maxNew, int? refuseInjectAt, int refuseSkip = 0, bool measureTiming = false)

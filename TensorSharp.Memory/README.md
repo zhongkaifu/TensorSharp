@@ -22,9 +22,10 @@ pipelines still need the execution adapters described in
 | `SsdSpillStore` | Private process-lifetime files, quota, atomic publication, SHA-256 validation of restored mutable state |
 | `MemoryRequestQueue` | Bounded FIFO queue; full declared request-peak reservation; cancellation; explicit pressure instead of overcommit |
 | `HostMemoryBackend` | Actual native host allocations and copies |
-| `CudaResidencyBackend` / `CudaExecutionFence` | CUDA allocations, completion events, direct device copy and opt-in P2P; compiled, **not exercised on hardware** |
+| `CudaResidencyBackend` / `CudaExecutionFence` | CUDA allocations, completion events and bounded host-staged multi-GPU copy; exercised on two A40s, direct P2P failed independent machine checks |
 | Runtime `PagedKvStorage` | Actual capture/inject path uses scoped leases, bounded native scratch, SSD restore and best-effort next-page prefetch |
 | Runtime `RequestMemoryAdmission` | Full peak reservation before prefix materialization, retained through physical release; budget/command wakeups instead of polling |
+| GGML `GgmlCacheBudgetScope` | Optional native lazy-copy/preload allocation charges in an existing managed budget; install before caches, retain credit through physical release |
 | `GgufMemoryCatalog` | GGUF and split-GGUF tensor regions, original quantized bytes, operator-defined slices |
 
 `ResourceKind` is descriptive metadata, not a model-specific policy switch. The core
@@ -91,6 +92,39 @@ export TS_SCHED_KV_SPILL_DIRECTORY=/path/on/ssd/tensorsharp-kv
 ```
 
 These are **per-engine host-snapshot budgets**, not whole-model VRAM/RAM limits.
+Programmatic configuration can instead share the same physical pools across
+engines, native cache ownership and request admission:
+
+```csharp
+var budget = new MemoryBudget(new[] {
+    new MemoryCharge("node0/ram", 2L << 30),
+    new MemoryCharge("node0/ssd", 16L << 30),
+    new MemoryCharge("node0/gpu0", 8L << 30),
+});
+var snapshots = KvSnapshotOptions.FromSharedBudget(
+    budget, "node0/ram", "node0/ssd", spillDirectory);
+// TensorSharp.GGML; install before loading/preloading native caches.
+using var nativeCaches = new GgmlCacheBudgetScope(
+    budget, new[] { new[] { "node0/gpu0" } });
+// Set SchedulerConfig.KvSnapshots = snapshots when constructing engines.
+// Stop work, dispose engines/models and clear native caches before scope disposal.
+```
+
+Import `TensorSharp.Runtime.Paged` and `TensorSharp.GGML` for the example. UMA
+rank mappings may include both RAM and GPU pools to constrain one physical copy.
+Shared capacities replace the independent per-engine limits; adapters release
+only their own charges and can evict only their own pages. `MemoryUsage` then
+reports the entire shared budget, including other owners. It may remain nonzero
+after one engine is disposed. Do not also reserve these same cache/snapshot bytes
+in a request envelope: this integration owns their allocation charges directly.
+
+The native scope covers lazy device-copy and explicit preload caches only. Graph
+scratch, live model KV, backend pools and streaming fallback remain outside it;
+cache admission refusal is not a whole-model allocation limit. Attaching after
+native cache allocation or detaching while allocations remain is rejected. Stop
+model work and call `GgmlBasicOps.ClearHostBufferCache()` before disposing the
+scope; failed disposal keeps callbacks and charges alive for a later retry.
+
 RAM includes one full capture scratch, fixed staging and resident snapshot pages.
 It must fit at least one resident page plus scratch and staging, each rounded to
 64-byte allocation alignment. SSD bytes default to zero; each spilled page is

@@ -526,12 +526,14 @@ namespace tsg_q4earena
 #ifdef TSG_GGML_TEST_HOOKS
 // Fail exactly the nth subsequent arena state copy. Tests reset this hook
 // after each scenario; production builds contain neither the export nor branch.
-TSG_EXPORT int TSGgml_Qwen4ExpArenaTestCopyFault(int nth)
+#define TSG_TEST_EXPORT TSG_EXPORT
+TSG_TEST_EXPORT int TSGgml_Qwen4ExpArenaTestCopyFault(int nth)
 {
     if (nth < 0) return 0;
     g_q4ab_copy_fault.store(nth, std::memory_order_relaxed);
     return 1;
 }
+#undef TSG_TEST_EXPORT
 #endif
 
 TSG_EXPORT int TSGgml_Qwen4ExpArenaFlushHostPointerStatus(void* host_ptr)

@@ -2787,6 +2787,12 @@ namespace TensorSharp.Runtime.Scheduling
                 dst.CopyTo(snapshot.Span);
                 block.Used = tokensInBlock;
                 block.HoldsSnapshotBytes = tokensInBlock == _blockSize;
+                // A recurrent snapshot contains the state at the current model
+                // head, even when its attention slice is an earlier full block.
+                // If a later restore stops early, only the true endpoint may be
+                // used as the starting state for recomputing the missing suffix.
+                block.IsRestorablePrefixEnd = !_model.RequiresPerBlockCapture
+                    || startToken + tokensInBlock == tokensInModel;
             }
         }
 

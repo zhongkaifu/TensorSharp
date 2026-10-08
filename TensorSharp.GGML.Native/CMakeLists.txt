@@ -271,6 +271,7 @@ set(TSG_GGMLOPS_SOURCES
     ggml_ops_matmul.cpp
     ggml_ops_matmul_precision.cpp
     ggml_ops_q8_precision.cpp
+    ggml_ops_q8_weight_policy.cpp
     ggml_ops_elementwise.cpp
     ggml_ops_norm_attn.cpp
     ggml_ops_training.cpp
@@ -455,11 +456,17 @@ set_target_properties(GgmlOps PROPERTIES
 )
 
 if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
+    set_property(SOURCE ggml_ops_q8_weight_policy.cpp APPEND PROPERTY COMPILE_DEFINITIONS TSG_GGML_TEST_HOOKS)
     add_executable(GgmlOpsCacheBudgetTest tests/cache_budget_test.cpp)
     target_include_directories(GgmlOpsCacheBudgetTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
     target_link_libraries(GgmlOpsCacheBudgetTest PRIVATE Threads::Threads)
     add_test(NAME cache-allocation-budget COMMAND GgmlOpsCacheBudgetTest)
     set_tests_properties(cache-allocation-budget PROPERTIES TIMEOUT 30)
+    add_executable(GgmlOpsSharedCacheBudgetTest tests/shared_cache_budget_test.cpp)
+    target_include_directories(GgmlOpsSharedCacheBudgetTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    target_link_libraries(GgmlOpsSharedCacheBudgetTest PRIVATE Threads::Threads)
+    add_test(NAME shared-cache-budget-lifetime COMMAND GgmlOpsSharedCacheBudgetTest)
+    set_tests_properties(shared-cache-budget-lifetime PROPERTIES TIMEOUT 30)
     if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
         set_property(SOURCE ggml_ops_core.cpp APPEND PROPERTY COMPILE_DEFINITIONS TSG_GGML_TEST_HOOKS)
         add_executable(GgmlOpsCacheMemoryIntegrationTest tests/cache_memory_integration_test.cpp)
@@ -722,7 +729,8 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
     add_test(NAME attention-exception-boundary COMMAND GgmlOpsAttentionExceptionBoundaryTest)
     set_tests_properties(attention-exception-boundary PROPERTIES TIMEOUT 30)
     add_executable(GgmlOpsQ8PrecisionCpuTest tests/q8_precision_test.cpp ggml_ops_q8_precision.cpp)
-    target_include_directories(GgmlOpsQ8PrecisionCpuTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    target_include_directories(GgmlOpsQ8PrecisionCpuTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/src")
     target_link_libraries(GgmlOpsQ8PrecisionCpuTest PRIVATE ggml-cpu ggml-base)
     add_test(NAME cpu-q8-f32-projection COMMAND GgmlOpsQ8PrecisionCpuTest)
     if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)

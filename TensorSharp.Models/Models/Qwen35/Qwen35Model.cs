@@ -504,6 +504,7 @@ namespace TensorSharp.Models
             // are merged into the trunk's weight dictionaries and its KV ring comes
             // off the same allocator.
             TryLoadQwen35DFlash(draftModelPath);
+            RegisterQwenQ8Precision();
         }
 
         private unsafe void FuseAttentionProjectionWeights()
@@ -1348,16 +1349,15 @@ namespace TensorSharp.Models
         // (<see cref="RequiresPerBlockCapture"/>).
         public override bool RequiresPerBlockCapture => true;
 
-        public override bool SupportsKVStateSnapshot => _kvCacheK != null && _kvCacheV != null;
+        public override bool SupportsKVStateSnapshot => !IsTensorParallel && _kvCacheK != null && _kvCacheV != null;
 
-        // A byte snapshot is still exposed, but it
-        // is not a viable cross-request cache for this hybrid architecture: each
-        // 256-token block repeats the complete GDN recurrent state (about 50 MiB
-        // for the 9B model), and interleaving those snapshots has historically
-        // corrupted sequence isolation. Continuous batching uses the model's
-        // device-resident per-request KV+GDN holders instead; fallback paths
-        // re-prefill cleanly.
-        public override bool SupportsCrossSequenceKvReuse => false;
+        // Snapshot swapping must settle every device-authoritative GDN/KV source,
+        // then drop captured graph bindings before the imported host state is used.
+        // Keep the declaration limited to the dense, trunk-only CUDA family covered
+        // by repeated full-logit replay and isolated-versus-interleaved inference.
+        // Other backends, MoE and MTP continue to use their per-request holders.
+        public override bool SupportsCrossSequenceKvReuse => SupportsKVStateSnapshot
+            && _backend == BackendType.GgmlCuda && _numExperts == 0 && _numNextnLayers == 0;
 
         /// <summary>
         /// Prompt M-RoPE positions compress after an image span (the running position
@@ -1401,8 +1401,12 @@ namespace TensorSharp.Models
         public override bool TryExtractKVBlock(int startToken, int tokenCount, Span<byte> destination)
         {
             if (!SupportsKVStateSnapshot) return false;
+            // Validate before any pointer arithmetic or destination writes. A signed
+            // overflow here otherwise turns an invalid range into a host overread.
+            if (startToken < 0 || tokenCount <= 0 || (long)startToken + tokenCount > _cacheSeqLen)
+                return false;
             long expected = ComputeKVBlockByteSize(tokenCount);
-            if (destination.Length != expected) return false;
+            if (expected <= sizeof(int) || destination.Length != expected) return false;
 
             // CopyAttentionOut / CopyGdnStateOut read raw host pointers.  A fused
             // GGML call may have advanced only their device mirrors.
@@ -1414,7 +1418,6 @@ namespace TensorSharp.Models
             {
                 if (!_isRecurrent[l])
                 {
-                    if (startToken + tokenCount > _cacheSeqLen) return false;
                     if (!CopyAttentionOut(_kvCacheK[l], startToken, tokenCount, destination[offset..], out int wK))
                         return false;
                     offset += wK;
@@ -1444,7 +1447,7 @@ namespace TensorSharp.Models
             // state of neither this block nor the one before it. Everything that can refuse
             // is therefore decided here, before the first write.
             if (!SupportsKVStateSnapshot) return false;
-            if (destToken != _cacheSeqLen || tokenCount <= 0) return false;
+            if (destToken < 0 || destToken != _cacheSeqLen || tokenCount <= 0) return false;
             long endToken = (long)destToken + tokenCount;
             if (endToken > _maxContextLength) return false;   // EnsureCacheCapacity would throw
             long expected = ComputeKVBlockByteSize(tokenCount);
@@ -1452,15 +1455,36 @@ namespace TensorSharp.Models
             long layerBytes = 0;
             for (int l = 0; l < Config.NumLayers; l++)
             {
-                layerBytes += _isRecurrent[l]
-                    ? GdnLayerStateBytes(l)
-                    : AttentionLayerBlockBytes(_kvCacheK[l], tokenCount) + AttentionLayerBlockBytes(_kvCacheV[l], tokenCount);
+                if (_isRecurrent[l])
+                {
+                    // Validate every recurrent payload before an earlier attention
+                    // row or GDN state can change. The MLX importer also refuses a
+                    // host-ring layout whose write index is not zero.
+                    long convBytes = (long)_convState[l].Length * sizeof(float);
+                    long deltaBytes = GdnDeltaStateBytes(_deltaStateTensor[l]);
+                    long qkvDim = (long)_headKDim * _numKHeads * 2 + (long)_headVDim * _numVHeads;
+                    int convTail = Math.Max(0, _convKernel - 1);
+                    if (_convState[l].Length != convTail * qkvDim
+                        || deltaBytes != (long)_numVHeads * _headVDim * _headKDim * sizeof(float))
+                        return false;
+                    int writeIndex = System.Buffers.Binary.BinaryPrimitives.ReadInt32LittleEndian(
+                        source.Slice(checked((int)(layerBytes + convBytes)), sizeof(int)));
+                    if ((uint)writeIndex >= (uint)Math.Max(1, convTail)
+                        || (_mlxGdnCache?[l] != null && writeIndex != 0))
+                        return false;
+                    layerBytes += convBytes + sizeof(int) + deltaBytes;
+                }
+                else
+                {
+                    layerBytes += AttentionLayerBlockBytes(_kvCacheK[l], tokenCount)
+                        + AttentionLayerBlockBytes(_kvCacheV[l], tokenCount);
+                }
             }
             // The trailing M-RoPE delta (see ComputeKVBlockByteSize): present, and a
             // rotation the next token can actually take - a position is never negative.
             if (source.Length - layerBytes != sizeof(int)) return false;
             int ropeDelta = System.Buffers.Binary.BinaryPrimitives.ReadInt32LittleEndian(source[(int)layerBytes..]);
-            if (endToken + ropeDelta < 0) return false;
+            if (endToken + ropeDelta < 0 || endToken + ropeDelta > int.MaxValue) return false;
 
             EnsureCacheCapacity(destToken + tokenCount);
             for (int l = 0; l < Config.NumLayers; l++)
