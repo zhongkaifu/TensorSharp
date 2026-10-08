@@ -11,8 +11,8 @@ using TensorSharp.Runtime;
 var options = new Dictionary<string, string>(StringComparer.Ordinal);
 for (int i = 0; i < args.Length; i += 2)
 {
-    if (i + 1 == args.Length || args[i] is not ("--model" or "--json" or "--steps" or "--prompt-tokens" or "--tile-bytes" or "--token-rows" or "--host-bytes" or "--device-bytes" or "--cycles"))
-        throw new ArgumentException("Use --model PATH --json PATH --steps 4 --prompt-tokens 32 --tile-bytes 1048576 --token-rows 32 --host-bytes 2097152 --device-bytes 2097152.");
+    if (i + 1 == args.Length || args[i] is not ("--model" or "--json" or "--steps" or "--prompt-tokens" or "--tile-bytes" or "--token-rows" or "--host-bytes" or "--device-bytes" or "--cycles" or "--prefill" or "--prefill-chunk"))
+        throw new ArgumentException("Use --model PATH --json PATH --steps 4 --prompt-tokens 32 --tile-bytes 1048576 --token-rows 32 --host-bytes 2097152 --device-bytes 2097152 [--prefill forward|refill] [--prefill-chunk TOKENS].");
     options.Add(args[i], args[i + 1]);
 }
 string modelPath = Path.GetFullPath(options["--model"]);
@@ -24,8 +24,16 @@ int tileBytes = int.Parse(options.GetValueOrDefault("--tile-bytes", "1048576"));
 int tokenRows = int.Parse(options.GetValueOrDefault("--token-rows", "32"));
 long hostBytes = long.Parse(options.GetValueOrDefault("--host-bytes", "2097152"));
 long deviceBytes = long.Parse(options.GetValueOrDefault("--device-bytes", "2097152"));
-if (steps is < 2 or > 32 || promptMinimum is < 1 or > 256 || cycles is < 1 or > 8)
-    throw new ArgumentException("Use 2..32 steps, 1..256 minimum prompt tokens, and 1..8 cycles.");
+string prefillEntry = options.GetValueOrDefault("--prefill", "forward");
+if (steps is < 2 or > 32 || promptMinimum is < 1 or > 896 || cycles is < 1 or > 8
+    || prefillEntry is not ("forward" or "refill"))
+    throw new ArgumentException("Use 2..32 steps, 1..896 minimum prompt tokens, 1..8 cycles, and forward/refill prefill.");
+if (options.TryGetValue("--prefill-chunk", out var prefillChunk))
+{
+    if (!int.TryParse(prefillChunk, out int parsedChunk) || parsedChunk < 1)
+        throw new ArgumentException("--prefill-chunk must be positive.");
+    Environment.SetEnvironmentVariable("TS_PREFILL_CHUNK", prefillChunk);
+}
 foreach (string name in new[] { "TENSORSHARP_TP_DEGREE", "TENSORSHARP_LAYER_SPLIT_DEGREE", "TS_SPEC", "SPECULATIVE_DECODING", "TS_MTP" })
     Environment.SetEnvironmentVariable(name, null);
 Environment.SetEnvironmentVariable("MAX_CONTEXT", "1024");
@@ -42,11 +50,18 @@ var nativeSamples = new List<object>();
 var lifecycleSamples = new List<object>();
 var cycleResults = new List<object>();
 var forwardTimings = new List<object>();
+var baselineForwardTimings = new List<object>();
+var forwardCallTimings = new List<ForwardCallTiming>();
+var processMemorySamples = new List<object>();
 long totalFileBytesRead = 0, totalLinearTiles = 0;
 double totalForwardMilliseconds = 0;
+double baselinePrefillMilliseconds = 0, baselineDecodeMilliseconds = 0;
+long peakObservedWorkingSetBytes = 0, processLifetimePeakWorkingSetBytes = 0;
+string? processMemoryObservationError = null;
 WeightStreamingStatistics? usage = null;
 long residentParameterBytes = 0;
 long expectedFileBytes = 0;
+string architecture = "";
 bool pressureRefused = false;
 int forwardPressureRefusals = 0;
 int resetRequiredRefusals = 0;
@@ -59,13 +74,18 @@ double baselineMilliseconds = 0, streamedMilliseconds = 0;
 try
 {
     using (var metadata = new GgufFile(modelPath))
-        expectedFileBytes = metadata.Tensors.Values.Where(t => t.Type == GgmlTensorType.Q8_0 && t.Shape.Length == 2)
+    {
+        architecture = metadata.GetString("general.architecture") ?? throw new InvalidDataException("Model architecture is missing.");
+        Require(architecture is "qwen35" or "gemma4", "This probe requires a supported Qwen35 or Gemma4 checkpoint.");
+        expectedFileBytes = metadata.Tensors.Values.Where(t => (t.Type is GgmlTensorType.Q8_0 or GgmlTensorType.F16) && t.Shape.Length == 2)
             .Sum(metadata.GetTensorByteCount);
+    }
     Require(expectedFileBytes > hostBytes && expectedFileBytes > deviceBytes,
         "The fixture's quantized weights must exceed both configured staging budgets.");
 
     model = ModelBase.Create(modelPath, BackendType.GgmlCuda);
-    Require(model is Qwen35Model && model.StreamingWeightUsage == null, "Resident reference unexpectedly streams weights.");
+    SampleProcessMemory("resident-loaded");
+    Require(model.Config.Architecture == architecture && model.StreamingWeightUsage == null, "Resident reference unexpectedly streams weights or changed architecture.");
     SampleNative("resident-loaded", requireNoPreload: false);
     var renderer = new KVCachePromptRenderer(new GgufPromptRenderer());
     for (int index = 0; index < 2; index++)
@@ -81,7 +101,12 @@ try
         } while (prompt.Length < promptMinimum);
         Require(prompt.Length + steps < 1024, "Prompt and continuation exceed the bounded test window.");
         model.ResetKVCache();
-        float[] logits = model.Forward(prompt);
+        long forwardStarted = Stopwatch.GetTimestamp();
+        float[] logits = Prefill(model, prompt);
+        double prefillMilliseconds = Stopwatch.GetElapsedTime(forwardStarted).TotalMilliseconds;
+        forwardCallTimings.Add(new("resident", null, index, 0, "prefill", prefillMilliseconds));
+        double decodeMilliseconds = 0;
+        SampleProcessMemory($"resident-case-{index}-prefill");
         var rows = new float[steps][];
         int[] generated = new int[steps];
         for (int step = 0; step < steps; step++)
@@ -90,8 +115,22 @@ try
             rows[step] = (float[])logits.Clone();
             generated[step] = Top(logits);
             Require(!model.Tokenizer.IsEos(generated[step]), "Resident counting fixture stopped early; EOS-only output is not validation.");
-            if (step + 1 < steps) logits = model.Forward(new[] { generated[step] });
+            if (step + 1 < steps)
+            {
+                int[] decodeInput = new[] { generated[step] };
+                forwardStarted = Stopwatch.GetTimestamp();
+                logits = model.Forward(decodeInput);
+                double elapsed = Stopwatch.GetElapsedTime(forwardStarted).TotalMilliseconds;
+                decodeMilliseconds += elapsed;
+                forwardCallTimings.Add(new("resident", null, index, step + 1, "decode", elapsed));
+                SampleProcessMemory($"resident-case-{index}-decode-{step + 1}");
+            }
         }
+        baselinePrefillMilliseconds += prefillMilliseconds;
+        baselineDecodeMilliseconds += decodeMilliseconds;
+        baselineForwardTimings.Add(new { Case = index, PromptTokens = prompt.Length,
+            DecodeCalls = steps - 1, PrefillMilliseconds = prefillMilliseconds,
+            DecodeMilliseconds = decodeMilliseconds, ForwardMilliseconds = prefillMilliseconds + decodeMilliseconds });
         cases.Add(new(index, text, prompt, generated));
         references.Add(rows);
     }
@@ -116,8 +155,13 @@ try
         double cyclePrefillMilliseconds = 0, cycleDecodeMilliseconds = 0;
         usage = null;
         model = ModelBase.Create(modelPath, BackendType.GgmlCuda, weightStreaming: streamingOptions);
-        Require(model is Qwen35Model, "Streaming model adapter changed architecture.");
-        residentParameterBytes = ((Qwen35Model)model).StreamingResidentParameterBytes;
+        Require(model.Config.Architecture == architecture, "Streaming model adapter changed architecture.");
+        residentParameterBytes = model switch
+        {
+            Qwen35Model qwen => qwen.StreamingResidentParameterBytes,
+            Gemma4Model gemma => gemma.StreamingResidentParameterBytes,
+            _ => throw new NotSupportedException("Missing resident-parameter accounting for this adapter."),
+        };
         Require(model.StreamingWeightUsage?.FileBackedWeightBytes == expectedFileBytes, "Some quantized weights were not represented as file regions.");
         Sample("streamed-loaded");
         SampleNative("streamed-loaded", requireNoPreload: true);
@@ -126,7 +170,7 @@ try
         // buffers. Releasing quota is insufficient: the model must demand a reset.
         using (budget.Reserve(new[] { new MemoryCharge("weights/gpu0", deviceBytes) }))
         {
-            try { model.Forward(cases[0].PromptTokens); }
+            try { Prefill(model, cases[0].PromptTokens); }
             catch (MemoryPressureException) { forwardPressureRefused = true; }
             Require(forwardPressureRefused, "An exhausted shared GPU pool did not refuse streamed forward.");
         }
@@ -142,9 +186,11 @@ try
         {
             model.ResetKVCache();
             long forwardStarted = Stopwatch.GetTimestamp();
-            float[] logits = model.Forward(item.PromptTokens);
+            float[] logits = Prefill(model, item.PromptTokens);
             double prefillMilliseconds = Stopwatch.GetElapsedTime(forwardStarted).TotalMilliseconds;
+            forwardCallTimings.Add(new("streamed", cycle, item.Index, 0, "prefill", prefillMilliseconds));
             double decodeMilliseconds = 0;
+            SampleProcessMemory($"streamed-cycle-{cycle}-case-{item.Index}-prefill");
             for (int step = 0; step < steps; step++)
             {
                 float[] expected = references[item.Index][step];
@@ -171,7 +217,10 @@ try
                     int[] decodeInput = new[] { item.GeneratedTokens[step] };
                     forwardStarted = Stopwatch.GetTimestamp();
                     logits = model.Forward(decodeInput);
-                    decodeMilliseconds += Stopwatch.GetElapsedTime(forwardStarted).TotalMilliseconds;
+                    double elapsed = Stopwatch.GetElapsedTime(forwardStarted).TotalMilliseconds;
+                    decodeMilliseconds += elapsed;
+                    forwardCallTimings.Add(new("streamed", cycle, item.Index, step + 1, "decode", elapsed));
+                    SampleProcessMemory($"streamed-cycle-{cycle}-case-{item.Index}-decode-{step + 1}");
                 }
             }
             cyclePrefillMilliseconds += prefillMilliseconds;
@@ -189,7 +238,7 @@ try
             "The test did not repeatedly read bounded weight tiles across real model layers.");
         Require(usage.Value.PeakHostStagingBytes <= hostBytes && usage.Value.PeakDeviceWorkspaceBytes <= deviceBytes,
             "Streaming workspace exceeded its shared budget.");
-        SampleLifecycle($"cycle-{cycle}-before-dispose", requireLiveGdn: true, requireEmpty: false);
+        SampleLifecycle($"cycle-{cycle}-before-dispose", requireLiveGdn: architecture == "qwen35", requireEmpty: false);
         model.Dispose(); model = null;
         var releasedBudget = budget.Snapshot();
         Require(releasedBudget.All(p => p.Reserved == 0 && p.Committed == 0), "A completed cycle retained streaming allocations.");
@@ -229,7 +278,8 @@ var native = Process.GetCurrentProcess().Modules.Cast<ProcessModule>()
     .Where(m => Path.GetFileName(m.FileName).Contains("GgmlOps", StringComparison.OrdinalIgnoreCase))
     .Select(m => new { m.FileName, Sha256 = Hash(m.FileName) }).ToArray();
 File.WriteAllText(reportPath, JsonSerializer.Serialize(new {
-    Passed = error == null, Error = error, Model = modelPath, ModelSha256 = Hash(modelPath),
+    Passed = error == null, Error = error, Architecture = architecture, Model = modelPath,
+    ModelFileBytes = new FileInfo(modelPath).Length, ModelSha256 = Hash(modelPath),
     Device = Environment.GetEnvironmentVariable("TS_VALIDATION_DEVICE"),
     GgmlRevision = Environment.GetEnvironmentVariable("TS_VALIDATION_GGML_REVISION"), Native = native,
     ModelsSha256 = Hash(typeof(ModelBase).Assembly.Location), ProbeSha256 = Hash(typeof(Case).Assembly.Location),
@@ -240,23 +290,62 @@ File.WriteAllText(reportPath, JsonSerializer.Serialize(new {
     ResidentParameterBytes = residentParameterBytes, Cases = cases, Metrics = metrics, Usage = usage,
     CycleResults = cycleResults, TotalFileBytesRead = totalFileBytesRead, TotalLinearTiles = totalLinearTiles,
     ForwardTimings = forwardTimings, TotalForwardMilliseconds = totalForwardMilliseconds,
-    ForwardTimingScope = "Wall time inside successful case prefill/decode ModelBase.Forward calls only; excludes model load, pressure tests, reset, logits comparisons, snapshots and disposal. Same-host configuration comparison only, not a standardized throughput benchmark.",
+    BaselineForwardTimings = baselineForwardTimings, BaselinePrefillMilliseconds = baselinePrefillMilliseconds,
+    BaselineDecodeMilliseconds = baselineDecodeMilliseconds,
+    BaselineForwardMilliseconds = baselinePrefillMilliseconds + baselineDecodeMilliseconds,
+    ForwardCallTimings = forwardCallTimings,
+    ForwardCallTimingScope = "Records each returned validation forward immediately, including calls whose subsequent logits comparison fails; excludes pressure/recovery calls. Completed-case aggregates retain their original success-only meaning.",
+    ForwardTimingScope = "Wall time inside successful case prefill (selected Forward/ForwardRefill entry) and decode ModelBase.Forward calls only, with the same scope for resident and streamed arms; excludes model load, pressure tests, reset, logits comparisons, snapshots and disposal. Same-host configuration comparison only, not a standardized throughput benchmark.",
+    Execution = new { PrefillEntry = prefillEntry == "refill" ? "ModelBase.ForwardRefill" : "ModelBase.Forward",
+        DecodeEntry = "ModelBase.Forward", MaxContext = 1024, KvCacheDtype = "f16",
+        PrefillChunkEnvironment = Environment.GetEnvironmentVariable("TS_PREFILL_CHUNK"),
+        PrefillChunkApplies = prefillEntry == "refill",
+        TensorParallelDegree = 1, LayerSplitDegree = 1,
+        CudaDisableFusion = Environment.GetEnvironmentVariable("GGML_CUDA_DISABLE_FUSION"),
+        CudaMmqPrecision = Environment.GetEnvironmentVariable("GGML_CUDA_MMQ_PREC"),
+        CudaCublasComputeType = Environment.GetEnvironmentVariable("GGML_CUDA_CUBLAS_COMPUTE_TYPE"),
+        WeightFusionCopies = Environment.GetEnvironmentVariable("TS_WEIGHT_FUSION_COPIES"),
+        GemmaDiagnosticDirectory = Environment.GetEnvironmentVariable("TS_GEMMA4_TENSOR_DUMP"),
+        GemmaDiagnosticLayers = Environment.GetEnvironmentVariable("TS_GEMMA4_TENSOR_DUMP_LAYERS"),
+        Note = "Both arms use the same public prefill entry. A null refill chunk override delegates to each model adapter's default; no fused/per-op graph override is applied by the probe. Weight TokenRows limits each linear's staging, independently of model refill chunks." },
+    ProcessMemorySamples = processMemorySamples, PeakObservedWorkingSetBytes = peakObservedWorkingSetBytes,
+    ProcessLifetimePeakWorkingSetBytes = processLifetimePeakWorkingSetBytes,
+    ProcessMemoryObservationError = processMemoryObservationError,
+    ProcessMemoryScope = "Observational process working set sampled after loads/forwards and at budget samples; the lifetime OS peak includes both resident and streamed arms. Neither is a GPU-memory measurement or a budget assertion, and sampled peaks may miss transients.",
     NativeLifecycleSamples = lifecycleSamples,
+    NativeLifecycleScope = "GDN graph cache counters exercise populated allocations only for Qwen35. Gemma4 does not use these caches; no populated Gemma graph-cache lifecycle coverage is inferred from their zero values.",
     PressureConstructionRefused = pressureRefused, ForwardPressureRefused = forwardPressureRefusals == cycles,
     RetryRequiredReset = resetRequiredRefusals == cycles, ForwardPressureRefusals = forwardPressureRefusals,
     ResetRequiredRefusals = resetRequiredRefusals, Snapshots = snapshots, FinalBudget = finalBudget,
     NativeSamples = nativeSamples, MappedFileCheckAvailable = mappedFileCheckAvailable, UnexpectedModelMappings = mappings,
     BaselineMilliseconds = baselineMilliseconds, StreamedMilliseconds = streamedMilliseconds,
-    Scope = "Real dense Qwen35 single-rank GGML CUDA Q8_0 inference using original file regions and bounded synchronous weight/output-row tiles. Budget covers quantized-weight host staging and CUDA streamed input/weight/output workspace. Small F32 constants, activations, KV/GDN state, other native caches, backend pools, CUDA runtime and OS file cache are excluded. Resident fused and streamed per-op execution are compared with the existing ForcedLogitProbe numerical gates. Timings include load/validation and are not throughput benchmarks. No multi-GPU streaming or end-to-end process memory cap is claimed."
+    Scope = "Real dense single-rank GGML CUDA inference using original Q8_0/F16 file regions and bounded synchronous weight/output-row tiles. Budget covers file-weight host staging and CUDA streamed input/weight/output workspace. Small F32 constants, activations, KV/GDN state, other native caches, backend pools, CUDA runtime and OS file cache are excluded. Resident fused and streamed per-op execution are compared with the existing ForcedLogitProbe numerical gates. Overall timings include load/validation and are not throughput benchmarks. No multi-GPU streaming or end-to-end process memory cap is claimed."
 }, new JsonSerializerOptions { WriteIndented = true }));
 Console.WriteLine($"Weight model validation passed={error == null}; report={reportPath}");
 return error == null ? 0 : 1;
 
 void Sample(string phase)
 {
+    SampleProcessMemory(phase);
     var pools = budget.Snapshot();
     Require(pools.All(p => p.Reserved >= 0 && p.Committed >= 0 && p.Available >= 0), "Budget exceeded its configured limit.");
     snapshots.Add(new { Phase = phase, Pools = pools, Usage = model!.StreamingWeightUsage });
+}
+float[] Prefill(ModelBase currentModel, int[] tokens)
+    => prefillEntry == "refill" ? currentModel.ForwardRefill(tokens) : currentModel.Forward(tokens);
+void SampleProcessMemory(string phase)
+{
+    try
+    {
+        using var process = Process.GetCurrentProcess();
+        process.Refresh();
+        long working = process.WorkingSet64, lifetimePeak = process.PeakWorkingSet64;
+        peakObservedWorkingSetBytes = Math.Max(peakObservedWorkingSetBytes, working);
+        processLifetimePeakWorkingSetBytes = Math.Max(processLifetimePeakWorkingSetBytes, lifetimePeak);
+        processMemorySamples.Add(new { Phase = phase, WorkingSetBytes = working, LifetimePeakWorkingSetBytes = lifetimePeak });
+    }
+    catch (Exception ex) when (ex is System.ComponentModel.Win32Exception or NotSupportedException or InvalidOperationException)
+    { processMemoryObservationError ??= ex.Message; }
 }
 void SampleNative(string phase, bool requireNoPreload)
 {
@@ -295,6 +384,7 @@ static int Top(float[] logits)
 static void Require([System.Diagnostics.CodeAnalysis.DoesNotReturnIf(false)] bool condition, string message)
 { if (!condition) throw new InvalidOperationException(message); }
 sealed record Case(int Index, string Prompt, int[] PromptTokens, int[] GeneratedTokens);
+sealed record ForwardCallTiming(string Arm, int? Cycle, int Case, int Step, string Phase, double Milliseconds);
 static class NativeLifecycle
 {
     [DllImport("GgmlOps", EntryPoint = "TSGgml_TestGdnChunkedCacheBytes", CallingConvention = CallingConvention.Cdecl)]

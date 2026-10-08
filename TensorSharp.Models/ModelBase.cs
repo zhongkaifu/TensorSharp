@@ -1406,8 +1406,7 @@ namespace TensorSharp.Models
                     var streamed = new Tensor(_allocator, DType.Float32, tokens.Length, dim);
                     try
                     {
-                        _weightStreamingExecutor.Embedding(qw, tokens, (IntPtr)GetFloatPtr(streamed));
-                        InvalidateTensorDeviceCache(streamed);
+                        ExecuteStreamedEmbedding(streamed, qw, tokens);
                         return streamed;
                     }
                     catch { streamed.Dispose(); throw; }
@@ -2317,7 +2316,11 @@ namespace TensorSharp.Models
 
         public void ResetKVCache()
         {
-            if (HasStreamingWeights) _streamingForwardFailed = true;
+            if (HasStreamingWeights)
+            {
+                _streamingForwardFailed = true;
+                ReleaseStreamingWorkspaceForReset();
+            }
             if (_distributedDriver) _tpGroup.BroadcastControl(TpControlReset, Array.Empty<int>());
             ResetKVCacheCore();
             _streamingForwardFailed = false;

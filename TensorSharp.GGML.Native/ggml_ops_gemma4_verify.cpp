@@ -12,11 +12,65 @@
 #include "gemma4_mm_mask.h"
 #include <chrono>
 #include <cstdio>
+#include <filesystem>
 
 using namespace tsg;
 
 namespace
 {
+    struct G4DiagnosticTensor { std::string name; ggml_tensor* tensor; };
+
+    // Read already-computed tensors in logical ggml order, including strided
+    // Q/K/V views. File failures cannot turn a completed KV update into a
+    // compute failure and cause the managed caller to replay it.
+    void dump_gemma_diagnostics(const char* directory, const std::string& tag,
+        const std::vector<G4DiagnosticTensor>& tensors)
+    {
+        if (directory == nullptr) return;
+        try
+        {
+            std::filesystem::create_directories(directory);
+            sync_backend(g_backend);
+            for (const auto& entry : tensors)
+            {
+                ggml_tensor* t = entry.tensor;
+                if (t->type != GGML_TYPE_F32 || t->nb[0] != sizeof(float))
+                    throw std::runtime_error("Gemma diagnostic requires row-contiguous F32 intermediates.");
+                std::vector<float> values(static_cast<std::size_t>(ggml_nelements(t)));
+                std::size_t target = 0;
+                for (std::int64_t i3 = 0; i3 < t->ne[3]; ++i3)
+                for (std::int64_t i2 = 0; i2 < t->ne[2]; ++i2)
+                for (std::int64_t i1 = 0; i1 < t->ne[1]; ++i1)
+                {
+                    const std::size_t source = i3 * t->nb[3] + i2 * t->nb[2] + i1 * t->nb[1];
+                    ggml_backend_tensor_get(t, values.data() + target, source, t->ne[0] * sizeof(float));
+                    target += static_cast<std::size_t>(t->ne[0]);
+                }
+                const auto base = std::filesystem::path(directory) / (tag + "." + entry.name);
+                FILE* file = std::fopen((base.string() + ".f32").c_str(), "wb");
+                if (file == nullptr) throw std::runtime_error("Cannot create Gemma diagnostic tensor file.");
+                const auto written = std::fwrite(values.data(), sizeof(float), values.size(), file);
+                const int closed = std::fclose(file);
+                if (written != values.size() || closed != 0)
+                    throw std::runtime_error("Cannot write Gemma diagnostic tensor file.");
+                FILE* metadata = std::fopen((base.string() + ".json").c_str(), "wb");
+                if (metadata == nullptr) throw std::runtime_error("Cannot create Gemma diagnostic metadata.");
+                const int printed = std::fprintf(metadata,
+                    "{\"Stage\":\"%s\",\"GgmlShape\":[%lld,%lld,%lld,%lld],\"Dtype\":\"F32\","
+                    "\"Layout\":\"Logical ggml order, ne0 contiguous; strided views compacted\","
+                    "\"Scope\":\"Existing CUDA fusion boundaries pinned for diagnostic lifetime only; normalized Q/K inside RMSNorm/Mul/RoPE are not separately exposed\"}",
+                    entry.name.c_str(), static_cast<long long>(t->ne[0]), static_cast<long long>(t->ne[1]),
+                    static_cast<long long>(t->ne[2]), static_cast<long long>(t->ne[3]));
+                const int metadata_closed = std::fclose(metadata);
+                if (printed < 0 || metadata_closed != 0)
+                    throw std::runtime_error("Cannot write Gemma diagnostic metadata.");
+            }
+        }
+        catch (const std::exception& error)
+        { std::fprintf(stderr, "[Gemma4 diagnostic] %s\n", error.what()); }
+        catch (...) { std::fprintf(stderr, "[Gemma4 diagnostic] Tensor output failed.\n"); }
+    }
+
     // Resources a tensor-parallel verify graph borrows between "build" and
     // "execute". This kernel allocates from the context pool and (for prefill-
     // sized N) the shared gallocr, so unlike the persistent decode graph it has
@@ -179,6 +233,33 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
         }
 
         const int N = num_tokens;
+        const char* diagnostic_directory = start_pos == 0 && !tp_mode
+            ? std::getenv("TS_GEMMA4_TENSOR_DUMP") : nullptr;
+        if (diagnostic_directory != nullptr && diagnostic_directory[0] == '\0') diagnostic_directory = nullptr;
+        int diagnostic_layer_count = 6;
+        if (const char* count = std::getenv("TS_GEMMA4_TENSOR_DUMP_LAYERS"))
+            diagnostic_layer_count = std::max(0, std::min(num_layers, std::atoi(count)));
+        std::string diagnostic_tag;
+        std::vector<G4DiagnosticTensor> diagnostic_tensors;
+        if (diagnostic_directory != nullptr)
+        {
+            std::uint64_t hash = UINT64_C(14695981039346656037);
+            if (ple_token_ids != nullptr)
+                for (int i = 0; i < N; ++i)
+                    for (int shift = 0; shift < 32; shift += 8)
+                        hash = (hash ^ ((static_cast<std::uint32_t>(ple_token_ids[i]) >> shift) & 255)) * UINT64_C(1099511628211);
+            char tag[96];
+            std::snprintf(tag, sizeof(tag), "native.p%d.n%d.t%016llx", start_pos, N, static_cast<unsigned long long>(hash));
+            diagnostic_tag = tag;
+        }
+        auto diagnostic = [&](const std::string& name, ggml_tensor* tensor, int detailed_layer = -1)
+        {
+            if (diagnostic_directory == nullptr || tensor == nullptr || detailed_layer >= diagnostic_layer_count) return;
+            // All selected nodes are existing fusion outputs. In particular,
+            // never expose the internal normalized Q/K before fused RoPE.
+            ggml_set_output(tensor);
+            diagnostic_tensors.push_back({name, tensor});
+        };
         const int totalSeqLen = start_pos + N;
         const bool fold = !tp_mode && logits_data != nullptr && lm_head_data != nullptr
             && final_norm_data != nullptr && vocab_size > 0;
@@ -256,6 +337,7 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
         ggml_context* ctx = context.value;
 
         ggml_tensor* current = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hidden_size, NQ);
+        diagnostic("embeddingScaled", current);
         ggml_tensor* pos_tensor = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, NQ);
 
         // Tensor-parallel cut points: the attention output projection and the FFN
@@ -289,6 +371,7 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
             // F32, same memory layout as the uploaded ple_data.
             ggml_tensor* ple_tok = ggml_get_rows(ctx, ple_table, ple_ids);
             ple_tok = ggml_scale(ctx, ple_tok, sqrtf(static_cast<float>(ple_dim)));
+            diagnostic("pleTokenScaled", ple_tok);
 
             if (ple_proj_w_data != nullptr)
             {
@@ -297,12 +380,15 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
                     ple_proj_w_ne0, ple_proj_w_ne1);
                 ple_proj_norm_w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ple_dim);
                 ggml_tensor* proj = ggml_mul_mat(ctx, ple_proj_w, current);   // [total_ple_dim, N]
+                diagnostic("pleProjectionRaw", proj);
                 proj = ggml_scale(ctx, proj, 1.0f / sqrtf(static_cast<float>(hidden_size)));
+                diagnostic("pleProjectionScaled", proj);
                 // Per-(token,layer) RMSNorm over ple_dim: view [total_ple_dim, N] as
                 // [ple_dim, num_layers*N], norm rows, scale by norm weight, reshape back.
                 ggml_tensor* proj_r = ggml_reshape_2d(ctx, ggml_cont(ctx, proj), ple_dim, static_cast<std::int64_t>(num_layers) * NQ);
                 proj_r = ggml_mul(ctx, ggml_rms_norm(ctx, proj_r, eps), ple_proj_norm_w);
                 proj = ggml_reshape_2d(ctx, proj_r, total_ple_dim, NQ);
+                diagnostic("pleProjectionNormed", proj);
                 // combined = (proj + tok) / sqrt(2)
                 ple_input = ggml_scale(ctx, ggml_add(ctx, proj, ple_tok), 1.0f / sqrtf(2.0f));
             }
@@ -317,6 +403,7 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
                 static_cast<std::int64_t>(NQ) * num_layers * ple_dim);
         }
         const bool has_ple = ple_input != nullptr;
+        diagnostic("pleCombined", ple_input);
 
         struct LayerTensors {
             ggml_tensor* attn_norm_w; ggml_tensor* qkv_w; ggml_tensor* k_w; ggml_tensor* v_w;
@@ -557,9 +644,13 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
             auto& lt = layers[l];
             auto& info = li[l];
             float rope_base = rope_base_arr[l];
+            char diagnostic_layer[24];
+            std::snprintf(diagnostic_layer, sizeof(diagnostic_layer), "layer%02d.", l);
+            const std::string diagnostic_prefix = diagnostic_layer;
 
             // attn norm
             ggml_tensor* normed = ggml_mul(ctx, ggml_rms_norm(ctx, hidden, eps), lt.attn_norm_w);  // [hidden, N]
+            diagnostic(diagnostic_prefix + "attnNorm", normed, l);
 
             // Q projection (+ K/V for non-shared layers). Shared (KV-donor) layers
             // project ONLY Q (qkv_w is the Q-only weight) and read the donor's K/V.
@@ -606,10 +697,14 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
                     headStride, qkv->nb[1], static_cast<std::size_t>(info.qDim + info.kDim) * sizeof(float));
             }
 
+            diagnostic(diagnostic_prefix + "qProjected", q_3d, l);
+            diagnostic(diagnostic_prefix + "kProjected", k_3d, l);
+            diagnostic(diagnostic_prefix + "vProjected", v_3d, l);
             // per-head Q norm + RoPE (always; Q is this layer's own)
             q_3d = ggml_mul(ctx, ggml_rms_norm(ctx, q_3d, eps), lt.q_norm_w);
             ggml_tensor* q_rope = ggml_rope_ext(ctx, q_3d, pos_tensor, rope_ff,
                 rope_dims, 2, 0, rope_base, 1.0f, 0, 1, 0, 0);  // [hd, num_heads, N]
+            diagnostic(diagnostic_prefix + "qNormRope", q_rope, l);
 
             lt.k_cpy = nullptr; lt.v_cpy = nullptr; lt.k_cpy2 = nullptr; lt.v_cpy2 = nullptr;
             lt.k_prev = nullptr; lt.v_prev = nullptr;
@@ -635,8 +730,10 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
                 // per-head K norm + V norm (unweighted), then RoPE on K.
                 k_3d = ggml_mul(ctx, ggml_rms_norm(ctx, k_3d, eps), lt.k_norm_w);
                 v_3d = ggml_rms_norm(ctx, v_3d, eps);
+                diagnostic(diagnostic_prefix + "vNormed", v_3d, l);
                 ggml_tensor* k_rope = ggml_rope_ext(ctx, k_3d, pos_tensor, rope_ff,
                     rope_dims, 2, 0, rope_base, 1.0f, 0, 1, 0, 0);  // [hd, kvHeads, NQ]
+                diagnostic(diagnostic_prefix + "kNormRope", k_rope, l);
 
                 // Write the K/V into the persistent cache. Global: linear append of
                 // all N at start_pos. SWA (circular, size = window): only the LAST
@@ -900,9 +997,11 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
             // flash_attn_ext returns [hd, num_heads, NQ, 1] — each column holds all
             // heads contiguously, exactly what the O projection wants.
             ggml_tensor* attn_flat = ggml_reshape_2d(ctx, attn_out, info.qDim, NQ);
+            diagnostic(diagnostic_prefix + "attention", attn_flat, l);
 
             // O projection -> post-attn norm -> residual
             ggml_tensor* o_out = ggml_mul_mat(ctx, lt.o_w, attn_flat);                  // [hidden, N]
+            diagnostic(diagnostic_prefix + "attentionProjected", o_out, l);
             if (tp_mode) tp_partial.push_back(o_out);
             ggml_tensor* post_attn = ggml_mul(ctx, ggml_rms_norm(ctx, o_out, eps), lt.post_attn_norm_w);
             // Normed term FIRST, residual second. ggml-metal fuses the triple
@@ -912,9 +1011,11 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
             // [hidden, N] read+write. Addition is commutative elementwise, so the
             // swap is bit-identical — it is purely which operand ggml sees first.
             ggml_tensor* residual1 = ggml_add(ctx, post_attn, hidden);
+            diagnostic(diagnostic_prefix + "attentionResidual", residual1);
 
             // FFN: norm -> gate_up -> gelu*up -> down -> post_ffn norm -> residual
             ggml_tensor* ffn_normed = ggml_mul(ctx, ggml_rms_norm(ctx, residual1, eps), lt.ffn_norm_w);
+            diagnostic(diagnostic_prefix + "ffnNorm", ffn_normed, l);
             ggml_tensor* ffn_hidden_split = nullptr;
             ggml_tensor* gu = nullptr;
             if (lt.gate_w != nullptr)
@@ -941,9 +1042,11 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
                 ? ffn_hidden_split
                 : ggml_geglu(ctx, gu);                                                  // [ff, N]
             ggml_tensor* down = ggml_mul_mat(ctx, lt.down_w, ffn_hidden);               // [hidden, N]
+            diagnostic(diagnostic_prefix + "ffnActivation", ffn_hidden, l);
             if (tp_mode) tp_partial.push_back(down);
             ggml_tensor* post_ffn = ggml_mul(ctx, ggml_rms_norm(ctx, down, eps), lt.post_ffn_norm_w);
             ggml_tensor* residual2 = ggml_add(ctx, post_ffn, residual1);   // normed first: fuses
+            diagnostic(diagnostic_prefix + "ffnResidual", residual2);
 
             // PLE injection (mirrors Gemma4ModelDecode, batched over the N rows).
             // ple_slice is a strided view of ple_input: column i (row i) at layer l.
@@ -968,6 +1071,7 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
                 residual2 = ggml_scale(ctx, residual2, scalar);
 
             hidden = residual2;
+            diagnostic(diagnostic_prefix + "output", hidden);
         }
 
         // hidden holds NQ columns; only the first N (real) columns are downloaded
@@ -1274,6 +1378,7 @@ TSG_EXPORT int TSGgml_Gemma4ModelVerify(
         if (native_profile)
             sync_backend(g_backend);
         const auto profile_compute_end = profile_now();
+        dump_gemma_diagnostics(diagnostic_directory, diagnostic_tag, diagnostic_tensors);
 
 
         finalize_compute_with_download(hidden_out, hidden_data, static_cast<std::size_t>(hidden_size) * N * sizeof(float));

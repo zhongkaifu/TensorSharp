@@ -335,6 +335,9 @@ if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
     list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_matmul_precision.cu)
     list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_attention_precision.cu)
     list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_q8_precision.cu)
+    list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_f16_streaming.cu)
+    list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_q8_resident_streaming.cu)
+    list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_f16_resident.cu)
     list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_tp_probe.cu)
     list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_host_pin.cu)
     # Wan / Qwen-Image VAE convolutions on cuDNN (see tsg_cuda_cudnn_conv.cu).
@@ -426,12 +429,13 @@ if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
     # normal expf implementation as well as F32 subnormals and IEEE division.
     foreach(TSG_CUDA_SOURCE IN LISTS TSG_GGMLOPS_SOURCES)
         if (TSG_CUDA_SOURCE MATCHES "\\.cu$" AND
-            NOT TSG_CUDA_SOURCE MATCHES "ggml_ops_(matmul|attention|q8)_precision\\.cu$")
+            NOT TSG_CUDA_SOURCE MATCHES "ggml_ops_(matmul|attention|q8)_precision\\.cu$" AND
+            NOT TSG_CUDA_SOURCE MATCHES "ggml_ops_f16_streaming\\.cu$")
             set_property(SOURCE ${TSG_CUDA_SOURCE} APPEND PROPERTY COMPILE_OPTIONS --use_fast_math)
         endif()
     endforeach()
     set_source_files_properties(ggml_ops_matmul_precision.cu ggml_ops_attention_precision.cu
-        ggml_ops_q8_precision.cu PROPERTIES
+        ggml_ops_q8_precision.cu ggml_ops_f16_streaming.cu PROPERTIES
         COMPILE_OPTIONS "--ftz=false;--prec-div=true;--prec-sqrt=true")
 endif()
 target_include_directories(GgmlOps PRIVATE
@@ -474,7 +478,9 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
     if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
         add_test(NAME cuda-q8-streaming COMMAND GgmlOpsQ8StreamingTest)
         add_test(NAME cuda-q8-streaming-singleton COMMAND GgmlOpsQ8StreamingTest --singleton)
-        set_tests_properties(cuda-q8-streaming cuda-q8-streaming-singleton PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
+        add_test(NAME cuda-resident-streaming COMMAND GgmlOpsQ8StreamingTest --resident)
+        add_test(NAME cuda-resident-full-shape COMMAND GgmlOpsQ8StreamingTest --resident-full)
+        set_tests_properties(cuda-q8-streaming cuda-q8-streaming-singleton cuda-resident-streaming cuda-resident-full-shape PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
     endif()
     add_executable(GgmlOpsCacheBudgetTest tests/cache_budget_test.cpp)
     target_include_directories(GgmlOpsCacheBudgetTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")

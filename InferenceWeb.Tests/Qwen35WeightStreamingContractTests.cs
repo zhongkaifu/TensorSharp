@@ -98,6 +98,7 @@ public sealed class Qwen35WeightStreamingContractTests
         Assert.False(model.TryImportRetainedCache("prefix", new MemoryStream()));
         Assert.False(model.TryExportRetainedCache("prefix", new MemoryStream()));
         Assert.Throws<NotSupportedException>(() => model.LoadVisionEncoder("must-not-be-opened.gguf"));
+        Assert.Throws<NotSupportedException>(() => model.LoadDFlashDraftWeights("must-not-be-opened.gguf"));
         Assert.Throws<NotSupportedException>(() => model.SetVisionEmbeddings(null, 0));
     }
 

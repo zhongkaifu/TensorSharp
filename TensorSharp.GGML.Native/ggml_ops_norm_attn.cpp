@@ -2574,7 +2574,8 @@ namespace
         const void* q_data, const void* k_data, const void* v_data, float* out_data,
         int num_heads, int num_kv_heads, int head_dim,
         int seq_len, int kv_len, int kv_stride,
-        int mask_start_pos, int sliding_window, float scale, bool kv_f16)
+        int mask_start_pos, int sliding_window, float scale, bool kv_f16,
+        int padded_kv_len = 0)
     {
         if (!ensure_backend()) return 0;
 
@@ -2588,12 +2589,13 @@ namespace
         auto* ctx = context.value;
 
         const ggml_type kv_type = kv_f16 ? GGML_TYPE_F16 : GGML_TYPE_F32;
+        const int physical_kv_len = padded_kv_len > kv_len ? padded_kv_len : kv_len;
         // flash_attn_ext wants q=[headDim, seqLen, numHeads], k/v=[headDim, kvLen,
         // numKVHeads] — exactly the head-first layout, so no permutes are needed.
         ggml_tensor* q_in = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, seq_len, num_heads);
-        ggml_tensor* k_in = ggml_new_tensor_3d(ctx, kv_type, head_dim, kv_len, num_kv_heads);
-        ggml_tensor* v_in = ggml_new_tensor_3d(ctx, kv_type, head_dim, kv_len, num_kv_heads);
-        ggml_tensor* mask_tensor = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, kv_len, seq_len);
+        ggml_tensor* k_in = ggml_new_tensor_3d(ctx, kv_type, head_dim, physical_kv_len, num_kv_heads);
+        ggml_tensor* v_in = ggml_new_tensor_3d(ctx, kv_type, head_dim, physical_kv_len, num_kv_heads);
+        ggml_tensor* mask_tensor = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, physical_kv_len, seq_len);
         ggml_tensor* attn_result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, num_heads * head_dim, seq_len);
         if (q_in == nullptr || k_in == nullptr || v_in == nullptr ||
             mask_tensor == nullptr || attn_result == nullptr)
@@ -2625,6 +2627,10 @@ namespace
             return 0;
         }
 
+        // Padded keys are masked, but must also contain finite values: zero
+        // attention probability does not make an uninitialized NaN harmless.
+        if (physical_kv_len != kv_len) ggml_backend_buffer_clear(buffer.value, 0);
+
         host_read_barrier();
         ggml_backend_tensor_set(q_in, q_data, 0,
             static_cast<std::size_t>(num_heads) * seq_len * head_dim * sizeof(float));
@@ -2632,8 +2638,8 @@ namespace
         // Upload the leading kvLen rows of each head from the [numKVHeads, kvStride,
         // headDim] cache. Contiguous single upload when the cache is exactly sized.
         const std::size_t kv_elem = kv_f16 ? sizeof(ggml_fp16_t) : sizeof(float);
-        const std::size_t dstHeadElems = static_cast<std::size_t>(kv_len) * head_dim;
-        if (kv_stride == kv_len)
+        const std::size_t dstHeadElems = static_cast<std::size_t>(physical_kv_len) * head_dim;
+        if (kv_stride == kv_len && physical_kv_len == kv_len)
         {
             const std::size_t bytes = static_cast<std::size_t>(num_kv_heads) * dstHeadElems * kv_elem;
             ggml_backend_tensor_set(k_in, k_data, 0, bytes);
@@ -2644,7 +2650,7 @@ namespace
             const auto* kb = static_cast<const unsigned char*>(k_data);
             const auto* vb = static_cast<const unsigned char*>(v_data);
             const std::size_t srcHeadElems = static_cast<std::size_t>(kv_stride) * head_dim;
-            const std::size_t headBytes = dstHeadElems * kv_elem;
+            const std::size_t headBytes = static_cast<std::size_t>(kv_len) * head_dim * kv_elem;
             for (int h = 0; h < num_kv_heads; ++h)
             {
                 const std::size_t srcOff = static_cast<std::size_t>(h) * srcHeadElems * kv_elem;
@@ -2656,7 +2662,7 @@ namespace
 
         // Causal (+ optional sliding-window) additive mask: row q attends key k iff
         // winStart <= k <= mask_start_pos + q.
-        g_prefill_mask_scratch.assign(static_cast<std::size_t>(kv_len) * seq_len, ggml_fp32_to_fp16(0.0f));
+        g_prefill_mask_scratch.assign(static_cast<std::size_t>(physical_kv_len) * seq_len, ggml_fp32_to_fp16(0.0f));
         {
             const ggml_fp16_t neg_inf = ggml_fp32_to_fp16(-INFINITY);
             const ggml_fp16_t zero_val = ggml_fp32_to_fp16(0.0f);
@@ -2664,9 +2670,9 @@ namespace
             {
                 int threshold = mask_start_pos + q_idx;
                 int winStart = (sliding_window > 0) ? std::max(0, threshold - sliding_window + 1) : 0;
-                ggml_fp16_t* row = &g_prefill_mask_scratch[static_cast<std::size_t>(q_idx) * kv_len];
-                for (int kv_idx = 0; kv_idx < kv_len; kv_idx++)
-                    row[kv_idx] = (kv_idx > threshold || kv_idx < winStart) ? neg_inf : zero_val;
+                ggml_fp16_t* row = &g_prefill_mask_scratch[static_cast<std::size_t>(q_idx) * physical_kv_len];
+                for (int kv_idx = 0; kv_idx < physical_kv_len; kv_idx++)
+                    row[kv_idx] = (kv_idx >= kv_len || kv_idx > threshold || kv_idx < winStart) ? neg_inf : zero_val;
             }
         }
         ggml_backend_tensor_set(mask_tensor, g_prefill_mask_scratch.data(), 0,
@@ -2685,6 +2691,219 @@ namespace
         return 1;
     }
 } // anonymous namespace
+
+// Explicit weight-free CUDA flash execution for file-backed model adapters.
+// Unlike the general prefill API this never silently changes to materialized
+// attention. All graph/device buffers belong to this synchronous call.
+TSG_EXPORT int TSGgml_StreamingFlashAttention(
+    const float* q_data, const void* k_data, const void* v_data, float* out_data,
+    int num_heads, int num_kv_heads, int head_dim, int seq_len, int kv_len,
+    int kv_stride, int mask_start_pos, int sliding_window, float scale, int kv_type)
+{
+    try
+    {
+        if (!q_data || !k_data || !v_data || !out_data || num_heads <= 0 || num_kv_heads <= 0
+            || num_heads % num_kv_heads != 0 || head_dim <= 0 || num_heads > std::numeric_limits<int>::max() / head_dim
+            || seq_len <= 0 || kv_len < seq_len
+            || kv_stride < kv_len || mask_start_pos < 0 || mask_start_pos > kv_len - seq_len
+            || sliding_window < 0 || !std::isfinite(scale)
+            || (kv_type != GGML_TYPE_F16 && kv_type != GGML_TYPE_F32))
+        {
+            set_last_error("Invalid streaming flash attention pointers, dimensions, mask or KV dtype.");
+            return 0;
+        }
+        // Match the resident Gemma/Qwen flash geometry for the CUDA 512/576
+        // head kernels, without reading caller memory beyond the valid keys.
+        int padded = kv_len;
+        if (head_dim == 512 || head_dim == 576)
+        {
+            if (kv_len > std::numeric_limits<int>::max() - 255)
+            {
+                set_last_error("Streaming flash attention KV padding overflows.");
+                return 0;
+            }
+            padded = ((kv_len + 255) / 256) * 256;
+        }
+        auto fits_bytes = [](int a, int b, int c, std::size_t bytes)
+        {
+            std::size_t total = static_cast<std::size_t>(a);
+            for (std::size_t factor : {static_cast<std::size_t>(b), static_cast<std::size_t>(c), bytes})
+            {
+                if (total > std::numeric_limits<std::size_t>::max() / factor) return false;
+                total *= factor;
+            }
+            return true;
+        };
+        const std::size_t kv_bytes = kv_type == GGML_TYPE_F16 ? sizeof(ggml_fp16_t) : sizeof(float);
+        if (!fits_bytes(num_heads, seq_len, head_dim, sizeof(float))
+            || !fits_bytes(num_kv_heads, kv_stride, head_dim, kv_bytes)
+            || !fits_bytes(num_kv_heads, padded, head_dim, kv_bytes)
+            || !fits_bytes(seq_len, padded, 1, sizeof(ggml_fp16_t)))
+        {
+            set_last_error("Streaming flash attention byte size overflows.");
+            return 0;
+        }
+        if (!ensure_backend()) return 0;
+        if (g_backend_type != BACKEND_TYPE_CUDA)
+        {
+            set_last_error("Streaming flash attention requires the GGML CUDA backend.");
+            return 0;
+        }
+        const int result = fused_prefill_attn_flash(q_data, k_data, v_data, out_data,
+            num_heads, num_kv_heads, head_dim, seq_len, kv_len, kv_stride,
+            mask_start_pos, sliding_window, scale, kv_type == GGML_TYPE_F16, padded);
+        if (result < 0)
+        {
+            set_last_error("CUDA flash attention does not support the requested streaming geometry.");
+            return 0;
+        }
+        return result;
+    }
+    catch (const std::exception& ex) { set_last_error(ex.what()); return 0; }
+    catch (...) { set_last_error("Unknown streaming flash attention failure."); return 0; }
+}
+
+// Keep Gemma's per-head RMSNorm, scale and NeoX rotation in one graph, just
+// like its resident forward. A standalone norm introduces an extra rounding
+// boundary before CUDA's fused norm/mul/rope kernel. Inputs are activations
+// and small vectors only; this call retains no host pointer or device graph.
+TSG_EXPORT int TSGgml_StreamingNormRoPE(
+    const float* input, const float* norm, const float* freq_factors,
+    float* output, int heads, int head_dim, int tokens, int start_pos,
+    int rope_dims, int freq_count, float eps, float freq_base)
+{
+    try
+    {
+        if (!input || !norm || !output || heads <= 0 || head_dim <= 0 || head_dim % 2 != 0
+            || heads > std::numeric_limits<int>::max() / head_dim || tokens <= 0 || tokens > 65535 || start_pos < 0
+            || start_pos > std::numeric_limits<int>::max() - tokens
+            || rope_dims <= 0 || rope_dims > head_dim || rope_dims % 2 != 0
+            || freq_count < 0 || (freq_factors ? freq_count < rope_dims / 2 : freq_count != 0)
+            || !std::isfinite(eps) || eps <= 0 || !std::isfinite(freq_base) || freq_base <= 0)
+        {
+            set_last_error("Invalid streaming norm/RoPE pointers, dimensions, positions or parameters.");
+            return 0;
+        }
+        const std::size_t row_elements = static_cast<std::size_t>(heads) * head_dim;
+        if (row_elements > std::numeric_limits<std::size_t>::max() / sizeof(float) / tokens)
+        {
+            set_last_error("Streaming norm/RoPE byte size overflows.");
+            return 0;
+        }
+        if (!ensure_backend()) return 0;
+        if (g_backend_type != BACKEND_TYPE_CUDA)
+        {
+            set_last_error("Streaming norm/RoPE requires the GGML CUDA backend.");
+            return 0;
+        }
+        PooledContextHandle context;
+        if (!context.init(3 * 1024 * 1024))
+        {
+            set_last_error("Failed to create streaming norm/RoPE context.");
+            return 0;
+        }
+        auto* ctx = context.value;
+        auto* x = tokens == 1 ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, head_dim, heads)
+            : ggml_new_tensor_3d(ctx, GGML_TYPE_F32, head_dim, heads, tokens);
+        auto* w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, head_dim);
+        auto* p = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, tokens);
+        auto* f = freq_factors ? ggml_new_tensor_1d(ctx, GGML_TYPE_F32, freq_count) : nullptr;
+        auto* normalized = ggml_mul(ctx, ggml_rms_norm(ctx, x, eps), w);
+        // Resident decode has this reshape between norm/mul and RoPE;
+        // prefill does not. Preserve both phase-specific fusion boundaries.
+        if (tokens == 1) normalized = ggml_reshape_3d(ctx, normalized, head_dim, heads, 1);
+        auto* rotated = ggml_rope_ext(ctx, normalized, p, f,
+            rope_dims, 2, 0, freq_base, 1.0f, 0, 1, 0, 0);
+        ggml_set_output(rotated);
+        auto* graph = ggml_new_graph(ctx);
+        ggml_build_forward_expand(graph, rotated);
+        BufferHandle buffer(ggml_backend_alloc_ctx_tensors(ctx, g_backend));
+        if (!buffer.value)
+        {
+            set_last_error("Failed to allocate streaming norm/RoPE activation buffer.");
+            return 0;
+        }
+        const std::size_t bytes = row_elements * tokens * sizeof(float);
+        std::vector<int32_t> positions(tokens);
+        for (int i = 0; i < tokens; ++i) positions[i] = start_pos + i;
+        host_read_barrier();
+        ggml_backend_tensor_set(x, input, 0, bytes);
+        ggml_backend_tensor_set(w, norm, 0, static_cast<std::size_t>(head_dim) * sizeof(float));
+        ggml_backend_tensor_set(p, positions.data(), 0, static_cast<std::size_t>(tokens) * sizeof(int32_t));
+        if (f) ggml_backend_tensor_set(f, freq_factors, 0, static_cast<std::size_t>(freq_count) * sizeof(float));
+        if (tsg::compute_graph(g_backend, graph) != GGML_STATUS_SUCCESS)
+        {
+            sync_backend(g_backend);
+            set_last_error("Streaming norm/RoPE graph execution failed.");
+            return 0;
+        }
+        finalize_compute_with_download(rotated, output, bytes);
+        clear_last_error();
+        return 1;
+    }
+    catch (const std::exception& ex) { set_last_error(ex.what()); return 0; }
+    catch (...) { set_last_error("Unknown streaming norm/RoPE failure."); return 0; }
+}
+
+// Direct norm -> multiply -> add chain, matching the resident Gemma graph.
+// The older general helper flattens both operands before adding, which blocks
+// CUDA's norm/mul/add fusion and introduces an extra rounding boundary.
+TSG_EXPORT int TSGgml_StreamingNormResidual(
+    float* residual, const float* input, const float* norm, int width, int rows, float eps)
+{
+    try
+    {
+        if (!residual || !input || !norm || width <= 0 || rows <= 0 || !std::isfinite(eps) || eps <= 0
+            || static_cast<std::size_t>(width) > std::numeric_limits<std::size_t>::max() / sizeof(float) / rows)
+        {
+            set_last_error("Invalid streaming norm/residual pointers, dimensions or epsilon.");
+            return 0;
+        }
+        if (!ensure_backend()) return 0;
+        if (g_backend_type != BACKEND_TYPE_CUDA)
+        {
+            set_last_error("Streaming norm/residual requires the GGML CUDA backend.");
+            return 0;
+        }
+        PooledContextHandle context;
+        if (!context.init(3 * 1024 * 1024))
+        {
+            set_last_error("Failed to create streaming norm/residual context.");
+            return 0;
+        }
+        auto* ctx = context.value;
+        auto* x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width, rows);
+        auto* r = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, width, rows);
+        auto* w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, width);
+        auto* normalized = ggml_mul(ctx, ggml_rms_norm(ctx, x, eps), w);
+        auto* added = ggml_add(ctx, normalized, r);
+        ggml_set_output(added);
+        auto* graph = ggml_new_graph(ctx);
+        ggml_build_forward_expand(graph, added);
+        BufferHandle buffer(ggml_backend_alloc_ctx_tensors(ctx, g_backend));
+        if (!buffer.value)
+        {
+            set_last_error("Failed to allocate streaming norm/residual activation buffer.");
+            return 0;
+        }
+        const std::size_t bytes = static_cast<std::size_t>(width) * rows * sizeof(float);
+        host_read_barrier();
+        ggml_backend_tensor_set(x, input, 0, bytes);
+        ggml_backend_tensor_set(r, residual, 0, bytes);
+        ggml_backend_tensor_set(w, norm, 0, static_cast<std::size_t>(width) * sizeof(float));
+        if (tsg::compute_graph(g_backend, graph) != GGML_STATUS_SUCCESS)
+        {
+            sync_backend(g_backend);
+            set_last_error("Streaming norm/residual graph execution failed.");
+            return 0;
+        }
+        finalize_compute_with_download(added, residual, bytes);
+        clear_last_error();
+        return 1;
+    }
+    catch (const std::exception& ex) { set_last_error(ex.what()); return 0; }
+    catch (...) { set_last_error("Unknown streaming norm/residual failure."); return 0; }
+}
 
 namespace tsg
 {

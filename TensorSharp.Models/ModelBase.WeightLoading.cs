@@ -43,7 +43,7 @@ namespace TensorSharp.Models
             // whole cold-load time on network-backed model storage.
             ReadBonsaiMetadata();
             if (HasStreamingWeights)
-                _weightStreamingExecutor = new WeightStreamingExecutor(_gguf, WeightStreaming);
+                _weightStreamingExecutor = new WeightStreamingExecutor(_gguf, WeightStreaming, StreamingWeightArithmetic);
             else
                 _gguf.PrefaultFileCache(ShouldPrefaultWeight);
             Console.Write("Loading model weights...");

@@ -21,7 +21,7 @@
     with SIGABRT inside load_aot_module, before any managed code runs. Measured on
     device.
 
-    Names carry no leading underscore: the linker adds one for -u. Native source export manifest; 315 symbols.
+    Names carry no leading underscore: the linker adds one for -u. Native source export manifest; 314 symbols.
   -->
   <ItemGroup Condition="'$(RuntimeIdentifier)' == 'ios-arm64'">
     <ReferenceNativeSymbol Include="TSGgml_ActivationGradF32" SymbolType="Function" />
@@ -277,8 +277,25 @@
     <ReferenceNativeSymbol Include="TSGgml_RegisterQ8F32Weight" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Q8StreamingPayloadBytes" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Q8StreamingCreate" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_Q8StreamingUploadInput" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Q8StreamingExecute" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_Q8StreamingDestroy" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_WeightStreamingPayloadBytes" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_WeightStreamingCreate" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_WeightStreamingPayloadBytesEx" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_WeightStreamingCreateEx" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_WeightStreamingUploadInput" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_WeightStreamingExecute" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_WeightStreamingDestroy" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_ResidentWeightPayloadBytes" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_ResidentWeightCreate" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_ResidentWeightUploadRows" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_ResidentWeightUploadInput" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_ResidentWeightProject" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_ResidentWeightDownload" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_StreamingFlashAttention" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_StreamingNormRoPE" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_StreamingNormResidual" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_ReleaseFusedFfnTpGraphs" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_ReleaseFusedMatmulAddTpGraphs" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_ReleaseReuseComputeBuffers" SymbolType="Function" />

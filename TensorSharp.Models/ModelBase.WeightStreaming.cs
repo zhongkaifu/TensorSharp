@@ -10,10 +10,27 @@ public abstract partial class ModelBase
     private WeightStreamingExecutor _weightStreamingExecutor;
     private bool _streamingForwardFailed;
     protected bool HasStreamingWeights => WeightStreaming != null;
+    // Match each model's ordinary projection policy: dense Qwen deliberately
+    // keeps F32 activations, while Gemma uses the resident CUDA dispatch rules.
+    protected virtual GgmlWeightStreamingArithmetic StreamingWeightArithmetic
+        => GgmlWeightStreamingArithmetic.FullPrecision;
 
     /// <summary>Available only when explicit file-backed weight execution is enabled.
     /// These counters exclude ordinary model activations, KV and native graph caches.</summary>
     public WeightStreamingStatistics? StreamingWeightUsage => _weightStreamingExecutor?.Statistics;
+
+    /// <summary>Read only the requested rows of any file-backed embedding table,
+    /// including per-layer embeddings. The caller owns and releases the output.</summary>
+    protected unsafe void ExecuteStreamedEmbedding(Tensor result, QuantizedWeight weight, int[] tokens)
+    {
+        ArgumentNullException.ThrowIfNull(tokens);
+        if (_weightStreamingExecutor == null) throw new InvalidOperationException("The weight streaming owner has been disposed.");
+        if (!weight.IsStreamed || result.DimensionCount != 2 || result.Sizes[0] != tokens.Length ||
+            result.Sizes[1] != weight.Ne0 || result.ElementType != DType.Float32 || !result.IsContiguous())
+            throw new ArgumentException("Streamed embedding requires a compatible contiguous Float32 output matrix.");
+        _weightStreamingExecutor.Embedding(weight, tokens, (IntPtr)GetFloatPtr(result));
+        InvalidateTensorDeviceCache(result);
+    }
 
     private void ThrowIfStreamingStateFailed()
     {
@@ -21,6 +38,9 @@ public abstract partial class ModelBase
             throw new InvalidOperationException("A streamed forward failed after model state may have changed. " +
                 "ResetKVCache and replay the request before forwarding again, or dispose the model.");
     }
+
+    private void ReleaseStreamingWorkspaceForReset()
+        => _weightStreamingExecutor?.ResetForReplay();
 
     protected void ExecuteQuantizedLinear(Tensor result, Tensor input, QuantizedWeight weight)
     {

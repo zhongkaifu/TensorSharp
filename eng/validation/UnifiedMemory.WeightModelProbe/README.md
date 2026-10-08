@@ -1,11 +1,22 @@
-# Real Qwen35 file-backed weight execution
+# Real file-backed model execution
 
-This .NET 10 CUDA probe compares an ordinary resident dense Qwen35 Q8_0 model
-against the explicit `WeightStreamingOptions` model adapter. The candidate reads
-original GGUF file regions through a bounded host buffer and evaluates each
-projection in synchronous output-row tiles. It does not preload or concatenate
-whole quantized weights, expose a weight pointer to cached graphs, or mmap the
-checkpoint. Embeddings read only the requested rows.
+This .NET 10 CUDA probe compares an ordinary resident model against its explicit
+`WeightStreamingOptions` adapter. It accepts dense Qwen35 Q8_0 and dense Gemma4
+Q8_0 with an optional F16 `per_layer_model_proj.weight`. Original GGUF regions
+are read through a bounded host buffer; embeddings read only requested rows.
+Gemma's fused QKV and gate/up matrices are logical file-source concatenations,
+without a full host copy or mmap. No temporary weight pointer enters cached
+model graphs.
+
+Qwen uses F32 activation arithmetic in synchronous output-row tiles. Gemma
+preserves the pinned resident CUDA arithmetic: Q8 matrix batches above eight
+tokens and F16 batches above sixteen temporarily stage one complete logical
+projection on the GPU. Its full weights, input, output and arithmetic scratch
+are charged before allocation and released after projection. Original M/N
+determine MMQ stream-K and cuBLAS reduction order; shrinking them introduced
+small differences that later quantization amplified. Smaller Gemma batches use
+row tiles with resident MMVQ/MMVF/MMF arithmetic. These policies support NVIDIA
+Ampere, Ada and Hopper; other hardware and arithmetic overrides may be refused.
 
 Build against unchanged upstream ggml and the TensorSharp native streaming
 operator, then copy the matching native library beside the probe:
@@ -39,9 +50,11 @@ EOS fails rather than counting an empty answer as a pass.
 By default the streamed model loads, runs both prompts and disposes twice,
 reusing the same independent references. Each cycle must return its budget to
 zero. With a test-enabled native build, optional counters also require the
-GDN chunked graph cache to become nonempty during execution and both GDN graph
-caches to return to zero after disposal. Missing test hooks are reported as
-unavailable. The process explicitly shuts down its owned backend before exit.
+Qwen GDN chunked graph cache to become nonempty during execution and both GDN
+graph caches to return to zero after disposal. Gemma does not use these caches:
+its zero counters do not establish populated-cache lifecycle coverage. Missing
+test hooks are reported as unavailable. The process explicitly shuts down its
+owned backend before exit.
 
 The report verifies actual file reads, repeated operator tiles, embedding row
 reads, host/device payload peaks below their configured budgets, no full-weight
@@ -53,14 +66,17 @@ after refusal, the model must reject another forward until `ResetKVCache`
 succeeds. The subsequent parity cases verify recovery. These checks require a
 real supported checkpoint and CUDA device.
 
-The initial adapter supports dense `qwen35`, single-rank GGML CUDA, Q8_0
-projection/embedding matrices and text-only inference. It rejects MoE, MTP,
+Both adapters support single-rank GGML CUDA and sequential text inference.
+Gemma additionally requires F16 or F32 KV storage. They reject MoE, MTP,
 external draft models, speculation (including N-gram), tensor parallelism, layer splitting, other backends and
-other matrix encodings. Small named F32 normalization and GDN parameters remain
+unsupported matrix encodings. Small named F32 normalization, PLE and GDN parameters remain
 resident: at most 1 MiB each and 32 MiB total, with their actual bytes reported.
 
-The shared budget covers the quantized-weight staging buffer, temporary host
-output tile, and native streamed CUDA input/weight/output workspace. Resident
+The shared budget covers the file-read buffer, temporary host output tile, and
+native streamed CUDA input/weight/output workspace, including quantization,
+padding, reduction fixup and explicit cuBLAS workspace. The current full-shape
+F16 implementation includes two temporary device copies of its weight matrix;
+both are charged. Resident
 small parameters, model activations, attention/GDN state, other native caches,
 backend allocator pools, driver/runtime memory and the OS file cache remain
 outside that scope. This is a bounded weight-execution check, not a cap on total
@@ -89,3 +105,51 @@ capacity is too small. The same-host short comparison reduced logical reads by
 not establish a decode, cold-storage or production-throughput improvement.
 Exact results, binary identities and unavailable scenarios are recorded in the
 [design validation section](../../../docs/design/unified-memory.zh-CN.md#14-验证与本次证据).
+
+Gemma E4B example using an existing local checkpoint (8.03 GB, Q8_0/F16):
+
+```powershell
+dotnet eng/validation/UnifiedMemory.WeightModelProbe/bin/Release/net10.0/UnifiedMemory.WeightModelProbe.dll `
+  --model C:/Works/models/gemma-4-E4B-it-uncensored-Q8_0.gguf `
+  --json artifacts/unified-memory/gemma-e4b.json `
+  --steps 16 --prompt-tokens 640 --cycles 2 `
+  --tile-bytes 16777216 --token-rows 32 `
+  --host-bytes 33554432 --device-bytes 268435456
+```
+
+The device minimum depends on the original matrix and full prompt shape. A
+small `--token-rows` bounds host transfers; it cannot eliminate Gemma's full
+device workspace. An insufficient shared budget refuses execution without
+falling back to a different arithmetic policy. `CompleteMatrixProjections`
+counts these projections; `LinearTiles` counts uploaded weight tiles (or
+projected tiles in the row-tiled path).
+
+Use `--prefill refill --prefill-chunk 256` to exercise public
+`ModelBase.ForwardRefill` chunking on both arms. The default is `Forward`;
+model refill chunks and weight-transfer token tiles are independent. With a
+minimum prompt longer than 512, Gemma exercises sliding-window eviction and KV
+sharing. Only completed strict-gate comparisons count as validation.
+
+On the RTX 3080 Laptop, the E4B checkpoint above passed both Forward and
+256-token ForwardRefill with two 645-token prompts, 16 vocabulary rows each,
+and two load/dispose cycles: 128 rows / 33,554,432 logits were byte-exact.
+These forced-streaming runs achieved about 88 / 48 prefill tokens/s respectively
+and 0.48 decode tokens/s, substantially below resident execution. The budget
+covers weight payload, not the whole process or all GPU memory.
+
+To compare file tiles, keep `--host-bytes 134217728 --device-bytes 268435456`,
+`--steps 4 --prompt-tokens 32 --cycles 1`, and run `--tile-bytes` in order
+`16777216, 67108864, 67108864, 16777216`, with a distinct JSON path per process.
+The measured 36-token prompts were byte-exact for all four runs. A 64 MiB tile
+reduced upload tile counts but increased host payload; the mean Forward time
+was 3.54% lower, with overlapping timing ranges and only two runs per setting.
+This does not establish a stable speedup or justify changing the global default.
+See the design document for separate timing, memory, binary and failure records.
+
+For arithmetic localization, set `TS_GEMMA4_TENSOR_DUMP` to an ignored output
+directory and optionally `TS_GEMMA4_TENSOR_DUMP_LAYERS` (default 6). Compare
+matching F32 snapshots using `eng/validation/compare-gemma-streaming-tensors.py`.
+The optional snapshots pin native fusion-boundary tensors and synchronize
+streamed intermediates. They are diagnostic runs, not performance measurements.
+The JSON records diagnostic/fusion overrides and each returned Forward call,
+including a call whose subsequent strict comparison failed.

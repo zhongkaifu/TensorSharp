@@ -6,9 +6,11 @@ using TensorSharp.Memory;
 
 namespace TensorSharp.Models;
 
-/// <summary>Opt-in bounded Q8_0 weight reads and CUDA linear workspaces. The shared
+/// <summary>Opt-in bounded file-weight reads and CUDA linear workspaces. Supported
+/// weight formats depend on the model adapter. The shared
 /// budget covers the weight staging buffer and each streamed linear's device input,
-/// weight tile and output tile. Existing model activations, live KV, small resident
+/// weight/output staging and arithmetic scratch. Some adapters require a complete
+/// temporary device matrix to preserve the resident reduction order. Existing model activations, live KV, small resident
 /// parameters, driver/runtime allocations and the OS file cache are not covered.</summary>
 public sealed class WeightStreamingOptions
 {
@@ -39,12 +41,14 @@ public sealed class WeightStreamingOptions
     /// as separate copies. The initial model adapter supports one CUDA rank.</summary>
     public IReadOnlyList<string> DevicePools { get; }
     public int TileBytes { get; }
-    /// <summary>Maximum tokens sharing a weight tile. The planner reduces this
-    /// when the remaining shared capacity cannot hold the input/output workspace.</summary>
+    /// <summary>Maximum tokens in a host transfer or tiled projection. The planner
+    /// may reduce it to fit shared capacity. Resident-compatible matrix arithmetic
+    /// can additionally require a charged device workspace for the full logical N.</summary>
     public int TokenTileRows { get; }
 }
 
 /// <summary>Payload and I/O counters, not process RSS or total CUDA consumption.</summary>
 public readonly record struct WeightStreamingStatistics(long FileBackedWeightBytes,
     long FileBytesRead, long LinearTiles, long EmbeddingRows, long PeakHostStagingBytes,
-    long PeakDeviceWorkspaceBytes);
+    long PeakDeviceWorkspaceBytes, long DeviceSessionCreations = 0, long InputUploads = 0,
+    long CompleteMatrixProjections = 0);
