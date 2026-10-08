@@ -36,6 +36,18 @@ bool parallel_small_batch_enabled() {
     return enabled;
 }
 
+int prefill_tile_columns() {
+    static const int columns = [] {
+        const char * value = std::getenv("TS_GGML_Q8_PREFILL_TILE");
+        const int selected = value && std::strcmp(value, "128") == 0 ? 128
+            : value && std::strcmp(value, "64") == 0 ? 64 : 32;
+        if (selected != 32)
+            std::fprintf(stderr, "[q8-f32] Experimental K-ordered prefill column tile selected: %d.\n", selected);
+        return selected;
+    }();
+    return columns;
+}
+
 // One full warp per output row. The decoded Q8 product and F32 activation are
 // unchanged; the lane sums and five shuffle additions deliberately use a new
 // reduction order. No atomics, staging allocation or input narrowing. A final
@@ -209,6 +221,10 @@ int tsg_matmul_q8_cuda_launch(const void * weights, const void * input, float * 
     else if (columns <= 8) launch<8>(weights, input, output, inner, rows, columns,
         weight_stride, input_inner_stride, input_column_stride, stream);
     else if (columns <= 16) launch<16>(weights, input, output, inner, rows, columns,
+        weight_stride, input_inner_stride, input_column_stride, stream);
+    else if (columns >= 128 && prefill_tile_columns() == 128) launch<128>(weights, input, output, inner, rows, columns,
+        weight_stride, input_inner_stride, input_column_stride, stream);
+    else if (columns >= 64 && prefill_tile_columns() >= 64) launch<64>(weights, input, output, inner, rows, columns,
         weight_stride, input_inner_stride, input_column_stride, stream);
     else launch<32>(weights, input, output, inner, rows, columns,
         weight_stride, input_inner_stride, input_column_stride, stream);

@@ -125,6 +125,7 @@ finally
         WeightFusionCopies = Environment.GetEnvironmentVariable("TS_WEIGHT_FUSION_COPIES"),
         Q8ParallelVector = Environment.GetEnvironmentVariable("TS_GGML_Q8_PARALLEL_VECTOR"),
         Q8ParallelSmallBatch = Environment.GetEnvironmentVariable("TS_GGML_Q8_PARALLEL_SMALL_BATCH"),
+        Q8PrefillTile = Environment.GetEnvironmentVariable("TS_GGML_Q8_PREFILL_TILE"),
         GgmlRevision = Environment.GetEnvironmentVariable("TS_VALIDATION_GGML_REVISION"),
         Device = Environment.GetEnvironmentVariable("TS_VALIDATION_DEVICE"),
         Runs = runs, Warmups = warmups, SerialControl = serialControl,

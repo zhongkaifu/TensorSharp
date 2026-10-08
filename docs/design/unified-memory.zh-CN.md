@@ -447,6 +447,14 @@ Qwen0.8B 的 context=8192、prompt=1024/2048/4096/6000、batch=2/3/4、32 步 ma
 
 预填充的另一独立研究工具 `GgmlOpsQ8PrefillBench` 使用实际预算约束的 F32 权重行 tile 和 pedantic SGEMM。stride/tail/canary/精确准入及少一字节拒绝检查通过，但 K=1024/M=7168/N=643 的部分较快 tile 仍超出原绝对误差门槛，未进入生产。v5 对旧串行控制也应用同一门槛，发现 527 抽样中有 2 项失败（relative L2 约 8.56e-7），因此现有实现不能当作精确 oracle。失败保持退出 1、原日志保留，没有放宽门槛或将较小的相对误差当作全部通过。scratch owner 清理后归零；范围和排除项见 `eng/validation/README-q8-prefill.md`。
 
+另一条保持原逐 K FMA 次序的预填充实验仅扩大 CTA 内复用的列 tile，以 `TS_GGML_Q8_PREFILL_TILE=64/128` 显式开启；默认仍为 32，不新增全局权重副本或 payload。native `4ae03489d078b7f971dfdd3113477f9cfdfce5c75ee4a7ad1a237e60283b3f8c` 的默认/vector/small-batch/两种 prefill tile 五组 CUDA 检查、CPU 96×2 均通过。Qwen0.8B 六进程按 32/64/128/128/64/32 运行，每组排除 warmup 后六次测量，完整 logits 与 token 历史全部相同，进程及 shutdown 均成功。prefill 中位 **1988.08/2346.67/2549.06 tokens/s**（64 列 +18.0%、128 列 +28.2%），decode **178.61/175.78/171.85** 且区间重叠；后者下降照实保留。测试期间无并发构建或推理，但未锁频，且此前图像测试已使设备升温。它不改变原算子的数值误差，也不能将前述独立 FP64 诊断失败改记为通过；绝对 prefill 性能仍不及独立基线。完整严格比较在 `q8-prefill-tiles-v1/comparison.json`。
+
+此 native 的两条 FullPrecision streaming 原生入口在启用 vector/small-batch 时通过；这些短列用例未覆盖大列 tile。另一次实际 Qwen file-refill 覆盖 prefill 选择和预算读取：两段各 165 tokens、refill64、各 4 个完整 logits 行，host/device 各 64 MiB、tile8 MiB、token rows128；relative L2 最大 **0.0008688620**、cosine 最低 **0.9999996592**，所有 top1 一致，原门槛通过。host/device staging 峰值 **18,350,080/8,519,680 bytes**，实际提前读取 **256 次**，压力/reset 后正常恢复且最终预算归零。该探针使用先前合格的 Models `4f264ce3…` 和新 native，身份已记录，不冒充所有托管程序集均为当前构建。证据在 `q8-prefill-stream-v1/`。
+
+Gemma Q4 的追加 FF7 请求提高 context/max-new 至 4096/3072，TensorSharp **1152 tokens**、独立 llama **1177 tokens** 均自然 EOS、无明显后缀循环。它们仍有译名、ATB/作品分类等内容错误，因此不计严格质量通过，也没有修复原 IQ2 文件的重复。记录在 `gemma-q4-k-m/*long-v1*`。
+
+图像独立对照从 clean stable-diffusion.cpp `3f8527a46c54ecf4cb4ed6003da8e8982283c73c` 构建，并显式使用 unchanged ggml `ffa4e8b…`，未采用该项目的修改版 ggml；CUDA graphs 关闭。相同组件、prompt、40 steps、seed42、CFG1、匹配 sigma 的 512² 编辑同样损坏副标题。追加 **1152×768**、接近原图比例的两引擎编辑可辨识人物、服饰、晴空和标题，但英文副标题仍有字符错误，均不计保留全部文字通过。TensorSharp 观察 wall 117.09 s、峰值 RSS 13.85 GB、采样全设备 VRAM 8603 MiB；独立参考 147.30 s、RSS 1.54 GB、VRAM 14562 MiB，并实际发生 VAE OOM 后 spatial tiling 恢复。二者参考图插值不同、参考有 fallback，且 TensorSharp 初始化期间有短 CPU 构建，不能将此单次时间当作性能胜出证明。RSS、private commit 与采样 VRAM 也不混算为同一预算。原图和未修改输出的严格人工检查在 `artifacts/multimodal-local-runs/image-edit-banner-{sd-upstream,1152}-v1/visual-assessment.json`。
+
 Qwen Image 2.1 还执行了真实 banner 编辑，源图 1253×836，conditioning 640×416，输出 512²、40 steps，native `4bd1fbae…`，进程退出零。人物/服装/姿态保留及明亮蓝天修改通过局部视觉检查，TensorSharp 标题正确，但英文副标题明显乱码，故整项严格语义检查 **失败**。37.063 秒 wall、33.722 秒模型阶段只是一例观测，不作为性能验收。原始图、提示、组件身份与失败判断保留在忽略的 `artifacts/multimodal-local-runs/image-edit-banner-v1/`；此前完整 512² 生图的 native 也是 4BD，F612 只对应较早 256² smoke，不混淆其验证范围。
 
 ## 15. 后续实际接入与硬件验证入口

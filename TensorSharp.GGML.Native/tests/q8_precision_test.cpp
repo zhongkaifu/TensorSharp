@@ -19,6 +19,7 @@
 namespace {
 bool parallel_vector = false;
 bool parallel_small_batch = false;
+int prefill_tile = 32;
 bool parallel_columns(int columns) { return (parallel_vector && columns == 1) || (parallel_small_batch && columns >= 2 && columns <= 8); }
 enum class pattern { random, residual, large, subnormal, non_power_scale, decoded_weight_residual, long_cancellation };
 
@@ -330,6 +331,14 @@ void run(ggml_backend_t allocator, ggml_backend_t backend) {
         c.inner = 32; c.rows = 3; c.columns = columns;
         execute(c);
     }
+    if (prefill_tile != 32) {
+        for (int columns : {63, 64, 65, 127, 128, 129, 256, 643}) {
+            test_case c;
+            c.inner = 384; c.rows = 129; c.columns = columns;
+            c.padded = c.interleaved = true; c.data = pattern::non_power_scale;
+            execute(c);
+        }
+    }
     // Exact fixtures reject activation quantization/narrowing and CUDA FTZ.
     for (pattern data : {pattern::residual, pattern::large, pattern::subnormal, pattern::decoded_weight_residual}) {
         for (int columns : {1, 9, 33}) {
@@ -354,8 +363,9 @@ void run(ggml_backend_t allocator, ggml_backend_t backend) {
     test_case c;
     c.inner = 384; c.rows = 73; c.columns = 1; c.target_column = 0;
     const auto reference = execute(c);
-    for (int columns : {2, 8, 9, 16, 17, 33, 65}) {
+    for (int columns : {2, 8, 9, 16, 17, 33, 65, 128, 129, 643}) {
         if (columns == 2 && !parallel_vector) continue;
+        if (columns >= 128 && prefill_tile == 32) continue;
         c.columns = columns;
         for (int position : {0, columns - 1}) {
             c.target_column = position;
@@ -425,15 +435,20 @@ void check_parallel_underflow(ggml_backend_t allocator, int columns) {
 
 int main(int argc, char ** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
-    require(argc == 1 || (argc == 2 && (std::string(argv[1]) == "--parallel-vector" || std::string(argv[1]) == "--parallel-small-batch")), "Unexpected Q8 precision arguments");
-    parallel_vector = argc == 2;
+    require(argc == 1 || (argc == 2 && (std::string(argv[1]) == "--parallel-vector" || std::string(argv[1]) == "--parallel-small-batch"
+        || std::string(argv[1]) == "--prefill-64" || std::string(argv[1]) == "--prefill-128")), "Unexpected Q8 precision arguments");
+    parallel_vector = argc == 2 && (std::string(argv[1]) == "--parallel-vector" || std::string(argv[1]) == "--parallel-small-batch");
     parallel_small_batch = argc == 2 && std::string(argv[1]) == "--parallel-small-batch";
+    if (argc == 2 && std::string(argv[1]) == "--prefill-64") prefill_tile = 64;
+    if (argc == 2 && std::string(argv[1]) == "--prefill-128") prefill_tile = 128;
 #ifdef _WIN32
     require(_putenv_s("TS_GGML_Q8_PARALLEL_VECTOR", parallel_vector ? "1" : "0") == 0, "Cannot configure Q8 test arithmetic");
     require(_putenv_s("TS_GGML_Q8_PARALLEL_SMALL_BATCH", parallel_small_batch ? "1" : "0") == 0, "Cannot configure Q8 batch arithmetic");
+    require(_putenv_s("TS_GGML_Q8_PREFILL_TILE", std::to_string(prefill_tile).c_str()) == 0, "Cannot configure Q8 prefill tile");
 #else
     require(setenv("TS_GGML_Q8_PARALLEL_VECTOR", parallel_vector ? "1" : "0", 1) == 0, "Cannot configure Q8 test arithmetic");
     require(setenv("TS_GGML_Q8_PARALLEL_SMALL_BATCH", parallel_small_batch ? "1" : "0", 1) == 0, "Cannot configure Q8 batch arithmetic");
+    require(setenv("TS_GGML_Q8_PREFILL_TILE", std::to_string(prefill_tile).c_str(), 1) == 0, "Cannot configure Q8 prefill tile");
 #endif
     std::printf("Q8 test arithmetic: %s\n", parallel_vector ? "experimental parallel-K vector; serial prefill" : "qualified K-ordered");
     if (parallel_small_batch) std::puts("Q8 test arithmetic: experimental parallel-K small batches N=2..8.");

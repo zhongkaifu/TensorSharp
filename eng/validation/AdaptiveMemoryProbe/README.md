@@ -263,3 +263,33 @@ under `qwen-llama-throughput-comparison-v2`. The earlier v1 client rejected the
 server's duplicate `none,none` speculation serialization; that trial is retained
 as failed evidence. The successful v2 run restarted the server and still rejects
 every active speculation type.
+
+The later Q8 prefill experiment uses inherited `TS_GGML_Q8_PREFILL_TILE=64` or
+`128`; unset/`32` preserves the default. N below the selected tile falls back
+to a smaller tile. All outputs retain their original K-increasing F32 FMA
+order. The experiment reuses decoded weights across more activation columns
+within a CTA; it increases register/shared-memory use without a global weight
+expansion or extra payload allocation. It remains opt-in pending wider device,
+shape and mixed-request performance coverage.
+
+Run six fresh processes in order 32/64/128/128/64/32, with
+`TS_GGML_Q8_PARALLEL_VECTOR=1`, `TS_GGML_Q8_PARALLEL_SMALL_BATCH=0`, identical
+native/managed files, capture off, one warmup and three measured requests each.
+Pass their `run-bounded-probe.py` execution records to
+`compare-prefill-tiles.py --executions <six execution.json paths> --output <json>`.
+The comparator requires distinct process lifetimes, the actual native selection
+logs, unchanged other settings, full raw-logit/token equality and valid timing
+denominators. Its CPU regressions are in `test_prefill_tile_comparison.py`.
+
+The first local Qwen0.8B run with the same 643-token fixture and 64 prediction
+rows had prefill medians 1988.08 / 2346.67 / 2549.06 tokens/s for 32/64/128,
+with six measurements each. All complete logits were byte-identical. Decode
+medians were 178.61 / 175.78 / 171.85, with overlapping ranges; the reduction
+is retained rather than attributed away. This is an approximately 28.2% prefill
+gain for the largest tile, still well below the earlier independent 8792.20
+baseline. No concurrent inference/build ran during this comparison, but clocks
+were not locked and earlier image tests had heated the device. This is not a
+statistical performance guarantee or an independent mathematical oracle.
+Native SHA: `4ae03489d078b7f971dfdd3113477f9cfdfce5c75ee4a7ad1a237e60283b3f8c`;
+upstream ggml is unchanged at `ffa4e8b80930029a35991f94e7c8a93cd67730ab`.
+Evidence: ignored `artifacts/unified-memory-adaptive/q8-prefill-tiles-v1/`.
