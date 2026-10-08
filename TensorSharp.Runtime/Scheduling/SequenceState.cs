@@ -6,6 +6,7 @@
 // TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using System.Threading;
 using TensorSharp.Runtime.Paged;
 
@@ -162,7 +163,18 @@ namespace TensorSharp.Runtime.Scheduling
         internal void BindGenerationVocabulary(ITokenizer? tokenizer)
         {
             var suppressed = tokenizer?.SuppressedTokenIds;
+            // No exclusions is the original contract, whether represented by
+            // null or an empty collection. Binding it must not discard a token
+            // already sampled on the device, including during failed-batch
+            // recovery, or restart the sequence's seeded sampler.
+            if (suppressed?.Count == 0) suppressed = null;
             if (ReferenceEquals(_modelSuppressedTokens, suppressed)) return;
+            if (_modelSuppressedTokens != null && suppressed != null
+                && _modelSuppressedTokens.SequenceEqual(suppressed))
+            {
+                _modelSuppressedTokens = suppressed;
+                return;
+            }
             _modelSuppressedTokens = suppressed;
             CachedSampler = null;
             PendingDeviceToken = null;

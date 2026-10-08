@@ -134,6 +134,39 @@ public sealed class ModelTokenSuppressionTests
     }
 
     [Fact]
+    public void EmptyOrEquivalentContractPreservesPendingDeviceTokenAndSamplerState()
+    {
+        var sequence = new SequenceState("stable-contract", new[] { 0 }, 3, 4,
+            new SamplingConfig { Temperature = 1, Seed = 17 });
+        var original = sequence.GetOrCreateSampler();
+        sequence.PendingDeviceToken = 2;
+        sequence.PendingDevicePosition = 4;
+        var tokenizer = new BpeTokenizer(["a", "b", "c"], [1, 1, 1], [], -1, [], false, false);
+        sequence.BindGenerationVocabulary(tokenizer);
+        sequence.BindGenerationVocabulary(null);
+        Assert.Same(original, sequence.GetOrCreateSampler());
+        Assert.Equal(2, sequence.PendingDeviceToken);
+        Assert.Equal(4, sequence.PendingDevicePosition);
+
+        sequence.BindGenerationVocabulary(new BpeTokenizer(["a", "b", "c"], [1, 1, 1], [], -1, [], false, false)
+            { SuppressedTokenIds = new[] { 1 } });
+        Assert.Null(sequence.PendingDeviceToken);
+        var restricted = sequence.GetOrCreateSampler();
+        Assert.NotSame(original, restricted);
+        sequence.PendingDeviceToken = 2;
+        sequence.BindGenerationVocabulary(new BpeTokenizer(["a", "b", "c"], [1, 1, 1], [], -1, [], false, false)
+            { SuppressedTokenIds = new[] { 1 } });
+        Assert.Same(restricted, sequence.GetOrCreateSampler());
+        Assert.Equal(2, sequence.PendingDeviceToken);
+
+        // Removing exclusions changes the distribution and still invalidates
+        // the old pending draw; only semantically unchanged bindings are inert.
+        sequence.BindGenerationVocabulary(tokenizer);
+        Assert.Null(sequence.PendingDeviceToken);
+        Assert.NotSame(restricted, sequence.GetOrCreateSampler());
+    }
+
+    [Fact]
     public async Task EngineUsesModelContractOnEveryStepWithoutRepetitionPenalties()
     {
         using var model = new SuppressionModel();
