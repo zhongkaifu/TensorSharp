@@ -60,6 +60,10 @@ long? deviceBudgetBytes = options.TryGetValue("device-budget-bytes", out string?
     ? long.Parse(budgetText, System.Globalization.CultureInfo.InvariantCulture) : null;
 if (deviceBudgetBytes.HasValue && (deviceBudgetBytes.Value <= 0 || backend != BackendType.GgmlCuda))
     throw new ArgumentException("--device-budget-bytes requires a positive capacity and ggml_cuda.");
+long? trimTargetBytes = options.TryGetValue("trim-target-bytes", out string? trimText)
+    ? long.Parse(trimText, System.Globalization.CultureInfo.InvariantCulture) : null;
+if (trimTargetBytes.HasValue && (trimTargetBytes.Value < 0 || !host || backend != BackendType.GgmlCuda))
+    throw new ArgumentException("--trim-target-bytes requires a nonnegative target and host expert placement on CUDA.");
 MemoryBudget? sharedBudget = null;
 GgmlCacheBudgetScope? cacheScope = null;
 ModelBase? model = null;
@@ -71,6 +75,7 @@ string? observedNativePath = null;
 string? observedNativeHash = null;
 var cleanupErrors = new List<string>();
 var budgetObservations = new List<object>();
+var trimObservations = new List<object>();
 var rowCaptures = new List<object>();
 FileStream? logitsStream = null;
 string? logitsPath = null;
@@ -128,6 +133,7 @@ void WriteEvidence(bool complete)
     node["device_budget_bytes"] = deviceBudgetBytes;
     node["budget_scope"] = deviceBudgetBytes.HasValue ? "rank0 cache, preload, and explicitly routed graph buffers; not all driver/host/KV allocations" : "disabled";
     node["budget_observations"] = JsonSerializer.SerializeToNode(budgetObservations);
+    node["trim_observations"] = JsonSerializer.SerializeToNode(trimObservations);
     node["logit_captures"] = JsonSerializer.SerializeToNode(new { format = "f32le", data_path = logitsPath,
         index_path = logitsIndexPath, rows = rowCaptures });
     node["error"] = failure;
@@ -218,6 +224,9 @@ if (prompt.Length == 0 || prompt.Any(token => token < 0 || token >= model.Tokeni
     throw new ArgumentException("Prompt must contain valid vocabulary token IDs.");
 if (prompt.Length + decode > int.Parse(Environment.GetEnvironmentVariable("MAX_CONTEXT")!))
     throw new ArgumentException("Prompt plus generation exceeds --max-context.");
+bool requireAllCache = Number("require-all-cache", 0, 0) != 0;
+if (requireAllCache && (!host || backend != BackendType.GgmlCuda || prompt.Length > 8))
+    throw new ArgumentException("--require-all-cache requires all-host experts on CUDA with a 1..8 token prefill.");
 if (options.TryGetValue("prompt-tokens-output", out string? tokenOutput))
 {
     Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(tokenOutput))!);
@@ -230,8 +239,26 @@ var statsBeforeTimedWork = backend == BackendType.GgmlCuda ? Qwen4ExpExpertCache
 string? referenceHash = null;
 float[]? finalLogits = null;
 int[]? finalGenerated = null;
+long expectedCachedRows = 0;
 for (int i = -warmups; i < iterations; i++)
 {
+    if (i >= 0 && trimTargetBytes.HasValue)
+    {
+        // Quiescent between requests; preserve the model and every KV/graph owner.
+        // Capture all logits to compare cold refills and warm decode afterwards.
+        var before = Qwen4ExpExpertCacheScenario.CacheStats();
+        var trimTimer = Stopwatch.StartNew();
+        long released = GgmlBasicOps.TrimHostMoeExpertCache(trimTargetBytes.Value);
+        trimTimer.Stop();
+        var after = Qwen4ExpExpertCacheScenario.CacheStats();
+        if (after.ReservedBytes > trimTargetBytes.Value || before.ReservedBytes - after.ReservedBytes != released
+            || before.Calls != after.Calls || before.Hits != after.Hits || before.Misses != after.Misses)
+            throw new InvalidOperationException("Expert-cache trim changed counters or failed its release target.");
+        trimObservations.Add(new { iteration = i, target_bytes = trimTargetBytes.Value, released_bytes = released,
+            milliseconds = trimTimer.Elapsed.TotalMilliseconds, before, after });
+        ObserveBudget($"iteration-{i}-after-expert-trim");
+        WriteEvidence(false);
+    }
     model.ResetKVCache();
     var timer = Stopwatch.StartNew();
     float[] logits = model.ForwardRefill(prompt);
@@ -275,6 +302,7 @@ for (int i = -warmups; i < iterations; i++)
         }
     }
     timer.Stop();
+    expectedCachedRows = checked(expectedCachedRows + (long)(prompt.Length + forwardSteps) * model.Config.NumLayers);
     ObserveBudget($"iteration-{i}-decode-complete");
     if (logits.Length == 0 || logits.Any(v => !float.IsFinite(v)))
         throw new InvalidOperationException("The benchmark returned empty or nonfinite final logits.");
@@ -305,6 +333,9 @@ if (backend == BackendType.GgmlCuda)
     if (host && Number("require-cache", 0, 0) != 0 && !(stats.Calls > statsBeforeTimedWork.Calls
         && hasReuse && stats.Misses > statsBeforeTimedWork.Misses))
         throw new InvalidOperationException("Expert cache did not engage and reuse selected weights.");
+    if (requireAllCache && stats.Calls - statsBeforeTimedWork.Calls != expectedCachedRows)
+        throw new InvalidOperationException($"Not every expert row used the cache: expected {expectedCachedRows}, " +
+            $"observed {stats.Calls - statsBeforeTimedWork.Calls}. Some rows fell back or were unaccounted.");
 }
 using var process = Process.GetCurrentProcess();
 process.Refresh();
@@ -330,6 +361,8 @@ completedReport = new
     managed_bytes = GC.GetTotalMemory(false),
     cache_stats = stats,
     cache_stats_before_timed_work = statsBeforeTimedWork,
+    expected_cached_rows = expectedCachedRows,
+    all_cache_rows_required = requireAllCache,
     prompt_tokens = prompt,
     rendered_prompt = renderedPrompt,
     generated_tokens = finalGenerated,

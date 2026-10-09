@@ -46,6 +46,52 @@ covered reservations and allocations to zero, the scope detaches, and native
 shutdown completes. Failure to release physical ownership leaves the scope
 rooted and the report failed rather than refunding live memory.
 
+For pressure/reclamation checks, `--require-all-cache 1` requires every expert
+row of a 1..8-token prefill and every subsequent decode call to use the cache.
+This is stronger than `--require-cache 1`, which only proves that some rows used
+and reused it. Unsupported long-prefill configurations are rejected by this
+stricter mode. A native allocation/commit failure is never retried as ordinary
+budget pressure; existing rollback tests remain required.
+
+The cache now retries smaller measured slot tables when either shared admission
+or observed free VRAM refuses the initial per-layer table. The lower bound holds
+all selected experts, and each rejected candidate has no device payload. Warm
+entries keep their slots and shared reservation; this avoids doing admission on
+every token. Reductions use bounded geometric steps, so this is not an optimal
+slot-allocation or fairness algorithm. Existing entries do not automatically grow
+when pressure subsides, and insufficient space for the minimum still falls back.
+The configured cache ceiling, per-layer partitioning, and native 512 MiB physical
+headroom floor remain; callers must budget other workspace/KV/driver allocations.
+
+`GgmlBasicOps.TrimHostMoeExpertCache(targetBytes)` allows a caller to reclaim
+whole least-recently-used expert graphs between requests. It drains pending
+copies, frees physical graph storage, then refunds shared credit. It preserves
+model/KV state, recent entries within the target, and cumulative cache counters.
+The target is process-wide across ranks; stop model work on **every** rank first.
+It is not a new persistent ceiling, a driver-memory measurement, or an eviction
+hook invoked from inside a budget callback. Subsequent requests can refill the
+configured cache. Automatic service-wide pressure scheduling is not supplied by
+this API.
+
+Pass `--trim-target-bytes 0` to empty this cache before each measured iteration,
+after warmup. The report records before/after cache accounting and shared-budget
+snapshots. Pair it with full-logit capture and the comparator below. For example,
+on the eight-layer fixture (actual allocator sizes are platform dependent):
+
+```powershell
+$env:TS_HOST_MOE_EXPERT_CACHE_MB = '32'
+$env:TS_HOST_MOE_EXPERT_CACHE_LAYERS = '8'
+$env:TS_HOST_MOE_PIN = '0'
+dotnet eng/validation/Qwen4ExpExpertCacheProbe/bin/Release/net10.0/Qwen4ExpExpertCacheProbe.dll --output artifacts/expert-pressure/model.json --prefill-tokens 4 --decode-tokens 32 --warmup 1 --iterations 2 --device-budget-bytes 26000000 --require-cache 1 --require-all-cache 1 --trim-target-bytes 0 --logits-dir artifacts/expert-pressure/logits
+```
+
+Use a second fresh process with ample shared capacity and no trim as the control;
+compare **each** measured iteration, with all other binaries and conditioning
+unchanged. Captured runs test arithmetic and ownership, not quiet throughput.
+Native `host-moe-expert-cache-*` tests additionally cover exact minimum/one-byte
+refusal, injected physical-availability limits (not actual CUDA OOM), allocation
+and commit rollback, three-entry LRU order, and queued device-output retirement.
+
 For a controlled prefill comparison, retain the first run's prompt IDs using
 `--prompt-tokens-output <file>`, then provide that exact file through
 `--tokens-file <file>` in both new processes. Compare explicit

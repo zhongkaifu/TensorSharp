@@ -35,6 +35,7 @@ namespace tsg
 #if defined(TSG_GGML_TEST_HOOKS)
         std::atomic<int> g_test_failure_stage{0};
         std::atomic<std::size_t> g_test_physical_bytes{0};
+        std::atomic<std::size_t> g_test_available_bytes{std::numeric_limits<std::size_t>::max()};
         bool test_failure(int stage)
         {
             int expected = stage;
@@ -247,7 +248,8 @@ namespace tsg
         }
 
         std::unique_ptr<CacheEntry> create_entry(const HostMoeSegment& hm,
-            const std::size_t (&stride)[3], ggml_backend_t backend, std::size_t quota)
+            const std::size_t (&stride)[3], ggml_backend_t backend, std::size_t quota,
+            std::size_t maximum_capacity)
         {
             std::size_t per_expert = 0;
             for (const auto s : stride)
@@ -256,8 +258,8 @@ namespace tsg
                 per_expert += s;
             }
             if (quota <= kWorkspaceAllowance || per_expert == 0) return nullptr;
-            std::size_t capacity = std::min<std::size_t>(hm.num_experts,
-                (quota - kWorkspaceAllowance) / per_expert);
+            std::size_t capacity = std::min({static_cast<std::size_t>(hm.num_experts),
+                maximum_capacity, (quota - kWorkspaceAllowance) / per_expert});
             if (capacity < static_cast<std::size_t>(hm.n_used)) return nullptr;
 
             // Graph scratch and quantized-tensor tail padding must fit too.
@@ -277,29 +279,38 @@ namespace tsg
             }
         }
 
-        bool allocate_entry(CacheEntry& entry)
+        // Only an admission refusal may try a smaller slot table. Once physical
+        // allocation starts, any failure must unwind the one owner and stop;
+        // retrying then could hide a CUDA/commit error behind a successful graph.
+        enum class Admission { refused, failed, admitted };
+
+        Admission allocate_entry(CacheEntry& entry)
         {
             std::size_t free_bytes = 0, total_bytes = 0;
             ggml_backend_dev_memory(ggml_backend_get_device(entry.backend), &free_bytes, &total_bytes);
-            if (total_bytes == 0 || free_bytes <= kDeviceHeadroom
-                || entry.bytes > free_bytes - kDeviceHeadroom) return false;
-            entry.shared_charge = SharedCacheCharge::reserve(g_active_rank, 1, entry.bytes);
-            if (!entry.shared_charge) return false;
 #if defined(TSG_GGML_TEST_HOOKS)
-            if (test_failure(1)) return false;
+            // Inject a tighter observation, never invent additional physical VRAM.
+            free_bytes = std::min(free_bytes, g_test_available_bytes.load());
+#endif
+            if (total_bytes == 0 || free_bytes <= kDeviceHeadroom
+                || entry.bytes > free_bytes - kDeviceHeadroom) return Admission::refused;
+            entry.shared_charge = SharedCacheCharge::reserve(g_active_rank, 1, entry.bytes);
+            if (!entry.shared_charge) return Admission::refused;
+#if defined(TSG_GGML_TEST_HOOKS)
+            if (test_failure(1)) return Admission::failed;
 #endif
             // Size-only reservation above creates a valid allocation plan with
             // no backing buffers. alloc_graph alone sees the matching plan and
             // does not allocate them; explicitly materialize that reservation.
-            if (!ggml_gallocr_reserve(entry.allocator, entry.graph)) return false;
+            if (!ggml_gallocr_reserve(entry.allocator, entry.graph)) return Admission::failed;
 #if defined(TSG_GGML_TEST_HOOKS)
             entry.test_physical_bytes = ggml_gallocr_get_buffer_size(entry.allocator, 0);
             g_test_physical_bytes.fetch_add(entry.test_physical_bytes);
-            if (test_failure(2)) return false;
+            if (test_failure(2)) return Admission::failed;
 #endif
-            if (!ggml_gallocr_alloc_graph(entry.allocator, entry.graph)) return false;
+            if (!ggml_gallocr_alloc_graph(entry.allocator, entry.graph)) return Admission::failed;
             const std::size_t actual = ggml_gallocr_get_buffer_size(entry.allocator, 0);
-            if (actual > entry.bytes - kWorkspaceAllowance) return false;
+            if (actual > entry.bytes - kWorkspaceAllowance) return Admission::failed;
             entry.bytes = actual + kWorkspaceAllowance;
             // CUDA initializes each quantized tensor's over-read tail at alloc.
             // Clear its complete payload as well: unused slots must never hold
@@ -311,11 +322,11 @@ namespace tsg
             sync_backend(entry.backend);
             if (g_ggml_error_count.load(std::memory_order_acquire) != errors_before
                 || g_backend_compute_failed.load(std::memory_order_acquire)
-                || !entry.shared_charge->commit(entry.bytes)) return false;
+                || !entry.shared_charge->commit(entry.bytes)) return Admission::failed;
 #if defined(TSG_GGML_TEST_HOOKS)
-            if (test_failure(3)) return false;
+            if (test_failure(3)) return Admission::failed;
 #endif
-            return true;
+            return Admission::admitted;
         }
 
         void copy_slot(CacheEntry& entry, int slot, int expert)
@@ -401,15 +412,32 @@ namespace tsg
         while (found != g_entries.end() && !(*found)->matches(hm, g_backend)) ++found;
         if (found == g_entries.end())
         {
-            auto entry = create_entry(hm, stride, g_backend, budget / layers);
-            if (!entry) return 0;
-            while (g_reserved > budget - entry->bytes && !g_entries.empty())
+            std::unique_ptr<CacheEntry> entry;
+            std::size_t maximum_capacity = static_cast<std::size_t>(hm.num_experts);
+            for (;;)
             {
-                const auto retired_bytes = g_entries.back()->bytes;
-                g_entries.pop_back();
-                g_reserved -= retired_bytes;
+                entry = create_entry(hm, stride, g_backend, budget / layers, maximum_capacity);
+                if (!entry) return 0;
+                while (g_reserved > budget - entry->bytes && !g_entries.empty())
+                {
+                    const auto retired_bytes = g_entries.back()->bytes;
+                    g_entries.pop_back();
+                    g_reserved -= retired_bytes;
+                }
+                if (g_reserved > budget - entry->bytes) return 0;
+                const auto admission = allocate_entry(*entry);
+                if (admission == Admission::admitted) break;
+                if (admission == Admission::failed || entry->capacity <= hm.n_used) return 0;
+                // Keep the operator's per-layer ceiling, but do not equate that
+                // ceiling with available shared credit or physical free VRAM.
+                // Smaller tables preserve the same scalar expert arithmetic and
+                // retain hot weights across calls. No payload is allocated for
+                // refused candidates, and the final candidate holds every routed
+                // expert even when all IDs are distinct.
+                maximum_capacity = std::max<std::size_t>(hm.n_used,
+                    static_cast<std::size_t>(entry->capacity) * 3 / 4);
+                entry.reset();
             }
-            if (g_reserved > budget - entry->bytes || !allocate_entry(*entry)) return 0;
             const auto bytes = entry->bytes;
             // A list-node allocation can throw. Publish before changing private
             // accounting so unique_ptr rollback still owns every physical byte.
@@ -570,6 +598,21 @@ namespace tsg
         g_hits = g_misses = g_calls = 0;
     }
 
+    std::size_t host_moe_expert_cache_trim(std::size_t target)
+    {
+        std::lock_guard<std::mutex> lock(g_cache_mutex);
+        const auto before = g_reserved;
+        while (g_reserved > target && !g_entries.empty())
+        {
+            const auto bytes = g_entries.back()->bytes;
+            // Destruction drains queued output copies and frees physical storage
+            // before refunding shared credit. Never revoke an in-flight owner.
+            g_entries.pop_back();
+            g_reserved -= bytes;
+        }
+        return before - g_reserved;
+    }
+
     void host_moe_expert_cache_stats(std::int64_t* reserved, std::int64_t* budget,
         std::int64_t* hits, std::int64_t* misses, std::int64_t* calls)
     {
@@ -585,6 +628,7 @@ namespace tsg
     // Linked only into the standalone cache fixture, never a production export.
     void host_moe_expert_cache_test_fail_next(int stage) { g_test_failure_stage.store(stage); }
     std::size_t host_moe_expert_cache_test_physical_bytes() { return g_test_physical_bytes.load(); }
+    void host_moe_expert_cache_test_available_bytes(std::size_t bytes) { g_test_available_bytes.store(bytes); }
 #endif
 }
 
@@ -594,4 +638,23 @@ TSG_EXPORT int TSGgml_HostMoeExpertCacheStats(std::int64_t* reserved, std::int64
     if (!reserved || !budget || !hits || !misses || !calls) return 0;
     tsg::host_moe_expert_cache_stats(reserved, budget, hits, misses, calls);
     return 1;
+}
+
+// Process-wide maintenance at a quiescent request boundary. This is an eviction
+// target, not a new ceiling: subsequent requests can fill the configured cache.
+// Counters remain cumulative, allowing the caller to observe the reload cost.
+TSG_EXPORT std::int64_t TSGgml_TrimHostMoeExpertCache(std::int64_t target_bytes)
+{
+    if (target_bytes < 0 || static_cast<std::uint64_t>(target_bytes)
+        > std::numeric_limits<std::size_t>::max()) return -1;
+    try
+    {
+        return static_cast<std::int64_t>(tsg::host_moe_expert_cache_trim(
+            static_cast<std::size_t>(target_bytes)));
+    }
+    catch (const std::exception& error)
+    {
+        tsg::set_last_error(std::string("Expert-cache trim failed: ") + error.what());
+        return -1;
+    }
 }

@@ -16,6 +16,7 @@
 
 extern "C" int TSGgml_HostMoeExpertCacheStats(std::int64_t*, std::int64_t*,
     std::int64_t*, std::int64_t*, std::int64_t*);
+extern "C" std::int64_t TSGgml_TrimHostMoeExpertCache(std::int64_t);
 
 // This standalone target compiles the production cache implementation with
 // small bridge stubs; it never loads a model or depends on modified ggml code.
@@ -32,6 +33,7 @@ namespace tsg
     ggml_backend_t q8_f32_execution_backend(ggml_backend_t backend, ggml_cgraph*) { return backend; }
     void host_moe_expert_cache_test_fail_next(int stage);
     std::size_t host_moe_expert_cache_test_physical_bytes();
+    void host_moe_expert_cache_test_available_bytes(std::size_t bytes);
 #ifdef TSG_GGML_USE_CUDA
     void host_pin_split(const void*, std::size_t bytes,
         std::vector<std::pair<std::size_t, std::size_t>>& pieces)
@@ -319,8 +321,11 @@ namespace
         using tsg::SharedCacheCharge;
         SharedLedger ledger;
         std::array<float, hidden> x{}, output{};
+        for (int i = 0; i < hidden; ++i) x[i] = std::sin(i * 0.031f);
         std::array<std::int32_t, used> ids{0, 1};
         std::array<float, used> routes{0.6f, 0.4f};
+        FullResidentGraph reference(weights);
+        const auto expected = reference.compute(x, ids, routes);
         auto call = [&] {
             return tsg::host_moe_cached_experts(weights.segment, x.data(), ids.data(), routes.data(),
                 output.data(), "qwen4exp fused token span");
@@ -366,14 +371,128 @@ namespace
         tsg::host_moe_expert_cache_on_drop(weights.segment.gate_data);
         ledger.check_empty();
         ledger.capacity = exact_bytes - 1;
-        require(call() == 0, "Expert-cache graph exceeded shared capacity by one byte");
+        require(call() == 1 && ledger.committed < exact_bytes,
+            "Available shared credit could fit fewer slots but the cache fell back");
+        require(std::memcmp(output.data(), expected.data(), sizeof(output)) == 0,
+            "Shrinking the slot table changed expert arithmetic");
+        require(ledger.committed <= ledger.capacity && ledger.valid,
+            "Adaptive slot admission exceeded shared credit");
+        const auto shrunk_reservations = ledger.reserve_calls;
+        const auto shrunk_bytes = Stats().reserved;
+        require(call() == 1 && ledger.reserve_calls == shrunk_reservations,
+            "Warm shrunken table repeated admission or lost its weights");
+        const auto before_trim = Stats();
+        require(TSGgml_TrimHostMoeExpertCache(-1) == -1
+            && TSGgml_TrimHostMoeExpertCache(before_trim.reserved) == 0
+            && Stats().reserved == before_trim.reserved,
+            "Invalid/no-op trim mutated a live cache");
+        require(TSGgml_TrimHostMoeExpertCache(0) == shrunk_bytes,
+            "Trim did not report all released accounted bytes");
         ledger.check_empty();
+        require(Stats().calls == before_trim.calls && Stats().hits == before_trim.hits
+            && Stats().misses == before_trim.misses,
+            "Trim erased cumulative cache counters");
+
+        // A two-expert checkpoint measures the same graph's minimum allocation
+        // without assuming ggml padding, allocator rounding or graph reuse. The
+        // full checkpoint must fit at that exact minimum, and never one byte less.
+        ledger.capacity = 2 << 20;
+        auto minimal = weights.segment;
+        minimal.num_experts = used;
+        minimal.gate_bytes = minimal.gate_bytes / experts * used;
+        minimal.up_bytes = minimal.up_bytes / experts * used;
+        minimal.down_bytes = minimal.down_bytes / experts * used;
+        require(tsg::host_moe_cached_experts(minimal, x.data(), ids.data(), routes.data(),
+            output.data(), "qwen4exp fused token span") == 1, "Could not measure minimum expert graph");
+        const auto minimum_bytes = ledger.committed;
+        require(minimum_bytes < exact_bytes, "Fixture did not have reducible weight slots");
+        TSGgml_TrimHostMoeExpertCache(0);
+        ledger.check_empty();
+        ledger.capacity = minimum_bytes - 1;
+        output.fill(-999.0f);
+        require(call() == 0, "Minimum expert graph exceeded shared capacity by one byte");
+        ledger.check_empty();
+        require(std::all_of(output.begin(), output.end(), [](float v) { return v == -999.0f; }),
+            "Rejected minimum graph changed output");
+        ledger.capacity = minimum_bytes;
+        require(call() == 1 && ledger.committed == minimum_bytes,
+            "Full checkpoint did not shrink to the exact two-expert minimum");
+        require(std::memcmp(output.data(), expected.data(), sizeof(output)) == 0,
+            "Minimum slot table changed full-resident results");
+        TSGgml_TrimHostMoeExpertCache(0);
+        ledger.check_empty();
+        // The same admission must respect observed VRAM even with abundant
+        // shared credit. Headroom and one-byte boundary are not CUDA OOM tests.
+        constexpr std::size_t physical_headroom = std::size_t(512) << 20;
+        ledger.capacity = exact_bytes;
+        const auto before_physical_refusal = ledger.reserve_calls;
+        tsg::host_moe_expert_cache_test_available_bytes(physical_headroom + minimum_bytes - 1);
+        require(call() == 0 && ledger.reserve_calls == before_physical_refusal,
+            "Insufficient physical availability reached shared admission or allocated a graph");
+        ledger.check_empty();
+        tsg::host_moe_expert_cache_test_available_bytes(physical_headroom + minimum_bytes);
+        require(call() == 1 && ledger.committed == minimum_bytes,
+            "Physical pressure did not reduce slots to the minimum fitting graph");
+        require(std::memcmp(output.data(), expected.data(), sizeof(output)) == 0,
+            "Physical-pressure admission changed expert arithmetic");
+        TSGgml_TrimHostMoeExpertCache(0);
+        ledger.check_empty();
+        tsg::host_moe_expert_cache_test_available_bytes(std::numeric_limits<std::size_t>::max());
         ledger.capacity = exact_bytes;
         require(call() == 1, "Budgeted expert graph failed to reload after invalidation");
         tsg::host_moe_expert_cache_release();
         ledger.check_empty();
         require(ledger.detach(), "Cannot detach after all expert-cache buffers were freed");
-        std::puts("PASS: expert shared quota, reserve-before-allocation, rollback, commit, reuse, invalidation and physical-free order");
+        std::printf("PASS: adaptive expert slots, minimum=%lld initial=%lld; shared quota, rollback, warm reuse and trim free-before-credit\n",
+            static_cast<long long>(minimum_bytes), static_cast<long long>(exact_bytes));
+    }
+
+    void trim_lru_checks(Weights& weights)
+    {
+        // Separate process: 8 MiB global ceiling / four partitions leaves enough
+        // space for three independent 2 MiB entries, unlike the eviction fixture.
+        FullResidentGraph reference(weights);
+        std::array<float, hidden> x{}, actual{};
+        for (int i = 0; i < hidden; ++i) x[i] = std::cos(i * 0.017f);
+        std::array<std::int32_t, used> ids{0, 1};
+        std::array<float, used> routes{0.4f, 0.6f};
+        const auto expected = reference.compute(x, ids, routes);
+        auto hm = weights.segment;
+        auto call = [&](int layer) {
+            hm.layer = layer;
+            require(tsg::host_moe_cached_experts(hm, x.data(), ids.data(), routes.data(),
+                actual.data(), "qwen4exp fused token span") == 1, "LRU fixture cache did not engage");
+            require(std::memcmp(actual.data(), expected.data(), sizeof(actual)) == 0,
+                "LRU fixture changed numerical results");
+        };
+        call(0);
+        const auto bytes = Stats().reserved;
+        call(1); call(2); call(0); // Oldest=1, then 2; most recently used=0.
+        const auto before = Stats();
+        require(before.reserved == bytes * 3, "LRU fixture did not retain three entries");
+        require(TSGgml_TrimHostMoeExpertCache(bytes * 2) == bytes
+            && Stats().reserved == bytes * 2, "Trim did not retire one whole LRU entry");
+        call(2); call(0);
+        require(Stats().misses == before.misses, "Trim evicted a recent entry instead of the oldest");
+        call(1);
+        require(Stats().misses == before.misses + used, "Trimmed layer did not reload every selected weight");
+
+        // No synchronization after a queued device-output copy. Trim must drain
+        // the source owner while leaving the external output and KV/model live.
+        hm.moe_in = reference.x; hm.weights = reference.routes; hm.moe_out = reference.output;
+        require(tsg::host_moe_cached_experts(hm, nullptr, ids.data(), nullptr,
+            nullptr, "qwen4exp fused token span") == 1, "Queued trim output did not engage");
+        const auto live = Stats();
+        require(TSGgml_TrimHostMoeExpertCache(0) == live.reserved && Stats().reserved == 0,
+            "Complete trim retained expert buffers");
+        ggml_backend_tensor_get(reference.output, actual.data(), 0, sizeof(actual));
+        require(std::memcmp(actual.data(), expected.data(), sizeof(actual)) == 0,
+            "Trim freed a still-pending device copy source");
+        require(Stats().calls == live.calls && Stats().hits == live.hits && Stats().misses == live.misses,
+            "LRU trim lost cumulative statistics");
+        call(0);
+        tsg::host_moe_expert_cache_release();
+        std::puts("PASS: three-entry LRU trim, recent hits retained, reload, queued output and unchanged arithmetic");
     }
 
     void cuda_checks(Weights& weights)
@@ -558,8 +677,9 @@ int main(int argc, char** argv)
     try
     {
         const bool invalid_budget = argc == 3 && std::strcmp(argv[1], "--invalid-budget") == 0;
-        set_environment("TS_HOST_MOE_EXPERT_CACHE_MB", invalid_budget ? argv[2] : "2");
-        set_environment("TS_HOST_MOE_EXPERT_CACHE_LAYERS", "1");
+        const bool trim_only = argc == 2 && std::strcmp(argv[1], "--trim") == 0;
+        set_environment("TS_HOST_MOE_EXPERT_CACHE_MB", invalid_budget ? argv[2] : trim_only ? "8" : "2");
+        set_environment("TS_HOST_MOE_EXPERT_CACHE_LAYERS", trim_only ? "4" : "1");
         set_environment("TS_HOST_MOE_EXPERT_CACHE_DIAGNOSTICS", "1");
         if (invalid_budget)
         {
@@ -574,6 +694,7 @@ int main(int argc, char** argv)
         for (int arg = 1; arg < argc; ++arg)
         {
             if (std::strcmp(argv[arg], "--cpu") == 0) cpu_only = true;
+            else if (std::strcmp(argv[arg], "--trim") == 0 && trim_only) { }
             else if (std::strcmp(argv[arg], "--prefetch") == 0) prefetch = true;
             else if (std::strcmp(argv[arg], "--quantization") == 0 && arg + 1 < argc)
             {
@@ -598,6 +719,13 @@ int main(int argc, char** argv)
             }
             g_backend = ggml_backend_cuda_init(0);
             require(g_backend != nullptr, "Could not initialize CUDA backend");
+            if (trim_only)
+            {
+                trim_lru_checks(weights);
+                ggml_backend_free(g_backend);
+                g_backend = nullptr;
+                return 0;
+            }
             shared_budget_checks(weights);
             cuda_checks(weights);
             require(prefetch == (tsg::g_test_prefetch_calls > 0),
