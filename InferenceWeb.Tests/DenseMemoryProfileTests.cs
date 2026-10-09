@@ -72,16 +72,18 @@ public sealed class DenseMemoryProfileTests
         Assert.Equal(normal.FusionBytes, retained.ResidentHostWeightBytes + retained.FusionBytes);
     }
 
-    [Fact]
-    public void MixedGateUpBoundsOnlyTheActualTargetFormatsInsteadOfExpandingBothToFloat()
+    [Theory]
+    [InlineData("gemma4")]
+    [InlineData("qwen35")]
+    public void MixedGateUpPreservesOriginalFormatsWithoutRequantizationAllocations(string architecture)
     {
-        using var f = new Fixture("gemma4", Matrix("blk.0.ffn_gate.weight", SyntheticGguf.GgmlType.Q8_0, 64, 2),
+        using var f = new Fixture(architecture, Matrix("blk.0.ffn_gate.weight", SyntheticGguf.GgmlType.Q8_0, 64, 2),
             Matrix("blk.0.ffn_up.weight", SyntheticGguf.GgmlType.F16, 64, 2));
         var profile = f.Read();
         Assert.Equal(0, profile.ResidentHostWeightBytes);
-        Assert.Equal(profile.Model.DenseWeights.Host + (128 - 68) * 2 + 3 * BufferPadding,
+        Assert.Equal(profile.Model.DenseWeights.Host + 3 * BufferPadding,
             profile.Model.DenseWeights.Device);
-        Assert.True(profile.FusionBytes >= 128 * 4); // packed F16 plus conversion scratch
+        Assert.Equal(0, profile.FusionBytes);
     }
 
     [Theory]

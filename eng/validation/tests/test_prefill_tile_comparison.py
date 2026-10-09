@@ -54,5 +54,35 @@ class PrefillTileEvidence(unittest.TestCase):
                 path.with_name("report.json").write_text(json.dumps(r)); path.write_text(json.dumps(e))
                 self.assertFalse(module.compare(paths)["ComparableAndBitwiseEqual"])
 
+    def auto_fixture(self, root, serial=False):
+        paths = self.fixture(root)[:4]
+        for path, tile in zip(paths, ("32", None, None, "32")):
+            r = json.loads(path.with_name("report.json").read_text())
+            r["Environment"][module.FLAG] = tile
+            if serial: r["Environment"][module.evidence.FLAG] = "0"
+            path.with_name("report.json").write_text(json.dumps(r))
+            path.with_name("process.log").write_text(("" if serial else module.evidence.MARKER + ".\n") +
+                ("[q8-f32] Automatic K-ordered prefill tiling: device=0 SMs=48 active64=3 active128=2; no global scratch.\n" if tile is None else ""))
+        return paths
+
+    def test_automatic_default_and_serial_vector_pass(self):
+        for serial in (False, True):
+            with self.subTest(serial=serial), tempfile.TemporaryDirectory() as directory:
+                paths = self.auto_fixture(Path(directory), serial)
+                result = module.compare(paths, automatic=True, vector_arm="serial" if serial else "parallel")
+                self.assertTrue(result["ComparableAndBitwiseEqual"], result)
+                self.assertEqual(6, result["Measurements"]["auto"]["PrefillTokensPerSecond"]["Samples"])
+
+    def test_automatic_refuses_explicit_flag_or_missing_native_selection(self):
+        for mutation in ("explicit", "missing", "wrong-arm"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as directory:
+                paths = self.auto_fixture(Path(directory)); path = paths[1]
+                r = json.loads(path.with_name("report.json").read_text())
+                if mutation == "explicit": r["Environment"][module.FLAG] = "auto"
+                if mutation == "wrong-arm": r["Environment"][module.FLAG] = "32"
+                if mutation == "missing": path.with_name("process.log").write_text(module.evidence.MARKER)
+                path.with_name("report.json").write_text(json.dumps(r))
+                self.assertFalse(module.compare(paths, automatic=True)["ComparableAndBitwiseEqual"])
+
 
 if __name__ == "__main__": unittest.main()

@@ -1,6 +1,7 @@
 // Copyright (c) Zhongkai Fu. All rights reserved.
 // Licensed under the BSD-3-Clause license in the repository root.
 #include "ggml_ops_q8_precision.h"
+#include "ggml_ops_q8_prefill_policy.h"
 #include "ggml-alloc.h"
 #ifdef TSG_GGML_USE_CUDA
 #include "ggml_ops_dsv4_fused.h"
@@ -144,7 +145,7 @@ std::vector<float> check(ggml_backend_t allocator, ggml_backend_t backend, const
     input_tensor input(leaves, GGML_TYPE_F32, input_shape, c.padded, c.interleaved);
     if (c.transposed) input.tensor = ggml_transpose(leaves, input.tensor);
 #if defined(TSG_GGML_USE_CUDA) && defined(TSG_GGML_TEST_HOOKS)
-    auto * baseline = c.columns <= 8 ? ggml_new_tensor_1d(leaves, GGML_TYPE_F32, int64_t(c.rows) * c.columns + 2) : nullptr;
+    auto * baseline = ggml_new_tensor_1d(leaves, GGML_TYPE_F32, int64_t(c.rows) * c.columns + 2);
 #endif
     auto * leaf_buffer = ggml_backend_alloc_ctx_tensors(leaves, allocator);
     require(leaf_buffer != nullptr, "Cannot allocate Q8 projection inputs");
@@ -339,6 +340,16 @@ void run(ggml_backend_t allocator, ggml_backend_t backend) {
             execute(c);
         }
     }
+    if (prefill_tile == 0) {
+        // Enough row tiles to exercise automatic reuse on large GPUs too;
+        // full-output FP64 + previous-dispatch byte comparison, not one column.
+        for (int columns : {64, 129, 192, 256}) {
+            test_case c;
+            c.inner = 32; c.rows = 12289; c.columns = columns;
+            c.padded = c.interleaved = true; c.data = pattern::non_power_scale;
+            execute(c);
+        }
+    }
     // Exact fixtures reject activation quantization/narrowing and CUDA FTZ.
     for (pattern data : {pattern::residual, pattern::large, pattern::subnormal, pattern::decoded_weight_residual}) {
         for (int columns : {1, 9, 33}) {
@@ -436,19 +447,30 @@ void check_parallel_underflow(ggml_backend_t allocator, int columns) {
 int main(int argc, char ** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     require(argc == 1 || (argc == 2 && (std::string(argv[1]) == "--parallel-vector" || std::string(argv[1]) == "--parallel-small-batch"
-        || std::string(argv[1]) == "--prefill-64" || std::string(argv[1]) == "--prefill-128")), "Unexpected Q8 precision arguments");
+        || std::string(argv[1]) == "--prefill-64" || std::string(argv[1]) == "--prefill-128"
+        || std::string(argv[1]) == "--prefill-auto")), "Unexpected Q8 precision arguments");
     parallel_vector = argc == 2 && (std::string(argv[1]) == "--parallel-vector" || std::string(argv[1]) == "--parallel-small-batch");
     parallel_small_batch = argc == 2 && std::string(argv[1]) == "--parallel-small-batch";
     if (argc == 2 && std::string(argv[1]) == "--prefill-64") prefill_tile = 64;
     if (argc == 2 && std::string(argv[1]) == "--prefill-128") prefill_tile = 128;
+    if (argc == 2 && std::string(argv[1]) == "--prefill-auto") prefill_tile = 0;
+    require(tsg_q8_prefill_auto_columns(8192, 643, 48, 3, 2) == 128, "Ample-grid reuse policy failed");
+    require(tsg_q8_prefill_auto_columns(8192, 160, 48, 3, 2) == 64, "Mid-width reuse policy failed");
+    require(tsg_q8_prefill_auto_columns(65, 128, 48, 3, 2) == 32, "Small row strips must retain parallelism");
+    require(tsg_q8_prefill_auto_columns(8192, 129, 48, 3, 2) == 32, "Tail padding must limit reuse");
+    require(tsg_q8_prefill_auto_columns(8192, 256, 48, 2, 0) == 64, "Unlaunchable wide tile must fall back");
+    require(tsg_q8_prefill_auto_columns(8192, 256, 48, 0, 0) == 32, "Unavailable reuse must fall back");
+    require(tsg_q8_prefill_auto_columns(8192, 256, 512, 2, 2) == 32, "Larger devices need enough CTAs");
+    require(tsg_q8_prefill_auto_columns(8192, 256, 128, 1, 1) == 128, "Single-block occupancy must be respected");
 #ifdef _WIN32
     require(_putenv_s("TS_GGML_Q8_PARALLEL_VECTOR", parallel_vector ? "1" : "0") == 0, "Cannot configure Q8 test arithmetic");
     require(_putenv_s("TS_GGML_Q8_PARALLEL_SMALL_BATCH", parallel_small_batch ? "1" : "0") == 0, "Cannot configure Q8 batch arithmetic");
-    require(_putenv_s("TS_GGML_Q8_PREFILL_TILE", std::to_string(prefill_tile).c_str()) == 0, "Cannot configure Q8 prefill tile");
+    require(_putenv_s("TS_GGML_Q8_PREFILL_TILE", prefill_tile ? std::to_string(prefill_tile).c_str() : "") == 0, "Cannot configure Q8 prefill tile");
 #else
     require(setenv("TS_GGML_Q8_PARALLEL_VECTOR", parallel_vector ? "1" : "0", 1) == 0, "Cannot configure Q8 test arithmetic");
     require(setenv("TS_GGML_Q8_PARALLEL_SMALL_BATCH", parallel_small_batch ? "1" : "0", 1) == 0, "Cannot configure Q8 batch arithmetic");
-    require(setenv("TS_GGML_Q8_PREFILL_TILE", std::to_string(prefill_tile).c_str(), 1) == 0, "Cannot configure Q8 prefill tile");
+    require((prefill_tile ? setenv("TS_GGML_Q8_PREFILL_TILE", std::to_string(prefill_tile).c_str(), 1)
+                         : unsetenv("TS_GGML_Q8_PREFILL_TILE")) == 0, "Cannot configure Q8 prefill tile");
 #endif
     std::printf("Q8 test arithmetic: %s\n", parallel_vector ? "experimental parallel-K vector; serial prefill" : "qualified K-ordered");
     if (parallel_small_batch) std::puts("Q8 test arithmetic: experimental parallel-K small batches N=2..8.");

@@ -1,6 +1,7 @@
 // Copyright (c) Zhongkai Fu. All rights reserved.
 // Licensed under the BSD-3-Clause license in the repository root.
 #include "ggml_ops_q8_precision.h"
+#include "ggml_ops_q8_prefill_policy.h"
 #include "ggml-backend-impl.h"
 #include "ggml-cuda.h"
 #include "ggml-cuda/common.cuh"
@@ -8,6 +9,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <vector>
 
 namespace {
 // Diagnostic opt-in while model/prefill/decode qualification is in progress.
@@ -39,9 +41,12 @@ bool parallel_small_batch_enabled() {
 int prefill_tile_columns() {
     static const int columns = [] {
         const char * value = std::getenv("TS_GGML_Q8_PREFILL_TILE");
-        const int selected = value && std::strcmp(value, "128") == 0 ? 128
+        // Automatic tiling changes reuse and launch geometry only. Every
+        // output retains the same K-increasing FMA and original F32 operands.
+        const int selected = !value || !*value || std::strcmp(value, "auto") == 0 ? 0
+            : std::strcmp(value, "128") == 0 ? 128
             : value && std::strcmp(value, "64") == 0 ? 64 : 32;
-        if (selected != 32)
+        if (selected > 32)
             std::fprintf(stderr, "[q8-f32] Experimental K-ordered prefill column tile selected: %d.\n", selected);
         return selected;
     }();
@@ -197,12 +202,47 @@ void launch(const void * weights, const void * input, float * output,
         static_cast<const char *>(input), output, inner, rows, columns,
         weight_stride, input_inner_stride, input_column_stride);
 }
+
+int automatic_tile(int rows, int columns, int & selected) {
+    if (columns < 64) { selected = 32; return int(cudaSuccess); }
+    struct DevicePolicy { int device, multiprocessors, active64, active128; };
+    // Host metadata only; never retain device pointers or payload allocations.
+    // Cache each device separately, without imposing a fixed maximum GPU count.
+    thread_local std::vector<DevicePolicy> policies;
+    int device = -1;
+    auto status = cudaGetDevice(&device);
+    if (status != cudaSuccess) return int(status);
+    const DevicePolicy * policy = nullptr;
+    for (const auto & item : policies) if (item.device == device) { policy = &item; break; }
+    if (!policy) {
+        DevicePolicy item{device, 0, 0, 0};
+        status = cudaDeviceGetAttribute(&item.multiprocessors, cudaDevAttrMultiProcessorCount, device);
+        if (status != cudaSuccess) return int(status);
+        status = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&item.active64, q8_f32_tiled<64>, 128, 0);
+        if (status != cudaSuccess) return int(status);
+        status = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&item.active128, q8_f32_tiled<128>, 128, 0);
+        if (status != cudaSuccess) return int(status);
+        policies.push_back(item); policy = &policies.back();
+        std::fprintf(stderr, "[q8-f32] Automatic K-ordered prefill tiling: device=%d SMs=%d active64=%d active128=%d; no global scratch.\n",
+            device, item.multiprocessors, item.active64, item.active128);
+    }
+    selected = tsg_q8_prefill_auto_columns(rows, columns, policy->multiprocessors, policy->active64, policy->active128);
+    return int(cudaSuccess);
+}
 } // namespace
 
 int tsg_matmul_q8_cuda_launch(const void * weights, const void * input, float * output,
         int inner, int rows, int columns, size_t weight_stride, size_t input_inner_stride,
         size_t input_column_stride, void * stream_pointer) {
     const auto stream = static_cast<cudaStream_t>(stream_pointer);
+    int tile = 32;
+    if (columns >= 64) {
+        tile = prefill_tile_columns();
+        if (tile == 0) {
+            const int status = automatic_tile(rows, columns, tile);
+            if (status != int(cudaSuccess)) return status;
+        }
+    }
     if (columns == 1 && parallel_vector_enabled()) {
         const unsigned blocks = unsigned((int64_t(rows) + 3) / 4);
         q8_f32_vector_parallel<false><<<blocks, 128, 0, stream>>>(static_cast<const char *>(weights),
@@ -222,9 +262,9 @@ int tsg_matmul_q8_cuda_launch(const void * weights, const void * input, float * 
         weight_stride, input_inner_stride, input_column_stride, stream);
     else if (columns <= 16) launch<16>(weights, input, output, inner, rows, columns,
         weight_stride, input_inner_stride, input_column_stride, stream);
-    else if (columns >= 128 && prefill_tile_columns() == 128) launch<128>(weights, input, output, inner, rows, columns,
+    else if (columns >= 128 && tile == 128) launch<128>(weights, input, output, inner, rows, columns,
         weight_stride, input_inner_stride, input_column_stride, stream);
-    else if (columns >= 64 && prefill_tile_columns() >= 64) launch<64>(weights, input, output, inner, rows, columns,
+    else if (columns >= 64 && tile >= 64) launch<64>(weights, input, output, inner, rows, columns,
         weight_stride, input_inner_stride, input_column_stride, stream);
     else launch<32>(weights, input, output, inner, rows, columns,
         weight_stride, input_inner_stride, input_column_stride, stream);

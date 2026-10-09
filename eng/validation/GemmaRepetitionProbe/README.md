@@ -1,5 +1,16 @@
 # Gemma repetition diagnosis
 
+For quantization localization, `../create-gguf-tensor-variant.py` creates a
+separately labelled diagnostic checkpoint from SHA-pinned source and donor
+GGUFs. Repeated `--tensor NAME` arguments select the only substituted tensors.
+Architecture parameters, tokenizer/template, tensor names/shapes and all shared
+F32 parameters must match. The tool verifies every output tensor's bytes against
+its selected input and records a manifest; both originals remain unchanged.
+Hashing uses bounded buffers and mapped tensor views, not full-file copies in
+RAM. Use a fresh ignored `--output-dir` and retain its manifest with the actual
+inference results. This changes the checkpoint and cannot be described as fixing
+the original IQ2 model or the inference engine, even if an answer improves.
+
 This fresh-process probe records the checkpoint's complete chat template, final
 prompt IDs, BOS/EOG configuration, tensor-type inventory, output IDs and decoded
 text. It uses the production `KVCachePromptRenderer` with `GgufPromptRenderer`.
@@ -157,3 +168,22 @@ the independent server executable SHA was
 Full prompts, token histories, text, termination, actual loaded identities and
 bounded process outcomes remain ignored under
 `artifacts/unified-memory-adaptive/gemma-{iq2,q4-k-m}/`.
+
+The embedding-only hypothesis was also tested with an explicitly labelled
+diagnostic checkpoint. Only the tied `token_embd.weight` changed from the IQ2
+file's Q3_K to the same-source Q4_K_M file's Q4_K; all other 666 tensor payloads
+remain byte-identical. The variant SHA256 is
+`fe4456f2512d0e5a4eba91939ad7d24af9f30559103a1db0c3646d9fa54775b7`.
+Fresh original and variant runs used the same 19-token FF7 prompt, context 4096,
+greedy production sampling, no penalties, no repetition stop and no speculation.
+Both reached the 3072-token cap without EOS and failed the quality check.
+The original repeated a 19-token period for a 1374-token suffix; the variant
+repeated a 41-token period for 914 tokens. Both also contained factual errors.
+Upgrading this embedding alone does not repair the reported problem.
+
+Evidence is ignored under `gemma-iq2-embedding-v1/`; native SHA `9be5eabf…`,
+Models SHA `77380c6c…`. The full-size variant used the generator version recorded
+in its manifest, before later single-file/alignment guard additions; those final
+guards were checked with synthetic tests, not a second full-size conversion.
+This altered checkpoint is diagnostic evidence, not a replacement presented as
+a repair to the original model.

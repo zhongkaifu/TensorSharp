@@ -14,6 +14,8 @@ TensorSharp.GGML.Native/build-windows/GgmlOpsQ8PrefillBench.exe --benchmark 1024
 
 Unset `TS_GGML_Q8_PARALLEL_VECTOR` and `TS_GGML_Q8_PARALLEL_SMALL_BATCH` for the
 serial control, and unset `TS_GGML_Q8_PREFILL_TILE` or set it to `32`.
+The executable explicitly pins that control to 32 before the first launch;
+production automatic tiling must not silently change its historical timings.
 The benchmark arguments are K, M, N, scratch ceiling in MiB and an optional
 inner-product chunk (zero/default disables it; otherwise a multiple of 32 up to K).
 Integer arguments reject signs, suffixes and overflow instead of silently

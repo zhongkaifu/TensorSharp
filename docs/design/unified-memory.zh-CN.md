@@ -471,6 +471,22 @@ native `a76d9b93914279a9274356e961397ce719201f9e6a332fd84232c767d90d4c53` 在 un
 
 K=1024/M=7168/N=643、scratch=32 MiB 的相同 527 个 FP64 抽样中，chunk=256 仍有 2/11 个可准入 tile 不满足原绝对门槛；chunk=128/64 的 11/11 满足门槛，但观测耗时更高，未作为性能实现采用。最终 chunk128 最快观测约 **4.54 ms**，同进程串行控制前后约 **3.11/3.47 ms**；没有锁频或均衡整模型 A/B，不能外推到模型吞吐。旧控制仍有 2 个抽样超出门槛，因此相关 benchmark 均保留退出 1。该轮未放宽门槛、未把整个测试标成通过。sanitizer 对应 CLI 收紧前执行文件 `caea0e22…`，最终重测及各版本身份保存在 `artifacts/unified-memory-adaptive/q8-prefill-chunks-v6/summary.json`。
 
+当前默认 Q8/F32 预填充已从固定 32 列改为硬件/形状自适应的 32/64/128 列：查询实际设备 SM 数和两个内核的可驻留 CTA 数，只有 grid 足够利用设备且列尾部浪费不超过 25% 时扩大复用；小行条带保留并行度。它不改变逐 K FMA 次序、不增加全局 VRAM payload，也不把 CTA shared memory 与可交换的权重预算混为一项。`TS_GGML_Q8_PREFILL_TILE=32/64/128` 保留为显式覆盖，unset/auto 使用默认策略；并行 K 的 decode/small-batch 实验仍默认关闭。
+
+native `9be5eabf71cb2554a2bf4a71866c4b2d12ce8a898854ba79fdba91b94f82ca89` 对 unchanged ggml `ffa4e8b…` 完成 **7/7** CPU/CUDA Q8 精度检查和 **4/4** 文件/驻留 streaming 检查，无跳过。新增完整矩阵旧/新逐位检查、独立 FP64 检查以及足够大 grid 的自动选择场景，保留特殊值、stride 和 canary 检查。Qwen0.8B 在 context=2048、prompt=643、64 prediction rows、每进程三次测量下，固定 32/unset/unset/固定 32 两轮 ABBA 共八进程：默认解码的 prefill **2106.63→2791.37 tokens/s（+32.50%）**，decode **19.519→19.442**；开启既有 parallel-K 解码时 prefill **1994.47→2747.54（+37.76%）**，decode **177.943→181.950**。每轮固定/自动之间完整 logits 哈希相同、正常退出和 shutdown；不声称两种解码算术之间逐位一致。没有并发构建/下载/推理，未锁频，decode 范围重叠。这仍不是独立基线性能达标或语言质量通过。证据见忽略的 `q8-prefill-auto-v1/`。
+
+追加 Tensor Core 分量展开研究在同一 K=1024/M=7168/N=643 的 527 个 FP64 抽样中，部分配置满足原门槛，但仍慢于现有内核；K=256 分块出现绝对误差超限。未接入生产，失败和实验源快照留在 `q8-tensor-prefill-v1/`、`q8-tensor-prefill-v2/`。`bc084594` 的 Linux x64/ARM64 CPU CI 已完成通过，不能代替新改动的 CI 或排队中的 GPU job。
+
+追加本地 Qwen3.8 27B UD-IQ4_XS 时发现，加载器为合并 Gate/Up 对 28 层混合格式做二次量化。单 rank GGML CPU/CUDA、已有 split FFN 的模型现在保留原始对象/格式/字节；37 个同格式 pair 仍合并，Gemma/Qwen 的单卡预算不再计入混合 pair 的二次量化副本与 scratch。TP 和其他后端不在这次修改范围内。新回归在旧 Models 二进制上实际失败（加载器 1 项、预算 2 项）；修复后的 CPU 相关测试 **38/38**、CUDA fixture **1/1** 通过，均未跳过。
+
+同一 27B 文件 SHA `40fac405…`、native `9be5eabf…`，旧/新 Models `77380c6c…` / `e85e3b25…`：两次独立进程观测加载 **85.14→7.36 秒**、加载后工作集 **16.398→14.484 GB**。文件哈希会预热页缓存，且只有各一次，不能作为冷加载或重复性能结论；带全词表捕获的 prefill/decode 计时也不是安静吞吐测试。相同 258-token prompt、context512、F16 KV 和 16 步固定历史，干净 llama `4ebdf2c7…` 全部 66 层在 CUDA。HTTP 全词表移除共同 token offset 后，旧/新相对 L2 中位数 **0.007010/0.004672**，最大 **0.026925/0.017443**，两版 argmax 均 16/16 一致，但**都未达到 0.001 门槛**，部分逐行结果变差。修复加载时权重改写不等于整模型数值或语言质量达标。
+
+27B 上另测并行 Q8 向量与串行版本：完整固定历史数值比较最大 relative L2 **0.011107**，未通过。并行解码继续仅供显式实验，不因小模型速度结果而设为默认。独立比较工具 `AdaptiveMemoryProbe/llama-teacher.py` 检查原始捕获哈希和完整词表，保存失败响应；新增 4 项 CPU 工具测试通过。证据在 `qwen27-q8-precision-v1/`。
+
+Gemma 12B IQ2 的 embedding-only 诊断也未找到修复：仅把 tied `token_embd.weight` 从 Q3_K 替换为同源 Q4_K，另外 666 个 tensor 字节不变；原模型和明确标记的诊断变体在同一 FF7 提示、context4096、无惩罚/无重复截断/MTP关闭下均生成到 3072-token 上限，没有 EOS，并出现重复和事实错误。原版 19-token 周期后缀 1374 tokens，变体 41-token 周期后缀 914 tokens。未用变体冒充原文件修复。生成器增加单文件与 alignment 检查后的版本只重测了合成 fixture，完整变体使用 manifest 记录的先前版本。原始输出与全部身份在 `gemma-iq2-embedding-v1/`。
+
+另测本地 Gemma E4B Q8（SHA `96c45581…`、262 prompt tokens、context1024、16 步）：固定32/unset配置的完整 logits 逐字节一致，进程正常退出。但此模型的 resident 路径使用原有量化算术，没有触发新 Q8/F32 自动分块，只算未受影响路径的回归，不计为新内核覆盖或性能提升。证据 `gemma-q8-auto-v1/`。
+
 ## 15. 后续实际接入与硬件验证入口
 
 `PagedKvStorage` 的 `Acquire` 返回有生命周期的 span 租约；`BatchExecutor` 的捕获、尾页刷新、恢复全部使用该 API。底层将一个页面视为不解释布局的可变资源，按原字节回写/恢复。前缀引用继续保留逻辑页，最后一个引用消失才注销；id 再次分配时增加 epoch。失败的释放不把页面放回 free queue。捕获 scratch 和固定搬运缓冲在启动时预留，单个模型必须能容纳一个合法完整快照页。恢复阶段可在有空闲驻留容量时预取下一页，与当前注入操作重叠；停止/回收前等待预取结束。

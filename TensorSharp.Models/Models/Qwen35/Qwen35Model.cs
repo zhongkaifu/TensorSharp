@@ -256,9 +256,9 @@ namespace TensorSharp.Models
         private QuantizedWeight[] _ffnGateUpQW;
         // Mixed-quant "UD"/dynamic GGUFs can store ffn_gate and ffn_up in different
         // GGML types (IQ2_XS vs IQ2_S, IQ1_S vs IQ2_XXS, ...). One fused tensor
-        // cannot represent that, and both of those types need an importance matrix
-        // to requantize, so ModelBase.FuseGateUpWeights leaves such a layer alone.
-        // These hold the unfused pair for exactly those layers; the FFN then runs
+        // cannot represent that without changing the stored weights. Single-rank
+        // GGML CPU/CUDA keeps these pairs split instead of requantizing them.
+        // These hold the unfused pair for those layers; the FFN then runs
         // two matmuls instead of one, with the weights untouched. Half the layers
         // of an unsloth Qwen3.8 UD quant land here, so this is the normal case for
         // that family, not a corner.

@@ -206,7 +206,7 @@ internal sealed record DenseMemoryProfile(InferenceModelMemory Model, long Fusio
                 if (arch == "gemma4" && !file.Tensors.ContainsKey(v)) v = p + "attn_k.weight";
                 Fusion([p + "attn_q.weight", p + "attn_k.weight", v]);
             }
-            Fusion([p + "ffn_gate.weight", p + "ffn_up.weight"], allowRequantization: true);
+            Fusion([p + "ffn_gate.weight", p + "ffn_up.weight"]);
         }
         long fusion = checked((retainHostQuantizedWeights ? 0 : quantFusion) + floatFusionPeak + conversionPeak);
         if (retainHostQuantizedWeights) residentHost = checked(residentHost + quantFusion);
@@ -231,7 +231,7 @@ internal sealed record DenseMemoryProfile(InferenceModelMemory Model, long Fusio
             RetainedMappedWeightBytes = mapped
         };
 
-        void Fusion(string[] names, bool keepSources = false, bool allowRequantization = false)
+        void Fusion(string[] names, bool keepSources = false)
         {
             if (names.Any(n => !file.Tensors.ContainsKey(n))) return;
             var tensors = names.Select(n => file.Tensors[n]).ToArray();
@@ -245,15 +245,10 @@ internal sealed record DenseMemoryProfile(InferenceModelMemory Model, long Fusio
             long packed = names.Sum(n => storedBytes[n]);
             if (raw && tensors.Any(t => t.Type != tensors[0].Type))
             {
-                if (!allowRequantization) return;
-                // The loader tries either source type, never an arbitrary F32
-                // expansion. Bound the larger legal row representation; failed
-                // or imatrix-only conversions simply leave the original pair.
-                long row = tensors.Max(t => storedBytes[t.Name] / checked((long)t.Shape[1]));
-                packed = checked(row * tensors.Sum(t => checked((long)t.Shape[1])));
-                long rows = tensors.Max(t => checked((long)t.Shape[1]));
-                long scratch = checked(4L * (long)tensors[0].Shape[0] * checked((rows + 511) / 512 * 512));
-                conversionPeak = Math.Max(conversionPeak, checked(2 * row * rows + scratch));
+                // Both supported single-CUDA families keep mixed Gate/Up (and
+                // mixed attention packs) in their original formats. No fused
+                // allocation or load-time requantization scratch is needed.
+                return;
             }
             largest = Math.Max(largest, packed);
             extraDevice = checked(extraDevice + (retainSources ? packed : Math.Max(0, packed - source)));

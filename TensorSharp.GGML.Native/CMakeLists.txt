@@ -813,7 +813,8 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
         set_tests_properties(cuda-q8-f32-parallel-small-batch PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
         add_test(NAME cuda-q8-f32-prefill-64 COMMAND GgmlOpsCudaQ8PrecisionTest --prefill-64)
         add_test(NAME cuda-q8-f32-prefill-128 COMMAND GgmlOpsCudaQ8PrecisionTest --prefill-128)
-        set_tests_properties(cuda-q8-f32-prefill-64 cuda-q8-f32-prefill-128 PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+        add_test(NAME cuda-q8-f32-prefill-auto COMMAND GgmlOpsCudaQ8PrecisionTest --prefill-auto)
+        set_tests_properties(cuda-q8-f32-prefill-64 cuda-q8-f32-prefill-128 cuda-q8-f32-prefill-auto PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
         # Opt-in synthetic-data timing with byte-exact previous-kernel control
         # and independent sampled FP64 oracle; never a performance assertion.
         add_executable(GgmlOpsQ8VectorBench tests/q8_vector_bench.cpp ggml_ops_q8_precision.cu)

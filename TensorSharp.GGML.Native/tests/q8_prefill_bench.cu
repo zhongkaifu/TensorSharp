@@ -363,6 +363,14 @@ int main(int argc, char ** argv) {
     require(!experimental || std::strcmp(experimental, "1") != 0, "Unset small-batch experiment for the serial control");
     experimental = std::getenv("TS_GGML_Q8_PREFILL_TILE");
     require(!experimental || std::strcmp(experimental, "32") == 0, "Unset prefill-tile experiment or use 32 for the serial control");
+    // Production now chooses tiles from hardware and geometry. Pin this
+    // experiment's historical control explicitly instead of silently changing
+    // the reference timing when the production default evolves.
+#ifdef _WIN32
+    require(_putenv_s("TS_GGML_Q8_PREFILL_TILE", "32") == 0, "Cannot pin serial control tile");
+#else
+    require(setenv("TS_GGML_Q8_PREFILL_TILE", "32", 1) == 0, "Cannot pin serial control tile");
+#endif
     int devices = 0; if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) return 77;
     checked(cudaSetDevice(0));
     bool passed = true;

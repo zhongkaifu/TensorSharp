@@ -1094,6 +1094,13 @@ namespace TensorSharp.Models
         private bool KeepMixedGateUpSplitOnMlx =>
             _backend == BackendType.Mlx && SupportsSplitGateUpFfn && SplitsMixedGateUpOnMlx;
 
+        // Requantizing an already quantized matrix changes its values even when
+        // the destination uses more bits. Single-rank GGML split FFNs consume
+        // the original formats directly. TP sharding still expects a fused pair.
+        private bool KeepMixedGateUpSplit => KeepMixedGateUpSplitOnMlx ||
+            (!IsTensorParallel && SupportsSplitGateUpFfn &&
+             _backend is BackendType.GgmlCpu or BackendType.GgmlCuda);
+
         protected unsafe void FuseGateUpWeights(int numLayers = 0)
         {
             if (numLayers <= 0)
@@ -1122,8 +1129,8 @@ namespace TensorSharp.Models
                     // Mixed-quant "UD"/dynamic GGUFs (e.g. Qwen3.8 UD quants, where
                     // ffn_gate is IQ4_XS but ffn_up is Q5_K) store gate and up in
                     // different types, which a single fused tensor can't represent.
-                    // Requantize the lower-fidelity side into the higher-fidelity
-                    // type first, then fuse as usual.
+                    // Preserve the stored values where the backend has a split
+                    // path; other paths still require a common representation.
                     if (gw.Scale != uw.Scale)
                     {
                         // Per-tensor sidecar scales differ: one fused tensor would
@@ -1134,7 +1141,7 @@ namespace TensorSharp.Models
                     }
 
                     QuantizedWeight gateSrc = gw, upSrc = uw, requant = null;
-                    if (gw.GgmlType != uw.GgmlType && KeepMixedGateUpSplitOnMlx)
+                    if (gw.GgmlType != uw.GgmlType && KeepMixedGateUpSplit)
                     {
                         keptMixedLayers.Add(
                             $"{l}:{(Runtime.GgmlTensorType)(uint)gw.GgmlType}+" +
@@ -1247,7 +1254,8 @@ namespace TensorSharp.Models
             {
                 Console.WriteLine(
                     $"  Split projections: {keptMixedLayers.Count} of {numLayers} mixed-quant ffn_gate/ffn_up pairs run " +
-                    "as two matmuls in their own types on MLX (no requantization; TS_MLX_MIXED_GATE_UP_SPLIT=0 fuses them).");
+                    $"as two matmuls in their original types on {_backend} (no requantization).");
+                Console.WriteLine($"    Preserved layers: {string.Join(", ", keptMixedLayers)}");
             }
             ReportDeclinedFusionCopies();
         }

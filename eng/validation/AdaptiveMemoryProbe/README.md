@@ -1,5 +1,88 @@
 # Adaptive memory execution
 
+The owned CUDA Q8/F32 prefill now selects 32, 64 or 128 columns automatically
+when `TS_GGML_Q8_PREFILL_TILE` is unset (or `auto`). It uses each device's SM
+count and actual kernel occupancy, the row/column geometry and a 25% maximum
+padding allowance. Small row strips retain more parallelism. No global device
+workspace or widened weight copy is added, and every output keeps the original
+K-increasing FMA order. Explicit `32`, `64` and `128` remain available for
+controlled comparisons. The separate parallel-K decode/small-batch experiments
+remain opt-in; automatic prefill does not change their default arithmetic.
+
+`compare-prefill-tiles.py --automatic --vector-mode serial --executions ...`
+requires four fresh processes in `32/unset/unset/32` order, three measured
+requests each, native selection logs, identical complete logit hashes and
+successful exit/shutdown. Use `--vector-mode parallel` when that experiment is
+enabled in all arms; do not mix it into the prefill comparison.
+
+On RTX 3080 Laptop 16 GiB, Qwen3.5 0.8B Q8, 643 prompt tokens, context 2048,
+64 prediction rows, native `9be5eabf71cb2554a2bf4a71866c4b2d12ce8a898854ba79fdba91b94f82ca89`
+and unchanged ggml `ffa4e8b80930029a35991f94e7c8a93cd67730ab`, six samples/arm gave:
+
+| Fixed decode arithmetic | Prefill fixed 32 → automatic (tokens/s) | Decode fixed 32 → automatic (tokens/s) |
+| --- | ---: | ---: |
+| Default K-ordered | 2106.63 → 2791.37 (+32.50%) | 19.519 → 19.442 |
+| Opt-in parallel-K | 1994.47 → 2747.54 (+37.76%) | 177.943 → 181.950 |
+
+Complete logits are byte-identical **within each row's prefill comparison**,
+not between the two decode arithmetic policies. Eight isolated processes
+finished successfully; compilation/downloads/other inference did not overlap.
+Clocks were not locked and decode ranges overlap. This is one checkpoint and
+geometry, not independent-engine parity or a semantic-quality pass. The default
+decode remains slow and prefill is still below the earlier independent baseline.
+Reports and full binary identities are ignored under `q8-prefill-auto-v1/`.
+
+Mixed Gate/Up matrices now keep their original formats on single-rank GGML
+CPU/CUDA families with a split FFN. Matching formats still fuse. The single-CUDA
+Gemma/Qwen budget forecast no longer reserves a requantized replacement or its
+conversion scratch. Tensor-parallel and other backend policies are unchanged.
+Regression fixtures assert original objects/types/bytes and matching-format
+concatenation; the old loader fails the mixed-format fixture and both affected
+architecture forecasts. Current CPU checks pass 38/38, plus the CUDA fixture.
+
+On local `Qwen3.8-27B-UD-IQ4_XS.gguf` (SHA256
+`40fac4050e940397dbf13087afd50f4734a11805bf9d65ef8ddd7483470e6199`),
+28 mixed layers remain split and 37 matching pairs still fuse. One fresh process
+per version observed load 85.14 → 7.36 seconds and post-load working set
+16,397,885,440 → 14,483,877,888 bytes. This is a warmed file-cache observation,
+not a cold-load or repeated performance result. Timed forwards with full-logit
+capture were about 397/393 prefill and 7.57/7.55 decode tokens/s; capture perturbs
+execution, so these are not quiet throughput qualifications.
+
+An unchanged llama.cpp `4ebdf2c74acce30883d8e34b7c70b3eb8146f2fe` ran the same
+checkpoint, 258 prompt IDs, context 512, F16 KV and 16 fixed-history predictions,
+all 66/66 layers offloaded. Complete-vocabulary comparisons remove only a common
+token offset from HTTP log probabilities. Old/new median relative errors were
+0.007010 / 0.004672, maxima 0.026925 / 0.017443; both matched all 16 argmax IDs,
+but **both fail the 0.001 numerical gate**. Some individual rows became worse.
+Preserving the checkpoint removes load-time weight corruption; this observation
+does not establish full-model numerical or language-quality correctness.
+
+The same repaired model with experimental parallel-K vector reduction also
+**fails** its matched-history comparison against serial reduction (maximum
+relative L2 0.011107). This wider-model failure is why parallel decode remains
+opt-in despite its earlier narrow-model performance result. Evidence and exact
+binary identities are under ignored `qwen27-q8-precision-v1/`.
+
+A separate local Gemma E4B Q8 regression (checkpoint `96c45581…`, 262 prompt
+tokens, context 1024, 16 predictions, current Models `e85e3b25…`) produced
+byte-identical complete outputs with fixed-32 versus unset configuration.
+Its resident path uses the existing quantized arithmetic and did **not** invoke
+the Q8/F32 automatic tiler. Thus `gemma-q8-auto-v1/` is an unaffected-path
+regression, not wider automatic-kernel coverage or a performance improvement.
+
+`llama-teacher.py` accepts one or more `--report <report.json>` captures, a
+`--server` URL, `--identity <identity.json>` and a fresh `--output` directory.
+The identity records `model_sha256`, `binary_sha256`, `source_revision`, the
+actual `command` and `startup_evidence`. The caller owns/stops the server and
+records its real configuration and libraries; HTTP alone cannot authenticate
+that manifest. Reports must contain complete captures with identical checkpoint,
+geometry and histories; different managed binaries are allowed. The tool verifies
+all capture bytes, saves requests and full responses (gzip), rejects clipped or
+incomplete probabilities, and reports the gate per input. A failing older input
+keeps the combined exit nonzero even if a newer input passes. Contract tests:
+`python -m unittest discover -s eng/validation/tests -p test_adaptive_llama_teacher.py`.
+
 This probe exercises `AdaptiveModelSession` with the same `ForwardRefill` and
 `Forward` entries as a regular resident model. It records load time separately,
 one warmup followed by measured requests, complete raw-logit hashes, token IDs,
@@ -264,13 +347,14 @@ server's duplicate `none,none` speculation serialization; that trial is retained
 as failed evidence. The successful v2 run restarted the server and still rejects
 every active speculation type.
 
-The later Q8 prefill experiment uses inherited `TS_GGML_Q8_PREFILL_TILE=64` or
-`128`; unset/`32` preserves the default. N below the selected tile falls back
+The earlier Q8 prefill experiment used inherited `TS_GGML_Q8_PREFILL_TILE=64` or
+`128`; at that revision unset meant `32`. Current automatic defaults are
+documented at the top of this file. N below an explicit selected tile falls back
 to a smaller tile. All outputs retain their original K-increasing F32 FMA
 order. The experiment reuses decoded weights across more activation columns
 within a CTA; it increases register/shared-memory use without a global weight
-expansion or extra payload allocation. It remains opt-in pending wider device,
-shape and mixed-request performance coverage.
+expansion or extra payload allocation. Explicit overrides remain available;
+wider device, shape and mixed-request performance coverage is still incomplete.
 
 Run six fresh processes in order 32/64/128/128/64/32, with
 `TS_GGML_Q8_PARALLEL_VECTOR=1`, `TS_GGML_Q8_PARALLEL_SMALL_BATCH=0`, identical
