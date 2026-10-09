@@ -12,9 +12,9 @@ spec.loader.exec_module(evidence)
 require = evidence.require
 
 
-def compare(paths, *, device=False):
-    cache = "DeviceCache" if device else "HostCache"
-    option = "--device-cache-bytes" if device else "--host-cache-bytes"
+def compare(paths, *, device=False, workspace=False):
+    cache = "DeviceWorkspaceCache" if workspace else "DeviceCache" if device else "HostCache"
+    option = "--workspace-cache-bytes" if workspace else "--device-cache-bytes" if device else "--host-cache-bytes"
     result = {"ComparableAndBitwiseEqual": False, "Errors": [], "Measurements": {}, "Executions": [],
         "Qualification": "Balanced fresh processes, unchanged complete logits, charged-owner cleanup and successful exits. Logical source bytes are not physical SSD traffic. Warm file cache; not independent arithmetic, semantic quality or engine parity. Idle hardware and thermal controls require external evidence."}
     try:
@@ -44,11 +44,16 @@ def compare(paths, *, device=False):
                     and plan.get("SelectedCandidate", {}).get("Placement") == 2, "File-weight placement was not exercised")
             require(plan["SelectedCandidate"] == baseline["Plan"]["SelectedCandidate"], "Execution geometry differs")
             previous_reads = previous_hits = previous_device_hits = previous_uploads = 0
+            previous_creations = previous_reuses = 0
             for row in report["Records"]:
                 usage = row.get("Streaming") or {}
                 require(usage.get("LinearTiles", 0) > 0 and usage.get("FileBytesRead", 0) > 0, "No streamed work")
                 require(0 <= usage[cache + "Bytes"] <= usage["Peak" + cache + "Bytes"] <= ceiling, "Invalid cache payload accounting")
-                if ceiling:
+                if workspace:
+                    require(usage["DeviceWorkspaceReuses"] >= 0, "Invalid workspace reuse counter")
+                    require((usage[cache + "Bytes"] > 0 and usage["DeviceWorkspaceReuses"] > 0) if ceiling
+                            else usage["DeviceWorkspaceReuses"] == 0, "Workspace cache was not exercised as requested")
+                elif ceiling:
                     require(usage[cache + "Bytes"] > 0 and usage[cache + "HitBytes"] > 0 and usage[cache + "Hits"] > 0,
                             "Cache was enabled but not exercised")
                 else:
@@ -61,16 +66,25 @@ def compare(paths, *, device=False):
                 require(reads > 0 and hits >= 0, "Invalid per-request source counters")
                 require(device_hits >= 0, "Device reuse counter decreased")
                 extra = {"DeviceCacheBytesPerRequest": device_hits}
-                if device:
+                if device or workspace:
                     uploads = usage["WeightUploadBytes"] - previous_uploads
                     require(uploads >= 0 and usage["PeakDeviceOwnedBytes"] >= usage["PeakDeviceCacheBytes"],
                             "Invalid device upload/ownership counters")
                     require(usage["PeakDeviceOwnedBytes"] <= int(report["RequestedOptions"]["--device-bytes"]),
                             "Combined device retention and workspace exceeded the ceiling")
-                    if ceiling and not row["Warmup"]:
+                    if device and ceiling and not row["Warmup"]:
                         require(device_hits > 0, "Measured request did not reuse device weights")
                     extra["WeightUploadBytesPerRequest"] = uploads
                     previous_uploads = usage["WeightUploadBytes"]
+                if workspace:
+                    creations = usage["DeviceSessionCreations"] - previous_creations
+                    reuses = usage["DeviceWorkspaceReuses"] - previous_reuses
+                    require(creations >= 0 and reuses >= 0, "Workspace lifecycle counter decreased")
+                    require(usage["PeakDeviceOwnedBytes"] >= usage["PeakDeviceWorkspaceCacheBytes"], "Invalid workspace ownership")
+                    if ceiling and not row["Warmup"]:
+                        require(reuses > 0, "Measured request did not reuse workspaces")
+                    extra.update(DeviceSessionCreationsPerRequest=creations, DeviceWorkspaceReusesPerRequest=reuses)
+                    previous_creations, previous_reuses = usage["DeviceSessionCreations"], usage["DeviceWorkspaceReuses"]
                 if not row["Warmup"]:
                     samples["on" if ceiling else "off"].append({**row, "FileBytesPerRequest": reads, "CacheBytesPerRequest": hits, **extra})
                 previous_reads, previous_hits = usage["FileBytesRead"], usage["HostCacheHitBytes"]
@@ -80,20 +94,29 @@ def compare(paths, *, device=False):
             result["Measurements"][arm] = {key: {"Median": statistics.median(row[key] for row in rows),
                 "Minimum": min(row[key] for row in rows), "Maximum": max(row[key] for row in rows), "Samples": len(rows)}
                 for key in ("PrefillTokensPerSecond", "DecodeTokensPerSecond", "FileBytesPerRequest", "CacheBytesPerRequest",
-                            "DeviceCacheBytesPerRequest", *(("WeightUploadBytesPerRequest",) if device else ()))}
+                            "DeviceCacheBytesPerRequest", *(("WeightUploadBytesPerRequest",) if device or workspace else ()),
+                            *(("DeviceSessionCreationsPerRequest", "DeviceWorkspaceReusesPerRequest") if workspace else ()))}
         measurements = result["Measurements"]
         consumed_bytes = {row["FileBytesPerRequest"] + row["CacheBytesPerRequest"] + row["DeviceCacheBytesPerRequest"]
                           for rows in samples.values() for row in rows}
         require(len(consumed_bytes) == 1, "Cache/source counters do not describe the same consumed weight bytes")
-        if device:
+        if device or workspace:
             projected_bytes = {row["WeightUploadBytesPerRequest"] + row["DeviceCacheBytesPerRequest"]
                                for rows in samples.values() for row in rows}
             require(len(projected_bytes) == 1, "Upload/reuse counters do not describe the same projected weights")
-        reduced = "WeightUploadBytesPerRequest" if device else "FileBytesPerRequest"
-        require(measurements["on"][reduced]["Median"] < measurements["off"][reduced]["Median"], "No measured transfer/read reduction")
+        if workspace:
+            operations = {row["DeviceSessionCreationsPerRequest"] + row["DeviceWorkspaceReusesPerRequest"]
+                          for rows in samples.values() for row in rows}
+            require(len(operations) == 1, "Creation/reuse counters do not describe the same workspace operations")
+            for key in ("FileBytesPerRequest", "CacheBytesPerRequest", "DeviceCacheBytesPerRequest", "WeightUploadBytesPerRequest"):
+                require(len({row[key] for rows in samples.values() for row in rows}) == 1,
+                        "Workspace comparison changed weight transfers or reads")
+        reduced = "DeviceSessionCreationsPerRequest" if workspace else "WeightUploadBytesPerRequest" if device else "FileBytesPerRequest"
+        require(measurements["on"][reduced]["Median"] < measurements["off"][reduced]["Median"], "No measured allocation/transfer/read reduction")
         result["OnToOffRatio"] = {key: measurements["on"][key]["Median"] / measurements["off"][key]["Median"]
             for key in ("PrefillTokensPerSecond", "DecodeTokensPerSecond", "FileBytesPerRequest",
-                        *(("WeightUploadBytesPerRequest",) if device else ()))}
+                        *(("WeightUploadBytesPerRequest",) if device or workspace else ()),
+                        *(("DeviceSessionCreationsPerRequest",) if workspace else ()))}
         result["ComparableAndBitwiseEqual"] = True
     except Exception as error:
         result["Errors"].append(str(error))

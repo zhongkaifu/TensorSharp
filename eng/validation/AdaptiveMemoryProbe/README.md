@@ -1,5 +1,37 @@
 # Adaptive memory execution
 
+`--workspace-cache-bytes` opts into reuse of idle row-tiled CUDA sessions
+(default zero). Both weights and activations are replaced before each use;
+this retains allocation capacity, not weight identity. Reuse requires the same
+rank, weight format and input width, with sufficient row/token capacity.
+ResidentCuda additionally requires the original logical matrix/token shape.
+Complete-matrix multi-token Gemma sessions are excluded. Up to 16 completed
+healthy sessions share the device budget; admission leaves the execution peak
+available, and pressure releases idle workspaces before retained weights.
+Normal KV reset preserves healthy sessions. Failed cleanup preserves ownership
+and blocks reuse until explicit reset physically retires the failed owner.
+
+For an isolated allocation comparison, keep RAM/device weight-cache ceilings
+fixed, and run four fresh processes with workspace caching off/on/on/off using
+the timing/identity requirements below. Then run `compare-workspace-cache.py
+--executions <four execution.json paths> --output <json>`. It requires complete
+logit/history equality, actual reuse in every measured request, fewer session
+creations, identical weight reads/uploads and operation counts, budget bounds,
+successful shutdown and zero final owners. A cache that displaces weights fails
+this isolated comparison; any such tradeoff needs a separate reported workload.
+These checks do not themselves guarantee a speedup. The option stays disabled
+by default pending broader model/device and cache-allocation measurements.
+
+The local `workspace-reuse-v1` comparison used Qwen0.8B, context512, 67 prompt
+tokens, 16 predictions, 512 MiB host/device, 256 MiB host-cache and fixed 128 MiB
+device-weight-cache ceilings. A 64 MiB workspace ceiling retained 31,555,584 B.
+Six measured requests per arm gave prefill 82.297→89.414 tokens/s (+8.65%) and
+decode 3.574→4.577 (+28.08%); each measured request replaced 2,224 fresh sessions
+with reuse. All complete logits/history, weight uploads and logical reads were
+unchanged. Shared owners returned to zero. Native `74c1b4f8…` was unchanged;
+Models `e1162225…`. Quiet RTX 3080 Laptop, warm file cache, unlocked clocks.
+This does not establish full-resident parity or a global cache-allocation policy.
+
 `--device-cache-bytes` bounds optional complete file-weight CUDA arenas (zero
 disables retention; omitted means use available forecast slack). The shared
 budget charges retained weights, input/output capacity and arithmetic scratch.

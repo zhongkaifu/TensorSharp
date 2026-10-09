@@ -190,6 +190,20 @@ budget has enough space; a tight or shared RAM/device pool keeps one buffer.
 Pending reads drain before disposal/refund. This overlaps file reads with the
 current operation; CUDA transfers remain synchronous.
 
+`--workspace-cache-bytes BYTES` (default zero) retains healthy idle row-tiled
+CUDA sessions in the same device budget. It replaces both input and weight
+bytes on reuse; compatible capacity is not a promise of cached weight identity.
+The pool has at most 16 entries and yields to workspace pressure before the
+weight cache. ResidentCuda reuses only identical original logical shapes;
+its complete-matrix multi-token path is excluded. `DeviceWorkspaceReuses`
+counts borrowed sessions, `DeviceSessionCreations` counts fresh allocations,
+and `DeviceWorkspaceCacheBytes` counts idle payload. `PeakDeviceOwnedBytes`
+includes retained weights, idle sessions and active workspace. These counters
+exclude driver/stream metadata and other model allocations. Correctness, reset
+and zero-owner checks still apply; successful execution alone is not a timing
+or language-quality result. For an isolated ABBA comparison use the adaptive
+probe's `compare-workspace-cache.py` with fixed weight-cache settings.
+
 The 2026-10-08 E4B short check with 16 MiB tiles, 128 MiB host and 256 MiB device
 quota executed 1,704 read-ahead operations and matched all eight full logit rows
 byte-for-byte. Peak charged host/device payload was 34,343,936 / 117,170,176 bytes,

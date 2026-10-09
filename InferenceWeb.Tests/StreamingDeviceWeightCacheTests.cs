@@ -7,7 +7,7 @@ using TensorSharp.Models;
 
 namespace InferenceWeb.Tests;
 
-public sealed class StreamingDeviceWeightCacheTests
+public sealed partial class StreamingDeviceWeightCacheTests
 {
     [GgmlTheory(BackendType.GgmlCuda)]
     [InlineData(8, false)]
@@ -121,7 +121,9 @@ public sealed class StreamingDeviceWeightCacheTests
             [new SyntheticGguf.Tensor { Name = "a.weight", Dims = [64, 32], Type = (SyntheticGguf.GgmlType)type,
                 Data = Enumerable.Range(0, 64 * 32).Select(i => (i % 7 - 3) / 4f).ToArray() },
              new SyntheticGguf.Tensor { Name = "b.weight", Dims = [64, 32], Type = (SyntheticGguf.GgmlType)type,
-                Data = Enumerable.Range(0, 64 * 32).Select(i => (i % 5 + 1) / 4f).ToArray() }]);
+                    Data = Enumerable.Range(0, 64 * 32).Select(i => (i % 5 + 1) / 4f).ToArray() },
+             new SyntheticGguf.Tensor { Name = "c.weight", Dims = [128, 32], Type = (SyntheticGguf.GgmlType)type,
+                Data = Enumerable.Range(0, 128 * 32).Select(i => (i % 7 - 2) / 4f).ToArray() }]);
         public void Dispose() => File.Delete(Path);
     }
 
@@ -134,8 +136,10 @@ public sealed class StreamingDeviceWeightCacheTests
             => _resident ? GgmlWeightStreamingArithmetic.ResidentCuda : GgmlWeightStreamingArithmetic.FullPrecision;
         protected override float[] ForwardCore(int[] tokens)
         {
-            using var input = CreateFloatTensor(Enumerable.Range(0, tokens.Length * 64).Select(i => (i % 11 - 5) / 8f).ToArray(), tokens.Length, 64);
-            using var output = LinearForward(input, tokens[0] == 0 ? "a.weight" : "b.weight");
+            int width = tokens[0] == 2 ? 128 : 64;
+            using var input = CreateFloatTensor(Enumerable.Range(0, tokens.Length * width)
+                .Select(i => (i % 11 - 5) / 8f + tokens[0] / 32f).ToArray(), tokens.Length, width);
+            using var output = LinearForward(input, tokens[0] == 0 ? "a.weight" : tokens[0] == 1 ? "b.weight" : "c.weight");
             return output.GetElementsAsFloat(tokens.Length * 32);
         }
         protected override void ResetKVCacheCore() { }

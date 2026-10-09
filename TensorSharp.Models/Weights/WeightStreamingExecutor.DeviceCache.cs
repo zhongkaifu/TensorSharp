@@ -22,7 +22,7 @@ internal sealed partial class WeightStreamingExecutor
     private void ObserveDevice(long workspace)
     {
         _peakDevice = Math.Max(_peakDevice, workspace);
-        _peakDeviceOwnedBytes = Math.Max(_peakDeviceOwnedBytes, checked(_deviceCacheBytes + workspace));
+        _peakDeviceOwnedBytes = Math.Max(_peakDeviceOwnedBytes, checked(_deviceCacheBytes + _workspaceBytes + workspace));
     }
 
     private unsafe bool TryRetainedLinear(QuantizedWeight weight, IntPtr input, IntPtr output, int tokens, int rank)
@@ -145,11 +145,16 @@ internal sealed partial class WeightStreamingExecutor
 
     private void LeaveDeviceAvailable(long required)
     {
-        while (_deviceCacheBytes > 0)
+        while (_deviceCacheBytes > 0 || _workspaceBytes > 0)
         {
             var available = _options.Budget.Snapshot().ToDictionary(p => p.Pool, p => p.Available, StringComparer.Ordinal);
             long shortage = _options.DevicePools.Max(p => Math.Max(0, required - available[p]));
             if (shortage == 0) return;
+            if (_workspaceBytes > 0)
+            {
+                TrimWorkspaces(Math.Max(0, _workspaceBytes - shortage));
+                continue;
+            }
             TrimDeviceCache(Math.Max(0, _deviceCacheBytes - shortage));
         }
     }

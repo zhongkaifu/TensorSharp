@@ -57,6 +57,20 @@ public sealed class WeightStreamingOptions
 
     private long _hostCacheBytes, _hostCacheReserveBytes = 4L << 20;
     private long _deviceCacheBytes, _deviceCacheReserveBytes = 4L << 20;
+    private long _deviceWorkspaceCacheBytes, _deviceWorkspaceCacheReserveBytes = 4L << 20;
+    /// <summary>Optional ceiling for idle row-streaming CUDA arenas. Reuse replaces
+    /// both input and weight bytes; it does not retain a weight identity. Complete
+    /// resident-matrix projections are excluded. Zero disables workspace retention.</summary>
+    public long DeviceWorkspaceCacheBytes
+    {
+        get => _deviceWorkspaceCacheBytes;
+        init { ArgumentOutOfRangeException.ThrowIfNegative(value); _deviceWorkspaceCacheBytes = value; }
+    }
+    public long DeviceWorkspaceCacheReserveBytes
+    {
+        get => _deviceWorkspaceCacheReserveBytes;
+        init { ArgumentOutOfRangeException.ThrowIfNegative(value); _deviceWorkspaceCacheReserveBytes = value; }
+    }
     /// <summary>Optional ceiling for complete immutable weights and their reusable
     /// CUDA input/output/scratch arenas. FullPrecision supports prefill and decode;
     /// ResidentCuda currently retains only fixed single-token projections.
@@ -109,4 +123,8 @@ public readonly record struct WeightStreamingStatistics(long FileBackedWeightByt
     public long DeviceCacheEvictedBytes { get; init; }
     public long WeightUploadBytes { get; init; }
     public long PeakDeviceOwnedBytes { get; init; }
+    public long DeviceWorkspaceCacheBytes { get; init; }
+    public long PeakDeviceWorkspaceCacheBytes { get; init; }
+    public long DeviceWorkspaceReuses { get; init; }
+    public long DeviceWorkspaceEvictedBytes { get; init; }
 }

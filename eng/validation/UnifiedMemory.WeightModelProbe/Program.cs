@@ -11,8 +11,8 @@ using TensorSharp.Runtime;
 var options = new Dictionary<string, string>(StringComparer.Ordinal);
 for (int i = 0; i < args.Length; i += 2)
 {
-    if (i + 1 == args.Length || args[i] is not ("--model" or "--json" or "--steps" or "--prompt-tokens" or "--tile-bytes" or "--token-rows" or "--host-bytes" or "--device-bytes" or "--cycles" or "--prefill" or "--prefill-chunk" or "--read-ahead" or "--host-cache-bytes" or "--device-cache-bytes"))
-        throw new ArgumentException("Use --model PATH --json PATH --steps 4 --prompt-tokens 32 --tile-bytes 1048576 --token-rows 32 --host-bytes 2097152 --device-bytes 2097152 [--prefill forward|refill] [--prefill-chunk TOKENS] [--read-ahead true|false] [--host-cache-bytes BYTES] [--device-cache-bytes BYTES].");
+    if (i + 1 == args.Length || args[i] is not ("--model" or "--json" or "--steps" or "--prompt-tokens" or "--tile-bytes" or "--token-rows" or "--host-bytes" or "--device-bytes" or "--cycles" or "--prefill" or "--prefill-chunk" or "--read-ahead" or "--host-cache-bytes" or "--device-cache-bytes" or "--workspace-cache-bytes"))
+        throw new ArgumentException("Use --model PATH --json PATH --steps 4 --prompt-tokens 32 --tile-bytes 1048576 --token-rows 32 --host-bytes 2097152 --device-bytes 2097152 [--prefill forward|refill] [--prefill-chunk TOKENS] [--read-ahead true|false] [--host-cache-bytes BYTES] [--device-cache-bytes BYTES] [--workspace-cache-bytes BYTES].");
     options.Add(args[i], args[i + 1]);
 }
 string modelPath = Path.GetFullPath(options["--model"]);
@@ -44,7 +44,8 @@ KvCacheDtypeConfig.ConfigureFromEnvironment();
 var budget = new MemoryBudget(new[] { new MemoryCharge("weights/host", hostBytes), new MemoryCharge("weights/gpu0", deviceBytes) });
 var streamingOptions = new WeightStreamingOptions(budget, "weights/host", new[] { "weights/gpu0" }, tileBytes, tokenRows, readAhead: readAhead)
 { HostCacheBytes = long.Parse(options.GetValueOrDefault("--host-cache-bytes", "0")),
-    DeviceCacheBytes = long.Parse(options.GetValueOrDefault("--device-cache-bytes", "0")) };
+    DeviceCacheBytes = long.Parse(options.GetValueOrDefault("--device-cache-bytes", "0")),
+    DeviceWorkspaceCacheBytes = long.Parse(options.GetValueOrDefault("--workspace-cache-bytes", "0")) };
 var cases = new List<Case>();
 var references = new List<float[][]>();
 var metrics = new List<object>();
@@ -243,6 +244,8 @@ try
             "Optional weight reuse exceeded its cache ceiling.");
         Require(usage.Value.PeakDeviceCacheBytes <= streamingOptions.DeviceCacheBytes,
             "Optional device reuse exceeded its cache ceiling.");
+        Require(usage.Value.PeakDeviceWorkspaceCacheBytes <= streamingOptions.DeviceWorkspaceCacheBytes,
+            "Optional idle workspace reuse exceeded its cache ceiling.");
         Require(usage.Value.PeakHostStagingBytes <= hostBytes && usage.Value.PeakDeviceWorkspaceBytes <= deviceBytes
             && usage.Value.PeakDeviceOwnedBytes <= deviceBytes,
             "Streaming workspace exceeded its shared budget.");
@@ -297,6 +300,7 @@ File.WriteAllText(reportPath, JsonSerializer.Serialize(new {
     HostBytes = hostBytes, DeviceBytes = deviceBytes, ReadAhead = readAhead, ExpectedFileBytes = expectedFileBytes,
     HostCacheCeilingBytes = streamingOptions.HostCacheBytes, HostCacheReserveBytes = streamingOptions.HostCacheReserveBytes,
     DeviceCacheCeilingBytes = streamingOptions.DeviceCacheBytes, DeviceCacheReserveBytes = streamingOptions.DeviceCacheReserveBytes,
+    WorkspaceCacheCeilingBytes = streamingOptions.DeviceWorkspaceCacheBytes,
     ResidentParameterBytes = residentParameterBytes, Cases = cases, Metrics = metrics, Usage = usage,
     CycleResults = cycleResults, TotalFileBytesRead = totalFileBytesRead, TotalLinearTiles = totalLinearTiles,
     ForwardTimings = forwardTimings, TotalForwardMilliseconds = totalForwardMilliseconds,

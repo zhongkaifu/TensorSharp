@@ -545,6 +545,30 @@ Gemma 12B IQ2 的 embedding-only 诊断也未找到修复：仅把 tied `token_e
 
 本轮没有新增 Flash Next、Qwen Image、IQ2 FF7、多 GPU 或智能体语义质量通过记录。SSH 指定 VM 仍拒绝连接（exit255）。更广的模型接入、独立引擎性能差距、IQ2 重复输出、媒体文字质量和异步搬运继续保留为未完成项。
 
+### 2026-10-09 UTC：完成通知边界与预算内 CUDA 工作区复用
+
+上一提交 `65ec9e04` 的 Linux ARM64 CI 通过，x64 有一项前缀保留测试失败（8094 passed、82 skipped、1 failed）。定位为请求的完成通知早于结束状态的保留/释放交接：容量压力先移除旧 checkpoint，再发布结束状态，调用方可能在两者之间读到空集合。现在正常结果处理在交接完成后才关闭 token channel 并通知 completion；释放异常仍保留原失败 owner 和额度，不承诺失败释放已经成功。新的确定性阻塞测试在旧 Runtime 上失败，修复后的前缀/引擎/预算相关测试 **422 passed、33 skipped**；跳过的模型场景不计通过。
+
+文件执行器新增可选的空闲行分块 CUDA arena 复用，`DeviceWorkspaceCacheBytes` / adaptive `MaximumStreamingWorkspaceCacheBytes` 默认均为零。每次借用重新上传输入和权重；匹配 rank、格式、K 和行/token 容量，ResidentCuda 还要求原始逻辑 N/M 相同，完整矩阵的多 token Gemma 路径不进入此池。最多保留 16 个成功完成的 session，所有 payload 继续占用共享设备预算。动态入口保留执行期峰值，压力下先物理释放空闲工作区，再回收权重缓存；正常 reset 保留健康项，失败 owner 禁止重用并在显式 reset 重试释放。不同 K、输入/权重替换、共享 owner、失败创建/上传/释放与恢复相关测试 **74/74** 通过，无跳过。
+
+Models SHA `e1162225ee23c3aae812d576a465d118909e55827a29a94cd31dc0be7df0a4d6`，AdaptiveMemoryProbe `713f29e1e2dbd63722e3f6efa2e9e1d4d9908feb6c79324fb5d142bfdcb34250`。本次没有改动 native，实际加载的仍为已验证的 `74c1b4f8…`；ggml `ffa4e8b80930029a35991f94e7c8a93cd67730ab` 工作树保持干净，未重复把上次 13 项原生测试计作本次新增覆盖。
+
+Qwen0.8B Q8 的两轮加载、32 行完整词表通过原门槛（最大 relative L2 **0.0008168431**，最低 cosine **0.9999996796**）。实际空闲工作区 **4,214,272 B**，复用 **2,221** 次；保留权重加全部工作区峰值 **138,409,472 B**。本地 Gemma E4B 的 8 行完整词表与常驻路径逐位一致，空闲工作区 **13,778,688 B**，复用 **1,455** 次，合计峰值 **265,132,800 B**，仍在 256 MiB 设备配额内。两模型的压力拒绝、reset 恢复与加载周期结束后零 owner 均通过；这些短数值检查不证明中文长输出语义正确。
+
+独立安静测速使用 Qwen0.8B、context512、67 prompt tokens、16 predictions、host/device ceiling 各 512 MiB、RAM cache ceiling 256 MiB、device weight cache ceiling 固定 128 MiB。工作区 ceiling 以 **0/64/64/0 MiB** 运行四个新进程，每进程排除 warmup，测三次；实际工作区保留 **31,555,584 B**，设备权重保留 **134,195,200 B**，两者峰值合计 **165,750,784 B**。
+
+| 指标 | 工作区复用关闭 | 工作区复用开启 |
+| --- | ---: | ---: |
+| prefill 中位 tokens/s（范围） | 82.297（80.362–84.209） | 89.414（87.368–90.207），+8.65% |
+| decode 中位 tokens/s（范围） | 3.574（3.492–3.610） | 4.577（4.542–4.602），+28.08% |
+| 每测量请求新建 session | 2,224 | 0（复用 2,224 次） |
+| 每测量请求逻辑源读取 B | 7,300,775,936 | 7,300,775,936 |
+| 每测量请求权重上传 B | 11,779,715,072 | 11,779,715,072 |
+
+所有 warmup/测量的完整 logits 和 token 历史一致，退出、shutdown 和最终 owner 清零通过。比较器还要求每个测量请求实际复用、创建与复用次数合计一致、RAM/device 权重命中及传输量不变；若工作区挤走权重，则拒绝这类隔离对照。三个缓存比较器 **6/6** 测试通过，包含伪造复用、计数下降、权重竞争、额度越界、输出变化和超时的拒绝用例。证据在忽略的 `artifacts/unified-memory-adaptive/workspace-reuse-v1/`，可复用入口为 [compare-workspace-cache.py](../../eng/validation/AdaptiveMemoryProbe/compare-workspace-cache.py)。
+
+本机仍为 RTX 3080 Laptop 16 GiB；无并发构建/推理/下载，哈希预热文件缓存，未锁频。配置与上一次 device-cache ABBA 不同，不能把两轮百分比相乘。工作区选项保持显式启用：尚未证明更广形状/设备或动态权重与工作区竞争下的最优分配。同步 CUDA 搬运、全驻留基线差距、IQ2 FF7 重复、媒体文字质量、多 GPU 和其他未执行场景继续未完成。
+
 ## 15. 后续实际接入与硬件验证入口
 
 `PagedKvStorage` 的 `Acquire` 返回有生命周期的 span 租约；`BatchExecutor` 的捕获、尾页刷新、恢复全部使用该 API。底层将一个页面视为不解释布局的可变资源，按原字节回写/恢复。前缀引用继续保留逻辑页，最后一个引用消失才注销；id 再次分配时增加 epoch。失败的释放不把页面放回 free queue。捕获 scratch 和固定搬运缓冲在启动时预留，单个模型必须能容纳一个合法完整快照页。恢复阶段可在有空闲驻留容量时预取下一页，与当前注入操作重叠；停止/回收前等待预取结束。

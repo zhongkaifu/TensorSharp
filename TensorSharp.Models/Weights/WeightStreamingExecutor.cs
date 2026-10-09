@@ -87,7 +87,9 @@ internal sealed partial class WeightStreamingExecutor : IDisposable
                     DeviceCacheBytes = _deviceCacheBytes, PeakDeviceCacheBytes = _peakDeviceCacheBytes,
                     DeviceCacheHits = _deviceCacheHits, DeviceCacheHitBytes = _deviceCacheHitBytes,
                     DeviceCacheEvictedBytes = _deviceCacheEvictedBytes, WeightUploadBytes = _weightUploadBytes,
-                    PeakDeviceOwnedBytes = _peakDeviceOwnedBytes
+                    PeakDeviceOwnedBytes = _peakDeviceOwnedBytes,
+                    DeviceWorkspaceCacheBytes = _workspaceBytes, PeakDeviceWorkspaceCacheBytes = _peakWorkspaceBytes,
+                    DeviceWorkspaceReuses = _workspaceReuses, DeviceWorkspaceEvictedBytes = _workspaceEvictedBytes
                 };
             }
         }
@@ -100,7 +102,7 @@ internal sealed partial class WeightStreamingExecutor : IDisposable
         lock (_gate)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
-            if (_activeSession != null || _activeResidentSession != null || _deviceCacheFaulted)
+            if (_activeSession != null || _activeResidentSession != null || _deviceCacheFaulted || _workspaceFaulted)
                 throw new InvalidOperationException("A failed CUDA workspace cleanup must be retried before another streamed operation.");
             if (!weight.IsStreamed || input == IntPtr.Zero || output == IntPtr.Zero || tokens <= 0)
                 throw new ArgumentException("Streaming linear requires a file-backed weight and valid input/output.");
@@ -127,30 +129,37 @@ internal sealed partial class WeightStreamingExecutor : IDisposable
             int desiredRows = checked((int)Math.Min(weight.Ne1, _options.TileBytes / rowBytes));
             int desiredTokens = Math.Min(tokens, Math.Min(_options.TokenTileRows,
                 _arithmetic == GgmlWeightStreamingArithmetic.ResidentCuda && weight.GgmlType == 8 ? 65535 : 65535 * 8));
-            if (_deviceCacheBytes > 0) LeaveDeviceAvailable(GgmlWeightStreamingSession.GetPayloadBytes(weight.GgmlType,
-                weight.Ne0, desiredRows, desiredTokens, _arithmetic, tokens, weight.Ne1, rank));
-            var (tileRows, tokenRows) = SelectTileLayout(_options, weight.Ne0, weight.Ne1, tokens,
-                (width, rows, count) => GgmlWeightStreamingSession.GetPayloadBytes(weight.GgmlType, width, rows, count,
-                    _arithmetic, tokens, weight.Ne1, rank), weight.GgmlType, _arithmetic);
-            // Packed output is copied into its strided destination before the next
-            // tile. This buffer is separate from, and charged alongside, file reads.
-            using var tileOutput = new StreamingHostBuffer(_options, checked(tileRows * tokenRows * sizeof(float)));
-            _peakHost = Math.Max(_peakHost, checked(HostReadBytes + tileOutput.AllocatedBytes));
+            BorrowWorkspace(weight, rank, tokens, desiredRows, desiredTokens);
+            bool complete = false;
+            bool retainedFailedAllocation = false;
             try
             {
-                _activeSession = new GgmlWeightStreamingSession(_options.Budget, _options.DevicePools,
-                    rank, weight.GgmlType, weight.Ne0, tileRows, tokenRows, input, _arithmetic, tokens, weight.Ne1);
-            }
-            catch (GgmlWeightStreamingAllocationException failure)
-            {
-                _activeSession = failure.UnreleasedSession;
-                throw;
-            }
-            _sessionCreations++;
-            _inputUploads++;
-            ObserveDevice(_activeSession.PayloadBytes);
-            try
-            {
+                if (_activeSession == null && (_deviceCacheBytes > 0 || _workspaceBytes > 0))
+                {
+                    if (FitsResidentIndexing(weight.Ne0, desiredRows, desiredTokens, tokens, weight.GgmlType, _arithmetic))
+                        LeaveDeviceAvailable(GgmlWeightStreamingSession.GetPayloadBytes(weight.GgmlType,
+                            weight.Ne0, desiredRows, desiredTokens, _arithmetic, tokens, weight.Ne1, rank));
+                    else { TrimWorkspaces(0); TrimDeviceCache(0); }
+                }
+                var (tileRows, tokenRows) = SelectTileLayout(_options, weight.Ne0, weight.Ne1, tokens,
+                    (width, rows, count) => _activeSession != null ? 0 : GgmlWeightStreamingSession.GetPayloadBytes(weight.GgmlType,
+                        width, rows, count, _arithmetic, tokens, weight.Ne1, rank), weight.GgmlType, _arithmetic);
+                using var tileOutput = new StreamingHostBuffer(_options, checked(tileRows * tokenRows * sizeof(float)));
+                _peakHost = Math.Max(_peakHost, checked(HostReadBytes + tileOutput.AllocatedBytes));
+                if (_activeSession != null) _activeSession.UploadInput(input, tokenRows);
+                else
+                {
+                    try
+                    {
+                        _activeSession = new GgmlWeightStreamingSession(_options.Budget, _options.DevicePools,
+                            rank, weight.GgmlType, weight.Ne0, tileRows, tokenRows, input, _arithmetic, tokens, weight.Ne1);
+                    }
+                    catch (GgmlWeightStreamingAllocationException failure)
+                    { _activeSession = failure.UnreleasedSession; retainedFailedAllocation = true; throw; }
+                    _sessionCreations++;
+                }
+                _inputUploads++;
+                ObserveDevice(_activeSession.PayloadBytes);
                 // Retain the same reservation and allocation across token chunks.
                 // A short final chunk only changes the valid input/output extent.
                 for (int token = 0; token < tokens;)
@@ -178,8 +187,13 @@ internal sealed partial class WeightStreamingExecutor : IDisposable
                     }
                     token = checked(token + count);
                 }
+                complete = true;
             }
-            finally { ReleaseSession(); }
+            finally
+            {
+                if (complete) ReturnWorkspace(rank, tokens, weight.Ne1);
+                else if (!retainedFailedAllocation) ReleaseSession();
+            }
         }
     }
 
@@ -328,7 +342,7 @@ internal sealed partial class WeightStreamingExecutor : IDisposable
 
     internal long TrimIdleCaches()
     {
-        lock (_gate) return checked(TrimDeviceCache(0) + (_hostCache?.TrimTo(0) ?? 0));
+        lock (_gate) return checked(TrimWorkspaces(0) + TrimDeviceCache(0) + (_hostCache?.TrimTo(0) ?? 0));
     }
 
     // Use remaining shared capacity, not a private subquota. Reduce output rows
@@ -407,6 +421,7 @@ internal sealed partial class WeightStreamingExecutor : IDisposable
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
             ReleaseSession();
+            if (_workspaceFaulted) { TrimWorkspaces(0); _workspaceFaulted = false; }
             if (_deviceCacheFaulted) { TrimDeviceCache(0); _deviceCacheFaulted = false; }
         }
     }
@@ -425,6 +440,7 @@ internal sealed partial class WeightStreamingExecutor : IDisposable
         {
             if (_disposed) return;
             ReleaseSession();
+            TrimWorkspaces(0);
             TrimDeviceCache(0);
             _hostCache?.Dispose();
             ((IDisposable)_readAheadWeights)?.Dispose();
