@@ -226,6 +226,9 @@ namespace TensorSharp.Models
         /// </summary>
         public virtual void TrimIdleMemory()
         {
+            long weights = _weightStreamingExecutor?.TrimHostCache() ?? 0;
+            if (weights > 0)
+                Console.WriteLine($"[memory] released {weights / (1024 * 1024)} MB of reusable host weight ranges");
             long released = _ggmlContext?.ReleasePooledMemory() ?? 0;
             if (released > 0)
                 Console.WriteLine($"[memory] released {released / (1024 * 1024)} MB of pooled host buffers to the system");

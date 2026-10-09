@@ -8,6 +8,18 @@ Gemma's fused QKV and gate/up matrices are logical file-source concatenations,
 without a full host copy or mmap. No temporary weight pointer enters cached
 model graphs.
 
+`--host-cache-bytes BYTES` optionally retains original source ranges in pageable
+RAM (default zero). The shared host budget includes aligned cache payload as well
+as staging, with 4 MiB held available for output workspace. Cache admission can
+therefore stop below the requested ceiling. `Usage` reports current/peak cache
+payload, hits, hit bytes and evictions separately from staging. A hit copies to
+existing staging; no cached pointer is retained by a native graph. Disposal must
+refund both cache and staging. Repeated-consumption checks add source bytes and
+cache-hit bytes; file bytes alone no longer describe every consumed range. The
+managed index and OS page cache are outside this payload quota. Use the adaptive
+probe's balanced comparison for isolated timing; this probe remains a numerical
+and failure-recovery validation with an in-process resident reference.
+
 Qwen uses F32 activation arithmetic in synchronous output-row tiles. Gemma
 preserves the pinned resident CUDA arithmetic: Q8 matrix batches above eight
 tokens and F16 batches above sixteen temporarily stage one complete logical

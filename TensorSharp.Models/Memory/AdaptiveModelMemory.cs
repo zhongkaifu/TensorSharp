@@ -23,6 +23,9 @@ public sealed record AdaptiveModelMemoryOptions(int ContextTokens, int PrefillTo
     public int MaximumPrefillChunkTokens { get; init; } = 2048;
     public bool AllowWeightStreaming { get; init; } = true;
     public int StreamingTileBytes { get; init; } = 16 << 20;
+    /// <summary>Ceiling for optional RAM weight reuse. Actual capacity comes from
+    /// physical availability minus the admitted request peak; zero disables reuse.</summary>
+    public long MaximumStreamingHostCacheBytes { get; init; } = long.MaxValue;
 }
 
 public readonly record struct InferenceHardwareMemory(long HostTotal, long HostAvailable,
@@ -78,11 +81,12 @@ public sealed class AdaptiveModelSession : IDisposable
     public const string DevicePool = "adaptive/cuda0";
     private readonly AdaptiveModelMemoryOptions _options;
     private readonly GgmlCacheBudgetScope _nativeBudget;
+    private readonly long _hostCacheReserveBytes;
     private bool _disposed;
 
     private AdaptiveModelSession(ModelBase model, MemoryBudget budget, GgmlCacheBudgetScope nativeBudget,
-        InferenceMemoryPlan plan, AdaptiveModelMemoryOptions options)
-    { Model = model; Budget = budget; _nativeBudget = nativeBudget; Plan = plan; _options = options; }
+        InferenceMemoryPlan plan, AdaptiveModelMemoryOptions options, long hostCacheReserveBytes)
+    { Model = model; Budget = budget; _nativeBudget = nativeBudget; Plan = plan; _options = options; _hostCacheReserveBytes = hostCacheReserveBytes; }
 
     public ModelBase Model { get; }
     public MemoryBudget Budget { get; }
@@ -111,10 +115,17 @@ public sealed class AdaptiveModelSession : IDisposable
         try
         {
             WeightStreamingOptions? streaming = plan.SelectedCandidate!.Placement == InferenceWeightPlacement.SsdStreaming
-                ? new(budget, HostPool, [DevicePool], options.StreamingTileBytes, Math.Min(32, plan.SelectedChunkTokens)) : null;
+                ? new(budget, HostPool, [DevicePool], options.StreamingTileBytes, Math.Min(32, plan.SelectedChunkTokens))
+                {
+                    HostCacheBytes = HostCacheLimit(plan, profile.SourceWeightBytes, options.MaximumStreamingHostCacheBytes),
+                    // Retention starts after loading. The required read tile is
+                    // already charged; leave the rest of the execution forecast
+                    // available. An optional second tile still competes for slack.
+                    HostCacheReserveBytes = Math.Max(0, HostExecutionPeak(plan) - options.StreamingTileBytes)
+                } : null;
             var policy = new ModelMemoryPolicy(options.ContextTokens, plan.SelectedChunkTokens);
             var model = ModelBase.Create(path, BackendType.GgmlCuda, 1, null!, null!, 1, streaming!, policy);
-            return new(model, budget, nativeBudget, plan, options);
+            return new(model, budget, nativeBudget, plan, options, streaming?.HostCacheReserveBytes ?? 0);
         }
         catch (Exception creation)
         {
@@ -136,16 +147,52 @@ public sealed class AdaptiveModelSession : IDisposable
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         var hw = InferenceHardwareMemory.CaptureCuda();
+        long cachedBytes = Model.StreamingWeightUsage?.HostCacheBytes ?? 0;
+        if (Pools(hw, Budget, _options).Any(pool => RequiresIdleTrim(pool, _hostCacheReserveBytes, cachedBytes)))
+        {
+            Model.TrimIdleMemory();
+            hw = InferenceHardwareMemory.CaptureCuda();
+        }
         bool admitted = true;
         foreach (var pool in Pools(hw, Budget, _options))
         {
             var owners = checked(pool.Accounting.Reserved + pool.Accounting.Committed);
-            var physical = Math.Min((decimal)pool.TotalBytes, (decimal)pool.Accounting.Committed + pool.AvailableBytes);
-            long desired = (long)Math.Max(0, Math.Min(pool.MaximumBudgetBytes, physical - pool.HeadroomBytes));
+            long desired = DesiredCapacity(pool);
             admitted &= desired >= owners;
             admitted &= Budget.TrySetCapacity(pool.Pool, Math.Max(owners, desired));
         }
         return admitted && AccountingError == null;
+    }
+
+    private static long DesiredCapacity(InferenceMemoryPool pool)
+    {
+        var physical = Math.Min((decimal)pool.TotalBytes, (decimal)pool.Accounting.Committed + pool.AvailableBytes);
+        return (long)Math.Max(0, Math.Min(pool.MaximumBudgetBytes, physical - pool.HeadroomBytes));
+    }
+
+    internal static bool RequiresIdleTrim(InferenceMemoryPool pool, long hostReserve, long cachedBytes)
+    {
+        decimal owners = (decimal)pool.Accounting.Reserved + pool.Accounting.Committed;
+        // A cache can still fit its payload quota while preventing the next
+        // request from obtaining its workspace or untracked forecast headroom.
+        decimal holdout = pool.Pool == HostPool && cachedBytes > 0 ? hostReserve : 0;
+        return DesiredCapacity(pool) < owners + holdout;
+    }
+
+    private static long HostExecutionPeak(InferenceMemoryPlan plan)
+    {
+        var peak = plan.PoolPeaks.Single(p => p.Pool == HostPool);
+        return Math.Max(peak.Prefill, peak.Decode);
+    }
+
+    internal static long HostCacheLimit(InferenceMemoryPlan plan, long sourceBytes, long ceiling)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegative(sourceBytes);
+        ArgumentOutOfRangeException.ThrowIfNegative(ceiling);
+        if (plan.SelectedCandidate?.Placement != InferenceWeightPlacement.SsdStreaming) return 0;
+        long capacity = plan.Capacities.Single(p => p.Pool == HostPool).DesiredCapacity;
+        long peak = HostExecutionPeak(plan);
+        return Math.Min(Math.Min(sourceBytes, ceiling), Math.Max(0, capacity - peak));
     }
 
     public void Dispose()
@@ -218,6 +265,7 @@ public sealed class AdaptiveModelSession : IDisposable
         if (o.ContextTokens <= 0 || o.PrefillTokens <= 0 || o.PrefillTokens > o.ContextTokens
             || o.MaximumPrefillChunkTokens <= 0 || o.StreamingTileBytes <= 0
             || o.MaximumHostBytes < 0 || o.MaximumDeviceBytes < 0
+            || o.MaximumStreamingHostCacheBytes < 0
             || o.HostHeadroomBytes < 0 || o.DeviceHeadroomBytes < 0)
             throw new ArgumentOutOfRangeException(nameof(o));
     }

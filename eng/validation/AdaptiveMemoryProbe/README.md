@@ -1,5 +1,36 @@
 # Adaptive memory execution
 
+The adaptive file-weight path now keeps immutable source ranges in pageable RAM
+when hardware and request forecasts leave room. `--host-cache-bytes` is an optional
+ceiling (zero disables reuse); actual retention is bounded by source size, the
+shared host pool, and prefill/decode workspace headroom. Loading-only temporary
+memory is not held out after loading. The required read tile is already charged;
+optional read-ahead staging competes for remaining slack. `RefreshCapacity()`
+trims idle cache before shrinking a pool enough to starve the next request's
+workspace, even when current payload owners would still fit.
+
+Cache ranges are copied into existing staging before device use. No cached host
+pointer enters a graph, no weight bytes change, and disposal refunds only after
+freeing allocations. Full caches retain existing ranges during sequential scans
+instead of replacing every tile before reuse; pressure trim is LRU. This is not
+a measured cost model or GPU weight retention. Exact-range keys may duplicate
+overlapping layouts; at most 4096 entries bound index overhead, which remains
+outside aligned-payload accounting. Explicit `WeightStreamingOptions` still
+defaults to no cache; this automatic policy applies only to the adaptive loader.
+
+To compare reuse, run four fresh bounded probe processes in `0/C/C/0` cache-ceiling
+order, using the same model, prompt, context, host/device ceilings and binaries.
+Set `TS_GGML_Q8_PARALLEL_VECTOR=0`, `TS_GGML_Q8_PARALLEL_SMALL_BATCH=0`, keep the
+prefill tile setting fixed, and disable full-logit capture. Use `--repeats 3`;
+the recorded warmup is excluded. Force a supported file-weight placement through
+the device ceiling and confirm it in the report, rather than assuming streaming.
+`compare-host-cache.py --executions FIRST SECOND THIRD FOURTH --output SUMMARY`
+checks completed non-overlapping processes, binary identities, unchanged full
+logit hashes/history, actual cache hits, equal consumed bytes, fewer source reads,
+budget snapshots and final owner cleanup. Logical file reads do not measure SSD
+traffic. Warm OS cache, unlocked clocks, raw-greedy prompts and limited hardware
+remain qualification limits; a pass is not a semantic or independent-engine gate.
+
 The owned CUDA Q8/F32 prefill now selects 32, 64 or 128 columns automatically
 when `TS_GGML_Q8_PREFILL_TILE` is unset (or `auto`). It uses each device's SM
 count and actual kernel occupancy, the row/column geometry and a 25% maximum

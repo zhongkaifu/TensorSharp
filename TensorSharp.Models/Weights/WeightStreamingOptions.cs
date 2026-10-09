@@ -8,7 +8,7 @@ namespace TensorSharp.Models;
 
 /// <summary>Opt-in bounded file-weight reads and CUDA linear workspaces. Supported
 /// weight formats depend on the model adapter. The shared
-/// budget covers the weight staging buffer and each streamed linear's device input,
+/// budget covers the weight staging buffer, optional reusable host payload, and each streamed linear's device input,
 /// weight/output staging and arithmetic scratch. Some adapters require a complete
 /// temporary device matrix to preserve the resident reduction order. Existing model activations, live KV, small resident
 /// parameters, driver/runtime allocations and the OS file cache are not covered.</summary>
@@ -54,6 +54,23 @@ public sealed class WeightStreamingOptions
     /// start the next file read before computing the current tile. A smaller budget
     /// retains one-buffer execution. This does not imply asynchronous CUDA copies.</summary>
     public bool ReadAhead { get; }
+
+    private long _hostCacheBytes, _hostCacheReserveBytes = 4L << 20;
+    /// <summary>Optional ceiling for reusable original weight bytes in pageable RAM.
+    /// Actual admission also respects remaining shared capacity and workspace reserve.
+    /// Zero preserves uncached execution. Cache entries never own native graph pointers.</summary>
+    public long HostCacheBytes
+    {
+        get => _hostCacheBytes;
+        init { ArgumentOutOfRangeException.ThrowIfNegative(value); _hostCacheBytes = value; }
+    }
+    /// <summary>Shared host capacity left available when admitting optional cache entries.
+    /// The adaptive loader supplies its request peak forecast, including untracked state.</summary>
+    public long HostCacheReserveBytes
+    {
+        get => _hostCacheReserveBytes;
+        init { ArgumentOutOfRangeException.ThrowIfNegative(value); _hostCacheReserveBytes = value; }
+    }
 }
 
 /// <summary>Payload and I/O counters, not process RSS or total CUDA consumption.</summary>
@@ -63,4 +80,9 @@ public readonly record struct WeightStreamingStatistics(long FileBackedWeightByt
     long CompleteMatrixProjections = 0)
 {
     public long ReadAheadOperations { get; init; }
+    public long HostCacheBytes { get; init; }
+    public long PeakHostCacheBytes { get; init; }
+    public long HostCacheHitBytes { get; init; }
+    public long HostCacheHits { get; init; }
+    public long HostCacheEvictedBytes { get; init; }
 }

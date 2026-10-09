@@ -63,7 +63,8 @@ try
         session = AdaptiveModelSession.Create(path, new(context, (int)Math.Min(context, (long)minimumPrompt + 64))
         {
             MaximumDeviceBytes = long.Parse(options.GetValueOrDefault("--device-bytes", long.MaxValue.ToString())),
-            MaximumHostBytes = long.Parse(options.GetValueOrDefault("--host-bytes", long.MaxValue.ToString()))
+            MaximumHostBytes = long.Parse(options.GetValueOrDefault("--host-bytes", long.MaxValue.ToString())),
+            MaximumStreamingHostCacheBytes = long.Parse(options.GetValueOrDefault("--host-cache-bytes", long.MaxValue.ToString()))
         });
         model = session.Model;
         plan = session.Plan;

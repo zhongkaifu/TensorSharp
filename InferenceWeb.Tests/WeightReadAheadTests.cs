@@ -21,13 +21,16 @@ public class WeightReadAheadTests
         Assert.Equal(10, statistics.ReadAheadOperations);
     }
 
-    [Fact]
-    public async Task NextReadOverlapsCurrentConsumptionAndAbortDrainsBeforeRefund()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task NextReadOverlapsCurrentConsumptionAndAbortDrainsBeforeRefund(bool cacheEnabled)
     {
         using var fixture = new Fixture();
         var budget = Budget(5 << 20);
         using var executor = new WeightStreamingExecutor(fixture.File,
-            new(budget, "ram", ["gpu"], tileBytes: 136));
+            new(budget, "ram", ["gpu"], tileBytes: 136)
+                { HostCacheBytes = cacheEnabled ? 1024 : 0, HostCacheReserveBytes = 0 });
         var source = new DelayedSource();
         using var weight = QuantizedWeight.CreateFileBacked(source, 8, 64, 4);
         var tiles = executor.ReadTiles(weight, 2).GetEnumerator();
@@ -37,7 +40,7 @@ public class WeightReadAheadTests
         var actual = new byte[136];
         Marshal.Copy(tiles.Current.Pointer, actual, 0, actual.Length);
         Assert.All(actual, b => Assert.Equal(1, b));
-        Assert.Equal(384, budget.Snapshot().Single(p => p.Pool == "ram").Committed);
+        Assert.Equal(cacheEnabled ? 576 : 384, budget.Snapshot().Single(p => p.Pool == "ram").Committed);
         var disposalEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var disposing = Task.Run(() => { disposalEntered.SetResult(); tiles.Dispose(); });
         await disposalEntered.Task;
@@ -46,6 +49,18 @@ public class WeightReadAheadTests
         await disposing.WaitAsync(TimeSpan.FromSeconds(10));
         Assert.Equal(272, executor.Statistics.FileBytesRead);
         Assert.Equal(1, executor.Statistics.ReadAheadOperations);
+        if (cacheEnabled)
+        {
+            Assert.Equal(384, executor.Statistics.HostCacheBytes);
+            foreach (var tile in executor.ReadTiles(weight, 2))
+            {
+                Marshal.Copy(tile.Pointer, actual, 0, actual.Length);
+                Assert.All(actual, b => Assert.Equal(tile.FirstRow == 0 ? (byte)1 : (byte)2, b));
+            }
+            Assert.Equal(272, executor.Statistics.FileBytesRead);
+            Assert.Equal(272, executor.Statistics.HostCacheHitBytes);
+            Assert.Equal(1, executor.Statistics.ReadAheadOperations); // Copies are not file read-ahead.
+        }
         executor.Dispose();
         Assert.All(budget.Snapshot(), p => Assert.Equal(0, p.Reserved + p.Committed));
     }
@@ -71,19 +86,23 @@ public class WeightReadAheadTests
         Assert.Equal(192, executor.Statistics.PeakHostStagingBytes);
     }
 
-    [Fact]
-    public void SpeculativeReadFailurePropagatesWhenItsTileIsConsumed()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void SpeculativeReadFailurePropagatesWhenItsTileIsConsumed(bool cacheEnabled)
     {
         using var fixture = new Fixture();
         var budget = Budget(5 << 20);
         using var executor = new WeightStreamingExecutor(fixture.File,
-            new(budget, "ram", ["gpu"], tileBytes: 136));
+            new(budget, "ram", ["gpu"], tileBytes: 136)
+                { HostCacheBytes = cacheEnabled ? 1024 : 0, HostCacheReserveBytes = 0 });
         var source = new DelayedSource();
         source.FinishSecond.SetException(new IOException("injected read failure"));
         using var weight = QuantizedWeight.CreateFileBacked(source, 8, 64, 4);
         using var tiles = executor.ReadTiles(weight, 2).GetEnumerator();
         Assert.True(tiles.MoveNext());
         Assert.Throws<IOException>(() => tiles.MoveNext());
+        Assert.Equal(cacheEnabled ? 192 : 0, executor.Statistics.HostCacheBytes); // Only the complete first read.
         executor.Dispose();
         Assert.All(budget.Snapshot(), p => Assert.Equal(0, p.Reserved + p.Committed));
     }
