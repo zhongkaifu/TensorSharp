@@ -21,6 +21,7 @@
 | GGML lazy device-copy/preload、选中专家 cache | 可通过 GgmlCacheBudgetScope 接入同一份托管 MemoryBudget，分配前预留、物理释放后归还；原有独立 cache 配额仍有效 |
 | 硬件/请求预算规划与驻留保留 | dense Gemma4/Qwen35 的 AdaptiveModelSession 显式入口；优先保留驻留图，按物理可用 RAM/VRAM、权重格式、融合、KV/状态和工作区选择；不是全模型自动策略 |
 | 文件权重的跨 token RAM / GPU 复用 | RAM 保留原始字节区间；GPU 可保留完整权重及其输入/输出/scratch arena。动态入口按硬件余量、执行期峰值和用户上限设置额度，压力时先回收缓存；Qwen FullPrecision 覆盖 prefill/decode，Gemma ResidentCuda 当前只保留 N=1 decode |
+| 文件执行临时 CUDA 工作区复用 | AdaptiveModelSession 默认自动启用；扣除其他 owner 与执行预留后，以最多四分之一余量作为工作区准入份额，权重缓存留出相应空间；请求 reset 回收未再使用的项。显式 0 关闭；底层手工 WeightStreamingOptions 仍保留零缓存默认值 |
 | GGML/Metal/Vulkan/MLX 原生图、分页 KV、全部融合算子 | 全面适配仍待实现；本轮没有 Metal/Vulkan/MLX 硬件验收 |
 | 多卡预算向量、带节点/设备标识的资源位置 | 已支持多位置工作集租约和全 rank fence；两张 A40 上实际内核、双向中转和释放验证通过 |
 | 多机协调、远程内存、异步 DMA 重叠 | 设计阶段，未实现；文件提前读取已实现，不能等同异步 CUDA DMA |
@@ -568,6 +569,28 @@ Qwen0.8B Q8 的两轮加载、32 行完整词表通过原门槛（最大 relativ
 所有 warmup/测量的完整 logits 和 token 历史一致，退出、shutdown 和最终 owner 清零通过。比较器还要求每个测量请求实际复用、创建与复用次数合计一致、RAM/device 权重命中及传输量不变；若工作区挤走权重，则拒绝这类隔离对照。三个缓存比较器 **6/6** 测试通过，包含伪造复用、计数下降、权重竞争、额度越界、输出变化和超时的拒绝用例。证据在忽略的 `artifacts/unified-memory-adaptive/workspace-reuse-v1/`，可复用入口为 [compare-workspace-cache.py](../../eng/validation/AdaptiveMemoryProbe/compare-workspace-cache.py)。
 
 本机仍为 RTX 3080 Laptop 16 GiB；无并发构建/推理/下载，哈希预热文件缓存，未锁频。配置与上一次 device-cache ABBA 不同，不能把两轮百分比相乘。工作区选项保持显式启用：尚未证明更广形状/设备或动态权重与工作区竞争下的最优分配。同步 CUDA 搬运、全驻留基线差距、IQ2 FF7 重复、媒体文字质量、多 GPU 和其他未执行场景继续未完成。
+
+### 2026-10-09 UTC：自适应入口默认工作区复用与竞争验证
+
+`AdaptiveModelMemoryOptions.MaximumStreamingWorkspaceCacheBytes` 现在默认 `long.MaxValue`，代表由硬件、请求执行峰值和共享账本限定上限；显式 `0` 关闭。实际准入再以扣除其他 owner 与执行预留后的可选设备余量的 **1/4** 为上限，不预先分配这部分显存。完整权重准入为尚未占用的工作区份额留出空间，已计费的空闲 arena 不重复扣除；上限、物理可用量和预算缩减仍有效。请求 reset 时物理释放上一请求没有用到的 workspace，并按当前余量缩小保留量；失败释放继续持有额度、阻止新计算并允许 reset 重试。该份额是经过代表性竞争测试的启发式，尚未实现按耗时反馈的全局最优分配。底层显式 `WeightStreamingOptions` 与其他手工缓存选项一样仍默认零；自动默认适用于已支持的 adaptive 文件路径，不表示所有 Server/CLI 模型已接入自动三层调度。
+
+最终 Models SHA `5552950117db0074da4b0180bc12ac322d5c7156e69bf6a46765ac9668645c14`，AdaptiveMemoryProbe `21009081c001b13229899cee81e70a021c0a247bc1b215a1501c8cbf8e76c97d`。native 仍为 `74c1b4f8…`，没有修改或重新宣称覆盖原生内核；ggml `ffa4e8b80930029a35991f94e7c8a93cd67730ab` 保持干净。相关托管/CUDA 检查 **78/78** 通过，无跳过，新增共享预算下权重与工作区共存、其他 owner 挤压、跨请求失效以及 aging 释放失败恢复。缓存/parallel/native/prefill 比较工具回归分别 **9/8/6/4** 项通过，无跳过。独立真实文件数值检查：Qwen **32** 行通过原门槛（最大 relative L2 **0.0008168431**），Gemma E4B **8** 行与常驻路径逐位一致；压力拒绝、reset 和最后零 owner 通过。这两次正确性运行与构建/CPU 校验有重叠，不计吞吐证据。
+
+四组性能对照共 **16 个独立进程**，每组均 off/auto/auto/off；auto 进程省略工作区选项，控制组显式设为零，RAM/device 权重缓存均使用自动上限。每个进程一个 warmup、三个测量请求；相同二进制、模型、上下文、完整 token 条件、Q8 串行算术和 tile32。固定请求每组每侧 6 个测量；混合请求 warmup 为短提示，测量顺序为长/短/长，按提示长度分别统计（短 2、长 4 个样本/侧）。首次长提示包含该形状的首次设置成本。
+
+| 文件模式与 host/device 配额 | prefill 中位 tokens/s：off → auto | decode 中位 tokens/s：off → auto | 每请求权重上传变化 |
+| --- | ---: | ---: | ---: |
+| Qwen0.8B，69-token prompt，512 MiB，16 predictions | 84.753 → 89.950（+6.13%） | 3.554 → 4.550（+28.02%） | +6.48% |
+| Qwen0.8B，69-token prompt，384 MiB，16 predictions | 66.774 → 74.779（+11.99%） | 2.702 → 3.436（+27.17%） | +1.46% |
+| Gemma E4B，38-token prompt，1 GiB，4 predictions | 10.977 → 11.457（+4.37%） | 0.574 → 0.650（+13.13%） | +2.96% |
+| Qwen 混合，512 MiB，69-token 短提示 | 65.899 → 68.123 | 2.897 → 3.276 | +0.49% |
+| Qwen 混合，512 MiB，258-token 长提示 | 123.844 → 122.702 | 3.295 → 3.284 | +3.13% |
+
+混合长提示的中位数下降原样保留；prefill 范围 **116.403–135.620 / 115.944–128.630**，decode **2.973–3.600 / 3.209–3.435**，均重叠。第一条长请求使更多图内存驻留；auto 曾在请求中实际复用后释放全部空闲工作区，后续稳定在较小份额，不能要求每条请求结束时缓存仍非零才算真实复用。新 `--competition` 比较模式验证每条测量请求的新增复用、完整输出、退出、最终零 owner，以及源读取/RAM/device 复用与投影字节的守恒，允许并报告权重上传变化。原隔离比较仍要求上传/读取不变；不会将自动竞争的收益错误归因于单独减少分配。首次混合报告因“结束时缓存为零”的旧校验拒绝，原失败证据保留；修正比较器并新增释放后验证用例后通过，未改原始模型记录。
+
+所有 warmup/测量的完整 logits 哈希及历史在对应控制与 auto 请求之间一致。Qwen 512/384 MiB 实际空闲工作区分别 **38,666,240 / 11,599,872 B**；Gemma 为 **112,639,744 B**。Qwen 固定 512 MiB 测量期新建 session **2,064→0/请求**；384 MiB 为 **2,688→368**；Gemma **1,105→253**。所有受测共享 pool 均未超出配额，释放后归零。保留 payload 与总 VRAM/RSS 仍有区别。
+
+本地 RTX 3080 Laptop 16 GiB、CUDA 12.6，四组对照期间无并发推理、构建或模型下载；文件缓存预热、未锁频，不作为跨机器或 p95/p99 保证。原始范围、身份、预算与完整失败记录在忽略的 `artifacts/unified-memory-adaptive/workspace-auto-v1/`。上一提交 `f0baf26a` 的 PR Unit Tests 已通过（[CI](https://github.com/zhongkaifu/TensorSharp/actions/runs/37886188421)），包括此前完成通知竞态修复；新的提交仍需独立 CI。没有新增多 GPU、异步搬运、IQ2 FF7、媒体或智能体语义通过；全驻留独立基线差距仍未关闭。
 
 ## 15. 后续实际接入与硬件验证入口
 

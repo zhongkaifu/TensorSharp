@@ -38,6 +38,8 @@ public class AdaptiveModelMemoryTests
         Assert.Equal(InferenceWeightPlacement.SsdStreaming, plan.SelectedCandidate!.Placement);
         Assert.Contains(plan.Components, c => c.Name == "kv-0" && c.Bytes.Device == 2048L * 65536);
         Assert.All(plan.PoolPeaks.Where(p => p.Pool == AdaptiveModelSession.DevicePool), p => Assert.True(p.Peak <= GiB));
+        Assert.True(AdaptiveModelSession.DeviceCacheLimit(plan, 4 * GiB, options.MaximumStreamingWorkspaceCacheBytes) > 0);
+        Assert.Equal(0, AdaptiveModelSession.DeviceCacheLimit(plan, 4 * GiB, 0));
     }
 
     [Fact]

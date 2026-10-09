@@ -44,10 +44,11 @@ internal sealed partial class WeightStreamingExecutor
                 return false; // Complete retention must not narrow row-streaming indexing support.
             long payload = GgmlResidentWeightSession.GetPayloadBytes(rank, weight.GgmlType, weight.Ne0, rows, capacity, _arithmetic);
             var available = _options.Budget.Snapshot().ToDictionary(p => p.Pool, p => p.Available, StringComparer.Ordinal);
+            long workspaceHoldout = Math.Max(0, WorkspaceRetentionLimit(available) - _workspaceBytes);
             // Scan resistance: a miss cannot replace a useful retained matrix.
             // Pressure trim below is LRU, and never revokes an in-use address.
             if (payload > _options.DeviceCacheBytes - _deviceCacheBytes
-                || _options.DevicePools.Any(p => payload > available[p] - _options.DeviceCacheReserveBytes)) return false;
+                || _options.DevicePools.Any(p => payload > (decimal)available[p] - _options.DeviceCacheReserveBytes - workspaceHoldout)) return false;
             try
             {
                 try

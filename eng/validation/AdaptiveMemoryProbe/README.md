@@ -1,14 +1,19 @@
 # Adaptive memory execution
 
-`--workspace-cache-bytes` opts into reuse of idle row-tiled CUDA sessions
-(default zero). Both weights and activations are replaced before each use;
+The adaptive entry automatically reuses idle row-tiled CUDA sessions. Omit
+`--workspace-cache-bytes` for automatic sizing, set zero to disable, or supply
+a byte ceiling. Both weights and activations are replaced before each use;
 this retains allocation capacity, not weight identity. Reuse requires the same
 rank, weight format and input width, with sufficient row/token capacity.
 ResidentCuda additionally requires the original logical matrix/token shape.
 Complete-matrix multi-token Gemma sessions are excluded. Up to 16 completed
-healthy sessions share the device budget; admission leaves the execution peak
-available, and pressure releases idle workspaces before retained weights.
-Normal KV reset preserves healthy sessions. Failed cleanup preserves ownership
+healthy sessions share the device budget. Admission leaves the execution peak
+available and uses at most one quarter of discretionary device capacity after
+other owners and headroom. Weight-cache admission holds that share available
+without charging existing idle workspaces twice. Pressure releases idle
+workspaces before retained weights. At request reset, sessions unused by the
+last request are physically retired and the retained pool shrinks to current
+slack. Healthy sessions used by the last request remain reusable. Failed cleanup preserves ownership
 and blocks reuse until explicit reset physically retires the failed owner.
 
 For an isolated allocation comparison, keep RAM/device weight-cache ceilings
@@ -19,10 +24,29 @@ logit/history equality, actual reuse in every measured request, fewer session
 creations, identical weight reads/uploads and operation counts, budget bounds,
 successful shutdown and zero final owners. A cache that displaces weights fails
 this isolated comparison; any such tradeoff needs a separate reported workload.
-These checks do not themselves guarantee a speedup. The option stays disabled
-by default pending broader model/device and cache-allocation measurements.
+These checks do not themselves guarantee a speedup. The explicit low-level
+`WeightStreamingOptions` constructor keeps its zero-cache defaults; automatic
+selection belongs to `AdaptiveModelSession`, which supplies the hardware/request
+forecast. The quarter-share rule is a bounded heuristic, not a global optimum.
 
-The local `workspace-reuse-v1` comparison used Qwen0.8B, context512, 67 prompt
+For default policy validation, omit the workspace option in the two enabled
+processes and pass `--workspace-cache-bytes 0` in the controls. Keep all other
+settings identical, including automatic device/host weight-cache settings. Add
+`--competition` to `compare-workspace-cache.py`; it requires actual workspace
+reuse and weight-cache use, and checks conservation of consumed/projected weight
+bytes while reporting changed uploads/reads. It preserves full-logit equality,
+identical binaries, successful exits and zero-owner requirements. This is a
+separate policy comparison; it does not relax the isolated allocation comparison.
+
+`--alternate-prompt-tokens N` renders a second prompt. The excluded warmup uses
+the primary prompt, then measured requests alternate second/primary/second. Both
+prompt token arrays and each row's index are recorded. Competition comparisons
+validate that schedule and report each prompt length separately. The first
+measured second-shape request includes any shape-specific setup; it is not a
+fully warmed constant-shape microbenchmark. Other comparison modes reject mixed
+prompts. Explicit full-logit capture remains correctness-only.
+
+The earlier opt-in `workspace-reuse-v1` comparison used Qwen0.8B, context512, 67 prompt
 tokens, 16 predictions, 512 MiB host/device, 256 MiB host-cache and fixed 128 MiB
 device-weight-cache ceilings. A 64 MiB workspace ceiling retained 31,555,584 B.
 Six measured requests per arm gave prefill 82.297→89.414 tokens/s (+8.65%) and

@@ -29,9 +29,9 @@ public sealed record AdaptiveModelMemoryOptions(int ContextTokens, int PrefillTo
     /// <summary>Ceiling for optional complete device weight arenas. Shared physical
     /// availability and execution-phase workspace forecasts further bound retention.</summary>
     public long MaximumStreamingDeviceCacheBytes { get; init; } = long.MaxValue;
-    /// <summary>Opt-in idle CUDA workspace reuse. Admission also leaves the full
-    /// execution forecast available, and workspaces yield before weight caches.</summary>
-    public long MaximumStreamingWorkspaceCacheBytes { get; init; }
+    /// <summary>Automatic idle CUDA workspace reuse, bounded by hardware/request
+    /// slack and a share of optional device retention. Zero explicitly disables it.</summary>
+    public long MaximumStreamingWorkspaceCacheBytes { get; init; } = long.MaxValue;
 }
 
 public readonly record struct InferenceHardwareMemory(long HostTotal, long HostAvailable,

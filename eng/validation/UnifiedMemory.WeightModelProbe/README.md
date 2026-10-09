@@ -193,8 +193,10 @@ current operation; CUDA transfers remain synchronous.
 `--workspace-cache-bytes BYTES` (default zero) retains healthy idle row-tiled
 CUDA sessions in the same device budget. It replaces both input and weight
 bytes on reuse; compatible capacity is not a promise of cached weight identity.
-The pool has at most 16 entries and yields to workspace pressure before the
-weight cache. ResidentCuda reuses only identical original logical shapes;
+The pool has at most 16 entries, uses at most a quarter of available optional
+device retention after execution headroom and other owners, and yields to
+workspace pressure before the weight cache. Request reset retires entries not
+used by the last request and trims to current slack. ResidentCuda reuses only identical original logical shapes;
 its complete-matrix multi-token path is excluded. `DeviceWorkspaceReuses`
 counts borrowed sessions, `DeviceSessionCreations` counts fresh allocations,
 and `DeviceWorkspaceCacheBytes` counts idle payload. `PeakDeviceOwnedBytes`

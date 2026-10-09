@@ -11,6 +11,74 @@ public sealed partial class StreamingDeviceWeightCacheTests
         new(budget, "ram", ["gpu"], 512, 8)
         { DeviceWorkspaceCacheBytes = ceiling, DeviceWorkspaceCacheReserveBytes = 0 };
 
+    [GgmlFact(BackendType.GgmlCuda)]
+    public void AutomaticWorkspaceShareCoexistsWithWeightsAndShrinksUnderOtherOwners()
+    {
+        using var file = new Fixture(8);
+        var budget = new MemoryBudget([new("ram", 1 << 20), new("gpu", 16384)]);
+        using var model = new Model(file.Path, new(budget, "ram", ["gpu"], 512, 8)
+        {
+            DeviceCacheBytes = long.MaxValue, DeviceCacheReserveBytes = 0,
+            DeviceWorkspaceCacheBytes = long.MaxValue, DeviceWorkspaceCacheReserveBytes = 0
+        }, false);
+        model.Forward([0]); model.Forward([1]);
+        var expected = model.Forward([2]);
+        Assert.Equal(expected, model.Forward([2]));
+        var usage = model.StreamingWeightUsage!.Value;
+        Assert.True(usage.DeviceCacheBytes > 0 && usage.DeviceWorkspaceReuses > 0);
+        Assert.InRange(usage.PeakDeviceWorkspaceCacheBytes, 1, 16384 / 4);
+        Assert.Equal(0, usage.DeviceCacheEvictedBytes);
+        model.ResetKVCache();
+        long remaining = budget.Snapshot().Single(p => p.Pool == "gpu").Available;
+        using var other = budget.Reserve([new("gpu", remaining)]); other.Commit();
+        model.ResetKVCache(); // Idle workspace must yield without revoking the other owner.
+        Assert.Equal(0, model.StreamingWeightUsage.Value.DeviceWorkspaceCacheBytes);
+        model.Dispose();
+        Assert.Equal(remaining, budget.Snapshot().Single(p => p.Pool == "gpu").Committed);
+    }
+
+    [GgmlTheory(BackendType.GgmlCuda)]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void RequestBoundaryRetiresWorkspacesUnusedByTheLastRequest(bool resident)
+    {
+        using var file = new Fixture(8);
+        var budget = Budget();
+        using var model = new Model(file.Path, WorkspaceOptions(budget), resident);
+        model.Forward(new int[8]);
+        long first = model.StreamingWeightUsage!.Value.DeviceWorkspaceCacheBytes;
+        model.ResetKVCache();
+        Assert.Equal(first, model.StreamingWeightUsage.Value.DeviceWorkspaceCacheBytes);
+        model.Forward([2]); // New request only uses a different K.
+        long both = model.StreamingWeightUsage.Value.DeviceWorkspaceCacheBytes;
+        Assert.True(both > first);
+        model.ResetKVCache();
+        Assert.Equal(both - first, model.StreamingWeightUsage.Value.DeviceWorkspaceCacheBytes);
+        Assert.Equal(first, model.StreamingWeightUsage.Value.DeviceWorkspaceEvictedBytes);
+        model.Dispose();
+        Assert.All(budget.Snapshot(), p => Assert.Equal(0, p.Reserved + p.Committed));
+    }
+
+    [GgmlFact(BackendType.GgmlCuda)]
+    [Trait("Requires", "NativeTestHooks")]
+    public void FailedAgingKeepsOwnershipUntilResetCanPhysicallyReleaseIt()
+    {
+        using var file = new Fixture(8);
+        using var hooks = new Hooks();
+        var budget = Budget();
+        using var model = new Model(file.Path, WorkspaceOptions(budget), false);
+        model.Forward([0]); model.ResetKVCache();
+        model.Forward([2]);
+        long owned = model.StreamingWeightUsage!.Value.DeviceWorkspaceCacheBytes;
+        hooks.Fail(2);
+        Assert.ThrowsAny<Exception>(model.ResetKVCache);
+        Assert.Equal(owned, budget.Snapshot().Single(p => p.Pool == "gpu").Committed);
+        Assert.Throws<InvalidOperationException>(() => model.Forward([0]));
+        model.ResetKVCache();
+        Assert.Equal(0, budget.Snapshot().Single(p => p.Pool == "gpu").Committed);
+        model.Forward([0]);
+    }
+
     [GgmlTheory(BackendType.GgmlCuda)]
     [InlineData(8, false)]
     [InlineData(1, false)]
@@ -19,7 +87,7 @@ public sealed partial class StreamingDeviceWeightCacheTests
     public void IdleWorkspacesReplaceInputAndWeightsAndPreserveResidentDispatch(int type, bool resident)
     {
         using var file = new Fixture(type);
-        int[] counts = resident ? [8, 1, 3, 8] : [19, 1, 3, 19];
+        int[] counts = resident ? [8, 8, 1, 3, 8] : [19, 1, 3, 19];
         int[][] requests = counts.Select((n, i) => Enumerable.Repeat(i % 2, n).ToArray()).ToArray();
         float[][] reference;
         using (var cold = new Model(file.Path, WorkspaceOptions(Budget(), 0), resident))
@@ -34,7 +102,7 @@ public sealed partial class StreamingDeviceWeightCacheTests
         }
         var usage = model.StreamingWeightUsage!.Value;
         Assert.True(usage.DeviceWorkspaceCacheBytes > 0 && usage.DeviceWorkspaceReuses > 0);
-        Assert.Equal(resident ? 3 : 1, usage.DeviceSessionCreations);
+        Assert.Equal(resident ? 4 : 1, usage.DeviceSessionCreations);
         Assert.Equal(0, usage.DeviceCacheBytes);
         Assert.Equal(usage.DeviceWorkspaceCacheBytes + 64, budget.Snapshot().Single(p => p.Pool == "gpu").Committed);
         model.TrimIdleMemory();

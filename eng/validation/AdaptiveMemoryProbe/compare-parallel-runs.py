@@ -35,7 +35,7 @@ def utc(value):
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
-def load(execution_path, arm):
+def load(execution_path, arm, *, allow_mixed=False):
     execution = json.loads(execution_path.read_text(encoding="utf-8-sig"))
     require(execution.get("complete") is True and execution.get("timed_out") is False
             and execution.get("exit_code") == 0 and not execution.get("error"), "Process did not exit successfully")
@@ -77,6 +77,11 @@ def load(execution_path, arm):
     valid_tokens = lambda ids: isinstance(ids, list) and all(type(x) is int and 0 <= x < geometry["Vocabulary"] for x in ids)
     prompt = report.get("Prompt")
     require(valid_tokens(prompt) and prompt and len(prompt) + steps <= geometry["Context"], "Invalid prompt/context")
+    prompts = report.get("Prompts")
+    if prompts is not None:
+        require(allow_mixed and isinstance(prompts, list) and len(prompts) == 2 and prompts[0] == prompt
+                and all(valid_tokens(p) and p and len(p) + steps <= geometry["Context"] for p in prompts),
+                "Mixed prompt schedule is unsupported or invalid")
     teacher = report.get("Teacher")
     if report.get("Generation") == "teacher-forced":
         require(valid_tokens(teacher) and len(teacher) == steps and is_hash(report.get("TeacherSha256")), "Invalid teacher history")
@@ -86,11 +91,14 @@ def load(execution_path, arm):
     require([row.get("Run") for row in rows] == [-1, 0, 1, 2]
             and all(row.get("Warmup") is (i == 0) for i, row in enumerate(rows)), "Missing excluded warmup or complete measured requests")
     for row in rows:
-        require(row.get("PromptTokens") == len(prompt) and row.get("DecodeCalls") == steps - 1
+        expected_index = 1 if prompts is not None and row["Run"] >= 0 and row["Run"] % 2 == 0 else 0
+        row_prompt = prompts[expected_index] if prompts is not None else prompt
+        require(row.get("PromptIndex", 0) == expected_index, "Request prompt schedule differs")
+        require(row.get("PromptTokens") == len(row_prompt) and row.get("DecodeCalls") == steps - 1
                 and valid_tokens(row.get("Generated")) and len(row["Generated"]) == steps
                 and row.get("Consumed") == (teacher if teacher is not None else row["Generated"])[:-1]
                 and is_hash(row.get("LogitsSha256")), "Incomplete token history or raw-logit identity")
-        for ms_key, rate_key, count in (("PrefillMilliseconds", "PrefillTokensPerSecond", len(prompt)),
+        for ms_key, rate_key, count in (("PrefillMilliseconds", "PrefillTokensPerSecond", len(row_prompt)),
                                        ("DecodeMilliseconds", "DecodeTokensPerSecond", steps - 1)):
             duration, rate = row.get(ms_key), row.get(rate_key)
             require(isinstance(duration, (float, int)) and math.isfinite(duration) and duration > 0

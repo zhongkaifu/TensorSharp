@@ -26,8 +26,9 @@ if (mode is not ("resident" or "adaptive")) throw new ArgumentException("--mode 
 int steps = int.Parse(options.GetValueOrDefault("--steps", "64"));
 int repeats = int.Parse(options.GetValueOrDefault("--repeats", "3"));
 int minimumPrompt = int.Parse(options.GetValueOrDefault("--prompt-tokens", "640"));
+int alternateMinimum = int.Parse(options.GetValueOrDefault("--alternate-prompt-tokens", minimumPrompt.ToString()));
 int context = int.Parse(options.GetValueOrDefault("--context", "2048"));
-if (steps < 2 || repeats < 1 || minimumPrompt < 1 || context <= (long)minimumPrompt + steps)
+if (steps < 2 || repeats < 1 || minimumPrompt < 1 || alternateMinimum < 1 || context <= (long)Math.Max(minimumPrompt, alternateMinimum) + steps)
     throw new ArgumentException("Require positive runs and a context larger than prompt plus decode.");
 bool captureLogits = bool.Parse(options.GetValueOrDefault("--capture-logits", "false"));
 int[]? teacher = options.TryGetValue("--teacher", out string? teacherFile)
@@ -54,19 +55,20 @@ LogitCapture? capture = null;
 bool shutdown = false;
 string? error = null;
 int[] prompt = [];
+int[]? alternatePrompt = null;
 double loadMs = 0;
 try
 {
     var timer = Stopwatch.StartNew();
     if (mode == "adaptive")
     {
-        session = AdaptiveModelSession.Create(path, new(context, (int)Math.Min(context, (long)minimumPrompt + 64))
+        session = AdaptiveModelSession.Create(path, new(context, (int)Math.Min(context, (long)Math.Max(minimumPrompt, alternateMinimum) + 64))
         {
             MaximumDeviceBytes = long.Parse(options.GetValueOrDefault("--device-bytes", long.MaxValue.ToString())),
             MaximumHostBytes = long.Parse(options.GetValueOrDefault("--host-bytes", long.MaxValue.ToString())),
             MaximumStreamingHostCacheBytes = long.Parse(options.GetValueOrDefault("--host-cache-bytes", long.MaxValue.ToString())),
             MaximumStreamingDeviceCacheBytes = long.Parse(options.GetValueOrDefault("--device-cache-bytes", long.MaxValue.ToString())),
-            MaximumStreamingWorkspaceCacheBytes = long.Parse(options.GetValueOrDefault("--workspace-cache-bytes", "0"))
+            MaximumStreamingWorkspaceCacheBytes = long.Parse(options.GetValueOrDefault("--workspace-cache-bytes", long.MaxValue.ToString()))
         });
         model = session.Model;
         plan = session.Plan;
@@ -79,15 +81,22 @@ try
     geometry = new { model.Config.Architecture, model.Config.HiddenSize, model.Config.NumLayers,
         model.Config.NumHeads, model.Config.NumKVHeads, Vocabulary = model.Tokenizer.VocabSize, Context = context };
     var renderer = new KVCachePromptRenderer(new GgufPromptRenderer());
-    string text = "Count upwards from 10 to 1000, separated by spaces. Output only the numbers.";
-    do
+    int[] Render(int minimum)
     {
-        prompt = renderer.RenderToTokens(model.Tokenizer, model.Config.ChatTemplate,
-            [new ChatMessage { Role = "user", Content = text }], model.Config.Architecture,
-            addGenerationPrompt: true, enableThinking: false).ToArray();
-        if (prompt.Length < minimumPrompt) text += " Include every consecutive integer without gaps.";
-    } while (prompt.Length < minimumPrompt);
-    if ((long)prompt.Length + steps > context) throw new ArgumentException("Rendered prompt exceeds admitted context.");
+        string text = "Count upwards from 10 to 1000, separated by spaces. Output only the numbers.";
+        int[] tokens;
+        do
+        {
+            tokens = renderer.RenderToTokens(model.Tokenizer, model.Config.ChatTemplate,
+                [new ChatMessage { Role = "user", Content = text }], model.Config.Architecture,
+                addGenerationPrompt: true, enableThinking: false).ToArray();
+            if (tokens.Length < minimum) text += " Include every consecutive integer without gaps.";
+        } while (tokens.Length < minimum);
+        if ((long)tokens.Length + steps > context) throw new ArgumentException("Rendered prompt exceeds admitted context.");
+        return tokens;
+    }
+    prompt = Render(minimumPrompt);
+    if (options.ContainsKey("--alternate-prompt-tokens")) alternatePrompt = Render(alternateMinimum);
     File.WriteAllText(Path.Combine(output, "prompt.json"), JsonSerializer.Serialize(prompt));
     if (captureLogits) capture = new LogitCapture(output);
 
@@ -95,17 +104,19 @@ try
     // logical KV but preserves reusable weights, graph workspaces and allocations.
     for (int run = -1; run < repeats; run++)
     {
+        int promptIndex = alternatePrompt != null && run >= 0 && run % 2 == 0 ? 1 : 0;
+        int[] requestPrompt = promptIndex == 1 ? alternatePrompt! : prompt;
         if (session != null && !session.RefreshCapacity())
             throw new InvalidOperationException("Hardware pressure requires pausing request admission.");
         model.ResetKVCache();
         var before = MemorySample();
         timer.Restart();
-        float[] logits = model.ForwardRefill(prompt);
+        float[] logits = model.ForwardRefill(requestPrompt);
         double prefillMs = timer.Elapsed.TotalMilliseconds;
         double decodeMs = 0;
         int[] generated = new int[steps];
         int[] consumed = new int[steps - 1];
-        var history = capture == null || run < 0 ? null : new List<int>(prompt);
+        var history = capture == null || run < 0 ? null : new List<int>(requestPrompt);
         using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
         for (int step = 0; step < steps; step++)
         {
@@ -123,14 +134,14 @@ try
         }
         records.Add(new
         {
-            Run = run, Warmup = run < 0, PromptTokens = prompt.Length, DecodeCalls = steps - 1,
+            Run = run, Warmup = run < 0, PromptIndex = promptIndex, PromptTokens = requestPrompt.Length, DecodeCalls = steps - 1,
             PrefillMilliseconds = prefillMs, DecodeMilliseconds = decodeMs,
-            PrefillTokensPerSecond = prompt.Length * 1000 / prefillMs,
+            PrefillTokensPerSecond = requestPrompt.Length * 1000 / prefillMs,
             DecodeTokensPerSecond = (steps - 1) * 1000 / decodeMs,
             LogitsSha256 = Convert.ToHexString(hash.GetHashAndReset()), Generated = generated, Consumed = consumed,
             Before = before, After = MemorySample(), Streaming = model.StreamingWeightUsage
         });
-        Console.WriteLine($"{mode} run={run}: prefill={prompt.Length * 1000 / prefillMs:F2}, decode={(steps - 1) * 1000 / decodeMs:F2} tok/s");
+        Console.WriteLine($"{mode} run={run}: prefill={requestPrompt.Length * 1000 / prefillMs:F2}, decode={(steps - 1) * 1000 / decodeMs:F2} tok/s");
     }
 }
 catch (Exception ex) { error = ex.ToString(); Console.Error.WriteLine(error); }
@@ -164,6 +175,7 @@ finally
         Context = context, LoadMilliseconds = loadMs, Plan = plan, AfterLoad = afterLoad,
         AfterDispose = afterDispose, Records = records, NativeShutdown = shutdown,
         RequestedOptions = options, Steps = steps, Repeats = repeats, ModelGeometry = geometry, Prompt = prompt,
+        Prompts = alternatePrompt == null ? null : new[] { prompt, alternatePrompt },
         Generation = teacher == null ? "raw-greedy" : "teacher-forced", Teacher = teacher, TeacherSha256 = teacherHash,
         TeacherConvention = "Exactly steps prediction rows; only teacher[0..steps-2] are consumed. The final teacher ID is retained but not forwarded.",
         CaptureLogits = captureLogits, LogitCapture = captured,

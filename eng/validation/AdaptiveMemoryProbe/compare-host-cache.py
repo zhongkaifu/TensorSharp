@@ -12,26 +12,30 @@ spec.loader.exec_module(evidence)
 require = evidence.require
 
 
-def compare(paths, *, device=False, workspace=False):
+def compare(paths, *, device=False, workspace=False, competition=False):
     cache = "DeviceWorkspaceCache" if workspace else "DeviceCache" if device else "HostCache"
     option = "--workspace-cache-bytes" if workspace else "--device-cache-bytes" if device else "--host-cache-bytes"
     result = {"ComparableAndBitwiseEqual": False, "Errors": [], "Measurements": {}, "Executions": [],
         "Qualification": "Balanced fresh processes, unchanged complete logits, charged-owner cleanup and successful exits. Logical source bytes are not physical SSD traffic. Warm file cache; not independent arithmetic, semantic quality or engine parity. Idle hardware and thermal controls require external evidence."}
     try:
         require(len(paths) == 4 and len({str(p.resolve()) for p in paths}) == 4, "Require four distinct execution records")
-        runs = [evidence.load(path, "serial") for path in paths]
+        require(not competition or workspace, "Competition mode requires workspace comparison")
+        runs = [evidence.load(path, "serial", allow_mixed=competition) for path in paths]
         runs.sort(key=lambda r: evidence.utc(r["execution"]["started_utc"]))
         require(len({r["execution"]["pid"] for r in runs}) == 4, "Process IDs must be distinct")
         require(all(evidence.utc(a["execution"]["finished_utc"]) <= evidence.utc(b["execution"]["started_utc"])
                     for a, b in zip(runs, runs[1:])), "Processes overlap")
-        ceilings = [int(r["report"]["RequestedOptions"][option]) for r in runs]
+        ceilings = [int(r["report"]["RequestedOptions"].get(option, 2**63 - 1) if competition
+                        else r["report"]["RequestedOptions"][option]) for r in runs]
         require(ceilings[0] == ceilings[3] == 0 and ceilings[1] == ceilings[2] > 0, "Require off/on/on/off order")
         baseline = runs[0]["report"]
         keys = ("ModelSha256", "ModelBytes", "ModelsAssemblySha256", "ProbeAssemblySha256", "ManagedAssembliesSha256",
-                "ModelGeometry", "Prompt", "Mode", "Generation", "Teacher", "Steps", "Repeats", "Environment")
+                "ModelGeometry", "Prompt", "Prompts", "Mode", "Generation", "Teacher", "Steps", "Repeats", "Environment")
         options = lambda r: {k: v for k, v in r["RequestedOptions"].items() if k not in ("--output", option)}
-        history = lambda r: [(row["Generated"], row["Consumed"], row["LogitsSha256"]) for row in r["Records"]]
-        require(len({row["LogitsSha256"] for row in baseline["Records"]}) == 1, "Same requests are not deterministic")
+        history = lambda r: [(row.get("PromptIndex", 0), row["Generated"], row["Consumed"], row["LogitsSha256"]) for row in r["Records"]]
+        for index in {row.get("PromptIndex", 0) for row in baseline["Records"]}:
+            require(len({row["LogitsSha256"] for row in baseline["Records"] if row.get("PromptIndex", 0) == index}) == 1,
+                    "Same requests are not deterministic")
         samples = {"off": [], "on": []}
         for run, ceiling in zip(runs, ceilings):
             report = run["report"]
@@ -51,8 +55,13 @@ def compare(paths, *, device=False, workspace=False):
                 require(0 <= usage[cache + "Bytes"] <= usage["Peak" + cache + "Bytes"] <= ceiling, "Invalid cache payload accounting")
                 if workspace:
                     require(usage["DeviceWorkspaceReuses"] >= 0, "Invalid workspace reuse counter")
-                    require((usage[cache + "Bytes"] > 0 and usage["DeviceWorkspaceReuses"] > 0) if ceiling
+                    retained = usage[("Peak" if competition else "") + cache + "Bytes"]
+                    require((retained > 0 and usage["DeviceWorkspaceReuses"] > 0) if ceiling
                             else usage["DeviceWorkspaceReuses"] == 0, "Workspace cache was not exercised as requested")
+                    if competition:
+                        weight_ceiling = int(report["RequestedOptions"].get("--device-cache-bytes", 2**63 - 1))
+                        require(0 < usage["DeviceCacheBytes"] <= usage["PeakDeviceCacheBytes"] <= weight_ceiling
+                                and usage.get("DeviceCacheHitBytes", 0) > 0, "Weight cache competition was not exercised")
                 elif ceiling:
                     require(usage[cache + "Bytes"] > 0 and usage[cache + "HitBytes"] > 0 and usage[cache + "Hits"] > 0,
                             "Cache was enabled but not exercised")
@@ -97,14 +106,14 @@ def compare(paths, *, device=False, workspace=False):
                             "DeviceCacheBytesPerRequest", *(("WeightUploadBytesPerRequest",) if device or workspace else ()),
                             *(("DeviceSessionCreationsPerRequest", "DeviceWorkspaceReusesPerRequest") if workspace else ()))}
         measurements = result["Measurements"]
-        consumed_bytes = {row["FileBytesPerRequest"] + row["CacheBytesPerRequest"] + row["DeviceCacheBytesPerRequest"]
-                          for rows in samples.values() for row in rows}
-        require(len(consumed_bytes) == 1, "Cache/source counters do not describe the same consumed weight bytes")
-        if device or workspace:
-            projected_bytes = {row["WeightUploadBytesPerRequest"] + row["DeviceCacheBytesPerRequest"]
-                               for rows in samples.values() for row in rows}
-            require(len(projected_bytes) == 1, "Upload/reuse counters do not describe the same projected weights")
-        if workspace:
+        for index in {row.get("PromptIndex", 0) for rows in samples.values() for row in rows}:
+            matching = [row for rows in samples.values() for row in rows if row.get("PromptIndex", 0) == index]
+            consumed_bytes = {row["FileBytesPerRequest"] + row["CacheBytesPerRequest"] + row["DeviceCacheBytesPerRequest"] for row in matching}
+            require(len(consumed_bytes) == 1, "Cache/source counters do not describe the same consumed weight bytes")
+            if device or workspace:
+                projected_bytes = {row["WeightUploadBytesPerRequest"] + row["DeviceCacheBytesPerRequest"] for row in matching}
+                require(len(projected_bytes) == 1, "Upload/reuse counters do not describe the same projected weights")
+        if workspace and not competition:
             operations = {row["DeviceSessionCreationsPerRequest"] + row["DeviceWorkspaceReusesPerRequest"]
                           for rows in samples.values() for row in rows}
             require(len(operations) == 1, "Creation/reuse counters do not describe the same workspace operations")
@@ -117,6 +126,15 @@ def compare(paths, *, device=False, workspace=False):
             for key in ("PrefillTokensPerSecond", "DecodeTokensPerSecond", "FileBytesPerRequest",
                         *(("WeightUploadBytesPerRequest",) if device or workspace else ()),
                         *(("DeviceSessionCreationsPerRequest",) if workspace else ()))}
+        if competition:
+            result["ComparisonScope"] = "Automatic workspace/weight competition; transfers may change. Fixed workload, original complete-logit equality and byte conservation remain required."
+            result["ByPromptTokens"] = {str(count): {arm: {key: {"Median": statistics.median(row[key] for row in rows if row["PromptTokens"] == count),
+                "Minimum": min(row[key] for row in rows if row["PromptTokens"] == count),
+                "Maximum": max(row[key] for row in rows if row["PromptTokens"] == count),
+                "Samples": sum(row["PromptTokens"] == count for row in rows)}
+                for key in ("PrefillTokensPerSecond", "DecodeTokensPerSecond", "WeightUploadBytesPerRequest", "DeviceSessionCreationsPerRequest")}
+                for arm, rows in samples.items()}
+                for count in sorted({row["PromptTokens"] for rows in samples.values() for row in rows})}
         result["ComparableAndBitwiseEqual"] = True
     except Exception as error:
         result["Errors"].append(str(error))

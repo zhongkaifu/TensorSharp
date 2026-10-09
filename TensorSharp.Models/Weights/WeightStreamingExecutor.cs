@@ -423,6 +423,7 @@ internal sealed partial class WeightStreamingExecutor : IDisposable
             ReleaseSession();
             if (_workspaceFaulted) { TrimWorkspaces(0); _workspaceFaulted = false; }
             if (_deviceCacheFaulted) { TrimDeviceCache(0); _deviceCacheFaulted = false; }
+            AgeWorkspaces();
         }
     }
 
