@@ -487,16 +487,17 @@ namespace TensorSharp.Runtime.Scheduling
             {
                 foreach (var id in output.FinishedRequestIds)
                 {
-                    // Admission can fail after a capacity change without executing a
-                    // model step. Complete those handles too; ApplyResults only sees
-                    // requests that produced a SequenceStepResult.
-                    if (_handles.TryGetValue(id, out var pending) && pending.Sequence.Error is { } error
-                        && _handles.TryRemove(id, out var failed))
-                    {
-                        failed.CompleteWithError(error);
-                        Interlocked.Increment(ref _totalCompleted);
-                    }
+                    // Finish the state handoff before notifying consumers. In
+                    // particular, capacity pressure can temporarily remove the
+                    // old checkpoint while publishing the finished state.
                     NotifyReleasedSequence(batched, id, seen);
+                    // Also handles admission failures without a model step.
+                    if (_handles.TryRemove(id, out var finished))
+                    {
+                        Interlocked.Increment(ref _totalCompleted);
+                        if (finished.Sequence.Error is { } error) finished.CompleteWithError(error);
+                        else finished.CompleteFinished();
+                    }
                 }
             }
             if (output.PreemptedRequestIds != null)
@@ -799,9 +800,6 @@ namespace TensorSharp.Runtime.Scheduling
                 {
                     LogSpeculationStatsIfAny(seq);
                     _scheduler.NotifyError(seq, r.Error, output);
-                    handle?.CompleteWithError(r.Error);
-                    _handles.TryRemove(seq.RequestId, out _);
-                    Interlocked.Increment(ref _totalCompleted);
                     continue;
                 }
 
@@ -834,9 +832,6 @@ namespace TensorSharp.Runtime.Scheduling
                             TruncateUnpublishedTail(seq, emittedCount);
                             LogSpeculationStatsIfAny(seq);
                             _scheduler.NotifyStop(seq, SequenceStatus.FinishedStopped, "eos", output);
-                            handle?.CompleteFinished();
-                            _handles.TryRemove(seq.RequestId, out _);
-                            Interlocked.Increment(ref _totalCompleted);
                             finished = true;
                             break;
                         }
@@ -849,9 +844,6 @@ namespace TensorSharp.Runtime.Scheduling
                             TruncateUnpublishedTail(seq, emittedCount);
                             LogSpeculationStatsIfAny(seq);
                             _scheduler.NotifyStop(seq, SequenceStatus.FinishedLengthCapped, "max_tokens", output);
-                            handle?.CompleteFinished();
-                            _handles.TryRemove(seq.RequestId, out _);
-                            Interlocked.Increment(ref _totalCompleted);
                             finished = true;
                             break;
                         }
@@ -888,9 +880,6 @@ namespace TensorSharp.Runtime.Scheduling
                                     ids => _model.Tokenizer?.Decode(ids)),
                                 period);
                             _scheduler.NotifyStop(seq, SequenceStatus.FinishedStopped, RepetitionGuard.FinishReason, output);
-                            handle?.CompleteFinished();
-                            _handles.TryRemove(seq.RequestId, out _);
-                            Interlocked.Increment(ref _totalCompleted);
                             finished = true;
                             break;
                         }

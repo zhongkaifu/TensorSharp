@@ -82,6 +82,36 @@ public sealed class CheckpointPublicationLifetimeTests
     }
 
     [Fact]
+    public async Task CompletionWaitsUntilFinishedStatePublicationHasSettled()
+    {
+        using var model = new BoundedRetainedModel();
+        using var resume = new ManualResetEventSlim();
+        var publishing = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        model.BeforeConversion = () =>
+        {
+            publishing.TrySetResult();
+            if (!resume.Wait(TimeSpan.FromSeconds(10))) throw new TimeoutException("Publication was not resumed.");
+        };
+        using var engine = new InferenceEngine(model, Configuration());
+        var sequence = Request("publication-boundary", Enumerable.Range(1, 48).ToList());
+        var handle = engine.SubmitRequest(sequence);
+        try
+        {
+            await publishing.Task.WaitAsync(TimeSpan.FromSeconds(10));
+            // The old retained checkpoint has been evicted, but the finished
+            // state has not been published yet. This is a real worker boundary,
+            // not a timing assumption or a concurrent read of the model's maps.
+            Assert.False(handle.Completion.IsCompleted);
+            while (handle.Tokens.TryRead(out _)) { }
+            Assert.False(handle.Tokens.Completion.IsCompleted);
+        }
+        finally { resume.Set(); }
+        await handle.Completion.WaitAsync(TimeSpan.FromSeconds(10));
+        Assert.Single(model.RetainedPayloadKeys);
+        Assert.Equal(1, engine.TotalCompleted);
+    }
+
+    [Fact]
     public async Task CompactedAgentHistoryUnderRetainedCapacityPressureStillGeneratesAndReusesExactState()
     {
         using var model = new BoundedRetainedModel();
@@ -175,6 +205,7 @@ public sealed class CheckpointPublicationLifetimeTests
     private sealed class BoundedRetainedModel : OracleModel, IPrefixCacheModel
     {
         internal int CapacityRefusals { get; private set; }
+        internal Action? BeforeConversion { get; set; }
         internal BoundedRetainedModel() : base(new OracleTraits
         {
             Name = "one-retained-recurrent", Class = FamilyClass.R,
@@ -201,7 +232,11 @@ public sealed class CheckpointPublicationLifetimeTests
 
         bool IPrefixCacheModel.TryConvertPrimary(string payloadKey, int length, out PayloadFootprint footprint)
         {
-            if (RetainedPayloadKeys.Count == 0) return TryConvertPrimary(payloadKey, length, out footprint);
+            if (RetainedPayloadKeys.Count == 0)
+            {
+                BeforeConversion?.Invoke();
+                return TryConvertPrimary(payloadKey, length, out footprint);
+            }
             CapacityRefusals++;
             footprint = default;
             return false;
