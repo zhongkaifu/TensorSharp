@@ -830,6 +830,14 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
         target_include_directories(GgmlOpsQ8ParallelVectorBench PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/src")
         target_link_libraries(GgmlOpsQ8ParallelVectorBench PRIVATE ggml-cuda ggml-base CUDA::cudart)
+
+        # Ordered-row alternatives: byte-exact checks plus a sequential-FMA
+        # forward-error bound. Explicit timing only, never a model-quality gate.
+        add_executable(GgmlOpsQ8OrderedVectorBench tests/q8_ordered_vector_bench.cu ggml_ops_q8_precision.cu)
+        target_compile_definitions(GgmlOpsQ8OrderedVectorBench PRIVATE TSG_GGML_USE_CUDA=1)
+        target_include_directories(GgmlOpsQ8OrderedVectorBench PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/src")
+        target_link_libraries(GgmlOpsQ8OrderedVectorBench PRIVATE ggml-cuda ggml-base CUDA::cudart)
         # Standalone bounded row-dequantization + pedantic SGEMM exploration.
         # No model dispatch changes and no unconditional performance assertion.
         add_executable(GgmlOpsQ8PrefillBench tests/q8_prefill_bench.cu ggml_ops_q8_precision.cu)

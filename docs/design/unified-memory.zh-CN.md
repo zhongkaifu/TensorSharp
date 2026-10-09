@@ -517,6 +517,20 @@ Gemma 12B IQ2 的 embedding-only 诊断也未找到修复：仅把 tied `token_e
 
 全部 warmup/测量请求的完整 logits 哈希和 token 历史一致，四进程正常退出/shutdown，缓存与其他预算 owner 释放归零。测量无并发构建、下载或其他推理；未锁频，模型哈希会预热文件缓存，未测冷盘、物理 SSD I/O、p95/p99 或独立引擎同预算性能。**该配置的绝对速度仍远低于全驻留参考，不能据此宣布性能目标完成。** 完整身份、范围、原始计数和失败拒绝在忽略的 `artifacts/unified-memory-adaptive/host-weight-cache-v2/`；比较入口为 [compare-host-cache.py](../../eng/validation/AdaptiveMemoryProbe/compare-host-cache.py)。本轮 SSH 两次连接均拒绝（exit255），没有新的 Linux/多 GPU 验收。上一提交 `2d66c0b9` 的 Linux x64/ARM64 CI 已通过，不代替这次新增托管实现的 CI。
 
+### 2026-10-09 UTC：保持运算顺序的默认 Q8 解码优化
+
+默认 N=1 投影改为每 lane 一行、每 CTA 一个 warp，用符合 Q8_0 两字节对齐约束的打包读取，消除原来的共享内存转置和每 32 项屏障。仍按递增 K 对原始 Q8 权重与 F32 激活执行相同 FMA；没有扩大权重、增加全局 scratch 或改变并行归约默认开关。sm86 编译资源为 40 registers、0 local stack、0 shared memory。所有改动在 TensorSharp 内；ggml `ffa4e8b80930029a35991f94e7c8a93cd67730ab` 工作树保持无改动。
+
+最终 native SHA `3c6f0fb7204b678a607fe38f74ba39fdcf436dd8503246adab16634d8beda7bc`，Models 仍为 `eb3781a9…`，AdaptiveMemoryProbe 为 `402871974977554eaffffc303147d38e4820ad7dc446035cb3a21ad133ff9386`。生产精度与 streaming 原生检查 **12/12** 通过，无跳过；默认精度程序另经 CUDA memcheck 检查，0 errors。原有独立 FP64 门槛未放宽。独立研究程序的 60 组形状/步幅 × 10 路径均逐位一致、canary/输入未改写，memcheck 0 errors；该研究自己的 FP64 检查使用逐项 FMA 的前向误差界，不能冒充生产严格绝对误差门槛通过。研究控制程序在修改生产代码前冻结，重新构建时的 control 则是当时链接的生产版本。
+
+本机 RTX 3080 Laptop 16 GiB，Qwen0.8B Q8、643-token prompt、context2048、64 prediction rows，旧/新/新/旧四个独立进程，每组 6 次测量并排除 warmup：decode 中位数 **19.513→84.985 tokens/s（4.355×）**，范围 **19.461–19.528 / 83.741–85.759**；prefill **2783.714→2804.476**，范围重叠。全部 warmup/测量的完整 logits 哈希和 token 历史相同，进程退出及 native shutdown 均正常。无并发推理、构建或下载，未锁频且文件哈希预热页缓存。与先前独立 llama **183.98 decode / 8792.20 prefill** 参考仍有明显差距，不作为性能目标完成的结论。
+
+同一托管程序集搭配旧/新 native，对本地 `C:\Works\models\Qwen\Qwen3.8-27B-UD-IQ4_XS.gguf`、258-token prompt、context512、固定历史 16 行全词表捕获全部逐位一致。这避免引入此前 parallel-K 在 27B 上的新偏差，但不解决既有独立基线差异或语义质量问题。Qwen 文件模式再测 32 行完整词表，原数值门槛通过；128 MiB host/64 MiB device/64 MiB cache ceiling 下实际保留 67,108,160 B，压力拒绝、reset 恢复与最终零 owner 均通过。该文件验证只计正确性和预算覆盖，不算吞吐基准。
+
+27B 另以关闭完整 logits 捕获的独立四进程完成相同固定历史 ABBA，每组 6 次测量：decode **7.503→14.749 tokens/s（1.966×）**，范围 **7.422–7.541 / 14.411–14.879**；prefill **397.602→391.744**，范围 **374.978–400.633 / 383.002–400.776**，保留中位下降的观测。包含 warmup 的所有完整 logits 哈希/历史一致，进程退出和 shutdown 正常。仍是单卡短固定历史，不能推断长中文输出质量、其他设备或并发 SLO。
+
+严格测速入口现为 `compare-native-runs.py --executions`，同时校验四进程时间/PID、退出、隔离部署身份、设置、计时分母以及包含 warmup 的完整历史，比较工具回归共 **6/6**。原始证据位于忽略的 `artifacts/unified-memory-adaptive/q8-ordered-vector-v1/`，方法见 [AdaptiveMemoryProbe](../../eng/validation/AdaptiveMemoryProbe/README.md)。上一提交 `f1bbbe53` 的 Linux x64/ARM64 CPU CI 已通过；本次 native 修改仍需独立 CI，多 GPU 与其他未运行场景不计通过。
+
 ## 15. 后续实际接入与硬件验证入口
 
 `PagedKvStorage` 的 `Acquire` 返回有生命周期的 span 租约；`BatchExecutor` 的捕获、尾页刷新、恢复全部使用该 API。底层将一个页面视为不解释布局的可变资源，按原字节回写/恢复。前缀引用继续保留逻辑页，最后一个引用消失才注销；id 再次分配时增加 epoch。失败的释放不把页面放回 free queue。捕获 scratch 和固定搬运缓冲在启动时预留，单个模型必须能容纳一个合法完整快照页。恢复阶段可在有空闲驻留容量时预取下一页，与当前注入操作重叠；停止/回收前等待预取结束。

@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+import test_adaptive_parallel_comparison as fixtures
 
 SPEC = importlib.util.spec_from_file_location("native_compare",
     Path(__file__).resolve().parents[1] / "AdaptiveMemoryProbe" / "compare-native-runs.py")
@@ -11,6 +12,44 @@ SPEC.loader.exec_module(COMPARE)
 
 
 class NativeComparisonTests(unittest.TestCase):
+    def execution_fixture(self, root):
+        seeds = fixtures.ParallelPerformanceEvidence().fixture(root)
+        paths = [seeds["serial"][0], *seeds["parallel"], seeds["serial"][1]]
+        for index, path in enumerate(paths):
+            report_path = path.with_name("report.json")
+            report = json.loads(report_path.read_text())
+            report.update(Model="same.gguf", Context=64)
+            report["Environment"][COMPARE.evidence.FLAG] = "0"
+            report["Native"][0]["Sha256"] = ("a" if index in (0, 3) else "b") * 64
+            for row in report["Records"]: row["LogitsSha256"] = "e" * 64
+            report_path.write_text(json.dumps(report))
+            path.with_name("process.log").write_text("")
+            path.with_name("prompt.json").write_text(json.dumps(report["Prompt"]))
+        return paths
+
+    def test_strict_executions_require_balanced_completed_processes(self):
+        with tempfile.TemporaryDirectory() as root:
+            result = COMPARE.compare_executions(self.execution_fixture(Path(root)))
+            self.assertTrue(result["ComparableAndBitwiseEqual"], result)
+            self.assertEqual(6, result["Measurements"]["candidate"]["DecodeTokensPerSecond"]["Samples"])
+
+    def test_strict_executions_reject_false_or_changed_evidence(self):
+        for change in ("exit", "capture", "shutdown", "warmup", "settings", "probe", "order", "duplicate"):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as root:
+                paths = self.execution_fixture(Path(root)); target = paths[1]
+                report = json.loads(target.with_name("report.json").read_text())
+                execution = json.loads(target.read_text())
+                if change == "exit": execution["exit_code"] = 1
+                if change == "capture": report["CaptureLogits"] = True
+                if change == "shutdown": report["NativeShutdown"] = False
+                if change == "warmup": report["Records"][0]["LogitsSha256"] = "0" * 64
+                if change == "settings": report["Environment"]["CUDA_VISIBLE_DEVICES"] = "2"
+                if change == "probe": report["ProbeAssemblySha256"] = "0" * 64
+                if change == "order": report["Native"][0]["Sha256"] = "a" * 64
+                if change == "duplicate": paths[3] = paths[0]
+                target.with_name("report.json").write_text(json.dumps(report)); target.write_text(json.dumps(execution))
+                self.assertFalse(COMPARE.compare_executions(paths)["ComparableAndBitwiseEqual"])
+
     def run_comparison(self, change=None):
         with tempfile.TemporaryDirectory() as root:
             paths = {"control": [], "candidate": []}

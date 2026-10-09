@@ -82,53 +82,30 @@ __global__ void q8_f32_vector_parallel(const char * weights, const char * input,
     if (lane == 0) output[row] = sum;
 }
 
-// Decode has only one activation column. The matrix kernel below would still
-// compute eight columns (seven zero-filled), leaving only 16 of 128 threads
-// contributing useful results. Threads cooperatively decode 64 weight rows,
-// then one half warp owns four independent row accumulators per lane. All
-// other threads skip the otherwise redundant seven columns while helping the
-// coalesced weight loads. Shared-memory transposition
-// keeps both the Q8 loads and the per-K row reads coalesced/bank-conflict free.
-// Keep exactly the existing scale multiplication followed by K-increasing
-// fmaf: no parallel-K reduction, activation narrowing or extra payload buffer.
+// Each lane owns a complete output row; independent rows provide parallelism
+// without changing the reduction order. Read two adjacent signed Q8 bytes at
+// once using the format's guaranteed two-byte alignment (34-byte block stride
+// forbids assuming aligned 32/128-bit loads). One warp per CTA limits the active
+// rows competing for L1 while the remaining bytes in each row are consumed.
+// No barriers, shared/global scratch, input narrowing or parallel-K reduction.
 __global__ void q8_f32_vector(const char * weights, const char * input, float * output,
         int inner, int rows, size_t weight_stride, size_t input_inner_stride) {
-    constexpr int TileRows = 64, TileInner = 32;
-    __shared__ float ws[TileInner][TileRows + 1];
-    __shared__ float xs[TileInner];
-    const int lane = int(threadIdx.x);
-    const int row_base = int(blockIdx.x) * TileRows;
-    float sums[4] = {};
-    for (int base = 0; base < inner; base += TileInner) {
-        for (int index = lane; index < TileRows * TileInner; index += 128) {
-            const int row = index / TileInner, k = index % TileInner;
-            float value = 0.0f;
-            if (row_base + row < rows) {
-                const char * block = weights + size_t(row_base + row) * weight_stride + size_t(base / 32) * 34;
-                const float scale = __half2float(*reinterpret_cast<const half *>(block));
-                value = scale * float(*reinterpret_cast<const int8_t *>(block + 2 + k));
-            }
-            ws[k][row] = value;
+    const int row = int(blockIdx.x) * 32 + int(threadIdx.x);
+    if (row >= rows) return;
+    float sum = 0.0f;
+    for (int block_index = 0; block_index < inner / 32; ++block_index) {
+        const char * block = weights + size_t(row) * weight_stride + size_t(block_index) * 34;
+        const float scale = __half2float(*reinterpret_cast<const half *>(block));
+#pragma unroll
+        for (int pair = 0; pair < 16; ++pair) {
+            const uint16_t packed = *reinterpret_cast<const uint16_t *>(block + 2 + pair * 2);
+            const float x0 = *reinterpret_cast<const float *>(input + size_t(block_index * 32 + pair * 2) * input_inner_stride);
+            const float x1 = *reinterpret_cast<const float *>(input + size_t(block_index * 32 + pair * 2 + 1) * input_inner_stride);
+            sum = fmaf(scale * float(int8_t(packed & 255)), x0, sum);
+            sum = fmaf(scale * float(int8_t(packed >> 8)), x1, sum);
         }
-        if (lane < TileInner)
-            xs[lane] = *reinterpret_cast<const float *>(input + size_t(base + lane) * input_inner_stride);
-        __syncthreads();
-        if (lane < 16) {
-#pragma unroll
-            for (int k = 0; k < TileInner; ++k) {
-                const float x = xs[k];
-#pragma unroll
-                for (int row = 0; row < 4; ++row)
-                    sums[row] = fmaf(ws[k][lane + row * 16], x, sums[row]);
-            }
-        }
-        __syncthreads();
     }
-    if (lane < 16) {
-#pragma unroll
-        for (int row = 0; row < 4; ++row)
-            if (row_base + lane + row * 16 < rows) output[row_base + lane + row * 16] = sums[row];
-    }
+    output[row] = sum;
 }
 
 // Each CTA owns a 64-row output tile. Its 128 threads each accumulate four
@@ -249,8 +226,8 @@ int tsg_matmul_q8_cuda_launch(const void * weights, const void * input, float * 
             static_cast<const char *>(input), output, inner, rows, weight_stride, input_inner_stride, input_column_stride);
     }
     else if (columns == 1) {
-        const unsigned blocks = unsigned((int64_t(rows) + 63) / 64);
-        q8_f32_vector<<<blocks, 128, 0, stream>>>(static_cast<const char *>(weights),
+        const unsigned blocks = unsigned((int64_t(rows) + 31) / 32);
+        q8_f32_vector<<<blocks, 32, 0, stream>>>(static_cast<const char *>(weights),
             static_cast<const char *>(input), output, inner, rows, weight_stride, input_inner_stride);
     }
     else if (columns <= 8 && parallel_small_batch_enabled()) {

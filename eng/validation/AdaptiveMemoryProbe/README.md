@@ -262,9 +262,72 @@ retained separately and has an older assembly/native identity.
 
 `compare-native-runs.py` compares two resident binary directories with identical
 managed assemblies and checkpoint, allowing only the native-library identity to
-differ. Use `--control` for the first/last reports and `--candidate` for the middle
-two reports in a control/candidate/candidate/control sequence. It requires full
-raw-logit equality, excluded warmups and at least two fresh processes per arm.
+differ. For current probes use `--executions FIRST SECOND THIRD FOURTH --output
+SUMMARY`, passing the bounded runner's four execution records in
+control/candidate/candidate/control order. Each process excludes one warmup and
+measures three requests; capture and parallel-K options must be disabled.
+The comparator checks non-overlapping process lifetimes, exit status, native
+shutdown, complete binary/geometry/environment identities, frozen binary
+directories, timing denominators and full-logit/history equality, including
+warmup. The legacy `--control`/`--candidate` report-only interface remains for
+older evidence, but does not qualify process completion or isolation.
+
+The current default N=1 kernel gives each lane one output row and uses one warp
+per CTA. Two-byte packed Q8 loads respect the format's 34-byte block alignment;
+the same increasing-K FMA sequence consumes the original F32 activations. It
+removes shared-memory transposition and per-block barriers without allocating
+global scratch or expanding weights. On sm86, the compiled kernel uses 40
+registers, no local stack and no shared memory. Parallel-K remains opt-in.
+
+RTX 3080 Laptop 16 GiB, the same 643-token Qwen0.8B fixture/context2048/64 prediction
+rows, four fresh ABBA processes and six measured requests per arm:
+
+Prefill uses the automatic policy; parallel-K vector/small-batch are both off.
+
+| Native | Prefill median (range), tokens/s | Decode median (range), tokens/s |
+| --- | ---: | ---: |
+| Previous `9be5eabf…` | 2783.714 (2731.641–2856.318) | 19.513 (19.461–19.528) |
+| Packed ordered rows `3c6f0fb7…` | 2804.476 (2684.324–2839.527) | 84.985 (83.741–85.759) |
+
+Complete logits and all histories, including warmup, are byte-identical. Decode
+improved 4.355x; prefill intervals overlap. No concurrent inference/build/download
+ran; clocks were not locked, and hashing warms the filesystem cache. This still
+falls short of the previously measured independent llama.cpp 183.98 decode /
+8792.20 prefill reference. It is a regression/performance check, not a semantic
+quality claim or proof that the previous arithmetic is an exact oracle.
+
+The same managed files and old/new native libraries also capture all 16
+teacher-forced vocabulary rows of local Qwen3.8-27B-UD-IQ4_XS, prompt258/context512,
+with byte-identical results. This avoids the new parallel-K divergence previously
+observed on 27B; it does not resolve the existing gap against independent llama.
+All 27B comparisons fix prefill tile32 and disable both parallel-K options.
+Separate capture-disabled 27B ABBA runs with three measured requests per process
+give decode 7.503 (7.422–7.541) → 14.749 (14.411–14.879) tokens/s, a 1.966x gain.
+Prefill is 397.602 (374.978–400.633) → 391.744 (383.002–400.776), with overlapping
+ranges; the measured decrease is retained. All warmup/measured logits and histories
+match bitwise. These fixed-history results are not open-ended language quality.
+Native CPU/CUDA precision and streaming checks pass 12/12 with no skips, and the
+production default precision test passes CUDA memcheck with zero errors.
+The existing strict FP64 thresholds are unchanged.
+
+The standalone `GgmlOpsQ8OrderedVectorBench --check` checks ten synthetic research
+routes on 60 shapes/stride layouts. Each route must match every output byte and
+canary; source buffers are read back to detect writes. Its independent FP64
+check uses the ordinary sequential-FMA forward-error bound, not the stricter
+production precision gate. `--benchmark K M` is bounded to a 2 GiB weight fixture,
+samples at most 62 FP64 rows, and balances forward/reverse route timing. It is
+explicit research, not CTest or model throughput. Its control is the production
+kernel linked at build time. The original-control executable was frozen before
+this production change; rebuilding now uses the new control.
+
+Evidence: ignored `artifacts/unified-memory-adaptive/q8-ordered-vector-v1/`.
+Final native SHA `3c6f0fb7204b678a607fe38f74ba39fdcf436dd8503246adab16634d8beda7bc`,
+Models `eb3781a969a37595de32db0e301420fb9dc3f461148526f5f7896f71af606397`,
+AdaptiveMemoryProbe `402871974977554eaffffc303147d38e4820ad7dc446035cb3a21ad133ff9386`;
+unchanged upstream ggml `ffa4e8b80930029a35991f94e7c8a93cd67730ab`.
+
+The earlier N=1 specialization below is retained as historical evidence with
+its separate native/managed identities.
 
 On the same hardware and Qwen checkpoint above, context 2048, 643 prompt tokens
 and 63 decode calls per request, the N=1 specialization keeps the previous
