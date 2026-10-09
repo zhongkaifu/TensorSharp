@@ -19,6 +19,17 @@ void checked(cudaError_t status) { require(status == cudaSuccess, cudaGetErrorSt
 void checked(cublasStatus_t status) { require(status == CUBLAS_STATUS_SUCCESS, "Pedantic cuBLAS operation failed"); }
 constexpr size_t WorkspaceBytes = 4 * 1024 * 1024;
 size_t aligned(size_t bytes) { require(bytes <= SIZE_MAX - 255, "Scratch alignment overflow"); return (bytes + 255) / 256 * 256; }
+int argument_integer(const char * value) {
+    require(value && value[0] != '\0', "Empty integer argument");
+    int result = 0;
+    for (const char * p = value; *p; ++p) {
+        require(*p >= '0' && *p <= '9', "Expected unsigned decimal integer argument");
+        const int digit = *p - '0';
+        require(result <= (std::numeric_limits<int>::max() - digit) / 10, "Integer argument overflow");
+        result = result * 10 + digit;
+    }
+    return result;
+}
 
 struct ScratchBudget {
     size_t capacity, live = 0, peak = 0;
@@ -69,21 +80,39 @@ __global__ void pack_input(const char * source, float * destination, int k, int 
 
 unsigned grid(size_t count) { return unsigned(std::min<size_t>((count + 255) / 256, 65535)); }
 
+__global__ void accumulate_chunk(const float * partial, double * accumulated, size_t count, bool first) {
+    for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < count;
+         i += size_t(blockDim.x) * gridDim.x)
+        accumulated[i] = (first ? 0.0 : accumulated[i]) + double(partial[i]);
+}
+
+__global__ void store_accumulated(const double * accumulated, float * output,
+                                  int rows, int columns, int output_stride) {
+    const size_t count = size_t(rows) * columns;
+    for (size_t i = size_t(blockIdx.x) * blockDim.x + threadIdx.x; i < count;
+         i += size_t(blockDim.x) * gridDim.x)
+        output[(i / rows) * output_stride + i % rows] = float(accumulated[i]);
+}
+
 struct TiledGemm {
-    int inner, row_capacity, column_capacity;
-    size_t bytes, weight_offset, input_offset;
+    int inner, row_capacity, column_capacity, inner_chunk;
+    size_t bytes, weight_offset, input_offset, partial_offset, accumulated_offset;
     bool packed_input;
     void * arena = nullptr;
     cublasHandle_t handle = nullptr;
     std::shared_ptr<tsg::SharedCacheCharge> charge;
 
-    static size_t payload(int k, int rows, int columns, bool pack) {
+    static size_t payload(int k, int rows, int columns, bool pack, int chunk = 0) {
         return WorkspaceBytes + aligned(size_t(k) * rows * sizeof(float))
-            + (pack ? aligned(size_t(k) * columns * sizeof(float)) : 0);
+            + (pack ? aligned(size_t(k) * columns * sizeof(float)) : 0)
+            + (chunk ? aligned(size_t(rows) * columns * sizeof(float))
+                     + aligned(size_t(rows) * columns * sizeof(double)) : 0);
     }
-    TiledGemm(ScratchBudget & budget, int k, int rows, int columns, bool pack)
-        : inner(k), row_capacity(rows), column_capacity(columns), bytes(payload(k, rows, columns, pack)),
+    TiledGemm(ScratchBudget & budget, int k, int rows, int columns, bool pack, int chunk = 0)
+        : inner(k), row_capacity(rows), column_capacity(columns), inner_chunk(chunk), bytes(payload(k, rows, columns, pack, chunk)),
           weight_offset(WorkspaceBytes), input_offset(WorkspaceBytes + aligned(size_t(k) * rows * sizeof(float))),
+          partial_offset(input_offset + (pack ? aligned(size_t(k) * columns * sizeof(float)) : 0)),
+          accumulated_offset(partial_offset + (chunk ? aligned(size_t(rows) * columns * sizeof(float)) : 0)),
           packed_input(pack) {
         charge = tsg::SharedCacheCharge::reserve(0, 2, bytes);
         if (!charge) return; // no physical payload exists if quota denied
@@ -125,14 +154,36 @@ struct TiledGemm {
                     checked(cudaGetLastError());
                     source = reinterpret_cast<const char *>(packed); leading_input = inner;
                 }
-                // Complete K for each output: no split-K partial sums. ldc is
-                // the full destination row count, so no output tile is needed.
-                checked(cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
-                    count_rows, count_columns, inner, &alpha, widened, CUDA_R_32F, inner,
-                    source, CUDA_R_32F, leading_input, &beta,
-                    output + size_t(first_column) * rows + first_row, CUDA_R_32F, rows,
-                    CUBLAS_COMPUTE_32F_PEDANTIC, CUBLAS_GEMM_DEFAULT));
-                checked(cudaGetLastError());
+                auto * destination = output + size_t(first_column) * rows + first_row;
+                if (inner_chunk == 0) {
+                    // Complete K. ldc is the full destination row count, so
+                    // the original candidate needs no output scratch.
+                    checked(cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                        count_rows, count_columns, inner, &alpha, widened, CUDA_R_32F, inner,
+                        source, CUDA_R_32F, leading_input, &beta, destination, CUDA_R_32F, rows,
+                        CUBLAS_COMPUTE_32F_PEDANTIC, CUBLAS_GEMM_DEFAULT));
+                    checked(cudaGetLastError());
+                } else {
+                    // Shorter F32 dots reduce local rounding error. Sum their
+                    // partial results in FP64 and round once at the end. This
+                    // changes reduction order, never weights/input precision.
+                    // Both intermediate tiles belong to the admitted arena.
+                    auto * partial = reinterpret_cast<float *>(static_cast<char *>(arena) + partial_offset);
+                    auto * accumulated = reinterpret_cast<double *>(static_cast<char *>(arena) + accumulated_offset);
+                    const size_t elements = size_t(count_rows) * count_columns;
+                    for (int first_k = 0; first_k < inner; first_k += inner_chunk) {
+                        const int count_k = std::min(inner_chunk, inner - first_k);
+                        checked(cublasGemmEx(handle, CUBLAS_OP_T, CUBLAS_OP_N,
+                            count_rows, count_columns, count_k, &alpha, widened + first_k, CUDA_R_32F, inner,
+                            source + size_t(first_k) * sizeof(float), CUDA_R_32F, leading_input, &beta,
+                            partial, CUDA_R_32F, count_rows, CUBLAS_COMPUTE_32F_PEDANTIC, CUBLAS_GEMM_DEFAULT));
+                        checked(cudaGetLastError());
+                        accumulate_chunk<<<grid(elements), 256>>>(partial, accumulated, elements, first_k == 0);
+                        checked(cudaGetLastError());
+                    }
+                    store_accumulated<<<grid(elements), 256>>>(accumulated, destination, count_rows, count_columns, rows);
+                    checked(cudaGetLastError());
+                }
             }
         }
     }
@@ -225,7 +276,8 @@ template<class Launch> double timing(Launch launch) {
     return double(elapsed) * 1000 / repetitions;
 }
 
-bool measure(int k, int m, int n, bool padded, size_t ceiling, bool benchmark) {
+bool measure(int k, int m, int n, bool padded, size_t ceiling, bool benchmark, int inner_chunk = 0) {
+    std::printf("{\"experiment_inner_chunk\":%d,\"k\":%d,\"m\":%d,\"n\":%d}\n", inner_chunk, k, m, n);
     Fixture fixture(k, m, n, padded);
     DeviceAllocation weights(fixture.weights.size()), input(fixture.input.size() * sizeof(float));
     const size_t output_count = size_t(m) * n + 2;
@@ -250,6 +302,7 @@ bool measure(int k, int m, int n, bool padded, size_t ceiling, bool benchmark) {
         "Cannot attach isolated scratch ledger");
     double best_us = std::numeric_limits<double>::infinity(); int best_rows = 0, best_columns = 0;
     bool all_qualified = true;
+    int admitted_candidates = 0, qualified_candidates = 0;
     std::set<int> row_tiles, column_tiles;
     for (int rows : (benchmark ? std::vector<int>{64, 256, 1024, 4096} : std::vector<int>{1, 63, 128}))
         row_tiles.insert(std::min(rows, m));
@@ -258,13 +311,14 @@ bool measure(int k, int m, int n, bool padded, size_t ceiling, bool benchmark) {
     for (int rows : row_tiles) for (int columns : column_tiles) {
         const int allocations_before = budget.allocations;
         {
-            TiledGemm projection(budget, k, rows, columns, padded);
+            TiledGemm projection(budget, k, rows, columns, padded, inner_chunk);
             if (!projection.arena) {
                 require(budget.live == 0 && budget.allocations == allocations_before, "Refused scratch still allocated payload");
-                std::printf("{\"route\":\"pedantic_f32_gemm\",\"admitted\":false,\"k\":%d,\"m\":%d,\"n\":%d,\"tile_rows\":%d,\"tile_columns\":%d,\"requested_bytes\":%zu,\"scratch_cap_bytes\":%zu}\n",
-                    k, m, n, rows, columns, projection.bytes, ceiling);
+                std::printf("{\"route\":\"pedantic_f32_gemm\",\"inner_chunk\":%d,\"admitted\":false,\"k\":%d,\"m\":%d,\"n\":%d,\"tile_rows\":%d,\"tile_columns\":%d,\"requested_bytes\":%zu,\"scratch_cap_bytes\":%zu}\n",
+                    inner_chunk, k, m, n, rows, columns, projection.bytes, ceiling);
                 continue;
             }
+            ++admitted_candidates;
             auto project = [&] { projection.project(weights.data, input.data, static_cast<float *>(candidate.data) + 1,
                 m, n, fixture.ws, fixture.xs, fixture.cs); };
             checked(cudaMemcpy(candidate.data, poison.data(), poison.size() * sizeof(float), cudaMemcpyHostToDevice));
@@ -274,51 +328,64 @@ bool measure(int k, int m, int n, bool padded, size_t ceiling, bool benchmark) {
             const double first_us = benchmark ? timing(project) : 0, second_us = benchmark ? timing(project) : 0;
             const double average = (first_us + second_us) / 2;
             all_qualified = all_qualified && error.passed;
+            if (error.passed) ++qualified_candidates;
             if (error.passed && average < best_us) { best_us = average; best_rows = rows; best_columns = columns; }
-            std::printf("{\"oracle_qualified\":%s,\"failed_samples\":%zu,\"tile_rows\":%d,\"tile_columns\":%d}\n",
-                error.passed ? "true" : "false", error.failed_samples, rows, columns);
-            std::printf("{\"data\":\"synthetic\",\"production_candidate\":false,\"route\":\"pedantic_f32_gemm\",\"admitted\":true,\"k\":%d,\"m\":%d,\"n\":%d,\"strided\":%s,\"tile_rows\":%d,\"tile_columns\":%d,\"scratch_cap_bytes\":%zu,\"scratch_payload_bytes\":%zu,\"workspace_bytes\":%zu,\"stream_us_1\":%.6f,\"stream_us_2\":%.6f,\"oracle_samples\":%zu,\"oracle_max_error\":%.9g,\"oracle_relative_l2\":%.9g}\n",
-                k, m, n, padded ? "true" : "false", rows, columns, ceiling, projection.bytes, WorkspaceBytes,
+            std::printf("{\"oracle_qualified\":%s,\"failed_samples\":%zu,\"tile_rows\":%d,\"tile_columns\":%d,\"inner_chunk\":%d}\n",
+                error.passed ? "true" : "false", error.failed_samples, rows, columns, inner_chunk);
+            std::printf("{\"data\":\"synthetic\",\"production_candidate\":false,\"route\":\"pedantic_f32_gemm\",\"inner_chunk\":%d,\"admitted\":true,\"k\":%d,\"m\":%d,\"n\":%d,\"strided\":%s,\"tile_rows\":%d,\"tile_columns\":%d,\"scratch_cap_bytes\":%zu,\"scratch_payload_bytes\":%zu,\"workspace_bytes\":%zu,\"stream_us_1\":%.6f,\"stream_us_2\":%.6f,\"oracle_samples\":%zu,\"oracle_max_error\":%.9g,\"oracle_relative_l2\":%.9g}\n",
+                inner_chunk, k, m, n, padded ? "true" : "false", rows, columns, ceiling, projection.bytes, WorkspaceBytes,
                 first_us, second_us, error.samples, error.maximum, error.relative);
         }
         require(budget.live == 0, "Scratch credit survived physical owner cleanup");
     }
     require(tsg::SharedCacheCharge::detach(&budget), "Scratch scope could not detach");
     const double after_us = benchmark ? timing(old) : 0;
-    std::printf("{\"route\":\"serial_f32_control\",\"k\":%d,\"m\":%d,\"n\":%d,\"stream_us_before\":%.6f,\"stream_us_after\":%.6f,\"oracle_relative_l2\":%.9g,\"oracle_max_error\":%.9g,\"oracle_qualified\":%s,\"failed_samples\":%zu,\"best_observed_tile_rows\":%d,\"best_observed_tile_columns\":%d,\"best_observed_stream_us\":%.6f,\"scratch_peak_bytes\":%zu,\"baseline_payload_bytes\":%zu,\"library_metadata_excluded\":true,\"final_scratch_live_bytes\":%zu}\n",
-        k, m, n, before_us, after_us, old_error.relative, old_error.maximum, old_error.passed ? "true" : "false", old_error.failed_samples, best_rows, best_columns,
+    std::printf("{\"admitted_candidates\":%d,\"qualified_candidates\":%d,\"intentional_refusal_check\":%s}\n",
+        admitted_candidates, qualified_candidates, !benchmark && admitted_candidates == 0 ? "true" : "false");
+    std::printf("{\"route\":\"serial_f32_control\",\"experiment_inner_chunk\":%d,\"k\":%d,\"m\":%d,\"n\":%d,\"stream_us_before\":%.6f,\"stream_us_after\":%.6f,\"oracle_relative_l2\":%.9g,\"oracle_max_error\":%.9g,\"oracle_qualified\":%s,\"failed_samples\":%zu,\"best_observed_tile_rows\":%d,\"best_observed_tile_columns\":%d,\"best_observed_stream_us\":%.6f,\"scratch_peak_bytes\":%zu,\"baseline_payload_bytes\":%zu,\"library_metadata_excluded\":true,\"final_scratch_live_bytes\":%zu}\n",
+        inner_chunk, k, m, n, before_us, after_us, old_error.relative, old_error.maximum, old_error.passed ? "true" : "false", old_error.failed_samples, best_rows, best_columns,
         std::isfinite(best_us) ? best_us : 0, budget.peak,
         fixture.weights.size() + fixture.input.size() * sizeof(float) + 2 * output_count * sizeof(float), budget.live);
-    return all_qualified && old_error.passed;
+    // A benchmark that cannot execute any candidate is unavailable, never a
+    // passing optimization. Only --check deliberately includes all-refused caps.
+    return all_qualified && old_error.passed && (!benchmark || admitted_candidates > 0);
 }
 }
 
 int main(int argc, char ** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
-    if (argc != 2 && argc != 6) { std::fprintf(stderr, "Use --check or --benchmark [K M N SCRATCH_MiB].\n"); return 2; }
+    if (argc != 2 && argc != 6 && argc != 7) { std::fprintf(stderr, "Use --check or --benchmark [K M N SCRATCH_MiB [INNER_CHUNK]].\n"); return 2; }
     const bool benchmark = std::string(argv[1]) == "--benchmark";
     require(benchmark || (argc == 2 && std::string(argv[1]) == "--check"), "Unknown benchmark mode");
     const char * experimental = std::getenv("TS_GGML_Q8_PARALLEL_VECTOR");
     require(!experimental || std::strcmp(experimental, "1") != 0, "Unset vector experiment for the serial control");
     experimental = std::getenv("TS_GGML_Q8_PARALLEL_SMALL_BATCH");
     require(!experimental || std::strcmp(experimental, "1") != 0, "Unset small-batch experiment for the serial control");
+    experimental = std::getenv("TS_GGML_Q8_PREFILL_TILE");
+    require(!experimental || std::strcmp(experimental, "32") == 0, "Unset prefill-tile experiment or use 32 for the serial control");
     int devices = 0; if (cudaGetDeviceCount(&devices) != cudaSuccess || devices == 0) return 77;
     checked(cudaSetDevice(0));
     bool passed = true;
-    if (argc == 6) {
-        const int k = std::atoi(argv[2]), m = std::atoi(argv[3]), n = std::atoi(argv[4]), mib = std::atoi(argv[5]);
+    if (argc >= 6) {
+        const int k = argument_integer(argv[2]), m = argument_integer(argv[3]), n = argument_integer(argv[4]), mib = argument_integer(argv[5]);
+        const int inner_chunk = argc == 7 ? argument_integer(argv[6]) : 0;
         require(k > 0 && k <= 8192 && k % 32 == 0 && m > 0 && m <= 262144 && n > 1 && n <= 8192
-            && mib > 0 && mib <= 512 && int64_t(m) * n <= 16 * 1024 * 1024, "Invalid bounded benchmark shape");
-        passed = measure(k, m, n, false, size_t(mib) * 1024 * 1024, true);
+            && mib > 0 && mib <= 512 && int64_t(m) * n <= 16 * 1024 * 1024
+            && inner_chunk >= 0 && inner_chunk <= k && inner_chunk % 32 == 0, "Invalid bounded benchmark shape/chunk");
+        passed = measure(k, m, n, false, size_t(mib) * 1024 * 1024, true, inner_chunk);
     } else if (benchmark) {
         const int shapes[][2] = {{1024, 5120}, {1024, 6144}, {1024, 7168}, {2048, 1024}, {3584, 1024}};
         for (const auto & shape : shapes)
             for (size_t cap : {8u * 1024 * 1024, 32u * 1024 * 1024}) passed = measure(shape[0], shape[1], 643, false, cap, true) && passed;
     } else {
-        for (int n : {2, 8, 9, 16, 17, 32, 33, 65}) passed = measure(96, 129, n, true, 8 * 1024 * 1024, false) && passed;
-        // Same shape, one-byte-short cap must refuse every allocation.
-        passed = measure(96, 129, 9, true, TiledGemm::payload(96, 1, 1, true) - 1, false) && passed;
-        passed = measure(96, 129, 9, true, TiledGemm::payload(96, 1, 1, true), false) && passed;
+        for (int chunk : {0, 32, 64}) {
+            for (int n : {2, 8, 9, 16, 17, 32, 33, 65})
+                passed = measure(96, 129, n, true, 8 * 1024 * 1024, false, chunk) && passed;
+            // Includes the final 32-wide K tail for chunk=64. One-byte-short
+            // admission now accounts for partial/FP64 accumulation tiles too.
+            passed = measure(96, 129, 9, true, TiledGemm::payload(96, 1, 1, true, chunk) - 1, false, chunk) && passed;
+            passed = measure(96, 129, 9, true, TiledGemm::payload(96, 1, 1, true, chunk), false, chunk) && passed;
+        }
     }
     return passed ? 0 : 1;
 }
