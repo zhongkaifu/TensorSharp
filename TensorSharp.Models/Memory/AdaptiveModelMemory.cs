@@ -26,6 +26,9 @@ public sealed record AdaptiveModelMemoryOptions(int ContextTokens, int PrefillTo
     /// <summary>Ceiling for optional RAM weight reuse. Actual capacity comes from
     /// physical availability minus the admitted request peak; zero disables reuse.</summary>
     public long MaximumStreamingHostCacheBytes { get; init; } = long.MaxValue;
+    /// <summary>Ceiling for optional complete device weight arenas. Shared physical
+    /// availability and execution-phase workspace forecasts further bound retention.</summary>
+    public long MaximumStreamingDeviceCacheBytes { get; init; } = long.MaxValue;
 }
 
 public readonly record struct InferenceHardwareMemory(long HostTotal, long HostAvailable,
@@ -82,11 +85,13 @@ public sealed class AdaptiveModelSession : IDisposable
     private readonly AdaptiveModelMemoryOptions _options;
     private readonly GgmlCacheBudgetScope _nativeBudget;
     private readonly long _hostCacheReserveBytes;
+    private readonly long _deviceCacheReserveBytes;
     private bool _disposed;
 
     private AdaptiveModelSession(ModelBase model, MemoryBudget budget, GgmlCacheBudgetScope nativeBudget,
-        InferenceMemoryPlan plan, AdaptiveModelMemoryOptions options, long hostCacheReserveBytes)
-    { Model = model; Budget = budget; _nativeBudget = nativeBudget; Plan = plan; _options = options; _hostCacheReserveBytes = hostCacheReserveBytes; }
+        InferenceMemoryPlan plan, AdaptiveModelMemoryOptions options, long hostCacheReserveBytes, long deviceCacheReserveBytes)
+    { Model = model; Budget = budget; _nativeBudget = nativeBudget; Plan = plan; _options = options;
+        _hostCacheReserveBytes = hostCacheReserveBytes; _deviceCacheReserveBytes = deviceCacheReserveBytes; }
 
     public ModelBase Model { get; }
     public MemoryBudget Budget { get; }
@@ -121,11 +126,14 @@ public sealed class AdaptiveModelSession : IDisposable
                     // Retention starts after loading. The required read tile is
                     // already charged; leave the rest of the execution forecast
                     // available. An optional second tile still competes for slack.
-                    HostCacheReserveBytes = Math.Max(0, HostExecutionPeak(plan) - options.StreamingTileBytes)
+                    HostCacheReserveBytes = Math.Max(0, HostExecutionPeak(plan) - options.StreamingTileBytes),
+                    DeviceCacheBytes = DeviceCacheLimit(plan, profile.SourceWeightBytes, options.MaximumStreamingDeviceCacheBytes),
+                    DeviceCacheReserveBytes = ExecutionPeak(plan, DevicePool)
                 } : null;
             var policy = new ModelMemoryPolicy(options.ContextTokens, plan.SelectedChunkTokens);
             var model = ModelBase.Create(path, BackendType.GgmlCuda, 1, null!, null!, 1, streaming!, policy);
-            return new(model, budget, nativeBudget, plan, options, streaming?.HostCacheReserveBytes ?? 0);
+            return new(model, budget, nativeBudget, plan, options, streaming?.HostCacheReserveBytes ?? 0,
+                streaming?.DeviceCacheReserveBytes ?? 0);
         }
         catch (Exception creation)
         {
@@ -148,7 +156,9 @@ public sealed class AdaptiveModelSession : IDisposable
         ObjectDisposedException.ThrowIf(_disposed, this);
         var hw = InferenceHardwareMemory.CaptureCuda();
         long cachedBytes = Model.StreamingWeightUsage?.HostCacheBytes ?? 0;
-        if (Pools(hw, Budget, _options).Any(pool => RequiresIdleTrim(pool, _hostCacheReserveBytes, cachedBytes)))
+        long deviceCachedBytes = Model.StreamingWeightUsage?.DeviceCacheBytes ?? 0;
+        if (Pools(hw, Budget, _options).Any(pool => RequiresIdleTrim(pool, _hostCacheReserveBytes, cachedBytes,
+                _deviceCacheReserveBytes, deviceCachedBytes)))
         {
             Model.TrimIdleMemory();
             hw = InferenceHardwareMemory.CaptureCuda();
@@ -170,28 +180,39 @@ public sealed class AdaptiveModelSession : IDisposable
         return (long)Math.Max(0, Math.Min(pool.MaximumBudgetBytes, physical - pool.HeadroomBytes));
     }
 
-    internal static bool RequiresIdleTrim(InferenceMemoryPool pool, long hostReserve, long cachedBytes)
+    internal static bool RequiresIdleTrim(InferenceMemoryPool pool, long hostReserve, long cachedBytes,
+        long deviceReserve = 0, long deviceCachedBytes = 0)
     {
         decimal owners = (decimal)pool.Accounting.Reserved + pool.Accounting.Committed;
         // A cache can still fit its payload quota while preventing the next
         // request from obtaining its workspace or untracked forecast headroom.
-        decimal holdout = pool.Pool == HostPool && cachedBytes > 0 ? hostReserve : 0;
+        decimal holdout = pool.Pool == HostPool && cachedBytes > 0 ? hostReserve
+            : pool.Pool == DevicePool && deviceCachedBytes > 0 ? deviceReserve : 0;
         return DesiredCapacity(pool) < owners + holdout;
     }
 
     private static long HostExecutionPeak(InferenceMemoryPlan plan)
+        => ExecutionPeak(plan, HostPool);
+
+    private static long ExecutionPeak(InferenceMemoryPlan plan, string pool)
     {
-        var peak = plan.PoolPeaks.Single(p => p.Pool == HostPool);
+        var peak = plan.PoolPeaks.Single(p => p.Pool == pool);
         return Math.Max(peak.Prefill, peak.Decode);
     }
 
     internal static long HostCacheLimit(InferenceMemoryPlan plan, long sourceBytes, long ceiling)
+        => CacheLimit(plan, HostPool, sourceBytes, ceiling);
+
+    internal static long DeviceCacheLimit(InferenceMemoryPlan plan, long sourceBytes, long ceiling)
+        => CacheLimit(plan, DevicePool, sourceBytes, ceiling);
+
+    private static long CacheLimit(InferenceMemoryPlan plan, string pool, long sourceBytes, long ceiling)
     {
         ArgumentOutOfRangeException.ThrowIfNegative(sourceBytes);
         ArgumentOutOfRangeException.ThrowIfNegative(ceiling);
         if (plan.SelectedCandidate?.Placement != InferenceWeightPlacement.SsdStreaming) return 0;
-        long capacity = plan.Capacities.Single(p => p.Pool == HostPool).DesiredCapacity;
-        long peak = HostExecutionPeak(plan);
+        long capacity = plan.Capacities.Single(p => p.Pool == pool).DesiredCapacity;
+        long peak = ExecutionPeak(plan, pool);
         return Math.Min(Math.Min(sourceBytes, ceiling), Math.Max(0, capacity - peak));
     }
 
@@ -265,7 +286,7 @@ public sealed class AdaptiveModelSession : IDisposable
         if (o.ContextTokens <= 0 || o.PrefillTokens <= 0 || o.PrefillTokens > o.ContextTokens
             || o.MaximumPrefillChunkTokens <= 0 || o.StreamingTileBytes <= 0
             || o.MaximumHostBytes < 0 || o.MaximumDeviceBytes < 0
-            || o.MaximumStreamingHostCacheBytes < 0
+            || o.MaximumStreamingHostCacheBytes < 0 || o.MaximumStreamingDeviceCacheBytes < 0
             || o.HostHeadroomBytes < 0 || o.DeviceHeadroomBytes < 0)
             throw new ArgumentOutOfRangeException(nameof(o));
     }

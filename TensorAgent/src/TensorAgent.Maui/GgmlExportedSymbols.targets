@@ -289,6 +289,9 @@
     <ReferenceNativeSymbol Include="TSGgml_WeightStreamingExecute" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_WeightStreamingDestroy" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_ResidentWeightPayloadBytes" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_ResidentWeightPayloadBytesEx" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_ResidentWeightCreateEx" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_ResidentWeightProjectColumns" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_ResidentWeightCreate" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_ResidentWeightUploadRows" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_ResidentWeightUploadInput" SymbolType="Function" />

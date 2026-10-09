@@ -20,7 +20,7 @@
 | CUDA 原始分配/读写/释放、真实 event fence、可选 P2P | 两张 A40 上单卡和主机中转多卡通过；本 VM 的直接 P2P 数据损坏，保持默认关闭 |
 | GGML lazy device-copy/preload、选中专家 cache | 可通过 GgmlCacheBudgetScope 接入同一份托管 MemoryBudget，分配前预留、物理释放后归还；原有独立 cache 配额仍有效 |
 | 硬件/请求预算规划与驻留保留 | dense Gemma4/Qwen35 的 AdaptiveModelSession 显式入口；优先保留驻留图，按物理可用 RAM/VRAM、权重格式、融合、KV/状态和工作区选择；不是全模型自动策略 |
-| 文件权重的跨 token RAM 复用 | 可选的原始字节区间缓存；与读取 tile 共用预算，动态入口按硬件余量和执行期峰值设置上限，压力时先归还缓存；尚无文件权重的跨 token GPU 保留 |
+| 文件权重的跨 token RAM / GPU 复用 | RAM 保留原始字节区间；GPU 可保留完整权重及其输入/输出/scratch arena。动态入口按硬件余量、执行期峰值和用户上限设置额度，压力时先回收缓存；Qwen FullPrecision 覆盖 prefill/decode，Gemma ResidentCuda 当前只保留 N=1 decode |
 | GGML/Metal/Vulkan/MLX 原生图、分页 KV、全部融合算子 | 全面适配仍待实现；本轮没有 Metal/Vulkan/MLX 硬件验收 |
 | 多卡预算向量、带节点/设备标识的资源位置 | 已支持多位置工作集租约和全 rank fence；两张 A40 上实际内核、双向中转和释放验证通过 |
 | 多机协调、远程内存、异步 DMA 重叠 | 设计阶段，未实现；文件提前读取已实现，不能等同异步 CUDA DMA |
@@ -34,7 +34,7 @@
 | `TensorSharp.Models/Models/Qwen4Exp/Qwen4ExpModel.ExpertPlacement.cs` | CUDA/Metal 专家放置、专家缓存配额和布局下限 | 算法已迁出；GGML CUDA 选中专家缓存已接共享预算并支持压力缩槽/空闲回收；其他分配和后端仍需接入 |
 | `TensorSharp.Models/GpuMemoryBudget.cs` | free VRAM、headroom、token 容量估算 | 统一观测、避免已驻留资源再次扣账 |
 | `TensorSharp.Models/ModelBase.WeightLoading.cs`、`ModelBase.WeightPolicy.cs` | 公共权重读取和驻留决策 | 从目录注册资源，按执行边界获取租约 |
-| `WeightStreamingOptions`、`WeightStreamingExecutor`、`GgmlWeightStreamingSession`、`GgmlResidentWeightSession` | 显式文件权重、固定主机 tile、下一 tile 文件预读和预算内 RAM 复用；按模型选择行分块或完整逻辑 M/N 的临时 CUDA 工作区 | Qwen35 Q8_0 和 Gemma4 Q8_0/F16 PLE 已接入；Gemma 的归约、Norm/RoPE/Residual 融合语义单独对齐；其他模型族、跨 token GPU 权重保留和异步 CUDA DMA 未接入 |
+| `WeightStreamingOptions`、`WeightStreamingExecutor`、`GgmlWeightStreamingSession`、`GgmlResidentWeightSession` | 显式文件权重、固定主机 tile、下一 tile 文件预读、预算内 RAM 范围和 GPU 完整权重复用；按模型保留行分块或完整逻辑 M/N 算术 | Qwen35 Q8_0 和 Gemma4 Q8_0/F16 PLE 已接入；Gemma 的归约、Norm/RoPE/Residual 融合语义单独对齐，GPU 保留限 N=1；其他模型族和异步 CUDA DMA 未接入 |
 | `TensorSharp.Runtime/GgufReader.cs` | GGUF、分片、mmap、tensor 类型与字节布局 | 新增文件区间接口；可避免预读整个数据区 |
 | `TensorSharp.GGML.Native/ggml_ops_core.cpp` | device-copy、预载、host buffer、offload cache | 所有分配必须预留；缓存命中必须表示上传已完成 |
 | `ggml_ops_host_moe_cache.cpp`、`ggml_ops_host_moe_decode.cpp` | 专家缓存与主机计算 | 热专家驻留、联合选中专家工作集、CPU/GPU 成本选择 |
@@ -128,7 +128,7 @@ capacity 要扣掉 OS、其他进程、驱动、.NET 元数据、原生 allocato
 
 CUDA MMQ/cuBLAS 的归约策略会随逻辑矩阵形状变化，微小误差又可能在后续 Q8_1 激活量化时放大。因此 Gemma 除了保留完整投影形状，还用仅持有激活和小参数的 `StreamingNormRoPE`、`StreamingNormResidual` 图保留原路径的 norm/mul/rope 与 norm/mul/add 融合边界，并使用显式 flash attention 与相同 KV dtype。常驻整模型权重图和 batched holder 仍关闭；这里保留的是实际计算语义，不是缓存整个文件权重模型。默认 fusion policy 的模型对比已单独记录；`TS_WEIGHT_FUSION_COPIES=0` 可能使常驻 FFN 采用 split 投影，该非默认参考尚未由当前结果覆盖。
 
-主机输出 tile 与 CUDA 工作区分别在分配前预留、物理释放后归还。若 host pool 也约束 CUDA allocation，规划会同时扣除独立的主机输出 staging 和设备工作区，避免漏记两份分配。允许分块的工作区按剩余额度缩小输出行数，再缩小 token 数；完整矩阵路径的 device payload 是固定下限，不会靠缩小 host tile 假装满足更低配额。规划后被其他 owner 抢占的额度仍由实际预留裁决，失败立即返回 pressure 并回收临时 staging，不持有半个工作集等待。调用同步完成后才复用 tile；CUDA 创建与清理同时失败时保留 session 和额度。`ResetKVCache` 必须先成功重试释放保留的 session，再重置模型状态并解除失败保护；Dispose 也允许重试。文件读取可与当前 tile 的计算重叠；跨 token 的 RAM 原始字节复用现已接入。H2D、计算和 D2H 仍按 session 同步执行，没有异步 DMA、跨 token GPU 权重 cache 或自动跨模型驱逐。
+主机输出 tile 与 CUDA 工作区分别在分配前预留、物理释放后归还。若 host pool 也约束 CUDA allocation，规划会同时扣除独立的主机输出 staging 和设备工作区，避免漏记两份分配。允许分块的工作区按剩余额度缩小输出行数，再缩小 token 数；完整矩阵路径的 device payload 是固定下限，不会靠缩小 host tile 假装满足更低配额。规划后被其他 owner 抢占的额度仍由实际预留裁决，失败立即返回 pressure 并回收临时 staging，不持有半个工作集等待。调用同步完成后才复用 tile；CUDA 创建与清理同时失败时保留 session 和额度。`ResetKVCache` 必须先成功重试释放保留的 session，再重置模型状态并解除失败保护；Dispose 也允许重试。文件读取可与当前 tile 的计算重叠；跨 token 的 RAM 原始字节复用现已接入。H2D、计算和 D2H 仍按 session 同步执行。可选 GPU cache 保留完整权重及其已计费 arena，命中时只替换输入和下载输出；没有异步 DMA 或自动跨模型驱逐。
 
 `HostCacheBytes` 控制可选 RAM 缓存，旧显式构造默认关闭。缓存以本次模型加载的 source 引用、offset 和长度为键，仅发布完整读取成功的不可变原始字节；命中先复制到固定 staging，再交给设备。64-byte 对齐 payload 分配前预留，物理释放后退款，缓存不持有捕获图地址。最多 4096 个条目；索引元数据由运行时 headroom 承担，不计作已精确约束的 RSS。满缓存不因每个扫描 miss 淘汰已有范围，避免大于 RAM 的顺序扫描导致完全抖动；压力回收采用 LRU。此策略没有成本反馈，区间形状变化也可能产生重复副本，不能称为最优替换算法。
 
@@ -271,7 +271,7 @@ $$T_{step}\geq\max(T_{compute},D_{ssd}/B_{ssd},D_{h2d}/B_{h2d}).$$
 2026-10-09 UTC 对照用户提供的初始设计复核：基础库、共享原生缓存预算、请求接入、文件执行和 RAM 原始字节复用已进入实现阶段，不能再统一列作“接口设计”。但初始目标的以下验收仍然缺失，不能因局部实现通过而删除：
 
 - 默认 Qwen 解码仍落后独立基线；并行归约实验在较大模型出现数值门槛失败。后续必须同时改善正确性与吞吐，不能直接将实验设为默认。
-- 文件权重尚无跨 token GPU 保留和异步 DMA；工作区分配、PCIe 搬运、计算和 OS/SSD 读取需分别测量，再决定保留哪些权重及流水线深度。当前 RAM 缓存只解决重复源读取的一部分。
+- 文件权重已支持预算内跨 token GPU 保留，但仍无异步 DMA；Gemma 非单 token 投影继续使用原完整形状或行分块算术。当前准入为按访问顺序填充、扫描不替换热项、压力时 LRU 回收，尚未按实测收益全局选择缓存或优化流水线深度。需继续分别测量工作区、PCIe、计算和物理 SSD I/O。
 - Gemma 12B UD-IQ2_M 的 FF7 重复/事实错误尚未解决；同源量化控制、独立数学对照和长输出质量检查仍需继续。其他低比特模型也不能套用 Q8 的验收。
 - Flash Next 与 Qwen Image 的已有短任务/单图结果不覆盖统一文件调度、多模态多轮、编辑、并发或完整质量指标。新增适配需逐阶段验证 encoder、专家、DiT/VAE 及状态恢复。
 - 全部原生 holder/KV、后端池、跨模型竞争和多卡故障恢复尚未统一；已计账 payload 不等于总 RAM/VRAM。远端不可用的本轮测试不计通过，旧 A40 结果保留其原范围。
@@ -408,7 +408,7 @@ dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj -c Release -m:1 \
 
 E4B Q8_0（checkpoint SHA `96c455818ff64884f0e2ae3bc5517675896c4eae60676cc9135b9bb865eaf15c`）在 RTX 3080 Laptop 16 GiB 上按 resident/adaptive/adaptive/resident 四个独立进程交替，context 2048，每进程排除一次 warmup、测三次 645-token prefill 和 63 次 decode。native SHA `4bd1fbae1ba3a7e8422f9169527a64277b56c6f008ef159e067f347287320233`。六次/组中位数为：resident **2037.09 / 53.24** tokens/s，adaptive **2053.09 / 52.53** tokens/s（prefill/decode）。decode 中位数低 1.35%，观测范围重叠；全部完整 raw-logit 哈希一致且退出零。这支持该 fixture 接近原驻留性能，不能推及所有模型、设备或受限卸载场景。方法与范围见 [AdaptiveMemoryProbe](../../eng/validation/AdaptiveMemoryProbe/README.md)，原始报告在忽略的 `artifacts/unified-memory-adaptive/e4b-abba-v1-*`。
 
-文件执行器可从同一 RAM 预算申请第二块 tile，消费当前块时启动下一次文件读取；中止后等待未完成读取，再释放 buffer 和额度。紧预算、禁用选项及 RAM/device 共用同一 pool 时保留单 buffer。CUDA Q8 输入量化 scratch 在同一输入的输出 tile 间复用，完整形状路径只清零尾部 padding。E4B 短提示新增验证的 8 个完整词表行逐位一致，触发 1,704 次提前读取，host/device payload 峰值 **34,343,936 / 117,170,176 B**。这次验证有并行编译，不用其耗时宣称提速；逻辑读取 **39,681,038,976 B** 也不是物理 SSD 流量。仍未实现文件权重路径跨 token 的 GPU 权重保留或异步 H2D/D2H。
+文件执行器可从同一 RAM 预算申请第二块 tile，消费当前块时启动下一次文件读取；中止后等待未完成读取，再释放 buffer 和额度。紧预算、禁用选项及 RAM/device 共用同一 pool 时保留单 buffer。CUDA Q8 输入量化 scratch 在同一输入的输出 tile 间复用，完整形状路径只清零尾部 padding。E4B 短提示新增验证的 8 个完整词表行逐位一致，触发 1,704 次提前读取，host/device payload 峰值 **34,343,936 / 117,170,176 B**。这次验证有并行编译，不用其耗时宣称提速；逻辑读取 **39,681,038,976 B** 也不是物理 SSD 流量。该阶段尚无跨 token GPU 权重保留；后续已补充预算内保留，见下文续验。异步 H2D/D2H 仍未实现。
 
 扩展真实模型检查使用 `C:\Works\models` 的官方分片/组件，并记录固定源版本及 SHA。Flash Next IQ1_M 的完整三分片、projector 和 Qwen Image 2.1 的 Q4 DiT、Qwen3VL encoder、projector、VAE 均完成文件验证。Flash 全模型约 75.45 GB，大于本机 RAM 与 VRAM 总量；host experts + 2 GiB 选中专家 cache 完成实际 `17+25` 任务并输出 `42`。仅该短任务的 prefill/decode 为 **1.676 / 1.291** tokens/s，cache 命中率 **18.89%**，不能当作已达到性能目标。Qwen Image 完成 512×512、40 step、seed 42 生图，红茶壶/蓝杯/木桌的单提示视觉检查通过；杯子部分裁边。不是全图像质量基准、编辑验收或独立实现数值对照。并行编译期间的计时不作为安静硬件性能。原始报告在忽略的 `artifacts/multimodal-local-runs/`。
 
@@ -530,6 +530,20 @@ Gemma 12B IQ2 的 embedding-only 诊断也未找到修复：仅把 tied `token_e
 27B 另以关闭完整 logits 捕获的独立四进程完成相同固定历史 ABBA，每组 6 次测量：decode **7.503→14.749 tokens/s（1.966×）**，范围 **7.422–7.541 / 14.411–14.879**；prefill **397.602→391.744**，范围 **374.978–400.633 / 383.002–400.776**，保留中位下降的观测。包含 warmup 的所有完整 logits 哈希/历史一致，进程退出和 shutdown 正常。仍是单卡短固定历史，不能推断长中文输出质量、其他设备或并发 SLO。
 
 严格测速入口现为 `compare-native-runs.py --executions`，同时校验四进程时间/PID、退出、隔离部署身份、设置、计时分母以及包含 warmup 的完整历史，比较工具回归共 **6/6**。原始证据位于忽略的 `artifacts/unified-memory-adaptive/q8-ordered-vector-v1/`，方法见 [AdaptiveMemoryProbe](../../eng/validation/AdaptiveMemoryProbe/README.md)。上一提交 `f1bbbe53` 的 Linux x64/ARM64 CPU CI 已通过；本次 native 修改仍需独立 CI，多 GPU 与其他未运行场景不计通过。
+
+### 2026-10-09 UTC：文件权重的预算内 GPU 保留
+
+文件执行器现在可将完整、不可变的 Q8_0/F16 权重及其输入/输出/scratch arena 保留在共享设备预算内。主机仍通过原有小 tile 上传和下载，不增加整矩阵主机副本。FullPrecision 使用实际 token 数，允许同一 arena 在预填充与解码间复用；Gemma ResidentCuda 当前只保留 N=1，其他 N 继续使用原有算术与工作区。完整矩阵超出索引范围或缓存额度时回退行分块。默认显式 streaming 的 `DeviceCacheBytes=0`；动态入口依据硬件容量、请求执行期峰值和 `MaximumStreamingDeviceCacheBytes` 自动设置上限并预留后续工作区。
+
+准入不因扫描未命中替换热项；临时工作区需要额度时先按 LRU 物理释放缓存，再缩小 tile。FullPrecision 晋升后移除同源 RAM 范围，避免重复保留。正常 KV reset 保留有效权重，idle trim/Dispose 释放；上传、计算或释放失败时禁止继续使用失败 owner，物理释放成功才归还预算，显式 reset 可重试。最多 256 个缓存 arena；驱动/stream/托管索引仍由额外余量覆盖，不能将 payload 上限称为总 VRAM/RSS 上限。当前策略不包含异步 CUDA DMA、全局公平分配或按收益优化的缓存选择。
+
+最终 native SHA `74c1b4f8c2981c8571d456b105074044b27b5b164446a116e8ffba0c69167ba1`，Models `c2404c9e326a8cd87dd2e02241d6f621bb81ad3e9c5cb5ed00e79cc9452d5791`，unchanged ggml 仍为 `ffa4e8b…`。**13/13** 原生、**129/129** 相关托管检查通过，无跳过；新增原生保留路径覆盖 14 个形状/算术组合、每项四次输入替换，独立 FP64 或原驻留算术门槛未放宽，CUDA memcheck **0 errors**。缓存比较器 4/4 测试通过，包含缺失命中、伪造节省、输出变化、预算越界和退出失败的拒绝检查。扩大执行 Python 全套检查为 582 项，报告 5 failures、49 errors、2 skipped，涉及历史文件缺失/哈希、Windows Bash/路径及文本编码；该全套检查未通过，完整失败日志保留。HTTP 相关测试以显式 UTF-8 复测 15/15 通过，不改写原全套失败。
+
+本地 Qwen0.8B 文件模式 32 行完整词表通过原数值门槛：最大 relative L2 **0.0008168431**、最低 cosine **0.9999996796**、全部 top1 一致，两次加载释放后预算归零。实际设备保留 **134,195,200 B**，保留与临时工作区合计峰值 **135,736,576 B**。Gemma E4B 两个短提示的 8 行完整词表与原驻留路径逐位相同，设备保留 **134,183,936 B**，合计峰值 **251,354,112 B**，小于 256 MiB 设备配额；两者均执行压力拒绝和 reset 恢复。这些是数值/所有权验证，不是语言质量通过。
+
+最终构建另以 Qwen0.8B、context512、67-token prompt、16 predictions、512 MiB host/device 配额、RAM cache ceiling 256 MiB，设备 cache 关/开/开/关进行四个独立进程对照。每进程排除 warmup、测三次请求；实际设备保留 **184,048,640 B**，受工作区预留约束而低于 256 MiB 上限。预填充中位 **75.096→86.556 tokens/s（+15.26%）**，范围 **73.299–78.000 / 83.700–90.398**；解码 **3.035→3.851（+26.90%）**，范围 **2.981–3.076 / 3.815–3.929**。每请求权重上传 **13,839,638,528→10,997,921,792 B（−20.53%）**，逻辑文件读取 **9,356,312,576→6,518,669,312 B（−30.33%）**。完整 logits/历史逐位一致，退出、native shutdown 和最后预算清零通过。相同全部二进制、串行 K、tile32，无并发构建/下载/推理；文件缓存已预热，未锁频。这仍远低于全驻留基线，不代表性能目标完成，也不是冷盘、物理 SSD 或 p95/p99 测量。证据在忽略的 `artifacts/unified-memory-adaptive/device-weight-cache-v2/`；相同 native 的原生日志在 `device-weight-cache-v1/`。
+
+本轮没有新增 Flash Next、Qwen Image、IQ2 FF7、多 GPU 或智能体语义质量通过记录。SSH 指定 VM 仍拒绝连接（exit255）。更广的模型接入、独立引擎性能差距、IQ2 重复输出、媒体文字质量和异步搬运继续保留为未完成项。
 
 ## 15. 后续实际接入与硬件验证入口
 

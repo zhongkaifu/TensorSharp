@@ -20,6 +20,23 @@ managed index and OS page cache are outside this payload quota. Use the adaptive
 probe's balanced comparison for isolated timing; this probe remains a numerical
 and failure-recovery validation with an in-process resident reference.
 
+`--device-cache-bytes BYTES` optionally retains complete immutable device weights
+and their input/output/scratch arenas (default zero). All retained payload shares
+the existing device budget, with a 4 MiB admission reserve. Qwen FullPrecision
+reuses these arenas across prefill and decode; Gemma ResidentCuda currently
+retains only N=1 decode projections. Larger Gemma batches keep their original
+complete-matrix arithmetic and may evict retained arenas before allocating a
+workspace. Host upload/download staging remains bounded. FullPrecision promotion
+removes duplicate RAM ranges for the same source; GPU eviction causes a later
+file/RAM reload. Normal KV reset keeps valid weights; idle trim and disposal
+release them. Failed CUDA cleanup retains both ownership and budget until retry.
+`PeakDeviceOwnedBytes` includes retained arenas plus temporary workspace;
+`WeightUploadBytes` records original weight H2D bytes, and `DeviceCacheHitBytes`
+records avoided uploads. Logical consumption adds file, RAM-hit and device-hit
+bytes. These are payload counters, not physical SSD traffic or total VRAM/RSS.
+If retention is being validated, require positive actual cache payload and hits;
+merely setting the option does not establish coverage.
+
 Qwen uses F32 activation arithmetic in synchronous output-row tiles. Gemma
 preserves the pinned resident CUDA arithmetic: Q8 matrix batches above eight
 tokens and F16 batches above sixteen temporarily stage one complete logical

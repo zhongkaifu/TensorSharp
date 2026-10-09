@@ -290,6 +290,20 @@ TSG_EXPORT int TSGgml_ResidentWeightCreate(int rank, int weight_type, std::int64
             nullptr, capacity, handle, true);
     } catch (const std::exception& error) { tsg::set_last_error(error.what()); return 0; }
 }
+TSG_EXPORT std::int64_t TSGgml_ResidentWeightPayloadBytesEx(int rank, int weight_type,
+        std::int64_t inner, int rows, int columns, int arithmetic) {
+    try { return std::int64_t(sizes(weight_type, inner, rows, columns, rank, arithmetic, columns, rows).total); }
+    catch (const std::exception& error) { tsg::set_last_error(error.what()); return 0; }
+}
+TSG_EXPORT int TSGgml_ResidentWeightCreateEx(int rank, int weight_type, std::int64_t inner,
+        int rows, int columns, int arithmetic, std::int64_t capacity, void** handle) {
+    if (!handle) { tsg::set_last_error("Retained weight streaming requires an output handle."); return 0; }
+    *handle = nullptr;
+    try {
+        return create_session(rank, weight_type, inner, rows, columns, arithmetic, columns, rows,
+            nullptr, capacity, handle, true);
+    } catch (const std::exception& error) { tsg::set_last_error(error.what()); return 0; }
+}
 TSG_EXPORT int TSGgml_ResidentWeightUploadRows(void* handle, const void* rows, int first_row, int row_count) {
 #if defined(TSG_GGML_USE_CUDA)
     auto* value = static_cast<session*>(handle);
@@ -362,14 +376,23 @@ TSG_EXPORT int TSGgml_ResidentWeightUploadInput(void* handle, const float* input
 TSG_EXPORT int TSGgml_ResidentWeightProject(void* handle) {
 #if defined(TSG_GGML_USE_CUDA)
     auto* value = static_cast<session*>(handle);
+    return TSGgml_ResidentWeightProjectColumns(handle, value ? value->max_columns : 0);
+#else
+    return TSGgml_ResidentWeightProjectColumns(handle, 0);
+#endif
+}
+TSG_EXPORT int TSGgml_ResidentWeightProjectColumns(void* handle, int columns) {
+#if defined(TSG_GGML_USE_CUDA)
+    auto* value = static_cast<session*>(handle);
 #endif
     try {
 #if defined(TSG_GGML_USE_CUDA)
         if (!value || !value->full_shape || !value->ready || value->uploaded_rows != value->max_rows ||
-            value->uploaded_columns != value->max_columns) {
+            columns <= 0 || columns > value->max_columns || value->uploaded_columns != columns ||
+            (value->arithmetic == 1 && columns != value->max_columns)) {
             tsg::set_last_error("Resident projection requires every original weight row and input token."); return 0;
         }
-        if (value->projected) return 1;
+        if (value->projected && value->columns == columns) return 1;
         value->ready = false;
         if (!checked(cudaSetDevice(value->device), "select device for complete projection")) return 0;
         auto* weights = static_cast<char*>(value->allocation) + value->bytes.input;
@@ -377,7 +400,15 @@ TSG_EXPORT int TSGgml_ResidentWeightProject(void* handle) {
         auto* scratch = reinterpret_cast<char*>(output) + value->bytes.output;
         // Original rows AND tokens determine stream-K partitions/fixup order.
         // Upload/download chunk sizes never enter the arithmetic dispatch.
-        if (value->weight_type == GGML_TYPE_Q8_0) {
+        if (value->arithmetic == 0) {
+            const int launched = value->weight_type == GGML_TYPE_Q8_0
+                ? tsg_matmul_q8_cuda_launch(weights, value->allocation, output,
+                    value->inner, value->max_rows, columns, value->bytes.row_bytes,
+                    sizeof(float), std::size_t(value->inner) * sizeof(float), value->stream)
+                : tsg_matmul_f16_cuda_launch(weights, value->allocation, output,
+                    value->inner, value->max_rows, columns, value->stream);
+            if (!checked(static_cast<cudaError_t>(launched), "launch retained full-precision projection")) return 0;
+        } else if (value->weight_type == GGML_TYPE_Q8_0) {
             tsg_q8_resident_launch(value->device, weights, static_cast<const float*>(value->allocation), output,
                 scratch, value->bytes.scratch, value->inner, value->max_rows, value->max_columns,
                 value->max_columns, value->max_rows, value->stream);
@@ -386,10 +417,10 @@ TSG_EXPORT int TSGgml_ResidentWeightProject(void* handle) {
             tsg::set_last_error(tsg_f16_resident_last_error()); return 0;
         }
         if (!checked(cudaStreamSynchronize(value->stream), "finish complete projection")) return 0;
-        value->projected = true; value->ready = true;
+        value->columns = columns; value->projected = true; value->ready = true;
         return 1;
 #else
-        (void)handle;
+        (void)handle; (void)columns;
         tsg::set_last_error("Resident weight streaming requires a CUDA-enabled build."); return 0;
 #endif
     } catch (const std::exception& error) {
@@ -407,12 +438,12 @@ TSG_EXPORT int TSGgml_ResidentWeightDownload(void* handle, float* output,
     try {
 #if defined(TSG_GGML_USE_CUDA)
         if (!value || !value->full_shape || !value->ready || !value->projected || !output ||
-            first_token < 0 || first_token > value->max_columns || token_count <= 0 || token_count > value->max_columns - first_token ||
+            first_token < 0 || first_token > value->columns || token_count <= 0 || token_count > value->columns - first_token ||
             first_row < 0 || first_row > value->max_rows || row_count <= 0 || row_count > value->max_rows - first_row) {
             tsg::set_last_error("Resident download requires a completed projection and an in-range output rectangle."); return 0;
         }
         value->ready = false;
-        const int stride = value->weight_type == GGML_TYPE_Q8_0
+        const int stride = value->arithmetic == 1 && value->weight_type == GGML_TYPE_Q8_0
             ? tsg_q8_resident_output_rows(value->max_rows) : value->max_rows;
         const auto* source = reinterpret_cast<const float*>(static_cast<const char*>(value->allocation) +
             value->bytes.input + value->bytes.weights) + std::size_t(first_token) * stride + first_row;

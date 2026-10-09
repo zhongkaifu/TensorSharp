@@ -8,8 +8,8 @@ namespace TensorSharp.Models;
 
 /// <summary>Opt-in bounded file-weight reads and CUDA linear workspaces. Supported
 /// weight formats depend on the model adapter. The shared
-/// budget covers the weight staging buffer, optional reusable host payload, and each streamed linear's device input,
-/// weight/output staging and arithmetic scratch. Some adapters require a complete
+/// budget covers the weight staging buffer, optional reusable host/device payload, and each streamed linear's device input,
+/// weight/output staging and arithmetic scratch. Device retention includes the full reusable arena. Some adapters require a complete
 /// temporary device matrix to preserve the resident reduction order. Existing model activations, live KV, small resident
 /// parameters, driver/runtime allocations and the OS file cache are not covered.</summary>
 public sealed class WeightStreamingOptions
@@ -56,6 +56,23 @@ public sealed class WeightStreamingOptions
     public bool ReadAhead { get; }
 
     private long _hostCacheBytes, _hostCacheReserveBytes = 4L << 20;
+    private long _deviceCacheBytes, _deviceCacheReserveBytes = 4L << 20;
+    /// <summary>Optional ceiling for complete immutable weights and their reusable
+    /// CUDA input/output/scratch arenas. FullPrecision supports prefill and decode;
+    /// ResidentCuda currently retains only fixed single-token projections.
+    /// Entries share the normal device pools and yield to temporary workspaces.</summary>
+    public long DeviceCacheBytes
+    {
+        get => _deviceCacheBytes;
+        init { ArgumentOutOfRangeException.ThrowIfNegative(value); _deviceCacheBytes = value; }
+    }
+    /// <summary>Device capacity kept available for subsequent request workspaces and
+    /// untracked state. The adaptive loader supplies its execution-phase forecast.</summary>
+    public long DeviceCacheReserveBytes
+    {
+        get => _deviceCacheReserveBytes;
+        init { ArgumentOutOfRangeException.ThrowIfNegative(value); _deviceCacheReserveBytes = value; }
+    }
     /// <summary>Optional ceiling for reusable original weight bytes in pageable RAM.
     /// Actual admission also respects remaining shared capacity and workspace reserve.
     /// Zero preserves uncached execution. Cache entries never own native graph pointers.</summary>
@@ -85,4 +102,11 @@ public readonly record struct WeightStreamingStatistics(long FileBackedWeightByt
     public long HostCacheHitBytes { get; init; }
     public long HostCacheHits { get; init; }
     public long HostCacheEvictedBytes { get; init; }
+    public long DeviceCacheBytes { get; init; }
+    public long PeakDeviceCacheBytes { get; init; }
+    public long DeviceCacheHitBytes { get; init; }
+    public long DeviceCacheHits { get; init; }
+    public long DeviceCacheEvictedBytes { get; init; }
+    public long WeightUploadBytes { get; init; }
+    public long PeakDeviceOwnedBytes { get; init; }
 }

@@ -93,6 +93,25 @@ internal sealed class StreamingWeightReadCache : IDisposable
         }
     }
 
+    internal void RemoveSource(IResourceSource source)
+    {
+        lock (_gate)
+        {
+            for (var node = _lru.First; node != null;)
+            {
+                var next = node.Next;
+                if (node.Value.Key.IsSource(source))
+                {
+                    ((IDisposable)node.Value.Buffer).Dispose();
+                    _bytes -= node.Value.Buffer.AllocatedBytes;
+                    _evicted += node.Value.Buffer.AllocatedBytes;
+                    _entries.Remove(node.Value.Key); _lru.Remove(node);
+                }
+                node = next;
+            }
+        }
+    }
+
     internal void LeaveAvailable(long requiredBytes)
     {
         ArgumentOutOfRangeException.ThrowIfNegative(requiredBytes);
@@ -114,6 +133,7 @@ internal sealed class StreamingWeightReadCache : IDisposable
         private readonly IResourceSource _source = source;
         private readonly long _offset = offset;
         private readonly int _length = length;
+        internal bool IsSource(IResourceSource value) => ReferenceEquals(_source, value);
         public bool Equals(Key other) => ReferenceEquals(_source, other._source) && _offset == other._offset && _length == other._length;
         public override bool Equals(object obj) => obj is Key other && Equals(other);
         public override int GetHashCode() => HashCode.Combine(RuntimeHelpers.GetHashCode(_source), _offset, _length);

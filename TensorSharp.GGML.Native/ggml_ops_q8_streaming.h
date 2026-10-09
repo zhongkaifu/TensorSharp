@@ -42,9 +42,17 @@ TSG_Q8_STREAM_API std::int64_t TSGgml_ResidentWeightPayloadBytes(int rank, int w
     std::int64_t inner, int rows, int columns);
 TSG_Q8_STREAM_API int TSGgml_ResidentWeightCreate(int rank, int weight_type, std::int64_t inner,
     int rows, int columns, std::int64_t capacity, void** handle);
+// Extended complete-weight owner: arithmetic 0 supports 1..capacity active
+// columns; arithmetic 1 preserves a fixed original N, including decode N=1.
+// Weights remain immutable after their consecutive bounded uploads complete.
+TSG_Q8_STREAM_API std::int64_t TSGgml_ResidentWeightPayloadBytesEx(int rank, int weight_type,
+    std::int64_t inner, int rows, int columns, int arithmetic);
+TSG_Q8_STREAM_API int TSGgml_ResidentWeightCreateEx(int rank, int weight_type, std::int64_t inner,
+    int rows, int columns, int arithmetic, std::int64_t capacity, void** handle);
 TSG_Q8_STREAM_API int TSGgml_ResidentWeightUploadRows(void* handle, const void* rows, int first_row, int row_count);
 TSG_Q8_STREAM_API int TSGgml_ResidentWeightUploadInput(void* handle, const float* input, int first_token, int token_count);
 TSG_Q8_STREAM_API int TSGgml_ResidentWeightProject(void* handle);
+TSG_Q8_STREAM_API int TSGgml_ResidentWeightProjectColumns(void* handle, int columns);
 TSG_Q8_STREAM_API int TSGgml_ResidentWeightDownload(void* handle, float* output,
     int first_token, int token_count, int first_row, int row_count);
 // Retained Q8_0 ABI for existing callers.

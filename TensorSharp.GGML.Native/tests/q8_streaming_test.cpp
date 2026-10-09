@@ -412,6 +412,74 @@ static void check_resident_full(int type, int inner, int rows, int columns, int 
         type, inner, rows, columns, tile_rows, tile_columns, static_cast<long long>(payload));
 }
 
+static void check_retained(int type, int arithmetic, int inner, int rows, int capacity) {
+    const std::size_t row_bytes = type == 8 ? std::size_t(inner / 32) * 34 : std::size_t(inner) * 2;
+    std::vector<unsigned char> weights(row_bytes * rows);
+    for (int row = 0; row < rows; ++row) for (int k = 0; k < inner; ++k) {
+        if (type == 8) {
+            auto* block = weights.data() + row * row_bytes + (k / 32) * 34;
+            const std::uint16_t half = 0x2400;
+            std::memcpy(block, &half, 2);
+            block[2 + k % 32] = static_cast<unsigned char>(((row * 19 + k * 37) % 256) - 128);
+        } else {
+            const std::uint16_t half = (row + k) % 2 ? 0x3800 : 0xb400;
+            std::memcpy(weights.data() + row * row_bytes + k * 2, &half, 2);
+        }
+    }
+    const auto bytes = TSGgml_ResidentWeightPayloadBytesEx(0, type, inner, rows, capacity, arithmetic);
+    require(bytes > 0, "retained payload query");
+    void* session = nullptr;
+    require(TSGgml_ResidentWeightCreateEx(0, type, inner, rows, capacity, arithmetic, bytes - 1, &session) == 0 && !session,
+        "retained exact admission rejects one byte short");
+    require(TSGgml_ResidentWeightCreateEx(0, type, inner, rows, capacity, arithmetic, bytes, &session) == 1,
+        "retained exact admission");
+    require(TSGgml_ResidentWeightProjectColumns(session, 1) == 0, "missing weights/input rejected");
+    require(TSGgml_ResidentWeightUploadRows(session, weights.data(), 1, 1) == 0, "weight gap rejected");
+    for (int row = 0; row < rows; row += 7) {
+        int count = std::min(7, rows - row);
+        std::vector<unsigned char> staging(weights.begin() + row * row_bytes, weights.begin() + (row + count) * row_bytes);
+        require(TSGgml_ResidentWeightUploadRows(session, staging.data(), row, count) == 1, "bounded immutable weight upload");
+        std::fill(staging.begin(), staging.end(), 0xA5);
+    }
+    require(TSGgml_ResidentWeightUploadRows(session, weights.data(), 0, 1) == 0, "retained weights cannot be replaced");
+    for (int active : {capacity, 1, std::min(8, capacity), capacity}) {
+        std::vector<float> input(std::size_t(inner) * active), actual(std::size_t(rows) * active + 8, -9876.5f);
+        for (std::size_t i = 0; i < input.size(); ++i) input[i] = float(int((i * 7919 + active * 43) % 65537) - 32768) / 32768.0f;
+        for (int token = 0; token < active; token += 3) {
+            int count = std::min(3, active - token);
+            std::vector<float> staging(input.begin() + token * inner, input.begin() + (token + count) * inner);
+            require(TSGgml_ResidentWeightUploadInput(session, staging.data(), token, count) == 1, "bounded replacement input");
+            std::fill(staging.begin(), staging.end(), std::numeric_limits<float>::quiet_NaN());
+            require(TSGgml_ResidentWeightDownload(session, actual.data(), 0, 1, 0, 1) == 0, "old output invalidated");
+        }
+        require(TSGgml_ResidentWeightProjectColumns(session, 0) == 0 &&
+            TSGgml_ResidentWeightProjectColumns(session, capacity + 1) == 0, "invalid active extent rejected");
+        require(TSGgml_ResidentWeightProjectColumns(session, active) == 1, "project retained weights");
+        require(TSGgml_ResidentWeightProjectColumns(session, active) == 1, "repeat completed projection");
+        require(TSGgml_ResidentWeightDownload(session, actual.data(), active, 1, 0, 1) == 0, "stale output tail rejected");
+        require(TSGgml_ResidentWeightDownload(session, actual.data(), 0, active, 0, rows) == 1, "retained output download");
+        require(std::all_of(actual.end() - 8, actual.end(), [](float v) { return v == -9876.5f; }), "retained output canary");
+        if (arithmetic == 0 && type == 8) double_oracle(input, actual, inner, rows, active, 0);
+        else if (arithmetic == 0) {
+            for (int n = 0; n < active; ++n) for (int row = 0; row < rows; ++row) {
+                double expected = 0;
+                for (int k = 0; k < inner; ++k) expected += ((row + k) % 2 ? .5 : -.25) * input[std::size_t(n) * inner + k];
+                require(std::isfinite(actual[std::size_t(n) * rows + row]) &&
+                    std::abs(actual[std::size_t(n) * rows + row] - expected) <= 1e-4 + 6e-6 * std::abs(expected), "retained F16 double oracle");
+            }
+        } else {
+            std::vector<float> expected(std::size_t(rows) * active);
+            TensorView2DDesc source{input.data(), active, inner, inner, 1, std::int64_t(input.size() * 4)};
+            TensorView2DDesc result{expected.data(), active, rows, rows, 1, std::int64_t(expected.size() * 4)};
+            require(TSGgml_AddmmQuantF32(result, source, weights.data(), type, inner, rows, weights.size()) == 1, "resident decode reference");
+            TSGgml_ClearHostBufferCache();
+            require(std::memcmp(actual.data(), expected.data(), expected.size() * 4) == 0, "retained resident decode byte-exact");
+        }
+    }
+    require(TSGgml_WeightStreamingDestroy(session) == 1, "retained owner released");
+    std::printf("retained type=%d arithmetic=%d K=%d M=%d capacity=%d: coverage, reuse, oracle and guards passed\n", type, arithmetic, inner, rows, capacity);
+}
+
 int main(int argc, char** argv) {
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     contract();
@@ -431,6 +499,16 @@ int main(int argc, char** argv) {
     }
     const int device = 0;
     require(TSGgml_MultiDeviceInit(3, &device, 1) == 1, "initialize CUDA");
+    if (argc == 2 && std::strcmp(argv[1], "--retained") == 0) {
+        for (int rows : {1, 129}) for (int capacity : {1, 9, 33}) {
+            check_retained(8, 0, 96, rows, capacity);
+            check_retained(1, 0, 33, rows, capacity);
+        }
+        check_retained(8, 1, 2560, 129, 1);
+        check_retained(1, 1, 2560, 128, 1);
+        TSGgml_Shutdown();
+        return 0;
+    }
     if (argc == 2 && std::strcmp(argv[1], "--resident-full") == 0) {
         check_resident_full(8, 96, 129, 9, 63, 4);
         check_resident_full(8, 2560, 3072, 36, 65, 7);

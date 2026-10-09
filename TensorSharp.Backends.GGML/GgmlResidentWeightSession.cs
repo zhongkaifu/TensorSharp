@@ -8,12 +8,12 @@ using TensorSharp.Memory;
 
 namespace TensorSharp.GGML;
 
-/// <summary>Temporarily holds one complete logical Q8_0/F16 matrix and its input/output
-/// on CUDA so the unchanged resident MMQ/cuBLAS shape and reduction order are preserved.
+/// <summary>Holds one complete logical Q8_0/F16 matrix and its input/output
+/// on CUDA with explicit FullPrecision or unchanged resident MMQ/cuBLAS arithmetic.
 /// Host transfers can be split into bounded consecutive tiles. The complete CUDA
 /// input, weights, output, quantization and fixup payload is reserved before allocation;
 /// caller host storage and CUDA context/stream metadata need separate headroom.
-/// No host-pointer cache or persistent model-weight allocation is used.
+/// The caller can retain this owner across projections. No host-pointer cache is used.
 /// Dispose retains ownership and its reservation if native release fails.</summary>
 public sealed class GgmlResidentWeightSession : IDisposable
 {
@@ -21,43 +21,71 @@ public sealed class GgmlResidentWeightSession : IDisposable
     private BudgetReservation? _reservation;
     private IntPtr _handle;
     private bool _ready, _projected;
-    private int _uploadedRows, _uploadedTokens;
+    private int _uploadedRows, _uploadedTokens, _projectedTokens;
 
     public long PayloadBytes { get; }
     public long InputWidth { get; }
     public int OutputRows { get; }
     public int TokenCount { get; }
     public int WeightType { get; }
+    public GgmlWeightStreamingArithmetic Arithmetic { get; }
 
     public static long GetPayloadBytes(int rank, int weightType, long inputWidth, int outputRows, int tokenCount)
+        => GetPayloadBytes(rank, weightType, inputWidth, outputRows, tokenCount, GgmlWeightStreamingArithmetic.ResidentCuda, false);
+
+    public static long GetPayloadBytes(int rank, int weightType, long inputWidth, int outputRows, int tokenCount,
+        GgmlWeightStreamingArithmetic arithmetic)
+        => GetPayloadBytes(rank, weightType, inputWidth, outputRows, tokenCount, arithmetic, true);
+
+    private static long GetPayloadBytes(int rank, int weightType, long inputWidth, int outputRows, int tokenCount,
+        GgmlWeightStreamingArithmetic arithmetic, bool extended)
     {
         ArgumentOutOfRangeException.ThrowIfNegative(rank);
         if (weightType != 8 && weightType != 1) throw new ArgumentOutOfRangeException(nameof(weightType), "Only Q8_0 (8) and F16 (1) are supported.");
         if (inputWidth <= 0 || inputWidth > int.MaxValue || (weightType == 8 && inputWidth % 32 != 0))
             throw new ArgumentOutOfRangeException(nameof(inputWidth), "Input width must be positive; Q8_0 requires a multiple of 32.");
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(outputRows);
-        if (tokenCount <= (weightType == 8 ? 8 : 16) || tokenCount > 65535)
-            throw new ArgumentOutOfRangeException(nameof(tokenCount), "Complete resident-shape streaming requires Q8_0 N>8 or F16 N>16, at most 65535 tokens.");
-        long bytes = GgmlNative.TSGgml_ResidentWeightPayloadBytes(rank, weightType, inputWidth, outputRows, tokenCount);
+        if (!Enum.IsDefined(arithmetic)) throw new ArgumentOutOfRangeException(nameof(arithmetic));
+        if (tokenCount <= (extended ? 0 : weightType == 8 ? 8 : 16) || tokenCount > 65535)
+            throw new ArgumentOutOfRangeException(nameof(tokenCount), extended ? "Retained input capacity must be 1..65535 tokens."
+                : "Complete resident-shape streaming requires Q8_0 N>8 or F16 N>16, at most 65535 tokens.");
+        long bytes = extended
+            ? GgmlNative.TSGgml_ResidentWeightPayloadBytesEx(rank, weightType, inputWidth, outputRows, tokenCount, (int)arithmetic)
+            : GgmlNative.TSGgml_ResidentWeightPayloadBytes(rank, weightType, inputWidth, outputRows, tokenCount);
         if (bytes <= 0) throw Failure("size calculation");
         return bytes;
     }
 
     public GgmlResidentWeightSession(MemoryBudget budget, IEnumerable<string> devicePools,
         int rank, int weightType, long inputWidth, int outputRows, int tokenCount)
+        : this(budget, devicePools, rank, weightType, inputWidth, outputRows, tokenCount, GgmlWeightStreamingArithmetic.ResidentCuda, false) { }
+
+    /// <summary>Retain complete weights with a charged input/output capacity.
+    /// FullPrecision permits varying active token counts up to tokenCount;
+    /// ResidentCuda fixes the original tokenCount to preserve its reduction policy.</summary>
+    public GgmlResidentWeightSession(MemoryBudget budget, IEnumerable<string> devicePools,
+        int rank, int weightType, long inputWidth, int outputRows, int tokenCount, GgmlWeightStreamingArithmetic arithmetic)
+        : this(budget, devicePools, rank, weightType, inputWidth, outputRows, tokenCount, arithmetic, true) { }
+
+    private GgmlResidentWeightSession(MemoryBudget budget, IEnumerable<string> devicePools,
+        int rank, int weightType, long inputWidth, int outputRows, int tokenCount, GgmlWeightStreamingArithmetic arithmetic, bool extended)
     {
         ArgumentNullException.ThrowIfNull(budget);
         ArgumentNullException.ThrowIfNull(devicePools);
         string[] pools = devicePools.ToArray();
         if (pools.Length == 0 || pools.Distinct(StringComparer.Ordinal).Count() != pools.Length)
             throw new ArgumentException("Map the device to at least one distinct budget pool.", nameof(devicePools));
-        WeightType = weightType; InputWidth = inputWidth; OutputRows = outputRows; TokenCount = tokenCount;
-        PayloadBytes = GetPayloadBytes(rank, weightType, inputWidth, outputRows, tokenCount);
+        WeightType = weightType; InputWidth = inputWidth; OutputRows = outputRows; TokenCount = tokenCount; Arithmetic = arithmetic;
+        PayloadBytes = GetPayloadBytes(rank, weightType, inputWidth, outputRows, tokenCount, arithmetic, extended);
         _reservation = budget.Reserve(pools.Select(pool => new MemoryCharge(pool, PayloadBytes)));
         try
         {
-            if (GgmlNative.TSGgml_ResidentWeightCreate(rank, weightType, inputWidth, outputRows, tokenCount,
-                    PayloadBytes, out _handle) != 1)
+            int created = extended
+                ? GgmlNative.TSGgml_ResidentWeightCreateEx(rank, weightType, inputWidth, outputRows, tokenCount,
+                    (int)arithmetic, PayloadBytes, out _handle)
+                : GgmlNative.TSGgml_ResidentWeightCreate(rank, weightType, inputWidth, outputRows, tokenCount,
+                    PayloadBytes, out _handle);
+            if (created != 1)
                 throw Failure("creation");
             _reservation.Commit();
             _ready = true;
@@ -116,20 +144,26 @@ public sealed class GgmlResidentWeightSession : IDisposable
 
     /// <summary>Compute the complete original M/N projection once after all rows
     /// and tokens have arrived. Repeating this call reuses the completed output.</summary>
-    public void Project()
+    public void Project() => Project(TokenCount);
+
+    public void Project(int tokenCount)
     {
+        if (tokenCount <= 0 || tokenCount > TokenCount || (Arithmetic == GgmlWeightStreamingArithmetic.ResidentCuda && tokenCount != TokenCount))
+            throw new ArgumentOutOfRangeException(nameof(tokenCount));
         lock (_gate)
         {
             CheckReady();
-            if (_uploadedRows != OutputRows || _uploadedTokens != TokenCount)
+            if (_uploadedRows != OutputRows || _uploadedTokens != tokenCount)
                 throw new InvalidOperationException("Projection requires every original weight row and input token.");
             if (_projected) return;
-            if (GgmlNative.TSGgml_ResidentWeightProject(_handle) != 1)
+            int projected = tokenCount == TokenCount ? GgmlNative.TSGgml_ResidentWeightProject(_handle)
+                : GgmlNative.TSGgml_ResidentWeightProjectColumns(_handle, tokenCount);
+            if (projected != 1)
             {
                 _ready = false;
                 throw Failure("projection");
             }
-            _projected = true;
+            _projected = true; _projectedTokens = tokenCount;
         }
     }
 
@@ -144,6 +178,7 @@ public sealed class GgmlResidentWeightSession : IDisposable
         {
             CheckReady();
             if (!_projected) throw new InvalidOperationException("Download requires a completed projection of the current input.");
+            CheckRange(firstToken, tokenCount, _projectedTokens, nameof(firstToken), nameof(tokenCount));
             if (GgmlNative.TSGgml_ResidentWeightDownload(_handle, hostOutput, firstToken, tokenCount, firstRow, rowCount) != 1)
             {
                 _ready = false;
@@ -194,6 +229,13 @@ public sealed class GgmlResidentWeightAllocationException : InvalidOperationExce
 
 internal static partial class GgmlNative
 {
+    [LibraryImport(DllName)]
+    internal static partial long TSGgml_ResidentWeightPayloadBytesEx(int rank, int weightType, long inner, int rows, int columns, int arithmetic);
+    [LibraryImport(DllName)]
+    internal static partial int TSGgml_ResidentWeightCreateEx(int rank, int weightType, long inner, int rows, int columns,
+        int arithmetic, long capacity, out IntPtr handle);
+    [LibraryImport(DllName)]
+    internal static partial int TSGgml_ResidentWeightProjectColumns(IntPtr handle, int columns);
     [LibraryImport(DllName)]
     internal static partial long TSGgml_ResidentWeightPayloadBytes(int rank, int weightType, long inner, int rows, int columns);
     [LibraryImport(DllName)]

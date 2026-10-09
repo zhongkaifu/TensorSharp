@@ -10,6 +10,22 @@ namespace InferenceWeb.Tests;
 public sealed class StreamingWeightReadCacheTests
 {
     [Fact]
+    public void DevicePromotionRemovesOnlyTheSameSourceFromRam()
+    {
+        var budget = new MemoryBudget([new("ram", 512), new("gpu", 1024)]);
+        using var cache = new StreamingWeightReadCache(new(budget, "ram", ["gpu"])
+            { HostCacheBytes = 512, HostCacheReserveBytes = 0 });
+        var first = new Source(128); var second = new Source(128); // Value-equal, reference-distinct.
+        cache.Store(first, 0, new byte[64]); cache.Store(first, 64, new byte[64]);
+        cache.Store(second, 0, new byte[64]);
+        cache.RemoveSource(first);
+        Assert.False(cache.TryCopy(first, 0, new byte[64]));
+        Assert.True(cache.TryCopy(second, 0, new byte[64]));
+        Assert.Equal(64, cache.Statistics.Bytes);
+        Assert.Equal(128, cache.Statistics.Evicted);
+        Assert.Equal(64, budget.Snapshot().Single(p => p.Pool == "ram").Committed);
+    }
+    [Fact]
     public void SequentialScanDoesNotEvictReusableRangesAndPressurePreservesOtherOwners()
     {
         var budget = new MemoryBudget([new("ram", 256), new("gpu", 1024)]);
@@ -81,7 +97,7 @@ public sealed class StreamingWeightReadCacheTests
         Assert.All(Read(executor, weight), value => Assert.Equal((byte)5, value));
         Assert.Equal(272, executor.Statistics.FileBytesRead);
         Assert.Equal(272, executor.Statistics.HostCacheHitBytes);
-        executor.TrimHostCache();
+        executor.TrimIdleCaches();
         Assert.Equal(192, budget.Snapshot().Single(p => p.Pool == "ram").Committed); // Required read tile remains.
         Read(executor, weight);
         Assert.Equal(544, executor.Statistics.FileBytesRead);
@@ -105,6 +121,14 @@ public sealed class StreamingWeightReadCacheTests
         Assert.Equal(expected, AdaptiveModelSession.HostCacheLimit(plan, source, ceiling));
         Assert.Equal(0, AdaptiveModelSession.HostCacheLimit(plan with
         { SelectedCandidate = plan.SelectedCandidate with { Placement = InferenceWeightPlacement.Resident } }, source, ceiling));
+        var devicePlan = plan with
+        {
+            Capacities = [new(AdaptiveModelSession.DevicePool, capacity, capacity, 0, 0, capacity, 0)],
+            PoolPeaks = [new(AdaptiveModelSession.DevicePool, peak, peak, peak, peak, 0, peak)]
+        };
+        Assert.Equal(expected, AdaptiveModelSession.DeviceCacheLimit(devicePlan, source, ceiling));
+        Assert.Equal(0, AdaptiveModelSession.DeviceCacheLimit(devicePlan with
+        { SelectedCandidate = devicePlan.SelectedCandidate with { Placement = InferenceWeightPlacement.Resident } }, source, ceiling));
     }
 
     [Fact]
@@ -125,6 +149,10 @@ public sealed class StreamingWeightReadCacheTests
         Assert.False(AdaptiveModelSession.RequiresIdleTrim(pool with { MaximumBudgetBytes = 768 }, 256, 128));
         Assert.True(AdaptiveModelSession.RequiresIdleTrim(pool with { MaximumBudgetBytes = 500 }, 0, 0));
         Assert.False(AdaptiveModelSession.RequiresIdleTrim(pool with { Pool = "gpu" }, 256, 128));
+        var device = pool with { Pool = AdaptiveModelSession.DevicePool };
+        Assert.True(AdaptiveModelSession.RequiresIdleTrim(device, 0, 0, 256, 128));
+        Assert.False(AdaptiveModelSession.RequiresIdleTrim(device, 0, 0, 256, 0));
+        Assert.False(AdaptiveModelSession.RequiresIdleTrim(device with { MaximumBudgetBytes = 768 }, 0, 0, 256, 128));
     }
 
     [GgmlFact(BackendType.GgmlCuda)]

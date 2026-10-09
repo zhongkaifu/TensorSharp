@@ -1,5 +1,46 @@
 # Adaptive memory execution
 
+`--device-cache-bytes` bounds optional complete file-weight CUDA arenas (zero
+disables retention; omitted means use available forecast slack). The shared
+budget charges retained weights, input/output capacity and arithmetic scratch.
+Admission preserves the request's execution peak. Temporary workspaces reclaim
+LRU arenas before reducing tile sizes. Normal KV reset keeps valid weights;
+idle trim/disposal physically release them before refunding credit. Qwen's
+FullPrecision path supports prefill/decode reuse; Gemma ResidentCuda currently
+retains only N=1 and keeps its original larger-N arithmetic. FullPrecision
+promotion removes duplicate same-source RAM ranges. This is synchronous CUDA
+execution with bounded host staging, not asynchronous DMA or a global cache policy.
+
+To qualify retention, run four fresh processes off/on/on/off with identical
+native/managed files, model, prompt, ceilings, host-cache option and environment.
+Use `TS_GGML_Q8_PARALLEL_VECTOR=0`, `TS_GGML_Q8_PARALLEL_SMALL_BATCH=0`, capture off,
+one warmup and three measured requests per process, then run:
+
+```sh
+python eng/validation/AdaptiveMemoryProbe/compare-device-cache.py \
+  --executions off-1/execution.json on-1/execution.json on-2/execution.json off-2/execution.json \
+  --output artifacts/device-cache-comparison.json
+```
+
+The comparator requires completed nonoverlapping processes, full logits/history
+equality, streamed placement, real device hits, unchanged other options, owner
+cleanup, shared-budget bounds and consistent file/RAM/device consumption. It also
+requires actual weight-upload reduction, rather than accepting a configured cache
+that was never used. Logical reads do not measure physical SSD traffic.
+
+Final local RTX 3080 Laptop validation (`device-weight-cache-v2`, native `74c1b4f8…`,
+Models `c2404c9e…`) used Qwen0.8B Q8, context512, 67 prompt tokens, 16 predictions,
+host/device ceilings 512 MiB, host cache ceiling 256 MiB, tile32 and default ordered
+decode. A 256 MiB device-cache ceiling retained 184,048,640 bytes after headroom.
+Six measured requests per arm gave prefill 75.096→86.556 tokens/s (+15.26%),
+decode 3.035→3.851 (+26.90%), weight H2D 13,839,638,528→10,997,921,792 bytes/request
+(−20.53%) and logical source reads 9,356,312,576→6,518,669,312 (−30.33%).
+Every complete logit hash/history matched; all processes shut down and charged
+owners returned to zero. No concurrent inference/build/download, warm file cache,
+unlocked clocks. This constrained file mode remains far below the full-resident
+baseline; no independent language-quality, multi-GPU or asynchronous-transfer
+performance claim follows.
+
 The adaptive file-weight path now keeps immutable source ranges in pageable RAM
 when hardware and request forecasts leave room. `--host-cache-bytes` is an optional
 ceiling (zero disables reuse); actual retention is bounded by source size, the
