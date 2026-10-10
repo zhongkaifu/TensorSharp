@@ -444,5 +444,14 @@ known failures and benchmark limitations; generated evidence stays in ignored
 runs separate reference/candidate processes, records real prompt lengths, admitted
 concurrency, request estimates, exact ledger maxima and observed RSS/device usage.
 Its Linux cgroup wrapper refuses unavailable enforcement. The design records 8K,
-32K and 64K configured-context results, without counting queued requests as
+32K, 64K and 128K configured-context results, without counting queued requests as
 simultaneously running or logical quotas as physical hard limits.
+
+Adaptive request admission binds its snapshot configuration, block size,
+running-request limit and prefill workspace shape. `PrefillChunkTokenLimit`
+also caps the scheduler's solo and contended prefill policies; the bound
+admission can impose a smaller cap. A prefix-free, non-speculative engine
+limited to one running request reserves execution memory without request
+snapshot pages, even with queued followers. Engine capture/transfer scratch
+remains charged. Gemma's estimate includes retained sliding-window prefill
+staging; this is still a qualified adapter forecast, not a whole-process cap.

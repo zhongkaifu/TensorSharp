@@ -8091,6 +8091,11 @@ namespace TensorSharp.Models
             _cudaDecodeRopeSinGlobal = null;
 
             _onesForVNorm?.Dispose();
+            _cachedRoPEPosQ?.Dispose();
+            _cachedRoPEPosK?.Dispose();
+            _cachedRoPEPosQ = _cachedRoPEPosK = null;
+            _cachedRoPEPosSeqLen = 0;
+            _cachedRoPEPosStartPos = -1;
             _neoXRopeCosTensor?.Dispose();
             _neoXRopeSinTensor?.Dispose();
             foreach (NeoXRopeSlot slot in _neoXRopeSlotByFreqs.Values)

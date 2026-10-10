@@ -7,6 +7,13 @@ using TensorSharp.Runtime.Paged;
 
 namespace TensorSharp.Runtime.Scheduling;
 
+/// <summary>The execution shape used to derive an adaptive request peak. Bound
+/// to one snapshot configuration so a smaller estimate cannot be reused with a
+/// larger block, concurrency or workspace. Single-request, prefix-free execution
+/// never swaps owners and therefore needs no request-owned snapshot pages.</summary>
+public sealed record RequestMemoryExecutionShape(KvSnapshotOptions Snapshots, int BlockTokens,
+    int MaximumRunningRequests, int MaximumPrefillTokens);
+
 /// <summary>Executor-supplied upper bounds for a request's incremental peak on every
 /// physical pool, including maximum state growth and scratch. Shared weights, pooled
 /// device arenas and retained prefixes need separate lifetime charges. Estimates must
@@ -32,6 +39,20 @@ public sealed class RequestMemoryAdmission
     /// It must consume that sequence's envelope, dispose synchronously, and is
     /// only supported with the per-sequence, non-speculative execution path.</summary>
     public Func<SequenceState, IDisposable>? EnterSerialExecution { get; init; }
+
+    public RequestMemoryExecutionShape? ExecutionShape { get; init; }
+
+    internal void ValidateConfiguration(SchedulerConfig config)
+    {
+        if (ExecutionShape is not { } shape) return;
+        if (shape.BlockTokens <= 0 || shape.MaximumRunningRequests <= 0 || shape.MaximumPrefillTokens <= 0
+            || shape.Snapshots == null || EnterSerialExecution == null || !ReferenceEquals(shape.Snapshots, config.KvSnapshots)
+            || !ReferenceEquals(shape.Snapshots.SharedBudget, Budget)
+            || config.BlockSize != shape.BlockTokens || config.MaxNumRunningSequences <= 0
+            || config.MaxNumRunningSequences > shape.MaximumRunningRequests
+            || config.EnablePrefixCaching || config.Speculation.Enabled)
+            throw new ArgumentException("The scheduler must preserve the request estimator's snapshot, block, concurrency and non-speculative prefix-free execution contract.", nameof(config));
+    }
 
     /// <summary>Build the snapshot portion of request admission from model page
     /// geometry and currently available shared RAM. Divide optional residency

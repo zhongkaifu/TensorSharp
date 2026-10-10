@@ -24,6 +24,7 @@ internal sealed record DenseMemoryProfile(InferenceModelMemory Model, long Fusio
     internal long SourceWeightBytes { get; init; }
     internal long ResidentHostWeightBytes { get; init; }
     internal long RetainedMappedWeightBytes { get; init; }
+    internal bool RetainsSlidingWindowPrefill { get; init; }
 
     internal InferenceMemoryBytes RequestPeak(int context, int chunk, bool streaming)
     {
@@ -54,7 +55,20 @@ internal sealed record DenseMemoryProfile(InferenceModelMemory Model, long Fusio
         // Existing graph/host pools also retain slabs between invocations.
         long perToken = checked(4 * checked(2 * Intermediate + 16 * Hidden + Heads * context));
         long bytes = checked((64L << 20) + chunk * perToken + Vocab * 4);
-        return new(bytes, bytes);
+        long sliding = 0, largestExtended = 0;
+        if (RetainsSlidingWindowPrefill && chunk > 1)
+            foreach (var kv in Model.KvCaches.Where(k => k.Tier == MemoryTier.Host && k.WindowTokens > 0 && context > k.WindowTokens))
+            {
+                // Gemma's whole-model graph gathers every old SWA window before
+                // any cache writes, and keeps donor chunk inputs for shared KV.
+                // Extended/converted attention inputs are layer-local on CUDA;
+                // sum retained donors but only take the largest local working set.
+                long rows = checked(kv.WindowTokens + ((long)chunk + 255) / 256 * 256);
+                sliding = checked(sliding + rows * kv.BytesPerToken * kv.LayerCount);
+                largestExtended = Math.Max(largestExtended, checked(rows * kv.BytesPerToken));
+            }
+        sliding = checked(sliding + 2 * largestExtended);
+        return new(checked(bytes + sliding), checked(bytes + sliding));
     }
 
     internal static DenseMemoryProfile Read(GgufFile file, AdaptiveModelMemoryOptions options,
@@ -250,7 +264,8 @@ internal sealed record DenseMemoryProfile(InferenceModelMemory Model, long Fusio
         }, fusion, checked(largest * 2 + (32L << 20)), hidden, intermediate, heads, vocab, refusal)
         {
             SourceWeightBytes = sourceWeights, ResidentHostWeightBytes = residentHost,
-            RetainedMappedWeightBytes = mapped
+            RetainedMappedWeightBytes = mapped,
+            RetainsSlidingWindowPrefill = arch == "gemma4"
         };
 
         void Fusion(string[] names, bool keepSources = false)

@@ -65,10 +65,12 @@ namespace TensorSharp.Runtime.Scheduling
         {
             _model = model ?? throw new ArgumentNullException(nameof(model));
             ArgumentNullException.ThrowIfNull(cfg);
+            ArgumentOutOfRangeException.ThrowIfNegativeOrZero(cfg.PrefillChunkTokenLimit);
             if (cfg.MemoryAdmission?.EnterSerialExecution != null
                 && (cfg.EnablePrefixCaching || cfg.Speculation.Enabled || !ExecutionOptions.FromEnvironment().BatchedPathDisabled))
                 throw new NotSupportedException("The serial request allocation adapter requires explicit per-sequence execution with prefix caching and speculation disabled.");
             if (cfg.BlockSize <= 0) cfg = cfg.WithBlockSize(PreferredBlockSize(model));
+            cfg.MemoryAdmission?.ValidateConfiguration(cfg);
             _logger = logger ?? NullLogger.Instance;
             _stopRepetition = cfg.StopRepetition;   // cfg is null-checked above
             _nativeSlotContextLimit = UsesNativeDeepSeek41Slots(model) ? Math.Max(0, model.MaxContextLength) : 0;

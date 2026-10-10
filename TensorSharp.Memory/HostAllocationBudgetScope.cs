@@ -76,7 +76,7 @@ public sealed class HostAllocationBudgetScope : IDisposable
         {
             if (_disposed) return;
             if (_allocations != 0 || _envelope != null)
-                throw new InvalidOperationException("Host allocations or execution still own budget credit. Release them and retry disposal.");
+                throw new InvalidOperationException($"Host allocations ({_allocations}, {_bytes} bytes) or execution still own budget credit. Release them and retry disposal.");
             _active = null;
             _disposed = true;
         }

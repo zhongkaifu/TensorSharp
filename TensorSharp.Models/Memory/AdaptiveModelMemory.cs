@@ -279,23 +279,37 @@ public sealed class AdaptiveModelSession : IDisposable
         int maximumRunningRequests, int prefillChunkTokens, int maximumQueuedRequests = 1024)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
+        ArgumentNullException.ThrowIfNull(snapshots);
+        if (prefillChunkTokens <= 0 || prefillChunkTokens > Plan.SelectedChunkTokens)
+            throw new ArgumentOutOfRangeException(nameof(prefillChunkTokens));
         if (!ReferenceEquals(snapshots.SharedBudget, Budget) || snapshots.RamPool != HostPool)
             throw new ArgumentException("Snapshots must share this session's host ledger.", nameof(snapshots));
-        var admission = RequestMemoryAdmission.ForKvSnapshots(snapshots, Model.ComputeKVBlockByteSize(blockTokens),
-            blockTokens, maximumRunningRequests, additionalPeak: seq =>
-            {
-                if (seq.MediaSpans.Count != 0) throw new NotSupportedException("Adaptive request forecasting is qualified for text only.");
-                var peak = EstimateRequestPeak(seq.PromptTokens.Count, seq.MaxNewTokens, prefillChunkTokens);
-                return new MemoryCharge[] { new(HostPool, peak.Host), new(DevicePool, peak.Device) };
-            }, maxQueuedRequests: maximumQueuedRequests);
-        return new(Budget, admission.EstimatePeak, maximumQueuedRequests) { EnterSerialExecution = seq =>
+        IReadOnlyList<MemoryCharge> ExecutionPeak(SequenceState seq)
         {
-            ObjectDisposedException.ThrowIf(_disposed, this);
-            var envelope = seq.MemoryEnvelope ?? throw new InvalidOperationException("Execution requires an admitted request envelope.");
-            var native = _nativeBudget.EnterExecution(envelope);
-            try { return new ExecutionScope(native, _hostBudget.EnterExecution(envelope)); }
-            catch { native.Dispose(); throw; }
-        } };
+            if (seq.MediaSpans.Count != 0) throw new NotSupportedException("Adaptive request forecasting is qualified for text only.");
+            var peak = EstimateRequestPeak(seq.PromptTokens.Count, seq.MaxNewTokens, prefillChunkTokens);
+            return new MemoryCharge[] { new(HostPool, peak.Host), new(DevicePool, peak.Device) };
+        }
+        var admission = RequestMemoryAdmission.ForKvSnapshots(snapshots, Model.ComputeKVBlockByteSize(blockTokens),
+            blockTokens, maximumRunningRequests, additionalPeak: ExecutionPeak, maxQueuedRequests: maximumQueuedRequests);
+        // The bound shape rejects prefix caching and more than one running
+        // request. Queued requests cannot cause a state swap. Engine-owned
+        // capture scratch/staging remain charged, but page/spill reservations
+        // would only strand credit for a path this engine cannot execute.
+        Func<SequenceState, IReadOnlyList<MemoryCharge>> estimate = maximumRunningRequests == 1
+            ? ExecutionPeak : admission.EstimatePeak;
+        return new(Budget, estimate, maximumQueuedRequests)
+        {
+            ExecutionShape = new(snapshots, blockTokens, maximumRunningRequests, prefillChunkTokens),
+            EnterSerialExecution = seq =>
+            {
+                ObjectDisposedException.ThrowIf(_disposed, this);
+                var envelope = seq.MemoryEnvelope ?? throw new InvalidOperationException("Execution requires an admitted request envelope.");
+                var native = _nativeBudget.EnterExecution(envelope);
+                try { return new ExecutionScope(native, _hostBudget.EnterExecution(envelope)); }
+                catch { native.Dispose(); throw; }
+            }
+        };
     }
 
     private sealed class ExecutionScope(IDisposable native, IDisposable host) : IDisposable

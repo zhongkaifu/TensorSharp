@@ -3173,6 +3173,7 @@ namespace tsg {
     void release_gdn_chunked_cache();
     void release_qwen35_recurrent_prefill_cache();
     void release_paged_attention_cache();
+    void release_prefill_attention_cache();
 }
 
 // Tensor-parallel graphs held across calls, defined in their own kernels.
@@ -3244,6 +3245,7 @@ TSG_EXPORT void TSGgml_ClearHostBufferCache()
     tsg::release_gdn_chunked_cache();
     tsg::release_qwen35_recurrent_prefill_cache();
     tsg::release_paged_attention_cache();
+    tsg::release_prefill_attention_cache();
     TSGgml_ReleaseFusedFfnTpGraphs();
     TSGgml_ReleaseFusedMatmulAddTpGraphs();
     tsg::clear_q8_f32_backends();
@@ -3327,6 +3329,7 @@ TSG_EXPORT void TSGgml_Shutdown()
     tsg::release_gdn_chunked_cache();
     tsg::release_qwen35_recurrent_prefill_cache();
     tsg::release_paged_attention_cache();
+    tsg::release_prefill_attention_cache();
     forget_cache_keys();
 
     const int ranks = tsg::g_device_count.load(std::memory_order_acquire);
@@ -3508,6 +3511,7 @@ TSG_EXPORT void TSGgml_ReleaseReuseComputeBuffers()
     host_read_barrier();
     TSGgml_QwenImage21ResetForwardCache();
     tsg::release_paged_attention_cache();
+    tsg::release_prefill_attention_cache();
     free_reuse_compute_buffer();
     free_reuse_gallocr();
 #if defined(TSG_GGML_USE_METAL)

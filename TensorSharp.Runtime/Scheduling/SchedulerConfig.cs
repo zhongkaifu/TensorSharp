@@ -30,6 +30,11 @@ namespace TensorSharp.Runtime.Scheduling
         /// to vLLM's <c>max_num_seqs</c>. Default 16.</summary>
         public int MaxNumRunningSequences { get; init; } = 16;
 
+        /// <summary>Hard per-forward prefill shape limit, including the solo and
+        /// prefill-only throughput policies. Keep this within the model's admitted
+        /// workspace shape. Request admission can impose a still smaller bound.</summary>
+        public int PrefillChunkTokenLimit { get; init; } = int.MaxValue;
+
         /// <summary>Maximum number of new prefill tokens to schedule per
         /// sequence in a mixed prefill+decode step. This bounds the time an
         /// already-streaming request waits behind one long-prompt forward.
@@ -120,6 +125,7 @@ namespace TensorSharp.Runtime.Scheduling
         {
             MaxNumBatchedTokens = MaxNumBatchedTokens,
             MaxNumRunningSequences = MaxNumRunningSequences,
+            PrefillChunkTokenLimit = PrefillChunkTokenLimit,
             MaxPrefillChunkSize = MaxPrefillChunkSize,
             SoloPrefillChunkSize = SoloPrefillChunkSize,
             NumBlocks = NumBlocks,

@@ -2315,6 +2315,7 @@ namespace
     struct PrefillAttnSession
     {
         bool valid = false;
+        ggml_backend_t backend = nullptr;
         int num_q = 0;
         int kv_bucket = 0;
         int num_heads = 0;
@@ -2345,6 +2346,7 @@ namespace
             q_in = k_in = v_in = mask = result = nullptr;
             graph = nullptr;
             valid = false;
+            backend = nullptr;
             kv_zero_covered_from = 0;
         }
 
@@ -2355,7 +2357,43 @@ namespace
     };
 
     constexpr std::size_t kPrefillAttnCacheSize = 16;
-    thread_local std::array<PrefillAttnSession, kPrefillAttnCacheSize> g_prefill_attn_cache;
+    struct PrefillThreadCache {
+        std::array<PrefillAttnSession, kPrefillAttnCacheSize> sessions;
+        void clear() { for (auto& session : sessions) session.destroy(); }
+    };
+    struct PrefillRegistry {
+        std::mutex mutex;
+        std::vector<std::shared_ptr<PrefillThreadCache>> caches;
+    };
+    PrefillRegistry& prefill_registry()
+    {
+        static auto* registry = new PrefillRegistry;
+        return *registry;
+    }
+    void release_prefill_caches()
+    {
+        // Like the shared graph pools, trimming requires quiescent execution.
+        auto& registry = prefill_registry();
+        std::lock_guard<std::mutex> lock(registry.mutex);
+        for (auto& cache : registry.caches) cache->clear();
+        registry.caches.erase(std::remove_if(registry.caches.begin(), registry.caches.end(),
+            [](const auto& cache) { return cache.use_count() == 1; }), registry.caches.end());
+    }
+    auto& prefill_sessions()
+    {
+        thread_local auto cache = [] {
+            auto& registry = prefill_registry();
+            std::lock_guard<std::mutex> lock(registry.mutex);
+            auto value = std::make_shared<PrefillThreadCache>();
+            registry.caches.push_back(value);
+            static std::once_flag cleanup;
+            std::call_once(cleanup, [] { std::atexit(release_prefill_caches); });
+            return value;
+        }();
+        // Keep CUDA allocations alive and charged when a worker exits. Freeing
+        // them under Windows DLL_THREAD_DETACH can fail under the loader lock.
+        return cache->sessions;
+    }
     thread_local std::uint64_t g_prefill_attn_lru = 0;
     thread_local std::vector<ggml_fp16_t> g_prefill_mask_scratch;
     thread_local std::vector<unsigned char> g_prefill_zero_scratch;
@@ -2364,9 +2402,9 @@ namespace
         int num_q, int kv_bucket, int num_heads, int num_kv_heads, int head_dim,
         std::uint32_t scale_bits, bool kv_f16)
     {
-        for (auto& s : g_prefill_attn_cache)
+        for (auto& s : prefill_sessions())
         {
-            if (s.valid && s.num_q == num_q && s.kv_bucket == kv_bucket &&
+            if (s.valid && s.backend == g_backend && s.num_q == num_q && s.kv_bucket == kv_bucket &&
                 s.num_heads == num_heads && s.num_kv_heads == num_kv_heads &&
                 s.head_dim == head_dim && s.scale_bits == scale_bits && s.kv_f16 == kv_f16)
             {
@@ -2379,10 +2417,10 @@ namespace
 
     PrefillAttnSession& acquire_prefill_session_slot()
     {
-        for (auto& s : g_prefill_attn_cache)
+        for (auto& s : prefill_sessions())
             if (!s.valid) { s.lru = ++g_prefill_attn_lru; return s; }
-        PrefillAttnSession* victim = &g_prefill_attn_cache[0];
-        for (auto& s : g_prefill_attn_cache)
+        PrefillAttnSession* victim = &prefill_sessions()[0];
+        for (auto& s : prefill_sessions())
             if (s.lru < victim->lru) victim = &s;
         victim->destroy();
         victim->lru = ++g_prefill_attn_lru;
@@ -2453,6 +2491,7 @@ namespace
         s.num_kv_heads = num_kv_heads; s.head_dim = head_dim;
         s.scale_bits = prefill_float_bits(scale); s.kv_f16 = kv_f16;
         s.kv_zero_covered_from = 0; // buffer explicitly cleared above
+        s.backend = g_backend;
         s.valid = true;
         return true;
     }
@@ -2907,15 +2946,11 @@ TSG_EXPORT int TSGgml_StreamingNormResidual(
 
 namespace tsg
 {
-    // Frees the calling thread's cached prefill-attention sessions. Called
-    // from TSGgml_Shutdown so the sessions' backend (CUDA) buffers are
-    // released while the driver is still alive; otherwise the thread_local
-    // destructors run during CRT teardown, after CUDA driver shutdown, and
-    // ggml aborts with "CUDA error: driver shutting down" on process exit.
+    void release_prefill_attention_cache() { release_prefill_caches(); }
+    // Compatibility entry point for quiescent backend shutdown.
     void free_prefill_attn_sessions()
     {
-        for (auto& s : g_prefill_attn_cache)
-            s.destroy();
+        release_prefill_caches();
     }
 }
 

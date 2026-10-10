@@ -14,7 +14,7 @@ using TensorSharp.Runtime.Scheduling;
 var o = new Dictionary<string, string>();
 for (int i = 0; i < args.Length; i += 2)
 {
-    if (i + 1 == args.Length || args[i] is not ("--model" or "--json" or "--arm" or "--reference" or "--context" or "--prompt" or "--steps" or "--width" or "--chunk" or "--host-bytes" or "--device-bytes" or "--ssd-bytes"))
+    if (i + 1 == args.Length || args[i] is not ("--model" or "--json" or "--arm" or "--reference" or "--context" or "--prompt" or "--steps" or "--width" or "--max-running" or "--chunk" or "--host-bytes" or "--device-bytes" or "--ssd-bytes"))
         throw new ArgumentException("Use --model path --json path --arm reference|candidate --reference reference.json --context 32768 --prompt 30000 --steps 16 --width 2 --chunk 256 --host-bytes N --device-bytes N --ssd-bytes N.");
     o.Add(args[i], args[i + 1]);
 }
@@ -22,9 +22,10 @@ string path = Path.GetFullPath(o["--model"]), output = Path.GetFullPath(o["--jso
 string arm = o["--arm"];
 int context = int.Parse(o.GetValueOrDefault("--context", "32768")), promptLength = int.Parse(o.GetValueOrDefault("--prompt", "30000")),
     steps = int.Parse(o.GetValueOrDefault("--steps", "16")), width = int.Parse(o.GetValueOrDefault("--width", "2")),
-    chunk = int.Parse(o.GetValueOrDefault("--chunk", "256"));
+    chunk = int.Parse(o.GetValueOrDefault("--chunk", "256")),
+    maxRunning = int.Parse(o.GetValueOrDefault("--max-running", width.ToString()));
 if (arm is not ("reference" or "candidate") || context < 128 || context > 131072 || promptLength < 32 || promptLength + steps + 64 > context
-    || steps < 2 || steps > 128 || width < 1 || width > 8 || chunk < 1 || chunk > Math.Min(context, 2048))
+    || steps < 2 || steps > 128 || width < 1 || width > 8 || maxRunning < 1 || maxRunning > width || chunk < 1 || chunk > Math.Min(context, 2048))
     throw new ArgumentException("Invalid context/request shape.");
 Directory.CreateDirectory(Path.GetDirectoryName(output)!);
 foreach (var (key, value) in new[] { ("MAX_CONTEXT", context.ToString()), ("KV_CACHE_DTYPE", "f16"),
@@ -96,7 +97,8 @@ try
             }
             rendered = Render(high);
         }
-        if (rendered.Length + steps > Math.Min(context, model.MaxReusablePrefixTokens))
+        if (rendered.Length + steps > context
+            || (maxRunning > 1 && rendered.Length + steps > model.MaxReusablePrefixTokens))
             throw new NotSupportedException("Request exceeds the model's admitted or exactly restorable context.");
         return rendered;
     }
@@ -105,16 +107,21 @@ try
     // Prefill uses the same graph shape in both processes; no unmeasured long warmup.
     KvSnapshotOptions? snapshots = budget == null ? null : KvSnapshotOptions.FromSharedBudget(budget,
         AdaptiveModelSession.HostPool, "probe/ssd", Path.Combine(Path.GetDirectoryName(output)!, "spill-" + Guid.NewGuid().ToString("N")), 64 << 10);
-    var admission = snapshots == null ? null : session!.CreateRequestMemoryAdmission(snapshots, blockTokens, width, chunk);
+    var admission = snapshots == null ? null : session!.CreateRequestMemoryAdmission(snapshots, blockTokens, maxRunning, chunk);
     foreach (var sequence in sequences)
         peaks.Add(new { sequence.RequestId, PromptTokens = sequence.PromptTokens.Count,
             ExecutionPeak = session?.EstimateRequestPeak(sequence.PromptTokens.Count, steps, chunk),
             TotalPeak = admission?.EstimatePeak(sequence) });
     var config = new SchedulerConfig { BlockSize = blockTokens,
         NumBlocks = checked(width * ((context + blockTokens - 1) / blockTokens) + 16),
-        MaxNumRunningSequences = width, MaxNumBatchedTokens = checked(width * chunk),
+        MaxNumRunningSequences = maxRunning, MaxNumBatchedTokens = checked(width * chunk), PrefillChunkTokenLimit = chunk,
         MaxPrefillChunkSize = chunk, SoloPrefillChunkSize = chunk, DecodeQuantumTokens = 256,
         EnablePrefixCaching = false, StopRepetition = false, KvSnapshots = snapshots, MemoryAdmission = admission };
+    // Preserve admission evidence even if a native failure prevents final cleanup.
+    await File.WriteAllTextAsync(output + ".planning.json", JsonSerializer.Serialize(new {
+        Arm = arm, Context = context, Chunk = chunk, MaximumRunningRequests = maxRunning,
+        Plan = session?.Plan, RequestPeaks = peaks, Budget = budget?.Snapshot()
+    }, new JsonSerializerOptions { WriteIndented = true }));
     using (var engine = new InferenceEngine(model, config))
     {
         Sample("before-requests");
@@ -156,7 +163,9 @@ try
         var root = reference.RootElement;
         if (!root.GetProperty("Passed").GetBoolean() || root.GetProperty("Arm").GetString() != "reference"
             || root.GetProperty("ModelSha256").GetString() != modelHash || root.GetProperty("ContextTokens").GetInt32() != context
-            || root.GetProperty("ChunkTokens").GetInt32() != chunk)
+            || root.GetProperty("ChunkTokens").GetInt32() != chunk
+            || root.GetProperty("MaximumRunningRequests").GetInt32() != maxRunning
+            || !root.GetProperty("PrefillChunkLimitEnforced").GetBoolean())
             throw new InvalidOperationException("Reference identity/shape does not match this candidate.");
         var expected = root.GetProperty("Requests").EnumerateArray().ToArray();
         using var actualDoc = JsonDocument.Parse(JsonSerializer.Serialize(requests));
@@ -181,11 +190,13 @@ finally
         Sample("model-disposed");
     }
     catch (Exception ex) { error = (error == null ? "" : error + "\n") + ex; }
+    afterDispose = budget?.Snapshot();
 }
 var native = Process.GetCurrentProcess().Modules.Cast<ProcessModule>().Where(m => Path.GetFileName(m.FileName).Contains("GgmlOps", StringComparison.OrdinalIgnoreCase))
     .Select(m => new { m.FileName, Sha256 = Hash(m.FileName) }).ToArray();
 await File.WriteAllTextAsync(output, JsonSerializer.Serialize(new { Passed = error == null, Error = error, Arm = arm,
     Model = path, ModelSha256 = modelHash, ContextTokens = context, MinimumPromptTokens = promptLength, Steps = steps, Width = width, ChunkTokens = chunk,
+    MaximumRunningRequests = maxRunning, PrefillChunkLimitEnforced = true,
     LoadSeconds = loadSeconds, WallSeconds = wall, TokenParity = parity, Requests = requests, RequestPeaks = peaks, Samples = samples,
     Residency = residency, RunningSamples = runningSamples, HighWatermarks = budget?.HighWatermarks(), AfterDispose = afterDispose,
     Native = native, GgmlRevision = Environment.GetEnvironmentVariable("TS_VALIDATION_GGML_REVISION"),

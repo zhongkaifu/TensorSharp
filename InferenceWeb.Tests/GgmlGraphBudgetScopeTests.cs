@@ -10,6 +10,86 @@ namespace InferenceWeb.Tests;
 // Actual device allocation; run with TS_TEST_GGML_BACKEND=cuda and native test hooks.
 public sealed class GgmlGraphBudgetScopeTests
 {
+    [CudaFact("TS_TEST_MODEL_DIR", "gemma-4-12B-it-qat", GgmlBackend = BackendType.GgmlCuda)]
+    public void GemmaPerOpPrefillPositionCachesReleaseHostCreditOnModelDispose()
+    {
+        GgmlBasicOps.EnsureBackendAvailable(GgmlBackendType.Cuda);
+        GgmlBasicOps.ClearHostBufferCache();
+        GgmlBasicOps.ReleaseReuseComputeBuffers();
+        var budget = new MemoryBudget([new("ram", 16L << 30)]);
+        using var scope = new HostAllocationBudgetScope(budget, ["ram"]);
+        string path = TestGates.FindGguf(Environment.GetEnvironmentVariable("TS_TEST_MODEL_DIR"), "gemma-4-12B-it-qat");
+        using (var model = (Gemma4Model)ModelBase.Create(path, BackendType.GgmlCuda, 1, null, null, 1, null,
+            memoryPolicy: new ModelMemoryPolicy(256, 64)))
+        {
+            // Exercise the private per-op branch directly: the usual whole-model
+            // prefill succeeds and would hide these two cached position owners.
+            var flags = System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance;
+            var allocator = (IAllocator)typeof(ModelBase).GetField("_allocator", flags)!.GetValue(model)!;
+            var rope = typeof(Gemma4Model).GetMethod("ApplyRoPEPrefill", flags)!;
+            foreach (int heads in new[] { model.Config.NumHeads, 1 })
+            {
+                using var data = new Tensor(allocator, DType.Float32, 3, heads * 64);
+                Marshal.Copy(new float[3 * heads * 64], 0, data.Storage.PtrAtElement(0), 3 * heads * 64);
+                rope.Invoke(model, [data, heads, 64, 3, 5, 10000f, 0, null]);
+                Assert.All(data.GetElementsAsFloat(3 * heads * 64), value => Assert.Equal(0f, value));
+            }
+            Assert.NotNull(typeof(Gemma4Model).GetField("_cachedRoPEPosQ", flags)!.GetValue(model));
+            Assert.NotNull(typeof(Gemma4Model).GetField("_cachedRoPEPosK", flags)!.GetValue(model));
+        }
+        Assert.Equal(0, scope.Usage.Bytes);
+        Assert.Equal(0, scope.Usage.Allocations);
+        Assert.Equal(0, budget.Snapshot().Single().Committed);
+    }
+    [GgmlFact(BackendType.GgmlCuda)]
+    public void PrefillWorkerCacheReturnsCreditOnGlobalTrimAndRebuildsAfterRefusal()
+    {
+        GgmlBasicOps.EnsureBackendAvailable(GgmlBackendType.Cuda);
+        GgmlBasicOps.ClearHostBufferCache();
+        GgmlBasicOps.ReleaseReuseComputeBuffers();
+        var budget = new MemoryBudget([new("gpu", 64L << 20)]);
+        using var scope = new GgmlCacheBudgetScope(budget, [["gpu"]], true);
+        static float[] Forward()
+        {
+            var context = new GgmlContext([0], GgmlBackendType.Cuda);
+            var allocator = new GgmlAllocator(context, 0);
+            try
+            {
+                using var q = new Tensor(allocator, DType.Float32, 2, 2, 64);
+                using var k = new Tensor(allocator, DType.Float32, 1, 2, 64);
+                using var v = new Tensor(allocator, DType.Float32, 1, 2, 64);
+                using var output = new Tensor(allocator, DType.Float32, 2, 128);
+                Marshal.Copy(new float[256], 0, q.Storage.PtrAtElement(0), 256);
+                Marshal.Copy(new float[128], 0, k.Storage.PtrAtElement(0), 128);
+                Marshal.Copy(Enumerable.Repeat(1f, 128).ToArray(), 0, v.Storage.PtrAtElement(0), 128);
+                GgmlBasicOps.FusedPrefillAttention(q, k, v, output, 2, 1, 64, 2, 2, 0, 0, 0.125f, 0);
+                return output.GetElementsAsFloat(256);
+            }
+            finally { context.ReleasePooledMemory(); }
+        }
+        try
+        {
+            float[]? workerOutput = null;
+            Exception? workerError = null;
+            var worker = new Thread(() => { try { workerOutput = Forward(); } catch (Exception ex) { workerError = ex; } });
+            worker.Start();
+            Assert.True(worker.Join(TimeSpan.FromSeconds(10)));
+            Assert.Null(workerError);
+            Assert.All(workerOutput!, v => Assert.InRange(v, 0.999f, 1.001f));
+            Assert.True(budget.Snapshot().Single().Committed > 0);
+            Assert.Throws<InvalidOperationException>(() => scope.Dispose());
+            GgmlBasicOps.ReleaseReuseComputeBuffers();
+            Assert.Equal(0, scope.ActiveAllocations);
+            Assert.True(budget.TrySetCapacity("gpu", 0));
+            Assert.Throws<InvalidOperationException>(() => Task.Run(Forward).GetAwaiter().GetResult());
+            Assert.Equal(0, budget.Snapshot().Single().Committed);
+            Assert.True(budget.TrySetCapacity("gpu", 64L << 20));
+            Assert.All(Task.Run(Forward).GetAwaiter().GetResult(), v => Assert.InRange(v, 0.999f, 1.001f));
+            Assert.Null(scope.CallbackError);
+        }
+        finally { GgmlBasicOps.ClearHostBufferCache(); GgmlBasicOps.ReleaseReuseComputeBuffers(); }
+        Assert.Equal(0, scope.ActiveAllocations);
+    }
     [GgmlFact(BackendType.GgmlCuda)]
     public void PagedAttentionWorkerCacheReturnsBudgetOnGlobalTrimAndRebuildsAfterRefusal()
     {

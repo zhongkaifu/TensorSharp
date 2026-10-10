@@ -67,6 +67,8 @@ namespace TensorSharp.Runtime.Scheduling
             bool requiresPerBlockCapture = false)
         {
             _cfg = cfg ?? throw new ArgumentNullException(nameof(cfg));
+            ArgumentOutOfRangeException.ThrowIfNegativeOrZero(cfg.PrefillChunkTokenLimit);
+            cfg.MemoryAdmission?.ValidateConfiguration(cfg);
             _pool = pool ?? throw new ArgumentNullException(nameof(pool));
             _logger = logger ?? NullLogger.Instance;
             // Per-boundary alignment only serves prefix pages that other sequences
@@ -191,6 +193,8 @@ namespace TensorSharp.Runtime.Scheduling
         public void Submit(SequenceState seq)
         {
             if (seq == null) throw new ArgumentNullException(nameof(seq));
+            if (_cfg.MemoryAdmission?.ExecutionShape is { } shape && seq.BlockTable.BlockSize != shape.BlockTokens)
+                throw new ArgumentException("The request block size differs from its admitted snapshot geometry.", nameof(seq));
             if (_waitingIndex.ContainsKey(seq.RequestId) || _running.ContainsKey(seq.RequestId))
                 throw new InvalidOperationException($"Sequence {seq.RequestId} is already submitted.");
             if (_memoryOwners.ContainsKey(seq.RequestId))
@@ -540,16 +544,18 @@ namespace TensorSharp.Runtime.Scheduling
             int candidatesRemaining,
             int soloPrefillCap)
         {
-            if (noContention)
-                return soloPrefillCap;
-            if (hasActiveDecode)
-                return _cfg.MaxPrefillChunkSize;
-
             candidatesRemaining = Math.Max(1, candidatesRemaining);
             int evenShare = tokenBudget / candidatesRemaining;
             if (tokenBudget % candidatesRemaining != 0)
                 evenShare++;
-            return Math.Max(1, evenShare);
+            int cap = noContention ? soloPrefillCap : hasActiveDecode
+                ? _cfg.MaxPrefillChunkSize : Math.Max(1, evenShare);
+            cap = Math.Min(cap, _cfg.PrefillChunkTokenLimit);
+            // Fairness and solo-throughput policies may increase a chunk, but
+            // cannot exceed the shape whose workspace was admitted. Apply this
+            // to both existing and newly admitted prefills.
+            return _cfg.MemoryAdmission?.ExecutionShape is { } shape
+                ? Math.Min(cap, shape.MaximumPrefillTokens) : cap;
         }
 
         /// <summary>Move the prefill that received only a partial quantum last

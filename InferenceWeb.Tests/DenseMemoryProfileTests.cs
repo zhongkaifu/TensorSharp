@@ -13,6 +13,22 @@ public sealed class DenseMemoryProfileTests
     private const long BufferPadding = 64L << 10;
 
     [Fact]
+    public void WrappedSlidingWindowsIncludeGatherConcatAndConversionAcrossAllOwners()
+    {
+        var model = new InferenceModelMemory { KvCaches = [
+            new(64, 2, 1024, 1024, MemoryTier.Host),
+            new(64, 2, 1024, 1024, MemoryTier.Accelerator)] };
+        var plain = new DenseMemoryProfile(model, 0, 0, 128, 256, 4, 512, null);
+        var gemma = plain with { RetainsSlidingWindowPrefill = true };
+        Assert.Equal(plain.Workspace(128, 1024), gemma.Workspace(128, 1024));
+        Assert.Equal(plain.Workspace(1, 4096), gemma.Workspace(1, 4096));
+        long staging = (1024L + 256) * 64 * (2 + 2);
+        Assert.Equal(plain.Workspace(128, 4096).Host + staging, gemma.Workspace(128, 4096).Host);
+        Assert.Equal(plain.RequestPeak(4096, 128, false).Device + staging,
+            gemma.RequestPeak(4096, 128, false).Device);
+    }
+
+    [Fact]
     public void NonMatrixHalfTensorIsDecodedAndKeepsItsFloatHostPayload()
     {
         using var f = new Fixture("gemma4", Matrix("auxiliary.weight", SyntheticGguf.GgmlType.F16, 64, 2, 2));

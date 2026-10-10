@@ -34,6 +34,91 @@ public class ContinuousBatchSchedulerTests
     private const int NumKVHeads = 2;
     private const int HeadDim = 4;
 
+    [Theory]
+    [InlineData(1, false, true)]
+    [InlineData(2, false, true)]
+    [InlineData(2, true, true)]
+    [InlineData(1, false, false)]
+    [InlineData(2, false, false)]
+    [InlineData(2, true, false)]
+    public void Scheduler_AdmittedWorkspaceCapsSoloContendedAndMixedPrefill(int width, bool mixed, bool admission)
+    {
+        using var directory = new SnapshotTestDirectory();
+        var budget = new MemoryBudget([new("ram", 1 << 20), new("ssd", 0)]);
+        using var host = new HostAllocationBudgetScope(budget, ["ram"]);
+        var snapshots = KvSnapshotOptions.FromSharedBudget(budget, "ram", "ssd", directory.Path, 64);
+        var cfg = new SchedulerConfig
+        {
+            BlockSize = BlockSize, NumBlocks = 64, MaxNumBatchedTokens = 64,
+            MaxPrefillChunkSize = 32, SoloPrefillChunkSize = 64,
+            PrefillChunkTokenLimit = admission ? 32 : 4,
+            MaxNumRunningSequences = width, EnablePrefixCaching = false, KvSnapshots = snapshots,
+            MemoryAdmission = admission ? new(budget, _ => Array.Empty<MemoryCharge>())
+            {
+                ExecutionShape = new(snapshots, BlockSize, width, 4),
+                EnterSerialExecution = seq => host.EnterExecution(seq.MemoryEnvelope!)
+            } : null
+        };
+        var pool = NewPool(cfg.NumBlocks);
+        using var storage = pool.Storage;
+        var scheduler = new ContinuousBatchScheduler(cfg, pool);
+        if (admission)
+            Assert.Throws<ArgumentException>(() => scheduler.Submit(new SequenceState("wrong-block",
+                new[] { 1, 2, 3, 4 }, 3, BlockSize * 2, SamplingConfig.Greedy)));
+        var first = NewSequence("shape-first", mixed ? 4 : 64, 16);
+        scheduler.Submit(first);
+        var initial = scheduler.Schedule();
+        Assert.Equal(4, Assert.Single(initial.ScheduledWork).NumScheduledTokens);
+        first.AdvanceComputedTokens(4);
+        if (width == 2) scheduler.Submit(NewSequence("shape-second", 64, 16));
+        var next = scheduler.Schedule();
+        Assert.Equal(width, next.ScheduledWork.Count);
+        Assert.All(next.ScheduledWork.Where(w => w.IsPrefill), w => Assert.Equal(4, w.NumScheduledTokens));
+        if (mixed) Assert.Equal(1, next.ScheduledWork.First(w => !w.IsPrefill).NumScheduledTokens);
+    }
+
+    [Fact]
+    public async Task Engine_SingleRunningRequestNeedsNoSnapshotPageCreditEvenWithQueuedFollowers()
+    {
+        string? previous = Environment.GetEnvironmentVariable("TS_SCHED_DISABLE_BATCHED");
+        Environment.SetEnvironmentVariable("TS_SCHED_DISABLE_BATCHED", "1");
+        try
+        {
+            using var directory = new SnapshotTestDirectory();
+            using var model = new StubModel("single-snapshot-free", 7);
+            long blockBytes = model.ComputeKVBlockByteSize(BlockSize);
+            var budget = new MemoryBudget([new("ram", 2 * blockBytes + 64), new("ssd", 0)]);
+            using var host = new HostAllocationBudgetScope(budget, ["ram"]);
+            var snapshots = KvSnapshotOptions.FromSharedBudget(budget, "ram", "ssd", directory.Path, 64);
+            var admission = new RequestMemoryAdmission(budget, _ => Array.Empty<MemoryCharge>())
+            {
+                ExecutionShape = new(snapshots, BlockSize, 1, 4),
+                EnterSerialExecution = seq => host.EnterExecution(seq.MemoryEnvelope!)
+            };
+            SchedulerConfig Config(int width, int block, bool prefix, KvSnapshotOptions options) => new()
+            {
+                BlockSize = block, NumBlocks = 64, MaxNumRunningSequences = width,
+                MaxNumBatchedTokens = 64, SoloPrefillChunkSize = 64, EnablePrefixCaching = prefix,
+                StopRepetition = false, KvSnapshots = options, MemoryAdmission = admission
+            };
+            Assert.Throws<ArgumentException>(() => new InferenceEngine(model, Config(2, BlockSize, false, snapshots)));
+            Assert.Throws<ArgumentException>(() => new InferenceEngine(model, Config(1, BlockSize * 2, false, snapshots)));
+            Assert.Throws<ArgumentException>(() => new InferenceEngine(model, Config(1, BlockSize, false, snapshots with { TransferBytes = 128 })));
+            Assert.Throws<NotSupportedException>(() => new InferenceEngine(model, Config(1, BlockSize, true, snapshots)));
+            Assert.All(budget.Snapshot(), p => Assert.Equal(0, p.Committed + p.Reserved));
+            using (var engine = new InferenceEngine(model, Config(1, BlockSize, false, snapshots)))
+            {
+                var handles = Enumerable.Range(0, 3).Select(i => engine.SubmitRequest(NewSequence($"queued-{i}", 64, 3))).ToArray();
+                await Task.WhenAll(handles.Select(h => h.Completion)).WaitAsync(TimeSpan.FromSeconds(5));
+                Assert.All(handles, h => Assert.Equal(new[] { 7, 7, 7 }, h.Sequence.OutputTokens));
+                Assert.Equal(0, engine.SnapshotResidencyStats!.Value.Loads);
+                Assert.Equal(0, engine.SnapshotResidencyStats!.Value.Spills);
+            }
+            Assert.All(budget.Snapshot(), p => Assert.Equal(0, p.Committed + p.Reserved));
+        }
+        finally { Environment.SetEnvironmentVariable("TS_SCHED_DISABLE_BATCHED", previous); }
+    }
+
     [Fact]
     public void BlockPool_AllocateAndFree_RoundTrips()
     {

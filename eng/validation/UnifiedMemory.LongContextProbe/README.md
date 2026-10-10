@@ -31,6 +31,24 @@ credit are also required. Failures return exit code 1 and include the error in
 JSON. Unsupported architectures/restoration windows are failures, not passes.
 This is storage/execution parity, not an independent semantic or llama.cpp oracle.
 
+`--width` controls submitted concurrency; `--max-running` independently caps
+admitted concurrency (defaults to width). For queued serial work, set
+`--width 2 --max-running 1` on both arms. With prefix reuse disabled this lane
+does not capture request snapshots, so `--ssd-bytes 0` is valid even when a
+snapshot of the whole prompt would not fit RAM. Engine capture scratch and
+transfer staging still count. A Gemma prompt may exceed its rolling-window
+restore limit only in this no-swap lane; interleaved restoration keeps the limit.
+
+Both arms set `PrefillChunkTokenLimit`; solo and contention scheduling cannot
+silently grow the workspace beyond `--chunk`. Candidate admission also binds
+the snapshot object/budget, block size, running limit, and maximum chunk used by
+its estimate. Configuration/sequence mismatches are rejected before allocation.
+`PrefillChunkLimitEnforced` distinguishes these runs from older probe results
+that configured chunk hints without an unconditional per-forward ceiling.
+`*.planning.json` preserves the selected plan and request peaks before execution,
+including for native failures that prevent a final result. Planning evidence
+alone is never a passing run.
+
 Interpret the recorded fields as follows:
 
 - `ContextTokens` is configured capacity. `Requests[].PromptTokens` is the actual
