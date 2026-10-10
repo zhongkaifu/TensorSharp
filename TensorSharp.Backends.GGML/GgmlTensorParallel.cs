@@ -216,10 +216,18 @@ namespace TensorSharp.GGML
         }
 
         /// <summary>True when a backend collective is available, including a pinned-host
-        /// pipeline. The native startup diagnostics identify the actual transport.</summary>
+        /// pipeline. The native startup diagnostics identify the actual transport.
+        /// Throws when the first collective never completed: the GPUs' streams are
+        /// blocked behind it, and continuing would hang the load instead of naming why.
+        /// NotSupportedException makes the hosts report it as a load refusal - one line
+        /// that says what to change - rather than as a crash.</summary>
         public static bool TensorParallelHasDeviceAllReduce()
         {
-            return TSGgml_TensorParallelHasDeviceAllReduce() != 0;
+            int result = TSGgml_TensorParallelHasDeviceAllReduce();
+            if (result < 0)
+                throw new NotSupportedException(GetLastErrorMessage(
+                    "The tensor-parallel AllReduce did not complete on these GPUs."));
+            return result != 0;
         }
 
         /// <summary>

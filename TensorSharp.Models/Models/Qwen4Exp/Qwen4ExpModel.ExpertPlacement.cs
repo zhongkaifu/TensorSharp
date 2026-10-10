@@ -69,11 +69,25 @@ namespace TensorSharp.Models
         {
             int n = Config.NumLayers;
             _expertOnHost = new bool[n];
+            // ggml_cuda plans against what each GPU has free, and sub-chunks prefill to
+            // the span width that plan reserved scratch for.
+            bool cudaPlans = _backend == BackendType.GgmlCuda && !IsTensorParallel;
 
             if (MoeCpuOffloadConfig.IsExplicitlySet)
             {
                 if (!MoeCpuOffloadConfig.IsEnabled)
+                {
+                    // An explicit "no offload" under a split is still checked per GPU:
+                    // failing here names the fix, failing in warmup does not.
+                    if (cudaPlans && LayerSplitDegree > 1)
+                        PlanCudaSplitExpertPlacement();
+                    else if (cudaPlans)
+                    {
+                        ApplySingleDeviceSpanCap(anyHost: false);
+                        CapSingleDeviceContext();
+                    }
                     return;
+                }
                 if (!IsGgmlBackend || IsTensorParallel)
                 {
                     MoeCpuOffloadConfig.WarnUnsupportedBackend(ArchitectureId,
@@ -87,20 +101,40 @@ namespace TensorSharp.Models
                         "--n-cpu-moe / --cpu-moe change nothing.");
                     return;
                 }
+                if (cudaPlans && LayerSplitDegree > 1)
+                {
+                    PlanCudaSplitExpertPlacement();
+                    return;
+                }
+                bool anyHost = false;
                 for (int l = 0; l < n; l++)
-                    _expertOnHost[l] = MoeCpuOffloadConfig.IsLayerOnCpu(l);
+                    anyHost |= _expertOnHost[l] = MoeCpuOffloadConfig.IsLayerOnCpu(l);
+                if (cudaPlans)
+                    ApplySingleDeviceSpanCap(anyHost);
                 ReportExpertPlacement("--n-cpu-moe / --cpu-moe", null);
+                if (cudaPlans)
+                    CapSingleDeviceContext();
+                return;
+            }
+
+            // A layer split was sized against each GPU before the preload; now re-fit
+            // each GPU's host set against what it really has free.
+            if (cudaPlans && LayerSplitDegree > 1)
+            {
+                PlanCudaSplitExpertPlacement();
                 return;
             }
 
             // CUDA has a separate VRAM pool. Quantized non-expert weights were
             // preloaded above, but the span still has to bind float weights and
             // caches. Plan against current free memory rather than total VRAM.
-            // A layer split needs a per-device plan and is left to explicit flags.
-            if (_backend == BackendType.GgmlCuda && !IsTensorParallel && LayerSplitDegree <= 1)
+            if (cudaPlans)
             {
                 if (!GgmlBasicOps.TryGetDeviceMemoryInfo(out long free, out long total) || total <= 0)
+                {
+                    ApplySingleDeviceSpanCap(anyHost: false);
                     return;
+                }
                 var layerBytes = new long[n];
                 var cacheMinimum = new long[n];
                 var cacheAllocationFloor = new long[n];
@@ -117,19 +151,47 @@ namespace TensorSharp.Models
                 // These tensors were filled directly on the host; their first
                 // device bindings remain pending. Dense quantized preloads are
                 // already reflected in measured free VRAM and are not counted
-                // again. The optional MTP head is preloaded AFTER this plan.
-                long pending = checked(CacheBytes() + (_mtpReady ? 0 : _mtpResidentBytes));
+                // again. The optional MTP head is preloaded AFTER this plan, the
+                // recurrent state is created by the first forward, and the vision
+                // tower (when the host said it will load one) after construction.
+                int kvElement = _kvCacheDtype == KvCacheDtype.F32 ? 4 : 2;
+                long pending = checked((_mtpReady ? 0 : _mtpResidentBytes) + _visionReserveBytes);
+                for (int l = 0; l < n; l++) pending = checked(pending + AllocatedLayerCacheBytes(l, kvElement));
                 foreach (var weight in _weights.Values) pending = checked(pending + weight.Storage.ByteLength);
                 long cacheBudget = ResolveCudaExpertCacheBudget(
                     Environment.GetEnvironmentVariable("TS_HOST_MOE_EXPERT_CACHE_MB"));
                 ulong cacheLayers = ResolveCudaExpertCacheLayers(
                     Environment.GetEnvironmentVariable("TS_HOST_MOE_EXPERT_CACHE_LAYERS"));
-                int resident = PlanCudaDeviceExpertLayers(layerBytes, pending, free,
-                    GpuMemoryBudget.ResolveHeadroomBytes(total), cacheBudget, cacheMinimum, cacheLayers, cacheAllocationFloor);
-                for (int l = 0; l < n - resident; l++) _expertOnHost[l] = true;
-                ReportExpertPlacement("planned", $"CUDA free {Gb(free)}, reserved scratch {Gb(DeviceScratchBytes)}" +
+                long headroom = GpuMemoryBudget.ResolveHeadroomBytes(total);
+                // Plan at the full span width; once anything has to go to the host,
+                // plan again at the narrower width that keeps more layers resident.
+                int? pinned = ParseSpanTokenOverride(Environment.GetEnvironmentVariable("TS_Q4E_PREFILL_CHUNK"));
+                int tokens = pinned ?? SpanTokensWhenResident;
+                int resident = PlanCudaDeviceExpertLayers(layerBytes, pending, free, headroom, cacheBudget,
+                    cacheMinimum, cacheLayers, cacheAllocationFloor, SpanScratch(tokens, _maxContextLength, kvElement));
+                if (pinned == null && resident < n)
+                {
+                    tokens = SpanTokensWhenOffloaded;
+                    resident = PlanCudaDeviceExpertLayers(layerBytes, pending, free, headroom, cacheBudget,
+                        cacheMinimum, cacheLayers, cacheAllocationFloor, SpanScratch(tokens, _maxContextLength, kvElement));
+                }
+                _spanTokenCapPinned = pinned != null;
+                SetSpanTokenCap(tokens, _maxContextLength);
+                long largestHost = 0, residentExperts = 0;
+                for (int l = 0; l < n; l++)
+                {
+                    if (l < n - resident) { _expertOnHost[l] = true; largestHost = Math.Max(largestHost, layerBytes[l]); }
+                    else residentExperts += layerBytes[l];
+                }
+                long scratch = SpanScratch(tokens, _maxContextLength, kvElement).Bytes(n - resident, largestHost);
+                ReportExpertPlacement("planned", $"CUDA free {Gb(free)}, reserved span scratch {Gb(scratch)} " +
+                    $"for prefill spans of up to {tokens} tokens" +
                     (cacheBudget > 0 ? $", expert cache ceiling {Gb(cacheBudget)}" : "") +
-                    "; --n-cpu-moe N overrides");
+                    "; --n-cpu-moe N and TS_Q4E_PREFILL_CHUNK override");
+                // Room the expert cache may claim is not room the KV cache can grow into.
+                long used = checked(pending + residentExperts + scratch + Math.Min(cacheBudget, Math.Max(0, free)));
+                CapContextToDeviceRoom(new[] { Math.Max(0, free - headroom) }, new[] { used },
+                    _kvCacheDtype == KvCacheDtype.F32 ? 4 : 2);
                 return;
             }
 
@@ -156,6 +218,15 @@ namespace TensorSharp.Models
                 _expertOnHost[l] = true;
             ReportExpertPlacement("planned", $"Metal working set {Gb(workingSet)}, RAM {Gb(ram)}; " +
                 "--n-cpu-moe N overrides");
+        }
+
+        /// <summary>Span width for a single-GPU ggml_cuda run whose host set was not
+        /// planned here (explicit flags, or no memory query).</summary>
+        private void ApplySingleDeviceSpanCap(bool anyHost)
+        {
+            int? pinned = ParseSpanTokenOverride(Environment.GetEnvironmentVariable("TS_Q4E_PREFILL_CHUNK"));
+            _spanTokenCapPinned = pinned != null;
+            SetSpanTokenCap(pinned ?? (anyHost ? SpanTokensWhenOffloaded : SpanTokensWhenResident), _maxContextLength);
         }
 
         internal static long ResolveCudaExpertCacheBudget(string value)
@@ -223,10 +294,13 @@ namespace TensorSharp.Models
         /// cache layouts preserve whole resident layers, reserving cache quota only
         /// for offloaded layers whose selected experts can fit it.
         /// Models that fit keep the uninterrupted all-device graph.</summary>
+        /// <param name="spanScratch">Scratch a span needs, by how many layers route
+        /// their experts to the host. Null keeps the flat <see cref="DeviceScratchBytes"/>
+        /// reserve.</param>
         internal static int PlanCudaDeviceExpertLayers(long[] layerExpertBytes, long pendingBytes,
             long freeBytes, long headroomBytes, long expertCacheBytes,
             long[] layerCacheMinimumBytes = null, ulong cacheLayers = 48,
-            long[] layerCacheAllocationFloorBytes = null)
+            long[] layerCacheAllocationFloorBytes = null, Qwen4ExpSpanScratch? spanScratch = null)
         {
             ArgumentNullException.ThrowIfNull(layerExpertBytes);
             if (pendingBytes < 0 || headroomBytes < 0 || expertCacheBytes < 0)
@@ -246,10 +320,33 @@ namespace TensorSharp.Models
                     if (layerCacheAllocationFloorBytes[l] < 0 || layerCacheAllocationFloorBytes[l] > layerCacheMinimumBytes[l])
                         throw new ArgumentOutOfRangeException(nameof(layerCacheAllocationFloorBytes));
             long available = Math.Max(0, freeBytes);
-            foreach (long reserve in new[] { pendingBytes, headroomBytes, DeviceScratchBytes })
+            foreach (long reserve in spanScratch == null
+                         ? new[] { pendingBytes, headroomBytes, DeviceScratchBytes }
+                         : new[] { pendingBytes, headroomBytes })
                 available = reserve >= available ? 0 : available - reserve;
             int Fit(long budget)
             {
+                if (spanScratch is Qwen4ExpSpanScratch scratch)
+                {
+                    // The scratch grows with every layer routed to the host (seam
+                    // tensors, and the stream buffer the first one adds), so each split
+                    // is checked as a whole. All-host is the floor whether it fits or not.
+                    int n = layerExpertBytes.Length;
+                    long residentBytes = 0;
+                    foreach (long b in layerExpertBytes) residentBytes = checked(residentBytes + b);
+                    long largestHost = 0;
+                    for (int split = 0; split <= n; split++)
+                    {
+                        if (split > 0)
+                        {
+                            residentBytes -= layerExpertBytes[split - 1];
+                            largestHost = Math.Max(largestHost, layerExpertBytes[split - 1]);
+                        }
+                        if (checked(residentBytes + scratch.Bytes(split, largestHost)) <= budget)
+                            return n - split;
+                    }
+                    return 0;
+                }
                 int resident = 0;
                 for (int l = layerExpertBytes.Length - 1; l >= 0; l--)
                 {
@@ -375,6 +472,8 @@ namespace TensorSharp.Models
             }
             if (onHost == 0)
                 return;
+            _placementSummary = $"the GPU holds the experts of {n - onHost} of {n} layers ({Gb(deviceBytes)}), "
+                + $"{onHost} run on the host";
             Console.WriteLine($"[moe-offload] qwen4exp ({how}): routed experts of {onHost} of {n} layers run on the " +
                 $"host from the GGUF mapping ({Gb(hostBytes)} read on demand); the accelerator holds {n - onHost} " +
                 $"layers' ({Gb(deviceBytes)})" + (detail != null ? $". {detail}." : "."));

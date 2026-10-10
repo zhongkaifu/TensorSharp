@@ -927,7 +927,9 @@ namespace TensorSharp.Cli
                 }
 
                 createdModel = ModelBase.Create(modelPath, backend, tpDegree, tpGroup, draftModelPath,
-                    layerSplitDegree: parallelism.LayerSplitDegree);
+                    layerSplitDegree: parallelism.LayerSplitDegree,
+                    projectorPath: ExpectedProjectorPath(modelPath, mmProjPath, mmProjDisabled,
+                        imagePath, audioPath, videoPath));
             }
             catch (Exception ex) when (ModelLoadRefusal.TryDescribe(ex, out string loadRefusal))
             {
@@ -1014,7 +1016,25 @@ namespace TensorSharp.Cli
             }
 
             var warmupSw = Stopwatch.StartNew();
-            model.WarmUpKernels();
+            try
+            {
+                model.WarmUpKernels();
+            }
+            catch (ModelLoadRefusedException ex) when (ModelLoadRefusal.TryDescribe(ex, out string warmupRefusal))
+            {
+                // Warmup is the first forward: a placement that does not really fit
+                // the GPU surfaces here as a refusal. Refuse like a load, with the fix in
+                // one line. Only the model's own refusal: a peer that drops out of a
+                // distributed warmup (an IOException) is a transport failure, not a
+                // refused load, and keeps its stack trace and exit code.
+                _log.LogError(LogEventIds.ModelLoadFailed,
+                    "Model load refused during kernel warmup: {ModelFile} on backend {Backend}: {Reason}",
+                    Path.GetFileName(modelPath), backend, warmupRefusal);
+                _log.LogDebug(LogEventIds.ModelLoadFailed, ex, "Kernel warmup refused: {ModelFile}", Path.GetFileName(modelPath));
+                Console.Error.WriteLine(ModelLoadRefusal.FormatErrorLine(warmupRefusal));
+                Environment.ExitCode = HostExitCodes.ModelLoadRefused;
+                return;
+            }
             warmupSw.Stop();
             _log.LogInformation(LogEventIds.HostConfiguration,
                 "Kernel warmup completed in {ElapsedMs:F1} ms", warmupSw.Elapsed.TotalMilliseconds);
@@ -2003,6 +2023,43 @@ namespace TensorSharp.Cli
             bool wantsVision = (imagePath != null || videoPath != null) && visionCapable;
             bool wantsAudio = (audioPath != null || videoPath != null) && audioCapable;
             return wantsVision || wantsAudio;
+        }
+
+        /// <summary>
+        /// The projector this run will load once the model is built: the named
+        /// <c>--mmproj</c>, or the companion file beside the model when an input needs
+        /// an encoder. Handed to <see cref="ModelBase.Create"/> so a model that places
+        /// its weights against device memory leaves room for the encoder. Null when no
+        /// projector will load, or when the companion cannot be determined up front
+        /// (the run still loads it afterwards; the placement just cannot price it).
+        /// </summary>
+        internal static string ExpectedProjectorPath(string modelPath, string mmProjPath, bool projectorDisabled,
+            string imagePath, string audioPath, string videoPath)
+        {
+            if (projectorDisabled)
+                return null;
+            // The companion is looked up for an image or a video (the vision tower is
+            // what a placement makes room for); an audio-only input loads one only on
+            // audio-capable families (WantsCompanionProjector), none of which plan
+            // device memory against it.
+            if (mmProjPath == null && imagePath == null && videoPath == null)
+                return null;
+            try
+            {
+                using var probe = GgufFile.OpenWithoutSiblingShards(modelPath);
+                string architecture = ModelArchitectureRegistry.Resolve(probe.GetString("general.architecture"), probe).Id;
+                // Resolved exactly as the load resolves it: --mmproj may name a directory.
+                return mmProjPath != null
+                    ? ModelArchitectureRegistry.ResolveProjectorPath(architecture, mmProjPath)
+                    : ModelArchitectureRegistry.FindCompanionProjector(architecture, modelPath);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidDataException
+                or InvalidOperationException or NotSupportedException or ArgumentException)
+            {
+                // The run still loads (or reports) the projector afterwards; the placement
+                // just cannot resolve it up front.
+                return mmProjPath != null && File.Exists(mmProjPath) ? mmProjPath : null;
+            }
         }
 
         /// <summary>

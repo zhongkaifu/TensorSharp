@@ -586,8 +586,10 @@ it and reads those parts from the SSD as tokens need them.
   the page cache after loading.
 - **The first layers' routed experts run on the host, from the same mapping.**
   `--n-cpu-moe N` / `--cpu-moe` choose them on the GGML GPU backends (measured on
-  `ggml_metal` and `ggml_cuda`). On `ggml_metal` with neither set, the engine plans the
-  split itself: it keeps whole layers' experts on the GPU while they fit both the Metal
+  `ggml_metal` and `ggml_cuda`). With neither set, `ggml_metal` and `ggml_cuda` plan the
+  split themselves; `ggml_cuda` plans per GPU, across a layer split too (see
+  [Expert placement on `ggml_cuda`](#expert-placement-on-ggml_cuda)). On `ggml_metal` the
+  engine keeps whole layers' experts on the GPU while they fit both the Metal
   working set and the RAM that the host layers need as page cache, and offloads the rest.
   On an M5 Pro with 48 GB (51.5 GB of RAM, a 40.2 GB Metal working set):
 
@@ -643,10 +645,11 @@ cache, so it depends on what else the Mac is doing: the same run decoded at
 10.3-11.3 tok/s while other work kept 5 GB compressed. TensorAgent offers this file on
 48 GB Macs ([measured in the app](../../TensorAgent/README.md#the-macs-own-models)).
 
-Single-device `ggml_cuda` also plans expert placement against current free VRAM,
-pending float weights and caches, driver headroom and a 3 GiB graph reserve.
-Explicit `--n-cpu-moe` / `--cpu-moe` settings override this plan. Tensor parallel
-and layer-split runs still require their explicit placement configuration.
+`ggml_cuda` also plans expert placement against each GPU's free VRAM, on one GPU and
+across a layer split (`--layer-split N`). Explicit `--n-cpu-moe` / `--cpu-moe` settings
+override the plan; tensor-parallel runs do not offload experts. See
+[Expert placement on `ggml_cuda`](#expert-placement-on-ggml_cuda) for how the plan is
+made, what it prints and what refuses a load.
 
 An optional CUDA selected-expert cache follows Strata's compact quantized-slot
 approach. It keeps only routed experts in persistent device buffers, preserves
@@ -757,9 +760,10 @@ Local evidence is in ignored `docs/validation/qwen38-strata-trained-audit/`,
 `qwen38-trained-transfer-ab-final/` and `strata-qwen38/`. Reusable runners and
 commands remain in `eng/validation/`.
 
-On CUDA, `--n-cpu-moe` serves the same purpose on a GPU too small for the file. On one
-A40 (46 GB) with 12 layers' experts on the host, `ggml_cuda` measured 600 / 30.2 tok/s
-(random tokens, pp512 / tg128) against llama-bench's 466.14 / 18.84 with `-ncmoe 12`.
+On CUDA, the same offload serves a GPU too small for the file: `ggml_cuda` plans it, and
+`--n-cpu-moe N` pins it. On one A40 (46 GB) with 12 layers' experts on the host,
+`ggml_cuda` measured 600 / 30.2 tok/s (random tokens, pp512 / tg128) against
+llama-bench's 466.14 / 18.84 with `-ncmoe 12`.
 
 The direct `cuda` engine runs UD-Q2_K_XL's IQ2_XS and IQ3_XXS experts: per-token kernels
 ported from ggml's dot products for decode, which still runs as a captured CUDA graph, and
@@ -788,6 +792,105 @@ while the driver compiled the PTX; the driver caches the result. On random token
 llama-bench's two-GPU run gave 210.74 / 41.99, far below its own server's numbers on the same
 machine, so the real-text table is the comparison to go by. There, TensorSharp prefills
 1.2-2.1x faster and decodes at 88-90% (`ggml_cuda`) and 95-96% (`cuda`) of llama.cpp's speed.
+
+### Expert placement on `ggml_cuda`
+
+With neither `--n-cpu-moe` nor `--cpu-moe` given, `ggml_cuda` decides which layers' routed
+experts run on the host, on one GPU and across a layer split (`--layer-split N`). Under
+`--tp N` nothing is offloaded. A layer split used to price every routed expert as
+GPU-resident, and nothing offloaded experts per GPU, so two 20 GB RTX 3080s were each asked
+for 27-38 GB and the load failed at kernel warmup.
+
+- **One GPU.** The plan starts from the free VRAM after the quantized dense weights are
+  uploaded and sets aside the float weights and caches still to bind, the driver headroom
+  (`TS_VRAM_HEADROOM_MB`; by default the larger of 512 MiB and 1/16 of the card) and
+  prefill-span scratch sized by the span width and the number of host-routed layers. It used
+  to reserve a flat 3 GiB, which a 4,096-token span with 40 host-routed layers exceeded,
+  pushing a 16 GB card into WDDM paging.
+- **A layer split.** Before anything uploads, the engine measures each GPU's free VRAM, less
+  the same headroom, and chooses the contiguous layer runs and the host-routed layers
+  together, so that as many layers as possible keep their experts on a GPU. Within each
+  GPU's run the leading layers route their experts to the host, where they are read on
+  demand from the GGUF mapping, and the trailing ones keep theirs on the GPU, the order
+  llama.cpp's `--n-cpu-moe` uses. After the dense weights are uploaded, each GPU is measured
+  again and its offload re-fitted. Startup prints the plan, for example:
+
+  ```
+  Layer split across 2 GPUs (sized to free VRAM): gpu0=layers 0-23 (10 with experts on the GPU, 14 on the host), ...
+  [moe-offload] qwen4exp (planned per GPU): routed experts of 28 of 48 layers run on the host from the GGUF mapping (...); gpu0 holds the experts of 10 of layers 0-23 (...), ...
+  ```
+
+  A layer split adds capacity, not speed: the GPUs run one after the other for every
+  token, and with experts on the host, decode speed depends on the host's RAM bandwidth for
+  the host-routed layers.
+
+Overrides, and what refuses a load (exit code 2):
+
+- `--n-cpu-moe N` / `--cpu-moe` (`TS_N_CPU_MOE` / `TS_CPU_MOE`) pin the host set, the first
+  N layers; `--n-cpu-moe 0` pins none. Under a layer split the runs are packed around that
+  set, a host-routed layer's experts no longer count against its GPU, and a placement that
+  cannot fit is refused with a message such as "Re-run with --n-cpu-moe N, or omit the
+  flag to let TensorSharp place the experts".
+- `TS_Q4E_LAYER_SPLIT=a,b` pins the runs (layers per GPU), and each GPU still offloads its
+  own leading layers. It is refused when a GPU cannot hold its run even with every expert
+  on the host.
+- When a split does not fit even with every expert on the host, the load is refused with
+  each GPU's need against its free memory. Lower `MAX_CONTEXT` or `TS_Q4E_PREFILL_CHUNK`,
+  free GPU memory, or add GPUs.
+
+**Prefill spans.** `TS_Q4E_PREFILL_CHUNK` (a token count, at least 128) is the widest
+prefill span qwen4exp runs on `ggml_cuda` without `--tp`; a longer prompt chunk runs as
+consecutive spans.
+The default is 4096 while every routed expert stays on the GPUs and 2048 once any layer is
+host-routed. Each host-routed layer streams its whole expert set onto the GPU once per span:
+a narrower span needs less scratch, which keeps more layers resident (faster decode), and a
+wider one amortizes the streaming (faster long-prompt prefill). Spans also narrow once the KV
+they read passes 16,384 rows, so a long context stays within the reserved scratch. Image and
+speculative-decoding forwards are split the same way: each span takes its rows of the image
+embeddings and position table, and writes its rows of the drafter's hidden states and logits.
+A value that is not a whole number of at least 128 stops the load with an error. When experts are offloaded, the `[moe-offload]` line names
+the width in use. A span boundary is a prefill-chunk boundary, so the prefill-shape caveat
+at the end of [Continuous batching](#continuous-batching) applies to it.
+
+**Context.** When the GPUs have no room left to grow the KV cache after the placement, the
+context is capped at load:
+`[moe-offload] qwen4exp: context capped at N tokens (was M): GPU d has no room to grow the KV cache further after this placement. ...`
+Setting `MAX_CONTEXT` allocates that window up front, and the plan reserves for it.
+
+**Vision projector.** A projector given with `--mmproj` (or, on the CLI, the companion found
+beside the model when `--image` or `--video` is given) is priced into the plan on
+GPU 0, which holds its tower as F32 weights plus about 512 MiB of scratch, so a multimodal run
+offloads correspondingly more experts instead of running GPU 0 out of memory later.
+
+**Warmup.** Warmup builds the widest span the plan allows, so a reserve that is too small
+fails before the first request rather than on it. If warmup runs out of GPU memory (another
+process took VRAM, or the driver needed more than planned) under an automatic placement, that
+GPU routes the experts of more of its layers to the host (a quarter of the layers it still
+holds, at least two) and warms up again, up to four times:
+`[moe-offload] qwen4exp: GPU d ran out of memory during warmup; routing the experts of layers a-b to the host as well ...`.
+When that cannot help (an explicit `--n-cpu-moe` / `--cpu-moe`, or every expert already on
+the host), the CLI and the server refuse the load with one line (exit code 2) instead of
+failing with a stack trace or serving a model that cannot answer. The line names the
+placement and what to change for it: a larger `TS_VRAM_HEADROOM_MB` (more free on every GPU,
+so more experts on the host), a larger `--n-cpu-moe`, or a lower `TS_Q4E_PREFILL_CHUNK` or
+`MAX_CONTEXT`.
+
+**Concurrent requests.** On a tight split each additional concurrent request needs its own KV
+and recurrent state on every GPU, about 0.5 GiB at a 16K context spread across the GPUs; a
+lone request reuses the state warmup placed. For several concurrent chats, lower
+`MAX_CONTEXT` or offload more layers.
+
+**Seam buffers.** A host-routed layer's MoE hand-off buffers are reused across layers for
+spans of 64 tokens or more, instead of being held for the whole pass. Measured on an RTX 3080
+Laptop (16 GB) with 40 host-routed layers: the span graph buffer (UD-IQ1_M,
+`MAX_CONTEXT=8192`, read with `TS_GGML_LOG_VRAM=1`) went from 2,164 to 572 MB at 2,048 tokens
+and from 4,705 to 1,561 MB at 4,096 tokens; the generated text was byte-identical; and a
+6,544-token prefill went from 116 s to 55 s because the card no longer paged. That is one
+card, not a throughput comparison.
+
+To exercise a layer split and its per-GPU offload on one card, upstream ggml-cuda's
+`GGML_CUDA_DEVICES=2` emulates two GPUs that each report half of its memory. It is emulation,
+not a performance measurement.
 
 ## Multi-GPU
 
@@ -827,10 +930,23 @@ buffers totaling the routed-expert bytes plus these overlapping rows, in additio
 these buffers remain alive while the model runs. Loading skips a full prefault
 of the sparse PLE table, whose rows are gathered on demand.
 
+**Fit.** Under `--tp N` every routed expert stays on the GPUs, split N ways, and every GPU
+also holds its own copy of the attention, recurrent and PLE weights, the head and the caches;
+experts cannot be offloaded in this mode. A checkpoint that cannot fit that way is refused at
+load, before the experts are sliced into host buffers, with each GPU's need and free memory
+(exit code 2). The 97 GB IQ4_XS checkpoint (three shards) carries about 61 GiB of routed experts, so on
+2x 20 GB GPUs each would need over 30 GiB: use `--layer-split 2` there, which keeps what fits
+on the GPUs and runs the rest of the experts from system RAM. Tensor parallelism with
+offloaded experts would not be faster on such a host anyway: replicating attention and caches
+on both GPUs leaves less room for experts than a layer split, and the host-resident experts set
+the decode speed either way.
+
 `--layer-split N` remains a separate option: each GPU holds a contiguous run of
 whole layers. It is available on `ggml_cuda`, `ggml_vulkan` and the direct `cuda`
-engine. Do not combine `--tp` and `--layer-split`; distributed
-`--tp-node-id`/`--tp-peers` groups are
+engine. On `ggml_cuda` the runs and the routed-expert offload are sized together against
+each GPU's free VRAM (see [Expert placement on `ggml_cuda`](#expert-placement-on-ggml_cuda));
+on `ggml_vulkan` the runs balance the weights' bytes. Do not combine `--tp` and
+`--layer-split`; distributed `--tp-node-id`/`--tp-peers` groups are
 unsupported. Older layer-split commands should use `--layer-split N` or
 `TENSORSHARP_LAYER_SPLIT_DEGREE=N`.
 
@@ -1000,12 +1116,16 @@ Measured on 2× A100-80GB, Qwen3.8-Flash-Next-UD-Q2_K_XL (73.4 GiB):
   2 GPUs `-sm layer` 1200 / 61.5 — so llama.cpp also gains ~10% prefill and
   ~0 decode from the second card.
 
-Startup prints which mode ran and the per-GPU layer/byte split.
-`TS_Q4E_LAYER_SPLIT=20,28` overrides the automatic balance with explicit layer
+Startup prints which mode ran and the per-GPU split: on `ggml_cuda` each GPU's layer
+run, how many of its layers keep their experts on the GPU, and the memory planned against
+what is free; on `ggml_vulkan` the per-GPU layer/byte split.
+`TS_Q4E_LAYER_SPLIT=20,28` overrides the automatic split with explicit layer
 counts per GPU (llama.cpp's `--tensor-split` in spirit) and throws rather than
-silently ignoring a value it cannot honour — useful because the automatic
-balance prices weights and cannot see the vision tower, which loads later and
-lands on GPU 0.
+silently ignoring a value it cannot honour. On `ggml_cuda` each GPU still offloads its
+own leading layers' experts, a run that a GPU cannot hold even with every expert on the
+host is refused, and the plan already prices a projector given with `--mmproj` on GPU 0.
+On `ggml_vulkan` the automatic balance prices weights only and cannot see the vision
+tower, which loads later and lands on GPU 0, so the override is how to leave room for it.
 
 ## Benchmark matrix
 

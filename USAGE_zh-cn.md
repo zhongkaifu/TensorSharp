@@ -309,7 +309,7 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --backend cu
 | `--backend <type>` | 计算后端：`cpu`、`cuda`、`mlx`、`ggml_cpu`、`ggml_metal`、`ggml_cuda` 或 `ggml_vulkan`（默认：`ggml_cpu`，在包括 macOS 在内的所有平台上都是如此） |
 | `--gpu-device <N>` | `ggml_vulkan` 后端使用的 Vulkan 设备索引，用于多 GPU 主机（例如同时装有 Intel 集成显卡和 NVIDIA 独立显卡的机器）。默认使用设备 0；可用 `--list-gpus` 查看索引。也可通过环境变量 `TS_GGML_VULKAN_DEVICE` 设置。 |
 | `--list-gpus` | 列出 ggml-vulkan 可见的 Vulkan 设备（索引 + 显卡名称）后退出 |
-| `--n-cpu-moe <N>` / `-ncmoe <N>` | 把前 N 层的路由 MoE 权重留在系统内存里并在 CPU 上做乘法；注意力、norm、路由器与始终活跃的共享专家仍留在加速器上（等价于 llama.cpp 的 `--n-cpu-moe`）。正是它让 35B-A3B 这类 MoE 能与长上下文 KV 缓存一起塞进 12–16 GB 的显卡。传 `all` 表示所有层。默认：所有架构（含 DeepSeek V4 与 GLM 5.x）都是 0 —— 装不下的模型会在加载时被拒绝并告知需要卸载多少层，而不会被悄悄卸载（环境变量 `TS_N_CPU_MOE`）。详见[混合专家 CPU 卸载](#混合专家-cpu-卸载--n-cpu-moe)。 |
+| `--n-cpu-moe <N>` / `-ncmoe <N>` | 把前 N 层的路由 MoE 权重留在系统内存里并在 CPU 上做乘法；注意力、norm、路由器与始终活跃的共享专家仍留在加速器上（等价于 llama.cpp 的 `--n-cpu-moe`）。正是它让 35B-A3B 这类 MoE 能与长上下文 KV 缓存一起塞进 12–16 GB 的显卡。传 `all` 表示所有层。默认：0（含 DeepSeek V4 与 GLM 5.x）—— 装不下的模型会在加载时被拒绝并告知需要卸载多少层，而不会被悄悄卸载（环境变量 `TS_N_CPU_MOE`）。例外是 `ggml_metal` 与 `ggml_cuda` 上的 Qwen 3.8 Flash Next（`qwen4exp`）：未设置时，专家放不下就由它自行规划卸载（在 `ggml_cuda` 上按每张 GPU 规划，`--layer-split N` 时也是如此）；显式给出的值（包括 `0`）会固定卸载的层，见[其模型卡片](docs/models/qwen38-flash-next_zh-cn.md#ggml_cuda-上的专家放置)。详见[混合专家 CPU 卸载](#混合专家-cpu-卸载--n-cpu-moe)。 |
 | `--cpu-moe` / `-cmoe` | `--n-cpu-moe all` 的简写。默认：关闭（环境变量 `TS_CPU_MOE`）。 |
 | `--cpu-moe-threads <N>` | 主机侧专家矩阵乘的工作线程数。默认：在核数多于 8 的主机上取本进程实际可用 CPU 并行度（`hardware_concurrency`，再受调度亲和性掩码与 cgroup CPU 配额约束）的**一半**，且**上限为 64**；3 到 8 个时取「全部减一」；2 个及以下取 1。DeepSeek V4 / V4.1 与 GLM-5.x 的原生 ggml 执行器在开启 `--n-cpu-moe` / `--cpu-moe` 后使用全部可用 CPU（GLM-5.x 在无 GPU 的运行中也是如此）。另一半并非浪费——加速器提交线程，以及 `TensorSharp.Server.Host` 里的 Kestrel 与调度器，同样需要可被调度，而 .NET 自己的线程池是按机器 CPU 数而不是 cgroup 配额来定的。把它设到接近配额是悬崖而不是缓坡：在 95 CPU 配额下，托管的 26B MoE 在 64 线程时实测 20.7 tok/s，71 线程时只剩 8.2。独占机器上可以调高（环境变量 `TS_CPU_MOE_THREADS`）。 |
 
@@ -323,7 +323,7 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --backend cu
 |---|---|
 | `--kv-cache-dtype <type>` | KV 缓存精度：`f32`、`f16`、`q8_0` 或 `q4_0`（默认：自动——由后端 / 模型决定；环境变量 `KV_CACHE_DTYPE`）。量化 / 半精度 KV 缓存以微小数值漂移换取内存节省；`q4_0`（约 0.56 字节/元素，约为 f32 的 1/7）是最激进的档位，面向 KV 缓存占主导内存的超长（128K–256K）上下文。块量化缓存（`q8_0`/`q4_0`）需要原生 GGML flash 路径；DeepSeek V4 / V4.1 会在加载时拒绝它们（其执行器的 cache 固定为 F16，由自己的内核读取），显式的 `f32` 会按 `f16` 报告。 |
 | `--tp <N>` | 张量并行度，仅切分层内权重；默认 `1`。需要架构与 GPU 后端支持。不能与 `--layer-split` 组合；不支持的请求在启动时失败。环境变量：`TENSORSHARP_TP_DEGREE`。 |
-| `--layer-split <N>` | 按层切分使用的本地 GPU 数；完整层放在不同设备。与 `--tp`、`--tp-node-id`、`--tp-peers` 互斥，仅限支持此模式的架构。环境变量：`TENSORSHARP_LAYER_SPLIT_DEGREE`。 |
+| `--layer-split <N>` | 按层切分使用的本地 GPU 数；完整层放在不同设备。与 `--tp`、`--tp-node-id`、`--tp-peers` 互斥，仅限支持此模式的架构。在 `ggml_cuda` 上，Qwen 3.8 Flash Next 会按每张 GPU 的空闲显存一并确定层段与路由专家卸载（[详情](docs/models/qwen38-flash-next_zh-cn.md#ggml_cuda-上的专家放置)）。环境变量：`TENSORSHARP_LAYER_SPLIT_DEGREE`。 |
 | `--tp-node-id <N>` | 多节点分布式张量并行中本节点的 0 起始编号。必须与 `--tp-peers` 一起使用。 |
 | `--tp-peers <list>` | 集群中所有节点的 `host:port` 列表（逗号分隔，例如 `192.168.1.10:9500,192.168.1.11:9500`）。所有节点必须使用完全相同的列表。必须与 `--tp-node-id` 一起使用。 |
 | `--interactive` / `-i` / `--chat` | 进入交互式 REPL 聊天会话（逐轮输入/输出），支持 KV 缓存复用、斜杠命令、运行时热切换 模型/后端/投影器、文件附件（图像、音频、视频、文本）以及实时调整采样参数。完整命令列表见下文「**交互式 REPL 命令**」一节 |
@@ -641,12 +641,12 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --config config/s
 | `--urls <urls>` | 完整监听 URL（分号分隔），用于 `--port`/`--host` 表达不了的情形（HTTPS、同时绑定多个端点）。两者都给时以 `--port`/`--host` 为准；三者都不给时依次回退到 `PORT`/`HOST` 与 `ASPNETCORE_URLS`。 |
 | `--backend <type>` | 默认计算后端（macOS 上默认 `ggml_metal`，其他平台默认 `ggml_cpu`；省略且本机具备平台默认后端时不打印任何警告；平台默认后端缺失时，启动会警告 `The platform default backend 'X' is unavailable on this machine (available: …). Using 'Y' instead`；显式指定本机没有的后端会拒绝启动模型的加载（退出码 2），不带模型的服务端则警告并回退到可用后端）：`cpu`、`cuda`、`mlx`、`ggml_cpu`、`ggml_metal`、`ggml_cuda` 或 `ggml_vulkan` |
 | `--tp <N>` | 张量并行度，仅切分层内权重；默认 `1`。需要架构与 GPU 后端支持。不能与 `--layer-split` 组合；不支持的请求在启动时失败。环境变量：`TENSORSHARP_TP_DEGREE`。 |
-| `--layer-split <N>` | 按层切分使用的本地 GPU 数；完整层放在不同设备。与 `--tp`、`--tp-node-id`、`--tp-peers` 互斥，仅限支持此模式的架构。环境变量：`TENSORSHARP_LAYER_SPLIT_DEGREE`。 |
+| `--layer-split <N>` | 按层切分使用的本地 GPU 数；完整层放在不同设备。与 `--tp`、`--tp-node-id`、`--tp-peers` 互斥，仅限支持此模式的架构。在 `ggml_cuda` 上，Qwen 3.8 Flash Next 会按每张 GPU 的空闲显存一并确定层段与路由专家卸载（[详情](docs/models/qwen38-flash-next_zh-cn.md#ggml_cuda-上的专家放置)）。环境变量：`TENSORSHARP_LAYER_SPLIT_DEGREE`。 |
 | `--tp-node-id <N>` | 多节点（分布式）张量并行中本节点的 0 起始编号。服务端只能是节点 `0`（对外提供 HTTP 的 driver）；其余节点请用 `TensorSharp.Cli` 启动。必须与 `--tp-peers` 一起使用。环境变量：`TENSORSHARP_TP_NODE_ID`。 |
 | `--tp-peers <list>` | 分布式 TP 集群中所有节点的 `host:port` 列表（逗号分隔，按节点 ID 排序，例如 `192.168.1.10:9500,192.168.1.11:9500`）。必须与 `--tp-node-id` 一起使用。环境变量：`TENSORSHARP_TP_PEERS`。 |
 | `--gpu-device <N>` | `ggml_vulkan` 后端使用的 Vulkan 设备索引，用于多 GPU 主机（例如同时装有 Intel 集成显卡和 NVIDIA 独立显卡的机器）。默认使用设备 0；可用 `--list-gpus` 查看索引。也可通过环境变量 `TS_GGML_VULKAN_DEVICE` 设置。 |
 | `--list-gpus` | 列出 ggml-vulkan 可见的 Vulkan 设备（索引 + 显卡名称）后退出 |
-| `--n-cpu-moe <N>` / `-ncmoe <N>` | 把前 N 层的路由 MoE 权重留在系统内存里、在 CPU 上运行其 FFN（见上文**混合专家 CPU 卸载**）。`all` 表示卸载所有层。默认：所有架构（含 DeepSeek V4 与 GLM 5.x）都是 0；装不下的模型会在加载时被拒绝并告知需要卸载多少层。环境变量：`TS_N_CPU_MOE`。 |
+| `--n-cpu-moe <N>` / `-ncmoe <N>` | 把前 N 层的路由 MoE 权重留在系统内存里、在 CPU 上运行其 FFN（见上文**混合专家 CPU 卸载**）。`all` 表示卸载所有层。默认：0（含 DeepSeek V4 与 GLM 5.x）；装不下的模型会在加载时被拒绝并告知需要卸载多少层。例外是 `ggml_metal` 与 `ggml_cuda` 上的 Qwen 3.8 Flash Next（`qwen4exp`）：未设置时，专家放不下就由它自行规划卸载（在 `ggml_cuda` 上按每张 GPU 规划，`--layer-split N` 时也是如此）；显式给出的值（包括 `0`）会固定卸载的层。环境变量：`TS_N_CPU_MOE`。 |
 | `--cpu-moe` / `-cmoe` | `--n-cpu-moe all` 的简写。默认：关闭。环境变量：`TS_CPU_MOE`。 |
 | `--cpu-moe-threads <N>` | 主机侧专家矩阵乘的工作线程数。默认：在核数多于 8 的主机上取可用 CPU 并行度（`hardware_concurrency`，再受亲和性掩码与 cgroup CPU 配额约束）的一半，且上限为 64；3 到 8 个时取「全部减一」；2 个及以下取 1（DeepSeek V4 / V4.1 与 GLM-5.x 的原生执行器在卸载专家后使用全部可用 CPU，GLM-5.x 在无 GPU 的运行中也是如此）。服务端还需要另一半来跑 Kestrel、调度器与加速器提交线程；把它设到接近配额会让吞吐直接崩塌而不是缓慢下降（95 CPU 配额下 64 线程 20.7 tok/s，71 线程只剩 8.2）。环境变量：`TS_CPU_MOE_THREADS`。 |
 | `--help` | 打印参数说明后退出（不带任何参数启动服务时也会显示） |
@@ -789,7 +789,7 @@ Agent Skills。凡是会渲染工具声明且有工具解析器的模型族都�
 |---|---|
 | `BACKEND` | 未传 `--backend` 时使用的默认计算后端（`cpu`、`cuda`、`mlx`、`ggml_cpu`、`ggml_metal`、`ggml_cuda` 或 `ggml_vulkan`；默认：macOS 为 `ggml_metal`，其他平台为 `ggml_cpu`） |
 | `MAX_TOKENS` | 未传 `--max-tokens` 时的最大生成长度：请求未携带上限时用它填充，请求要求更多时按它截断（默认：`20000`，该默认值只填充、不截断） |
-| `MAX_CONTEXT` | 要分配的上下文窗口，覆盖 GGUF 自报的长度。设了它就是**硬上限**：缓存加一整个 `n_ubatch` 的计算图装得下就照办，装不下就带着具体数字拒绝加载。不设时，自报长度只是**上界**——权重加载完之后运行时会去问各设备实际还剩多少显存，按能装下的大小定上下文，并把选中的值打印出来。GLM-5.2 自报 1,048,576 token（约 93 GiB 的 KV）；在 3x RTX PRO 6000 上按层切分选到 342,272，`--tp 3` 选到 91,136，`--n-cpu-moe 30` 选到 646,400 |
+| `MAX_CONTEXT` | 要分配的上下文窗口，覆盖 GGUF 自报的长度。设了它就是**硬上限**：缓存加一整个 `n_ubatch` 的计算图装得下就照办，装不下就带着具体数字拒绝加载。不设时，自报长度只是**上界**——权重加载完之后运行时会去问各设备实际还剩多少显存，按能装下的大小定上下文，并把选中的值打印出来。GLM-5.2 自报 1,048,576 token（约 93 GiB 的 KV）；在 3x RTX PRO 6000 上按层切分选到 342,272，`--tp 3` 选到 91,136，`--n-cpu-moe 30` 选到 646,400。`ggml_cuda` 上的 Qwen 3.8 Flash Next 在放置专家之后，若各 GPU 已没有空间让 KV 缓存继续增长，也会缩小窗口（`[moe-offload] qwen4exp: context capped at N tokens (was M)`）；设置 `MAX_CONTEXT` 可预先分配整个窗口，放置规划会为它预留空间 |
 | `VIDEO_SAMPLE_FPS` | 输入视频作为多模态提示词时每秒抽取的帧数；基于时间的抽帧（默认：`1`）。它与视频生成的输出参数 `--fps` 无关 |
 | `VIDEO_MAX_FRAMES` | 输入视频作为多模态提示词时抽取帧数的可选上限（超出时均匀降采样）；未设置或为 `0` 表示不限制（默认：不限制）。它与视频生成的输出参数 `--video-frames` 无关 |
 | `PORT` / `HOST` | 未传 `--port` / `--host` 时的监听端口与绑定网卡（默认：`5000`、`0.0.0.0`） |
@@ -815,7 +815,8 @@ Agent Skills。凡是会渲染工具声明且有工具解析器的模型族都�
 | `TENSORSHARP_LAYER_SPLIT_DEGREE` | 本地按层切分的 GPU 数，等价于 `--layer-split N`，与 TP 及分布式 TP 参数互斥。 |
 | `TENSORSHARP_LAYER_SPLIT_DEVICES` | Qwen 3.8 Flash Next 的共享 GGML 按层执行器的设备序号，逗号分隔，例如 `0,2`；与 `TENSORSHARP_TP_DEVICES` 独立。原生 GLM/DeepSeek 执行器请使用 `CUDA_VISIBLE_DEVICES`。 |
 | `TENSORSHARP_TP_DEVICES` | 各 rank 使用的 GPU 序号（逗号分隔，例如 `0,2`；默认 `0..tp-1`）。用于 GGML 后端上的 TP。 |
-| `TS_Q4E_LAYER_SPLIT` | Qwen 3.8 Flash Next（`qwen4exp`）多卡按层切分时每张 GPU 分到的层数（逗号分隔，例如 `20,28`），用于取代自动的显存均衡。给出无法满足的值时会直接抛错，而不是静默忽略。 |
+| `TS_Q4E_LAYER_SPLIT` | Qwen 3.8 Flash Next（`qwen4exp`）多卡按层切分时每张 GPU 分到的层数（逗号分隔，例如 `20,28`），用于取代自动划分。在 `ggml_cuda` 上，每张 GPU 仍会卸载自己靠前那些层的专家；某张 GPU 即使把全部专家放到主机也放不下它的层段时会拒绝加载。给出无法满足的值时会直接抛错，而不是静默忽略。 |
+| `TS_Q4E_PREFILL_CHUNK` | Qwen 3.8 Flash Next（`qwen4exp`）在不使用 `--tp` 的 `ggml_cuda` 上运行的最宽 prefill span（token 数，至少 `128`）；更长的提示词分块按连续的多个 span 运行。默认：所有路由专家都留在 GPU 上时为 `4096`，只要有一层的专家在主机上运行就为 `2048`（span 越窄所需工作区越小，能把专家留在 GPU 上的层就越多；span 越宽，长 prefill 中每个 span 的专家流式传输开销就分摊得越开）。span 所读取的 KV 超过 16,384 行后，span 还会自动变窄。 |
 | `TENSORSHARP_TP_NODE_ID` | 多节点分布式张量并行中本节点的 0 起始编号。必须与 `TENSORSHARP_TP_PEERS` 一起设置。 |
 | `TENSORSHARP_TP_PEERS` | 分布式 TP 集群中所有节点的 `host:port` 列表（逗号分隔，例如 `192.168.1.10:9500,192.168.1.11:9500`）。必须与 `TENSORSHARP_TP_NODE_ID` 一起设置。 |
 | `TENSORSHARP_TP_CONNECT_TIMEOUT_SECONDS` | 各节点向 peer 发起连接的重试窗口（默认：`120` 秒）。若节点由人工或较慢的编排系统间隔较久启动，可调大该值。 |
@@ -1596,7 +1597,7 @@ token）——注意卸载配置离这张卡的 16 GB 有多远，以及 GPT-OSS
   prefill 2048 / decode 64 上实测：`--n-cpu-moe 30` 为 94.7 / 16.4 tok/s，全部常驻
   时为 915.9 / 43.9。这里卸载买到的是「装得下」而不是速度——它腾出的显存把可用
   上下文从 342,272 抬到了 646,400 token。
-* **Qwen 3.8 Flash Next 在 Apple 芯片上自行规划卸载。** 它的 UD-Q2_K_XL 文件有
+* **Qwen 3.8 Flash Next 在 Apple 芯片与 `ggml_cuda` 上自行规划卸载。** 它的 UD-Q2_K_XL 文件有
   78.9 GB：46.1 GB 路由专家，外加 28.8 GB 的 n-gram 表。未设置时，`ggml_metal` 会在
   同时满足 Metal 工作集与被卸载层页缓存所需内存的前提下，把整层专家留在 GPU 上，卸载
   最前面的若干层，并打印计划（`[moe-offload] qwen4exp (planned): ...`）；
@@ -1609,6 +1610,11 @@ token）——注意卸载配置离这张卡的 16 GB 有多远，以及 GPT-OSS
   真实文本（1,818 token 提示词、贪心生成 256 个 token）上 prefill 109.4-115.5 tok/s、
   decode 12.8-12.9 tok/s，llama-server 为 20.4-22.4 与 13.00-13.24（加 `--no-op-offload`
   时为 28.8-31.6 与 11.94-12.48）。详见[模型卡片](docs/models/qwen38-flash-next_zh-cn.md#超出内存运行)。
+  `ggml_cuda` 按每张 GPU 的空闲显存规划，单卡与 `--layer-split N` 都适用：按层切分会同时选定层段与
+  主机路由层，每张 GPU 层段内靠前那些层的专家放到主机上。显式的 `--n-cpu-moe N` / `--cpu-moe` 会固定
+  主机层集合，切分放不下时拒绝加载（退出码 2）。`ggml_cuda` 上的 prefill 以不超过
+  `TS_Q4E_PREFILL_CHUNK` 个 token 的 span 运行（专家全部在 GPU 上时为 4096，只要有一层的专家在主机上
+  就为 2048）。见 [`ggml_cuda` 上的专家放置](docs/models/qwen38-flash-next_zh-cn.md#ggml_cuda-上的专家放置)。
 * **单 token 的主机专家走 TensorSharp 自己的内核。** 用的仍是 ggml 的 CPU 点积，但
   线程组每层只唤醒一次、算完即休眠，而不是每次调用都要唤醒工作线程的 ggml 图。忙等的
   线程组在主机侧更快，却让层间的 GPU 段在 Apple 芯片上慢了 1.5-2 倍，所以线程组改为
@@ -1646,6 +1652,9 @@ CLI 与服务端使用不同参数明确选择运行模式：
 
 Qwen 3.8 Flash Next（`qwen4exp`）在 `ggml_cuda`、`ggml_vulkan` 与 direct `cuda` 上
 支持整层放置，并在合格的 `ggml_cuda` 设备和量化上支持本地 FFN 张量并行。
+在 `ggml_cuda` 上，它的按层切分会与路由专家卸载一起按每张 GPU 的空闲显存确定：某张 GPU 放不下其各层的
+专家时，会把靠前那些层的专家路由到主机，切分因此仍能加载，此时 decode 还取决于主机内存为这些层提供的
+带宽（见[混合专家 CPU 卸载](#混合专家-cpu-卸载--n-cpu-moe)）。
 UD-Q2_K_XL 只能按层切分；TP 的验证范围见[支持的架构](#支持的架构)。
 DeepSeek V4 / V4.1 与 GLM 5.x 同样通过 `--layer-split N` 指定本地卡数。未配置两种模式时
 默认单设备。GLM 5.x 还支持 GGML GPU 后端上的
@@ -1666,8 +1675,8 @@ TensorSharp.Server.Host/bin/TensorSharp.Server.Host --model qwen38-flash-next.gg
 
 历史上的 2× A100-80GB、Qwen3.8-Flash-Next-UD-Q2_K_XL 实测显示：单卡和双卡贪心输出逐字节相同，
 prefill 约 1520–1550 t/s，decode 约 56 t/s。这验证了该检查点的容量与正确性，不代表普遍提速。
-`TS_Q4E_LAYER_SPLIT=20,28` 可覆盖自动放置、指定每卡层数；它不负责选择运行模式，也不替代
-`--layer-split`。
+`TS_Q4E_LAYER_SPLIT=20,28` 可覆盖自动放置、指定每卡层数（在 `ggml_cuda` 上，每张 GPU 仍各自规划
+专家卸载）；它不负责选择运行模式，也不替代 `--layer-split`。
 
 ### 本地张量并行（单进程，多 GPU）
 
@@ -1794,7 +1803,9 @@ tg64 17.6，而按层切分是 915.9 / 43.9——78 层里每一层都要对 `[6
 只在带 NVLink 的机器上、或者模型没有别的办法装下时才用它。
 
 在支持此组合的架构上，TP 可以与 MoE CPU 卸载组合：`--tp N --n-cpu-moe M` 保留多 rank 融合图，并把被卸载层的专家字节
-从每个 rank 的显存中去掉。组合后的实测数据见[混合专家 CPU 卸载](#混合专家-cpu-卸载--n-cpu-moe)。Qwen 3.8 Flash Next 在 TP 下拒绝专家卸载。
+从每个 rank 的显存中去掉。组合后的实测数据见[混合专家 CPU 卸载](#混合专家-cpu-卸载--n-cpu-moe)。Qwen 3.8 Flash Next 在 TP 下拒绝专家卸载：所有路由专家都留在 GPU 上并平均切分，同时每张 GPU 还各自持有
+其余权重与缓存的完整副本。无法这样放下的检查点会在加载时、切分专家之前被拒绝，列出每张 GPU 所需与空闲的
+显存，并建议改用 `--layer-split N`——它会把放不下的专家放到系统内存中运行。
 
 | 变量 | 作用 |
 |---|---|
@@ -1802,12 +1813,13 @@ tg64 17.6，而按层切分是 915.9 / 43.9——78 层里每一层都要对 `[6
 | `TS_GGML_TP_PARALLEL=0` | 顺序而非并发地驱动各 rank（诊断用） |
 | `TS_GGML_TP_FUSED_MATMUL=1` | 由单个线程提交两个 rank 的线性层（默认关闭；它每次调用都要为每个 rank 分配设备缓冲，在 Qwen 3.5 35B 上实测慢 2.3×） |
 | `TS_GGML_TP_DEVICE_AR_THRESHOLD` | 超过该元素数量时 AllReduce 走设备集合通信（默认 262144） |
-| `TS_Q4E_LAYER_SPLIT=20,28` | 仅 Qwen 3.8 Flash Next：用显式的每卡层数取代按层切分的自动显存均衡。给出无法满足的值时直接抛错而不是静默忽略——这个开关有用，是因为自动均衡只按权重定价，看不到后加载、会落在 GPU 0 上的视觉塔 |
+| `TS_Q4E_LAYER_SPLIT=20,28` | 仅 Qwen 3.8 Flash Next：用显式的每卡层数取代按层切分的自动划分。给出无法满足的值时直接抛错而不是静默忽略。在 `ggml_cuda` 上，自动划分会与专家卸载一起按每张 GPU 的空闲显存确定，并已把 `--mmproj` 投影器计入 GPU 0；使用覆盖值时，每张 GPU 仍会卸载自己靠前那些层的专家。在 `ggml_vulkan` 上，自动均衡只按权重定价，看不到后加载、会落在 GPU 0 上的视觉塔 |
 | `TS_GGML_F32_RESIDENT=0` | 每次调用重新绑定 F32 线性层权重，而不是常驻设备（诊断用） |
 | `TS_GEMMA4_TP_FUSED_MOE=0` | 仅 Gemma 4：从融合的整模 MoE 主干（专家内部 Megatron 切分）回退到逐算子的整专家路径。融合路径在 26B 上加载时会物化约 10.5 GB 的专家分片（约 36 秒），换来约 10× 的 decode。被 `--n-cpu-moe` 卸载的层不参与这次物化——它们从不在加速器上运行——因此 `--cpu-moe` 也会去掉这笔加载开销 |
 | `GGML_CUDA_AR_BF16_THRESHOLD` | ggml-cuda 集合通信在多大载荷以上把 F32 转成 BF16 再归约。TensorSharp 把 ggml 的默认值（1 字节，即总是转换）提高到 1 MB，使 decode 规模的集合通信精确归约；设为 `0` 则完全禁用转换 |
 | `TS_QWEN35_LAYER_TRACE=1` | 打印首次前向的逐层残差流摘要，单卡与 TP 两条路径都会输出（诊断用） |
-| `GGML_CUDA_ALLREDUCE` | `nccl` / `internal` / `none`，直接透传给 ggml |
+| `GGML_CUDA_ALLREDUCE` | `nccl` / `internal` / `none`，直接透传给 ggml。未设置时 Linux 使用 NCCL，其他平台（Windows）使用钉页主机内存的 `internal` 管线，该管线只支持正好 2 张 GPU |
+| `TS_GGML_TP_WDDM_FLUSH=0` | 仅 Windows：停止在每次 AllReduce 之后提交各 GPU 已排队的 launch（诊断用；见下文） |
 
 ### 约束
 
@@ -1817,6 +1829,15 @@ tg64 17.6，而按层切分是 915.9 / 43.9——78 层里每一层都要对 `[6
 - **Muse-Glimmer** 最多 `--tp 2`：它只有 2 个 KV head，而这里没有任何模型会在 `numKVHeads < tp` 时复制 KV head。TP 下 DFlash 草稿器会被拒绝挂载（CLI 打印警告并按普通解码运行；服务端拒绝启动，退出码 2），KV 块页面在 TP 下同样可用（快照会遍历每层的按 rank 缓存），并且需要 GGML CUDA/Vulkan 后端——融合的按 rank 计划需要一个 ggml-metal 不提供的设备集合通信。
 
 ### 集群调优与诊断
+
+Windows 上没有 NCCL，两张 GPU 通过 ggml 的钉页主机内存 `internal` 管线归约，其 kernel 在 GPU 内部会合：
+各自在钉页主机内存中写入一个令牌，然后自旋等待读到对方的令牌。WDDM（Windows 驱动模型）会把 kernel launch
+暂存在每个设备的软件队列中，而后半段从未提交的会合永远不会完成。这就是 issue #256 中 `--tp 2` 的启动卡死
+（Windows 10 上的 2× RTX 3080，停在 `[TP] GGML tensor parallelism: 2 device(s), AllReduce=device` 之后，
+CPU 与 GPU 都空闲）。TensorSharp 现在会在自己发起的每次 AllReduce 之后提交两张 GPU 的队列；启动时用 3 秒后
+自行放弃的 kernel 检查这种会合（两张 GPU 无法会合时回退到主机归约并打印说明）；并用 `TS_GGML_TP_AR_PROBE_MS`
+（10 秒）约束第一次集合通信：始终未完成时拒绝加载（退出码 2），并给出 `GGML_CUDA_ALLREDUCE=none` 与
+`--layer-split N` 两种办法，而不是卡住。
 
 本地 AllReduce 优先使用 CUDA 点对点（P2P）DMA。启动时，并行组会为每一对报告支持
 P2P 的设备启用 peer access，随后做一次往返自检：部分拓扑（挂在某些 PCIe 交换机
@@ -1992,7 +2013,8 @@ CLI 的普通生成使用共享调度器，其报告的 prefill 时间是首 tok
 |---|---|---|---|
 | 本地张量并行（单进程，多 GPU） | 关闭（`1` 张 GPU） | **`TENSORSHARP_TP_DEGREE=N`** | `--tp N`（CLI 与服务端） |
 | TP 各 rank 使用的 GPU 序号（GGML 后端） | `0..tp-1` | `TENSORSHARP_TP_DEVICES=0,2` | — |
-| `qwen4exp` 按层切分（`--layer-split N`）每张卡的显式层数 | 自动显存均衡 | `TS_Q4E_LAYER_SPLIT=20,28` | — |
+| `qwen4exp` 按层切分（`--layer-split N`）每张卡的显式层数 | 自动：`ggml_cuda` 上与专家卸载一起按每张 GPU 的空闲显存确定；`ggml_vulkan` 上按字节均衡 | `TS_Q4E_LAYER_SPLIT=20,28` | — |
+| `ggml_cuda` 上 `qwen4exp` 的最宽 prefill span（更长的提示词分块按连续的多个 span 运行） | `4096`；只要有一层的专家在主机上运行就为 `2048` | `TS_Q4E_PREFILL_CHUNK=N`（至少 `128`） | — |
 | 分布式 TP 节点编号（多节点） | 未设置（关闭） | **`TENSORSHARP_TP_NODE_ID=N`** | `--tp-node-id N`（CLI 与服务端；服务端必须是节点 `0`） |
 | 分布式 TP peer 端点 | 未设置（关闭） | **`TENSORSHARP_TP_PEERS=host1:port1,host2:port2`** | `--tp-peers host1:port1,host2:port2`（CLI 与服务端） |
 | peer 连接重试窗口（多节点） | `120` 秒 | `TENSORSHARP_TP_CONNECT_TIMEOUT_SECONDS=N` | — |
@@ -2206,8 +2228,11 @@ KV 缓存类型（例如 DeepSeek V4.1 上的 `KV_CACHE_DTYPE=q8_0`）、模型�
 组建的分布式 `--tp-node-id` / `--tp-peers` 组，或者显式指定却无法启用的 `--draft-model`（例如服务端上
 `--tp N` > 1 时的 DFlash / DFlash2 草稿器）。原生加载器自己的诊断行（`[dsv4] ...`、`[glm] ...`）仍可能出现在错误行之前；
 错误行会重复原因，单独读也能看懂。加载过程中其他任何失败——`NullReferenceException`、CUDA 错误、
-内存不足导致的中止——都不算拒绝，会保留堆栈信息。唯一的例外：DeepSeek V4/V4.1 与 GLM 的原生整模型加载器
-放弃的每一次加载都按拒绝报告，包括在设备上分配权重或缓存失败，原因即它们的 `[dsv4]`/`[glm]` 那一行。
+内存不足导致的中止——都不算拒绝，会保留堆栈信息。有两个例外：DeepSeek V4/V4.1 与 GLM 的原生整模型加载器
+放弃的每一次加载都按拒绝报告，包括在设备上分配权重或缓存失败，原因即它们的 `[dsv4]`/`[glm]` 那一行；
+`ggml_cuda` 上的 Qwen 3.8 Flash Next 在 kernel 预热时显存不足、且把该 GPU 更多的专家移到主机并重新预热
+也无济于事时，同样按拒绝报告，并写明应调整什么（`TS_VRAM_HEADROOM_MB`、`--n-cpu-moe`、
+`TS_Q4E_PREFILL_CHUNK`、`MAX_CONTEXT`）。
 
 以 `2` 退出之前，服务端会先释放被拒绝的加载留下的资源（模型服务与 ggml 后端），并且不会打开端口。
 拒绝的堆栈本来就是噪音，所以只在 Debug 级别记录：`TENSORSHARP_LOG_LEVEL=Debug`（两个宿主都适用）

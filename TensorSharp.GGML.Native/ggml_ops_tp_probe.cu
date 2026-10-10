@@ -1166,4 +1166,293 @@ void tp_cuda_f32_gather_free(TpF32Gather * handle)
     delete handle;
 }
 
+// ---------------------------------------------------------------------------
+// ggml's internal two-GPU AllReduce on hosts without NCCL (every Windows host).
+//
+// That pipeline synchronizes the two GPUs INSIDE a kernel: each GPU publishes
+// an arrival token in mapped pinned host memory and spins until it reads the
+// other GPU's token. Nothing in the CUDA programming model promises that the
+// two kernels make progress together, and on WDDM (the Windows driver model)
+// a launch can sit in the driver's per-device software queue until something
+// flushes that queue. The pipeline launches on GPU 0, then GPU 1, and the
+// caller then synchronizes GPU 0: GPU 0's kernel is submitted and spins while
+// GPU 1's can wait, unsubmitted, behind a synchronize that never returns. The
+// spin sleeps between reads, so CPU and GPU both look idle - the hang reported
+// in issue #256 when --layer-split 2 was replaced by --tp 2 on 2x RTX 3080
+// under Windows 10.
+//
+// Two defences, both TensorSharp-side (ggml stays unmodified):
+//   * tp_cuda_flush_backends(): after every AllReduce TensorSharp issues,
+//     flush each rank's queue (cudaStreamQuery submits pending work without
+//     waiting), so both halves of the rendezvous are on their GPUs before any
+//     thread blocks.
+//   * tp_probe_cuda_host_signal(): before the communicator exists, run the
+//     same rendezvous with TensorSharp's own kernels - which give up on their
+//     own after a deadline - and fall back to the host reduction when the two
+//     GPUs cannot see each other's signal at all.
+// ---------------------------------------------------------------------------
+
+namespace
+{
+    // Mapped pinned layout, in ints: one 64-byte line per value per rank.
+    constexpr int k_signal_line_ints = 16;
+    constexpr int k_signal_arrival = 0;                         // + rank line
+    constexpr int k_signal_payload = 2 * k_signal_line_ints;    // + rank line
+    constexpr int k_signal_verdict = 4 * k_signal_line_ints;    // + rank line
+    constexpr int k_signal_ints = 6 * k_signal_line_ints;
+
+    // Kernel verdicts written back to host memory.
+    constexpr int k_signal_ok = 1;
+    constexpr int k_signal_timeout = 2;
+    constexpr int k_signal_bad_payload = 3;
+    constexpr int k_signal_unsupported = 4;
+
+    __global__ void tp_host_signal_probe_kernel(int* base, int rank, int token, long long timeout_ns)
+    {
+        if (threadIdx.x != 0 || blockIdx.x != 0)
+            return;
+        volatile int* verdict = base + k_signal_verdict + rank * k_signal_line_ints;
+#if __CUDA_ARCH__ >= 700
+        volatile int* arrival_mine = base + k_signal_arrival + rank * k_signal_line_ints;
+        volatile int* arrival_peer = base + k_signal_arrival + (1 - rank) * k_signal_line_ints;
+        volatile int* payload_mine = base + k_signal_payload + rank * k_signal_line_ints;
+        volatile int* payload_peer = base + k_signal_payload + (1 - rank) * k_signal_line_ints;
+        // Same ordering as ggml's chunked AllReduce kernel: data, fence, token.
+        *payload_mine = token * 2 + rank;
+        __threadfence_system();
+        *arrival_mine = token;
+        __threadfence_system();
+
+        unsigned long long start, now;
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(start));
+        int result = k_signal_timeout;
+        for (;;)
+        {
+            if (*arrival_peer == token)
+            {
+                __threadfence_system();
+                result = *payload_peer == token * 2 + (1 - rank) ? k_signal_ok : k_signal_bad_payload;
+                break;
+            }
+            asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(now));
+            if (static_cast<long long>(now - start) > timeout_ns)
+                break;
+            __nanosleep(200);
+        }
+        *verdict = result;
+        __threadfence_system();
+#else
+        (void)token;
+        (void)timeout_ns;
+        *verdict = k_signal_unsupported;
+#endif
+    }
+
+    // Restores the calling thread's CUDA device on scope exit.
+    struct CudaDeviceRestore
+    {
+        int device = -1;
+        CudaDeviceRestore() { if (cudaGetDevice(&device) != cudaSuccess) device = -1; }
+        ~CudaDeviceRestore() { if (device >= 0) cudaSetDevice(device); }
+    };
+}
+
+int tp_probe_cuda_host_signal(const int* device_indices, int count)
+{
+    if (device_indices == nullptr || count != 2)
+        return -1;
+    const char* mode = std::getenv("TS_GGML_TP_AR_PROBE");
+    if (mode != nullptr && std::strcmp(mode, "0") == 0)
+        return -1;
+    const int device_count = ggml_cuda_info().device_count;
+    for (int r = 0; r < count; ++r)
+    {
+        // ggml's pipeline declines devices below Volta on its own.
+        if (device_indices[r] < 0 || device_indices[r] >= device_count
+            || ggml_cuda_info().devices[device_indices[r]].cc < GGML_CUDA_CC_VOLTA)
+            return -1;
+    }
+
+    // The kernels give up after kernel_ms; the host waits that long plus time for
+    // a launch to be scheduled at all. A healthy pair meets in microseconds.
+    constexpr int kernel_ms = 3000;
+    constexpr int host_grace_ms = 5000;
+    constexpr int token = 1;
+
+    CudaDeviceRestore restore;
+    // Allocated the way ggml's pipeline allocates its arrival ring: portable,
+    // mapped, one device pointer shared by both GPUs.
+    ggml_cuda_set_device(device_indices[count - 1]);
+    int* host = nullptr;
+    int* mapped = nullptr;
+    if (cudaHostAlloc(reinterpret_cast<void**>(&host), k_signal_ints * sizeof(int),
+            cudaHostAllocPortable | cudaHostAllocMapped) != cudaSuccess)
+    {
+        (void)cudaGetLastError();
+        return -1;
+    }
+    std::memset(host, 0, k_signal_ints * sizeof(int));
+    if (cudaHostGetDevicePointer(reinterpret_cast<void**>(&mapped), host, 0) != cudaSuccess)
+    {
+        (void)cudaGetLastError();
+        cudaFreeHost(host);
+        return -1;
+    }
+
+    cudaStream_t streams[2] = {};
+    bool launched[2] = {};
+    for (int r = 0; r < count; ++r)
+    {
+        ggml_cuda_set_device(device_indices[r]);
+        if (cudaStreamCreateWithFlags(&streams[r], cudaStreamNonBlocking) != cudaSuccess)
+            break;
+        tp_host_signal_probe_kernel<<<1, 32, 0, streams[r]>>>(mapped, r, token,
+            static_cast<long long>(kernel_ms) * 1000000LL);
+        if (cudaGetLastError() != cudaSuccess)
+            break;
+        launched[r] = true;
+        // Submit now: the rendezvous needs both kernels on their GPUs at once.
+        (void)cudaStreamQuery(streams[r]);
+    }
+    if (!launched[0] || !launched[1])
+    {
+        // A kernel whose peer never launched gives up on its own after
+        // kernel_ms; wait for it before freeing the page it writes.
+        for (int r = 0; r < count; ++r)
+            if (streams[r] != nullptr)
+            {
+                ggml_cuda_set_device(device_indices[r]);
+                cudaStreamSynchronize(streams[r]);
+                cudaStreamDestroy(streams[r]);
+            }
+        (void)cudaGetLastError();
+        cudaFreeHost(host);
+        return -1;
+    }
+
+    bool done[2] = {};
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kernel_ms + host_grace_ms);
+    for (;;)
+    {
+        bool all = true;
+        for (int r = 0; r < count; ++r)
+        {
+            if (done[r])
+                continue;
+            ggml_cuda_set_device(device_indices[r]);
+            const cudaError_t rc = cudaStreamQuery(streams[r]);
+            if (rc == cudaSuccess)
+                done[r] = true;
+            else if (rc != cudaErrorNotReady)
+            {
+                std::fprintf(stderr, "[TP] pinned-host AllReduce probe: GPU %d failed (%s).\n",
+                    device_indices[r], cudaGetErrorString(rc));
+                std::fflush(stderr);
+                (void)cudaGetLastError();
+                return 0;
+            }
+            all &= done[r];
+        }
+        if (all || std::chrono::steady_clock::now() >= deadline)
+            break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    if (!done[0] || !done[1])
+    {
+        // A kernel that has not even run by now cannot be cleaned up safely: it
+        // would still write into the mapped page. Leave the page and the streams.
+        std::fprintf(stderr,
+            "[TP] pinned-host AllReduce probe: GPU %d's kernel did not run within %d ms.\n",
+            device_indices[done[0] ? 1 : 0], kernel_ms + host_grace_ms);
+        std::fflush(stderr);
+        return 0;
+    }
+
+    int verdicts[2];
+    for (int r = 0; r < count; ++r)
+        verdicts[r] = reinterpret_cast<volatile int*>(host)[k_signal_verdict + r * k_signal_line_ints];
+    for (int r = 0; r < count; ++r)
+    {
+        ggml_cuda_set_device(device_indices[r]);
+        cudaStreamDestroy(streams[r]);
+    }
+    cudaFreeHost(host);
+
+    if (verdicts[0] == k_signal_ok && verdicts[1] == k_signal_ok)
+        return 1;
+    if (verdicts[0] == k_signal_unsupported || verdicts[1] == k_signal_unsupported)
+        return -1;
+    for (int r = 0; r < count; ++r)
+        if (verdicts[r] != k_signal_ok)
+            std::fprintf(stderr, "[TP] pinned-host AllReduce probe: GPU %d %s GPU %d's signal within %d ms.\n",
+                device_indices[r], verdicts[r] == k_signal_bad_payload ? "saw stale data behind" : "never saw",
+                device_indices[1 - r], kernel_ms);
+    std::fflush(stderr);
+    return 0;
+}
+
+void tp_cuda_flush_backends(ggml_backend_t const* backends, int count)
+{
+#if defined(_WIN32)
+    // Only WDDM queues launches in software; elsewhere a launch is already on
+    // its way to the GPU and this would be a wasted driver call per collective.
+    // TS_GGML_TP_WDDM_FLUSH=0 turns it off, for diagnosis only.
+    static const bool enabled = []
+    {
+        const char* value = std::getenv("TS_GGML_TP_WDDM_FLUSH");
+        return value == nullptr || std::strcmp(value, "0") != 0;
+    }();
+    if (!enabled)
+        return;
+    CudaDeviceRestore restore;
+    for (int r = 0; r < count; ++r)
+    {
+        ggml_backend_t backend = backends[r];
+        if (backend == nullptr || !ggml_backend_is_cuda(backend))
+            continue;
+        auto* ctx = static_cast<ggml_backend_cuda_context*>(backend->context);
+        ggml_cuda_set_device(ctx->device);
+        (void)cudaStreamQuery(ctx->stream());
+    }
+#else
+    (void)backends;
+    (void)count;
+#endif
+}
+
+int tp_cuda_wait_backends(ggml_backend_t const* backends, int count, int timeout_ms)
+{
+    if (count > TSG_MAX_DEVICES)
+        return -1;
+    for (int r = 0; r < count; ++r)
+        if (backends[r] == nullptr || !ggml_backend_is_cuda(backends[r]))
+            return -1;
+    CudaDeviceRestore restore;
+    bool done[TSG_MAX_DEVICES] = {};
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+    for (;;)
+    {
+        bool all = true;
+        for (int r = 0; r < count; ++r)
+        {
+            if (done[r])
+                continue;
+            auto* ctx = static_cast<ggml_backend_cuda_context*>(backends[r]->context);
+            ggml_cuda_set_device(ctx->device);
+            const cudaError_t rc = cudaStreamQuery(ctx->stream());
+            if (rc == cudaSuccess)
+                done[r] = true;
+            else if (rc != cudaErrorNotReady)
+                return -1;          // a real error: the caller's synchronize reports it
+            all &= done[r];
+        }
+        if (all)
+            return 1;
+        if (std::chrono::steady_clock::now() >= deadline)
+            return 0;
+        std::this_thread::sleep_for(std::chrono::microseconds(200));
+    }
+}
+
 } // namespace tsg

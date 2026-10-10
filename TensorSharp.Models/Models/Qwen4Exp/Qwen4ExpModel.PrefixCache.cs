@@ -46,7 +46,8 @@ namespace TensorSharp.Models
                 SubCapBytes = new ResourceVector
                 {
                     DeviceKv = _retainedCacheBudgetBytes >= 0 ? _retainedCacheBudgetBytes
-                        : GpuMemoryBudget.TryGetReservationSpareBytes(_backend, out _) ? 0 : UnmeasuredRetainedCacheBudgetBytes,
+                        : GpuMemoryBudget.TryGetReservationSpareBytes(_backend, Math.Max(1, LayerSplitDegree), out _)
+                            ? 0 : UnmeasuredRetainedCacheBudgetBytes,
                 },
             };
         }
@@ -58,7 +59,12 @@ namespace TensorSharp.Models
 
         public void DetachPrefixCache() => _prefixCacheSink = null;
 
-        public long QuerySpareBytes(ResourceClass cls) => QueryPrefixCacheSpareBytes(cls);
+        /// <summary>Device classes under a layer split report the tightest GPU of the
+        /// split: a holder's KV and recurrent state are spread across all of them.</summary>
+        public long QuerySpareBytes(ResourceClass cls)
+            => LayerSplitDegree > 1 && cls is ResourceClass.DeviceKv or ResourceClass.StateSnapshot or ResourceClass.NativeSlot
+                ? (GpuMemoryBudget.TryGetReservationSpareBytes(_backend, LayerSplitDegree, out long spare) ? Math.Max(0, spare) : -1)
+                : QueryPrefixCacheSpareBytes(cls);
 
         // ---------------------------------------------------------------- end states
 

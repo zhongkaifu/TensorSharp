@@ -339,7 +339,7 @@ option names carefully.
 | `--backend <type>` | Compute backend: `cpu`, `cuda`, `mlx`, `ggml_cpu`, `ggml_metal`, `ggml_cuda`, or `ggml_vulkan` (default: `ggml_cpu`, on every OS including macOS) |
 | `--gpu-device <N>` | Vulkan device index for the `ggml_vulkan` backend on multi-GPU hosts (e.g. an integrated Intel GPU next to a discrete NVIDIA one). Defaults to device 0; use `--list-gpus` to see the indices. Also settable via the `TS_GGML_VULKAN_DEVICE` env var. |
 | `--list-gpus` | List the Vulkan devices ggml-vulkan can see (index + adapter name) and exit |
-| `--n-cpu-moe <N>` / `-ncmoe <N>` | Keep the routed Mixture-of-Experts weights of the first N layers in system RAM and multiply them on the CPU; attention, norms, the router and the always-active shared expert stay on the accelerator (llama.cpp's `--n-cpu-moe` equivalent). This is what lets a 35B-A3B MoE fit beside a long-context KV cache on a 12-16 GB card. Pass `all` for every layer. Default: 0 on every architecture, DeepSeek V4 and GLM 5.x included — a model that does not fit is refused at load with the number of layers that would make it fit, rather than silently offloaded (env `TS_N_CPU_MOE`). |
+| `--n-cpu-moe <N>` / `-ncmoe <N>` | Keep the routed Mixture-of-Experts weights of the first N layers in system RAM and multiply them on the CPU; attention, norms, the router and the always-active shared expert stay on the accelerator (llama.cpp's `--n-cpu-moe` equivalent). This is what lets a 35B-A3B MoE fit beside a long-context KV cache on a 12-16 GB card. Pass `all` for every layer. Default: 0, DeepSeek V4 and GLM 5.x included — a model that does not fit is refused at load with the number of layers that would make it fit, rather than silently offloaded (env `TS_N_CPU_MOE`). Qwen 3.8 Flash Next (`qwen4exp`) is the exception on `ggml_metal` and `ggml_cuda`: unset, it plans the offload itself when its experts do not fit (on `ggml_cuda` per GPU, across `--layer-split N` too), and an explicit value, `0` included, pins it; see [its card](docs/models/qwen38-flash-next.md#expert-placement-on-ggml_cuda). |
 | `--cpu-moe` / `-cmoe` | Shorthand for `--n-cpu-moe all`. Default: off (env `TS_CPU_MOE`). |
 | `--cpu-moe-threads <N>` | Worker threads for the host-side expert matmul. Default: **half** the CPU parallelism this process can actually use (`hardware_concurrency` clamped by the scheduler affinity mask and the cgroup CPU quota), **capped at 64**, on hosts with more than 8; all but one with 3 to 8; one with 2 or fewer. DeepSeek V4 / V4.1 and GLM-5.x on their native ggml executors use every usable CPU once `--n-cpu-moe` / `--cpu-moe` is on (GLM-5.x also on a GPU-less run). The other half is not waste — the accelerator submission threads, and in `TensorSharp.Server.Host` Kestrel and the scheduler, have to be schedulable too, and .NET sizes its own pool from the machine's CPU count rather than the cgroup quota. Sizing this near the quota is a cliff, not a slope: on a 95-CPU quota the hosted 26B MoE measured 20.7 tok/s at 64 threads and 8.2 at 71. Raise it on a dedicated box (env `TS_CPU_MOE_THREADS`). |
 
@@ -511,7 +511,7 @@ script gets that error instead of watching a setting be ignored.
 | `--no-audio` | Skip audio decoding on models that generate an audio track jointly with the video (MiniMax-H3), saving the audio VAE's time and memory. Ignored by video-only models. |
 | `--wan-vae` / `--wan-te` / `--wan-dit2` / `--video-te` | **Removed and rejected at startup on both hosts, including as config-file keys.** Use `--video-vae`, `--video-text-encoder` and `--video-dit2`. The `TS_WAN_VAE`, `TS_WAN_TE` and `TS_WAN_DIT2` variables are refused too: every video model reads `TS_VIDEO_VAE`, `TS_VIDEO_TEXT_ENCODER` and `TS_VIDEO_DIT2`. |
 | `--tp <N>` | Tensor-parallel degree: shard weights within layers over N local GPUs (default `1`). Requires a supported architecture and GPU backend. Mutually exclusive with `--layer-split`; unsupported requests fail at startup. Env: `TENSORSHARP_TP_DEGREE`. |
-| `--layer-split <N>` | Local GPU count for whole-layer placement on supported architectures. Mutually exclusive with `--tp`, `--tp-node-id`, and `--tp-peers`; single-node only. Env: `TENSORSHARP_LAYER_SPLIT_DEGREE`. |
+| `--layer-split <N>` | Local GPU count for whole-layer placement on supported architectures. Mutually exclusive with `--tp`, `--tp-node-id`, and `--tp-peers`; single-node only. On `ggml_cuda`, Qwen 3.8 Flash Next sizes the layer runs and its routed-expert offload together against each GPU's free VRAM ([details](docs/models/qwen38-flash-next.md#expert-placement-on-ggml_cuda)). Env: `TENSORSHARP_LAYER_SPLIT_DEGREE`. |
 | `--tp-node-id <N>` | This node's 0-based ID for multi-node (distributed) tensor parallelism. Requires `--tp-peers`. |
 | `--tp-peers <list>` | Comma-separated `host:port` list of all nodes in the distributed TP cluster (e.g. `192.168.1.10:9500,192.168.1.11:9500`). Requires `--tp-node-id`. |
 | `--test` | Run built-in tokenizer, ChatML-template, and Ollama-comparison tests |
@@ -691,7 +691,7 @@ Running `TensorSharp.Server.Host` (`dotnet TensorSharp.Server.Host/bin/TensorSha
 | `--urls <urls>` | Full listen URL(s), semicolon-separated, for what `--port`/`--host` cannot express (HTTPS, several endpoints). `--port`/`--host` win when both are given. Without any of the three, `PORT`/`HOST` apply, then `ASPNETCORE_URLS`. |
 | `--backend <type>` | Default compute backend: `cpu`, `cuda`, `mlx`, `ggml_cpu`, `ggml_metal`, `ggml_cuda`, or `ggml_vulkan` (default `ggml_metal` on macOS, `ggml_cpu` elsewhere). Omitted on a machine that has the platform default, it logs nothing; if the platform default is missing, startup warns `The platform default backend 'X' is unavailable on this machine (available: …). Using 'Y' instead`. An explicit backend the machine lacks refuses the startup model's load (exit code 2); a model-less server warns and falls back to an available one. |
 | `--tp <N>` | Tensor-parallel degree: shard weights within layers over N local GPUs (default `1`). Requires a supported architecture and GPU backend. Mutually exclusive with `--layer-split`; unsupported requests fail at startup. Env: `TENSORSHARP_TP_DEGREE`. |
-| `--layer-split <N>` | Local GPU count for whole-layer placement on supported architectures. Mutually exclusive with `--tp`, `--tp-node-id`, and `--tp-peers`; single-node only. Env: `TENSORSHARP_LAYER_SPLIT_DEGREE`. |
+| `--layer-split <N>` | Local GPU count for whole-layer placement on supported architectures. Mutually exclusive with `--tp`, `--tp-node-id`, and `--tp-peers`; single-node only. On `ggml_cuda`, Qwen 3.8 Flash Next sizes the layer runs and its routed-expert offload together against each GPU's free VRAM ([details](docs/models/qwen38-flash-next.md#expert-placement-on-ggml_cuda)). Env: `TENSORSHARP_LAYER_SPLIT_DEGREE`. |
 | `--tp-node-id <N>` | This node's 0-based ID for multi-node (distributed) tensor parallelism. The server can only be node `0` (the driver that serves HTTP); start worker nodes with `TensorSharp.Cli`. Requires `--tp-peers`. Env: `TENSORSHARP_TP_NODE_ID`. |
 | `--tp-peers <list>` | Comma-separated `host:port` list of all nodes in the distributed TP cluster, ordered by node ID (e.g. `192.168.1.10:9500,192.168.1.11:9500`). Requires `--tp-node-id`. Env: `TENSORSHARP_TP_PEERS`. |
 | `--gpu-device <N>` | Vulkan device index for the `ggml_vulkan` backend on multi-GPU hosts (e.g. an integrated Intel GPU next to a discrete NVIDIA one). Defaults to device 0; use `--list-gpus` to see the indices. Also settable via the `TS_GGML_VULKAN_DEVICE` env var. |
@@ -788,7 +788,7 @@ of quietly losing a setting.
 | `--seed <N>` | Random seed (`-1` = non-deterministic) |
 | `--stop <string>` | Stop sequence (can be repeated). Under `--sampling-precedence config` a per-request `stop`/`stop_sequences` list is merged with these; under `request` it replaces them. |
 | `--sampling-precedence <config\|request>` | Who wins when a request also carries a sampling parameter you set above. `config` (default) keeps your value — clients such as VS Code Copilot Chat hardcode `temperature`/`top_p` into every request and would otherwise silently override your configuration; parameters you did **not** set still come from the request. `request` restores client-always-wins. Env: `TENSORSHARP_SAMPLING_PRECEDENCE`. |
-| `--n-cpu-moe <N>` / `-ncmoe <N>` | Keep the routed MoE weights of the first N layers in system RAM and run their FFN on the CPU (see **Mixture-of-Experts CPU offload** above). `all` offloads every layer. Default: 0 on every architecture, DeepSeek V4 and GLM 5.x included; a model that does not fit is refused at load with the number of layers that would make it fit. Env: `TS_N_CPU_MOE`. |
+| `--n-cpu-moe <N>` / `-ncmoe <N>` | Keep the routed MoE weights of the first N layers in system RAM and run their FFN on the CPU (see **Mixture-of-Experts CPU offload** above). `all` offloads every layer. Default: 0, DeepSeek V4 and GLM 5.x included; a model that does not fit is refused at load with the number of layers that would make it fit. Qwen 3.8 Flash Next (`qwen4exp`) is the exception on `ggml_metal` and `ggml_cuda`: unset, it plans the offload itself when its experts do not fit (on `ggml_cuda` per GPU, across `--layer-split N` too), and an explicit value, `0` included, pins it. Env: `TS_N_CPU_MOE`. |
 | `--cpu-moe` / `-cmoe` | Shorthand for `--n-cpu-moe all`. Default: off. Env: `TS_CPU_MOE`. |
 | `--cpu-moe-threads <N>` | Worker threads for the host-side expert matmul. Default: half the usable CPU parallelism (`hardware_concurrency` clamped by the affinity mask and the cgroup CPU quota), capped at 64, on hosts with more than 8; all but one with 3 to 8; one with 2 or fewer (DeepSeek V4 / V4.1 and GLM-5.x on their native executors use every usable CPU once experts are offloaded, and GLM-5.x also on a GPU-less run). The server needs the other half for Kestrel, the scheduler and the accelerator submission threads; sizing this near the quota collapses throughput rather than degrading (20.7 tok/s at 64 threads vs 8.2 at 71 on a 95-CPU quota). Env: `TS_CPU_MOE_THREADS`. |
 | `--kv-cache-dtype <type>` | KV cache precision for the hosted model: `f32`, `f16`, `q8_0`, or `q4_0` (quantized caches trade small numerical drift for memory; see the CLI table above for the tier trade-offs). Default: auto — the backend/model pick. Env: `KV_CACHE_DTYPE`. |
@@ -856,7 +856,7 @@ latency, quality or delegation-rate measurements are published. Full design:
 |---|---|
 | `BACKEND` | Default compute backend (`cpu`, `cuda`, `mlx`, `ggml_cpu`, `ggml_metal`, `ggml_cuda`, or `ggml_vulkan`), used when `--backend` is not passed (default: `ggml_metal` on macOS, `ggml_cpu` elsewhere) |
 | `MAX_TOKENS` | Maximum generation length when `--max-tokens` is not passed: fills in when a request omits its own limit and caps a request that asks for more (default: `20000`, which is a plain default and does not cap) |
-| `MAX_CONTEXT` | Context window to allocate, overriding the length the GGUF advertises. Set, it is a **hard limit**: honoured when the caches plus one full `n_ubatch` graph fit, refused with the numbers when they do not. Left unset, the advertised length is a **ceiling** — after the weights load, the runtime asks the devices how much VRAM is actually free, sizes the context to fit, and logs what it picked. GLM-5.2 advertises 1,048,576 tokens (~93 GiB of KV); on 3x RTX PRO 6000 the pick is 342,272 on the layer split, 91,136 with `--tp 3`, and 646,400 with `--n-cpu-moe 30` |
+| `MAX_CONTEXT` | Context window to allocate, overriding the length the GGUF advertises. Set, it is a **hard limit**: honoured when the caches plus one full `n_ubatch` graph fit, refused with the numbers when they do not. Left unset, the advertised length is a **ceiling** — after the weights load, the runtime asks the devices how much VRAM is actually free, sizes the context to fit, and logs what it picked. GLM-5.2 advertises 1,048,576 tokens (~93 GiB of KV); on 3x RTX PRO 6000 the pick is 342,272 on the layer split, 91,136 with `--tp 3`, and 646,400 with `--n-cpu-moe 30`. Qwen 3.8 Flash Next on `ggml_cuda` can also cap the window after placing its experts, when the GPUs have no room left to grow the KV cache (`[moe-offload] qwen4exp: context capped at N tokens (was M)`); set `MAX_CONTEXT` to allocate the window up front, which the placement then reserves for |
 | `VIDEO_SAMPLE_FPS` | Frames sampled per second from an **input video prompt** for multimodal understanding; time-based extraction (default: `1`). This is unrelated to the video-generation output setting `--fps`. |
 | `VIDEO_MAX_FRAMES` | Optional upper bound on frames extracted from an **input video prompt** (evenly down-sampled); unset/`0` means no cap (default: no cap). This is unrelated to the video-generation output setting `--video-frames`. |
 | `PORT` / `HOST` | Listen port / bind interface when `--port` / `--host` are not passed (defaults: `5000`, `0.0.0.0`) |
@@ -882,7 +882,8 @@ latency, quality or delegation-rate measurements are published. Full design:
 | `TENSORSHARP_LAYER_SPLIT_DEGREE` | Local GPU count for whole-layer placement, equivalent to `--layer-split N`; mutually exclusive with TP and distributed TP settings. |
 | `TENSORSHARP_LAYER_SPLIT_DEVICES` | Device ordinals for the Qwen 3.8 Flash Next shared GGML layer executor, comma-separated (e.g. `0,2`); independent of `TENSORSHARP_TP_DEVICES`. Native GLM/DeepSeek placement uses `CUDA_VISIBLE_DEVICES` instead. |
 | `TENSORSHARP_TP_DEVICES` | GPU ordinals the TP ranks map to, comma-separated (e.g. `0,2`; default `0..tp-1`). Used by TP on the GGML backends. |
-| `TS_Q4E_LAYER_SPLIT` | Explicit per-GPU layer counts for the Qwen 3.8 Flash Next (`qwen4exp`) multi-GPU layer split, comma-separated (e.g. `20,28`), replacing the automatic VRAM balance. Throws rather than silently ignoring a value it cannot honour. |
+| `TS_Q4E_LAYER_SPLIT` | Explicit per-GPU layer counts for the Qwen 3.8 Flash Next (`qwen4exp`) multi-GPU layer split, comma-separated (e.g. `20,28`), replacing the automatic split. On `ggml_cuda` each GPU still offloads its own leading layers' experts, and a run that a GPU cannot hold even with every expert on the host is refused. Throws rather than silently ignoring a value it cannot honour. |
+| `TS_Q4E_PREFILL_CHUNK` | Widest prefill span, in tokens (at least `128`), that Qwen 3.8 Flash Next (`qwen4exp`) runs on `ggml_cuda` without `--tp`; a longer prompt chunk runs as consecutive spans. Default: `4096` while every routed expert stays on the GPUs, `2048` once any layer's experts run on the host (a narrower span needs less scratch, so more layers keep their experts on the GPU; a wider one amortizes the per-span expert streaming of a long prefill). Spans also narrow once the KV they read passes 16,384 rows. |
 | `TENSORSHARP_TP_NODE_ID` | This node's 0-based ID for multi-node distributed tensor parallelism. Must be set together with `TENSORSHARP_TP_PEERS`. |
 | `TENSORSHARP_TP_PEERS` | Comma-separated `host:port` list of all nodes in the distributed TP cluster (e.g. `192.168.1.10:9500,192.168.1.11:9500`). Must be set together with `TENSORSHARP_TP_NODE_ID`. |
 | `TENSORSHARP_TP_CONNECT_TIMEOUT_SECONDS` | How long each node keeps retrying outbound connections to its peers before giving up (default: `120`). Raise it when nodes are started far apart by hand or by a slow orchestrator. |
@@ -1793,8 +1794,8 @@ Notes:
   decode 64: `--n-cpu-moe 30` is 94.7 / 16.4 tok/s against 915.9 / 43.9 fully
   resident. Offload buys the fit here, not the speed — it frees enough VRAM to
   raise the sized context from 342,272 to 646,400 tokens.
-* **Qwen 3.8 Flash Next plans the offload itself on Apple silicon.** Its
-  UD-Q2_K_XL file is 78.9 GB: 46.1 GB of routed experts and a 28.8 GB n-gram
+* **Qwen 3.8 Flash Next plans the offload itself on Apple silicon and on `ggml_cuda`.**
+  Its UD-Q2_K_XL file is 78.9 GB: 46.1 GB of routed experts and a 28.8 GB n-gram
   table. Unset, `ggml_metal` keeps whole layers' experts on the GPU while they
   fit both the Metal working set and the RAM the offloaded layers need for their
   page cache, offloads the first layers and logs the plan (`[moe-offload]
@@ -1810,6 +1811,14 @@ Notes:
   llama-server's 20.4-22.4 and 13.00-13.24 (28.8-31.6 and 11.94-12.48 with
   `--no-op-offload`). See the
   [model card](docs/models/qwen38-flash-next.md#larger-than-memory).
+  `ggml_cuda` plans against each GPU's free VRAM, on one GPU or across
+  `--layer-split N`: a split chooses its layer runs and its host-routed layers
+  together, and within each GPU's run the leading layers' experts go to the host.
+  An explicit `--n-cpu-moe N` / `--cpu-moe` pins the host set, and a split that
+  cannot fit it is refused (exit code 2). Prefill on `ggml_cuda` runs in spans of
+  at most `TS_Q4E_PREFILL_CHUNK` tokens (4096 with every expert on the GPUs, 2048
+  once any layer's experts run on the host). See
+  [Expert placement on `ggml_cuda`](docs/models/qwen38-flash-next.md#expert-placement-on-ggml_cuda).
 * **One-token host experts run on TensorSharp's own kernel.** ggml's CPU dot
   products, but on a team woken once per layer and parked as soon as the layer is
   done, instead of a ggml graph whose workers wake at every call. A busy-waiting
@@ -1859,7 +1868,12 @@ to `--layer-split N`. CPU backends cannot run a multi-GPU mode.
 
 Qwen 3.8 Flash Next (`qwen4exp`) supports whole-layer placement on `ggml_cuda`,
 `ggml_vulkan` and direct `cuda`, plus local FFN tensor parallelism on qualified
-`ggml_cuda` devices and quantizations. Its UD-Q2_K_XL checkpoint is layer-split-only;
+`ggml_cuda` devices and quantizations. On `ggml_cuda` its layer split is sized to each
+GPU's free VRAM together with the routed-expert offload: a GPU too small for its layers'
+experts routes its leading layers' experts to the host, so the split still loads, and
+decode then also depends on host RAM bandwidth for those layers (see
+[Mixture-of-Experts CPU offload](#mixture-of-experts-cpu-offload---n-cpu-moe)).
+Its UD-Q2_K_XL checkpoint is layer-split-only;
 see [Supported architectures](#supported-architectures) for the TP qualification.
 DeepSeek V4 / V4.1 and GLM 5.x also require `--layer-split N` to select the
 local layer-split device count. With neither mode configured, the default is
@@ -1885,7 +1899,8 @@ byte-identical greedy output on one and two GPUs, prefill about 1520–1550 t/s,
 and decode about 56 t/s in both placements. They establish capacity and
 correctness for that checkpoint, not a general speedup.
 `TS_Q4E_LAYER_SPLIT=20,28` overrides automatic placement with explicit per-GPU
-layer counts; it does not select the execution mode or replace `--layer-split`.
+layer counts (on `ggml_cuda` each GPU still plans its own expert offload); it does not
+select the execution mode or replace `--layer-split`.
 
 ### Local tensor parallelism (single process, multiple GPUs)
 
@@ -2025,7 +2040,11 @@ Reach for it there on an NVLink host, or when a model fits no other way.
 On architectures that support the combination, TP composes with MoE CPU offload: `--tp N --n-cpu-moe M` keeps the fused
 multi-rank graph and drops the offloaded layers' expert bytes from every rank's
 VRAM. See [Mixture-of-Experts CPU offload](#mixture-of-experts-cpu-offload---n-cpu-moe)
-for the combined numbers. Qwen 3.8 Flash Next refuses expert offload under TP.
+for the combined numbers. Qwen 3.8 Flash Next refuses expert offload under TP: every routed expert
+stays on the GPUs, split evenly, and every GPU also holds its own copy of the other weights and of
+the caches. A checkpoint that cannot fit that way is refused at load, before the experts are sliced,
+with each GPU's need against its free memory, and pointed at `--layer-split N`, which runs the
+experts that do not fit from system RAM.
 
 | Variable | Effect |
 |---|---|
@@ -2033,12 +2052,13 @@ for the combined numbers. Qwen 3.8 Flash Next refuses expert offload under TP.
 | `TS_GGML_TP_PARALLEL=0` | Drive ranks sequentially instead of concurrently (diagnostic) |
 | `TS_GGML_TP_FUSED_MATMUL=1` | Submit both ranks' linears from one thread (off by default; it allocates a device buffer per rank per call, measured 2.3× slower on Qwen 3.5 35B) |
 | `TS_GGML_TP_DEVICE_AR_THRESHOLD` | Element count above which AllReduce uses the device collective (default 262144) |
-| `TS_Q4E_LAYER_SPLIT=20,28` | Qwen 3.8 Flash Next only: explicit layer counts per GPU for its layer split, instead of the automatic VRAM balance. Throws rather than silently ignoring a value it cannot honour — useful because the automatic balance prices weights and cannot see the vision tower, which loads later and lands on GPU 0 |
+| `TS_Q4E_LAYER_SPLIT=20,28` | Qwen 3.8 Flash Next only: explicit layer counts per GPU for its layer split, instead of the automatic split. Throws rather than silently ignoring a value it cannot honour. On `ggml_cuda` the automatic split is sized with the expert offload to each GPU's free VRAM and already prices an `--mmproj` projector on GPU 0; under the override each GPU still offloads its own leading layers. On `ggml_vulkan` the automatic balance prices weights only and cannot see the vision tower, which loads later and lands on GPU 0 |
 | `TS_GGML_F32_RESIDENT=0` | Bind F32 linear weights per call instead of keeping them device-resident (diagnostic) |
 | `TS_GEMMA4_TP_FUSED_MOE=0` | Gemma 4 only: fall back from the fused whole-model MoE trunk (Megatron split inside each expert) to the whole-expert per-op path. The fused path materializes ~10.5 GB of expert slices at load on the 26B (~36 s) in exchange for a ~10× decode. Layers offloaded by `--n-cpu-moe` are skipped by that materialization — they never run on the accelerator — so `--cpu-moe` also removes the load-time cost |
 | `GGML_CUDA_AR_BF16_THRESHOLD` | Payload size above which ggml-cuda's collective converts F32 to BF16 before reducing. TensorSharp raises ggml's default (1 byte — i.e. always) to 1 MB so decode-sized collectives reduce exactly; `0` disables the conversion entirely |
 | `TS_QWEN35_LAYER_TRACE=1` | Print a per-layer residual-stream summary for the first forward, from both the single-GPU and TP loops (diagnostic) |
-| `GGML_CUDA_ALLREDUCE` | `nccl` / `internal` / `none`, passed through to ggml |
+| `GGML_CUDA_ALLREDUCE` | `nccl` / `internal` / `none`, passed through to ggml. Unset, Linux uses NCCL and every other platform (Windows) the pinned-host `internal` pipeline, which supports exactly 2 GPUs |
+| `TS_GGML_TP_WDDM_FLUSH=0` | Windows only: stop submitting each GPU's queued launches after every AllReduce (diagnostic; see below) |
 
 ### Constraints
 
@@ -2063,6 +2083,18 @@ stages through host memory from the start.
 | `TENSORSHARP_TP_HOST_ALLREDUCE=1` | off | Run the local AllReduce as device→host, sum on the CPU, host→device. Slower, but matches the multi-node reduce exactly — useful for isolating P2P correctness issues. |
 | `TENSORSHARP_TP_CONNECT_TIMEOUT_SECONDS=N` | `120` | How long a node retries outbound connections to its peers. Nodes are usually launched by hand seconds or minutes apart, so a peer's listener may not be up yet; raise this for slow orchestrators. |
 | `TENSORSHARP_TP_RECV_TIMEOUT_SECONDS=N` | `300` | Per-receive timeout on a peer socket. Without it a stalled peer would block on the OS TCP keepalive (often 2+ hours) instead of failing the collective. |
+
+On Windows there is no NCCL, so two GPUs reduce through ggml's pinned-host `internal`
+pipeline, whose kernels meet inside the GPUs: each publishes a token in pinned host memory
+and spins until it reads the other's. WDDM, the Windows driver model, holds kernel launches
+in a per-device software queue, and a rendezvous whose second half was never submitted never
+completes. That was the `--tp 2` startup hang of issue #256 (2x RTX 3080 under Windows 10,
+stuck after `[TP] GGML tensor parallelism: 2 device(s), AllReduce=device` with CPU and GPUs
+idle). TensorSharp now submits both GPUs' queues after every AllReduce it issues, checks the
+rendezvous at startup with kernels that give up after 3 s (falling back to the host reduction,
+with a message, when the two GPUs cannot meet), and bounds the first collective by
+`TS_GGML_TP_AR_PROBE_MS` (10 s): one that never completes refuses the load (exit code 2) and
+names `GGML_CUDA_ALLREDUCE=none` and `--layer-split N` instead of hanging.
 
 Startup logs make the topology explicit: the local group prints
 `Tensor parallelism: N GPUs (<device names>)`, P2P demotions print a
@@ -2239,7 +2271,8 @@ The full picture, including the native loader's own knobs, is in the
 |---|---|---|---|
 | Local tensor parallelism (multi-GPU, single process) | OFF (`1` GPU) | **`TENSORSHARP_TP_DEGREE=N`** | `--tp N` (CLI and server) |
 | GPU ordinals used by the TP ranks (GGML backends) | `0..tp-1` | `TENSORSHARP_TP_DEVICES=0,2` | — |
-| Explicit per-GPU layer counts for the `qwen4exp` layer split (`--layer-split N`) | automatic VRAM balance | `TS_Q4E_LAYER_SPLIT=20,28` | — |
+| Explicit per-GPU layer counts for the `qwen4exp` layer split (`--layer-split N`) | automatic: on `ggml_cuda` sized with the expert offload to each GPU's free VRAM; on `ggml_vulkan` a byte balance | `TS_Q4E_LAYER_SPLIT=20,28` | — |
+| Widest `qwen4exp` prefill span on `ggml_cuda` (a longer prompt chunk runs as consecutive spans) | `4096`; `2048` once any layer's experts run on the host | `TS_Q4E_PREFILL_CHUNK=N` (at least `128`) | — |
 | Distributed TP node ID (multi-node) | unset (disabled) | **`TENSORSHARP_TP_NODE_ID=N`** | `--tp-node-id N` (CLI and server; the server must be node `0`) |
 | Distributed TP peer endpoints | unset (disabled) | **`TENSORSHARP_TP_PEERS=host1:port1,host2:port2`** | `--tp-peers host1:port1,host2:port2` (CLI and server) |
 | Peer connect retry window (multi-node) | `120` s | `TENSORSHARP_TP_CONNECT_TIMEOUT_SECONDS=N` | — |
@@ -2480,10 +2513,13 @@ an explicit `--draft-model` that cannot be activated (a DFlash / DFlash2 drafter
 `[glm] ...`) may still appear above the error line; the error line repeats the
 reason so it is readable on its own. Anything else that fails during a load — a
 `NullReferenceException`, a CUDA error, an out-of-memory abort — is not a refusal
-and keeps its stack trace. One exception: the DeepSeek V4/V4.1 and GLM native
+and keeps its stack trace. Two exceptions: the DeepSeek V4/V4.1 and GLM native
 whole-model loaders report every load they abandon as a refusal, including a
 weight or cache allocation that failed on a device, with their `[dsv4]`/`[glm]`
-line as the reason.
+line as the reason; and Qwen 3.8 Flash Next on `ggml_cuda` reports a kernel warmup
+that runs out of GPU memory as a refusal that names what to change
+(`TS_VRAM_HEADROOM_MB`, `--n-cpu-moe`, `TS_Q4E_PREFILL_CHUNK`, `MAX_CONTEXT`), once
+moving more of that GPU's experts to the host and warming up again has not helped.
 
 Before exiting with `2` the server releases what the refused load left behind
 (the model service and the ggml backend) and never opens its port. A refusal's
