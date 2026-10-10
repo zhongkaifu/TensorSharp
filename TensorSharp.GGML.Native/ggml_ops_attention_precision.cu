@@ -324,7 +324,7 @@ void tsg_attention_cuda_compute(ggml_tensor * dst, ggml_backend_t backend) {
     ggml_custom_op_params params;
     std::memcpy(&params, dst->op_params, sizeof(params));
     const auto & desc = *static_cast<const tsg_dsv4_fused_desc *>(params.userdata);
-    CUDA_CHECK(cudaSetDevice(context->device));
+    ggml_cuda_set_device(context->device);
     if (desc.kind == TSG_ATTN_VISION_F32) {
         const auto q = tensor_view(dst->src[0]), k = tensor_view(dst->src[1]), v = tensor_view(dst->src[2]);
         GGML_ASSERT(q.ne[0] == 72 && (q.ne[1] + 127) / 128 <= INT_MAX && q.ne[2] <= 65535 && q.ne[3] <= 65535);

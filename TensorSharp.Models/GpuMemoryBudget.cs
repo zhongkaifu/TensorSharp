@@ -100,6 +100,51 @@ namespace TensorSharp.Models
         internal static bool TryGetReservationSpareBytes(BackendType backend, out long spareBytes)
             => TryGetSpareBytes(AppliesToReservations(backend), out spareBytes);
 
+        /// <summary>
+        /// <see cref="TryGetReservationSpareBytes(BackendType, out long)"/> across the
+        /// <paramref name="deviceCount"/> GPUs of a layer split: the smallest spare of
+        /// any of them. The device query reports the calling thread's ACTIVE rank, so
+        /// measuring only that one sees GPU 0 while most of a split's per-request
+        /// state (each layer's KV and recurrent state) lives on the others.
+        /// </summary>
+        internal static bool TryGetReservationSpareBytes(BackendType backend, int deviceCount, out long spareBytes)
+        {
+            if (deviceCount <= 1)
+                return TryGetReservationSpareBytes(backend, out spareBytes);
+            spareBytes = 0;
+            if (!AppliesToReservations(backend))
+                return false;
+            long smallest = long.MaxValue;
+            int previous = GgmlBasicOps.GetActiveRank();
+            try
+            {
+                // The caller's own rank goes LAST: the CUDA device query makes the
+                // queried GPU the thread's current CUDA device and nothing restores it,
+                // so ending on the restored rank keeps the two consistent.
+                for (int i = 0; i < deviceCount; i++)
+                {
+                    int rank = previous >= 0 && previous < deviceCount ? (previous + 1 + i) % deviceCount : i;
+                    GgmlBasicOps.SetActiveRank(rank);
+                    if (!GgmlBasicOps.TryGetDeviceMemoryInfo(out long freeBytes, out long totalBytes) || totalBytes <= 0)
+                        return false;
+                    smallest = Math.Min(smallest, Math.Max(0, freeBytes - ResolveHeadroomBytes(totalBytes)));
+                }
+            }
+            catch (ArgumentOutOfRangeException)
+            {
+                // More ranks than the backend has initialized (a shutdown or backend
+                // recreation in between): nothing measurable, as for any failed query.
+                return false;
+            }
+            finally
+            {
+                try { GgmlBasicOps.SetActiveRank(previous); }
+                catch (ArgumentOutOfRangeException) { }
+            }
+            spareBytes = smallest;
+            return true;
+        }
+
         private static bool TryGetSpareBytes(bool backendApplies, out long spareBytes)
         {
             spareBytes = 0;

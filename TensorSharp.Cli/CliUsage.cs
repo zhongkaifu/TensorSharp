@@ -488,7 +488,9 @@ namespace TensorSharp.Cli
                     "for every layer. Default: 0 (everything on the accelerator) on every architecture, DeepSeek V4 " +
                     "included: a DeepSeek V4 load that does not fit the visible VRAM is refused - naming the " +
                     "fewest layers that would fit, when offloading can make it fit - rather than offloaded on " +
-                    "its own (TS_N_CPU_MOE env var overrides).",
+                    "its own (TS_N_CPU_MOE env var overrides). Qwen 3.8 Flash Next on ggml_metal / ggml_cuda is the " +
+                    "exception: unset, it plans the offload itself when its experts do not fit (per GPU under " +
+                    "--layer-split N); any explicit value, 0 included, pins it.",
                     "--n-cpu-moe 32"),
                 new OptionHelp("--cpu-moe | -cmoe",
                     "Shorthand for --n-cpu-moe all: every routed expert stays in system RAM. Default: off " +

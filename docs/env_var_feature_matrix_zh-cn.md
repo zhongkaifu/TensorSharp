@@ -67,7 +67,7 @@ TensorAgent 在每次加载模型之前写入自己的取值（`EngineMemoryPoli
 | 环境变量 | 适用范围 | 功能影响 | 运行时 baseline | Sweep 值 | 默认 sweep |
 |---|---|---|---|---|---|
 | `KV_CACHE_DTYPE` | 除 DeepSeek V4 / V4.1 执行器之外的全部：它们的 cache 固定为 F16，由自己的注意力、gather 与压缩器内核直接读取，`q8_0` / `q4_0` 会在**加载时被拒绝**并给出原因（打开检查点之前抛 `NotSupportedException`），`f32` 会被告知并按 `f16` 报告 | KV cache 元素类型 | 自动（随模型对齐：模型权重低于 F32 时为 `f16`，否则为 `f32`） | `f32`, `f16`, `q8_0`（运行时还接受 `q4_0`，不参与 sweep） | 是 |
-| `TS_N_CPU_MOE` | MoE 模型 | 前 N 层的路由专家留在系统内存：decode 时在主机上做乘法，prefill 时流式送到加速器上跑一整张图。在 `ggml_metal` 上未设置时，若专家放不下，Qwen 3.8 Flash Next（`qwen4exp`）会按 Metal 工作集与内存自行规划（48 GiB 的 Mac 上 48 层中有 15 层的专家留在 GPU 上） | 关闭（`0`） | `0`, `16`, `all` | 否（已为 GGML GPU 后端与 MoE 家族注册，但不在默认配置的列表中） |
+| `TS_N_CPU_MOE` | MoE 模型 | 前 N 层的路由专家留在系统内存：decode 时在主机上做乘法，prefill 时流式送到加速器上跑一整张图。未设置时，若专家放不下，Qwen 3.8 Flash Next（`qwen4exp`）会自行规划：在 `ggml_metal` 上按 Metal 工作集与内存（48 GiB 的 Mac 上 48 层中有 15 层的专家留在 GPU 上），在 `ggml_cuda` 上按每张 GPU 的空闲显存，单卡与 `--layer-split N` 切分都适用。设置后（包括 `0`）固定卸载的层，`qwen4exp` 的切分放不下这些层时拒绝加载 | 关闭（`0`）；`qwen4exp` 在 `ggml_metal` / `ggml_cuda` 上自行规划 | `0`, `16`, `all` | 否（已为 GGML GPU 后端与 MoE 家族注册，但不在默认配置的列表中） |
 | `TS_CPU_MOE` | MoE 模型 | 卸载所有层的路由专家（等价于 `TS_N_CPU_MOE=all`） | 关闭 | 未注册 | 否 |
 | `TS_CPU_MOE_THREADS` | MoE 模型 | 主机端专家 matmul 的工作线程数。可用 CPU（硬件线程数按亲和性掩码与 cgroup CPU 配额收敛后）超过 8 个时，默认取其一半，上限 64：decode 侧的 matmul 只有一个 token 宽，超过几十个线程后每多一个线程只是多一个屏障参与者（在双路 Xeon 上实测 192 线程比 32 线程慢 7 倍）。较小的主机几乎用满全部 CPU。DeepSeek V4 / V4.1 则默认使用全部可用 CPU（见下文） | 可用数 ≤2 时为 1，≤8 时为可用数−1，否则 min(可用数/2, 64) | - | 否 |
 | `TS_HOST_MOE_DEVICE_MIN_BATCH` | 启用卸载的 MoE 模型 | 达到或超过该 batch 大小时，被卸载的层改为在加速器上计算、专家权重流式送入，而不是在主机上算。`0` 恢复纯主机卸载 | `128` | 未注册 | 否 |
@@ -76,7 +76,7 @@ TensorAgent 在每次加载模型之前写入自己的取值（`EngineMemoryPoli
 | `TS_HOST_MOE_DECODE` | 启用卸载的 MoE 模型 | `0` 让单 token 的被卸载层改走 ggml CPU 计算图，而不是 TensorSharp 的 decode 内核（仍用 ggml 自己的 CPU 点积，但线程组每层只唤醒一次；在 M5 Pro 上跑 Qwen3.8-Flash-Next 时每层 0.6 → 0.32 ms）。用于 A/B 对比 | 启用 | 未注册 | 否 |
 | `TS_HOST_MOE_TIMING` | 启用卸载的 MoE 模型 | 诊断：`1` 主机侧每次调用的准备与 matmul 时间，以及流式 prefill 的字节数、传输速率与 GPU 时间；`2` 每个权重的拷贝速率（会同步，改变所测的东西）；`3` 每个 decode pass 的加速器分段、主机专家与上传时间；`4` 单 token 内核的各阶段与工作线程的唤醒 | 关闭 | 未注册 | 否 |
 | `TS_HOST_MOE_EXPERT_FILTER` | 启用卸载的 MoE 模型 | 只流式传输该 batch 实际路由到的专家，并合并成连续区间 | 启用 | 未注册 | 否 |
-| `MAX_CONTEXT` | 长文本 / 上传文本 | 硬上下文上限。设置了就是硬性要求：缓存放得下就照办，放不下就带着数字拒绝。不设置时，GGUF 宣称的长度只是上限，加载器会按设备真正装得下的量来定——GLM-5.2 宣称 1M token，那是约 93 GiB 的 KV | 模型默认值（是上限而非承诺） | `4096`, `8192`, `16384` | 是 |
+| `MAX_CONTEXT` | 长文本 / 上传文本 | 硬上下文上限。设置了就是硬性要求：缓存放得下就照办，放不下就带着数字拒绝。不设置时，GGUF 宣称的长度只是上限，加载器会按设备真正装得下的量来定——GLM-5.2 宣称 1M token，那是约 93 GiB 的 KV。`ggml_cuda` 上的 Qwen 3.8 Flash Next 在放置专家之后，若各 GPU 已没有空间让 KV 缓存继续增长，也可能缩小窗口（`context capped at N tokens`）；设置 `MAX_CONTEXT` 会预先分配整个窗口，放置规划会为它预留空间 | 模型默认值（是上限而非承诺） | `4096`, `8192`, `16384` | 是 |
 
 ## Prefill / Decode 调优
 
@@ -329,7 +329,8 @@ V4.1 的服务路径是一套原生 `ggml_cuda` 计算图，另有 `ggml_cpu` �
 | `TS_GEMMA4_TP_FUSED_MOE` | GGML 上 TP 下的 Gemma 4 MoE | `0` 表示从融合的整模 MoE 主干（专家内部 Megatron 切分）回退到逐算子的整专家路径 | 开启（融合主干） | 未注册 | 否 |
 | `TS_GLM_TP_SHARD` | GGML 上 TP 下的 GLM 5.x | 切分哪一半：`1` 注意力头，`2` 路由专家，`3` 两者都切。路由专家是在每个专家内部按行切分，而不是按专家 id 分配，因为 `ggml_mul_mat_id` 要求同一 token 选中的专家 id 互不相同 | `3`（两者） | `1`, `2`, `3` | 否 |
 | `TS_GLM_TP_OVERSUBSCRIBE` | GGML 上 TP 下的 GLM 5.x | `1` 允许多个 rank 共享一张 GPU，用于在单卡机器上验证切分的正确性 | `0`（一 rank 一卡） | `0`, `1` | 否 |
-| `TS_Q4E_LAYER_SPLIT` | `--layer-split N` 下按层切分的 Qwen 3.8 Flash Next（`qwen4exp`） | 直接指定每张 GPU 分到的层数（逗号分隔，例如 `20,28`），取代自动的显存均衡；给出无法满足的值时会直接抛错，而不是静默忽略。这个架构上的 `--layer-split N` 是按层切分而非张量并行——`--tp N` 是独立的 FFN 通道切分模式，不使用此层分配覆盖值 | 自动（按各设备空闲显存装箱） | 未注册 | 否 |
+| `TS_Q4E_LAYER_SPLIT` | `--layer-split N` 下按层切分的 Qwen 3.8 Flash Next（`qwen4exp`） | 直接指定每张 GPU 分到的层数（逗号分隔，例如 `20,28`），取代自动划分；给出无法满足的值时会直接抛错，而不是静默忽略。在 `ggml_cuda` 上，每张 GPU 仍会卸载自己靠前那些层的专家；某张 GPU 即使把全部专家放到主机也放不下它的层段时会拒绝加载。这个架构上的 `--layer-split N` 是按层切分而非张量并行——`--tp N` 是独立的 FFN 通道切分模式，不使用此层分配覆盖值 | 自动：`ggml_cuda` 上层段与专家卸载一起按每张 GPU 的空闲显存确定；`ggml_vulkan` 上按权重字节均衡 | 未注册 | 否 |
+| `TS_Q4E_PREFILL_CHUNK` | 不使用 `--tp` 的 `ggml_cuda` 上的 Qwen 3.8 Flash Next（`qwen4exp`），单卡或 `--layer-split N` | 最宽 prefill span 的 token 数（至少 128）；更长的提示词分块按连续的多个 span 运行。span 越窄所需工作区越小，能把专家留在 GPU 上的层就越多（decode 更快）；span 越宽，主机路由专家在每个 span 的流式传输开销分摊得越开（长提示词 prefill 更快）。span 所读取的 KV 超过 16,384 行后，span 还会自动变窄；图像与投机解码的前向同样按 span 切分。取值不是不小于 128 的整数时，加载会报错终止 | 所有路由专家都留在 GPU 上时为 `4096`，只要有一层路由到主机就为 `2048` | 未注册 | 否 |
 | `TS_Q4E_RETAINED_CACHE_MB` | Qwen 3.8 Flash Next（`qwen4exp`）保留复用 | 保留会话与共享前缀检查点共用的预算（MiB），受实测内存余量限制。未设置时预算为实测余量的一半（与 Qwen 3.5 对空闲 holder 的规则相同），只有无法测得余量时才用 4096；原先固定的 4096 默认值在 4x A40 张量切分上只能容纳四个并发 1.3 GB 会话中的三个。Radix 前缀缓存负责淘汰，放不下的 holder 会被拒绝（只报告一次）。`0` 或无法解析的值拒绝所有保留 | 实测余量的一半（无法测得时为 `4096`） | 未注册 | 否 |
 | `GGML_CUDA_ALLREDUCE` | 本地 TP，`ggml_cuda` | `nccl` / `internal` / `none` —— 直接透传给 ggml 的集合通信选择；显式设置同时会跳过启动前探测 | 自动（构建时能找到 NCCL 且通过探测就用 NCCL） | 未注册 | 否 |
 | `TS_GGML_TP_CUDA_GRAPHS` | 本地 TP，`ggml_cuda` | `0` 关闭多 GPU 运行下的 CUDA graph 捕获。TP 下默认**开启**捕获：一个张量并行 token 是几十次按 rank 的小提交，重放的代价远低于重新下发（4×A40：Qwen3.5-9B tp4 88 → 128.5 tok/s，Qwen3.5-35B-A3B tp2 71.3 → 104.1）。历史上曾因捕获污染的隐患而禁用，那个隐患已不再成立——ggml 用 `cudaStreamCaptureModeRelaxed` 捕获。这个 opt-out 会在第一次后端调用之前翻译成原生的 `GGML_CUDA_DISABLE_GRAPHS`，因为 ggml 会在首次使用时锁定该值 | 开启捕获 | 未注册 | 否 |

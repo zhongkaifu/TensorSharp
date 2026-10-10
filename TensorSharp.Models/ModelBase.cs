@@ -2881,8 +2881,12 @@ namespace TensorSharp.Models
         /// <param name="draftModelPath">Optional speculative-decoding draft
         /// model (DeepSeek V4's DSpark support GGUF, Muse-Glimmer's DFlash block);
         /// ignored by architectures that have no drafter.</param>
+        /// <param name="projectorPath">Optional multimodal projector the caller will load
+        /// after the model is built; when omitted, the path set by an enclosing
+        /// <see cref="ExpectProjector"/> scope is used. Lets architectures that place
+        /// weights against device memory leave room for it.</param>
         public static ModelBase Create(string ggufPath, BackendType backend, int tpDegree = 1, ITensorParallelGroup tpGroup = null,
-            string draftModelPath = null, int layerSplitDegree = 1)
+            string draftModelPath = null, int layerSplitDegree = 1, string projectorPath = null)
         {
             if (tpGroup == null && tpDegree <= 1)
                 tpDegree = ReadParallelDegree("TENSORSHARP_TP_DEGREE", tpDegree);
@@ -2894,11 +2898,40 @@ namespace TensorSharp.Models
 
             tpDegree = ResolveTensorParallelSupport(architecture, backend, tpDegree, ref tpGroup,
                 out int layerSplit, layerSplitDegree);
-            var context = new ModelCreateContext(ggufPath, backend, probe, tpDegree, tpGroup, draftModelPath, layerSplit);
+            var context = new ModelCreateContext(ggufPath, backend, probe, tpDegree, tpGroup, draftModelPath, layerSplit,
+                projectorPath ?? s_expectedProjector.Value);
             architecture.ApplyNativeTunables?.Invoke(context);
             ModelBase model = architecture.Factory(context);
             model.VerifyTensorParallelShardedWeights(architecture.Id);
             return model;
+        }
+
+        private static readonly System.Threading.AsyncLocal<string> s_expectedProjector = new();
+
+        /// <summary>
+        /// Declare, for the <see cref="Create"/> calls made inside the returned scope,
+        /// the multimodal projector the caller will load once the model exists. Hosts
+        /// that build the model through a factory delegate use this instead of
+        /// threading the path through every factory signature.
+        /// </summary>
+        public static IDisposable ExpectProjector(string projectorPath)
+        {
+            string previous = s_expectedProjector.Value;
+            s_expectedProjector.Value = string.IsNullOrWhiteSpace(projectorPath) ? null : projectorPath;
+            return new ProjectorScope(previous);
+        }
+
+        private sealed class ProjectorScope : IDisposable
+        {
+            private readonly string _previous;
+            private bool _disposed;
+            public ProjectorScope(string previous) => _previous = previous;
+            public void Dispose()
+            {
+                if (_disposed) return;
+                _disposed = true;
+                s_expectedProjector.Value = _previous;
+            }
         }
 
         private static int ReadParallelDegree(string variable, int fallback)

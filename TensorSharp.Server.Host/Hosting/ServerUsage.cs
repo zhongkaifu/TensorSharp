@@ -231,7 +231,9 @@ namespace TensorSharp.Server.Host.Hosting
                     "Keep the routed MoE expert weights of the first N layers in system RAM and multiply them on " +
                     "the CPU; attention, norms, the router and the shared expert stay on the accelerator. This is " +
                     "what makes a 35B-A3B MoE fit beside a long-context KV cache on a 12-16 GB card. Pass 'all' " +
-                    "for every layer. Default: 0 (everything on the accelerator; TS_N_CPU_MOE env var overrides).",
+                    "for every layer. Default: 0 (everything on the accelerator; TS_N_CPU_MOE env var overrides), " +
+                    "except that Qwen 3.8 Flash Next on ggml_metal / ggml_cuda plans the offload itself when its " +
+                    "experts do not fit (per GPU under --layer-split N); any explicit value, 0 included, pins it.",
                     "--n-cpu-moe 32"),
                 new OptionHelp("--cpu-moe | -cmoe",
                     "Shorthand for --n-cpu-moe all: every routed expert stays in system RAM. Default: off " +
