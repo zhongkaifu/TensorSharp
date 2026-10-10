@@ -415,7 +415,14 @@ evidence for this distinction without treating normal pressure as a callback err
 - `AcquireReadSetAsync` releases partial pins on pressure or conflicts. Retry the
   whole operator working set, microbatch, or use a supported tensor partition.
 - Best-effort prefetch does not evict existing demand data. In-flight reads still
-  consume reserved transfer bandwidth and memory.
+  consume reserved transfer bandwidth and memory. A physical allocator refusal
+  is a prefetch miss. Demand allocation retries after evicting idle replicas from
+  the affected pools, bounded by the initial resident set; it never evicts leases
+  or borrows another request's reserved credit. A refused RAM demotion can spill
+  directly to disk. Full disk or failed cleanup preserves the recovery source
+  (or quarantined allocation), rather than returning fictitious free credit.
+  `MemorySchedulerStats.PhysicalAllocationRefusals` distinguishes these physical
+  refusals from logical quota exhaustion.
 - One resource larger than a pool fails explicitly. The executor must provide a
   correct tiled kernel; arbitrary byte slicing alone does not make a kernel tiled.
 - Spill restore checks its hash before publishing the destination. These files are
@@ -444,9 +451,23 @@ release and stopping once the request can fit. Newest/public prefixes remain
 evictable for admission; pins and pending donations still protect live state.
 If credit is still insufficient, the worker sleeps outside the model lock and
 wakes on a budget change or command. Its own partial reclaim does not busy-spin.
-This does not implement cross-engine eviction, revoke live owners, or supply
-missing model-specific peak estimates. `MemoryBudget.CanReserve` only observes
-headroom; the subsequent atomic `TryReserve` remains authoritative.
+Blocked engines now publish pressure to other engines using the same ledger.
+Each peer reclaims its own idle state on its own worker, under its own model lock,
+only when no sequence is running and the compute gate is open. Notifications
+coalesce once per budget generation; cancelled demand cannot cause later eviction.
+This is cooperative reclamation, not global LRU or strict inter-engine fairness.
+It does not permit concurrent AdaptiveModelSessions over process-global GGML caches,
+revoke live owners, or supply missing model-specific peak estimates.
+`MemoryBudget.CanReserve` only observes headroom; atomic reservation still decides
+admission. A closed compute gate permits cancellation of unadmitted requests but
+defers commands releasing or retaining model state until the gate opens.
+
+`ContinuousBatchSchedulerTests.Engine_RepeatedPressureAndCancellationPreservesFifoProgressAndCredit`
+accepts `TS_TEST_SHARED_MEMORY_SOAK_CYCLES=100000` (64 by default, at most 1000000).
+Every cycle submits eight requests behind an external budget owner, cancels four,
+and verifies survivors' FIFO progress, tokens and complete credit return. It uses
+a controlled model, so a large cycle count does not establish long-running GPU
+service stability or global fairness between engines.
 
 ```sh
 dotnet run --project eng/tests/unified-memory/UnifiedMemory.Tests.csproj -c Release \
@@ -482,7 +503,10 @@ known failures and benchmark limitations; generated evidence stays in ignored
 [`UnifiedMemory.LongContextProbe`](../eng/validation/UnifiedMemory.LongContextProbe/README.md)
 runs separate reference/candidate processes, records real prompt lengths, admitted
 concurrency, request estimates, exact ledger maxima and observed RSS/device usage.
-Its Linux cgroup wrapper refuses unavailable enforcement. The design records 8K,
+Its Linux cgroup wrapper refuses unavailable enforcement. The Windows
+[`run-memory-job.py`](../eng/validation/run-memory-job.py) wrapper verifies a Job
+private-commit ceiling with an allocation-refusal canary before running the model;
+this does not cap RSS, file-cache residency or VRAM. The design records 8K,
 32K, 64K and 128K configured-context results, without counting queued requests as
 simultaneously running or logical quotas as physical hard limits.
 

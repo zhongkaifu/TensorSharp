@@ -2041,6 +2041,112 @@ CUDA普通/连续恢复全快照字节和四步完整logits一致性测试，缺
 更多MoE/多模态/MTP/TP场景。旧VM的Linux结果属于历史，不能算当前提交的新
 验收；短计数/恢复一致性也不能代替全面语义质量基准。
 
+### 跨引擎压力、物理拒绝恢复与更多模型：2026-10-10
+
+本轮仍只在 Windows 11、i7-11800H、32 GiB RAM、RTX 3080 Laptop 16 GiB 上实测。
+VM 已关闭。新增 Qwen3.5 0.8B Q8_0 与 F16 mmproj 来自
+`unsloth/Qwen3.5-0.8B-GGUF`，下载 revision 为
+`6ab461498e2023f6e3c1baea90a8f0fe38ab64d0`，两文件均按仓库 LFS SHA-256 校验。
+模型和本轮证据实际位于 D: USB HDD，通过目录联接从 `C:\Works\models` 和
+`artifacts/runtime-pressure-20261010/` 访问；不能把其交换性能写成 SSD/NVMe 性能。
+ggml 仍为未修改的 `ffa4e8b80930029a35991f94e7c8a93cd67730ab`；本轮没有原生 ggml 改动。
+
+**新完成的执行/恢复路径：**
+
+- 同一 `MemoryBudget` 的引擎现在能够发布准入压力，唤醒其他空闲引擎。对方只在自己的
+  worker、自己的模型锁下回收，不跨模型持锁，也不驱逐运行中的序列。通知按预算变化合并，
+  两个无可回收资源的引擎不会相互忙唤醒。清除已取消需求，不把过期通知当作回收依据。
+  这不是全局 LRU 或跨引擎严格 FIFO；也没有解除 GGML 进程全局缓存只支持一个
+  `AdaptiveModelSession` 的限制。
+- 修复已取消 token 的回调早于 Submit 到达时留下孤立请求的问题；回调绑定序列身份，
+  旧请求的延迟取消不会误伤复用同一 ID 的新请求。计算门关闭时仍可取消尚未准入的请求，
+  但释放活跃状态、trim 和修改推测执行的命令必须等门重新打开。
+  这些是跨平台调度契约测试，不能替代 Apple 前后台切换、AOT 或真实 Metal/MLX 验收。
+- RAM 分配可能在账本尚有额度时被 OS 拒绝。需求读取现在先归还失败分配的预留，
+  再有界地回收相应 pool 的空闲副本；允许回收另一请求的空闲页面，但额度仍归还原请求，
+  不挪用对方预留。host demotion 物理拒绝可直接转磁盘；磁盘满、lease 存活或清理失败时
+  保留恢复源/隔离计账。预取被物理拒绝只记一次 miss，不为预取驱逐需求数据。
+  `PhysicalAllocationRefusals` 单独记录此类拒绝。CUDA adapter 将驱动 OOM 映射为同一契约。
+- 实际硬限触发了 Qwen 的每算子后备路径，暴露出失败投影和已消费 hidden 的 host owner
+  泄漏。已修复并增加真实 CUDA 强制分配拒绝回归；池化块只有实际 trim 后才归还额度，
+  测试不会把池化保留当作泄漏，也不会提前归还物理所有权。
+
+**硬限验收口径：** 新工具 `eng/validation/run-memory-job.py` 将挂起的子进程先加入
+Windows Job，再恢复执行；读回限制，并用超额 `VirtualAlloc` 必须失败的 canary 证明
+限制生效。超时终止自己启动的进程树，不可用时无无界运行的后备。该限制是私有提交内存，
+不是 RSS、文件映射/页缓存或 VRAM 硬限，也没有让 portable scheduler 依赖 Windows API。
+
+Qwen 0.8B、32K 容量、28,002 × 2 实际输入、每请求 32 输出、chunk 256、F16 KV：
+最初把逻辑 RAM/GPU 各设成 8 GiB，放进 8 GiB Job 时失败；回收修复后仍可能因
+WDDM/CUDA 的提交内存需要额外余量而失败，不能用“池额度相同”冒充完整物理约束。
+改为 RAM/GPU 各 6 GiB、spill 8 GiB 后，两路同时准入，逐 token 与无预算对照一致，
+一次物理拒绝通过一次实际换出恢复；累计传输 23,347,276 bytes，结束后所有账本和
+host/native owner 归零。wall 61.267 s，prefill 1,326–1,355、decode 70.78–72.78 tokens/s。
+Job peak commit 8,588,500,992 bytes，距离 8 GiB 限制仅约 1.37 MiB，余量很紧；
+这是一条成功压力恢复记录，不是跨负载安全默认配置或全物理计账完成的证明。
+
+**真正运行并发与性能：** 下表 reference 是 TensorSharp 无共享预算的同一路径，
+不是 llama.cpp。每 arm 新进程、同一模型/提示/KV/chunk/生成长度，哈希读取会暖文件缓存，
+未锁定 GPU 时钟。prefill/decode 是 forward 计时，wall 包含调度和快照开销；不能相互替代。
+
+| Qwen 0.8B 场景 | wall s，reference→共享预算 | prefill tokens/s | decode tokens/s | peak RSS GiB |
+|---|---:|---:|---:|---:|
+| 32K，28,002×2，正序 | 61.524→58.238 | 1,337–1,356→1,340–1,360 | 70.53–73.88→69.91–72.99 | 6.842→6.768 |
+| 同配置反序 | 58.933→68.197 | 1,328–1,349→1,275–1,297 | 70.89–73.92→40.10–73.87 | 6.837→6.751 |
+| 64K，56,010×2 | 166.904→166.948 | 1,011–1,016→1,011–1,021 | 61.24–66.90→63.41–65.56 | 11.971→11.540 |
+
+这些运行的观测最大 running 都是 2，采用按序列执行、交替恢复状态，不是双序列 CUDA
+批处理内核。32K 共享 RAM/GPU/spill 各 8 GiB；64K 为 12/12/16 GiB。
+两组模型输出都完全一致，native quota 拒绝为 0、实际 spill 为 0，清理后账本归零。
+另有 RAM/GPU/spill 各 4 GiB 的 32K 测试虽正确完成，但 running 只有 1，不计作并发通过。
+32K 两种顺序的 wall 差分别为 -5.34%/+15.72%，波动尚未归因，不能宣称已消除额外开销。
+64K 单组 wall 差 +0.03%，也是单组证据，不是跨负载无开销保证。
+64K 状态所有权切换 reference/共享预算为 55.166/55.195 s；其中 extraction 为
+34.607/34.811 s、bulk inject 为 12.244/12.324 s。phase 存在嵌套，不能加总；
+完整快照捕获仍是后续减少共同基线开销的主要方向。
+
+4K 容量、最少 3,500 输入、提交两个请求但只运行一个的短请求复测，保持每请求 32
+输出、chunk 256、禁用 prefix/speculation。正序/反序各一个新进程对照：
+
+| 模型 | 正序 wall s，reference→共享预算 | 反序 wall s，reference→共享预算 | decode 范围，reference→共享预算 |
+|---|---:|---:|---:|
+| Qwen3.5 0.8B Q8_0 | 4.413→4.440（+0.61%） | 4.388→4.437（+1.11%） | 77.27–80.33→76.69–80.16 |
+| Gemma4 E4B uncensored Q8_0 | 4.065→4.064（-0.04%） | 4.097→4.205（+2.64%） | 48.48–49.87→47.63–49.84 |
+
+均输出一致、未发生 native quota 拒绝、清理后额度归零。Qwen RAM/GPU 各 4 GiB，
+Gemma RAM/GPU 为 8/12 GiB，两者 spill 额度为 0；此串行 lane 无请求快照换出。
+包括冷图构建，不包括进程启动/模型加载，文件缓存也未清空；因此只能说这轮首请求的
+额外耗时较小，不能说已经修复了受控磁盘冷启动，更不能把与上轮的差异全部归因于代码。
+
+**模型质量与测试口径：**
+
+- Qwen 0.8B 图像后多轮复用、并发文本/图像、快照导入/克隆已实测。图像控制最大 logit
+  差 0.00997，文本控制 0.00502，恢复的 6 步完整 logits 差为 0；这些证明的是执行一致性。
+  模型仍可能把屋顶/墙壁颜色说反、误判主体颜色，并把尼罗河列为欧洲河流。
+  本地 llama.cpp `b10636-4d19b2876` 用同一 Q8_0、相同系统/用户提示也输出了
+  “Rhine, Danube, and the Nile”。按用户要求记录该双方共有的地理错误，暂不修改模型；
+  图像语义还没有独立 oracle 结论，不计作质量通过。
+- 本地 Qwen3.6 35B-A3B UD-IQ2_XXS 的 CUDA MTP 测试过去只要求前半段 token 一致，
+  并且继续生成到 EOS 之后。现在要求首个 EOS 前及 EOS 本身完全一致，缺少模型/开关/设备
+  明确记作 skipped。本轮首都问答 13/13 tokens 一致；draft 12、accept 8、verify 4、
+  rollback 2。短回答普通 decode 19.06、MTP 10.29 tokens/s，MTP 明显更慢，不能据此
+  默认启用。普通 prefill 含冷图构建、MTP 在同进程后跑，因此二者 prefill 数字不构成
+  公平性能对照。本测试也不是共享预算 MoE/MTP 全模型验收。
+
+**回归范围：** 最终相关 .NET 回归 474 通过、10 skipped；其中真实 CUDA 不可能容量分配
+验证 OOM 分类、额度归还以及随后小分配的可用性。受控主机/文件系统 harness 为
+58 通过、1 skipped（Windows 不允许该文件共享模式下的损坏注入），模拟 accelerator
+明确标记，不当作设备实测。Windows Job API 的正常退出、非零退出及超时清理三项通过。
+另外 Qwen 强制拒绝及 100,000 轮请求压力分别通过；后者共 800,000 请求、400,000 取消，
+逐轮检查存活请求的 FIFO 进度、输出和完整额度归还，测试耗时 9.41 s。
+这是高次数状态机测试，不是多小时真实 GPU 服务 soak。多模态三项通过、一项缺 27B 模型
+skipped；MTP 实际执行一项通过。各子集有重叠，不相加成独立通过总数。
+
+**仍未完成：** 共享预算继续显式开启。完整 GC/tokenizer/mmap/页缓存/vendor/driver
+物理归属、各平台等价硬限和自动余量规划尚未闭环；Apple 执行适配/真机、多小时取消/公平性、
+全局跨引擎回收策略、MoE/多模态/MTP/TP 的完整共享预算适配仍待完成。单卡本机不能把
+Apple 和 TP 场景算作通过；局部 CUDA/受控主机状态机测试也不能替代这些验收。
+
 ## 15. 后续实际接入与硬件验证入口
 
 `PagedKvStorage` 的 `Acquire` 返回有生命周期的 span 租约；`BatchExecutor` 的捕获、尾页刷新、恢复全部使用该 API。底层将一个页面视为不解释布局的可变资源，按原字节回写/恢复。前缀引用继续保留逻辑页，最后一个引用消失才注销；id 再次分配时增加 epoch。失败的释放不把页面放回 free queue。捕获 scratch 和固定搬运缓冲在启动时预留，单个模型必须能容纳一个合法完整快照页。恢复阶段可在有空闲驻留容量时预取下一页，与当前注入操作重叠；停止/回收前等待预取结束。
@@ -2055,7 +2161,7 @@ export TS_SCHED_KV_SPILL_DIRECTORY=/path/on/ssd/tensorsharp-kv
 
 这些是**每个引擎的主机快照预算**，包含其 scratch/staging；不是总 RSS、模型权重、原生设备 KV 或 holder 的上限。多引擎部署须保证这些独立配额总和适合机器容量。显式配置后，planner 使用逐序列主机快照路径；不支持安全跨序列恢复、零字节布局或快照页大于可恢复窗口的模型在创建 engine 时明确拒绝。单请求直接执行可不捕获快照，更大的原生 attention/KV/holder 适配仍需对应实现。
 
-程序化配置还可通过 `KvSnapshotOptions.FromSharedBudget(budget, ramPool, ssdPool, directory)` 借用同一份 `MemoryBudget`，将多个引擎的页面、capture scratch、staging 和 spill 记入共同的物理 pool。此时共享 pool 的容量替代独立引擎限额，`MemoryUsage` 返回所有 owner 的总账；释放一个引擎只归还它自己的额度，不要求整个账本归零。每个引擎只能驱逐自己的页面；共享账本尚不提供跨引擎 LRU。
+程序化配置还可通过 `KvSnapshotOptions.FromSharedBudget(budget, ramPool, ssdPool, directory)` 借用同一份 `MemoryBudget`，将多个引擎的页面、capture scratch、staging 和 spill 记入共同的物理 pool。此时共享 pool 的容量替代独立引擎限额，`MemoryUsage` 返回所有 owner 的总账；释放一个引擎只归还它自己的额度，不要求整个账本归零。准入压力可以唤醒共享账本的其他空闲引擎，由对方回收自己的缓存；尚不提供全局跨引擎 LRU。
 
 `TensorSharp.GGML.GgmlCacheBudgetScope` 将原生 lazy device-copy 与显式 preload 接入这份托管预算。每个 rank 映射到一个或多个 pool；例如 UMA 同时约束 `node0/ram` 和 `node0/gpu0`，独立显卡只约束对应 GPU pool。必须在这些缓存首次分配前安装；原生预留、实际分配、commit 和物理释放依次持有同一额度。已有缓存或正在分配时拒绝接管；仍有额度或回调在途时拒绝卸载并保留托管回调，允许清理后重试。停止模型执行并清空原生缓存后再释放 scope。不要又在请求 envelope 中重复预留这些由适配器直接计费的字节。
 
@@ -2067,7 +2173,7 @@ export TS_SCHED_KV_SPILL_DIRECTORY=/path/on/ssd/tensorsharp-kv
 DeepSeek 暂存随模型销毁释放；紧凑 arena 可在空缓存 trim 时释放。
 省略 `hostPools` 保留原契约；OS 页缓存、模型映射、CPU 长 prefill scratch 等仍未覆盖。
 
-`SchedulerConfig.MemoryAdmission` 已接入实际调度器：执行器提供每请求完整增量峰值，按多 pool 原子预留；准入先于前缀物化，取消/结束/抢占的额度在模型释放完成后才归还。`SequenceState.MemoryEnvelope` 用于实际分配，防止双重计账；缓存存活的子分配继续计费。共享权重、池化 arena 和保留前缀必须采用自己的生命周期额度。预算耗尽且当前引擎无运行请求时，先回收自己的空闲缓存至够用，仍不足则在模型锁外等待预算变化或新命令，不忙轮询。尚未为所有旧模型自动推导成本，也不跨引擎驱逐缓存。
+`SchedulerConfig.MemoryAdmission` 已接入实际调度器：执行器提供每请求完整增量峰值，按多 pool 原子预留；准入先于前缀物化，取消/结束/抢占的额度在模型释放完成后才归还。`SequenceState.MemoryEnvelope` 用于实际分配，防止双重计账；缓存存活的子分配继续计费。共享权重、池化 arena 和保留前缀必须采用自己的生命周期额度。预算耗尽且当前引擎无运行请求时，先回收自己的空闲缓存至够用，仍不足则发布共享预算压力，在模型锁外等待预算变化或新命令，不忙轮询。其他空闲引擎在自己的模型锁和计算门约束下协同回收；尚未为所有旧模型自动推导成本。
 
 多卡 `ResourcePlacement` 工作集失败时释放所有部分 pin，`ResourceLeaseSet.ReleaseAfterAsync` 接受全 rank fence。CUDA 实现真实 event fence 与可选 P2P；默认跨设备走有界主机中转。仓库既有 P2P 通信实现记录了部分云端 PCIe/IOMMU 拓扑传输损坏，故新接口也不能只凭 `cuDeviceCanAccessPeer` 就默认启用。
 

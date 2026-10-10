@@ -10,6 +10,46 @@ namespace InferenceWeb.Tests;
 // Actual device allocation; run with TS_TEST_GGML_BACKEND=cuda and native test hooks.
 public sealed class GgmlGraphBudgetScopeTests
 {
+    [CudaFact("TS_TEST_MODEL_DIR", "Qwen3.5-0.8B-Q8_0", GgmlBackend = BackendType.GgmlCuda)]
+    public void QwenPerOpAllocationRefusalReleasesProjectionAndConsumedHiddenState()
+    {
+        GgmlBasicOps.ClearHostBufferCache();
+        GgmlBasicOps.ReleaseReuseComputeBuffers();
+        var budget = new MemoryBudget([new("ram", 4L << 30), new("gpu", 4L << 30)]);
+        using var native = new GgmlCacheBudgetScope(budget, [["gpu"]], true, ["ram"]);
+        using var host = new HostAllocationBudgetScope(budget, ["ram"]);
+        string path = TestGates.FindGguf(Environment.GetEnvironmentVariable("TS_TEST_MODEL_DIR"), "Qwen3.5-0.8B-Q8_0");
+        using (var model = (Qwen35Model)ModelBase.Create(path, BackendType.GgmlCuda, 1, null, null, 1, null,
+            new ModelMemoryPolicy(512, 64) { OmitEmbeddedDraftWeights = true }))
+        {
+            var flags = System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance;
+            var allocator = (IAllocator)typeof(ModelBase).GetField("_allocator", flags)!.GetValue(model)!;
+            using var input = new Tensor(allocator, DType.Float32, 64, model.Config.HiddenSize);
+            using var envelope = budget.Reserve([new("gpu", 0)]);
+            using (native.EnterExecution(envelope))
+            {
+                var method = typeof(Qwen35Model).GetMethod("FusedNormLinear", flags)!;
+                object At(string field) => ((Array)typeof(Qwen35Model).GetField(field, flags)!.GetValue(model)!).GetValue(0)!;
+                ((GgmlAllocator)allocator).Context.ReleasePooledMemory();
+                long before = host.Usage.Bytes;
+                var failure = Assert.Throws<System.Reflection.TargetInvocationException>(() =>
+                    method.Invoke(model, [input, At("_attnNormW"), At("_ssmInProjQW"), At("_ssmInProjF32")]));
+                Assert.IsType<InvalidOperationException>(failure.InnerException);
+                ((GgmlAllocator)allocator).Context.ReleasePooledMemory();
+                Assert.Equal(before, host.Usage.Bytes);
+                var loop = typeof(Qwen35Model).GetMethod("RunPerOpLayerLoop", flags)!;
+                Assert.Throws<System.Reflection.TargetInvocationException>(() => loop.Invoke(model, [input, 64, 0]));
+            }
+        }
+        GgmlBasicOps.ClearHostBufferCache();
+        GgmlBasicOps.ReleaseReuseComputeBuffers();
+        Assert.True(native.AllocationRefusals.Count > 0);
+        Assert.Null(native.CallbackError);
+        Assert.Equal(0, host.Usage.Bytes);
+        Assert.Equal(0, native.ActiveAllocations);
+        Assert.All(budget.Snapshot(), p => Assert.Equal(0, p.Committed + p.Reserved));
+    }
+
     [CudaFact("TS_TEST_MODEL_DIR", "gemma-4-12B-it-qat", GgmlBackend = BackendType.GgmlCuda)]
     public void GemmaPerOpPrefillPositionCachesReleaseHostCreditOnModelDispose()
     {

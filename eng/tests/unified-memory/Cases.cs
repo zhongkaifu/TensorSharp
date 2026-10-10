@@ -178,7 +178,7 @@ static partial class Cases
         string path = Directory.GetFiles(f.Root, "*.bin", SearchOption.AllDirectories).Single();
         // An external writer/corrupt medium is outside FileShare's advisory protection
         // on Unix; the runtime must still detect changed bytes when restoring.
-        if (OperatingSystem.IsWindows()) throw new PlatformNotSupportedException("Use a filesystem fault injector for this corruption case on Windows.");
+        if (OperatingSystem.IsWindows()) throw new TestUnavailableException("Use a filesystem fault injector for this corruption case on Windows.");
         using (var stream = new FileStream(path, FileMode.Open, FileAccess.Write, FileShare.ReadWrite)) stream.WriteByte(45);
         await Check.ThrowsAsync<InvalidDataException>(() => f.Read(a));
         Check.Equal(0, f.Scheduler.GetStats().ActiveLeases);

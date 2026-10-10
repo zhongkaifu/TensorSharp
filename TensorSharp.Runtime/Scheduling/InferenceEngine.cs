@@ -56,6 +56,9 @@ namespace TensorSharp.Runtime.Scheduling
         private readonly Dictionary<string, Exception> _failedSequenceReleases = new(StringComparer.Ordinal);
         private bool _stopping;
         private bool _disposed;
+        private readonly SharedBudgetReclamation.Registration? _sharedReclamation;
+        private int _reclamationPending;
+        private readonly Queue<EngineCommand> _gateDeferredCommands = new();
 
         /// <summary>Whether the radix prefix cache serves this loaded model (prefix
         /// caching is on and the model implements the prefix-cache contract).</summary>
@@ -114,6 +117,12 @@ namespace TensorSharp.Runtime.Scheduling
                         ExecutionOptions.FromEnvironment(),
                         cfg));
 
+                if (cfg.MemoryAdmission is { } memoryAdmission)
+                    _sharedReclamation = SharedBudgetReclamation.Register(memoryAdmission.Budget, () =>
+                    {
+                        if (Interlocked.Exchange(ref _reclamationPending, 1) == 0)
+                            _commands.Writer.TryWrite(new EngineCommand { Kind = EngineCommandKind.Reclaim });
+                    });
                 _worker = new Thread(WorkerLoop)
                 {
                     IsBackground = true,
@@ -123,6 +132,7 @@ namespace TensorSharp.Runtime.Scheduling
             }
             catch
             {
+                _sharedReclamation?.Dispose();
                 _pool.Storage.Dispose();
                 throw;
             }
@@ -221,6 +231,7 @@ namespace TensorSharp.Runtime.Scheduling
                     {
                         Kind = EngineCommandKind.Submit,
                         Sequence = seq,
+                        Cancellation = ct,
                     }))
                 {
                     _handles.TryRemove(seq.RequestId, out _);
@@ -272,6 +283,11 @@ namespace TensorSharp.Runtime.Scheduling
             });
         }
 
+        // Cancellation registrations belong to one submission, not to every
+        // future request that may reuse its string ID.
+        internal void Abort(SequenceState sequence) => _commands.Writer.TryWrite(new EngineCommand
+        { Kind = EngineCommandKind.Abort, RequestId = sequence.RequestId, Sequence = sequence });
+
         public void Dispose()
         {
             lock (_disposalGate)
@@ -294,6 +310,7 @@ namespace TensorSharp.Runtime.Scheduling
                 if (_worker.IsAlive && !_worker.Join(TimeSpan.FromSeconds(60)))
                     throw new TimeoutException("InferenceEngine worker did not finish within 60s. Model buffers remain owned; retry disposal after the worker stops.");
 
+                _sharedReclamation?.Dispose();
                 var abandoned = new ObjectDisposedException(nameof(InferenceEngine),
                     "The inference engine was shut down while this request was in flight.");
                 foreach (var entry in _handles)
@@ -358,6 +375,7 @@ namespace TensorSharp.Runtime.Scheduling
                     }
                 }
             }
+            finally { _sharedReclamation?.Dispose(); }
         }
 
         private void RunWorkerLoop()
@@ -380,16 +398,45 @@ namespace TensorSharp.Runtime.Scheduling
                     finally { wake.Cancel(); }
                     memoryWait = null;
                 }
+                // Cleanup/retention can submit backend work too. Leave commands
+                // owning model state parked while the host disallows GPU work;
+                // metadata-only submission/cancellation can still make progress.
+                if (Volatile.Read(ref _computeGate)?.IsOpen ?? true)
+                    while (_gateDeferredCommands.TryDequeue(out var deferred))
+                        lock (_model.GpuComputeLock) ApplyCommand(deferred);
                 // Drain queued commands (non-blocking).
                 while (_commands.Reader.TryRead(out var cmd))
                 {
+                    if (!(Volatile.Read(ref _computeGate)?.IsOpen ?? true) && !CanApplyWhileGateClosed(cmd))
+                    {
+                        _gateDeferredCommands.Enqueue(cmd);
+                        continue;
+                    }
                     lock (_model.GpuComputeLock)
                         ApplyCommand(cmd);
+                }
+
+                if (_scheduler.WaitingCount == 0) _sharedReclamation?.Clear();
+                // Foreign pressure can arrive during a forward. Keep the single
+                // pending bit until every live sequence has finished; never trim
+                // active state or submit GPU work while the host gate is closed.
+                if (Volatile.Read(ref _reclamationPending) != 0 && _scheduler.RunningCount == 0
+                    && (Volatile.Read(ref _computeGate)?.IsOpen ?? true))
+                {
+                    Interlocked.Exchange(ref _reclamationPending, 0);
+                    lock (_model.GpuComputeLock)
+                        _executor.ReclaimForAdmission(() => !(_sharedReclamation?.NeedsReclamation() ?? false));
                 }
 
                 // If there's nothing in flight, block on command channel.
                 if (_scheduler.RunningCount == 0 && _scheduler.WaitingCount == 0)
                 {
+                    if ((Volatile.Read(ref _reclamationPending) != 0 || _gateDeferredCommands.Count != 0)
+                        && Volatile.Read(ref _computeGate) is { } idleGate)
+                    {
+                        if (!WaitForCommandOr(idleGate.WaitAsync())) break;
+                        continue;
+                    }
                     try
                     {
                         // Wait for at least one command to arrive.
@@ -409,8 +456,7 @@ namespace TensorSharp.Runtime.Scheduling
                 if (Volatile.Read(ref _computeGate) is ComputeGate gate && !gate.IsOpen)
                 {
                     Interlocked.Increment(ref _stepsHeldByGate);
-                    try { gate.Wait(_shutdownCts.Token); }
-                    catch (OperationCanceledException) { break; }
+                    if (!WaitForCommandOr(gate.WaitAsync())) break;
                     continue;
                 }
 
@@ -463,10 +509,12 @@ namespace TensorSharp.Runtime.Scheduling
                             // and a self-induced retry/trim busy loop.
                             memoryWait = admission.Budget.ChangeSignal;
                             if (admission.Budget.CanReserve(peak)) memoryWait = null;
+                            else _sharedReclamation?.Publish(peak, memoryWait);
                         }
                         continue;
                     }
                     memoryWait = null;
+                    _sharedReclamation?.Clear();
 
                     try
                     {
@@ -494,6 +542,32 @@ namespace TensorSharp.Runtime.Scheduling
                     }
                 }
             }
+        }
+
+        private bool CanApplyWhileGateClosed(EngineCommand command)
+        {
+            if (command.Kind is EngineCommandKind.Submit or EngineCommandKind.Reclaim) return true;
+            if (command.Kind != EngineCommandKind.Abort) return false;
+            return !_handles.TryGetValue(command.RequestId, out var handle)
+                ? !_failedSequenceReleases.ContainsKey(command.RequestId)
+                : !HasModelState(handle.Sequence);
+        }
+
+        private static bool HasModelState(SequenceState sequence) => sequence.NumComputedTokens != 0
+            || sequence.BlockTable.NumBlocks != 0 || sequence.MemoryEnvelope != null
+            || sequence.PrefixCacheReusedTokens != 0;
+
+        private bool WaitForCommandOr(Task signal)
+        {
+            using var wake = CancellationTokenSource.CreateLinkedTokenSource(_shutdownCts.Token);
+            try
+            {
+                Task.WhenAny(signal, _commands.Reader.WaitToReadAsync(wake.Token).AsTask())
+                    .WaitAsync(_shutdownCts.Token).GetAwaiter().GetResult();
+                return true;
+            }
+            catch (OperationCanceledException) { return false; }
+            finally { wake.Cancel(); }
         }
 
         private void NotifyReleasedSequences(SchedulerOutput output)
@@ -735,6 +809,18 @@ namespace TensorSharp.Runtime.Scheduling
                 case EngineCommandKind.Submit:
                     try
                     {
+                        // Registering an already-cancelled token can enqueue Abort
+                        // before Submit. Never schedule an orphan after that abort.
+                        if (!_handles.TryGetValue(cmd.Sequence.RequestId, out var submitted)
+                            || !ReferenceEquals(submitted.Sequence, cmd.Sequence)) break;
+                        if (cmd.Cancellation.IsCancellationRequested)
+                        {
+                            _handles.TryRemove(cmd.Sequence.RequestId, out _);
+                            cmd.Sequence.Status = SequenceStatus.FinishedAborted;
+                            cmd.Sequence.FinishReason = "aborted";
+                            submitted.CompleteAborted();
+                            break;
+                        }
                         // A larger metadata pool accounts for independent native
                         // slots; it must not enlarge any individual slot's context.
                         long requested = (long)cmd.Sequence.PromptTokens.Count + cmd.Sequence.MaxNewTokens;
@@ -777,14 +863,19 @@ namespace TensorSharp.Runtime.Scheduling
                     break;
 
                 case EngineCommandKind.Abort:
+                    if (cmd.Sequence != null && (!_handles.TryGetValue(cmd.RequestId, out var expected)
+                        || !ReferenceEquals(expected.Sequence, cmd.Sequence))) break;
+                    bool hadModelState = _failedSequenceReleases.ContainsKey(cmd.RequestId)
+                        || (_handles.TryGetValue(cmd.RequestId, out var aborting) && HasModelState(aborting.Sequence));
                     _scheduler.Abort(cmd.RequestId);
                     // Every radix family owns request keys, including primary-only
                     // models which have no IBatchedPagedModel release hook.
-                    NotifyReleasedSequence(
-                        _model as IBatchedPagedModel,
-                        cmd.RequestId,
-                        seen: null,
-                        retainFusedCache: true);
+                    if (hadModelState)
+                        NotifyReleasedSequence(
+                            _model as IBatchedPagedModel,
+                            cmd.RequestId,
+                            seen: null,
+                            retainFusedCache: true);
                     if (_handles.TryRemove(cmd.RequestId, out var handle))
                     {
                         // Aborted requests (stop button, client disconnect,
@@ -1015,6 +1106,7 @@ namespace TensorSharp.Runtime.Scheduling
             public SequenceState Sequence;
             public string RequestId;
             public SpeculationOptions Speculation;
+            public CancellationToken Cancellation;
         }
 
         private enum EngineCommandKind
@@ -1023,6 +1115,7 @@ namespace TensorSharp.Runtime.Scheduling
             Abort,
             Trim,
             Speculation,
+            Reclaim, // Wake only; consume the pending bit at a quiescent boundary.
         }
     }
 }

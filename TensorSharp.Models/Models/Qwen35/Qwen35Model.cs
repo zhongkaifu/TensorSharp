@@ -1993,17 +1993,27 @@ namespace TensorSharp.Models
 
         private Tensor RunPerOpLayerLoop(Tensor hidden, int seqLen, int startPos)
         {
-            for (int layer = 0; layer < Config.NumLayers; layer++)
+            try
             {
-                if (_isRecurrent[layer])
-                    hidden = RecurrentBlock(hidden, layer, seqLen, startPos);
-                else
-                    hidden = AttentionBlock(hidden, layer, seqLen, startPos);
-                TryEvaluateMlxLayerBoundary(hidden, layer, seqLen);
-                TraceLayer(hidden, layer, "");
+                for (int layer = 0; layer < Config.NumLayers; layer++)
+                {
+                    if (_isRecurrent[layer])
+                        hidden = RecurrentBlock(hidden, layer, seqLen, startPos);
+                    else
+                        hidden = AttentionBlock(hidden, layer, seqLen, startPos);
+                    TryEvaluateMlxLayerBoundary(hidden, layer, seqLen);
+                    TraceLayer(hidden, layer, "");
+                }
+                _layerTraceForwards++;
+                return hidden;
             }
-            _layerTraceForwards++;
-            return hidden;
+            catch
+            {
+                // This loop consumes the caller's hidden state. A backend
+                // allocation refusal must not strand its host owner.
+                hidden.Dispose();
+                throw;
+            }
         }
 
         /// <summary>
@@ -4077,12 +4087,16 @@ namespace TensorSharp.Models
                 int seqLen = (int)input.Sizes[0];
                 int outDim = (int)qw.Ne1;
                 Tensor result = new Tensor(_allocator, DType.Float32, seqLen, outDim);
-                GgmlBasicOps.FusedRmsNormMatMulQuant(result, input, normW, Config.Eps,
-                    qw.CacheKey, qw.GgmlType, qw.Ne0, qw.Ne1, qw.RawBytes);
-                if (qw.Scale != 1.0f)
-                    Ops.Mul(result, result, qw.Scale); // sidecar per-tensor scale2
-                _linearTicks += Stopwatch.GetTimestamp() - t0;
-                return result;
+                try
+                {
+                    GgmlBasicOps.FusedRmsNormMatMulQuant(result, input, normW, Config.Eps,
+                        qw.CacheKey, qw.GgmlType, qw.Ne0, qw.Ne1, qw.RawBytes);
+                    if (qw.Scale != 1.0f)
+                        Ops.Mul(result, result, qw.Scale); // sidecar per-tensor scale2
+                    _linearTicks += Stopwatch.GetTimestamp() - t0;
+                    return result;
+                }
+                catch { result.Dispose(); throw; }
             }
 
             if (_backend == BackendType.Mlx && qw != null && normW != null && input.DimensionCount == 2 && qw.Scale == 1.0f)
@@ -4111,9 +4125,8 @@ namespace TensorSharp.Models
             }
 
             // Fallback: explicit norm + linear.
-            Tensor normed = RMSNormOpCached(input, normW);
+            using Tensor normed = RMSNormOpCached(input, normW);
             Tensor projected = LinearForwardCached(normed, qw, wF32);
-            normed.Dispose();
             return projected;
         }
 

@@ -26,6 +26,11 @@ var tests = new (string Name, Func<Task> Run)[]
     ("cancelled transfer rolls back unpublished allocation", Cases.CancelTransfer),
     ("failed read rolls back and can retry", Cases.FailedRead),
     ("failed allocation rolls back reservation", Cases.FailedAllocation),
+    ("physical host refusal spills an idle page from another request without losing bytes", Cases.PhysicalRefusalSpill),
+    ("physical host refusal never evicts a leased page", Cases.PhysicalRefusalPinned),
+    ("physical host prefetch refusal never evicts demand data", Cases.PhysicalRefusalPrefetch),
+    ("physical host refusal with full SSD stops and preserves the recovery source", Cases.PhysicalRefusalFullDisk),
+    ("physical host demotion refusal spills or preserves device state [simulated accelerator]", Cases.PhysicalRefusalDemotion),
     ("failed rollback keeps unpublished memory quarantined and charged", Cases.FailedRollbackCleanup),
     ("failed host demotion cleanup retains both physical allocations", Cases.FailedDemotionCleanup),
     ("failed allocation initialization transfers cleanup ownership", Cases.FailedInitializationCleanup),
@@ -69,6 +74,7 @@ if (filterIndex >= 0)
     if (tests.Length == 0) throw new ArgumentException("No test case matched --filter.");
 }
 int failed = 0;
+int skipped = 0;
 foreach (var (name, run) in tests)
 {
     var clock = Stopwatch.StartNew();
@@ -78,6 +84,12 @@ foreach (var (name, run) in tests)
         Console.WriteLine($"PASS {name} ({clock.ElapsedMilliseconds} ms)");
         results.Add(new { name, passed = true, milliseconds = clock.ElapsedMilliseconds });
     }
+    catch (TestUnavailableException ex)
+    {
+        skipped++;
+        Console.WriteLine($"SKIP {name}: {ex.Message}");
+        results.Add(new { name, passed = false, skipped = true, reason = ex.Message });
+    }
     catch (Exception ex)
     {
         failed++;
@@ -85,7 +97,7 @@ foreach (var (name, run) in tests)
         results.Add(new { name, passed = false, milliseconds = clock.ElapsedMilliseconds, error = ex.ToString() });
     }
 }
-Console.WriteLine($"{tests.Length - failed}/{tests.Length} passed. CUDA/Metal/Vulkan hardware and production model inference: NOT RUN.");
+Console.WriteLine($"{tests.Length - failed - skipped}/{tests.Length} passed; {skipped} skipped; {failed} failed. CUDA/Metal/Vulkan hardware and production model inference: NOT RUN.");
 int jsonIndex = Array.IndexOf(args, "--json");
 if (jsonIndex >= 0)
 {
@@ -111,6 +123,8 @@ static class Check
     public static async Task ThrowsAsync<T>(Func<Task> action) where T : Exception
     { try { await action(); } catch (T) { return; } throw new Exception($"Expected {typeof(T).Name}"); }
 }
+
+sealed class TestUnavailableException(string message) : Exception(message);
 
 sealed class BytesSource(byte[] bytes) : IResourceSource
 {
@@ -164,14 +178,17 @@ sealed class Fixture : IAsyncDisposable
     public readonly BoundedTransfers Transfers;
     public readonly SsdSpillStore Spill;
     public readonly TieredMemoryScheduler Scheduler;
-    public Fixture(long ram = Page * 2, long gpu = Page, long disk = Page * 64, int chunk = Page, bool failOnce = false)
+    public Fixture(long ram = Page * 2, long gpu = Page, long disk = Page * 64, int chunk = Page, bool failOnce = false,
+        int physicalPages = -1)
     {
         Directory.CreateDirectory(Root);
         Budget = new(new[] { new MemoryCharge("ram", ram + chunk), new MemoryCharge("gpu", gpu), new MemoryCharge("ssd", disk) });
         Transfers = new(Budget, "ram", chunk, 1);
         Spill = new(Budget, "ssd", Root, Transfers);
         Gpu = new(Host);
-        Scheduler = new(Budget, new IMemoryBackend[] { failOnce ? new FailOnceBackend(Host) : Host, Gpu }, Transfers, Spill, Host.Location);
+        IMemoryBackend backend = failOnce ? new FailOnceBackend(Host)
+            : physicalPages >= 0 ? new PhysicallyLimitedBackend(Host, checked(physicalPages * Page)) : Host;
+        Scheduler = new(Budget, new[] { backend, Gpu }, Transfers, Spill, Host.Location);
     }
     public static ResourceKey Key(string name) => new("fixture", 0, name);
     public ResourceKey Add(string name, bool mutable = false, int bytes = Page, IResourceSource? source = null)

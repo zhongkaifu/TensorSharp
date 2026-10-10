@@ -40,7 +40,7 @@ namespace TensorSharp.Runtime.Scheduling
         internal InferenceRequestHandle(SequenceState seq, InferenceEngine engine, CancellationToken ct)
         {
             Sequence = seq;
-            _ctReg = ct.Register(() => engine.Abort(seq.RequestId));
+            _ctReg = ct.Register(() => engine.Abort(seq));
         }
 
         internal void PublishToken(int tokenId)

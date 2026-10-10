@@ -52,7 +52,9 @@ public interface IMemoryBackend
     IReadOnlyList<MemoryCharge> GetAllocationCharges(long byteLength);
     /// <summary>Return a zero-initialized allocation. On failure, release all physical
     /// memory or throw ResourceAllocationException with the still-owned buffer so
-    /// the scheduler can retain its charge and quarantine it for cleanup.</summary>
+    /// the scheduler can retain its charge and quarantine it for cleanup. Report
+    /// physical capacity refusal as OutOfMemoryException after successful rollback,
+    /// so demand allocation may reclaim idle replicas and retry.</summary>
     ValueTask<IResourceBuffer> AllocateAsync(long byteLength, CancellationToken cancellationToken = default);
 }
 
@@ -81,7 +83,12 @@ public interface IDirectCopyTarget
 public readonly record struct ResidencySnapshot(ResourceKey Resource, MemoryLocation Location,
     long Version, long Bytes, int Readers, bool Writer, long LastUse);
 public readonly record struct MemorySchedulerStats(long Loads, long Hits, long Evictions, long Spills,
-    long TransferBytes, int Resources, int ActiveLeases);
+    long TransferBytes, int Resources, int ActiveLeases)
+{
+    /// <summary>Backend OutOfMemory refusals after ledger admission. Demand may
+    /// recover by bounded idle eviction; speculative prefetch does not evict.</summary>
+    public long PhysicalAllocationRefusals { get; init; }
+}
 
 internal static class MemoryRange
 {

@@ -65,7 +65,10 @@ public sealed class CudaResidencyBackend : IMemoryBackend
             _recordCopy = recordCopy;
             ByteLength = bytes;
             context.MakeCurrent();
-            CudaDriverApi.cuMemAlloc(out _pointer, checked((nuint)bytes)).ThrowOnError();
+            int allocationResult = CudaDriverApi.cuMemAlloc(out _pointer, checked((nuint)bytes));
+            if (allocationResult == 2 /* CUDA_ERROR_OUT_OF_MEMORY */)
+                throw new OutOfMemoryException($"CUDA device {context.DeviceId} refused {bytes} bytes.");
+            allocationResult.ThrowOnError();
             try
             {
                 CudaDriverApi.cuMemsetD8(_pointer, 0, checked((nuint)bytes)).ThrowOnError();

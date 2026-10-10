@@ -31,6 +31,30 @@ credit are also required. Failures return exit code 1 and include the error in
 JSON. Unsupported architectures/restoration windows are failures, not passes.
 This is storage/execution parity, not an independent semantic or llama.cpp oracle.
 
+On Windows, an owned child can run inside a verified Job private-commit limit:
+
+```powershell
+python eng/validation/run-memory-job.py --commit-bytes 8589934592 `
+  --output artifacts/long-context/job-run --timeout 600 -- `
+  dotnet eng/validation/UnifiedMemory.LongContextProbe/bin/Release/net10.0/UnifiedMemory.LongContextProbe.dll `
+  --model C:/models/Qwen3.5-0.8B-Q8_0.gguf --arm candidate `
+  --json artifacts/long-context/job-candidate.json --reference artifacts/long-context/reference.json `
+  --context 32768 --prompt 28000 --steps 16 --width 2 --chunk 256 `
+  --host-bytes 6442450944 --device-bytes 6442450944 --ssd-bytes 8589934592
+```
+
+Use a fresh output directory. The wrapper assigns the suspended child before it
+executes, reads back the limit, and first verifies that an over-limit private
+allocation actually fails. It records process-tree peak commit and kills its
+owned process tree on timeout or exit. Exit 77 means enforcement unavailable;
+there is no unbounded fallback. Wrapper success also requires model exit code 0.
+The Job is a **private-commit ceiling**, not a RAM/RSS, mapped-file or VRAM cap.
+Windows/WDDM device allocation can also consume process commit, so logical RAM
+and CUDA quotas need headroom together; copying the Job capacity into each pool
+does not establish admission safety. This wrapper is validation infrastructure,
+not an OS dependency of the memory scheduler. Run its actual API tests with
+`python -m unittest discover -s eng/validation/tests -p test_memory_job.py`.
+
 `--width` controls submitted concurrency; `--max-running` independently caps
 admitted concurrency (defaults to width). For queued serial work, set
 `--width 2 --max-running 1` on both arms. With prefix reuse disabled this lane

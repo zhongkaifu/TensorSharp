@@ -40,6 +40,7 @@ public sealed class TieredMemoryScheduler : IAsyncDisposable
     private readonly IMemoryBackend? _host;
     private bool _stopping;
     private long _clock, _loads, _hits, _evictions, _spills;
+    private long _physicalAllocationRefusals;
 
     public TieredMemoryScheduler(MemoryBudget budget, IEnumerable<IMemoryBackend> backends,
         BoundedTransfers transfers, SsdSpillStore spillStore, MemoryLocation? demotionHost = null)
@@ -148,9 +149,8 @@ public sealed class TieredMemoryScheduler : IAsyncDisposable
                 }
                 if (target == null)
                 {
-                    var reservation = await ReserveWithEvictionAsync(backend.GetAllocationCharges(entry.Resource.ByteLength),
+                    provisional = target = await AllocateWithEvictionAsync(entry, backend,
                         allowEviction, cancellationToken, allocationEnvelope).ConfigureAwait(false);
-                    provisional = target = await AllocateReplicaAsync(entry, backend, reservation, cancellationToken).ConfigureAwait(false);
                     if (!discardExisting)
                     {
                         if (source != null) await _transfers.CopyAsync(source, target.Buffer, cancellationToken).ConfigureAwait(false);
@@ -239,31 +239,70 @@ public sealed class TieredMemoryScheduler : IAsyncDisposable
                 ? _budget.Snapshot().ToDictionary(x => x.Pool, x => x.Available)
                 : allocationEnvelope.Charges.ToDictionary(x => x.Pool, x => x.Bytes);
             var constrained = charges.Where(c => c.Bytes > available.GetValueOrDefault(c.Pool)).Select(c => c.Pool).ToHashSet();
-            Entry? victim = null;
-            Replica? replica = null;
-            MemoryLocation victimLocation = default;
-            lock (_gate)
-            {
-                foreach (var candidateItem in _lru)
-                {
-                    var candidate = candidateItem.Entry;
-                    if (candidate.Transition != null || candidate.Writer || candidate.Fault != null) continue;
-                    var item = candidateItem.Replica;
-                    if (item.Readers != 0 || attempted.Contains((candidate.Resource.Key, candidateItem.Location))) continue;
-                    if (allocationEnvelope != null && !ReferenceEquals(item.Charge.Parent, allocationEnvelope)) continue;
-                    if (!item.Charge.Charges.Any(c => c.Bytes > 0 && constrained.Contains(c.Pool))) continue;
-                    victim = candidate; replica = item; victimLocation = candidateItem.Location;
-                    break;
-                }
-                if (victim != null) victim.Transition = Signal();
-            }
-            if (victim == null)
+            if (!await TryEvictOneAsync(constrained, attempted, allocationEnvelope, cancellationToken).ConfigureAwait(false))
                 throw new MemoryPressureException("Budget is occupied by live leases, in-flight transfers, or non-evictable reservations. Defer the request or reduce its working set.");
-            attempted.Add((victim.Resource.Key, victimLocation));
-            try { await EvictAsync(victim, victimLocation, replica!, cancellationToken).ConfigureAwait(false); }
-            catch (MemoryPressureException) { /* A full SSD need not prevent evicting another clean weight. */ }
-            finally { lock (_gate) EndTransition(victim); }
         }
+    }
+
+    private async ValueTask<Replica> AllocateWithEvictionAsync(Entry entry, IMemoryBackend backend,
+        bool allowEviction, CancellationToken cancellationToken, BudgetReservation? envelope)
+    {
+        var charges = backend.GetAllocationCharges(entry.Resource.ByteLength);
+        HashSet<(ResourceKey, MemoryLocation)>? attempted = null;
+        HashSet<string>? pools = null;
+        int remaining = 0;
+        while (true)
+        {
+            var reservation = await ReserveWithEvictionAsync(charges, allowEviction, cancellationToken, envelope).ConfigureAwait(false);
+            try { return await AllocateReplicaAsync(entry, backend, reservation, cancellationToken).ConfigureAwait(false); }
+            catch (OutOfMemoryException) when (allowEviction)
+            {
+                // Allocation rollback has already returned the unused credit.
+                // OS/device refusal may precede ledger exhaustion (external owners,
+                // driver heaps, fragmentation or a process limit). Evict only idle
+                // replicas from these pools, preserving authoritative data first.
+                // A failed cleanup throws a different exception and is never retried.
+                if (attempted == null)
+                {
+                    attempted = new();
+                    pools = charges.Where(c => c.Bytes > 0).Select(c => c.Pool).ToHashSet();
+                    lock (_gate) remaining = _lru.Count;
+                }
+                // Bound retries even when concurrent callers continually add pages.
+                if (remaining-- <= 0 || !await TryEvictOneAsync(pools!, attempted, null, cancellationToken).ConfigureAwait(false))
+                    throw;
+            }
+        }
+    }
+
+    private async ValueTask<bool> TryEvictOneAsync(HashSet<string> constrained,
+        HashSet<(ResourceKey, MemoryLocation)> attempted, BudgetReservation? envelope, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        Entry? victim = null;
+        Replica? replica = null;
+        MemoryLocation location = default;
+        lock (_gate)
+        {
+            foreach (var candidateItem in _lru)
+            {
+                var candidate = candidateItem.Entry;
+                if (candidate.Transition != null || candidate.Writer || candidate.Fault != null) continue;
+                var item = candidateItem.Replica;
+                if (item.Readers != 0 || attempted.Contains((candidate.Resource.Key, candidateItem.Location))) continue;
+                if (envelope != null && !ReferenceEquals(item.Charge.Parent, envelope)) continue;
+                if (!item.Charge.Charges.Any(c => c.Bytes > 0 && constrained.Contains(c.Pool))) continue;
+                victim = candidate; replica = item; location = candidateItem.Location;
+                break;
+            }
+            if (victim != null) victim.Transition = Signal();
+        }
+        if (victim == null) return false;
+        attempted.Add((victim.Resource.Key, location));
+        try { await EvictAsync(victim, location, replica!, cancellationToken).ConfigureAwait(false); }
+        catch (MemoryPressureException) { /* A full SSD need not prevent evicting another clean weight. */ }
+        finally { lock (_gate) EndTransition(victim); }
+        return true;
     }
 
     private async ValueTask EvictAsync(Entry entry, MemoryLocation location, Replica replica, CancellationToken cancellationToken)
@@ -288,6 +327,12 @@ public sealed class TieredMemoryScheduler : IAsyncDisposable
                         demoted.LruNode = _lru.AddLast((entry, _host.Location, demoted));
                         provisional = null;
                     }
+                }
+                catch (OutOfMemoryException) when (provisional == null)
+                {
+                    // The host allocator may refuse despite ledger headroom.
+                    // Allocation rollback returned the provisional charge; retain
+                    // the device source and fall through to bounded disk spill.
                 }
                 catch (Exception error)
                 {
@@ -339,6 +384,7 @@ public sealed class TieredMemoryScheduler : IAsyncDisposable
         }
         catch (Exception error)
         {
+            if (error is OutOfMemoryException) Interlocked.Increment(ref _physicalAllocationRefusals);
             if (buffer == null) reservation.Dispose();
             else RollbackAllocation(entry, new Replica(buffer, reservation), error);
             throw;
@@ -380,6 +426,7 @@ public sealed class TieredMemoryScheduler : IAsyncDisposable
             return true;
         }
         catch (MemoryPressureException) { return false; }
+        catch (OutOfMemoryException) { return false; } // Physical refusal is also a best-effort miss.
     }
 
     /// <summary>All-or-nothing lease set for one operator/batch. A pressure failure
@@ -416,7 +463,8 @@ public sealed class TieredMemoryScheduler : IAsyncDisposable
     public MemorySchedulerStats GetStats()
     {
         lock (_gate) return new(_loads, _hits, _evictions, _spills, _transfers.BytesCopied, _entries.Count,
-            _entries.Values.Sum(e => e.Replicas.Values.Sum(r => r.Readers) + (e.Writer ? 1 : 0)));
+            _entries.Values.Sum(e => e.Replicas.Values.Sum(r => r.Readers) + (e.Writer ? 1 : 0)))
+        { PhysicalAllocationRefusals = Interlocked.Read(ref _physicalAllocationRefusals) };
     }
 
     /// <summary>Caller must quiesce execution and stop issuing acquires first.

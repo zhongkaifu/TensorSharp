@@ -756,6 +756,224 @@ public class ContinuousBatchSchedulerTests
         Assert.Equal(0, budget.Snapshot().Single().Available);
     }
 
+    [Fact]
+    public async Task Engine_MemoryAdmission_ReclaimsAnotherIdleEngine()
+    {
+        var budget = new MemoryBudget([new("gpu", 100)]);
+        using var parked = budget.Reserve([new("gpu", 100)]);
+        parked.Commit();
+        using var donor = new StubModel("donor", 7) { OnTrim = parked.Dispose };
+        using var receiver = new StubModel("receiver", 7);
+        using var first = new InferenceEngine(donor, SharedConfig(budget, 0));
+        using var second = new InferenceEngine(receiver, SharedConfig(budget, 100));
+        var result = await second.SubmitRequest(NewSequence("needs-donor", 8, 3)).Completion.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(SequenceStatus.FinishedLengthCapped, result.Status);
+        Assert.Equal(1, donor.TrimCalls);
+        Assert.Equal(0, first.TotalStepsRun);
+        Assert.Equal(100, budget.Snapshot().Single().Available);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Engine_MemoryAdmission_DefersForeignReclaimUntilGateOpens(bool cancelWaiting)
+    {
+        var budget = new MemoryBudget([new("gpu", 100)]);
+        using var parked = budget.Reserve([new("gpu", 100)]);
+        using var donor = new StubModel("gated-donor", 7) { OnTrim = parked.Dispose };
+        var gate = new ComputeGate(); gate.Close();
+        using var first = new InferenceEngine(donor, SharedConfig(budget, 0)) { ComputeGate = gate };
+        var attempted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var receiver = new StubModel("receiver", 7) { OnTrim = () => attempted.TrySetResult() };
+        using var second = new InferenceEngine(receiver, SharedConfig(budget, 100));
+        var waiting = second.SubmitRequest(NewSequence("waiting", 8, 3));
+        await attempted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await Task.Delay(50);
+        Assert.Equal(0, donor.TrimCalls);
+        Assert.False(waiting.Completion.IsCompleted);
+        if (cancelWaiting)
+        {
+            second.Abort(waiting.RequestId);
+            Assert.Equal(SequenceStatus.FinishedAborted, (await waiting.Completion.WaitAsync(TimeSpan.FromSeconds(5))).Status);
+            // Completion is delivered inside ApplyCommand; wait for its worker to
+            // remove the cancelled demand before opening the donor's gate.
+            second.Dispose();
+        }
+        gate.Open();
+        if (!cancelWaiting)
+        {
+            await waiting.Completion.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.Equal(1, donor.TrimCalls);
+        }
+        else
+        {
+            await Task.Delay(50);
+            Assert.Equal(0, donor.TrimCalls);
+            Assert.Equal(0, budget.Snapshot().Single().Available);
+        }
+    }
+
+    [Fact]
+    public async Task Engine_MemoryAdmission_ForeignPressureNeverTrimsActiveForward()
+    {
+        var budget = new MemoryBudget([new("gpu", 100)]);
+        using var parked = budget.Reserve([new("gpu", 100)]);
+        using var entered = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        using var donor = new StubModel("active-donor", 7, entered, release) { OnTrim = parked.Dispose };
+        using var first = new InferenceEngine(donor, SharedConfig(budget, 0));
+        using var receiver = new StubModel("receiver", 7);
+        using var second = new InferenceEngine(receiver, SharedConfig(budget, 100));
+        try
+        {
+            var active = first.SubmitRequest(NewSequence("active", 8, 4));
+            Assert.True(entered.Wait(TimeSpan.FromSeconds(5)));
+            var waiting = second.SubmitRequest(NewSequence("waiting", 8, 3));
+            await Task.Delay(100);
+            Assert.Equal(0, donor.TrimCalls);
+            Assert.False(waiting.Completion.IsCompleted);
+            release.Set();
+            await Task.WhenAll(active.Completion, waiting.Completion).WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.Equal(1, donor.TrimCalls);
+            Assert.Equal(100, budget.Snapshot().Single().Available);
+        }
+        finally { release.Set(); }
+    }
+
+    [Fact]
+    public async Task Engine_MemoryAdmission_BlockedPeersDoNotWakeEachOtherForever()
+    {
+        var budget = new MemoryBudget([new("gpu", 100)]);
+        using var external = budget.Reserve([new("gpu", 100)]);
+        using var a = new StubModel("peer-a", 7);
+        using var b = new StubModel("peer-b", 7);
+        using var first = new InferenceEngine(a, SharedConfig(budget, 100));
+        using var second = new InferenceEngine(b, SharedConfig(budget, 100));
+        var one = first.SubmitRequest(NewSequence("one", 8, 3));
+        var two = second.SubmitRequest(NewSequence("two", 8, 3));
+        await Task.Delay(150);
+        int attempts = a.TrimCalls + b.TrimCalls;
+        await Task.Delay(150);
+        Assert.InRange(attempts, 2, 8);
+        Assert.Equal(attempts, a.TrimCalls + b.TrimCalls);
+        external.Dispose();
+        await Task.WhenAll(one.Completion, two.Completion).WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.All(new[] { one, two }, h => Assert.Equal(new[] { 7, 7, 7 }, h.Sequence.OutputTokens));
+    }
+
+    [Fact]
+    public async Task Engine_PreCancelledRequestsNeverForwardOrOrphanAnEnvelope()
+    {
+        var budget = new MemoryBudget([new("gpu", 100)]);
+        int calls = 0;
+        using var model = new StubModel("cancel-stress", 7) { OnForward = () => Interlocked.Increment(ref calls) };
+        using var engine = new InferenceEngine(model, SharedConfig(budget, 100));
+        using var cancelled = new CancellationTokenSource(); cancelled.Cancel();
+        for (int i = 0; i < 500; ++i)
+        {
+            // Reuse IDs deliberately: queued callbacks must name the submission.
+            var handle = engine.SubmitRequest(NewSequence("reused-id", 8, 3), cancelled.Token);
+            Assert.Equal(SequenceStatus.FinishedAborted, (await handle.Completion.WaitAsync(TimeSpan.FromSeconds(5))).Status);
+        }
+        Assert.Equal(0, calls);
+        var final = engine.SubmitRequest(NewSequence("barrier", 8, 3));
+        await final.Completion.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(new[] { 7, 7, 7 }, final.Sequence.OutputTokens);
+        Assert.Equal(0, engine.WaitingCount);
+        Assert.Equal(0, engine.RunningCount);
+        Assert.Equal(100, budget.Snapshot().Single().Available);
+        Assert.Equal(0, model.TrimCalls);
+        Assert.Equal(4, calls); // One prompt and the executor's three decode forwards.
+    }
+
+    [Fact]
+    public async Task Engine_ClosedComputeGateAllowsQueuedCancellationButDefersModelTrim()
+    {
+        var budget = new MemoryBudget([new("gpu", 100)]);
+        var gate = new ComputeGate(); gate.Close();
+        var trimmed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var model = new StubModel("gated-commands", 7) { OnTrim = () => trimmed.TrySetResult() };
+        using var engine = new InferenceEngine(model, SharedConfig(budget, 100)) { ComputeGate = gate };
+        var waiting = engine.SubmitRequest(NewSequence("waiting", 8, 3));
+        Assert.True(SpinWait.SpinUntil(() => engine.StepsHeldByGate != 0, TimeSpan.FromSeconds(5)));
+        engine.TrimIdleMemory();
+        engine.Abort(waiting.RequestId);
+        Assert.Equal(SequenceStatus.FinishedAborted, (await waiting.Completion.WaitAsync(TimeSpan.FromSeconds(5))).Status);
+        Assert.Equal(0, engine.TotalStepsRun);
+        Assert.Equal(0, model.TrimCalls);
+        Assert.Equal(100, budget.Snapshot().Single().Available);
+        gate.Open();
+        await trimmed.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(1, model.TrimCalls);
+    }
+
+    [Fact]
+    public async Task Engine_ClosedComputeGateKeepsActiveEnvelopeUntilSafeCancellation()
+    {
+        var budget = new MemoryBudget([new("gpu", 100)]);
+        var gate = new ComputeGate();
+        using var model = new StubModel("active-gated-cancel", 7) { OnForward = gate.Close };
+        using var engine = new InferenceEngine(model, SharedConfig(budget, 100)) { ComputeGate = gate };
+        var active = engine.SubmitRequest(NewSequence("active", 8, 8));
+        Assert.True(SpinWait.SpinUntil(() => engine.StepsHeldByGate != 0, TimeSpan.FromSeconds(5)));
+        engine.Abort(active.RequestId);
+        await Task.Delay(50);
+        Assert.False(active.Completion.IsCompleted);
+        Assert.Equal(0, budget.Snapshot().Single().Available);
+        Assert.Equal(1, engine.TotalStepsRun);
+        gate.Open();
+        Assert.Equal(SequenceStatus.FinishedAborted, (await active.Completion.WaitAsync(TimeSpan.FromSeconds(5))).Status);
+        Assert.Equal(100, budget.Snapshot().Single().Available);
+        Assert.Equal(1, engine.TotalStepsRun);
+    }
+
+    [Fact]
+    public async Task Engine_RepeatedPressureAndCancellationPreservesFifoProgressAndCredit()
+    {
+        var budget = new MemoryBudget([new("gpu", 100)]);
+        using var model = new StubModel("pressure-cancel-cycles", 7);
+        using var engine = new InferenceEngine(model, SharedConfig(budget, 100));
+        int cycles = int.Parse(Environment.GetEnvironmentVariable("TS_TEST_SHARED_MEMORY_SOAK_CYCLES") ?? "64",
+            System.Globalization.CultureInfo.InvariantCulture);
+        Assert.InRange(cycles, 64, 1_000_000);
+        for (int cycle = 0; cycle < cycles; ++cycle)
+        {
+            using var external = budget.Reserve([new("gpu", 100)]);
+            var handles = Enumerable.Range(0, 8)
+                .Select(i => engine.SubmitRequest(NewSequence($"cycle-{cycle}-{i}", 8, 3))).ToArray();
+            // Cancel the head and alternating waiters while another owner holds
+            // all credit. Survivors must progress in their original FIFO order.
+            foreach (int i in new[] { 0, 2, 4, 6 }) engine.Abort(handles[i].RequestId);
+            foreach (int i in new[] { 0, 2, 4, 6 })
+                Assert.Equal(SequenceStatus.FinishedAborted,
+                    (await handles[i].Completion.WaitAsync(TimeSpan.FromSeconds(5))).Status);
+            external.Dispose();
+            await Task.WhenAll(handles.Select(h => h.Completion)).WaitAsync(TimeSpan.FromSeconds(5));
+            DateTime? previous = null;
+            foreach (int i in new[] { 1, 3, 5, 7 })
+            {
+                Assert.Equal(new[] { 7, 7, 7 }, handles[i].Sequence.OutputTokens);
+                Assert.True(handles[i].Sequence.FirstScheduledAt.HasValue);
+                if (previous.HasValue) Assert.True(handles[i].Sequence.FirstScheduledAt >= previous);
+                previous = handles[i].Sequence.FirstScheduledAt;
+            }
+            Assert.Equal(100, budget.Snapshot().Single().Available);
+            Assert.Equal(0, engine.WaitingCount);
+            Assert.Equal(0, engine.RunningCount);
+        }
+        Assert.Equal(100, budget.HighWatermarks().Single().Owned);
+        Assert.Equal(8L * cycles, engine.TotalSubmitted);
+        Console.WriteLine($"Shared-memory pressure/cancellation: {cycles} cycles, {8L * cycles} requests, " +
+            $"{4L * cycles} cancellations; every cycle checked FIFO progress, tokens and full credit return.");
+    }
+
+    private static SchedulerConfig SharedConfig(MemoryBudget budget, long peak) => new()
+    {
+        BlockSize = BlockSize, NumBlocks = 32, EnablePrefixCaching = false,
+        StopRepetition = false, DecodeQuantumTokens = 1,
+        MemoryAdmission = new(budget, _ => new[] { new MemoryCharge("gpu", peak) })
+    };
+
     private sealed class SnapshotTestDirectory : IDisposable
     {
         public string Path { get; } = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "ts-runtime-kv-" + Guid.NewGuid().ToString("N"));
