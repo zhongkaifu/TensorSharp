@@ -87,6 +87,22 @@ to measure its swap amortization separately. Both arms receive the same setting.
 Report TTFT as well as total time: longer owner quanta trade fairness for fewer
 snapshot transfers. Neither setting enables the disabled batched decode route.
 
+`--context-tokens` sets the model/session context policy (default 1024).
+`--prompt-tokens` is a minimum: the complete rendered prompt can be slightly longer;
+the probe checks the actual length against both the context and restorable window.
+Increasing this option does not establish semantic long-context quality.
+
+`--admission-reclaim true` requires `--adaptive true` and separately enables the
+native holder route for a pressure test. It seeds and verifies prefix reuse,
+lowers the device ledger to its current occupancy, queues a synthetic large
+request peak, and requires real cache credit to be released automatically.
+The request must remain blocked after this partial reclaim. An explicit budget
+refresh then restores execution headroom and the output must match the isolated
+reference. The report records released credit and recovery time. This tests
+reclamation/waiting/wakeup and graph rebuilding, not a complete model request
+estimator or execution under a physical VRAM hard cap. The original holder-disable
+setting is restored before the separate full-logit snapshot replay.
+
 Dense Qwen 3.5 on single-rank GGML CUDA now supports this route when the checkpoint
 has no MTP layers. Its snapshot includes attention K/V, every GDN convolution
 ring and write index, the delta state, and the M-RoPE position delta. Export

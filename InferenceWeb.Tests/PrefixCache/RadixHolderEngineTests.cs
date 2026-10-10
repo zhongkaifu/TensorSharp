@@ -6,6 +6,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using InferenceWeb.Tests.PrefixCache.Fakes;
 using Microsoft.Extensions.Logging.Abstractions;
+using TensorSharp.Memory;
 using TensorSharp.Runtime;
 using TensorSharp.Runtime.Paged;
 using TensorSharp.Runtime.Scheduling;
@@ -628,6 +629,99 @@ public class RadixHolderEngineTests
         var reference = Request("reference", prompt);
         await Run(cold, reference);
         Assert.Equal(reference.OutputTokens, after.OutputTokens);
+    }
+
+    [Fact]
+    public async Task MemoryAdmission_ReclaimsRetainedCheckpoint_AndRecomputesExactly()
+    {
+        var budget = new MemoryBudget(new[] { new MemoryCharge("ram", 400) });
+        using var model = new BudgetedCheckpointModel(budget);
+        var cfg = new SchedulerConfig
+        {
+            BlockSize = 8, NumBlocks = 256, MaxNumBatchedTokens = 64,
+            MaxPrefillChunkSize = 16, SoloPrefillChunkSize = 64, StopRepetition = false,
+            MemoryAdmission = new(budget, s => new[] { new MemoryCharge("ram", s.RequestId == "seed" ? 0 : 100) })
+        };
+        using var engine = new InferenceEngine(model, cfg);
+        await Run(engine, Request("seed", Tokens(32), "a", shared: 16));
+        Assert.NotEmpty(model.RetainedPayloadKeys);
+        long retained = budget.Snapshot().Single().Committed;
+        Assert.True(retained > 0);
+        Assert.True(budget.TrySetCapacity("ram", retained));
+        var after = Request("after-pressure", Tokens(16).Concat(Tokens(16, 81)).ToList(), "b", shared: 16);
+        await Run(engine, after);
+        Assert.Contains(ReleaseReason.Pressure, model.ReleaseReasons);
+        using var cold = new InferenceEngine(OracleFakes.R(8), Configuration(false));
+        var reference = Request("reference", after.PromptTokens.ToList());
+        await Run(cold, reference);
+        Assert.Equal(reference.OutputTokens, after.OutputTokens);
+        engine.Dispose();
+        Assert.Equal(retained, budget.Snapshot().Single().Available);
+    }
+
+    private sealed class BudgetedCheckpointModel(MemoryBudget budget)
+        : OracleModel(OracleFakes.R(8).Traits with { AdoptPrimaryOnDisplacement = false }, 8), IPrefixCacheModel
+    {
+        private readonly Dictionary<string, BudgetReservation> _charges = new();
+        internal List<ReleaseReason> ReleaseReasons { get; } = new();
+
+        bool IPrefixCacheModel.TryCaptureCopy(string requestId, string key, out PayloadFootprint footprint)
+        {
+            footprint = default;
+            var charge = budget.TryReserve(new[] { new MemoryCharge("ram", 100) });
+            if (charge == null) return false;
+            if (!TryCaptureCopy(requestId, key, out footprint)) { charge.Dispose(); return false; }
+            charge.Commit(); _charges.Add(key, charge);
+            return true;
+        }
+
+        void IPrefixCacheModel.ReleasePayloads(ReadOnlySpan<string> keys, ReleaseReason reason)
+        {
+            ReleasePayloads(keys, reason);
+            ReleaseReasons.Add(reason);
+            foreach (string key in keys)
+                if (_charges.Remove(key, out var charge)) charge.Dispose();
+        }
+    }
+
+    [Fact]
+    public void MemoryAdmission_ReclaimsOnlyEnoughCheckpointCredit()
+    {
+        var budget = new MemoryBudget(new[] { new MemoryCharge("ram", 400) });
+        using var model = new BudgetedCheckpointModel(budget);
+        var pool = new BlockPool(32, 8, 64);
+        var scheduler = new ContinuousBatchScheduler(Configuration(), pool);
+        var cache = new PrefixCacheCoordinator(model, pool, scheduler,
+            model.GetPrefixCacheCapabilities(), NullLogger.Instance);
+        var sequences = new List<SequenceState>();
+        try
+        {
+            for (int i = 0; i < 2; i++)
+            {
+                var sequence = Request($"cached-{i}", Tokens(16, i * 40 + 1), $"scope-{i}", shared: 16);
+                sequences.Add(sequence);
+                foreach (var block in pool.AllocateNew(2)!) sequence.BlockTable.AppendBlock(block);
+                model.ResetKVCache(); model.Forward(sequence.PromptTokens.ToArray());
+                sequence.SetComputedTokensForPrefixAdoption(16);
+                cache.CaptureCheckpoint(sequence);
+                cache.ReleaseRequest(sequence);
+            }
+            Assert.Equal(2, model.RetainedPayloadKeys.Count);
+            Assert.True(budget.TrySetCapacity("ram", 200));
+            cache.ReclaimForAdmission(() => budget.CanReserve(new[] { new MemoryCharge("ram", 100) }));
+            Assert.Single(model.RetainedPayloadKeys);
+            Assert.Equal(100, budget.Snapshot().Single().Available);
+            int releases = model.ReleaseReasons.Count;
+            cache.ReclaimForAdmission(() => budget.CanReserve(new[] { new MemoryCharge("ram", 100) }));
+            Assert.Equal(releases, model.ReleaseReasons.Count);
+        }
+        finally
+        {
+            cache.Reset(); cache.Detach();
+            foreach (var sequence in sequences) pool.Free(sequence.BlockTable.Clear());
+            pool.Storage.Dispose();
+        }
+        Assert.Equal(200, budget.Snapshot().Single().Available);
     }
 
     [Fact]

@@ -574,6 +574,65 @@ public class ContinuousBatchSchedulerTests
         Assert.All(budget.Snapshot(), p => Assert.Equal(p.Capacity, p.Available));
     }
 
+    [Fact]
+    public async Task Engine_MemoryAdmission_ReclaimsParkedBuffers_OnlyWhenBlocked()
+    {
+        var budget = new MemoryBudget(new[] { new MemoryCharge("gpu", 100) });
+        using var parked = budget.Reserve(new[] { new MemoryCharge("gpu", 100) });
+        parked.Commit();
+        using var model = new StubModel("fp-reclaim", 7) { OnTrim = parked.Dispose };
+        using var engine = new InferenceEngine(model, new SchedulerConfig { BlockSize = BlockSize, NumBlocks = 32,
+            EnablePrefixCaching = false, StopRepetition = false,
+            MemoryAdmission = new(budget, _ => new[] { new MemoryCharge("gpu", 100) }) });
+        await engine.SubmitRequest(NewSequence("first", 8, 3)).Completion.WaitAsync(TimeSpan.FromSeconds(5));
+        await engine.SubmitRequest(NewSequence("second", 8, 3)).Completion.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(1, model.TrimCalls);
+        engine.Dispose();
+        Assert.All(budget.Snapshot(), p => Assert.Equal(p.Capacity, p.Available));
+    }
+
+    [Fact]
+    public async Task Engine_MemoryAdmission_PartialReclaimSleeps_ThenWakesOnExternalRelease()
+    {
+        var budget = new MemoryBudget(new[] { new MemoryCharge("gpu", 100) });
+        using var parked = budget.Reserve(new[] { new MemoryCharge("gpu", 20) });
+        using var outside = budget.Reserve(new[] { new MemoryCharge("gpu", 80) });
+        var trimmed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var model = new StubModel("fp-partial-reclaim", 7)
+        {
+            OnTrim = () => { parked.Dispose(); trimmed.TrySetResult(); }
+        };
+        using var engine = new InferenceEngine(model, new SchedulerConfig { BlockSize = BlockSize, NumBlocks = 32,
+            StopRepetition = false, MemoryAdmission = new(budget, _ => new[] { new MemoryCharge("gpu", 100) }) });
+        var handle = engine.SubmitRequest(NewSequence("waiting", 8, 3));
+        await trimmed.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await Task.Delay(100);
+        Assert.False(handle.Completion.IsCompleted);
+        Assert.Equal(1, model.TrimCalls); // Own release must not trigger another trim.
+        Assert.Equal(0, engine.TotalStepsRun);
+        outside.Dispose();
+        var result = await handle.Completion.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(SequenceStatus.FinishedLengthCapped, result.Status);
+        Assert.Equal(1, model.TrimCalls);
+    }
+
+    [Fact]
+    public async Task Engine_MemoryAdmission_FailedReclaimStopsBeforeForward()
+    {
+        var budget = new MemoryBudget(new[] { new MemoryCharge("gpu", 100) });
+        using var parked = budget.Reserve(new[] { new MemoryCharge("gpu", 100) });
+        using var model = new StubModel("fp-failed-reclaim", 7)
+        { OnTrim = () => throw new InvalidOperationException("parked-buffer release failed") };
+        using var engine = new InferenceEngine(model, new SchedulerConfig { BlockSize = BlockSize, NumBlocks = 32,
+            StopRepetition = false, MemoryAdmission = new(budget, _ => new[] { new MemoryCharge("gpu", 100) }) });
+        var handle = engine.SubmitRequest(NewSequence("waiting", 8, 3));
+        var error = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => handle.Completion.WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.Equal("parked-buffer release failed", error.Message);
+        Assert.Equal(0, engine.TotalStepsRun);
+        Assert.Equal(0, budget.Snapshot().Single().Available);
+    }
+
     private sealed class SnapshotTestDirectory : IDisposable
     {
         public string Path { get; } = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "ts-runtime-kv-" + Guid.NewGuid().ToString("N"));
@@ -810,6 +869,9 @@ public class ContinuousBatchSchedulerTests
 
         public void SetEos(int eosId) => _eos = eosId;
         public int CurrentSeqLen => _cacheSeqLen;
+        public Action? OnTrim { get; init; }
+        public int TrimCalls;
+        public void TrimIdleMemory() { Interlocked.Increment(ref TrimCalls); OnTrim?.Invoke(); }
 
         public float[] Forward(int[] tokens)
         {

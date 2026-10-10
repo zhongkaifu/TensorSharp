@@ -355,6 +355,17 @@ must be calibrated against measured free memory on the target device.
 
 ## Validation
 
+When `SchedulerConfig.MemoryAdmission` blocks an otherwise idle engine, it first
+reclaims its own parked model buffers and unlocked prefix payloads. Prefixes are
+evicted in priority/LRU order, checking actual multi-pool headroom after every
+release and stopping once the request can fit. Newest/public prefixes remain
+evictable for admission; pins and pending donations still protect live state.
+If credit is still insufficient, the worker sleeps outside the model lock and
+wakes on a budget change or command. Its own partial reclaim does not busy-spin.
+This does not implement cross-engine eviction, revoke live owners, or supply
+missing model-specific peak estimates. `MemoryBudget.CanReserve` only observes
+headroom; the subsequent atomic `TryReserve` remains authoritative.
+
 ```sh
 dotnet run --project eng/tests/unified-memory/UnifiedMemory.Tests.csproj -c Release \
   -- --json artifacts/unified-memory/results.json

@@ -447,6 +447,17 @@ namespace TensorSharp.Runtime.Scheduling
                             FailStalledSequences();
                         if (!_scheduler.MemoryAdmissionBlocked || _scheduler.RunningCount > 0 || _scheduler.WaitingCount == 0)
                             memoryWait = null;
+                        else if (_scheduler.BlockedMemoryPeak is { } peak
+                            && _scheduler.Config.MemoryAdmission is { } admission)
+                        {
+                            _executor.ReclaimForAdmission(() => admission.Budget.CanReserve(peak));
+                            // Reclamation itself may pulse the old signal without
+                            // freeing enough credit. Capture a fresh signal BEFORE
+                            // rechecking, avoiding both missed external releases
+                            // and a self-induced retry/trim busy loop.
+                            memoryWait = admission.Budget.ChangeSignal;
+                            if (admission.Budget.CanReserve(peak)) memoryWait = null;
+                        }
                         continue;
                     }
                     memoryWait = null;

@@ -13,8 +13,8 @@ using TensorSharp.Runtime.Scheduling;
 var options = new Dictionary<string, string>(StringComparer.Ordinal);
 for (int i = 0; i < args.Length; i += 2)
 {
-    if (i + 1 == args.Length || args[i] is not ("--model" or "--json" or "--widths" or "--steps" or "--prompt-tokens" or "--backend" or "--expect-unsupported" or "--shared-budget" or "--adaptive" or "--host-bytes" or "--device-bytes" or "--resident-pages" or "--decode-quantum"))
-        throw new ArgumentException("Use --model path --json path --widths 1,2,4,8,16 --steps 8 --prompt-tokens 64 --backend ggml_cuda|ggml_cpu --expect-unsupported true|false --shared-budget true|false --adaptive true|false --resident-pages 1|auto --decode-quantum 1.");
+    if (i + 1 == args.Length || args[i] is not ("--model" or "--json" or "--widths" or "--steps" or "--prompt-tokens" or "--context-tokens" or "--backend" or "--expect-unsupported" or "--shared-budget" or "--adaptive" or "--host-bytes" or "--device-bytes" or "--resident-pages" or "--decode-quantum" or "--admission-reclaim"))
+        throw new ArgumentException("Use --model path --json path --widths 1,2,4,8,16 --steps 8 --prompt-tokens 64 --context-tokens 1024 --backend ggml_cuda|ggml_cpu --expect-unsupported true|false --shared-budget true|false --adaptive true|false --resident-pages 1|auto --decode-quantum 1 --admission-reclaim true|false.");
     options.Add(args[i], args[i + 1]);
 }
 string modelPath = Path.GetFullPath(options["--model"]);
@@ -22,9 +22,12 @@ string output = Path.GetFullPath(options.GetValueOrDefault("--json", "artifacts/
 int[] widths = options.GetValueOrDefault("--widths", "1,2,4,8,16").Split(',').Select(int.Parse).ToArray();
 int steps = int.Parse(options.GetValueOrDefault("--steps", "8"));
 int promptTokens = int.Parse(options.GetValueOrDefault("--prompt-tokens", "64"));
+int contextTokens = int.Parse(options.GetValueOrDefault("--context-tokens", "1024"));
 bool expectUnsupported = bool.Parse(options.GetValueOrDefault("--expect-unsupported", "false"));
 bool sharedAdmission = bool.Parse(options.GetValueOrDefault("--shared-budget", "false"));
 bool adaptive = bool.Parse(options.GetValueOrDefault("--adaptive", "false"));
+bool admissionReclaim = bool.Parse(options.GetValueOrDefault("--admission-reclaim", "false"));
+if (admissionReclaim && !adaptive) throw new ArgumentException("--admission-reclaim requires --adaptive true.");
 string residentPages = options.GetValueOrDefault("--resident-pages", "1");
 int decodeQuantum = int.Parse(options.GetValueOrDefault("--decode-quantum", "1"));
 ArgumentOutOfRangeException.ThrowIfNegativeOrZero(decodeQuantum);
@@ -36,12 +39,13 @@ BackendType backend = options.GetValueOrDefault("--backend", "ggml_cuda") switch
     "ggml_cpu" => BackendType.GgmlCpu,
     _ => throw new ArgumentException("Unsupported backend."),
 };
-if (widths.Length == 0 || widths.Any(w => w < 1 || w > 16) || steps is < 2 or > 64 || promptTokens is < 32 or > 256)
-    throw new ArgumentException("Use widths 1..16, steps 2..64 and prompt tokens 32..256.");
+if (widths.Length == 0 || widths.Any(w => w < 1 || w > 16) || steps is < 2 or > 64
+    || contextTokens is < 128 or > 131072 || promptTokens < 32 || promptTokens > contextTokens - steps - 64)
+    throw new ArgumentException("Use widths 1..16, steps 2..64, context 128..131072 and prompt tokens 32..(context-steps-64).");
 const int blockSize = 16;
 const int transferBytes = 64 << 10;
 string spillDirectory = Path.Combine(Path.GetDirectoryName(output)!, "model-spill-" + Guid.NewGuid().ToString("N"));
-Environment.SetEnvironmentVariable("MAX_CONTEXT", "1024");
+Environment.SetEnvironmentVariable("MAX_CONTEXT", contextTokens.ToString());
 // Both arms use the same per-sequence model execution, chunk sizes and sample work.
 // The candidate additionally proves that the configured storage actually spills.
 Environment.SetEnvironmentVariable("TS_SCHED_DISABLE_BATCHED", "1");
@@ -53,6 +57,7 @@ var runs = new List<EngineRun>();
 var isolatedRuns = new List<EngineRun>();
 var failures = new List<string>();
 object? snapshotReplay = null;
+object? reclaimRun = null;
 object? capabilities = null;
 var promptFixtures = new List<PromptFixture>();
 var nativeCacheSamples = new List<object>();
@@ -89,7 +94,7 @@ try
     if (adaptive)
     {
         if (backend != BackendType.GgmlCuda) throw new ArgumentException("Adaptive probe requires CUDA.");
-        session = AdaptiveModelSession.Create(modelPath, new(1024, 512), sharedBudget!);
+        session = AdaptiveModelSession.Create(modelPath, new(contextTokens, 512), sharedBudget!);
         adaptivePlan = session.Plan;
     }
     var model = loadedModel = session?.Model ?? ModelBase.Create(modelPath, backend);
@@ -127,7 +132,7 @@ try
                 if (tokens.Length >= promptTokens) break;
                 instruction += " Remember to include each consecutive number, without gaps, and continue in ascending order.";
             }
-            Require(tokens.Length + steps <= Math.Min(1024, model.MaxReusablePrefixTokens),
+            Require(tokens.Length + steps <= Math.Min(contextTokens, model.MaxReusablePrefixTokens),
                 $"Rendered prompt {index} plus decode exceeds the model's restorable snapshot window.");
             promptFixtures.Add(new(index, instruction, tokens));
         }
@@ -176,6 +181,10 @@ try
                 failures.Add($"width {width}: did not exercise SSD spill and restoration.");
             SampleNativeCaches($"width-{width}-completed");
         }
+
+        if (admissionReclaim)
+            reclaimRun = await AdmissionReclaimProbe.Run(model, sharedBudget!, Prompt(0), steps,
+                isolatedRuns[0].Requests[0].Tokens);
 
         // Teacher-forced replay checks EVERY vocabulary logit, beyond generated argmax.
         // Keep the complete chat framing and capture each prompt at its actual
@@ -281,10 +290,10 @@ await File.WriteAllTextAsync(output, JsonSerializer.Serialize(new
     SharedAfterModelDispose = sharedAfterModelDispose, SharedAfterAllDispose = sharedAfterAllDispose,
     SharedContract = "When enabled, requests reserve either one resident snapshot page or an automatic resident window, and aligned spill pages where required. Scratch/staging and model buffers have separate lifetimes in the same ledger. Managed baseline and numerical replay retain their original storage. This is not a complete model/request peak or a whole-process cap.",
     PromptFixtureKind = "Complete model chat template with non-thinking assistant generation suffix; distinct counting requests; padded within user content to the requested minimum token count.",
-    MinimumPromptTokens = promptTokens, PromptFixtures = promptFixtures,
+    MinimumPromptTokens = promptTokens, ContextTokens = contextTokens, PromptFixtures = promptFixtures,
     ExpectedUnsupported = expectUnsupported, RejectedUnsupported = rejectedUnsupported,
     ModelCleanupDeferred = modelCleanupDeferred,
-    IsolatedRuns = isolatedRuns, Runs = runs, SnapshotReplay = snapshotReplay,
+    IsolatedRuns = isolatedRuns, Runs = runs, SnapshotReplay = snapshotReplay, AdmissionReclaim = reclaimRun,
     NativeCacheSamples = nativeCacheSamples,
     NativeCacheScope = "GGML-reported lazy-copy and explicit-preload payload per rank; excludes graph arenas, device KV, backend pools and physical driver allocation overhead. Availability is false with an older native binary.",
     Limitations = "Real model host snapshot RAM/SSD validation on the declared Backend. Model weights and live device KV remain resident and outside snapshot budget. Width 1 is an output/timing control only: no ownership swap or host snapshot occurs. Rendered chat fixtures test isolation and exact managed/tiered generated tokens, not semantic quality. Full-logit tolerance replay uses two complete short chat prompts and forced tokens. No whole-model out-of-core, multimodal, MTP, tensor-parallel snapshot, HTTP latency or speedup claim. Timings include engine I/O/compute, exclude load/compilation, and have one sample per width/arm. OS page cache is not bounded; physical filesystem medium is not assumed to be NVMe."

@@ -356,6 +356,33 @@ public class PrefixTreeEvictionTests
     }
 
     [Fact]
+    public void AdmissionReclaim_EvictsInPriorityOrder_IncludingNewest_ButHonorsPins()
+    {
+        PrefixTree t = Tk.Tree(Tk.Caps(pages: PageSupport.None));
+        int s = Tk.Scope(t);
+        RadixNode pub = Tk.Put(t, Tk.Key(t, Tk.Seq(1, 20)), 10, 0, p: 10, host: 100);
+        RadixNode old = Tk.Put(t, Tk.Key(t, Tk.Seq(100, 20)), 10, s, host: 100);
+        RadixNode newest = Tk.Put(t, Tk.Key(t, Tk.Seq(200, 20)), 10, s, host: 100);
+        t.Pin(old);
+        LockReceipt held = t.AcquireState(pub);
+        Assert.True(t.EvictOneForAdmission());
+        Assert.False(newest.InTree);
+        Assert.True(old.InTree && pub.InTree);
+        Assert.False(t.EvictOneForAdmission());
+        t.Release(ref held);
+        t.Unpin(old);
+        Assert.True(t.EvictOneForAdmission());
+        Assert.False(old.InTree);
+        Assert.True(pub.InTree);
+        Assert.True(t.EvictOneForAdmission());
+        Assert.False(pub.InTree);
+        Assert.False(t.EvictOneForAdmission());
+        Assert.Equal(3, t.Reclaim.Count);
+        t.Reclaim.Drain((_, reason) => Assert.Equal(ReleaseReason.Pressure, reason));
+        Tk.Valid(t);
+    }
+
+    [Fact]
     public void EffectiveCaps_EnforceCaps()
     {
         long spare = 1000;

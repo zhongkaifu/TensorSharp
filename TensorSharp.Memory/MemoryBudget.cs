@@ -125,6 +125,15 @@ public sealed class MemoryBudget
         }
     }
 
+    /// <summary>Check current headroom without owning it. Intended for bounded cache
+    /// reclamation; admission must still use TryReserve because other owners can race.</summary>
+    public bool CanReserve(IEnumerable<MemoryCharge> charges)
+    {
+        var normalized = Normalize(charges);
+        lock (_gate) return normalized.All(c => c.Bytes <=
+            _pools[c.Pool].Capacity - _pools[c.Pool].Reserved - _pools[c.Pool].Committed);
+    }
+
     // A spilled/demoted child must use its request's reserved credit while that
     // request is alive. Retained prefixes outlive the envelope and then compete
     // directly for free pool capacity. Check and reserve under the same lock.

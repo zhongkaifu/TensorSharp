@@ -2679,6 +2679,16 @@ namespace TensorSharp.Runtime.Scheduling
             return "prefix caching is off; the model released what it parked for reuse";
         }
 
+        /// <summary>Called only when no sequence is running. Release parked model
+        /// buffers first, then just enough unlocked prefix payloads to unblock work.
+        /// A release failure is a lifecycle failure and must stop the worker.</summary>
+        internal void ReclaimForAdmission(Func<bool> canAdmit)
+        {
+            if (canAdmit()) return;
+            _model.TrimIdleMemory();
+            RadixCache?.ReclaimForAdmission(canAdmit);
+        }
+
         /// <summary>Consume a token the batched greedy path sampled on-device
         /// last step (bit-equivalent to re-sampling the logits it summarizes),
         /// falling back to host sampling from LastLogits. Any position drift —

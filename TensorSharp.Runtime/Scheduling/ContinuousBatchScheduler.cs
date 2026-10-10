@@ -137,6 +137,7 @@ namespace TensorSharp.Runtime.Scheduling
         public int WaitingCount => _waiting.Count;
         public int RunningCount => _running.Count;
         public bool MemoryAdmissionBlocked { get; private set; }
+        internal IReadOnlyList<MemoryCharge>? BlockedMemoryPeak { get; private set; }
         public BlockPool Pool => _pool;
         public SchedulerConfig Config => _cfg;
 
@@ -250,6 +251,7 @@ namespace TensorSharp.Runtime.Scheduling
         public SchedulerOutput Schedule()
         {
             MemoryAdmissionBlocked = false;
+            BlockedMemoryPeak = null;
             var output = new SchedulerOutput();
             int tokenBudget = _cfg.MaxNumBatchedTokens;
 
@@ -403,7 +405,12 @@ namespace TensorSharp.Runtime.Scheduling
                         continue;
                     }
                     var envelope = admission.Budget.TryReserve(peak);
-                    if (envelope == null) { MemoryAdmissionBlocked = true; break; }
+                    if (envelope == null)
+                    {
+                        MemoryAdmissionBlocked = true;
+                        BlockedMemoryPeak = peak;
+                        break;
+                    }
                     seq.MemoryEnvelope = envelope;
                     _memoryOwners.Add(seq.RequestId, seq);
                 }

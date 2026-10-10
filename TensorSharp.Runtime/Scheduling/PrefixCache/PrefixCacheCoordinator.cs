@@ -632,6 +632,15 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
         Drain();
     }
 
+    /// <summary>Admission needs actual released credit, not the tree's predicted
+    /// byte counts. Drain each victim before rechecking the shared multi-pool budget.
+    /// Stop as soon as work fits, preserving the remaining reusable prefixes.</summary>
+    internal void ReclaimForAdmission(Func<bool> canAdmit)
+    {
+        Drain();
+        while (!canAdmit() && _tree.EvictOneForAdmission()) Drain();
+    }
+
     internal void Detach() => _cacheModel.DetachPrefixCache();
 
     private static int[] PrefixTokens(SequenceState sequence, int length)
