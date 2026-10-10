@@ -21,8 +21,8 @@ namespace TensorSharp.Runtime.Speculative
     public sealed record SpeculationOptions
     {
         /// <summary>Speculative decoding requested. Default OFF - a per-token
-        /// head is resident in every checkpoint that ships one, so engaging by
-        /// its mere presence would silently change what a plain run does.
+        /// checkpoint may carry a per-token head, but engaging by its mere
+        /// presence would silently change what a plain run does.
         /// CLI: <c>--spec</c>; env: <c>TS_SPEC</c>.</summary>
         public bool Enabled { get; init; }
 

@@ -23,7 +23,9 @@ namespace TensorSharp.Runtime.Paged
         private readonly PagedKvStorage _storage;
         private readonly int _blockSize;
 
-        public BlockPool(int numBlocks, int blockSize, long blockByteSize)
+        public BlockPool(int numBlocks, int blockSize, long blockByteSize) : this(numBlocks, blockSize, blockByteSize, null) { }
+
+        public BlockPool(int numBlocks, int blockSize, long blockByteSize, KvSnapshotOptions? snapshotOptions)
         {
             if (numBlocks <= 0) throw new ArgumentOutOfRangeException(nameof(numBlocks));
             if (blockSize <= 0) throw new ArgumentOutOfRangeException(nameof(blockSize));
@@ -31,7 +33,7 @@ namespace TensorSharp.Runtime.Paged
             _blockSize = blockSize;
             _blocks = new KvBlock[numBlocks];
             _freeQueue = new FreeBlockQueue();
-            _storage = new PagedKvStorage(numBlocks, blockByteSize);
+            _storage = new PagedKvStorage(numBlocks, blockByteSize, snapshotOptions);
 
             for (int i = 0; i < numBlocks; i++)
             {
@@ -94,11 +96,11 @@ namespace TensorSharp.Runtime.Paged
                 if (b == null) continue;
                 if (b.RefCount <= 0)
                     throw new InvalidOperationException($"Double-free of block {b.Id}");
+                if (b.RefCount == 1) ReleaseStorage(b);
                 b.RefCount--;
                 if (b.RefCount == 0)
                 {
                     _freeQueue.Enqueue(b);
-                    ReleaseStorage(b);
                 }
             }
         }
@@ -109,11 +111,11 @@ namespace TensorSharp.Runtime.Paged
             if (block == null) return;
             if (block.RefCount <= 0)
                 throw new InvalidOperationException($"Double-free of block {block.Id}");
+            if (block.RefCount == 1) ReleaseStorage(block);
             block.RefCount--;
             if (block.RefCount == 0)
             {
                 _freeQueue.Enqueue(block);
-                ReleaseStorage(block);
             }
         }
 

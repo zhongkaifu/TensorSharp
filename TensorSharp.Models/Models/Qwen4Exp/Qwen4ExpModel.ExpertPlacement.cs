@@ -228,68 +228,9 @@ namespace TensorSharp.Models
             long[] layerCacheMinimumBytes = null, ulong cacheLayers = 48,
             long[] layerCacheAllocationFloorBytes = null)
         {
-            ArgumentNullException.ThrowIfNull(layerExpertBytes);
-            if (pendingBytes < 0 || headroomBytes < 0 || expertCacheBytes < 0)
-                throw new ArgumentOutOfRangeException(nameof(pendingBytes));
-            if (layerCacheMinimumBytes != null && layerCacheMinimumBytes.Length != layerExpertBytes.Length)
-                throw new ArgumentException("Cache layouts must match the expert layer count.", nameof(layerCacheMinimumBytes));
-            if (layerCacheAllocationFloorBytes != null && (layerCacheMinimumBytes == null
-                || layerCacheAllocationFloorBytes.Length != layerExpertBytes.Length))
-                throw new ArgumentException("Cache allocation floors must match the cache layouts.", nameof(layerCacheAllocationFloorBytes));
-            foreach (long bytes in layerExpertBytes)
-                if (bytes < 0) throw new ArgumentOutOfRangeException(nameof(layerExpertBytes));
-            if (layerCacheMinimumBytes != null)
-                foreach (long bytes in layerCacheMinimumBytes)
-                    if (bytes < 0) throw new ArgumentOutOfRangeException(nameof(layerCacheMinimumBytes));
-            if (layerCacheAllocationFloorBytes != null)
-                for (int l = 0; l < layerCacheAllocationFloorBytes.Length; l++)
-                    if (layerCacheAllocationFloorBytes[l] < 0 || layerCacheAllocationFloorBytes[l] > layerCacheMinimumBytes[l])
-                        throw new ArgumentOutOfRangeException(nameof(layerCacheAllocationFloorBytes));
-            long available = Math.Max(0, freeBytes);
-            foreach (long reserve in new[] { pendingBytes, headroomBytes, DeviceScratchBytes })
-                available = reserve >= available ? 0 : available - reserve;
-            int Fit(long budget)
-            {
-                int resident = 0;
-                for (int l = layerExpertBytes.Length - 1; l >= 0; l--)
-                {
-                    long bytes = layerExpertBytes[l];
-                    if (bytes > budget) break;
-                    budget -= bytes;
-                    resident++;
-                }
-                return resident;
-            }
-            int count = Fit(available);
-            if (count == layerExpertBytes.Length || expertCacheBytes == 0 || cacheLayers == 0 || layerCacheMinimumBytes == null)
-                return count;
-            long quota = (long)((ulong)expertCacheBytes / cacheLayers);
-            bool CacheFits(int layer) => layerCacheMinimumBytes[layer] > 0 && layerCacheMinimumBytes[layer] <= quota;
-            bool CacheMayAllocate(int layer)
-            {
-                long floor = layerCacheAllocationFloorBytes == null ? layerCacheMinimumBytes[layer] : layerCacheAllocationFloorBytes[layer];
-                return floor > 0 && floor <= quota;
-            }
-            bool all = cacheLayers >= (ulong)layerExpertBytes.Length;
-            for (int l = 0; l < layerExpertBytes.Length; l++) all &= CacheFits(l);
-            if (all) return 0;
-            // A heterogeneous model can cache only some host layers. Charge their
-            // quotas before retaining whole GPU layers, and repeat when that charge
-            // moves another eligible layer to the host. Even a quota below our
-            // conservative threshold can fit the native allocator with reuse;
-            // charge any layer above the necessary payload+workspace floor.
-            // This prevents both tiers spending the same remaining device bytes.
-            for (;;)
-            {
-                int eligible = 0;
-                for (int l = 0; l < layerExpertBytes.Length - count; l++)
-                    if (CacheMayAllocate(l)) eligible++;
-                long reserve = quota == 0 || eligible == 0 ? 0
-                    : eligible > expertCacheBytes / quota ? expertCacheBytes : quota * eligible;
-                int next = Fit(reserve >= available ? 0 : available - reserve);
-                if (next == count) return count;
-                count = next;
-            }
+            return TensorSharp.Memory.TieredPlacementPlanner.PlanDiscreteResidency(
+                layerExpertBytes, pendingBytes, freeBytes, headroomBytes, DeviceScratchBytes,
+                expertCacheBytes, layerCacheMinimumBytes, cacheLayers, layerCacheAllocationFloorBytes);
         }
 
         /// <summary>How many trailing layers' experts the accelerator holds. A layer
@@ -299,28 +240,11 @@ namespace TensorSharp.Models
         internal static int PlanDeviceExpertLayers(long[] layerExpertBytes, long otherDeviceBytes,
             long workingSetBytes, long ramBytes)
         {
-            int n = layerExpertBytes.Length;
-            long hostReserve = Math.Max(HostReserveFloorBytes, ramBytes / 6);
-            long wired = otherDeviceBytes + DeviceScratchBytes;
-            long offloadedHot = 0;
-            for (int l = 0; l < n; l++)
-                offloadedHot += (long)(layerExpertBytes[l] * OffloadedHotFraction);
-
-            int onDevice = 0;
-            // Walk from the LAST layer down: those are the ones that stay resident.
-            for (int l = n - 1; l >= 0; l--)
-            {
-                long nextWired = wired + layerExpertBytes[l];
-                long nextHot = offloadedHot - (long)(layerExpertBytes[l] * OffloadedHotFraction);
-                if (nextWired > workingSetBytes - Math.Max(GpuMemoryBudget.MinHeadroomBytes, workingSetBytes / 16))
-                    break;
-                if (ramBytes - nextWired < hostReserve + nextHot)
-                    break;
-                wired = nextWired;
-                offloadedHot = nextHot;
-                onDevice++;
-            }
-            return onDevice;
+            return TensorSharp.Memory.TieredPlacementPlanner.PlanUnifiedResidency(
+                layerExpertBytes, otherDeviceBytes, workingSetBytes, ramBytes,
+                Math.Max(HostReserveFloorBytes, ramBytes / 6),
+                Math.Max(GpuMemoryBudget.MinHeadroomBytes, workingSetBytes / 16),
+                DeviceScratchBytes, OffloadedHotFraction);
         }
 
         private long LayerExpertBytes(int layer)

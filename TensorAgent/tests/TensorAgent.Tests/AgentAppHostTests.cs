@@ -114,8 +114,7 @@ public sealed class AgentAppHostTests : IDisposable
         CatalogModel model = ModelCatalog.Find(id)!;
         var store = new ModelStore(paths.ModelsDirectory);
         Directory.CreateDirectory(store.DirectoryFor(model));
-        using (FileStream stream = File.Create(store.PathFor(model, model.Weights)))
-            stream.SetLength(model.Weights.Bytes);
+        SparseFileFixture.Create(store.PathFor(model, model.Weights), model.Weights.Bytes);
 
         _host = new AgentAppHost(paths);
         _host.Start();
@@ -153,8 +152,7 @@ public sealed class AgentAppHostTests : IDisposable
         settings.Save(chosen);
         var store = new ModelStore(paths.ModelsDirectory);
         Directory.CreateDirectory(store.DirectoryFor(model));
-        using (FileStream weights = File.Create(store.PathFor(model, model.Weights)))
-            weights.SetLength(model.Weights.Bytes);
+        SparseFileFixture.Create(store.PathFor(model, model.Weights), model.Weights.Bytes);
         string marker = Path.Combine(paths.DataRoot, "model-load-in-progress.json");
         File.WriteAllText(marker, JsonSerializer.Serialize(new { ModelId = model.Id }));
 
@@ -295,8 +293,7 @@ public sealed class AgentAppHostTests : IDisposable
         Directory.CreateDirectory(store.DirectoryFor(lora));
         foreach (LoraFile file in lora.Files)
         {
-            using FileStream stream = File.Create(store.PathFor(lora, file));
-            stream.SetLength(file.Bytes);
+            SparseFileFixture.Create(store.PathFor(lora, file), file.Bytes);
         }
     }
 

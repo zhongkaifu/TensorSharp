@@ -26,7 +26,7 @@ namespace TensorSharp.Models
 
         public void LoadVisionEncoder(string mmProjPath)
         {
-            if (Config.Architecture != "glm5next")
+            if (!GlmDsaArchitecture.IsGlm5Next(Config.Architecture))
             {
                 Console.WriteLine($"Warning: {Config.Architecture} has no vision tower; ignoring mmproj {mmProjPath}.");
                 return;

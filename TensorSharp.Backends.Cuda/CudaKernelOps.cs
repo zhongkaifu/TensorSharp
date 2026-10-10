@@ -1990,7 +1990,7 @@ namespace TensorSharp.Cuda
                 src.Sizes[2] != cache.Sizes[2] ||
                 cache.Sizes[1] != cacheSize ||
                 srcCount != src.Sizes[0] * seqLen * src.Sizes[2] ||
-                (!circular && startPos + seqLen > cacheSize))
+                (!circular && (startPos > cacheSize || seqLen > cacheSize - startPos)))
             {
                 return false;
             }

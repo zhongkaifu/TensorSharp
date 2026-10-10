@@ -238,7 +238,7 @@ namespace TensorSharp.Models
         /// (same contract as the retained Qwen hybrid GDN models). glm-dsa proper has no
         /// recurrent state and keeps the base behaviour.
         /// </summary>
-        public override bool SupportsKVCacheTruncation => Config.Architecture != "glm5next";
+        public override bool SupportsKVCacheTruncation => !GlmDsaArchitecture.IsGlm5Next(Config.Architecture);
 
         /// <summary>
         /// The dtype a slot's MLA and indexer rows are actually allocated in: F16 in the
@@ -356,7 +356,7 @@ namespace TensorSharp.Models
         {
             var full = new bool[_numTrunkLayers];
 
-            if (arch == "glm5next")
+            if (GlmDsaArchitecture.IsGlm5Next(arch))
             {
                 // GLM-5.3-Flash: attention.head_count_kv is a per-layer array,
                 // 0 on KDA (linear-attention) layers and 1 on MLA+DSA layers.

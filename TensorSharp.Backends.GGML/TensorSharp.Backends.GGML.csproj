@@ -55,6 +55,7 @@
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\TensorSharp.Core\TensorSharp.Core.csproj" />
+    <ProjectReference Include="..\TensorSharp.Memory\TensorSharp.Memory.csproj" />
   </ItemGroup>
   <!-- Native sources whose change should trigger a native rebuild. The globs are
        single-level so they do not descend into the build*/ output dirs, the tests/

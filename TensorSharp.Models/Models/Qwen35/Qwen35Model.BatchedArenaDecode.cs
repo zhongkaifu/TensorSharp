@@ -57,6 +57,7 @@ namespace TensorSharp.Models
         /// round-robin loop alone instead of declining the whole batch.</summary>
         public bool CanBatchDecode(string requestId, int position)
         {
+            if (HasStreamingWeights) return false;
             if (_fusedHolders == null || !_fusedHolders.TryGetValue(requestId, out var h) || h.K == null)
                 return false;
             return position + 1 <= h.KvCapacity;
@@ -140,6 +141,8 @@ namespace TensorSharp.Models
             float[][] outLogits, int[] outNextTokens)
         {
             BatchedFusedDecodeDeclineReason = null;
+            if (HasStreamingWeights)
+                return ArenaDecline("file-backed weights do not support persistent fused weight graphs");
             // The native graph is shared by CUDA and Metal. Its recurrent-slot
             // aggregation carries explicit dataflow dependencies, so Metal's
             // concurrent graph scheduler cannot race the column producers.

@@ -35,6 +35,7 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "ggml-alloc.h"
+#include "ggml_ops_graph_budget.h"
 #if defined(TSG_GGML_USE_METAL)
 #include "ggml-metal.h"
 #endif
@@ -250,6 +251,7 @@ namespace tsg
         DeviceCopy,
     };
 
+    class SharedCacheCharge;
     struct CachedHostBuffer {
         ggml_backend_buffer_t buffer = nullptr;
         std::size_t bytes = 0;
@@ -272,6 +274,8 @@ namespace tsg
         // or the host pointer for a zero-copy wrap). Recording it lets a repeat
         // bind attach with two assignments and no backend calls at all.
         void* bound_addr = nullptr;
+        // Declared after the payload fields; release only after buffer_free.
+        std::shared_ptr<SharedCacheCharge> shared_charge;
     };
 
     // --- Multi-device (tensor-parallel) state -------------------------------
@@ -309,7 +313,12 @@ namespace tsg
         std::int64_t offloadable_budget = 0;
 
         std::int64_t device_copy_resident_bytes = 0;
+        std::int64_t device_copy_reserved_bytes = 0;
         std::int64_t device_copy_budget_bytes = 0;
+        // Explicit preloads retain their existing admission policy; they are
+        // measured separately and do not consume the lazy device-copy quota.
+        std::int64_t preload_resident_bytes = 0;
+        std::int64_t preload_reserved_bytes = 0;
     };
 
     extern DeviceState g_device_states[TSG_MAX_DEVICES];
@@ -318,6 +327,11 @@ namespace tsg
     // Active rank for the calling thread. Per-thread so a rank worker pool can
     // drive several GPUs concurrently without stepping on each other.
     extern thread_local int g_active_rank;
+
+    inline ggml_backend_buffer_t alloc_ctx_tensors_budgeted(ggml_context* context, ggml_backend_t backend)
+    {
+        return graph_budget_alloc_ctx_tensors(context, backend, g_active_rank);
+    }
 
     // Cluster-wide tensor-parallel geometry, for a run split across NODES.
     // g_device_count is this process's share; these two describe the whole
@@ -473,8 +487,12 @@ namespace tsg
     // belongs to that command buffer, so latch it. The flag is sticky because the
     // backend is — ggml-metal clears has_error only by being recreated. That is what
     // TSGgml_RecreateBackend exists for, and it is the only thing that clears this.
+    ggml_backend_t q8_f32_execution_backend(ggml_backend_t backend, ggml_cgraph* graph);
+    void clear_q8_f32_backends();
+
     inline ggml_status compute_graph(ggml_backend_t backend, ggml_cgraph* graph)
     {
+        backend = q8_f32_execution_backend(backend, graph);
         const std::uint64_t before = g_ggml_error_count.load(std::memory_order_acquire);
         const ggml_status status = ggml_backend_graph_compute(backend, graph);
         if (g_ggml_error_count.load(std::memory_order_acquire) != before)
@@ -659,7 +677,7 @@ namespace tsg
         ~BufferHandle()
         {
             if (value != nullptr)
-                ggml_backend_buffer_free(value);
+                graph_budget_free_buffer(value);
         }
 
         BufferHandle(const BufferHandle&) = delete;
@@ -675,7 +693,7 @@ namespace tsg
             if (this != &other)
             {
                 if (value != nullptr)
-                    ggml_backend_buffer_free(value);
+                    graph_budget_free_buffer(value);
                 value = other.value;
                 other.value = nullptr;
             }

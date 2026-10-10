@@ -13,6 +13,23 @@ spec.loader.exec_module(runner)
 
 
 class StrataComparisonTests(unittest.TestCase):
+    def test_instruction_format_is_not_repaired_before_scoring(self):
+        for case, text in (("math", "42."), ("math", "42!"),
+                           ("extraction", "cedar | maple"), ("extraction", "cedar maple"),
+                           ("code", "```python\ndef square(x):\n    return x*x\n```")):
+            with self.subTest(case=case, text=text):
+                self.assertFalse(runner.semantic_check(case, text, True)["passed"])
+
+    def test_tool_arguments_are_complete_json_without_duplicate_keys(self):
+        answer = '{"name":"get_weather","arguments":{"city":"Hangzhou","unit":"celsius"}}'
+        self.assertTrue(runner.semantic_check("tool_json", answer, True)["passed"])
+        for text, eos in ((answer, False), (answer.replace('celsius', 'fahrenheit'), True),
+                          (answer.replace('"name":', '"name":"wrong","name":'), True),
+                          ('```json\n' + answer + '\n```', True),
+                          (answer[:-1] + ',"extra":1}', True)):
+            with self.subTest(text=text, eos=eos):
+                self.assertFalse(runner.semantic_check("tool_json", text, eos)["passed"])
+
     LOG = "prompt  : 11 22 33\noutput  : 42 99\ndecode  2 tokens in 123.0 ms -> 16.26 tok/s\nprefill  2 tokens in 51.0 ms -> 39.22 tok/s (time to first token 72.0 ms)\n"
 
     def test_completed_ids_and_different_timing_denominators(self):

@@ -22,7 +22,9 @@
 //
 // Metal does not fuse this chain, so its run is a plain kernel-correctness guard.
 //
-// Usage: GgmlOpsMoeFusedBiasAliasTest [cpu|cuda|metal]   (exit 77 = backend unavailable)
+// `cuda stream` also covers graph-owned expert weights: their last unfused
+// consumer must not let gallocr reuse their storage while fused MMVQ still reads.
+// Usage: GgmlOpsMoeFusedBiasAliasTest [cpu|cuda|metal] [stream] (exit 77 = unavailable)
 
 #include <algorithm>
 #include <cmath>
@@ -166,7 +168,7 @@ struct Model
 };
 
 // Returns false (after printing why) when the kernel disagrees with the host or with itself.
-bool run_case(const std::string& name, Model& m, int Tokens)
+bool run_case(const std::string& name, Model& m, int Tokens, bool stream = false)
 {
     auto& gate = m.gate; auto& up = m.up; auto& down = m.down;
     const auto& gate_bias = m.gate_bias; const auto& up_bias = m.up_bias; const auto& down_bias = m.down_bias;
@@ -207,7 +209,7 @@ bool run_case(const std::string& name, Model& m, int Tokens)
             up.bytes.data(), GgmlTypeQ8_0, Hidden, Ff, static_cast<std::int64_t>(up.bytes.size()),
             down.bytes.data(), GgmlTypeQ8_0, Ff, Hidden, static_cast<std::int64_t>(down.bytes.size()),
             gate_bias.data(), up_bias.data(), down_bias.data(),
-            ActivationSwiGluOai, Alpha, Limit, /*run_on_cpu=*/0);
+            ActivationSwiGluOai, Alpha, Limit, /*run_on_cpu=*/stream ? 1 : 0);
         if (ok == 0)
         {
             const char* err = TSGgml_GetLastError();
@@ -230,7 +232,7 @@ bool run_case(const std::string& name, Model& m, int Tokens)
     bool ok = true;
     if (!(worst <= tolerance))
     {
-        std::printf("  FAIL: output differs from the host evaluation (a fused kernel read a bias the graph had already overwritten?)\n");
+        std::printf("  FAIL: output differs from the host evaluation (a fused kernel read an overwritten uploaded leaf?)\n");
         ok = false;
     }
     if (!deterministic)
@@ -252,6 +254,23 @@ int main(int argc, char** argv)
         else if (name == "metal" || name == "ggml_metal") backend = BackendTypeMetal;
         else if (name != "cpu" && name != "ggml_cpu") fail("unknown backend argument " + name + "; use cpu, cuda or metal");
     }
+    const bool stream = argc >= 3 && std::string(argv[2]) == "stream";
+    if (stream)
+    {
+        if (backend != BackendTypeCuda) fail("the streamed fusion regression requires CUDA");
+        // Set the native CRT environment before its first threshold lookup.
+        // Small N exercises fused gate/up MMVQ while weights live in gallocr.
+#ifdef _WIN32
+        _putenv_s("TS_HOST_MOE_DEVICE_MIN_BATCH", "1");
+        _putenv_s("TS_HOST_MOE_PIN", "0");
+        _putenv_s("TS_HOST_MOE_EXPERT_CACHE_MB", "0");
+#else
+        setenv("TS_HOST_MOE_DEVICE_MIN_BATCH", "1", 1);
+        setenv("TS_HOST_MOE_PIN", "0", 1);
+        setenv("TS_HOST_MOE_EXPERT_CACHE_MB", "0", 1);
+#endif
+        name += "-stream";
+    }
     if (TSGgml_IsBackendAvailable(backend) == 0)
     {
         const char* err = TSGgml_GetLastError();
@@ -269,8 +288,9 @@ int main(int argc, char** argv)
     for (float& v : m.down_bias) v = next_int(-48, 48) / 16.0f;
 
     bool ok = true;
-    for (int tokens : { 1, 4, 7 })
-        ok = run_case(name, m, tokens) && ok;
+    const std::vector<int> counts = stream ? std::vector<int>{1, 8, 9, 38} : std::vector<int>{1, 4, 7};
+    for (int tokens : counts)
+        ok = run_case(name, m, tokens, stream) && ok;
     // Release the cached buffers and the backend before exit: ggml-metal asserts in
     // its static destructor while residency sets still hold buffers.
     TSGgml_Shutdown();

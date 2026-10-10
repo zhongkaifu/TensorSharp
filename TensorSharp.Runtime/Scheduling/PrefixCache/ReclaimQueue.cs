@@ -89,15 +89,18 @@ internal sealed class ReclaimQueue
         try
         {
             sink?.Invoke(new ReadOnlySpan<string>(_drainBuffer, 0, n), reason);
+            // ReleasePayloads is idempotent, including unknown keys. A sink may
+            // free part of the batch before throwing, so retain the entire batch
+            // and its conservative charge until a retry confirms all are gone.
+            _entries.Clear();
+            _keys.Clear();
+            _pending = default;
+            ReleasedKeys += n;
         }
         finally
         {
             Array.Clear(_drainBuffer, 0, n);
-            _entries.Clear();
-            _keys.Clear();
-            _pending = default;
             DrainCalls++;
-            ReleasedKeys += n;
         }
         return n;
     }

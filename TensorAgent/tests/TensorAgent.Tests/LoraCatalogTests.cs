@@ -353,8 +353,7 @@ public sealed class LoraCatalogTests : IDisposable
             Directory.CreateDirectory(store.DirectoryFor(lora));
             foreach (LoraFile file in lora.Files)
             {
-                using FileStream stream = File.Create(store.PathFor(lora, file));
-                stream.SetLength(file.Bytes);
+                SparseFileFixture.Create(store.PathFor(lora, file), file.Bytes);
             }
         }
         return store;

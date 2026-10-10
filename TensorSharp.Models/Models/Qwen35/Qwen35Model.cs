@@ -33,7 +33,7 @@ namespace TensorSharp.Models
     /// (gate+up + down) or a Mixture-of-Experts SwiGLU (router + top-K SwiGLU experts +
     /// optional shared SwiGLU expert gated by sigmoid), depending on which weights are present.
     /// </summary>
-    public partial class Qwen35Model : ModelBase
+    public partial class Qwen35Model : ModelBase, TensorSharp.Runtime.Paged.IKvSnapshotBulkRestorer
     {
         private static long _nextVerifyOwnerId;
         private static readonly object _verifyTpPlanLock = new();
@@ -61,11 +61,12 @@ namespace TensorSharp.Models
         // executed by the speculative-decoding paths in Qwen35Model.Mtp.cs.
         private int _numNextnLayers;
         private int _mtpLayerIdx = -1;
+        private bool _loadEmbeddedMtpWeights = true;
 
         // Per-layer arrays must cover the MTP block (it reuses AttentionBlock
         // and the standard KV-cache machinery) while the main forward loops
         // iterate only Config.NumLayers trunk layers.
-        private int TotalLayerCount => Config.NumLayers + _numNextnLayers;
+        private int TotalLayerCount => Config.NumLayers + (_loadEmbeddedMtpWeights ? _numNextnLayers : 0);
 
         // MoE configuration (qwen35moe / qwen3next variants)
         private int _numExperts;
@@ -256,9 +257,9 @@ namespace TensorSharp.Models
         private QuantizedWeight[] _ffnGateUpQW;
         // Mixed-quant "UD"/dynamic GGUFs can store ffn_gate and ffn_up in different
         // GGML types (IQ2_XS vs IQ2_S, IQ1_S vs IQ2_XXS, ...). One fused tensor
-        // cannot represent that, and both of those types need an importance matrix
-        // to requantize, so ModelBase.FuseGateUpWeights leaves such a layer alone.
-        // These hold the unfused pair for exactly those layers; the FFN then runs
+        // cannot represent that without changing the stored weights. Single-rank
+        // GGML CPU/CUDA keeps these pairs split instead of requantizing them.
+        // These hold the unfused pair for those layers; the FFN then runs
         // two matmuls instead of one, with the weights untouched. Half the layers
         // of an unsloth Qwen3.8 UD quant land here, so this is the normal case for
         // that family, not a corner.
@@ -347,8 +348,15 @@ namespace TensorSharp.Models
         /// (general.architecture = "dflash"). When present it replaces the trunk's
         /// own NextN/MTP block as the drafter.</param>
         public Qwen35Model(string ggufPath, BackendType backend, int tpDegree = 1, ITensorParallelGroup tpGroup = null,
-            string draftModelPath = null)
-            : base(ggufPath, backend, tpDegree, tpGroup)
+            string draftModelPath = null, WeightStreamingOptions weightStreaming = null)
+            : this(ggufPath, backend, tpDegree, tpGroup, draftModelPath, weightStreaming, null)
+        {
+        }
+
+        public Qwen35Model(string ggufPath, BackendType backend,
+            int tpDegree, ITensorParallelGroup tpGroup,
+            string draftModelPath, WeightStreamingOptions weightStreaming, ModelMemoryPolicy memoryPolicy)
+            : base(ggufPath, backend, tpDegree, tpGroup, 1, weightStreaming, memoryPolicy)
         {
             _useMetalGdnInplaceState = ShouldUseMetalGdnInplaceState(backend, IsTensorParallel);
 
@@ -358,7 +366,7 @@ namespace TensorSharp.Models
             }
             catch
             {
-                if (HasBonsaiCheckpointMetadata)
+                if (HasBonsaiCheckpointMetadata || weightStreaming != null || memoryPolicy != null)
                 {
                     // Reuse the ordinary cleanup without virtual dispatch into
                     // a subclass whose constructor has not completed. A missing
@@ -394,7 +402,9 @@ namespace TensorSharp.Models
             if (_numNextnLayers > 0)
             {
                 Config.NumLayers -= _numNextnLayers;
-                _mtpLayerIdx = Config.NumLayers;
+                _loadEmbeddedMtpWeights = ShouldLoadEmbeddedMtpWeights(
+                    TensorSharp.Runtime.Speculative.SpeculationOptions.FromEnvironment(), MemoryPolicy);
+                _mtpLayerIdx = _loadEmbeddedMtpWeights ? Config.NumLayers : -1;
             }
 
             // MRoPE sections
@@ -450,7 +460,8 @@ namespace TensorSharp.Models
             Console.WriteLine($"Layer types: {attnCount} full attention, {recCount} recurrent (GatedDeltaNet)");
 
             if (_numNextnLayers > 0)
-                Console.WriteLine($"NextN/MTP: {_numNextnLayers} draft block(s) at layer {_mtpLayerIdx} (excluded from main stack)");
+                Console.WriteLine($"NextN/MTP: {_numNextnLayers} draft block(s) at layer {Config.NumLayers} " +
+                    (_loadEmbeddedMtpWeights ? "(excluded from main stack)" : "(omitted by speculative loading policy; no draft weights or KV)"));
 
             if (_numExperts > 0)
             {
@@ -464,10 +475,17 @@ namespace TensorSharp.Models
                     MoeCpuOffloadConfig.WarnUnsupportedBackend("qwen35moe", _backend.ToString());
             }
 
+            ValidateStreamingWeightConfiguration(draftModelPath);
             LoadWeights();
-            FuseAttentionProjectionWeights();
-            FuseRecurrentInputWeights();
-            FuseGateUpWeights(TotalLayerCount);
+            if (OmittedCheckpointWeightCount > 0)
+                Console.WriteLine($"  Omitted NextN checkpoint payload: {OmittedCheckpointWeightBytes} bytes " +
+                    $"across {OmittedCheckpointWeightCount} tensors (not physical RAM/VRAM savings).");
+            if (!HasStreamingWeights)
+            {
+                FuseAttentionProjectionWeights();
+                FuseRecurrentInputWeights();
+                FuseGateUpWeights(TotalLayerCount);
+            }
             RegisterBonsaiWeightTransforms(_headVDim, _numKHeads, _numVHeads);
             DetectMoeLayers();
             BuildLayerKeys();
@@ -480,7 +498,7 @@ namespace TensorSharp.Models
                 ShardQwen35WeightsForTP();
                 PrepareCudaQuantizedWeightsForInferenceTP();
             }
-            else
+            else if (!HasStreamingWeights)
             {
                 PrepareCudaQuantizedWeightsForInference();
             }
@@ -504,6 +522,7 @@ namespace TensorSharp.Models
             // are merged into the trunk's weight dictionaries and its KV ring comes
             // off the same allocator.
             TryLoadQwen35DFlash(draftModelPath);
+            RegisterQwenQ8Precision();
         }
 
         private unsafe void FuseAttentionProjectionWeights()
@@ -1348,16 +1367,16 @@ namespace TensorSharp.Models
         // (<see cref="RequiresPerBlockCapture"/>).
         public override bool RequiresPerBlockCapture => true;
 
-        public override bool SupportsKVStateSnapshot => _kvCacheK != null && _kvCacheV != null;
+        public override bool SupportsKVStateSnapshot => !IsTensorParallel && _kvCacheK != null && _kvCacheV != null;
 
-        // A byte snapshot is still exposed, but it
-        // is not a viable cross-request cache for this hybrid architecture: each
-        // 256-token block repeats the complete GDN recurrent state (about 50 MiB
-        // for the 9B model), and interleaving those snapshots has historically
-        // corrupted sequence isolation. Continuous batching uses the model's
-        // device-resident per-request KV+GDN holders instead; fallback paths
-        // re-prefill cleanly.
-        public override bool SupportsCrossSequenceKvReuse => false;
+        // Snapshot swapping must settle every device-authoritative GDN/KV source,
+        // then drop captured graph bindings before the imported host state is used.
+        // Keep the declaration limited to the dense, trunk-only CUDA family covered
+        // by repeated full-logit replay and isolated-versus-interleaved inference.
+        // Other backends, MoE and MTP continue to use their per-request holders.
+        public override bool SupportsCrossSequenceKvReuse => SupportsKVStateSnapshot
+            && _backend == BackendType.GgmlCuda && _numExperts == 0
+            && (_numNextnLayers == 0 || !_loadEmbeddedMtpWeights);
 
         /// <summary>
         /// Prompt M-RoPE positions compress after an image span (the running position
@@ -1401,8 +1420,12 @@ namespace TensorSharp.Models
         public override bool TryExtractKVBlock(int startToken, int tokenCount, Span<byte> destination)
         {
             if (!SupportsKVStateSnapshot) return false;
+            // Validate before any pointer arithmetic or destination writes. A signed
+            // overflow here otherwise turns an invalid range into a host overread.
+            if (startToken < 0 || tokenCount <= 0 || (long)startToken + tokenCount > _cacheSeqLen)
+                return false;
             long expected = ComputeKVBlockByteSize(tokenCount);
-            if (destination.Length != expected) return false;
+            if (expected <= sizeof(int) || destination.Length != expected) return false;
 
             // CopyAttentionOut / CopyGdnStateOut read raw host pointers.  A fused
             // GGML call may have advanced only their device mirrors.
@@ -1414,7 +1437,6 @@ namespace TensorSharp.Models
             {
                 if (!_isRecurrent[l])
                 {
-                    if (startToken + tokenCount > _cacheSeqLen) return false;
                     if (!CopyAttentionOut(_kvCacheK[l], startToken, tokenCount, destination[offset..], out int wK))
                         return false;
                     offset += wK;
@@ -1436,6 +1458,10 @@ namespace TensorSharp.Models
         }
 
         public override bool TryInjectKVBlock(int destToken, int tokenCount, ReadOnlySpan<byte> source)
+            => TryInjectKvBlockCore(destToken, tokenCount, source, deferEndState: false, endStateOnly: false);
+
+        private bool TryInjectKvBlockCore(int destToken, int tokenCount, ReadOnlySpan<byte> source,
+            bool deferEndState, bool endStateOnly)
         {
             // A refusal must leave the model exactly as it was: callers treat a refused
             // block as the end of what the model holds and resume from there (an inject
@@ -1444,23 +1470,45 @@ namespace TensorSharp.Models
             // state of neither this block nor the one before it. Everything that can refuse
             // is therefore decided here, before the first write.
             if (!SupportsKVStateSnapshot) return false;
-            if (destToken != _cacheSeqLen || tokenCount <= 0) return false;
+            if (destToken < 0 || tokenCount <= 0) return false;
             long endToken = (long)destToken + tokenCount;
+            if (endStateOnly ? endToken != _cacheSeqLen : destToken != _cacheSeqLen) return false;
             if (endToken > _maxContextLength) return false;   // EnsureCacheCapacity would throw
             long expected = ComputeKVBlockByteSize(tokenCount);
             if (expected <= sizeof(int) || source.Length != expected) return false;
             long layerBytes = 0;
             for (int l = 0; l < Config.NumLayers; l++)
             {
-                layerBytes += _isRecurrent[l]
-                    ? GdnLayerStateBytes(l)
-                    : AttentionLayerBlockBytes(_kvCacheK[l], tokenCount) + AttentionLayerBlockBytes(_kvCacheV[l], tokenCount);
+                if (_isRecurrent[l])
+                {
+                    // Validate every recurrent payload before an earlier attention
+                    // row or GDN state can change. The MLX importer also refuses a
+                    // host-ring layout whose write index is not zero.
+                    long convBytes = (long)_convState[l].Length * sizeof(float);
+                    long deltaBytes = GdnDeltaStateBytes(_deltaStateTensor[l]);
+                    long qkvDim = (long)_headKDim * _numKHeads * 2 + (long)_headVDim * _numVHeads;
+                    int convTail = Math.Max(0, _convKernel - 1);
+                    if (_convState[l].Length != convTail * qkvDim
+                        || deltaBytes != (long)_numVHeads * _headVDim * _headKDim * sizeof(float))
+                        return false;
+                    int writeIndex = System.Buffers.Binary.BinaryPrimitives.ReadInt32LittleEndian(
+                        source.Slice(checked((int)(layerBytes + convBytes)), sizeof(int)));
+                    if ((uint)writeIndex >= (uint)Math.Max(1, convTail)
+                        || (_mlxGdnCache?[l] != null && writeIndex != 0))
+                        return false;
+                    layerBytes += convBytes + sizeof(int) + deltaBytes;
+                }
+                else
+                {
+                    layerBytes += AttentionLayerBlockBytes(_kvCacheK[l], tokenCount)
+                        + AttentionLayerBlockBytes(_kvCacheV[l], tokenCount);
+                }
             }
             // The trailing M-RoPE delta (see ComputeKVBlockByteSize): present, and a
             // rotation the next token can actually take - a position is never negative.
             if (source.Length - layerBytes != sizeof(int)) return false;
             int ropeDelta = System.Buffers.Binary.BinaryPrimitives.ReadInt32LittleEndian(source[(int)layerBytes..]);
-            if (endToken + ropeDelta < 0) return false;
+            if (endToken + ropeDelta < 0 || endToken + ropeDelta > int.MaxValue) return false;
 
             EnsureCacheCapacity(destToken + tokenCount);
             for (int l = 0; l < Config.NumLayers; l++)
@@ -1477,6 +1525,12 @@ namespace TensorSharp.Models
             {
                 if (!_isRecurrent[l])
                 {
+                    if (endStateOnly)
+                    {
+                        offset += checked((int)(AttentionLayerBlockBytes(_kvCacheK[l], tokenCount)
+                            + AttentionLayerBlockBytes(_kvCacheV[l], tokenCount)));
+                        continue;
+                    }
                     if (!CopyAttentionIn(_kvCacheK[l], destToken, tokenCount, source[offset..], out int rK))
                         return false;
                     offset += rK;
@@ -1486,6 +1540,11 @@ namespace TensorSharp.Models
                 }
                 else
                 {
+                    if (deferEndState)
+                    {
+                        offset += checked((int)GdnLayerStateBytes(l));
+                        continue;
+                    }
                     if (!CopyGdnStateIn(l, source[offset..], out int rG))
                         return false;
                     offset += rG;
@@ -1775,6 +1834,7 @@ namespace TensorSharp.Models
 
         private int ComputePrefillChunkSize()
         {
+            if (MemoryPolicy != null) return MemoryPolicy.PrefillChunkTokens;
             string env = Environment.GetEnvironmentVariable("TS_PREFILL_CHUNK");
             if (!string.IsNullOrEmpty(env) && int.TryParse(env, out int v) && v > 0)
                 return v;
@@ -1933,17 +1993,27 @@ namespace TensorSharp.Models
 
         private Tensor RunPerOpLayerLoop(Tensor hidden, int seqLen, int startPos)
         {
-            for (int layer = 0; layer < Config.NumLayers; layer++)
+            try
             {
-                if (_isRecurrent[layer])
-                    hidden = RecurrentBlock(hidden, layer, seqLen, startPos);
-                else
-                    hidden = AttentionBlock(hidden, layer, seqLen, startPos);
-                TryEvaluateMlxLayerBoundary(hidden, layer, seqLen);
-                TraceLayer(hidden, layer, "");
+                for (int layer = 0; layer < Config.NumLayers; layer++)
+                {
+                    if (_isRecurrent[layer])
+                        hidden = RecurrentBlock(hidden, layer, seqLen, startPos);
+                    else
+                        hidden = AttentionBlock(hidden, layer, seqLen, startPos);
+                    TryEvaluateMlxLayerBoundary(hidden, layer, seqLen);
+                    TraceLayer(hidden, layer, "");
+                }
+                _layerTraceForwards++;
+                return hidden;
             }
-            _layerTraceForwards++;
-            return hidden;
+            catch
+            {
+                // This loop consumes the caller's hidden state. A backend
+                // allocation refusal must not strand its host owner.
+                hidden.Dispose();
+                throw;
+            }
         }
 
         /// <summary>
@@ -2616,6 +2686,8 @@ namespace TensorSharp.Models
         // building the layer graph.
         public override Tensor SubmitGreedyDecodeStep(int? firstTokenForBegin)
         {
+            if (HasStreamingWeights)
+                throw new NotSupportedException("File-backed Qwen35 weights require Forward or ForwardRefill; pipelined execution is unsupported.");
             _forwardSw.Start();
             int seqLen = 1;
             int startPos = _cacheSeqLen;
@@ -2849,7 +2921,7 @@ namespace TensorSharp.Models
             // Fused outproj+FFN for attention layers: when the fused attention layer
             // decode is NOT used and the layer is dense FFN (not MoE), fuse the attention
             // output projection + residual + FFN into one GPU dispatch.
-            bool canFuseAttnOutFFN = !fusedDecodeApplied && IsGgmlBackend
+            bool canFuseAttnOutFFN = !HasStreamingWeights && !fusedDecodeApplied && IsGgmlBackend
                 && !(_isMoeLayer != null && _isMoeLayer[layer])
                 && _attnOutputQW[layer] != null
                 && _postAttnNormW[layer] != null
@@ -3760,6 +3832,11 @@ namespace TensorSharp.Models
         /// </summary>
         private Tensor FFNCachedFused(Tensor residual, Tensor postNormW, int layer, int seqLen)
         {
+            if (HasStreamingWeights)
+            {
+                using var normed = RMSNormOpCached(residual, postNormW);
+                return FFNCached(normed, layer, seqLen);
+            }
             int intermSize = Config.IntermediateSize;
 
             // Prefill fast path: collapse the entire dense SwiGLU FFN
@@ -4004,18 +4081,22 @@ namespace TensorSharp.Models
         private Tensor FusedNormLinear(Tensor input, Tensor normW, QuantizedWeight qw, Tensor wF32)
         {
             // Fused path: needs GGML backend, a quantized weight, and a 2D input view.
-            if (IsGgmlBackend && qw != null && normW != null && input.DimensionCount == 2)
+            if (!HasStreamingWeights && IsGgmlBackend && qw != null && normW != null && input.DimensionCount == 2)
             {
                 long t0 = Stopwatch.GetTimestamp();
                 int seqLen = (int)input.Sizes[0];
                 int outDim = (int)qw.Ne1;
                 Tensor result = new Tensor(_allocator, DType.Float32, seqLen, outDim);
-                GgmlBasicOps.FusedRmsNormMatMulQuant(result, input, normW, Config.Eps,
-                    qw.CacheKey, qw.GgmlType, qw.Ne0, qw.Ne1, qw.RawBytes);
-                if (qw.Scale != 1.0f)
-                    Ops.Mul(result, result, qw.Scale); // sidecar per-tensor scale2
-                _linearTicks += Stopwatch.GetTimestamp() - t0;
-                return result;
+                try
+                {
+                    GgmlBasicOps.FusedRmsNormMatMulQuant(result, input, normW, Config.Eps,
+                        qw.CacheKey, qw.GgmlType, qw.Ne0, qw.Ne1, qw.RawBytes);
+                    if (qw.Scale != 1.0f)
+                        Ops.Mul(result, result, qw.Scale); // sidecar per-tensor scale2
+                    _linearTicks += Stopwatch.GetTimestamp() - t0;
+                    return result;
+                }
+                catch { result.Dispose(); throw; }
             }
 
             if (_backend == BackendType.Mlx && qw != null && normW != null && input.DimensionCount == 2 && qw.Scale == 1.0f)
@@ -4044,9 +4125,8 @@ namespace TensorSharp.Models
             }
 
             // Fallback: explicit norm + linear.
-            Tensor normed = RMSNormOpCached(input, normW);
+            using Tensor normed = RMSNormOpCached(input, normW);
             Tensor projected = LinearForwardCached(normed, qw, wF32);
-            normed.Dispose();
             return projected;
         }
 
@@ -4059,6 +4139,7 @@ namespace TensorSharp.Models
         /// </summary>
         private Tensor TryFusedNormLinearInto(Tensor output, Tensor input, Tensor normW, QuantizedWeight qw)
         {
+            if (HasStreamingWeights) return null;
             if (qw == null || normW == null
                 || input.DimensionCount != 2 || output == null
                 || output.DimensionCount != 2 || output.Sizes[1] != qw.Ne1
@@ -4109,6 +4190,7 @@ namespace TensorSharp.Models
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private bool TryLinearAddInto(Tensor residual, Tensor input, QuantizedWeight qw)
         {
+            if (HasStreamingWeights) return false;
             if (qw == null || input.DimensionCount != 2 || residual.DimensionCount != 2)
                 return false;
 
@@ -4211,6 +4293,7 @@ namespace TensorSharp.Models
         /// </summary>
         private unsafe bool TryFusedAttnLayerPrefill(Tensor hidden, int layer, int seqLen, int startPos)
         {
+            if (HasStreamingWeights) return false;
             if (!IsGgmlBackend) return false;
             if (hidden == null || hidden.DimensionCount != 2 || hidden.ElementType != DType.Float32)
                 return false;
@@ -4284,6 +4367,7 @@ namespace TensorSharp.Models
 
         private bool TryFusedAttnLayerDecode(Tensor residual, int layer, int position)
         {
+            if (HasStreamingWeights) return false;
             if (!IsGgmlBackend)
                 return false;
             if (residual == null || residual.DimensionCount != 2 || residual.ElementType != DType.Float32)
@@ -6147,10 +6231,8 @@ namespace TensorSharp.Models
                 int seqLen = (int)input.Sizes[0];
                 int outDim = (int)qw.Ne1;
                 result = new Tensor(_allocator, DType.Float32, seqLen, outDim);
-                if (IsGgmlBackend)
-                    GgmlBasicOps.AddmmQuant(result, input, qw.CacheKey, qw.GgmlType, qw.Ne0, qw.Ne1, qw.RawBytes);
-                else
-                    AddmmQuantManaged(result, input, qw);
+                try { ExecuteQuantizedLinear(result, input, qw); }
+                catch { result.Dispose(); throw; }
                 if (qw.Scale != 1.0f)
                     Ops.Mul(result, result, qw.Scale); // sidecar per-tensor scale2
             }
@@ -6279,12 +6361,16 @@ namespace TensorSharp.Models
 
         public void LoadVisionEncoder(string mmProjPath)
         {
+            if (HasStreamingWeights)
+                throw new NotSupportedException("File-backed Qwen35 weight execution currently supports text-only inference; vision weights are not streamed.");
             VisionEncoder = new Qwen35VisionEncoder(mmProjPath, _allocator);
             VisionEncoder.SetHostModel(this);
         }
 
         public void SetVisionEmbeddings(Tensor visionEmbeddings, int startPosition)
         {
+            if (HasStreamingWeights)
+                throw new NotSupportedException("File-backed Qwen35 weight execution currently supports text-only inference.");
             _visionEmbeddingsList.Add((visionEmbeddings, startPosition));
         }
 

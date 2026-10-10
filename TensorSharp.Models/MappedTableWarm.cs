@@ -8,6 +8,8 @@ using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
+using TensorSharp.Memory;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -22,8 +24,12 @@ namespace TensorSharp.Models
     /// </summary>
     internal static class MappedTableWarm
     {
-        private const long Block = 64L << 20;
+        private const int Block = 8 << 20;
         private const long Headroom = 8L << 30;
+        private const int MaxWorkers = 4;
+        // Two models must not each admit a whole-table warm against the same available memory.
+        // Recheck after acquiring the gate; completed reads remain reusable in the OS page cache.
+        private static readonly SemaphoreSlim WarmGate = new(1, 1);
 
         /// <summary>
         /// Start reading <paramref name="ranges"/> (shard path, byte offset, byte count), or return null
@@ -32,69 +38,161 @@ namespace TensorSharp.Models
         /// </summary>
         public static Task Start(IReadOnlyList<(string Path, long Offset, long Bytes)> ranges, string tag, string what,
             CancellationToken cancel)
+            => Start(ranges, tag, what, cancel, HostMemoryAvailable, Headroom, Block, MaxWorkers,
+                Console.Error.WriteLine);
+
+        internal static Task Start(IReadOnlyList<(string Path, long Offset, long Bytes)> ranges, string tag, string what,
+            CancellationToken cancel, Func<long> memoryAvailable, long headroom, int blockBytes, int maxWorkers,
+            Action<string> log)
         {
             if (ranges == null || ranges.Count == 0)
                 return null;
+            ArgumentNullException.ThrowIfNull(memoryAvailable);
+            ArgumentNullException.ThrowIfNull(log);
+            if (headroom < 0 || blockBytes <= 0 || maxWorkers <= 0)
+                throw new ArgumentOutOfRangeException(nameof(blockBytes));
+            var snapshot = ranges.ToArray();
             long bytes = 0;
-            foreach (var range in ranges)
-                bytes += range.Bytes;
-            long available = HostMemoryAvailable();
-            if (available > 0 && available < bytes + Headroom)
+            foreach (var range in snapshot)
             {
-                Console.Error.WriteLine($"[{tag}] {what} warming skipped: {available / (double)(1L << 30):F1} GiB " +
-                    $"of host memory available would not keep {bytes / (double)(1L << 30):F1} GiB of tables cached");
-                return null;
+                if (string.IsNullOrEmpty(range.Path) || range.Offset < 0 || range.Bytes < 0 ||
+                    range.Offset > long.MaxValue - range.Bytes)
+                    throw new ArgumentException("Invalid mapped-table file range.", nameof(ranges));
+                bytes = checked(bytes + range.Bytes);
             }
-            return Task.Run(() =>
+            if (bytes == 0 || cancel.IsCancellationRequested)
+                return null;
+
+            int Workers()
             {
-                var sw = Stopwatch.StartNew();
-                var blocks = new List<(string Path, long Offset, long Bytes)>();
-                foreach (var (path, offset, length) in ranges)
-                    for (long at = 0; at < length; at += Block)
-                        blocks.Add((path, offset + at, Math.Min(Block, length - at)));
-                using var handles = new ThreadLocal<Dictionary<string, Microsoft.Win32.SafeHandles.SafeFileHandle>>(
-                    () => new Dictionary<string, Microsoft.Win32.SafeHandles.SafeFileHandle>(), trackAllValues: true);
-                using var buffers = new ThreadLocal<byte[]>(() => new byte[Block]);
+                long available = memoryAvailable();
+                int count = WorkerCount(bytes, available, headroom, blockBytes, maxWorkers);
+                if (count == 0)
+                    log(available <= 0
+                        ? $"[{tag}] {what} warming skipped: available host memory is unknown"
+                        : $"[{tag}] {what} warming skipped: {available / (double)(1L << 30):F1} GiB available cannot hold " +
+                          $"{bytes / (double)(1L << 30):F1} GiB of tables plus headroom and read buffers");
+                return count;
+            }
+
+            if (Workers() == 0)
+                return null;
+            return Task.Run(async () =>
+            {
+                bool entered = false;
                 try
                 {
-                    Parallel.ForEach(blocks, new ParallelOptions { MaxDegreeOfParallelism = 16, CancellationToken = cancel }, block =>
+                    await WarmGate.WaitAsync(cancel).ConfigureAwait(false);
+                    entered = true;
+                    int workers = Workers();
+                    if (workers == 0)
+                        return;
+                    var sw = Stopwatch.StartNew();
+                    var cursorLock = new object();
+                    int rangeIndex = 0;
+                    long rangeOffset = 0;
+                    long readBytes = 0;
+                    bool pressure = false;
+                    using var stopped = CancellationTokenSource.CreateLinkedTokenSource(cancel);
+
+                    // Fixed worker bodies bound the number of retained byte arrays, unlike
+                    // thread-local arrays which can accumulate when Parallel changes workers.
+                    Parallel.For(0, workers, new ParallelOptions { MaxDegreeOfParallelism = workers }, _ =>
                     {
-                        var open = handles.Value;
-                        if (!open.TryGetValue(block.Path, out var handle))
-                            open[block.Path] = handle = File.OpenHandle(block.Path, FileMode.Open, FileAccess.Read, FileShare.Read);
-                        RandomAccess.Read(handle, new Span<byte>(buffers.Value, 0, (int)block.Bytes), block.Offset);
+                        var open = new Dictionary<string, Microsoft.Win32.SafeHandles.SafeFileHandle>();
+                        try
+                        {
+                            var buffer = new byte[blockBytes];
+                            while (!stopped.IsCancellationRequested)
+                            {
+                                (string Path, long Offset, int Bytes) block;
+                                lock (cursorLock)
+                                {
+                                    while (rangeIndex < snapshot.Length && rangeOffset == snapshot[rangeIndex].Bytes)
+                                    {
+                                        rangeIndex++;
+                                        rangeOffset = 0;
+                                    }
+                                    if (rangeIndex == snapshot.Length)
+                                        return;
+                                    long available = memoryAvailable();
+                                    // Unknown memory is not permission to continue a large read.
+                                    if (available <= 0 || available - Math.Min(available, headroom) < (long)workers * blockBytes)
+                                    {
+                                        pressure = true;
+                                        stopped.Cancel();
+                                        return;
+                                    }
+                                    var range = snapshot[rangeIndex];
+                                    int count = (int)Math.Min(blockBytes, range.Bytes - rangeOffset);
+                                    block = (range.Path, range.Offset + rangeOffset, count);
+                                    rangeOffset += count;
+                                }
+                                if (!open.TryGetValue(block.Path, out var handle))
+                                    open[block.Path] = handle = File.OpenHandle(block.Path, FileMode.Open, FileAccess.Read, FileShare.Read);
+                                int done = 0;
+                                while (done < block.Bytes)
+                                {
+                                    stopped.Token.ThrowIfCancellationRequested();
+                                    int count = RandomAccess.Read(handle, buffer.AsSpan(done, block.Bytes - done), block.Offset + done);
+                                    if (count == 0)
+                                        throw new EndOfStreamException($"Mapped table ended before the requested range in '{block.Path}'.");
+                                    done += count;
+                                }
+                                Interlocked.Add(ref readBytes, done);
+                            }
+                        }
+                        catch
+                        {
+                            stopped.Cancel();
+                            throw;
+                        }
+                        finally
+                        {
+                            foreach (var handle in open.Values)
+                                handle.Dispose();
+                        }
                     });
-                    Console.Error.WriteLine($"[{tag}] warmed {bytes / (double)(1L << 30):F1} GiB of {what} in {sw.Elapsed.TotalSeconds:F1}s");
+                    if (pressure)
+                        log($"[{tag}] {what} warming stopped: available host memory fell below the headroom and read-buffer allowance");
+                    else if (!cancel.IsCancellationRequested && readBytes == bytes)
+                        log($"[{tag}] warmed {bytes / (double)(1L << 30):F1} GiB of {what} in {sw.Elapsed.TotalSeconds:F1}s");
                 }
                 catch (OperationCanceledException) { }
-                catch (IOException ex)
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException ||
+                    ex is AggregateException aggregate && aggregate.Flatten().InnerExceptions.All(
+                        inner => inner is IOException or UnauthorizedAccessException or OperationCanceledException))
                 {
-                    Console.Error.WriteLine($"[{tag}] {what} warming stopped: {ex.Message}");
+                    log($"[{tag}] {what} warming stopped: {ex.GetBaseException().Message}");
                 }
                 finally
                 {
-                    foreach (var open in handles.Values)
-                        foreach (var handle in open.Values)
-                            handle.Dispose();
+                    if (entered)
+                        WarmGate.Release();
                 }
             });
         }
 
-        /// <summary>MemAvailable from /proc/meminfo in bytes, or 0 where there is none.</summary>
+        internal static int WorkerCount(long bytes, long available, long headroom, int blockBytes, int maxWorkers)
+        {
+            if (bytes <= 0 || available <= 0 || headroom < 0 || blockBytes <= 0 || maxWorkers <= 0 ||
+                headroom >= available || bytes >= available - headroom)
+                return 0;
+            long room = available - headroom - bytes;
+            long blocks = bytes / blockBytes + (bytes % blockBytes == 0 ? 0 : 1);
+            return (int)Math.Min(Math.Min(maxWorkers, blocks), room / blockBytes);
+        }
+
+        /// <summary>Currently available physical RAM, including reclaimable cache, or 0 if unknown.</summary>
         public static long HostMemoryAvailable()
         {
             try
             {
-                foreach (string line in File.ReadLines("/proc/meminfo"))
-                {
-                    if (!line.StartsWith("MemAvailable:", StringComparison.Ordinal))
-                        continue;
-                    string[] parts = line.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-                    return long.Parse(parts[1]) * 1024;
-                }
+                return HostMemoryInfo.Capture().Available;
             }
             catch (IOException) { }
             catch (UnauthorizedAccessException) { }
+            catch (PlatformNotSupportedException) { }
             return 0;
         }
     }

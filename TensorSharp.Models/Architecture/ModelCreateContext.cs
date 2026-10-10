@@ -24,7 +24,14 @@ namespace TensorSharp.Models.Architecture
     {
         public ModelCreateContext(string ggufPath, BackendType backend, GgufFile probe,
             int tpDegree = 1, ITensorParallelGroup tpGroup = null,
-            string draftModelPath = null, int layerSplitDegree = 1)
+            string draftModelPath = null, int layerSplitDegree = 1, WeightStreamingOptions weightStreaming = null)
+            : this(ggufPath, backend, probe, tpDegree, tpGroup, draftModelPath, layerSplitDegree, weightStreaming, null)
+        {
+        }
+
+        public ModelCreateContext(string ggufPath, BackendType backend, GgufFile probe,
+            int tpDegree, ITensorParallelGroup tpGroup,
+            string draftModelPath, int layerSplitDegree, WeightStreamingOptions weightStreaming, ModelMemoryPolicy memoryPolicy)
         {
             GgufPath = ggufPath ?? throw new ArgumentNullException(nameof(ggufPath));
             Backend = backend;
@@ -33,6 +40,8 @@ namespace TensorSharp.Models.Architecture
             TpGroup = tpGroup;
             DraftModelPath = draftModelPath;
             LayerSplitDegree = layerSplitDegree;
+            WeightStreaming = weightStreaming;
+            MemoryPolicy = memoryPolicy;
         }
 
         /// <summary>Path of the main model GGUF.</summary>
@@ -60,8 +69,13 @@ namespace TensorSharp.Models.Architecture
         /// architectures that implement layer placement; 1 when not requested.</summary>
         public int LayerSplitDegree { get; }
 
+        /// <summary>Explicit bounded weight execution; unsupported adapters must reject it.</summary>
+        public WeightStreamingOptions WeightStreaming { get; }
+
+        public ModelMemoryPolicy MemoryPolicy { get; }
+
         /// <summary>Rebuild with a different tensor-parallel / layer-split resolution.</summary>
         public ModelCreateContext With(int tpDegree, ITensorParallelGroup tpGroup, int layerSplitDegree)
-            => new(GgufPath, Backend, Probe, tpDegree, tpGroup, DraftModelPath, layerSplitDegree);
+            => new(GgufPath, Backend, Probe, tpDegree, tpGroup, DraftModelPath, layerSplitDegree, WeightStreaming, MemoryPolicy);
     }
 }

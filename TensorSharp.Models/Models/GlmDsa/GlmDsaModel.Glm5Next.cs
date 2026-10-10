@@ -65,7 +65,7 @@ namespace TensorSharp.Models
         /// g5n block; every key here is absent on GLM-5.2.</summary>
         private void ParseGlm5NextConfig(string arch, int numTrunkLayers)
         {
-            _g5n = arch == "glm5next";
+            _g5n = GlmDsaArchitecture.IsGlm5Next(arch);
             if (!_g5n)
                 return;
 

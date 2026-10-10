@@ -6,6 +6,7 @@
 // TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
 using TensorSharp.Runtime.Speculative;
 using TensorSharp.Runtime.Scheduling.PrefixCache;
+using TensorSharp.Runtime.Paged;
 
 namespace TensorSharp.Runtime.Scheduling
 {
@@ -16,6 +17,10 @@ namespace TensorSharp.Runtime.Scheduling
     /// </summary>
     public sealed class SchedulerConfig
     {
+        /// <summary>Optional RAM/SSD budgets for model snapshot bytes only.</summary>
+        public KvSnapshotOptions? KvSnapshots { get; init; }
+        public RequestMemoryAdmission? MemoryAdmission { get; init; }
+
         /// <summary>Maximum tokens forwarded across all sequences per step.
         /// Equivalent to vLLM's <c>max_num_batched_tokens</c>. Default 4096.</summary>
         public int MaxNumBatchedTokens { get; init; } = 4096;
@@ -24,6 +29,11 @@ namespace TensorSharp.Runtime.Scheduling
         /// sequences stay in the waiting queue until one finishes. Equivalent
         /// to vLLM's <c>max_num_seqs</c>. Default 16.</summary>
         public int MaxNumRunningSequences { get; init; } = 16;
+
+        /// <summary>Hard per-forward prefill shape limit, including the solo and
+        /// prefill-only throughput policies. Keep this within the model's admitted
+        /// workspace shape. Request admission can impose a still smaller bound.</summary>
+        public int PrefillChunkTokenLimit { get; init; } = int.MaxValue;
 
         /// <summary>Maximum number of new prefill tokens to schedule per
         /// sequence in a mixed prefill+decode step. This bounds the time an
@@ -115,6 +125,7 @@ namespace TensorSharp.Runtime.Scheduling
         {
             MaxNumBatchedTokens = MaxNumBatchedTokens,
             MaxNumRunningSequences = MaxNumRunningSequences,
+            PrefillChunkTokenLimit = PrefillChunkTokenLimit,
             MaxPrefillChunkSize = MaxPrefillChunkSize,
             SoloPrefillChunkSize = SoloPrefillChunkSize,
             NumBlocks = NumBlocks,
@@ -123,6 +134,8 @@ namespace TensorSharp.Runtime.Scheduling
             StopRepetition = StopRepetition,
             DecodeQuantumTokens = DecodeQuantumTokens,
             Speculation = speculation,
+            KvSnapshots = KvSnapshots,
+            MemoryAdmission = MemoryAdmission,
         };
 
         public static SchedulerConfig FromEnvironment()
@@ -143,6 +156,7 @@ namespace TensorSharp.Runtime.Scheduling
                 StopRepetition = ReadBool("TS_SCHED_STOP_REPETITION", true),
                 DecodeQuantumTokens = ReadInt("TS_SCHED_DECODE_QUANTUM", 256),
                 Speculation = SpeculationOptions.FromEnvironment(),
+                KvSnapshots = KvSnapshotOptions.FromEnvironment(),
             };
             return cfg;
         }

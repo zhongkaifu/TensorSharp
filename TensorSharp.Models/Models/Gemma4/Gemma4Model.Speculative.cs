@@ -96,7 +96,11 @@ namespace TensorSharp.Models
         // (n-gram) verifies on every Gemma 4 checkpoint, draft GGUF or not - which
         // is what TensorAgent's tool loops need, since the assistant GGUF is an
         // optional download there. The gate is the backend alone.
-        public bool SpeculationProfitable => IsGgmlBackend || _backend == BackendType.Cuda;
+        public string SpeculationRefusal => HasStreamingWeights
+            ? "File-backed Gemma4 weights support Forward/ForwardRefill only; speculative verification (including N-gram) is unsupported."
+            : null;
+
+        public bool SpeculationProfitable => !HasStreamingWeights && (IsGgmlBackend || _backend == BackendType.Cuda);
 
         /// <summary>
         /// Seven drafts, so a verify is EIGHT rows: the last row count ggml's
@@ -175,6 +179,7 @@ namespace TensorSharp.Models
         /// </summary>
         public void LoadMtpDraftWeights(string draftGgufPath)
         {
+            RefuseStreamingAlternateEntry("MTP draft loading");
             if (string.IsNullOrEmpty(draftGgufPath) || !System.IO.File.Exists(draftGgufPath))
                 throw new System.IO.FileNotFoundException("Gemma 4 MTP draft GGUF not found.", draftGgufPath);
 
@@ -382,6 +387,7 @@ namespace TensorSharp.Models
 
         public unsafe void SpecForward(int[] tokens, float[] hAllOut, float[] logitsOut, bool allLogitsRows)
         {
+            if (HasStreamingWeights) throw new NotSupportedException(SpeculationRefusal);
             // No draft-head requirement: nothing below reads the assistant weights.
             // A weight-free speculator (n-gram) drives this trunk on any checkpoint.
             int seqLen = tokens.Length;
@@ -707,6 +713,7 @@ namespace TensorSharp.Models
         /// </summary>
         public unsafe void DraftStep(int token, float[] hPrev, int pos, float[] logitsOut, float[] hOut)
         {
+            RefuseStreamingAlternateEntry("draft decoding");
             if (!HasDraftHead)
                 throw new InvalidOperationException("Model has no Gemma 4 MTP draft head.");
 

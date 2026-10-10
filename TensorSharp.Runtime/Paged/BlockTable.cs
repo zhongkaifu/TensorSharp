@@ -136,6 +136,21 @@ namespace TensorSharp.Runtime.Paged
             return all;
         }
 
+        /// <summary>Release owned references without forgetting a page whose
+        /// physical cleanup failed. Remove each tail only after the pool accepts
+        /// it, so a retry still owns the remaining logical prefix.</summary>
+        internal void ReleaseAll(BlockPool pool)
+        {
+            ArgumentNullException.ThrowIfNull(pool);
+            while (_blocks.Count > 0)
+            {
+                int last = _blocks.Count - 1;
+                pool.Free(_blocks[last]);
+                _blocks.RemoveAt(last);
+                _numTokens = (int)Math.Min(_numTokens, (long)_blocks.Count * _blockSize);
+            }
+        }
+
         /// <summary>Capacity (in tokens) currently allocated, including the
         /// partial trailing block. Tokens beyond this require allocating new
         /// blocks before they can be forwarded.</summary>

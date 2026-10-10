@@ -8319,9 +8319,8 @@ if (tile_b + TileSize <= InRows && tile_m + TileSize <= OutDim) {
                 long phys = GetPhysicalMemoryBytes();
                 if (phys <= 0)
                     return;
-                long physMb = phys / 1024 / 1024;
-                long reserve = Math.Max(2048, physMb / 8);
-                limitMb = Math.Max(physMb - reserve, physMb * 85 / 100);
+                limitMb = DefaultWiredLimitMiB(phys);
+                if (limitMb <= 0) return;
             }
             else if (!long.TryParse(value, out limitMb) || limitMb <= 0)
             {
@@ -8357,13 +8356,20 @@ if (tile_b + TileSize <= InRows && tile_m + TileSize <= OutDim) {
             }
         }
 
+        internal static long DefaultWiredLimitMiB(long physicalBytes)
+        {
+            long physicalMiB = Math.Max(0, physicalBytes) / (1024 * 1024);
+            long reserveMiB = Math.Max(2048, physicalMiB / 8);
+            return Math.Max(0, Math.Min(physicalMiB - reserveMiB, physicalMiB * 85 / 100));
+        }
+
         private static long GetPhysicalMemoryBytes()
         {
             try
             {
                 if (OperatingSystem.IsMacOS() || OperatingSystem.IsLinux())
                 {
-                    return (long)GC.GetGCMemoryInfo().TotalAvailableMemoryBytes;
+                    return TensorSharp.Memory.HostMemoryInfo.Capture().Total;
                 }
             }
             catch

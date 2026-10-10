@@ -44,6 +44,7 @@ public partial class ModelService
                 var thinking = new StringBuilder();
                 var calls = new List<ToolCall>();
                 ChatStreamUpdate terminal = default;
+                bool historyCompacted = false;
                 void Append(ParsedOutput part)
                 {
                     if (part == null) return;
@@ -56,6 +57,7 @@ public partial class ModelService
                     SamplingForDeepSeek41SkillRound(Architecture, turnSampling, sourceSampling),
                     childTools, enableThinking, childTurn).ConfigureAwait(false))
                 {
+                    historyCompacted |= update.HistoryCompacted;
                     if (update.Done) { terminal = update; continue; }
                     if (update.RawGenerationSuffix != null)
                         parser.SetGenerationPromptSuffix(update.RawGenerationSuffix);
@@ -83,6 +85,7 @@ public partial class ModelService
                     FinishReason = terminal.FinishReason,
                     RawPromptTrailingWhitespace = terminal.RawPromptTrailingWhitespace,
                     RawGenerationSuffix = terminal.RawGenerationSuffix,
+                    HistoryCompacted = historyCompacted,
                 };
             };
         }

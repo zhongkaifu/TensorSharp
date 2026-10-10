@@ -4180,7 +4180,12 @@ extern "C" __global__ void ts_copy_head_first_to_cache_f32(
     int tmp = idx / head_dim;
     int seq = tmp % seq_len;
     int head = tmp / seq_len;
-    int cache_pos = circular ? ((start_pos + seq) % cache_size) : (start_pos + seq);
+    // An oversized prefill can otherwise launch multiple writers for the same
+    // ring slot. Only the final cache_size rows belong to the retained window.
+    // This depends on sequence extent, not the graph's dynamic write position.
+    if (circular && seq < seq_len - cache_size)
+        return;
+    int cache_pos = circular ? (int)(((int64_t)start_pos + seq) % cache_size) : (start_pos + seq);
     cache[((size_t)head * cache_size + cache_pos) * head_dim + d] = source[idx];
 }
 
@@ -4206,7 +4211,11 @@ extern "C" __global__ void ts_copy_head_first_to_cache_f16(
     int tmp = idx / head_dim;
     int seq = tmp % seq_len;
     int head = tmp / seq_len;
-    int cache_pos = circular ? ((start_pos + seq) % cache_size) : (start_pos + seq);
+    // Retain only the newest window so each ring slot has a single writer,
+    // including when the source crosses the ring more than once.
+    if (circular && seq < seq_len - cache_size)
+        return;
+    int cache_pos = circular ? (int)(((int64_t)start_pos + seq) % cache_size) : (start_pos + seq);
     cache[((size_t)head * cache_size + cache_pos) * head_dim + d] = __float2half_rn(source[idx]);
 }
 

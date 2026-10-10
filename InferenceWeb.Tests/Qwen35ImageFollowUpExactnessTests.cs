@@ -24,7 +24,7 @@
 //     taken from; a version-1 file is refused.
 //
 // Opt-in:
-//   TS_TEST_MODEL_DIR=<dir with Qwen3.5-9B*.gguf and its mmproj>
+//   TS_TEST_MODEL_DIR=<dir with Qwen3.5-9B or Qwen3.5-0.8B Q8_0 and its mmproj>
 //   TS_TEST_QWEN35_MMPROJ=<mmproj path>   (optional when the dir holds one Qwen3.5-9B mmproj)
 //   TS_TEST_QWEN35_IMAGE=<image path>     (optional; a synthetic picture otherwise, 448x336
 //                                          for the direct cases and 896x672 for the
@@ -46,7 +46,7 @@ namespace InferenceWeb.Tests;
 public class Qwen35ImageFollowUpExactnessTests
 {
     private const string EnvModelDir = "TS_TEST_MODEL_DIR";
-    private const string ModelPattern = "qwen3.5-9b-q8_0|qwen3.5-9b";
+    private const string ModelPattern = "qwen3.5-9b-q8_0|qwen3.5-9b|qwen3.5-0.8b-q8_0";
     private const int EngineNewTokens = 24;
     private const int DirectSteps = EngineNewTokens;
     private readonly ITestOutputHelper _output;

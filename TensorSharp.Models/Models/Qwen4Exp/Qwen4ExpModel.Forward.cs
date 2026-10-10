@@ -1341,6 +1341,9 @@ namespace TensorSharp.Models
                             if (ok && last) _spanLogitsValid = true;
                             if (!ok)
                             {
+                                // Capture the native cause before cleanup or another
+                                // backend call can replace the thread-local error.
+                                string nativeError = GgmlBasicOps.LastNativeError();
                                 _tokenGraphUnsupported = true;
                                 if (ranAnything)
                                 {
@@ -1351,8 +1354,13 @@ namespace TensorSharp.Models
                                     // forward takes the per-layer fallback.
                                     throw new InvalidOperationException(
                                         "qwen4exp token span failed mid-token; the per-layer " +
-                                        "fallback takes over on the next forward.");
+                                        "fallback takes over on the next forward. " + nativeError);
                                 }
+                                if (IsTensorParallel || _specForwardActive || HasQsa
+                                    || LayerSplitDegree > 1 || _pendingMRoPEPositions != null)
+                                    throw new InvalidOperationException(
+                                        "qwen4exp: required token-span path failed; this configuration cannot use the per-layer fallback. "
+                                        + nativeError);
                                 return false;
                             }
                             ranAnything = true;

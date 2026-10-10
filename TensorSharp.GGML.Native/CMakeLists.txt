@@ -160,7 +160,9 @@ if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
     set(GGML_CUDA_FORCE_MMQ OFF CACHE BOOL "" FORCE)
     set(GGML_CUDA_FORCE_CUBLAS OFF CACHE BOOL "" FORCE)
     set(GGML_CUDA_NO_VMM OFF CACHE BOOL "" FORCE)
-    set(GGML_CUDA_NO_PEER_COPY OFF CACHE BOOL "" FORCE)
+    # Cloud PCIe/IOMMU routes can advertise peer access but corrupt transfers.
+    # Preserve an explicit host-staging deployment choice without patching ggml.
+    set(GGML_CUDA_NO_PEER_COPY OFF CACHE BOOL "Disable CUDA peer copies and use host staging")
     set(GGML_CUDA_DEBUG OFF CACHE BOOL "" FORCE)
     # NCCL powers the cross-GPU AllReduce on the tensor-parallel path
     # (ggml-cuda's comm backend prefers it over the P2P pipeline and the
@@ -261,6 +263,7 @@ endif()
 set(TSG_GGMLOPS_SOURCES
     bonsai_quant.cpp
     ggml_ops_core.cpp
+    ggml_ops_graph_budget.cpp
     ggml_ops_graph_optimize.cpp
     ggml_ops_bonsai.cpp
     ggml_ops_attention_alloc.cpp
@@ -269,6 +272,8 @@ set(TSG_GGMLOPS_SOURCES
     ggml_ops_matmul.cpp
     ggml_ops_matmul_precision.cpp
     ggml_ops_q8_precision.cpp
+    ggml_ops_q8_weight_policy.cpp
+    ggml_ops_q8_streaming.cpp
     ggml_ops_elementwise.cpp
     ggml_ops_norm_attn.cpp
     ggml_ops_training.cpp
@@ -331,6 +336,9 @@ if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
     list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_matmul_precision.cu)
     list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_attention_precision.cu)
     list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_q8_precision.cu)
+    list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_f16_streaming.cu)
+    list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_q8_resident_streaming.cu)
+    list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_f16_resident.cu)
     list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_tp_probe.cu)
     list(APPEND TSG_GGMLOPS_SOURCES ggml_ops_host_pin.cu)
     # Wan / Qwen-Image VAE convolutions on cuDNN (see tsg_cuda_cudnn_conv.cu).
@@ -422,12 +430,13 @@ if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
     # normal expf implementation as well as F32 subnormals and IEEE division.
     foreach(TSG_CUDA_SOURCE IN LISTS TSG_GGMLOPS_SOURCES)
         if (TSG_CUDA_SOURCE MATCHES "\\.cu$" AND
-            NOT TSG_CUDA_SOURCE MATCHES "ggml_ops_(matmul|attention|q8)_precision\\.cu$")
+            NOT TSG_CUDA_SOURCE MATCHES "ggml_ops_(matmul|attention|q8)_precision\\.cu$" AND
+            NOT TSG_CUDA_SOURCE MATCHES "ggml_ops_f16_streaming\\.cu$")
             set_property(SOURCE ${TSG_CUDA_SOURCE} APPEND PROPERTY COMPILE_OPTIONS --use_fast_math)
         endif()
     endforeach()
     set_source_files_properties(ggml_ops_matmul_precision.cu ggml_ops_attention_precision.cu
-        ggml_ops_q8_precision.cu PROPERTIES
+        ggml_ops_q8_precision.cu ggml_ops_f16_streaming.cu PROPERTIES
         COMPILE_OPTIONS "--ftz=false;--prec-div=true;--prec-sqrt=true")
 endif()
 target_include_directories(GgmlOps PRIVATE
@@ -453,6 +462,58 @@ set_target_properties(GgmlOps PROPERTIES
 )
 
 if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
+    set_property(SOURCE ggml_ops_host_moe_cache.cpp APPEND PROPERTY COMPILE_DEFINITIONS TSG_GGML_TEST_HOOKS)
+    set_property(SOURCE ggml_ops_q8_weight_policy.cpp APPEND PROPERTY COMPILE_DEFINITIONS TSG_GGML_TEST_HOOKS)
+    set_property(SOURCE ggml_ops_q8_streaming.cpp APPEND PROPERTY COMPILE_DEFINITIONS TSG_GGML_TEST_HOOKS)
+    set_property(SOURCE ggml_ops_gated_delta_net.cpp ggml_ops_qwen35_recurrent_prefill.cpp
+        APPEND PROPERTY COMPILE_DEFINITIONS TSG_GGML_TEST_HOOKS)
+    add_executable(GgmlOpsGdnCacheLifecycleTest tests/gdn_cache_lifecycle_test.cpp)
+    target_link_libraries(GgmlOpsGdnCacheLifecycleTest PRIVATE GgmlOps)
+    if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
+        add_test(NAME cuda-gdn-cache-lifecycle COMMAND GgmlOpsGdnCacheLifecycleTest)
+        set_tests_properties(cuda-gdn-cache-lifecycle PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 60)
+    endif()
+    add_executable(GgmlOpsQ8StreamingTest tests/q8_streaming_test.cpp)
+    target_include_directories(GgmlOpsQ8StreamingTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    target_link_libraries(GgmlOpsQ8StreamingTest PRIVATE GgmlOps)
+    add_test(NAME q8-streaming-contract COMMAND GgmlOpsQ8StreamingTest --contract)
+    if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
+        add_test(NAME cuda-q8-streaming COMMAND GgmlOpsQ8StreamingTest)
+        add_test(NAME cuda-q8-streaming-singleton COMMAND GgmlOpsQ8StreamingTest --singleton)
+        add_test(NAME cuda-resident-streaming COMMAND GgmlOpsQ8StreamingTest --resident)
+        add_test(NAME cuda-resident-full-shape COMMAND GgmlOpsQ8StreamingTest --resident-full)
+        add_test(NAME cuda-retained-weight-streaming COMMAND GgmlOpsQ8StreamingTest --retained)
+        set_tests_properties(cuda-retained-weight-streaming PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+        set_tests_properties(cuda-q8-streaming cuda-q8-streaming-singleton cuda-resident-streaming cuda-resident-full-shape PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 180)
+    endif()
+    add_executable(GgmlOpsCacheBudgetTest tests/cache_budget_test.cpp)
+    target_include_directories(GgmlOpsCacheBudgetTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    target_link_libraries(GgmlOpsCacheBudgetTest PRIVATE Threads::Threads)
+    add_test(NAME cache-allocation-budget COMMAND GgmlOpsCacheBudgetTest)
+    set_tests_properties(cache-allocation-budget PROPERTIES TIMEOUT 30)
+    add_executable(GgmlOpsSharedCacheBudgetTest tests/shared_cache_budget_test.cpp)
+    target_include_directories(GgmlOpsSharedCacheBudgetTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    target_link_libraries(GgmlOpsSharedCacheBudgetTest PRIVATE Threads::Threads)
+    add_test(NAME shared-cache-budget-lifetime COMMAND GgmlOpsSharedCacheBudgetTest)
+    add_executable(GgmlOpsExpertEvictionTest tests/expert_eviction_test.cpp)
+    target_include_directories(GgmlOpsExpertEvictionTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME host-moe-expert-eviction-policy COMMAND GgmlOpsExpertEvictionTest)
+    set_tests_properties(shared-cache-budget-lifetime PROPERTIES TIMEOUT 30)
+    add_executable(GgmlOpsGraphBudgetTest tests/graph_budget_test.cpp ggml_ops_graph_budget.cpp)
+    target_include_directories(GgmlOpsGraphBudgetTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/src")
+    target_link_libraries(GgmlOpsGraphBudgetTest PRIVATE ggml-cpu ggml-base Threads::Threads)
+    add_test(NAME graph-buffer-budget-lifetime COMMAND GgmlOpsGraphBudgetTest)
+    set_tests_properties(graph-buffer-budget-lifetime PROPERTIES TIMEOUT 30)
+    if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
+        set_property(SOURCE ggml_ops_core.cpp APPEND PROPERTY COMPILE_DEFINITIONS TSG_GGML_TEST_HOOKS)
+        add_executable(GgmlOpsCacheMemoryIntegrationTest tests/cache_memory_integration_test.cpp)
+        target_link_libraries(GgmlOpsCacheMemoryIntegrationTest PRIVATE GgmlOps)
+        add_test(NAME cuda-cache-memory-single COMMAND GgmlOpsCacheMemoryIntegrationTest 1)
+        add_test(NAME cuda-cache-memory-multi COMMAND GgmlOpsCacheMemoryIntegrationTest 2)
+        set_tests_properties(cuda-cache-memory-single cuda-cache-memory-multi PROPERTIES
+            SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 120)
+    endif()
     set_property(SOURCE ggml_ops_qwen4exp.cpp APPEND PROPERTY COMPILE_DEFINITIONS TSG_GGML_TEST_HOOKS)
     set_property(SOURCE ggml_ops_qwen4exp_arena.cpp APPEND PROPERTY COMPILE_DEFINITIONS TSG_GGML_TEST_HOOKS)
     add_executable(GgmlOpsQwen4ExpQsaPlanTest tests/qwen4exp_qsa_plan_test.cpp)
@@ -519,6 +580,10 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
     add_executable(GgmlOpsDsv4FileWarmTest tests/dsv4_file_warm_test.cpp)
     target_link_libraries(GgmlOpsDsv4FileWarmTest PRIVATE Threads::Threads)
     add_test(NAME deepseek41-host-file-warm COMMAND GgmlOpsDsv4FileWarmTest)
+    add_executable(GgmlOpsDsv4HostExpertReadTest tests/dsv4_host_expert_read_test.cpp)
+    target_include_directories(GgmlOpsDsv4HostExpertReadTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/src")
+    target_link_libraries(GgmlOpsDsv4HostExpertReadTest PRIVATE Threads::Threads ggml ggml-cpu)
+    add_test(NAME deepseek41-host-expert-demand-read COMMAND GgmlOpsDsv4HostExpertReadTest)
 
     add_executable(GgmlOpsGlmFileStripTest tests/glm_file_strip_test.cpp)
     add_test(NAME glm-checkpoint-strips COMMAND GgmlOpsGlmFileStripTest)
@@ -591,6 +656,7 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
 
     add_executable(GgmlOpsHostMoeExpertCacheTest
         tests/host_moe_expert_cache_test.cpp ggml_ops_host_moe_cache.cpp)
+    target_compile_definitions(GgmlOpsHostMoeExpertCacheTest PRIVATE TSG_GGML_TEST_HOOKS)
     target_include_directories(GgmlOpsHostMoeExpertCacheTest PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/src")
     target_link_libraries(GgmlOpsHostMoeExpertCacheTest PRIVATE ggml-cpu ggml-base)
@@ -614,6 +680,22 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
         target_compile_definitions(GgmlOpsHostMoeExpertCacheTest PRIVATE TSG_GGML_USE_CUDA=1)
         target_link_libraries(GgmlOpsHostMoeExpertCacheTest PRIVATE ggml-cuda)
         add_test(NAME host-moe-expert-cache-cuda-parity COMMAND GgmlOpsHostMoeExpertCacheTest)
+        add_test(NAME host-moe-expert-cache-cuda-trim COMMAND GgmlOpsHostMoeExpertCacheTest --trim)
+        add_test(NAME host-moe-expert-cache-cuda-lfu COMMAND GgmlOpsHostMoeExpertCacheTest --quantization iq1_m --lfu)
+        set_tests_properties(host-moe-expert-cache-cuda-lfu PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 120)
+        if (WIN32)
+            add_test(NAME host-moe-expert-cache-cuda-file-read COMMAND GgmlOpsHostMoeExpertCacheTest --file-read)
+            add_test(NAME host-moe-expert-cache-cuda-file-lfu COMMAND GgmlOpsHostMoeExpertCacheTest --quantization iq1_m --file-read --lfu)
+            set_tests_properties(host-moe-expert-cache-cuda-file-lfu PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 120)
+            add_test(NAME host-moe-expert-cache-cuda-iq1-m-file-read COMMAND GgmlOpsHostMoeExpertCacheTest --quantization iq1_m --file-read)
+            add_test(NAME host-moe-expert-cache-cuda-file-pageable COMMAND GgmlOpsHostMoeExpertCacheTest --file-read --prefetch)
+            set_tests_properties(host-moe-expert-cache-cuda-file-read host-moe-expert-cache-cuda-iq1-m-file-read
+                host-moe-expert-cache-cuda-file-pageable
+                PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 120)
+            set_tests_properties(host-moe-expert-cache-cuda-file-pageable PROPERTIES ENVIRONMENT "GGML_CUDA_NO_PINNED=1")
+        endif()
+        set_tests_properties(host-moe-expert-cache-cuda-trim
+            PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 120)
         add_test(NAME host-moe-expert-cache-cuda-iq1-m-parity
             COMMAND GgmlOpsHostMoeExpertCacheTest --quantization iq1_m)
         add_test(NAME host-moe-expert-cache-cuda-iq2-xxs-parity
@@ -706,7 +788,8 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
     add_test(NAME attention-exception-boundary COMMAND GgmlOpsAttentionExceptionBoundaryTest)
     set_tests_properties(attention-exception-boundary PROPERTIES TIMEOUT 30)
     add_executable(GgmlOpsQ8PrecisionCpuTest tests/q8_precision_test.cpp ggml_ops_q8_precision.cpp)
-    target_include_directories(GgmlOpsQ8PrecisionCpuTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    target_include_directories(GgmlOpsQ8PrecisionCpuTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/src")
     target_link_libraries(GgmlOpsQ8PrecisionCpuTest PRIVATE ggml-cpu ggml-base)
     add_test(NAME cpu-q8-f32-projection COMMAND GgmlOpsQ8PrecisionCpuTest)
     if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
@@ -741,12 +824,50 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
         add_executable(GgmlOpsCudaQ8PrecisionTest tests/q8_precision_test.cpp
             ggml_ops_q8_precision.cpp ggml_ops_q8_precision.cu ggml_ops_matmul_precision.cu
             ggml_ops_attention_precision.cu ggml_ops_dsv4_fused.cu)
-        target_compile_definitions(GgmlOpsCudaQ8PrecisionTest PRIVATE TSG_GGML_USE_CUDA=1)
+        target_compile_definitions(GgmlOpsCudaQ8PrecisionTest PRIVATE TSG_GGML_USE_CUDA=1 TSG_GGML_TEST_HOOKS)
         target_include_directories(GgmlOpsCudaQ8PrecisionTest PRIVATE
             "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/src")
         target_link_libraries(GgmlOpsCudaQ8PrecisionTest PRIVATE ggml-cuda ggml-cpu ggml-base CUDA::cublas)
         add_test(NAME cuda-q8-f32-projection COMMAND GgmlOpsCudaQ8PrecisionTest)
         set_tests_properties(cuda-q8-f32-projection PROPERTIES SKIP_RETURN_CODE 77)
+        add_test(NAME cuda-q8-f32-parallel-vector COMMAND GgmlOpsCudaQ8PrecisionTest --parallel-vector)
+        set_tests_properties(cuda-q8-f32-parallel-vector PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+        add_test(NAME cuda-q8-f32-parallel-small-batch COMMAND GgmlOpsCudaQ8PrecisionTest --parallel-small-batch)
+        set_tests_properties(cuda-q8-f32-parallel-small-batch PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+        add_test(NAME cuda-q8-f32-prefill-64 COMMAND GgmlOpsCudaQ8PrecisionTest --prefill-64)
+        add_test(NAME cuda-q8-f32-prefill-128 COMMAND GgmlOpsCudaQ8PrecisionTest --prefill-128)
+        add_test(NAME cuda-q8-f32-prefill-auto COMMAND GgmlOpsCudaQ8PrecisionTest --prefill-auto)
+        set_tests_properties(cuda-q8-f32-prefill-64 cuda-q8-f32-prefill-128 cuda-q8-f32-prefill-auto PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+        # Opt-in synthetic-data timing with byte-exact previous-kernel control
+        # and independent sampled FP64 oracle; never a performance assertion.
+        add_executable(GgmlOpsQ8VectorBench tests/q8_vector_bench.cpp ggml_ops_q8_precision.cu)
+        target_compile_definitions(GgmlOpsQ8VectorBench PRIVATE TSG_GGML_USE_CUDA=1 TSG_GGML_TEST_HOOKS)
+        target_include_directories(GgmlOpsQ8VectorBench PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/src")
+        target_link_libraries(GgmlOpsQ8VectorBench PRIVATE ggml-cuda ggml-base CUDA::cudart)
+        # Timing alternatives against an independent FP64 oracle. The F32
+        # reduction also has an explicit diagnostic production opt-in; the
+        # benchmark-only F64 route is not selected by production dispatch.
+        add_executable(GgmlOpsQ8ParallelVectorBench tests/q8_parallel_vector_bench.cu ggml_ops_q8_precision.cu)
+        target_compile_definitions(GgmlOpsQ8ParallelVectorBench PRIVATE TSG_GGML_USE_CUDA=1)
+        target_include_directories(GgmlOpsQ8ParallelVectorBench PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/src")
+        target_link_libraries(GgmlOpsQ8ParallelVectorBench PRIVATE ggml-cuda ggml-base CUDA::cudart)
+
+        # Ordered-row alternatives: byte-exact checks plus a sequential-FMA
+        # forward-error bound. Explicit timing only, never a model-quality gate.
+        add_executable(GgmlOpsQ8OrderedVectorBench tests/q8_ordered_vector_bench.cu ggml_ops_q8_precision.cu)
+        target_compile_definitions(GgmlOpsQ8OrderedVectorBench PRIVATE TSG_GGML_USE_CUDA=1)
+        target_include_directories(GgmlOpsQ8OrderedVectorBench PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/src")
+        target_link_libraries(GgmlOpsQ8OrderedVectorBench PRIVATE ggml-cuda ggml-base CUDA::cudart)
+        # Standalone bounded row-dequantization + pedantic SGEMM exploration.
+        # No model dispatch changes and no unconditional performance assertion.
+        add_executable(GgmlOpsQ8PrefillBench tests/q8_prefill_bench.cu ggml_ops_q8_precision.cu)
+        target_compile_definitions(GgmlOpsQ8PrefillBench PRIVATE TSG_GGML_USE_CUDA=1)
+        target_include_directories(GgmlOpsQ8PrefillBench PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/src")
+        target_link_libraries(GgmlOpsQ8PrefillBench PRIVATE ggml-cuda ggml-base CUDA::cublas)
         add_executable(GgmlOpsQwen4ExpReduceTest tests/qwen4exp_reduce_test.cpp
             ggml_ops_qwen4exp_reduce.cpp ggml_ops_matmul_precision.cu
             ggml_ops_attention_precision.cu ggml_ops_q8_precision.cu ggml_ops_dsv4_fused.cu)
@@ -832,6 +953,12 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
     if (TENSORSHARP_GGML_NATIVE_ENABLE_CUDA)
         add_test(NAME moe-fused-bias-alias-cuda COMMAND GgmlOpsMoeFusedBiasAliasTest cuda)
         set_tests_properties(moe-fused-bias-alias-cuda PROPERTIES SKIP_RETURN_CODE 77)
+        add_test(NAME moe-stream-weight-alias-cuda COMMAND GgmlOpsMoeFusedBiasAliasTest cuda stream)
+        set_tests_properties(moe-stream-weight-alias-cuda PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE)
+        add_executable(GgmlOpsMoeStreamBudgetTest tests/moe_stream_budget_test.cpp)
+        target_link_libraries(GgmlOpsMoeStreamBudgetTest PRIVATE GgmlOps)
+        add_test(NAME moe-stream-shared-budget-cuda COMMAND GgmlOpsMoeStreamBudgetTest)
+        set_tests_properties(moe-stream-shared-budget-cuda PROPERTIES SKIP_RETURN_CODE 77)
     endif()
     if (APPLE AND TENSORSHARP_GGML_NATIVE_ENABLE_METAL)
         add_test(NAME moe-fused-bias-alias-metal COMMAND GgmlOpsMoeFusedBiasAliasTest metal)

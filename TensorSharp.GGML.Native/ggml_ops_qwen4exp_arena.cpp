@@ -182,7 +182,7 @@ namespace
                 ggml_backend_free(precise_backend);
                 precise_backend = nullptr;
             }
-            if (alloc != nullptr) { ggml_gallocr_free(alloc); alloc = nullptr; }
+            if (alloc != nullptr) { tsg::graph_budget_gallocr_free(alloc); alloc = nullptr; }
             buffer = nullptr;
             if (ctx != nullptr) { ggml_free(ctx); ctx = nullptr; }
             graph = nullptr;
@@ -536,6 +536,7 @@ TSG_TEST_EXPORT int TSGgml_Qwen4ExpArenaTestCopyFault(int nth)
     g_q4ab_copy_fault.store(nth, std::memory_order_relaxed);
     return 1;
 }
+#undef TSG_TEST_EXPORT
 #endif
 
 TSG_EXPORT int TSGgml_Qwen4ExpArenaFlushHostPointerStatus(void* host_ptr)
@@ -1171,8 +1172,8 @@ TSG_EXPORT int TSGgml_Qwen4ExpArenaDecodeBatched(
             // alloc_ctx_tensors also allocates the unused stacked-expert tensor
             // descriptors of CPU-offloaded layers, wiring tens of GB on Metal.
             optimize_graph_for_metal(ctx, e.graph);
-            e.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(g_backend));
-            if (!e.alloc || !ggml_gallocr_alloc_graph(e.alloc, e.graph))
+            e.alloc = tsg::graph_budget_gallocr_new(ggml_backend_get_default_buffer_type(g_backend), tsg::g_active_rank);
+            if (!e.alloc || !tsg::graph_budget_gallocr_alloc_graph(e.alloc, e.graph))
                 return abort_build("failed to allocate the arena backend buffer.");
             for (auto* tensors : {&e.k_arena, &e.v_arena, &e.conv_arena, &e.ssm_arena, &e.qsa_arena})
                 for (auto* t : *tensors)

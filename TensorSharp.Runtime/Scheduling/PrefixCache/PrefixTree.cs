@@ -1482,6 +1482,30 @@ internal sealed class PrefixTree
         return freed >= need;
     }
 
+    /// <summary>Release one eligible LRU victim for admission. Unlike a general
+    /// pressure hint, newest/public entries are not exempt when they prevent work.
+    /// Existing lists exclude pinned state and pending donations.</summary>
+    internal bool EvictOneForAdmission()
+    {
+        for (int t = 0; t <= (int)EvictionTier.PublicTop; t++)
+        {
+            var tier = (EvictionTier)t;
+            RadixNode? leaf = Lists.First(LruKind.Leaf, tier);
+            RadixNode? state = Lists.First(LruKind.State, tier);
+            if (leaf is null && state is null) continue;
+            if (leaf is not null && (state is null || leaf.LastAccess <= state.LastAccess))
+                DeleteLeafCascade(leaf, ReleaseReason.Pressure);
+            else
+            {
+                DetachEndState(state!, ReleaseReason.Pressure);
+                CollectFrom(state!);
+            }
+            Counters.Evictions++;
+            return true;
+        }
+        return false;
+    }
+
     private RadixNode? FirstWithBytes(byte listId, ResourceClass cls, bool stateOnly)
     {
         for (RadixNode? n = Lists.First(listId); n is not null; n = n.LruNext)

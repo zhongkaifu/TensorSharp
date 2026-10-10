@@ -86,8 +86,8 @@ int fused_rms_norm_matmul_quant_f32_impl(
         }
         else
         {
-            if (input_buf != nullptr) ggml_backend_buffer_free(input_buf);
-            if (result_buf != nullptr) ggml_backend_buffer_free(result_buf);
+            if (input_buf != nullptr) tsg::graph_budget_free_buffer(input_buf);
+            if (result_buf != nullptr) tsg::graph_budget_free_buffer(result_buf);
             use_zero_copy = false;
             result_binding = create_standard_binding(context.value, result_desc);
             input_binding = can_map_standard_view(input_desc)
@@ -175,7 +175,7 @@ int fused_rms_norm_matmul_quant_f32_impl(
     ggml_cgraph* graph = ggml_new_graph(context.value);
     ggml_build_forward_expand(graph, output_tensor);
 
-    BufferHandle buffer(ggml_backend_alloc_ctx_tensors(context.value, g_backend));
+    BufferHandle buffer(tsg::alloc_ctx_tensors_budgeted(context.value, g_backend));
     if (buffer.value == nullptr)
     {
         set_last_error("Failed to allocate backend buffer for fused rms_norm_matmul.");
@@ -322,8 +322,8 @@ int fused_matmul_quant_add_f32_impl(
         }
         else
         {
-            if (inp_buf != nullptr) ggml_backend_buffer_free(inp_buf);
-            if (res_buf != nullptr) ggml_backend_buffer_free(res_buf);
+            if (inp_buf != nullptr) tsg::graph_budget_free_buffer(inp_buf);
+            if (res_buf != nullptr) tsg::graph_budget_free_buffer(res_buf);
             use_zero_copy = false;
             residual_binding = create_standard_binding(context.value, residual_desc);
             input_binding = can_map_standard_view(input_desc)
@@ -388,7 +388,7 @@ int fused_matmul_quant_add_f32_impl(
     ggml_cgraph* graph = ggml_new_graph(context.value);
     ggml_build_forward_expand(graph, output_tensor);
 
-    BufferHandle buffer(ggml_backend_alloc_ctx_tensors(context.value, g_backend));
+    BufferHandle buffer(tsg::alloc_ctx_tensors_budgeted(context.value, g_backend));
     if (buffer.value == nullptr)
     {
         set_last_error("Failed to allocate backend buffer for fused matmul_add.");
@@ -628,8 +628,8 @@ static int fused_ffn_swiglu_quant_f32_slab(
         }
         else
         {
-            if (inp_buf != nullptr) ggml_backend_buffer_free(inp_buf);
-            if (res_buf != nullptr) ggml_backend_buffer_free(res_buf);
+            if (inp_buf != nullptr) tsg::graph_budget_free_buffer(inp_buf);
+            if (res_buf != nullptr) tsg::graph_budget_free_buffer(res_buf);
             use_zero_copy = false;
             residual_binding = create_standard_binding(context.value, residual_desc);
             input_binding = can_map_standard_view(input_desc)
@@ -783,7 +783,7 @@ static int fused_ffn_swiglu_quant_f32_slab(
     BufferHandle buffer(nullptr);
     if (tp_mode || !alloc_graph_reuse_gallocr(graph))
     {
-        buffer.value = ggml_backend_alloc_ctx_tensors(context.value, g_backend);
+        buffer.value = tsg::alloc_ctx_tensors_budgeted(context.value, g_backend);
         if (buffer.value == nullptr)
         {
             if (alloc_failed_out != nullptr)
@@ -1051,8 +1051,8 @@ int fused_ffn_act_project_quant_f32_impl(
         }
         else
         {
-            if (inp_buf != nullptr) ggml_backend_buffer_free(inp_buf);
-            if (out_buf != nullptr) ggml_backend_buffer_free(out_buf);
+            if (inp_buf != nullptr) tsg::graph_budget_free_buffer(inp_buf);
+            if (out_buf != nullptr) tsg::graph_budget_free_buffer(out_buf);
             use_zero_copy = false;
             output_binding = create_standard_binding(context.value, output_desc);
             input_binding = can_map_standard_view(input_desc)
@@ -1183,7 +1183,7 @@ int fused_ffn_act_project_quant_f32_impl(
     BufferHandle buffer(nullptr);
     if (!alloc_graph_reuse_gallocr(graph))
     {
-        buffer.value = ggml_backend_alloc_ctx_tensors(context.value, g_backend);
+        buffer.value = tsg::alloc_ctx_tensors_budgeted(context.value, g_backend);
         if (buffer.value == nullptr)
         {
             set_last_error("fused_ffn_act: failed to allocate backend buffer.");
@@ -1580,7 +1580,7 @@ int fused_vision_mlp_f32_impl(
     }
     ggml_build_forward_expand(graph, output);
 
-    BufferHandle buffer(ggml_backend_alloc_ctx_tensors(ctx, g_backend));
+    BufferHandle buffer(tsg::alloc_ctx_tensors_budgeted(ctx, g_backend));
     if (!buffer.value)
     {
         set_last_error("fused_vision_mlp: buffer alloc failed.");
@@ -1720,7 +1720,7 @@ int fused_vision_attention_f32_impl(
     if (!graph) { set_last_error("fused_vision_attn: graph failed."); return 0; }
     ggml_build_forward_expand(graph, output);
 
-    BufferHandle buffer(ggml_backend_alloc_ctx_tensors(ctx, g_backend));
+    BufferHandle buffer(tsg::alloc_ctx_tensors_budgeted(ctx, g_backend));
     if (!buffer.value) { set_last_error("fused_vision_attn: buffer alloc failed."); return 0; }
 
     if (!use_zero_copy)
@@ -2048,7 +2048,7 @@ int fused_gemma4_vision_block_f32_impl(
     BufferHandle buffer(nullptr);
     if (!alloc_graph_reuse_gallocr(graph))
     {
-        buffer.value = ggml_backend_alloc_ctx_tensors(ctx, g_backend);
+        buffer.value = tsg::alloc_ctx_tensors_budgeted(ctx, g_backend);
         if (!buffer.value) { set_last_error("fused_gemma4_vision_block: buffer alloc failed."); return 0; }
     }
 
@@ -2137,8 +2137,8 @@ int fused_outproj_ffn_quant_f32_impl(
         bool inp_ok = res_ok && create_binding_from_host_ptr_2d(context.value, g_backend, input_desc, input_binding, inp_buf);
         if (res_ok && inp_ok) { host_ptr_buffers.emplace_back(res_buf); host_ptr_buffers.emplace_back(inp_buf); }
         else {
-            if (inp_buf) ggml_backend_buffer_free(inp_buf);
-            if (res_buf) ggml_backend_buffer_free(res_buf);
+            if (inp_buf) tsg::graph_budget_free_buffer(inp_buf);
+            if (res_buf) tsg::graph_budget_free_buffer(res_buf);
             use_zero_copy = false;
             residual_binding = create_standard_binding(context.value, residual_desc);
             input_binding = can_map_standard_view(input_desc)
@@ -2250,7 +2250,7 @@ int fused_outproj_ffn_quant_f32_impl(
     BufferHandle buffer(nullptr);
     if (!alloc_graph_reuse_gallocr(graph))
     {
-        buffer.value = ggml_backend_alloc_ctx_tensors(ctx, g_backend);
+        buffer.value = tsg::alloc_ctx_tensors_budgeted(ctx, g_backend);
         if (!buffer.value) { set_last_error("fused_outproj_ffn: buffer alloc failed."); return 0; }
     }
 
@@ -2323,8 +2323,8 @@ int fused_outproj_norm_router_quant_f32_impl(
             host_ptr_buffers.emplace_back(nb); host_ptr_buffers.emplace_back(rtb);
         } else {
             use_zero_copy = false;
-            if (rtb) ggml_backend_buffer_free(rtb); if (nb) ggml_backend_buffer_free(nb);
-            if (ib) ggml_backend_buffer_free(ib); if (rb) ggml_backend_buffer_free(rb);
+            if (rtb) tsg::graph_budget_free_buffer(rtb); if (nb) tsg::graph_budget_free_buffer(nb);
+            if (ib) tsg::graph_budget_free_buffer(ib); if (rb) tsg::graph_budget_free_buffer(rb);
             residual_binding = create_standard_binding(context.value, residual_desc);
             input_binding = can_map_standard_view(input_desc) ?
                 create_standard_binding(context.value, input_desc) :
@@ -2405,7 +2405,7 @@ int fused_outproj_norm_router_quant_f32_impl(
     ggml_build_forward_expand(graph, out_normed);
     ggml_build_forward_expand(graph, out_router);
 
-    BufferHandle buffer(ggml_backend_alloc_ctx_tensors(ctx, g_backend));
+    BufferHandle buffer(tsg::alloc_ctx_tensors_budgeted(ctx, g_backend));
     if (!buffer.value) { set_last_error("fused_outproj_norm_router: alloc failed."); return 0; }
 
     if (!use_zero_copy) {
@@ -2681,8 +2681,8 @@ int fused_rms_norm_residual_add_f32_impl(
         }
         else
         {
-            if (inp_buf != nullptr) ggml_backend_buffer_free(inp_buf);
-            if (res_buf != nullptr) ggml_backend_buffer_free(res_buf);
+            if (inp_buf != nullptr) tsg::graph_budget_free_buffer(inp_buf);
+            if (res_buf != nullptr) tsg::graph_budget_free_buffer(res_buf);
             use_zero_copy = false;
             residual_binding = create_standard_binding(context.value, residual_desc);
             input_binding = can_map_standard_view(input_desc)
@@ -2741,7 +2741,7 @@ int fused_rms_norm_residual_add_f32_impl(
     ggml_cgraph* graph = ggml_new_graph(context.value);
     ggml_build_forward_expand(graph, output);
 
-    BufferHandle buffer(ggml_backend_alloc_ctx_tensors(context.value, g_backend));
+    BufferHandle buffer(tsg::alloc_ctx_tensors_budgeted(context.value, g_backend));
     if (buffer.value == nullptr)
     {
         set_last_error("fused_rms_norm_add: failed to allocate backend buffer.");
@@ -2879,8 +2879,8 @@ int fused_ple_block_quant_f32_impl(
         }
         else
         {
-            if (pli_buf != nullptr) ggml_backend_buffer_free(pli_buf);
-            if (res_buf != nullptr) ggml_backend_buffer_free(res_buf);
+            if (pli_buf != nullptr) tsg::graph_budget_free_buffer(pli_buf);
+            if (res_buf != nullptr) tsg::graph_budget_free_buffer(res_buf);
             use_zero_copy = false;
             residual_binding = create_standard_binding(context.value, residual_desc);
             pli_binding = can_map_standard_view(per_layer_input_desc)
@@ -2974,7 +2974,7 @@ int fused_ple_block_quant_f32_impl(
     ggml_cgraph* graph = ggml_new_graph(context.value);
     ggml_build_forward_expand(graph, output);
 
-    BufferHandle buffer(ggml_backend_alloc_ctx_tensors(context.value, g_backend));
+    BufferHandle buffer(tsg::alloc_ctx_tensors_budgeted(context.value, g_backend));
     if (buffer.value == nullptr)
     {
         set_last_error("fused_ple: failed to allocate backend buffer.");
@@ -3781,8 +3781,8 @@ TSG_EXPORT int TSGgml_MoEExpertsForwardF32(
             }
             else
             {
-                if (ib) ggml_backend_buffer_free(ib);
-                if (rb) ggml_backend_buffer_free(rb);
+                if (ib) tsg::graph_budget_free_buffer(ib);
+                if (rb) tsg::graph_budget_free_buffer(rb);
                 zc = false;
                 res_bind = create_standard_binding(context.value, result);
                 inp_bind = create_standard_binding(context.value, input);
@@ -3856,7 +3856,7 @@ TSG_EXPORT int TSGgml_MoEExpertsForwardF32(
         ggml_cgraph* graph = ggml_new_graph(context.value);
         ggml_build_forward_expand(graph, out);
 
-        BufferHandle buffer(ggml_backend_alloc_ctx_tensors(context.value, g_backend));
+        BufferHandle buffer(tsg::alloc_ctx_tensors_budgeted(context.value, g_backend));
         if (!buffer.value)
         {
             set_last_error("MoE: buffer alloc failed");
@@ -3975,8 +3975,8 @@ TSG_EXPORT int TSGgml_MoEExpertsSwiGLUForwardF32(
             }
             else
             {
-                if (ib) ggml_backend_buffer_free(ib);
-                if (rb) ggml_backend_buffer_free(rb);
+                if (ib) tsg::graph_budget_free_buffer(ib);
+                if (rb) tsg::graph_budget_free_buffer(rb);
                 zc = false;
                 res_bind = create_standard_binding(context.value, result);
                 inp_bind = create_standard_binding(context.value, input);
@@ -4041,7 +4041,7 @@ TSG_EXPORT int TSGgml_MoEExpertsSwiGLUForwardF32(
         ggml_cgraph* graph = ggml_new_graph(context.value);
         ggml_build_forward_expand(graph, out);
 
-        BufferHandle buffer(ggml_backend_alloc_ctx_tensors(context.value, g_backend));
+        BufferHandle buffer(tsg::alloc_ctx_tensors_budgeted(context.value, g_backend));
         if (!buffer.value)
         {
             set_last_error("MoE SwiGLU: buffer alloc failed");
@@ -4176,8 +4176,8 @@ TSG_EXPORT int TSGgml_MoEExpertsSwiGLUResidualF32(
             }
             else
             {
-                if (ib) ggml_backend_buffer_free(ib);
-                if (rb) ggml_backend_buffer_free(rb);
+                if (ib) tsg::graph_budget_free_buffer(ib);
+                if (rb) tsg::graph_budget_free_buffer(rb);
                 zc = false;
                 res_bind = create_standard_binding(context.value, residual);
                 inp_bind = create_standard_binding(context.value, input);
@@ -4270,7 +4270,7 @@ TSG_EXPORT int TSGgml_MoEExpertsSwiGLUResidualF32(
         ggml_cgraph* graph = ggml_new_graph(context.value);
         ggml_build_forward_expand(graph, out);
 
-        BufferHandle buffer(ggml_backend_alloc_ctx_tensors(context.value, g_backend));
+        BufferHandle buffer(tsg::alloc_ctx_tensors_budgeted(context.value, g_backend));
         if (!buffer.value)
         {
             set_last_error("MoE SwiGLU residual: buffer alloc failed");

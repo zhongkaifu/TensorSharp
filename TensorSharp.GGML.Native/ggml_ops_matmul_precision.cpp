@@ -158,9 +158,18 @@ ggml_tensor * tsg_matmul_id_quant_strip(ggml_context * ctx, ggml_tensor * a, ggm
     GGML_ASSERT(ids->type == GGML_TYPE_I32 && ids->ne[1] == b->ne[2] && ids->ne[2] == 1 && ids->ne[3] == 1);
     GGML_ASSERT(desc->i0 > 0 && desc->i1 >= 0 && int64_t(desc->i1) + a->ne[1] <= desc->i0);
     GGML_ASSERT(a->ne[0] <= INT_MAX);
+#ifndef TSG_GGML_USE_CUDA
+    // A CPU build does not need the CUDA full-row MMQ descriptor. Delegate
+    // complete stored rows to the CPU backend, including its per-expert tiled
+    // prefill dispatch. Repeating vec_dot per output used a different reduction
+    // once upstream selected that dispatch (e.g. Q2_K, 17 routed tokens on VNNI),
+    // and also discarded its batching performance.
+    return ggml_mul_mat_id(ctx, a, b, ids);
+#else
     ggml_tensor * args[] = {a, b, ids};
     return ggml_custom_4d(ctx, GGML_TYPE_F32, a->ne[1], ids->ne[0], b->ne[2], 1,
         args, 3, compute_cpu, GGML_N_TASKS_MAX, desc);
+#endif
 }
 
 ggml_tensor * tsg_matmul_id_quant_pair(ggml_context * ctx, ggml_tensor * gate, ggml_tensor * up,
@@ -176,7 +185,13 @@ ggml_tensor * tsg_matmul_id_quant_pair(ggml_context * ctx, ggml_tensor * gate, g
     GGML_ASSERT(ids->ne[1] == input->ne[2] && ids->ne[2] == 1 && ids->ne[3] == 1);
     GGML_ASSERT(desc->i0 > 0 && desc->i1 >= 0 && int64_t(desc->i1) + gate->ne[1] <= desc->i0);
     GGML_ASSERT(gate->ne[0] <= INT_MAX);
+#ifndef TSG_GGML_USE_CUDA
+    auto * gate_output = ggml_mul_mat_id(ctx, gate, input, ids);
+    auto * up_output = ggml_mul_mat_id(ctx, up, input, ids);
+    return ggml_concat(ctx, gate_output, up_output, 3);
+#else
     ggml_tensor * args[] = {gate,input,ids,up};
     return ggml_custom_4d(ctx,GGML_TYPE_F32,gate->ne[1],ids->ne[0],input->ne[2],2,
         args,4,compute_cpu,GGML_N_TASKS_MAX,desc);
+#endif
 }

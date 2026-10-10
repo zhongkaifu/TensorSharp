@@ -2,6 +2,7 @@
 // Licensed under the BSD-3-Clause license in the repository root.
 #include "ggml_ops_q8_precision.h"
 #include "ggml_ops_dsv4_fused.h"
+#include "ggml-impl.h"
 #include <climits>
 #include <cstdint>
 #include <cstring>
@@ -35,6 +36,14 @@ void compute_cpu(ggml_tensor * dst, int ith, int nth, void *) {
     }
 }
 } // namespace
+
+bool tsg_is_matmul_q8_f32(const ggml_tensor * tensor) {
+    if (tensor == nullptr || tensor->op != GGML_OP_CUSTOM) return false;
+    ggml_custom_op_params parameters;
+    std::memcpy(&parameters, tensor->op_params, sizeof(parameters));
+    // Identify our callback without interpreting another custom op's userdata.
+    return parameters.fun == compute_cpu;
+}
 
 ggml_tensor * tsg_matmul_q8_f32(ggml_context * ctx, ggml_tensor * weights, ggml_tensor * input) {
     GGML_ASSERT(weights && input && weights->type == GGML_TYPE_Q8_0 && input->type == GGML_TYPE_F32);

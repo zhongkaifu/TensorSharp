@@ -54,7 +54,6 @@ namespace TensorSharp.GGML
             DeviceId = deviceIds[0];
             BackendType = backendType;
             MemoryPool = new GgmlMemoryPool(backendType);
-            MemoryPool.EnsureInitialBlocks();
             GgmlNative.EnsureAvailable(backendType);
 
             if (deviceIds.Length > 1)
@@ -102,6 +101,8 @@ namespace TensorSharp.GGML
             bool enableAsync = backendType == GgmlBackendType.Metal &&
                                !string.Equals(disableAsync, "0", StringComparison.Ordinal);
             GgmlNative.SetAsyncCompute(enableAsync);
+            // Allocate initial host blocks only after fallible backend setup.
+            MemoryPool.EnsureInitialBlocks();
         }
 
         /// <summary>Physical device index backing rank 0.</summary>

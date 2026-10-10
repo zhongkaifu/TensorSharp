@@ -18,7 +18,7 @@ namespace TensorSharp.Models
         /// <summary>Whether a checkpoint loads on the direct-CUDA engine: GLM-5.3-Flash on
         /// <c>--backend cuda</c>.</summary>
         internal static bool DirectCudaApplies(BackendType backend, GgufFile probe)
-            => backend == BackendType.Cuda && probe?.GetString("general.architecture") == "glm5next";
+            => backend == BackendType.Cuda && GlmDsaArchitecture.IsGlm5Next(probe?.GetString("general.architecture"));
 
         /// <summary>The direct-CUDA engine places whole layers itself; the base class only needs a
         /// host allocator.</summary>

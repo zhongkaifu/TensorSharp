@@ -1,12 +1,113 @@
 // Copyright (c) Zhongkai Fu. All rights reserved.
 // Licensed under the BSD-3-Clause license in the repository root.
 #include "ggml_ops_q8_precision.h"
+#include "ggml_ops_q8_prefill_policy.h"
 #include "ggml-backend-impl.h"
 #include "ggml-cuda.h"
 #include "ggml-cuda/common.cuh"
 #include <cstdint>
+#include <cstdlib>
+#include <cstdio>
+#include <cstring>
+#include <vector>
 
 namespace {
+// Diagnostic opt-in while model/prefill/decode qualification is in progress.
+// Fix the policy at first use: changing an environment variable must not mix
+// arithmetic inside already captured CUDA graphs. The qualified default below
+// retains its K-increasing sum and cross-column bitwise contract.
+bool parallel_vector_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("TS_GGML_Q8_PARALLEL_VECTOR");
+        const bool selected = value && std::strcmp(value, "1") == 0;
+        if (selected)
+            std::fprintf(stderr, "[q8-f32] Experimental parallel-K F32 vector selected (N=1).\n");
+        return selected;
+    }();
+    return enabled;
+}
+
+bool parallel_small_batch_enabled() {
+    static const bool enabled = [] {
+        const char * value = std::getenv("TS_GGML_Q8_PARALLEL_SMALL_BATCH");
+        const bool selected = value && std::strcmp(value, "1") == 0;
+        if (selected)
+            std::fprintf(stderr, "[q8-f32] Experimental parallel-K F32 small batch selected (2<=N<=8).\n");
+        return selected;
+    }();
+    return enabled;
+}
+
+int prefill_tile_columns() {
+    static const int columns = [] {
+        const char * value = std::getenv("TS_GGML_Q8_PREFILL_TILE");
+        // Automatic tiling changes reuse and launch geometry only. Every
+        // output retains the same K-increasing FMA and original F32 operands.
+        const int selected = !value || !*value || std::strcmp(value, "auto") == 0 ? 0
+            : std::strcmp(value, "128") == 0 ? 128
+            : value && std::strcmp(value, "64") == 0 ? 64 : 32;
+        if (selected > 32)
+            std::fprintf(stderr, "[q8-f32] Experimental K-ordered prefill column tile selected: %d.\n", selected);
+        return selected;
+    }();
+    return columns;
+}
+
+// One full warp per output row. The decoded Q8 product and F32 activation are
+// unchanged; the lane sums and five shuffle additions deliberately use a new
+// reduction order. No atomics, staging allocation or input narrowing. A final
+// partial CTA may contain unused whole warps, never a partial active warp.
+template<bool Batched>
+__global__ void q8_f32_vector_parallel(const char * weights, const char * input, float * output,
+        int inner, int rows, size_t weight_stride, size_t input_inner_stride, size_t input_column_stride) {
+    const int lane = int(threadIdx.x) & 31;
+    const int row = int(blockIdx.x) * 4 + int(threadIdx.x) / 32;
+    if (row >= rows) return;
+    // Independent columns use the same lane/FMA/shuffle order as N=1. No
+    // staging, duplicated weight ownership or extra device allocation.
+    if constexpr (Batched) {
+        input += size_t(blockIdx.y) * input_column_stride;
+        output += size_t(blockIdx.y) * rows;
+    }
+    float sum = 0.0f;
+    for (int block = 0; block < inner / 32; ++block) {
+        const char * source = weights + size_t(row) * weight_stride + size_t(block) * 34;
+        const float scale = __half2float(*reinterpret_cast<const half *>(source));
+        const float weight = scale * float(*reinterpret_cast<const int8_t *>(source + 2 + lane));
+        const float activation = *reinterpret_cast<const float *>(input + size_t(block * 32 + lane) * input_inner_stride);
+        sum = fmaf(weight, activation, sum);
+    }
+    for (int shift = 16; shift > 0; shift /= 2)
+        sum += __shfl_down_sync(0xffffffffu, sum, shift);
+    if (lane == 0) output[row] = sum;
+}
+
+// Each lane owns a complete output row; independent rows provide parallelism
+// without changing the reduction order. Read two adjacent signed Q8 bytes at
+// once using the format's guaranteed two-byte alignment (34-byte block stride
+// forbids assuming aligned 32/128-bit loads). One warp per CTA limits the active
+// rows competing for L1 while the remaining bytes in each row are consumed.
+// No barriers, shared/global scratch, input narrowing or parallel-K reduction.
+__global__ void q8_f32_vector(const char * weights, const char * input, float * output,
+        int inner, int rows, size_t weight_stride, size_t input_inner_stride) {
+    const int row = int(blockIdx.x) * 32 + int(threadIdx.x);
+    if (row >= rows) return;
+    float sum = 0.0f;
+    for (int block_index = 0; block_index < inner / 32; ++block_index) {
+        const char * block = weights + size_t(row) * weight_stride + size_t(block_index) * 34;
+        const float scale = __half2float(*reinterpret_cast<const half *>(block));
+#pragma unroll
+        for (int pair = 0; pair < 16; ++pair) {
+            const uint16_t packed = *reinterpret_cast<const uint16_t *>(block + 2 + pair * 2);
+            const float x0 = *reinterpret_cast<const float *>(input + size_t(block_index * 32 + pair * 2) * input_inner_stride);
+            const float x1 = *reinterpret_cast<const float *>(input + size_t(block_index * 32 + pair * 2 + 1) * input_inner_stride);
+            sum = fmaf(scale * float(int8_t(packed & 255)), x0, sum);
+            sum = fmaf(scale * float(int8_t(packed >> 8)), x1, sum);
+        }
+    }
+    output[row] = sum;
+}
+
 // Each CTA owns a 64-row output tile. Its 128 threads each accumulate four
 // rows and Columns/8 columns. Weight blocks widen once into shared memory and
 // are reused across the entire column tile, preserving quantized residency.
@@ -70,15 +171,99 @@ __global__ void q8_f32_tiled(const char * weights, const char * input, float * o
 }
 
 template<int Columns>
-void launch(ggml_tensor * dst, cudaStream_t stream) {
-    const auto * w = dst->src[0];
-    const auto * x = dst->src[1];
-    const dim3 grid(unsigned((w->ne[1] + 63) / 64), unsigned((x->ne[1] + Columns - 1) / Columns));
-    q8_f32_tiled<Columns><<<grid, 128, 0, stream>>>(static_cast<const char *>(w->data),
-        static_cast<const char *>(x->data), static_cast<float *>(dst->data), int(w->ne[0]),
-        int(w->ne[1]), int(x->ne[1]), w->nb[1], x->nb[0], x->nb[1]);
+void launch(const void * weights, const void * input, float * output,
+        int inner, int rows, int columns, size_t weight_stride, size_t input_inner_stride,
+        size_t input_column_stride, cudaStream_t stream) {
+    const dim3 grid(unsigned((int64_t(rows) + 63) / 64), unsigned((columns + Columns - 1) / Columns));
+    q8_f32_tiled<Columns><<<grid, 128, 0, stream>>>(static_cast<const char *>(weights),
+        static_cast<const char *>(input), output, inner, rows, columns,
+        weight_stride, input_inner_stride, input_column_stride);
+}
+
+int automatic_tile(int rows, int columns, int & selected) {
+    if (columns < 64) { selected = 32; return int(cudaSuccess); }
+    struct DevicePolicy { int device, multiprocessors, active64, active128; };
+    // Host metadata only; never retain device pointers or payload allocations.
+    // Cache each device separately, without imposing a fixed maximum GPU count.
+    thread_local std::vector<DevicePolicy> policies;
+    int device = -1;
+    auto status = cudaGetDevice(&device);
+    if (status != cudaSuccess) return int(status);
+    const DevicePolicy * policy = nullptr;
+    for (const auto & item : policies) if (item.device == device) { policy = &item; break; }
+    if (!policy) {
+        DevicePolicy item{device, 0, 0, 0};
+        status = cudaDeviceGetAttribute(&item.multiprocessors, cudaDevAttrMultiProcessorCount, device);
+        if (status != cudaSuccess) return int(status);
+        status = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&item.active64, q8_f32_tiled<64>, 128, 0);
+        if (status != cudaSuccess) return int(status);
+        status = cudaOccupancyMaxActiveBlocksPerMultiprocessor(&item.active128, q8_f32_tiled<128>, 128, 0);
+        if (status != cudaSuccess) return int(status);
+        policies.push_back(item); policy = &policies.back();
+        std::fprintf(stderr, "[q8-f32] Automatic K-ordered prefill tiling: device=%d SMs=%d active64=%d active128=%d; no global scratch.\n",
+            device, item.multiprocessors, item.active64, item.active128);
+    }
+    selected = tsg_q8_prefill_auto_columns(rows, columns, policy->multiprocessors, policy->active64, policy->active128);
+    return int(cudaSuccess);
 }
 } // namespace
+
+int tsg_matmul_q8_cuda_launch(const void * weights, const void * input, float * output,
+        int inner, int rows, int columns, size_t weight_stride, size_t input_inner_stride,
+        size_t input_column_stride, void * stream_pointer) {
+    const auto stream = static_cast<cudaStream_t>(stream_pointer);
+    int tile = 32;
+    if (columns >= 64) {
+        tile = prefill_tile_columns();
+        if (tile == 0) {
+            const int status = automatic_tile(rows, columns, tile);
+            if (status != int(cudaSuccess)) return status;
+        }
+    }
+    if (columns == 1 && parallel_vector_enabled()) {
+        const unsigned blocks = unsigned((int64_t(rows) + 3) / 4);
+        q8_f32_vector_parallel<false><<<blocks, 128, 0, stream>>>(static_cast<const char *>(weights),
+            static_cast<const char *>(input), output, inner, rows, weight_stride, input_inner_stride, input_column_stride);
+    }
+    else if (columns == 1) {
+        const unsigned blocks = unsigned((int64_t(rows) + 31) / 32);
+        q8_f32_vector<<<blocks, 32, 0, stream>>>(static_cast<const char *>(weights),
+            static_cast<const char *>(input), output, inner, rows, weight_stride, input_inner_stride);
+    }
+    else if (columns <= 8 && parallel_small_batch_enabled()) {
+        const dim3 grid(unsigned((int64_t(rows) + 3) / 4), unsigned(columns));
+        q8_f32_vector_parallel<true><<<grid, 128, 0, stream>>>(static_cast<const char *>(weights),
+            static_cast<const char *>(input), output, inner, rows, weight_stride, input_inner_stride, input_column_stride);
+    }
+    else if (columns <= 8) launch<8>(weights, input, output, inner, rows, columns,
+        weight_stride, input_inner_stride, input_column_stride, stream);
+    else if (columns <= 16) launch<16>(weights, input, output, inner, rows, columns,
+        weight_stride, input_inner_stride, input_column_stride, stream);
+    else if (columns >= 128 && tile == 128) launch<128>(weights, input, output, inner, rows, columns,
+        weight_stride, input_inner_stride, input_column_stride, stream);
+    else if (columns >= 64 && tile >= 64) launch<64>(weights, input, output, inner, rows, columns,
+        weight_stride, input_inner_stride, input_column_stride, stream);
+    else launch<32>(weights, input, output, inner, rows, columns,
+        weight_stride, input_inner_stride, input_column_stride, stream);
+    return int(cudaGetLastError());
+}
+
+#if defined(TSG_GGML_TEST_HOOKS)
+// Keep the previous implementation available only to native correctness tests;
+// no runtime switch or additional public C ABI changes production dispatch.
+int tsg_matmul_q8_cuda_launch_reference(const void * weights, const void * input, float * output,
+        int inner, int rows, int columns, size_t weight_stride, size_t input_inner_stride,
+        size_t input_column_stride, void * stream_pointer) {
+    const auto stream = static_cast<cudaStream_t>(stream_pointer);
+    if (columns <= 8) launch<8>(weights, input, output, inner, rows, columns,
+        weight_stride, input_inner_stride, input_column_stride, stream);
+    else if (columns <= 16) launch<16>(weights, input, output, inner, rows, columns,
+        weight_stride, input_inner_stride, input_column_stride, stream);
+    else launch<32>(weights, input, output, inner, rows, columns,
+        weight_stride, input_inner_stride, input_column_stride, stream);
+    return int(cudaGetLastError());
+}
+#endif
 
 void tsg_matmul_q8_cuda_compute(ggml_tensor * dst, ggml_backend_t cuda_backend) {
     GGML_ASSERT(ggml_backend_is_cuda(cuda_backend) && ggml_is_contiguous(dst));
@@ -89,8 +274,9 @@ void tsg_matmul_q8_cuda_compute(ggml_tensor * dst, ggml_backend_t cuda_backend) 
     auto * context = static_cast<ggml_backend_cuda_context *>(cuda_backend->context);
     CUDA_CHECK(cudaSetDevice(context->device));
     const cudaStream_t stream = context->stream(context->device, 0);
-    if (dst->ne[1] <= 8) launch<8>(dst, stream);
-    else if (dst->ne[1] <= 16) launch<16>(dst, stream);
-    else launch<32>(dst, stream);
-    CUDA_CHECK(cudaGetLastError());
+    const auto * w = dst->src[0];
+    const auto * x = dst->src[1];
+    CUDA_CHECK(static_cast<cudaError_t>(tsg_matmul_q8_cuda_launch(w->data, x->data,
+        static_cast<float *>(dst->data), int(w->ne[0]), int(w->ne[1]), int(x->ne[1]),
+        w->nb[1], x->nb[0], x->nb[1], stream)));
 }

@@ -21,6 +21,11 @@ namespace TensorSharp.Server
         private readonly Func<string, BackendType, ITensorParallelGroup, string, ModelBase> _createModel;
 
         private ModelBase _model;
+        // Retiring models are unpublished immediately, but remain owned here until
+        // every physical release succeeds. A failed Dispose must be retryable.
+        private ModelBase _pendingDisposal;
+        private ITensorParallelGroup _pendingDisposalGroup;
+        private string _pendingDisposalName;
         private string _loadedModelPath;
         private string _loadedMmProjPath;
         private BackendType _backend;
@@ -219,10 +224,14 @@ namespace TensorSharp.Server
         public long LoadEpoch => Interlocked.Read(ref _loadEpoch);
         private long _loadEpoch;
 
-        private void UnloadCurrentModel()
+        private void UnloadCurrentModel(ITensorParallelGroup failedLoadGroup = null)
         {
+            RetryPendingDisposal();
             string previousModel = LoadedModelName;
             ModelBase outgoing = _model;
+            _pendingDisposal = outgoing;
+            _pendingDisposalGroup = failedLoadGroup;
+            _pendingDisposalName = previousModel;
             // Unpublished FIRST. While the outgoing model drains below, a request arriving
             // now must find no model (and be refused) rather than find this one and build a
             // fresh engine on it that the dispose would then free under its worker.
@@ -234,6 +243,15 @@ namespace TensorSharp.Server
             if (outgoing != null)
             {
                 Interlocked.Increment(ref _loadEpoch);
+            }
+            RetryPendingDisposal();
+        }
+
+        private void RetryPendingDisposal()
+        {
+            ModelBase outgoing = _pendingDisposal;
+            if (outgoing != null)
+            {
                 // The engine has already been torn down, but a request can still be inside
                 // the model: an image or audio encode runs on the request's thread before
                 // anything reaches the engine. Stop new uses, let the running ones leave
@@ -243,22 +261,34 @@ namespace TensorSharp.Server
                 if (!outgoing.WaitForUsesToDrain(UseDrainTimeout))
                 {
                     _logger.LogWarning(LogEventIds.ModelUnloaded,
-                        "{Model} was still encoding a request after {Seconds}s; unloading once the GPU lock is free",
-                        previousModel, UseDrainTimeout.TotalSeconds);
+                        "{Model} was still using the model after {Seconds}s; disposal is retained for retry",
+                        _pendingDisposalName, UseDrainTimeout.TotalSeconds);
+                    // A yielding encoder can release the GPU lock while it still
+                    // owns tensors. Acquiring that lock is not proof it has exited.
+                    throw new TimeoutException("The retiring model still has active uses; retry unloading after they exit.");
                 }
                 lock (outgoing.GpuComputeLock)
                     outgoing.Dispose();
+                _pendingDisposal = null;
             }
 
-            if (!string.IsNullOrEmpty(previousModel))
+            // A failed load may have built a TP group before its model existed.
+            // Keep that owner as well; never release it beneath a live model.
+            _pendingDisposalGroup?.Dispose();
+            _pendingDisposalGroup = null;
+            if (!string.IsNullOrEmpty(_pendingDisposalName))
             {
                 _logger.LogInformation(LogEventIds.ModelUnloaded,
-                    "Unloaded previous model {PreviousModel}", previousModel);
+                    "Unloaded previous model {PreviousModel}", _pendingDisposalName);
             }
+            _pendingDisposalName = null;
         }
 
         private void LoadModelCore(string modelPath, string mmProjPath, string backendStr)
         {
+            // Also guards rollback after a partially loaded replacement failed
+            // disposal. No factory or TP initialization may overlap that owner.
+            RetryPendingDisposal();
             _backend = ResolveBackend(backendStr);
 
             var loadSw = Stopwatch.StartNew();
@@ -377,24 +407,12 @@ namespace TensorSharp.Server
                 // either a fully loaded model or none at all. A tensor-parallel group
                 // built for a model that never came to exist has no other owner
                 // (a model disposes its own group; Dispose is idempotent either way).
-                _model?.Dispose();
-                tpGroup?.Dispose();
-                _model = null;
-                _loadedModelPath = null;
-                _loadedMmProjPath = null;
-                DraftHeadActivationError = null;
-                DraftHeadRefusedByModel = false;
+                UnloadCurrentModel(tpGroup);
                 throw;
             }
         }
 
-        public void Dispose()
-        {
-            _model?.Dispose();
-            _model = null;
-            _loadedModelPath = null;
-            _loadedMmProjPath = null;
-        }
+        public void Dispose() => UnloadCurrentModel();
 
         private void LoadEncoders(string mmProjPath)
         {

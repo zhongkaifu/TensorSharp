@@ -2,8 +2,12 @@
 // Licensed under the BSD-3-Clause license in the repository root.
 using System.Diagnostics;
 using System.Security.Cryptography;
+using System.Runtime.InteropServices;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using InferenceWeb.Tests;
+using TensorSharp.GGML;
+using TensorSharp.Memory;
 using TensorSharp.Models;
 using TensorSharp.Runtime;
 
@@ -43,6 +47,9 @@ bool q2kxl = Value("quantization", "mixed") switch
 };
 int prefill = Number("prefill-tokens", 40), decode = Number("decode-tokens", 64);
 int warmups = Number("warmup", 2, 0), iterations = Number("iterations", 5);
+int layerSplit = Number("layer-split", 1);
+if (layerSplit > 1 && (synthetic || backend != BackendType.GgmlCuda))
+    throw new ArgumentException("--layer-split requires a real checkpoint and ggml_cuda.");
 string generation = Value("generation", "teacher-forced");
 if (generation is not ("teacher-forced" or "greedy"))
     throw new ArgumentException("generation must be greedy or teacher-forced");
@@ -52,6 +59,133 @@ foreach (string name in TensorSharp.Runtime.Speculative.SpeculationEnvVars.Remov
 Environment.SetEnvironmentVariable("MAX_CONTEXT", Value("max-context", Math.Max(256, prefill + decode + 16).ToString()));
 KvCacheDtypeConfig.Set(KvCacheDtype.F16);
 string modelPath = synthetic ? Path.Combine(Path.GetDirectoryName(output)!, "fixture.gguf") : Path.GetFullPath(options["model"]);
+long? deviceBudgetBytes = options.TryGetValue("device-budget-bytes", out string? budgetText)
+    ? long.Parse(budgetText, System.Globalization.CultureInfo.InvariantCulture) : null;
+if (deviceBudgetBytes.HasValue && (deviceBudgetBytes.Value <= 0 || backend != BackendType.GgmlCuda))
+    throw new ArgumentException("--device-budget-bytes requires a positive capacity and ggml_cuda.");
+long? hostBudgetBytes = options.TryGetValue("host-budget-bytes", out string? hostBudgetText)
+    ? long.Parse(hostBudgetText, System.Globalization.CultureInfo.InvariantCulture) : null;
+if (hostBudgetBytes.HasValue && (hostBudgetBytes.Value < 0 || !deviceBudgetBytes.HasValue))
+    throw new ArgumentException("--host-budget-bytes requires a nonnegative capacity and --device-budget-bytes.");
+long? trimTargetBytes = options.TryGetValue("trim-target-bytes", out string? trimText)
+    ? long.Parse(trimText, System.Globalization.CultureInfo.InvariantCulture) : null;
+if (trimTargetBytes.HasValue && (trimTargetBytes.Value < 0 || !host || backend != BackendType.GgmlCuda))
+    throw new ArgumentException("--trim-target-bytes requires a nonnegative target and host expert placement on CUDA.");
+MemoryBudget? sharedBudget = null;
+GgmlCacheBudgetScope? cacheScope = null;
+ModelBase? model = null;
+CudaActivityCapture? activityCapture = null;
+object? completedReport = null;
+object? checkpointIdentity = null;
+object? modelGeometry = null;
+string? failure = null;
+string? observedNativePath = null;
+string? observedNativeHash = null;
+var cleanupErrors = new List<string>();
+var budgetObservations = new List<object>();
+var trimObservations = new List<object>();
+var rowCaptures = new List<object>();
+var processCounters = new List<object>();
+void ObserveProcess(string stage)
+{
+    if (Value("process-counters", "false") == "true") processCounters.Add(ProbeProcessCounters.Capture(stage));
+}
+FileStream? logitsStream = null;
+string? logitsPath = null;
+string? logitsIndexPath = null;
+string[] benchmarkEnvironmentNames = ["CUDA_VISIBLE_DEVICES", "NVIDIA_TF32_OVERRIDE", "MAX_CONTEXT", "OMP_NUM_THREADS",
+    "TENSORSHARP_TP_DEGREE", "TS_CPU_MOE", "TS_N_CPU_MOE", "TS_CPU_MOE_THREADS", "TS_GGML_CPU_THREADS",
+    "TS_HOST_MOE_DEVICE_MIN_BATCH", "TS_HOST_MOE_EXPERT_CACHE_MB", "TS_HOST_MOE_EXPERT_CACHE_LAYERS",
+    "TS_HOST_MOE_EXPERT_CACHE_DIAGNOSTICS", "TS_HOST_MOE_EXPERT_CACHE_PREFETCH", "TS_HOST_MOE_EXPERT_CACHE_BRIDGE",
+    "TS_HOST_MOE_EXPERT_CACHE_OUTPUT_BRIDGE", "TS_HOST_MOE_PIN", "TS_HOST_MOE_PIN_MAX_MB", "TS_HOST_MOE_TIMING",
+    "TS_HOST_MOE_DEBUG", "TS_HOST_MOE_VERIFY", "TS_HOST_MOE_EXPERT_FILTER", "TS_HOST_MOE_OS_PREFETCH", "TS_HOST_MOE_FILE_READ",
+    "TS_HOST_MOE_EXPERT_CACHE_LFU", "TS_HOST_MOE_ROUTE_TRACE", "GGML_CUDA_ALLREDUCE", "NCCL_P2P_DISABLE",
+    "TS_GGML_MEMORY_BUDGET", "TS_GGML_MEMORY_BUDGET_MB", "TS_Q4E_FUSED_GLU", "TS_GGML_PHASE_TIMING",
+    "TS_GGML_UPLOAD_PREFETCH", "TS_GGML_LOG_VRAM", "TS_Q4E_DECODE_VIEWS", "TS_Q4E_BROADCAST_VIEWS"];
+bool modelDisposed = false, cacheCleared = false, reuseReleased = false, scopeDetached = false, shutdown = false;
+void CaptureLogits(float[] logits, string stage, int iteration, IReadOnlyList<int> history)
+{
+    if (logitsStream == null) return;
+    if (logits.Length == 0 || logits.Any(value => !float.IsFinite(value)))
+        throw new InvalidOperationException($"Empty/nonfinite logits at {stage}, iteration {iteration}.");
+    var bytes = MemoryMarshal.AsBytes(logits.AsSpan());
+    long offset = logitsStream.Position;
+    logitsStream.Write(bytes);
+    logitsStream.Flush();
+    rowCaptures.Add(new { stage, iteration, warmup = iteration < 0, input_tokens = history.ToArray(),
+        byte_offset = offset, elements = logits.Length, sha256 = Convert.ToHexString(SHA256.HashData(bytes)).ToLowerInvariant(),
+        argmax = Enumerable.Range(0, logits.Length).MaxBy(index => logits[index]) });
+    File.WriteAllText(logitsIndexPath!, JsonSerializer.Serialize(new { format = "f32le", data_path = logitsPath,
+        rows = rowCaptures, limitations = "Diagnostic capture I/O is outside forward timers; this is not a quiet performance run." },
+        new JsonSerializerOptions { WriteIndented = true }) + Environment.NewLine);
+}
+void ObserveBudget(string stage)
+{
+    if (sharedBudget == null) return;
+    budgetObservations.Add(new { stage, pools = sharedBudget.Snapshot(), active_allocations = cacheScope?.ActiveAllocations,
+        callback_error = cacheScope?.CallbackError?.ToString() });
+}
+void WriteEvidence(bool complete)
+{
+    var node = completedReport == null ? new JsonObject() : JsonSerializer.SerializeToNode(completedReport)!.AsObject();
+    node["schema_version"] = 2;
+    node["passed"] = complete && failure == null && cleanupErrors.Count == 0;
+    node["run_complete"] = complete;
+    node["requested_options"] = JsonSerializer.SerializeToNode(options);
+    node["model_path"] = modelPath;
+    node["checkpoint_identity"] = JsonSerializer.SerializeToNode(checkpointIdentity);
+    node["model_geometry"] = JsonSerializer.SerializeToNode(modelGeometry);
+    node["model_sha256"] = synthetic && File.Exists(modelPath) ? Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(modelPath))).ToLowerInvariant() : null;
+    node["native_path"] = observedNativePath;
+    node["native_sha256"] = observedNativeHash;
+    node["managed_assemblies_sha256"] = JsonSerializer.SerializeToNode(AppDomain.CurrentDomain.GetAssemblies()
+        .Where(a => a.GetName().Name?.StartsWith("TensorSharp", StringComparison.Ordinal) == true && !a.IsDynamic)
+        .Select(a => a.Location).Where(File.Exists).Distinct().OrderBy(path => path)
+        .ToDictionary(path => path, path => Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(path))).ToLowerInvariant()));
+    node["environment"] = JsonSerializer.SerializeToNode(benchmarkEnvironmentNames
+        .Where(name => Environment.GetEnvironmentVariable(name) != null)
+        .ToDictionary(name => name, Environment.GetEnvironmentVariable));
+    node["device_budget_bytes"] = deviceBudgetBytes;
+    node["host_budget_bytes"] = hostBudgetBytes;
+    node["device_budget_rank_count"] = deviceBudgetBytes.HasValue ? layerSplit : 0;
+    node["budget_scope"] = deviceBudgetBytes.HasValue ? "per-rank cache, preload, and explicitly routed graph buffers; device_budget_bytes applies independently to every layer-split rank; optional shared host pool covers expert file staging only; not all driver/host/KV allocations" : "disabled";
+    node["budget_observations"] = JsonSerializer.SerializeToNode(budgetObservations);
+    node["trim_observations"] = JsonSerializer.SerializeToNode(trimObservations);
+    node["process_counters"] = JsonSerializer.SerializeToNode(processCounters);
+    node["logit_captures"] = JsonSerializer.SerializeToNode(new { format = "f32le", data_path = logitsPath,
+        index_path = logitsIndexPath, rows = rowCaptures });
+    node["error"] = failure;
+    node["cleanup"] = JsonSerializer.SerializeToNode(new { model_disposed = modelDisposed, cache_cleared = cacheCleared,
+        reuse_released = reuseReleased, scope_detached = scopeDetached, native_shutdown = shutdown,
+        retained_model_owner = model != null, retained_scope_owner = cacheScope != null, errors = cleanupErrors });
+    File.WriteAllText(output, node.ToJsonString(new JsonSerializerOptions { WriteIndented = true }) + Environment.NewLine);
+}
+try
+{
+GgmlBasicOps.EnsureBackendAvailable(backend == BackendType.GgmlCuda ? GgmlBackendType.Cuda : GgmlBackendType.Cpu);
+observedNativePath = Qwen4ExpExpertCacheScenario.MappedNativePath();
+observedNativeHash = Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(observedNativePath))).ToLowerInvariant();
+if (options.TryGetValue("logits-dir", out string? captureDirectory))
+{
+    if (!BitConverter.IsLittleEndian) throw new PlatformNotSupportedException("Diagnostic capture requires little-endian float32.");
+    captureDirectory = Path.GetFullPath(captureDirectory);
+    Directory.CreateDirectory(captureDirectory);
+    logitsPath = Path.Combine(captureDirectory, "rows.f32");
+    logitsIndexPath = Path.Combine(captureDirectory, "rows.json");
+    if (File.Exists(logitsIndexPath)) throw new IOException("Logit index already exists; use a fresh capture directory.");
+    logitsStream = new FileStream(logitsPath, FileMode.CreateNew, FileAccess.Write, FileShare.Read);
+}
+if (deviceBudgetBytes.HasValue)
+{
+    string[][] rankPools = Enumerable.Range(0, layerSplit).Select(rank => new[] { $"gpu{rank}" }).ToArray();
+    var pools = rankPools.Select(rank => new MemoryCharge(rank[0], deviceBudgetBytes.Value)).ToList();
+    if (hostBudgetBytes.HasValue) pools.Add(new("host", hostBudgetBytes.Value));
+    sharedBudget = new MemoryBudget(pools);
+    cacheScope = new GgmlCacheBudgetScope(sharedBudget, rankPools, includeGraphBuffers: true,
+        hostPools: hostBudgetBytes.HasValue ? ["host"] : null);
+    ObserveBudget("attached-before-model-load");
+}
+WriteEvidence(false);
 Dictionary<string, float[][]>? captures = null;
 if (synthetic)
 {
@@ -68,9 +202,18 @@ if (synthetic)
 
 MoeCpuOffloadConfig.Reset();
 if (host) MoeCpuOffloadConfig.SetAllLayers();
+if (options.TryGetValue("model-identity-report", out string? identityReport))
+    checkpointIdentity = ProbeCheckpointIdentity.Read(modelPath, identityReport);
+ObserveProcess("before-model-load");
 var load = Stopwatch.StartNew();
-using var model = ModelBase.Create(modelPath, backend);
+model = ModelBase.Create(modelPath, backend, layerSplitDegree: layerSplit);
 load.Stop();
+ObserveProcess("after-model-load");
+modelGeometry = new { architecture = model.Config.Architecture, hidden_size = model.Config.HiddenSize,
+    layers = model.Config.NumLayers, heads = model.Config.NumHeads, kv_heads = model.Config.NumKVHeads,
+    key_length = model.Config.KeyLength, value_length = model.Config.ValueLength,
+    vocabulary = model.Config.VocabSize, context_limit = model.MaxContextLength, kv_dtype = "f16", layer_split = layerSplit };
+ObserveBudget("model-loaded");
 string nativePath = Qwen4ExpExpertCacheScenario.MappedNativePath();
 string nativeHash = Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(nativePath))).ToLowerInvariant();
 var managedAssemblies = AppDomain.CurrentDomain.GetAssemblies()
@@ -105,6 +248,9 @@ if (prompt.Length == 0 || prompt.Any(token => token < 0 || token >= model.Tokeni
     throw new ArgumentException("Prompt must contain valid vocabulary token IDs.");
 if (prompt.Length + decode > int.Parse(Environment.GetEnvironmentVariable("MAX_CONTEXT")!))
     throw new ArgumentException("Prompt plus generation exceeds --max-context.");
+bool requireAllCache = Number("require-all-cache", 0, 0) != 0;
+if (requireAllCache && (!host || backend != BackendType.GgmlCuda || prompt.Length > 8))
+    throw new ArgumentException("--require-all-cache requires all-host experts on CUDA with a 1..8 token prefill.");
 if (options.TryGetValue("prompt-tokens-output", out string? tokenOutput))
 {
     Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(tokenOutput))!);
@@ -115,22 +261,73 @@ string DecodeGeneration(IEnumerable<int> generated) => model.Tokenizer.Decode(
     generated.TakeWhile(token => !model.Tokenizer.IsEos(token)).ToList());
 var statsBeforeTimedWork = backend == BackendType.GgmlCuda ? Qwen4ExpExpertCacheScenario.CacheStats() : null;
 string? referenceHash = null;
+string? referenceChainHash = null;
 float[]? finalLogits = null;
 int[]? finalGenerated = null;
+long expectedCachedRows = 0;
+if (options.TryGetValue("cuda-trace-library", out string? traceLibrary))
+    activityCapture = new CudaActivityCapture(traceLibrary, Path.ChangeExtension(output, ".cuda.jsonl"));
 for (int i = -warmups; i < iterations; i++)
 {
+    if (i >= 0 && Value("release-residency", "false") == "true")
+    {
+        model.ResetKVCache();
+        model.ReleaseGgmlDeviceResidency();
+        ObserveBudget($"iteration-{i}-after-residency-release");
+    }
+    if (i >= 0 && trimTargetBytes.HasValue)
+    {
+        // Quiescent between requests; preserve the model and every KV/graph owner.
+        // Capture all logits to compare cold refills and warm decode afterwards.
+        var before = Qwen4ExpExpertCacheScenario.CacheStats();
+        var trimTimer = Stopwatch.StartNew();
+        long released = GgmlBasicOps.TrimHostMoeExpertCache(trimTargetBytes.Value);
+        trimTimer.Stop();
+        var after = Qwen4ExpExpertCacheScenario.CacheStats();
+        if (after.ReservedBytes > trimTargetBytes.Value || before.ReservedBytes - after.ReservedBytes != released
+            || before.Calls != after.Calls || before.Hits != after.Hits || before.Misses != after.Misses)
+            throw new InvalidOperationException("Expert-cache trim changed counters or failed its release target.");
+        trimObservations.Add(new { iteration = i, target_bytes = trimTargetBytes.Value, released_bytes = released,
+            milliseconds = trimTimer.Elapsed.TotalMilliseconds, before, after });
+        ObserveBudget($"iteration-{i}-after-expert-trim");
+        WriteEvidence(false);
+    }
     model.ResetKVCache();
+    using var logitChain = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+    var decodeStepMilliseconds = new List<double>();
+    ObserveProcess($"iteration-{i}-before-prefill");
+    activityCapture?.Mark($"prefill/{i}/begin");
     var timer = Stopwatch.StartNew();
     float[] logits = model.ForwardRefill(prompt);
     timer.Stop();
+    activityCapture?.Mark($"prefill/{i}/end");
+    ObserveProcess($"iteration-{i}-after-prefill");
+    ObserveBudget($"iteration-{i}-prefill-complete");
     double prefillMs = timer.Elapsed.TotalMilliseconds;
+    logitChain.AppendData(MemoryMarshal.AsBytes(logits.AsSpan()));
+    var cacheAfterPrefill = backend == BackendType.GgmlCuda ? Qwen4ExpExpertCacheScenario.CacheStats() : null;
+    var inputHistory = new List<int>(prompt);
+    CaptureLogits(logits, "prefill", i, inputHistory);
     var generated = new List<int>();
     bool eos = false;
     int forwardSteps = 0;
+    ObserveProcess($"iteration-{i}-before-decode");
     timer.Restart();
     if (generation == "teacher-forced")
     {
-        foreach (int token in forced) logits = model.Forward(new[] { token });
+        foreach (int token in forced)
+        {
+            activityCapture?.Mark($"decode/{i}/{decodeStepMilliseconds.Count}/begin");
+            double stepStart = timer.Elapsed.TotalMilliseconds;
+            logits = model.Forward(new[] { token });
+            timer.Stop();
+            activityCapture?.Mark($"decode/{i}/{decodeStepMilliseconds.Count}/end");
+            decodeStepMilliseconds.Add(timer.Elapsed.TotalMilliseconds - stepStart);
+            logitChain.AppendData(MemoryMarshal.AsBytes(logits.AsSpan()));
+            inputHistory.Add(token);
+            CaptureLogits(logits, "decode", i, inputHistory);
+            timer.Start();
+        }
         forwardSteps = forced.Length;
     }
     else
@@ -141,10 +338,30 @@ for (int i = -warmups; i < iterations; i++)
             for (int j = 1; j < logits.Length; j++) if (logits[j] > logits[token]) token = j;
             generated.Add(token);
             if (model.Tokenizer.IsEos(token)) { eos = true; break; }
-            if (position + 1 < decode) { logits = model.Forward(new[] { token }); forwardSteps++; }
+            if (position + 1 < decode)
+            {
+                activityCapture?.Mark($"decode/{i}/{decodeStepMilliseconds.Count}/begin");
+                double stepStart = timer.Elapsed.TotalMilliseconds;
+                logits = model.Forward(new[] { token }); forwardSteps++;
+                timer.Stop();
+                activityCapture?.Mark($"decode/{i}/{decodeStepMilliseconds.Count}/end");
+                decodeStepMilliseconds.Add(timer.Elapsed.TotalMilliseconds - stepStart);
+                logitChain.AppendData(MemoryMarshal.AsBytes(logits.AsSpan()));
+                inputHistory.Add(token);
+                CaptureLogits(logits, "decode", i, inputHistory);
+                timer.Start();
+            }
         }
     }
     timer.Stop();
+    ObserveProcess($"iteration-{i}-after-decode");
+    var cacheAfterDecode = backend == BackendType.GgmlCuda ? Qwen4ExpExpertCacheScenario.CacheStats() : null;
+    string chainHash = Convert.ToHexString(logitChain.GetHashAndReset()).ToLowerInvariant();
+    referenceChainHash ??= chainHash;
+    if (referenceChainHash != chainHash)
+        throw new InvalidOperationException("Identical repeated inputs changed a complete vocabulary row.");
+    expectedCachedRows = checked(expectedCachedRows + (long)(prompt.Length + forwardSteps) * model.Config.NumLayers);
+    ObserveBudget($"iteration-{i}-decode-complete");
     if (logits.Length == 0 || logits.Any(v => !float.IsFinite(v)))
         throw new InvalidOperationException("The benchmark returned empty or nonfinite final logits.");
     byte[] bytes = new byte[logits.Length * sizeof(float)];
@@ -154,13 +371,15 @@ for (int i = -warmups; i < iterations; i++)
     if (referenceHash != hash) throw new InvalidOperationException("Identical repeated inputs changed final logits.");
     finalLogits = (float[])logits.Clone();
     finalGenerated = generated.ToArray();
-    var row = new { warmup = i < 0, iteration = i < 0 ? i + warmups : i, prefill_tokens = prompt.Length,
+    var row = new { warmup = i < 0, iteration = i, prefill_tokens = prompt.Length,
         decode_tokens = forwardSteps, generated_tokens = finalGenerated,
         selected_text = generation == "greedy" ? DecodeGeneration(generated) : null,
         finish_reason = generation == "greedy" ? (eos ? "eos" : "length") : "teacher-forced",
         prefill_ms = prefillMs, decode_ms = timer.Elapsed.TotalMilliseconds,
         prefill_tps = prompt.Length / (prefillMs / 1000), decode_tps = forwardSteps / timer.Elapsed.TotalSeconds,
-        final_logit_sha256 = hash };
+        final_logit_sha256 = hash, full_logit_chain_sha256 = chainHash, logit_rows = forwardSteps + 1,
+        decode_step_ms = decodeStepMilliseconds,
+        cache_stats_after_prefill = cacheAfterPrefill, cache_stats_after_decode = cacheAfterDecode };
     runs.Add(row);
     Console.WriteLine(JsonSerializer.Serialize(row));
 }
@@ -174,10 +393,13 @@ if (backend == BackendType.GgmlCuda)
     if (host && Number("require-cache", 0, 0) != 0 && !(stats.Calls > statsBeforeTimedWork.Calls
         && hasReuse && stats.Misses > statsBeforeTimedWork.Misses))
         throw new InvalidOperationException("Expert cache did not engage and reuse selected weights.");
+    if (requireAllCache && stats.Calls - statsBeforeTimedWork.Calls != expectedCachedRows)
+        throw new InvalidOperationException($"Not every expert row used the cache: expected {expectedCachedRows}, " +
+            $"observed {stats.Calls - statsBeforeTimedWork.Calls}. Some rows fell back or were unaccounted.");
 }
 using var process = Process.GetCurrentProcess();
 process.Refresh();
-var report = new
+completedReport = new
 {
     schema_version = 1,
     passed = true,
@@ -199,6 +421,8 @@ var report = new
     managed_bytes = GC.GetTotalMemory(false),
     cache_stats = stats,
     cache_stats_before_timed_work = statsBeforeTimedWork,
+    expected_cached_rows = expectedCachedRows,
+    all_cache_rows_required = requireAllCache,
     prompt_tokens = prompt,
     rendered_prompt = renderedPrompt,
     generated_tokens = finalGenerated,
@@ -212,9 +436,54 @@ var report = new
     {
         "Synthetic checkpoints exercise engines and cache ownership; they cannot establish trained language quality or real-model throughput.",
         "Teacher-forced decode excludes sampling and serves identical token inputs; it is not an HTTP end-to-end throughput result.",
+        "Optional CUPTI activity recording instruments execution; its durations are diagnostic, not ordinary throughput.",
         "Working-set and external GPU telemetry are process/driver measurements, not a full allocator peak.",
         "The cache is opt-in; eligible bias-free SiLU expert paths with one through eight rows engage it."
     }
 };
-File.WriteAllText(output, JsonSerializer.Serialize(report, new JsonSerializerOptions { WriteIndented = true }) + Environment.NewLine);
+}
+catch (Exception error)
+{
+    failure = error.ToString();
+    Console.Error.WriteLine(failure);
+    ObserveBudget("operation-failed-before-cleanup");
+}
+finally
+{
+    try { activityCapture?.Stop(); }
+    catch (Exception error) { cleanupErrors.Add("CUPTI capture.Stop: " + error); }
+    try { logitsStream?.Dispose(); logitsStream = null; }
+    catch (Exception error) { cleanupErrors.Add("logit capture.Dispose: " + error); }
+    // Preserve both physical owners and callback roots if a cleanup step fails.
+    // A failed scope detach must not turn into a successful zero-budget result.
+    try { model?.Dispose(); model = null; modelDisposed = true; }
+    catch (Exception error) { cleanupErrors.Add("model.Dispose: " + error); }
+    if (modelDisposed)
+    {
+        try { GgmlBasicOps.ClearHostBufferCache(); cacheCleared = true; }
+        catch (Exception error) { cleanupErrors.Add("ClearHostBufferCache: " + error); }
+        try { GgmlBasicOps.ReleaseReuseComputeBuffers(); reuseReleased = true; }
+        catch (Exception error) { cleanupErrors.Add("ReleaseReuseComputeBuffers: " + error); }
+    }
+    ObserveBudget("after-physical-cleanup-before-detach");
+    if (cacheScope != null)
+    {
+        if (cacheScope.CallbackError != null) cleanupErrors.Add("budget callback: " + cacheScope.CallbackError);
+        if (cacheScope.ActiveAllocations != 0 || sharedBudget!.Snapshot().Any(pool => pool.Reserved != 0 || pool.Committed != 0))
+            cleanupErrors.Add("Covered native allocations retain budget credit after physical cleanup.");
+        else if (cleanupErrors.Count == 0)
+        {
+            try { cacheScope.Dispose(); cacheScope = null; scopeDetached = true; }
+            catch (Exception error) { cleanupErrors.Add("budget scope.Dispose: " + error); }
+        }
+    }
+    WriteEvidence(false); // Keep ownership evidence even if a native shutdown aborts.
+    if (cleanupErrors.Count == 0 && cacheScope == null)
+    {
+        try { GgmlBasicOps.Shutdown(); shutdown = true; }
+        catch (Exception error) { cleanupErrors.Add("native Shutdown: " + error); }
+    }
+    WriteEvidence(true);
+}
 Console.WriteLine("report=" + output);
+Environment.ExitCode = failure == null && cleanupErrors.Count == 0 ? 0 : 1;

@@ -1782,6 +1782,8 @@ namespace TensorSharp.AgentHost.CodeExec
             // which is what this did — reported both edits as applied while keeping only
             // the last.
             var pending = new Dictionary<string, string?>(StringComparer.Ordinal);
+            var originalContents = new Dictionary<string, string>(StringComparer.Ordinal);
+            var fullyComposed = new HashSet<string>(StringComparer.Ordinal);
             var order = new List<string>();
             var outcomes = new List<CodePatch.FileOutcome>();
 
@@ -1799,6 +1801,7 @@ namespace TensorSharp.AgentHost.CodeExec
                 try
                 {
                     content = File.ReadAllText(path);
+                    originalContents.TryAdd(path, content.Replace("\r\n", "\n", StringComparison.Ordinal));
                     return true;
                 }
                 catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
@@ -1842,6 +1845,7 @@ namespace TensorSharp.AgentHost.CodeExec
                             if (!created.Ok)
                                 return CodeExecResult.Refused($"in '{section.Path}': {created.Error}");
                             Stage(full, created.Text);
+                            fullyComposed.Add(full);
                             outcomes.Add(new CodePatch.FileOutcome(
                                 section.Op, section.Path, null, created.LinesAdded, 0, 0));
                             break;
@@ -1880,7 +1884,13 @@ namespace TensorSharp.AgentHost.CodeExec
                                 V4ADiff.DiffResult result = V4ADiff.Update(
                                     current, section.Body, section.Newline, section.Path);
                                 if (!result.Ok)
+                                {
+                                    // A failed anchor demonstrates that the earlier bytes
+                                    // are not sufficient evidence for this repair. Let a
+                                    // read show them again even if the file is unchanged.
+                                    workspace.Reads.InvalidateReadVisibility(full);
                                     return CodeExecResult.Refused($"in '{section.Path}': {result.Error}");
+                                }
                                 updated = result.Text;
                                 added = result.LinesAdded;
                                 removed = result.LinesRemoved;
@@ -1999,14 +2009,20 @@ namespace TensorSharp.AgentHost.CodeExec
                 return CodeExecResult.Refused($"the patch could not be written ({ex.Message}). {restored}");
             }
 
-            // A patch's writes are reads too, on the same "writing counts as reading"
-            // rule the rest of this surface uses: the model composed those bytes, so an
-            // edit_file that follows a patch must not be gated on re-reading them. Without
-            // this the two halves of the surface disagreed about the same file.
+            // Retain edit provenance, but an update supplies only its changed spans:
+            // it cannot make a compacted-away full result visible again. An Add section
+            // actually composes the entire file and can establish full visibility.
             foreach (string path in order)
             {
                 if (pending[path] is { } written)
-                    workspace.Reads.Record(path, written.Replace("\r\n", "\n", StringComparison.Ordinal), 1, int.MaxValue, complete: true);
+                {
+                    string normalized = written.Replace("\r\n", "\n", StringComparison.Ordinal);
+                    if (fullyComposed.Contains(path))
+                        workspace.Reads.Record(path, normalized, 1, int.MaxValue, complete: true);
+                    else
+                        workspace.Reads.RecordEdit(path, originalContents.GetValueOrDefault(path),
+                            normalized, 1, int.MaxValue, complete: true);
+                }
                 else
                     workspace.Reads.Forget(path);
             }
@@ -2122,7 +2138,7 @@ namespace TensorSharp.AgentHost.CodeExec
             // rendered again. The saving is the point but not the whole point — a model
             // that re-reads after every edit spends its context on bytes it already has,
             // and the reply is what tells it the earlier result is still authoritative.
-            if (complete && workspace.Reads.Check(full, seenText).Freshness == ReadFreshness.Fresh)
+            if (complete && workspace.Reads.CanReuseVisibleRead(full, seenText))
             {
                 return new CodeExecResult(
                     true,
@@ -2319,7 +2335,7 @@ namespace TensorSharp.AgentHost.CodeExec
             // looked at, which is precisely the check three lines above.
             int editedFirst = changedLine + 1;
             int editedLast = editedFirst + replacement.Count(c => c == '\n');
-            workspace.Reads.Record(full, updated, editedFirst, editedLast, complete: seen.Complete);
+            workspace.Reads.RecordEdit(full, content, updated, editedFirst, editedLast, complete: seen.Complete);
 
             _logger.LogInformation(LogEventIds.CodeExecEdited,
                 "codeexec.edited path={Path} rung={Rung} freshness={Freshness} matches={Matches} all={All}",

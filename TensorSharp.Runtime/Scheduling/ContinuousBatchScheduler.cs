@@ -6,6 +6,8 @@
 // TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
 using System;
 using System.Collections.Generic;
+using System.Linq;
+using TensorSharp.Memory;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using TensorSharp.Runtime.Paged;
@@ -54,6 +56,8 @@ namespace TensorSharp.Runtime.Scheduling
         // Request ids survive additions/removals better than a numeric cursor.
         private string? _nextPrefillRequestId;
         private readonly ILogger _logger;
+        private readonly Dictionary<string, MemoryCharge[]> _memoryPeaks = new(StringComparer.Ordinal);
+        private readonly Dictionary<string, SequenceState> _memoryOwners = new(StringComparer.Ordinal);
 
         public ContinuousBatchScheduler(
             SchedulerConfig cfg,
@@ -63,6 +67,8 @@ namespace TensorSharp.Runtime.Scheduling
             bool requiresPerBlockCapture = false)
         {
             _cfg = cfg ?? throw new ArgumentNullException(nameof(cfg));
+            ArgumentOutOfRangeException.ThrowIfNegativeOrZero(cfg.PrefillChunkTokenLimit);
+            cfg.MemoryAdmission?.ValidateConfiguration(cfg);
             _pool = pool ?? throw new ArgumentNullException(nameof(pool));
             _logger = logger ?? NullLogger.Instance;
             // Per-boundary alignment only serves prefix pages that other sequences
@@ -132,6 +138,8 @@ namespace TensorSharp.Runtime.Scheduling
 
         public int WaitingCount => _waiting.Count;
         public int RunningCount => _running.Count;
+        public bool MemoryAdmissionBlocked { get; private set; }
+        internal IReadOnlyList<MemoryCharge>? BlockedMemoryPeak { get; private set; }
         public BlockPool Pool => _pool;
         public SchedulerConfig Config => _cfg;
 
@@ -185,8 +193,12 @@ namespace TensorSharp.Runtime.Scheduling
         public void Submit(SequenceState seq)
         {
             if (seq == null) throw new ArgumentNullException(nameof(seq));
+            if (_cfg.MemoryAdmission?.ExecutionShape is { } shape && seq.BlockTable.BlockSize != shape.BlockTokens)
+                throw new ArgumentException("The request block size differs from its admitted snapshot geometry.", nameof(seq));
             if (_waitingIndex.ContainsKey(seq.RequestId) || _running.ContainsKey(seq.RequestId))
                 throw new InvalidOperationException($"Sequence {seq.RequestId} is already submitted.");
+            if (_memoryOwners.ContainsKey(seq.RequestId))
+                throw new InvalidOperationException("The previous request with this id has not released its physical memory.");
 
             // A single request can eventually reclaim blocks from other requests
             // through preemption, but it can never exceed the pool's physical
@@ -208,6 +220,15 @@ namespace TensorSharp.Runtime.Scheduling
                 throw ex;
             }
 
+            if (_cfg.MemoryAdmission is { } admission)
+            {
+                if (_waiting.Count >= admission.MaxQueuedRequests)
+                    throw new MemoryPressureException("The memory admission queue is full.");
+                var peak = admission.EstimatePeak(seq).ToArray();
+                if (!admission.Budget.CanEverFit(peak))
+                    throw new MemoryPressureException("Request peak exceeds a configured physical memory pool even in isolation.");
+                _memoryPeaks.Add(seq.RequestId, peak);
+            }
             var node = _waiting.AddLast(seq);
             _waitingIndex[seq.RequestId] = node;
             seq.Status = SequenceStatus.Waiting;
@@ -233,6 +254,8 @@ namespace TensorSharp.Runtime.Scheduling
         /// </summary>
         public SchedulerOutput Schedule()
         {
+            MemoryAdmissionBlocked = false;
+            BlockedMemoryPeak = null;
             var output = new SchedulerOutput();
             int tokenBudget = _cfg.MaxNumBatchedTokens;
 
@@ -373,6 +396,28 @@ namespace TensorSharp.Runtime.Scheduling
                 // Try prefix cache lookup before allocating blocks (only for
                 // brand-new sequences; preempted ones already had their blocks
                 // freed and need a fresh re-prefill, no shortcut).
+                if (_cfg.MemoryAdmission is { } admission && seq.MemoryEnvelope == null)
+                {
+                    var peak = _memoryPeaks[seq.RequestId];
+                    // A budget can shrink while a request is queued. Waiting on its
+                    // change signal cannot help an envelope that no longer fits even
+                    // in isolation; reject just this request and visit the next one.
+                    if (!admission.Budget.CanEverFit(peak))
+                    {
+                        NotifyError(seq, new MemoryPressureException(
+                            "Request peak exceeds a physical memory pool after its capacity changed."), output);
+                        continue;
+                    }
+                    var envelope = admission.Budget.TryReserve(peak);
+                    if (envelope == null)
+                    {
+                        MemoryAdmissionBlocked = true;
+                        BlockedMemoryPeak = peak;
+                        break;
+                    }
+                    seq.MemoryEnvelope = envelope;
+                    _memoryOwners.Add(seq.RequestId, seq);
+                }
                 bool soleAdmission = false;
                 if (seq.BlockTable.NumBlocks == 0 && PrefixCachingActive)
                 {
@@ -499,16 +544,18 @@ namespace TensorSharp.Runtime.Scheduling
             int candidatesRemaining,
             int soloPrefillCap)
         {
-            if (noContention)
-                return soloPrefillCap;
-            if (hasActiveDecode)
-                return _cfg.MaxPrefillChunkSize;
-
             candidatesRemaining = Math.Max(1, candidatesRemaining);
             int evenShare = tokenBudget / candidatesRemaining;
             if (tokenBudget % candidatesRemaining != 0)
                 evenShare++;
-            return Math.Max(1, evenShare);
+            int cap = noContention ? soloPrefillCap : hasActiveDecode
+                ? _cfg.MaxPrefillChunkSize : Math.Max(1, evenShare);
+            cap = Math.Min(cap, _cfg.PrefillChunkTokenLimit);
+            // Fairness and solo-throughput policies may increase a chunk, but
+            // cannot exceed the shape whose workspace was admitted. Apply this
+            // to both existing and newly admitted prefills.
+            return _cfg.MemoryAdmission?.ExecutionShape is { } shape
+                ? Math.Min(cap, shape.MaximumPrefillTokens) : cap;
         }
 
         /// <summary>Move the prefill that received only a partial quantum last
@@ -584,8 +631,7 @@ namespace TensorSharp.Runtime.Scheduling
                     or SequenceStatus.FinishedAborted)
                 _radixCache.RetainPagedFinished(seq);
 
-            var freed = seq.BlockTable.Clear();
-            if (freed.Count > 0) _pool.Free(freed);
+            seq.BlockTable.ReleaseAll(_pool);
 
             seq.Status = finalStatus;
             seq.FinishReason = reason;
@@ -600,8 +646,24 @@ namespace TensorSharp.Runtime.Scheduling
 
             if (_running.Remove(seq.RequestId))
                 _runningOrder.Remove(seq);
+            _memoryPeaks.Remove(seq.RequestId);
 
             return true;
+        }
+
+        /// <summary>Call only AFTER model release/fences, including preemption and
+        /// cancellation. Retained allocations drawn from the envelope remain charged.
+        /// A failing release hook must leave its envelope reserved for recovery.</summary>
+        public void NotifyMemoryReleased(string requestId)
+        {
+            if (_memoryOwners.TryGetValue(requestId, out var seq))
+            {
+                if (seq.Status == SequenceStatus.Running)
+                    throw new InvalidOperationException("Cannot release a running request's memory envelope.");
+                seq.MemoryEnvelope!.Dispose();
+                seq.MemoryEnvelope = null;
+                _memoryOwners.Remove(requestId);
+            }
         }
 
         /// <summary>Make sure the sequence has block table capacity for
@@ -785,8 +847,7 @@ namespace TensorSharp.Runtime.Scheduling
         private void PreemptSequence(SequenceState victim)
         {
             CacheFullBlocksForSequence(victim);
-            var freed = victim.BlockTable.Clear();
-            if (freed.Count > 0) _pool.Free(freed);
+            victim.BlockTable.ReleaseAll(_pool);
 
             _running.Remove(victim.RequestId);
             _runningOrder.Remove(victim);

@@ -16,7 +16,8 @@ namespace TensorSharp.Models
             Id = "qwen35",
             DisplayName = "Qwen 3.5 / Qwen 3.6 (Gated DeltaNet + MoE)",
             Aliases = new[] { "qwen35", "qwen35moe", "qwen3next" },
-            Factory = c => new Qwen35Model(c.GgufPath, c.Backend, c.TpDegree, c.TpGroup, c.DraftModelPath),
+            SupportsWeightStreaming = true,
+            Factory = c => new Qwen35Model(c.GgufPath, c.Backend, c.TpDegree, c.TpGroup, c.DraftModelPath, c.WeightStreaming, c.MemoryPolicy),
             ProjectorFileHints = new[]
             {
                 "Qwen3.5-mmproj-F16.gguf",

@@ -9,9 +9,8 @@
 //
 // Greedy speculative decoding is verification-gated: every emitted token is
 // the trunk's argmax given the same prefix, so the output stream must match
-// plain greedy decoding except where batched-vs-sequential kernel ordering
-// flips a near-tie argmax (the same FP-drift tolerance the batched
-// Qwen3.5 correctness test uses).
+// plain greedy decoding through the first EOS. Any earlier divergence fails;
+// a partial matching prefix is not evidence of correct verification.
 //
 // Opt-in via TS_TEST_QWEN36_SPEC=1 (loads a ~10-12 GB GGUF). Model resolution order:
 //   1. TS_TEST_QWEN36_SPEC_MODEL     — explicit .gguf path
@@ -39,11 +38,10 @@ public class Qwen36SpeculativeTests
 
     private const string DefaultModelDir = @"C:\Works\models\mtp";
 
-    [Fact]
+    [MtpFact]
     public void Mtp_SpeculativeGreedy_MatchesBaselineGreedy()
     {
         string modelPath = ResolveModel();
-        if (modelPath == null) { _output.WriteLine("[mtp] opt-in not set or model missing; skipping"); return; }
 
         int maxNew = EnvInt("TS_TEST_QWEN36_SPEC_NEW_TOKENS", 32);
         int maxDraft = EnvInt("TS_SPEC_DRAFT", 8);
@@ -66,7 +64,7 @@ public class Qwen36SpeculativeTests
         var swBaseDecode = Stopwatch.StartNew();
         int t = Argmax(logits);
         baseline.Add(t);
-        for (int i = 1; i < maxNew; i++)
+        for (int i = 1; i < maxNew && !model.Tokenizer.IsEos(t); i++)
         {
             logits = model.Forward(new[] { t });
             t = Argmax(logits);
@@ -76,7 +74,7 @@ public class Qwen36SpeculativeTests
 
         // Speculative: MTP draft + batched trunk verification.
         var spec = new SpeculativeDecoder(model, maxDraft);
-        List<int> specTokens = spec.GenerateGreedy(tokens, maxNew);
+        List<int> specTokens = spec.GenerateGreedy(tokens, maxNew, model.Tokenizer.IsEos);
 
         string baseText = model.Tokenizer.Decode(baseline);
         string specText = model.Tokenizer.Decode(specTokens);
@@ -93,23 +91,22 @@ public class Qwen36SpeculativeTests
         while (matchPrefix < compareLen && baseline[matchPrefix] == specTokens[matchPrefix])
             matchPrefix++;
         _output.WriteLine($"[mtp] prefix match {matchPrefix}/{compareLen}");
+        _output.WriteLine($"[mtp] baseline: prefill={tokens.Length / swBasePrefill.Elapsed.TotalSeconds:F2} tok/s, " +
+            $"decode={(baseline.Count - 1) / swBaseDecode.Elapsed.TotalSeconds:F2} tok/s; " +
+            $"spec: prefill={tokens.Length / spec.LastPrefillSeconds:F2} tok/s, " +
+            $"decode={(specTokens.Count - 1) / spec.LastDecodeSeconds:F2} tok/s; " +
+            $"tokens={baseline.Count}/{specTokens.Count}, stopped={model.Tokenizer.IsEos(baseline[^1])}");
 
-        Xunit.Assert.Equal(maxNew, specTokens.Count);
-        // Verification gating means divergence can only come from FP drift on a
-        // near-tie argmax; require at least half the stream to match (random
-        // agreement on a 150k vocab is ~0).
-        Xunit.Assert.True(matchPrefix >= compareLen / 2,
-            $"spec/baseline prefix match {matchPrefix}/{compareLen} below 50% — structural divergence suspected");
+        Xunit.Assert.Equal(baseline, specTokens);
+        Xunit.Assert.True(specTokens.Count == maxNew || model.Tokenizer.IsEos(specTokens[^1]));
         Xunit.Assert.True(spec.TokensDrafted > 0, "draft head never produced a candidate");
         Xunit.Assert.True(spec.TokensAccepted > 0, "no drafted token was ever accepted");
     }
 
-    [Fact]
+    [MtpFact("TS_TEST_QWEN36_SPEC_BENCH")]
     public void Mtp_PerfBench_SpecVsBaseline()
     {
         string modelPath = ResolveModel();
-        if (modelPath == null || Environment.GetEnvironmentVariable("TS_TEST_QWEN36_SPEC_BENCH") != "1")
-        { _output.WriteLine("[mtp-bench] opt-in not set; skipping"); return; }
 
         int maxNew = EnvInt("TS_TEST_QWEN36_SPEC_NEW_TOKENS", 64);
         int maxDraft = EnvInt("TS_SPEC_DRAFT", 8);
@@ -168,15 +165,13 @@ public class Qwen36SpeculativeTests
         _output.WriteLine($"[mtp-bench] spec:     \"{Trim(model.Tokenizer.Decode(specTokens))}\"");
     }
 
-    [Fact]
+    [MtpFact("TS_TEST_QWEN36_SPEC_PROFILE")]
     public void Mtp_Profile_LayerTypeSplit()
     {
         // Opt-in profiling (TS_TEST_QWEN36_SPEC_PROFILE=1): where does a speculative step's
         // trunk time go — attention layers, recurrent (GDN) layers, or the LM
         // head? Drives optimization of the speculative path's per-pass cost.
         string modelPath = ResolveModel();
-        if (modelPath == null || Environment.GetEnvironmentVariable("TS_TEST_QWEN36_SPEC_PROFILE") != "1")
-        { _output.WriteLine("[mtp-profile] opt-in not set; skipping"); return; }
 
         int maxNew = EnvInt("TS_TEST_QWEN36_SPEC_NEW_TOKENS", 48);
         int maxDraft = EnvInt("TS_SPEC_DRAFT", 8);
@@ -209,6 +204,25 @@ public class Qwen36SpeculativeTests
         _output.WriteLine($"[mtp-profile] trunk recurrent (GDN) layers: {recMs:F0} ms ({100 * recMs / decodeMs:F1}%)");
         _output.WriteLine($"[mtp-profile] trunk LM head: {headMs:F0} ms ({100 * headMs / decodeMs:F1}%)");
         _output.WriteLine($"[mtp-profile] unaccounted (draft head, catch-up, emb, copies): {decodeMs - attnMs - recMs - headMs:F0} ms");
+    }
+
+    // Missing opt-in, weights or device must be visible as skipped, not passed.
+    public sealed class MtpFactAttribute : FactAttribute
+    {
+        public MtpFactAttribute(string extraOptIn = null)
+        {
+            if (ResolveModel() == null) Skip = "Set TS_TEST_QWEN36_SPEC=1 and provide Qwen3.6 weights.";
+            else if (extraOptIn != null && Environment.GetEnvironmentVariable(extraOptIn) != "1")
+                Skip = $"Set {extraOptIn}=1 to run this model benchmark.";
+            else
+            {
+                var backend = ResolveBackend();
+                if (backend is BackendType.GgmlCpu or BackendType.GgmlCuda or BackendType.GgmlMetal)
+                    Skip = TestGates.GgmlPinSkip(backend);
+                if (backend is BackendType.Cuda or BackendType.GgmlCuda)
+                    Skip ??= TestGates.CudaSkip;
+            }
+        }
     }
 
     private static int Argmax(float[] v)

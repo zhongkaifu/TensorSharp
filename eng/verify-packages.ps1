@@ -25,6 +25,12 @@ else {
 
 $PublicPackages = @(
     @{
+        Id = "TensorSharp.Memory"
+        Project = "TensorSharp.Memory/TensorSharp.Memory.csproj"
+        TensorSharpDependencies = @()
+        EmbeddedAssemblies = @()
+    },
+    @{
         # Package id intentionally differs from the project name - see the
         # PackageId comment in TensorSharp.Core.csproj.
         Id = "TensorSharp.Tensors"
@@ -41,7 +47,7 @@ $PublicPackages = @(
     @{
         Id = "TensorSharp.Runtime"
         Project = "TensorSharp.Runtime/TensorSharp.Runtime.csproj"
-        TensorSharpDependencies = @()
+        TensorSharpDependencies = @("TensorSharp.Memory")
         EmbeddedAssemblies = @()
     },
     @{
@@ -53,7 +59,7 @@ $PublicPackages = @(
     @{
         Id = "TensorSharp.Backends.Cuda"
         Project = "TensorSharp.Backends.Cuda/TensorSharp.Backends.Cuda.csproj"
-        TensorSharpDependencies = @("TensorSharp.Tensors")
+        TensorSharpDependencies = @("TensorSharp.Tensors", "TensorSharp.Memory")
         EmbeddedAssemblies = @()
     },
     @{

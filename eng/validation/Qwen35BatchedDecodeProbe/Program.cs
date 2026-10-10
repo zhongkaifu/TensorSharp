@@ -103,7 +103,7 @@ finally
     Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(output))!);
     File.WriteAllText(output, JsonSerializer.Serialize(new
     {
-        Model = Path.GetFullPath(modelPath), ModelBytes = new FileInfo(modelPath).Length,
+        Model = Path.GetFullPath(modelPath), ModelBytes = new FileInfo(modelPath).Length, ModelSha256 = Hash(modelPath),
         Backend = backendName, KvDtype = kvDtype, Context = context, InitialCacheTokens = initial,
         Steps = steps, Pairs = pairs, Widths = widths, AllowFallback = allowFallback,
         PromptLengthsOverride = promptLengthsOverride,
@@ -123,6 +123,9 @@ finally
         CudaGraphsDisabled = Environment.GetEnvironmentVariable("GGML_CUDA_DISABLE_GRAPHS"),
         CudaFusionDisabled = Environment.GetEnvironmentVariable("GGML_CUDA_DISABLE_FUSION"),
         WeightFusionCopies = Environment.GetEnvironmentVariable("TS_WEIGHT_FUSION_COPIES"),
+        Q8ParallelVector = Environment.GetEnvironmentVariable("TS_GGML_Q8_PARALLEL_VECTOR"),
+        Q8ParallelSmallBatch = Environment.GetEnvironmentVariable("TS_GGML_Q8_PARALLEL_SMALL_BATCH"),
+        Q8PrefillTile = Environment.GetEnvironmentVariable("TS_GGML_Q8_PREFILL_TILE"),
         GgmlRevision = Environment.GetEnvironmentVariable("TS_VALIDATION_GGML_REVISION"),
         Device = Environment.GetEnvironmentVariable("TS_VALIDATION_DEVICE"),
         Runs = runs, Warmups = warmups, SerialControl = serialControl,

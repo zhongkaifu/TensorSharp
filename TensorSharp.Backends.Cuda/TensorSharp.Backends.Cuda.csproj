@@ -12,6 +12,7 @@
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\TensorSharp.Core\TensorSharp.Core.csproj" />
+    <ProjectReference Include="..\TensorSharp.Memory\TensorSharp.Memory.csproj" />
   </ItemGroup>
 
   <PropertyGroup>

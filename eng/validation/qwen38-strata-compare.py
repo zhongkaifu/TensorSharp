@@ -36,6 +36,7 @@ CASES = {
     "extraction": "Inventory: cedar=3, maple=7, pine=2. Return only the names whose quantity is at least 3, comma-separated in the original order.",
     "code": "Write a Python function square(x) that returns x*x. Return only the function, without Markdown.",
     "squares": "Return the squares of the integers 1 through 20, in order, as comma-separated integers. Return only the list.",
+    "tool_json": 'Available tool: get_weather(city, unit), where unit is "celsius" or "fahrenheit". User asks: What is the weather in Hangzhou in Celsius? Return only one JSON object with exactly the keys "name" and "arguments", containing the tool name and its required arguments. Do not answer the weather question.',
 }
 
 
@@ -44,17 +45,27 @@ def semantic_check(case, text, complete):
     if not complete or not text.strip():
         return {"passed": False, "reason": "missing EOS or empty answer"}
     if case == "math":
-        passed = re.fullmatch(r"42[.!]?", text.strip()) is not None
+        passed = text.strip() == "42"
     elif case == "extraction":
-        passed = re.findall(r"[A-Za-z]+", text.lower()) == ["cedar", "maple"]
+        passed = re.fullmatch(r"cedar\s*,\s*maple", text.strip(), re.IGNORECASE) is not None
     elif case == "squares":
         answer = text.strip()
         passed = bool(re.fullmatch(r"\d+(?:\s*,\s*\d+){19}", answer)) and [int(value.strip()) for value in answer.split(",")] == [value * value for value in range(1, 21)]
+    elif case == "tool_json":
+        def unique_object(pairs):
+            result = dict(pairs)
+            if len(result) != len(pairs):
+                raise ValueError("Duplicate JSON keys")
+            return result
+        try:
+            passed = json.loads(text, object_pairs_hook=unique_object) == {
+                "name": "get_weather", "arguments": {"city": "Hangzhou", "unit": "celsius"}}
+        except (ValueError, TypeError):
+            passed = False
     elif case == "code":
         source = text.strip()
-        if source.startswith("```"):
-            source = re.sub(r"^```(?:python)?\s*\n", "", source)
-            source = re.sub(r"\n```\s*$", "", source)
+        # The task explicitly forbids Markdown. Parsing the original answer
+        # prevents a formatting failure from becoming a pass after repair.
         try:
             tree = ast.parse(source)
             functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)]

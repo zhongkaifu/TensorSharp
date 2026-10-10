@@ -36,9 +36,9 @@ namespace TensorSharp.AgentHost.Skills
     /// <c>open().write()</c>, a redirect through a shell variable, a background job that
     /// finished between calls, and every write path nobody has thought of yet are all seen,
     /// because the question is asked of the filesystem instead of of the command string.
-    /// There is nothing to invalidate and therefore nothing that can be forgotten to
-    /// invalidate — the <see cref="RewriteWatch"/> docstring's six escape routes exist
-    /// precisely because that class has to enumerate write paths, and this one does not.
+    /// Content freshness needs no write-path invalidation. Whether a prior full result
+    /// is still available in the model's context is separate: history compaction and a
+    /// failed patch invalidate read visibility without discarding edit provenance.
     /// </para>
     /// <para>
     /// <b>Writing counts as reading.</b> A file the model just created with a heredoc, a
@@ -113,6 +113,7 @@ namespace TensorSharp.AgentHost.Skills
             public int FirstLine;
             public int LastLine;
             public bool Complete;
+            public bool VisibleComplete;
             public string? Text;
             public long Touched;
         }
@@ -136,6 +137,16 @@ namespace TensorSharp.AgentHost.Skills
         /// <param name="lastLine">1-based last line shown, for a partial read.</param>
         /// <param name="complete">Whether the whole file was shown.</param>
         public void Record(string fullPath, string content, int firstLine, int lastLine, bool complete)
+            => RecordCore(fullPath, content, firstLine, lastLine, complete, mutation: false, previousContent: null);
+
+        // An edit supplies only its changed span. Preserve full-result visibility only
+        // if the previous complete bytes were still visible and matched its input.
+        internal void RecordEdit(string fullPath, string? previousContent, string content,
+            int firstLine, int lastLine, bool complete)
+            => RecordCore(fullPath, content, firstLine, lastLine, complete, mutation: true, previousContent);
+
+        private void RecordCore(string fullPath, string content, int firstLine, int lastLine,
+            bool complete, bool mutation, string? previousContent)
         {
             if (string.IsNullOrEmpty(fullPath) || content == null)
                 return;
@@ -148,7 +159,11 @@ namespace TensorSharp.AgentHost.Skills
                     _entries[fullPath] = entry;
                 }
 
-                entry.Hash = Hash(content);
+                ulong hash = Hash(content);
+                entry.VisibleComplete = mutation
+                    ? entry.VisibleComplete && previousContent != null && entry.Hash == Hash(previousContent)
+                    : complete || (entry.Hash == hash && entry.VisibleComplete);
+                entry.Hash = hash;
                 _remembered -= entry.Text?.Length ?? 0;
                 entry.Text = content.Length <= MaxRememberedChars ? content : null;
                 _remembered += entry.Text?.Length ?? 0;
@@ -216,6 +231,44 @@ namespace TensorSharp.AgentHost.Skills
                 return new ReadState(
                     entry.Complete ? ReadFreshness.Fresh : ReadFreshness.Partial,
                     entry.FirstLine, entry.LastLine, entry.Complete, entry.Text);
+            }
+        }
+
+        /// <summary>
+        /// Whether an unchanged full-file result can still be reused from the model's
+        /// context. Historical edit provenance alone does not imply prompt visibility.
+        /// </summary>
+        public bool CanReuseVisibleRead(string fullPath, string currentContent)
+        {
+            if (string.IsNullOrEmpty(fullPath))
+                return false;
+            lock (_gate)
+            {
+                if (!_entries.TryGetValue(fullPath, out Entry? entry)
+                    || !entry.VisibleComplete || entry.Hash != Hash(currentContent ?? string.Empty))
+                    return false;
+                entry.Touched = ++_clock;
+                return true;
+            }
+        }
+
+        /// <summary>
+        /// Allow the next full read to show bytes again, while retaining hashes, ranges
+        /// and remembered text for edit checks. Null invalidates all paths after context
+        /// compaction; a specific path is used when a failed patch needs fresh evidence.
+        /// A partial reread cannot restore visibility of an old complete result.
+        /// </summary>
+        public void InvalidateReadVisibility(string? fullPath = null)
+        {
+            lock (_gate)
+            {
+                if (fullPath == null)
+                {
+                    foreach (Entry entry in _entries.Values)
+                        entry.VisibleComplete = false;
+                }
+                else if (_entries.TryGetValue(fullPath, out Entry? entry))
+                    entry.VisibleComplete = false;
             }
         }
 

@@ -133,6 +133,7 @@ namespace
     struct PagedAttnSession
     {
         bool valid = false;
+        ggml_backend_t backend = nullptr;
         int num_q = 0;
         int padded_kv_len_bucket = 0;
         int num_heads = 0;
@@ -170,7 +171,7 @@ namespace
         {
             if (buffer != nullptr)
             {
-                ggml_backend_buffer_free(buffer);
+                graph_budget_free_buffer(buffer);
                 buffer = nullptr;
             }
             if (ctx != nullptr)
@@ -183,6 +184,7 @@ namespace
             q_in = k_in = v_in = attn_mask = sinks_tensor = attn_result = nullptr;
             graph = nullptr;
             valid = false;
+            backend = nullptr;
             kv_zero_covered_from = 0;
         }
 
@@ -194,13 +196,71 @@ namespace
     };
 
     constexpr std::size_t kPagedAttnCacheSize = 16;
-    thread_local std::array<PagedAttnSession, kPagedAttnCacheSize> g_paged_attn_cache;
-    thread_local std::uint64_t g_paged_attn_lru_counter = 0;
-
-    // Thread-local mask scratch so we don't allocate a fresh vector per call.
-    thread_local std::vector<ggml_fp16_t> g_paged_attn_mask_scratch;
-    // Thread-local zero buffer for padding K/V slots. Grown to max needed.
-    thread_local std::vector<float> g_paged_attn_zero_scratch;
+    struct PagedAttnHostPtrCacheEntry {
+        void* host_ptr = nullptr;
+        ggml_backend_t backend = nullptr;
+        std::size_t bytes = 0;
+        ggml_backend_buffer_t buffer = nullptr;
+        std::uint64_t lru = 0;
+    };
+    constexpr std::size_t kHostPtrCacheSize = 16;
+    struct PagedAttentionThreadCache;
+    struct PagedAttentionRegistry {
+        std::mutex mutex;
+        std::vector<std::shared_ptr<PagedAttentionThreadCache>> caches;
+    };
+    PagedAttentionRegistry& paged_registry()
+    {
+        // TLS destructors can run after ordinary C++ statics. The tiny registry
+        // intentionally lasts until process exit; all payload is cleared below.
+        static auto* registry = new PagedAttentionRegistry;
+        return *registry;
+    }
+    void release_paged_caches();
+    struct PagedAttentionThreadCache {
+        std::array<PagedAttnSession, kPagedAttnCacheSize> sessions;
+        std::array<PagedAttnHostPtrCacheEntry, kHostPtrCacheSize> host_ptr;
+        std::uint64_t lru = 0, host_lru = 0;
+        std::vector<ggml_fp16_t> mask;
+        std::vector<float> zero;
+        void clear()
+        {
+            for (auto& session : sessions) session.destroy();
+            for (auto& entry : host_ptr) {
+                if (entry.buffer) ggml_backend_buffer_free(entry.buffer);
+                entry = {};
+            }
+            std::vector<ggml_fp16_t>().swap(mask);
+            std::vector<float>().swap(zero);
+            lru = host_lru = 0;
+        }
+    };
+    PagedAttentionThreadCache& paged_cache()
+    {
+        thread_local auto cache = [] {
+            auto& registry = paged_registry();
+            std::lock_guard<std::mutex> lock(registry.mutex);
+            auto value = std::make_shared<PagedAttentionThreadCache>();
+            registry.caches.push_back(value);
+            static std::once_flag cleanup;
+            std::call_once(cleanup, [] { std::atexit(release_paged_caches); });
+            return value;
+        }();
+        // Registry ownership prevents cudaFree from a Windows TLS destructor
+        // under DLL_THREAD_DETACH's loader lock. A retired worker's buffers stay
+        // charged until explicit quiescent trim or ordered process teardown.
+        return *cache;
+    }
+    // As with the other shared graph caches, explicit release requires all
+    // model execution to be quiescent. The registry lock protects thread exit.
+    void release_paged_caches()
+    {
+        auto& registry = paged_registry();
+        std::lock_guard<std::mutex> lock(registry.mutex);
+        for (auto& cache : registry.caches) cache->clear();
+        registry.caches.erase(std::remove_if(registry.caches.begin(), registry.caches.end(),
+            [](const auto& cache) { return cache.use_count() == 1; }), registry.caches.end());
+    }
 
     inline std::uint32_t float_bits(float v)
     {
@@ -213,9 +273,9 @@ namespace
         int num_q, int padded_kv_len_bucket, int num_heads, int num_kv_heads,
         int head_dim, std::uint32_t scale_bits, bool has_sinks)
     {
-        for (auto& sess : g_paged_attn_cache)
+        for (auto& sess : paged_cache().sessions)
         {
-            if (!sess.valid) continue;
+            if (!sess.valid || sess.backend != g_backend) continue;
             if (sess.num_q == num_q &&
                 sess.padded_kv_len_bucket == padded_kv_len_bucket &&
                 sess.num_heads == num_heads &&
@@ -224,7 +284,7 @@ namespace
                 sess.scale_bits == scale_bits &&
                 sess.has_sinks == has_sinks)
             {
-                sess.lru = ++g_paged_attn_lru_counter;
+                sess.lru = ++paged_cache().lru;
                 return &sess;
             }
         }
@@ -234,14 +294,14 @@ namespace
     PagedAttnSession& acquire_paged_attn_session_slot()
     {
         // Prefer an invalid slot.
-        for (auto& sess : g_paged_attn_cache)
-            if (!sess.valid) { sess.lru = ++g_paged_attn_lru_counter; return sess; }
+        for (auto& sess : paged_cache().sessions)
+            if (!sess.valid) { sess.lru = ++paged_cache().lru; return sess; }
         // Otherwise evict the LRU entry.
-        PagedAttnSession* victim = &g_paged_attn_cache[0];
-        for (auto& sess : g_paged_attn_cache)
+        PagedAttnSession* victim = &paged_cache().sessions[0];
+        for (auto& sess : paged_cache().sessions)
             if (sess.lru < victim->lru) victim = &sess;
         victim->destroy();
-        victim->lru = ++g_paged_attn_lru_counter;
+        victim->lru = ++paged_cache().lru;
         return *victim;
     }
 
@@ -300,7 +360,7 @@ namespace
         sess.graph = ggml_new_graph(sess.ctx);
         ggml_build_forward_expand(sess.graph, result);
 
-        sess.buffer = ggml_backend_alloc_ctx_tensors(sess.ctx, g_backend);
+        sess.buffer = alloc_ctx_tensors_budgeted(sess.ctx, g_backend);
         if (sess.buffer == nullptr)
         {
             set_last_error("Failed to allocate backend buffer for paged-attention session.");
@@ -332,6 +392,7 @@ namespace
         // range is already clean.
         sess.kv_zero_covered_from = 0;
         sess.valid = true;
+        sess.backend = g_backend;
         return true;
     }
 
@@ -395,13 +456,13 @@ namespace
             const int zero_to = sess->kv_zero_covered_from;
             const std::size_t zero_elems =
                 static_cast<std::size_t>(zero_to - zero_from) * num_kv_heads * head_dim;
-            if (g_paged_attn_zero_scratch.size() < zero_elems)
-                g_paged_attn_zero_scratch.assign(zero_elems, 0.0f);
+            if (paged_cache().zero.size() < zero_elems)
+                paged_cache().zero.assign(zero_elems, 0.0f);
             const std::size_t pad_offset =
                 static_cast<std::size_t>(zero_from) * num_kv_heads * head_dim * sizeof(float);
-            ggml_backend_tensor_set(sess->k_in, g_paged_attn_zero_scratch.data(),
+            ggml_backend_tensor_set(sess->k_in, paged_cache().zero.data(),
                                      pad_offset, zero_elems * sizeof(float));
-            ggml_backend_tensor_set(sess->v_in, g_paged_attn_zero_scratch.data(),
+            ggml_backend_tensor_set(sess->v_in, paged_cache().zero.data(),
                                      pad_offset, zero_elems * sizeof(float));
         }
         if (seq_len > sess->kv_zero_covered_from)
@@ -409,10 +470,10 @@ namespace
 
         // Build and upload the mask. The cached graph always references the
         // mask tensor; we just refresh its content per call.
-        fill_causal_mask_fp16(g_paged_attn_mask_scratch, padded_kv_len_bucket,
+        fill_causal_mask_fp16(paged_cache().mask, padded_kv_len_bucket,
                               num_q, seq_len, first_q_pos, sliding_window);
-        ggml_backend_tensor_set(sess->attn_mask, g_paged_attn_mask_scratch.data(),
-                                 0, g_paged_attn_mask_scratch.size() * sizeof(ggml_fp16_t));
+        ggml_backend_tensor_set(sess->attn_mask, paged_cache().mask.data(),
+                                 0, paged_cache().mask.size() * sizeof(ggml_fp16_t));
 
         if (has_sinks)
         {
@@ -647,15 +708,8 @@ namespace
         // holds a ggml_backend_buffer_t we created via
         // ggml_backend_dev_buffer_from_host_ptr; subsequent calls with the
         // same pointer reuse it.
-        struct PagedAttnHostPtrCacheEntry {
-            void* host_ptr = nullptr;
-            std::size_t bytes = 0;
-            ggml_backend_buffer_t buffer = nullptr;
-            std::uint64_t lru = 0;
-        };
-        constexpr std::size_t kHostPtrCacheSize = 16;
-        thread_local std::array<PagedAttnHostPtrCacheEntry, kHostPtrCacheSize> g_host_ptr_cache;
-        thread_local std::uint64_t g_host_ptr_lru = 0;
+        auto& g_host_ptr_cache = paged_cache().host_ptr;
+        auto& g_host_ptr_lru = paged_cache().host_lru;
 
         auto get_or_make_host_ptr_buffer = [&](void* host_ptr, std::size_t bytes) -> ggml_backend_buffer_t {
             if (host_ptr == nullptr || bytes == 0 || dev == nullptr) return nullptr;
@@ -665,7 +719,7 @@ namespace
 
             // Lookup.
             for (auto& e : g_host_ptr_cache) {
-                if (e.buffer != nullptr && e.host_ptr == host_ptr && e.bytes == bytes) {
+                if (e.buffer != nullptr && e.backend == g_backend && e.host_ptr == host_ptr && e.bytes == bytes) {
                     e.lru = ++g_host_ptr_lru;
                     return e.buffer;
                 }
@@ -688,6 +742,7 @@ namespace
                 dev, host_ptr, bytes, bytes);
             if (buf == nullptr) return nullptr;
             victim->host_ptr = host_ptr;
+            victim->backend = g_backend;
             victim->bytes = bytes;
             victim->buffer = buf;
             victim->lru = ++g_host_ptr_lru;
@@ -707,7 +762,7 @@ namespace
         // Allocate the remaining (non-zero-copy) tensors. ggml only
         // allocates the ones still unbound, so this just covers k_in, v_in,
         // attn_mask, sinks, and the intermediate graph nodes.
-        BufferHandle ctx_buffer(ggml_backend_alloc_ctx_tensors(ctx, g_backend));
+        BufferHandle ctx_buffer(alloc_ctx_tensors_budgeted(ctx, g_backend));
         if (ctx_buffer.value == nullptr)
         {
             set_last_error("Failed to allocate backend buffer for paged attention (device).");
@@ -775,6 +830,10 @@ namespace
         return 1;
     }
 } // anonymous namespace
+
+namespace tsg {
+    void release_paged_attention_cache() { release_paged_caches(); }
+}
 
 // ============================================================================
 // TSGgml_PagedAttentionForward

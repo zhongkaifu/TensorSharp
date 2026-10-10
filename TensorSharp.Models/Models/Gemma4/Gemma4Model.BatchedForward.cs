@@ -68,6 +68,7 @@ namespace TensorSharp.Models
         {
             get
             {
+                if (HasStreamingWeights) return false;
                 if (IsTensorParallel) return false;
                 if (_kvCacheDtype.IsBlockQuantized())
                 {
@@ -89,6 +90,7 @@ namespace TensorSharp.Models
 
         public IReadOnlyList<float[]> ForwardBatch(BatchedForwardContext ctx)
         {
+            RefuseStreamingAlternateEntry("batched forward");
             if (ctx == null) throw new ArgumentNullException(nameof(ctx));
             int numSeqs = ctx.Sequences.Count;
             if (numSeqs == 0) return Array.Empty<float[]>();
@@ -529,7 +531,7 @@ namespace TensorSharp.Models
         /// claim migration support in that case.
         /// </summary>
         public bool SupportsLinearKVMigration =>
-            _kvCacheK != null && _kvCacheV != null && !_kvCacheDtype.IsBlockQuantized();
+            !HasStreamingWeights && _kvCacheK != null && _kvCacheV != null && !_kvCacheDtype.IsBlockQuantized();
 
         /// <summary>
         /// Copy <paramref name="owner"/>'s K/V history out of the linear

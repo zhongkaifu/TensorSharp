@@ -32,6 +32,8 @@
 // cost — the C# layer simply passes the base pointer of expert 0.
 
 #include "ggml_ops_internal.h"
+#include "ggml_ops_moe_prefetch.h"
+#include "ggml_ops_file_source.h"
 #include "dsv41_engram_io.h"
 
 #include "ggml-backend.h"
@@ -295,6 +297,14 @@ namespace
             // is therefore bounded by the largest single layer, not the model.
             if (stream_only)
             {
+                // Unlike resident weights, these leafs live in graph compute
+                // memory. Keep them live for the whole graph: CUDA may fuse
+                // gate/up/GLU into one MMVQ kernel, while the graph allocator
+                // otherwise reuses a consumed weight's storage for its output.
+                // The upstream fusion overlap check assumes leaf weights are
+                // externally owned and skips them. No upstream patch is needed.
+                ggml_set_input(tensor);
+                ggml_set_output(tensor);
                 uploads.push_back({tensor, host_data, bytes, true});
                 return true;
             }
@@ -332,6 +342,10 @@ namespace
             }
 
             // Fall back to deferred upload after backend buffer allocation.
+            // This fallback is also graph-owned and has the same fused-kernel
+            // lifetime as the explicit streaming branch above.
+            ggml_set_input(tensor);
+            ggml_set_output(tensor);
             uploads.push_back({tensor, host_data, bytes, true});
             return true;
         }
@@ -571,20 +585,25 @@ namespace
     // offloaded experts, 30 s of a 1818-token prefill whose GPU work took 1 s.
     // Faulted in concurrently first, the copy reads from the page cache. Nothing
     // is pinned or copied here; the pages stay evictable.
-    void prefetch_mapped_ranges_impl(const std::uint8_t* base,
-                                const std::vector<std::pair<std::size_t, std::size_t>>& ranges)
+    tsg_dsv41::engram_io_pool& mapped_read_pool()
     {
-        static tsg_dsv41::engram_io_pool s_pool(16);
+        static tsg_dsv41::engram_io_pool pool(std::min(16, available_cpu_parallelism()));
+        return pool;
+    }
+
+    void prefetch_mapped_buffers_impl(
+        const std::vector<std::pair<const std::uint8_t*, std::size_t>>& buffers)
+    {
         constexpr std::size_t kChunk = std::size_t(4) << 20;
         constexpr std::size_t kStride = 4096;   // at most one touch per page on any host
         // Read by the pool's workers: an ordinary local, never thread_local.
-        std::vector<std::pair<std::size_t, std::size_t>> tasks;
-        for (const auto& r : ranges)
+        std::vector<std::pair<const std::uint8_t*, std::size_t>> tasks;
+        for (const auto& r : buffers)
             for (std::size_t o = 0; o < r.second; o += kChunk)
                 tasks.emplace_back(r.first + o, std::min(kChunk, r.second - o));
         std::atomic<std::uint64_t> sink{0};
-        s_pool.run(tasks.size(), [&](std::size_t i) {
-            const volatile std::uint8_t* p = base + tasks[i].first;
+        mapped_read_pool().run(tasks.size(), [&](std::size_t i) {
+            const volatile std::uint8_t* p = tasks[i].first;
             const std::size_t n = tasks[i].second;
             std::uint64_t sum = 0;
             for (std::size_t k = 0; k < n; k += kStride) sum += p[k];
@@ -1443,7 +1462,7 @@ namespace
             : alloc_graph_reuse_gallocr(graph);
         if (!graph_allocated)
         {
-            backend_buffer.value = ggml_backend_alloc_ctx_tensors(ctx, g_backend);
+            backend_buffer.value = graph_budget_alloc_ctx_tensors(ctx, g_backend, g_active_rank);
             if (backend_buffer.value == nullptr)
             {
                 set_last_error("MoE prefill: failed to allocate backend buffer for graph tensors.");
@@ -1742,10 +1761,82 @@ namespace
 
 namespace tsg
 {
+    void read_expert_files(std::vector<ExpertReadTask>& tasks,
+        const std::function<void(std::size_t)>& consume)
+    {
+        mapped_read_pool().run_pipelined(tasks.size(), [&](std::size_t i) {
+            tasks[i].prepare();
+        }, consume);
+    }
+
     void prefetch_mapped_ranges(const std::uint8_t* base,
         const std::vector<std::pair<std::size_t, std::size_t>>& ranges)
     {
-        prefetch_mapped_ranges_impl(base, ranges);
+        std::vector<std::pair<const std::uint8_t*, std::size_t>> buffers;
+        buffers.reserve(ranges.size());
+        for (const auto& range : ranges) buffers.emplace_back(base + range.first, range.second);
+        prefetch_mapped_buffers_impl(buffers);
+    }
+
+    void prefetch_mapped_buffers(
+        const std::vector<std::pair<const std::uint8_t*, std::size_t>>& buffers)
+    {
+        prefetch_mapped_buffers_impl(buffers);
+    }
+
+    void upload_prefetched_mapped_buffer(const std::uint8_t* source, std::size_t bytes,
+        const std::function<void(std::size_t, std::size_t)>& upload)
+    {
+        if (!bytes) return;
+        if (!source) throw std::invalid_argument("Missing mapped upload source");
+        constexpr std::size_t chunk = std::size_t(4) << 20;
+        auto& pool = mapped_read_pool();
+        const std::size_t window = chunk * pool.threads();
+        if (vram_log_enabled())
+            std::fprintf(stderr, "[cache-upload] rank=%d bytes=%zu read_threads=%u window_bytes=%zu\n",
+                g_active_rank, bytes, pool.threads(), window);
+        std::atomic<std::uint64_t> sink{0};
+        for (std::size_t begin = 0; begin < bytes;)
+        {
+            const auto length = std::min(window, bytes - begin);
+            const auto count = (length + chunk - 1) / chunk;
+            pool.run_pipelined(count, [&](std::size_t task) {
+                const auto offset = begin + task * chunk;
+                const auto size = std::min(chunk, bytes - offset);
+                const volatile std::uint8_t* p = source + offset;
+                std::uint64_t sum = 0;
+                for (std::size_t i = 0; i < size; i += 4096) sum += p[i];
+                sum += p[size - 1];
+                sink.fetch_add(sum, std::memory_order_relaxed);
+            }, [&](std::size_t task) {
+                const auto offset = begin + task * chunk;
+                upload(offset, std::min(chunk, bytes - offset));
+            });
+            begin += length;
+        }
+    }
+
+    std::chrono::steady_clock::duration prefetch_mapped_experts(
+        const std::vector<MoePrefetchExpert>& experts,
+        const std::function<void(std::size_t, std::size_t)>& consume)
+    {
+        using Clock = std::chrono::steady_clock;
+        if (experts.empty()) return Clock::duration::zero();
+        const auto count = experts.size() * 3;
+        std::atomic<std::size_t> remaining{count};
+        std::atomic<std::uint64_t> sink{0};
+        const auto started = Clock::now();
+        auto reads_completed = started;
+        mapped_read_pool().run_pipelined(count, [&](std::size_t task) {
+            std::uint64_t sum = 0;
+            const auto& buffer = experts[task / 3][task % 3];
+            const volatile std::uint8_t* p = buffer.first;
+            for (std::size_t k = 0; k < buffer.second; k += 4096) sum += p[k];
+            if (buffer.second != 0) sum += p[buffer.second - 1];
+            sink.fetch_add(sum, std::memory_order_relaxed);
+            if (remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) reads_completed = Clock::now();
+        }, [&](std::size_t task) { consume(task / 3, task % 3); });
+        return reads_completed - started;
     }
 
     // Host-side routed-expert FFN, shared by the standalone MoE op (when the

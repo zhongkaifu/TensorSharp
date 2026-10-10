@@ -56,3 +56,16 @@ jobs:
         run: >
           dotnet test InferenceWeb.Tests/InferenceWeb.Tests.csproj
           --filter "Category!=Bench&Requires!=Cuda&Requires!=Mlx&Requires!=Models"
+
+      - name: Run unified memory state and real-file pressure tests
+        run: >
+          dotnet run --project eng/tests/unified-memory/UnifiedMemory.Tests.csproj
+          -c Release -- --json artifacts/unified-memory/results.json
+
+      - name: Check native cache admission under concurrent allocation
+        run: |
+          mkdir -p artifacts/unified-memory
+          c++ -std=c++17 -O2 -pthread -I TensorSharp.GGML.Native TensorSharp.GGML.Native/tests/cache_budget_test.cpp -o artifacts/unified-memory/cache-budget-test
+          artifacts/unified-memory/cache-budget-test
+          c++ -std=c++17 -O2 -pthread -I TensorSharp.GGML.Native TensorSharp.GGML.Native/tests/shared_cache_budget_test.cpp -o artifacts/unified-memory/shared-cache-budget-test
+          artifacts/unified-memory/shared-cache-budget-test
