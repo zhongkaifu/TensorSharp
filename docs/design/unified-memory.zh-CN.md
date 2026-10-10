@@ -1455,6 +1455,94 @@ junction 存在 D 盘。未提交生成日志、报表或 upstream 改动。
 DeepSeek 新任务冷访问及上述上游数值缺口、全模型 KV/媒体/workspace 账本、
 较小共同 RAM+VRAM 硬预算、长上下文/并发和跨后端适配仍待继续。
 
+### 2026-10-10 UTC 续验：多模态计账、低预算和长上下文并发
+
+**默认状态没有变成全模型统一调度。** 已验证的局部缓存/图复用仍沿用默认策略；
+`GgmlCacheBudgetScope`、`AdaptiveModelSession`、主机 KV 分层和请求内存准入仍是显式入口。
+本轮扩展的是已接入分配的计账覆盖，不是全进程 RAM/VRAM 硬上限。
+
+新接入 Qwen-Image 2.1 的持久图、前缀 K/V、VAE context buffer，以及 MiniMax-H3
+十处执行/持久 context buffer 分配；释放也通过同一生命周期计账。Qwen-Image
+在共享额度不足时回收可重建的另一图槽，再进行一次有界重试。测试发现失败的
+ggml allocator 仍保留无 backing storage 的计划，直接重试会崩溃；TensorSharp
+现先销毁失败 allocator，再新建重试。未修改上游 ggml。
+
+真实权重来自固定 revision、逐文件 SHA-256 验证的 Qwen-Image 2.1 Q4_K_M、
+Qwen3-VL-8B Q4_K_M/F16 projector/BF16 VAE，以及 Unsloth MiniMax-H3 FL2VA Q4_K、
+32B Q4_K_M encoder、视频/音频 VAE 和固定 tokenizer。另修正 Qwen-Image 配置中
+把 Q4/F16 文件命名为 Q8/BF16 的错误，并使用可覆盖的跨平台模型目录。
+
+双 A40 VM 的多模态测试只使用一张卡；RAM cgroup 仍为 93.13 GiB、CPU 配额
+16.15 核。创建较小子 cgroup 被拒绝，因此**尚无较小 RAM 硬上限通过结论**。
+表中额度只约束已接入的 native 分配；RSS 与 GPU 实测不能与额度混称。
+
+| 场景 | 计账额度 GiB | 生成耗时 s | 计账峰值 GiB | 进程 RSS 峰值 GiB | GPU 峰值 GiB |
+|---|---:|---:|---:|---:|---:|
+| Qwen-Image 512²/20 步，连续两次，原预读入口 | 32 | 23.334 / 9.573 | 4.106 | 11.881 | 4.604 |
+| 相同请求，较小额度 | 8 | 18.507 / 9.423 | 4.106 | 11.773 | 4.612 |
+| 红壶改蓝壶，512²/20 步 | 8 | 25.976 | 6.078 | 12.703 | 6.808 |
+| H3 文生视频，256²/22 帧/8 步 | 32 | 40.328 | 15.673 | 16.280 | 16.341 |
+| 相同 H3 请求，较小额度 | 20 | 38.949 | 15.673 | 16.309 | 16.341 |
+| H3 256²/107 帧/4 步，数值覆盖 | 32 | 46.150 | 16.023 | 16.660 | 16.690 |
+| H3 图生视频，256²/22 帧/8 步 | 20 | 47.970 | 15.898 | 18.246 | 未采样 |
+
+首组矩阵与 sd.cpp 的 CPU 编译有重叠，耗时只作诊断，不能用于声称额度改变带来
+加速。峰值为采样下界。Qwen 两档额度的两次原始 F32 像素均逐字节相同；H3
+两档额度及修改前 native 控制的 22 帧和双声道 PCM 均逐字节相同。所有成功运行
+模型 Dispose 后计账归零。Qwen 4 GiB 额度在所需图不适配时明确失败，清理后
+active allocations 为零；这属于拒绝/回收验证，**不计为生成成功**。
+
+独立性能对照发现 Qwen-Image 自定义 DiT loader 绕过了通用并行预读。现接入
+相同的有界、容量检查及驻留页检查，`TS_QWEN21_DIT_PREFAULT=0` 可关闭；仍尊重
+`TS_GGUF_PREFAULT=0`。编译和其他服务退出后的 off/on/on/off 四个新进程测试：
+首请求平均 **22.20 → 15.18 s（-31.6%）**，去噪阶段均值 **14.027 → 7.058 s**，
+四次原始像素 SHA 完全相同，计账峰值不变。本地 RTX 3080 Laptop/32 GiB RAM
+的前后各两次测试也保持原始像素相同；最终两次为 20.152/16.501 s，RSS 峰值
+11.770 GiB、计账峰值 4.106 GiB；样本不足以声称本地稳定加速。
+
+最终 CLI 与未修改的 stable-diffusion.cpp 同权重、512²、20 步、seed 42、CFG 1、
+显式相同 sigma、每引擎两个新进程、交替串行测试：
+
+| 引擎 | 进程 wall 均值 s | 内部生成均值 s | 去噪均值 s | VAE 解码均值 s | GPU 峰值 GiB |
+|---|---:|---:|---:|---:|---:|
+| TensorSharp 最终预读 | 17.687 | 15.180 | 6.961 | 5.383 | 4.599 |
+| stable-diffusion.cpp | 9.465 | 7.870 | 6.370 | 0.685 | 8.923 |
+
+因此首次请求性能**仍未达基线**，剩余差距集中于加载/文本编码和首次 VAE 阶段。
+两边实际 GPU 占用不同，没有同一硬内存额度结论；sd.cpp RSS 采样不可用，保留为空。
+成图 RGBA PSNR 为 32.92 dB，像素不相同，不能据此判定谁是质量 ground truth。
+人工检查文生图符合红壶/木桌描述；改色完成但背景纹理与高光也变了，严格背景
+保留尚未通过。视频首末帧可辨识雪地行走狐狸；没有将有限值检查当作完整视听质量验收。
+
+Qwen3.8 IQ1_M 在双卡、context 16384 下，两个主题各约 **11266 prompt tokens**，
+串行/并发/错峰、串流交叠、精确标记任务、取消槽复用和后续健康检查通过。
+主题组端到端合计输出率分别为 **16.26/15.14/14.27 tokens/s**；日志明确
+`arena decode currently requires one device`，双卡仍逐序列 fused 执行，不能宣称
+双卡批量 decode 已完成。相同 HTTP 长提示的 llama.cpp 双槽控制为串行/并发
+**25.43/31.22 tokens/s**，未施加相同硬 RAM/VRAM 配额，也不是纯 decode 速度。
+本地 Gemma 4 12B QAT UD-Q4_K_XL 的相同短主题矩阵通过，日志观察到 batch width 2；
+主题串行/并发为 **38.31/62.71 tokens/s**，标记任务没有同等吞吐提升。
+
+这些自动测试只覆盖相关性、明显串话、标记与恢复。两模型的长篇答案在串行/
+并发之间并不逐字相同，不能宣称严格输出一致。人工复核发现 Qwen 并发 FF7
+回答称“神罗科学家爱丽丝”，与 [Square Enix 官方人物介绍](https://na.finalfantasy.com/titles/finalfantasy7)
+不符；该项事实质量未通过，不能被自动主题 PASS 覆盖。llama 的本轮截断回答
+未复现同一人物错误，不据此断言问题已解决或归因于量化。
+
+本轮验证：Windows 五项 Qwen native CPU/CUDA/VAE 测试通过；Linux 四项相应测试
+通过，其中 TP 使用 `NCCL_P2P_DISABLE=1`，不覆盖 VM 已知失效的默认 P2P。
+Windows 定向托管测试 193 通过、1 个无 fixture 的真实 companion 测试跳过。
+Linux H3 实际权重两项测试通过，含 640×384 下 22–124 帧有限值扫描及长片段
+去噪循环。GGML 仍为干净的 `ffa4e8b80930029a35991f94e7c8a93cd67730ab`；sd.cpp 为
+`f89d9b13d730eabeede7314ce49dacd18d3c90c2`，其 ggml 为
+`d25b121ce1d6ae0c7e62ad080460d9fc1e46dd93`。复用探针见
+`eng/validation/UnifiedMemory.MultimodalProbe/README.md`；生成证据在忽略的
+`artifacts/multimodal-budget-20261010/` 和 `artifacts/multimodal-budget-gemma-20261010/`。
+
+仍需完成：其余 executor/live KV/managed arrays/vendor workspace 的全模型计账；
+硬 RAM 限额和跨请求统一准入；更长上下文与多卡批量 decode；上述事实质量问题的
+独立数值定位；首次 VAE/加载延迟、更多 LoRA/遮罩/多参考及完整音频质量验收。
+
 ## 15. 后续实际接入与硬件验证入口
 
 `PagedKvStorage` 的 `Acquire` 返回有生命周期的 span 租约；`BatchExecutor` 的捕获、尾页刷新、恢复全部使用该 API。底层将一个页面视为不解释布局的可变资源，按原字节回写/恢复。前缀引用继续保留逻辑页，最后一个引用消失才注销；id 再次分配时增加 epoch。失败的释放不把页面放回 free queue。捕获 scratch 和固定搬运缓冲在启动时预留，单个模型必须能容纳一个合法完整快照页。恢复阶段可在有空闲驻留容量时预取下一页，与当前注入操作重叠；停止/回收前等待预取结束。
@@ -1473,7 +1561,7 @@ export TS_SCHED_KV_SPILL_DIRECTORY=/path/on/ssd/tensorsharp-kv
 
 `TensorSharp.GGML.GgmlCacheBudgetScope` 将原生 lazy device-copy 与显式 preload 接入这份托管预算。每个 rank 映射到一个或多个 pool；例如 UMA 同时约束 `node0/ram` 和 `node0/gpu0`，独立显卡只约束对应 GPU pool。必须在这些缓存首次分配前安装；原生预留、实际分配、commit 和物理释放依次持有同一额度。已有缓存或正在分配时拒绝接管；仍有额度或回调在途时拒绝卸载并保留托管回调，允许清理后重试。停止模型执行并清空原生缓存后再释放 scope。不要又在请求 envelope 中重复预留这些由适配器直接计费的字节。
 
-默认 scope 仍为 cache-only；可选 `includeGraphBuffers: true` 增加已接线的 context buffer 和 reuse graph arena，包括 Gemma/Qwen35 主要执行入口及 Qwen4Exp 的自有图 arena、循环状态和设备状态快照。Qwen4Exp batch arena 额度不足时不推进 holder，增加额度后可重试。未接线的 executor、部分 live KV/holder、backend pool、host-pointer wrapper 和 driver overhead 仍不包含，因此不是整个模型的硬 VRAM 上限。Qwen35/Gemma4 的显式文件权重模式通过各自 session 直接预留同一份 `MemoryBudget`；AdaptiveModelSession 同时启用覆盖到的 graph scope，保留实际拒绝而不改用不受限 fallback。接口用法见 [Memory README](../../TensorSharp.Memory/README.md) 和 [adaptive 入口](../../eng/validation/AdaptiveMemoryProbe/README.md)。
+默认 scope 仍为 cache-only；可选 `includeGraphBuffers: true` 增加已接线的 context buffer 和 reuse graph arena，包括 Gemma/Qwen35 主要执行入口、Qwen4Exp 的自有图 arena/循环状态/设备快照、Qwen-Image 2.1 的图/前缀/VAE buffer 及 MiniMax-H3 的已接线执行 buffer。Qwen4Exp batch arena 额度不足时不推进 holder，增加额度后可重试。未接线的 executor、部分 live KV/holder、backend pool、host-pointer wrapper 和 driver overhead 仍不包含，因此不是整个模型的硬 VRAM 上限。Qwen35/Gemma4 的显式文件权重模式通过各自 session 直接预留同一份 `MemoryBudget`；AdaptiveModelSession 同时启用覆盖到的 graph scope，保留实际拒绝而不改用不受限 fallback。接口用法见 [Memory README](../../TensorSharp.Memory/README.md) 和 [adaptive 入口](../../eng/validation/AdaptiveMemoryProbe/README.md)。
 
 四参数 scope 的 `hostPools` 可将紧凑专家文件读取 arena 和 DeepSeek 按路由读取的暂存接入同一账本的 RAM pool，独立于 rank 的 GPU 映射。
 与其他 RAM owner 原子竞争额度，先准入再分配，物理释放后归还；增长前先释放旧 arena，避免双份暂存。

@@ -14,7 +14,8 @@ namespace TensorSharp.GGML;
 /// UMA applies two constraints to one allocation, not two physical copies.
 /// With includeGraphBuffers=true, additionally charge the explicitly routed
 /// TensorSharp-owned context buffers and shared reuse graph allocators, including
-/// Qwen4Exp graph arenas, recurrent state and device state snapshots. Buffers
+/// Qwen4Exp graph arenas, recurrent state and device state snapshots, Qwen-Image
+/// retained graphs/prefix storage, and MiniMax-H3 execution buffers. Buffers
 /// retain their original native backend interfaces. Other allocator paths, live KV
 /// outside these buffers, host-pointer wrappers, backend pools, allocator rounding
 /// and driver overhead are not covered; this is not a whole-model memory cap.
