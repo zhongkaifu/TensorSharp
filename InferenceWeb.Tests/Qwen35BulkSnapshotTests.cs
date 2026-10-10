@@ -11,10 +11,18 @@ public sealed class Qwen35BulkSnapshotTests
 
     [CudaFact("TS_TEST_MODEL_DIR", Pattern, GgmlBackend = BackendType.GgmlCuda)]
     public void BulkRestoreMatchesEverySnapshotByteAndEveryDecodeLogitOfSerialRestore()
+        => CheckRestore(Pattern);
+
+    [CudaFact("TS_TEST_MODEL_DIR", "Qwen3.8-27B-UD-IQ4_XS", GgmlBackend = BackendType.GgmlCuda)]
+    public void OmittedDraft27BMatchesEverySnapshotByteAndEveryDecodeLogit()
+        => CheckRestore("Qwen3.8-27B-UD-IQ4_XS");
+
+    private static void CheckRestore(string pattern)
     {
-        string path = TestGates.FindGguf(Environment.GetEnvironmentVariable("TS_TEST_MODEL_DIR"), Pattern);
+        string path = TestGates.FindGguf(Environment.GetEnvironmentVariable("TS_TEST_MODEL_DIR"), pattern);
         using var model = (Qwen35Model)ModelBase.Create(path, BackendType.GgmlCuda, 1, null, null, 1, null,
-            new ModelMemoryPolicy(128, 16));
+            new ModelMemoryPolicy(128, 16) { OmitEmbeddedDraftWeights = true });
+        Assert.True(model.SupportsCrossSequenceKvReuse);
         int[] tokens = model.Tokenizer.Encode(string.Concat(Enumerable.Repeat(
             "The archive lists rivers, forests and mountains in alphabetical order. ", 8)), addSpecial: false).Take(52).ToArray();
         Assert.Equal(52, tokens.Length);

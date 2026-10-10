@@ -149,10 +149,18 @@ public sealed class GgmlGraphBudgetScopeTests
                 Assert.Equal(256, budget.Snapshot().Single().Committed);
                 Assert.Equal(0, budget.Snapshot().Single().Reserved);
                 Assert.Equal(IntPtr.Zero, native.Allocate(0, 1));
+                var refused = scope.AllocationRefusals;
+                Assert.Equal(1, refused.Count);
+                Assert.Equal(refused.First, refused.Last);
+                Assert.Equal(2, refused.First!.Kind);
+                Assert.True(refused.First.Bytes > 0);
+                Assert.All(refused.First.RemainingEnvelope!, charge => Assert.Equal(0, charge.Bytes));
+                Assert.Equal(256, Assert.Single(refused.First.Budget).Committed);
             }
             finally { if (buffer != IntPtr.Zero) native.Free(buffer); }
             Assert.Equal(256, budget.Snapshot().Single().Reserved);
             Assert.Equal(0, budget.Snapshot().Single().Committed);
+            Assert.All(scope.AllocationRefusals.First!.RemainingEnvelope!, charge => Assert.Equal(0, charge.Bytes));
         }
         Assert.Null(scope.CallbackError);
     }

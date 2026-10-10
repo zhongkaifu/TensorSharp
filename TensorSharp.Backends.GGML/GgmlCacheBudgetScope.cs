@@ -12,6 +12,12 @@ namespace TensorSharp.GGML;
 /// constraint pools. Pending bytes are reservations, not proven allocations.</summary>
 public sealed record GgmlAllocationUsage(int Rank, int Kind, int Allocations, long PendingBytes, long CommittedBytes);
 
+/// <summary>A refused allocation is ordinary pressure, separate from a callback
+/// error. RemainingEnvelope is null outside a request. Observations are diagnostic,
+/// not reusable capacity; other owners can change immediately after the callback.</summary>
+public sealed record GgmlAllocationRefusal(int Rank, int Kind, long Bytes,
+    IReadOnlyList<MemoryCharge>? RemainingEnvelope, IReadOnlyList<MemoryPoolSnapshot> Budget);
+
 /// <summary>Opt-in, process-wide budget ownership for new GGML lazy device-copy
 /// and explicit-preload cache allocations. Install before those allocations exist.
 /// Each rank maps to one or more existing budget pools; listing RAM and GPU for
@@ -59,6 +65,12 @@ public sealed class GgmlCacheBudgetScope : IDisposable
     private bool _disposed;
     private bool _disposing;
     private BudgetReservation? _executionEnvelope;
+    private long _allocationRefusalCount;
+    private GgmlAllocationRefusal? _firstAllocationRefusal, _lastAllocationRefusal;
+
+    /// <summary>Bounded failure telemetry: no growing event log or successful-allocation sampling.</summary>
+    public (long Count, GgmlAllocationRefusal? First, GgmlAllocationRefusal? Last) AllocationRefusals
+    { get { lock (_gate) return (_allocationRefusalCount, _firstAllocationRefusal, _lastAllocationRefusal); } }
 
     public GgmlCacheBudgetScope(MemoryBudget budget, IEnumerable<IEnumerable<string>> rankPools)
         : this(budget, rankPools, includeGraphBuffers: false) { }
@@ -201,7 +213,15 @@ public sealed class GgmlCacheBudgetScope : IDisposable
                 var charges = pools.Select(pool => new MemoryCharge(pool, bytes));
                 reservation = owner._executionEnvelope == null ? owner._budget.TryReserve(charges)
                     : owner._executionEnvelope.TryTake(charges);
-                if (reservation == null) return 0;
+                if (reservation == null)
+                {
+                    var refusal = new GgmlAllocationRefusal(rank, kind, bytes,
+                        owner._executionEnvelope?.Charges, owner._budget.Snapshot());
+                    owner._allocationRefusalCount++;
+                    owner._firstAllocationRefusal ??= refusal;
+                    owner._lastAllocationRefusal = refusal;
+                    return 0;
+                }
                 ulong token = checked(++owner._nextToken);
                 owner._allocations.Add(token, new(reservation, rank, kind, bytes));
                 return token;

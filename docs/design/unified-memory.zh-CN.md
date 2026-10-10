@@ -1951,6 +1951,96 @@ Windows DLL为`45f8cd7546fa7639c1dc50f0fc668e5f303856d47fb2aa7fb387cffb38631c21`
 scratch、driver/vendor内存的可执行归属策略；物理限额下的准入峰值保证；真实模型
 spill、长期取消/公平性，以及其它模型、多模态、TP/MTP/holder路径的回归资格。
 
+### 本机多模型、Qwen 峰值修复与跨平台边界：2026-10-10
+
+VM 已关闭，本轮仅在 Windows 11、i7-11800H（8核16线程）、32 GiB RAM、
+RTX 3080 Laptop 16 GiB 上验证。模型来自 `C:\Works\models`。C: 空间不足，
+证据/换页通过忽略目录的 junction 放在 D: USB HDD；不是 SSD/NVMe 吞吐成绩。
+
+**跨平台实现**：主机观测移入独立的 `TensorSharp.Memory.HostMemoryInfo`，
+不再由 CUDA 模型类持有 Windows/Linux 实现。Windows 保留物理内存观测，Linux
+保留可见 cgroup 约束。macOS 新增 `hw.memsize`、Mach VM 页计数；iOS/Mac
+Catalyst 再取应用剩余额度的较小值。free 已含 speculative，不重复相加；不把
+inactive/dirty/compressed 全当作空闲，应用额度为零不当作无限。模型文件预热
+共用该入口。MLX 默认 wired ceiling 修复 `Max` 与预留空间策略相反的问题，
+并停止使用 GC 堆额度冒充物理 RAM。依据见 [Apple 应用内存说明](https://developer.apple.com/documentation/os/os_proc_available_memory)
+和 [XNU VM ABI](https://github.com/apple-oss-distributions/xnu/blob/main/osfmk/mach/vm_statistics.h)。
+
+预算、准入、归属和主机 KV 换页只依赖 pool、字节量与执行能力；cgroup/MPS
+仅是外部验收工具，不是运行依赖。UMA 必须由后端/硬件报告，不能按 OS 名称
+猜测；同一设备分配可同时受 RAM/GPU working-set 约束，不算成两份物理存储。
+iOS spill 必须使用应用可写目录，不假设桌面路径或无限后台运行时间。
+未知容量/执行能力必须拒绝。
+
+Apple 计数解释、4K/16K页、零额度、错误输入与 ABI 布局已在 Windows 测试；
+**Apple 原生 API、AOT、Metal/MLX 模型执行尚未验收**。`AdaptiveModelSession`
+仍是 dense single-CUDA 适配器。主机提供者覆盖不等于执行适配；其他后端需要
+自己的分配回调、工作区测量和 UMA 准入，不能直接套用 CUDA 布局/峰值。
+
+**真实 Qwen3.8 27B 发现的三个问题已经修复**：
+
+- GGUF 含尾部 NextN 层，原先即使主干不加载这些层也会被拒绝。Adaptive 现在
+  固定仅主干的 `ModelMemoryPolicy`，规划与加载用同一排除规则；按实际主干
+  层数/权重计账，环境改变不能追加未计账草稿。活跃推测解码仍拒绝。普通直接
+  API 保留原有行为。省略 MTP 的 dense CUDA trunk 可恢复主机快照；活跃 MTP、
+  MoE、TP 和 NextN 文件 streaming 仍未在此适配器验收。
+- hidden=5120、heads=24、显式 head dimension=256 是合法布局。移除错误的
+  整除限制，工作区按真实投影宽度估算。没有显式维度且无法整除仍拒绝。
+- 漏算与 prefill 同时保留的整模型 decode 图。实际拒绝：申请 **204,816,640 B**，
+  请求剩余 **150,915,584 B**，全局却有 **1,307,242,496 B** 可用，触发慢速
+  per-op 回退。现按层数、投影宽度、循环状态、上下文预留 decode 图；未提高
+  调用者预算、借其他请求额度或绕过计账。新增有界 `NativeAllocationRefusals`
+  记录总次数/首末拒绝及当时额度；普通压力与 callback 错误分开。
+
+Qwen 的同一786-token×2、32-token输出，逻辑 RAM/GPU/spill 为8/15/4 GiB：
+修复前 wall **27.23 s**、decode **2.93–3.06 tok/s**；修复后首次 **10.93 s、
+13.91–14.59 tok/s**，对照11.15 s。实际最大running=2、拒绝=0。反序复测如下。
+
+表格为普通 **TensorSharp resident → shared candidate**，不是 llama.cpp。
+每arm新进程，含冷图构建，F16 KV、输出32 tokens；速率范围来自两请求各自
+forward 时间，wall包含调度/恢复。Gemma4K chunk256，其余chunk128。
+Gemma长请求受SWA恢复窗口限制，max-running=1排队；仅Qwen此行实际running=2。
+
+| 本机模型/实际输入 | wall s | prefill tok/s | decode tok/s | 峰值 RSS GiB | 采样整卡 VRAM GiB |
+| --- | --- | --- | --- | --- | --- |
+| Gemma E4B Q8_0，3519×2 | 4.036→4.211（+4.34%） | 2423–2757→2197–2748 | 48.96–49.21→48.19–48.46 | 8.867→8.905 | 9.133→9.133 |
+| Gemma12B UD-Q4_K_XL，3523×2 | 8.420→8.038（−4.54%） | 1000–1121→1040–1212 | 35.96–37.02→36.24–37.30 | 8.636→8.675 | 9.713→9.713 |
+| Qwen3.8 27B UD-IQ4_XS，786×2 | 10.816→11.407（+5.47%） | 288–297→270–285 | 14.26–14.49→13.93–14.09 | 14.581→14.573 | 15.214→15.205 |
+| Gemma E4B Q8_0，28023×2、32K配置 | 32.485→32.368（−0.36%） | 1764–1852→1770–1864 | 43.93–44.72→42.21–43.66 | 8.867→8.906 | 9.530→9.530 |
+
+四行token完全一致、计数前缀正确、原生拒绝0、释放后账本归零。Gemma E4B
+4K正序/反序仍有 **+6.12%/+4.34%** 冷启动wall开销，主要集中第一请求prefill；
+Qwen修复后两次约 **−2.0%/+5.5%**，不能宣布稳定零开销。模型加载、页面缓存、
+频率和其他进程未受统一控制；构建重叠的初期探索测量不作吞吐结论。
+Gemma逻辑RAM/GPU为8/12 GiB，Qwen为8/15 GiB；Qwen ledger RAM最大owned/
+committed约3.03/1.35 GiB，GPU约14.28/13.15 GiB，SSD为0。RSS达14.57 GiB，
+高于8 GiB RAM额度，说明映射、GC/运行库、driver等仍未受同一物理硬限约束。
+RSS、映射、GC和native payload重叠，不能相加；VRAM采样可能漏瞬时峰值。
+
+另行完成强制文件换页 replay（自动驻留引擎arm的spill仍为0）：
+
+| 模型/后端 | spill/load | 字节一致恢复 | 完整 logits 比较数 | 最大绝对误差 |
+| --- | --- | --- | --- | --- |
+| Gemma12B UD-Q4_K_XL / CUDA | 2/8 | 6 | 12,582,912 | 0 |
+| Gemma E4B Q8_0 / CPU | 2/8 | 6 | 6,291,456 | 0 |
+
+两份历史各恢复三次，logits有限、argmax差异0、最后总账归零。CPU验证共享主机
+KV/文件层，不表示CUDA Adaptive模型分配器已经移植到CPU。Qwen27B另通过真实
+CUDA普通/连续恢复全快照字节和四步完整logits一致性测试，缺0.8B模型的一项跳过。
+相关回归最终 **464通过/6跳过**；首轮能力测试把已省略MTP仍当活跃MTP，补充
+显式状态覆盖后通过。缺模型/设备、Apple真机均未计作通过。
+
+本轮未改原生或ggml源文件。上游树干净，revision仍为
+`ffa4e8b80930029a35991f94e7c8a93cd67730ab`；Windows DLL SHA-256仍为
+`45f8cd7546fa7639c1dc50f0fc668e5f303856d47fb2aa7fb387cffb38631c21`。
+证据、失败记录、模型/程序集指纹和报表在忽略的
+`artifacts/portable-memory-20261010/`，不提交Git。
+
+**共享预算仍显式开启**。剩余验收包括完整物理归属/跨平台硬限、Apple执行适配
+与真机、长上下文真正并发、短冷启动开销、长期取消/公平性、跨引擎回收，以及
+更多MoE/多模态/MTP/TP场景。旧VM的Linux结果属于历史，不能算当前提交的新
+验收；短计数/恢复一致性也不能代替全面语义质量基准。
+
 ## 15. 后续实际接入与硬件验证入口
 
 `PagedKvStorage` 的 `Acquire` 返回有生命周期的 span 租约；`BatchExecutor` 的捕获、尾页刷新、恢复全部使用该 API。底层将一个页面视为不解释布局的可变资源，按原字节回写/恢复。前缀引用继续保留逻辑页，最后一个引用消失才注销；id 再次分配时增加 epoch。失败的释放不把页面放回 free queue。捕获 scratch 和固定搬运缓冲在启动时预留，单个模型必须能容纳一个合法完整快照页。恢复阶段可在有空闲驻留容量时预取下一页，与当前注入操作重叠；停止/回收前等待预取结束。
@@ -1983,7 +2073,7 @@ DeepSeek 暂存随模型销毁释放；紧凑 arena 可在空缓存 trim 时释�
 
 硬件验证工具：[UnifiedMemory.CudaProbe](../../eng/validation/UnifiedMemory.CudaProbe/README.md)。它在每个选中 GPU 上实际执行整数内核，检查全量结果、事件生命周期、VRAM/RAM 压力下的 SSD 恢复、16 个并发读取者、逐方向 GPU 复制、部分工作集回滚与所有 rank fence。指定 P2P 却未走 peer 路径时返回失败；没有驱动或设备时返回 unavailable，不算通过。
 
-此前旧 VM 在文件权重续验时连接被拒绝，当时仅使用本机 CUDA；当前已切换至 `69.30.85.216:22101` 并完成上述双 A40 验证。历史 unavailable 与各部署的通过/失败分别记录，不能混算。生成的日志、JSON、TRX、模型探针输出保留在忽略的 `artifacts/unified-memory/`、`artifacts/unified-memory-continuation/`、`artifacts/unified-memory-gemma/`、`artifacts/new-vm-20261009/` 和本轮 `artifacts/vm216-20261009/`，不提交 Git。
+此前旧 VM 在文件权重续验时连接被拒绝，随后 `69.30.85.216:22101` 完成上述双 A40 验证；该 VM 现已关闭，最新一轮仅在本机验证。历史 unavailable 与各部署的通过/失败分别记录，不能混算。生成的日志、JSON、TRX、模型探针输出保留在忽略的 `artifacts/unified-memory/`、`artifacts/unified-memory-continuation/`、`artifacts/unified-memory-gemma/`、`artifacts/new-vm-20261009/` 和本轮 `artifacts/vm216-20261009/`，不提交 Git。
 
 ## 16. 外部工程依据
 

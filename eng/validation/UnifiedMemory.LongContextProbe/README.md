@@ -94,6 +94,13 @@ rank/kind (0: lazy device copy, 1: preloaded weights, 2: graph/context buffer,
 3: native host staging), counting each payload once even with multiple constraint
 pools. Uninstrumented allocator/driver overhead is still outside the ledger.
 
+`Samples[].NativeRefusals` records a count and the first/last refused native
+allocation, including its requested bytes, remaining request envelope and pool
+snapshot. A request may finish correctly after falling back to a slower graph;
+token parity alone does not pass performance acceptance. Inspect these refusals
+and fallback logs even when `Passed` is true. Captured capacities are diagnostic
+observations, not reusable credit. The event history is bounded to two records.
+
 Under MPS, CUDA can return whole-device total with client-limited free memory.
 The probe therefore leaves `CudaDeviceUsedBytes` null and records the raw
 `CudaAvailability` instead. Whole-device occupancy requires independent NVML or

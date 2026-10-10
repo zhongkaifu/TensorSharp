@@ -22,6 +22,7 @@ pipelines still need the execution adapters described in
 | `SsdSpillStore` | Private process-lifetime files, quota, atomic publication, SHA-256 validation of restored mutable state |
 | `MemoryRequestQueue` | Bounded FIFO queue; full declared request-peak reservation; cancellation; explicit pressure instead of overcommit |
 | `HostMemoryBackend` | Actual native host allocations and copies |
+| `HostMemoryInfo` | Model/backend-independent host observations: Windows physical RAM, Linux visible cgroup hierarchy, macOS free/purgeable RAM, iOS/Mac Catalyst app allowance |
 | `CudaResidencyBackend` / `CudaExecutionFence` | CUDA allocations, completion events and bounded host-staged multi-GPU copy; exercised on two A40s, direct P2P failed independent machine checks |
 | Runtime `PagedKvStorage` | Actual capture/inject path uses scoped leases, bounded native scratch, SSD restore and best-effort next-page prefetch |
 | Runtime `RequestMemoryAdmission` | Full peak reservation before prefix materialization, retained through physical release; budget/command wakeups instead of polling |
@@ -356,6 +357,44 @@ for anonymous-memory exhaustion. Active, dirty, mapped, shared and unevictable
 pages are excluded; v2 requires a verified leaf with protection counters. The
 same leaf credit is bounded by every visible ancestor and `/proc/meminfo`.
 These observations remain forecasts with safety headroom, not atomic OS quotas.
+
+## Platform boundaries
+
+`HostMemoryInfo.Capture()` lives in the model-independent memory assembly and
+does not initialize CUDA or MLX. Windows and Linux use their existing physical
+memory/cgroup providers. macOS uses `hw.memsize` and Mach VM counters; iOS and
+Mac Catalyst also cap availability by `os_proc_available_memory()`. Apple free
+pages already include speculative pages. Inactive/dirty/compressed pages are
+not assumed free, and zero app allowance grants zero new capacity. These are
+conservative observations, not Jetsam protection or a process hard limit.
+
+The ledger, residency scheduler, host KV paging, request admission and planner
+use byte counts and capability/pool mappings, not a particular OS quota API.
+UMA adapters must charge device allocations to physical RAM and the device
+working-set constraint without inventing a second physical allocation. Linux
+cgroups and CUDA MPS are optional external validation tools, never runtime
+requirements. Other platforms need their own hard-limit acceptance evidence.
+
+Host observation support does not qualify every executor: `AdaptiveModelSession`
+still requires the single-CUDA dense adapter. Metal/MLX and iOS execution need
+their own allocation hooks and measured workspace/UMA adapters before adopting
+this entry point. Shared budgets remain explicit. Apple P/Invoke and real model
+execution must be exercised on Apple hosts; Windows arithmetic/ABI tests alone
+do not constitute Apple runtime acceptance.
+
+For Qwen checkpoints with trailing NextN layers, adaptive loading fixes a
+trunk-only `ModelMemoryPolicy` before construction. The geometry excludes the
+same draft tensors and layers as the loader; active speculation is refused.
+Resident execution and host snapshots may use this omitted-draft trunk.
+NextN file streaming remains unqualified and is rejected. Direct callers without
+this policy retain the existing learned-draft loading behavior.
+
+Qwen geometry accepts an explicit attention head dimension independently of
+embedding width. Its request forecast includes the retained capture-safe decode
+graph alongside prefill scratch and live state: the decoder keeps per-layer
+activation slots, so a one-layer scratch estimate can force slow fallback even
+with free global budget. `NativeAllocationRefusals` exposes bounded diagnostic
+evidence for this distinction without treating normal pressure as a callback error.
 
 ## Ownership and failure rules
 

@@ -21,4 +21,7 @@ public sealed record ModelMemoryPolicy
 
     public int ContextTokens { get; }
     public int PrefillChunkTokens { get; }
+    /// <summary>The admitted graph contains only the trunk. Resolve before
+    /// loading so later environment changes cannot add unaccounted draft weights.</summary>
+    public bool OmitEmbeddedDraftWeights { get; init; }
 }

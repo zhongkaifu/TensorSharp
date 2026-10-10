@@ -25,6 +25,8 @@ internal sealed record DenseMemoryProfile(InferenceModelMemory Model, long Fusio
     internal long ResidentHostWeightBytes { get; init; }
     internal long RetainedMappedWeightBytes { get; init; }
     internal bool RetainsSlidingWindowPrefill { get; init; }
+    internal long AttentionProjectionWidth { get; init; }
+    internal int RetainedDecodeGraphLayers { get; init; }
 
     internal InferenceMemoryBytes RequestPeak(int context, int chunk, bool streaming)
     {
@@ -53,7 +55,7 @@ internal sealed record DenseMemoryProfile(InferenceModelMemory Model, long Fusio
         // Include logits, both FFN branches, residual/projection scratch and a
         // materialized attention score matrix even if flash attention avoids it.
         // Existing graph/host pools also retain slabs between invocations.
-        long perToken = checked(4 * checked(2 * Intermediate + 16 * Hidden + Heads * context));
+        long perToken = checked(4 * checked(2 * Intermediate + 16 * Math.Max(Hidden, AttentionProjectionWidth) + Heads * context));
         long bytes = checked((64L << 20) + chunk * perToken + Vocab * 4);
         long sliding = 0, largestExtended = 0;
         if (RetainsSlidingWindowPrefill && chunk > 1)
@@ -68,11 +70,18 @@ internal sealed record DenseMemoryProfile(InferenceModelMemory Model, long Fusio
                 largestExtended = Math.Max(largestExtended, checked(rows * kv.BytesPerToken));
             }
         sliding = checked(sliding + 2 * largestExtended);
-        return new(checked(bytes + sliding), checked(bytes + sliding));
+        // Qwen's capture-safe decode context keeps distinct per-layer activation
+        // and recurrent-output slots (it cannot use the generic one-layer reuse
+        // allocator). That graph can coexist with retained prefill workspace and
+        // live KV/state. Account it on device even during the prefill phase, so a
+        // later graph build does not exhaust a successfully admitted envelope.
+        long decodeGraph = RetainedDecodeGraphLayers == 0 ? 0 : checked((64L << 20)
+            + RetainedDecodeGraphLayers * perToken + Vocab * 4 + Model.RecurrentStatePerSequence.Device);
+        return new(checked(bytes + sliding), checked(bytes + sliding + decodeGraph));
     }
 
     internal static DenseMemoryProfile Read(GgufFile file, AdaptiveModelMemoryOptions options,
-        bool retainHostQuantizedWeights = false)
+        bool retainHostQuantizedWeights = false, bool omitEmbeddedDraftWeights = false)
     {
         string? arch = file.GetString("general.architecture");
         if (arch is not ("gemma4" or "qwen35"))
@@ -93,10 +102,15 @@ internal sealed record DenseMemoryProfile(InferenceModelMemory Model, long Fusio
             return number;
         }
         int layers = checked((int)Int("block_count"));
-        if (layers <= 0 || Int("expert_count") != 0 || Int("expert_used_count") != 0 || Int("nextn_predict_layers") != 0)
-            throw new NotSupportedException("Adaptive dense loading requires a nonempty decoder with no experts or draft blocks.");
+        int nextnLayers = checked((int)Int("nextn_predict_layers"));
+        if (layers <= 0 || Int("expert_count") != 0 || Int("expert_used_count") != 0
+            || (nextnLayers > 0 && (arch != "qwen35" || !omitEmbeddedDraftWeights || nextnLayers >= layers)))
+            throw new NotSupportedException("Adaptive dense loading requires a nonempty dense trunk; embedded Qwen draft layers must be explicitly omitted by the loading policy.");
+        layers -= nextnLayers; // Qwen block_count includes trailing NextN layers.
+        var activeTensors = file.Tensors.Values.Where(t => nextnLayers == 0
+            || !Qwen35Model.IsEmbeddedMtpWeight(t.Name, layers, nextnLayers)).ToArray();
         long hidden = Int("embedding_length"), heads = Int("attention.head_count");
-        if (hidden <= 0 || heads <= 0 || hidden % heads != 0)
+        if (hidden <= 0 || heads <= 0)
             throw new NotSupportedException("Unknown attention geometry.");
         long intermediate = Int("feed_forward_length");
         if (intermediate <= 0) throw new NotSupportedException("Missing feed-forward geometry.");
@@ -108,7 +122,7 @@ internal sealed record DenseMemoryProfile(InferenceModelMemory Model, long Fusio
         long weights = 0, small = 0, largest = 0, sourceWeights = 0, residentHost = 0, mapped = 0;
         long quantFusion = 0, floatFusionPeak = 0, conversionPeak = 0, extraDevice = 0;
         var storedBytes = new Dictionary<string, long>(StringComparer.Ordinal);
-        foreach (var tensor in file.Tensors.Values)
+        foreach (var tensor in activeTensors)
         {
             if (tensor.Shape.Length == 0 || tensor.Shape.Any(d => d == 0 || d > int.MaxValue)
                 || tensor.Name.Contains("_exps.", StringComparison.Ordinal)
@@ -139,7 +153,7 @@ internal sealed record DenseMemoryProfile(InferenceModelMemory Model, long Fusio
         }
         // Padded device rows and the additional K-as-V projection in Gemma can
         // make the device representation larger than its original file span.
-        long padding = checked(file.Tensors.Count * (64L << 10));
+        long padding = checked(activeTensors.Length * (64L << 10));
         // Ordinary fused projections replace source matrices before preload;
         // Qwen's quantized recurrent input pack retains its separate sources;
         // its F32 packing branch replaces them like ordinary projections.
@@ -147,7 +161,7 @@ internal sealed record DenseMemoryProfile(InferenceModelMemory Model, long Fusio
         var kv = new List<InferenceKvCache>();
         var recurrentLayers = new bool[layers];
         var sharedLayers = new bool[layers];
-        long recurrent = 0;
+        long recurrent = 0, attentionWidth = hidden;
         if (arch == "gemma4")
         {
             bool[]? local = file.GetBoolArray($"{arch}.attention.sliding_window_pattern");
@@ -203,10 +217,13 @@ internal sealed record DenseMemoryProfile(InferenceModelMemory Model, long Fusio
         {
             long count = Int("attention.head_count_kv", checked((uint)heads));
             long key = Int("attention.key_length"), value = Int("attention.value_length");
+            if (key == 0 && value == 0 && hidden % heads != 0)
+                throw new NotSupportedException("Qwen requires an explicit head dimension when embedding width is not divisible by head count.");
             // Match ModelConfig.HeadDim and Qwen35.InitCaches: both K and V
             // allocate the same head dimension, even if the two metadata lengths
             // differ. A value-only checkpoint also uses that value for both.
             long headDimension = key > 0 ? key : value > 0 ? value : hidden / heads;
+            attentionWidth = checked(heads * headDimension);
             int interval = checked((int)Int("full_attention_interval", 4));
             if (interval <= 0) throw new NotSupportedException("Invalid recurrent layer interval.");
             var layerTypes = file.GetStringArray($"{arch}.layer_types");
@@ -252,9 +269,9 @@ internal sealed record DenseMemoryProfile(InferenceModelMemory Model, long Fusio
         try
         {
             if (arch == "gemma4") Gemma4Model.ValidateStreamingWeightMetadata(arch, BackendType.GgmlCuda,
-                1, 1, 0, 0, null!, file.Tensors.Values);
+                1, 1, 0, 0, null!, activeTensors);
             else Qwen35Model.ValidateStreamingWeightMetadata(arch, BackendType.GgmlCuda,
-                1, 1, 0, 0, null!, file.Tensors.Values);
+                1, 1, 0, nextnLayers, null!, activeTensors);
         }
         catch (NotSupportedException ex) { refusal = ex.Message; }
         return new(new()
@@ -265,6 +282,8 @@ internal sealed record DenseMemoryProfile(InferenceModelMemory Model, long Fusio
         {
             SourceWeightBytes = sourceWeights, ResidentHostWeightBytes = residentHost,
             RetainedMappedWeightBytes = mapped,
+            AttentionProjectionWidth = attentionWidth,
+            RetainedDecodeGraphLayers = arch == "qwen35" ? layers : 0,
             RetainsSlidingWindowPrefill = arch == "gemma4"
         };
 

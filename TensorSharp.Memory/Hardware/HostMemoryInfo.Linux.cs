@@ -6,17 +6,17 @@ using System.Globalization;
 using System.IO;
 using System.Linq;
 
-namespace TensorSharp.Models;
+namespace TensorSharp.Memory;
 
-/// <summary>Linux host availability constrained by this process's visible memory
-/// cgroup hierarchy. This is an observation for admission forecasts, not an atomic
-/// reservation. A cgroup namespace can hide further ancestors; their usage cannot
-/// be discovered through the namespace-private filesystem. Visible ancestors are
-/// all checked. Observed clean, unmapped inactive file cache may be reclaimed;
-/// active/mapped/dirty/unevictable pages are not treated as free. Missing optional
-/// cache details give no credit; read/parse failures never mean unlimited capacity.</summary>
-internal static class HostMemoryAvailability
+public static partial class HostMemoryInfo
 {
+    /// <summary>Linux host availability constrained by this process's visible memory
+    /// cgroup hierarchy. This is an observation for admission forecasts, not an atomic
+    /// reservation. A cgroup namespace can hide further ancestors; their usage cannot
+    /// be discovered through the namespace-private filesystem. Visible ancestors are
+    /// all checked. Observed clean, unmapped inactive file cache may be reclaimed;
+    /// active/mapped/dirty/unevictable pages are not treated as free. Missing optional
+    /// cache details give no credit; read/parse failures never mean unlimited capacity.</summary>
     internal static (long Total, long Available) CaptureLinux() => ReadLinux(File.ReadAllText);
 
     // A pure filesystem seam keeps parsing tests independent of the test host's

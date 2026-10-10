@@ -1,6 +1,6 @@
 // Copyright (c) Zhongkai Fu. Licensed under the BSD-3-Clause license.
 using System.Globalization;
-using TensorSharp.Models;
+using TensorSharp.Memory;
 using Xunit;
 
 namespace InferenceWeb.Tests;
@@ -207,7 +207,7 @@ public sealed class HostMemoryAvailabilityTests
     public void PermissionFailureCannotBeMistakenForAnAbsentController()
     {
         var f = V2("/job"); Limit(f, "/cg/job", GiB, 0);
-        IOException error = Assert.Throws<IOException>(() => HostMemoryAvailability.ReadLinux(path =>
+        IOException error = Assert.Throws<IOException>(() => HostMemoryInfo.ReadLinux(path =>
             path == "/cg/job/memory.current" ? throw new UnauthorizedAccessException("test") : Get(f, path)));
         Assert.IsType<UnauthorizedAccessException>(error.InnerException);
     }
@@ -251,5 +251,5 @@ public sealed class HostMemoryAvailabilityTests
     }
     private static string Get(Dictionary<string, string> f, string path) => f.TryGetValue(path, out string? value)
         ? value : throw new FileNotFoundException("fixture path missing", path);
-    private static (long Total, long Available) Read(Dictionary<string, string> f) => HostMemoryAvailability.ReadLinux(path => Get(f, path));
+    private static (long Total, long Available) Read(Dictionary<string, string> f) => HostMemoryInfo.ReadLinux(path => Get(f, path));
 }

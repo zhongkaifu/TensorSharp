@@ -4,7 +4,6 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
-using System.Runtime.InteropServices;
 using TensorSharp.GGML;
 using TensorSharp.Memory;
 using TensorSharp.Memory.Planning;
@@ -50,30 +49,7 @@ public readonly record struct InferenceHardwareMemory(long HostTotal, long HostA
         return new(host.Total, host.Available, total, free);
     }
 
-    internal static (long Total, long Available) CaptureHost()
-    {
-        if (OperatingSystem.IsWindows())
-        {
-            var status = new MemoryStatus { Length = (uint)Marshal.SizeOf<MemoryStatus>() };
-            if (!GlobalMemoryStatusEx(ref status))
-                throw new IOException("GlobalMemoryStatusEx could not read physical memory.");
-            return (checked((long)status.TotalPhysical), checked((long)status.AvailablePhysical));
-        }
-        if (OperatingSystem.IsLinux())
-            return HostMemoryAvailability.CaptureLinux();
-        throw new PlatformNotSupportedException("An available-physical-memory provider is required for this host.");
-    }
-
-    [StructLayout(LayoutKind.Sequential)]
-    private struct MemoryStatus
-    {
-        public uint Length, Load;
-        public ulong TotalPhysical, AvailablePhysical, TotalPageFile, AvailablePageFile,
-            TotalVirtual, AvailableVirtual, AvailableExtendedVirtual;
-    }
-    [DllImport("kernel32.dll", SetLastError = true)]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool GlobalMemoryStatusEx(ref MemoryStatus status);
+    internal static (long Total, long Available) CaptureHost() => HostMemoryInfo.Capture();
 }
 
 /// <summary>Hardware/request-aware loading for dense Gemma4/Qwen35 on one CUDA
@@ -109,6 +85,7 @@ public sealed class AdaptiveModelSession : IDisposable
     public Exception? AccountingError => _nativeBudget.CallbackError;
     public (long Bytes, long PeakBytes, int Allocations) HostAllocationUsage => _hostBudget.Usage;
     public IReadOnlyList<GgmlAllocationUsage> NativeAllocationUsage => _nativeBudget.AllocationUsage;
+    public (long Count, GgmlAllocationRefusal? First, GgmlAllocationRefusal? Last) NativeAllocationRefusals => _nativeBudget.AllocationRefusals;
 
     public static AdaptiveModelSession Create(string path, AdaptiveModelMemoryOptions options)
         => CreateCore(path, options, null);
@@ -127,8 +104,10 @@ public sealed class AdaptiveModelSession : IDisposable
     {
         ArgumentNullException.ThrowIfNull(options);
         Validate(options);
+        if (TensorSharp.Runtime.Speculative.SpeculationOptions.FromEnvironment().Enabled)
+            throw new NotSupportedException("AdaptiveModelSession admits trunk-only execution; speculative execution requires a qualified memory adapter.");
         using var gguf = new GgufFile(path);
-        var profile = DenseMemoryProfile.Read(gguf, options, ModelBase.RetainsAllHostQuantizedWeights);
+        var profile = DenseMemoryProfile.Read(gguf, options, ModelBase.RetainsAllHostQuantizedWeights, omitEmbeddedDraftWeights: true);
         var hardware = InferenceHardwareMemory.CaptureCuda();
         var budget = sharedBudget ?? new MemoryBudget([new(HostPool, 0), new(DevicePool, 0)]);
         var plan = PlanLoad(profile, options, hardware, budget, sharedBudget != null);
@@ -158,7 +137,7 @@ public sealed class AdaptiveModelSession : IDisposable
                     DeviceWorkspaceCacheBytes = DeviceCacheLimit(plan, profile.SourceWeightBytes, options.MaximumStreamingWorkspaceCacheBytes),
                     DeviceWorkspaceCacheReserveBytes = ExecutionPeak(plan, DevicePool)
                 } : null;
-            var policy = new ModelMemoryPolicy(options.ContextTokens, plan.SelectedChunkTokens);
+            var policy = new ModelMemoryPolicy(options.ContextTokens, plan.SelectedChunkTokens) { OmitEmbeddedDraftWeights = true };
             var model = ModelBase.Create(path, BackendType.GgmlCuda, 1, null!, null!, 1, streaming!, policy);
             return new(model, budget, nativeBudget, plan, options, streaming?.HostCacheReserveBytes ?? 0,
                 streaming?.DeviceCacheReserveBytes ?? 0, sharedBudget == null, hostBudget, profile);

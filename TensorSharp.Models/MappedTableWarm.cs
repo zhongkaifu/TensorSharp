@@ -9,7 +9,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
-using System.Runtime.InteropServices;
+using TensorSharp.Memory;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -186,39 +186,14 @@ namespace TensorSharp.Models
         /// <summary>Currently available physical RAM, including reclaimable cache, or 0 if unknown.</summary>
         public static long HostMemoryAvailable()
         {
-            if (OperatingSystem.IsWindows())
-            {
-                var status = new MemoryStatus { Length = (uint)Marshal.SizeOf<MemoryStatus>() };
-                return GlobalMemoryStatusEx(ref status) && status.AvailablePhysical <= long.MaxValue
-                    ? (long)status.AvailablePhysical : 0;
-            }
-            if (!OperatingSystem.IsLinux())
-                return 0;
             try
             {
-                return HostMemoryAvailability.CaptureLinux().Available;
+                return HostMemoryInfo.Capture().Available;
             }
             catch (IOException) { }
             catch (UnauthorizedAccessException) { }
+            catch (PlatformNotSupportedException) { }
             return 0;
         }
-
-        [StructLayout(LayoutKind.Sequential)]
-        private struct MemoryStatus
-        {
-            public uint Length;
-            public uint MemoryLoad;
-            public ulong TotalPhysical;
-            public ulong AvailablePhysical;
-            public ulong TotalPageFile;
-            public ulong AvailablePageFile;
-            public ulong TotalVirtual;
-            public ulong AvailableVirtual;
-            public ulong AvailableExtendedVirtual;
-        }
-
-        [DllImport("kernel32.dll", SetLastError = true)]
-        [return: MarshalAs(UnmanagedType.Bool)]
-        private static extern bool GlobalMemoryStatusEx(ref MemoryStatus status);
     }
 }

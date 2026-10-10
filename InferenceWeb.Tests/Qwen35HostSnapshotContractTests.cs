@@ -80,7 +80,10 @@ public sealed class Qwen35HostSnapshotContractTests
         Assert.False(fixture.Model.SupportsCrossSequenceKvReuse);
         fixture.Set("_numExperts", 0);
         fixture.Set("_numNextnLayers", 1);
+        fixture.Set("_loadEmbeddedMtpWeights", true);
         Assert.False(fixture.Model.SupportsCrossSequenceKvReuse);
+        fixture.Set("_loadEmbeddedMtpWeights", false);
+        Assert.True(fixture.Model.SupportsCrossSequenceKvReuse);
         fixture.Set("_numNextnLayers", 0);
         fixture.SetBase("_backend", BackendType.GgmlMetal);
         Assert.False(fixture.Model.SupportsCrossSequenceKvReuse);

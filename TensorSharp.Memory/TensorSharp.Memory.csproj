@@ -5,4 +5,7 @@
     <IsPackable>true</IsPackable>
     <Description>Model-independent resource budgets, residency leases, and bounded RAM/SSD transfers for TensorSharp.</Description>
   </PropertyGroup>
+  <ItemGroup>
+    <InternalsVisibleTo Include="InferenceWeb.Tests" />
+  </ItemGroup>
 </Project>

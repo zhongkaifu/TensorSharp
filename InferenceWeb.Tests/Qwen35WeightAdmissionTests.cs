@@ -7,6 +7,15 @@ namespace InferenceWeb.Tests;
 public sealed class Qwen35WeightAdmissionTests
 {
     [Fact]
+    public void AdmittedTrunkPolicyCannotLoadDraftWeightsAfterEnvironmentPolicyChanges()
+    {
+        var policy = new ModelMemoryPolicy(1024, 64) { OmitEmbeddedDraftWeights = true };
+        Assert.False(Qwen35Model.ShouldLoadEmbeddedMtpWeights(SpeculationOptions.Disabled, policy));
+        Assert.False(Qwen35Model.ShouldLoadEmbeddedMtpWeights(new() { Enabled = true }, policy));
+        Assert.True(Qwen35Model.ShouldLoadEmbeddedMtpWeights(new() { Enabled = true }, new(1024, 64)));
+    }
+
+    [Fact]
     public void UnconfiguredDirectApiRetainsItsLearnedDraftCapability()
     {
         Assert.True(Qwen35Model.ShouldLoadEmbeddedMtpWeights(SpeculationOptions.Disabled));

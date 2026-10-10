@@ -9,6 +9,70 @@ namespace InferenceWeb.Tests;
 
 public sealed class DenseMemoryProfileTests
 {
+    [Theory]
+    [InlineData("key_length")]
+    [InlineData("value_length")]
+    public void ExplicitQwenHeadDimensionDoesNotRequireEmbeddingWidthDivisibleByHeads(string field)
+    {
+        using var fixture = new Fixture("qwen35");
+        fixture.File.Metadata["qwen35.attention.head_count"] = 3u; // embedding width = 64
+        fixture.File.Metadata["qwen35.full_attention_interval"] = 1u;
+        Assert.Throws<NotSupportedException>(() => fixture.Read());
+        fixture.File.Metadata[$"qwen35.attention.{field}"] = 32u;
+        var profile = fixture.Read();
+        Assert.All(profile.Model.KvCaches, kv => Assert.Equal(8 * 2 * 32, kv.BytesPerToken));
+        Assert.Equal(96, profile.AttentionProjectionWidth);
+        Assert.True(profile.Workspace(64, 1024).Device > (profile with { AttentionProjectionWidth = 64 }).Workspace(64, 1024).Device);
+    }
+
+    [Fact]
+    public void OmittedQwenDraftGeometryMatchesTheSameTrunkWithoutDraftPayload()
+    {
+        using var trunk = new Fixture("qwen35", Matrix("blk.0.ffn_gate.weight", SyntheticGguf.GgmlType.Q8_0, 64, 128));
+        using var draft = new Fixture("qwen35", Matrix("blk.0.ffn_gate.weight", SyntheticGguf.GgmlType.Q8_0, 64, 128),
+            Matrix("blk.1.nextn.eh_proj.weight", SyntheticGguf.GgmlType.F16, 128, 128));
+        draft.File.Metadata["qwen35.block_count"] = 2u;
+        draft.File.Metadata["qwen35.nextn_predict_layers"] = 1u;
+        var expected = trunk.Read();
+        Assert.Throws<NotSupportedException>(() => draft.Read());
+        var actual = DenseMemoryProfile.Read(draft.File, new(1024, 64), false, omitEmbeddedDraftWeights: true);
+        Assert.Equal(expected.Model.DenseWeights, actual.Model.DenseWeights);
+        Assert.Equal(expected.Model.Persistent, actual.Model.Persistent);
+        Assert.Equal(expected.Model.RecurrentStatePerSequence, actual.Model.RecurrentStatePerSequence);
+        Assert.Equal(expected.Model.KvCaches, actual.Model.KvCaches);
+        Assert.Equal(expected.SourceWeightBytes, actual.SourceWeightBytes);
+        Assert.Equal(expected.FusionBytes, actual.FusionBytes);
+        Assert.Equal(expected.Workspace(64, 1024), actual.Workspace(64, 1024));
+        Assert.Equal(1, actual.RetainedDecodeGraphLayers);
+        Assert.Contains("no MTP", actual.StreamingRefusal!);
+    }
+
+    [Fact]
+    public void QwenWorkspaceIncludesRetainedWholeDecoderGraphBeyondOneLayerScratch()
+    {
+        using var f = new Fixture("qwen35");
+        f.File.Metadata["qwen35.block_count"] = 64u;
+        var profile = f.Read();
+        var withoutGraph = profile with { RetainedDecodeGraphLayers = 0 };
+        var workspace = profile.Workspace(128, 1024);
+        Assert.Equal(withoutGraph.Workspace(128, 1024).Host, workspace.Host);
+        Assert.True(workspace.Device > withoutGraph.Workspace(128, 1024).Device
+            + profile.Model.RecurrentStatePerSequence.Device);
+        Assert.True(profile.RequestPeak(1024, 128, false).Device > withoutGraph.RequestPeak(1024, 128, false).Device);
+    }
+
+    [Theory]
+    [InlineData("qwen35", 1)]
+    [InlineData("qwen35", 2)]
+    [InlineData("gemma4", 1)]
+    public void OmissionCannotHideInvalidOrUnadaptedDraftLayouts(string architecture, int drafts)
+    {
+        using var fixture = new Fixture(architecture);
+        fixture.File.Metadata[$"{architecture}.nextn_predict_layers"] = (uint)drafts;
+        Assert.Throws<NotSupportedException>(() => DenseMemoryProfile.Read(fixture.File, new(1024, 64), false,
+            omitEmbeddedDraftWeights: true));
+    }
+
     private const long RuntimeAllowance = 128L << 20;
     private const long BufferPadding = 64L << 10;
 

@@ -10,8 +10,8 @@ public partial class Qwen35Model
     // construction. Preserve that capability when no policy was supplied. An
     // explicit --no-spec veto, or an enabled n-gram drafter, cannot use NextN.
     // Resolve once: changing process environment later must not change admission.
-    internal static bool ShouldLoadEmbeddedMtpWeights(SpeculationOptions options) =>
-        !options.ExplicitlyDisabled
+    internal static bool ShouldLoadEmbeddedMtpWeights(SpeculationOptions options, ModelMemoryPolicy memoryPolicy = null) =>
+        memoryPolicy?.OmitEmbeddedDraftWeights != true && !options.ExplicitlyDisabled
         && !(options.Enabled && string.Equals(options.SpeculatorName,
             SpeculatorRegistry.NGram, StringComparison.OrdinalIgnoreCase));
 

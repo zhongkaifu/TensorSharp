@@ -57,6 +57,8 @@ void Sample(string phase)
         CudaDeviceUsedBytes = DeviceUsed(), CudaAvailability = DeviceAvailability(),
         ManagedBytes = GC.GetTotalMemory(false), Budget = budget?.Snapshot(),
         Physical = PhysicalMemory.Capture(path), NativeAllocation = session?.NativeAllocationUsage,
+        NativeRefusals = session == null ? null : (object)new { session.NativeAllocationRefusals.Count,
+            session.NativeAllocationRefusals.First, session.NativeAllocationRefusals.Last },
         HostAllocation = session == null ? null : (object)new { session.HostAllocationUsage.Bytes, session.HostAllocationUsage.PeakBytes, session.HostAllocationUsage.Allocations } });
     Console.WriteLine($"PHASE {phase} {DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}");
 }

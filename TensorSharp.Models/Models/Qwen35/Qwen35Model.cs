@@ -403,7 +403,7 @@ namespace TensorSharp.Models
             {
                 Config.NumLayers -= _numNextnLayers;
                 _loadEmbeddedMtpWeights = ShouldLoadEmbeddedMtpWeights(
-                    TensorSharp.Runtime.Speculative.SpeculationOptions.FromEnvironment());
+                    TensorSharp.Runtime.Speculative.SpeculationOptions.FromEnvironment(), MemoryPolicy);
                 _mtpLayerIdx = _loadEmbeddedMtpWeights ? Config.NumLayers : -1;
             }
 
@@ -1375,7 +1375,8 @@ namespace TensorSharp.Models
         // by repeated full-logit replay and isolated-versus-interleaved inference.
         // Other backends, MoE and MTP continue to use their per-request holders.
         public override bool SupportsCrossSequenceKvReuse => SupportsKVStateSnapshot
-            && _backend == BackendType.GgmlCuda && _numExperts == 0 && _numNextnLayers == 0;
+            && _backend == BackendType.GgmlCuda && _numExperts == 0
+            && (_numNextnLayers == 0 || !_loadEmbeddedMtpWeights);
 
         /// <summary>
         /// Prompt M-RoPE positions compress after an image span (the running position
