@@ -110,6 +110,33 @@ public sealed class SkillCompletionGuardTests : IDisposable
         Assert.Single(updates, update => update.Done);
     }
 
+    /// <summary>
+    /// A guarded round and its correction hold their answer and reasoning until the artifact
+    /// check says what they are worth, and the client sees nothing of them meanwhile. For
+    /// every piece held the loop hands the client's stream loop an update with nothing in
+    /// it: an append-only adapter's keep-alive runs on those (StreamKeepAlive), or a long
+    /// held correction left the stream silent past a proxy's idle timeout.
+    /// </summary>
+    [Fact]
+    public async Task HeldRoundsAndTheCorrection_HandOverAnUpdateForEveryPieceTheyHold()
+    {
+        SessionWorkspace workspace = _workspaces.GetOrCreate("held-correction");
+        var runner = new ArtifactRunner(_artifacts, ArtifactMode.TruncatedZip);
+        SkillRequestPlan plan = Plan(runner, workspace, guarded: true);
+        const string first = "<think>done</think>Initial false success.";
+        const string correction = "<think>retry</think>Second false success.";
+        var replay = new ReplayGeneration(first, correction + "<tool_call>\n"
+            + "{\"name\": \"shell\", \"arguments\": {\"command\": \"make bad deck\"}}\n"
+            + "</tool_call>");
+
+        List<ChatStreamUpdate> updates = await Run(plan, replay.Invoke);
+
+        int empty = updates.Count(u => u.IsParsed && !u.Done && string.IsNullOrEmpty(u.Piece)
+            && string.IsNullOrEmpty(u.ThinkingPiece) && u.ParsedToolCalls == null && u.ToolProgressPhase == null);
+        Assert.True(empty >= first.Length + correction.Length, $"{empty} empty updates");
+        Assert.Equal(2, replay.Calls);
+    }
+
     [Fact]
     public async Task ValidArtifactBeforeFinal_ReleasesTheModelsAnswerInMultiplePieces()
     {

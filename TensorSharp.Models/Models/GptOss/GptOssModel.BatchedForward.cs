@@ -318,12 +318,14 @@ namespace TensorSharp.Models
         /// second concurrent sequence arrives — without migration the batched
         /// kernel would read zeros for the first sequence's prior positions.
         ///
-        /// Block-quantised caches (Q8_0) aren't supported by the migration
-        /// code (only F32/F16 dequant is implemented); the batched path
-        /// rejects them anyway.</summary>
+        /// The read is <see cref="KvCacheHostReader"/>, shared with Nemotron-H, so
+        /// the gate does not look at the dtype. A loaded gpt-oss never holds a
+        /// block-quantized cache anyway (<see cref="SupportsBlockQuantizedKvCache"/>
+        /// is false: a q8_0 / q4_0 request becomes f16 at load), so the dtype test
+        /// this gate used to carry never declined a loaded model and gpt-oss kept
+        /// its N=1 fused path under every K/V setting.</summary>
         public bool SupportsLinearKVMigration =>
-            _kvCacheK != null && _kvCacheV != null
-            && !_kvCacheDtype.IsBlockQuantized();
+            _kvCacheK != null && _kvCacheV != null;
 
         /// <summary>Copy <paramref name="owner"/>'s K/V history out of the
         /// linear per-layer cache <c>_kvCacheK</c>/<c>_kvCacheV</c> (layout
@@ -374,10 +376,9 @@ namespace TensorSharp.Models
 
             for (int layer = 0; layer < numLayers; layer++)
             {
-                int cacheLen = (int)_kvCacheK[layer].Sizes[1];
-                int totalElems = kvHeads * cacheLen * headDim;
-                if (!TryReadCacheAsF32(_kvCacheK[layer], totalElems, out float[] kFlat) ||
-                    !TryReadCacheAsF32(_kvCacheV[layer], totalElems, out float[] vFlat))
+                // The owner's rows only, laid out [kvHeads, ownerTokens, headDim].
+                if (!KvCacheHostReader.TryReadHeadRowsAsFloat32(_kvCacheK[layer], ownerTokens, out float[] kFlat) ||
+                    !KvCacheHostReader.TryReadHeadRowsAsFloat32(_kvCacheV[layer], ownerTokens, out float[] vFlat))
                 {
                     return false;
                 }
@@ -395,7 +396,7 @@ namespace TensorSharp.Models
 
                     for (int h = 0; h < kvHeads; h++)
                     {
-                        int srcOffset = (h * cacheLen + p) * headDim;
+                        int srcOffset = (h * ownerTokens + p) * headDim;
                         int dstOffset = slotOffset + h * headDim;
                         Buffer.BlockCopy(
                             kFlat, srcOffset * sizeof(float),
@@ -410,27 +411,6 @@ namespace TensorSharp.Models
             }
 
             return true;
-        }
-
-        private static unsafe bool TryReadCacheAsF32(Tensor cache, int totalElems, out float[] flat)
-        {
-            if (cache.ElementType == DType.Float32)
-            {
-                flat = cache.GetElementsAsFloat(totalElems);
-                return true;
-            }
-            if (cache.ElementType == DType.Float16)
-            {
-                flat = new float[totalElems];
-                ushort* src = TensorComputePrimitives.GetHalfPointer(cache);
-                fixed (float* dst = flat)
-                {
-                    TensorComputePrimitives.F16ToF32(dst, src, totalElems);
-                }
-                return true;
-            }
-            flat = null;
-            return false;
         }
 
         private void EnsureGptOssPagedBuffers(int numBlocks, int blockSize)

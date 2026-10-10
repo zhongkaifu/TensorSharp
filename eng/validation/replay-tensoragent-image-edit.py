@@ -2,8 +2,13 @@
 """Compare a captured TensorAgent edit with its equivalent direct image API call.
 
 Use an isolated host that still retains the captured uploads. This uses the same
-ordered source/references, mask, and TensorAgent's 1024x1024 target area. It checks
+ordered source/references, mask, TensorAgent's 1024x1024 target area and its
+keepSourceSize (every TensorAgent edit sends it). It checks
 exact output parity and protected pixels; a single pair is not a latency study.
+
+The parity holds for one edit noise: a capture made by a build whose edits drew
+their noise from the seed alone replays only on a host started with
+TS_QWEN21_EDIT_NOISE=seed.
 """
 import argparse
 import base64
@@ -22,7 +27,8 @@ MASK_KEYS = ('maskPath', 'maskMode', 'maskInvert', 'maskFeather', 'maskCrop', 'm
 def canonical_payload(request):
     message = next(message for message in reversed(request['messages']) if message['role'] == 'user')
     return {'prompt': message['content'].strip(), 'imagePaths': list(message['stillImagePaths']),
-            'targetArea': 1024 * 1024, **{key: message[key] for key in MASK_KEYS if key in message}}
+            'targetArea': 1024 * 1024, 'keepSourceSize': True,
+            **{key: message[key] for key in MASK_KEYS if key in message}}
 
 
 def main():

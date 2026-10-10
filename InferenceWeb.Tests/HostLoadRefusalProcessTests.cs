@@ -261,6 +261,41 @@ public class HostLoadRefusalProcessTests : IDisposable
         Assert.Contains("docs/models/qwenimage21.md", run.Stderr, StringComparison.Ordinal);
     }
 
+    // ---- the Qwen-Image-2.1 checkpoint declaration (--qwen-image-variant) ---------------
+    // It means nothing to another model: the CLI refuses the flag before loading (the server
+    // loads and warns, QwenImage21TurboTests). A declaration the model cannot read is the
+    // model's refusal, through the variable both hosts publish.
+
+    [Theory]
+    [InlineData("--qwen-image-variant", "turbo")]
+    [InlineData("--qwen-image-variant=base", null)]
+    public void Cli_QwenImageVariantForAnotherModel_IsAConfigurationError(string flag, string? value)
+    {
+        string model = WriteGguf("Qwen3.5-9B-Q8_0.gguf", "qwen35", new[] { "token_embd.weight" });
+        string[] line = value == null ? new[] { flag } : new[] { flag, value };
+
+        string error = AssertOneConfigurationErrorLine(RunCliWith(model, line), "--qwen-image-variant applies to Qwen-Image-2.1 models only");
+        Assert.Contains("'Qwen3.5-9B-Q8_0.gguf' (qwen35) is not one.", error, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void BothHosts_AnUnknownQwenImageVariantVariable_RefusesTheLoad()
+    {
+        // A Qwen-Image-2.1 transformer by its tensor names (the GGUFs carry no other sign).
+        string model = WriteGguf("Qwen-Image-2.1-Turbo-AD-Q4_K.gguf", "qwen_image", new[]
+        {
+            "img_in.weight", "txt_norm.weight", "txt_in.text_norm.weight", "txt_in.weight", "proj_out.weight",
+        });
+        var environment = new Dictionary<string, string> { ["TS_QWEN_IMAGE_VARIANT"] = "lightning" };
+        foreach (HostRun run in new[] { RunCliWith(model, Array.Empty<string>(), environment),
+                                         RunServerWith(model, Array.Empty<string>(), environment: environment) })
+        {
+            AssertRefused(run, "TS_QWEN_IMAGE_VARIANT expects one of base, turbo " +
+                "(which Qwen-Image-2.1 checkpoint the GGUF holds), not 'lightning'.");
+            Assert.DoesNotContain("Unhandled exception", run.Stdout + run.Stderr, StringComparison.Ordinal);
+        }
+    }
+
     private static void AssertConfigurationError(HostRun run, string messageFragment)
     {
         string line = AssertOneConfigurationErrorLine(run, messageFragment);
@@ -291,20 +326,25 @@ public class HostLoadRefusalProcessTests : IDisposable
     /// A tiny but complete GGUF carrying tensor names from the Qwen-Image-Edit-2511 layout
     /// (double-stream blocks, a Qwen2.5-VL text input, no <c>txt_in.text_norm</c>) and
     /// tagged <c>general.architecture=qwen_image</c>, so the registry routes it to the
-    /// Qwen-Image loader, which must refuse it by name. The tensors are small F32 stubs:
-    /// the server checks that a file holds every byte its tensors claim before it loads,
-    /// and the refusal only needs the names.
+    /// Qwen-Image loader, which must refuse it by name.
     /// </summary>
-    private string WriteLegacyQwenImageModel()
+    private string WriteLegacyQwenImageModel() => WriteGguf("qwen-image-edit-2511-Q4_K_M.gguf", "qwen_image", new[]
+    {
+        "img_in.weight", "txt_norm.weight", "txt_in.weight", "proj_out.weight",
+        "transformer_blocks.0.attn.to_q.weight", "transformer_blocks.0.attn.add_q_proj.weight",
+    });
+
+    /// <summary>
+    /// A tiny but complete GGUF tagged <c>general.architecture=<paramref name="architecture"/></c>
+    /// with tensors named <paramref name="names"/>, enough for the registry to route it and a
+    /// loader to refuse it by those names. The tensors are small F32 stubs: the server checks
+    /// that a file holds every byte its tensors claim before it loads.
+    /// </summary>
+    private string WriteGguf(string fileName, string architecture, string[] names)
     {
         const int Alignment = 32;          // GGUF default (general.alignment absent)
         const int Elements = 32;           // 128 bytes per tensor, already aligned
-        string path = Path.Combine(_dir, "qwen-image-edit-2511-Q4_K_M.gguf");
-        string[] names =
-        {
-            "img_in.weight", "txt_norm.weight", "txt_in.weight", "proj_out.weight",
-            "transformer_blocks.0.attn.to_q.weight", "transformer_blocks.0.attn.add_q_proj.weight",
-        };
+        string path = Path.Combine(_dir, fileName);
         using var writer = new BinaryWriter(File.Create(path));
         void WriteString(string value)
         {
@@ -318,7 +358,7 @@ public class HostLoadRefusalProcessTests : IDisposable
         writer.Write(1UL);                   // one metadata pair
         WriteString("general.architecture");
         writer.Write(8u);                    // string
-        WriteString("qwen_image");
+        WriteString(architecture);
         for (int i = 0; i < names.Length; i++)
         {
             WriteString(names[i]);
@@ -399,7 +439,7 @@ public class HostLoadRefusalProcessTests : IDisposable
         // Nothing inherited from the test run may change what the host loads.
         foreach (string name in new[] { "KV_CACHE_DTYPE", "MAX_CONTEXT", "TENSORSHARP_TP_DEGREE",
                      "TENSORSHARP_LAYER_SPLIT_DEGREE", "TENSORSHARP_TP_NODE_ID", "TENSORSHARP_TP_PEERS",
-                     "TS_SPEC_DRAFT_MODEL" })
+                     "TS_SPEC_DRAFT_MODEL", "TS_QWEN_IMAGE_VARIANT", "TS_LORAS" })
             startInfo.Environment.Remove(name);
         foreach ((string name, string value) in environment ?? new Dictionary<string, string>())
             startInfo.Environment[name] = value;

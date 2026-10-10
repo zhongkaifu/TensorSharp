@@ -107,6 +107,18 @@ public sealed class QwenImageMaskRequestTests
             Form(new() { [field] = value }, File("image"), File("mask")), 1024)).StatusCode);
 
     [Fact]
+    public void MultipartKeepSourceSizeIsAJsonBoolean()
+    {
+        var parsed = WebUiAdapter.ParseImageEditForm(Form(new() { ["keepSourceSize"] = "true" }, File("image")), 1024);
+        Assert.True(WebUiChatService.ParseImageParameters(parsed.Parameters).KeepSourceSize);
+        foreach (string value in new[] { "yes", "1" })
+            Assert.Equal(400, Assert.Throws<WebUiRequestRejectedException>(() => WebUiAdapter.ParseImageEditForm(
+                Form(new() { ["keepSourceSize"] = value }, File("image")), 1024)).StatusCode);
+        Assert.Equal(400, Assert.Throws<WebUiRequestRejectedException>(() => WebUiAdapter.ParseImageEditForm(
+            Form(new() { ["keepSourceSize"] = "true", ["width"] = "1024", ["height"] = "768" }, File("image")), 1024)).StatusCode);
+    }
+
+    [Fact]
     public void MultipartNumbersAreInvariantAndKeepInt64Seeds()
     {
         var old = CultureInfo.CurrentCulture;

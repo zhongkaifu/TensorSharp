@@ -298,7 +298,7 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model models/di
   <h2 id="thinking">思考 / 推理模式</h2>
   <p>具备思考能力的模型（Qwen 3.5/3.6、Qwen 3.8 Flash Next、Gemma 4、GPT OSS、Nemotron-H、DeepSeek V4、DeepSeek V4.1、GLM 5.x、Muse-Glimmer）会在最终答案前产生结构化的思维链。思考内容与可见回复分离，便于客户端显示或隐藏。</p>
   <ul>
-    <li><strong>Qwen 3.5/3.6 / Nemotron-H</strong> —— <code>&lt;think&gt;…&lt;/think&gt;</code> 标签。</li>
+    <li><strong>Qwen 3.5/3.6 / Nemotron-H</strong> —— <code>&lt;think&gt;…&lt;/think&gt;</code> 标签。关闭思考时，Nemotron-H Reasoning-128K 有时会在已闭合的 <code>&lt;think&gt;&lt;/think&gt;</code> 之后继续推理并自己写出 <code>&lt;/think&gt;</code>。若它从回复的前 2,048 个字符之内开始，这段文本会作为推理上报，而不是作为答案；更晚出现的闭合被当作答案文本，推理和字面的 <code>&lt;/think&gt;</code> 因此留在答案中，这是已知限制（<a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/models/nemotron_zh-cn.md#12-输出解析器与聊天模板">详情</a>）。</li>
     <li><strong>Qwen 3.8 Flash Next</strong> —— 同样是 <code>&lt;think&gt;…&lt;/think&gt;</code> 标签，开关方式也相同：关闭思考时，发布的模板会渲染一个已闭合的空 <code>&lt;think&gt;&lt;/think&gt;</code> 块。</li>
     <li><strong>Gemma 4</strong> —— <code>&lt;|channel&gt;thought …&lt;channel|&gt;</code> 标签。</li>
     <li><strong>GPT OSS</strong> —— Harmony 格式：<code>&lt;|channel|&gt;analysis</code> 用于思考，<code>&lt;|channel|&gt;final</code> 用于答案。</li>
@@ -313,7 +313,7 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model models/di
   <h2 id="toolcalling">工具调用 / 函数调用</h2>
   <p>受支持的模型家族可以调用用户自定义工具，并参与多轮工具调用对话。将工具定义为 JSON，通过 <code>--tools</code>（CLI）或 <code>tools</code> 参数（API）传入。每个受支持架构使用各自的线格式，其输出解析器会将调用提取为结构化 <code>tool_calls</code>：</p>
   <ul>
-    <li><strong>Nemotron-H</strong> —— <code>&lt;tool_call&gt;{"name": …, "arguments": {…}}&lt;/tool_call&gt;</code></li>
+    <li><strong>Nemotron-H</strong> —— Reasoning-128K：Nemotron 家族约定 <code>&lt;TOOLCALL&gt;[{"name": …, "arguments": {…}}]&lt;/TOOLCALL&gt;</code>（<code>[read_file(path="notes.txt")]</code> 这类 Python 风格的调用同样被接受）。Nemotron 3 Nano / Omni：内容为 XML <code>&lt;function=NAME&gt;&lt;parameter=key&gt;</code> 的 <code>&lt;tool_call&gt;</code>（JSON 形式仍被接受）。</li>
     <li><strong>Qwen 3.5 / 3.6、Qwen 3.8 Flash Next</strong> —— 同样是 <code>&lt;tool_call&gt;</code> 块，但内容为 XML：<code>&lt;function=NAME&gt;&lt;parameter=key&gt;value&lt;/parameter&gt;&lt;/function&gt;</code>（JSON 形式仍被接受）。</li>
     <li><strong>Gemma 4</strong> —— <code>&lt;|tool_call&gt;call:function_name{args}&lt;tool_call|&gt;</code></li>
     <li><strong>GPT OSS (Harmony)</strong> —— 工具以 TypeScript 命名空间声明；调用在 commentary 通道发出。</li>

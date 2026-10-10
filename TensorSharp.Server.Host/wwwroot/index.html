@@ -2808,8 +2808,11 @@ async function runImageEdit(userMsg, bubbleText, statsDiv) {
     const res = await fetch(editing ? '/api/image-edit/stream' : '/api/image-generate/stream', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
+      // An edit comes back at its source picture's own size, as a selection edit always
+      // did; sized from the area alone, an edit of an edit could come back smaller.
       body: JSON.stringify({ imagePaths: editImages,
-        prompt: userMsg.content || '', maskPath: userMsg.maskPath, maskMode: userMsg.maskMode,
+        prompt: userMsg.content || '', keepSourceSize: editing || undefined,
+        maskPath: userMsg.maskPath, maskMode: userMsg.maskMode,
         maskFeather: userMsg.maskFeather, maskCrop: userMsg.maskCrop }),
       signal: currentAbortController.signal
     });

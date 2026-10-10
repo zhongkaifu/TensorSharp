@@ -16,6 +16,11 @@ Example (a baseline build against the current one, with the prefix cache on and 
 
 Arguments after `--` go to qwen-image21-bench.py unchanged (--engine and --cli are
 set per arm). Generated records belong in ignored artifacts/ or docs/validation/.
+
+Edits: the bench runs TensorSharp's default edit noise, keyed to the reference images. A
+build from before that change drew an edit's noise from the seed alone, so pass
+`--edit-noise seed` after `--` when one arm is such a build, or every edit differs from it
+for that reason alone; an arm can also set TS_QWEN21_EDIT_NOISE itself.
 """
 import argparse
 import json

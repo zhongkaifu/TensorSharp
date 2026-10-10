@@ -130,6 +130,61 @@ public sealed class AgentAppHostTests : IDisposable
     }
 
     /// <summary>
+    /// A model the previous launch died loading is not loaded again by itself.
+    ///
+    /// <para>
+    /// The choice is saved before the load, and every launch loads the saved choice and
+    /// warms it a few seconds later. A model whose load or first prefill takes the
+    /// process down therefore did it again at every launch: the app "always crashed",
+    /// and the user never reached the list to pick another model. The record of a load
+    /// in progress is what tells this launch; the choice itself is kept, so the user
+    /// can try it again on purpose.
+    /// </para>
+    /// </summary>
+    [Fact]
+    public void AModelTheLastLaunchDiedLoadingIsNotLoadedAgainAutomatically()
+    {
+        CatalogModel model = ModelCatalog.Find("bonsai-2-27b-ptq1-0")!;
+        AgentPaths paths = Paths with { DeviceMemoryGB = 48, DeviceClass = DeviceClass.Desktop };
+        paths.EnsureCreated();
+        var settings = new SettingsStore(paths.SettingsFile);
+        AppSettings chosen = settings.Load();
+        chosen.SelectedModelId = model.Id;
+        settings.Save(chosen);
+        var store = new ModelStore(paths.ModelsDirectory);
+        Directory.CreateDirectory(store.DirectoryFor(model));
+        using (FileStream weights = File.Create(store.PathFor(model, model.Weights)))
+            weights.SetLength(model.Weights.Bytes);
+        string marker = Path.Combine(paths.DataRoot, "model-load-in-progress.json");
+        File.WriteAllText(marker, JsonSerializer.Serialize(new { ModelId = model.Id }));
+
+        _host = new AgentAppHost(paths);
+        _host.Start();
+
+        Assert.Equal(AgentAppHost.ModelLoadState.Failed, _host.ModelLoad);
+        Assert.Contains(model.DisplayName, _host.ModelLoadError);
+        Assert.Equal(model.Id, new SettingsStore(paths.SettingsFile).Load().SelectedModelId);
+        // Kept, so the launch after this one does not load it either (ModelLoadRecordTests).
+        Assert.True(File.Exists(marker));
+    }
+
+    /// <summary>The record describes the previous process only: a launch always clears it.</summary>
+    [Fact]
+    public void AStaleLoadRecordForAnotherModelIsClearedAtStartup()
+    {
+        AgentPaths paths = Paths with { DeviceMemoryGB = 48, DeviceClass = DeviceClass.Desktop };
+        paths.EnsureCreated();
+        string marker = Path.Combine(paths.DataRoot, "model-load-in-progress.json");
+        File.WriteAllText(marker, JsonSerializer.Serialize(new { ModelId = "gemma-4-e2b-q8" }));
+
+        _host = new AgentAppHost(paths);
+        _host.Start();
+
+        Assert.Equal(AgentAppHost.ModelLoadState.None, _host.ModelLoad);
+        Assert.False(File.Exists(marker));
+    }
+
+    /// <summary>
     /// A remembered model the catalog no longer has is cleared, not merely skipped.
     ///
     /// <para>
@@ -409,6 +464,68 @@ public sealed class AgentAppHostTests : IDisposable
     }
 
     /// <summary>
+    /// The app answers /api/chat through its GPU gate, not the route's default frame source,
+    /// so the gate has to plan a picture turn from the conversation as the route does
+    /// (MediaRoutesTests): the first version of image turns decided only in the default, and
+    /// the app sent pictures to the text pipeline. The stand-in model is unsure, so the turn
+    /// ends with its question and no image work.
+    /// </summary>
+    [Fact]
+    public async Task TheGpuGatePlansAPictureTurnFromTheConversation()
+    {
+        AgentAppHost host = Start();
+        object lifecycle = host.ModelService.LifecycleService;
+        var modelField = lifecycle.GetType().GetField("_model",
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!;
+        modelField.SetValue(lifecycle,
+            System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(TensorSharp.Models.QwenImage.QwenImageModel)));
+        try
+        {
+            File.WriteAllBytes(Path.Combine(host.Options.UploadDirectory, "dog.png"), new byte[] { 1 });
+            var asked = new List<ImageTurns.PlanQuestion>();
+            host.ImagePlanner = new ImageTurns.Planner(host.Options.UploadDirectory, (question, _) =>
+            {
+                lock (asked) asked.Add(question);
+                // Every option alike: the model cannot tell what was meant, so the turn asks.
+                float each = 1f / question.Options.Count;
+                return Task.FromResult<TensorSharp.Models.QwenImage.ImageIntentChoice?>(
+                    new(0, each, 0) { Probabilities = Enumerable.Repeat(each, question.Options.Count).ToArray() });
+            });
+
+            using var request = new HttpRequestMessage(HttpMethod.Post, "/api/chat")
+            {
+                Content = JsonContent.Create(new
+                {
+                    messages = new object[]
+                    {
+                        new { role = "user", content = "a dog" },
+                        new { role = "assistant", content = "", imageUrl = "/uploads/dog.png" },
+                        new { role = "user", content = "with a hat" },
+                    },
+                }),
+            };
+            using HttpResponseMessage response = await _client!.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
+            var frames = new List<JsonElement>();
+            using (var reader = new StreamReader(await response.Content.ReadAsStreamAsync()))
+            {
+                while (await reader.ReadLineAsync() is { } line)
+                {
+                    if (line.StartsWith("data: ", StringComparison.Ordinal))
+                        frames.Add(JsonSerializer.Deserialize<JsonElement>(line[6..]));
+                }
+            }
+
+            Assert.Contains("\"with a hat\"", Assert.Single(asked).User, StringComparison.Ordinal);
+            Assert.Contains(frames, f => f.TryGetProperty("image_choice", out _));
+            Assert.True(frames[^1].GetProperty("done").GetBoolean());
+        }
+        finally
+        {
+            modelField.SetValue(lifecycle, null);
+        }
+    }
+
+    /// <summary>
     /// A picture whose plug-ins cannot be honoured ends with the reason, not with a picture
     /// made without them; and the preparation is told whether the picture is an edit.
     /// </summary>
@@ -422,7 +539,7 @@ public sealed class AgentAppHostTests : IDisposable
             .RootElement.Clone();
 
         var frames = new List<JsonElement>();
-        await foreach (object frame in ImageTurns.StreamAsync(_host.Chat, body, CancellationToken.None, editing =>
+        await foreach (object frame in ImageTurns.StreamAsync(_host.Chat, body, _host.ImagePlanner, CancellationToken.None, editing =>
         {
             asked.Add(editing);
             return ImageTurns.Preparation.Refused("Viggle Turbo is turned on but its files are missing.");

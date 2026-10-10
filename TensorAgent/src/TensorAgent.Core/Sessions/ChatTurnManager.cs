@@ -361,6 +361,7 @@ public sealed class ChatTurnManager : IDisposable
         var artifactUrls = new HashSet<string>(StringComparer.Ordinal);
         string? sessionId = null;
         string? imageUrl = null, videoUrl = null, audioUrl = null;
+        ImageTurnRecord? image = null;
         StoredTurnStats? stats = null;
         ChatTurnState state;
 
@@ -369,7 +370,7 @@ public sealed class ChatTurnManager : IDisposable
             await foreach (object frame in frames(turn.Token).WithCancellation(turn.Token).ConfigureAwait(false))
             {
                 turn.Append(frame, content, MaxBufferedFrames);
-                ReadInto(frame, content, thinking, artifacts, artifactUrls, ref sessionId, ref imageUrl, ref videoUrl, ref audioUrl, ref stats);
+                ReadInto(frame, content, thinking, artifacts, artifactUrls, ref sessionId, ref imageUrl, ref videoUrl, ref audioUrl, ref image, ref stats);
             }
             state = ChatTurnState.Completed;
         }
@@ -414,7 +415,8 @@ public sealed class ChatTurnManager : IDisposable
                     imageUrl,
                     videoUrl,
                     audioUrl,
-                    stats);
+                    stats,
+                    image);
             }
             catch (Exception) { /* a lost transcript must not be a crash on a background thread */ }
         }
@@ -445,6 +447,7 @@ public sealed class ChatTurnManager : IDisposable
         ref string? imageUrl,
         ref string? videoUrl,
         ref string? audioUrl,
+        ref ImageTurnRecord? image,
         ref StoredTurnStats? stats)
     {
         try
@@ -513,6 +516,10 @@ public sealed class ChatTurnManager : IDisposable
                 && picture.ValueKind == JsonValueKind.String
                 && picture.GetString() is { Length: > 0 } made)
                 imageUrl = made;
+            // And what that picture was made from, or the readings a turn offered instead of
+            // making one: the next image turn plans from these (ImageTurnRecord).
+            if (ImageTurnRecord.FromFrame(root) is { } recorded)
+                image = recorded;
             // Likewise the clip a video model's turn made, and its soundtrack when that is a
             // file of its own (VideoTurns); both arrive on the same frame.
             if (root.TryGetProperty("videoUrl", out JsonElement clip)

@@ -115,6 +115,16 @@ public sealed partial class AppleMediaProvider
         return (width, height);
     }
 
+    /// <summary>The smallest multiple of 600 (AVFoundation's default) that one frame at <paramref name="fps"/> divides.</summary>
+    internal static int TrackTimeScale(int fps)
+    {
+        if (fps <= 0)
+            return 600;
+        int a = 600, b = fps;
+        while (b != 0) (a, b) = (b, a % b);
+        return 600 / a * fps;
+    }
+
     private string Write(string path, RgbImage[] frames, int fps, GeneratedVideoAudio? audio)
     {
         var (width, height) = CheckEncodable(path, frames);
@@ -168,6 +178,11 @@ public sealed partial class AppleMediaProvider
             {
                 // Offline encode: let the writer apply back-pressure instead of dropping.
                 ExpectsMediaDataInRealTime = false,
+                // A track timescale the frame duration divides exactly. The default is
+                // 600, which holds 1/24 s but not 1/16 s: Wan's 16 fps frames were stored
+                // as 37/600 s each and the clip played at 16.216 fps, shorter than the turn
+                // reported. lcm(fps, 600) keeps 600 for the rates it already suited.
+                MediaTimeScale = TrackTimeScale(fps),
             };
             using var adaptor = new AVAssetWriterInputPixelBufferAdaptor(
                 input,

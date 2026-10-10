@@ -233,6 +233,19 @@ namespace TensorSharp.Runtime
             return JsonSerializer.Serialize(obj);
         }
 
+        private static readonly JsonSerializerOptions RelaxedJson = new()
+        {
+            Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+        };
+
+        /// <summary>A call as the model wrote it: <c>wc -l &lt; notes.txt</c>, not
+        /// <c>wc -l \u003C notes.txt</c>, which the model would then copy.</summary>
+        private static string SerializeToolCallVerbatim(ToolCall tc)
+        {
+            var obj = new Dictionary<string, object?> { ["name"] = tc.Name, ["arguments"] = tc.Arguments };
+            return JsonSerializer.Serialize(obj, RelaxedJson);
+        }
+
         /// <summary>
         /// Render the NVIDIA Nemotron 3 Nano Omni chat template.
         /// Matches the GGUF jinja template that ships with the model:
@@ -328,6 +341,23 @@ namespace TensorSharp.Runtime
         private const string NemotronHReasoningOn = "{'reasoning': True}";
         private const string NemotronHReasoningOff = "{'reasoning': False}";
 
+        // The Nemotron family's tool convention, word for word as NVIDIA's own templates
+        // render it (NVIDIA-Nemotron-Nano-9B-v2; Llama-Nemotron Super v1.5), doubled
+        // braces included: Jinja prints them literally. The Reasoning-128K template has no
+        // tool syntax of its own. Nemotron-H 8B (Q4_K_M), two tool tasks x 3 seeds per arm:
+        // behind a 16k-character skills prompt it called a tool 7 times in 12 with this
+        // block and 2 in 12 with the Hermes one; with only the tools, 10 in 12 against 8.
+        private const string NemotronToolsPreamble =
+            "\n\nYou can use the following tools to assist the user if required:\n<AVAILABLE_TOOLS>[";
+        private const string NemotronToolsInstructions =
+            "]</AVAILABLE_TOOLS>\n\nIf you decide to call any tool(s), use the following format:\n" +
+            "<TOOLCALL>[{{\"name\": \"tool_name1\", \"arguments\": \"tool_args1\"}}, " +
+            "{{\"name\": \"tool_name2\", \"arguments\": \"tool_args2\"}}]</TOOLCALL>\n\n" +
+            "The user will execute tool-calls and return responses from tool(s) in this format:\n" +
+            "<TOOL_RESPONSE>[{{\"tool_response1\"}}, {{\"tool_response2\"}}]</TOOL_RESPONSE>\n\n" +
+            "Based on the tool responses, you can call additional tools if needed, correct tool calls " +
+            "if any errors are found, or just respond to the user.";
+
         /// <summary>
         /// True when a <c>nemotron_h</c> GGUF carries the Nemotron-H Reasoning-128K turn
         /// format (<c>&lt;SPECIAL_10&gt;System</c> / <c>&lt;SPECIAL_11&gt;User</c> /
@@ -356,10 +386,18 @@ namespace TensorSharp.Runtime
         /// assistant header. The marker is added here from the request's thinking flag
         /// unless the caller's system prompt already carries one. EOS is
         /// <c>&lt;SPECIAL_11&gt;</c>, the same token that opens the next turn.</para>
+        /// <para>The added marker goes at the END of the system section, after the system
+        /// text and the tool declarations. The shipped template only asks whether the
+        /// marker occurs anywhere in <c>messages[0].content</c>, so its position is free,
+        /// and at the end the two thinking modes render the same thousands of tokens of
+        /// system prompt and tools before they differ. Prepended, they diverged at the
+        /// fifth token, and a warm-up or cached prefix of one mode was useless to the
+        /// other.</para>
         /// <para>The shipped template has no tool syntax. Tools are declared in the system
-        /// prompt with the JSON <c>&lt;tool_call&gt;</c> convention the ChatML parser reads,
-        /// and tool results are fed back as a user turn wrapped in
-        /// <c>&lt;tool_response&gt;</c>, so an agentic loop still sees its results.</para>
+        /// prompt with the Nemotron family's own convention (<c>&lt;AVAILABLE_TOOLS&gt;</c>,
+        /// calls in <c>&lt;TOOLCALL&gt;[...]&lt;/TOOLCALL&gt;</c>), and a turn's tool results
+        /// are fed back as one user turn wrapped in <c>&lt;TOOL_RESPONSE&gt;[...]</c>, so an
+        /// agentic loop still sees its results.</para>
         /// </summary>
         public static string RenderNemotronHReasoning(List<ChatMessage> messages, bool addGenerationPrompt = true,
             List<ToolFunction>? tools = null, bool enableThinking = false)
@@ -369,6 +407,7 @@ namespace TensorSharp.Runtime
 
             bool hasSystem = messages.Count > 0 && messages[0].Role == "system";
             string system = hasSystem ? (messages[0].Content ?? string.Empty).Trim() : string.Empty;
+            string? marker = null;
             bool thinkingOn;
             if (system.Contains(NemotronHReasoningOn, StringComparison.Ordinal))
             {
@@ -381,21 +420,21 @@ namespace TensorSharp.Runtime
             else
             {
                 thinkingOn = enableThinking;
-                string marker = enableThinking ? NemotronHReasoningOn : NemotronHReasoningOff;
-                system = system.Length > 0 ? marker + "\n" + system : marker;
+                marker = enableThinking ? NemotronHReasoningOn : NemotronHReasoningOff;
             }
 
             if (tools != null && tools.Count > 0)
             {
-                system += "\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\n" +
-                          "You are provided with function signatures within <tools></tools> XML tags:\n<tools>";
+                var declarations = new List<string>(tools.Count);
                 foreach (var tool in tools)
-                    system += "\n" + Jinja2Template.ToJson(BuildToolDeclaration(tool));
-                system += "\n</tools>\n\nFor each function call, return a json object with function name and " +
-                          "arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n" +
-                          "{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call>\n" +
-                          "Function results are returned to you inside <tool_response></tool_response> tags.";
+                    declarations.Add(Jinja2Template.ToJson(BuildToolDeclaration(tool)["function"]));
+                system += NemotronToolsPreamble + string.Join(", ", declarations) + NemotronToolsInstructions;
             }
+
+            // Last, so both thinking modes share everything before it (see the summary).
+            // Without system text the tools block opens the section, minus its separator.
+            if (marker != null)
+                system = system.Length > 0 ? system.TrimStart('\n') + "\n\n" + marker : marker;
 
             sb.Append(NemotronHSystemMarker).Append('\n').Append(system);
 
@@ -412,26 +451,31 @@ namespace TensorSharp.Runtime
                         string content = (msg.Content ?? string.Empty).Trim();
                         if (content.Length > 0)
                             parts.Add(content);
-                        if (msg.ToolCalls != null)
+                        if (msg.ToolCalls is { Count: > 0 })
                         {
+                            var calls = new List<string>(msg.ToolCalls.Count);
                             foreach (var tc in msg.ToolCalls)
-                                parts.Add("<tool_call>\n" + SerializeToolCall(tc) + "\n</tool_call>");
+                                calls.Add(SerializeToolCallVerbatim(tc));
+                            parts.Add("<TOOLCALL>[" + string.Join(", ", calls) + "]</TOOLCALL>");
                         }
                         sb.Append(string.Join("\n", parts));
                         break;
                     }
                     case "tool":
                     {
+                        // A turn's results go back together, as the family's one list.
                         bool prevIsTool = i > start && messages[i - 1].Role == "tool";
                         if (!prevIsTool)
-                            sb.Append('\n').Append(NemotronHTurnMarker).Append("User\n");
+                            sb.Append('\n').Append(NemotronHTurnMarker).Append("User\n<TOOL_RESPONSE>[");
                         else
-                            sb.Append('\n');
-                        sb.Append("<tool_response>\n").Append((msg.Content ?? string.Empty).Trim())
-                          .Append("\n</tool_response>");
+                            sb.Append(", ");
+                        sb.Append((msg.Content ?? string.Empty).Trim());
                         bool nextIsTool = i + 1 < messages.Count && messages[i + 1].Role == "tool";
                         if (!nextIsTool)
+                        {
+                            sb.Append("]</TOOL_RESPONSE>");
                             AppendNemotronHAssistantHeader(sb, isLast && addGenerationPrompt, thinkingOn);
+                        }
                         break;
                     }
                     default: // user, or a later system message rendered as a user turn
@@ -451,8 +495,13 @@ namespace TensorSharp.Runtime
         {
             sb.Append('\n').Append(NemotronHTurnMarker).Append("Assistant\n");
             if (generationPrompt)
-                sb.Append(thinkingOn ? "<think>\n" : "<think></think>");
+                sb.Append(NemotronHGenerationPromptOpening(thinkingOn));
         }
+
+        /// <summary>What the Reasoning-128K generation prompt writes after the assistant
+        /// header, and a past turn does not.</summary>
+        internal static string NemotronHGenerationPromptOpening(bool thinkingOn)
+            => thinkingOn ? "<think>\n" : "<think></think>";
 
         private static void AppendNemotronUserContent(StringBuilder sb, ChatMessage msg)
         {

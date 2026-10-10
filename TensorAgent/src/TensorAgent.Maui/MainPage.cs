@@ -1081,6 +1081,10 @@ public sealed class MainPage : ContentPage
                         if (hasToken)
                             answer.Append(token.GetString());
                     }
+                    // The whole answer, when text the page showed proved to be reasoning:
+                    // the next turn sends back what remains, as the page does.
+                    if (frame.TryGetProperty("replace", out JsonElement whole) && whole.ValueKind == JsonValueKind.String)
+                        answer.Clear().Append(whole.GetString());
                     if (frame.TryGetProperty("promptTokens", out JsonElement p))
                         prompt = p.GetInt32();
                     if (frame.TryGetProperty("kvReusedTokens", out JsonElement r))

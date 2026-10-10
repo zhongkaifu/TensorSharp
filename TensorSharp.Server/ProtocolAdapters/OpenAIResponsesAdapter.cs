@@ -46,6 +46,10 @@ public sealed class OpenAIResponsesAdapter
     private readonly ILoggerFactory _loggerFactory;
     private readonly IResponsesStore _store;
 
+    /// <summary>How long a stream may go without a byte before it is sent a keep-alive
+    /// (see <see cref="StreamKeepAlive"/>). Settable for tests.</summary>
+    internal TimeSpan KeepAliveInterval { get; init; } = StreamKeepAlive.DefaultInterval;
+
     public OpenAIResponsesAdapter(
         ModelService svc,
         ServerHostingOptions options,
@@ -329,7 +333,7 @@ public sealed class OpenAIResponsesAdapter
         string itemStatus = status == FinishReasonMapper.ResponsesIncomplete ? "incomplete" : "completed";
 
         string rawOutput = collector.PlainText();
-        bool useParser = enableThinking || (tools != null && tools.Count > 0) || OutputParserFactory.IsAlwaysRequired(_svc.Architecture);
+        bool useParser = enableThinking || (tools != null && tools.Count > 0) || OutputParserFactory.IsAlwaysRequired(_svc.Architecture, _svc.ChatTemplate);
         var output = new List<object>();
 
         if (responseFormat != null)
@@ -404,7 +408,7 @@ public sealed class OpenAIResponsesAdapter
 
         bool bufferForStructured = responseFormat != null;
         bool useParser = !bufferForStructured &&
-            (enableThinking || (tools != null && tools.Count > 0) || OutputParserFactory.IsAlwaysRequired(_svc.Architecture));
+            (enableThinking || (tools != null && tools.Count > 0) || OutputParserFactory.IsAlwaysRequired(_svc.Architecture, _svc.ChatTemplate));
 
         IOutputParser? parser = null;
         string? generationSuffix = null;
@@ -450,6 +454,8 @@ public sealed class OpenAIResponsesAdapter
         {
             if (!update.Done)
             {
+                // Text a parser holds sends nothing for as long as it is held.
+                await SseWriter.KeepAliveIfIdleAsync(ctx.Response, KeepAliveInterval, ctx.RequestAborted).ConfigureAwait(false);
                 if (update.RawGenerationSuffix != null)
                 {
                     generationSuffix = update.RawGenerationSuffix;

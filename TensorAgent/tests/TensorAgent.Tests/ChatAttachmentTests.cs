@@ -196,25 +196,85 @@ public sealed class ChatAttachmentTests : IDisposable
     }
 
     /// <summary>
-    /// The same file attached twice keeps its first copy, so a name cannot change
-    /// which bytes a program reads halfway through a conversation.
+    /// A repeated name keeps the file it first meant, so a name cannot change which bytes
+    /// a program reads halfway through a conversation -- and the second file is staged
+    /// under a name of its own rather than dropped. Two photos pasted on a phone are both
+    /// "image.png"; dropping the second left the program opening the first when the user
+    /// meant the second, and refused a text-only model the second image outright.
     /// </summary>
     [Fact]
-    public void ARepeatedNameKeepsTheFileItFirstMeant()
+    public void ARepeatedNameKeepsTheFileItFirstMeantAndTheNextFileGetsItsOwn()
     {
         Upload("g1.png");
         Upload("g9.png");
+        Upload("g10.png");
         List<ChatMessage> messages = Parse("""
             [{ "role": "user", "content": "one",
                "attachments": [{ "file": "g1.png", "fileName": "photo.png", "mediaType": "image" }] },
              { "role": "assistant", "content": "ok" },
              { "role": "user", "content": "two",
-               "attachments": [{ "file": "g9.png", "fileName": "photo.png", "mediaType": "image" }] }]
+               "attachments": [{ "file": "g9.png", "fileName": "photo.png", "mediaType": "image" },
+                               { "file": "g1.png", "fileName": "photo.png", "mediaType": "image" },
+                               { "file": "g10.png", "fileName": "photo.png", "mediaType": "image" }] }]
             """);
         Assert.Null(Resolve(messages, _uploads));
 
-        CodeInputFile only = Assert.Single(Collect(messages));
-        Assert.Equal(Path.Combine(_uploads, "g1.png"), only.SourcePath);
+        IReadOnlyList<CodeInputFile> files = Collect(messages);
+        Assert.Equal(
+            new[]
+            {
+                new CodeInputFile("photo.png", Path.Combine(_uploads, "g1.png")),
+                new CodeInputFile("photo-2.png", Path.Combine(_uploads, "g9.png")),
+                new CodeInputFile("photo-3.png", Path.Combine(_uploads, "g10.png")),
+            },
+            files);
+    }
+
+    /// <summary>
+    /// Two pasted photos are both "image.png". For a text-only model every image must be
+    /// staged before its vision input is removed, and the second used to be dropped by
+    /// name -- so the request was refused as "no vision" although a tool could open both.
+    /// </summary>
+    [Fact]
+    public void TwoPhotosWithTheSameNameAreBothStagedForATextOnlyModel()
+    {
+        Upload("p1.png");
+        Upload("p2.png");
+        List<ChatMessage> messages = Parse("""
+            [{ "role": "user", "content": "first", "imagePaths": ["p1.png"],
+               "attachments": [{ "file": "p1.png", "fileName": "image.png", "mediaType": "image" }] },
+             { "role": "assistant", "content": "ok" },
+             { "role": "user", "content": "put both in a pdf", "imagePaths": ["p2.png"],
+               "attachments": [{ "file": "p2.png", "fileName": "image.png", "mediaType": "image" }] }]
+            """);
+        Assert.Null(Resolve(messages, _uploads));
+
+        IReadOnlyDictionary<string, string> staged = Collect(messages)
+            .ToDictionary(file => file.SourcePath, file => file.Name, StringComparer.Ordinal);
+
+        Assert.Equal("image.png", staged[Path.Combine(_uploads, "p1.png")]);
+        Assert.Equal("image-2.png", staged[Path.Combine(_uploads, "p2.png")]);
+        Assert.True(TensorSharp.Chat.WebUiChatService.TryUseImagesAsStagedFiles(messages, staged));
+    }
+
+    /// <summary>
+    /// An iPhone photo is staged as the PNG it is converted to, so its HEIC name reserves
+    /// that PNG name too: a real "IMG_1.png" attached beside "IMG_1.heic" must not be
+    /// overwritten by the conversion.
+    /// </summary>
+    [Fact]
+    public void AHeicPhotoReservesTheNameOfItsConvertedCopy()
+    {
+        Upload("h1.heic");
+        Upload("p1.png");
+        List<ChatMessage> messages = Parse("""
+            [{ "role": "user", "content": "both",
+               "attachments": [{ "file": "h1.heic", "fileName": "IMG_1.heic", "mediaType": "image" },
+                               { "file": "p1.png", "fileName": "IMG_1.png", "mediaType": "image" }] }]
+            """);
+        Assert.Null(Resolve(messages, _uploads));
+
+        Assert.Equal(new[] { "IMG_1.heic", "IMG_1-2.png" }, Collect(messages).Select(f => f.Name).ToArray());
     }
 
     /// <summary>

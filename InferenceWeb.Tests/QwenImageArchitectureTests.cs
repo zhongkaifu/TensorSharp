@@ -150,7 +150,7 @@ public sealed class QwenImageArchitectureTests
         return tensors;
     }
 
-    private static Dictionary<string, (ulong[] Shape, GgmlTensorType Type)> Version21Tensors(string prefix, bool fused)
+    internal static Dictionary<string, (ulong[] Shape, GgmlTensorType Type)> Version21Tensors(string prefix, bool fused)
     {
         var tensors = new Dictionary<string, (ulong[] Shape, GgmlTensorType Type)>();
         void Add(string name, GgmlTensorType type, params ulong[] shape) => tensors.Add(prefix + name, (shape, type));
@@ -184,7 +184,7 @@ public sealed class QwenImageArchitectureTests
 
     // Header-only GGUF exercises the real reader and registry, without needing
     // gigabytes of payload or allocating a native inference backend.
-    private sealed class TensorHeader : IDisposable
+    internal sealed class TensorHeader : IDisposable
     {
         private readonly string _directory = System.IO.Path.Combine(System.IO.Path.GetTempPath(), Guid.NewGuid().ToString("N"));
         internal GgufFile File { get; }

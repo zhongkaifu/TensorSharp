@@ -333,6 +333,13 @@ namespace TensorSharp.Server.Host.Hosting
                 new OptionHelp("--qwen-image-mmproj <path>",
                     "Qwen3-VL-8B vision projector GGUF, required for image editing. Default: same-directory scan.",
                     "--qwen-image-mmproj mmproj-Qwen3VL-8B-Instruct-F16.gguf"),
+                new OptionHelp("--qwen-image-variant <base|turbo>",
+                    "Which Qwen-Image-2.1 checkpoint the DiT GGUF holds: base or turbo. The GGUFs carry no metadata and Turbo has the " +
+                    "base tensors, so a host declares it; turbo samples Qwen-Image-2.1-Turbo's published 8-step schedule at CFG 1 " +
+                    "by default, refuses other step counts and refuses step-distillation LoRA plug-ins. Default: none - a file " +
+                    "name with the word turbo is assumed to be Turbo (the load says so), any other is base. Another model " +
+                    "loads without it, with a warning.",
+                    "--qwen-image-variant turbo"),
                 new OptionHelp("--lora <path>",
                     "Qwen-Image-2.1 LoRA plug-in: a LoRA .safetensors (diffusers/PEFT, ComfyUI, kohya, DiffSynth, DoRA or " +
                     "VideoX-Fun PDD format) or a TensorSharp plug-in config .json from config/lora/ (downloads its weights on " +

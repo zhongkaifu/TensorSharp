@@ -108,6 +108,30 @@ public sealed class EngineMemoryPolicyTests : IDisposable
             m => Assert.True(m.LeanCaches));
     }
 
+    /// <summary>
+    /// A phone keeps the window measured against its jetsam budget; a desktop is given the
+    /// one the entry's tier affords (CatalogModel.DesktopContextLength), because 8,192 left
+    /// a desktop chat about a thousand tokens beside the ~7.2k-token shared prompt. The
+    /// user's own context setting still wins on either.
+    /// </summary>
+    [Fact]
+    public void ADesktopGivesAnEightKChatEntryTheWindowItsTierAffords()
+    {
+        CatalogModel e2b = Entry("gemma-4-e2b-q8");
+        CatalogModel e4b = Entry("gemma-4-e4b-iq4xs");
+
+        Assert.Equal(8192, EngineMemoryPolicy.Apply(e4b, new AppSettings(), DeviceClass.Phone));
+        Assert.Equal("8192", Environment.GetEnvironmentVariable(EngineMemoryPolicy.MaxContextVariable));
+
+        Assert.Equal(16384, EngineMemoryPolicy.Apply(e4b, AppSettings.DesktopDefaults(), DeviceClass.Desktop));
+        Assert.Equal("16384", Environment.GetEnvironmentVariable(EngineMemoryPolicy.MaxContextVariable));
+        Assert.Equal(32768, EngineMemoryPolicy.Apply(e2b, AppSettings.DesktopDefaults(), DeviceClass.Desktop));
+
+        AppSettings chosen = AppSettings.DesktopDefaults();
+        chosen.ContextLength = 12288;
+        Assert.Equal(12288, EngineMemoryPolicy.Apply(e2b, chosen, DeviceClass.Desktop));
+    }
+
     [Fact]
     public void TheIq1MFlashEntryAppliesItsBoundedContextAndF16CacheOnTheDesktop()
     {

@@ -586,6 +586,17 @@ data: [DONE]
 末尾 chunk 的 `usage` 块同样会携带 `prompt_tokens_details.cached_tokens`，与
 非流式响应保持一致。
 
+当解析器暂扣尚无法归类的文本时（Nemotron-H Reasoning-128K 关闭思考的回复，
+在证实是推理还是答案之前），流每 15 秒发送一行 SSE 注释而不是保持静默，
+以免被代理的空闲超时切断。SSE 客户端会跳过它：
+
+```
+: keep-alive
+```
+
+`/v1/responses` 发送同样的注释，`/api/chat/ollama` 发送 message 为空的分块
+（`"message":{"role":"assistant","content":""}`，`"done":false`）。
+
 ### Chat Completions + JSON 模式
 
 ```bash
@@ -1025,6 +1036,7 @@ curl -N -X POST http://localhost:5000/api/chat \
 |---|---|---|
 | `token` | 每个生成的 token（启用 `think` / `tools` 时为解析后的内容片段） | 流式正文 |
 | `replace`、`diffusionStep`、`diffusionTotal`、`preview` | 每个 DiffusionGemma 去噪预览与最终替换 | 替换整条 assistant 消息，而不是追加 token |
+| 单独的 `replace` | 已作为答案流式发送的文本被证实是推理时（Nemotron-H Reasoning-128K 在关闭思考的 prompt 已关闭推理块后，又自己写出 `</think>`） | 本轮到目前为止的完整答案，包含所有工具轮次；它跟在携带这段推理的 `thinking` 帧之后，之后的 `token` 帧在其后追加 |
 | `thinking` | 解析到的思维链片段（仅当模型输出含思维链时） | 流式思维链 |
 | `tool_calls` | 模型输出调用者定义的工具调用 | `{name, arguments}` 数组；内置技能/代码调用改由服务端进程内执行 |
 | `tool_progress`、`tool`、`text`、`seconds`、`detail`、`agents` | 进程内技能/代码/子智能体调用正在写出或运行时 | 短暂的实时活动：阶段为 `writing`、`running` 或 `finished`；内置 Web UI 只保留有界的当前尾部，并在 `finished` 时清除。`wait_agent` 处于 `running` 时，`agents` 是本请求中所有子智能体的快照（`agent_id`、`parent_id`、`task`、`agent_type`、`status`、`tool`、`tool_status`、`detail`、`result`、`error`），其他情况下为 `null` |
@@ -1057,6 +1069,14 @@ data: {"skill_step":"shell","agent_id":"/root","skill":null,"detail":null,"ok":t
 
 ```
 data: {"tool_progress":"running","tool":"wait_agent","text":"","seconds":3,"detail":null,"agents":[{"agent_id":"/root/api_review","parent_id":"/root","task":"Review the API layer for migration risks...","agent_type":"reviewer","status":"running","tool":"read_file","tool_status":"completed","detail":"src/api.cs","result":null,"error":null}]}
+```
+
+工具轮次的文本被证实是推理后的收回示例（前一轮的开场白保留，推理移入推理框）：
+
+```
+data: {"thinking":"Okay, the user wants to know how many lines are in notes.txt. ..."}
+data: {"replace":"To determine the number of lines, I will read the file.\n\n"}
+data: {"token":"The file has 7 lines."}
 ```
 
 DiffusionGemma 预览帧示例：
@@ -1239,10 +1259,13 @@ curl --fail-with-body http://localhost:5000/api/image-generate \
 使用下文的图像编辑路由。宽高须同时设置，且都取 32 的倍数。省略尺寸时，生成为原生
 2048×2048，编辑则取与第一张参考图宽高比一致、面积大致相同的尺寸。
 `targetArea: 1048576` 选择约 1K 的输出并自动选择宽高比；显式尺寸优先。服务启动时同时传入
-`--width` 与 `--height`（32 的倍数）会替换这一默认值：所有未发送 `width`/`height` 的生成与编辑
-请求都改用该尺寸，此时它也优先于 `targetArea`；只传其中一个则不影响图像尺寸。内置 Web UI 不发送
-尺寸，因此这两个参数决定它的输出尺寸（它们同时也设置默认视频尺寸）。编辑时每张参考图
-以约 1 百万像素（若输出面积更小，则以输出面积）作为条件输入。
+`--width` 与 `--height`（32 的倍数）会替换这一默认值：所有既未发送 `width`/`height`、也未发送自己的
+`targetArea` 的生成与编辑请求都改用该尺寸；只传其中一个则不影响图像尺寸。内置 Web UI 不发送
+尺寸，因此这两个参数决定它生成图片的尺寸（它们同时也设置默认视频尺寸）。带 `keepSourceSize: true`
+的编辑请求则返回第一张图的精确宽高，采样面积约为其自身面积（至少 1 百万像素、至多原本使用的面积），宽高比近似保持；Web UI 的每次
+编辑都会发送它，因此对编辑结果再次编辑时尺寸保持不变。它不能与 `width`/`height` 同时使用，
+`/api/image-generate` 也不接受它。编辑时每张参考图以约 1 百万像素（若输出面积更小，则以输出面积）
+作为条件输入。
 
 省略 `steps`/`cfg` 时使用 40 步 Euler 和 CFG 1，遵循已发布 2.1 模型的推荐，除非启动时的
 LoRA 插件提供了自己的配方（见下文 [LoRA 插件](#qwen-image-21-lora-插件)）。CFG 1 每步
@@ -1273,6 +1296,8 @@ curl -X POST http://localhost:5000/api/image-edit \
 ```
 
 不显式指定 `width` / `height`（且服务端没有 `--width`/`--height` 默认值）时，输出保持第一张参考图的宽高比，面积约为 2048×2048 像素。
+
+`seed`（默认 0）决定初始噪声。编辑的噪声还取决于传入的图片，因此用生成某张图时的种子和尺寸去编辑它，不会从这张图自己的噪声开始；相同的图片与设置仍得到相同的结果。以 `TS_QWEN21_EDIT_NOISE=seed` 启动的服务端只按种子为编辑取噪声，与 stable-diffusion.cpp 相同。
 
 也接受 JSON body `{ "imagePaths": ["<file from /api/upload>"], "prompt": "...",
 "steps": 0, "cfg": 0, "seed": 42 }`（`imagePaths` 按参考图顺序列出先前上传文件的服务端文件名；

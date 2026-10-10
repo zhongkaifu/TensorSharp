@@ -46,6 +46,13 @@ public sealed record CatalogLora
     public required string DisplayName { get; init; }
     /// <summary>The <see cref="ModelCatalog"/> entry it adapts.</summary>
     public required string BaseModelId { get; init; }
+    /// <summary>
+    /// Other entries it applies to beside <see cref="BaseModelId"/>, each one only after a real
+    /// picture showed the plug-in working there: the Qwen-Image 2.1 Turbo entries take the style
+    /// plug-ins validated on Turbo. Never a speed plug-in: Turbo is step-distilled already and
+    /// the engine refuses a second schedule (<c>LoraCatalogTests</c> holds both rules).
+    /// </summary>
+    public IReadOnlyList<string> AlsoFor { get; init; } = Array.Empty<string>();
     public required LoraKind Kind { get; init; }
     /// <summary>The adapter weights (always first) and any file the engine reads beside them.</summary>
     public required IReadOnlyList<LoraFile> Files { get; init; }
@@ -80,6 +87,13 @@ public sealed record CatalogLora
     public bool NeedsModelSteps { get; init; }
     public required string License { get => CatalogText.Read(_license); init => _license = value; }
 
+    /// <summary>Whether it applies to the catalog entry <paramref name="modelId"/>: its own base
+    /// model or one of <see cref="AlsoFor"/>.</summary>
+    public bool AppliesTo(string? modelId) =>
+        modelId is not null
+        && (string.Equals(BaseModelId, modelId, StringComparison.OrdinalIgnoreCase)
+            || AlsoFor.Contains(modelId, StringComparer.OrdinalIgnoreCase));
+
     public LoraFile Weights => Files[0];
     public long TotalBytes => Files.Sum(f => f.Bytes);
     public bool StrengthAdjustable => Kind != LoraKind.Speed;
@@ -101,6 +115,10 @@ public sealed record CatalogLora
 public static class LoraCatalog
 {
     public const string QwenImage = "qwen-image-2.1-q4km";
+
+    /// <summary>The Qwen-Image 2.1 Turbo entries: the style plug-ins validated on Turbo apply to
+    /// them (<see cref="CatalogLora.AlsoFor"/>), the speed plug-ins never do.</summary>
+    public static readonly IReadOnlyList<string> QwenImageTurbo = new[] { "qwen-image-2.1-turbo-adq4k", "qwen-image-2.1-turbo-q8" };
 
     /// <summary>The Qwen Research License of the base model and most plug-ins.</summary>
     private const string QwenResearch = "catalog.license.qwenResearch";
@@ -194,6 +212,10 @@ public static class LoraCatalog
             Id = "qwen-image-2.1-film-stills",
             DisplayName = "Film Stills",
             BaseModelId = QwenImage,
+            // Validated on Turbo at 0.7, seeds 42 and 7 (qwen-image21-turbo.py --suite style):
+            // the look applies and part of the scene is redrawn
+            // (docs/models/qwenimage21.md#lora-plug-ins-on-turbo).
+            AlsoFor = QwenImageTurbo,
             Kind = LoraKind.Style,
             DefaultStrength = 0.7f,
             Files = new[]
@@ -210,6 +232,10 @@ public static class LoraCatalog
             Id = "qwen-image-2.1-grainscape",
             DisplayName = "Grainscape",
             BaseModelId = QwenImage,
+            // Validated on Turbo at 0.7, seeds 42 and 7 (qwen-image21-turbo.py --suite style):
+            // the look applies and part of the scene is redrawn
+            // (docs/models/qwenimage21.md#lora-plug-ins-on-turbo).
+            AlsoFor = QwenImageTurbo,
             Kind = LoraKind.Style,
             DefaultStrength = 0.7f,
             Files = new[]
@@ -336,9 +362,23 @@ public static class LoraCatalog
     public static CatalogLora? Find(string id) =>
         BuiltIn.FirstOrDefault(l => string.Equals(l.Id, id, StringComparison.OrdinalIgnoreCase));
 
-    /// <summary>The plug-ins for <paramref name="baseModelId"/>, in catalog order.</summary>
-    public static IReadOnlyList<CatalogLora> For(string? baseModelId) =>
-        BuiltIn.Where(l => string.Equals(l.BaseModelId, baseModelId, StringComparison.OrdinalIgnoreCase)).ToList();
+    /// <summary>The plug-ins that apply to the entry <paramref name="modelId"/>, in catalog order.</summary>
+    public static IReadOnlyList<CatalogLora> For(string? modelId) =>
+        BuiltIn.Where(l => l.AppliesTo(modelId)).ToList();
+
+    /// <summary>
+    /// The plug-ins the LoRA sheet lists: those that apply to the loaded image model, so a Qwen-Image
+    /// 2.1 Turbo entry is never offered a speed plug-in; with no image model loaded, every plug-in
+    /// of a model in <paramref name="offered"/>.
+    /// </summary>
+    public static IReadOnlyList<CatalogLora> Offered(CatalogModel? loaded, IEnumerable<CatalogModel> offered)
+    {
+        ArgumentNullException.ThrowIfNull(offered);
+        CatalogModel[] models = offered.ToArray();
+        return BuiltIn.Where(l => loaded is { IsImageGenerator: true }
+            ? l.AppliesTo(loaded.Id)
+            : models.Any(m => l.AppliesTo(m.Id))).ToList();
+    }
 
     /// <summary>The text of an embedded engine config (<see cref="CatalogLora.RecipeConfig"/>).</summary>
     public static string RecipeText(CatalogLora lora)

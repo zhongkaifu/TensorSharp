@@ -1169,6 +1169,68 @@ public sealed class QwenImage21LoraSetTests : IDisposable
         Assert.Contains("Two LoRA plug-ins define a sampling recipe", ex.Message, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public void Refuse_ARecipePlugInOnTurbo_NamingHowTurboWasIdentified()
+    {
+        // Qwen-Image-2.1-Turbo is step-distilled already: a plug-in that brings a schedule of
+        // its own cannot also apply, and the load fails before the plug-in's tensors are read.
+        using var dit = Transformer();
+        var (path, _) = ToQ();
+        string recipe = WriteText("speed.json", """{ "type": "qwen-image-2.1-lora", "sampling": { "steps": 4, "sigmas": [1, 0.75, 0.5, 0.25] } }""");
+
+        var ex = Assert.Throws<ArgumentException>(() => QwenImage21LoraSet.Load(new[] { new LoraSpec(path, null, recipe) },
+            dit, Prefix, BackendType.GgmlCpu, 1, QwenImage21Turbo.Recipe, "assumed from its file name; declare --qwen-image-variant base if it is not"));
+        Assert.Contains("carries a sampling recipe (speed.json): it is a step-distillation plug-in", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("this transformer is Qwen-Image-2.1-Turbo (assumed from its file name; declare --qwen-image-variant base if it is not)",
+            ex.Message, StringComparison.Ordinal);
+        Assert.Contains("use the plug-in with the base Qwen-Image-2.1 checkpoint, or Turbo without it", ex.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Turbo_TheModelHandsItsScheduleToTheLoad()
+    {
+        // Through QwenImageModel.SetLoras, which every host's --lora reaches: the model must
+        // pass its own recipe, and how it was identified, to the load.
+        using var dit = Transformer();
+        var (path, _) = ToQ();
+        string recipe = WriteText("speed.json", """{ "type": "qwen-image-2.1-lora", "sampling": { "steps": 4, "sigmas": [1, 0.75, 0.5, 0.25] } }""");
+        var speed = new[] { new LoraSpec(path, null, recipe) };
+
+        foreach (var (declared, how) in new[] { (true, "declared"), (false, "assumed from its file name; declare --qwen-image-variant base if it is not") })
+        {
+            QwenImageModel turbo = QwenImage21TurboTests.ModelOf(QwenImageVariant.Turbo, declared, dit, BackendType.GgmlCpu);
+            var ex = Assert.Throws<ArgumentException>(() => turbo.SetLoras(speed));
+            Assert.Contains($"this transformer is Qwen-Image-2.1-Turbo ({how}), which is step-distilled already", ex.Message, StringComparison.Ordinal);
+            Assert.Null(turbo.Loras);
+            Assert.Same(QwenImage21Turbo.Recipe, turbo.SamplingRecipe);
+        }
+
+        // The base checkpoint takes the same plug-in and samples on its recipe.
+        QwenImageModel baseModel = QwenImage21TurboTests.ModelOf(QwenImageVariant.Base, true, dit, BackendType.GgmlCpu);
+        baseModel.SetLoras(speed);
+        try
+        {
+            Assert.NotNull(baseModel.Loras?.Recipe);
+            Assert.Same(baseModel.Loras!.Recipe, baseModel.SamplingRecipe);
+            Assert.Equal(4, baseModel.SamplingRecipe.DefaultSteps);
+        }
+        finally
+        {
+            baseModel.SetLoras(Array.Empty<LoraSpec>());
+        }
+    }
+
+    [Fact]
+    public void Turbo_TakesAPlugInThatBringsNoSchedule()
+    {
+        using var dit = Transformer();
+        var (path, _) = ToQ();
+        using var set = QwenImage21LoraSet.Load(new[] { new LoraSpec(path) }, dit, Prefix, BackendType.GgmlCpu, 1,
+            QwenImage21Turbo.Recipe, "declared");
+        Assert.Null(set.Recipe);
+        Assert.True(set.FactorBytes > 0);
+    }
+
     // ---- (g) tensor parallelism: row-parallel projections -------------------------------------
 
     [Fact]

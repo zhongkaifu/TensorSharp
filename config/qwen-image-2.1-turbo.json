@@ -1,0 +1,52 @@
+{
+  // Qwen-Image-2.1-Turbo: Qwen-Image-2.1 distilled to 8 Euler steps at CFG 1, for text-to-image
+  // and editing. Same VAE, Qwen3-VL-8B text encoder and vision projector as Qwen-Image-2.1,
+  // under the file names their publishers use; point a Qwen-Image-2.1 config at the same folder
+  // and file names and the two models share one download of them.
+  // Both CLI and Server.Host verify SHA-256 for new downloads; cached files are reused.
+  //
+  //   TensorSharp.Cli --config config/qwen-image-2.1-turbo.json --prompt "..." --width 1024 --height 1024
+  //   TensorSharp.Server.Host --config config/qwen-image-2.1-turbo.json
+  //
+  // The GGUF carries no metadata and Turbo has the base checkpoint's tensors, so this config
+  // declares the checkpoint ("qwen-image-variant": "turbo"). Turbo then samples its published
+  // schedule, the model_index.json sample_sigmas [1.0, 0.978453, 0.95418, 0.926626, 0.89508,
+  // 0.845148, 0.704534, 0.414568] and a final 0, unshifted at every size, at CFG 1. Other step
+  // counts are refused (Qwen has evaluated no other schedule), and so are step-distillation LoRA
+  // plug-ins (they bring a second schedule). Defaults: native 2048x2048; edits retain the input
+  // aspect ratio; explicit dimensions must be divisible by 32.
+  //
+  // AD-Q4_K is AtomicChat's importance-matrix 4-bit file (4.20 GB). For the transformer closest
+  // to the full-precision checkpoint (the card's LPIPS against BF16: Q8_0 0.037, AD-Q4_K 0.147;
+  // the Q4_K_M text encoder below moves pictures about as far as AD-Q4_K by the card's own
+  // measurement, and stays), use the 7.59 GB Q8_0: replace the file name in "path" and "urls" with
+  // Qwen-Image-2.1-Turbo-Q8_0.gguf and set "sha256" to
+  //   99f498fb7188be7eac9eb5f345a9e074d30eef3ca235b419e92563e5b48073c4
+  // Apple Silicon uses ggml_metal. Override --backend ggml_cuda for NVIDIA GPUs.
+  // License: Qwen Research License (non-commercial); text encoder Apache-2.0.
+  "variables": {
+    "root": "${TENSORSHARP_MODELS:-../models}/qwen-image-2.1"
+  },
+  "backend": "ggml_metal",
+  "qwen-image-variant": "turbo",
+  "model": {
+    "path": "${root}/Qwen-Image-2.1-Turbo-AD-Q4_K.gguf",
+    "urls": ["https://huggingface.co/AtomicChat/Qwen-Image-2.1-Turbo-GGUF/resolve/bb25d06bc74119c12207243d68917951e6d9c232/Qwen-Image-2.1-Turbo-AD-Q4_K.gguf"],
+    "sha256": "4bb73c53cbe284bbd6d69b9fdc59539c531f0389dd2aa567663d777f8130bc59"
+  },
+  "qwen-image-vae": {
+    "path": "${root}/qwen_image_2.1_vae_bf16.safetensors",
+    "urls": ["https://huggingface.co/Comfy-Org/Qwen-Image-2.1/resolve/ace0edeb3791a594ddfa36ed5f41a178a394e921/vae/qwen_image_2.1_vae_bf16.safetensors"],
+    "sha256": "bb21f7473051e1ac368515dd3f2e15cd44d7a11748ee8823e1ddca3e4876b7c9"
+  },
+  "qwen-image-vl": {
+    "path": "${root}/Qwen3VL-8B-Instruct-Q4_K_M.gguf",
+    "urls": ["https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct-GGUF/resolve/f982a07559d4a2f6c8744d840bf6fccab30eea96/Qwen3VL-8B-Instruct-Q4_K_M.gguf"],
+    "sha256": "67d1659bfe71b89d50b45a4ad1a9e5b997e5bb16ce5da66a6a6167abd569e9e2"
+  },
+  "qwen-image-mmproj": {
+    "path": "${root}/mmproj-Qwen3VL-8B-Instruct-F16.gguf",
+    "urls": ["https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct-GGUF/resolve/f982a07559d4a2f6c8744d840bf6fccab30eea96/mmproj-Qwen3VL-8B-Instruct-F16.gguf"],
+    "sha256": "ca524100ebf825c9a870db1c580d03879e0da0ab2541697e2458e64891cf9d38"
+  }
+}

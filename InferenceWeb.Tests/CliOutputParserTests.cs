@@ -13,7 +13,7 @@ public class CliOutputParserTests
     {
         var tokenizer = new CharacterTokenizer();
         var prompt = tokenizer.Encode(new string('x', 10000) + "<|channel>thought\n");
-        var parser = CliOutputParser.Create("gemma4", enableThinking, null, tokenizer, prompt);
+        var parser = Create("gemma4", enableThinking, tokenizer, prompt);
         var thinking = new StringBuilder();
         const string reasoning = "Inspecting the tool result before answering.";
         foreach (char ch in reasoning)
@@ -34,8 +34,7 @@ public class CliOutputParserTests
     public void BufferedGeneration_TruncatedInsidePromptOpenedThought_HasNoAnswer()
     {
         var tokenizer = new CharacterTokenizer();
-        var parser = CliOutputParser.Create("gemma4", false, null, tokenizer,
-            tokenizer.Encode("<|channel>thought\n"));
+        var parser = Create("gemma4", false, tokenizer, tokenizer.Encode("<|channel>thought\n"));
 
         var output = parser.Add("Still inspecting the tool result.", true);
 
@@ -50,8 +49,7 @@ public class CliOutputParserTests
     public void AClosedOrAbsentThoughtChannel_DoesNotConsumeTheAnswer(string promptText)
     {
         var tokenizer = new CharacterTokenizer();
-        var parser = CliOutputParser.Create("gemma4", false, null, tokenizer,
-            tokenizer.Encode(promptText));
+        var parser = Create("gemma4", false, tokenizer, tokenizer.Encode(promptText));
 
         var output = parser.Add("An immediate answer", false);
 
@@ -63,12 +61,16 @@ public class CliOutputParserTests
     public void OtherParsers_DoNotDecodeThePromptAgain()
     {
         var tokenizer = new CharacterTokenizer();
-        var parser = CliOutputParser.Create("unknown", false, null, tokenizer,
-            tokenizer.Encode("<|channel>thought\n"));
+        var parser = Create("unknown", false, tokenizer, tokenizer.Encode("<|channel>thought\n"));
 
         Assert.Equal("The answer", parser.Add("The answer", true).Content);
         Assert.Empty(tokenizer.DecodeLengths);
     }
+
+    private static IOutputParser Create(string architecture, bool enableThinking, ITokenizer tokenizer,
+        List<int> prompt, string chatTemplate = null)
+        => CliOutputParser.Create(architecture, enableThinking, null,
+            CliOutputParser.PromptTail(architecture, chatTemplate, tokenizer, prompt));
 
     private sealed class CharacterTokenizer : ITokenizer
     {

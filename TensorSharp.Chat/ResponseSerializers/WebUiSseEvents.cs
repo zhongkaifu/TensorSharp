@@ -38,6 +38,11 @@ namespace TensorSharp.Server.ResponseSerializers
             preview,
         };
 
+        /// <summary>Replace the entire assistant message body with <paramref name="text"/>,
+        /// with no denoising progress: what is left of the answer once text it showed
+        /// proved to be reasoning (see <c>WebUiChatService.AnswerFrames</c>).</summary>
+        public static object Replace(string text) => new { replace = text };
+
         public static object ToolCalls(IReadOnlyList<ToolCall> toolCalls) => new
         {
             tool_calls = toolCalls.Select(tc => (object)new

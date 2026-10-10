@@ -112,7 +112,7 @@ public sealed class ImageBench
         int steps = 0;
         string loras = "none";
         string? url = null, error = null;
-        await foreach (object frame in ImageTurns.StreamAsync(_app.Chat, body, token, _app.PrepareImageTurn).ConfigureAwait(false))
+        await foreach (object frame in ImageTurns.StreamAsync(_app.Chat, body, _app.ImagePlanner, token, _app.PrepareImageTurn).ConfigureAwait(false))
         {
             int total = AgentAppHost.IntIn(frame, "image_steps");
             if (total > 0)

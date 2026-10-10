@@ -400,12 +400,20 @@ namespace TensorSharp.Models
         /// attention history, and the Mamba2 slot pool would start from
         /// freshly-zeroed conv/SSM state.
         ///
-        /// Block-quantised attention caches (Q8_0) aren't supported by the
-        /// migration code (only F32/F16 dequant is implemented).</summary>
+        /// The paged arrays are float32 whatever the linear cache holds, and
+        /// <see cref="KvCacheHostReader"/> dequantizes a block-quantized (q8_0 /
+        /// q4_0) cache on the way. Declining a quantized cache here used to cost
+        /// the whole prefix cache: the planner refused the N=1 fused path, every
+        /// solo request ran the batched route (no pages, no end states) and nothing
+        /// was ever reused. A quantized cache still declines where the N=1 decode
+        /// cannot append to and read it in place (<see cref="FlashDecodeHandlesBlockQuantKv"/>):
+        /// there the batched route's native paged attention over float32 decodes a
+        /// long context far faster than the host walk would. False for an unloaded
+        /// model.</summary>
         public bool SupportsLinearKVMigration =>
             _kvCacheK != null && _kvCacheV != null
             && _convState != null && _ssmState != null
-            && !_kvCacheDtype.IsBlockQuantized();
+            && (!_kvCacheDtype.IsBlockQuantized() || FlashDecodeHandlesBlockQuantKv);
 
         /// <summary>Copy <paramref name="owner"/>'s in-progress state out of
         /// the solo per-model stores and into the paged / per-slot stores
@@ -493,10 +501,10 @@ namespace TensorSharp.Models
             int layer, SequenceState owner, int ownerTokens, int headDim, int blockSize)
         {
             int kvHeads = _layerNumKVHeads[layer];
-            int cacheLen = (int)_kvCacheK[layer].Sizes[1];
-            int totalElems = kvHeads * cacheLen * headDim;
-            if (!TryReadCacheAsF32(_kvCacheK[layer], totalElems, out float[] kFlat) ||
-                !TryReadCacheAsF32(_kvCacheV[layer], totalElems, out float[] vFlat))
+            // The owner's rows only, laid out [kvHeads, ownerTokens, headDim]: not the
+            // whole context the cache is sized for.
+            if (!KvCacheHostReader.TryReadHeadRowsAsFloat32(_kvCacheK[layer], ownerTokens, out float[] kFlat) ||
+                !KvCacheHostReader.TryReadHeadRowsAsFloat32(_kvCacheV[layer], ownerTokens, out float[] vFlat))
             {
                 return false;
             }
@@ -515,7 +523,7 @@ namespace TensorSharp.Models
 
                 for (int h = 0; h < kvHeads; h++)
                 {
-                    int srcOffset = (h * cacheLen + p) * headDim;
+                    int srcOffset = (h * ownerTokens + p) * headDim;
                     int dstOffset = slotOffset + h * headDim;
                     Buffer.BlockCopy(
                         kFlat, srcOffset * sizeof(float),
@@ -564,27 +572,6 @@ namespace TensorSharp.Models
             // populated. Matches the refresh pattern in TryInjectKVBlock.
             _nemoSlotMamba2NativeDecodeStateInitialized[layer][slot] = false;
             _nemoSlotMamba2HostStateStale[layer][slot] = false;
-        }
-
-        private static unsafe bool TryReadCacheAsF32(Tensor cache, int totalElems, out float[] flat)
-        {
-            if (cache.ElementType == DType.Float32)
-            {
-                flat = cache.GetElementsAsFloat(totalElems);
-                return true;
-            }
-            if (cache.ElementType == DType.Float16)
-            {
-                flat = new float[totalElems];
-                ushort* src = TensorComputePrimitives.GetHalfPointer(cache);
-                fixed (float* dst = flat)
-                {
-                    TensorComputePrimitives.F16ToF32(dst, src, totalElems);
-                }
-                return true;
-            }
-            flat = null;
-            return false;
         }
 
         public IReadOnlyList<float[]> ForwardBatch(BatchedForwardContext ctx)

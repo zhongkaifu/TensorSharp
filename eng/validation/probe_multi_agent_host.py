@@ -10,6 +10,18 @@ import time
 import urllib.request
 
 
+def shown_answer(frames):
+    """The answer a page is left showing: tokens append, a replace sets the whole of it
+    (a host takes back text that proved to be reasoning that way)."""
+    answer = ""
+    for frame in frames:
+        if isinstance(frame.get("token"), str):
+            answer += frame["token"]
+        if isinstance(frame.get("replace"), str):
+            answer = frame["replace"]
+    return answer
+
+
 def request(base, prompt, *, enabled=True, cancel_on_spawn=False, max_tokens=768):
     body = {"messages": [{"role": "user", "content": prompt}], "think": False,
             "maxTokens": max_tokens, "newChat": True, "multi_agent": enabled}
@@ -31,7 +43,7 @@ def request(base, prompt, *, enabled=True, cancel_on_spawn=False, max_tokens=768
                 time.sleep(1)
                 cancelled = True
                 break
-    answer = "".join(frame.get("token", "") for frame in frames)
+    answer = shown_answer(frames)
     return {"seconds": time.perf_counter() - started, "cancelled_on_spawn": cancelled,
             "answer": answer, "frames": frames}
 

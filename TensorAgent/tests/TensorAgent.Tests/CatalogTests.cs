@@ -20,6 +20,8 @@ public sealed class CatalogTests
             "qwen3.8-flash-next-q2kxl",
             "qwen3.8-flash-next-iq1m",
             "qwen-image-2.1-q4km",
+            "qwen-image-2.1-turbo-adq4k",
+            "qwen-image-2.1-turbo-q8",
             "minimax-h3-fl2va-q4k",
             "minimax-h3-ref2va-q4k",
             "gemma-4-26b-a4b-qat-q4kxl",
@@ -242,6 +244,8 @@ public sealed class CatalogTests
         "qwen3.8-flash-next-q2kxl",
         "qwen3.8-flash-next-iq1m",
         "qwen-image-2.1-q4km",
+        "qwen-image-2.1-turbo-adq4k",
+        "qwen-image-2.1-turbo-q8",
         "minimax-h3-fl2va-q4k",
         "minimax-h3-ref2va-q4k",
     };
@@ -262,13 +266,15 @@ public sealed class CatalogTests
     /// <summary>
     /// Qwen3.8 27B, Muse-Glimmer 30B and Qwen-Image 2.1 are offered only where a Mac's
     /// memory exists (no iPhone or iPad reaches 24 GB): the two chat models from 32 GB,
-    /// the image model from 24. See <see cref="EachDesktopEntryFitsItsTierBesideMacOS"/>
+    /// the image model and its 4-bit Turbo from 24, the 8-bit Turbo from 32. See <see cref="EachDesktopEntryFitsItsTierBesideMacOS"/>
     /// for the measurements behind each number.
     /// </summary>
     [Theory]
     [InlineData("qwen3.8-27b-q4kxl", 32)]
     [InlineData("muse-glimmer-30b-q4kxl", 32)]
     [InlineData("qwen-image-2.1-q4km", 24)]
+    [InlineData("qwen-image-2.1-turbo-adq4k", 24)]
+    [InlineData("qwen-image-2.1-turbo-q8", 32)]
     [InlineData("minimax-h3-fl2va-q4k", 32)]
     [InlineData("minimax-h3-ref2va-q4k", 32)]
     [InlineData("qwen3.8-flash-next-q2kxl", 48)]
@@ -345,6 +351,11 @@ public sealed class CatalogTests
         ["muse-glimmer-30b-q4kxl"] = (15.88, 10.9, "chat-e2e.py's seven scenarios with the projector, LeanCaches"),
         // The DiT stays mapped through the denoise; the text encoder is released first.
         ["qwen-image-2.1-q4km"] = (4.19, 14.3, "an edit at 1248x832, 40 steps (the CLI's peak footprint)"),
+        // Measured 2026-10-09 the same way (/usr/bin/time -l, peak memory footprint), 8 steps: the
+        // peak does not depend on the transformer's quantization (base 14.37, AD-Q4_K 14.35,
+        // Q8_0 14.36 GB), so the 8-bit file's 3.4 GB of extra weights are what move it up a tier.
+        ["qwen-image-2.1-turbo-adq4k"] = (4.20, 14.4, "an edit at 1248x832, 8 steps (the CLI's peak footprint)"),
+        ["qwen-image-2.1-turbo-q8"] = (7.59, 14.4, "an edit at 1248x832, 8 steps (the CLI's peak footprint)"),
         // The largest stage is the 18.2 GB text encoder: the denoiser and the VAEs kept from the
         // previous clip are taken off the device before it runs (MiniMaxH3Pipeline), and wired
         // memory peaked at 20 GB with the decode (denoiser + video VAE) on top of the system's.
@@ -406,6 +417,50 @@ public sealed class CatalogTests
             Assert.True(need > below,
                 $"{id} needs about {need:F1} GB ({how}), which the {below} GB tier already holds");
         }
+    }
+
+    /// <summary>
+    /// Every chat entry has room on a desktop for TensorAgent's shared prompt (~7.2k tokens
+    /// of tools, skills and instructions), a reply and a conversation. Eighteen entries said
+    /// 8,192 -- a phone's budget -- and on a Mac that left about a thousand tokens beside the
+    /// shared prompt, so every follow-up compacted the conversation away. The window is the
+    /// documented rule (<see cref="CatalogModel.DesktopContextLength"/>), checked here
+    /// against each entry's stated K/V cost; the phone's <see cref="CatalogModel.ContextLength"/>
+    /// and the jetsam tests above are unchanged.
+    /// </summary>
+    [Fact]
+    public void EveryChatEntryHasRoomForTheSharedPromptAndAConversationOnTheDesktop()
+    {
+        foreach (CatalogModel m in ModelCatalog.BuiltIn.Where(m => m.Kind != CatalogArchitectureKind.Diffusion))
+        {
+            Assert.True(m.DesktopContextLength >= CatalogModel.MinimumDesktopChatContext,
+                $"{m.Id} gets a {m.DesktopContextLength}-token window on a desktop; the shared prompt, a reply "
+                + $"and a conversation need {CatalogModel.MinimumDesktopChatContext}");
+            Assert.True(m.DesktopContextLength >= m.ContextLength, $"{m.Id}: a desktop never gets less than a phone");
+            if (m.ContextLength >= CatalogModel.DesktopChatContextTarget)
+                continue;
+
+            Assert.True(m.KvBytesPerToken > 0, $"{m.Id} must state its K/V bytes per token to be given a desktop window");
+            Assert.True(m.DesktopContextLength <= CatalogModel.DesktopChatContextTarget);
+            Assert.Equal(0, m.DesktopContextLength % 4096);
+            // Half of what the tier has beside the weights, the dequantized projector and the
+            // system holds the whole window's K/V twice (host tensor and device mirror).
+            double spare = m.MinDeviceMemoryGB * 1e9 - m.ResidentWeightsBytes
+                - 2.0 * (m.Projector?.Bytes ?? 0) - MacOsGB * 1e9;
+            Assert.True(2.0 * m.KvBytesPerToken * m.DesktopContextLength <= spare / 2,
+                $"{m.Id}: {m.DesktopContextLength} tokens of K/V do not fit its {m.MinDeviceMemoryGB} GB tier");
+        }
+
+        // Where the tier, not the target, decides -- each worked in the entry's comment.
+        Assert.Equal(16384, ModelCatalog.Find("gemma-4-e4b-iq4xs")!.DesktopContextLength);
+        Assert.Equal(20480, ModelCatalog.Find("gemma-4-31b-q4-0")!.DesktopContextLength);
+        Assert.Equal(28672, ModelCatalog.Find("qwen3.6-27b-q4km")!.DesktopContextLength);
+        Assert.Equal(16384, ModelCatalog.Find("mistral-small-3.1-24b-q4km")!.DesktopContextLength);
+        Assert.Equal(32768, ModelCatalog.Find("gemma-4-e2b-q8")!.DesktopContextLength);
+        Assert.Equal(32768, ModelCatalog.Find("nemotron-h-8b-q4km")!.DesktopContextLength);
+        // A diffusion entry's prompt carries no shared agent prompt, and its window is its own.
+        CatalogModel diffusion = ModelCatalog.Find("diffusiongemma-26b-a4b-q4km")!;
+        Assert.Equal(diffusion.ContextLength, diffusion.DesktopContextLength);
     }
 
     [Fact]
@@ -601,6 +656,8 @@ public sealed class CatalogTests
         "minimax-h3-ref2va-q4k",
         "qwen3.8-flash-next-q2kxl",
         "qwen3.8-flash-next-iq1m",
+        "qwen-image-2.1-turbo-adq4k",
+        "qwen-image-2.1-turbo-q8",
         "gemma-4-26b-a4b-qat-q4kxl",
         "gemma-4-31b-q4-0",
         "qwen3.5-35b-a3b-q4km",

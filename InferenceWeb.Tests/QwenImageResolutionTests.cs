@@ -4,6 +4,7 @@ using TensorSharp.Models.QwenImage;
 
 namespace InferenceWeb.Tests;
 
+[Collection(QwenImageDefaultSizeCollection.Name)]
 public sealed class QwenImageResolutionTests : IDisposable
 {
     private readonly string _width = Environment.GetEnvironmentVariable("TS_QWEN_IMAGE_WIDTH");

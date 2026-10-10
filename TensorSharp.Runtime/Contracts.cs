@@ -193,6 +193,20 @@ namespace TensorSharp.Runtime
         long ComputeKVBlockByteSize(int tokenCount) => 0;
 
         /// <summary>
+        /// Bytes of the same block snapshot WITHOUT its recurrent-state section: the
+        /// attention K/V rows only. A <see cref="RequiresPerBlockCapture"/> model
+        /// bundles its whole running state (Mamba2 conv/SSM, GDN) with every block,
+        /// yet only a block captured exactly at its own end can ever be resumed from
+        /// (<c>KvBlock.IsRestorablePrefixEnd</c>); the state copied into any other
+        /// block is never read. Such a model may offer this smaller form, which
+        /// <see cref="TryExtractKVBlock"/> / <see cref="TryInjectKVBlock"/> then accept
+        /// alongside the full one, told apart by the span length. Equal to
+        /// <see cref="ComputeKVBlockByteSize"/> (the default) when the model has no
+        /// separate form; the executor then writes every block in full.
+        /// </summary>
+        long ComputeKVBlockByteSizeWithoutRecurrentState(int tokenCount) => ComputeKVBlockByteSize(tokenCount);
+
+        /// <summary>
         /// Whether this architecture must be snapshotted at every block boundary
         /// DURING prefill, rather than once at the end. Recurrent / SSM layers
         /// (Qwen 3.5 GatedDeltaNet, Nemotron Mamba2) need this because the running
@@ -204,7 +218,10 @@ namespace TensorSharp.Runtime
         /// <summary>
         /// Copy the bytes for token positions <c>[startToken, startToken+tokenCount)</c>
         /// of the model's per-layer K/V cache into <paramref name="destination"/>. The
-        /// destination must be exactly <see cref="ComputeKVBlockByteSize"/> bytes wide.
+        /// destination must be exactly <see cref="ComputeKVBlockByteSize"/> bytes wide,
+        /// or exactly <see cref="ComputeKVBlockByteSizeWithoutRecurrentState"/> for a
+        /// model with that smaller form, which then writes the K/V rows and no
+        /// recurrent state.
         /// Returns false if the requested range is not valid (e.g. extends past the
         /// model's currently-cached tokens) or the model does not support snapshots.
         /// </summary>
@@ -217,6 +234,10 @@ namespace TensorSharp.Runtime
         /// cache at that position. <paramref name="destToken"/> must equal the
         /// current cached token count - in other words the manager always appends
         /// in order from position 0. Returns false on size mismatch or unsupported.
+        /// A source of exactly <see cref="ComputeKVBlockByteSizeWithoutRecurrentState"/>
+        /// bytes (when that differs from the full size) writes the K/V rows and leaves
+        /// the recurrent state untouched: the model holds no resumable state at the new
+        /// end until a block carrying its state follows.
         /// </summary>
         bool TryInjectKVBlock(int destToken, int tokenCount, ReadOnlySpan<byte> source) => false;
     }

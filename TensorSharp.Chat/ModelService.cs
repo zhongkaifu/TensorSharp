@@ -73,6 +73,10 @@ namespace TensorSharp.Server
         public string LoadedMmProjPath => _lifecycle.LoadedMmProjPath;
         public string LoadedBackend => _lifecycle.LoadedBackend;
         public virtual string Architecture => _lifecycle.Architecture;
+        /// <summary>The loaded GGUF's embedded chat template, or null. One architecture name
+        /// can carry two turn formats, and some parsing decisions depend on which one
+        /// (<see cref="OutputParserFactory.IsAlwaysRequired(string, string)"/>).</summary>
+        public virtual string ChatTemplate => _lifecycle.Model?.Config?.ChatTemplate;
         /// <summary>Whether the loaded model carries its optional audio tower (see <see cref="TensorSharp.Models.Architecture.AudioInputSupport"/>).</summary>
         public virtual bool IsAudioEncoderLoaded => TensorSharp.Models.Architecture.AudioInputSupport.IsAudioEncoderLoaded(_lifecycle.Model);
         public ModelBase Model => _lifecycle.Model;
@@ -348,7 +352,7 @@ namespace TensorSharp.Server
             // One turn, many generations: every round of the loop runs in the cache scope
             // its first round resolved, so round two continues round one's state even on
             // a shared session where the scope is proved from history.
-            var turn = new ChatTurnContext();
+            var turn = new ChatTurnContext { StagedAttachmentNames = skills.StagedAttachmentNames };
 
             // Sampling for a turn that can run code. The runner decides, because it is
             // what knows the operator's configuration; SamplingConfig.ForCodingTurn then

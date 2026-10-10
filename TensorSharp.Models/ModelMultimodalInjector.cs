@@ -210,6 +210,23 @@ namespace TensorSharp.Models
 
         public List<int> ProcessPromptTokens(List<ChatMessage> history, List<int> inputTokens, string requestId = null)
         {
+            // An encode is a use of the model the engine does not see: registered so an
+            // unload waits for it (or stops it at its next yield) instead of freeing the
+            // encoder's weights under it. See ModelBase.BeginRetirement.
+            if (!_model.TryEnterUse())
+                throw new ModelUnloadedException();
+            try
+            {
+                return ProcessPromptTokensCore(history, inputTokens, requestId);
+            }
+            finally
+            {
+                _model.ExitUse();
+            }
+        }
+
+        private List<int> ProcessPromptTokensCore(List<ChatMessage> history, List<int> inputTokens, string requestId)
+        {
             string key = NormalizeRequestId(requestId);
             var previous = _preparation.Value;
             var current = new PreparationContext(key,

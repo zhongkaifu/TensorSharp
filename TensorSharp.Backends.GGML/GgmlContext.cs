@@ -24,6 +24,14 @@ namespace TensorSharp.GGML
         /// </summary>
         public long ReleasePooledMemory() => MemoryPool.Trim();
 
+        /// <summary>
+        /// The model that owns this context has been disposed: release the pooled host
+        /// blocks and stop pooling (see <see cref="GgmlMemoryPool.Close"/>). Only the owner
+        /// may call this, after its tensors are freed and no Metal buffer wraps them any
+        /// longer (ClearHostBufferCache).
+        /// </summary>
+        public long ReleasePoolForDisposal() => MemoryPool.Close();
+
         public GgmlContext(int[] deviceIds, GgmlBackendType backendType)
             : this(deviceIds, backendType, enableCollectives: true)
         {

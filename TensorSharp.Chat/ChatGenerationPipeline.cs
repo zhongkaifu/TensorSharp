@@ -126,8 +126,11 @@ namespace TensorSharp.Server
         /// produced (see <see cref="ChatMessage.RawGenerationSuffix"/>). The skills
         /// loops rebuild each tool round from this update, so without it a round's
         /// framing would be replayed as whatever the NEXT request's mode is.
-        /// An open Gemma thought channel is also sent in an empty non-terminal
-        /// update before generation, so streaming parsers know its initial state.
+        /// An open Gemma thought channel, and the reasoning block of a template whose
+        /// thinking-off replies may reason anyway
+        /// (<see cref="ChatProtocol.ThinkingOffReplyMayReason"/>), are also sent in an
+        /// empty non-terminal update before generation, so streaming parsers know their
+        /// initial state.
         /// </summary>
         public string? RawGenerationSuffix { get; init; }
 
@@ -136,6 +139,15 @@ namespace TensorSharp.Server
         /// <see cref="Piece"/>. Only meaningful when <see cref="IsParsed"/> is true.
         /// </summary>
         public string ThinkingPiece { get; init; }
+
+        /// <summary>
+        /// Answer text that earlier updates carried in <see cref="Piece"/> and that proved
+        /// to be reasoning (<see cref="ParsedOutput.RetractedContent"/>): the consumer removes
+        /// it from the end of the answer before it applies this update, whose
+        /// <see cref="ThinkingPiece"/> already holds it. Only a producer told that its
+        /// consumer can take text back sets it (<c>SkillRequestPlan.ClientRetractsAnswerText</c>).
+        /// </summary>
+        public string RetractedPiece { get; init; }
 
         /// <summary>
         /// Tool calls the CALLER must service, already extracted. Only meaningful when
@@ -165,11 +177,19 @@ namespace TensorSharp.Server
         /// <summary>One already-parsed delta: content, reasoning, or caller tool calls.</summary>
         public static ChatStreamUpdate Parsed(
             string content, string thinking, IReadOnlyList<ToolCall> toolCalls) =>
+            Parsed(content, thinking, toolCalls, retracted: null);
+
+        /// <summary>One already-parsed delta that also takes back earlier content (see
+        /// <see cref="RetractedPiece"/>). A separate overload, not an optional parameter, so
+        /// code built against the three-argument form keeps binding to it.</summary>
+        public static ChatStreamUpdate Parsed(
+            string content, string thinking, IReadOnlyList<ToolCall> toolCalls, string retracted) =>
             new(content ?? string.Empty, false, 0, 0, 0, 0, 0, 0, null)
             {
                 ThinkingPiece = thinking,
                 ParsedToolCalls = toolCalls,
                 IsParsed = true,
+                RetractedPiece = string.IsNullOrEmpty(retracted) ? null : retracted,
             };
 
         /// <summary>
@@ -233,6 +253,17 @@ namespace TensorSharp.Server
         /// Only exact matches within the current public prefix become checkpoint
         /// boundaries; this never grants another agent access to private history.</summary>
         public IReadOnlyList<MultiAgentPromptProfile> PublicPrefixCandidates { get; set; }
+
+        /// <summary>The shared prefix (length and hash) the turn last logged, so a tool loop
+        /// logs it once and again only if a round's differs.</summary>
+        public string LoggedSharedPrefix { get; set; }
+
+        /// <summary>Each upload's path to the name the code tools stage it under, when the
+        /// request offers them (<c>WebUiChatService.StagedNamesBySource</c>); null otherwise.
+        /// An earlier picture that no longer fits the window is named in its note by this name
+        /// -- the one the message's own "(Attached as file ...)" note gives -- not by the
+        /// user's display name, which two photos can share.</summary>
+        public IReadOnlyDictionary<string, string> StagedAttachmentNames { get; set; }
     }
 
     internal sealed class ChatGenerationPipeline : IDisposable
@@ -297,6 +328,10 @@ namespace TensorSharp.Server
                 ChatTurnContext turnContext = null)
         {
             session ??= new ChatSession("__svc_intrinsic__", sharedAcrossConversations: true);
+            // Which load this request runs on, read BEFORE the model: an unload advances it
+            // first, so a request that still sees the old model never files its tokens as
+            // the next model's (see ConversationTranscriptStore.Augment).
+            long loadEpoch = _lifecycle.LoadEpoch;
             var model = _lifecycle.Model
                 ?? throw new InvalidOperationException("No model is loaded.");
 
@@ -341,11 +376,17 @@ namespace TensorSharp.Server
             // timing channel reads would charge all prefill to decode and include
             // client backpressure in the reported token generation speed.
             var totalSw = Stopwatch.StartNew();
-            var engine = _engineHost.TryGetEngine()
-                ?? throw new InvalidOperationException(
+            var engine = _engineHost.TryGetEngine();
+            if (engine == null)
+            {
+                // No engine is built on a model being unloaded (InferenceEngineHost).
+                if (model.IsRetiring)
+                    throw new ModelUnloadedException();
+                throw new InvalidOperationException(
                     "Continuous-batching engine is unavailable for this model " +
                     "(the model supports neither IBatchedPagedModel.ForwardBatch " +
                     "nor IModelArchitecture.SupportsKVStateSnapshot).");
+            }
             var enginePoolStats = engine.PoolStats;
             long engineCapacityLong = (long)enginePoolStats.totalBlocks * enginePoolStats.blockSize;
             int engineContextLimit = (int)Math.Min(int.MaxValue, engineCapacityLong);
@@ -356,7 +397,7 @@ namespace TensorSharp.Server
             var preparedHistory = ChatHistoryPreparer.PrepareHistoryForInference(history, arch, _logger);
             TranscriptAugmentation augmentation;
             lock (session.HistoryLock)
-                augmentation = session.Transcripts.Augment(preparedHistory);
+                augmentation = session.Transcripts.Augment(preparedHistory, loadEpoch);
             List<ChatMessage> renderHistory = augmentation.History;
             // Which conversation's cached state this request may continue past the
             // public prefix: the session's own (Web UI chat), or the one the history
@@ -399,7 +440,6 @@ namespace TensorSharp.Server
             int contextLimit = model.MaxContextLength;
             if (engineContextLimit > 0 && (contextLimit <= 0 || engineContextLimit < contextLimit))
                 contextLimit = engineContextLimit;
-            int hardPromptLimit = contextLimit > 1 ? contextLimit - 1 : 0;
             int requestedReserve = contextLimit > 1
                 ? HistoryCompactionReserve(maxTokens, contextLimit)
                 : 0;
@@ -429,10 +469,15 @@ namespace TensorSharp.Server
                     out generationPromptTrailingWhitespace,
                     tools: tools, enableThinking: enableThinking, reasoningEffort: reasoningEffort);
                 _logger.LogWarning(LogEventIds.PromptTruncated,
-                    "prompt.history_compacted from {OriginalTokens} to {KeptTokens} tokens by removing {RemovedMessages} old messages (contextLimit={ContextLimit}, historyReserve={HistoryReserve} for a requested reply of {RequestedTokens}, sessionId={SessionId}); leading instructions, latest user task, and newest repair round were preserved",
+                    "prompt.history_compacted from {OriginalTokens} to {KeptTokens} tokens by removing {RemovedMessages} old messages (contextLimit={ContextLimit}, protectedTokens={ProtectedTokens}, historyReserve={HistoryReserve} of a preferred {PreferredReserve} for a requested reply of {RequestedTokens}, sessionId={SessionId}); leading instructions, latest user task, and newest repair round were preserved",
                     window.OriginalPromptTokens, inputTokens.Count, window.RemovedMessages,
-                    contextLimit, requestedReserve, maxTokens, session?.Id ?? "(none)");
+                    contextLimit, window.ProtectedTokens, contextLimit - window.PromptLimit, requestedReserve,
+                    maxTokens, session?.Id ?? "(none)");
             }
+
+            // Rendering can take a while on a long chat, and a switch can unload the model
+            // meanwhile: stop here, the way the rest of preparation stops (see PrepareMediaPrompt).
+            ThrowIfUnloaded(model, cancellationToken);
 
             bool hasMultimodal = RequiresMultimodalPreparation(renderHistory);
             if (hasMultimodal)
@@ -478,98 +523,70 @@ namespace TensorSharp.Server
                 // ~3-line change as for Gemma 4 and recommended.
                 lock (model.GpuComputeLock)
                 {
-                    List<ChatMessage> historyBeforeMediaCompaction = renderHistory;
                     var unexpandedTokens = inputTokens;
-                    int unexpandedBeforeMediaCompaction = unexpandedTokens.Count;
-                    string mediaBeforeCompaction = BuildMediaFingerprint(renderHistory);
                     // ClearPreparedPromptState is safe when preparation fails
                     // before creating a bucket. Arm cleanup first so partial
                     // image/audio preparation cannot leak tensors on overflow
                     // or any other exception before engine submission.
                     injectorBucketCreated = true;
-                    inputTokens = model.MultimodalInjector.ProcessPromptTokens(renderHistory, inputTokens, requestId);
+                    inputTokens = PrepareMediaPrompt(model, cancellationToken, renderHistory, inputTokens, requestId);
 
                     // Media placeholders expand only after the encoder runs. If that
-                    // expansion consumed the reply reserve, use the now-known overhead
-                    // to remove additional complete old turns and prepare once more.
-                    // This prevents the final token fallback from slicing off system
-                    // instructions merely because an image added thousands of tokens.
-                    int expansionOverhead = Math.Max(0, inputTokens.Count - unexpandedTokens.Count);
-                    int adjustedPromptLimit = targetPromptLimit > expansionOverhead
-                        ? targetPromptLimit - expansionOverhead
-                        : 1;
+                    // expansion consumed the reply reserve, earlier images and recordings
+                    // give way first -- each replaced by a note in its own message, so the
+                    // turn's words and the answer about it stay -- and only then complete
+                    // old turns (CompactMediaHistoryForContext). Every candidate is measured
+                    // by preparing it, which the encoder's content-keyed cache answers for
+                    // whatever media it keeps. This prevents the final token fallback from
+                    // slicing off system instructions merely because an image added
+                    // thousands of tokens.
                     if (!preserveAttachedDocuments && targetPromptLimit > 0
-                        && inputTokens.Count > targetPromptLimit
-                        && unexpandedTokens.Count > adjustedPromptLimit)
+                        && inputTokens.Count > targetPromptLimit)
                     {
-                        ContextHistoryWindow mediaWindow = CompactHistoryForContext(
-                            renderHistory,
-                            unexpandedTokens.Count,
-                            adjustedPromptLimit,
-                            CountPromptTokens);
-                        if (mediaWindow.RemovedMessages > 0
-                            && mediaWindow.FinalPromptTokens <= hardPromptLimit)
+                        List<ChatMessage> prepared = renderHistory;
+                        List<int> preparedUnexpanded = unexpandedTokens;
+                        List<int> preparedExpanded = inputTokens;
+                        List<int> preparedBreakpoints = explicitBreakpoints;
+                        string preparedTrailingWhitespace = generationPromptTrailingWhitespace;
+                        int Prepare(List<ChatMessage> candidate)
                         {
                             model.MultimodalInjector.ClearPreparedPromptState(requestId);
-                            renderHistory = mediaWindow.History;
-                            unexpandedTokens = _kvCacheRenderer.RenderToTokens(
-                                model.Tokenizer, model.Config.ChatTemplate, renderHistory, arch,
-                                addGenerationPrompt: true, out explicitBreakpoints,
-                                out generationPromptTrailingWhitespace,
+                            preparedUnexpanded = _kvCacheRenderer.RenderToTokens(
+                                model.Tokenizer, model.Config.ChatTemplate, candidate, arch,
+                                addGenerationPrompt: true, out preparedBreakpoints,
+                                out preparedTrailingWhitespace,
                                 tools: tools, enableThinking: enableThinking, reasoningEffort: reasoningEffort);
-                            inputTokens = model.MultimodalInjector.ProcessPromptTokens(
-                                renderHistory, unexpandedTokens, requestId);
+                            preparedExpanded = PrepareMediaPrompt(model, cancellationToken,
+                                candidate, preparedUnexpanded, requestId);
+                            prepared = candidate;
+                            return preparedExpanded.Count;
+                        }
 
-                            // If the discarded prefix itself owned an old image/audio
-                            // attachment, its expansion tokens disappeared too. The
-                            // first limit conservatively charged that now-absent media
-                            // to every remaining text turn and may therefore have
-                            // removed more history than necessary. Recompute once with
-                            // the measured remaining-media overhead and recover the
-                            // largest message-boundary window that does not reintroduce
-                            // any removed media. This costs at most one additional media
-                            // preparation, only on an already-overflowing prompt.
-                            int remainingMediaOverhead = Math.Max(
-                                0, inputTokens.Count - unexpandedTokens.Count);
-                            string mediaAfterCompaction = BuildMediaFingerprint(renderHistory);
-                            if (remainingMediaOverhead < expansionOverhead
-                                && !string.Equals(
-                                    mediaBeforeCompaction,
-                                    mediaAfterCompaction,
-                                    StringComparison.Ordinal))
-                            {
-                                ContextHistoryWindow recoveredWindow = RecoverHistoryAfterRemovedMedia(
-                                    historyBeforeMediaCompaction,
-                                    unexpandedBeforeMediaCompaction,
-                                    targetPromptLimit,
-                                    hardPromptLimit,
-                                    remainingMediaOverhead,
-                                    mediaWindow,
-                                    mediaAfterCompaction,
-                                    CountPromptTokens);
-                                if (recoveredWindow.RemovedMessages < mediaWindow.RemovedMessages)
-                                {
-                                    model.MultimodalInjector.ClearPreparedPromptState(requestId);
-                                    renderHistory = recoveredWindow.History;
-                                    unexpandedTokens = _kvCacheRenderer.RenderToTokens(
-                                        model.Tokenizer, model.Config.ChatTemplate, renderHistory, arch,
-                                        addGenerationPrompt: true, out explicitBreakpoints,
-                                        out generationPromptTrailingWhitespace,
-                                        tools: tools, enableThinking: enableThinking, reasoningEffort: reasoningEffort);
-                                    inputTokens = model.MultimodalInjector.ProcessPromptTokens(
-                                        renderHistory, unexpandedTokens, requestId);
-                                    mediaWindow = recoveredWindow;
-                                    remainingMediaOverhead = Math.Max(
-                                        0, inputTokens.Count - unexpandedTokens.Count);
-                                }
-                            }
+                        MediaHistoryWindow mediaWindow = CompactMediaHistoryForContext(
+                            renderHistory, unexpandedTokens.Count, inputTokens.Count,
+                            contextLimit, maxTokens, CountPromptTokens, Prepare,
+                            turnContext.StagedAttachmentNames);
+                        if (!ReferenceEquals(mediaWindow.History, prepared))
+                            Prepare(mediaWindow.History);
+                        renderHistory = prepared;
+                        unexpandedTokens = preparedUnexpanded;
+                        inputTokens = preparedExpanded;
+                        explicitBreakpoints = preparedBreakpoints;
+                        generationPromptTrailingWhitespace = preparedTrailingWhitespace;
+
+                        if (mediaWindow.ElidedMedia > 0 || mediaWindow.RemovedMessages > 0)
+                        {
                             _logger.LogWarning(LogEventIds.PromptTruncated,
-                                "prompt.multimodal_history_compacted from {OriginalTokens} to {KeptTokens} unexpanded tokens by removing {RemovedMessages} old messages after accounting for {MediaTokens} media-expansion tokens (contextLimit={ContextLimit}, sessionId={SessionId})",
+                                "prompt.multimodal_history_compacted from {OriginalTokens} to {KeptTokens} tokens by replacing {ElidedMedia} earlier images, videos or recordings with a note and removing {RemovedMessages} old messages (contextLimit={ContextLimit}, protectedTokens={ProtectedTokens}, historyReserve={HistoryReserve} of a preferred {PreferredReserve} for a requested reply of {RequestedTokens}, sessionId={SessionId})",
                                 mediaWindow.OriginalPromptTokens,
-                                unexpandedTokens.Count,
+                                inputTokens.Count,
+                                mediaWindow.ElidedMedia,
                                 mediaWindow.RemovedMessages,
-                                remainingMediaOverhead,
                                 contextLimit,
+                                mediaWindow.ProtectedTokens,
+                                contextLimit - mediaWindow.PromptLimit,
+                                requestedReserve,
+                                maxTokens,
                                 session?.Id ?? "(none)");
                         }
                     }
@@ -586,7 +603,8 @@ namespace TensorSharp.Server
                         preserveAllInput: true,
                         executionContextLimit: engineContextLimit,
                         explicitBreakpoints: explicitBreakpoints,
-                        preservedInputKind: preserveAttachedDocuments ? "document and media input" : "media input");
+                        preservedInputKind: preserveAttachedDocuments ? "document and media input" : "media input",
+                        forModel: model);
 
                     // Where each image/audio span landed and what it is, after any trim:
                     // the engine compares these positionally when it reuses a prefix.
@@ -598,7 +616,8 @@ namespace TensorSharp.Server
                 inputTokens = TruncatePromptToContext(
                     session, inputTokens, maxTokens, out effectiveMaxTokens, null,
                     preserveAllInput: preserveAttachedDocuments,
-                    executionContextLimit: engineContextLimit, explicitBreakpoints: explicitBreakpoints);
+                    executionContextLimit: engineContextLimit, explicitBreakpoints: explicitBreakpoints,
+                    forModel: model);
             }
 
             int promptTokenCount = inputTokens.Count;
@@ -620,6 +639,7 @@ namespace TensorSharp.Server
             IReadOnlyList<int> publicCheckpointBoundaries = ComputePublicCheckpointBoundaries(
                 model, inputTokens, sharedPrefixTokens, turnContext.PublicPrefixCandidates,
                 arch, enableThinking, reasoningEffort);
+            LogSharedPrefix(turnContext, session, requestId, inputTokens, sharedPrefixTokens, publicCheckpointBoundaries);
 
             var seq = new SequenceState(
                 requestId: requestId,
@@ -634,11 +654,26 @@ namespace TensorSharp.Server
                 cacheScope: cacheScope,
                 publicCheckpointBoundaries: publicCheckpointBoundaries);
 
-            string recordedSuffix = RecordedGenerationSuffix(model.Tokenizer, inputTokens, arch, enableThinking);
-            if (SignalsOpenThoughtChannel(arch, recordedSuffix))
+            string recordedSuffix = RecordedGenerationSuffix(model.Tokenizer, inputTokens, arch, enableThinking,
+                model.Config.ChatTemplate);
+            bool announceSuffix = AnnouncesGenerationSuffix(arch, model.Config.ChatTemplate, recordedSuffix, cfg);
+            if (announceSuffix)
                 yield return ChatStreamUpdate.Text(string.Empty) with { RawGenerationSuffix = recordedSuffix };
 
-            var handle = engine.SubmitRequest(seq, cancellationToken);
+            InferenceRequestHandle handle;
+            try
+            {
+                handle = engine.SubmitRequest(seq, cancellationToken);
+            }
+            catch (ObjectDisposedException ex) when (model.IsRetiring || cancellationToken.IsCancellationRequested)
+            {
+                // The engine was torn down while this request was still preparing (an image
+                // encode runs before submission). A switch that stopped the turn ends it the
+                // way a stopped turn ends; a request nobody stopped is told what happened.
+                if (cancellationToken.IsCancellationRequested)
+                    throw new OperationCanceledException(ex.Message, ex, cancellationToken);
+                throw new ModelUnloadedException(ex);
+            }
             var generatedTokens = new List<int>();
             var rawBytes = new List<byte>();
             int prevValidLen = 0;
@@ -650,6 +685,11 @@ namespace TensorSharp.Server
             StringBuilder decodedForStops = hasStopSequences ? new StringBuilder() : null;
             TokenSampler stopSampler = hasStopSequences ? new TokenSampler(cfg) : null;
             string finishReason = "max_tokens";
+
+            // A family whose model writes the tool's result itself after its call ends the
+            // turn at its first complete call (ChatProtocol.ToolCallEndsTurn).
+            ToolCallTurnEnd toolCallTurnEnd = ToolCallTurnEnd.For(arch, model.Config.ChatTemplate, enableThinking, tools,
+                announceSuffix ? recordedSuffix : null);
 
             // The thinking budget. A reasoning model can spend an ENTIRE token
             // allowance inside its thinking channel and emit no answer at all: observed
@@ -736,6 +776,12 @@ namespace TensorSharp.Server
                         stopRequested = true;
                         finishReason = "stop_sequence";
                     }
+                }
+
+                if (toolCallTurnEnd != null && toolCallTurnEnd.Observe(piece))
+                {
+                    stopRequested = true;
+                    finishReason = "stop_sequence";
                 }
 
                 if (thinkingScan != null && !thinkingClosed)
@@ -832,11 +878,12 @@ namespace TensorSharp.Server
                     RawGenerationSuffix = recordedSuffix,
                 },
                 BuildEmittedTurn(arch, assistantText, enableThinking, tools,
-                    // Parsers are primed with the prompt's open channel exactly when this
+                    // Parsers are primed with the prompt's tail exactly when this
                     // pipeline announced it (above); mirror that, or the recorded content
                     // would differ from what the adapters parsed.
-                    SignalsOpenThoughtChannel(arch, recordedSuffix) ? recordedSuffix : null,
-                    wasCancelled));
+                    announceSuffix ? recordedSuffix : null,
+                    wasCancelled),
+                loadEpoch);
 
             if (stopped != null)
             {
@@ -909,6 +956,7 @@ namespace TensorSharp.Server
             SamplingConfig samplingConfig = null)
         {
             session ??= new ChatSession("__svc_intrinsic__", sharedAcrossConversations: true);
+            long loadEpoch = _lifecycle.LoadEpoch;   // before the model; see ChatStreamWithMetricsAsync
             var model = (DiffusionGemmaModel)(_lifecycle.Model
                 ?? throw new InvalidOperationException("No model is loaded."));
             string arch = model.Config.Architecture;
@@ -917,7 +965,7 @@ namespace TensorSharp.Server
             // Read under the session lock so a parallel request's record can't race it.
             List<ChatMessage> renderHistory;
             lock (session.HistoryLock)
-                renderHistory = session.Transcripts.Augment(preparedHistory).History;
+                renderHistory = session.Transcripts.Augment(preparedHistory, loadEpoch).History;
             bool preserveAttachedDocuments = HasTextFileAttachments(renderHistory);
 
             using var chatScope = _telemetry.BeginInferenceScope(
@@ -964,7 +1012,7 @@ namespace TensorSharp.Server
                 turns.Enter(cancellationToken);
                 try
                 {
-                    inputTokens = model.MultimodalInjector.ProcessPromptTokens(
+                    inputTokens = PrepareMediaPrompt(model, cancellationToken,
                         renderHistory, inputTokens, mediaRequestId);
                 }
                 finally { turns.Exit(); }
@@ -975,12 +1023,14 @@ namespace TensorSharp.Server
                 preserveAllInput: preserveAttachedDocuments || hasImageMedia,
                 preservedInputKind: hasImageMedia
                     ? (preserveAttachedDocuments ? "document and media input" : "media input")
-                    : "document");
+                    : "document",
+                forModel: model);
             int promptTokenCount = inputTokens.Count;
             // The publisher template may leave a thought channel open at the end of the
             // prompt; the parser then has to start inside it, exactly as it does for
             // Gemma 4's autoregressive turns.
-            string generationSuffix = RecordedGenerationSuffix(model.Tokenizer, inputTokens, arch, enableThinking: false);
+            string generationSuffix = RecordedGenerationSuffix(model.Tokenizer, inputTokens, arch, enableThinking: false,
+                model.Config.ChatTemplate);
             promptSw.Stop();
 
             try
@@ -1026,7 +1076,8 @@ namespace TensorSharp.Server
                         RawPromptTrailingWhitespace = generationPromptTrailingWhitespace,
                     },
                     new EmittedAssistantTurn(finalContent, null, finalThinking, finalText,
-                        cancellationToken.IsCancellationRequested));
+                        cancellationToken.IsCancellationRequested),
+                    loadEpoch);
 
                 long totalNs = InferenceTelemetry.ToNanos(totalSw.ElapsedTicks);
                 _telemetry.LogChatFinished(
@@ -1155,16 +1206,61 @@ namespace TensorSharp.Server
             catch { return string.Empty; }
         }
 
-        private static bool SignalsOpenThoughtChannel(string arch, string recordedSuffix)
-            => arch == "gemma4" && recordedSuffix != null
-                && recordedSuffix.EndsWith("<|channel>thought\n", StringComparison.Ordinal);
+        /// <summary>
+        /// The media half of prompt preparation (the vision/audio encode, on the request's
+        /// thread). A model switch that stops the request during it unloads the model, and
+        /// the encode stops at its next block (ModelBase.BeginRetirement); a request the
+        /// switch cancelled ends as stopped rather than as an error.
+        /// </summary>
+        private static void ThrowIfUnloaded(ModelBase model, CancellationToken cancellationToken)
+        {
+            if (!model.IsRetiring)
+                return;
+            cancellationToken.ThrowIfCancellationRequested();
+            throw new ModelUnloadedException();
+        }
+
+        private static List<int> PrepareMediaPrompt(
+            ModelBase model, CancellationToken cancellationToken,
+            List<ChatMessage> history, List<int> inputTokens, string requestId)
+        {
+            try
+            {
+                return model.MultimodalInjector.ProcessPromptTokens(history, inputTokens, requestId);
+            }
+            catch (ModelUnloadedException ex) when (cancellationToken.IsCancellationRequested)
+            {
+                throw new OperationCanceledException(ex.Message, ex, cancellationToken);
+            }
+        }
+
+        /// <summary>
+        /// Whether every parser of this turn is told what the prompt ended with before the
+        /// first piece: a Gemma 4 prompt that opened the thought channel, or any tail of a
+        /// template whose thinking-off replies may reason past a closed block
+        /// (<see cref="ChatProtocol.ThinkingOffReplyMayReason"/>), where the tail rather than
+        /// the request's flag says whether the block is open. Not the latter when
+        /// <paramref name="sampling"/> constrains the reply from its first token
+        /// (<see cref="OutputParserFactory.ConstrainsReplyStart"/>): a thinking-off
+        /// <c>response_format</c> reply is the JSON, and parsed as possible reasoning a
+        /// <c>&lt;/think&gt;</c> inside one of its strings split it in two.
+        /// </summary>
+        internal static bool AnnouncesGenerationSuffix(string arch, string chatTemplate, string recordedSuffix,
+            SamplingConfig sampling = null)
+        {
+            if (string.IsNullOrEmpty(recordedSuffix))
+                return false;
+            if (arch == "gemma4")
+                return recordedSuffix.EndsWith("<|channel>thought\n", StringComparison.Ordinal);
+            return OutputParserFactory.ThinkingOffReplyMayReason(arch, chatTemplate, sampling);
+        }
 
         private static void RecordGeneratedTurn(
             ChatSession session, List<ChatMessage> preparedHistory,
-            string cacheScope, ChatMessage generated, EmittedAssistantTurn emitted)
+            string cacheScope, ChatMessage generated, EmittedAssistantTurn emitted, long loadEpoch)
         {
             lock (session.HistoryLock)
-                session.Transcripts.Record(preparedHistory, generated, emitted, cacheScope);
+                session.Transcripts.Record(preparedHistory, generated, emitted, cacheScope, loadEpoch);
         }
 
         /// <summary>
@@ -1290,6 +1386,42 @@ namespace TensorSharp.Server
             }
         }
 
+        /// <summary>
+        /// Say, once per turn (and again if a later round's differs), how long the prefix
+        /// this request declared shared is and a short hash of its tokens. Two requests
+        /// that should share it -- the startup warm-up and the first chat after it --
+        /// must log the same pair; a different hash names drift that otherwise shows only
+        /// as a reuse of 0 several lines later (an attachment's name in a tool
+        /// declaration was one).
+        /// </summary>
+        private void LogSharedPrefix(ChatTurnContext turnContext, ChatSession session, string requestId,
+            List<int> promptTokens, int sharedPrefixTokens, IReadOnlyList<int> publicCheckpointBoundaries)
+        {
+            string hash = SharedPrefixHash(promptTokens, sharedPrefixTokens);
+            string logged = sharedPrefixTokens + ":" + hash;
+            if (string.Equals(turnContext.LoggedSharedPrefix, logged, StringComparison.Ordinal))
+                return;
+            turnContext.LoggedSharedPrefix = logged;
+            _logger.LogInformation(LogEventIds.KvCacheReusePlan,
+                "prompt.shared_prefix tokens={SharedPrefixTokens} hash={SharedPrefixHash} boundaries={Boundaries} "
+                + "of {PromptTokens} prompt tokens (requestId={RequestId}, sessionId={SessionId})",
+                sharedPrefixTokens, hash, string.Join(",", publicCheckpointBoundaries), promptTokens.Count,
+                requestId, session?.Id ?? "(none)");
+        }
+
+        /// <summary>The first eight hex digits of a SHA-256 over the first
+        /// <paramref name="count"/> token ids, or "-" for an empty prefix.</summary>
+        internal static string SharedPrefixHash(IReadOnlyList<int> tokens, int count)
+        {
+            count = Math.Min(count, tokens?.Count ?? 0);
+            if (count <= 0)
+                return "-";
+            byte[] bytes = new byte[count * sizeof(int)];
+            for (int i = 0; i < count; i++)
+                System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(bytes.AsSpan(i * sizeof(int)), tokens[i]);
+            return Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(bytes), 0, 4).ToLowerInvariant();
+        }
+
         /// <summary>Find one public ancestor shared by all prompt profiles in an
         /// agent tree. Recurrent models must capture their state at that exact
         /// boundary while the parent prefills; a later snapshot cannot be trimmed
@@ -1333,11 +1465,19 @@ namespace TensorSharp.Server
         /// the rendered prompt's tail shows — the suffix when it is there, an explicit
         /// "nothing" when it is not — and the renderer trusts that over its default.
         /// </para>
+        /// <para>
+        /// Nor does every prompt end on the REQUESTED mode's suffix. Nemotron-H
+        /// Reasoning-128K's system prompt can carry <c>{'reasoning': True|False}</c>, which
+        /// overrides the request's flag in the template, so the other mode's suffix is
+        /// checked too: recording nothing for a think-off request whose prompt opened the
+        /// block parsed its whole reasoning as the answer and left the re-render one block
+        /// short of the cache.
+        /// </para>
         /// </summary>
         internal static string RecordedGenerationSuffix(
-            ITokenizer tokenizer, List<int> promptTokens, string arch, bool enableThinking)
+            ITokenizer tokenizer, List<int> promptTokens, string arch, bool enableThinking, string chatTemplate = null)
         {
-            string suffix = KVCachePromptRenderer.GetAssistantGenerationSuffix(arch, enableThinking);
+            string suffix = KVCachePromptRenderer.GetAssistantGenerationSuffix(arch, enableThinking, chatTemplate);
             // DiffusionGemma renders through the same channel-priming template family.
             bool gemma = arch == "gemma4" || arch == "diffusion-gemma" || arch == "diffusion_gemma";
             if ((!gemma && string.IsNullOrEmpty(suffix)) || promptTokens == null || promptTokens.Count == 0 || tokenizer == null)
@@ -1359,17 +1499,11 @@ namespace TensorSharp.Server
                         return openChannel;
                     return string.Empty;
                 }
-                if (tail.EndsWith(suffix, StringComparison.Ordinal))
+                if (EndsWithFraming(tail, suffix))
                     return suffix;
-                // Every Jinja render is TrimEnd()ed, and only some families put the
-                // trailing newline back (Gemma 4, Qwen 3.5). For the rest (such as
-                // Qwen3.8-Flash-Next) the prompt ends on `</think>` without the
-                // suffix's `\n\n`. The framing is still there, so it is the framing that
-                // is recorded; the exact boundary whitespace travels separately as
-                // RawPromptTrailingWhitespace and is restored by the renderer.
-                string trimmedSuffix = suffix.TrimEnd();
-                if (trimmedSuffix.Length > 0 && tail.TrimEnd().EndsWith(trimmedSuffix, StringComparison.Ordinal))
-                    return suffix;
+                string otherSuffix = KVCachePromptRenderer.GetAssistantGenerationSuffix(arch, !enableThinking, chatTemplate);
+                if (!string.IsNullOrEmpty(otherSuffix) && EndsWithFraming(tail, otherSuffix))
+                    return otherSuffix;
                 return string.Empty;
             }
             catch (Exception)
@@ -1378,6 +1512,20 @@ namespace TensorSharp.Server
                 // family's declared suffix, which is what was recorded before.
                 return suffix;
             }
+        }
+
+        private static bool EndsWithFraming(string tail, string suffix)
+        {
+            if (tail.EndsWith(suffix, StringComparison.Ordinal))
+                return true;
+            // Every Jinja render is TrimEnd()ed, and only some families put the
+            // trailing newline back (Gemma 4, Qwen 3.5). For the rest (such as
+            // Qwen3.8-Flash-Next) the prompt ends on `</think>` without the
+            // suffix's `\n\n`. The framing is still there, so it is the framing that
+            // is recorded; the exact boundary whitespace travels separately as
+            // RawPromptTrailingWhitespace and is restored by the renderer.
+            string trimmedSuffix = suffix.TrimEnd();
+            return trimmedSuffix.Length > 0 && tail.TrimEnd().EndsWith(trimmedSuffix, StringComparison.Ordinal);
         }
 
         public async IAsyncEnumerable<ChatStreamUpdate>
@@ -1406,11 +1554,21 @@ namespace TensorSharp.Server
             }
         }
 
+        /// <param name="ProtectedTokens">What the kept part costs on its own -- the
+        /// instructions, the latest request and its rounds -- when the compactor had to
+        /// measure it, else 0.</param>
+        /// <param name="PromptLimit">The prompt budget the result was fitted to; the window
+        /// minus it is the reply reserve that was protected.</param>
+        /// <param name="RemovedTurnMessages">How many of <paramref name="RemovedMessages"/>
+        /// were in COMPLETED turns; the rest were older rounds of the active request.</param>
         internal readonly record struct ContextHistoryWindow(
             List<ChatMessage> History,
             int OriginalPromptTokens,
             int FinalPromptTokens,
-            int RemovedMessages);
+            int RemovedMessages,
+            int ProtectedTokens = 0,
+            int PromptLimit = 0,
+            int RemovedTurnMessages = 0);
 
         /// <summary>
         /// How much of the window the compactor sets aside for the reply BEFORE it
@@ -1437,6 +1595,44 @@ namespace TensorSharp.Server
             int cap = Math.Max(1024, contextLimit / 4);
             return Math.Clamp(Math.Min(requestedGenerationTokens, cap), 1, contextLimit - 1);
         }
+
+        /// <summary>The least reply a completed turn may be kept at the expense of.</summary>
+        internal const int MinimumSharedReplyReserve = 1024;
+
+        /// <summary>
+        /// The reserve while deciding which COMPLETED turns to keep, given what the
+        /// protected prompt -- the instructions plus the latest request and its rounds --
+        /// already takes: the preferred reserve, unless that prompt leaves less than twice
+        /// it free. Then completed turns and the reply share what is left, the reply never
+        /// below <c>min(requested, 1024)</c>.
+        ///
+        /// <para>
+        /// The fixed reserve made a small window all-or-nothing. TensorAgent's shared
+        /// prompt is ~6.2k tokens on Gemma 4 E2B and ~7.2k on Qwen; in an 8,192 window the
+        /// preferred reserve (2,048) left a 6,144-token prompt budget that the
+        /// instructions and the new question alone exceeded, so EVERY follow-up removed
+        /// every earlier turn -- the photo and the answer about it included -- and the
+        /// model was asked "what colour is the text in it?" about nothing (live: "What
+        /// specific one-word information about..."). With protected 6,200: free 1,991,
+        /// reserve max(995, 1,024) = 1,024, budget 7,168, and a 600-token image turn stays.
+        /// A 32,768 window with the same prompt leaves 25,567 free, so nothing changes there.
+        /// </para>
+        /// </summary>
+        internal static int HistoryCompactionReserve(int requestedGenerationTokens, int contextLimit, int protectedTokens)
+        {
+            int preferred = HistoryCompactionReserve(requestedGenerationTokens, contextLimit);
+            if (contextLimit <= 1 || protectedTokens <= 0)
+                return preferred;
+            int free = contextLimit - 1 - protectedTokens;
+            if (free >= 2 * preferred)
+                return preferred;
+            int floor = Math.Max(1, Math.Min(requestedGenerationTokens, MinimumSharedReplyReserve));
+            return Math.Min(preferred, Math.Max(free / 2, floor));
+        }
+
+        /// <summary>The prompt budget <see cref="HistoryCompactionReserve(int, int, int)"/> leaves.</summary>
+        internal static int AdaptivePromptLimit(int contextLimit, int requestedGenerationTokens, int protectedTokens) =>
+            contextLimit - HistoryCompactionReserve(requestedGenerationTokens, contextLimit, protectedTokens);
 
         /// <summary>
         /// Apply the same context/reply budget policy used by live generation before
@@ -1465,7 +1661,8 @@ namespace TensorSharp.Server
             int reserve = HistoryCompactionReserve(requestedGenerationTokens, contextLimit);
             int promptLimit = contextLimit - reserve;
             ContextHistoryWindow window = CompactHistoryForContext(
-                history, originalPromptTokens, promptLimit, countPromptTokens);
+                history, originalPromptTokens, promptLimit, countPromptTokens,
+                protectedTokens => AdaptivePromptLimit(contextLimit, requestedGenerationTokens, protectedTokens));
             int hardPromptLimit = contextLimit - 1;
             if (window.FinalPromptTokens > hardPromptLimit)
             {
@@ -1483,7 +1680,8 @@ namespace TensorSharp.Server
             return window.RemovedMessages > 0
                 ? window
                 : new ContextHistoryWindow(
-                    history, originalPromptTokens, originalPromptTokens, RemovedMessages: 0);
+                    history, originalPromptTokens, originalPromptTokens, RemovedMessages: 0,
+                    window.ProtectedTokens, window.PromptLimit);
         }
 
         /// <summary>
@@ -1493,11 +1691,28 @@ namespace TensorSharp.Server
         /// Token counts come from the real renderer supplied by the caller, so chat-template
         /// framing, tool declarations and cached raw output are included.
         /// </summary>
+        /// <param name="completedTurnPromptLimit">
+        /// Optional: the prompt budget for keeping COMPLETED turns, given the tokens of the
+        /// protected prompt (every completed turn removed, the active request kept) --
+        /// <see cref="AdaptivePromptLimit"/>. It is never stricter than
+        /// <paramref name="promptTokenLimit"/>, and it buys completed turns only: the
+        /// active request's own older rounds are first fitted to the preferred budget,
+        /// so a tool loop never keeps them at the expense of its reply.
+        /// </param>
+        /// <param name="protectedPromptTokenLimit">
+        /// Optional: the preferred budget for the protected prompt alone, when it is not
+        /// <paramref name="promptTokenLimit"/> (0: the same). A multimodal caller counts
+        /// media unexpanded and takes each candidate's expansion off its limit, and that
+        /// expansion includes the pictures of completed turns, which the protected prompt
+        /// does not have.
+        /// </param>
         internal static ContextHistoryWindow CompactHistoryForContext(
             List<ChatMessage> history,
             int originalPromptTokens,
             int promptTokenLimit,
-            Func<List<ChatMessage>, int> countPromptTokens)
+            Func<List<ChatMessage>, int> countPromptTokens,
+            Func<int, int> completedTurnPromptLimit = null,
+            int protectedPromptTokenLimit = 0)
         {
             if (history == null)
                 throw new ArgumentNullException(nameof(history));
@@ -1506,7 +1721,8 @@ namespace TensorSharp.Server
             if (promptTokenLimit <= 0 || originalPromptTokens <= promptTokenLimit || history.Count < 2)
             {
                 return new ContextHistoryWindow(
-                    history, originalPromptTokens, originalPromptTokens, RemovedMessages: 0);
+                    history, originalPromptTokens, originalPromptTokens, RemovedMessages: 0,
+                    PromptLimit: promptTokenLimit);
             }
 
             int instructionCount = 0;
@@ -1545,6 +1761,7 @@ namespace TensorSharp.Server
                 removable.Add((start, end));
                 start = end;
             }
+            int completedRanges = removable.Count;
 
             // Within the active request, each assistant generation plus the tool results
             // it requested is one repair round. Retain the newest round (normally the
@@ -1573,12 +1790,29 @@ namespace TensorSharp.Server
                     history, originalPromptTokens, originalPromptTokens, RemovedMessages: 0);
             }
 
-            List<ChatMessage> BuildCandidate(int rangeCount, out int removedMessages)
+            // The messages the first `n` completed turns lose (an instruction inside one stays).
+            var turnMessages = new int[completedRanges + 1];
+            for (int range = 0; range < completedRanges; range++)
+            {
+                int count = 0;
+                for (int i = removable[range].Start; i < removable[range].End; i++)
+                {
+                    if (!IsInstructionRole(history[i]?.Role))
+                        count++;
+                }
+                turnMessages[range + 1] = turnMessages[range] + count;
+            }
+
+            // The candidate without the first `completedCount` completed turns and the first
+            // `roundCount` older rounds of the active request, oldest first in each.
+            List<ChatMessage> BuildCandidate(int completedCount, int roundCount, out int removedMessages)
             {
                 var removed = new bool[history.Count];
                 removedMessages = 0;
-                for (int range = 0; range < rangeCount; range++)
+                for (int range = 0; range < removable.Count; range++)
                 {
+                    if (range < completedRanges ? range >= completedCount : range - completedRanges >= roundCount)
+                        continue;
                     (int rangeStart, int rangeEnd) = removable[range];
                     for (int i = rangeStart; i < rangeEnd; i++)
                     {
@@ -1609,39 +1843,127 @@ namespace TensorSharp.Server
             // ranges with a bounded binary search. The all-ranges measurement also
             // covers the protected minimum that may still exceed the preferred reserve.
             int maximumRanges = removable.Count;
-            List<ChatMessage> maximum = BuildCandidate(maximumRanges, out int maximumRemoved);
+            int olderRounds = maximumRanges - completedRanges;
+            List<ChatMessage> maximum = BuildCandidate(completedRanges, olderRounds, out int maximumRemoved);
             int maximumTokens = countPromptTokens(maximum);
+
+            // Completed turns may share the reply's room when the protected prompt leaves
+            // little of it (HistoryCompactionReserve(int, int, int)). Protected here is every
+            // completed turn removed and the active request kept -- its older rounds held to
+            // the PREFERRED budget first, the oldest removed until they fit -- so the extra
+            // room buys completed turns only. Deciding the completed turns on the rounds as
+            // they were, and falling back to removing in order when those did not fit, took
+            // the earlier conversation with the old rounds from the third round of every
+            // tool loop on a phone, whose shared prompt alone is past the preferred budget:
+            // the image turn kept on rounds one and two was gone on round three.
+            if (completedTurnPromptLimit != null && completedRanges > 0)
+            {
+                int requestLimit = protectedPromptTokenLimit > 0 ? protectedPromptTokenLimit : promptTokenLimit;
+                int roundsRemoved = olderRounds;
+                List<ChatMessage> requestOnly = maximum;
+                int requestOnlyTokens = maximumTokens;
+                int requestOnlyRemoved = maximumRemoved;
+                if (olderRounds > 0 && maximumTokens <= requestLimit)
+                {
+                    List<ChatMessage> allRounds = BuildCandidate(completedRanges, 0, out int allRoundsRemoved);
+                    int allRoundsTokens = countPromptTokens(allRounds);
+                    if (allRoundsTokens <= requestLimit)
+                    {
+                        roundsRemoved = 0;
+                        requestOnly = allRounds;
+                        requestOnlyTokens = allRoundsTokens;
+                        requestOnlyRemoved = allRoundsRemoved;
+                    }
+                    else
+                    {
+                        // The fewest oldest rounds whose removal fits; all of them is known to.
+                        int low = 1, high = olderRounds - 1;
+                        while (low <= high)
+                        {
+                            int middle = low + ((high - low) / 2);
+                            List<ChatMessage> candidate = BuildCandidate(completedRanges, middle, out int candidateRemoved);
+                            int candidateTokens = countPromptTokens(candidate);
+                            if (candidateTokens <= requestLimit)
+                            {
+                                roundsRemoved = middle;
+                                requestOnly = candidate;
+                                requestOnlyTokens = candidateTokens;
+                                requestOnlyRemoved = candidateRemoved;
+                                high = middle - 1;
+                            }
+                            else
+                            {
+                                low = middle + 1;
+                            }
+                        }
+                    }
+                }
+
+                int limit = Math.Max(promptTokenLimit, completedTurnPromptLimit(requestOnlyTokens));
+                if (roundsRemoved == 0 && originalPromptTokens <= limit)
+                {
+                    return new ContextHistoryWindow(
+                        history, originalPromptTokens, originalPromptTokens, RemovedMessages: 0,
+                        requestOnlyTokens, limit);
+                }
+                if (requestOnlyTokens > limit)
+                {
+                    return new ContextHistoryWindow(
+                        requestOnly, originalPromptTokens, requestOnlyTokens, requestOnlyRemoved,
+                        requestOnlyTokens, limit, turnMessages[completedRanges]);
+                }
+                // The fewest oldest completed turns whose removal fits beside those rounds'
+                // (every completed turn with the rounds still there was measured above).
+                return SmallestFitting(roundsRemoved > 0 ? 0 : 1, completedRanges - 1,
+                    count => count, count => (BuildCandidate(count, roundsRemoved, out int dropped), dropped),
+                    requestOnly, requestOnlyTokens, requestOnlyRemoved, limit, requestOnlyTokens);
+            }
+
             if (maximumTokens > promptTokenLimit || maximumRanges == 1)
             {
                 return new ContextHistoryWindow(
-                    maximum, originalPromptTokens, maximumTokens, maximumRemoved);
+                    maximum, originalPromptTokens, maximumTokens, maximumRemoved,
+                    maximumTokens, promptTokenLimit, turnMessages[completedRanges]);
             }
+            return SmallestFitting(1, maximumRanges - 1, count => Math.Min(count, completedRanges),
+                count => (BuildCandidate(Math.Min(count, completedRanges), Math.Max(0, count - completedRanges),
+                    out int dropped), dropped),
+                maximum, maximumTokens, maximumRemoved, promptTokenLimit, maximumTokens);
 
-            int low = 1;
-            int high = maximumRanges - 1;
-            List<ChatMessage> compacted = maximum;
-            int finalTokens = maximumTokens;
-            int removedMessages = maximumRemoved;
-            while (low <= high)
+            // The fewest ranges in [low, high] whose removal fits `limit`, as `build` removes
+            // them (`completedOf` of them completed turns); the fallback, which removes one
+            // more than `high`, is known to fit.
+            ContextHistoryWindow SmallestFitting(int low, int high, Func<int, int> completedOf,
+                Func<int, (List<ChatMessage> Candidate, int Removed)> build,
+                List<ChatMessage> fallback, int fallbackTokens, int fallbackRemoved, int limit, int protectedTokens)
             {
-                int middle = low + ((high - low) / 2);
-                List<ChatMessage> candidate = BuildCandidate(middle, out int candidateRemoved);
-                int candidateTokens = countPromptTokens(candidate);
-                if (candidateTokens <= promptTokenLimit)
+                List<ChatMessage> compacted = fallback;
+                int finalTokens = fallbackTokens;
+                int removedMessages = fallbackRemoved;
+                int removedRanges = high + 1;
+                while (low <= high)
                 {
-                    compacted = candidate;
-                    finalTokens = candidateTokens;
-                    removedMessages = candidateRemoved;
-                    high = middle - 1;
+                    int middle = low + ((high - low) / 2);
+                    (List<ChatMessage> candidate, int candidateRemoved) = build(middle);
+                    int candidateTokens = countPromptTokens(candidate);
+                    if (candidateTokens <= limit)
+                    {
+                        compacted = candidate;
+                        finalTokens = candidateTokens;
+                        removedMessages = candidateRemoved;
+                        removedRanges = middle;
+                        high = middle - 1;
+                    }
+                    else
+                    {
+                        low = middle + 1;
+                    }
                 }
-                else
-                {
-                    low = middle + 1;
-                }
-            }
 
-            return new ContextHistoryWindow(
-                compacted, originalPromptTokens, finalTokens, removedMessages);
+                return new ContextHistoryWindow(
+                    compacted, originalPromptTokens, finalTokens, removedMessages, protectedTokens, limit,
+                    turnMessages[completedOf(removedRanges)]);
+            }
         }
 
         private static bool IsInstructionRole(string role) =>
@@ -1710,9 +2032,13 @@ namespace TensorSharp.Server
             bool preserveAllInput = false,
             int executionContextLimit = 0,
             List<int> explicitBreakpoints = null,
-            string preservedInputKind = "document")
+            string preservedInputKind = "document",
+            ModelBase forModel = null)
         {
-            var model = _lifecycle.Model;
+            // The request's own model when the caller has it: a switch can unpublish the
+            // loaded model while this request prepares, and the request then ends where its
+            // cancellation is looked at (SubmitRequest), not here.
+            var model = forModel ?? _lifecycle.Model ?? throw new ModelUnloadedException();
             int maxCtx = model.MaxContextLength;
             if (executionContextLimit > 0 && (maxCtx <= 0 || executionContextLimit < maxCtx))
                 maxCtx = executionContextLimit;
@@ -1929,82 +2255,293 @@ namespace TensorSharp.Server
             return false;
         }
 
-        /// <summary>
-        /// A string naming every image/audio attachment of a history in order, or null
-        /// when there is none. Used only to tell whether history compaction removed
-        /// media; prompt reuse compares media positionally by content instead
-        /// (<see cref="SequenceState.MediaSpans"/>).
-        /// </summary>
-        private static string BuildMediaFingerprint(List<ChatMessage> history)
-        {
-            if (history == null) return null;
-            StringBuilder sb = null;
-            foreach (var m in history)
-            {
-                if (m == null) continue;
-                if (m.ImagePaths != null)
-                {
-                    foreach (var p in m.ImagePaths)
-                    {
-                        if (string.IsNullOrEmpty(p)) continue;
-                        (sb ??= new StringBuilder()).Append(m.IsVideo ? "vid:" : "img:").Append(p).Append('\n');
-                    }
-                }
-                if (m.AudioPaths != null)
-                {
-                    foreach (var p in m.AudioPaths)
-                    {
-                        if (string.IsNullOrEmpty(p)) continue;
-                        (sb ??= new StringBuilder()).Append("aud:").Append(p).Append('\n');
-                    }
-                }
-            }
-            return sb?.ToString();
-        }
+        /// <param name="OriginalPromptTokens">The prepared prompt before compaction, media expanded.</param>
+        /// <param name="FinalPromptTokens">The prepared prompt after it, media expanded.</param>
+        /// <param name="ElidedMedia">Earlier images, videos and recordings that became a note.</param>
+        /// <param name="RemovedMessages">Messages of completed turns removed whole.</param>
+        /// <param name="ProtectedTokens">The protected prompt, media expanded (0 when unmeasured).</param>
+        /// <param name="PromptLimit">The prompt budget the result was fitted to, media expanded.</param>
+        internal readonly record struct MediaHistoryWindow(
+            List<ChatMessage> History,
+            int OriginalPromptTokens,
+            int FinalPromptTokens,
+            int ElidedMedia,
+            int RemovedMessages,
+            int ProtectedTokens,
+            int PromptLimit);
 
         /// <summary>
-        /// Reclaim text turns that a first multimodal compaction discarded only because
-        /// it charged the expansion cost of media removed with an older turn. Recovery
-        /// may not bring that media back, and the expanded result must still fit the hard
-        /// context ceiling. Kept pure so the boundary policy can be regression-tested
-        /// without running a vision encoder.
+        /// Fit a prepared multimodal prompt whose media expansion overflowed the preferred
+        /// reply reserve: the reply shares room with completed turns as in the text pass
+        /// (<see cref="AdaptivePromptLimit"/>), then the OLDEST earlier pictures and
+        /// recordings, one at a time, each become a note in its message
+        /// (<see cref="ChatHistoryPreparer.WithMediaReplacedByNote"/>), as few as fit, and
+        /// only when every earlier picture and recording is gone are complete old turns
+        /// removed. The latest request's own media is never touched.
+        ///
+        /// <para>
+        /// One at a time, in conversation order (<see cref="EarlierMediaItems"/>): a message
+        /// with three photos loses its first and keeps the other two when that is enough. A
+        /// video is one item -- its frames are one recording, and half a video is not a
+        /// smaller video. What goes is always the shortest leading run of that order that
+        /// fits, so the same conversation and window give the same prompt on every turn, and
+        /// an earlier item is never kept while a later one is noted.
+        /// </para>
+        ///
+        /// <para>
+        /// Removing whole turns first lost the words with the pixels: in an image chat
+        /// the photo is in the first user message, so the first follow-up that overflowed
+        /// dropped the question about it AND the model's answer, and the next one was
+        /// answered about nothing. The answer is usually what the conversation needs from
+        /// an old image; a note keeps it and tells the model the picture is no longer
+        /// shown, rather than letting it describe pixels it cannot see.
+        /// </para>
+        /// <para>
+        /// Exact, not estimated: <paramref name="countExpandedPromptTokens"/> prepares a
+        /// candidate (the encoder's cache answers for media already encoded), and the
+        /// protected prompt is charged only the expansion of the media it keeps -- measured
+        /// on the candidate with every earlier item elided, when the decision depends on
+        /// it (a prompt that fits as it is does not). Because removed turns then hold
+        /// no media, their removal changes the expansion by nothing, which is why no
+        /// second recovery pass is needed. Pure apart from the two counters, so the policy
+        /// is tested without an encoder.
+        /// </para>
         /// </summary>
-        internal static ContextHistoryWindow RecoverHistoryAfterRemovedMedia(
-            List<ChatMessage> originalHistory,
-            int originalUnexpandedTokens,
-            int targetPromptLimit,
-            int hardPromptLimit,
-            int remainingMediaOverhead,
-            ContextHistoryWindow currentWindow,
-            string remainingMediaFingerprint,
-            Func<List<ChatMessage>, int> countPromptTokens)
+        /// <param name="countPromptTokens">The rendered prompt, media unexpanded.</param>
+        /// <param name="countExpandedPromptTokens">The prepared prompt, media expanded.</param>
+        /// <param name="stagedNames">Each upload to the name the code tools stage it under, when
+        /// the request offers them (<see cref="ChatTurnContext.StagedAttachmentNames"/>): the
+        /// notes name a file the way the conversation's own attachment notes do.</param>
+        internal static MediaHistoryWindow CompactMediaHistoryForContext(
+            List<ChatMessage> history,
+            int unexpandedPromptTokens,
+            int expandedPromptTokens,
+            int contextLimit,
+            int requestedGenerationTokens,
+            Func<List<ChatMessage>, int> countPromptTokens,
+            Func<List<ChatMessage>, int> countExpandedPromptTokens,
+            IReadOnlyDictionary<string, string> stagedNames = null)
         {
-            if (originalHistory == null)
-                throw new ArgumentNullException(nameof(originalHistory));
+            if (history == null)
+                throw new ArgumentNullException(nameof(history));
             if (countPromptTokens == null)
                 throw new ArgumentNullException(nameof(countPromptTokens));
-            if (targetPromptLimit <= 0 || hardPromptLimit <= 0 || remainingMediaOverhead < 0)
-                return currentWindow;
+            if (countExpandedPromptTokens == null)
+                throw new ArgumentNullException(nameof(countExpandedPromptTokens));
 
-            int recoveredUnexpandedLimit = targetPromptLimit > remainingMediaOverhead
-                ? targetPromptLimit - remainingMediaOverhead
-                : 1;
-            ContextHistoryWindow recovered = CompactHistoryForContext(
-                originalHistory,
-                originalUnexpandedTokens,
-                recoveredUnexpandedLimit,
-                countPromptTokens);
-            bool sameRemainingMedia = string.Equals(
-                BuildMediaFingerprint(recovered.History),
-                remainingMediaFingerprint,
-                StringComparison.Ordinal);
-            bool fitsHardLimit =
-                (long)recovered.FinalPromptTokens + remainingMediaOverhead <= hardPromptLimit;
-            return sameRemainingMedia
-                && fitsHardLimit
-                && recovered.RemovedMessages < currentWindow.RemovedMessages
-                    ? recovered
-                    : currentWindow;
+            int preferredLimit = contextLimit > 1
+                ? contextLimit - HistoryCompactionReserve(requestedGenerationTokens, contextLimit)
+                : 0;
+            var unchanged = new MediaHistoryWindow(history, expandedPromptTokens, expandedPromptTokens,
+                ElidedMedia: 0, RemovedMessages: 0, ProtectedTokens: 0, preferredLimit);
+            if (preferredLimit <= 0 || expandedPromptTokens <= preferredLimit)
+                return unchanged;
+
+            var counted = new List<(List<ChatMessage> Messages, int Tokens)>();
+            List<EarlierMedia> earlier = EarlierMediaItems(history);
+            Candidate asIs = new(history, unexpandedPromptTokens, expandedPromptTokens);
+            // The expansion the protected prompt keeps: all of it when nothing earlier can
+            // go, none when only earlier messages carry media, else that of the candidate
+            // with every earlier item elided -- measured only when it matters (below).
+            int protectedOverhead = earlier.Count == 0 ? asIs.Overhead : 0;
+            Candidate? allElided = null;
+            if (earlier.Count > 0 && HasMediaOutside(history, earlier))
+            {
+                // Measuring it prepares another prompt, and then this one again: two renders
+                // and two media preparations on every image turn of a phone, whose shared
+                // prompt alone is past the preferred budget. It lies between none and all of
+                // this prompt's expansion, and a prompt that fits at both ends fits at every
+                // point between: a larger protected prompt leaves the reply less room and
+                // completed turns more (AdaptivePromptLimit), and holds the active request's
+                // older rounds to less. So an image turn that fits as it is prepares nothing.
+                protectedOverhead = 0;
+                ContextHistoryWindow least = Fit(asIs);
+                protectedOverhead = asIs.Overhead;
+                ContextHistoryWindow most = Fit(asIs);
+                if (least.RemovedMessages == 0 && most.RemovedMessages == 0)
+                    return unchanged with { PromptLimit = least.PromptLimit + asIs.Overhead };
+                allElided = Measure(ElideEarlierMedia(history, earlier, earlier.Count, stagedNames));
+                protectedOverhead = allElided.Value.Overhead;
+            }
+
+            // Whether a candidate keeps every completed turn is what decides; older rounds of
+            // the active request go by the preferred budget alone (CompactHistoryForContext),
+            // the same with or without earlier pictures, which are in completed turns.
+            ContextHistoryWindow window = Fit(asIs);
+            if (window.RemovedTurnMessages == 0)
+                return Kept(asIs, window, elidedItems: 0);
+
+            Candidate removalBase = asIs;
+            int elided = 0;
+            if (earlier.Count > 0)
+            {
+                Candidate all = allElided ?? Measure(ElideEarlierMedia(history, earlier, earlier.Count, stagedNames));
+                ContextHistoryWindow allWindow = Fit(all);
+                if (allWindow.RemovedTurnMessages == 0)
+                {
+                    // The fewest oldest items whose removal makes every turn fit.
+                    Candidate best = all;
+                    ContextHistoryWindow bestWindow = allWindow;
+                    int bestCount = earlier.Count;
+                    int low = 1, high = earlier.Count - 1;
+                    while (low <= high)
+                    {
+                        int middle = low + ((high - low) / 2);
+                        Candidate candidate = Measure(ElideEarlierMedia(history, earlier, middle, stagedNames));
+                        ContextHistoryWindow candidateWindow = Fit(candidate);
+                        if (candidateWindow.RemovedTurnMessages == 0)
+                        {
+                            best = candidate;
+                            bestWindow = candidateWindow;
+                            bestCount = middle;
+                            high = middle - 1;
+                        }
+                        else
+                        {
+                            low = middle + 1;
+                        }
+                    }
+                    return Kept(best, bestWindow, bestCount);
+                }
+                removalBase = all;
+                window = allWindow;
+                elided = earlier.Count;
+            }
+
+            // Removed turns hold no media now, so the expansion of what is kept is exact.
+            int finalExpanded = window.FinalPromptTokens + removalBase.Overhead;
+            if (finalExpanded > contextLimit - 1)
+                return unchanged;   // not even the protected prompt fits: reported with the complete input
+            return new MediaHistoryWindow(window.History, expandedPromptTokens, finalExpanded, elided,
+                window.RemovedMessages, Expanded(window.ProtectedTokens), window.PromptLimit + removalBase.Overhead);
+
+            Candidate Measure(List<ChatMessage> candidate) =>
+                new(candidate, Count(candidate), countExpandedPromptTokens(candidate));
+
+            // A candidate that keeps every completed turn, less any older rounds `fitted` let go.
+            MediaHistoryWindow Kept(Candidate candidate, ContextHistoryWindow fitted, int elidedItems) =>
+                new(fitted.RemovedMessages == 0 ? candidate.History : fitted.History, expandedPromptTokens,
+                    fitted.RemovedMessages == 0 ? candidate.Expanded : fitted.FinalPromptTokens + candidate.Overhead,
+                    elidedItems, fitted.RemovedMessages, Expanded(fitted.ProtectedTokens), fitted.PromptLimit + candidate.Overhead);
+
+            // Completed turns fitted with the reply sharing the room the protected prompt
+            // (its own media expanded) leaves; counts stay unexpanded, so every limit is the
+            // expanded one less the expansion of what it is compared with: a candidate's
+            // own, or the protected prompt's.
+            ContextHistoryWindow Fit(Candidate candidate) =>
+                CompactHistoryForContext(candidate.History, candidate.Unexpanded,
+                    Math.Max(1, preferredLimit - candidate.Overhead), Count,
+                    protectedTokens => AdaptivePromptLimit(contextLimit, requestedGenerationTokens,
+                        protectedTokens + protectedOverhead) - candidate.Overhead,
+                    Math.Max(1, preferredLimit - protectedOverhead));
+
+            // A candidate is often counted for more than one budget (both ends above, and
+            // each fit measures its protected prompt): each is rendered once. Compaction
+            // never edits a message, so the same messages in the same order are the same prompt.
+            int Count(List<ChatMessage> candidate)
+            {
+                foreach ((List<ChatMessage> messages, int tokens) in counted)
+                {
+                    if (SameMessages(messages, candidate))
+                        return tokens;
+                }
+                int count = countPromptTokens(candidate);
+                counted.Add((candidate, count));
+                return count;
+            }
+
+            static bool SameMessages(List<ChatMessage> a, List<ChatMessage> b)
+            {
+                if (a.Count != b.Count)
+                    return false;
+                for (int i = 0; i < a.Count; i++)
+                {
+                    if (!ReferenceEquals(a[i], b[i]))
+                        return false;
+                }
+                return true;
+            }
+
+            int Expanded(int protectedTokens) => protectedTokens > 0 ? protectedTokens + protectedOverhead : 0;
+        }
+
+        private readonly record struct Candidate(List<ChatMessage> History, int Unexpanded, int Expanded)
+        {
+            internal int Overhead => Math.Max(0, Expanded - Unexpanded);
+        }
+
+        /// <summary>One earlier picture, video or recording that can give way to a note: the
+        /// message it is in, and how many of that message's images (a video's frames, all of
+        /// them) and recordings it is.</summary>
+        internal readonly record struct EarlierMedia(int Message, int Images, int Audio);
+
+        /// <summary>
+        /// The images, videos and recordings of completed turns -- before the latest genuine
+        /// user request, instructions excluded -- oldest first: message by message, and in a
+        /// message its images in order, then its recordings. The latest request's media and
+        /// any instruction's are not among them.
+        /// </summary>
+        internal static List<EarlierMedia> EarlierMediaItems(List<ChatMessage> history)
+        {
+            var items = new List<EarlierMedia>();
+            if (history == null)
+                return items;
+            int latestUser = -1;
+            for (int i = history.Count - 1; i >= 0; i--)
+            {
+                if (IsGenuineUserMessage(history, i))
+                {
+                    latestUser = i;
+                    break;
+                }
+            }
+            for (int i = 0; i < latestUser; i++)
+            {
+                ChatMessage message = history[i];
+                if (IsInstructionRole(message?.Role) || !ChatHistoryPreparer.HasMultimodalContent(message))
+                    continue;
+                int images = message.ImagePaths?.Count ?? 0;
+                if (images > 0 && message.IsVideo)
+                    items.Add(new EarlierMedia(i, images, 0));
+                else
+                    for (int k = 0; k < images; k++)
+                        items.Add(new EarlierMedia(i, 1, 0));
+                for (int k = 0; k < (message.AudioPaths?.Count ?? 0); k++)
+                    items.Add(new EarlierMedia(i, 0, 1));
+            }
+            return items;
+        }
+
+        /// <summary>The history with the first <paramref name="count"/> of
+        /// <paramref name="earlier"/> replaced by a note. The caller's list is not changed.</summary>
+        internal static List<ChatMessage> ElideEarlierMedia(List<ChatMessage> history, List<EarlierMedia> earlier, int count,
+            IReadOnlyDictionary<string, string> stagedNames = null)
+        {
+            var elided = new List<ChatMessage>(history);
+            count = Math.Min(count, earlier.Count);
+            for (int k = 0; k < count;)
+            {
+                // A message's items are adjacent and in its own order, so the first `count`
+                // cover a leading run of its images and of its recordings.
+                int message = earlier[k].Message, images = 0, audio = 0;
+                for (; k < count && earlier[k].Message == message; k++)
+                {
+                    images += earlier[k].Images;
+                    audio += earlier[k].Audio;
+                }
+                elided[message] = ChatHistoryPreparer.WithMediaReplacedByNote(history[message], images, audio, stagedNames);
+            }
+            return elided;
+        }
+
+        private static bool HasMediaOutside(List<ChatMessage> history, List<EarlierMedia> earlier)
+        {
+            for (int i = 0; i < history.Count; i++)
+            {
+                if (!earlier.Exists(item => item.Message == i) && ChatHistoryPreparer.HasMultimodalContent(history[i]))
+                    return true;
+            }
+            return false;
         }
 
         /// <summary>True when the thinking budget applies to this request: thinking was asked

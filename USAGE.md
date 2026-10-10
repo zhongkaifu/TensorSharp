@@ -126,7 +126,8 @@ on the command line skips a configured projector's download.
 ```
 
 Ready-to-use examples live in [`config/`](config/) (`cli-basic.json`,
-`server-basic.json`, `variables.json`, `auto-download.json`, `qwen-image-2.1.json`)
+`server-basic.json`, `variables.json`, `auto-download.json`, `qwen-image-2.1.json`,
+`qwen-image-2.1-turbo.json`)
 — each uses real, public, ungated URLs, so it works on a fresh machine. The same
 directory also holds presets for chat models (`gemma-4-*`, `qwen3.5-9b-*`,
 `qwen3.6-*`, `gpt-oss-20b`), agent hosting (`agent-*`), embedding services
@@ -188,6 +189,13 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --config config/qwen-image-2.1.js
     --prompt "A small orange cat beside a blue ceramic vase, soft daylight" --output generated.png
 dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --config config/qwen-image-2.1.json --image generated.png \
     --prompt "Change the blue vase to a red vase. Preserve the cat, lighting and composition." --output edited.png
+
+# Qwen-Image-2.1-Turbo: the 8-step distillation, with the same VAE, text encoder and mmproj.
+# The config declares the checkpoint (--qwen-image-variant turbo), so it samples Turbo's
+# published 8-step schedule at CFG 1. See docs/models/qwenimage21.md#qwen-image-21-turbo.
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --config config/qwen-image-2.1-turbo.json \
+    --prompt "A small orange cat beside a blue ceramic vase, soft daylight" \
+    --width 1024 --height 1024 --output turbo-checkpoint.png
 
 # Qwen-Image-2.1 with a LoRA plug-in. config/lora/ holds ready-made ones that download
 # their weights on first use; a step-distilled plug-in also brings its sampling recipe
@@ -351,7 +359,7 @@ quietly. Measured on gemma-4-26B-A4B (`--cpu-moe`, peak VRAM): `ggml_cuda`
 | `--no-prefix-cache` | Disable runtime prefix reuse (it sets `TS_SCHED_PREFIX_CACHE=0`) and interactive system/tool prompt warmup. Radix caching is enabled by default for normal CLI generation, including single-shot, interactive, JSONL, and skill/tool requests. The CLI's cache lives in memory only, so every new process starts cold. Unrelated to `--warmup-runs`, which warms compute kernels. |
 | `--system <text>` | System prompt to seed the interactive session (overridden inside the REPL by `/system`) |
 | `--system-file <path>` | Read the initial system prompt from a UTF-8 text file (alternative to `--system`) |
-| `--think` | Enable thinking/reasoning mode (chain-of-thought). Opt-in for GLM-5.2 / GLM-5.3 (`glm-dsa`) — without it their template closes the reasoning block immediately (`<think></think>`) so the model answers directly, and with it the prompt carries `Reasoning Effort: Max` and leaves the block open for the model to close. GLM-5.3-Flash (`glm5next`) always reasons; this flag cannot disable it. GPT-OSS also always reasons before it answers, with or without the flag: its Harmony prompt has no "thinking off", and the CLI renders its `Reasoning:` line at `medium`. `/think on\|off` toggles it inside the REPL. |
+| `--think` | Enable thinking/reasoning mode (chain-of-thought). Opt-in for GLM-5.2 / GLM-5.3 (`glm-dsa`) — without it their template closes the reasoning block immediately (`<think></think>`) so the model answers directly, and with it the prompt carries `Reasoning Effort: Max` and leaves the block open for the model to close. GLM-5.3-Flash (`glm5next`) always reasons; this flag cannot disable it. GPT-OSS also always reasons before it answers, with or without the flag: its Harmony prompt has no "thinking off", and the CLI renders its `Reasoning:` line at `medium`. Nemotron-H Reasoning-128K sometimes reasons without the flag and closes the block itself; the CLI prints that text as reasoning, not as the answer, and so prints the start of such a reply only once it is decided: at its `</think>`, its first complete tool call, its end, or after 2,048 characters at most (see [Nemotron-H](docs/models/nemotron.md#12-output-parser-and-chat-template)). `/think on\|off` toggles it inside the REPL. |
 | `--tools <path>` | JSON file with tool/function definitions. Wire formats differ by family and the parser is picked from the architecture — GLM 5.x emits XML (`<tool_call>NAME<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>`, one element per argument, values `tojson`-encoded when they are not plain strings) rather than a JSON body, and the server parses that back into the usual OpenAI tool-call fields so clients see the standard shape. |
 | `--skills-dir <path>` | Directory to scan for Agent Skills (a folder holding `SKILL.md` files, or a single skill directory). Repeatable; scanned in the order given, up to three levels deep. Without it, every existing `.agents/skills` directory from the working directory up to its Git repository root is used (nearest first; outside a repository only the working directory is checked), followed by a `skills` directory beside the binary, which is created if missing. Explicit roots replace these defaults, and personal/global skill directories are never loaded automatically. A path that does not exist is a startup error naming the flag. Env: `TS_SKILLS_DIR` (a path-separator-separated list). |
 | `--skill <name>` | Select a skill for this run, by the name in its `SKILL.md` (which is also its directory name). Repeatable. On tool-capable model families, selection advertises the skill's metadata and scopes the built-in skill tools to it; it does **not** inline the `SKILL.md` body. The body is inlined only as the fallback for a family/request that cannot use tool declarations (including structured-output requests), when it fits the prompt budget. |
@@ -460,20 +468,22 @@ script gets that error instead of watching a setting be ignored.
 | `--test-chunked-prefill` | Run the chunked-prefill correctness check (compares chunked vs non-chunked logits) |
 | `--correct-prefill <N>` | Prompt length used by `--test-chunked-prefill` |
 | `--correct-decode <N>` | Decode length used by `--test-chunked-prefill` |
-| `--diffusion-steps <N>` | DiffusionGemma denoising steps per block (default: 48). For Qwen-Image-2.1, the FlowMatch-Euler step count — omit for auto (40, or the step count of a `--lora` plug-in's sampling recipe). |
-| `--diffusion-seed <N>` | Noise seed for the diffusion paths: DiffusionGemma's deterministic sampler and Qwen-Image-2.1 (default: 0), and video generation (Wan, MiniMax-H3), where leaving it out draws a fresh random seed each run. This is the seed that decides what a clip looks like — `--seed` is the text sampling seed and does not affect it. |
+| `--diffusion-steps <N>` | DiffusionGemma denoising steps per block (default: 48). For Qwen-Image-2.1, the FlowMatch-Euler step count — omit for auto (40, or the step count of a `--lora` plug-in's sampling recipe; Qwen-Image-2.1-Turbo runs 8, the only count it takes). |
+| `--diffusion-seed <N>` | Noise seed for the diffusion paths: DiffusionGemma's deterministic sampler and Qwen-Image-2.1 (default: 0), and video generation (Wan, MiniMax-H3), where leaving it out draws a fresh random seed each run. This is the seed that decides what a clip looks like — `--seed` is the text sampling seed and does not affect it. A Qwen-Image-2.1 picture depends on the seed and its size; an edit's noise also depends on its `--image` pictures, so editing a picture at the seed it was drawn with does not restart from its own noise ([seeds and edits](docs/models/qwenimage21.md#seeds-and-edits)). |
 | `--diffusion-blocks <N>` | DiffusionGemma block-autoregressive canvas count. `0` derives the count from `--max-tokens` and the model canvas length. |
 | `--image <path>` | Input image for Qwen-Image-2.1 editing (also the image input for multimodal chat); repeat it for multiple references. Every `--image` is a reference, tagged `<image1>`, `<image2>`, … in command-line order ahead of the prompt, so the prompt can name a picture by its tag. Without `--image`, a Qwen-Image-2.1 DiT generates an image from the prompt instead. |
 | `--mask <path>` | Qwen-Image-2.1 mask at the first input image's exact dimensions. Requires `--image`; additional images remain references. Preserves source dimensions and unselected decoded RGBA pixels. See [Masked image editing](#masked-image-editing). |
 | `--mask-mode <mode>` / `--mask-invert` | `grayscale` (default): white edits, black protects and gray blends. `alpha`: transparent edits, opaque protects. `--mask-invert` reverses the selection. |
 | `--mask-feather <pixels>` | Soften the mask inward in source pixels; range 0–1024, default 0. |
 | `--mask-crop` / `--mask-crop-padding <pixels>` | Process the selection with surrounding context, then composite onto the original canvas. Padding is in source pixels; range 0–16384, default 64. Mask settings without `--mask` are rejected. |
+| `--keep-source-size` | Qwen-Image-2.1 edit: return the first `--image`'s exact width and height, so an edit of an edit keeps its size. Sampling uses about the image's own area, at least 1 megapixel and at most the automatic area, at about its aspect ratio (the 32-pixel grid rounds both), and the result is resized to the source. Requires `--image`; cannot be combined with `--width`/`--height`. Masked edits keep the source size without it. The server takes it as the per-request field `keepSourceSize`. See [Keeping the source size](#keeping-the-source-size). |
 | `--prompt <text>` | Qwen-Image-2.1 generation prompt or edit instruction (falls back to `--input` file contents if omitted). |
 | `--output <path>` | Qwen-Image-2.1 output PNG path (default: `generated.png` for generation, `edited.png` for editing). |
 | `--cfg <F>` | Qwen-Image-2.1 true-CFG guidance scale (`<= 1` disables the negative pass). Omit for auto: 1.0 for Qwen-Image-2.1 (one transformer prediction per step), or the CFG of a `--lora` plug-in's sampling recipe; a value above 1 adds the negative pass. Shares `--diffusion-steps` / `--diffusion-seed` for step count and seed. On MiniMax-H3 the only accepted value is `1.0` (its default): the checkpoint ships CFG-distilled and anything higher is refused up front rather than run and degraded. `TensorSharp.Server.Host` has no `--cfg` at all — a request body can still carry `cfg`. |
 | `--qwen-image-vae <path>` | Override the resolved Qwen-Image-2.1 VAE companion (default: the `qwen_image_2.1_vae*.safetensors` file next to the DiT GGUF). Env: `TS_QWEN_IMAGE_VAE`. |
 | `--qwen-image-vl <path>` | Override the resolved Qwen3-VL-8B text-encoder GGUF (default: a `Qwen3VL-8B` / `Qwen3-VL-8B` GGUF next to the DiT). Env: `TS_QWEN_IMAGE_TE`. |
 | `--qwen-image-mmproj <path>` | Override the resolved Qwen3-VL-8B mmproj (vision grounding for edits) GGUF (default: a matching `mmproj` GGUF next to the DiT). Env: `TS_QWEN_IMAGE_MMPROJ`. |
+| `--qwen-image-variant <base\|turbo>` | Which Qwen-Image-2.1 checkpoint the DiT GGUF holds. The GGUFs carry no metadata and Turbo has the base checkpoint's tensors, so the host declares it: `turbo` samples Qwen-Image-2.1-Turbo's published 8-step schedule at CFG 1, refuses other step counts and refuses step-distillation `--lora` plug-ins. Default: none — a file name containing the word `turbo` is assumed to be Turbo and the load says so; any other is `base`. Refused with any other model. Env: `TS_QWEN_IMAGE_VARIANT`. See [Qwen-Image-2.1-Turbo](docs/models/qwenimage21.md#qwen-image-21-turbo). |
 | `--lora <path>` | Qwen-Image-2.1 LoRA plug-in: a LoRA `.safetensors` file or a TensorSharp plug-in config `.json` (see [`config/lora/`](config/lora/)). Repeat to stack LoRAs. Applied unmerged on top of the quantized transformer. Refused with any other model. Default: none. See [Qwen-Image-2.1 LoRA plug-ins](#qwen-image-21-lora-plug-ins). |
 | `--lora-scale <f>` | Strength of the preceding `--lora` (multiplies alpha / rank). Default: the plug-in config's `"scale"`, else `1.0`. |
 | `--lora-config <path>` | Companion config of the preceding `--lora`: a TensorSharp LoRA config, a PEFT `adapter_config.json` or a VideoX-Fun `pdd_config.json`. Default: none (a PDD bundle's `pdd_config.json`, and a PEFT `adapter_config.json` beside `adapter_model.safetensors`, are found next to the weights). |
@@ -763,6 +773,7 @@ of quietly losing a setting.
 | `--video-dit2 <path>` | Second diffusion expert on dual-expert models (Wan 2.2 A14B's high/low-noise partner of `--model`). Auto-resolved by name when the pair is co-located. Env: `TS_VIDEO_DIT2`. |
 | `--audio-vae <path>` | Audio VAE for models that generate an audio track jointly with the video (`minimax_h3_audio_vae_fp32.safetensors`). Without it such a model still runs and produces video, just no audio. Env: `TS_VIDEO_AUDIO_VAE`. |
 | `--qwen-image-vae <path>` / `--qwen-image-vl <path>` / `--qwen-image-mmproj <path>` | Override the Qwen-Image-2.1 companions the server otherwise finds next to the DiT GGUF: the VAE, the Qwen3-VL-8B text encoder and its vision projector (needed for editing). Checked at startup. Env: `TS_QWEN_IMAGE_VAE`, `TS_QWEN_IMAGE_TE`, `TS_QWEN_IMAGE_MMPROJ`. |
+| `--qwen-image-variant <base\|turbo>` | Which Qwen-Image-2.1 checkpoint the DiT GGUF holds, same spelling and meaning as on the CLI: `turbo` samples Turbo's 8-step schedule at CFG 1 by default (a request's `steps` may only be 8) and refuses step-distillation `--lora` plug-ins. Applies to every Qwen-Image model the server loads; another model loads without it and the server logs a warning, as for `--lora`. Default: none — a file name containing the word `turbo` is assumed to be Turbo and the load says so. Checked at startup. Env: `TS_QWEN_IMAGE_VARIANT`. |
 | `--width <px>` / `--height <px>` | Default Qwen-Image-2.1 output size for an image request that names neither a size nor an area (the Web UI sends none); a request that sets its own width/height or target area keeps its own geometry. The default needs both values. A side that is not a multiple of 32 is rounded down to one (never below 32) with a one-time `[qwen-image] WARNING`; with only one side given, or an unparsable or negative value, the default is ignored with a one-time warning and the automatic size (a 2048×2048 area; 1024×1024 on the `cpu` backend) stays. A Qwen-Image server also warns at startup in either case; nothing is refused. A width/height set in the request itself must still be a positive multiple of 32. Env: `TS_QWEN_IMAGE_WIDTH` / `TS_QWEN_IMAGE_HEIGHT`. They are also aliases of `--video-width` / `--video-height`. |
 | `--lora <path>` / `--lora-scale <f>` / `--lora-config <path>` | Qwen-Image-2.1 LoRA plug-ins, same spelling and binding rules as on the CLI (repeat `--lora` to stack; scale and config bind to the preceding `--lora`). The files are checked at startup, and the set applies to every image request; a request's `steps` / `cfg` still override a plug-in's sampling recipe. Other models ignore them (the startup log says the plug-ins apply to Qwen-Image-2.1 models only). See [Qwen-Image-2.1 LoRA plug-ins](#qwen-image-21-lora-plug-ins). |
 | `--qwen-image-lora` / `--offload-cpu` | **Removed and rejected at startup, including as config-file keys.** Both served only the earlier Qwen-Image-Edit pipeline. `--qwen-image-lora` is replaced by `--lora` above; `--offload-cpu` has no replacement, because Qwen-Image-2.1 keeps its DiT weights resident. |
@@ -983,6 +994,25 @@ by JSON requests through `/api/upload` first. A mask requires Qwen-Image-2.1,
 an input image and matching source dimensions. See the [mask guide](docs/models/qwenimage21.md#precise-local-editing-with-a-mask)
 for selection semantics, sampling geometry, API examples and validation coverage.
 
+### Keeping the source size
+
+Without a mask, an edit's size comes from an area (the automatic 2048×2048 area, or a
+request's `targetArea`) at the first image's aspect ratio, so a picture larger than
+that area comes back smaller, and the next edit of a selection edit's full-size result
+shrank. `--keep-source-size` (the request field `keepSourceSize: true`) returns the
+first image's exact width and height instead:
+
+```bash
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --config config/qwen-image-2.1.json \
+    --image edited.png --keep-source-size \
+    --prompt "Make the sky a sunset" --output edited-again.png
+```
+
+Sampling uses about the image's own area -- at least 1 megapixel, where references are
+conditioned, and at most the area the edit would otherwise use -- at about its aspect
+ratio (the 32-pixel grid rounds both), and the decoded result is resized to the source
+when that differs from it. The server Web UI and TensorAgent send it with every edit.
+
 ## Qwen-Image-2.1 LoRA plug-ins
 
 `--lora` adds a LoRA to the Qwen-Image-2.1 diffusion transformer: a style, an
@@ -1012,6 +1042,13 @@ does not expose per-request LoRA selection; TensorAgent has its own saved LoRA c
 which apply from the next picture. The retired `--qwen-image-lora` is still a removed
 flag, and its error names `--lora`; `TS_QWEN_IMAGE_LORA` is refused at load with
 the same advice.
+
+On Qwen-Image-2.1-Turbo (`--qwen-image-variant turbo`), which is step-distilled
+already, a plug-in that carries a sampling recipe (the four step-distillation plug-ins
+below, or any config with `"sampling"`) is refused at load with the reason; plug-ins
+without a recipe load. Film Stills and Grainscape were validated on Turbo (the look
+applies, and part of the scene is redrawn); see
+[LoRA plug-ins on Turbo](docs/models/qwenimage21.md#lora-plug-ins-on-turbo).
 
 ```bash
 # A ready-made plug-in: the config downloads (and hash-checks) its weights on first
@@ -2192,7 +2229,9 @@ The full picture, including the native loader's own knobs, is in the
 | Prefix KV cache (the text and reference-image keys and values are stored at the first denoising step and reused at every later one) | ON | `TS_QWEN21_PREFIX_CACHE=0` (or `false` / `off` / `no`) turns it off | — |
 | Prefix KV cache storage type | `auto` — what the attention kernel reads, so cached steps reproduce the uncached run | `TS_QWEN21_PREFIX_CACHE_TYPE` = `auto` / `f16` / `f32` / `q8_0` / `q8_0_v` (the 8-bit types round the stored prefix; a misspelled value is an error even while the cache is off) | — |
 | Prefix KV cache size limit | at most half of the memory the device reports free | `TS_QWEN21_PREFIX_CACHE_MAX_MIB` caps one cache further; a cache that does not fit is declined with a warning, and that request recomputes the prefix every step | — |
+| Edit noise | `references` — an edit's initial noise follows the seed and its reference images, so an edit never restarts from the noise that drew its source | `TS_QWEN21_EDIT_NOISE=seed` draws edits from the seed's text-to-image noise, as stable-diffusion.cpp does, for matched-noise comparisons (each such edit prints a line saying so); any other value is an error | — |
 | Companion overrides | resolved next to the DiT GGUF | `TS_QWEN_IMAGE_VAE`, `TS_QWEN_IMAGE_TE`, `TS_QWEN_IMAGE_MMPROJ` | `--qwen-image-vae`, `--qwen-image-vl`, `--qwen-image-mmproj` |
+| Checkpoint variant (Turbo samples its own 8-step schedule) | none: a file name with the word `turbo` is assumed to be Turbo, said at load; any other is `base` | `TS_QWEN_IMAGE_VARIANT` = `base` / `turbo` (any other value refuses the load) | `--qwen-image-variant` |
 
 #### Tensor parallelism & distributed inference
 

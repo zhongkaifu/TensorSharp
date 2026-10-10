@@ -607,6 +607,18 @@ data: [DONE]
 The final chunk's `usage` block carries `prompt_tokens_details.cached_tokens`
 just like the non-streaming response.
 
+While a parser holds text it cannot classify yet (a Nemotron-H Reasoning-128K
+thinking-off reply until it proves to be reasoning or the answer), the stream
+sends an SSE comment line every 15 s instead of falling silent, so a proxy's
+idle timeout does not cut it. SSE clients skip it:
+
+```
+: keep-alive
+```
+
+`/v1/responses` sends the same comment, and `/api/chat/ollama` sends a chunk
+with an empty message (`"message":{"role":"assistant","content":""}`, `"done":false`).
+
 ### Chat Completions with JSON mode
 
 ```bash
@@ -1077,6 +1089,7 @@ Event shapes:
 |---|---|---|
 | `token` | each generated token (or parsed content chunk when `think`/`tools` are active) | streaming content |
 | `replace`, `diffusionStep`, `diffusionTotal`, `preview` | each DiffusionGemma denoising preview and final replacement | replace the whole assistant message body instead of appending a token |
+| `replace` alone | when text already streamed as the answer proves to be reasoning (Nemotron-H Reasoning-128K closing a reasoning block its thinking-off prompt had closed) | the whole answer of the turn so far, every round included; it follows the `thinking` frame that carries the reasoning, and later `token` frames append to it |
 | `thinking` | each parsed reasoning chunk (only when the model emits one) | streaming chain-of-thought |
 | `tool_calls` | when the model emits a caller-defined tool call | array of `{name, arguments}`; built-in skill/code calls are executed in process instead |
 | `tool_progress`, `tool`, `text`, `seconds`, `detail`, `agents` | while an in-process skill/code/agent call is being written or run | transient live activity: phase is `writing`, `running`, or `finished`; the bundled Web UI keeps only a bounded current tail and clears it on `finished`. While `wait_agent` is `running`, `agents` is a snapshot of every sub-agent in the request (`agent_id`, `parent_id`, `task`, `agent_type`, `status`, `tool`, `tool_status`, `detail`, `result`, `error`); otherwise it is `null` |
@@ -1109,6 +1122,15 @@ Sample sub-agent snapshot while `wait_agent` runs:
 
 ```
 data: {"tool_progress":"running","tool":"wait_agent","text":"","seconds":3,"detail":null,"agents":[{"agent_id":"/root/api_review","parent_id":"/root","task":"Review the API layer for migration risks...","agent_type":"reviewer","status":"running","tool":"read_file","tool_status":"completed","detail":"src/api.cs","result":null,"error":null}]}
+```
+
+Sample retraction, after a tool round's text proved to be reasoning (the
+earlier round's preamble stays, the reasoning moves to the reasoning box):
+
+```
+data: {"thinking":"Okay, the user wants to know how many lines are in notes.txt. ..."}
+data: {"replace":"To determine the number of lines, I will read the file.\n\n"}
+data: {"token":"The file has 7 lines."}
 ```
 
 Sample DiffusionGemma preview frame:
@@ -1314,10 +1336,14 @@ or approximately the same area at the first reference's aspect ratio for editing
 `targetArea: 1048576` selects approximately 1K output with automatic aspect ratio;
 explicit dimensions take precedence. Starting the server with both `--width` and
 `--height` (multiples of 32) replaces that default for every generation or edit
-request that sends no `width`/`height`, and then also takes precedence over
-`targetArea`; either flag alone leaves image sizes unchanged. The bundled Web UI
-sends no size, so these flags set its output size (they also set the default
-video size). Editing references are conditioned at
+request that sends neither `width`/`height` nor its own `targetArea`; either flag
+alone leaves image sizes unchanged. The bundled Web UI sends no size, so these
+flags set the size of its generated pictures (they also set the default video
+size). An edit request with `keepSourceSize: true` returns the first image's exact
+width and height instead, sampled at about its own area and aspect ratio, at least
+1 megapixel and at most the area it would otherwise use; the Web UI sends it with every edit, so an
+edit of an edit keeps its size. It cannot be combined with `width`/`height`, and
+`/api/image-generate` refuses it. Editing references are conditioned at
 approximately 1 megapixel each, or the output area if smaller.
 
 Omitted `steps`/`cfg` select 40 Euler steps and CFG 1, following the released
@@ -1354,6 +1380,12 @@ Response:
 Without explicit `width` / `height` (and no server `--width`/`--height` default),
 the output keeps the first reference's aspect ratio at approximately 2048×2048
 pixels of area.
+
+`seed` (default 0) keys the initial noise. An edit's noise also depends on the
+pictures it is given, so editing a picture at the seed and size it was generated
+with does not start from that picture's own noise; the same pictures and settings
+still give the same result. A server started with `TS_QWEN21_EDIT_NOISE=seed`
+draws edits from the seed alone, as stable-diffusion.cpp does.
 
 A JSON body `{ "imagePaths": ["<file from /api/upload>"], "prompt": "...",
 "steps": 0, "cfg": 0, "seed": 42 }` is also accepted (`imagePaths` lists the

@@ -204,7 +204,9 @@ public sealed class Qwen4ExpRetainedCachePolicyTests
         PrefixCacheCapabilities caps = fixture.Model.GetPrefixCacheCapabilities();
         Assert.Equal(FamilyClass.R, caps.Class);
         Assert.Equal(TruncationKind.None, caps.Truncation);
-        Assert.False(caps.ReuseAcrossMediaSpan);
+        // Complete holders keep the rotary gap and QSA position history, so identical
+        // media continues at the exact retained length (Qwen4ExpModel.PrefixCache).
+        Assert.True(caps.ReuseAcrossMediaSpan);
         Assert.False(caps.Persistable);
         Assert.Equal(4096L * 1024 * 1024, caps.SubCapBytes.DeviceKv);
         Assert.False(string.IsNullOrEmpty(caps.NamespaceFingerprint));

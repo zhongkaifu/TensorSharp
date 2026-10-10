@@ -117,7 +117,9 @@ namespace TensorSharp.Server
         public InferenceEngine TryGetEngine()
         {
             var model = _lifecycle.Model;
-            if (model == null) return null;
+            // A model being unloaded gets no new engine: its dispose would free the weights
+            // under that engine's worker.
+            if (model == null || model.IsRetiring) return null;
             if (!model.SupportsKVStateSnapshot && model is not IBatchedPagedModel) return null;
 
             string fp = model.KVStateFingerprint ?? string.Empty;

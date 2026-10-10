@@ -11,6 +11,7 @@
 using TensorAgent.Core.Catalog;
 using TensorAgent.Core.Hosting;
 using TensorAgent.Core.Settings;
+using TensorSharp.Runtime;
 
 namespace TensorAgent.Tests;
 
@@ -70,11 +71,16 @@ public sealed class DiffusionCatalogTests
     private static CatalogModel QwenImage21 =>
         DiffusionModelFixture.QwenImage21;
 
-    /// <summary>What <c>DiffusionCompanions</c> publishes, and all it publishes.</summary>
+    /// <summary>What <c>DiffusionCompanions</c> publishes, and all it publishes: the three
+    /// companions and the checkpoint variant the entry declares.</summary>
     private static readonly string[] CompanionVariables =
     [
-        "TS_QWEN_IMAGE_VAE", "TS_QWEN_IMAGE_TE", "TS_QWEN_IMAGE_MMPROJ",
+        "TS_QWEN_IMAGE_VAE", "TS_QWEN_IMAGE_TE", "TS_QWEN_IMAGE_MMPROJ", "TS_QWEN_IMAGE_VARIANT",
     ];
+
+    /// <summary>The Qwen-Image 2.1 Turbo entries (the 4-bit default and the 8-bit one).</summary>
+    private static CatalogModel[] Turbos =>
+        ModelCatalog.BuiltIn.Where(m => m.Family == CatalogFamily.QwenImage && m.ImageVariant == QwenImageVariant.Turbo).ToArray();
 
     /// <summary>
     /// Variables only the retired Qwen-Image-Edit-2511 pipeline read. Nothing may publish
@@ -173,6 +179,59 @@ public sealed class DiffusionCatalogTests
         Assert.False(VaeScanFinds(weights));
         Assert.False(VaeScanFinds(textEncoder));
         Assert.False(VaeScanFinds(projector));
+    }
+
+    /// <summary>
+    /// The Turbo entries take the base entry's VAE, text encoder and projector as the same
+    /// files -- name, size, hash and pinned URL -- so an install that holds one entry links
+    /// them for the other instead of downloading 6.9 GB again (ModelStore.SharedCopy matches
+    /// on size and hash). Only the denoiser is their own, and no scan mistakes it for a companion.
+    /// </summary>
+    [Fact]
+    public void TheTurboEntriesShareTheBaseEntrysCompanionsAndDeclareTheirCheckpoint()
+    {
+        Assert.Equal(QwenImageVariant.Base, QwenImage21.ImageVariant);
+        Assert.Equal(new[] { "qwen-image-2.1-turbo-adq4k", "qwen-image-2.1-turbo-q8" }, Turbos.Select(m => m.Id));
+        foreach (CatalogModel turbo in Turbos)
+        {
+            Assert.True(turbo.IsImageGenerator);
+            Assert.Equal(CatalogArchitectureKind.Diffusion, turbo.Kind);
+            Assert.Equal(QwenImage21.Modalities, turbo.Modalities);
+            foreach (CatalogFileRole role in new[] { CatalogFileRole.TextEncoder, CatalogFileRole.Vae, CatalogFileRole.VisionProjector })
+                Assert.Equal(QwenImage21.Files.Single(f => f.Role == role), turbo.Files.Single(f => f.Role == role));
+            Assert.Equal(4, turbo.Files.Count);
+            Assert.Contains("/AtomicChat/Qwen-Image-2.1-Turbo-GGUF/resolve/bb25d06bc74119c12207243d68917951e6d9c232/", turbo.Weights.Url);
+            string weights = turbo.Weights.FileName;
+            Assert.False(VaeScanFinds(weights) || TextEncoderScanFinds(weights) || VisionProjectorScanFinds(weights), weights);
+        }
+        CatalogModel fast = ModelCatalog.Find("qwen-image-2.1-turbo-adq4k")!, best = ModelCatalog.Find("qwen-image-2.1-turbo-q8")!;
+        Assert.Equal(("Qwen-Image-2.1-Turbo-AD-Q4_K.gguf", 4_201_694_944L, "4bb73c53cbe284bbd6d69b9fdc59539c531f0389dd2aa567663d777f8130bc59"),
+            (fast.Weights.FileName, fast.Weights.Bytes, fast.Weights.Sha256));
+        Assert.Equal(("Qwen-Image-2.1-Turbo-Q8_0.gguf", 7_591_554_784L, "99f498fb7188be7eac9eb5f345a9e074d30eef3ca235b419e92563e5b48073c4"),
+            (best.Weights.FileName, best.Weights.Bytes, best.Weights.Sha256));
+    }
+
+    /// <summary>
+    /// The sampling schedule follows the entry, never the file name: every Qwen-Image selection
+    /// publishes its variant (the base entry too, so a Turbo declaration does not outlive its
+    /// selection), and any other selection clears it.
+    /// </summary>
+    [Fact]
+    public void EveryQwenImageSelectionPublishesTheCheckpointItsEntryDeclares()
+    {
+        string variable = QwenImageVariantFlag.EnvironmentVariable;
+        foreach (CatalogModel model in Turbos.Prepend(QwenImage21))
+        {
+            using var installation = new FakeInstall(model, install: m => m.Files);
+            IReadOnlyDictionary<string, string> published = DiffusionCompanions.Publish(model, installation.Store);
+            string expected = model.ImageVariant == QwenImageVariant.Turbo ? "turbo" : "base";
+            Assert.Equal(expected, published[variable]);
+            Assert.Equal(expected, Environment.GetEnvironmentVariable(variable));
+            Assert.Equal(CompanionVariables.Order(StringComparer.Ordinal), published.Keys.Order(StringComparer.Ordinal));
+
+            DiffusionCompanions.Publish(ModelCatalog.BuiltIn.First(m => m.Family == CatalogFamily.Wan), installation.Store);
+            Assert.Null(Environment.GetEnvironmentVariable(variable));
+        }
     }
 
     [Fact]

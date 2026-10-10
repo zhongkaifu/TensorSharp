@@ -14,6 +14,7 @@ using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Runtime.CompilerServices;
+using System.Text;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Channels;
@@ -1280,6 +1281,91 @@ namespace TensorSharp.Chat
 
         private int _mediaJobs;
 
+        /// <summary>
+        /// Ask the loaded image model's own Qwen3-VL-8B which of <paramref name="options"/> fits
+        /// the question in <paramref name="system"/> and <paramref name="user"/>
+        /// (<see cref="TensorSharp.Models.QwenImage.QwenImageModel.ChooseAnswer"/>): a host that plans
+        /// an image turn from the whole conversation asks it what the newest message wants done.
+        /// The options are their texts; the model letters them and asks for a letter itself.
+        ///
+        /// <para>Null when the loaded model is not Qwen-Image-2.1, when it is being unloaded,
+        /// or when it cannot score the question (no GGML backend, an encoder-only text-encoder
+        /// GGUF, a question over <see cref="TensorSharp.Models.QwenImage.QwenImageModel.MaxQuestionTokens"/>);
+        /// the caller decides without it. Cancellation and engine failures propagate.</para>
+        ///
+        /// <para>It is a media job, counted BEFORE the model is read: a host's model switch asks
+        /// <see cref="IsGeneratingMedia"/> before it unloads, so a model read first could be
+        /// disposed in between. It also holds a use of the model
+        /// (<see cref="TensorSharp.Models.ModelBase.TryEnterUse"/>), which an unload waits for,
+        /// and it waits for and holds the lock picture requests take, because the model is not
+        /// thread-safe and its encoder must not overlap a picture's. A model that started to be
+        /// unloaded while the question waited for that lock is not asked.</para>
+        /// </summary>
+        public async Task<TensorSharp.Models.QwenImage.ImageIntentChoice?> ChooseWithImageModelAsync(
+            string system, string user, IReadOnlyList<string> options, CancellationToken cancellationToken)
+        {
+            var logger = _loggerFactory.CreateLogger("TensorSharp.Server.ImageEdit");
+            TensorSharp.Models.QwenImage.ImageIntentChoice? choice;
+            long elapsedMs;
+            bool retired;
+            Interlocked.Increment(ref _mediaJobs);
+            try
+            {
+                if (_svc.Model is not TensorSharp.Models.QwenImage.QwenImageModel model)
+                    return null;
+                retired = !model.TryEnterUse();
+                if (retired)
+                {
+                    choice = null;
+                    elapsedMs = 0;
+                }
+                else
+                {
+                    try
+                    {
+                        (choice, elapsedMs, retired) = await Task.Run(() =>
+                        {
+                            lock (_imageEditLock)
+                            {
+                                cancellationToken.ThrowIfCancellationRequested();
+                                // A switch that began while this waited behind a picture is waiting
+                                // for this use to end; it is not kept waiting for a question.
+                                if (model.IsRetiring)
+                                    return ((TensorSharp.Models.QwenImage.ImageIntentChoice?)null, 0L, true);
+                                // Timed inside the lock: a wait behind a picture is not the scorer's cost.
+                                var scoring = Stopwatch.StartNew();
+                                var result = model.ChooseAnswer(system, user, options, cancellationToken);
+                                return (result, scoring.ElapsedMilliseconds, false);
+                            }
+                        }, cancellationToken);
+                    }
+                    finally
+                    {
+                        model.ExitUse();
+                    }
+                }
+            }
+            finally
+            {
+                // The awaited worker has left the model (a cancelled request that never started
+                // one has nothing to wait for), so the job is over either way.
+                Interlocked.Decrement(ref _mediaJobs);
+            }
+            if (choice == null)
+            {
+                logger.LogInformation(LogEventIds.UploadReceived, retired
+                    ? "Image turn plan not scored: the image model is being unloaded; the host decides without it"
+                    : "Image turn plan not scored: the image model's Qwen3-VL cannot answer this question; the host decides without it");
+                return null;
+            }
+            logger.LogInformation(LogEventIds.UploadReceived,
+                "Image turn plan scored by the image model's Qwen3-VL in {Ms} ms over {Tokens} tokens: {Probabilities}",
+                elapsedMs, choice.PromptTokens,
+                string.Join(", ", choice.Probabilities.Select((p, i) =>
+                    string.Create(System.Globalization.CultureInfo.InvariantCulture, $"{i}={p:F2}"))));
+            return choice;
+        }
+
         // Every loadable QwenImageModel is a Qwen-Image-2.1 model: earlier Qwen-Image
         // checkpoints are refused at load, so the model type is the whole check.
         private const string NotAnImageModelError = "The loaded model is not a Qwen-Image-2.1 model.";
@@ -1305,13 +1391,14 @@ namespace TensorSharp.Chat
 
         /// <summary>
         /// <c>POST /api/image-edit</c> with a JSON body: <c>{ imagePaths[] | imagePath,
-        /// prompt, steps?, cfg?, seed?, targetArea?, maskPath?, maskMode?, maskInvert?,
-        /// maskFeather?, maskCrop?, maskCropPadding? }</c> where the paths are the bare
-        /// server file names <c>/api/upload</c> returned. Runs the loaded Qwen-Image-2.1
+        /// prompt, steps?, cfg?, seed?, targetArea?, keepSourceSize?, maskPath?, maskMode?,
+        /// maskInvert?, maskFeather?, maskCrop?, maskCropPadding? }</c> where the paths are the
+        /// bare server file names <c>/api/upload</c> returned. Runs the loaded Qwen-Image-2.1
         /// model and returns <c>{ ok, url, width, height, elapsedSeconds }</c>. With
         /// multiple images the first drives the output geometry and the prompt can
         /// reference them as "Picture 1", "Picture 2", ... in upload order. A mask applies
-        /// only to the first image and retains its original canvas and unselected pixels.
+        /// only to the first image and retains its original canvas and unselected pixels;
+        /// <c>keepSourceSize</c> returns the first image's exact size without one.
         /// </summary>
         public Task<object> ImageEditAsync(JsonElement body, CancellationToken cancellationToken) =>
             ImageRequestAsync(body, generate: false, null, cancellationToken);
@@ -1358,6 +1445,7 @@ namespace TensorSharp.Chat
                 p.TargetArea = body.TryGetProperty("targetArea", out var area)
                     ? area.GetInt64() : p.ResolveTargetArea();
                 if (body.TryGetProperty("negativePrompt", out var negative)) p.NegativePrompt = negative.GetString() ?? " ";
+                if (body.TryGetProperty("keepSourceSize", out var keep)) p.KeepSourceSize = keep.GetBoolean();
                 if (body.TryGetProperty("maskMode", out var mode))
                     p.MaskMode = mode.GetString()?.ToLowerInvariant() switch
                     {
@@ -1388,6 +1476,9 @@ namespace TensorSharp.Chat
             if (p.Width < 0 || p.Height < 0 || (p.Width == 0) != (p.Height == 0)
                 || p.Width % alignment != 0 || p.Height % alignment != 0)
                 throw new WebUiRequestRejectedException(400, new { error = $"width and height must both be zero (automatic) or positive multiples of {alignment}." });
+            // Both choose the output size; the pipeline refuses the pair as well.
+            if (p.KeepSourceSize && (p.Width != 0 || p.Height != 0))
+                throw new WebUiRequestRejectedException(400, new { error = "keepSourceSize returns the first image's own size; it cannot be combined with width/height." });
         }
 
         internal static string ParseImagePrompt(JsonElement body, bool generate)
@@ -1401,6 +1492,8 @@ namespace TensorSharp.Chat
                 throw new WebUiRequestRejectedException(400, new { error = "Text-to-image generation requires a nonempty prompt." });
             if (generate && HasMaskFields(body))
                 throw new WebUiRequestRejectedException(400, new { error = "Masks require an input image and /api/image-edit." });
+            if (generate && body.TryGetProperty("keepSourceSize", out var keep) && keep.ValueKind == JsonValueKind.True)
+                throw new WebUiRequestRejectedException(400, new { error = "keepSourceSize requires an input image and /api/image-edit." });
             if (generate && ((body.TryGetProperty("imagePaths", out var images)
                     && images.ValueKind != JsonValueKind.Null
                     && (images.ValueKind != JsonValueKind.Array || images.GetArrayLength() > 0))
@@ -1737,7 +1830,7 @@ namespace TensorSharp.Chat
             // never blocks on the consumer (unbounded TryWrite) so it can't stall the denoise.
             var channel = Channel.CreateUnbounded<EditFrame>(new UnboundedChannelOptions { SingleReader = true, SingleWriter = true });
             // steps == 0 means "auto": the pipeline resolves the real count itself (40 for
-            // Qwen-Image-2.1), so request the full preview budget and let the pipeline's
+            // Qwen-Image-2.1, 8 for Turbo, a LoRA recipe's own count), so request the full preview budget and let the pipeline's
             // interval math fit it to the resolved steps. Clamping against the raw 0 here
             // disabled previews entirely for auto-step requests (the Web UI default).
             int previewCount = p.Steps > 0 ? Math.Clamp(p.Steps - 1, 0, 8) : 8;
@@ -2534,6 +2627,20 @@ namespace TensorSharp.Chat
                 });
             }
 
+            // The names the code tools stage each attachment under, on the message that
+            // attached it: the tool declarations no longer carry them (they are inside
+            // the prefix every conversation shares). Only when this request offers the
+            // runner that stages them, and on this inference copy only -- the persisted
+            // conversation is the request body, which never sees the note. The plan
+            // carries the same names to the pipeline, whose note for an earlier picture
+            // that no longer fits must name the file the way this note does.
+            if (skillPlan?.ToolContext?.CodeRunner != null)
+            {
+                IReadOnlyDictionary<string, string> stagedNames = StagedNamesBySource(sourceCodeInputFiles);
+                messages = ChatHistoryPreparer.AnnotateAttachmentNames(messages, stagedNames);
+                skillPlan.StagedAttachmentNames = stagedNames;
+            }
+
             // A host-routed deliverable is complete only when the loop can prove the
             // file a tool reported is the same immutable artifact its URL downloads.
             // Snapshot after attachments have been staged: an attached deck already
@@ -2569,6 +2676,8 @@ namespace TensorSharp.Chat
 
             if (skillPlan != null)
             {
+                // Both pages take shown text back through a whole-answer `replace`.
+                skillPlan.ClientRetractsAnswerText = true;
                 messages = skillPlan.Apply(messages);
                 if (!string.IsNullOrWhiteSpace(inferredSkillRoute?.Instructions))
                     messages = SkillPrompt.Apply(messages, inferredSkillRoute.Instructions);
@@ -2591,7 +2700,7 @@ namespace TensorSharp.Chat
             // multi-second skill lookup into visible progress rather than a hang.
             int reportedInvocations = 0;
             bool reportedVerifiedArtifact = false;
-            bool alwaysNeedsParsing = OutputParserFactory.IsAlwaysRequired(_svc.Architecture);
+            bool alwaysNeedsParsing = OutputParserFactory.IsAlwaysRequired(_svc.Architecture, _svc.ChatTemplate);
             bool useUiParser = uiThink || (uiTools != null && uiTools.Count > 0) || alwaysNeedsParsing;
 
             IOutputParser uiParser = null;
@@ -2599,6 +2708,7 @@ namespace TensorSharp.Chat
             {
                 uiParser = OutputParserFactory.Create(_svc.Architecture);
                 uiParser.Init(uiThink, uiTools);
+                uiParser.AcceptRetractions();
             }
 
             bool aborted = false;
@@ -2622,11 +2732,13 @@ namespace TensorSharp.Chat
             bool turnTruncated = false;
             string turnFinishReason = null;
             bool turnRepetitionExplained = false;
-            // Whether the turn ever produced ANSWER text, as opposed to thinking or a
-            // tool call. tokenCount cannot answer that: it counts every streamed piece,
-            // so a turn that ran a skill and then stopped without writing anything has a
-            // healthy tokenCount and nothing a user can read.
-            bool sawContent = false;
+            // The ANSWER text the page shows for this turn, as opposed to thinking or a
+            // tool call: every token frame adds to it, every replace sets it. tokenCount
+            // cannot say whether there is one: it counts every streamed piece, so a turn
+            // that ran a skill and then stopped without writing anything has a healthy
+            // tokenCount and nothing a user can read. Kept whole across rounds and the
+            // retry, because a retraction is sent as the whole answer without it.
+            var visibleAnswer = new StringBuilder();
             // Set when the skills loop hands over already-separated pieces. uiParser is
             // bypassed for those, so it must not be flushed at the end either — it holds
             // no state, and the loop's own parser already did its final flush.
@@ -2705,20 +2817,15 @@ namespace TensorSharp.Chat
                         sawParsedUpdate = true;
                         // The skills loop already parsed this round and is handing over
                         // the separated pieces (see SkillChatLoop). Running our own
-                        // parser over them would be parsing parsed text.
-                        if (!string.IsNullOrEmpty(update.ThinkingPiece))
-                            yield return WebUiSseEvents.Thinking(update.ThinkingPiece);
+                        // parser over them would be parsing parsed text. Its content
+                        // counts exactly as the non-loop parser branch below counts it;
+                        // otherwise a successful tool-assisted answer is followed by the
+                        // false "ended this turn without writing an answer" placeholder.
                         if (HasParsedAnswerContent(update))
-                        {
-                            // SkillChatLoop has already separated content from thinking
-                            // and tool progress. Count that content exactly as the
-                            // non-loop parser branch below does; otherwise a successful
-                            // tool-assisted answer is followed by the false "ended this
-                            // turn without writing an answer" placeholder.
-                            sawContent = true;
                             tokenCount++;
-                            yield return WebUiSseEvents.Token(update.Piece);
-                        }
+                        foreach (object frame in AnswerFrames(
+                            visibleAnswer, update.Piece, update.ThinkingPiece, update.RetractedPiece))
+                            yield return frame;
                         if (update.ParsedToolCalls is { Count: > 0 })
                             yield return WebUiSseEvents.ToolCalls(update.ParsedToolCalls);
                         if (update.ToolProgressPhase != null)
@@ -2739,13 +2846,9 @@ namespace TensorSharp.Chat
                     if (uiParser != null)
                     {
                         var parsed = uiParser.Add(piece, false);
-                        if (!string.IsNullOrEmpty(parsed.Thinking))
-                            yield return WebUiSseEvents.Thinking(parsed.Thinking);
-                        if (!string.IsNullOrEmpty(parsed.Content))
-                        {
-                            sawContent = true;
-                            yield return WebUiSseEvents.Token(parsed.Content);
-                        }
+                        foreach (object frame in AnswerFrames(
+                            visibleAnswer, parsed.Content, parsed.Thinking, parsed.RetractedContent))
+                            yield return frame;
                         if (parsed.ToolCalls != null)
                             yield return WebUiSseEvents.ToolCalls(parsed.ToolCalls);
                     }
@@ -2755,8 +2858,8 @@ namespace TensorSharp.Chat
                         // a model that needs no parser ended with the "ended this turn
                         // without writing an answer" note, which the page then sent back
                         // as part of the assistant's message on the next turn.
-                        sawContent = true;
-                        yield return WebUiSseEvents.Token(piece);
+                        foreach (object frame in AnswerFrames(visibleAnswer, piece, null, null))
+                            yield return frame;
                     }
                 }
             }
@@ -2798,6 +2901,7 @@ namespace TensorSharp.Chat
 
                 var retryParser = useUiParser ? OutputParserFactory.Create(_svc.Architecture) : null;
                 retryParser?.Init(false, uiTools);
+                retryParser?.AcceptRetractions();
                 bool retryCompleted = false;
                 bool retrySawParsedUpdate = false;
                 IAsyncEnumerator<ChatStreamUpdate> retry = _svc
@@ -2845,16 +2949,13 @@ namespace TensorSharp.Chat
                         }
                         retrySawParsedUpdate |= update.IsParsed;
                         update = ParseRetryUpdate(update, retryParser);
-                        if (!string.IsNullOrEmpty(update.ThinkingPiece))
-                            yield return WebUiSseEvents.Thinking(update.ThinkingPiece);
+                        // Only the separated answer counts as retry content; a
+                        // prompt-opened thought channel can exist with thinking off.
                         if (!string.IsNullOrEmpty(update.Piece))
-                        {
-                            // Only the separated answer counts as retry content; a
-                            // prompt-opened thought channel can exist with thinking off.
-                            sawContent = true;
                             tokenCount++;
-                            yield return WebUiSseEvents.Token(update.Piece);
-                        }
+                        foreach (object frame in AnswerFrames(
+                            visibleAnswer, update.Piece, update.ThinkingPiece, update.RetractedPiece))
+                            yield return frame;
                         if (update.ParsedToolCalls is { Count: > 0 })
                             yield return WebUiSseEvents.ToolCalls(update.ParsedToolCalls);
                         if (update.ToolProgressPhase != null)
@@ -2879,7 +2980,7 @@ namespace TensorSharp.Chat
             }
 
             foreach (object frame in FinalFrames(sawParsedUpdate ? null : uiParser, aborted, inferenceError, chatSession, sw, tokenCount,
-                turnPromptTokens, turnKvReusedTokens, turnTruncated, sawContent, turnFinishReason,
+                turnPromptTokens, turnKvReusedTokens, turnTruncated, visibleAnswer, turnFinishReason,
                 turnRepetitionExplained, turnEvalTokens, turnEvalNs))
             {
                 yield return frame;
@@ -3132,11 +3233,41 @@ namespace TensorSharp.Chat
         /// The paths were resolved (and confined to the upload root) by
         /// <see cref="ChatMessageParser.ResolveAttachmentPaths"/> before this runs.
         /// </para>
+        /// <para>
+        /// Every upload gets a name of its own, decided by its FIRST appearance and by
+        /// nothing after it. A second file with a name already given -- two photos pasted
+        /// on a phone are both "image.png" -- is staged as "image-2.png" rather than
+        /// dropped, which used to leave the program opening the first photo when the
+        /// user meant the second (and refused a text-only model the second image
+        /// outright, because it was never staged). The first file keeps its name, so a
+        /// later attachment can never change which bytes a name means, and the names of
+        /// message i depend on messages 0..i only: the conversation re-renders them
+        /// byte for byte on every later turn (see
+        /// <see cref="ChatHistoryPreparer.AnnotateAttachmentNames"/>). The suffix has no
+        /// spaces or brackets, which a shell command written by a model gets wrong.
+        /// A HEIC/HEIF photo reserves the PNG name <see cref="ReadableCodeInputFiles"/>
+        /// will stage it under as well, so the converted copy cannot collide with a
+        /// real PNG of that name either.
+        /// </para>
+        /// <para>
+        /// What this does not see is the workspace. A session's persistent workspace also
+        /// holds what the model wrote, and a name given here can be one of those -- an
+        /// "image-2.png" the model saved on an earlier turn, as much as a "report.pdf" --
+        /// and staging then replaces the model's file with the upload
+        /// (<c>CodeInputFileStager</c> keeps a workspace copy only when it is at least as
+        /// new as the upload). The names are not steered around such files because they
+        /// must follow from the messages alone: a name that depended on the workspace
+        /// would change whenever the workspace did -- a file written, a sweep -- and with
+        /// it every later rendering of the message that attached it. Avoiding the
+        /// collision needs a record, kept with the workspace, of the names already given.
+        /// </para>
         /// </summary>
         internal static IReadOnlyList<CodeInputFile> CollectCodeInputFiles(List<ChatMessage> messages)
         {
             List<CodeInputFile> files = null;
-            var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            // Case-insensitively, like the filesystems the workspace lives on.
+            var taken = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            var sources = new HashSet<string>(StringComparer.Ordinal);
 
             foreach (ChatMessage message in messages ?? new List<ChatMessage>())
             {
@@ -3150,26 +3281,62 @@ namespace TensorSharp.Chat
                 for (int i = 0; i < paths.Count; i++)
                 {
                     string path = paths[i];
-                    if (string.IsNullOrEmpty(path))
+                    // The same upload attached again (or sent again with the history) is
+                    // the same file under the name it was first given.
+                    if (string.IsNullOrEmpty(path) || !sources.Add(path))
                         continue;
 
                     // Same order as the paths; the stored name stands in when the client
-                    // did not send display names. A repeated name keeps its first file —
-                    // re-attaching the same document must not flip which copy the code
-                    // reads mid-conversation.
-                    string name = names != null && i < names.Count && !string.IsNullOrWhiteSpace(names[i])
-                        ? Path.GetFileName(names[i])
-                        : Path.GetFileName(path);
-
-                    if (name.Length == 0 || !seen.Add(name))
+                    // did not send display names. Staged under the form the prompt quotes
+                    // it in, so the note naming it names this file.
+                    string name = ChatHistoryPreparer.ProseSafeFileName(
+                        names != null && i < names.Count && !string.IsNullOrWhiteSpace(names[i])
+                            ? Path.GetFileName(names[i])
+                            : Path.GetFileName(path));
+                    if (name.Length == 0)
                         continue;
 
-                    (files ??= new List<CodeInputFile>()).Add(new CodeInputFile(name, path));
+                    string distinct = name;
+                    for (int n = 2; IsTaken(distinct, path); n++)
+                        distinct = Path.GetFileNameWithoutExtension(name) + "-" + n + Path.GetExtension(name);
+                    taken.Add(distinct);
+                    taken.Add(ReadableName(distinct, path));
+
+                    (files ??= new List<CodeInputFile>()).Add(new CodeInputFile(distinct, path));
                 }
             }
 
             return files ?? (IReadOnlyList<CodeInputFile>)Array.Empty<CodeInputFile>();
+
+            bool IsTaken(string candidate, string source) =>
+                taken.Contains(candidate) || taken.Contains(ReadableName(candidate, source));
         }
+
+        /// <summary>
+        /// Each upload's path, as the messages reference it, to the name the code tools
+        /// stage it under: its <see cref="CollectCodeInputFiles"/> name, with a HEIC photo
+        /// named by the PNG <see cref="ReadableCodeInputFiles"/> stages for it. Derived from
+        /// the collected list alone -- never from this turn's conversion or staging, which
+        /// stage under the same name whatever happens -- so a message is named the same way
+        /// on every turn that renders it.
+        /// </summary>
+        internal static IReadOnlyDictionary<string, string> StagedNamesBySource(IReadOnlyList<CodeInputFile> collected)
+        {
+            var names = new Dictionary<string, string>(StringComparer.Ordinal);
+            foreach (CodeInputFile file in collected ?? Array.Empty<CodeInputFile>())
+            {
+                if (!string.IsNullOrEmpty(file.SourcePath))
+                    names.TryAdd(file.SourcePath, ReadableName(file.Name, file.SourcePath));
+            }
+            return names;
+        }
+
+        /// <summary>The name <see cref="ReadableCodeInputFiles"/> stages a file under: a format
+        /// Pillow cannot open is named as the PNG it is converted to.</summary>
+        private static string ReadableName(string name, string sourcePath) =>
+            UnreadableByPillow.Contains(Path.GetExtension(sourcePath ?? string.Empty))
+                ? Path.GetFileNameWithoutExtension(name) + ".png"
+                : name;
 
         /// <summary>Image formats the bundled Pillow has no decoder for.</summary>
         private static readonly HashSet<string> UnreadableByPillow =
@@ -3189,9 +3356,13 @@ namespace TensorSharp.Chat
         /// built from, not the thumbnail in the bubble), and cached beside the original.
         /// </para>
         /// <para>
-        /// A conversion that fails leaves the original in place: the model then gets
-        /// Pillow's own error, which is a better outcome than an attachment that silently
-        /// disappears from the working directory.
+        /// A conversion that fails stages the original bytes, still under the PNG name: the
+        /// model then gets Pillow's own error, which is a better outcome than an attachment
+        /// that silently disappears from the working directory. The name is not changed
+        /// back to .heic because the conversation already named the file -- on every turn,
+        /// from the file lists alone (<see cref="StagedNamesBySource"/>) -- and a name that
+        /// followed this turn's decode would rewrite an earlier message's note, and point
+        /// the model at a file the workspace does not have.
         /// </para>
         /// </summary>
         private IReadOnlyList<CodeInputFile> ReadableCodeInputFiles(IReadOnlyList<CodeInputFile> files)
@@ -3210,11 +3381,9 @@ namespace TensorSharp.Chat
                 }
 
                 converted ??= new List<CodeInputFile>(files.Take(i));
-                if (TryRenderPng(file.SourcePath, out string png))
-                    converted.Add(new CodeInputFile(
-                        Path.GetFileNameWithoutExtension(file.Name) + ".png", png));
-                else
-                    converted.Add(file);
+                converted.Add(new CodeInputFile(
+                    ReadableName(file.Name, file.SourcePath),
+                    TryRenderPng(file.SourcePath, out string png) ? png : file.SourcePath));
             }
 
             return converted ?? files;
@@ -3238,7 +3407,7 @@ namespace TensorSharp.Chat
             {
                 _loggerFactory.CreateLogger("TensorSharp.Server.Upload").LogWarning(
                     LogEventIds.UploadReceived,
-                    "Could not decode {Source} for the interpreter: {Error}; the original is staged instead",
+                    "Could not decode {Source} for the interpreter: {Error}; the original bytes are staged under the PNG name instead",
                     source, ex.Message);
                 try { if (File.Exists(png)) File.Delete(png); } catch { /* best effort */ }
                 return false;
@@ -3253,6 +3422,14 @@ namespace TensorSharp.Chat
         internal static bool HasParsedAnswerContent(ChatStreamUpdate update) =>
             update.IsParsed && !string.IsNullOrEmpty(update.Piece);
 
+        private static bool IsNullOrWhiteSpace(StringBuilder text)
+        {
+            for (int i = 0; i < text.Length; i++)
+                if (!char.IsWhiteSpace(text[i]))
+                    return false;
+            return true;
+        }
+
         /// <summary>Separates raw retry output while preserving already-parsed skill updates.</summary>
         internal static ChatStreamUpdate ParseRetryUpdate(ChatStreamUpdate update, IOutputParser parser)
         {
@@ -3265,7 +3442,35 @@ namespace TensorSharp.Chat
                 return update;
 
             var parsed = parser.Add(update.Piece ?? string.Empty, false);
-            return ChatStreamUpdate.Parsed(parsed.Content, parsed.Thinking, parsed.ToolCalls);
+            return ChatStreamUpdate.Parsed(parsed.Content, parsed.Thinking, parsed.ToolCalls, parsed.RetractedContent);
+        }
+
+        /// <summary>
+        /// The frames for one separated piece of the answer, keeping
+        /// <paramref name="visibleAnswer"/> equal to what a page has shown for the turn.
+        /// Text taken back (<see cref="ParsedOutput.RetractedContent"/>) goes as its
+        /// reasoning first and then as a whole-answer <c>replace</c>, before any new
+        /// content. Two frames, because the hosts' transcript readers take one of
+        /// <c>token</c>, <c>replace</c> and <c>thinking</c> from a frame; a relative
+        /// "remove this" key would also be one more key every reader has to learn, and
+        /// a reader that missed it would keep the reasoning in the answer it sends back.
+        /// </summary>
+        internal static IEnumerable<object> AnswerFrames(
+            StringBuilder visibleAnswer, string content, string thinking, string retracted)
+        {
+            if (!string.IsNullOrEmpty(thinking))
+                yield return WebUiSseEvents.Thinking(thinking);
+            if (!string.IsNullOrEmpty(retracted) && visibleAnswer.Length >= retracted.Length
+                && visibleAnswer.ToString(visibleAnswer.Length - retracted.Length, retracted.Length) == retracted)
+            {
+                visibleAnswer.Length -= retracted.Length;
+                yield return WebUiSseEvents.Replace(visibleAnswer.ToString());
+            }
+            if (!string.IsNullOrEmpty(content))
+            {
+                visibleAnswer.Append(content);
+                yield return WebUiSseEvents.Token(content);
+            }
         }
 
         /// <summary>
@@ -3318,26 +3523,21 @@ namespace TensorSharp.Chat
             return artifact;
         }
 
-        private static IEnumerable<object> FinalFrames(
+        internal static IEnumerable<object> FinalFrames(
             IOutputParser uiParser, bool aborted, string inferenceError,
             ChatSession chatSession, Stopwatch sw, int tokenCount, int turnPromptTokens, int turnKvReusedTokens,
-            bool truncated, bool sawContent = true, string finishReason = null,
+            bool truncated, StringBuilder visibleAnswer, string finishReason = null,
             bool repetitionExplained = false, long evalTokens = 0, long evalNs = 0)
         {
             if (uiParser != null && !aborted)
             {
+                // The parser's final flush is answer text like any other, and the check
+                // below is a few lines away: a turn whose whole answer arrived here would
+                // otherwise be told, immediately underneath it, that it never wrote one.
                 var finalParsed = uiParser.Add("", true);
-                if (!string.IsNullOrEmpty(finalParsed.Thinking))
-                    yield return WebUiSseEvents.Thinking(finalParsed.Thinking);
-                if (!string.IsNullOrEmpty(finalParsed.Content))
-                {
-                    // The parser's final flush is answer text like any other, and the
-                    // check below is three lines away: a turn whose whole answer arrived
-                    // here would otherwise be told, immediately underneath it, that it
-                    // never wrote one.
-                    sawContent = true;
-                    yield return WebUiSseEvents.Token(finalParsed.Content);
-                }
+                foreach (object frame in AnswerFrames(
+                    visibleAnswer, finalParsed.Content, finalParsed.Thinking, finalParsed.RetractedContent))
+                    yield return frame;
                 if (finalParsed.ToolCalls != null)
                     yield return WebUiSseEvents.ToolCalls(finalParsed.ToolCalls);
             }
@@ -3346,8 +3546,12 @@ namespace TensorSharp.Chat
             // or a tool, streamed plenty of tokens doing it, and then ended without writing
             // an answer. tokenCount is healthy, truncated is false, and the page shows the
             // step that ran followed by nothing at all -- "I do not know what was
-            // happening". Say that the turn ended, so the absence is legible.
-            if (!aborted && inferenceError == null && !truncated && tokenCount > 0 && !sawContent)
+            // happening". Say that the turn ended, so the absence is legible. Whatever was
+            // shown and then taken back as reasoning does not count, nor does a bare line
+            // break: a reply that reasoned, closed the block and wrote an empty call list
+            // left nothing else.
+            if (!aborted && inferenceError == null && !truncated && tokenCount > 0
+                && IsNullOrWhiteSpace(visibleAnswer))
             {
                 yield return WebUiSseEvents.Token(
                     "_(The model ended this turn without writing an answer. Any tool or skill"

@@ -697,7 +697,11 @@ public class TensorAgentMauiProjectTests
         // An Entitlements.plist beside it is what MAUI signs the app with, and the App
         // Sandbox there would stop every command: a process inside the App Sandbox
         // cannot apply the Seatbelt profile the desktop backend confines code with.
-        Assert.False(File.Exists(Path.Combine(MauiDir, "Platforms", "MacCatalyst", "Entitlements.plist")));
+        // The hardened runtime's own entitlements (JIT for Mono, camera, microphone,
+        // photos) are fine there; the App Sandbox is not.
+        string entitlements = Path.Combine(MauiDir, "Platforms", "MacCatalyst", "Entitlements.plist");
+        if (File.Exists(entitlements))
+            Assert.DoesNotContain("com.apple.security.app-sandbox", File.ReadAllText(entitlements));
         Assert.DoesNotContain(Csproj.Descendants(Ns + "CodesignEntitlements"),
             e => e.Value.Contains("MacCatalyst", StringComparison.Ordinal));
         foreach (string file in new[] { "AppDelegate.cs", "Program.cs", "SceneDelegate.cs" })

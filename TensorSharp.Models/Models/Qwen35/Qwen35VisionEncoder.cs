@@ -692,7 +692,9 @@ namespace TensorSharp.Models
                     _hostModel?.YieldGpuComputeLock();
                 return ok;
             }
-            catch (Exception e)
+            // A stop from the yield (the model is being unloaded) is not a kernel failure:
+            // falling back to the unfused path would keep encoding on a retiring model.
+            catch (Exception e) when (e is not OperationCanceledException and not ModelUnloadedException)
             {
                 if (!_wholeEncoderFusedWarned)
                 {

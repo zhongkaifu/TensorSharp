@@ -10,6 +10,7 @@
 using System;
 using System.Diagnostics;
 using System.IO;
+using System.Threading;
 using Microsoft.Extensions.Logging;
 
 namespace TensorSharp.Server
@@ -77,7 +78,7 @@ namespace TensorSharp.Server
         public string LoadedMmProjPath => _loadedMmProjPath;
         public string LoadedBackend => _model != null ? BackendCatalog.ToBackendValue(_backend) : null;
         public string Architecture => _model?.Config?.Architecture;
-        public ModelBase Model => _model;
+        public ModelBase Model => Volatile.Read(ref _model);
         public BackendType Backend => _backend;
 
         public bool IsModelAlreadyLoaded(string modelName)
@@ -203,15 +204,51 @@ namespace TensorSharp.Server
         /// </summary>
         internal void Unload() => UnloadCurrentModel();
 
+        /// <summary>
+        /// How long an unload waits for a request that is still encoding an image or a
+        /// clip on the outgoing model. An encoder that yields stops at its next block; one
+        /// that does not finishes its encode first, and a long clip's frames take a while.
+        /// </summary>
+        internal static TimeSpan UseDrainTimeout { get; set; } = TimeSpan.FromMinutes(2);
+
+        /// <summary>
+        /// Advances every time a model is unloaded, so anything recorded against one load
+        /// (a conversation's raw output tokens, see ConversationTranscriptStore) can tell it
+        /// is looking at another model's state.
+        /// </summary>
+        public long LoadEpoch => Interlocked.Read(ref _loadEpoch);
+        private long _loadEpoch;
+
         private void UnloadCurrentModel()
         {
             string previousModel = LoadedModelName;
-            _model?.Dispose();
-            _model = null;
+            ModelBase outgoing = _model;
+            // Unpublished FIRST. While the outgoing model drains below, a request arriving
+            // now must find no model (and be refused) rather than find this one and build a
+            // fresh engine on it that the dispose would then free under its worker.
+            Volatile.Write(ref _model, null);
             _loadedModelPath = null;
             _loadedMmProjPath = null;
             DraftHeadActivationError = null;
             DraftHeadRefusedByModel = false;
+            if (outgoing != null)
+            {
+                Interlocked.Increment(ref _loadEpoch);
+                // The engine has already been torn down, but a request can still be inside
+                // the model: an image or audio encode runs on the request's thread before
+                // anything reaches the engine. Stop new uses, let the running ones leave
+                // (an encoder stops at its next yield), and dispose holding the GPU lock,
+                // so nothing of this model runs while its weights and buffers are freed.
+                outgoing.BeginRetirement();
+                if (!outgoing.WaitForUsesToDrain(UseDrainTimeout))
+                {
+                    _logger.LogWarning(LogEventIds.ModelUnloaded,
+                        "{Model} was still encoding a request after {Seconds}s; unloading once the GPU lock is free",
+                        previousModel, UseDrainTimeout.TotalSeconds);
+                }
+                lock (outgoing.GpuComputeLock)
+                    outgoing.Dispose();
+            }
 
             if (!string.IsNullOrEmpty(previousModel))
             {
@@ -295,6 +332,17 @@ namespace TensorSharp.Server
                     _logger.LogWarning(
                         "LoRA plug-ins ({Loras}) apply to Qwen-Image-2.1 models only; {Model} ({Architecture}) runs without them.",
                         TensorSharp.Runtime.LoraCliFlags.Describe(loras), LoadedModelName, Architecture ?? "unknown architecture");
+                }
+                // So does the checkpoint declaration (--qwen-image-variant), which the CLI refuses
+                // for another model outright.
+                if (_model is not TensorSharp.Models.QwenImage.QwenImageModel &&
+                    Environment.GetEnvironmentVariable(TensorSharp.Runtime.QwenImageVariantFlag.EnvironmentVariable) is { } variant &&
+                    !string.IsNullOrWhiteSpace(variant))
+                {
+                    _logger.LogWarning(
+                        "{Flag} / {EnvVar} ({Variant}) applies to Qwen-Image-2.1 models only; {Model} ({Architecture}) is not one and ignores it.",
+                        TensorSharp.Runtime.QwenImageVariantFlag.Flag, TensorSharp.Runtime.QwenImageVariantFlag.EnvironmentVariable,
+                        variant.Trim(), LoadedModelName, Architecture ?? "unknown architecture");
                 }
 
                 loadSw.Stop();

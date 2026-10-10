@@ -8,7 +8,7 @@ The test suites exercise TensorSharp.Server.Host's current public compatibility 
 - Ollama chat compatibility: `/api/chat/ollama`
 - OpenAI Chat Completions compatibility: `/v1/chat/completions`
 
-The scripts auto-detect the loaded model architecture and skip thinking or tool-calling checks when the active model does not support those capabilities. They target autoregressive compatibility behavior; DiffusionGemma's Web UI whole-message `replace` preview frames are not covered until a dedicated diffusion suite is added.
+The scripts auto-detect the loaded model architecture and skip thinking or tool-calling checks when the active model does not support those capabilities. They target autoregressive compatibility behavior. The Web UI checks apply a whole-message `replace` frame the way the page does (it sets the answer, later tokens append), which covers the retraction Nemotron-H Reasoning-128K sends when text already streamed proves to be reasoning (see the `/api/chat` event table in [API_EXAMPLES.md](../API_EXAMPLES.md)); DiffusionGemma's denoising previews are not checked until a dedicated diffusion suite is added.
 
 ## Current Suite Status
 
@@ -110,7 +110,7 @@ Unsupported architectures are reported as `SKIP`, not `FAIL`.
 - The OpenAI coverage in this folder targets Chat Completions compatibility. OpenAI's newer Responses API is not the compatibility surface TensorSharp.Server.Host currently emulates here.
 - Structured outputs follow the Chat Completions `response_format` contract. `json_schema` requests combined with `tools` are expected to return HTTP `400`. Combined with `think` they return `400` except on families that declare where reasoning ends (GPT-OSS, DeepSeek V4.1, Qwen 3.8 Flash Next, Gemma 4, Nemotron-H, Muse-Glimmer), which serve them; the scripts pick the expectation from the reported architecture.
 - The Ollama and OpenAI compatibility projects continue to evolve. These scripts are aligned with the server's current contract plus the current documented behavior around thinking, tool calling, and structured outputs.
-- DiffusionGemma can return final text through append-oriented compatibility endpoints, but only Web UI `/api/chat` exposes the live denoising `replace` frames.
+- DiffusionGemma can return final text through append-oriented compatibility endpoints, but only Web UI `/api/chat` exposes the live denoising `replace` frames. `/api/chat` also sends a `replace` on its own when Nemotron-H Reasoning-128K text already streamed as the answer proves to be reasoning; the append-only endpoints hold that text until it is decided and send keep-alives meanwhile (an SSE `: keep-alive` comment, or an Ollama chunk with an empty message).
 - The browser UI is at `http://localhost:5000` (`GET /` serves `index.html`); `GET /health` is the liveness endpoint.
 
 ## Usage

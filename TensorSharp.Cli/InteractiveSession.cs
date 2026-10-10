@@ -1612,10 +1612,11 @@ namespace TensorSharp.Cli
 
             // Streaming output parser so we strip <think> blocks from the live
             // console output (they're surfaced separately when --think is on).
-            var parser = CliOutputParser.Create(arch, _enableThinking, _tools,
-                _model.Tokenizer, inputTokens);
-            bool useParser = _enableThinking || (_tools != null && _tools.Count > 0) || parser.AlwaysRequired;
-            bool showThinking = _enableThinking || parser.AlwaysRequired;
+            string promptTail = CliOutputParser.PromptTail(arch, _model.Config.ChatTemplate, _model.Tokenizer, inputTokens);
+            var parser = CliOutputParser.Create(arch, _enableThinking, _tools, promptTail);
+            bool parserRequired = OutputParserFactory.IsAlwaysRequired(arch, _model.Config.ChatTemplate);
+            bool useParser = _enableThinking || (_tools != null && _tools.Count > 0) || parserRequired;
+            bool showThinking = _enableThinking || parserRequired;
 
             Console.WriteLine();
             Console.Write("Assistant: ");
@@ -1631,6 +1632,9 @@ namespace TensorSharp.Cli
             string assistantContentBuffer = string.Empty;
             string assistantThinkingBuffer = string.Empty;
             var turnToolCalls = new List<ToolCall>();
+            // A family that writes its tool's result itself ends the turn at its call.
+            ToolCallTurnEnd toolCallTurnEnd = ToolCallTurnEnd.For(arch, _model.Config.ChatTemplate, _enableThinking, _tools,
+                promptTail);
             // Per-turn speculative counters (null when the turn decoded plainly).
 
 
@@ -1686,6 +1690,12 @@ namespace TensorSharp.Cli
                         Console.Write(piece);
                         assistantContentBuffer += piece;
                     }
+                }
+
+                if (toolCallTurnEnd != null && toolCallTurnEnd.Observe(piece))
+                {
+                    finishReason = "stop_sequence";
+                    return false;
                 }
 
                 if (_samplingConfig.StopSequences != null && _samplingConfig.StopSequences.Count > 0)

@@ -17,6 +17,7 @@ import base64
 import hashlib
 import io
 import json
+import os
 from pathlib import Path
 import subprocess
 import time
@@ -101,6 +102,10 @@ def main():
         'references': [{'path': str(path), 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
                        for path in references],
         'mask_sha256': hashlib.sha256(mask.read_bytes()).hexdigest(),
+        # The initial noise of an edit follows the seed and, by default, the source and
+        # reference images (TS_QWEN21_EDIT_NOISE); output hashes only compare like with like.
+        'edit_noise': ('set by the server process' if args.server_url else
+                       (os.environ.get('TS_QWEN21_EDIT_NOISE') or '').strip().lower() or 'references'),
         'dependencies': {'tensorsharp': revision(ROOT), 'ggml': revision(ROOT / 'ExternalProjects/ggml')},
         'limitations': [
             'Exact protected pixels and nonzero edits do not measure prompt adherence or perceptual quality.',

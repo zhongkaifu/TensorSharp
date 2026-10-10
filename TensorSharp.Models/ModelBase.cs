@@ -36,6 +36,9 @@ namespace TensorSharp.Models
 
         protected readonly GgufFile _gguf;
         private readonly GgmlContext _ggmlContext;
+        // False when the context belongs to a caller-supplied tensor-parallel group, which
+        // outlives this model; the owner releases the context's pool when it is disposed.
+        private readonly bool _ownsGgmlContext;
         protected readonly IAllocator _allocator;
         protected readonly BackendType _backend;
 
@@ -279,10 +282,12 @@ namespace TensorSharp.Models
             {
                 case BackendType.GgmlCpu:
                     _ggmlContext = new GgmlContext(new[] { 0 }, GgmlBackendType.Cpu);
+                    _ownsGgmlContext = true;
                     _allocator = new GgmlAllocator(_ggmlContext, 0);
                     break;
                 case BackendType.GgmlMetal:
                     _ggmlContext = new GgmlContext(new[] { 0 }, GgmlBackendType.Metal);
+                    _ownsGgmlContext = true;
                     _allocator = new GgmlAllocator(_ggmlContext, 0);
                     break;
                 case BackendType.GgmlCuda:
@@ -300,6 +305,7 @@ namespace TensorSharp.Models
                         // and leaving it set would also make the startup banner claim a
                         // transport that is never used.
                         _ggmlContext = CreateGgmlContext(ggmlType, LayerSplitDegree, enableCollectives: false);
+                        _ownsGgmlContext = true;
                         _allocator = new GgmlAllocator(_ggmlContext, 0);
                     }
                     else
@@ -307,7 +313,9 @@ namespace TensorSharp.Models
                         // A caller-supplied group (multi-node) already owns the
                         // multi-GPU context; reuse it rather than initializing the
                         // devices a second time.
-                        _ggmlContext = FindGgmlContext(_tpGroup) ?? CreateGgmlContext(ggmlType, tpDegree);
+                        GgmlContext shared = FindGgmlContext(_tpGroup);
+                        _ggmlContext = shared ?? CreateGgmlContext(ggmlType, tpDegree);
+                        _ownsGgmlContext = shared == null;
                         _tpGroup ??= CreateGgmlTpGroup(_ggmlContext);
                         _allocator = _tpGroup != null ? _tpGroup.GetAllocator(0) : new GgmlAllocator(_ggmlContext, 0);
                     }
@@ -2509,6 +2517,69 @@ namespace TensorSharp.Models
             {
                 Monitor.Enter(GpuComputeLock);
             }
+            // The yield is exactly where an unload can get in. A model on its way out stops
+            // its encoder here rather than letting the next block run on weights that are
+            // about to be freed (see BeginRetirement).
+            if (_retiring)
+                throw new ModelUnloadedException();
+        }
+
+        // No lock object: some callers build a model without running its constructor
+        // (tests use RuntimeHelpers.GetUninitializedObject), and an unload is rare enough
+        // that waiting for the count to reach zero by polling costs nothing.
+        private volatile bool _retiring;
+        private int _activeUses;
+
+        /// <summary>Whether this model is being unloaded (see <see cref="BeginRetirement"/>).</summary>
+        public bool IsRetiring => _retiring;
+
+        /// <summary>
+        /// Mark this model as on its way out, before it is disposed.
+        ///
+        /// <para>
+        /// The engine is not the only thing that runs this model. A request's image or
+        /// audio is encoded on the request's own thread before anything is submitted to the
+        /// engine, so the engine's counters read idle for the whole encode and a model
+        /// switch used to dispose the model under it: the encoder's next block ran on freed
+        /// weights and a freed compute buffer while the next model loaded on another thread.
+        /// After this call new uses are refused and a running encoder stops at its next
+        /// <see cref="YieldGpuComputeLock"/>; <see cref="WaitForUsesToDrain"/> then waits for
+        /// the ones still inside.
+        /// </para>
+        /// </summary>
+        public void BeginRetirement() => _retiring = true;
+
+        /// <summary>
+        /// Start a use of this model outside the engine (prompt media preparation). False,
+        /// with nothing to undo, when the model is being unloaded.
+        /// </summary>
+        public bool TryEnterUse()
+        {
+            Interlocked.Increment(ref _activeUses);
+            if (!_retiring)
+                return true;
+            ExitUse();
+            return false;
+        }
+
+        /// <summary>End a use started by a successful <see cref="TryEnterUse"/>.</summary>
+        public void ExitUse() => Interlocked.Decrement(ref _activeUses);
+
+        /// <summary>
+        /// Wait until no use started by <see cref="TryEnterUse"/> is still running. Bounded:
+        /// an encoder that never yields finishes its whole encode first, and the caller
+        /// disposes under <see cref="GpuComputeLock"/> anyway. True when all uses left.
+        /// </summary>
+        public bool WaitForUsesToDrain(TimeSpan timeout)
+        {
+            var waited = System.Diagnostics.Stopwatch.StartNew();
+            while (Volatile.Read(ref _activeUses) > 0)
+            {
+                if (waited.Elapsed >= timeout)
+                    return false;
+                Thread.Sleep(5);
+            }
+            return true;
         }
 
         /// <summary>
@@ -2556,6 +2627,14 @@ namespace TensorSharp.Models
         /// of K/V state across all layers, or 0 when snapshotting is unsupported.
         /// </summary>
         public virtual long ComputeKVBlockByteSize(int tokenCount) => 0;
+
+        /// <summary>
+        /// Bytes of a block snapshot without its recurrent-state section (the attention
+        /// K/V rows only), for the blocks that are not a restore point. Equal to
+        /// <see cref="ComputeKVBlockByteSize"/> unless the family overrides it. See
+        /// <see cref="IModelArchitecture.ComputeKVBlockByteSizeWithoutRecurrentState"/>.
+        /// </summary>
+        public virtual long ComputeKVBlockByteSizeWithoutRecurrentState(int tokenCount) => ComputeKVBlockByteSize(tokenCount);
 
         /// <summary>
         /// Whether this architecture must capture state at every block boundary
@@ -2745,6 +2824,14 @@ namespace TensorSharp.Models
 
             if (_allocator is IDisposable allocatorDisposable)
                 allocatorDisposable.Dispose();
+
+            // Last, after every tensor of this model went back to its pool and the host
+            // buffer cache dropped the Metal wrappers around those blocks: give the pool's
+            // blocks back. Nothing else can reach this pool once the model is gone, so
+            // without this each unload kept whatever it held for the life of the process
+            // (see GgmlMemoryPool.Close).
+            if (_ownsGgmlContext)
+                _ggmlContext?.ReleasePoolForDisposal();
         }
 
         /// <summary>

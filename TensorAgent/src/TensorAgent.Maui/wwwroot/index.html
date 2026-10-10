@@ -163,6 +163,24 @@ body { display: flex; flex-direction: column; }
   overflow-wrap: anywhere;
 }
 
+/* Under a picture: what it was made from, with that picture small. On the newest turn,
+   the other reading of the request, or the readings a turn asked the user to choose
+   between, as buttons big enough to tap. */
+.image-plan {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
+  max-width: 88%; margin-top: 4px; padding: 0 2px;
+  font-size: 12px; line-height: 1.5; color: var(--muted);
+}
+.image-plan > img { width: 28px; height: 28px; object-fit: cover; border-radius: 6px; display: block; }
+.image-redo { display: flex; flex-wrap: wrap; gap: 8px; max-width: 88%; margin-top: 6px; }
+.image-plan .image-redo { flex-basis: 100%; max-width: 100%; margin-top: 2px; }
+.image-redo button {
+  display: inline-flex; align-items: center; gap: 6px; min-height: 42px; padding: 6px 12px;
+  border-radius: 999px; border: 1px solid var(--border); background: var(--surface-2);
+  color: var(--text); font-size: 13.5px; cursor: pointer;
+}
+.image-redo button img { width: 26px; height: 26px; object-fit: cover; border-radius: 6px; display: block; }
+
 .copy {
   align-self: flex-start; margin-top: 4px;
   font-size: 11px; color: var(--muted); background: none; border: 0; padding: 4px 2px;

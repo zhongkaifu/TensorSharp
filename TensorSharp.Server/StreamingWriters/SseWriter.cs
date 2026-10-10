@@ -8,6 +8,7 @@
 // TensorSharp is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 
+using System;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
@@ -28,6 +29,7 @@ internal static class SseWriter
         response.ContentType = "text/event-stream";
         response.Headers.CacheControl = "no-cache";
         response.Headers.Connection = "keep-alive";
+        StreamKeepAlive.Stamp(response);
     }
 
     /// <summary>
@@ -44,6 +46,7 @@ internal static class SseWriter
         string json = JsonSerializer.Serialize(payload, jsonOptions);
         await response.WriteAsync($"data: {json}\n\n", cancellationToken).ConfigureAwait(false);
         await response.Body.FlushAsync(cancellationToken).ConfigureAwait(false);
+        StreamKeepAlive.Stamp(response);
     }
 
     /// <summary>
@@ -59,6 +62,7 @@ internal static class SseWriter
         string json = JsonSerializer.Serialize(payload, jsonOptions);
         await response.WriteAsync($"data: {json}\n\n").ConfigureAwait(false);
         await response.Body.FlushAsync().ConfigureAwait(false);
+        StreamKeepAlive.Stamp(response);
     }
 
     /// <summary>
@@ -87,5 +91,22 @@ internal static class SseWriter
         string json = JsonSerializer.Serialize(payload, jsonOptions);
         await response.WriteAsync($"event: {eventName}\ndata: {json}\n\n", cancellationToken).ConfigureAwait(false);
         await response.Body.FlushAsync(cancellationToken).ConfigureAwait(false);
+        StreamKeepAlive.Stamp(response);
+    }
+
+    /// <summary>
+    /// An SSE comment line (<c>: keep-alive</c>) when nothing has been written for
+    /// <paramref name="interval"/> (see <see cref="StreamKeepAlive"/>). The SSE format says
+    /// a line that starts with a colon is ignored, so every client skips it, and it carries
+    /// no event an OpenAI or Responses client could mistake for output.
+    /// </summary>
+    public static async Task KeepAliveIfIdleAsync(
+        HttpResponse response, TimeSpan interval, CancellationToken cancellationToken)
+    {
+        if (!StreamKeepAlive.IsDue(response, interval))
+            return;
+        await response.WriteAsync(": keep-alive\n\n", cancellationToken).ConfigureAwait(false);
+        await response.Body.FlushAsync(cancellationToken).ConfigureAwait(false);
+        StreamKeepAlive.Stamp(response);
     }
 }

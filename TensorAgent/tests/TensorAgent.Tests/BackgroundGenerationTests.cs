@@ -533,6 +533,154 @@ public sealed class BackgroundGenerationTests : IDisposable
             messages[2].GetProperty("content").GetString()!, StringComparison.Ordinal);
     }
 
+    /// <summary>
+    /// A carried-on attempt knows nothing of the text it continues, so the whole-answer
+    /// <c>replace</c> it sends (a DiffusionGemma preview, or the answer left once text it
+    /// showed proved to be reasoning) covers only its own part. The page kept the earlier
+    /// attempt's text, so the gate puts it in front; without it the replace wiped what the
+    /// reader had already watched appear.
+    /// </summary>
+    [Fact]
+    public void AReplaceFromACarriedOnAttemptKeepsTheTextItCarriesOn()
+    {
+        const string carried = "It was invented in 1947 at Bell Labs, ";
+        var written = new System.Text.StringBuilder(carried);
+
+        Assert.IsNotType<Dictionary<string, object?>>(AgentAppHost.AsShown(new { token = "Okay, plan" }, carried, written));
+        AgentAppHost.AsShown(new { thinking = "Okay, plan" }, carried, written);
+        object retraction = AgentAppHost.AsShown(new { replace = "" }, carried, written);
+        Assert.Equal("{\"replace\":\"It was invented in 1947 at Bell Labs, \"}", JsonSerializer.Serialize(retraction));
+        AgentAppHost.AsShown(new { token = "by Bardeen and Brattain." }, carried, written);
+        Assert.Equal(carried + "by Bardeen and Brattain.", written.ToString());
+
+        // Whatever else a replace frame carries rides along unchanged, in order.
+        object preview = AgentAppHost.AsShown(
+            new { replace = "canvas", diffusionStep = 3, diffusionTotal = 8, preview = true }, carried, written);
+        Assert.Equal(
+            "{\"replace\":\"It was invented in 1947 at Bell Labs, canvas\",\"diffusionStep\":3,\"diffusionTotal\":8,\"preview\":true}",
+            JsonSerializer.Serialize(preview));
+
+        // An attempt that carries nothing on sends its frames as they are.
+        var fresh = new System.Text.StringBuilder("stale");
+        var plain = new { replace = "Seven." };
+        Assert.Same(plain, AgentAppHost.AsShown(plain, string.Empty, fresh));
+        Assert.Equal("Seven.", fresh.ToString());
+    }
+
+    /// <summary>
+    /// The whole gate, over a turn whose first attempt the GPU poisoned. An ordinary
+    /// model's half answer is carried on: the next attempt is asked to continue it, and the
+    /// <c>replace</c> that attempt sends when text it showed proves to be reasoning keeps
+    /// the carried text in front, as the page shows it.
+    /// </summary>
+    [Fact]
+    public async Task APoisonedAttempt_IsCarriedOn_AndItsReplaceKeepsTheCarriedText()
+    {
+        const string carried = "It was invented in 1947 at Bell Labs, by ";
+        AgentAppHost host = StartWith(new FamilyModelService("qwen35", template: null));
+        var bodies = new List<JsonElement>();
+        host.TurnFrames = (body, _) => PoisonedThenRetracting(bodies, body, carried);
+
+        List<JsonElement> frames = await GatedFrames(host);
+
+        Assert.Equal(2, bodies.Count);
+        Assert.True(bodies[1].GetProperty(AgentAppHost.ResumedTurnMarker).GetBoolean());
+        Assert.Equal(carried, bodies[1].GetProperty("messages")[1].GetProperty("content").GetString());
+        Assert.Contains(frames, f => f.TryGetProperty("restart", out _) && !f.TryGetProperty("replace", out _));
+        JsonElement retraction = Assert.Single(frames, f => f.TryGetProperty("replace", out _));
+        Assert.Equal(carried, retraction.GetProperty("replace").GetString());
+        Assert.Equal(carried + "Bardeen and Brattain.", Shown(frames));
+    }
+
+    /// <summary>
+    /// Nemotron-H Reasoning-128K shows a thinking-off reply before the <c>&lt;/think&gt;</c>
+    /// that may say it was reasoning, so what the page has been shown is not known to be
+    /// the answer. Carried on, it was handed to the model as its own answer and kept in
+    /// front of every later <c>replace</c>, which put the reasoning back in the answer. The
+    /// gate starts such a turn again from the top instead.
+    /// </summary>
+    [Fact]
+    public async Task APoisonedAttempt_OfAModelWhoseShownAnswerMayBeReasoning_StartsAgainFromTheTop()
+    {
+        const string reasoning = "Okay, the user wants to know how many lines the file has, so I ";
+        const string template =
+            "{{ '<SPECIAL_10>System\n' }}{% for message in messages %}{{ '\n<SPECIAL_11>Assistant\n' }}{% endfor %}";
+        AgentAppHost host = StartWith(new FamilyModelService("nemotron_h", template));
+        var bodies = new List<JsonElement>();
+        host.TurnFrames = (body, _) => PoisonedThenRetracting(bodies, body, reasoning);
+        Assert.True(AgentAppHost.CanBeCarriedOn(reasoning));
+
+        List<JsonElement> frames = await GatedFrames(host);
+
+        Assert.Equal(2, bodies.Count);
+        Assert.False(bodies[1].TryGetProperty(AgentAppHost.ResumedTurnMarker, out _));
+        Assert.Equal(1, bodies[1].GetProperty("messages").GetArrayLength());
+        JsonElement restart = Assert.Single(frames, f => f.TryGetProperty("restart", out _));
+        Assert.Equal(string.Empty, restart.GetProperty("replace").GetString());
+        Assert.Equal("Bardeen and Brattain.", Shown(frames));
+    }
+
+    private AgentAppHost StartWith(TensorSharp.Server.ModelService modelService)
+    {
+        _host = new AgentAppHost(new AgentPaths(
+            Path.Combine(_root, "data"), Path.Combine(_root, "cache")), modelService: modelService);
+        _host.Start();
+        return _host;
+    }
+
+    /// <summary>The first attempt shows <paramref name="first"/> and dies of a poisoned
+    /// engine; the next shows a fragment, takes it back as reasoning and answers.</summary>
+    private static async IAsyncEnumerable<object> PoisonedThenRetracting(
+        List<JsonElement> bodies, JsonElement body, string first)
+    {
+        bodies.Add(body.Clone());
+        await Task.Yield();
+        if (bodies.Count == 1)
+        {
+            yield return new { token = first };
+            yield return new { done = true, error = "Metal command buffer 12 failed with status 5" };
+            yield break;
+        }
+        yield return new { token = "Okay, plan" };
+        yield return new { thinking = "Okay, plan" };
+        yield return new { replace = string.Empty };
+        yield return new { token = "Bardeen and Brattain." };
+        yield return new { done = true };
+    }
+
+    private static async Task<List<JsonElement>> GatedFrames(AgentAppHost host)
+    {
+        JsonElement body = JsonSerializer.SerializeToElement(new
+        {
+            sessionId = "s1",
+            messages = new[] { new { role = "user", content = "Who invented the transistor?" } },
+            think = false,
+        });
+        var frames = new List<JsonElement>();
+        await foreach (object frame in host.GatedChatFrames(body, CancellationToken.None))
+            frames.Add(JsonSerializer.SerializeToElement(frame));
+        return frames;
+    }
+
+    /// <summary>The answer a page is left showing: tokens append, a replace sets it.</summary>
+    private static string Shown(IEnumerable<JsonElement> frames)
+    {
+        string shown = string.Empty;
+        foreach (JsonElement frame in frames)
+        {
+            if (frame.TryGetProperty("replace", out JsonElement whole)) shown = whole.GetString()!;
+            if (frame.TryGetProperty("token", out JsonElement token)) shown += token.GetString();
+        }
+        return shown;
+    }
+
+    /// <summary>A model service that reports a family and template and loads nothing.</summary>
+    private sealed class FamilyModelService(string architecture, string? template) : TensorSharp.Server.ModelService
+    {
+        public override string Architecture => architecture;
+        public override string ChatTemplate => template!;
+    }
+
     [Fact]
     public void AResumedTurnIsMarkedSoItsScaffoldingStaysOutOfTheTranscript()
     {

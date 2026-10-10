@@ -8,7 +8,9 @@
 // ============================================================================
 // Qwen3-VL-8B text encoder for Qwen-Image-2.1. We only need a single forward
 // pass over the (already-tokenized) prompt to produce the 4096-dim conditioning
-// hidden states the DiT consumes — no generation, no KV cache, no logits.
+// hidden states the DiT consumes — no generation, no KV cache. The one use of the
+// language-model head is NextTokenLogits: the same single pass, then the final norm
+// and a few rows of output.weight, to score a multiple-choice question.
 //
 // This is a Qwen3-VL decoder trunk: RMSNorm -> GQA attention (separate q/k/v
 // projections, per-head Q/K RMS norms, interleaved M-RoPE) -> RMSNorm -> SwiGLU
@@ -156,6 +158,105 @@ namespace TensorSharp.Models.QwenImage
                     $"other {total - ms(_profileLinear) - ms(_profileAttention) - ms(_profileNorm):F0} ms");
             }
             return output; // Qwen-Image-2.1 uses the last block before output_norm.
+        }
+
+        /// <summary>
+        /// The longest prompt <see cref="NextTokenLogits"/> scores. The fused trunk materializes the
+        /// attention scores and their softmax as two F32 [seq, seq, 32 heads] tensors: 256 MiB at
+        /// 1024 tokens, growing with the square (1 GiB at 2048), on a device about to hold the
+        /// diffusion transformer. An edit's own conditioning pass with a 1 MP reference is about
+        /// 1.1k tokens (1024 image slots plus the prompt), so a question within this cap needs no
+        /// more scratch than the encode every edit already makes.
+        /// </summary>
+        internal const int MaxScoringTokens = 1024;
+
+        /// <summary>
+        /// Why <paramref name="gguf"/> cannot score a next token, or null when it can: it needs the
+        /// language-model head, <c>output_norm.weight</c> [hidden] and <c>output.weight</c>
+        /// [hidden, vocab]. Header only. Qwen3-VL-8B does not tie its head to <c>token_embd</c>, and
+        /// encoder-only exports of it drop the head (<see cref="QwenImage21CompanionValidation.ValidateText"/>
+        /// never needed it), so a missing head means the scorer is unavailable: projecting with the
+        /// embedding matrix would produce confident probabilities that mean nothing.
+        /// </summary>
+        internal static string ScoringHeadRefusal(GgufFile gguf)
+        {
+            ArgumentNullException.ThrowIfNull(gguf);
+            ulong hidden = gguf.GetUint32("qwen3vl.embedding_length", 0);
+            if (hidden == 0)
+                return "the text encoder GGUF declares no qwen3vl.embedding_length";
+            if (!gguf.Tensors.TryGetValue("output_norm.weight", out var norm) || norm.Shape.Length != 1 || norm.Shape[0] != hidden)
+                return $"the text encoder GGUF has no output_norm.weight [{hidden}]";
+            if (!gguf.Tensors.TryGetValue("output.weight", out var head) || head.Shape.Length != 2 ||
+                head.Shape[0] != hidden || head.Shape[1] == 0)
+                return $"the text encoder GGUF has no output.weight [{hidden}, vocab] (an encoder-only export)";
+            return null;
+        }
+
+        /// <summary>
+        /// The logits of <paramref name="candidateIds"/> as the token after <paramref name="tokens"/>:
+        /// one causal pass over the trunk (<see cref="EncodeHidden(int[])"/>, the fused graph on GGML
+        /// backends), then <see cref="HeadLogits"/> on the last position. Only the candidates' rows
+        /// of <c>output.weight</c> are dequantized: no [vocab] logits vector, no KV cache. Throws
+        /// <see cref="ImageIntentUnavailableException"/> for a sequence over
+        /// <see cref="MaxScoringTokens"/>, a backend that is not GGML, or a GGUF without the head.
+        /// </summary>
+        internal float[] NextTokenLogits(int[] tokens, int[] candidateIds)
+        {
+            ArgumentNullException.ThrowIfNull(tokens);
+            ArgumentNullException.ThrowIfNull(candidateIds);
+            if (tokens.Length == 0) throw new ArgumentException("At least one token is required.", nameof(tokens));
+            if (tokens.Length > MaxScoringTokens)
+                throw new ImageIntentUnavailableException($"the question is {tokens.Length} tokens, over the {MaxScoringTokens}-token scoring cap");
+            // The pure-C# backend runs the per-op trunk: 0.76-0.88 s for the 37-token default prompt
+            // on an i7-11800H (the note on its projections below), so a question of a few hundred
+            // tokens would cost seconds on every turn.
+            if (!IsGgmlBackend)
+                throw new ImageIntentUnavailableException("next-token scoring runs on GGML backends only");
+            if (ScoringHeadRefusal(_gguf) is string refusal)
+                throw new ImageIntentUnavailableException(refusal);
+
+            float[] states = EncodeHidden(tokens);
+            var last = new float[Config.HiddenSize];
+            Array.Copy(states, (long)(tokens.Length - 1) * last.Length, last, 0, last.Length);
+            return HeadLogits(last, ReadFloat32("output_norm.weight"), _eps, _gguf, _gguf.Tensors["output.weight"], candidateIds);
+        }
+
+        /// <summary>
+        /// The language-model head for <paramref name="ids"/> only: RMSNorm of
+        /// <paramref name="state"/> with <paramref name="normWeight"/> (Qwen3's plain weight, no +1
+        /// offset), then its dot product with each id's row of <paramref name="head"/>, read from
+        /// the GGUF mapping (the one the fused trunk binds its weights from) and dequantized
+        /// whatever type the head is stored in (Q6_K in the released Q4_K_M file).
+        /// </summary>
+        internal static float[] HeadLogits(float[] state, float[] normWeight, float eps, GgufFile gguf, GgufTensorInfo head, int[] ids)
+        {
+            int hidden = state.Length;
+            if (normWeight.Length != hidden || head.Shape.Length != 2 || (long)head.Shape[0] != hidden)
+                throw new ArgumentException($"The head must be [{hidden}, vocab] with a [{hidden}] norm.", nameof(head));
+            long vocab = (long)head.Shape[1];
+            foreach (int id in ids)
+                if (id < 0 || id >= vocab)
+                    throw new ArgumentOutOfRangeException(nameof(ids), id, $"Token ids must lie in [0, {vocab}).");
+
+            double sumSquares = 0;
+            for (int d = 0; d < hidden; d++) sumSquares += (double)state[d] * state[d];
+            float inverse = 1f / MathF.Sqrt((float)(sumSquares / hidden) + eps);
+            var normed = new float[hidden];
+            for (int d = 0; d < hidden; d++) normed[d] = state[d] * inverse * normWeight[d];
+
+            if (!gguf.TryGetTensorDataPointer(head, out IntPtr data))
+                throw new InvalidOperationException($"The GGUF could not be mapped to read {head.Name}.");
+            long rowBytes = NativeDequant.RowSize((int)head.Type, hidden);
+            var row = new float[hidden];
+            var logits = new float[ids.Length];
+            for (int i = 0; i < ids.Length; i++)
+            {
+                NativeDequant.DequantizeToFloat32((int)head.Type, data + (nint)(ids[i] * rowBytes), row, 0, hidden);
+                double dot = 0;
+                for (int d = 0; d < hidden; d++) dot += (double)normed[d] * row[d];
+                logits[i] = (float)dot;
+            }
+            return logits;
         }
 
         // get_rope_index: text tokens get sequential positions (all 3 equal); image tokens get
@@ -735,15 +836,20 @@ namespace TensorSharp.Models.QwenImage
         // outlive the call and be F32 regardless of on-disk type.
         private unsafe IntPtr F32Stable(string name)
         {
-            var info = _gguf.Tensors[name];
-            long n = info.NumElements;
-            var host = new float[n];
-            byte[] raw = _gguf.ReadTensorData(info);
-            NativeDequant.DequantizeToFloat32((int)info.Type, raw, 0, host, 0, n);
-            IntPtr p = System.Runtime.InteropServices.Marshal.AllocHGlobal((IntPtr)(n * sizeof(float)));
-            System.Runtime.InteropServices.Marshal.Copy(host, 0, p, (int)n);
+            float[] host = ReadFloat32(name);
+            IntPtr p = System.Runtime.InteropServices.Marshal.AllocHGlobal((IntPtr)((long)host.Length * sizeof(float)));
+            System.Runtime.InteropServices.Marshal.Copy(host, 0, p, host.Length);
             _fusedAllocs.Add(p);
             return p;
+        }
+
+        /// <summary>A (small) GGUF tensor as F32 on the host, whatever its on-disk type.</summary>
+        private float[] ReadFloat32(string name)
+        {
+            var info = _gguf.Tensors[name];
+            var host = new float[info.NumElements];
+            NativeDequant.DequantizeToFloat32((int)info.Type, _gguf.ReadTensorData(info), 0, host, 0, host.Length);
+            return host;
         }
 
         public override void Dispose()

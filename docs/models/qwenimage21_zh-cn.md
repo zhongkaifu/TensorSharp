@@ -25,6 +25,9 @@ Qwen-Image / Qwen-Image-Edit 检查点（例如 Qwen-Image-Edit-2511）已不再
 | 文本编码器 | `Qwen3VL-8B-Instruct-Q4_K_M.gguf` | [Qwen/Qwen3-VL-8B-Instruct-GGUF](https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct-GGUF) |
 | 编辑用视觉编码器 | `mmproj-Qwen3VL-8B-Instruct-F16.gguf` | 同一个 Qwen3-VL 仓库 |
 
+Qwen-Image-2.1-Turbo 是 Qwen 对同一模型的 8 步蒸馏版，使用这些伴随文件，搭配自己的
+Transformer 与配置文件；见 [Qwen-Image-2.1-Turbo](#qwen-image-21-turbo)。
+
 ## 启动 CLI
 
 以下命令都在 TensorSharp 仓库根目录下运行。该配置在 Apple Silicon 上选择
@@ -87,6 +90,13 @@ CFG 1 每一步只运行一次 Transformer 预测；此前的默认值 CFG 6 会
 每张参考图以约 1 百万像素（若输出面积更小，则以输出面积）作为条件输入；把输出
 提高到 2K 并不会同时把每张参考图的 VAE、视觉编码器和 Transformer 工作量翻四倍。
 
+按面积决定尺寸的编辑会把比该面积大的图片变小、比它小的图片变大。要按图片自身尺寸编辑——从而
+对编辑结果再次编辑时不缩小——请传 `--keep-source-size`（API 请求中为 `keepSourceSize: true`）：
+输出为第一张图的精确宽高。采样面积约为图片自身面积——至少 1 百万像素（参考图的条件面积），至多该编辑
+原本使用的面积——宽高比近似保持（二者都按 32 像素网格取整）；与源图尺寸不同时，结果再缩放回源图尺寸。它不能与显式宽高
+同时使用，并且需要输入图。带遮罩的编辑（见下文）无需此参数即保持源图尺寸。服务端 Web UI 与
+TensorAgent 的每次编辑都会发送它。初始噪声按编辑实际采样的尺寸生成（见[种子与编辑](#种子与编辑)）。
+
 调度现在遵循
 [官方调度器配置](https://huggingface.co/Qwen/Qwen-Image-2.1/blob/main/scheduler/scheduler_config.json)：
 使用指数动态偏移（序列长度/偏移锚点为 256/0.5 与 8192/0.9），随后做终端拉伸到
@@ -106,6 +116,92 @@ CFG 1 带来的提速直接来自已发布的 2.1 检查点。步数蒸馏 LoRA 
 
 快速冒烟测试可以用 256×256、一步。这样的运行只验证加载和端到端数据通路，
 并不能说明默认 2048×2048/40 步设置下的图像质量或性能。
+
+### 种子与编辑
+
+`--diffusion-seed`（API 中为 `seed`，默认 0）是生成初始噪声的 Philox 生成器的密钥。
+文生图噪声只由种子和输出尺寸决定，与 stable-diffusion.cpp 的 `--rng cuda` 相同，
+因此相同的请求得到相同的图像。
+
+编辑的噪声还取决于参考图。TensorSharp 对传入的图片计算哈希（按顺序对 8 位 RGB 值，
+以及存在不透明度不为满的像素时的 alpha，计算 SHA-256），并用这个哈希选出一条单独的
+Philox 流来生成噪声；流水线的 `Qwen-Image-2.1: …` 日志行以 `(edit noise stream <id>)` 显示它。否则，
+用画出某张图的种子和尺寸去编辑它时，会从恰好生成这张图的那份噪声开始，
+Qwen-Image-2.1 可能照原样重描这张图而不执行指令。各个主机的默认值正会走到这一步：
+请求不指定时种子为 0，编辑又按源图尺寸采样——自动尺寸在相同面积下沿用源图宽高比，而
+`keepSourceSize`（Web UI 与 TensorAgent 会发送）把 1024×1024 的图仍按 1024×1024 采样。一只在种子 0 下画出的狐狸（1024×1024，
+CFG 1），在种子 0 下要求“change the background to a sandy beach with the ocean behind
+the fox”时，在 12 步、40 步以及使用加速 LoRA 时都变成过度锐化、仍在雪地里的图；
+在种子 5 下画出并编辑的狐狸也一样，而同一只狐狸换一个种子编辑就得到了海滩。
+这种重描是大概率而非必然：在 CFG 6 下从源图自身种子的噪声出发给茶壶换色依然成功
+（见英文模型卡的历史对比）。
+
+- 相同的图片、提示词、种子与设置得到相同的编辑结果；换种子得到另一种构图，与以前一样。
+  改写提示词不改变噪声。
+- Qwen-Image-2.1-Turbo 的编辑同样如此：流取决于图片，而不取决于检查点。
+- 噪声按编辑采样的尺寸生成。使用 `keepSourceSize` 时，这是[上文](#启动-cli)所述的采样尺寸，
+  两者不同时并非源图自身的尺寸；结果随后再缩放回源图尺寸。
+- 在同一种子下再次编辑结果图时，噪声是新的，因为图片变了。
+- 遮罩编辑使用整张源图的流，而不是选区或其裁剪的流，因此同一张图上的所有选区共用该图的流。
+- 流取决于解码后的像素，内存中的图片与它保存的 PNG 哈希相同。TensorSharp 写出的每个 PNG，
+  以及任何不带颜色信息的 PNG，在每个主机上都解码出相同的字节。PNG 嵌入了色彩配置文件时
+  （macOS 与 iPhone 的截图都是如此），或者它没有 alpha 通道而 `gAMA` 或 `cHRM` 块描述的是
+  其他色彩空间时，TensorAgent 应用会把它转换为 sRGB，CLI 和服务端则保留存储的值
+  （`eng/validation/apple-png-decode-check.py` 会列出哪些 PNG 属于这种情况）。这样的 PNG 与
+  JPEG 或 HEIC 照片（在应用中的解码可能相差几个色阶）一样，在应用中得到的流与 CLI 和服务端
+  不同，于是得到另一种构图。跨主机比较这类图片的编辑时，请设置 `TS_QWEN21_EDIT_NOISE=seed`。
+- `TS_QWEN21_EDIT_NOISE=seed` 让编辑使用该种子的文生图噪声（与 stable-diffusion.cpp 和
+  diffusers 相同）：用于与这些引擎做噪声对齐的对比，以及复现这一改动之前的编辑结果。每次
+  这样的编辑都会打印 `TS_QWEN21_EDIT_NOISE=seed: this edit starts from the seed's
+  text-to-image noise …`。默认值为 `references`；其他取值会使请求失败。
+- 唯一的开销是哈希。在 M5 Pro 上用 CoreCLR，Release 构建对 1 百万像素参考图耗时 2.6–3.9 ms，
+  对 1200 万像素照片耗时 29–44 ms（同时哈希半透明 alpha 平面时取上限）；Debug 构建分别为
+  16–26 ms 与 177–298 ms。以上为 `eng/validation/QwenImage21EditNoiseCost` 两次运行的范围
+  （它的 `-p:ModelsDir` 可测量在别处构建的 TensorSharp.Models，例如 CLI 的）。文生图不做哈希。
+  Apple 应用运行在 Mono 上，逐像素循环还要更慢；这一点未测量。
+
+#### 实测效果
+
+Apple M5 Pro（48 GiB，macOS 27.0），`ggml_metal`，未修改的 ggml
+`ffa4e8b80930029a35991f94e7c8a93cd67730ab`。Q4_K_M 检查点用 12 步，Turbo AD-Q4_K 用它的 8 步，
+均为 1024×1024、CFG 1，每张图一个全新的 CLI 进程。“之前”指同一构建去掉按参考图选择的编辑噪声。
+
+- 文生图没有变化：下文的茶壶提示词在种子 0 和 1 下，以及 Turbo 在种子 0 下画的“A red fox
+  sitting in deep snow in a winter forest, photograph.”，前后两个构建的 PNG SHA-256 相同。
+- 重描消失了。种子 0 画出的狐狸在种子 0 下按“change the background to a sandy beach with
+  the ocean behind the fox”编辑，之前得到过度锐化、仍在雪林中的副本；现在狐狸坐在沙滩上，
+  身后是大海。用 `--keep-source-size` 代替 `--width 1024 --height 1024` 时，编辑同样按
+  1024×1024 采样，得到相同的 PNG；把这张图以 multipart 上传发给服务端的 `/api/image-edit`，
+  带 `keepSourceSize`、不带 `seed` 与尺寸（即 Web UI 的发送方式），结果也相同；两者打印的
+  噪声流都一样。设置 `TS_QWEN21_EDIT_NOISE=seed` 时，该编辑的 PNG 与之前的 SHA-256 相同，
+  遮罩编辑（下文种子 0 的换色）也一样。
+- Turbo 的表现相同。它在种子 0 下画的狐狸，在种子 0 下按海滩指令并带 `--keep-source-size`
+  编辑，之前得到过度锐化的副本：狐狸身后仍是森林，雪地变成了龟裂的地面；现在狐狸坐在海滩上，
+  身后是海浪。种子模式同样复现了之前的 PNG。
+- 连续编辑会执行指令：把两个检查点得到的海滩图在种子 0 下再按“put a red knitted scarf
+  around the fox's neck”编辑，狐狸都戴上了围巾，海滩保持不变。
+- 局部编辑更好地保留了画面。用“A red ceramic teapot on a wooden table, soft daylight,
+  product photograph.”在种子 0、1、2 下各画一张，再在各自的种子下按“Change the red teapot
+  to cobalt blue. Keep its shape, lighting, the wooden table and background unchanged.”
+  换色，一次不带选区，一次带围住茶壶的选区。两种噪声都把茶壶变成了蓝色（蓝色像素比例相差
+  不超过 0.003）。从源图自身的噪声出发时，茶壶成了颗粒感很重的深蓝色，桌面和背景被过度锐化；
+  从按参考图选择的噪声出发时，它们与源图保持接近。去掉茶壶及其周围 16 像素后与源图比较的
+  PSNR（`eng/validation/qwen-image21-edit-fidelity.py`）：
+
+  | 换色 | 种子 0 | 种子 1 | 种子 2 |
+  |---|---:|---:|---:|
+  | 整张图，按参考图选择的噪声 | 25.4 dB | 29.5 dB | 30.9 dB |
+  | 整张图，`TS_QWEN21_EDIT_NOISE=seed` | 20.2 dB | 17.0 dB | 16.9 dB |
+  | 选区内，按参考图选择的噪声 | 29.8 dB | 26.4 dB | 29.0 dB |
+  | 选区内，`TS_QWEN21_EDIT_NOISE=seed` | 21.8 dB | 19.3 dB | 19.4 dB |
+
+  每次遮罩编辑中，选区外的像素都与源图完全一致。
+- 耗时在运行间波动范围内相同：两种设置下以及改动之前，每次编辑都是 135–139 s，Turbo 每次编辑 98 s。
+
+图片、哈希与分析保存在被忽略的 `artifacts/editnoise4/` 与 `artifacts/editnoise5/` 中（本地验证
+证据，未提交）。未测量：CUDA、Vulkan 与 `--tp`、`cpu` 后端、TensorAgent 应用（它们把同样的图片
+交给同一条流水线，但运行在 Mono 上；它们的 PNG 解码只在 macOS 上用其 Swift 复刻核对过，未在 iOS
+上核对）、Turbo 上的遮罩与多参考图编辑，以及 JPEG 或 HEIC 源图。
 
 ## 启动 TensorSharp.Server.Host
 
@@ -157,15 +253,19 @@ curl --fail-with-body http://127.0.0.1:5000/api/image-edit \
 
 重复 `image` 部分即可传入多张参考图。也可以先把文件上传到 `/api/upload`，再向
 `/api/image-edit` 发送包含 `imagePaths`（或旧的 `imagePath`）的 JSON。两个图像端点都
-接受 `negativePrompt`、`targetArea`、`width`、`height`、`steps`、`cfg` 和 `seed`。
-`targetArea` 控制自动尺寸选择；显式尺寸优先。省略 `width`、`height`、`targetArea`、
+接受 `negativePrompt`、`targetArea`、`width`、`height`、`steps`、`cfg` 和 `seed`（默认 0；
+编辑的噪声还取决于参考图，见[种子与编辑](#种子与编辑)）。`targetArea` 控制自动尺寸选择；显式尺寸优先。省略 `width`、`height`、`targetArea`、
 `steps` 和 `cfg` 时使用上文的模型默认值。`targetArea: 1048576` 选择约 1K 的输出，
-同时保留自动宽高比选择。
+同时保留自动宽高比选择。编辑端点还接受 `keepSourceSize`（JSON 中为 `true`，multipart 中为
+`-F 'keepSourceSize=true'`）：结果保持第一张图的精确尺寸，并按上文所述在 `targetArea`
+（或默认面积）之内采样。与 `width`/`height` 同时发送，或发送到 `/api/image-generate` 时，
+会以 400 拒绝。
 
 启动服务端时传入 `--width` 与 `--height` 会改变这个默认尺寸。主机把它们发布为
 `TS_QWEN_IMAGE_WIDTH` / `TS_QWEN_IMAGE_HEIGHT`，之后凡是既没有 `width`/`height`、也没有显式
 `targetArea` 的图像请求都使用该尺寸，包括不发送尺寸的 Web UI 请求；此时编辑也不再沿用第一张参考图的
-宽高比。请求自己设置了 `targetArea` 时保留它自己的几何设置。默认尺寸需要两个参数都设置。不是 32 倍数的
+宽高比——带 `keepSourceSize` 的编辑（Web UI 的每次编辑）除外：它只使用该尺寸的面积，按源图宽高比采样，
+并保持源图尺寸。请求自己设置了 `targetArea` 时保留它自己的几何设置。默认尺寸需要两个参数都设置。不是 32 倍数的
 值会向下取整到 32 的倍数（最小 32），并打印一次 `[qwen-image] WARNING: … render at WxH instead. Reported
 once.`；只设置其一、或值无法解析或为负数时，默认尺寸会被忽略（同样只警告一次），继续使用自动尺寸。
 Qwen-Image 服务端在这两种情况下都会在启动时警告，但不会拒绝任何东西。请求本身设置的 `width` / `height`
@@ -177,6 +277,174 @@ Qwen-Image 服务端在这两种情况下都会在启动时警告，但不会拒
 `done: true` 以及最终的 `url`、尺寸和耗时秒数，或者包含 `error`。聊天补全路由不会
 运行这个扩散模型。现有的 `/api/image-edit` 请求仍至少需要一张参考图；生成有自己的
 端点。预览由当前流预测估计出的干净潜变量解码而来。
+
+## Qwen-Image-2.1-Turbo
+
+[Qwen-Image-2.1-Turbo](https://huggingface.co/Qwen/Qwen-Image-2.1-Turbo) 是 Qwen 对同一个
+7B Transformer 的加速检查点：蒸馏为 **8 步 Euler、CFG 1**，使用一个固定调度。它的 VAE、
+Qwen3-VL-8B 文本编码器与视觉投影器与上面的 2.1 文件逐字节相同。TensorSharp 运行
+[AtomicChat 的 GGUF](https://huggingface.co/AtomicChat/Qwen-Image-2.1-Turbo-GGUF)（修订版本
+`bb25d06`），这些文件不含元数据：
+
+| 文件 | 大小 | 相对 BF16 的 LPIPS（模型卡） | 用途 |
+|---|---:|---:|---|
+| `Qwen-Image-2.1-Turbo-AD-Q4_K.gguf` | 4,201,694,944 字节 | 0.147 | [`config/qwen-image-2.1-turbo.json`](../../config/qwen-image-2.1-turbo.json) 的快速默认 |
+| `Qwen-Image-2.1-Turbo-Q8_0.gguf` | 7,591,554,784 字节 | 0.037 | 最接近全精度的 Transformer |
+
+模型卡中的其他文件（AD-Q6_K、AD-Q5_K、AD-Q3_K、AD-Q2_K、BF16）张量名相同；这里只运行了上面两个。
+模型卡还测量了文本编码器：Q4_K_M 编码器让图片偏离 BF16 编码器的程度（LPIPS 约 0.17）与
+AD-Q4_K 偏离 BF16 Transformer 的程度相当，Q8_0 编码器为 0.037。配置文件沿用上面 2.1 布局中的 Q4_K_M
+编码器及其发布文件名，因此在同一目录中存放两个模型时只需下载一次。
+
+```bash
+dotnet run --project TensorSharp.Cli -c Release --no-build -- \
+  --config config/qwen-image-2.1-turbo.json \
+  --prompt 'a neon sign that reads "OPEN LATE", rainy night' \
+  --width 1024 --height 1024 --diffusion-seed 42 --output turbo.png
+dotnet run --project TensorSharp.Server.Host -c Release --no-build -- \
+  --config config/qwen-image-2.1-turbo.json --host 127.0.0.1 --port 5000
+```
+
+### 声明检查点
+
+Turbo 的张量名与形状与基础检查点相同，GGUF 又没有元数据，文件本身无法区分二者，所以由宿主声明：
+
+- CLI 与服务端用 `--qwen-image-variant turbo`（或 `base`），配置文件用
+  `"qwen-image-variant": "turbo"`；Turbo 配置文件已经写好。宿主通过 `TS_QWEN_IMAGE_VARIANT`
+  交给模型，进程内调用方也可以在构造 `QwenImageModel` 之前设置它（其 `Variant` 属性报告结果）。
+  未知的参数值在启动时是配置错误（退出码 1），未知的 `TS_QWEN_IMAGE_VARIANT` 会拒绝加载（退出码 2）。
+- TensorAgent 的 Turbo 目录条目自行声明。
+
+加载时打印 `variant = turbo (declared)`。不声明时会读取文件名：文件名含单词 `turbo` 即按 Turbo
+处理（与 Wan 识别步数蒸馏检查点的方式相同），加载时打印
+`variant = turbo, ASSUMED from the word "turbo" in the file name: ...`。这只是猜测：合并进基础
+检查点的 Viggle 步数蒸馏 LoRA 以同样的文件名发布（Abiray/Qwen-Image-2.1-viggle-turbo-v0.2.1-6step-GGUF
+提供的 `qwen_image_2.1_turbo_Q4_K_M.gguf` 与 Abiray/Qwen-Image-2.1-Turbo-GGUF 中的完全同名），
+这样的合并需要 Viggle 的调度而不是 Turbo 的，请为它声明 `base`。其他文件名一律视为基础检查点。
+服务端的声明与伴随文件路径一样，作用于它加载的每个 Qwen-Image 模型。这一声明对其他模型
+没有意义：CLI 遇到其他模型时拒绝 `--qwen-image-variant`（退出码 1），服务端则照常加载该模型、
+不使用声明，并记录一条警告，与 `--lora` 相同。
+
+### 采样
+
+Turbo 使用其
+[`model_index.json`](https://huggingface.co/Qwen/Qwen-Image-2.1-Turbo/blob/main/model_index.json)
+中的 `sample_sigmas`，再加上最后的 0：
+
+```text
+[1.0, 0.978453, 0.95418, 0.926626, 0.89508, 0.845148, 0.704534, 0.414568, 0]
+```
+
+它的调度器 shift 为 1.0 且不做动态偏移，因此在任何分辨率下都原样使用这些值：diffusers 就是这样
+加载的，AtomicChat 模型卡也把这组值作为 `--sigmas` 交给 stable-diffusion.cpp。运行时会在去噪前记录：
+
+```text
+Qwen-Image-2.1 Turbo: 1024x1024, 8 steps, CFG 1, seed 42, 0 reference(s)
+  [qwen21] Turbo schedule (model_index.json sample_sigmas): 8 steps on fixed sigmas [1, 0.97845, 0.95418, 0.92663, 0.89508, 0.84515, 0.70453, 0.41457, 0]
+```
+
+- 默认 8 步、CFG 1。显式的 `--diffusion-steps 8`（请求中的 `steps: 8`）可以接受，其他步数会被拒绝，
+  报错会写出支持的步数。Qwen 的模型卡说明只设置步数不会覆盖保存的调度，且没有评估过其他调度，
+  所以 TensorSharp 不会把这 8 个值重新采样成别的步数。
+- 显式的 `--cfg` 大于 1（请求中的 `cfg`）时仍会加上负向前向，与基础检查点相同；Turbo 是为 CFG 1 蒸馏的。
+- 时间步以 F32 送入 Transformer，与基础检查点和 stable-diffusion.cpp 相同。
+- 编辑、`--keep-source-size` 与前缀 KV 缓存的行为与基础检查点相同（见下方验证，以及 TensorAgent
+  在 Turbo 上的规划测试）；遮罩与多张参考图走同一代码路径，但未在 Turbo 上运行过。编辑的噪声
+  在这里同样取决于图片（见[种子与编辑](#种子与编辑)）。
+
+### Turbo 上的 LoRA 插件
+
+Turbo 本身已经过步数蒸馏。带采样配方的插件（Viggle Turbo、Pruna 8 步与 5 步、Fun-Acc 的 PDD
+包，或任何带 `"sampling"` 的配置）会在读取张量之前被拒绝：`LoRA plug-in refused: LoRA '...'
+carries a sampling recipe (...): it is a step-distillation plug-in, and this transformer is
+Qwen-Image-2.1-Turbo (declared), which is step-distilled already and samples on its own 8-step
+schedule.` CLI 与服务端都会拒绝加载（退出码 2），报错还会写明 Turbo 是如何识别的。
+不带配方的插件可以加载。不带插件配置直接传入的 LoRA `.safetensors` 也没有配方，引擎无法区分加速
+适配器与风格适配器；请传入 `config/lora/` 中的插件。
+
+已用真实图片在 Turbo 上验证：通过 `config/lora/` 中的插件以强度 0.7 使用 Film Stills 与
+Grainscape，各自与不加插件的同一提示词、同一种子对比，种子为 42 和 7（1024×1024、AD-Q4_K；
+[`qwen-image21-turbo.py`](../../eng/validation/qwen-image21-turbo.py) 的 `--suite style` 可复现，
+其种子 42 的图片与先前一次运行逐字节相同）。两个插件都会施加各自的风格，也都会重画部分场景，
+Film Stills 改动更多：
+
+- Film Stills 把清晰的夜间电车站场景变成更柔和、颗粒更明显、色调更暖的电影剧照。种子 42 下它还
+  去掉了电车和长椅，女子坐在一团看不清的暗色物体上；种子 7 下她仍坐在候车亭的长椅上，但身后的
+  街道被重画，原来轨道的位置变成了一棵树和一排店面。
+- Grainscape 把清晨清澈的山间湖泊变成朦胧、低饱和的胶片质感。湖面、小船和山大致留在原来的位置；
+  岩壁和山脊线被重画，种子 42 下小船还多了一副桨。
+- 重画场景来自插件本身，而不是 Turbo：在基础检查点上以 40 步（Q4_K_M、种子 42）运行，Film Stills
+  把同一个电车站场景整个换掉了：没有电车，视角更低，街道两旁是树。
+- 每个插件每步约多 5.4%（8.28–8.31 秒对 7.86–7.88 秒）。
+
+TensorAgent 的 Turbo 条目只提供这两个插件。编辑类插件与 Quality Fix 尚未在 Turbo
+上试过，Object Remover 只在基础模型的 40 步下有效。
+
+### 与 stable-diffusion.cpp 的一致性
+
+2026-10-09 在 Apple M5 Pro（48 GB，`ggml_metal`）上对比 TensorSharp 与 stable-diffusion.cpp
+`f89d9b1`（当天的 master，包含修正自定义 sigma 的 `c150a6b`；以 Metal 和它自带的 ggml 子模块
+`d25b121` 构建）。TensorSharp 使用未修改的上游 ggml `ffa4e8b`。两个引擎使用同一个 Transformer
+GGUF、Q4_K_M 文本编码器、BF16 VAE 与 F16 mmproj，同样的提示词、种子 42 与 Philox 噪声
+（sd.cpp 使用 `--rng cuda`），Euler、CFG 1，以及公布的 8 个 sigma（sd.cpp 通过 `--sigmas` 传入）。
+编辑用的参考图是 Turbo 模型卡中的游艇草图，预先合成到白底并缩放到 1728×608 的条件尺寸，因此两个
+引擎都不再缩放它。PSNR 比较两个引擎输出的 PNG，每一对也都用肉眼核对过。每步秒数取稳态（第 2 步起）。
+这次编辑运行于 TensorSharp 按参考图选择编辑噪声之前，因此两个引擎都从该种子的噪声开始；要复现它需要
+`TS_QWEN21_EDIT_NOISE=seed`，基准脚本在同时运行两个引擎时会自动设置。
+
+| 提示词 | Transformer | 尺寸 | PSNR | 每步秒数 TensorSharp / sd.cpp | 总耗时 TensorSharp / sd.cpp |
+|---|---|---|---:|---:|---:|
+| 模型卡的 `a neon sign that reads "OPEN LATE", rainy night` | AD-Q4_K | 1024×1024 | 57.4 dB | 7.79 / 8.76 | 70.3 / 92.8 s |
+| 毛笔字写着“清风茶社”的茶馆招牌（中文提示词） | AD-Q4_K | 1024×1024 | 44.7 dB | 7.78 / 8.77 | 69.4 / 79.9 s |
+| 老渔夫的特写肖像照片 | AD-Q4_K | 1024×1024 | 59.6 dB | 7.79 / 8.76 | 69.5 / 79.4 s |
+| 编辑：把模型卡的游艇草图变成照片（完整提示词） | AD-Q4_K | 1728×608 | 39.3 dB | 7.97 / 11.16 | 87.2 / 114.3 s |
+| 霓虹灯招牌 | Q8_0 | 1024×1024 | 59.5 dB | 7.62 / 8.63 | 69.0 / 79.1 s |
+
+- 每一对都是同一张图：霓虹灯招牌红色的 OPEN、蓝色的 LATE；茶馆招牌写出了四个字，两个引擎都把
+  “风”写成繁体“風”；肖像连皮肤纹理都一致；编辑后的游艇保留了草图中的桅杆、驾驶室、船中部的四扇窗、
+  两艘救生艇、黄色烟囱，以及五个和九个一排的舷窗。
+- 剩下的差异来自舍入：两个引擎的求和顺序不同。编辑的差异最大，因为参考图还要经过两个引擎各自的
+  视觉编码器与 VAE 编码器。sd.cpp 的第一次运行（霓虹灯招牌）包含从冷页缓存读取文件的时间。
+- 8 位与 4 位 Transformer 画出同一场景但细节不同：TensorSharp 的两张霓虹灯招牌相差 19.1 dB，与模型卡
+  中 AD-Q4_K 相对 BF16 的 20.8 dB 相当。
+- TensorSharp 在 Metal 上的输出是确定的：重复运行得到逐字节相同的 PNG。
+
+模型卡的示例图使用 `--rng cpu` 与 BF16 文本编码器，无法在这里逐像素复现；上面的对比以 sd.cpp 本身为参考。
+
+### 性能
+
+Apple M5 Pro（48 GB），`ggml_metal`，1024×1024，霓虹灯招牌提示词，种子 42，Q4_K_M 文本编码器。
+每种配置在两个全新进程中各运行一次，按 A-B-C-D-D-C-B-A 顺序、每次间隔 20 秒，表中为中位数（同一配置
+两次运行相差不到 0.4%）。每步秒数取稳态；第一步还要保存前缀 KV 缓存，约多 0.2 秒。各配置的 VAE 解码
+均为 5.1–5.3 秒，文本编码 0.3 秒。
+
+| 配置 | 步数 | 每步秒数 | 去噪 | 总耗时 | 相对 40 步 |
+|---|---:|---:|---:|---:|---:|
+| Qwen-Image-2.1 Q4_K_M | 40 | 7.83 | 313.3 s | 319.5 s | 1.0× |
+| Qwen-Image-2.1 Q4_K_M + Viggle Turbo r128 | 6 | 8.30 | 50.0 s | 56.3 s | 5.7× |
+| Turbo AD-Q4_K | 8 | 7.86 | 63.1 s | 69.3 s | 4.6× |
+| Turbo Q8_0 | 8 | 7.62 | 61.2 s | 67.6 s | 4.7× |
+
+- Turbo 每步的开销与基础检查点相同：Transformer 一样，AD-Q4_K 的混合量化（首尾各四个块的注意力为
+  Q5_K、其余为 Q4_K，调制为 Q8_0，时间嵌入、输出头与文本输入为 BF16）与 Q4_K_M（注意力 V 为 Q6_K）
+  相差不到 0.4%。BF16 张量只作用于两行（时间嵌入）或提示词的 token（`txt_in`），而不是 4,096 个图像
+  token，因此它们的类型看不出影响。
+- Q8_0 每步比 AD-Q4_K 快 3%：4,096 个图像 token 时矩阵乘法受计算而非带宽限制，矩阵内核解包 Q8_0
+  块比 K-quant 块便宜。质量更高的文件也更快，代价是多 3.4 GB 权重。
+- Viggle Turbo 的 6 步最先完成：它每步多 6%（不合并的适配器），但少两步。Turbo 是 Qwen 自己的蒸馏，
+  不需要适配器。
+- 在 1248×832 编辑时（`/usr/bin/time -l`）三种 Transformer 的峰值内存占用均为 14.35–14.37 GB：
+  Transformer 从文件映射，峰值来自它前后的阶段。TensorAgent 的档位在此基础上再加上权重。
+
+可用 [`eng/validation/qwen-image21-turbo.py`](../../eng/validation/qwen-image21-turbo.py)
+（`--suite parity,perf,footprint`）复现，它调用
+[`qwen-image21-bench.py`](../../eng/validation/qwen-image21-bench.py) `--variant turbo`。
+
+### Turbo 的限制
+
+- Turbo 只运行 8 步。模型卡的测量与这里的测量都在约 1 百万像素；Qwen 推荐约 2 百万像素（默认的 2048×2048）。
+- 变体靠声明。未声明且文件名为 `...turbo...` 的文件按 Turbo 处理，对同名发布的步数蒸馏合并模型来说是错的。
+- Turbo 的其他量化版本未在这里运行。
 
 ## 用遮罩精确编辑局部区域
 
@@ -403,7 +671,8 @@ dotnet run --project TensorSharp.Cli -c Release --no-build -- \
 显式设置优先于配方，配方又优先于模型默认值（40 步、CFG 1）：CLI 上是 `--diffusion-steps` /
 `--cfg`，服务端是请求中的 `steps` / `cfg`（`0` 或省略表示使用配方）。配方没有调度的步数会被
 拒绝，报错会列出支持的步数；PDD 包每个训练步有一个输出头，只能按训练时的步数运行。两个都带
-配方的插件不能叠加。风格与编辑插件不带配方，沿用检查点自己的调度。运行会在去噪前记录解析出的
+配方的插件不能叠加；[Qwen-Image-2.1-Turbo](#turbo-上的-lora-插件) 的检查点有自己的调度，
+带配方的插件在它上面会被拒绝。风格与编辑插件不带配方，沿用检查点自己的调度。运行会在去噪前记录解析出的
 配方及其 sigma。
 
 ### 支持的格式
@@ -539,6 +808,7 @@ sd.cpp 忽略 `lora_adapter_metadata` 中的 alpha，因此给它的 Pruna 倍�
 - 插件只作用于 Qwen-Image-2.1；CLI 遇到其他模型时拒绝 `--lora`，服务端则记录一条警告，
   并在不带插件的情况下加载该模型。
 - 每次运行只能有一个插件带采样配方，而带 sigma 的配方只能以它定义的步数运行。
+  Qwen-Image-2.1-Turbo 不接受任何带配方的插件。
 - Qwen-Image-2.1-Fix 作者的工作流还使用了 APG、FreSca 以及 CFG 3 下的 `seeds_2` 采样器，
   TensorSharp 没有实现这些；DoRA 本身会被精确应用。
 - Pruna 适配器在 1K 下训练。Fun-Acc 在 2048×2048 下训练，其模型卡指出小而密的文字以及部分
@@ -627,4 +897,6 @@ FP8 权重：TensorSharp 加载块量化的 GGUF 权重；ggml 没有 FP8 E4M3 �
 ## 验证记录
 
 Unsloth Q8_0 验证、完整模型性能测量、原生优化验证、与 stable-diffusion.cpp 的
-历史对比以及复现命令，请参阅[英文版模型卡](qwenimage21.md)。
+历史对比以及复现命令，请参阅[英文版模型卡](qwenimage21.md)。其中的编辑对比是在编辑噪声
+改为由参考图决定之前完成的；要与 stable-diffusion.cpp 的编辑噪声对齐，现在需要
+`TS_QWEN21_EDIT_NOISE=seed`（基准脚本的 `--edit-noise seed`，两个引擎都运行时的默认值）。

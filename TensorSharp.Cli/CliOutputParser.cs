@@ -11,22 +11,34 @@ namespace TensorSharp.Cli
     internal static class CliOutputParser
     {
         internal static IOutputParser Create(string architecture, bool enableThinking,
-            List<ToolFunction> tools, ITokenizer tokenizer, List<int> promptTokens)
+            List<ToolFunction> tools, string promptTail)
         {
             var parser = OutputParserFactory.Create(architecture);
             parser.Init(enableThinking, tools);
-
-            if (parser is Gemma4OutputParser)
-            {
-                // A tool-result prompt may already open thought even with --think off.
-                // Inspect only the actual tail; a family default cannot identify that
-                // state, and decoding a long prompt again would add needless work.
-                int count = Math.Min(promptTokens.Count, 64);
-                string tail = tokenizer.Decode(promptTokens.GetRange(promptTokens.Count - count, count));
-                parser.SetGenerationPromptSuffix(tail);
-            }
-
+            parser.SetGenerationPromptSuffix(promptTail);
             return parser;
+        }
+
+        /// <summary>
+        /// The prompt's tail, for a family whose parsers start where the prompt left off
+        /// rather than where the request's flag says; null for every other family. A Gemma 4
+        /// tool-result prompt may already open thought even with --think off, and a template
+        /// whose thinking-off replies may reason anyway
+        /// (<see cref="ChatProtocol.ThinkingOffReplyMayReason"/>) is told whether its block
+        /// is open. Only the actual tail is inspected: a family default cannot identify that
+        /// state, and decoding a long prompt again would add needless work. The same tail
+        /// primes the turn's <see cref="ToolCallTurnEnd"/>, which must parse as the printed
+        /// output does.
+        /// </summary>
+        internal static string PromptTail(string architecture, string chatTemplate,
+            ITokenizer tokenizer, List<int> promptTokens)
+        {
+            bool readsTail = OutputParserFactory.Create(architecture) is Gemma4OutputParser
+                || OutputParserFactory.ThinkingOffReplyMayReason(architecture, chatTemplate);
+            if (!readsTail || tokenizer == null || promptTokens == null || promptTokens.Count == 0)
+                return null;
+            int count = Math.Min(promptTokens.Count, 64);
+            return tokenizer.Decode(promptTokens.GetRange(promptTokens.Count - count, count));
         }
     }
 }

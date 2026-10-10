@@ -321,6 +321,21 @@ class QwenChatCacheBenchmarkTests(unittest.TestCase):
         self.assertEqual(state.result()["first_answer_ms"], 15)
         self.assertEqual(state.message(), {"role": "assistant", "content": "42"})
 
+    def test_webui_replace_sets_the_answer_that_is_sent_back(self):
+        # Text the page showed and then took back as reasoning (Nemotron-H Reasoning-128K
+        # closing a block its thinking-off prompt had closed) arrives as its reasoning and a
+        # whole-answer replace. The next turn sends back what remains, or the server's
+        # transcript no longer recognises the turn and the benchmark measures a re-prefill.
+        state = bench.StreamState("webui")
+        state.add({"token": "Okay, the user asks."}, 5)
+        state.add({"thinking": "Okay, the user asks."}, 8)
+        state.add({"replace": ""}, 8)
+        state.add({"token": "Paris."}, 12)
+        state.add({"done": True, "tokenCount": 6, "promptTokens": 8, "kvReusedTokens": 0}, 15)
+        state.validate()
+        self.assertEqual(state.message(), {"role": "assistant", "content": "Paris."})
+        self.assertEqual(state.result()["reasoning"], "Okay, the user asks.")
+
     def test_unfinished_or_failed_streams_never_pass_validation(self):
         for final in (None, {"done": True, "tokenCount": 2, "promptTokens": 3},
                       {"done": True, "tokenCount": 2, "promptTokens": 3, "kvReusedTokens": 4},

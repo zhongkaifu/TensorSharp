@@ -116,6 +116,8 @@ public class ConfigFileArgsTests : IDisposable
         "cpu-moe", "n-cpu-moe", "cpu-moe-threads",
         "spec", "no-spec", "spec-type", "spec-draft", "spec-pmin", "draft-model",
         "qwen-image-vae", "qwen-image-vl", "qwen-image-mmproj",
+        // Which Qwen-Image-2.1 checkpoint the GGUF holds (QwenImageVariantFlag), same spelling on the CLI.
+        "qwen-image-variant",
         "video-vae", "video-text-encoder", "video-dit2", "audio-vae",
         "video-width", "video-height", "video-steps", "video-mode", "video-frames", "fps",
         "width", "height",

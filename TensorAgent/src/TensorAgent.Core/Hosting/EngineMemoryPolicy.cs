@@ -143,6 +143,19 @@ public static class EngineMemoryPolicy
     }
 
     /// <summary>
+    /// The context window <paramref name="model"/>'s entry gives a load on
+    /// <paramref name="device"/> when the user has not chosen one: the phone's measured
+    /// <see cref="CatalogModel.ContextLength"/>, or on a desktop the window the entry's tier
+    /// affords (<see cref="CatalogModel.DesktopContextLength"/>). <see cref="Apply"/> loads
+    /// with it and the catalog route reports it, so the two cannot disagree.
+    /// </summary>
+    public static int DefaultContextLength(CatalogModel model, DeviceClass device)
+    {
+        ArgumentNullException.ThrowIfNull(model);
+        return device == DeviceClass.Desktop ? model.DesktopContextLength : model.ContextLength;
+    }
+
+    /// <summary>
     /// Apply <paramref name="model"/>'s budget for the load that is about to happen.
     /// Returns the context length handed to the engine, or 0 when the entry does not
     /// state one (the diffusion entries, which hold no KV cache) and the GGUF's own
@@ -153,10 +166,15 @@ public static class EngineMemoryPolicy
         ArgumentNullException.ThrowIfNull(model);
 
         // The user's override wins where they set one; otherwise the catalog entry,
-        // which is written per model against the device tier that is offered it.
+        // which is written per model against the device tier that is offered it: the
+        // phone's measured window, or on a desktop the window the entry's tier affords
+        // (CatalogModel.DesktopContextLength) -- the phone's 8,192 left a desktop chat
+        // ~1k tokens beside TensorAgent's ~7.2k-token shared prompt, and every follow-up
+        // compacted the conversation away. A LeanCaches entry's caches still start at
+        // 2,048 tokens and grow, so the larger ceiling costs nothing until it is used.
         int context = settings?.ContextLength is int chosen && chosen > 0
             ? chosen
-            : model.ContextLength;
+            : DefaultContextLength(model, device);
 
         if (context > 0)
             Environment.SetEnvironmentVariable(MaxContextVariable, context.ToString());

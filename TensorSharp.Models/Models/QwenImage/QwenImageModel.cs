@@ -8,7 +8,9 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Threading;
 using TensorSharp.Core;
+using TensorSharp.GGML;
 using TensorSharp.Runtime;
 
 namespace TensorSharp.Models.QwenImage
@@ -127,7 +129,22 @@ namespace TensorSharp.Models.QwenImage
                 _mmprojPath = ResolveVersion21Companion("TS_QWEN_IMAGE_MMPROJ", dir,
                     n => n.Contains("mmproj") && (n.Contains("qwen3vl-8b") || n.Contains("qwen3-vl-8b")) && n.EndsWith(".gguf"));
 
+                // Turbo and the base checkpoint share every tensor name and shape, and the GGUFs
+                // carry no metadata: the host declares which one this is (QwenImage21Turbo).
+                string variantNote;
+                try
+                {
+                    Variant = QwenImage21Turbo.Resolve(Environment.GetEnvironmentVariable(QwenImageVariantFlag.EnvironmentVariable),
+                        ggufPath, out variantNote);
+                }
+                catch (ArgumentException e)
+                {
+                    throw new ModelLoadRefusedException(e.Message, e);
+                }
+                _variantDeclared = !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable(QwenImageVariantFlag.EnvironmentVariable));
+
                 Console.WriteLine($"Qwen-Image-2.1: DiT={Path.GetFileName(ggufPath)}");
+                Console.WriteLine($"  variant      = {variantNote}");
                 Console.WriteLine($"  VAE          = {_vaePath ?? "<missing>"}");
                 Console.WriteLine($"  text-encoder = {_tePath ?? "<missing>"}");
                 Console.WriteLine($"  mmproj       = {_mmprojPath ?? "<none> (text-only grounding)"}");
@@ -175,6 +192,25 @@ namespace TensorSharp.Models.QwenImage
         internal QwenImage21LoraSet Loras { get; private set; }
 
         /// <summary>
+        /// Which 2.1 checkpoint the transformer is, as declared by the host
+        /// (<see cref="QwenImageVariantFlag.EnvironmentVariable"/>) or, without a declaration,
+        /// assumed from the file name (<see cref="QwenImage21Turbo.Resolve"/>). Turbo samples 8 steps
+        /// on its own fixed schedule at CFG 1 by default and takes no step-distillation LoRA.
+        /// </summary>
+        public QwenImageVariant Variant { get; }
+
+        private readonly bool _variantDeclared;
+
+        /// <summary>The checkpoint's own sampling recipe: Turbo's, or null for the base checkpoint,
+        /// whose schedule is <see cref="QwenImage21Sampling.Sigmas"/>.</summary>
+        internal QwenImage21LoraRecipe CheckpointRecipe => Variant == QwenImageVariant.Turbo ? QwenImage21Turbo.Recipe : null;
+
+        /// <summary>The recipe a request samples with when it names no steps or CFG: a LoRA
+        /// plug-in's (never together with a checkpoint's; <see cref="SetLoras"/> refuses that),
+        /// else the checkpoint's own, else null.</summary>
+        internal QwenImage21LoraRecipe SamplingRecipe => Loras?.Recipe ?? CheckpointRecipe;
+
+        /// <summary>
         /// Replace the LoRA plug-ins applied to every later request (an empty list removes them).
         /// The adapters are validated against this transformer immediately; a failure leaves the
         /// previous set in place.
@@ -188,7 +224,12 @@ namespace TensorSharp.Models.QwenImage
             {
                 var timer = System.Diagnostics.Stopwatch.StartNew();
                 string prefix = _gguf.Tensors.ContainsKey("img_in.weight") ? "" : "model.diffusion_model.";
-                loaded = QwenImage21LoraSet.Load(resolved, _gguf, prefix, _backend, IsTensorParallel ? TpDegree : 1);
+                // A step-distillation plug-in brings its own schedule; Turbo has one already.
+                string checkpoint = CheckpointRecipe == null ? null : _variantDeclared
+                    ? "declared"
+                    : $"assumed from its file name; declare {QwenImageVariantFlag.Flag} base if it is not";
+                loaded = QwenImage21LoraSet.Load(resolved, _gguf, prefix, _backend, IsTensorParallel ? TpDegree : 1,
+                    CheckpointRecipe, checkpoint);
                 Console.WriteLine($"Qwen-Image-2.1 LoRA: {resolved.Count} plug-in(s), applied unmerged " +
                     $"({loaded.FactorBytes / (1024.0 * 1024.0):F0} MiB of factors, loaded in {timer.Elapsed.TotalSeconds:F1}s)");
                 Console.WriteLine(loaded.Summary);
@@ -242,6 +283,86 @@ namespace TensorSharp.Models.QwenImage
         public RgbImage GenerateImage(string prompt, QwenImageParams p = null)
         {
             return GetPipeline21().Run(prompt, Array.Empty<RgbImage>(), p ?? new QwenImageParams());
+        }
+
+        /// <summary>
+        /// The longest question <see cref="ChooseAnswer"/> scores, in tokens of the prompt
+        /// <see cref="ChooseAnswerPrompt"/> renders. A longer one gets no answer (null), so a
+        /// caller that cannot count tokens fits its question under this from above.
+        /// </summary>
+        public const int MaxQuestionTokens = QwenImageTextEncoder.MaxScoringTokens;
+
+        /// <summary>
+        /// The prompt <see cref="ChooseAnswer"/> scores for these arguments, with the options in
+        /// the order given (every other pass is the same text with the option lines rotated, so
+        /// it is about as long): the encoder's ChatML around <paramref name="system"/>, then
+        /// <paramref name="user"/> followed by the lettered options and the reply format this
+        /// model adds. What a caller measures against <see cref="MaxQuestionTokens"/>.
+        /// </summary>
+        public static string ChooseAnswerPrompt(string system, string user, IReadOnlyList<string> options)
+        {
+            QwenImageIntentScorer.Validate(system, user, options);
+            return QwenImageIntentScorer.RenderChatMl(QwenImageIntentScorer.StripControlMarkers(system),
+                QwenImageIntentScorer.RenderQuestion(user, options, Enumerable.Range(0, options.Count).ToArray()));
+        }
+
+        /// <summary>
+        /// Ask this model's own Qwen3-VL-8B which of <paramref name="options"/> fits the question
+        /// in <paramref name="system"/> and <paramref name="user"/>. The options are TEXTS, not
+        /// labels: this method letters them A, B, ... after <paramref name="user"/> and adds the
+        /// line asking for a letter, so a caller writes neither (a list of bare letters is
+        /// refused). Each option is scored by the probability of its letter as the first token of
+        /// the reply, once per rotation of the options so that each is shown at every position,
+        /// then averaged (<see cref="QwenImageIntentScorer.Choose"/>). The prompt is the encoder's own
+        /// Qwen3-VL-Instruct ChatML (<see cref="ChooseAnswerPrompt"/>), with <c>&lt;|</c> and
+        /// <c>|&gt;</c> removed from every inserted text.
+        /// <para>It builds the text encoder for the call, as a picture's conditioning pass does,
+        /// and disposes it and releases the GGML scratch before returning, so nothing of it is
+        /// resident when a picture is made next. Like the image methods it is not thread-safe:
+        /// a host serializes it with picture requests.</para>
+        /// <para>Null when the model cannot answer, with the reason printed: a backend that is not
+        /// GGML, a text-encoder GGUF without its output head (encoder-only exports exist), or a
+        /// question over <see cref="MaxQuestionTokens"/> tokens. Argument errors, cancellation
+        /// and native failures throw.</para>
+        /// </summary>
+        public ImageIntentChoice? ChooseAnswer(string system, string user, IReadOnlyList<string> options,
+            CancellationToken cancellationToken = default)
+        {
+            QwenImageIntentScorer.Validate(system, user, options);
+            try
+            {
+                if (!UsesGgml)
+                    throw new ImageIntentUnavailableException("next-token scoring runs on GGML backends only");
+                // Header only: an encoder-only GGUF is refused before 5 GB of weights are mapped.
+                if (QwenImageTextEncoder.ScoringHeadRefusal(TeGguf) is string refusal)
+                    throw new ImageIntentUnavailableException(refusal);
+                cancellationToken.ThrowIfCancellationRequested();
+                try
+                {
+                    using var encoder = new QwenImageTextEncoder(_tePath, _backend);
+                    return QwenImageIntentScorer.Choose(system, user, options,
+                        text => encoder.Tokenizer.Encode(text, addSpecial: false), encoder.NextTokenLogits,
+                        QwenImageTextEncoder.MaxScoringTokens, cancellationToken);
+                }
+                finally
+                {
+                    ReleaseComputeBuffers();
+                }
+            }
+            catch (ImageIntentUnavailableException e)
+            {
+                Console.WriteLine($"Qwen-Image-2.1: the text encoder cannot score this question: {e.Message}.");
+                return null;
+            }
+        }
+
+        /// <summary>Releases GGML scratch and resident weights between stages. The pure-C# cpu
+        /// backend has neither, and must not call into the native library at all.</summary>
+        internal void ReleaseComputeBuffers()
+        {
+            if (!UsesGgml) return;
+            GgmlBasicOps.ReleaseReuseComputeBuffers();
+            GgmlBasicOps.ClearHostBufferCache();
         }
 
         // ---- IModelArchitecture autoregressive surface: not applicable to an image model ----
