@@ -115,6 +115,7 @@ public sealed class KvSnapshotLease : IDisposable
     private bool _disposed;
     internal KvSnapshotLease(byte[] bytes, ResourceAccess access) { _managed = bytes; _access = access; }
     internal KvSnapshotLease(ResourceLease resource, ResourceAccess access) { _resource = resource; _access = access; }
+    internal Task<bool>? PendingPrefetch { get; set; }
     private unsafe Span<byte> Bytes
     {
         get
@@ -129,7 +130,7 @@ public sealed class KvSnapshotLease : IDisposable
     public void Dispose()
     {
         if (_disposed) return;
-        _resource?.Dispose();
-        _disposed = true;
+        try { PendingPrefetch?.GetAwaiter().GetResult(); }
+        finally { _resource?.Dispose(); _disposed = true; }
     }
 }

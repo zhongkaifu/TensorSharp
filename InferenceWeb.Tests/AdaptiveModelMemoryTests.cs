@@ -89,6 +89,21 @@ public class AdaptiveModelMemoryTests
     }
 
     [Fact]
+    public void SmallSharedQuotaOnLargeDeviceUsesQuotaSizedHeadroomWithoutIgnoringPhysicalAvailability()
+    {
+        var budget = new MemoryBudget([new(AdaptiveModelSession.HostPool, 8 * GiB), new(AdaptiveModelSession.DevicePool, 8 * GiB)]);
+        var hardware = new InferenceHardwareMemory(512 * GiB, 40 * GiB, 48 * GiB, 6 * GiB);
+        var options = new AdaptiveModelMemoryOptions(2048, 512) { AllowWeightStreaming = false };
+        var before = budget.Snapshot().ToArray();
+        Assert.True(AdaptiveModelSession.PlanLoad(Profile(), options, hardware, budget, sharedBudget: true).Accepted);
+        Assert.False(AdaptiveModelSession.PlanLoad(Profile(), options with { DeviceHeadroomBytes = 3 * GiB },
+            hardware, budget, sharedBudget: true).Accepted);
+        Assert.False(AdaptiveModelSession.PlanLoad(Profile(), options,
+            hardware with { DeviceAvailable = 3 * GiB }, budget, sharedBudget: true).Accepted);
+        Assert.Equal(before, budget.Snapshot());
+    }
+
+    [Fact]
     public void SharedLedgerCeilingsAndExistingOwnersConstrainPlacementAndCaches()
     {
         var budget = new MemoryBudget([new(AdaptiveModelSession.HostPool, 8 * GiB), new(AdaptiveModelSession.DevicePool, GiB)]);

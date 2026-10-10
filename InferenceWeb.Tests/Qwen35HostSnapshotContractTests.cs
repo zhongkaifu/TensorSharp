@@ -86,6 +86,54 @@ public sealed class Qwen35HostSnapshotContractTests
         Assert.False(fixture.Model.SupportsCrossSequenceKvReuse);
     }
 
+    [Theory]
+    [InlineData(false, false)]
+    [InlineData(true, false)]
+    [InlineData(false, true)]
+    [InlineData(true, true)]
+    public void BulkRestore_CopiesFinalStateAndPreservesAcceptedEndpointOnRefusal(bool refuseLast, bool tiered)
+    {
+        using var fixture = new SnapshotFixture();
+        byte[] first = fixture.Extract(0, 4);
+        fixture.Conv[1][0] += 100;
+        fixture.Conv[3][0] += 200;
+        byte[] second = fixture.Extract(4, 3);
+        byte[] expectedSecond = (byte[])second.Clone();
+        if (refuseLast)
+            BinaryPrimitives.WriteInt32LittleEndian(second.AsSpan(second.Length - sizeof(int)), int.MaxValue);
+        fixture.SetBase("_cacheSeqLen", 0);
+        var reads = new List<int>();
+        string root = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "ts-bulk-" + Guid.NewGuid().ToString("N"));
+        long page = (first.Length + 63L) / 64 * 64;
+        using var storage = new TensorSharp.Runtime.Paged.PagedKvStorage(2, first.Length,
+            tiered ? new(2 * page + 64, 8 * 4096, root, 64) : null);
+        storage.Store(0, first, null);
+        storage.Store(1, second, null);
+        int restored = fixture.Model.RestoreKvSnapshots(4, 7, b =>
+        {
+            reads.Add(b);
+            return storage.Acquire(b);
+        });
+        Assert.Equal(refuseLast ? 4 : 7, restored);
+        Assert.Equal(refuseLast ? new[] { 0, 1, 0 } : new[] { 0, 1 }, reads);
+        Assert.Equal(refuseLast ? first : expectedSecond, refuseLast ? fixture.Extract(0, 4) : fixture.Extract(4, 3));
+        // A short return has fully materialized recurrent state and can continue
+        // through the ordinary API without resetting or hidden completion calls.
+        if (refuseLast)
+        {
+            Assert.True(fixture.Model.TryInjectKVBlock(4, 3, expectedSecond));
+            Assert.Equal(expectedSecond, fixture.Extract(4, 3));
+        }
+        if (tiered)
+        {
+            Assert.True(storage.ResidencyStats!.Value.Spills > 0);
+            Assert.Equal(0, storage.ResidencyStats!.Value.ActiveLeases);
+        }
+        storage.Dispose();
+        if (tiered) Assert.All(storage.MemoryUsage!, p => Assert.Equal(0, p.Reserved + p.Committed));
+        if (System.IO.Directory.Exists(root)) System.IO.Directory.Delete(root, true);
+    }
+
     // Real Qwen snapshot methods over CPU-owned tensors, without loading weights
     // or invoking native kernels. GPU inference coverage belongs to ModelProbe.
     private sealed class SnapshotFixture : IDisposable

@@ -139,6 +139,7 @@ namespace TensorSharp.Runtime.Scheduling
         public int WaitingCount => _scheduler.WaitingCount;
         public IReadOnlyList<TensorSharp.Memory.MemoryPoolSnapshot>? SnapshotMemoryUsage => _pool.Storage.MemoryUsage;
         public TensorSharp.Memory.MemorySchedulerStats? SnapshotResidencyStats => _pool.Storage.ResidencyStats;
+        public object SnapshotSwapTimings => _executor.SwapMetrics.Snapshot();
 
         /// <summary>
         /// Whether the step loop may run right now, or null for "always".

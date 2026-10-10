@@ -296,6 +296,51 @@ public sealed class InjectShortfallAccountingTests
         return (model, a, b, completions[0], completions[1]);
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task RefusedRestore_ReplayPreservesTheWorkspaceChunkLimit(bool admissionBound)
+    {
+        using var environment = new EnvScope();
+        environment.Set("TS_SCHED_DISABLE_BATCHED", "1");
+        int[][] prompts = [Enumerable.Range(1, 67).ToArray(), Enumerable.Range(71, 73).ToArray()];
+        var expected = new List<int[]>();
+        foreach (var prompt in prompts) expected.Add(await RunColdAsync(prompt, 6));
+        var model = new HistoryHashModel { RefuseInjectAt = 0, RefuseInjectSkip = 4 };
+        var budget = new TensorSharp.Memory.MemoryBudget([new("ram", 16384), new("disk", 32 * 4096)]);
+        string root = Path.Combine(Path.GetTempPath(), "ts-replay-bound-" + Guid.NewGuid().ToString("N"));
+        var snapshots = TensorSharp.Runtime.Paged.KvSnapshotOptions.FromSharedBudget(budget, "ram", "disk", root, 64);
+        var admission = new RequestMemoryAdmission(budget, _ => [new("ram", 4096), new("disk", 8 * 4096)])
+        {
+            ExecutionShape = new(snapshots, BlockSize, 2, 8),
+            EnterSerialExecution = _ => new CancellationTokenSource(),
+        };
+        using var engine = new InferenceEngine(model, new SchedulerConfig
+        {
+            BlockSize = BlockSize, NumBlocks = 64, MaxNumRunningSequences = 2,
+            MaxNumBatchedTokens = 64, MaxPrefillChunkSize = 32, SoloPrefillChunkSize = 32,
+            PrefillChunkTokenLimit = admissionBound ? int.MaxValue : 8, DecodeQuantumTokens = 1,
+            KvSnapshots = admissionBound ? snapshots : null, MemoryAdmission = admissionBound ? admission : null,
+            EnablePrefixCaching = false, StopRepetition = false,
+        });
+        var gate = new ComputeGate(); gate.Close(); engine.ComputeGate = gate;
+        var sequences = prompts.Select((p, i) => new SequenceState($"bounded-replay-{i}", p, 6, BlockSize, SamplingConfig.Greedy)).ToArray();
+        var handles = sequences.Select(s => engine.SubmitRequest(s)).ToArray();
+        gate.Open();
+        await Task.WhenAll(handles.Select(h => h.Completion)).WaitAsync(TimeSpan.FromSeconds(20));
+        Assert.Equal(1, model.RefusedInjects);
+        Assert.True(model.Forwards.Sum(f => f.Count) > prompts.Sum(p => p.Length) + 10);
+        Assert.All(model.Forwards, f => Assert.InRange(f.Count, 1, 8));
+        for (int i = 0; i < sequences.Length; i++)
+        {
+            Assert.Equal(SequenceStatus.FinishedLengthCapped, sequences[i].Status);
+            Assert.Equal(expected[i], sequences[i].OutputTokens.ToArray());
+        }
+        engine.Dispose();
+        Assert.All(budget.Snapshot(), p => Assert.Equal(0, p.Reserved + p.Committed));
+        if (Directory.Exists(root)) Directory.Delete(root, true);
+    }
+
     // ------------------------------------------------------------------ helpers
 
     private static void AssertIncludesAllForwardTime(InferenceCompletion completion, ForwardTiming timing)

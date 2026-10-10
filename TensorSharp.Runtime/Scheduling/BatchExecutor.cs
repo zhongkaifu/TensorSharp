@@ -38,6 +38,8 @@ namespace TensorSharp.Runtime.Scheduling
         private readonly ContinuousBatchScheduler _scheduler;
         private readonly int _blockSize;
         private readonly ILogger _logger;
+        private readonly bool _bulkRestore = Environment.GetEnvironmentVariable("TS_DISABLE_BULK_KV_RESTORE") != "1";
+        public KvSwapMetrics SwapMetrics { get; } = new();
 
         // Currently-owning sequence (whose K/V state is in the model's tensors).
         private SequenceState? _currentOwner;
@@ -2468,6 +2470,7 @@ namespace TensorSharp.Runtime.Scheduling
         /// its blocks.</summary>
         private void EnsureOwnership(SequenceState seq)
         {
+            using var ownershipTiming = SwapMetrics.Measure(KvSwapMetrics.Phase.Ownership);
             if (ReferenceEquals(_currentOwner, seq))
             {
                 // Same owner: nothing to do. (Sanity check: model's cached count
@@ -2785,7 +2788,10 @@ namespace TensorSharp.Runtime.Scheduling
                 if (expectedBytes <= 0) break;
 
                 var dst = CaptureScratch(checked((int)expectedBytes));
-                if (!_model.TryExtractKVBlock(startToken, tokensInBlock, dst))
+                bool extracted;
+                using (SwapMetrics.Measure(KvSwapMetrics.Phase.Extract))
+                    extracted = _model.TryExtractKVBlock(startToken, tokensInBlock, dst);
+                if (!extracted)
                 {
                     // For SWA-bounded models (e.g. Gemma 4) blocks whose positions
                     // have aged out of the sliding window can't be re-extracted —
@@ -2803,7 +2809,8 @@ namespace TensorSharp.Runtime.Scheduling
                 // not confused with full-block layout). For the trailing
                 // partial block we use the partial-byte size; the storage slab
                 // is sized for one full block so partial fits.
-                _pool.Storage.Store(block.Id, dst, SnapshotEnvelope(seq));
+                using (SwapMetrics.Measure(KvSwapMetrics.Phase.Store))
+                    _pool.Storage.Store(block.Id, dst, SnapshotEnvelope(seq));
                 block.Used = tokensInBlock;
                 block.HoldsSnapshotBytes = tokensInBlock == _blockSize;
                 // A recurrent snapshot contains the state at the current model
@@ -2836,6 +2843,38 @@ namespace TensorSharp.Runtime.Scheduling
 
             int injected = 0;
             int blocks = seq.BlockTable.NumBlocks;
+            if (_bulkRestore && _model is IKvSnapshotBulkRestorer restorer)
+            {
+                int available = 0;
+                for (int b = 0; b < blocks && available < tokensToInject; b++)
+                {
+                    int n = Math.Min(_blockSize, tokensToInject - available);
+                    var block = seq.BlockTable.Blocks[b];
+                    if (n == _blockSize ? !block.HoldsSnapshotBytes : block.Used != n) break;
+                    if (_model.ComputeKVBlockByteSize(n) <= 0) break;
+                    available += n;
+                }
+                if (available == 0) return 0;
+                using var timing = SwapMetrics.Measure(KvSwapMetrics.Phase.Inject);
+                int restored = restorer.RestoreKvSnapshots(_blockSize, available, b =>
+                {
+                    KvSnapshotLease lease;
+                    using (SwapMetrics.Measure(KvSwapMetrics.Phase.Acquire))
+                        lease = _pool.Storage.Acquire(seq.BlockTable.Blocks[b].Id,
+                            TensorSharp.Memory.ResourceAccess.Read, SnapshotEnvelope(seq));
+                    try
+                    {
+                        using (SwapMetrics.Measure(KvSwapMetrics.Phase.Prefetch))
+                            if ((long)(b + 1) * _blockSize < available)
+                                lease.PendingPrefetch = _pool.Storage.TryPrefetch(seq.BlockTable.Blocks[b + 1].Id, SnapshotEnvelope(seq));
+                        return lease;
+                    }
+                    catch { lease.Dispose(); throw; }
+                });
+                if (restored < 0 || restored > available || (restored < available && restored % _blockSize != 0))
+                    throw new InvalidOperationException("Bulk KV restore returned an invalid prefix length.");
+                return restored;
+            }
             for (int b = 0; b < blocks; b++)
             {
                 int startToken = b * _blockSize;
@@ -2855,7 +2894,10 @@ namespace TensorSharp.Runtime.Scheduling
                 long expectedBytes = _model.ComputeKVBlockByteSize(tokensInBlock);
                 if (expectedBytes <= 0) break;
 
-                using var snapshot = _pool.Storage.Acquire(block.Id, TensorSharp.Memory.ResourceAccess.Read, SnapshotEnvelope(seq));
+                KvSnapshotLease acquired;
+                using (SwapMetrics.Measure(KvSwapMetrics.Phase.Acquire))
+                    acquired = _pool.Storage.Acquire(block.Id, TensorSharp.Memory.ResourceAccess.Read, SnapshotEnvelope(seq));
+                using var snapshot = acquired;
                 var src = snapshot.ReadOnlySpan;
                 if (src.Length < expectedBytes)
                 {
@@ -2868,10 +2910,16 @@ namespace TensorSharp.Runtime.Scheduling
                 // Best effort: overlap the next SSD page read with this model
                 // injection if a second resident page fits. Never evict demand
                 // data to prefetch, and join before any storage may be recycled.
-                var prefetch = b + 1 < blocks && startToken + tokensInBlock < tokensToInject
-                    ? _pool.Storage.TryPrefetch(seq.BlockTable.Blocks[b + 1].Id, SnapshotEnvelope(seq)) : null;
+                System.Threading.Tasks.Task<bool>? prefetch;
+                using (SwapMetrics.Measure(KvSwapMetrics.Phase.Prefetch))
+                    prefetch = b + 1 < blocks && startToken + tokensInBlock < tokensToInject
+                        ? _pool.Storage.TryPrefetch(seq.BlockTable.Blocks[b + 1].Id, SnapshotEnvelope(seq)) : null;
                 bool accepted;
-                try { accepted = _model.TryInjectKVBlock(startToken, tokensInBlock, slice); }
+                try
+                {
+                    using (SwapMetrics.Measure(KvSwapMetrics.Phase.Inject))
+                        accepted = _model.TryInjectKVBlock(startToken, tokensInBlock, slice);
+                }
                 finally { prefetch?.GetAwaiter().GetResult(); }
                 if (!accepted)
                 {
@@ -2965,6 +3013,9 @@ namespace TensorSharp.Runtime.Scheduling
             float[]? pendingLogits = seq.LastLogits != null ? (float[])seq.LastLogits.Clone() : null;
             float[]? lastLogits = null;
             int chunk = Math.Max(1, _scheduler.Config.MaxNumBatchedTokens);
+            chunk = Math.Min(chunk, _scheduler.Config.PrefillChunkTokenLimit);
+            if (_scheduler.Config.MemoryAdmission?.ExecutionShape is { } shape)
+                chunk = Math.Min(chunk, shape.MaximumPrefillTokens);
             int promptTokens = seq.PromptTokens.Count;
             while (start < target)
             {
@@ -3017,9 +3068,13 @@ namespace TensorSharp.Runtime.Scheduling
                 int startToken = b * _blockSize;
                 long bytes = _model.ComputeKVBlockByteSize(_blockSize);
                 var dst = CaptureScratch(checked((int)bytes));
-                if (!_model.TryExtractKVBlock(startToken, _blockSize, dst))
+                bool extracted;
+                using (SwapMetrics.Measure(KvSwapMetrics.Phase.Extract))
+                    extracted = _model.TryExtractKVBlock(startToken, _blockSize, dst);
+                if (!extracted)
                     break;
-                _pool.Storage.Store(block.Id, dst, SnapshotEnvelope(seq));
+                using (SwapMetrics.Measure(KvSwapMetrics.Phase.Store))
+                    _pool.Storage.Store(block.Id, dst, SnapshotEnvelope(seq));
                 block.Used = _blockSize;
                 block.HoldsSnapshotBytes = true;
                 block.IsRestorablePrefixEnd = !_model.RequiresPerBlockCapture

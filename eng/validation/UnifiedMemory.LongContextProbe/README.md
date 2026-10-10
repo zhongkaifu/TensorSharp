@@ -74,6 +74,31 @@ Interpret the recorded fields as follows:
   rendering is outside request timing, and OS file cache/clock frequency are not
   controlled. Repeat and reverse arm order before concluding a speed difference.
 
+For snapshot diagnosis set `TS_PROFILE_KV_SWAP=1`. `SwapTimings` aggregates
+ownership, extraction, storage, acquisition, prefetch and injection. Ownership
+includes nested work; bulk injection includes acquisition/prefetch, so these
+totals are not additive. `TS_DISABLE_BULK_KV_RESTORE=1` retains the old per-block
+restoration for an A/B control. Qualified Qwen35 hybrid restoration otherwise
+copies attention rows from every page and recurrent state only from the last
+accepted endpoint. A refused next page restores the preceding endpoint before
+returning; only one demand page is held, and best-effort prefetch still joins
+before releasing its lease. Other model implementations keep their existing
+contract. This optimization does not enable shared budgeting globally.
+
+`Samples[].Physical` records process/GC observations. Linux adds `/proc/self/status`,
+`smaps_rollup` and residency for mappings of the exact model path. Running samples
+include lightweight status counters; mapping/PSS detail is measured at phase
+boundaries. These observations overlap: do not add RSS, PSS, mapped pages, GC and
+allocation payloads together. `NativeAllocation` groups instrumented charges by
+rank/kind (0: lazy device copy, 1: preloaded weights, 2: graph/context buffer,
+3: native host staging), counting each payload once even with multiple constraint
+pools. Uninstrumented allocator/driver overhead is still outside the ledger.
+
+Under MPS, CUDA can return whole-device total with client-limited free memory.
+The probe therefore leaves `CudaDeviceUsedBytes` null and records the raw
+`CudaAvailability` instead. Whole-device occupancy requires independent NVML or
+`nvidia-smi` samples and includes server/other-client memory.
+
 The process installs one allocation adapter before model construction. Prefix
 caching, speculative/MTP execution and batched holders are explicitly disabled.
 Media, multi-rank snapshot restoration and unqualified models must not be counted
@@ -109,3 +134,36 @@ to a different first-touching group. See the kernel's
 and [v2 memory controller](https://docs.kernel.org/admin-guide/cgroup-v2.html)
 documentation. Record the actual enforcement and environment; never infer a
 physical-cap pass from a `MemoryBudget` capacity alone.
+
+## CUDA allocation hard-limit acceptance
+
+`../run-cuda-mps-limit.py` starts an isolated Linux MPS daemon with a unique pipe
+and log directory, using an exact GPU UUID. It never changes GPU compute mode,
+an existing daemon or a parent cgroup. Example (run both arms independently):
+
+```sh
+python eng/validation/run-cuda-mps-limit.py \
+  --gpu-uuid GPU-your-device-uuid --limit-mib 4096 \
+  --output artifacts/long-context/mps-candidate --timeout 1200 -- \
+  dotnet "$probe" --model /workspace/models/Qwen3.5-0.8B-Q8_0.gguf \
+  --json artifacts/long-context/mps-candidate.json --arm candidate \
+  --reference artifacts/long-context/mps-reference.json \
+  --context 32768 --prompt 28000 --steps 16 --width 2 --chunk 256 \
+  --host-bytes 8589934592 --device-bytes 8589934592 --ssd-bytes 17179869184
+```
+
+The external limit and logical device ledger are distinct. This example tests
+whether the workload actually completes under 4 GiB CUDA allocation enforcement;
+it does not prove the 8 GiB forecast ledger guarantees admission under every
+4 GiB placement. The wrapper confirms that a canary and the model process both
+connect to its server. The canary must allocate 1 MiB, receive CUDA out-of-memory
+for `limit + 16 MiB`, and release its context. It samples device occupancy
+independently, requires a zero model exit code and shuts down only its own daemon.
+Use a fresh evidence directory and pass the CUDA process directly (not a wrapper
+that spawns it). Missing MPS returns 77/unavailable/failed; a failed canary or model
+never falls back to unrestricted execution. The model command must perform its
+own output comparison and cleanup checks, as this probe does.
+
+This enforces **client CUDA allocations**, not whole-board VRAM, RAM, driver/server
+overhead, or combined RAM+VRAM. See NVIDIA's [MPS environment variables](https://docs.nvidia.com/deploy/mps/appendix-environment-variables.html)
+and [control interface](https://docs.nvidia.com/deploy/mps/appendix-tools-and-interface-reference.html).

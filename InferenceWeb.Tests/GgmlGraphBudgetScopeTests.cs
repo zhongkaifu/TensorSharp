@@ -208,6 +208,8 @@ public sealed class GgmlGraphBudgetScopeTests
             Assert.Equal(1, scope.ActiveAllocations);
             Assert.Equal(512, budget.Snapshot().Single(p => p.Pool == "shared").Committed);
             Assert.Equal(256, budget.Snapshot().Single(p => p.Pool == "gpu").Committed);
+            // Two constraints describe the same allocation, not 512 physical bytes.
+            Assert.Equal(256, Assert.Single(scope.AllocationUsage).CommittedBytes);
             Assert.Equal(IntPtr.Zero, native.Allocate(0, 1));
             Assert.Equal(1, scope.ActiveAllocations);
             Assert.Throws<InvalidOperationException>(() => scope.Dispose());
@@ -310,12 +312,17 @@ public sealed class GgmlGraphBudgetScopeTests
             Assert.Equal(1, scope.ActiveAllocations);
             Assert.Equal(1, native.ReserveHost(2048));
             Assert.Equal(1, scope.ActiveAllocations); // No second charge for reuse.
+            var usage = Assert.Single(scope.AllocationUsage);
+            Assert.Equal(3, usage.Kind);
+            Assert.Equal(4096, usage.CommittedBytes);
+            Assert.Equal(0, usage.PendingBytes);
             Assert.Equal(8192, budget.Snapshot().Single(p => p.Pool == "ram").Committed);
             Assert.Equal(0, budget.Snapshot().Single(p => p.Pool == "gpu").Committed);
             Assert.Throws<InvalidOperationException>(() => scope.Dispose());
             // Growing frees the old arena before reserving the replacement.
             Assert.Equal(0, native.ReserveHost(4097));
             Assert.Equal(0, scope.ActiveAllocations);
+            Assert.Empty(scope.AllocationUsage);
             Assert.Equal(4096, budget.Snapshot().Single(p => p.Pool == "ram").Committed);
             Assert.Equal(1, native.ReserveHost(4096));
             Assert.Null(scope.CallbackError);

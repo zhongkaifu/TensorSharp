@@ -33,7 +33,7 @@ namespace TensorSharp.Models
     /// (gate+up + down) or a Mixture-of-Experts SwiGLU (router + top-K SwiGLU experts +
     /// optional shared SwiGLU expert gated by sigmoid), depending on which weights are present.
     /// </summary>
-    public partial class Qwen35Model : ModelBase
+    public partial class Qwen35Model : ModelBase, TensorSharp.Runtime.Paged.IKvSnapshotBulkRestorer
     {
         private static long _nextVerifyOwnerId;
         private static readonly object _verifyTpPlanLock = new();
@@ -1457,6 +1457,10 @@ namespace TensorSharp.Models
         }
 
         public override bool TryInjectKVBlock(int destToken, int tokenCount, ReadOnlySpan<byte> source)
+            => TryInjectKvBlockCore(destToken, tokenCount, source, deferEndState: false, endStateOnly: false);
+
+        private bool TryInjectKvBlockCore(int destToken, int tokenCount, ReadOnlySpan<byte> source,
+            bool deferEndState, bool endStateOnly)
         {
             // A refusal must leave the model exactly as it was: callers treat a refused
             // block as the end of what the model holds and resume from there (an inject
@@ -1465,8 +1469,9 @@ namespace TensorSharp.Models
             // state of neither this block nor the one before it. Everything that can refuse
             // is therefore decided here, before the first write.
             if (!SupportsKVStateSnapshot) return false;
-            if (destToken < 0 || destToken != _cacheSeqLen || tokenCount <= 0) return false;
+            if (destToken < 0 || tokenCount <= 0) return false;
             long endToken = (long)destToken + tokenCount;
+            if (endStateOnly ? endToken != _cacheSeqLen : destToken != _cacheSeqLen) return false;
             if (endToken > _maxContextLength) return false;   // EnsureCacheCapacity would throw
             long expected = ComputeKVBlockByteSize(tokenCount);
             if (expected <= sizeof(int) || source.Length != expected) return false;
@@ -1519,6 +1524,12 @@ namespace TensorSharp.Models
             {
                 if (!_isRecurrent[l])
                 {
+                    if (endStateOnly)
+                    {
+                        offset += checked((int)(AttentionLayerBlockBytes(_kvCacheK[l], tokenCount)
+                            + AttentionLayerBlockBytes(_kvCacheV[l], tokenCount)));
+                        continue;
+                    }
                     if (!CopyAttentionIn(_kvCacheK[l], destToken, tokenCount, source[offset..], out int rK))
                         return false;
                     offset += rK;
@@ -1528,6 +1539,11 @@ namespace TensorSharp.Models
                 }
                 else
                 {
+                    if (deferEndState)
+                    {
+                        offset += checked((int)GdnLayerStateBytes(l));
+                        continue;
+                    }
                     if (!CopyGdnStateIn(l, source[offset..], out int rG))
                         return false;
                     offset += rG;

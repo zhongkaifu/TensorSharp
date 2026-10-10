@@ -8,6 +8,10 @@ using TensorSharp.Memory;
 
 namespace TensorSharp.GGML;
 
+/// <summary>Instrumented payload ownership, counted once even with multiple
+/// constraint pools. Pending bytes are reservations, not proven allocations.</summary>
+public sealed record GgmlAllocationUsage(int Rank, int Kind, int Allocations, long PendingBytes, long CommittedBytes);
+
 /// <summary>Opt-in, process-wide budget ownership for new GGML lazy device-copy
 /// and explicit-preload cache allocations. Install before those allocations exist.
 /// Each rank maps to one or more existing budget pools; listing RAM and GPU for
@@ -41,7 +45,14 @@ public sealed class GgmlCacheBudgetScope : IDisposable
     private readonly MemoryBudget _budget;
     private readonly string[][] _rankPools;
     private readonly string[] _hostPools;
-    private readonly Dictionary<ulong, BudgetReservation> _allocations = new();
+    private sealed class Allocation(BudgetReservation reservation, int rank, int kind, long bytes)
+    {
+        public readonly BudgetReservation Reservation = reservation;
+        public readonly int Rank = rank, Kind = kind;
+        public readonly long Bytes = bytes;
+        public bool Committed;
+    }
+    private readonly Dictionary<ulong, Allocation> _allocations = new();
     private GCHandle _handle;
     private ulong _nextToken;
     private Exception? _callbackError;
@@ -107,6 +118,18 @@ public sealed class GgmlCacheBudgetScope : IDisposable
     /// the unmanaged boundary. Ordinary quota rejection is not an error.</summary>
     public Exception? CallbackError { get { lock (_gate) return _callbackError; } }
     public int ActiveAllocations { get { lock (_gate) return _allocations.Count; } }
+    /// <summary>Kind 0: lazy device copies; 1: preloaded weights; 2: graph/context
+    /// buffers; 3: native host staging. Excludes uninstrumented driver/OS memory.</summary>
+    public IReadOnlyList<GgmlAllocationUsage> AllocationUsage
+    {
+        get
+        {
+            lock (_gate) return _allocations.Values.GroupBy(a => (a.Rank, a.Kind))
+                .Select(g => new GgmlAllocationUsage(g.Key.Rank, g.Key.Kind, g.Count(),
+                    g.Where(a => !a.Committed).Sum(a => a.Bytes), g.Where(a => a.Committed).Sum(a => a.Bytes)))
+                .OrderBy(a => a.Rank).ThenBy(a => a.Kind).ToArray();
+        }
+    }
     public bool IncludesGraphBuffers { get; }
     public bool IncludesHostBuffers => _hostPools.Length != 0;
 
@@ -180,7 +203,7 @@ public sealed class GgmlCacheBudgetScope : IDisposable
                     : owner._executionEnvelope.TryTake(charges);
                 if (reservation == null) return 0;
                 ulong token = checked(++owner._nextToken);
-                owner._allocations.Add(token, reservation);
+                owner._allocations.Add(token, new(reservation, rank, kind, bytes));
                 return token;
             }
             catch (Exception ex)
@@ -196,7 +219,13 @@ public sealed class GgmlCacheBudgetScope : IDisposable
         var owner = Owner(context);
         lock (owner._gate)
         {
-            try { owner._allocations[token].Commit(); return 1; }
+            try
+            {
+                var allocation = owner._allocations[token];
+                allocation.Reservation.Commit();
+                allocation.Committed = true;
+                return 1;
+            }
             catch (Exception ex) { owner._callbackError ??= ex; return 0; }
         }
     }
@@ -208,7 +237,7 @@ public sealed class GgmlCacheBudgetScope : IDisposable
             try
             {
                 if (!owner._allocations.TryGetValue(token, out var reservation)) return;
-                reservation.Dispose();
+                reservation.Reservation.Dispose();
                 owner._allocations.Remove(token);
             }
             catch (Exception ex) { owner._callbackError ??= ex; }

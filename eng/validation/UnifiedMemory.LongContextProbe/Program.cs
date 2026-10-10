@@ -39,18 +39,24 @@ var runningSamples = new List<object>();
 MemoryBudget? budget = null;
 AdaptiveModelSession? session = null;
 ModelBase? model = null;
-object? residency = null, afterDispose = null;
+object? residency = null, afterDispose = null, swapTimings = null;
 string? error = null;
 bool? parity = null;
 double wall = 0, loadSeconds = 0;
-long? DeviceUsed() => model != null && GgmlBasicOps.TryGetDeviceMemoryInfo(out long free, out long total) ? total - free : null;
+bool mpsClient = !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("CUDA_MPS_PIPE_DIRECTORY"));
+// Under an MPS allocation limit, CUDA may report board total but client-limited
+// free bytes. Their difference is NOT physical board occupancy.
+long? DeviceUsed() => !mpsClient && model != null && GgmlBasicOps.TryGetDeviceMemoryInfo(out long free, out long total) ? total - free : null;
+object? DeviceAvailability() => model != null && GgmlBasicOps.TryGetDeviceMemoryInfo(out long free, out long total)
+    ? new { ReportedFreeBytes = free, ReportedTotalBytes = total, MpsClient = mpsClient } : null;
 void Sample(string phase)
 {
     using var process = Process.GetCurrentProcess();
     samples.Add(new { Phase = phase, UnixMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
         WorkingSetBytes = process.WorkingSet64, PeakWorkingSetBytes = process.PeakWorkingSet64,
-        CudaDeviceUsedBytes = DeviceUsed(),
+        CudaDeviceUsedBytes = DeviceUsed(), CudaAvailability = DeviceAvailability(),
         ManagedBytes = GC.GetTotalMemory(false), Budget = budget?.Snapshot(),
+        Physical = PhysicalMemory.Capture(path), NativeAllocation = session?.NativeAllocationUsage,
         HostAllocation = session == null ? null : (object)new { session.HostAllocationUsage.Bytes, session.HostAllocationUsage.PeakBytes, session.HostAllocationUsage.Allocations } });
     Console.WriteLine($"PHASE {phase} {DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}");
 }
@@ -133,7 +139,9 @@ try
             using var process = Process.GetCurrentProcess();
             runningSamples.Add(new { UnixMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
                 Running = engine.RunningCount, Waiting = engine.WaitingCount, Budget = budget?.Snapshot(),
-                WorkingSetBytes = process.WorkingSet64, CudaDeviceUsedBytes = DeviceUsed() });
+                WorkingSetBytes = process.WorkingSet64, CudaDeviceUsedBytes = DeviceUsed(),
+                HostStatusBytes = PhysicalMemory.LinuxStatus(), ManagedLiveBytes = GC.GetTotalMemory(false),
+                NativeAllocation = session?.NativeAllocationUsage });
             await Task.WhenAny(pending, Task.Delay(100));
         }
         var results = await pending;
@@ -155,6 +163,7 @@ try
                 throw new InvalidOperationException($"Incomplete/empty request {i}: {r.Status}/{r.FinishReason}.");
         }
         residency = engine.SnapshotResidencyStats;
+        swapTimings = engine.SnapshotSwapTimings;
     }
     Sample("engine-disposed");
     if (o.TryGetValue("--reference", out var referencePath))
@@ -197,7 +206,8 @@ var native = Process.GetCurrentProcess().Modules.Cast<ProcessModule>().Where(m =
 await File.WriteAllTextAsync(output, JsonSerializer.Serialize(new { Passed = error == null, Error = error, Arm = arm,
     Model = path, ModelSha256 = modelHash, ContextTokens = context, MinimumPromptTokens = promptLength, Steps = steps, Width = width, ChunkTokens = chunk,
     MaximumRunningRequests = maxRunning, PrefillChunkLimitEnforced = true,
-    LoadSeconds = loadSeconds, WallSeconds = wall, TokenParity = parity, Requests = requests, RequestPeaks = peaks, Samples = samples,
+    BulkRestoreEnabled = Environment.GetEnvironmentVariable("TS_DISABLE_BULK_KV_RESTORE") != "1",
+    LoadSeconds = loadSeconds, WallSeconds = wall, TokenParity = parity, Requests = requests, RequestPeaks = peaks, Samples = samples, SwapTimings = swapTimings,
     Residency = residency, RunningSamples = runningSamples, HighWatermarks = budget?.HighWatermarks(), AfterDispose = afterDispose,
     Native = native, GgmlRevision = Environment.GetEnvironmentVariable("TS_VALIDATION_GGML_REVISION"),
     Managed = new[] { typeof(ModelBase).Assembly.Location, typeof(InferenceEngine).Assembly.Location, typeof(MemoryBudget).Assembly.Location,

@@ -108,6 +108,7 @@ public sealed class AdaptiveModelSession : IDisposable
     public InferenceMemoryPlan Plan { get; }
     public Exception? AccountingError => _nativeBudget.CallbackError;
     public (long Bytes, long PeakBytes, int Allocations) HostAllocationUsage => _hostBudget.Usage;
+    public IReadOnlyList<GgmlAllocationUsage> NativeAllocationUsage => _nativeBudget.AllocationUsage;
 
     public static AdaptiveModelSession Create(string path, AdaptiveModelMemoryOptions options)
         => CreateCore(path, options, null);
@@ -365,12 +366,17 @@ public sealed class AdaptiveModelSession : IDisposable
     private static InferenceMemoryPool[] Pools(InferenceHardwareMemory hw, MemoryBudget budget, AdaptiveModelMemoryOptions o, bool sharedBudget = false)
     {
         var snapshots = budget.Snapshot().ToDictionary(p => p.Pool);
+        long hostCeiling = sharedBudget ? Math.Min(o.MaximumHostBytes, snapshots[HostPool].Capacity) : o.MaximumHostBytes;
+        long deviceCeiling = sharedBudget ? Math.Min(o.MaximumDeviceBytes, snapshots[DevicePool].Capacity) : o.MaximumDeviceBytes;
+        // A small partition/quota on a large machine must not inherit headroom
+        // proportional to the whole machine. Availability still independently
+        // constrains the plan; explicit operator headroom always takes priority.
         return
         [
-            new(HostPool, hw.HostTotal, hw.HostAvailable, o.HostHeadroomBytes ?? Math.Max(512L << 20, hw.HostTotal / 16),
-                snapshots[HostPool], sharedBudget ? Math.Min(o.MaximumHostBytes, snapshots[HostPool].Capacity) : o.MaximumHostBytes),
-            new(DevicePool, hw.DeviceTotal, hw.DeviceAvailable, o.DeviceHeadroomBytes ?? GpuMemoryBudget.ResolveHeadroomBytes(hw.DeviceTotal),
-                snapshots[DevicePool], sharedBudget ? Math.Min(o.MaximumDeviceBytes, snapshots[DevicePool].Capacity) : o.MaximumDeviceBytes)
+            new(HostPool, hw.HostTotal, hw.HostAvailable, o.HostHeadroomBytes ?? Math.Max(512L << 20, Math.Min(hw.HostTotal, hostCeiling) / 16),
+                snapshots[HostPool], hostCeiling),
+            new(DevicePool, hw.DeviceTotal, hw.DeviceAvailable, o.DeviceHeadroomBytes ?? GpuMemoryBudget.ResolveHeadroomBytes(Math.Min(hw.DeviceTotal, deviceCeiling)),
+                snapshots[DevicePool], deviceCeiling)
         ];
     }
 
