@@ -1930,7 +1930,8 @@ CUDA，必须判失败。该负例的 canary成功、模型连接false、整体e
 MPS 的 CUDA查询可能同时返回整卡 total 和客户端受限 free；直接相减会错误
 显示约44 GiB占用。probe已在MPS下将该占用字段置空，保留原始可用量，使用
 独立 `nvidia-smi` 采样记录整卡占用。旧 `final-mps-*` 的该字段不可使用，
-以 `measured-mps-*` 为准。当前 VM 新建8 GiB RAM cgroup仍返回EPERM/exit77，
+以 `measured-mps-*` 为准。当前 VM 新建8 GiB RAM cgroup仍返回PermissionError
+（本次为EACCES）/exit77，
 `enforcement=unavailable, passed=false`，未启动无限制替代。
 
 Windows最终回归 **424通过/7跳过**，Linux **425通过/6跳过**。新增真实 A40
