@@ -47,6 +47,8 @@ internal sealed class QwenImage21LoraSet : IDisposable
     // the managed kernels: it must not reach the native library whatever the process-global
     // NativeDequant route says.
     private bool _managedDequant;
+    private QwenImage21LoraRecipe _checkpointRecipe;
+    private string _checkpointNote;
 
     /// <summary>The sampling recipe of the plug-in that carries one, or null.</summary>
     internal QwenImage21LoraRecipe Recipe { get; private set; }
@@ -94,11 +96,19 @@ internal sealed class QwenImage21LoraSet : IDisposable
     /// Load <paramref name="specs"/> against the transformer GGUF <paramref name="dit"/>
     /// (tensor names prefixed by <paramref name="prefix"/>). <paramref name="ranks"/> is the
     /// tensor-parallel degree the transformer will shard over (1 = one device).
+    /// <paramref name="checkpointRecipe"/> is the transformer's own sampling recipe (Turbo's,
+    /// how it was identified in <paramref name="checkpointNote"/>), with which a plug-in that
+    /// carries a recipe of its own is refused before its tensors are read.
     /// </summary>
     internal static QwenImage21LoraSet Load(IReadOnlyList<LoraSpec> specs, GgufFile dit, string prefix,
-        BackendType backend, int ranks)
+        BackendType backend, int ranks, QwenImage21LoraRecipe checkpointRecipe = null, string checkpointNote = null)
     {
-        var set = new QwenImage21LoraSet { _managedDequant = backend == BackendType.Cpu };
+        var set = new QwenImage21LoraSet
+        {
+            _managedDequant = backend == BackendType.Cpu,
+            _checkpointRecipe = checkpointRecipe,
+            _checkpointNote = checkpointNote,
+        };
         try
         {
             var lines = new List<string>();
@@ -187,6 +197,12 @@ internal sealed class QwenImage21LoraSet : IDisposable
 
         if (config?.Recipe != null)
         {
+            if (_checkpointRecipe != null)
+                throw new ArgumentException(
+                    $"LoRA '{file}' carries a sampling recipe ({Path.GetFileName(config.Recipe.Source)}): it is a step-distillation " +
+                    $"plug-in, and this transformer is Qwen-Image-2.1-Turbo ({_checkpointNote}), which is step-distilled already and " +
+                    "samples on its own 8-step schedule. The two schedules cannot both apply; use the plug-in with the base " +
+                    "Qwen-Image-2.1 checkpoint, or Turbo without it.");
             if (Recipe != null)
                 throw new ArgumentException(
                     $"Two LoRA plug-ins define a sampling recipe ({Recipe.Source} and {config.Recipe.Source}). A step-distilled " +

@@ -8,6 +8,8 @@
 // TensorSharp is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 
+using TensorSharp.Runtime;
+
 namespace TensorAgent.Core.Catalog;
 
 /// <summary>
@@ -55,9 +57,10 @@ public static class DiffusionCompanions
     ];
 
     /// <summary>
-    /// Publish <paramref name="model"/>'s installed companions and clear the rest.
-    /// Returns what was set, variable to path, so the caller can log it — a startup line
-    /// naming the files is the only place a user can see which copies are being used.
+    /// Publish <paramref name="model"/>'s installed companions and, for a Qwen-Image entry, its
+    /// checkpoint variant, and clear the rest. Returns what was set, variable to path (or to
+    /// the variant), so the caller can log it — a startup line naming the files is the only
+    /// place a user can see which copies are being used.
     /// </summary>
     /// <param name="model">The selected entry, or null when nothing is selected.</param>
     /// <param name="store">Where this installation keeps its models.</param>
@@ -78,6 +81,13 @@ public static class DiffusionCompanions
             if (path is not null)
                 published[group.Key] = path;
         }
+        // Which checkpoint a Qwen-Image entry's weights are (CatalogModel.ImageVariant): the
+        // GGUF cannot say, and without it the engine guesses from the file name. Written for
+        // both variants, so a Turbo declaration never outlives its selection.
+        string? variant = model?.Family == CatalogFamily.QwenImage ? QwenImageVariantFlag.Name(model.ImageVariant) : null;
+        Environment.SetEnvironmentVariable(QwenImageVariantFlag.EnvironmentVariable, variant);
+        if (variant is not null)
+            published[QwenImageVariantFlag.EnvironmentVariable] = variant;
         return published;
     }
 

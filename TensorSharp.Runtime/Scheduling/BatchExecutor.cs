@@ -2437,7 +2437,7 @@ namespace TensorSharp.Runtime.Scheduling
                     bool retained = cleanFinish && RadixCache.RetainFinished(seq, primary);
                     if (_cbDebug)
                         Console.Error.WriteLine($"[cb] release {requestId} status={seq.Status} computed={seq.NumComputedTokens}/{seq.NumTotalTokens} " +
-                            $"primary={primary} retained={retained}");
+                            $"primary={primary} retained={retained} prefixCache=[{RadixCache.Tree.Cached}] poolSlabBytes={_pool.Storage.AllocatedBytes}");
                     if (retained && primary)
                     {
                         _liveCacheValid = false;
@@ -2752,7 +2752,13 @@ namespace TensorSharp.Runtime.Scheduling
                 if (_model.RequiresPerBlockCapture && block.Used == tokensInBlock)
                     continue;
 
-                long expectedBytes = _model.ComputeKVBlockByteSize(tokensInBlock);
+                // The model's running state is the state at tokensInModel, so on a
+                // recurrent model only the block ending there can carry it; any other
+                // full block captured here (one CaptureNewlyFullBlocks never took) holds
+                // its K/V rows only and is not a restore point.
+                bool restorable = !_model.RequiresPerBlockCapture
+                    || startToken + tokensInBlock == tokensInModel;
+                long expectedBytes = SnapshotByteSize(tokensInBlock, restorable);
                 if (expectedBytes <= 0) break;
 
                 EnsureScratch((int)expectedBytes);
@@ -2774,12 +2780,58 @@ namespace TensorSharp.Runtime.Scheduling
                 // we use the full-block byte size (so partial-block layout is
                 // not confused with full-block layout). For the trailing
                 // partial block we use the partial-byte size; the storage slab
-                // is sized for one full block so partial fits.
-                var slab = _pool.Storage.GetSpan(block.Id);
+                // is sized for one full block so partial fits. A recurrent model's
+                // full block is allocated at exactly the length written (SlabFor).
+                var slab = SlabFor(block, tokensInBlock, (int)expectedBytes);
                 dst.CopyTo(slab);
                 block.Used = tokensInBlock;
                 block.HoldsSnapshotBytes = tokensInBlock == _blockSize;
+                if (_model.RequiresPerBlockCapture && tokensInBlock == _blockSize)
+                    block.IsRestorablePrefixEnd = restorable;
             }
+        }
+
+        /// <summary>
+        /// Bytes of one block snapshot of <paramref name="tokensInBlock"/> tokens. A
+        /// per-block-capture (recurrent) model carries its running state only in a block
+        /// that is a restore point (<paramref name="withRecurrentState"/>): the state copied
+        /// into any other block is never read (a resume only ever lands on a restorable
+        /// block, <see cref="LastRestorableInjectedLength"/>), and on Nemotron-H 8B it is
+        /// ~99 MiB a block against ~4 MiB of K/V. Every other family writes the full block,
+        /// exactly as before.
+        /// </summary>
+        private long SnapshotByteSize(int tokensInBlock, bool withRecurrentState)
+        {
+            long full = _model.ComputeKVBlockByteSize(tokensInBlock);
+            if (withRecurrentState || !_model.RequiresPerBlockCapture || full <= 0)
+                return full;
+            long kvOnly = _model.ComputeKVBlockByteSizeWithoutRecurrentState(tokensInBlock);
+            return kvOnly > 0 && kvOnly < full ? kvOnly : full;
+        }
+
+        /// <summary>The pool slab a snapshot of <paramref name="bytes"/> is written into: the
+        /// full-size slab as always, or for a per-block-capture model's FULL block one of
+        /// exactly <paramref name="bytes"/>, so a K/V-only block holds (and is charged) only
+        /// that. A trailing partial block keeps the full-size slab: it always carries the
+        /// state, is re-extracted at a new length on every swap-out, and is never a page,
+        /// so an exact-length slab would only reallocate the ~99 MiB state section each time.</summary>
+        private Span<byte> SlabFor(KvBlock block, int tokensInBlock, int bytes)
+            => _model.RequiresPerBlockCapture && tokensInBlock == _blockSize
+                ? _pool.Storage.GetSpan(block.Id, bytes)
+                : _pool.Storage.GetSpan(block.Id);
+
+        /// <summary>The bytes a per-block-capture model injects from a slab of
+        /// <paramref name="slabLength"/> bytes holding <paramref name="tokensInBlock"/> tokens:
+        /// the <paramref name="full"/> snapshot (for a partial block, the leading bytes of its
+        /// full-size slab; see <see cref="SlabFor"/>), or for a full block its K/V-only form
+        /// (which restores the K/V rows and leaves the running state as the blocks before it
+        /// left it). 0 when the slab holds neither.</summary>
+        private long RecurrentInjectByteSize(int tokensInBlock, int slabLength, long full)
+        {
+            if (slabLength == full) return full;
+            if (tokensInBlock != _blockSize) return slabLength > full ? full : 0;
+            long kvOnly = _model.ComputeKVBlockByteSizeWithoutRecurrentState(tokensInBlock);
+            return kvOnly > 0 && slabLength == kvOnly ? kvOnly : 0;
         }
 
         /// <summary>Inject all blocks for <paramref name="seq"/> into the model's
@@ -2823,6 +2875,19 @@ namespace TensorSharp.Runtime.Scheduling
                 if (expectedBytes <= 0) break;
 
                 var src = _pool.Storage.GetReadOnlySpan(block.Id);
+                if (_model.RequiresPerBlockCapture)
+                {
+                    // A recurrent model's full block is either form; the slab length says which.
+                    expectedBytes = RecurrentInjectByteSize(tokensInBlock, src.Length, expectedBytes);
+                    if (expectedBytes <= 0)
+                    {
+                        _logger.LogWarning(
+                            "Inject found a block snapshot of neither known size for sequence {RequestId} block {Block}: have {Have} bytes",
+                            seq.RequestId, b, src.Length);
+                        break;
+                    }
+                }
+
                 if (src.Length < expectedBytes)
                 {
                     _logger.LogWarning(
@@ -2863,7 +2928,7 @@ namespace TensorSharp.Runtime.Scheduling
         private void InjectPrefixOrRecompute(SequenceState seq, int tokens)
         {
             int injected = InjectAllBlocks(seq, tokens);
-            if (injected >= tokens)
+            if (injected >= tokens && EndsAtRestorablePoint(seq, injected))
                 return;
 
             int usable = LastRestorableInjectedLength(seq, injected);
@@ -2902,12 +2967,32 @@ namespace TensorSharp.Runtime.Scheduling
             if (injected <= 0 || !_model.RequiresPerBlockCapture)
                 return Math.Max(0, injected);
             // A shortfall always stops at a block start, so every injected block is full.
+            // (A complete inject that ended on a block with no state - see
+            // EndsAtRestorablePoint - is block-aligned too.)
             for (int b = injected / _blockSize - 1; b >= 0; b--)
             {
                 if (seq.BlockTable.Blocks[b].IsRestorablePrefixEnd)
                     return (b + 1) * _blockSize;
             }
             return 0;
+        }
+
+        /// <summary>
+        /// Whether the model holds a resumable state after injecting <paramref name="injected"/>
+        /// tokens of <paramref name="seq"/>. Always for an attention-only model. A
+        /// per-block-capture model restores its running state from the last injected block,
+        /// which is right only when that block was captured at its own end: a trailing
+        /// partial block (extracted at the owner's current end, state included) or a full
+        /// block marked <see cref="KvBlock.IsRestorablePrefixEnd"/>. Any other full block
+        /// holds K/V rows only (or, before K/V-only blocks existed, the state of a later
+        /// position), so a complete inject ending on one is no resume point either.
+        /// </summary>
+        private bool EndsAtRestorablePoint(SequenceState seq, int injected)
+        {
+            if (!_model.RequiresPerBlockCapture || injected <= 0 || injected % _blockSize != 0)
+                return true;
+            int last = injected / _blockSize - 1;
+            return last < seq.BlockTable.NumBlocks && seq.BlockTable.Blocks[last].IsRestorablePrefixEnd;
         }
 
         /// <summary>Forward <paramref name="seq"/>'s tokens from its (just revoked)
@@ -2973,18 +3058,26 @@ namespace TensorSharp.Runtime.Scheduling
                 if (block.Used == _blockSize) continue; // already captured
 
                 int startToken = b * _blockSize;
-                long bytes = _model.ComputeKVBlockByteSize(_blockSize);
+                // Decided BEFORE extracting: a recurrent model's running state is the
+                // state at NumComputedTokens, so it belongs to (and is only copied into)
+                // the block ending exactly there. Every other block takes its K/V rows
+                // only (SnapshotByteSize).
+                bool restorable = !_model.RequiresPerBlockCapture
+                    || (b == fullBlocksNow - 1 && seq.NumComputedTokens % _blockSize == 0);
+                long bytes = SnapshotByteSize(_blockSize, restorable);
                 EnsureScratch((int)bytes);
                 var dst = _scratch.AsSpan(0, (int)bytes);
                 if (!_model.TryExtractKVBlock(startToken, _blockSize, dst))
                     break;
-                dst.CopyTo(_pool.Storage.GetSpan(block.Id));
+                dst.CopyTo(SlabFor(block, _blockSize, (int)bytes));
                 block.Used = _blockSize;
                 block.HoldsSnapshotBytes = true;
-                block.IsRestorablePrefixEnd = !_model.RequiresPerBlockCapture
-                    || (b == fullBlocksNow - 1 && seq.NumComputedTokens % _blockSize == 0);
+                block.IsRestorablePrefixEnd = restorable;
                 captured++;
                 if (b < previouslyFull) previouslyFull = b;
+                // Inside the reply only the newest restore point keeps its state.
+                if (restorable && _model.RequiresPerBlockCapture && (b + 1) * _blockSize > seq.PromptTokens.Count)
+                    HoldDecodeRestorePoint(seq, b);
             }
 
             // Let the scheduler index the newly-full blocks (hash registration).
@@ -2992,6 +3085,40 @@ namespace TensorSharp.Runtime.Scheduling
                 _scheduler.OnBlocksCommitted(seq, previouslyFull * _blockSize);
 
             return captured;
+        }
+
+        /// <summary>
+        /// Make block <paramref name="blockIndex"/> - a restore point inside the generated text,
+        /// just captured with the running state - the sequence's held decode restore point
+        /// (<see cref="SequenceState.HeldDecodeRestoreBlock"/>), and rewrite the one it replaces
+        /// as K/V rows only. Decode fills a block every block-size tokens and every one ends at
+        /// the forward that filled it, so without this each became a restore point:
+        /// a 2,000-token reply on Nemotron-H 8B left ~790 MiB of Mamba2 state in the prefix
+        /// cache, of which a later turn can use one block at most (the last restore point
+        /// before it diverges from the reply; a continuation of the whole reply takes the end
+        /// state). The block replaced is still this sequence's alone - the prefix cache takes
+        /// held blocks only once the sequence stops - and the model still holds its rows, as
+        /// the sequence that just forwarded is the owner. Otherwise it keeps its state.
+        /// </summary>
+        private void HoldDecodeRestorePoint(SequenceState seq, int blockIndex)
+        {
+            int previous = seq.HeldDecodeRestoreBlock;
+            seq.HeldDecodeRestoreBlock = blockIndex;
+            if (previous < 0 || previous >= blockIndex || previous >= seq.BlockTable.NumBlocks)
+                return;
+            KvBlock block = seq.BlockTable.Blocks[previous];
+            if (!block.IsRestorablePrefixEnd || block.RefCount != 1 || !block.HoldsSnapshotBytes
+                || (RadixCache != null && RadixCache.Tree.TryGetBlockOwner(block, out _)))
+                return;
+            long bytes = SnapshotByteSize(_blockSize, withRecurrentState: false);
+            if (bytes <= 0 || bytes >= _pool.Storage.SlabLength(block.Id))
+                return;
+            EnsureScratch((int)bytes);
+            var dst = _scratch.AsSpan(0, (int)bytes);
+            if (!_model.TryExtractKVBlock(previous * _blockSize, _blockSize, dst))
+                return;
+            dst.CopyTo(SlabFor(block, _blockSize, (int)bytes));
+            block.IsRestorablePrefixEnd = false;
         }
 
         /// <summary>

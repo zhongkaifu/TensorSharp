@@ -21,6 +21,7 @@ internal sealed partial class PrefixCacheCoordinator
         public bool HoldsSnapshotBytes(KvBlock block) => block.HoldsSnapshotBytes;
         public int UsedTokens(KvBlock block) => block.Used;
         public int RefCount(KvBlock block) => block.RefCount;
+        public long SnapshotByteLength(KvBlock block) => pool.Storage.SlabLength(block.Id);
     }
 
     internal void CapturePages(SequenceState seq)
@@ -36,6 +37,10 @@ internal sealed partial class PrefixCacheCoordinator
         length = PromptMediaSpans.ClampReusablePrefix(length, seq.MediaSpans, seq.MediaSpans,
             _tree.Caps.ReuseAcrossMediaSpan);
         int count = Math.Min(length / blockSize, seq.BlockTable.NumBlocks);
+        // A decode restore point stays out until the sequence stops: the next one replaces
+        // it, and a cached page is immutable (SequenceState.HeldDecodeRestoreBlock).
+        if (seq.HeldDecodeRestoreBlock >= 0)
+            count = Math.Min(count, seq.HeldDecodeRestoreBlock);
         if (count == 0) return;
 
         var pages = new List<PageRef>(count);

@@ -183,6 +183,10 @@ class StreamState:
         if self.protocol == "webui":
             self.append("content", event.get("token"), elapsed)
             self.append("reasoning", event.get("thinking"), elapsed)
+            # The whole answer, when text the page showed proved to be reasoning (or a
+            # DiffusionGemma canvas): what is sent back next turn is what remains.
+            if isinstance(event.get("replace"), str):
+                self.content = event["replace"]
             if event.get("tool_calls"):
                 self.errors.append("Unexpected model tool call in prose benchmark")
             if event.get("done"):

@@ -597,10 +597,13 @@ namespace TensorSharp.Cli
                     "a value above 1 adds the negative-prompt pass); the model's own for video.",
                     "--cfg 4"),
                 new OptionHelp("--diffusion-steps <N>",
-                    "Denoising steps. Range: >= 1. Default: 48 for DiffusionGemma, 40 for Qwen-Image-2.1.",
+                    "Denoising steps. Range: >= 1. Default: 48 for DiffusionGemma, 40 for Qwen-Image-2.1 (8, the only count it takes, for " +
+                    "Qwen-Image-2.1-Turbo; a LoRA plug-in's recipe sets its own).",
                     "--diffusion-steps 20"),
                 new OptionHelp("--diffusion-seed <N>",
-                    "Random seed for the diffusion sampler. Default: 0.",
+                    "Random seed for the diffusion sampler. Default: 0. A Qwen-Image-2.1 edit's noise also depends " +
+                    "on its --image pictures, so editing a picture at the seed it was drawn with does not restart " +
+                    "from its own noise (TS_QWEN21_EDIT_NOISE=seed draws edits from the seed alone).",
                     "--diffusion-seed 7"),
                 new OptionHelp("--diffusion-blocks <N>",
                     "DiffusionGemma only: number of generation blocks. Default: 0 — derived from --max-tokens and " +
@@ -621,6 +624,13 @@ namespace TensorSharp.Cli
                 new OptionHelp("--qwen-image-mmproj <path>",
                     "Qwen3-VL-8B vision projector GGUF, required for image editing. Default: same-directory scan.",
                     "--qwen-image-mmproj mmproj-Qwen3VL-8B-Instruct-F16.gguf"),
+                new OptionHelp("--qwen-image-variant <base|turbo>",
+                    "Which Qwen-Image-2.1 checkpoint the DiT GGUF holds: base or turbo. The GGUFs carry no metadata and Turbo has the " +
+                    "base tensors, so a host declares it; turbo samples Qwen-Image-2.1-Turbo's published 8-step schedule at CFG 1 " +
+                    "by default, refuses other step counts and refuses step-distillation LoRA plug-ins. Default: none - a file " +
+                    "name with the word turbo is assumed to be Turbo (the load says so), any other is base. Refused with " +
+                    "another model.",
+                    "--qwen-image-variant turbo"),
                 new OptionHelp("--mask <file>",
                     "Qwen-Image-2.1 local edit mask, matching the first --image dimensions. Unselected pixels and output size are preserved. Default: none.",
                     "--image photo.png --mask selection.png"),
@@ -639,6 +649,12 @@ namespace TensorSharp.Cli
                 new OptionHelp("--mask-crop-padding <pixels>",
                     "Context around the selected crop, in source pixels (0-16384). Default: 64.",
                     "--mask-crop-padding 96"),
+                new OptionHelp("--keep-source-size",
+                    "Qwen-Image-2.1 edit: return the first --image's exact width and height, so an edit of an edit keeps " +
+                    "its size. Sampling uses about the image's own area, at least 1 megapixel and at most the automatic " +
+                    "area, at about its aspect ratio, and the result is resized to the source. Cannot be combined with --width/--height. Masked " +
+                    "edits keep the source size without it. Default: off (the automatic size).",
+                    "--image photo.png --keep-source-size"),
                 new OptionHelp("--lora <path>",
                     "Qwen-Image-2.1 LoRA plug-in: a LoRA .safetensors (diffusers/PEFT, ComfyUI, kohya, DiffSynth, DoRA or " +
                     "VideoX-Fun PDD format) or a TensorSharp plug-in config .json from config/lora/ (downloads its weights on " +

@@ -10,20 +10,28 @@ using System.Runtime.CompilerServices;
 namespace TensorSharp.Runtime.Paged
 {
     /// <summary>
-    /// Physical byte storage for the paged KV pool: <c>numBlocks</c> slabs of
-    /// <c>blockByteSize</c> bytes each. Indexed by <see cref="KvBlock.Id"/>.
+    /// Physical byte storage for the paged KV pool: up to <c>numBlocks</c> slabs of at
+    /// most <c>blockByteSize</c> bytes each. Indexed by <see cref="KvBlock.Id"/>.
     ///
     /// The block layout is whatever the model's <c>TryExtractKVBlock</c>
-    /// produces - this class just owns the bytes and a sticky "dirty" flag per
-    /// slot. Storage is in managed memory; for the GGML/CUDA path the bytes are
-    /// shuttled into device-resident KV tensors by the model layer at
-    /// inject time.
+    /// produces - this class just owns the bytes. Storage is in managed memory; for
+    /// the GGML/CUDA path the bytes are shuttled into device-resident KV tensors by
+    /// the model layer at inject time.
+    ///
+    /// <para>A slab is normally the full <see cref="BlockByteSize"/>. A per-block-capture
+    /// (recurrent) model writes most of its blocks in a smaller K/V-only form
+    /// (<c>IModelArchitecture.ComputeKVBlockByteSizeWithoutRecurrentState</c>): such a
+    /// slab is allocated at exactly the length written (<see cref="GetSpan(int, int)"/>),
+    /// and <see cref="GetReadOnlySpan"/> returns that real length, which is how a reader
+    /// tells the two forms apart. <see cref="AllocatedBytes"/> is what the slabs actually
+    /// hold; <see cref="ReservedBytes"/> the worst case if every block held a full one.</para>
     /// </summary>
     public sealed class PagedKvStorage : IDisposable
     {
         private readonly byte[]?[] _slabs;
         private readonly long _blockByteSize;
         private readonly int _numBlocks;
+        private long _allocatedBytes;
         private bool _disposed;
 
         public PagedKvStorage(int numBlocks, long blockByteSize)
@@ -46,23 +54,60 @@ namespace TensorSharp.Runtime.Paged
         }
 
         public int NumBlocks => _numBlocks;
+
+        /// <summary>The full (largest) slab size: one block of every layer's K/V and,
+        /// for a recurrent model, its running state.</summary>
         public long BlockByteSize => _blockByteSize;
+
+        /// <summary>Upper bound: every block holding a full slab.</summary>
         public long ReservedBytes => (long)_numBlocks * _blockByteSize;
 
-        /// <summary>Get a writable span for block <paramref name="blockId"/>. Allocates
-        /// the slab on first access. The returned span is exactly <see cref="BlockByteSize"/>
-        /// long.</summary>
+        /// <summary>Bytes the allocated slabs actually hold right now.</summary>
+        public long AllocatedBytes => _allocatedBytes;
+
+        /// <summary>Get a writable full-size span for block <paramref name="blockId"/>.
+        /// Allocates the slab on first access, and replaces a shorter slab written in the
+        /// K/V-only form. The returned span is exactly <see cref="BlockByteSize"/> long.</summary>
         public Span<byte> GetSpan(int blockId)
         {
-            EnsureSlab(blockId);
-            return _slabs[blockId].AsSpan();
+            CheckId(blockId);
+            byte[]? slab = _slabs[blockId];
+            if (slab == null || slab.LongLength != _blockByteSize)
+                slab = Replace(blockId, _blockByteSize);
+            return slab.AsSpan();
         }
 
-        /// <summary>Read-only view of block <paramref name="blockId"/>.</summary>
+        /// <summary>Get a writable span of exactly <paramref name="length"/> bytes for block
+        /// <paramref name="blockId"/>, (re)allocating the slab at that length when it is
+        /// missing or of another length. <paramref name="length"/> is at most
+        /// <see cref="BlockByteSize"/>.</summary>
+        public Span<byte> GetSpan(int blockId, int length)
+        {
+            CheckId(blockId);
+            if (length < 0 || length > _blockByteSize)
+                throw new ArgumentOutOfRangeException(nameof(length),
+                    $"Slab length {length} is outside [0,{_blockByteSize}].");
+            byte[]? slab = _slabs[blockId];
+            if (slab == null || slab.Length != length)
+                slab = Replace(blockId, length);
+            return slab.AsSpan();
+        }
+
+        /// <summary>Read-only view of block <paramref name="blockId"/>, at the length it was
+        /// written with (a never-written block reads as a zeroed full-size slab).</summary>
         public ReadOnlySpan<byte> GetReadOnlySpan(int blockId)
         {
-            EnsureSlab(blockId);
-            return _slabs[blockId].AsSpan();
+            CheckId(blockId);
+            byte[]? slab = _slabs[blockId] ?? Replace(blockId, _blockByteSize);
+            return slab.AsSpan();
+        }
+
+        /// <summary>Bytes block <paramref name="blockId"/>'s slab holds; 0 when none is
+        /// allocated.</summary>
+        public long SlabLength(int blockId)
+        {
+            if ((uint)blockId >= (uint)_numBlocks) return 0;
+            return _slabs[blockId]?.LongLength ?? 0;
         }
 
         /// <summary>Drop the slab for block <paramref name="blockId"/> back to the GC.
@@ -71,16 +116,27 @@ namespace TensorSharp.Runtime.Paged
         public void ReleaseSlab(int blockId)
         {
             if ((uint)blockId >= (uint)_numBlocks) return;
+            byte[]? slab = _slabs[blockId];
+            if (slab == null) return;
+            _allocatedBytes -= slab.LongLength;
             _slabs[blockId] = null;
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private void EnsureSlab(int blockId)
+        private void CheckId(int blockId)
         {
             if ((uint)blockId >= (uint)_numBlocks)
                 throw new ArgumentOutOfRangeException(nameof(blockId), $"Block id {blockId} out of range [0,{_numBlocks}).");
-            if (_slabs[blockId] == null)
-                _slabs[blockId] = new byte[_blockByteSize];
+        }
+
+        private byte[] Replace(int blockId, long length)
+        {
+            byte[]? old = _slabs[blockId];
+            if (old != null) _allocatedBytes -= old.LongLength;
+            var slab = new byte[length];
+            _slabs[blockId] = slab;
+            _allocatedBytes += length;
+            return slab;
         }
 
         public void Dispose()
@@ -89,6 +145,7 @@ namespace TensorSharp.Runtime.Paged
             _disposed = true;
             for (int i = 0; i < _slabs.Length; i++)
                 _slabs[i] = null;
+            _allocatedBytes = 0;
         }
     }
 }

@@ -62,6 +62,58 @@ public class NemotronHReasoningTemplateTests
             prompt);
     }
 
+    /// <summary>The added marker goes after the system text, so both thinking modes render
+    /// the same system prompt and differ only from the marker on. Prepended, they diverged
+    /// at the fifth token and neither mode's cached prefix was any use to the other.</summary>
+    [Theory]
+    [InlineData(false, "{'reasoning': False}", "<think></think>")]
+    [InlineData(true, "{'reasoning': True}", "<think>\n")]
+    public void AddedMarker_ClosesTheSystemSection(bool thinking, string marker, string opener)
+    {
+        string prompt = Render(
+        [
+            new ChatMessage { Role = "system", Content = " You are terse. " },
+            new ChatMessage { Role = "user", Content = "Hi" },
+        ], thinking);
+
+        Assert.Equal(
+            "<SPECIAL_10>System\nYou are terse.\n\n" + marker + "\n<SPECIAL_11>User\nHi\n<SPECIAL_11>Assistant\n" + opener,
+            prompt);
+    }
+
+    /// <summary>The shipped template only asks whether the marker occurs anywhere in the
+    /// system content: a system message that ENDS with it renders, through the template
+    /// itself, exactly what the renderer produces when it adds the marker there.</summary>
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void AddedMarker_MatchesTheShippedTemplateForASystemEndingInIt(bool thinking)
+    {
+        const string system = "You are terse.";
+        string marker = thinking ? "{'reasoning': True}" : "{'reasoning': False}";
+        string expected = new Jinja2Template(ShippedTemplate).Render(new Dictionary<string, object>
+        {
+            ["messages"] = new List<object>
+            {
+                new Dictionary<string, object> { ["role"] = "system", ["content"] = system + "\n\n" + marker },
+                new Dictionary<string, object> { ["role"] = "user", ["content"] = "What is 2+2?" },
+                new Dictionary<string, object> { ["role"] = "assistant", ["content"] = "4" },
+                new Dictionary<string, object> { ["role"] = "user", ["content"] = "And 3+3?" },
+            },
+            ["add_generation_prompt"] = true,
+        });
+
+        string rendered = Render(
+        [
+            new ChatMessage { Role = "system", Content = system },
+            new ChatMessage { Role = "user", Content = "What is 2+2?" },
+            new ChatMessage { Role = "assistant", Content = "4" },
+            new ChatMessage { Role = "user", Content = "And 3+3?" },
+        ], thinking);
+
+        Assert.Equal(expected, rendered);
+    }
+
     [Theory]
     [InlineData("{'reasoning': False}\nYou are terse.", false)]
     [InlineData("{'reasoning': True}", true)]
@@ -117,11 +169,15 @@ public class NemotronHReasoningTemplateTests
 
         string prompt = Render(messages, tools: tools);
 
-        Assert.StartsWith("<SPECIAL_10>System\n{'reasoning': False}\n\n# Tools", prompt);
-        Assert.Contains("\"name\": \"get_weather\"", prompt);
+        // The reasoning marker closes the system section, after the tool declarations.
+        Assert.StartsWith(
+            "<SPECIAL_10>System\nYou can use the following tools to assist the user if required:\n" +
+            "<AVAILABLE_TOOLS>[{\"name\": \"get_weather\"", prompt);
+        Assert.Contains("]</AVAILABLE_TOOLS>\n\nIf you decide to call any tool(s), use the following format:\n<TOOLCALL>[{{", prompt);
+        Assert.Contains("or just respond to the user.\n\n{'reasoning': False}\n<SPECIAL_11>User\nWeather in Paris?", prompt);
         Assert.Contains(
-            "\n<SPECIAL_11>Assistant\n<tool_call>\n{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Paris\"}}\n</tool_call>" +
-            "\n<SPECIAL_11>User\n<tool_response>\n{\"temp\": 21}\n</tool_response>\n<SPECIAL_11>Assistant\n<think></think>",
+            "\n<SPECIAL_11>Assistant\n<TOOLCALL>[{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Paris\"}}]</TOOLCALL>" +
+            "\n<SPECIAL_11>User\n<TOOL_RESPONSE>[{\"temp\": 21}]</TOOL_RESPONSE>\n<SPECIAL_11>Assistant\n<think></think>",
             prompt);
         Assert.DoesNotContain("<|im_start|>", prompt);
     }

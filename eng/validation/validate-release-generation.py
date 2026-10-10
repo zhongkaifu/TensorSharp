@@ -5,6 +5,10 @@ Case JSON supplies uploads {alias:path} and cases [{id,endpoint,request,
 expected}]. Exact string values @alias in requests resolve to uploaded file
 names. This records structural/numerical checks; semantic visual quality is
 explicitly pending separate inspection, never inferred from a valid MP4/PNG.
+
+A --reference recorded by a build whose Qwen-Image edits drew their noise from the
+seed alone differs on every /api/image-edit case: start the candidate server with
+TS_QWEN21_EDIT_NOISE=seed to compare edits with such a baseline.
 """
 import argparse
 import base64

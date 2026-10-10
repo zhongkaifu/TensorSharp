@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Measures the Qwen-Image-2.1 edit-noise hash (Program.cs). By default it builds against this
+       checkout's TensorSharp.Models; -p:ModelsDir=<dir> measures a TensorSharp.Models.dll built
+       elsewhere instead, such as the CLI's Debug output. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+  <ItemGroup Condition="'$(ModelsDir)' == ''">
+    <ProjectReference Include="../../../TensorSharp.Models/TensorSharp.Models.csproj" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(ModelsDir)' != ''">
+    <Reference Include="TensorSharp.Models">
+      <HintPath>$(ModelsDir)/TensorSharp.Models.dll</HintPath>
+    </Reference>
+    <Reference Include="TensorSharp.Runtime">
+      <HintPath>$(ModelsDir)/TensorSharp.Runtime.dll</HintPath>
+    </Reference>
+  </ItemGroup>
+</Project>

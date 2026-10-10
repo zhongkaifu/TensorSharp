@@ -622,7 +622,8 @@ namespace TensorSharp.Models
                 return false;
             if (kCache.ElementType != vCache.ElementType)
                 return false;
-            if (kCache.ElementType != DType.Float32 && kCache.ElementType != DType.Float16)
+            if (kCache.ElementType != DType.Float32 && kCache.ElementType != DType.Float16
+                && !(IsBlockQuantCacheDType(kCache.ElementType) && FlashDecodeHandlesBlockQuantKv))
                 return false;
 
             try
@@ -638,6 +639,25 @@ namespace TensorSharp.Models
                 return false;
             }
         }
+
+        /// <summary>
+        /// Backends whose flash-attention decode kernel appends to and reads a
+        /// block-quantized (q8_0 / q4_0) cache in place. The kernel builds the cache
+        /// with the cache's own type and needs flash_attn_ext over q8_0/q4_0 K/V at
+        /// head_dim 128 plus the f32-to-q8_0/q4_0 copy of the new row into a view that
+        /// strides across the KV heads. ggml-metal has both and is the backend this path
+        /// was validated on (Nemotron-H 8B, q8_0 and q4_0). ggml-cuda has the same ops
+        /// (Qwen 3.5 admits Metal and CUDA, IsFusedGraphKvCacheDType) but this model has
+        /// not been run there, so it stays out until it is. ggml-cpu reads such K/V but
+        /// cannot write it there - its copy to a quantized type takes only a contiguous
+        /// destination and aborts the process otherwise (ops.cpp "not implemented") - and
+        /// ggml-vulkan has not been run on this path. Elsewhere a quantized cache would
+        /// take the host walk, which dequantizes the whole window per attention layer per
+        /// token (4.5 tok/s against 22.6 on the batched route, ggml-cpu at 2.8k tokens), so
+        /// <see cref="SupportsLinearKVMigration"/> keeps such a cache off the N=1 path.
+        /// </summary>
+        private bool FlashDecodeHandlesBlockQuantKv =>
+            _backend is BackendType.GgmlMetal;
 
         /// <summary>
         /// Copy device-side KV rows back into the host mirror. No-op unless a
@@ -1098,6 +1118,11 @@ namespace TensorSharp.Models
         //     state is a function of all preceding tokens, so capture happens
         //     after each prefill chunk lands (RequiresPerBlockCapture=true).
         //   * FFN layers contribute zero bytes (stateless).
+        // The Mamba2 section is ~99 MiB on the 8B (24 layers x 4.1 MiB) against
+        // ~4 MiB of f16 K/V per 256 tokens, and only a block captured exactly at
+        // its own end can be resumed from, so the executor asks for the K/V-only
+        // form (ComputeKVBlockByteSizeWithoutRecurrentState) for every other block:
+        // the same layout with the Mamba2 sections left out.
         public override bool RequiresPerBlockCapture => true;
 
         public override bool SupportsKVStateSnapshot => _kvCacheK != null && _kvCacheV != null;
@@ -1119,6 +1144,13 @@ namespace TensorSharp.Models
         }
 
         public override long ComputeKVBlockByteSize(int tokenCount)
+            => ComputeNemotronBlockBytes(tokenCount, includeRecurrentState: true);
+
+        /// <summary>The block without its Mamba2 sections: the attention K/V rows only.</summary>
+        public override long ComputeKVBlockByteSizeWithoutRecurrentState(int tokenCount)
+            => ComputeNemotronBlockBytes(tokenCount, includeRecurrentState: false);
+
+        private long ComputeNemotronBlockBytes(int tokenCount, bool includeRecurrentState)
         {
             if (tokenCount <= 0 || _kvCacheK == null || _layerTypes == null) return 0;
             long total = 0;
@@ -1132,6 +1164,7 @@ namespace TensorSharp.Models
                         total += NemotronLayerBlockBytes(_kvCacheV[l], tokenCount);
                         break;
                     case LayerType.Mamba2:
+                        if (!includeRecurrentState) break;
                         total += (long)_convState[l].Length * sizeof(float);
                         total += (long)_ssmState[l].Length * sizeof(float);
                         break;
@@ -1141,11 +1174,21 @@ namespace TensorSharp.Models
             return total;
         }
 
+        /// <summary>Which of the two block forms a span of <paramref name="length"/> bytes is:
+        /// true for the full block, false for the K/V-only one, null for neither.</summary>
+        private bool? NemotronBlockFormOf(int tokenCount, int length)
+        {
+            long full = ComputeKVBlockByteSize(tokenCount);
+            if (full <= 0) return null;
+            if (length == full) return true;
+            long kvOnly = ComputeKVBlockByteSizeWithoutRecurrentState(tokenCount);
+            return kvOnly > 0 && length == kvOnly ? false : null;
+        }
+
         public override bool TryExtractKVBlock(int startToken, int tokenCount, Span<byte> destination)
         {
             if (!SupportsKVStateSnapshot) return false;
-            long expected = ComputeKVBlockByteSize(tokenCount);
-            if (destination.Length != expected) return false;
+            if (NemotronBlockFormOf(tokenCount, destination.Length) is not bool withState) return false;
             EnsureKvCacheHostSynchronized();
 
             int offset = 0;
@@ -1163,6 +1206,7 @@ namespace TensorSharp.Models
                         offset += wV;
                         break;
                     case LayerType.Mamba2:
+                        if (!withState) break;
                         if (!CopyMamba2StateOut(l, destination[offset..], out int wM))
                             return false;
                         offset += wM;
@@ -1176,8 +1220,9 @@ namespace TensorSharp.Models
         {
             if (!SupportsKVStateSnapshot) return false;
             if (destToken != _cacheSeqLen) return false;
-            long expected = ComputeKVBlockByteSize(tokenCount);
-            if (source.Length != expected) return false;
+            // The K/V-only form writes the attention rows and leaves every Mamba2
+            // state (host arrays and the native decode shadow) exactly as it was.
+            if (NemotronBlockFormOf(tokenCount, source.Length) is not bool withState) return false;
 
             // Injection rewrites host rows; anything still device-only has to be
             // flushed first so the re-upload does not resurrect stale rows.
@@ -1198,6 +1243,7 @@ namespace TensorSharp.Models
                         offset += rV;
                         break;
                     case LayerType.Mamba2:
+                        if (!withState) break;
                         if (!CopyMamba2StateIn(l, source[offset..], out int rM))
                             return false;
                         offset += rM;
@@ -1212,8 +1258,8 @@ namespace TensorSharp.Models
             // native decode cache itself is NOT cleared: it also holds the device state
             // of every live batched sequence, which is authoritative (their host arrays
             // are stale), and an ownership swap for another request lands here while
-            // they run.
-            if (_mamba2NativeDecodeStateInitialized != null)
+            // they run. A K/V-only block rewrote no host state, so it keeps the flags.
+            if (withState && _mamba2NativeDecodeStateInitialized != null)
             {
                 Array.Clear(_mamba2NativeDecodeStateInitialized);
                 if (_mamba2HostStateStale != null)
@@ -1860,8 +1906,8 @@ namespace TensorSharp.Models
         /// allocation grew with the prompt: a 4,096-token chunk deep into a 32k prompt asked
         /// ggml-cuda for 37 GB on the 8B and every long request failed with HTTP 500. GGML
         /// backends now take the fused prefill kernel, which reads the grouped F32/F16 cache
-        /// directly and switches to flash attention (O(kvLen) working set) once the scores
-        /// would be large. Every other case attends in query sub-chunks sized by
+        /// directly (a q8_0 / q4_0 cache through its dequantized window) and switches to
+        /// flash attention (O(kvLen) working set) once the scores would be large. Every other case attends in query sub-chunks sized by
         /// <see cref="PrefillScoreBudgetBytes"/>; each sub-chunk sees exactly the keys a
         /// causal mask would let it see, so the result is unchanged.</para>
         /// </summary>
@@ -1883,6 +1929,31 @@ namespace TensorSharp.Models
                         seqLen, totalSeqLen, checked((int)kCache.Sizes[1]),
                         startPos, 0, scale);
                     return fused;
+                }
+                if (IsBlockQuantCacheDType(kCache.ElementType) && vCache.ElementType == kCache.ElementType)
+                {
+                    // No kernel reads a q8_0 / q4_0 cache in place here: dequantize the
+                    // active window once per KV head (the kernel broadcasts the groups,
+                    // where the materialized path below copies each head groupSize
+                    // times) and take the F32 kernel, which switches to flash attention
+                    // as the window grows. The rows are the ones the materialized path
+                    // reads, so the result is the same attention.
+                    Tensor kWindow = ExpandKVHeadsBlockQuant(kCache, 1, totalSeqLen);
+                    Tensor vWindow = ExpandKVHeadsBlockQuant(vCache, 1, totalSeqLen);
+                    try
+                    {
+                        var fused = new Tensor(_allocator, DType.Float32, seqLen, numHeads * headDim);
+                        GgmlBasicOps.FusedPrefillAttention(
+                            qHeads, kWindow, vWindow, fused,
+                            numHeads, numKVHeads, headDim,
+                            seqLen, totalSeqLen, startPos, 0, scale);
+                        return fused;
+                    }
+                    finally
+                    {
+                        kWindow.Dispose();
+                        vWindow.Dispose();
+                    }
                 }
                 if (kCache.ElementType == DType.Float32 && vCache.ElementType == DType.Float32)
                 {

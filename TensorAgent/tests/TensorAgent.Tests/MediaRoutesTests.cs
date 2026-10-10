@@ -435,6 +435,56 @@ public sealed class MediaRoutesTests : IDisposable
         Assert.Equal(new[] { true, true, true }, asked);
     }
 
+    /// <summary>
+    /// The route's own frame source reads a picture turn against the whole conversation with
+    /// the planner it was given, as the app's GPU gate does (AgentAppHostTests). Before, it
+    /// read the newest message alone, and a follow-up to a picture drew an unrelated one.
+    /// The stand-in model is unsure, so the turn ends with its question and no image work.
+    /// </summary>
+    [Fact]
+    public async Task TheDefaultChatRoutePlansAPictureTurnFromTheConversation()
+    {
+        var modelField = _models.LifecycleService.GetType().GetField("_model",
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!;
+        modelField.SetValue(_models.LifecycleService,
+            System.Runtime.CompilerServices.RuntimeHelpers.GetUninitializedObject(typeof(TensorSharp.Models.QwenImage.QwenImageModel)));
+        try
+        {
+            File.WriteAllBytes(Path.Combine(_uploads, "dog.png"), new byte[] { 1 });
+            var asked = new List<ImageTurns.PlanQuestion>();
+            using var server = new LoopbackServer(NullLogger.Instance);
+            server.MapWebUi(_chat, _uploads, planImage: new ImageTurns.Planner(_uploads, (question, _) =>
+            {
+                lock (asked) asked.Add(question);
+                // Every option alike: the model cannot tell what was meant, so the turn asks.
+                float each = 1f / question.Options.Count;
+                return Task.FromResult<TensorSharp.Models.QwenImage.ImageIntentChoice?>(
+                    new(0, each, 0) { Probabilities = Enumerable.Repeat(each, question.Options.Count).ToArray() });
+            }));
+            server.Start();
+            using var client = new HttpClient { BaseAddress = new Uri(server.BaseUrl) };
+            client.DefaultRequestHeaders.Add("Cookie", $"{LoopbackServer.TokenCookie}={server.Token}");
+
+            List<JsonElement> frames = await StreamAsync(client, "/api/chat", new
+            {
+                messages = new object[]
+                {
+                    new { role = "user", content = "a dog" },
+                    new { role = "assistant", content = "", imageUrl = "/uploads/dog.png" },
+                    new { role = "user", content = "with a hat" },
+                },
+            });
+
+            Assert.Contains("\"with a hat\"", Assert.Single(asked).User, StringComparison.Ordinal);
+            Assert.Contains(frames, f => f.TryGetProperty("image_choice", out _));
+            Assert.True(frames[^1].GetProperty("done").GetBoolean());
+        }
+        finally
+        {
+            modelField.SetValue(_models.LifecycleService, null);
+        }
+    }
+
     [Fact]
     public async Task DefaultChatRouteHonoursLoraPreparationForAMaskedEdit()
     {

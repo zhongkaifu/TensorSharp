@@ -196,6 +196,7 @@ has the measurements and the remaining diagnostic switches.
 
 | Env var | Applies to | Feature impact | Runtime baseline | Sweep values | Swept by default |
 |---|---|---|---|---|---|
+| `TS_QWEN21_EDIT_NOISE` | Qwen-Image-2.1 edits | `references` (or unset): an edit's initial noise is drawn on a Philox stream keyed to its reference images (8-bit pixels, SHA-256), so it never restarts from the noise that drew its source at the same seed and size. `seed`: edits draw the seed's text-to-image noise, as stable-diffusion.cpp does, for matched-noise comparisons; each such edit prints a line. Any other value fails the request. Text-to-image noise is the same either way | `references` | not registered | no |
 | `TS_QWEN21_PREFIX_CACHE` | Qwen-Image-2.1 DiT | `0` (or `false` / `off` / `no`) turns off the prefix KV cache, which stores the text and reference-image keys and values at the first denoising step and reuses them at every later step | ON | not registered | no |
 | `TS_QWEN21_PREFIX_CACHE_TYPE` | same | Storage type of the cached prefix: `auto` (what attention reads, so output matches the uncached run), `f16`, `f32`, `q8_0` or `q8_0_v` (the 8-bit settings round the stored prefix). A misspelled value is an error even while the cache is off | `auto` | not registered | no |
 | `TS_QWEN21_PREFIX_CACHE_MAX_MIB` | same | Cap on one cache in MiB, on top of the rule that a cache may use at most half of the device's free memory. A cache that does not fit is declined with a warning, and that request recomputes the prefix every step | unset | not registered | no |

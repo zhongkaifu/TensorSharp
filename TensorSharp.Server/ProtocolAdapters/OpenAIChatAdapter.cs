@@ -46,6 +46,10 @@ public sealed partial class OpenAIChatAdapter
     private readonly SessionWorkspaceManager _workspaces;
     private readonly ILoggerFactory _loggerFactory;
 
+    /// <summary>How long a stream may go without a byte before it is sent a keep-alive
+    /// (see <see cref="StreamKeepAlive"/>). Settable for tests.</summary>
+    internal TimeSpan KeepAliveInterval { get; init; } = StreamKeepAlive.DefaultInterval;
+
     public OpenAIChatAdapter(
         ModelService svc,
         ServerHostingOptions options,
@@ -495,8 +499,10 @@ public sealed partial class OpenAIChatAdapter
         samplingConfig = WithStructuredOutputConstraint(samplingConfig, responseFormat, openaiThink);
         samplingConfig = WithDeepSeek41ToolGrammar(samplingConfig, toolGrammar, openaiThink);
 
+        // With the constraint in place and before it has seen a token: a reply it shapes
+        // from token 0 needs no parser for stray reasoning, and the pipeline primes none.
         bool useStreamParser = openaiThink || (openaiTools != null && openaiTools.Count > 0)
-            || OutputParserFactory.IsAlwaysRequired(_svc.Architecture);
+            || OutputParserFactory.IsAlwaysRequired(_svc.Architecture, _svc.ChatTemplate, samplingConfig);
         var buffer = bufferForStructured ? new StringBuilder() : null;
 
         IOutputParser? parser = null;
@@ -525,6 +531,8 @@ public sealed partial class OpenAIChatAdapter
             string piece = update.Piece;
             if (!update.Done)
             {
+                // Text a parser holds sends nothing for as long as it is held.
+                await SseWriter.KeepAliveIfIdleAsync(ctx.Response, KeepAliveInterval, ctx.RequestAborted).ConfigureAwait(false);
                 if (update.RawGenerationSuffix != null)
                 {
                     parser?.SetGenerationPromptSuffix(update.RawGenerationSuffix);
@@ -760,6 +768,8 @@ public sealed partial class OpenAIChatAdapter
 
         samplingConfig = WithStructuredOutputConstraint(samplingConfig, responseFormat, openaiThink);
         samplingConfig = WithDeepSeek41ToolGrammar(samplingConfig, toolGrammar, openaiThink);
+        // Before generation: a delayed grammar is active once its trigger has been generated.
+        bool replyNeedsParser = OutputParserFactory.IsAlwaysRequired(_svc.Architecture, _svc.ChatTemplate, samplingConfig);
 
         var collector = new ChatStreamCollector();
         int promptTokens = 0, evalTokens = 0, kvReusedTokens = 0;
@@ -782,8 +792,7 @@ public sealed partial class OpenAIChatAdapter
         }
 
         string rawOutput = collector.PlainText();
-        bool useParser = openaiThink || (openaiTools != null && openaiTools.Count > 0)
-            || OutputParserFactory.IsAlwaysRequired(_svc.Architecture);
+        bool useParser = openaiThink || (openaiTools != null && openaiTools.Count > 0) || replyNeedsParser;
         object responseMessage;
         bool sawToolCalls = false;
 

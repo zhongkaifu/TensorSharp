@@ -51,6 +51,34 @@ public sealed class StoredMessage
     [JsonPropertyName("artifacts")] public List<StoredArtifact>? Artifacts { get; set; }
     /// <summary>Generated image URL for an image-edit turn.</summary>
     [JsonPropertyName("imageUrl")] public string? ImageUrl { get; set; }
+    /// <summary>
+    /// How that picture was made (see <see cref="Hosting.ImageTurns"/>): <c>edit</c> changed
+    /// <see cref="ImageSources"/>, <c>new</c> drew it from words, <c>again</c> repeated an
+    /// earlier picture's request with the next seed. A later turn reads it to know which
+    /// picture a follow-up is about. Absent on pictures saved before turns recorded it, whose
+    /// request is the user message before them.
+    /// </summary>
+    [JsonPropertyName("imagePlan")] public string? ImagePlan { get; set; }
+    /// <summary>What decided <see cref="ImagePlan"/>: <c>attached</c>, <c>asked</c>, <c>first</c>,
+    /// <c>model</c>, or <c>unavailable</c> when the image model could not be asked and the newest
+    /// picture was changed on a guess, which the page goes on saying under the picture.</summary>
+    [JsonPropertyName("imagePlanReason")] public string? ImagePlanReason { get; set; }
+    /// <summary>The pictures it was made from, as upload names: the one changed first, then
+    /// any references. None for a picture drawn from words.</summary>
+    [JsonPropertyName("imageSources")] public List<string>? ImageSources { get; set; }
+    /// <summary>The words the image service was given for it.</summary>
+    [JsonPropertyName("imagePrompt")] public string? ImagePrompt { get; set; }
+    /// <summary>The seed it was made with; another version is made with the next one.</summary>
+    [JsonPropertyName("imageSeed")] public long? ImageSeed { get; set; }
+    /// <summary>The selection a masked edit was confined to, kept so another version keeps it.</summary>
+    [JsonPropertyName("imageMask")] public StoredImageMask? ImageMask { get; set; }
+    /// <summary>The readings an image turn offered the user instead of guessing between them.</summary>
+    [JsonPropertyName("imageChoices")] public List<StoredImageChoice>? ImageChoices { get; set; }
+    /// <summary>On a user message: how the user told the page to read it (<c>edit</c>,
+    /// <c>new</c> or <c>again</c>), when they chose rather than leaving it to the host.</summary>
+    [JsonPropertyName("imageIntent")] public string? ImageIntent { get; set; }
+    /// <summary>On a user message: the picture that choice names, as an upload name.</summary>
+    [JsonPropertyName("imageSource")] public string? ImageSource { get; set; }
     /// <summary>Generated clip URL for a video turn.</summary>
     [JsonPropertyName("videoUrl")] public string? VideoUrl { get; set; }
     /// <summary>The clip's soundtrack, kept only when it is a separate file the page plays
@@ -78,6 +106,13 @@ public sealed class StoredMessage
                     if (a.Frames is not null) foreach (string f in a.Frames) yield return Path.GetFileName(f);
                 }
             if (!string.IsNullOrEmpty(ImageUrl)) yield return Path.GetFileName(ImageUrl);
+            // What a picture was made from stays as long as the picture does: another version
+            // of it is made from those files, and Compare original shows the first of them.
+            if (ImageSources is not null)
+                foreach (string source in ImageSources)
+                    yield return Path.GetFileName(source);
+            if (!string.IsNullOrEmpty(ImageMask?.MaskPath)) yield return Path.GetFileName(ImageMask.MaskPath);
+            if (!string.IsNullOrEmpty(ImageSource)) yield return Path.GetFileName(ImageSource);
             if (!string.IsNullOrEmpty(VideoUrl)) yield return Path.GetFileName(VideoUrl);
             if (!string.IsNullOrEmpty(AudioUrl)) yield return Path.GetFileName(AudioUrl);
         }
@@ -154,6 +189,25 @@ public sealed class StoredAttachment
     [JsonPropertyName("pageCount")] public int? PageCount { get; set; }
     [JsonPropertyName("extractedPageCount")] public int? ExtractedPageCount { get; set; }
     [JsonPropertyName("renderedAsImages")] public bool? RenderedAsImages { get; set; }
+}
+
+/// <summary>The selection a masked edit applied, under the names the image service reads.</summary>
+public sealed class StoredImageMask
+{
+    [JsonPropertyName("maskPath")] public string? MaskPath { get; set; }
+    [JsonPropertyName("maskMode")] public string? MaskMode { get; set; }
+    [JsonPropertyName("maskInvert")] public bool? MaskInvert { get; set; }
+    [JsonPropertyName("maskFeather")] public int? MaskFeather { get; set; }
+    [JsonPropertyName("maskCrop")] public bool? MaskCrop { get; set; }
+    [JsonPropertyName("maskCropPadding")] public int? MaskCropPadding { get; set; }
+}
+
+/// <summary>One reading of a request an image turn offered as a button: <c>edit</c> or
+/// <c>again</c> of the picture <see cref="Source"/> names, or <c>new</c>.</summary>
+public sealed class StoredImageChoice
+{
+    [JsonPropertyName("intent")] public string Intent { get; set; } = string.Empty;
+    [JsonPropertyName("source")] public string? Source { get; set; }
 }
 
 /// <summary>A produced file kept in the artifact store.</summary>

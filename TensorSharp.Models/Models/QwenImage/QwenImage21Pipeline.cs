@@ -1,9 +1,13 @@
 // Copyright (c) Zhongkai Fu. All rights reserved.
 // Licensed under the BSD-3-Clause license in the repository root.
 using System;
+using System.Buffers;
+using System.Buffers.Binary;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
-using TensorSharp.GGML;
+using System.Security.Cryptography;
+using System.Threading;
 using TensorSharp.Runtime;
 
 namespace TensorSharp.Models.QwenImage
@@ -27,37 +31,31 @@ namespace TensorSharp.Models.QwenImage
             if (p.Steps < 0 || !float.IsFinite(p.CfgScale) || p.CfgScale < 0)
                 throw new ArgumentException("Steps and CFG must be finite and nonnegative (zero selects the model default).");
             foreach (var input in inputs) ArgumentNullException.ThrowIfNull(input);
-            var mask = QwenImageEditMask.Create(p, inputs.Length > 0 ? inputs[0] : null);
-            var (width, height) = ResolveDimensions(p, inputs.Length > 0 ? inputs[0] : null, _model.Backend);
+            // Parse first: a misspelled setting fails before any work, text-to-image included.
+            bool followReferences = QwenImage21Sampling.EditNoiseFollowsReferences(
+                Environment.GetEnvironmentVariable(QwenImage21Sampling.EditNoiseVariable));
+            var request = new Request(inputs, p, _model.Backend, followReferences);
+            var mask = request.Mask;
+            var geometry = request.Geometry;
+            var (width, height) = geometry.Sampling;
             if (mask?.IsEmpty == true)
             {
                 Console.WriteLine("Qwen-Image-2.1: empty edit mask; returning the original image without inference.");
                 return mask.UnchangedCopy();
             }
-            if (mask != null)
-            {
-                (width, height) = mask.SamplingDimensions(width, height);
-                // Keep every additional reference in its original coordinate system.
-                // The first reference supplies the masked canvas or selected crop.
-                inputs = (RgbImage[])inputs.Clone();
-                inputs[0] = mask.Reference;
-            }
+            inputs = request.Inputs;
             if (inputs.Length > 0 && _model.MmprojPath == null)
                 throw new InvalidOperationException("Qwen-Image-2.1 editing requires the Qwen3-VL-8B vision projector; set --qwen-image-mmproj or TS_QWEN_IMAGE_MMPROJ.");
-            // A LoRA plug-in's recipe (a step-distilled adapter's trained schedule) supplies
-            // the defaults; explicit steps / CFG still win.
-            var recipe = _model.Loras?.Recipe;
-            int steps = p.Steps != 0 ? p.Steps : recipe is { DefaultSteps: > 0 } ? recipe.DefaultSteps : 40;
-            // The released 2.1 checkpoint is intended for sampling without CFG.
-            // An explicit value > 1 still opts into the additional negative pass.
-            float cfg = p.CfgScale != 0 ? p.CfgScale : recipe?.Cfg ?? 1f;
-            int h = height / 16, w = width / 16, sequence = checked(h * w);
+            var recipe = _model.SamplingRecipe;
+            int h = request.LatentHeight, w = request.LatentWidth, sequence = checked(h * w);
             // Validate the schedule before any encoder or VAE work.
-            float[] sigmas = recipe is { HasSchedule: true } ? recipe.Sigmas(steps, sequence) : QwenImage21Sampling.Sigmas(steps, sequence);
+            var (steps, cfg, sigmas) = ResolveSampling(p, recipe, sequence);
             if (_model.Loras is { OutputHeads.Length: > 0 } bundle && bundle.OutputHeads.Length != steps)
                 throw new ArgumentException($"The LoRA bundle has one output head per trained step ({bundle.OutputHeads.Length}); it cannot run {steps} steps.");
             // Refuse a size this machine cannot hold before any encoder, transformer or VAE work.
             if (_model.Backend == BackendType.Cpu) CheckCpuMemory(width, height, inputs);
+            // After the refusals, so a refused request hashes nothing; 0 for text-to-image.
+            ulong noiseStream = request.NoiseStream;
             var total = Stopwatch.StartNew();
             var phase = Stopwatch.StartNew();
             void Phase(string name)
@@ -66,17 +64,29 @@ namespace TensorSharp.Models.QwenImage
                 if (ReportMemory) Console.WriteLine($"  [qwen21-memory] after {name}: {MemoryLine()}");
                 phase.Restart();
             }
-            Console.WriteLine($"Qwen-Image-2.1: {width}x{height}, {steps} steps, CFG {cfg}, seed {p.Seed}, {inputs.Length} reference(s)");
+            string stream = noiseStream != 0 ? $" (edit noise stream {noiseStream:x16})" : "";
+            Console.WriteLine($"Qwen-Image-2.1{(_model.Variant == QwenImageVariant.Turbo ? " Turbo" : "")}: {width}x{height}, " +
+                $"{steps} steps, CFG {cfg}, seed {p.Seed}{stream}, {inputs.Length} reference(s)");
+            if (inputs.Length > 0 && !followReferences)
+                Console.WriteLine($"  [qwen21] {QwenImage21Sampling.EditNoiseVariable}=seed: this edit starts from the seed's text-to-image " +
+                    "noise (stable-diffusion.cpp parity); an edit of a picture drawn at this seed and size may retrace it.");
             if (mask != null)
                 Console.WriteLine($"  [qwen21-mask] {p.MaskMode.ToString().ToLowerInvariant()}, canvas {mask.Source.Width}x{mask.Source.Height}, " +
                     $"region {mask.X},{mask.Y},{mask.Width},{mask.Height}, feather {p.MaskFeather}; exact protected pixels");
-            if (UsesHostCpuAutomaticSize(p, _model.Backend))
+            if (mask == null && geometry.Output != geometry.Sampling)
+                Console.WriteLine($"  [qwen21] keeping the source size {geometry.Output.Width}x{geometry.Output.Height}: " +
+                    $"sampled at {width}x{height}, then resized to it");
+            if (!p.KeepSourceSize && UsesHostCpuAutomaticSize(p, _model.Backend))
                 Console.WriteLine($"  automatic size on the cpu backend: {width}x{height} (about " +
                     $"{HostCpuAutomaticArea / (1024 * 1024)} MP). The native 2048x2048 area has four times the tokens and takes " +
                     "about 5x longer per step on a CPU; pass --width/--height (width/height in an API request) for another size.");
             if (recipe is { HasSchedule: true })
-                Console.WriteLine($"  [lora] sampling recipe ({System.IO.Path.GetFileName(recipe.Source)}): {recipe.Describe(steps, sequence)}");
+                Console.WriteLine(recipe.LogLine(steps, sequence));
 
+            // Drawn before any encoder or VAE work (4 MB at 2048x2048), so a test without weights
+            // sees the latent sampling starts from (LatentsDrawn).
+            float[] latents = request.InitialLatents();
+            LatentsDrawn.Value?.Invoke(latents);
             try
             {
                 var refs = new RgbImage[inputs.Length];
@@ -119,13 +129,12 @@ namespace TensorSharp.Models.QwenImage
                         (negative, negativeLength, negativeSlots) = conditioner.EncodePrompt(p.NegativePrompt ?? "", refs);
                 }
                 Phase("text and vision encode");
-                ReleaseComputeBuffers();
+                _model.ReleaseComputeBuffers();
                 // On the cpu backend the conditioner's packed vision weights and working buffers
                 // are managed arrays (GBs for an edit). Nothing during the denoise allocates
                 // managed memory, so without a collection they stay committed until the VAE.
                 if (!_model.UsesGgml) GC.Collect(GC.MaxGeneration, GCCollectionMode.Forced, blocking: true, compacting: false);
 
-                float[] latents = ToTokens(QwenImage21Sampling.Noise(checked(sequence * 64), p.Seed), h, w);
                 float[] maskNoise = sourceTokens == null ? null : (float[])latents.Clone();
                 if (sourceTokens != null)
                     QwenImageEditMask.Reinject(latents, sourceTokens, maskNoise, latentMask, sigmas[0]);
@@ -199,19 +208,105 @@ namespace TensorSharp.Models.QwenImage
                 // Denoising is finished; release resident DiT weights (on the cpu
                 // backend, the transformer's activation scratch) before allocating the
                 // much larger full-resolution VAE feature maps.
-                ReleaseComputeBuffers();
+                _model.ReleaseComputeBuffers();
                 _dit?.ReleaseScratch();
                 var output = Vae.Decode(new VaeLatent(64, h, w, ToChannels(latents, h, w)));
-                if (mask != null) output = mask.Composite(output);
+                output = FinishOutput(output, mask, geometry.Output);
                 Phase("VAE decode");
                 Console.WriteLine($"  [qwen21-timing] total: {total.Elapsed.TotalSeconds:F3}s");
                 return output;
             }
             finally
             {
-                ReleaseComputeBuffers();
+                _model.ReleaseComputeBuffers();
                 _dit?.ReleaseScratch();
             }
+        }
+
+        /// <summary>
+        /// Test seam: called on the calling flow with the latent <see cref="Run"/> samples from,
+        /// after the request's refusals and before any encoder, VAE or transformer work. A test
+        /// that throws from it runs <see cref="Run"/> with no weights. Null outside tests.
+        /// </summary>
+        internal static readonly AsyncLocal<Action<float[]>> LatentsDrawn = new();
+
+        /// <summary>
+        /// The model-free part of a request, settled before any encoder work: the selection, the
+        /// geometry (<see cref="ResolveGeometry"/>), the references the encoders see and the
+        /// initial noise. <see cref="Run"/> samples from exactly <see cref="InitialLatents"/>
+        /// (<see cref="LatentsDrawn"/> shows it), so the noise's wiring is tested without a model.
+        /// </summary>
+        internal sealed class Request
+        {
+            private readonly long _seed;
+            private readonly bool _followReferences;
+            private ulong? _noiseStream;
+
+            /// <param name="callerInputs">The reference pictures as the caller passed them.</param>
+            /// <param name="followReferences">Whether an edit's noise follows its references
+            /// (<see cref="QwenImage21Sampling.EditNoiseFollowsReferences"/>).</param>
+            internal Request(RgbImage[] callerInputs, QwenImageParams p, BackendType? backend, bool followReferences)
+            {
+                ArgumentNullException.ThrowIfNull(callerInputs);
+                ArgumentNullException.ThrowIfNull(p);
+                CallerInputs = callerInputs;
+                _seed = p.Seed;
+                _followReferences = followReferences;
+                RgbImage first = callerInputs.Length > 0 ? callerInputs[0] : null;
+                Mask = QwenImageEditMask.Create(p, first);
+                Geometry = ResolveGeometry(p, first, Mask, backend);
+                Inputs = callerInputs;
+                if (Mask is { IsEmpty: false })
+                {
+                    // Keep every additional reference in its original coordinate system.
+                    // The first reference supplies the masked canvas or selected crop.
+                    Inputs = (RgbImage[])callerInputs.Clone();
+                    Inputs[0] = Mask.Reference;
+                }
+            }
+
+            /// <summary>The pictures the caller gave, which an edit's noise follows: not the
+            /// selection's canvas or crop in <see cref="Inputs"/>, nor the resized copies the
+            /// encoders see (Lanczos differs between hosts).</summary>
+            internal RgbImage[] CallerInputs { get; }
+
+            /// <summary>The references the encoders see: the caller's, with the selection's
+            /// canvas or crop in place of the first.</summary>
+            internal RgbImage[] Inputs { get; }
+
+            internal QwenImageEditMask Mask { get; }
+
+            internal ((int Width, int Height) Sampling, (int Width, int Height) Output) Geometry { get; }
+
+            internal int LatentHeight => Geometry.Sampling.Height / 16;
+
+            internal int LatentWidth => Geometry.Sampling.Width / 16;
+
+            /// <summary>The initial noise's Philox stream (<see cref="QwenImage21Sampling.NoiseStream"/>),
+            /// hashed on first use so a request refused before sampling hashes nothing.</summary>
+            internal ulong NoiseStream => _noiseStream ??= QwenImage21Sampling.NoiseStream(CallerInputs, _followReferences);
+
+            /// <summary>The latent sampling starts from, drawn for the sampling size: an edit that
+            /// keeps its source size samples at <see cref="KeptSourceSampling"/>, not at the
+            /// source's own size.</summary>
+            internal float[] InitialLatents() => QwenImage21Sampling.InitialLatents(_seed, NoiseStream, LatentHeight, LatentWidth);
+        }
+
+        /// <summary>
+        /// The steps, CFG and steps+1 sigmas a request samples with. A LoRA plug-in's recipe (a
+        /// step-distilled adapter's trained schedule) or the checkpoint's own (Turbo's,
+        /// <see cref="QwenImage21Turbo"/>) supplies the defaults, otherwise 40 steps on the
+        /// scheduler's shifted schedule at CFG 1; explicit steps / CFG still win, and a step
+        /// count a recipe has no schedule for is refused (ArgumentException).
+        /// </summary>
+        internal static (int Steps, float Cfg, float[] Sigmas) ResolveSampling(QwenImageParams p, QwenImage21LoraRecipe recipe, int imageTokens)
+        {
+            int steps = p.Steps != 0 ? p.Steps : recipe is { DefaultSteps: > 0 } ? recipe.DefaultSteps : 40;
+            // The released 2.1 checkpoint is intended for sampling without CFG.
+            // An explicit value > 1 still opts into the additional negative pass.
+            float cfg = p.CfgScale != 0 ? p.CfgScale : recipe?.Cfg ?? 1f;
+            float[] sigmas = recipe is { HasSchedule: true } ? recipe.Sigmas(steps, imageTokens) : QwenImage21Sampling.Sigmas(steps, imageTokens);
+            return (steps, cfg, sigmas);
         }
 
         // TS_QWEN21_MEMORY=1 prints the process memory after every phase (working set, commit,
@@ -256,15 +351,6 @@ namespace TensorSharp.Models.QwenImage
                 Console.WriteLine(string.Create(CultureInfo.InvariantCulture,
                     $"  [qwen21] WARNING: {width}x{height} needs about {QwenImage21CpuMemory.Gib(needed):F1} GiB at its peak, " +
                     $"but only {QwenImage21CpuMemory.Gib(free):F1} GiB is free right now; close other programs or expect paging."));
-        }
-
-        /// <summary>Releases GGML scratch and resident weights between stages. The pure-C# cpu
-        /// backend has neither, and must not call into the native library at all.</summary>
-        private void ReleaseComputeBuffers()
-        {
-            if (!_model.UsesGgml) return;
-            GgmlBasicOps.ReleaseReuseComputeBuffers();
-            GgmlBasicOps.ClearHostBufferCache();
         }
 
         private static void ReportPrefixCache(QwenImage21DiT.PrefixCache cache, string branch, int ranks)
@@ -340,14 +426,95 @@ namespace TensorSharp.Models.QwenImage
             }
             // The server's default size (--width/--height) stands in only for a request that
             // named neither a size nor an area; an explicit area keeps its own geometry.
-            bool areaRequested = AreaRequested(p);
-            if (!areaRequested && DefaultSize() is { } size)
+            if (!AreaRequested(p) && DefaultSize() is { } size)
                 return size;
-            long area = !areaRequested && backend is { } b && IsHostCpu(b) ? HostCpuAutomaticArea : p.ResolveTargetArea();
-            return DimensionsForArea(reference?.Width ?? 1, reference?.Height ?? 1, area);
+            return DimensionsForArea(reference?.Width ?? 1, reference?.Height ?? 1, AutomaticArea(p, backend));
         }
 
         private static bool AreaRequested(QwenImageParams p) => p.TargetArea > 0 && p.TargetArea != AutomaticTargetArea;
+
+        // The area an automatic size spends: the request's own, or HostCpuAutomaticArea on the cpu backend.
+        private static long AutomaticArea(QwenImageParams p, BackendType? backend) =>
+            !AreaRequested(p) && backend is { } b && IsHostCpu(b) ? HostCpuAutomaticArea : p.ResolveTargetArea();
+
+        /// <summary>
+        /// Where a request samples and the size it returns. Unmasked, the output is the sampled
+        /// image itself, or with <see cref="QwenImageParams.KeepSourceSize"/> the first reference's
+        /// exact size (<see cref="KeptSourceSampling"/>). Masked, the output is the source canvas,
+        /// which <see cref="QwenImageEditMask.Composite"/> restores whatever the sampling size
+        /// (the crop's share of the canvas's), so keeping the source size changes nothing there.
+        /// </summary>
+        internal static ((int Width, int Height) Sampling, (int Width, int Height) Output) ResolveGeometry(
+            QwenImageParams p, RgbImage reference, QwenImageEditMask mask, BackendType? backend = null)
+        {
+            var kept = KeptSourceSize(p, reference);
+            if (mask != null)
+            {
+                var (width, height) = ResolveDimensions(p, reference, backend);
+                return (mask.SamplingDimensions(width, height), (mask.Source.Width, mask.Source.Height));
+            }
+            if (kept is { } size)
+                return (KeptSourceSampling(p, reference, backend), size);
+            var sampling = ResolveDimensions(p, reference, backend);
+            return (sampling, sampling);
+        }
+
+        /// <summary>The size <see cref="QwenImageParams.KeepSourceSize"/> keeps: the first reference's
+        /// exact width and height, or null when the request does not ask for it. Refuses a request
+        /// that also names a width/height (two answers to one question) or has no reference.</summary>
+        internal static (int Width, int Height)? KeptSourceSize(QwenImageParams p, RgbImage reference)
+        {
+            if (!p.KeepSourceSize) return null;
+            if (p.Width != 0 || p.Height != 0)
+                throw new ArgumentException("Keeping the source size cannot be combined with an explicit width/height; send one or the other.");
+            if (reference == null)
+                throw new ArgumentException("Keeping the source size requires an input image to edit.");
+            return (reference.Width, reference.Height);
+        }
+
+        /// <summary>
+        /// The smallest area an edit that keeps its source size samples at, budget permitting:
+        /// the area references are conditioned at (<see cref="ResolveReferenceDimensions"/>).
+        /// Below it the model works from far fewer image tokens than it was trained at -- a
+        /// 100 x 100 icon would have been edited from 36 -- and a selection edit of the same
+        /// picture would sample at the full budget.
+        /// </summary>
+        internal const long KeptSourceSamplingFloor = 1024L * 1024;
+
+        /// <summary>
+        /// Where an edit that keeps its source size samples: at about the source's aspect ratio
+        /// (the 32-pixel grid rounds it), within the area the request would otherwise sample at,
+        /// and at about the source's own area between <see cref="KeptSourceSamplingFloor"/> and
+        /// that budget. The budget is the request's targetArea, the automatic area, or the area
+        /// of the server's default size (whose own aspect ratio would distort the source once
+        /// resized back to it). A picture larger than the budget samples exactly where an
+        /// automatic size would and is then resized up to its own size, rather than handed back
+        /// smaller; one smaller than the floor samples at the floor and is resized down. In
+        /// between, the source holds no detail for more tokens to restore, so it samples at its
+        /// own size, and a source on the 32-pixel grid is not resized at all.
+        /// </summary>
+        internal static (int Width, int Height) KeptSourceSampling(QwenImageParams p, RgbImage source, BackendType? backend = null)
+        {
+            long budget = !AreaRequested(p) && DefaultSize() is { } size
+                ? (long)size.Width * size.Height
+                : AutomaticArea(p, backend);
+            long own = checked((long)source.Width * source.Height);
+            return DimensionsForArea(source.Width, source.Height, Math.Min(budget, Math.Max(own, KeptSourceSamplingFloor)));
+        }
+
+        /// <summary>
+        /// The decoded picture as the request returns it: composited into the source canvas for a
+        /// selection, otherwise resized to <paramref name="output"/> -- a no-op, the same
+        /// instance, when the sampling size already is the output size, so nothing changes for a
+        /// request that does not keep its source size.
+        /// </summary>
+        internal static RgbImage FinishOutput(RgbImage decoded, QwenImageEditMask mask, (int Width, int Height) output)
+        {
+            if (mask != null) return mask.Composite(decoded);
+            return decoded.Width == output.Width && decoded.Height == output.Height
+                ? decoded
+                : ImageIO.Resize(decoded, output.Width, output.Height);
+        }
 
         /// <summary>Whether <see cref="ResolveDimensions"/> picks <see cref="HostCpuAutomaticArea"/>.</summary>
         internal static bool UsesHostCpuAutomaticSize(QwenImageParams p, BackendType backend) =>
@@ -501,16 +668,142 @@ namespace TensorSharp.Models.QwenImage
             return result;
         }
 
+        /// <summary>
+        /// <c>references</c> (the default): an edit's noise also depends on its reference
+        /// pictures (<see cref="NoiseStream"/>). <c>seed</c>: an edit starts from the seed's
+        /// text-to-image noise, as stable-diffusion.cpp and diffusers do, for matched-noise A/B runs.
+        /// </summary>
+        internal const string EditNoiseVariable = "TS_QWEN21_EDIT_NOISE";
+
+        /// <summary>Whether an edit's noise follows its references; anything other than
+        /// <c>references</c> (or unset) and <c>seed</c> is refused.</summary>
+        internal static bool EditNoiseFollowsReferences(string value) =>
+            (value ?? "").Trim().ToLowerInvariant() switch
+            {
+                "" or "references" => true,
+                "seed" => false,
+                _ => throw new ArgumentException($"{EditNoiseVariable}='{value}' is not one of references, seed."),
+            };
+
+        /// <summary>
+        /// The Philox stream of a request's initial noise: 0 for text-to-image (and for an edit
+        /// when <paramref name="followReferences"/> is false), otherwise <see cref="ReferenceStream"/>
+        /// of <paramref name="callerInputs"/>, the pictures as the caller passed them.
+        /// </summary>
+        internal static ulong NoiseStream(IReadOnlyList<RgbImage> callerInputs, bool followReferences)
+        {
+            ArgumentNullException.ThrowIfNull(callerInputs);
+            return callerInputs.Count == 0 || !followReferences ? 0 : ReferenceStream(callerInputs);
+        }
+
+        /// <summary>
+        /// The initial latent, token-major: <see cref="Noise(int, long, ulong)"/> drawn in CHW
+        /// order and transposed, so equal seeds and streams identify equal noise.
+        /// </summary>
+        internal static float[] InitialLatents(long seed, ulong stream, int latentHeight, int latentWidth) =>
+            QwenImage21Pipeline.ToTokens(Noise(checked(latentHeight * latentWidth * 64), seed, stream), latentHeight, latentWidth);
+
+        /// <summary>
+        /// A nonzero stream id for an edit, keyed to its reference pictures. Without it, the noise
+        /// depends on the seed and size alone, so an edit of a picture at the seed and size it was
+        /// drawn at starts from the very latent that became that picture, and Qwen-Image 2.1 can
+        /// retrace the picture instead of following the instruction. A fox drawn at seed 0
+        /// (1024x1024, CFG 1) and changed at seed 0 came back over-sharpened, still in the snow,
+        /// for "change the background to a sandy beach" (at 12 and 40 steps, and with a speed
+        /// LoRA); drawn and changed at seed 5 it did the same; the seed-5 fox changed at seed 0,
+        /// and the seed-0 fox at seeds 1, 2, 3 and 7, got the beach. A teapot recolored at CFG 6
+        /// from its own seed's noise did change, so the retrace is likely rather than certain.
+        ///
+        /// <para>SHA-256 over a versioned encoding: the domain string, the reference count, then
+        /// per reference its width, height, an alpha flag, its RGB quantized to 8 bits as a PNG
+        /// stores it (<see cref="Quantize8"/>), and the quantized alpha when any pixel is not
+        /// opaque. Quantizing makes a picture kept in memory and the same picture reloaded from its
+        /// PNG give one stream. Every host decodes a PNG TensorSharp wrote, or any PNG without
+        /// colour information, to the same bytes; the Apple provider converts one that embeds a
+        /// colour profile (a macOS or iPhone screenshot) to sRGB, as it does an opaque one whose
+        /// gAMA or cHRM describes another space (eng/validation/apple-png-decode-check.py), and a
+        /// JPEG or HEIC decoder may differ by a few levels. Such a picture gets another stream there.
+        /// All-opaque alpha hashes as no alpha: the VAE reads both the same way.
+        /// The first eight digest bytes, little-endian, are the id; 0 (text-to-image) maps to 1.</para>
+        /// </summary>
+        internal static ulong ReferenceStream(IReadOnlyList<RgbImage> references)
+        {
+            ArgumentNullException.ThrowIfNull(references);
+            if (references.Count == 0) return 0;
+            using var hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+            hash.AppendData("TensorSharp/qwen-image-2.1/edit-noise/v1"u8);
+            Span<byte> header = stackalloc byte[9];
+            BinaryPrimitives.WriteInt32LittleEndian(header, references.Count);
+            hash.AppendData(header[..4]);
+            byte[] buffer = ArrayPool<byte>.Shared.Rent(64 * 1024);
+            try
+            {
+                foreach (var image in references)
+                {
+                    ArgumentNullException.ThrowIfNull(image);
+                    bool translucent = false;
+                    ReadOnlySpan<float> alphas = image.Alpha;
+                    for (int i = 0; i < alphas.Length && !translucent; i++) translucent = Quantize8(alphas[i]) != 255;
+                    BinaryPrimitives.WriteInt32LittleEndian(header, image.Width);
+                    BinaryPrimitives.WriteInt32LittleEndian(header[4..], image.Height);
+                    header[8] = translucent ? (byte)1 : (byte)0;
+                    hash.AppendData(header);
+                    AppendQuantized(hash, image.Pixels, buffer);
+                    if (translucent) AppendQuantized(hash, image.Alpha, buffer);
+                }
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(buffer);
+            }
+            Span<byte> digest = stackalloc byte[32];
+            hash.GetHashAndReset(digest);
+            ulong stream = BinaryPrimitives.ReadUInt64LittleEndian(digest);
+            return stream == 0 ? 1 : stream;
+        }
+
+        // One plain loop per chunk: the Mono hosts run vector helpers slower than this.
+        private static void AppendQuantized(IncrementalHash hash, float[] values, byte[] buffer)
+        {
+            for (int start = 0; start < values.Length; start += buffer.Length)
+            {
+                ReadOnlySpan<float> source = values.AsSpan(start, Math.Min(buffer.Length, values.Length - start));
+                Span<byte> bytes = buffer.AsSpan(0, source.Length);
+                for (int i = 0; i < source.Length; i++) bytes[i] = Quantize8(source[i]);
+                hash.AppendData(bytes);
+            }
+        }
+
+        /// <summary>ImageIO's float-to-byte rule (round half up, clamped), with NaN as 0 on every runtime.</summary>
+        [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+        internal static byte Quantize8(float value)
+        {
+            float scaled = value * 255f + 0.5f;
+            return scaled >= 0f ? scaled <= 255f ? (byte)scaled : (byte)255 : (byte)0;
+        }
+
         // Philox4x32-10 + Box-Muller, matching stable-diffusion.cpp --rng cuda.
         // Generate in CHW order before transposing, so equal seeds identify equal noise.
-        internal static float[] Noise(int count, long seed)
+        internal static float[] Noise(int count, long seed) => Noise(count, seed, 0);
+
+        /// <summary>
+        /// <see cref="Noise(int, long)"/> on another Philox stream. sd.cpp's counter is
+        /// (offset, 0, i, 0); the stream fills the two words it leaves at zero, so stream 0 is
+        /// its sequence bit for bit and the key keeps meaning the seed (mixing the stream into
+        /// the key would make an edit's noise some other seed's text-to-image noise). For one key
+        /// Philox maps distinct counters to distinct 128-bit blocks; Box-Muller reads two of the
+        /// four words and rounds to float, so two streams' values coincide only by chance.
+        /// Word 0 stays free for a sampler that draws more than once.
+        /// </summary>
+        internal static float[] Noise(int count, long seed, ulong stream)
         {
             var result = new float[count];
             const float inv32 = 2.3283064e-10f;
             const float inv32Tau = inv32 * 6.2831855f;
+            uint streamLow = (uint)stream, streamHigh = (uint)(stream >> 32);
             for (int i = 0; i < count; i++)
             {
-                uint a = 0, b = 0, c = (uint)i, d = 0;
+                uint a = 0, b = streamLow, c = (uint)i, d = streamHigh;
                 uint k0 = (uint)seed, k1 = (uint)((ulong)seed >> 32);
                 for (int round = 0; round < 10; round++)
                 {

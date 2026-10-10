@@ -3102,6 +3102,9 @@ extern "C" void TSGgml_WanResetForwardCache();
 
 TSG_EXPORT void TSGgml_ClearHostBufferCache()
 {
+    // Everything below frees buffers a deferred command buffer may still be reading
+    // (see TSGgml_ReleaseReuseComputeBuffers). One atomic when nothing is pending.
+    host_read_barrier();
     // ModelBase.Dispose uses this global cache sweep before unmapping weights.
     // Retire compact expert buffers here as well, while CUDA is still alive.
     tsg::host_moe_expert_cache_release();
@@ -3119,6 +3122,19 @@ TSG_EXPORT void TSGgml_ClearHostBufferCache()
     // their captured graphs pointing at freed device memory.
     TSGgml_WanResetForwardCache();
     TSGgml_Qwen35ResetDecodeCache();
+    // The same holds for the persistent graphs TSGgml_InvalidateHostBuffer drops when
+    // it frees ONE device copy; this wipe frees all of them. They used to survive a
+    // model unload until TSGgml_Shutdown. Their keys are raw host addresses (DFlash:
+    // drafter weight + ring row, Muse-Glimmer and Gemma 4: norm weight + KV), so a model
+    // loaded afterwards whose allocations landed on the old addresses replayed a graph
+    // bound to freed MTLBuffers. Each rebuilds on its next call.
+    TSGgml_DFlashResetCaches();
+    TSGgml_MuseGlimmerResetDecodeCache();
+    TSGgml_Gemma4ResetDecodeCache();
+    TSGgml_Gemma4ResetBatchedDecodeCache();
+    TSGgml_Gemma4ResetMoEBatchedDecodeCache();
+    TSGgml_Gemma4MoEResetDecodeCache();
+    TSGgml_GptOssResetDecodeCache();
     // A process-global host-weight eviction must retire every verify graph/TP
     // plan, but another live Qwen35 model may still own the only current copy of
     // its recurrent state. Preserve those owner-private state buffers so its next

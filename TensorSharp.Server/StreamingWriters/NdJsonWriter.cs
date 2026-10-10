@@ -8,6 +8,7 @@
 // TensorSharp is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 
+using System;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
@@ -25,6 +26,7 @@ internal static class NdJsonWriter
     {
         response.ContentType = "application/x-ndjson";
         response.Headers.CacheControl = "no-cache";
+        StreamKeepAlive.Stamp(response);
     }
 
     /// <summary>
@@ -40,5 +42,19 @@ internal static class NdJsonWriter
         string json = JsonSerializer.Serialize(payload, jsonOptions);
         await response.WriteAsync(json + "\n", cancellationToken).ConfigureAwait(false);
         await response.Body.FlushAsync(cancellationToken).ConfigureAwait(false);
+        StreamKeepAlive.Stamp(response);
     }
+
+    /// <summary>
+    /// The chunk <paramref name="keepAlive"/> makes, as one line, when nothing has been
+    /// written for <paramref name="interval"/> (see <see cref="StreamKeepAlive"/>). NDJSON
+    /// has no comment, and Ollama clients parse every line, so the caller makes an ordinary
+    /// chunk with nothing in it: an empty message that is not done.
+    /// </summary>
+    public static Task KeepAliveIfIdleAsync(
+        HttpResponse response, TimeSpan interval, Func<object> keepAlive, CancellationToken cancellationToken,
+        JsonSerializerOptions? jsonOptions = null)
+        => StreamKeepAlive.IsDue(response, interval)
+            ? WriteLineAsync(response, keepAlive(), cancellationToken, jsonOptions)
+            : Task.CompletedTask;
 }

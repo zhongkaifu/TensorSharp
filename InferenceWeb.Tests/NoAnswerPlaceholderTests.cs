@@ -19,12 +19,18 @@ namespace InferenceWeb.Tests;
 /// codebase's rule is that every message accusing the model has to be right.
 ///
 /// <para>
-/// It is decided by one flag, <c>sawContent</c>, and three different places stream answer
-/// text: the ordinary parse loop, the parser's final flush, and the retry that runs a
-/// truncated turn again with thinking off. Only the first set the flag. Recorded
+/// It used to be decided by one flag, <c>sawContent</c>, and three different places stream
+/// answer text: the ordinary parse loop, the parser's final flush, and the retry that runs
+/// a truncated turn again with thinking off. Only the first set the flag. Recorded
 /// 2026-09-10: a turn that produced a ten-slide deck, described it in ten numbered lines
 /// and gave the user a download link ended with a sentence telling them nothing had been
 /// written — the placeholder accusing the model of exactly what the retry had just fixed.
+/// </para>
+/// <para>
+/// It is now decided by the answer the page is left showing, <c>visibleAnswer</c>, which
+/// only <c>AnswerFrames</c> writes: text that was shown and then taken back as reasoning
+/// (Nemotron-H Reasoning-128K closing a block its thinking-off prompt had closed) no longer
+/// counts as an answer. So every path that streams answer text has to go through it.
 /// </para>
 /// <para>
 /// A source check rather than a behavioural one because reaching those branches needs a
@@ -64,8 +70,23 @@ public class NoAnswerPlaceholderTests
             "if (reasonedPastItsBudget && tokenCount == 0",
             "if (retryCompleted)");
 
-        Assert.Contains("WebUiSseEvents.Token(update.Piece)", retry, StringComparison.Ordinal);
-        Assert.Contains("sawContent = true;", retry, StringComparison.Ordinal);
+        Assert.Contains("AnswerFrames(", retry, StringComparison.Ordinal);
+        Assert.Contains("visibleAnswer, update.Piece", retry, StringComparison.Ordinal);
+    }
+
+    /// <summary>No answer text reaches the page except through <c>AnswerFrames</c>, which
+    /// keeps the record the placeholder is decided by.</summary>
+    [Fact]
+    public void EveryStreamedAnswer_GoesThroughTheVisibleAnswer()
+    {
+        string turn = Between(
+            Source(),
+            "IOutputParser uiParser = null;",
+            "foreach (object frame in FinalFrames(");
+
+        Assert.DoesNotContain("WebUiSseEvents.Token(", turn, StringComparison.Ordinal);
+        Assert.DoesNotContain("WebUiSseEvents.Replace(", turn, StringComparison.Ordinal);
+        Assert.True(turn.Split("AnswerFrames(").Length - 1 >= 4, "a streaming path no longer goes through AnswerFrames");
     }
 
     /// <summary>
@@ -110,8 +131,8 @@ public class NoAnswerPlaceholderTests
             "var finalParsed = uiParser.Add(\"\", true);",
             "ended this turn without writing an answer");
 
-        Assert.Contains("WebUiSseEvents.Token(finalParsed.Content)", flush, StringComparison.Ordinal);
-        Assert.Contains("sawContent = true;", flush, StringComparison.Ordinal);
+        Assert.Contains("AnswerFrames(", flush, StringComparison.Ordinal);
+        Assert.Contains("visibleAnswer, finalParsed.Content", flush, StringComparison.Ordinal);
     }
 
     /// <summary>
@@ -124,7 +145,7 @@ public class NoAnswerPlaceholderTests
         string source = Source();
         Assert.Contains("ended this turn without writing an answer", source, StringComparison.Ordinal);
 
-        string guard = Between(source, "&& tokenCount > 0 && !sawContent", "ended this turn without writing an answer");
+        string guard = Between(source, "&& IsNullOrWhiteSpace(visibleAnswer)", "ended this turn without writing an answer");
         Assert.True(guard.Length < 400, "the placeholder moved away from its guard");
     }
 }

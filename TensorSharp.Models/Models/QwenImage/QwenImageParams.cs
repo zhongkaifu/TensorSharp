@@ -36,6 +36,12 @@ namespace TensorSharp.Models.QwenImage
         /// <summary>Negative prompt for the CFG pass (empty = unconditional).</summary>
         public string NegativePrompt { get; set; } = " ";
 
+        /// <summary>
+        /// Philox key of the initial noise. Text-to-image noise depends on the seed and size alone
+        /// (stable-diffusion.cpp --rng cuda). An edit's noise also depends on its reference images,
+        /// so an edit never restarts from the noise that drew its source; TS_QWEN21_EDIT_NOISE=seed
+        /// restores seed-only edit noise for matched-noise comparisons.
+        /// </summary>
         public long Seed { get; set; } = 0;
 
         /// <summary>
@@ -56,6 +62,17 @@ namespace TensorSharp.Models.QwenImage
         /// <summary>Optional explicit output width/height override (0 = derive from input + TargetArea).</summary>
         public int Width { get; set; } = 0;
         public int Height { get; set; } = 0;
+
+        /// <summary>
+        /// Edit only: return the first reference image's exact width and height, so an edit of
+        /// an edit keeps the picture's size. Sampling stays within the area the request would
+        /// otherwise use (TargetArea, the server's default size or the automatic area) and
+        /// within the source's own area, at the source's aspect ratio; the decoded result is
+        /// resized to the source when the 32-pixel grid or that cap differs from it. Masked
+        /// edits already return the source canvas. Cannot be combined with Width/Height, which
+        /// choose the output size themselves, and requires a reference image.
+        /// </summary>
+        public bool KeepSourceSize { get; set; } = false;
 
         /// <summary>
         /// Optional mask matching the first reference image's exact dimensions. Masked edits

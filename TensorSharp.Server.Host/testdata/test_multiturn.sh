@@ -202,6 +202,10 @@ test_webui_basic_multiturn() {
         while IFS= read -r line; do
             if echo "$line" | jq -e '.token' &>/dev/null 2>&1; then
                 tokens+=$(echo "$line" | jq -r '.token')
+            elif echo "$line" | jq -e '.replace | type == "string"' &>/dev/null 2>&1; then
+                # The whole answer, when text already streamed proved to be reasoning:
+                # what the next turn sends back is what remains.
+                tokens=$(echo "$line" | jq -r '.replace')
             fi
             if echo "$line" | jq -e '.done == true' &>/dev/null 2>&1; then
                 done_received=true
@@ -500,6 +504,10 @@ test_webui_system_message_long() {
         while IFS= read -r line; do
             if echo "$line" | jq -e '.token' &>/dev/null 2>&1; then
                 tokens+=$(echo "$line" | jq -r '.token')
+            elif echo "$line" | jq -e '.replace | type == "string"' &>/dev/null 2>&1; then
+                # The whole answer, when text already streamed proved to be reasoning:
+                # what the next turn sends back is what remains.
+                tokens=$(echo "$line" | jq -r '.replace')
             fi
             if echo "$line" | jq -e '.done == true' &>/dev/null 2>&1; then
                 done_received=true

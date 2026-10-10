@@ -173,8 +173,13 @@ needs code execution and the required tools described below.
 **Make or edit an image.** On a machine with the required memory, download and
 **Use Qwen-Image 2.1**. Describe the picture in the composer, or attach a photo and
 describe the change. Select a region with the image editor when you want a masked
-edit. Finished edits offer **Compare original** and **Edit again**. Optional
+edit. Finished edits offer **Compare original** and **Edit again**. A follow-up such
+as "make it brighter" changes the picture above, while a new description draws a new
+picture; each picture says which, and the newest offers the other reading. Optional
 **LoRA plug-ins** are under the model-name menu and have separate downloads.
+**Qwen-Image 2.1 Turbo** does the same in 8 steps instead of 40, about a fifth of the
+time, and shares the text encoder, VAE and vision files with Qwen-Image 2.1, so having
+both downloads them once; it offers only the style plug-ins validated on it.
 
 **Make a video.** Download and **Use MiniMax-H3**, then describe a short clip or
 attach a starting photo. **MiniMax-H3 References** accepts reference photos, clips

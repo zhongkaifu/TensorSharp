@@ -90,6 +90,12 @@ public static partial class WebUiRoutes
     /// chat picture does, so the saved choice holds for every picture the app makes: without
     /// it they would use whatever set the last chat picture left on the model.
     /// </param>
+    /// <param name="planImage">
+    /// How the default frame source reads a picture turn's conversation, or null for the
+    /// loaded image model judging it over <paramref name="uploadDirectory"/>
+    /// (<see cref="ImageTurns.Planner.For"/>). A host that passes <paramref name="chatFrames"/>
+    /// plans inside its own frames, as the app's GPU gate does.
+    /// </param>
     public static void MapWebUi(
         this LoopbackServer server,
         WebUiChatService chat,
@@ -98,7 +104,8 @@ public static partial class WebUiRoutes
         ConversationRecorder? recorder = null,
         Func<JsonElement, CancellationToken, IAsyncEnumerable<object>>? chatFrames = null,
         ChatTurnManager? turns = null,
-        Func<bool, ImageTurns.Preparation>? prepareImage = null)
+        Func<bool, ImageTurns.Preparation>? prepareImage = null,
+        ImageTurns.Planner? planImage = null)
     {
         ArgumentNullException.ThrowIfNull(server);
         ArgumentNullException.ThrowIfNull(chat);
@@ -106,7 +113,8 @@ public static partial class WebUiRoutes
         // An image model answers the same route, under the same turn manager and
         // recorder, so a picture survives the page being hidden exactly as an answer
         // does (see ImageTurns).
-        chatFrames ??= (body, ct) => ImageTurns.FramesFor(chat, body, ct, prepareImage);
+        ImageTurns.Planner planner = planImage ?? ImageTurns.Planner.For(chat, uploadDirectory);
+        chatFrames ??= (body, ct) => ImageTurns.FramesFor(chat, body, ct, prepareImage, planner);
 
         // ---- chat ---------------------------------------------------------------
         server.MapGet("/api/queue/status", (_, _) => Ok(chat.GetQueueStatus()));
@@ -402,7 +410,8 @@ public static partial class WebUiRoutes
         ShareIntake? shares = null,
         Func<bool>? hasShareContainer = null,
         Func<string, bool>? discardShare = null,
-        Action<string?>? onModelCacheDirectoryChanged = null)
+        Action<string?>? onModelCacheDirectoryChanged = null,
+        DeviceClass device = DeviceClass.Phone)
     {
         ArgumentNullException.ThrowIfNull(server);
         ArgumentNullException.ThrowIfNull(catalog);
@@ -421,7 +430,7 @@ public static partial class WebUiRoutes
 
         server.MapGet("/api/agent/catalog", (_, _) => Ok(new
         {
-            models = catalog.Select(m => Describe(m, models, downloads)).ToArray(),
+            models = catalog.Select(m => Describe(m, models, downloads, device)).ToArray(),
         }));
 
         server.MapGet("/api/agent/catalog/{id}", (request, _) =>
@@ -429,7 +438,7 @@ public static partial class WebUiRoutes
             CatalogModel? model = Find(request.RouteValues["id"]);
             return model is null
                 ? Task.FromResult<LoopbackResponse?>(LoopbackResponse.Json(new { error = Loc.T("host.models.notFound") }, 404))
-                : Ok(Describe(model, models, downloads));
+                : Ok(Describe(model, models, downloads, device));
         });
 
         // What is transferring right now, whoever started it. A page that was closed
@@ -495,7 +504,7 @@ public static partial class WebUiRoutes
             // it raises describes the symptom rather than the delete that caused it.
             downloads?.Cancel(model.Id);
             models.Delete(model);
-            return Ok(Describe(model, models, downloads));
+            return Ok(Describe(model, models, downloads, device));
         });
 
         server.MapGet("/api/agent/conversations", (_, _) => Ok(new { conversations = conversations.List() }));
@@ -784,7 +793,8 @@ public static partial class WebUiRoutes
         public void Report(ModelDownloadProgress value) => writer.TryWrite(Frame(value));
     }
 
-    private static object Describe(CatalogModel model, ModelStore store, ModelDownloadManager? downloads = null) => new
+    private static object Describe(CatalogModel model, ModelStore store, ModelDownloadManager? downloads = null,
+        DeviceClass device = DeviceClass.Phone) => new
     {
         id = model.Id,
         name = model.DisplayName,
@@ -793,7 +803,9 @@ public static partial class WebUiRoutes
         quantization = model.Quantization,
         notes = model.Notes,
         license = model.License,
-        contextLength = model.ContextLength,
+        // The window a load on THIS device gets when the user has not chosen one: a
+        // desktop's is larger than the phone's (EngineMemoryPolicy.DefaultContextLength).
+        contextLength = EngineMemoryPolicy.DefaultContextLength(model, device),
         modalities = model.Modalities.ToString(),
         kind = model.Kind.ToString(),
         experimental = model.Experimental,
@@ -837,6 +849,7 @@ public static partial class WebUiRoutes
         var seen = new HashSet<string>(StringComparer.Ordinal);
         string? sessionId = null;
         string? imageUrl = null, videoUrl = null, audioUrl = null;
+        ImageTurnRecord? image = null;
         StoredTurnStats? stats = null;
 
         await foreach (object frame in frames.ConfigureAwait(false))
@@ -863,6 +876,8 @@ public static partial class WebUiRoutes
                 && picture.ValueKind == JsonValueKind.String
                 && picture.GetString() is { Length: > 0 } url)
                 imageUrl = url;
+            if (ImageTurnRecord.FromFrame(root) is { } recorded)
+                image = recorded;
             if (root.TryGetProperty("videoUrl", out JsonElement clip)
                 && clip.ValueKind == JsonValueKind.String
                 && clip.GetString() is { Length: > 0 } filmed)
@@ -878,7 +893,7 @@ public static partial class WebUiRoutes
         }
 
         if (sessionId is not null)
-            recorder.Complete(sessionId, content.ToString(), thinking.ToString(), artifacts, imageUrl, videoUrl, audioUrl, stats);
+            recorder.Complete(sessionId, content.ToString(), thinking.ToString(), artifacts, imageUrl, videoUrl, audioUrl, stats, image);
     }
 
     /// <summary>

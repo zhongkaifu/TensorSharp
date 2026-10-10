@@ -45,6 +45,10 @@ public sealed class OllamaAdapter
     private readonly SessionWorkspaceManager _workspaces;
     private readonly ILoggerFactory _loggerFactory;
 
+    /// <summary>How long a stream may go without a byte before it is sent a keep-alive
+    /// (see <see cref="StreamKeepAlive"/>). Settable for tests.</summary>
+    internal TimeSpan KeepAliveInterval { get; init; } = StreamKeepAlive.DefaultInterval;
+
     public OllamaAdapter(
         ModelService svc,
         ServerHostingOptions options,
@@ -418,7 +422,8 @@ public sealed class OllamaAdapter
 
         var parser = OutputParserFactory.Create(_svc.Architecture);
         parser.Init(enableThinking, tools);
-        bool useParser = enableThinking || (tools != null && tools.Count > 0) || parser.AlwaysRequired;
+        bool useParser = enableThinking || (tools != null && tools.Count > 0)
+            || OutputParserFactory.IsAlwaysRequired(_svc.Architecture, _svc.ChatTemplate);
         List<ToolCall>? collectedToolCalls = null;
         // Set when the skills loop hands over already-separated pieces (see
         // SkillChatLoop). `parser` is bypassed for those and must not be flushed at
@@ -431,6 +436,10 @@ public sealed class OllamaAdapter
         {
             if (!update.Done)
             {
+                // Text a parser holds sends nothing for as long as it is held.
+                await NdJsonWriter.KeepAliveIfIdleAsync(ctx.Response, KeepAliveInterval,
+                    () => OllamaResponseFactory.ChatParsedChunk(_svc.LoadedModelName, string.Empty, null),
+                    ctx.RequestAborted, JsonOptions.IgnoreNulls).ConfigureAwait(false);
                 if (update.RawGenerationSuffix != null)
                 {
                     parser.SetGenerationPromptSuffix(update.RawGenerationSuffix);
@@ -573,7 +582,7 @@ public sealed class OllamaAdapter
 
         string rawOutput = collector.PlainText();
         bool useParser = enableThinking || (tools != null && tools.Count > 0)
-            || OutputParserFactory.IsAlwaysRequired(_svc.Architecture);
+            || OutputParserFactory.IsAlwaysRequired(_svc.Architecture, _svc.ChatTemplate);
 
         object finalMessage;
         bool sawToolCalls = false;

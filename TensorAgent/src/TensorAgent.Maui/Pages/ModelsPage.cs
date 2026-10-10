@@ -79,6 +79,7 @@ public sealed class ModelsPage : ContentPage
         BackgroundColor = Theme.Background;
         Padding = new Thickness(0);
         Build();
+        LoopbackWebHost.ValidationTapModel = TapForValidation;
 
         // A new language rebuilds the screen, cells and all. The rows are rebuilt in it by
         // the next Refresh, which appearing always runs.
@@ -595,6 +596,26 @@ public sealed class ModelsPage : ContentPage
         card.SetBinding(Border.StrokeProperty, nameof(ModelRow.CardStroke));
         card.SetBinding(AutomationIdProperty, nameof(ModelRow.AutomationId));
         return card;
+    }
+
+    /// <summary>
+    /// A validation run's tap on a model's action button (see
+    /// <see cref="LoopbackWebHost.ValidationTapModel"/>): open this page as the menu does,
+    /// then take the same action a click takes. Main thread only.
+    /// </summary>
+    private async Task<string> TapForValidation(string id)
+    {
+        if (!AppShell.IsOnTop(this))
+            await AppShell.OpenAsync("models");
+        ModelRow? row = _rows.FirstOrDefault(r => string.Equals(r.Model.Id, id, StringComparison.Ordinal));
+        if (row is null)
+            return "no such model";
+        if (!row.Runnable || !row.IsInstalled)
+            return "not installed or not runnable here";
+        if (row.IsBusy || _selecting)
+            return "busy";
+        OnAction(row);
+        return "tapped";
     }
 
     private async void OnAction(ModelRow? row)

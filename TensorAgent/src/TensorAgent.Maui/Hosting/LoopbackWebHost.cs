@@ -158,6 +158,13 @@ public sealed class LoopbackWebHost : IDisposable
             }
             _host.Options.RepointHostedModel(weights, projector);
         }
+        // A validation run can tap a model's action on the Models page from a script: the
+        // GUI cannot be driven while the screen is locked, and a switch made any other way
+        // skips the page's own path (Select, Refresh, the way back to the chat). Mapped
+        // before the server starts because its route table is not safe to grow while it
+        // serves.
+        if (ValidationRoot() is not null)
+            MapValidationRoutes();
         _running = this;
         _host.Start();
         // Windows GUI launches have no attached console. An explicitly isolated
@@ -183,6 +190,29 @@ public sealed class LoopbackWebHost : IDisposable
 #endif
     }
 
+    /// <summary>
+    /// What a validation script's "tap" lands on: the Models page sets it to its own action
+    /// handler. Null until that page exists.
+    /// </summary>
+    internal static Func<string, Task<string>>? ValidationTapModel { get; set; }
+
+    private void MapValidationRoutes()
+    {
+        // POST /api/agent/validation/tap-model {"id": "<catalog id>"}: press that model's
+        // action button, on the main thread, exactly as a click does. Answers once the tap
+        // is delivered; the load it starts is followed through /api/agent/engine.
+        _host.Server.MapPost("/api/agent/validation/tap-model", async (request, ct) =>
+        {
+            System.Text.Json.JsonElement body = await request.ReadJsonAsync(ct);
+            string id = body.TryGetProperty("id", out var value) ? value.GetString() ?? string.Empty : string.Empty;
+            Func<string, Task<string>>? tap = ValidationTapModel;
+            if (tap is null)
+                return LoopbackResponse.Json(new { ok = false, error = "the Models page does not exist yet" }, 409);
+            string outcome = await MainThread.InvokeOnMainThreadAsync(() => tap(id));
+            return LoopbackResponse.Json(new { ok = outcome == "tapped", outcome, id });
+        });
+    }
+
     /// <summary>The host the app is running, while it is running; see <see cref="ShutDownForTermination"/>.</summary>
     private static LoopbackWebHost? _running;
 
@@ -201,6 +231,10 @@ public sealed class LoopbackWebHost : IDisposable
     public static void ShutDownForTermination()
     {
         LoopbackWebHost? running = Interlocked.Exchange(ref _running, null);
+        // First, because the quit can end in _exit below, which skips Dispose: a model
+        // still loading or warming up when the user quits did not crash the app, and the
+        // next launch must load it as usual (see AgentAppHost.LoadSelectedModelInBackground).
+        running?._host.ForgetModelLoadInProgress();
         // Mac Catalyst gives applicationWillTerminate about five seconds: past that,
         // UIKitMacHelper's lifecycle watchdog calls exit() itself. A clip mid-step takes
         // longer than that to stop (MEASURED: a quit three steps into a 22-frame clip was

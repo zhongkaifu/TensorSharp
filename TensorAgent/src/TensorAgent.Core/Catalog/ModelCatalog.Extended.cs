@@ -10,6 +10,9 @@ public static partial class ModelCatalog
     // inference validation: all newly exposed entries remain explicitly experimental.
     // Memory tiers are conservative capacity estimates, without unmeasured disk-paging
     // deductions; actual backend support and generation memory depend on the model card.
+    // The layer counts, KV heads and head dims behind each KvBytesPerToken were read on
+    // 2026-10-08 from the metadata of the pinned GGUF files themselves (block_count,
+    // attention.head_count_kv, key/value_length, sliding_window, kv_lora_rank).
     private static IEnumerable<CatalogModel> ExtendedModels()
     {
         yield return new CatalogModel
@@ -35,6 +38,10 @@ public static partial class ModelCatalog
             Modalities = CatalogModalities.Image | CatalogModalities.Video,
             MinDeviceMemoryGB = 32,
             ContextLength = 8192,
+            // 30 layers, one in six global with two KV heads of 512; the other 25 keep
+            // 1,024-row sliding rings, a fixed 200 MiB: 5 x 2 x 512 x 2 x 2 bytes.
+            // Desktop window 32,768.
+            KvBytesPerToken = 5 * 2 * 512 * 2 * 2,
             KvCacheDtype = "f16",
             LeanCaches = true,
             Sampling = new CatalogSampling(1.0f, 64, 0.95f, 0.0f),
@@ -67,6 +74,10 @@ public static partial class ModelCatalog
             Modalities = CatalogModalities.Image | CatalogModalities.Video,
             MinDeviceMemoryGB = 32,
             ContextLength = 8192,
+            // 60 layers, one in six global with four KV heads of 512 (the sliding layers'
+            // 1,024-row rings are a fixed 800 MiB): 10 x 4 x 512 x 2 x 2 bytes = 80 KiB.
+            // Beside 18 GB of weights the 32 GB tier affords 20,480 on a desktop.
+            KvBytesPerToken = 10 * 4 * 512 * 2 * 2,
             KvCacheDtype = "f16",
             LeanCaches = true,
             Sampling = new CatalogSampling(1.0f, 64, 0.95f, 0.0f),
@@ -96,6 +107,10 @@ public static partial class ModelCatalog
             Modalities = CatalogModalities.Image,
             MinDeviceMemoryGB = 48,
             ContextLength = 8192,
+            // qwen35moe: 40 layers, every fourth full attention (two KV heads of 256), the
+            // rest linear attention with a fixed state: 10 x 2 x 256 x 2 x 2 bytes.
+            // Desktop window 32,768.
+            KvBytesPerToken = 10 * 2 * 256 * 2 * 2,
             KvCacheDtype = "q8_0",
             LeanCaches = true,
             Sampling = new CatalogSampling(0.7f, 20, 0.8f, 0.0f),
@@ -125,6 +140,10 @@ public static partial class ModelCatalog
             Modalities = CatalogModalities.Image,
             MinDeviceMemoryGB = 48,
             ContextLength = 8192,
+            // qwen35moe: 40 layers and the MTP block; every fourth layer and the MTP block
+            // are full attention (two KV heads of 256): 11 x 2 x 256 x 2 x 2 bytes.
+            // Desktop window 32,768.
+            KvBytesPerToken = 11 * 2 * 256 * 2 * 2,
             KvCacheDtype = "q8_0",
             LeanCaches = true,
             Sampling = new CatalogSampling(0.7f, 20, 0.8f, 0.0f),
@@ -154,6 +173,10 @@ public static partial class ModelCatalog
             Modalities = CatalogModalities.Image,
             MinDeviceMemoryGB = 32,
             ContextLength = 8192,
+            // qwen35: 64 layers and the MTP block; every fourth layer and the MTP block are
+            // full attention (four KV heads of 256): 17 x 4 x 256 x 2 x 2 bytes = 68 KiB at
+            // f16, half that at the entry's q8_0. At f16 the 32 GB tier affords 28,672.
+            KvBytesPerToken = 17 * 4 * 256 * 2 * 2,
             KvCacheDtype = "q8_0",
             LeanCaches = true,
             Sampling = new CatalogSampling(0.7f, 20, 0.8f, 0.0f),
@@ -180,6 +203,10 @@ public static partial class ModelCatalog
             Modalities = CatalogModalities.Text,
             MinDeviceMemoryGB = 24,
             ContextLength = 8192,
+            // 24 layers with eight KV heads of 64. Half are 128-token sliding layers, but the
+            // engine sizes every layer's cache to the whole context (GptOssModel.InitKVCache),
+            // so all count: 24 x 8 x 64 x 2 x 2 bytes = 48 KiB. Desktop window 32,768.
+            KvBytesPerToken = 24 * 8 * 64 * 2 * 2,
             KvCacheDtype = "f16",
             LeanCaches = true,
             Sampling = new CatalogSampling(0.7f, 40, 0.95f, 0.0f),
@@ -206,6 +233,10 @@ public static partial class ModelCatalog
             Modalities = CatalogModalities.Text,
             MinDeviceMemoryGB = 24,
             ContextLength = 8192,
+            // 52 layers, of which only 7, 18, 29 and 40 are attention (eight KV heads of
+            // 128); the rest are Mamba2 or FFN with a fixed state: 4 x 8 x 128 x 2 x 2
+            // bytes = 16 KiB. Desktop window 32,768.
+            KvBytesPerToken = 4 * 8 * 128 * 2 * 2,
             KvCacheDtype = "f16",
             LeanCaches = true,
             Sampling = new CatalogSampling(0.7f, 40, 0.95f, 0.0f),
@@ -232,6 +263,9 @@ public static partial class ModelCatalog
             Modalities = CatalogModalities.Text,
             MinDeviceMemoryGB = 48,
             ContextLength = 8192,
+            // 98 layers, five of them attention (eight KV heads of 128), the rest Mamba2 or
+            // FFN: 5 x 8 x 128 x 2 x 2 bytes. Desktop window 32,768.
+            KvBytesPerToken = 5 * 8 * 128 * 2 * 2,
             KvCacheDtype = "f16",
             LeanCaches = true,
             Sampling = new CatalogSampling(0.7f, 40, 0.95f, 0.0f),
@@ -261,6 +295,9 @@ public static partial class ModelCatalog
             Modalities = CatalogModalities.Image,
             MinDeviceMemoryGB = 48,
             ContextLength = 8192,
+            // 52 layers, six attention (two KV heads of 128), the rest Mamba2 or MoE:
+            // 6 x 2 x 128 x 2 x 2 bytes. Desktop window 32,768.
+            KvBytesPerToken = 6 * 2 * 128 * 2 * 2,
             KvCacheDtype = "f16",
             LeanCaches = true,
             Sampling = new CatalogSampling(0.7f, 40, 0.95f, 0.0f),
@@ -287,6 +324,9 @@ public static partial class ModelCatalog
             Modalities = CatalogModalities.Text,
             MinDeviceMemoryGB = 48,
             ContextLength = 8192,
+            // 53 layers, seven attention (two KV heads of 128), the rest Mamba2 or MoE:
+            // 7 x 2 x 128 x 2 x 2 bytes. Desktop window 32,768.
+            KvBytesPerToken = 7 * 2 * 128 * 2 * 2,
             KvCacheDtype = "f16",
             LeanCaches = true,
             Sampling = new CatalogSampling(0.7f, 40, 0.95f, 0.0f),
@@ -316,6 +356,10 @@ public static partial class ModelCatalog
             Modalities = CatalogModalities.Image,
             MinDeviceMemoryGB = 32,
             ContextLength = 8192,
+            // 40 full-attention layers with eight KV heads of 128: 40 x 8 x 128 x 2 x 2 bytes
+            // = 160 KiB, the most per token of any chat entry. Beside 14.3 GB of weights
+            // the 32 GB tier affords 16,384 on a desktop.
+            KvBytesPerToken = 40 * 8 * 128 * 2 * 2,
             KvCacheDtype = "f16",
             LeanCaches = true,
             Sampling = new CatalogSampling(0.7f, 40, 0.95f, 0.0f),
@@ -342,6 +386,9 @@ public static partial class ModelCatalog
             Modalities = CatalogModalities.Text,
             MinDeviceMemoryGB = 24,
             ContextLength = 8192,
+            // 32 full-attention layers with four KV heads of 128: 32 x 4 x 128 x 2 x 2 bytes.
+            // Desktop window 32,768.
+            KvBytesPerToken = 32 * 4 * 128 * 2 * 2,
             KvCacheDtype = "f16",
             LeanCaches = true,
             Sampling = new CatalogSampling(0.7f, 40, 0.95f, 0.0f),
@@ -377,6 +424,10 @@ public static partial class ModelCatalog
             Modalities = CatalogModalities.Text,
             MinDeviceMemoryGB = 192,
             ContextLength = 8192,
+            // 43 layers, each a 512-wide latent row (K and V share it) and a 128-wide indexer
+            // key. Most layers keep a quarter or 1/128 of the rows; counting every row of
+            // every layer is an upper bound: 43 x (512 + 128) x 2 bytes. Desktop 32,768.
+            KvBytesPerToken = 43 * (512 + 128) * 2,
             KvCacheDtype = "f16",
             LeanCaches = true,
             Sampling = new CatalogSampling(0.0f, 0, 1.0f, 0.0f),
@@ -430,6 +481,10 @@ public static partial class ModelCatalog
             Modalities = CatalogModalities.Text,
             MinDeviceMemoryGB = 512,
             ContextLength = 8192,
+            // 40 layers, each a 512-wide latent row and a 128-wide indexer key; the compressed
+            // layers keep half of the rows, so counting all of them is an upper bound:
+            // 40 x (512 + 128) x 2 bytes. Desktop window 32,768.
+            KvBytesPerToken = 40 * (512 + 128) * 2,
             KvCacheDtype = "f16",
             LeanCaches = true,
             Sampling = new CatalogSampling(0.7f, 40, 0.95f, 0.0f),
@@ -471,6 +526,10 @@ public static partial class ModelCatalog
             Modalities = CatalogModalities.Text,
             MinDeviceMemoryGB = 384,
             ContextLength = 8192,
+            // MLA: one 576-wide row per token (kv_lora_rank 512 + 64 rope) and the DSA
+            // indexer's 128-wide key, for 78 trunk layers and the MTP block:
+            // 79 x (576 + 128) x 2 bytes. Desktop window 32,768.
+            KvBytesPerToken = 79 * (576 + 128) * 2,
             KvCacheDtype = "f16",
             LeanCaches = true,
             Sampling = new CatalogSampling(0.7f, 40, 0.95f, 0.0f),
@@ -515,6 +574,10 @@ public static partial class ModelCatalog
             Modalities = CatalogModalities.Text,
             MinDeviceMemoryGB = 384,
             ContextLength = 8192,
+            // MLA: one 576-wide row per token (kv_lora_rank 512 + 64 rope) and the DSA
+            // indexer's 128-wide key, for 78 trunk layers and the MTP block:
+            // 79 x (576 + 128) x 2 bytes. Desktop window 32,768.
+            KvBytesPerToken = 79 * (576 + 128) * 2,
             KvCacheDtype = "f16",
             LeanCaches = true,
             Sampling = new CatalogSampling(0.7f, 40, 0.95f, 0.0f),
@@ -553,6 +616,10 @@ public static partial class ModelCatalog
             Modalities = CatalogModalities.Image,
             MinDeviceMemoryGB = 192,
             ContextLength = 8192,
+            // glm5-next: 12 of its 46 layers keep a 512-wide MLA row (no rope) and a
+            // 128-wide indexer key, the rest a fixed KDA state: 12 x (512 + 128) x 2 bytes.
+            // Desktop window 32,768.
+            KvBytesPerToken = 12 * (512 + 128) * 2,
             KvCacheDtype = "f16",
             LeanCaches = true,
             Sampling = new CatalogSampling(0.7f, 40, 0.95f, 0.0f),

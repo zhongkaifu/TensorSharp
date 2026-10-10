@@ -533,6 +533,203 @@ public class RadixHolderEngineTests
         Assert.Equal(prefixLength, (await Run(restarted, afterRestart)).PrefixCacheReusedTokens);
     }
 
+    /// <summary>Qwen 3.5's prefix-cache shape (exact-length holders, persistable) with its
+    /// real media rule: a reused prefix may continue across an image span
+    /// (Qwen35Model's <c>ReuseAcrossMediaSpan</c>).</summary>
+    private static OracleModel MediaRecurrent() => new(new OracleTraits
+    {
+        Name = "R-media", Class = FamilyClass.R, EndState = EndStateSupport.CopyAndDonate,
+        CanCaptureCopy = true, AdoptPrimaryOnDisplacement = true, Persistable = true,
+        DeviceDirtyOnForward = true, Truncation = TruncationKind.None, Pages = PageSupport.None,
+        ReuseAcrossMediaSpan = true,
+    }, 8);
+
+    private static SequenceState ImageTurn(string id, List<int> prompt, IReadOnlyList<PromptMediaSpan> spans,
+        int shared, string scope) => new(id, prompt, 3, 8, SamplingConfig.Greedy,
+            mediaSpans: spans, cacheScope: scope, sharedPrefixTokens: shared);
+
+    private static List<int> Continue(SequenceState previous, params int[] tail) =>
+        previous.PromptTokens.Concat(previous.OutputTokens).Take(previous.NumComputedTokens).Concat(tail).ToList();
+
+    // Live, on Qwen3.8 27B: the warm-up published the 7,219-token shared prompt, and an
+    // image chat right after it logged "reuse=0", because the attachment's name was in a
+    // tool declaration inside that prefix. With the prefix identical, an image placed after
+    // it is the ordinary case: the chat reuses the warm-up's checkpoint, a text follow-up
+    // its own turn through the image, and a later turn that attaches another file the turn
+    // before it -- each with the output a cold engine computes.
+    [Fact]
+    public async Task ImageChat_ReusesTheWarmupPrefix_AndEachFollowUpReusesThePreviousTurn()
+    {
+        const int shared = 16;
+        List<int> system = Tokens(shared);
+        var store = new MultipleCheckpointStore();
+        using var engine = new InferenceEngine(MediaRecurrent(), Configuration());
+        engine.PrefixCheckpointStore = store;
+        await Run(engine, new SequenceState("warmup", system.Concat(new[] { 201, 202 }).ToList(), 1, 8,
+            SamplingConfig.Greedy, cacheScope: "warmup", sharedPrefixTokens: shared));
+        Assert.Contains(shared, store.SavedLengths);
+
+        var cat = new PromptMediaSpan(shared + 3, shared + 11, new string('a', 64));
+        List<int> imagePrompt = system.Concat(new[] { 203, 204, 205 })
+            .Concat(Enumerable.Repeat(240, 8)).Concat(new[] { 206, 207 }).ToList();
+        var image = ImageTurn("image", imagePrompt, new[] { cat }, shared, "chat");
+        Assert.Equal(shared, (await Run(engine, image)).PrefixCacheReusedTokens);
+
+        var text = ImageTurn("text", Continue(image, 208, 209), new[] { cat }, shared, "chat");
+        int textReuse = (await Run(engine, text)).PrefixCacheReusedTokens;
+        Assert.True(textReuse >= cat.End, $"the follow-up reused {textReuse}, not past the image ({cat.End})");
+        Assert.Equal(image.NumComputedTokens, textReuse);
+
+        List<int> laterPrompt = Continue(text, 210);
+        var dog = new PromptMediaSpan(laterPrompt.Count, laterPrompt.Count + 8, new string('b', 64));
+        laterPrompt.AddRange(Enumerable.Repeat(241, 8));
+        laterPrompt.Add(211);
+        var later = ImageTurn("later", laterPrompt, new[] { cat, dog }, shared, "chat");
+        Assert.True((await Run(engine, later)).PrefixCacheReusedTokens >= text.NumComputedTokens);
+        // The media prefix is never what a store holds: only the text-only shared prefix was saved.
+        Assert.All(store.SavedLengths, length => Assert.True(length <= cat.Start));
+
+        using var cold = new InferenceEngine(MediaRecurrent(), Configuration(false));
+        foreach (SequenceState warm in new[] { image, text, later })
+        {
+            var reference = new SequenceState("cold-" + warm.RequestId, warm.PromptTokens.ToList(), 3, 8,
+                SamplingConfig.Greedy, mediaSpans: warm.MediaSpans);
+            await Run(cold, reference);
+            Assert.Equal(reference.OutputTokens, warm.OutputTokens);
+        }
+    }
+
+    // An image as the first message after a restart (or after the resident checkpoint was
+    // evicted) restores the shared prefix from disk like a text chat: the store key is the
+    // prefix's text tokens, and the image comes after them. Refusing every media request
+    // here meant such a chat prefilled the whole shared prompt again.
+    [Fact]
+    public async Task ImageChatAfterRestart_RestoresTheSharedPrefixFromDisk()
+    {
+        const int shared = 16;
+        List<int> system = Tokens(shared);
+        var store = new MultipleCheckpointStore();
+        using (var engine = new InferenceEngine(MediaRecurrent(), Configuration()))
+        {
+            engine.PrefixCheckpointStore = store;
+            await Run(engine, new SequenceState("warmup", system.Concat(new[] { 201 }).ToList(), 1, 8,
+                SamplingConfig.Greedy, cacheScope: "warmup", sharedPrefixTokens: shared));
+        }
+
+        using var restarted = new InferenceEngine(MediaRecurrent(), Configuration());
+        restarted.PrefixCheckpointStore = store;
+        var span = new PromptMediaSpan(shared + 2, shared + 10, new string('c', 64));
+        List<int> prompt = system.Concat(new[] { 212, 213 }).Concat(Enumerable.Repeat(242, 8)).Concat(new[] { 214 }).ToList();
+        var request = ImageTurn("after-restart", prompt, new[] { span }, shared, "fresh");
+        Assert.Equal(shared, (await Run(restarted, request)).PrefixCacheReusedTokens);
+        Assert.Contains(shared, store.OpenedLengths);
+    }
+
+    // With no warm-up -- the first message after a launch whose warm-up was skipped, or a
+    // host that never warms -- the image chat itself is the first request to compute the
+    // shared prefix. That prefix holds no media, so it is saved like a text chat's; a
+    // boundary a span starts before is not. This used to refuse every request with any
+    // media, so the next launch prefilled the whole shared prompt again.
+    [Theory]
+    [InlineData(19, 8, new[] { 16 })]   // the image is in the user turn, behind the shared prompt
+    [InlineData(12, 3, new[] { 8 })]    // a span inside the shared prefix: only the ancestor before it
+    public async Task ImageChatWithoutAWarmup_SavesTheSharedPrefixBeforeItsImage(int spanStart, int spanLength, int[] saved)
+    {
+        const int shared = 16;
+        var store = new MultipleCheckpointStore();
+        using var engine = new InferenceEngine(MediaRecurrent(), Configuration());
+        engine.PrefixCheckpointStore = store;
+        var span = new PromptMediaSpan(spanStart, spanStart + spanLength, new string('e', 64));
+        List<int> prompt = Tokens(spanStart).Concat(Enumerable.Repeat(243, spanLength))
+            .Concat(new[] { 215, 216, 217, 218 }).ToList();
+        var request = new SequenceState("first", prompt, 3, 8, SamplingConfig.Greedy,
+            mediaSpans: new[] { span }, cacheScope: "chat", sharedPrefixTokens: shared,
+            publicCheckpointBoundaries: new[] { 8 });
+
+        Assert.Equal(0, (await Run(engine, request)).PrefixCacheReusedTokens);
+        foreach (int length in saved)
+            Assert.Contains(length, store.SavedLengths);
+        Assert.All(store.SavedLengths, length => Assert.True(length < span.Start,
+            $"saved a {length}-token prefix at or past the image at {span.Start}"));
+
+        // What was saved is the text prefix the store is keyed by: a text chat after a
+        // restart restores it.
+        using var restarted = new InferenceEngine(MediaRecurrent(), Configuration());
+        restarted.PrefixCheckpointStore = store;
+        int longest = saved.Max();
+        var text = new SequenceState("text", prompt.Take(longest).Concat(new[] { 219, 220 }).ToList(), 3, 8,
+            SamplingConfig.Greedy, cacheScope: "other", sharedPrefixTokens: longest);
+        Assert.Equal(longest, (await Run(restarted, text)).PrefixCacheReusedTokens);
+    }
+
+    // The gate is per boundary: a checkpoint is looked up only when every media span of the
+    // request starts at or after it, because the store key says nothing of an image's pixels.
+    [Theory]
+    [InlineData(-1, new[] { 16, 8 })]   // no media
+    [InlineData(16, new[] { 16, 8 })]   // the span starts exactly at the shared boundary
+    [InlineData(12, new[] { 8 })]       // a span inside the shared prefix: only the ancestor
+    [InlineData(4, new int[0])]         // a span before every boundary: nothing
+    public void CheckpointRestore_IsGatedPerBoundaryByTheFirstMediaSpan(int spanStart, int[] opened)
+    {
+        using var model = MediaRecurrent();
+        var (_, cache) = PendingCheckpointScheduler(model);
+        var store = new MultipleCheckpointStore();
+        cache!.CheckpointStore = store;
+        PromptMediaSpan[]? spans = spanStart < 0
+            ? null
+            : new[] { new PromptMediaSpan(spanStart, spanStart + 8, new string('d', 64)) };
+        var sequence = new SequenceState("gate", Tokens(40), 3, 8, SamplingConfig.Greedy,
+            mediaSpans: spans, cacheScope: "gate", sharedPrefixTokens: 16,
+            publicCheckpointBoundaries: new[] { 8 });
+
+        Assert.Equal(0, cache.ComputeReusablePrefix(sequence));
+        Assert.Equal(opened, store.OpenedLengths);
+    }
+
+    [Fact]
+    public void DeclineReason_NamesAPromptThatLeftItsOwnSharedPrefix_AndTheRealClamp()
+    {
+        // Every cached prefix ends inside this prompt's shared prefix: its shared part drifted.
+        var drifted = new MatchPlan { Structural = 5_300 };
+        Assert.Equal("the prompt leaves every cached prefix at token 5300, inside its 7219-token shared prefix",
+            PrefixCacheCoordinator.DescribeDecline(drifted, publicBoundary: 7_219, rewindCapTokens: 16));
+
+        // Gemma 4's rewind past the cap is said as that, and never blamed on a media span --
+        // not even one that cut ANOTHER source: each source is described by its own clamps.
+        var rewound = new MatchPlan
+        {
+            Structural = 7_400,
+            TruncationDecline = SourceDecline.Clamped,
+            TruncationClamps = ClampReasons.RewindCap,
+            EndStateDecline = SourceDecline.Clamped,
+            EndStateClamps = ClampReasons.Media,
+            Clamps = ClampReasons.RewindCap | ClampReasons.Media,
+        };
+        string reason = PrefixCacheCoordinator.DescribeDecline(rewound, publicBoundary: 7_219, rewindCapTokens: 16)!;
+        Assert.Equal("rewinding the cached conversation is cut short by the 16-token rewind cap", reason);
+        Assert.DoesNotContain("media", reason, StringComparison.Ordinal);
+
+        var media = new MatchPlan
+        {
+            Structural = 7_400,
+            EndStateDecline = SourceDecline.Clamped,
+            EndStateClamps = ClampReasons.Media,
+            Clamps = ClampReasons.Media,
+        };
+        Assert.Equal("the retained state is cut short by a media span",
+            PrefixCacheCoordinator.DescribeDecline(media, publicBoundary: 7_219, rewindCapTokens: 16));
+
+        // Every flag has words; only a cut no flag records is "a clamp".
+        foreach (ClampReasons flag in Enum.GetValues<ClampReasons>().Where(flag => flag != ClampReasons.None))
+            Assert.NotEqual("a clamp", PrefixCacheCoordinator.ClampWords(flag, rewindCapTokens: 16));
+        Assert.Equal("the media reuse threshold and the minimum clone length",
+            PrefixCacheCoordinator.ClampWords(ClampReasons.MmThreshold | ClampReasons.CloneCost, rewindCapTokens: 16));
+        Assert.Equal("a clamp", PrefixCacheCoordinator.ClampWords(ClampReasons.None, rewindCapTokens: 16));
+
+        // Nothing matched at all, or a longer source simply won: nothing to say.
+        Assert.Null(PrefixCacheCoordinator.DescribeDecline(new MatchPlan(), publicBoundary: 7_219, rewindCapTokens: 16));
+    }
+
     [Fact]
     public async Task ExplicitNone_DoesNotReadOrPublishPayloads()
     {

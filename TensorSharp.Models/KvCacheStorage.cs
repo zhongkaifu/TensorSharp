@@ -228,4 +228,97 @@ namespace TensorSharp.Models
                 Set(dtype);
         }
     }
+
+    /// <summary>
+    /// Reads a linear K/V cache tensor back from host memory as float32, for code that
+    /// moves a sequence's history out of the cache into float storage of its own (the
+    /// linear-to-paged migration of Nemotron-H and gpt-oss). Every dtype
+    /// <see cref="KvCacheDtypeConfig"/> can select is readable: F32 as is, F16 widened,
+    /// and the block-quantized Q8_0 / Q4_0 dequantized with ggml's reference block layout
+    /// (<see cref="ManagedQuantizedOps"/>, TensorSharp-owned). Both writers of a quantized
+    /// cache use that layout - prefill rows are quantized by the managed
+    /// <c>CopyToCacheBlockQuant</c>, decode rows by ggml's own <c>cpy</c> kernel - so the
+    /// float read is exactly what the attention kernels see.
+    ///
+    /// <para>The caller makes the host copy current first (a device-resident cache is
+    /// synced to its host mirror); this method only drains in-flight async work, as
+    /// <see cref="TensorComputePrimitives.GetHalfPointer"/> does.</para>
+    /// </summary>
+    internal static class KvCacheHostReader
+    {
+        private const int QuantBlockElements = 32;
+
+        /// <summary>
+        /// Rows <c>[0, <paramref name="rows"/>)</c> of every head of a
+        /// <c>[heads, capacity, headDim]</c> cache as float32, laid out
+        /// <c>[heads, rows, headDim]</c>. Only the rows a sequence holds are read: the
+        /// cache is sized for the whole context (32k rows on a server), and reading all of
+        /// it dequantized two 134 MB arrays per attention layer of Nemotron-H 8B to move a
+        /// few hundred rows. Each head's leading rows are one contiguous run, and for a
+        /// block-quantized cache a whole number of 32-element blocks (a K/V row of 64, 128 or
+        /// 256 is), so they decode as stored. A cache of another shape or offset, a row that
+        /// is not whole blocks, or a dtype this reader does not know returns false with
+        /// nothing read.
+        /// </summary>
+        internal static unsafe bool TryReadHeadRowsAsFloat32(Tensor cache, int rows, out float[] flat)
+        {
+            flat = null;
+            if (cache == null || cache.DimensionCount != 3 || cache.StorageOffset != 0 || !cache.IsContiguous())
+                return false;
+            int heads = (int)cache.Sizes[0], capacity = (int)cache.Sizes[1], headDim = (int)cache.Sizes[2];
+            if (rows < 0 || rows > capacity || heads <= 0 || headDim <= 0)
+                return false;
+            long headStride = (long)capacity * headDim;
+            bool blockQuant = cache.ElementType is DType.Q8_0 or DType.Q4_0;
+            if (!blockQuant && cache.ElementType is not (DType.Float32 or DType.Float16))
+                return false;
+            if (blockQuant && (headDim % QuantBlockElements != 0
+                || cache.Storage.ByteLength < cache.ElementType.ByteLengthFor(heads * headStride)))
+                return false;
+            int run = rows * headDim;
+            var result = new float[(long)heads * run];
+            switch (cache.ElementType)
+            {
+                case DType.Float32:
+                {
+                    float* src = TensorComputePrimitives.GetFloatPointer(cache);
+                    fixed (float* dst = result)
+                        for (int h = 0; h < heads; h++)
+                            Buffer.MemoryCopy(src + h * headStride, dst + (long)h * run,
+                                (long)run * sizeof(float), (long)run * sizeof(float));
+                    break;
+                }
+                case DType.Float16:
+                {
+                    ushort* src = TensorComputePrimitives.GetHalfPointer(cache);
+                    fixed (float* dst = result)
+                        for (int h = 0; h < heads; h++)
+                            TensorComputePrimitives.F16ToF32(dst + (long)h * run, src + h * headStride, run);
+                    break;
+                }
+                default: // Q8_0 / Q4_0, checked above
+                {
+                    cache.Storage.EnsureHostReadable();
+                    // A quantized storage has no element address but its first.
+                    IntPtr basePtr = cache.Storage.PtrAtElement(0);
+                    int ggmlType = GgmlTypeOf(cache.ElementType);
+                    for (int h = 0; h < heads && run > 0; h++)
+                    {
+                        IntPtr src = basePtr + (nint)cache.ElementType.ByteLengthFor(h * headStride);
+                        ManagedQuantizedOps.DequantizeToFloat32(ggmlType, src, result, h * run, run);
+                    }
+                    break;
+                }
+            }
+            flat = result;
+            return true;
+        }
+
+        private static int GgmlTypeOf(DType dtype) => dtype switch
+        {
+            DType.Q8_0 => KvCacheDtype.Q8_0.GgmlType(),
+            DType.Q4_0 => KvCacheDtype.Q4_0.GgmlType(),
+            _ => throw new ArgumentOutOfRangeException(nameof(dtype)),
+        };
+    }
 }

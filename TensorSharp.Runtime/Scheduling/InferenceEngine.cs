@@ -106,6 +106,10 @@ namespace TensorSharp.Runtime.Scheduling
 
         public IModelArchitecture Model => _model;
         public BlockPoolStats PoolStats => _pool.GetStats();
+        /// <summary>The block pool itself, for tests that inspect its slabs.</summary>
+        internal BlockPool Pool => _pool;
+        /// <summary>The radix prefix cache, or null when it does not serve this model.</summary>
+        internal PrefixCache.PrefixCacheCoordinator? RadixCache => _executor.RadixCache;
         public long TotalCompleted => Interlocked.Read(ref _totalCompleted);
         public long TotalSubmitted => Interlocked.Read(ref _totalSubmitted);
         public long TotalStepsRun => Interlocked.Read(ref _totalStepsRun);

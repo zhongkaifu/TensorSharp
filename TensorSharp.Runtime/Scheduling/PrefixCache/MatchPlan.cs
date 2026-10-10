@@ -138,6 +138,7 @@ internal sealed class MatchPlan
     public int BlockedByScope;                               // O2 (sampled; never influences the plan)
     public ClampReasons Clamps;
     public SourceDecline EndStateDecline, PageDecline, PrimaryDecline, TruncationDecline;   // real reasons for O1
+    public ClampReasons EndStateClamps, PageClamps, PrimaryClamps, TruncationClamps;       // Clamps, per source (O1's words)
     public bool SearchCapped;                                // more than MaxTrailEnds alternative paths
     public bool TruncationSearchCapped;                      // the truncation BFS stopped at its node budget
     public int CandidateCount;                               // candidates considered (diagnostics)
@@ -150,6 +151,8 @@ internal sealed class MatchPlan
         AnchorParent = null; AnchorOffset = 0; AnchorTrailEnd = -1; PayloadNode = null; PageCount = 0;
         Structural = 0; PublicCap = 0; PublicTokens = 0; BranchPosition = 0; BlockedByScope = 0;
         Clamps = ClampReasons.None;
+        EndStateClamps = ClampReasons.None; PageClamps = ClampReasons.None;
+        PrimaryClamps = ClampReasons.None; TruncationClamps = ClampReasons.None;
         EndStateDecline = SourceDecline.None; PageDecline = SourceDecline.None;
         PrimaryDecline = SourceDecline.None; TruncationDecline = SourceDecline.None;
         SearchCapped = false; TruncationSearchCapped = false; CandidateCount = 0;

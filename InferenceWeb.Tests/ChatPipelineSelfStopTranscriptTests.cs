@@ -73,6 +73,96 @@ public sealed class ChatPipelineSelfStopTranscriptTests : IDisposable
         Assert.Equal(forwarded, recorded.Take(forwarded.Length).ToArray());
     }
 
+    /// <summary>
+    /// A turn's raw tokens are filed under the model load that produced them, and only that
+    /// load gets them back. After a switch the app keeps the same chat open, and the old
+    /// model's ids used to be spliced into the new model's prompt.
+    /// </summary>
+    [Fact]
+    public async Task ATurnIsRecordedUnderTheLoadThatProducedIt()
+    {
+        using var lifecycle = new ModelLifecycleService(NullLogger.Instance,
+            (path, backend, tp, draft) => new DigitModel(path));
+        lifecycle.LoadModel(_path, null, "cpu");
+        lifecycle.LoadModel(_path, null, "cpu");   // a switch: this load's epoch is not the first's
+        Assert.NotEqual(0, lifecycle.LoadEpoch);
+        using var host = new InferenceEngineHost(lifecycle, NullLogger.Instance) { SchedulerConfigOverride = Config() };
+        var pipeline = new ChatGenerationPipeline(lifecycle, host,
+            new KVCachePromptRenderer(new FixedRenderer()),
+            new InferenceTelemetry(NullLogger.Instance), NullLogger.Instance);
+        using var session = new ChatSession();
+        var history = new List<ChatMessage> { new() { Role = "user", Content = "count" } };
+
+        var streamed = new StringBuilder();
+        await foreach (var update in pipeline.ChatStreamWithMetricsAsync(session, history, 4, CancellationToken.None, SamplingConfig.Greedy))
+            if (!update.Done) streamed.Append(update.Piece);
+
+        var followUp = new List<ChatMessage>
+        {
+            history[0],
+            new() { Role = "assistant", Content = streamed.ToString() },
+            new() { Role = "user", Content = "go on" },
+        };
+        Assert.NotNull(session.Transcripts.Augment(followUp, lifecycle.LoadEpoch).History[1].RawOutputTokens);
+        Assert.Null(session.Transcripts.Augment(followUp, lifecycle.LoadEpoch + 1).History[1].RawOutputTokens);
+    }
+
+    /// <summary>
+    /// The model is unloaded while a request is still preparing. A request the switch
+    /// cancelled ends as cancelled; one nobody cancelled is told the model went away,
+    /// instead of a cancellation a server would read as the client leaving.
+    /// </summary>
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task AnUnloadDuringPreparationEndsTheRequestCleanly(bool cancelledBySwitch)
+    {
+        using var lifecycle = new ModelLifecycleService(NullLogger.Instance,
+            (path, backend, tp, draft) => new DigitModel(path));
+        lifecycle.LoadModel(_path, null, "cpu");
+        using var host = new InferenceEngineHost(lifecycle, NullLogger.Instance) { SchedulerConfigOverride = Config() };
+        using var stop = new CancellationTokenSource();
+        bool unloaded = false;
+        var renderer = new CallbackRenderer(() =>
+        {
+            if (unloaded) return;
+            unloaded = true;
+            if (cancelledBySwitch) stop.Cancel();
+            host.Reset();
+            lifecycle.Unload();
+        });
+        var pipeline = new ChatGenerationPipeline(lifecycle, host,
+            new KVCachePromptRenderer(renderer),
+            new InferenceTelemetry(NullLogger.Instance), NullLogger.Instance);
+        using var session = new ChatSession();
+        var history = new List<ChatMessage> { new() { Role = "user", Content = "count" } };
+
+        async Task Run()
+        {
+            await foreach (var _ in pipeline.ChatStreamWithMetricsAsync(session, history, 4, stop.Token, SamplingConfig.Greedy)) { }
+        }
+
+        Exception ex = await Record.ExceptionAsync(Run);
+        Assert.True(unloaded);
+        if (cancelledBySwitch)
+            Assert.IsAssignableFrom<OperationCanceledException>(ex);
+        else
+            Assert.IsType<ModelUnloadedException>(ex);
+    }
+
+    private sealed class CallbackRenderer : IPromptRenderer
+    {
+        private readonly Action _onRender;
+        public CallbackRenderer(Action onRender) => _onRender = onRender;
+
+        public string Render(string template, List<ChatMessage> messages, bool addGenerationPrompt = true,
+            string architecture = null, List<ToolFunction> tools = null, bool enableThinking = false)
+        {
+            _onRender();
+            return "abcdefgh";
+        }
+    }
+
     private static SchedulerConfig Config() => new()
     {
         BlockSize = 2, NumBlocks = 128, MaxNumRunningSequences = 2,

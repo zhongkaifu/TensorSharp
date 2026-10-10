@@ -427,11 +427,12 @@
       body.innerHTML = render(content);
       b.appendChild(body);
     }
+    var entry = extra && extra.entry;
     if (extra && extra.imageUrl) {
       var made = document.createElement('img');
       made.src = extra.imageUrl; made.alt = t('page.image.generatedAlt');
       b.appendChild(made);
-      imageActions(b, made, extra.imageUrl, newestImageRequest());
+      imageActions(b, made, extra.imageUrl, entry, newestImageRequest());
     }
     if (extra && extra.videoUrl) {
       b.appendChild(clipNode(extra.videoUrl));
@@ -442,8 +443,14 @@
     // The files this turn produced, put back the way the live turn showed them.
     // They are the point of the turn far more often than the prose is.
     if (extra && extra.artifacts) extra.artifacts.forEach(function (f) { fileLine({ turn: turn, bubble: b }, f); });
-    var view = { turn: turn, bubble: b };
+    var view = { turn: turn, bubble: b, entry: entry };
     if (role === 'assistant' && extra && extra.stats) showTurnStats(view, extra.stats);
+    // What a picture was made from, and on the newest turn the other readings of its
+    // request -- or, for a turn that asked instead of guessing, the readings it offered.
+    if (entry && extra.imageUrl && entry.imagePlan) {
+      showImagePlan(view, entry.imagePlan, entry.imageSources, entry.imagePlanReason, newestImageRequest(), !!extra.latest);
+    }
+    if (entry && entry.imageChoices && extra.latest) showImageChoices(view, entry.imageChoices, newestImageRequest());
     if (stickBottom) toBottom();
     return view;
   }
@@ -751,6 +758,9 @@
     // image in the composer instead of assuming a text-only model/tool workflow.
     state.acceptsVisionProjector = !d || typeof d.acceptsVisionProjector !== 'boolean'
       ? true : d.acceptsVisionProjector;
+    // A picture's other readings and a question's buttons re-send the request to the image
+    // model; with another model loaded they would send it to that one instead.
+    if (state.model && !makesImages()) retireImageRedo();
     state.contextTokens = (d && d.contextTokens) || 0;
     // New hosts report the GGUF's own window separately from the effective
     // runtime/KV-cache limit. Fall back for compatibility with an older host.
@@ -903,10 +913,14 @@
    * the next turn wrote a transcript with the photo missing from it.
    */
   function renderMessages(messages) {
-    (messages || []).forEach(function (m) {
+    var list = messages || [];
+    list.forEach(function (m, i) {
       state.history.push(m);
+      // The message itself goes with it, so a picture shows what it was made from; only the
+      // last turn can still be answered another way.
       addTurn(m.role, displayText(m.content), m.attachments,
-        { artifacts: m.artifacts, imageUrl: m.imageUrl, videoUrl: m.videoUrl, audioUrl: m.audioUrl, stats: m.stats });
+        { artifacts: m.artifacts, imageUrl: m.imageUrl, videoUrl: m.videoUrl, audioUrl: m.audioUrl, stats: m.stats,
+          entry: m, latest: i === list.length - 1 });
     });
   }
 
@@ -1379,6 +1393,8 @@
   }
 
   function commitMessage(typed, atts, msg) {
+    // The turn above is no longer the newest, so it can no longer be answered another way.
+    retireImageRedo();
     var userView = addTurn('user', typed, atts);
     // A capability refresh is asynchronous. Preserve anything newly typed or
     // attached during that short check instead of clearing it with the sent draft.
@@ -1391,6 +1407,23 @@
 
     state.history.push(msg);
 
+    var body = chatBody();
+
+    // The host acknowledges these only after every request preflight passed and the
+    // user turn was written to the durable conversation store. Until that point the
+    // App Group envelope remains the crash-safe backing for this volatile composer.
+    if (appliedShareOrder.length) body.shareIds = appliedShareOrder.slice();
+
+    stream(body, {
+      text: typed, attachments: atts, message: msg, turn: userView.turn,
+      // So a recovery can tell the host's acknowledgement of this draft apart from a
+      // request that never arrived: see resumeTurn.
+      shareIds: body.shareIds,
+    });
+  }
+
+  /** The /api/chat body for the history as it stands, with this chat's settings. */
+  function chatBody() {
     var body = {
       // The history AS IT IS, not a copy of it with the attachments removed. The
       // whole array used to be flattened to {role, content} on its way out, which
@@ -1408,18 +1441,7 @@
       body.skills = [];
       body.skills_discovery = false;
     }
-
-    // The host acknowledges these only after every request preflight passed and the
-    // user turn was written to the durable conversation store. Until that point the
-    // App Group envelope remains the crash-safe backing for this volatile composer.
-    if (appliedShareOrder.length) body.shareIds = appliedShareOrder.slice();
-
-    stream(body, {
-      text: typed, attachments: atts, message: msg, turn: userView.turn,
-      // So a recovery can tell the host's acknowledgement of this draft apart from a
-      // request that never arrived: see resumeTurn.
-      shareIds: body.shareIds,
-    });
+    return body;
   }
 
   /**
@@ -1890,6 +1912,9 @@
       if (live.stats) { live.stats.remove(); live.stats = null; }
       Array.prototype.slice.call(live.turn.querySelectorAll('.step, .think, .copy'))
         .forEach(function (n) { n.remove(); });
+      // The replay sends the plan and the question again.
+      if (live.plan) { live.plan.remove(); live.plan = null; }
+      if (live.choices) { live.choices.remove(); live.choices = null; }
       live.step = null; live.tool = ''; live.detail = '';
       return live;
     }
@@ -2050,6 +2075,9 @@
     // next request rewrites the saved transcript from -- an entry that has forgotten
     // the PDF erases the PDF from a chat that had one.
     var made = [], madeSeen = {}, madeImage = null, madeVideo = null, madeAudio = null;
+    // What the picture was made from, and the readings an image turn offered instead of
+    // making one: the host plans the next picture turn from both.
+    var madeFrom = null, madeChoices = null;
     var reader = res.body.getReader(), dec = new TextDecoder(), buf = '';
     // Whether the host said the turn was over. A stream that ends without it did not
     // end because the answer did: the connection went away underneath it.
@@ -2216,10 +2244,25 @@
         madeSeen[file.url] = 1;
         made.push({ name: file.name || file.url, bytes: file.bytes || 0, url: file.url });
       });
-      // An image model's turn (ImageTurns on the host): steps while the picture
-      // denoises, some carrying a small preview, then the finished picture. One <img>
-      // is refreshed in place, so the preview becomes the picture instead of a new
-      // image being stacked under it for every step.
+      // An image model's turn (ImageTurns on the host): first what it will do with the
+      // request, then steps while the picture denoises, some carrying a small preview, then
+      // the finished picture. One <img> is refreshed in place, so the preview becomes the
+      // picture instead of a new image being stacked under it for every step.
+      //
+      // The plan is shown as soon as it is known, with the other readings of the request
+      // beside it, so a wrong guess costs a tap rather than the picture (on an M5 Pro at
+      // 1024 x 1024, about 5.5 minutes for a new one and 7 for an edit).
+      // The LAST plan is the one that holds: a turn the host runs again after a GPU fault
+      // plans again.
+      if (f.image_plan) {
+        progress(t(IMAGE_PLAN_ACTIVITY[f.image_plan] || 'page.activity.drawing'));
+        showImagePlan(view, f.image_plan, (f.image_sources || []).map(uploadName), f.image_plan_reason,
+          newestImageRequest(), true);
+      }
+      if (f.image_choice) {
+        madeChoices = f.image_choice;
+        showImageChoices(view, madeChoices, newestImageRequest());
+      }
       if (typeof f.image_step === 'number') {
         // With LoRA plug-ins the host names them on every step (ImageTurns.Translate).
         var loras = f.image_loras && f.image_loras.length ? f.image_loras.join(' + ') : null;
@@ -2234,6 +2277,7 @@
       }
       if (f.image || f.imageUrl) {
         madeImage = f.imageUrl || f.image;
+        madeFrom = imageRecordOf(f);
         // The picture goes under the text, so the text has to be there first.
         if (answerDirty) { view.bubble.innerHTML = render(answer); view.answerSoFar = answer; answerDirty = false; }
         pictureOf(view).src = madeImage;
@@ -2304,14 +2348,22 @@
       if (made.length) entry.artifacts = made;
       if (madeImage) {
         entry.imageUrl = madeImage;
-        imageActions(view.bubble, pictureOf(view), madeImage, newestImageRequest());
+        // Copied, not only shown: the next request sends this entry, and the host plans
+        // the next picture from what this one was made from.
+        Object.assign(entry, madeFrom);
+        imageActions(view.bubble, pictureOf(view), madeImage, entry, newestImageRequest());
       }
+      if (madeChoices) entry.imageChoices = madeChoices;
       if (madeVideo) entry.videoUrl = madeVideo;
       if (madeAudio) entry.audioUrl = madeAudio;
       // Nothing produced is nothing to remember: the host's own record skips an empty
       // turn too, and an empty assistant entry in the history would be sent back to
       // the model as a message it never wrote.
-      if (answer || thinking || made.length || madeImage || madeVideo) state.history.push(entry);
+      if (answer || thinking || made.length || madeImage || madeVideo) {
+        state.history.push(entry);
+        // What a plan's other readings and a question's buttons answer again.
+        view.entry = entry;
+      }
       if (answer) addCopy(view.turn, function () { return answer; });
       setGenerating(false);
       state.abort = null;
@@ -2331,13 +2383,192 @@
     return null;
   }
 
-  function imageActions(bubble, picture, resultUrl, request) {
+  // ---- what a picture was made from ------------------------------------------
+  //
+  // The host reads a follow-up against the whole conversation (ImageTurns): it may change a
+  // picture already here, draw a new one, or make another version, and it records which on
+  // the picture. The page shows that under the picture and, on the newest turn, offers the
+  // other reading; a tap sends the same words again with the reading spelled out
+  // (imageIntent, imageSource) in place of the turn it replaces.
+
+  /** The fields the host records on a picture, copied off its frame onto the history entry. */
+  var IMAGE_RECORD = ['imagePlan', 'imagePlanReason', 'imageSources', 'imagePrompt', 'imageSeed', 'imageMask'];
+  function imageRecordOf(f) {
+    var record = {};
+    IMAGE_RECORD.forEach(function (key) {
+      if (f[key] !== undefined && f[key] !== null) record[key] = f[key];
+    });
+    return record;
+  }
+  var IMAGE_PLAN_ACTIVITY = {
+    edit: 'page.activity.changingPicture', new: 'page.activity.drawingNew', again: 'page.activity.drawingAgain',
+  };
+  var IMAGE_PLAN_CAPTION = {
+    edit: 'page.image.plan.edit', new: 'page.image.plan.new', again: 'page.image.plan.again',
+  };
+  var IMAGE_OVERRIDE = { edit: 'page.image.override.edit', new: 'page.image.override.new' };
+  var IMAGE_CHOICE = { edit: 'page.image.choice.edit', new: 'page.image.choice.new', again: 'page.image.choice.again' };
+
+  /** A photo the user attached anywhere in the chat, by its upload name: its chip says how to show it. */
+  function attachmentNamed(name, request) {
+    var messages = (request ? [request] : []).concat(state.history.slice().reverse());
+    for (var i = 0; i < messages.length; i++) {
+      var found = (messages[i].attachments || []).filter(function (a) { return a.file === name; })[0];
+      if (found) return found;
+    }
+    return null;
+  }
+  /** Where to show a picture a result was made from: a HEIC's full-size conversion, else the file. */
+  function sourceUrlOf(name, request) {
+    var chip = attachmentNamed(name, request);
+    return chip ? editImageOf(chip) : uploadUrl(name);
+  }
+
+  /** The newest picture before history[index]: a picture the model made, or a photo attached. */
+  function pictureBefore(index) {
+    for (var i = index - 1; i >= 0; i--) {
+      var m = state.history[i];
+      if (m.role === 'assistant' && m.imageUrl) return uploadName(m.imageUrl);
+      if (m.role === 'user' && m.stillImagePaths && m.stillImagePaths.length)
+        return m.stillImagePaths[m.stillImagePaths.length - 1];
+    }
+    return null;
+  }
+
+  /**
+   * The other readings of the request a picture answered. None when the request attached
+   * its own photos -- those were the target -- or when there was nothing else it could mean.
+   */
+  function overridesFor(plan, request) {
+    if (!request || (request.stillImagePaths && request.stillImagePaths.length) || request.maskPath) return [];
+    var earlier = pictureBefore(state.history.lastIndexOf(request));
+    var changeEarlier = earlier ? [{ intent: 'edit', source: earlier }] : [];
+    if (plan === 'edit') return [{ intent: 'new' }];
+    if (plan === 'again') return changeEarlier.concat([{ intent: 'new' }]);
+    if (plan === 'new') return changeEarlier;
+    return [];
+  }
+
+  function redoButton(view, label, option) {
+    var b = el('button', 'filechip', null);
+    b.type = 'button';
+    if (option.source) {
+      var thumb = document.createElement('img');
+      thumb.src = sourceUrlOf(option.source); thumb.alt = '';
+      b.appendChild(thumb);
+    }
+    b.appendChild(el('span', null, label));
+    b.addEventListener('click', function () { redoImageTurn(view, option.intent, option.source || null); });
+    return b;
+  }
+
+  /**
+   * Under a picture: what it was made from ("Changed the picture above", with the picture),
+   * and on the newest turn the other reading of the request. Shown from the plan frame on,
+   * and again for a reopened chat from what the host recorded.
+   */
+  function showImagePlan(view, plan, sources, reason, request, latest) {
+    if (view.plan) view.plan.remove();
+    // The request this turn answers: what a tap sends again, even if the turn never finishes.
+    view.request = request;
+    var line = el('div', 'image-plan');
+    line.appendChild(el('span', null, t(IMAGE_PLAN_CAPTION[plan] || 'page.image.plan.new')));
+    var source = (plan === 'edit' || plan === 'again') && sources && sources[0];
+    if (source) {
+      var thumb = document.createElement('img');
+      thumb.src = sourceUrlOf(source, request); thumb.alt = t('page.image.originalAlt');
+      line.appendChild(thumb);
+    }
+    // The image model could not be asked, so the newest picture was changed on a guess.
+    if (reason === 'unavailable') line.appendChild(el('span', null, t('page.image.plan.guessed')));
+    var others = latest ? overridesFor(plan, request) : [];
+    if (others.length) {
+      var redo = el('div', 'image-redo');
+      others.forEach(function (option) { redo.appendChild(redoButton(view, t(IMAGE_OVERRIDE[option.intent]), option)); });
+      line.appendChild(redo);
+    }
+    view.turn.insertBefore(line, view.bubble.nextSibling);
+    view.plan = line;
+  }
+
+  /** The readings a turn offered instead of guessing, as buttons under its question. */
+  function showImageChoices(view, choices, request) {
+    if (view.choices) view.choices.remove();
+    view.request = request;
+    var redo = el('div', 'image-redo image-choice');
+    choices.forEach(function (option) {
+      if (IMAGE_CHOICE[option.intent]) redo.appendChild(redoButton(view, t(IMAGE_CHOICE[option.intent]), option));
+    });
+    view.turn.insertBefore(redo, view.bubble.nextSibling);
+    view.choices = redo;
+  }
+
+  /** Only the newest turn can be answered another way; an older one's buttons go when a new turn starts. */
+  function retireImageRedo() {
+    Array.prototype.slice.call(chat.querySelectorAll('.image-redo')).forEach(function (n) { n.remove(); });
+  }
+
+  /** The user's bubble a turn answers: the nearest one above it. */
+  function askedTurnOf(turn) {
+    var turns = chat.children;
+    for (var i = Array.prototype.indexOf.call(turns, turn) - 1; i >= 0; i--)
+      if (/(^|\s)me(\s|$)/.test(turns[i].className)) return turns[i];
+    return null;
+  }
+
+  /**
+   * Answer the newest request again, read the way the user just chose: the same words,
+   * with imageIntent and imageSource, IN PLACE of the turn that read it differently -- the
+   * history loses that turn, so the host's saved copy does too, and the picture it made is
+   * no longer offered to later turns. Works while that turn is still drawing: the host
+   * stops a conversation's running turn when it is sent the next one.
+   */
+  function redoImageTurn(view, intent, source) {
+    var live = state.generating && state.liveView === view;
+    if ((state.generating && !live) || state.maskEditing || !state.model) return;
+    // Only an image model reads imageIntent; another one would answer the words as prose in
+    // place of the picture. Its buttons go too (as on a model change, see paintModel).
+    if (!makesImages()) { retireImageRedo(); return; }
+    // As a send does: the picture is made with the plug-ins being chosen, once they are.
+    if (loraChoice !== null) { notice(t('page.send.waitForLoras')); return; }
+    var at = state.history.length - 1;
+    if (!live) {
+      // A finished turn is replaced along with its request. One that failed or was stopped
+      // left nothing in the history, so its request is still the newest message there --
+      // and the other reading is what the user is most likely to want then.
+      if (view.entry) {
+        if (state.history[at] !== view.entry) return;
+        at--;
+      } else if (!view.request || state.history[at] !== view.request) {
+        return;
+      }
+    }
+    var request = state.history[at];
+    if (!request || request.role !== 'user') return;
+    var asked = askedTurnOf(view.turn);
+    if (live) detach();
+    var msg = Object.assign({}, request, { imageIntent: intent });
+    if (source) msg.imageSource = source; else delete msg.imageSource;
+    state.history.splice(at);
+    state.history.push(msg);
+    view.turn.remove();
+    retireImageRedo();
+    stream(chatBody(), { text: msg.content, attachments: [], message: msg, turn: asked });
+  }
+
+  function imageActions(bubble, picture, resultUrl, entry, request) {
     if (bubble.querySelector('.image-edit-actions')) return;
     var actions = el('div', 'image-edit-actions');
-    var source = request && request.stillImagePaths && request.stillImagePaths[0];
+    // What the picture was made from, as the host recorded it. A picture saved before it
+    // recorded that was made from the request before it, as it is read here then.
+    var recorded = entry && Array.isArray(entry.imageSources);
+    var sources = recorded ? entry.imageSources : (request && request.stillImagePaths) || [];
+    var source = sources[0];
+    // The request's own photos are restored with their chips, selection and words; a picture
+    // from elsewhere in the chat is attached as it is, with the words it was changed with.
+    var fromRequest = !recorded || !!(request && request.stillImagePaths && request.stillImagePaths[0] === source);
     if (source) {
-      var sourceAttachment = (request.attachments || []).filter(function (a) { return a.file === source; })[0];
-      var originalUrl = sourceAttachment ? editImageOf(sourceAttachment) : uploadUrl(source);
+      var originalUrl = sourceUrlOf(source, request);
       var original = false;
       var compare = el('button', 'filechip', t('page.image.compareOriginal')); compare.type = 'button';
       compare.setAttribute('aria-pressed', 'false');
@@ -2354,7 +2585,7 @@
       if (state.generating || state.maskEditing || pendingUploadCount || state.attachments.length || text.value.trim()) {
         notice(t('page.image.draftInTheWay')); return;
       }
-      if (source) {
+      if (source && fromRequest) {
         var saved = request.attachments || [];
         state.attachments = saved.map(function (a) { return Object.assign({}, a); });
         request.stillImagePaths.forEach(function (path) {
@@ -2366,16 +2597,19 @@
         // Top-level fields record what this turn actually applied. Older saved
         // chips may also contain dormant selections that must not become active.
         state.attachments.forEach(clearImageSelection);
-        if (request.maskPath) {
-          target._maskActive = true;
-          target.maskPath = request.maskPath;
-          target.maskMode = request.maskMode || 'grayscale';
-          target.maskFeather = request.maskFeather || 0;
-          target.maskCrop = !!request.maskCrop;
-          target.maskInvert = !!request.maskInvert;
-          if (typeof request.maskCropPadding === 'number') target.maskCropPadding = request.maskCropPadding;
-        }
+        applySelection(target, request);
         text.value = request.content || '';
+      } else if (source) {
+        // A picture from elsewhere in the chat -- one the model made, or a photo attached
+        // earlier -- with the selection and the words this one was made with.
+        state.attachments = sources.map(function (name) {
+          var chip = attachmentNamed(name, request);
+          return chip ? Object.assign({}, chip)
+            : { file: name, fileName: GENERATED_IMAGE, mediaType: 'image', url: uploadUrl(name) };
+        });
+        state.attachments.forEach(clearImageSelection);
+        applySelection(state.attachments[0], entry.imageMask);
+        text.value = entry.imagePrompt || '';
       } else {
         state.attachments = [{ file: uploadName(resultUrl), fileName: GENERATED_IMAGE, mediaType: 'image', url: resultUrl }];
       }
@@ -2398,6 +2632,18 @@
     });
     actions.appendChild(download);
     bubble.appendChild(actions);
+  }
+
+  /** Make the selection a turn applied (a request's or a picture's record) active on its photo again. */
+  function applySelection(target, from) {
+    if (!target || !from || !from.maskPath) return;
+    target._maskActive = true;
+    target.maskPath = from.maskPath;
+    target.maskMode = from.maskMode || 'grayscale';
+    target.maskFeather = from.maskFeather || 0;
+    target.maskCrop = !!from.maskCrop;
+    target.maskInvert = !!from.maskInvert;
+    if (typeof from.maskCropPadding === 'number') target.maskCropPadding = from.maskCropPadding;
   }
 
   function selectImageArea(attachment) {

@@ -8,6 +8,8 @@
 // TensorSharp is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 
+using TensorSharp.Runtime;
+
 namespace TensorAgent.Core.Catalog;
 
 /// <summary>
@@ -93,6 +95,11 @@ public static partial class ModelCatalog
             Modalities = CatalogModalities.Image | CatalogModalities.Audio | CatalogModalities.Video,
             MinDeviceMemoryGB = 12,
             ContextLength = 8192,
+            // 35 layers, one in five global (head_dim 512, one KV head), and the last 20
+            // share the K/V of earlier layers (shared_kv_layers), so three global layers
+            // own a cache: 3 x 1 x 512 x 2 x 2 bytes. The sliding layers' 512-row rings
+            // are a fixed 6 MiB. Desktop window 32,768.
+            KvBytesPerToken = 3 * 1 * 512 * 2 * 2,
             // f16, not q8_0: Gemma 4 declines a block-quantized cache
             // (Gemma4Model.SupportsBlockQuantizedKvCache). Its sliding-window layers
             // use a circular cache whose managed helpers are float-only, and the 26B
@@ -127,6 +134,11 @@ public static partial class ModelCatalog
             Modalities = CatalogModalities.Image | CatalogModalities.Audio | CatalogModalities.Video,
             MinDeviceMemoryGB = 12,
             ContextLength = 8192,
+            // 42 layers, one in six global (two KV heads of 512), the last 18 sharing earlier
+            // layers' K/V: four global layers own a cache, 4 x 2 x 512 x 2 x 2 bytes (the
+            // 148 MiB the engine reports at 8K is this plus the fixed 20 MiB of 512-row
+            // sliding rings). On the 12 GB tier that affords a 16,384 desktop window.
+            KvBytesPerToken = 4 * 2 * 512 * 2 * 2,
             KvCacheDtype = "f16",
             Sampling = new CatalogSampling(1.0f, 64, 0.95f, 0.0f),
             SupportsThinking = true,
@@ -457,21 +469,9 @@ public static partial class ModelCatalog
                 new CatalogFile(CatalogFileRole.Weights, "qwen_image_2.1_Q4_K_M.gguf",
                     Hf("Abiray/Qwen-Image-2.1-GGUF", "qwen_image_2.1_Q4_K_M.gguf"),
                     4_189_343_904, "dc956c958fbfa1d5c64ec316d7e865283d17d97a9eb332a4a74a4d63afaae9a5"),
-                new CatalogFile(CatalogFileRole.TextEncoder, "Qwen3VL-8B-Instruct-Q4_K_M.gguf",
-                    Hf("Qwen/Qwen3-VL-8B-Instruct-GGUF", "Qwen3VL-8B-Instruct-Q4_K_M.gguf"),
-                    5_027_784_800, "67d1659bfe71b89d50b45a4ad1a9e5b997e5bb16ce5da66a6a6167abd569e9e2"),
-                new CatalogFile(CatalogFileRole.Vae, "qwen_image_2.1_vae_bf16.safetensors",
-                    Hf("Comfy-Org/Qwen-Image-2.1", "vae/qwen_image_2.1_vae_bf16.safetensors"),
-                    675_509_688, "bb21f7473051e1ac368515dd3f2e15cd44d7a11748ee8823e1ddca3e4876b7c9"),
-                // Required, unlike a chat model's projector. Making a picture from words
-                // does not use it, but editing a photo refuses to run without it, and an
-                // optional file here could never be added later: the Models page's "add
-                // vision" action fetches a chat model's Projector, not this role. Optional,
-                // a download with optional files switched off made a model that advertises
-                // photo editing and cannot do it.
-                new CatalogFile(CatalogFileRole.VisionProjector, "mmproj-Qwen3VL-8B-Instruct-F16.gguf",
-                    Hf("Qwen/Qwen3-VL-8B-Instruct-GGUF", "mmproj-Qwen3VL-8B-Instruct-F16.gguf"),
-                    1_159_029_824, "ca524100ebf825c9a870db1c580d03879e0da0ab2541697e2458e64891cf9d38"),
+                QwenImage21TextEncoder(),
+                QwenImage21Vae(),
+                QwenImage21VisionProjector(),
             },
             Modalities = CatalogModalities.Image | CatalogModalities.ImageOutput,
             MinDeviceMemoryGB = 24,
@@ -483,6 +483,35 @@ public static partial class ModelCatalog
             License = QwenImageLicense,
             Notes = "catalog.model.qwenImage21.notes",
         },
+        // Qwen-Image-2.1-Turbo (AtomicChat/Qwen-Image-2.1-Turbo-GGUF at bb25d06, read on
+        // 2026-10-09): the 2.1 transformer distilled to 8 steps at CFG 1 on its own fixed
+        // schedule. The GGUF carries no metadata and has the base checkpoint's tensors, so the
+        // entry declares the variant (ImageVariant, published by DiffusionCompanions) instead of
+        // the engine guessing from the file name. The VAE, text encoder and projector are the
+        // base entry's files, byte for byte: an install that has either entry links them from
+        // there instead of downloading them again (ModelStore).
+        QwenImage21Turbo(
+            id: "qwen-image-2.1-turbo-adq4k",
+            weights: new CatalogFile(CatalogFileRole.Weights, "Qwen-Image-2.1-Turbo-AD-Q4_K.gguf",
+                QwenImageTurboUrl("Qwen-Image-2.1-Turbo-AD-Q4_K.gguf"),
+                4_201_694_944, "4bb73c53cbe284bbd6d69b9fdc59539c531f0389dd2aa567663d777f8130bc59"),
+            quantization: "catalog.model.qwenImage21TurboAdQ4k.quantization",
+            // Measured like the base entry: the CLI's peak footprint for an edit at 1248x832
+            // (CatalogTests.MeasuredOnAMac).
+            minDeviceMemoryGB: 24,
+            notes: "catalog.model.qwenImage21TurboAdQ4k.notes"),
+        // The transformer closest to the full-precision Turbo (the card's LPIPS against BF16:
+        // Q8_0 0.037, AD-Q4_K 0.147), for the tier that holds 3.4 GB more weights. It keeps the
+        // shared Q4_K_M encoder, which by the card's measurement moves pictures about as far as
+        // AD-Q4_K, so its notes claim no more than the transformer's measurement.
+        QwenImage21Turbo(
+            id: "qwen-image-2.1-turbo-q8",
+            weights: new CatalogFile(CatalogFileRole.Weights, "Qwen-Image-2.1-Turbo-Q8_0.gguf",
+                QwenImageTurboUrl("Qwen-Image-2.1-Turbo-Q8_0.gguf"),
+                7_591_554_784, "99f498fb7188be7eac9eb5f345a9e074d30eef3ca235b419e92563e5b48073c4"),
+            quantization: "catalog.model.qwenImage21TurboQ8.quantization",
+            minDeviceMemoryGB: 32,
+            notes: "catalog.model.qwenImage21TurboQ8.notes"),
         MiniMaxH3(
             id: "minimax-h3-fl2va-q4k",
             displayName: "MiniMax-H3",
@@ -503,6 +532,51 @@ public static partial class ModelCatalog
             modalities: CatalogModalities.Image | CatalogModalities.Video | CatalogModalities.Audio,
             notes: "catalog.model.minimaxH3Ref2va.notes"),
     }.Concat(ExtendedModels()).ToArray();
+
+    // Qwen-Image-2.1's companions, shared by its base and Turbo entries: one set of bytes, so a
+    // second entry links the first one's copies. Pinned at the revisions config/qwen-image-2.1.json uses.
+    private static CatalogFile QwenImage21TextEncoder() => new(CatalogFileRole.TextEncoder, "Qwen3VL-8B-Instruct-Q4_K_M.gguf",
+        "https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct-GGUF/resolve/f982a07559d4a2f6c8744d840bf6fccab30eea96/Qwen3VL-8B-Instruct-Q4_K_M.gguf",
+        5_027_784_800, "67d1659bfe71b89d50b45a4ad1a9e5b997e5bb16ce5da66a6a6167abd569e9e2");
+
+    private static CatalogFile QwenImage21Vae() => new(CatalogFileRole.Vae, "qwen_image_2.1_vae_bf16.safetensors",
+        "https://huggingface.co/Comfy-Org/Qwen-Image-2.1/resolve/ace0edeb3791a594ddfa36ed5f41a178a394e921/vae/qwen_image_2.1_vae_bf16.safetensors",
+        675_509_688, "bb21f7473051e1ac368515dd3f2e15cd44d7a11748ee8823e1ddca3e4876b7c9");
+
+    // Required, unlike a chat model's projector. Making a picture from words does not use it,
+    // but editing a photo refuses to run without it, and an optional file here could never be
+    // added later: the Models page's "add vision" action fetches a chat model's Projector, not
+    // this role. Optional, a download with optional files switched off made a model that
+    // advertises photo editing and cannot do it.
+    private static CatalogFile QwenImage21VisionProjector() => new(CatalogFileRole.VisionProjector, "mmproj-Qwen3VL-8B-Instruct-F16.gguf",
+        "https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct-GGUF/resolve/f982a07559d4a2f6c8744d840bf6fccab30eea96/mmproj-Qwen3VL-8B-Instruct-F16.gguf",
+        1_159_029_824, "ca524100ebf825c9a870db1c580d03879e0da0ab2541697e2458e64891cf9d38");
+
+    private static string QwenImageTurboUrl(string file) =>
+        $"https://huggingface.co/AtomicChat/Qwen-Image-2.1-Turbo-GGUF/resolve/bb25d06bc74119c12207243d68917951e6d9c232/{file}";
+
+    /// <summary>A Qwen-Image 2.1 Turbo entry: one of the AtomicChat Turbo denoisers plus the base
+    /// entry's companions.</summary>
+    private static CatalogModel QwenImage21Turbo(
+        string id, CatalogFile weights, string quantization, int minDeviceMemoryGB, string notes) => new()
+    {
+        Id = id,
+        DisplayName = "Qwen-Image 2.1 Turbo",
+        Family = CatalogFamily.QwenImage,
+        Kind = CatalogArchitectureKind.Diffusion,
+        Parameters = "catalog.model.qwenImage21Turbo.parameters",
+        Quantization = quantization,
+        Files = new[] { weights, QwenImage21TextEncoder(), QwenImage21Vae(), QwenImage21VisionProjector() },
+        Modalities = CatalogModalities.Image | CatalogModalities.ImageOutput,
+        MinDeviceMemoryGB = minDeviceMemoryGB,
+        ContextLength = 0,
+        KvCacheDtype = "f16",
+        Sampling = new CatalogSampling(1.0f, 0, 1.0f, 0.0f),
+        // 8 steps on its published schedule at CFG 1, whatever the file is called.
+        ImageVariant = QwenImageVariant.Turbo,
+        License = QwenImageLicense,
+        Notes = notes,
+    };
 
     private static CatalogFile FlashNextProjector() => new(CatalogFileRole.Projector, "mmproj-BF16.gguf",
         Hf("unsloth/Qwen3.8-Flash-Next-GGUF", "mmproj-BF16.gguf"),

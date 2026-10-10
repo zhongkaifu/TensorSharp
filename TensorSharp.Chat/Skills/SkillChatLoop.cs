@@ -120,8 +120,7 @@ namespace TensorSharp.Server.Skills
                 // for skills_read calls to answer. Having parsed, it forwards the
                 // SEPARATED pieces rather than the raw text, so tool markup never
                 // reaches the adapter and every round streams as it decodes.
-                var parser = OutputParserFactory.Create(architecture);
-                parser.Init(enableThinking, plan.Tools);
+                IOutputParser parser = NewParser(architecture, enableThinking, plan);
 
                 var content = new StringBuilder();
                 var thinking = new StringBuilder();
@@ -163,14 +162,16 @@ namespace TensorSharp.Server.Skills
                     // only content still leaks the very false claim this guard rejects.
                     // A tool call does not stream as an answer either; it is ours to
                     // answer or the caller's to service.
-                    if (holdAnswer)
+                    bool forwarded = false;
+                    if (Separated(delta) is { } piece)
                     {
-                        if (!string.IsNullOrEmpty(delta.Content) || !string.IsNullOrEmpty(delta.Thinking))
-                            heldAnswer.Add(ChatStreamUpdate.Parsed(delta.Content, delta.Thinking, null));
-                    }
-                    else if (!string.IsNullOrEmpty(delta.Content) || !string.IsNullOrEmpty(delta.Thinking))
-                    {
-                        yield return ChatStreamUpdate.Parsed(delta.Content, delta.Thinking, null);
+                        if (holdAnswer)
+                            heldAnswer.Add(piece);
+                        else
+                        {
+                            yield return piece;
+                            forwarded = true;
+                        }
                     }
 
                     // The call's BODY does stream — as progress, not as content. A
@@ -179,7 +180,12 @@ namespace TensorSharp.Server.Skills
                     // handed to the client as an answer.
                     toolBeingWritten = delta.ToolCallName ?? toolBeingWritten;
                     if (!string.IsNullOrEmpty(delta.ToolCallText))
+                    {
                         yield return ChatStreamUpdate.ToolProgress("writing", toolBeingWritten, delta.ToolCallText);
+                        forwarded = true;
+                    }
+                    if (!forwarded)
+                        yield return StillWriting();
                 }
 
                 promptTokens += terminal.PromptTokens;
@@ -191,14 +197,12 @@ namespace TensorSharp.Server.Skills
 
                 ParsedOutput flushed = parser.Add(string.Empty, true);
                 Accumulate(flushed, content, thinking, calls);
-                if (holdAnswer)
+                if (Separated(flushed) is { } flushedPiece)
                 {
-                    if (!string.IsNullOrEmpty(flushed.Content) || !string.IsNullOrEmpty(flushed.Thinking))
-                        heldAnswer.Add(ChatStreamUpdate.Parsed(flushed.Content, flushed.Thinking, null));
-                }
-                else if (!string.IsNullOrEmpty(flushed.Content) || !string.IsNullOrEmpty(flushed.Thinking))
-                {
-                    yield return ChatStreamUpdate.Parsed(flushed.Content, flushed.Thinking, null);
+                    if (holdAnswer)
+                        heldAnswer.Add(flushedPiece);
+                    else
+                        yield return flushedPiece;
                 }
 
                 // A round the engine ended for repeating itself is not a round to act on.
@@ -441,8 +445,7 @@ namespace TensorSharp.Server.Skills
             // message with yet another skills_read, its markup must still not reach the
             // client — forwarding it raw here would surface a tool call the caller
             // cannot service, which is the exact stall this loop exists to prevent.
-            var finalParser = OutputParserFactory.Create(architecture);
-            finalParser.Init(enableThinking, plan.Tools);
+            IOutputParser finalParser = NewParser(architecture, enableThinking, plan);
             var finalCalls = new List<ToolCall>();
             var finalContent = new StringBuilder();
             var finalThinking = new StringBuilder();
@@ -464,29 +467,34 @@ namespace TensorSharp.Server.Skills
 
                 ParsedOutput delta = finalParser.Add(update.Piece, false);
                 Accumulate(delta, finalContent, finalThinking, finalCalls);
-                if (guardCompletion)
+                bool forwarded = false;
+                if (Separated(delta) is { } piece)
                 {
-                    if (!string.IsNullOrEmpty(delta.Content) || !string.IsNullOrEmpty(delta.Thinking))
-                        finalHeldAnswer.Add(ChatStreamUpdate.Parsed(delta.Content, delta.Thinking, null));
-                }
-                else if (!string.IsNullOrEmpty(delta.Content) || !string.IsNullOrEmpty(delta.Thinking))
-                {
-                    yield return ChatStreamUpdate.Parsed(delta.Content, delta.Thinking, null);
+                    if (guardCompletion)
+                        finalHeldAnswer.Add(piece);
+                    else
+                    {
+                        yield return piece;
+                        forwarded = true;
+                    }
                 }
                 if (!string.IsNullOrEmpty(delta.ToolCallText))
+                {
                     yield return ChatStreamUpdate.ToolProgress("writing", delta.ToolCallName, delta.ToolCallText);
+                    forwarded = true;
+                }
+                if (!forwarded)
+                    yield return StillWriting();
             }
 
             ParsedOutput last = finalParser.Add(string.Empty, true);
             Accumulate(last, finalContent, finalThinking, finalCalls);
-            if (guardCompletion)
+            if (Separated(last) is { } lastPiece)
             {
-                if (!string.IsNullOrEmpty(last.Content) || !string.IsNullOrEmpty(last.Thinking))
-                    finalHeldAnswer.Add(ChatStreamUpdate.Parsed(last.Content, last.Thinking, null));
-            }
-            else if (!string.IsNullOrEmpty(last.Content) || !string.IsNullOrEmpty(last.Thinking))
-            {
-                yield return ChatStreamUpdate.Parsed(last.Content, last.Thinking, null);
+                if (guardCompletion)
+                    finalHeldAnswer.Add(lastPiece);
+                else
+                    yield return lastPiece;
             }
 
             // Only the client's own tools may be forwarded here — this is ordinarily
@@ -678,8 +686,7 @@ namespace TensorSharp.Server.Skills
         {
             cancellationToken.ThrowIfCancellationRequested();
 
-            var parser = OutputParserFactory.Create(architecture);
-            parser.Init(enableThinking, plan.Tools);
+            IOutputParser parser = NewParser(architecture, enableThinking, plan);
             var content = new StringBuilder();
             var thinking = new StringBuilder();
             var calls = new List<ToolCall>();
@@ -712,6 +719,8 @@ namespace TensorSharp.Server.Skills
                 toolBeingWritten = delta.ToolCallName ?? toolBeingWritten;
                 if (!string.IsNullOrEmpty(delta.ToolCallText))
                     yield return ChatStreamUpdate.ToolProgress("writing", toolBeingWritten, delta.ToolCallText);
+                else
+                    yield return StillWriting();
             }
 
             ParsedOutput flushed = parser.Add(string.Empty, true);
@@ -1376,12 +1385,49 @@ namespace TensorSharp.Server.Skills
         private static string Truncate(string text, int max) =>
             text.Length <= max ? text : text.Substring(0, max - 1) + "\u2026";
 
-        /// <summary>Fold one parser delta into the round's running totals.</summary>
+        /// <summary>A round's parser. It streams text it cannot classify yet only to a client
+        /// that can take it back (<see cref="SkillRequestPlan.ClientRetractsAnswerText"/>).</summary>
+        private static IOutputParser NewParser(string architecture, bool enableThinking, SkillRequestPlan plan)
+        {
+            IOutputParser parser = OutputParserFactory.Create(architecture);
+            parser.Init(enableThinking, plan.Tools);
+            if (plan.ClientRetractsAnswerText)
+                parser.AcceptRetractions();
+            return parser;
+        }
+
+        /// <summary>
+        /// The update for a generated piece that gives the client nothing yet: the parser
+        /// holds it (text it cannot classify, a partial tag) or the route holds the answer.
+        /// It carries no text. It hands the client's stream loop control on every piece, so
+        /// an append-only stream can send a keep-alive instead of going silent past a
+        /// proxy's idle timeout (StreamKeepAlive, in TensorSharp.Server).
+        /// </summary>
+        private static ChatStreamUpdate StillWriting() => ChatStreamUpdate.Parsed(string.Empty, null, null);
+
+        /// <summary>The update that carries one parser delta's content, reasoning and
+        /// retraction to the client, or null when it has none of them.</summary>
+        private static ChatStreamUpdate? Separated(ParsedOutput delta)
+        {
+            if (string.IsNullOrEmpty(delta.Content) && string.IsNullOrEmpty(delta.Thinking)
+                && string.IsNullOrEmpty(delta.RetractedContent))
+                return null;
+            return ChatStreamUpdate.Parsed(delta.Content, delta.Thinking, null, delta.RetractedContent);
+        }
+
+        /// <summary>Fold one parser delta into the round's running totals. Retracted text
+        /// leaves the content first, so the round's history says what the client was left
+        /// showing: that is what the next request sends back, and what its transcript
+        /// splice has to match.</summary>
         private static void Accumulate(
             ParsedOutput delta, StringBuilder content, StringBuilder thinking, List<ToolCall> calls)
         {
             if (delta == null)
                 return;
+            string retracted = delta.RetractedContent;
+            if (!string.IsNullOrEmpty(retracted) && content.Length >= retracted.Length
+                && content.ToString(content.Length - retracted.Length, retracted.Length) == retracted)
+                content.Length -= retracted.Length;
             if (!string.IsNullOrEmpty(delta.Content))
                 content.Append(delta.Content);
             if (!string.IsNullOrEmpty(delta.Thinking))

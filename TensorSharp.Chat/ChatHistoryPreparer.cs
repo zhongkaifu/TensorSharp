@@ -212,6 +212,90 @@ namespace TensorSharp.Server
             return prepared ?? history;
         }
 
+        /// <summary>
+        /// Name, on each user message that attached files, the files it attached as the
+        /// code tools stage them, e.g. <c>(Attached as file 'IMG_0004.png' in the working
+        /// directory.)</c>.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// The names used to be appended to the shell tool's declaration, and the
+        /// declarations are inside the prefix every conversation shares: one attachment
+        /// changed the "identical" system prompt (an image chat on Qwen3.8 27B reused 0 of
+        /// the warm-up's 7,219 tokens), and every later attachment re-prefilled the chat
+        /// from inside the tools block. On the message, a name costs nothing upstream of
+        /// it, and the note says which message each file came with, which the declaration
+        /// never could.
+        /// </para>
+        /// <para>
+        /// It must render the same bytes on every turn that shows the message, or each
+        /// follow-up would re-prefill from the first annotated message. So a message's
+        /// note lists only its own files, under names fixed at their first appearance
+        /// (<c>WebUiChatService.CollectCodeInputFiles</c>), and is appended -- explicit
+        /// cache-breakpoint offsets into the body stay valid. A CSV the file-backed
+        /// reference (<see cref="UseFileBackedCsvAttachments"/>) already names is not
+        /// named twice. Applied to the inference copy only; the returned list shares
+        /// every message it did not annotate.
+        /// </para>
+        /// </remarks>
+        internal static List<ChatMessage> AnnotateAttachmentNames(
+            List<ChatMessage> history,
+            IReadOnlyDictionary<string, string> namesBySource)
+        {
+            if (history == null || history.Count == 0 || namesBySource == null || namesBySource.Count == 0)
+                return history;
+
+            List<ChatMessage> prepared = null;
+            for (int i = 0; i < history.Count; i++)
+            {
+                ChatMessage message = history[i];
+                List<string> paths = message?.AttachmentPaths ?? message?.TextFilePaths;
+                if (paths is not { Count: > 0 } ||
+                    !string.Equals(message.Role, "user", StringComparison.OrdinalIgnoreCase))
+                {
+                    continue;
+                }
+
+                string csvReference = FileBackedCsvReferenceHeader(message.Content);
+                var quoted = new List<string>();
+                foreach (string path in paths)
+                {
+                    if (string.IsNullOrEmpty(path) || !namesBySource.TryGetValue(path, out string name))
+                        continue;
+                    string label = QuoteFileName(name);
+                    if (quoted.Contains(label, StringComparer.Ordinal) ||
+                        (csvReference != null && csvReference.Contains(label, StringComparison.Ordinal)))
+                    {
+                        continue;
+                    }
+                    quoted.Add(label);
+                }
+                if (quoted.Count == 0)
+                    continue;
+
+                string note = quoted.Count == 1
+                    ? "(Attached as file " + quoted[0] + " in the working directory.)"
+                    : "(Attached as files " + string.Join(", ", quoted) + " in the working directory.)";
+                ChatMessage copy = CloneShallow(message);
+                copy.Content = string.IsNullOrEmpty(message.Content) ? note : message.Content + "\n\n" + note;
+
+                prepared ??= new List<ChatMessage>(history);
+                prepared[i] = copy;
+            }
+
+            return prepared ?? history;
+        }
+
+        /// <summary>The first line of a file-backed CSV reference, which names the staged
+        /// tables, or null when <paramref name="content"/> does not start with one.</summary>
+        private static string FileBackedCsvReferenceHeader(string content)
+        {
+            if (content == null || !content.StartsWith(FileBackedCsvPrefix, StringComparison.Ordinal))
+                return null;
+            int end = content.IndexOf('\n');
+            return end < 0 ? content : content.Substring(0, end);
+        }
+
         private readonly record struct AttachedTextFile(string Path, string Name, bool IsCsv);
 
         private readonly record struct FileEnvelope(string Name, string Content);
@@ -301,12 +385,122 @@ namespace TensorSharp.Server
             return true;
         }
 
-        private static string QuoteFileName(string name)
+        private static string QuoteFileName(string name) => "'" + ProseSafeFileName(name) + "'";
+
+        /// <summary>
+        /// <paramref name="name"/> as the prompt quotes it: without control characters, so a
+        /// crafted name cannot manufacture another instruction line, and with an apostrophe
+        /// as ’, so it cannot end the quotes around it. A file name belongs in prose, not in
+        /// prompt structure.
+        /// </summary>
+        /// <remarks>
+        /// <c>WebUiChatService.CollectCodeInputFiles</c> stages each attachment under this
+        /// form of its name too. A note that quoted "Bob's report.pdf" as 'Bob’s report.pdf'
+        /// over a file staged as "Bob's report.pdf" sent the model to a file that does not
+        /// exist; one name for both cannot disagree, and a staged name without an apostrophe
+        /// also survives the single quotes of a shell command a model writes around it.
+        /// </remarks>
+        internal static string ProseSafeFileName(string name)
         {
-            // A file name belongs in prose, not in prompt structure. Strip control
-            // characters so a crafted name cannot manufacture another instruction line.
+            if (string.IsNullOrEmpty(name))
+                return name ?? string.Empty;
             string safe = new(name.Where(c => !char.IsControl(c)).ToArray());
-            return "'" + safe.Replace("'", "’", StringComparison.Ordinal) + "'";
+            return safe.Replace("'", "’", StringComparison.Ordinal);
+        }
+
+        /// <summary>
+        /// A copy of <paramref name="message"/> without its first <paramref name="images"/>
+        /// images (all of a video's frames, which go together) and first
+        /// <paramref name="audio"/> recordings, each named in a short note where it was --
+        /// "[earlier image 'cat.png' is no longer shown]" -- so the words of a turn survive
+        /// when its media no longer fits the window
+        /// (<c>ChatGenerationPipeline.CompactMediaHistoryForContext</c>). The note keeps the
+        /// model from answering about pixels it is no longer given, and tells it which file a
+        /// later "the first photo" meant.
+        ///
+        /// <para>
+        /// The name is the one the file can be OPENED by. When the request offers the code
+        /// tools, <paramref name="stagedNames"/> maps each upload to the name they stage it
+        /// under -- the name the message's own "(Attached as file ...)" note gives
+        /// (<see cref="AnnotateAttachmentNames"/>). The user's display name would disagree
+        /// with it exactly when it matters: two pasted photos are both "image.png", the
+        /// second is staged as "image-2.png", and "image.png" in the workspace is the FIRST
+        /// one; a HEIC photo is staged as its PNG. Without code tools nothing is staged and
+        /// the display name is all the conversation has. A picture with no name the user
+        /// knows (a frame the server extracted, or a client that sent no attachment list)
+        /// is noted without one rather than by its internal upload name.
+        /// </para>
+        /// </summary>
+        internal static ChatMessage WithMediaReplacedByNote(
+            ChatMessage message, int images, int audio, IReadOnlyDictionary<string, string> stagedNames = null)
+        {
+            int imageCount = message.ImagePaths?.Count ?? 0;
+            int audioCount = message.AudioPaths?.Count ?? 0;
+            images = message.IsVideo && images > 0 ? imageCount : Math.Clamp(images, 0, imageCount);
+            audio = Math.Clamp(audio, 0, audioCount);
+
+            var notes = new List<string>();
+            if (images > 0 && message.IsVideo)
+            {
+                // The frames are the server's extraction, not something the user named.
+                notes.Add("[an earlier video is no longer shown]");
+            }
+            else
+            {
+                for (int i = 0; i < images; i++)
+                    notes.Add(Note("image", message.ImagePaths[i], "shown"));
+            }
+            for (int i = 0; i < audio; i++)
+                notes.Add(Note("audio", message.AudioPaths[i], "included"));
+
+            ChatMessage copy = CloneShallow(message);
+            if (images > 0)
+            {
+                copy.ImagePaths = images < imageCount ? message.ImagePaths.Skip(images).ToList() : null;
+                copy.ImageTimestamps = images < imageCount && message.ImageTimestamps != null
+                    ? message.ImageTimestamps.Skip(images).ToList()
+                    : null;
+                if (copy.ImagePaths == null)
+                    copy.IsVideo = false;
+            }
+            if (audio > 0)
+                copy.AudioPaths = audio < audioCount ? message.AudioPaths.Skip(audio).ToList() : null;
+            if (notes.Count == 0)
+                return copy;
+
+            string note = string.Join("\n", notes);
+            // Where the media was: templates place it ahead of the words.
+            copy.Content = string.IsNullOrEmpty(message.Content) ? note : note + "\n\n" + message.Content;
+            // Offsets into the old body no longer name the same bytes.
+            copy.ContentCacheBreakpoints = null;
+            return copy;
+
+            string Note(string kind, string path, string verb)
+            {
+                string name = NoteName(message, path, stagedNames);
+                return name == null
+                    ? "[an earlier " + (kind == "image" ? "image" : "recording") + " is no longer " + verb + "]"
+                    : "[earlier " + kind + " " + QuoteFileName(name) + " is no longer " + verb + "]";
+            }
+        }
+
+        /// <summary>The name a media note gives <paramref name="path"/>: the staged name when
+        /// the request stages files, else the name the user attached it under; null when the
+        /// conversation never named it.</summary>
+        private static string NoteName(ChatMessage message, string path, IReadOnlyDictionary<string, string> stagedNames)
+        {
+            if (string.IsNullOrEmpty(path))
+                return null;
+            if (stagedNames != null)
+                return stagedNames.TryGetValue(path, out string staged) && !string.IsNullOrWhiteSpace(staged) ? staged : null;
+            int index = message.AttachmentPaths?.IndexOf(path) ?? -1;
+            if (index < 0)
+                return null;
+            string supplied = message.AttachmentNames != null && index < message.AttachmentNames.Count
+                ? message.AttachmentNames[index]
+                : null;
+            string name = Path.GetFileName(string.IsNullOrWhiteSpace(supplied) ? path : supplied);
+            return name.Length == 0 ? null : name;
         }
 
         public static bool HasMultimodalContent(ChatMessage msg)

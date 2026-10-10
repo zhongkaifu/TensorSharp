@@ -111,7 +111,7 @@ entry is skipped, so nothing is fetched for it.`。`--config` 可重复出现以
 ```
 
 开箱即用的示例见 [`config/`](config/)（`cli-basic.json`、`server-basic.json`、`variables.json`、
-`auto-download.json`、`qwen-image-2.1.json`）——每个都使用真实、公开、无需授权的 URL，
+`auto-download.json`、`qwen-image-2.1.json`、`qwen-image-2.1-turbo.json`）——每个都使用真实、公开、无需授权的 URL，
 因此在全新机器上也能直接运行。该目录还提供聊天模型（`gemma-4-*`、`qwen3.5-9b-*`、`qwen3.6-*`、
 `gpt-oss-20b`）、智能体托管（`agent-*`）、嵌入服务（`embedding-*`）、DiffusionGemma 与 Jev
 （`diffusiongemma-*`、`jev-diffusiongemma-q4`）以及视频（`minimax-h3-*`、`wan-video-*`）的预设，
@@ -168,6 +168,13 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --config config/qwen-image-2.1.js
     --prompt "A small orange cat beside a blue ceramic vase, soft daylight" --output generated.png
 dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --config config/qwen-image-2.1.json --image generated.png \
     --prompt "Change the blue vase to a red vase. Preserve the cat, lighting and composition." --output edited.png
+
+# Qwen-Image-2.1-Turbo：蒸馏为 8 步的版本，VAE、文本编码器与 mmproj 相同。配置文件声明了
+# 检查点（--qwen-image-variant turbo），因此按 Turbo 公布的 8 步调度、CFG 1 采样。
+# 见 docs/models/qwenimage21_zh-cn.md#qwen-image-21-turbo。
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --config config/qwen-image-2.1-turbo.json \
+    --prompt "A small orange cat beside a blue ceramic vase, soft daylight" \
+    --width 1024 --height 1024 --output turbo-checkpoint.png
 
 # 带 LoRA 插件的 Qwen-Image-2.1。config/lora/ 中是现成的插件，首次使用时自动下载权重；
 # 步数蒸馏插件还会带上自己的采样配方（这里是 6 步、CFG 1）。见下文“Qwen-Image-2.1 LoRA 插件”。
@@ -323,7 +330,7 @@ dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --model <model.gguf> --backend cu
 | `--no-prefix-cache` | 关闭运行时的 Radix 前缀复用（等同于设置 `TS_SCHED_PREFIX_CACHE=0`），也不再在交互式会话启动时预热 system/工具提示词。Radix 缓存对普通的 CLI 生成默认开启，包括单次、交互式、JSONL 与技能/工具请求。CLI 的缓存只在内存里，每个新进程都从冷启动开始。它与用于预热计算内核的 `--warmup-runs` 无关。 |
 | `--system <text>` | 用于初始化交互式会话的系统提示词（在 REPL 中可用 `/system` 覆盖） |
 | `--system-file <path>` | 从 UTF-8 文本文件读取初始系统提示词（`--system` 的替代写法） |
-| `--think` | 启用思维链/推理模式。GLM-5.2 / GLM-5.3（`glm-dsa`）按需开启：不加时它们的模板会把推理块立刻闭合（`<think></think>`），模型直接作答；加上后提示里会带上 `Reasoning Effort: Max`，并留下一个未闭合的 `<think>` 交给模型自己收尾。GLM-5.3-Flash（`glm5next`）始终思考，该参数不能关闭它的推理。GPT-OSS 也不论是否加这个参数都会先推理再作答：它的 Harmony 提示没有“关闭思考”的写法，CLI 把其中的 `Reasoning:` 行渲染为 `medium`。REPL 里用 `/think on\|off` 切换。 |
+| `--think` | 启用思维链/推理模式。GLM-5.2 / GLM-5.3（`glm-dsa`）按需开启：不加时它们的模板会把推理块立刻闭合（`<think></think>`），模型直接作答；加上后提示里会带上 `Reasoning Effort: Max`，并留下一个未闭合的 `<think>` 交给模型自己收尾。GLM-5.3-Flash（`glm5next`）始终思考，该参数不能关闭它的推理。GPT-OSS 也不论是否加这个参数都会先推理再作答：它的 Harmony 提示没有“关闭思考”的写法，CLI 把其中的 `Reasoning:` 行渲染为 `medium`。Nemotron-H Reasoning-128K 不加该参数时有时仍会推理并自己闭合推理块；CLI 把这段文本作为推理而不是答案打印，因此这类回复的开头要等有了定论才打印：遇到 `</think>`、第一个完整的工具调用、回复结束，或最多 2,048 个字符之后（见 [Nemotron-H](docs/models/nemotron_zh-cn.md#12-输出解析器与聊天模板)）。REPL 里用 `/think on\|off` 切换。 |
 | `--tools <path>` | 包含工具/函数定义的 JSON 文件。线格式因系列而异，解析器按架构选取——GLM 5.x 发出的是 XML（`<tool_call>NAME<arg_key>k</arg_key><arg_value>v</arg_value></tool_call>`，每个参数一个元素，非纯字符串的值以 `tojson` 编码）而不是 JSON 主体，服务端会把它解析回常规的 OpenAI 工具调用字段，因此客户端看到的仍是标准形状。 |
 | `--skills-dir <path>` | 扫描 Agent Skills 的目录（可以是装着若干 `SKILL.md` 的文件夹，也可以是单个技能目录）。可重复；按给出的顺序扫描，最深三层。不传时，先使用从工作目录向上直到 Git 仓库根目录之间所有已存在的 `.agents/skills` 目录（离得近的优先；不在仓库内时只检查工作目录），再加上二进制文件旁的 `skills` 目录（不存在则创建）。显式给出的目录会取代这些默认值，个人/全局技能目录永远不会被自动加载。传入的路径不存在会在启动时报错并点名该参数。环境变量：`TS_SKILLS_DIR`（以路径分隔符分隔的列表）。 |
 | `--skill <name>` | 为本次运行选中一个技能，名称取自其 `SKILL.md`（也就是它的目录名）。可重复。对支持工具调用的模型族，选中只会展示技能元数据并把内置技能工具的可达范围限定到该技能，**不会**把 `SKILL.md` 正文直接写入提示词。只有模型族或请求无法使用工具声明时（包括结构化输出请求），才会在预算允许时内联正文作为回退。 |
@@ -419,20 +426,22 @@ Linux 仍隐藏常见的 `/run` 端点，但本地 Unix IPC 并非完整隔离�
 | `--test-chunked-prefill` | 运行分块 prefill 正确性检查（对比分块与非分块 logits） |
 | `--correct-prefill <N>` | `--test-chunked-prefill` 使用的 prompt 长度 |
 | `--correct-decode <N>` | `--test-chunked-prefill` 使用的 decode 长度 |
-| `--diffusion-steps <N>` | DiffusionGemma 每个 block 的去噪步数（默认：48）。对 Qwen-Image-2.1 则是 FlowMatch-Euler 步数——省略时自动选择（40，或 `--lora` 插件采样配方中的步数）。 |
-| `--diffusion-seed <N>` | 扩散路径的噪声种子：DiffusionGemma 的确定性采样器与 Qwen-Image-2.1（默认：0），以及视频生成（Wan、MiniMax-H3）——视频不传时每次运行都会取一个新的随机种子。决定一段视频长什么样的是这个种子，`--seed` 是文本采样种子，对它没有影响。 |
+| `--diffusion-steps <N>` | DiffusionGemma 每个 block 的去噪步数（默认：48）。对 Qwen-Image-2.1 则是 FlowMatch-Euler 步数——省略时自动选择（40，或 `--lora` 插件采样配方中的步数；Qwen-Image-2.1-Turbo 为 8，也只接受 8）。 |
+| `--diffusion-seed <N>` | 扩散路径的噪声种子：DiffusionGemma 的确定性采样器与 Qwen-Image-2.1（默认：0），以及视频生成（Wan、MiniMax-H3）——视频不传时每次运行都会取一个新的随机种子。决定一段视频长什么样的是这个种子，`--seed` 是文本采样种子，对它没有影响。Qwen-Image-2.1 的图像由种子和尺寸决定；编辑的噪声还取决于 `--image` 传入的图片，因此用画出某张图的种子去编辑它，不会从它自己的噪声重新开始（[种子与编辑](docs/models/qwenimage21_zh-cn.md#种子与编辑)）。 |
 | `--diffusion-blocks <N>` | DiffusionGemma block-autoregressive canvas 数量。`0` 表示根据 `--max-tokens` 与模型 canvas 长度推导。 |
 | `--image <path>` | Qwen-Image-2.1 编辑用的输入图像（也是多模态聊天的图像输入）；重复该参数可传入多张参考图。每个 `--image` 都是一张参考图，按命令行顺序在提示词之前标记为 `<image1>`、`<image2>`……，提示词可以用这些标记指代图片。不带 `--image` 时，Qwen-Image-2.1 DiT 改为根据提示词生成图像。 |
 | `--mask <path>` | Qwen-Image-2.1 掩码，尺寸须与第一张输入图完全一致。需要 `--image`；其他图片仍作为参考。保留源图尺寸及未选中的已解码 RGBA 像素。见[掩码图像编辑](#掩码图像编辑)。 |
 | `--mask-mode <mode>` / `--mask-invert` | `grayscale`（默认）：白色编辑、黑色保护、灰色混合。`alpha`：透明编辑、不透明保护。`--mask-invert` 反转选区。 |
 | `--mask-feather <pixels>` | 按源图像素向内柔化边缘；范围 0–1024，默认 0。 |
 | `--mask-crop` / `--mask-crop-padding <pixels>` | 处理选区及周围上下文，再合成回原始画布。padding 按源图像素计，范围 0–16384，默认 64。未给 `--mask` 时掩码设置会被拒绝。 |
+| `--keep-source-size` | Qwen-Image-2.1 编辑：返回第一张 `--image` 的精确宽高，使对编辑结果的再次编辑保持尺寸不变。采样面积约为该图自身面积，至少 1 百万像素、至多自动面积，宽高比近似保持（二者都按 32 像素网格取整），结果再缩放回源图尺寸。需要 `--image`；不能与 `--width`/`--height` 同时使用。带掩码的编辑无需此参数即保持源图尺寸。服务端对应的每请求字段为 `keepSourceSize`。见[保持源图尺寸](#保持源图尺寸)。 |
 | `--prompt <text>` | Qwen-Image-2.1 的生成提示词或编辑指令（省略时回退到 `--input` 文件内容）。 |
 | `--output <path>` | Qwen-Image-2.1 输出 PNG 路径（默认：生成为 `generated.png`，编辑为 `edited.png`）。 |
 | `--cfg <F>` | Qwen-Image-2.1 true-CFG 引导尺度（`<= 1` 关闭负向分支）。省略时自动选择：Qwen-Image-2.1 为 1.0（每步只做一次 Transformer 预测），或 `--lora` 插件采样配方中的 CFG；大于 1 的值会增加负向分支。步数与种子复用 `--diffusion-steps` / `--diffusion-seed`。在 MiniMax-H3 上唯一可接受的取值是 `1.0`（也是它的默认值）：该检查点是 CFG 蒸馏的，更高的值会被直接拒绝，而不是照跑然后出劣化结果。`TensorSharp.Server.Host` 根本没有 `--cfg` 参数——但请求体里仍然可以带 `cfg`。 |
 | `--qwen-image-vae <path>` | 覆盖解析到的 Qwen-Image-2.1 VAE 伴随文件（默认：DiT GGUF 旁的 `qwen_image_2.1_vae*.safetensors` 文件）。环境变量：`TS_QWEN_IMAGE_VAE`。 |
 | `--qwen-image-vl <path>` | 覆盖解析到的 Qwen3-VL-8B 文本编码器 GGUF（默认：DiT 旁的 `Qwen3VL-8B` / `Qwen3-VL-8B` GGUF）。环境变量：`TS_QWEN_IMAGE_TE`。 |
 | `--qwen-image-mmproj <path>` | 覆盖解析到的 Qwen3-VL-8B mmproj（编辑时的视觉接地）GGUF（默认：DiT 旁匹配的 `mmproj` GGUF）。环境变量：`TS_QWEN_IMAGE_MMPROJ`。 |
+| `--qwen-image-variant <base\|turbo>` | DiT GGUF 是哪一个 Qwen-Image-2.1 检查点。GGUF 不带元数据，Turbo 的张量又与基础检查点相同，所以由宿主声明：`turbo` 按 Qwen-Image-2.1-Turbo 公布的 8 步调度、CFG 1 采样，拒绝其他步数，也拒绝步数蒸馏 `--lora` 插件。默认：不声明——文件名含单词 `turbo` 时按 Turbo 处理，加载时会打印这一假定；其他文件为 `base`。用于其他模型时被拒绝。环境变量：`TS_QWEN_IMAGE_VARIANT`。见 [Qwen-Image-2.1-Turbo](docs/models/qwenimage21_zh-cn.md#qwen-image-21-turbo)。 |
 | `--lora <path>` | Qwen-Image-2.1 LoRA 插件：LoRA `.safetensors` 文件，或 TensorSharp 插件配置 `.json`（见 [`config/lora/`](config/lora/)）。重复该参数可叠加多个 LoRA。以不合并的方式叠加在量化 Transformer 之上。用于其他模型时会被拒绝。默认：无。见 [Qwen-Image-2.1 LoRA 插件](#qwen-image-21-lora-插件)。 |
 | `--lora-scale <f>` | 前一个 `--lora` 的强度（乘以 alpha / rank）。默认：插件配置中的 `"scale"`，否则为 `1.0`。 |
 | `--lora-config <path>` | 前一个 `--lora` 的伴随配置：TensorSharp LoRA 配置、PEFT `adapter_config.json` 或 VideoX-Fun `pdd_config.json`。默认：无（PDD 包的 `pdd_config.json`，以及与 `adapter_model.safetensors` 同目录的 PEFT `adapter_config.json`，会在权重旁自动找到）。 |
@@ -707,6 +716,7 @@ Unix IPC 并非完整隔离边界：macOS 为兼容性保留共享临时目录�
 | `--video-dit2 <path>` | 双专家模型的第二个扩散专家（Wan 2.2 A14B 中与 `--model` 配对的 high/low-noise 搭档）。两者同目录时按文件名自动解析。环境变量：`TS_VIDEO_DIT2`。 |
 | `--audio-vae <path>` | 与视频联合生成音轨的模型所用的音频 VAE（`minimax_h3_audio_vae_fp32.safetensors`）。不提供时该类模型仍能出图，只是没有音频。环境变量：`TS_VIDEO_AUDIO_VAE`。 |
 | `--qwen-image-vae <path>` / `--qwen-image-vl <path>` / `--qwen-image-mmproj <path>` | 覆盖服务端原本在 DiT GGUF 旁找到的 Qwen-Image-2.1 伴随文件：VAE、Qwen3-VL-8B 文本编码器及其视觉投影器（编辑时需要）。启动时检查。环境变量：`TS_QWEN_IMAGE_VAE`、`TS_QWEN_IMAGE_TE`、`TS_QWEN_IMAGE_MMPROJ`。 |
+| `--qwen-image-variant <base\|turbo>` | DiT GGUF 是哪一个 Qwen-Image-2.1 检查点，拼写与含义同 CLI：`turbo` 默认按 Turbo 的 8 步调度、CFG 1 采样（请求的 `steps` 只能是 8），并拒绝步数蒸馏 `--lora` 插件。作用于服务端加载的每个 Qwen-Image 模型；其他模型照常加载、不使用它，服务端会记录一条警告，与 `--lora` 相同。默认：不声明——文件名含单词 `turbo` 时按 Turbo 处理，加载时会打印这一假定。启动时检查。环境变量：`TS_QWEN_IMAGE_VARIANT`。 |
 | `--width <px>` / `--height <px>` | 图像请求既未指定尺寸也未指定面积时（Web UI 从不指定）Qwen-Image-2.1 的默认输出尺寸；请求自己设置了宽高或目标面积时保留它自己的几何设置。默认尺寸需要两个值都给出。不是 32 倍数的边会向下取整到 32 的倍数（最小 32），并打印一次 `[qwen-image] WARNING`；只给出一边、或值无法解析或为负数时，默认尺寸会被忽略（同样只警告一次），继续使用自动尺寸（2048×2048 面积；`cpu` 后端上为 1024×1024）。Qwen-Image 服务端在这两种情况下都会在启动时警告，但不会拒绝启动。请求本身设置的宽高仍必须是 32 的正整数倍。环境变量：`TS_QWEN_IMAGE_WIDTH` / `TS_QWEN_IMAGE_HEIGHT`。它们同时也是 `--video-width` / `--video-height` 的别名。 |
 | `--lora <path>` / `--lora-scale <f>` / `--lora-config <path>` | Qwen-Image-2.1 LoRA 插件，拼写与绑定规则都与 CLI 相同（重复 `--lora` 可叠加；强度与配置绑定到前一个 `--lora`）。文件在启动时检查，这组插件作用于每个图像请求；请求中的 `steps` / `cfg` 仍会覆盖插件的采样配方。其他模型会忽略它们（启动日志会说明这些插件只作用于 Qwen-Image-2.1 模型）。见 [Qwen-Image-2.1 LoRA 插件](#qwen-image-21-lora-插件)。 |
 | `--qwen-image-lora` / `--offload-cpu` | **已移除，启动时（包括作为配置文件键时）直接拒绝。** 两者只服务于早期的 Qwen-Image-Edit 流水线。`--qwen-image-lora` 由上面的 `--lora` 取代；`--offload-cpu` 没有替代项，因为 Qwen-Image-2.1 的 DiT 权重始终常驻。 |
@@ -911,6 +921,21 @@ JSON 引用的文件请先通过 `/api/upload` 上传。
 掩码需要 Qwen-Image-2.1、输入图以及与源图一致的尺寸。
 选区语义、采样几何、API 示例与验证范围见[掩码指南](docs/models/qwenimage21_zh-cn.md#用遮罩精确编辑局部区域)。
 
+### 保持源图尺寸
+
+不带掩码时，编辑结果的尺寸由一个面积（自动的 2048×2048 面积，或请求的 `targetArea`）
+按第一张图的宽高比决定，因此比该面积大的图片会变小，对掩码编辑得到的原尺寸结果再做编辑时
+也会缩小。`--keep-source-size`（请求字段 `keepSourceSize: true`）改为返回第一张图的精确宽高：
+
+```bash
+dotnet TensorSharp.Cli/bin/TensorSharp.Cli.dll --config config/qwen-image-2.1.json \
+    --image edited.png --keep-source-size \
+    --prompt "Make the sky a sunset" --output edited-again.png
+```
+
+采样面积约为图片自身面积——至少 1 百万像素（参考图的条件面积），至多该编辑原本使用的面积——宽高比
+近似保持（二者都按 32 像素网格取整）；与源图尺寸不同时，解码结果会缩放回源图尺寸。服务端 Web UI 与 TensorAgent 的每次编辑都会发送该字段。
+
 ## Qwen-Image-2.1 LoRA 插件
 
 `--lora` 把一个 LoRA 加到 Qwen-Image-2.1 扩散 Transformer 上：可以是一种风格、一项编辑
@@ -934,6 +959,11 @@ JSON 引用的文件请先通过 `/api/upload` 上传。
 （`LoRA plug-ins (applied to Qwen-Image-2.1 models only): ...`），并把它们应用到每个
 图像请求上。TensorSharp.Server.Host 不提供按请求选择 LoRA；TensorAgent 有自己的已保存插件选择，从下一张图片起生效。已退役的 `--qwen-image-lora` 仍是已移除的参数，其报错
 会指明 `--lora`；`TS_QWEN_IMAGE_LORA` 在加载时被拒绝，并给出同样的建议。
+
+Qwen-Image-2.1-Turbo（`--qwen-image-variant turbo`）本身已经过步数蒸馏：带采样配方的插件
+（下表中的四个步数蒸馏插件，或任何带 `"sampling"` 的配置）在加载时被拒绝并说明原因；不带
+配方的插件可以加载。Film Stills 与 Grainscape 已在 Turbo 上验证（风格会生效，部分场景会被重画），见
+[Turbo 上的 LoRA 插件](docs/models/qwenimage21_zh-cn.md#turbo-上的-lora-插件)。
 
 ```bash
 # 现成的插件：配置在首次使用时下载（并校验哈希）权重，并带上适配器的采样配方，
@@ -1952,7 +1982,9 @@ CLI 的普通生成使用共享调度器，其报告的 prefill 时间是首 tok
 | 前缀 KV 缓存（在第一个去噪步保存文本与参考图像的 key / value，之后每一步复用） | 开启 | `TS_QWEN21_PREFIX_CACHE=0`（或 `false` / `off` / `no`）关闭它 | — |
 | 前缀 KV 缓存的存储类型 | `auto` —— 即注意力内核实际读取的类型，因此缓存后的步骤与不缓存时结果一致 | `TS_QWEN21_PREFIX_CACHE_TYPE` = `auto` / `f16` / `f32` / `q8_0` / `q8_0_v`（8 bit 类型会对保存的前缀做舍入；即使缓存关闭，拼错的值也会报错） | — |
 | 前缀 KV 缓存大小上限 | 最多使用设备报告的空闲内存的一半 | `TS_QWEN21_PREFIX_CACHE_MAX_MIB` 进一步限制单个缓存；放不下的缓存会带警告被拒绝，该请求每一步都重新计算前缀 | — |
+| 编辑噪声 | `references` —— 编辑的初始噪声由种子与参考图共同决定，因此编辑不会从画出源图的那份噪声重新开始 | `TS_QWEN21_EDIT_NOISE=seed` 让编辑改用该种子的文生图噪声（与 stable-diffusion.cpp 相同），用于噪声对齐的对比（每次这样的编辑都会打印一行说明）；其他取值会报错 | — |
 | 伴随组件覆盖 | 在 DiT GGUF 同目录解析 | `TS_QWEN_IMAGE_VAE`、`TS_QWEN_IMAGE_TE`、`TS_QWEN_IMAGE_MMPROJ` | `--qwen-image-vae`、`--qwen-image-vl`、`--qwen-image-mmproj` |
+| 检查点变体（Turbo 使用自己的 8 步调度） | 不声明：文件名含单词 `turbo` 时按 Turbo 处理，加载时会说明；其他为 `base` | `TS_QWEN_IMAGE_VARIANT` = `base` / `turbo`（其他值会拒绝加载） | `--qwen-image-variant` |
 
 #### 张量并行与分布式推理
 

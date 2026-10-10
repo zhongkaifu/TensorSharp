@@ -4,6 +4,10 @@
 Never replaces source binaries. One warmup per binary, then AB/BA/AB measured
 pairs. Records actual loaded GgmlOps module identity, GPU samples, wall/denoise
 times and exact baseline image/protected RGBA parity. No builds are performed.
+
+The recorded output hash holds only for the edit noise it was made with: the runs
+use the request report's TS_QWEN21_EDIT_NOISE, and `seed` for a report recorded
+before that setting existed, when every edit drew the seed's noise.
 """
 import argparse
 import ctypes
@@ -80,7 +84,7 @@ def stage_runtime(source, destination, native):
     return {path.name: digest(path) for path in destination.iterdir() if path.is_file()}
 
 
-def run_one(args, runtime, native_hash, command_template, label, source, mask, expected_output):
+def run_one(args, runtime, native_hash, command_template, label, source, mask, expected_output, edit_noise):
     command = command_template.copy()
     command[1] = str(runtime / "TensorSharp.Cli.dll")
     image = args.out / f"{label}.png"
@@ -90,6 +94,7 @@ def run_one(args, runtime, native_hash, command_template, label, source, mask, e
     samples, mapped = [], None
     with log_path.open("w", encoding="utf-8") as log:
         child = subprocess.Popen(command, cwd=ROOT, stdout=log, stderr=subprocess.STDOUT,
+                                 env=dict(os.environ, TS_QWEN21_EDIT_NOISE=edit_noise),
                                  creationflags=subprocess.CREATE_NO_WINDOW)
         try:
             while child.poll() is None:
@@ -146,6 +151,9 @@ def main():
     args.out.mkdir(parents=True, exist_ok=True)
     request = json.loads(args.request_report.read_text())
     template = next(run for run in request["runs"] if bool(run["crop"]) == args.crop)
+    edit_noise = request.get("edit_noise", "seed")
+    if edit_noise not in ("references", "seed"):
+        parser.error(f"The request report's edit noise is {edit_noise!r}; a CLI report records references or seed")
     command = template["command"]
     source = Path(command[command.index("--image") + 1])
     mask = Path(command[command.index("--mask") + 1])
@@ -157,7 +165,7 @@ def main():
         k: v for k, v in manifests["B"].items() if k != "GgmlOps.dll"}
     report = {"passed": False, "native_inputs": {key: {"path": str(path), "sha256": hashes[key]} for key, path in natives.items()},
               "runtime_manifests": manifests, "dependencies": {"ggml": MASK.revision(ROOT / "ExternalProjects/ggml")},
-              "warmups": [], "runs": [], "cooldown_seconds": args.cooldown, "crop": args.crop,
+              "warmups": [], "runs": [], "cooldown_seconds": args.cooldown, "crop": args.crop, "edit_noise": edit_noise,
               "limitations": ["A is the preserved premerge CFBA binary, not the unavailable B1E800 merge-validation binary.",
                               "Both variants use current managed assemblies and the same ordered image/mask workload; mode is recorded in crop.",
                               "Only this synthetic source/edit, one CUDA device, and three paired repeats are measured; not general model quality.",
@@ -175,7 +183,7 @@ def main():
             if index:
                 time.sleep(args.cooldown)
             print(f"Starting {label}", flush=True)
-            result = run_one(args, runtimes[variant], hashes[variant], command, label, source, mask, template["output_sha256"])
+            result = run_one(args, runtimes[variant], hashes[variant], command, label, source, mask, template["output_sha256"], edit_noise)
             result["variant"] = variant
             report["warmups" if warmup else "runs"].append(result)
             output.write_text(json.dumps(report, indent=2) + "\n")

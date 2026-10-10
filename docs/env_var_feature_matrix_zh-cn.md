@@ -173,6 +173,7 @@ TestMatrix 配置中 sweep。
 
 | 环境变量 | 适用范围 | 功能影响 | 运行时 baseline | Sweep 值 | 默认 sweep |
 |---|---|---|---|---|---|
+| `TS_QWEN21_EDIT_NOISE` | Qwen-Image-2.1 编辑 | `references`（或不设置）：编辑的初始噪声取自由参考图（8 位像素的 SHA-256）决定的 Philox 流，因此在相同种子与尺寸下也不会从画出源图的那份噪声重新开始。`seed`：编辑改用该种子的文生图噪声（与 stable-diffusion.cpp 相同），用于噪声对齐的对比，每次这样的编辑都会打印一行。其他取值会使请求失败。文生图噪声在两种设置下相同 | `references` | 未注册 | 否 |
 | `TS_QWEN21_PREFIX_CACHE` | Qwen-Image-2.1 DiT | `0`（或 `false` / `off` / `no`）关闭前缀 KV 缓存：它在第一个去噪步保存文本与参考图像的 key / value，之后每一步复用 | 启用 | 未注册 | 否 |
 | `TS_QWEN21_PREFIX_CACHE_TYPE` | 同上 | 缓存前缀的存储类型：`auto`（注意力实际读取的类型，输出与不缓存时一致）、`f16`、`f32`、`q8_0` 或 `q8_0_v`（8 bit 设置会对保存的前缀做舍入）。即使缓存关闭，拼错的值也会报错 | `auto` | 未注册 | 否 |
 | `TS_QWEN21_PREFIX_CACHE_MAX_MIB` | 同上 | 单个缓存的上限（MiB），叠加在"缓存最多使用设备空闲内存一半"的规则之上。放不下的缓存会带警告被拒绝，该请求每一步都重新计算前缀 | 未设置 | 未注册 | 否 |

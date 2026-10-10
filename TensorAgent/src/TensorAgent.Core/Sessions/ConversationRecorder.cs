@@ -132,10 +132,13 @@ public sealed class ConversationRecorder
     /// <param name="videoUrl">The clip a video model made this turn, likewise.</param>
     /// <param name="audioUrl">That clip's soundtrack, when it is a separate file rather than inside the clip.</param>
     /// <param name="stats">The model's terminal counters, when supplied by a text turn.</param>
+    /// <param name="image">What the picture was made from, or the readings an image turn offered
+    /// instead of making one (see <see cref="ImageTurnRecord"/>).</param>
     public void Complete(
         string sessionId, string content, string? thinking = null,
         IReadOnlyList<StoredArtifact>? artifacts = null, string? imageUrl = null,
-        string? videoUrl = null, string? audioUrl = null, StoredTurnStats? stats = null)
+        string? videoUrl = null, string? audioUrl = null, StoredTurnStats? stats = null,
+        ImageTurnRecord? image = null)
     {
         // Image/video completion frames carry zero-token placeholder counters. Keep
         // actual LLM counters when a text turn also produced media through a tool.
@@ -155,7 +158,7 @@ public sealed class ConversationRecorder
             if (conversation.Messages.Count > 0 && conversation.Messages[^1].Role == "assistant")
                 conversation.Messages.RemoveAt(conversation.Messages.Count - 1);
 
-            conversation.Messages.Add(new StoredMessage
+            var answer = new StoredMessage
             {
                 Role = "assistant",
                 Content = content,
@@ -169,7 +172,9 @@ public sealed class ConversationRecorder
                 ImageUrl = string.IsNullOrEmpty(imageUrl) ? null : imageUrl,
                 VideoUrl = string.IsNullOrEmpty(videoUrl) ? null : videoUrl,
                 AudioUrl = string.IsNullOrEmpty(videoUrl) || string.IsNullOrEmpty(audioUrl) ? null : audioUrl,
-            });
+            };
+            image?.ApplyTo(answer);
+            conversation.Messages.Add(answer);
             _store.Save(conversation);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or JsonException)
@@ -207,11 +212,28 @@ public sealed class ConversationRecorder
 
             if (body.TryGetProperty("messages", out JsonElement messages) && messages.ValueKind == JsonValueKind.Array)
             {
+                // What each picture was made from is written down when the picture is (see
+                // Complete), and the next image turn plans from it. The page copies it into
+                // its history too, but a copy that lacks it -- a page from before it existed,
+                // or one that rebuilt an entry -- must not erase it here, or the picture would
+                // read as one drawn from the words before it. Only a picture with no record
+                // at all is left to that reading.
+                var madeFrom = new Dictionary<string, ImageTurnRecord>(StringComparer.Ordinal);
+                foreach (StoredMessage known in conversation.Messages)
+                {
+                    if (known.ImageUrl is { Length: > 0 } url && ImageTurnRecord.MadeFrom(known) is { } record)
+                        madeFrom[url] = record;
+                }
                 var replacement = new List<StoredMessage>(messages.GetArrayLength());
                 foreach (JsonElement message in messages.EnumerateArray())
                 {
                     if (message.Deserialize<StoredMessage>(ConversationStore.Json) is { } stored)
+                    {
+                        if (stored.ImagePlan is null && stored.ImageUrl is { Length: > 0 } picture
+                            && madeFrom.TryGetValue(picture, out ImageTurnRecord? record))
+                            record.ApplyTo(stored);
                         replacement.Add(stored);
+                    }
                 }
                 conversation.Messages = replacement;
             }
