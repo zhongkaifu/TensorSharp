@@ -50,6 +50,9 @@ public class PrefixTreeEvaluateTests
         Assert.Equal(3, plan.PageCount);
         Assert.Equal(MaterializeMode.InjectA1Pages, plan.Mode);
         Assert.True((plan.Clamps & ClampReasons.RewindCap) != 0);
+        // Recorded against the source it cut, so a decline line never blames another on it.
+        Assert.True((plan.TruncationClamps & ClampReasons.RewindCap) != 0);
+        Assert.Equal(ClampReasons.None, (plan.EndStateClamps | plan.PageClamps | plan.PrimaryClamps) & ClampReasons.RewindCap);
 
         // Diverge at 21: A=20 beats pages (16).
         fork = Tk.Cat(Tk.Seq(1, 21), Tk.Seq(900, 10));
@@ -159,6 +162,7 @@ public class PrefixTreeEvaluateTests
         // Page 2 ends inside the span (24 ∈ (22, 26)): not usable; page 3 is absent.
         Assert.Equal(2 * B, plan.Length);
         Assert.True((plan.Clamps & ClampReasons.Media) != 0);
+        Assert.True((plan.PageClamps & ClampReasons.Media) != 0);
     }
 
     [Theory]
@@ -363,6 +367,8 @@ public class PrefixTreeEvaluateTests
         Assert.Equal(CandidateKind.Pages, plan.Kind);
         Assert.Equal(16, plan.Length);
         Assert.True((plan.Clamps & ClampReasons.CloneCost) != 0);
+        Assert.Equal(ClampReasons.CloneCost, plan.EndStateClamps & ClampReasons.CloneCost);
+        Assert.Equal(ClampReasons.None, plan.PageClamps & ClampReasons.CloneCost);
         Assert.Equal(SourceDecline.CloneCost, plan.EndStateDecline);
         // Donations are not clones: a 24-token own-scope donation is kept.
         Tk.Put(t, key, 40, s, p: 24);
@@ -388,6 +394,7 @@ public class PrefixTreeEvaluateTests
         MatchPlan plan = Tk.Plan(t, Tk.Req(Tk.Key(t, tokens, spans), s, spans: spans));
         Assert.Equal(CandidateKind.None, plan.Kind);
         Assert.True((plan.Clamps & ClampReasons.MmThreshold) != 0);
+        Assert.True((plan.EndStateClamps & ClampReasons.MmThreshold) != 0);
         Assert.Equal(SourceDecline.MmThreshold, plan.EndStateDecline);
         // At or above the threshold, reuse is kept.
         Tk.Put(t, key, 36, s, spans: spans);

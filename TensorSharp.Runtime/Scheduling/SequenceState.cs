@@ -122,6 +122,19 @@ namespace TensorSharp.Runtime.Scheduling
         /// sequence's shared prefix, so the prefill stops aligning to it.</summary>
         internal bool PrefixCheckpointTaken { get; set; }
 
+        /// <summary>
+        /// A recurrent (per-block-capture) model's newest restore point inside the generated
+        /// text: the index of the block that carries the running state at its end, or -1.
+        /// Decode fills a block every few hundred tokens and each one ends exactly at the
+        /// forward that filled it, so each would be a restore point - ~99 MiB of Mamba2 state
+        /// a block on Nemotron-H 8B. Only the newest is worth keeping (a resume lands on the
+        /// last restore point before the next turn diverges, and a continuation of the whole
+        /// reply takes the end state instead), so the executor drops the state from the one
+        /// before when the next arrives, and the prefix cache takes this block only once the
+        /// sequence stops (<see cref="ContinuousBatchScheduler"/>'s finish and preemption).
+        /// </summary>
+        internal int HeldDecodeRestoreBlock { get; set; } = -1;
+
         /// <summary>Monotonic submission sequence number. Used as FCFS tiebreaker
         /// when multiple sequences share the same priority.</summary>
         public long Sn { get; }
@@ -360,6 +373,7 @@ namespace TensorSharp.Runtime.Scheduling
             // And it reserves its K/V again on its first chunk back: the cache it ran in
             // may have been released with it.
             PrefillReservationTaken = false;
+            HeldDecodeRestoreBlock = -1;
         }
 
         /// <summary>Abandon a planned live-cache continuation (see
@@ -375,6 +389,7 @@ namespace TensorSharp.Runtime.Scheduling
             PrefixCacheReusedTokens = 0;
             LastLogits = null;
             PendingDeviceToken = null;
+            HeldDecodeRestoreBlock = -1;
             BlockTable.ResetTokensKeepingBlocks();
         }
 

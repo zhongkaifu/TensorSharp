@@ -10,6 +10,7 @@
 
 using System.Diagnostics.CodeAnalysis;
 using TensorAgent.Core.Localization;
+using TensorSharp.Runtime;
 
 namespace TensorAgent.Core.Catalog;
 
@@ -61,6 +62,9 @@ public enum CatalogFileRole
     /// others from the same folder by their exact gguf-split names, so every shard is required
     /// and stored under its published name.</summary>
     WeightsShard,
+    /// <summary>The second Wan A14B denoiser, loaded after the first expert's stage.
+    /// This is an independent GGUF, not a shard of the primary weights.</summary>
+    SecondaryWeights,
 }
 
 /// <summary>One downloadable artifact of a catalog entry.</summary>
@@ -84,7 +88,12 @@ public sealed record CatalogFile(
 
 /// <summary>Model families the catalog knows; used for grouping in the UI and for
 /// family-specific defaults (thinking, sampling).</summary>
-public enum CatalogFamily { Gemma4, Qwen35, Qwen36, Qwen38, QwenImage, GptOss, Bonsai, MuseGlimmer, MiniMaxH3, Qwen38FlashNext }
+public enum CatalogFamily
+{
+    // Append new families: the numeric values are part of persisted catalog data.
+    Gemma4, Qwen35, Qwen36, Qwen38, QwenImage, GptOss, Bonsai, MuseGlimmer, MiniMaxH3, Qwen38FlashNext,
+    DeepSeek4, DeepSeek41, Glm5, Nemotron, Mistral3, HunyuanDense, DiffusionGemma, Wan,
+}
 
 /// <summary>Dense or mixture-of-experts.</summary>
 public enum CatalogArchitectureKind { Dense, MixtureOfExperts, Diffusion }
@@ -134,8 +143,74 @@ public sealed record CatalogModel
     /// The tier allows for resident weights, KV cache, optional companions and compute
     /// buffers; accelerator placement and disk paging depend on the backend and device.</summary>
     public required int MinDeviceMemoryGB { get; init; }
-    /// <summary>Context length the app configures (MAX_CONTEXT); bounds the KV cache.</summary>
+    /// <summary>Context length the app configures (MAX_CONTEXT); bounds the KV cache. The
+    /// phone's window, measured against its jetsam budget; a desktop is given
+    /// <see cref="DesktopContextLength"/>.</summary>
     public required int ContextLength { get; init; }
+
+    /// <summary>
+    /// Bytes of K/V cache one token of context costs at F16 -- the widest precision the
+    /// Settings screen offers, so a user's choice can only make it cheaper -- counted from
+    /// the architecture: the layers that keep K/V for the whole context, times their KV
+    /// heads, head dim, 2 (K and V) and 2 bytes. A sliding-window layer whose ring has a
+    /// fixed size, and a recurrent (SSM, linear-attention) layer, does not grow with the
+    /// context and is not counted. Zero when the entry states none; it then keeps
+    /// <see cref="ContextLength"/> on a desktop too.
+    /// </summary>
+    public long KvBytesPerToken { get; init; }
+
+    /// <summary>The window a desktop gives a chat entry when it can afford it (see
+    /// <see cref="DesktopContextLength"/>).</summary>
+    public const int DesktopChatContextTarget = 32768;
+
+    /// <summary>
+    /// The least window a chat entry may have on a desktop: the prompt TensorAgent shares
+    /// across conversations (tool declarations, skills, instructions -- 7,219 tokens at the
+    /// warm-up on Qwen3.8 27B), the 2,048-token reply reserve an 8k-16k window keeps, and
+    /// as much again for the conversation itself.
+    /// </summary>
+    public const int MinimumDesktopChatContext = 16384;
+
+    /// <summary>What macOS (or Windows) and the rest of a desktop keep for themselves.</summary>
+    private const double DesktopSystemReserveBytes = 5e9;
+
+    /// <summary>
+    /// The context a desktop gives this entry: <see cref="DesktopChatContextTarget"/>, or
+    /// the largest multiple of 4,096 below it that the entry's tier can afford, and never
+    /// less than <see cref="ContextLength"/>.
+    ///
+    /// <para>
+    /// Why: an entry's <see cref="ContextLength"/> was written against a phone's jetsam
+    /// budget, and 8,192 there left a desktop with the same window. The shared prompt takes
+    /// ~7.2k of it, so every follow-up compacted the whole conversation away -- an image
+    /// chat forgot the image, and a thinking turn ran out at 712 tokens of thought
+    /// (Nemotron-H 8B, finishReason=thinking_budget).
+    /// </para>
+    /// <para>
+    /// Affordable: what the tier has beside the resident weights, the projector (dequantized
+    /// to about twice its file) and the system, halved -- the other half is the compute
+    /// buffers and the conversations the engine keeps -- must hold a whole window of K/V
+    /// charged twice, the host tensor and its Metal (or CUDA) mirror. A diffusion entry is
+    /// left alone: its prompt carries no shared agent prompt, and DiffusionGemma's prompt
+    /// K/V is per layer and full precision, which this count does not describe.
+    /// </para>
+    /// </summary>
+    public int DesktopContextLength
+    {
+        get
+        {
+            if (Kind == CatalogArchitectureKind.Diffusion || ContextLength <= 0
+                || ContextLength >= DesktopChatContextTarget || KvBytesPerToken <= 0)
+                return ContextLength;
+            double spare = MinDeviceMemoryGB * 1e9 - ResidentWeightsBytes
+                - 2.0 * (Projector?.Bytes ?? 0) - DesktopSystemReserveBytes;
+            double affordable = spare / 2 / (2.0 * KvBytesPerToken);
+            int window = affordable >= DesktopChatContextTarget
+                ? DesktopChatContextTarget
+                : Math.Max(0, (int)affordable / 4096 * 4096);
+            return Math.Max(ContextLength, window);
+        }
+    }
     /// <summary>KV cache dtype to request ("f16", "q8_0"); block-quantised caches halve KV memory
     /// where the family's fused paths accept them.</summary>
     public required string KvCacheDtype { get; init; }
@@ -185,5 +260,15 @@ public sealed record CatalogModel
     public CatalogFile Weights => Files.First(f => f.Role == CatalogFileRole.Weights);
     public CatalogFile? Projector => Files.FirstOrDefault(f => f.Role == CatalogFileRole.Projector);
     public bool IsImageGenerator => Family == CatalogFamily.QwenImage;
+
+    /// <summary>
+    /// For a Qwen-Image entry, which 2.1 checkpoint its weights are. The GGUFs carry no metadata
+    /// and Turbo has the base checkpoint's tensors, so the entry declares it and
+    /// <see cref="DiffusionCompanions"/> publishes it to the engine
+    /// (<see cref="QwenImageVariantFlag.EnvironmentVariable"/>): the sampling schedule follows the
+    /// entry, never the file name. Turbo also decides which LoRA plug-ins the entry takes
+    /// (<see cref="CatalogLora.AppliesTo"/>). Meaningless for other families.
+    /// </summary>
+    public QwenImageVariant ImageVariant { get; init; } = QwenImageVariant.Base;
     public bool IsVideoGenerator => Modalities.HasFlag(CatalogModalities.VideoOutput);
 }

@@ -27,6 +27,10 @@ weights. Larger images and multiple references increase that requirement.
 | Text encoder | `Qwen3VL-8B-Instruct-Q4_K_M.gguf` | [Qwen/Qwen3-VL-8B-Instruct-GGUF](https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct-GGUF) |
 | Vision encoder for editing | `mmproj-Qwen3VL-8B-Instruct-F16.gguf` | Same Qwen3-VL repository |
 
+Qwen-Image-2.1-Turbo, Qwen's 8-step distillation of the same model, uses these
+companions with its own transformer and configuration; see
+[Qwen-Image-2.1-Turbo](#qwen-image-21-turbo).
+
 ## Launch the CLI
 
 Run these commands from the TensorSharp repository root. The configuration
@@ -96,6 +100,18 @@ Reference images are conditioned at approximately 1 megapixel each, or the
 output area if smaller; increasing the output to 2K does not also quadruple each
 reference's VAE, vision-encoder and transformer workload.
 
+An edit sized from an area returns a picture larger than that area smaller, and
+one smaller than it larger. To edit a picture at its own size — and so edit an
+edit without it shrinking — pass `--keep-source-size` (`keepSourceSize: true` in
+an API request): the output is the first image's exact width and height. It is
+sampled at about that image's own area -- at least 1 megapixel, where references
+are conditioned, and at most the area the edit would otherwise use -- at about its
+aspect ratio (the 32-pixel grid rounds both), then resized to the source when that
+differs from it. It cannot be combined with an explicit width and
+height, and needs an input image. A masked edit (below) keeps the source size
+without it. The server Web UI and TensorAgent send it with every edit. The initial
+noise is drawn for the size the edit samples at ([seeds and edits](#seeds-and-edits)).
+
 The schedule now follows the
 [official scheduler configuration](https://huggingface.co/Qwen/Qwen-Image-2.1/blob/main/scheduler/scheduler_config.json):
 exponential dynamic shifting with the 256/0.5 and 8192/0.9 sequence-length/shift
@@ -118,6 +134,121 @@ passes; see [LoRA plug-ins](#lora-plug-ins).
 For a quick executable smoke test use 256×256 and one step. Such a run verifies
 loading and the end-to-end data path; it does not demonstrate image quality or
 performance at the default 2048×2048/40-step settings.
+
+### Seeds and edits
+
+`--diffusion-seed` (`seed` in the API; default 0) is the key of the Philox
+generator that draws the initial noise. Text-to-image noise depends on the seed
+and the output size alone, as in stable-diffusion.cpp with `--rng cuda`, so the
+same request gives the same picture.
+
+An edit's noise also depends on its reference images. TensorSharp hashes the
+pictures as they were passed (SHA-256 over their 8-bit RGB values in order, plus
+alpha when any pixel is not opaque) and draws the noise on a separate Philox
+stream chosen by that hash; the pipeline's `Qwen-Image-2.1: …` log line shows it
+as `(edit noise stream <id>)`. Without this, editing a picture at the seed and size it
+was drawn with starts from the very noise that became that picture, and
+Qwen-Image-2.1 can then retrace the picture instead of following the instruction.
+Every host's defaults lead there: the seed is 0 unless a request names one, and an
+edit samples at its source's size — an automatic size follows the source's aspect
+at the same area, and `keepSourceSize` (sent by the Web UI and TensorAgent) samples
+a 1024×1024 picture at 1024×1024. A fox drawn at seed 0 (1024×1024, CFG 1) and asked at
+seed 0 to "change the background to a sandy beach with the ocean behind the fox"
+came back over-sharpened and still in the snow, at 12 and 40 steps and with a
+speed LoRA; a fox drawn and edited at seed 5 did the same, while the same fox
+edited at another seed got the beach. That retrace is likely rather than certain:
+a teapot recolored at CFG 6 from its own seed's noise did change
+([historical comparison](#historical-validation-and-comparison)).
+
+- The same pictures, prompt, seed and settings give the same edit, and another
+  seed gives another composition, as before. Rewording the prompt keeps the noise.
+- Qwen-Image-2.1-Turbo draws its edits the same way: the stream depends on the
+  pictures, not on the checkpoint.
+- The noise is drawn for the size the edit samples at. With `keepSourceSize` that
+  is the sampling size [above](#launch-the-cli), not the source's own size when the
+  two differ; the result is resized to the source afterwards.
+- Editing a result again at the same seed starts from new noise, because its
+  picture changed.
+- A masked edit takes the stream of the whole source picture, not of the selection
+  or its crop, so every selection on one picture shares that picture's stream.
+- The stream follows the decoded pixels, and a picture kept in memory hashes like
+  its saved PNG. Every PNG TensorSharp writes, and any PNG without colour
+  information, decodes to the same bytes on every host. The TensorAgent apps convert
+  a PNG to sRGB when it embeds a colour profile, as macOS and iPhone screenshots do,
+  and when it has no alpha channel and its `gAMA` or `cHRM` chunk describes another
+  space; the CLI and server keep the stored values
+  (`eng/validation/apple-png-decode-check.py` lists which). Such a PNG, like a JPEG
+  or HEIC photo, which can decode a few levels differently in the apps, gets another
+  stream in the apps than on the CLI and server, so another composition. Compare
+  edits of such pictures across hosts with `TS_QWEN21_EDIT_NOISE=seed`.
+- `TS_QWEN21_EDIT_NOISE=seed` draws edits from the seed's text-to-image noise, as
+  stable-diffusion.cpp and diffusers do: use it for matched-noise comparisons with
+  those engines and to reproduce edits made before this change. Each such edit
+  prints `TS_QWEN21_EDIT_NOISE=seed: this edit starts from the seed's text-to-image
+  noise …`. `references` is the default; any other value fails the request.
+- Hashing is the only cost. On an M5 Pro with CoreCLR it took 2.6–3.9 ms for a
+  1-megapixel reference and 29–44 ms for a 12-megapixel photo in a Release build
+  (the high end when a translucent alpha plane is hashed too), and 16–26 ms and
+  177–298 ms in a Debug build, over two runs of
+  `eng/validation/QwenImage21EditNoiseCost` (its `-p:ModelsDir` measures a
+  TensorSharp.Models built elsewhere, such as the CLI's). Text-to-image hashes
+  nothing. The Apple apps run on Mono, where a per-pixel loop is slower still; that
+  was not measured.
+
+#### Measured effect
+
+Apple M5 Pro (48 GiB, macOS 27.0), `ggml_metal`, unchanged ggml
+`ffa4e8b80930029a35991f94e7c8a93cd67730ab`. The Q4_K_M checkpoint at 12 steps and
+Turbo AD-Q4_K at its 8, both at 1024×1024 and CFG 1, one fresh CLI process per
+picture. "Before" is the same build without reference-keyed edit noise.
+
+- Text-to-image did not change: the teapot prompt below at seeds 0 and 1, and "A
+  red fox sitting in deep snow in a winter forest, photograph." drawn by Turbo at
+  seed 0, gave PNGs with the same SHA-256 before and after.
+- The retrace is gone. The fox drawn at seed 0 and edited at seed 0 to "change the
+  background to a sandy beach with the ocean behind the fox" came back before as an
+  over-sharpened copy, still in the snowy forest; now the fox sits on a sandy beach
+  with the sea behind it. With `--keep-source-size` in place of `--width 1024
+  --height 1024` the edit samples at 1024×1024 as well and gave the same PNG, and so
+  did the server's `/api/image-edit` given the picture as a multipart upload with
+  `keepSourceSize` and no `seed` or size, as the Web UI sends it; both printed the
+  same noise stream. With `TS_QWEN21_EDIT_NOISE=seed` the edit's PNG had the same
+  SHA-256 as before, and so did a masked edit (the seed-0 recolor below).
+- Turbo behaves the same. Its seed-0 fox, edited at seed 0 with the beach
+  instruction and `--keep-source-size`, came back before as an over-sharpened copy,
+  the forest still behind the fox and the snow turned to cracked earth; now the fox
+  sits on a beach with waves behind it. Seed mode again gave the PNG from before.
+- A chained edit follows its instruction: each beach picture, edited again at seed 0
+  to "put a red knitted scarf around the fox's neck", got the scarf and kept the
+  beach, on both checkpoints.
+- Local edits keep more of the scene. "A red ceramic teapot on a wooden table, soft
+  daylight, product photograph." was drawn at seeds 0, 1 and 2, and each picture was
+  recolored at its own seed with "Change the red teapot to cobalt blue. Keep its
+  shape, lighting, the wooden table and background unchanged.", once without and
+  once with a selection around the teapot. Both noises turned the teapot blue (the
+  same share of blue pixels within 0.003). From the source's own noise the teapot
+  came out a gritty navy and the table and background over-sharpened; from the
+  reference-keyed noise they stayed close to the source. PSNR against the source,
+  leaving out the teapot and 16 pixels around it
+  (`eng/validation/qwen-image21-edit-fidelity.py`):
+
+  | Recolor | Seed 0 | Seed 1 | Seed 2 |
+  |---|---:|---:|---:|
+  | Whole picture, reference-keyed noise | 25.4 dB | 29.5 dB | 30.9 dB |
+  | Whole picture, `TS_QWEN21_EDIT_NOISE=seed` | 20.2 dB | 17.0 dB | 16.9 dB |
+  | Inside the selection, reference-keyed noise | 29.8 dB | 26.4 dB | 29.0 dB |
+  | Inside the selection, `TS_QWEN21_EDIT_NOISE=seed` | 21.8 dB | 19.3 dB | 19.4 dB |
+
+  Pixels outside the selection were exact in every masked run.
+- Wall time was the same within run-to-run noise: 135–139 s per edit in both modes
+  and before, 98 s per Turbo edit.
+
+Images, hashes and the analysis are in ignored `artifacts/editnoise4/` and
+`artifacts/editnoise5/` (local validation evidence, not committed). Not measured:
+CUDA, Vulkan and `--tp`, the `cpu` backend, the TensorAgent apps (they pass the same
+pictures to the same pipeline, but run on Mono; their PNG decoding was checked by a
+Swift copy of it on macOS, not on iOS), masked and multi-reference edits on Turbo,
+and JPEG or HEIC sources.
 
 ## Launch TensorSharp.Server.Host
 
@@ -170,16 +301,23 @@ curl --fail-with-body http://127.0.0.1:5000/api/image-edit \
 Repeat the `image` part for multiple references. Alternatively upload files to
 `/api/upload` and send JSON containing `imagePaths` (or legacy `imagePath`) to
 `/api/image-edit`. Both image endpoints accept `negativePrompt`, `targetArea`,
-`width`, `height`, `steps`, `cfg` and `seed`. `targetArea` controls automatic
-geometry; explicit dimensions take precedence. Omitting `width`, `height`,
+`width`, `height`, `steps`, `cfg` and `seed` (default 0; an edit's noise also
+depends on its references, see [Seeds and edits](#seeds-and-edits)). `targetArea`
+controls automatic geometry; explicit dimensions take precedence. Omitting `width`, `height`,
 `targetArea`, `steps` and `cfg` selects the model defaults above. `targetArea: 1048576`
 selects approximately 1K output while retaining automatic aspect-ratio selection.
+The edit endpoints also accept `keepSourceSize` (JSON `true`, or `-F 'keepSourceSize=true'`
+in multipart): the result keeps the first image's exact size, sampled within
+`targetArea` (or the default area) as described above. Sent with `width`/`height`,
+or to `/api/image-generate`, it is rejected with a 400.
 
 Starting the server with `--width` and `--height` changes that default size. The
 host publishes them as `TS_QWEN_IMAGE_WIDTH` / `TS_QWEN_IMAGE_HEIGHT`, and every
 image request that sets neither `width`/`height` nor an explicit `targetArea` then
 uses that size, including Web UI requests, which send no size; an edit then no
-longer follows the first reference's aspect ratio. A request that sets its own
+longer follows the first reference's aspect ratio, except one with `keepSourceSize`
+(every Web UI edit), which spends only that size's area, at the source's aspect
+ratio, and keeps the source's size. A request that sets its own
 `targetArea` keeps its own geometry. The default needs both flags. A value that is
 not a multiple of 32 is rounded down to one (never below 32), with a one-time
 `[qwen-image] WARNING: … render at WxH instead. Reported once.`; with only one of
@@ -197,6 +335,212 @@ preview `image` data URL. The terminal frame contains `done: true` and the final
 run this diffusion model. Existing `/api/image-edit` requests still require
 at least one reference; generation has its own endpoint.
 Previews decode the estimated clean latent from the current flow prediction.
+
+## Qwen-Image-2.1-Turbo
+
+[Qwen-Image-2.1-Turbo](https://huggingface.co/Qwen/Qwen-Image-2.1-Turbo) is Qwen's
+accelerated checkpoint of the same 7B transformer, distilled to **8 Euler steps at
+CFG 1** on one fixed schedule. Its VAE, Qwen3-VL-8B text encoder and vision projector
+are the 2.1 files above, byte for byte. TensorSharp runs the
+[AtomicChat GGUFs](https://huggingface.co/AtomicChat/Qwen-Image-2.1-Turbo-GGUF)
+(revision `bb25d06`), which carry no metadata:
+
+| File | Size | LPIPS against BF16 (the card's) | Use |
+|---|---:|---:|---|
+| `Qwen-Image-2.1-Turbo-AD-Q4_K.gguf` | 4,201,694,944 bytes | 0.147 | The fast default of [`config/qwen-image-2.1-turbo.json`](../../config/qwen-image-2.1-turbo.json) |
+| `Qwen-Image-2.1-Turbo-Q8_0.gguf` | 7,591,554,784 bytes | 0.037 | The transformer closest to full precision |
+
+The card's other files (AD-Q6_K, AD-Q5_K, AD-Q3_K, AD-Q2_K, BF16) have the same tensor
+names; only the two above were run here. The card also measures the text encoder: a
+Q4_K_M encoder moves the pictures about as far from a BF16 encoder (LPIPS about 0.17) as
+AD-Q4_K moves them from the BF16 transformer, and a Q8_0 encoder by 0.037. The
+configuration keeps the Q4_K_M encoder of the 2.1 layout above, under its published file
+name, so one folder holding both models downloads it once.
+
+```bash
+dotnet run --project TensorSharp.Cli -c Release --no-build -- \
+  --config config/qwen-image-2.1-turbo.json \
+  --prompt 'a neon sign that reads "OPEN LATE", rainy night' \
+  --width 1024 --height 1024 --diffusion-seed 42 --output turbo.png
+dotnet run --project TensorSharp.Server.Host -c Release --no-build -- \
+  --config config/qwen-image-2.1-turbo.json --host 127.0.0.1 --port 5000
+```
+
+### Declaring the checkpoint
+
+Turbo's tensors have the base checkpoint's names and shapes, and the GGUFs have no
+metadata, so nothing in the file tells the two apart. The host declares it:
+
+- `--qwen-image-variant turbo` (or `base`) on the CLI and the server, or
+  `"qwen-image-variant": "turbo"` in a config file; the Turbo config sets it. The hosts
+  hand it to the model as `TS_QWEN_IMAGE_VARIANT`, which an in-process caller can set
+  before constructing `QwenImageModel` (its `Variant` property reports the result). An
+  unknown flag value is a configuration error at startup (exit code 1), and an unknown
+  `TS_QWEN_IMAGE_VARIANT` refuses the load (exit code 2).
+- TensorAgent's Turbo catalog entries declare it themselves.
+
+The load prints `variant = turbo (declared)`. Without a declaration it reads the file
+name: a name containing the word `turbo` is assumed to be Turbo, the way Wan's
+step-distilled checkpoints are recognised, and the load prints
+`variant = turbo, ASSUMED from the word "turbo" in the file name: ...`. That is a guess.
+Merges of the Viggle step-distillation LoRA into the base checkpoint are published under
+the same names (Abiray/Qwen-Image-2.1-viggle-turbo-v0.2.1-6step-GGUF ships
+`qwen_image_2.1_turbo_Q4_K_M.gguf`, exactly as Abiray/Qwen-Image-2.1-Turbo-GGUF does), and
+such a merge needs Viggle's schedule, not Turbo's; declare `base` for it. Any other name
+is the base checkpoint. The server applies its declaration to every Qwen-Image model it
+loads, like the companion paths. The declaration means nothing to another model: the CLI
+refuses `--qwen-image-variant` with one (exit code 1), and the server loads it without the
+declaration and logs a warning, as it does for `--lora`.
+
+### Sampling
+
+Turbo samples `sample_sigmas` from its
+[`model_index.json`](https://huggingface.co/Qwen/Qwen-Image-2.1-Turbo/blob/main/model_index.json),
+followed by a final 0:
+
+```text
+[1.0, 0.978453, 0.95418, 0.926626, 0.89508, 0.845148, 0.704534, 0.414568, 0]
+```
+
+Its scheduler has shift 1.0 and no dynamic shifting, so the values are used as they are
+at every resolution: that is how diffusers loads them, and what the AtomicChat card passes
+to stable-diffusion.cpp as `--sigmas`. The run logs it before denoising:
+
+```text
+Qwen-Image-2.1 Turbo: 1024x1024, 8 steps, CFG 1, seed 42, 0 reference(s)
+  [qwen21] Turbo schedule (model_index.json sample_sigmas): 8 steps on fixed sigmas [1, 0.97845, 0.95418, 0.92663, 0.89508, 0.84515, 0.70453, 0.41457, 0]
+```
+
+- The default is 8 steps at CFG 1. An explicit `--diffusion-steps 8` (`steps: 8` in a
+  request) is accepted, and any other count is refused with a message that names the
+  supported one. Qwen's card says that setting the step count alone does not override the
+  saved schedule and that other schedules have not been evaluated, so TensorSharp does not
+  resample the eight values into another count.
+- An explicit `--cfg` above 1 (`cfg` in a request) still adds the negative pass, as on the
+  base checkpoint; Turbo was distilled for CFG 1.
+- The timestep reaches the transformer in F32, as for the base checkpoint and in
+  stable-diffusion.cpp.
+- Editing, `--keep-source-size` and the prefix KV cache work as on the base checkpoint
+  (validated below, and by TensorAgent's planner test on Turbo); masks and several
+  references take the same code path but were not run on Turbo. An edit's noise
+  follows its pictures here too ([seeds and edits](#seeds-and-edits)).
+
+### LoRA plug-ins on Turbo
+
+Turbo is step-distilled already. A plug-in that brings a sampling recipe (Viggle Turbo,
+Pruna 8-step and 5-step, Fun-Acc's PDD bundle, or any config with `"sampling"`) is refused
+before its tensors are read: `LoRA plug-in refused: LoRA '...' carries a sampling recipe
+(...): it is a step-distillation plug-in, and this transformer is Qwen-Image-2.1-Turbo
+(declared), which is step-distilled already and samples on its own 8-step schedule.`
+The CLI and the server refuse the load (exit code 2), and the message says how Turbo was
+identified. A plug-in without a recipe loads. A bare LoRA `.safetensors`
+passed without its plug-in config carries no recipe either, so the engine cannot tell a
+speed adapter from a style one; pass the `config/lora/` plug-in.
+
+Validated on Turbo with real pictures: Film Stills and Grainscape through their
+`config/lora/` plug-ins at their strength 0.7, each against the same prompt and seed
+without it, at seeds 42 and 7 (1024×1024, AD-Q4_K; `--suite style` of
+[`qwen-image21-turbo.py`](../../eng/validation/qwen-image21-turbo.py) reproduces them, and
+its seed-42 pictures were byte-identical to an earlier run's). Both plug-ins apply their
+look, and both redraw part of the scene, Film Stills more than Grainscape:
+
+- Film Stills turned a sharp night scene at a tram stop into a softer, grainier, warmer
+  film still. At seed 42 it also dropped the tram and the bench, and the woman sits on an
+  indistinct dark shape; at seed 7 she stays on the shelter's bench, but the street behind
+  her is redrawn, with a tree and shopfronts where the tracks were.
+- Grainscape turned a clear mountain lake at dawn into a hazy, muted film look. The lake,
+  the boat and the mountains stay in about the same places; the rock faces and the skyline
+  are redrawn, and at seed 42 the boat gained a pair of oars.
+- Redrawing the scene is the plug-in's, not Turbo's: on the base checkpoint at 40 steps
+  (Q4_K_M, seed 42), Film Stills replaced the same tram-stop scene entirely, with no tram,
+  a lower viewpoint and a tree-lined street.
+- Each adds about 5.4% per step (8.28–8.31 s against 7.86–7.88 s).
+
+TensorAgent offers these two for its Turbo entries and no other plug-in. The
+editing plug-ins and Quality Fix have not been tried on Turbo, and Object Remover works
+only at the base model's 40 steps.
+
+### Parity with stable-diffusion.cpp
+
+TensorSharp against stable-diffusion.cpp `f89d9b1` (its master on 2026-10-09, which
+includes the `c150a6b` custom-sigma fix; built with Metal and its own ggml submodule
+`d25b121`), on 2026-10-09. TensorSharp used unchanged upstream ggml `ffa4e8b`. Apple M5
+Pro, 48 GB, `ggml_metal`. Both engines got the same transformer GGUF, the Q4_K_M text
+encoder, the BF16 VAE and the F16 mmproj; the same prompt, seed 42 and Philox noise
+(`--rng cuda` on sd.cpp); Euler at CFG 1; and the eight published sigmas (sd.cpp through
+`--sigmas`). The edit's reference was the Turbo card's yacht sketch, composited over white
+and resized beforehand to its 1728×608 conditioning size, so neither engine resized it.
+PSNR compares the two engines' PNGs, and every pair was also compared by eye. Seconds per
+step is the steady state (step 2 onwards). The edit ran before TensorSharp keyed edit
+noise to the references, so both engines started it from the seed's noise; repeating it
+takes `TS_QWEN21_EDIT_NOISE=seed`, which the bench sets when both engines run.
+
+| Prompt | Transformer | Size | PSNR | s/step TensorSharp / sd.cpp | Wall time TensorSharp / sd.cpp |
+|---|---|---|---:|---:|---:|
+| The card's `a neon sign that reads "OPEN LATE", rainy night` | AD-Q4_K | 1024×1024 | 57.4 dB | 7.79 / 8.76 | 70.3 / 92.8 s |
+| A tea-house sign with the brush-written name 清风茶社 (prompt in Chinese) | AD-Q4_K | 1024×1024 | 44.7 dB | 7.78 / 8.77 | 69.4 / 79.9 s |
+| A close-up portrait photograph of an elderly fisherman | AD-Q4_K | 1024×1024 | 59.6 dB | 7.79 / 8.76 | 69.5 / 79.4 s |
+| Edit: the card's yacht sketch into a photograph (its full prompt) | AD-Q4_K | 1728×608 | 39.3 dB | 7.97 / 11.16 | 87.2 / 114.3 s |
+| The neon sign | Q8_0 | 1024×1024 | 59.5 dB | 7.62 / 8.63 | 69.0 / 79.1 s |
+
+- Each pair is the same picture. The neon sign reads OPEN in red and LATE in blue; the
+  tea-house sign has the four characters, both engines writing 风 in its traditional form
+  風; the portrait matches down to the skin texture; and the edited yacht keeps the
+  sketch's mast, wheelhouse, four midships windows, two lifeboats, yellow funnel and the
+  rows of five and nine portholes.
+- The remaining differences are rounding: the two engines order their sums differently.
+  The edit differs most, because the reference also goes through both engines' vision and
+  VAE encoders. sd.cpp's first run (the neon sign) includes reading its files from a cold
+  page cache.
+- The 8-bit and 4-bit transformers draw the same scene with different details: the two
+  TensorSharp neon signs are 19.1 dB apart, in line with the card's 20.8 dB between
+  AD-Q4_K and BF16.
+- TensorSharp's output is deterministic on Metal: repeated runs gave byte-identical PNGs.
+
+The card's sample grid uses `--rng cpu` and a BF16 text encoder, so it cannot be matched
+pixel for pixel here; the comparison above uses sd.cpp itself as the reference.
+
+### Performance
+
+Apple M5 Pro, 48 GB, `ggml_metal`, 1024×1024, the neon-sign prompt, seed 42, the Q4_K_M
+text encoder. Each configuration ran in two fresh processes, in A-B-C-D-D-C-B-A order with
+20 s between runs, and the table shows the medians (the two runs of each were within 0.4%).
+Seconds per step is the steady state; the first step also stores the prefix KV cache and
+takes about 0.2 s longer. The VAE decode took 5.1–5.3 s and the text encoder 0.3 s in every
+configuration.
+
+| Configuration | Steps | s/step | Denoise | Wall time | Against 40 steps |
+|---|---:|---:|---:|---:|---:|
+| Qwen-Image-2.1 Q4_K_M | 40 | 7.83 | 313.3 s | 319.5 s | 1.0× |
+| Qwen-Image-2.1 Q4_K_M + Viggle Turbo r128 | 6 | 8.30 | 50.0 s | 56.3 s | 5.7× |
+| Turbo AD-Q4_K | 8 | 7.86 | 63.1 s | 69.3 s | 4.6× |
+| Turbo Q8_0 | 8 | 7.62 | 61.2 s | 67.6 s | 4.7× |
+
+- A Turbo step costs what a base step costs: the transformer is the same, and AD-Q4_K's
+  mix (Q5_K attention in the first and last four blocks and Q4_K elsewhere, Q8_0 modulation,
+  BF16 time embedding, output head and text input) runs within 0.4% of Q4_K_M's (Q6_K
+  attention values). The BF16 tensors work on two rows (the time embedding) or the prompt's
+  tokens (`txt_in`), not the 4,096 image tokens, so their type does not show.
+- Q8_0 is 3% faster per step than AD-Q4_K: at 4,096 image tokens the products are
+  compute-bound, and a Q8_0 block is cheaper to unpack in the matrix kernels than a K-quant
+  block. The higher-quality file is also the faster one; it costs 3.4 GB more weights.
+- Viggle Turbo's 6 steps finish first: each of its steps costs 6% more (the unmerged
+  adapter), but there are two fewer. Turbo is Qwen's own distillation and takes no adapter.
+- The peak memory footprint of an edit at 1248×832 (`/usr/bin/time -l`) was 14.35–14.37 GB
+  with every one of the three transformers: the transformer is mapped from its file, and the
+  peak comes from the stages around it. TensorAgent's tiers add the weights to it.
+
+Reproduce these with [`eng/validation/qwen-image21-turbo.py`](../../eng/validation/qwen-image21-turbo.py)
+(`--suite parity,perf,footprint`), which drives
+[`qwen-image21-bench.py`](../../eng/validation/qwen-image21-bench.py) `--variant turbo`.
+
+### Turbo limitations
+
+- Only 8 steps run on Turbo. The card's measurements, and these, are at about 1 megapixel;
+  Qwen recommends about 2 megapixels (the 2048×2048 default).
+- The variant is a declaration. An undeclared file named `...turbo...` is assumed to be
+  Turbo, which is wrong for a step-distillation merge published under the same name.
+- Turbo's other quantizations were not run here.
 
 ## Precise local editing with a mask
 
@@ -489,7 +833,9 @@ steps, CFG 1): `--diffusion-steps` / `--cfg` on the CLI, and a request's `steps`
 `cfg` on the server (`0` or omitted selects the recipe). A step count the recipe
 has no schedule for is refused, and the error lists the supported counts; a PDD
 bundle, which has one output head per trained step, runs only its trained count.
-Two plug-ins that both carry a recipe cannot be stacked. Style and editing
+Two plug-ins that both carry a recipe cannot be stacked, and on
+[Qwen-Image-2.1-Turbo](#lora-plug-ins-on-turbo), whose checkpoint has a schedule of its
+own, a plug-in that carries one is refused. Style and editing
 plug-ins carry no recipe and keep the checkpoint's own schedule. The run logs the
 resolved recipe and its sigmas before denoising.
 
@@ -661,7 +1007,7 @@ included (see [TensorAgent's README](../../TensorAgent/README.md)).
   other model, and the server logs a warning and loads the other model without
   them.
 - Only one plug-in per run can carry a sampling recipe, and a recipe with sigmas
-  runs only the step counts it defines.
+  runs only the step counts it defines. Qwen-Image-2.1-Turbo takes none.
 - The Qwen-Image-2.1-Fix author's workflow also uses APG, FreSca and the `seeds_2`
   sampler at CFG 3, which TensorSharp does not implement; the DoRA itself is
   applied exactly.
@@ -896,7 +1242,10 @@ matching F32 sigma vectors and Philox noise, in serial fresh processes.
 | 512×512 color-change edit, 25 steps | 101.664 s | 114.186 s |
 
 TensorSharp used 11.9% and 11.0% less wall time respectively in these single-run
-comparisons. The generation images were visually close (48.38 dB RGB PSNR after
+comparisons. The edit ran before TensorSharp keyed edit noise to the reference
+images; matching stable-diffusion.cpp's edit noise now takes
+`TS_QWEN21_EDIT_NOISE=seed` (the benchmark's `--edit-noise seed`, its default when
+both engines run). The generation images were visually close (48.38 dB RGB PSNR after
 white compositing); both editing outputs changed the teapot to blue. This does
 not establish broad quality or performance superiority. TensorSharp's 1K VAE
 decode remained slower (13.319 s versus 7.270 s), and peak process RSS was higher
@@ -1114,7 +1463,11 @@ the 0–255 scale.
 The editing run used the same reference file, `sd-t2i-512.png`, in both engines
 and this instruction: “Change the red teapot to cobalt blue. Keep its shape,
 lighting, the wooden table and background unchanged.” Both outputs showed a
-blue teapot with the scene preserved. Raw RGBA comparison gave MAE 0.620672
+blue teapot with the scene preserved. Both started from the noise that had drawn
+`sd-t2i-512.png` (seed 42, 512×512), and the CFG 6 recolor still followed the
+instruction; TensorSharp now draws an edit's noise from a stream keyed to its
+references, so this comparison needs `TS_QWEN21_EDIT_NOISE=seed` to be repeated.
+Raw RGBA comparison gave MAE 0.620672
 and RMSE 1.12041; white-composited RGB gave MAE 0.825444 and RMSE 1.292416,
 on the 0–255 scale. TensorSharp spent 1.664 s encoding the reference VAE,
 6.599 s encoding text/vision, 162.564 s denoising and 4.817 s decoding.
@@ -1159,7 +1512,10 @@ revisions; model hashes; output dimensions; reference images; seed; sampler;
 step count; CFG; cache settings; and whether weight loading and first-run shader
 compilation are included. Compare both cold end-to-end latency and repeated
 inference with the same loaded process. Identical seeds across engines do not
-guarantee identical initial noise; compare images as well as timing.
+guarantee identical initial noise; compare images as well as timing. TensorSharp's
+edits draw their noise from a stream keyed to the reference images
+([Seeds and edits](#seeds-and-edits)), so an edit matches stable-diffusion.cpp's
+noise only with `TS_QWEN21_EDIT_NOISE=seed`.
 
 ## Reproduce comparisons with the current implementation
 
@@ -1178,7 +1534,11 @@ python3 eng/validation/qwen-image21-bench.py \
   --prompt 'A red ceramic teapot on a wooden table, soft daylight, product photograph.'
 ```
 
-Add `--mode edit --image reference.png` and an editing prompt for an edit,
+Add `--mode edit --image reference.png` and an editing prompt for an edit
+(`--edit-noise seed`, the default when both engines run, gives TensorSharp
+stable-diffusion.cpp's seed-only edit noise; `--edit-noise references`, the
+default with `--engine tensorsharp`, measures TensorSharp's own; the report
+records which),
 `--engine tensorsharp` to run only TensorSharp without a reference binary,
 `--repeat 3` for repeated fresh-process measurements, or `--dry-run` to
 inspect commands. The default reference binary is

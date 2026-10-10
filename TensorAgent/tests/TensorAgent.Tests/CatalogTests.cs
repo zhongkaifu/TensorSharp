@@ -20,8 +20,35 @@ public sealed class CatalogTests
             "qwen3.8-flash-next-q2kxl",
             "qwen3.8-flash-next-iq1m",
             "qwen-image-2.1-q4km",
+            "qwen-image-2.1-turbo-adq4k",
+            "qwen-image-2.1-turbo-q8",
             "minimax-h3-fl2va-q4k",
             "minimax-h3-ref2va-q4k",
+            "gemma-4-26b-a4b-qat-q4kxl",
+            "gemma-4-31b-q4-0",
+            "qwen3.5-35b-a3b-q4km",
+            "qwen3.6-35b-a3b-q4km",
+            "qwen3.6-27b-q4km",
+            "gpt-oss-20b-mxfp4",
+            "nemotron-h-8b-q4km",
+            "nemotron-h-47b-q4km",
+            "nemotron-3-nano-omni-30b-a3b-q4kxl",
+            "nemotron-3.5-lightning-30b-a3b-mxfp4",
+            "mistral-small-3.1-24b-q4km",
+            "hy-mt2-1.8b-q4km",
+            "deepseek-v4-flash-0731-q2kxl",
+            "deepseek-v4.1-flash-engramq5-q2k",
+            "glm-5.2-iq2xxs",
+            "glm-5.3-q2kxl",
+            "glm-5.3-flash-q2kxl",
+            "diffusiongemma-26b-a4b-q4km",
+            "wan2.1-t2v-1.3b-q8",
+            "wan2.1-t2v-14b-q4km",
+            "wan2.2-ti2v-5b-q8",
+            "wan2.2-ti2v-5b-turbo-q8",
+            "wan2.2-t2v-a14b-q4km",
+            "wan2.2-i2v-a14b-q4km",
+            "wan2.2-i2v-a14b-lightx2v-q4km",
         };
 
         Assert.Equal(expected, ModelCatalog.BuiltIn.Select(m => m.Id).ToArray());
@@ -48,7 +75,7 @@ public sealed class CatalogTests
                 else
                 {
                     Assert.StartsWith("https://huggingface.co/", f.Url);
-                    Assert.EndsWith("/resolve/main/" + f.Url.Split("/resolve/main/")[1], f.Url);
+                    Assert.Matches(@"/resolve/(main|[0-9a-f]{40})/[^\s]+$", f.Url);
                 }
                 // A size read from a pointer file (~130 bytes) instead of the object is the
                 // mistake this catches. Loose tokenizer files are genuinely small - MiniMax-H3's
@@ -61,7 +88,7 @@ public sealed class CatalogTests
             // Keep the recognized tiers narrow so a typo cannot silently expose an
             // entry on an unintended device class. 24, 32 and 48 are the desktop's: no
             // phone or tablet reaches them, so those entries stay off every one.
-            Assert.Contains(m.MinDeviceMemoryGB, new[] { 6, 8, 12, 16, 24, 32, 48 });
+            Assert.Contains(m.MinDeviceMemoryGB, new[] { 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024 });
             // A later shard of a split GGUF is required and carries shard 1's gguf-split
             // name with its own number: the engine finds it beside shard 1 by that name.
             var shards = m.Files.Where(f => f.Role == CatalogFileRole.WeightsShard).ToList();
@@ -217,6 +244,8 @@ public sealed class CatalogTests
         "qwen3.8-flash-next-q2kxl",
         "qwen3.8-flash-next-iq1m",
         "qwen-image-2.1-q4km",
+        "qwen-image-2.1-turbo-adq4k",
+        "qwen-image-2.1-turbo-q8",
         "minimax-h3-fl2va-q4k",
         "minimax-h3-ref2va-q4k",
     };
@@ -227,23 +256,25 @@ public sealed class CatalogTests
         Assert.Empty(ModelCatalog.ForDevice(8));
         // Bonsai 2 27B is the one 16 GB entry: its repacked weights do not fit a 12 GB phone.
         Assert.Equal(
-            ModelCatalog.BuiltIn.Where(m => m.Id != "bonsai-2-27b-ptq1-0" && !DesktopOnly.Contains(m.Id)).Select(m => m.Id),
+            ModelCatalog.BuiltIn.Where(m => m.MinDeviceMemoryGB <= 12).Select(m => m.Id),
             ModelCatalog.ForDevice(12).Select(m => m.Id));
         Assert.Equal(
-            ModelCatalog.BuiltIn.Where(m => !DesktopOnly.Contains(m.Id)).Select(m => m.Id),
+            ModelCatalog.BuiltIn.Where(m => m.MinDeviceMemoryGB <= 16).Select(m => m.Id),
             ModelCatalog.ForDevice(16).Select(m => m.Id));
     }
 
     /// <summary>
     /// Qwen3.8 27B, Muse-Glimmer 30B and Qwen-Image 2.1 are offered only where a Mac's
     /// memory exists (no iPhone or iPad reaches 24 GB): the two chat models from 32 GB,
-    /// the image model from 24. See <see cref="EachDesktopEntryFitsItsTierBesideMacOS"/>
+    /// the image model and its 4-bit Turbo from 24, the 8-bit Turbo from 32. See <see cref="EachDesktopEntryFitsItsTierBesideMacOS"/>
     /// for the measurements behind each number.
     /// </summary>
     [Theory]
     [InlineData("qwen3.8-27b-q4kxl", 32)]
     [InlineData("muse-glimmer-30b-q4kxl", 32)]
     [InlineData("qwen-image-2.1-q4km", 24)]
+    [InlineData("qwen-image-2.1-turbo-adq4k", 24)]
+    [InlineData("qwen-image-2.1-turbo-q8", 32)]
     [InlineData("minimax-h3-fl2va-q4k", 32)]
     [InlineData("minimax-h3-ref2va-q4k", 32)]
     [InlineData("qwen3.8-flash-next-q2kxl", 48)]
@@ -301,7 +332,9 @@ public sealed class CatalogTests
     [Fact]
     public void ADesktopIsOfferedEverythingASmallerDeviceIs()
     {
-        Assert.Equal(ModelCatalog.BuiltIn.Select(m => m.Id), ModelCatalog.ForDevice(48).Select(m => m.Id));
+        foreach (int tier in new[] { 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024 })
+            Assert.All(ModelCatalog.ForDevice(tier), model => Assert.Contains(model, ModelCatalog.ForDevice(1024)));
+        Assert.Equal(ModelCatalog.BuiltIn.Select(m => m.Id), ModelCatalog.ForDevice(1024).Select(m => m.Id));
     }
 
     /// <summary>
@@ -318,6 +351,11 @@ public sealed class CatalogTests
         ["muse-glimmer-30b-q4kxl"] = (15.88, 10.9, "chat-e2e.py's seven scenarios with the projector, LeanCaches"),
         // The DiT stays mapped through the denoise; the text encoder is released first.
         ["qwen-image-2.1-q4km"] = (4.19, 14.3, "an edit at 1248x832, 40 steps (the CLI's peak footprint)"),
+        // Measured 2026-10-09 the same way (/usr/bin/time -l, peak memory footprint), 8 steps: the
+        // peak does not depend on the transformer's quantization (base 14.37, AD-Q4_K 14.35,
+        // Q8_0 14.36 GB), so the 8-bit file's 3.4 GB of extra weights are what move it up a tier.
+        ["qwen-image-2.1-turbo-adq4k"] = (4.20, 14.4, "an edit at 1248x832, 8 steps (the CLI's peak footprint)"),
+        ["qwen-image-2.1-turbo-q8"] = (7.59, 14.4, "an edit at 1248x832, 8 steps (the CLI's peak footprint)"),
         // The largest stage is the 18.2 GB text encoder: the denoiser and the VAEs kept from the
         // previous clip are taken off the device before it runs (MiniMaxH3Pipeline), and wired
         // memory peaked at 20 GB with the decode (denoiser + video VAE) on top of the system's.
@@ -381,6 +419,50 @@ public sealed class CatalogTests
         }
     }
 
+    /// <summary>
+    /// Every chat entry has room on a desktop for TensorAgent's shared prompt (~7.2k tokens
+    /// of tools, skills and instructions), a reply and a conversation. Eighteen entries said
+    /// 8,192 -- a phone's budget -- and on a Mac that left about a thousand tokens beside the
+    /// shared prompt, so every follow-up compacted the conversation away. The window is the
+    /// documented rule (<see cref="CatalogModel.DesktopContextLength"/>), checked here
+    /// against each entry's stated K/V cost; the phone's <see cref="CatalogModel.ContextLength"/>
+    /// and the jetsam tests above are unchanged.
+    /// </summary>
+    [Fact]
+    public void EveryChatEntryHasRoomForTheSharedPromptAndAConversationOnTheDesktop()
+    {
+        foreach (CatalogModel m in ModelCatalog.BuiltIn.Where(m => m.Kind != CatalogArchitectureKind.Diffusion))
+        {
+            Assert.True(m.DesktopContextLength >= CatalogModel.MinimumDesktopChatContext,
+                $"{m.Id} gets a {m.DesktopContextLength}-token window on a desktop; the shared prompt, a reply "
+                + $"and a conversation need {CatalogModel.MinimumDesktopChatContext}");
+            Assert.True(m.DesktopContextLength >= m.ContextLength, $"{m.Id}: a desktop never gets less than a phone");
+            if (m.ContextLength >= CatalogModel.DesktopChatContextTarget)
+                continue;
+
+            Assert.True(m.KvBytesPerToken > 0, $"{m.Id} must state its K/V bytes per token to be given a desktop window");
+            Assert.True(m.DesktopContextLength <= CatalogModel.DesktopChatContextTarget);
+            Assert.Equal(0, m.DesktopContextLength % 4096);
+            // Half of what the tier has beside the weights, the dequantized projector and the
+            // system holds the whole window's K/V twice (host tensor and device mirror).
+            double spare = m.MinDeviceMemoryGB * 1e9 - m.ResidentWeightsBytes
+                - 2.0 * (m.Projector?.Bytes ?? 0) - MacOsGB * 1e9;
+            Assert.True(2.0 * m.KvBytesPerToken * m.DesktopContextLength <= spare / 2,
+                $"{m.Id}: {m.DesktopContextLength} tokens of K/V do not fit its {m.MinDeviceMemoryGB} GB tier");
+        }
+
+        // Where the tier, not the target, decides -- each worked in the entry's comment.
+        Assert.Equal(16384, ModelCatalog.Find("gemma-4-e4b-iq4xs")!.DesktopContextLength);
+        Assert.Equal(20480, ModelCatalog.Find("gemma-4-31b-q4-0")!.DesktopContextLength);
+        Assert.Equal(28672, ModelCatalog.Find("qwen3.6-27b-q4km")!.DesktopContextLength);
+        Assert.Equal(16384, ModelCatalog.Find("mistral-small-3.1-24b-q4km")!.DesktopContextLength);
+        Assert.Equal(32768, ModelCatalog.Find("gemma-4-e2b-q8")!.DesktopContextLength);
+        Assert.Equal(32768, ModelCatalog.Find("nemotron-h-8b-q4km")!.DesktopContextLength);
+        // A diffusion entry's prompt carries no shared agent prompt, and its window is its own.
+        CatalogModel diffusion = ModelCatalog.Find("diffusiongemma-26b-a4b-q4km")!;
+        Assert.Equal(diffusion.ContextLength, diffusion.DesktopContextLength);
+    }
+
     [Fact]
     public void TheNewDesktopEntriesUseThePinnedFourBitArtifacts()
     {
@@ -397,8 +479,8 @@ public sealed class CatalogTests
         Assert.Equal(15_878_222_368, muse.Weights.Bytes);
         Assert.Equal("82bece304887a313ece08400bc030f6066c7bff5b906b0cd40308ec8a409fd38", muse.Weights.Sha256);
         Assert.True(muse.Projector is { Optional: true });
-        // The DFlash drafter verifies greedily and the app samples, so it is not offered.
-        Assert.DoesNotContain(muse.Files, f => f.Role == CatalogFileRole.Draft);
+        Assert.True(Assert.Single(muse.Files, f => f.Role == CatalogFileRole.Draft).Optional);
+        Assert.True(Assert.Single(qwen.Files, f => f.Role == CatalogFileRole.Draft).Optional);
     }
 
     [Theory]
@@ -574,6 +656,33 @@ public sealed class CatalogTests
         "minimax-h3-ref2va-q4k",
         "qwen3.8-flash-next-q2kxl",
         "qwen3.8-flash-next-iq1m",
+        "qwen-image-2.1-turbo-adq4k",
+        "qwen-image-2.1-turbo-q8",
+        "gemma-4-26b-a4b-qat-q4kxl",
+        "gemma-4-31b-q4-0",
+        "qwen3.5-35b-a3b-q4km",
+        "qwen3.6-35b-a3b-q4km",
+        "qwen3.6-27b-q4km",
+        "gpt-oss-20b-mxfp4",
+        "nemotron-h-8b-q4km",
+        "nemotron-h-47b-q4km",
+        "nemotron-3-nano-omni-30b-a3b-q4kxl",
+        "nemotron-3.5-lightning-30b-a3b-mxfp4",
+        "mistral-small-3.1-24b-q4km",
+        "hy-mt2-1.8b-q4km",
+        "deepseek-v4-flash-0731-q2kxl",
+        "deepseek-v4.1-flash-engramq5-q2k",
+        "glm-5.2-iq2xxs",
+        "glm-5.3-q2kxl",
+        "glm-5.3-flash-q2kxl",
+        "diffusiongemma-26b-a4b-q4km",
+        "wan2.1-t2v-1.3b-q8",
+        "wan2.1-t2v-14b-q4km",
+        "wan2.2-ti2v-5b-q8",
+        "wan2.2-ti2v-5b-turbo-q8",
+        "wan2.2-t2v-a14b-q4km",
+        "wan2.2-i2v-a14b-q4km",
+        "wan2.2-i2v-a14b-lightx2v-q4km",
     };
 
     /// <summary>

@@ -8,6 +8,8 @@
 // TensorSharp is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 
+using TensorSharp.Runtime;
+
 namespace TensorAgent.Core.Catalog;
 
 /// <summary>
@@ -49,12 +51,16 @@ public static class DiffusionCompanions
         // A folder, not a file: MiniMaxH3TextEncoder reads vocab.json, merges.txt and
         // tokenizer_config.json from it.
         (CatalogFamily.MiniMaxH3, CatalogFileRole.Tokenizer, "TS_VIDEO_TOKENIZER"),
+        (CatalogFamily.Wan, CatalogFileRole.TextEncoder, "TS_VIDEO_TEXT_ENCODER"),
+        (CatalogFamily.Wan, CatalogFileRole.Vae, "TS_VIDEO_VAE"),
+        (CatalogFamily.Wan, CatalogFileRole.SecondaryWeights, "TS_VIDEO_DIT2"),
     ];
 
     /// <summary>
-    /// Publish <paramref name="model"/>'s installed companions and clear the rest.
-    /// Returns what was set, variable to path, so the caller can log it — a startup line
-    /// naming the files is the only place a user can see which copies are being used.
+    /// Publish <paramref name="model"/>'s installed companions and, for a Qwen-Image entry, its
+    /// checkpoint variant, and clear the rest. Returns what was set, variable to path (or to
+    /// the variant), so the caller can log it — a startup line naming the files is the only
+    /// place a user can see which copies are being used.
     /// </summary>
     /// <param name="model">The selected entry, or null when nothing is selected.</param>
     /// <param name="store">Where this installation keeps its models.</param>
@@ -63,13 +69,25 @@ public static class DiffusionCompanions
         ArgumentNullException.ThrowIfNull(store);
 
         var published = new Dictionary<string, string>(StringComparer.Ordinal);
-        foreach ((CatalogFamily family, CatalogFileRole role, string variable) in Published)
+        // Several families share the video variables. Resolve the selected family first,
+        // then write each variable once so another family's row cannot clear its path.
+        foreach (var group in Published.GroupBy(p => p.Variable))
         {
-            string? path = model is not null && model.Family == family ? PathOf(model, role, store) : null;
-            Environment.SetEnvironmentVariable(variable, path);
+            string? path = null;
+            if (model is not null)
+                foreach (var entry in group.Where(p => p.Family == model.Family))
+                    path = PathOf(model, entry.Role, store);
+            Environment.SetEnvironmentVariable(group.Key, path);
             if (path is not null)
-                published[variable] = path;
+                published[group.Key] = path;
         }
+        // Which checkpoint a Qwen-Image entry's weights are (CatalogModel.ImageVariant): the
+        // GGUF cannot say, and without it the engine guesses from the file name. Written for
+        // both variants, so a Turbo declaration never outlives its selection.
+        string? variant = model?.Family == CatalogFamily.QwenImage ? QwenImageVariantFlag.Name(model.ImageVariant) : null;
+        Environment.SetEnvironmentVariable(QwenImageVariantFlag.EnvironmentVariable, variant);
+        if (variant is not null)
+            published[QwenImageVariantFlag.EnvironmentVariable] = variant;
         return published;
     }
 

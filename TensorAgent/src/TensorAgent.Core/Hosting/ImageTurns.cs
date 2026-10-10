@@ -23,24 +23,34 @@ namespace TensorAgent.Core.Hosting;
 /// The page has one route for a turn, <c>/api/chat</c>, and on this host that route runs
 /// under the turn manager and the conversation recorder: the turn survives the page being
 /// hidden, and what it produced is written down when it ends. An image model answers the
-/// same route rather than a second one the page would have to drive on its own. The newest
-/// user message is the request: with a photo attached it is an edit of that photo,
-/// otherwise a picture made from the words.
+/// same route rather than a second one the page would have to drive on its own.
+/// </para>
+/// <para>
+/// The newest user message is the request, read against the conversation it ends (see
+/// <see cref="PlanAsync(ImageConversation, Planner, CancellationToken)"/>). Photos attached
+/// to it are what it edits. Otherwise it may change a picture already in the chat, ask for
+/// a new one, or ask for another version of the last one; which, when the conversation's
+/// shape does not settle it, the image model's own language model is asked. The turn used to
+/// read the newest message alone, so "make it brighter" after a picture drew a new picture
+/// of those words.
 /// </para>
 /// <para>
 /// The image service's frames are translated into the chat stream's vocabulary:
-/// <c>image_step</c> while the picture denoises (some carry a small <c>preview</c>), one
-/// <c>imageUrl</c> for the finished picture, and the usual <c>done</c> with the session,
-/// which is what the recorder keys the transcript on.
+/// <c>image_plan</c> once the turn knows what it will do, <c>image_step</c> while the
+/// picture denoises (some carry a small <c>preview</c>), one <c>imageUrl</c> for the
+/// finished picture with what it was made from, and the usual <c>done</c> with the session,
+/// which is what the recorder keys the transcript on. A turn that is unsure what was meant
+/// answers with a question and <c>image_choice</c> instead of a picture.
 /// </para>
 /// </summary>
-public static class ImageTurns
+public static partial class ImageTurns
 {
     /// <summary>
-    /// The output area a turn asks for: 1024 x 1024 for a picture made from words, and the
-    /// same area at the photo's own shape for an edit. The model's native area is 2048 x
-    /// 2048, which has four times the image tokens and costs several times as long per
-    /// step; the page offers no size setting, so this is the size every turn gets.
+    /// The output area a turn asks for: 1024 x 1024 for a picture made from words. An edit
+    /// returns its source picture's own size and samples at this area at most, at the
+    /// picture's shape (see <see cref="ImagePlan.Payload"/>). The model's native area is 2048
+    /// x 2048, which has four times the image tokens and costs several times as long per
+    /// step; the page offers no size setting, so this is the budget every turn gets.
     /// </summary>
     public const long DefaultTargetArea = 1024L * 1024;
 
@@ -60,12 +70,16 @@ public static class ImageTurns
     /// <param name="prepare">Asked before a picture is started, with whether it is an edit: the
     /// LoRA plug-ins it is made with (see <see cref="Preparation"/>). Null for a host that chooses
     /// none, whose pictures keep whatever set the model was loaded with.</param>
+    /// <param name="planner">How a picture turn reads the conversation (see <see cref="Planner"/>).
+    /// Required rather than defaulted for the same reason this method exists: a caller that left
+    /// it out would quietly plan every turn from the newest message alone again.</param>
     public static IAsyncEnumerable<object> FramesFor(
         WebUiChatService chat, JsonElement body, CancellationToken cancellationToken,
-        Func<bool, Preparation>? prepare = null)
+        Func<bool, Preparation>? prepare, Planner planner)
     {
         ArgumentNullException.ThrowIfNull(chat);
-        return chat.LoadedModelMakesImages ? StreamAsync(chat, body, cancellationToken, prepare)
+        ArgumentNullException.ThrowIfNull(planner);
+        return chat.LoadedModelMakesImages ? StreamAsync(chat, body, planner, cancellationToken, prepare)
             : chat.LoadedModelMakesVideo ? VideoTurns.StreamAsync(chat, body, cancellationToken)
             : chat.ChatStreamAsync(body, cancellationToken);
     }
@@ -87,13 +101,16 @@ public static class ImageTurns
     /// </summary>
     /// <param name="chat">The chat service, with an image model loaded.</param>
     /// <param name="body">The <c>/api/chat</c> request the page sent.</param>
+    /// <param name="planner">See <see cref="FramesFor"/>.</param>
     /// <param name="cancellationToken">Ends the turn; the picture is abandoned.</param>
     /// <param name="prepare">See <see cref="FramesFor"/>.</param>
     public static async IAsyncEnumerable<object> StreamAsync(
-        WebUiChatService chat, JsonElement body, [EnumeratorCancellation] CancellationToken cancellationToken,
+        WebUiChatService chat, JsonElement body, Planner planner,
+        [EnumeratorCancellation] CancellationToken cancellationToken,
         Func<bool, Preparation>? prepare = null)
     {
         ArgumentNullException.ThrowIfNull(chat);
+        ArgumentNullException.ThrowIfNull(planner);
 
         string? sessionId = body.ValueKind == JsonValueKind.Object
             && body.TryGetProperty("sessionId", out JsonElement id) && id.ValueKind == JsonValueKind.String
@@ -103,8 +120,8 @@ public static class ImageTurns
         // must not be discarded underneath the edit. A refusal is thrown before the first
         // frame, which is what turns it into a status code rather than a stream.
         using IDisposable? lease = chat.AcquireChatRequestLease?.Invoke(body);
-        ImageRequest? request = Read(body);
-        if (request is null)
+        ImageConversation? conversation = ReadConversation(body, planner.UploadDirectory);
+        if (conversation is null)
         {
             yield return new
             {
@@ -120,16 +137,42 @@ public static class ImageTurns
         if (!string.IsNullOrEmpty(sessionId))
             chat.OnChatRequest?.Invoke(sessionId, body);
 
-        Preparation? prepared = prepare?.Invoke(request.Editing);
+        // Cancellation and faults from the image model's answer are not caught: a stopped
+        // turn is a stopped turn, and the app's GPU gate tells a damaged engine from a refusal
+        // only by what reaches it (AgentAppHost.GatedChatFrames).
+        ImagePlan plan = await PlanAsync(conversation, planner, cancellationToken).ConfigureAwait(false);
+        if (plan.Choices is { } choices)
+        {
+            // The question is the answer's text, so the transcript and a text model reading
+            // this chat later see what the user saw; the buttons ride on their own frame.
+            yield return new { token = Loc.T("host.image.choose") };
+            yield return new { image_choice = choices.Select(c => new { intent = c.Intent, source = c.Source }).ToArray() };
+            yield return new { done = true, sessionId };
+            yield break;
+        }
+
+        // After the plan, because the plug-ins depend on it: one made only for edits is not
+        // applied to a picture drawn from words.
+        Preparation? prepared = prepare?.Invoke(plan.Editing);
         if (prepared?.Error is { } refusal)
         {
             yield return new { done = true, error = refusal, sessionId };
             yield break;
         }
 
-        using JsonDocument payload = JsonDocument.Parse(JsonSerializer.Serialize(request.Payload));
+        // Before the first step, so the page can say what it is doing while it does it. A turn
+        // the GPU gate runs again plans again and sends this again; the page keeps the last.
+        yield return new
+        {
+            image_plan = plan.Kind,
+            image_sources = plan.Sources.Select(UploadUrl).ToArray(),
+            image_prompt = plan.Prompt,
+            image_plan_reason = plan.Reason,
+        };
+
+        using JsonDocument payload = JsonDocument.Parse(JsonSerializer.Serialize(plan.Payload));
         JsonElement service = payload.RootElement.Clone();
-        IAsyncEnumerable<object> frames = (request.Editing, prepared) switch
+        IAsyncEnumerable<object> frames = (plan.Editing, prepared) switch
         {
             (true, null) => chat.ImageEditStreamAsync(service, cancellationToken),
             (false, null) => chat.ImageGenerateStreamAsync(service, cancellationToken),
@@ -137,16 +180,17 @@ public static class ImageTurns
             (false, _) => chat.ImageGenerateStreamAsync(service, prepared.Specs, cancellationToken),
         };
 
-        await foreach (object frame in Translate(frames, sessionId, cancellationToken, prepared?.Loras).ConfigureAwait(false))
+        await foreach (object frame in Translate(frames, sessionId, cancellationToken, prepared?.Loras, plan).ConfigureAwait(false))
             yield return frame;
     }
 
     /// <summary>The image service's frames, as the chat stream's. A step frame names the LoRA
-    /// plug-ins in use (<c>image_loras</c>) when there are any.</summary>
+    /// plug-ins in use (<c>image_loras</c>) when there are any; the picture's frame carries what
+    /// <paramref name="plan"/> made it from, which the recorders write down beside it.</summary>
     internal static async IAsyncEnumerable<object> Translate(
         IAsyncEnumerable<object> frames, string? sessionId,
         [EnumeratorCancellation] CancellationToken cancellationToken = default,
-        IReadOnlyList<string>? loras = null)
+        IReadOnlyList<string>? loras = null, ImagePlan? plan = null)
     {
         await foreach (object frame in frames.WithCancellation(cancellationToken).ConfigureAwait(false))
         {
@@ -159,7 +203,25 @@ public static class ImageTurns
                     yield return new { done = true, error = error.GetString(), sessionId };
                     yield break;
                 }
-                yield return new { imageUrl = Text(f, "url"), width = Number(f, "width"), height = Number(f, "height") };
+                if (plan is null)
+                {
+                    yield return new { imageUrl = Text(f, "url"), width = Number(f, "width"), height = Number(f, "height") };
+                }
+                else
+                {
+                    yield return new
+                    {
+                        imageUrl = Text(f, "url"),
+                        width = Number(f, "width"),
+                        height = Number(f, "height"),
+                        imagePlan = plan.Kind,
+                        imagePlanReason = plan.Reason,
+                        imageSources = plan.Sources,
+                        imagePrompt = plan.Prompt,
+                        imageSeed = plan.Seed,
+                        imageMask = plan.Mask.Count == 0 ? null : plan.Mask,
+                    };
+                }
                 yield return new
                 {
                     done = true,
@@ -195,48 +257,6 @@ public static class ImageTurns
         yield return new { done = true, aborted = true, sessionId };
     }
 
-    /// <summary>What the newest user message asks for, or null when it asks for nothing.</summary>
-    internal static ImageRequest? Read(JsonElement body)
-    {
-        if (body.ValueKind != JsonValueKind.Object
-            || !body.TryGetProperty("messages", out JsonElement messages)
-            || messages.ValueKind != JsonValueKind.Array)
-            return null;
-
-        JsonElement? last = null;
-        foreach (JsonElement message in messages.EnumerateArray())
-        {
-            if (message.ValueKind == JsonValueKind.Object
-                && message.TryGetProperty("role", out JsonElement role)
-                && role.ValueKind == JsonValueKind.String
-                && role.GetString() == "user")
-                last = message;
-        }
-        if (last is not { } user)
-            return null;
-
-        string prompt = Text(user, "content")?.Trim() ?? string.Empty;
-        // Stills only: a video's sampled frames are not a photo to edit.
-        string[] photos = Paths(user, "stillImagePaths");
-        string[] maskSettings = ["maskPath", "maskMode", "maskInvert", "maskFeather", "maskCrop", "maskCropPadding"];
-        bool hasMaskSettings = maskSettings.Any(name => user.TryGetProperty(name, out JsonElement value) && value.ValueKind != JsonValueKind.Null);
-        if (photos.Length > 0 || hasMaskSettings)
-        {
-            var payload = new Dictionary<string, object?>
-            {
-                ["prompt"] = prompt, ["imagePaths"] = photos, ["targetArea"] = DefaultTargetArea,
-            };
-            // The first photo is the source; later photos provide reference context.
-            // Forward raw JSON so the image service can reject invalid settings rather
-            // than silently applying a whole-image edit when a selection is malformed.
-            foreach (string name in maskSettings)
-                if (user.TryGetProperty(name, out JsonElement value) && value.ValueKind != JsonValueKind.Null)
-                    payload[name] = value.Clone();
-            return new ImageRequest(true, payload);
-        }
-        return prompt.Length == 0 ? null : new ImageRequest(false, new { prompt, targetArea = DefaultTargetArea });
-    }
-
     private static string? Text(JsonElement element, string name) =>
         element.TryGetProperty(name, out JsonElement value) && value.ValueKind == JsonValueKind.String ? value.GetString() : null;
 
@@ -250,7 +270,4 @@ public static class ImageTurns
                 .Select(p => p.GetString()!)
                 .ToArray()
             : Array.Empty<string>();
-
-    /// <summary>An edit (with the photos) or a picture made from words, as the service's body.</summary>
-    internal sealed record ImageRequest(bool Editing, object Payload);
 }

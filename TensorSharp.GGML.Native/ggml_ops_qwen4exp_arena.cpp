@@ -526,7 +526,10 @@ namespace tsg_q4earena
 #ifdef TSG_GGML_TEST_HOOKS
 // Fail exactly the nth subsequent arena state copy. Tests reset this hook
 // after each scenario; production builds contain neither the export nor branch.
+// Keep test exports distinct from the production ABI manifest's TSG_EXPORT scan.
+#ifndef TSG_TEST_EXPORT
 #define TSG_TEST_EXPORT TSG_EXPORT
+#endif
 TSG_TEST_EXPORT int TSGgml_Qwen4ExpArenaTestCopyFault(int nth)
 {
     if (nth < 0) return 0;

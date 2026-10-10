@@ -365,7 +365,7 @@ public class ServerOptionsBuilderTests : IDisposable
             "--seed", "--stop", "--kv-cache-dtype",
             "--continuous-batching", "--prefill-chunk-size",
             "--spec", "--spec-type", "--spec-draft", "--spec-pmin", "--draft-model",
-            "--qwen-image-vae", "--qwen-image-vl", "--qwen-image-mmproj",
+            "--qwen-image-vae", "--qwen-image-vl", "--qwen-image-mmproj", "--qwen-image-variant",
             "--video-vae", "--video-text-encoder", "--video-dit2", "--audio-vae",
             "--n-cpu-moe", "--cpu-moe", "--cpu-moe-threads",
             "--skill", "--list-skills",

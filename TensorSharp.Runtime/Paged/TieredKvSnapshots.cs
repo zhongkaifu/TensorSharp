@@ -113,15 +113,23 @@ public sealed class KvSnapshotLease : IDisposable
     private readonly ResourceLease? _resource;
     private readonly ResourceAccess _access;
     private bool _disposed;
+    private int? _readLength;
     internal KvSnapshotLease(byte[] bytes, ResourceAccess access) { _managed = bytes; _access = access; }
     internal KvSnapshotLease(ResourceLease resource, ResourceAccess access) { _resource = resource; _access = access; }
     internal Task<bool>? PendingPrefetch { get; set; }
+    internal void LimitReadLength(int length)
+    {
+        if (_access != ResourceAccess.Read || length < 0 || length > Bytes.Length)
+            throw new ArgumentOutOfRangeException(nameof(length));
+        _readLength = length;
+    }
     private unsafe Span<byte> Bytes
     {
         get
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
-            return _resource == null ? _managed.AsSpan() : new Span<byte>((void*)_resource.Pointer, checked((int)_resource.ByteLength));
+            var bytes = _resource == null ? _managed.AsSpan() : new Span<byte>((void*)_resource.Pointer, checked((int)_resource.ByteLength));
+            return _readLength is int length ? bytes[..length] : bytes;
         }
     }
     public ReadOnlySpan<byte> ReadOnlySpan => Bytes;

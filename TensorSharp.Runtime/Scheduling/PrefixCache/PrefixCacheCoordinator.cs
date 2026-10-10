@@ -181,7 +181,8 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
             && !(request.Route == ExpectedRoute.BatchedPaged && IsPagedEndState(_plan)))
             _plan.Reset();
         LastBlockedByScope = _plan.BlockedByScope;
-        LastDeclineReason = _plan.HasReuse ? null : DescribeDecline(_plan);
+        LastDeclineReason = _plan.HasReuse ? null
+            : DescribeDecline(_plan, request.PublicBoundary, _tree.Caps.RewindCapTokens);
         // The executor never continues the live cache for a request with explicit cache breakpoints
         // (BatchExecutor.EnsureOwnership), so do not promise it one: admission announced the reuse and
         // execution took it back.
@@ -196,19 +197,50 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
     /// <summary>The first specific reason a plan reused nothing: a rewind of the cached conversation, then
     /// the live cache, a retained state, pages. Sources that were simply absent or lost to a longer one say
     /// nothing. Before it existed the log said only "0/N tokens", which is all a user saw when every
-    /// DeepSeek V4.1 thinking turn re-prefilled its whole prompt.</summary>
-    private static string? DescribeDecline(MatchPlan plan)
-        => Describe("rewinding the cached conversation", plan.TruncationDecline)
-           ?? Describe("the live cache", plan.PrimaryDecline)
-           ?? Describe("the retained state", plan.EndStateDecline)
-           ?? Describe("the cached pages", plan.PageDecline);
+    /// DeepSeek V4.1 thinking turn re-prefilled its whole prompt.
+    /// <para>
+    /// A prompt that leaves every cached prefix INSIDE its own shared prefix is reported as
+    /// that, first: the part every conversation is meant to share is not the same as the
+    /// cached one's, and no source could have helped. Live, an attachment's name in a tool
+    /// declaration did exactly this -- and the line said "no resumable radix prefix" on
+    /// Qwen3.8 27B, and on Gemma 4 E2B blamed "a media span, a breakpoint or the rewind
+    /// cap" when no media span was involved. A clamp names the flags that cut THAT source
+    /// (<see cref="MatchPlan.TruncationClamps"/> and its siblings), never another's.
+    /// </para></summary>
+    internal static string? DescribeDecline(MatchPlan plan, int publicBoundary, int rewindCapTokens)
+    {
+        if (plan.Structural > 0 && plan.Structural < publicBoundary)
+            return $"the prompt leaves every cached prefix at token {plan.Structural}, "
+                + $"inside its {publicBoundary}-token shared prefix";
+        return Describe("rewinding the cached conversation", plan.TruncationDecline, plan.TruncationClamps, rewindCapTokens)
+           ?? Describe("the live cache", plan.PrimaryDecline, plan.PrimaryClamps, rewindCapTokens)
+           ?? Describe("the retained state", plan.EndStateDecline, plan.EndStateClamps, rewindCapTokens)
+           ?? Describe("the cached pages", plan.PageDecline, plan.PageClamps, rewindCapTokens);
+    }
 
-    private static string? Describe(string source, SourceDecline decline)
+    /// <summary>Clamp flags, in words; "a clamp" only for a cut no flag records (a family's
+    /// own truncation rule, a page without recurrent state at its end).</summary>
+    internal static string ClampWords(ClampReasons clamps, int rewindCapTokens)
+    {
+        var parts = new List<string>(2);
+        if ((clamps & ClampReasons.RewindCap) != 0) parts.Add($"the {rewindCapTokens}-token rewind cap");
+        if ((clamps & ClampReasons.MediaAcrossSpan) != 0) parts.Add("a media span this family cannot continue past");
+        if ((clamps & ClampReasons.Media) != 0) parts.Add("a media span");
+        if ((clamps & ClampReasons.Breakpoint) != 0) parts.Add("an explicit cache breakpoint");
+        if ((clamps & ClampReasons.LeaveOne) != 0) parts.Add("the last prompt token, which is always forwarded");
+        if ((clamps & ClampReasons.Window) != 0) parts.Add("the page window");
+        if ((clamps & ClampReasons.Granularity) != 0) parts.Add("the rewind granularity");
+        if ((clamps & ClampReasons.MmThreshold) != 0) parts.Add("the media reuse threshold");
+        if ((clamps & ClampReasons.CloneCost) != 0) parts.Add("the minimum clone length");
+        return parts.Count == 0 ? "a clamp" : string.Join(" and ", parts);
+    }
+
+    private static string? Describe(string source, SourceDecline decline, ClampReasons clamps, int rewindCapTokens)
     {
         string? why = decline switch
         {
             SourceDecline.NotPermitted => "belongs to another conversation",
-            SourceDecline.Clamped => "is cut short by a media span, a breakpoint or the rewind cap",
+            SourceDecline.Clamped => "is cut short by " + ClampWords(clamps, rewindCapTokens),
             SourceDecline.PrimaryBusy => "is busy with other requests",
             SourceDecline.PrimaryClaimed => "is already claimed this step",
             SourceDecline.ModelRefused => "is declined by the model",
@@ -667,14 +699,32 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
     {
         var store = CheckpointStore;
         if (store is null || !PublicCheckpointsEnabled || !CheckpointsSupported || !_tree.Caps.Persistable
-            || sequence.CacheBreakpoints is not null || sequence.MediaSpans.Count > 0) return;
+            || sequence.CacheBreakpoints is not null) return;
         // Longest first: loading a shorter ancestor must not evict an already
         // usable descendant when the checkpoint budget is small.
         _tree.Plan(BuildRequest(sequence, PredictRoute()), _plan);
         int residentLength = _plan.Length;
         for (int i = sequence.PublicCheckpointBoundaries.Count - 1; i >= 0; i--)
-            if (sequence.PublicCheckpointBoundaries[i] > residentLength
-                && TryRestoreCheckpoint(sequence, store, sequence.PublicCheckpointBoundaries[i])) return;
+        {
+            int boundary = sequence.PublicCheckpointBoundaries[i];
+            // The store is keyed by text tokens alone, so only a prefix that holds no
+            // media is the stored one. A request whose image comes AFTER the boundary --
+            // an image chat, whose picture is in the user turn behind the shared system
+            // prompt -- restores exactly what a text chat does. This used to refuse every
+            // request with any media, so an image sent as the first message after a
+            // restart (or after the in-memory checkpoint was evicted) prefilled the whole
+            // shared prompt again.
+            if (boundary > residentLength && !HasMediaBefore(sequence, boundary)
+                && TryRestoreCheckpoint(sequence, store, boundary)) return;
+        }
+    }
+
+    /// <summary>Whether a media span of <paramref name="sequence"/> starts before <paramref name="length"/>.</summary>
+    private static bool HasMediaBefore(SequenceState sequence, int length)
+    {
+        foreach (PromptMediaSpan span in sequence.MediaSpans)
+            if (span.Start < length) return true;
+        return false;
     }
 
     private bool TryRestoreCheckpoint(SequenceState sequence, IPrefixCheckpointStore store, int length)
@@ -696,6 +746,11 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
                     if (_cacheModel.TryImport(key, length, stream, out var footprint)
                         && Publish(node, key, footprint, length, PayloadOrigin.DiskImport))
                     {
+                        // Said, because nothing else says it: the admission line only
+                        // shows the reuse, and a restore and a resident hit look alike there.
+                        _logger.LogInformation(
+                            "Restored the {Length}-token public prefix checkpoint from disk for {RequestId}.",
+                            length, sequence.RequestId);
                         // This ancestor may serve a new branch beyond the two
                         // already resident endpoints. Prefer normal LRU for this
                         // import, without exempting it from any count or byte cap.
@@ -719,7 +774,10 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
     private void SaveCheckpoint(SequenceState sequence, string key, int length)
     {
         var store = CheckpointStore;
-        if (store is null || !_tree.Caps.Persistable || sequence.MediaSpans.Count > 0) return;
+        // The store key is the prefix's text tokens, which say nothing of an image's
+        // pixels: a prefix that holds a media span is never saved, one that ends before
+        // the first span is exactly the text prefix it is keyed by.
+        if (store is null || !_tree.Caps.Persistable || HasMediaBefore(sequence, length)) return;
         try
         {
             int[] tokens = PrefixTokens(sequence, length);

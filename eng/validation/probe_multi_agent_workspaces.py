@@ -89,6 +89,18 @@ def json_objects(text):
                 pass
 
 
+def shown_answer(frames):
+    """The answer a page is left showing: tokens append, a replace sets the whole of it
+    (a host takes back text that proved to be reasoning that way)."""
+    answer = ""
+    for frame in frames:
+        if isinstance(frame.get("token"), str):
+            answer += frame["token"]
+        if isinstance(frame.get("replace"), str):
+            answer = frame["replace"]
+    return answer
+
+
 def request(endpoint, max_tokens, timeout, report):
     body = {"messages": [{"role": "user", "content": PROMPT}], "think": False,
             "maxTokens": max_tokens, "newChat": True, "multi_agent": True}
@@ -125,7 +137,7 @@ def request(endpoint, max_tokens, timeout, report):
                 frames.append(frame)
     finally:
         report["seconds"] = time.perf_counter() - started
-        report["answer"] = "".join(f.get("token", "") for f in frames)
+        report["answer"] = shown_answer(frames)
 
 
 def fetch_artifacts(endpoint, report):

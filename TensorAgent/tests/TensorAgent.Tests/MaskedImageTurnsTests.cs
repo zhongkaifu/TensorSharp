@@ -6,15 +6,26 @@ namespace TensorAgent.Tests;
 
 public sealed class MaskedImageTurnsTests
 {
+    /// <summary>
+    /// What a message with a photo or a selection asks for. Those are always what it edits,
+    /// so the image model is never asked; the stand-in fails the test if it is.
+    /// </summary>
+    private static async Task<ImageTurns.ImagePlan> PlanAsync(JsonDocument body)
+    {
+        var planner = new ImageTurns.Planner(Path.GetTempPath(),
+            (_, _) => throw new InvalidOperationException("an attached photo is never a question for the model"));
+        return Assert.IsType<ImageTurns.ImagePlan>(await ImageTurns.PlanAsync(body.RootElement, planner, CancellationToken.None));
+    }
+
     [Fact]
-    public void SelectedAreaIsForwardedSeparatelyFromSourceAndReferences()
+    public async Task SelectedAreaIsForwardedSeparatelyFromSourceAndReferences()
     {
         using JsonDocument body = JsonDocument.Parse("""
             {"messages":[{"role":"user","content":"change the scarf",
               "stillImagePaths":["source.png","reference.png"],"maskPath":"selection.png",
               "maskMode":"grayscale","maskInvert":true,"maskFeather":4,"maskCrop":true,"maskCropPadding":96}]}
             """);
-        ImageTurns.ImageRequest request = Assert.IsType<ImageTurns.ImageRequest>(ImageTurns.Read(body.RootElement));
+        ImageTurns.ImagePlan request = await PlanAsync(body);
         JsonElement payload = JsonSerializer.SerializeToElement(request.Payload);
         Assert.True(request.Editing);
         Assert.Equal(new[] { "source.png", "reference.png" }, payload.GetProperty("imagePaths").EnumerateArray().Select(x => x.GetString()));
@@ -24,29 +35,31 @@ public sealed class MaskedImageTurnsTests
         Assert.Equal(4, payload.GetProperty("maskFeather").GetInt32());
         Assert.True(payload.GetProperty("maskCrop").GetBoolean());
         Assert.Equal(96, payload.GetProperty("maskCropPadding").GetInt32());
+        // A selection keeps its canvas anyway; the field is the same for every edit.
+        Assert.True(payload.GetProperty("keepSourceSize").GetBoolean());
     }
 
     [Fact]
-    public void OldSelectionsDoNotLeakIntoNewImageRequests()
+    public async Task OldSelectionsDoNotLeakIntoNewImageRequests()
     {
         using JsonDocument body = JsonDocument.Parse("""
             {"messages":[{"role":"user","content":"edit","stillImagePaths":["old.png"],"maskPath":"old-mask.png"},
               {"role":"assistant","imageUrl":"/uploads/old-result.png"},
               {"role":"user","content":"new edit","stillImagePaths":["new.png"]}]}
             """);
-        var request = Assert.IsType<ImageTurns.ImageRequest>(ImageTurns.Read(body.RootElement));
+        ImageTurns.ImagePlan request = await PlanAsync(body);
         Assert.False(JsonSerializer.SerializeToElement(request.Payload).TryGetProperty("maskPath", out _));
     }
 
     [Theory]
     [InlineData("\"mask.png\"")]
     [InlineData("123")]
-    public void MissingSourceAndInvalidSelectionAreSentToServiceValidation(string mask)
+    public async Task MissingSourceAndInvalidSelectionAreSentToServiceValidation(string mask)
     {
         using JsonDocument body = JsonDocument.Parse("""
             {"messages":[{"role":"user","content":"edit","maskPath":
             """ + mask + "}]}");
-        var request = Assert.IsType<ImageTurns.ImageRequest>(ImageTurns.Read(body.RootElement));
+        ImageTurns.ImagePlan request = await PlanAsync(body);
         Assert.True(request.Editing);
         JsonElement payload = JsonSerializer.SerializeToElement(request.Payload);
         Assert.Empty(payload.GetProperty("imagePaths").EnumerateArray());

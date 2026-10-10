@@ -222,6 +222,37 @@ namespace TensorSharp.Runtime
         public Func<bool, string?>? AssistantGenerationSuffix { get; init; }
 
         /// <summary>
+        /// <see cref="AssistantGenerationSuffix"/> for a family whose architecture name
+        /// carries more than one turn format, given the GGUF's embedded template (null when
+        /// unknown). Takes precedence when set.
+        ///
+        /// <para>
+        /// Nemotron-H 8B Reasoning-128K opens the answer with <c>&lt;think&gt;&lt;/think&gt;</c>
+        /// (or <c>&lt;think&gt;\n</c>) but renders a past assistant turn as its bare content,
+        /// while the Nemotron 3 ChatML template frames both alike. With no suffix declared, a
+        /// follow-up's history diverged from the cache six tokens before the previous prompt
+        /// ended, and the recurrent state cannot rewind: every follow-up re-prefilled the
+        /// whole conversation after the shared system prompt.
+        /// </para>
+        /// </summary>
+        public Func<bool, string?, string?>? AssistantGenerationSuffixForTemplate { get; init; }
+
+        /// <summary>
+        /// Text the template writes after a past assistant turn's content that the model
+        /// itself writes as the end of its reply, given the GGUF's embedded template. When
+        /// a turn's raw tokens already end with it, the template's copy is dropped.
+        ///
+        /// <para>
+        /// Nemotron-H Reasoning-128K closes a turn with <c>\n&lt;SPECIAL_11&gt;</c>, after
+        /// the content stripped. The model writes that newline and then the end token
+        /// itself ("Paris\n", then <c>&lt;SPECIAL_11&gt;</c>), so a spliced turn rendered
+        /// "Paris\n\n&lt;SPECIAL_11&gt;" where the cache held "Paris\n&lt;SPECIAL_11&gt;",
+        /// one token short of a follow-up's continuation.
+        /// </para>
+        /// </summary>
+        public Func<string?, string?>? ModelWrittenTurnSeparator { get; init; }
+
+        /// <summary>
         /// Whether cached assistant tokens may replace the template's history.
         /// Disable when the protocol deliberately changes past reasoning or turn
         /// framing; replaying raw tokens would violate the model's input format.
@@ -338,6 +369,46 @@ namespace TensorSharp.Runtime
         /// </summary>
         public bool RendersToolResultMessages { get; init; } = true;
 
+        /// <summary>
+        /// True when the turn ends once the model has written a complete tool call, given
+        /// the GGUF's embedded template (one architecture name can carry two turn formats).
+        /// For a family whose model goes on to write the tool's RESULT itself instead of
+        /// stopping. Decided by the family's own output parser (<see cref="ToolCallTurnEnd"/>),
+        /// so a close tag named in the model's reasoning, or written inside a string
+        /// argument, does not end the turn.
+        ///
+        /// <para>
+        /// Nemotron-H 8B Reasoning-128K closed its call and wrote a tool response with an
+        /// invented file content, then answered from it ("The file has 3 lines."). The call
+        /// still ran, but the reply the user read was made up before the result existed.
+        /// It puts all of a turn's calls in one list inside one tag, so ending the turn at
+        /// the first complete call loses no call.
+        /// </para>
+        /// </summary>
+        public Func<string?, bool>? ToolCallEndsTurn { get; init; }
+
+        /// <summary>
+        /// True when the model may reason although its generation prompt CLOSED the
+        /// reasoning block, and then close the block itself before it answers, given the
+        /// GGUF's embedded template. The pipeline then tells every parser of the reply what
+        /// the prompt ended with (<c>ChatStreamUpdate.RawGenerationSuffix</c>), and the
+        /// family's parser holds the opening of such a reply as undecided until the close, a
+        /// complete tool call or the end of the reply says what it was. A reply the sampler
+        /// shapes from its first token (a thinking-off <c>response_format</c> grammar, see
+        /// <c>OutputParserFactory.ConstrainsReplyStart</c>) cannot reason and is exempt.
+        ///
+        /// <para>
+        /// Nemotron-H 8B Reasoning-128K with thinking off ends its prompt with
+        /// <c>&lt;think&gt;&lt;/think&gt;</c>, and in tool rounds it still wrote 320-1878
+        /// characters of "Okay, the user ..." and a <c>&lt;/think&gt;</c> of its own. Parsed
+        /// as an answer, the reasoning and the literal tag were what the user read and what
+        /// the transcript kept. Nothing in the text tells that reasoning from an ordinary
+        /// answer before the close, so the close is what decides. Nemotron 3 Nano / Omni
+        /// (ChatML) have shown no such reply and stream their answers unheld.
+        /// </para>
+        /// </summary>
+        public Func<string?, bool>? ThinkingOffReplyMayReason { get; init; }
+
         internal void Validate()
         {
             if (string.IsNullOrWhiteSpace(Id))
@@ -348,6 +419,11 @@ namespace TensorSharp.Runtime
             {
                 throw new InvalidOperationException(
                     $"Chat protocol '{Id}' says its parser is always required but supplies none.");
+            }
+            if (ThinkingOffReplyMayReason != null && CreateOutputParser == null)
+            {
+                throw new InvalidOperationException(
+                    $"Chat protocol '{Id}' says a thinking-off reply may reason but supplies no parser to separate it.");
             }
             if ((ThinkingBudgetOpenToken != null || SuppressUnopenedThinkingEndAfter != null) && ThinkingBudgetEndToken == null)
             {

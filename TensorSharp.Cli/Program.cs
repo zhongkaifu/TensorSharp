@@ -271,6 +271,22 @@ namespace TensorSharp.Cli
                 return;
             }
 
+            // --qwen-image-variant (either spelling, like the server) is consumed here too, so the
+            // switch below, which ignores what it does not know, never drops a joined spelling.
+            QwenImageVariant? qwenImageVariant;
+            try
+            {
+                var withoutVariant = new List<string>();
+                qwenImageVariant = QwenImageVariantFlag.Take(args, withoutVariant);
+                args = withoutVariant.ToArray();
+            }
+            catch (ArgumentException ex)
+            {
+                Console.Error.WriteLine("Configuration error: " + ex.Message);
+                Environment.ExitCode = HostExitCodes.ConfigurationError;
+                return;
+            }
+
             // Pick up the KV cache dtype from the KV_CACHE_DTYPE environment variable
             // before parsing CLI args. The --kv-cache-dtype flag below overrides this.
             KvCacheDtypeConfig.ConfigureFromEnvironment();
@@ -304,6 +320,7 @@ namespace TensorSharp.Cli
             string imagePath = null;
             var imagePathList = new List<string>();   // every --image in order (multi-image edit)
             var imageMask = new ImageMaskCliOptions();
+            bool keepSourceSize = false;   // Qwen-Image-2.1 edit: return the first --image's exact size
             string audioPath = null;
             string videoPath = null;
             string mmProjPath = null;
@@ -408,6 +425,7 @@ namespace TensorSharp.Cli
                     case "--mask-feather":
                     case "--mask-crop":
                     case "--mask-crop-padding": imageMask.Read(args, ref i); break;
+                    case "--keep-source-size": keepSourceSize = true; break;
                     case "--prompt": editPrompt = args[++i]; break;
                     case "--cfg": cfgScale = float.Parse(args[++i]); cfgScaleSet = true; break;
                     case "--qwen-image-vae": qwenImageVaePath = args[++i]; break;
@@ -559,6 +577,7 @@ namespace TensorSharp.Cli
             parallelism.ApplyEnvironment();
             int tpDegree = parallelism.TpDegree;
             imageMask.Validate(imagePathList.Count);
+            ValidateKeepSourceSize(keepSourceSize, imagePathList.Count, imageWidth, imageHeight);
 
             // `--mmproj none` is the server's spelling for "no projector", and a config
             // file's keys ARE flags: without this the CLI handed "none" to LoadProjectors
@@ -798,10 +817,21 @@ namespace TensorSharp.Cli
             ApplyVideoCompanionOverride("--video-dit2", videoDit2Path, "TS_VIDEO_DIT2");
             ApplyVideoCompanionOverride("--audio-vae", videoAudioVaePath, "TS_VIDEO_AUDIO_VAE");
 
+            // --qwen-image-variant declares which Qwen-Image-2.1 checkpoint the GGUF holds
+            // (Turbo samples its own 8-step schedule); QwenImageModel reads it at load.
+            if (qwenImageVariant is { } variant)
+            {
+                Environment.SetEnvironmentVariable(QwenImageVariantFlag.EnvironmentVariable, QwenImageVariantFlag.Name(variant));
+                _log.LogInformation(LogEventIds.HostConfiguration, "Qwen-Image-2.1 variant declared: {Variant}",
+                    QwenImageVariantFlag.Name(variant));
+            }
+
             // LoRA plug-ins apply to Qwen-Image-2.1's transformer only. Probe the file's
             // architecture first, so a text or video model is refused before a plug-in
             // downloads its weights or the model loads, and nothing is applied silently.
-            if (loraSpecs.Count > 0 ||
+            // The variant declaration is checked the same way: it means nothing to another model.
+            string declaredVariant = Environment.GetEnvironmentVariable(QwenImageVariantFlag.EnvironmentVariable);
+            if (loraSpecs.Count > 0 || !string.IsNullOrWhiteSpace(declaredVariant) ||
                 !string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable(LoraCliFlags.EnvironmentVariable)))
             {
                 string loraArchitecture = null;
@@ -816,6 +846,13 @@ namespace TensorSharp.Cli
                 }
                 if (loraArchitecture != null && loraArchitecture != "qwen_image")
                 {
+                    if (qwenImageVariant != null)
+                    {
+                        Console.Error.WriteLine($"Configuration error: {QwenImageVariantFlag.Flag} applies to Qwen-Image-2.1 models only; " +
+                            $"'{Path.GetFileName(modelPath)}' ({loraArchitecture}) is not one.");
+                        Environment.ExitCode = HostExitCodes.ConfigurationError;
+                        return;
+                    }
                     if (loraSpecs.Count > 0)
                     {
                         Console.Error.WriteLine($"Configuration error: {LoraCliFlags.LoraFlag} applies to Qwen-Image-2.1 models only; " +
@@ -823,9 +860,14 @@ namespace TensorSharp.Cli
                         Environment.ExitCode = HostExitCodes.ConfigurationError;
                         return;
                     }
-                    _log.LogWarning(LogEventIds.HostConfiguration,
-                        "{EnvVar} names LoRA plug-ins, but {Model} ({Architecture}) does not take them; it runs without them.",
-                        LoraCliFlags.EnvironmentVariable, Path.GetFileName(modelPath), loraArchitecture);
+                    if (!string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable(LoraCliFlags.EnvironmentVariable)))
+                        _log.LogWarning(LogEventIds.HostConfiguration,
+                            "{EnvVar} names LoRA plug-ins, but {Model} ({Architecture}) does not take them; it runs without them.",
+                            LoraCliFlags.EnvironmentVariable, Path.GetFileName(modelPath), loraArchitecture);
+                    if (!string.IsNullOrWhiteSpace(declaredVariant))
+                        _log.LogWarning(LogEventIds.HostConfiguration,
+                            "{EnvVar} ({Variant}) declares a Qwen-Image-2.1 checkpoint, but {Model} ({Architecture}) is not one; it ignores it.",
+                            QwenImageVariantFlag.EnvironmentVariable, declaredVariant.Trim(), Path.GetFileName(modelPath), loraArchitecture);
                 }
                 else if (loraSpecs.Count > 0)
                 {
@@ -905,6 +947,8 @@ namespace TensorSharp.Cli
             }
             using var model = createdModel;
             imageMask.ValidateModel(model is TensorSharp.Models.QwenImage.QwenImageModel);
+            if (keepSourceSize && model is not TensorSharp.Models.QwenImage.QwenImageModel)
+                throw new ArgumentException("--keep-source-size requires a Qwen-Image-2.1 model.");
 
             // Speculator weights that ship as their own file (Gemma 4's
             // gemma4-assistant draft head, named with --draft-model) attach
@@ -940,7 +984,7 @@ namespace TensorSharp.Cli
                     return;
                 }
                 string outPath = outputFile ?? (imagePathList.Count == 0 ? "generated.png" : "edited.png");
-                RunImageEdit(qwenImageModel, imagePathList, prompt, outPath, diffusionStepsSet ? diffusionSteps : 0, cfgScaleSet ? cfgScale : 0f, diffusionSeed, imageWidth, imageHeight, negativePrompt, imageMask);
+                RunImageEdit(qwenImageModel, imagePathList, prompt, outPath, diffusionStepsSet ? diffusionSteps : 0, cfgScaleSet ? cfgScale : 0f, diffusionSeed, imageWidth, imageHeight, negativePrompt, imageMask, keepSourceSize);
                 return;
             }
 
@@ -1673,7 +1717,7 @@ namespace TensorSharp.Cli
                 string rawOutput = model.Tokenizer.Decode(generatedTokens);
 
                 var parser = CliOutputParser.Create(arch, enableThinking, null,
-                    model.Tokenizer, inputTokens);
+                    CliOutputParser.PromptTail(arch, model.Config.ChatTemplate, model.Tokenizer, inputTokens));
                 var parsed = parser.Add(rawOutput, true);
                 string content = parsed.Content ?? "";
                 string thinking = parsed.Thinking ?? "";
@@ -2116,9 +2160,22 @@ namespace TensorSharp.Cli
             return hasAny ? cfg : fallback;
         }
 
+        /// <summary>--keep-source-size needs an image to keep the size of, and replaces --width/--height
+        /// rather than combining with them (the pipeline refuses the pair as well, but only after the
+        /// model has loaded).</summary>
+        internal static void ValidateKeepSourceSize(bool keepSourceSize, int imageCount, int width, int height)
+        {
+            if (!keepSourceSize) return;
+            if (imageCount == 0)
+                throw new ArgumentException("--keep-source-size requires --image; it keeps the first image's width and height.");
+            if (width != 0 || height != 0)
+                throw new ArgumentException("--keep-source-size cannot be combined with --width/--height; it returns the first image's own size.");
+        }
+
         static void RunImageEdit(TensorSharp.Models.QwenImage.QwenImageModel model,
             IReadOnlyList<string> imagePaths, string prompt, string outputPath, int steps, float cfgScale, int seed,
-            int width = 0, int height = 0, string negativePrompt = null, ImageMaskCliOptions imageMask = null)
+            int width = 0, int height = 0, string negativePrompt = null, ImageMaskCliOptions imageMask = null,
+            bool keepSourceSize = false)
         {
             foreach (var path in imagePaths)
             {
@@ -2142,12 +2199,15 @@ namespace TensorSharp.Cli
                 Width = width,
                 Height = height,
                 NegativePrompt = negativePrompt ?? " ",
+                KeepSourceSize = keepSourceSize,
             };
             imageMask?.Apply(p);
             if (p.Mask != null)
                 Console.WriteLine($"  mask   : {imageMask.Path} ({p.MaskMode}, feather={p.MaskFeather}, crop={p.MaskCrop})");
             if (width > 0 && height > 0)
                 Console.WriteLine($"  explicit output size {width}x{height}");
+            if (keepSourceSize)
+                Console.WriteLine($"  keeping the source size {inputs[0].Width}x{inputs[0].Height}");
             var sw = Stopwatch.StartNew();
             var output = inputs.Count == 0 ? model.GenerateImage(prompt, p) : model.EditImage(prompt, inputs, p);
             sw.Stop();
@@ -2507,9 +2567,16 @@ namespace TensorSharp.Cli
                 var sampler = new TokenSampler(cfg);
                 var streamed = new List<int>();
                 string trimmedAtStop = null;
+                // A family that writes its tool's result itself ends the turn at its call.
+                string promptTail = CliOutputParser.PromptTail(model.Config.Architecture, model.Config.ChatTemplate,
+                    model.Tokenizer, inputTokens);
+                ToolCallTurnEnd toolCallTurnEnd = ToolCallTurnEnd.For(model.Config.Architecture,
+                    model.Config.ChatTemplate, enableThinking, tools, promptTail);
                 bool Emit(int token)
                 {
                     streamed.Add(token);
+                    if (toolCallTurnEnd != null && toolCallTurnEnd.ObserveToken(model.Tokenizer, token))
+                        return false;
                     if (cfg.StopSequences == null || cfg.StopSequences.Count == 0)
                         return true;
                     var (trimmed, shouldStop) = sampler.CheckStopSequences(model.Tokenizer.Decode(streamed));
@@ -2535,12 +2602,12 @@ namespace TensorSharp.Cli
                     model.PrintTimingStats();
                 }
                 string decoded = trimmedAtStop ?? model.Tokenizer.Decode(result.Tokens);
-                var parser = CliOutputParser.Create(model.Config.Architecture, enableThinking, tools,
-                    model.Tokenizer, inputTokens);
-                bool useParser = enableThinking || (tools != null && tools.Count > 0) || parser.AlwaysRequired;
+                var parser = CliOutputParser.Create(model.Config.Architecture, enableThinking, tools, promptTail);
+                bool parserRequired = OutputParserFactory.IsAlwaysRequired(model.Config.Architecture, model.Config.ChatTemplate);
+                bool useParser = enableThinking || (tools != null && tools.Count > 0) || parserRequired;
                 var parsed = useParser ? parser.Add(decoded, true) : new ParsedOutput { Content = decoded };
                 onParsed?.Invoke(parsed);
-                return useParser ? FormatParsedResult(parsed, enableThinking || parser.AlwaysRequired) : decoded;
+                return useParser ? FormatParsedResult(parsed, enableThinking || parserRequired) : decoded;
             }
             finally
             {
@@ -3206,7 +3273,7 @@ namespace TensorSharp.Cli
 
                 // Append the assistant turn so subsequent renders include it.
                 var parser = CliOutputParser.Create(arch, enableThinking, null,
-                    model.Tokenizer, inputTokens);
+                    CliOutputParser.PromptTail(arch, model.Config.ChatTemplate, model.Tokenizer, inputTokens));
                 var parsed = parser.Add(model.Tokenizer.Decode(generatedTokens), true);
                 history.Add(new ChatMessage
                 {

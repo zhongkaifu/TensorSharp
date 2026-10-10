@@ -140,6 +140,12 @@ internal readonly record struct PageRef(KvBlock Block, int PageIndex, PageStore 
 {
     internal bool HasA1 => (Store & PageStore.A1HostSlab) != 0;
     internal bool HasA2 => (Store & PageStore.A2ModelPaged) != 0;
+
+    /// <summary>The host slab's real length, recorded by the tree when the page is attached
+    /// (<see cref="IPrefixTreePageHost.SnapshotByteLength"/>); 0 = not reported, charge
+    /// <c>PrefixTreeOptions.PageHostBytes</c>. A recurrent family's restore-point page carries
+    /// its running state and every other page only K/V, so the two differ widely.</summary>
+    internal long HostBytes { get; init; }
 }
 
 /// <summary>
@@ -157,6 +163,9 @@ internal interface IPrefixTreePageHost
     bool HoldsSnapshotBytes(KvBlock block);
     int UsedTokens(KvBlock block);
     int RefCount(KvBlock block);
+    /// <summary>Bytes the block's host slab holds, or 0 when unknown (the tree then charges
+    /// <c>PrefixTreeOptions.PageHostBytes</c>, the full block size).</summary>
+    long SnapshotByteLength(KvBlock block) => 0;
 }
 
 /// <summary>A page host that owns nothing: every flag is true and refcounts are tracked locally.</summary>

@@ -144,6 +144,94 @@ public sealed class LoraCatalogTests : IDisposable
         Assert.Empty(LoraCatalog.For("gemma-4-e2b-q8"));
         // No phone or tablet reaches the image model's tier, so none is offered a plug-in.
         Assert.DoesNotContain(ModelCatalog.ForDevice(16), m => m.Id == LoraCatalog.QwenImage);
+        Assert.All(LoraCatalog.QwenImageTurbo, id => Assert.DoesNotContain(ModelCatalog.ForDevice(16), m => m.Id == id));
+    }
+
+    /// <summary>
+    /// Qwen-Image 2.1 Turbo is step-distilled already, and the engine refuses a plug-in that
+    /// brings a second schedule: no speed plug-in applies to a Turbo entry. A plug-in reaches a
+    /// Turbo entry only by naming it (<see cref="CatalogLora.AlsoFor"/>), which is done for the
+    /// style plug-ins a real picture validated there: Film Stills and Grainscape.
+    /// </summary>
+    [Fact]
+    public void ATurboEntryIsOfferedOnlyThePlugInsValidatedOnItAndNeverASpeedOne()
+    {
+        string[] turbos = ModelCatalog.BuiltIn
+            .Where(m => m.Family == CatalogFamily.QwenImage && m.ImageVariant == QwenImageVariant.Turbo).Select(m => m.Id).ToArray();
+        Assert.Equal(turbos, LoraCatalog.QwenImageTurbo);
+        foreach (CatalogLora lora in LoraCatalog.BuiltIn)
+        {
+            foreach (string id in lora.AlsoFor)
+                Assert.Contains(id, turbos);
+            if (lora.Kind == LoraKind.Speed || lora.NeedsModelSteps)
+                Assert.All(turbos, id => Assert.False(lora.AppliesTo(id), $"{lora.Id} must not apply to {id}"));
+        }
+        foreach (string id in turbos)
+        {
+            Assert.Equal(new[] { Film, Grain }, LoraCatalog.For(id).Select(l => l.Id));
+            // What the LoRA sheet lists while that entry is loaded.
+            Assert.Equal(new[] { Film, Grain }, LoraCatalog.Offered(ModelCatalog.Find(id), ModelCatalog.BuiltIn).Select(l => l.Id));
+        }
+        // The base model, a chat model or nothing loaded: every plug-in of an offered model.
+        Assert.Equal(LoraCatalog.BuiltIn, LoraCatalog.Offered(ModelCatalog.Find(LoraCatalog.QwenImage), ModelCatalog.BuiltIn));
+        Assert.Equal(LoraCatalog.BuiltIn, LoraCatalog.Offered(ModelCatalog.Find("gemma-4-e2b-q8"), ModelCatalog.BuiltIn));
+        Assert.Equal(LoraCatalog.BuiltIn, LoraCatalog.Offered(null, ModelCatalog.BuiltIn));
+        Assert.Empty(LoraCatalog.Offered(null, ModelCatalog.ForDevice(16)));
+    }
+
+    [Fact]
+    public void ATurboPictureLeavesTheSpeedPlugInOutAndSaysWhy()
+    {
+        LoraStore store = StoreWith(Viggle, Film, Grain);
+        string turbo = LoraCatalog.QwenImageTurbo[0];
+
+        LoraPlan plan = LoraSelection.Plan(
+            new[] { new ImageLoraChoice(Viggle, 1f), new ImageLoraChoice(Film, 0.7f) }, turbo, store, editing: false, out string? error)!;
+        Assert.Null(error);
+        Assert.Equal(new[] { "Film Stills" }, plan.Names);
+        Assert.Equal(new float?[] { 0.7f }, plan.Specs.Select(s => s.Scale));
+        Assert.Equal("Viggle Turbo sits out: Qwen-Image 2.1 Turbo is step-distilled already", plan.SatOut);
+
+        // Alone, the speed plug-in leaves nothing to apply, and the plan still says why.
+        plan = LoraSelection.Plan(new[] { new ImageLoraChoice(Viggle, 1f) }, turbo, store, editing: false, out error)!;
+        Assert.Null(error);
+        Assert.Empty(plan.Specs);
+        Assert.Equal("Viggle Turbo sits out: Qwen-Image 2.1 Turbo is step-distilled already", plan.SatOut);
+
+        // The base model takes the same choice whole.
+        Assert.Equal(new[] { "Viggle Turbo", "Film Stills" },
+            LoraSelection.Plan(new[] { new ImageLoraChoice(Viggle, 1f), new ImageLoraChoice(Film, 0.7f) },
+                LoraCatalog.QwenImage, store, editing: false, out _)!.Names);
+    }
+
+    [Fact]
+    public void ATurboPictureNamesEveryChosenPlugInNotValidatedThere()
+    {
+        // Turned on while the base model was loaded, then the Turbo entry: the sheet no longer
+        // lists them, and the picture is made without them, so the plan says why for each.
+        const string detail = "qwen-image-2.1-detail-enhancer";
+        const string remover = "qwen-image-2.1-object-remover";
+        LoraStore store = StoreWith(Viggle, Film, detail, remover);
+        var choices = new[]
+        {
+            new ImageLoraChoice(detail, 0.8f), new ImageLoraChoice(Viggle, 1f),
+            new ImageLoraChoice(Film, 0.7f), new ImageLoraChoice(remover, 1f),
+        };
+
+        LoraPlan plan = LoraSelection.Plan(choices, LoraCatalog.QwenImageTurbo[1], store, editing: true, out string? error)!;
+        Assert.Null(error);
+        Assert.Equal(new[] { "Film Stills" }, plan.Names);
+        Assert.Equal("Detail Enhancer sits out: not validated on Qwen-Image 2.1 Turbo; " +
+            "Viggle Turbo sits out: Qwen-Image 2.1 Turbo is step-distilled already; " +
+            "Object Remover sits out: not validated on Qwen-Image 2.1 Turbo", plan.SatOut);
+
+        // Nothing left to apply: still said.
+        plan = LoraSelection.Plan(new[] { new ImageLoraChoice(detail, 0.8f) }, LoraCatalog.QwenImageTurbo[0], store, editing: false, out _)!;
+        Assert.Empty(plan.Specs);
+        Assert.Equal("Detail Enhancer sits out: not validated on Qwen-Image 2.1 Turbo", plan.SatOut);
+
+        // A model that makes no pictures has no plug-ins to name.
+        Assert.Same(LoraPlan.None, LoraSelection.Plan(choices, "gemma-4-e2b-q8", store, editing: true, out _));
     }
 
     // ---- the store ---------------------------------------------------------------------
@@ -265,8 +353,7 @@ public sealed class LoraCatalogTests : IDisposable
             Directory.CreateDirectory(store.DirectoryFor(lora));
             foreach (LoraFile file in lora.Files)
             {
-                using FileStream stream = File.Create(store.PathFor(lora, file));
-                stream.SetLength(file.Bytes);
+                SparseFileFixture.Create(store.PathFor(lora, file), file.Bytes);
             }
         }
         return store;

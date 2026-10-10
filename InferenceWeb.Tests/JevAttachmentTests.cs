@@ -16,27 +16,6 @@ namespace InferenceWeb.Tests;
 [CollectionDefinition("Jev attachment media", DisableParallelization = true)]
 public sealed class JevAttachmentMediaCollection;
 
-/// <summary>Discovery-time gate, so hosts without symlink permission report skipped coverage.</summary>
-public sealed class JevSymlinkFactAttribute : FactAttribute
-{
-    private static readonly Lazy<string?> SkipReason = new(() =>
-    {
-        string directory = Path.Combine(Path.GetTempPath(), "ts-jev-symlink-probe-" + Guid.NewGuid().ToString("N"));
-        try
-        {
-            Directory.CreateDirectory(directory);
-            string target = Path.Combine(directory, "target");
-            File.WriteAllText(target, "probe");
-            File.CreateSymbolicLink(Path.Combine(directory, "link"), target);
-            return null;
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or PlatformNotSupportedException)
-        { return "Requires permission and filesystem support for creating symbolic links."; }
-        finally { try { Directory.Delete(directory, recursive: true); } catch (IOException) { } }
-    });
-    public JevSymlinkFactAttribute() => Skip = SkipReason.Value;
-}
-
 [Collection("Jev attachment media")]
 public sealed class JevAttachmentTests : IDisposable
 {
@@ -103,7 +82,7 @@ public sealed class JevAttachmentTests : IDisposable
         Assert.Contains("missing", (await Assert.ThrowsAsync<JevValidationException>(() => JevAttachmentPreparer.PrepareAsync(request, Storage))).Message);
     }
 
-    [JevSymlinkFact]
+    [SymbolicLinkFact]
     public async Task SymlinkUploadsNeverReachExtraction()
     {
         File.WriteAllText(Path.Combine(_directory, "source.txt"), "refund");

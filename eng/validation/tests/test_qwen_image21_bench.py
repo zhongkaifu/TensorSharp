@@ -119,7 +119,7 @@ class QwenImage21BenchmarkTests(unittest.TestCase):
 
     def test_conditioning_diagnostics_ignore_unused_negative_prompt(self):
         args = SimpleNamespace(prompt="A red cube.", negative_prompt="(blur:1.2)", cfg=1,
-                               image=[], width=1024, height=1024, ts_extra=[], sd_extra=[])
+                               image=[], width=1024, height=1024, ts_extra=[], sd_extra=[], engine="both")
         self.assertEqual(BENCH.comparison_notes(args), [])
         args.cfg = 2
         self.assertTrue(any("prompt-weighting" in note for note in BENCH.comparison_notes(args)))
@@ -127,7 +127,7 @@ class QwenImage21BenchmarkTests(unittest.TestCase):
     def test_edit_diagnostics_distinguish_2k_reference_workload(self):
         args = SimpleNamespace(prompt="Change the cube to blue.", negative_prompt="", cfg=1,
                                image=[Path("reference.png")], width=1024, height=1024,
-                               ts_extra=[], sd_extra=[])
+                               ts_extra=[], sd_extra=[], engine="both")
         notes = BENCH.comparison_notes(args)
         self.assertTrue(any("different filters" in note for note in notes))
         self.assertFalse(any("1 megapixel" in note for note in notes))
@@ -136,6 +136,29 @@ class QwenImage21BenchmarkTests(unittest.TestCase):
         notes = BENCH.comparison_notes(args)
         self.assertTrue(any("1 megapixel" in note for note in notes))
         self.assertTrue(any("Extra arguments" in note for note in notes))
+
+    def test_edit_noise_defaults_match_the_comparison_and_never_guess(self):
+        resolve = BENCH.resolve_edit_noise
+        self.assertIsNone(resolve("t2i", "both", None, None))
+        self.assertEqual(resolve("edit", "both", None, None), "seed")
+        self.assertEqual(resolve("multi", "sd_cpp", None, ""), "seed")
+        self.assertEqual(resolve("edit", "tensorsharp", None, None), "references")
+        # An A/B arm's environment override and an explicit flag both win over the default.
+        self.assertEqual(resolve("edit", "tensorsharp", None, " Seed "), "seed")
+        self.assertEqual(resolve("edit", "both", "references", None), "references")
+        self.assertEqual(resolve("edit", "both", "seed", "seed"), "seed")
+        for mode, requested, inherited in (("edit", "references", "seed"), ("edit", None, "sd"), ("t2i", "seed", None)):
+            with self.subTest(mode=mode, requested=requested, inherited=inherited), self.assertRaises(ValueError):
+                resolve(mode, "both", requested, inherited)
+
+    def test_edit_notes_say_whether_the_engines_shared_noise(self):
+        args = SimpleNamespace(prompt="Change the cube to blue.", negative_prompt="", cfg=1, image=[Path("reference.png")],
+                               width=1024, height=1024, ts_extra=[], sd_extra=[], engine="both", edit_noise="seed")
+        self.assertTrue(any("TS_QWEN21_EDIT_NOISE=seed" in note for note in BENCH.comparison_notes(args)))
+        args.edit_noise = "references"
+        self.assertTrue(any("different noise" in note for note in BENCH.comparison_notes(args)))
+        args.engine = "tensorsharp"
+        self.assertFalse(any("noise" in note for note in BENCH.comparison_notes(args)))
 
     def test_schedule_matches_official_golden_vectors(self):
         # The same independent Diffusers golden vectors are used by
@@ -172,7 +195,7 @@ class QwenImage21BenchmarkTests(unittest.TestCase):
             dotnet="dotnet", cli=Path("TensorSharp.Cli.dll"), backend="ggml_cuda",
             prompt="A red cube on a white table.", width=512, height=1024, steps=40,
             cfg=1, seed=42, sd_cli=Path("sd-cli.exe"), sd_backend="cuda0",
-            match_sigmas=True, sigma_nodes=None, lora=None,
+            match_sigmas=True, sigma_nodes=None, lora=None, variant=None,
             negative_prompt="", image=[], ts_extra=[], sd_extra=[])
         models = {name: Path(filename) for name, filename in BENCH.MODEL_NAMES.items()}
         commands = BENCH.commands(args, models, Path("ts.png"), Path("sd.png"))

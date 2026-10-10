@@ -22,12 +22,19 @@ internal enum QwenImage21SigmaShift
 
 /// <summary>
 /// The sampling contract that comes with a LoRA, typically a step-distillation adapter
-/// trained for a fixed schedule. Explicit host settings (steps, CFG) still win; a step
+/// trained for a fixed schedule, or with a step-distilled checkpoint (Qwen-Image-2.1-Turbo,
+/// <see cref="QwenImage21Turbo"/>). Explicit host settings (steps, CFG) still win; a step
 /// count the recipe has no schedule for is refused rather than silently resampled.
 /// </summary>
 internal sealed class QwenImage21LoraRecipe
 {
     internal string Source { get; init; } = "";
+    /// <summary>What the recipe belongs to, as the subject of a refusal ("... defines schedules
+    /// for"); null for a LoRA plug-in's, which names its config file.</summary>
+    internal string Owner { get; init; }
+    /// <summary>The run's log prefix ahead of <see cref="Describe"/>; null for a LoRA plug-in's,
+    /// which names its config file.</summary>
+    internal string LogLabel { get; init; }
     internal int DefaultSteps { get; init; }
     /// <summary>Sigma nodes per supported step count (without the terminal 0).</summary>
     internal IReadOnlyDictionary<int, float[]> Nodes { get; init; } = new Dictionary<int, float[]>();
@@ -45,7 +52,7 @@ internal sealed class QwenImage21LoraRecipe
     {
         if (!Nodes.TryGetValue(steps, out var nodes))
             throw new ArgumentException(
-                $"The LoRA sampling recipe from {Source} defines schedules for {string.Join(", ", Nodes.Keys.OrderBy(k => k))} " +
+                $"{Owner ?? "The LoRA sampling recipe from " + Source} defines schedules for {string.Join(", ", Nodes.Keys.OrderBy(k => k))} " +
                 $"step(s), not {steps}. Use one of those step counts, or omit --diffusion-steps / \"steps\" to use its default ({DefaultSteps}).");
         var result = new float[steps + 1];
         double mu = 0.5 + (imageTokens - 256) * (0.9 - 0.5) / (8192 - 256);
@@ -58,6 +65,10 @@ internal sealed class QwenImage21LoraRecipe
         result[steps] = 0f;
         return result;
     }
+
+    /// <summary>The line the run logs before denoising.</summary>
+    internal string LogLine(int steps, int imageTokens) =>
+        $"  {LogLabel ?? $"[lora] sampling recipe ({System.IO.Path.GetFileName(Source)})"}: {Describe(steps, imageTokens)}";
 
     internal string Describe(int steps, int imageTokens) =>
         $"{steps} steps on {(Shift == QwenImage21SigmaShift.Dynamic ? "shifted" : "fixed")} sigmas " +

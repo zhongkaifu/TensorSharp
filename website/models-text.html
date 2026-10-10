@@ -298,7 +298,7 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model models/di
   <h2 id="thinking">Thinking / reasoning mode</h2>
   <p>Thinking-capable models (Qwen 3.5/3.6, Qwen 3.8 Flash Next, Gemma 4, GPT OSS, Nemotron-H, DeepSeek V4, DeepSeek V4.1, GLM 5.x, Muse-Glimmer) produce structured chain-of-thought before the final answer. The thinking content is separated from the visible response so the client can show or hide it.</p>
   <ul>
-    <li><strong>Qwen 3.5/3.6 / Nemotron-H</strong> — <code>&lt;think&gt;…&lt;/think&gt;</code> tags.</li>
+    <li><strong>Qwen 3.5/3.6 / Nemotron-H</strong> — <code>&lt;think&gt;…&lt;/think&gt;</code> tags. With thinking off, Nemotron-H Reasoning-128K sometimes reasons past its closed <code>&lt;think&gt;&lt;/think&gt;</code> and closes the block itself. When the close starts within the reply's first 2,048 characters, that text is reported as reasoning, not as the answer; a later close counts as answer text, so the reasoning and the literal <code>&lt;/think&gt;</code> stay in the answer, a known limitation (<a href="https://github.com/zhongkaifu/TensorSharp/blob/main/docs/models/nemotron.md#12-output-parser-and-chat-template">details</a>).</li>
     <li><strong>Qwen 3.8 Flash Next</strong> — the same <code>&lt;think&gt;…&lt;/think&gt;</code> tags and the same switch: with thinking off, the published template renders a closed, empty <code>&lt;think&gt;&lt;/think&gt;</code> block.</li>
     <li><strong>Gemma 4</strong> — <code>&lt;|channel&gt;thought …&lt;channel|&gt;</code> tags.</li>
     <li><strong>GPT OSS</strong> — Harmony format: <code>&lt;|channel|&gt;analysis</code> for thinking, <code>&lt;|channel|&gt;final</code> for the answer.</li>
@@ -313,7 +313,7 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model models/di
   <h2 id="toolcalling">Tool calling / function calling</h2>
   <p>Supported model families can invoke user-defined tools and participate in multi-turn tool-call conversations. Define tools as JSON and pass them via <code>--tools</code> (CLI) or the <code>tools</code> parameter (API). Each supported architecture uses its own wire format, and its output parser extracts calls into structured <code>tool_calls</code>:</p>
   <ul>
-    <li><strong>Nemotron-H</strong> — <code>&lt;tool_call&gt;{"name": …, "arguments": {…}}&lt;/tool_call&gt;</code></li>
+    <li><strong>Nemotron-H</strong> — Reasoning-128K: the Nemotron family convention, <code>&lt;TOOLCALL&gt;[{"name": …, "arguments": {…}}]&lt;/TOOLCALL&gt;</code> (Python-style calls such as <code>[read_file(path="notes.txt")]</code> are accepted too). Nemotron 3 Nano / Omni: <code>&lt;tool_call&gt;</code> with an XML <code>&lt;function=NAME&gt;&lt;parameter=key&gt;</code> body (the JSON form is still accepted).</li>
     <li><strong>Qwen 3.5 / 3.6, Qwen 3.8 Flash Next</strong> — the same <code>&lt;tool_call&gt;</code> block with an XML body: <code>&lt;function=NAME&gt;&lt;parameter=key&gt;value&lt;/parameter&gt;&lt;/function&gt;</code> (the JSON form is still accepted).</li>
     <li><strong>Gemma 4</strong> — <code>&lt;|tool_call&gt;call:function_name{args}&lt;tool_call|&gt;</code></li>
     <li><strong>GPT OSS (Harmony)</strong> — tools declared as a TypeScript namespace; calls emitted on the commentary channel.</li>

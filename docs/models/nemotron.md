@@ -14,9 +14,9 @@
 | Example models | Nemotron-H-8B-Reasoning-128K, Nemotron-H-47B-Reasoning-128K, Nemotron 3 Nano Omni |
 | Modalities | Text, image (Omni-class with `mmproj` loaded). Audio only when an audio companion GGUF carrying the Parakeet tower is loaded (§4.7); otherwise audio is **refused** (HTTP 400 / CLI error with `NemotronModel.AudioInputUnsupportedMessage`): the public Omni GGUFs ship no audio tower, only the RADIO vision tower in the `mmproj` (see §4.6). |
 | Thinking mode | Yes (`<think> ... </think>`) |
-| Tool calling | Yes (`<tool_call>{...}</tool_call>`); eligible for skills, the code tools and server-side [sub-agent delegation](../multi_agent.md) |
+| Tool calling | Yes: Reasoning-128K `<TOOLCALL>[...]</TOOLCALL>` (JSON or Python-style calls), Nemotron 3 Nano / Omni `<tool_call>` with an XML `<function=...>` body (§12); eligible for skills, the code tools and server-side [sub-agent delegation](../multi_agent.md) |
 | Batched / paged forward | **Default ON** — `--no-continuous-batching` forces the per-sequence KV-swap path. Per-slot Mamba2 conv + SSM state pool, paged K/V for attention layers. Optional native batched Mamba2 step kernel (`TS_NEMOTRON_MAMBA2_BATCHED_NATIVE=1`). See §11. |
-| Output parser | `ChatMlOutputParser` |
+| Output parser | `NemotronOutputParser` (a `ChatMlOutputParser`) |
 
 ## Downloads
 
@@ -779,12 +779,20 @@ verify cannot beat plain decoding. Details: [speculative decoding](../speculativ
 
 ## 12. Output parser and chat template
 
-- `ChatMlOutputParser` parses `<think> ... </think>` for chain-of-thought
-  reasoning and `<tool_call>{...}</tool_call>` for tool calls. A JSON list
-  of call objects inside one `<tool_call>` is accepted too (the Reasoning-128K
-  checkpoints' own tool format is a list and they fall back to it), and a
-  body of any other JSON shape yields no call. Such a body used to throw from
-  the parser and abort the streamed HTTP response.
+- `NemotronOutputParser` (a `ChatMlOutputParser`) parses `<think> ... </think>`
+  for chain-of-thought reasoning and tool calls in `<TOOLCALL>...</TOOLCALL>` or
+  `<tool_call>...</tool_call>`. A call body may be a JSON call object, a JSON
+  list of them (the Nemotron convention), the XML `<function=NAME>` /
+  `<parameter=key>` form, or a Python-style list of calls such as
+  `[read_file(path="notes.txt"), shell("wc -l notes.txt")]`
+  (`PythonicToolCalls`). The Reasoning-128K 8B Q4_K_M wrote every call in
+  that Python form, whatever format the prompt asked for. Python calls take
+  literals only, a positional argument binds to the declared parameter at that
+  position, and a body cut off by EOS or the token limit yields no call. An
+  open tag starts a call only when a call body follows it, so reasoning that
+  names the tag stays reasoning. A body of any other shape yields no call.
+  Such a body used to throw from the parser and abort the streamed HTTP
+  response.
 - `response_format` combines with `"think": true`. Thinking on primes
   `<think>\n` after the assistant marker (the Nemotron 3.5 GGUF template does
   the same), so the JSON grammar stays dormant through the reasoning and arms
@@ -823,16 +831,121 @@ verify cannot beat plain decoding. Details: [speculative decoding](../speculativ
     the generation prompt then opens (`<think>\n`) or closes
     (`<think></think>`) the reasoning block. `RenderNemotronHReasoning` adds
     the marker from the request's `think` flag unless the system prompt
-    already carries one. The shipped template has no tool syntax, so tools
-    are declared in the system prompt with the JSON `<tool_call>`
-    convention and tool results come back as a user turn wrapped in
-    `<tool_response>`. These checkpoints used to be rendered as ChatML: the
-    model saw `<|im_start|>` as plain text and answered with `</think>`,
-    invented `<|im_start|>user` turns and `<unk>` loops.
+    already carries one, and puts it at the end of the system section, after
+    the system text and the tool declarations: both thinking modes then
+    render the same system prompt and tools before they differ. Prepended,
+    they diverged at the fifth token, and a warm-up or cached prefix of one
+    mode was useless to the other. The shipped template has no tool syntax,
+    so tools are declared with the Nemotron family's own convention, word for
+    word as NVIDIA's Nemotron templates render it (NVIDIA-Nemotron-Nano-9B-v2,
+    Llama-Nemotron Super v1.5): the declarations in
+    `<AVAILABLE_TOOLS>[...]</AVAILABLE_TOOLS>`, then the instructions to call
+    in `<TOOLCALL>[...]</TOOLCALL>` and to expect results in
+    `<TOOL_RESPONSE>[...]</TOOL_RESPONSE>`. A past call is rendered back as
+    `<TOOLCALL>[...]</TOOLCALL>`, and a turn's tool results go back as one
+    user turn wrapped in `<TOOL_RESPONSE>[...]</TOOL_RESPONSE>`. On the 8B
+    Q4_K_M (two tool tasks, three seeds per arm), behind a 16k-character
+    skills prompt the model called a tool 7 times in 12 with this block and
+    2 in 12 with the Hermes JSON `<tool_call>` block; with only the tools,
+    10 in 12 against 8. After its call the model went on to write a made-up
+    tool response and answer from it, so a turn ends at its first complete
+    call (`ChatProtocol.ToolCallEndsTurn`, `ToolCallTurnEnd`). The family's
+    own parser decides, so a tag named in the reasoning, or a close tag
+    inside a string argument, does not end the turn. The model puts all of a
+    turn's calls in one list inside one tag, so no call is lost. These
+    checkpoints used to be rendered as ChatML: the model saw `<|im_start|>` as
+    plain text and answered with `</think>`, invented `<|im_start|>user` turns
+    and `<unk>` loops.
+  - With thinking off the Reasoning-128K checkpoints sometimes reason anyway,
+    after the closed `<think></think>`, and close the block themselves before
+    the call or the answer. This happened mostly in tool rounds after a tool
+    result. In 98 logged replies of the 8B Q4_K_M, the close came after 320-1878
+    characters of "Okay, the user ..." (median 684), and later the deeper the
+    tool loop. That reasoning and the literal `</think>` used to be
+    shown, and saved, as the answer. The protocol declares this per template
+    (`ChatProtocol.ThinkingOffReplyMayReason`). The pipeline tells every parser
+    of the reply what the prompt ended with, and the parser holds the start of
+    the reply as undecided. A `</think>` makes it reasoning. A complete tool
+    call or the end of the reply makes it the answer. An empty call list
+    (`<TOOLCALL>[]</TOOLCALL>`, in either call tag and in every Nemotron-H
+    template) counts as no call and adds no text. A
+    `</think>` inside a Markdown code block or code span is quoted text, and
+    so is one that starts after the first 2,048 characters. All 98 logged
+    stray closes fall inside that window (95th percentile 1,601). A
+    1,024-character window covered only 79%, and the reasoning it missed still
+    reached held streams. The
+    replay that measures this runs the real parser over logged replies:
+    [`eng/validation/NemotronThinkOffReplay`](../../eng/validation/NemotronThinkOffReplay/README.md).
+    `eng/validation/nemotron-thinkoff-e2e.py` checks a running server end to
+    end.
+  - Known limitation: the window does not cover every reply. Behind
+    TensorAgent's 12-tool system prompt the tool rounds reason longer, and in a
+    live TensorAgent run (8B Q4_K_M, Metal) 4 of 39 stray closes came at
+    2,212-3,064 characters. Once 2,048 characters pass without a close, the
+    parser has decided the reply is the answer, on every path (the Web UI and
+    TensorAgent included), so a later close is kept as the answer's own text.
+    In that run the reasoning and the literal `</think>` reached the answer in
+    2 of 9 thinking-off tool chats.
+  - The Web UI and TensorAgent pages stream undecided text as it arrives. When
+    the close comes, the host sends the reasoning as a `thinking` frame and
+    then the remaining answer as a `replace` frame. Clients that cannot take
+    text back (the OpenAI, Ollama and Responses APIs, and the CLI) receive the
+    undecided text only once it is decided. For an ordinary thinking-off
+    answer, the first character therefore arrives up to 2,048 characters
+    later. Over 104 logged ordinary replies this was a median of 229
+    characters (about 3 s), 90th percentile 1,401 (about 22 s) and at most
+    2,047 (about 37 s at the logged decode rate). Streamed from
+    `/v1/chat/completions` on Metal, a one-sentence answer (190 characters)
+    arrived whole 2.6 s after its first token, a 1,402-character answer 17 s
+    after it, and a 3,362-character answer sent its first 2,053 characters
+    after 27 s and streamed the rest. Thinking-on
+    replies and Nemotron 3 Nano / Omni (ChatML) are never held or taken back.
+  - The window is counted in characters, so the wait grows as decoding slows:
+    2,048 characters are about 500 tokens, which is 100 s at 5 tokens a second
+    (the 47B, or the CPU backend). Before keep-alives, a held stream sent
+    nothing at all in that time, and a proxy's idle timeout (nginx: 60 s)
+    closed it. While text is held, `/v1/chat/completions` and `/v1/responses`
+    now send an SSE comment (`: keep-alive`) every 15 s, and `/api/chat/ollama`
+    sends a chunk with an empty message. The skills and sub-agent loop, which
+    holds the text itself, hands the adapter an empty update for every piece it
+    holds, so the adapter can send them. The CLI writes to a terminal and sends
+    nothing extra. Nothing is sent while the prompt prefills, as before.
+  - The decision reads the reply exactly as it was generated. The transcript and
+    the non-streaming APIs parse a reply whole, while the pages and the SSE APIs
+    parse it as it streams, and both now decide alike. Before, the Markdown rule
+    read the text as shown: around an empty call list the call branch had
+    trimmed line breaks, two fence lines ran together, and the same reply was
+    reasoning in the stream but answer in the transcript, so the follow-up
+    re-prefilled the conversation.
+  - A `response_format` reply with thinking off is shaped by its grammar (or
+    first-token list) from the first token, so it cannot be stray reasoning. It
+    is not parsed as possible reasoning, and a `</think>` inside one of its JSON
+    strings stays there. The pipeline announces no prompt tail for it, and the
+    OpenAI adapter runs no parser over it, as before this template needed one.
+    `/v1/responses` applies no grammar to its `text.format` (the format is asked
+    for in the prompt), so its replies can still open with stray reasoning and
+    are parsed like any other thinking-off reply.
+  - TensorAgent shows an undecided reply as it arrives, so after a GPU fault it
+    cannot tell which part of the shown answer is decided. A turn on such a
+    model starts again from the top instead of being carried on. Carried on,
+    the reasoning was handed to the model as its own answer so far and kept in
+    front of the answer.
+  - The tail of the prompt, not the request's `think` flag, decides where the
+    reply starts. A caller's `{'reasoning': True}` in the system prompt opens
+    the block even when the request has thinking off. The reply is then parsed
+    as reasoning, and the transcript records the `<think>\n` the cache holds.
+    Before, the whole reasoning was the answer, and the next turn re-rendered
+    the history one block short of the cache.
   - **Nemotron 3 Nano / Omni** (and every other `nemotron_h*` template) use
     ChatML (`<|im_start|>` / `<|im_end|>`). Multimodal placeholders include
     `<image>` (later expanded into `<img>` + N + `</img>`) and
-    `<so_embedding>` (audio).
+    `<so_embedding>` (audio). `RenderNemotron` declares tools in the system
+    turn as a `<tools>` block of `<function>` entries and asks for calls as
+    `<tool_call><function=NAME><parameter=key>value</parameter></function></tool_call>`;
+    past calls are rendered back in that form, and consecutive tool results
+    go back in one user turn, each wrapped in `<tool_response>`. These models
+    write one `<tool_call>` per parallel call, so their turns do not end at
+    the first call.
 
 ## 13. Optimization opportunities
 

@@ -707,9 +707,10 @@ namespace TensorSharp.Runtime.Scheduling
             // An explicit client breakpoint (cache_control / prompt_cache_breakpoint)
             // caps both registration and adoption at its block boundary. For a
             // recurrent model the blocks inside a fused round are non-restorable
-            // (they carry the round-end state), so without a real checkpoint at the
-            // marker the marked prefix stays in the index but is never adoptable -
-            // every follow-up request matches it and re-prefills it. Snap the round
+            // (they hold their K/V rows only, no recurrent state), so without a real
+            // checkpoint at the marker the marked prefix stays in the index but is
+            // never adoptable - every follow-up request matches it and re-prefills
+            // it. Snap the round
             // so it ends exactly at the last block boundary the breakpoint admits;
             // the capture then records a genuine checkpoint there and the marked
             // prefix becomes fully restorable.
@@ -870,6 +871,10 @@ namespace TensorSharp.Runtime.Scheduling
         }
         private void CacheFullBlocksForSequence(SequenceState seq)
         {
+            // The sequence stops decoding here, so its newest decode restore point is
+            // final and goes to the prefix cache with the rest (OnBlocksCommitted keeps it
+            // back while a later one may still replace it).
+            seq.HeldDecodeRestoreBlock = -1;
             if (PrefixCachingActive)
                 _radixCache!.CapturePages(seq);
         }

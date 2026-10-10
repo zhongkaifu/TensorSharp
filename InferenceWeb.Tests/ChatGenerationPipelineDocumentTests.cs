@@ -358,9 +358,10 @@ public class ChatGenerationPipelineDocumentTests
                 Attached("Now analyze the replacement.", secondPath),
             };
 
-            // CollectCodeInputFiles intentionally keeps the first meaning of a
-            // workspace name. The path-keyed map therefore authorizes only that exact
-            // source for compaction, never every later upload with the same display name.
+            // CollectCodeInputFiles keeps the first meaning of a workspace name (a later
+            // upload with the same display name is staged under its own, numbered name).
+            // The path-keyed map therefore authorizes only that exact source for
+            // compaction, never every later upload with the same display name.
             List<ChatMessage> compacted = ChatHistoryPreparer.UseFileBackedCsvAttachments(
                 history, Staged((firstPath, "responses.csv")));
 

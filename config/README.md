@@ -161,6 +161,16 @@ how far along it is. See [`auto-download.json`](auto-download.json).
 
 `url` (singular) is accepted as a shorthand for a single-entry `urls`.
 
+Split GGUF models need every shard beside the first. Add the remaining shards
+under the primary download object's `files` array, each with its own `path`,
+`urls` and `sha256`, as in [`qwen3.8-flash-next.json`](qwen3.8-flash-next.json).
+The hosts download every missing shard and emit just one `--model` argument
+pointing to the primary `path`. Cached shards are reused independently. Paths
+inside `files` are relative to the config file, just like the primary path;
+`--model` on the command line skips the entire configured download group.
+Use separate `mmproj` and `draft-model` options for optional companions so they
+can be selected independently of the required shards.
+
 ## Examples in this folder
 
 Every example uses **real, public, ungated** Hugging Face URLs, so the files
@@ -176,6 +186,7 @@ If you already have a file at that `path`, it is used as-is (no download).
 | [`variables.json`](variables.json) | Gemma-4 26B-A4B: model + mmproj + MTP draft | One shared root/repo reused across three related files |
 | [`auto-download.json`](auto-download.json) | Qwen3.5-9B (~8.9 GB) | Auto-download demo using a public GGUF |
 | [`qwen-image-2.1.json`](qwen-image-2.1.json) | Qwen-Image-2.1 Q4_K_M + dedicated VAE + Qwen3-VL-8B + projector | Text-to-image and editing; pinned, checksum-verified downloads |
+| [`qwen-image-2.1-turbo.json`](qwen-image-2.1-turbo.json) | Qwen-Image-2.1-Turbo AD-Q4_K + the same VAE, Qwen3-VL-8B and projector | Text-to-image and editing in 8 steps; declares `"qwen-image-variant": "turbo"`; the companions keep their publishers' file names, so a base-model config pointed at the same folder and names downloads them once for both |
 | [`lora/qwen-image-2.1-*.json`](lora/) | Twelve Qwen-Image-2.1 LoRA plug-ins (each downloads its weights; Fun-Acc also its `pdd_config.json`) | `--lora` plug-ins on top of `qwen-image-2.1.json`: step-distilled 4–8-step recipes, styles and editing skills; see [below](#qwen-image-21-lora-plug-ins-lora) |
 | [`minimax-h3-fl2va.json`](minimax-h3-fl2va.json) | MiniMax-H3 FL2VA: DiT + Qwen3-VL-32B + video VAE + audio VAE (~35.5 GB) | **Video and 32 kHz stereo audio in one packed latent**; text-to-video, image-to-video, first/last frame |
 | [`minimax-h3-ref2va.json`](minimax-h3-ref2va.json) | MiniMax-H3 Ref2VA: DiT + Qwen3-VL-32B + video VAE + audio VAE (~35.4 GB) | The same four networks, reference checkpoint: up to nine stills, clips and soundtracks |
@@ -220,6 +231,7 @@ TensorSharp.Server.Host --config config/gemma-4-26b-a4b.json
 | [`qwen3.5-9b-uncensored-q8.json`](qwen3.5-9b-uncensored-q8.json) | Qwen3.5-9B Uncensored (Q8_0) | Text LLM |
 | [`qwen3.6-27b.json`](qwen3.6-27b.json) | Qwen3.6-27B + vision | Multimodal LLM |
 | [`qwen3.6-35b-a3b.json`](qwen3.6-35b-a3b.json) | Qwen3.6-35B-A3B (MoE) + vision | Multimodal MoE LLM |
+| [`qwen3.8-flash-next.json`](qwen3.8-flash-next.json) | Qwen3.8 Flash Next (UD-Q2_K_XL, three shards) + vision | Multimodal MoE LLM; optional shared MTP head |
 | [`gemma-4-e4b.json`](gemma-4-e4b.json) | Gemma-4 E4B **uncensored** (TrevorJS's community build, Q8_0) + stock unsloth vision projector + AtomicChat MTP draft | Multimodal LLM |
 | [`gemma-4-12b.json`](gemma-4-12b.json) | Gemma-4 12B (QAT) + vision + MTP draft | Multimodal LLM |
 | [`gemma-4-26b-a4b.json`](gemma-4-26b-a4b.json) | Gemma-4 26B-A4B (MoE) + vision + MTP draft | Multimodal MoE LLM |
@@ -236,6 +248,16 @@ Notes:
 
 - **Multimodal** configs load a vision projector, so add `--image photo.png` to ask
   about a picture.
+- **Qwen3.8 Flash Next** downloads about 78.9 GB of weights across three shards
+  and a 0.9 GB BF16 projector. It defaults to `ggml_cuda` with F16 KV; pass
+  `--backend ggml_metal` on Apple Silicon. Expert and PLE paging can keep the
+  resident working set below the download size, with device- and SSD-dependent
+  performance. Pass `--mmproj none` to skip vision. The commented `draft-model`
+  entry enables the separate 2.8 GB shared Q8_0 MTP head on GGML backends;
+  uncomment it to download and use that head. Speculation applies to solo
+  requests prefilling from position zero; retained-prefix and concurrent
+  requests decode plainly. See the [model guide](../docs/models/qwen38-flash-next.md)
+  for supported execution paths and measured limits.
 - **Speculative decoding** is lossless and works on **both** hosts — a key here
   becomes the matching flag, and `TensorSharp.Cli` honours every one of them.
   There is one spelling per option: `"spec"`, `"spec-type"`, `"spec-draft"`,
@@ -270,6 +292,12 @@ Notes:
   alone is ignored with a warning). Add a LoRA plug-in from
   [`lora/`](#qwen-image-21-lora-plug-ins-lora) with `--lora`. See
   [the Qwen-Image-2.1 guide](../docs/models/qwenimage21.md).
+  [`qwen-image-2.1-turbo.json`](qwen-image-2.1-turbo.json) runs the 8-step Turbo
+  checkpoint the same way. Its GGUF has no metadata, so the config declares it with
+  `"qwen-image-variant": "turbo"` (`--qwen-image-variant` on both hosts). Turbo then
+  defaults to its published 8-step schedule at CFG 1, refuses other step counts, and
+  refuses the step-distillation plug-ins of `lora/`. See
+  [the Turbo section](../docs/models/qwenimage21.md#qwen-image-21-turbo).
 - **DiffusionGemma** runs its iterative denoising path on both hosts; on the CLI,
   tune it with `--diffusion-steps` / `--diffusion-seed`. Its `mmproj` entry is the
   Gemma-4 vision tower, loaded straight from the upstream Hugging Face shard

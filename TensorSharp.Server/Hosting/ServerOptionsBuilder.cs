@@ -719,7 +719,8 @@ public static class ServerOptionsBuilder
     /// (<c>--qwen-image-vae</c> / <c>--qwen-image-vl</c> /
     /// <c>--qwen-image-mmproj</c>) into the env vars that
     /// <c>QwenImageModel</c> reads (<c>TS_QWEN_IMAGE_VAE</c> /
-    /// <c>TS_QWEN_IMAGE_TE</c> / <c>TS_QWEN_IMAGE_MMPROJ</c>) and the LoRA plug-ins
+    /// <c>TS_QWEN_IMAGE_TE</c> / <c>TS_QWEN_IMAGE_MMPROJ</c>), the checkpoint
+    /// declaration (<c>--qwen-image-variant</c>, <c>TS_QWEN_IMAGE_VARIANT</c>) and the LoRA plug-ins
     /// (<c>--lora</c> / <c>--lora-scale</c> / <c>--lora-config</c>, published as
     /// <c>TS_LORAS</c>) — the existing
     /// override mechanism for the three networks the qwen_image DiT GGUF does
@@ -753,6 +754,15 @@ public static class ServerOptionsBuilder
             if (TryReadOption(args, ref i, "--qwen-image-mmproj", out string? mmprojOpt))
             {
                 SetQwenImageCompanionEnv("--qwen-image-mmproj", "TS_QWEN_IMAGE_MMPROJ", mmprojOpt);
+                changed = true;
+                continue;
+            }
+            // Which 2.1 checkpoint the DiT GGUF holds (base / turbo): the files carry no
+            // metadata, and Turbo samples its own 8-step schedule. Last one wins.
+            if (TryReadOption(args, ref i, QwenImageVariantFlag.Flag, out string? variantOpt))
+            {
+                Environment.SetEnvironmentVariable(QwenImageVariantFlag.EnvironmentVariable,
+                    QwenImageVariantFlag.Name(QwenImageVariantFlag.Parse(variantOpt, QwenImageVariantFlag.Flag)));
                 changed = true;
                 continue;
             }
@@ -1349,6 +1359,7 @@ public static class ServerOptionsBuilder
             if (TryReadOption(args, ref i, "--qwen-image-vae", out _)
                 || TryReadOption(args, ref i, "--qwen-image-vl", out _)
                 || TryReadOption(args, ref i, "--qwen-image-mmproj", out _)
+                || TryReadOption(args, ref i, QwenImageVariantFlag.Flag, out _)
                 || TryReadOption(args, ref i, "--width", out _)
                 || TryReadOption(args, ref i, "--height", out _)
                 || TryReadOption(args, ref i, LoraCliFlags.LoraFlag, out _)
@@ -1416,7 +1427,7 @@ public static class ServerOptionsBuilder
             "--draft-model",
             "--redis-url",
             "--n-cpu-moe", "--cpu-moe", "--cpu-moe-threads",
-            "--qwen-image-vae", "--qwen-image-vl", "--qwen-image-mmproj",
+            "--qwen-image-vae", "--qwen-image-vl", "--qwen-image-mmproj", QwenImageVariantFlag.Flag,
             "--video-vae", "--video-text-encoder", "--video-dit2", "--audio-vae",
             "--video-width", "--video-height", "--video-steps", "--video-mode",
             "--kv-cache-dtype", "--gpu-device", "--list-gpus", "--help",

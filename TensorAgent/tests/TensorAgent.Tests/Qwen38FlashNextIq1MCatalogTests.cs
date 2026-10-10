@@ -59,12 +59,14 @@ public sealed class Qwen38FlashNextIq1MCatalogTests : IDisposable
         Assert.Equal(907_542_944, projector.Bytes);
         Assert.Equal("2e788f8c511d8093c7b43cb87b2fd7e14228340318057f8fb20c86df2efe2355", projector.Sha256);
         Assert.True(projector.Optional);
-        Assert.Equal(CatalogModalities.Image, model.Modalities);
-        Assert.Equal(4, model.Files.Count);
+        Assert.Equal(CatalogModalities.Image | CatalogModalities.Video, model.Modalities);
+        Assert.Equal(5, model.Files.Count);
         Assert.Equal(74_538_755_776, model.WeightsBytes);
         Assert.Equal(model.WeightsBytes, model.TotalBytes);
-        Assert.Equal(model.WeightsBytes + projector.Bytes, model.TotalBytesWithOptional);
-        Assert.DoesNotContain(model.Files, f => f.Role == CatalogFileRole.Draft);
+        CatalogFile draft = Assert.Single(model.Files, f => f.Role == CatalogFileRole.Draft);
+        Assert.True(draft.Optional);
+        Assert.Equal(ModelCatalog.Find("qwen3.8-flash-next-q2kxl")!.Files.Single(f => f.Role == CatalogFileRole.Draft), draft);
+        Assert.Equal(model.WeightsBytes + projector.Bytes + draft.Bytes, model.TotalBytesWithOptional);
     }
 
     [Fact]
@@ -147,7 +149,8 @@ public sealed class Qwen38FlashNextIq1MCatalogTests : IDisposable
         Assert.False(store.IsFileInstalled(model, projector));
         Assert.Null(store.CompanionPath(model, CatalogFileRole.Projector));
         Assert.Equal(0, store.RemainingBytes(model));
-        Assert.Equal(projector.Bytes, store.RemainingBytes(model, includeOptional: true));
+        Assert.Equal(projector.Bytes, store.RemainingBytes(model, new[] { CatalogFileRole.Projector }));
+        Assert.Equal(model.Files.Where(f => f.Optional).Sum(f => f.Bytes), store.RemainingBytes(model, includeOptional: true));
 
         WriteFile(store, model, projector, projector.Bytes - 1);
         Assert.Equal(InstallState.Installed, store.StateOf(model));
@@ -158,7 +161,9 @@ public sealed class Qwen38FlashNextIq1MCatalogTests : IDisposable
         Assert.Equal(InstallState.Installed, store.StateOf(model));
         Assert.True(store.IsFileInstalled(model, projector));
         Assert.Equal(store.PathFor(model, projector), store.CompanionPath(model, CatalogFileRole.Projector));
-        Assert.Equal(0, store.RemainingBytes(model, includeOptional: true));
+        Assert.Equal(0, store.RemainingBytes(model, new[] { CatalogFileRole.Projector }));
+        Assert.Equal(model.Files.Single(f => f.Role == CatalogFileRole.Draft).Bytes,
+            store.RemainingBytes(model, includeOptional: true));
     }
 
     // Verify the production sizes and hashes above, then use small fixtures to exercise

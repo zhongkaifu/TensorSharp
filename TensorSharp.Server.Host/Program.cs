@@ -202,8 +202,9 @@ try
     specFlagsApplied = ServerOptionsBuilder.ApplySpeculativeCliFlags(args);
     // Translate --qwen-image-vae / --qwen-image-vl / --qwen-image-mmproj into the
     // TS_QWEN_IMAGE_* env vars QwenImageModel reads to locate the Qwen-Image-2.1 VAE,
-    // Qwen3-VL-8B text encoder and mmproj, and --lora / --lora-scale / --lora-config into
-    // TS_LORAS. Must run before the startup model is loaded.
+    // Qwen3-VL-8B text encoder and mmproj, --qwen-image-variant into TS_QWEN_IMAGE_VARIANT,
+    // and --lora / --lora-scale / --lora-config into TS_LORAS. Must run before the startup
+    // model is loaded.
     qwenImageFlagsApplied = ServerOptionsBuilder.ApplyQwenImageCompanionCliFlags(args);
     // Translate --kv-cache-dtype into the process-wide KvCacheDtypeConfig (or honor
     // the KV_CACHE_DTYPE env var) so block-quantized / half-precision KV caches are
@@ -482,10 +483,11 @@ if (moeCpuOffloadFlagsApplied || TensorSharp.Models.MoeCpuOffloadConfig.IsEnable
 if (qwenImageFlagsApplied)
 {
     startupLogger.LogInformation(LogEventIds.HostConfiguration,
-        "Qwen-Image companions configured via CLI: vae={Vae} vl={Vl} mmproj={Mmproj}",
+        "Qwen-Image companions configured via CLI: vae={Vae} vl={Vl} mmproj={Mmproj} variant={Variant}",
         Environment.GetEnvironmentVariable("TS_QWEN_IMAGE_VAE") ?? "(scan)",
         Environment.GetEnvironmentVariable("TS_QWEN_IMAGE_TE") ?? "(scan)",
-        Environment.GetEnvironmentVariable("TS_QWEN_IMAGE_MMPROJ") ?? "(scan)");
+        Environment.GetEnvironmentVariable("TS_QWEN_IMAGE_MMPROJ") ?? "(scan)",
+        Environment.GetEnvironmentVariable(TensorSharp.Runtime.QwenImageVariantFlag.EnvironmentVariable) ?? "(file name)");
     var loras = TensorSharp.Runtime.LoraCliFlags.FromJson(Environment.GetEnvironmentVariable(TensorSharp.Runtime.LoraCliFlags.EnvironmentVariable));
     if (loras.Count > 0)
         startupLogger.LogInformation(LogEventIds.HostConfiguration,

@@ -27,6 +27,7 @@ using TensorSharp.AgentHost.CodeExec;
 using TensorSharp.AgentHost.Skills;
 using TensorSharp.Chat;
 using TensorSharp.GGML;
+using TensorSharp.Runtime;
 using TensorSharp.Runtime.Scheduling;
 using TensorSharp.Server;
 using TensorSharp.Server.Hosting;
@@ -257,6 +258,14 @@ public sealed class AgentAppHost : IDisposable
         // by the stream wrapper below before anything new is submitted. See ComputeGate.
         Compute = new ComputeGate();
         ModelService.EngineHost.ComputeGate = Compute;
+        // An app that leaves the foreground can be ended by the system while it is away,
+        // and that is not a load the process failed to survive (see MarkModelLoadStarted).
+        // A warm-up that runs after the app comes back records itself again.
+        Compute.Changed += open =>
+        {
+            if (!open)
+                MarkModelLoadFinished(null);
+        };
         Sessions = new SessionManager();
         Uploads = new UploadStoragePolicy(paths.UploadsDirectory);
 
@@ -280,6 +289,7 @@ public sealed class AgentAppHost : IDisposable
             CodeRunner!, Workspaces, Artifacts, _loggerFactory,
             WebUiChatService.DefaultArtifactUriPrefix,
             skillRouter: TensorAgentSkillRouter.Route);
+        ImagePlanner = ImageTurns.Planner.For(Chat, Options.UploadDirectory);
 
         // The share contract stays platform-neutral. On iOS the path points into the
         // App Group container; tests use an ordinary temporary directory.
@@ -377,7 +387,7 @@ public sealed class AgentAppHost : IDisposable
             Catalog, Models, Conversations, Settings, DescribeEngine, RaisePageEvent, Downloads,
             onSettingsChanged: ApplySettings, describeModel: DescribeModelState, shares: Shares,
             hasShareContainer: () => ShareInbox is not null, discardShare: DiscardPendingShare,
-            onModelCacheDirectoryChanged: SetModelCacheDirectory);
+            onModelCacheDirectoryChanged: SetModelCacheDirectory, device: Paths.DeviceClass);
         Server.MapLoras(this);
     }
 
@@ -404,6 +414,14 @@ public sealed class AgentAppHost : IDisposable
     public UploadStoragePolicy Uploads { get; }
     public ServerHostingOptions Options { get; }
     public WebUiChatService Chat { get; }
+
+    /// <summary>
+    /// How a picture turn reads the conversation it ends: the uploads the pictures are kept in,
+    /// and the loaded image model as the judge of what a follow-up asks for (see
+    /// <see cref="ImageTurns.Planner"/>). Settable so a test can stand in for the model.
+    /// </summary>
+    internal ImageTurns.Planner ImagePlanner { get; set; }
+
     public ConversationRecorder Recorder { get; }
     public ShareIntake Shares { get; }
     public ShareImporter ShareImports { get; }
@@ -864,19 +882,26 @@ public sealed class AgentAppHost : IDisposable
     /// reuse it without sharing the warm-up's user message or generated token.
     /// </para>
     /// </summary>
-    public void WarmThePrefixCache()
+    public void WarmThePrefixCache() => StartWarmingThePrefixCache(loadGeneration: null, finishesLoadOf: null);
+
+    /// <param name="loadGeneration">The load this warm-up follows; it is dropped if another
+    /// load has begun by the time it would generate. Null: no such check.</param>
+    /// <param name="finishesLoadOf">The model whose in-progress load record this warm-up
+    /// clears when it is over, however it ends.</param>
+    /// <returns>Whether a warm-up was started (and will clear that record itself).</returns>
+    private bool StartWarmingThePrefixCache(int? loadGeneration, string? finishesLoadOf)
     {
         if (!(ModelService.EngineHost.SchedulerConfigOverride ?? SchedulerConfig.FromEnvironment()).EnablePrefixCaching)
         {
             HostLog.LogInformation("not warming the prefix cache: runtime prefix reuse is disabled");
-            return;
+            return false;
         }
         // An image or video model has no system prompt to share and no engine to warm one
         // with; asking it for a token only logs a failure after every load (see ImageTurns).
         if (Chat.LoadedModelMakesImages || Chat.LoadedModelMakesVideo)
         {
             HostLog.LogInformation("not warming the prefix cache: the loaded model makes pictures or video");
-            return;
+            return false;
         }
         // Never beside a turn. The warm-up is opportunistic by definition -- it exists to
         // save the NEXT message a wait -- so contending with a message already being
@@ -886,7 +911,7 @@ public sealed class AgentAppHost : IDisposable
         if (Turns.IsBusy)
         {
             HostLog.LogInformation("not warming the prefix cache: a turn is already using the engine");
-            return;
+            return false;
         }
 
         CancellationTokenSource source;
@@ -926,7 +951,21 @@ public sealed class AgentAppHost : IDisposable
                     HostLog.LogInformation("dropping the prefix-cache warm-up: a turn started while it was waiting");
                     return;
                 }
+                // And a load: the user can pick another model during the settling delay.
+                // That load stops warm-ups, but one armed outside the model lock can begin
+                // after the stop, and its generation would build an engine on the weights
+                // being replaced.
+                if (loadGeneration is { } armedFor
+                    && (armedFor != Volatile.Read(ref _loadGeneration) || ModelLoad != ModelLoadState.Loaded))
+                {
+                    HostLog.LogInformation("dropping the prefix-cache warm-up: another model load has begun");
+                    return;
+                }
                 token.ThrowIfCancellationRequested();
+                // The warm-up's first prefill is part of the load it follows: recorded again
+                // here, in case the app left (and the record was cleared) while it waited.
+                if (finishesLoadOf is not null)
+                    MarkModelLoadStarted(finishesLoadOf);
 
                 // WITH A SESSION, and that is the difference between warming the right
                 // prompt and warming a different one. A request that carries no session
@@ -990,6 +1029,9 @@ public sealed class AgentAppHost : IDisposable
             }
             finally
             {
+                // However it ended, the load it followed is over: the process survived it.
+                if (finishesLoadOf is not null)
+                    MarkModelLoadFinished(finishesLoadOf);
                 // From a task of its own, after this one is out of the way: the rebuild
                 // stops and waits for "the warm-up", which is this very task.
                 if (rebuildAfterwards)
@@ -1003,6 +1045,7 @@ public sealed class AgentAppHost : IDisposable
             if (ReferenceEquals(_warmup, source))
                 _warmupTask = running;
         }
+        return true;
     }
 
     /// <summary>
@@ -1114,7 +1157,40 @@ public sealed class AgentAppHost : IDisposable
     /// what tells a genuine engine fault apart from the one this exists for.
     /// </para>
     /// </summary>
-    private async IAsyncEnumerable<object> GatedChatFrames(
+    /// <summary>How long a turn waits for a model load before going ahead regardless.</summary>
+    internal static TimeSpan ModelLoadAdmissionTimeout { get; set; } = TimeSpan.FromMinutes(3);
+
+    private async Task WaitWhileAModelLoadsAsync(CancellationToken cancellationToken)
+    {
+        if (ModelLoad != ModelLoadState.Loading)
+            return;
+        HostLog.LogInformation("a turn is waiting for the model load to finish");
+        // Only time in front counts: a load does not run while the app is away, and a
+        // user who comes back after ten minutes is not owed a timeout.
+        TimeSpan waited = TimeSpan.Zero;
+        TimeSpan step = TimeSpan.FromMilliseconds(100);
+        while (ModelLoad == ModelLoadState.Loading)
+        {
+            if (waited >= ModelLoadAdmissionTimeout)
+            {
+                // Refused rather than let through: going ahead now is exactly the turn on a
+                // half-loaded model this wait exists to prevent.
+                throw new InvalidOperationException(Loc.T("page.send.modelLoadingUnnamed"));
+            }
+            await Task.Delay(step, cancellationToken).ConfigureAwait(false);
+            if (Compute.IsOpen)
+                waited += step;
+        }
+    }
+
+    /// <summary>
+    /// Test seam: the frames a turn reads in place of <see cref="ImageTurns.FramesFor"/>, so
+    /// the retry logic of <see cref="GatedChatFrames"/> can be driven without a model. Null
+    /// in the app.
+    /// </summary>
+    internal Func<JsonElement, CancellationToken, IAsyncEnumerable<object>>? TurnFrames { get; set; }
+
+    internal async IAsyncEnumerable<object> GatedChatFrames(
         JsonElement body,
         [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken)
     {
@@ -1131,10 +1207,21 @@ public sealed class AgentAppHost : IDisposable
         // What the user has already watched appear. Kept across a retry so the answer
         // can be carried on rather than written again from the top -- see below.
         var written = new System.Text.StringBuilder();
+        // The earlier attempts' text a carried-on attempt continues. That attempt knows
+        // nothing of it, so a `replace` it sends (a DiffusionGemma preview, an answer that
+        // took back text which proved to be reasoning) sets only its own part.
+        string carriedOn = string.Empty;
         JsonElement attemptBody = body;
 
         for (int attempt = 0; ; attempt++)
         {
+            // A message sent while a model is loading waits for the load. The page can
+            // offer Send during a switch: the chat API names the new model as soon as its
+            // weights are in, while its encoders and draft head are still being attached,
+            // and a turn admitted then built its engine on a half-loaded model. Waiting
+            // also means the message is answered by the model the user just chose.
+            await WaitWhileAModelLoadsAsync(cancellationToken).ConfigureAwait(false);
+
             // BEFORE the rebuild, not after. A rebuild unloads the model and frees the
             // backend; doing that while a warm-up is still generating tears the weights
             // out from under a live step. Ordering this after the rebuild protected the
@@ -1170,12 +1257,21 @@ public sealed class AgentAppHost : IDisposable
 
             long closuresAtStart = Compute.Closures;
             bool poisoned = false;
+            // Whether the answer this attempt shows may still be taken back. Nemotron-H
+            // Reasoning-128K can reason past the block its prompt closed, and the page is
+            // shown that text before the `</think>` that says it was reasoning; the gate
+            // cannot tell which part of it is decided. Read before the attempt, from the
+            // model that writes it: after a fault the model may be gone.
+            bool shownAnswerMayBeTakenBack = OutputParserFactory.ThinkingOffReplyMayReason(
+                ModelService.Architecture, ModelService.ChatTemplate);
 
             // Through ImageTurns.FramesFor, not the chat stream directly: this gate
             // REPLACES the route's default frame source, so it has to make the same
             // choice that default makes, or an image model is handed to the text pipeline.
             await using (IAsyncEnumerator<object> frames =
-                ImageTurns.FramesFor(Chat, attemptBody, cancellationToken, PrepareImageTurn).GetAsyncEnumerator(cancellationToken))
+                (TurnFrames?.Invoke(attemptBody, cancellationToken)
+                 ?? ImageTurns.FramesFor(Chat, attemptBody, cancellationToken, PrepareImageTurn, ImagePlanner))
+                .GetAsyncEnumerator(cancellationToken))
             {
                 while (true)
                 {
@@ -1226,11 +1322,7 @@ public sealed class AgentAppHost : IDisposable
                         }
                     }
 
-                    if (TokenIn(frames.Current) is { Length: > 0 } piece)
-                        written.Append(piece);
-                    else if (ReplaceIn(frames.Current) is { } whole)
-                        written.Clear().Append(whole);
-                    yield return frames.Current;
+                    yield return AsShown(frames.Current, carriedOn, written);
                 }
             }
 
@@ -1247,10 +1339,14 @@ public sealed class AgentAppHost : IDisposable
             //
             // Not always, though. A fragment too short to be worth keeping, or one
             // that stops in the middle of a tool call, would make the continuation
-            // harder to produce than the answer; those start cleanly instead.
+            // harder to produce than the answer; those start cleanly instead. So does
+            // an answer that may still prove to be reasoning: carried on, the model
+            // was handed its own reasoning as the answer so far, and the page kept it
+            // in front of every later `replace` -- the leak the retraction removes.
             string soFar = written.ToString();
-            if (CanBeCarriedOn(soFar))
+            if (!shownAnswerMayBeTakenBack && CanBeCarriedOn(soFar))
             {
+                carriedOn = soFar;
                 attemptBody = WithTheAnswerSoFar(body, soFar);
                 yield return new
                 {
@@ -1261,6 +1357,7 @@ public sealed class AgentAppHost : IDisposable
             {
                 attemptBody = body;
                 written.Clear();
+                carriedOn = string.Empty;
                 yield return new
                 {
                     replace = string.Empty,
@@ -1412,6 +1509,40 @@ public sealed class AgentAppHost : IDisposable
 
     /// <summary>The whole-answer text a <c>replace</c> frame sets, or null if the frame is not one.</summary>
     private static string? ReplaceIn(object? frame) => PropertyIn(frame, "replace", ReplaceProperties);
+
+    /// <summary>
+    /// <paramref name="frame"/> as the page must get it, with <paramref name="written"/>
+    /// kept equal to the answer the page shows. A <c>replace</c> sets the whole answer of
+    /// the attempt that sent it, so after a carry-on it gets the earlier attempts' text,
+    /// <paramref name="carriedOn"/>, in front of it.
+    /// </summary>
+    internal static object AsShown(object frame, string carriedOn, System.Text.StringBuilder written)
+    {
+        if (TokenIn(frame) is { Length: > 0 } piece)
+        {
+            written.Append(piece);
+            return frame;
+        }
+        if (ReplaceIn(frame) is not { } whole)
+            return frame;
+        written.Clear().Append(carriedOn).Append(whole);
+        return carriedOn.Length == 0 ? frame : WithReplace(frame, written.ToString());
+    }
+
+    /// <summary>
+    /// The same frame with its <c>replace</c> text swapped for <paramref name="text"/> and
+    /// every other property kept, in order. A dictionary rather than another anonymous
+    /// object, because what else rides on a replace frame depends on who sent it; every
+    /// reader downstream of this gate reads frames as JSON, and a dictionary serializes as
+    /// the same object.
+    /// </summary>
+    internal static object WithReplace(object frame, string text)
+    {
+        var copy = new Dictionary<string, object?>(StringComparer.Ordinal);
+        foreach (System.Reflection.PropertyInfo property in frame.GetType().GetProperties())
+            copy[property.Name] = property.Name == "replace" ? text : property.GetValue(frame);
+        return copy;
+    }
 
     /// <summary>
     /// The error text on a stream frame, or null if it carries none.
@@ -1733,6 +1864,8 @@ public sealed class AgentAppHost : IDisposable
             // next attempt should still try.
             TraceBackground("the recovery reload FAILED: " + ex.Message);
             HostLog.LogWarning(ex, "rebuilding the engine after a GPU fault failed");
+            if (ModelLoad == ModelLoadState.Loading)
+                SetModelLoad(ModelLoadState.Failed, ex.Message);
             return false;
         }
     }
@@ -1796,7 +1929,17 @@ public sealed class AgentAppHost : IDisposable
         if (Interlocked.Exchange(ref _autoLoadStarted, 1) != 0)
             return;
 
+        // Left by the previous process. Kept only while it names the model this launch
+        // would load (see below); one naming anything else is stale.
+        string? unfinishedLoad = ReadUnfinishedLoad();
         AppSettings settings = Settings.Load();
+        if (unfinishedLoad is not null
+            && !string.Equals(unfinishedLoad, settings.SelectedModelId, StringComparison.Ordinal))
+        {
+            ForgetLoadRecord();
+            unfinishedLoad = null;
+        }
+
         if (settings.SelectedModelId is not { Length: > 0 } id)
             return;
 
@@ -1858,6 +2001,23 @@ public sealed class AgentAppHost : IDisposable
             return;
         }
 
+        // The previous process ended while this model was loading or warming up. A model
+        // whose load or first prefill takes the process down would otherwise do it again a
+        // few seconds into every launch, because the choice is saved before the load: the
+        // app would "always crash" and the user would never reach the list to pick another
+        // model. So no launch loads it by itself until the user chooses a model again: the
+        // record stays (a quit or a trip to the background does not clear another
+        // process's record), and the next load the user starts replaces it.
+        if (string.Equals(unfinishedLoad, model.Id, StringComparison.Ordinal))
+        {
+            string reason = Loc.T("host.models.closedWhileLoading", ("model", model.DisplayName));
+            _loggerFactory.CreateLogger("TensorAgent.Host").LogWarning(
+                "the last launch ended while {Model} was loading; not loading it again automatically", model.Id);
+            Console.WriteLine($"TensorAgent: not loading {model.Id} automatically: the last launch ended while it was loading");
+            SetModelLoad(ModelLoadState.Failed, reason);
+            return;
+        }
+
         SetModelLoad(ModelLoadState.Loading, null);
         _ = Task.Run(() =>
         {
@@ -1869,6 +2029,10 @@ public sealed class AgentAppHost : IDisposable
             {
                 _loggerFactory.CreateLogger("TensorAgent.Host")
                     .LogWarning(ex, "the last used model {Model} could not be loaded", model.Id);
+                // Set to Loading above, before UseModel ran: whatever stopped it, the app is
+                // not loading any more.
+                if (ModelLoad == ModelLoadState.Loading)
+                    SetModelLoad(ModelLoadState.Failed, ex.Message);
             }
         });
     }
@@ -2095,6 +2259,11 @@ public sealed class AgentAppHost : IDisposable
     /// <summary>True when the loaded model carries a usable draft head.</summary>
     public bool DraftHeadAttached => ModelService.Model is IDraftHead { HasDraftHead: true };
 
+    /// <summary>Whether the completed load attached the catalog's downloaded draft,
+    /// rather than only a head already embedded in the target weights.</summary>
+    public bool CatalogDraftHeadAttached => _loadedCatalogDraftPath is not null && DraftHeadAttached
+        && ModelService.DraftHeadActivationError is null;
+
     /// <summary>
     /// Switch speculation on or off for the running engine without touching the saved
     /// settings - what the on-device benchmark does between its passes. Returns a
@@ -2118,8 +2287,8 @@ public sealed class AgentAppHost : IDisposable
             ? InstalledDraftPath(loadedModel, Path.GetDirectoryName(ModelService.LoadedModelPath)!)
             : model is null ? null : Models.CompanionPath(model, CatalogFileRole.Draft);
         string note = SpeculationPolicy.PrepareLoad(settings, draftHead);
-        bool draftAttached = SpeculationPolicy.SpeculatesWithDraftHead(
-            draftHead, ModelService.Model is IDraftHead { HasDraftHead: true });
+        bool draftAttached = CatalogDraftHeadAttached
+            && string.Equals(_loadedCatalogDraftPath, draftHead, StringComparison.Ordinal);
         string algorithm = SpeculationPolicy.ChooseAlgorithm(draftAttached);
         bool live = ModelService.EngineHost.UpdateSpeculation(SpeculationOptions.FromEnvironment());
         string account = $"{note}; algorithm {algorithm}; {(live ? "applied to the running engine" : "no engine standing, applies at the next load")}";
@@ -2489,6 +2658,7 @@ public sealed class AgentAppHost : IDisposable
         // buffers they run on.
         StopWarmingThePrefixCacheAndWaitAsync().GetAwaiter().GetResult();
         string? loaded = null;
+        int loadGeneration = 0;
 
         // One load at a time, whoever asked. There are three callers now — the startup
         // load, the Models list, and the device hook — and the startup one takes twenty
@@ -2504,6 +2674,8 @@ public sealed class AgentAppHost : IDisposable
                 return current;
             });
             string weights = Paths.SelectedModelPath(settings);
+            string? projector = Models.CompanionPath(model, CatalogFileRole.Projector);
+            string? draftHead = Models.CompanionPath(model, CatalogFileRole.Draft);
 
             // The model that is asked for is the one already standing: nothing to load.
             // Two callers reach here for the same model at launch -- the startup load of
@@ -2513,6 +2685,8 @@ public sealed class AgentAppHost : IDisposable
             // trusted; a failed one is retried by loading again.
             if (ModelLoad == ModelLoadState.Loaded
                 && string.Equals(ModelService.LoadedModelPath, weights, StringComparison.Ordinal)
+                && string.Equals(ModelService.LoadedMmProjPath, projector, StringComparison.Ordinal)
+                && string.Equals(_loadedCatalogDraftPath, draftHead, StringComparison.Ordinal)
                 && ModelService.LoadedBackend is { Length: > 0 } standing)
             {
                 HostLog.LogInformation("{Model} is already loaded on {Backend}; not loading it again", model.Id, standing);
@@ -2520,168 +2694,194 @@ public sealed class AgentAppHost : IDisposable
             }
             else
             {
-                SetModelLoad(ModelLoadState.Loading, null);
-
-                // Loading is GPU work too -- ggml_metal_init and the load's own warm-up
-                // graph -- and it is refused from the background exactly as a token is.
-                // The startup load begins a few seconds BEFORE UIKit calls the process
-                // active, which on the phone produced a backend poisoned before its first
-                // token: the warm-up failed and the user's first message opened on "backend
-                // is in error state". So a load holds here until the app is in front.
-                // Bounded, because every caller is off the UI thread but the wait must never
-                // become a way for a stuck gate to make "Use" hang for ever.
-                if (!Compute.IsOpen)
+                try
                 {
-                    TraceBackground("holding the model load until the app is in front");
-                    try { Compute.Wait(new CancellationTokenSource(TimeSpan.FromMinutes(2)).Token); }
-                    catch (OperationCanceledException)
+                    // Again, now that this load owns the gate. The load before it armed its
+                    // warm-up AFTER leaving this lock, so a warm-up can have started between
+                    // the stop above and here; it would run its first generation on the
+                    // weights this load is about to unmap. The generation number tells a
+                    // warm-up that is still waiting to start that its model is gone.
+                    StopWarmingThePrefixCacheAndWaitAsync().GetAwaiter().GetResult();
+                    loadGeneration = Interlocked.Increment(ref _loadGeneration);
+                    SetModelLoad(ModelLoadState.Loading, null);
+
+                    // Loading is GPU work too -- ggml_metal_init and the load's own warm-up
+                    // graph -- and it is refused from the background exactly as a token is.
+                    // The startup load begins a few seconds BEFORE UIKit calls the process
+                    // active, which on the phone produced a backend poisoned before its first
+                    // token: the warm-up failed and the user's first message opened on "backend
+                    // is in error state". So a load holds here until the app is in front.
+                    // Bounded, because every caller is off the UI thread but the wait must never
+                    // become a way for a stuck gate to make "Use" hang for ever.
+                    if (!Compute.IsOpen)
                     {
-                        TraceBackground("the app did not come to the front within two minutes; loading anyway");
+                        TraceBackground("holding the model load until the app is in front");
+                        try { Compute.Wait(new CancellationTokenSource(TimeSpan.FromMinutes(2)).Token); }
+                        catch (OperationCanceledException)
+                        {
+                            TraceBackground("the app did not come to the front within two minutes; loading anyway");
+                        }
+                    }
+
+                    if (!File.Exists(weights))
+                    {
+                        var missing = new FileNotFoundException(
+                            Loc.T("host.models.notDownloaded", ("model", model.DisplayName)), weights);
+                        SetModelLoad(ModelLoadState.Failed, missing.Message);
+                        throw missing;
+                    }
+
+                    // A filename existing is not enough: an interrupted optional download can
+                    // leave a truncated destination behind. Only a catalog-size-complete
+                    // projector is safe to hand to the engine. Optional projectors may be
+                    // absent for text-only use; required ones make the install incomplete.
+                    if (model.Projector is { Optional: false } requiredProjector && projector is null)
+                    {
+                        string path = Models.PathFor(model, requiredProjector);
+                        var missing = new FileNotFoundException(
+                            Loc.T("host.models.projectorNotDownloaded", ("model", model.DisplayName)), path);
+                        SetModelLoad(ModelLoadState.Failed, missing.Message);
+                        throw missing;
+                    }
+
+                    // A diffusion entry is several files, and the pipeline looks for a missing one
+                    // by its name: MiniMax-H3 searches the whole model store and would take
+                    // Qwen-Image's text encoder for its own. A half-downloaded set (a relaunch in
+                    // the middle of the download restores the remembered choice) must not load and
+                    // then fail - or worse, not fail - inside the first picture or clip. The same
+                    // holds for a split GGUF: the engine opens the later shards by name and would
+                    // refuse with a FileNotFoundException for a file the user never chose.
+                    if ((model.Kind == CatalogArchitectureKind.Diffusion || model.Files.Count(f => !f.Optional) > 1)
+                        && Models.StateOf(model) != InstallState.Installed)
+                    {
+                        var incomplete = new FileNotFoundException(
+                            Loc.T("host.models.incomplete", ("model", model.DisplayName)), Models.DirectoryFor(model));
+                        SetModelLoad(ModelLoadState.Failed, incomplete.Message);
+                        throw incomplete;
+                    }
+
+                    // Before the load, not after: the engine reads its context length and KV
+                    // dtype when the model is constructed. This is the only funnel for a load
+                    // (startup, the Models list, the device hook all arrive here), which is why
+                    // it is the right place for the budget. See EngineMemoryPolicy for the
+                    // measurements -- this is what stops a pasted document from growing the KV
+                    // cache until jetsam kills the app.
+                    // A load releases the model that is standing, and a turn may be running on
+                    // it: the engine's threads read weights that LoadModel is about to unmap, and
+                    // the request pipeline holds tensors that the model's disposal frees. The
+                    // phone showed the result -- a segmentation fault in managed code the moment
+                    // the second load landed under the first turn. So the turns are stopped
+                    // (recorded as stopped, like the Stop button) and the engine is drained
+                    // before the swap, the same order the host's own shutdown uses.
+                    if (Turns.IsBusy)
+                    {
+                        HostLog.LogWarning("loading {Model} stops the turn in progress", model.Id);
+                        Turns.StopAll();
+                    }
+                    WaitForTheEngineToStop();
+
+                    EngineMemoryPolicy.Apply(model, settings, Paths.DeviceClass);
+
+                    // Every load, not only the one at startup: a diffusion model reads where its
+                    // companions are when it is constructed, and switching from one to another at
+                    // run time used to leave the first one's paths (or none) for the second.
+                    PublishCompanions(model);
+
+                    // Speculative decoding, and the draft head that makes it best: the
+                    // catalog's optional companion, handed to the loader the way the CLI's
+                    // --draft-model is. Before the load for the same reason as the budget.
+                    HostLog.LogInformation("{Model}: {Speculation}", model.Id, SpeculationPolicy.PrepareLoad(settings, draftHead));
+
+                    // The entry's own card values, for the same reason and in the same place.
+                    // CatalogModel.Sampling was written for every entry and read by nothing, so
+                    // every model was sampled at the built-in Ollama-compatible default
+                    // (temperature 0.8, top-k 40, top-p 0.9) whatever its card said -- Gemma 4
+                    // asks for 1.0 / 64 / 0.95 and Qwen for 0.7 / 20 / 0.8. A wrong sampler does
+                    // not fail, it just answers worse, which is the hardest kind of setting to
+                    // notice is inert.
+                    Options.RepointSamplingDefaults(SamplingDefaultsFor(model));
+
+                    Options.RepointHostedModel(weights, projector);
+
+                    // Where this model's shared-prefix checkpoint outlives the process: set BEFORE
+                    // the load, so the engine built for it is born with it, and named by these
+                    // weights, so a file made from other weights of the same shape is never
+                    // restored. The warm-up that follows reads it back instead of prefilling it,
+                    // and a first message sent before the warm-up finds it too.
+                    // Every shard is part of the identity: a re-downloaded later shard of a split
+                    // GGUF must not restore a checkpoint made from the old bytes. A single-file
+                    // entry's identity is unchanged (no shards to add).
+                    string?[] identityFiles = new[] { weights }
+                        .Concat(model.WeightFiles.Where(f => f.Role == CatalogFileRole.WeightsShard)
+                            .Select(f => Path.Combine(Models.DirectoryFor(model), f.FileName)))
+                        .Append(projector)
+                        .ToArray();
+                    ModelService.EngineHost.PrefixCheckpointStore = new PrefixCheckpointFileStore(
+                        Paths.PrefixCheckpointDirectoryFor(model),
+                        PrefixCheckpointFileStore.WeightsIdentityOf(identityFiles),
+                        HostLog);
+
+                    // Recorded before the native load and cleared once the load and its warm-up
+                    // are through (or failed cleanly): a process that dies in between leaves it
+                    // behind, and the next launch does not load this model again by itself.
+                    // See LoadSelectedModelInBackground.
+                    MarkModelLoadStarted(model.Id);
+                    var refusals = new List<string>();
+                    foreach (BackendOption backend in BackendsFor(model))
+                    {
+                        try
+                        {
+                            ModelService.LoadModel(weights, projector, backend.Value);
+                            // The engine is built after this, so the algorithm it reads is
+                            // decided here, from whether the catalog's draft head really
+                            // attached (a head built into the weights file does not count:
+                            // see SpeculationPolicy.SpeculatesWithDraftHead).
+                            bool draftAttached = SpeculationPolicy.SpeculatesWithDraftHead(
+                                draftHead, ModelService.Model is IDraftHead { HasDraftHead: true })
+                                && ModelService.DraftHeadActivationError is null;
+                            string algorithm = SpeculationPolicy.ChooseAlgorithm(draftAttached);
+                            // Also hand it to the engine host: a settings switch flipped while this
+                            // model was loading was remembered with the algorithm chosen before the
+                            // draft head was known, and must not outlive this decision.
+                            ModelService.EngineHost.UpdateSpeculation(SpeculationOptions.FromEnvironment());
+                            if (draftHead is not null && !draftAttached)
+                                HostLog.LogWarning("{Model}: the draft head {File} did not attach ({Reason}); speculating with {Algorithm} instead",
+                                    model.Id, Path.GetFileName(draftHead), ModelService.DraftHeadActivationError ?? "no reason given", algorithm);
+                            _loggerFactory.CreateLogger("TensorAgent.Host").LogInformation(
+                                "using {Model} on {Backend} (speculation: {Algorithm})", model.Id, backend.Value, algorithm);
+                            LogMemory($"after loading {model.Id}");
+                            _loadedCatalogDraftPath = draftAttached ? draftHead : null;
+                            SetModelLoad(ModelLoadState.Loaded, null);
+                            loaded = backend.Value;
+                            break;
+                        }
+                        catch (Exception ex)
+                        {
+                            refusals.Add($"{backend.Value}: {ex.Message}");
+                        }
+                    }
+
+                    if (loaded is null)
+                    {
+                        MarkModelLoadFinished(model.Id);
+                        if (refusals.Count == 0)
+                            refusals.Add(Loc.T("host.models.noGpuForVideo"));
+                        var refused = new InvalidOperationException(
+                            Loc.T("host.models.loadRefused", ("model", model.DisplayName))
+                            + Environment.NewLine + "  " + string.Join(Environment.NewLine + "  ", refusals));
+                        SetModelLoad(ModelLoadState.Failed, refused.Message);
+                        throw refused;
                     }
                 }
-
-                if (!File.Exists(weights))
+                catch (Exception ex) when (ModelLoad == ModelLoadState.Loading)
                 {
-                    var missing = new FileNotFoundException(
-                        Loc.T("host.models.notDownloaded", ("model", model.DisplayName)), weights);
-                    SetModelLoad(ModelLoadState.Failed, missing.Message);
-                    throw missing;
-                }
-
-                // A filename existing is not enough: an interrupted optional download can
-                // leave a truncated destination behind. Only a catalog-size-complete
-                // projector is safe to hand to the engine. Optional projectors may be
-                // absent for text-only use; required ones make the install incomplete.
-                string? projector = Models.CompanionPath(model, CatalogFileRole.Projector);
-                if (model.Projector is { Optional: false } requiredProjector && projector is null)
-                {
-                    string path = Models.PathFor(model, requiredProjector);
-                    var missing = new FileNotFoundException(
-                        Loc.T("host.models.projectorNotDownloaded", ("model", model.DisplayName)), path);
-                    SetModelLoad(ModelLoadState.Failed, missing.Message);
-                    throw missing;
-                }
-
-                // A diffusion entry is several files, and the pipeline looks for a missing one
-                // by its name: MiniMax-H3 searches the whole model store and would take
-                // Qwen-Image's text encoder for its own. A half-downloaded set (a relaunch in
-                // the middle of the download restores the remembered choice) must not load and
-                // then fail - or worse, not fail - inside the first picture or clip. The same
-                // holds for a split GGUF: the engine opens the later shards by name and would
-                // refuse with a FileNotFoundException for a file the user never chose.
-                if ((model.Kind == CatalogArchitectureKind.Diffusion || model.Files.Count(f => !f.Optional) > 1)
-                    && Models.StateOf(model) != InstallState.Installed)
-                {
-                    var incomplete = new FileNotFoundException(
-                        Loc.T("host.models.incomplete", ("model", model.DisplayName)), Models.DirectoryFor(model));
-                    SetModelLoad(ModelLoadState.Failed, incomplete.Message);
-                    throw incomplete;
-                }
-
-                // Before the load, not after: the engine reads its context length and KV
-                // dtype when the model is constructed. This is the only funnel for a load
-                // (startup, the Models list, the device hook all arrive here), which is why
-                // it is the right place for the budget. See EngineMemoryPolicy for the
-                // measurements -- this is what stops a pasted document from growing the KV
-                // cache until jetsam kills the app.
-                // A load releases the model that is standing, and a turn may be running on
-                // it: the engine's threads read weights that LoadModel is about to unmap, and
-                // the request pipeline holds tensors that the model's disposal frees. The
-                // phone showed the result -- a segmentation fault in managed code the moment
-                // the second load landed under the first turn. So the turns are stopped
-                // (recorded as stopped, like the Stop button) and the engine is drained
-                // before the swap, the same order the host's own shutdown uses.
-                if (Turns.IsBusy)
-                {
-                    HostLog.LogWarning("loading {Model} stops the turn in progress", model.Id);
-                    Turns.StopAll();
-                }
-                WaitForTheEngineToStop();
-
-                EngineMemoryPolicy.Apply(model, settings, Paths.DeviceClass);
-
-                // Every load, not only the one at startup: a diffusion model reads where its
-                // companions are when it is constructed, and switching from one to another at
-                // run time used to leave the first one's paths (or none) for the second.
-                PublishCompanions(model);
-
-                // Speculative decoding, and the draft head that makes it best: the
-                // catalog's optional companion, handed to the loader the way the CLI's
-                // --draft-model is. Before the load for the same reason as the budget.
-                string? draftHead = Models.CompanionPath(model, CatalogFileRole.Draft);
-                HostLog.LogInformation("{Model}: {Speculation}", model.Id, SpeculationPolicy.PrepareLoad(settings, draftHead));
-
-                // The entry's own card values, for the same reason and in the same place.
-                // CatalogModel.Sampling was written for every entry and read by nothing, so
-                // every model was sampled at the built-in Ollama-compatible default
-                // (temperature 0.8, top-k 40, top-p 0.9) whatever its card said -- Gemma 4
-                // asks for 1.0 / 64 / 0.95 and Qwen for 0.7 / 20 / 0.8. A wrong sampler does
-                // not fail, it just answers worse, which is the hardest kind of setting to
-                // notice is inert.
-                Options.RepointSamplingDefaults(SamplingDefaultsFor(model));
-
-                Options.RepointHostedModel(weights, projector);
-
-                // Where this model's shared-prefix checkpoint outlives the process: set BEFORE
-                // the load, so the engine built for it is born with it, and named by these
-                // weights, so a file made from other weights of the same shape is never
-                // restored. The warm-up that follows reads it back instead of prefilling it,
-                // and a first message sent before the warm-up finds it too.
-                // Every shard is part of the identity: a re-downloaded later shard of a split
-                // GGUF must not restore a checkpoint made from the old bytes. A single-file
-                // entry's identity is unchanged (no shards to add).
-                string?[] identityFiles = new[] { weights }
-                    .Concat(model.WeightFiles.Where(f => f.Role == CatalogFileRole.WeightsShard)
-                        .Select(f => Path.Combine(Models.DirectoryFor(model), f.FileName)))
-                    .Append(projector)
-                    .ToArray();
-                ModelService.EngineHost.PrefixCheckpointStore = new PrefixCheckpointFileStore(
-                    Paths.PrefixCheckpointDirectoryFor(model),
-                    PrefixCheckpointFileStore.WeightsIdentityOf(identityFiles),
-                    HostLog);
-
-                var refusals = new List<string>();
-                foreach (BackendOption backend in BackendsFor(model))
-                {
-                    try
-                    {
-                        ModelService.LoadModel(weights, projector, backend.Value);
-                        // The engine is built after this, so the algorithm it reads is
-                        // decided here, from whether the catalog's draft head really
-                        // attached (a head built into the weights file does not count:
-                        // see SpeculationPolicy.SpeculatesWithDraftHead).
-                        bool draftAttached = SpeculationPolicy.SpeculatesWithDraftHead(
-                            draftHead, ModelService.Model is IDraftHead { HasDraftHead: true });
-                        string algorithm = SpeculationPolicy.ChooseAlgorithm(draftAttached);
-                        // Also hand it to the engine host: a settings switch flipped while this
-                        // model was loading was remembered with the algorithm chosen before the
-                        // draft head was known, and must not outlive this decision.
-                        ModelService.EngineHost.UpdateSpeculation(SpeculationOptions.FromEnvironment());
-                        if (draftHead is not null && !draftAttached)
-                            HostLog.LogWarning("{Model}: the draft head {File} did not attach ({Reason}); speculating with {Algorithm} instead",
-                                model.Id, Path.GetFileName(draftHead), ModelService.DraftHeadActivationError ?? "no reason given", algorithm);
-                        _loggerFactory.CreateLogger("TensorAgent.Host").LogInformation(
-                            "using {Model} on {Backend} (speculation: {Algorithm})", model.Id, backend.Value, algorithm);
-                        LogMemory($"after loading {model.Id}");
-                        SetModelLoad(ModelLoadState.Loaded, null);
-                        loaded = backend.Value;
-                        break;
-                    }
-                    catch (Exception ex)
-                    {
-                        refusals.Add($"{backend.Value}: {ex.Message}");
-                    }
-                }
-
-                if (loaded is null)
-                {
-                    if (refusals.Count == 0)
-                        refusals.Add(Loc.T("host.models.noGpuForVideo"));
-                    var refused = new InvalidOperationException(
-                        Loc.T("host.models.loadRefused", ("model", model.DisplayName))
-                        + Environment.NewLine + "  " + string.Join(Environment.NewLine + "  ", refusals));
-                    SetModelLoad(ModelLoadState.Failed, refused.Message);
-                    throw refused;
+                    // Every refusal above says Failed before it throws; anything else that
+                    // leaves this load (a settings write on a full disk, a companion that
+                    // could not be published) must not leave the app "Loading" for ever,
+                    // with every message waiting for a load that is no longer running.
+                    MarkModelLoadFinished(model.Id);
+                    SetModelLoad(ModelLoadState.Failed, ex.Message);
+                    throw;
                 }
             }
         }
@@ -2693,13 +2893,129 @@ public sealed class AgentAppHost : IDisposable
         // native fault, on every launch. The comment at the top of this lock already
         // said what happens when two threads are inside the engine's load at once; this
         // was the same mistake wearing a different hat.
-        if (warmAfterwards)
-            WarmThePrefixCache();
+        // Also when the model was already standing: the stop at the top of this method
+        // cancelled its warm-up, which is restarted here as it always was.
+        bool loadedNow = loadGeneration != 0;
+        bool warming = warmAfterwards && StartWarmingThePrefixCache(
+            loadedNow ? loadGeneration : null, finishesLoadOf: loadedNow ? model.Id : null);
+        if (loadedNow && !warming)
+            MarkModelLoadFinished(model.Id);
         StartSpeculationBenchIfRequested();
         return loaded;
     }
 
     private readonly object _modelGate = new();
+
+    /// <summary>
+    /// Counts loads. A warm-up armed for one load checks it before it generates, so a
+    /// warm-up that was still waiting when the user picked another model never runs on
+    /// the next model's half-loaded weights.
+    /// </summary>
+    private int _loadGeneration;
+
+    // ---- a load the process did not survive -------------------------------------
+
+    private string UnfinishedLoadMarkerPath => Path.Combine(Paths.DataRoot, "model-load-in-progress.json");
+
+    /// <summary>
+    /// Record that <paramref name="modelId"/> is being loaded or warmed up, in the
+    /// foreground, right now. Present only while that work runs; a launch that finds it
+    /// knows the previous process ended in the middle of it.
+    /// </summary>
+    private void MarkModelLoadStarted(string modelId)
+    {
+        // Only work the user is watching: an app that is away can be ended by the system
+        // at any moment, and that says nothing about the model. And never once the app is
+        // quitting, which is a deliberate end too.
+        if (_quitting || !Compute.IsOpen)
+            return;
+        lock (_loadMarkerLock)
+        {
+            try
+            {
+                Directory.CreateDirectory(Paths.DataRoot);
+                File.WriteAllText(UnfinishedLoadMarkerPath, JsonSerializer.Serialize(new UnfinishedLoad(modelId)));
+                _loadMarkerOwned = true;
+            }
+            catch (Exception ex)
+            {
+                HostLog.LogDebug(ex, "could not record the load of {Model} as in progress", modelId);
+            }
+        }
+        // The app can leave between the check above and the write; its handler ran first.
+        if (!Compute.IsOpen)
+            MarkModelLoadFinished(null);
+    }
+
+    /// <summary>
+    /// The load (and its warm-up) of <paramref name="modelId"/> is over. Null: whatever
+    /// THIS process is loading. A record left by the previous process is not this
+    /// process's to clear by quitting or leaving the foreground: it is what keeps a
+    /// model that took the app down from being loaded automatically on the next launch
+    /// too, until the user picks a model (see LoadSelectedModelInBackground).
+    /// </summary>
+    private void MarkModelLoadFinished(string? modelId)
+    {
+        lock (_loadMarkerLock)
+        {
+            try
+            {
+                if (modelId is null ? !_loadMarkerOwned
+                    : ReadUnfinishedLoad() is { } marked && !string.Equals(marked, modelId, StringComparison.Ordinal))
+                    return;
+                File.Delete(UnfinishedLoadMarkerPath);
+                _loadMarkerOwned = false;
+            }
+            catch (Exception ex)
+            {
+                HostLog.LogDebug(ex, "could not clear the in-progress load record");
+            }
+        }
+    }
+
+    private void ForgetLoadRecord()
+    {
+        lock (_loadMarkerLock)
+        {
+            try { File.Delete(UnfinishedLoadMarkerPath); }
+            catch (Exception ex) { HostLog.LogDebug(ex, "could not clear the in-progress load record"); }
+            _loadMarkerOwned = false;
+        }
+    }
+
+    /// <summary>
+    /// The app is being quit: whatever this process was loading or warming up, it did not
+    /// take the process down. Called before the quit can end in <c>_exit</c>, which skips
+    /// <see cref="Dispose"/>; nothing is recorded after this.
+    /// </summary>
+    public void ForgetModelLoadInProgress()
+    {
+        _quitting = true;
+        MarkModelLoadFinished(null);
+    }
+
+    private readonly object _loadMarkerLock = new();
+    private volatile bool _loadMarkerOwned;
+    private volatile bool _quitting;
+
+    private string? ReadUnfinishedLoad()
+    {
+        try
+        {
+            if (!File.Exists(UnfinishedLoadMarkerPath))
+                return null;
+            return JsonSerializer.Deserialize<UnfinishedLoad>(File.ReadAllText(UnfinishedLoadMarkerPath))?.ModelId;
+        }
+        catch (Exception)
+        {
+            return null;
+        }
+    }
+
+    private sealed record UnfinishedLoad(string ModelId);
+    // Companion identity belongs to the completed load. A projector or draft downloaded
+    // later must reload even when the selected weights path has not changed.
+    private string? _loadedCatalogDraftPath;
 
     /// <summary>
     /// What <see cref="WaitForTheEngineToStop"/> polls, and the only thing that decides
@@ -2994,6 +3310,9 @@ public sealed class AgentAppHost : IDisposable
     {
         Shares.Acknowledging -= OnShareAcknowledged;
         StopMemoryTrace();
+        // Leaving on purpose, even in the middle of a load, is not a load the process
+        // failed to survive.
+        ForgetModelLoadInProgress();
 
         // Before the turns are asked to stop, because a turn parked on a closed gate --
         // and an engine step loop parked on it -- is not running and cannot notice that

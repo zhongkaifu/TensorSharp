@@ -55,7 +55,7 @@ internal sealed class PrefixTreeOptions
     public required PrefixCacheCapabilities Capabilities { get; init; }
     public int BlockSize { get; init; } = 256;
     public int ContextLength { get; init; } = int.MaxValue;
-    public long PageHostBytes { get; init; }                           // A1 slab bytes per page (ComputeBlockByteSize)
+    public long PageHostBytes { get; init; }                           // A1 slab bytes per page (ComputeBlockByteSize) when the host reports no slab length
     public long EngineSerial { get; init; }
     public int PublicMax { get; init; } = 4;                           // TS_PREFIX_CHECKPOINTS_MAX
     public int ScopedEndStateLeavesMax { get; init; } = 4;             // TS_RETAINED_FUSED_CACHE_MAX; 0 = unlimited
@@ -396,6 +396,7 @@ internal sealed class PrefixTree
         if (best.IsValid && ResumabilityRules.IsClone(best.Mode) && best.Length < _options.MinCloneTokens)
         {
             clamps |= ClampReasons.CloneCost;
+            ClampSlot(plan, best.Kind) |= ClampReasons.CloneCost;
             SetDecline(plan, best.Kind, SourceDecline.CloneCost);
             // The next candidate that is not a clone. C is never it: C exists only when longer than A and B,
             // so a valid C is always the best, and a best that is a clone is excluded.
@@ -407,6 +408,7 @@ internal sealed class PrefixTree
         if (best.IsValid && Caps.MmReuseMinTokens > 0 && best.Length < Caps.MmReuseMinTokens && HasSpanAtOrAfter(r.Spans, best.Length))
         {
             clamps |= ClampReasons.MmThreshold;
+            ClampSlot(plan, best.Kind) |= ClampReasons.MmThreshold;
             SetDecline(plan, best.Kind, SourceDecline.MmThreshold);
             best = default;
         }
@@ -468,6 +470,14 @@ internal sealed class PrefixTree
         if (kind == CandidateKind.PrimaryResident) return ref plan.PrimaryDecline;
         if (kind == CandidateKind.Pages) return ref plan.PageDecline;
         return ref plan.TruncationDecline;
+    }
+
+    private static ref ClampReasons ClampSlot(MatchPlan plan, CandidateKind kind)
+    {
+        if (kind == CandidateKind.EndState) return ref plan.EndStateClamps;
+        if (kind == CandidateKind.PrimaryResident) return ref plan.PrimaryClamps;
+        if (kind == CandidateKind.Pages) return ref plan.PageClamps;
+        return ref plan.TruncationClamps;
     }
 
     private static void SetDecline(MatchPlan plan, CandidateKind kind, SourceDecline decline) => DeclineSlot(plan, kind) = decline;
@@ -538,9 +548,13 @@ internal sealed class PrefixTree
                 SetDeclineIfNone(plan, primary ? CandidateKind.PrimaryResident : CandidateKind.EndState, SourceDecline.NotPermitted);
                 continue;
             }
-            if (Rules.ClampLength(length, r, ref clamps) != length)
+            ClampReasons local = ClampReasons.None;
+            if (Rules.ClampLength(length, r, ref local) != length)
             {
-                SetDeclineIfNone(plan, primary ? CandidateKind.PrimaryResident : CandidateKind.EndState, SourceDecline.Clamped);
+                CandidateKind declined = primary ? CandidateKind.PrimaryResident : CandidateKind.EndState;
+                clamps |= local;
+                ClampSlot(plan, declined) |= local;
+                SetDeclineIfNone(plan, declined, SourceDecline.Clamped);
                 continue;
             }
             if (primary)
@@ -578,6 +592,7 @@ internal sealed class PrefixTree
         int blockSize = _options.BlockSize;
         Candidate best = default;
         bool sawPage = false, sawReadable = false;
+        ClampReasons pageClamps = ClampReasons.None;
         for (int t = 0; t < plan.TrailEnds.Count; t++)
         {
             int pathLen = CollectPath(plan, plan.TrailEnds[t]);
@@ -606,8 +621,8 @@ internal sealed class PrefixTree
                             || !Rules.RouteCanRead(page.Store, mode, r.Route))
                         { stop = true; break; }
                         sawReadable = true;
-                        if (!Rules.PageInWindow(pageEnd)) { clamps |= ClampReasons.Window; stop = true; break; }
-                        if (Rules.PageEndResumable(page) && Rules.ClampLength(pageEnd, r, ref clamps) == pageEnd)
+                        if (!Rules.PageInWindow(pageEnd)) { pageClamps |= ClampReasons.Window; stop = true; break; }
+                        if (Rules.PageEndResumable(page) && Rules.ClampLength(pageEnd, r, ref pageClamps) == pageEnd)
                             usable = pageEnd;
                         p++;
                     }
@@ -625,6 +640,8 @@ internal sealed class PrefixTree
                     best = cand;
             }
         }
+        clamps |= pageClamps;
+        plan.PageClamps |= pageClamps;
         if (!best.IsValid)
             plan.PageDecline = !sawPage ? SourceDecline.Absent : !sawReadable ? SourceDecline.RouteUnreadable : SourceDecline.Clamped;
         else
@@ -662,6 +679,7 @@ internal sealed class PrefixTree
             int target = Rules.ClampAligned(structural, r, Caps.TruncationGranularity, ref local);
             if (target <= bestSoFar || target <= 0) continue;
             clamps |= local;
+            plan.TruncationClamps |= local;
             considered = true;
             int head = 0, tail = 0, visited = 0;
             EnsureBfs(1);
@@ -714,6 +732,7 @@ internal sealed class PrefixTree
         if (!Rules.RewindWithinCap(d.Depth, target))
         {
             clamps |= ClampReasons.RewindCap;
+            plan.TruncationClamps |= ClampReasons.RewindCap;
             SetDeclineIfNone(plan, CandidateKind.TruncatedEndState, SourceDecline.Clamped);
             return default;
         }
@@ -1297,6 +1316,10 @@ internal sealed class PrefixTree
                 Counters.PagesDuplicate++;
                 continue;
             }
+            // Charge the slab's real length where the host knows it: a recurrent family's
+            // page holds its running state only at a restore point, so pages differ ~25x.
+            long slabBytes = page.HasA1 ? _pages.SnapshotByteLength(page.Block) : 0;
+            if (slabBytes > 0) page = page with { HostBytes = slabBytes };
             _pages.RetainPage(page.Block);
             ResourceVector before = ProtectedOf(owner);
             owner.AddPage(page);
@@ -2060,10 +2083,12 @@ internal sealed class PrefixTree
 
     // ------------------------------------------------------------------ internals: accounting, lists, tiers
 
-    private ResourceVector PageBytes(in PageRef page)
+    /// <summary>What one page charges: a pool page, and for a host slab its bytes - the length
+    /// recorded when it was attached, or the full block size when the host did not report one.</summary>
+    internal ResourceVector PageBytes(in PageRef page)
     {
         var v = new ResourceVector { PoolPages = 1 };
-        if (page.HasA1) v.HostKv = _options.PageHostBytes;
+        if (page.HasA1) v.HostKv = page.HostBytes > 0 ? page.HostBytes : _options.PageHostBytes;
         return v;
     }
 

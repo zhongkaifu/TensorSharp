@@ -99,20 +99,39 @@ static partial class Cases
 
     public static async Task EngineShrinkingBudget()
     {
-        var budget = new MemoryBudget(new[] { new MemoryCharge("ram", 100) });
-        using var occupied = budget.Reserve(new[] { new MemoryCharge("ram", 50) });
-        using var model = new SnapshotEngineModel();
-        using var engine = new InferenceEngine(model, new SchedulerConfig { BlockSize = 8,
-            EnablePrefixCaching = false,
-            MemoryAdmission = new(budget, _ => new[] { new MemoryCharge("ram", 80) }) });
-        var seq = MemorySequence("shrunk");
-        var handle = engine.SubmitRequest(seq);
-        await AwaitCondition(() => engine.WaitingCount == 1);
-        Check.True(budget.TrySetCapacity("ram", 50));
-        await Check.ThrowsAsync<MemoryPressureException>(() => handle.Completion.WaitAsync(TimeSpan.FromSeconds(5)));
-        Check.Equal(SequenceStatus.FinishedError, seq.Status);
-        Check.Equal(0, engine.WaitingCount);
-        Check.Equal(0, model.Extractions);
+        foreach (bool shrinkDuringReclamation in new[] { true, false })
+        {
+            var budget = new MemoryBudget(new[] { new MemoryCharge("ram", 100) });
+            using var occupied = budget.Reserve(new[] { new MemoryCharge("ram", 50) });
+            using var model = new SnapshotEngineModel();
+            int shrinks = 0;
+            if (shrinkDuringReclamation)
+                model.BeforeTrim = () =>
+                {
+                    // Schedule has already found the peak possible but blocked.
+                    // Pulse the old signal before the worker captures a fresh one.
+                    model.BeforeTrim = null;
+                    Check.True(budget.TrySetCapacity("ram", 50));
+                    Interlocked.Increment(ref shrinks);
+                };
+            using var engine = new InferenceEngine(model, new SchedulerConfig { BlockSize = 8,
+                EnablePrefixCaching = false,
+                MemoryAdmission = new(budget, _ => new[] { new MemoryCharge("ram", 80) }) });
+            var seq = MemorySequence("shrunk");
+            var handle = engine.SubmitRequest(seq);
+            if (!shrinkDuringReclamation)
+            {
+                await AwaitCondition(() => engine.WaitingCount == 1);
+                Check.True(budget.TrySetCapacity("ram", 50));
+            }
+            await Check.ThrowsAsync<MemoryPressureException>(() => handle.Completion.WaitAsync(TimeSpan.FromSeconds(5)));
+            Check.Equal(shrinkDuringReclamation ? 1 : 0, Volatile.Read(ref shrinks));
+            Check.Equal(SequenceStatus.FinishedError, seq.Status);
+            Check.Equal(0, engine.WaitingCount);
+            Check.Equal(0, model.ForwardCalls);
+            Check.Equal(0, model.Extractions);
+            Check.Equal(50L, budget.Snapshot().Single().Reserved);
+        }
     }
 
     public static async Task EngineReleaseRecovery()
@@ -347,6 +366,7 @@ sealed class SnapshotEngineModel : IModelArchitecture, IBatchedPagedModel
     public int PartialExtractions;
     public Dictionary<string, int> FullCaptureCounts { get; } = new();
     public Action? BeforeForward;
+    public Action? BeforeTrim;
     public int ForwardCalls;
     public int ReleaseFailuresRemaining;
     public int ReleaseAttempts;
@@ -375,6 +395,7 @@ sealed class SnapshotEngineModel : IModelArchitecture, IBatchedPagedModel
         return result;
     }
     public void ResetKVCache() => _history.Clear();
+    public void TrimIdleMemory() => BeforeTrim?.Invoke();
     public void TruncateKVCache(int count) => _history.RemoveRange(count, _history.Count - count);
     public long ComputeKVBlockByteSize(int tokenCount) => tokenCount * sizeof(int);
     public bool TryExtractKVBlock(int startToken, int tokenCount, Span<byte> destination)

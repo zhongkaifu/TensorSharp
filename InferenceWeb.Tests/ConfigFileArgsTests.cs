@@ -116,6 +116,8 @@ public class ConfigFileArgsTests : IDisposable
         "cpu-moe", "n-cpu-moe", "cpu-moe-threads",
         "spec", "no-spec", "spec-type", "spec-draft", "spec-pmin", "draft-model",
         "qwen-image-vae", "qwen-image-vl", "qwen-image-mmproj",
+        // Which Qwen-Image-2.1 checkpoint the GGUF holds (QwenImageVariantFlag), same spelling on the CLI.
+        "qwen-image-variant",
         "video-vae", "video-text-encoder", "video-dit2", "audio-vae",
         "video-width", "video-height", "video-steps", "video-mode", "video-frames", "fps",
         "width", "height",
@@ -173,7 +175,7 @@ public class ConfigFileArgsTests : IDisposable
         string configDir = Path.Combine(repoRoot, "config");
         if (!Directory.Exists(configDir)) return;
 
-        var understood = new HashSet<string>(StringComparer.Ordinal) { "path", "url", "urls", "sha256" };
+        var understood = new HashSet<string>(StringComparer.Ordinal) { "path", "url", "urls", "sha256", "files" };
 
         foreach (string path in Directory.GetFiles(configDir, "*.json"))
         {
@@ -183,18 +185,21 @@ public class ConfigFileArgsTests : IDisposable
                 if (option.Value.ValueKind != JsonValueKind.Object) continue;
                 if (IsReserved(option.Name)) continue;
 
-                string where = $"config/{Path.GetFileName(path)} option {Quote(option.Name)}";
-                foreach (JsonProperty field in option.Value.EnumerateObject())
+                foreach ((string key, JsonElement entry) in DownloadEntries(option.Name, option.Value))
                 {
-                    Assert.True(
-                        understood.Contains(field.Name),
-                        $"{where} has field {Quote(field.Name)}, which ConfigFileArgs does not read "
-                        + "-- a download entry is { path, urls[, sha256] }.");
-                }
+                    string where = $"config/{Path.GetFileName(path)} option {Quote(key)}";
+                    foreach (JsonProperty field in entry.EnumerateObject())
+                    {
+                        Assert.True(
+                            understood.Contains(field.Name),
+                            $"{where} has field {Quote(field.Name)}, which ConfigFileArgs does not read "
+                            + "-- a download entry is { path, urls[, sha256, files] }.");
+                    }
 
-                Assert.True(
-                    option.Value.TryGetProperty("urls", out _) || option.Value.TryGetProperty("url", out _),
-                    $"{where} names no urls, so it cannot download on a machine that lacks the file.");
+                    Assert.True(
+                        entry.TryGetProperty("urls", out _) || entry.TryGetProperty("url", out _),
+                        $"{where} names no urls, so it cannot download on a machine that lacks the file.");
+                }
             }
         }
     }
@@ -277,22 +282,40 @@ public class ConfigFileArgsTests : IDisposable
             {
                 if (option.Value.ValueKind != JsonValueKind.Object || IsReserved(option.Name)) continue;
 
-                string where = $"config/{Path.GetFileName(path)} option {Quote(option.Name)}";
-                Assert.True(
-                    option.Value.TryGetProperty("sha256", out JsonElement sha)
-                    && sha.ValueKind == JsonValueKind.String
-                    && Sha256Hex.IsMatch(sha.GetString()),
-                    $"{where} has no lowercase-hex \"sha256\", so a download is trusted unchecked.");
-
-                foreach (string url in DownloadUrls(option.Value))
+                foreach ((string key, JsonElement entry) in DownloadEntries(option.Name, option.Value))
                 {
-                    string resolved = ResolveVariables(url, variables);
+                    string where = $"config/{Path.GetFileName(path)} option {Quote(key)}";
                     Assert.True(
-                        PinnedHuggingFaceUrl.IsMatch(resolved),
-                        $"{where} downloads {resolved}, which is not pinned to a full commit "
-                        + "(https://huggingface.co/<owner>/<repo>/resolve/<40-hex commit>/<file>).");
+                        entry.TryGetProperty("sha256", out JsonElement sha)
+                        && sha.ValueKind == JsonValueKind.String
+                        && Sha256Hex.IsMatch(sha.GetString()),
+                        $"{where} has no lowercase-hex \"sha256\", so a download is trusted unchecked.");
+
+                    foreach (string url in DownloadUrls(entry))
+                    {
+                        string resolved = ResolveVariables(url, variables);
+                        Assert.True(
+                            PinnedHuggingFaceUrl.IsMatch(resolved),
+                            $"{where} downloads {resolved}, which is not pinned to a full commit "
+                            + "(https://huggingface.co/<owner>/<repo>/resolve/<40-hex commit>/<file>).");
+                    }
                 }
             }
+        }
+    }
+
+    private static IEnumerable<(string Key, JsonElement Entry)> DownloadEntries(string key, JsonElement entry)
+    {
+        Assert.Equal(JsonValueKind.Object, entry.ValueKind);
+        yield return (key, entry);
+        if (!entry.TryGetProperty("files", out JsonElement files)) yield break;
+        Assert.Equal(JsonValueKind.Array, files.ValueKind);
+        int index = 0;
+        foreach (JsonElement file in files.EnumerateArray())
+        {
+            foreach (var child in DownloadEntries($"{key}.files[{index}]", file))
+                yield return child;
+            index++;
         }
     }
 

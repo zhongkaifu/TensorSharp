@@ -58,6 +58,11 @@ internal sealed class FakePageHost : IPrefixTreePageHost
     public bool HoldsSnapshotBytes(KvBlock block) => _flags[block].Snapshot;
     public int UsedTokens(KvBlock block) => _flags[block].Used;
     public int RefCount(KvBlock block) => _refs[block];
+
+    /// <summary>Real slab lengths to report per block; a block without one reports 0
+    /// (unknown), and the tree charges the configured full page size.</summary>
+    internal readonly Dictionary<KvBlock, long> SlabBytes = new(ReferenceEqualityComparer.Instance);
+    public long SnapshotByteLength(KvBlock block) => SlabBytes.TryGetValue(block, out long bytes) ? bytes : 0;
 }
 
 /// <summary>A validator whose refusals the test controls.</summary>

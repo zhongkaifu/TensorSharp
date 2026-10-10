@@ -39,6 +39,7 @@ TensorSharp 使用 GGUF 格式模型文件。以下是各架构对应的已核�
 | Qwen-Image-2.1 | 专用 2.1 VAE（必需） | [Comfy-Org/Qwen-Image-2.1](https://huggingface.co/Comfy-Org/Qwen-Image-2.1/tree/main/vae) 中的 `vae/qwen_image_2.1_vae_bf16.safetensors`——放在 DiT 旁，或用 `--qwen-image-vae` / `TS_QWEN_IMAGE_VAE` 指定 |
 | Qwen-Image-2.1 | Qwen3-VL-8B 文本编码器（必需） | [Qwen/Qwen3-VL-8B-Instruct-GGUF](https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct-GGUF) 中的 `Qwen3VL-8B-Instruct-Q4_K_M.gguf`——放在 DiT 旁，或用 `--qwen-image-vl` / `TS_QWEN_IMAGE_TE` 指定 |
 | Qwen-Image-2.1 | 编辑用视觉编码器 | 同一 Qwen3-VL 仓库中的 `mmproj-Qwen3VL-8B-Instruct-F16.gguf`——放在 DiT 旁，或用 `--qwen-image-mmproj` / `TS_QWEN_IMAGE_MMPROJ` 指定 |
+| Qwen-Image-2.1-Turbo | 扩散 Transformer，8 步蒸馏版（即 `--model` GGUF） | [AtomicChat/Qwen-Image-2.1-Turbo-GGUF](https://huggingface.co/AtomicChat/Qwen-Image-2.1-Turbo-GGUF)，文件 `Qwen-Image-2.1-Turbo-AD-Q4_K.gguf`（4.20 GB）；`Qwen-Image-2.1-Turbo-Q8_0.gguf`（7.59 GB）是最接近全精度的 Transformer（文本编码器仍是同一个 Q4_K_M）。[`config/qwen-image-2.1-turbo.json`](config/qwen-image-2.1-turbo.json) 以固定修订版本与 SHA-256 把 AD-Q4_K 下载到模型根目录下的 `qwen-image-2.1/`，VAE、文本编码器与 mmproj 使用上面列出的发布文件名，因此已存有这些文件的目录只需下载 Transformer。GGUF 不含元数据，因此配置文件声明了检查点（`--qwen-image-variant turbo`）。详见 [qwenimage21_zh-cn.md](docs/models/qwenimage21_zh-cn.md#qwen-image-21-turbo) |
 | Qwen-Image-2.1 | LoRA 插件（可选） | [`config/lora/`](config/lora/) 中的十二个插件，用 `--lora` 加载；每个插件在首次使用时以固定修订版本与 SHA-256 从 Hugging Face 下载其 `.safetensors`，保存到模型根目录下的 `qwen-image-2.1/loras/`（Fun-Acc 还会下载它转交的 `pdd_config.json`）。包括步数蒸馏适配器（Viggle Turbo、Pruna 8/5 步、阿里巴巴 PAI Fun-Acc 4 步）以及风格 / 编辑 LoRA；其中数个仅限非商业用途。见 [USAGE_zh-cn.md](USAGE_zh-cn.md#qwen-image-21-lora-插件) |
 | MiniMax-H3 音视频生成 | 去噪器（`--model` GGUF） | **两个独立的 checkpoint，不是开关**——加载哪一个决定了它接受什么条件输入。[unsloth/MiniMax-H3-GGUF](https://huggingface.co/unsloth/MiniMax-H3-GGUF)：`minimax_h3_fl2va_pruned-Q4_K.gguf`（10.64 GiB）用于文生视频 / 图生视频 / 首尾帧，`minimax_h3_ref2va_pruned-Q4_K.gguf`（10.60 GiB）用于身份与外观参考。另有 Q8_0（19.97 GiB）到 Q2_K（6.26 GiB）。H3 是 CFG 蒸馏模型：**CFG 必须为 1.0**（默认值）；当前默认 20 步，4–8 步是以质量换速度的选择。这些 GGUF **完全没有元数据**，TensorSharp 靠张量表识别它们，并从文件名读出分区——重命名或重新量化时请保留 `fl2va` / `ref2va`。两个 checkpoint 共用下面三个网络，所以事后再加另一个只需下它自己的约 10.6 GiB。TensorAgent 的桌面目录（32 GB 档位）会自己下载整套带哈希校验的文件（含分词器），分为 `minimax-h3-fl2va-q4k` 与 `minimax-h3-ref2va-q4k` 两个条目；后安装的那个直接链接已有的 24.0 GB 共用文件而不重新下载，只下载自己的去噪器。见 [minimax-h3_zh-cn.md](docs/models/minimax-h3_zh-cn.md#在-tensoragent-mac-应用里) |
 | MiniMax-H3 音视频生成 | Qwen3-VL-32B 文本编码器（必需） | 同仓库：`qwen3vl_32b_minimax_h3-Q4_K_M.gguf`（16.97 GiB），或 `-Q2_K_M.gguf`（12.20 GiB）以搭配最小的那几个去噪器。截断到 50 层并去掉最后的 norm，去噪开始前即从显存释放。**它不含分词器**——还需要下一行那三个文件 |
@@ -302,6 +303,17 @@ dotnet TensorSharp.Server.Host/bin/TensorSharp.Server.Host.dll --model models/qw
 （在 Web UI 里，不带附件的提示词会生成图像；附加一张或多张图像即可编辑。省略设置时为 2048×2048（纯 C# `cpu` 上为 1024×1024）、40 步 Euler、CFG 1；`--width 1024 --height 1024` 是更快的草图尺寸；服务端同时给出 `--width` / `--height` 时会改变这个默认值。详见 [qwenimage21_zh-cn.md](docs/models/qwenimage21_zh-cn.md)。）
 
 步数蒸馏 LoRA 插件（可选）能把 40 步降到 4–8 步。去掉上面 CLI 命令里的 `--diffusion-steps 40 --cfg 1`，再加上 `--lora config/lora/qwen-image-2.1-viggle-turbo.json`（默认 6 步，CFG 1）或 `--lora config/lora/qwen-image-2.1-pruna-8step.json`（8 步）：适配器在首次使用时下载，步数与 CFG 由它的配方提供。显式的 `--diffusion-steps` / `--cfg` 会覆盖配方，配方没有对应调度的步数会被拒绝。服务端在启动时接受同样的 `--lora`。全部十二个插件见 [config/README.md](config/README.md#qwen-image-21-lora-plug-ins-lora)。
+
+**Qwen-Image-2.1-Turbo**（同一模型蒸馏为 8 步、CFG 1；[AtomicChat/Qwen-Image-2.1-Turbo-GGUF](https://huggingface.co/AtomicChat/Qwen-Image-2.1-Turbo-GGUF)）：`qwen-image-2.1/` 中已有 Qwen-Image-2.1 的文件时，它的配置只需下载 4.20 GB 的 AD-Q4_K Transformer。配置声明了检查点，因此 Turbo 按公布的 8 步调度采样；其他步数和步数蒸馏 LoRA 插件会被拒绝：
+
+```bash
+dotnet run --project TensorSharp.Cli -c Release --no-build -- \
+  --config config/qwen-image-2.1-turbo.json \
+  --prompt 'a neon sign that reads "OPEN LATE", rainy night' \
+  --width 1024 --height 1024 --diffusion-seed 42 --output turbo.png
+```
+
+手动下载：`hf download AtomicChat/Qwen-Image-2.1-Turbo-GGUF Qwen-Image-2.1-Turbo-AD-Q4_K.gguf --local-dir models`，然后像上面那样传入伴随文件，并加上 `--qwen-image-variant turbo`。详见 [Turbo 一节](docs/models/qwenimage21_zh-cn.md#qwen-image-21-turbo)。
 
 **MiniMax-H3 音视频生成**（提示词 + 可选关键帧或参考 → H.264 MP4，**外加原生 32 kHz 立体声音频，在同一个打包 latent 里一起生成**）：
 

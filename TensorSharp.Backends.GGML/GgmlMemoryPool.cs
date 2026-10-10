@@ -152,7 +152,7 @@ namespace TensorSharp.GGML
                     throw new InvalidOperationException("Pointer is not an outstanding allocation of this GGML pool.");
                 }
 
-                if (_maxPooledBlocks > 0 && block.Size <= _maxRetainedBlockSize &&
+                if (!_closed && _maxPooledBlocks > 0 && block.Size <= _maxRetainedBlockSize &&
                     _available.Count < _maxPooledBlocks)
                 {
                     _available.Add(block);
@@ -166,6 +166,31 @@ namespace TensorSharp.GGML
                 // the reusable list; Trim retries them without losing credit.
                 lock (_lock) _pendingRelease.Add(block);
             }
+        }
+
+        private bool _closed;
+
+        /// <summary>
+        /// The owner is gone: return every pooled block now, and from here on unmap each
+        /// block as it is freed instead of keeping it.
+        ///
+        /// <para>
+        /// A pool belongs to one model's context, and nothing else can reach it. Keeping
+        /// freed blocks for a model that has been unloaded is a leak for the life of the
+        /// process: up to 32 blocks of up to 64 MiB of written memory per unload, and per
+        /// Qwen-Image picture, whose text encoder is a model of its own. Measured in the Mac
+        /// app before this existed: every switch between two chat models grew the next
+        /// load's footprint by about 220 MB, and image turns by far more. Tensors that are
+        /// freed after their model (a holder released late, a finalizer) land here too, so
+        /// a closed pool does not keep them either.
+        /// </para>
+        /// </summary>
+        /// <returns>The bytes returned to the system by this call.</returns>
+        public long Close()
+        {
+            lock (_lock)
+                _closed = true;
+            return Trim();
         }
 
         /// <summary>

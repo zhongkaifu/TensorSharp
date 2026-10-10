@@ -249,7 +249,7 @@ public sealed class WebUiAdapter
                 if (values.Count != 1) throw new WebUiRequestRejectedException(400, new { error = $"{name} must have one value." });
                 fields[name] = values[0];
             }
-        foreach (string name in new[] { "steps", "cfg", "seed", "targetArea", "width", "height", "maskInvert", "maskFeather", "maskCrop", "maskCropPadding" })
+        foreach (string name in new[] { "steps", "cfg", "seed", "targetArea", "width", "height", "keepSourceSize", "maskInvert", "maskFeather", "maskCrop", "maskCropPadding" })
             if (form.TryGetValue(name, out var values))
             {
                 if (values.Count != 1) throw new WebUiRequestRejectedException(400, new { error = $"{name} must have one value." });

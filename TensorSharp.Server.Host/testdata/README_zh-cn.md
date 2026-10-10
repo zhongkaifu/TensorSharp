@@ -8,7 +8,7 @@
 - Ollama 聊天兼容接口：`/api/chat/ollama`
 - OpenAI Chat Completions 兼容接口：`/v1/chat/completions`
 
-测试脚本会自动检测当前加载模型的架构，并在该模型不支持思维链或工具调用时自动跳过相关用例。它们主要覆盖自回归兼容行为；DiffusionGemma Web UI 的整条消息 `replace` 去噪预览帧，需等专门的 diffusion 套件加入后才会覆盖。
+测试脚本会自动检测当前加载模型的架构，并在该模型不支持思维链或工具调用时自动跳过相关用例。它们主要覆盖自回归兼容行为。Web UI 用例按页面的方式应用整条消息的 `replace` 帧（它设置答案，之后的 token 在其后追加），因此覆盖了 Nemotron-H Reasoning-128K 在已流式发送的文本被证实是推理时发送的收回帧（见 [API_EXAMPLES_zh-cn.md](../API_EXAMPLES_zh-cn.md) 中的 `/api/chat` 事件表）；DiffusionGemma 的去噪预览帧需等专门的 diffusion 套件加入后才会检查。
 
 ## 当前套件状态
 
@@ -105,7 +105,7 @@ python3 test_multiturn.py
 - 本目录中的 OpenAI 覆盖范围针对的是 Chat Completions 兼容接口。OpenAI 较新的 Responses API 不在 TensorSharp.Server.Host 当前模拟的兼容范围内。
 - 结构化输出遵循 Chat Completions 的 `response_format` 协议。`json_schema` 与 `tools` 同时使用时预期返回 HTTP `400`。与 `think` 同时使用时同样返回 `400`，但声明了推理结束位置的家族（GPT-OSS、DeepSeek V4.1、Qwen 3.8 Flash Next、Gemma 4、Nemotron-H、Muse-Glimmer）会正常处理；脚本根据服务端报告的架构选择预期结果。
 - Ollama 与 OpenAI 兼容方案仍在持续演进。这些脚本与服务端当前的契约以及在思维链、工具调用、结构化输出方面的文档化行为保持一致。
-- DiffusionGemma 可以通过 append-oriented 兼容端点返回最终文本，但只有 Web UI `/api/chat` 会暴露实时去噪 `replace` 帧。
+- DiffusionGemma 可以通过 append-oriented 兼容端点返回最终文本，但只有 Web UI `/api/chat` 会暴露实时去噪 `replace` 帧。当 Nemotron-H Reasoning-128K 已作为答案流式发送的文本被证实是推理时，`/api/chat` 还会单独发送一个 `replace`；只能追加的端点会暂扣这段文本直到有定论，期间发送保活帧（SSE 的 `: keep-alive` 注释行，或 message 为空的 Ollama 分块）。
 - 浏览器 UI 位于 `http://localhost:5000`（`GET /` 直接返回 `index.html`）；`GET /health` 是存活检查接口。
 
 ## 使用方法

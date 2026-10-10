@@ -107,6 +107,24 @@ namespace TensorSharp.Server.Skills
         internal WorkspaceArtifactCompletionRequirement CompletionRequirement { get; set; }
 
         /// <summary>
+        /// Each attachment's upload path to the name the code tools stage it under, set by
+        /// the adapter that staged them and named them on their messages
+        /// (<c>WebUiChatService</c>); null when nothing named them. Carried to every
+        /// generation of the turn (<see cref="ChatTurnContext.StagedAttachmentNames"/>) so a
+        /// note that replaces an earlier picture names the same file the message does.
+        /// </summary>
+        internal IReadOnlyDictionary<string, string>? StagedAttachmentNames { get; set; }
+
+        /// <summary>
+        /// True when the client of this turn can take shown answer text back, as the Web UI
+        /// pages do with a whole-answer <c>replace</c>. The loop's parsers then stream text
+        /// they cannot classify yet at once and retract it if it proves to be reasoning
+        /// (<see cref="ChatStreamUpdate.RetractedPiece"/>); otherwise they hold it until it
+        /// is decided, which is all an append-only API stream can take.
+        /// </summary>
+        internal bool ClientRetractsAnswerText { get; set; }
+
+        /// <summary>
         /// The single artifact that passed the routed completion contract. Until this is
         /// set, adapters must not expose files captured by guarded invocations: a partial
         /// ZIP is useful evidence for repair, but it is not a user deliverable.
@@ -222,8 +240,10 @@ namespace TensorSharp.Server.Skills
         /// <param name="unknown">Names the registry does not have. A caller should reject the request.</param>
         /// <param name="codeInputFiles">
         /// Files the user attached to the conversation, for the shell tool to stage into
-        /// the program's working directory. The declaration names them so the model opens
-        /// the real attachment instead of re-typing its content into the source.
+        /// the program's working directory. They are NOT named in any declaration: the
+        /// declarations sit inside the prefix every conversation shares, so the names are
+        /// carried on the messages that attached them instead
+        /// (<c>ChatHistoryPreparer.AnnotateAttachmentNames</c>).
         /// </param>
         /// <param name="workspace">
         /// The request/session workspace, shared by <c>shell</c> and skill scripts. Null
@@ -373,7 +393,7 @@ namespace TensorSharp.Server.Skills
             // skill's instructions may well tell the model to compute something, and the
             // two are useful in the same turn.
             if (offerCode && offerTools)
-                tools = AppendCodeTool(tools, codeRunner!, codeInputFiles, workspace, prompt.Reachable.Count());
+                tools = AppendCodeTool(tools, codeRunner!, workspace, prompt.Reachable.Count());
 
             if (workspace != null && offerTools)
                 DescribeSharedWorkspace(tools, codeRunner);
@@ -456,7 +476,6 @@ namespace TensorSharp.Server.Skills
             List<ToolFunction> tools = AppendCodeTool(
                 clientTools != null ? new List<ToolFunction>(clientTools) : new List<ToolFunction>(),
                 codeRunner,
-                codeInputFiles,
                 workspace);
 
             if (workspace != null)
@@ -556,7 +575,7 @@ namespace TensorSharp.Server.Skills
         }
 
         private static List<ToolFunction> AppendCodeTool(
-            List<ToolFunction>? tools, ICodeRunner runner, IReadOnlyList<CodeInputFile>? inputFiles = null,
+            List<ToolFunction>? tools, ICodeRunner runner,
             SessionWorkspace? workspace = null, int reachableSkills = 0)
         {
             var merged = tools != null ? new List<ToolFunction>(tools) : new List<ToolFunction>();
@@ -569,9 +588,9 @@ namespace TensorSharp.Server.Skills
                 return merged;
 
             // BY NAME, never by index. Everything below patches this declaration's
-            // description — the conversation's attachments, the skills on the module
-            // path — and it was written as declarations[0] back when the shell was the
-            // first thing declared. The moment the file tools went in
+            // description — where attachments are, the skills on the module path — and
+            // it was written as declarations[0] back when the shell was the first thing
+            // declared. The moment the file tools went in
             // front of it, every attachment note and skill-import note would have landed
             // on read_file's description instead: it compiles, and the only place it
             // shows up is in what the model was told.
@@ -591,14 +610,33 @@ namespace TensorSharp.Server.Skills
             // ShellTools.DeclareShell's `persists` parameter for what patching the prose
             // produced.
 
-            // The attachments are per request, so the declaration learns about them here
-            // rather than in the runner. Named explicitly - "this file exists, open it" -
-            // because a model that only saw the attachment's CONTENT inlined into the
-            // conversation otherwise re-types that content into its program, abridged.
-            // Repeated on the 'command' parameter: that description is what the model is
-            // reading while it writes the command, and observed on gemma-4-E4B, a note
-            // only at the tail of the tool description was not enough to stop the
-            // re-typing.
+            // Where the user's attachments are, said the same way on every request. A
+            // model that only saw an attachment's CONTENT inlined into the conversation
+            // re-types that content into its program, abridged, so the declaration says
+            // the file is there to open. Repeated on the 'command' parameter: that
+            // description is what the model is reading while it writes the command, and
+            // observed on gemma-4-E4B, a note only at the tail of the tool description
+            // was not enough to stop the re-typing.
+            //
+            // The NAMES are not here. They were, once per request, and the declarations
+            // are inside the prefix every conversation shares: on Qwen3.8 27B the
+            // warm-up's 7,219-token prompt was matched only up to the shell's
+            // description, so an image chat logged "reuse=0" and prefilled 8,345 tokens,
+            // and every later attachment re-prefilled the whole chat from there. The
+            // names now ride on the message that attached them
+            // (ChatHistoryPreparer.AnnotateAttachmentNames), which a later turn
+            // re-renders byte for byte.
+            shell.Description +=
+                " Files the user attaches are copied into this working directory under the names given in "
+                + "the conversation; open them there instead of pasting their content.";
+            if (shell.Parameters != null
+                && shell.Parameters.TryGetValue("command", out ToolParameter commandParameter))
+            {
+                commandParameter.Description +=
+                    " The user's attached files are in the working directory under the names given in the "
+                    + "conversation: read them from there instead of pasting their content into a command.";
+            }
+
             // A skill's bundled package is on the module search path, which the model
             // cannot discover by trying: observed spending a thousand seconds copying
             // slack-gif-creator's core/ package into its workspace file by file because
@@ -615,30 +653,6 @@ namespace TensorSharp.Server.Skills
                     + "the module path), so use them rather than copying their code.";
             }
 
-            if (inputFiles is { Count: > 0 })
-            {
-                string names = string.Join(", ", inputFiles.Select(f => "'" + f.Name + "'"));
-                shell.Description +=
-                    " The user's attached files are already in the working directory - open them by these exact names: "
-                    + names + ".";
-
-                if (shell.Parameters != null
-                    && shell.Parameters.TryGetValue("command", out ToolParameter commandParameter))
-                {
-                    commandParameter.Description +=
-                        " The user's attached files are in the working directory: read "
-                        + names + " from there instead of pasting their content into a command.";
-                }
-
-                // And on skills_run, which is the tool a SKILL.md sends the model to and
-                // therefore the one it is usually reading when it needs the name. Told
-                // only via the shell, a model asked to turn an attached photo into a PDF
-                // read the documents skill, picked exactly the right script, and then
-                // said "no name was told to me" and spent a round running `ls` — the
-                // file was named, on a tool it was not using.
-                Announce(declarations, SkillTools.RunToolName, names);
-            }
-
             // A caller's own tool of the same name wins: it is theirs, they can service it,
             // and quietly shadowing it would break their request in order to add ours.
             // Shadowing is decided PER NAME. An early return on a clash with the first
@@ -648,28 +662,6 @@ namespace TensorSharp.Server.Skills
             return Merge(merged, declarations, persists);
         }
 
-        /// <summary>
-        /// Tell one more tool about the conversation's attachments, on the declaration
-        /// and on the argument the model is reading while it writes the call.
-        /// </summary>
-        private static void Announce(IReadOnlyList<ToolFunction> declarations, string tool, string names)
-        {
-            ToolFunction? declaration = declarations.FirstOrDefault(
-                d => string.Equals(d?.Name, tool, StringComparison.Ordinal));
-            if (declaration == null)
-                return;
-
-            declaration.Description +=
-                " The user's attached files are already in the working directory a script runs in - "
-                + "pass these exact names to it: " + names + ".";
-
-            if (declaration.Parameters != null
-                && declaration.Parameters.TryGetValue("args", out ToolParameter args))
-            {
-                args.Description +=
-                    " When a script needs one of the user's attached files, name it here: " + names + ".";
-            }
-        }
         /// <summary>
         /// Add each declaration the caller does not already own.
         ///

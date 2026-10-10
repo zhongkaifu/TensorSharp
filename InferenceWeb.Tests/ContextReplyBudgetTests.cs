@@ -76,4 +76,54 @@ public sealed class ContextReplyBudgetTests
         Assert.Equal(846, result.ReplyReserve);
         Assert.True(result.FinalPromptTokens + 4096 + result.ReplyReserve <= 12288);
     }
+
+    [Fact]
+    public void CurrentImageAndLargeToolPolicyStillShareReplySpaceWithoutErasingEarlierWork()
+    {
+        var history = History(400);
+        history[1].ImagePaths = new List<string> { "/current.png" };
+        int Expanded(List<ChatMessage> messages) => Count(messages)
+            + messages.Sum(message => (message.ImagePaths?.Count ?? 0) * 400);
+
+        var result = ChatGenerationPipeline.CompactMediaHistoryForContext(
+            history, Count(history), Expanded(history), 8192, 4096, Count, Expanded);
+
+        Assert.Same(history, result.History);
+        Assert.Equal(0, result.ElidedMedia);
+        Assert.Equal(0, result.RemovedMessages);
+        Assert.Same(history[0], result.History[0]);
+        Assert.Same(history[1], result.History[1]);
+        Assert.Same(history[^1], result.History[^1]);
+        Assert.Equal(7300, result.FinalPromptTokens);
+        Assert.Equal(7546, result.PromptLimit);
+        Assert.True(result.FinalPromptTokens <= result.PromptLimit);
+        Assert.True(result.PromptLimit < 8192);
+    }
+
+    [Fact]
+    public void AfterEarlierImageElisionReplyFallbackStillReportsRemovedCompletedTurns()
+    {
+        var history = History(400);
+        history[0] = Message("system", 6600);
+        history[1].ImagePaths = new List<string> { "/current.png" };
+        var earlier = Message("user", 20);
+        earlier.ImagePaths = new List<string> { "/earlier.png" };
+        earlier.AttachmentPaths = new List<string> { "/earlier.png" };
+        earlier.AttachmentNames = new List<string> { "earlier.png" };
+        history.InsertRange(1, new[] { earlier, Message("assistant", 2000) });
+        int Expanded(List<ChatMessage> messages) => Count(messages)
+            + messages.Sum(message => (message.ImagePaths?.Count ?? 0) * 400);
+
+        var result = ChatGenerationPipeline.CompactMediaHistoryForContext(
+            history, Count(history), Expanded(history), 8192, 4096, Count, Expanded);
+
+        Assert.Equal(1, result.ElidedMedia);
+        Assert.Equal(4, result.RemovedMessages);
+        Assert.Equal(new[] { history[0], history[3], history[^2], history[^1] }, result.History);
+        Assert.Equal(7400, result.ProtectedTokens);
+        Assert.Equal(7400, result.FinalPromptTokens);
+        Assert.Equal(7796, result.PromptLimit);
+        Assert.True(result.FinalPromptTokens <= result.PromptLimit);
+        Assert.True(result.PromptLimit < 8192);
+    }
 }

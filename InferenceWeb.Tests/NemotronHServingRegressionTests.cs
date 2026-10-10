@@ -58,7 +58,21 @@ public sealed class NemotronHModelFixture : IDisposable
             if (string.IsNullOrEmpty(Environment.GetEnvironmentVariable("MAX_CONTEXT")))
                 Environment.SetEnvironmentVariable("MAX_CONTEXT", "65536");
             var backend = TestGates.PinnedGgmlBackend;
-            _model = ModelBase.Create(path, backend);
+            // KV_CACHE_DTYPE (q8_0, q4_0, f16, ...) runs the lane on that K/V cache, as the
+            // server's --kv-cache-dtype would; the process-wide choice is put back after load
+            // (the model keeps its own copy).
+            KvCacheDtype restoreDtype = KvCacheDtypeConfig.Current;
+            bool restoreExplicit = KvCacheDtypeConfig.IsExplicitlySet;
+            try
+            {
+                if (KvCacheDtypeConfig.TryParse(Environment.GetEnvironmentVariable("KV_CACHE_DTYPE"), out KvCacheDtype dtype))
+                    KvCacheDtypeConfig.Set(dtype);
+                _model = ModelBase.Create(path, backend);
+            }
+            finally
+            {
+                KvCacheDtypeConfig.RestoreForTests(restoreDtype, restoreExplicit);
+            }
             return _model;
         }
     }
@@ -371,7 +385,8 @@ public class NemotronHServingRegressionTests : IClassFixture<NemotronHModelFixtu
     /// single-sequence forward of each sequence on its own tokens. The two paths use
     /// different kernels (paged F32 K/V against the F16 cache, batch-size dependent
     /// quantized matmul), which measured max|dlogit| 0.3-1.4 on the 8B; a sequence reading
-    /// another's state, or state from the wrong step, is off by far more.</summary>
+    /// another's state, or state from the wrong step, is off by far more. A q4_0 lane checks
+    /// the batched choices instead (see the comment at the reference loop).</summary>
     [ModelFact(NemotronHModelFixture.EnvDir, NemotronHModelFixture.GgufPattern)]
     public void ForwardBatch_FourSequences_MatchesPerSequenceForward()
     {
@@ -433,6 +448,17 @@ public class NemotronHServingRegressionTests : IClassFixture<NemotronHModelFixtu
         }
 
         // Reference: each sequence alone through Forward, on the tokens the batch chose.
+        // The logit bound is the batched kernels' own drift (up to 1.4 on f16 and q8_0).
+        // On a q4_0 cache the reference attends over 4-bit K/V - a step is 1/8 of its
+        // block's largest value, against 1/127 for q8_0 - while ForwardBatch reads float32
+        // paged K/V, so the reference alone sits 2-5 logits off (max|dlogit| 5.14 measured,
+        // argmax unchanged) and no logit bound tells that from a state bug. That lane
+        // checks the choice instead: each batched argmax is the reference's, or a token the
+        // reference ranks within NearTopLogitGap of its top, which a sequence attending over
+        // another's state, or the wrong step's, does not manage.
+        bool quantizationBound = model.KvCacheDtype == KvCacheDtype.Q4_0;
+        _output.WriteLine($"kv={model.KvCacheDtype.ToShortString()}: " +
+            (quantizationBound ? "near-top choice check" : "max|dlogit| <= 4.0"));
         var failures = new List<string>();
         for (int s = 0; s < n; s++)
         {
@@ -445,10 +471,14 @@ public class NemotronHServingRegressionTests : IClassFixture<NemotronHModelFixtu
             for (int t = 0; t < reference.Count; t++)
             {
                 double diff = MaxAbsDiff(reference[t], batchedLogits[s][t]);
-                bool top = ArgMax(reference[t]) == ArgMax(batchedLogits[s][t]);
+                int choice = ArgMax(batchedLogits[s][t]);
+                bool top = ArgMax(reference[t]) == choice;
                 line.Append($"{t}:{diff:F2}{(top ? "" : "!")} ");
-                if (diff > 4.0)
+                if (!quantizationBound && diff > 4.0)
                     failures.Add($"seq {s} step {t}: argmax {(top ? "same" : "differs")}, max|dlogit|={diff:F2}");
+                float gap = reference[t][ArgMax(reference[t])] - reference[t][choice];
+                if (quantizationBound && gap > NearTopLogitGap)
+                    failures.Add($"seq {s} step {t}: batched chose a token the reference ranks {gap:F2} below its top");
             }
             _output.WriteLine(line.ToString());
         }
@@ -508,6 +538,168 @@ public class NemotronHServingRegressionTests : IClassFixture<NemotronHModelFixtu
         _output.WriteLine($"decode after pool grow: max|dlogit|={diff:F2} argmax single={ArgMax(reference)} batched={ArgMax(batchedDecode)}");
         Assert.True(diff < 3.0, $"the decoding sequence lost its K/V history when the paged pool grew (max|dlogit| {diff:F2})");
         Assert.Equal(ArgMax(reference), ArgMax(batchedDecode));
+    }
+
+    /// <summary>Radix pages on the real weights, under whatever K/V dtype the lane loads
+    /// (KV_CACHE_DTYPE). A Nemotron-H page carries the 24 Mamba2 layers' state (~99 MiB on
+    /// the 8B) only where it is a restore point; every other page holds K/V rows alone. A
+    /// new chat sharing the first request's public prefix resumes from the restore point -
+    /// rebuilt from K/V-only pages plus the one carrying the state - and decodes exactly
+    /// what a cold prefill of its prompt decodes. The radix budget charges the real slabs.
+    /// A q8_0 / q4_0 cache used to keep every request off this path entirely (no linear
+    /// K/V migration, so no N=1 fused route and no pages).</summary>
+    [ModelFact(NemotronHModelFixture.EnvDir, NemotronHModelFixture.GgufPattern)]
+    public async Task SharedPrefixPages_CarryStateOnlyAtRestorePoints_AndResumeExactly()
+    {
+        var model = _fixture.Model;
+        var caps = ExecutionCapabilities.FromModel(model);
+        _output.WriteLine($"kv={model.KvCacheDtype.ToShortString()} {caps.Describe()}");
+        if (!LaneMigratesQuantizedKv(model))
+        {
+            Assert.False(caps.SupportsLinearKvMigration, "a quantized cache migrated where the N=1 decode cannot append to it");
+            _output.WriteLine("this lane keeps a quantized cache on the batched route: no N=1 path, no pages");
+            return;
+        }
+        Assert.True(caps.SupportsLinearKvMigration, "the N=1 fused path is unavailable on this K/V dtype");
+        // And the prefix cache sees the batched route's end states, as it does for f16.
+        var prefixCaps = Assert.IsAssignableFrom<TensorSharp.Runtime.Scheduling.PrefixCache.IPrefixCacheModel>(model)
+            .GetPrefixCacheCapabilities();
+        _output.WriteLine($"prefix cache: endState={prefixCaps.EndState} pagedEndStates={prefixCaps.PagedEndStates} pages={prefixCaps.Pages}");
+        Assert.Equal(TensorSharp.Runtime.Scheduling.PrefixCache.EndStateSupport.DonateOnly, prefixCaps.EndState);
+        Assert.True(prefixCaps.PagedEndStates);
+
+        var sb = new StringBuilder();
+        for (int i = 0; i < 60; i++)
+            sb.Append("Rule ").Append(i).Append(": the archive keeps ledger ").Append(i * 7 + 3).Append(" on shelf ").Append(i % 9).Append(".\n");
+        int[] shared = model.Tokenizer.Encode(sb.ToString(), addSpecial: true).ToArray();
+        Assert.True(shared.Length > 3 * 256, $"need more than 768 shared tokens, have {shared.Length}");
+        int[] Ask(string q) => shared.Concat(model.Tokenizer.Encode("\nQuestion: " + q + "\nAnswer:", addSpecial: false)).ToArray();
+        int[] promptA = Ask("Which shelf holds ledger 52?");
+        int[] promptB = Ask("What does rule 12 keep?");
+        const int maxNew = 24;
+        SchedulerConfig Config(bool prefixCaching) => new()
+        {
+            MaxNumBatchedTokens = 4096,
+            MaxNumRunningSequences = 4,
+            NumBlocks = 64,
+            BlockSize = 256,
+            EnablePrefixCaching = prefixCaching,
+            StopRepetition = false,
+        };
+
+        long fullPage = model.ComputeKVBlockByteSize(256);
+        long kvPage = model.ComputeKVBlockByteSizeWithoutRecurrentState(256);
+        _output.WriteLine($"page bytes: full={fullPage >> 20} MiB, K/V-only={kvPage >> 10} KiB");
+        Assert.True(kvPage < fullPage / 4);
+
+        List<int> warmB;
+        int reused;
+        model.ResetKVCache();
+        using (var engine = new InferenceEngine(model, Config(prefixCaching: true), NullLogger.Instance))
+        {
+            await RunScoped(engine, "a", promptA, maxNew, "chat-a", shared.Length);
+            var tree = engine.RadixCache!.Tree;
+            int full = 0, kvOnly = 0;
+            long slabs = 0;
+            for (int id = 0; id < engine.Pool.NumBlocks; id++)
+            {
+                var block = engine.Pool.GetBlock(id);
+                if (!tree.TryGetBlockOwner(block, out _)) continue;
+                long len = engine.Pool.Storage.SlabLength(id);
+                slabs += len;
+                if (len == fullPage && block.IsRestorablePrefixEnd) full++;
+                else if (len == kvPage && !block.IsRestorablePrefixEnd) kvOnly++;
+                else Assert.Fail($"page {id}: {len} bytes, restorable={block.IsRestorablePrefixEnd}");
+            }
+            _output.WriteLine($"pages: {full} with state, {kvOnly} K/V-only; charged {tree.Cached.HostKv >> 20} MiB of {slabs >> 20} MiB slabs");
+            Assert.True(full >= 1 && kvOnly >= 1);
+            Assert.Equal(slabs, tree.Cached.HostKv);
+
+            var b = await RunScoped(engine, "b", promptB, maxNew, "chat-b", shared.Length);
+            warmB = b.OutputTokens.ToList();
+            reused = b.PrefixCacheReusedTokens;
+        }
+
+        model.ResetKVCache();
+        List<int> coldB;
+        using (var cold = new InferenceEngine(model, Config(prefixCaching: false), NullLogger.Instance))
+            coldB = (await RunScoped(cold, "b-cold", promptB, maxNew, "chat-cold", 0)).OutputTokens.ToList();
+        model.ResetKVCache();
+
+        _output.WriteLine($"B reused {reused} of {promptB.Length} prompt tokens");
+        _output.WriteLine($"warm: {Show(Decode(model, warmB))}");
+        _output.WriteLine($"cold: {Show(Decode(model, coldB))}");
+        Assert.True(reused >= 256 && reused % 256 == 0, $"B reused {reused} tokens");
+        Assert.Equal(coldB, warmB);
+    }
+
+    /// <summary>The linear-to-paged migration a second request triggers moves the solo
+    /// sequence's K/V into the batched path's float32 paged arrays. On a q8_0 / q4_0 cache
+    /// that read dequantizes (it used to decline, which kept every request of such a cache
+    /// off the N=1 fused path); a batched decode on the migrated history then tracks the
+    /// decode the linear cache itself gives, as the batched kernels do for f16.</summary>
+    [ModelFact(NemotronHModelFixture.EnvDir, NemotronHModelFixture.GgufPattern)]
+    public void MigratedLinearHistory_DecodesLikeTheLinearCache()
+    {
+        var model = _fixture.Model;
+        var batched = Assert.IsAssignableFrom<IBatchedPagedModel>(model);
+        if (!LaneMigratesQuantizedKv(model))
+        {
+            Assert.False(batched.SupportsLinearKVMigration, "a quantized cache migrated where the N=1 decode cannot append to it");
+            _output.WriteLine($"kv={model.KvCacheDtype.ToShortString()}: this lane keeps a quantized cache on the batched route");
+            return;
+        }
+        Assert.True(batched.SupportsLinearKVMigration, $"no linear migration on a {model.KvCacheDtype.ToShortString()} cache");
+        var renderer = new KVCachePromptRenderer(new GgufPromptRenderer());
+        int[] prompt = Render(model, renderer, Prompts[0] + " Explain the steps in two sentences.");
+        const int blockSize = 16;
+
+        model.ResetKVCache();
+        int token = ArgMax(model.Forward(prompt));
+        float[] linearDecode = (float[])model.Forward(new[] { token }).Clone();
+
+        model.ResetKVCache();
+        model.Forward(prompt);
+        var seq = new SequenceState($"mig-{Guid.NewGuid():N}", prompt, 4, blockSize, SamplingConfig.Greedy);
+        for (int b = 0; b < (prompt.Length + 1 + blockSize - 1) / blockSize; b++)
+            seq.BlockTable.AppendBlock(new TensorSharp.Runtime.Paged.KvBlock(b));
+        seq.AdvanceComputedTokens(prompt.Length);
+        float[] batchedDecode;
+        try
+        {
+            Assert.True(batched.TryMigrateLinearKVToPaged(seq, blockSize), "migration refused");
+            batchedDecode = batched.ForwardBatch(BuildContext(new[] { seq }, new[] { new[] { token } }, blockSize))[0];
+        }
+        finally
+        {
+            batched.OnSequenceReleased(seq.RequestId);
+            model.ResetKVCache();
+        }
+
+        double diff = MaxAbsDiff(linearDecode, batchedDecode);
+        _output.WriteLine($"kv={model.KvCacheDtype.ToShortString()} prompt={prompt.Length} decode after migration: " +
+            $"max|dlogit|={diff:F2} argmax linear={ArgMax(linearDecode)} batched={ArgMax(batchedDecode)}");
+        Assert.True(diff < 3.0, $"the migrated history decodes differently (max|dlogit| {diff:F2})");
+        Assert.Equal(ArgMax(linearDecode), ArgMax(batchedDecode));
+    }
+
+    /// <summary>Whether this lane migrates its K/V cache to the batched route: a float cache
+    /// always does, a q8_0 / q4_0 one only where the N=1 decode is validated to append to and
+    /// read it in place (ggml-metal). ggml-cpu aborts on that append, and ggml-cuda and
+    /// ggml-vulkan have not run it with this model, so there a quantized cache keeps the
+    /// batched route, by design.</summary>
+    private static bool LaneMigratesQuantizedKv(ModelBase model)
+        => !model.KvCacheDtype.IsBlockQuantized()
+           || TestGates.PinnedGgmlBackend is BackendType.GgmlMetal;
+
+    private static async Task<SequenceState> RunScoped(InferenceEngine engine, string id, int[] prompt, int maxNew,
+        string scope, int publicTokens)
+    {
+        var seq = new SequenceState(id, prompt, maxNew, 256, SamplingConfig.Greedy,
+            sharedPrefixTokens: publicTokens, cacheScope: scope);
+        var completion = await engine.SubmitRequest(seq).Completion.WaitAsync(TimeSpan.FromMinutes(5));
+        Assert.NotEqual(SequenceStatus.FinishedError, completion.Status);
+        return seq;
     }
 
     private static BatchedForwardContext BuildContext(SequenceState[] seqs, int[][] tokens, int blockSize)

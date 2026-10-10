@@ -75,6 +75,8 @@ namespace TensorSharp.Server
             public EmittedAssistantTurn Emitted;
             public string Scope;
             public long Tokens;
+            // Which load of the model produced these tokens (ModelLifecycleService.LoadEpoch).
+            public long Epoch;
         }
 
         private sealed class ChainEntry
@@ -121,7 +123,12 @@ namespace TensorSharp.Server
         /// clean assistant message the client sends for it. Messages that already carry
         /// raw tokens (the tool loop's own rounds) are left as they are.
         /// </summary>
-        public TranscriptAugmentation Augment(IReadOnlyList<ChatMessage> incoming)
+        /// <param name="epoch">The model load the request will run on. Only records made under
+        /// the same load are spliced: raw token ids are the vocabulary of the model that
+        /// generated them, and after a model switch the same chat (the app keeps it open)
+        /// used to hand model A's ids to model B. In range they are a garbled history the
+        /// user cannot see; past B's vocabulary they index beyond its embedding table.</param>
+        public TranscriptAugmentation Augment(IReadOnlyList<ChatMessage> incoming, long epoch = 0)
         {
             if (incoming == null)
                 return new TranscriptAugmentation(null, null, 0);
@@ -155,7 +162,7 @@ namespace TensorSharp.Server
                     {
                         foreach (TurnRecord candidate in entry.Records)
                         {
-                            if (!EmittedMatches(src, candidate))
+                            if (candidate.Epoch != epoch || !EmittedMatches(src, candidate))
                                 continue;
                             if (match == null)
                             {
@@ -226,7 +233,8 @@ namespace TensorSharp.Server
             IReadOnlyList<ChatMessage> history,
             ChatMessage generated,
             EmittedAssistantTurn emitted,
-            string scope)
+            string scope,
+            long epoch = 0)
         {
             if (generated?.RawOutputTokens is not { Count: > 0 } || emitted == null)
                 return;
@@ -275,7 +283,7 @@ namespace TensorSharp.Server
                 };
             }
 
-            var record = new TurnRecord { Replacement = replacement, Emitted = emitted, Scope = scope, Tokens = tokens };
+            var record = new TurnRecord { Replacement = replacement, Emitted = emitted, Scope = scope, Tokens = tokens, Epoch = epoch };
             lock (_lock)
             {
                 if (!_chains.TryGetValue(key, out ChainEntry entry))

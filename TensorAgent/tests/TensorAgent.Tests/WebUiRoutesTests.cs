@@ -265,6 +265,73 @@ public sealed class WebUiRoutesTests : IDisposable
     }
 
     /// <summary>
+    /// The route's recorder keeps what a picture was made from beside the picture, and a
+    /// question's choices beside the question, for the same reason it keeps the answer: the
+    /// next picture turn plans from them, and the page may be gone when the turn ends.
+    /// </summary>
+    [Fact]
+    public async Task ThePicturesRecordAndAQuestionsChoicesAreWrittenDownWithTheTurn()
+    {
+        var recorder = new ConversationRecorder(_conversations);
+        using var server = new LoopbackServer(NullLogger.Instance) { RequireToken = false };
+        server.MapWebUi(_chat, _root, skills: null, recorder: recorder, chatFrames: (body, _) => Turn(body));
+        server.Start();
+        using var client = new HttpClient { BaseAddress = new Uri(server.BaseUrl) };
+
+        JsonElement created = await BodyOf(await client.PostAsync("/api/sessions?conversation=new", null));
+        string sessionId = created.GetProperty("sessionId").GetString()!;
+        string conversationId = created.GetProperty("conversationId").GetString()!;
+
+        foreach (string ask in new[] { "picture", "question" })
+        {
+            HttpResponseMessage streamed = await client.PostAsync("/api/chat", new StringContent(
+                $$"""{"sessionId":"{{sessionId}}","ask":"{{ask}}","messages":[{"role":"user","content":"with a hat"}]}""",
+                Encoding.UTF8, "application/json"));
+            await streamed.Content.ReadAsStringAsync();
+
+            StoredMessage answer = new ConversationStore(_conversations.Root).Load(conversationId)!.Messages[^1];
+            if (ask == "picture")
+            {
+                Assert.Equal("/uploads/hat.png", answer.ImageUrl);
+                Assert.Equal("edit", answer.ImagePlan);
+                Assert.Equal(new[] { "dog.png" }, answer.ImageSources);
+                Assert.Equal("with a hat", answer.ImagePrompt);
+                Assert.Equal(0, answer.ImageSeed);
+                Assert.Equal("mask.png", answer.ImageMask!.MaskPath);
+                Assert.Contains("mask.png", answer.ReferencedUploads);
+            }
+            else
+            {
+                Assert.Equal("Which one?", answer.Content);
+                Assert.Equal(new[] { "edit:dog.png", "new:" },
+                    answer.ImageChoices!.Select(c => c.Intent + ":" + c.Source));
+            }
+        }
+
+        static async IAsyncEnumerable<object> Turn(JsonElement body)
+        {
+            string sessionId = body.GetProperty("sessionId").GetString()!;
+            await Task.Yield();
+            if (body.GetProperty("ask").GetString() == "picture")
+            {
+                yield return new { image_plan = "edit", image_sources = new[] { "/uploads/dog.png" }, image_prompt = "with a hat", image_plan_reason = "model" };
+                yield return new
+                {
+                    imageUrl = "/uploads/hat.png", width = 64, height = 64,
+                    imagePlan = "edit", imageSources = new[] { "dog.png" }, imagePrompt = "with a hat", imageSeed = 0L,
+                    imageMask = new { maskPath = "mask.png", maskMode = "grayscale" },
+                };
+            }
+            else
+            {
+                yield return new { token = "Which one?" };
+                yield return new { image_choice = new object[] { new { intent = "edit", source = "dog.png" }, new { intent = "new", source = (string?)null } } };
+            }
+            yield return new { done = true, sessionId };
+        }
+    }
+
+    /// <summary>
     /// What the page asks before it decides which chat to open.
     ///
     /// <para>
@@ -393,9 +460,36 @@ public sealed class WebUiRoutesTests : IDisposable
             families.Add(model.GetProperty("family").GetString()!);
             kinds.Add(model.GetProperty("kind").GetString()!);
         }
-        Assert.True(families.SetEquals(new[] { "Gemma4", "Qwen35", "Bonsai", "Qwen38", "MuseGlimmer", "Qwen38FlashNext", "QwenImage", "MiniMaxH3" }),
+        Assert.True(families.SetEquals(new[]
+            {
+                "Gemma4", "Qwen35", "Bonsai", "Qwen38", "MuseGlimmer", "Qwen38FlashNext", "QwenImage", "MiniMaxH3",
+                "Qwen36", "GptOss", "Nemotron", "Mistral3", "HunyuanDense", "DeepSeek4", "DeepSeek41", "Glm5",
+                "DiffusionGemma", "Wan",
+            }),
             string.Join(", ", families));
         Assert.True(kinds.SetEquals(new[] { "Dense", "MixtureOfExperts", "Diffusion" }), string.Join(", ", kinds));
+    }
+
+    // The catalog reports the window a load on THIS device gets: a desktop is given more
+    // than the phone's measured window, and the route must not say otherwise.
+    [Fact]
+    public async Task TheCatalogReportsTheContextWindowOfThisDeviceClass()
+    {
+        CatalogModel entry = ModelCatalog.BuiltIn.First(m => m.DesktopContextLength > m.ContextLength);
+        using var desktop = new LoopbackServer(NullLogger.Instance);
+        desktop.MapAgent(ModelCatalog.BuiltIn, _models, _conversations, _settings, () => "test engine",
+            device: DeviceClass.Desktop);
+        desktop.Start();
+        using var client = new HttpClient { BaseAddress = new Uri(desktop.BaseUrl) };
+        client.DefaultRequestHeaders.Add("Cookie", $"{LoopbackServer.TokenCookie}={desktop.Token}");
+
+        JsonElement onDesktop = await BodyOf(await client.GetAsync($"/api/agent/catalog/{entry.Id}"));
+        JsonElement onPhone = await BodyOf(await _client.GetAsync($"/api/agent/catalog/{entry.Id}"));
+
+        Assert.Equal(entry.DesktopContextLength, onDesktop.GetProperty("contextLength").GetInt32());
+        Assert.Equal(EngineMemoryPolicy.DefaultContextLength(entry, DeviceClass.Desktop),
+            onDesktop.GetProperty("contextLength").GetInt32());
+        Assert.Equal(entry.ContextLength, onPhone.GetProperty("contextLength").GetInt32());
     }
 
     [Fact]

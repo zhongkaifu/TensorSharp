@@ -446,6 +446,49 @@ public sealed class ChatTurnTests
         finally { try { Directory.Delete(root, true); } catch (IOException) { } }
     }
 
+    /// <summary>
+    /// Text the page showed and took back as reasoning (Nemotron-H Reasoning-128K closing a
+    /// block its prompt had closed) arrives as its reasoning and then the whole answer that
+    /// is left. The saved turn says what the page shows: the earlier round's text and the
+    /// answer, with the reasoning in its own field and nowhere in the answer. The recorder
+    /// already applied a <c>replace</c> this way for DiffusionGemma previews; this pins that
+    /// it does for the retraction's frames, in the order the Web UI sends them.
+    /// </summary>
+    [Fact]
+    public async Task ARetractedReasoningIsSavedAsReasoningAndNotAsTheAnswer()
+    {
+        string root = Path.Combine(Path.GetTempPath(), "turn-retract-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            var store = new ConversationStore(root);
+            Conversation conversation = store.Create();
+            var recorder = new ConversationRecorder(store);
+            recorder.Bind("session-retract", conversation.Id);
+            using var turns = new ChatTurnManager(recorder);
+
+            string id = turns.Start(conversation.Id, _ => RetractionFrames());
+            await WaitFor(() => !turns.StatusOfId(id)!.IsRunning);
+
+            Conversation reloaded = Assert.IsType<Conversation>(new ConversationStore(root).Load(conversation.Id));
+            StoredMessage assistant = Assert.Single(reloaded.Messages);
+            Assert.Equal("I will read it.\n\nThe file has 7 lines.", assistant.Content);
+            Assert.Equal("Okay, the user wants the count.", assistant.Thinking);
+        }
+        finally { try { Directory.Delete(root, true); } catch (IOException) { } }
+    }
+
+    private static async IAsyncEnumerable<object> RetractionFrames()
+    {
+        await Task.Yield();
+        yield return new { token = "I will read it.\n\n", sessionId = "session-retract" };
+        yield return new { token = "Okay, the user " };
+        yield return new { token = "wants the count." };
+        yield return new { thinking = "Okay, the user wants the count." };
+        yield return new { replace = "I will read it.\n\n" };
+        yield return new { token = "The file has 7 lines." };
+        yield return new { done = true, sessionId = "session-retract", tokenCount = 12, elapsed = 1.0, tokPerSec = 12.0 };
+    }
+
     private static async IAsyncEnumerable<object> StatsFrames(object terminal)
     {
         await Task.Yield();

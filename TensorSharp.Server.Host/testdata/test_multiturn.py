@@ -163,11 +163,13 @@ class TestRunner:
             or normalized.startswith("nemotronh")
 
     def _extract_sse_tokens(self, events):
-        """Extract concatenated token text from SSE events."""
+        """Extract the answer text from SSE events: tokens append, a replace sets it all."""
         tokens = ""
         for ev in events:
             if "token" in ev:
                 tokens += ev["token"]
+            elif isinstance(ev.get("replace"), str):
+                tokens = ev["replace"]
         return tokens
 
     def _extract_ndjson_content(self, items):

@@ -140,6 +140,10 @@ namespace TensorSharp.Runtime.Scheduling
 
         public IModelArchitecture Model => _model;
         public BlockPoolStats PoolStats => _pool.GetStats();
+        /// <summary>The block pool itself, for tests that inspect its slabs.</summary>
+        internal BlockPool Pool => _pool;
+        /// <summary>The radix prefix cache, or null when it does not serve this model.</summary>
+        internal PrefixCache.PrefixCacheCoordinator? RadixCache => _executor.RadixCache;
         public long TotalCompleted => Interlocked.Read(ref _totalCompleted);
         public long TotalSubmitted => Interlocked.Read(ref _totalSubmitted);
         public long TotalStepsRun => Interlocked.Read(ref _totalStepsRun);
@@ -508,7 +512,12 @@ namespace TensorSharp.Runtime.Scheduling
                             // rechecking, avoiding both missed external releases
                             // and a self-induced retry/trim busy loop.
                             memoryWait = admission.Budget.ChangeSignal;
-                            if (admission.Budget.CanReserve(peak)) memoryWait = null;
+                            // Capacity can also shrink during reclamation. That
+                            // invalidates the queued peak instead of admitting it;
+                            // let Schedule reject it rather than waiting for a
+                            // second budget change that may never arrive.
+                            if (!admission.Budget.CanEverFit(peak) || admission.Budget.CanReserve(peak))
+                                memoryWait = null;
                             else _sharedReclamation?.Publish(peak, memoryWait);
                         }
                         continue;

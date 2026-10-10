@@ -94,10 +94,14 @@ namespace TensorSharp.Runtime
         /// Returns an empty string for architectures whose chat templates already emit
         /// the suffix as part of the standard assistant-message framing.
         /// </summary>
-        public static string GetAssistantGenerationSuffix(string architecture, bool enableThinking)
+        public static string GetAssistantGenerationSuffix(string architecture, bool enableThinking, string? chatTemplate = null)
         {
             if (string.IsNullOrEmpty(architecture))
                 return string.Empty;
+
+            ChatProtocol? protocol = ChatProtocolRegistry.For(architecture);
+            if (protocol?.AssistantGenerationSuffixForTemplate != null)
+                return protocol.AssistantGenerationSuffixForTemplate(enableThinking, chatTemplate) ?? string.Empty;
 
             // WHICH suffix, per family, is declared once in ChatProtocolRegistry beside
             // that family's renderer and output parser - it is a property of the chat
@@ -712,7 +716,7 @@ namespace TensorSharp.Runtime
             // What this request's generation prompt would end with is the fallback;
             // a turn the transcript tracked knows what ITS prompt ended with, and that
             // is what the cache holds in front of its raw tokens.
-            string suffix = GetAssistantGenerationSuffix(architecture, enableThinking);
+            string suffix = GetAssistantGenerationSuffix(architecture, enableThinking, chatTemplate);
             IReadOnlyList<string?> recordedSuffixes =
                 rawGenerationSuffixByPlaceholderIndex ?? (IReadOnlyList<string?>)Array.Empty<string?>();
             bool anyRecordedSuffix = false;
@@ -745,6 +749,10 @@ namespace TensorSharp.Runtime
                     ? boundaries
                     : Array.Empty<string?>(),
                 trimUnknownBoundaries: rendererStrippedTrailingWhitespace);
+
+            string? turnSeparator = ChatProtocolRegistry.For(architecture)?.ModelWrittenTurnSeparator?.Invoke(chatTemplate);
+            if (!string.IsNullOrEmpty(turnSeparator) && rawTokensByPlaceholderIndex is { Count: > 0 })
+                text = DropSeparatorsTheModelWrote(text, turnSeparator, rawTokensByPlaceholderIndex, tokenizer);
 
             List<int> tokens = TokenizeAndReplacePlaceholderSpans(
                 tokenizer,
@@ -1110,6 +1118,52 @@ namespace TensorSharp.Runtime
                 searchPos = sentinel + 1;
             }
             return sb.ToString();
+        }
+
+        /// <summary>
+        /// Drop the template's <paramref name="separator"/> right after each raw turn whose
+        /// tokens already end with it (<see cref="ChatProtocol.ModelWrittenTurnSeparator"/>).
+        /// </summary>
+        private static string DropSeparatorsTheModelWrote(
+            string text, string separator, IReadOnlyList<List<int>> rawTokensByPlaceholderIndex, ITokenizer tokenizer)
+        {
+            var sb = new System.Text.StringBuilder(text.Length);
+            int searchPos = 0;
+            int placeholderIndex = 0;
+            while (searchPos < text.Length)
+            {
+                int sentinel = text.IndexOf(PlaceholderSentinel, searchPos);
+                int sentinelEnd = sentinel < 0 ? -1 : text.IndexOf(PlaceholderSentinel, sentinel + 1);
+                if (sentinelEnd < 0)
+                {
+                    sb.Append(text, searchPos, text.Length - searchPos);
+                    break;
+                }
+                sb.Append(text, searchPos, sentinelEnd + 1 - searchPos);
+                searchPos = sentinelEnd + 1;
+                if (placeholderIndex < rawTokensByPlaceholderIndex.Count
+                    && string.CompareOrdinal(text, searchPos, separator, 0, separator.Length) == 0
+                    && EndsWith(tokenizer, rawTokensByPlaceholderIndex[placeholderIndex], separator))
+                {
+                    searchPos += separator.Length;
+                }
+                placeholderIndex++;
+            }
+            return sb.ToString();
+        }
+
+        private static bool EndsWith(ITokenizer tokenizer, List<int> tokens, string text)
+        {
+            if (tokens.Count == 0) return false;
+            try
+            {
+                int take = Math.Min(tokens.Count, 8);
+                return tokenizer.Decode(tokens.GetRange(tokens.Count - take, take)).EndsWith(text, StringComparison.Ordinal);
+            }
+            catch (Exception)
+            {
+                return false;
+            }
         }
 
         private static string NormalizeWhitespaceBeforeEachPlaceholder(

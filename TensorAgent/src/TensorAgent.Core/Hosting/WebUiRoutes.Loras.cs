@@ -30,7 +30,7 @@ public static partial class WebUiRoutes
         ArgumentNullException.ThrowIfNull(host);
 
         CatalogLora? Find(string id) =>
-            LoraCatalog.Find(id) is { } lora && host.Catalog.Any(m => m.Id == lora.BaseModelId) ? lora : null;
+            LoraCatalog.Find(id) is { } lora && host.Catalog.Any(m => lora.AppliesTo(m.Id)) ? lora : null;
 
         LoopbackResponse? NotFound(string id) => LoopbackResponse.Json(new { error = Loc.T("host.loras.notFound", ("id", id)) }, 404);
 
@@ -100,7 +100,9 @@ public static partial class WebUiRoutes
         });
     }
 
-    /// <summary>The LoRA sheet's state: every plug-in of an offered model, and the choice.</summary>
+    /// <summary>The LoRA sheet's state: the plug-ins of the loaded image model (with none loaded,
+    /// every plug-in of an offered model), and the choice. A Qwen-Image 2.1 Turbo entry is offered
+    /// only the plug-ins validated on it, never a speed plug-in.</summary>
     internal static object DescribeLoras(AgentAppHost host)
     {
         IReadOnlyList<ImageLoraChoice> chosen = host.Settings.Load().ImageLoras;
@@ -113,8 +115,7 @@ public static partial class WebUiRoutes
             loadedModel = loadedModel?.Id,
             minStrength = LoraCatalog.MinStrength,
             maxStrength = LoraCatalog.MaxStrength,
-            loras = LoraCatalog.BuiltIn
-                .Where(l => host.Catalog.Any(m => m.Id == l.BaseModelId))
+            loras = LoraCatalog.Offered(loadedModel, host.Catalog)
                 .Select(l =>
                 {
                     ImageLoraChoice? choice = chosen.FirstOrDefault(c => string.Equals(c.Id, l.Id, StringComparison.OrdinalIgnoreCase));

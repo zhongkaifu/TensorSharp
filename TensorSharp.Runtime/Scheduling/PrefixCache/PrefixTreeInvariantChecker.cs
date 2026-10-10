@@ -129,11 +129,7 @@ internal sealed class PrefixTreeInvariantChecker
             // I8
             ResourceVector own = default, pageBytes = default;
             foreach (PageRef page in n.PageSpan)
-            {
-                var pb = new ResourceVector { PoolPages = 1 };
-                if (page.HasA1) pb.HostKv = tree.Options.PageHostBytes;
-                pageBytes += pb;
-            }
+                pageBytes += tree.PageBytes(page);
             own = pageBytes;
             if (n.EndState is not null) own += n.EndState.Bytes;
             if (own != n.Bytes) Fail("I8", $"{n} Bytes {n.Bytes} != payload bytes {own}");
@@ -180,6 +176,9 @@ internal sealed class PrefixTreeInvariantChecker
                     Fail("I12", $"page {page.PageIndex} of {n} has no store of record");
                 if (page.HasA1 && (!host.HoldsSnapshotBytes(page.Block) || host.UsedTokens(page.Block) < blockSize))
                     Fail("I12", $"A1 page {page.PageIndex} of {n} has no full snapshot slab");
+                // A cached page is immutable, so the slab it was charged for is the slab it holds.
+                if (page.HasA1 && page.HostBytes > 0 && host.SnapshotByteLength(page.Block) != page.HostBytes)
+                    Fail("I12", $"A1 page {page.PageIndex} of {n} is charged {page.HostBytes} bytes but its slab holds {host.SnapshotByteLength(page.Block)}");
                 if (page.HasA2 && !host.HoldsModelPagedKv(page.Block))
                     Fail("I12", $"A2 page {page.PageIndex} of {n} is not in model-paged storage");
             }

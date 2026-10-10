@@ -66,6 +66,26 @@ public sealed class VideoTurnsTests
     }
 
     [Fact]
+    public void WanUsesItsOwnFrameGridAndAcceptsOneConditioningPhoto()
+    {
+        var wan = new FakeVideoModel
+        {
+            VideoModelFamily = "wan", SupportsAudio = false, SupportsImageConditioning = true,
+        };
+        var payload = Payload(VideoTurns.Read(Body(new
+        {
+            role = "user", content = "the fox walks", stillImagePaths = new[] { "fox.png" },
+        }), wan));
+        Assert.Equal(21, payload["frames"]);
+        Assert.Equal("fox.png", payload["imagePath"]);
+        Assert.False(payload.ContainsKey("steps"));
+        Assert.NotNull(VideoTurns.Read(Body(new
+        {
+            role = "user", content = "the fox walks", stillImagePaths = new[] { "a.png", "b.png" },
+        }), wan).Error);
+    }
+
+    [Fact]
     public void OnTheKeyframeCheckpointOnePhotoStartsTheClipAndASecondEndsIt()
     {
         Dictionary<string, object> one = Payload(VideoTurns.Read(Body(new

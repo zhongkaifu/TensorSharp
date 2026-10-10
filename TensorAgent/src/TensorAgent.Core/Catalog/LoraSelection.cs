@@ -18,7 +18,7 @@ namespace TensorAgent.Core.Catalog;
 /// <param name="Specs">What the image service is handed for the picture: the speed plug-in
 /// first, then the others in the order they were turned on.</param>
 /// <param name="Names">Their display names, in the same order.</param>
-/// <param name="SatOut">Why a chosen speed plug-in is not applied to this picture, or null.</param>
+/// <param name="SatOut">Why chosen plug-ins are not applied to this picture, or null.</param>
 public sealed record LoraPlan(IReadOnlyList<LoraSpec> Specs, IReadOnlyList<string> Names, string? SatOut = null)
 {
     public static LoraPlan None { get; } = new(Array.Empty<LoraSpec>(), Array.Empty<string>());
@@ -105,10 +105,13 @@ public static class LoraSelection
     /// What the saved choice asks the engine to apply to <paramref name="modelId"/>'s next picture.
     /// A plug-in for another model, or one this build does not know, is skipped, and so is one
     /// made only for edits when the picture is made from words (the sheet says so, and the
-    /// picture's progress names what it is drawn with). A known plug-in that is no longer
-    /// installed, or a hand-edited choice with two speed plug-ins, is an error rather than a
-    /// silent omission: the user would otherwise get a picture without the plug-in they turned
-    /// on, with nothing to say so.
+    /// picture's progress names what it is drawn with). A plug-in chosen for another image model
+    /// sits out this one's pictures and the plan says so (<see cref="LoraPlan.SatOut"/>): a speed
+    /// plug-in on a Qwen-Image 2.1 Turbo entry, which is step-distilled already, and any plug-in
+    /// not validated on the entry, which <see cref="CatalogLora.AlsoFor"/> lists. A known plug-in
+    /// that is no longer installed, or a hand-edited choice with two speed plug-ins, is an error
+    /// rather than a silent omission: the user would otherwise get a picture without the plug-in
+    /// they turned on, with nothing to say so.
     /// </summary>
     /// <param name="editing">Whether the picture edits an attached photo.</param>
     /// <returns>The plan, or null with <paramref name="error"/> set.</returns>
@@ -120,13 +123,24 @@ public static class LoraSelection
         error = null;
         var chosen = new List<(CatalogLora Lora, float Strength)>();
         var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        CatalogModel? model = ModelCatalog.Find(modelId ?? string.Empty);
+        var satOut = new List<string>();
         foreach (ImageLoraChoice choice in choices)
         {
             if (choice is null || !seen.Add(choice.Id ?? string.Empty))
                 continue;
-            if (LoraCatalog.Find(choice.Id!) is not { } lora
-                || !string.Equals(lora.BaseModelId, modelId, StringComparison.OrdinalIgnoreCase)
-                || lora.NeedsPhoto && !editing)
+            if (LoraCatalog.Find(choice.Id!) is not { } lora)
+                continue;
+            if (!lora.AppliesTo(modelId))
+            {
+                // Another image model's plug-in: the picture is made without it, and says why.
+                if (model is { IsImageGenerator: true })
+                    satOut.Add(lora.Kind == LoraKind.Speed && model.ImageVariant == QwenImageVariant.Turbo
+                        ? $"{lora.DisplayName} sits out: {model.DisplayName} is step-distilled already"
+                        : $"{lora.DisplayName} sits out: not validated on {model.DisplayName}");
+                continue;
+            }
+            if (lora.NeedsPhoto && !editing)
                 continue;
             if (!store.IsInstalled(lora))
             {
@@ -144,14 +158,14 @@ public static class LoraSelection
         }
         // A task that works only on the model's own schedule keeps it: the speed plug-in sits
         // out this picture, which the page names in its progress and the host logs.
-        string? satOut = null;
         if (speeds.Length == 1 && chosen.FirstOrDefault(c => c.Lora.NeedsModelSteps).Lora is { } task)
         {
-            satOut = $"{speeds[0].DisplayName} sits out: {task.DisplayName} works only at the model's own steps";
+            satOut.Add($"{speeds[0].DisplayName} sits out: {task.DisplayName} works only at the model's own steps");
             chosen.RemoveAll(c => c.Lora.Kind == LoraKind.Speed);
         }
+        string? why = satOut.Count == 0 ? null : string.Join("; ", satOut);
         if (chosen.Count == 0)
-            return LoraPlan.None;
+            return why is null ? LoraPlan.None : LoraPlan.None with { SatOut = why };
 
         var ordered = chosen.Where(c => c.Lora.Kind == LoraKind.Speed).Concat(chosen.Where(c => c.Lora.Kind != LoraKind.Speed)).ToList();
         float StrengthOf((CatalogLora Lora, float Strength) c) => c.Lora.StrengthAdjustable && float.IsFinite(c.Strength)
@@ -160,6 +174,6 @@ public static class LoraSelection
         return new LoraPlan(
             ordered.Select(c => store.SpecFor(c.Lora, StrengthOf(c))).ToArray(),
             ordered.Select(c => c.Lora.DisplayName).ToArray(),
-            satOut);
+            why);
     }
 }

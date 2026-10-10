@@ -65,12 +65,16 @@ public sealed class Qwen38FlashNextCatalogTests : IDisposable
             Assert.Equal(expected[i].Sha, weights[i].Sha256);
             Assert.False(weights[i].Optional);
         }
-        // Text only: no projector, and no draft (the MTP head is a separate 2.8 GB file that
-        // does not engage after a shared-prefix clone).
-        Assert.Equal(expected.Length, model.Files.Count);
+        Assert.Equal(expected.Length + 2, model.Files.Count);
+        Assert.True(model.Projector is { Optional: true });
+        CatalogFile draft = Assert.Single(model.Files, f => f.Role == CatalogFileRole.Draft);
+        Assert.True(draft.Optional);
+        Assert.Equal("mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf", draft.FileName);
+        Assert.Equal(2_786_568_256, draft.Bytes);
+        Assert.Equal("5ff54097406a905cf3a724c709124ceb0e3e10235ee862298969e91c96fa96e6", draft.Sha256);
         Assert.Equal(78_869_128_864, model.TotalBytes);
         Assert.Equal(model.TotalBytes, model.WeightsBytes);
-        Assert.Equal(CatalogModalities.Text, model.Modalities);
+        Assert.Equal(CatalogModalities.Image | CatalogModalities.Video, model.Modalities);
     }
 
     [Fact]

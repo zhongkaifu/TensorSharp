@@ -27,6 +27,24 @@ namespace TensorSharp.Runtime
         private const string HandOverToAnswer =
             "\n\nConsidering the limited time by the user, I have to give the solution based on the thinking directly now.\n";
 
+        // How much of a thinking-off Nemotron-H Reasoning-128K reply may still turn out to
+        // be reasoning (ChatProtocol.ThinkingOffReplyMayReason): a `</think>` that starts
+        // within this many characters closes stray reasoning, one after it is the answer's
+        // own text. 98 stray closes were logged on the 8B Q4_K_M (Metal): tool rounds in
+        // TensorAgent and the Web UI, first rounds and long tool loops over the OpenAI API.
+        // They came at 320-1878 characters, median 684 and 95th percentile 1601, so all of
+        // them fall inside. 1024 covered 79%, and the closes it missed leaked the reasoning
+        // and the tag into held streams; the longest came deep in a tool loop, where each
+        // round reasons about the rounds before it. Known gap: behind TensorAgent's
+        // 12-tool system prompt tool rounds reason longer, and 4 of 39 closes logged there
+        // came at 2212-3064 characters, past this window, so they still leak. The price is paid by clients that
+        // cannot take text back (the OpenAI, Ollama and Responses streams, the CLI): an
+        // ordinary answer longer than this shows its first character only once this much
+        // has been generated, about 500 tokens or 30 s at the 8B's 16 tok/s and 100 s at
+        // 5 tok/s; their streams send keep-alives meanwhile (StreamKeepAlive), or a proxy's
+        // idle timeout closes them. Clients that can take text back are not held.
+        internal const int NemotronHStrayReasoningWindow = 2048;
+
         private static readonly object Gate = new();
         private static readonly Dictionary<string, ChatProtocol> ByArchitecture =
             new(StringComparer.OrdinalIgnoreCase);
@@ -415,7 +433,27 @@ namespace TensorSharp.Runtime
                     ? ChatTemplate.RenderNemotronHReasoning(r.Messages, r.AddGenerationPrompt, r.Tools, r.EnableThinking)
                     : ChatTemplate.RenderNemotron(r.Messages, r.AddGenerationPrompt, r.Tools, r.EnableThinking),
                 PreferOwnRenderer = _ => true,
-                CreateOutputParser = () => new ChatMlOutputParser(),
+                CreateOutputParser = () => new NemotronOutputParser(NemotronHStrayReasoningWindow),
+                // Reasoning-128K writes a made-up tool response after its call. Nemotron 3
+                // Nano / Omni write one <tool_call> per parallel call, so they keep going.
+                ToolCallEndsTurn = ChatTemplate.IsNemotronHReasoningTemplate,
+                // Reasoning-128K reasons past its closed `<think></think>` and closes the
+                // block itself, after tool results and on first rounds alike. The parser is
+                // told the prompt's tail only for this template, so Nemotron 3 ChatML parses
+                // as before.
+                ThinkingOffReplyMayReason = ChatTemplate.IsNemotronHReasoningTemplate,
+                // Both templates render a tool result from the tool message alone, so a
+                // calling round's raw tokens can stand in for it. Re-rendered, the call is
+                // not what the model wrote (Reasoning-128K writes Python calls), and the
+                // recurrent state cannot rewind: each round re-prefilled the conversation.
+                ToolCallRawSplicing = ToolCallRawSplicing.Always,
+                // Reasoning-128K's generation prompt opens the answer; its past turns are bare
+                // content. Nemotron 3 ChatML renders `<think></think>` into past turns itself.
+                AssistantGenerationSuffixForTemplate = (thinking, template) =>
+                    ChatTemplate.IsNemotronHReasoningTemplate(template)
+                        ? ChatTemplate.NemotronHGenerationPromptOpening(thinking)
+                        : null,
+                ModelWrittenTurnSeparator = template => ChatTemplate.IsNemotronHReasoningTemplate(template) ? "\n" : null,
                 // Thinking on primes `<think>\n` after the assistant marker (thinking off
                 // renders the closed `<think></think>`), so the answer starts after the
                 // model's own `</think>` - the same boundary the Nemotron 3.5 GGUF

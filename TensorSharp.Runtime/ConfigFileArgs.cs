@@ -57,7 +57,10 @@ namespace TensorSharp.Runtime
     /// <item><b>Auto-download.</b> A file option may be an object
     /// <c>{ "path": "...", "urls": ["...", "..."] }</c>. If <c>path</c> is missing
     /// on disk it is downloaded from the first working URL and saved there, so the
-    /// next run reuses the local copy. See <see cref="ModelDownloader"/>.</item>
+    /// next run reuses the local copy. An optional <c>"files"</c> array contains
+    /// additional download objects, such as the remaining split GGUF shards;
+    /// all are resolved while only the main path becomes an argument.
+    /// See <see cref="ModelDownloader"/>.</item>
     /// </list>
     ///
     /// Example config file:
@@ -593,6 +596,40 @@ namespace TensorSharp.Runtime
             JsonElement spec,
             ExpandContext context)
         {
+            // Parse the whole group before starting a potentially large transfer. A cached
+            // first shard must still resolve its remaining shards, and overriding the option
+            // must skip this entire group (AppendProperty handles that before resolution).
+            var files = new List<DownloadFile>();
+            CollectDownloadFiles(configPath, configDirectory, variables, key, spec, files);
+            foreach (DownloadFile file in files)
+            {
+                if (File.Exists(file.Path))
+                {
+                    context.Log.WriteLine($"[model-download] {file.Key}: using cached file at {file.Path}");
+                    continue;
+                }
+
+                if (file.Urls.Count == 0)
+                    throw new FileNotFoundException(
+                        $"Configuration file '{configPath}' option '{file.Key}' path not found and no download URL was provided: {file.Path}",
+                        file.Path);
+
+                context.Log.WriteLine($"[model-download] {file.Key}: '{file.Path}' not found locally; attempting download from {file.Urls.Count} source(s)");
+                ModelDownloader.Download(file.Path, file.Urls, file.Sha256, file.Key, context.Log, context.InteractiveProgress);
+            }
+            return files[0].Path;
+        }
+
+        private sealed record DownloadFile(string Key, string Path, List<string> Urls, string? Sha256);
+
+        private static void CollectDownloadFiles(
+            string configPath,
+            string? configDirectory,
+            VariableResolver variables,
+            string key,
+            JsonElement spec,
+            List<DownloadFile> files)
+        {
             if (!spec.TryGetProperty("path", out JsonElement pathElement) || pathElement.ValueKind != JsonValueKind.String)
                 throw new ArgumentException(
                     $"Configuration file '{configPath}' option '{key}' is an object but has no string \"path\" field. " +
@@ -608,20 +645,22 @@ namespace TensorSharp.Runtime
                 ? shaElement.GetString()
                 : null;
 
-            if (File.Exists(localPath))
+            files.Add(new DownloadFile(key, localPath, urls, sha256));
+
+            if (!spec.TryGetProperty("files", out JsonElement additionalFiles))
+                return;
+            if (additionalFiles.ValueKind != JsonValueKind.Array)
+                throw new ArgumentException(
+                    $"Configuration file '{configPath}' option '{key}' has a \"files\" field that is not an array.");
+            int index = 0;
+            foreach (JsonElement additionalFile in additionalFiles.EnumerateArray())
             {
-                context.Log.WriteLine($"[model-download] {key}: using cached file at {localPath}");
-                return localPath;
+                if (additionalFile.ValueKind != JsonValueKind.Object)
+                    throw new ArgumentException(
+                        $"Configuration file '{configPath}' option '{key}' has a non-object entry in \"files\" at index {index}.");
+                CollectDownloadFiles(configPath, configDirectory, variables, $"{key}.files[{index}]", additionalFile, files);
+                index++;
             }
-
-            if (urls.Count == 0)
-                throw new FileNotFoundException(
-                    $"Configuration file '{configPath}' option '{key}' path not found and no download URL was provided: {localPath}",
-                    localPath);
-
-            context.Log.WriteLine($"[model-download] {key}: '{localPath}' not found locally; attempting download from {urls.Count} source(s)");
-            ModelDownloader.Download(localPath, urls, sha256, key, context.Log, context.InteractiveProgress);
-            return localPath;
         }
 
         private static List<string> ReadUrls(string configPath, VariableResolver variables, string key, JsonElement spec)

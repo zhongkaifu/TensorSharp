@@ -58,6 +58,12 @@ namespace TensorSharp.Server.ProtocolAdapters
             if (update.IsParsed)
             {
                 IsParsed = true;
+                // Only a loop told its client can take text back retracts any; a collector's
+                // never is, but a retraction it did get still leaves the answer first.
+                string retracted = update.RetractedPiece;
+                if (!string.IsNullOrEmpty(retracted) && _content.Length >= retracted.Length
+                    && _content.ToString(_content.Length - retracted.Length, retracted.Length) == retracted)
+                    _content.Length -= retracted.Length;
                 if (!string.IsNullOrEmpty(update.Piece))
                     _content.Append(update.Piece);
                 if (!string.IsNullOrEmpty(update.ThinkingPiece))

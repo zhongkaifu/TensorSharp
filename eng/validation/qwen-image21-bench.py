@@ -13,7 +13,21 @@ Examples:
       --prompt 'Change the teapot to blue.'
   python3 eng/validation/qwen-image21-bench.py --mode multi --image a.png --image b.png \
       --prompt 'Place the object from image 2 into image 1.' --width 1024 --height 1024
+  python3 eng/validation/qwen-image21-bench.py --variant turbo --steps 8 --width 1024 --height 1024 \
+      --dit Qwen-Image-2.1-Turbo-AD-Q4_K.gguf --prompt 'a neon sign that reads "OPEN LATE", rainy night'
   python3 eng/validation/qwen-image21-bench.py --dry-run
+
+--variant turbo declares Qwen-Image-2.1-Turbo to TensorSharp (--qwen-image-variant turbo) and hands
+sd.cpp the same published 8-step schedule through --sigmas (sd.cpp needs c150a6b or newer for it).
+A style or editing plug-in (--lora with its --lora-config) runs on it; one that carries a sampling
+recipe is refused, as TensorSharp refuses it.
+
+Edit noise: sd.cpp draws an edit's initial noise from the seed alone; TensorSharp keys it to
+the reference images too (TS_QWEN21_EDIT_NOISE=references, its default), so an edit never
+restarts from the noise that drew its source. --edit-noise picks TensorSharp's side: `seed`
+(the default with --engine both or sd_cpp) matches sd.cpp's noise for pixel comparisons;
+`references` (the default with --engine tensorsharp) measures what TensorSharp ships. The
+choice is printed and recorded in the manifest.
 """
 import argparse
 import csv
@@ -67,6 +81,11 @@ def qwen21_sigmas(steps, image_tokens):
     return result + [0.0]
 
 
+# Qwen/Qwen-Image-2.1-Turbo model_index.json sample_sigmas (revision d65dbc9), used unshifted, plus
+# the terminal 0: QwenImage21Turbo.SampleSigmas in TensorSharp.
+TURBO_SIGMAS = [1.0, 0.978453, 0.95418, 0.926626, 0.89508, 0.845148, 0.704534, 0.414568]
+
+
 def recipe_sigmas(nodes, shift, image_tokens):
     """Match QwenImage21LoraRecipe.Sigmas: raw nodes, optionally through the checkpoint's
     dynamic exponential shift (no shift_terminal), then a terminal 0, rounded to F32."""
@@ -78,6 +97,30 @@ def recipe_sigmas(nodes, shift, image_tokens):
     return result + [0.0]
 
 
+def carried_recipe(config):
+    """What in a TensorSharp --lora-config brings a sampling recipe, or None: its own "sampling",
+    a PDD config's trained grid, or a forwarded companion config (a PDD bundle's carries one)."""
+    if "sampling" in config:
+        return 'its own "sampling" recipe'
+    if "pdd_num_steps" in config:
+        return "a PDD bundle's trained sigma grid"
+    if "config" in config:
+        return "a forwarded companion config, which for a PDD bundle carries a recipe"
+    return None
+
+
+def tensorsharp_schedule(args, recipe):
+    """The schedule TensorSharp samples, as the report states it (the run's log line names the
+    sigmas it actually used)."""
+    if args.variant == "turbo":
+        return {"kind": "turbo", "source": "Qwen/Qwen-Image-2.1-Turbo model_index.json sample_sigmas",
+                "shift": "none", "sigmas": recipe_sigmas(TURBO_SIGMAS, "none", 1)}
+    if recipe:
+        return {"kind": "lora-recipe", "source": f"{args.lora_config.name} ({recipe})"}
+    return {"kind": "base", "base_image_seq_len": 256, "max_image_seq_len": 8192,
+            "base_shift": 0.5, "max_shift": 0.9, "shift_terminal": 0.02}
+
+
 def comparison_notes(args):
     notes = []
     prompts = [args.prompt] + ([args.negative_prompt] if args.cfg > 1 else [])
@@ -87,9 +130,32 @@ def comparison_notes(args):
         notes.append("Reference resizing uses different filters (TensorSharp Lanczos, sd.cpp nearest-neighbor). For pixel comparisons, supply identical references already at the intended conditioning dimensions.")
         if args.width * args.height > 1024 * 1024:
             notes.append("TensorSharp caps reference conditioning near 1 megapixel; sd.cpp defaults to the output area. Match its geometry with --sd-extra=--ref-image-args --sd-extra=vae_input_max_pixels=1048576 or review an explicit reference-resize override.")
+    if getattr(args, "edit_noise", None) and args.engine == "both":
+        notes.append("TensorSharp edits ran with TS_QWEN21_EDIT_NOISE=seed: the same Philox noise as sd.cpp, not TensorSharp's default edit noise, which also follows the reference images."
+                     if args.edit_noise == "seed" else
+                     "TensorSharp edits ran with its default reference-keyed noise and sd.cpp with the seed's noise: the engines started from different noise, so pixel differences include the noise, not only the implementations.")
     if args.ts_extra or args.sd_extra:
         notes.append("Extra arguments can override the reported common settings; review each recorded engine command before treating the workloads as equivalent.")
     return notes
+
+
+def resolve_edit_noise(mode, engine, requested, inherited):
+    """TensorSharp's TS_QWEN21_EDIT_NOISE for this run, or None for text-to-image.
+
+    An explicit --edit-noise wins; otherwise a value already in the environment (an A/B arm's
+    override), otherwise sd.cpp's seed-only noise when sd.cpp runs and TensorSharp's default
+    when it runs alone. A contradiction or an unknown value is an error, never a guess.
+    """
+    inherited = (inherited or "").strip().lower()
+    if inherited not in ("", "references", "seed"):
+        raise ValueError(f"TS_QWEN21_EDIT_NOISE={inherited!r} is not one of references, seed.")
+    if requested and inherited and requested != inherited:
+        raise ValueError(f"--edit-noise {requested} contradicts TS_QWEN21_EDIT_NOISE={inherited} in the environment.")
+    if mode == "t2i":
+        if requested:
+            raise ValueError("--edit-noise applies to edit and multi modes; text-to-image noise follows the seed alone.")
+        return None
+    return requested or inherited or ("references" if engine == "tensorsharp" else "seed")
 
 
 def capture(argv):
@@ -455,6 +521,11 @@ def commands(args, models, ts_image, sd_image):
           "--rng", "cuda", "--seed", str(args.seed), "--fa", "-o", str(sd_image)]
     if args.sd_backend:
         sd += ["--backend", args.sd_backend]
+    if args.variant == "turbo":
+        ts += ["--qwen-image-variant", "turbo"]
+        sd += ["--sigmas", ",".join(format(value, ".9g") for value in recipe_sigmas(TURBO_SIGMAS, "none", 1))]
+    elif args.variant == "base":
+        ts += ["--qwen-image-variant", "base"]
     if args.sigma_nodes:
         # A LoRA recipe's schedule; TensorSharp derives the same values from --lora-config.
         nodes = [float(v) for v in args.sigma_nodes.split(",")]
@@ -519,11 +590,18 @@ def main():
                         help="sd.cpp <lora:name:multiplier>; defaults to --lora-scale (or 1). sd.cpp ignores PEFT alpha metadata.")
     parser.add_argument("--sigma-nodes", help="Comma-separated recipe sigma nodes passed to sd.cpp as --sigmas (after --sigma-shift).")
     parser.add_argument("--sigma-shift", choices=("none", "dynamic"), default="none")
+    parser.add_argument("--variant", choices=("base", "turbo"),
+                        help="Declare the checkpoint to TensorSharp (--qwen-image-variant). turbo also passes "
+                             "Qwen-Image-2.1-Turbo's published 8-step schedule to sd.cpp; it takes --steps 8 only.")
     parser.add_argument("--ts-extra", action="append", default=[], help="Additional TensorSharp argv token; use --ts-extra=--option.")
     parser.add_argument("--sd-extra", action="append", default=[], help="Additional sd.cpp argv token; use --sd-extra=--option.")
     parser.add_argument("--engine-order", choices=("sd-first", "ts-first"), default="sd-first")
     parser.add_argument("--engine", choices=("both", "tensorsharp", "sd_cpp"), default="both",
                         help="Run a single engine for quality/performance validation without requiring the reference binary.")
+    parser.add_argument("--edit-noise", choices=("references", "seed"),
+                        help="TensorSharp's edit noise in edit and multi modes (TS_QWEN21_EDIT_NOISE): seed matches sd.cpp's "
+                             "seed-only noise; references is TensorSharp's default. Default: seed with --engine both or sd_cpp, "
+                             "references with --engine tensorsharp, or the value TS_QWEN21_EDIT_NOISE already has.")
     parser.add_argument("--repeat", type=int, default=1, help="Serial fresh-process measurements per engine, not warm in-process requests.")
     parser.add_argument("--timeout", type=float, default=3600, help="Seconds per engine invocation.")
     parser.add_argument("--sample-interval", type=float, default=1.0,
@@ -544,8 +622,15 @@ def main():
         parser.error("Cooldown must be finite and nonnegative.")
     if args.match_sigmas and any(value == "--sigmas" or value.startswith("--sigmas=") for value in args.sd_extra):
         parser.error("--match-sigmas cannot be combined with --sd-extra=--sigmas.")
+    if args.variant == "turbo" and (args.steps != len(TURBO_SIGMAS) or args.match_sigmas or args.sigma_nodes):
+        parser.error("--variant turbo runs Turbo's own 8-step schedule: pass --steps 8 and neither --match-sigmas "
+                     "nor --sigma-nodes.")
     if (args.mode == "t2i" and args.image) or (args.mode == "edit" and len(args.image) != 1) or (args.mode == "multi" and len(args.image) < 2):
         parser.error("t2i takes no images; edit takes exactly one; multi takes two or more --image arguments.")
+    try:
+        args.edit_noise = resolve_edit_noise(args.mode, args.engine, args.edit_noise, os.environ.get("TS_QWEN21_EDIT_NOISE"))
+    except ValueError as error:
+        parser.error(str(error))
     models = {n: (getattr(args, n) or args.models_dir/f).resolve() for n, f in MODEL_NAMES.items()}
     args.image = [p.resolve() for p in args.image]
     args.cli, args.sd_cli, args.sd_repo, args.ggml_repo, args.output = (
@@ -554,6 +639,7 @@ def main():
     if (args.lora_config or args.lora_scale is not None or args.sd_lora_multiplier is not None or args.sigma_nodes) and not args.lora \
             and not args.sigma_nodes:
         parser.error("--lora-config/--lora-scale/--sd-lora-multiplier require --lora.")
+    recipe = None
     if args.lora:
         args.lora = args.lora.resolve()
         if args.lora.suffix.lower() != ".safetensors":
@@ -566,6 +652,12 @@ def main():
             if args.lora_scale is None and args.sd_lora_multiplier is None and config.get("scale", 1.0) != 1.0:
                 parser.error(f"{args.lora_config.name} sets strength {config['scale']}; pass --lora-scale (or "
                              "--sd-lora-multiplier) so sd.cpp gets the same strength.")
+            recipe = carried_recipe(config)
+            # Turbo is step-distilled already: TensorSharp refuses a plug-in that brings a second
+            # schedule. Style and editing plug-ins carry none and run on Turbo's.
+            if args.variant == "turbo" and recipe:
+                parser.error(f"--variant turbo: {args.lora_config.name} carries {recipe}. TensorSharp refuses "
+                             "step-distillation plug-ins on Qwen-Image-2.1-Turbo; style and editing plug-ins run on it.")
     if not args.dry_run:
         binaries = ([args.cli] if args.engine == "tensorsharp" else [args.sd_cli]
                     if args.engine == "sd_cpp" else [args.cli, args.sd_cli])
@@ -575,6 +667,10 @@ def main():
                 parser.error(f"Required file is missing: {path}")
     args.output.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ)
+    if args.edit_noise:
+        env["TS_QWEN21_EDIT_NOISE"] = args.edit_noise
+        print(f"TensorSharp edit noise: {args.edit_noise}"
+              + (" (sd.cpp's seed-only noise)" if args.edit_noise == "seed" else " (keyed to the reference images, TensorSharp's default)"), flush=True)
     # Only named numerical/performance knobs are recorded; unrelated environment
     # variables may contain credentials and must never enter a report.
     device_env = {"CUDA_VISIBLE_DEVICES", "CUDA_LAUNCH_BLOCKING", "CUDA_MODULE_LOADING",
@@ -584,13 +680,14 @@ def main():
                     if k.startswith(("TS_QWEN", "GGML_", "TENSORSHARP_GGML_")) or k in device_env}
     manifest = {
         "created_utc": datetime.now(timezone.utc).isoformat(), "dry_run": args.dry_run,
-        "parameters": {k: getattr(args, k) for k in ("mode", "prompt", "negative_prompt", "width", "height", "steps", "cfg", "seed", "backend", "sd_backend", "repeat", "match_sigmas")},
+        "parameters": {k: getattr(args, k) for k in ("mode", "prompt", "negative_prompt", "width", "height", "steps", "cfg", "seed", "backend", "sd_backend", "repeat", "match_sigmas", "variant")},
         "sampler": "Euler", "noise": "Philox4x32-10 / Box-Muller (--rng cuda)",
+        "edit_noise": None if args.mode == "t2i" else {"tensorsharp": args.edit_noise, "sd_cpp": "seed"},
         "engine_selection": args.engine,
         "cooldown_seconds": args.cooldown_seconds,
-        "tensorsharp_schedule": {"base_image_seq_len": 256, "max_image_seq_len": 8192,
-                                 "base_shift": 0.5, "max_shift": 0.9, "shift_terminal": 0.02},
-        "sd_cpp_sigmas": qwen21_sigmas(args.steps, (args.width // 16) * (args.height // 16)) if args.match_sigmas else None,
+        "tensorsharp_schedule": tensorsharp_schedule(args, recipe),
+        "sd_cpp_sigmas": (qwen21_sigmas(args.steps, (args.width // 16) * (args.height // 16)) if args.match_sigmas
+                          else recipe_sigmas(TURBO_SIGMAS, "none", 1) if args.variant == "turbo" else None),
         "hardware": {"platform": platform.platform(), "machine": platform.machine(),
                      "cpu": capture(["sysctl", "-n", "machdep.cpu.brand_string"]) if sys.platform == "darwin" else platform.processor(),
                      "memory_bytes": capture(["sysctl", "-n", "hw.memsize"]) if sys.platform == "darwin" else None},
@@ -613,7 +710,7 @@ def main():
                         "sd.cpp enables automatic weight placement/graph segmentation by default. Check its runtime placement logs; --backend cuda0 alone does not prove every weight remained on the GPU.",
                         "Pixel statistics and matched-seed similarity do not establish semantic quality or fidelity.",
                         ("sd.cpp receives the same F32 sigma vector as TensorSharp through --sigmas. Kernel and encoder rounding can still change pixels."
-                         if args.match_sigmas else
+                         if args.match_sigmas or args.variant == "turbo" else
                          "TensorSharp uses the released Qwen 2.1 scheduler. Older sd.cpp revisions use Flux shift defaults; identical CLI settings do not imply identical sigma schedules. Use --match-sigmas for matched denoising schedules."),
                         "No unavailable model/device scenario is counted as a passing measurement."] + comparison_notes(args),
         "runs": [],
