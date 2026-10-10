@@ -35,6 +35,7 @@
     <ReferenceNativeSymbol Include="TSGgml_AlignedFree" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_AttachSharedCacheBudget" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_AttachSharedCacheBudgetEx" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_AttachSharedCacheBudgetWithHost" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_AttentionSoftmaxWithSinksF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_BinaryScalarF32" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_BinaryTensorF32" SymbolType="Function" />
@@ -273,6 +274,7 @@
     <ReferenceNativeSymbol Include="TSGgml_QwenVaeRun" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_RecreateBackend" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_ReduceLastDimF32" SymbolType="Function" />
+    <ReferenceNativeSymbol Include="TSGgml_RegisterHostFileSource" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_RegisterOffloadable" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_RegisterPinnedHostBuffer" SymbolType="Function" />
     <ReferenceNativeSymbol Include="TSGgml_RegisterQ8F32Weight" SymbolType="Function" />

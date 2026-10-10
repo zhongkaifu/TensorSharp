@@ -6227,6 +6227,12 @@ internal enum GgmlIndexReductionOp
             return TSGgml_RegisterPinnedHostBuffer(ptr, bytes) != 0;
         }
 
+        [LibraryImport(DllName, StringMarshalling = StringMarshalling.Utf8)]
+        private static partial int TSGgml_RegisterHostFileSource(IntPtr pointer, long bytes, string path, long offset);
+
+        public static bool RegisterHostFileSource(IntPtr pointer, long bytes, string path, long offset)
+            => TSGgml_RegisterHostFileSource(pointer, bytes, path, offset) != 0;
+
         public static void UnregisterPinnedHostBuffer(IntPtr ptr)
         {
             TSGgml_UnregisterPinnedHostBuffer(ptr);

@@ -112,9 +112,15 @@ public sealed class GgmlGraphBudgetScopeTests
         internal delegate IntPtr AllocateBuffer(int rank, long bytes);
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
         internal delegate void FreeBuffer(IntPtr buffer);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        internal delegate int ReserveHostBuffer(long bytes);
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        internal delegate void ClearHostBuffer();
         private readonly IntPtr _module;
         public AllocateBuffer Allocate { get; }
         public FreeBuffer Free { get; }
+        public ReserveHostBuffer ReserveHost { get; }
+        public ClearHostBuffer ClearHost { get; }
         public NativeFixture()
         {
             GgmlBasicOps.EnsureBackendAvailable(GgmlBackendType.Cuda);
@@ -125,9 +131,54 @@ public sealed class GgmlGraphBudgetScopeTests
             {
                 Allocate = Marshal.GetDelegateForFunctionPointer<AllocateBuffer>(NativeLibrary.GetExport(_module, "TSGgml_TestGraphBudgetAllocate"));
                 Free = Marshal.GetDelegateForFunctionPointer<FreeBuffer>(NativeLibrary.GetExport(_module, "TSGgml_TestGraphBudgetFree"));
+                ReserveHost = Marshal.GetDelegateForFunctionPointer<ReserveHostBuffer>(NativeLibrary.GetExport(_module, "TSGgml_TestExpertHostWorkspaceReserve"));
+                ClearHost = Marshal.GetDelegateForFunctionPointer<ClearHostBuffer>(NativeLibrary.GetExport(_module, "TSGgml_TestExpertHostWorkspaceClear"));
             }
             catch { NativeLibrary.Free(_module); throw; }
         }
         public void Dispose() => NativeLibrary.Free(_module);
+    }
+
+    [GgmlFact(BackendType.GgmlCuda)]
+    [Trait("Requires", "NativeTestHooks")]
+    public void ExpertHostArenaSharesRamCreditWithoutChargingGpuAndRejectsLateAdoption()
+    {
+        using var native = new NativeFixture();
+        var budget = new MemoryBudget([new("ram", 8192), new("gpu", 4096)]);
+        using var other = budget.Reserve([new("ram", 4096)]);
+        other.Commit();
+        Assert.Equal(1, native.ReserveHost(4096));
+        try
+        {
+            Assert.Throws<InvalidOperationException>(() => new GgmlCacheBudgetScope(budget, [["gpu"]], false, ["ram"]));
+            using var legacy = new GgmlCacheBudgetScope(budget, [["gpu"]]);
+            Assert.False(legacy.IncludesHostBuffers);
+            Assert.Equal(0, legacy.ActiveAllocations);
+        }
+        finally { native.ClearHost(); }
+        using var scope = new GgmlCacheBudgetScope(budget, [["gpu"]], false, ["ram"]);
+        Assert.True(scope.IncludesHostBuffers);
+        try
+        {
+            Assert.Equal(1, native.ReserveHost(4096));
+            Assert.Equal(1, scope.ActiveAllocations);
+            Assert.Equal(1, native.ReserveHost(2048));
+            Assert.Equal(1, scope.ActiveAllocations); // No second charge for reuse.
+            Assert.Equal(8192, budget.Snapshot().Single(p => p.Pool == "ram").Committed);
+            Assert.Equal(0, budget.Snapshot().Single(p => p.Pool == "gpu").Committed);
+            Assert.Throws<InvalidOperationException>(() => scope.Dispose());
+            // Growing frees the old arena before reserving the replacement.
+            Assert.Equal(0, native.ReserveHost(4097));
+            Assert.Equal(0, scope.ActiveAllocations);
+            Assert.Equal(4096, budget.Snapshot().Single(p => p.Pool == "ram").Committed);
+            Assert.Equal(1, native.ReserveHost(4096));
+            Assert.Null(scope.CallbackError);
+        }
+        finally { native.ClearHost(); }
+        Assert.Equal(0, scope.ActiveAllocations);
+        Assert.Equal(4096, budget.Snapshot().Single(p => p.Pool == "ram").Committed);
+        Assert.All(budget.Snapshot(), p => Assert.Equal(0, p.Reserved));
+        scope.Dispose();
+        using var reattached = new GgmlCacheBudgetScope(budget, [["gpu"]], false, ["ram"]);
     }
 }

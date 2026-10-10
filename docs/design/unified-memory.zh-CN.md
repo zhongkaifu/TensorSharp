@@ -1,6 +1,6 @@
 # TensorSharp 统一 VRAM / RAM / SSD 调度系统
 
-源码基线：`f5b1eefb6cf378ed19c9a33178be84c818f7fc4b`；文件权重执行续作基于 `163474ba30814e5abcaba277c3a1f83d9f8ab604`。设计、实现与硬件续验：2026-10-08 UTC。
+源码基线：`f5b1eefb6cf378ed19c9a33178be84c818f7fc4b`；文件权重执行续作基于 `163474ba30814e5abcaba277c3a1f83d9f8ab604`。设计、实现与硬件续验：2026-10-10 UTC。
 
 ## 1. 交付状态与目标
 
@@ -17,11 +17,14 @@
 | 文件权重实际执行 | dense Qwen35 Q8_0 和 dense Gemma4 Q8_0/F16 PLE 的单 rank GGML CUDA 文本适配器已接入；Qwen 0.8B 已验收，Gemma E4B 短/长提示 Forward 和分块 ForwardRefill 完整 logits 逐位一致；配额只覆盖登记的权重 payload |
 | Qwen CUDA/UMA 静态放置算法通用化 | 已接入原模型路径；保持原调优参数 |
 | 主机 KV 快照、前缀页、循环状态快照 | 显式启用时选择可恢复的逐序列路径，不再被融合路径绕过；Gemma 及 dense、无 MTP、单 rank GGML CUDA 的 Qwen 3.5 真实模型 RAM/文件换页已验证；不接管原生 holder/device arena |
-| CUDA 原始分配/读写/释放、真实 event fence、可选 P2P | 两张 A40 上单卡和主机中转多卡通过；本 VM 的直接 P2P 数据损坏，保持默认关闭 |
-| GGML lazy device-copy/preload、选中专家 cache | 可通过 GgmlCacheBudgetScope 接入同一份托管 MemoryBudget，分配前预留、物理释放后归还；原有独立 cache 配额仍有效 |
+| CUDA 原始分配/读写/释放、真实 event fence、可选 P2P | 默认有界主机中转。前一台 `63.141.33.49` 的中转和显式 P2P 探针通过；当前 `69.30.85.216` 的中转通过、显式 P2P 两个方向均损坏，独立 CUDA oracle 复现；不能跨部署推断直连可靠性 |
+| GGML lazy device-copy/preload、选中专家 cache | 可通过 GgmlCacheBudgetScope 接入同一份托管 MemoryBudget，分配前预留、物理释放后归还；原有独立 cache 配额仍有效。Linux CUDA 大权重 cache miss 默认按页面驻留与 CPU 配额选择有界读取/上传流水线；不新增主机权重 payload 副本，实际覆盖见第 14 节 |
+| Flash 选中专家的 Windows 文件读取/上传 | 已实现精确分片区间登记、有界并行读取、最多 32 MiB 共享搬运 arena、失败恢复和设备驻留释放后的重新登记；超过可用 RAM 且已有正值专家配额时自动选择。arena 可通过 hostPools 接同一 RAM 账本；槽内默认使用衰减频次淘汰，冷热性能和独立质量验收仍需分别看第 14 节 |
 | 硬件/请求预算规划与驻留保留 | dense Gemma4/Qwen35 的 AdaptiveModelSession 显式入口；优先保留驻留图，按物理可用 RAM/VRAM、权重格式、融合、KV/状态和工作区选择；不是全模型自动策略 |
 | 文件权重的跨 token RAM / GPU 复用 | RAM 保留原始字节区间；GPU 可保留完整权重及其输入/输出/scratch arena。动态入口按硬件余量、执行期峰值和用户上限设置额度，压力时先回收缓存；Qwen FullPrecision 覆盖 prefill/decode，Gemma ResidentCuda 当前只保留 N=1 decode |
 | 文件执行临时 CUDA 工作区复用 | AdaptiveModelSession 默认自动启用；扣除其他 owner 与执行预留后，以最多四分之一余量作为工作区准入份额，权重缓存留出相应空间；请求 reset 回收未再使用的项。显式 0 关闭；底层手工 WeightStreamingOptions 仍保留零缓存默认值 |
+| Qwen4Exp 单 token 图内复制及广播消除 | CUDA 默认保留已连续的选定只读输入，并以零步幅 view 广播；真实 IQ1_M 的 34 行完整 logits 逐位一致。最新新 VM 应用 decode 56.65 token/s，同期 llama 59.95，尚未对齐，详见第 14 节 |
+| Qwen4Exp 图、循环状态与设备快照预算 | 已接入 includeGraphBuffers 共享账本，覆盖单请求和 batch arena；快照回滚、耗尽拒绝、增额重试和清理归零已有 CUDA 测试；仍不是总 VRAM 上限 |
 | GGML/Metal/Vulkan/MLX 原生图、分页 KV、全部融合算子 | 全面适配仍待实现；本轮没有 Metal/Vulkan/MLX 硬件验收 |
 | 多卡预算向量、带节点/设备标识的资源位置 | 已支持多位置工作集租约和全 rank fence；两张 A40 上实际内核、双向中转和释放验证通过 |
 | 多机协调、远程内存、异步 DMA 重叠 | 设计阶段，未实现；文件提前读取已实现，不能等同异步 CUDA DMA |
@@ -49,9 +52,9 @@
 
 本次原生改动全部位于 TensorSharp 自有 C++/CUDA 文件。upstream ggml 固定为 `ffa4e8b80930029a35991f94e7c8a93cd67730ab`，本地 checkout 保持原样，此前 VM 验收也使用未修改的同一 revision。VM 的 CUDA 12.8 / sm_86 缓存预算构建和本机 CUDA 12.6 / sm_86 文件权重构建分别记录，不能混为一次验收。对该 VM 使用 ggml 已有的 `GGML_CUDA_NO_PEER_COPY=ON`；TensorSharp 的 CMake 不再强制覆盖用户选项，没有修改 upstream 实现。
 
-lazy device-copy cache 在分配前原子预留、成功发布后转为 committed，使用 ggml 报告的 buffer 字节数；显式 preload 单独记录 reserved/committed。`GgmlBasicOps.TryGetCacheMemoryUsage` 提供每 rank 诊断。可在首次缓存分配前安装 `GgmlCacheBudgetScope`，将这些缓存的完整所有权记入与 KV 快照共用的托管 `MemoryBudget`；物理释放后才归还额度，失败的 scope 卸载可在清理后重试。新增 `includeGraphBuffers: true` 可纳入已接线的普通算子和 Gemma/Qwen35 图 buffer、reuse gallocr；默认构造保留旧 cache-only 合约。仍未覆盖所有 native executor、backend/driver pool 和总 RSS/VRAM。具体接入与关闭顺序见第 15 节。
+lazy device-copy cache 在分配前原子预留、成功发布后转为 committed，使用 ggml 报告的 buffer 字节数；显式 preload 单独记录 reserved/committed。`GgmlBasicOps.TryGetCacheMemoryUsage` 提供每 rank 诊断。可在首次缓存分配前安装 `GgmlCacheBudgetScope`，将这些缓存的完整所有权记入与 KV 快照共用的托管 `MemoryBudget`；物理释放后才归还额度，失败的 scope 卸载可在清理后重试。新增 `includeGraphBuffers: true` 可纳入已接线的普通算子和 Gemma/Qwen35 图 buffer、reuse gallocr，以及 Qwen4Exp 自有图 arena、循环状态和设备状态快照；默认构造保留旧 cache-only 合约。仍未覆盖所有 native executor、backend/driver pool 和总 RSS/VRAM。具体接入与关闭顺序见第 15 节。
 
-首次 DeviceCopy 上传现在在发布前同步完成，随后图构建因 scratch 分配失败而退出，也不会留下未初始化的缓存命中。CPU/UMA host-pointer 路径不变；冷 miss 增加 descriptor 和同步成本，尚未测量其性能影响，不能宣传为提速。设备回归覆盖 F32、Q8_0、opaque host key 和放弃图构建后重试；没有 Metal/Vulkan 运行验证。
+首次 DeviceCopy 上传现在在发布前同步完成，随后图构建因 scratch 分配失败而退出，也不会留下未初始化的缓存命中。CPU/UMA host-pointer 路径不变；该正确性修复相对早期延迟上传的独立成本尚未隔离，不能将它本身宣传为提速。后续 Linux 冷页读取/上传优化保留这一发布边界，其同一二进制开关对照见第 14 节。设备回归覆盖 F32、Q8_0、opaque host key、放弃图构建后重试，以及跨 64 MiB 窗口和部分尾块；没有 Metal/Vulkan 运行验证。
 
 ## 3. 系统分层
 
@@ -592,6 +595,866 @@ Qwen0.8B Q8 的两轮加载、32 行完整词表通过原门槛（最大 relativ
 
 本地 RTX 3080 Laptop 16 GiB、CUDA 12.6，四组对照期间无并发推理、构建或模型下载；文件缓存预热、未锁频，不作为跨机器或 p95/p99 保证。原始范围、身份、预算与完整失败记录在忽略的 `artifacts/unified-memory-adaptive/workspace-auto-v1/`。上一提交 `f0baf26a` 的 PR Unit Tests 已通过（[CI](https://github.com/zhongkaifu/TensorSharp/actions/runs/37886188421)），包括此前完成通知竞态修复；新的提交仍需独立 CI。没有新增多 GPU、异步搬运、IQ2 FF7、媒体或智能体语义通过；全驻留独立基线差距仍未关闭。
 
+### 2026-10-09 UTC：Flash 文件读取、冷热性能与独立质量续验
+
+本节基于 `5bce5840` 之后的工作区修改。TensorSharp-owned native SHA256 为 `3fb137a04a10511cec5a1f5a43f8e7d35712471dfb65d2c56f39176a8eab940a`，最终 Models 为 `6dcadb46…`；upstream ggml `ffa4e8b80930029a35991f94e7c8a93cd67730ab` checkout 保持未修改。复用此前 mmap 读取/上传流水线；新增 Windows 文件读取，避免所有 decode miss 都将映射源页纳入进程工作集。加载器登记精确分片、偏移和长度，读取工人填充一个按需增长的主机 arena，只有提交线程执行上传。投影全部提交后才发布槽位，失败时等待在途读取/上传；不改原权重字节或算术。
+
+arena payload 上限 **32 MiB**，此模型观测约 **16.85 MiB**；优先小型 CUDA pinned host allocation，失败时回退 pageable RAM，不锁住整套模型映射。空缓存 trim 释放 arena；模型仍存活但调用 `ReleaseGgmlDeviceResidency()` 时，失效旧登记后按原 GGUF 区间重新登记，保证下次执行继续使用文件路径。自动策略仅覆盖 Windows、GGML CUDA、可映射量化专家、已有正值专家配额且专家总量大于当前可用 RAM 的情况，在加载和设备驻留释放后评估。`TS_HOST_MOE_FILE_READ=0/1` 保留诊断覆盖。**这不是全局动态 RAM 策略**：主机 arena 尚未接共同 RAM 账本，专家 VRAM 配额仍需配置，CPU 长预填充与其他权重/KV 不在此文件路径中。
+
+正式验证在 RTX 3080 Laptop 16 GiB、31.71 GiB RAM、i7-11800H、CUDA 12.6 上串行运行，无并发模型/构建/下载，未锁频、未清空 OS 缓存。中文 FF7 提示 62 tokens、126 decode forward、自然 EOS、context512、8 CPU threads、无推测解码；同一最终二进制只切换文件读取。两轮 ABBA/BAAB 共 8 进程，每进程首请求单列、之后 3 次重复；两侧专家配额均为 9472 MiB，实际专家图保留均为 **9,894,764,544 bytes**。
+
+| 中文完整生成 | mmap | 有界文件读取 |
+| --- | ---: | ---: |
+| 首请求 prefill 中位 tokens/s，各 4 次 | 12.35 | 7.40 |
+| 首请求 decode 中位 tokens/s，各 4 次 | 6.06 | 15.35 |
+| 热请求 prefill 中位 tokens/s，各 12 次 | 22.31 | 24.30 |
+| 热请求 decode 中位 tokens/s，各 12 次 | 24.86 | 22.00 |
+| 全部进程的峰值工作集 GiB | 21.98 | 16.60 |
+| 采样全设备 VRAM 峰值 GiB，含桌面 | 14.33 | 14.37 |
+
+首次 decode 改善，热 decode **-11.52%**；首次 prefill 的观测亦下降、范围较宽，不能只展示有利数字。首请求不是受控冷 SSD；热请求是同进程相同提示和历史。完整词表链与输出在全部 32 请求逐位相同并完成清理，但这仅验证搬运等价性。另一个 88-token 工具 JSON 提示 ABBA 共 16 请求也完整词表逐位一致、自然 EOS；首请求 decode 中位 **3.62→9.12**，热 decode **22.16→17.84（-19.47%）**，峰值工作集 **22.58→19.03 GiB**。中文和工具提示都没有用输出来证明一般语言质量。
+
+带 I/O 采样的独立诊断发现 mmap 过程可用 RAM 最低仅 **0.257 GiB**，全磁盘读取约 **18.18 GiB**；早期文件版本对应 **3.148 GiB / 8.51 GiB**。两次顺序及 OS cache 状态不同、二进制也非最终版本，不计受控性能结论；全磁盘统计覆盖其他进程，PageFaultCount 包含软错误，进程 I/O 又遗漏部分 mmap 读取。Windows 内核追踪因权限不可用，未将其算作通过。热请求仍需复制读入文件字节；新策略如何同时保留首次性能与热数据复用，是后续工作，不宣称瓶颈已经全部定位或解决。
+
+已撤回 PrefetchVirtualMemory（热请求回退和更大磁盘读取）、VirtualUnlock（内核开销/停顿）、完整与三个地址抽样的 QueryWorkingSetEx（均有严重内核开销），以及按热度串行 ReadFile（热 decode 回退约 14.78%）。被中止的实验只有原始日志，不计完整吞吐或通过。最终保留有界并行读/上传；没有改 ggml。默认自动选择的真实模型另完成一次首次、两次设备驻留释放后 refill，三次完整词表一致、EOS 和清理通过；重新登记日志真实出现，重复 refill decode 约 **14.71/14.71 tokens/s**，不能作为热吞吐；首次 prefill 仍约 **29.53 s**。
+
+独立 Strata `99f3dbd0b21d1401b3769e0c0d963913607f380b` 与固定 llama.cpp `3cf03257f219afbe7334045ff7c6a06ac68c627d` 从未修改源码构建，TensorSharp 的依赖仍为前述 `ffa4e8b…`。两轮新进程测试给两引擎相同提示 token IDs、FP16 KV、greedy/EOS、无实际 MTP。平方数 1..20 列表全部通过且输出 IDs 相同；严格工具 JSON **TensorSharp 缓存开启/关闭均失败，Strata 通过**：TensorSharp 多出 Markdown 代码围栏。没有剥除围栏、放宽检查或把正确字段当作格式通过，也没有执行真实工具或完整智能体循环。文件搬运开关保持同一 CUDA 路径的全部 logits；缓存关闭是另一 CPU 量化算术，不能把这两类比较混为一谈。
+
+该 Strata 首请求 decode 约 **3–4 tokens/s**，TensorSharp 文件路径平方数约 **12.96/18.30**、工具 JSON **8.90/8.20**；不是用户 10–11 基线的复现。Strata 实际专家缓存约 9.60 GiB、进程工作集约 10.31 GiB；TensorSharp 专家配额 9.25 GiB、工作集约 13.93–19.03 GiB，总 RAM 不匹配。兼容 pack 的 dense BF16 转换、两个引擎的 prefill/decode/TTFT 分母差异明确保留，因此不能宣称相同资源性能或整图逐位 parity。此独立比较使用 native `70658696…`，后续最终版新增回收/重新登记修复；二进制与各自范围分别记录。
+
+最终本机原生 CUDA 检查 **16/16、无跳过**，涵盖真实 Q8/IQ1_M 文件偏移/边界、异序完成、部分上传/读取失败恢复、源失效、pageable fallback、trim 与释放后重用；Compute Sanitizer memcheck **0 errors**。性能比较器 **21/21**、语义检查工具 **11/11**；这些工具测试不改变实际 JSON 失败。新增原生入口的 iOS 保留清单已同步，既有项目/源符号检查 **21/21** 通过，未运行 iOS 构建/设备。Probe/Server.Host 构建成功。原始证据在忽略的 `artifacts/flash-decode-optimization-v2/`，汇总为 [本地报表](../validation/flash-decode-optimization-v2/report.html)；复用工具在 [Probe 说明](../../eng/validation/Qwen4ExpExpertCacheProbe/README.md)。
+
+**剩余工作**：解决热 decode 回退与首次 prefill；Flash 全请求 RAM/VRAM/workspace 共同规划；匹配总资源及请求的独立性能验收；严格结构化输出、Gemma IQ2 无限重复、Qwen Image 字幕质量与真实多轮智能体；长上下文及新版本多 GPU 回归。给定 VM 的 SSH 本轮仍拒绝连接，未新增远程/多 GPU 通过记录。历史 `1.29 tokens/s` 是旧 2 GiB 缓存、仅 3 decode 次、无 warmup 的短请求，不能直接与本轮 9.25 GiB/长生成相除当作补丁提速。
+
+### 2026-10-09 UTC：专家频次复用、共同主机预算和实际工具往返
+
+本轮仍使用未修改的 upstream ggml `ffa4e8b80930029a35991f94e7c8a93cd67730ab`。已开启的紧凑专家缓存，槽内淘汰默认改为**衰减访问频次，同频时 LRU**；保护当前全部路由，优先空槽，16-bit 计数饱和，衰减周期随容量选择 32–1024 行。只增加计数元数据，不增加权重副本或改变计算。`TS_HOST_MOE_EXPERT_CACHE_LFU=0` 保留原 LRU 对照；专家缓存本身仍要求正值配额，尚未变成全请求自动规划。
+
+真实中文、工具 JSON、平方数的路由捕获，均先逐项复现原生 LRU 的 calls/hits/misses，再用于离线策略诊断；trace 计时不算吞吐。中文热请求的专家未命中中位数 **5440→3332**，工具 **2814→1723**，平方数 **1663→934**，主要减少重复文件读取和上传。正式比较保持两侧配额、文件读取、CPU 线程、上下文、采样完全相同，短 prefill 固定走 CPU。硬件仍为 RTX 3080 Laptop 16 GiB、31.71 GiB RAM、i7-11800H，未锁频、未清空 OS 页缓存。
+
+| 请求 / 配额 / 二进制 | 热 prefill，LRU→频次，tokens/s | 热 decode，LRU→频次，tokens/s | decode 变化 | 进程峰值 WS，LRU→频次，GiB |
+| --- | ---: | ---: | ---: | ---: |
+| 中文 / 9472 MiB / A，两轮 ABBA+BAAB | 21.42→22.37 | 21.52→24.39 | +13.33% | 16.56→16.59 |
+| 工具 JSON / 9472 MiB / A，ABBA | 21.51→20.68 | 17.70→21.77 | +23.03% | 19.03→19.03 |
+| 平方数 / 9472 MiB / B，ABBA | 24.35→23.10 | 25.66→26.72 | +4.14% | 14.02→14.03 |
+| 工具 JSON / 2048 MiB / B，ABBA | 20.93→21.58 | 7.96→9.23 | +15.95% | 19.03→19.03 |
+
+A 为 native `bc756aabe81e69637cd7b30b675d23c64e91f5e71beecd386084b4dc75ff68c7`，B 为最终 `9c3e68d79200a2f77779fa3ae7a65b9e3975edbb42e7e909c74b5e21ee281f40`；两者之间只拆分主机预算原生接口并增加版本不匹配时的明确拒绝，未改专家计算/淘汰代码。各二进制分别统计。另有 A 的平方数 BAAB，热 decode **25.83→26.99**，完整结果保留在报表。9472 MiB 组的实际专家图保留均为 **9,894,764,544 bytes**；2048 MiB 组为 **2,101,714,944 bytes**。全设备峰值大缓存约 14.4–14.5 GiB，小缓存约 7.2 GiB，含桌面，不是模型硬上限。
+
+六轮共 **96 次完整生成**的受控组内词表链、EOS、配额及清理均通过。平方数 32 次独立内容检查通过；无约束工具 JSON 32 次仍带围栏，严格检查失败。中文只有回归一致性与实际输出记录，不据此宣布广泛语言质量通过。首请求仍有退步和顺序影响：A 的工具 decode **9.31→8.65**、平方数 **18.44→14.77**；B 的平方数反向顺序为 **15.40→16.72**。首次 prefill 未普遍改善，不把热请求收益当作首请求收益，也不将 v1 的 1.29 与本轮不同历史/配额相除。
+
+**主机 arena 已接共同预算**：`GgmlCacheBudgetScope(..., includeGraphBuffers, hostPools)` 将其与其他 RAM owner 原子计费，GPU rank pool 独立；先预留再分配，增长前先释放旧缓冲，物理释放后归还。已有 arena 拒绝接管，存活时拒绝卸载。独立的 `TSGgml_AttachSharedCacheBudgetWithHost` 防止旧原生库把扩展参数当作 graph 布尔值而漏计 RAM；混用旧库时在模型加载前明确拒绝。省略 hostPools 保持旧覆盖范围。
+
+最终版在真实模型上用已接线 GPU 配额 15 GiB、host 配额 32 MiB，完成首请求及两次设备驻留释放、trim、refill，三次完整词表相同且清理归零；1-byte host 配额在读取/arena 分配前拒绝，保留原生拒绝原因并清理归零。host arena 本模型约 16.85 MiB，上限 32 MiB；**不覆盖** mmap 驻留、OS 文件缓存、CPU 长 prefill scratch 或所有驱动分配，仍不是整个进程 RAM 上限。
+
+另对现有 GPU streamed prefill 做了诊断，阈值设为 32：工具 prefill 首次/两次重复为 **8.48/38.45/42.93**，平方数为 **15.18/35.22/36.04 tokens/s**。同任务文本与 CPU 路径相同，但 logits 不逐位相同；工具格式问题仍存在。全设备峰值约 **15.2–15.3 GiB**，更接近物理上限。此路径启用了计时日志，只作为诊断，未据此降低默认 128-token 阈值或宣称数值验收完成。
+
+**真实 HTTP 质量覆盖**：最终 Server.Host，context 4096、专家配额 8192 MiB、现有 GPU prefill 阈值 128、无 MTP/前缀复用。天气工具与字符串 JSON 参数两种任务，在流式/非流式下完成四个两轮往返；严格验证工具名、参数类型和内容、模型生成的 call ID、回传 receipt。另一个严格 JSON Schema 响应通过。它们是客户端工具夹具，不执行外部天气查询或模型生成代码，且不能替无约束格式失败免责。首次 context 1024 因真实受保护工具提示超过容量而拒绝，保留该失败后扩大上下文并降低缓存重测。1564-token 天气请求首次 TTFT **183.67 s**、decode **7.67 tokens/s**，重复同类请求 **32.62 s / 11.99 tokens/s**；实际长 prefill 延迟仍是明显未完成项。
+
+最终原生 **21/21**、托管/符号 **24/24**、Python 验证工具 **43/43** 通过，无跳过；托管中 3 项为实际 CUDA 预算测试、21 项为项目/符号检查。专家文件/LFU/拒绝恢复夹具的 Compute Sanitizer 为 **0 errors**；未做 iOS 设备或构建验收。初始夹具槽位假设、测试钩子构建缺失、原生拒绝原因丢失及旧库兼容检查器的未安装 scope 判断均有原始失败和后续修复/核验记录。Probe、Server.Host 构建成功；NuGet 在线漏洞数据查询不可达警告保留。
+
+证据在忽略的 `artifacts/flash-decode-optimization-v3/`，完整阶段数据、质量失败、二进制身份及限制见 [v3 报表](../validation/flash-decode-optimization-v3/report.html)。剩余重点是长/首请求 prefill、Flash 全请求共同资源规划、同总资源的独立基线、Gemma IQ2 重复、图像语义和真实工具执行型智能体；VM 本轮仍拒绝 SSH，没有新增多 GPU 通过结果。
+
+### 2026-10-09 UTC：扩展多架构质量、性能与图像验证
+
+新增 [串行多模型验证入口](../../eng/validation/multimodel-quality-bench.md) 与独立重算评分/计时分母的报告工具，直接测试生产 HTTP 服务。冻结部署仍使用 native `9c3e68d79200a2f77779fa3ae7a65b9e3975edbb42e7e909c74b5e21ee281f40`；本轮没有修改或重建原生内核。上游 ggml `ffa4e8b80930029a35991f94e7c8a93cd67730ab` 干净。所有 GPU 请求串行，贪心、无惩罚、关闭推测解码/前缀复用/技能发现/模型委派；不把现有实现输出当作正确答案。
+
+主矩阵五个 checkpoint、**66 次请求，严格任务检查 51 通过、15 失败**。每项先运行一次，再重复两次；下表速度为后两次的中位数，单位 tokens/s。短 prefill/decode 使用平方数任务；较长 prefill 使用 60 条记录的信息提取，实际只有 419–614 prompt tokens，不是长上下文验收。单卡仍为 RTX 3080 Laptop 16 GiB、RAM 31.71 GiB。内存为整个进程生命周期的采样峰值，各列峰值不保证同时发生。
+
+| 模型/放置 | 严格任务通过 | 短 prefill | 平方数 decode | 较长 prefill | RAM working set GiB | 整卡 VRAM GiB |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| GPT-OSS 20B Q8_0，GPU | 9/12 | 689.24 | 89.23 | 1987.07 | 18.66 | 12.64 |
+| Muse-Glimmer 30B IQ2_XXS，GPU | 9/15 | 347.95 | 18.56，截断 | 502.60 | 12.19 | 10.74 |
+| Qwen3.6 35B-A3B IQ2_XXS，GPU，MTP 文件但推测关闭 | 12/15 | 354.10 | 71.27 | 1355.66 | 13.64 | 13.87 |
+| Gemma 12B QAT UD-Q4_K_XL，GPU | 12/15 | 300.34 | 37.58 | 1177.58 | 8.37 | 8.42 |
+| Gemma 26B-A4B QAT UD-Q4_K_XL，8 线程主机专家 | 9/9 | 57.27 | 22.93 | 447.18 | 13.42 | 3.93 |
+
+**具体失败与独立检查**：GPT-OSS 的无约束 JSON 三次把 `arguments` 写成字符串；Gemma 12B 三次带 Markdown 围栏。Muse 的平方数/JSON 六次在 256-token 上限截断；`think:false` 并未使该 checkpoint 停止内部推理。另一个新进程以 1024 上限各测一次，分别在 399/292 tokens 完成两项任务；这是预算区分实验，不称为修复，也不合并到主表。
+
+Muse 与 Gemma 12B 的同一数字图片 OCR 各 **3/3** 通过；Qwen3.6 三次将 `4821` 读为 `4081`。独立、未修改的 llama.cpp `4ebdf2c74acce30883d8e34b7c70b3eb8146f2fe` 用同一 checkpoint、projector、图片和可见提示也三次失败，输出 `6611`。双方 prompt count 均为 332，但没有完整 token/logit 对齐，不能认作数值一致或认定量化是唯一原因。本地主模型和 projector 的完整 SHA 与 [Unsloth MTP 仓库固定版本](https://huggingface.co/unsloth/Qwen3.6-35B-A3B-MTP-GGUF/tree/5bc3e238d916f48a861bac2f8a1990a0e9b7e98d) 一致；非 MTP 仓库同名文件的字节不同，不能混用身份。
+
+四个模型各完成流式/非流式工具调用，共 **8 个两轮往返**；检查模型生成的 call ID、参数及回传 receipt。这些是客户端天气夹具，不是外部天气服务或完整宿主智能体执行。四个模型各一次 JSON Schema 请求通过，不能替无约束格式失败免责。Qwen3-VL 8B 的独立 chat 加载失败：当前只接入 Qwen-Image 的 encoder，未注册完整聊天架构，未计通过。
+
+评分代码同时修正了自动剥离代码围栏、宽松接受数学/列表格式、以及允许重复工具参数键的问题。相关 Python 检查 **33/33** 通过，无跳过；已有 8 个真实工具往返另经新规则离线复核通过，不重复计作 GPU 测试。报告工具重新从原始响应验证每项评分、请求、采样设置、图像 SHA、计时分母和实际加载的 native 身份；质量失败原样保留。
+
+**资源策略的边界**：Gemma 26B 主表显式关闭 compact expert cache；较早设置 4096 MiB 的六次运行另存，代码检查该缓存只接入 Qwen4Exp，不能把一个未生效选项当作跨模型预算/缓存覆盖。全驻留 GPU 与主机专家放置不同，不作简单速度排名。RAM working set、private commit、整卡 VRAM 均不是全请求 `MemoryBudget` 硬上限。图像编码/渲染不在模型 prefill 计算计时内，HTTP 总时间单独保留；decode 包括内部推理及协议 token，不等于可见答案速率。哈希与启动 warmup 会预热，未控制冷 SSD 或锁频；两个热样本不支持 p95/p99 或性能最优结论。
+
+证据在忽略的 `artifacts/multimodel-quality-v1/`，完整首请求/热请求范围、内存、输出与失败分析见 [多模型报表](../validation/multimodel-quality-v1/report.html)。本轮继续未完成的项目包括 Flash 首/长 prefill、全模型共同资源动态规划、Qwen3.6 OCR 定位、Gemma IQ2 FF7 重复、Qwen-Image 字幕质量、完整宿主智能体和多 GPU；VM SSH 再次拒绝连接。没有新增这些场景的通过记录。
+
+### 2026-10-09 UTC：新双 A40 VM、多模型实测与默认容量规划
+
+新 VM 实测为两张 A40，各 46,068 MiB；CUDA 12.8、驱动 580.159.03、Ubuntu 24.04、.NET 10.0.401。宿主机显示 503 GiB RAM 和 96 逻辑 CPU，容器实际 `memory.max=99999997952`（93.13 GiB）、`cpu.max=1615000 100000`（16.15 核）。规划必须采用容器限制。`/workspace` 是约 932 GiB 的网络文件系统，不能将首次读取/换页数字标为本地 NVMe 性能。
+
+工作树（包括前序未提交的自有实现）已部署；ggml 固定 `ffa4e8b80930029a35991f94e7c8a93cd67730ab`，实际验证的 upstream checkout 保持干净。独立 CUDA Runtime 双向同步/异步复制四项全量数据检查通过。统一内存 CUDA 探针在主机中转、显式 P2P 两种模式下均完成真实内核、event、全缓冲复制、文件回写/恢复、多 rank fence 和释放检查；这不等于三个生产模型都接入统一预算。
+
+Qwen3.8 Flash Next 使用 Unsloth `766911a6b7369840a91dbcd95f9f997acaab6cd6` 的 UD-IQ1_M 三分片和 BF16 projector；GLM 5.3 Flash 使用 Unsloth `a38483c8cd5df544f53d70fb281afe97369d5ab6` 的 UD-Q2_K_XL 四分片和 BF16 projector。Unsloth 的 V4.1 Flash GGUF 地址返回 401，改用模型文档已记录的 smalinin 修复版 `d1de55c19f95172c882906cc83c0e55932d26a63` Q2_K-Q5（312.349 GiB）。三组下载均完成完整 SHA-256 校验。DeepSeek 视觉组件从官方 `dba1be0a40aa45a94ad051997016db3960a90277` 的隔离视觉分片和精确区间生成，970,619,072 字节、306 tensors，SHA-256 `e7b0debed15706dd2f065879fa62a54f49e5c0472a54fa33d5ff40957f167e0c`；生成组件的哈希与发布方权重校验分开记录。
+
+验证工具扩展到 Linux：核对实际加载的 `.so`、全部 GGUF 分片、每卡及合计 VRAM、进程 RSS 和容器用量/限流。可显式复用先前完整下载校验的摘要并复查尺寸，报告明确不宣称每次重复全量哈希。新增独立 llama.cpp HTTP 任务重放与原始响应离线复核；按用户要求，两引擎共同失败的质量用例先记录、暂缓修复。生成证据在忽略的 `artifacts/new-vm-20261009/`，[完整报告](../../artifacts/new-vm-20261009/report.html) 分开验证同部署分组，保留初始失败和复测日志。
+
+本轮修复：
+
+- 发布 GGUF 使用 `glm5-next`，原有入口只识别 `glm5next`；统一架构识别、native 元数据前缀、视觉和协议入口，未改写模型或 ggml。混合 KDA/MLA + Q8 专家合成 fixture 的旧/新别名在托管和原生 CPU 上 logits 逐位一致，decode/reset/rewind 契约一致；随后用真实双卡 GLM 完成下面的文本、图像、工具测试。
+- GLM 5.3 Flash / DeepSeek V4.1 的 GGML CUDA 加载器默认调用已有 native 容量规划，根据实际空闲 VRAM、context、scratch 和 ubatch 选择最少 CPU 专家层；可全驻留时选择零层。其他后端/模型保留原策略，显式 CLI 或环境变量设置仍优先。修复环境变量 `TS_N_CPU_MOE=0` / `TS_CPU_MOE=0` 未标记为显式禁止的问题；回归从 3 项失败变为本机 51/51 通过。VM 最终定向托管套件 **146 通过、2 跳过**，跳过项不计通过。
+- Linux Hadamard 隔离测试补齐无关投影分支的 fail-fast 链接 stub。CPU-only 量化 strip 改用未修改 ggml 的 `mul_mat_id` 批处理语义，修复 VNNI Q2_K 在 N=17 时与参考计算的偏差；14 种量化格式和显式 F32 的定向复测通过。CUDA strip 分支未因此改变，不宣称获得 CUDA 加速。
+
+顺序单请求、context 4096、16 线程、无 MTP、无前缀复用、贪心采样，计时期间无并发下载/编译。任务是算术、严格 JSON、短代码、60 条记录的文中检索和图片数字 OCR；同一检索提示在三个模型上分别为 612、466、378 token。每类 3 次，表中 warm 为后两次中位数；首次不等于主动清空 OS 缓存。DeepSeek 行合并同一 auto-final 部署的基础套件与检索/工具补测，完整报告分别核对两份原始运行。速度单位 tokens/s。
+
+| 模型 / 部署 | 严格质量 | 首次短 prefill / decode | warm 短 prefill / decode | warm 检索 prefill | 采样 RSS / 两卡 VRAM GiB |
+| --- | --- | --- | --- | --- | --- |
+| Qwen3.8 Flash Next UD-IQ1_M / v2 | 12/15 | 140.59 / 47.36 | 254.28 / 53.24 | 735.51 | 43.11 / 46.07 |
+| GLM 5.3 Flash UD-Q2_K_XL / auto-final | 15/15 | 41.37 / 20.69 | 51.70 / 22.81 | 171.66 | 25.44 / 82.40 |
+| DeepSeek V4.1 Flash Q2_K-Q5 / auto-final | 15/15 | 0.84 / 2.58 | 45.31 / 18.42 | 92.39 | 83.83 / 81.16 |
+
+三模型 OCR 均通过，非流式、流式两轮工具调用及 JSON Schema 也各通过；工具结果是客户端生成的确定性回执，不是已覆盖完整宿主智能体。Qwen 的 3 个失败是未加 schema 的严格 JSON 返回 Markdown 围栏，独立 llama.cpp 同样失败，暂缓处理。RAM 是进程采样 RSS，VRAM 是同一时刻各卡占用总和，不是相同强制内存配额；容器 `memory.current` 含页缓存并接近上限，未发生 OOM。Qwen 退出时有一次采样进程消失记录，原始证据保留。
+
+v2 的实际 native SHA-256 为 `91b62abca1e0e12f0a7aeada356213c670e023a7278ab594024145a7d8c440f1`，Models 为 `8bc8a1f7ae464f3fa88a07af8568720dd8008f62e641c34fd3c31ab5c95e2f0e`。auto-final 使用相同 native，Models 为 `39c37166b0c588b1e4eb3675bbf2e8252d2c9e586f23c47755c43ba3f7c41c4f`。v2 已在显式 12/24 层上完成 GLM/DeepSeek 复测；auto-final 未提供层数仍实际选择 12/24 层并通过，不能把默认行为变化宣传成热 decode 内核加速。
+
+原生全套首次运行 **91 项：83 通过、6 跳过、2 失败**。6 项需要 3–8 GPU；CPU strip 失败已如上修复并定向复测。另一项为未修改 upstream F16 dense flash attention 在 N=256、KV=4096/8192 下相对 FP64 的 L2 误差约 0.00167/0.00187，超过 0.0015；dense 与 sparse-hint 回落路径逐位一致，真正 sparse 路径的较长 KV 场景通过。保留失败、不放宽阈值；这不是 DeepSeek 真实模型与 llama.cpp 的共同质量失败。没有把定向复测称为整套重跑全绿。
+
+仍需继续的工作：
+
+- DeepSeek 的主机专家约 110.0 GiB，加 Engram 共 235.8 GiB 主机映射，超过容器 93.13 GiB。新提示需要不同权重页，网络存储换页令首次请求明显变慢；18.42 tokens/s 是重复工作集命中页缓存后的结果，冷请求瓶颈尚未解决。自动卸载是加载时容量规划，尚不是全局 RAM/VRAM/SSD 成本最优调度。
+- Qwen IQ1_M tensor parallel 因缺少精确 CUDA MMQ output-strip kernel 明确拒绝；本轮双 GPU layer split 通过，不能算 TP 通过。完整生产 KV/media/holder 接入共同账本、跨请求成本反馈及异步读取/传输流水线仍有缺口。
+- 独立 llama.cpp 固定未修改 `6184e92c57dcd34de8a3e381d7641a5e75250d5f`。Qwen warm 算术 decode 为 58.81、检索 prefill 为 630.65；GLM 需将层划分从 1:1 调为 28:19 才能在相同 12 层 CPU offload 下装入两卡。GLM 仅设置 `enable_thinking=false` 仍产生思考，单独加 `reasoning_budget_tokens=0` 的复测为 15/15，warm 算术 decode 21.61；保留两种配置的独立结果。两引擎模板、输出 token、scratch/ubatch 和计时分母有差异，报告保留原始次数，不宣称固定 token 或相同硬预算下性能已经一致。DeepSeek 实际加载退出码 1、返回 `unknown model architecture: deepseek41`，没有可用独立真实模型 logits 对照。
+- 长上下文、服务并发、完整宿主智能体、音频与图像生成不在本轮三模型验收内；不能从有限任务全部通过推断全面质量最优。
+
+### DeepSeek CPU 专家的按路由读取：2026-10-09 后续验证
+
+新增 Linux `TS_DSV4_HOST_EXPERT_READ=1` 实验路径：在实际路由产生后，以持久描述符、
+I/O 线程池和有界暂存读取当前层选中的 gate/up/down 原始字节。模型仍使用原 mmap 和
+未修改的 ggml 算子；不改量化或归约顺序，不预测未来专家，不声称跨层计算/传输已经重叠。
+线程数综合进程 CPU affinity/cgroup 和请求配置，最多 16；暂存依据主机实际 allowance
+缩放，最多 64 MiB。配置 `hostPools` 时先取得共享 RAM 信用、物理释放后归还，
+OS 文件页、Engram 映射和其余运行时内存仍不属于这个暂存额度。
+
+初版的自定义节点在整张 CPU 图的 16 个线程上重复执行驻留查询，已在 TensorSharp 回调
+中增加单线程入口保护。真实 ggml 图覆盖 1/4/16 线程、1/3 列、9 次连续执行，共 54 次，
+检查路由字节、后续 matmul 结果以及每层读取次数。解码的已检查专家可使用至多八次层调用
+的驻留提示；新专家和 prefill 总是检查。这是可过期的性能提示，不是锁页；OS 提前回收
+仍由 mmap 正常缺页读取。配额竞争、失败 commit 回滚、驻留跳过、短文件错误和释放回收
+也通过。四个相关 native CTest 通过，Linux 页缓存工具单测通过。
+
+最终对照使用同一个 native `8aa6cf26874fd34097dd110dccae9fd9d7aff4f1567671b4d0c845ce78d95d05`，
+ggml 仍是干净的 `ffa4e8b80930029a35991f94e7c8a93cd67730ab`。设备、量化和容器限制同上，
+context 4096、16 线程、自动 CPU 专家 24 层，关闭 MTP、前缀复用和后台 Engram 预热。
+两臂启动前仅对十个分片执行客户端文件缓存回收，`mincore` 验证全部 81,880,380 页非驻留。
+不控制 FUSE 文件服务器或物理设备缓存；模型加载仍可预热部分页。性能套件不加载 projector。
+
+每类五次请求，warm 为后四次中位数，单位 tokens/s。只有平方数首次是进程首请求，
+其余新提示可利用前序请求的缓存。各配对组回答、prompt/generated token 数一致。
+
+| 任务 | 首次 prefill，关→开 | 首次 decode，关→开 | warm prefill，关→开 | warm decode，关→开 |
+| --- | --- | --- | --- | --- |
+| 平方数，31→58 token | 0.91→4.41 | 2.74→4.21 | 44.86→43.53 | 17.36→16.76 |
+| 严格工具 JSON，72→27 token | 1.76→9.34 | 3.48→4.98 | 52.30→49.73 | 17.36→15.62 |
+| 文中检索，378→1 token | 14.83→42.69 | 不作吞吐结论 | 105.33→94.22 | 不作吞吐结论 |
+
+平方数首请求总耗时从 55.29 s 降至 20.95 s，但热 decode 仍下降约 3.5%，工具 JSON 热
+decode 下降约 10.0%，检索热 prefill 下降约 10.5%。因此仍默认关闭，不把冷热折中写成
+普遍提速。驻留提示已减少重复查询，整个热图仍有开销；消除这部分开销以及加入根据
+实测缺页成本切换的策略，是下一步，尚未完成。采样 RSS 约 61.09→61.06 GiB、两卡同时
+VRAM 80.57→80.64 GiB，含文件缓存的 cgroup 峰值约 73.28→75.45 GiB，均不是全局硬预算。
+
+真实模型以相同有效 token 历史，比较 17-token prefill、8 步 teacher-forced decode 和
+reset 后 31-token refill：10 组完整 129,280 维 logits 全部有限且逐位一致，共 1,292,800
+个值。额外安装实际 native host 预算回调后，关闭时暂存峰值为 0，开启时为 64 MiB；
+模型销毁后额度全部归还、解绑成功。这是同模型两配置的数值不变性，不能代替独立模型 oracle。
+
+补充确认生产默认的 TensorSharp 自有 F32 attention，在 N=256、head=512、64 heads、
+KV=4096/8192 的两组测试通过；相对分解 F32 参考的 L2 分别约 2.55e-7 / 7.47e-7。
+4096 的自有 dense 路径耗时 9.21 ms、参考 8.37 ms；8192 的自有 sparse 路径 17.24 ms、
+参考 17.67 ms，只是该形状的微算子测量。此前 upstream F16 相对 FP64 的失败仍保留，
+它不是这个生产默认 F32 路径；未修改 ggml、未放宽阈值，也没有把补测记成全套 CTest 全绿。
+
+本次完整生成的配对性能套件为 30/30；最终同库开启路径的代码和 OCR 补测为 6/6，
+非流式、流式两轮工具往返及 JSON Schema 均通过。它们是确定性客户端工具回执，
+没有执行完整宿主智能体。通过情况和最终图片/工具补测见
+`artifacts/deepseek-cold-20261009/report.html` 与原始报告。该忽略目录保留三轮不同二进制的
+冷热结果和失败实验，不将它们混成同一实现的重复测量。
+
+### 取消读取节点后的热态对照：2026-10-09
+
+在 TensorSharp 自有 CPU 后端中登记专家文件映射，在原 `MUL_MAT_ID` 前准备读取，
+不再添加路由复制或读取节点。CPU 产生的路由先执行其依赖前缀；同一路由的三个投影
+共享准备，不同路由分别处理。CPU 算术与其他自定义算子仍由原 upstream 后端执行。
+
+这一阶段的库为 `ec402a6f34b1ae43347172460db41244ff8653681c46d7e53a1c6685ab8d47cd`。
+先开后关、再先关后开，两组普通亲和性对照各五次请求；下表合并每组后四次，
+每种模式、每个任务共八个 warm 样本，单位 tokens/s。二进制、请求、token 数、
+显存/主机限制与页缓存回收条件匹配。相同 token 位置的图节点和 split 数一致。
+
+| 任务 | warm prefill，关→开 | warm decode，关→开 |
+| --- | --- | --- |
+| 平方数 | 47.39→42.82 | 18.66→17.07 |
+| 严格工具 JSON | 54.51→48.77 | 18.18→14.64 |
+| 378-token 文中检索 | 102.18→97.57 | 仅输出 1 token，不作吞吐结论 |
+
+**取消额外节点仍未消除热退化。** 仅将旧节点移出计算线程组的较早版本也未解决问题，
+其负面结果单列保留。驻留检查累计耗时较小，不能据此推断全部差距来自检查本身；
+运行时调度、内存放置等影响仍需隔离。
+
+该构建实际为 `GGML_OPENMP=ON` 并链接 `libgomp`。`ggml_threadpool` 对象存在并不
+意味着 ggml 的 pthread 工作线程及 `poll` 参数在生效。显式限制到 CPU 0–15 后，
+平方数 warm decode 降至约 10–11 tokens/s；普通亲和性下显式设置
+`OMP_WAIT_POLICY=PASSIVE`、`GOMP_SPINCOUNT=0` 后约为 5.81（关）/7.57（开）。
+这些负面实验不作为默认策略，也不能据此断言所有 NUMA 或等待策略均无效。
+
+这一阶段最终库的四组配对共 120/120，代码与 OCR 补测 6/6、流式/非流式工具回执、
+JSON Schema 均通过。10 组完整 129,280 维 logits 逐位一致，64 MiB 暂存额度销毁后
+归零。原生测试补强了 CPU 路由生产依赖、不同路由不可误复用及其他自定义算子的执行，
+共 109 次包装后端成功执行和 13 次原 CPU 参考；四项相关 CTest 通过。
+基准工具对 OpenMP 设置显式记录并排除继承环境中的隐含调优，8 项工具测试通过。
+
+完整证据在 `artifacts/deepseek-hot-20261009/report.html`。模型、存储、并发和独立
+oracle 的覆盖边界同上；此处没有把普通亲和性、限制 CPU 或被动等待的结果混成一个
+性能中位数。按实际缺页反馈避开热态准备的实现及压力恢复验证在后续阶段继续进行。
+
+### 缺页反馈与热态直通：2026-10-09
+
+在上述自有 CPU 后端中增加反馈策略：连续 32 个单 token CPU 图没有实际读取和
+major fault 后，直接提交整个原 CPU 图，省去逐专家准备。多 token 图恢复准备；
+进程 major-fault 计数变化时同时清除热态状态和旧专家驻留提示。提示始终是可失效的
+优化，原 mmap 和 upstream 算术继续承担数据读取与计算。已开启读取时可用
+`TS_DSV4_HOST_EXPERT_HOT_BYPASS=0` 关闭该策略。
+
+最终库为 `38551bf1bc92bd0e2a420db43734e1acf0aa6b75288c8178189a930b466a91bf`，
+ggml 仍为干净的 `ffa4e8b80930029a35991f94e7c8a93cd67730ab`。
+双 A40、93.13 GiB cgroup RAM、16.15 核 CPU 配额，context 4096、16 计算线程、
+按层分两卡、自动 24 层 CPU 专家；关闭 MTP、前缀复用及 Engram 后台预热。
+普通配置先关后开、再先开后关，每任务每臂五次，后四次合并为八个 warm 样本：
+
+| 任务 | warm prefill，关→开 | warm decode，关→开 |
+| --- | --- | --- |
+| 平方数 | 48.37→42.81 | 18.75→16.89 |
+| 严格工具 JSON | 55.85→50.87 | 18.29→16.46 |
+| 378-token 文中检索 | 104.24→99.87 | 仅输出 1 token，不作吞吐结论 |
+
+两次进程首请求的平方数端到端耗时分别由 **54.46→26.58 秒**、
+**54.40→21.17 秒**。每臂启动前十个分片共 81,880,380 个客户端缓存页全部非驻留；
+不包含对 FUSE 服务端或物理设备缓存的控制，模型加载仍会预热部分页面。
+冷启动收益仍在，但**尚未证明热态稳定达到原路径性能**：开启时两组平方数 warm
+decode 分别为 14.32 和 18.63，工具 JSON 为 13.38 和 18.34 tokens/s，不能只选后一组。
+慢的一组各 warm 请求专家新增读取均为零；准备累计约 19–44 ms/请求，采样中
+CPU 限额节流也较少。调度/内存放置仍待隔离，不能把全部差距归因于驻留查询。
+普通配置、固定线程分布和较早版本均单列，不混成一个中位数。
+
+补充的 `OMP_PROC_BIND=spread`、`OMP_PLACES=cores` 组合配置中，平方数 warm
+decode 为 20.05→17.81，工具 JSON 为 15.07→16.89 tokens/s，没有一致收益。
+它还将提交线程的亲和性收窄，触发现有预算规则把读取池从 16 线程/64 MiB 降为
+2 线程/8 MiB，故不能把结果全部归因于计算线程分布，也未据此调整默认配置。
+这暴露出后续成本策略需要分别评估计算并行度与存储读取并发度。
+普通配置的采样峰值 RSS 为 61.04–61.09 GiB，两卡同时采样的 VRAM 总和为
+80.57–80.63 GiB；包含文件缓存的 cgroup 采样峰值为 67.76–71.42 GiB。
+这些是采样值，不是所有瞬时峰值或整个运行时的硬预算证明。
+
+质量与恢复验证：
+
+- 普通配置配对请求 60/60，补充组合配置 30/30；代码/OCR 补测 6/6，流式与非流式模型工具回执、
+  JSON Schema 通过。这里只覆盖有限任务，不代表完整宿主智能体或并发任务已完成。
+- 两种模式各捕获 21 个完整 129,280 维 FP32 logits，逐位一致。独占测试进程在
+  同步 Forward 之间回收自己的只读模型映射，再确认十个分片缓存均非驻留；
+  相同历史下继续解码与回收前参考逐位一致。没有把这次压力测试用作吞吐基准。
+- 开启策略时，回收后新增 50 次 major fault，实际重新准备 1,844,674,560 字节
+  专家数据，热态直通计数不再增长，证明恢复准备确实发生。
+- 64 MiB 共享主机暂存预算峰值符合额度，模型销毁后额度归零且 detach 成功。
+  这不是整个模型的 RAM 硬上限；OS 文件页、其他运行时分配另计。
+- 四项相关 CTest 通过；原生夹具包含 142 次包装后端成功执行和 13 次原 CPU
+  参考，覆盖 CPU 路由依赖、热态直通、回到多 token 准备、错误传播及预算回滚。
+  映射范围校验工具的三项测试通过。未重新宣称全部原生测试或其他模型通过。
+
+完整日志、逐请求响应、内存采样、源码/二进制身份及失败尝试保存在
+`artifacts/deepseek-adaptive-20261009/report.html`。实验读取仍默认关闭。
+32 次阈值尚未经过成本标定；跨模型统一 KV/媒体/workspace 账本、带宽/延迟反馈、
+跨阶段异步传输流水线、更多并发/模态覆盖仍未完成，不能用本阶段验证替代。
+
+### 持久提交线程实验与两引擎复测：2026-10-09
+
+为隔离 DeepSeek 热态回退中的线程迁移因素，测试了 TensorSharp 自有的同步持久
+CPU 提交线程原型。两臂均开启专家读取，使用同一个实验库，只改变提交线程开关；
+默认 CPU 亲和性、16 个读取线程和 64 MiB 暂存额度保持一致。每臂启动前均确认
+十个分片的客户端缓存页全部非驻留，每任务五次，后四次取 warm 中位数。
+
+| 任务 | warm prefill，原提交→持久线程 | warm decode，原提交→持久线程 |
+| --- | --- | --- |
+| 平方数 | 46.50→44.32 | 18.21→14.04 |
+| 严格工具 JSON | 52.18→51.66 | 17.14→13.41 |
+| 文中检索 | 104.21→100.15 | 仅输出 1 token，不作吞吐结论 |
+
+仅完成先关后开的一个顺序，不能排除 NUMA/系统波动或认定迁移是唯一原因，
+但该原型没有提供保留所需的性能证据，**已经撤回**。30/30 模型 HTTP 请求通过，
+两臂响应与 token 数一致，图几何一致；四项相关 CTest 通过，覆盖 142 次包装后端
+执行、13 次原 CPU 参考，以及并发提交/错误恢复夹具。原型的完整 logits、压力恢复
+及补充 OCR 验证没有执行，不算通过。实验库 SHA-256 为
+`8572ca9f796022c24d4d03dc547f41260a7c620ca690750381aeecdc29a8a783`；
+源码按前一阶段清单精确恢复，原生库重新构建后逐字节恢复为 `38551bf…`，四项
+相关 CTest 再次通过。ggml 仍为未修改的 `ffa4e8b…`。实验源码、撤回补丁、
+原始响应、测试与恢复清单在忽略的 `artifacts/deepseek-dispatch-20261009/`，
+其 `dispatch-report.html` 明确区分实际通过和未执行的覆盖。
+
+随后复测 Qwen3.8 Flash Next UD-IQ1_M，复用此前已验证的冻结 Server 构建及
+`91b62abc…` 原生库，与未修改的 llama.cpp `6184e92c…` 串行比较。模型三分片、
+BF16 projector、二进制身份与实际加载路径均复核。双 A40、context 4096、
+16 计算线程、两卡按层划分，关闭 MTP、提示 KV 复用与诊断日志。两个文本任务
+各执行三次，warm 为后两次中位数，两引擎均 **6/6** 通过。本轮结果与此前完整
+套件分别保留，没有合并样本，也不冒充最新全部工作区源码的跨模型验收。
+
+| 本轮 Qwen 任务 | TensorSharp prefill | llama.cpp prefill | TensorSharp decode | llama.cpp decode |
+| --- | --- | --- | --- | --- |
+| 平方数 | 246.50 | 179.06 | 52.25 | 60.19 |
+| 文中检索 | 711.25 | 659.52 | 输出过短，不作比较 | 输出过短，不作比较 |
+
+单位 tokens/s。本轮平方数 decode 观测低 **13.2%**，此前完整套件为
+53.24 对 58.81、低 9.5%；两组均表明缺口存在，但样本量与系统波动不足以证明
+代码退化或最优性能。平方数 prompt 为 37 对 38 token，两边输出计数均为 87；
+检索 prompt 为 612 对 613 token、输出均为 4。llama decode 分母对应 86 个后续
+生成步骤，TensorSharp 的 API 区间还包含末端执行；模板、ubatch、scratch 也
+未完全统一。因此这是相同用户任务的应用层观测，尚非固定 token 序列和相同
+强制 RAM+VRAM 配额下的性能验收。
+
+本轮 Qwen 两文本任务的采样峰值 RSS 为 **43.05 对 42.72 GiB**，两卡同时
+采样的 VRAM 总和为 **44.54 对 44.98 GiB**。含页缓存的 cgroup 峰值分别为
+约 **92.98、90.49 GiB**，不能把 RSS 当作实际 RAM 总成本。此处没有图片任务，
+不能与旧完整套件的峰值相减当作内存优化收益。启动至就绪约 **149.62 对
+12.10 秒**；TensorSharp 包含较长内核/图预热，未统一启动策略或控制整个文件
+缓存，该数值不作为严格冷启动基准，但启动延迟仍是待优化项。
+
+独立开启 `TS_Q4E_PROFILE`/`TS_Q4E_LOG` 的诊断运行也完成 6/6 请求。三个
+平方数请求各观察到 88 次单 token Forward，原生调用累计区间占 API decode
+约 **99.5%**，并观察到 graph replay。该粗粒度毫秒计时包括原生图执行、准备、
+同步和传输，不是纯 CUDA kernel 时间。诊断日志影响性能，其吞吐没有纳入上表。
+目前证据支持优先细分原生执行阶段，而不是把托管采样视为主要成本；尚需统一
+执行步数、CUDA event/传输计时及更长输出验证，不能据此宣布找到唯一瓶颈。
+
+同 VM 的既有 GLM 5.3 Flash UD-Q2_K_XL 完整套件，两边均 15/15 通过；
+平方数 warm prefill 为 **51.70 对 37.55**、decode 为 **22.81 对 21.61**。
+这是既有结果，本轮没有重新运行 GLM。双方均卸载 12 层 CPU 专家，llama
+分卡 28:19 并设置 `reasoning_budget_tokens=0`；输出长度仍不同。RSS
+**25.44 对 90.88 GiB** 的差别包含映射/页缓存统计归属，不能等同于节省同等
+物理 RAM。DeepSeek V4.1 在该 llama.cpp revision 报 `unknown model architecture:
+deepseek41`，仍没有有效两引擎吞吐对照；不得将 TensorSharp 的 18.75 tokens/s
+与加载失败值相比。
+
+汇总、原始计时、质量失败、资源峰值和身份清单见本阶段
+`engine-comparison.html` / `engine-comparison.json`。Qwen 旧完整套件的严格
+JSON 围栏失败两边均有，仍为 12/15，没有被本轮两个文本任务的 6/6 覆盖。
+固定工作量与共同硬预算对照、Qwen 原生 decode/启动优化、DeepSeek 读取热态
+回退、跨模型 KV/媒体/workspace 账本、成本反馈与异步传输、长上下文/并发及
+完整宿主智能体仍未完成。
+
+### Qwen 默认门控融合与冷权重上传：2026-10-09
+
+本阶段最终原生库为 `3d27837388a03998ab75db51835d2f999f28bb8210f6992f2e60e4df3159b673`。
+upstream ggml 仍为干净的 `ffa4e8b80930029a35991f94e7c8a93cd67730ab`，没有补丁。
+Server 复用已有冻结托管程序集，原生库与本轮七个变更源文件的身份已复核；
+这不代表其余未提交托管改动都经过本轮跨模型验收。测试仍使用双 A40、
+93.13 GiB cgroup RAM、16.15 核 CPU 配额，context 4096、16 计算线程、按层分两卡，
+关闭 MTP 和前缀复用。计时期间没有并行编译、下载或其他模型测试。
+
+先对原生跨度增加可关闭的阶段计时。诊断中两个 rank 的首次节点构建/权重绑定
+分别耗时约 57.67、55.57 秒，同次图计算仅约 53、44 毫秒；热态 replay 的
+图计算中位数约 8.76、9.26 毫秒。这是包含同步的主机区间，不是纯 CUDA
+kernel 时间，也没有把诊断吞吐混入普通测试。启动与 decode 因而分别处理：
+
+- **普通 CUDA 单 token FFN 默认使用 canonical SwiGLU 节点**，允许未修改的
+  ggml 配对投影融合。CPU 专家、TP 和多 token 图保留原路径；
+  `TS_Q4E_FUSED_GLU=0` 可关闭。多 token 验证和其他设备没有被本次单 token
+  性能结果自动覆盖。
+- **Linux CUDA 的大权重 cache miss 默认自动选择页面准备/分块上传**。先完成
+  设备预算准入及分配；对至少 16 MiB 的权重，仅在 CPU 并行额度大于一且
+  `mincore` 检测到非驻留页面时启动流水线。全驻留源或查询失败保持整块上传。
+  `TS_GGML_UPLOAD_PREFETCH=0` 关闭，`=1` 强制符合大小/设备条件的权重准备；
+  未设置为自动。
+- 工作池初始化时按亲和性/CFS 配额限制总并发度，最多 16（包含提交线程）；
+  每块 4 MiB、一个活跃读取窗口最多 64 MiB。工作线程读页，提交线程上传，
+  每个窗口等待读取全部结束后再前进，异常也先汇合工作线程。没有新增或锁定
+  主机权重 payload 副本；全部上传完成后才发布 cache 命中及提交额度。
+  这是读取与同步上传的重叠，**尚不是异步 CUDA DMA 与计算的重叠**。
+  页缓存仍由 OS 回收，窗口不是总 RAM 硬上限；并发度也没有在线成本标定。
+
+Qwen UD-IQ1_M 的 GLU 对照使用同一个实验库，先开后关、再先关后开；每臂、
+每任务合计六个 warm 样本。32/32 文本请求通过。平方数 warm decode 为
+**53.01→55.30 tokens/s（观测 +4.3%）**，prefill 为 263.41→265.17。
+长检索 prefill 为 758.92→740.76；该多 token 路径没有改变，仍保留这组波动，
+不将少量样本解释为全场景稳定提速。两个顺序分别保留在报告中。
+
+上传策略的各轮使用对应的同一二进制，只改变上传开关，不合并不同缓存条件：
+
+| Qwen 对照 | 就绪秒数，关→开 | 平方数 warm prefill，关→开 | 平方数 warm decode，关→开 |
+| --- | --- | --- | --- |
+| 首组，客户端缓存未控制 | 143.61→70.63 | 257.89→242.63 | 53.23→53.10 |
+| 反向顺序，两臂启动前客户端缓存均非驻留 | 131.45→58.60 | 263.14→263.50 | 54.10→53.85 |
+| 最终库，关闭→默认自动；均先回收客户端缓存 | 122.47→60.46 | 258.19→266.98 | 55.01→55.18 |
+
+速度单位 tokens/s，warm 为每任务第 2、3 次中位数。最终自动策略使此条件下的
+就绪时间下降 **50.6%**。缓存回收只针对停止使用的模型分片，逐分片确认非驻留；
+未控制 FUSE 服务端或设备缓存，不称为物理冷盘测试。首组短 prefill 的下降
+没有在后两组复现，但这些结果也不证明所有硬件、存储或并发下均无退化。
+
+正确性与资源生命周期验证：
+
+- GLU 合成模型 34 行、真实 Qwen 34 行完整 logits 逐位一致；最终自动上传
+  与原路径另有 34 行真实 Qwen logits 逐位一致，词表为 248,320。
+  均检查完成状态及模型、cache、reuse buffer 和 native shutdown；
+  原始 FP32 payload 下载后再次校验。它们证明路径一致性，不替代独立语义检查。
+- 自动上传诊断确认 144 次准备、合计 41,838,182,400 字节，跨两个 rank，
+  窗口最大 64 MiB；不是仅设置开关而没有执行。该带日志运行不用于吞吐比较。
+- 最终构建的 12 次相关 CTest（8 个不同场景）均通过，没有 skipped。
+  覆盖单/双卡 cache 预算与释放、自动/强制/关闭策略、非对齐驻留查询和冷尾页，
+  64 MiB + 8 KiB 权重的每行精确校验、冷源端点及内部页面、缓存复用，
+  读取池异常汇合，以及 Qwen QSA/CPU/CUDA prefill 合并。
+- 首次真实模型捕获因输入验证清单 schema 不匹配，在加载模型前失败；
+  保留失败记录，转换既有完整 hash 核验清单、核对当前大小/mtime/分片元数据后
+  重试通过。没有将这次工具失败计为模型失败，也没有冒充重新进行整文件 hash。
+
+最终库与同 VM 上干净的 llama.cpp `6184e92c57dcd34de8a3e381d7641a5e75250d5f`
+重新执行了五种任务各三次，均含代码、严格 JSON、长检索和图片 OCR：
+
+| 模型 | 平方数 PF：TS / llama | 平方数 D：TS / llama | 长检索 PF：TS / llama | 任务检查：TS / llama |
+| --- | --- | --- | --- | --- |
+| Qwen3.8 Flash Next UD-IQ1_M | 266.98 / 177.27 | 55.18 / 59.04 | 750.67 / 660.01 | 12/15 / 12/15 |
+| GLM 5.3 Flash UD-Q2_K_XL | 51.22 / 35.05 | 21.43 / 20.40 | 166.26 / 135.74 | 15/15 / 15/15 |
+
+Qwen decode 仍观测落后 **6.5%**，没有宣布完成性能对齐。其严格 JSON 的三个
+围栏失败两边均有，按用户要求记录而不在本轮修复。TensorSharp 两个模型额外的
+流式/非流式工具往返及 JSON Schema 均通过；工具回执为确定性客户端模拟，
+尚非完整宿主智能体。GLM 双方均卸载 12 层 CPU 专家，llama 分卡 28:19，
+并显式设置 `reasoning_budget_tokens=0`。Qwen 平方数 prompt 为 37/38 token，
+输出计数均为 87，但 llama 的 decode 区间对应 86 个后续步骤；模板、ubatch、
+scratch 和执行步数未完全统一，仍为应用层对照，不是固定 token、共同指定的
+较小 RAM+VRAM 配额验收。
+
+| 模型/引擎 | 峰值 RSS GiB | 双卡显存峰值 GiB | 含页缓存的 cgroup 峰值 GiB | 启动至就绪秒数 |
+| --- | --- | --- | --- | --- |
+| Qwen / TensorSharp | 43.31 | 46.14 | 93.12 | 60.46 |
+| Qwen / llama.cpp | 42.73 | 45.02 | 90.37 | 80.57 |
+| GLM / TensorSharp | 25.40 | 82.40 | 93.13 | 35.49 |
+| GLM / llama.cpp | 91.70 | 82.25 | 93.13 | 198.37 |
+
+这些是整个运行的采样峰值；TensorSharp 还包含工具/schema 补测，llama 为共同
+十五项任务，不能相减当作严格相同工作量的内存收益。显存为两卡同时采样总和，
+含设备/驱动占用；RSS 与文件缓存统计归属不同，GLM 的 RSS 差距不代表同等
+物理 RAM 节省。双方仍接近 cgroup 上限。本轮两引擎均先回收模型客户端缓存，
+但初始化、读取与预热策略不同；不能把此前缓存未统一时 llama 的 12 秒就绪
+结果与本轮 80.57 秒相减，解释为代码退化。
+
+完整结果、每次响应、峰值、源码/二进制身份与原始 payload 在忽略的
+`artifacts/qwen-pipeline-20261009/report.html` / `report.json`，归档 152 个证据文件
+均已校验。DeepSeek 本轮未重新验收，固定 llama.cpp 对 `deepseek41` 的不支持
+记录仍有效。Qwen 剩余原生 decode 开销、固定工作量/较小硬预算对照、DeepSeek
+读取热态回退、全模型 KV/媒体/workspace 账本、在线成本反馈、异步 DMA、长上下文、
+并发、多平台及完整宿主智能体仍未完成。
+
+### 新 VM 与 Windows 跨硬件续验：2026-10-09
+
+当前 VM 已切换为 `69.30.85.216:22101`；前文 `63.141.33.49` 上的成绩保留为
+历史记录。新机为双 A40，每卡 46,068 MiB，驱动 595.91.07、CUDA 12.8。
+宿主物理 RAM 约 503 GiB，但当前容器使用 **cgroup v1**，memory limit 为
+99,999,997,952 字节（93.13 GiB），CPU quota 为 16.15 核。`/workspace` 是
+FUSE 网络卷，不能把测试称为本地 NVMe/SSD 性能。控制器只读，本轮未建立更小的
+共同进程 RAM 硬配额。Windows 对照机仍为 RTX 3080 Laptop 16 GiB、约 31.71 GiB
+物理 RAM、驱动 566.36、CUDA 12.6。
+
+发现并修复验证采样器只读取 v2 固定路径的问题。新增
+`eng/validation/linux-cgroup-telemetry.py`，通过被测服务进程的 cgroup membership
+和 mountinfo 识别 v1/v2/hybrid、组合 CPU mount、命名空间内挂载及可见祖先；
+保留原始文件名、controller version、读取错误和单位。v1 的 usage/limit/peak
+映射到报告字段，但不把 failcnt 冒充 v2 OOM 次数，也不把读取失败写成零。
+现有模型侧 `HostMemoryAvailability` 已支持两种版本，本次修复的是验证观测。
+采样器的目标服务由同一工具启动，共享其 mount namespace；不声称已验收任意
+跨 namespace/PID 的观测。解析单测 5 项及包含 PID/退出竞态的 bench 单测 9 项通过。
+
+双卡传输验收发现明确的部署限制：`UnifiedMemory.CudaProbe --peer false`
+在两卡的真实 kernel、事件、RAM/VRAM 压力恢复、并发读取、部分工作集回滚和
+全 rank fence 检查中通过；显式 `--peer true` 两个方向均发生字节损坏。
+新增独立 CUDA Runtime 程序 `eng/validation/cuda-peer-oracle.cu`，不依赖
+TensorSharp/ggml，复现 4 KiB、1 MiB + 17 B、16 MiB 三种大小、两个方向的
+**6/6 直接 P2P 失败、6/6 主机中转通过**。因此保持默认有界主机中转；
+尚不能区分具体驱动、虚拟化或硬件根因，不能只凭 API 报支持启用直接 P2P。
+补充 `--without-peer-access` 独立新进程控制后，同一 `cudaMemcpyPeerAsync` API
+的 6 项复制与 6 项主机中转均正确；这种运行时回退的通过不代表直接 P2P 可用。
+当前两引擎构建没有启用 `GGML_CUDA_NO_PEER_COPY`，运行环境也没有设置
+`GGML_CUDA_P2P`；这些实际条件与前文旧 VM 的构建条件分别记录。
+原生双卡 cache 测试另经 compute-sanitizer memcheck，报告 0 errors。
+
+本机以重新构建的原生库
+`5f222d080283b87bcbd404480e50f1728165235d501bdf8497c38a2b8803231d`
+完成三模型对照。ggml 为未修改的 `ffa4e8b80930029a35991f94e7c8a93cd67730ab`；
+Windows llama.cpp 为干净的 `4ebdf2c74acce30883d8e34b7c70b3eb8146f2fe`。
+本机 24 项相关 CTest 通过、无 skipped；4 项真实 CUDA graph budget/释放检查
+在最终 DLL 上单独重跑通过。较早使用旧 DLL 的那次运行保留，但不作为最终库覆盖。
+
+下表为每任务三次中的后两次中位数，单位 tokens/s，context 4096、8 线程、
+无 MTP/前缀复用、贪心并关闭惩罚。质量包含平方数、原始严格 JSON、代码、
+长检索，以及具备 mmproj 的两个模型的图片 OCR。
+
+| 本机模型 | 短 PF：TS / llama | D：TS / llama | 长 PF：TS / llama | 严格任务：TS / llama |
+| --- | --- | --- | --- | --- |
+| Gemma 4 12B QAT UD-Q4_K_XL | 279.19 / 355.77 | 38.20 / 39.30 | 1161.19 / 1178.84 | 12/15 / 12/15 |
+| Qwen3.6 35B-A3B UD-IQ2_XXS | 357.88 / 385.05 | 72.49 / 73.90 | 1385.16 / 1141.65 | 12/15 / 12/15 |
+| GPT-OSS 20B Q8_0 | 616.22 / 549.48 | 85.68 / 83.44 | 1991.88 / 1445.71 | 9/12 / 9/12 |
+
+Gemma 短 prefill 仍落后，长 prefill 差距较小。Gemma 的三个原始 JSON 回答均带
+围栏，Qwen 的三次 OCR 均读错数字，GPT-OSS 的三个 JSON 回答均把 arguments
+写成字符串；对应 llama 对照也失败，依用户要求记录而暂不修复。Qwen 两引擎读错的
+数字不同，不能由同一通过数声称输出等价。三个 TensorSharp 模型额外的流式/非流式
+工具往返与 JSON Schema 均通过；这不覆盖原始严格 JSON 的失败。
+
+| 本机模型/引擎 | 峰值 RSS GiB | 整卡显存峰值 GiB |
+| --- | --- | --- |
+| Gemma / TensorSharp | 8.31 | 8.64 |
+| Gemma / llama.cpp | 7.00 | 8.37 |
+| Qwen3.6 / TensorSharp | 13.57 | 14.21 |
+| Qwen3.6 / llama.cpp | 11.31 | 12.94 |
+| GPT-OSS / TensorSharp | 18.63 | 12.82 |
+| GPT-OSS / llama.cpp | 11.31 | 12.00 |
+
+这是应用层对照：模板/token 分母未完全统一，llama decode 使用其计时对应的
+n−1 步，TensorSharp 使用 API 计数。显存含桌面与驱动占用；生命周期不同，TS
+还包含工具/schema 补测，不能将峰值差直接解释成等工作量物理 RAM 收益。模型先
+hash、TS 先执行、llama 后执行，未统一冷缓存条件，不比较冷启动。
+该冻结版本还有一个已定位的加载语义差异：Qwen3.6 虽然关闭了推测生成，TensorSharp 日志
+仍记录初始化 NextN/MTP draft head；llama 日志明确忽略 20 个相关 tensor，原始
+payload 合计 322,557,952 字节。这不是实测 GPU 差额，也解释不了全部内存差距；
+后续同工作集和辅助权重的按需准入需要把这部分单独核算。下述 2026-10-10 UTC
+续验已修复显式关闭 MTP 和启用 n-gram 时的此项加载问题；上表仍保留原冻结版本数据。
+
+此外，在同一冻结服务上补了真实宿主智能体：skill 选择/读取、skill script、shell、
+文件生成、读取、patch 和执行。Qwen3.6 为 **5/6**，skill 选择的最终答复多了说明
+文字；生成和修改后的两个 Python 函数均经独立新增输入检查通过。Gemma QAT 也为
+**5/6**，文件修改成功，但反复生成相同的无效 PowerShell，未完成要求的 shell
+验证；执行器没有重放历史错误命令。独立诊断发现保留的两个 Python 函数都正确，
+仍不把原工作流失败改为通过。这些是 Windows **显式 unconfined 功能验证**，
+不构成 OS 隔离、稳定长程代理能力或双引擎智能体性能验收。
+
+新 VM 的 21 项相关原生 CTest 已通过、无 skipped。`Qwen4ExpExpertCacheProbe`
+现在支持 layer split 的每 rank 独立 device pool，数值配额分别应用于每张卡，
+可选 host pool 仍共用一个 RAM 账本。真实 Qwen UD-IQ1_M 在双卡每 rank 32 GiB
+scope 下，两轮合计 **34 行、8,442,880 个 logits** 与无 scope 路径逐位一致；
+两个下载后的原始 payload 也再次逐行校验 SHA。阶段观察中两卡最大 committed
+分别为 22,311,445,696 / 23,159,210,380 字节，清理后两卡账本及 1,090 个活跃
+allocation owner 全部归零。它们是阶段采样值，不是每个瞬时分配的峰值。
+每 rank 16 MiB 用例在 quantized weight preload 明确拒绝，随后 cache/reuse
+释放、scope 卸载、native shutdown 均完成，没有残留 owner 或 cleanup error。
+以上配额覆盖已接入 cache/preload/graph buffer，**不是总 VRAM/RSS/KV 配额**。
+这组正确性验证与下载重叠，不用于吞吐比较。
+
+进一步降低到每 rank **21 GiB**，运行仍成功：部分权重未驻留于 cache，转入已
+计账的 graph storage；两轮各 17 行完整 logits 的链哈希与无 scope 结果一致。
+阶段观察的 committed 最大值为 22,311,445,696 / 22,471,082,164 字节，均在每卡
+22,548,578,304 字节容量内，最终全部归零。此用例原先预期触发拒绝，故编排脚本的
+该断言失败；原记录保留并单独更正解释，不称作运行时失败，也不假称已经覆盖
+“第一卡运行后第二卡中途拒绝”。21 GiB 仅保留全量 logits 的链摘要，未另外导出
+原始词表 payload；32 GiB 的完整下载复核范围保持独立。
+
+为定位 Gemma 短 prefill，`GemmaRepetitionProbe` 新增仅用于诊断的
+`--prefill-method forward|refill`。相同 40-token prompt、8 个固定 teacher token，
+按 Forward/Refill/Refill/Forward 顺序运行；同方法两次完整 logits 逐位一致，
+跨方法 relative L2 为 **0.0561–0.1206**。两方法及独立 llama 连续生成的 allowed
+argmax 在这 8 行均一致，但 top-list logit gap 仍有差异；有限 top-1 一致不能证明
+完整数学等价。首次 Forward 约 196/165 ms，Refill 约 199/220 ms，包含 graph/JIT
+初始化，不作为 warm 吞吐收益。当前最后一个 prompt token 独立 decode 的路径
+未改默认，不能为减少一次调用而忽视 batch geometry 引起的数值变化。
+
+新 VM 主矩阵已完成，冻结原生库为
+`7bd75ec6aeea0c0880df44f451a00c5432d00b8cf63738629cf56a9bd91035da`，
+独立 llama.cpp 为未修改的 `6184e92c57dcd34de8a3e381d7641a5e75250d5f`。
+运行环境清除了先前实验变量，16 线程、context 4096、按层分两卡；GLM 两边均
+放置 12 层 CPU 专家。编译、模型下载及正确性探针结束后才串行运行性能矩阵。
+
+| 新 VM 模型 | 短 PF：TS / llama | D：TS / llama | 长 PF：TS / llama | 严格任务：TS / llama |
+| --- | --- | --- | --- | --- |
+| Qwen3.8 Flash Next UD-IQ1_M | 256.16 / 179.19 | 55.33 / 60.00 | 762.09 / 625.07 | 12/15 / 12/15 |
+| GLM 5.3 Flash UD-Q2_K_XL | 48.53 / 37.89 | 22.13 / 22.27 | 160.00 / 136.89 | 15/15 / 15/15 |
+| DeepSeek V4.1 Flash EngramQ5-Q2_K | 47.03 / 不支持 | 19.12 / 不支持 | 98.81 / 不支持 | 12/12 / 未执行 |
+
+Qwen decode 仍落后约 **7.8%**，性能对齐未完成；其三次原始 JSON 围栏失败两边
+都有。GLM decode 观测差约 0.6%，不把小样本微差解读为稳定优劣。三个 TS 模型
+额外的两个工具往返及一次 schema 均通过。DeepSeek 本轮仅测文本，未在新 VM
+复验视觉组件；固定 llama revision 的 `deepseek41` 不支持记录来自先前独立加载
+失败，本轮没有把该缺项算作通过，也没有编造两引擎吞吐比。
+
+| 新 VM 模型/引擎 | 峰值 RSS GiB | 双卡显存峰值 GiB | cgroup 采样峰值 GiB | 就绪秒数 |
+| --- | --- | --- | --- | --- |
+| Qwen / TensorSharp | 43.44 | 46.18 | 93.13 | 68.68 |
+| Qwen / llama.cpp | 42.73 | 45.02 | 90.26 | 10.78 |
+| GLM / TensorSharp | 25.45 | 82.40 | 93.13 | 51.56 |
+| GLM / llama.cpp | 91.89 | 82.26 | 93.13 | 243.13 |
+| DeepSeek / TensorSharp | 85.86 | 83.02 | 93.13 | 29.70 |
+
+这组未清空、也未统一各次启动的文件缓存，故**不比较冷启动**；尤其不能把
+Qwen 的 68.68/10.78 秒称为同冷态加载速度比。RSS 和共享文件缓存口径不同，
+不能从 GLM 的 RSS 差推导同等物理 RAM 节省。v1 控制器实际采样成功，保留了
+limit/usage/failcnt；观测到的 failcnt 为零不代表任意请求均不会触达容量上限。
+DeepSeek 的首个平方数 prefill/decode 为 **37.81/22.23 秒**，首次工具提示为
+**44.06/8.91 秒**，首次长检索 prefill 为 **26.53 秒**；相同工具提示随后两次
+prefill 为 1.54/1.29 秒。网络卷、页缓存与新 token 的访问工作集影响显著，
+不能把 warm 19.12 tokens/s 当作首请求或任意新任务的 SLO。
+
+为继续缩小 Qwen 的 decode 差距，另试验仅由 TensorSharp 提前展开 router 权重
+子图，使 ggml 能识别连续的 softmax/top-k/get-rows 融合；没有修改 ggml。
+小型合成模型的 34 行 logits 逐位一致，但真实 UD-IQ1_M 的每轮 17 行中，
+prefill 一致，16 行 decode 的 relative L2 为 **0.0474–0.1691**，远超既定
+`1e-6` 门槛。所有 top-1 相同不能替代完整数值检查，故停止该候选的性能验收，
+撤回实验开关和代码。独立进程设置 `GGML_CUDA_DISABLE_FUSION=1` 后，两种图
+顺序恢复逐位一致；证据把差异定位到融合相关路径，但未证明具体哪个算子有误，
+也不把当前实现自动当作模型语义的独立真值。失败捕获、源码快照和控制实验
+保留在 `router-experiment/`；上述主矩阵使用此前冻结的库，不受此实验影响。
+撤回后强制重新编译，Linux 库的 SHA-256 恢复为主矩阵的 `7bd75ec6…035da`；
+两轮合计 34 行真实模型 logits 与实验关闭时逐位一致。恢复后的 Linux 相关
+CTest 20 项通过。Windows 恢复构建为 `bf584fe5…c701a`，相关检查 23 项通过、
+单 GPU 笔记本上的双卡项 1 项 skipped；不能把这项计作通过。首次恢复曾因
+复制文件保留旧时间戳而没有重编译，证据留存于 `restored/`，最终强制重建及
+回归位于 `restored-final/`，两者不混算。
+
+按更新后的设计核对，本轮新增完成与剩余工作分别为：
+
+| 范围 | 当前状态与后续验收 |
+| --- | --- |
+| 新 VM / Windows、多模型共同任务、图像及真实工具 | 本轮已完成 6 个模型的 TS 测试和其中 5 个 llama 对照；每模型 3 次共同任务，失败原样保留。不是长程智能体或所有模态验收 |
+| 双卡预算与释放 | 真实 Qwen 的每卡 32/21 GiB scope 数值一致、16 MiB 预加载拒绝及清理完成；不是整个进程 RAM/总 VRAM 硬上限，也未覆盖第二卡运行中拒绝 |
+| 跨硬件观测与传输 | v1/v2 采样器及新部署的独立复制 oracle 完成；当前 VM 的显式 P2P 不合格，保留默认有界中转 |
+| 解码和短 prefill 对齐 | 正在进行。Qwen decode 仍差 7.8%，Gemma 短 PF 仍差约 21.5%；router 提前展开、Gemma Forward/Refill 候选均没有足够数值证据可改变默认 |
+| 冷权重/新任务访问 | 部分页驻留反馈及读取/上传流水线已实现；DeepSeek 网络卷上的首次新任务延迟仍显著，尚需不同提示工作集、受控页缓存及成本反馈验收 |
+| 模型全资源统一计账 | 部分接入；KV、媒体、辅助 MTP 权重、全部 workspace 的统一准入，以及相同较小 RAM+VRAM 硬预算对照仍待完成 |
+| 长上下文、并发、其他后端、异步 DMA、多机 | 本轮未覆盖；相关全面适配仍属剩余工作，不能从双卡单请求测试外推 |
+
+本阶段原始证据及独立重算报告位于忽略目录
+`artifacts/vm216-20261009/`，入口为 `report.html` 和 `report.json`。全模型 KV/媒体/workspace 统一账本、较小共同
+RAM+VRAM 硬预算对照、在线成本反馈、异步 DMA、长上下文/并发及完整跨平台
+智能体仍未完成；新增硬件结果不代表整个设计已验收。
+
+### 2026-10-10 UTC 续验：Qwen 辅助权重准入与 decode 定位
+
+本轮已实现 Qwen3.5/3.6 的 NextN 权重按需加载：启动时显式 `--no-spec` /
+`TS_SPEC=0`，或启用 `TS_SPEC_TYPE=ngram`，均在 prefault、权重物化、融合、上传
+之前排除声明的尾部 NextN 层，相应层的 KV 和缓存数组也不再创建。专家文件读取
+策略的工作集估算只计入准入权重。没有指定策略的直接 API 保留历史兼容能力，允许
+调用者在构造后附加学习型草稿解码器；显式启用 MTP 仍加载并执行该头。策略在模型
+构造时确定，不随之后的环境变量变更动态重载。本项不扩大文件流式权重模式的支持范围。
+
+真实本地 `Qwen3.6-35B-A3B-UD-IQ2_XXS` 少加载 **20 个 tensor / 322,557,952
+字节（307.6 MiB）源 payload**，总缓存层数从 41 降至 40。源字节数不是物理 RAM/
+VRAM 节省值。公共观测字段 `OmittedCheckpointWeightBytes/Count` 明确采用该口径。
+实现及 probe 全在 TensorSharp 自有代码中；上游 ggml 仍为干净的
+`ffa4e8b80930029a35991f94e7c8a93cd67730ab`，本轮没有 native 源码或二进制行为改动。
+
+可复用入口为 [Qwen35WeightAdmissionProbe](../../eng/validation/Qwen35WeightAdmissionProbe/README.md)。
+冻结改动前后程序集，共用同一 checkpoint、native、上下文、输入及 teacher token：
+
+| 数值/执行范围 | 实际结果 |
+| --- | --- |
+| 显式关闭 MTP：改动前 / 后 | 两轮共 34 行完整词表 logits 逐位一致 |
+| 显式启用 MTP：改动前 / 后 | 两轮共 34 行完整 logits 逐位一致；16 个生成 token 相同，16 drafted / 8 accepted / 8 verify / 4 rollback |
+| 修改后关闭 MTP / n-gram | 两轮共 34 行完整 logits 逐位一致 |
+| 实际 n-gram 生成：改动前 / 后 | 另 17 行完整 logits 逐位一致；64 个输出 token 相同，42 drafted / 42 accepted / 21 verify / 0 rollback |
+| 最终相关单元测试 | Windows **99/99**、Linux **99/99**，均无 skipped；包含加载策略、streaming 契约、CLI、prefault 与 n-gram |
+
+每行复核原始 f32 payload、SHA-256、长度和输入历史；没有以 top-1 相同代替全量
+检查。该证据证明此修改的行为不变，不是模型语义的独立真值。真实数值覆盖一个
+Windows GGML CUDA checkpoint，不能算作其他量化、MLX 或 Linux 真实 NextN 模型
+验证。Linux 首次 `--no-restore` 因缺少项目还原资产未实际运行测试，不计为通过；
+恢复依赖后的正式 TRX 才是上述 99/99 的依据。初始探针 teacher 长度检查失败以及
+复制失败日志均保留，不计为通过。
+
+本地 RTX 3080 Laptop 16 GiB，context 4096、8 线程、greedy、输出上限 512，关闭
+MTP 和前缀复用。每组相同五类任务各 3 次，速度仍采用指定任务后两次的中位数。
+按“前 / 后 / 后 / 前”执行，前后使用相同 native `bf584fe5…c701a`：
+
+| 顺序 | 短 prefill token/s | decode token/s | 长 prefill token/s | 峰值 RSS GiB | 整板显存峰值 GiB |
+| --- | --- | --- | --- | --- | --- |
+| 0 / 修改前 | 323.31 | 71.89 | 1359.96 | 13.94 | 14.11 |
+| 1 / 修改后 | 385.10 | 75.08 | 1417.93 | 13.75 | 14.04 |
+| 2 / 修改后 | 381.71 | 73.12 | 1426.58 | 13.86 | 14.13 |
+| 3 / 修改前 | 380.74 | 74.47 | 1418.66 | 13.80 | 14.14 |
+
+decode 两组中位数为 **73.18 → 74.10 token/s**，约 +1.26%，区间重叠，不能宣称
+稳定提速。短 prefill 波动也不能直接归因于本修改。RSS/显存读数受采样、桌面及
+驱动影响，不能把源 payload 当作显存收益。四组共同任务完整答复、结束原因和
+token 数均相同，严格任务 **12/15**，原有 3 次 OCR 失败保留；工具往返与 schema
+均通过。C 盘在冗余二进制复制时耗尽后，两组冻结程序均改存 D 盘，原始证据保留在
+忽略目录；未比较冷启动，也未将失败的复制当作完成。
+
+新 VM 双 A40 的 Qwen3.8 使用原稳定冻结库 `7bd75ec6…035da`，单独完成线程数
+16 / 8 / 8 / 16 的同任务对照；这些性能运行期间，本任务没有在 VM 并行构建、
+下载或执行其他测试：
+
+| 线程 / 顺序 | 短 prefill token/s | decode token/s | 长 prefill token/s | 峰值 RSS GiB | 双卡显存峰值 GiB |
+| --- | --- | --- | --- | --- | --- |
+| 16 / 0 | 265.15 | 54.48 | 739.73 | 43.34 | 46.14 |
+| 8 / 1 | 252.14 | 55.23 | 742.76 | 43.47 | 46.21 |
+| 8 / 2 | 260.02 | 54.08 | 731.80 | 43.41 | 46.12 |
+| 16 / 3 | 257.07 | 54.66 | 748.50 | 43.30 | 46.05 |
+
+16 线程 decode 中位数 **54.57**，8 线程 **54.65 token/s**，差约 0.15%；没有
+充分依据修改全局线程默认。全部严格任务 12/15，原始 JSON 围栏失败保留，工具和
+schema 补测通过。本轮没有重新跑 llama.cpp；上一主矩阵 55.33 / 60.00 的约 7.8%
+差距仍属未解决，不把不同轮次观测拼成新的引擎速度比。
+
+进一步使用原库开启已有阶段计时，40-token prefill、64 个固定 teacher token，
+两轮。第二轮前两个 decode 为 **34.19 / 44.95 ms**，之后 62 步中位数 **17.80 ms**。
+后 62 步的两个 layer span 中位数分别为总计 **8.555 / 9.080 ms**，其中
+`graph_compute` 为 **8.470 / 8.875 ms**；累计该调用占 span 墙钟 **98.25%**。
+准备、输入上传与输出下载较小。`graph_compute` 包括图内调度、同步和可能的搬运，
+不等同于纯 GPU 算术；这些带诊断日志的时间不混入主吞吐矩阵。
+代码审计显示每个 span 的 prefill/decode 共用一个 shape cache 槽，形状切换会
+替换已有图；保留多形状的候选仍需有界预算、释放及全 logits 验证，**尚未实现**。
+稳定 decode 的下一步是算子级定位，而不是根据线程实验猜测提速。
+
+本轮证据入口：忽略目录 `artifacts/weight-admission-20261010/report.html` 与
+`report.json`。辅助 MTP 无用驻留这一具体缺项已修复；全模型 KV/媒体/workspace
+统一计账、较小共同 RAM+VRAM 硬预算对照、Qwen decode/Gemma 短 prefill 对齐、
+DeepSeek 新任务冷访问、长上下文/并发和跨后端全面验收仍未完成。
+
+### 2026-10-10 UTC 续验：Qwen3.8 单 token 图内复制消除
+
+已完成上一阶段的 CUDA 算子级定位，并在 TensorSharp 自有
+`ggml_ops_qwen4exp.cpp` 中消除部分冗余物化：单 token 且输入已连续时，
+hyperconnection 首路混合、GDN 的 q/k/v 及归一化输入直接保留 view。
+该路径仅在 CUDA 默认开启；`TS_Q4E_DECODE_VIEWS=0` 可恢复原复制路径。
+多 token 图、状态写入以及专家融合所需的显式分配屏障保持原有行为；没有修改
+上游 ggml，也没有采用前一轮未通过数值验收的 router 顺序候选。
+
+新增可复用的 [CUPTI activity 工具](../../eng/validation/cuda-activity-trace.md)
+在图内记录 GPU 内核、复制及 runtime API，用完整 forward 的时间戳界定范围。
+两组均取第二轮跳过前两步后的 14 步，未发现丢失记录或 CUPTI 错误。
+每步 D2D 复制从 **519 降至 207 次**，累计复制时间 **1.0996 → 0.7387 ms**；
+各名称 GPU 内核的执行次数相同，累计内核时间 **15.8761 / 15.8821 ms**。
+API 与 GPU 时间重叠，不能相加；CUPTI 会增加 graph launch 开销，以上不是
+无插桩的吞吐结果。已有逐节点 profiler 会打破融合并改变数值，其结果不作为
+正确性 oracle 或正式性能对照。实际追踪也确认专家加权归约已经融合，不能仅
+凭图中的 add 数量判断该归约尚未融合。
+
+数值校验使用同一真实 `Qwen3.8-Flash-Next-UD-IQ1_M` checkpoint、40 个提示
+token、16 个固定 teacher token、两轮，每行 248,320 个 f32。旧稳定库、候选
+关闭、候选开启的 **34 行完整 logits 逐位一致**；最终限定 CUDA 的构建另在
+每卡 32 GiB 已接线资源 scope 下复验，34 行仍逐位一致。独立复核原始 f32
+文件的偏移、长度、输入历史及 SHA-256；各 scope 均在物理清理后归零。
+这证明修改保持已有结果，不把旧实现视为独立模型语义真值；scope 也不覆盖
+总 VRAM、全部 KV、driver/backend pool 或主机 RAM。
+
+同期间按 off / on / llama / on / off / llama 顺序完成六组应用对照。四组 TS
+使用同一最终 native 和程序集，仅切换上述开关；不插入 CUPTI。硬件为双 A40，
+context 4096、16 线程、按层分两卡、greedy、输出上限 512、关闭 MTP 和前缀
+复用。同一五类共同任务各执行三次，表中取每组对应任务后两次的中位数：
+
+| 顺序 / 路径 | 短 prefill token/s | decode token/s | 长 prefill token/s | 峰值 RSS GiB | 双卡显存峰值 GiB |
+| --- | --- | --- | --- | --- | --- |
+| 0 / TS 原复制 | 234.07 | 54.34 | 743.42 | 43.31 | 46.13 |
+| 1 / TS view | 255.36 | 56.04 | 748.98 | 43.30 | 45.98 |
+| 2 / llama.cpp | 171.18 | 59.68 | 654.79 | 42.73 | 45.02 |
+| 3 / TS view | 262.50 | 55.68 | 763.07 | 43.20 | 46.07 |
+| 4 / TS 原复制 | 255.01 | 55.29 | 761.04 | 43.54 | 46.23 |
+| 5 / llama.cpp | 181.08 | 60.28 | 636.85 | 42.73 | 45.02 |
+
+TS decode 两组中位数 **54.82 → 55.86 token/s（+1.91%）**；同期 llama 为
+**59.98**，TS 仍落后 **6.87%**。两次 on 的运行中位数都高于 off，但单次
+请求区间有重叠、样本有限，不能外推普遍稳定收益。多 token prefill 图未变，
+短 prefill 的波动不直接归因于该修改。两引擎的模板和 token 数仍可能不同；
+llama decode 使用实际 n−1 步，此表不是固定 teacher token 的跨引擎内核基准。
+
+全部六组严格任务均为 **12/15**，三次原始 JSON 围栏失败两引擎共有，依用户
+要求记录保留。数学、代码、长检索及图像 OCR 通过。四组 TS 的完整答复、
+停止原因和 token 数相同，额外的两个真实工具往返及一次 schema 均通过。
+RSS/整板显存仅为采样峰值，TS 多执行的工具任务也不同，不能推导等工作量
+物理 RAM 节省。最后一次 llama 采样出现一次 PID 消失错误；其脚本先停止
+进程后停止采样器，存在退出竞争，该组只报告已有样本峰值，不声称连续完整
+采样。没有统一清空页缓存，不比较冷启动；容器 RAM 上限仍为 93.13 GiB，
+没有增加较小的共同 RAM 硬预算。
+
+最终构建的实际相关验证：Windows CUDA 托管测试 **15/15**、Linux 双卡
+**15/15**；Windows 原生 CTest **8 通过 / 1 双卡项 skipped**，Linux **9/9**；
+诊断报告解析器 **4/4**。Windows 初次忘记选择 CUDA 测试后端造成 8 项 skipped，
+该记录不计入通过。真实数值仅覆盖此 IQ1_M；其他量化、其他后端、长上下文与
+并发未在本轮增加验收。GGML 仍为干净的 `ffa4e8b80930029a35991f94e7c8a93cd67730ab`，
+llama 为干净的 `6184e92c57dcd34de8a3e381d7641a5e75250d5f`。最终 Linux native
+为 `ed488422…ad7f6`，Windows 为 `5b6f5a02…0ae3`。
+
+原始证据、源码差分、构建身份、独立重算报表位于忽略目录
+`artifacts/qwen-kernel-20261010/`（入口 `report.html` / `report.json`）。较大
+证据通过该目录内 junction 保存到 D 盘，未 force-add。GLM/DeepSeek 等模型
+本轮未重跑，仍参考先前分阶段报表。Qwen 剩余 decode 差距、Gemma 短 prefill、
+DeepSeek 新任务冷访问、KV/媒体/workspace 全资源统一账本、共同较小 RAM+VRAM
+预算、长上下文/并发与跨后端验收仍未完成。
+
+### 2026-10-10 UTC 续验：Qwen 广播消除及图/状态共享预算
+
+进一步将单 token CUDA hyperconnection scatter 和 PLE 的只读广播改为零步幅
+view，保留后续乘法的归约与融合语义。`TS_Q4E_BROADCAST_VIEWS=0` 恢复物化
+repeat，与上一阶段 `TS_Q4E_DECODE_VIEWS` 独立；默认开启，多 token 和非 CUDA
+路径不变。初版错误使用 `ggml_view_tensor`，丢失计算生产者并触发 native
+assert，已改为保留源依赖的 `ggml_view_3d`。失败日志保留，仅修正后的构建合格。
+
+Qwen4Exp 自有的 gallocr 图 arena、循环/GDN/PLE/QSA 状态和设备状态快照已接入
+`includeGraphBuffers: true` 的共享账本，按活动 rank 计费，物理释放后归还。
+batch arena 同样接入。新增三项 CUDA 测试分别验证 cache-only/graph scope
+覆盖差异及快照回滚、额度耗尽时拒绝并清理、batch 拒绝不推进 holder 且增额后
+原批重试与参考输出一致。默认 cache-only 合约保持；host、全部 KV/媒体、
+backend/driver pool 尚未统一覆盖，不能称为整个模型的硬显存上限。
+
+真实 IQ1_M checkpoint 的 40-token 提示、16 个固定 teacher token、两轮，
+开关两侧以及两个 CUPTI 诊断运行的 **34 行完整词表 logits**，均与上一稳定
+构建逐位一致；每行 248,320 个 f32。独立复核原始文件偏移、长度、SHA-256 和
+输入历史。每卡 32 GiB 已接线 scope 的物理清理后额度归零；这证明保留既有
+数值，不将旧实现当作独立语义真值。
+
+同一最终 native、相同 TS 程序集、相同环境，仅切换广播开关，完成六组
+off / on / llama / on / off / llama 对照。双 A40，context 4096、16 线程、
+按层分两卡、greedy、输出上限 512，无 MTP/前缀复用；五种共同任务各三次，
+下表速度取指定任务后两次中位数，应用测试没有 CUPTI 插桩或并行 GPU 测试：
+
+| 顺序 / 路径 | 短 prefill token/s | decode token/s | 长 prefill token/s | 峰值 RSS GiB | 双卡显存峰值 GiB |
+| --- | --- | --- | --- | --- | --- |
+| matrix-0-off | 214.43 | 56.48 | 755.16 | 43.24 | 46.09 |
+| matrix-1-on | 251.69 | 56.58 | 727.78 | 43.25 | 46.02 |
+| matrix-2-llama | 176.88 | 59.63 | 656.41 | 42.73 | 45.02 |
+| matrix-3-on | 258.53 | 56.72 | 721.48 | 43.31 | 46.10 |
+| matrix-4-off | 208.09 | 54.46 | 690.19 | 43.37 | 46.16 |
+| matrix-5-llama | 181.56 | 60.27 | 649.25 | 42.73 | 45.02 |
+
+
+两组运行中位数：TS decode **55.47 → 56.65 token/s**
+（+2.14%），同期 llama **59.95**，
+仍落后 **5.50%**。多 token 图没有改变，prefill
+波动不能直接归因于该优化；样本有限，不能外推全部工作集或硬件。模板与 token
+数可不同，llama decode 用实际 n−1 步；不是跨引擎固定 token 内核基准。
+
+六组均 **12/15**：三次原始 JSON 围栏失败两引擎共有，保留失败；数学、代码、
+长检索、图片 OCR 通过。四组 TS 的完整答复、停止原因和 token 数相同，额外
+两种工具往返与 schema 通过。采样器先停止再退出服务，六组无采样错误；RSS
+和整板显存仍只是采样峰值，TS 额外任务不同，不能据此推导等工作量 RAM 节省。
+容器 RAM 上限仍为 93.13 GiB，未增加较小共同硬预算，也未控制冷文件缓存。
+
+CUPTI 独立诊断中，第二轮跳过前两步后的 14 步，repeat 内核每步
+**169 → 72**，无活动丢失或追踪错误，全部 logits
+仍逐位一致。API/GPU 时间有重叠，插桩会改变运行开销，不计入主吞吐结论。
+
+实际相关托管验证：Windows CUDA **18 个唯一测试通过**（17 项与后续 3 项有
+2 项重叠），Linux CUDA **21/21**；策略/CPU 两平台各 **150/150**。原生全量
+Windows **85 通过、1 双卡项 skipped**；Linux **84 通过、2 失败、6 skipped**（需要 3–8 张卡）。
+Linux 失败 `deepseek41-sparse-flash-attention-cuda` 直接链接未改的上游 ggml，
+不链接 TensorSharp 内核：256-token、4096/8192 KV 的结果与 dense 路径相同，
+对独立 double oracle 的 relative L2 为 0.001668 / 0.001868，超过原有
+0.0015 门槛；没有放宽阈值或将失败计入通过。Windows 不配置该测试。另一项
+失败为默认传输的 NCCL F32 gather 超时，使用 `NCCL_P2P_DISABLE=1` 单独复跑
+通过；结合此前独立 CUDA 直连损坏证据，仍不能宣称默认 P2P 在此 VM 可靠。
+
+变更 Python 工具测试 **85 通过、1 Linux-only skipped**。另一次历史全量
+discovery 共 651 项，5 failures、44 errors、3 skips，**未通过**；涉及缺失的
+历史忽略证据 fixture、Windows CRLF 导致的固定源码 hash 差异和平台假设。保留日志，不把相关小集的
+通过描述为全仓库通过。Qwen Image 2.1 的原生 CPU/CUDA 合成图测试通过，但
+不计作新增真实图像 checkpoint 的生成质量验收。
+
+ggml 仍为干净 `ffa4e8b80930029a35991f94e7c8a93cd67730ab`，llama 为干净
+`6184e92c57dcd34de8a3e381d7641a5e75250d5f`。Linux native
+`affe5f81…746aa`，Windows `8a52a011…e1a60`；构建后仅修正一处 allocator
+名称注释，未改变执行代码。证据入口为忽略目录
+`artifacts/qwen-broadcast-20261010/report.html` / `report.json`；大文件通过
+junction 存在 D 盘。未提交生成日志、报表或 upstream 改动。
+
+本阶段收尾不等于全设计完成。Qwen 剩余 decode 差距、Gemma 短 prefill、
+DeepSeek 新任务冷访问及上述上游数值缺口、全模型 KV/媒体/workspace 账本、
+较小共同 RAM+VRAM 硬预算、长上下文/并发和跨后端适配仍待继续。
+
 ## 15. 后续实际接入与硬件验证入口
 
 `PagedKvStorage` 的 `Acquire` 返回有生命周期的 span 租约；`BatchExecutor` 的捕获、尾页刷新、恢复全部使用该 API。底层将一个页面视为不解释布局的可变资源，按原字节回写/恢复。前缀引用继续保留逻辑页，最后一个引用消失才注销；id 再次分配时增加 epoch。失败的释放不把页面放回 free queue。捕获 scratch 和固定搬运缓冲在启动时预留，单个模型必须能容纳一个合法完整快照页。恢复阶段可在有空闲驻留容量时预取下一页，与当前注入操作重叠；停止/回收前等待预取结束。
@@ -610,7 +1473,13 @@ export TS_SCHED_KV_SPILL_DIRECTORY=/path/on/ssd/tensorsharp-kv
 
 `TensorSharp.GGML.GgmlCacheBudgetScope` 将原生 lazy device-copy 与显式 preload 接入这份托管预算。每个 rank 映射到一个或多个 pool；例如 UMA 同时约束 `node0/ram` 和 `node0/gpu0`，独立显卡只约束对应 GPU pool。必须在这些缓存首次分配前安装；原生预留、实际分配、commit 和物理释放依次持有同一额度。已有缓存或正在分配时拒绝接管；仍有额度或回调在途时拒绝卸载并保留托管回调，允许清理后重试。停止模型执行并清空原生缓存后再释放 scope。不要又在请求 envelope 中重复预留这些由适配器直接计费的字节。
 
-默认 scope 仍为 cache-only；可选 `includeGraphBuffers: true` 增加已接线的 context buffer 和 reuse graph arena，包括 Gemma/Qwen35 主要执行入口。未接线的 executor、部分 live KV/holder、backend pool、host-pointer wrapper 和 driver overhead 仍不包含，因此不是整个模型的硬 VRAM 上限。Qwen35/Gemma4 的显式文件权重模式通过各自 session 直接预留同一份 `MemoryBudget`；AdaptiveModelSession 同时启用覆盖到的 graph scope，保留实际拒绝而不改用不受限 fallback。接口用法见 [Memory README](../../TensorSharp.Memory/README.md) 和 [adaptive 入口](../../eng/validation/AdaptiveMemoryProbe/README.md)。
+默认 scope 仍为 cache-only；可选 `includeGraphBuffers: true` 增加已接线的 context buffer 和 reuse graph arena，包括 Gemma/Qwen35 主要执行入口及 Qwen4Exp 的自有图 arena、循环状态和设备状态快照。Qwen4Exp batch arena 额度不足时不推进 holder，增加额度后可重试。未接线的 executor、部分 live KV/holder、backend pool、host-pointer wrapper 和 driver overhead 仍不包含，因此不是整个模型的硬 VRAM 上限。Qwen35/Gemma4 的显式文件权重模式通过各自 session 直接预留同一份 `MemoryBudget`；AdaptiveModelSession 同时启用覆盖到的 graph scope，保留实际拒绝而不改用不受限 fallback。接口用法见 [Memory README](../../TensorSharp.Memory/README.md) 和 [adaptive 入口](../../eng/validation/AdaptiveMemoryProbe/README.md)。
+
+四参数 scope 的 `hostPools` 可将紧凑专家文件读取 arena 和 DeepSeek 按路由读取的暂存接入同一账本的 RAM pool，独立于 rank 的 GPU 映射。
+与其他 RAM owner 原子竞争额度，先准入再分配，物理释放后归还；增长前先释放旧 arena，避免双份暂存。
+配额不足会报告原生原因并终止当前执行，不静默绕到 mmap。已有主机 arena 时拒绝接管，仍存活时拒绝卸载。
+DeepSeek 暂存随模型销毁释放；紧凑 arena 可在空缓存 trim 时释放。
+省略 `hostPools` 保留原契约；OS 页缓存、模型映射、CPU 长 prefill scratch 等仍未覆盖。
 
 `SchedulerConfig.MemoryAdmission` 已接入实际调度器：执行器提供每请求完整增量峰值，按多 pool 原子预留；准入先于前缀物化，取消/结束/抢占的额度在模型释放完成后才归还。`SequenceState.MemoryEnvelope` 用于实际分配，防止双重计账；缓存存活的子分配继续计费。共享权重、池化 arena 和保留前缀必须采用自己的生命周期额度。预算耗尽且当前引擎无运行请求时，worker 在模型锁外等待预算变化或新命令，不忙轮询。尚未为所有旧模型自动推导成本。
 
@@ -618,7 +1487,7 @@ export TS_SCHED_KV_SPILL_DIRECTORY=/path/on/ssd/tensorsharp-kv
 
 硬件验证工具：[UnifiedMemory.CudaProbe](../../eng/validation/UnifiedMemory.CudaProbe/README.md)。它在每个选中 GPU 上实际执行整数内核，检查全量结果、事件生命周期、VRAM/RAM 压力下的 SSD 恢复、16 个并发读取者、逐方向 GPU 复制、部分工作集回滚与所有 rank fence。指定 P2P 却未走 peer 路径时返回失败；没有驱动或设备时返回 unavailable，不算通过。
 
-此前已使用给定 SSH 访问 VM、安装隔离的 .NET SDK、构建 CUDA 原生库并运行上述 A40 硬件和模型用例；当前文件权重续验时该连接被拒绝，仅使用本机 CUDA。历史环境的 unavailable、当前无法连接与已有通过结果分别记录，不能混算。生成的日志、JSON、TRX、模型探针输出均保留在忽略的 `artifacts/unified-memory/`、`artifacts/unified-memory-continuation/` 和 `artifacts/unified-memory-gemma/`，不提交 Git。
+此前旧 VM 在文件权重续验时连接被拒绝，当时仅使用本机 CUDA；当前已切换至 `69.30.85.216:22101` 并完成上述双 A40 验证。历史 unavailable 与各部署的通过/失败分别记录，不能混算。生成的日志、JSON、TRX、模型探针输出保留在忽略的 `artifacts/unified-memory/`、`artifacts/unified-memory-continuation/`、`artifacts/unified-memory-gemma/`、`artifacts/new-vm-20261009/` 和本轮 `artifacts/vm216-20261009/`，不提交 Git。
 
 ## 16. 外部工程依据
 

@@ -13,12 +13,16 @@ namespace TensorSharp.GGML;
 /// Each rank maps to one or more existing budget pools; listing RAM and GPU for
 /// UMA applies two constraints to one allocation, not two physical copies.
 /// With includeGraphBuffers=true, additionally charge the explicitly routed
-/// TensorSharp-owned context buffers and shared reuse graph allocators. Buffers
+/// TensorSharp-owned context buffers and shared reuse graph allocators, including
+/// Qwen4Exp graph arenas, recurrent state and device state snapshots. Buffers
 /// retain their original native backend interfaces. Other allocator paths, live KV
 /// outside these buffers, host-pointer wrappers, backend pools, allocator rounding
 /// and driver overhead are not covered; this is not a whole-model memory cap.
 /// Cache-only refusal can use unbudgeted per-graph streaming. Dispose only after
 /// model work has stopped and all covered caches/graphs have been released.
+/// Supplying hostPools additionally accounts for the compact expert file-read
+/// arena and DeepSeek demand-read staging against the same budget, independently
+/// of rank/device pool mappings.
 /// Failed disposal keeps callbacks rooted and accounting active for a retry.</summary>
 public sealed class GgmlCacheBudgetScope : IDisposable
 {
@@ -35,6 +39,7 @@ public sealed class GgmlCacheBudgetScope : IDisposable
     private readonly object _lifecycleGate = new();
     private readonly MemoryBudget _budget;
     private readonly string[][] _rankPools;
+    private readonly string[] _hostPools;
     private readonly Dictionary<ulong, BudgetReservation> _allocations = new();
     private GCHandle _handle;
     private ulong _nextToken;
@@ -45,11 +50,25 @@ public sealed class GgmlCacheBudgetScope : IDisposable
         : this(budget, rankPools, includeGraphBuffers: false) { }
 
     public GgmlCacheBudgetScope(MemoryBudget budget, IEnumerable<IEnumerable<string>> rankPools, bool includeGraphBuffers)
+        : this(budget, rankPools, includeGraphBuffers, hostPools: null) { }
+
+    /// <summary>Also charge explicitly routed native host staging to the supplied
+    /// host pools. Null excludes these buffers, preserving the legacy contract.
+    /// This mapping is process-wide, independent of device-rank pools. It covers
+    /// the compact expert file arena and DeepSeek demand-read staging,
+    /// not mmap residency or all host allocations.</summary>
+    public GgmlCacheBudgetScope(MemoryBudget budget, IEnumerable<IEnumerable<string>> rankPools,
+        bool includeGraphBuffers, IEnumerable<string>? hostPools)
     {
         ArgumentNullException.ThrowIfNull(budget);
         ArgumentNullException.ThrowIfNull(rankPools);
         _budget = budget;
         IncludesGraphBuffers = includeGraphBuffers;
+        _hostPools = hostPools?.ToArray() ?? [];
+        if (hostPools != null && (_hostPools.Length == 0 || _hostPools.Distinct(StringComparer.Ordinal).Count() != _hostPools.Length))
+            throw new ArgumentException("Map host staging to one or more distinct pools, or use null to exclude it.", nameof(hostPools));
+        if (_hostPools.Length > 0)
+            budget.CanEverFit(_hostPools.Select(pool => new MemoryCharge(pool, 0)));
         _rankPools = rankPools.Select(pools => pools?.ToArray()
             ?? throw new ArgumentException("Every rank needs a pool mapping.", nameof(rankPools))).ToArray();
         if (_rankPools.Length == 0 || _rankPools.Any(p => p.Length == 0 || p.Distinct(StringComparer.Ordinal).Count() != p.Length))
@@ -63,15 +82,20 @@ public sealed class GgmlCacheBudgetScope : IDisposable
             IntPtr reserve = Marshal.GetFunctionPointerForDelegate(ReserveRoot);
             IntPtr commit = Marshal.GetFunctionPointerForDelegate(CommitRoot);
             IntPtr release = Marshal.GetFunctionPointerForDelegate(ReleaseRoot);
-            int attached = includeGraphBuffers
+            int attached = IncludesHostBuffers
+                ? GgmlNative.AttachSharedCacheBudgetWithHost(context, reserve, commit, release, includeGraphBuffers ? 1 : 0)
+                : includeGraphBuffers
                 ? GgmlNative.AttachSharedCacheBudgetEx(context, reserve, commit, release, 1)
                 : GgmlNative.AttachSharedCacheBudget(context, reserve, commit, release);
             if (attached != 1)
                 throw new InvalidOperationException("Install the GGML budget before covered cache/graph allocations, with no other active budget scope.");
         }
-        catch
+        catch (Exception error)
         {
             _handle.Free();
+            if (IncludesHostBuffers && error is EntryPointNotFoundException)
+                throw new NotSupportedException(
+                    "Expert host-buffer budgeting requires a native library with TSGgml_AttachSharedCacheBudgetWithHost. Update the native library together with the managed assemblies.", error);
             throw;
         }
     }
@@ -81,6 +105,7 @@ public sealed class GgmlCacheBudgetScope : IDisposable
     public Exception? CallbackError { get { lock (_gate) return _callbackError; } }
     public int ActiveAllocations { get { lock (_gate) return _allocations.Count; } }
     public bool IncludesGraphBuffers { get; }
+    public bool IncludesHostBuffers => _hostPools.Length != 0;
 
     public void Dispose()
     {
@@ -109,9 +134,15 @@ public sealed class GgmlCacheBudgetScope : IDisposable
             BudgetReservation? reservation = null;
             try
             {
-                if ((uint)rank >= (uint)owner._rankPools.Length || bytes <= 0
-                    || (kind != 0 && kind != 1 && !(kind == 2 && owner.IncludesGraphBuffers))) return 0;
-                reservation = owner._budget.TryReserve(owner._rankPools[rank].Select(pool => new MemoryCharge(pool, bytes)));
+                if (bytes <= 0) return 0;
+                string[] pools;
+                if (kind == 3 && owner.IncludesHostBuffers)
+                    pools = owner._hostPools;
+                else if ((uint)rank < (uint)owner._rankPools.Length
+                    && (kind == 0 || kind == 1 || (kind == 2 && owner.IncludesGraphBuffers)))
+                    pools = owner._rankPools[rank];
+                else return 0;
+                reservation = owner._budget.TryReserve(pools.Select(pool => new MemoryCharge(pool, bytes)));
                 if (reservation == null) return 0;
                 ulong token = checked(++owner._nextToken);
                 owner._allocations.Add(token, reservation);

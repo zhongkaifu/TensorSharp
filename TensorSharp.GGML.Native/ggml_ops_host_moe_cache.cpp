@@ -5,6 +5,10 @@
 // copied into compact, persistent slots; ordinary upstream ggml CUDA kernels
 // compute the complete routed FFN. No CPU/GPU partial-sum split is involved.
 #include "ggml_ops_internal.h"
+#include "ggml_ops_moe_prefetch.h"
+#include "ggml_ops_file_source.h"
+#include "ggml_ops_moe_prefetch_policy.h"
+#include "ggml_ops_expert_eviction.h"
 #include "ggml_ops_precision_policy.h"
 #include "ggml_ops_shared_cache_budget.h"
 #include "ggml-impl.h"
@@ -88,6 +92,24 @@ namespace tsg
             return enabled;
         }
 
+        bool route_trace()
+        {
+            static const bool enabled = [] {
+                const char* value = std::getenv("TS_HOST_MOE_ROUTE_TRACE");
+                return value && std::strcmp(value, "1") == 0;
+            }();
+            return enabled;
+        }
+
+        bool frequency_eviction()
+        {
+            static const bool enabled = [] {
+                const char* value = std::getenv("TS_HOST_MOE_EXPERT_CACHE_LFU");
+                return value == nullptr || std::strcmp(value, "1") == 0;
+            }();
+            return enabled;
+        }
+
         struct CacheEntry
         {
             ggml_backend_t backend = nullptr;
@@ -100,6 +122,10 @@ namespace tsg
             std::vector<int> expert_for_slot;
             std::vector<std::uint64_t> last_used;
             std::uint64_t clock = 0;
+            ExpertEvictionPolicy eviction_policy;
+            ExpertPrefetchPolicy prefetch_policy;
+            std::uint64_t prefetch_observations = 0, prefetch_reads = 0;
+            std::uint64_t file_read_calls = 0, file_read_bytes = 0;
             ggml_context* ctx = nullptr;
             ggml_gallocr_t allocator = nullptr;
             ggml_cgraph* graph = nullptr;
@@ -118,6 +144,13 @@ namespace tsg
 
             ~CacheEntry()
             {
+                if (diagnostics() && file_read_calls)
+                    std::fprintf(stderr, "[HOSTMOE-CACHE-FILE] layer=%d calls=%llu file_bytes=%llu\n", layer,
+                        static_cast<unsigned long long>(file_read_calls), static_cast<unsigned long long>(file_read_bytes));
+                if (diagnostics() && prefetch_observations != 0)
+                    std::fprintf(stderr, "[HOSTMOE-CACHE-PREFETCH] layer=%d observed=%llu parallel_reads=%llu\n",
+                        layer, static_cast<unsigned long long>(prefetch_observations),
+                        static_cast<unsigned long long>(prefetch_reads));
                 // The last direct output copy can still be queued after the
                 // helper returns. Drain it before eviction/invalidation frees
                 // any source storage; CUDA remains alive at both release hooks.
@@ -150,6 +183,46 @@ namespace tsg
         // per-layer slots. Each layer has at most budget / layer_count bytes,
         // preventing early layers from consuming every slot on the first token.
         std::list<std::unique_ptr<CacheEntry>> g_entries;
+        std::unordered_map<const void*, std::shared_ptr<ExpertFileSource>> g_file_sources;
+        // One process-wide workspace under g_cache_mutex, never one per layer.
+        // Kept through asynchronous uploads, drained on failure and released at
+        // cache teardown. Larger routed sets retain the ordinary mmap path.
+        constexpr std::size_t kFileReadWorkspace = std::size_t(32) << 20;
+        struct FileReadWorkspace {
+            ggml_backend_buffer_t buffer = nullptr;
+            std::shared_ptr<SharedCacheCharge> shared_charge;
+            std::size_t size() const { return buffer ? ggml_backend_buffer_get_size(buffer) : 0; }
+            std::uint8_t* data() const { return static_cast<std::uint8_t*>(ggml_backend_buffer_get_base(buffer)); }
+            void clear() {
+                if (buffer) ggml_backend_buffer_free(buffer);
+                buffer = nullptr;
+                shared_charge.reset(); // Return host credit after physical free.
+            }
+            ~FileReadWorkspace() { clear(); }
+            void reserve(std::size_t bytes) {
+                if (bytes <= size()) return;
+                if (bytes > kFileReadWorkspace) throw std::runtime_error("Expert read workspace exceeds its ceiling");
+                // The previous row has completed; free before growing so the
+                // transfer arena never temporarily holds two allocations.
+                clear();
+                auto charge = SharedCacheCharge::reserve(0, 3, bytes);
+                if (!charge) throw std::runtime_error("Expert read workspace exceeds shared host budget");
+#ifdef TSG_GGML_USE_CUDA
+                auto type = ggml_backend_cuda_host_buffer_type();
+#else
+                auto type = ggml_backend_cpu_buffer_type();
+#endif
+                // Upstream falls back to ordinary RAM when pinning fails.
+                // Only this small transfer arena is pinned, never model views.
+                buffer = ggml_backend_buft_alloc_buffer(type, bytes);
+                if (!buffer) throw std::runtime_error("Cannot allocate expert read workspace");
+                if (!charge->commit(size())) {
+                    clear();
+                    throw std::runtime_error("Cannot commit expert read workspace to shared host budget");
+                }
+                shared_charge = std::move(charge);
+            }
+        } g_file_read_buffer;
 
 #ifdef TSG_GGML_USE_CUDA
         bool valid_layout(const HostMoeSegment& hm, std::size_t (&stride)[3])
@@ -194,6 +267,7 @@ namespace tsg
             if (entry.ctx == nullptr) return false;
             auto* ctx = entry.ctx;
             entry.capacity = capacity;
+            entry.eviction_policy.configure(entry.num_experts, capacity, frequency_eviction());
             entry.weight[0] = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(entry.type[0]),
                 entry.hidden, entry.n_ff, capacity);
             entry.weight[1] = ggml_new_tensor_3d(ctx, static_cast<ggml_type>(entry.type[1]),
@@ -329,20 +403,24 @@ namespace tsg
             return Admission::admitted;
         }
 
+        void copy_slot_part(CacheEntry& entry, int slot, int expert, int part,
+            std::vector<std::pair<std::size_t, std::size_t>>& pieces)
+        {
+            const auto* src = static_cast<const std::uint8_t*>(entry.source[part])
+                + static_cast<std::size_t>(expert) * entry.stride[part];
+            // Respect prior registrations without pinning the expert stack or
+            // creating a second RAM copy. Only the caller issues these uploads.
+            host_pin_split(src, entry.stride[part], pieces);
+            for (const auto& p : pieces)
+                ggml_backend_tensor_set_async(entry.backend, entry.weight[part], src + p.first,
+                    static_cast<std::size_t>(slot) * entry.stride[part] + p.first, p.second);
+        }
+
         void copy_slot(CacheEntry& entry, int slot, int expert)
         {
             std::vector<std::pair<std::size_t, std::size_t>> pieces;
             for (int i = 0; i < 3; ++i)
-            {
-                const auto* src = static_cast<const std::uint8_t*>(entry.source[i])
-                    + static_cast<std::size_t>(expert) * entry.stride[i];
-                // Respect prior registrations from streamed prefill without
-                // pinning the whole expert stack or creating a second RAM copy.
-                host_pin_split(src, entry.stride[i], pieces);
-                for (const auto& p : pieces)
-                    ggml_backend_tensor_set_async(entry.backend, entry.weight[i], src + p.first,
-                        static_cast<std::size_t>(slot) * entry.stride[i] + p.first, p.second);
-            }
+                copy_slot_part(entry, slot, expert, i, pieces);
         }
 
         ggml_backend_buffer_t tensor_buffer(const ggml_tensor* tensor)
@@ -445,6 +523,12 @@ namespace tsg
             g_reserved += bytes;
             const auto& published = *g_entries.front();
             if (diagnostics()) std::fprintf(stderr,
+                "[HOSTMOE-EVICTION] layer=%d policy=%s epoch=%u\n", hm.layer,
+                published.eviction_policy.epoch() ? "lfu" : "lru", published.eviction_policy.epoch());
+            if (route_trace()) std::fprintf(stderr,
+                "[HOSTMOE-ROUTE-CREATE] layer=%d slots=%d experts=%d\n",
+                hm.layer, published.capacity, hm.num_experts);
+            if (diagnostics()) std::fprintf(stderr,
                 "[HOSTMOE-CACHE] layer=%d slots=%d reserved=%zu budget=%zu graph=%zu workspace_allowance=%zu input_bridge=%s\n",
                 hm.layer, published.capacity, g_reserved, budget,
                 published.bytes - kWorkspaceAllowance, kWorkspaceAllowance, device_inputs ? "device" : "host");
@@ -458,9 +542,11 @@ namespace tsg
         std::vector<std::uint8_t> protected_slots(entry.capacity, 0);
         std::vector<std::pair<int, int>> misses;
         misses.reserve(hm.n_used);
-        static const bool prefetch = [] {
+        static const int prefetch = [] {
             const char* e = std::getenv("TS_HOST_MOE_EXPERT_CACHE_PREFETCH");
-            return e != nullptr && e[0] == '1';
+            // Unset: follow observed source-read costs for this cache entry.
+            // Explicit 0/1 retain the diagnostic disable/force contracts.
+            return e == nullptr ? -1 : e[0] == '1' ? 1 : 0;
         }();
         // Qwen4Exp's precision policy uses decode kernels for every row in a
         // short prefill/speculative target block. Replay this same scalar graph
@@ -469,6 +555,13 @@ namespace tsg
         for (int row = 0; row < hm.seq_len; ++row)
         {
             const auto* row_ids = ids + static_cast<std::size_t>(row) * hm.n_used;
+            entry.eviction_policy.observe(row_ids, hm.n_used);
+            if (route_trace()) {
+                std::fprintf(stderr, "[HOSTMOE-ROUTE] layer=%d ids=", hm.layer);
+                for (int k = 0; k < hm.n_used; ++k)
+                    std::fprintf(stderr, "%s%d", k ? "," : "", row_ids[k]);
+                std::fputc('\n', stderr);
+            }
             std::fill(remapped.begin(), remapped.end(), -1);
             std::fill(protected_slots.begin(), protected_slots.end(), 0);
             misses.clear();
@@ -493,7 +586,9 @@ namespace tsg
                 if (remapped[k] >= 0) { ++g_hits; continue; }
                 int slot = -1;
                 for (int s = 0; s < entry.capacity; ++s)
-                    if (!protected_slots[s] && (slot < 0 || entry.last_used[s] < entry.last_used[slot])) slot = s;
+                    if (!protected_slots[s] && (slot < 0 || entry.eviction_policy.prefer(
+                        entry.expert_for_slot[s], entry.last_used[s],
+                        entry.expert_for_slot[slot], entry.last_used[slot]))) slot = s;
                 if (slot < 0)
                 {
                     set_last_error("qwen4exp expert cache: all slots protected before routed experts were filled.");
@@ -506,27 +601,84 @@ namespace tsg
             }
             // Fault all selected misses concurrently before pageable CUDA
             // uploads serialize source page faults on the launching thread.
-            // Only raw bytes are touched; cache-hit payloads and row arithmetic
-            // are unchanged. Keep this opt-in for cold/warm trained A/B runs.
-            if (prefetch && !misses.empty())
-            {
-                std::vector<std::pair<std::size_t, std::size_t>> ranges;
-                ranges.reserve(misses.size());
-                for (int part = 0; part < 3; ++part)
-                {
-                    ranges.clear();
-                    for (const auto& miss : misses)
-                        ranges.emplace_back(static_cast<std::size_t>(miss.second) * entry.stride[part],
-                            entry.stride[part]);
-                    std::sort(ranges.begin(), ranges.end());
-                    prefetch_mapped_ranges(static_cast<const std::uint8_t*>(entry.source[part]), ranges);
-                }
+            // Only already-selected raw bytes are touched; no speculative experts,
+            // pinned weight copies or expanded device quota. Join all three
+            // projections together. Upload each ready projection on this caller
+            // thread while the bounded I/O workers read the remaining misses.
+            std::size_t miss_bytes = 0;
+            for (const auto stride_bytes : entry.stride) miss_bytes += stride_bytes * misses.size();
+            const bool observe = prefetch < 0 && ExpertPrefetchPolicy::eligible(misses.size(), miss_bytes);
+            const bool do_prefetch = !misses.empty() && (prefetch == 1
+                || (prefetch < 0 && entry.prefetch_policy.should_prefetch(misses.size(), miss_bytes)));
+            if (observe) ++entry.prefetch_observations;
+            // No slot may retain a valid old expert ID after its first source
+            // projection is overwritten, including interrupted uploads.
+            for (const auto& miss : misses) entry.expert_for_slot[miss.first] = -1;
+            std::array<std::shared_ptr<ExpertFileSource>, 3> files;
+            bool file_read = !misses.empty() && miss_bytes <= kFileReadWorkspace;
+            for (int part = 0; file_read && part < 3; ++part) {
+                const auto source = g_file_sources.find(entry.source[part]);
+                if (source == g_file_sources.end()
+                    || source->second->bytes() != entry.stride[part] * static_cast<std::size_t>(hm.num_experts))
+                    file_read = false;
+                else files[part] = source->second;
             }
-            for (const auto& miss : misses)
+            struct DrainFileUploads {
+                ggml_backend_t backend;
+                bool active;
+                ~DrainFileUploads() { if (active) sync_backend(backend); }
+            } drain{entry.backend, file_read};
+            if (file_read)
+            {
+                ++entry.file_read_calls;
+                ++entry.prefetch_reads;
+                g_file_read_buffer.reserve(miss_bytes);
+                std::vector<ExpertReadTask> tasks;
+                tasks.reserve(misses.size() * 3);
+                std::size_t offset = 0;
+                for (const auto& miss : misses) for (int part = 0; part < 3; ++part) {
+                    tasks.push_back({files[part].get(), static_cast<std::size_t>(miss.second) * entry.stride[part],
+                        g_file_read_buffer.data() + offset, entry.stride[part]});
+                    offset += entry.stride[part];
+                }
+                std::vector<int> copied_parts(misses.size(), 0);
+                read_expert_files(tasks, [&](std::size_t index) {
+                    const auto i = index / 3, part = index % 3;
+                    const auto& task = tasks[index];
+                    entry.file_read_bytes += task.bytes;
+                    ggml_backend_tensor_set_async(entry.backend, entry.weight[part], task.destination,
+                        static_cast<std::size_t>(misses[i].first) * entry.stride[part], task.bytes);
+                    if (++copied_parts[i] == 3) entry.expert_for_slot[misses[i].first] = misses[i].second;
+                });
+            }
+            else if (do_prefetch)
+            {
+                ++entry.prefetch_reads;
+                std::vector<MoePrefetchExpert> experts(misses.size());
+                for (std::size_t i = 0; i < misses.size(); ++i)
+                {
+                    for (int part = 0; part < 3; ++part)
+                        experts[i][part] = {static_cast<const std::uint8_t*>(entry.source[part])
+                                + static_cast<std::size_t>(misses[i].second) * entry.stride[part], entry.stride[part]};
+                }
+                std::vector<std::pair<std::size_t, std::size_t>> pieces;
+                std::vector<int> copied_parts(misses.size(), 0);
+                const auto read_time = prefetch_mapped_experts(experts, [&](std::size_t i, std::size_t part) {
+                    const auto& miss = misses[i];
+                    copy_slot_part(entry, miss.first, miss.second, static_cast<int>(part), pieces);
+                    if (++copied_parts[i] == 3) entry.expert_for_slot[miss.first] = miss.second;
+                });
+                if (observe) entry.prefetch_policy.observe_read(miss_bytes, read_time);
+            }
+            const auto upload_started = observe && !do_prefetch
+                ? ExpertPrefetchPolicy::Clock::now() : ExpertPrefetchPolicy::Clock::time_point{};
+            if (!file_read && !do_prefetch) for (const auto& miss : misses)
             {
                 copy_slot(entry, miss.first, miss.second);
                 entry.expert_for_slot[miss.first] = miss.second;
             }
+            if (observe && !do_prefetch && !file_read)
+                entry.prefetch_policy.observe_upload(miss_bytes, ExpertPrefetchPolicy::Clock::now() - upload_started);
             for (const int slot : remapped) entry.last_used[slot] = ++entry.clock;
             // Copies and compute use the backend's own stream; graph topology and
             // addresses never change when slots are replaced or IDs are remapped.
@@ -554,6 +706,7 @@ namespace tsg
                 set_last_error("qwen4exp expert cache: CUDA expert graph failed.");
                 return -1;
             }
+            drain.active = false; // compute_graph synchronized the preceding uploads.
             if (device_output)
                 copy_device_row(entry.backend, entry.output, hm.moe_out,
                     static_cast<std::size_t>(row) * entry.hidden * sizeof(float), true);
@@ -573,6 +726,7 @@ namespace tsg
     {
         if (ptr == nullptr) return;
         std::lock_guard<std::mutex> lock(g_cache_mutex);
+        g_file_sources.erase(ptr);
         for (auto it = g_entries.begin(); it != g_entries.end();)
         {
             const auto& entry = **it;
@@ -593,7 +747,12 @@ namespace tsg
             "[HOSTMOE-CACHE] calls=%llu hits=%llu misses=%llu reserved=%zu budget=%zu release\n",
             static_cast<unsigned long long>(g_calls), static_cast<unsigned long long>(g_hits),
             static_cast<unsigned long long>(g_misses), g_reserved, cache_budget());
+        if (diagnostics() && g_file_read_buffer.size())
+            std::fprintf(stderr, "[HOSTMOE-FILE-WORKSPACE] bytes=%zu ceiling=%zu type=%s\n",
+                g_file_read_buffer.size(), kFileReadWorkspace, ggml_backend_buffer_name(g_file_read_buffer.buffer));
         g_entries.clear();
+        g_file_sources.clear();
+        g_file_read_buffer.clear();
         g_reserved = 0;
         g_hits = g_misses = g_calls = 0;
     }
@@ -610,6 +769,7 @@ namespace tsg
             g_entries.pop_back();
             g_reserved -= bytes;
         }
+        if (g_entries.empty()) g_file_read_buffer.clear();
         return before - g_reserved;
     }
 
@@ -628,8 +788,46 @@ namespace tsg
     // Linked only into the standalone cache fixture, never a production export.
     void host_moe_expert_cache_test_fail_next(int stage) { g_test_failure_stage.store(stage); }
     std::size_t host_moe_expert_cache_test_physical_bytes() { return g_test_physical_bytes.load(); }
+    std::size_t host_moe_expert_cache_test_file_workspace_bytes() { return g_file_read_buffer.size(); }
     void host_moe_expert_cache_test_available_bytes(std::size_t bytes) { g_test_available_bytes.store(bytes); }
+#if defined(_WIN32)
+#define TSG_MOE_TEST_EXPORT extern "C" __declspec(dllexport)
+#else
+#define TSG_MOE_TEST_EXPORT extern "C" __attribute__((visibility("default")))
 #endif
+    TSG_MOE_TEST_EXPORT int TSGgml_TestExpertHostWorkspaceReserve(std::int64_t bytes) {
+        if (bytes <= 0) return 0;
+        std::lock_guard<std::mutex> lock(g_cache_mutex);
+        try { g_file_read_buffer.reserve(static_cast<std::size_t>(bytes)); return 1; }
+        catch (...) { return 0; }
+    }
+    TSG_MOE_TEST_EXPORT void TSGgml_TestExpertHostWorkspaceClear() {
+        std::lock_guard<std::mutex> lock(g_cache_mutex);
+        g_file_read_buffer.clear();
+    }
+#undef TSG_MOE_TEST_EXPORT
+#endif
+
+    bool register_host_file_source(const void* pointer, std::int64_t bytes,
+        const char* path, std::int64_t offset)
+    {
+        if (!pointer || bytes <= 0 || offset < 0) return false;
+        auto source = std::make_shared<ExpertFileSource>(path, offset, bytes);
+        std::lock_guard<std::mutex> lock(g_cache_mutex);
+        if (g_file_sources.count(pointer)) return false;
+        g_file_sources.emplace(pointer, std::move(source));
+        return true;
+    }
+}
+
+TSG_EXPORT int TSGgml_RegisterHostFileSource(const void* pointer, std::int64_t bytes,
+    const char* path, std::int64_t offset)
+{
+    try { return tsg::register_host_file_source(pointer, bytes, path, offset) ? 1 : 0; }
+    catch (const std::exception& error) {
+        tsg::set_last_error(std::string("Host file source registration failed: ") + error.what());
+        return 0;
+    }
 }
 
 TSG_EXPORT int TSGgml_HostMoeExpertCacheStats(std::int64_t* reserved, std::int64_t* budget,

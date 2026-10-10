@@ -102,11 +102,79 @@ static void test_joint_lookup() {
     }
 }
 
+static void test_pipeline() {
+    using namespace std::chrono;
+    for (unsigned threads : {1, 2, 8, 16}) {
+        tsg_dsv41::engram_io_pool pool(threads);
+        const auto caller = std::this_thread::get_id();
+        std::mutex gate;
+        std::condition_variable opened;
+        bool consumed_first = false, overlapped = false;
+        std::vector<int> prepared(24, 0), consumed(24, 0);
+        std::atomic<int> finished{0};
+        pool.run_pipelined(prepared.size(), [&](size_t i) {
+            if (i != 0) {
+                std::unique_lock<std::mutex> lock(gate);
+                if (!opened.wait_for(lock, seconds(2), [&] { return consumed_first; }))
+                    throw std::runtime_error("Pipeline waited for all reads before consuming the first ready item");
+            }
+            prepared[i] = 17 + int(i);
+            ++finished;
+        }, [&](size_t i) {
+            require(std::this_thread::get_id() == caller, "Pipeline consumer left its submitting thread");
+            require(prepared[i] == 17 + int(i), "Pipeline consumed an incomplete source");
+            ++consumed[i];
+            if (i == 0) {
+                overlapped = finished < int(prepared.size());
+                {
+                    std::lock_guard<std::mutex> lock(gate);
+                    consumed_first = true;
+                }
+                opened.notify_all();
+            }
+        });
+        require(overlapped, "Pipeline had no read/consume overlap opportunity");
+        for (int calls : consumed) require(calls == 1, "Pipeline consumed a source more or less than once");
+        for (bool fail_prepare : {true, false}) {
+            std::atomic<int> active{0};
+            expect_error([&] {
+                pool.run_pipelined(24, [&](size_t i) {
+                    struct Guard {
+                        std::atomic<int>& active;
+                        Guard(std::atomic<int>& a) : active(a) { ++active; }
+                        ~Guard() { --active; }
+                    } guard(active);
+                    if (fail_prepare && i == 3) throw std::runtime_error("prepare");
+                }, [&](size_t) {
+                    if (!fail_prepare) throw std::runtime_error("consume");
+                });
+            });
+            require(active == 0, "Pipeline returned before failed-job workers released their source owners");
+            std::fill(consumed.begin(), consumed.end(), 0);
+            pool.run_pipelined(24, [](size_t) {}, [&](size_t i) { ++consumed[i]; });
+            for (int calls : consumed) require(calls == 1, "Pipeline did not recover after an exception");
+        }
+        std::atomic<int> concurrent_calls{0};
+        std::vector<std::thread> submitters;
+        for (int j = 0; j < 4; ++j) submitters.emplace_back([&, j] {
+            if (j % 2 == 0) pool.run_pipelined(24, [](size_t) {}, [&](size_t) { ++concurrent_calls; });
+            else pool.run(24, [&](size_t) { ++concurrent_calls; });
+        });
+        for (auto& thread : submitters) thread.join();
+        require(concurrent_calls == 96, "Mixed pipeline/plain pool submissions lost work");
+        pool.run_pipelined(0, [](size_t) { throw std::runtime_error("empty prepare"); },
+            [](size_t) { throw std::runtime_error("empty consume"); });
+    }
+}
+
+
+
 int main() {
     using tsg_dsv41::engram_io_pool;
     expect_error([] { engram_io_pool invalid(0); });
     expect_error([] { engram_io_pool invalid(33); });
     test_joint_lookup();
+    test_pipeline();
     tsg_dsv41::engram_data layout;
     // Published V4.1 geometry: 24 independently hashed 256-element rows
     // per token. Cover decode and the former serial small-prefill path.

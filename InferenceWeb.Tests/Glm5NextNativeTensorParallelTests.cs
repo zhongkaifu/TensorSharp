@@ -46,6 +46,35 @@ public sealed class Glm5NextNativeTensorParallelTests : IDisposable
     }
 
     [GgmlFact(BackendType.GgmlCpu)]
+    public void PublishedHyphenatedArchitecture_PreservesLogitsAndRecurrentContract()
+    {
+        string legacy = GlmDsaSyntheticModelBuilder.WriteGlm5NextTpFixture(
+            Path.Combine(_dir, "legacy.gguf"), 4, true, numLayers: 4,
+            mixedAttention: true, routedExperts: true, quantizeExperts: true);
+        string current = GlmDsaSyntheticModelBuilder.WriteGlm5NextTpFixture(
+            Path.Combine(_dir, "current.gguf"), 4, true, numLayers: 4,
+            mixedAttention: true, routedExperts: true, quantizeExperts: true, architecture: "glm5-next");
+        using NativeEnvScope env = NativeCpuTpEnvironment();
+        Assert.Same(ChatProtocolRegistry.For("glm5next"), ChatProtocolRegistry.For("glm5-next"));
+        foreach (string native in new[] { "0", "1" })
+        {
+            env.Set("TS_GLM_NATIVE", native);
+            using ModelBase reference = ModelBase.Create(legacy, BackendType.GgmlCpu);
+            using ModelBase actual = ModelBase.Create(current, BackendType.GgmlCpu);
+            Assert.Equal("glm5-next", actual.Config.Architecture);
+            Assert.False(actual.SupportsKVCacheTruncation);
+            int[] prompt = { 65, 66, 67 };
+            float[] expected = (float[])reference.ForwardRefill(prompt).Clone();
+            float[] first = (float[])actual.ForwardRefill(prompt).Clone();
+            AssertLogitsClose(expected, first, 0);
+            int next = ArgMax(expected);
+            AssertLogitsClose(reference.Forward(new[] { next }), actual.Forward(new[] { next }), 0);
+            actual.ResetKVCache();
+            AssertLogitsClose(first, actual.ForwardRefill(prompt), 0);
+        }
+    }
+
+    [GgmlFact(BackendType.GgmlCpu)]
     public void NativeLoader_AcceptsGlm5NextWithTwoAlignedTpRanks()
     {
         string path = GlmDsaSyntheticModelBuilder.WriteGlm5NextTpFixture(

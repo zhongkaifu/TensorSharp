@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <vector>
+#include "../ggml_ops_upload_prefetch.h"
 
 extern "C" {
 struct TensorView2DDesc { void* data; int dim0, dim1, stride0, stride1; std::int64_t raw_bytes; };
@@ -50,6 +51,28 @@ int main(int argc, char** argv)
     if (TSGgml_GetGpuDeviceCount(3) < ranks) { std::puts("SKIP CUDA device count is insufficient"); return 77; }
     const int indices[] = {0, 1};
     require(TSGgml_MultiDeviceInit(3, indices, ranks) == 1, "CUDA backend initialization failed");
+#if defined(__linux__)
+    // Query more than one mincore window, including unaligned endpoints. The
+    // untouched anonymous range is cold; writing it makes every page resident.
+    const auto page = static_cast<std::size_t>(sysconf(_SC_PAGESIZE));
+    const auto mapping_bytes = page * 4098;
+    auto* mapping = static_cast<unsigned char*>(mmap(nullptr, mapping_bytes,
+        PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    require(mapping != MAP_FAILED, "cannot create residency-policy fixture");
+    require(tsg::mapped_upload_has_nonresident_pages(mapping + 1, mapping_bytes - 2),
+        "untouched source was incorrectly classified as resident");
+    std::memset(mapping, 1, mapping_bytes);
+    require(!tsg::mapped_upload_has_nonresident_pages(mapping + 1, mapping_bytes - 2),
+        "fully resident source would take the cold-upload pipeline");
+    require(madvise(mapping + page * 4097, page, MADV_DONTNEED) == 0, "cannot discard tail fixture page");
+    require(tsg::mapped_upload_has_nonresident_pages(mapping + 1, mapping_bytes - 2),
+        "residency query missed a cold tail beyond its first window");
+    require(munmap(mapping, mapping_bytes) == 0, "cannot release residency-policy fixture");
+    require(!tsg::mapped_upload_has_nonresident_pages(nullptr, 1)
+        && !tsg::mapped_upload_has_nonresident_pages(reinterpret_cast<void*>(1), 0)
+        && !tsg::mapped_upload_has_nonresident_pages(reinterpret_cast<void*>(1), SIZE_MAX),
+        "invalid residency hints did not retain the ordinary path");
+#endif
     constexpr int width = 128, rows = 128;
     constexpr std::int64_t bytes = width * rows * sizeof(float);
     std::vector<float> first(width * rows), second(width * rows), input(width, 1), output(rows);
@@ -146,5 +169,69 @@ int main(int argc, char** argv)
     TSGgml_ClearHostBufferCache();
     for (int rank = 0; rank < ranks; ++rank)
         require(usage(rank).committed == 0, "abandoned-graph cache teardown leaked charges");
+
+    // Cross the 64 MiB upload-preparation window, with a partial final chunk.
+    // Every row is checked, including the tail, after an abandoned graph has
+    // published the completed payload. Run with TS_GGML_UPLOAD_PREFETCH=1 to
+    // exercise the bounded reader/upload pipeline on Linux CUDA.
+    constexpr int large_width = 2048, large_rows = 8193;
+    const std::int64_t large_bytes = std::int64_t(large_width) * large_rows * sizeof(float);
+    std::vector<float> large(std::size_t(large_width) * large_rows), large_input(large_width, 1), large_output(large_rows);
+    for (int row = 0; row < large_rows; ++row)
+        for (int col = 0; col < large_width; ++col)
+            large[std::size_t(row) * large_width + col] = float(row + 1) / 8192;
+    for (int rank = 0; rank < ranks; ++rank) {
+        require(TSGgml_SetActiveDevice(rank) == 1, "cannot select large-upload rank");
+        TSGgml_SetDeviceCopyBudget(0);
+        require(TSGgml_TestAbandonCachedWeight(large.data(), large.data(), 0,
+            large_width, large_rows, large_bytes) == 1, "cannot publish large cache upload");
+        const auto populated = usage(rank);
+        require(populated.committed >= large_bytes, "large cache payload not accounted");
+        TensorView2DDesc result{large_output.data(), 1, large_rows, large_rows, 1, large_rows * sizeof(float)};
+        TensorView2DDesc source{large_input.data(), 1, large_width, large_width, 1, large_width * sizeof(float)};
+        require(TSGgml_AddmmQuantF32(result, source, large.data(), 0, large_width, large_rows, large_bytes) == 1,
+            "large cache replay failed");
+        for (int row = 0; row < large_rows; ++row)
+            require(large_output[row] == large_width * large[std::size_t(row) * large_width],
+                "large cache upload lost a chunk or changed its tail");
+        require(usage(rank).committed == populated.committed, "large cache hit allocated a duplicate");
+        TSGgml_InvalidateHostBuffer(large.data());
+        require(usage(rank).committed == 0, "large cache teardown leaked charges");
+        std::printf("PASS rank %d: 64 MiB + 8 KiB upload, every row exact, cache replay and release\n", rank);
+    }
+#if defined(__linux__)
+    // Keep the interior nonresident until the cache copy reads it. Endpoints
+    // distinguish a completed cold upload from an untouched device allocation;
+    // the row oracle also checks every zero-filled interior page. With the
+    // environment unset this exercises automatic cold-source selection.
+    constexpr int cold_rows = 2049;
+    constexpr std::size_t cold_bytes = std::size_t(large_width) * cold_rows * sizeof(float);
+    auto* cold = static_cast<float*>(mmap(nullptr, cold_bytes, PROT_READ | PROT_WRITE,
+        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    require(cold != MAP_FAILED, "cannot map cold-upload fixture");
+    cold[0] = 1;
+    cold[cold_bytes / sizeof(float) - 1] = 2;
+    for (int rank = 0; rank < ranks; ++rank) {
+        require(madvise(reinterpret_cast<unsigned char*>(cold) + page, cold_bytes - 2 * page,
+            MADV_DONTNEED) == 0, "cannot discard cold-upload fixture interior");
+        require(tsg::mapped_upload_has_nonresident_pages(cold, cold_bytes), "cold fixture became resident");
+        require(TSGgml_SetActiveDevice(rank) == 1, "cannot select cold-upload rank");
+        require(TSGgml_TestAbandonCachedWeight(cold, cold, 0, large_width, cold_rows, cold_bytes) == 1,
+            "cannot publish cold cache upload");
+        require(usage(rank).committed >= cold_bytes, "cold cache payload was not charged");
+        std::vector<float> cold_output(cold_rows, -1);
+        TensorView2DDesc result{cold_output.data(), 1, cold_rows, cold_rows, 1, cold_rows * sizeof(float)};
+        TensorView2DDesc source{large_input.data(), 1, large_width, large_width, 1, large_width * sizeof(float)};
+        require(TSGgml_AddmmQuantF32(result, source, cold, 0, large_width, cold_rows, cold_bytes) == 1,
+            "cold cache replay failed");
+        for (int row = 0; row < cold_rows; ++row)
+            require(cold_output[row] == (row == 0 ? 1 : row == cold_rows - 1 ? 2 : 0),
+                "cold upload changed endpoints or an interior page");
+        TSGgml_InvalidateHostBuffer(cold);
+        require(usage(rank).committed == 0, "cold cache teardown leaked charges");
+        std::printf("PASS rank %d: nonresident upload, exact endpoints/interior and release\n", rank);
+    }
+    require(munmap(cold, cold_bytes) == 0, "cannot unmap cold-upload fixture");
+#endif
     TSGgml_Shutdown();
 }

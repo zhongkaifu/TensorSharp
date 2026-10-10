@@ -368,7 +368,7 @@ namespace TensorSharp.Runtime
             Register(new ChatProtocol
             {
                 Id = "glm5next",
-                Architectures = new[] { "glm5next" },
+                Architectures = new[] { "glm5next", "glm5-next" },
                 // GLM-5.3-Flash ALWAYS opens a <think> block in the generation prompt
                 // (its template has no thinking-off shape), with no newline after it.
                 // Re-rendered history goes through the template's empty-<think></think>

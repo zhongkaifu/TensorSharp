@@ -33,6 +33,14 @@ owned llama server afterward.
 Modes are `metadata` (no model execution), `direct` (public `ModelBase.Forward`)
 and `engine` (a single request through `InferenceEngine`, default scheduler
 settings, explicitly disabled speculation and repetition termination).
+Direct mode additionally accepts `--prefill-method forward|refill` (default
+`forward`). Only the initial prompt call changes; subsequent teacher-forced
+decode calls still use `Forward`. Gemma's refill can separate the last prompt
+token from its prefix, changing projection and attention geometry. Preserve
+both complete logit captures and identical teacher histories when comparing
+these paths. Fresh-process first-forward timing includes graph/JIT setup and
+is not a warm service-throughput benchmark. This option changes no production
+default and is rejected outside direct mode.
 The direct mode records finite full-row checks, top-20 logits/probabilities,
 entropy, token positions/timings and exact repeated suffixes. `--logits true`
 writes all little-endian F32 vocabulary rows; 1,024 rows of a 262,144-token

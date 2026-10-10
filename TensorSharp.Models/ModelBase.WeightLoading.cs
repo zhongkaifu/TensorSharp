@@ -35,6 +35,14 @@ namespace TensorSharp.Models
         // Sparse host lookup tables can opt out of reading every row at startup.
         protected virtual bool ShouldPrefaultWeight(GgufTensorInfo info) => true;
 
+        // Admission is resolved by the model before loading. Excluded tensors
+        // must not be prefaulted, materialized, fused or uploaded afterwards.
+        protected virtual bool ShouldLoadWeight(GgufTensorInfo info) => true;
+
+        /// <summary>Source tensor payload omitted at load, not measured RAM/VRAM savings.</summary>
+        public long OmittedCheckpointWeightBytes { get; private set; }
+        public int OmittedCheckpointWeightCount { get; private set; }
+
         protected void LoadWeights()
         {
             // Parallel page-cache warm-up first: everything below (serial
@@ -42,10 +50,11 @@ namespace TensorSharp.Models
             // otherwise reads the file at one-or-two-stream speed, which is the
             // whole cold-load time on network-backed model storage.
             ReadBonsaiMetadata();
+            bool useExpertFileReads = ShouldUseExpertFileReads();
             if (HasStreamingWeights)
                 _weightStreamingExecutor = new WeightStreamingExecutor(_gguf, WeightStreaming, StreamingWeightArithmetic);
             else
-                _gguf.PrefaultFileCache(ShouldPrefaultWeight);
+                _gguf.PrefaultFileCache(info => ShouldLoadWeight(info) && ShouldPrefaultWeight(info));
             Console.Write("Loading model weights...");
             int countF32 = 0;
             int countQuant = 0;
@@ -53,10 +62,18 @@ namespace TensorSharp.Models
             long totalF32Bytes = 0;
             long mappedQuantBytes = 0;
             bool tryMmap = CanUseFileMappedQuantizedWeights;
+            OmittedCheckpointWeightBytes = 0;
+            OmittedCheckpointWeightCount = 0;
             foreach (var kv in _gguf.Tensors)
             {
                 var info = kv.Value;
                 long byteCount = _gguf.GetTensorByteCount(info);
+                if (!ShouldLoadWeight(info))
+                {
+                    OmittedCheckpointWeightBytes = checked(OmittedCheckpointWeightBytes + byteCount);
+                    OmittedCheckpointWeightCount++;
+                    continue;
+                }
 
                 if (HasStreamingWeights && IsQuantizedLinearWeight(info))
                 {
@@ -110,6 +127,8 @@ namespace TensorSharp.Models
                                 mappedTensorPtr, (int)info.Type, ne0, ne1, numExperts,
                                 byteCount, isExternalView: true, ownerToken: _gguf,
                                 ownedBuffer: IntPtr.Zero);
+                            if (useExpertFileReads)
+                                RegisterExpertFileSource(info.Name, mappedTensorPtr, byteCount);
                             mappedQuantBytes += byteCount;
                         }
                         else

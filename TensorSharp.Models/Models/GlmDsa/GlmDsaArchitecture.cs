@@ -12,6 +12,11 @@ namespace TensorSharp.Models
     /// <summary>GLM-5.x (DeepSeek Sparse Attention) and GLM-5.3-Flash architecture plug-in.</summary>
     internal static class GlmDsaArchitecture
     {
+        // Both published GGUF spellings use the same schema. Keep the spelling
+        // from the file when reading metadata: it is also the key prefix.
+        internal static bool IsGlm5Next(string architecture)
+            => architecture is "glm5next" or "glm5-next";
+
         public static ModelArchitectureDescriptor Descriptor { get; } = new()
         {
             // glm-dsa: MLA + lightning indexer + sigmoid MoE.
@@ -19,7 +24,7 @@ namespace TensorSharp.Models
             // pooled DSA indexer, Sinkhorn hyper-connections, 288-expert MoE. Same class.
             Id = "glm-dsa",
             DisplayName = "GLM-5.x (DeepSeek Sparse Attention) and GLM-5.3-Flash",
-            Aliases = new[] { "glm-dsa", "glm_dsa", "glm5next" },
+            Aliases = new[] { "glm-dsa", "glm_dsa", "glm5next", "glm5-next" },
             Factory = Create,
             SupportsLayerSplit = true,
             // GLM-5.3-Flash also places whole layers on --backend cuda (the direct-CUDA engine).

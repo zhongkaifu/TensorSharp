@@ -38,7 +38,7 @@ namespace TensorSharp.Models
             try
             {
                 string arch = _gguf.First.GetString("general.architecture") ?? string.Empty;
-                if (arch != "glm5next")
+                if (!GlmDsaArchitecture.IsGlm5Next(arch))
                     throw new NotSupportedException(
                         $"[{Tag}] the direct-CUDA GLM engine runs GLM-5.3-Flash (glm5next), not '{arch}'; use --backend ggml_cuda.");
                 _gguf.BeginStreaming();

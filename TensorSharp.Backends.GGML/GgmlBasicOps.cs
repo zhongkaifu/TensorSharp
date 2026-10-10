@@ -1523,6 +1523,8 @@ namespace TensorSharp.GGML
         public static bool TryRegisterPinnedHostBuffer(IntPtr ptr, long bytes)
             => GgmlNative.TryRegisterPinnedHostBuffer(ptr, bytes);
         public static void UnregisterPinnedHostBuffer(IntPtr ptr) => GgmlNative.UnregisterPinnedHostBuffer(ptr);
+        public static bool RegisterHostFileSource(IntPtr pointer, long bytes, string path, long offset)
+            => GgmlNative.RegisterHostFileSource(pointer, bytes, path, offset);
 
         public static IntPtr AlignedAlloc(long size) => GgmlNative.AlignedAlloc(size);
         public static void AlignedFree(IntPtr ptr) => GgmlNative.AlignedFree(ptr);

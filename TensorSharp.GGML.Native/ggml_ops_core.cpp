@@ -13,6 +13,8 @@
 #include "ggml_ops_graph_optimize.h"
 #include "ggml_ops_cache_budget.h"
 #include "ggml_ops_shared_cache_budget.h"
+#include "ggml_ops_moe_prefetch.h"
+#include "ggml_ops_upload_prefetch.h"
 
 #if defined(TSG_GGML_USE_METAL)
 #include "ggml-backend-impl.h"
@@ -1550,7 +1552,28 @@ namespace tsg
             if (ggml_backend_tensor_alloc(allocation.get(), upload_tensor, address) != GGML_STATUS_SUCCESS)
                 return false;
             host_read_barrier();
-            ggml_backend_tensor_set(upload_tensor, resolve_upload_source(data), 0, bytes);
+            const void* source = resolve_upload_source(data);
+            bool prepare_pages = false;
+#if defined(__linux__) && defined(GGML_USE_CUDA)
+            static const int upload_prefetch = [] {
+                const char* value = std::getenv("TS_GGML_UPLOAD_PREFETCH");
+                if (value && std::strcmp(value, "0") == 0) return 0;
+                if (value && std::strcmp(value, "1") == 0) return 1;
+                return 2; // Auto: do not split a fully resident RAM upload.
+            }();
+            prepare_pages = upload_prefetch != 0 && usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS
+                && bytes >= (std::size_t(16) << 20) && ggml_backend_is_cuda(backend)
+                && (upload_prefetch == 1 || (available_cpu_parallelism() > 1
+                    && mapped_upload_has_nonresident_pages(source, bytes)));
+#endif
+            if (prepare_pages)
+                upload_prefetched_mapped_buffer(static_cast<const std::uint8_t*>(source), bytes,
+                    [&](std::size_t offset, std::size_t count) {
+                        ggml_backend_tensor_set(upload_tensor,
+                            static_cast<const std::uint8_t*>(source) + offset, offset, count);
+                    });
+            else
+                ggml_backend_tensor_set(upload_tensor, source, 0, bytes);
             sync_backend(backend);
 
             std::lock_guard<std::mutex> lock(g_host_buffer_cache_mutex);
@@ -3883,8 +3906,18 @@ TSG_EXPORT int TSGgml_AttachSharedCacheBudgetEx(void* context,
     tsg::SharedCacheCharge::Reserve reserve, tsg::SharedCacheCharge::Commit commit,
     tsg::SharedCacheCharge::Release release, int include_graph_buffers)
 {
-    if (include_graph_buffers != 0 && include_graph_buffers != 1) return 0;
-    return tsg::SharedCacheCharge::attach(context, reserve, commit, release, include_graph_buffers != 0) ? 1 : 0;
+    return tsg::SharedCacheCharge::attach(context, reserve, commit, release,
+        include_graph_buffers != 0) ? 1 : 0;
+}
+
+// A distinct export prevents older native libraries from silently accepting a
+// new coverage flag as the legacy graph boolean while leaving RAM uncharged.
+TSG_EXPORT int TSGgml_AttachSharedCacheBudgetWithHost(void* context,
+    tsg::SharedCacheCharge::Reserve reserve, tsg::SharedCacheCharge::Commit commit,
+    tsg::SharedCacheCharge::Release release, int include_graph_buffers)
+{
+    return tsg::SharedCacheCharge::attach(context, reserve, commit, release,
+        include_graph_buffers != 0, true) ? 1 : 0;
 }
 
 // Cache payload accounting only: graph arenas, KV slots, backend pools and driver

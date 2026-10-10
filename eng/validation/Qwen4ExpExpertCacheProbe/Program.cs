@@ -47,6 +47,9 @@ bool q2kxl = Value("quantization", "mixed") switch
 };
 int prefill = Number("prefill-tokens", 40), decode = Number("decode-tokens", 64);
 int warmups = Number("warmup", 2, 0), iterations = Number("iterations", 5);
+int layerSplit = Number("layer-split", 1);
+if (layerSplit > 1 && (synthetic || backend != BackendType.GgmlCuda))
+    throw new ArgumentException("--layer-split requires a real checkpoint and ggml_cuda.");
 string generation = Value("generation", "teacher-forced");
 if (generation is not ("teacher-forced" or "greedy"))
     throw new ArgumentException("generation must be greedy or teacher-forced");
@@ -60,6 +63,10 @@ long? deviceBudgetBytes = options.TryGetValue("device-budget-bytes", out string?
     ? long.Parse(budgetText, System.Globalization.CultureInfo.InvariantCulture) : null;
 if (deviceBudgetBytes.HasValue && (deviceBudgetBytes.Value <= 0 || backend != BackendType.GgmlCuda))
     throw new ArgumentException("--device-budget-bytes requires a positive capacity and ggml_cuda.");
+long? hostBudgetBytes = options.TryGetValue("host-budget-bytes", out string? hostBudgetText)
+    ? long.Parse(hostBudgetText, System.Globalization.CultureInfo.InvariantCulture) : null;
+if (hostBudgetBytes.HasValue && (hostBudgetBytes.Value < 0 || !deviceBudgetBytes.HasValue))
+    throw new ArgumentException("--host-budget-bytes requires a nonnegative capacity and --device-budget-bytes.");
 long? trimTargetBytes = options.TryGetValue("trim-target-bytes", out string? trimText)
     ? long.Parse(trimText, System.Globalization.CultureInfo.InvariantCulture) : null;
 if (trimTargetBytes.HasValue && (trimTargetBytes.Value < 0 || !host || backend != BackendType.GgmlCuda))
@@ -67,6 +74,7 @@ if (trimTargetBytes.HasValue && (trimTargetBytes.Value < 0 || !host || backend !
 MemoryBudget? sharedBudget = null;
 GgmlCacheBudgetScope? cacheScope = null;
 ModelBase? model = null;
+CudaActivityCapture? activityCapture = null;
 object? completedReport = null;
 object? checkpointIdentity = null;
 object? modelGeometry = null;
@@ -77,6 +85,11 @@ var cleanupErrors = new List<string>();
 var budgetObservations = new List<object>();
 var trimObservations = new List<object>();
 var rowCaptures = new List<object>();
+var processCounters = new List<object>();
+void ObserveProcess(string stage)
+{
+    if (Value("process-counters", "false") == "true") processCounters.Add(ProbeProcessCounters.Capture(stage));
+}
 FileStream? logitsStream = null;
 string? logitsPath = null;
 string? logitsIndexPath = null;
@@ -85,8 +98,10 @@ string[] benchmarkEnvironmentNames = ["CUDA_VISIBLE_DEVICES", "NVIDIA_TF32_OVERR
     "TS_HOST_MOE_DEVICE_MIN_BATCH", "TS_HOST_MOE_EXPERT_CACHE_MB", "TS_HOST_MOE_EXPERT_CACHE_LAYERS",
     "TS_HOST_MOE_EXPERT_CACHE_DIAGNOSTICS", "TS_HOST_MOE_EXPERT_CACHE_PREFETCH", "TS_HOST_MOE_EXPERT_CACHE_BRIDGE",
     "TS_HOST_MOE_EXPERT_CACHE_OUTPUT_BRIDGE", "TS_HOST_MOE_PIN", "TS_HOST_MOE_PIN_MAX_MB", "TS_HOST_MOE_TIMING",
-    "TS_HOST_MOE_DEBUG", "TS_HOST_MOE_VERIFY", "TS_HOST_MOE_EXPERT_FILTER", "GGML_CUDA_ALLREDUCE", "NCCL_P2P_DISABLE",
-    "TS_GGML_MEMORY_BUDGET", "TS_GGML_MEMORY_BUDGET_MB"];
+    "TS_HOST_MOE_DEBUG", "TS_HOST_MOE_VERIFY", "TS_HOST_MOE_EXPERT_FILTER", "TS_HOST_MOE_OS_PREFETCH", "TS_HOST_MOE_FILE_READ",
+    "TS_HOST_MOE_EXPERT_CACHE_LFU", "TS_HOST_MOE_ROUTE_TRACE", "GGML_CUDA_ALLREDUCE", "NCCL_P2P_DISABLE",
+    "TS_GGML_MEMORY_BUDGET", "TS_GGML_MEMORY_BUDGET_MB", "TS_Q4E_FUSED_GLU", "TS_GGML_PHASE_TIMING",
+    "TS_GGML_UPLOAD_PREFETCH", "TS_GGML_LOG_VRAM", "TS_Q4E_DECODE_VIEWS", "TS_Q4E_BROADCAST_VIEWS"];
 bool modelDisposed = false, cacheCleared = false, reuseReleased = false, scopeDetached = false, shutdown = false;
 void CaptureLogits(float[] logits, string stage, int iteration, IReadOnlyList<int> history)
 {
@@ -131,9 +146,12 @@ void WriteEvidence(bool complete)
         .Where(name => Environment.GetEnvironmentVariable(name) != null)
         .ToDictionary(name => name, Environment.GetEnvironmentVariable));
     node["device_budget_bytes"] = deviceBudgetBytes;
-    node["budget_scope"] = deviceBudgetBytes.HasValue ? "rank0 cache, preload, and explicitly routed graph buffers; not all driver/host/KV allocations" : "disabled";
+    node["host_budget_bytes"] = hostBudgetBytes;
+    node["device_budget_rank_count"] = deviceBudgetBytes.HasValue ? layerSplit : 0;
+    node["budget_scope"] = deviceBudgetBytes.HasValue ? "per-rank cache, preload, and explicitly routed graph buffers; device_budget_bytes applies independently to every layer-split rank; optional shared host pool covers expert file staging only; not all driver/host/KV allocations" : "disabled";
     node["budget_observations"] = JsonSerializer.SerializeToNode(budgetObservations);
     node["trim_observations"] = JsonSerializer.SerializeToNode(trimObservations);
+    node["process_counters"] = JsonSerializer.SerializeToNode(processCounters);
     node["logit_captures"] = JsonSerializer.SerializeToNode(new { format = "f32le", data_path = logitsPath,
         index_path = logitsIndexPath, rows = rowCaptures });
     node["error"] = failure;
@@ -159,8 +177,12 @@ if (options.TryGetValue("logits-dir", out string? captureDirectory))
 }
 if (deviceBudgetBytes.HasValue)
 {
-    sharedBudget = new MemoryBudget([new MemoryCharge("gpu0", deviceBudgetBytes.Value)]);
-    cacheScope = new GgmlCacheBudgetScope(sharedBudget, [["gpu0"]], includeGraphBuffers: true);
+    string[][] rankPools = Enumerable.Range(0, layerSplit).Select(rank => new[] { $"gpu{rank}" }).ToArray();
+    var pools = rankPools.Select(rank => new MemoryCharge(rank[0], deviceBudgetBytes.Value)).ToList();
+    if (hostBudgetBytes.HasValue) pools.Add(new("host", hostBudgetBytes.Value));
+    sharedBudget = new MemoryBudget(pools);
+    cacheScope = new GgmlCacheBudgetScope(sharedBudget, rankPools, includeGraphBuffers: true,
+        hostPools: hostBudgetBytes.HasValue ? ["host"] : null);
     ObserveBudget("attached-before-model-load");
 }
 WriteEvidence(false);
@@ -182,13 +204,15 @@ MoeCpuOffloadConfig.Reset();
 if (host) MoeCpuOffloadConfig.SetAllLayers();
 if (options.TryGetValue("model-identity-report", out string? identityReport))
     checkpointIdentity = ProbeCheckpointIdentity.Read(modelPath, identityReport);
+ObserveProcess("before-model-load");
 var load = Stopwatch.StartNew();
-model = ModelBase.Create(modelPath, backend);
+model = ModelBase.Create(modelPath, backend, layerSplitDegree: layerSplit);
 load.Stop();
+ObserveProcess("after-model-load");
 modelGeometry = new { architecture = model.Config.Architecture, hidden_size = model.Config.HiddenSize,
     layers = model.Config.NumLayers, heads = model.Config.NumHeads, kv_heads = model.Config.NumKVHeads,
     key_length = model.Config.KeyLength, value_length = model.Config.ValueLength,
-    vocabulary = model.Config.VocabSize, context_limit = model.MaxContextLength, kv_dtype = "f16" };
+    vocabulary = model.Config.VocabSize, context_limit = model.MaxContextLength, kv_dtype = "f16", layer_split = layerSplit };
 ObserveBudget("model-loaded");
 string nativePath = Qwen4ExpExpertCacheScenario.MappedNativePath();
 string nativeHash = Convert.ToHexString(SHA256.HashData(File.ReadAllBytes(nativePath))).ToLowerInvariant();
@@ -237,11 +261,20 @@ string DecodeGeneration(IEnumerable<int> generated) => model.Tokenizer.Decode(
     generated.TakeWhile(token => !model.Tokenizer.IsEos(token)).ToList());
 var statsBeforeTimedWork = backend == BackendType.GgmlCuda ? Qwen4ExpExpertCacheScenario.CacheStats() : null;
 string? referenceHash = null;
+string? referenceChainHash = null;
 float[]? finalLogits = null;
 int[]? finalGenerated = null;
 long expectedCachedRows = 0;
+if (options.TryGetValue("cuda-trace-library", out string? traceLibrary))
+    activityCapture = new CudaActivityCapture(traceLibrary, Path.ChangeExtension(output, ".cuda.jsonl"));
 for (int i = -warmups; i < iterations; i++)
 {
+    if (i >= 0 && Value("release-residency", "false") == "true")
+    {
+        model.ResetKVCache();
+        model.ReleaseGgmlDeviceResidency();
+        ObserveBudget($"iteration-{i}-after-residency-release");
+    }
     if (i >= 0 && trimTargetBytes.HasValue)
     {
         // Quiescent between requests; preserve the model and every KV/graph owner.
@@ -260,23 +293,37 @@ for (int i = -warmups; i < iterations; i++)
         WriteEvidence(false);
     }
     model.ResetKVCache();
+    using var logitChain = IncrementalHash.CreateHash(HashAlgorithmName.SHA256);
+    var decodeStepMilliseconds = new List<double>();
+    ObserveProcess($"iteration-{i}-before-prefill");
+    activityCapture?.Mark($"prefill/{i}/begin");
     var timer = Stopwatch.StartNew();
     float[] logits = model.ForwardRefill(prompt);
     timer.Stop();
+    activityCapture?.Mark($"prefill/{i}/end");
+    ObserveProcess($"iteration-{i}-after-prefill");
     ObserveBudget($"iteration-{i}-prefill-complete");
     double prefillMs = timer.Elapsed.TotalMilliseconds;
+    logitChain.AppendData(MemoryMarshal.AsBytes(logits.AsSpan()));
+    var cacheAfterPrefill = backend == BackendType.GgmlCuda ? Qwen4ExpExpertCacheScenario.CacheStats() : null;
     var inputHistory = new List<int>(prompt);
     CaptureLogits(logits, "prefill", i, inputHistory);
     var generated = new List<int>();
     bool eos = false;
     int forwardSteps = 0;
+    ObserveProcess($"iteration-{i}-before-decode");
     timer.Restart();
     if (generation == "teacher-forced")
     {
         foreach (int token in forced)
         {
+            activityCapture?.Mark($"decode/{i}/{decodeStepMilliseconds.Count}/begin");
+            double stepStart = timer.Elapsed.TotalMilliseconds;
             logits = model.Forward(new[] { token });
             timer.Stop();
+            activityCapture?.Mark($"decode/{i}/{decodeStepMilliseconds.Count}/end");
+            decodeStepMilliseconds.Add(timer.Elapsed.TotalMilliseconds - stepStart);
+            logitChain.AppendData(MemoryMarshal.AsBytes(logits.AsSpan()));
             inputHistory.Add(token);
             CaptureLogits(logits, "decode", i, inputHistory);
             timer.Start();
@@ -293,8 +340,13 @@ for (int i = -warmups; i < iterations; i++)
             if (model.Tokenizer.IsEos(token)) { eos = true; break; }
             if (position + 1 < decode)
             {
+                activityCapture?.Mark($"decode/{i}/{decodeStepMilliseconds.Count}/begin");
+                double stepStart = timer.Elapsed.TotalMilliseconds;
                 logits = model.Forward(new[] { token }); forwardSteps++;
                 timer.Stop();
+                activityCapture?.Mark($"decode/{i}/{decodeStepMilliseconds.Count}/end");
+                decodeStepMilliseconds.Add(timer.Elapsed.TotalMilliseconds - stepStart);
+                logitChain.AppendData(MemoryMarshal.AsBytes(logits.AsSpan()));
                 inputHistory.Add(token);
                 CaptureLogits(logits, "decode", i, inputHistory);
                 timer.Start();
@@ -302,6 +354,12 @@ for (int i = -warmups; i < iterations; i++)
         }
     }
     timer.Stop();
+    ObserveProcess($"iteration-{i}-after-decode");
+    var cacheAfterDecode = backend == BackendType.GgmlCuda ? Qwen4ExpExpertCacheScenario.CacheStats() : null;
+    string chainHash = Convert.ToHexString(logitChain.GetHashAndReset()).ToLowerInvariant();
+    referenceChainHash ??= chainHash;
+    if (referenceChainHash != chainHash)
+        throw new InvalidOperationException("Identical repeated inputs changed a complete vocabulary row.");
     expectedCachedRows = checked(expectedCachedRows + (long)(prompt.Length + forwardSteps) * model.Config.NumLayers);
     ObserveBudget($"iteration-{i}-decode-complete");
     if (logits.Length == 0 || logits.Any(v => !float.IsFinite(v)))
@@ -319,7 +377,9 @@ for (int i = -warmups; i < iterations; i++)
         finish_reason = generation == "greedy" ? (eos ? "eos" : "length") : "teacher-forced",
         prefill_ms = prefillMs, decode_ms = timer.Elapsed.TotalMilliseconds,
         prefill_tps = prompt.Length / (prefillMs / 1000), decode_tps = forwardSteps / timer.Elapsed.TotalSeconds,
-        final_logit_sha256 = hash };
+        final_logit_sha256 = hash, full_logit_chain_sha256 = chainHash, logit_rows = forwardSteps + 1,
+        decode_step_ms = decodeStepMilliseconds,
+        cache_stats_after_prefill = cacheAfterPrefill, cache_stats_after_decode = cacheAfterDecode };
     runs.Add(row);
     Console.WriteLine(JsonSerializer.Serialize(row));
 }
@@ -376,6 +436,7 @@ completedReport = new
     {
         "Synthetic checkpoints exercise engines and cache ownership; they cannot establish trained language quality or real-model throughput.",
         "Teacher-forced decode excludes sampling and serves identical token inputs; it is not an HTTP end-to-end throughput result.",
+        "Optional CUPTI activity recording instruments execution; its durations are diagnostic, not ordinary throughput.",
         "Working-set and external GPU telemetry are process/driver measurements, not a full allocator peak.",
         "The cache is opt-in; eligible bias-free SiLU expert paths with one through eight rows engage it."
     }
@@ -389,6 +450,8 @@ catch (Exception error)
 }
 finally
 {
+    try { activityCapture?.Stop(); }
+    catch (Exception error) { cleanupErrors.Add("CUPTI capture.Stop: " + error); }
     try { logitsStream?.Dispose(); logitsStream = null; }
     catch (Exception error) { cleanupErrors.Add("logit capture.Dispose: " + error); }
     // Preserve both physical owners and callback roots if a cleanup step fails.

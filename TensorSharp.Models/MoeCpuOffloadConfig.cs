@@ -74,6 +74,16 @@ namespace TensorSharp.Models
         public static bool IsExplicitlySet => _explicitlySet;
 
         /// <summary>
+        /// Native whole-model loaders with a capacity planner accept -1 to keep
+        /// the fewest possible leading expert layers on the host. This is a
+        /// per-loader choice, not a change to the global per-layer weight policy.
+        /// In particular, explicitly setting zero must disable automatic offload.
+        /// </summary>
+        internal static int ResolveNativeLayers(bool planWhenUnspecified)
+            => _explicitlySet ? (_allLayers ? int.MaxValue : _cpuMoeLayers)
+                : planWhenUnspecified ? -1 : 0;
+
+        /// <summary>
         /// Worker threads for the host-side MoE matmul. Zero (the default) lets
         /// the native layer pick <c>hardware_concurrency</c>. Exposed because
         /// the GPU-side graph submission thread is otherwise idle while the host
@@ -253,8 +263,10 @@ namespace TensorSharp.Models
             if (TryParse(Environment.GetEnvironmentVariable(EnvVarLayers), out int layers, out bool allLayers))
             {
                 if (allLayers) SetAllLayers();
-                else if (layers > 0) SetLayers(layers);
+                else SetLayers(layers); // zero is an explicit refusal to offload
             }
+            else if (!string.IsNullOrWhiteSpace(all) && all.Trim() == "0")
+                SetLayers(0);
         }
 
         private static int _unsupportedWarned;

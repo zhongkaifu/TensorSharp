@@ -135,6 +135,57 @@ namespace
         return type == GGML_TYPE_F32 || type == GGML_TYPE_F16 || type == GGML_TYPE_BF16;
     }
 
+    bool q4e_fused_glu_enabled()
+    {
+        static const bool enabled = [] {
+            const char* value = std::getenv("TS_Q4E_FUSED_GLU");
+            return value == nullptr || std::strcmp(value, "0") != 0;
+        }();
+        return enabled;
+    }
+
+    // A one-token slice is often already contiguous. Materializing it again
+    // adds a device copy without changing its layout. Keep multi-row paths and
+    // deliberate allocation barriers outside these selected read-only inputs.
+    ggml_tensor* q4e_decode_cont(ggml_context* ctx, ggml_tensor* x, int tokens)
+    {
+#ifdef TSG_GGML_USE_CUDA
+        static const bool enabled = [] {
+            const char* value = std::getenv("TS_Q4E_DECODE_VIEWS");
+            return value == nullptr || std::strcmp(value, "0") != 0;
+        }();
+        if (enabled && tokens == 1 && ggml_backend_is_cuda(g_backend) && ggml_is_contiguous(x))
+            return x;
+#else
+        (void)tokens;
+#endif
+        return ggml_cont(ctx, x);
+    }
+
+    // The single-row scatter reads the same vector for each residual stream.
+    // A zero row stride expresses that read-only broadcast without materializing
+    // hc copies. Keep the multiply as a separate operation (no arithmetic change).
+    ggml_tensor* q4e_repeat_streams(ggml_context* ctx, ggml_tensor* x, int streams, int tokens)
+    {
+#ifdef TSG_GGML_USE_CUDA
+        static const bool enabled = [] {
+            const char* value = std::getenv("TS_Q4E_BROADCAST_VIEWS");
+            return value == nullptr || std::strcmp(value, "0") != 0;
+        }();
+        if (enabled && tokens == 1 && ggml_backend_is_cuda(g_backend)
+            && x->ne[1] == 1 && x->ne[2] == 1 && x->ne[3] == 1)
+        {
+            // Construct a view of the physical extent first: ggml_view_3d's
+            // constructor checks the dense extent before installing its strides.
+            auto* view = ggml_view_3d(ctx, x, x->ne[0], 1, 1, 0, x->nb[2], 0);
+            view->ne[1] = streams;
+            view->nb[1] = 0;
+            return view;
+        }
+#endif
+        return ggml_repeat_4d(ctx, x, x->ne[0], streams, tokens, 1);
+    }
+
     // Keep a fusion input's memory from being reused inside its graph.
     void q4e_keep_fusion_input(ggml_tensor* t)
     {
@@ -327,7 +378,7 @@ namespace
             if (precise_backend) { ggml_backend_synchronize(precise_backend); ggml_backend_free(precise_backend); precise_backend = nullptr; }
             tp_matmuls.clear();
             qsa_sig = nullptr; qsa_inputs.clear();
-            if (alloc) { ggml_gallocr_free(alloc); alloc = nullptr; }
+            if (alloc) { tsg::graph_budget_gallocr_free(alloc); alloc = nullptr; }
             if (ctx) { ggml_free(ctx); ctx = nullptr; }
             graph = nullptr; res_in = nullptr; res_out = nullptr;
             conv_in = conv_out = ssm_in = ssm_out = nullptr;
@@ -346,7 +397,7 @@ namespace
         void reset()
         {
             reset_graph();
-            if (state_buf) { ggml_backend_buffer_free(state_buf); state_buf = nullptr; }
+            if (state_buf) { tsg::graph_budget_free_buffer(state_buf); state_buf = nullptr; }
             state_ready = false;
         }
     };
@@ -399,21 +450,23 @@ namespace
 
 // External linkage (declared in ggml_ops_internal.h): shared with the arena
 // kernel. Both operate on the ACTIVE rank's map - callers select the device
-// first.
+// first. Graph arenas, recurrent state, QSA state and snapshots all use the
+// owned kind-2 allocator: admission precedes physical allocation, and every
+// corresponding release refunds credit only after freeing the buffer.
 Q4eSeqStateEntry* q4e_seq_state(const void* key, std::size_t bytes)
     {
         if (key == nullptr) return nullptr;
         Q4eSeqStateEntry& e = g_q4e_seq_state[key];
         if (e.buf != nullptr && e.bytes < bytes)
         {
-            ggml_backend_buffer_free(e.buf);
+            tsg::graph_budget_free_buffer(e.buf);
             e.buf = nullptr;
             e.ready = false;
         }
         if (e.buf == nullptr)
         {
-            e.buf = ggml_backend_buft_alloc_buffer(
-                    ggml_backend_get_default_buffer_type(g_backend), bytes);
+            e.buf = tsg::graph_budget_alloc_buffer(
+                    ggml_backend_get_default_buffer_type(g_backend), bytes, tsg::g_active_rank);
             e.bytes = bytes;
             e.ready = false;
             if (e.buf == nullptr) return nullptr;
@@ -946,8 +999,8 @@ ggml_tensor* q4e_nodes_ffn(
     gated = ggml_reshape_3d(ctx, gated, n_embd, hc, T);
 
     // Collapse the streams by their mean.
-    ggml_tensor* mixed = ggml_cont(ctx, ggml_view_2d(ctx, gated, n_embd, T,
-            ggml_row_size(gated->type, n_embd) * hc, 0));
+    ggml_tensor* mixed = q4e_decode_cont(ctx, ggml_view_2d(ctx, gated, n_embd, T,
+            ggml_row_size(gated->type, n_embd) * hc, 0), T);
     for (int c = 1; c < hc; ++c)
     {
         ggml_tensor* s = ggml_view_2d(ctx, gated, n_embd, T,
@@ -981,7 +1034,16 @@ ggml_tensor* q4e_nodes_ffn(
 
     ggml_tensor* sg = q4e_tp_projection(ctx, w_sh_g, mixed, nullptr, full_shared_ff, n_ff_sh, rank * n_ff_sh);
     ggml_tensor* su = q4e_tp_projection(ctx, w_sh_u, mixed, nullptr, full_shared_ff, n_ff_sh, rank * n_ff_sh);
-    ggml_tensor* shared_activation = ggml_mul(ctx, ggml_silu(ctx, sg), su);
+    // The canonical GLU node permits upstream's paired projection kernels.
+    // Use it for ordinary CUDA decode. Multi-row verification, CPU experts,
+    // and tensor parallelism retain their separately qualified paths.
+    bool fused_glu = false;
+#ifdef TSG_GGML_USE_CUDA
+    fused_glu = q4e_fused_glu_enabled() && T == 1 && !cpu_moe
+        && !g_q4e_tp_partials && ggml_backend_is_cuda(g_backend);
+#endif
+    ggml_tensor* shared_activation = fused_glu ? ggml_swiglu_split(ctx, sg, su)
+        : ggml_mul(ctx, ggml_silu(ctx, sg), su);
     ggml_tensor* moe_out = nullptr;
     if (cpu_moe)
     {
@@ -1059,7 +1121,8 @@ ggml_tensor* q4e_nodes_ffn(
         ggml_tensor* e_gate = q4e_tp_projection(ctx, w_gate_e, moe_in, sel, full_ff, n_ff, rank * n_ff);
         ggml_set_name(e_up, "q4e.ffn.expert_up");
         ggml_set_name(e_gate, "q4e.ffn.expert_gate");
-        ggml_tensor* par = ggml_mul(ctx, ggml_silu(ctx, e_gate), e_up);
+        ggml_tensor* par = fused_glu ? ggml_swiglu_split(ctx, e_gate, e_up)
+            : ggml_mul(ctx, ggml_silu(ctx, e_gate), e_up);
         ggml_set_name(par, "q4e.ffn.expert_activation");
         if (g_q4e_tp_partials)
         {
@@ -1139,7 +1202,7 @@ ggml_tensor* q4e_nodes_ffn(
     wsc = ggml_reshape_3d(ctx, wsc, 1, hc, T);
 
     ggml_tensor* b = ggml_reshape_3d(ctx, ffn_out, n_embd, 1, T);
-    b = ggml_repeat_4d(ctx, b, n_embd, hc, T, 1);
+    b = q4e_repeat_streams(ctx, b, hc, T);
 
     ggml_tensor* res_out = ggml_add(ctx, res3, ggml_mul(ctx, b, wsc));
     res_out = ggml_reshape_2d(ctx, res_out, hc_dim, T);
@@ -1212,8 +1275,8 @@ ggml_tensor* q4e_nodes_gdn(
     ggml_tensor* gt = ggml_sigmoid(ctx, q4e_mul_mat(ctx, w_up, lo));
     ggml_tensor* gated = ggml_reshape_3d(ctx, ggml_mul(ctx, xn, gt), n_embd, hc, T);
 
-    ggml_tensor* mixed = ggml_cont(ctx, ggml_view_2d(ctx, gated, n_embd, T,
-            ggml_row_size(gated->type, n_embd) * hc, 0));
+    ggml_tensor* mixed = q4e_decode_cont(ctx, ggml_view_2d(ctx, gated, n_embd, T,
+            ggml_row_size(gated->type, n_embd) * hc, 0), T);
     for (int c = 1; c < hc; ++c)
     {
         mixed = ggml_add(ctx, mixed, ggml_view_2d(ctx, gated, n_embd, T,
@@ -1250,8 +1313,8 @@ ggml_tensor* q4e_nodes_gdn(
             ggml_row_size(conv_out->type, head_v_dim), conv_out->nb[1],
             ggml_row_size(conv_out->type, 2 * key_dim));
 
-    q = ggml_l2_norm(ctx, ggml_cont(ctx, q), eps);
-    k = ggml_l2_norm(ctx, ggml_cont(ctx, k), eps);
+    q = ggml_l2_norm(ctx, q4e_decode_cont(ctx, q, T), eps);
+    k = ggml_l2_norm(ctx, q4e_decode_cont(ctx, k, T), eps);
 
     // Repeat q/k up to the value-head count. ggml_repeat TILES (head h reads
     // h % n_k_heads), which is the convention Qwen 3.5's kernel and llama.cpp's
@@ -1262,9 +1325,9 @@ ggml_tensor* q4e_nodes_gdn(
         q = ggml_repeat_4d(ctx, q, head_k_dim, n_v_heads, T, 1);
         k = ggml_repeat_4d(ctx, k, head_k_dim, n_v_heads, T, 1);
     }
-    q = ggml_reshape_4d(ctx, ggml_cont(ctx, q), head_k_dim, n_v_heads, T, 1);
-    k = ggml_reshape_4d(ctx, ggml_cont(ctx, k), head_k_dim, n_v_heads, T, 1);
-    v = ggml_reshape_4d(ctx, ggml_cont(ctx, v), head_v_dim, n_v_heads, T, 1);
+    q = ggml_reshape_4d(ctx, q4e_decode_cont(ctx, q, T), head_k_dim, n_v_heads, T, 1);
+    k = ggml_reshape_4d(ctx, q4e_decode_cont(ctx, k, T), head_k_dim, n_v_heads, T, 1);
+    v = ggml_reshape_4d(ctx, q4e_decode_cont(ctx, v, T), head_v_dim, n_v_heads, T, 1);
 
     // The op scales q internally (llama.cpp passes it unscaled), and a uniform
     // scale here would be absorbed by the RMS norm below in any case.
@@ -1287,7 +1350,7 @@ ggml_tensor* q4e_nodes_gdn(
             ggml_row_size(gdn_out->type, attn_elems));
 
     // qwen4exp closes with a SIGMOID gate, where Qwen 3.5 uses SiLU.
-    ggml_tensor* normed = ggml_mul(ctx, ggml_rms_norm(ctx, ggml_cont(ctx, core), eps), w_ssmnorm);
+    ggml_tensor* normed = ggml_mul(ctx, ggml_rms_norm(ctx, q4e_decode_cont(ctx, core, T), eps), w_ssmnorm);
     ggml_tensor* zg = ggml_sigmoid(ctx, ggml_reshape_3d(ctx, z, head_v_dim, n_v_heads, T));
     ggml_tensor* out2 = ggml_reshape_2d(ctx, ggml_mul(ctx, normed, zg), value_dim, T);
     ggml_tensor* proj = q4e_mul_mat(ctx, w_out, out2);        // [n_embd, T]
@@ -1295,8 +1358,7 @@ ggml_tensor* q4e_nodes_gdn(
     // ---- hyper-connection scatter ----
     ggml_tensor* wsc = ggml_reshape_3d(ctx, ggml_scale(ctx,
             ggml_sigmoid(ctx, ggml_scale(ctx, inject, 1.0f / (float)hc)), 2.0f), 1, hc, T);
-    ggml_tensor* bexp = ggml_repeat_4d(ctx, ggml_reshape_3d(ctx, proj, n_embd, 1, T),
-            n_embd, hc, T, 1);
+    ggml_tensor* bexp = q4e_repeat_streams(ctx, ggml_reshape_3d(ctx, proj, n_embd, 1, T), hc, T);
     ggml_tensor* res_out = ggml_reshape_2d(ctx,
             ggml_add(ctx, res3, ggml_mul(ctx, bexp, wsc)), hc_dim, T);
 
@@ -1379,8 +1441,8 @@ ggml_tensor* q4e_nodes_attn(
     ggml_tensor* lo = ggml_silu(ctx, ggml_scale(ctx, q4e_mul_mat(ctx, w_down, xn), 1.0f / (float)hc));
     ggml_tensor* gt = ggml_sigmoid(ctx, q4e_mul_mat(ctx, w_up, lo));
     ggml_tensor* gated = ggml_reshape_3d(ctx, ggml_mul(ctx, xn, gt), n_embd, hc, T);
-    ggml_tensor* mixed = ggml_cont(ctx, ggml_view_2d(ctx, gated, n_embd, T,
-            ggml_row_size(gated->type, n_embd) * hc, 0));
+    ggml_tensor* mixed = q4e_decode_cont(ctx, ggml_view_2d(ctx, gated, n_embd, T,
+            ggml_row_size(gated->type, n_embd) * hc, 0), T);
     for (int c = 1; c < hc; ++c)
         mixed = ggml_add(ctx, mixed, ggml_view_2d(ctx, gated, n_embd, T,
                 ggml_row_size(gated->type, n_embd) * hc, ggml_row_size(gated->type, n_embd) * c));
@@ -1541,8 +1603,7 @@ ggml_tensor* q4e_nodes_attn(
     // ---- hyper-connection scatter ----
     ggml_tensor* wsc = ggml_reshape_3d(ctx, ggml_scale(ctx,
             ggml_sigmoid(ctx, ggml_scale(ctx, inject, 1.0f / (float)hc)), 2.0f), 1, hc, T);
-    ggml_tensor* bexp = ggml_repeat_4d(ctx, ggml_reshape_3d(ctx, proj, n_embd, 1, T),
-            n_embd, hc, T, 1);
+    ggml_tensor* bexp = q4e_repeat_streams(ctx, ggml_reshape_3d(ctx, proj, n_embd, 1, T), hc, T);
     ggml_tensor* res_out = ggml_reshape_2d(ctx,
             ggml_add(ctx, res3, ggml_mul(ctx, bexp, wsc)), hc_dim, T);
 
@@ -1618,8 +1679,8 @@ ggml_tensor* q4e_nodes_ple(
     ggml_tensor* gate = ggml_sigmoid(ctx, ggml_mul(ctx, sg, mag));            // [1, hc, TT]
 
     ggml_tensor* val  = q4e_mul_mat(ctx, w_value, ple_emb_in);               // [n_embd, TT]
-    ggml_tensor* v3   = ggml_repeat_4d(ctx,
-            ggml_reshape_3d(ctx, val, n_embd, 1, TT), n_embd, hc, TT, 1);
+    ggml_tensor* v3   = q4e_repeat_streams(ctx,
+            ggml_reshape_3d(ctx, val, n_embd, 1, TT), hc, TT);
     ggml_tensor* gated = ggml_reshape_2d(ctx, ggml_mul(ctx, v3, gate), hc_dim2, TT);
 
     // Dilated causal depthwise conv over the conv-normed gate output.
@@ -1814,10 +1875,10 @@ TSG_EXPORT int TSGgml_Qwen4ExpFfnBlock(
         graph->uid = q4e_next_graph_uid();
         ggml_build_forward_expand(graph, res_out);
 
-        ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(g_backend));
-        if (alloc == nullptr || !ggml_gallocr_alloc_graph(alloc, graph))
+        ggml_gallocr_t alloc = tsg::graph_budget_gallocr_new(ggml_backend_get_default_buffer_type(g_backend), tsg::g_active_rank);
+        if (alloc == nullptr || !tsg::graph_budget_gallocr_alloc_graph(alloc, graph))
         {
-            if (alloc) ggml_gallocr_free(alloc);
+            if (alloc) tsg::graph_budget_gallocr_free(alloc);
             ggml_free(ctx);
             set_last_error("qwen4exp FFN block: failed to allocate graph tensors.");
             return 0;
@@ -1829,7 +1890,7 @@ TSG_EXPORT int TSGgml_Qwen4ExpFfnBlock(
         q4e_note(0, true);
         if (graph_compute_profiled(g_backend, graph, kQwen4ExpFfnKernel) != GGML_STATUS_SUCCESS)
         {
-            ggml_gallocr_free(alloc);
+            tsg::graph_budget_gallocr_free(alloc);
             ggml_free(ctx);
             set_last_error("qwen4exp FFN block: graph compute failed.");
             return 0;
@@ -1855,7 +1916,7 @@ TSG_EXPORT int TSGgml_Qwen4ExpFfnBlock(
             return 1;
         }
 
-        ggml_gallocr_free(alloc);
+        tsg::graph_budget_gallocr_free(alloc);
         ggml_free(ctx);
         return 1;
     }
@@ -1986,10 +2047,10 @@ TSG_EXPORT int TSGgml_Qwen4ExpGdnBlock(
             binder.upload_list.push_back({ssm_state, a->ssm_state, ssm_bytes});
         }
 
-        ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(g_backend));
-        if (alloc == nullptr || !ggml_gallocr_alloc_graph(alloc, graph))
+        ggml_gallocr_t alloc = tsg::graph_budget_gallocr_new(ggml_backend_get_default_buffer_type(g_backend), tsg::g_active_rank);
+        if (alloc == nullptr || !tsg::graph_budget_gallocr_alloc_graph(alloc, graph))
         {
-            if (alloc) ggml_gallocr_free(alloc);
+            if (alloc) tsg::graph_budget_gallocr_free(alloc);
             ggml_free(ctx);
             set_last_error("qwen4exp GDN block: failed to allocate graph tensors.");
             return 0;
@@ -2002,7 +2063,7 @@ TSG_EXPORT int TSGgml_Qwen4ExpGdnBlock(
         q4e_note(1, true);
         if (graph_compute_profiled(g_backend, graph, kQwen4ExpGdnKernel) != GGML_STATUS_SUCCESS)
         {
-            ggml_gallocr_free(alloc); ggml_free(ctx);
+            tsg::graph_budget_gallocr_free(alloc); ggml_free(ctx);
             set_last_error("qwen4exp GDN block: graph compute failed.");
             return 0;
         }
@@ -2023,7 +2084,7 @@ TSG_EXPORT int TSGgml_Qwen4ExpGdnBlock(
             slot->valid = true;
             return 1;
         }
-        ggml_gallocr_free(alloc); ggml_free(ctx);
+        tsg::graph_budget_gallocr_free(alloc); ggml_free(ctx);
         return 1;
     }
     catch (const std::exception& e)
@@ -2113,10 +2174,10 @@ TSG_EXPORT int TSGgml_Qwen4ExpAttnBlock(
         ggml_set_output(res_out);
         ggml_build_forward_expand(graph, res_out);
 
-        ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(g_backend));
-        if (alloc == nullptr || !ggml_gallocr_alloc_graph(alloc, graph))
+        ggml_gallocr_t alloc = tsg::graph_budget_gallocr_new(ggml_backend_get_default_buffer_type(g_backend), tsg::g_active_rank);
+        if (alloc == nullptr || !tsg::graph_budget_gallocr_alloc_graph(alloc, graph))
         {
-            if (alloc) ggml_gallocr_free(alloc);
+            if (alloc) tsg::graph_budget_gallocr_free(alloc);
             ggml_free(ctx);
             set_last_error("qwen4exp attn block: failed to allocate graph tensors.");
             return 0;
@@ -2135,7 +2196,7 @@ TSG_EXPORT int TSGgml_Qwen4ExpAttnBlock(
         q4e_note(2, true);
         if (graph_compute_profiled(g_backend, graph, kQwen4ExpAttnKernel) != GGML_STATUS_SUCCESS)
         {
-            ggml_gallocr_free(alloc); ggml_free(ctx);
+            tsg::graph_budget_gallocr_free(alloc); ggml_free(ctx);
             set_last_error("qwen4exp attn block: graph compute failed.");
             return 0;
         }
@@ -2153,7 +2214,7 @@ TSG_EXPORT int TSGgml_Qwen4ExpAttnBlock(
             slot->valid = true;
             return 1;
         }
-        ggml_gallocr_free(alloc); ggml_free(ctx);
+        tsg::graph_budget_gallocr_free(alloc); ggml_free(ctx);
         return 1;
     }
     catch (const std::exception& e)
@@ -2243,6 +2304,11 @@ static int q4e_token_span_impl(
         // the KV device copies, the GDN/PLE state buffers, the residual buffer -
         // is selected by the active rank, so the scope is the whole mechanism.
         tsg::ScopedRank q4e_rank(q4e_resolve_device(device));
+        char phase_tag[96] = {};
+        if (tsg::phase_timing_enabled())
+            std::snprintf(phase_tag, sizeof(phase_tag), "qwen4exp span rank=%d T=%d layers=%d..%d",
+                    tsg::g_active_rank, n_tokens, layer_begin, layer_end);
+        tsg::PhaseTimer phase_timer(phase_tag);
         if (!ensure_backend()) return 0;
         // Retire any arena slots holding this holder's caches or recurrent
         // state: the span reads the resident KV copies and the seq-state
@@ -2393,6 +2459,7 @@ static int q4e_token_span_impl(
             && slot->use_mrope == (use_mrope ? 1 : 0)
             && slot->host_moe_layers == cpu_moe_layers)
         {
+            phase_timer.mark("replay_prepare");
             ggml_backend_tensor_set(slot->res_in, res_data, 0, res_bytes);
             if (slot->ple_emb_in != nullptr)
                 ggml_backend_tensor_set(slot->ple_emb_in, ple_emb, 0,
@@ -2403,6 +2470,7 @@ static int q4e_token_span_impl(
                 q4e_set_attn_indices(slot->span_pos[i], slot->span_kvidx[i], T, position,
                         use_mrope ? (const int32_t*)mrope_pos : nullptr, rope_position);
             upload_qsa(slot->qsa_inputs);
+            phase_timer.mark("input_upload");
             q4e_note(3, false);
             if (tp_mode)
             {
@@ -2427,18 +2495,22 @@ static int q4e_token_span_impl(
                 set_last_error("qwen4exp token span: replay failed.");
                 return 0;
             }
+            phase_timer.mark("graph_compute");
             if (slot->logits != nullptr)
             {
                 ggml_backend_tensor_get(slot->logits, logits_out, 0,
                         (std::size_t)head->vocab * logits_rows * sizeof(float));
                 if (hidden_out != nullptr)
                     ggml_backend_tensor_get(slot->res_out, hidden_out, 0, res_bytes);
+                phase_timer.mark("output_download");
                 return 1;
             }
             ggml_backend_tensor_get(slot->res_out, res_data, 0, res_bytes);
+            phase_timer.mark("output_download");
             q4e_trace_probe(slot, "replay", position);
             return 1;
         }
+        phase_timer.mark("build_prepare");
         slot->reset_graph();
         if (tp_mode) g_q4e_tp_matmuls = &slot->tp_matmuls;
         g_q4e_row_kernels.keep_fusion_inputs = row_scope;
@@ -2703,15 +2775,17 @@ static int q4e_token_span_impl(
         std::vector<int> host_moe_seg_end;
         if (!host_moe_build_segment_ends(graph, host_moe, host_moe_seg_end, kQwen4ExpSpanKernel))
             return 0;
+        phase_timer.mark("nodes_and_bindings");
         const double t_pregal = q4e_phase_log() ? q4e_now_ms() : 0.0;
-        ggml_gallocr_t alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(g_backend));
-        std::unique_ptr<std::remove_pointer_t<ggml_gallocr_t>, decltype(&ggml_gallocr_free)>
-            owned_alloc(alloc, ggml_gallocr_free);
-        if (alloc == nullptr || !ggml_gallocr_alloc_graph(alloc, graph))
+        ggml_gallocr_t alloc = tsg::graph_budget_gallocr_new(ggml_backend_get_default_buffer_type(g_backend), tsg::g_active_rank);
+        std::unique_ptr<std::remove_pointer_t<ggml_gallocr_t>, decltype(&tsg::graph_budget_gallocr_free)>
+            owned_alloc(alloc, tsg::graph_budget_gallocr_free);
+        if (alloc == nullptr || !tsg::graph_budget_gallocr_alloc_graph(alloc, graph))
         {
             set_last_error("qwen4exp token span: failed to allocate graph tensors.");
             return 0;
         }
+        phase_timer.mark("graph_allocate");
         const double t_gal = q4e_phase_log() ? q4e_now_ms() : 0.0;
 
         binder.flush();
@@ -2740,6 +2814,7 @@ static int q4e_token_span_impl(
                     use_mrope ? (const int32_t*)mrope_pos : nullptr, rope_position);
 
         upload_qsa(slot->qsa_inputs);
+        phase_timer.mark("input_upload");
         const double t_up = q4e_phase_log() ? q4e_now_ms() : 0.0;
         q4e_note(3, true);
         if (tp_mode)
@@ -2767,6 +2842,7 @@ static int q4e_token_span_impl(
             set_last_error("qwen4exp token span: graph compute failed.");
             return 0;
         }
+        phase_timer.mark("graph_compute");
         if (q4e_phase_log() && T > 1)
         {
             tsg::sync_backend(g_backend);
@@ -2785,6 +2861,7 @@ static int q4e_token_span_impl(
         }
         else
             ggml_backend_tensor_get(res_out, res_data, 0, res_bytes);
+        phase_timer.mark("output_download");
 #ifdef TSG_GGML_TEST_HOOKS
         if (q4e_dump_nodes)
         {
@@ -3113,7 +3190,7 @@ TSG_EXPORT void TSGgml_Qwen4ExpReleaseAllSeqState()
     {
         tsg::ScopedRank rank(d);
         for (auto& kv : g_q4e_seq_state)
-            if (kv.second.buf) ggml_backend_buffer_free(kv.second.buf);
+            if (kv.second.buf) tsg::graph_budget_free_buffer(kv.second.buf);
         g_q4e_seq_state.clear();
     }
     TSGgml_Qwen4ExpResetFfnCache();
@@ -3138,7 +3215,7 @@ TSG_EXPORT void TSGgml_Qwen4ExpReleaseSeqState(const void* const* keys, int n)
         {
             auto it = g_q4e_seq_state.find(keys[i]);
             if (it == g_q4e_seq_state.end()) continue;
-            if (it->second.buf) ggml_backend_buffer_free(it->second.buf);
+            if (it->second.buf) tsg::graph_budget_free_buffer(it->second.buf);
             g_q4e_seq_state.erase(it);
             freed = true;
         }
@@ -3163,14 +3240,14 @@ namespace
 
         ~Q4eStateSnapshotEntry()
         {
-            if (saved) ggml_backend_buffer_free(saved);
+            if (saved) tsg::graph_budget_free_buffer(saved);
             if (ctx) ggml_free(ctx);
         }
 
         void prepare(std::size_t required)
         {
             if (bytes == required && saved != nullptr) return;
-            if (saved) { ggml_backend_buffer_free(saved); saved = nullptr; }
+            if (saved) { tsg::graph_budget_free_buffer(saved); saved = nullptr; }
             if (ctx) { ggml_free(ctx); ctx = nullptr; }
             bytes = 0;
             if (required == 0 || required % sizeof(float) != 0)
@@ -3183,8 +3260,8 @@ namespace
             live_tensor = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, required / sizeof(float));
             saved_tensor = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, required / sizeof(float));
             auto buft = ggml_backend_get_default_buffer_type(g_backend);
-            saved = ggml_backend_buft_alloc_buffer(buft,
-                    ggml_backend_buft_get_alloc_size(buft, saved_tensor));
+            saved = tsg::graph_budget_alloc_buffer(buft,
+                    ggml_backend_buft_get_alloc_size(buft, saved_tensor), tsg::g_active_rank);
             if (saved == nullptr) throw std::bad_alloc();
             if (ggml_backend_tensor_alloc(saved, saved_tensor,
                     ggml_backend_buffer_get_base(saved)) != GGML_STATUS_SUCCESS)

@@ -121,11 +121,35 @@ in a request envelope: this integration owns their allocation charges directly.
 The default native scope covers lazy device-copy, explicit preload and selected
 expert caches. Pass `includeGraphBuffers: true` to additionally cover the wired
 context buffers and reuse gallocr arenas in common operators and the Gemma4/Qwen35
-graphs. Other executors, some live KV/holders, backend pools and driver overhead
+graphs, plus Qwen4Exp graph arenas, recurrent state and device state snapshots.
+Qwen4Exp batched arena admission failures leave sequence holders available for a
+retry after credit becomes available. Other executors, some live KV/holders, backend pools and driver overhead
 remain outside it; this is not a whole-model allocation limit. Attaching after
 covered allocation or detaching while allocations remain is rejected. Stop model
 work, dispose models and release covered native caches/compute buffers before
 scope disposal; failed disposal keeps callbacks and charges alive for a retry.
+
+The four-argument overload can also charge the compact MoE expert file-read
+arena and DeepSeek demand-read staging to process-wide host pools in the same budget:
+
+```csharp
+using var nativeCaches = new GgmlCacheBudgetScope(
+    budget, new[] { new[] { "node0/gpu0" } },
+    includeGraphBuffers: true, hostPools: new[] { "node0/ram" });
+```
+
+This replaces the scope in the earlier example; only one scope can be active.
+Host staging competes atomically with other owners of those RAM pools, retains
+its charge until physical release, and does not consume a discrete GPU pool.
+Admission failure stops the expert operation before reading or allocating the
+arena. Empty-cache trim releases the compact arena; model destruction releases
+DeepSeek demand-read staging. A non-null host mapping must be nonempty;
+omitting it preserves the previous cache/graph-only contract. Mapped source
+pages, CPU long-prefill scratch, OS file cache and driver overhead remain outside
+this host coverage, so it is not a process RSS limit.
+Host coverage uses a distinct native export: mixing these managed assemblies
+with an older native library fails at attachment instead of silently omitting
+RAM accounting. Cache-only and graph-only constructors retain their old ABI.
 
 RAM includes one full capture scratch, fixed staging and resident snapshot pages.
 It must fit at least one resident page plus scratch and staging, each rounded to

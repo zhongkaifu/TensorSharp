@@ -23,8 +23,9 @@ namespace tsg
             Reserve reserve = nullptr;
             Commit commit = nullptr;
             Release release = nullptr;
-            std::uint64_t live[3] = {};
+            std::uint64_t live[4] = {};
             bool graph_buffers = false;
+            bool host_buffers = false;
         };
         static Registry& registry()
         {
@@ -43,14 +44,17 @@ namespace tsg
         SharedCacheCharge(const SharedCacheCharge&) = delete;
         SharedCacheCharge& operator=(const SharedCacheCharge&) = delete;
 
-        static bool attach(void* context, Reserve reserve, Commit commit, Release release, bool graph_buffers = false)
+        static bool attach(void* context, Reserve reserve, Commit commit, Release release,
+            bool graph_buffers = false, bool host_buffers = false)
         {
             if (context == nullptr || reserve == nullptr || commit == nullptr || release == nullptr) return false;
             auto& r = registry();
             std::lock_guard<std::mutex> lock(r.mutex);
-            if (r.reserve != nullptr || r.live[0] != 0 || r.live[1] != 0 || (graph_buffers && r.live[2] != 0)) return false;
+            if (r.reserve != nullptr || r.live[0] != 0 || r.live[1] != 0
+                || (graph_buffers && r.live[2] != 0) || (host_buffers && r.live[3] != 0)) return false;
             r.context = context; r.reserve = reserve; r.commit = commit; r.release = release;
             r.graph_buffers = graph_buffers;
+            r.host_buffers = host_buffers;
             return true;
         }
         static bool detach(void* context)
@@ -58,18 +62,19 @@ namespace tsg
             auto& r = registry();
             std::lock_guard<std::mutex> lock(r.mutex);
             if (r.context != context || r.reserve == nullptr || r.live[0] != 0 || r.live[1] != 0
-                || (r.graph_buffers && r.live[2] != 0)) return false;
+                || (r.graph_buffers && r.live[2] != 0) || (r.host_buffers && r.live[3] != 0)) return false;
             r.context = nullptr; r.reserve = nullptr; r.commit = nullptr; r.release = nullptr;
             r.graph_buffers = false;
+            r.host_buffers = false;
             return true;
         }
         static std::shared_ptr<SharedCacheCharge> reserve(int rank, int kind, std::size_t bytes)
         {
-            if (kind < 0 || kind > 2 || bytes == 0 || bytes > static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max())) return {};
+            if (kind < 0 || kind > 3 || bytes == 0 || bytes > static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max())) return {};
             auto charge = std::make_shared<SharedCacheCharge>();
             auto& r = registry();
             std::lock_guard<std::mutex> lock(r.mutex);
-            if (r.reserve != nullptr && (kind != 2 || r.graph_buffers)) {
+            if (r.reserve != nullptr && (kind != 2 || r.graph_buffers) && (kind != 3 || r.host_buffers)) {
                 charge->token_ = r.reserve(r.context, rank, kind, static_cast<std::int64_t>(bytes));
                 if (charge->token_ == 0) return {};
             }

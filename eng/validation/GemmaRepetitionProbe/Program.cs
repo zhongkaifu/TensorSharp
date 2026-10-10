@@ -20,6 +20,9 @@ for (int i = 0; i < args.Length; i++)
 string Option(string name, string fallback) => options.GetValueOrDefault(name, fallback);
 string path = Path.GetFullPath(options["model"]), output = Path.GetFullPath(options["output"]);
 string mode = Option("mode", "direct"), backendName = Option("backend", "ggml_cuda");
+string prefillMethod = Option("prefill-method", "forward");
+if (prefillMethod is not ("forward" or "refill") || (mode != "direct" && options.ContainsKey("prefill-method")))
+    throw new ArgumentException("--prefill-method forward|refill is a direct-mode diagnostic only.");
 string sampling = Option("sampling", "production");
 if (sampling is not ("production" or "raw")) throw new ArgumentException("Sampling must be production or raw.");
 if (mode == "engine" && sampling == "raw") throw new ArgumentException("Engine mode always respects the model generation contract.");
@@ -118,7 +121,7 @@ try
         .Select(m => new { Path = m.FileName, Sha256 = Hash(m.FileName) }).ToArray();
     // Persist identities before generation too: an external timeout or native
     // crash cannot execute this program's finally block.
-    Write("execution-started.json", new { Mode = mode, Backend = backendName, Native = native,
+    Write("execution-started.json", new { Mode = mode, PrefillMethod = mode == "direct" ? prefillMethod : "engine-managed", Backend = backendName, Native = native,
         ModelsSha256 = Hash(typeof(ModelBase).Assembly.Location), ProbeSha256 = Hash(typeof(Program).Assembly.Location),
         RuntimeSha256 = Hash(typeof(InferenceEngine).Assembly.Location), ProcessId = Environment.ProcessId });
     if (mode == "engine")
@@ -154,7 +157,9 @@ try
         for (int step = 0; step < maxNew; step++)
         {
             long started = Stopwatch.GetTimestamp();
-            float[] logits = model.Forward(step == 0 ? promptTokens : [tokens[^1]]);
+            float[] logits = step == 0 && prefillMethod == "refill"
+                ? model.ForwardRefill(promptTokens)
+                : model.Forward(step == 0 ? promptTokens : [tokens[^1]]);
             double milliseconds = Stopwatch.GetElapsedTime(started).TotalMilliseconds;
             if (logits.Length != tokenizer.VocabSize || logits.Any(x => !float.IsFinite(x)))
             {
@@ -202,7 +207,7 @@ finally
     Write("report.json", new
     {
         Qualification = "Diagnostic only: finite execution and absence of an obvious suffix loop do not establish semantic or numerical correctness. Compare an independent implementation and inspect the answer.",
-        Mode = mode, Backend = backendName, Thinking = thinking, PromptTokens = promptTokens,
+        Mode = mode, PrefillMethod = mode == "direct" ? prefillMethod : "engine-managed", Backend = backendName, Thinking = thinking, PromptTokens = promptTokens,
         GeneratedTokens = tokens, Text = text, Stop = stop, Finite = mode == "direct" && steps.Count > 0 ? (bool?)finite : null,
         Error = failure?.ToString(),
         EngineCompletion = engineCompletion,

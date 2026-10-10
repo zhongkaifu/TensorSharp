@@ -462,6 +462,7 @@ set_target_properties(GgmlOps PROPERTIES
 )
 
 if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
+    set_property(SOURCE ggml_ops_host_moe_cache.cpp APPEND PROPERTY COMPILE_DEFINITIONS TSG_GGML_TEST_HOOKS)
     set_property(SOURCE ggml_ops_q8_weight_policy.cpp APPEND PROPERTY COMPILE_DEFINITIONS TSG_GGML_TEST_HOOKS)
     set_property(SOURCE ggml_ops_q8_streaming.cpp APPEND PROPERTY COMPILE_DEFINITIONS TSG_GGML_TEST_HOOKS)
     set_property(SOURCE ggml_ops_gated_delta_net.cpp ggml_ops_qwen35_recurrent_prefill.cpp
@@ -494,6 +495,9 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
     target_include_directories(GgmlOpsSharedCacheBudgetTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
     target_link_libraries(GgmlOpsSharedCacheBudgetTest PRIVATE Threads::Threads)
     add_test(NAME shared-cache-budget-lifetime COMMAND GgmlOpsSharedCacheBudgetTest)
+    add_executable(GgmlOpsExpertEvictionTest tests/expert_eviction_test.cpp)
+    target_include_directories(GgmlOpsExpertEvictionTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+    add_test(NAME host-moe-expert-eviction-policy COMMAND GgmlOpsExpertEvictionTest)
     set_tests_properties(shared-cache-budget-lifetime PROPERTIES TIMEOUT 30)
     add_executable(GgmlOpsGraphBudgetTest tests/graph_budget_test.cpp ggml_ops_graph_budget.cpp)
     target_include_directories(GgmlOpsGraphBudgetTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}"
@@ -576,6 +580,10 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
     add_executable(GgmlOpsDsv4FileWarmTest tests/dsv4_file_warm_test.cpp)
     target_link_libraries(GgmlOpsDsv4FileWarmTest PRIVATE Threads::Threads)
     add_test(NAME deepseek41-host-file-warm COMMAND GgmlOpsDsv4FileWarmTest)
+    add_executable(GgmlOpsDsv4HostExpertReadTest tests/dsv4_host_expert_read_test.cpp)
+    target_include_directories(GgmlOpsDsv4HostExpertReadTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../ExternalProjects/ggml/src")
+    target_link_libraries(GgmlOpsDsv4HostExpertReadTest PRIVATE Threads::Threads ggml ggml-cpu)
+    add_test(NAME deepseek41-host-expert-demand-read COMMAND GgmlOpsDsv4HostExpertReadTest)
 
     add_executable(GgmlOpsGlmFileStripTest tests/glm_file_strip_test.cpp)
     add_test(NAME glm-checkpoint-strips COMMAND GgmlOpsGlmFileStripTest)
@@ -673,6 +681,19 @@ if (TENSORSHARP_GGML_NATIVE_BUILD_TESTS)
         target_link_libraries(GgmlOpsHostMoeExpertCacheTest PRIVATE ggml-cuda)
         add_test(NAME host-moe-expert-cache-cuda-parity COMMAND GgmlOpsHostMoeExpertCacheTest)
         add_test(NAME host-moe-expert-cache-cuda-trim COMMAND GgmlOpsHostMoeExpertCacheTest --trim)
+        add_test(NAME host-moe-expert-cache-cuda-lfu COMMAND GgmlOpsHostMoeExpertCacheTest --quantization iq1_m --lfu)
+        set_tests_properties(host-moe-expert-cache-cuda-lfu PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 120)
+        if (WIN32)
+            add_test(NAME host-moe-expert-cache-cuda-file-read COMMAND GgmlOpsHostMoeExpertCacheTest --file-read)
+            add_test(NAME host-moe-expert-cache-cuda-file-lfu COMMAND GgmlOpsHostMoeExpertCacheTest --quantization iq1_m --file-read --lfu)
+            set_tests_properties(host-moe-expert-cache-cuda-file-lfu PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 120)
+            add_test(NAME host-moe-expert-cache-cuda-iq1-m-file-read COMMAND GgmlOpsHostMoeExpertCacheTest --quantization iq1_m --file-read)
+            add_test(NAME host-moe-expert-cache-cuda-file-pageable COMMAND GgmlOpsHostMoeExpertCacheTest --file-read --prefetch)
+            set_tests_properties(host-moe-expert-cache-cuda-file-read host-moe-expert-cache-cuda-iq1-m-file-read
+                host-moe-expert-cache-cuda-file-pageable
+                PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 120)
+            set_tests_properties(host-moe-expert-cache-cuda-file-pageable PROPERTIES ENVIRONMENT "GGML_CUDA_NO_PINNED=1")
+        endif()
         set_tests_properties(host-moe-expert-cache-cuda-trim
             PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE TIMEOUT 120)
         add_test(NAME host-moe-expert-cache-cuda-iq1-m-parity

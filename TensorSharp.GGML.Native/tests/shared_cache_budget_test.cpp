@@ -19,16 +19,18 @@ struct Ledger {
     std::uint64_t next = 0;
     std::map<std::uint64_t, Allocation> allocations;
     bool fail_commit = false;
+    static std::vector<int> pools(int rank) { return rank < 0 ? std::vector<int>{0} : std::vector<int>{0, rank + 1}; }
     static std::uint64_t reserve(void* context, int rank, int kind, std::int64_t bytes)
     {
         auto& l = *static_cast<Ledger*>(context);
-        require(kind == 0 || kind == 1, "unknown cache allocation kind");
+        require(kind == 0 || kind == 1 || kind == 3, "unknown cache allocation kind");
         if (rank < 0 || rank > 1) return 0;
-        for (int pool : {0, rank + 1})
+        if (kind == 3) rank = -1; // Host staging consumes shared RAM, no GPU credit.
+        for (int pool : pools(rank))
             if (bytes > l.capacity[pool] - l.reserved[pool] - l.committed[pool]) return 0;
         const auto token = ++l.next;
         l.allocations.emplace(token, Allocation{rank, bytes});
-        for (int pool : {0, rank + 1}) l.reserved[pool] += bytes;
+        for (int pool : pools(rank)) l.reserved[pool] += bytes;
         return token;
     }
     static int commit(void* context, std::uint64_t token)
@@ -37,7 +39,7 @@ struct Ledger {
         if (l.fail_commit) return 0;
         auto& a = l.allocations.at(token);
         require(!a.committed, "double commit");
-        for (int pool : {0, a.rank + 1}) { l.reserved[pool] -= a.bytes; l.committed[pool] += a.bytes; }
+        for (int pool : pools(a.rank)) { l.reserved[pool] -= a.bytes; l.committed[pool] += a.bytes; }
         a.committed = true;
         return 1;
     }
@@ -46,7 +48,7 @@ struct Ledger {
         auto& l = *static_cast<Ledger*>(context);
         auto a = l.allocations.at(token);
         require(!a.physical, "shared credits released before physical memory");
-        for (int pool : {0, a.rank + 1}) (a.committed ? l.committed[pool] : l.reserved[pool]) -= a.bytes;
+        for (int pool : pools(a.rank)) (a.committed ? l.committed[pool] : l.reserved[pool]) -= a.bytes;
         l.allocations.erase(token);
     }
 };
@@ -121,5 +123,21 @@ int main()
         "concurrent release leaked shared charges");
     require(SharedCacheCharge::detach(&ledger), "cannot detach fully released callbacks");
     require(attach(ledger) && SharedCacheCharge::detach(&ledger), "detach cannot be followed by clean registration");
+    auto host_attach = [&] { return SharedCacheCharge::attach(&ledger, Ledger::reserve, Ledger::commit, Ledger::release, false, true); };
+    auto old_host = SharedCacheCharge::reserve(0, 3, 32);
+    require(old_host && old_host->commit(32) && !host_attach(), "host scope adopted a live uncharged arena");
+    require(attach(ledger) && SharedCacheCharge::detach(&ledger), "legacy scope unexpectedly covers host storage");
+    old_host.reset();
+    require(host_attach(), "host scope could not attach after arena release");
+    auto gpu = SharedCacheCharge::reserve(1, 1, 64);
+    auto host = SharedCacheCharge::reserve(0, 3, 64);
+    require(gpu && host && !SharedCacheCharge::reserve(0, 3, 1), "host staging escaped the shared RAM limit");
+    require(gpu->commit(64) && host->commit(64), "host/device shared commits failed");
+    require(ledger.committed[0] == 128 && ledger.committed[1] == 0 && ledger.committed[2] == 64,
+        "host staging was charged to a GPU pool");
+    gpu.reset();
+    require(!SharedCacheCharge::detach(&ledger), "host arena did not retain callback ownership");
+    host.reset();
+    require(ledger.allocations.empty() && SharedCacheCharge::detach(&ledger), "host release leaked shared credit");
     std::puts("PASS shared cache bridge: atomic attach/detach, multi-pool/rank quota, physical-free order, rollback and concurrency");
 }

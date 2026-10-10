@@ -1647,12 +1647,19 @@ static glm_model * glm_load(const char * gguf_path, int n_gpu_req, int n_ctx, in
     // GLM-5.3-Flash ("glm5next") loads through this same executor: it keeps the
     // MLA+DSA+MoE core and adds KDA layers, pooled indexing and Sinkhorn
     // hyper-connections on top.
+    std::string architecture_prefix = "glm-dsa";
     {
         const int64_t ai = gguf_find_key(g0, "general.architecture");
         if (ai >= 0 && gguf_get_kv_type(g0, ai) == GGUF_TYPE_STRING)
-            hp.g5n = strcmp(gguf_get_val_str(g0, ai), "glm5next") == 0;
+        {
+            const char * architecture = gguf_get_val_str(g0, ai);
+            hp.g5n = strcmp(architecture, "glm5next") == 0 || strcmp(architecture, "glm5-next") == 0;
+            // The current published spelling also prefixes every metadata key.
+            // Own the string beyond gguf_free(g0); never rewrite the checkpoint.
+            if (hp.g5n) architecture_prefix = architecture;
+        }
     }
-    const char * AP = hp.g5n ? "glm5next" : "glm-dsa";
+    const char * AP = architecture_prefix.c_str();
     bool ok = true;
     ok &= kv_u32(g0, akey(AP, "block_count").c_str(), &hp.n_layer_all);
     ok &= kv_u32(g0, akey(AP, "embedding_length").c_str(), &hp.n_embd);

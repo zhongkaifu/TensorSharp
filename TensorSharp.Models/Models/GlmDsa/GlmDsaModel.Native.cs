@@ -98,18 +98,15 @@ namespace TensorSharp.Models
 
         /// <summary>
         /// Translate the process-wide <see cref="MoeCpuOffloadConfig"/> into the
-        /// native loader's routed-expert offload policy. Offload stays OFF unless
-        /// the operator asks for it: on a host that does have the VRAM it costs
-        /// most of the decode throughput for no reason, and a host that genuinely
-        /// cannot fit the model gets a load error naming the fewest layers that
-        /// would work.
+        /// native loader's routed-expert offload policy. GLM-5.3-Flash on GGML
+        /// CUDA defaults to the capacity plan; it keeps all experts on the GPU
+        /// when they fit and otherwise offloads only the layers required by the
+        /// per-device weight, context and scratch estimate. Explicit zero still
+        /// requires a fully resident load. Other executors remain opt-in.
         /// </summary>
-        private static int ResolveCpuMoeLayers()
-        {
-            if (!MoeCpuOffloadConfig.IsExplicitlySet)
-                return GgmlGlmNative.CpuMoeNone;
-            return MoeCpuOffloadConfig.AllLayers ? int.MaxValue : MoeCpuOffloadConfig.CpuMoeLayers;
-        }
+        private int ResolveCpuMoeLayers(BackendType backend)
+            => MoeCpuOffloadConfig.ResolveNativeLayers(backend == BackendType.GgmlCuda &&
+                GlmDsaArchitecture.IsGlm5Next(Config.Architecture));
 
         private static int ParseEnvInt(string name, int fallback)
         {
@@ -151,7 +148,7 @@ namespace TensorSharp.Models
                 Environment.GetEnvironmentVariable("MAX_CONTEXT"));
 
             IntPtr handle = GgmlGlmNative.LoadModel(ggufPath, nGpu, maxContext, nUbatch, nThreads,
-                ResolveCpuMoeLayers(), BackendRegistryName(backend), tp, ctxIsHardLimit,
+                ResolveCpuMoeLayers(backend), BackendRegistryName(backend), tp, ctxIsHardLimit,
                 NativeMtpRequested());
             if (handle == IntPtr.Zero)
                 throw NativeLoadRefused("glm", ggufPath,

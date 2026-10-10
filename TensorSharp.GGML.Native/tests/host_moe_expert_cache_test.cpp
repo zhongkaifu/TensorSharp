@@ -2,6 +2,9 @@
 // Licensed under the BSD-3-Clause license in the repository root.
 // The optional expert tier against an independent full-resident CUDA graph.
 #include "ggml_ops_internal.h"
+#include "ggml_ops_moe_prefetch.h"
+#include "ggml_ops_file_source.h"
+#include "ggml_ops_moe_prefetch_policy.h"
 #include "ggml_ops_precision_policy.h"
 #include "ggml_ops_shared_cache_budget.h"
 #include "ggml-impl.h"
@@ -12,11 +15,13 @@
 #include <cstdio>
 #include <cstdlib>
 #include <map>
+#include <fstream>
 #include <stdexcept>
 
 extern "C" int TSGgml_HostMoeExpertCacheStats(std::int64_t*, std::int64_t*,
     std::int64_t*, std::int64_t*, std::int64_t*);
 extern "C" std::int64_t TSGgml_TrimHostMoeExpertCache(std::int64_t);
+extern "C" int TSGgml_RegisterHostFileSource(const void*, std::int64_t, const char*, std::int64_t);
 
 // This standalone target compiles the production cache implementation with
 // small bridge stubs; it never loads a model or depends on modified ggml code.
@@ -27,36 +32,61 @@ namespace tsg
     std::atomic<std::uint64_t> g_ggml_error_count{0};
     std::atomic<bool> g_backend_compute_failed{false};
     std::uint64_t g_test_prefetch_calls = 0;
+    int g_test_copy_failure_countdown = 0;
+    int g_test_file_failure_countdown = 0;
+    std::uint64_t g_test_file_reads = 0;
     void set_last_error(const std::string& message) { std::fprintf(stderr, "%s\n", message.c_str()); }
     // Expert tensors in this fixture have no registered dense-Qwen precision
     // policy. Keep their ordinary unchanged ggml CUDA dispatch.
     ggml_backend_t q8_f32_execution_backend(ggml_backend_t backend, ggml_cgraph*) { return backend; }
     void host_moe_expert_cache_test_fail_next(int stage);
     std::size_t host_moe_expert_cache_test_physical_bytes();
+    std::size_t host_moe_expert_cache_test_file_workspace_bytes();
     void host_moe_expert_cache_test_available_bytes(std::size_t bytes);
 #ifdef TSG_GGML_USE_CUDA
+    void read_expert_files(std::vector<ExpertReadTask>& tasks,
+        const std::function<void(std::size_t)>& consume)
+    {
+        for (std::size_t i = tasks.size(); i-- > 0;) {
+            if (g_test_file_failure_countdown > 0 && --g_test_file_failure_countdown == 0)
+                throw std::runtime_error("Injected interrupted expert file read");
+            tasks[i].prepare();
+            ++g_test_file_reads;
+            consume(i);
+        }
+    }
     void host_pin_split(const void*, std::size_t bytes,
         std::vector<std::pair<std::size_t, std::size_t>>& pieces)
     {
+        if (g_test_copy_failure_countdown > 0 && --g_test_copy_failure_countdown == 0)
+            throw std::runtime_error("Injected partial expert upload failure");
         pieces.assign(1, {0, bytes});
     }
-    void prefetch_mapped_ranges(const std::uint8_t* base,
-        const std::vector<std::pair<std::size_t, std::size_t>>& ranges)
+    std::chrono::steady_clock::duration prefetch_mapped_experts(
+        const std::vector<MoePrefetchExpert>& experts,
+        const std::function<void(std::size_t, std::size_t)>& consume)
     {
         // The production bridge reuses the existing MoE page-fault pool. This
         // standalone cache test observes its raw ranges and touches them without
         // linking the unrelated host-FFN engine or needing mapped model files.
-        if (base == nullptr || ranges.empty() || !std::is_sorted(ranges.begin(), ranges.end()))
-            throw std::runtime_error("Cache prefetch ranges are missing or unordered");
+        if (experts.empty()) throw std::runtime_error("Cache prefetch buffers are missing");
         volatile std::uint8_t sink = 0;
-        for (const auto& range : ranges)
+        for (std::size_t i = experts.size(); i-- > 0;)
         {
-            if (range.second == 0) throw std::runtime_error("Cache prefetch range is empty");
-            sink ^= base[range.first];
-            sink ^= base[range.first + range.second - 1];
+            for (std::size_t part = 3; part-- > 0;)
+            {
+                const auto& range = experts[i][part];
+                if (range.first == nullptr || range.second == 0)
+                    throw std::runtime_error("Cache prefetch buffer is empty");
+                sink ^= range.first[0];
+                sink ^= range.first[range.second - 1];
+                consume(i, part);
+            }
+            // Reverse expert/projection completion; slots/IDs must still match.
         }
         (void)sink;
         ++g_test_prefetch_calls;
+        return std::chrono::steady_clock::duration::zero();
     }
 #endif
 }
@@ -77,6 +107,27 @@ namespace
 #endif
     }
 
+    void prefetch_policy_checks()
+    {
+        tsg::ExpertPrefetchPolicy policy;
+        constexpr std::size_t bytes = 16 << 20;
+        using namespace std::chrono;
+        require(!policy.should_prefetch(0, 0) && !policy.should_prefetch(1, bytes)
+            && !policy.should_prefetch(2, 1024), "Small demand dispatched the read pool");
+        require(policy.should_prefetch(8, bytes), "Cold demand did not enable parallel reads");
+        policy.observe_read(bytes, milliseconds(20));
+        require(policy.should_prefetch(8, bytes), "Slow source reads disabled prefetch");
+        policy.observe_read(bytes, microseconds(100));
+        require(!policy.should_prefetch(8, bytes), "Resident pages kept dispatching workers");
+        for (int i = 0; i < 100; ++i) policy.observe_upload(bytes, microseconds(500));
+        require(!policy.should_prefetch(8, bytes), "Fast uploads repeatedly re-armed prefetch");
+        policy.observe_upload(bytes, milliseconds(30));
+        require(policy.should_prefetch(8, bytes), "New expensive reads did not re-arm prefetch");
+        require(!policy.should_prefetch(1, bytes), "Re-armed policy lost its minimum work guard");
+        tsg::ExpertPrefetchPolicy reloaded;
+        require(reloaded.should_prefetch(8, bytes), "Reload inherited another mapping's hot state");
+    }
+
     struct Stats
     {
         std::int64_t reserved = 0, budget = 0, hits = 0, misses = 0, calls = 0;
@@ -93,10 +144,11 @@ namespace
 
     struct SharedLedger
     {
-        struct Allocation { std::int64_t bytes; bool committed = false; };
+        struct Allocation { std::int64_t bytes; bool committed = false; bool host = false; };
         std::int64_t capacity = 2 << 20, pending = 0, committed = 0;
+        std::int64_t host_capacity = 32 << 20, host_pending = 0, host_committed = 0;
         std::uint64_t next = 0, reserve_calls = 0, commit_calls = 0, release_calls = 0;
-        bool fail_commit = false, valid = true, attached = false;
+        bool fail_commit = false, valid = true, attached = false, host_enabled = false;
         std::map<std::uint64_t, Allocation> allocations;
 
         ~SharedLedger()
@@ -113,11 +165,12 @@ namespace
         {
             auto& l = *static_cast<SharedLedger*>(context);
             ++l.reserve_calls;
-            if (rank != 0 || kind != 1 || bytes <= 0) { l.valid = false; return 0; }
-            if (bytes > l.capacity - l.pending - l.committed) return 0;
+            if (rank != 0 || (kind != 1 && !(kind == 3 && l.host_enabled)) || bytes <= 0) { l.valid = false; return 0; }
+            const bool host = kind == 3;
+            if (bytes > (host ? l.host_capacity - l.host_pending - l.host_committed : l.capacity - l.pending - l.committed)) return 0;
             const auto token = ++l.next;
-            l.allocations.emplace(token, Allocation{bytes});
-            l.pending += bytes;
+            l.allocations.emplace(token, Allocation{bytes, false, host});
+            (host ? l.host_pending : l.pending) += bytes;
             return token;
         }
         static int commit(void* context, std::uint64_t token)
@@ -125,12 +178,14 @@ namespace
             auto& l = *static_cast<SharedLedger*>(context);
             ++l.commit_calls;
             auto found = l.allocations.find(token);
-            if (found == l.allocations.end() || found->second.committed
-                || tsg::host_moe_expert_cache_test_physical_bytes() == 0) { l.valid = false; return 0; }
+            if (found == l.allocations.end() || found->second.committed) { l.valid = false; return 0; }
+            const auto physical = found->second.host ? tsg::host_moe_expert_cache_test_file_workspace_bytes()
+                : tsg::host_moe_expert_cache_test_physical_bytes();
+            if (physical == 0) { l.valid = false; return 0; }
             if (l.fail_commit) return 0;
             auto& allocation = found->second;
-            l.pending -= allocation.bytes;
-            l.committed += allocation.bytes;
+            (allocation.host ? l.host_pending : l.pending) -= allocation.bytes;
+            (allocation.host ? l.host_committed : l.committed) += allocation.bytes;
             allocation.committed = true;
             return 1;
         }
@@ -141,15 +196,19 @@ namespace
             auto found = l.allocations.find(token);
             // These ownership fixtures keep one cache entry alive at a time;
             // the separate full-resident oracle is not charged to this cache.
-            if (found == l.allocations.end() || tsg::host_moe_expert_cache_test_physical_bytes() != 0)
+            if (found == l.allocations.end()) { l.valid = false; return; }
+            if ((found->second.host ? tsg::host_moe_expert_cache_test_file_workspace_bytes()
+                    : tsg::host_moe_expert_cache_test_physical_bytes()) != 0)
             { l.valid = false; return; }
             auto& allocation = found->second;
-            (allocation.committed ? l.committed : l.pending) -= allocation.bytes;
+            (allocation.host ? (allocation.committed ? l.host_committed : l.host_pending)
+                : (allocation.committed ? l.committed : l.pending)) -= allocation.bytes;
             l.allocations.erase(found);
         }
-        bool attach()
+        bool attach(bool include_host = false)
         {
-            const bool result = tsg::SharedCacheCharge::attach(this, reserve, commit, release);
+            host_enabled = include_host;
+            const bool result = tsg::SharedCacheCharge::attach(this, reserve, commit, release, false, include_host);
             if (result) attached = true;
             return result;
         }
@@ -161,7 +220,7 @@ namespace
         }
         void check_empty()
         {
-            require(valid && allocations.empty() && pending == 0 && committed == 0,
+            require(valid && allocations.empty() && pending == 0 && committed == 0 && host_pending == 0 && host_committed == 0,
                 "Expert-cache shared credit escaped physical ownership or rollback");
             require(tsg::host_moe_expert_cache_test_physical_bytes() == 0 && Stats().reserved == 0,
                 "Expert-cache rollback retained physical or private-accounted storage");
@@ -495,6 +554,112 @@ namespace
         std::puts("PASS: three-entry LRU trim, recent hits retained, reload, queued output and unchanged arithmetic");
     }
 
+#if defined(_WIN32)
+    void file_read_checks(Weights& weights)
+    {
+        const std::string path = "host-moe-source-" + std::to_string(GetCurrentProcessId()) + ".bin";
+        std::array<std::int64_t, 3> offsets{};
+        {
+            std::ofstream file(path, std::ios::binary | std::ios::trunc);
+            require(bool(file), "Cannot create expert file fixture");
+            for (int part = 0; part < 3; ++part) {
+                file.write("nonzero-offset!", 15);
+                offsets[part] = static_cast<std::int64_t>(file.tellp());
+                file.write(reinterpret_cast<const char*>(weights.quantized[part].data()), weights.quantized[part].size());
+            }
+            require(bool(file), "Cannot write expert file fixture");
+        }
+        for (int part = 0; part < 3; ++part)
+            require(TSGgml_RegisterHostFileSource(weights.quantized[part].data(), weights.quantized[part].size(),
+                path.c_str(), offsets[part]) == 1, "Cannot register exact file extent");
+        require(TSGgml_RegisterHostFileSource(weights.quantized[0].data(), weights.quantized[0].size(),
+            path.c_str(), offsets[0]) == 0, "Duplicate source silently replaced an existing owner");
+        bool rejected = false;
+        try { tsg::ExpertFileSource invalid(path.c_str(), UINT64_MAX-1, 3); }
+        catch (const std::runtime_error&) { rejected = true; }
+        require(rejected, "Overflowing file extent accepted");
+        {
+            tsg::ExpertFileSource source(path.c_str(), offsets[0], weights.quantized[0].size());
+            std::array<std::uint8_t, 113> tail{};
+            source.read(source.bytes()-tail.size(), tail.data(), tail.size());
+            require(std::memcmp(tail.data(), weights.quantized[0].data()+source.bytes()-tail.size(), tail.size()) == 0,
+                "Partial source tail or file offset changed bytes");
+            rejected = false;
+            try { source.read(source.bytes()-tail.size()+1, tail.data(), tail.size()); }
+            catch (const std::runtime_error&) { rejected = true; }
+            require(rejected, "Out-of-range file read accepted");
+        }
+        FullResidentGraph reference(weights);
+        std::array<float, hidden> x{}, actual{};
+        for (int i = 0; i < hidden; ++i) x[i] = std::sin(0.03f * i);
+        std::array<float, used> routes{0.65f,0.35f};
+        auto pair = [&](int first) {
+            std::array<std::int32_t, used> ids{first, first+1};
+            const auto expected = reference.compute(x, ids, routes);
+            require(tsg::host_moe_cached_experts(weights.segment, x.data(), ids.data(), routes.data(),
+                actual.data(), "qwen4exp fused token span") == 1, "File-backed cache did not execute");
+            require(std::memcmp(actual.data(), expected.data(), sizeof(actual)) == 0, "File staging changed expert logits");
+        };
+        SharedLedger ledger;
+        require(ledger.attach(true), "Cannot attach shared host/device quota before file staging");
+        std::size_t arena_bytes = 0;
+        for (const auto& part : weights.quantized) arena_bytes += part.size() / experts * used;
+        ledger.host_capacity = arena_bytes - 1;
+        const auto before_denied = tsg::g_test_file_reads;
+        rejected = false;
+        try { pair(0); } catch (const std::runtime_error&) { rejected = true; }
+        require(rejected && ledger.host_pending == 0 && ledger.host_committed == 0
+            && tsg::host_moe_expert_cache_test_file_workspace_bytes() == 0
+            && before_denied == tsg::g_test_file_reads,
+            "Host quota refusal allocated, read, or silently fell back to unbounded mmap");
+        ledger.host_capacity = arena_bytes;
+        ledger.fail_commit = true;
+        rejected = false;
+        try { pair(0); } catch (const std::runtime_error&) { rejected = true; }
+        require(rejected && ledger.host_pending == 0 && ledger.host_committed == 0
+            && tsg::host_moe_expert_cache_test_file_workspace_bytes() == 0,
+            "Refused host commit retained physical storage or credit");
+        ledger.fail_commit = false;
+        pair(0);
+        require(ledger.host_committed == static_cast<std::int64_t>(arena_bytes)
+            && ledger.host_pending == 0 && !ledger.detach(), "Exact host quota or lifetime ownership failed");
+        for (int i = 0; i < experts; i += used) pair(i);
+        const auto reads = tsg::g_test_file_reads;
+        require(tsg::host_moe_expert_cache_test_file_workspace_bytes() > 0
+            && tsg::host_moe_expert_cache_test_file_workspace_bytes() <= (32u << 20),
+            "File workspace was absent or exceeded its process-wide ceiling");
+        pair(experts-used);
+        require(reads > 0 && reads == tsg::g_test_file_reads, "Warm slots reread files or file path was not exercised");
+        require(TSGgml_TrimHostMoeExpertCache(0) > 0
+            && tsg::host_moe_expert_cache_test_file_workspace_bytes() == 0 && ledger.host_committed == 0,
+            "An idle cache trim retained its file transfer workspace");
+        pair(0);
+        require(tsg::g_test_file_reads > reads, "Cache trim lost the live model's source registrations");
+        for (int i = 0; i < experts; i += used) pair(i);
+        tsg::g_test_file_failure_countdown = 2;
+        rejected = false;
+        // A frequency policy may correctly retain the recently repeated pair 0.
+        // Visit the full working set to force a miss against a filled cache,
+        // without assuming which expert a particular eviction policy removed.
+        for (int i = 0; i < experts && !rejected; i += used)
+            try { pair(i); } catch (const std::runtime_error&) { rejected = true; }
+        require(rejected && tsg::g_test_file_failure_countdown == 0, "Interrupted file read was not exercised");
+        for (int i = experts-used; i >= 0; i -= used) pair(i);
+        // Invalidate one registered source: no incomplete triple may use file
+        // staging; the existing mapped path still computes the exact answer.
+        tsg::host_moe_expert_cache_on_drop(weights.segment.gate_data);
+        const auto before_fallback = tsg::g_test_file_reads;
+        pair(0);
+        require(before_fallback == tsg::g_test_file_reads, "Dropped file source was retained");
+        tsg::host_moe_expert_cache_release();
+        ledger.check_empty();
+        require(ledger.detach(), "File teardown did not release shared host/device quota");
+        require(std::remove(path.c_str()) == 0, "File handles survived cache teardown");
+        require(tsg::host_moe_expert_cache_test_file_workspace_bytes() == 0, "File workspace survived cache teardown");
+        std::puts("PASS: exact file extents, cached reuse, out-of-order staging, partial-read recovery and source release");
+    }
+#endif
+
     void cuda_checks(Weights& weights)
     {
         fallback_checks(weights);
@@ -668,6 +833,27 @@ namespace
         const Stats released;
         require(released.reserved == 0 && released.calls == 0 && released.hits == 0 && released.misses == 0,
             "Explicit expert-cache teardown retained device allocations or old counters");
+
+        // Fill a complete routing cycle, then fail after the first projection
+        // of an evicted slot was uploaded. No old expert ID may remain valid
+        // over those partially replaced bytes, even if the caller retries.
+        auto run_pair = [&](int first) {
+            std::array<std::int32_t, used> selected{first, first + 1};
+            const auto expected_pair = reloaded.compute(x, selected, routes);
+            require(tsg::host_moe_cached_experts(weights.segment, x.data(), selected.data(), routes.data(),
+                actual.data(), "qwen4exp fused token span") == 1, "Failed upload prevented cache recovery");
+            require(std::memcmp(actual.data(), expected_pair.data(), sizeof(actual)) == 0,
+                "A partially overwritten slot retained a valid old expert ID");
+        };
+        for (int i = 0; i < experts; i += used) run_pair(i);
+        tsg::g_test_copy_failure_countdown = 2;
+        bool interrupted = false;
+        try { run_pair(0); }
+        catch (const std::runtime_error&) { interrupted = true; }
+        require(interrupted && tsg::g_test_copy_failure_countdown == 0,
+            "Partial expert upload failure injection did not execute");
+        for (int i = experts - used; i >= 0; i -= used) run_pair(i);
+        tsg::host_moe_expert_cache_release();
     }
 #endif
 }
@@ -676,6 +862,7 @@ int main(int argc, char** argv)
 {
     try
     {
+        prefetch_policy_checks();
         const bool invalid_budget = argc == 3 && std::strcmp(argv[1], "--invalid-budget") == 0;
         const bool trim_only = argc == 2 && std::strcmp(argv[1], "--trim") == 0;
         set_environment("TS_HOST_MOE_EXPERT_CACHE_MB", invalid_budget ? argv[2] : trim_only ? "8" : "2");
@@ -690,12 +877,14 @@ int main(int argc, char** argv)
             return 0;
         }
         Weights weights;
-        bool cpu_only = false, prefetch = false;
+        bool cpu_only = false, prefetch = false, file_read = false, lfu = false;
         for (int arg = 1; arg < argc; ++arg)
         {
             if (std::strcmp(argv[arg], "--cpu") == 0) cpu_only = true;
             else if (std::strcmp(argv[arg], "--trim") == 0 && trim_only) { }
             else if (std::strcmp(argv[arg], "--prefetch") == 0) prefetch = true;
+            else if (std::strcmp(argv[arg], "--file-read") == 0) file_read = true;
+            else if (std::strcmp(argv[arg], "--lfu") == 0) lfu = true;
             else if (std::strcmp(argv[arg], "--quantization") == 0 && arg + 1 < argc)
             {
                 ggml_type type = GGML_TYPE_COUNT;
@@ -708,6 +897,7 @@ int main(int argc, char** argv)
             else throw std::runtime_error("Unsupported expert-cache test argument");
         }
         set_environment("TS_HOST_MOE_EXPERT_CACHE_PREFETCH", prefetch ? "1" : "0");
+        set_environment("TS_HOST_MOE_EXPERT_CACHE_LFU", lfu ? "1" : "0");
         weights.fill(0.5f);
 #ifdef TSG_GGML_USE_CUDA
         if (!cpu_only)
@@ -719,6 +909,13 @@ int main(int argc, char** argv)
             }
             g_backend = ggml_backend_cuda_init(0);
             require(g_backend != nullptr, "Could not initialize CUDA backend");
+#if defined(_WIN32)
+            if (file_read) {
+                file_read_checks(weights);
+                ggml_backend_free(g_backend); g_backend = nullptr;
+                return 0;
+            }
+#endif
             if (trim_only)
             {
                 trim_lru_checks(weights);

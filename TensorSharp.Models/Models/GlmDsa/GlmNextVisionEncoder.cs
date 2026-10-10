@@ -70,7 +70,7 @@ namespace TensorSharp.Models
             var gguf = new GgufFile(mmProjPath);
 
             string projector = gguf.GetString("clip.projector_type") ?? "";
-            if (projector != "glm5next")
+            if (!GlmDsaArchitecture.IsGlm5Next(projector))
                 Console.WriteLine($"Warning: mmproj projector_type is '{projector}', expected 'glm5next'.");
 
             _patchSize = (int)gguf.GetUint32("clip.vision.patch_size", 14);

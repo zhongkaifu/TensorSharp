@@ -33,6 +33,11 @@ def main():
                     "cgroup_memory_stat": Path("/sys/fs/cgroup/memory/memory.stat"),
                     "cgroup_memory_pressure": Path("/sys/fs/cgroup/memory.pressure"),
                     "cgroup_cpu_stat": Path("/sys/fs/cgroup/cpu/cpu.stat"),
+                    "cgroup_v2_memory_current": Path("/sys/fs/cgroup/memory.current"),
+                    "cgroup_v2_memory_max": Path("/sys/fs/cgroup/memory.max"),
+                    "cgroup_v2_memory_events": Path("/sys/fs/cgroup/memory.events"),
+                    "cgroup_v2_memory_stat": Path("/sys/fs/cgroup/memory.stat"),
+                    "cgroup_v2_cpu_stat": Path("/sys/fs/cgroup/cpu.stat"),
                     "host_memory_pressure": Path("/proc/pressure/memory"),
                     "host_io_pressure": Path("/proc/pressure/io"),
                 }.items():

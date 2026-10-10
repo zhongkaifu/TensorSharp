@@ -1,5 +1,9 @@
 # Qwen4Exp selected-expert cache validation
 
+For optional Linux CUPTI kernel/API/copy attribution, see
+[CUDA activity diagnostics](../cuda-activity-trace.md). `--cuda-trace-library`
+enables the recorder; it is off by default and its timings are diagnostic only.
+
 This probe exercises the opt-in `TS_HOST_MOE_EXPERT_CACHE_MB` CUDA cache with the
 same eight-layer synthetic Qwen4Exp GGUF fixture used by engine regressions. It
 includes PLE, GDN, QSA, mixed quantization, changing teacher-forced routes, reset
@@ -24,7 +28,8 @@ that exercises eviction, and a 128 MiB budget. It also compares staged inputs
 and outputs (`TS_HOST_MOE_EXPERT_CACHE_BRIDGE=0`) against input-only transfers
 (`TS_HOST_MOE_EXPERT_CACHE_OUTPUT_BRIDGE=0`) and the default direct CUDA input/output
 bridges. A fourth variant enables raw miss prefetch
-(`TS_HOST_MOE_EXPERT_CACHE_PREFETCH=1`, off by default). Each variant runs in a fresh
+(`TS_HOST_MOE_EXPERT_CACHE_PREFETCH=1`, forced rather than the adaptive default).
+Explicit `=0` remains the no-prefetch control. Each variant runs in a fresh
 process with explicit flags; the default wrapper now runs sixteen synthetic arms.
 It retains complete logits and
 checks relative L2 at `1e-6` with equal argmaxes against all-device execution and
@@ -36,7 +41,9 @@ Native provenance is the actual mapped library path and SHA-256, and ggml must
 remain unchanged.
 
 Pass `--device-budget-bytes <positive-int64>` with `--backend ggml_cuda` to
-attach a shared rank-0 `MemoryBudget` before loading the model. This opts into
+attach a shared `MemoryBudget` before loading the model. The value is a separate
+capacity for each layer-split rank (`gpu0`, `gpu1`, ...); it is not divided by the
+number of devices. Single-device use retains the same `gpu0` meaning. This opts into
 cache/preload and TensorSharp's explicitly routed graph-buffer charges. It is
 not a cap on every CUDA driver/backend allocation, CPU memory, or OS mmap page.
 The final report retains accounting snapshots, actual loaded binary hashes,
@@ -108,6 +115,28 @@ stopwatches, but the resulting run is diagnostic and is not a quiet performance
 measurement. An interrupted run preserves its completed row index; that does not
 turn the incomplete model report into a pass.
 
+For a real GGML CUDA checkpoint, `--layer-split 2` runs contiguous layers on two
+devices and records the degree in model geometry. Set `CUDA_VISIBLE_DEVICES`
+explicitly and use matching placement in both capture processes. The synthetic
+fixture rejects this option. With `--device-budget-bytes`, every selected rank
+has its own pool in the same ledger; all must release their covered allocations
+before the scope can detach. `--host-budget-bytes` remains one shared staging
+pool, not one duplicate allowance per rank. Check per-pool snapshots and actual
+engagement; this still does not establish a whole-model or process memory cap.
+
+The probe records `TS_Q4E_FUSED_GLU`, `TS_GGML_UPLOAD_PREFETCH`,
+`TS_GGML_PHASE_TIMING` and `TS_GGML_LOG_VRAM` so fresh-process captures can
+qualify the default CUDA decode and loading paths. Set `TS_Q4E_FUSED_GLU=0`
+for the separate SiLU/multiply control; the canonical GLU default is limited
+to ordinary single-token CUDA FFNs without CPU experts or tensor parallelism.
+On Linux CUDA, large admitted device-cache weights automatically overlap cold
+page preparation with chunk uploads. `TS_GGML_UPLOAD_PREFETCH=0` disables this;
+`=1` forces preparation for eligible weights, including resident sources.
+Unset uses residency and CPU-parallelism checks. `TS_GGML_LOG_VRAM=1` records
+the actually prepared byte ranges and bounded read windows. Logging/capture
+runs are diagnostics, not quiet throughput measurements. Neither flag creates
+a whole-process RAM cap or an asynchronous CUDA compute/transfer pipeline.
+
 Compare two routes' matched captures, including the initial prefill row:
 
 ```powershell
@@ -130,6 +159,9 @@ reuses earlier full verification; metadata equality is not a new content hash.
 Reverify a checkpoint after modification. Synthetic checkpoints record their
 complete file hash directly. Actual native and managed hashes remain in both
 final reports; route agreement is not a claim of identical engine versions.
+The input schema has a `files` array; a download report with only `shards` is
+not interchangeable. Preserve the prior hash provenance and verify current
+size, mtime and GGUF split metadata when preparing a compatible manifest.
 
 For an independent matched-history diagnostic, start an unchanged llama.cpp
 server on the same verified GGUF and retain its revision, binary hash, backend,
@@ -256,3 +288,142 @@ conversions preclude a cross-engine bit-exact claim. This small semantic suite
 does not establish broad language quality or performance parity.
 
 All generated evidence belongs in ignored `docs/validation/` or `artifacts/`.
+
+## Serial Flash decode comparison
+
+Every request now hashes the complete vocabulary after prefill and every decode
+call, outside forward timing, even without `--logits-dir`. Repetitions must have
+identical complete histories. The report includes `full_logit_chain_sha256`,
+per-step decode milliseconds and expert hit/miss counters at phase boundaries.
+This proves unchanged output for the tested history; it is not an independent
+mathematical or broad language-quality oracle.
+
+Freeze two probe directories with identical managed binaries and separate native
+libraries, then run the old/new/new/old sequence without concurrent GPU workloads:
+
+```powershell
+python eng/validation/flash-decode-bench.py --model C:/Works/models/Qwen3.8-Flash-Next-GGUF/Qwen3.8-Flash-Next-UD-IQ1_M-00001-of-00003.gguf --model-identity-report artifacts/multimodal-local-preflight/integrity.json --control-dir artifacts/flash-control --candidate-dir artifacts/flash-candidate --output artifacts/flash-abba
+```
+
+The tool uses a 2 GiB expert cache, 8 CPU threads, context 512, one separately
+reported first request and three measured repetitions in each process. Its default
+order can be reversed with `--candidate-first`; preserve both sequences when
+checking order sensitivity. This balances order, but does not reset OS pages.
+The default 32-step teacher-forced history is a microbenchmark. For actual generation pass
+`--generation greedy --prompt <text> --decode-tokens 256`; optionally supply
+`--expected-output <answer>` to require that exact trimmed answer and EOS in every
+request. Greedy comparisons always require EOS, including without an expected
+answer. Generated outputs and timing denominators remain in the raw reports.
+
+`compare-flash-decode-runs.py` validates checkpoint/managed/native identities,
+settings, serial execution, all vocabulary histories including warmup, expert
+reservation and physical ownership cleanup. Its `passed` means comparable,
+unchanged output, not a speedup: regressions are retained in the result. First
+requests are not controlled cold-storage tests; OS pages are not flushed. Process
+peak working set and one-second whole-board VRAM samples are observed consumption,
+not total RAM/VRAM caps; board samples include the desktop and can miss spikes.
+Do not compare a three-call first request directly with warmed long-generation
+throughput or claim independent engine parity from these checks.
+
+For a separate capacity experiment use `--expert-cache-mb <MiB>` with a measured
+workspace/KV/driver allowance appropriate to the device and request. Each ABBA
+suite keeps that ceiling identical on both sides; changing it between suites
+measures capacity effects, not a native-code speedup. A small fixed expert cache
+can leave most VRAM unused while repeatedly reading and uploading the same
+weights. These measurements do not supply an automatic whole-system RAM policy.
+
+The native page reader now queues each completed gate/up/down projection for
+upload on the submitting thread while bounded workers prepare other sources.
+It waits for all workers even after read/upload exceptions. The native pool
+tests force read/consume overlap, caller-thread consumption, exception recovery,
+and mixed concurrent submissions; the expert-cache tests reverse completion
+order and inject interrupted uploads to detect stale valid victim slots.
+
+On Windows, `TS_HOST_MOE_FILE_READ=1` registers exact GGUF shard extents and
+reads missing expert projections into one reusable host transfer arena, at most
+32 MiB per process. CUDA host allocation permits reads and uploads to overlap;
+upstream falls back to pageable RAM if pinning is unavailable. The arena grows
+only to observed demand, drains before reuse after failures, and is released by
+an empty-cache trim. This is separate from the device expert quota and is not a
+whole-process RAM limit. The registered extents and handles retire on source
+invalidation or teardown. A live model's `ReleaseGgmlDeviceResidency()` restores
+its extents after invalidation so later execution can continue staging.
+
+Without this variable, mapped CUDA experts exceeding available physical RAM at
+load time select file staging when a valid, positive expert-cache budget exists.
+`=0` preserves mmap reads and `=1` forces registration. This initial source policy
+does not make the expert quota or total RSS automatically adapt to every request.
+The file path currently covers the compact expert cache, not CPU long-prefill
+reads, all model weights, KV, or other backends.
+
+Pass `--candidate-file-read` to `flash-decode-bench.py` (and its standalone
+comparator) to compare explicit mmap/file arms with the same adaptive mmap
+prefetch setting. Both arms can use one frozen probe directory. The comparator
+requires actual native file-read and bounded-workspace evidence, besides all
+output/budget checks. The default prefetch comparison explicitly disables file
+staging on both sides. Use `--release-residency true` directly on the probe for
+a separate release/refill correctness run; its repetitions include reloading
+device resources and must not be labelled warm throughput.
+
+For I/O diagnosis, wrap a probe command with
+`python eng/validation/flash-decode-io.py --output artifacts/flash-io -- dotnet ... --process-counters true`.
+This requires `psutil`. The Windows phase snapshots distinguish process I/O,
+page faults (including soft faults), private commit and working set. Physical
+disk samples include every process; process I/O counters omit some mmap I/O.
+Neither is a controlled cold-storage measurement or an attribution of every
+SSD byte to model weights. Keep this diagnostic sampling separate from quiet
+throughput measurements.
+
+The independent Strata smoke runner also supports `--cases tool_json`. It
+requires one complete JSON tool call with exact tool/argument values and no
+duplicate keys; it does not execute a tool or validate a multi-turn agent loop.
+
+`flash-decode-report.py --input <annotations.json> --output docs/validation/<run>`
+renders an HTML/JSON report from completed comparisons. The input has `title`,
+`notes`, `groups` (each with `name` and comparison `directories`), optional
+`semantic_report`, and optional `sections` (each with `title` and `notes`). Paths
+resolve relative to the input. Each group must use one binary/checkpoint/request
+identity; the tool rechecks all comparisons, rejects overlapping processes or
+different full vocabulary histories, separates first and repeated requests, and
+preserves every independent semantic failure. It does not infer overall quality
+or performance acceptance from a successful transport comparison.
+An optional group `semantic_case` uses a case from `qwen38-strata-compare.py`;
+the measured prompt must match exactly. Every request, including the first, must
+satisfy that independent task check and EOS. Failures appear in the report without
+changing the original output or the separate transport-comparison result.
+
+Pass `--candidate-lfu` to compare legacy LRU against capacity-dependent decaying
+frequency eviction. Both arms then force file staging and use identical device
+quotas; the comparator also checks native policy logs. This option and
+`--candidate-file-read` are mutually exclusive. Other experiment modes explicitly
+disable LFU on both arms to avoid conflating the two changes. Production defaults
+to LFU within an enabled expert cache; `TS_HOST_MOE_EXPERT_CACHE_LFU=0` restores LRU.
+
+For diagnostic route captures, `flash-expert-route-capture.py` accepts
+`--binary-dir`, `--model`, `--model-identity-report`, `--prompt` and `--output`.
+It forces LRU and `TS_HOST_MOE_ROUTE_TRACE=1`, then invokes
+`flash-expert-cache-replay.py` to compare miss counts at the recorded layer
+capacities. LRU replay must exactly match native calls/hits/misses first. Tracing
+prints each route and changes timing; neither capture timings nor replayed miss
+counts establish throughput or language quality.
+
+The probe's `--host-budget-bytes` requires `--device-budget-bytes` and installs
+a host-pool mapping on the same budget. Host coverage is the expert file arena
+payload only. `flash-host-budget-check.py` exercises a 32 MiB host allowance with
+complete Chinese requests, residency release, cache trim and refill; a second
+1-byte allowance must fail with the native budget cause and leave no credit.
+It takes `--binary-dir`, `--model`, `--model-identity-report` and `--output`;
+`--scenario admitted|refused` allows a targeted retest. These lifecycle timings
+are not warm throughput. Default file-source and LFU selection stay unset so
+the positive run checks actual defaults, including after reload.
+
+Device scopes with graph coverage also charge Qwen4Exp graph arenas, recurrent
+state and device state snapshots. They do not cover all model KV, driver/backend
+pools or host allocations. `Qwen4ExpGraphBudgetTests` verifies snapshot charges,
+rollback equivalence, refusal under exhausted credit, batched retry and release.
+
+Single-token CUDA hyperconnection and PLE broadcasts use read-only zero-stride
+views by default. `TS_Q4E_BROADCAST_VIEWS=0` restores materialized repeats for an
+isolated comparison; it is independent of `TS_Q4E_DECODE_VIEWS`. Batched and
+multi-token graphs keep their existing layouts. Record the switch and native
+binary identity with full-vocabulary logits before comparing throughput.

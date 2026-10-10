@@ -61,11 +61,12 @@ namespace TensorSharp.Models
         // executed by the speculative-decoding paths in Qwen35Model.Mtp.cs.
         private int _numNextnLayers;
         private int _mtpLayerIdx = -1;
+        private bool _loadEmbeddedMtpWeights = true;
 
         // Per-layer arrays must cover the MTP block (it reuses AttentionBlock
         // and the standard KV-cache machinery) while the main forward loops
         // iterate only Config.NumLayers trunk layers.
-        private int TotalLayerCount => Config.NumLayers + _numNextnLayers;
+        private int TotalLayerCount => Config.NumLayers + (_loadEmbeddedMtpWeights ? _numNextnLayers : 0);
 
         // MoE configuration (qwen35moe / qwen3next variants)
         private int _numExperts;
@@ -401,7 +402,9 @@ namespace TensorSharp.Models
             if (_numNextnLayers > 0)
             {
                 Config.NumLayers -= _numNextnLayers;
-                _mtpLayerIdx = Config.NumLayers;
+                _loadEmbeddedMtpWeights = ShouldLoadEmbeddedMtpWeights(
+                    TensorSharp.Runtime.Speculative.SpeculationOptions.FromEnvironment());
+                _mtpLayerIdx = _loadEmbeddedMtpWeights ? Config.NumLayers : -1;
             }
 
             // MRoPE sections
@@ -457,7 +460,8 @@ namespace TensorSharp.Models
             Console.WriteLine($"Layer types: {attnCount} full attention, {recCount} recurrent (GatedDeltaNet)");
 
             if (_numNextnLayers > 0)
-                Console.WriteLine($"NextN/MTP: {_numNextnLayers} draft block(s) at layer {_mtpLayerIdx} (excluded from main stack)");
+                Console.WriteLine($"NextN/MTP: {_numNextnLayers} draft block(s) at layer {Config.NumLayers} " +
+                    (_loadEmbeddedMtpWeights ? "(excluded from main stack)" : "(omitted by speculative loading policy; no draft weights or KV)"));
 
             if (_numExperts > 0)
             {
@@ -473,6 +477,9 @@ namespace TensorSharp.Models
 
             ValidateStreamingWeightConfiguration(draftModelPath);
             LoadWeights();
+            if (OmittedCheckpointWeightCount > 0)
+                Console.WriteLine($"  Omitted NextN checkpoint payload: {OmittedCheckpointWeightBytes} bytes " +
+                    $"across {OmittedCheckpointWeightCount} tensors (not physical RAM/VRAM savings).");
             if (!HasStreamingWeights)
             {
                 FuseAttentionProjectionWeights();

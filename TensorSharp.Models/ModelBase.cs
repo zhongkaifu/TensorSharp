@@ -2164,6 +2164,10 @@ namespace TensorSharp.Models
                 if (stacked != null && stacked.Data != IntPtr.Zero)
                     GgmlBasicOps.InvalidateHostBuffer(stacked.Data);
             }
+            // Invalidation also retires native file registrations. These GGUF
+            // mappings still belong to the live model; restore their exact
+            // extents so the next execution retains the bounded read path.
+            RefreshExpertFileSourcesAfterResidencyRelease();
         }
 
         /// <summary>

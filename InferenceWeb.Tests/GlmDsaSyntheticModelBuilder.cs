@@ -84,7 +84,7 @@ internal static class GlmDsaSyntheticModelBuilder
     public static string WriteGlm5NextTpFixture(
         string path, int numHeads, bool quantizeAttentionOutput, int numLayers = 1,
         bool mixedAttention = false, bool routedExperts = false, bool quantizeExperts = false,
-        int contextLength = 256, int indexerTopK = 4)
+        int contextLength = 256, int indexerTopK = 4, string architecture = "glm5next")
     {
         const int hidden = 64;
         const int ffn = 64;
@@ -210,7 +210,9 @@ internal static class GlmDsaSyntheticModelBuilder
             foreach (var tensor in tensors)
                 if (tensor.Name.EndsWith("_exps.weight", StringComparison.Ordinal)) tensor.Type = GgmlType.Q8_0;
 
-        const string a = "glm5next";
+        if (architecture is not ("glm5next" or "glm5-next"))
+            throw new ArgumentException("Expected a GLM-5-Next GGUF architecture", nameof(architecture));
+        string a = architecture;
         var kv = new List<KvEntry>
         {
             new KvStr  { Key = "general.architecture", V = a },
