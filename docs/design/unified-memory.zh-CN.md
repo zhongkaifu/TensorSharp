@@ -1680,6 +1680,98 @@ Gemma 整个探针进程最高工作集 9.11 GiB、整卡采样峰值 9,150 MiB�
 vendor workspace 计账、图重建和 KV 增长的完整峰值、自动硬件容量刷新、
 公平性/延迟验收、真正长上下文及更多多模态应用；因此保持显式接入。
 
+### 主机资源归属、请求执行峰值与 8K/32K/64K 验收：2026-10-10
+
+**本轮补齐了重要的分配入口，但“完整资源计账”和物理硬限验收仍未全部完成，
+全模型统一内存继续显式接入。** 主要变化：
+
+- 新增 `HostAllocationBudgetScope`，在模型创建前接管已接线的 GGML 主机池和
+  `HostBuffers`。按实际页/对齐尺寸先预留再分配，复用更大块时保留其完整额度。
+  归还池不等于释放；失败的 unmap 保留归属供重试。CPU 初始池部分分配失败会
+  回滚，模型销毁会真正 trim 已归还的块。已有未接管分配不能追溯计账。
+- `AdaptiveModelSession.EstimateRequestPeak` 使用实际模型几何，包含 KV 块取整、
+  循环状态、旧/新状态共存的增长峰值、图工作区和文件权重投影余量。
+  `CreateRequestMemoryAdmission` 再加主机快照驻留/可能的 spill 额度。
+  每个序列执行时，host/native 分配消费该请求的 envelope；预留不再与同一
+  分配重复计账，也不能借用其他请求的空闲额度。存活缓冲在请求关闭后仍收费。
+- 新适配器只接受显式单 rank、逐序列、无 prefix cache、无 speculation 的
+  dense 文本执行。media、MTP、batched holder 和 TP 尚未适配；拒绝不支持的路径。
+  这是一条同步模型执行通道，不是多引擎并行分配上下文。
+- `MemoryBudget.HighWatermarks()` 给出每个 pool 自创建以来精确的 Owned
+  （预留加提交）和 Committed 峰值，补足定时采样遗漏。它们不是 RSS。
+- 扩大回归发现 Windows 原生分页注意力缓存在线程析构中调用 CUDA 释放而
+  崩溃。改为 TensorSharp 自有的进程级缓存归属，在计算停止后统一释放；
+  cache key 加 backend 身份，graph buffer 的分配/释放均接入预算。
+  退出线程的缓存保持计账，trim 后可在恢复额度时正确重建。没有修改上游 ggml。
+
+**回归证据。** Windows/Linux 各 398 项通过、各 5 项条件跳过；之后新增的
+CPU 初始化回滚与主机分配检查在 Windows 的 10 通过/1 跳过组合、Linux 的
+5 项主机检查中通过。专门的 Windows 线程退出回收测试通过；VM 第二张 A40
+原生检查 7 通过、1 跳过。Linux 核心 harness 为 54/54，其中模拟 accelerator
+场景仍标为模拟。早期发生 native 崩溃和计账释放不匹配的失败记录全部保留，
+没有算作通过；Metal/Vulkan 未获得本轮硬件验收。
+
+新的 [LongContextProbe](../../eng/validation/UnifiedMemory.LongContextProbe/README.md)
+让参考和候选使用独立进程，避免把同进程参考路径的高水位当作候选内存。
+以下均为 Qwen3.5 0.8B Q8_0、每请求 16 个输出 token、F16 KV、相同逐序列路径。
+参考是 TensorSharp resident 模型/托管快照，**不是 llama.cpp**。
+8K 使用 chunk128，其余 chunk256。速率使用 forward 时间，墙钟包含排队和状态交换。
+
+| 硬件 / 配置 / RAM、device 账本 | 实际输入 / 最大同时准入 | 参考 / 候选整组秒 | 候选 prefill token/s | 候选 decode token/s | 参考 / 候选 RSS 峰值 GiB |
+| --- | --- | ---: | ---: | ---: | ---: |
+| RTX 3080 Laptop / 8K / 2、4 GiB | 每路 6,018 / 2 | 11.959 / 12.042 | 1,266–1,305 | 71.51–75.60 | 2.613 / 2.672 |
+| A40 / 32K / 4、4 GiB | 每路 28,002 / **1** | 78.364 / 20.951 | 2,706–2,768 | 72.28–79.19 | 6.243 / 1.362 |
+| A40 / 32K / 8、8 GiB，首轮 | 每路 28,002 / 2 | 78.364 / 92.526 | 1,747–1,796 | 75.98–78.06 | 6.243 / 6.376 |
+| A40 / 32K / 8、8 GiB，反向复测 | 每路 28,002 / 2 | 75.022 / 77.275 | 1,841–1,917 | 66.56–84.89 | 6.226 / 6.400 |
+| A40 / 64K / 8、8 GiB | 60,018 / 1 | 24.079 / 24.448 | 2,482 | 74.07 | 1.731 / 1.729 |
+
+所有候选逐 token 一致，且引擎/模型释放后全部账本为零。32K 小预算只让一路
+运行，减少交错恢复，因此较短耗时**不能算并发加速**。两路 32K 的差距在首轮
+18.1%、反向复测 3.0% 之间，未锁定时钟/宿主负载，不能宣布稳定持平；forward
+以外的状态交换仍是主要墙钟成本。64K 是实际约 60K 输入的单请求验收，没有
+换入换出。计数提示建立执行一致性，不证明长文理解或智能体语义质量。
+
+| 候选场景 | RAM Owned / Committed 峰值 GiB | device Owned / Committed 峰值 GiB | 整卡已用采样峰值 GiB |
+| --- | ---: | ---: | ---: |
+| 本地 8K | 1.970 / 1.136 | 1.729 / 1.081 | 2.428 |
+| A40 32K，4 GiB | 2.197 / 0.417 | 3.008 / 1.381 | 1.947 |
+| A40 32K，8 GiB，两轮相同账本峰值 | 7.976 / 5.158 | 4.148 / 1.381 | 1.887 |
+| A40 64K，8 GiB | 7.998 / 0.792 | 4.230 / 1.772 | 2.258 |
+
+Owned 和 Committed 各自取峰，不要求同一时刻；整卡 total-minus-free 包含非本
+进程占用，采样可能错过短峰。64K 单请求仍保守预留潜在快照和增长工作区，
+Owned 远高于 Committed，后续应根据完整执行生命周期减少不必要的预留，
+不能简单减掉其他 owner 的 committed 字节。本地 RAM 配额 2 GiB 而 RSS 达
+2.672 GiB，直接说明 GC、映射驻留等尚不在完整物理上限内。
+
+长上下文组均无真实 spill。另用当前原生/主机计账实现对本地 Gemma 4 12B
+QAT UD-Q4_K_XL 做短上下文完整快照回放：**12,582,912 logits，最大绝对差 0，
+6 次逐字节恢复，2 次 spill，传输 138,313,728 bytes**。该探针仍使用快照部分的
+请求估算入口，不是新增完整执行 envelope 的 Gemma 长上下文验收，也不是
+原先 IQ2_M 重复问题的本轮复验。
+
+**物理硬限：尚未通过。** 新增 `eng/validation/run-memory-cgroup.py`，只在
+新建且已委派的 Linux cgroup 内启动待测子进程，读回 RAM/禁用 swap 上限，
+记录内核 peak/events 和进程 RSS；不可用时 exit77、`passed=false`，不启动
+无限制替代。当前 VM 是 user namespace，cgroup 叶目录不允许创建子组，
+8 GiB 验收在启动模型前得到 PermissionError；没有修改共享父组的约 93 GiB
+现有限额。本轮只验证了拒绝路径，尚无成功施加小 cgroup 硬限的模型记录。
+该工具也不限制 VRAM，cgroup 内存与共享文件页的 RSS 归属并非一一对应。
+
+上游 revision 仍是 `ffa4e8b80930029a35991f94e7c8a93cd67730ab`，本地/VM
+上游树干净。Windows 原生 SHA-256 为 `4f91b4f241a0bc0deeee60cd3cfa84ef3086d9fdeae0006bfe70fb559463260c`，
+Linux 为 `7b3203083520500d1e80e2f850cd36d7c2c4aac7ecbf39fc24eda8092f9bcd01`。
+47 个远端证据文件经 SHA-256 清单校验，报表、失败记录和实际加载二进制哈希
+保存在忽略的 `artifacts/resource-accounting-20261010/`。首轮 32K 使用的 managed
+GGML DLL 早于最后的 CPU 初始池回滚修复；反向复测与 64K 已用最终 DLL，
+相关 CUDA 路径没有变化。本地 D: 为 USB HDD，VM /workspace 为 FUSE 网络存储，
+不声明 NVMe 吞吐结果。
+
+仍待完成：GC/tokenizer、映射页驻留、全部 native host scratch 和 vendor/driver
+内存归属；跨引擎缓存回收；硬件变化下自动重新规划；更小物理 RAM/VRAM 硬限；
+减少保守重复峰值和长上下文交错恢复成本；128K、长期运行/取消公平性以及
+多模态、MTP、TP、批量 holder 的完整请求峰值和应用质量验收。
+
 ## 15. 后续实际接入与硬件验证入口
 
 `PagedKvStorage` 的 `Acquire` 返回有生命周期的 span 租约；`BatchExecutor` 的捕获、尾页刷新、恢复全部使用该 API。底层将一个页面视为不解释布局的可变资源，按原字节回写/恢复。前缀引用继续保留逻辑页，最后一个引用消失才注销；id 再次分配时增加 epoch。失败的释放不把页面放回 free queue。捕获 scratch 和固定搬运缓冲在启动时预留，单个模型必须能容纳一个合法完整快照页。恢复阶段可在有空闲驻留容量时预取下一页，与当前注入操作重叠；停止/回收前等待预取结束。

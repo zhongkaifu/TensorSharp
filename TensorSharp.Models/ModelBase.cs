@@ -2786,6 +2786,9 @@ namespace TensorSharp.Models
 
             if (_allocator is IDisposable allocatorDisposable)
                 allocatorDisposable.Dispose();
+            // Returning tensors to the host pool keeps both their physical
+            // memory and budget alive. Teardown must actually unmap the pool.
+            _ggmlContext?.ReleasePooledMemory();
         }
 
         /// <summary>

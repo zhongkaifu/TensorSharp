@@ -9,6 +9,25 @@ namespace InferenceWeb.Tests;
 public class AdaptiveModelMemoryTests
 {
     private const long GiB = 1L << 30;
+
+    [Fact]
+    public void RequestPeakIncludesRoundedGrowthCopiesAndBothPhysicalTiers()
+    {
+        var profile = Profile() with { Model = new()
+        {
+            RecurrentStatePerSequence = new(100, 200),
+            KvCaches = [new(16, LayerCount: 2, AllocationBlockTokens: 256),
+                new(16, LayerCount: 2, AllocationBlockTokens: 256, Tier: MemoryTier.Host),
+                new(8, WindowTokens: 512, AllocationBlockTokens: 512, Tier: MemoryTier.Host)]
+        } };
+        var workspace = profile.Workspace(32, 257);
+        var peak = profile.RequestPeak(257, 32, false);
+        Assert.Equal(workspace.Host + 2 * (100 + 512 * 32 + 512 * 8), peak.Host);
+        Assert.Equal(workspace.Device + 2 * (200 + 512 * 32), peak.Device);
+        Assert.Equal(peak.Device + profile.LargestProjectionBytes, profile.RequestPeak(257, 32, true).Device);
+        Assert.True(profile.RequestPeak(32768, 32, false).Host > peak.Host);
+        Assert.Throws<ArgumentOutOfRangeException>(() => profile.RequestPeak(0, 32, false));
+    }
     private static MemoryBudget EmptyBudget() => new([
         new(AdaptiveModelSession.HostPool, 0), new(AdaptiveModelSession.DevicePool, 0)]);
     private static DenseMemoryProfile Profile(string? refusal = null) => new(new()

@@ -314,6 +314,10 @@ namespace TensorSharp.Runtime.Scheduling
                     WarnSpeculationRefusedOnce(plan.SpeculationRefusal);
                 LogPlanTransition(plan);
 
+                if (_scheduler.Config.MemoryAdmission?.EnterSerialExecution != null
+                    && (plan.Candidates[0] != ExecutionPathKind.PerSequence || _scheduler.Config.Speculation.Enabled))
+                    throw new NotSupportedException("The request allocation adapter requires non-speculative PerSequence execution. Select that path explicitly before submitting requests.");
+
                 for (int i = 0; i < plan.Candidates.Count; i++)
                 {
                     if (i > 0)
@@ -1618,6 +1622,7 @@ namespace TensorSharp.Runtime.Scheduling
                 int prevComputed = seq.NumComputedTokens;
                 try
                 {
+                    using var allocationScope = _scheduler.Config.MemoryAdmission?.EnterSerialExecution?.Invoke(seq);
                     EnsureOwnership(seq);
 
                     // NextN/MTP speculative decoding (handles its own advance/
@@ -2686,7 +2691,7 @@ namespace TensorSharp.Runtime.Scheduling
         {
             if (canAdmit()) return;
             _model.TrimIdleMemory();
-            RadixCache?.ReclaimForAdmission(canAdmit);
+            RadixCache?.ReclaimForAdmission(canAdmit, () => _model.TrimIdleMemory());
         }
 
         /// <summary>Consume a token the batched greedy path sampled on-device

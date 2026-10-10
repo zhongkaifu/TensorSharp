@@ -554,6 +554,44 @@ public class ContinuousBatchSchedulerTests
     }
 
     [Fact]
+    public async Task Engine_SerialAllocationsUseEachRequestsReservedCredit()
+    {
+        string? previous = Environment.GetEnvironmentVariable("TS_SCHED_DISABLE_BATCHED");
+        Environment.SetEnvironmentVariable("TS_SCHED_DISABLE_BATCHED", "1");
+        try
+        {
+            var budget = new MemoryBudget([new("ram", 512)]);
+            using var host = new HostAllocationBudgetScope(budget, ["ram"]);
+            var routed = new HashSet<string>();
+            using var model = new StubModel("fp-execution-credit", 7)
+            {
+                OnForward = () =>
+                {
+                    IntPtr ptr = HostBuffers.Allocate(256);
+                    try { Assert.Equal(256, host.Usage.Bytes); }
+                    finally { HostBuffers.Free(ptr); }
+                }
+            };
+            using var engine = new InferenceEngine(model, new SchedulerConfig
+            {
+                BlockSize = BlockSize, NumBlocks = 32, MaxNumRunningSequences = 2,
+                EnablePrefixCaching = false, StopRepetition = false,
+                MemoryAdmission = new(budget, _ => new MemoryCharge[] { new("ram", 256) })
+                { EnterSerialExecution = seq => { routed.Add(seq.RequestId); return host.EnterExecution(seq.MemoryEnvelope!); } }
+            });
+            var first = engine.SubmitRequest(NewSequence("first", 8, 3));
+            var second = engine.SubmitRequest(NewSequence("second", 8, 3));
+            await Task.WhenAll(first.Completion, second.Completion).WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.Equal(new[] { "first", "second" }, routed.OrderBy(x => x));
+            Assert.All(new[] { first, second }, h => Assert.Equal(new[] { 7, 7, 7 }, h.Sequence.OutputTokens));
+            engine.Dispose();
+            Assert.Equal(512, budget.Snapshot().Single().Available);
+            Assert.Equal(0, host.Usage.Bytes);
+        }
+        finally { Environment.SetEnvironmentVariable("TS_SCHED_DISABLE_BATCHED", previous); }
+    }
+
+    [Fact]
     public async Task Engine_MemoryAdmission_WakesOnExternalRelease_AndCancellation()
     {
         var budget = new MemoryBudget(new[] { new MemoryCharge("gpu", 100) });
@@ -870,11 +908,13 @@ public class ContinuousBatchSchedulerTests
         public void SetEos(int eosId) => _eos = eosId;
         public int CurrentSeqLen => _cacheSeqLen;
         public Action? OnTrim { get; init; }
+        public Action? OnForward { get; init; }
         public int TrimCalls;
         public void TrimIdleMemory() { Interlocked.Increment(ref TrimCalls); OnTrim?.Invoke(); }
 
         public float[] Forward(int[] tokens)
         {
+            OnForward?.Invoke();
             _forwardEntered?.Set();
             if (_releaseForward != null
                 && !_releaseForward.Wait(TimeSpan.FromSeconds(5)))

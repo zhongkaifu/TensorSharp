@@ -46,6 +46,8 @@ public sealed class GgmlCacheBudgetScope : IDisposable
     private ulong _nextToken;
     private Exception? _callbackError;
     private bool _disposed;
+    private bool _disposing;
+    private BudgetReservation? _executionEnvelope;
 
     public GgmlCacheBudgetScope(MemoryBudget budget, IEnumerable<IEnumerable<string>> rankPools)
         : this(budget, rankPools, includeGraphBuffers: false) { }
@@ -108,6 +110,29 @@ public sealed class GgmlCacheBudgetScope : IDisposable
     public bool IncludesGraphBuffers { get; }
     public bool IncludesHostBuffers => _hostPools.Length != 0;
 
+    /// <summary>Route synchronous model execution allocations through an admitted
+    /// request, including callbacks on native worker threads. The caller must
+    /// hold the model compute lock and may not overlap execution or await.</summary>
+    public IDisposable EnterExecution(BudgetReservation envelope)
+    {
+        ArgumentNullException.ThrowIfNull(envelope);
+        lock (_gate)
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            if (_disposing) throw new InvalidOperationException("The GGML budget is being detached.");
+            if (!ReferenceEquals(envelope.Budget, _budget)) throw new ArgumentException("Request belongs to a different budget.", nameof(envelope));
+            if (_executionEnvelope != null) throw new InvalidOperationException("Concurrent or nested GGML execution envelopes are unsupported.");
+            _executionEnvelope = envelope;
+            return new Execution(this);
+        }
+    }
+
+    private sealed class Execution(GgmlCacheBudgetScope owner) : IDisposable
+    {
+        private bool _disposed;
+        public void Dispose() { lock (owner._gate) { if (_disposed) return; owner._executionEnvelope = null; _disposed = true; } }
+    }
+
     public void Dispose()
     {
         // Do not hold _gate while calling native: a callback can already own the
@@ -116,12 +141,19 @@ public sealed class GgmlCacheBudgetScope : IDisposable
         {
             if (_disposed) return;
             lock (_gate)
-                if (_allocations.Count != 0)
+            {
+                if (_allocations.Count != 0 || _executionEnvelope != null)
                     throw new InvalidOperationException("GGML allocations still own budget credit. Stop model work and release covered caches/graphs before disposing the budget scope.");
-            if (GgmlNative.DetachSharedCacheBudget(GCHandle.ToIntPtr(_handle)) != 1)
-                throw new InvalidOperationException("A covered GGML allocation is still in flight. Retry disposal after model work and cleanup finish.");
-            _handle.Free(); // Native detach proves no callback can still use it.
-            _disposed = true;
+                _disposing = true;
+            }
+            try
+            {
+                if (GgmlNative.DetachSharedCacheBudget(GCHandle.ToIntPtr(_handle)) != 1)
+                    throw new InvalidOperationException("A covered GGML allocation is still in flight. Retry disposal after model work and cleanup finish.");
+                _handle.Free(); // Native detach proves no callback can still use it.
+                lock (_gate) _disposed = true;
+            }
+            finally { lock (_gate) _disposing = false; }
         }
     }
 
@@ -131,7 +163,7 @@ public sealed class GgmlCacheBudgetScope : IDisposable
         var owner = Owner(context);
         lock (owner._gate)
         {
-            if (owner._callbackError != null) return 0;
+            if (owner._callbackError != null || owner._disposing || owner._disposed) return 0;
             BudgetReservation? reservation = null;
             try
             {
@@ -143,7 +175,9 @@ public sealed class GgmlCacheBudgetScope : IDisposable
                     && (kind == 0 || kind == 1 || (kind == 2 && owner.IncludesGraphBuffers)))
                     pools = owner._rankPools[rank];
                 else return 0;
-                reservation = owner._budget.TryReserve(pools.Select(pool => new MemoryCharge(pool, bytes)));
+                var charges = pools.Select(pool => new MemoryCharge(pool, bytes));
+                reservation = owner._executionEnvelope == null ? owner._budget.TryReserve(charges)
+                    : owner._executionEnvelope.TryTake(charges);
                 if (reservation == null) return 0;
                 ulong token = checked(++owner._nextToken);
                 owner._allocations.Add(token, reservation);

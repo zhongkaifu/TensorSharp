@@ -9,6 +9,8 @@ using TensorSharp.GGML;
 using TensorSharp.Memory;
 using TensorSharp.Memory.Planning;
 using TensorSharp.Runtime;
+using TensorSharp.Runtime.Paged;
+using TensorSharp.Runtime.Scheduling;
 
 namespace TensorSharp.Models;
 
@@ -87,6 +89,8 @@ public sealed class AdaptiveModelSession : IDisposable
     public const string DevicePool = "adaptive/cuda0";
     private readonly AdaptiveModelMemoryOptions _options;
     private readonly GgmlCacheBudgetScope _nativeBudget;
+    private readonly HostAllocationBudgetScope _hostBudget;
+    private readonly DenseMemoryProfile _profile;
     private readonly bool _ownsBudget;
     private readonly long _hostCacheReserveBytes;
     private readonly long _deviceCacheReserveBytes;
@@ -94,14 +98,16 @@ public sealed class AdaptiveModelSession : IDisposable
 
     private AdaptiveModelSession(ModelBase model, MemoryBudget budget, GgmlCacheBudgetScope nativeBudget,
         InferenceMemoryPlan plan, AdaptiveModelMemoryOptions options, long hostCacheReserveBytes, long deviceCacheReserveBytes,
-        bool ownsBudget)
+        bool ownsBudget, HostAllocationBudgetScope hostBudget, DenseMemoryProfile profile)
     { Model = model; Budget = budget; _nativeBudget = nativeBudget; Plan = plan; _options = options;
-        _hostCacheReserveBytes = hostCacheReserveBytes; _deviceCacheReserveBytes = deviceCacheReserveBytes; _ownsBudget = ownsBudget; }
+        _hostCacheReserveBytes = hostCacheReserveBytes; _deviceCacheReserveBytes = deviceCacheReserveBytes; _ownsBudget = ownsBudget;
+        _hostBudget = hostBudget; _profile = profile; }
 
     public ModelBase Model { get; }
     public MemoryBudget Budget { get; }
     public InferenceMemoryPlan Plan { get; }
     public Exception? AccountingError => _nativeBudget.CallbackError;
+    public (long Bytes, long PeakBytes, int Allocations) HostAllocationUsage => _hostBudget.Usage;
 
     public static AdaptiveModelSession Create(string path, AdaptiveModelMemoryOptions options)
         => CreateCore(path, options, null);
@@ -134,8 +140,10 @@ public sealed class AdaptiveModelSession : IDisposable
         // buffer sizes/rounding, rather than committing the whole forecast and
         // charging those same bytes a second time in allocation callbacks.
         var nativeBudget = new GgmlCacheBudgetScope(budget, new[] { new[] { DevicePool } }, includeGraphBuffers: true, hostPools: [HostPool]);
+        HostAllocationBudgetScope? hostBudget = null;
         try
         {
+            hostBudget = new(budget, [HostPool]);
             WeightStreamingOptions? streaming = plan.SelectedCandidate!.Placement == InferenceWeightPlacement.SsdStreaming
                 ? new(budget, HostPool, [DevicePool], options.StreamingTileBytes, Math.Min(32, plan.SelectedChunkTokens))
                 {
@@ -152,16 +160,16 @@ public sealed class AdaptiveModelSession : IDisposable
             var policy = new ModelMemoryPolicy(options.ContextTokens, plan.SelectedChunkTokens);
             var model = ModelBase.Create(path, BackendType.GgmlCuda, 1, null!, null!, 1, streaming!, policy);
             return new(model, budget, nativeBudget, plan, options, streaming?.HostCacheReserveBytes ?? 0,
-                streaming?.DeviceCacheReserveBytes ?? 0, sharedBudget == null);
+                streaming?.DeviceCacheReserveBytes ?? 0, sharedBudget == null, hostBudget, profile);
         }
         catch (Exception creation)
         {
             // Constructors with a memory policy unwind their owned resources.
             // Never detach a callback with a live native allocation.
-            try { nativeBudget.Dispose(); }
+            try { hostBudget?.Dispose(); nativeBudget.Dispose(); }
             catch (Exception cleanup)
             {
-                throw new AdaptiveModelAllocationException(nativeBudget, budget, new AggregateException(creation, cleanup));
+                throw new AdaptiveModelAllocationException(nativeBudget, budget, new AggregateException(creation, cleanup), hostBudget);
             }
             throw;
         }
@@ -242,8 +250,57 @@ public sealed class AdaptiveModelSession : IDisposable
     {
         if (_disposed) return;
         Model.Dispose();
+        _hostBudget.Dispose();
         _nativeBudget.Dispose();
         _disposed = true;
+    }
+
+    /// <summary>Conservative request-owned execution peak, separate from shared
+    /// weights and snapshot pages. Includes simultaneous old/new KV during
+    /// growth and native graph scratch. It does not certify file-cache RSS or
+    /// driver/GC overhead. Only the qualified serial text lane is supported.</summary>
+    public InferenceMemoryBytes EstimateRequestPeak(int promptTokens, int maximumNewTokens, int prefillChunkTokens)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        int context = checked(promptTokens + maximumNewTokens);
+        if (promptTokens <= 0 || maximumNewTokens <= 0 || context > _options.ContextTokens
+            || prefillChunkTokens <= 0 || prefillChunkTokens > Plan.SelectedChunkTokens)
+            throw new ArgumentOutOfRangeException(nameof(promptTokens), "Request exceeds the admitted context or prefill shape.");
+        return _profile.RequestPeak(context, Math.Min(prefillChunkTokens, promptTokens),
+            Plan.SelectedCandidate!.Placement == InferenceWeightPlacement.SsdStreaming);
+    }
+
+    /// <summary>Combine execution and host-KV peaks on this ledger. Configure the
+    /// engine for explicit non-speculative PerSequence execution, with no prefix
+    /// caching or media. Each allocation consumes the admitted envelope; a
+    /// underestimated shape fails closed instead of borrowing another request's
+    /// credit. Retained buffers remain charged after the request completes.</summary>
+    public RequestMemoryAdmission CreateRequestMemoryAdmission(KvSnapshotOptions snapshots, int blockTokens,
+        int maximumRunningRequests, int prefillChunkTokens, int maximumQueuedRequests = 1024)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (!ReferenceEquals(snapshots.SharedBudget, Budget) || snapshots.RamPool != HostPool)
+            throw new ArgumentException("Snapshots must share this session's host ledger.", nameof(snapshots));
+        var admission = RequestMemoryAdmission.ForKvSnapshots(snapshots, Model.ComputeKVBlockByteSize(blockTokens),
+            blockTokens, maximumRunningRequests, additionalPeak: seq =>
+            {
+                if (seq.MediaSpans.Count != 0) throw new NotSupportedException("Adaptive request forecasting is qualified for text only.");
+                var peak = EstimateRequestPeak(seq.PromptTokens.Count, seq.MaxNewTokens, prefillChunkTokens);
+                return new MemoryCharge[] { new(HostPool, peak.Host), new(DevicePool, peak.Device) };
+            }, maxQueuedRequests: maximumQueuedRequests);
+        return new(Budget, admission.EstimatePeak, maximumQueuedRequests) { EnterSerialExecution = seq =>
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            var envelope = seq.MemoryEnvelope ?? throw new InvalidOperationException("Execution requires an admitted request envelope.");
+            var native = _nativeBudget.EnterExecution(envelope);
+            try { return new ExecutionScope(native, _hostBudget.EnterExecution(envelope)); }
+            catch { native.Dispose(); throw; }
+        } };
+    }
+
+    private sealed class ExecutionScope(IDisposable native, IDisposable host) : IDisposable
+    {
+        public void Dispose() { try { host.Dispose(); } finally { native.Dispose(); } }
     }
 
     internal static InferenceMemoryPlan PlanLoad(DenseMemoryProfile profile, AdaptiveModelMemoryOptions options,
@@ -320,9 +377,10 @@ public sealed class AdaptiveModelSession : IDisposable
 /// forgets the still-live allocation.</summary>
 public sealed class AdaptiveModelAllocationException : InvalidOperationException
 {
-    internal AdaptiveModelAllocationException(GgmlCacheBudgetScope scope, MemoryBudget budget, Exception inner)
+    internal AdaptiveModelAllocationException(GgmlCacheBudgetScope scope, MemoryBudget budget, Exception inner, HostAllocationBudgetScope? hostScope = null)
         : base("Adaptive model construction failed with live native budget owners; accounting remains attached.", inner)
-    { UnreleasedBudgetScope = scope; Budget = budget; }
+    { UnreleasedBudgetScope = scope; Budget = budget; UnreleasedHostBudgetScope = hostScope; }
     public GgmlCacheBudgetScope UnreleasedBudgetScope { get; }
+    public HostAllocationBudgetScope? UnreleasedHostBudgetScope { get; }
     public MemoryBudget Budget { get; }
 }

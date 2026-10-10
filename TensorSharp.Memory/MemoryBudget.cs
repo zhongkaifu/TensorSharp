@@ -9,6 +9,7 @@ public readonly record struct MemoryPoolSnapshot(string Pool, long Capacity, lon
 {
     public long Available => Capacity - Reserved - Committed;
 }
+public readonly record struct MemoryPoolHighWatermark(string Pool, long Owned, long Committed);
 
 public sealed class MemoryPressureException : InvalidOperationException
 {
@@ -25,6 +26,7 @@ public sealed class MemoryBudget
         public long Capacity = capacity;
         public long Reserved;
         public long Committed;
+        public long PeakOwned, PeakCommitted;
     }
     private readonly object _gate = new();
     private readonly Dictionary<string, Pool> _pools = new(StringComparer.Ordinal);
@@ -83,7 +85,12 @@ public sealed class MemoryBudget
         {
             if (normalized.Any(c => c.Bytes > _pools[c.Pool].Capacity - _pools[c.Pool].Reserved - _pools[c.Pool].Committed))
                 return null;
-            foreach (var c in normalized) _pools[c.Pool].Reserved += c.Bytes;
+            foreach (var c in normalized)
+            {
+                var pool = _pools[c.Pool];
+                pool.Reserved += c.Bytes;
+                pool.PeakOwned = Math.Max(pool.PeakOwned, pool.Reserved + pool.Committed);
+            }
             return new BudgetReservation(this, normalized);
         }
     }
@@ -125,6 +132,15 @@ public sealed class MemoryBudget
         }
     }
 
+    /// <summary>Exact ledger high-water marks since construction, including
+    /// reservations that outlive a sampler interval. Committed is instrumented
+    /// payload, Owned includes unused request credit; neither is process RSS.</summary>
+    public IReadOnlyList<MemoryPoolHighWatermark> HighWatermarks()
+    {
+        lock (_gate) return _pools.Select(p => new MemoryPoolHighWatermark(p.Key,
+            p.Value.PeakOwned, p.Value.PeakCommitted)).ToArray();
+    }
+
     /// <summary>Check current headroom without owning it. Intended for bounded cache
     /// reclamation; admission must still use TryReserve because other owners can race.</summary>
     public bool CanReserve(IEnumerable<MemoryCharge> charges)
@@ -155,6 +171,7 @@ public sealed class MemoryBudget
             {
                 _pools[c.Pool].Reserved -= c.Bytes;
                 _pools[c.Pool].Committed += c.Bytes;
+                _pools[c.Pool].PeakCommitted = Math.Max(_pools[c.Pool].PeakCommitted, _pools[c.Pool].Committed);
             }
             reservation.State = 1;
         }
@@ -226,6 +243,7 @@ public sealed class BudgetReservation : IDisposable
         Items = items;
     }
     public IReadOnlyList<MemoryCharge> Charges => Owner.Charges(this);
+    public MemoryBudget Budget => Owner;
     /// <summary>Draw allocation credit without double counting a request's reserved
     /// peak. Disposing the child returns credit while this envelope stays open.</summary>
     public BudgetReservation? TryTake(IEnumerable<MemoryCharge> charges) => Owner.Take(this, charges);

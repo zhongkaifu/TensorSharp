@@ -25,6 +25,28 @@ internal sealed record DenseMemoryProfile(InferenceModelMemory Model, long Fusio
     internal long ResidentHostWeightBytes { get; init; }
     internal long RetainedMappedWeightBytes { get; init; }
 
+    internal InferenceMemoryBytes RequestPeak(int context, int chunk, bool streaming)
+    {
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(context);
+        ArgumentOutOfRangeException.ThrowIfNegativeOrZero(chunk);
+        long host = Model.RecurrentStatePerSequence.Host, device = Model.RecurrentStatePerSequence.Device;
+        foreach (var kv in Model.KvCaches)
+        {
+            long tokens = kv.WindowTokens == 0 ? context : Math.Min(context, kv.WindowTokens);
+            tokens = checked((tokens + kv.AllocationBlockTokens - 1) / kv.AllocationBlockTokens * kv.AllocationBlockTokens);
+            long bytes = checked(tokens * kv.BytesPerToken * kv.LayerCount);
+            if (kv.Tier == MemoryTier.Host) host = checked(host + bytes);
+            else if (kv.Tier == MemoryTier.Accelerator) device = checked(device + bytes);
+            else throw new NotSupportedException("Serial live KV must be in RAM or on device.");
+        }
+        var workspace = Workspace(chunk, context);
+        // Old and replacement states coexist while a cache grows/restores.
+        // Do not subtract arbitrary committed bytes: they can belong to another
+        // request, weight, cache shape, or another engine on the shared ledger.
+        return new(checked(host * 2 + workspace.Host),
+            checked(device * 2 + workspace.Device + (streaming ? LargestProjectionBytes : 0)));
+    }
+
     internal InferenceMemoryBytes Workspace(int chunk, int context)
     {
         // Include logits, both FFN branches, residual/projection scratch and a

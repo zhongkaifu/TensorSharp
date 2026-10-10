@@ -65,6 +65,9 @@ namespace TensorSharp.Runtime.Scheduling
         {
             _model = model ?? throw new ArgumentNullException(nameof(model));
             ArgumentNullException.ThrowIfNull(cfg);
+            if (cfg.MemoryAdmission?.EnterSerialExecution != null
+                && (cfg.EnablePrefixCaching || cfg.Speculation.Enabled || !ExecutionOptions.FromEnvironment().BatchedPathDisabled))
+                throw new NotSupportedException("The serial request allocation adapter requires explicit per-sequence execution with prefix caching and speculation disabled.");
             if (cfg.BlockSize <= 0) cfg = cfg.WithBlockSize(PreferredBlockSize(model));
             _logger = logger ?? NullLogger.Instance;
             _stopRepetition = cfg.StopRepetition;   // cfg is null-checked above

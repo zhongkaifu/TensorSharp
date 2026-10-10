@@ -27,6 +27,12 @@ public sealed class RequestMemoryAdmission
     public Func<SequenceState, IReadOnlyList<MemoryCharge>> EstimatePeak { get; }
     public int MaxQueuedRequests { get; }
 
+    /// <summary>Optional allocation routing for a qualified serial execution
+    /// adapter. Called under the model compute lock around one sequence's work.
+    /// It must consume that sequence's envelope, dispose synchronously, and is
+    /// only supported with the per-sequence, non-speculative execution path.</summary>
+    public Func<SequenceState, IDisposable>? EnterSerialExecution { get; init; }
+
     /// <summary>Build the snapshot portion of request admission from model page
     /// geometry and currently available shared RAM. Divide optional residency
     /// across the intended concurrency instead of forcing every request to swap

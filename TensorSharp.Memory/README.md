@@ -26,6 +26,7 @@ pipelines still need the execution adapters described in
 | Runtime `PagedKvStorage` | Actual capture/inject path uses scoped leases, bounded native scratch, SSD restore and best-effort next-page prefetch |
 | Runtime `RequestMemoryAdmission` | Full peak reservation before prefix materialization, retained through physical release; budget/command wakeups instead of polling |
 | GGML `GgmlCacheBudgetScope` | Optional native lazy-copy/preload allocation charges in an existing managed budget; install before caches, retain credit through physical release |
+| `HostAllocationBudgetScope` | GGML host pool and `HostBuffers` allocations reserve aligned bytes before allocation; retained pool blocks and failed OS frees keep their credit |
 | `GgufMemoryCatalog` | GGUF and split-GGUF tensor regions, original quantized bytes, operator-defined slices |
 
 `ResourceKind` is descriptive metadata, not a model-specific policy switch. The core
@@ -215,6 +216,48 @@ other per-request peaks with `additionalPeak`, and separately charge persistent
 weights/arenas. This helper does not make an incomplete model estimator complete.
 Cold prefixes and other engines' caches still require explicit reclaim coordination.
 
+### Qualified adaptive request accounting
+
+`AdaptiveModelSession` now attaches both the native graph/cache scope and
+`HostAllocationBudgetScope` before loading the model. The host scope covers wired
+GGML pool allocations and owned host weight buffers. Pool reuse keeps the actual
+larger allocation charged; returning a tensor to a pool is not a physical release.
+Failed unmaps remain charged and can be retried. Model teardown trims the returned
+host blocks before detaching the scopes. Failed adaptive construction exposes
+`UnreleasedHostBudgetScope` as well as its native scope when cleanup cannot finish.
+
+For the qualified dense single-rank text path, use
+`session.CreateRequestMemoryAdmission(snapshots, blockTokens, maximumRunningRequests,
+prefillChunkTokens)` with snapshots on that session's shared RAM pool. Create it
+after loading persistent owners and before constructing the engine. Configure
+`TS_SCHED_DISABLE_BATCHED=1`, disable prefix caching and speculation, and keep the
+engine's prefill chunk within `session.Plan.SelectedChunkTokens`. Unsupported
+execution paths are rejected instead of silently bypassing the adapter.
+
+`EstimateRequestPeak` derives live host/device KV and recurrent state from model
+geometry, rounds KV capacity to allocation blocks, allows old/new state to coexist
+during growth, and includes graph workspace and streaming projection headroom.
+Snapshot residency and possible spill are added separately. While each sequence
+executes synchronously under the compute lock, its host/native allocations consume
+its reserved envelope, including native worker callbacks. They cannot borrow a
+different request's unused credit. Closing a request releases only unused credit;
+retained buffers remain charged until physical release. This process-wide adapter
+supports one serialized model lane, not concurrent engines or asynchronous scope use.
+
+`MemoryBudget.HighWatermarks()` gives exact per-pool maxima since construction:
+`Owned` includes unused reservations and committed bytes, while `Committed` is
+instrumented allocation payload. These values are neither process RSS nor an OS
+hard cap. The estimator remains conservative and is not a complete forecast for
+GC/tokenizer memory, mapped-page residency, all native host scratch, vendor heaps,
+media, batched holders or tensor-parallel execution. Shared capacities and request
+residency plans still need refresh at a quiescent policy boundary.
+
+The native paged-attention sessions also use graph-budget allocation/free hooks.
+Their process-owned registry keeps CUDA buffers out of Windows thread destructors;
+quiescent trim releases live and retired workers' cache payload before backend
+teardown. Cache keys include backend identity. This does not permit trimming while
+another model operation is executing.
+
 The working-set API also accepts `ResourcePlacement` entries spanning multiple
 devices. A partial failure releases every acquired pin. `ResourceLeaseSet` can
 retire against a fence covering every rank. CUDA peer copies default **off** because
@@ -396,3 +439,10 @@ These do not establish whole-model weight streaming, media support or
 tensor-parallel snapshot coverage. The design records exact executed coverage,
 known failures and benchmark limitations; generated evidence stays in ignored
 `artifacts/` and is not committed.
+
+[`UnifiedMemory.LongContextProbe`](../eng/validation/UnifiedMemory.LongContextProbe/README.md)
+runs separate reference/candidate processes, records real prompt lengths, admitted
+concurrency, request estimates, exact ledger maxima and observed RSS/device usage.
+Its Linux cgroup wrapper refuses unavailable enforcement. The design records 8K,
+32K and 64K configured-context results, without counting queued requests as
+simultaneously running or logical quotas as physical hard limits.

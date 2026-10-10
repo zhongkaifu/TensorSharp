@@ -10,6 +10,72 @@ namespace InferenceWeb.Tests;
 // Actual device allocation; run with TS_TEST_GGML_BACKEND=cuda and native test hooks.
 public sealed class GgmlGraphBudgetScopeTests
 {
+    [GgmlFact(BackendType.GgmlCuda)]
+    public void PagedAttentionWorkerCacheReturnsBudgetOnGlobalTrimAndRebuildsAfterRefusal()
+    {
+        GgmlBasicOps.EnsureBackendAvailable(GgmlBackendType.Cuda);
+        GgmlBasicOps.ClearHostBufferCache();
+        GgmlBasicOps.ReleaseReuseComputeBuffers();
+        var budget = new MemoryBudget([new("gpu", 64L << 20)]);
+        using var scope = new GgmlCacheBudgetScope(budget, [["gpu"]], true);
+        static float[] Forward()
+        {
+            float[] output = new float[2 * 2 * 64];
+            GgmlBasicOps.PagedAttentionForward(new float[output.Length], new float[16 * 64],
+                Enumerable.Repeat(1f, 16 * 64).ToArray(), output, [0, 2], [2], [0, 1], [0], [0],
+                numSeqs: 1, numTokens: 2, numHeads: 2, numKvHeads: 1, headDim: 64, blockSize: 16, scale: 0.125f);
+            return output;
+        }
+        try
+        {
+            float[]? workerOutput = null;
+            Exception? workerError = null;
+            var worker = new Thread(() => { try { workerOutput = Forward(); } catch (Exception ex) { workerError = ex; } });
+            worker.Start();
+            Assert.True(worker.Join(TimeSpan.FromSeconds(10)));
+            Assert.Null(workerError);
+            Assert.All(workerOutput!, v => Assert.InRange(v, 0.999f, 1.001f));
+            // Thread exit must not cudaFree under Windows DLL_THREAD_DETACH.
+            // The retired cache still owns credit until an explicit trim.
+            Assert.True(budget.Snapshot().Single().Committed > 0);
+            Assert.Throws<InvalidOperationException>(() => scope.Dispose());
+            // Release from a different thread after the original worker exits.
+            GgmlBasicOps.ReleaseReuseComputeBuffers();
+            Assert.Equal(0, scope.ActiveAllocations);
+            Assert.True(budget.TrySetCapacity("gpu", 0));
+            Assert.Throws<InvalidOperationException>(() => Task.Run(Forward).GetAwaiter().GetResult());
+            Assert.Equal(0, budget.Snapshot().Single().Committed);
+            Assert.True(budget.TrySetCapacity("gpu", 64L << 20));
+            Assert.All(Task.Run(Forward).GetAwaiter().GetResult(), v => Assert.InRange(v, 0.999f, 1.001f));
+            Assert.Null(scope.CallbackError);
+        }
+        finally { GgmlBasicOps.ClearHostBufferCache(); GgmlBasicOps.ReleaseReuseComputeBuffers(); }
+        Assert.Equal(0, scope.ActiveAllocations);
+    }
+    [GgmlFact(BackendType.GgmlCuda)]
+    [Trait("Requires", "NativeTestHooks")]
+    public void NativeWorkerAllocationConsumesRequestCreditAndReturnsItOnFree()
+    {
+        using var native = new NativeFixture();
+        var budget = new MemoryBudget([new("gpu", 256)]);
+        using var scope = new GgmlCacheBudgetScope(budget, [["gpu"]], true);
+        using var envelope = budget.Reserve([new("gpu", 256)]);
+        using (scope.EnterExecution(envelope))
+        {
+            IntPtr buffer = Task.Run(() => native.Allocate(0, 256)).GetAwaiter().GetResult();
+            try
+            {
+                Assert.NotEqual(IntPtr.Zero, buffer);
+                Assert.Equal(256, budget.Snapshot().Single().Committed);
+                Assert.Equal(0, budget.Snapshot().Single().Reserved);
+                Assert.Equal(IntPtr.Zero, native.Allocate(0, 1));
+            }
+            finally { if (buffer != IntPtr.Zero) native.Free(buffer); }
+            Assert.Equal(256, budget.Snapshot().Single().Reserved);
+            Assert.Equal(0, budget.Snapshot().Single().Committed);
+        }
+        Assert.Null(scope.CallbackError);
+    }
     [CudaFact("TS_TEST_MODEL_DIR", "gemma-4-e4b", GgmlBackend = BackendType.GgmlCuda)]
     public void SoloGemmaDecodeReturnsGraphCreditOnModelDisposeWithoutBackendShutdown()
     {
