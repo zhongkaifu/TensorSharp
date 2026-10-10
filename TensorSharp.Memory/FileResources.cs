@@ -78,14 +78,18 @@ public sealed class SsdSpillStore : IDisposable
         else Directory.CreateDirectory(_directory, UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
     }
 
-    internal async ValueTask<Snapshot> WriteAsync(IResourceSource source, CancellationToken cancellationToken)
+    internal async ValueTask<Snapshot> WriteAsync(IResourceSource source, CancellationToken cancellationToken,
+        BudgetReservation? allocationOwner = null)
     {
         lock (_gate) { ObjectDisposedException.ThrowIf(_disposed, this); _files++; }
         string path = Path.Combine(_directory, Guid.NewGuid().ToString("N") + ".pending");
         BudgetReservation? reservation = null;
         try
         {
-            reservation = _budget.Reserve(new[] { new MemoryCharge(_pool, MemoryRange.Align(source.ByteLength, 4096)) });
+            var charges = new[] { new MemoryCharge(_pool, MemoryRange.Align(source.ByteLength, 4096)) };
+            reservation = allocationOwner == null ? _budget.Reserve(charges)
+                : _budget.TryReserveFollowing(allocationOwner, charges)
+                    ?? throw new MemoryPressureException("The spill does not fit its owner's reserved SSD budget.");
             using (var handle = File.OpenHandle(path, FileMode.CreateNew, FileAccess.Write, FileShare.None,
                 FileOptions.Asynchronous | FileOptions.SequentialScan))
             {
@@ -101,7 +105,10 @@ public sealed class SsdSpillStore : IDisposable
                     offset += count;
                 }
                 cancellationToken.ThrowIfCancellationRequested();
-                RandomAccess.FlushToDisk(handle);
+                // This process-private swap file is not a restart checkpoint.
+                // Awaited writes make all bytes visible to the reader; forcing
+                // durable media synchronization for every evicted page stalls
+                // decode without providing a recoverable session after a crash.
                 // SafeFileHandle must close before opening the committed reader on Windows.
                 handle.Dispose();
                 string committedPath = Path.ChangeExtension(path, ".bin");

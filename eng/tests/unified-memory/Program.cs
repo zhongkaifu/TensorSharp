@@ -6,6 +6,14 @@ using TensorSharp.Memory;
 var tests = new (string Name, Func<Task> Run)[]
 {
     ("atomic multi-pool reservation and UMA constraints", Cases.Budgets),
+    ("atomic capacity refresh preserves owners and avoids no-op wakeups", Cases.AtomicCapacityRefresh),
+    ("snapshot admission sizes residency from shared headroom and request geometry", Cases.AdaptiveSnapshotAdmission),
+    ("KV pages and spill consume request envelopes without double charging", Cases.SnapshotRequestEnvelope),
+    ("insufficient request SSD credit preserves KV despite free global capacity", Cases.SnapshotEnvelopeRefusal),
+    ("cancelling an active snapshot request releases credit for a correct followup", Cases.SharedSnapshotCancellation),
+    ("speculative prefetch never waits on an active execution lease", Cases.PrefetchLeaseConflict),
+    ("full snapshot replacement skips SSD reads and preserves failed writes", Cases.SnapshotOverwrite),
+    ("engine request admission and KV spill share one physical ledger", Cases.EngineSharedSnapshotAdmission),
     ("parallel reservation pressure", Cases.ConcurrentBudgets),
     ("request envelopes avoid double accounting", Cases.Envelopes),
     ("bounded FIFO request admission and cancellation", Cases.Admission),
@@ -53,6 +61,13 @@ var tests = new (string Name, Func<Task> Run)[]
     ("multi-location working set and collective fence [simulated accelerator]", Cases.MultipleLocations),
 };
 var results = new List<object>();
+int filterIndex = Array.IndexOf(args, "--filter");
+if (filterIndex >= 0)
+{
+    if (filterIndex + 1 == args.Length) throw new ArgumentException("--filter requires a case name substring.");
+    tests = tests.Where(t => t.Name.Contains(args[filterIndex + 1], StringComparison.OrdinalIgnoreCase)).ToArray();
+    if (tests.Length == 0) throw new ArgumentException("No test case matched --filter.");
+}
 int failed = 0;
 foreach (var (name, run) in tests)
 {
@@ -71,10 +86,13 @@ foreach (var (name, run) in tests)
     }
 }
 Console.WriteLine($"{tests.Length - failed}/{tests.Length} passed. CUDA/Metal/Vulkan hardware and production model inference: NOT RUN.");
-if (args.Length == 2 && args[0] == "--json")
+int jsonIndex = Array.IndexOf(args, "--json");
+if (jsonIndex >= 0)
 {
-    Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(args[1]))!);
-    await File.WriteAllTextAsync(args[1], JsonSerializer.Serialize(new
+    if (jsonIndex + 1 == args.Length) throw new ArgumentException("--json requires a file path.");
+    string jsonPath = args[jsonIndex + 1];
+    Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(jsonPath))!);
+    await File.WriteAllTextAsync(jsonPath, JsonSerializer.Serialize(new
     {
         tests = results,
         hardwareInference = "not run",

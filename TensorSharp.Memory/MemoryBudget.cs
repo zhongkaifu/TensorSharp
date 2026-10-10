@@ -28,18 +28,18 @@ public sealed class MemoryBudget
     }
     private readonly object _gate = new();
     private readonly Dictionary<string, Pool> _pools = new(StringComparer.Ordinal);
-    private TaskCompletionSource _changed = NewSignal();
+    private TaskCompletionSource? _changed;
     private static TaskCompletionSource NewSignal() => new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     /// <summary>Capture BEFORE trying admission, then wait if it fails. The signal
     /// completes when releases/capacity changes could allow progress; no polling or
     /// callbacks under the accounting lock are required.</summary>
-    public Task ChangeSignal { get { lock (_gate) return _changed.Task; } }
+    public Task ChangeSignal { get { lock (_gate) return (_changed ??= NewSignal()).Task; } }
     private void Pulse()
     {
         var old = _changed;
-        _changed = NewSignal();
-        old.TrySetResult();
+        _changed = null;
+        old?.TrySetResult();
     }
 
     public MemoryBudget(IEnumerable<MemoryCharge> capacities)
@@ -99,16 +99,40 @@ public sealed class MemoryBudget
 
     /// <summary>Lowering a budget never silently invalidates existing leases.</summary>
     public bool TrySetCapacity(string pool, long capacity)
+        => TrySetCapacities(new[] { new MemoryCharge(pool, capacity) });
+
+    /// <summary>Apply a hardware refresh as one transaction. A live owner in any
+    /// pool prevents every change; unchanged capacities do not wake waiters.</summary>
+    public bool TrySetCapacities(IEnumerable<MemoryCharge> capacities)
     {
-        ArgumentOutOfRangeException.ThrowIfNegative(capacity);
+        ArgumentNullException.ThrowIfNull(capacities);
+        var updates = capacities.ToArray();
+        foreach (var c in updates)
+        {
+            ArgumentException.ThrowIfNullOrWhiteSpace(c.Pool);
+            ArgumentOutOfRangeException.ThrowIfNegative(c.Bytes);
+            if (!_pools.ContainsKey(c.Pool)) throw new ArgumentException($"Unknown pool: {c.Pool}");
+        }
+        if (updates.Select(c => c.Pool).Distinct(StringComparer.Ordinal).Count() != updates.Length)
+            throw new ArgumentException("A capacity update must name each pool at most once.", nameof(capacities));
         lock (_gate)
         {
-            var p = _pools[pool];
-            if (capacity < p.Reserved + p.Committed) return false;
-            p.Capacity = capacity;
-            Pulse();
+            if (updates.Any(c => c.Bytes < _pools[c.Pool].Reserved + _pools[c.Pool].Committed)) return false;
+            bool changed = updates.Any(c => c.Bytes != _pools[c.Pool].Capacity);
+            foreach (var c in updates) _pools[c.Pool].Capacity = c.Bytes;
+            if (changed) Pulse();
             return true;
         }
+    }
+
+    // A spilled/demoted child must use its request's reserved credit while that
+    // request is alive. Retained prefixes outlive the envelope and then compete
+    // directly for free pool capacity. Check and reserve under the same lock.
+    internal BudgetReservation? TryReserveFollowing(BudgetReservation origin, IEnumerable<MemoryCharge> charges)
+    {
+        if (!ReferenceEquals(origin.Owner, this)) throw new ArgumentException("Allocation belongs to a different budget.");
+        lock (_gate)
+            return origin.Parent is { State: 0 } parent ? Take(parent, charges) : TryReserve(charges);
     }
 
     internal void Commit(BudgetReservation reservation)
@@ -132,6 +156,7 @@ public sealed class MemoryBudget
         lock (_gate)
         {
             if (reservation.State == 2) return;
+            bool releasedToPool = false;
             foreach (var c in reservation.Items)
             {
                 if (reservation.State == 0) _pools[c.Pool].Reserved -= c.Bytes;
@@ -145,9 +170,12 @@ public sealed class MemoryBudget
                     parent.Items[index] = parent.Items[index] with { Bytes = checked(parent.Items[index].Bytes + c.Bytes) };
                     _pools[c.Pool].Reserved += c.Bytes;
                 }
+                else if (c.Bytes > 0) releasedToPool = true;
             }
             reservation.State = 2;
-            Pulse();
+            // Returning a page to its live request envelope changes no global
+            // availability. Do not wake every engine blocked on this pool.
+            if (releasedToPool) Pulse();
         }
     }
 

@@ -87,14 +87,16 @@ public sealed class AdaptiveModelSession : IDisposable
     public const string DevicePool = "adaptive/cuda0";
     private readonly AdaptiveModelMemoryOptions _options;
     private readonly GgmlCacheBudgetScope _nativeBudget;
+    private readonly bool _ownsBudget;
     private readonly long _hostCacheReserveBytes;
     private readonly long _deviceCacheReserveBytes;
     private bool _disposed;
 
     private AdaptiveModelSession(ModelBase model, MemoryBudget budget, GgmlCacheBudgetScope nativeBudget,
-        InferenceMemoryPlan plan, AdaptiveModelMemoryOptions options, long hostCacheReserveBytes, long deviceCacheReserveBytes)
+        InferenceMemoryPlan plan, AdaptiveModelMemoryOptions options, long hostCacheReserveBytes, long deviceCacheReserveBytes,
+        bool ownsBudget)
     { Model = model; Budget = budget; _nativeBudget = nativeBudget; Plan = plan; _options = options;
-        _hostCacheReserveBytes = hostCacheReserveBytes; _deviceCacheReserveBytes = deviceCacheReserveBytes; }
+        _hostCacheReserveBytes = hostCacheReserveBytes; _deviceCacheReserveBytes = deviceCacheReserveBytes; _ownsBudget = ownsBudget; }
 
     public ModelBase Model { get; }
     public MemoryBudget Budget { get; }
@@ -102,24 +104,36 @@ public sealed class AdaptiveModelSession : IDisposable
     public Exception? AccountingError => _nativeBudget.CallbackError;
 
     public static AdaptiveModelSession Create(string path, AdaptiveModelMemoryOptions options)
+        => CreateCore(path, options, null);
+
+    /// <summary>Borrow a shared ledger containing HostPool and DevicePool. The
+    /// caller owns capacities; loading/refresh never raises or rewrites them.
+    /// Other RAM owners (including KV snapshots) may use the same ledger. Only
+    /// one process-global GGML scope/model is supported, as in the private form.</summary>
+    public static AdaptiveModelSession Create(string path, AdaptiveModelMemoryOptions options, MemoryBudget budget)
+    {
+        ArgumentNullException.ThrowIfNull(budget);
+        return CreateCore(path, options, budget);
+    }
+
+    private static AdaptiveModelSession CreateCore(string path, AdaptiveModelMemoryOptions options, MemoryBudget? sharedBudget)
     {
         ArgumentNullException.ThrowIfNull(options);
         Validate(options);
         using var gguf = new GgufFile(path);
         var profile = DenseMemoryProfile.Read(gguf, options, ModelBase.RetainsAllHostQuantizedWeights);
         var hardware = InferenceHardwareMemory.CaptureCuda();
-        var budget = new MemoryBudget([new(HostPool, 0), new(DevicePool, 0)]);
-        var plan = PlanLoad(profile, options, hardware, budget);
+        var budget = sharedBudget ?? new MemoryBudget([new(HostPool, 0), new(DevicePool, 0)]);
+        var plan = PlanLoad(profile, options, hardware, budget, sharedBudget != null);
         if (!plan.Accepted)
             throw new MemoryPressureException(string.Join(Environment.NewLine, plan.Rejections.Select(r => r.Reason).Distinct()));
-        foreach (var capacity in plan.Capacities)
-            if (!budget.TrySetCapacity(capacity.Pool, capacity.ProtectedCapacity))
-                throw new MemoryPressureException("Memory owners changed during load admission.");
+        if (sharedBudget == null && !budget.TrySetCapacities(plan.Capacities.Select(c => new MemoryCharge(c.Pool, c.ProtectedCapacity))))
+            throw new MemoryPressureException("Memory owners changed during load admission.");
 
         // Install before model preload. Callback reservations arbitrate actual
         // buffer sizes/rounding, rather than committing the whole forecast and
         // charging those same bytes a second time in allocation callbacks.
-        var nativeBudget = new GgmlCacheBudgetScope(budget, new[] { new[] { DevicePool } }, includeGraphBuffers: true);
+        var nativeBudget = new GgmlCacheBudgetScope(budget, new[] { new[] { DevicePool } }, includeGraphBuffers: true, hostPools: [HostPool]);
         try
         {
             WeightStreamingOptions? streaming = plan.SelectedCandidate!.Placement == InferenceWeightPlacement.SsdStreaming
@@ -138,7 +152,7 @@ public sealed class AdaptiveModelSession : IDisposable
             var policy = new ModelMemoryPolicy(options.ContextTokens, plan.SelectedChunkTokens);
             var model = ModelBase.Create(path, BackendType.GgmlCuda, 1, null!, null!, 1, streaming!, policy);
             return new(model, budget, nativeBudget, plan, options, streaming?.HostCacheReserveBytes ?? 0,
-                streaming?.DeviceCacheReserveBytes ?? 0);
+                streaming?.DeviceCacheReserveBytes ?? 0, sharedBudget == null);
         }
         catch (Exception creation)
         {
@@ -163,20 +177,22 @@ public sealed class AdaptiveModelSession : IDisposable
         long cachedBytes = Model.StreamingWeightUsage?.HostCacheBytes ?? 0;
         var streaming = Model.StreamingWeightUsage;
         long deviceCachedBytes = checked((streaming?.DeviceCacheBytes ?? 0) + (streaming?.DeviceWorkspaceCacheBytes ?? 0));
-        if (Pools(hw, Budget, _options).Any(pool => RequiresIdleTrim(pool, _hostCacheReserveBytes, cachedBytes,
+        if (Pools(hw, Budget, _options, !_ownsBudget).Any(pool => RequiresIdleTrim(pool, _hostCacheReserveBytes, cachedBytes,
                 _deviceCacheReserveBytes, deviceCachedBytes)))
         {
             Model.TrimIdleMemory();
             hw = InferenceHardwareMemory.CaptureCuda();
         }
         bool admitted = true;
-        foreach (var pool in Pools(hw, Budget, _options))
+        var updates = new List<MemoryCharge>();
+        foreach (var pool in Pools(hw, Budget, _options, !_ownsBudget))
         {
             var owners = checked(pool.Accounting.Reserved + pool.Accounting.Committed);
             long desired = DesiredCapacity(pool);
             admitted &= desired >= owners;
-            admitted &= Budget.TrySetCapacity(pool.Pool, Math.Max(owners, desired));
+            updates.Add(new(pool.Pool, Math.Max(owners, desired)));
         }
+        if (_ownsBudget) admitted &= Budget.TrySetCapacities(updates);
         return admitted && AccountingError == null;
     }
 
@@ -217,7 +233,7 @@ public sealed class AdaptiveModelSession : IDisposable
         ArgumentOutOfRangeException.ThrowIfNegative(sourceBytes);
         ArgumentOutOfRangeException.ThrowIfNegative(ceiling);
         if (plan.SelectedCandidate?.Placement != InferenceWeightPlacement.SsdStreaming) return 0;
-        long capacity = plan.Capacities.Single(p => p.Pool == pool).DesiredCapacity;
+        long capacity = plan.Capacities.Single(p => p.Pool == pool).AdditionalAvailable;
         long peak = ExecutionPeak(plan, pool);
         return Math.Min(Math.Min(sourceBytes, ceiling), Math.Max(0, capacity - peak));
     }
@@ -231,7 +247,7 @@ public sealed class AdaptiveModelSession : IDisposable
     }
 
     internal static InferenceMemoryPlan PlanLoad(DenseMemoryProfile profile, AdaptiveModelMemoryOptions options,
-        InferenceHardwareMemory hardware, MemoryBudget budget)
+        InferenceHardwareMemory hardware, MemoryBudget budget, bool sharedBudget = false)
     {
         Validate(options);
         var candidates = new List<InferenceExecutionCandidate>();
@@ -270,20 +286,20 @@ public sealed class AdaptiveModelSession : IDisposable
         }
         return InferenceMemoryPlanner.Plan(new()
         {
-            Pools = Pools(hardware, budget, options), HostPools = [HostPool], DevicePools = [DevicePool],
+            Pools = Pools(hardware, budget, options, sharedBudget), HostPools = [HostPool], DevicePools = [DevicePool],
             Model = profile.Model, Workload = new(options.ContextTokens, options.PrefillTokens, 1, 1), Candidates = candidates
         });
     }
 
-    private static InferenceMemoryPool[] Pools(InferenceHardwareMemory hw, MemoryBudget budget, AdaptiveModelMemoryOptions o)
+    private static InferenceMemoryPool[] Pools(InferenceHardwareMemory hw, MemoryBudget budget, AdaptiveModelMemoryOptions o, bool sharedBudget = false)
     {
         var snapshots = budget.Snapshot().ToDictionary(p => p.Pool);
         return
         [
             new(HostPool, hw.HostTotal, hw.HostAvailable, o.HostHeadroomBytes ?? Math.Max(512L << 20, hw.HostTotal / 16),
-                snapshots[HostPool], o.MaximumHostBytes),
+                snapshots[HostPool], sharedBudget ? Math.Min(o.MaximumHostBytes, snapshots[HostPool].Capacity) : o.MaximumHostBytes),
             new(DevicePool, hw.DeviceTotal, hw.DeviceAvailable, o.DeviceHeadroomBytes ?? GpuMemoryBudget.ResolveHeadroomBytes(hw.DeviceTotal),
-                snapshots[DevicePool], o.MaximumDeviceBytes)
+                snapshots[DevicePool], sharedBudget ? Math.Min(o.MaximumDeviceBytes, snapshots[DevicePool].Capacity) : o.MaximumDeviceBytes)
         ];
     }
 

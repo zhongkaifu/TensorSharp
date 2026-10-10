@@ -58,6 +58,35 @@ Use `--prompt-tokens 256 --steps 16 --widths 2` for a longer bounded-window case
 These cases remain within the model's declared restorable window; they do not
 prove long-context attention beyond that window.
 
+## Shared admission and adaptive model loading
+
+Add `--shared-budget true --adaptive true --resident-pages auto` to test a dense
+single-CUDA model session and its KV pages in one ledger. Default operator ceilings
+are 8 GiB RAM, 12 GiB device, and 4 GiB spill; `--host-bytes` and `--device-bytes`
+override the first two. An unrelated real 64 MiB host allocation is kept alive to
+verify that model disposal releases only its own charges. The scope remains the
+instrumented allocations, not whole-process RAM/VRAM or a cgroup hard limit.
+
+`--resident-pages auto` uses `RequestMemoryAdmission.ForKvSnapshots` and holds
+aside the session's host execution forecast. The old default, `1`, is a deliberate
+per-request one-page pressure test; it can be much slower on a USB HDD or network
+filesystem. Auto mode does not require spills in concurrent engine runs when their
+snapshots fit RAM. The separate full-logit replay still forces real file spill and
+checks all restored bytes and prediction values. Engine requests account for their
+snapshot pages, not unadapted model-owned incremental scratch or live KV.
+
+The JSON distinguishes shared-owner cleanup, numerical replay, concurrency and
+storage residency. Timings are complete engine request wall times (prefill plus
+decode plus swapping), not isolated prefill/decode speeds. Neither budget figures
+nor post-run counters are physical peak RSS/VRAM measurements. Preserve those
+limitations when comparing the managed and tiered arms.
+
+The stress fixture defaults to `--decode-quantum 1`, forcing frequent ownership
+changes. Production `SchedulerConfig` defaults to 256; pass `--decode-quantum 256`
+to measure its swap amortization separately. Both arms receive the same setting.
+Report TTFT as well as total time: longer owner quanta trade fairness for fewer
+snapshot transfers. Neither setting enables the disabled batched decode route.
+
 Dense Qwen 3.5 on single-rank GGML CUDA now supports this route when the checkpoint
 has no MTP layers. Its snapshot includes attention K/V, every GDN convolution
 ring and write index, the delta state, and the M-RoPE position delta. Export

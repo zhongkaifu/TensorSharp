@@ -58,6 +58,7 @@ namespace TensorSharp.Runtime.Paged
         /// <summary>Logical page capacity, not committed RAM. Use MemoryUsage for tiered charges.</summary>
         public long ReservedBytes => (long)_numBlocks * _blockByteSize;
         public bool UsesTieredSnapshots => _tiered != null;
+        internal MemoryBudget? Budget => _tiered?.Budget;
         /// <summary>Budget counters. With a shared budget, includes every owner
         /// of its pools, not only this storage instance.</summary>
         public IReadOnlyList<MemoryPoolSnapshot>? MemoryUsage => _tiered?.Budget.Snapshot();
@@ -65,17 +66,36 @@ namespace TensorSharp.Runtime.Paged
 
         /// <summary>Acquire bytes only for the duration of a synchronous model call.</summary>
         public KvSnapshotLease Acquire(int blockId, ResourceAccess access = ResourceAccess.Read)
+            => Acquire(blockId, access, null);
+
+        public KvSnapshotLease Acquire(int blockId, ResourceAccess access, BudgetReservation? allocationEnvelope)
         {
             CheckBlock(blockId);
             if (access != ResourceAccess.Read && access != ResourceAccess.Write)
                 throw new ArgumentOutOfRangeException(nameof(access));
-            if (_tiered != null) return _tiered.Acquire(blockId, access);
+            if (_tiered != null) return _tiered.Acquire(blockId, access, allocationEnvelope);
+            if (allocationEnvelope != null) throw new InvalidOperationException("Request envelopes require budgeted KV snapshots.");
             EnsureSlab(blockId);
             return new KvSnapshotLease(_slabs[blockId]!, access);
         }
 
         internal Span<byte> CaptureScratch(int bytes) => _tiered!.CaptureScratch(bytes);
-        internal System.Threading.Tasks.Task<bool>? TryPrefetch(int blockId) => _tiered?.TryPrefetch(blockId);
+
+        /// <summary>Publish a freshly captured page. Old spilled bytes are not
+        /// needed for replacement; padding is cleared so the entire new page is
+        /// initialized, including when the model captured only a partial tail.</summary>
+        internal void Store(int blockId, ReadOnlySpan<byte> bytes, BudgetReservation? allocationEnvelope)
+        {
+            CheckBlock(blockId);
+            if (bytes.Length > _blockByteSize) throw new ArgumentOutOfRangeException(nameof(bytes));
+            using var lease = _tiered != null
+                ? _tiered.Acquire(blockId, ResourceAccess.Write, allocationEnvelope, overwrite: true)
+                : Acquire(blockId, ResourceAccess.Write, allocationEnvelope);
+            bytes.CopyTo(lease.Span);
+            lease.Span[bytes.Length..].Clear();
+        }
+        internal System.Threading.Tasks.Task<bool>? TryPrefetch(int blockId, BudgetReservation? allocationEnvelope = null)
+            => _tiered?.TryPrefetch(blockId, allocationEnvelope);
 
         /// <summary>Get a writable span for block <paramref name="blockId"/>. Allocates
         /// the slab on first access. The returned span is exactly <see cref="BlockByteSize"/>

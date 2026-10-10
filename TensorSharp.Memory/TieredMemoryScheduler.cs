@@ -89,9 +89,17 @@ public sealed class TieredMemoryScheduler : IAsyncDisposable
         BudgetReservation? allocationEnvelope = null)
         => AcquireCoreAsync(key, location, access, true, cancellationToken, allocationEnvelope);
 
+    /// <summary>Acquire a mutable resource for complete replacement. The caller
+    /// must overwrite every byte before releasing the lease. A spilled old version
+    /// is not read back; failed allocation still preserves that recovery source.</summary>
+    public ValueTask<ResourceLease> AcquireForOverwriteAsync(ResourceKey key, MemoryLocation location,
+        CancellationToken cancellationToken = default, BudgetReservation? allocationEnvelope = null)
+        => AcquireCoreAsync(key, location, ResourceAccess.Write, true, cancellationToken, allocationEnvelope,
+            discardExisting: true);
+
     private async ValueTask<ResourceLease> AcquireCoreAsync(ResourceKey key, MemoryLocation location,
         ResourceAccess access, bool allowEviction, CancellationToken cancellationToken, BudgetReservation? allocationEnvelope = null,
-        bool waitForConflicts = true)
+        bool waitForConflicts = true, bool discardExisting = false)
     {
         if (!_backends.TryGetValue(location, out var backend)) throw new ArgumentException($"Unknown location: {location}");
         if (access != ResourceAccess.Read && access != ResourceAccess.Write) throw new ArgumentOutOfRangeException(nameof(access));
@@ -143,10 +151,13 @@ public sealed class TieredMemoryScheduler : IAsyncDisposable
                     var reservation = await ReserveWithEvictionAsync(backend.GetAllocationCharges(entry.Resource.ByteLength),
                         allowEviction, cancellationToken, allocationEnvelope).ConfigureAwait(false);
                     provisional = target = await AllocateReplicaAsync(entry, backend, reservation, cancellationToken).ConfigureAwait(false);
-                    if (source != null) await _transfers.CopyAsync(source, target.Buffer, cancellationToken).ConfigureAwait(false);
-                    else if (entry.Version != 0) throw new InvalidOperationException("Mutable resource has lost its authoritative data.");
-                    // Backends initialize new allocations to zero. This is the only
-                    // source-less state: a newly registered mutable resource.
+                    if (!discardExisting)
+                    {
+                        if (source != null) await _transfers.CopyAsync(source, target.Buffer, cancellationToken).ConfigureAwait(false);
+                        else if (entry.Version != 0) throw new InvalidOperationException("Mutable resource has lost its authoritative data.");
+                    }
+                    // Backends initialize new allocations to zero. Source-less
+                    // data is legal only for a new resource or complete overwrite.
                 }
                 cancellationToken.ThrowIfCancellationRequested();
                 if (access == ResourceAccess.Write)
@@ -261,7 +272,7 @@ public sealed class TieredMemoryScheduler : IAsyncDisposable
         // recursively acquire another entry while holding this transition.
         if (location.Tier == MemoryTier.Accelerator && _host != null && !entry.Replicas.ContainsKey(_host.Location))
         {
-            var charge = _budget.TryReserve(_host.GetAllocationCharges(entry.Resource.ByteLength));
+            var charge = _budget.TryReserveFollowing(replica.Charge, _host.GetAllocationCharges(entry.Resource.ByteLength));
             if (charge != null)
             {
                 Replica? provisional = null;
@@ -290,7 +301,7 @@ public sealed class TieredMemoryScheduler : IAsyncDisposable
         // replica exists; this keeps one authoritative recovery path at all times.
         if (!hasRecovery)
         {
-            var snapshot = await _spillStore.WriteAsync(replica.Buffer, cancellationToken).ConfigureAwait(false);
+            var snapshot = await _spillStore.WriteAsync(replica.Buffer, cancellationToken, replica.Charge).ConfigureAwait(false);
             lock (_gate) { entry.Spill = snapshot; _spills++; }
         }
         FreeReplica(entry, replica);
@@ -356,11 +367,16 @@ public sealed class TieredMemoryScheduler : IAsyncDisposable
 
     /// <summary>Best-effort prefetch never evicts demand data. It is a performance
     /// hint; demand always retries the exact source on a miss.</summary>
-    public async ValueTask<bool> TryPrefetchAsync(ResourceKey key, MemoryLocation location, CancellationToken cancellationToken = default)
+    public ValueTask<bool> TryPrefetchAsync(ResourceKey key, MemoryLocation location, CancellationToken cancellationToken = default)
+        => TryPrefetchAsync(key, location, cancellationToken, null);
+
+    public async ValueTask<bool> TryPrefetchAsync(ResourceKey key, MemoryLocation location, CancellationToken cancellationToken,
+        BudgetReservation? allocationEnvelope)
     {
         try
         {
-            using var lease = await AcquireCoreAsync(key, location, ResourceAccess.Read, false, cancellationToken).ConfigureAwait(false);
+            using var lease = await AcquireCoreAsync(key, location, ResourceAccess.Read, false, cancellationToken, allocationEnvelope,
+                waitForConflicts: false).ConfigureAwait(false);
             return true;
         }
         catch (MemoryPressureException) { return false; }

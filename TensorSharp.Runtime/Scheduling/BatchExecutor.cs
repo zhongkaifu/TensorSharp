@@ -2788,8 +2788,7 @@ namespace TensorSharp.Runtime.Scheduling
                 // not confused with full-block layout). For the trailing
                 // partial block we use the partial-byte size; the storage slab
                 // is sized for one full block so partial fits.
-                using var snapshot = _pool.Storage.Acquire(block.Id, TensorSharp.Memory.ResourceAccess.Write);
-                dst.CopyTo(snapshot.Span);
+                _pool.Storage.Store(block.Id, dst, SnapshotEnvelope(seq));
                 block.Used = tokensInBlock;
                 block.HoldsSnapshotBytes = tokensInBlock == _blockSize;
                 // A recurrent snapshot contains the state at the current model
@@ -2841,7 +2840,7 @@ namespace TensorSharp.Runtime.Scheduling
                 long expectedBytes = _model.ComputeKVBlockByteSize(tokensInBlock);
                 if (expectedBytes <= 0) break;
 
-                using var snapshot = _pool.Storage.Acquire(block.Id);
+                using var snapshot = _pool.Storage.Acquire(block.Id, TensorSharp.Memory.ResourceAccess.Read, SnapshotEnvelope(seq));
                 var src = snapshot.ReadOnlySpan;
                 if (src.Length < expectedBytes)
                 {
@@ -2855,7 +2854,7 @@ namespace TensorSharp.Runtime.Scheduling
                 // injection if a second resident page fits. Never evict demand
                 // data to prefetch, and join before any storage may be recycled.
                 var prefetch = b + 1 < blocks && startToken + tokensInBlock < tokensToInject
-                    ? _pool.Storage.TryPrefetch(seq.BlockTable.Blocks[b + 1].Id) : null;
+                    ? _pool.Storage.TryPrefetch(seq.BlockTable.Blocks[b + 1].Id, SnapshotEnvelope(seq)) : null;
                 bool accepted;
                 try { accepted = _model.TryInjectKVBlock(startToken, tokensInBlock, slice); }
                 finally { prefetch?.GetAwaiter().GetResult(); }
@@ -3005,8 +3004,7 @@ namespace TensorSharp.Runtime.Scheduling
                 var dst = CaptureScratch(checked((int)bytes));
                 if (!_model.TryExtractKVBlock(startToken, _blockSize, dst))
                     break;
-                using var snapshot = _pool.Storage.Acquire(block.Id, TensorSharp.Memory.ResourceAccess.Write);
-                dst.CopyTo(snapshot.Span);
+                _pool.Storage.Store(block.Id, dst, SnapshotEnvelope(seq));
                 block.Used = _blockSize;
                 block.HoldsSnapshotBytes = true;
                 block.IsRestorablePrefixEnd = !_model.RequiresPerBlockCapture
@@ -3039,6 +3037,14 @@ namespace TensorSharp.Runtime.Scheduling
                 return fullBlocks;
             return Math.Min(fullBlocks, cap / _blockSize);
         }
+
+        // A shared admission peak includes request-owned pages/spill. Draw from
+        // that envelope rather than competing with its own reserved credit.
+        // Legacy independent snapshot budgets keep their independent contract.
+        private TensorSharp.Memory.BudgetReservation? SnapshotEnvelope(SequenceState seq)
+            => _pool.Storage.Budget != null
+                && ReferenceEquals(_pool.Storage.Budget, _scheduler.Config.MemoryAdmission?.Budget)
+                    ? seq.MemoryEnvelope : null;
 
         private Span<byte> CaptureScratch(int bytes)
         {

@@ -12,7 +12,9 @@ namespace TensorSharp.Models;
 /// cgroup hierarchy. This is an observation for admission forecasts, not an atomic
 /// reservation. A cgroup namespace can hide further ancestors; their usage cannot
 /// be discovered through the namespace-private filesystem. Visible ancestors are
-/// all checked, and read/parse failures never mean unlimited capacity.</summary>
+/// all checked. Observed clean, unmapped inactive file cache may be reclaimed;
+/// active/mapped/dirty/unevictable pages are not treated as free. Missing optional
+/// cache details give no credit; read/parse failures never mean unlimited capacity.</summary>
 internal static class HostMemoryAvailability
 {
     internal static (long Total, long Available) CaptureLinux() => ReadLinux(File.ReadAllText);
@@ -88,6 +90,7 @@ internal static class HostMemoryAvailability
         var mount = mounts.OrderBy(m => m.Root.Length).First();
         string suffix = mount.Root == "/" ? member : member[mount.Root.Length..];
         string leaf = suffix is "" or "/" ? mount.Point : Join(mount.Point, suffix.TrimStart('/'));
+        long reclaimable = ReclaimableLeafCache(leaf);
         string directory = leaf;
         while (true)
         {
@@ -133,7 +136,50 @@ internal static class HostMemoryAvailability
         void Apply(long limit, long used)
         {
             total = Math.Min(total, limit);
-            available = Math.Min(available, used >= limit ? 0 : limit - used);
+            // Only this leaf's observed clean inactive file cache is credited
+            // at every ancestor. Do not borrow siblings' protected working sets.
+            decimal remaining = (decimal)limit - used + Math.Min(used, reclaimable);
+            available = Math.Min(available, (long)Math.Clamp(remaining, 0, limit));
+        }
+        long ReclaimableLeafCache(string leafDirectory)
+        {
+            var stats = ParseStats(Optional(Join(leafDirectory, "memory.stat")));
+            if (stats == null) return 0;
+            if (v2)
+            {
+                // v2 memory.stat aggregates descendants, which may have hard
+                // reclaim protection. With no local-only counter, credit only a
+                // proven leaf; missing observations retain the strict old bound.
+                var tree = ParseStats(Optional(Join(leafDirectory, "cgroup.stat")));
+                if (tree == null || !tree.TryGetValue("nr_descendants", out long children) || children != 0
+                    || !tree.TryGetValue("nr_dying_descendants", out long dying) || dying != 0) return 0;
+            }
+            string[] exclusions = v2
+                ? ["file_dirty", "file_writeback", "file_mapped", "shmem", "unevictable"]
+                : ["dirty", "writeback", "mapped_file", "shmem", "unevictable"];
+            if (!stats.TryGetValue("inactive_file", out long inactive) || exclusions.Any(k => !stats.ContainsKey(k))) return 0;
+            decimal clean = inactive;
+            foreach (string key in exclusions) clean -= stats[key];
+            if (v2)
+            {
+                string? min = Optional(Join(leafDirectory, "memory.min"));
+                string? low = Optional(Join(leafDirectory, "memory.low"));
+                if (min == null || low == null) return 0;
+                clean -= Math.Max(Number(min.Trim(), leafDirectory + "/memory.min"), Number(low.Trim(), leafDirectory + "/memory.low"));
+            }
+            return (long)Math.Max(0, clean);
+        }
+        Dictionary<string, long>? ParseStats(string? text)
+        {
+            if (text == null) return null;
+            var values = new Dictionary<string, long>(StringComparer.Ordinal);
+            foreach (string line in Lines(text))
+            {
+                var fields = line.Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
+                if (fields.Length != 2 || !values.TryAdd(fields[0], Number(fields[1], "cgroup statistics")))
+                    throw Invalid("cgroup statistics");
+            }
+            return values;
         }
         string Read(string path)
         {

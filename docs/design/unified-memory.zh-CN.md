@@ -146,7 +146,7 @@ $$M_{\min}=M_{\text{required state}}+M_{\text{activations}}+M_{\text{scratch}}+M
 
 当某个现有内核的这个工作集也放不下时，需要更细粒度且正确的分块内核，或者 CPU 路径。如果全部合法路径都无法前进，应在加载/准入阶段给出需要的最小容量，而不是启动之后反复 OOM。
 
-SSD 存放两类内容：只读模型权重直接引用原文件；变化的运行状态写入独立配额的临时快照。当前可变状态快照采用有界缓冲、完成落盘后原子改名和 SHA-256 校验，失败/取消不发布目标。原文件不被修改。文件名不含 prompt 或请求内容。进程崩溃后的自动清理和持久恢复尚未实现，不能把临时 swap 文件当成可恢复会话数据库。
+SSD 存放两类内容：只读模型权重直接引用原文件；变化的运行状态写入独立配额的临时快照。当前可变状态快照采用有界缓冲、完成所有写入并关闭句柄后原子改名和 SHA-256 校验，失败/取消不发布目标。临时换页不逐页强制持久化到物理介质。原文件不被修改。文件名不含 prompt 或请求内容。进程崩溃后的自动清理和持久恢复尚未实现，不能把临时 swap 文件当成可恢复会话数据库。
 
 ## 7. 按计算行为选择策略
 
@@ -1542,6 +1542,81 @@ Linux H3 实际权重两项测试通过，含 640×384 下 22–124 帧有限值
 仍需完成：其余 executor/live KV/managed arrays/vendor workspace 的全模型计账；
 硬 RAM 限额和跨请求统一准入；更长上下文与多卡批量 decode；上述事实质量问题的
 独立数值定位；首次 VAE/加载延迟、更多 LoRA/遮罩/多参考及完整音频质量验收。
+
+### 共享请求额度、自动快照驻留与容器准入：2026-10-10
+
+**默认状态：全模型统一内存仍未默认启用。** 本轮使显式共享配置下的模型、
+KV 快照和请求预留实际连接起来，并修复了会阻碍默认启用的确定性问题。
+
+- `AdaptiveModelSession.Create(path, options, sharedBudget)` 借用既有 RAM/device
+  pool，加载与刷新不改写外部容量；计算可选缓存时扣除其他 owner。
+  私有 session 使用原子多 pool 容量刷新，失败不会只改一半。
+- 同一账本上的请求峰值与 KV 页面不再重复计费。捕获、恢复、预取、spill
+  使用原请求的 envelope；请求结束后仍被缓存保留的子分配继续计费。
+  SSD 预留不足时拒绝，不能绕过预留去占用其他全局空闲额度。
+- 预取遇到在途转换或活跃写租约立即返回未命中，不等待正在执行的请求。
+  无容量变化的刷新、子分配归还给仍存活的请求，不再唤醒全局准入等待者。
+- 完整替换快照不读回将被覆盖的 SSD 旧页；分配失败保留旧恢复来源。
+  临时 swap 不逐页执行持久介质同步，仍保留写完、关闭、原子发布和恢复校验。
+- `RequestMemoryAdmission.ForKvSnapshots` 按实际页大小、请求长度、并发数、
+  既有 owner 和执行余量分配 RAM 窗口；能完全驻留的请求不预留无用 spill。
+  它只推导快照部分，其他请求增量仍须由 adapter 提供，不是全模型估算器。
+
+VM 上复现了另一个真实问题：cgroup v1 的约 93.13 GiB 限额中，约 90 GiB
+是文件页缓存，原算法直接用 limit−usage，导致 0.8B 模型也无法准入。
+现在仅保守计入当前叶 cgroup 的干净、未映射、非活跃文件缓存，并扣除
+dirty/writeback/shmem/unevictable；v2 还要求确认无后代并扣除保护额度。
+每个可见祖先和宿主 MemAvailable 仍约束结果，不借用兄弟 cgroup 的缓存。
+缺少完整统计不给回收额度，错误统计仍拒绝。修复后相同 VM 成功加载和运行，
+前后 `memory.failcnt` 都为 0。这里是硬件可用量预测，不是原子的 OS 内存预留。
+计数语义参考 Linux 官方 [v1 memory controller](https://docs.kernel.org/admin-guide/cgroup-v1/memory.html)
+和 [v2 memory controller](https://docs.kernel.org/admin-guide/cgroup-v2.html)；上述保守公式是 TensorSharp 的策略。
+
+实际执行与质量：
+
+- Linux 核心运行时测试 **54/54**；Windows **53/54**，其中既有损坏文件注入
+  在 Windows 报平台不可用，**未计通过**。托管规划、硬件观察、调度与快照
+  集成测试 **115/115、0 skip**。旧二进制分别复现共享额度拒绝和预取等待；
+  新实现通过。取消活跃请求后，剩余请求及新请求输出正确、额度归零。
+- Qwen3.5 0.8B Q8_0：本地 RTX 3080 Laptop 与 VM A40，单请求及 2/4 并发，
+  与隔离执行 token 完全一致。每个数值回放案例比较 **11,919,360** 个 logits，
+  最大差为 **0**，六次完整快照导出/恢复字节一致。
+- 本地 Gemma4 12B QAT UD-Q4_K_XL：1/2 并发及 **12,582,912** 个回放 logits
+  全部一致，最大差 **0**。这不是此前有重复输出问题的 IQ2_M checkpoint。
+- 模型释放后保留独立 owner 的 64 MiB，全部物理释放后账本归零。
+  这些是状态恢复/隔离测试，不是事实问答、长输出或智能体语义质量验收。
+
+以下是整组请求墙钟时间，含 prefill、decode 和换页，**不是分别测得的
+prefill/decode tokens/s**。对照是相同 TensorSharp 逐序列路径的 managed
+快照，不是 llama.cpp；两侧都关闭 batched decode/prefix reuse。
+
+| 模型 / 环境 / 场景 | managed 对照 | 共享预算快照 | 解释 |
+| --- | ---: | ---: | --- |
+| Qwen0.8B / 本地 / 2 并发、短提示 | 1.696 s | 1.738 s | 最终实现两个独立进程平均；auto 驻留、0 spill |
+| Qwen0.8B / 本地 / 4 并发、短提示 | 3.396 s | 3.412 s | 同上；0 spill |
+| Gemma12B QAT Q4 / 本地 / 2 并发 | 3.787 s | 3.672 s | 单次；0 spill，不宣称稳定加速 |
+| Qwen0.8B / A40 / 2 并发、短提示 | 2.079 s | 2.453 s | 单次；此项仍有 18% 墙钟差距 |
+| Qwen0.8B / A40 / 4 并发、短提示 | 4.581 s | 4.593 s | 单次；0 spill |
+| Qwen0.8B / A40 / 1 GiB RAM + 4 GiB device、长一些的提示、量子 1 | 6.068 s | 65.674 s | 48 次 spill，约 5291 MiB 恢复传输；压力性能未达标 |
+| 同一小账本与提示、使用现有默认量子 256 | 3.055 s | 3.052 s | 0 spill；请求 TTFT 约 2.75/2.97 s，不能等同严格逐 token 公平性 |
+
+常规案例账本上限为 8 GiB RAM + 12 GiB device；小账本案例为 1 + 4 GiB。
+它们**不是 RSS/物理 VRAM 硬限**，本探针未采样物理峰值。小账本提示最小
+256 tokens、context 1024，不算长上下文验收。`--decode-quantum 1` 是强制
+频繁换页的压力配置，现有生产默认是 256。本地强制每请求一页时耗时
+44.33 s，I/O 调整后 46.12 s，未测得收益；auto 驻留才消除了此处不必要换页。
+本地 spill 目录实际位于 Seagate USB HDD，VM `/workspace` 是网络 FUSE；
+没有把它们称为实测 NVMe SSD。单次/两次测量、未锁定时钟，不能当通用性能保证。
+
+GGML 始终未修改，revision 为 `ffa4e8b80930029a35991f94e7c8a93cd67730ab`。
+生成报表/JSON/日志位于忽略的 `artifacts/shared-admission-20261010/`；远端
+归档 32 个文件经 SHA-256 清单验证。复用入口见
+`eng/validation/UnifiedMemory.ModelProbe/README.md`。
+
+剩余默认启用门槛：全模型 live KV/holder/managed/vendor workspace 计账；
+所有 adapter 的完整请求峰值；跨 owner/引擎缓存回收与多模型 GGML scope；
+较小预算下吞吐和交互公平性的兼顾；真正长上下文、物理内存硬限、更多多模态
+与工具调用质量验收。不能因为本轮明确场景通过就全局切换默认值。
 
 ## 15. 后续实际接入与硬件验证入口
 

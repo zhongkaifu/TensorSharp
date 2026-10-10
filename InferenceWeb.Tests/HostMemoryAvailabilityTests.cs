@@ -10,6 +10,42 @@ public sealed class HostMemoryAvailabilityTests
     private const long GiB = 1L << 30;
 
     [Fact]
+    public void V1CreditsOnlyOwnCleanInactiveCacheNotHierarchicalOrActiveCache()
+    {
+        var f = V1();
+        V1Limit(f, "/cg/team/job", 4 * GiB, 4 * GiB);
+        V1Limit(f, "/cg/team", 8 * GiB, 8 * GiB);
+        f["/cg/team/job/memory.stat"] = $"inactive_file {3 * GiB}\ndirty {GiB / 4}\nwriteback {GiB / 4}\nmapped_file {GiB / 4}\nshmem {GiB / 4}\nunevictable 0\nactive_file {8 * GiB}\ntotal_inactive_file {16 * GiB}\n";
+        Assert.Equal((4 * GiB, 2 * GiB), Read(f));
+        f["/cg/team/job/memory.stat"] = "inactive_file 100\ndirty 200\nwriteback 0\nmapped_file 0\nshmem 0\nunevictable 0";
+        Assert.Equal((4 * GiB, 0L), Read(f));
+    }
+
+    [Fact]
+    public void V2CreditsVerifiedLeafCacheWhileRespectingProtectionAndHostAvailability()
+    {
+        var f = V2("/job"); Limit(f, "/cg/job", 4 * GiB, 4 * GiB);
+        f["/cg/job/cgroup.stat"] = "nr_descendants 0\nnr_dying_descendants 0";
+        f["/cg/job/memory.stat"] = $"inactive_file {3 * GiB}\nfile_dirty 0\nfile_writeback 0\nfile_mapped 0\nshmem 0\nunevictable 0";
+        f["/cg/job/memory.min"] = GiB.ToString(); f["/cg/job/memory.low"] = "0";
+        Assert.Equal((4 * GiB, 2 * GiB), Read(f));
+        f["/proc/meminfo"] = MemInfo(16 * GiB, GiB);
+        Assert.Equal((4 * GiB, GiB), Read(f));
+        f["/cg/job/cgroup.stat"] = "nr_descendants 1\nnr_dying_descendants 0";
+        Assert.Equal((4 * GiB, 0L), Read(f));
+    }
+
+    [Fact]
+    public void MissingCacheDetailsNeverRelaxQuotaAndMalformedStatsFailClosed()
+    {
+        var f = V1(); V1Limit(f, "/cg/team/job", GiB, GiB); V1Limit(f, "/cg/team", 2 * GiB, GiB);
+        f["/cg/team/job/memory.stat"] = $"inactive_file {GiB}";
+        Assert.Equal((GiB, 0L), Read(f));
+        f["/cg/team/job/memory.stat"] = "inactive_file -1";
+        Assert.Throws<IOException>(() => Read(f));
+    }
+
+    [Fact]
     public void V2UsesTheTightestRemainingAncestorQuotaIncludingSiblingUsage()
     {
         var f = V2("/team/job");

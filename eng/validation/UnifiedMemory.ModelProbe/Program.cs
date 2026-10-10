@@ -13,8 +13,8 @@ using TensorSharp.Runtime.Scheduling;
 var options = new Dictionary<string, string>(StringComparer.Ordinal);
 for (int i = 0; i < args.Length; i += 2)
 {
-    if (i + 1 == args.Length || args[i] is not ("--model" or "--json" or "--widths" or "--steps" or "--prompt-tokens" or "--backend" or "--expect-unsupported"))
-        throw new ArgumentException("Use --model path --json path --widths 1,2,4,8,16 --steps 8 --prompt-tokens 64 --backend ggml_cuda|ggml_cpu --expect-unsupported true|false.");
+    if (i + 1 == args.Length || args[i] is not ("--model" or "--json" or "--widths" or "--steps" or "--prompt-tokens" or "--backend" or "--expect-unsupported" or "--shared-budget" or "--adaptive" or "--host-bytes" or "--device-bytes" or "--resident-pages" or "--decode-quantum"))
+        throw new ArgumentException("Use --model path --json path --widths 1,2,4,8,16 --steps 8 --prompt-tokens 64 --backend ggml_cuda|ggml_cpu --expect-unsupported true|false --shared-budget true|false --adaptive true|false --resident-pages 1|auto --decode-quantum 1.");
     options.Add(args[i], args[i + 1]);
 }
 string modelPath = Path.GetFullPath(options["--model"]);
@@ -23,6 +23,13 @@ int[] widths = options.GetValueOrDefault("--widths", "1,2,4,8,16").Split(',').Se
 int steps = int.Parse(options.GetValueOrDefault("--steps", "8"));
 int promptTokens = int.Parse(options.GetValueOrDefault("--prompt-tokens", "64"));
 bool expectUnsupported = bool.Parse(options.GetValueOrDefault("--expect-unsupported", "false"));
+bool sharedAdmission = bool.Parse(options.GetValueOrDefault("--shared-budget", "false"));
+bool adaptive = bool.Parse(options.GetValueOrDefault("--adaptive", "false"));
+string residentPages = options.GetValueOrDefault("--resident-pages", "1");
+int decodeQuantum = int.Parse(options.GetValueOrDefault("--decode-quantum", "1"));
+ArgumentOutOfRangeException.ThrowIfNegativeOrZero(decodeQuantum);
+if (residentPages is not ("1" or "auto")) throw new ArgumentException("--resident-pages must be 1 or auto.");
+if (adaptive && !sharedAdmission) throw new ArgumentException("--adaptive requires --shared-budget true.");
 BackendType backend = options.GetValueOrDefault("--backend", "ggml_cuda") switch
 {
     "ggml_cuda" => BackendType.GgmlCuda,
@@ -62,15 +69,39 @@ long blockBytes = 0;
 long ramBytes = 0;
 ModelBase? loadedModel = null;
 bool modelCleanupDeferred = false;
+MemoryBudget? sharedBudget = null;
+AdaptiveModelSession? session = null;
+BudgetReservation? unrelatedOwner = null;
+IResourceBuffer? unrelatedBuffer = null;
+object? sharedAfterModelDispose = null;
+object? sharedAfterAllDispose = null;
+object? adaptivePlan = null;
 try
 {
-    var model = loadedModel = ModelBase.Create(modelPath, backend);
+    if (sharedAdmission)
+    {
+        sharedBudget = new([new(AdaptiveModelSession.HostPool, long.Parse(options.GetValueOrDefault("--host-bytes", (8L << 30).ToString()))),
+            new(AdaptiveModelSession.DevicePool, long.Parse(options.GetValueOrDefault("--device-bytes", (12L << 30).ToString()))), new("probe/ssd", 4L << 30)]);
+        unrelatedOwner = sharedBudget.Reserve([new(AdaptiveModelSession.HostPool, 64 << 20)]);
+        unrelatedBuffer = await new HostMemoryBackend(AdaptiveModelSession.HostPool).AllocateAsync(64 << 20);
+        unrelatedOwner.Commit();
+    }
+    if (adaptive)
+    {
+        if (backend != BackendType.GgmlCuda) throw new ArgumentException("Adaptive probe requires CUDA.");
+        session = AdaptiveModelSession.Create(modelPath, new(1024, 512), sharedBudget!);
+        adaptivePlan = session.Plan;
+    }
+    var model = loadedModel = session?.Model ?? ModelBase.Create(modelPath, backend);
     SampleNativeCaches("loaded");
     blockBytes = model.ComputeKVBlockByteSize(blockSize);
     capabilities = new { model.SupportsKVStateSnapshot, model.SupportsCrossSequenceKvReuse,
         model.RequiresPerBlockCapture, model.MaxReusablePrefixTokens, model.KVStateFingerprint };
     ramBytes = checked(2 * Align(Math.Max(blockBytes, 1)) + Align(transferBytes));
     KvSnapshotOptions snapshotOptions = new(ramBytes, Math.Max(1L << 30, blockBytes * 1024), spillDirectory, transferBytes);
+    KvSnapshotOptions engineSnapshotOptions = sharedAdmission
+        ? KvSnapshotOptions.FromSharedBudget(sharedBudget!, AdaptiveModelSession.HostPool, "probe/ssd", spillDirectory, transferBytes)
+        : snapshotOptions;
     if (expectUnsupported)
     {
         try { using var unused = new InferenceEngine(model, Config(2, snapshotOptions)); }
@@ -117,11 +148,11 @@ try
             if (runs.Count / 2 % 2 == 0)
             {
                 baseline = await RunAndRecord(model, width, null, "managed", Prompt);
-                tiered = await RunAndRecord(model, width, snapshotOptions, "tiered", Prompt);
+                tiered = await RunAndRecord(model, width, engineSnapshotOptions, "tiered", Prompt);
             }
             else
             {
-                tiered = await RunAndRecord(model, width, snapshotOptions, "tiered", Prompt);
+                tiered = await RunAndRecord(model, width, engineSnapshotOptions, "tiered", Prompt);
                 baseline = await RunAndRecord(model, width, null, "managed", Prompt);
             }
             if (baseline.Error != null || tiered.Error != null)
@@ -141,7 +172,7 @@ try
             }
             // A solo request never swaps with prefix capture disabled. It is a
             // timing/output control, and cannot count as spill/restore coverage.
-            if (width > 1 && tiered.Residency is not { Spills: > 0, Loads: > 0 })
+            if (width > 1 && residentPages != "auto" && tiered.Residency is not { Spills: > 0, Loads: > 0 })
                 failures.Add($"width {width}: did not exercise SSD spill and restoration.");
             SampleNativeCaches($"width-{width}-completed");
         }
@@ -217,7 +248,17 @@ try
 catch (Exception ex) { error = ex.ToString(); Console.Error.WriteLine(error); }
 if (!modelCleanupDeferred)
 {
-    try { loadedModel?.Dispose(); }
+    try
+    {
+        if (session != null) session.Dispose(); else loadedModel?.Dispose();
+        sharedAfterModelDispose = sharedBudget?.Snapshot();
+        if (sharedBudget != null)
+            Require(sharedBudget.Snapshot().All(p => p.Reserved == 0
+                && p.Committed == (p.Pool == AdaptiveModelSession.HostPool ? 64 << 20 : 0)),
+                "Model/engine disposal lost another owner's credit or retained its own allocations.");
+        unrelatedBuffer?.Dispose(); unrelatedOwner?.Dispose();
+        sharedAfterAllDispose = sharedBudget?.Snapshot();
+    }
     catch (Exception ex) { error = (error == null ? "" : error + "\n") + ex; }
 }
 bool passed = error == null && failures.Count == 0;
@@ -235,6 +276,10 @@ await File.WriteAllTextAsync(output, JsonSerializer.Serialize(new
     Native = native, RuntimeSha256 = Hash(typeof(InferenceEngine).Assembly.Location),
     ModelsSha256 = Hash(typeof(ModelBase).Assembly.Location), ProbeSha256 = Hash(typeof(EngineRun).Assembly.Location),
     Capabilities = capabilities, BlockBytes = blockBytes, SnapshotRamBytes = ramBytes,
+    SharedAdmission = sharedAdmission, Adaptive = adaptive, AdaptivePlan = adaptivePlan,
+    ResidentPages = residentPages, DecodeQuantum = decodeQuantum,
+    SharedAfterModelDispose = sharedAfterModelDispose, SharedAfterAllDispose = sharedAfterAllDispose,
+    SharedContract = "When enabled, requests reserve either one resident snapshot page or an automatic resident window, and aligned spill pages where required. Scratch/staging and model buffers have separate lifetimes in the same ledger. Managed baseline and numerical replay retain their original storage. This is not a complete model/request peak or a whole-process cap.",
     PromptFixtureKind = "Complete model chat template with non-thinking assistant generation suffix; distinct counting requests; padded within user content to the requested minimum token count.",
     MinimumPromptTokens = promptTokens, PromptFixtures = promptFixtures,
     ExpectedUnsupported = expectUnsupported, RejectedUnsupported = rejectedUnsupported,
@@ -254,11 +299,20 @@ SchedulerConfig Config(int width, KvSnapshotOptions? snapshot) => new()
 {
     BlockSize = blockSize, NumBlocks = 512, MaxNumRunningSequences = width,
     MaxNumBatchedTokens = blockSize * width, MaxPrefillChunkSize = blockSize, SoloPrefillChunkSize = blockSize,
-    DecodeQuantumTokens = 1, EnablePrefixCaching = false, StopRepetition = false, KvSnapshots = snapshot,
+    DecodeQuantumTokens = decodeQuantum, EnablePrefixCaching = false, StopRepetition = false, KvSnapshots = snapshot,
+    MemoryAdmission = snapshot?.SharedBudget is { } budget ? residentPages == "auto"
+        ? RequestMemoryAdmission.ForKvSnapshots(snapshot, blockBytes, blockSize, width,
+            executionHeadroomBytes: session?.Plan.PoolPeaks.Where(p => p.Pool == AdaptiveModelSession.HostPool)
+                .Select(p => Math.Max(p.Prefill, p.Decode)).Single() ?? 0)
+        : new(budget, seq =>
+        [new(snapshot.RamPool, Align(blockBytes)),
+         new(snapshot.SsdPool, checked(((seq.PromptTokens.Count + (long)seq.MaxNewTokens + blockSize - 1) / blockSize)
+            * ((blockBytes + 4095) / 4096 * 4096)))]) : null,
 };
 async Task<EngineRun> RunEngine(ModelBase model, int width, KvSnapshotOptions? snapshot, string mode, Func<int, int[]> prompt)
 {
     model.ResetKVCache();
+    if (session != null && !session.RefreshCapacity()) throw new MemoryPressureException("Adaptive refresh refused new work.");
     var gate = new ComputeGate(); gate.Close();
     using var engine = new InferenceEngine(model, Config(width, snapshot)) { ComputeGate = gate };
     var sequences = Enumerable.Range(0, width).Select(rank => new SequenceState($"{mode}-{width}-{rank}",
@@ -294,7 +348,8 @@ async Task<EngineRun> RunEngine(ModelBase model, int width, KvSnapshotOptions? s
     engine.Dispose();
     var afterDispose = engine.SnapshotMemoryUsage;
     if (budget?.Any(p => p.Reserved + p.Committed > p.Capacity) == true
-        || afterDispose?.Any(p => p.Reserved != 0 || p.Committed != 0) == true)
+        || (snapshot?.SharedBudget == null && afterDispose?.Any(p => p.Reserved != 0 || p.Committed != 0) == true)
+        || (snapshot?.SharedBudget != null && afterDispose?.Any(p => p.Pool == snapshot.SsdPool && (p.Reserved != 0 || p.Committed != 0)) == true))
         runError = (runError == null ? "" : runError + "\n") + "Snapshot budget exceeded or charges leaked at disposal.";
     var rows = sequences.Select(s => new RequestRun(s.PromptTokens.ToArray(), s.OutputTokens.ToArray(),
         s.Status.ToString(), s.FinishReason, s.FirstTokenAt is { } first && released is { } start

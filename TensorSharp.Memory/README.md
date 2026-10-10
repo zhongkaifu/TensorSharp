@@ -196,6 +196,25 @@ Retained allocations must be charged separately or drawn from that envelope so
 closing the request does not forget live memory. Estimates are not inferred from
 model labels, and this policy is not automatically enabled for unadapted models.
 
+When `KvSnapshots.SharedBudget` and `MemoryAdmission.Budget` are the same instance,
+the executor automatically draws page/restore/prefetch allocations from the request
+envelope. SSD spill and accelerator demotion follow the original allocation's live
+envelope too. An insufficient envelope fails even if unrelated global credit is
+available. After the envelope closes, retained prefix allocations remain charged;
+their later relocation competes for global free capacity. Capture scratch and
+transfer buffers are charged once for the engine, outside request peaks.
+
+`RequestMemoryAdmission.ForKvSnapshots(options, blockBytes, blockTokens,
+maxRunningRequests, executionHeadroomBytes, additionalPeak)` derives the snapshot
+portion from actual model page geometry and shared headroom. It divides optional
+RAM residency across planned concurrency and reserves spill space only when the
+request cannot stay fully resident. Construct it before the engine allocates its
+scratch/staging, after loading persistent owners. Recreate the policy at a quiescent
+boundary when workload/capacity policy changes; submitted peaks stay fixed. Supply
+other per-request peaks with `additionalPeak`, and separately charge persistent
+weights/arenas. This helper does not make an incomplete model estimator complete.
+Cold prefixes and other engines' caches still require explicit reclaim coordination.
+
 The working-set API also accepts `ResourcePlacement` entries spanning multiple
 devices. A partial failure releases every acquired pin. `ResourceLeaseSet` can
 retire against a fence covering every rank. CUDA peer copies default **off** because
@@ -278,6 +297,23 @@ substituted. A new request geometry needs a new plan at an idle boundary.
 See [AdaptiveMemoryProbe](../eng/validation/AdaptiveMemoryProbe/README.md) for
 actual resident comparisons and their model/device limits.
 
+The overload `AdaptiveModelSession.Create(path, options, sharedBudget)` borrows
+existing `AdaptiveModelSession.HostPool` and `DevicePool` constraints. It neither
+raises nor rewrites caller-owned capacities, accounts for existing owners when
+planning optional caches, and returns only its own credits at disposal. Host
+staging hooks are enabled as well as routed device/graph hooks. This does not
+permit a second simultaneous process-global GGML model/scope. Private session
+capacity refresh uses `MemoryBudget.TrySetCapacities` to update pools atomically;
+a failed shrink changes none. No-op refreshes and credit returned to a live request
+envelope do not wake engines waiting for globally available capacity.
+
+Linux observations include a conservative portion of the current cgroup's clean
+inactive file cache, so an idle container filled by model reads is not mistaken
+for anonymous-memory exhaustion. Active, dirty, mapped, shared and unevictable
+pages are excluded; v2 requires a verified leaf with protection counters. The
+same leaf credit is bounded by every visible ancestor and `/proc/meminfo`.
+These observations remain forecasts with safety headroom, not atomic OS quotas.
+
 ## Ownership and failure rules
 
 - A resource key includes owner/revision, epoch and name. Tenant or adapter-specific
@@ -303,6 +339,9 @@ actual resident comparisons and their model/device limits.
 - Spill restore checks its hash before publishing the destination. These files are
   temporary swap state, not durable restart checkpoints. No persistent KV sharing,
   crash recovery, encryption layer, multi-node transport or disk LRU is implemented.
+  Writes complete and the file closes before atomic publication, without forcing
+  per-page durable media synchronization. A complete snapshot overwrite avoids
+  reading the superseded SSD version; allocation failure retains the old source.
 - Close order: quiesce execution, unregister/dispose scheduler, dispose spill store,
   dispose transfer buffers, close source catalogs/backend contexts.
 

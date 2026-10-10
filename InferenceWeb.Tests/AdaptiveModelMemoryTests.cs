@@ -68,4 +68,27 @@ public class AdaptiveModelMemoryTests
         Assert.Throws<ArgumentOutOfRangeException>(() => new ModelMemoryPolicy(0, 1));
         Assert.Equal(512, new ModelMemoryPolicy(4096, 512).PrefillChunkTokens);
     }
+
+    [Fact]
+    public void SharedLedgerCeilingsAndExistingOwnersConstrainPlacementAndCaches()
+    {
+        var budget = new MemoryBudget([new(AdaptiveModelSession.HostPool, 8 * GiB), new(AdaptiveModelSession.DevicePool, GiB)]);
+        using var owner = budget.Reserve([new(AdaptiveModelSession.HostPool, 2 * GiB), new(AdaptiveModelSession.DevicePool, 256 << 20)]);
+        owner.Commit();
+        var before = budget.Snapshot().ToArray();
+        var plan = AdaptiveModelSession.PlanLoad(Profile(), new(2048, 512),
+            new(32 * GiB, 20 * GiB, 16 * GiB, 14 * GiB), budget, sharedBudget: true);
+        Assert.True(plan.Accepted);
+        Assert.Equal(InferenceWeightPlacement.SsdStreaming, plan.SelectedCandidate!.Placement);
+        Assert.Equal(before, budget.Snapshot());
+        var host = plan.Capacities.Single(p => p.Pool == AdaptiveModelSession.HostPool);
+        Assert.Equal(6 * GiB, host.AdditionalAvailable);
+        var device = plan.Capacities.Single(p => p.Pool == AdaptiveModelSession.DevicePool);
+        long peak = plan.PoolPeaks.Where(p => p.Pool == AdaptiveModelSession.DevicePool).Select(p => Math.Max(p.Prefill, p.Decode)).Single();
+        Assert.Equal(Math.Max(0, device.AdditionalAvailable - peak), AdaptiveModelSession.DeviceCacheLimit(plan, 4 * GiB, long.MaxValue));
+        Assert.True(budget.TrySetCapacity(AdaptiveModelSession.DevicePool, 256 << 20));
+        var rejected = AdaptiveModelSession.PlanLoad(Profile(), new(2048, 512),
+            new(32 * GiB, 20 * GiB, 16 * GiB, 14 * GiB), budget, sharedBudget: true);
+        Assert.False(rejected.Accepted);
+    }
 }

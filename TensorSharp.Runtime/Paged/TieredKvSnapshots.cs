@@ -54,7 +54,7 @@ internal sealed class TieredKvSnapshots : IDisposable
         Scheduler = new(Budget, new[] { _host }, _transfers, _spill, _host.Location);
     }
 
-    public KvSnapshotLease Acquire(int blockId, ResourceAccess access)
+    public KvSnapshotLease Acquire(int blockId, ResourceAccess access, BudgetReservation? allocationEnvelope, bool overwrite = false)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         if (!_keys.TryGetValue(blockId, out var key))
@@ -63,7 +63,10 @@ internal sealed class TieredKvSnapshots : IDisposable
             Scheduler.Register(new(key, _blockBytes, ResourceKind.KvPage, Mutable: true));
             _keys.Add(blockId, key);
         }
-        var lease = Scheduler.AcquireAsync(key, _host.Location, access).AsTask().GetAwaiter().GetResult();
+        var pending = overwrite
+            ? Scheduler.AcquireForOverwriteAsync(key, _host.Location, allocationEnvelope: allocationEnvelope)
+            : Scheduler.AcquireAsync(key, _host.Location, access, allocationEnvelope: allocationEnvelope);
+        var lease = pending.AsTask().GetAwaiter().GetResult();
         return new KvSnapshotLease(lease, access);
     }
 
@@ -74,11 +77,11 @@ internal sealed class TieredKvSnapshots : IDisposable
         return new Span<byte>((void*)_scratch.Pointer, bytes);
     }
 
-    public Task<bool> TryPrefetch(int blockId)
+    public Task<bool> TryPrefetch(int blockId, BudgetReservation? allocationEnvelope)
     {
         ObjectDisposedException.ThrowIf(_disposed, this);
         return _keys.TryGetValue(blockId, out var key)
-            ? Scheduler.TryPrefetchAsync(key, _host.Location).AsTask() : Task.FromResult(false);
+            ? Scheduler.TryPrefetchAsync(key, _host.Location, default, allocationEnvelope).AsTask() : Task.FromResult(false);
     }
 
     public void Release(int blockId)
