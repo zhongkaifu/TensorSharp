@@ -9,6 +9,7 @@
 // MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the BSD-3-Clause License for more details.
 
 #include "ggml_ops_internal.h"
+#include "ggml_ops_q8_weight_policy.h"
 
 using namespace tsg;
 
@@ -278,7 +279,7 @@ TSG_EXPORT int TSGgml_Qwen35GdnLayerTP(
             ggml_tensor* normed = ggml_mul(ctx, ggml_rms_norm(ctx, hidden_t, eps), attn_norm_w);
 
             // Packed in-projection: [Q | K | V | Z | beta | alpha] for this rank's heads.
-            ggml_tensor* packed = ggml_mul_mat(ctx, inproj_w, normed);   // [packed_dim, N]
+            ggml_tensor* packed = tsg::weight_mul_mat(ctx, inproj_w, normed, inproj_w_data); // [packed_dim, N]
             const std::size_t f32 = sizeof(float);
 
             ggml_tensor* qkv_v = ggml_view_2d(ctx, packed, qkv_dim, N, packed->nb[1], 0);

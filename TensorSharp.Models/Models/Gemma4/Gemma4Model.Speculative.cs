@@ -96,7 +96,11 @@ namespace TensorSharp.Models
         // (n-gram) verifies on every Gemma 4 checkpoint, draft GGUF or not - which
         // is what TensorAgent's tool loops need, since the assistant GGUF is an
         // optional download there. The gate is the backend alone.
-        public bool SpeculationProfitable => IsGgmlBackend || _backend == BackendType.Cuda;
+        public string SpeculationRefusal => HasStreamingWeights
+            ? "File-backed Gemma4 weights support Forward/ForwardRefill only; speculative verification (including N-gram) is unsupported."
+            : null;
+
+        public bool SpeculationProfitable => !HasStreamingWeights && (IsGgmlBackend || _backend == BackendType.Cuda);
 
         /// <summary>
         /// Seven drafts, so a verify is EIGHT rows: the last row count ggml's
@@ -175,6 +179,7 @@ namespace TensorSharp.Models
         /// </summary>
         public void LoadMtpDraftWeights(string draftGgufPath)
         {
+            RefuseStreamingAlternateEntry("MTP draft loading");
             if (string.IsNullOrEmpty(draftGgufPath) || !System.IO.File.Exists(draftGgufPath))
                 throw new System.IO.FileNotFoundException("Gemma 4 MTP draft GGUF not found.", draftGgufPath);
 
@@ -367,7 +372,10 @@ namespace TensorSharp.Models
         private static readonly bool s_specProfile =
             Environment.GetEnvironmentVariable("TS_GMTP_PROFILE") == "1";
         private long _specProfCalls, _specProfRows, _specProfEmbedTicks, _specProfKernelTicks,
-            _specProfPerOpTicks, _specProfHeadTicks, _specProfTotalTicks, _specProfPleGatherCalls;
+            _specProfPerOpTicks, _specProfHeadTicks, _specProfTotalTicks, _specProfPleGatherCalls,
+            _specProfScalarTicks, _specProfScalarCalls;
+        private ScalarVerifyWorkspace _scalarVerifyWorkspace;
+        private Action<int[], float[], float[]> _scalarVerifyForward;
 
         /// <summary>One line: verify calls, rows, and ms per call by phase.</summary>
         public string DescribeSpecProfile()
@@ -377,11 +385,98 @@ namespace TensorSharp.Models
             return $"spec verify calls={_specProfCalls} rows/call={(double)_specProfRows / n:0.0} " +
                    $"ms/call: total={ms(_specProfTotalTicks) / n:0.0} embed+ple={ms(_specProfEmbedTicks) / n:0.0} " +
                    $"kernel={ms(_specProfKernelTicks) / n:0.0} perOp={ms(_specProfPerOpTicks) / n:0.0} " +
-                   $"norm+head+copy={ms(_specProfHeadTicks) / n:0.0} ple-gather={_specProfPleGatherCalls}";
+                   $"norm+head+copy={ms(_specProfHeadTicks) / n:0.0} scalar={ms(_specProfScalarTicks) / n:0.0} " +
+                   $"scalar-calls={_specProfScalarCalls} ple-gather={_specProfPleGatherCalls}";
         }
 
         public unsafe void SpecForward(int[] tokens, float[] hAllOut, float[] logitsOut, bool allLogitsRows)
         {
+            if (HasStreamingWeights) throw new NotSupportedException(SpeculationRefusal);
+            if (!UseScalarTwoRowVerify(_backend, IsTensorParallel, _numExperts, tokens.Length, allLogitsRows))
+            {
+                SpecForwardCore(tokens, hAllOut, logitsOut, allLogitsRows, preserveVerifyBackup: false);
+                return;
+            }
+
+            // The CUDA MoE two-row graph can change target logits and persisted KV
+            // relative to single-token decode. Verify this small window sequentially;
+            // do not relax acceptance or discard the draft/verification evidence.
+            // This is based on the ACTUAL proposal length, including a default
+            // seven-draft window whose drafter stopped after its first proposal.
+            long started = System.Diagnostics.Stopwatch.GetTimestamp();
+            _scalarVerifyWorkspace ??= new ScalarVerifyWorkspace(Config.HiddenSize, Config.VocabSize);
+            _scalarVerifyWorkspace.ValidateOutputs(tokens, hAllOut, logitsOut);
+            EnsureCacheCapacity(checked(_cacheSeqLen + tokens.Length));
+            _swaVerifyBackup = null;
+            SaveSwaSlotsForVerify(_cacheSeqLen, tokens.Length);
+            // Save the SWA rows ONCE for the entire verify. Each inner scalar call
+            // must leave this backup intact: a rejected second row may have evicted
+            // the slot that the committed first row's successor still needs.
+            _scalarVerifyForward ??= (one, hidden, logits) =>
+                SpecForwardCore(one, hidden, logits, allLogitsRows: false, preserveVerifyBackup: true);
+            _scalarVerifyWorkspace.Run(tokens, hAllOut, logitsOut, _scalarVerifyForward);
+            // SpecOnVerifyAccepted and the executor's position rewind settle this
+            // window as usual. Gemma has no recurrent state; accepted scalar KV is
+            // already live. Exceptions propagate, never retry a batch after partial
+            // scalar writes. The enclosing request's existing failure path owns it.
+            long elapsed = System.Diagnostics.Stopwatch.GetTimestamp() - started;
+            _specProfCalls++;
+            _specProfRows += tokens.Length;
+            _specProfScalarCalls++;
+            _specProfScalarTicks += elapsed;
+            _specProfTotalTicks += elapsed;
+            if (s_specProfile && (_specProfCalls & 15) == 0)
+                Console.Error.WriteLine($"[gemma4 spec] {DescribeSpecProfile()} scalar-two-row=true");
+        }
+
+        internal static bool UseScalarTwoRowVerify(BackendType backend, bool tensorParallel,
+            int experts, int rows, bool allLogitsRows)
+            => backend == BackendType.GgmlCuda && !tensorParallel && experts > 0 && rows == 2 && allLogitsRows;
+
+        // One reusable vocabulary row, not a fresh LOH allocation per verify. The
+        // callback consumes the one-token buffer synchronously, like SpecForward.
+        internal sealed class ScalarVerifyWorkspace
+        {
+            private readonly int[] _token = new int[1];
+            private readonly float[] _hidden, _logits;
+
+            internal ScalarVerifyWorkspace(int hidden, int vocab)
+            {
+                if (hidden <= 0 || vocab <= 0) throw new ArgumentOutOfRangeException();
+                _hidden = new float[hidden];
+                _logits = new float[vocab];
+            }
+
+            internal void ValidateOutputs(int[] tokens, float[] hidden, float[] logits)
+            {
+                if (tokens == null || tokens.Length != 2)
+                    throw new ArgumentException("Scalar verification requires exactly two tokens.", nameof(tokens));
+                if (logits == null || logits.LongLength < 2L * _logits.Length)
+                    throw new ArgumentException("Two complete vocabulary rows are required.", nameof(logits));
+                if (hidden != null && hidden.LongLength < 2L * _hidden.Length)
+                    throw new ArgumentException("Two complete hidden rows are required.", nameof(hidden));
+            }
+
+            internal void Run(int[] tokens, float[] hidden, float[] logits,
+                Action<int[], float[], float[]> forward)
+            {
+                ValidateOutputs(tokens, hidden, logits);
+                ArgumentNullException.ThrowIfNull(forward);
+                for (int row = 0; row < 2; row++)
+                {
+                    _token[0] = tokens[row];
+                    forward(_token, hidden != null ? _hidden : null, _logits);
+                    if (hidden != null)
+                        Array.Copy(_hidden, 0L, hidden, (long)row * _hidden.Length, _hidden.Length);
+                    Array.Copy(_logits, 0L, logits, (long)row * _logits.Length, _logits.Length);
+                }
+            }
+        }
+
+        private unsafe void SpecForwardCore(int[] tokens, float[] hAllOut, float[] logitsOut,
+            bool allLogitsRows, bool preserveVerifyBackup)
+        {
+            if (HasStreamingWeights) throw new NotSupportedException(SpeculationRefusal);
             // No draft-head requirement: nothing below reads the assistant weights.
             // A weight-free speculator (n-gram) drives this trunk on any checkpoint.
             int seqLen = tokens.Length;
@@ -416,9 +511,12 @@ namespace TensorSharp.Models
             // to evict from the sliding-window ring so SpecOnVerifyAccepted can put
             // it back. Any other multi-row call (a kept-prefix re-forward) commits
             // every row, and a single row evicts nothing the next step still reads.
-            _swaVerifyBackup = null;
-            if (allLogitsRows && seqLen > 1)
-                SaveSwaSlotsForVerify(startPos, seqLen);
+            if (!preserveVerifyBackup)
+            {
+                _swaVerifyBackup = null;
+                if (allLogitsRows && seqLen > 1)
+                    SaveSwaSlotsForVerify(startPos, seqLen);
+            }
 
             Tensor h = Embedding(tokens);
             ScaleEmbedding(h);
@@ -707,6 +805,7 @@ namespace TensorSharp.Models
         /// </summary>
         public unsafe void DraftStep(int token, float[] hPrev, int pos, float[] logitsOut, float[] hOut)
         {
+            RefuseStreamingAlternateEntry("draft decoding");
             if (!HasDraftHead)
                 throw new InvalidOperationException("Model has no Gemma 4 MTP draft head.");
 

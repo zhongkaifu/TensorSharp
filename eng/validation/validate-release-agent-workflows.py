@@ -35,8 +35,17 @@ CASES = {
 }
 
 
-def case_spec(name, trial, distinct_inputs=False):
+def case_spec(name, trial, distinct_inputs=False, target_shell="posix"):
     spec = copy.deepcopy(CASES[name])
+    if target_shell not in ("posix", "powershell", "cmd"):
+        raise ValueError("Unsupported target shell: " + target_shell)
+    if name == "shell_run" and target_shell != "posix":
+        command = "Write-Output 'release-shell-4821'" if target_shell == "powershell" else "echo release-shell-4821"
+        spec["prompt"] = (f"Use the shell tool to execute {command} in the request workspace. "
+                          "Return exactly the stdout. Do not claim execution if the tool refuses.")
+    if spec.get("execution") and target_shell != "posix":
+        spec["prompt"] += (f" The execution host is Windows and its shell is {target_shell}. "
+                           "Use Windows-compatible commands; do not use POSIX shell heredocs.")
     if not distinct_inputs:
         return spec
     marker = "probe-" + hashlib.sha256(f"{name}:{trial}".encode()).hexdigest()[:12]
@@ -74,8 +83,9 @@ def validate_result_artifact(client, artifacts, expected, result):
         raise RuntimeError("Downloaded final result artifact failed validation")
 
 
-def run(client, name, trial, timeout, sandbox_available, distinct_inputs=False, thinking=False, sandbox_off=False):
-    spec = case_spec(name, trial, distinct_inputs)
+def run(client, name, trial, timeout, sandbox_available, distinct_inputs=False, thinking=False, sandbox_off=False,
+        target_shell="posix"):
+    spec = case_spec(name, trial, distinct_inputs, target_shell)
     session = create_session(client, 30)
     result = {"scenario": name, "trial": trial, "session": session, "status": "fail", "events": [], "artifacts": []}
     result["expected"] = spec.get("artifact", spec.get("expected"))
@@ -150,6 +160,8 @@ def main():
     parser.add_argument("--scenarios", default=",".join(CASES))
     parser.add_argument("--concurrency", default="1,4")
     parser.add_argument("--timeout", type=float, default=1200)
+    parser.add_argument("--target-shell", choices=("posix", "powershell", "cmd"), default="posix",
+                        help="Shell used by the server, independent of this client's operating system")
     sandbox = parser.add_mutually_exclusive_group()
     sandbox.add_argument("--sandbox-unavailable", action="store_true")
     sandbox.add_argument("--sandbox-off", action="store_true",
@@ -165,6 +177,7 @@ def main():
               "skills": skills, "sandbox_available": False if args.sandbox_unavailable else (None if args.sandbox_off else True),
               "execution_mode": "unconfined" if args.sandbox_off else "sandbox",
               "distinct_inputs": args.distinct_inputs,
+              "target_shell": args.target_shell,
               "thinking": args.thinking,
               "harness_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
               "run_complete": False, "cases": []}
@@ -176,15 +189,15 @@ def main():
             with ThreadPoolExecutor(max_workers=degree) as pool:
                 futures = [pool.submit(run, client, name, f"c{degree}-i{index}", args.timeout,
                                        not args.sandbox_unavailable and not args.sandbox_off,
-                                       args.distinct_inputs, args.thinking, args.sandbox_off) for index in range(degree)]
+                                       args.distinct_inputs, args.thinking, args.sandbox_off, args.target_shell) for index in range(degree)]
                 cases = [future.result() for future in futures]
             for case in cases:
                 case["concurrency"] = degree
             report["cases"].extend(cases)
-            args.output.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
+            args.output.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
             print(name, degree, [case["status"] for case in cases], flush=True)
     report["run_complete"] = True
-    args.output.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
+    args.output.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     return int(any(case["status"] != "ok" for case in report["cases"]))
 
 

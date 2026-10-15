@@ -14,6 +14,7 @@ import json
 import os
 from pathlib import Path
 import secrets
+import socket
 import subprocess
 import threading
 import time
@@ -21,6 +22,8 @@ from urllib.parse import parse_qs, urlsplit
 
 
 MAX_BODY = 16384
+MAX_REJECT_DRAIN = 2 * MAX_BODY
+REJECT_DRAIN_SECONDS = 0.25
 LIFETIME_SECONDS = 600
 
 
@@ -190,8 +193,29 @@ class HandoffHandler(BaseHTTPRequestHandler):
         self.close_connection = True
         try:
             self.wfile.write(data)
+            if code >= 400:
+                # Closing with an unread POST body can reset the connection on
+                # Windows, losing even the refusal status. Send the complete
+                # refusal and a FIN first, then discard a bounded amount of
+                # untrusted input. Never trust its framing or decode/log it.
+                self.wfile.flush()
+                self.connection.shutdown(socket.SHUT_WR)
+                self.discard_rejected_body()
         except (OSError, TimeoutError):
             pass
+
+    def discard_rejected_body(self):
+        remaining = MAX_REJECT_DRAIN
+        deadline = time.monotonic() + REJECT_DRAIN_SECONDS
+        while remaining:
+            timeout = deadline - time.monotonic()
+            if timeout <= 0:
+                return
+            self.connection.settimeout(timeout)
+            data = self.rfile.read1(min(4096, remaining))
+            if not data:
+                return
+            remaining -= len(data)
 
     def check_host(self):
         return self.headers.get_all("Host", []) == [self.server.host]

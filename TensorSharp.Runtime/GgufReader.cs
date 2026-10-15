@@ -95,6 +95,7 @@ namespace TensorSharp.Runtime
         /// unchanged (the map stays empty).
         /// </summary>
         private readonly Dictionary<string, GgufFile> _tensorOwner = new(StringComparer.Ordinal);
+        private readonly bool _omitTokenizerMetadata;
 
         public GgufFile(string path) : this(path, isShard: false) { }
 
@@ -112,8 +113,16 @@ namespace TensorSharp.Runtime
         /// </summary>
         public static GgufFile OpenWithoutSiblingShards(string path) => new GgufFile(path, isShard: true);
 
-        private GgufFile(string path, bool isShard)
+        /// <summary>Read geometry and file regions for admission without allocating
+        /// a duplicate vocabulary, merge table or chat template. Tokenizer metadata
+        /// is deliberately absent; this reader must not be used to create a tokenizer.
+        /// Split tensor ownership and all non-tokenizer metadata are preserved.</summary>
+        public static GgufFile OpenForMemoryPlanning(string path)
+            => new GgufFile(path, isShard: false, omitTokenizerMetadata: true);
+
+        private GgufFile(string path, bool isShard, bool omitTokenizerMetadata = false)
         {
+            _omitTokenizerMetadata = omitTokenizerMetadata;
             _path = path;
             _stream = File.OpenRead(path);
             try
@@ -192,7 +201,7 @@ namespace TensorSharp.Runtime
                         $"{_path} is shard {selfNo} of {splitCount}, but {Path.GetFileName(shardPath)} is missing. " +
                         "Every shard of a split GGUF must sit in the same directory.", shardPath);
 
-                var shard = new GgufFile(shardPath, isShard: true);
+                var shard = new GgufFile(shardPath, isShard: true, omitTokenizerMetadata: _omitTokenizerMetadata);
                 _shards.Add(shard);
                 foreach (var kv in shard.Tensors)
                 {
@@ -367,6 +376,11 @@ namespace TensorSharp.Runtime
             {
                 string key = ReadString(reader);
                 var valType = (GgufValueType)reader.ReadUInt32();
+                if (_omitTokenizerMetadata && key.StartsWith("tokenizer.", StringComparison.Ordinal))
+                {
+                    SkipMetadataValue(reader, valType);
+                    continue;
+                }
                 object value = ReadValue(reader, valType);
                 Metadata[key] = value;
             }
@@ -827,6 +841,46 @@ namespace TensorSharp.Runtime
                 default:
                     throw new NotSupportedException($"Unknown GGUF value type: {type}");
             }
+        }
+
+        private static void SkipMetadataValue(BinaryReader reader, GgufValueType type)
+        {
+            static void Bytes(BinaryReader r, ulong count)
+            {
+                long remaining = r.BaseStream.Length - r.BaseStream.Position;
+                if (remaining < 0 || count > (ulong)remaining)
+                    throw new EndOfStreamException("GGUF metadata extends past the end of its shard.");
+                r.BaseStream.Seek((long)count, SeekOrigin.Current);
+            }
+            static ulong Width(GgufValueType t) => t switch
+            {
+                GgufValueType.Uint8 or GgufValueType.Int8 or GgufValueType.Bool => 1,
+                GgufValueType.Uint16 or GgufValueType.Int16 => 2,
+                GgufValueType.Uint32 or GgufValueType.Int32 or GgufValueType.Float32 => 4,
+                GgufValueType.Uint64 or GgufValueType.Int64 or GgufValueType.Float64 => 8,
+                _ => throw new NotSupportedException($"Unknown GGUF metadata element type: {t}")
+            };
+            if (type == GgufValueType.String)
+            {
+                ulong length = reader.ReadUInt64();
+                if (length > int.MaxValue) throw new InvalidDataException("GGUF string length is out of range.");
+                Bytes(reader, length);
+            }
+            else if (type == GgufValueType.Array)
+            {
+                var element = (GgufValueType)reader.ReadUInt32();
+                ulong count = reader.ReadUInt64();
+                if (count > int.MaxValue) throw new InvalidDataException("GGUF metadata array length is out of range.");
+                if (element == GgufValueType.String)
+                {
+                    // Even empty strings have an eight-byte length prefix.
+                    if (count > (ulong)(reader.BaseStream.Length - reader.BaseStream.Position) / 8)
+                        throw new EndOfStreamException("GGUF string array extends past the end of its shard.");
+                    for (ulong i = 0; i < count; i++) SkipMetadataValue(reader, element);
+                }
+                else Bytes(reader, checked(count * Width(element)));
+            }
+            else Bytes(reader, Width(type));
         }
 
         private object ReadArray(BinaryReader reader)

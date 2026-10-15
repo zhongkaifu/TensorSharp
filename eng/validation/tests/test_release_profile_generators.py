@@ -7,18 +7,41 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
+from eng.validation.tests.fixtures import deepseek_metadata as FIXTURE
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(SCRIPTS))
 spec = importlib.util.spec_from_file_location("deepseek_profiles", SCRIPTS / "make-deepseek-release-profiles.py")
 deepseek = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(deepseek)
-INVENTORY = SCRIPTS.parents[1] / "docs/validation/ggml-no-patch-2026-09-15/download-inventory-complete.json"
 
 
 class DeepSeekProfileTests(unittest.TestCase):
-    def test_full_archived_workloads_and_launch_settings_are_preserved(self):
-        profiles, sources = deepseek.build_profiles("a" * 64)
+    def setUp(self):
+        temporary=tempfile.TemporaryDirectory();self.addCleanup(temporary.cleanup)
+        self.inputs=FIXTURE.bundle(temporary.name)
+        pins=patch.multiple(deepseek,SPARSE_SOURCE=self.inputs['sparse'],REFERENCE_SOURCE=self.inputs['reference'],
+                            SPARSE_SHA256=FIXTURE.digest(self.inputs['sparse']),REFERENCE_SHA256=FIXTURE.digest(self.inputs['reference']))
+        pins.start();self.addCleanup(pins.stop)
+
+    def profiles(self,pin,sparse=None):
+        return deepseek.build_profiles(pin,sparse or self.inputs['sparse'],self.inputs['reference'])
+
+    def command(self,output):
+        # Override immutable historical pins only in this test subprocess. The
+        # actual CLI argument parser, pin checks and overwrite protection run.
+        code=('import importlib.util,sys;sys.path.insert(0,sys.argv[1]);'
+              's=importlib.util.spec_from_file_location("fixture_cli",sys.argv[1]+"/make-deepseek-release-profiles.py");'
+              'm=importlib.util.module_from_spec(s);s.loader.exec_module(m);'
+              'm.SPARSE_SHA256=sys.argv[2];m.REFERENCE_SHA256=sys.argv[3];'
+              'sys.argv=[s.origin,*sys.argv[4:]];m.main()')
+        return [sys.executable,'-c',code,str(SCRIPTS),FIXTURE.digest(self.inputs['sparse']),FIXTURE.digest(self.inputs['reference']),
+                '--native-sha256','a'*64,'--output',str(output),'--sparse-source-profile',str(self.inputs['sparse']),
+                '--decomposed-source-report',str(self.inputs['reference'])]
+
+    def test_full_fixture_workloads_and_launch_settings_are_preserved(self):
+        profiles, sources = self.profiles("a" * 64)
         original = deepseek.read_archived(deepseek.SPARSE_SOURCE, deepseek.SPARSE_SHA256)
         reference = deepseek.read_archived(deepseek.REFERENCE_SOURCE, deepseek.REFERENCE_SHA256, report=True)
         self.assertEqual(len(profiles), 3)
@@ -35,6 +58,7 @@ class DeepSeekProfileTests(unittest.TestCase):
         for name, profile in profiles.items():
             self.assertEqual(profile["expected_native_sha256"], "a" * 64)
             self.assertEqual(profile["native_policy"], "exact")
+            self.assertEqual(profile['plan_status'],'prepared-not-executed')
             # Layer profiles pass --layer-split; the expert-TP profile passes --tp.
             flag, degree, rest = placement(profile["extra_args"])
             self.assertEqual(flag, "--tp" if name == "accurate-expert-tp7" else "--layer-split")
@@ -59,16 +83,15 @@ class DeepSeekProfileTests(unittest.TestCase):
             tampered = Path(folder) / "profile.json"
             tampered.write_bytes(deepseek.SPARSE_SOURCE.read_bytes() + b"\n")
             with self.assertRaisesRegex(ValueError, "SHA256 mismatch"):
-                deepseek.build_profiles("a" * 64, tampered)
+                self.profiles("a" * 64, tampered)
         for pin in ("", "A" * 64, "a" * 63, "g" * 64):
             with self.subTest(pin=pin), self.assertRaises(ValueError):
-                deepseek.build_profiles(pin)
+                self.profiles(pin)
 
     def test_cli_refuses_overwriting_completed_plan(self):
         with tempfile.TemporaryDirectory() as folder:
             output = Path(folder) / "plans"
-            command = [sys.executable, str(SCRIPTS / "make-deepseek-release-profiles.py"),
-                       "--native-sha256", "a" * 64, "--output", str(output)]
+            command = self.command(output)
             result = subprocess.run(command, capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
             before = {f.name: f.read_bytes() for f in output.iterdir()}
@@ -79,9 +102,13 @@ class DeepSeekProfileTests(unittest.TestCase):
 
 
 class ModalityProfileTests(unittest.TestCase):
+    def setUp(self):
+        temporary=tempfile.TemporaryDirectory();self.addCleanup(temporary.cleanup)
+        self.inventory=FIXTURE.bundle(temporary.name)['inventory']
+
     def command(self, output, baseline="b" * 64, candidate="c" * 64):
         return [sys.executable, str(SCRIPTS / "make-modality-release-profiles.py"),
-                "--inventory", str(INVENTORY), "--output", str(output),
+                "--inventory", str(self.inventory), "--output", str(output),
                 "--baseline-sha256", baseline, "--candidate-sha256", candidate]
 
     def test_every_modality_profile_has_explicit_role_pin_and_cpu_absence(self):
@@ -92,7 +119,8 @@ class ModalityProfileTests(unittest.TestCase):
             manifest = json.loads((output / "manifest.json").read_text())
             self.assertEqual(len(manifest["profiles"]), 40)
             self.assertEqual(manifest["pending"], [])
-            self.assertEqual(manifest["inventory_sha256"], hashlib.sha256(INVENTORY.read_bytes()).hexdigest())
+            self.assertEqual(manifest["inventory_sha256"], hashlib.sha256(self.inventory.read_bytes()).hexdigest())
+            self.assertEqual(manifest['status'],'prepared-not-executed')
             for entry in manifest["profiles"]:
                 profile = json.loads(Path(entry["path"]).read_text())
                 expected = "b" * 64 if profile["revision_role"] == "baseline" else "c" * 64

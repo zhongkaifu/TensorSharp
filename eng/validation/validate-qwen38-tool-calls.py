@@ -133,6 +133,13 @@ def request(url, body, timeout, evidence):
         connection.close()
 
 
+def unique_object(pairs):
+    result = dict(pairs)
+    if len(result) != len(pairs):
+        raise ValueError("Duplicate tool argument keys")
+    return result
+
+
 def run_case(args, scenario, stream, thinking):
     spec = SPECS[scenario]
     result = {"scenario": scenario, "stream": stream, "thinking": thinking, "status": "fail",
@@ -158,7 +165,7 @@ def run_case(args, scenario, stream, thinking):
         call = calls[0]
         if not call.get("id") or call.get("type") != "function" or call["function"]["name"] != spec["name"]:
             raise ValueError("Missing call ID or incorrect function identity")
-        arguments = json.loads(call["function"]["arguments"])
+        arguments = json.loads(call["function"]["arguments"], object_pairs_hook=unique_object)
         result["arguments"] = arguments
         if arguments != spec["expected"]:
             raise ValueError(f"Arguments differ: expected {spec['expected']!r}, received {arguments!r}")

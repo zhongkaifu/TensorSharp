@@ -1269,6 +1269,11 @@ internal sealed class PrefixTree
             Counters.EndStatesRefused++;
             return AttachResult.Refused;
         }
+        // Grow every fallible container before the first ownership/accounting
+        // mutation. Intrusive LRU/count/scope updates below allocate nothing.
+        BeforeEndStatePublicationCapacity?.Invoke();
+        _keyIndex.EnsureCapacity(checked(_keyIndex.Count + 1));
+        if (node.IsPublicBoundary) _publicBoundaries.EnsureCapacity(checked(_publicBoundaries.Count + 1));
         bool revived = node.HadEndState || node.Children.Count > 0 || node.PageCount > 0;
         ResourceVector before = ProtectedOf(node);
         node.EndState = payload;
@@ -1284,6 +1289,37 @@ internal sealed class PrefixTree
         Relink(node);
         Version++;
         return revived ? AttachResult.Revived : AttachResult.Attached;
+    }
+
+    /// <summary>Refresh a physically demoted holder's device residency without
+    /// dropping its exact host state. The unique key plus previous footprint
+    /// reject a delayed notification for a detached or replaced payload. Only
+    /// device reductions are allowed; every other resource and state identity
+    /// must stay identical, so this path cannot manufacture capacity.</summary>
+    internal bool TryApplyDeviceDemotion(string key, PayloadFootprint previous, PayloadFootprint current)
+    {
+        if (key == null || !_keyIndex.TryGetValue(key, out var node)
+            || node.EndState is not { Kind: EndStateKind.Holder } payload
+            || payload.Key != key || payload.Footprint != previous
+            || previous.Tokens != node.Depth || current.Tokens != previous.Tokens
+            || current.CapacityTokens != previous.CapacityTokens || current.PositionDelta != previous.PositionDelta
+            || previous.Bytes.AnyNegative || current.Bytes.AnyNegative
+            || current.Bytes.DeviceKv > previous.Bytes.DeviceKv)
+            return false;
+        var expected = previous.Bytes; expected.DeviceKv = current.Bytes.DeviceKv;
+        if (current.Bytes != expected) return false;
+        ResourceVector delta = current.Bytes - previous.Bytes;
+        if (delta.IsZero && !payload.DeviceDirty) return true;
+        ResourceVector before = ProtectedOf(node);
+        payload.Footprint = current;
+        payload.DeviceDirty = false; // The complete host state is authoritative.
+        node.Bytes += delta;
+        _cached += delta;
+        ScopeBytesAdjust(node.ScopeIx, delta);
+        _protected += ProtectedOf(node) - before;
+        Relink(node);
+        Version++; // A match planned against the old resource shape is stale.
+        return true;
     }
 
     /// <summary>
@@ -1480,6 +1516,30 @@ internal sealed class PrefixTree
             }
         }
         return freed >= need;
+    }
+
+    /// <summary>Release one eligible LRU victim for admission. Unlike a general
+    /// pressure hint, newest/public entries are not exempt when they prevent work.
+    /// Existing lists exclude pinned state and pending donations.</summary>
+    internal bool EvictOneForAdmission()
+    {
+        for (int t = 0; t <= (int)EvictionTier.PublicTop; t++)
+        {
+            var tier = (EvictionTier)t;
+            RadixNode? leaf = Lists.First(LruKind.Leaf, tier);
+            RadixNode? state = Lists.First(LruKind.State, tier);
+            if (leaf is null && state is null) continue;
+            if (leaf is not null && (state is null || leaf.LastAccess <= state.LastAccess))
+                DeleteLeafCascade(leaf, ReleaseReason.Pressure);
+            else
+            {
+                DetachEndState(state!, ReleaseReason.Pressure);
+                CollectFrom(state!);
+            }
+            Counters.Evictions++;
+            return true;
+        }
+        return false;
     }
 
     private RadixNode? FirstWithBytes(byte listId, ResourceClass cls, bool stateOnly)
@@ -2265,6 +2325,8 @@ internal sealed class PrefixTree
     }
 
     // ------------------------------------------------------------------ test hooks
+
+    internal Action? BeforeEndStatePublicationCapacity { get; set; }
 
     /// <summary>Test hook: sets the version without a mutation (invariant mutation tests).</summary>
     internal void UnsafeSetVersion(long version) => Version = version;

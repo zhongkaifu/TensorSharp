@@ -130,7 +130,7 @@ public sealed class MultiAgentWorkspaceTests : IDisposable
         Assert.Throws<ArgumentException>(() => AgentWorkspace.Create(_parent, "bad", [path]));
     }
 
-    [Fact]
+    [SymbolicLinkFact]
     public void SymbolicLinksAreRejectedEvenWhenTheirTargetsRemainInsideParent()
     {
         Write(_parent.Workspace!, "real/file.txt", "evidence");

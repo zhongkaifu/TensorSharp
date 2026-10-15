@@ -95,13 +95,13 @@ namespace TensorSharp.Models
 
         // ForwardBatch handles multimodal sequences directly (vision
         // embedding inject + per-batch MRoPE position table).
-        public bool SupportsBatchedMultimodal => true;
+        public bool SupportsBatchedMultimodal => !HasStreamingWeights;
 
         /// <summary>Declared availability of the batched path (see
         /// <see cref="IBatchedPagedModel.BatchedForwardAvailable"/>): not under tensor
         /// parallelism, so <c>ExecutionPlanner</c> routes those runs to the per-seq
         /// path up front.</summary>
-        public bool BatchedForwardAvailable => !IsTensorParallel;
+        public bool BatchedForwardAvailable => !IsTensorParallel && !HasStreamingWeights;
 
         // ====================================================================
         // N=1 fast path (BatchExecutor): when only ONE sequence is scheduled,
@@ -121,7 +121,7 @@ namespace TensorSharp.Models
         // it (returns false), so concurrency falls back to the correct (if
         // serialized) per-seq path rather than the slow op-by-op batched decode.
         public bool SupportsLinearKVMigration =>
-            _kvCacheK != null && _kvCacheV != null
+            !HasStreamingWeights && _kvCacheK != null && _kvCacheV != null
             && _convState != null && _deltaStateTensor != null;
 
         // Migrate the N=1 fast-path owner's linear KV + GDN state into paged
@@ -132,6 +132,7 @@ namespace TensorSharp.Models
         // falls back to the (correct, serialized) per-seq rotation.
         public bool TryMigrateLinearKVToPaged(SequenceState owner, int blockSize)
         {
+            if (HasStreamingWeights) return false;
             try { return MigrateLinearToPaged(owner, blockSize); }
             catch (Exception)
             {
@@ -236,6 +237,8 @@ namespace TensorSharp.Models
 
         public IReadOnlyList<float[]> ForwardBatch(BatchedForwardContext ctx)
         {
+            if (HasStreamingWeights)
+                throw new NotSupportedException("File-backed Qwen35 weights require per-sequence execution; batched weight graphs retain full-weight pointers.");
             if (ctx == null) throw new ArgumentNullException(nameof(ctx));
             int numSeqs = ctx.Sequences.Count;
             if (numSeqs == 0) return Array.Empty<float[]>();

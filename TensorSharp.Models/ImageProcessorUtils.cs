@@ -275,7 +275,7 @@ namespace TensorSharp.Models
         /// Precompute, for one axis, each output pixel's source window and normalized weights.
         /// </summary>
         private static void BuildCubicWeights(int srcSize, int dstSize,
-            out int[] bounds, out double[] weights, out int windowSize)
+            out int[] bounds, out double[] weights, out int windowSize, bool byteDomain = false)
         {
             double scale = (double)srcSize / dstSize;
             double filterScale = Math.Max(1.0, scale);
@@ -291,14 +291,20 @@ namespace TensorSharp.Models
             {
                 double center = (i + 0.5) * scale;
                 int xmin = (int)Math.Max(0, Math.Floor(center - support + 0.5));
-                int xmax = (int)Math.Min(srcSize, Math.Ceiling(center + support + 0.5));
+                int xmax = (int)Math.Min(srcSize, byteDomain
+                    ? Math.Truncate(center + support + 0.5) : Math.Ceiling(center + support + 0.5));
                 int count = xmax - xmin;
 
                 double sum = 0;
                 int wBase = i * windowSize;
                 for (int k = 0; k < count; k++)
                 {
-                    double w = CubicFilter((xmin + k + 0.5 - center) / filterScale);
+                    // The byte path follows the Pillow/mtmd coefficient order
+                    // before 22-bit quantization. Preserve the existing float
+                    // Gemma path's arithmetic and footprint unchanged.
+                    double w = CubicFilter(byteDomain
+                        ? (k + xmin - center + 0.5) * (1.0 / filterScale)
+                        : (xmin + k + 0.5 - center) / filterScale);
                     weights[wBase + k] = w;
                     sum += w;
                 }
@@ -309,6 +315,122 @@ namespace TensorSharp.Models
                 bounds[i * 2] = xmin;
                 bounds[i * 2 + 1] = count;
             }
+        }
+
+        /// <summary>Known temporary array payload for the Qwen byte bicubic
+        /// path, excluding the caller's RGBA and returned CHW arrays. This is
+        /// checked before allocating coefficient tables or horizontal pixels.
+        /// Both temporary doubles and quantized coefficients remain covered;
+        /// no collection between the two passes is assumed.</summary>
+        internal static long GetByteBicubicResizeScratchBytes(int srcW, int srcH, int dstW, int dstH)
+        {
+            if (srcW <= 0 || srcH <= 0 || dstW <= 0 || dstH <= 0)
+                throw new ArgumentOutOfRangeException(nameof(srcW), "Resize dimensions must be positive.");
+            checked
+            {
+                long sourcePixels = (long)srcW * srcH, outputPixels = (long)dstW * dstH;
+                if (sourcePixels > Array.MaxLength / 4 || outputPixels > Array.MaxLength / 3)
+                    throw new NotSupportedException("Qwen byte resize exceeds the supported managed array range.");
+                if (srcW == dstW && srcH == dstH) return 0;
+                long horizontal = 3L * srcH * dstW;
+                long Window(int source, int target) => checked((long)Math.Ceiling(BicubicSupport * Math.Max(1.0, (double)source / target)) * 2 + 1);
+                long xWindow = Window(srcW, dstW), yWindow = Window(srcH, dstH);
+                long xCoefficients = dstW * xWindow, yCoefficients = dstH * yWindow;
+                if (horizontal > Array.MaxLength || xWindow > int.MaxValue || yWindow > int.MaxValue
+                    || xCoefficients > Array.MaxLength || yCoefficients > Array.MaxLength
+                    || 2L * dstW > Array.MaxLength || 2L * dstH > Array.MaxLength)
+                    throw new NotSupportedException("Qwen bicubic scratch exceeds the supported managed array range.");
+                return horizontal + (sizeof(double) + sizeof(int)) * (xCoefficients + yCoefficients)
+                    + 2L * sizeof(int) * (dstW + (long)dstH);
+            }
+        }
+
+        private const int ByteBicubicPrecisionBits = 22;
+        private static int[] QuantizeByteCubicWeights(double[] weights)
+        {
+            var result = new int[weights.Length];
+            const double scale = 1 << ByteBicubicPrecisionBits;
+            for (int i = 0; i < weights.Length; i++)
+                result[i] = checked((int)Math.Round(weights[i] * scale, MidpointRounding.AwayFromZero));
+            return result;
+        }
+
+        private static byte CompositeChannelToByte(byte[] rgba, int pixelBase, int channel)
+        {
+            int alpha = rgba[pixelBase + 3];
+            return (byte)((rgba[pixelBase + channel] * alpha + 255 * (255 - alpha) + 127) / 255);
+        }
+
+        private static byte RoundedByteCubic(long accumulator) => (byte)Math.Clamp(
+            accumulator >> ByteBicubicPrecisionBits, 0L, 255L);
+
+        /// <summary>Qwen's antialiased byte-domain bicubic preprocessing. Each
+        /// separable pass rounds/clamps to uint8 before the next pass, using
+        /// 22-bit coefficients as Pillow/torchvision uint8/unchanged mtmd do.
+        /// The existing Gemma float-intermediate bicubic path is independent.</summary>
+        internal static float[] ResizeRgbaToChannelFirstBicubicByte(
+            byte[] rgba, int srcW, int srcH, int dstW, int dstH)
+        {
+            ArgumentNullException.ThrowIfNull(rgba);
+            GetByteBicubicResizeScratchBytes(srcW, srcH, dstW, dstH);
+            if (rgba.LongLength != checked(4L * srcW * srcH))
+                throw new ArgumentException("RGBA payload differs from the source dimensions.", nameof(rgba));
+            int outPixels = checked(dstW * dstH);
+            var result = new float[checked(3 * outPixels)];
+            if (srcW == dstW && srcH == dstH)
+            {
+                Parallel.For(0, srcH, y =>
+                {
+                    for (int x = 0; x < srcW; x++)
+                    {
+                        int pixel = y * srcW + x;
+                        for (int c = 0; c < 3; c++)
+                            result[c * outPixels + pixel] = CompositeChannelToByte(rgba, pixel * 4, c) / 255f * 2f - 1f;
+                    }
+                });
+                return result;
+            }
+
+            BuildCubicWeights(srcW, dstW, out int[] xBounds, out double[] xFloating, out int xWindow, byteDomain: true);
+            BuildCubicWeights(srcH, dstH, out int[] yBounds, out double[] yFloating, out int yWindow, byteDomain: true);
+            int[] xWeights = QuantizeByteCubicWeights(xFloating), yWeights = QuantizeByteCubicWeights(yFloating);
+            int horizontalPixels = checked(srcH * dstW);
+            var horizontal = new byte[checked(3 * horizontalPixels)];
+            const long rounding = 1L << (ByteBicubicPrecisionBits - 1);
+            Parallel.For(0, srcH, sy =>
+            {
+                for (int dx = 0; dx < dstW; dx++)
+                {
+                    int xmin = xBounds[dx * 2], count = xBounds[dx * 2 + 1], weightBase = dx * xWindow;
+                    long red = rounding, green = rounding, blue = rounding;
+                    for (int k = 0; k < count; k++)
+                    {
+                        int pixelBase = (sy * srcW + xmin + k) * 4, weight = xWeights[weightBase + k];
+                        red += (long)weight * CompositeChannelToByte(rgba, pixelBase, 0);
+                        green += (long)weight * CompositeChannelToByte(rgba, pixelBase, 1);
+                        blue += (long)weight * CompositeChannelToByte(rgba, pixelBase, 2);
+                    }
+                    int pixel = sy * dstW + dx;
+                    horizontal[pixel] = RoundedByteCubic(red);
+                    horizontal[horizontalPixels + pixel] = RoundedByteCubic(green);
+                    horizontal[2 * horizontalPixels + pixel] = RoundedByteCubic(blue);
+                }
+            });
+            Parallel.For(0, dstH, dy =>
+            {
+                int ymin = yBounds[dy * 2], count = yBounds[dy * 2 + 1], weightBase = dy * yWindow;
+                for (int dx = 0; dx < dstW; dx++)
+                    for (int c = 0; c < 3; c++)
+                    {
+                        long accumulator = rounding;
+                        int plane = c * horizontalPixels;
+                        for (int k = 0; k < count; k++)
+                            accumulator += (long)yWeights[weightBase + k] * horizontal[plane + (ymin + k) * dstW + dx];
+                        byte pixel = RoundedByteCubic(accumulator);
+                        result[c * outPixels + dy * dstW + dx] = pixel / 255f * 2f - 1f;
+                    }
+            });
+            return result;
         }
 
         /// <summary>

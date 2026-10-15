@@ -10,7 +10,10 @@ internal static class RequestCompletionChecks
 }
 
 internal sealed record RequestTimeline(string Id, long StartedUnixMilliseconds, double SubmissionOffsetMs, int OutTokens,
-    List<double> TokenTimesMs, string Finish, string Error, RequestSpeculationCounters Speculation);
+    List<double> TokenTimesMs, string Finish, string Error, RequestSpeculationCounters Speculation)
+{
+    public SpeculativePhaseTimings? SpeculationTimings { get; init; }
+}
 
 internal sealed record RequestSpeculationCounters(long Drafted, long Accepted, long VerifySteps, long PlainSteps,
     long Rollbacks, long ParkedSteps, int GovernorWins, int GovernorLosses, int GovernorParkedSteps)

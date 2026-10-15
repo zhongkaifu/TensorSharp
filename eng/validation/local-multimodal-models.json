@@ -1,0 +1,53 @@
+{
+  "note": "Expected identities only, not a claim of inference or hardware qualification. Paths are relative to --model-root. The alternative Qwen-Image Q8 DiT is deliberately excluded: its independent expected SHA has not been established.",
+  "files": [
+    {
+      "path": "Qwen3.8-Flash-Next-GGUF/Qwen3.8-Flash-Next-UD-IQ1_M-00001-of-00003.gguf",
+      "bytes": 10946624,
+      "sha256": "6584f289c808a486ac33aef20906774bcf6616785535c03b842072951e5112d2",
+      "source": "https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/blob/38bb39ee97821de2c9009abb7e93950eec396e66/UD-IQ1_M/Qwen3.8-Flash-Next-UD-IQ1_M-00001-of-00003.gguf"
+    },
+    {
+      "path": "Qwen3.8-Flash-Next-GGUF/Qwen3.8-Flash-Next-UD-IQ1_M-00002-of-00003.gguf",
+      "bytes": 49988981792,
+      "sha256": "a7cbafba2cbc1ccde484ed05e1bbeaef4d67e0924ef51cc8b8de18e62edb5586",
+      "source": "https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/blob/38bb39ee97821de2c9009abb7e93950eec396e66/UD-IQ1_M/Qwen3.8-Flash-Next-UD-IQ1_M-00002-of-00003.gguf"
+    },
+    {
+      "path": "Qwen3.8-Flash-Next-GGUF/Qwen3.8-Flash-Next-UD-IQ1_M-00003-of-00003.gguf",
+      "bytes": 24538827360,
+      "sha256": "ae757ff9347651adacc7746f137d8c29b51f25cf6bb27cd49086ef45bd8cc203",
+      "source": "https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/blob/38bb39ee97821de2c9009abb7e93950eec396e66/UD-IQ1_M/Qwen3.8-Flash-Next-UD-IQ1_M-00003-of-00003.gguf"
+    },
+    {
+      "path": "Qwen3.8-Flash-Next-GGUF/mmproj-BF16.gguf",
+      "bytes": 907542944,
+      "sha256": "2e788f8c511d8093c7b43cb87b2fd7e14228340318057f8fb20c86df2efe2355",
+      "source": "https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF/blob/38bb39ee97821de2c9009abb7e93950eec396e66/mmproj-BF16.gguf"
+    },
+    {
+      "path": "qwen-image-2.1/qwen_image_2.1_Q4_K_M.gguf",
+      "bytes": 4189343904,
+      "sha256": "dc956c958fbfa1d5c64ec316d7e865283d17d97a9eb332a4a74a4d63afaae9a5",
+      "source": "https://huggingface.co/Abiray/Qwen-Image-2.1-GGUF/blob/c9dd12108f53974cd1e0abd708df042d6df0ca8d/qwen_image_2.1_Q4_K_M.gguf"
+    },
+    {
+      "path": "qwen-image-2.1/Qwen3VL-8B-Instruct-Q4_K_M.gguf",
+      "bytes": 5027784800,
+      "sha256": "67d1659bfe71b89d50b45a4ad1a9e5b997e5bb16ce5da66a6a6167abd569e9e2",
+      "source": "https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct-GGUF/blob/f982a07559d4a2f6c8744d840bf6fccab30eea96/Qwen3VL-8B-Instruct-Q4_K_M.gguf"
+    },
+    {
+      "path": "qwen-image-2.1/mmproj-Qwen3VL-8B-Instruct-F16.gguf",
+      "bytes": 1159029824,
+      "sha256": "ca524100ebf825c9a870db1c580d03879e0da0ab2541697e2458e64891cf9d38",
+      "source": "https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct-GGUF/blob/f982a07559d4a2f6c8744d840bf6fccab30eea96/mmproj-Qwen3VL-8B-Instruct-F16.gguf"
+    },
+    {
+      "path": "qwen-image-2.1/qwen_image_2.1_vae_bf16.safetensors",
+      "bytes": 675509688,
+      "sha256": "bb21f7473051e1ac368515dd3f2e15cd44d7a11748ee8823e1ddca3e4876b7c9",
+      "source": "https://huggingface.co/Comfy-Org/Qwen-Image-2.1/blob/ace0edeb3791a594ddfa36ed5f41a178a394e921/vae/qwen_image_2.1_vae_bf16.safetensors"
+    }
+  ]
+}

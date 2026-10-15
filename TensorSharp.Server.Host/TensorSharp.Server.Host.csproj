@@ -41,7 +41,7 @@
 			<GgmlNativeBinary Include="$(GgmlNativeBuildDir)/$(GgmlNativeBinaryName)" Condition="Exists('$(GgmlNativeBuildDir)/$(GgmlNativeBinaryName)')" />
 			<GgmlNativeBinary Include="$(GgmlNativeBuildDir)/Release/$(GgmlNativeBinaryName)" Condition="Exists('$(GgmlNativeBuildDir)/Release/$(GgmlNativeBinaryName)')" />
 		</ItemGroup>
-		<Copy SourceFiles="@(GgmlNativeBinary)" DestinationFolder="$(OutputPath)" SkipUnchangedFiles="true" />
+		<Copy SourceFiles="@(GgmlNativeBinary)" DestinationFolder="$(TargetDir)" SkipUnchangedFiles="true" />
 	</Target>
 	<Target Name="CopyMlxNativeBinary" AfterTargets="Build" Condition="'$(MlxNativeBinaryName)' != ''">
 		<ItemGroup>
@@ -52,7 +52,7 @@
 			<MlxNativeBinary Include="$(MlxNativeInstallDir)/$(MlxNativeMetallibName)" Condition="'$(MlxNativeMetallibName)' != '' And Exists('$(MlxNativeInstallDir)/$(MlxNativeMetallibName)')" />
 			<MlxNativeBinary Include="$(MlxNativeInstallDir)/lib/$(MlxNativeMetallibName)" Condition="'$(MlxNativeMetallibName)' != '' And !Exists('$(MlxNativeInstallDir)/$(MlxNativeMetallibName)') And Exists('$(MlxNativeInstallDir)/lib/$(MlxNativeMetallibName)')" />
 		</ItemGroup>
-		<Copy SourceFiles="@(MlxNativeBinary)" DestinationFolder="$(OutputPath)" SkipUnchangedFiles="true" />
+		<Copy SourceFiles="@(MlxNativeBinary)" DestinationFolder="$(TargetDir)" SkipUnchangedFiles="true" />
 	</Target>
 
   <ItemGroup>

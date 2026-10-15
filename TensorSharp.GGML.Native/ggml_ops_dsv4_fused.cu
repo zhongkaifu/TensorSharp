@@ -47,6 +47,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 
 bool tsg_dsv4_cuda_supports_native_bf16(ggml_backend_t backend) {
     if (!ggml_backend_is_cuda(backend)) return false;
@@ -1242,12 +1243,18 @@ ggml_backend_t tsg_dsv4_fused_backend_init(ggml_backend_t cuda_backend)
 
     auto * cc = (ggml_backend_cuda_context *) cuda_backend->context;
 
-    auto * ctx = new tsg_dsv4_backend_ctx();
+    // Every allocation stays owned until the whole borrowing backend exists.
+    // In particular, a recoverable bad_alloc while creating its device/backend
+    // must also destroy the already-created private matmul handle. CUDA/cuBLAS
+    // fatal checks retain their existing process-termination behavior.
+    auto ctx = std::make_unique<tsg_dsv4_backend_ctx>();
     ctx->device = cc->device;
     ctx->cuda_backend = cuda_backend;
     ctx->cuda_dev = ggml_backend_get_device(cuda_backend);
     ctx->cuda_buft = ggml_backend_get_default_buffer_type(cuda_backend);
-    ctx->matmul = tsg_matmul_cuda_init(cuda_backend);
+    std::unique_ptr<tsg_matmul_cuda_state, decltype(&tsg_matmul_cuda_free)> matmul(
+        tsg_matmul_cuda_init(cuda_backend), tsg_matmul_cuda_free);
+    ctx->matmul = matmul.get();
     snprintf(ctx->name, sizeof(ctx->name), "TSDSV4-%d", ctx->device);
     snprintf(ctx->desc, sizeof(ctx->desc), "TensorSharp DSV4 fused ops (CUDA%d)", ctx->device);
 
@@ -1255,16 +1262,19 @@ ggml_backend_t tsg_dsv4_fused_backend_init(ggml_backend_t cuda_backend)
     // shared static would be re-pointed at each new model's context, and freeing
     // any one model would leave the others' device record dangling. The record
     // is reached on every supports_op call, so this has to be per instance.
-    auto * dev = new ggml_backend_device();
+    auto dev = std::make_unique<ggml_backend_device>();
     dev->iface = tsg_dsv4_device_iface;
     dev->reg = nullptr;
-    dev->context = ctx;
+    dev->context = ctx.get();
 
-    ggml_backend_t backend = new ggml_backend {
+    auto backend = std::make_unique<ggml_backend>(ggml_backend {
         /* .guid    = */ tsg_dsv4_backend_guid(),
         /* .iface   = */ tsg_dsv4_backend_iface,
-        /* .device  = */ dev,
-        /* .context = */ ctx,
-    };
-    return backend;
+        /* .device  = */ dev.get(),
+        /* .context = */ ctx.get(),
+    });
+    matmul.release();
+    dev.release();
+    ctx.release();
+    return backend.release();
 }

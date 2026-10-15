@@ -27,7 +27,7 @@ using InferenceWeb.Tests.PrefixCache;
 namespace InferenceWeb.Tests;
 
 [Collection(EngineEnvironmentCollection.Name)]
-public sealed class RecurrentPageSlabTests
+public sealed class RecurrentPageSlabTests : IDisposable
 {
     private const int BlockSize = 8;
     private const int VocabSize = 97;
@@ -36,17 +36,25 @@ public sealed class RecurrentPageSlabTests
     private const long FullBlockBytes = BlockSize * KvBytesPerToken + StateBytes;
     private const long KvOnlyBlockBytes = BlockSize * KvBytesPerToken;
     private const string Conversation = "conv";
+    private readonly string _spillRoot = Path.Combine(Path.GetTempPath(), "ts-recurrent-tiered-" + Guid.NewGuid().ToString("N"));
+
+    public void Dispose()
+    {
+        if (Directory.Exists(_spillRoot)) Directory.Delete(_spillRoot, recursive: true);
+    }
 
     // ------------------------------------------------------------------ (a) slab contents
 
-    [Fact]
-    public async Task NonRestorableBlocks_HoldOnlyKv_RestorePointsHoldTheState()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task NonRestorableBlocks_HoldOnlyKv_RestorePointsHoldTheState(bool tiered)
     {
         // One 24-token forward (the prompt end is split at its last block boundary): blocks
         // 0 and 1 fill in the middle of it, block 2 at its end.
         int[] prompt = Prompt(27, seed: 5);
         var model = new RecurrentStateModel();
-        using var engine = new InferenceEngine(model, Config(prefixCaching: true, prefillChunk: 64), NullLogger.Instance);
+        using var engine = new InferenceEngine(model, Config(prefixCaching: true, prefillChunk: 64, tiered: tiered), NullLogger.Instance);
         await RunAsync(engine, "a", prompt, maxNew: 1);
 
         Assert.Equal(new[] { 24, 3 }, model.Forwards.Take(2).Select(f => f.Count));
@@ -56,8 +64,9 @@ public sealed class RecurrentPageSlabTests
         // restore point, the K/V rows alone everywhere else.
         var pages = TreePages(engine);
         Assert.Equal(3, pages.Count);
-        Assert.Equal(2, pages.Count(p => !p.Restorable && p.SlabBytes == KvOnlyBlockBytes));
-        Assert.Equal(1, pages.Count(p => p.Restorable && p.SlabBytes == FullBlockBytes));
+        Assert.Equal(2, pages.Count(p => !p.Restorable && p.PayloadBytes == KvOnlyBlockBytes));
+        Assert.Equal(1, pages.Count(p => p.Restorable && p.PayloadBytes == FullBlockBytes));
+        if (tiered) Assert.All(pages, p => Assert.Equal(FullBlockBytes, p.SlabBytes));
     }
 
     [Fact]
@@ -76,23 +85,28 @@ public sealed class RecurrentPageSlabTests
     }
 
     /// <summary>The blocks the radix cache holds as pages, with their flag and slab length.</summary>
-    private static List<(bool Restorable, long SlabBytes)> TreePages(InferenceEngine engine)
+    private static List<(bool Restorable, long SlabBytes, int PayloadBytes)> TreePages(InferenceEngine engine)
     {
         PrefixTree tree = engine.RadixCache!.Tree;
-        var pages = new List<(bool, long)>();
+        var pages = new List<(bool, long, int)>();
         for (int id = 0; id < engine.Pool.NumBlocks; id++)
         {
             KvBlock block = engine.Pool.GetBlock(id);
             if (tree.TryGetBlockOwner(block, out _))
-                pages.Add((block.IsRestorablePrefixEnd, engine.Pool.Storage.SlabLength(id)));
+            {
+                using var lease = engine.Pool.Storage.Acquire(id);
+                pages.Add((block.IsRestorablePrefixEnd, engine.Pool.Storage.SlabLength(id), lease.ReadOnlySpan.Length));
+            }
         }
         return pages;
     }
 
     // ------------------------------------------------------------------ (b) exact restores
 
-    [Fact]
-    public async Task RestoreFromARestorablePage_EqualsAColdRun()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task RestoreFromARestorablePage_EqualsAColdRun(bool tiered)
     {
         int[] shared = Prompt(24, seed: 11);
         int[] promptA = shared.Concat(new[] { 7, 8, 9 }).ToArray();
@@ -100,7 +114,7 @@ public sealed class RecurrentPageSlabTests
         int[] coldB = await RunColdAsync(promptB, maxNew: 6);
 
         var model = new RecurrentStateModel();
-        using var engine = new InferenceEngine(model, Config(prefixCaching: true, prefillChunk: 64), NullLogger.Instance);
+        using var engine = new InferenceEngine(model, Config(prefixCaching: true, prefillChunk: 64, tiered: tiered), NullLogger.Instance);
         await RunAsync(engine, "a", promptA, maxNew: 3);
         int injectsBefore = model.KvOnlyInjects + model.FullInjects;
 
@@ -113,6 +127,7 @@ public sealed class RecurrentPageSlabTests
         Assert.Equal(2, model.KvOnlyInjects);
         Assert.Equal(1, model.FullInjects);
         Assert.Equal(coldB, b.OutputTokens.ToArray());
+        if (tiered) Assert.True(engine.SnapshotResidencyStats!.Value.Spills > 0);
     }
 
     [Fact]
@@ -135,10 +150,13 @@ public sealed class RecurrentPageSlabTests
     }
 
     [Theory]
-    [InlineData(true, true)]
-    [InlineData(true, false)]
-    [InlineData(false, true)]
-    public async Task OwnershipSwapsEveryToken_ReinjectMixedSlabs_AndMatchColdRuns(bool kvOnlyForm, bool prefixCaching)
+    [InlineData(true, true, false)]
+    [InlineData(true, false, false)]
+    [InlineData(false, true, false)]
+    [InlineData(true, true, true)]
+    [InlineData(true, false, true)]
+    [InlineData(false, true, true)]
+    public async Task OwnershipSwapsEveryToken_ReinjectMixedSlabs_AndMatchColdRuns(bool kvOnlyForm, bool prefixCaching, bool tiered)
     {
         // Two requests on the single-cache path with a one-token decode quantum: ownership
         // rotates every step, so every swap-in rebuilds the sequence from its blocks - K/V-only
@@ -151,7 +169,7 @@ public sealed class RecurrentPageSlabTests
 
         var model = new RecurrentStateModel(kvOnlyForm);
         using var engine = new InferenceEngine(model,
-            Config(prefixCaching, prefillChunk: 64, decodeQuantum: 1), NullLogger.Instance);
+            Config(prefixCaching, prefillChunk: 64, decodeQuantum: 1, tiered: tiered), NullLogger.Instance);
         var a = new SequenceState("a", promptA.ToList(), maxNew, BlockSize, SamplingConfig.Greedy);
         var b = new SequenceState("b", promptB.ToList(), maxNew, BlockSize, SamplingConfig.Greedy);
         var ha = engine.SubmitRequest(a);
@@ -162,10 +180,18 @@ public sealed class RecurrentPageSlabTests
         if (kvOnlyForm) Assert.True(model.KvOnlyInjects > 0, "no K/V-only block was re-injected");
         Assert.Equal(coldA, a.OutputTokens.ToArray());
         Assert.Equal(coldB, b.OutputTokens.ToArray());
+        if (tiered)
+        {
+            Assert.True(engine.SnapshotResidencyStats!.Value.Spills > 0);
+            engine.Dispose();
+            Assert.All(engine.SnapshotMemoryUsage!, p => Assert.Equal(0, p.Reserved + p.Committed));
+        }
     }
 
-    [Fact]
-    public async Task ACompleteInjectEndingOnAKvOnlyBlock_ResumesFromTheLastRestorePoint()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ACompleteInjectEndingOnAKvOnlyBlock_ResumesFromTheLastRestorePoint(bool tiered)
     {
         // A model that does not ask the tree for state at page ends lets B adopt A's first
         // two pages, both K/V-only: every injected block is whole, yet the last one holds no
@@ -178,7 +204,7 @@ public sealed class RecurrentPageSlabTests
         int[] coldB = await RunColdAsync(promptB, maxNew: 5);
 
         var model = new RecurrentStateModel(pagesNeedStateAtEnd: false);
-        using var engine = new InferenceEngine(model, Config(prefixCaching: true, prefillChunk: 64), NullLogger.Instance);
+        using var engine = new InferenceEngine(model, Config(prefixCaching: true, prefillChunk: 64, tiered: tiered), NullLogger.Instance);
         await RunAsync(engine, "a", promptA, maxNew: 3);
         int forwardsBefore = model.Forwards.Count;
         SequenceState b = await RunAsync(engine, "b", promptB, maxNew: 5);
@@ -194,8 +220,10 @@ public sealed class RecurrentPageSlabTests
 
     // ------------------------------------------------------------------ (b2) decode restore points
 
-    [Fact]
-    public async Task DecodeFilledBlocks_OnlyTheNewestRestorePointKeepsItsState()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task DecodeFilledBlocks_OnlyTheNewestRestorePointKeepsItsState(bool tiered)
     {
         // 27 prompt tokens forward as 24 + 3, then 22 decode steps fill blocks 3, 4 and 5 one
         // token at a time, each at the forward that filled it - so each is a restore point
@@ -203,7 +231,7 @@ public sealed class RecurrentPageSlabTests
         // as K/V rows when the next arrives, and the cache takes the newest once A stops.
         int[] prompt = Prompt(27, seed: 5);
         var model = new RecurrentStateModel();
-        using var engine = new InferenceEngine(model, Config(prefixCaching: true, prefillChunk: 64), NullLogger.Instance);
+        using var engine = new InferenceEngine(model, Config(prefixCaching: true, prefillChunk: 64, tiered: tiered), NullLogger.Instance);
         await RunAsync(engine, "a", prompt, maxNew: 22);
 
         Assert.Equal(new[]
@@ -216,15 +244,17 @@ public sealed class RecurrentPageSlabTests
 
         var pages = TreePages(engine);
         Assert.Equal(6, pages.Count);
-        Assert.Equal(2, pages.Count(p => p.Restorable && p.SlabBytes == FullBlockBytes));
-        Assert.Equal(4, pages.Count(p => !p.Restorable && p.SlabBytes == KvOnlyBlockBytes));
+        Assert.Equal(2, pages.Count(p => p.Restorable && p.PayloadBytes == FullBlockBytes));
+        Assert.Equal(4, pages.Count(p => !p.Restorable && p.PayloadBytes == KvOnlyBlockBytes));
         PrefixTree tree = engine.RadixCache!.Tree;
-        Assert.Equal(2 * FullBlockBytes + 4 * KvOnlyBlockBytes, tree.Cached.HostKv);
+        Assert.Equal(tiered ? 6 * FullBlockBytes : 2 * FullBlockBytes + 4 * KvOnlyBlockBytes, tree.Cached.HostKv);
         Tk.Valid(tree);
     }
 
-    [Fact]
-    public async Task AFollowUpOfTheReply_ResumesFromTheNewestDecodeRestorePoint()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task AFollowUpOfTheReply_ResumesFromTheNewestDecodeRestorePoint(bool tiered)
     {
         // A's reply fills blocks 3-5; another chat then takes the model, so A's follow-up
         // (its prompt, its reply, a new turn) can only come back through the pages. It
@@ -232,7 +262,7 @@ public sealed class RecurrentPageSlabTests
         // decodes what a cold run of the follow-up decodes.
         int[] promptA = Prompt(27, seed: 5);
         var model = new RecurrentStateModel();
-        using var engine = new InferenceEngine(model, Config(prefixCaching: true, prefillChunk: 64), NullLogger.Instance);
+        using var engine = new InferenceEngine(model, Config(prefixCaching: true, prefillChunk: 64, tiered: tiered), NullLogger.Instance);
         SequenceState a = await RunAsync(engine, "a", promptA, maxNew: 22);
         await RunAsync(engine, "x", Prompt(19, seed: 41), maxNew: 2);
 
@@ -246,12 +276,14 @@ public sealed class RecurrentPageSlabTests
 
     // ------------------------------------------------------------------ (c) the page budget
 
-    [Fact]
-    public async Task PageBudget_ChargesTheRealSlabBytes()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task PageBudget_ChargesTheRealSlabBytes(bool tiered)
     {
         int[] prompt = Prompt(43, seed: 31);
         var model = new RecurrentStateModel();
-        using var engine = new InferenceEngine(model, Config(prefixCaching: true, prefillChunk: 64), NullLogger.Instance);
+        using var engine = new InferenceEngine(model, Config(prefixCaching: true, prefillChunk: 64, tiered: tiered), NullLogger.Instance);
         await RunAsync(engine, "a", prompt, maxNew: 2);
 
         PrefixTree tree = engine.RadixCache!.Tree;
@@ -263,7 +295,8 @@ public sealed class RecurrentPageSlabTests
             if (!tree.TryGetBlockOwner(block, out _)) continue;
             pages++;
             slabBytes += pool.Storage.SlabLength(id);
-            if (pool.Storage.SlabLength(id) == KvOnlyBlockBytes) kvOnlyPages++;
+            using var lease = pool.Storage.Acquire(id);
+            if (lease.ReadOnlySpan.Length == KvOnlyBlockBytes) kvOnlyPages++;
         }
 
         // 43 prompt tokens forward as 40 + 3: blocks 0-3 K/V-only, block 4 the restore point.
@@ -271,8 +304,13 @@ public sealed class RecurrentPageSlabTests
         Assert.Equal(4, kvOnlyPages);
         Assert.Equal(pages, tree.Cached.PoolPages);
         Assert.Equal(slabBytes, tree.Cached.HostKv);
-        Assert.Equal(4 * KvOnlyBlockBytes + FullBlockBytes, tree.Cached.HostKv);
-        Assert.True(tree.Cached.HostKv < pages * FullBlockBytes);
+        Assert.Equal(tiered ? pages * FullBlockBytes : 4 * KvOnlyBlockBytes + FullBlockBytes, tree.Cached.HostKv);
+        if (tiered)
+        {
+            Assert.True(engine.SnapshotResidencyStats!.Value.Spills > 0);
+            Assert.Equal(0, pool.Storage.AllocatedBytes); // no uncharged managed slabs alongside tiered resources
+        }
+        else Assert.True(tree.Cached.HostKv < pages * FullBlockBytes);
         Tk.Valid(tree);
     }
 
@@ -379,7 +417,7 @@ public sealed class RecurrentPageSlabTests
     private static int[] Prompt(int length, int seed)
         => Enumerable.Range(0, length).Select(i => 3 + (i * 19 + seed * 7) % 80).ToArray();
 
-    private static SchedulerConfig Config(bool prefixCaching, int prefillChunk, int decodeQuantum = BlockSize) => new()
+    private SchedulerConfig Config(bool prefixCaching, int prefillChunk, int decodeQuantum = BlockSize, bool tiered = false) => new()
     {
         MaxNumBatchedTokens = 64,
         MaxNumRunningSequences = 4,
@@ -388,9 +426,13 @@ public sealed class RecurrentPageSlabTests
         BlockSize = BlockSize,
         EnablePrefixCaching = prefixCaching,
         DecodeQuantumTokens = decodeQuantum,
+        // Scratch + two resident pages + one transfer buffer. More live snapshots
+        // force real SSD spill/reload while each logical K/V-only page stays short.
+        KvSnapshots = tiered ? new(3 * ((FullBlockBytes + 63) / 64 * 64) + 64,
+            64 * 16384, Path.Combine(_spillRoot, Guid.NewGuid().ToString("N")), 64) : null,
     };
 
-    private static async Task<int[]> RunColdAsync(int[] prompt, int maxNew)
+    private async Task<int[]> RunColdAsync(int[] prompt, int maxNew)
     {
         var model = new RecurrentStateModel();
         using var engine = new InferenceEngine(model, Config(prefixCaching: false, prefillChunk: 64), NullLogger.Instance);

@@ -165,6 +165,8 @@ namespace TensorSharp.Server.Skills
                 await foreach (ChatStreamUpdate update in
                     generate(working, activeTools, cancellationToken).ConfigureAwait(false))
                 {
+                    if (update.HistoryCompacted)
+                        plan.ToolContext?.Workspace?.Reads.InvalidateReadVisibility();
                     if (update.Done)
                     {
                         terminal = update;
@@ -511,6 +513,8 @@ namespace TensorSharp.Server.Skills
             await foreach (ChatStreamUpdate update in
                 generate(working, finalTools, cancellationToken).ConfigureAwait(false))
             {
+                if (update.HistoryCompacted)
+                    plan.ToolContext?.Workspace?.Reads.InvalidateReadVisibility();
                 if (update.Done)
                 {
                     finalTerminal = update;
@@ -758,6 +762,8 @@ namespace TensorSharp.Server.Skills
             await foreach (ChatStreamUpdate update in
                 generate(working, plan.Tools, cancellationToken).ConfigureAwait(false))
             {
+                if (update.HistoryCompacted)
+                    plan.ToolContext?.Workspace?.Reads.InvalidateReadVisibility();
                 if (update.Done)
                 {
                     terminal = update;

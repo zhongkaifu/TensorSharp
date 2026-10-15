@@ -182,6 +182,62 @@ class ComparisonTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 module.validate(candidate)
 
+    def expert_copy_arms(self):
+        reference = copy.deepcopy(self.report)
+        reference.update(backend="GgmlCuda", architecture="gpt-oss",
+                         environment={"TS_WEIGHT_FUSION_COPIES": "1"},
+                         gptoss_per_expert_prefill=dict(requested=True, verified_prefill_calls=2,
+                             expected_assignments_per_call=4100, observed_assignment_ends=[4100, 4100]),
+                         ggml_device_copy_budget=dict(requested_bytes=1, after=dict(DeviceCopyBudgetBytes=1)))
+        candidate = copy.deepcopy(reference)
+        candidate["environment"] = {}
+        return reference, candidate
+
+    def test_expert_copies_requires_unset_automatic_candidate(self):
+        reference, candidate = self.expert_copy_arms()
+        self.assertTrue(module.compare([reference], [candidate], policy="gptoss-expert-copies")["passed"])
+        candidate["environment"]["TS_WEIGHT_FUSION_COPIES"] = "0"
+        with self.assertRaisesRegex(ValueError, "Expected TS_WEIGHT_FUSION_COPIES"):
+            module.compare([reference], [candidate], policy="gptoss-expert-copies")
+
+    def test_unchecked_quality_is_not_reported_as_exact(self):
+        reference, candidate = self.expert_copy_arms()
+        for report in (reference, candidate):
+            report.update(quality_checked=False, quality_passed=None, quality=[])
+        result = module.compare([reference], [candidate], policy="gptoss-expert-copies")
+        self.assertTrue(result["passed"])
+        self.assertIsNone(result["exact_quality_tokens"])
+
+    def test_expert_copies_checks_cache_and_actual_fallback_engagement(self):
+        reference, candidate = self.expert_copy_arms()
+        for field, value in (("ggml_device_copy_budget", dict(requested_bytes=0, after=dict(DeviceCopyBudgetBytes=0))),
+                             ("gptoss_per_expert_prefill", dict(requested=False))):
+            changed = copy.deepcopy(candidate)
+            changed[field] = value
+            with self.assertRaises(ValueError):
+                module.compare([reference], [changed], policy="gptoss-expert-copies")
+        for report in (reference, candidate):
+            report["gptoss_per_expert_prefill"]["verified_prefill_calls"] = 0
+        with self.assertRaisesRegex(ValueError, "engagement is incomplete"):
+            module.compare([reference], [candidate], policy="gptoss-expert-copies")
+
+    def test_expert_copies_rejects_unapplied_cache_or_other_changed_flags(self):
+        reference, candidate = self.expert_copy_arms()
+        candidate["ggml_device_copy_budget"]["after"]["DeviceCopyBudgetBytes"] = 0
+        with self.assertRaisesRegex(ValueError, "not applied"):
+            module.compare([reference], [candidate], policy="gptoss-expert-copies")
+        reference, candidate = self.expert_copy_arms()
+        candidate["environment"]["TS_Q4E_PREFILL_COMBINE"] = "0"
+        with self.assertRaisesRegex(ValueError, "environment controls"):
+            module.compare([reference], [candidate], policy="gptoss-expert-copies")
+
+    def test_expert_copies_rejects_other_backend_or_model(self):
+        for key, value in (("backend", "Cuda"), ("architecture", "qwen35")):
+            reference, candidate = self.expert_copy_arms()
+            reference[key] = candidate[key] = value
+            with self.assertRaisesRegex(ValueError, "requires GPT-OSS"):
+                module.compare([reference], [candidate], policy="gptoss-expert-copies")
+
 
 if __name__ == "__main__":
     unittest.main()

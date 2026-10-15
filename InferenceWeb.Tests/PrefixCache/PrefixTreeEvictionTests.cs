@@ -269,9 +269,12 @@ public class PrefixTreeEvictionTests
         Assert.Equal(0, q.Drain(null));
         q.Enqueue("pc:0:3", ReleaseReason.Evicted, default);
         Assert.Equal(1, q.Drain(null));                // a null sink drops the batch
-        // A sink that throws still clears the queue.
+        // A failed release keeps ownership for a later idempotent retry.
         q.Enqueue("pc:0:4", ReleaseReason.Evicted, default);
         Assert.Throws<InvalidOperationException>(() => q.Drain((k, r) => throw new InvalidOperationException()));
+        Assert.Equal(1, q.Count);
+        Assert.True(q.Contains("pc:0:4"));
+        Assert.Equal(1, q.Drain((keys, _) => Assert.Equal("pc:0:4", keys[0])));
         Assert.Equal(0, q.Count);
     }
 
@@ -349,6 +352,33 @@ public class PrefixTreeEvictionTests
         Assert.False(pub1.InTree);
         Assert.False(a2.InTree);
         Assert.Equal(2, t.NodeCount);
+        Tk.Valid(t);
+    }
+
+    [Fact]
+    public void AdmissionReclaim_EvictsInPriorityOrder_IncludingNewest_ButHonorsPins()
+    {
+        PrefixTree t = Tk.Tree(Tk.Caps(pages: PageSupport.None));
+        int s = Tk.Scope(t);
+        RadixNode pub = Tk.Put(t, Tk.Key(t, Tk.Seq(1, 20)), 10, 0, p: 10, host: 100);
+        RadixNode old = Tk.Put(t, Tk.Key(t, Tk.Seq(100, 20)), 10, s, host: 100);
+        RadixNode newest = Tk.Put(t, Tk.Key(t, Tk.Seq(200, 20)), 10, s, host: 100);
+        t.Pin(old);
+        LockReceipt held = t.AcquireState(pub);
+        Assert.True(t.EvictOneForAdmission());
+        Assert.False(newest.InTree);
+        Assert.True(old.InTree && pub.InTree);
+        Assert.False(t.EvictOneForAdmission());
+        t.Release(ref held);
+        t.Unpin(old);
+        Assert.True(t.EvictOneForAdmission());
+        Assert.False(old.InTree);
+        Assert.True(pub.InTree);
+        Assert.True(t.EvictOneForAdmission());
+        Assert.False(pub.InTree);
+        Assert.False(t.EvictOneForAdmission());
+        Assert.Equal(3, t.Reclaim.Count);
+        t.Reclaim.Drain((_, reason) => Assert.Equal(ReleaseReason.Pressure, reason));
         Tk.Valid(t);
     }
 

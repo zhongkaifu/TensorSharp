@@ -34,6 +34,17 @@ namespace InferenceWeb.Tests;
 /// </summary>
 public class PrefixCacheStartupTests
 {
+    [Theory]
+    [InlineData(true, true, true, true)]
+    [InlineData(true, false, true, true)]
+    [InlineData(true, false, false, true)]
+    [InlineData(false, true, true, true)]
+    [InlineData(false, false, true, false)]
+    [InlineData(false, true, false, false)]
+    public void UnifiedWarmupStillUsesAdmissionWhenPrefixRetentionIsDisabled(
+        bool unified, bool prefix, bool runtimePrefix, bool expected)
+        => Assert.Equal(expected, PrefixCacheWarmup.ShouldRun(unified, prefix, runtimePrefix));
+
     // ---- the server's warm-up request ------------------------------------
 
     /// <summary>

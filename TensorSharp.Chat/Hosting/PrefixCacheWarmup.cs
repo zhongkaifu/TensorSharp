@@ -37,6 +37,12 @@ namespace TensorSharp.Server.Hosting
     /// </summary>
     public static class PrefixCacheWarmup
     {
+        /// <summary>Unified execution must initialize its admitted kernels even
+        /// when reusable prompt state is explicitly disabled. Other modes retain
+        /// their existing prefix-warmup opt-out behavior.</summary>
+        public static bool ShouldRun(bool unifiedMemoryEnabled, bool prefixCacheEnabled, bool runtimePrefixEnabled)
+            => unifiedMemoryEnabled || (prefixCacheEnabled && runtimePrefixEnabled);
+
         /// <summary>How the warm-up ended, for a caller that wants to say so.</summary>
         public readonly record struct Result(bool Warmed, string Detail, TimeSpan Elapsed)
         {
@@ -78,6 +84,13 @@ namespace TensorSharp.Server.Hosting
         /// its own session.
         /// </remarks>
         public static JsonElement BuildRequest(string sessionId, bool think, int maxTokens = 1)
+            => BuildRequestCore(sessionId, think, maxTokens, false);
+
+        public static JsonElement BuildKernelInitializationRequest(string sessionId, bool think, int maxTokens = 1)
+            => BuildRequestCore(sessionId, think, maxTokens, true);
+
+        private static JsonElement BuildRequestCore(string sessionId, bool think, int maxTokens,
+            bool kernelInitializationOnly)
         {
             if (string.IsNullOrWhiteSpace(sessionId))
                 throw new ArgumentException("a warm-up needs its own session id", nameof(sessionId));
@@ -90,6 +103,17 @@ namespace TensorSharp.Server.Hosting
                 ["think"] = think,
                 ["newChat"] = false,
             };
+            // GLM has no resumable shared-prefix checkpoint adapter. Replaying
+            // the default skills/agent catalog cannot warm that absent cache;
+            // initialize its admitted kernels with a short ordinary chat instead.
+            // This affects only the private startup lease, never user requests.
+            if (kernelInitializationOnly)
+            {
+                body["tools"] = Array.Empty<object>();
+                body["skills"] = Array.Empty<string>();
+                body["skills_discovery"] = false;
+                body["multi_agent"] = false;
+            }
             return JsonSerializer.SerializeToElement(body);
         }
 
@@ -115,19 +139,34 @@ namespace TensorSharp.Server.Hosting
         /// is the point.
         /// </para>
         /// </remarks>
-        public static async Task<Result> RunAsync(
+        public static Task<Result> RunAsync(
             Func<JsonElement, CancellationToken, IAsyncEnumerable<object>> frames,
             string sessionId,
             bool think,
             ILogger logger,
-            CancellationToken cancellationToken = default)
+            CancellationToken cancellationToken = default,
+            int maxTokens = 1)
+            => RunCoreAsync(frames, sessionId, think, logger, cancellationToken, maxTokens, false);
+
+        /// <summary>Initialize admitted kernels without claiming that a reusable
+        /// default chat prefix was prepared. User request configuration is untouched.</summary>
+        public static Task<Result> RunKernelInitializationAsync(
+            Func<JsonElement, CancellationToken, IAsyncEnumerable<object>> frames,
+            string sessionId, bool think, ILogger logger,
+            CancellationToken cancellationToken = default, int maxTokens = 1)
+            => RunCoreAsync(frames, sessionId, think, logger, cancellationToken, maxTokens, true);
+
+        private static async Task<Result> RunCoreAsync(
+            Func<JsonElement, CancellationToken, IAsyncEnumerable<object>> frames,
+            string sessionId, bool think, ILogger logger,
+            CancellationToken cancellationToken, int maxTokens, bool kernelInitializationOnly)
         {
             if (frames == null) throw new ArgumentNullException(nameof(frames));
 
             var clock = Stopwatch.StartNew();
             try
             {
-                JsonElement body = BuildRequest(sessionId, think);
+                JsonElement body = BuildRequestCore(sessionId, think, maxTokens, kernelInitializationOnly);
                 string failure = null;
                 bool completed = false;
                 await foreach (object frame in frames(body, cancellationToken).ConfigureAwait(false))
@@ -152,7 +191,9 @@ namespace TensorSharp.Server.Hosting
                         "Prefix cache warm-up failed: {Error}", failure);
                     return new Result(false, failure, clock.Elapsed);
                 }
-                return new Result(true, "shared-prompt warm-up request completed", clock.Elapsed);
+                return new Result(true, kernelInitializationOnly
+                    ? "kernel-initialization request completed; shared prefix not prepared"
+                    : "shared-prompt warm-up request completed", clock.Elapsed);
             }
             catch (OperationCanceledException)
             {

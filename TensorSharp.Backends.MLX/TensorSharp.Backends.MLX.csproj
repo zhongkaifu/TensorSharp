@@ -50,6 +50,6 @@
       <MlxNativeBinary Include="$(MlxNativeInstallDir)/$(MlxNativeMetallibName)" Condition="'$(MlxNativeMetallibName)' != '' And Exists('$(MlxNativeInstallDir)/$(MlxNativeMetallibName)')" />
       <MlxNativeBinary Include="$(MlxNativeInstallDir)/lib/$(MlxNativeMetallibName)" Condition="'$(MlxNativeMetallibName)' != '' And !Exists('$(MlxNativeInstallDir)/$(MlxNativeMetallibName)') And Exists('$(MlxNativeInstallDir)/lib/$(MlxNativeMetallibName)')" />
     </ItemGroup>
-    <Copy SourceFiles="@(MlxNativeBinary)" DestinationFolder="$(OutputPath)" SkipUnchangedFiles="true" />
+    <Copy SourceFiles="@(MlxNativeBinary)" DestinationFolder="$(TargetDir)" SkipUnchangedFiles="true" />
   </Target>
 </Project>

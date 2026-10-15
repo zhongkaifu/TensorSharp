@@ -34,6 +34,7 @@
     <EmbeddedResource Include="Fixtures/NemotronAudio/reference128.json" />
     <EmbeddedResource Include="Fixtures/NemotronAudio/frontend_reference.json" />
     <EmbeddedResource Include="Fixtures/Qwen35MRope/reference_positions.json" />
+    <EmbeddedResource Include="Fixtures/QwenImageBicubic/reference.json" />
     <EmbeddedResource Include="Fixtures/Glm4Tokenizer/reference.json" />
     <EmbeddedResource Include="Fixtures/DesktopSurface/create_surface.c" />
     <EmbeddedResource Include="Fixtures/WindowsKnownFolders/probe.py" />

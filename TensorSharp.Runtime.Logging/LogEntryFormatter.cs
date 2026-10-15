@@ -130,13 +130,7 @@ namespace TensorSharp.Runtime.Logging
 
             writer.WritePropertyName("props");
             writer.WriteStartObject();
-            for (int i = 0; i < state.Count; i++)
-            {
-                var kv = state[i];
-                if (kv.Key == "{OriginalFormat}")
-                    continue;
-                WriteProperty(writer, kv.Key, kv.Value);
-            }
+            WriteUniqueProperties(writer, state);
             writer.WriteEndObject();
         }
 
@@ -144,14 +138,26 @@ namespace TensorSharp.Runtime.Logging
         {
             writer.WritePropertyName("scope");
             writer.WriteStartObject();
-            for (int i = 0; i < scopes.Count; i++)
+            WriteUniqueProperties(writer, scopes);
+            writer.WriteEndObject();
+        }
+
+        private static void WriteUniqueProperties(Utf8JsonWriter writer, IReadOnlyList<KeyValuePair<string, object>> properties)
+        {
+            // ASP.NET's outer request scope and our middleware both supply
+            // RequestId. Emit one unambiguous member, with the innermost scope
+            // (last captured value) winning. Repeated template placeholders use
+            // the same rule. Formatting runs on the background writer thread.
+            var values = new Dictionary<string, object>(properties.Count, StringComparer.Ordinal);
+            for (int i = 0; i < properties.Count; i++)
             {
-                var kv = scopes[i];
+                var kv = properties[i];
                 if (kv.Key == "{OriginalFormat}")
                     continue;
-                WriteProperty(writer, kv.Key, kv.Value);
+                values[kv.Key] = kv.Value;
             }
-            writer.WriteEndObject();
+            foreach (var kv in values)
+                WriteProperty(writer, kv.Key, kv.Value);
         }
 
         private static void WriteProperty(Utf8JsonWriter writer, string name, object value)

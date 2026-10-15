@@ -1,4 +1,4 @@
-﻿// Copyright (c) Zhongkai Fu. All rights reserved.
+// Copyright (c) Zhongkai Fu. All rights reserved.
 // https://github.com/zhongkaifu/TensorSharp
 //
 // This file is part of TensorSharp.
@@ -343,6 +343,7 @@ namespace TensorSharp.Models
 
         public void LoadVisionEncoder(string mmProjPath)
         {
+            RefuseStreamingAlternateEntry("vision encoder loading");
             // The direct CUDA backend currently diverges numerically in the Gemma4
             // vision stack; keep projector embeddings on the stable CPU path and
             // copy the final embeddings into the CUDA language model.
@@ -358,16 +359,38 @@ namespace TensorSharp.Models
 
         public void LoadAudioEncoder(string mmProjPath)
         {
+            RefuseStreamingAlternateEntry("audio encoder loading");
             _audioEncoder = new Gemma4AudioEncoder(mmProjPath, _allocator);
             _audioEncoder.SetHostModel(this);
         }
 
         public void SetAudioEmbeddings(Tensor embeddings, int insertPosition)
         {
+            RefuseStreamingAlternateEntry("audio embeddings");
             _pendingAudioEmbeddingsList.Add((embeddings, insertPosition));
         }
 
-        public Gemma4Model(string ggufPath, BackendType backend, int tpDegree = 1, ITensorParallelGroup tpGroup = null) : base(ggufPath, backend, tpDegree, tpGroup)
+        public Gemma4Model(string ggufPath, BackendType backend, int tpDegree = 1, ITensorParallelGroup tpGroup = null,
+            WeightStreamingOptions weightStreaming = null, string draftModelPath = null)
+            : this(ggufPath, backend, tpDegree, tpGroup, weightStreaming, draftModelPath, null)
+        {
+        }
+
+        public Gemma4Model(string ggufPath, BackendType backend,
+            int tpDegree, ITensorParallelGroup tpGroup,
+            WeightStreamingOptions weightStreaming, string draftModelPath, ModelMemoryPolicy memoryPolicy)
+            : base(ggufPath, backend, tpDegree, tpGroup, 1, weightStreaming, memoryPolicy)
+        {
+            try { InitializeGemma4Model(draftModelPath); }
+            catch
+            {
+                if (weightStreaming != null || memoryPolicy != null)
+                    CleanUpFailedBonsaiConstruction(DisposeGemma4Resources, () => base.Dispose());
+                throw;
+            }
+        }
+
+        private void InitializeGemma4Model(string draftModelPath)
         {
             Config = new ModelConfig { Architecture = _gguf.GetString("general.architecture") };
             ParseBaseConfig();
@@ -460,6 +483,7 @@ namespace TensorSharp.Models
             }
 
             ParseTokenizer();
+            ValidateStreamingWeightConfiguration(draftModelPath);
             LoadWeights();
 
             _hasTiedOutput = !_weights.ContainsKey("output.weight") && !_quantWeights.ContainsKey("output.weight");
@@ -468,10 +492,15 @@ namespace TensorSharp.Models
 
             DetectHeadDimsFromWeights();
             LoadLayerScalars();
-            FuseQKVWeights();
-            FuseGateUpWeights();
-            FuseExpertGateUpWeights();
-            CacheMoEStackedWeights();
+            if (HasStreamingWeights)
+                ComposeStreamingProjectionWeights();
+            else
+            {
+                FuseQKVWeights();
+                FuseGateUpWeights();
+                FuseExpertGateUpWeights();
+                CacheMoEStackedWeights();
+            }
 
             if (IsTensorParallel)
             {
@@ -479,7 +508,7 @@ namespace TensorSharp.Models
                 ShardGemma4WeightsForTP();
                 PrepareCudaQuantizedWeightsForInferenceTP();
             }
-            else
+            else if (!HasStreamingWeights)
             {
                 PrepareCudaQuantizedWeightsForInference();
             }
@@ -1271,6 +1300,7 @@ namespace TensorSharp.Models
 
         public void SetVisionEmbeddings(Tensor embeddings, int insertPosition)
         {
+            RefuseStreamingAlternateEntry("vision embeddings");
             _pendingVisionEmbeddingsList.Add((embeddings, insertPosition));
         }
 
@@ -1293,6 +1323,7 @@ namespace TensorSharp.Models
 
         private float[] ForwardComputeCore(int[] tokens)
         {
+            if (HasStreamingWeights) return ForwardStreamingCore(tokens, produceLogits: true);
             _forwardSw.Start();
             int seqLen = tokens.Length;
             int startPos = _cacheSeqLen;
@@ -1657,11 +1688,12 @@ namespace TensorSharp.Models
         // call site (returns true only when MLX backend + tied/quantized
         // LM head + quantized token_embd are all available).
         public override bool SupportsPipelinedGreedy =>
-            _backend == BackendType.Mlx
+            !HasStreamingWeights && _backend == BackendType.Mlx
             && _quantWeights.ContainsKey("token_embd.weight");
 
         public override Tensor SubmitGreedyDecodeStep(int? firstTokenForBegin)
         {
+            RefuseStreamingAlternateEntry("pipelined greedy decoding");
             // Same wrapping rationale as Forward(): collapse all nested MLX
             // worker round-trips into one big inline run on the worker thread.
             if (_backend == BackendType.Mlx && !MlxWorker.Shared.IsOnWorkerThread)
@@ -1921,6 +1953,7 @@ namespace TensorSharp.Models
         // Shared by ForwardRefill and the MTP speculative prefill (SpecForward).
         internal int ComputePrefillChunkSize()
         {
+            if (MemoryPolicy != null) return MemoryPolicy.PrefillChunkTokens;
             // 2048 is the memory-safe ceiling for the full-attention score tensor
             // (~numHeads ├ù chunk ├ù totalKv ├ù 4B). We floor at it (not window*2) so a
             // single start_pos==0 chunk covers typical long prompts even on
@@ -1945,7 +1978,7 @@ namespace TensorSharp.Models
 
         protected override float[] ForwardRefillCore(int[] tokens)
         {
-            if (tokens == null || tokens.Length <= 1 || !_canUseFusedDecode)
+            if (tokens == null || tokens.Length <= 1 || (!_canUseFusedDecode && !HasStreamingWeights))
                 return ForwardCore(tokens);
 
             // The chunked prefill path (PrefillWithoutLogits) uses the non-TP
@@ -1996,6 +2029,11 @@ namespace TensorSharp.Models
         {
             if (tokens == null || tokens.Length == 0)
                 return;
+            if (HasStreamingWeights)
+            {
+                ForwardStreamingCore(tokens, produceLogits: false);
+                return;
+            }
 
             _forwardSw.Start();
             int seqLen = tokens.Length;
@@ -2605,6 +2643,13 @@ namespace TensorSharp.Models
 
         private unsafe void BuildGemma4DecodeArrays()
         {
+            if (HasStreamingWeights)
+            {
+                // The streamed per-op path also writes RoPE/cache buffers on
+                // the host; it needs the same eager-sync contract as below.
+                if (GgmlBasicOps.GetAsyncCompute()) GgmlBasicOps.SetAsyncCompute(false);
+                return;
+            }
             if (!IsGgmlBackend) return;
 
             // Under tensor parallelism the projection weights have been replaced
@@ -3173,6 +3218,7 @@ namespace TensorSharp.Models
 
         public bool CanBatchDecode(string requestId, int position)
         {
+            if (HasStreamingWeights) return false;
             if (position < 0 || _fusedHolders == null
                 || !_fusedHolders.TryGetValue(requestId, out var holder)) return false;
             // A checked-out holder's dictionary snapshot can predate its most
@@ -3199,6 +3245,7 @@ namespace TensorSharp.Models
         public unsafe bool TryForwardBatchedFusedDecode(
             IReadOnlyList<string> requestIds, int[] tokens, int[] positions, float[][] outLogits)
         {
+            if (HasStreamingWeights) return DeclineBatchedFusedDecode("file-backed weights require the sequential forward path");
             BatchedFusedDecodeDeclineReason = null;
             // ---- gates (any failure => round-robin fallback) ----
             if (!IsGgmlBackend) return DeclineBatchedFusedDecode("requires a GGML backend");
@@ -4436,6 +4483,7 @@ namespace TensorSharp.Models
 
         private unsafe Tensor ComputePLE(int[] tokens, Tensor hiddenState, int seqLen)
         {
+            if (HasStreamingWeights) return ComputeStreamingPLE(tokens, hiddenState, seqLen);
             int totalPleDim = _pleDim * Config.NumLayers;
 
             Tensor pleTokenEmb = null;
@@ -4602,7 +4650,7 @@ namespace TensorSharp.Models
         internal bool ForceUnfused { get; set; }
 
         /// <summary>Fused layer prefill, unless this instance was forced unfused.</summary>
-        private bool UseFusedLayerPrefill => !ForceUnfused;
+        private bool UseFusedLayerPrefill => !HasStreamingWeights && !ForceUnfused;
 
         private Tensor TransformerBlock(Tensor hidden, int layer, int seqLen, int startPos,
             bool isShared, Tensor perLayerInput, HashSet<int> exceptPositions = null)
@@ -5880,11 +5928,13 @@ namespace TensorSharp.Models
             // caller applies Gemma's post_ffw_norm + residual add. Covers both the
             // batched (server, dense layers) and per-sequence (CLI, MoE-fallback
             // dense layers) paths since both route through here.
-            var fusedProj = TryFusedDenseFFNProject(input, normWeightName, gateUpWeightName, downWeightName, actType: 1);
+            var fusedProj = HasStreamingWeights ? null
+                : TryFusedDenseFFNProject(input, normWeightName, gateUpWeightName, downWeightName, actType: 1);
             if (fusedProj != null)
                 return fusedProj;
 
             using var normed = RMSNormOp(input, normWeightName);
+            DumpStreamingTensor(normed, $"layer{_gemmaDiagnosticCurrentLayer:D2}.ffnNorm", _gemmaDiagnosticCurrentLayer);
             return FFNGelu(normed, gateUpWeightName, downWeightName, seqLen);
         }
 
@@ -5984,6 +6034,7 @@ namespace TensorSharp.Models
 
         private bool TryFusedPleBlockGgml(Tensor result, Tensor perLayerInput, string prefix)
         {
+            if (HasStreamingWeights) return false;
             if (!_ggmlFusedPle)
                 return false;
             if (_backend != BackendType.GgmlCuda && _backend != BackendType.GgmlMetal && _backend != BackendType.GgmlCpu)
@@ -6042,6 +6093,19 @@ namespace TensorSharp.Models
         private Tensor FFNGeluProjected(Tensor gateUp, string downWeightName, int seqLen)
         {
             int halfDim = (int)(gateUp.Sizes[1] / 2);
+            if (HasStreamingWeights)
+            {
+                using (gateUp)
+                using (var gateView = gateUp.Narrow(1, 0, halfDim))
+                using (var streamedGate = Ops.NewContiguous(gateView))
+                using (var streamedUp = gateUp.Narrow(1, halfDim, halfDim))
+                {
+                    Ops.GELUMul(streamedGate, streamedGate, streamedUp);
+                    DumpStreamingTensor(streamedGate, $"layer{_gemmaDiagnosticCurrentLayer:D2}.ffnActivation", _gemmaDiagnosticCurrentLayer);
+                    return LinearForward(streamedGate, downWeightName)
+                        ?? throw new InvalidOperationException($"Missing FFN down projection weight '{downWeightName}'.");
+                }
+            }
 
             if (_backend == BackendType.Mlx)
             {
@@ -6114,6 +6178,17 @@ namespace TensorSharp.Models
 
         private Tensor FFNGeluSeparate(Tensor input, string gateWeightName, string upWeightName, string downWeightName)
         {
+            if (HasStreamingWeights)
+            {
+                using var streamedGate = LinearForward(input, gateWeightName)
+                    ?? throw new InvalidOperationException($"Missing FFN gate projection weight '{gateWeightName}'.");
+                using var streamedUp = LinearForward(input, upWeightName)
+                    ?? throw new InvalidOperationException($"Missing FFN up projection weight '{upWeightName}'.");
+                Ops.GELUMul(streamedGate, streamedGate, streamedUp);
+                DumpStreamingTensor(streamedGate, $"layer{_gemmaDiagnosticCurrentLayer:D2}.ffnActivation", _gemmaDiagnosticCurrentLayer);
+                return LinearForward(streamedGate, downWeightName)
+                    ?? throw new InvalidOperationException($"Missing FFN down projection weight '{downWeightName}'.");
+            }
             Tensor gate = LinearForward(input, gateWeightName);
             if (gate == null)
                 throw new InvalidOperationException($"Missing FFN gate projection weight '{gateWeightName}'.");
@@ -6192,105 +6267,143 @@ namespace TensorSharp.Models
             int qDim = Config.NumHeads * hd;
             int kDim = kvHeads * hd;
 
-            Tensor q, k = null, v = null;
+            Tensor q = null, k = null, v = null;
             string qkvName = $"{prefix}.attn_qkv.weight";
             bool useFusedQKV = !isShared && (_quantWeights.ContainsKey(qkvName) || _weights.ContainsKey(qkvName));
 
             // For global (non-SWA) prefill layers with fused QKV, use a fast path
             // that copies directly from QKV to head-first layout, skipping the
             // intermediate flat copies and the separate ReshapeToHeads step.
-            bool _useGlobalFastPath = useFusedQKV && seqLen > 1 && !isLocal && !isShared;
+            bool _useGlobalFastPath = !HasStreamingWeights && useFusedQKV && seqLen > 1 && !isLocal && !isShared;
             Tensor _globalQHeads = null, _globalKHeads = null, _globalVHeads = null;
+            Tensor projectionOwner = null;
 
-            if (_useGlobalFastPath)
+            try
             {
-                Tensor qkv = LinearForward(input, qkvName);
-
-                _globalQHeads = SplitQKVToHeadFirst(qkv, 0, Config.NumHeads, seqLen, hd);
-                _globalKHeads = SplitQKVToHeadFirst(qkv, qDim, kvHeads, seqLen, hd);
-                _globalVHeads = SplitQKVToHeadFirst(qkv, qDim + kDim, kvHeads, seqLen, hd);
-                qkv.Dispose();
-
-                // RMSNorm on head-first layout (row-independent, order doesn't matter)
-                using (var qR = _globalQHeads.View(Config.NumHeads * seqLen, hd))
-                    Ops.RMSNorm(qR, qR, _weights[$"{prefix}.attn_q_norm.weight"], null, Config.Eps);
-                using (var kR = _globalKHeads.View(kvHeads * seqLen, hd))
-                    Ops.RMSNorm(kR, kR, _weights[$"{prefix}.attn_k_norm.weight"], null, Config.Eps);
-                ApplyUnweightedRMSNorm(_globalVHeads, kvHeads, hd, seqLen);
-
-                // NeoX RoPE on head-first layout
-                float[] globalFreqs = _ropeFreqsGlobal;
-                ApplyNeoXRoPEHeadFirst(_globalQHeads, Config.NumHeads, hd, seqLen, startPos, globalFreqs);
-                ApplyNeoXRoPEHeadFirst(_globalKHeads, kvHeads, hd, seqLen, startPos, globalFreqs);
-
-                q = null; k = null; v = null;
-            }
-            else if (useFusedQKV)
-            {
-                Tensor qkv = LinearForward(input, qkvName);
-                int vDim = (int)qkv.Sizes[1] - qDim - kDim;
-
-                if (seqLen == 1)
+                if (_useGlobalFastPath)
                 {
-                    q = qkv.Narrow(1, 0, qDim);
-                    k = qkv.Narrow(1, qDim, kDim);
-                    v = qkv.Narrow(1, qDim + kDim, vDim);
+                    Tensor qkv = projectionOwner = LinearForward(input, qkvName);
+
+                    _globalQHeads = SplitQKVToHeadFirst(qkv, 0, Config.NumHeads, seqLen, hd);
+                    _globalKHeads = SplitQKVToHeadFirst(qkv, qDim, kvHeads, seqLen, hd);
+                    _globalVHeads = SplitQKVToHeadFirst(qkv, qDim + kDim, kvHeads, seqLen, hd);
+                    qkv.Dispose();
+
+                    // RMSNorm on head-first layout (row-independent, order doesn't matter)
+                    using (var qR = _globalQHeads.View(Config.NumHeads * seqLen, hd))
+                        Ops.RMSNorm(qR, qR, _weights[$"{prefix}.attn_q_norm.weight"], null, Config.Eps);
+                    using (var kR = _globalKHeads.View(kvHeads * seqLen, hd))
+                        Ops.RMSNorm(kR, kR, _weights[$"{prefix}.attn_k_norm.weight"], null, Config.Eps);
+                    ApplyUnweightedRMSNorm(_globalVHeads, kvHeads, hd, seqLen);
+
+                    // NeoX RoPE on head-first layout
+                    float[] globalFreqs = _ropeFreqsGlobal;
+                    ApplyNeoXRoPEHeadFirst(_globalQHeads, Config.NumHeads, hd, seqLen, startPos, globalFreqs);
+                    ApplyNeoXRoPEHeadFirst(_globalKHeads, kvHeads, hd, seqLen, startPos, globalFreqs);
+
+                    q = null; k = null; v = null;
                 }
-                else
+                else if (useFusedQKV)
                 {
-                    q = SliceColumnsContiguous(qkv, 0, qDim);
-                    k = SliceColumnsContiguous(qkv, qDim, kDim);
-                    v = SliceColumnsContiguous(qkv, qDim + kDim, vDim);
-                }
-                qkv.Dispose();
-
-                if (seqLen == 1)
-                {
-                    RMSNormInPlace(q, _weights[$"{prefix}.attn_q_norm.weight"], Config.NumHeads, hd, Config.Eps);
-                    RMSNormInPlace(k, _weights[$"{prefix}.attn_k_norm.weight"], kvHeads, hd, Config.Eps);
-                }
-                else
-                {
-                    q = ApplyBatchRMSNorm(q, $"{prefix}.attn_q_norm.weight", Config.NumHeads, seqLen, hd);
-                    k = ApplyBatchRMSNorm(k, $"{prefix}.attn_k_norm.weight", kvHeads, seqLen, hd);
-                }
-                ApplyUnweightedRMSNorm(v, kvHeads, hd, seqLen);
-            }
-            else
-            {
-                q = LinearForward(input, $"{prefix}.attn_q.weight");
-
-                if (seqLen == 1)
-                    RMSNormInPlace(q, _weights[$"{prefix}.attn_q_norm.weight"], Config.NumHeads, hd, Config.Eps);
-                else
-                    q = ApplyBatchRMSNorm(q, $"{prefix}.attn_q_norm.weight", Config.NumHeads, seqLen, hd);
-
-                if (!isShared)
-                {
-                    k = LinearForward(input, $"{prefix}.attn_k.weight");
-
-                    bool hasVWeight = _weights.ContainsKey($"{prefix}.attn_v.weight") ||
-                                      _quantWeights.ContainsKey($"{prefix}.attn_v.weight");
-                    if (hasVWeight)
-                        v = LinearForward(input, $"{prefix}.attn_v.weight");
-                    else
-                    {
-                        v = new Tensor(_allocator, DType.Float32, k.Sizes);
-                        Ops.Copy(v, k);
-                    }
+                    Tensor qkv = projectionOwner = LinearForward(input, qkvName);
+                    int vDim = (int)qkv.Sizes[1] - qDim - kDim;
 
                     if (seqLen == 1)
-                        RMSNormInPlace(k, _weights[$"{prefix}.attn_k_norm.weight"], kvHeads, hd, Config.Eps);
+                    {
+                        q = qkv.Narrow(1, 0, qDim);
+                        k = qkv.Narrow(1, qDim, kDim);
+                        v = qkv.Narrow(1, qDim + kDim, vDim);
+                    }
                     else
-                        k = ApplyBatchRMSNorm(k, $"{prefix}.attn_k_norm.weight", kvHeads, seqLen, hd);
+                    {
+                        q = SliceColumnsContiguous(qkv, 0, qDim);
+                        k = SliceColumnsContiguous(qkv, qDim, kDim);
+                        v = SliceColumnsContiguous(qkv, qDim + kDim, vDim);
+                    }
+                    qkv.Dispose();
 
+                    DumpStreamingTensor(q, $"layer{layer:D2}.qProjected", layer);
+                    DumpStreamingTensor(k, $"layer{layer:D2}.kProjected", layer);
+                    DumpStreamingTensor(v, $"layer{layer:D2}.vProjected", layer);
+                    if (!HasStreamingWeights)
+                    {
+                        if (seqLen == 1)
+                        {
+                            RMSNormInPlace(q, _weights[$"{prefix}.attn_q_norm.weight"], Config.NumHeads, hd, Config.Eps);
+                            RMSNormInPlace(k, _weights[$"{prefix}.attn_k_norm.weight"], kvHeads, hd, Config.Eps);
+                        }
+                        else
+                        {
+                            q = ApplyBatchRMSNorm(q, $"{prefix}.attn_q_norm.weight", Config.NumHeads, seqLen, hd);
+                            k = ApplyBatchRMSNorm(k, $"{prefix}.attn_k_norm.weight", kvHeads, seqLen, hd);
+                        }
+                    }
                     ApplyUnweightedRMSNorm(v, kvHeads, hd, seqLen);
                 }
+                else
+                {
+                    q = LinearForward(input, $"{prefix}.attn_q.weight");
+                    DumpStreamingTensor(q, $"layer{layer:D2}.qProjected", layer);
+
+                    if (!HasStreamingWeights)
+                    {
+                        if (seqLen == 1)
+                            RMSNormInPlace(q, _weights[$"{prefix}.attn_q_norm.weight"], Config.NumHeads, hd, Config.Eps);
+                        else
+                            q = ApplyBatchRMSNorm(q, $"{prefix}.attn_q_norm.weight", Config.NumHeads, seqLen, hd);
+                    }
+
+                    if (!isShared)
+                    {
+                        k = LinearForward(input, $"{prefix}.attn_k.weight");
+                        DumpStreamingTensor(k, $"layer{layer:D2}.kProjected", layer);
+
+                        bool hasVWeight = _weights.ContainsKey($"{prefix}.attn_v.weight") ||
+                                          _quantWeights.ContainsKey($"{prefix}.attn_v.weight");
+                        if (hasVWeight)
+                            v = LinearForward(input, $"{prefix}.attn_v.weight");
+                        else
+                        {
+                            v = new Tensor(_allocator, DType.Float32, k.Sizes);
+                            Ops.Copy(v, k);
+                        }
+                        DumpStreamingTensor(v, $"layer{layer:D2}.vProjected", layer);
+
+                        if (!HasStreamingWeights)
+                        {
+                            if (seqLen == 1)
+                                RMSNormInPlace(k, _weights[$"{prefix}.attn_k_norm.weight"], kvHeads, hd, Config.Eps);
+                            else
+                                k = ApplyBatchRMSNorm(k, $"{prefix}.attn_k_norm.weight", kvHeads, seqLen, hd);
+                        }
+
+                        ApplyUnweightedRMSNorm(v, kvHeads, hd, seqLen);
+                    }
+                }
+                if (HasStreamingWeights)
+                {
+                    Tensor factors = null;
+                    if (!isLocal) _weights.TryGetValue("rope_freqs.weight", out factors);
+                    int ropeDim = isLocal ? hd : _partialRotaryDims;
+                    float ropeBase = isLocal ? _ropeLocalBase : _ropeGlobalBase;
+                    GgmlBasicOps.StreamingNormRoPE(q, _weights[$"{prefix}.attn_q_norm.weight"], factors, q,
+                        Config.NumHeads, hd, seqLen, startPos, ropeDim, Config.Eps, ropeBase);
+                    if (k != null)
+                        GgmlBasicOps.StreamingNormRoPE(k, _weights[$"{prefix}.attn_k_norm.weight"], factors, k,
+                            kvHeads, hd, seqLen, startPos, ropeDim, Config.Eps, ropeBase);
+                }
+            }
+            catch when (HasStreamingWeights)
+            {
+                q?.Dispose(); k?.Dispose(); v?.Dispose();
+                _globalQHeads?.Dispose(); _globalKHeads?.Dispose(); _globalVHeads?.Dispose();
+                projectionOwner?.Dispose();
+                throw;
             }
 
             // Apply NeoX-style RoPE (skipped for the global fast path, which
             // already applied it).
-            if (!_useGlobalFastPath)
+            if (!_useGlobalFastPath && !HasStreamingWeights)
             {
                 float[] freqs = isLocal ? _ropeFreqsLocal : _ropeFreqsGlobal;
                 if (seqLen == 1)
@@ -6314,6 +6427,9 @@ namespace TensorSharp.Models
             }
 
             int totalSeqLen = startPos + seqLen;
+            DumpStreamingTensor(q, $"layer{layer:D2}.qNormRope", layer);
+            DumpStreamingTensor(k, $"layer{layer:D2}.kNormRope", layer);
+            DumpStreamingTensor(v, $"layer{layer:D2}.vNormed", layer);
             Tensor result;
 
             if (seqLen == 1)
@@ -6363,7 +6479,25 @@ namespace TensorSharp.Models
                 int kvCacheLayer = _kvDonorMap.TryGetValue(layer, out int donor) ? donor : layer;
                 int cacheLen = _kvCacheSize[kvCacheLayer];
 
-                if (isLocal)
+                if (HasStreamingWeights)
+                {
+                    using var qHeads = q.View(Config.NumHeads, 1, hd);
+                    if (isLocal)
+                    {
+                        int attendLen = Math.Min(totalSeqLen, _slidingWindow);
+                        // Resident CUDA decode reads the saturated ring in
+                        // physical order from offset zero. All entries are in
+                        // this single query's window; rotating them would only
+                        // change floating-point reduction order. Before the
+                        // ring fills, the same physical prefix is chronological.
+                        result = StreamingCacheAttention(qHeads, _kvCacheK[kvCacheLayer], _kvCacheV[kvCacheLayer],
+                            kvHeads, hd, 1, attendLen);
+                    }
+                    else
+                        result = StreamingCacheAttention(qHeads, _kvCacheK[kvCacheLayer], _kvCacheV[kvCacheLayer],
+                            kvHeads, hd, 1, totalSeqLen);
+                }
+                else if (isLocal)
                 {
                     int attendLen = Math.Min(totalSeqLen, _slidingWindow);
                     result = new Tensor(_allocator, DType.Float32, 1, Config.NumHeads * hd);
@@ -6534,12 +6668,18 @@ namespace TensorSharp.Models
                     int maskStart = kvLen - seqLen;
                     // Native kernel outputs directly in flat [seqLen, numHeads*hd]
                     // via on-device permute+cont, skipping ReshapeFromHeadsEx copy.
-                    result = new Tensor(_allocator, DType.Float32, seqLen, Config.NumHeads * hd);
-                    GgmlBasicOps.FusedPrefillAttention(
-                        qHeads, kvSrcK, kvSrcV, result,
-                        Config.NumHeads, kvHeads, hd,
-                        seqLen, kvLen,
-                        maskStart, windowSize, 1.0f);
+                    if (HasStreamingWeights)
+                        result = StreamingPrefillAttention(qHeads, kvSrcK, kvSrcV, kvHeads, hd,
+                            seqLen, kvLen, windowSize, _kvCacheK[kvCacheLayer].ElementType);
+                    else
+                    {
+                        result = new Tensor(_allocator, DType.Float32, seqLen, Config.NumHeads * hd);
+                        GgmlBasicOps.FusedPrefillAttention(
+                            qHeads, kvSrcK, kvSrcV, result,
+                            Config.NumHeads, kvHeads, hd,
+                            seqLen, kvLen,
+                            maskStart, windowSize, 1.0f);
+                    }
                     qHeads.Dispose();
                 }
                 else if (result == null && _backend == BackendType.Cuda && canUseFusedPrefillAttn)
@@ -6614,34 +6754,39 @@ namespace TensorSharp.Models
                     // need the custom mask the flash kernel can't express.
                     int windowSize = isLocal ? _slidingWindow : 0;
                     int maskStart = kvLen - seqLen;
-                    result = new Tensor(_allocator, DType.Float32, seqLen, Config.NumHeads * hd);
-                    if (!ownsKvSrc
-                        && kvSrcK.ElementType == DType.Float16 && kvSrcV.ElementType == DType.Float16)
-                    {
-                        // Read K/V straight from the F16 cache — no per-chunk F16->F32
-                        // dequant round-trip. The kernel reads the leading kvLen rows of
-                        // each head from the [kvHeads, cacheLen, hd] cache and does GQA
-                        // in-kernel (numKvHeads = kvHeads). mul_mat accumulates in F32, so
-                        // the result is identical to dequantizing first.
-                        int kvCacheLen = (int)kvSrcK.Sizes[1];
-                        GgmlBasicOps.FusedPrefillAttentionF16KV(
-                            qHeads, kvSrcK, kvSrcV, result,
-                            Config.NumHeads, kvHeads, hd,
-                            seqLen, kvLen, kvCacheLen,
-                            maskStart, windowSize, 1.0f);
-                    }
+                    if (HasStreamingWeights)
+                        result = StreamingCacheAttention(qHeads, kvSrcK, kvSrcV, kvHeads, hd, seqLen, kvLen);
                     else
                     {
-                        // F32 cache (or owned concat src): dequant to F32 then flash.
-                        Tensor kF32 = ExpandKVHeads(kvSrcK, 1, kvLen);
-                        Tensor vF32 = ExpandKVHeads(kvSrcV, 1, kvLen);
-                        GgmlBasicOps.FusedPrefillAttention(
-                            qHeads, kF32, vF32, result,
-                            Config.NumHeads, kvHeads, hd,
-                            seqLen, kvLen,
-                            maskStart, windowSize, 1.0f);
-                        kF32.Dispose();
-                        vF32.Dispose();
+                        result = new Tensor(_allocator, DType.Float32, seqLen, Config.NumHeads * hd);
+                        if (!ownsKvSrc
+                            && kvSrcK.ElementType == DType.Float16 && kvSrcV.ElementType == DType.Float16)
+                        {
+                            // Read K/V straight from the F16 cache — no per-chunk F16->F32
+                            // dequant round-trip. The kernel reads the leading kvLen rows of
+                            // each head from the [kvHeads, cacheLen, hd] cache and does GQA
+                            // in-kernel (numKvHeads = kvHeads). mul_mat accumulates in F32, so
+                            // the result is identical to dequantizing first.
+                            int kvCacheLen = (int)kvSrcK.Sizes[1];
+                            GgmlBasicOps.FusedPrefillAttentionF16KV(
+                                qHeads, kvSrcK, kvSrcV, result,
+                                Config.NumHeads, kvHeads, hd,
+                                seqLen, kvLen, kvCacheLen,
+                                maskStart, windowSize, 1.0f);
+                        }
+                        else
+                        {
+                            // F32 cache (or owned concat src): dequant to F32 then flash.
+                            Tensor kF32 = ExpandKVHeads(kvSrcK, 1, kvLen);
+                            Tensor vF32 = ExpandKVHeads(kvSrcV, 1, kvLen);
+                            GgmlBasicOps.FusedPrefillAttention(
+                                qHeads, kF32, vF32, result,
+                                Config.NumHeads, kvHeads, hd,
+                                seqLen, kvLen,
+                                maskStart, windowSize, 1.0f);
+                            kF32.Dispose();
+                            vF32.Dispose();
+                        }
                     }
                     qHeads.Dispose();
                 }
@@ -6720,6 +6865,7 @@ namespace TensorSharp.Models
 
             using (result)
             {
+                DumpStreamingTensor(result, $"layer{layer:D2}.attention", layer);
                 return LinearForward(result, $"{prefix}.attn_output.weight");
             }
         }
@@ -6993,7 +7139,7 @@ namespace TensorSharp.Models
         }
 
         private Tensor ApplyRoPEPrefill(Tensor data, int numHeads, int headDim,
-            int seqLen, int startPos, float ropeBase)
+            int seqLen, int startPos, float ropeBase, int ropeDim = 0, Tensor freqFactors = null)
         {
             // Cache the position tensor: all local layers in a forward pass
             // share the same (seqLen, startPos), only numHeads differs (Q vs K).
@@ -7051,8 +7197,13 @@ namespace TensorSharp.Models
             }
 
             using var reshaped = data.View(1, seqLen, numHeads, headDim);
-            Ops.RoPEEx(reshaped, reshaped, posTensor, headDim, 2, 0,
-                ropeBase, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+            if (HasStreamingWeights)
+                GgmlBasicOps.RoPEExWithFreqFactors(reshaped, reshaped, posTensor, freqFactors,
+                    ropeDim > 0 ? ropeDim : headDim, 2, 0,
+                    ropeBase, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+            else
+                Ops.RoPEEx(reshaped, reshaped, posTensor, headDim, 2, 0,
+                    ropeBase, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
             if (freshForRank)
                 posTensor.Dispose();
             return data;
@@ -7515,80 +7666,88 @@ namespace TensorSharp.Models
         {
             if (prevWindowLen <= 0) return null;
             var result = new Tensor(_allocator, DType.Float32, kvHeads, prevWindowLen, headDim);
-            int prevStart = startPos - prevWindowLen;
-            if (CudaFusedOps.TryGatherCircularHeadFirst(result, cache, prevStart, prevWindowLen, cacheSize))
-                return result;
-
-            int firstSlot = ((prevStart % cacheSize) + cacheSize) % cacheSize;
-
-            if (cache.ElementType == DType.Float16)
+            try
             {
-                ushort* cachePtrH = TensorComputePrimitives.GetHalfPointer(cache);
-                float* dstPtrH = GetFloatPtr(result);
-                int doParallelH = kvHeads >= 4 ? 1 : 0;
-                int firstSlotLocal = firstSlot;
-                int prevWindowLenLocal = prevWindowLen;
-                int cacheSizeLocal = cacheSize;
-                int headDimLocal = headDim;
-                long cachePtrHAddr = (long)cachePtrH;
-                long dstPtrHAddr = (long)dstPtrH;
-                void CopyOneHeadH(int h)
+                int prevStart = startPos - prevWindowLen;
+                if (CudaFusedOps.TryGatherCircularHeadFirst(result, cache, prevStart, prevWindowLen, cacheSize))
+                    return result;
+
+                int firstSlot = ((prevStart % cacheSize) + cacheSize) % cacheSize;
+
+                if (cache.ElementType == DType.Float16)
                 {
-                    ushort* cacheHead = (ushort*)cachePtrHAddr + (long)h * cacheSizeLocal * headDimLocal;
-                    float* dstHead = (float*)dstPtrHAddr + (long)h * prevWindowLenLocal * headDimLocal;
-                    if (firstSlotLocal + prevWindowLenLocal <= cacheSizeLocal)
+                    ushort* cachePtrH = TensorComputePrimitives.GetHalfPointer(cache);
+                    float* dstPtrH = GetFloatPtr(result);
+                    int doParallelH = kvHeads >= 4 ? 1 : 0;
+                    int firstSlotLocal = firstSlot;
+                    int prevWindowLenLocal = prevWindowLen;
+                    int cacheSizeLocal = cacheSize;
+                    int headDimLocal = headDim;
+                    long cachePtrHAddr = (long)cachePtrH;
+                    long dstPtrHAddr = (long)dstPtrH;
+                    void CopyOneHeadH(int h)
                     {
-                        TensorComputePrimitives.F16ToF32(dstHead,
-                            cacheHead + (long)firstSlotLocal * headDimLocal,
-                            prevWindowLenLocal * headDimLocal);
+                        ushort* cacheHead = (ushort*)cachePtrHAddr + (long)h * cacheSizeLocal * headDimLocal;
+                        float* dstHead = (float*)dstPtrHAddr + (long)h * prevWindowLenLocal * headDimLocal;
+                        if (firstSlotLocal + prevWindowLenLocal <= cacheSizeLocal)
+                        {
+                            TensorComputePrimitives.F16ToF32(dstHead,
+                                cacheHead + (long)firstSlotLocal * headDimLocal,
+                                prevWindowLenLocal * headDimLocal);
+                        }
+                        else
+                        {
+                            int tailLen = cacheSizeLocal - firstSlotLocal;
+                            TensorComputePrimitives.F16ToF32(dstHead,
+                                cacheHead + (long)firstSlotLocal * headDimLocal,
+                                tailLen * headDimLocal);
+                            int headLen = prevWindowLenLocal - tailLen;
+                            TensorComputePrimitives.F16ToF32(dstHead + (long)tailLen * headDimLocal,
+                                cacheHead, headLen * headDimLocal);
+                        }
+                    }
+                    if (doParallelH != 0)
+                        System.Threading.Tasks.Parallel.For(0, kvHeads, CopyOneHeadH);
+                    else
+                        for (int h = 0; h < kvHeads; h++) CopyOneHeadH(h);
+                    return result;
+                }
+
+                float* cachePtr = GetFloatPtr(cache);
+                float* dstPtr = GetFloatPtr(result);
+                long headBytes = (long)headDim * sizeof(float);
+
+                int doParallel = kvHeads >= 4 ? 1 : 0;
+                void CopyOneHead(int h)
+                {
+                    float* cacheHead = cachePtr + (long)h * cacheSize * headDim;
+                    float* dstHead = dstPtr + (long)h * prevWindowLen * headDim;
+                    if (firstSlot + prevWindowLen <= cacheSize)
+                    {
+                        long bytes = (long)prevWindowLen * headBytes;
+                        Buffer.MemoryCopy(cacheHead + (long)firstSlot * headDim, dstHead, bytes, bytes);
                     }
                     else
                     {
-                        int tailLen = cacheSizeLocal - firstSlotLocal;
-                        TensorComputePrimitives.F16ToF32(dstHead,
-                            cacheHead + (long)firstSlotLocal * headDimLocal,
-                            tailLen * headDimLocal);
-                        int headLen = prevWindowLenLocal - tailLen;
-                        TensorComputePrimitives.F16ToF32(dstHead + (long)tailLen * headDimLocal,
-                            cacheHead, headLen * headDimLocal);
+                        int tailLen = cacheSize - firstSlot;
+                        long tailBytes = (long)tailLen * headBytes;
+                        Buffer.MemoryCopy(cacheHead + (long)firstSlot * headDim, dstHead, tailBytes, tailBytes);
+                        int headLen = prevWindowLen - tailLen;
+                        long headRangeBytes = (long)headLen * headBytes;
+                        Buffer.MemoryCopy(cacheHead, dstHead + (long)tailLen * headDim, headRangeBytes, headRangeBytes);
                     }
                 }
-                if (doParallelH != 0)
-                    System.Threading.Tasks.Parallel.For(0, kvHeads, CopyOneHeadH);
+                if (doParallel != 0)
+                    System.Threading.Tasks.Parallel.For(0, kvHeads, CopyOneHead);
                 else
-                    for (int h = 0; h < kvHeads; h++) CopyOneHeadH(h);
+                    for (int h = 0; h < kvHeads; h++) CopyOneHead(h);
                 return result;
             }
-
-            float* cachePtr = GetFloatPtr(cache);
-            float* dstPtr = GetFloatPtr(result);
-            long headBytes = (long)headDim * sizeof(float);
-
-            int doParallel = kvHeads >= 4 ? 1 : 0;
-            void CopyOneHead(int h)
+            catch
             {
-                float* cacheHead = cachePtr + (long)h * cacheSize * headDim;
-                float* dstHead = dstPtr + (long)h * prevWindowLen * headDim;
-                if (firstSlot + prevWindowLen <= cacheSize)
-                {
-                    long bytes = (long)prevWindowLen * headBytes;
-                    Buffer.MemoryCopy(cacheHead + (long)firstSlot * headDim, dstHead, bytes, bytes);
-                }
-                else
-                {
-                    int tailLen = cacheSize - firstSlot;
-                    long tailBytes = (long)tailLen * headBytes;
-                    Buffer.MemoryCopy(cacheHead + (long)firstSlot * headDim, dstHead, tailBytes, tailBytes);
-                    int headLen = prevWindowLen - tailLen;
-                    long headRangeBytes = (long)headLen * headBytes;
-                    Buffer.MemoryCopy(cacheHead, dstHead + (long)tailLen * headDim, headRangeBytes, headRangeBytes);
-                }
+                result.Dispose();
+                throw;
             }
-            if (doParallel != 0)
-                System.Threading.Tasks.Parallel.For(0, kvHeads, CopyOneHead);
-            else
-                for (int h = 0; h < kvHeads; h++) CopyOneHead(h);
-            return result;
         }
 
         /// <summary>
@@ -7605,26 +7764,34 @@ namespace TensorSharp.Models
             int hd = (int)a.Sizes[2];
             int totalLen = lenA + lenB;
             var result = new Tensor(_allocator, DType.Float32, kvHeads, totalLen, hd);
-            if (CudaFusedOps.TryConcatHeadFirst(result, a, b))
-                return result;
-
-            float* aPtr = GetFloatPtr(a);
-            float* bPtr = GetFloatPtr(b);
-            float* dstPtr = GetFloatPtr(result);
-            long aHeadBytes = (long)lenA * hd * sizeof(float);
-            long bHeadBytes = (long)lenB * hd * sizeof(float);
-
-            void CopyOneHead(int h)
+            try
             {
-                float* dstHead = dstPtr + (long)h * totalLen * hd;
-                Buffer.MemoryCopy(aPtr + (long)h * lenA * hd, dstHead, aHeadBytes, aHeadBytes);
-                Buffer.MemoryCopy(bPtr + (long)h * lenB * hd, dstHead + lenA * hd, bHeadBytes, bHeadBytes);
+                if (CudaFusedOps.TryConcatHeadFirst(result, a, b))
+                    return result;
+
+                float* aPtr = GetFloatPtr(a);
+                float* bPtr = GetFloatPtr(b);
+                float* dstPtr = GetFloatPtr(result);
+                long aHeadBytes = (long)lenA * hd * sizeof(float);
+                long bHeadBytes = (long)lenB * hd * sizeof(float);
+
+                void CopyOneHead(int h)
+                {
+                    float* dstHead = dstPtr + (long)h * totalLen * hd;
+                    Buffer.MemoryCopy(aPtr + (long)h * lenA * hd, dstHead, aHeadBytes, aHeadBytes);
+                    Buffer.MemoryCopy(bPtr + (long)h * lenB * hd, dstHead + lenA * hd, bHeadBytes, bHeadBytes);
+                }
+                if (kvHeads >= 4)
+                    System.Threading.Tasks.Parallel.For(0, kvHeads, CopyOneHead);
+                else
+                    for (int h = 0; h < kvHeads; h++) CopyOneHead(h);
+                return result;
             }
-            if (kvHeads >= 4)
-                System.Threading.Tasks.Parallel.For(0, kvHeads, CopyOneHead);
-            else
-                for (int h = 0; h < kvHeads; h++) CopyOneHead(h);
-            return result;
+            catch
+            {
+                result.Dispose();
+                throw;
+            }
         }
 
         /// <summary>
@@ -7639,7 +7806,12 @@ namespace TensorSharp.Models
             DisposeSwaPrevWindows();
             if (seqLen <= 0 || startPos <= 0 || _slidingWindow <= 0 || _kvCacheK == null) return;
             int W = _slidingWindow;
-            int prevWindowLen = Math.Min(startPos, W - 1);
+            // The resident CUDA verify graph retains W previous rows, then
+            // masks the oldest row for the first query. Keep that leading
+            // masked slot in streaming too: omitting it shifts flash's reduction
+            // geometry even though the set of attended logical keys is equal.
+            // Ordinary per-op paths keep their existing W-1 layout.
+            int prevWindowLen = Math.Min(startPos, HasStreamingWeights ? W : W - 1);
             if (prevWindowLen <= 0) return;
 
             _swaPrevWindow = new Dictionary<int, (Tensor, Tensor)>();
@@ -7656,9 +7828,22 @@ namespace TensorSharp.Models
                 int kvHeads = KVHeadsForLayer(srcLayer);
                 int hd = HeadDimForLayer(srcLayer);
                 int cacheSize = _kvCacheSize[srcLayer];
-                Tensor kPrev = BuildSwaPrevWindow(_kvCacheK[srcLayer], startPos, prevWindowLen, kvHeads, hd, cacheSize);
-                Tensor vPrev = BuildSwaPrevWindow(_kvCacheV[srcLayer], startPos, prevWindowLen, kvHeads, hd, cacheSize);
-                _swaPrevWindow[srcLayer] = (kPrev, vPrev);
+                Tensor kPrev = null;
+                Tensor vPrev = null;
+                try
+                {
+                    kPrev = BuildSwaPrevWindow(_kvCacheK[srcLayer], startPos, prevWindowLen, kvHeads, hd, cacheSize);
+                    vPrev = BuildSwaPrevWindow(_kvCacheV[srcLayer], startPos, prevWindowLen, kvHeads, hd, cacheSize);
+                    _swaPrevWindow[srcLayer] = (kPrev, vPrev);
+                    // The dictionary owns both tensors only after publication.
+                    kPrev = null;
+                    vPrev = null;
+                }
+                finally
+                {
+                    vPrev?.Dispose();
+                    kPrev?.Dispose();
+                }
             }
         }
 
@@ -7684,12 +7869,18 @@ namespace TensorSharp.Models
 
             int numHeads = (int)cache.Sizes[0];
             int headDim = (int)cache.Sizes[2];
+            // Only the final window survives a chunk longer than the ring.
+            // Scheduling all source rows in parallel would let old and new
+            // rows race for the same destination slot. Keep the original
+            // seqLen as the head stride while skipping the overwritten prefix.
+            int rowsToWrite = Math.Min(seqLen, cacheSize);
+            int sourceStart = seqLen - rowsToWrite;
 
             if (cache.ElementType == DType.Float16)
             {
                 float* srcPtrF16 = GetFloatPtr(src);
                 ushort* cachePtrF16 = TensorComputePrimitives.GetHalfPointer(cache);
-                int totalWorkF16 = seqLen * numHeads;
+                int totalWorkF16 = rowsToWrite * numHeads;
                 if (totalWorkF16 >= 64)
                 {
                     long srcAddrF16 = (long)srcPtrF16;
@@ -7701,9 +7892,9 @@ namespace TensorSharp.Models
                     int numHeadsLocal = numHeads;
                     System.Threading.Tasks.Parallel.For(0, totalWorkF16, idx =>
                     {
-                        int s = idx / numHeadsLocal;
+                        int s = sourceStart + idx / numHeadsLocal;
                         int h = idx % numHeadsLocal;
-                        int cacheIdx = (startPosLocal + s) % cacheSizeLocal;
+                        int cacheIdx = (int)(((long)startPosLocal + s) % cacheSizeLocal);
                         float* srcRow = (float*)srcAddrF16 + (long)h * seqLenLocal * headDimLocal + (long)s * headDimLocal;
                         ushort* dstRow = (ushort*)dstAddrF16 + (long)h * cacheSizeLocal * headDimLocal + (long)cacheIdx * headDimLocal;
                         TensorComputePrimitives.F32ToF16(dstRow, srcRow, headDimLocal);
@@ -7711,9 +7902,9 @@ namespace TensorSharp.Models
                 }
                 else
                 {
-                    for (int s = 0; s < seqLen; s++)
+                    for (int s = sourceStart; s < seqLen; s++)
                     {
-                        int cacheIdx = (startPos + s) % cacheSize;
+                        int cacheIdx = (int)(((long)startPos + s) % cacheSize);
                         for (int h = 0; h < numHeads; h++)
                         {
                             float* srcRow = srcPtrF16 + (long)h * seqLen * headDim + (long)s * headDim;
@@ -7730,14 +7921,14 @@ namespace TensorSharp.Models
             float* cachePtr = GetFloatPtr(cache);
             int headBytes = headDim * sizeof(float);
 
-            int totalWork = seqLen * numHeads;
+            int totalWork = rowsToWrite * numHeads;
             if (totalWork >= 64)
             {
                 System.Threading.Tasks.Parallel.For(0, totalWork, idx =>
                 {
-                    int s = idx / numHeads;
+                    int s = sourceStart + idx / numHeads;
                     int h = idx % numHeads;
-                    int cacheIdx = (startPos + s) % cacheSize;
+                    int cacheIdx = (int)(((long)startPos + s) % cacheSize);
                     float* srcRow = srcPtr + (long)h * seqLen * headDim + (long)s * headDim;
                     float* dstRow = cachePtr + (long)h * cacheSize * headDim + (long)cacheIdx * headDim;
                     Buffer.MemoryCopy(srcRow, dstRow, headBytes, headBytes);
@@ -7745,9 +7936,9 @@ namespace TensorSharp.Models
             }
             else
             {
-                for (int s = 0; s < seqLen; s++)
+                for (int s = sourceStart; s < seqLen; s++)
                 {
-                    int cacheIdx = (startPos + s) % cacheSize;
+                    int cacheIdx = (int)(((long)startPos + s) % cacheSize);
                     for (int h = 0; h < numHeads; h++)
                     {
                         float* srcRow = srcPtr + (long)h * seqLen * headDim + (long)s * headDim;
@@ -7863,6 +8054,12 @@ namespace TensorSharp.Models
 
         public override void Dispose()
         {
+            DisposeGemma4Resources();
+            base.Dispose();
+        }
+
+        private void DisposeGemma4Resources()
+        {
             // Graph entries own captured scratch blocks and refs to KV/PLE/RoPE
             // inputs; release them before tearing down those model tensors.
             InvalidateCudaDecodeGraphs();
@@ -7894,6 +8091,11 @@ namespace TensorSharp.Models
             _cudaDecodeRopeSinGlobal = null;
 
             _onesForVNorm?.Dispose();
+            _cachedRoPEPosQ?.Dispose();
+            _cachedRoPEPosK?.Dispose();
+            _cachedRoPEPosQ = _cachedRoPEPosK = null;
+            _cachedRoPEPosSeqLen = 0;
+            _cachedRoPEPosStartPos = -1;
             _neoXRopeCosTensor?.Dispose();
             _neoXRopeSinTensor?.Dispose();
             foreach (NeoXRopeSlot slot in _neoXRopeSlotByFreqs.Values)
@@ -7928,7 +8130,6 @@ namespace TensorSharp.Models
                     disposed.Add(l);
                 }
             }
-            base.Dispose();
         }
     }
 }

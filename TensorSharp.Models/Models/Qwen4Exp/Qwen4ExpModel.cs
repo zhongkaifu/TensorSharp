@@ -96,11 +96,18 @@ namespace TensorSharp.Models
 
         public Qwen4ExpModel(string ggufPath, BackendType backend, int tpDegree = 1,
             ITensorParallelGroup tpGroup = null, int layerSplitDegree = 1, string draftGgufPath = null)
-            : base(ggufPath, backend, tpDegree, tpGroup, layerSplitDegree)
+            : this(ggufPath, backend, tpDegree, tpGroup, layerSplitDegree, draftGgufPath, null)
+        {
+        }
+
+        public Qwen4ExpModel(string ggufPath, BackendType backend, int tpDegree,
+            ITensorParallelGroup tpGroup, int layerSplitDegree, string draftGgufPath, ModelMemoryPolicy memoryPolicy)
+            : base(ggufPath, backend, tpDegree, tpGroup, layerSplitDegree, null, memoryPolicy)
         {
             Config = new ModelConfig { Architecture = ArchitectureId };
             try
             {
+                ValidateUnifiedMemoryPolicy(memoryPolicy, backend, tpDegree, layerSplitDegree, draftGgufPath);
                 ParseBaseConfig();
                 ParseQwen4ExpConfig();
                 ValidateQwen4ExpTensorParallelMetadata();
@@ -135,11 +142,16 @@ namespace TensorSharp.Models
                 PlanExpertPlacement();
                 FinalizeMtpHead();
             }
-            catch
+            catch (Exception creation)
             {
                 // A constructor that throws has no caller to release its GGUF
                 // mapping, partial shards, device buffers or TP worker group.
-                Dispose();
+                if (MemoryPolicy != null)
+                {
+                    try { Dispose(); }
+                    catch (Exception cleanup) { throw new Qwen4ExpConstructionCleanupException(this, creation, cleanup); }
+                }
+                else Dispose();
                 throw;
             }
         }
@@ -522,8 +534,12 @@ namespace TensorSharp.Models
             // scale vectors as [n, 1]. These consumers read F32 coefficients directly,
             // so let LoadWeights normalize them instead of retaining matrix bytes.
             // Projections, including HC inject and SSM alpha/beta, stay compressed.
-            string name = info.Name;
-            if (name.EndsWith(".ple_conv1d.weight", StringComparison.Ordinal)
+            if (RequiresFloatGeometry(info.Name)) return false;
+            return base.IsQuantizedLinearWeight(info);
+        }
+
+        internal static bool RequiresFloatGeometry(string name)
+            => name.EndsWith(".ple_conv1d.weight", StringComparison.Ordinal)
                 || name.EndsWith(".ssm_conv1d.weight", StringComparison.Ordinal)
                 || name.EndsWith("_norm.weight", StringComparison.Ordinal)
                 || name.EndsWith(".ple_norm_key.weight", StringComparison.Ordinal)
@@ -531,12 +547,7 @@ namespace TensorSharp.Models
                 || name.EndsWith(".ple_norm_conv.weight", StringComparison.Ordinal)
                 || name.EndsWith(".ssm_dt.bias", StringComparison.Ordinal)
                 || name.EndsWith(".ssm_a", StringComparison.Ordinal)
-                || name.EndsWith(".ffn_gate_inp_shexp.weight", StringComparison.Ordinal))
-            {
-                return false;
-            }
-            return base.IsQuantizedLinearWeight(info);
-        }
+                || name.EndsWith(".ffn_gate_inp_shexp.weight", StringComparison.Ordinal);
 
         // Names are checked up front rather than on first use: a missing hyper-connection
         // tensor otherwise surfaces as a null dereference 40 layers into the first

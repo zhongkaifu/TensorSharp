@@ -26,6 +26,7 @@ namespace TensorSharp.Server
         private readonly ChatSession _intrinsicSession;
         private readonly InferenceEngineHost _engineHost;
         private readonly ChatGenerationPipeline _generation;
+        private readonly Hosting.StartupWarmupStatusStore _startupWarmup = new();
 
         public ModelService()
             : this(NullLogger<ModelService>.Instance)
@@ -80,6 +81,18 @@ namespace TensorSharp.Server
         /// <summary>Whether the loaded model carries its optional audio tower (see <see cref="TensorSharp.Models.Architecture.AudioInputSupport"/>).</summary>
         public virtual bool IsAudioEncoderLoaded => TensorSharp.Models.Architecture.AudioInputSupport.IsAudioEncoderLoaded(_lifecycle.Model);
         public ModelBase Model => _lifecycle.Model;
+
+        public Hosting.StartupWarmupStatus StartupWarmup => _startupWarmup.Get(Model);
+
+        public void RecordStartupWarmup(ModelBase model, Hosting.StartupWarmupStatus status)
+            => _startupWarmup.Set(model, status);
+
+        /// <summary>Explicit shared-budget loading mode. Set before loading; unsupported configurations are refused.</summary>
+        public bool UnifiedMemoryEnabled
+        {
+            get => _lifecycle.UnifiedMemoryEnabled;
+            set => _lifecycle.UnifiedMemoryEnabled = value;
+        }
 
         /// <summary>
         /// Non-null when an explicitly requested <c>--draft-model</c> could not

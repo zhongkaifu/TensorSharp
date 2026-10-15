@@ -12,7 +12,7 @@ namespace InferenceWeb.Tests;
 /// <summary>
 /// Qwen4Exp's patch merger uses GELU(erf), while its transformer-block MLPs
 /// use gelu_pytorch_tanh. The primary reference is Qwen4ExpVisionPatchMerger in
-/// https://github.com/huggingface/transformers/blob/v5.16.1/src/transformers/models/qwen4_exp/modeling_qwen4_exp.py#L1705.
+/// https://github.com/huggingface/transformers/blob/v5.16.1/src/transformers/models/qwen4_exp/modeling_qwen4_exp.py#L1557.
 /// These tests use a synthetic projector and independent scalar goldens;
 /// they qualify activation wiring, not trained-model vision quality.
 /// </summary>
@@ -62,9 +62,10 @@ public sealed class Qwen4ExpVisionMergerActivationTests : IDisposable
 
     [Theory]
     [InlineData(null, false)]
+    [InlineData("", false)]
     [InlineData("0", false)]
     [InlineData("1", true)]
-    public void Qwen4ExpProjectorLoaderRequiresExplicitErfOptIn(string? optIn, bool erf)
+    public void Qwen4ExpProjectorLoaderKeepsErfAnExplicitDiagnosticOptIn(string? optIn, bool erf)
     {
         // LoadVisionEncoder needs only the allocator. Keep language-weight loading
         // out of this activation regression, then detach the incomplete host model.
@@ -77,6 +78,32 @@ public sealed class Qwen4ExpVisionMergerActivationTests : IDisposable
             model.LoadVisionEncoder(_mmproj);
             model.VisionEncoder.SetHostModel(null);
             AssertClose(erf ? Erf : Tanh, EncodeControlledMerger(model.VisionEncoder));
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("TS_Q4E_VISION_MERGER_ERF", previous);
+            model.VisionEncoder?.Dispose();
+            GC.SuppressFinalize(model);
+        }
+    }
+
+    [Fact]
+    public void ExplicitReferenceErfProjectorMatchesIndependentGoldensAtZeroAndSaturatedTails()
+    {
+        // Independently evaluated with Python math.erf, then rounded to F32.
+        // Include both signs near zero and tails which saturate the normal CDF.
+        float[] inputs = [-8f, -6f, -.001f, -0f, 0f, .001f, 6f, 8f];
+        float[] expected = [-4.8849813e-15f, -5.9195259e-9f, -.0004996011f,
+            -0f, 0f, .0005003989f, 6f, 8f];
+        var model = (Qwen4ExpModel)RuntimeHelpers.GetUninitializedObject(typeof(Qwen4ExpModel));
+        typeof(ModelBase).GetField("_allocator", BindingFlags.Instance | BindingFlags.NonPublic)!.SetValue(model, _allocator);
+        string? previous = Environment.GetEnvironmentVariable("TS_Q4E_VISION_MERGER_ERF");
+        try
+        {
+            Environment.SetEnvironmentVariable("TS_Q4E_VISION_MERGER_ERF", "1");
+            model.LoadVisionEncoder(_mmproj);
+            model.VisionEncoder.SetHostModel(null);
+            AssertClose(expected, EncodeControlledMerger(model.VisionEncoder, inputs));
         }
         finally
         {
@@ -123,15 +150,16 @@ public sealed class Qwen4ExpVisionMergerActivationTests : IDisposable
         AssertClose(Erf, EncodeControlledMerger(encoder));
     }
 
-    private float[] EncodeControlledMerger(Qwen35VisionEncoder encoder)
+    private float[] EncodeControlledMerger(Qwen35VisionEncoder encoder, float[]? inputs = null)
     {
+        inputs ??= Inputs;
         var weights = Weights(encoder);
         int merged = QwenVLSyntheticMmprojBuilder.Hidden * QwenVLSyntheticMmprojBuilder.MergeSize * QwenVLSyntheticMmprojBuilder.MergeSize;
         // A zero first projection plus known bias isolates activation in the real
         // EncodeCore merger; the output projection selects all eight test values.
         weights["mm.0.weight"].SetElementsAsFloat(new float[merged * merged]);
         var bias = new float[merged];
-        Inputs.CopyTo(bias, 0);
+        inputs.CopyTo(bias, 0);
         weights["mm.0.bias"].SetElementsAsFloat(bias);
         weights["mm.2.weight"].SetElementsAsFloat(SelectionMatrix(Inputs.Length, merged));
         weights["mm.2.bias"].SetElementsAsFloat(new float[Inputs.Length]);

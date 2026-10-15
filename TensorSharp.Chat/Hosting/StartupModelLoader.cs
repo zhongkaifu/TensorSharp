@@ -88,12 +88,7 @@ namespace TensorSharp.Server.Hosting
 
             if (modelService.Model != null)
             {
-                var warmupSw = Stopwatch.StartNew();
-                modelService.Model.WarmUpKernels();
-                warmupSw.Stop();
-                logger.LogInformation(LogEventIds.HostConfiguration,
-                    "Kernel warmup completed in {ElapsedMs:F1} ms", warmupSw.Elapsed.TotalMilliseconds);
-                modelService.Model.LogVramSnapshot("after kernel warmup");
+                WarmUpLoadedModel(modelService.Model, modelService.UnifiedMemoryEnabled, logger);
 
                 // Multi-node tensor parallelism: from here on this server is the
                 // driver (node 0) — every forward pass broadcasts to the worker
@@ -102,6 +97,27 @@ namespace TensorSharp.Server.Hosting
                 // node and must not broadcast). No-op on single-node groups.
                 modelService.Model.BeginDistributedDriver();
             }
+        }
+
+        internal static void WarmUpLoadedModel(ModelBase model, bool unifiedMemoryEnabled, ILogger logger)
+        {
+            if (unifiedMemoryEnabled)
+            {
+                // The legacy warmup calls Forward/ForwardRefill directly, with
+                // its own prefill geometry and no request allocation envelope.
+                // The host performs scheduled chat warm-up after the service
+                // container is ready, before opening its listener. That request
+                // materializes caches inside the ordinary admission envelope.
+                logger.LogInformation(LogEventIds.HostConfiguration,
+                    "Direct kernel warmup deferred (--unified-memory): scheduled startup warmup initializes kernels and caches within its memory envelope before accepting requests.");
+                return;
+            }
+            var warmupSw = Stopwatch.StartNew();
+            model.WarmUpKernels();
+            warmupSw.Stop();
+            logger.LogInformation(LogEventIds.HostConfiguration,
+                "Kernel warmup completed in {ElapsedMs:F1} ms", warmupSw.Elapsed.TotalMilliseconds);
+            model.LogVramSnapshot("after kernel warmup");
         }
 
         /// <summary>
@@ -157,8 +173,19 @@ namespace TensorSharp.Server.Hosting
             if (!options.PrefixCacheEnabled)
             {
                 logger.LogInformation(LogEventIds.HostConfiguration,
-                    "Prefix cache disabled (--no-prefix-cache): runtime reuse, startup warmup, "
-                    + "and disk persistence are off.");
+                    "Prefix cache disabled (--no-prefix-cache): runtime reuse and disk persistence are off. {WarmupPolicy}",
+                    options.UnifiedMemoryEnabled
+                        ? "Scheduled unified execution warmup remains enabled."
+                        : "Prefix startup warmup is off.");
+                return;
+            }
+
+            if (options.UnifiedMemoryEnabled)
+            {
+                // FileStore exports a complete managed payload and maintains an
+                // independent disk quota. It is not yet a shared-budget SSD owner.
+                logger.LogInformation(LogEventIds.HostConfiguration,
+                    "Unified prefix cache uses budgeted in-memory checkpoints; disk prefix persistence is disabled until its export buffers and SSD storage share the session budget.");
                 return;
             }
 

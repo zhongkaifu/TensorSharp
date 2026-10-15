@@ -85,15 +85,24 @@ internal sealed partial class PrefixCacheCoordinator
         return true;
     }
 
-    /// <summary>The tree released these payloads: free the pool blocks of the paged ones, then let the model
-    /// release its part of every one.</summary>
+    /// <summary>Release model state before recycling its pool pages. A partial
+    /// failure keeps every remaining page reference available for retry.</summary>
     private void ReleasePayloads(ReadOnlySpan<string> payloadKeys, ReleaseReason reason)
     {
+        _cacheModel.ReleasePayloads(payloadKeys, reason);
         foreach (string key in payloadKeys)
         {
-            if (key != null && _pagedEndStates.Remove(key, out KvBlock[]? blocks))
-                _pool.Free(blocks);
+            if (key != null && _pagedEndStates.TryGetValue(key, out KvBlock[]? blocks))
+            {
+                for (int i = blocks.Length - 1; i >= 0; i--)
+                {
+                    _pool.Free(blocks[i]);
+                    // These arrays are no longer adoptable after the tree queues
+                    // their payload for release. Null marks only a confirmed free.
+                    blocks[i] = null!;
+                }
+                _pagedEndStates.Remove(key);
+            }
         }
-        _cacheModel.ReleasePayloads(payloadKeys, reason);
     }
 }

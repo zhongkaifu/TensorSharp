@@ -1523,6 +1523,8 @@ namespace TensorSharp.GGML
         public static bool TryRegisterPinnedHostBuffer(IntPtr ptr, long bytes)
             => GgmlNative.TryRegisterPinnedHostBuffer(ptr, bytes);
         public static void UnregisterPinnedHostBuffer(IntPtr ptr) => GgmlNative.UnregisterPinnedHostBuffer(ptr);
+        public static bool RegisterHostFileSource(IntPtr pointer, long bytes, string path, long offset)
+            => GgmlNative.RegisterHostFileSource(pointer, bytes, path, offset);
 
         public static IntPtr AlignedAlloc(long size) => GgmlNative.AlignedAlloc(size);
         public static void AlignedFree(IntPtr ptr) => GgmlNative.AlignedFree(ptr);
@@ -2977,6 +2979,9 @@ namespace TensorSharp.GGML
 
         public static bool Qwen4ExpCopyQsaCache(IntPtr key, IntPtr destination, long bytes, int device)
             => GgmlNative.Qwen4ExpCopyQsaCache(key, destination, bytes, device);
+
+        public static bool Qwen4ExpPrepareQsaCache(IntPtr key, long bytes, int device)
+            => GgmlNative.Qwen4ExpPrepareQsaCache(key, bytes, device);
 
         /// <summary>Drop every cached qwen4exp FFN graph (they pin weight bindings).</summary>
         public static void Qwen4ExpResetFfnCache() => GgmlNative.Qwen4ExpResetFfnCache();

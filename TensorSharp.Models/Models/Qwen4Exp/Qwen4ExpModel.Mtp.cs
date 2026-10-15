@@ -41,6 +41,8 @@ namespace TensorSharp.Models
         public void LoadMtpDraftWeights(string path)
         {
             ArgumentException.ThrowIfNullOrWhiteSpace(path);
+            if (MemoryPolicy?.OmitEmbeddedDraftWeights == true)
+                throw new NotSupportedException("The admitted qwen4exp memory policy excludes MTP weights and state.");
             path = Path.GetFullPath(path);
             if (_mtpFile != null)
             {

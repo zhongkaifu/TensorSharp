@@ -42,6 +42,7 @@
 // ============================================================================
 
 #include "ggml_ops_internal.h"
+#include "ggml_ops_host_moe_file_batch.h"
 #include "ggml-cpu.h"
 
 #include <algorithm>
@@ -423,8 +424,8 @@ namespace tsg
         }
     }
 
-    bool host_moe_decode_experts_rows(const HostMoeSegment& hm, const float* x, const std::int32_t* ids,
-                                     const float* weights, float* out)
+    static bool host_moe_decode_experts_rows_impl(const HostMoeSegment& hm, const float* x, const std::int32_t* ids,
+                                     const float* weights, float* out, bool bounded)
     {
         if (!decode_kernel_enabled() || hm.seq_len < 1 || hm.seq_len > kMaxRows || hm.activation != 0
             || hm.up_data == nullptr || hm.gate_bias || hm.up_bias || hm.down_bias
@@ -493,25 +494,44 @@ namespace tsg
         const ggml_type q_gate = tg->vec_dot_type, q_up = tu->vec_dot_type, q_down = td->vec_dot_type;
         const std::size_t xq_gate_row = ggml_row_size(q_gate, n_embd);
         const std::size_t xq_up_row = ggml_row_size(q_up, n_embd);
-        s_xq_gate.resize(xq_gate_row * n_rows);
+        const std::size_t hq_row = ggml_row_size(q_down, n_ff);
+        HostMoeCpuArena scratch;
+        std::array<std::size_t, 7> offsets{};
+        std::array<std::size_t, 7> lengths = { xq_gate_row * n_rows, q_up != q_gate ? xq_up_row * n_rows : 0,
+            std::size_t(selected) * n_ff * sizeof(float), std::size_t(selected) * n_ff * sizeof(float),
+            std::size_t(selected) * n_ff * sizeof(float), std::size_t(selected) * hq_row,
+            n_rows > 1 ? std::size_t(selected) * n_embd * sizeof(float) : 0 };
+        if (bounded) {
+            std::size_t total = 0;
+            for (std::size_t i = 0; i < lengths.size(); ++i) {
+                offsets[i] = total; total = host_moe_checked_add(total, host_moe_align(lengths[i]));
+            }
+            scratch.reserve(total);
+        } else {
+            s_xq_gate.resize(xq_gate_row * n_rows);
+            if (q_up != q_gate) s_xq_up.resize(xq_up_row * n_rows);
+            s_g.resize((std::size_t)selected * n_ff); s_u.resize((std::size_t)selected * n_ff);
+            s_h.resize((std::size_t)selected * n_ff); s_hq.resize((std::size_t)selected * hq_row);
+            if (n_rows > 1) s_projected.resize((std::size_t)selected * n_embd);
+        }
+        auto* xq_gate_data = bounded ? scratch.data() + offsets[0] : s_xq_gate.data();
+        auto* xq_up_data = bounded ? scratch.data() + offsets[1] : s_xq_up.data();
+        auto* g_data = bounded ? reinterpret_cast<float*>(scratch.data() + offsets[2]) : s_g.data();
+        auto* u_data = bounded ? reinterpret_cast<float*>(scratch.data() + offsets[3]) : s_u.data();
+        auto* h_data = bounded ? reinterpret_cast<float*>(scratch.data() + offsets[4]) : s_h.data();
+        auto* hq_data = bounded ? scratch.data() + offsets[5] : s_hq.data();
+        auto* projected_data = bounded ? reinterpret_cast<float*>(scratch.data() + offsets[6]) : s_projected.data();
         const auto quant_gate = ggml_get_type_traits_cpu(q_gate)->from_float;
         for (int r = 0; r < n_rows; ++r)
-            quant_gate(x + (std::size_t)r * n_embd, s_xq_gate.data() + (std::size_t)r * xq_gate_row, n_embd);
-        const void* xq_up = s_xq_gate.data();
+            quant_gate(x + (std::size_t)r * n_embd, xq_gate_data + (std::size_t)r * xq_gate_row, n_embd);
+        const void* xq_up = xq_gate_data;
         if (q_up != q_gate)
         {
-            s_xq_up.resize(xq_up_row * n_rows);
             const auto quant_up = ggml_get_type_traits_cpu(q_up)->from_float;
             for (int r = 0; r < n_rows; ++r)
-                quant_up(x + (std::size_t)r * n_embd, s_xq_up.data() + (std::size_t)r * xq_up_row, n_embd);
-            xq_up = s_xq_up.data();
+                quant_up(x + (std::size_t)r * n_embd, xq_up_data + (std::size_t)r * xq_up_row, n_embd);
+            xq_up = xq_up_data;
         }
-        const std::size_t hq_row = ggml_row_size(q_down, n_ff);
-        s_g.resize((std::size_t)selected * n_ff);
-        s_u.resize((std::size_t)selected * n_ff);
-        s_h.resize((std::size_t)selected * n_ff);
-        s_hq.resize((std::size_t)selected * hq_row);
-        if (n_rows > 1) s_projected.resize((std::size_t)selected * n_embd);
 
         DecodeJob& j = g_team->acquire();
         j.n_rows = n_rows; j.n_used = hm.n_used; j.n_embd = n_embd; j.n_ff = n_ff;
@@ -542,10 +562,10 @@ namespace tsg
         j.gate_dot = tg->vec_dot; j.up_dot = tu->vec_dot; j.down_dot = td->vec_dot;
         j.h_quant = ggml_get_type_traits_cpu(q_down)->from_float;
         j.hq_row = hq_row;
-        j.xq_gate = s_xq_gate.data(); j.xq_up = xq_up;
+        j.xq_gate = xq_gate_data; j.xq_up = xq_up;
         j.xq_gate_row = xq_gate_row; j.xq_up_row = xq_up_row;
-        j.g = s_g.data(); j.u = s_u.data(); j.h = s_h.data(); j.hq = s_hq.data();
-        j.out = out; j.projected = n_rows > 1 ? s_projected.data() : nullptr;
+        j.g = g_data; j.u = u_data; j.h = h_data; j.hq = hq_data;
+        j.out = out; j.projected = n_rows > 1 ? projected_data : nullptr;
         j.chunks_per_matrix = (n_ff + kRowsPerChunk - 1) / kRowsPerChunk;
         j.chunks1 = selected * 2 * j.chunks_per_matrix;
         j.chunks3_per_row = (n_embd + kRowsPerChunk - 1) / kRowsPerChunk;
@@ -584,6 +604,15 @@ namespace tsg
             }
         }
         return true;
+    }
+
+    bool host_moe_decode_experts_rows(const HostMoeSegment& hm, const float* x, const std::int32_t* ids,
+        const float* weights, float* out) {
+        return host_moe_decode_experts_rows_impl(hm, x, ids, weights, out, false);
+    }
+    bool host_moe_decode_experts_rows_bounded(const HostMoeSegment& hm, const float* x, const std::int32_t* ids,
+        const float* weights, float* out) {
+        return host_moe_decode_experts_rows_impl(hm, x, ids, weights, out, true);
     }
 
     bool host_moe_decode_experts(const HostMoeSegment& hm, const float* x, const std::int32_t* ids,

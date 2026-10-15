@@ -1,6 +1,6 @@
+#nullable enable annotations
 using System;
 using System.Runtime.CompilerServices;
-using System.Runtime.InteropServices;
 using System.Text;
 using TensorSharp.Cuda.Interop;
 
@@ -30,13 +30,15 @@ namespace TensorSharp.Cuda
 
         public static bool IsAvailable()
         {
+            if (VisibilityMaskHidesAllDevices(Environment.GetEnvironmentVariable("CUDA_VISIBLE_DEVICES")))
+                return false;
+
             try
             {
-                string driverName = RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "nvcuda.dll" : "libcuda.so.1";
-                if (!NativeLibrary.TryLoad(driverName, out IntPtr handle))
-                    return false;
-
-                NativeLibrary.Free(handle);
+                // The resolver keeps the driver backing its P/Invoke entry points
+                // alive. Loading and immediately unloading it as an availability
+                // probe can leave vendor notification callbacks pointing into an
+                // unloaded module, even when no CUDA device is visible.
                 return ProbeDeviceCount() > 0;
             }
             catch
@@ -47,6 +49,9 @@ namespace TensorSharp.Cuda
 
         public static int GetDeviceCount()
         {
+            if (VisibilityMaskHidesAllDevices(Environment.GetEnvironmentVariable("CUDA_VISIBLE_DEVICES")))
+                return 0;
+
             CudaLibraryResolver.Register();
             CudaDriverApi.cuInit(0).ThrowOnError();
             CudaDriverApi.cuDeviceGetCount(out int count).ThrowOnError();
@@ -55,6 +60,9 @@ namespace TensorSharp.Cuda
 
         public static CudaDevice GetDevice(int ordinal)
         {
+            if (VisibilityMaskHidesAllDevices(Environment.GetEnvironmentVariable("CUDA_VISIBLE_DEVICES")))
+                throw new InvalidOperationException("CUDA_VISIBLE_DEVICES hides every CUDA device.");
+
             CudaLibraryResolver.Register();
             CudaDriverApi.cuInit(0).ThrowOnError();
             CudaDriverApi.cuDeviceGet(out int device, ordinal).ThrowOnError();
@@ -76,6 +84,11 @@ namespace TensorSharp.Cuda
         {
             return $"GPU {Ordinal}: {Name} ({TotalMemoryFormatted}, sm_{ComputeCapabilityMajor}{ComputeCapabilityMinor}, {MultiprocessorCount} SMs)";
         }
+
+        // A partial list such as "0,-1" still exposes its leading device. Only
+        // the explicit all-hidden forms bypass driver initialization.
+        internal static bool VisibilityMaskHidesAllDevices(string? mask)
+            => mask != null && (string.IsNullOrWhiteSpace(mask) || mask.Trim() == "-1");
 
         [MethodImpl(MethodImplOptions.NoInlining)]
         private static int ProbeDeviceCount()

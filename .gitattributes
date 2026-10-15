@@ -4,8 +4,14 @@
 # corrupts every other line, which silently broke the GGML native build and
 # the CUDA arch-detection fallback.
 *.sh text eol=lf
+# The serialized DeepSeek capture verifies this exact audited comparator source
+# byte hash before importing it. Preserve its audited Git-blob bytes on Windows.
+eng/validation/compare-deepseek-teacher-logits.py text eol=lf
 # Localization tables have a canonical LF format verified by the app's tests.
 TensorAgent/src/TensorAgent.Core/Localization/**/*.json text eol=lf
 TensorAgent/src/TensorAgent.Sharing/Localization/**/*.json text eol=lf
 # Docker RUN heredocs are shell scripts too.
 Dockerfile* text eol=lf
+# PDF xref offsets and fixture digests require exact bytes on every platform.
+# ASCII-only PDFs are still binary; CRLF checkout conversion corrupts offsets.
+*.pdf binary

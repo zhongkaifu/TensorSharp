@@ -12,6 +12,9 @@
 #include "ggml_ops_dsv4_fused.h"
 #include "ggml_ops_transformer_common.h"
 #include "ggml_ops_qwen4exp_qsa.h"
+#include "ggml_ops_qwen4exp_arena_scope.h"
+#include "ggml_ops_qwen4exp_attn_diagnostic.h"
+#include "ggml_ops_qwen4exp_fusion_lifetime.h"
 #ifdef TSG_GGML_USE_CUDA
 #include "ggml-cuda.h"
 #endif
@@ -85,6 +88,13 @@ namespace
 {
     constexpr int kQ4abMaxEntries = 4;
     constexpr const char* kQ4abKernel = "qwen4exp arena batched decode";
+    tsg::Qwen4ExpArenaScope g_q4ab_scope;
+    struct Q4abExecution {
+        std::uint64_t id = 0;
+        int sequences = 0, slots = 0, nodes = 0, host_segments = 0, path = 0;
+    };
+    std::atomic<std::uint64_t> g_q4ab_execution_id{0};
+    thread_local Q4abExecution g_q4ab_last_execution;
 
     int q4ab_slot_bucket(int n)
     {
@@ -153,6 +163,7 @@ namespace
         std::vector<tsg::HostMoeSegment> host_moe;
         std::vector<int> host_moe_seg_end;
         std::vector<ggml_tensor*> trace_res;
+        std::vector<Qwen4ExpAttnDiagnostic> attn_diagnostic;
         const void* sig_disc = nullptr;
         int num_layers = 0, H = 0, vocab = 0, n_slots = 0;
         int hd = 0, kvH = 0, hc = 0;
@@ -182,7 +193,7 @@ namespace
                 ggml_backend_free(precise_backend);
                 precise_backend = nullptr;
             }
-            if (alloc != nullptr) { ggml_gallocr_free(alloc); alloc = nullptr; }
+            if (alloc != nullptr) { tsg::graph_budget_gallocr_free(alloc); alloc = nullptr; }
             buffer = nullptr;
             if (ctx != nullptr) { ggml_free(ctx); ctx = nullptr; }
             graph = nullptr;
@@ -193,6 +204,7 @@ namespace
             qsa_arena.clear(); qsa_args.clear(); qsa_inputs.clear();
             host_moe.clear(); host_moe_seg_end.clear();
             trace_res.clear();
+            attn_diagnostic.clear();
             valid = false;
         }
 
@@ -399,6 +411,30 @@ namespace
             q4ab_flush_and_drop_slot(e, s);
     }
 
+    bool q4ab_pools_empty()
+    {
+        for (const auto& pool : g_q4ab_pools)
+            for (const auto& e : pool.entries)
+                if (e.ctx || e.alloc || e.valid ||
+                    std::any_of(e.slots.begin(), e.slots.end(), [](const Q4abSlot& s) { return s.active; }))
+                    return false;
+        return true;
+    }
+
+    void q4ab_retire_all()
+    {
+        // Stop on a failed flush: preserve its physical state and scope token
+        // for retry/reset. Successfully retired earlier entries stay released.
+        for (int r = 0; r < tsg::TSG_MAX_DEVICES; ++r) {
+            tsg::ScopedRank rank(r);
+            for (auto& e : g_q4ab_pools[r].entries) {
+                q4ab_flush_entry(e);
+                e.release_graph();
+                e.slots.clear();
+            }
+        }
+    }
+
     // Causal mask fill over [cap, n_slots]: column s zero on [0, pos_s], -inf
     // beyond. Padded/absent columns attend row 0 only.
     void q4ab_fill_mask(std::vector<ggml_fp16_t>& mask, std::int64_t cap, int n_slots,
@@ -536,7 +572,58 @@ TSG_TEST_EXPORT int TSGgml_Qwen4ExpArenaTestCopyFault(int nth)
     g_q4ab_copy_fault.store(nth, std::memory_order_relaxed);
     return 1;
 }
+#undef TSG_TEST_EXPORT
 #endif
+
+TSG_EXPORT int TSGgml_Qwen4ExpArenaBudgetKind() { return 5; }
+
+TSG_EXPORT std::uint64_t TSGgml_BeginScopedQwen4ExpArena(int max_entries)
+{
+    try {
+        std::lock_guard<std::mutex> lock(q4ab_mutex());
+        const auto token = g_q4ab_scope.begin(max_entries, q4ab_pools_empty());
+        if (!token) set_last_error("qwen4exp arena: scoped configuration requires an empty, unowned pool and 1..4 entries");
+        else clear_last_error();
+        return token;
+    } catch (const std::exception& ex) { set_last_error(ex.what()); return 0; }
+    catch (...) { set_last_error("Unknown error beginning qwen4exp arena scope."); return 0; }
+}
+
+TSG_EXPORT int TSGgml_TrimScopedQwen4ExpArena(std::uint64_t token)
+{
+    try {
+        std::lock_guard<std::mutex> lock(q4ab_mutex());
+        if (!g_q4ab_scope.trim(token, q4ab_retire_all)) {
+            set_last_error("qwen4exp arena: invalid scope token for trim"); return 0;
+        }
+        clear_last_error(); return 1;
+    } catch (const std::exception& ex) { set_last_error(ex.what()); return 0; }
+    catch (...) { set_last_error("Unknown error trimming qwen4exp arena scope."); return 0; }
+}
+
+TSG_EXPORT int TSGgml_EndScopedQwen4ExpArena(std::uint64_t token)
+{
+    try {
+        std::lock_guard<std::mutex> lock(q4ab_mutex());
+        if (!g_q4ab_scope.end(token, q4ab_retire_all)) {
+            set_last_error("qwen4exp arena: invalid scope token for end"); return 0;
+        }
+        clear_last_error(); return 1;
+    } catch (const std::exception& ex) { set_last_error(ex.what()); return 0; }
+    catch (...) { set_last_error("Unknown error ending qwen4exp arena scope."); return 0; }
+}
+
+// Thread-local, successful execution only. One logical graph may be executed
+// as device segments separated by host MoE; this is NOT a GPU launch count.
+TSG_EXPORT int TSGgml_Qwen4ExpArenaLastExecution(std::uint64_t* accepted_id,
+    int* n_seqs, int* n_slots, int* graph_nodes, int* host_segments, int* path)
+{
+    if (!accepted_id || !n_seqs || !n_slots || !graph_nodes || !host_segments || !path) return 0;
+    const auto& value = g_q4ab_last_execution;
+    *accepted_id = value.id; *n_seqs = value.sequences; *n_slots = value.slots;
+    *graph_nodes = value.nodes; *host_segments = value.host_segments; *path = value.path;
+    return value.id != 0 ? 1 : 0;
+}
 
 TSG_EXPORT int TSGgml_Qwen4ExpArenaFlushHostPointerStatus(void* host_ptr)
 {
@@ -652,6 +739,7 @@ TSG_EXPORT int TSGgml_Qwen4ExpArenaDecodeBatched(
     float* logits_data, std::int32_t* sampled_data, int want_logits,
     int device)
 {
+    g_q4ab_last_execution = {};
     bool compute_started = false;
     try
     {
@@ -732,9 +820,9 @@ TSG_EXPORT int TSGgml_Qwen4ExpArenaDecodeBatched(
                 set_last_error("qwen4exp arena batched decode: token id out of range.");
                 return 0;
             }
-            if (cache_positions[s] < 0 || cache_positions[s] >= cache_rows[s] || rope_positions[s] < 0)
+            if (!tsg::qwen4exp_arena_position_valid(cache_positions[s], cache_rows[s], rope_positions[s]))
             {
-                set_last_error("qwen4exp arena batched decode: sequence exceeds its cache rows (no-wrap).");
+                set_last_error("qwen4exp arena batched decode: requires a nonempty prefilled sequence within its cache rows (no-wrap) and a nonnegative rotary position.");
                 return 0;
             }
             maxTotal = std::max<std::int64_t>(maxTotal, cache_positions[s] + 1);
@@ -817,7 +905,8 @@ TSG_EXPORT int TSGgml_Qwen4ExpArenaDecodeBatched(
             return true;
         };
         int entry_idx = -1;
-        for (int i = 0; i < kQ4abMaxEntries; i++)
+        const int entry_limit = g_q4ab_scope.entries();
+        for (int i = 0; i < entry_limit; i++)
         {
             Q4abEntry& e = pool.entries[i];
             if (e.valid && e.sig_disc == sig_disc && e.n_slots == n_slots_req &&
@@ -861,11 +950,11 @@ TSG_EXPORT int TSGgml_Qwen4ExpArenaDecodeBatched(
             }
             if (entry_idx < 0)
             {
-                for (int i = 0; i < kQ4abMaxEntries; i++)
+                for (int i = 0; i < entry_limit; i++)
                     if (!pool.entries[i].valid && !q4ab_has_failed_slot(pool.entries[i])) { entry_idx = i; break; }
                 if (entry_idx < 0)
                 {
-                    for (int i = 0; i < kQ4abMaxEntries; i++)
+                    for (int i = 0; i < entry_limit; i++)
                         if (!q4ab_has_failed_slot(pool.entries[i]) &&
                             (entry_idx < 0 || pool.used[i] < pool.used[entry_idx])) entry_idx = i;
                 }
@@ -1078,6 +1167,7 @@ TSG_EXPORT int TSGgml_Qwen4ExpArenaDecodeBatched(
                         const int padded = e.attention_windows[s];
                         auto* mask = ggml_view_2d(ctx, e.attn_mask, padded, 1, e.attn_mask->nb[1], (size_t)s * e.attn_mask->nb[3]);
                         auto* pos = ggml_view_1d(ctx, e.rope_pos_in, 1, (size_t)s * sizeof(int32_t));
+                        qwen4exp_expand_rotary_position_input(e.graph, pos);
                         auto* idx = ggml_view_1d(ctx, e.local_idx_in, 1, (size_t)s * sizeof(int64_t));
                         auto* k = ggml_view_3d(ctx, e.k_arena[il], hd, e.cap, kvH, rb, e.cap * rb, (size_t)s * e.rows_per_slot * rb);
                         auto* v = ggml_view_3d(ctx, e.v_arena[il], hd, e.cap, kvH, rb, e.cap * rb, (size_t)s * e.rows_per_slot * rb);
@@ -1090,10 +1180,15 @@ TSG_EXPORT int TSGgml_Qwen4ExpArenaDecodeBatched(
                             qsa.inputs = &e.qsa_inputs[il][s];
                             qsa.cache = ggml_view_2d(ctx, raw, a.head_dim, e.cap, raw->nb[1], (size_t)s * raw->nb[2]);
                         }
+                        Qwen4ExpAttnDiagnostic* diagnostic = nullptr;
+                        if (qwen4exp_attn_diagnostic_config().matches(true, il)) {
+                            e.attn_diagnostic.emplace_back();
+                            diagnostic = &e.attn_diagnostic.back(); diagnostic->layer = il; diagnostic->slot = s;
+                        }
                         auto* out = q4e_nodes_attn(ctx, e.graph, binder, &attn[il], col, mask, pos, idx,
                             n_embd, hc, hc_low_rank, 1, head_dim, n_head, kvH, (int)e.cap, padded,
                             n_rot, rope_base, rope_freq_scale, attn_scale, eps, use_flash,
-                            nullptr, nullptr, nullptr, nullptr, k, v, qsa.args ? &qsa : nullptr);
+                            nullptr, nullptr, nullptr, nullptr, k, v, qsa.args ? &qsa : nullptr, diagnostic);
                         next = next ? ggml_concat(ctx, next, out, 1) : out;
                     }
                     res = next;
@@ -1171,8 +1266,9 @@ TSG_EXPORT int TSGgml_Qwen4ExpArenaDecodeBatched(
             // alloc_ctx_tensors also allocates the unused stacked-expert tensor
             // descriptors of CPU-offloaded layers, wiring tens of GB on Metal.
             optimize_graph_for_metal(ctx, e.graph);
-            e.alloc = ggml_gallocr_new(ggml_backend_get_default_buffer_type(g_backend));
-            if (!e.alloc || !ggml_gallocr_alloc_graph(e.alloc, e.graph))
+            e.alloc = tsg::graph_budget_gallocr_new(ggml_backend_get_default_buffer_type(g_backend), tsg::g_active_rank,
+                g_q4ab_scope.active(), 5);
+            if (!e.alloc || !tsg::graph_budget_gallocr_alloc_graph(e.alloc, e.graph))
                 return abort_build("failed to allocate the arena backend buffer.");
             for (auto* tensors : {&e.k_arena, &e.v_arena, &e.conv_arena, &e.ssm_arena, &e.qsa_arena})
                 for (auto* t : *tensors)
@@ -1627,6 +1723,9 @@ TSG_EXPORT int TSGgml_Qwen4ExpArenaDecodeBatched(
                                            e.sampled_stage.size() * sizeof(std::int32_t));
         host_read_barrier();
 
+        for (const auto& diagnostic : e.attn_diagnostic)
+            for (int caller = 0; caller < n_seqs; ++caller)
+                if (slot_of[caller] == diagnostic.slot) diagnostic.dump("arena", cache_positions[caller], caller);
         if (trace) for (size_t i = 0; i < e.trace_res.size(); ++i)
         {
             auto* t = e.trace_res[i];
@@ -1682,6 +1781,9 @@ TSG_EXPORT int TSGgml_Qwen4ExpArenaDecodeBatched(
         }
 
         clear_last_error();
+        g_q4ab_last_execution = {g_q4ab_execution_id.fetch_add(1, std::memory_order_relaxed) + 1,
+            n_seqs, e.n_slots, ggml_graph_n_nodes(e.graph), static_cast<int>(e.host_moe.size()),
+            e.host_moe.empty() ? 0 : 1};
         return 1;
     }
     // A failed flush can leave solo state only partially copied, even before

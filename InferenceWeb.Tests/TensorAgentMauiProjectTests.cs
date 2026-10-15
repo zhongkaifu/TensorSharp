@@ -215,6 +215,10 @@ public class TensorAgentMauiProjectTests
                      "TSGgml_TranscodeBonsaiToQ2_0",
                      "TSGgml_BonsaiRegisterWeight",
                      "TSGgml_BonsaiUnregisterWeight",
+                     "TSGgml_GlmUnifiedBudgetVersion",
+                     "TSGgml_GlmSelectedExpertMinimumBudget",
+                     "TSGgml_BeginHostMoeExpertCacheScopeWithCapacityGrowth",
+                     "TSGgml_HostMoeFilePipelineVersion",
                  })
         {
             Assert.Contains(export, retained);
@@ -223,7 +227,7 @@ public class TensorAgentMauiProjectTests
         // The failure is architectural rather than model-specific: an export
         // added to the static archive but omitted here survives Debug/simulator
         // builds and then disappears under the Release device strip step. Keep
-        // the manifest identical to the native source exports so the next model
+        // the manifest identical to the production native source exports so the next model
         // kernel cannot repeat that delayed EntryPointNotFound failure.
         string nativeDir = Path.Combine(RepoRoot, "TensorSharp.GGML.Native");
         var exportPattern = new Regex(
@@ -236,9 +240,15 @@ public class TensorAgentMauiProjectTests
                            path.EndsWith(".h", StringComparison.Ordinal))
             .SelectMany(path => exportPattern.Matches(File.ReadAllText(path))
                 .Select(match => match.Groups[1].Value))
+            // TSGgml_Test* is the reserved test-hook ABI; those functions are
+            // absent from the production archive and cannot be Release roots.
+            .Where(name => !name.StartsWith("TSGgml_Test", StringComparison.Ordinal))
             .Distinct(StringComparer.Ordinal)
             .OrderBy(name => name, StringComparer.Ordinal)
             .ToArray();
+
+        Assert.DoesNotContain(retained,
+            name => name.StartsWith("TSGgml_Test", StringComparison.Ordinal));
 
         Assert.Equal(nativeExports,
             retained.Distinct(StringComparer.Ordinal)
@@ -694,14 +704,16 @@ public class TensorAgentMauiProjectTests
             Assert.Contains($"<key>{key}</key>", plist);
         }
 
-        // An Entitlements.plist beside it is what MAUI signs the app with, and the App
-        // Sandbox there would stop every command: a process inside the App Sandbox
-        // cannot apply the Seatbelt profile the desktop backend confines code with.
-        // The hardened runtime's own entitlements (JIT for Mono, camera, microphone,
-        // photos) are fine there; the App Sandbox is not.
-        string entitlements = Path.Combine(MauiDir, "Platforms", "MacCatalyst", "Entitlements.plist");
-        if (File.Exists(entitlements))
-            Assert.DoesNotContain("com.apple.security.app-sandbox", File.ReadAllText(entitlements));
+        // Hardened-runtime entitlements enable JIT and existing capture features.
+        // App Sandbox is a separate entitlement: it would prevent the desktop
+        // backend from applying its own Seatbelt profile to skill processes.
+        var entitlements = XDocument.Load(Path.Combine(MauiDir, "Platforms", "MacCatalyst", "Entitlements.plist"));
+        Assert.Contains(entitlements.Descendants("key"),
+            key => key.Value == "com.apple.security.cs.allow-jit"
+                && key.ElementsAfterSelf().First().Name.LocalName == "true");
+        Assert.DoesNotContain(entitlements.Descendants("key"),
+            key => key.Value == "com.apple.security.app-sandbox"
+                && key.ElementsAfterSelf().First().Name.LocalName == "true");
         Assert.DoesNotContain(Csproj.Descendants(Ns + "CodesignEntitlements"),
             e => e.Value.Contains("MacCatalyst", StringComparison.Ordinal));
         foreach (string file in new[] { "AppDelegate.cs", "Program.cs", "SceneDelegate.cs" })

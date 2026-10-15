@@ -96,6 +96,10 @@ namespace TensorSharp.Models.Architecture
         /// whole-layer placement. LayerSplit architectures support it inherently.</summary>
         public bool SupportsLayerSplit { get; init; }
 
+        /// <summary>Provides an explicit file-backed weight execution adapter. The
+        /// factory validates the backend, layout and model features before loading.</summary>
+        public bool SupportsWeightStreaming { get; init; }
+
         /// <summary>Optional native partial-TP mode, for an otherwise layer-split
         /// executor. True only when its explicit native settings enable real sharding
         /// for the requested degree and backend.</summary>

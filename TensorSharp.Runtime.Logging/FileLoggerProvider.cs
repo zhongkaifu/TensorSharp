@@ -10,9 +10,11 @@
 
 using System;
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.IO;
 using System.Text;
 using System.Threading;
+using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
 
 namespace TensorSharp.Runtime.Logging
@@ -37,6 +39,10 @@ namespace TensorSharp.Runtime.Logging
         private readonly Thread _writer;
         private readonly CancellationTokenSource _shutdown = new();
         private readonly object _writeLock = new();
+        private readonly object _flushLifecycleLock = new();
+        private readonly ConcurrentQueue<TaskCompletionSource<bool>> _flushRequests = new();
+        private readonly SemaphoreSlim _flushSlots;
+        private int _activeWrites;
 
         private DateTime _currentDateUtc;
         private int _rolloverSuffix;
@@ -51,6 +57,7 @@ namespace TensorSharp.Runtime.Logging
             _options.Validate();
 
             _queue = new FileLogQueue(_options.MaxQueuedEntries);
+            _flushSlots = new SemaphoreSlim(_options.MaxQueuedEntries, _options.MaxQueuedEntries);
             _writer = new Thread(WriterLoop)
             {
                 IsBackground = true,
@@ -71,25 +78,58 @@ namespace TensorSharp.Runtime.Logging
                 new FileLogger(name, _queue, _scopes, _options.MinimumLevel));
         }
 
-        /// <summary>Block until pending entries are flushed, or <paramref name="timeout"/> elapses.</summary>
+        /// <summary>Wait for the writer to finish pending records and durably flush
+        /// their file. Returns false on timeout or after disposal starts. A timeout
+        /// does not cancel disk I/O already submitted by the writer.</summary>
         public bool Flush(TimeSpan timeout)
         {
-            var deadline = DateTime.UtcNow + timeout;
-            while (_queue.Pending > 0 && DateTime.UtcNow < deadline)
-                Thread.Sleep(10);
+            if (timeout < TimeSpan.Zero && timeout != Timeout.InfiniteTimeSpan)
+                throw new ArgumentOutOfRangeException(nameof(timeout));
+            if (_disposed)
+                return false; // Disposal may still be completing its final durable I/O.
 
-            lock (_writeLock)
+            var timer = Stopwatch.StartNew();
+            TimeSpan Remaining() => timeout == Timeout.InfiniteTimeSpan
+                ? Timeout.InfiniteTimeSpan : TimeSpan.FromTicks(Math.Max(0, timeout.Ticks - timer.Elapsed.Ticks));
+            var completion = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            if (!_flushSlots.Wait(Remaining()))
+                return false;
+            lock (_flushLifecycleLock)
             {
-                _currentFile?.Flush(true);
+                // Disposal cannot retire the writer between this registration
+                // and its wakeup, including callers waiting for a bounded slot.
+                if (_disposed)
+                {
+                    _flushSlots.Release();
+                    return false;
+                }
+                _flushRequests.Enqueue(completion);
+                _queue.SignalShutdown(); // Wake the writer without a queued log.
             }
-            return _queue.Pending == 0;
+            try
+            {
+                if (!completion.Task.Wait(Remaining()))
+                {
+                    completion.TrySetCanceled();
+                    return false;
+                }
+            }
+            catch (AggregateException)
+            {
+                // Preserve the original I/O exception rather than changing the
+                // public Flush contract to an AggregateException.
+                return completion.Task.GetAwaiter().GetResult();
+            }
+            return completion.Task.GetAwaiter().GetResult();
         }
 
         public void Dispose()
         {
-            if (_disposed)
-                return;
-            _disposed = true;
+            lock (_flushLifecycleLock)
+            {
+                if (_disposed) return;
+                _disposed = true;
+            }
 
             try { _shutdown.Cancel(); }
             catch { /* nothing useful we can do here */ }
@@ -99,6 +139,12 @@ namespace TensorSharp.Runtime.Logging
             catch { /* shutting down anyway */ }
 
             DrainQueue();
+            CompleteFlushRequests();
+            while (_flushRequests.TryDequeue(out var abandoned))
+            {
+                _flushSlots.Release();
+                abandoned.TrySetResult(false);
+            }
 
             lock (_writeLock)
             {
@@ -118,39 +164,64 @@ namespace TensorSharp.Runtime.Logging
             {
                 _queue.WaitForEntry(_options.FlushInterval, token);
                 DrainQueue();
+                CompleteFlushRequests();
             }
 
             DrainQueue();
+            CompleteFlushRequests();
         }
 
         private void DrainQueue()
         {
-            while (_queue.TryDequeue(out var entry))
+            while (true)
             {
-                if (entry == null) continue;
+                // Increment before dequeue: an empty queue must not make Flush
+                // overlook a record currently being formatted outside _writeLock.
+                Interlocked.Increment(ref _activeWrites);
                 try
                 {
-                    WriteEntry(entry);
-                }
-                catch
-                {
-                    // Logging must never throw out of an application's hot path. We
-                    // intentionally swallow here; the next file-rotation pass will
-                    // attempt to recover by opening a fresh handle.
+                    if (!_queue.TryDequeue(out var entry))
+                        break;
+                    if (entry == null) continue;
                     try
                     {
-                        lock (_writeLock)
-                        {
-                            try { _currentFile?.Dispose(); } catch { }
-                            _currentFile = null;
-                            _currentFilePath = null;
-                        }
+                        WriteEntry(entry);
                     }
                     catch
                     {
-                        // give up
+                        // Logging must never throw out of an application's hot path.
+                        // The next file-rotation pass attempts a fresh handle.
+                        try
+                        {
+                            lock (_writeLock)
+                            {
+                                try { _currentFile?.Dispose(); } catch { }
+                                _currentFile = null;
+                                _currentFilePath = null;
+                            }
+                        }
+                        catch { /* give up */ }
                     }
                 }
+                finally { Interlocked.Decrement(ref _activeWrites); }
+            }
+        }
+
+        private void CompleteFlushRequests()
+        {
+            if (_queue.Pending != 0 || Volatile.Read(ref _activeWrites) != 0)
+                return;
+            while (_queue.Pending == 0 && Volatile.Read(ref _activeWrites) == 0
+                && _flushRequests.TryDequeue(out var completion))
+            {
+                _flushSlots.Release();
+                if (completion.Task.IsCompleted) continue;
+                try
+                {
+                    lock (_writeLock) { _currentFile?.Flush(true); }
+                    completion.TrySetResult(true);
+                }
+                catch (Exception error) { completion.TrySetException(error); }
             }
         }
 

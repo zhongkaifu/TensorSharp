@@ -165,12 +165,15 @@ namespace TensorSharp.Models
         /// <param name="directCuda">Load on the direct-CUDA whole-model engine (GLM-5.3-Flash on
         /// <c>--backend cuda</c>; see <see cref="DirectCudaApplies"/>).</param>
         internal GlmDsaModel(string ggufPath, BackendType backend, int tpDegree, ITensorParallelGroup tpGroup,
-            int layerSplitDegree, bool directCuda)
+            int layerSplitDegree, bool directCuda, ModelMemoryPolicy memoryPolicy = null)
             : base(ggufPath,
                 directCuda ? ValidateDirectCuda(tpDegree, tpGroup, layerSplitDegree)
                     : ValidateParallelism(backend, tpDegree, tpGroup, layerSplitDegree),
-                NativeRequested(backend) || directCuda ? 1 : tpDegree, directCuda ? null : tpGroup)
+                NativeRequested(backend) || directCuda ? 1 : tpDegree, directCuda ? null : tpGroup, 1, null, memoryPolicy)
         {
+            try
+            {
+            ValidateUnifiedMemoryPolicy(memoryPolicy, backend, tpDegree, layerSplitDegree, directCuda);
             string arch = _gguf.GetString("general.architecture") ?? "glm-dsa";
             Config = new ModelConfig { Architecture = arch };
             ParseBaseConfig();
@@ -198,6 +201,7 @@ namespace TensorSharp.Models
 
             if (NativeRequested(backend))
             {
+                ParseGlm5NextConfig(arch, _numTrunkLayers, allocateState: false);
                 // The whole model lives in the native executor: no managed weight
                 // tensors, no managed caches.
                 InitNativeExecutor(ggufPath, backend, tpDegree, layerSplitDegree, maxContextLength);
@@ -230,6 +234,13 @@ namespace TensorSharp.Models
 
             InitCaches(initialCacheLength, maxContextLength);
             AllocateScratch();
+            }
+            catch (Exception creation)
+            {
+                try { Dispose(); }
+                catch (Exception cleanup) { throw new GlmConstructionCleanupException(this, creation, cleanup); }
+                throw;
+            }
         }
 
         /// <summary>
@@ -238,7 +249,7 @@ namespace TensorSharp.Models
         /// (same contract as the retained Qwen hybrid GDN models). glm-dsa proper has no
         /// recurrent state and keeps the base behaviour.
         /// </summary>
-        public override bool SupportsKVCacheTruncation => Config.Architecture != "glm5next";
+        public override bool SupportsKVCacheTruncation => !GlmDsaArchitecture.IsGlm5Next(Config.Architecture);
 
         /// <summary>
         /// The dtype a slot's MLA and indexer rows are actually allocated in: F16 in the
@@ -356,7 +367,7 @@ namespace TensorSharp.Models
         {
             var full = new bool[_numTrunkLayers];
 
-            if (arch == "glm5next")
+            if (GlmDsaArchitecture.IsGlm5Next(arch))
             {
                 // GLM-5.3-Flash: attention.head_count_kv is a per-layer array,
                 // 0 on KDA (linear-attention) layers and 1 on MLA+DSA layers.

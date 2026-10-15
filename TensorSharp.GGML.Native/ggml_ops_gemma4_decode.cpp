@@ -72,7 +72,7 @@ namespace
 
         void reset()
         {
-            if (buffer != nullptr) { ggml_backend_buffer_free(buffer); buffer = nullptr; }
+            if (buffer != nullptr) { tsg::graph_budget_free_buffer(buffer); buffer = nullptr; }
             if (ctx != nullptr) { ggml_free(ctx); ctx = nullptr; }
             graph = nullptr; valid = false;
             hidden_in = hidden_out = pos_tensor = ple_input = ple_ids = nullptr;
@@ -1072,7 +1072,7 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
             // attention workspaces; ordinary activations retain unique slots.
             persist_buf = (g_backend_type == BACKEND_TYPE_METAL
                 ? alloc_ctx_tensors_with_attention_reuse(ctx, graph, g_backend)
-                : ggml_backend_alloc_ctx_tensors(ctx, g_backend));
+                : tsg::alloc_ctx_tensors_budgeted(ctx, g_backend));
             if (persist_buf == nullptr)
             {
                 set_last_error("Gemma4 model decode: failed to allocate persist backend buffer.");
@@ -1084,7 +1084,7 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
         {
             buffer.value = (g_backend_type == BACKEND_TYPE_METAL
                 ? alloc_ctx_tensors_with_attention_reuse(ctx, graph, g_backend)
-                : ggml_backend_alloc_ctx_tensors(ctx, g_backend));
+                : tsg::alloc_ctx_tensors_budgeted(ctx, g_backend));
             if (buffer.value == nullptr)
             {
                 set_last_error("Failed to allocate backend buffer for Gemma4 model decode.");
@@ -1147,7 +1147,7 @@ TSG_EXPORT int TSGgml_Gemma4ModelDecode(
             if (status != GGML_STATUS_SUCCESS)
             {
                 set_last_error("ggml backend graph execution failed for Gemma4 model decode.");
-                if (can_persist) { ggml_backend_buffer_free(persist_buf); ggml_free(ctx); }
+                if (can_persist) { tsg::graph_budget_free_buffer(persist_buf); ggml_free(ctx); }
                 return 0;
             }
 

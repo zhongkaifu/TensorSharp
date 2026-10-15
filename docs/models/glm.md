@@ -1,4 +1,4 @@
-# GLM-5.x (`glm-dsa`, `glm5next`)
+# GLM-5.x (`glm-dsa`, `glm5next` / `glm5-next`)
 
 > **Multi-GPU selection:** use `--layer-split N` for whole-layer placement or a supported `--tp N` tensor-parallel mode. With neither mode configured, the default is one device. Older commands and measurements below predate that default: migrate multi-GPU launches by adding `--layer-split N`. Layer split is single-node only.
 
@@ -12,6 +12,19 @@ id is `glm-dsa` (the loader also accepts `glm_dsa`). **GLM-5.3** is the same blo
 shares this whole page - see [its section below](#glm-53-glm-dsa). **GLM-5.3-Flash**
 (`glm5next`) runs through the same executor - see
 [its section below](#glm-53-flash-glm5next).
+
+Both GLM-5.3-Flash GGUF spellings, `glm5next` and the current published
+`glm5-next`, are accepted. Metadata is read with the original file's prefix;
+neither the GGUF nor upstream ggml needs modification. The alias also retains
+the KDA state/rewind contract, chat protocol and vision integration.
+
+On `ggml_cuda`, GLM-5.3-Flash now uses the native capacity planner when CPU
+expert offload is unspecified. It chooses the fewest leading host expert layers
+that fit the visible devices together with context and graph reserves (zero if
+everything fits). `--n-cpu-moe 0`, a positive count and `--cpu-moe` remain
+explicit overrides. This is a load-time per-model plan, not a shared RAM/VRAM
+budget or a guarantee that host-mapped expert pages fit in RAM. Other GLM
+architectures and backends keep their existing opt-in policy.
 
 ## The block
 

@@ -162,6 +162,56 @@ public class FileLoggerProviderTests
     }
 
     [Fact]
+    public void Logger_EmitsUniqueScopeMembersWithInnermostRequestIdentityAndRestoresParent()
+    {
+        string dir = CreateTempDir();
+        try
+        {
+            using var provider = new FileLoggerProvider(CreateOptions(dir));
+            var logger = provider.CreateLogger("ScopeIdentity");
+            using (logger.BeginScope(new Dictionary<string, object>
+                { ["RequestId"] = "transport-id", ["ConnectionId"] = "connection" }))
+            {
+                using (logger.BeginScope(new Dictionary<string, object>
+                    { ["RequestId"] = "http-id", ["SessionId"] = "session" }))
+                    logger.LogInformation("inner");
+                logger.LogInformation("outer");
+            }
+            Assert.True(provider.Flush(TimeSpan.FromSeconds(2)));
+            provider.Dispose();
+            var entries = ReadAllEntries(dir);
+            Assert.Equal(2, entries.Count);
+            var inner = entries[0].GetProperty("scope");
+            Assert.Equal("http-id", inner.GetProperty("RequestId").GetString());
+            Assert.Equal("connection", inner.GetProperty("ConnectionId").GetString());
+            Assert.Equal("session", inner.GetProperty("SessionId").GetString());
+            Assert.Equal(inner.EnumerateObject().Count(), inner.EnumerateObject().Select(p => p.Name).Distinct().Count());
+            Assert.Equal("transport-id", entries[1].GetProperty("scope").GetProperty("RequestId").GetString());
+        }
+        finally { TryCleanup(dir); }
+    }
+
+    [Fact]
+    public void Logger_RepeatedTemplateKeysAreUnambiguousAndKeepTheLastValue()
+    {
+        string dir = CreateTempDir();
+        try
+        {
+            using var provider = new FileLoggerProvider(CreateOptions(dir));
+            var logger = provider.CreateLogger("RepeatedTemplate");
+            logger.LogInformation("Counts {Count}/{Count}", 1, 2);
+            Assert.True(provider.Flush(TimeSpan.FromSeconds(2)));
+            provider.Dispose();
+            var entry = Assert.Single(ReadAllEntries(dir));
+            Assert.Equal("Counts 1/2", entry.GetProperty("message").GetString());
+            Assert.Equal("Counts {Count}/{Count}", entry.GetProperty("template").GetString());
+            Assert.Single(entry.GetProperty("props").EnumerateObject());
+            Assert.Equal(2, entry.GetProperty("props").GetProperty("Count").GetInt32());
+        }
+        finally { TryCleanup(dir); }
+    }
+
+    [Fact]
     public void Logger_RecordsExceptionDetails()
     {
         string dir = CreateTempDir();
@@ -196,6 +246,82 @@ public class FileLoggerProviderTests
         {
             TryCleanup(dir);
         }
+    }
+
+    [Fact]
+    public void Flush_DoesNotAcknowledgeARecordStillBeingFormatted()
+    {
+        string dir = CreateTempDir();
+        using var entered = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        using var provider = new FileLoggerProvider(CreateOptions(dir));
+        try
+        {
+            var state = new[] { new KeyValuePair<string, object>("payload", new BlockingLogValue(entered, release)) };
+            provider.CreateLogger("BlockedFormat").Log(LogLevel.Information, default, state, null,
+                static (_, _) => "already enqueued");
+            Assert.True(entered.Wait(TimeSpan.FromSeconds(5)));
+
+            var clock = System.Diagnostics.Stopwatch.StartNew();
+            Assert.False(provider.Flush(TimeSpan.FromMilliseconds(150)));
+            Assert.True(clock.Elapsed < TimeSpan.FromSeconds(1), "Flush timeout must not wait for blocked writer I/O or formatting.");
+            Assert.Empty(Directory.GetFiles(dir, "*.jsonl"));
+
+            release.Set();
+            Assert.True(provider.Flush(TimeSpan.FromSeconds(2)));
+            Assert.Equal(1, CountEntriesWhileWriterOpen(dir));
+        }
+        finally { release.Set(); provider.Dispose(); TryCleanup(dir); }
+    }
+
+    [Fact]
+    public async Task Flush_CompletionIncludesTheInFlightRecordBeforeDispose()
+    {
+        string dir = CreateTempDir();
+        using var entered = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        using var provider = new FileLoggerProvider(CreateOptions(dir));
+        try
+        {
+            var state = new[] { new KeyValuePair<string, object>("payload", new BlockingLogValue(entered, release)) };
+            provider.CreateLogger("BlockedFormat").Log(LogLevel.Information, default, state, null,
+                static (_, _) => "already enqueued");
+            Assert.True(entered.Wait(TimeSpan.FromSeconds(5)));
+            Task<bool> flush = Task.Run(() => provider.Flush(TimeSpan.FromSeconds(2)));
+            Task first = await Task.WhenAny(flush, Task.Delay(TimeSpan.FromMilliseconds(100)));
+            Assert.NotSame(flush, first);
+            release.Set();
+            Assert.True(await flush);
+            Assert.Equal(1, CountEntriesWhileWriterOpen(dir));
+        }
+        finally { release.Set(); provider.Dispose(); TryCleanup(dir); }
+    }
+
+    private sealed class BlockingLogValue(ManualResetEventSlim entered, ManualResetEventSlim release)
+    {
+        public override string ToString()
+        {
+            entered.Set();
+            if (!release.Wait(TimeSpan.FromSeconds(5))) throw new TimeoutException("Blocked log formatter was not released.");
+            return "payload";
+        }
+    }
+
+    private static int CountEntriesWhileWriterOpen(string directory)
+    {
+        int count = 0;
+        foreach (string file in Directory.GetFiles(directory, "*.jsonl"))
+        {
+            // Windows readers must allow the existing writer's write access.
+            using var stream = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            using var reader = new StreamReader(stream);
+            while (reader.ReadLine() is { } line)
+            {
+                using var document = JsonDocument.Parse(line);
+                ++count;
+            }
+        }
+        return count;
     }
 
     [Fact]

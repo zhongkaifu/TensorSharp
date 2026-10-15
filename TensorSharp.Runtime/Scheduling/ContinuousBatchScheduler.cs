@@ -6,6 +6,9 @@
 // TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
 using System;
 using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+using TensorSharp.Memory;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 using TensorSharp.Runtime.Paged;
@@ -53,7 +56,76 @@ namespace TensorSharp.Runtime.Scheduling
         // through the prefill set, resume at that sequence next iteration.
         // Request ids survive additions/removals better than a numeric cursor.
         private string? _nextPrefillRequestId;
+        private InferenceEngine.StartupPrefillCohort? _startupPrefillCohort;
+        internal void BeginStartupPrefillCohort(InferenceEngine.StartupPrefillCohort cohort)
+        {
+            if (_startupPrefillCohort?.Holding == true)
+                throw new InvalidOperationException("A startup prefill cohort is already installed.");
+            _startupPrefillCohort = cohort;
+        }
+
+        private void UpdateStartupPrefillCohort()
+        {
+            var cohort = _startupPrefillCohort;
+            if (cohort == null) return;
+            if (!cohort.Holding) { _startupPrefillCohort = null; return; }
+            var live = GetInFlightSequencesSnapshot();
+            if (live.Count != cohort.Members.Count || live.Any(s => !cohort.Members.Contains(s)))
+                cohort.Decline("startup cohort membership changed or foreign work arrived");
+            else if (live.Any(s => s.Status == SequenceStatus.Preempted))
+                cohort.Decline("startup cohort was preempted");
+            else if (live.All(s => _running.ContainsKey(s.RequestId) && s.NumComputedTokens >= s.PromptTokens.Count))
+                cohort.Complete();
+            if (!cohort.Holding) _startupPrefillCohort = null;
+        }
+
+        private void DeclineStartupPrefillCohort(SequenceState member, string reason)
+        {
+            if (_startupPrefillCohort is { Holding: true } cohort && cohort.Members.Contains(member))
+            { cohort.Decline(reason); _startupPrefillCohort = null; }
+        }
         private readonly ILogger _logger;
+        private readonly Dictionary<string, MemoryCharge[]> _memoryPeaks = new(StringComparer.Ordinal);
+        private readonly Dictionary<string, SequenceState> _memoryOwners = new(StringComparer.Ordinal);
+        private SharedBudgetReclamation.Registration? _sharedAdmission;
+        private readonly HashSet<SequenceState> _physicalAdmissionObserved = new();
+        private readonly Dictionary<SequenceState, Task> _physicalAdmissionWaitSignals = new(ReferenceEqualityComparer.Instance);
+        private void InvalidateHolderPhysicalWaits()
+        {
+            if (_cfg.MemoryAdmission?.UsePerSequenceHolders != true) return;
+            // Physical recovery depends on the live holder cohort as well as
+            // ledger availability. A finished/cancelled holder can retain all
+            // its charged children, so closing its empty envelope need not pulse
+            // ChangeSignal. The next idle observation must still be allowed to
+            // return unused joint credit and reclaim retained state. Invalidate
+            // only when membership changes, never after each decode token.
+            _physicalAdmissionObserved.Clear();
+            _physicalAdmissionWaitSignals.Clear();
+        }
+        internal void AttachSharedAdmission(SharedBudgetReclamation.Registration registration) => _sharedAdmission = registration;
+        // After reclamation the worker captures a fresh change signal. A physical
+        // target can still refuse an otherwise ready request; schedule that check
+        // now rather than waiting for a second owner release that may never occur.
+        internal bool CanAdmitMemory(IReadOnlyList<MemoryCharge> peak) =>
+            _cfg.MemoryAdmission!.HasPhysicalCheck
+                ? _waiting.First is { } head && CanAttemptPhysicalAdmission(head.Value, peak)
+            : _sharedAdmission?.CanAdmit(peak) ?? _cfg.MemoryAdmission.Budget.CanReserve(peak);
+        private bool CanAttemptPhysicalAdmission(SequenceState request, IReadOnlyList<MemoryCharge> peak)
+        {
+            var budget = _cfg.MemoryAdmission!.Budget;
+            if (_cfg.MemoryAdmission.UsePerSequenceHolders
+                && _physicalAdmissionWaitSignals.TryGetValue(request, out var holderWait)
+                && ReferenceEquals(holderWait, budget.ChangeSignal)) return false;
+            if (!(_sharedAdmission?.CanAttemptPhysicalAdmission(peak) ?? budget.CanReserveConfiguredCeiling(peak)))
+                return false;
+            // A caller-owned refreshed ledger target can be stricter than this
+            // model's fresh physical constraint. A real failed transaction then
+            // waits for global progress instead of repeatedly sampling hardware
+            // between token steps. New heads and FIFO-only waits have no record.
+            return budget.CanReserve(peak)
+                || !_physicalAdmissionWaitSignals.TryGetValue(request, out var attemptedSignal)
+                || !ReferenceEquals(attemptedSignal, budget.ChangeSignal);
+        }
 
         public ContinuousBatchScheduler(
             SchedulerConfig cfg,
@@ -63,6 +135,8 @@ namespace TensorSharp.Runtime.Scheduling
             bool requiresPerBlockCapture = false)
         {
             _cfg = cfg ?? throw new ArgumentNullException(nameof(cfg));
+            ArgumentOutOfRangeException.ThrowIfNegativeOrZero(cfg.PrefillChunkTokenLimit);
+            cfg.MemoryAdmission?.ValidateConfiguration(cfg);
             _pool = pool ?? throw new ArgumentNullException(nameof(pool));
             _logger = logger ?? NullLogger.Instance;
             // Per-boundary alignment only serves prefix pages that other sequences
@@ -132,6 +206,8 @@ namespace TensorSharp.Runtime.Scheduling
 
         public int WaitingCount => _waiting.Count;
         public int RunningCount => _running.Count;
+        public bool MemoryAdmissionBlocked { get; private set; }
+        internal IReadOnlyList<MemoryCharge>? BlockedMemoryPeak { get; private set; }
         public BlockPool Pool => _pool;
         public SchedulerConfig Config => _cfg;
 
@@ -185,8 +261,12 @@ namespace TensorSharp.Runtime.Scheduling
         public void Submit(SequenceState seq)
         {
             if (seq == null) throw new ArgumentNullException(nameof(seq));
+            if (_cfg.MemoryAdmission?.ExecutionShape is { } shape && seq.BlockTable.BlockSize != shape.BlockTokens)
+                throw new ArgumentException("The request block size differs from its admitted snapshot geometry.", nameof(seq));
             if (_waitingIndex.ContainsKey(seq.RequestId) || _running.ContainsKey(seq.RequestId))
                 throw new InvalidOperationException($"Sequence {seq.RequestId} is already submitted.");
+            if (_memoryOwners.ContainsKey(seq.RequestId))
+                throw new InvalidOperationException("The previous request with this id has not released its physical memory.");
 
             // A single request can eventually reclaim blocks from other requests
             // through preemption, but it can never exceed the pool's physical
@@ -208,6 +288,22 @@ namespace TensorSharp.Runtime.Scheduling
                 throw ex;
             }
 
+            if (_cfg.MemoryAdmission is { } admission)
+            {
+                if (_waiting.Count >= admission.MaxQueuedRequests)
+                    throw new MemoryPressureException("The memory admission queue is full.");
+                var peak = admission.EstimatePeak(seq).ToArray();
+                if (admission.EstimateMaterializationPeak != null && !admission.Budget.CanEverFitConfiguredCeiling(peak))
+                    throw new MemoryPressureException("The no-hit execution peak exceeds a configured memory pool even in isolation.");
+                // A refresh adapter may reduce optional retained-cache allowance
+                // at the physical boundary. Its queued estimate is provisional:
+                // reject only the refreshed peak, before any reservation/forward.
+                if (!admission.ReestimateAfterPhysicalCheck
+                    && !(!admission.HasPhysicalCheck ? admission.Budget.CanEverFit(peak)
+                    : admission.Budget.CanEverFitConfiguredCeiling(peak)))
+                    throw new MemoryPressureException("Request peak exceeds a configured physical memory pool even in isolation.");
+                _memoryPeaks.Add(seq.RequestId, peak);
+            }
             var node = _waiting.AddLast(seq);
             _waitingIndex[seq.RequestId] = node;
             seq.Status = SequenceStatus.Waiting;
@@ -233,6 +329,9 @@ namespace TensorSharp.Runtime.Scheduling
         /// </summary>
         public SchedulerOutput Schedule()
         {
+            UpdateStartupPrefillCohort();
+            MemoryAdmissionBlocked = false;
+            BlockedMemoryPeak = null;
             var output = new SchedulerOutput();
             int tokenBudget = _cfg.MaxNumBatchedTokens;
 
@@ -271,6 +370,12 @@ namespace TensorSharp.Runtime.Scheduling
                     prefillSnapshot.Add(seq);
             }
             bool hasActiveDecode = decodeSnapshot.Count > 0;
+            if (_startupPrefillCohort is { } startupCohort)
+            {
+                hasActiveDecode = false;
+                foreach (var seq in decodeSnapshot)
+                    if (!startupCohort.Members.Contains(seq)) { hasActiveDecode = true; break; }
+            }
 
             // -------------------------------------------------------------- 1. Decode first.
             // A fixed running-order traversal can otherwise let enough prefills
@@ -283,6 +388,7 @@ namespace TensorSharp.Runtime.Scheduling
                 // A prior allocation attempt may have preempted a later entry
                 // from this snapshot to recover KV blocks.
                 if (!_running.ContainsKey(seq.RequestId)) continue;
+                if (_startupPrefillCohort?.Members.Contains(seq) == true) continue;
                 TryScheduleRunningSequence(
                     seq, want: 1, isPrefill: false, output, ref tokenBudget);
             }
@@ -318,7 +424,7 @@ namespace TensorSharp.Runtime.Scheduling
                 int promptUncomputed = Math.Max(
                     0, seq.PromptTokens.Count - seq.NumComputedTokens);
                 int cap = GetPrefillCap(
-                    noContention, hasActiveDecode, tokenBudget,
+                    seq, noContention, hasActiveDecode, tokenBudget,
                     prefillCandidatesRemaining, soloPrefillCap);
                 int desired = Math.Min(promptUncomputed, cap);
                 int want = Math.Min(desired, tokenBudget);
@@ -373,9 +479,113 @@ namespace TensorSharp.Runtime.Scheduling
                 // Try prefix cache lookup before allocating blocks (only for
                 // brand-new sequences; preempted ones already had their blocks
                 // freed and need a fresh re-prefill, no shortcut).
-                bool soleAdmission = false;
-                if (seq.BlockTable.NumBlocks == 0 && PrefixCachingActive)
+                if (_cfg.MemoryAdmission is { } admission && seq.MemoryEnvelope == null)
                 {
+                    var peak = admission.EstimateMaterializationPeak?.Invoke(seq).ToArray() ?? _memoryPeaks[seq.RequestId];
+                    _memoryPeaks[seq.RequestId] = peak;
+                    BudgetReservation? envelope;
+                    Task? attemptedSignal = null;
+                    try
+                    {
+                        IReadOnlyList<MemoryCharge>? constraints = null;
+                        IReadOnlyList<MemoryCharge> SamplePhysicalCapacity()
+                        {
+                            // A holder adapter can wait for its live neighbour
+                            // after physical refusal. Observe before any trim or
+                            // sample so a concurrent release cannot be missed.
+                            attemptedSignal = admission.Budget.ChangeSignal;
+                            var sampled = (admission.BeforeAdmissionWithRunning != null
+                                ? admission.BeforeAdmissionWithRunning(seq, _runningOrder)
+                                : admission.BeforeAdmission!(seq)) ?? throw new InvalidOperationException(
+                                "The physical admission check returned no capacity constraints.");
+                            if (admission.ReestimateAfterPhysicalCheck)
+                            {
+                                peak = (admission.EstimateMaterializationPeak ?? admission.EstimatePeak)(seq).ToArray();
+                                if (!admission.Budget.CanEverFitConfiguredCeiling(peak))
+                                    throw new MemoryPressureException("Refreshed request peak exceeds a configured memory pool.");
+                                _memoryPeaks[seq.RequestId] = peak;
+                            }
+                            return sampled;
+                        }
+                        bool hasTurn = _sharedAdmission?.HasAdmissionTurn(peak) ?? true;
+                        // Sample a new eligible head once, even if a private stale
+                        // target or owner floor currently makes it wait. Recovery
+                        // does not necessarily pulse the ledger's change signal.
+                        if (admission.HasPhysicalCheck
+                            && ((!admission.Budget.CanEverFit(peak)) || (hasTurn
+                                && (!_physicalAdmissionObserved.Contains(seq) || CanAttemptPhysicalAdmission(seq, peak)))))
+                        {
+                            constraints = SamplePhysicalCapacity();
+                            _physicalAdmissionObserved.Add(seq);
+                        }
+                        if (!admission.Budget.CanEverFit(peak))
+                            throw new MemoryPressureException(
+                                "Request peak exceeds a physical memory pool after its capacity changed.");
+                        // A resource-blocked head may be revisited between other
+                        // requests' token steps. Only sample physical capacity when
+                        // this request is actually eligible to acquire an envelope.
+                        // Configured contention has a ledger release signal. A
+                        // lowered physical target may never pulse it: attempt the
+                        // constrained transaction and explicitly refuse that case.
+                        bool ready = !admission.HasPhysicalCheck || CanAttemptPhysicalAdmission(seq, peak);
+                        if (admission.HasPhysicalCheck && ready && constraints == null)
+                            constraints = SamplePhysicalCapacity();
+                        if (constraints != null && !admission.Budget.CanEverFit(peak, constraints))
+                            throw new MemoryPressureException(
+                                "Request peak exceeds a freshly observed physical capacity even in isolation.");
+                        if (_sharedAdmission != null)
+                            envelope = _sharedAdmission.TryReserve(seq, peak, out attemptedSignal, constraints, waitOnly: !ready);
+                        else if (!ready) envelope = null;
+                        else
+                        {
+                            if (constraints != null) attemptedSignal = admission.Budget.ChangeSignal;
+                            envelope = constraints == null ? admission.Budget.TryReserve(peak)
+                                : admission.Budget.TryReserve(peak, constraints);
+                        }
+                    }
+                    catch (MemoryPressureException) when (admission.UsePerSequenceHolders && _running.Count > 0
+                        && admission.Budget.CanEverFitConfiguredCeiling(peak))
+                    {
+                        // Another live request owns releasable state/envelope.
+                        // It can finish and wake this head. Do not turn ordinary
+                        // contention into a failed HTTP response, or re-sample
+                        // physical capacity after every decode token.
+                        _physicalAdmissionObserved.Add(seq);
+                        _physicalAdmissionWaitSignals[seq] = attemptedSignal ?? admission.Budget.ChangeSignal;
+                        _sharedAdmission?.TryReserve(seq, peak, waitOnly: true);
+                        MemoryAdmissionBlocked = true;
+                        BlockedMemoryPeak = peak;
+                        break;
+                    }
+                    catch (Exception error)
+                    {
+                        // No model state has been executed for this envelope.
+                        // A failed physical observation/refusal must not strand the
+                        // head forever or fail another already running sequence.
+                        NotifyError(seq, error, output);
+                        continue;
+                    }
+                    if (envelope == null)
+                    {
+                        if (attemptedSignal != null) _physicalAdmissionWaitSignals[seq] = attemptedSignal;
+                        MemoryAdmissionBlocked = true;
+                        BlockedMemoryPeak = peak;
+                        break;
+                    }
+                    _physicalAdmissionWaitSignals.Remove(seq);
+                    seq.MemoryEnvelope = envelope;
+                    _memoryOwners.Add(seq.RequestId, seq);
+                }
+                bool soleAdmission = false;
+                try
+                {
+                  if (seq.BlockTable.NumBlocks == 0 && PrefixCachingActive)
+                  {
+                    // Materializing a retained holder can allocate tensors and
+                    // download native hybrid state before the first Forward.
+                    // Its destination envelope already exists at this point.
+                    using var materializationScope = _cfg.MemoryAdmission?.UsePerSequenceHolders == true
+                        ? _cfg.MemoryAdmission.EnterSerialExecution!(seq) : null;
                     _radixCache!.PrimaryAvailable = _running.Count == 0 && output.ScheduledWork.Count == 0;
                     int length = _prefixCacheLcp?.Invoke(seq) ?? 0;
                     if (WaitForScheduledPublicCheckpoint(seq, output, length))
@@ -400,6 +610,20 @@ namespace TensorSharp.Runtime.Scheduling
                         source == null ? string.Empty : $" from {source}",
                         seq.PromptTokens.Count - seq.PrefixCacheReusedTokens,
                         why == null ? string.Empty : $" ({why})");
+                  }
+                  // Adoption has now published the actual reusable token count
+                  // and its request allocation scope is closed. Return unused
+                  // wide-prefill credit before the remaining prompt executes.
+                  _cfg.MemoryAdmission?.AfterPrefixMaterialization?.Invoke(seq);
+                }
+                catch (Exception error) when (_cfg.MemoryAdmission?.UsePerSequenceHolders == true)
+                {
+                    // Prefix materialization can refuse quota or fail after
+                    // creating a partial holder. Release this request through
+                    // the normal fenced hook; preserve neighbours' scheduled
+                    // work instead of escalating a Schedule exception globally.
+                    NotifyError(seq, error, output);
+                    continue;
                 }
 
                 int promptUncomputed = Math.Max(0, seq.PromptTokens.Count - seq.NumComputedTokens);
@@ -411,7 +635,7 @@ namespace TensorSharp.Runtime.Scheduling
                 }
 
                 int cap = GetPrefillCap(
-                    noContention, hasActiveDecode, tokenBudget,
+                    seq, noContention, hasActiveDecode, tokenBudget,
                     Math.Max(1, prefillCandidatesRemaining), soloPrefillCap);
                 int desired = Math.Min(promptUncomputed, cap);
                 int want = Math.Min(desired, tokenBudget);
@@ -431,6 +655,7 @@ namespace TensorSharp.Runtime.Scheduling
                 _waitingIndex.Remove(seq.RequestId);
                 _running[seq.RequestId] = seq;
                 _runningOrder.Add(seq);
+                InvalidateHolderPhysicalWaits();
                 seq.Status = SequenceStatus.Running;
                 seq.FirstScheduledAt = DateTime.UtcNow;
 
@@ -449,6 +674,19 @@ namespace TensorSharp.Runtime.Scheduling
                     break;
             }
 
+            if (output.IsEmpty && _startupPrefillCohort is { Holding: true } stalledCohort)
+            {
+                // Holding a ready decoder must never strand a cohort that cannot
+                // admit all of its peers. Ordinary decode can release real state
+                // and credit; the optional warmup reports that width as declined.
+                stalledCohort.Decline(MemoryAdmissionBlocked
+                    ? "startup cohort lacks physical memory to admit every member"
+                    : "startup cohort cannot progress every prefill with the available KV capacity");
+                _startupPrefillCohort = null;
+                foreach (var seq in _runningOrder.ToArray())
+                    if (seq.NumComputedTokens >= seq.PromptTokens.Count && tokenBudget > 0)
+                        TryScheduleRunningSequence(seq, 1, false, output, ref tokenBudget);
+            }
             return output;
         }
 
@@ -493,22 +731,26 @@ namespace TensorSharp.Runtime.Scheduling
         /// <summary>Choose a latency cap for mixed work, or an even share of the
         /// full device token budget when all contenders are still prefilling.</summary>
         private int GetPrefillCap(
+            SequenceState sequence,
             bool noContention,
             bool hasActiveDecode,
             int tokenBudget,
             int candidatesRemaining,
             int soloPrefillCap)
         {
-            if (noContention)
-                return soloPrefillCap;
-            if (hasActiveDecode)
-                return _cfg.MaxPrefillChunkSize;
-
             candidatesRemaining = Math.Max(1, candidatesRemaining);
             int evenShare = tokenBudget / candidatesRemaining;
             if (tokenBudget % candidatesRemaining != 0)
                 evenShare++;
-            return Math.Max(1, evenShare);
+            int cap = noContention ? soloPrefillCap : hasActiveDecode
+                ? _cfg.MaxPrefillChunkSize : Math.Max(1, evenShare);
+            cap = Math.Min(cap, _cfg.PrefillChunkTokenLimit);
+            cap = Math.Min(cap, _cfg.MemoryAdmission?.GetPrefillTokenLimit(sequence) ?? int.MaxValue);
+            // Fairness and solo-throughput policies may increase a chunk, but
+            // cannot exceed the shape whose workspace was admitted. Apply this
+            // to both existing and newly admitted prefills.
+            return _cfg.MemoryAdmission?.ExecutionShape is { } shape
+                ? Math.Min(cap, shape.MaximumPrefillTokens) : cap;
         }
 
         /// <summary>Move the prefill that received only a partial quantum last
@@ -569,6 +811,10 @@ namespace TensorSharp.Runtime.Scheduling
             Exception? error = null)
         {
             if (seq == null || seq.Status.IsFinished()) return false;
+            DeclineStartupPrefillCohort(seq, "startup cohort member ended before every prefill completed: " + reason);
+            _physicalAdmissionObserved.Remove(seq);
+            _physicalAdmissionWaitSignals.Remove(seq);
+            _sharedAdmission?.Cancel(seq);
             // A finishing request frees a slot; let admission try again.
             _sequenceSlotCap = int.MaxValue;
 
@@ -584,8 +830,7 @@ namespace TensorSharp.Runtime.Scheduling
                     or SequenceStatus.FinishedAborted)
                 _radixCache.RetainPagedFinished(seq);
 
-            var freed = seq.BlockTable.Clear();
-            if (freed.Count > 0) _pool.Free(freed);
+            seq.BlockTable.ReleaseAll(_pool);
 
             seq.Status = finalStatus;
             seq.FinishReason = reason;
@@ -599,9 +844,30 @@ namespace TensorSharp.Runtime.Scheduling
             }
 
             if (_running.Remove(seq.RequestId))
+            {
                 _runningOrder.Remove(seq);
+                InvalidateHolderPhysicalWaits();
+            }
+            _memoryPeaks.Remove(seq.RequestId);
 
             return true;
+        }
+
+        /// <summary>Call only AFTER model release/fences, including preemption and
+        /// cancellation. Retained allocations drawn from the envelope remain charged.
+        /// A failing release hook must leave its envelope reserved for recovery.</summary>
+        public void NotifyMemoryReleased(string requestId)
+        {
+            if (_memoryOwners.TryGetValue(requestId, out var seq))
+            {
+                if (seq.Status == SequenceStatus.Running)
+                    throw new InvalidOperationException("Cannot release a running request's memory envelope.");
+                seq.MemoryEnvelope!.Dispose();
+                seq.MemoryEnvelope = null;
+                _physicalAdmissionObserved.Remove(seq);
+                _physicalAdmissionWaitSignals.Remove(seq);
+                _memoryOwners.Remove(requestId);
+            }
         }
 
         /// <summary>Make sure the sequence has block table capacity for
@@ -784,12 +1050,13 @@ namespace TensorSharp.Runtime.Scheduling
         /// so its re-admission recovers most of the work.</summary>
         private void PreemptSequence(SequenceState victim)
         {
+            DeclineStartupPrefillCohort(victim, "startup cohort was preempted");
             CacheFullBlocksForSequence(victim);
-            var freed = victim.BlockTable.Clear();
-            if (freed.Count > 0) _pool.Free(freed);
+            victim.BlockTable.ReleaseAll(_pool);
 
             _running.Remove(victim.RequestId);
             _runningOrder.Remove(victim);
+            InvalidateHolderPhysicalWaits();
             victim.Status = SequenceStatus.Preempted;
             victim.ResetForPreemption();
 

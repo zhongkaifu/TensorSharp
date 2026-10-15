@@ -18,6 +18,7 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -40,6 +41,9 @@ void TSGgml_ReleaseReuseComputeBuffers();
 void TSGgml_SetDeviceCopyBudget(std::int64_t bytes);
 std::int64_t TSGgml_DeviceCopyCacheResidentBytes();
 void TSGgml_Shutdown();
+int TSGgml_AttachSharedCacheBudgetEx(void*, std::uint64_t (*)(void*, int, int, std::int64_t),
+    int (*)(void*, std::uint64_t), void (*)(void*, std::uint64_t), int);
+int TSGgml_DetachSharedCacheBudget(void*);
 }
 
 namespace {
@@ -584,6 +588,97 @@ int tensor_parallel_regression(Model& model, int backend) {
     return calls;
 }
 
+// Exercise the public bridge, not a second copy of the native static registry.
+struct BudgetLedger {
+    struct Ticket { int kind; std::int64_t bytes; bool committed = false; };
+    std::map<std::uint64_t, Ticket> tickets;
+    std::uint64_t next = 0;
+    std::int64_t capacity = 1ll << 30, used = 0, graphs = 0;
+    int refused = 0;
+    static std::uint64_t reserve(void* p, int rank, int kind, std::int64_t bytes) {
+        auto& s = *static_cast<BudgetLedger*>(p);
+        require(rank == 0 && kind >= 0 && kind <= 2 && bytes > 0, "invalid budget request");
+        if (bytes > s.capacity - s.used) { ++s.refused; return 0; }
+        auto token = ++s.next;
+        s.tickets.emplace(token, Ticket{kind, bytes}); s.used += bytes;
+        return token;
+    }
+    static int commit(void* p, std::uint64_t token) {
+        auto& s = *static_cast<BudgetLedger*>(p);
+        auto& t = s.tickets.at(token);
+        require(!t.committed, "duplicate budget commit");
+        t.committed = true;
+        if (t.kind == 2) s.graphs += t.bytes;
+        return 1;
+    }
+    static void release(void* p, std::uint64_t token) {
+        auto& s = *static_cast<BudgetLedger*>(p);
+        auto t = s.tickets.at(token);
+        s.used -= t.bytes;
+        if (t.kind == 2 && t.committed) s.graphs -= t.bytes;
+        s.tickets.erase(token);
+    }
+    static void cleanup() {
+        TSGgml_QwenImage21ResetForwardCache();
+        TSGgml_QwenImage21ReleasePrefixCaches();
+        TSGgml_ReleaseReuseComputeBuffers();
+        TSGgml_ClearHostBufferCache();
+    }
+};
+
+int budget_regression(Model& model, int backend) {
+    const Shape large{"budget-large", 80, 17, {{0,17,0,0}, {17,97,0,1}}};
+    const Shape small{"budget-small", 31, 9, {{0,9,0,0}, {9,40,0,1}}};
+    Inputs a(large, 0), b(small, 0);
+    env("TS_QWEN21_GRAPH_REUSE", "1"); env("TS_QWEN21_FLASH", "1");
+    env("TS_QWEN21_PAD_MASK", "0");
+    BudgetLedger::cleanup();
+    forward(model, large, a, true); auto expected_a = a.output;
+    forward(model, small, b, true); auto expected_b = b.output;
+    int calls = 2;
+    for (bool graphs : {false, true, true}) {
+        BudgetLedger::cleanup();
+        BudgetLedger ledger;
+        require(TSGgml_AttachSharedCacheBudgetEx(&ledger, BudgetLedger::reserve,
+            BudgetLedger::commit, BudgetLedger::release, graphs) == 1, "budget attach failed");
+        if (graphs) {
+            ledger.capacity = 0;
+            auto d = a.descriptor(model, large, true);
+            require(TSGgml_QwenImage21Forward(&d) == 0, "zero shared credit bypassed by graph");
+            require(ledger.used == 0 && ledger.tickets.empty(), "failed graph leaked credit");
+            require(ledger.refused > 0, "zero budget never consulted");
+            ledger.capacity = 1ll << 30;
+        }
+        forward(model, large, a, true); ++calls;
+        compare(a.output, expected_a, "budget retry output", 1e-6);
+        require(graphs ? ledger.graphs > 0 : ledger.graphs == 0, "graph scope coverage wrong");
+        if (graphs && (backend == 1 || backend == 3)) {
+            // Only one persistent graph fits. The smaller second shape must
+            // retire the first slot and retry instead of reporting a false OOM.
+            ledger.capacity = ledger.used;
+            int refused = ledger.refused;
+            forward(model, small, b, true); ++calls;
+            require(ledger.refused > refused, "tight budget did not exercise graph retirement");
+            require(ledger.used <= ledger.capacity, "budget oversubscribed");
+            compare(b.output, expected_b, "graph retirement output", 1e-6);
+            ledger.capacity = 1ll << 30;
+        }
+        forward(model, large, a, true, 991); ++calls;
+        forward(model, large, a, true, 991); ++calls;
+        compare(a.output, expected_a, "budget prefix replay output", 1e-6);
+        TSGgml_QwenImage21ResetForwardCache();
+        TSGgml_ReleaseReuseComputeBuffers();
+        require(graphs ? ledger.graphs > 0 : ledger.graphs == 0, "prefix storage not charged");
+        TSGgml_QwenImage21ReleasePrefixCache(991);
+        require(ledger.graphs == 0, "prefix release leaked credit");
+        BudgetLedger::cleanup();
+        require(ledger.used == 0 && ledger.tickets.empty(), "multimodal cleanup leaked shared credit");
+        require(TSGgml_DetachSharedCacheBudget(&ledger) == 1, "budget detach failed");
+    }
+    std::printf("PASS shared graph/prefix credit, exhausted-credit refusal, retry parity, retirement and cleanup\n");
+    return calls;
+}
+
 void regression(const Options& options) {
     Model model(options.dim, options.ff, options.layers);
     const std::vector<Shape> shapes = {
@@ -761,6 +856,7 @@ void regression(const Options& options) {
     {
         TSGgml_QwenImage21ResetForwardCache();
         env("TS_QWEN21_GRAPH_REUSE", "1"); env("TS_QWEN21_FLASH", "1"); env("TS_QWEN21_PAD_MASK", "0");
+        calls += budget_regression(model, options.backend);
         calls += tensor_parallel_regression(model, options.backend);
     }
     if (!options.write_reference.empty()) write_reference(options.write_reference, computed);

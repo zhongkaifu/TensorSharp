@@ -65,6 +65,47 @@ control in `spec` and `image`. By default both run when a head is attached;
 explicit `auto` requires an attached head. Use `--spec-candidates auto --spec-only`
 for a plain-versus-learned comparison without the ngram or extra tool rounds.
 
+`--spec-order plain-first|spec-first` controls the actual execution order in
+`spec` and `image`. The default remains `plain-first`. With `spec-first`, all
+selected speculative candidates run before the plain control; the comparison is
+performed after both arms finish, and JSON rows retain execution order. Each
+`--warmup N` full scenario pass warms every selected arm once, using the same
+order as measurement. Run separately launched processes in balanced orders to
+control ordering effects; reversing two arms inside one process does not create
+independent ABBA samples. `rows.json.run.json` records the process ID and start,
+arguments, order and pass counts. Pin the actual native, managed and source
+identities with the external validation launcher as well.
+
+Individual rows and request timelines export `SpeculationTimings` with the full
+precision `DraftMs`, `VerifyMs`, `SnapshotMs`, `RollbackMs`, `CatchUpMs`, `PlainMs`,
+`PlainMsPerToken` and `SpecMsPerToken` counters. Missing speculative state omits
+this object; it does not fabricate zero timings. Phase totals do not include all
+scheduler/sampling work, and governor rates are local calibration estimates, not
+independent plain-control rates. Concurrent rows keep per-request timings without
+averaging governor estimates. Require complete EOS and full token equality with
+`eng/validation/validate-speculative-rows.py` plus an explicit EOS check; the
+batching `PASS` line alone still does not qualify output or performance.
+
+`eng/validation/run-speculative-window-matrix.py` prepares and runs the bounded
+Gemma CPU8 candidate-window comparison (1, 3, and default auto7, each in both
+orders; one warmup and two measured passes per fresh process):
+
+```text
+python eng/validation/run-speculative-window-matrix.py prepare --entry benchmarks/AgentTurnBench/bin/Release/net10.0/AgentTurnBench.dll --expected-entry-sha256 ENTRY_SHA256 --expected-native-sha256 NATIVE_SHA256 --model MODEL.gguf --draft-model MTP.gguf --output artifacts/FRESH_MATRIX --plan artifacts/FRESH_PLAN.json
+python eng/validation/run-speculative-window-matrix.py run --plan artifacts/FRESH_PLAN.json
+```
+
+Preparation only hashes small application/source files and records checkpoint
+size/mtime; it does not execute the model or recompute checkpoint hashes. Every
+run verifies the prepared managed/entry/source pins, observes the owned native
+module, and checks full token arrays, explicit EOS, active speculation, actual
+armed window, and plain-output consistency across all passes/processes. Quality
+failures remain visible and allow the other independent runs to finish; process
+or identity failures stop execution. Exit2 means the full matrix completed with
+quality failures, exit1 means incomplete execution, and exit0 requires all gates.
+The report keeps phase costs even on quality failure without calling that an
+optimization. Sampled telemetry and concurrent host load can affect timings.
+
 `--spec-engine ngram|auto` enables speculation on ordinary scenario engines.
 The explicitly labeled plain controls in `spec`, `json`, `newchat` and `image`
 always disable it, so they remain independent comparison controls. The `conc` rows measure
@@ -173,7 +214,14 @@ The other switches pick the prompt and drafter:
 | `--spec-diagnostic-newchat` | the `newchat` scenario's chat B prompt, on the linear trunk |
 | `--spec-diagnostic-speculator auto` | the checkpoint's own drafter instead of n-gram (pass `--draft-model` where it is a separate file) |
 | `--spec-diagnostic-window N` | draft window (default 7) |
+| `--spec-diagnostic-prefill refill\|forward` | diagnostic and rowcheck prefill entry point, recorded with prompt token IDs. Default `refill` retains historical behavior; `forward` matches the engine's ordinary `_model.Forward(chunk)` prefill entry point |
 | `--spec-diagnostic-rowcheck` | after the prompt, the same next-token rows through a one-row spec forward, 2..window+1-row verifies, a kept-prefix re-forward, a decode after a committed verify and a plain two-token forward, each against the one-row decode; then exits. The prompt plus the window must stay under the model's sliding window (the checks rewind the cache, which cannot restore an evicted slot), so pair it with `--spec-diagnostic-prompt`; a longer prompt is refused |
+
+Match prefill entry points before comparing diagnostic output with a scheduled
+request. Gemma's `ForwardRefill` splits off the last token for a decode step,
+while `Forward` processes the whole prompt chunk. The same prompt IDs can thus
+produce different arithmetic and subsequent greedy output. A diagnostic result
+from one entry point does not prove a state leak in the other.
 
 ```
 dotnet benchmarks/AgentTurnBench/bin/Release/net10.0/AgentTurnBench.dll \

@@ -90,7 +90,7 @@ namespace TensorSharp.Models
             byte[] rgba = ImageProcessorUtils.DecodeImageToRGBA(fileBytes, out int origWidth, out int origHeight);
 
             var (resizedH, resizedW) = SmartResize(origHeight, origWidth);
-            float[] pixels = ImageProcessorUtils.ResizeRgbaToChannelFirstNormalized(
+            float[] pixels = ImageProcessorUtils.ResizeRgbaToChannelFirstBicubicByte(
                 rgba, origWidth, origHeight, resizedW, resizedH);
             return (pixels, resizedH, resizedW);
         }
@@ -107,7 +107,7 @@ namespace TensorSharp.Models
                 throw new ArgumentException($"Video frame size {resizedH}x{resizedW} is not a multiple of {Factor}.");
             byte[] fileBytes = File.ReadAllBytes(imagePath);
             byte[] rgba = ImageProcessorUtils.DecodeImageToRGBA(fileBytes, out int origWidth, out int origHeight);
-            return ImageProcessorUtils.ResizeRgbaToChannelFirstNormalized(
+            return ImageProcessorUtils.ResizeRgbaToChannelFirstBicubicByte(
                 rgba, origWidth, origHeight, resizedW, resizedH);
         }
 

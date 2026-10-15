@@ -249,15 +249,15 @@ namespace TensorSharp.Models
         // reference flip; this is also what lets a new chat start from the shared-prefix
         // checkpoint instead of prefilling the system prompt again.
         public bool SupportsPerSequenceFusedForward =>
-            !IsTensorParallel
+            !HasStreamingWeights && !IsTensorParallel
             && ((_backend == BackendType.GgmlCuda && !_fdUnsupported)
                 || _backend == BackendType.GgmlMetal
                 || _backend == BackendType.Mlx);
 
-        public bool SupportsRetainedFusedCache => true;
+        public bool SupportsRetainedFusedCache => !HasStreamingWeights;
 
         public bool HasFusedSequenceCache(string requestId)
-            => requestId != null && _fusedHolders != null && _fusedHolders.ContainsKey(requestId);
+            => !HasStreamingWeights && requestId != null && _fusedHolders != null && _fusedHolders.ContainsKey(requestId);
 
         private Qwen35KvCacheHolder SnapshotActiveCache() => new Qwen35KvCacheHolder
         {
@@ -388,6 +388,8 @@ namespace TensorSharp.Models
         /// prefix before the first forward.</summary>
         public bool BindSequenceCache(string requestId)
         {
+            if (HasStreamingWeights)
+                throw new NotSupportedException("File-backed Qwen35 weights do not support fused sequence holders; use the linear state snapshot path.");
             if (string.IsNullOrEmpty(requestId))
                 throw new ArgumentException("RequestId required", nameof(requestId));
             _fusedHolders ??= new Dictionary<string, Qwen35KvCacheHolder>(StringComparer.Ordinal);
@@ -426,6 +428,8 @@ namespace TensorSharp.Models
         /// fresh empty allocation for later N==1 use.</summary>
         public void AdoptPrimaryCacheToFused(string requestId)
         {
+            if (HasStreamingWeights)
+                throw new NotSupportedException("File-backed Qwen35 weights cannot migrate the linear cache into a fused sequence holder.");
             if (string.IsNullOrEmpty(requestId)) return;
             _fusedHolders ??= new Dictionary<string, Qwen35KvCacheHolder>(StringComparer.Ordinal);
 
@@ -516,6 +520,7 @@ namespace TensorSharp.Models
         /// (the prefix cache's tree-minted payload key, or the request id itself).</summary>
         public bool RetainSequenceCacheAs(string requestId, string key)
         {
+            if (HasStreamingWeights) return false;
             if (_fusedHolders == null || string.IsNullOrEmpty(requestId) || string.IsNullOrEmpty(key))
                 return false;
             if (!_fusedHolders.TryGetValue(requestId, out var holder))
@@ -550,6 +555,7 @@ namespace TensorSharp.Models
         /// calls this when the holder's entire token run is an exact prompt prefix.</summary>
         public bool TryRebindRetainedCache(string retainedRequestId, string newRequestId)
         {
+            if (HasStreamingWeights) return false;
             if (_retainedFusedHolders == null
                 || string.IsNullOrEmpty(retainedRequestId)
                 || string.IsNullOrEmpty(newRequestId))
@@ -653,7 +659,7 @@ namespace TensorSharp.Models
         /// has been brought back to the host. GGML only, and not under tensor
         /// parallelism (the cache lives on the ranks there).</summary>
         public bool SupportsPrefixCheckpoints =>
-            (IsGgmlBackend || _backend == BackendType.Mlx) && !IsTensorParallel && _kvCacheK != null;
+            !HasStreamingWeights && (IsGgmlBackend || _backend == BackendType.Mlx) && !IsTensorParallel && _kvCacheK != null;
 
         /// <summary>Deep-copy the ACTIVE cache into the retained set under
         /// <paramref name="key"/>. See <see cref="IBatchedPagedModel.TryCheckpointActiveCache"/>.</summary>
@@ -693,6 +699,7 @@ namespace TensorSharp.Models
         /// untouched. See <see cref="IBatchedPagedModel.TryCloneRetainedCache"/>.</summary>
         public bool TryCloneRetainedCache(string retainedKey, string newRequestId)
         {
+            if (HasStreamingWeights) return false;
             if (_retainedFusedHolders == null
                 || string.IsNullOrEmpty(retainedKey)
                 || string.IsNullOrEmpty(newRequestId))

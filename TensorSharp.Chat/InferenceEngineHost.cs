@@ -120,7 +120,12 @@ namespace TensorSharp.Server
             // A model being unloaded gets no new engine: its dispose would free the weights
             // under that engine's worker.
             if (model == null || model.IsRetiring) return null;
-            if (!model.SupportsKVStateSnapshot && model is not IBatchedPagedModel) return null;
+            if (!model.SupportsKVStateSnapshot && model is not IBatchedPagedModel)
+            {
+                if (_lifecycle.UnifiedMemoryEnabled)
+                    throw new NotSupportedException("The unified-memory model requires a supported scheduled execution path.");
+                return null;
+            }
 
             string fp = model.KVStateFingerprint ?? string.Empty;
             lock (_gate)
@@ -135,6 +140,9 @@ namespace TensorSharp.Server
                 SchedulerConfig cfg = SchedulerConfigOverride;
                 string cfgSource = cfg != null ? "host" : "environment";
                 cfg ??= SchedulerConfig.FromEnvironment();
+                cfg = _lifecycle.ConfigureScheduler(model, cfg);
+                if (_lifecycle.UnifiedMemoryEnabled && _pendingSpeculation?.Enabled == true)
+                    throw new NotSupportedException("Unified memory does not support speculative execution.");
                 _engine = new InferenceEngine(model, cfg, _logger)
                 {
                     ComputeGate = _computeGate,
@@ -217,6 +225,8 @@ namespace TensorSharp.Server
         public bool UpdateSpeculation(SpeculationOptions options)
         {
             options ??= SpeculationOptions.Disabled;
+            if (_lifecycle.UnifiedMemoryEnabled && options.Enabled)
+                throw new NotSupportedException("Unified memory does not support speculative execution.");
             // Remembered as well as applied: a switch that lands while TryGetEngine is
             // building the engine (the gate held for the block-pool allocation, the
             // environment possibly read before the switch was written) is handed to
@@ -263,7 +273,11 @@ namespace TensorSharp.Server
         {
             lock (_gate)
             {
-                if (_disposed) return;
+                // Stop publishing work immediately, but keep a failed engine
+                // owner reachable. The engine can refuse disposal while its
+                // worker or sequence buffers are still live and needs a retry
+                // before the lifecycle may release the model/budget scopes.
+                if (_disposed && _engine == null) return;
                 _disposed = true;
                 _engine?.Dispose();
                 _engine = null;

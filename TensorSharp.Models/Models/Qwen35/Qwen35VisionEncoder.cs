@@ -82,6 +82,7 @@ namespace TensorSharp.Models
         public Qwen35VisionEncoder(string mmProjPath, IAllocator allocator, bool qwenImage21 = false,
             bool mergerGeluErf = false)
         {
+            _memoryGeometryPath = mmProjPath;
             _qwenImage21 = qwenImage21;
             _mergerGeluErf = mergerGeluErf;
             _allocator = allocator;
@@ -112,8 +113,17 @@ namespace TensorSharp.Models
             for (int i = 0; i < _blockCount; i++)
                 _blockPrefixes[i] = $"v.blk.{i}";
 
-            LoadWeights(gguf);
-            CombineTemporalPatchWeights();
+            try
+            {
+                LoadWeights(gguf);
+                CombineTemporalPatchWeights();
+            }
+            catch (Exception creation)
+            {
+                try { Dispose(); }
+                catch (Exception cleanup) { throw new QwenVisionConstructionCleanupException(this, creation, cleanup); }
+                throw;
+            }
         }
 
         private void LoadWeights(GgufFile gguf)
@@ -146,8 +156,12 @@ namespace TensorSharp.Models
                     tsShape[i] = ggufShape[ggufShape.Length - 1 - i];
 
                 var tensor = new Tensor(_allocator, DType.Float32, tsShape);
-                tensor.SetElementsAsFloat(f32);
-                _weights[info.Name] = tensor;
+                try
+                {
+                    tensor.SetElementsAsFloat(f32);
+                    _weights[info.Name] = tensor;
+                }
+                catch { tensor.Dispose(); throw; }
                 count++;
             }
             Console.WriteLine($" done ({count} tensors)");
@@ -162,8 +176,12 @@ namespace TensorSharp.Models
             var w0 = _weights["v.patch_embd.weight"];
             var w1 = _weights["v.patch_embd.weight.1"];
             var combined = new Tensor(_allocator, DType.Float32, w0.Sizes);
-            Ops.Add(combined, w0, w1);
-            _weights["v.patch_embd.combined"] = combined;
+            try
+            {
+                Ops.Add(combined, w0, w1);
+                _weights["v.patch_embd.combined"] = combined;
+            }
+            catch { combined.Dispose(); throw; }
         }
 
         /// <summary>
@@ -223,6 +241,9 @@ namespace TensorSharp.Models
             //    the raster pipeline's result with its rows permuted.
             long t0 = Stopwatch.GetTimestamp();
             var blockOrdered = PatchEmbed(pixelValues, secondFrame, resizedH, resizedW, gridH, gridW);
+            Tensor postNormed = null, mergedContig = null, projected = null;
+            try
+            {
             long patchEmbedTicks = Stopwatch.GetTimestamp() - t0;
             Trace("patchEmbed", blockOrdered);
 
@@ -247,6 +268,8 @@ namespace TensorSharp.Models
             }
             if (!wholeEncoderDone)
             {
+                if (UnifiedPreparationActive)
+                    throw new InvalidOperationException("The admitted GGML vision graph declined; execution cannot retry through an unplanned fallback.");
                 for (int i = 0; i < _blockCount; i++)
                 {
                     if (!s_traceEnabled)
@@ -283,7 +306,7 @@ namespace TensorSharp.Models
                     MlxFusedOps.TryAsyncEvaluate(blockOrdered);
                     // Yield GpuComputeLock between encoder blocks so concurrent
                     // decode requests on the engine worker stay responsive.
-                    _hostModel?.YieldGpuComputeLock();
+                    YieldVisionCompute();
                 }
             }
             // Drain before splitting the phase timings; direct-CUDA kernels are
@@ -295,8 +318,9 @@ namespace TensorSharp.Models
             Console.WriteLine(" done");
 
             // 5. Post-LayerNorm
-            var postNormed = LayerNormOp(blockOrdered, "v.post_ln.weight", "v.post_ln.bias");
+            postNormed = LayerNormOp(blockOrdered, "v.post_ln.weight", "v.post_ln.bias");
             blockOrdered.Dispose();
+            blockOrdered = null;
 
             // 6. Spatial merge + projection
             long projStart = Stopwatch.GetTimestamp();
@@ -304,14 +328,16 @@ namespace TensorSharp.Models
             int mergedDim = _hiddenSize * _spatialMergeSize * _spatialMergeSize;
 
             using var merged = postNormed.View(mergedPatches, mergedDim);
-            var mergedContig = Ops.NewContiguous(merged);
+            mergedContig = Ops.NewContiguous(merged);
             postNormed.Dispose();
+            postNormed = null;
 
             using var fc1 = LinearForwardWithBias(mergedContig, "mm.0.weight", "mm.0.bias");
             mergedContig.Dispose();
+            mergedContig = null;
             ApplyVisionMergerGelu(fc1);
 
-            var projected = LinearForwardWithBias(fc1, "mm.2.weight", "mm.2.bias");
+            projected = LinearForwardWithBias(fc1, "mm.2.weight", "mm.2.bias");
 
             // The direct-CUDA path only *queues* its kernels, so without this the
             // numbers below would report launch cost (tens of ms) rather than
@@ -329,7 +355,17 @@ namespace TensorSharp.Models
                 $"proj {projTicks * msPerTick:F0} ms), " +
                 $"{numPatches} patches -> {mergedPatches} tokens");
 
-            return projected;
+            Tensor result = projected;
+            projected = null;
+            return result;
+            }
+            finally
+            {
+                projected?.Dispose();
+                mergedContig?.Dispose();
+                postNormed?.Dispose();
+                blockOrdered?.Dispose();
+            }
         }
 
         /// <summary>
@@ -376,7 +412,7 @@ namespace TensorSharp.Models
 
             // Build im2col matrix [numPatches, rowStride] in parallel.
             int[] blockOrder = GetOrCreateBlockOrder(gridH, gridW);
-            var im2col = new Tensor(_allocator, DType.Float32, numPatches, rowStride);
+            using var im2col = new Tensor(_allocator, DType.Float32, numPatches, rowStride);
             using (var staging = new HostStaging(im2col, _cudaDirect))
             {
                 float* im2colPtr = staging.Ptr;
@@ -438,6 +474,8 @@ namespace TensorSharp.Models
             }
             int outDim = (int)weightView2D.Sizes[0];
             var result = new Tensor(_allocator, DType.Float32, numPatches, outDim);
+            try
+            {
             Ops.Addmm(result, 0, result, 1.0f, im2col, weightT);
             im2col.Dispose();
 
@@ -445,6 +483,8 @@ namespace TensorSharp.Models
                 Ops.Add(result, result, bias);
 
             return result;
+            }
+            catch { result.Dispose(); throw; }
         }
 
         /// <summary>
@@ -483,9 +523,12 @@ namespace TensorSharp.Models
                 if (_buffer == null)
                     return;
 
-                _tensor.Storage.CopyToStorage(_tensor.StorageOffset, _handle.AddrOfPinnedObject(),
-                    _tensor.ElementCount() * sizeof(float));
-                _handle.Free();
+                try
+                {
+                    _tensor.Storage.CopyToStorage(_tensor.StorageOffset, _handle.AddrOfPinnedObject(),
+                        _tensor.ElementCount() * sizeof(float));
+                }
+                finally { if (_handle.IsAllocated) _handle.Free(); }
             }
         }
 
@@ -511,9 +554,13 @@ namespace TensorSharp.Models
                 Array.Copy(b, (long)o * patchStride, rows, (long)o * 2 * patchStride + patchStride, patchStride);
             }
             var temporal = new Tensor(_allocator, DType.Float32, outDim, 2 * patchStride);
-            temporal.SetElementsAsFloat(rows);
-            _weights[key] = temporal;
-            return temporal;
+            try
+            {
+                temporal.SetElementsAsFloat(rows);
+                _weights[key] = temporal;
+                return temporal;
+            }
+            catch { ReleaseVisionTensor(temporal); throw; }
         }
 
         private Tensor GetOrCreatePatchEmbedWeight2D(Tensor convWeight, string weightName, int patchStride)
@@ -526,6 +573,8 @@ namespace TensorSharp.Models
             // Reshape the 4D conv weight [outDim, C, P, P] into a 2D matrix [outDim, patchStride]
             // through a contiguous copy. This is a one-time allocation.
             Tensor flat = new Tensor(_allocator, DType.Float32, outDim, patchStride);
+            try
+            {
             unsafe
             {
                 float* src = GetFloatPtr(convWeight);
@@ -536,6 +585,8 @@ namespace TensorSharp.Models
 
             _transposedWeights[key] = flat;
             return flat;
+            }
+            catch { ReleaseVisionTensor(flat); throw; }
         }
 
         private Tensor GetOrCreatePatchEmbedTransposed(Tensor weight2D, string weightName)
@@ -555,8 +606,8 @@ namespace TensorSharp.Models
                 result = Ops.NewContiguous(t);
             }
 
-            _transposedWeights[key] = result;
-            return result;
+            try { _transposedWeights[key] = result; return result; }
+            catch { ReleaseVisionTensor(result); throw; }
         }
 
         /// <summary>
@@ -689,12 +740,12 @@ namespace TensorSharp.Models
                     ln1W, ln1B, qkvW, qkvB, outW, outB, ln2W, ln2B, upW, upB, downW, downB,
                     geluErf: UseFusedVision21);
                 if (ok)
-                    _hostModel?.YieldGpuComputeLock();
+                    YieldVisionCompute();
                 return ok;
             }
             // A stop from the yield (the model is being unloaded) is not a kernel failure:
             // falling back to the unfused path would keep encoding on a retiring model.
-            catch (Exception e) when (e is not OperationCanceledException and not ModelUnloadedException)
+            catch (Exception e) when (!UnifiedPreparationActive && e is not OperationCanceledException and not ModelUnloadedException)
             {
                 if (!_wholeEncoderFusedWarned)
                 {
@@ -730,7 +781,7 @@ namespace TensorSharp.Models
                         cosTable, sinTable, numPatches, _numHeads, headDim, halfDim, attnScale);
                     fusedAttn = true;
                 }
-                catch (Exception e)
+                catch (Exception e) when (!UnifiedPreparationActive)
                 {
                     fusedAttn = false;
                     if (!_fusedVisionAttnWarned)
@@ -771,7 +822,7 @@ namespace TensorSharp.Models
                     GgmlBasicOps.FusedVisionMLP(hidden, ln2W, ln2B, _eps, upW, upB, downW, downB);
                     return hidden;
                 }
-                catch (Exception e)
+                catch (Exception e) when (!UnifiedPreparationActive)
                 {
                     // Fall back to unfused path on failure.
                     if (!_fusedVisionMlpWarned)
@@ -1169,8 +1220,9 @@ namespace TensorSharp.Models
             int outDim = (int)weightT.Sizes[1];
 
             var result = new Tensor(_allocator, DType.Float32, seqLen, outDim);
-
-            Tensor contiguousInput = input.IsContiguous() ? null : Ops.NewContiguous(input);
+            try
+            {
+            using Tensor contiguousInput = input.IsContiguous() ? null : Ops.NewContiguous(input);
             Tensor src = contiguousInput ?? input;
 
             Ops.Addmm(result, 0, result, 1.0f, src, weightT);
@@ -1181,6 +1233,8 @@ namespace TensorSharp.Models
                 Ops.Add(result, result, bias);
 
             return result;
+            }
+            catch { result.Dispose(); throw; }
         }
 
         // The pure-C# backend runs the packed linears, the vectorized GELU and the managed
@@ -1293,7 +1347,8 @@ namespace TensorSharp.Models
             if (_cudaDirect && weight.DimensionCount == 2)
             {
                 transposed = HostTranspose2D(weight);
-                _transposedWeights[weightName] = transposed;
+                try { _transposedWeights[weightName] = transposed; }
+                catch { ReleaseVisionTensor(transposed); throw; }
                 // Release the untransposed original: nothing on this path reads it
                 // again (LinearForwardWithBias takes its output dim from the
                 // transpose, and the GGML fused block paths are gated off). The
@@ -1302,15 +1357,15 @@ namespace TensorSharp.Models
                 // is what pushes a 16 GB card into WDDM shared-memory spillover —
                 // where the encoder's ~350 MB of per-block activations run 6x
                 // slower and each successive image degrades further.
+                ReleaseVisionTensor(weight);
                 _weights.Remove(weightName);
-                weight.Dispose();
                 return transposed;
             }
 
             using var weightViewT = weight.Transpose();
             transposed = Ops.NewContiguous(weightViewT);
-            _transposedWeights[weightName] = transposed;
-            return transposed;
+            try { _transposedWeights[weightName] = transposed; return transposed; }
+            catch { ReleaseVisionTensor(transposed); throw; }
         }
 
         private unsafe Tensor GetOrCreatePositionEmbedding(int gridH, int gridW)
@@ -1321,6 +1376,10 @@ namespace TensorSharp.Models
 
             int numPatches = gridH * gridW;
             cached = new Tensor(_allocator, DType.Float32, numPatches, _hiddenSize);
+            try
+            {
+            // Finish staged upload before publishing ownership into the cache.
+            {
             float* posPtr = GetFloatPtr(_weights["v.position_embd.weight"]);
             using var staging = new HostStaging(cached, _cudaDirect);
             float* dstPtr = staging.Ptr;
@@ -1400,8 +1459,11 @@ namespace TensorSharp.Models
             });
             }
 
+            }
             _positionEmbeddingCache[key] = cached;
             return cached;
+            }
+            catch { ReleaseVisionTensor(cached); throw; }
         }
 
         private RopeCache GetOrCreateRopeCache(int gridH, int gridW, int numPatches, int halfDim)
@@ -1466,23 +1528,46 @@ namespace TensorSharp.Models
             return cache;
         }
 
+        private static void ReleaseVisionTensor(Tensor tensor)
+        {
+            if (tensor == null) return;
+            if (tensor.Storage is GgmlStorage)
+            {
+                GgmlBasicOps.HostReadBarrier();
+                GgmlBasicOps.InvalidateTensorHostBuffer(tensor);
+            }
+            tensor.Dispose();
+        }
+
+        private static void DrainTensorCache<TKey>(Dictionary<TKey, Tensor> cache)
+        {
+            // Remove each successfully released owner before proceeding, so a
+            // later invalidation failure retains only owners that need a retry.
+            while (cache.Count != 0)
+            {
+                using var entries = cache.GetEnumerator();
+                entries.MoveNext();
+                var entry = entries.Current;
+                ReleaseVisionTensor(entry.Value);
+                cache.Remove(entry.Key);
+            }
+        }
+
         public void Dispose()
         {
-            foreach (var w in _positionEmbeddingCache.Values)
-                w.Dispose();
-            _positionEmbeddingCache.Clear();
-            foreach (var w in _transposedWeights.Values)
-                w.Dispose();
-            _transposedWeights.Clear();
-            foreach (var w in _weights.Values)
-                w.Dispose();
-            _weights.Clear();
-            foreach (var (cos, sin) in _ropeDeviceCache.Values)
+            DrainTensorCache(_positionEmbeddingCache);
+            DrainTensorCache(_transposedWeights);
+            DrainTensorCache(_weights);
+            while (_ropeDeviceCache.Count != 0)
             {
-                cos.Dispose();
-                sin.Dispose();
+                using var entries = _ropeDeviceCache.GetEnumerator();
+                entries.MoveNext();
+                var entry = entries.Current;
+                ReleaseVisionTensor(entry.Value.Cos);
+                _ropeDeviceCache[entry.Key] = (null, entry.Value.Sin);
+                ReleaseVisionTensor(entry.Value.Sin);
+                _ropeDeviceCache.Remove(entry.Key);
             }
-            _ropeDeviceCache.Clear();
             _ropeCache.Clear();
             _blockOrderCache.Clear();
             _cpuPackedWeights.Clear();

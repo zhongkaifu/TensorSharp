@@ -10,6 +10,8 @@
 using System;
 using System.Collections.Concurrent;
 using System.Runtime.InteropServices;
+using System.IO;
+using TensorSharp.Memory;
 
 namespace TensorSharp.Runtime
 {
@@ -37,6 +39,7 @@ namespace TensorSharp.Runtime
         private const int MAP_ANON = 0x1000;
 
         private static readonly ConcurrentDictionary<nint, nuint> Mapped = new();
+        private static readonly ConcurrentDictionary<nint, HostAllocationBudgetScope.Allocation> Credits = new();
         private static readonly bool MapLargeBuffers = OperatingSystem.IsMacOS() || OperatingSystem.IsIOS();
 
         /// <summary>Allocate <paramref name="size"/> bytes aligned to at least
@@ -46,6 +49,24 @@ namespace TensorSharp.Runtime
         {
             if (size <= 0)
                 throw new ArgumentOutOfRangeException(nameof(size));
+            if (alignment <= 0 || (alignment & (alignment - 1)) != 0)
+                throw new ArgumentOutOfRangeException(nameof(alignment), "Alignment must be a positive power of two.");
+
+            int rounding = MapLargeBuffers && size >= MappedThreshold ? Environment.SystemPageSize : alignment;
+            long allocated = checked((size + rounding - 1) / rounding * rounding);
+            var credit = HostAllocationBudgetScope.Reserve(allocated);
+            try
+            {
+                IntPtr ptr = AllocateCore(allocated, alignment);
+                credit?.Commit();
+                if (credit != null) Credits[ptr] = credit;
+                return ptr;
+            }
+            catch { credit?.Dispose(); throw; }
+        }
+
+        private static IntPtr AllocateCore(long size, int alignment)
+        {
 
             if (MapLargeBuffers && size >= MappedThreshold)
             {
@@ -70,12 +91,14 @@ namespace TensorSharp.Runtime
         {
             if (ptr == IntPtr.Zero)
                 return;
-            if (Mapped.TryRemove(ptr, out nuint length))
+            if (Mapped.TryGetValue(ptr, out nuint length))
             {
-                _ = munmap((void*)ptr, length);
-                return;
+                if (munmap((void*)ptr, length) != 0)
+                    throw new IOException("The OS refused to release a host buffer; its allocation and budget remain owned for retry.");
+                Mapped.TryRemove(ptr, out _);
             }
-            NativeMemory.AlignedFree(ptr.ToPointer());
+            else NativeMemory.AlignedFree(ptr.ToPointer());
+            if (Credits.TryRemove(ptr, out var credit)) credit.Dispose();
         }
 
         [LibraryImport("libc", EntryPoint = "mmap", SetLastError = true)]

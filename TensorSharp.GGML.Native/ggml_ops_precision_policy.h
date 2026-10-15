@@ -4,6 +4,41 @@
 #include <cstdint>
 #include <cstdlib>
 
+// A projection's numerical contract belongs to its role, independently of
+// its model or weight-residency policy. Recurrent gates persist rounding in
+// state; residual mixing feeds every subsequent sublayer. Preserve their F32
+// activations, including qualified original-format quantized projections.
+// Ordinary throughput projections retain their checkpoint/backend arithmetic.
+enum class tsg_projection_role {
+    throughput,
+    recurrent_decay,
+    recurrent_output_gate,
+    recurrent_update,
+    residual_mixing,
+    routing_logits,
+};
+
+constexpr bool tsg_projection_requires_f32(tsg_projection_role role) {
+    return role != tsg_projection_role::throughput;
+}
+
+// Upstream cuBLAS explicitly lets this environment override per-node F32.
+// Callers opting into the contract must reject these conflicting settings on
+// CUDA rather than claim that an F32 tag defeats the override. Other settings
+// retain upstream's usual validation/warning behavior.
+inline bool tsg_f32_projection_environment_conflicts(const char* value) {
+    if (!value) return false;
+    const auto equal = [value](const char* expected) {
+        const char* actual = value;
+        for (; *actual && *expected; ++actual, ++expected) {
+            const char lower = *actual >= 'A' && *actual <= 'Z' ? *actual + ('a' - 'A') : *actual;
+            if (lower != *expected) return false;
+        }
+        return *actual == *expected;
+    };
+    return equal("f16") || equal("fp16") || equal("bf16");
+}
+
 // Decode-class width for the TensorSharp-owned F32 precision paths (explicit
 // F32 matmul on CUDA and F32 attention on CPU/CUDA).
 //

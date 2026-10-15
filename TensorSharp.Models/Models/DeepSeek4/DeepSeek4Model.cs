@@ -169,7 +169,7 @@ namespace TensorSharp.Models
                     $"Hidden={Config.HiddenSize}, Heads={Config.NumHeads}, HeadDim={Config.KeyLength}, Vocab={Config.VocabSize}" +
                     (dspark != null ? ", DSpark drafter" : string.Empty));
 
-                int nCpuMoe = ResolveCpuMoeLayers();
+                int nCpuMoe = ResolveCpuMoeLayers(isV41 && backend == BackendType.GgmlCuda);
                 // `backend`, not `_backend`: the base ctor coerces everything to
                 // GgmlCpu so no second GPU context is created, but the native
                 // executor still has to pick its devices from the backend the
@@ -218,22 +218,13 @@ namespace TensorSharp.Models
         /// Translate the process-wide <see cref="MoeCpuOffloadConfig"/> into the
         /// native loader's routed-expert offload policy.
         ///
-        /// <para>Offload is OFF unless the operator asks for it, exactly as it is
-        /// for every other architecture. DeepSeek V4 used to default to an
-        /// automatic spill because a Q8_K_XL checkpoint (151 GiB) outweighs most
-        /// hosts, but choosing that silently is the wrong trade on a host that
-        /// *does* have the VRAM: it moves ~29 GiB of experts to the CPU and costs
-        /// most of the decode throughput for no reason. A host that genuinely
-        /// cannot fit the model now gets a load error naming the fewest layers
-        /// that would (see the "[dsv4] does not fit" message), which is a better
-        /// answer than a silent slowdown or an out-of-memory abort.</para>
+        /// <para>V4.1 on GGML CUDA uses the native capacity plan when unspecified:
+        /// actual free VRAM, context, scratch and microbatch choose the fewest
+        /// host expert layers, including zero when everything fits. Explicit
+        /// flags always win. Other executors keep their existing opt-in policy.</para>
         /// </summary>
-        private static int ResolveCpuMoeLayers()
-        {
-            if (!MoeCpuOffloadConfig.IsExplicitlySet)
-                return 0;
-            return MoeCpuOffloadConfig.AllLayers ? int.MaxValue : MoeCpuOffloadConfig.CpuMoeLayers;
-        }
+        private static int ResolveCpuMoeLayers(bool planWhenUnspecified = false)
+            => MoeCpuOffloadConfig.ResolveNativeLayers(planWhenUnspecified);
 
         /// <summary>
         /// ggml backend registry name whose devices the native executor should

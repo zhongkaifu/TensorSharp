@@ -225,8 +225,8 @@ namespace TensorSharp.Models
             if (!_retainedFusedHolders.TryGetValue(requestId, out var holder))
                 return;
             holder.Retired = true;
-            _retainedFusedHolders.Remove(requestId);
             DisposeHolder(holder);
+            _retainedFusedHolders.Remove(requestId);
             ReleaseSlotBase(holder.SlotBase);
         }
 
@@ -254,7 +254,11 @@ namespace TensorSharp.Models
             // The copy is sized to what the source holds, never more than the source.
             if (!EnsureRetentionBudget(RetainedHolderBytes(source), "checkpointing " + key))
                 return false;
-            var copy = DeepCopyHolder(source);
+            Qwen4ExpKvCacheHolder copy;
+            try { copy = DeepCopyHolder(source); }
+            // A checkpoint is optional. Only swallow a quota refusal whose
+            // unpublished owner was successfully released by DeepCopyHolder.
+            catch (TensorSharp.Memory.MemoryPressureException) when (_pendingHolderAllocation == null) { return false; }
             bool published = false;
             try
             {
@@ -267,8 +271,7 @@ namespace TensorSharp.Models
             {
                 if (!published)
                 {
-                    DisposeHolder(copy);
-                    ReleaseSlotBase(copy.SlotBase);
+                    DisposeUnpublishedHolder(copy);
                 }
             }
             return true;
@@ -302,8 +305,7 @@ namespace TensorSharp.Models
             {
                 if (!published)
                 {
-                    DisposeHolder(copy);
-                    ReleaseSlotBase(copy.SlotBase);
+                    DisposeUnpublishedHolder(copy);
                 }
             }
             return true;
@@ -422,6 +424,19 @@ namespace TensorSharp.Models
                     Console.WriteLine($"[memory] Qwen4Exp: freed {victims.Count} retained conversation holder(s)");
             }
             base.TrimIdleMemory();
+        }
+
+        /// <summary>Unified admission can reclaim public checkpoints as well as
+        /// idle conversations. Live request holders stay untouched.</summary>
+        internal void TrimUnifiedPrefixCheckpoints()
+        {
+            if (_retainedFusedHolders == null || _retainedFusedHolders.Count == 0) return;
+            var keys = new List<string>(_retainedFusedHolders.Keys);
+            foreach (string key in keys)
+            {
+                DiscardRetainedCache(key);
+                _prefixCacheSink?.OnPayloadInvalidated(key, InvalidationReason.TrimmedByModel);
+            }
         }
 
         // ---- test-facing accessors ----
@@ -579,8 +594,7 @@ namespace TensorSharp.Models
             {
                 if (!complete)
                 {
-                    DisposeHolder(dst);
-                    ReleaseSlotBase(dst.SlotBase);
+                    DisposeUnpublishedHolder(dst);
                 }
             }
         }
@@ -606,16 +620,17 @@ namespace TensorSharp.Models
                 dstConv.Storage.EnsureHostReadable();
                 dstSsm.Storage.EnsureHostReadable();
                 long entryBytes = checked(ssmOff + ssmBytes);
-                byte[] staging = GC.AllocateUninitializedArray<byte>(checked((int)entryBytes), pinned: true);
-                IntPtr stagingPtr = Marshal.UnsafeAddrOfPinnedArrayElement(staging, 0);
+                // Large recurrent exports are physical host payload, not an
+                // untracked pinned GC scratch array. The active request's host
+                // allocation scope reserves before allocating this buffer.
+                using var staging = new Tensor(_allocator, DType.Float32, checked(entryBytes / sizeof(float)));
+                IntPtr stagingPtr = (IntPtr)GetFloatPtr(staging);
                 if (TryExportSeqState((IntPtr)GetFloatPtr(srcConv), stagingPtr, entryBytes, DeviceForLayer(l),
                         source.DeviceStateSeeded, $"GDN state of layer {l}"))
                 {
-                    fixed (byte* s = staging)
-                    {
-                        Buffer.MemoryCopy(s, GetFloatPtr(dstConv), convBytes, convBytes);
-                        Buffer.MemoryCopy(s + ssmOff, GetFloatPtr(dstSsm), ssmBytes, ssmBytes);
-                    }
+                    byte* s = (byte*)stagingPtr;
+                    Buffer.MemoryCopy(s, GetFloatPtr(dstConv), convBytes, convBytes);
+                    Buffer.MemoryCopy(s + ssmOff, GetFloatPtr(dstSsm), ssmBytes, ssmBytes);
                     exported = true;
                 }
                 if (!exported)

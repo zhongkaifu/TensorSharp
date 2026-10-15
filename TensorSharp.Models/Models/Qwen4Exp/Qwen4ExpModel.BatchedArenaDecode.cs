@@ -5,6 +5,7 @@ using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using TensorSharp.GGML;
 using TensorSharp.Runtime;
+using TensorSharp.Runtime.Scheduling;
 
 namespace TensorSharp.Models
 {
@@ -12,6 +13,7 @@ namespace TensorSharp.Models
     {
         public string BatchedFusedDecodeDeclineReason { get; private set; }
         internal long ArenaBatchedDecodeSteps { get; private set; }
+        public FusedBatchExecutionEvidence? LastAcceptedFusedBatch { get; private set; }
         private float[] _arenaLogitsStaging;
 
         public bool CanBatchDecode(string requestId, int position)
@@ -22,7 +24,10 @@ namespace TensorSharp.Models
             // predate its prefill and growth. Read its live fields until check-in.
             bool active = string.Equals(requestId, _activeFusedKey, StringComparison.Ordinal);
             return position >= 0 && position == (active ? _cacheSeqLen : h.CacheSeqLen)
-                && position < (active ? _kvCacheCapacity : h.KvCapacity)
+                // A full holder can grow inside its own admitted scope before
+                // the joint graph runs; it does not need a solo decode token.
+                && position <= (active ? _kvCacheCapacity : h.KvCapacity)
+                && position < _maxContextLength
                 && !(active ? _specStateFailed : h.SpecStateFailed)
                 && (active ? _deviceStateAuthoritative : h.DeviceStateSeeded);
         }
@@ -56,6 +61,38 @@ namespace TensorSharp.Models
             finally { LoadCacheHolder(previous); }
         }
 
+        public bool PrepareBatchedFusedDecode(string requestId)
+        {
+            // Publishing the active fields first is metadata-only. Every
+            // descriptor/state allocation below is inside this request's scope.
+            RestorePrimaryCache();
+            if (requestId == null || _fusedHolders == null || !_fusedHolders.ContainsKey(requestId)) return false;
+            BindSequenceCache(requestId);
+            try
+            {
+                bool grew = _cacheSeqLen >= _kvCacheCapacity;
+                EnsureCacheCapacity(checked(_cacheSeqLen + 1));
+                if (grew && HasQsa)
+                    for (int layer = 0; layer < Config.NumLayers; ++layer)
+                        if (_idxKCache[layer] is { } cache
+                            && !GgmlBasicOps.Qwen4ExpPrepareQsaCache(
+                                TensorComputePrimitives.GetStoragePointer(cache), cache.Storage.ByteLength, DeviceForLayer(layer)))
+                            throw new InvalidOperationException("qwen4exp QSA could not prepare a grown holder for joint decode. "
+                                + GgmlBasicOps.LastNativeError());
+                return EnsureAttnArgs() && EnsureGdnArgs() && EnsureQsaArgs()
+                    && (_pleHeads <= 0 || EnsurePleArgs());
+            }
+            finally { RestorePrimaryCache(); }
+        }
+
+        internal void ReleaseUnifiedPrefillGraphs(string requestId)
+        {
+            RestorePrimaryCache();
+            if (_fusedHolders == null || !_fusedHolders.TryGetValue(requestId, out var holder)) return;
+            GgmlBasicOps.Qwen4ExpDropHolderGraphs(PinnedArrayPointer(holder.AttnArgs),
+                PinnedArrayPointer(holder.GdnArgs), PinnedArrayPointer(holder.PleArgs));
+        }
+
         private static IntPtr PinnedArrayPointer(Array array)
             => array == null || array.Length == 0 ? IntPtr.Zero : Marshal.UnsafeAddrOfPinnedArrayElement(array, 0);
 
@@ -63,6 +100,7 @@ namespace TensorSharp.Models
             int[] tokens, int[] positions, float[][] outLogits, int[] outNextTokens)
         {
             BatchedFusedDecodeDeclineReason = null;
+            LastAcceptedFusedBatch = null;
             if (Environment.GetEnvironmentVariable("TS_Q4E_DISABLE_ARENA_DECODE") == "1")
                 return ArenaDecline("disabled via TS_Q4E_DISABLE_ARENA_DECODE=1");
             if (!IsGgmlBackend || _tokenGraphUnsupported)
@@ -91,6 +129,10 @@ namespace TensorSharp.Models
                 if (id == null || !unique.Add(id) || !CanBatchDecode(id, positions[i]))
                     return ArenaDecline($"sequence {i} is duplicated, unbound, stale, or needs cache growth");
                 holders[i] = _fusedHolders[id];
+                // Direct callers without the scheduler's admitted preparation
+                // retain the decline contract and can arrange their own growth.
+                if (positions[i] >= holders[i].KvCapacity)
+                    return ArenaDecline($"sequence {i} is duplicated, unbound, stale, or needs cache growth");
                 if (tokens[i] < 0 || tokens[i] >= Config.VocabSize)
                     return ArenaDecline($"sequence {i} has an invalid token");
                 if (HasQsa && holders[i].QsaPositionCount != positions[i])
@@ -245,6 +287,9 @@ namespace TensorSharp.Models
                 }
             }
             ++ArenaBatchedDecodeSteps;
+            if (GgmlBasicOps.TryGetQwen4ExpBatchExecution() is { } actual && actual.Sequences == n)
+                LastAcceptedFusedBatch = new(actual.ExecutionId, actual.Sequences, actual.Nodes,
+                    actual.HostSegments, actual.Path);
             return true;
         }
     }

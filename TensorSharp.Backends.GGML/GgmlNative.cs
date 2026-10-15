@@ -27,6 +27,13 @@ public enum GgmlBackendType
     Vulkan = 4,
 }
 
+/// <summary>One rank's native cache payload accounting. Graph arenas, KV slots,
+/// backend pools and driver overhead are excluded. Explicit preloads remain
+/// outside the legacy lazy device-copy quota.</summary>
+public readonly record struct GgmlCacheMemoryUsage(int Rank, long DeviceCopyReservedBytes,
+    long DeviceCopyCommittedBytes, long DeviceCopyBudgetBytes, long PreloadReservedBytes,
+    long PreloadCommittedBytes);
+
     [StructLayout(LayoutKind.Sequential)]
     internal readonly struct GgmlTensorView2D
     {
@@ -4154,6 +4161,11 @@ internal enum GgmlIndexReductionOp
         public static bool Qwen4ExpCopyQsaCache(IntPtr key, IntPtr destination, long bytes, int device)
             => TSGgml_Qwen4ExpCopyQsaCache(key, destination, bytes, device) != 0;
 
+        [LibraryImport(DllName)]
+        private static partial int TSGgml_Qwen4ExpPrepareQsaCache(IntPtr key, long bytes, int device);
+        public static bool Qwen4ExpPrepareQsaCache(IntPtr key, long bytes, int device)
+            => TSGgml_Qwen4ExpPrepareQsaCache(key, bytes, device) != 0;
+
         public static void Qwen4ExpResetFfnCache() => TSGgml_Qwen4ExpResetFfnCache();
 
         // Mirrors NemoMamba2BatchedSeqDesc in ggml_ops_mamba2.cpp; same 32-byte
@@ -4282,6 +4294,11 @@ internal enum GgmlIndexReductionOp
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
         private static partial long TSGgml_DeviceCopyCacheResidentBytes();
+
+        [LibraryImport(DllName)]
+        [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
+        private static partial int TSGgml_GetCacheMemoryUsage(int rank, out long copyReserved,
+            out long copyCommitted, out long copyBudget, out long preloadReserved, out long preloadCommitted);
 
         [LibraryImport(DllName)]
         [UnmanagedCallConv(CallConvs = new[] { typeof(CallConvCdecl) })]
@@ -6014,6 +6031,14 @@ internal enum GgmlIndexReductionOp
         /// per-block activation/KV device copies are reclaimed rather than leaked.</summary>
         public static long DeviceCopyCacheResidentBytes() => TSGgml_DeviceCopyCacheResidentBytes();
 
+        public static bool TryGetCacheMemoryUsage(int rank, out GgmlCacheMemoryUsage usage)
+        {
+            int success = TSGgml_GetCacheMemoryUsage(rank, out long reserved, out long committed,
+                out long budget, out long preloadReserved, out long preloadCommitted);
+            usage = new(rank, reserved, committed, budget, preloadReserved, preloadCommitted);
+            return success != 0;
+        }
+
         /// <summary>Diagnostic: active backend device memory. On Metal <paramref name="totalBytes"/>
         /// is recommendedMaxWorkingSetSize and <paramref name="freeBytes"/> = total - currentAllocatedSize,
         /// so (total - free) is the bytes currently resident. Returns false if unavailable.</summary>
@@ -6206,6 +6231,12 @@ internal enum GgmlIndexReductionOp
         {
             return TSGgml_RegisterPinnedHostBuffer(ptr, bytes) != 0;
         }
+
+        [LibraryImport(DllName, StringMarshalling = StringMarshalling.Utf8)]
+        private static partial int TSGgml_RegisterHostFileSource(IntPtr pointer, long bytes, string path, long offset);
+
+        public static bool RegisterHostFileSource(IntPtr pointer, long bytes, string path, long offset)
+            => TSGgml_RegisterHostFileSource(pointer, bytes, path, offset) != 0;
 
         public static void UnregisterPinnedHostBuffer(IntPtr ptr)
         {

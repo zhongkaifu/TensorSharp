@@ -13,6 +13,7 @@ using System.Text;
 using System.Threading;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
+using TensorSharp.Memory;
 using TensorSharp.Runtime.Paged;
 using TensorSharp.Runtime.Scheduling.PrefixCache;
 
@@ -38,6 +39,8 @@ namespace TensorSharp.Runtime.Scheduling
         private readonly ContinuousBatchScheduler _scheduler;
         private readonly int _blockSize;
         private readonly ILogger _logger;
+        private readonly bool _bulkRestore = Environment.GetEnvironmentVariable("TS_DISABLE_BULK_KV_RESTORE") != "1";
+        public KvSwapMetrics SwapMetrics { get; } = new();
 
         // Currently-owning sequence (whose K/V state is in the model's tensors).
         private SequenceState? _currentOwner;
@@ -181,6 +184,8 @@ namespace TensorSharp.Runtime.Scheduling
         private bool _forwardBatchDeclineWarned;
         private bool _fusedBatchedDeclineWarned;
         private bool _fusedBatchedSuccessReported;
+        private readonly bool _traceFusedBatches = Environment.GetEnvironmentVariable("TS_BATCHED_FUSED_TRACE") == "1";
+        private long _acceptedFusedBatches;
         private bool _specPrefixReuseDeclineWarned;
         private bool _crossSeqSerializationWarned;
         private bool _pastCapSerializationWarned;
@@ -191,6 +196,19 @@ namespace TensorSharp.Runtime.Scheduling
             if (_fusedBatchedSuccessReported) return;
             _fusedBatchedSuccessReported = true;
             _logger.LogInformation("Batched fused decode accepted {Count} sequences in one graph. Reported once.", count);
+        }
+
+        private void ReportPublishedFusedBatch(IBatchedPagedModel model,
+            IReadOnlyList<ScheduledSequenceWork> work, int[] positionsBefore)
+        {
+            long id = ++_acceptedFusedBatches;
+            if (!_traceFusedBatches || model.LastAcceptedFusedBatch is not { } actual) return;
+            _logger.LogInformation("batch.fused.accepted batch={BatchExecutionId} requests={SequenceRequestIdsJson} before={PositionsBeforeJson} after={PositionsAfterJson} count={ActiveSequenceCount} native={NativeAcceptedExecutionId} nodes={NativeNodeCount} graphs={NativeGraphCount} hostSegments={NativeHostSegmentCount} kind={NativeExecutionKind} published={ManagedPublishCompleted}",
+                id, System.Text.Json.JsonSerializer.Serialize(work.Select(w => w.Sequence.RequestId)),
+                System.Text.Json.JsonSerializer.Serialize(positionsBefore),
+                System.Text.Json.JsonSerializer.Serialize(work.Select(w => w.Sequence.NumComputedTokens)),
+                actual.ActiveSequenceCount, actual.NativeAcceptedExecutionId, actual.NativeNodeCount,
+                1, actual.NativeHostSegmentCount, actual.NativeExecutionKind, true);
         }
 
         private sealed class SpecSeqContext
@@ -259,6 +277,8 @@ namespace TensorSharp.Runtime.Scheduling
             // ggml_metal_synchronize aborts the process.
             lock (_model.GpuComputeLock)
             {
+                foreach (var work in output.ScheduledWork)
+                    work.Sequence.BindGenerationVocabulary(_model.Tokenizer);
                 if (RadixCache != null)
                 {
                     RadixCache.Drain();
@@ -301,7 +321,7 @@ namespace TensorSharp.Runtime.Scheduling
                 // only executes the plan. Options/capabilities are snapshotted
                 // per step because several are env-var backed and tests toggle
                 // them at runtime.
-                var options = ExecutionOptions.FromEnvironment();
+                var options = _scheduler.Config.ResolveExecutionOptions();
                 var caps = ExecutionCapabilities.FromModel(_model);
                 var features = ComputeStepFeatures(output, caps);
                 var plan = ExecutionPlanner.PlanStep(caps, options, PlanConfig, features);
@@ -311,6 +331,11 @@ namespace TensorSharp.Runtime.Scheduling
                 if (plan.SpeculationRefusal != null)
                     WarnSpeculationRefusedOnce(plan.SpeculationRefusal);
                 LogPlanTransition(plan);
+
+                if (_scheduler.Config.MemoryAdmission?.EnterSerialExecution != null
+                    && (plan.Candidates[0] != (_scheduler.Config.MemoryAdmission.UsePerSequenceHolders
+                        ? ExecutionPathKind.PerSequenceFused : ExecutionPathKind.PerSequence) || _scheduler.Config.Speculation.Enabled))
+                    throw new NotSupportedException("The request allocation adapter requires non-speculative PerSequence execution. Select that path explicitly before submitting requests.");
 
                 for (int i = 0; i < plan.Candidates.Count; i++)
                 {
@@ -1109,6 +1134,7 @@ namespace TensorSharp.Runtime.Scheduling
             {
                 if (_currentOwner.Status == SequenceStatus.Running)
                 {
+                    using var allocationScope = _scheduler.Config.MemoryAdmission?.EnterSerialExecution?.Invoke(_currentOwner);
                     // N=1 forwards borrow the model-owned logits buffer. The
                     // next request's Forward may overwrite it before this owner
                     // resumes, so detach it once at the ownership transition.
@@ -1164,6 +1190,7 @@ namespace TensorSharp.Runtime.Scheduling
             // vLLM/SGLang schedulers do) - without this, a single admission
             // degraded every in-flight decode to a serial weight sweep.
             HashSet<string>? handledBatched = null;
+            HashSet<string>? rejectedBatchPreparation = null;
             if (options.BatchedFusedDecodeEnabled && n >= 2)
             {
                 var decodeWork = new List<ScheduledSequenceWork>(n);
@@ -1171,6 +1198,26 @@ namespace TensorSharp.Runtime.Scheduling
                     if (!work.IsPrefill &&
                         fused.CanBatchDecode(work.Sequence.RequestId, work.Sequence.NumComputedTokens))
                         decodeWork.Add(work);
+                var batchAdmission = _scheduler.Config.MemoryAdmission;
+                if (batchAdmission?.EnterBatchedExecution != null && decodeWork.Count >= 2)
+                    for (int i = decodeWork.Count - 1; i >= 0; --i)
+                    {
+                        var seq = decodeWork[i].Sequence;
+                        try
+                        {
+                            using var holderScope = batchAdmission.EnterSerialExecution!(seq);
+                            if (!fused.PrepareBatchedFusedDecode(seq.RequestId))
+                                throw new InvalidOperationException("An admitted holder could not prepare for its shared batch.");
+                        }
+                        catch (Exception error)
+                        {
+                            // No joint kernel has run. A refused destination
+                            // cannot invalidate any other holder's history.
+                            (rejectedBatchPreparation ??= new()).Add(seq.RequestId);
+                            results.Add(new SequenceStepResult { Sequence = seq, Error = error });
+                            decodeWork.RemoveAt(i);
+                        }
+                    }
                 int dn = decodeWork.Count;
                 if (dn >= 2)
                 {
@@ -1193,6 +1240,11 @@ namespace TensorSharp.Runtime.Scheduling
                             if (allGreedy && !seq.GetOrCreateSampler().IsPlainGreedyArgmax)
                                 allGreedy = false;
                         }
+                        // Holder metadata/state preparation belongs to each
+                        // request. The subsequent multi-request graph has its
+                        // own independently reserved, session-lived owner.
+                        using var batchAllocationScope = batchAdmission?.EnterBatchedExecution?.Invoke(
+                            decodeWork.Select(work => work.Sequence).ToArray());
                         if (allGreedy)
                         {
                             // Device-sampled fast path: no host logits at all. The
@@ -1225,6 +1277,7 @@ namespace TensorSharp.Runtime.Scheduling
                                         ForwardElapsedTicks = batchTicksPerSequence,
                                     });
                                 }
+                                ReportPublishedFusedBatch(fused, decodeWork, bpositions);
                                 if (dn == n)
                                     return results;
                                 handledBatched = new HashSet<string>(reqIds);
@@ -1258,6 +1311,7 @@ namespace TensorSharp.Runtime.Scheduling
                                         ForwardElapsedTicks = batchTicksPerSequence,
                                     });
                                 }
+                                ReportPublishedFusedBatch(fused, decodeWork, bpositions);
                                 if (dn == n)
                                     return results;
                                 handledBatched = new HashSet<string>(reqIds);
@@ -1318,12 +1372,14 @@ namespace TensorSharp.Runtime.Scheduling
             {
                 // Decode subset already served by the batched fast path
                 // above; only the prefill chunks of a mixed step remain.
-                if (handledBatched != null && handledBatched.Contains(work.Sequence.RequestId))
+                if ((handledBatched != null && handledBatched.Contains(work.Sequence.RequestId))
+                    || (rejectedBatchPreparation != null && rejectedBatchPreparation.Contains(work.Sequence.RequestId)))
                     continue;
                 var seq = work.Sequence;
                 int prevComputed = seq.NumComputedTokens;
                 try
                 {
+                    using var allocationScope = _scheduler.Config.MemoryAdmission?.EnterSerialExecution?.Invoke(seq);
                     bool freshCache = fused.BindSequenceCache(seq.RequestId);
 
                     if (_pendingRetainedFusedTruncations.Remove(
@@ -1381,6 +1437,11 @@ namespace TensorSharp.Runtime.Scheduling
                             "execution (the claimed live state is gone); re-prefilling the full prompt.",
                             seq.RequestId);
                         seq.ClearLiveCacheContinuation();
+                        // Both decode and prefill work describe the old head.
+                        // In particular prevComputed still names that old media
+                        // slice. Re-plan before forwarding or sampling anything.
+                        results.Add(new SequenceStepResult { Sequence = seq, TokensForwarded = 0, IsPrefill = true });
+                        continue;
                     }
 
                     // Prefix-cache reuse: a freshly-created cache whose sequence
@@ -1616,6 +1677,7 @@ namespace TensorSharp.Runtime.Scheduling
                 int prevComputed = seq.NumComputedTokens;
                 try
                 {
+                    using var allocationScope = _scheduler.Config.MemoryAdmission?.EnterSerialExecution?.Invoke(seq);
                     EnsureOwnership(seq);
 
                     // NextN/MTP speculative decoding (handles its own advance/
@@ -2126,7 +2188,10 @@ namespace TensorSharp.Runtime.Scheduling
                 // same penalized distribution verification draws from, or
                 // acceptance decays toward zero as the output history grows.
                 adjustDraftLogits: (draftLogits, pendingDrafts) =>
-                    penaltySampler.ApplyPenalties(draftLogits, seq.OutputTokens, pendingDrafts),
+                {
+                    penaltySampler.ApplyModelSuppression(draftLogits);
+                    penaltySampler.ApplyPenalties(draftLogits, seq.OutputTokens, pendingDrafts);
+                },
                 onDraftAccepted: d =>
                 {
                     seq.AppendOutputToken(d);
@@ -2323,7 +2388,7 @@ namespace TensorSharp.Runtime.Scheduling
         /// byte snapshots are deliberately not cross-request reusable, but its full
         /// request-owned attention + recurrent-state holder is.</summary>
         private bool ModelUsesRetainableFusedCache()
-            => ExecutionOptions.FromEnvironment().RetainedFusedCacheBudget != 0
+            => _scheduler.Config.ResolveExecutionOptions().RetainedFusedCacheBudget != 0
             && _model is IBatchedPagedModel f
             && f.SupportsPerSequenceFusedForward
             && f.SupportsRetainedFusedCache;
@@ -2458,6 +2523,7 @@ namespace TensorSharp.Runtime.Scheduling
         /// its blocks.</summary>
         private void EnsureOwnership(SequenceState seq)
         {
+            using var ownershipTiming = SwapMetrics.Measure(KvSwapMetrics.Phase.Ownership);
             if (ReferenceEquals(_currentOwner, seq))
             {
                 // Same owner: nothing to do. (Sanity check: model's cached count
@@ -2595,6 +2661,13 @@ namespace TensorSharp.Runtime.Scheduling
 
         private int[] BuildPrefillChunk(SequenceState seq, ScheduledSequenceWork work)
         {
+            // Validate immutable scheduled work before reserving KV or allocating
+            // the actual input array. Reducing only an estimate is insufficient.
+            var admission = _scheduler.Config.MemoryAdmission;
+            int limit = admission?.GetPrefillTokenLimit(seq) ?? int.MaxValue;
+            if (work.NumScheduledTokens > limit)
+                throw new MemoryPressureException("Scheduled prefill exceeds its admitted request width.");
+            admission?.RevalidateExecution?.Invoke(seq);
             if (!seq.PrefillReservationTaken)
             {
                 // Reserve the prompt plus its declared generation budget in a
@@ -2613,7 +2686,7 @@ namespace TensorSharp.Runtime.Scheduling
                     seq.PromptTokens.Count,
                     seq.MaxNewTokens,
                     _model.MaxContextLength,
-                    ExecutionOptions.FromEnvironment().KvGenerationReserveMax));
+                    _scheduler.Config.ResolveExecutionOptions().KvGenerationReserveMax));
             }
 
             int want = work.NumScheduledTokens;
@@ -2672,6 +2745,16 @@ namespace TensorSharp.Runtime.Scheduling
             if (RadixCache != null) return RadixCache.TrimIdleMemory();
             _model.TrimIdleMemory();
             return "prefix caching is off; the model released what it parked for reuse";
+        }
+
+        /// <summary>Called only when no sequence is running. Release parked model
+        /// buffers first, then just enough unlocked prefix payloads to unblock work.
+        /// A release failure is a lifecycle failure and must stop the worker.</summary>
+        internal bool ReclaimForAdmission(Func<bool> canAdmit, int maximumVictims = int.MaxValue)
+        {
+            if (canAdmit()) return false;
+            _model.TrimIdleMemory();
+            return RadixCache?.ReclaimForAdmission(canAdmit, () => _model.TrimIdleMemory(), maximumVictims) ?? false;
         }
 
         /// <summary>Consume a token the batched greedy path sampled on-device
@@ -2744,6 +2827,15 @@ namespace TensorSharp.Runtime.Scheduling
                     && RadixCache != null && RadixCache.Tree.TryGetBlockOwner(block, out _))
                     continue;
 
+                // A completed page is immutable even when only this request owns
+                // it. Rewriting every full page on each dense-model decode swap
+                // needlessly restores old SSD pages, invalidates their backing
+                // versions and spills them again. Keep their published snapshot;
+                // only the still-growing partial tail needs a fresh extraction.
+                if (_pool.Storage.UsesTieredSnapshots && tokensInBlock == _blockSize
+                    && block.Used == _blockSize && block.HoldsSnapshotBytes)
+                    continue;
+
                 // A recurrent full block was captured at the exact Forward
                 // boundary where it first became available. Re-extracting it on
                 // a later owner swap would overwrite that checkpoint with the
@@ -2761,9 +2853,11 @@ namespace TensorSharp.Runtime.Scheduling
                 long expectedBytes = SnapshotByteSize(tokensInBlock, restorable);
                 if (expectedBytes <= 0) break;
 
-                EnsureScratch((int)expectedBytes);
-                var dst = _scratch.AsSpan(0, (int)expectedBytes);
-                if (!_model.TryExtractKVBlock(startToken, tokensInBlock, dst))
+                var dst = CaptureScratch(checked((int)expectedBytes));
+                bool extracted;
+                using (SwapMetrics.Measure(KvSwapMetrics.Phase.Extract))
+                    extracted = _model.TryExtractKVBlock(startToken, tokensInBlock, dst);
+                if (!extracted)
                 {
                     // For SWA-bounded models (e.g. Gemma 4) blocks whose positions
                     // have aged out of the sliding window can't be re-extracted —
@@ -2780,14 +2874,13 @@ namespace TensorSharp.Runtime.Scheduling
                 // we use the full-block byte size (so partial-block layout is
                 // not confused with full-block layout). For the trailing
                 // partial block we use the partial-byte size; the storage slab
-                // is sized for one full block so partial fits. A recurrent model's
-                // full block is allocated at exactly the length written (SlabFor).
-                var slab = SlabFor(block, tokensInBlock, (int)expectedBytes);
-                dst.CopyTo(slab);
+                // retains full capacity for a partial tail. Full recurrent blocks publish
+                // their exact payload length, so K/V-only pages cannot restore zero state.
+                using (SwapMetrics.Measure(KvSwapMetrics.Phase.Store))
+                    StoreSnapshot(seq, block, tokensInBlock, dst);
                 block.Used = tokensInBlock;
                 block.HoldsSnapshotBytes = tokensInBlock == _blockSize;
-                if (_model.RequiresPerBlockCapture && tokensInBlock == _blockSize)
-                    block.IsRestorablePrefixEnd = restorable;
+                block.IsRestorablePrefixEnd = restorable;
             }
         }
 
@@ -2809,21 +2902,17 @@ namespace TensorSharp.Runtime.Scheduling
             return kvOnly > 0 && kvOnly < full ? kvOnly : full;
         }
 
-        /// <summary>The pool slab a snapshot of <paramref name="bytes"/> is written into: the
-        /// full-size slab as always, or for a per-block-capture model's FULL block one of
-        /// exactly <paramref name="bytes"/>, so a K/V-only block holds (and is charged) only
-        /// that. A trailing partial block keeps the full-size slab: it always carries the
-        /// state, is re-extracted at a new length on every swap-out, and is never a page,
-        /// so an exact-length slab would only reallocate the ~99 MiB state section each time.</summary>
-        private Span<byte> SlabFor(KvBlock block, int tokensInBlock, int bytes)
-            => _model.RequiresPerBlockCapture && tokensInBlock == _blockSize
-                ? _pool.Storage.GetSpan(block.Id, bytes)
-                : _pool.Storage.GetSpan(block.Id);
+        /// <summary>Publish full recurrent blocks at their exact logical length. Managed
+        /// slabs shrink physically; tiered pages retain their budgeted capacity. Partial
+        /// tails retain full capacity because they are replaced at every ownership swap.</summary>
+        private void StoreSnapshot(SequenceState seq, KvBlock block, int tokensInBlock, ReadOnlySpan<byte> bytes)
+            => _pool.Storage.Store(block.Id, bytes, SnapshotEnvelope(seq),
+                exactLength: _model.RequiresPerBlockCapture && tokensInBlock == _blockSize);
 
         /// <summary>The bytes a per-block-capture model injects from a slab of
         /// <paramref name="slabLength"/> bytes holding <paramref name="tokensInBlock"/> tokens:
         /// the <paramref name="full"/> snapshot (for a partial block, the leading bytes of its
-        /// full-size slab; see <see cref="SlabFor"/>), or for a full block its K/V-only form
+        /// full-size slab; see <see cref="StoreSnapshot"/>), or for a full block its K/V-only form
         /// (which restores the K/V rows and leaves the running state as the blocks before it
         /// left it). 0 when the slab holds neither.</summary>
         private long RecurrentInjectByteSize(int tokensInBlock, int slabLength, long full)
@@ -2855,6 +2944,38 @@ namespace TensorSharp.Runtime.Scheduling
 
             int injected = 0;
             int blocks = seq.BlockTable.NumBlocks;
+            if (_bulkRestore && _model is IKvSnapshotBulkRestorer restorer)
+            {
+                int available = 0;
+                for (int b = 0; b < blocks && available < tokensToInject; b++)
+                {
+                    int n = Math.Min(_blockSize, tokensToInject - available);
+                    var block = seq.BlockTable.Blocks[b];
+                    if (n == _blockSize ? !block.HoldsSnapshotBytes : block.Used != n) break;
+                    if (_model.ComputeKVBlockByteSize(n) <= 0) break;
+                    available += n;
+                }
+                if (available == 0) return 0;
+                using var timing = SwapMetrics.Measure(KvSwapMetrics.Phase.Inject);
+                int restored = restorer.RestoreKvSnapshots(_blockSize, available, b =>
+                {
+                    KvSnapshotLease lease;
+                    using (SwapMetrics.Measure(KvSwapMetrics.Phase.Acquire))
+                        lease = _pool.Storage.Acquire(seq.BlockTable.Blocks[b].Id,
+                            TensorSharp.Memory.ResourceAccess.Read, SnapshotEnvelope(seq));
+                    try
+                    {
+                        using (SwapMetrics.Measure(KvSwapMetrics.Phase.Prefetch))
+                            if ((long)(b + 1) * _blockSize < available)
+                                lease.PendingPrefetch = _pool.Storage.TryPrefetch(seq.BlockTable.Blocks[b + 1].Id, SnapshotEnvelope(seq));
+                        return lease;
+                    }
+                    catch { lease.Dispose(); throw; }
+                });
+                if (restored < 0 || restored > available || (restored < available && restored % _blockSize != 0))
+                    throw new InvalidOperationException("Bulk KV restore returned an invalid prefix length.");
+                return restored;
+            }
             for (int b = 0; b < blocks; b++)
             {
                 int startToken = b * _blockSize;
@@ -2874,7 +2995,11 @@ namespace TensorSharp.Runtime.Scheduling
                 long expectedBytes = _model.ComputeKVBlockByteSize(tokensInBlock);
                 if (expectedBytes <= 0) break;
 
-                var src = _pool.Storage.GetReadOnlySpan(block.Id);
+                KvSnapshotLease acquired;
+                using (SwapMetrics.Measure(KvSwapMetrics.Phase.Acquire))
+                    acquired = _pool.Storage.Acquire(block.Id, TensorSharp.Memory.ResourceAccess.Read, SnapshotEnvelope(seq));
+                using var snapshot = acquired;
+                var src = snapshot.ReadOnlySpan;
                 if (_model.RequiresPerBlockCapture)
                 {
                     // A recurrent model's full block is either form; the slab length says which.
@@ -2888,6 +3013,7 @@ namespace TensorSharp.Runtime.Scheduling
                     }
                 }
 
+
                 if (src.Length < expectedBytes)
                 {
                     _logger.LogWarning(
@@ -2896,7 +3022,21 @@ namespace TensorSharp.Runtime.Scheduling
                     break;
                 }
                 var slice = src[..(int)expectedBytes];
-                if (!_model.TryInjectKVBlock(startToken, tokensInBlock, slice))
+                // Best effort: overlap the next SSD page read with this model
+                // injection if a second resident page fits. Never evict demand
+                // data to prefetch, and join before any storage may be recycled.
+                System.Threading.Tasks.Task<bool>? prefetch;
+                using (SwapMetrics.Measure(KvSwapMetrics.Phase.Prefetch))
+                    prefetch = b + 1 < blocks && startToken + tokensInBlock < tokensToInject
+                        ? _pool.Storage.TryPrefetch(seq.BlockTable.Blocks[b + 1].Id, SnapshotEnvelope(seq)) : null;
+                bool accepted;
+                try
+                {
+                    using (SwapMetrics.Measure(KvSwapMetrics.Phase.Inject))
+                        accepted = _model.TryInjectKVBlock(startToken, tokensInBlock, slice);
+                }
+                finally { prefetch?.GetAwaiter().GetResult(); }
+                if (!accepted)
                 {
                     _logger.LogWarning(
                         "Inject failed for sequence {RequestId} block {Block} at {Start}",
@@ -3008,6 +3148,10 @@ namespace TensorSharp.Runtime.Scheduling
             float[]? pendingLogits = seq.LastLogits != null ? (float[])seq.LastLogits.Clone() : null;
             float[]? lastLogits = null;
             int chunk = Math.Max(1, _scheduler.Config.MaxNumBatchedTokens);
+            chunk = Math.Min(chunk, _scheduler.Config.PrefillChunkTokenLimit);
+            chunk = Math.Min(chunk, _scheduler.Config.MemoryAdmission?.GetPrefillTokenLimit(seq) ?? int.MaxValue);
+            if (_scheduler.Config.MemoryAdmission?.ExecutionShape is { } shape)
+                chunk = Math.Min(chunk, shape.MaximumPrefillTokens);
             int promptTokens = seq.PromptTokens.Count;
             while (start < target)
             {
@@ -3018,6 +3162,12 @@ namespace TensorSharp.Runtime.Scheduling
                 // into generated tokens would carry a position table shorter than itself.
                 if (start < promptTokens)
                     n = Math.Min(n, promptTokens - start);
+                else if (_scheduler.Config.MemoryAdmission?.UsePerSequenceHolders == true)
+                    n = 1; // The admitted generated-token peak is a decode row.
+                // Restore may have reduced the holder's real capacity. Validate
+                // each actual phase/growth boundary before its Forward, inside
+                // the existing scope; unchanged shapes perform no hardware IO.
+                _scheduler.Config.MemoryAdmission?.RevalidateExecution?.Invoke(seq);
                 var tokens = new int[n];
                 for (int i = 0; i < n; i++)
                     tokens[i] = seq.TokenAt(start + i);
@@ -3058,18 +3208,18 @@ namespace TensorSharp.Runtime.Scheduling
                 if (block.Used == _blockSize) continue; // already captured
 
                 int startToken = b * _blockSize;
-                // Decided BEFORE extracting: a recurrent model's running state is the
-                // state at NumComputedTokens, so it belongs to (and is only copied into)
-                // the block ending exactly there. Every other block takes its K/V rows
-                // only (SnapshotByteSize).
+                // The state belongs only to the block ending at the current model head.
                 bool restorable = !_model.RequiresPerBlockCapture
                     || (b == fullBlocksNow - 1 && seq.NumComputedTokens % _blockSize == 0);
                 long bytes = SnapshotByteSize(_blockSize, restorable);
-                EnsureScratch((int)bytes);
-                var dst = _scratch.AsSpan(0, (int)bytes);
-                if (!_model.TryExtractKVBlock(startToken, _blockSize, dst))
+                var dst = CaptureScratch(checked((int)bytes));
+                bool extracted;
+                using (SwapMetrics.Measure(KvSwapMetrics.Phase.Extract))
+                    extracted = _model.TryExtractKVBlock(startToken, _blockSize, dst);
+                if (!extracted)
                     break;
-                dst.CopyTo(SlabFor(block, _blockSize, (int)bytes));
+                using (SwapMetrics.Measure(KvSwapMetrics.Phase.Store))
+                    StoreSnapshot(seq, block, _blockSize, dst);
                 block.Used = _blockSize;
                 block.HoldsSnapshotBytes = true;
                 block.IsRestorablePrefixEnd = restorable;
@@ -3113,11 +3263,14 @@ namespace TensorSharp.Runtime.Scheduling
             long bytes = SnapshotByteSize(_blockSize, withRecurrentState: false);
             if (bytes <= 0 || bytes >= _pool.Storage.SlabLength(block.Id))
                 return;
-            EnsureScratch((int)bytes);
-            var dst = _scratch.AsSpan(0, (int)bytes);
-            if (!_model.TryExtractKVBlock(previous * _blockSize, _blockSize, dst))
+            var dst = CaptureScratch(checked((int)bytes));
+            bool extracted;
+            using (SwapMetrics.Measure(KvSwapMetrics.Phase.Extract))
+                extracted = _model.TryExtractKVBlock(previous * _blockSize, _blockSize, dst);
+            if (!extracted)
                 return;
-            dst.CopyTo(SlabFor(block, _blockSize, (int)bytes));
+            using (SwapMetrics.Measure(KvSwapMetrics.Phase.Store))
+                StoreSnapshot(seq, block, _blockSize, dst);
             block.IsRestorablePrefixEnd = false;
         }
 
@@ -3139,10 +3292,20 @@ namespace TensorSharp.Runtime.Scheduling
             return Math.Min(fullBlocks, cap / _blockSize);
         }
 
-        private void EnsureScratch(int bytes)
+        // A shared admission peak includes request-owned pages/spill. Draw from
+        // that envelope rather than competing with its own reserved credit.
+        // Legacy independent snapshot budgets keep their independent contract.
+        private TensorSharp.Memory.BudgetReservation? SnapshotEnvelope(SequenceState seq)
+            => _pool.Storage.Budget != null
+                && ReferenceEquals(_pool.Storage.Budget, _scheduler.Config.MemoryAdmission?.Budget)
+                    ? seq.MemoryEnvelope : null;
+
+        private Span<byte> CaptureScratch(int bytes)
         {
+            if (_pool.Storage.UsesTieredSnapshots) return _pool.Storage.CaptureScratch(bytes);
             if (_scratch == null || _scratch.Length < bytes)
                 _scratch = new byte[bytes];
+            return _scratch.AsSpan(0, bytes);
         }
 
         /// <summary>Reset internal state. Called by the engine on model reload.</summary>
@@ -3438,6 +3601,12 @@ namespace TensorSharp.Runtime.Scheduling
         /// previously that decline degraded every in-flight decode to a serial
         /// weight sweep for the step. Default true.</summary>
         bool CanBatchDecode(string requestId, int position) => true;
+
+        /// <summary>Prepare any holder-owned allocations before entering the
+        /// separate shared allocation scope for a multi-request graph.</summary>
+        bool PrepareBatchedFusedDecode(string requestId) => true;
+
+        FusedBatchExecutionEvidence? LastAcceptedFusedBatch => null;
     }
 
     /// <summary>Per-step metadata for the batched paged attention path.

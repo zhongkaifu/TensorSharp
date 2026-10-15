@@ -63,9 +63,9 @@ namespace TensorSharp.Models
 
         /// <summary>Read the glm5next-only metadata. Mirrors the native loader's
         /// g5n block; every key here is absent on GLM-5.2.</summary>
-        private void ParseGlm5NextConfig(string arch, int numTrunkLayers)
+        private void ParseGlm5NextConfig(string arch, int numTrunkLayers, bool allocateState = true)
         {
-            _g5n = arch == "glm5next";
+            _g5n = GlmDsaArchitecture.IsGlm5Next(arch);
             if (!_g5n)
                 return;
 
@@ -93,7 +93,7 @@ namespace TensorSharp.Models
                     $"glm5next metadata is incomplete (kda.head_dim={_kdaHeadDim}, ssm.conv_kernel={_dConv}, " +
                     $"indexer.kpool={_indexerKpool}, hyper_connection.count={_hcMult}).");
 
-            AllocateKdaState(numTrunkLayers);
+            if (allocateState) AllocateKdaState(numTrunkLayers);
         }
 
         private void AllocateKdaState(int numTrunkLayers)

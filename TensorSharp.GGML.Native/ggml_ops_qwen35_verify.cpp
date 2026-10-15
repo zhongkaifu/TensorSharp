@@ -127,7 +127,7 @@ namespace
                 if (commit.ctx != nullptr) ggml_free(commit.ctx);
             commit_graphs.clear();
             if (allocator != nullptr) { ggml_gallocr_free(allocator); allocator = nullptr; }
-            if (buffer != nullptr) { ggml_backend_buffer_free(buffer); buffer = nullptr; }
+            if (buffer != nullptr) { tsg::graph_budget_free_buffer(buffer); buffer = nullptr; }
             if (ctx != nullptr) { ggml_free(ctx); ctx = nullptr; }
             graph = nullptr; valid = false;
             hidden_t = pos_t = kv_index = mask_t = logits_out = normed_out = nullptr;
@@ -323,14 +323,14 @@ namespace
         state.live_state = {};
         if (state.state_buf != nullptr)
         {
-            ggml_backend_buffer_free(state.state_buf);
+            tsg::graph_budget_free_buffer(state.state_buf);
             state.state_buf = nullptr;
             state.state_buf_size = 0;
         }
         ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(g_backend);
         if (buft == nullptr)
             return false;
-        state.state_buf = ggml_backend_buft_alloc_buffer(buft, needed);
+        state.state_buf = tsg::graph_budget_alloc_buffer(buft, needed, rank);
         if (state.state_buf == nullptr)
             return false;
         ggml_backend_buffer_set_usage(state.state_buf, GGML_BACKEND_BUFFER_USAGE_COMPUTE);
@@ -1829,7 +1829,7 @@ namespace
             }
             else
             {
-                persist_buf = ggml_backend_alloc_ctx_tensors(ctx, g_backend);
+                persist_buf = tsg::alloc_ctx_tensors_budgeted(ctx, g_backend);
                 if (persist_buf == nullptr)
                 {
                     set_last_error("Qwen3.5 model verify: failed to allocate persist buffer.");
@@ -1847,7 +1847,7 @@ namespace
         }
         else if (!alloc_graph_reuse_gallocr(graph))
         {
-            BufferHandle buffer(ggml_backend_alloc_ctx_tensors(ctx, g_backend));
+            BufferHandle buffer(tsg::alloc_ctx_tensors_budgeted(ctx, g_backend));
             if (buffer.value == nullptr)
             {
                 set_last_error("Qwen3.5 model verify: failed to allocate backend buffer.");
@@ -1882,7 +1882,7 @@ namespace
                 (long long)u.tensor->ne[0], (long long)u.tensor->ne[1],
                 (long long)u.tensor->ne[2], (long long)u.tensor->ne[3], u.bytes);
             set_last_error(msg);
-            if (persist_buf != nullptr) ggml_backend_buffer_free(persist_buf);
+            if (persist_buf != nullptr) tsg::graph_budget_free_buffer(persist_buf);
             if (fv_persist) ggml_free(ctx);
             return 0;
         }
@@ -2006,7 +2006,7 @@ namespace
         }
         if (status != GGML_STATUS_SUCCESS)
         {
-            if (persist_buf != nullptr) ggml_backend_buffer_free(persist_buf);
+            if (persist_buf != nullptr) tsg::graph_budget_free_buffer(persist_buf);
             if (fv_persist) ggml_free(ctx);
             if (host_moe.empty())
                 set_last_error("Qwen3.5 model verify: graph execution failed.");
@@ -2110,7 +2110,7 @@ namespace
                         owner_rank.live_state.conv_slice_bytes = conv_slice_bytes;
                         owner_rank.live_state.current_side = state_input_side;
                     }
-                    if (persist_buf != nullptr) ggml_backend_buffer_free(persist_buf);
+                    if (persist_buf != nullptr) tsg::graph_budget_free_buffer(persist_buf);
                     ggml_free(ctx);
                     set_last_error("Qwen3.5 model verify: all persistent slots have uncommitted owner snapshots.");
                     return 0;
@@ -2257,7 +2257,7 @@ namespace
             Q35VerifyOwnerRankState& state = owner->ranks[r];
             state.tp.reset();
             if (state.state_buf != nullptr)
-                ggml_backend_buffer_free(state.state_buf);
+                tsg::graph_budget_free_buffer(state.state_buf);
             state.state_buf = nullptr;
             state.state_buf_size = 0;
             state.state_backend = nullptr;

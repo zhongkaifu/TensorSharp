@@ -327,7 +327,7 @@ namespace
 
         BufferHandle buffer((g_backend_type == BACKEND_TYPE_METAL
                 ? alloc_ctx_tensors_with_attention_reuse(ctx, graph, g_backend)
-                : ggml_backend_alloc_ctx_tensors(ctx, g_backend)));
+                : tsg::alloc_ctx_tensors_budgeted(ctx, g_backend)));
         if (buffer.value == nullptr)
         {
             set_last_error("Failed to allocate backend buffer for Qwen3.5 attention layer decode.");
@@ -492,7 +492,7 @@ namespace
 
         void reset()
         {
-            if (buffer != nullptr) { ggml_backend_buffer_free(buffer); buffer = nullptr; }
+            if (buffer != nullptr) { tsg::graph_budget_free_buffer(buffer); buffer = nullptr; }
             if (ctx != nullptr) { ggml_free(ctx); ctx = nullptr; }
             graph = nullptr; valid = false;
             hidden_t = token_t = hidden_out = pos_tensor = kv_index = attn_mask = nullptr;
@@ -1185,6 +1185,15 @@ namespace
         ggml_tensor* hidden = token_input
             ? ggml_reshape_1d(ctx, tsg::bonsai_get_rows(ctx, token_embd_t, token_t, token_embd_data), H)
             : hidden_t;
+        // Opt-in first-token evidence retains the real fused arithmetic while
+        // exposing full residual vectors for comparison with the managed TP loop.
+        const char* diagnostic_directory = position == 0 && !tp_mode
+            ? std::getenv("TS_QWEN35_TENSOR_DUMP") : nullptr;
+        if (diagnostic_directory != nullptr && *diagnostic_directory == '\0') diagnostic_directory = nullptr;
+        std::vector<ggml_tensor*> diagnostic_layers;
+        std::vector<ggml_tensor*> diagnostic_blocks;
+        ggml_tensor* diagnostic_embedding = hidden;
+        if (diagnostic_directory != nullptr) ggml_set_output(diagnostic_embedding);
         for (int l = 0; l < num_layers; l++)
         {
             const TSGgmlQwen35LayerDesc& d = layers[l];
@@ -1514,6 +1523,11 @@ namespace
             }
 
             ggml_tensor* residual1 = ggml_add(ctx, hidden, block_out);
+            if (diagnostic_directory != nullptr)
+            {
+                ggml_set_output(residual1);
+                diagnostic_blocks.push_back(residual1);
+            }
 
             // ===== FFN =====
             ggml_tensor* ffn_normed = ggml_mul(ctx, ggml_rms_norm(ctx, residual1, eps), t.post_attn_norm_w);
@@ -1684,6 +1698,11 @@ namespace
             }
 
             hidden = ggml_add(ctx, residual1, ffn_down);
+            if (diagnostic_directory != nullptr)
+            {
+                ggml_set_output(hidden);
+                diagnostic_layers.push_back(hidden);
+            }
         }
 
         ggml_tensor* hidden_out;
@@ -1971,7 +1990,7 @@ namespace
             vram_log_ctx_breakdown("q35-decode-persist", ctx, 12);
             persist_buf = (g_backend_type == BACKEND_TYPE_METAL
                 ? alloc_ctx_tensors_with_attention_reuse(ctx, graph, g_backend)
-                : ggml_backend_alloc_ctx_tensors(ctx, g_backend));
+                : tsg::alloc_ctx_tensors_budgeted(ctx, g_backend));
             if (persist_buf == nullptr)
             {
                 set_last_error("Qwen3.5 model decode: failed to allocate persist backend buffer.");
@@ -1997,7 +2016,7 @@ namespace
             // no in-place recurrent state) and keeps the reuse gallocr.
             buffer.value = (g_backend_type == BACKEND_TYPE_METAL
                 ? alloc_ctx_tensors_with_attention_reuse(ctx, graph, g_backend)
-                : ggml_backend_alloc_ctx_tensors(ctx, g_backend));
+                : tsg::alloc_ctx_tensors_budgeted(ctx, g_backend));
             if (buffer.value == nullptr)
             {
                 set_last_error("Qwen3.5 model decode: failed to allocate backend buffer.");
@@ -2102,7 +2121,7 @@ namespace
             if (!tp_plan_segments(slot->tp_plan, tp_boundary))
             {
                 slot->tp_plan.clear();
-                ggml_backend_buffer_free(persist_buf);
+                tsg::graph_budget_free_buffer(persist_buf);
                 ggml_free(ctx);
                 slot->ctx = nullptr; slot->buffer = nullptr; slot->graph = nullptr; slot->valid = false;
                 return 0;
@@ -2174,7 +2193,7 @@ namespace
                 set_last_error("Qwen3.5 model decode: graph execution failed.");
             if (persist)
             {
-                ggml_backend_buffer_free(persist_buf);
+                tsg::graph_budget_free_buffer(persist_buf);
                 ggml_free(ctx);
             }
             return 0;
@@ -2190,6 +2209,41 @@ namespace
         // Metal async mode the download above is only QUEUED, so the gallocr path
         // (persist == false, buffer.value == nullptr) would return stale bytes.
         host_read_barrier();
+
+        if (diagnostic_directory != nullptr)
+        {
+            auto dump = [&](ggml_tensor* tensor, const std::string& name) {
+                std::vector<float> values(static_cast<std::size_t>(ggml_nelements(tensor)));
+                ggml_backend_tensor_get(tensor, values.data(), 0, values.size() * sizeof(float));
+                const std::string path = std::string(diagnostic_directory) + "/fused." + name + ".f32";
+                FILE* file = std::fopen(path.c_str(), "wb");
+                // The graph has already advanced recurrent state. An optional
+                // dump failure must not trigger the managed fallback and run
+                // the same token again.
+                if (file == nullptr)
+                {
+                    std::fprintf(stderr, "[Qwen35 diagnostic] Cannot create tensor '%s'\n", path.c_str());
+                    return false;
+                }
+                const auto written = std::fwrite(values.data(), sizeof(float), values.size(), file);
+                const int closed = std::fclose(file);
+                if (written != values.size() || closed != 0)
+                {
+                    std::fprintf(stderr, "[Qwen35 diagnostic] Cannot write tensor '%s'\n", path.c_str());
+                    return false;
+                }
+                return true;
+            };
+            bool dump_ok = dump(diagnostic_embedding, "embedding");
+            for (std::size_t l = 0; dump_ok && l < diagnostic_layers.size(); ++l)
+            {
+                char name[32];
+                std::snprintf(name, sizeof(name), "layer%02d", static_cast<int>(l));
+                dump_ok = dump(diagnostic_layers[l], name);
+                std::snprintf(name, sizeof(name), "layer%02d.block", static_cast<int>(l));
+                if (dump_ok) dump_ok = dump(diagnostic_blocks[l], name);
+            }
+        }
 
         if (persist && dcb != nullptr)
         {
@@ -2894,7 +2948,7 @@ namespace
         {
             buffer.value = (g_backend_type == BACKEND_TYPE_METAL
                 ? alloc_ctx_tensors_with_attention_reuse(ctx, graph, g_backend)
-                : ggml_backend_alloc_ctx_tensors(ctx, g_backend));
+                : tsg::alloc_ctx_tensors_budgeted(ctx, g_backend));
             if (buffer.value == nullptr)
             {
                 set_last_error("Qwen3.5 batched decode: failed to allocate backend buffer.");

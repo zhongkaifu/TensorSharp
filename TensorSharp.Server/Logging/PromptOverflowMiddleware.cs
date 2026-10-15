@@ -1,6 +1,7 @@
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Builder;
 using Microsoft.AspNetCore.Http;
+using TensorSharp.Memory;
 
 namespace TensorSharp.Server.Logging;
 
@@ -27,14 +28,24 @@ public static class PromptOverflowMiddleware
         }
         catch (PromptContextOverflowException ex) when (!context.Response.HasStarted)
         {
-            await WriteBadRequestAsync(context, ex.Message).ConfigureAwait(false);
+            await WriteErrorAsync(context, ex.Message, StatusCodes.Status400BadRequest,
+                "invalid_request_error", "context_length_exceeded").ConfigureAwait(false);
+        }
+        catch (MemoryPressureException ex) when (!context.Response.HasStarted)
+        {
+            await WriteErrorAsync(context, ex.Message, StatusCodes.Status503ServiceUnavailable,
+                "resource_exhausted", "resource_exhausted").ConfigureAwait(false);
         }
     }
 
-    private static async Task WriteBadRequestAsync(HttpContext context, string message)
+    private static async Task WriteErrorAsync(HttpContext context, string message, int status,
+        string type, string code)
     {
+        context.Response.Headers.TryGetValue(RequestLoggingMiddleware.RequestIdHeader, out var requestId);
         context.Response.Clear();
-        context.Response.StatusCode = StatusCodes.Status400BadRequest;
+        if (requestId.Count > 0)
+            context.Response.Headers[RequestLoggingMiddleware.RequestIdHeader] = requestId;
+        context.Response.StatusCode = status;
 
         // OpenAI SDKs parse {error:{message,type}}; the Ollama and Web UI
         // clients expect a flat {error:"..."}. Shape by route prefix.
@@ -42,7 +53,7 @@ public static class PromptOverflowMiddleware
         {
             await context.Response.WriteAsJsonAsync(new
             {
-                error = new { message, type = "invalid_request_error", code = "context_length_exceeded" }
+                error = new { message, type, code }
             }).ConfigureAwait(false);
         }
         else

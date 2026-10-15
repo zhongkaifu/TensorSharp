@@ -10,6 +10,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Linq;
 using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Threading.Tasks;
@@ -382,19 +383,101 @@ namespace TensorSharp.Models
         /// file-backed could not be offered to a phone.
         /// </para>
         /// <para>
-        /// Nothing on the GGML path ever reads the fused tensor. Both the fused MoE
+        /// Normal stacked GGML execution does not read the fused tensor. Both the fused MoE
         /// kernel (<see cref="TryMoEPrefillFused"/>, which serves prefill AND
         /// single-token decode) and the whole-model fused decode graph read
         /// <see cref="_layerStackedGate"/> / <see cref="_layerStackedUp"/> -- zero-cost
         /// views over the ORIGINAL 3D blocks, already separate. Only the per-expert
-        /// managed fallback indexed the fused name, and it now has
-        /// <see cref="ExpertFFNSplit"/>, so the copy is declinable like every other one.
+        /// managed fallback needs a concatenation. Automatic CUDA policy creates
+        /// one temporary expert copy there; explicit split policy can instead use
+        /// <see cref="ExpertFFNSplit"/>.
         /// </para>
         /// </summary>
         private bool _expertGateUpSplit;
+        // Automatic CUDA copy avoidance preserves the qualified fused matmul
+        // geometry in the rare per-expert fallback. Explicit split policy and
+        // incompatible source formats keep their separate-projection semantics.
+        private bool _temporaryExpertGateUpFusion;
+        private GptOssTemporaryExpertWeight _temporaryExpertGateUpOwner;
 
         private unsafe void FuseExpertGateUpWeights()
         {
+            // CUDA's stacked MoE graphs read the original gate/up blocks. The
+            // per-expert concatenations only retained a second host copy (6.3 GiB
+            // for 20B Q8_0), with no benefit to those graphs. Keep the existing
+            // temporary single-expert fallback, and preserve explicit operator overrides. Other
+            // backends and TP retain their independently qualified policy.
+            string fusionOverride = Environment.GetEnvironmentVariable("TS_WEIGHT_FUSION_COPIES");
+            bool forceCopies = fusionOverride == "1" || string.Equals(fusionOverride, "true", StringComparison.OrdinalIgnoreCase);
+            bool useStackedCudaWeights = _backend == BackendType.GgmlCuda && !IsTensorParallel && !forceCopies
+                && Enumerable.Range(0, Config.NumLayers).All(l =>
+                    _stackedExpertWeights.ContainsKey($"blk.{l}.ffn_gate_exps.weight")
+                    && _stackedExpertWeights.ContainsKey($"blk.{l}.ffn_up_exps.weight")
+                    && _stackedExpertWeights.ContainsKey($"blk.{l}.ffn_down_exps.weight"));
+            // The name table has one layout for the entire model. Decide before
+            // touching any pair, including mixed quant types and F32 sources;
+            // otherwise an earlier pair can lose its split weights or biases.
+            if (!IsTensorParallel && (useStackedCudaWeights || !AllowWeightFusionCopies))
+                _expertGateUpSplit = true;
+            string incompatiblePair = null;
+            bool allQuantized = true;
+            if (!_expertGateUpSplit || (useStackedCudaWeights && AllowWeightFusionCopies))
+            {
+                // Preflight the entire model before disposing any source. One
+                // mixed-format pair requires split names for every expert,
+                // even when the operator explicitly requested fusion copies.
+                for (int l = 0; l < Config.NumLayers && incompatiblePair == null; l++)
+                for (int e = 0; e < _numExperts; e++)
+                {
+                    string gate = $"blk.{l}.ffn_gate_exps.{e}";
+                    string up = $"blk.{l}.ffn_up_exps.{e}";
+                    long rows = 0;
+                    bool compatible = false;
+                    if (_quantWeights.TryGetValue(gate + ".weight", out var gw) &&
+                        _quantWeights.TryGetValue(up + ".weight", out var uw))
+                    {
+                        // Raw concatenation does not carry per-source Scale.
+                        compatible = gw.GgmlType == uw.GgmlType && gw.Ne0 == uw.Ne0 &&
+                            gw.Ne1 == uw.Ne1 && gw.Ne0 > 0 && gw.Ne1 > 0 && gw.Ne1 <= int.MaxValue / 2 &&
+                            gw.RawBytes > 0 && gw.RawBytes == uw.RawBytes &&
+                            gw.Scale == 1f && uw.Scale == 1f && gw.HasHostData && uw.HasHostData;
+                        rows = gw.Ne1;
+                    }
+                    else if (_weights.TryGetValue(gate + ".weight", out var gf) &&
+                             _weights.TryGetValue(up + ".weight", out var uf))
+                    {
+                        allQuantized = false;
+                        compatible = gf.ElementType == DType.Float32 && uf.ElementType == DType.Float32 &&
+                            gf.Sizes.Length == 2 && uf.Sizes.Length == 2 &&
+                            gf.Sizes[0] == uf.Sizes[0] && gf.Sizes[1] == uf.Sizes[1] &&
+                            gf.Sizes[0] > 0 && gf.Sizes[0] <= int.MaxValue / 2 &&
+                            gf.Sizes[1] > 0 && gf.Sizes[1] <= int.MaxValue;
+                        if (compatible) rows = gf.Sizes[0];
+                    }
+                    bool hasGateBias = _weights.TryGetValue(gate + ".bias", out var gb);
+                    bool hasUpBias = _weights.TryGetValue(up + ".bias", out var ub);
+                    compatible &= hasGateBias == hasUpBias;
+                    if (hasGateBias && hasUpBias)
+                        compatible &= gb.ElementType == DType.Float32 && ub.ElementType == DType.Float32 &&
+                            gb.Sizes.Length == 2 && ub.Sizes.Length == 2 &&
+                            gb.Sizes[0] == 1 && ub.Sizes[0] == 1 &&
+                            gb.Sizes[1] == rows && ub.Sizes[1] == rows && rows <= int.MaxValue / 2;
+                    if (!compatible)
+                    {
+                        incompatiblePair = $"layer {l}, expert {e}";
+                        break;
+                    }
+                }
+                if (incompatiblePair != null)
+                {
+                    if (IsTensorParallel)
+                        throw new NotSupportedException($"GPT-OSS tensor parallelism requires losslessly fusible expert gate/up weights and biases; incompatible {incompatiblePair}. No expert projections were fused.");
+                    _expertGateUpSplit = true;
+                    Console.WriteLine($"  Expert Gate+Up fusion declined: incompatible {incompatiblePair}; preserving all separate weights and biases without requantization (including when TS_WEIGHT_FUSION_COPIES=1).");
+                }
+            }
+            _temporaryExpertGateUpFusion = useStackedCudaWeights && AllowWeightFusionCopies
+                && incompatiblePair == null && allQuantized;
             int fused = 0;
             int declined = 0;
             long declinedBytes = 0;
@@ -406,38 +489,29 @@ namespace TensorSharp.Models
                     string upName = $"blk.{l}.ffn_up_exps.{e}.weight";
                     string fusedName = $"blk.{l}.ffn_gate_up_exps.{e}.weight";
 
+                    if (_expertGateUpSplit)
+                    {
+                        long Bytes(string name) => _quantWeights.TryGetValue(name, out var quant)
+                            ? quant.RawBytes : _weights.TryGetValue(name, out var tensor)
+                                ? checked(tensor.ElementCount() * sizeof(float)) : 0;
+                        declinedBytes = checked(declinedBytes + Bytes(gateName) + Bytes(upName));
+                        declined++;
+                        continue; // Preserve both source projections AND their separate biases.
+                    }
+
                     if (_quantWeights.TryGetValue(gateName, out var gw) &&
                         _quantWeights.TryGetValue(upName, out var uw) &&
                         gw.GgmlType == uw.GgmlType && gw.Ne0 == uw.Ne0)
                     {
-                        // Declinable, and the decision is model-wide: the name table
-                        // built later has ONE shape for every (layer, expert), so a
-                        // per-pair answer would leave some experts fused and some not
-                        // and the table wrong for half of them. The first pair decides;
-                        // the rest are only measured, so the line printed at the end is
-                        // the whole saving rather than one expert's share of it.
-                        if (_expertGateUpSplit)
-                        {
-                            declinedBytes += gw.RawBytes + uw.RawBytes;
-                            declined++;
-                            continue;
-                        }
                         // Not under tensor parallelism: the sharder partitions the
                         // FUSED name (ShardFusedGateUpColumnParallel), so declining
                         // there would leave it nothing to shard. TP is a multi-GPU
                         // desktop configuration and never a phone's, so the two
                         // never want the same answer anyway.
-                        if (!TryCreateFusedQuantizedWeight(
-                                separatePathAvailable: !IsTensorParallel,
-                                out QuantizedWeight fusedWeight, gw, uw))
-                        {
-                            // Nothing is disposed and nothing is removed: the separate
-                            // gate and up weights ARE the model from here on.
-                            _expertGateUpSplit = true;
-                            declinedBytes += gw.RawBytes + uw.RawBytes;
-                            declined++;
-                            continue;
-                        }
+                        // The model-wide decision above is final. Do not re-read
+                        // process policy per pair and publish a mixed name layout.
+                        TryCreateFusedQuantizedWeight(separatePathAvailable: false,
+                            out QuantizedWeight fusedWeight, gw, uw);
 
                         _quantWeights[fusedName] = fusedWeight;
                         _quantWeights.Remove(gateName); gw.Dispose();
@@ -483,7 +557,7 @@ namespace TensorSharp.Models
                 Console.WriteLine(
                     $"  Expert Gate+Up kept separate: {declined} pairs, "
                     + $"{declinedBytes / (1024.0 * 1024.0):0} MB of anonymous copies avoided "
-                    + "(TS_WEIGHT_FUSION_COPIES=1 to fuse anyway)");
+                    + (incompatiblePair == null ? "(TS_WEIGHT_FUSION_COPIES=1 requests compatible fusion)" : "(incompatible fusion was refused)"));
             }
         }
 
@@ -2568,16 +2642,74 @@ namespace TensorSharp.Models
         /// </summary>
         private unsafe Tensor ExpertForward(Tensor input, string[] names, int seqLen) =>
             _expertGateUpSplit
-                ? ExpertFFNSplit(input, names[0], names[1], names[4], names[5], names[2], names[3], seqLen)
+                ? _temporaryExpertGateUpFusion
+                    ? ExpertFFNTemporary(input, names[0], names[1], names[4], names[5], names[2], names[3], seqLen)
+                    : ExpertFFNSplit(input, names[0], names[1], names[4], names[5], names[2], names[3], seqLen)
                 : ExpertFFN(input, names[0], names[1], names[2], names[3], seqLen);
+
+        /// <summary>Retain the original fused output width without retaining every
+        /// expert's duplicate weights. At most one expert copy is alive; its host
+        /// allocation participates in the active HostAllocationBudgetScope. CUDA
+        /// reduction/activation quantization can amplify rounding differences if
+        /// gate and up are dispatched with half the original output width.</summary>
+        private unsafe Tensor ExpertFFNTemporary(
+            Tensor input, string gateWeightName, string gateBiasName,
+            string upWeightName, string upBiasName,
+            string downWeightName, string downBiasName, int seqLen)
+        {
+            // A failed barrier/invalidation leaves this owner rooted. Retry its
+            // cleanup before allocating another expert, never recycle its pointer.
+            ReleaseTemporaryExpertGateUp();
+            _temporaryExpertGateUpOwner = new GptOssTemporaryExpertWeight(
+                _quantWeights[gateWeightName], _quantWeights[upWeightName], IsGgmlBackend);
+            Tensor gateUp = null;
+            try
+            {
+                try
+                {
+                    var weight = _temporaryExpertGateUpOwner.Weight;
+                    gateUp = new Tensor(_allocator, DType.Float32, seqLen, weight.Ne1);
+                    ExecuteQuantizedLinear(gateUp, input, weight);
+                    int halfDim = checked((int)(weight.Ne1 / 2));
+                    float* ptr = GetFloatPtr(gateUp);
+                    if (_weights.TryGetValue(gateBiasName, out var gateBias))
+                    {
+                        float* bias = GetFloatPtr(gateBias);
+                        for (int s = 0; s < seqLen; s++)
+                            VecScaleAdd(ptr + (long)s * halfDim * 2, bias, 1f, halfDim);
+                    }
+                    if (_weights.TryGetValue(upBiasName, out var upBias))
+                    {
+                        float* bias = GetFloatPtr(upBias);
+                        for (int s = 0; s < seqLen; s++)
+                            VecScaleAdd(ptr + (long)s * halfDim * 2 + halfDim, bias, 1f, halfDim);
+                    }
+                }
+                finally { ReleaseTemporaryExpertGateUp(); }
+                return ExpertDownFromFusedProjection(gateUp, downWeightName, downBiasName, seqLen);
+            }
+            finally
+            {
+                // The result cannot escape when either execution or native cache
+                // retirement fails. A retirement failure retains only the weight.
+                gateUp?.Dispose();
+            }
+        }
+
+        private void ReleaseTemporaryExpertGateUp()
+        {
+            _temporaryExpertGateUpOwner?.Dispose();
+            _temporaryExpertGateUpOwner = null;
+        }
 
         /// <summary>
         /// The same expert with gate and up run as two projections instead of one.
         ///
         /// <para>
-        /// Byte-identical to <see cref="ExpertFFN"/>: the fused weight is only ever the
-        /// two of them concatenated along the output dimension, so a single matmul of
-        /// width 2*n_ff and two of width n_ff produce the same numbers. What it costs is
+        /// Algebraically equivalent to <see cref="ExpertFFN"/>: the fused weight is
+        /// the two projections concatenated along the output dimension. Backend
+        /// kernel selection and reduction order can differ with that dimension,
+        /// so bitwise equality requires separate numerical qualification. It costs
         /// one extra dispatch per active expert; what it buys is not copying the whole
         /// mixture of experts into anonymous memory to make the fused weight exist
         /// (6,768 MB on gpt-oss-20b Q8_0).
@@ -2588,40 +2720,41 @@ namespace TensorSharp.Models
             string upWeightName, string upBiasName,
             string downWeightName, string downBiasName, int seqLen)
         {
-            Tensor gate = LinearForwardWithBias(input, gateWeightName, gateBiasName);
-            Tensor up = LinearForwardWithBias(input, upWeightName, upBiasName);
-            int halfDim = (int)gate.Sizes[1];
-
-            // In place into `gate`, exactly as the fused path activates the first half
-            // of its gate||up buffer.
-            float* gatePtr = GetFloatPtr(gate);
-            float* upPtr = GetFloatPtr(up);
-            for (int s = 0; s < seqLen; s++)
-                ApplySwiGluOaiInPlace(gatePtr + (long)s * halfDim, upPtr + (long)s * halfDim, halfDim);
-            up.Dispose();
-
-            Tensor down = LinearForwardWithBias(gate, downWeightName, downBiasName);
-            gate.Dispose();
-            return down;
+            using Tensor gate = LinearForwardWithBias(input, gateWeightName, gateBiasName);
+            using (Tensor up = LinearForwardWithBias(input, upWeightName, upBiasName))
+            {
+                int halfDim = (int)gate.Sizes[1];
+                // In place into `gate`, exactly as the fused path activates the first half
+                // of its gate||up buffer. Release up before allocating down; both
+                // intermediates remain owned if a later projection throws.
+                float* gatePtr = GetFloatPtr(gate);
+                float* upPtr = GetFloatPtr(up);
+                for (int s = 0; s < seqLen; s++)
+                    ApplySwiGluOaiInPlace(gatePtr + (long)s * halfDim, upPtr + (long)s * halfDim, halfDim);
+            }
+            return LinearForwardWithBias(gate, downWeightName, downBiasName);
         }
 
         private unsafe Tensor ExpertFFN(Tensor input, string gateUpWeightName, string gateUpBiasName,
             string downWeightName, string downBiasName, int seqLen)
         {
-            Tensor gateUp = LinearForwardWithBias(input, gateUpWeightName, gateUpBiasName);
+            using Tensor gateUp = LinearForwardWithBias(input, gateUpWeightName, gateUpBiasName);
+            return ExpertDownFromFusedProjection(gateUp, downWeightName, downBiasName, seqLen);
+        }
+
+        private unsafe Tensor ExpertDownFromFusedProjection(Tensor gateUp,
+            string downWeightName, string downBiasName, int seqLen)
+        {
             int halfDim = (int)(gateUp.Sizes[1] / 2);
 
             if (_backend == BackendType.Cuda)
             {
-                var activatedCuda = new Tensor(_allocator, DType.Float32, seqLen, halfDim);
+                using var activatedCuda = new Tensor(_allocator, DType.Float32, seqLen, halfDim);
                 if (CudaFusedOps.TrySwiGluOaiSplit(activatedCuda, gateUp, halfDim, SiluAlpha, SiluLimit))
                 {
                     gateUp.Dispose();
-                    Tensor downCuda = LinearForwardWithBias(activatedCuda, downWeightName, downBiasName);
-                    activatedCuda.Dispose();
-                    return downCuda;
+                    return LinearForwardWithBias(activatedCuda, downWeightName, downBiasName);
                 }
-                activatedCuda.Dispose();
             }
 
             float* guPtr = GetFloatPtr(gateUp);
@@ -2637,18 +2770,17 @@ namespace TensorSharp.Models
             if (seqLen == 1)
             {
                 activated = gateUp.Narrow(1, 0, halfDim);
-                gateUp.Dispose();
             }
             else
             {
                 using var gView = gateUp.Narrow(1, 0, halfDim);
                 activated = Ops.NewContiguous(gView);
-                gateUp.Dispose();
             }
-
-            Tensor down = LinearForwardWithBias(activated, downWeightName, downBiasName);
-            activated.Dispose();
-            return down;
+            using (activated)
+            {
+                gateUp.Dispose();
+                return LinearForwardWithBias(activated, downWeightName, downBiasName);
+            }
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -2730,50 +2862,53 @@ namespace TensorSharp.Models
             Tensor result = LinearForward(input, weightName);
             if (result == null)
                 return null;
-
-            if (_weights.TryGetValue(biasName, out var bias))
+            try
             {
-                if (_backend == BackendType.Cuda && CudaFusedOps.TryAddBiasRows(result, bias))
-                    return result;
-
-                int seqLen = (int)result.Sizes[0];
-                int outDim = (int)result.Sizes[1];
-                int biasDim = (int)bias.ElementCount();
-
-                // On MLX the host loop below forces a device sync for every
-                // projection (the matmul result has to be read back before the
-                // bias can be added), which left decode host-bound. Broadcast
-                // the bias over the rows and add it on the device instead.
-                if (_backend == BackendType.Mlx && biasDim == outDim)
+                if (_weights.TryGetValue(biasName, out var bias))
                 {
-                    using var biasRow = bias.View(1, outDim);
-                    if (seqLen == 1)
+                    if (_backend == BackendType.Cuda && CudaFusedOps.TryAddBiasRows(result, bias))
+                        return result;
+
+                    int seqLen = (int)result.Sizes[0];
+                    int outDim = (int)result.Sizes[1];
+                    int biasDim = (int)bias.ElementCount();
+
+                    // On MLX the host loop below forces a device sync for every
+                    // projection (the matmul result has to be read back before the
+                    // bias can be added), which left decode host-bound. Broadcast
+                    // the bias over the rows and add it on the device instead.
+                    if (_backend == BackendType.Mlx && biasDim == outDim)
                     {
-                        Ops.Add(result, result, biasRow);
+                        using var biasRow = bias.View(1, outDim);
+                        if (seqLen == 1)
+                        {
+                            Ops.Add(result, result, biasRow);
+                        }
+                        else
+                        {
+                            using var expanded = biasRow.Expand(seqLen, outDim);
+                            Ops.Add(result, result, expanded);
+                        }
+                        return result;
                     }
-                    else
-                    {
-                        using var expanded = biasRow.Expand(seqLen, outDim);
-                        Ops.Add(result, result, expanded);
-                    }
-                    return result;
+
+                    float* rPtr = GetFloatPtr(result);
+                    float* bPtr = GetFloatPtr(bias);
+                    int dim = Math.Min(outDim, biasDim);
+
+                    for (int s = 0; s < seqLen; s++)
+                        VecScaleAdd(rPtr + (long)s * outDim, bPtr, 1.0f, dim);
                 }
-
-                float* rPtr = GetFloatPtr(result);
-                float* bPtr = GetFloatPtr(bias);
-                int dim = Math.Min(outDim, biasDim);
-
-                for (int s = 0; s < seqLen; s++)
-                    VecScaleAdd(rPtr + (long)s * outDim, bPtr, 1.0f, dim);
+                return result;
             }
-
-            return result;
+            catch { result.Dispose(); throw; }
         }
 
         #endregion
 
         public override void Dispose()
         {
+            ReleaseTemporaryExpertGateUp();
             if (_kvCacheK != null)
                 foreach (var t in _kvCacheK) t?.Dispose();
             if (_kvCacheV != null)

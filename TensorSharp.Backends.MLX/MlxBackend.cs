@@ -34,9 +34,20 @@ namespace TensorSharp.MLX
             MlxNative.EnsureGpuDevice(deviceId);
         }
 
+        /// <summary>Read process-wide MLX allocator counters without evaluating
+        /// lazy arrays. Throws if the observation is unavailable; use Try for
+        /// best-effort diagnostics. These counters are not total physical RAM.</summary>
         public static MlxMemorySnapshot GetMemorySnapshot()
         {
             return MlxNative.GetMemorySnapshot();
+        }
+
+        /// <summary>False means unknown, not zero. The out snapshot is usable only
+        /// on success. Does not evaluate arrays, synchronize Metal, or certify
+        /// ownership; pending lazy work and untracked host/driver memory are absent.</summary>
+        public static bool TryGetMemorySnapshot(out MlxMemorySnapshot snapshot, out string error)
+        {
+            return MlxNative.TryGetMemorySnapshot(out snapshot, out error);
         }
 
         public static void ClearCache()

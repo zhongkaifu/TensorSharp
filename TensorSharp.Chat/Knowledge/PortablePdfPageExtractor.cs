@@ -71,6 +71,7 @@ public sealed class PortablePdfPageExtractor : IKnowledgePdfPageExtractor
         deadline.CancelAfter(TimeSpan.FromSeconds(_options.TimeoutSeconds));
         var ct = deadline.Token;
         string scratch = CreateScratch();
+        Exception? primaryFailure = null;
         try
         {
             PreflightFile(context.FilePath);
@@ -88,8 +89,13 @@ public sealed class PortablePdfPageExtractor : IKnowledgePdfPageExtractor
                 Warnings = string.IsNullOrWhiteSpace(result.StandardError) ? Array.Empty<string>()
                     : new[] { "Tesseract diagnostic: " + LimitDiagnostic(result.StandardError) } };
         }
-        catch (Win32Exception) { throw new NotSupportedException("PDF OCR requires installed Poppler pdftoppm and Tesseract 5 executables. Configure their paths and reindex."); }
-        finally { Directory.Delete(scratch, true); }
+        catch (Win32Exception error)
+        {
+            primaryFailure = new NotSupportedException("PDF OCR requires installed Poppler pdftoppm and Tesseract 5 executables. Configure their paths and reindex.", error);
+            throw primaryFailure;
+        }
+        catch (Exception error) { primaryFailure = error; throw; }
+        finally { await PortablePdfScratchDirectory.DeletePreservingFailureAsync(scratch, primaryFailure).ConfigureAwait(false); }
     }
 
     /// <summary>Render a complete cropped/rotated page. Useful for previews and independent raster validation.</summary>
@@ -101,8 +107,10 @@ public sealed class PortablePdfPageExtractor : IKnowledgePdfPageExtractor
         using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         deadline.CancelAfter(TimeSpan.FromSeconds(_options.TimeoutSeconds));
         string scratch = CreateScratch();
+        Exception? primaryFailure = null;
         try { return await RenderAsync(context, ResolveExecutable(_options.PdfToPpmExecutable, "pdftoppm"), scratch, deadline.Token).ConfigureAwait(false); }
-        finally { Directory.Delete(scratch, true); }
+        catch (Exception error) { primaryFailure = error; throw; }
+        finally { await PortablePdfScratchDirectory.DeletePreservingFailureAsync(scratch, primaryFailure).ConfigureAwait(false); }
     }
 
     private async Task<byte[]> RenderAsync(KnowledgePdfPageContext context, string renderer, string scratch, CancellationToken ct)

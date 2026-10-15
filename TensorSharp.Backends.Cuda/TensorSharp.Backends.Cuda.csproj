@@ -12,6 +12,7 @@
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="..\TensorSharp.Core\TensorSharp.Core.csproj" />
+    <ProjectReference Include="..\TensorSharp.Memory\TensorSharp.Memory.csproj" />
   </ItemGroup>
 
   <PropertyGroup>
@@ -46,7 +47,10 @@
          nvcc, SelectCudaPtxContent below swaps these for the locally compiled
          PTX before target paths are assigned. -->
     <Content Include="$(CudaCommittedPtxDir)/*.ptx" Link="cuda_kernels\%(Filename)%(Extension)" Condition="Exists('$(CudaCommittedPtxDir)')">
-      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <!-- Referencing projects may still contain newer files from another
+           producer. The selected producer wins over destination timestamps. -->
+      <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+      <CopyToPublishDirectory>Always</CopyToPublishDirectory>
     </Content>
   </ItemGroup>
 
@@ -94,7 +98,8 @@
       <Content Remove="$(CudaCommittedPtxDir)/*.ptx" />
       <Content Include="@(CudaKernel->'$(PtxOutputDir)/%(Filename).ptx')">
         <Link>cuda_kernels\%(Filename).ptx</Link>
-        <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+        <CopyToOutputDirectory>Always</CopyToOutputDirectory>
+        <CopyToPublishDirectory>Always</CopyToPublishDirectory>
       </Content>
     </ItemGroup>
   </Target>
@@ -154,13 +159,17 @@
 
   <Target Name="CopyCudaPtxToOutput" AfterTargets="CompileCudaPtx">
     <ItemGroup>
-      <_CompiledPtx Include="$(PtxOutputDir)/*.ptx" />
+      <!-- Match SelectCudaPtxContent and SDK publish: without nvcc, a stale
+           local obj file is not an authorized replacement for the baseline. -->
+      <_OutputPtx Include="@(CudaKernel->'$(PtxOutputDir)/%(Filename).ptx')" Condition="'$(_NvccExitCode)' == '0'" />
+      <_OutputPtx Include="$(CudaCommittedPtxDir)/*.ptx" Condition="'$(_NvccExitCode)' != '0'" />
     </ItemGroup>
-    <MakeDir Directories="$([MSBuild]::NormalizePath('$(OutDir)', 'cuda_kernels'))" Condition="'@(_CompiledPtx)' != ''" />
-    <Copy SourceFiles="@(_CompiledPtx)"
+    <MakeDir Directories="$([MSBuild]::NormalizePath('$(OutDir)', 'cuda_kernels'))" Condition="'@(_OutputPtx)' != ''" />
+    <!-- A previous toolchain's payload can have the same size and timestamp.
+         Copy the small selected kernel set even in that case. -->
+    <Copy SourceFiles="@(_OutputPtx)"
           DestinationFolder="$([MSBuild]::NormalizePath('$(OutDir)', 'cuda_kernels'))"
-          SkipUnchangedFiles="true"
-          Condition="'@(_CompiledPtx)' != ''" />
+          Condition="'@(_OutputPtx)' != ''" />
   </Target>
 
   <!-- Explicit opt-in that copies the freshly compiled PTX over the committed

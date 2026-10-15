@@ -1,7 +1,10 @@
 import copy
 import importlib.util
 from pathlib import Path
+import tempfile
 import unittest
+from unittest.mock import patch
+from eng.validation.tests.fixtures import deepseek_metadata as FIXTURE
 
 PATH = Path(__file__).resolve().parents[1] / 'prepare-deepseek-teacher-logits.py'
 SPEC = importlib.util.spec_from_file_location('teacher_plan', PATH)
@@ -51,8 +54,12 @@ class TeacherPlanTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'SHA256'):
             PLAN.build_plan('latest')
 
-    def test_all_archived_requests_and_only_the_tp_degree_differs(self):
-        plan = PLAN.build_plan('2' * 64)
+    def test_all_fixture_requests_and_only_the_tp_degree_differs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data=FIXTURE.bundle(directory)
+            with patch.multiple(PLAN,ROOT=data['root'],REPORTS=data['reports'],ARCHIVE=data['archive'],
+                                PINNED_REPORTS=data['pinned_reports'],SOURCE_PROFILE_SHA256=FIXTURE.digest(data['sparse'])):
+                plan = PLAN.build_plan('2' * 64)
         self.assertEqual(plan['request_count'], 113)
         self.assertEqual([s['requests'] for s in plan['sources']], [60, 25, 25, 3])
         self.assertFalse(plan['qualified'])

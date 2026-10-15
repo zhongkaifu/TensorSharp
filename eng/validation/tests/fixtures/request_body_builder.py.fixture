@@ -1,0 +1,23 @@
+# Model-free fixture of benchmark request-body semantics. No transport runs.
+def run_openai_chat(base_url: str, model_name: str, messages: list, *,
+                    tools: Optional[list] = None,
+                    response_format: Optional[dict] = None,
+                    max_tokens: int = 128,
+                    stream: bool = True,
+                    extra_body: Optional[dict] = None,
+                    timeout_s: float = 1200.0) -> dict:
+    url = base_url.rstrip("/") + "/v1/chat/completions"
+    body = {"model": model_name, "messages": messages, "max_tokens": max_tokens,
+            "temperature": 0, "stream": stream}
+    if extra_body:
+        body.update(extra_body)
+    if tools:
+        body["tools"] = tools
+    if response_format:
+        body["response_format"] = response_format
+    if stream:
+        body["stream_options"] = {"include_usage": True}
+        body["timings_per_token"] = True
+    if not stream:
+        return _run_blocking(url, body, timeout_s)
+    return _run_streaming(url, body, timeout_s)

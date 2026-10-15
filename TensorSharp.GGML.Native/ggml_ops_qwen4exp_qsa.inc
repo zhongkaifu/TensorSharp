@@ -46,6 +46,9 @@ static ggml_tensor* q4e_nodes_qsa_mask(ggml_context* ctx, ggml_cgraph* graph,
         pooled = pooled ? ggml_add(ctx, pooled, part) : part;
     }
     pooled = ggml_scale(ctx, pooled, 1.f / R);
+    // Match the main attention Q/K lifetime policy even without probe outputs.
+    // Otherwise arena layout can change normalization/rotary fusion eligibility.
+    q4e_keep_fusion_input(pooled);
     if (qsa.probes) { ggml_set_output(pooled); qsa.probes->push_back(pooled); }
     pooled = ggml_mul(ctx, ggml_rms_norm(ctx, pooled, eps), nk);
     pooled = ggml_reshape_3d(ctx, pooled, D, 1, B);
@@ -55,6 +58,7 @@ static ggml_tensor* q4e_nodes_qsa_mask(ggml_context* ctx, ggml_cgraph* graph,
     pooled = ggml_reshape_2d(ctx, pooled, D, B);
     if (qsa.probes) { ggml_set_output(pooled); qsa.probes->push_back(pooled); }
     auto* q = ggml_reshape_3d(ctx, q4e_qsa_matmul(ctx, wq, mixed), D, H, T);
+    q4e_keep_fusion_input(q);
     q = ggml_mul(ctx, ggml_rms_norm(ctx, q, eps), nq);
     q = ggml_rope_multi(ctx, q, in.query_positions, nullptr, n_rot, sections,
         GGML_ROPE_TYPE_IMROPE, 0, base, scale, 0.f, 1.f, 0.f, 0.f);

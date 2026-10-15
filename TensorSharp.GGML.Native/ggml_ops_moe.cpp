@@ -32,6 +32,9 @@
 // cost — the C# layer simply passes the base pointer of expert 0.
 
 #include "ggml_ops_internal.h"
+#include "ggml_ops_moe_prefetch.h"
+#include "ggml_ops_file_source.h"
+#include "ggml_ops_host_moe_file_batch.h"
 #include "dsv41_engram_io.h"
 
 #include "ggml-backend.h"
@@ -41,6 +44,10 @@
 // already-built whole-model decode graph, pausing at each offloaded layer for
 // the host expert matmul. Same internal API the tensor-parallel executor uses.
 #include "ggml-impl.h"
+#include "ggml_ops_moe_file_pipeline.h"
+#if defined(TSG_GGML_USE_CUDA)
+#include "ggml-cuda.h"
+#endif
 
 #include <cstdint>
 #include <cmath>
@@ -50,7 +57,9 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <mutex>
+#include <stdexcept>
 #include <thread>
 
 #ifdef __linux__
@@ -149,6 +158,65 @@ namespace
         // was single-threaded by luck rather than by design.) Serializing costs
         // nothing real: the pool already owns every core it is allowed to use.
         std::mutex g_moe_cpu_compute_mutex;
+        std::mutex g_moe_file_cpu_mutex;
+        HostMoeCpuArena g_moe_file_weights, g_moe_file_work;
+        HostMoeFilePipeline g_moe_file_pipeline;
+        HostMoeFilePipelineConfiguration g_moe_file_pipeline_config;
+        std::uint64_t g_moe_file_pipeline_calls = 0, g_moe_file_pipeline_source_bytes = 0;
+        // Separate from the whole-model and ordinary streaming allocators. A
+        // file-backed layer executes inside the outer graph's live allocation.
+        // The file mutex serializes use; request-boundary trim frees this slot.
+        ggml_gallocr_t g_moe_file_stream_gallocr = nullptr;
+        ggml_backend_t g_moe_file_stream_backend = nullptr;
+        void clear_file_stream_gallocr() {
+            g_moe_file_pipeline.clear();
+            if (g_moe_file_stream_gallocr) graph_budget_gallocr_free(g_moe_file_stream_gallocr);
+            g_moe_file_stream_gallocr = nullptr;
+            g_moe_file_stream_backend = nullptr;
+        }
+        struct FileStreamAllocationRefused {};
+        bool allocate_file_stream_graph(ggml_cgraph* graph) {
+            if (g_moe_file_stream_gallocr && g_moe_file_stream_backend != g_backend)
+                throw std::runtime_error("Host MoE file stream backend changed without quiescent cleanup");
+            if (!g_moe_file_stream_gallocr) {
+                g_moe_file_stream_gallocr = graph_budget_gallocr_new(ggml_backend_get_default_buffer_type(g_backend), g_active_rank, true);
+                g_moe_file_stream_backend = g_backend;
+            }
+            if (g_moe_file_stream_gallocr && graph_budget_gallocr_alloc_graph(g_moe_file_stream_gallocr, graph)) return true;
+            // A failed reserve leaves upstream gallocr's tensor plan poisoned.
+            clear_file_stream_gallocr();
+            return false;
+        }
+#if defined(TSG_GGML_TEST_HOOKS)
+        std::atomic<int> g_moe_file_read_failure{0};
+        std::atomic<int> g_moe_file_stream_failure{0};
+        std::atomic<std::uint64_t> g_moe_file_stream_drains{0};
+#endif
+        struct FileStreamDrain {
+            ggml_backend_t backend = nullptr;
+            void finish() {
+                if (!backend) return;
+                sync_backend(backend);
+#if defined(TSG_GGML_TEST_HOOKS)
+                g_moe_file_stream_drains.fetch_add(1);
+#endif
+                backend = nullptr;
+                if (g_backend_compute_failed.load(std::memory_order_acquire))
+                    throw std::runtime_error("Host MoE compact stream drain failed");
+            }
+            ~FileStreamDrain() noexcept {
+                try { finish(); } catch (...) { g_backend_compute_failed.store(true, std::memory_order_release); }
+            }
+        };
+        void file_stream_test_failure(int stage) {
+#if defined(TSG_GGML_TEST_HOOKS)
+            int expected = stage;
+            if (g_moe_file_stream_failure.compare_exchange_strong(expected, 0))
+                throw std::runtime_error("Injected host MoE compact stream failure");
+#else
+            (void)stage;
+#endif
+        }
 
         // Set by TSGgml_SetHostMoeThreads (the --cpu-moe-threads flag). It
         // cannot travel through TS_CPU_MOE_THREADS alone: .NET's
@@ -295,6 +363,14 @@ namespace
             // is therefore bounded by the largest single layer, not the model.
             if (stream_only)
             {
+                // Unlike resident weights, these leafs live in graph compute
+                // memory. Keep them live for the whole graph: CUDA may fuse
+                // gate/up/GLU into one MMVQ kernel, while the graph allocator
+                // otherwise reuses a consumed weight's storage for its output.
+                // The upstream fusion overlap check assumes leaf weights are
+                // externally owned and skips them. No upstream patch is needed.
+                ggml_set_input(tensor);
+                ggml_set_output(tensor);
                 uploads.push_back({tensor, host_data, bytes, true});
                 return true;
             }
@@ -332,6 +408,10 @@ namespace
             }
 
             // Fall back to deferred upload after backend buffer allocation.
+            // This fallback is also graph-owned and has the same fused-kernel
+            // lifetime as the explicit streaming branch above.
+            ggml_set_input(tensor);
+            ggml_set_output(tensor);
             uploads.push_back({tensor, host_data, bytes, true});
             return true;
         }
@@ -442,6 +522,7 @@ namespace
         // mmap instead of uploading them to the accelerator. Set per layer by
         // the caller from MoeCpuOffloadConfig.IsLayerOnCpu(layer).
         bool run_on_cpu = false;
+        const HostMoeFileBatch* file_batch = nullptr;
 
         // Whether run_on_cpu may be satisfied by streaming the experts to the
         // accelerator for one graph instead of computing them on the host (see
@@ -483,18 +564,21 @@ namespace
     //
     // 0 disables the device path (TS_HOST_MOE_DEVICE_MIN_BATCH=0), restoring
     // host-only offload.
-    int moe_offload_stream_batch_threshold()
+    int moe_offload_stream_batch_threshold(bool file_backed)
     {
-        static const int s_threshold = []() {
+        static const int s_override = []() {
             if (const char* e = std::getenv("TS_HOST_MOE_DEVICE_MIN_BATCH"))
             {
                 const int n = std::atoi(e);
                 if (n >= 0)
                     return n;
             }
-            return 128;
+            return -1;
         }();
-        return s_threshold;
+        // File staging is already admitted and materializes a compact expert
+        // axis. Avoid replaying a real prefill tail as many scalar CPU/cache
+        // operations. Keep the ordinary mmap policy and explicit overrides.
+        return s_override >= 0 ? s_override : (file_backed ? 32 : 128);
     }
 
     // ------------------------------------------------------------------
@@ -571,20 +655,25 @@ namespace
     // offloaded experts, 30 s of a 1818-token prefill whose GPU work took 1 s.
     // Faulted in concurrently first, the copy reads from the page cache. Nothing
     // is pinned or copied here; the pages stay evictable.
-    void prefetch_mapped_ranges_impl(const std::uint8_t* base,
-                                const std::vector<std::pair<std::size_t, std::size_t>>& ranges)
+    tsg_dsv41::engram_io_pool& mapped_read_pool()
     {
-        static tsg_dsv41::engram_io_pool s_pool(16);
+        static tsg_dsv41::engram_io_pool pool(std::min(16, available_cpu_parallelism()));
+        return pool;
+    }
+
+    void prefetch_mapped_buffers_impl(
+        const std::vector<std::pair<const std::uint8_t*, std::size_t>>& buffers)
+    {
         constexpr std::size_t kChunk = std::size_t(4) << 20;
         constexpr std::size_t kStride = 4096;   // at most one touch per page on any host
         // Read by the pool's workers: an ordinary local, never thread_local.
-        std::vector<std::pair<std::size_t, std::size_t>> tasks;
-        for (const auto& r : ranges)
+        std::vector<std::pair<const std::uint8_t*, std::size_t>> tasks;
+        for (const auto& r : buffers)
             for (std::size_t o = 0; o < r.second; o += kChunk)
                 tasks.emplace_back(r.first + o, std::min(kChunk, r.second - o));
         std::atomic<std::uint64_t> sink{0};
-        s_pool.run(tasks.size(), [&](std::size_t i) {
-            const volatile std::uint8_t* p = base + tasks[i].first;
+        mapped_read_pool().run(tasks.size(), [&](std::size_t i) {
+            const volatile std::uint8_t* p = tasks[i].first;
             const std::size_t n = tasks[i].second;
             std::uint64_t sum = 0;
             for (std::size_t k = 0; k < n; k += kStride) sum += p[k];
@@ -779,20 +868,26 @@ namespace
                 reinterpret_cast<void*>(base), bytes + lead);
             if (buf == nullptr)
                 return false;
-            buffers.emplace_back(buf);
+            BufferHandle owner(buf);
+            buffers.emplace_back(std::move(owner));
             return ggml_backend_tensor_alloc(buf, t, data) == GGML_STATUS_SUCCESS;
         };
 
+        const auto* file_batch = p.file_batch;
+        if (file_batch) file_batch->read(g_moe_file_weights);
+        void* const gate_pointer = file_batch ? g_moe_file_weights.data() + file_batch->offset[0] : p.gate_data;
+        void* const up_pointer = file_batch ? g_moe_file_weights.data() + file_batch->offset[1] : p.up_data;
+        void* const down_pointer = file_batch ? g_moe_file_weights.data() + file_batch->offset[2] : p.down_data;
         if (!wrap_host(b.hidden_t, p.hidden_in, b.hidden_bytes) ||
             !wrap_host(b.hidden_out_t, b.out_buffer_ptr, b.hidden_bytes) ||
-            !wrap_host(b.gate_w, p.gate_data, static_cast<std::size_t>(p.gate_total_bytes)) ||
-            !wrap_host(b.down_w, p.down_data, static_cast<std::size_t>(p.down_total_bytes)))
+            !wrap_host(b.gate_w, gate_pointer, static_cast<std::size_t>(p.gate_total_bytes)) ||
+            !wrap_host(b.down_w, down_pointer, static_cast<std::size_t>(p.down_total_bytes)))
         {
             set_last_error("MoE CPU offload: failed to wrap a host buffer for the expert weights.");
             return 0;
         }
         if (b.up_w != nullptr &&
-            !wrap_host(b.up_w, p.up_data, static_cast<std::size_t>(p.up_total_bytes)))
+            !wrap_host(b.up_w, up_pointer, static_cast<std::size_t>(p.up_total_bytes)))
         {
             set_last_error("MoE CPU offload: failed to wrap the up-projection host buffer.");
             return 0;
@@ -801,12 +896,25 @@ namespace
         // Everything still unbound (ids, routing weights, biases, post-norm
         // weight, and all graph intermediates) is small; allocate it in one
         // CPU-backend buffer freed when this call returns.
+        std::shared_ptr<SharedCacheCharge> scratch_charge;
+        ggml_cplan cpu_plan{};
+        if (file_batch) {
+            const auto bytes = ggml_backend_alloc_ctx_tensors_from_buft_size(ctx, ggml_backend_cpu_buffer_type());
+            if (!bytes) throw std::runtime_error("Host MoE CPU graph scratch planning failed");
+            scratch_charge = SharedCacheCharge::reserve(0, 3, bytes);
+            if (!scratch_charge || !scratch_charge->is_accounted()) throw std::runtime_error("Host MoE CPU graph scratch budget refused");
+            cpu_plan = ggml_graph_plan(graph, moe_cpu_thread_count(), g_moe_cpu_threadpool);
+            g_moe_file_work.reserve(cpu_plan.work_size);
+            cpu_plan.work_data = g_moe_file_work.data();
+        }
         BufferHandle scratch(ggml_backend_alloc_ctx_tensors(ctx, cpu));
         if (scratch.value == nullptr)
         {
             set_last_error("MoE CPU offload: failed to allocate the host scratch buffer.");
             return 0;
         }
+        if (scratch_charge && !scratch_charge->commit(ggml_backend_buffer_get_size(scratch.value)))
+            throw std::runtime_error("Host MoE CPU graph scratch commit refused");
 
         ggml_backend_tensor_set(b.ids_t, p.selected_experts, 0,
             static_cast<std::size_t>(p.seq_len) *
@@ -847,7 +955,10 @@ namespace
             return e != nullptr && e[0] == '1';
         }();
         const auto t_compute = std::chrono::steady_clock::now();
-        const ggml_status status = tsg::compute_graph(cpu, graph);
+        const auto errors_before = g_ggml_error_count.load(std::memory_order_acquire);
+        const ggml_status status = file_batch ? ggml_graph_compute(graph, &cpu_plan) : tsg::compute_graph(cpu, graph);
+        if (g_ggml_error_count.load(std::memory_order_acquire) != errors_before)
+            g_backend_compute_failed.store(true, std::memory_order_release);
         if (s_timing)
         {
             const auto t_end = std::chrono::steady_clock::now();
@@ -863,7 +974,7 @@ namespace
                 acc_setup = acc_compute = 0.0;
             }
         }
-        if (status != GGML_STATUS_SUCCESS)
+        if (status != GGML_STATUS_SUCCESS || (file_batch && g_backend_compute_failed.load(std::memory_order_acquire)))
         {
             set_last_error("MoE CPU offload: host graph compute failed.");
             return 0;
@@ -877,6 +988,47 @@ namespace
 
     int moe_ffn_prefill_graph_impl(const MoEFFNGraphParams& p)
     {
+        // Preserve the original batch and every route's reduction order. Only
+        // the expert axis is compacted; ordinary workloads never take this path.
+        if (!p.file_batch && p.run_on_cpu && p.activation_type == MOE_ACT_SWIGLU_SPLIT
+            && p.up_data && !p.gate_bias && !p.up_bias && !p.down_bias
+            && !p.residual_in_out && g_device_count.load(std::memory_order_acquire) <= 1
+            && g_tp_global_degree.load(std::memory_order_acquire) <= 1) {
+            HostMoeFileBatch batch;
+            const void* pointers[] = { p.gate_data, p.up_data, p.down_data };
+            const std::int64_t totals[] = { p.gate_total_bytes, p.up_total_bytes, p.down_total_bytes };
+            const int sources = host_moe_file_batch_sources(pointers, totals, batch.sources);
+            if (sources < 0) throw std::runtime_error("Host MoE CPU file sources are incomplete or have changed");
+            if (sources > 0) {
+                batch.plan(p.selected_experts, p.routing_weights, p.seq_len, p.n_used, p.num_experts,
+                    {static_cast<std::size_t>(totals[0]), static_cast<std::size_t>(totals[1]), static_cast<std::size_t>(totals[2])});
+                MoEFFNGraphParams compact = p;
+                compact.num_experts = static_cast<int>(batch.experts.size());
+                compact.selected_experts = batch.ids.data();
+                compact.gate_total_bytes = batch.bytes[0]; compact.up_total_bytes = batch.bytes[1]; compact.down_total_bytes = batch.bytes[2];
+                // Keep the original wide-batch CUDA arithmetic when it fits.
+                // CUDA MUL_MAT_ID requires distinct experts within each row.
+                // Repeated routes retain the qualified bounded CPU arithmetic.
+                // Other backends also keep that CPU implementation.
+                compact.allow_device_stream = p.allow_device_stream && g_backend_type == BACKEND_TYPE_CUDA
+                    && !batch.duplicate_routes && SharedCacheCharge::graph_accounting_attached();
+                compact.file_batch = &batch;
+                std::lock_guard<std::mutex> file_lock(g_moe_file_cpu_mutex);
+                try {
+                    int result;
+                    try { result = moe_ffn_prefill_graph_impl(compact); }
+                    catch (const FileStreamAllocationRefused&) {
+                        // The rejected GPU graph has already unwound. No upload
+                        // or compute was submitted: rebuild entirely on CPU,
+                        // still from registered files under its host quota.
+                        compact.allow_device_stream = false;
+                        result = moe_ffn_prefill_graph_impl(compact);
+                    }
+                    if (!result) { clear_file_stream_gallocr(); g_moe_file_weights.clear(); g_moe_file_work.clear(); }
+                    return result;
+                } catch (...) { clear_file_stream_gallocr(); g_moe_file_weights.clear(); g_moe_file_work.clear(); throw; }
+            }
+        }
         float* const hidden_in = p.hidden_in;
         const int seq_len = p.seq_len;
         const int hidden_dim = p.hidden_dim;
@@ -938,7 +1090,7 @@ namespace
             set_last_error("MoE prefill: invalid shape parameter (must all be > 0).");
             return 0;
         }
-        if (n_used > num_experts)
+        if (n_used > num_experts && !p.file_batch)
         {
             set_last_error("MoE prefill: n_used cannot exceed num_experts.");
             return 0;
@@ -1332,7 +1484,7 @@ namespace
         // over every token in it and computing on the accelerator is several
         // times faster end to end. `stream_experts` picks the second; the branch
         // below (taken before any accelerator binding) is the first.
-        const int stream_threshold = moe_offload_stream_batch_threshold();
+        const int stream_threshold = moe_offload_stream_batch_threshold(p.file_batch != nullptr);
         const bool stream_experts =
             p.run_on_cpu &&
             p.allow_device_stream &&
@@ -1342,6 +1494,7 @@ namespace
 
         if (p.run_on_cpu && !stream_experts)
         {
+            if (p.file_batch) g_moe_file_pipeline.clear();
             MoECpuGraphBinding b;
             b.hidden_t = hidden_t;
             b.hidden_out_t = hidden_out_t;
@@ -1376,7 +1529,7 @@ namespace
         // identical.
         float* const out_buffer_ptr = residual_mode ? residual_in_out : hidden_out;
 
-        if (dev != nullptr && hidden_bytes >= 4096)
+        if (!p.file_batch && dev != nullptr && hidden_bytes >= 4096)
         {
             // cacheable=false: a cached host-ptr buffer cross-pollinates with
             // every other op that touches the same C# Tensor.Storage pointer
@@ -1438,12 +1591,14 @@ namespace
         // whole-model graph, whose tensors are placed in the shared reuse
         // allocator; re-planning that allocator here would move them out from
         // under the nodes still to come. Use the allocator kept for this path.
-        const bool graph_allocated = stream_experts
-            ? alloc_graph_moe_stream_gallocr(graph)
-            : alloc_graph_reuse_gallocr(graph);
+        const bool file_stream = stream_experts && p.file_batch;
+        const auto file_error_epoch = g_ggml_error_count.load(std::memory_order_acquire);
+        const bool graph_allocated = file_stream ? allocate_file_stream_graph(graph)
+            : stream_experts ? alloc_graph_moe_stream_gallocr(graph) : alloc_graph_reuse_gallocr(graph);
         if (!graph_allocated)
         {
-            backend_buffer.value = ggml_backend_alloc_ctx_tensors(ctx, g_backend);
+            if (file_stream) throw FileStreamAllocationRefused{};
+            backend_buffer.value = graph_budget_alloc_ctx_tensors(ctx, g_backend, g_active_rank);
             if (backend_buffer.value == nullptr)
             {
                 set_last_error("MoE prefill: failed to allocate backend buffer for graph tensors.");
@@ -1454,6 +1609,50 @@ namespace
         // race with in-flight zero-copy GPU writes targeting `hidden_in` /
         // `selected_experts` / `routing_weights` from the previous op.
         host_read_barrier();
+        // The only GPU fallback boundary was above, before any transfer or
+        // computation. All later errors propagate after draining this backend.
+        FileStreamDrain file_drain{file_stream ? g_backend : nullptr};
+        bool file_pipeline = false;
+#if defined(TSG_GGML_USE_CUDA)
+        if (file_stream && ggml_backend_is_cuda(g_backend)) {
+            // Explicit scopes isolate a model session from process-static
+            // environment settings. Unscoped callers retain legacy behavior.
+            const auto legacy_enabled = [] {
+                static const bool value = [] {
+                    const char* option = std::getenv("TS_HOST_MOE_FILE_PIPELINE");
+                    if (option && std::strcmp(option, "1") == 0) return true;
+                    if (!option || std::strcmp(option, "0") == 0) return false;
+                    throw std::runtime_error("TS_HOST_MOE_FILE_PIPELINE must be 0 or 1");
+                }();
+                return value;
+            };
+            const bool scoped = g_moe_file_pipeline_config.active();
+            const auto& policy = g_moe_file_pipeline_config.settings();
+            const bool enabled = scoped ? host_moe_file_pipeline_eligible(policy, seq_len,
+                p.file_batch->payload, true, true,
+                g_device_count.load() <= 1 && g_tp_global_degree.load() <= 1, graph_allocated)
+                : legacy_enabled();
+            if (enabled) {
+                // The ring replaces the full layer's CPU arena, never adds a
+                // second retained payload to the host forecast. Trim releases
+                // it with the dedicated file-stream graph at request boundaries.
+                g_moe_file_weights.clear(); g_moe_file_work.clear();
+                file_pipeline = g_moe_file_pipeline.prepare(g_backend, p.file_batch->payload,
+                    scoped ? policy.maximum_ring_bytes : 16u << 20);
+            }
+        }
+#endif
+        if (file_stream && !file_pipeline) {
+            g_moe_file_pipeline.clear();
+            p.file_batch->read(g_moe_file_weights);
+            // Deferred binding only recorded metadata. Replace every expert
+            // upload source with the admitted compact arena, never mmap.
+            for (auto& upload : uploads) {
+                if (upload.tensor == gate_w) upload.host_data = g_moe_file_weights.data() + p.file_batch->offset[0];
+                else if (upload.tensor == up_w) upload.host_data = g_moe_file_weights.data() + p.file_batch->offset[1];
+                else if (upload.tensor == down_w) upload.host_data = g_moe_file_weights.data() + p.file_batch->offset[2];
+            }
+        }
 
         // TS_HOST_MOE_TIMING=1 covers the streamed path too: "how many bytes
         // crossed the bus and how long the graph took" is the whole story of an
@@ -1476,9 +1675,23 @@ namespace
 
         for (const WeightUploadInfo& u : uploads)
         {
+            if (file_pipeline && (u.tensor == gate_w || u.tensor == up_w || u.tensor == down_w)) {
+                streamed_bytes += u.bytes;
+                continue; // Bounded reads and DMA are issued after small inputs.
+            }
             if (!u.needs_upload || u.tensor == nullptr || u.host_data == nullptr || u.bytes == 0)
                 continue;
-            if (stream_experts &&
+            if (file_stream && (u.tensor == gate_w || u.tensor == up_w || u.tensor == down_w)) {
+                // Synchronous copies avoid the global mmap pin registry, whose
+                // ownership cannot follow an arena that grows or is trimmed.
+                const auto errors = g_ggml_error_count.load(std::memory_order_acquire);
+                ggml_backend_tensor_set(u.tensor, u.host_data, 0, u.bytes);
+                if (g_ggml_error_count.load(std::memory_order_acquire) != errors
+                    || g_backend_compute_failed.load(std::memory_order_acquire))
+                    throw std::runtime_error("Host MoE compact expert upload failed");
+                streamed_bytes += u.bytes;
+                file_stream_test_failure(1);
+            } else if (stream_experts &&
                 (u.tensor == gate_w || u.tensor == up_w || u.tensor == down_w))
             {
                 streamed_bytes += stream_expert_weight(
@@ -1546,13 +1759,30 @@ namespace
         }
 
         const auto t_compute = std::chrono::steady_clock::now();
-        ggml_status status = tsg::compute_graph(g_backend, graph);
-        if (status != GGML_STATUS_SUCCESS)
+        if (file_stream && (g_ggml_error_count.load(std::memory_order_acquire) != file_error_epoch
+            || g_backend_compute_failed.load(std::memory_order_acquire)))
+            throw std::runtime_error("Host MoE compact graph setup or input upload failed");
+        ggml_status status = GGML_STATUS_SUCCESS;
+        if (file_pipeline) {
+            g_moe_file_pipeline.run(mapped_read_pool(), *p.file_batch, {gate_w, up_w, down_w},
+                graph, down_proj, seq_len, s_stream_timing, [] {
+#if defined(TSG_GGML_TEST_HOOKS)
+                    if (g_moe_file_read_failure.exchange(0))
+                        throw std::runtime_error("Injected expert file read failure");
+#endif
+                }, [](int stage) { file_stream_test_failure(stage); });
+        } else status = tsg::compute_graph(g_backend, graph);
+        if (status != GGML_STATUS_SUCCESS || (file_stream && g_backend_compute_failed.load(std::memory_order_acquire)))
         {
             set_last_error("MoE prefill: ggml_backend_graph_compute failed.");
             return 0;
         }
-        if (s_stream_timing && stream_experts)
+        if (file_stream && !file_pipeline) file_stream_test_failure(2);
+        if (file_pipeline) {
+            ++g_moe_file_pipeline_calls;
+            g_moe_file_pipeline_source_bytes += p.file_batch->payload;
+        }
+        if (s_stream_timing && stream_experts && !file_pipeline)
         {
             const auto t_end = std::chrono::steady_clock::now();
             static thread_local double acc_up = 0.0, acc_gpu = 0.0, acc_mb = 0.0;
@@ -1579,7 +1809,14 @@ namespace
         // out_buffer_ptr is hidden_out (standalone) or residual_in_out
         // (residual mode); the kernel wrote into the same backend tensor
         // (hidden_out_t) in both cases so the finalize path is identical.
-        if (hidden_out_zero_copy)
+        if (file_stream) {
+            file_drain.finish();
+            const auto errors = g_ggml_error_count.load(std::memory_order_acquire);
+            ggml_backend_tensor_get(hidden_out_t, out_buffer_ptr, 0, hidden_bytes);
+            if (g_ggml_error_count.load(std::memory_order_acquire) != errors
+                || g_backend_compute_failed.load(std::memory_order_acquire))
+                throw std::runtime_error("Host MoE compact output download failed");
+        } else if (hidden_out_zero_copy)
         {
             finalize_compute(true, hidden_out_t, out_buffer_ptr, hidden_bytes);
         }
@@ -1742,10 +1979,142 @@ namespace
 
 namespace tsg
 {
+    // Called only at a quiescent session boundary while the shared host budget
+    // remains installed. No ring is allocated until an eligible file prefill.
+    // Version 2 qualifies the bounded parallel intra-slot reader. Version 1
+    // sequential readers must not be silently promoted by newer managed code.
+    TSG_EXPORT int TSGgml_HostMoeFilePipelineVersion() { return 2; }
+
+    TSG_EXPORT int TSGgml_BeginHostMoeFilePipelineScope(int enabled, int minimum_rows,
+        std::int64_t minimum_payload_bytes, std::int64_t maximum_ring_bytes, std::uint64_t* token) {
+        if (token) *token = 0;
+        try {
+            clear_last_error();
+            if (!token || (enabled != 0 && enabled != 1) || minimum_payload_bytes <= 0 || maximum_ring_bytes <= 0
+                || static_cast<std::uint64_t>(minimum_payload_bytes) > (std::numeric_limits<std::size_t>::max)()
+                || static_cast<std::uint64_t>(maximum_ring_bytes) > (std::numeric_limits<std::size_t>::max)())
+                throw std::invalid_argument("Invalid host MoE pipeline scope configuration");
+            std::lock_guard<std::mutex> lock(g_moe_file_cpu_mutex);
+            *token = g_moe_file_pipeline_config.begin({enabled != 0, minimum_rows,
+                static_cast<std::size_t>(minimum_payload_bytes), static_cast<std::size_t>(maximum_ring_bytes)}, [] {
+                const auto epoch = g_ggml_error_count.load(std::memory_order_acquire);
+                g_moe_file_pipeline.clear();
+                if (g_ggml_error_count.load(std::memory_order_acquire) != epoch)
+                    throw std::runtime_error("Host MoE pipeline scope drain failed");
+            });
+            if (!*token) throw std::invalid_argument("Host MoE pipeline scope requires valid thresholds and no active scope");
+            return 1;
+        } catch (const std::exception& e) { try { set_last_error(e.what()); } catch (...) {} return 0; }
+        catch (...) { try { set_last_error("Host MoE pipeline scope creation failed"); } catch (...) {} return 0; }
+    }
+    TSG_EXPORT int TSGgml_EndHostMoeFilePipelineScope(std::uint64_t token) {
+        try {
+            clear_last_error();
+            std::lock_guard<std::mutex> lock(g_moe_file_cpu_mutex);
+            if (!g_moe_file_pipeline_config.end(token, [] {
+                const auto epoch = g_ggml_error_count.load(std::memory_order_acquire);
+                g_moe_file_pipeline.clear();
+                if (g_ggml_error_count.load(std::memory_order_acquire) != epoch)
+                    throw std::runtime_error("Host MoE pipeline scope drain failed");
+            })) throw std::invalid_argument("Host MoE pipeline disposal requires its active scope token");
+            return 1;
+        } catch (const std::exception& e) { try { set_last_error(e.what()); } catch (...) {} return 0; }
+        catch (...) { try { set_last_error("Host MoE pipeline scope disposal failed"); } catch (...) {} return 0; }
+    }
+    TSG_EXPORT int TSGgml_HostMoeFilePipelineStats(std::int64_t* calls,
+        std::int64_t* source_bytes, std::int64_t* retained_ring_bytes) {
+        if (!calls || !source_bytes || !retained_ring_bytes) return 0;
+        std::lock_guard<std::mutex> lock(g_moe_file_cpu_mutex);
+        *calls = static_cast<std::int64_t>(g_moe_file_pipeline_calls);
+        *source_bytes = static_cast<std::int64_t>(g_moe_file_pipeline_source_bytes);
+        *retained_ring_bytes = static_cast<std::int64_t>(g_moe_file_pipeline.retained_bytes());
+        return 1;
+    }
+    void host_moe_cpu_staging_release() {
+        std::lock_guard<std::mutex> lock(g_moe_file_cpu_mutex);
+        clear_file_stream_gallocr();
+        g_moe_file_work.clear(); g_moe_file_weights.clear();
+    }
+    void read_expert_files(std::vector<ExpertReadTask>& tasks,
+        const std::function<void(std::size_t)>& consume)
+    {
+        mapped_read_pool().run_pipelined(tasks.size(), [&](std::size_t i) {
+#if defined(TSG_GGML_TEST_HOOKS)
+            if (g_moe_file_read_failure.exchange(0))
+                throw std::runtime_error("Injected expert file read failure");
+#endif
+            tasks[i].prepare();
+        }, consume);
+    }
+
     void prefetch_mapped_ranges(const std::uint8_t* base,
         const std::vector<std::pair<std::size_t, std::size_t>>& ranges)
     {
-        prefetch_mapped_ranges_impl(base, ranges);
+        std::vector<std::pair<const std::uint8_t*, std::size_t>> buffers;
+        buffers.reserve(ranges.size());
+        for (const auto& range : ranges) buffers.emplace_back(base + range.first, range.second);
+        prefetch_mapped_buffers_impl(buffers);
+    }
+
+    void prefetch_mapped_buffers(
+        const std::vector<std::pair<const std::uint8_t*, std::size_t>>& buffers)
+    {
+        prefetch_mapped_buffers_impl(buffers);
+    }
+
+    void upload_prefetched_mapped_buffer(const std::uint8_t* source, std::size_t bytes,
+        const std::function<void(std::size_t, std::size_t)>& upload)
+    {
+        if (!bytes) return;
+        if (!source) throw std::invalid_argument("Missing mapped upload source");
+        constexpr std::size_t chunk = std::size_t(4) << 20;
+        auto& pool = mapped_read_pool();
+        const std::size_t window = chunk * pool.threads();
+        if (vram_log_enabled())
+            std::fprintf(stderr, "[cache-upload] rank=%d bytes=%zu read_threads=%u window_bytes=%zu\n",
+                g_active_rank, bytes, pool.threads(), window);
+        std::atomic<std::uint64_t> sink{0};
+        for (std::size_t begin = 0; begin < bytes;)
+        {
+            const auto length = std::min(window, bytes - begin);
+            const auto count = (length + chunk - 1) / chunk;
+            pool.run_pipelined(count, [&](std::size_t task) {
+                const auto offset = begin + task * chunk;
+                const auto size = std::min(chunk, bytes - offset);
+                const volatile std::uint8_t* p = source + offset;
+                std::uint64_t sum = 0;
+                for (std::size_t i = 0; i < size; i += 4096) sum += p[i];
+                sum += p[size - 1];
+                sink.fetch_add(sum, std::memory_order_relaxed);
+            }, [&](std::size_t task) {
+                const auto offset = begin + task * chunk;
+                upload(offset, std::min(chunk, bytes - offset));
+            });
+            begin += length;
+        }
+    }
+
+    std::chrono::steady_clock::duration prefetch_mapped_experts(
+        const std::vector<MoePrefetchExpert>& experts,
+        const std::function<void(std::size_t, std::size_t)>& consume)
+    {
+        using Clock = std::chrono::steady_clock;
+        if (experts.empty()) return Clock::duration::zero();
+        const auto count = experts.size() * 3;
+        std::atomic<std::size_t> remaining{count};
+        std::atomic<std::uint64_t> sink{0};
+        const auto started = Clock::now();
+        auto reads_completed = started;
+        mapped_read_pool().run_pipelined(count, [&](std::size_t task) {
+            std::uint64_t sum = 0;
+            const auto& buffer = experts[task / 3][task % 3];
+            const volatile std::uint8_t* p = buffer.first;
+            for (std::size_t k = 0; k < buffer.second; k += 4096) sum += p[k];
+            if (buffer.second != 0) sum += p[buffer.second - 1];
+            sink.fetch_add(sum, std::memory_order_relaxed);
+            if (remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) reads_completed = Clock::now();
+        }, [&](std::size_t task) { consume(task / 3, task % 3); });
+        return reads_completed - started;
     }
 
     // Host-side routed-expert FFN, shared by the standalone MoE op (when the
@@ -1932,8 +2301,44 @@ namespace tsg
         return true;
     }
 
+    // Preserve the dedicated scalar/independent-row CPU arithmetic when the
+    // device cache declines. Stage only its source pointers; scratch is owned
+    // separately by the bounded entry point and returned after the team joins.
+    int host_moe_file_decode(const HostMoeSegment& hm, const float* x, const std::int32_t* ids,
+        const float* routes, float* out)
+    {
+        if ((hm.seq_len != 1 && !hm.independent_decode_rows) || hm.activation != 0 || !hm.up_data
+            || hm.gate_bias || hm.up_bias || hm.down_bias || g_device_count.load() > 1 || g_tp_global_degree.load() > 1) return 0;
+        HostMoeFileBatch batch;
+        const void* pointers[] = {hm.gate_data, hm.up_data, hm.down_data};
+        const std::int64_t totals[] = {hm.gate_bytes, hm.up_bytes, hm.down_bytes};
+        const int registered = host_moe_file_batch_sources(pointers, totals, batch.sources);
+        if (!registered) return 0;
+        std::lock_guard<std::mutex> file_lock(g_moe_file_cpu_mutex);
+        try {
+            if (registered < 0) throw std::runtime_error("Host MoE decode file sources are incomplete");
+            batch.plan(ids, routes, hm.seq_len, hm.n_used, hm.num_experts,
+                {std::size_t(totals[0]),std::size_t(totals[1]),std::size_t(totals[2])});
+            batch.read(g_moe_file_weights);
+            HostMoeSegment compact = hm;
+            compact.num_experts = static_cast<int>(batch.experts.size());
+            compact.gate_data = g_moe_file_weights.data() + batch.offset[0]; compact.gate_bytes = batch.bytes[0];
+            compact.up_data = g_moe_file_weights.data() + batch.offset[1]; compact.up_bytes = batch.bytes[1];
+            compact.down_data = g_moe_file_weights.data() + batch.offset[2]; compact.down_bytes = batch.bytes[2];
+            if (host_moe_decode_experts_rows_bounded(compact, x, batch.ids.data(), routes, out)) return 1;
+            // Keep the original row-by-row fallback for wider independent sets.
+            compact.seq_len = 1;
+            for (int row = 0; row < hm.seq_len; ++row)
+                if (!host_moe_decode_experts_rows_bounded(compact, x + std::size_t(row) * hm.hidden,
+                    batch.ids.data() + std::size_t(row) * hm.n_used, routes + std::size_t(row) * hm.n_used,
+                    out + std::size_t(row) * hm.hidden)) return 2;
+            return 1;
+        } catch (...) { g_moe_file_weights.clear(); g_moe_file_work.clear(); throw; }
+    }
+
     bool host_moe_compute_segment(const HostMoeSegment& hm, std::vector<float>& out, const char* kernel_name,
-                                  HostMoeStagedInputs* staged, bool allow_device_stream, bool* output_on_device)
+                                  HostMoeStagedInputs* staged, bool allow_device_stream, bool* output_on_device,
+                                  ggml_backend_t explicit_backend)
     {
         if (output_on_device != nullptr) *output_on_device = false;
         if (hm.moe_in == nullptr || hm.sel_ids == nullptr ||
@@ -1976,7 +2381,7 @@ namespace tsg
             if (output_on_device != nullptr && s_cache_device_outputs)
             {
                 const int cached = host_moe_cached_experts(hm, nullptr, s_ids.data(),
-                    nullptr, nullptr, kernel_name);
+                    nullptr, nullptr, kernel_name, explicit_backend);
                 if (cached != 0)
                 {
                     *output_on_device = cached > 0;
@@ -1984,7 +2389,7 @@ namespace tsg
                 }
             }
             const int cached = host_moe_cached_experts(hm, nullptr, s_ids.data(),
-                nullptr, out.data(), kernel_name);
+                nullptr, out.data(), kernel_name, explicit_backend);
             if (cached != 0) return cached > 0;
         }
         ggml_backend_tensor_get(hm.moe_in, s_moe_in.data(), 0, act_count * sizeof(float));
@@ -1998,12 +2403,14 @@ namespace tsg
         }
 
         const int cached = allow_device_stream ? host_moe_cached_experts(hm, s_moe_in.data(), s_ids.data(),
-            s_weights.data(), out.data(), kernel_name) : 0;
+            s_weights.data(), out.data(), kernel_name, explicit_backend) : 0;
         if (cached != 0)
             return cached > 0;
-        if (host_moe_decode_experts(hm, s_moe_in.data(), s_ids.data(), s_weights.data(), out.data()))
+        const int file_decode = host_moe_file_decode(hm, s_moe_in.data(), s_ids.data(), s_weights.data(), out.data());
+        if (file_decode == 1) return true;
+        if (file_decode == 0 && host_moe_decode_experts(hm, s_moe_in.data(), s_ids.data(), s_weights.data(), out.data()))
             return true;
-        if (hm.independent_decode_rows && hm.seq_len > 1)
+        if (file_decode == 0 && hm.independent_decode_rows && hm.seq_len > 1)
         {
             if (host_moe_decode_experts_rows(hm, s_moe_in.data(), s_ids.data(), s_weights.data(), out.data()))
                 return true;
@@ -2030,7 +2437,7 @@ namespace tsg
             hm.down_data, hm.down_type, hm.down_ne0, hm.down_ne1, hm.down_bytes,
             hm.gate_bias, hm.up_bias, hm.down_bias,
             hm.activation, hm.oai_alpha, hm.oai_limit,
-            allow_device_stream);
+            allow_device_stream && explicit_backend == nullptr);
         // A batch that took the device stream publishes its result through
         // finalize_compute_with_download, which on Metal with async compute only
         // QUEUES a blit into `out`. The seam reads `out` as soon as this returns
@@ -2047,6 +2454,56 @@ namespace tsg
         const std::size_t act_count = static_cast<std::size_t>(hm.hidden) * static_cast<std::size_t>(hm.seq_len);
         ggml_backend_tensor_set(hm.moe_out, data, 0, act_count * sizeof(float));
     }
+
+#if defined(TSG_GGML_TEST_HOOKS)
+    TSG_EXPORT void TSGgml_TestHostMoeFileReadFailNext() { g_moe_file_read_failure.store(1); }
+    TSG_EXPORT void TSGgml_TestHostMoeFileStreamFailNext(int stage) { g_moe_file_stream_failure.store(stage); }
+    TSG_EXPORT std::uint64_t TSGgml_TestHostMoeFileStreamDrains() { return g_moe_file_stream_drains.load(); }
+    TSG_EXPORT int TSGgml_TestHostMoeFileCpuGraph(float* input, float* output, int rows, int hidden, int ff,
+        int experts, int used, const std::int32_t* ids, const float* routes,
+        void* gate, int gate_type, std::int64_t gate_bytes,
+        void* up, int up_type, std::int64_t up_bytes, void* down, int down_type, std::int64_t down_bytes)
+    {
+        try {
+            return moe_ffn_host_experts(input, output, rows, hidden, ff, experts, used, ids, routes,
+                gate, gate_type, hidden, ff, gate_bytes, up, up_type, hidden, ff, up_bytes,
+                down, down_type, ff, hidden, down_bytes, nullptr, nullptr, nullptr,
+                MOE_ACT_SWIGLU_SPLIT, 1.702f, 7.f, false) ? 1 : 0;
+        } catch (const std::exception& e) { try { set_last_error(e.what()); } catch (...) {} return 0; }
+        catch (...) { return 0; }
+    }
+    TSG_EXPORT int TSGgml_TestHostMoeFileSegment(float* input, float* output, int rows, int hidden, int ff,
+        int experts, int used, const std::int32_t* ids, const float* routes,
+        void* gate, int gate_type, std::int64_t gate_bytes,
+        void* up, int up_type, std::int64_t up_bytes, void* down, int down_type, std::int64_t down_bytes)
+    {
+        try {
+            std::unique_ptr<ggml_context, decltype(&ggml_free)> context(
+                ggml_init({1024 * 1024, nullptr, true}), ggml_free);
+            if (!context) return 0;
+            HostMoeSegment hm;
+            hm.hidden = hidden; hm.n_ff = ff; hm.seq_len = rows; hm.num_experts = experts; hm.n_used = used;
+            hm.independent_decode_rows = rows > 1;
+            hm.gate_data = gate; hm.gate_type = gate_type; hm.gate_bytes = gate_bytes; hm.gate_ne0 = hidden; hm.gate_ne1 = ff;
+            hm.up_data = up; hm.up_type = up_type; hm.up_bytes = up_bytes; hm.up_ne0 = hidden; hm.up_ne1 = ff;
+            hm.down_data = down; hm.down_type = down_type; hm.down_bytes = down_bytes; hm.down_ne0 = ff; hm.down_ne1 = hidden;
+            hm.moe_in = ggml_new_tensor_2d(context.get(), GGML_TYPE_F32, hidden, rows);
+            hm.moe_out = ggml_new_tensor_2d(context.get(), GGML_TYPE_F32, hidden, rows);
+            hm.sel_ids = ggml_new_tensor_2d(context.get(), GGML_TYPE_I32, used, rows);
+            hm.weights = ggml_new_tensor_2d(context.get(), GGML_TYPE_F32, used, rows);
+            BufferHandle buffer(ggml_backend_alloc_ctx_tensors_from_buft(context.get(), ggml_backend_cpu_buffer_type()));
+            if (!buffer.value) return 0;
+            ggml_backend_tensor_set(hm.moe_in, input, 0, std::size_t(rows) * hidden * sizeof(float));
+            ggml_backend_tensor_set(hm.sel_ids, ids, 0, std::size_t(rows) * used * sizeof(std::int32_t));
+            ggml_backend_tensor_set(hm.weights, routes, 0, std::size_t(rows) * used * sizeof(float));
+            std::vector<float> result;
+            if (!host_moe_compute_segment(hm, result, "qwen4exp fused token span", nullptr, false, nullptr)) return 0;
+            std::memcpy(output, result.data(), result.size() * sizeof(float));
+            return 1;
+        } catch (const std::exception& e) { try { set_last_error(e.what()); } catch (...) {} return 0; }
+        catch (...) { return 0; }
+    }
+#endif
 
     void host_moe_zero_segment(const HostMoeSegment& hm)
     {

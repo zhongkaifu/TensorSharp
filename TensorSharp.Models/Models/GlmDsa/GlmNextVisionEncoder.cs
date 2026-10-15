@@ -63,14 +63,37 @@ namespace TensorSharp.Models
         public int ProjectionDim => _projectionDim;
         public int PatchSize => _patchSize;
         public int SpatialMergeSize => _spatialMergeSize;
+        internal bool RequireWholeEncoderFused { get; set; }
+
+        /// <summary>Only host weight allocations still needed by the admitted
+        /// whole encoder path. Originals, combined patch and merger linear
+        /// already exist and own budget credit from construction.</summary>
+        internal long UnifiedHostWeightGrowthBound()
+        {
+            if (!RequireWholeEncoderFused) throw new InvalidOperationException("Unified host weight forecast requires the whole encoder path.");
+            string patch = _weights.ContainsKey("v.patch_embd.combined") ? "v.patch_embd.combined" : "v.patch_embd.weight";
+            long pending = 0;
+            void IncludeMissing(string name, string key)
+            {
+                if (_transposedWeights.ContainsKey(key)) return;
+                if (!_weights.TryGetValue(name, out var tensor)) throw new InvalidOperationException("Missing GLM vision weight: " + name);
+                pending = checked(pending + tensor.ElementCount() * sizeof(float) + (64L << 10));
+            }
+            IncludeMissing(patch, patch + ".2d.T");
+            foreach (string name in new[] { "mm.patch_merger.linear", "mm.model.fc.weight", "mm.gate.weight", "mm.up.weight", "mm.down.weight" })
+                IncludeMissing(name, name);
+            return pending;
+        }
 
         public GlmNextVisionEncoder(string mmProjPath, IAllocator allocator)
         {
             _allocator = allocator;
-            var gguf = new GgufFile(mmProjPath);
+            using var gguf = new GgufFile(mmProjPath);
+            try
+            {
 
             string projector = gguf.GetString("clip.projector_type") ?? "";
-            if (projector != "glm5next")
+            if (!GlmDsaArchitecture.IsGlm5Next(projector) && projector != "glm5v")
                 Console.WriteLine($"Warning: mmproj projector_type is '{projector}', expected 'glm5next'.");
 
             _patchSize = (int)gguf.GetUint32("clip.vision.patch_size", 14);
@@ -96,7 +119,13 @@ namespace TensorSharp.Models
             LoadWeights(gguf);
             CombinePatchEmbedWeights();
             BuildMergerLinearWeight();
-            gguf.Dispose();
+            }
+            catch (Exception creation)
+            {
+                try { Dispose(); }
+                catch (Exception cleanup) { throw new GlmVisionConstructionCleanupException(this, creation, cleanup); }
+                throw;
+            }
         }
 
         private void LoadWeights(GgufFile gguf)
@@ -121,8 +150,8 @@ namespace TensorSharp.Models
                     tsShape[i] = (long)info.Shape[info.Shape.Length - 1 - i];
 
                 var tensor = new Tensor(_allocator, DType.Float32, tsShape);
-                tensor.SetElementsAsFloat(f32);
-                _weights[info.Name] = tensor;
+                try { tensor.SetElementsAsFloat(f32); _weights.Add(info.Name, tensor); }
+                catch { tensor.Dispose(); throw; }
                 count++;
             }
             Console.WriteLine($" done ({count} tensors)");
@@ -204,6 +233,11 @@ namespace TensorSharp.Models
                 rope.CosTable, rope.SinTable);
             if (!fused)
             {
+                if (RequireWholeEncoderFused)
+                {
+                    hidden.Dispose();
+                    throw new InvalidOperationException("GLM unified vision requires the admitted whole encoder graph; the backend declined it.");
+                }
                 for (int i = 0; i < _blockCount; i++)
                 {
                     Console.Write($"\r  GLM vision block {i + 1}/{_blockCount}...");
@@ -399,14 +433,17 @@ namespace TensorSharp.Models
                     numPatches, _numHeads, headDim, halfDim, cosTable, sinTable,
                     ln1W, qkvW, qkvB, qnW, knW, outW, outB, ln2W,
                     gateW, gateB, upW, upB, downW, downB);
-                if (!ok)
+                if (!ok && !RequireWholeEncoderFused)
                     _fusedEncoderUnavailable = true;
                 return ok;
             }
             catch (Exception ex)
             {
-                Console.WriteLine($"GLM fused vision encoder unavailable ({ex.Message}); using the per-block path.");
-                _fusedEncoderUnavailable = true;
+                Console.WriteLine(RequireWholeEncoderFused
+                    ? $"GLM unified whole encoder call failed ({ex.Message})."
+                    : $"GLM fused vision encoder unavailable ({ex.Message}); using the per-block path.");
+                // A shared-budget refusal can be retried after pressure clears.
+                if (!RequireWholeEncoderFused) _fusedEncoderUnavailable = true;
                 return false;
             }
         }

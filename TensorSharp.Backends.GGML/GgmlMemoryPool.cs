@@ -11,6 +11,8 @@ using System;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Threading;
+using System.IO;
+using TensorSharp.Memory;
 
 namespace TensorSharp.GGML
 {
@@ -42,6 +44,8 @@ namespace TensorSharp.GGML
 
         private readonly object _lock = new object();
         private readonly List<PoolBlock> _available = new List<PoolBlock>();
+        private readonly List<PoolBlock> _pendingRelease = new List<PoolBlock>();
+        private readonly Func<IntPtr, nuint, bool> _freeVirtual;
         // True size and allocation provenance of every block currently handed
         // out. The best-fit search below can serve a request from a LARGER
         // pooled block, so the byteLength the caller passes back to Free() is a
@@ -58,8 +62,9 @@ namespace TensorSharp.GGML
         private readonly int _maxPooledBlocks;
         private readonly nuint _maxRetainedBlockSize;
 
-        public GgmlMemoryPool(GgmlBackendType backendType)
+        public GgmlMemoryPool(GgmlBackendType backendType, Func<IntPtr, nuint, bool> freeVirtual = null)
         {
+            _freeVirtual = freeVirtual ?? FreeVirtual;
             int systemPageSize = Environment.SystemPageSize;
             _pageSize = IsAppleOS()
                 ? Math.Max(MetalPageSize, systemPageSize)
@@ -84,7 +89,8 @@ namespace TensorSharp.GGML
 
         public IntPtr Allocate(long byteLength)
         {
-            nuint size = (nuint)byteLength;
+            ArgumentOutOfRangeException.ThrowIfNegative(byteLength);
+            nuint size = checked((nuint)byteLength);
             nuint alignedSize = AlignSize(size);
 
             lock (_lock)
@@ -110,6 +116,14 @@ namespace TensorSharp.GGML
                 if (bestIdx >= 0)
                 {
                     PoolBlock block = _available[bestIdx];
+                    // Pools predating an opt-in scope must acquire credit before
+                    // their retained allocation can serve budgeted execution.
+                    if (block.Credit == null)
+                    {
+                        var credit = HostAllocationBudgetScope.Reserve(checked((long)block.Size));
+                        credit?.Commit();
+                        block = new PoolBlock(block.Ptr, block.Size, block.IsVirtual, credit);
+                    }
                     _available.RemoveAt(bestIdx);
                     _outstanding[block.Ptr] = block;
                     return block.Ptr;
@@ -133,11 +147,9 @@ namespace TensorSharp.GGML
             {
                 if (!_outstanding.Remove(ptr, out block))
                 {
-                    // Unknown pointer: not handed out by this pool. Freeing it
-                    // with a guessed size/allocator can only corrupt the heap,
-                    // so treat it as a virtual mapping of the caller-claimed
-                    // size and let FreeToSystem leak it if munmap declines.
-                    block = new PoolBlock(ptr, AlignSize((nuint)byteLength), _useVirtualAlloc);
+                    // In particular, a second free must not insert the same
+                    // address twice and hand it to two live tensors.
+                    throw new InvalidOperationException("Pointer is not an outstanding allocation of this GGML pool.");
                 }
 
                 if (!_closed && _maxPooledBlocks > 0 && block.Size <= _maxRetainedBlockSize &&
@@ -148,7 +160,12 @@ namespace TensorSharp.GGML
                 }
             }
 
-            FreeToSystem(block);
+            if (!FreeToSystem(block))
+            {
+                // Ownership has returned to the pool. Keep failed frees out of
+                // the reusable list; Trim retries them without losing credit.
+                lock (_lock) _pendingRelease.Add(block);
+            }
         }
 
         private bool _closed;
@@ -186,58 +203,82 @@ namespace TensorSharp.GGML
             List<PoolBlock> release;
             lock (_lock)
             {
-                if (_available.Count == 0)
+                if (_available.Count == 0 && _pendingRelease.Count == 0)
                     return 0;
                 release = new List<PoolBlock>(_available);
+                release.AddRange(_pendingRelease);
                 _available.Clear();
+                _pendingRelease.Clear();
             }
             long bytes = 0;
+            bool failed = false;
             foreach (PoolBlock block in release)
             {
-                bytes += (long)block.Size;
-                FreeToSystem(block);
+                if (FreeToSystem(block)) bytes = checked(bytes + (long)block.Size);
+                else
+                {
+                    lock (_lock) _pendingRelease.Add(block);
+                    failed = true;
+                }
             }
+            if (failed) throw new IOException("The OS refused to release a GGML host mapping; retry trimming after resolving the failure.");
             return bytes;
         }
 
         private nuint AlignSize(nuint size)
         {
             if (size == 0) return (nuint)_pageSize;
-            return ((size + (nuint)(_pageSize - 1)) / (nuint)_pageSize) * (nuint)_pageSize;
+            return checked(((size + (nuint)(_pageSize - 1)) / (nuint)_pageSize) * (nuint)_pageSize);
         }
 
         private PoolBlock AllocateNew(nuint alignedSize)
         {
-            if (_useVirtualAlloc)
+            var credit = HostAllocationBudgetScope.Reserve(checked((long)alignedSize));
+            try
             {
-                IntPtr ptr = AllocateVirtual(alignedSize);
-                if (ptr != IntPtr.Zero)
-                    return new PoolBlock(ptr, alignedSize, isVirtual: true);
+                bool isVirtual = _useVirtualAlloc;
+                IntPtr ptr = isVirtual ? AllocateVirtual(alignedSize) : IntPtr.Zero;
+                if (ptr == IntPtr.Zero)
+                {
+                    ptr = Marshal.AllocHGlobal(checked((nint)alignedSize));
+                    isVirtual = false;
+                }
+                credit?.Commit();
+                return new PoolBlock(ptr, alignedSize, isVirtual, credit);
             }
-
-            return new PoolBlock(Marshal.AllocHGlobal((nint)alignedSize), alignedSize, isVirtual: false);
+            catch { credit?.Dispose(); throw; }
         }
 
-        private static void FreeToSystem(in PoolBlock block)
+        private bool FreeToSystem(in PoolBlock block)
         {
             if (block.IsVirtual)
             {
                 // If munmap/VirtualFree fails (e.g. vm.max_map_count exhausted),
                 // leaking the mapping is the only safe outcome — this pointer
                 // did not come from the C heap, so it must NEVER reach free().
-                FreeVirtual(block.Ptr, block.Size);
-                return;
+                if (!_freeVirtual(block.Ptr, block.Size)) return false;
             }
-
-            Marshal.FreeHGlobal(block.Ptr);
+            else Marshal.FreeHGlobal(block.Ptr);
+            block.Credit?.Dispose();
+            return true;
         }
 
         internal void EnsureInitialBlocks()
         {
             lock (_lock)
             {
-                while (_available.Count < _initialBlockCount)
-                    _available.Add(AllocateNew((nuint)BlockSize));
+                try
+                {
+                    while (_available.Count < _initialBlockCount)
+                        _available.Add(AllocateNew((nuint)BlockSize));
+                }
+                catch
+                {
+                    // A rejected constructor has no caller to trim the partially
+                    // initialized pool. Roll back its already allocated blocks.
+                    Trim();
+                    throw;
+                }
             }
         }
 
@@ -246,12 +287,14 @@ namespace TensorSharp.GGML
             public readonly IntPtr Ptr;
             public readonly nuint Size;
             public readonly bool IsVirtual;
+            public readonly HostAllocationBudgetScope.Allocation Credit;
 
-            public PoolBlock(IntPtr ptr, nuint size, bool isVirtual)
+            public PoolBlock(IntPtr ptr, nuint size, bool isVirtual, HostAllocationBudgetScope.Allocation credit = null)
             {
                 Ptr = ptr;
                 Size = size;
                 IsVirtual = isVirtual;
+                Credit = credit;
             }
         }
 

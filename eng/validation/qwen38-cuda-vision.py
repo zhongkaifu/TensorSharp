@@ -18,6 +18,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import sys
 import threading
 import time
 
@@ -60,6 +61,17 @@ def file_identity(path, hash_content=True):
     if hash_content:
         result["sha256"] = sha256(path)
     return result
+
+
+def cli_launcher(path, dotnet="dotnet"):
+    """Accept both published apphosts and framework-dependent Windows/Linux DLLs."""
+    return [dotnet, str(path)] if path.suffix.lower() == ".dll" else [str(path)]
+
+
+def native_library_path(directory, platform_name=None):
+    platform_name = sys.platform if platform_name is None else platform_name
+    name = "GgmlOps.dll" if platform_name == "win32" else "libGgmlOps.dylib" if platform_name == "darwin" else "libGgmlOps.so"
+    return directory / name
 
 
 def interactive_result(log, expected_text):
@@ -154,6 +166,7 @@ def main():
     for name in ("cli", "model", "mmproj", "image", "report-dir"):
         parser.add_argument("--" + name, type=Path, required=True)
     parser.add_argument("--mode", choices=("interactive", "ocr"), default="interactive")
+    parser.add_argument("--dotnet", default="dotnet", help="Runtime executable when --cli is a .dll")
     parser.add_argument("--tp", type=int, default=2)
     parser.add_argument("--max-tokens", type=int, default=20000)
     parser.add_argument("--ocr-max-tokens", type=int, default=256)
@@ -177,7 +190,7 @@ def main():
     report_path = args.report_dir / "report.json"
     if report_path.exists():
         parser.error("Use a fresh --report-dir to preserve previous evidence")
-    command = [str(args.cli), "--backend", "ggml_cuda", "--model", str(args.model), "--mmproj", str(args.mmproj),
+    command = cli_launcher(args.cli, args.dotnet) + ["--backend", "ggml_cuda", "--model", str(args.model), "--mmproj", str(args.mmproj),
                "--tp", str(args.tp), "--log-dir", str(args.report_dir / "logs")]
     if args.mode == "interactive":
         command += ["--interactive", "--think", "--max-tokens", str(args.max_tokens)]
@@ -188,19 +201,20 @@ def main():
                                         "images": [str(args.image)], "temperature": 0, "max_tokens": args.ocr_max_tokens}) + "\n")
         command += ["--input-jsonl", str(requests), "--output", str(args.report_dir / "answers.jsonl")]
         standard_input = ""
-    (args.report_dir / "stdin.txt").write_text(standard_input)
+    (args.report_dir / "stdin.txt").write_text(standard_input, encoding="utf-8")
     shards = sorted(args.model.parent.glob(re.sub(r"-\d{5}-of-\d{5}\.gguf$", "-*-of-*.gguf", args.model.name)))
     report = {"mode": args.mode, "command": command, "cwd": str(args.cli.parent), "run_complete": False,
               "started_utc": datetime.now(timezone.utc).isoformat(), "source": git_identity(ROOT),
               "ggml": git_identity(args.ggml_dir), "cli": file_identity(args.cli), "image": file_identity(args.image),
               "projector": file_identity(args.mmproj), "model_shards": [file_identity(path, False) for path in shards],
               "harness_sha256": sha256(Path(__file__)), "environment": {key: value for key, value in os.environ.items()
-                 if key.startswith(("TS_Q4E_", "TS_TP_", "TS_GGML_", "TS_SCHED_", "GGML_"))
-                 or key in ("CUDA_VISIBLE_DEVICES", "NVIDIA_TF32_OVERRIDE", "TS_N_CPU_MOE", "TS_CPU_MOE")},
+                 if key.startswith(("TS_Q4E_", "TS_TP_", "TS_GGML_", "TS_SCHED_", "TS_HOST_MOE_", "GGML_"))
+                 or key in ("CUDA_VISIBLE_DEVICES", "NVIDIA_TF32_OVERRIDE", "TS_N_CPU_MOE", "TS_CPU_MOE", "MAX_CONTEXT")},
               "scope": "Original thinking banner turn, retained image follow-up, or greedy OCR in a separate invocation. No broad visual-quality or comparative performance claim.",
               "limitations": ["Model shards are identified by path, size and mtime, not content hash.", "Interactive sampling uses CLI defaults and is not deterministic.", "Wall time includes model loading; turn prefill/decode times are reported by the CLI."]}
-    library = args.cli.parent / "libGgmlOps.so"
+    library = native_library_path(args.cli.parent)
     report["native_library"] = file_identity(library.resolve()) if library.is_file() else None
+    report["native_library_scope"] = "Platform-native deployment file beside the CLI; not a process-module observation."
     report["managed_binaries"] = [file_identity(path) for path in (
         args.cli.parent / "TensorSharp.Cli.dll", args.cli.parent / "TensorSharp.Models.dll",
         args.cli.parent / "TensorSharp.Backends.GGML.dll", args.cli.parent / "TensorSharp.Runtime.dll") if path.is_file()]
@@ -210,9 +224,10 @@ def main():
     sampler.thread.start()
     started = time.monotonic()
     try:
-        with (args.report_dir / "cli.log").open("w") as log:
+        with (args.report_dir / "cli.log").open("w", encoding="utf-8") as log:
             process = subprocess.Popen(command, cwd=args.cli.parent, stdin=subprocess.PIPE, stdout=log,
-                                       stderr=subprocess.STDOUT, text=True)
+                                       stderr=subprocess.STDOUT, text=True, encoding="utf-8",
+                                       creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0)
             try:
                 process.communicate(standard_input, timeout=args.timeout)
                 report["timed_out"] = False
@@ -228,7 +243,7 @@ def main():
         sampler.stop.set()
         sampler.thread.join()
         sampler.sample()
-    log_text = (args.report_dir / "cli.log").read_text(errors="replace")
+    log_text = (args.report_dir / "cli.log").read_text(encoding="utf-8", errors="replace")
     report["validation"] = interactive_result(log_text, args.expected_text) if args.mode == "interactive" else ocr_result(
         args.report_dir / "answers.jsonl", args.expected_text, args.ocr_max_tokens)
     report["error_markers"] = ERROR.findall(log_text)
@@ -238,7 +253,7 @@ def main():
     report["passed"] = (report["returncode"] == 0 and not report["timed_out"] and not report["error_markers"]
                         and report["validation"]["passed"] and report["ggml"]["clean"] and report["ggml_after"]["clean"]
                         and report["ggml"]["revision"] == report["ggml_after"]["revision"])
-    report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
+    report_path.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
     print(json.dumps({"passed": report["passed"], "report": str(report_path), "wall_seconds": report["wall_seconds"]}))
     return 0 if report["passed"] else 1
 

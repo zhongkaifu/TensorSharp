@@ -38,6 +38,18 @@ class DelayedSseHandler(BaseHTTPRequestHandler):
 
 
 class QwenChatCacheBenchmarkTests(unittest.TestCase):
+    def test_ignored_output_allows_resolved_junction_and_rejects_escape(self):
+        with TemporaryDirectory() as folder:
+            root = Path(folder) / "checkout"
+            requested = root / "artifacts" / "linked" / "report.json"
+            target = Path(folder) / "other-volume" / "report.json"
+            with patch.object(bench, "ROOT", root), patch.object(Path, "resolve", return_value=target):
+                self.assertEqual(target, bench.output_path(requested))
+            with patch.object(bench, "ROOT", root):
+                for path in (root / "src" / "report.json", root / "artifacts" / ".." / "report.json"):
+                    with self.assertRaises(ValueError):
+                        bench.output_path(path)
+
     def test_webui_discovery_uses_loaded_model_and_preserves_host_metadata(self):
         loaded = "Qwen3.8-Flash-Next-UD-IQ1_M-00001-of-00003.gguf"
         metadata = {"models": [loaded], "loaded": loaded, "visionReady": True,

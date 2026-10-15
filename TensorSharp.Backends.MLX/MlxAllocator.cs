@@ -34,6 +34,13 @@ namespace TensorSharp.MLX
             return MlxBackend.GetMemorySnapshot();
         }
 
+        /// <summary>Process-wide allocator telemetry, not this allocator's owned
+        /// payload. False leaves an unknown sample; it must not become zero usage.</summary>
+        public bool TryGetMemorySnapshot(out MlxMemorySnapshot snapshot, out string error)
+        {
+            return MlxBackend.TryGetMemorySnapshot(out snapshot, out error);
+        }
+
         private void ThrowIfDisposed()
         {
             if (disposed)

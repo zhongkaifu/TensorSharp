@@ -35,6 +35,24 @@ public sealed class MoeCpuOffloadConfigTests : IDisposable
     public void Dispose() => MoeCpuOffloadConfig.Reset();
 
     [Fact]
+    public void NativeCapacityPlan_DistinguishesUnsetFromExplicitZeroAndReset()
+    {
+        Assert.Equal(-1, MoeCpuOffloadConfig.ResolveNativeLayers(planWhenUnspecified: true));
+        Assert.Equal(0, MoeCpuOffloadConfig.ResolveNativeLayers(planWhenUnspecified: false));
+        Assert.False(MoeCpuOffloadConfig.IsEnabled); // other loaders are unchanged
+        MoeCpuOffloadConfig.SetLayers(0);
+        Assert.Equal(0, MoeCpuOffloadConfig.ResolveNativeLayers(planWhenUnspecified: true));
+        MoeCpuOffloadConfig.SetLayers(7);
+        Assert.Equal(7, MoeCpuOffloadConfig.ResolveNativeLayers(planWhenUnspecified: true));
+        Assert.Equal(7, MoeCpuOffloadConfig.ResolveNativeLayers(planWhenUnspecified: false));
+        MoeCpuOffloadConfig.SetAllLayers();
+        Assert.Equal(int.MaxValue, MoeCpuOffloadConfig.ResolveNativeLayers(planWhenUnspecified: true));
+        MoeCpuOffloadConfig.Reset();
+        Assert.Equal(-1, MoeCpuOffloadConfig.ResolveNativeLayers(planWhenUnspecified: true));
+        Assert.Equal(0, MoeCpuOffloadConfig.ResolveNativeLayers(planWhenUnspecified: false));
+    }
+
+    [Fact]
     public void Default_IsDisabled()
     {
         Assert.False(MoeCpuOffloadConfig.IsEnabled);
@@ -271,6 +289,8 @@ public sealed class MoeCpuOffloadConfigTests : IDisposable
             MoeCpuOffloadConfig.ConfigureFromEnvironment();
 
             Assert.False(MoeCpuOffloadConfig.IsEnabled);
+            Assert.True(MoeCpuOffloadConfig.IsExplicitlySet);
+            Assert.Equal(0, MoeCpuOffloadConfig.ResolveNativeLayers(planWhenUnspecified: true));
         }
         finally
         {
@@ -295,5 +315,19 @@ public sealed class MoeCpuOffloadConfigTests : IDisposable
         {
             Environment.SetEnvironmentVariable("TS_N_CPU_MOE", null);
         }
+    }
+
+    [Theory]
+    [InlineData("0", null, 0)]
+    [InlineData(null, "0", 0)]
+    [InlineData("8", "0", 8)]
+    public void EnvironmentPolicy_PreservesExplicitZeroAndLayerPrecedence(string? layers, string? all, int expected)
+    {
+        using var env = new NativeEnvScope();
+        env.Set("TS_N_CPU_MOE", layers);
+        env.Set("TS_CPU_MOE", all);
+        MoeCpuOffloadConfig.ConfigureFromEnvironment();
+        Assert.True(MoeCpuOffloadConfig.IsExplicitlySet);
+        Assert.Equal(expected, MoeCpuOffloadConfig.ResolveNativeLayers(planWhenUnspecified: true));
     }
 }

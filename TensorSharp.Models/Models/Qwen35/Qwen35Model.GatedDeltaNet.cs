@@ -724,6 +724,7 @@ namespace TensorSharp.Models
         /// </summary>
         private unsafe bool TryFusedRecLayerPrefill(Tensor hidden, int layer, int seqLen)
         {
+            if (HasStreamingWeights) return false;
             // ggml_cuda AND ggml_metal: the native kernel is backend-agnostic
             // (ggml_ssm_conv + ggml_gated_delta_net + ggml_cpy, NO ggml_set_rows)
             // and allocates a dedicated per-graph buffer (ggml_backend_alloc_ctx_tensors,
@@ -837,7 +838,7 @@ namespace TensorSharp.Models
             bool isMoeLayer = _isMoeLayer != null && _isMoeLayer[layer];
 
             // ---- Path A: Fused dense FFN (non-MoE layers) ----
-            bool canFuseDenseFFN = IsGgmlBackend && !isMoeLayer
+            bool canFuseDenseFFN = !HasStreamingWeights && IsGgmlBackend && !isMoeLayer
                 && _ssmOutQW[layer] != null && _postAttnNormW[layer] != null
                 && _ffnGateUpQW[layer] != null && _ffnDownQW[layer] != null;
 
@@ -1376,6 +1377,7 @@ namespace TensorSharp.Models
         private unsafe bool TryFullModelDecodeCore(
             Tensor hidden, int tokenId, int position, float[] logitsOut)
         {
+            if (HasStreamingWeights) return false;
             if (logitsOut == null || logitsOut.Length < Config.VocabSize)
                 return FdBail("logits buffer missing/too small");
             bool tokenInput = tokenId >= 0;
@@ -1857,6 +1859,7 @@ namespace TensorSharp.Models
         internal unsafe bool TryFullModelVerify(Tensor hidden, int startPos, int seqLen, float[] normedOut, float[] logitsOut, int nLogitRows = -1, int rowOffset = 0,
             float[] captureData = null, int[] captureLayers = null, bool keepDeviceState = false)
         {
+            if (HasStreamingWeights) return false;
             // Run one whole-model prefill/verify graph on every GGML GPU backend.
             // CUDA and Vulkan use per-head set_rows KV writes. Metal uses contiguous
             // cpy views at a graph-baked offset, matching llama.cpp's linear KV-store

@@ -90,9 +90,9 @@ namespace TensorSharp.Models
         /// repointing the fused-decode pointer arrays), so MoE and dense share
         /// the exact same per-request-cache machinery below.</summary>
         public bool SupportsPerSequenceFusedForward =>
-            IsGgmlBackend && (_canUseFusedFullModelDecode || _numExperts > 0);
+            !HasStreamingWeights && IsGgmlBackend && (_canUseFusedFullModelDecode || _numExperts > 0);
 
-        public bool SupportsRetainedFusedCache => true;
+        public bool SupportsRetainedFusedCache => !HasStreamingWeights;
 
         public bool HasFusedSequenceCache(string requestId)
             => requestId != null && _fusedHolders != null && _fusedHolders.ContainsKey(requestId);
@@ -166,6 +166,7 @@ namespace TensorSharp.Models
         /// (NumComputedTokens &gt; 0 at admission) before the first Forward.</summary>
         public bool BindSequenceCache(string requestId)
         {
+            RefuseStreamingAlternateEntry("per-sequence fused cache binding");
             if (string.IsNullOrEmpty(requestId))
                 throw new ArgumentException("RequestId required", nameof(requestId));
             _fusedHolders ??= new Dictionary<string, Gemma4KvCacheHolder>(StringComparer.Ordinal);
@@ -206,6 +207,7 @@ namespace TensorSharp.Models
         /// so that owner's history is preserved as its own per-request cache.</summary>
         public void AdoptPrimaryCacheToFused(string requestId)
         {
+            RefuseStreamingAlternateEntry("per-sequence fused cache adoption");
             if (string.IsNullOrEmpty(requestId)) return;
             _fusedHolders ??= new Dictionary<string, Gemma4KvCacheHolder>(StringComparer.Ordinal);
 
@@ -326,6 +328,7 @@ namespace TensorSharp.Models
         /// (the prefix cache's tree-minted payload key, or the request id itself).</summary>
         public bool RetainSequenceCacheAs(string requestId, string key)
         {
+            if (HasStreamingWeights) return false;
             if (_fusedHolders == null || string.IsNullOrEmpty(requestId) || string.IsNullOrEmpty(key))
                 return false;
             if (!_fusedHolders.TryGetValue(requestId, out var holder))
@@ -361,6 +364,7 @@ namespace TensorSharp.Models
         /// Returns false when no retained holder exists for the id.</summary>
         public bool TryRebindRetainedCache(string retainedRequestId, string newRequestId)
         {
+            if (HasStreamingWeights) return false;
             if (_retainedFusedHolders == null
                 || string.IsNullOrEmpty(retainedRequestId)
                 || string.IsNullOrEmpty(newRequestId))
@@ -393,7 +397,7 @@ namespace TensorSharp.Models
         /// <summary>Gemma 4 can copy its complete cache — every global layer's K/V
         /// and every local layer's circular window — as plain bytes, so a
         /// checkpoint is exact. GGML only: the copy relies on host-side storage.</summary>
-        public bool SupportsPrefixCheckpoints => IsGgmlBackend && _kvCacheK != null && _kvCacheV != null;
+        public bool SupportsPrefixCheckpoints => !HasStreamingWeights && IsGgmlBackend && _kvCacheK != null && _kvCacheV != null;
 
         /// <summary>Deep-copy the ACTIVE cache (primary or checked-out holder) into the
         /// retained set under <paramref name="key"/>. See
@@ -432,6 +436,7 @@ namespace TensorSharp.Models
         /// is untouched. See <see cref="IBatchedPagedModel.TryCloneRetainedCache"/>.</summary>
         public bool TryCloneRetainedCache(string retainedKey, string newRequestId)
         {
+            if (HasStreamingWeights) return false;
             if (_retainedFusedHolders == null
                 || string.IsNullOrEmpty(retainedKey)
                 || string.IsNullOrEmpty(newRequestId))

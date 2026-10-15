@@ -102,6 +102,56 @@ public:
         if (error_) std::rethrow_exception(error_);
     }
 
+    // Workers prepare independent sources; only the submitting thread consumes
+    // ready items (e.g. issues CUDA uploads). Consumption can overlap remaining
+    // reads. All workers are joined before return, including either exception
+    // path, so caller-owned mappings/callback captures cannot outlive this call.
+    template<typename Prepare, typename Consume>
+    void run_pipelined(size_t count, Prepare prepare, Consume consume_ready) {
+        if (!count) return;
+        std::unique_lock<std::mutex> submit(submission_);
+        if (workers_.empty() || count == 1) {
+            for (size_t i = 0; i < count; ++i) { prepare(i); consume_ready(i); }
+            return;
+        }
+        std::vector<size_t> ready(count);
+        size_t available = 0, consumed = 0;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            job_ = [&](size_t i) {
+                prepare(i);
+                {
+                    std::lock_guard<std::mutex> completed(mutex_);
+                    ready[available++] = i;
+                }
+                done_.notify_one();
+            };
+            count_ = count;
+            cursor_.store(0, std::memory_order_relaxed);
+            error_ = nullptr;
+            pending_ = workers_.size();
+            ++generation_;
+        }
+        ready_.notify_all();
+        std::exception_ptr consumer_error;
+        std::unique_lock<std::mutex> lock(mutex_);
+        while (consumed < count) {
+            done_.wait(lock, [&] { return consumed < available || error_ || pending_ == 0; });
+            if (error_) break;
+            if (consumed == available) break;
+            const size_t i = ready[consumed++];
+            lock.unlock();
+            try { consume_ready(i); }
+            catch (...) { consumer_error = std::current_exception(); }
+            lock.lock();
+            if (consumer_error) break;
+        }
+        done_.wait(lock, [&] { return pending_ == 0; });
+        job_ = nullptr;
+        if (consumer_error) std::rethrow_exception(consumer_error);
+        if (error_) std::rethrow_exception(error_);
+    }
+
     // Opt-in load-time warming. Each task walks a contiguous 8 MiB range;
     // touching every page faults it in while allowing filesystem readahead.
     // Pages remain evictable; this neither pins nor copies the entire table.

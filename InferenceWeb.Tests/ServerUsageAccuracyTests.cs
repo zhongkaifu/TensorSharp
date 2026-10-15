@@ -24,6 +24,19 @@ namespace InferenceWeb.Tests;
 /// </summary>
 public class ServerUsageAccuracyTests
 {
+    [Fact]
+    public void UnifiedMemoryHelpSeparatesExplicitAdapterFromWholeProcessHardLimits()
+    {
+        string usage = Usage();
+        Assert.Contains("--unified-memory", usage);
+        Assert.Contains("Default: off. Unsupported models", usage);
+        Assert.Contains("Up to three requests can join native decode batches", usage);
+        Assert.Contains("not an OS-enforced whole-process RAM/VRAM hard limit", usage);
+        Assert.Contains("unpinned fallback is 2048 with --unified-memory, otherwise 20000", usage);
+        Assert.Contains("an explicit request limit may exceed that fallback", usage);
+        Assert.Contains("--max-tokens or MAX_TOKENS pins the cap", usage);
+    }
+
     private static string Usage()
     {
         var writer = new StringWriter();

@@ -2,6 +2,7 @@
 // Licensed under the BSD-3-Clause license in the repository root.
 using System.Text;
 using TensorSharp.Runtime;
+using TensorSharp.Memory;
 
 namespace InferenceWeb.Tests;
 
@@ -73,6 +74,42 @@ public sealed class GgufPrefaultTests : IDisposable
         file.PrefaultFileCache();
         Assert.Equal(0, file.PrefaultReadBytes);
         Assert.Equal(TensorBytes, file.ReadTensorData(file.Tensors["weight"]).Length);
+    }
+
+    [Fact]
+    public void PrefaultUsesPhysicalAvailabilityIncludingItsConcurrentReadBuffers()
+    {
+        Assert.False(GgufFile.CanPrefaultFileCache(1, 0, 1));
+        Assert.False(GgufFile.CanPrefaultFileCache(64 << 20, 128 << 20, 2));
+        Assert.True(GgufFile.CanPrefaultFileCache(64 << 20, 160 << 20, 2));
+        Assert.False(GgufFile.CanPrefaultFileCache(long.MaxValue, long.MaxValue, int.MaxValue));
+    }
+
+    [Fact]
+    public void PrefaultReadBufferRemainsChargedUntilPhysicalFree()
+    {
+        using var file = new GgufFile(Write("budget.gguf", false, 0, "weight"));
+        var budget = new MemoryBudget([new("ram", TensorBytes)]);
+        using var scope = new HostAllocationBudgetScope(budget, ["ram"]);
+        file.PrefaultFileCache();
+        Assert.Equal(TensorBytes, file.PrefaultReadBytes);
+        Assert.Equal(TensorBytes, scope.Usage.PeakBytes);
+        Assert.Equal(0, scope.Usage.Bytes);
+        Assert.Equal(0, scope.Usage.Allocations);
+        Assert.Equal(0, budget.Snapshot().Single().Committed);
+        Assert.Equal(0, budget.Snapshot().Single().Reserved);
+    }
+
+    [Fact]
+    public void PrefaultQuotaRefusalSkipsOptionalWarmupWithoutBreakingTensorReads()
+    {
+        using var file = new GgufFile(Write("budget-refusal.gguf", false, 0, "weight"));
+        var budget = new MemoryBudget([new("ram", 0)]);
+        using var scope = new HostAllocationBudgetScope(budget, ["ram"]);
+        file.PrefaultFileCache();
+        Assert.Equal(0, file.PrefaultReadBytes);
+        Assert.Equal(0, scope.Usage.Bytes);
+        Assert.All(file.ReadTensorData(file.Tensors["weight"]), value => Assert.Equal((byte)17, value));
     }
 
     [Fact]

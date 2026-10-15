@@ -842,10 +842,11 @@ namespace TensorSharp.Runtime
                     var context = BuildJinja2Context(
                         preprocessed, addGenerationPrompt, tools, enableThinking, architecture, reasoningEffort);
                     string result = jinja.Render(context);
-                    // Gemma's generation boundary is part of its published template:
-                    // preserve its newline and any channel prefix exactly. Adding an
-                    // empty thought block can make E4B continue unmarked reasoning.
-                    if (architecture != "gemma4" || !addGenerationPrompt)
+                    // Preserve these publishers' generation boundaries exactly:
+                    // Qwen4Exp's closed think block ends with two newlines, which
+                    // are prompt tokens, and Gemma's newline/channel prefix is
+                    // likewise significant. Let the template choose the framing.
+                    if (!addGenerationPrompt || (architecture != "gemma4" && architecture != "qwen4exp"))
                         result = result.TrimEnd();
                     if (result.Length > 0)
                     {

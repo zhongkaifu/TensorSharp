@@ -13,6 +13,7 @@ using System.IO;
 using System.Diagnostics.CodeAnalysis;
 using System.Reflection;
 using System.Text;
+using TensorSharp.Memory;
 
 namespace TensorSharp.Runtime
 {
@@ -70,7 +71,9 @@ namespace TensorSharp.Runtime
     /// which is how the architectures decline a backend, a <c>--tp</c> layout or a KV
     /// cache dtype; <see cref="IOException"/> (a missing, truncated or unreadable model,
     /// shard or sidecar); <see cref="InvalidDataException"/> (a file that is not the
-    /// GGUF it claims to be); <see cref="UnauthorizedAccessException"/>.
+    /// GGUF it claims to be); <see cref="UnauthorizedAccessException"/>;
+    /// <see cref="MemoryPressureException"/> (the shared allocation budget deliberately
+    /// refused the requested model or execution reserve).
     /// </para>
     /// <para>
     /// Everything else, <see cref="NullReferenceException"/>, a plain
@@ -104,6 +107,7 @@ namespace TensorSharp.Runtime
         {
             Exception? ex = Unwrap(exception);
             return ex is ModelLoadRefusedException
+                or MemoryPressureException
                 or NotSupportedException
                 or IOException
                 or InvalidDataException

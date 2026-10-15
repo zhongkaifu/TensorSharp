@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../../TensorSharp.Backends.GGML/TensorSharp.Backends.GGML.csproj" />
+    <ProjectReference Include="../../../TensorSharp.Runtime/TensorSharp.Runtime.csproj" />
+    <Compile Include="../../../InferenceWeb.Tests/GlmDsaSyntheticModelBuilder.cs" Link="Fixtures/GlmDsaSyntheticModelBuilder.cs" />
+    <Compile Include="../../../InferenceWeb.Tests/GlmDsaQuantizedSourceFixture.cs" Link="Fixtures/GlmDsaQuantizedSourceFixture.cs" />
+  </ItemGroup>
+</Project>

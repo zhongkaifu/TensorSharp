@@ -21,6 +21,45 @@ namespace TensorSharp.Models
         // keeps the block MLP's tanh GELU and can select erf GELU for the merger.
         public Qwen35VisionEncoder VisionEncoder { get; private set; }
 
+        private Func<QwenVisionPreparationPlan, IDisposable> _unifiedVisionAdmission;
+        internal bool HasUnifiedVisionAdmission => _unifiedVisionAdmission != null;
+
+        internal void ConfigureUnifiedVisionAdmission(Func<QwenVisionPreparationPlan, IDisposable> admission)
+        {
+            if (MemoryPolicy == null) throw new InvalidOperationException("Vision admission requires a model memory policy.");
+            lock (GpuComputeLock) _unifiedVisionAdmission = admission;
+        }
+
+        internal List<int> PrepareUnifiedVision(Qwen35VisionEncoder encoder, IReadOnlyList<string> paths,
+            List<int> inputTokens, int imagePadId, Func<List<int>> prepare)
+        {
+            if (encoder == null) throw new InvalidOperationException("Image input requires the admitted vision projector.");
+            if (imagePadId < 0) throw new InvalidOperationException("Missing image placeholder token.");
+            int placeholders = 0;
+            foreach (int token in inputTokens) if (token == imagePadId) placeholders++;
+            // Header probing is bounded and precedes pixel decoding, model
+            // execution and all media-sized Tensor/native allocations.
+            var plan = QwenVisionPreparationPlan.Create(paths, inputTokens.Count, placeholders,
+                _maxContextLength, encoder.UnifiedMemoryGeometry);
+            lock (GpuComputeLock)
+            {
+                if (encoder.UnifiedPreparationActive) throw new InvalidOperationException("Reentrant unified vision preparation.");
+                var admission = _unifiedVisionAdmission ?? throw new InvalidOperationException("Vision admission was removed during preparation.");
+                using var scope = admission(plan) ?? throw new InvalidOperationException("Vision admission must return an owned execution scope.");
+                plan.ValidateFilesUnchanged();
+                encoder.UnifiedPreparationActive = true;
+                try
+                {
+                    List<int> result = prepare();
+                    if (result.Count != plan.ExpandedPromptTokens)
+                        throw new InvalidOperationException("Prepared image geometry differs from the admitted prompt.");
+                    plan.ValidateFilesUnchanged();
+                    return result;
+                }
+                finally { encoder.UnifiedPreparationActive = false; }
+            }
+        }
+
         // The GDN recurrence, the PLE conv history and the n-gram history cannot be
         // rewound to an earlier position, so a cached prefix is only reusable when
         // the new prompt EXTENDS it exactly - same contract as Qwen3.5. The base
@@ -47,13 +86,21 @@ namespace TensorSharp.Models
 
         public void LoadVisionEncoder(string mmProjPath)
         {
-            // The published Qwen4ExpVisionPatchMerger uses nn.GELU() (erf),
-            // independently of the block MLP's gelu_pytorch_tanh. Preserve the
-            // supplied GGUF path's existing tanh default; erf is an explicit
-            // fidelity experiment until matching trained-image controls qualify it.
+            if (VisionEncoder != null) throw new InvalidOperationException("The qwen4exp vision projector is already loaded.");
+            // Keep the existing GGUF path until representative image generation
+            // qualifies a change. The HF-reference erf merger remains available
+            // for explicit diagnostics; scalar activation goldens alone do not
+            // certify continuation quality. Block MLP activation is independent.
             bool mergerErf = Environment.GetEnvironmentVariable("TS_Q4E_VISION_MERGER_ERF") == "1";
-            VisionEncoder = new Qwen35VisionEncoder(mmProjPath, _allocator, mergerGeluErf: mergerErf);
-            VisionEncoder.SetHostModel(this);
+            Qwen35VisionEncoder encoder;
+            try { encoder = new Qwen35VisionEncoder(mmProjPath, _allocator, mergerGeluErf: mergerErf); }
+            catch (QwenVisionConstructionCleanupException failure)
+            {
+                VisionEncoder = failure.UnreleasedEncoder;
+                throw;
+            }
+            encoder.SetHostModel(this);
+            VisionEncoder = encoder;
         }
 
         private readonly List<(Tensor Embeddings, int StartPosition)> _visionEmbeddingsList = new();

@@ -41,7 +41,7 @@ def runtime_file_identity(binary):
         snapshot["errors"].append("Cannot enumerate runtime: " + repr(error))
         return snapshot
     for path in paths:
-        name = str(path.relative_to(binary))
+        name = path.relative_to(binary).as_posix()
         record = {}
         snapshot["files"][name] = record
         try:
@@ -123,6 +123,13 @@ def stop(process, timeout=10):
         return {"started": False}
     if process.poll() is not None:
         return {"started": True, "requested": False, "forced": False, "exit_code": process.returncode}
+    if sys.platform == "win32":
+        # Windows terminate is TerminateProcess, not a graceful SIGTERM. Reap
+        # the owned child and retain that distinction in validation evidence.
+        process.terminate()
+        process.wait(timeout=timeout)
+        return {"started": True, "requested": True, "forced": True,
+                "exit_code": process.returncode, "method": "TerminateProcess"}
     try:
         os.killpg(process.pid, signal.SIGTERM)
     except ProcessLookupError:
@@ -221,7 +228,7 @@ def source_identity(repo):
         for folder in (native, *managed):
             for directory, children, files in os.walk(repo / folder):
                 children[:] = [name for name in children if name not in excluded and not name.startswith("build-")]
-                names.extend(str((Path(directory) / name).relative_to(repo)) for name in files)
+                names.extend((Path(directory) / name).relative_to(repo).as_posix() for name in files)
         revision = None
     suffixes = {".cs", ".csproj", ".props", ".targets", ".cpp", ".c", ".h", ".hpp", ".cu", ".cuh", ".cmake", ".sh", ".m", ".mm", ".metal"}
     groups = {"native_sources": {}, "managed_sources": {}, "shared_build_inputs": {}}

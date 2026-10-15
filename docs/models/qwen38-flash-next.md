@@ -675,15 +675,53 @@ Eligible segments copy activations, routing weights and outputs directly between
 CUDA buffers. Host-MoE debug and GPU verification retain the staged host contract.
 `TS_HOST_MOE_EXPERT_CACHE_OUTPUT_BRIDGE=0` restores output staging for A/B checks;
 `TS_HOST_MOE_EXPERT_CACHE_BRIDGE=0` restores input and output staging.
-`TS_HOST_MOE_EXPERT_CACHE_PREFETCH=1` optionally faults selected cache-miss byte
-ranges in parallel before pageable uploads. It leaves weights evictable, copies
-their original bytes, and defaults off pending cold/warm workload measurements.
+When the expert cache is enabled, selected cache-miss pages are read in parallel
+before pageable uploads when observed read costs justify it. The default policy
+groups gate/up/down into one bounded worker dispatch for at least two misses and
+4 MiB. The submitting thread uploads each completed projection while workers read
+the remaining sources, then joins them before expert compute. The policy stops
+dispatching when reads are cheap and re-arms after slow source staging. State
+belongs to each cache entry and resets on eviction/reload.
+`TS_HOST_MOE_EXPERT_CACHE_PREFETCH=0` disables this mmap hint; `=1` forces it for every
+nonempty miss set. Neither mode pins weights, expands cache quotas, drops experts,
+or changes their arithmetic. Pages remain evictable. This overlaps demand reads
+with uploads within a layer, not compute across layers; it does not impose an OS
+page-cache memory limit. Failed partial uploads invalidate their victim slots
+before replacement, and every worker joins before source owners can be released.
+
+On Windows, a positive expert-cache budget and mapped experts larger than the
+available physical RAM at load time select exact file staging automatically.
+The loader registers each GGUF shard, offset and byte length. Missed projections
+are read and uploaded through one host transfer arena, growing to demand with a
+32 MiB payload ceiling. CUDA host allocation permits asynchronous uploads;
+upstream falls back to pageable RAM if pinning fails. `TS_HOST_MOE_FILE_READ=0`
+retains mmap reads; `=1` forces registration. Failures drain queued uploads before
+buffer reuse, empty-cache trims free the arena, and releasing a live model's
+device residency restores file registrations for subsequent execution.
+This does not increase the device expert quota or read extra experts. It covers
+the compact expert cache, not CPU long-prefill reads. Installing
+`GgmlCacheBudgetScope` with `hostPools` before allocation charges this payload to
+the shared RAM ledger, independently of the device pool; refusal stops the
+operation before allocating the arena. Legacy scopes omit this coverage.
+OS file cache, other host weights and driver allocations remain outside a hard cap. Initial source selection
+is not a complete runtime RAM/VRAM policy. See the
+[probe guide](../../eng/validation/Qwen4ExpExpertCacheProbe/README.md) for separate
+first-request/repeated measurements and complete-logit comparisons.
+
+Within each enabled expert cache, eviction now defaults to decaying frequency
+with LRU tie-breaking. Current routed experts stay protected, unused slots are
+filled first, and counters age according to the slot capacity so routing from an
+earlier request can lose priority. Only small CPU counters are added; the device
+weight quota and arithmetic are unchanged. `TS_HOST_MOE_EXPERT_CACHE_LFU=0`
+restores LRU for controlled comparisons. The expert cache itself still requires
+a positive quota; this is not an automatic whole-request memory planner.
 
 The budget covers graph allocations plus a conservative workspace allowance;
 CUDA's shared pool and driver allocations still require additional free VRAM;
 retired CUDA capture objects can persist until upstream's idle sweep, so the
 owned reservation is not total process VRAM or its immediate reduction at unload.
-`TS_HOST_MOE_EXPERT_CACHE_DIAGNOSTICS=1` reports slots, hits, misses and reservation.
+`TS_HOST_MOE_EXPERT_CACHE_DIAGNOSTICS=1` reports slots, hits, misses and reservation,
+plus adaptive read-dispatch counts when entries are retired.
 An entry also requires physical free VRAM above the native safety reserve;
 an oversized requested budget can leave some layers using CPU fallback.
 Use `eng/validation/qwen4exp-expert-cache.py` for complete-logit A/B checks and
@@ -1006,6 +1044,33 @@ counts per GPU (llama.cpp's `--tensor-split` in spirit) and throws rather than
 silently ignoring a value it cannot honour — useful because the automatic
 balance prices weights and cannot see the vision tower, which loads later and
 lands on GPU 0.
+
+## CUDA single-token copy reuse
+
+Single-token CUDA graphs use selected already-contiguous read-only inputs directly,
+avoiding redundant materialization in hyperconnection mixing and GDN q/k/v and norm
+inputs. Set `TS_Q4E_DECODE_VIEWS=0` to restore the original copies. Multi-token graphs
+and state writes retain their existing behavior.
+
+The 2026-10-10 dual-A40 / UD-IQ1_M validation retained bit-identical full-vocabulary
+logits across 34 rows and reduced D2D copies from 519 to 207 per step. Interleaved
+application runs measured 54.82 → 55.86 decode tokens/s, with llama.cpp at 59.98.
+A gap remains; these samples do not establish gains for other devices, quantizations,
+or workloads. See the [unified-memory validation record](../design/unified-memory.zh-CN.md)
+for settings, quality failures, memory definitions, and actual coverage.
+
+Single-token CUDA hyperconnection and PLE broadcasts also use read-only zero-stride
+views. `TS_Q4E_BROADCAST_VIEWS=0` restores materialized repeats independently of the
+copy-reuse switch above. The multiply and state writes retain their arithmetic;
+multi-token and non-CUDA paths retain their layouts. The follow-up validation in
+the unified-memory record covers this optimization separately.
+
+With `GgmlCacheBudgetScope(..., includeGraphBuffers: true)`, Qwen4Exp-owned graph
+arenas, recurrent state and device snapshots now share the mapped rank pools.
+Exhausted batched-arena credit refuses execution before advancing sequence holders,
+allowing a retry after capacity is restored. Dispose model resources before the
+scope. This covers selected native allocations, not whole-process RAM/VRAM or
+driver/backend pools.
 
 ## Benchmark matrix
 

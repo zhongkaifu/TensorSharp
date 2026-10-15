@@ -21,7 +21,8 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
     private readonly IPrefixCacheModel _cacheModel;
     private readonly ILogger _logger;
     private readonly Dictionary<SequenceState, RequestKey> _requests = new();
-    private readonly Queue<string> _invalidated = new();
+    private readonly Queue<(string Key, InvalidationReason Reason)> _invalidated = new();
+    private readonly Queue<(string Key, PayloadFootprint Previous, PayloadFootprint Current)> _deviceDemotions = new(16);
     private readonly HashSet<long> _storeMisses = new();
     private readonly MatchPlan _plan = new();
     private string? _primaryKey;
@@ -37,13 +38,15 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
         _scheduler = scheduler;
         _cacheModel = (IPrefixCacheModel)model;
         _logger = logger;
-        var options = ExecutionOptions.FromEnvironment();
+        var options = scheduler.Config.ResolveExecutionOptions();
+        bool batchedEnabled = !options.BatchedPathDisabled && scheduler.Config.KvSnapshots == null;
+        bool admittedHolders = scheduler.Config.MemoryAdmission?.UsePerSequenceHolders == true;
         // A materialized holder is only readable through the fused per-request route, a paged end state only
         // through the batched route. Without that route (--no-continuous-batching, TS_PER_SEQ_FUSED=0, or a model
         // that lacks it) no placeholder blocks may be adopted for it.
         bool endStateRoute = capabilities.PagedEndStates
-            ? !options.BatchedPathDisabled && model is IBatchedPagedModel { BatchedForwardAvailable: true }
-            : !options.BatchedPathDisabled && options.PerSeqFusedEnabled
+            ? batchedEnabled && model is IBatchedPagedModel { BatchedForwardAvailable: true }
+            : (batchedEnabled || admittedHolders) && options.PerSeqFusedEnabled
               && model is IBatchedPagedModel { SupportsPerSequenceFusedForward: true };
         if (!endStateRoute)
             capabilities = capabilities with
@@ -62,7 +65,7 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
             PageHost = new PageHost(pool),
             PageHostBytes = InferenceEngine.ComputeBlockByteSize(model, pool.BlockSize),
             PoolPagesCap = pool.NumBlocks,
-            BatchedPagedEnabled = !options.BatchedPathDisabled,
+            BatchedPagedEnabled = batchedEnabled,
             PayloadValidator = this,
             QuerySpareBytes = _cacheModel.QuerySpareBytes,
             HostRamBytes = GC.GetGCMemoryInfo().TotalAvailableMemoryBytes,
@@ -74,10 +77,10 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
     internal int RequestCount => _requests.Count;
     internal bool PrimaryAvailable { get; set; }
     internal bool RequiresSoleAdmission { get; private set; }
-    private static bool RetentionEnabled
-        => ExecutionOptions.FromEnvironment() is { RetainedFusedCacheBudget: null or > 0 };
-    private static bool PublicCheckpointsEnabled
-        => ExecutionOptions.FromEnvironment() is { PrefixCheckpointBudget: > 0 };
+    private bool RetentionEnabled
+        => _scheduler.Config.ResolveExecutionOptions() is { RetainedFusedCacheBudget: null or > 0 };
+    private bool PublicCheckpointsEnabled
+        => _scheduler.Config.ResolveExecutionOptions() is { PrefixCheckpointBudget: > 0 };
     internal bool CheckpointsSupported => _tree.Caps.CanCaptureCopy && (PublicCheckpointsEnabled || RetentionEnabled);
     internal bool PublicCheckpointsSupported => PublicCheckpointsEnabled && CheckpointsSupported;
     internal string? LastSource { get; private set; }
@@ -146,8 +149,9 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
 
     private ExpectedRoute PredictRoute()
     {
-        var options = ExecutionOptions.FromEnvironment();
-        if (!options.BatchedPathDisabled && options.PerSeqFusedEnabled
+        var options = _scheduler.Config.ResolveExecutionOptions();
+        if (_scheduler.Config.KvSnapshots == null
+            && (!options.BatchedPathDisabled || _scheduler.Config.MemoryAdmission?.UsePerSequenceHolders == true) && options.PerSeqFusedEnabled
             && _model is IBatchedPagedModel { SupportsPerSequenceFusedForward: true })
             return ExpectedRoute.PerSequenceFused;
         return ExpectedRoute.Primary;
@@ -166,7 +170,7 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
                 or MaterializeMode.ConvertPrimaryThenClone)
             _plan.Reset();
         if (!_plan.HasReuse && PredictRoute() == ExpectedRoute.Primary
-            && !ExecutionOptions.FromEnvironment().BatchedPathDisabled
+            && !_scheduler.Config.ResolveExecutionOptions().BatchedPathDisabled
             && _model is IBatchedPagedModel { BatchedForwardAvailable: true } paged
             && (sequence.MediaSpans.Count == 0 || paged.SupportsBatchedMultimodal))
         {
@@ -394,18 +398,48 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
             publicBoundary ? length : sequence.SharedPrefixTokens,
             explicitBoundary ? NodeFlags.EndsAtBreakpoint : promptBoundary ? NodeFlags.PromptEnd : NodeFlags.None,
             GetSpans(sequence));
+        // A media-key collision can stop insertion before this exact state boundary.
+        // Never associate the full state with a shallower prefix (including Root).
+        if (node.Depth != length) return;
         if (node.EndState is not null) return;
-        string key = _tree.MintKey();
-        bool captured = _cacheModel.TryCaptureCopy(sequence.RequestId, key, out var footprint);
-        if (!captured && ReleaseOldestScopedPayload())
-            captured = _cacheModel.TryCaptureCopy(sequence.RequestId, key, out footprint);
-        if (!captured)
+        // Releasing a deeper retained state may otherwise collect this still-empty
+        // ancestor and recycle its object before the capture retry publishes it.
+        LockReceipt publication = _tree.AcquirePath(node);
+        try
         {
-            _tree.CollectIfEmpty(node);
-            return;
+            string key = _tree.MintKey();
+            // Every publication/rollback object exists before the model owns
+            // the copied payload. Optional metadata OOM must not strand a copy.
+            BeforeCheckpointPublicationAllocation?.Invoke();
+            string[] rollback = [key];
+            var payload = new EndStatePayload
+            {
+                Key = key, Kind = _tree.Caps.Class == FamilyClass.N ? EndStateKind.NativeSlot : EndStateKind.Holder,
+                Origin = PayloadOrigin.CaptureCopy, DeviceDirty = false,
+            };
+            bool captured = _cacheModel.TryCaptureCopy(sequence.RequestId, key, out var footprint);
+            if (!captured && ReleaseOldestScopedPayload())
+                captured = _cacheModel.TryCaptureCopy(sequence.RequestId, key, out footprint);
+            if (!captured) return;
+            payload.Footprint = footprint;
+            bool published;
+            try { published = Publish(node, payload, length); }
+            catch
+            {
+                // Publication may be fully attached if a later validation
+                // fails. Never release a payload while its exact tree entry
+                // still advertises it. No reclaim-queue growth during rollback.
+                if (node.EndState?.Key == key)
+                    _tree.DetachEndState(node, ReleaseReason.Invalidated, enqueue: false);
+                _cacheModel.ReleasePayloads(rollback, ReleaseReason.Invalidated);
+                // A refused physical free remains model-owned and charged; no
+                // predicted bytes are credited here. It can be retried later.
+                throw;
+            }
+            // Persisting an already committed checkpoint is a separate action.
+            if (published && publicBoundary) SaveCheckpoint(sequence, key, length);
         }
-        if (Publish(node, key, footprint, length, PayloadOrigin.CaptureCopy) && publicBoundary)
-            SaveCheckpoint(sequence, key, length);
+        finally { _tree.Release(ref publication); }
         Trim();
     }
 
@@ -417,50 +451,56 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
         KeyRope key = GetKey(sequence);
         RadixNode node = _tree.Insert(key, length, GetScope(sequence), sequence.SharedPrefixTokens,
             NodeFlags.None, GetSpans(sequence));
+        if (node.Depth != length) return false;
         if (node.EndState is not null) return false;
-        string payloadKey = _tree.MintKey();
-        if (primary && _tree.Caps.DeferPrimaryConversion)
+        LockReceipt publication = _tree.AcquirePath(node);
+        try
         {
-            RegisterPrimary(node, payloadKey, length);
-            return false; // The live primary still belongs to the executor, not a retained holder.
-        }
-        bool captured = RetentionEnabled && _tree.Caps.EndState != EndStateSupport.None
-            && _cacheModel.TryCaptureDonate(sequence.RequestId, payloadKey, length, out _);
-        if (!captured && RetentionEnabled && _tree.Caps.EndState != EndStateSupport.None
-            && _model is IBatchedPagedModel holder && holder.HasFusedSequenceCache(sequence.RequestId)
-            && ReleaseOldestScopedPayload())
-            captured = _cacheModel.TryCaptureDonate(sequence.RequestId, payloadKey, length, out _);
-        PayloadOrigin origin = PayloadOrigin.Donation;
-        bool conversionFailed = false;
-        if (!captured && RetentionEnabled && primary && _tree.Caps.AdoptPrimaryOnDisplacement)
-        {
-            captured = _cacheModel.TryConvertPrimary(payloadKey, length, out _);
-            if (!captured && ReleaseOldestScopedPayload())
+            string payloadKey = _tree.MintKey();
+            if (primary && _tree.Caps.DeferPrimaryConversion)
+            {
+                RegisterPrimary(node, payloadKey, length);
+                return false; // The live primary still belongs to the executor, not a retained holder.
+            }
+            bool captured = RetentionEnabled && _tree.Caps.EndState != EndStateSupport.None
+                && _cacheModel.TryCaptureDonate(sequence.RequestId, payloadKey, length, out _);
+            if (!captured && RetentionEnabled && _tree.Caps.EndState != EndStateSupport.None
+                && _model is IBatchedPagedModel holder && holder.HasFusedSequenceCache(sequence.RequestId)
+                && ReleaseOldestScopedPayload())
+                captured = _cacheModel.TryCaptureDonate(sequence.RequestId, payloadKey, length, out _);
+            PayloadOrigin origin = PayloadOrigin.Donation;
+            bool conversionFailed = false;
+            if (!captured && RetentionEnabled && primary && _tree.Caps.AdoptPrimaryOnDisplacement)
+            {
                 captured = _cacheModel.TryConvertPrimary(payloadKey, length, out _);
-            origin = PayloadOrigin.PrimaryConversion;
-            conversionFailed = !captured;
-        }
-        if (captured)
-        {
-            bool published = Publish(node, payloadKey, _cacheModel.MeasureEndState(payloadKey), length, origin);
-            Trim();
-            return published;
-        }
-        // A conversion can fail AFTER adopting the primary: the holder adapter then releases what it
-        // adopted, and DeepSeek V4.1 resets a released slot to position 0. Advertising that primary let an
-        // exact continuation keep it (no rewind, so nothing asks the model) and decode from an empty cache.
-        // Keep it only while the model still reports this sequence's length.
-        if (conversionFailed && _cacheModel is IPrefixCacheModelDiagnostics diagnostics
-            && diagnostics.PrimaryCacheLength != length)
-        {
-            InvalidatePrimary();
-            _tree.CollectIfEmpty(node);
+                if (!captured && ReleaseOldestScopedPayload())
+                    captured = _cacheModel.TryConvertPrimary(payloadKey, length, out _);
+                origin = PayloadOrigin.PrimaryConversion;
+                conversionFailed = !captured;
+            }
+            if (captured)
+            {
+                bool published = Publish(node, payloadKey, _cacheModel.MeasureEndState(payloadKey), length, origin);
+                Trim();
+                return published;
+            }
+            // A conversion can fail AFTER adopting the primary: the holder adapter then releases what it
+            // adopted, and DeepSeek V4.1 resets a released slot to position 0. Advertising that primary let an
+            // exact continuation keep it (no rewind, so nothing asks the model) and decode from an empty cache.
+            // Keep it only while the model still reports this sequence's length.
+            if (conversionFailed && _cacheModel is IPrefixCacheModelDiagnostics diagnostics
+                && diagnostics.PrimaryCacheLength != length)
+            {
+                InvalidatePrimary();
+                _tree.CollectIfEmpty(node);
+                return false;
+            }
+            if (primary && _tree.Caps.PrimaryResident)
+                RegisterPrimary(node, payloadKey, length);
+            else _tree.CollectIfEmpty(node);
             return false;
         }
-        if (primary && _tree.Caps.PrimaryResident)
-            RegisterPrimary(node, payloadKey, length);
-        else _tree.CollectIfEmpty(node);
-        return false;
+        finally { _tree.Release(ref publication); }
     }
 
     private void RegisterPrimary(RadixNode node, string payloadKey, int length)
@@ -475,19 +515,26 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
         else _tree.CollectIfEmpty(node);
     }
 
+    internal Action? BeforeCheckpointPublicationAllocation { get; set; } // Native-free OOM qualification hook.
+
     private bool Publish(RadixNode node, string key, PayloadFootprint footprint, int length, PayloadOrigin origin)
+        => Publish(node, new EndStatePayload
+        {
+            Key = key, Kind = _tree.Caps.Class == FamilyClass.N ? EndStateKind.NativeSlot : EndStateKind.Holder,
+            Origin = origin, Footprint = footprint, DeviceDirty = origin != PayloadOrigin.CaptureCopy,
+        }, length);
+
+    private bool Publish(RadixNode node, EndStatePayload payload, int length)
     {
+        string key = payload.Key;
+        PayloadFootprint footprint = payload.Footprint;
         if (footprint.Tokens != length)
         {
             _tree.Reclaim.Enqueue(key, ReleaseReason.Invalidated, footprint.Bytes);
             _tree.CollectIfEmpty(node);
             return false;
         }
-        var result = _tree.AttachEndState(node, new EndStatePayload
-        {
-            Key = key, Kind = _tree.Caps.Class == FamilyClass.N ? EndStateKind.NativeSlot : EndStateKind.Holder,
-            Origin = origin, Footprint = footprint, DeviceDirty = origin != PayloadOrigin.CaptureCopy,
-        });
+        var result = _tree.AttachEndState(node, payload);
         if (result == AttachResult.Refused)
         {
             _tree.Reclaim.Enqueue(key, ReleaseReason.Invalidated, footprint.Bytes);
@@ -594,7 +641,9 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
         if (found is not null) ReleaseRequest(found);
     }
 
-    public void OnPayloadInvalidated(string payloadKey, InvalidationReason reason) => _invalidated.Enqueue(payloadKey);
+    public void OnPayloadInvalidated(string payloadKey, InvalidationReason reason) => _invalidated.Enqueue((payloadKey, reason));
+    public void OnPayloadDeviceDemoted(string payloadKey, PayloadFootprint previous, PayloadFootprint current)
+        => _deviceDemotions.Enqueue((payloadKey, previous, current));
     public bool CanMaterialize(string payloadKey, int payloadTokens, int targetTokens)
         => _cacheModel.CanMaterialize(payloadKey, payloadTokens, targetTokens);
     public bool CanRewindPrimary(int payloadTokens, int targetTokens)
@@ -603,7 +652,41 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
     internal void Drain()
     {
         bool hadInvalidations = _invalidated.Count > 0;
-        while (_invalidated.TryDequeue(out var key)) _tree.InvalidatePayload(key);
+        while (_invalidated.TryDequeue(out var invalidation))
+        {
+            // Callback notifications remain deferred to this worker boundary.
+            // Tree metadata is observed before detach; it describes the indexed
+            // payload, never physical release credit, a model checkpoint flag,
+            // or the pool that originally triggered the callback.
+            try
+            {
+                if (_logger.IsEnabled(LogLevel.Debug))
+                {
+                    RadixNode? node = null;
+                    if (invalidation.Key is not null)
+                        _tree.TryGetNodeByKey(invalidation.Key, out node);
+                    EndStatePayload? payload = node?.EndState;
+                    _logger.LogDebug(
+                        "Radix payload invalidation: key={PayloadKey}, reason={InvalidationReason}, indexed={PayloadIndexed}, " +
+                        "nodeId={NodeId}, scope={ScopeIndex}, depth={NodeDepth}, kind={PayloadKind}, origin={PayloadOrigin}, " +
+                        "tokens={PayloadTokens}, capacity={PayloadCapacityTokens}, pathLocks={PathLockCount}, stateLocks={StateLockCount}, pins={PinCount}.",
+                        invalidation.Key, invalidation.Reason, node is not null,
+                        node?.Id, node?.ScopeIx, node?.Depth, payload?.Kind, payload?.Origin,
+                        payload?.Footprint.Tokens, payload?.Footprint.CapacityTokens,
+                        node?.LockRef, node?.StateLockRef, node?.PinRef);
+                }
+            }
+            catch (Exception)
+            {
+                // Optional diagnostics must not lose an already-dequeued
+                // model invalidation when a logging provider fails.
+            }
+            _tree.InvalidatePayload(invalidation.Key!);
+        }
+        // Invalidations take precedence. A delayed transfer report cannot
+        // revive a removed payload or change a newer holder at the same node.
+        while (_deviceDemotions.TryDequeue(out var demotion))
+            _tree.TryApplyDeviceDemotion(demotion.Key, demotion.Previous, demotion.Current);
         int refused = _tree.FlushQueuedInvalidations();
         int released = _tree.Reclaim.Drain(ReleasePayloads);
         if (hadInvalidations || refused > 0 || released > 0) RetireEmptyScopes();
@@ -649,6 +732,25 @@ internal sealed partial class PrefixCacheCoordinator : IPrefixPayloadSink, IPayl
         _primaryKey = null;
         _storeMisses.Clear();
         Drain();
+    }
+
+    /// <summary>Admission needs actual released credit, not the tree's predicted
+    /// byte counts. Drain each victim before rechecking the shared multi-pool budget.
+    /// Stop as soon as work fits, preserving the remaining reusable prefixes.</summary>
+    internal bool ReclaimForAdmission(Func<bool> canAdmit, Action? releasePooledMemory = null,
+        int maximumVictims = int.MaxValue)
+    {
+        Drain();
+        int reclaimed = 0;
+        while (reclaimed < maximumVictims && !canAdmit() && _tree.EvictOneForAdmission())
+        {
+            reclaimed++;
+            Drain();
+            // A released holder may return buffers to a still-charged pool.
+            // Return those physical bytes before selecting another victim.
+            if (!canAdmit()) releasePooledMemory?.Invoke();
+        }
+        return reclaimed > 0 && reclaimed == maximumVictims && !canAdmit();
     }
 
     internal void Detach() => _cacheModel.DetachPrefixCache();

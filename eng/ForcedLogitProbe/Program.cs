@@ -6,6 +6,7 @@ using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text.Json;
 using TensorSharp;
+using TensorSharp.GGML;
 using TensorSharp.Models;
 using TensorSharp.Runtime;
 
@@ -110,7 +111,14 @@ foreach (var item in cases)
     }
     if (referenceFile != null && referenceFile.Position != referenceFile.Length) throw new InvalidOperationException("Reference logit width/step mismatch");
     item.GeneratedTokens = generated;
-    results.Add(new { name = item.Name, prompt_tokens = item.PromptTokens.Length, steps = count, metrics });
+    int requestedRanks = int.Parse(Environment.GetEnvironmentVariable("TENSORSHARP_TP_DEGREE") ?? "1");
+    var cacheMemory = Enumerable.Range(0, requestedRanks).Select(rank =>
+    {
+        bool available = GgmlBasicOps.TryGetCacheMemoryUsage(rank, out var usage);
+        return new { rank, available, usage };
+    }).ToArray();
+    results.Add(new { name = item.Name, prompt_tokens = item.PromptTokens.Length, steps = count, metrics,
+        cache_memory = cacheMemory });
     File.WriteAllText(Path.Combine(directory, "metrics.json"), JsonSerializer.Serialize(new { all_finite = allFinite,
         qualified = referenceDir == null ? (bool?)null : qualified,
         gate = new { max_relative_l2 = 0.001, min_cosine = 0.999999, require_identical_top1 = true },

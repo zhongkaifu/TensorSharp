@@ -8,6 +8,7 @@ namespace TensorSharp.MLX
     {
         private readonly object sync = new();
         private IntPtr buffer;
+        private MlxHostMirrorOwner hostMirror;
         private MlxNative.MlxArray deviceArray;
         private bool hostDirty = true;
         private bool deviceDirty;
@@ -26,16 +27,16 @@ namespace TensorSharp.MLX
 
         protected override void Destroy()
         {
-            if (buffer != IntPtr.Zero)
+            lock (sync)
             {
-                NativeMemory.AlignedFree(buffer.ToPointer());
+                hostMirror?.Dispose();
+                hostMirror = null;
                 buffer = IntPtr.Zero;
-            }
-
-            if (deviceArray.IsValid)
-            {
-                MlxNative.FreeArray(deviceArray);
-                deviceArray = default;
+                if (deviceArray.IsValid)
+                {
+                    MlxNative.FreeArray(deviceArray);
+                    deviceArray = default;
+                }
             }
         }
 
@@ -58,6 +59,7 @@ namespace TensorSharp.MLX
             ThrowIfDestroyed();
             lock (sync)
             {
+                ThrowIfDestroyed();
                 EnsureHostBufferAllocated();
                 if (!deviceDirty || !deviceArray.IsValid || ByteLength == 0)
                     return;
@@ -212,6 +214,7 @@ namespace TensorSharp.MLX
 
             lock (sync)
             {
+                ThrowIfDestroyed();
                 if (deviceArray.IsValid && !hostDirty)
                     return;
 
@@ -483,9 +486,9 @@ namespace TensorSharp.MLX
             if (buffer != IntPtr.Zero)
                 return;
 
-            nuint allocationBytes = (nuint)Math.Max(ByteLength, 1);
-            buffer = (IntPtr)NativeMemory.AlignedAlloc(allocationBytes, 64);
-            NativeMemory.Clear(buffer.ToPointer(), allocationBytes);
+            var owner = MlxHostMirrorOwner.Allocate(ByteLength);
+            hostMirror = owner;
+            buffer = owner.Pointer;
         }
 
         private void ValidateElementRange(long index, long length)

@@ -2,6 +2,7 @@
 // Licensed under the BSD-3-Clause license in the repository root.
 #include "ggml_ops_internal.h"
 #include "ggml_ops_bonsai.h"
+#include "ggml_ops_q8_weight_policy.h"
 #include <map>
 #include <tuple>
 
@@ -149,7 +150,7 @@ ggml_tensor * bonsai_transform(ggml_context * ctx, ggml_tensor * x, const void *
     return x;
 }
 ggml_tensor * bonsai_mul_mat(ggml_context * ctx, ggml_tensor * w, ggml_tensor * x, const void * key) {
-    return ggml_mul_mat(ctx, w, bonsai_transform(ctx, x, key, false));
+    return tsg::weight_mul_mat(ctx, w, bonsai_transform(ctx, x, key, false), key);
 }
 ggml_tensor * bonsai_get_rows(ggml_context * ctx, ggml_tensor * w, ggml_tensor * ids, const void * key) {
     return bonsai_transform(ctx, ggml_get_rows(ctx, w, ids), key, true);

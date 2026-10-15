@@ -89,6 +89,7 @@ namespace TensorSharp.Models
         private Dictionary<string, Qwen4ExpKvCacheHolder> _fusedHolders;
         private string _activeFusedKey;
         private Qwen4ExpKvCacheHolder _primaryHolder;
+        private Qwen4ExpKvCacheHolder _pendingHolderAllocation;
         private float[] _holderLogits;
         // Span graph-slot base of the ACTIVE holder (0 = primary).
         private int _seqSlotBase;
@@ -188,12 +189,28 @@ namespace TensorSharp.Models
         private Qwen4ExpKvCacheHolder CreateFreshHolder()
             => AllocateHolder(_initialKvCacheCapacity > 0 ? _initialKvCacheCapacity : _kvCacheCapacity);
 
+        // Allocation, copying and publication are all fallible. Keep an
+        // unpublished copy reachable until its physical cleanup has succeeded.
+        private void DisposeUnpublishedHolder(Qwen4ExpKvCacheHolder holder)
+        {
+            _pendingHolderAllocation = holder;
+            DisposeHolder(holder);
+            ReleaseSlotBase(holder.SlotBase);
+            _pendingHolderAllocation = null;
+        }
+
         /// <summary>A brand-new, zeroed holder with attention K/V and QSA raw-key
         /// caches of <paramref name="cap"/> rows and zeroed recurrent/PLE state. The
         /// allocation half of <see cref="CreateFreshHolder"/>, on its own so a copy
         /// can be sized to what its source holds (RetainedCache).</summary>
         private Qwen4ExpKvCacheHolder AllocateHolder(int cap)
         {
+            if (_pendingHolderAllocation != null)
+            {
+                DisposeHolder(_pendingHolderAllocation);
+                ReleaseSlotBase(_pendingHolderAllocation.SlotBase);
+                _pendingHolderAllocation = null;
+            }
             int nLayer = Config.NumLayers;
             DType kvDtype = _kvCacheDtype.ToDType();
             if (cap <= 0) throw new ArgumentOutOfRangeException(nameof(cap));
@@ -205,6 +222,17 @@ namespace TensorSharp.Models
             var convWriteIdx = new int[nLayer];
             var convStateT = new Tensor[nLayer];
             var stateT = new Tensor[nLayer];
+            var holder = new Qwen4ExpKvCacheHolder
+            {
+                K = k, V = v, IdxK = idx, KvCapacity = cap,
+                GdnConvState = convState, GdnConvWriteIdx = convWriteIdx,
+                GdnConvStateT = convStateT, GdnStateT = stateT,
+                PleHistory = new List<int>()
+            };
+            // This owner exists before the first physical allocation. A failed
+            // cleanup remains reachable for unload/retry; never orphan the
+            // already-created earlier layers when a later allocation is refused.
+            _pendingHolderAllocation = holder;
 
             try
             {
@@ -235,41 +263,21 @@ namespace TensorSharp.Models
                     pleConv = GC.AllocateArray<float>(
                         checked((int)((long)(_pleConvKernel - 1) * _pleNgram * _hcDim)), pinned: true);
 
-                var holder = new Qwen4ExpKvCacheHolder
-                {
-                    K = k,
-                    V = v,
-                    IdxK = idx,
-                    KvCapacity = cap,
-                    CacheSeqLen = 0,
-                    KvHostStale = false,
-                    GdnConvState = convState,
-                    GdnConvWriteIdx = convWriteIdx,
-                    GdnConvStateT = convStateT,
-                    GdnStateT = stateT,
-                    PleConvState = pleConv,
-                    PleHistory = new List<int>(),
-                    PleNextPos = 0,
-                    MropeCacheGap = 0,
-                    AttnArgs = null,
-                    GdnArgs = null,
-                    PleArgs = null,
-                    SlotBase = 0,
-                };
+                holder.PleConvState = pleConv;
                 holder.SlotBase = ClaimSlotBase();
+                _pendingHolderAllocation = null;
                 return holder;
             }
-            catch
+            catch (Exception creation)
             {
-                // Allocation can fail after earlier layers already own buffers.
-                // None of these tensors has been published to a live holder.
-                foreach (Tensor[] set in new[] { k, v, idx, convStateT, stateT })
-                    foreach (Tensor tensor in set)
-                        if (tensor != null)
-                        {
-                            InvalidateTensorDeviceCache(tensor);
-                            tensor.Dispose();
-                        }
+                try
+                {
+                    DisposeHolder(holder);
+                    ReleaseSlotBase(holder.SlotBase);
+                    _pendingHolderAllocation = null;
+                }
+                catch (Exception cleanup)
+                { throw new AggregateException("Holder allocation and cleanup failed; the model retains its cleanup owner.", creation, cleanup); }
                 throw;
             }
         }
@@ -295,6 +303,7 @@ namespace TensorSharp.Models
             }
             else
             {
+                _fusedHolders.EnsureCapacity(checked(_fusedHolders.Count + 1));
                 holder = CreateFreshHolder();
                 _fusedHolders[requestId] = holder;
                 fresh = true;
@@ -350,6 +359,10 @@ namespace TensorSharp.Models
                 // re-seed may have replaced fields since it was loaded. Dispose what
                 // is live, not what was recorded at bind time.
                 holder = SnapshotActiveCache();
+                // The snapshot contains any buffers grown since binding.
+                // Publish it before disposal so a partial native/host free
+                // failure retains a complete retry owner in the registry.
+                _fusedHolders[requestId] = holder;
                 _activeFusedKey = null;
                 if (_primaryHolder != null)
                 {
@@ -358,8 +371,8 @@ namespace TensorSharp.Models
                 }
             }
 
-            _fusedHolders.Remove(requestId);
             DisposeHolder(holder);
+            _fusedHolders.Remove(requestId);
             ReleaseSlotBase(holder.SlotBase);
         }
 
@@ -386,7 +399,6 @@ namespace TensorSharp.Models
         private void DisposeHolder(Qwen4ExpKvCacheHolder holder)
         {
             if (holder == null || holder.Disposed) return;
-            holder.Disposed = true;
             holder.Retired = true;
             ReleaseMtpState(holder.GdnConvStateT);
             if (ReferenceEquals(_specSnapshotOwner, holder.GdnConvStateT))
@@ -406,11 +418,13 @@ namespace TensorSharp.Models
             void DisposeSet(Tensor[] set)
             {
                 if (set == null) return;
-                foreach (var t in set)
+                for (int i = 0; i < set.Length; i++)
                 {
+                    var t = set[i];
                     if (t == null) continue;
                     InvalidateTensorDeviceCache(t);
                     t.Dispose();
+                    set[i] = null;
                 }
             }
             DisposeSet(holder.K);
@@ -418,10 +432,17 @@ namespace TensorSharp.Models
             DisposeSet(holder.IdxK);
             DisposeSet(holder.GdnConvStateT);
             DisposeSet(holder.GdnStateT);
+            holder.Disposed = true;
         }
 
         private void DisposeAllFusedHolders()
         {
+            if (_pendingHolderAllocation != null)
+            {
+                DisposeHolder(_pendingHolderAllocation);
+                ReleaseSlotBase(_pendingHolderAllocation.SlotBase);
+                _pendingHolderAllocation = null;
+            }
             if (_fusedHolders != null)
             {
                 foreach (var kv in _fusedHolders)

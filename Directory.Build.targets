@@ -1,0 +1,31 @@
+<Project>
+  <!-- The SDK's publish "Always" bucket can still skip equal-size/equal-time
+       files. Re-copy only its already selected CUDA PTX payloads; never guess a
+       producer, inspect obj, or change ordinary content-copy behavior. -->
+  <Target Name="TensorSharpCopySelectedPtxToPublish"
+          AfterTargets="CopyFilesToPublishDirectory"
+          Condition="'$(PublishDir)' != '' and '@(ResolvedFileToPublish)' != ''">
+    <PropertyGroup>
+      <_TensorSharpPtxPublishRoot>$([MSBuild]::NormalizeDirectory('$(MSBuildProjectDirectory)', '$(PublishDir)', 'cuda_kernels'))</_TensorSharpPtxPublishRoot>
+    </PropertyGroup>
+    <ItemGroup>
+      <_TensorSharpPtxPublishCandidate Include="@(ResolvedFileToPublish)"
+          Condition="'%(ResolvedFileToPublish.Extension)' == '.ptx' and '%(ResolvedFileToPublish.CopyToPublishDirectory)' != 'Never' and '%(ResolvedFileToPublish.RelativePath)' != ''">
+        <NormalizedRelativePath>$([System.String]::Copy('%(ResolvedFileToPublish.RelativePath)').Replace('\', '/'))</NormalizedRelativePath>
+      </_TensorSharpPtxPublishCandidate>
+      <_TensorSharpPtxPublishSelected Include="@(_TensorSharpPtxPublishCandidate)">
+        <DestinationPath>$([MSBuild]::NormalizePath('$(MSBuildProjectDirectory)', '$(PublishDir)', '%(_TensorSharpPtxPublishCandidate.NormalizedRelativePath)'))</DestinationPath>
+      </_TensorSharpPtxPublishSelected>
+      <!-- Normalize dot segments before checking the directory boundary. The
+           trailing separator prevents cuda_kernels_other from matching. -->
+      <_TensorSharpPtxPublishSelected Remove="@(_TensorSharpPtxPublishSelected)"
+          Condition="!$([System.String]::Copy('%(_TensorSharpPtxPublishSelected.DestinationPath)').StartsWith('$(_TensorSharpPtxPublishRoot)'))" />
+    </ItemGroup>
+    <Copy SourceFiles="@(_TensorSharpPtxPublishSelected)"
+          DestinationFiles="@(_TensorSharpPtxPublishSelected->'%(DestinationPath)')"
+          SkipUnchangedFiles="false"
+          Condition="'@(_TensorSharpPtxPublishSelected)' != ''">
+      <Output TaskParameter="DestinationFiles" ItemName="FileWrites" />
+    </Copy>
+  </Target>
+</Project>

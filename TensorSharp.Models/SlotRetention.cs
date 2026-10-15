@@ -18,7 +18,7 @@ namespace TensorSharp.Models
     internal static class SlotRetention
     {
         /// <summary>A retained slot and the tokens it held when it was retained (a retained slot never runs).</summary>
-        internal readonly record struct RetainedSlot(int Slot, int Tokens);
+        internal readonly record struct RetainedSlot(int Slot, int Tokens, bool IsCopy = false);
 
         /// <summary>The native slot operations the retention moves need.</summary>
         internal interface ISlotStore

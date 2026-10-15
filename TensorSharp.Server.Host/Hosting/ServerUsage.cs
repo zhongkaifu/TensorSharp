@@ -99,6 +99,14 @@ namespace TensorSharp.Server.Host.Hosting
                     "Host a GGUF embedding encoder instead of a chat model. Exposes /v1/embeddings and /api/embed. " +
                     "Requires --model; supports cpu (pure C#, no native libraries), ggml_cpu, ggml_metal, and ggml_cuda. Chat prefix warmup is skipped.",
                     "--model snowflake-arctic-embed-l-v2.0-q8_0.gguf --embeddings --no-webui"),
+                new OptionHelp("--unified-memory",
+                    "Explicit shared-budget model session for Qwen4Exp or GLM5Next on a single ggml_cuda GPU, " +
+                    "including a matching --mmproj. Default: off. Unsupported models, backends, tensor parallelism " +
+                    "and speculation are refused. Up to three requests can join native decode batches when their " +
+                    "state and workspace fit. Budgeted in-memory conversation prefixes and scheduled startup warmup " +
+                    "are enabled. Live block-KV/SSD paging remains unavailable; Qwen can demote inactive retained " +
+                    "state to charged host mirrors. This is not an OS-enforced whole-process RAM/VRAM hard limit.",
+                    "--model Qwen3.8-Flash-Next.gguf --mmproj mmproj-BF16.gguf --backend ggml_cuda --unified-memory"),
                 new OptionHelp("--embedding-threads <N>",
                     "CPU threads for the embedding encoder. Requires --embeddings; default: backend chooses.",
                     "--embedding-threads 8"),
@@ -184,7 +192,8 @@ namespace TensorSharp.Server.Host.Hosting
             {
                 new OptionHelp("--max-tokens <N>",
                     "Maximum tokens to generate per request: fills in when the request omits a limit, and caps a " +
-                    "request that asks for more. Default: 20000, uncapped (MAX_TOKENS env var overrides).",
+                    "request that asks for more. The unpinned fallback is 2048 with --unified-memory, otherwise 20000; " +
+                    "an explicit request limit may exceed that fallback. --max-tokens or MAX_TOKENS pins the cap.",
                     "--max-tokens 4096"),
                 new OptionHelp("--temperature <f>",
                     "Sampling temperature; 0 = greedy. Default: 0.8 (TENSORSHARP_TEMPERATURE env var).",

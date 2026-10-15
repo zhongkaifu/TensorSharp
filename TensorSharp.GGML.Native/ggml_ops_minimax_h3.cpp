@@ -432,7 +432,7 @@ TSG_EXPORT int TSGgml_MiniMaxH3VideoVaeDecode(const TSGgmlMiniMaxH3VideoVaeDecod
         BufferHandle buffer(nullptr);
         if (!alloc_graph_reuse_gallocr(graph))
         {
-            buffer.value = ggml_backend_alloc_ctx_tensors(ctx, g_backend);
+            buffer.value = alloc_ctx_tensors_budgeted(ctx, g_backend);
             if (buffer.value == nullptr)
             { set_last_error("MiniMaxH3VideoVaeDecode: buffer alloc failed."); return 0; }
         }
@@ -680,7 +680,7 @@ TSG_EXPORT int TSGgml_MiniMaxH3TextEncode(const TSGgmlMiniMaxH3TextEncodeDesc* d
         BufferHandle buffer(nullptr);
         if (!alloc_graph_reuse_gallocr(graph))
         {
-            buffer.value = ggml_backend_alloc_ctx_tensors(ctx, g_backend);
+            buffer.value = alloc_ctx_tensors_budgeted(ctx, g_backend);
             if (buffer.value == nullptr)
             { set_last_error("MiniMaxH3TextEncode: buffer alloc failed."); return 0; }
         }
@@ -1235,7 +1235,7 @@ TSG_EXPORT int TSGgml_MiniMaxH3DitForward(const TSGgmlMiniMaxH3DitForwardDesc* d
         BufferHandle buffer(nullptr);
         if (!alloc_graph_reuse_gallocr(graph))
         {
-            buffer.value = ggml_backend_alloc_ctx_tensors(ctx, g_backend);
+            buffer.value = alloc_ctx_tensors_budgeted(ctx, g_backend);
             if (buffer.value == nullptr)
             { set_last_error("MiniMaxH3DitForward: buffer alloc failed."); return 0; }
         }
@@ -1507,7 +1507,7 @@ TSG_EXPORT int TSGgml_MiniMaxH3VideoVaeEncode(const TSGgmlMiniMaxH3VideoVaeEncod
         BufferHandle buffer(nullptr);
         if (!alloc_graph_reuse_gallocr(graph))
         {
-            buffer.value = ggml_backend_alloc_ctx_tensors(ctx, g_backend);
+            buffer.value = alloc_ctx_tensors_budgeted(ctx, g_backend);
             if (buffer.value == nullptr)
             { set_last_error("MiniMaxH3VideoVaeEncode: buffer alloc failed."); return 0; }
         }
@@ -1819,7 +1819,7 @@ TSG_EXPORT int TSGgml_MiniMaxH3AudioVaeDecode(const TSGgmlMiniMaxH3AudioVaeDecod
         BufferHandle buffer(nullptr);
         if (!alloc_graph_reuse_gallocr(graph))
         {
-            buffer.value = ggml_backend_alloc_ctx_tensors(ctx, g_backend);
+            buffer.value = alloc_ctx_tensors_budgeted(ctx, g_backend);
             if (buffer.value == nullptr)
             { set_last_error("MiniMaxH3AudioVaeDecode: buffer alloc failed."); return 0; }
         }
@@ -2076,7 +2076,7 @@ TSG_EXPORT int TSGgml_MiniMaxH3VisionEncode(const TSGgmlMiniMaxH3VisionEncodeDes
             BufferHandle pbuf(nullptr);
             if (!alloc_graph_reuse_gallocr(pg))
             {
-                pbuf.value = ggml_backend_alloc_ctx_tensors(ctx, g_backend);
+                pbuf.value = alloc_ctx_tensors_budgeted(ctx, g_backend);
                 if (pbuf.value == nullptr)
                 { set_last_error("MiniMaxH3VisionEncode: probe buffer alloc failed."); return 0; }
             }
@@ -2138,7 +2138,7 @@ TSG_EXPORT int TSGgml_MiniMaxH3VisionEncode(const TSGgmlMiniMaxH3VisionEncodeDes
         BufferHandle buffer(nullptr);
         if (!alloc_graph_reuse_gallocr(graph))
         {
-            buffer.value = ggml_backend_alloc_ctx_tensors(ctx, g_backend);
+            buffer.value = alloc_ctx_tensors_budgeted(ctx, g_backend);
             if (buffer.value == nullptr)
             { set_last_error("MiniMaxH3VisionEncode: buffer alloc failed."); return 0; }
         }
@@ -2466,7 +2466,7 @@ TSG_EXPORT int TSGgml_MiniMaxH3AudioVaeEncode(const TSGgmlMiniMaxH3AudioVaeEncod
         BufferHandle buffer(nullptr);
         if (!alloc_graph_reuse_gallocr(graph))
         {
-            buffer.value = ggml_backend_alloc_ctx_tensors(ctx, g_backend);
+            buffer.value = alloc_ctx_tensors_budgeted(ctx, g_backend);
             if (buffer.value == nullptr)
             { set_last_error("MiniMaxH3AudioVaeEncode: buffer alloc failed."); return 0; }
         }
@@ -2800,7 +2800,7 @@ TSG_EXPORT int TSGgml_MiniMaxH3VideoVaeEncode3D(const TSGgmlMiniMaxH3VideoVaeEnc
             BufferHandle pbuf(nullptr);
             if (!alloc_graph_reuse_gallocr(pg))
             {
-                pbuf.value = ggml_backend_alloc_ctx_tensors(ctx, g_backend);
+                pbuf.value = alloc_ctx_tensors_budgeted(ctx, g_backend);
                 if (pbuf.value == nullptr)
                 { set_last_error("MiniMaxH3VideoVaeEncode3D: probe buffer alloc failed."); return 0; }
             }
@@ -2869,7 +2869,7 @@ TSG_EXPORT int TSGgml_MiniMaxH3VideoVaeEncode3D(const TSGgmlMiniMaxH3VideoVaeEnc
         BufferHandle buffer(nullptr);
         if (!alloc_graph_reuse_gallocr(graph))
         {
-            buffer.value = ggml_backend_alloc_ctx_tensors(ctx, g_backend);
+            buffer.value = alloc_ctx_tensors_budgeted(ctx, g_backend);
             if (buffer.value == nullptr)
             { set_last_error("MiniMaxH3VideoVaeEncode3D: buffer alloc failed."); return 0; }
         }

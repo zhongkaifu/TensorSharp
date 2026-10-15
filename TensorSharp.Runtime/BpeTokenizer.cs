@@ -40,6 +40,9 @@ namespace TensorSharp.Runtime
         int BosTokenId { get; }
         int[] EosTokenIds { get; }
         int VocabSize { get; }
+        /// <summary>Model-declared generation exclusions, independent of user sampling penalties.
+        /// An empty list does not imply that every special token is forbidden.</summary>
+        IReadOnlyList<int> SuppressedTokenIds => Array.Empty<int>();
         List<int> Encode(string text, bool addSpecial = true);
         string Decode(List<int> ids);
         void AppendTokenBytes(int tokenId, List<byte> buffer);
@@ -79,6 +82,7 @@ namespace TensorSharp.Runtime
         public int BosTokenId => _bosTokenId;
         public int[] EosTokenIds => _eosTokenIds;
         public int VocabSize => _vocab.Length;
+        public IReadOnlyList<int> SuppressedTokenIds { get; init; } = Array.Empty<int>();
 
         public BpeTokenizer(string[] vocab, int[] tokenTypes, string[] merges,
             int bosTokenId, int[] eosTokenIds, bool addBos, bool addEos,

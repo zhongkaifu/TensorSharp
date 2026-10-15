@@ -12,11 +12,12 @@ from __future__ import annotations
 import argparse
 import ast
 import ctypes
+import hashlib
 import importlib.util
 import json
 import math
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import statistics
 import struct
@@ -24,6 +25,7 @@ import subprocess
 import sys
 import threading
 import time
+import zipfile
 
 
 HERE = Path(__file__).resolve().parent
@@ -31,11 +33,50 @@ spec = importlib.util.spec_from_file_location("expert_cache_validation", HERE / 
 cache = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(cache)
 
+
+def dependency_identity(path, expected_revision, manifest_path=None):
+    """Verify an unchanged Git checkout or every payload of a pinned archive."""
+    path = Path(path).resolve()
+    if manifest_path is None:
+        revision, status = cache.git(path, "rev-parse", "HEAD"), cache.git(path, "status", "--porcelain")
+        if revision != expected_revision or status:
+            raise ValueError("Strata dependency revision or clean status differs from its pinned source")
+        return {"revision": revision, "status": status, "verification": "git"}
+    manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8-sig"))
+    archive = Path(manifest["archive"])
+    if (manifest.get("revision") != expected_revision or Path(manifest["source"]).resolve() != path
+            or cache.sha(archive) != manifest.get("archive_sha256")):
+        raise ValueError("Strata dependency archive provenance mismatch")
+    expected = {}
+    with zipfile.ZipFile(archive) as zipped:
+        for member in zipped.infolist():
+            parts = PurePosixPath(member.filename).parts
+            if not parts or parts[0] != "llama.cpp-" + expected_revision or any(p == ".." for p in parts):
+                raise ValueError("Strata dependency archive root does not match its pinned revision")
+            if member.is_dir():
+                continue
+            relative = "/".join(parts[1:])
+            if not relative or relative in expected:
+                raise ValueError("Strata dependency archive has duplicate or empty payload paths")
+            digest = hashlib.sha256(zipped.read(member)).hexdigest()
+            payload = path.joinpath(*parts[1:])
+            if not payload.is_file() or payload.is_symlink() or cache.sha(payload) != digest:
+                raise ValueError("Strata dependency extracted payload differs: " + relative)
+            expected[relative] = digest
+    actual = {p.relative_to(path).as_posix() for p in path.rglob("*") if p.is_file()}
+    if not expected or actual != set(expected):
+        raise ValueError("Strata dependency has extra or missing source files")
+    return {"revision": expected_revision, "status": "", "verification": "archive-payloads",
+            "archive": str(archive.resolve()), "archive_sha256": manifest["archive_sha256"],
+            "verified_files": len(expected), "manifest_sha256": cache.sha(manifest_path)}
+
+
 CASES = {
     "math": "Compute 17 + 25. Reply with only the integer.",
     "extraction": "Inventory: cedar=3, maple=7, pine=2. Return only the names whose quantity is at least 3, comma-separated in the original order.",
     "code": "Write a Python function square(x) that returns x*x. Return only the function, without Markdown.",
     "squares": "Return the squares of the integers 1 through 20, in order, as comma-separated integers. Return only the list.",
+    "tool_json": 'Available tool: get_weather(city, unit), where unit is "celsius" or "fahrenheit". User asks: What is the weather in Hangzhou in Celsius? Return only one JSON object with exactly the keys "name" and "arguments", containing the tool name and its required arguments. Do not answer the weather question.',
 }
 
 
@@ -44,17 +85,27 @@ def semantic_check(case, text, complete):
     if not complete or not text.strip():
         return {"passed": False, "reason": "missing EOS or empty answer"}
     if case == "math":
-        passed = re.fullmatch(r"42[.!]?", text.strip()) is not None
+        passed = text.strip() == "42"
     elif case == "extraction":
-        passed = re.findall(r"[A-Za-z]+", text.lower()) == ["cedar", "maple"]
+        passed = re.fullmatch(r"cedar\s*,\s*maple", text.strip(), re.IGNORECASE) is not None
     elif case == "squares":
         answer = text.strip()
         passed = bool(re.fullmatch(r"\d+(?:\s*,\s*\d+){19}", answer)) and [int(value.strip()) for value in answer.split(",")] == [value * value for value in range(1, 21)]
+    elif case == "tool_json":
+        def unique_object(pairs):
+            result = dict(pairs)
+            if len(result) != len(pairs):
+                raise ValueError("Duplicate JSON keys")
+            return result
+        try:
+            passed = json.loads(text, object_pairs_hook=unique_object) == {
+                "name": "get_weather", "arguments": {"city": "Hangzhou", "unit": "celsius"}}
+        except (ValueError, TypeError):
+            passed = False
     elif case == "code":
         source = text.strip()
-        if source.startswith("```"):
-            source = re.sub(r"^```(?:python)?\s*\n", "", source)
-            source = re.sub(r"\n```\s*$", "", source)
+        # The task explicitly forbids Markdown. Parsing the original answer
+        # prevents a formatting failure from becoming a pass after repair.
         try:
             tree = ast.parse(source)
             functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)]
@@ -232,40 +283,76 @@ def windows_peak_working_set(pid):
 
 
 def run_process(command, cwd, environment, directory, timeout):
-    directory.mkdir(parents=True)
-    samples, peaks, stopped = [], [], threading.Event()
+    directory.mkdir(parents=True, exist_ok=False)
+    samples, peaks, sampling_errors, stopped = [], [], [], threading.Event()
     started = time.monotonic()
     evidence = {"command": command, "environment": {key: value for key, value in environment.items()
-                if key.startswith(("TS_HOST_MOE_", "MAX_CONTEXT", "KV_CACHE_DTYPE"))}, "passed": False}
-    with (directory / "process.log").open("w", encoding="utf-8") as log:
-        process = subprocess.Popen(command, cwd=cwd, env=environment, stdout=log, stderr=subprocess.STDOUT)
-        def sample():
-            while not stopped.is_set():
-                samples.append(cache.gpu_sample())
-                peak = windows_peak_working_set(process.pid)
-                if peak is not None:
-                    peaks.append(peak)
-                stopped.wait(1)
-        thread = threading.Thread(target=sample, daemon=True)
-        thread.start()
-        try:
-            evidence["exit_code"] = process.wait(timeout=timeout)
-            evidence["passed"] = evidence["exit_code"] == 0
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait()
-            evidence.update(exit_code=process.returncode, failure="timeout", timeout_seconds=timeout)
-        finally:
-            evidence["whole_process_seconds"] = time.monotonic() - started
-            stopped.set()
-            thread.join(timeout=15)
-    evidence["sampled_peak_working_set_bytes"] = max(peaks) if peaks else None
-    (directory / "gpu.json").write_text(json.dumps(samples, indent=2) + "\n", encoding="utf-8")
-    (directory / "run.json").write_text(json.dumps(evidence, indent=2) + "\n", encoding="utf-8")
+                if key.upper().startswith(("TS_HOST_MOE_", "STRATA_", "CUDA_", "MAX_CONTEXT", "KV_CACHE_DTYPE"))
+                or key.upper() in ("TS_CPU_MOE_THREADS", "TS_GGML_CPU_THREADS")}, "passed": False,
+                "complete": False, "exit_code": None, "timeout_seconds": timeout, "cleanup_errors": []}
+    process = thread = None
+    def publish():
+        temporary = directory / "run.json.tmp"
+        temporary.write_text(json.dumps(evidence, indent=2) + "\n", encoding="utf-8")
+        temporary.replace(directory / "run.json")
+    publish()
+    try:
+        with (directory / "process.log").open("w", encoding="utf-8") as log:
+            process = subprocess.Popen(command, cwd=cwd, env=environment, stdout=log, stderr=subprocess.STDOUT,
+                                       creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+            evidence["pid"] = process.pid
+            publish()
+            def sample():
+                while not stopped.is_set():
+                    try:
+                        samples.append(cache.gpu_sample())
+                        peak = windows_peak_working_set(process.pid)
+                        if peak is not None:
+                            peaks.append(peak)
+                    except Exception as error:
+                        sampling_errors.append(repr(error))
+                        return
+                    stopped.wait(1)
+            thread = threading.Thread(target=sample, daemon=True)
+            thread.start()
+            try:
+                evidence["exit_code"] = process.wait(timeout=timeout)
+                evidence["complete"] = True
+            except subprocess.TimeoutExpired:
+                evidence.update(failure="timeout", timed_out=True)
+    except BaseException as error:
+        evidence.update(failure=repr(error), complete=False)
+        raise
+    finally:
+        evidence["whole_process_seconds"] = time.monotonic() - started
+        if process is not None:
+            try:
+                if process.poll() is None:
+                    process.kill()
+                evidence["exit_code"] = process.wait(timeout=15)
+            except Exception as error:
+                evidence["cleanup_errors"].append("owned process: " + repr(error))
+        stopped.set()
+        if thread is not None and thread.ident is not None:
+            try:
+                thread.join(timeout=15)
+                if thread.is_alive():
+                    evidence["cleanup_errors"].append("sampler did not stop")
+            except Exception as error:
+                evidence["cleanup_errors"].append("sampler: " + repr(error))
+        evidence["sampling_errors"] = list(sampling_errors)
+        evidence["gpu_telemetry_complete"] = (bool(samples) and not sampling_errors
+            and all(row.get("exit_code") == 0 and row.get("csv") and not row.get("error") for row in samples))
+        evidence["sampled_peak_working_set_bytes"] = max(peaks) if peaks else None
+        evidence["passed"] = (evidence["complete"] and evidence["exit_code"] == 0
+            and not evidence.get("failure") and not evidence["cleanup_errors"])
+        evidence["harness_wall_seconds"] = time.monotonic() - started
+        (directory / "gpu.json").write_text(json.dumps(list(samples), indent=2) + "\n", encoding="utf-8")
+        publish()
     return evidence
 
 
-def ts_environment(budget):
+def ts_environment(budget, cpu_threads=0):
     environment = os.environ.copy()
     for key in list(environment):
         if key.startswith(("TS_SPEC", "TS_MTP", "TS_Q4E_EXPERT_CACHE_")) or key in (
@@ -274,7 +361,35 @@ def ts_environment(budget):
     environment.update(TS_HOST_MOE_EXPERT_CACHE_MB=str(budget), TS_HOST_MOE_EXPERT_CACHE_LAYERS="48",
                        TS_HOST_MOE_EXPERT_CACHE_DIAGNOSTICS="1", TS_HOST_MOE_EXPERT_CACHE_BRIDGE="1",
                        TS_HOST_MOE_DECODE="1", TS_HOST_MOE_PIN_MAX_MB="0", TS_HOST_MOE_PIN="0")
+    if cpu_threads:
+        environment.update(TS_CPU_MOE_THREADS=str(cpu_threads), TS_GGML_CPU_THREADS=str(cpu_threads))
     return environment
+
+
+def strata_environment(inherited=None):
+    """Keep host/device selection, but never inherit output-changing engine knobs.
+
+    Strata 0.1.42 enables approximate route-tail skipping by default in CUDA
+    serve. Explicit zero also protects this scalar runner if that default is
+    extended to generate. Other experimental route/quantization overrides are
+    removed, not assigned zero: some switches test only presence.
+    """
+    environment = dict(os.environ if inherited is None else inherited)
+    for key in list(environment):
+        if key.upper().startswith("STRATA_"):
+            environment.pop(key)
+    environment["STRATA_ROUTE_TAIL_SKIP"] = "0"
+    return environment
+
+
+def strata_resource_arguments(resident_budget_gib, cpu_threads=0, vram_reserve_mib=None):
+    """Placement controls, not a claim of equal total physical resource limits."""
+    arguments = ["--resident-budget-gib", str(resident_budget_gib)]
+    if cpu_threads:
+        arguments += ["--pool-workers", str(cpu_threads)]
+    if vram_reserve_mib is not None:
+        arguments += ["--vram-reserve-mib", str(vram_reserve_mib)]
+    return arguments
 
 
 def main():
@@ -285,6 +400,8 @@ def main():
     parser.add_argument("--strata", type=Path, required=True)
     parser.add_argument("--strata-root", type=Path, default=Path("C:/Works/Strata"))
     parser.add_argument("--strata-dependency", type=Path)
+    parser.add_argument("--strata-dependency-manifest", type=Path,
+                        help="verified extraction provenance for a dependency downloaded as a pinned zip")
     parser.add_argument("--verified-download-report", type=Path,
                         help="verified downloader report for exactly these checkpoint paths, sizes and publisher SHA-256 values")
     parser.add_argument("--probe", type=Path, default=HERE / "Qwen4ExpExpertCacheProbe/bin/Release/net10.0/Qwen4ExpExpertCacheProbe.dll")
@@ -292,6 +409,10 @@ def main():
     parser.add_argument("--context", type=int, default=512)
     parser.add_argument("--max-new", type=int, default=128)
     parser.add_argument("--resident-budget-gib", type=float, default=8)
+    parser.add_argument("--cpu-threads", type=int, default=0,
+                        help="explicit expert worker count for both engines; zero leaves engine defaults")
+    parser.add_argument("--strata-vram-reserve-mib", type=int,
+                        help="VRAM reserve for Strata's automatic expert cache; not a total physical hard limit")
     parser.add_argument("--strata-expert-profile", type=Path,
                         help="static expert profile required for resident CPU experts; defaults to Strata's shipped data/expert-profile.bin")
     parser.add_argument("--strata-spec-window", type=int, default=2, choices=(0, 2, 3, 4, 5, 6, 7, 8),
@@ -308,8 +429,10 @@ def main():
     parser.add_argument("--dump-strata-logits", action="store_true",
                         help="opt-in stride=1 diagnostic I/O; results then include that I/O and must not be used as quiet throughput")
     args = parser.parse_args()
-    if min(*args.cache_mb, args.context, args.max_new, args.repetitions, args.timeout) <= 0 or args.resident_budget_gib < 0 or len(set(args.cache_mb)) != len(args.cache_mb):
+    if min(*args.cache_mb, args.context, args.max_new, args.repetitions, args.timeout) <= 0 or not math.isfinite(args.resident_budget_gib) or args.resident_budget_gib <= 0 or len(set(args.cache_mb)) != len(args.cache_mb):
         parser.error("budgets, workloads, repetitions and timeouts must be positive")
+    if args.cpu_threads < 0 or (args.strata_vram_reserve_mib is not None and args.strata_vram_reserve_mib < 0):
+        parser.error("worker count and VRAM reserve must be nonnegative")
     if len(set(args.cases)) != len(args.cases):
         parser.error("cases must be unique")
     if args.initial_cache_mb not in [0] + args.cache_mb:
@@ -325,6 +448,8 @@ def main():
               "cases": {}, "comparisons": {}, "runner_sha256": cache.sha(__file__), "settings": vars(args).copy(),
               "limitations": ["Deterministic semantic smoke cases do not establish general language quality.",
                   "Strata's pack converts dense projections to BF16; cross-engine bit-exact logits are not expected.",
+                  "Strata route-tail skipping is explicitly disabled and inherited STRATA overrides are removed; this is not a measurement of the default approximate CUDA serve policy.",
+                  "Strata resident-budget-gib limits resident experts, not total host memory; expert-cache auto is not a common physical VRAM hard limit.",
                   "Stock Strata native IQ experts use a verifier with capacity >=2, explicitly capped to one target row without MTP or suffix drafts; observed window counts must confirm scalar execution.",
                   "Decode and prefill denominators differ between engines; compare their labelled timings and whole-process wall time.",
                   "GPU telemetry includes the desktop and all processes; sampled working set can miss short peaks.",
@@ -354,15 +479,16 @@ def main():
             "tensorsharp": {"generation": "scalar greedy", "mtp": False, "prompt_lookup_drafts": False},
             "strata": {"verifier_capacity": args.strata_spec_window, "target_window_cap": 1,
                        "mtp": False, "mtp_pack_supplied": False, "oracle_supplied": False, "suffix_draft": 0,
+                       "route_tail_skip": 0, "inherited_strata_overrides": "removed",
                        "window_histogram_diagnostic_probability": 1,
                        "prefill": "auto", "generation": "greedy", "algorithm_match_requires_observed_single_row_windows": True}}
         if report["ggml_status"] or report["strata_status"]:
             raise ValueError("Comparison requires unchanged upstream ggml and Strata source checkouts")
         if args.strata_dependency:
-            report.update(strata_dependency_revision=cache.git(args.strata_dependency, "rev-parse", "HEAD"),
-                          strata_dependency_status=cache.git(args.strata_dependency, "status", "--porcelain"))
-            if report["strata_dependency_status"]:
-                raise ValueError("Strata dependency checkout is modified")
+            pin = (args.strata_root / "third_party/ggml/VERSION.txt").read_text().split()[0]
+            identity = dependency_identity(args.strata_dependency, pin, args.strata_dependency_manifest)
+            report.update(strata_dependency_revision=identity["revision"], strata_dependency_status=identity["status"],
+                          strata_dependency_identity=identity)
         conversions = json.loads((args.pack / "conversions.json").read_text(encoding="utf-8"))
         report["pack"] = {"path": str(args.pack.resolve()), "conversions": conversions,
                           "small_files_sha256": {p.name: cache.sha(p) for p in args.pack.iterdir() if p.is_file() and p.stat().st_size < 16 * 1024 * 1024},
@@ -411,7 +537,7 @@ def main():
                                    "--warmup", "0", "--iterations", "1", "--thinking", "false", "--require-cache", "1" if budget else "0"]
                         command += ["--tokens-file", str(tokens_file.resolve())] if prompt_ids else [
                             "--prompt-file", str(prompt_file.resolve()), "--prompt-tokens-output", str(tokens_file.resolve())]
-                        evidence = run_process(command, root, ts_environment(budget), arm_directory, args.timeout)
+                        evidence = run_process(command, root, ts_environment(budget, args.cpu_threads), arm_directory, args.timeout)
                         arms[arm] = evidence
                         report["cases"][case]["runs"] = report["cases"][case]["runs"][:repetition] + [{"repetition": repetition, "arms": arms}]
                         save()
@@ -456,8 +582,9 @@ def main():
                         # The standalone executable enters generate directly.
                         command = [str(args.strata.resolve()), "--pack", str(args.pack.resolve()), "--native", str(args.model.resolve()),
                                    "--tokens-file", str(tokens_file.resolve()), "--max-context", str(args.context), "--max-new", str(args.max_new),
-                                   "--kv", "fp16", "--expert-cache", "auto", "--expert-cache-per-layer", "--resident-budget-gib", str(args.resident_budget_gib),
+                                   "--kv", "fp16", "--expert-cache", "auto", "--expert-cache-per-layer",
                                    "--prefill", "auto", "--greedy", "--stop-eos"]
+                        command += strata_resource_arguments(args.resident_budget_gib, args.cpu_threads, args.strata_vram_reserve_mib)
                         command += ["--suffix-draft", "0"]
                         if args.strata_spec_window:
                             command += ["--spec", str(args.strata_spec_window), "--mtp-max-t", "1", "--spec-min-p", "1"]
@@ -465,7 +592,7 @@ def main():
                             command += ["--dump-logits", str(dump_path.resolve())]
                         if expert_profile.is_file():
                             command += ["--expert-profile", str(expert_profile.resolve())]
-                        evidence = run_process(command, args.strata_root, os.environ.copy(), arm_directory, args.timeout)
+                        evidence = run_process(command, args.strata_root, strata_environment(), arm_directory, args.timeout)
                         arms[arm] = evidence
                         report["cases"][case]["runs"] = report["cases"][case]["runs"][:repetition] + [{"repetition": repetition, "arms": arms}]
                         save()

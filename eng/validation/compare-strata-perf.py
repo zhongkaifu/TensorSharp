@@ -70,7 +70,9 @@ def validate(report):
     return measured
 
 
-def compare(before, after, max_regression=5):
+def compare(before, after, max_regression=5, policy="moe-fusion"):
+    if policy not in ("moe-fusion", "gptoss-expert-copies"):
+        raise ValueError("Unknown comparison policy")
     if not before or len(before) != len(after):
         raise ValueError("Supply equal nonempty process counts")
     reference = before[0]
@@ -91,13 +93,35 @@ def compare(before, after, max_regression=5):
                 for key in ("model_path", "model_last_write_utc"):
                     if report.get(key) != reference.get(key):
                         raise ValueError(f"Checkpoint identity mismatch: {key}")
-            flag = "TENSORSHARP_CUDA_MOE_FUSION" if report["backend"] == "Cuda" else "TS_Q4E_PREFILL_COMBINE"
-            expected_flag = "0" if arm == "before" else "1"
+            if policy == "gptoss-expert-copies":
+                if report["backend"] != "GgmlCuda" or report["architecture"] != "gpt-oss":
+                    raise ValueError("Expert-copy comparison requires GPT-OSS on GGML CUDA")
+                flag, expected_flag = "TS_WEIGHT_FUSION_COPIES", "1" if arm == "before" else None
+                feature_flags = (flag,)
+                fallback = report.get("gptoss_per_expert_prefill", {})
+                reference_fallback = reference.get("gptoss_per_expert_prefill", {})
+                if fallback != reference_fallback:
+                    raise ValueError("Per-expert fallback engagement changed")
+                if fallback.get("requested"):
+                    calls = len(report["runs"]) + 1  # timed/warmup plus independent capture
+                    assignments = fallback.get("expected_assignments_per_call")
+                    if (fallback.get("verified_prefill_calls") != calls or type(assignments) is not int
+                            or assignments <= 0 or fallback.get("observed_assignment_ends") != [assignments] * calls):
+                        raise ValueError("Per-expert fallback engagement is incomplete")
+                cache = report.get("ggml_device_copy_budget") or {}
+                requested = cache.get("requested_bytes")
+                if requested != (reference.get("ggml_device_copy_budget") or {}).get("requested_bytes"):
+                    raise ValueError("Device-copy cache policy changed")
+                if requested is not None and cache.get("after", {}).get("DeviceCopyBudgetBytes") != requested:
+                    raise ValueError("Device-copy cache policy was not applied")
+            else:
+                flag = "TENSORSHARP_CUDA_MOE_FUSION" if report["backend"] == "Cuda" else "TS_Q4E_PREFILL_COMBINE"
+                expected_flag = "0" if arm == "before" else "1"
+                feature_flags = ("TENSORSHARP_CUDA_MOE_FUSION", "TS_Q4E_PREFILL_COMBINE")
             if report.get("environment", {}).get(flag) != expected_flag:
-                raise ValueError(f"Expected explicit {flag}={expected_flag} in {arm} arm")
+                raise ValueError(f"Expected {flag}={expected_flag!r} in {arm} arm")
             # The runner may set both feature switches per arm. Only the switch
             # for this backend affects execution; permit the other when it agrees.
-            feature_flags = ("TENSORSHARP_CUDA_MOE_FUSION", "TS_Q4E_PREFILL_COMBINE")
             for feature_flag in feature_flags:
                 value = report.get("environment", {}).get(feature_flag)
                 if value is not None and value != expected_flag:
@@ -141,7 +165,8 @@ def compare(before, after, max_regression=5):
                   "Kernel allocation accounting and driver/OS memory snapshots are reported separately by the probes."]
     if reference_files is None:
         limitations.append("Legacy probe reports identify only the selected input file. Split-checkpoint identity and total size require separately verified shard provenance.")
-    return {"passed": passed, "exact_full_logits": True, "exact_quality_tokens": True, "exact_corresponding_warmup_logits": True,
+    return {"passed": passed, "policy": policy, "exact_full_logits": True,
+            "exact_quality_tokens": True if reference["quality_checked"] else None, "exact_corresponding_warmup_logits": True,
             "quality_checked": reference["quality_checked"], "process_pairs": len(before),
             "max_regression_percent": max_regression, "metrics": metrics,
             "complete_checkpoint_file_identity_checked": reference_files is not None,
@@ -154,10 +179,12 @@ def main():
     p.add_argument("--after", nargs="+", type=Path, required=True)
     p.add_argument("--output", type=Path, required=True)
     p.add_argument("--max-regression-percent", type=float, default=5)
+    p.add_argument("--policy", choices=("moe-fusion", "gptoss-expert-copies"), default="moe-fusion",
+                   help="GPT-OSS compares explicit copies=1 with the unset automatic policy in identical binaries")
     args = p.parse_args()
     try:
         result = compare([json.loads(x.read_text(encoding="utf-8-sig")) for x in args.before],
-                         [json.loads(x.read_text(encoding="utf-8-sig")) for x in args.after], args.max_regression_percent)
+                         [json.loads(x.read_text(encoding="utf-8-sig")) for x in args.after], args.max_regression_percent, args.policy)
     except (ValueError, KeyError, OSError) as error:
         result = {"passed": False, "failure": str(error)}
     args.output.parent.mkdir(parents=True, exist_ok=True)

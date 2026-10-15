@@ -143,8 +143,7 @@ public sealed class ModelLoadRecordTests : IDisposable
         settings.Save(chosen);
         var store = new ModelStore(paths.ModelsDirectory);
         Directory.CreateDirectory(store.DirectoryFor(model));
-        using (FileStream weights = File.Create(store.PathFor(model, model.Weights)))
-            weights.SetLength(model.Weights.Bytes);
+        SparseFileFixture.Create(store.PathFor(model, model.Weights), model.Weights.Bytes);
         File.WriteAllText(Marker, JsonSerializer.Serialize(new { ModelId = model.Id }));
 
         for (int launch = 0; launch < 3; launch++)

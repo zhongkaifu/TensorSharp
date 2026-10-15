@@ -141,7 +141,7 @@ static int vae_run_conv2d(const TSGgmlConv2dDesc* d)
 
         // VAE conv weights are managed float[] with unstable addresses (no benefit from
         // the host-pointer cacheable cache, and reuse would be unsafe), so upload fresh.
-        BufferHandle buffer(ggml_backend_alloc_ctx_tensors(ctx, g_backend));
+        BufferHandle buffer(alloc_ctx_tensors_budgeted(ctx, g_backend));
         if (buffer.value == nullptr) { set_last_error("Conv2d: buffer alloc failed (im2col OOM?)."); return 0; }
 
         host_read_barrier();
@@ -527,7 +527,7 @@ TSG_EXPORT int TSGgml_QwenVaeRun(const TSGgmlQwenVaeDesc* d)
         BufferHandle buffer(nullptr);
         if (!alloc_graph_reuse_gallocr(graph))
         {
-            buffer.value = ggml_backend_alloc_ctx_tensors(ctx, g_backend);
+            buffer.value = alloc_ctx_tensors_budgeted(ctx, g_backend);
             if (buffer.value == nullptr) { set_last_error("QwenVaeRun: buffer alloc failed."); return 0; }
         }
 
@@ -813,7 +813,7 @@ TSG_EXPORT int TSGgml_QwenTeTrunk(const TSGgmlQwenTeTrunkDesc* d)
         BufferHandle buffer(nullptr);
         if (!alloc_graph_reuse_gallocr(graph))
         {
-            buffer.value = ggml_backend_alloc_ctx_tensors(ctx, g_backend);
+            buffer.value = alloc_ctx_tensors_budgeted(ctx, g_backend);
             if (buffer.value == nullptr) { set_last_error("QwenTeTrunk: buffer alloc failed."); return 0; }
         }
 

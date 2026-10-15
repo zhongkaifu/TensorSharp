@@ -138,7 +138,7 @@ namespace TensorSharp.Models
             List<Qwen4ExpKvCacheHolder> released = null;
             foreach (string key in payloadKeys)
             {
-                if (key != null && _retainedFusedHolders.Remove(key, out var holder))
+                if (key != null && _retainedFusedHolders.TryGetValue(key, out var holder))
                 {
                     holder.Retired = true;
                     (released ??= new List<Qwen4ExpKvCacheHolder>()).Add(holder);
@@ -164,6 +164,9 @@ namespace TensorSharp.Models
                     DisposeHolder(holder);
                     ReleaseSlotBase(holder.SlotBase);
                 }
+                // Keep every retry owner reachable until all physical releases
+                // above succeeded. Disposed holders are harmless on retry.
+                foreach (string key in payloadKeys) _retainedFusedHolders.Remove(key);
             }
             finally
             {

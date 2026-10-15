@@ -15,6 +15,7 @@ using Microsoft.Extensions.Logging.Abstractions;
 using TensorSharp;
 using TensorSharp.AgentHost.Skills;
 using TensorSharp.Chat;
+using TensorSharp.Memory;
 using TensorSharp.Runtime;
 using TensorSharp.Server.Hosting;
 
@@ -55,6 +56,7 @@ public class ModelLoadRefusalTests : IDisposable
         new object[] { new IOException("model.gguf is incomplete: re-download this file.") },
         new object[] { new InvalidDataException("Not a GGUF file (magic: 0x20746F6E)") },
         new object[] { new UnauthorizedAccessException("Access to the path is denied.") },
+        new object[] { new MemoryPressureException("GLM dense/vision weights and admitted execution state exceed CUDA capacity.") },
     };
 
     [Theory]
@@ -146,6 +148,41 @@ public class ModelLoadRefusalTests : IDisposable
 
         RecordingLogger.Entry error = Assert.Single(logger.Entries, e => e.Level == LogLevel.Error);
         Assert.IsType<NullReferenceException>(error.Exception);
+    }
+
+    [Fact]
+    public void BudgetRefusal_IsLoggedWithoutAnUnhandledFailure()
+    {
+        var logger = new RecordingLogger();
+        using var lifecycle = new ModelLifecycleService(logger,
+            (_, _, _, _) => throw new MemoryPressureException("GLM execution reserve exceeds CUDA capacity."));
+
+        var refusal = Assert.Throws<MemoryPressureException>(() =>
+            lifecycle.LoadModel(WriteMinimalGguf("budget.gguf"), null, "ggml_cuda"));
+
+        Assert.True(ModelLoadRefusal.TryDescribe(refusal, out string reason));
+        Assert.Equal("GLM execution reserve exceeds CUDA capacity.", reason);
+        var error = Assert.Single(logger.Entries, e => e.Level == LogLevel.Error);
+        Assert.Null(error.Exception);
+        Assert.Contains(reason, error.Message);
+        Assert.False(lifecycle.IsLoaded);
+    }
+
+    [Fact]
+    public void BudgetRefusal_DuringReload_PreservesPreviousModel()
+    {
+        string original = WriteMinimalGguf("original.gguf");
+        string rejected = WriteMinimalGguf("pressure.gguf");
+        using var lifecycle = new ModelLifecycleService(NullLogger.Instance, (path, _, _, _) =>
+            path == rejected ? throw new MemoryPressureException("No CUDA capacity remains.") : new FakeModel(path));
+        lifecycle.LoadModel(original, null, "cpu");
+
+        Assert.Throws<MemoryPressureException>(() => lifecycle.LoadModel(rejected, null, "cpu"));
+
+        Assert.True(lifecycle.IsLoaded);
+        Assert.Equal("original.gguf", lifecycle.LoadedModelName);
+        Assert.False(ModelLoadRefusal.TryDescribe(new AggregateException(
+            new MemoryPressureException("budget refused"), new InvalidOperationException("cleanup failed")), out _));
     }
 
     [Fact]

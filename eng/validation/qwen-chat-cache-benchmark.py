@@ -21,6 +21,7 @@ import http.client
 import json
 import math
 import mimetypes
+import os
 from pathlib import Path
 import statistics
 import time
@@ -46,9 +47,14 @@ def digest(raw):
 
 
 def output_path(value):
-    path = Path(value).resolve()
-    require(any(path.is_relative_to((ROOT / folder).resolve()) for folder in ("artifacts", "docs/validation")),
+    # Large ignored evidence folders may be directory junctions to another
+    # drive. Validate the requested checkout namespace before following them.
+    raw = Path(value)
+    require(".." not in raw.parts, "Evidence path must not contain parent traversal")
+    lexical = Path(os.path.abspath(raw))
+    require(any(lexical.is_relative_to(Path(os.path.abspath(ROOT / folder))) for folder in ("artifacts", "docs/validation")),
             "Output must remain inside this checkout's ignored artifacts/ or docs/validation/")
+    path = lexical.resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
     return path
 

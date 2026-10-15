@@ -33,6 +33,7 @@ namespace TensorSharp.Server.Hosting;
 public static class ServerOptionsBuilder
 {
     private const int DefaultMaxTokensFallback = 20000;
+    private const int UnifiedMemoryMaxTokensFallback = 2048;
 
     public static ServerHostingOptions Build(string[] args, string baseDirectory)
     {
@@ -63,6 +64,7 @@ public static class ServerOptionsBuilder
             out UploadLimitOverrides configuredUploads,
             out bool configuredNoWebUi,
             out bool configuredNoPrefixCache,
+            out bool configuredUnifiedMemory,
             parallelismArgs);
         TensorSharp.Distributed.ModelParallelismOptions.Parse(parallelismArgs.ToArray());
 
@@ -72,6 +74,8 @@ public static class ServerOptionsBuilder
         string? startupModelPath = ResolveConfiguredModelPath(configuredModel);
         string? startupMmProjPath = ResolveConfiguredMmProjPath(configuredMmProj, startupModelPath);
         bool embeddingsEnabled = args.Any(a => string.Equals(a, "--embeddings", StringComparison.OrdinalIgnoreCase));
+        if (configuredUnifiedMemory && embeddingsEnabled)
+            throw new ArgumentException("--unified-memory does not support --embeddings.");
         int embeddingThreads = ReadEmbeddingIntOption(args, "--embedding-threads");
         int embeddingContextSize = ReadEmbeddingIntOption(args, "--embedding-context-size");
         if (embeddingsEnabled && string.IsNullOrWhiteSpace(startupModelPath))
@@ -83,6 +87,8 @@ public static class ServerOptionsBuilder
 
         string? backendInput = configuredBackend ?? Environment.GetEnvironmentVariable("BACKEND");
         string requestedBackend = backendInput ?? PlatformDefaultBackend;
+        if (configuredUnifiedMemory && BackendCatalog.Canonicalize(requestedBackend) != "ggml_cuda")
+            throw new ArgumentException("--unified-memory requires --backend ggml_cuda; unsupported backends are not substituted.");
         if (embeddingsEnabled)
             EmbeddingHosting.ResolveModelBackend(requestedBackend);
 
@@ -95,21 +101,8 @@ public static class ServerOptionsBuilder
                 .ToArray();
         string defaultBackend = BackendCatalog.ResolveDefaultBackend(requestedBackend, supportedBackends);
 
-        bool maxTokensPinned = configuredMaxTokens.HasValue;
-        int defaultMaxTokens;
-        if (configuredMaxTokens.HasValue)
-        {
-            defaultMaxTokens = configuredMaxTokens.Value;
-        }
-        else if (TryParsePositiveInt(Environment.GetEnvironmentVariable("MAX_TOKENS"), out int envMaxTokens))
-        {
-            defaultMaxTokens = envMaxTokens;
-            maxTokensPinned = true;
-        }
-        else
-        {
-            defaultMaxTokens = DefaultMaxTokensFallback;
-        }
+        (int defaultMaxTokens, bool maxTokensPinned) = ResolveMaxTokensDefaults(
+            configuredMaxTokens, configuredUnifiedMemory);
 
         // Keep mutable media outside a pinned/read-only application deployment
         // when configured, just as logs and prefix checkpoints can be relocated.
@@ -190,15 +183,29 @@ public static class ServerOptionsBuilder
             skillOptions.Selected,
             skillOptions.Sandbox,
             skillOptions.AllowNetwork,
-            // The flag is the only way to turn it OFF, which is why the switch is the
-            // negation: a config file emits nothing for `false`, so a positive
-            // "prefix-cache": false would silently leave it on.
+            // The unified session supplies its own budgeted retention policy;
+            // preserve the operator's cache choice instead of disabling it here.
             prefixCacheEnabled: !configuredNoPrefixCache,
             prefixCacheDirectory: ResolvePrefixCacheDirectory(baseDirectory, startupModelPath),
             embeddingsEnabled: embeddingsEnabled,
             embeddingThreads: embeddingThreads,
             embeddingContextSize: embeddingContextSize,
-            multiAgent: ReadMultiAgentOptions(args));
+            multiAgent: ReadMultiAgentOptions(args),
+            unifiedMemoryEnabled: configuredUnifiedMemory);
+    }
+
+    /// <summary>Resolve the output default without probing a backend. Built-in
+    /// fallbacks stay unpinned so a request can explicitly choose a larger limit.</summary>
+    internal static (int MaxTokens, bool Pinned) ResolveMaxTokensDefaults(int? configuredMaxTokens, bool unifiedMemory)
+    {
+        if (configuredMaxTokens.HasValue)
+            return (configuredMaxTokens.Value, true);
+        if (TryParsePositiveInt(Environment.GetEnvironmentVariable("MAX_TOKENS"), out int envMaxTokens))
+            return (envMaxTokens, true);
+        // Admission estimates the request's worst permitted output, including
+        // retained state. Avoid reserving the ordinary 20K fallback for a small
+        // unified request whose caller did not select an output limit.
+        return (unifiedMemory ? UnifiedMemoryMaxTokensFallback : DefaultMaxTokensFallback, false);
     }
 
     private static readonly string[] AgentValueFlags =
@@ -321,7 +328,7 @@ public static class ServerOptionsBuilder
     /// <summary>Backend originally requested via <c>--backend</c> / <c>BACKEND</c> (without the OS-default fallback).</summary>
     public static string? ReadConfiguredBackendInput(string[] args)
     {
-        ParseArgs(args, out _, out _, out string? configuredBackend, out _, out _, out _, out _, out _, out _, out _, out _, out _, out _, out _, out _, out _);
+        ParseArgs(args, out _, out _, out string? configuredBackend, out _, out _, out _, out _, out _, out _, out _, out _, out _, out _, out _, out _, out _, out _);
         return configuredBackend ?? Environment.GetEnvironmentVariable("BACKEND");
     }
 
@@ -650,7 +657,7 @@ public static class ServerOptionsBuilder
         // Use the host's existing operand consumption rather than scanning values
         // as options. Unknown flags are left to Build's normal diagnostic pass.
         ParseArgs(args ?? Array.Empty<string>(), out _, out _, out _, out _, out _, out _, out _,
-            out _, out _, out _, out _, out _, out _, out _, out _, out _,
+            out _, out _, out _, out _, out _, out _, out _, out _, out _, out _,
             parallelismArgs, ignoreUnknownOptions: true);
         return TensorSharp.Distributed.ModelParallelismOptions.Parse(parallelismArgs.ToArray()).ApplyEnvironment();
     }
@@ -970,6 +977,7 @@ public static class ServerOptionsBuilder
         out UploadLimitOverrides configuredUploads,
         out bool configuredNoWebUi,
         out bool configuredNoPrefixCache,
+        out bool configuredUnifiedMemory,
         List<string>? parallelismArgs = null,
         bool ignoreUnknownOptions = false)
     {
@@ -989,9 +997,15 @@ public static class ServerOptionsBuilder
         configuredUploads = default;
         configuredNoWebUi = false;
         configuredNoPrefixCache = false;
+        configuredUnifiedMemory = false;
 
         for (int i = 0; i < args.Length; i++)
         {
+            if (string.Equals(args[i], "--unified-memory", StringComparison.OrdinalIgnoreCase))
+            {
+                configuredUnifiedMemory = true;
+                continue;
+            }
             if (TryReadOption(args, ref i, "--model", out string? modelOption))
             {
                 configuredModel = modelOption;
@@ -1415,7 +1429,7 @@ public static class ServerOptionsBuilder
         var knownFlags = new List<string>
         {
             "--model", "--mmproj", "--backend", "--max-tokens", "--video-frames", "--fps",
-            "--embeddings", "--embedding-threads", "--embedding-context-size",
+            "--embeddings", "--embedding-threads", "--embedding-context-size", "--unified-memory",
             "--port", "--host", "--urls", "--no-webui", "--no-prefix-cache",
             "--temperature", "--top-k", "--top-p", "--min-p",
             "--repeat-penalty", "--repeat-last-n", "--presence-penalty", "--frequency-penalty",

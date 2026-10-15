@@ -136,6 +136,7 @@ void warm_layer(int layer, const reader & gate, const reader & up, const reader 
     options.populate = true;
     const auto result = tsg_dsv4::warm_file_ranges(paths, ranges, options);
     require(result.ok, result.error.c_str());
+    if (result.budget_skipped) return; // No alternate prefault; upload demand reads remain unchanged.
     if (result.bytes_total >= 1024ull * 1024 * 1024)
         std::fprintf(stderr, "[dsv41-tp] layer %d source warm: %.2f GiB in %.2fs (%d threads, %.2f GiB read, %.2f GiB resident)\n",
             layer, result.bytes_total / 1073741824.0, result.seconds, result.threads,

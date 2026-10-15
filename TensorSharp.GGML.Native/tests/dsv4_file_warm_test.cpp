@@ -217,7 +217,7 @@ struct invalidating_file_ops
         handles[(size_t) fd].closed = true;
         ++closes;
     }
-    bool resident(const void * p, uint64_t bytes, std::vector<unsigned char> &)
+    bool resident(const void * p, uint64_t bytes, file_warm_scratch &)
     {
         std::lock_guard<std::mutex> lock(mu);
         check(opens == 4 && closes == 0, "residency checked before all four handles were opened");

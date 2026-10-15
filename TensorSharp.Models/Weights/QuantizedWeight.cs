@@ -117,6 +117,7 @@ namespace TensorSharp.Models
 
         public void Dispose()
         {
+            DisableQ8F32Activations();
             try
             {
                 UnregisterBonsaiWeights();
@@ -253,6 +254,8 @@ namespace TensorSharp.Models
 
         public IntPtr EnsureDeviceCacheKey()
         {
+            if (IsStreamed)
+                throw new InvalidOperationException("A streamed file region cannot become a persistent device-cache key.");
             if (_ownsCacheKeyHandle)
                 return CacheKey;
 
@@ -263,10 +266,28 @@ namespace TensorSharp.Models
             if (DevicePreloadTooLarge)
                 return CacheKey;
 
-            _cacheKeyHandle = GCHandle.Alloc(this, GCHandleType.Normal);
-            CacheKey = GCHandle.ToIntPtr(_cacheKeyHandle);
+            var handle = GCHandle.Alloc(this, GCHandleType.Normal);
+            IntPtr key = GCHandle.ToIntPtr(handle);
+            try
+            {
+                RegisterBonsaiCacheKey(key);
+                RegisterQ8F32Key(key);
+            }
+            catch
+            {
+                // Keep the prior host identity usable. Publishing an opaque key
+                // before precision registration would make a retry skip it.
+                try { UnregisterQ8F32Key(key); }
+                finally
+                {
+                    try { UnregisterBonsaiCacheKey(key); }
+                    finally { handle.Free(); }
+                }
+                throw;
+            }
+            _cacheKeyHandle = handle;
+            CacheKey = key;
             _ownsCacheKeyHandle = true;
-            RegisterBonsaiCacheKey(CacheKey);
             return CacheKey;
         }
 
@@ -282,6 +303,7 @@ namespace TensorSharp.Models
             DevicePreloadTooLarge = true;
             if (_ownsCacheKeyHandle)
             {
+                UnregisterQ8F32Key(CacheKey);
                 UnregisterBonsaiCacheKey(CacheKey);
                 _cacheKeyHandle.Free();
                 _ownsCacheKeyHandle = false;
@@ -295,6 +317,7 @@ namespace TensorSharp.Models
                 return;
 
             IntPtr currentData = _data;
+            UnregisterQ8F32Key(currentData);
             try { UnregisterBonsaiCacheKey(currentData); }
             finally
             {

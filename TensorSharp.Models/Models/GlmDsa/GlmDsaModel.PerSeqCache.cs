@@ -20,9 +20,9 @@
 //
 // ForwardBatch (the token-batched paged path) is deliberately unavailable: MLA
 // keeps one compressed row per token and the DSA indexer scores against that
-// same contiguous history, neither of which has a paged-KV layout. Concurrent
-// requests are served by interleaving whole-graph per-sequence forwards, which
-// is what the engine's per-sequence fused contract below expresses.
+// same contiguous history, neither of which has a paged-KV layout. Native
+// token-batched decode shares one graph across independent sequence slots;
+// prefill and unsupported decode shapes use per-sequence forwards.
 using System;
 using System.Collections.Generic;
 using TensorSharp.GGML;
@@ -41,6 +41,8 @@ namespace TensorSharp.Models
         private bool _batchedChunkingLatched;
         // Native tensor-parallel degree (1 = layer split or one device).
         private int _nativeTp = 1;
+        public FusedBatchExecutionEvidence LastAcceptedFusedBatch { get; private set; }
+        public GgmlGlmBatchExecution LastNativeBatchedExecution { get; private set; }
 
         /// <summary>The native executor declines every token-batched decode under tensor parallelism
         /// (TSGgml_GlmForwardBatchedDecode); the executor's once-per-run warning quotes this.</summary>
@@ -96,8 +98,16 @@ namespace TensorSharp.Models
                 {
                     // Memory full: the idle primary first (its contents are nobody's during a fused step),
                     // then a retained conversation's slot (a cached next turn is lost).
-                    slot = _exec.SlotAlloc();
-                    if (slot < 0) slot = SlotRetention.TakeIdlePrimary(_slotByRequest, ref _primarySlot, _activeSlotKey, new ExecutorGlmSlotStore(_exec));
+                    // Several requests may be admitted before any binds. A
+                    // zero-extra-slot request has the unique primary promise;
+                    // a full-credit neighbour must not steal it when execution
+                    // order changes or the previous claimant is cancelled.
+                    bool canTakePrimary = _unifiedPrimarySlotReuse?.Invoke(requestId) ?? true;
+                    slot = MemoryPolicy != null && canTakePrimary
+                        ? SlotRetention.TakeIdlePrimary(_slotByRequest, ref _primarySlot, _activeSlotKey, new ExecutorGlmSlotStore(_exec)) : -1;
+                    if (slot < 0) slot = _exec.SlotAlloc();
+                    if (slot < 0 && canTakePrimary)
+                        slot = SlotRetention.TakeIdlePrimary(_slotByRequest, ref _primarySlot, _activeSlotKey, new ExecutorGlmSlotStore(_exec));
                     if (slot < 0 && _retainedSlots is { Count: > 0 }) slot = AllocSlotReclaimingRetained();
                     if (slot < 0)
                         throw new SequenceSlotUnavailableException(
@@ -176,20 +186,28 @@ namespace TensorSharp.Models
         {
             lock (_nativeSync)
             {
+                LastAcceptedFusedBatch = null;
+                LastNativeBatchedExecution = null;
                 if (_exec == null || _slotByRequest == null) return false;
-                int n = requestIds.Count;
-                if (n < 2) return false;
+                int n = requestIds?.Count ?? 0;
+                if (n < 2 || tokens == null || positions == null || outLogits == null
+                    || tokens.Length != n || positions.Length != n || outLogits.Length != n) return false;
 
                 var slots = new int[n];
                 for (int i = 0; i < n; i++)
                 {
                     if (requestIds[i] == null || !_slotByRequest.TryGetValue(requestIds[i], out slots[i]))
                         return false;
+                    if (tokens[i] < 0 || tokens[i] >= Config.VocabSize || positions[i] < 0 || positions[i] >= _maxContextLength)
+                        return false;
                 }
 
                 int vocab = Config.VocabSize;
                 if ((long) n * vocab > int.MaxValue) return false;
                 var flat = new float[n * vocab];
+                int context = 0;
+                for (int i = 0; i < n; ++i) context = Math.Max(context, checked(positions[i] + 1));
+                PrepareUnifiedGraph(context, Math.Min(n, 16), true);
                 BeforeGraphCall();
                 try
                 {
@@ -202,6 +220,20 @@ namespace TensorSharp.Models
                     var row = new float[vocab];
                     Array.Copy(flat, (long) i * vocab, row, 0, vocab);
                     outLogits[i] = row;
+                }
+                // Wider batches execute several graphs. Their last chunk must
+                // never be presented as one graph for all original requests.
+                if (n <= 16 && _exec is NativeGlmExecutor native && native.LastBatchedExecution is { } actual)
+                {
+                    if (actual.Rows != n) throw new InvalidOperationException("Native GLM batch evidence has the wrong row count.");
+                    for (int i = 0; i < n; ++i)
+                        if (actual.Slots[i] != slots[i] || actual.PositionsBefore[i] != positions[i]
+                            || actual.PositionsAfter[i] != checked(positions[i] + 1))
+                            throw new InvalidOperationException("Native GLM batch evidence disagrees with its request slots or published positions.");
+                    LastNativeBatchedExecution = actual;
+                    // GLM has no explicit HostMoeSegment seams; its one logical
+                    // scheduler graph can still split into many backend spans.
+                    LastAcceptedFusedBatch = new(actual.ExecutionId, n, actual.Nodes, 0, 0);
                 }
                 return true;
             }

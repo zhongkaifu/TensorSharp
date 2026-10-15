@@ -468,9 +468,14 @@ implementation, not the current two-gather
 implementation; see
 `docs/validation/qualification-2026-09-16/numerical-tp-chosen-r1/README.md` (local validation evidence, not committed).
 
-If the weights and context do not fit, add `--n-cpu-moe N` to keep the routed
-experts of the first N layers on the host, or `--cpu-moe` for all routed
-experts. Attention, routing, and the shared expert remain on the GPU.
+On `ggml_cuda`, an unspecified CPU offload policy now asks the native capacity
+planner for the fewest leading host expert layers that fit the visible devices,
+context and workspace; a fitting model keeps every expert on the GPU. Use
+`--n-cpu-moe 0` to require full GPU residency, a positive `--n-cpu-moe N` to
+choose the count, or `--cpu-moe` for all routed experts. Other backends retain
+explicit offload. Attention, routing, and the shared expert remain on the GPU.
+This load-time plan is not a unified request budget: host mappings can exceed
+the RAM allowance and incur paging, as the loader reports.
 [Engram table placement](#where-the-engram-tables-live) is selected separately;
 when the tables use host mappings, only selected embedding rows are read and
 transferred for each input batch. CPU MoE offload and layer split are implemented,
@@ -1526,3 +1531,43 @@ also showed slower final latency. A later 72-request control
 are local validation evidence, not committed) held the native library fixed, passed every answer and did not reproduce the
 slowdown. No production fix was made from these diagnostics; the differing
 results and their limits remain in the validation report.
+
+## Routed CPU expert reads (Linux experiment)
+
+`TS_DSV4_HOST_EXPERT_READ=1` enables bounded parallel reads for routed experts
+offloaded by the GPU executor. Unset or `0` retains the existing path; other
+values are rejected. This requires contiguous GGUF host mappings on Linux.
+After routing, it reads the selected experts' original gate/up/down bytes into
+the OS page cache. The original ggml operators still use the mmap weights;
+quantization, routing and reduction order are unchanged. It does not predict
+future routes or overlap computation across layers.
+
+The TensorSharp CPU backend prepares registered expert mappings immediately
+before the original `MUL_MAT_ID` operations. It adds no routing or read nodes to
+the graph. If the selected IDs are produced on the CPU, their graph prefix is
+executed first; gate/up/down using the same selected-ID tensor share preparation.
+Reads run outside the CPU compute team, and all arithmetic and unrelated custom
+operations still execute on the unchanged upstream CPU backend.
+
+Descriptors and I/O workers live with the model. Worker count respects process
+CPU affinity/cgroup availability and configured threads, with a maximum of 16.
+Staging scales with the actual host-memory allowance up to 64 MiB, with at most
+4 MiB per read. When shared `hostPools` are attached, staging reserves RAM credit
+before allocation and retains it until model destruction frees the buffers.
+Mapped/OS-cached weight pages and other runtime allocations are outside this
+staging charge.
+
+Resident ranges skip reads. During preparation, multi-token inputs check residency
+and single-token inputs may reuse a per-expert observation for eight layer calls.
+After 32 single-token CPU graphs with no reads or major faults, the wrapper can
+delegate the entire graph directly. A process major-fault change resets this
+heuristic and invalidates the per-expert hints; multi-token graphs also resume
+preparation. With the reader enabled, `TS_DSV4_HOST_EXPERT_HOT_BYPASS=0` disables
+this heuristic (`1` is its default; other values are rejected). The threshold is
+experimental, not a calibrated storage cost model. These are advisory hints, not
+page locks or guaranteed residency: the original mmap can still fault normally
+if the OS reclaims a page. Read errors reject the
+forward and require reloading the model; partially read staging never serves as
+weights. The default remains disabled pending broader storage/workload coverage.
+See the [unified-memory validation record](../design/unified-memory.zh-CN.md)
+for cold and warm measurements and their limits.

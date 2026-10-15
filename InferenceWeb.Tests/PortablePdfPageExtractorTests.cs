@@ -273,7 +273,7 @@ public sealed class PortablePdfPageExtractorTests : IDisposable
         source.CopyTo(target);
         return path;
     }
-    public void Dispose() => Directory.Delete(_directory, true);
+    public void Dispose() => PortablePdfScratchDirectory.Delete(_directory);
 }
 
 internal sealed class PopplerPdfFactAttribute : FactAttribute

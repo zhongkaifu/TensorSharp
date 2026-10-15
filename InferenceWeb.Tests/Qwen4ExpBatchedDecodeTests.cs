@@ -52,6 +52,10 @@ public sealed class Qwen4ExpBatchedDecodeTests(ITestOutputHelper output) : IDisp
     public void HostOffloadedArenaParity_Cuda(int offloadLayers)
         => RunArenaParity(BackendType.GgmlCuda, 3, true, offloadLayers);
 
+    [GgmlFact(BackendType.GgmlCuda)]
+    public void EightRequestHostOffloadedArenaParity_Cuda()
+        => RunArenaParity(BackendType.GgmlCuda, width: 8, q2kxl: true, offloadLayers: 8);
+
     [GgmlFact(BackendType.GgmlCpu)]
     public void DenseArenaWithoutQsa_Cpu() => RunArenaParity(BackendType.GgmlCpu, 3, false, qsa: false);
 
@@ -69,7 +73,15 @@ public sealed class Qwen4ExpBatchedDecodeTests(ITestOutputHelper output) : IDisp
     public void ArenaCrossesSparseQsaThresholdAfterDenseReplay_Cuda()
         => RunSparseThresholdTransition(BackendType.GgmlCuda);
 
-    private void RunSparseThresholdTransition(BackendType backend)
+    [GgmlFact(BackendType.GgmlCuda)]
+    public void PreparedHolderGrowthStaysBatched_Cuda()
+        => RunSparseThresholdTransition(BackendType.GgmlCuda, preparedGrowth: true);
+
+    [GgmlFact(BackendType.GgmlCpu)]
+    public void PreparedHolderGrowthStaysBatched_Cpu()
+        => RunSparseThresholdTransition(BackendType.GgmlCpu, preparedGrowth: true);
+
+    private void RunSparseThresholdTransition(BackendType backend, bool preparedGrowth = false)
     {
         const int topK = 16;
         const int sparseWidth = topK + Qwen4ExpSyntheticModelBuilder.CompressRatio - 1;
@@ -101,7 +113,17 @@ public sealed class Qwen4ExpBatchedDecodeTests(ITestOutputHelper output) : IDisp
             }
             reference.RestorePrimaryCache();
             var rows = new float[ids.Length][];
-            if (round == 7)
+            if (preparedGrowth)
+                foreach (string id in ids)
+                {
+                    Assert.True(model.CanBatchDecode(id, position));
+                    Assert.True(model.PrepareBatchedFusedDecode(id));
+                    model.BindSequenceCache(id);
+                    Assert.Equal(position, model.CacheSeqLen); // preparation does not decode
+                    Assert.Equal(position, Field<int>(model, "_qsaPositionCount"));
+                    model.RestorePrimaryCache();
+                }
+            if (round == 7 && !preparedGrowth)
             {
                 // Seven dense arena executions have filled the 16-row caches.
                 // Growth flushes them and solo decode expands each cache to 32.
@@ -130,7 +152,7 @@ public sealed class Qwen4ExpBatchedDecodeTests(ITestOutputHelper output) : IDisp
                     worst = Math.Max(worst, AssertClose(expected[order[i]], rows[i], $"threshold round {round}, row {i}"));
             }
         }
-        Assert.Equal(11, model.ArenaBatchedDecodeSteps - before);
+        Assert.Equal(preparedGrowth ? 12 : 11, model.ArenaBatchedDecodeSteps - before);
         for (int i = 0; i < ids.Length; ++i)
         {
             model.BindSequenceCache(ids[i]); reference.BindSequenceCache(ids[i]);
@@ -138,7 +160,7 @@ public sealed class Qwen4ExpBatchedDecodeTests(ITestOutputHelper output) : IDisp
             Assert.Equal(21, Field<int>(model, "_qsaPositionCount"));
             worst = Math.Max(worst, AssertClose(reference.Forward([113]), model.Forward([113]), "threshold final solo " + i));
         }
-        output.WriteLine($"{backend}: 7 dense and 4 sparse arena steps across cache growth and request reordering; final solo state matched; worst |dlogit|={worst:G6}.");
+        output.WriteLine($"{backend}: {model.ArenaBatchedDecodeSteps - before} arena steps across cache growth and request reordering; preparedGrowth={preparedGrowth}; final solo state matched; worst |dlogit|={worst:G6}.");
     }
 
     [Qwen4ExpArenaCopyFaultFact]
@@ -530,13 +552,21 @@ public sealed class Qwen4ExpBatchedDecodeTests(ITestOutputHelper output) : IDisp
     public Task HostOffloadedContinuousBatching_MatchesSerial_Cuda(int offloadLayers)
         => RunEngine(BackendType.GgmlCuda, offloadLayers);
 
-    private async Task RunEngine(BackendType backend, int offloadLayers = 0)
+    [GgmlFact(BackendType.GgmlCuda)]
+    public Task EightQueuedHostOffloadedRequests_MatchSerial_Cuda()
+        => RunEngine(BackendType.GgmlCuda, offloadLayers: 8, requestCount: 8);
+
+    private async Task RunEngine(BackendType backend, int offloadLayers = 0, int requestCount = 3)
     {
         string path = Fixture();
         if (offloadLayers > 0) MoeCpuOffloadConfig.SetLayers(offloadLayers);
         using var model = new Qwen4ExpModel(path, backend);
         const int count = 8;
         int[][] prompts = [Prompt(3, 28), Prompt(7, 33), Prompt(11, 39)];
+        if (requestCount > prompts.Length)
+            prompts = prompts.Concat(Enumerable.Range(prompts.Length, requestCount - prompts.Length)
+                .Select(i => Prompt(3 + 4 * i, 28 + 5 * i))).ToArray();
+        Assert.Equal(requestCount, prompts.Length);
         var expected = new List<int>[prompts.Length];
         var serialLogits = new float[prompts.Length][][];
         foreach (int i in Enumerable.Range(0, prompts.Length))
@@ -557,11 +587,12 @@ public sealed class Qwen4ExpBatchedDecodeTests(ITestOutputHelper output) : IDisp
         model.ResetKVCache();
         var config = new SchedulerConfig
         {
-            // CUDA greedy parity compares the same eight-token prefill shapes.
+            // Greedy parity bounds prefill to the serial oracle's eight-token
+            // graph width on every backend, including ARM64 quantized CPU kernels.
             // The aggregate budget also bounds concurrent prefills: a 64-token
             // budget permits larger chunks despite MaxPrefillChunkSize below.
-            MaxNumBatchedTokens = backend == BackendType.GgmlCuda ? 8 : 64,
-            MaxNumRunningSequences = 4,
+            MaxNumBatchedTokens = 8,
+            MaxNumRunningSequences = Math.Max(4, requestCount),
             MaxPrefillChunkSize = 8, SoloPrefillChunkSize = 8,
             NumBlocks = 128, BlockSize = 8, EnablePrefixCaching = false, DecodeQuantumTokens = 1,
         };
@@ -584,7 +615,7 @@ public sealed class Qwen4ExpBatchedDecodeTests(ITestOutputHelper output) : IDisp
             Assert.Equal(expected[i], streams[i]);
         }
         Assert.True(model.ArenaBatchedDecodeSteps > 0, "Parallel requests never executed a batched graph.");
-        output.WriteLine($"{backend}, hostLayers={offloadLayers}: three parallel 8-token streams matched independent serial greedy; {model.ArenaBatchedDecodeSteps} arena steps.");
+        output.WriteLine($"{backend}, hostLayers={offloadLayers}: {prompts.Length} queued 8-token streams matched independent serial greedy; {model.ArenaBatchedDecodeSteps} arena steps.");
     }
 
     private static async Task<List<int>> Drain(InferenceRequestHandle handle)

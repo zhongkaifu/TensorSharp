@@ -50,6 +50,7 @@
 #include "dsv41_engram_io.h"
 #include "dsv41_engram_advice.h"
 #include "dsv4_file_warm.h"
+#include "dsv4_host_expert_backend.h"
 #include "dsv4_exact_read.h"
 #include "ggml_ops_deepseek41_vision.h"
 #include "ggml_ops_deepseek41_tp.h"
@@ -209,6 +210,9 @@ struct dsv4_layer
     // so a handful of offloaded layers is the difference between "does not fit
     // in the visible VRAM" and "runs".
     bool cpu_moe = false;
+#if defined(__linux__)
+    tsg_dsv4::host_expert_read_context host_read;
+#endif
 };
 
 // Per-layer KV caches / compressor state for ONE sequence slot
@@ -570,6 +574,7 @@ struct dsv4_model
     // every host split of every graph, so --n-cpu-moe pays for its threads once
     // instead of once per offloaded layer per token.
     ggml_threadpool_t cpu_threadpool = nullptr;
+    ggml_backend_t host_io_backend = nullptr; // borrows backends[n_gpu]
 #if defined(TSG_GGML_TEST_HOOKS)
     int test_cpu_pool_threads = 0;
 #endif
@@ -595,6 +600,9 @@ struct dsv4_model
     std::vector<size_t> mmap_sizes;
     std::vector<ggml_backend_buffer_t> mmap_bufs;
     size_t mmap_weight_bytes = 0; // tensor bytes served from the mappings
+#if defined(__linux__)
+    std::unique_ptr<tsg_dsv4::host_expert_reader> host_expert_io;
+#endif
 
     ggml_tensor * tok_embd = nullptr;
     ggml_tensor * output_norm = nullptr;
@@ -679,6 +687,9 @@ struct dsv4_model
         engram_warm_stop.store(true, std::memory_order_relaxed);
         if (engram_warm_thread.joinable()) engram_warm_thread.join();
         graph_cache.clear();
+#if defined(__linux__)
+        host_expert_io.reset();
+#endif
         engram_io.reset();
         moe_tp.reset();
         vision.reset();
@@ -705,6 +716,7 @@ struct dsv4_model
         }
         for (int i = 0; i < MAX_GPUS; i++)
             if (ts_backends[i]) ggml_backend_free(ts_backends[i]);
+        if (host_io_backend) ggml_backend_free(host_io_backend);
         for (int i = 0; i < n_backends; i++)
             if (backends[i]) ggml_backend_free(backends[i]);
         // After the CPU backend, which holds a borrowed pointer to it.
@@ -1383,6 +1395,7 @@ static bool dsv4_prefault_host_experts(dsv4_model & loaded, const shard_files & 
                 fprintf(stderr, "[dsv4] prefaulting the mmapped host experts failed: %s\n", r.error.c_str());
                 return false;
             }
+            if (r.budget_skipped) return true; // Demand reads continue; no page-touch fallback.
             fprintf(stderr, "[dsv4] prefaulted %.1f GiB of mmapped host experts in %.1fs "
                             "(pread, %d threads: %.1f GiB read, %.1f GiB already resident)\n",
                     warm_bytes / 1073741824.0,
@@ -1565,7 +1578,8 @@ static bool dsv4_warm_engram(dsv4_model & loaded, const shard_files & shards,
                 fprintf(stderr, "[dsv41] warming the Engram tables failed: %s\n", r.error.c_str());
                 return false;
             }
-            fprintf(stderr, "[dsv41] warmed %.2f GiB of Engram pages in %.2fs (%d pread threads: %.2f GiB read, "
+            if (!r.budget_skipped)
+                fprintf(stderr, "[dsv41] warmed %.2f GiB of Engram pages in %.2fs (%d pread threads: %.2f GiB read, "
                 "%.2f GiB already resident)\n",
                 bytes / 1073741824.0, std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count(),
                 r.threads, r.bytes_read / 1073741824.0, r.bytes_resident / 1073741824.0);
@@ -1619,7 +1633,7 @@ static bool dsv4_warm_engram(dsv4_model & loaded, const shard_files & shards,
                         if (r.stopped) return;
                         if (!r.ok)
                             fprintf(stderr, "[dsv41] background Engram warming stopped: %s\n", r.error.c_str());
-                        else
+                        else if (!r.budget_skipped)
                             fprintf(stderr, "[dsv41] warmed %.2f GiB of Engram pages in %.2fs (background, %d pread threads: "
                                 "%.2f GiB read, %.2f GiB already resident)\n",
                                 bytes / 1073741824.0,
@@ -2079,6 +2093,11 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
     if (tp_ranks < 0 || tp_ranks == 1 || tp_ranks > 8)
         throw std::runtime_error("DeepSeek V4.1 tensor parallelism requires 0 (disabled) or 2..8 ranks");
 
+    const bool host_read = host_expert_read_enabled(getenv("TS_DSV4_HOST_EXPERT_READ"));
+#if !defined(__linux__)
+    if (host_read) throw std::runtime_error("Demand expert reads require Linux page-cache residency queries");
+#endif
+
     std::unique_ptr<dsv4_model> m(new dsv4_model());
     bool engram_random_advice = false, engram_random_override = false;
 
@@ -2139,7 +2158,9 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
     }
 
     m->n_gpu = n_gpu;
-    ggml_backend_t cpu = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
+    // Avoid global device enumeration for this auxiliary CPU backend: a host
+    // run must not initialize linked accelerator drivers merely to create it.
+    ggml_backend_t cpu = ggml_backend_cpu_init();
     {
         // The CPU backend normally only builds rope tables at load time, so the
         // caller's modest thread count is right. With --n-cpu-moe it also runs
@@ -2179,6 +2200,14 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
     }
     m->backends[n_gpu] = cpu;
     m->n_backends = n_gpu + 1;
+#if defined(__linux__)
+    if (host_read && !cpu_only) {
+        const char * adaptive = getenv("TS_DSV4_HOST_EXPERT_HOT_BYPASS");
+        if (adaptive && strcmp(adaptive, "0") != 0 && strcmp(adaptive, "1") != 0)
+            throw std::runtime_error("TS_DSV4_HOST_EXPERT_HOT_BYPASS must be 0 or 1");
+        m->host_io_backend = host_expert_backend(cpu, !adaptive || strcmp(adaptive, "0") != 0);
+    }
+#endif
 
     // --- fused-op backends (kernel-count is the decode wall; the fused ops
     // collapse the small-op chains, injected via GGML_OP_CUSTOM nodes) ---
@@ -2213,10 +2242,10 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
         // backend, which host-resident routed experts are pinned to.
         for (int d = 0; d < n_gpu; d++)
             m->dev_backends[d] = m->ts_backends[d] ? m->ts_backends[d] : m->backends[d];
-        m->dev_backends[n_gpu] = cpu;
+        m->dev_backends[n_gpu] = m->host_io_backend ? m->host_io_backend : cpu;
         int nb = 0;
         for (int d = 0; d < n_gpu; d++) m->sched_backends[nb++] = m->dev_backends[d];
-        m->sched_backends[nb++] = cpu;
+        m->sched_backends[nb++] = m->dev_backends[n_gpu];
         for (int i = 0; i < nb; i++)
             m->sched_bufts[i] = ggml_backend_get_default_buffer_type(m->sched_backends[i]);
         m->n_sched_backends = nb;
@@ -3302,6 +3331,33 @@ static dsv4_model * dsv4_load(const char * gguf_path, int n_gpu_req, int n_ctx, 
         if (!sizes_ok) return nullptr;
         if (!dsv4_upload_parallel(shards, jobs, load_threads, m->mmap_weight_bytes)) return nullptr;
 
+#if defined(__linux__)
+        // Demand pread is independent of arithmetic and keeps page-cache pages
+        // evictable. Initially opt-in while hardware A/B coverage is collected.
+        if (hp.v41 && !cpu_only && n_cpu_moe > 0 && host_read)
+        {
+            const size_t allowance = dsv4_host_mem_allowance();
+            const size_t staging = std::min<size_t>(64 * 1024 * 1024,
+                allowance ? std::max<size_t>(1024 * 1024, allowance / 1024) : 16 * 1024 * 1024);
+            const int explicit_threads = tsg::host_moe_explicit_thread_count();
+            const unsigned threads = unsigned(std::max(1, std::min({16, tsg::available_cpu_parallelism(),
+                explicit_threads > 0 ? explicit_threads : n_threads > 0 ? n_threads : 16})));
+            m->host_expert_io.reset(new tsg_dsv4::host_expert_reader(shards.paths, threads, staging));
+            for (auto & layer : m->layers) if (layer.cpu_moe)
+            {
+                const std::array<ggml_tensor *, 3> projections{layer.ffn_gate_exps, layer.ffn_up_exps, layer.ffn_down_exps};
+                for (size_t p = 0; p < projections.size(); ++p)
+                    if (!ggml_is_contiguous(projections[p]) ||
+                        !dsv4_mapped_file_range(*m, projections[p], layer.host_read.projections[p]))
+                        throw std::runtime_error("Demand expert reads require contiguous mapped projections");
+                layer.host_read.reader = m->host_expert_io.get();
+                layer.host_read.experts = size_t(layer.ffn_up_exps->ne[2]);
+                host_expert_backend_register(m->host_io_backend, &layer.host_read);
+            }
+            fprintf(stderr, "[dsv4] demand expert pread: threads=%u staging=%zu bytes; resident ranges skipped\n",
+                threads, m->host_expert_io->staging_bytes());
+        }
+#endif
         if (!dsv4_prefault_host_experts(*m, shards, load_threads)) return nullptr;
 
         dsv4_pin_host_experts(*m, n_cpu_moe);
@@ -6236,6 +6292,19 @@ static bool dsv4_forward_ubatch(dsv4_model & m, const int32_t * tokens, int64_t 
 #endif
     auto t_compute = now();
 
+#if defined(__linux__)
+    if (m.host_expert_io)
+    {
+        if (m.host_expert_io->error()[0])
+        {
+            fprintf(stderr, "[dsv4] %s\n", m.host_expert_io->error());
+            return false;
+        }
+        if (perf >= 2) fprintf(stderr, "[dsv4] expert read cumulative: requested=%" PRIu64 " resident=%" PRIu64
+            " read=%" PRIu64 " wait=%.2fms bypass=%" PRIu64 "\n", m.host_expert_io->requested, m.host_expert_io->resident,
+            m.host_expert_io->read, m.host_expert_io->elapsed_ms, host_expert_backend_bypassed(m.host_io_backend));
+    }
+#endif
     if (want_logits && logits_out)
         ggml_backend_tensor_get(res.logits, logits_out, 0,
                                 (size_t) (all_logits ? nt : 1) * hp.n_vocab * sizeof(float));
@@ -6633,6 +6702,13 @@ static bool dsv4_forward_batched_decode(
         fprintf(stderr, "[dsv4] batched graph compute failed\n");
         return false;
     }
+#if defined(__linux__)
+    if (m.host_expert_io && m.host_expert_io->error()[0])
+    {
+        fprintf(stderr, "[dsv4] %s\n", m.host_expert_io->error());
+        return false;
+    }
+#endif
 
     ggml_backend_tensor_get(res.logits, logits_out, 0, (size_t) n * hp.n_vocab * sizeof(float));
     writes.complete = true;

@@ -93,7 +93,7 @@ struct PrefixCache {
     PrefixCache(const PrefixCache&) = delete;
     PrefixCache& operator=(const PrefixCache&) = delete;
     ~PrefixCache() {
-        if (buffer) ggml_backend_buffer_free(buffer);
+        if (buffer) graph_budget_free_buffer(buffer);
         if (ctx) ggml_free(ctx);
     }
 };
@@ -391,7 +391,7 @@ struct ForwardGraph {
     TpRankPlan plan;
 
     ~ForwardGraph() {
-        if (allocator) ggml_gallocr_free(allocator);
+        if (allocator) graph_budget_gallocr_free(allocator);
         if (ctx) ggml_free(ctx);
     }
 
@@ -669,20 +669,33 @@ std::unique_ptr<ForwardGraph> build_graph(const TSGQi21Desc* d, bool persistent,
             // Gallocr may recycle an input after its last consumer. Constants
             // uploaded only at build time must survive every subsequent replay.
             for (const auto& c : b.constants) ggml_set_output(c.tensor);
-            result->allocator = ggml_gallocr_new(ggml_backend_get_default_buffer_type(g_backend));
-            if (!result->allocator) throw std::runtime_error("QwenImage21: graph allocator creation failed");
+            // Use a separate metadata-only planner: reserve_n_size mutates its
+            // plans, so alloc_graph on that allocator would skip backing storage.
+            std::unique_ptr<ggml_gallocr, decltype(&ggml_gallocr_free)> planner(
+                ggml_gallocr_new(ggml_backend_get_default_buffer_type(g_backend)), ggml_gallocr_free);
+            if (!planner) throw std::runtime_error("QwenImage21: graph planner creation failed");
             size_t need = 0, free_bytes = 0, total_bytes = 0;
-            ggml_gallocr_reserve_n_size(result->allocator, graph, nullptr, nullptr, &need);
+            ggml_gallocr_reserve_n_size(planner.get(), graph, nullptr, nullptr, &need);
+            planner.reset();
             ggml_backend_dev_memory(ggml_backend_get_device(g_backend), &free_bytes, &total_bytes);
             // A second CFG shape is optional: retire the other slot when both
             // scratch arenas would overcommit VRAM and spill on Windows.
             if (total_bytes && (need > free_bytes || free_bytes - need < size_t(512) * 1024 * 1024)) {
                 for (auto& retained : graph_cache[g_active_rank]) retained.reset();
             }
-            // The size-only reserve populates plans without backing buffers;
-            // alloc_graph cannot detect that case, so reserve storage explicitly.
-            if (!ggml_gallocr_reserve(result->allocator, graph) || !ggml_gallocr_alloc_graph(result->allocator, graph))
-                throw std::runtime_error("QwenImage21: persistent graph allocation failed");
+            result->allocator = graph_budget_gallocr_new(ggml_backend_get_default_buffer_type(g_backend), g_active_rank);
+            if (!result->allocator) throw std::runtime_error("QwenImage21: graph allocator creation failed");
+            if (!graph_budget_gallocr_alloc_graph(result->allocator, graph)) {
+                // Shared credit can run out before physical VRAM. The other CFG
+                // shape is disposable; return its credit before one bounded retry.
+                for (auto& retained : graph_cache[g_active_rank]) retained.reset();
+                // Upstream retains size plans after a failed reserve. A retry
+                // needs a fresh allocator, otherwise it can use missing storage.
+                graph_budget_gallocr_free(result->allocator);
+                result->allocator = graph_budget_gallocr_new(ggml_backend_get_default_buffer_type(g_backend), g_active_rank);
+                if (!result->allocator || !graph_budget_gallocr_alloc_graph(result->allocator, graph))
+                    throw std::runtime_error("QwenImage21: persistent graph allocation failed");
+            }
         } else if (!alloc_graph_reuse_gallocr(graph)) {
             throw std::runtime_error("QwenImage21: graph allocation failed");
         }
@@ -821,7 +834,7 @@ std::unique_ptr<PrefixCache> create_prefix_cache(const TSGQi21Desc& d, const std
             cache->k.push_back(ggml_new_tensor_3d(cache->ctx, cache->k_type, d.head_dim, d.prefix_seq, d.heads));
             cache->v.push_back(ggml_new_tensor_3d(cache->ctx, cache->v_type, d.head_dim, d.prefix_seq, d.heads));
         }
-        cache->buffer = ggml_backend_alloc_ctx_tensors_from_buft(cache->ctx, ggml_backend_get_default_buffer_type(g_backend));
+        cache->buffer = graph_budget_alloc_ctx_tensors(cache->ctx, g_backend, cache->rank);
     }
     if (!cache->buffer) {
         cache->declined = true;
@@ -1016,7 +1029,7 @@ TSG_EXPORT int TSGgml_QwenImage21ForwardTp(const TSGQi21Desc* const* descs, int 
                     drop_graphs_of_cache(cache->id);
                     cache->declined = true; cache->filled = false;
                     cache->k.clear(); cache->v.clear();
-                    if (cache->buffer) { ggml_backend_buffer_free(cache->buffer); cache->buffer = nullptr; }
+                    if (cache->buffer) { graph_budget_free_buffer(cache->buffer); cache->buffer = nullptr; }
                 }
                 std::fill(caches.begin(), caches.end(), nullptr);
                 path = TSG_QI21_PATH_DECLINED;

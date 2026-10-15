@@ -87,7 +87,12 @@ class WindowsDesktopPackagingTests(unittest.TestCase):
             wix.payload_manifest(self.publish, "win-x64-cuda")
 
     def test_symbolic_links_are_rejected(self):
-        (self.publish / "linked.dll").symlink_to(self.publish / "GgmlOps.dll")
+        try:
+            (self.publish / "linked.dll").symlink_to(self.publish / "GgmlOps.dll")
+        except OSError as error:
+            if sys.platform == "win32" and getattr(error, "winerror", None) == 1314:
+                self.skipTest("Windows symbolic-link creation requires Developer Mode or the symbolic-link privilege.")
+            raise
         with self.assertRaisesRegex(ValueError, "symbolic links"):
             wix.payload_manifest(self.publish, "win-x64-cpu")
 

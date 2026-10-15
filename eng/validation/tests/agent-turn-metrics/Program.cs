@@ -1,10 +1,12 @@
 using System.Text.Json;
+using TensorSharp.Runtime.Speculative;
 
 int checks = 0;
 void Equal(double expected, double actual)
 {
     checks++;
-    if (Math.Abs(expected - actual) > 1e-10) throw new Exception($"Expected {expected:R}, got {actual:R}");
+    if (!double.IsFinite(expected) || !double.IsFinite(actual) || Math.Abs(expected - actual) > 1e-10)
+        throw new Exception($"Expected {expected:R}, got {actual:R}");
 }
 void True(bool value) { checks++; if (!value) throw new Exception("Assertion failed"); }
 void Invalid(Action action)
@@ -68,4 +70,65 @@ var timelines = new[]
 var restored = JsonSerializer.Deserialize<RequestTimeline[]>(JsonSerializer.Serialize(timelines))!;
 Equal(100, restored[1].SubmissionOffsetMs); Equal(0, restored[1].Speculation.VerifySteps);
 True(restored[1].Error == "late failure"); True(restored[1].TokenTimesMs.SequenceEqual(new[] { 10.0 }));
-Console.WriteLine($"PASS {checks} model-free concurrent metric, counter, serialization and error checks");
+
+// Strict CLI values and actual arm enumeration preserve the old default while
+// allowing a real reversed control. Every arm gets one request per warmup/pass.
+True(SpeculativeBenchmarkOrdering.Parse("plain-first") == SpeculativeRunOrder.PlainFirst);
+True(SpeculativeBenchmarkOrdering.Parse("spec-first") == SpeculativeRunOrder.SpecFirst);
+Invalid(() => SpeculativeBenchmarkOrdering.Parse("auto"));
+Invalid(() => SpeculativeBenchmarkOrdering.Parse(""));
+Invalid(() => SpeculativeBenchmarkOrdering.Parse("Plain-First"));
+var candidates = new[] { "ngram", "auto" };
+True(SpeculativeBenchmarkOrdering.Arrange(SpeculativeRunOrder.PlainFirst, "plain", candidates)
+    .SequenceEqual(new[] { "plain", "ngram", "auto" }));
+True(SpeculativeBenchmarkOrdering.Arrange(SpeculativeRunOrder.SpecFirst, "plain", candidates)
+    .SequenceEqual(new[] { "ngram", "auto", "plain" }));
+foreach (SpeculativeRunOrder order in Enum.GetValues<SpeculativeRunOrder>())
+{
+    True(SpeculativeBenchmarkOrdering.Arrange(order, "plain", Array.Empty<string>()).SequenceEqual(new[] { "plain" }));
+    var passes = Enumerable.Range(0, 3).SelectMany(_ => SpeculativeBenchmarkOrdering.Arrange(order, "plain", candidates));
+    True(passes.GroupBy(x => x).All(group => group.Count() == 3));
+}
+Invalid(() => SpeculativeBenchmarkOrdering.Arrange((SpeculativeRunOrder)99, "plain", candidates).ToArray());
+
+// Link the real SpeculationStats source: mapping must retain fractional phase
+// values and calibrated rates, independent of the rounded/truncated log string.
+var stats = new SpeculationStats
+{
+    DraftTicks = 12345, VerifyTicks = 23456, SnapshotTicks = 34567,
+    RollbackTicks = 45678, CatchUpTicks = 56789, PlainTicks = 67891,
+    PlainMsPerToken = 12.345678901234, SpecMsPerToken = 23.456789012345,
+};
+var timing = SpeculativePhaseTimings.From(stats)!;
+Equal(stats.DraftMs, timing.DraftMs); Equal(stats.VerifyMs, timing.VerifyMs);
+Equal(stats.SnapshotMs, timing.SnapshotMs); Equal(stats.RollbackMs, timing.RollbackMs);
+Equal(stats.CatchUpMs, timing.CatchUpMs); Equal(stats.PlainMs, timing.PlainMs);
+Equal(stats.PlainMsPerToken, timing.PlainMsPerToken); Equal(stats.SpecMsPerToken, timing.SpecMsPerToken);
+True(SpeculativePhaseTimings.From(null) == null);
+var timedTimeline = timelines[0] with { SpeculationTimings = timing };
+var timedRestored = JsonSerializer.Deserialize<RequestTimeline>(JsonSerializer.Serialize(timedTimeline))!;
+True(timedRestored.SpeculationTimings == timing);
+stats.Reset();
+True(timing.DraftMs > 0 && timing.PlainMsPerToken > 0); // immutable snapshot survives reuse
+var untimedJson = JsonSerializer.Serialize(timelines[0], new JsonSerializerOptions
+{
+    DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull,
+});
+True(!untimedJson.Contains("SpeculationTimings")); // absent is not a measured zero
+
+True(SpeculativeDiagnosticPrefill.Parse("refill") == DiagnosticPrefillMode.Refill);
+True(SpeculativeDiagnosticPrefill.Parse("forward") == DiagnosticPrefillMode.Forward);
+Invalid(() => SpeculativeDiagnosticPrefill.Parse("Forward"));
+Invalid(() => SpeculativeDiagnosticPrefill.Parse(""));
+int[] diagnosticTokens = { 42, 17 };
+float[] forwardResult = { 1 }, refillResult = { 2 };
+int forwardCalls = 0, refillCalls = 0;
+float[] Forward(int[] input) { True(ReferenceEquals(input, diagnosticTokens)); forwardCalls++; return forwardResult; }
+float[] Refill(int[] input) { True(ReferenceEquals(input, diagnosticTokens)); refillCalls++; return refillResult; }
+True(ReferenceEquals(SpeculativeDiagnosticPrefill.Run(default, diagnosticTokens, Forward, Refill), refillResult));
+Equal(0, forwardCalls); Equal(1, refillCalls);
+True(ReferenceEquals(SpeculativeDiagnosticPrefill.Run(DiagnosticPrefillMode.Forward, diagnosticTokens, Forward, Refill), forwardResult));
+Equal(1, forwardCalls); Equal(1, refillCalls);
+Invalid(() => SpeculativeDiagnosticPrefill.Run((DiagnosticPrefillMode)99, diagnosticTokens, Forward, Refill));
+
+Console.WriteLine($"PASS {checks} model-free metric, ordering, precise timing, serialization and error checks");

@@ -1,0 +1,308 @@
+{
+  "prompts": {
+    "code": "Write a Python function square(x) that returns x*x. Return only the function, without Markdown.",
+    "tool_json": "Available tool: get_weather(city, unit), where unit is \"celsius\" or \"fahrenheit\". User asks: What is the weather in Hangzhou in Celsius? Return only one JSON object with exactly the keys \"name\" and \"arguments\", containing the tool name and its required arguments. Do not answer the weather question."
+  },
+  "rows": [
+    {
+      "case": "code",
+      "id": "two_lines",
+      "answer": "def square(x):\n    return x*x",
+      "passed": true
+    },
+    {
+      "case": "code",
+      "id": "single_line",
+      "answer": "def square(x): return x * x",
+      "passed": true
+    },
+    {
+      "case": "code",
+      "id": "comments",
+      "answer": "# pure function\ndef square(x): # input\n\treturn (x) * ((x)) # output",
+      "passed": true
+    },
+    {
+      "case": "code",
+      "id": "parentheses",
+      "answer": "def square(x):\n    return ((x * x));",
+      "passed": true
+    },
+    {
+      "case": "code",
+      "id": "tabs",
+      "answer": "def\tsquare ( x ) :\n\treturn x*x",
+      "passed": true
+    },
+    {
+      "case": "code",
+      "id": "markdown",
+      "answer": "```python\ndef square(x):\n    return x*x\n```",
+      "passed": false
+    },
+    {
+      "case": "code",
+      "id": "keyword_prose",
+      "answer": "Here is def square(x): return x*x",
+      "passed": false
+    },
+    {
+      "case": "code",
+      "id": "wrong_product",
+      "answer": "def square(x): return x+y",
+      "passed": false
+    },
+    {
+      "case": "code",
+      "id": "cube",
+      "answer": "def square(x): return x*x*x",
+      "passed": false
+    },
+    {
+      "case": "code",
+      "id": "power",
+      "answer": "def square(x): return x**2",
+      "passed": false
+    },
+    {
+      "case": "code",
+      "id": "call",
+      "answer": "def square(x): return eval(\"x*x\")",
+      "passed": false
+    },
+    {
+      "case": "code",
+      "id": "import",
+      "answer": "import os\ndef square(x): return x*x",
+      "passed": false
+    },
+    {
+      "case": "code",
+      "id": "wrong_indent",
+      "answer": "def square(x):\nreturn x*x",
+      "passed": false
+    },
+    {
+      "case": "code",
+      "id": "side_effect",
+      "answer": "def square(x):\n    print(x)\n    return x*x",
+      "passed": false
+    },
+    {
+      "case": "code",
+      "id": "second_function",
+      "answer": "def square(x): return x*x\ndef other(x): return x",
+      "passed": false
+    },
+    {
+      "case": "code",
+      "id": "default_arg",
+      "answer": "def square(x=0): return x*x",
+      "passed": false
+    },
+    {
+      "case": "code",
+      "id": "positional_only",
+      "answer": "def square(x,/): return x*x",
+      "passed": false
+    },
+    {
+      "case": "code",
+      "id": "annotation",
+      "answer": "def square(x: int): return x*x",
+      "passed": false
+    },
+    {
+      "case": "code",
+      "id": "decorator",
+      "answer": "@evil\ndef square(x): return x*x",
+      "passed": false
+    },
+    {
+      "case": "code",
+      "id": "docstring",
+      "answer": "def square(x):\n    \"doc\"\n    return x*x",
+      "passed": false
+    },
+    {
+      "case": "code",
+      "id": "truncated_header",
+      "answer": "def square(x):",
+      "passed": false
+    },
+    {
+      "case": "code",
+      "id": "truncated_return",
+      "answer": "def square(x): return x*",
+      "passed": false
+    },
+    {
+      "case": "code",
+      "id": "non_python_whitespace",
+      "answer": "def square(x):\n\u00a0\n    return x*x",
+      "passed": false
+    },
+    {
+      "case": "tool_json",
+      "id": "compact",
+      "answer": "{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Hangzhou\",\"unit\":\"celsius\"}}",
+      "passed": true
+    },
+    {
+      "case": "tool_json",
+      "id": "reordered",
+      "answer": "{ \"arguments\": { \"unit\": \"celsius\", \"city\": \"Hangzhou\" }, \"name\": \"get_weather\" }",
+      "passed": true
+    },
+    {
+      "case": "tool_json",
+      "id": "fenced",
+      "answer": "```json\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Hangzhou\", \"unit\": \"celsius\"}}\n```",
+      "passed": false
+    },
+    {
+      "case": "tool_json",
+      "id": "wrong_city",
+      "answer": "{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Suzhou\",\"unit\":\"celsius\"}}",
+      "passed": false
+    },
+    {
+      "case": "tool_json",
+      "id": "wrong_unit",
+      "answer": "{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Hangzhou\",\"unit\":\"fahrenheit\"}}",
+      "passed": false
+    },
+    {
+      "case": "tool_json",
+      "id": "wrong_name",
+      "answer": "{\"name\":\"weather\",\"arguments\":{\"city\":\"Hangzhou\",\"unit\":\"celsius\"}}",
+      "passed": false
+    },
+    {
+      "case": "tool_json",
+      "id": "extra_root",
+      "answer": "{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Hangzhou\",\"unit\":\"celsius\"},\"extra\":0}",
+      "passed": false
+    },
+    {
+      "case": "tool_json",
+      "id": "extra_argument",
+      "answer": "{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Hangzhou\",\"unit\":\"celsius\",\"extra\":0}}",
+      "passed": false
+    },
+    {
+      "case": "tool_json",
+      "id": "duplicate_root",
+      "answer": "{\"name\":\"wrong\",\"name\":\"get_weather\",\"arguments\":{\"city\":\"Hangzhou\",\"unit\":\"celsius\"}}",
+      "passed": false
+    },
+    {
+      "case": "tool_json",
+      "id": "duplicate_argument",
+      "answer": "{\"name\":\"get_weather\",\"arguments\":{\"city\":\"wrong\",\"city\":\"Hangzhou\",\"unit\":\"celsius\"}}",
+      "passed": false
+    },
+    {
+      "case": "tool_json",
+      "id": "missing_unit",
+      "answer": "{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Hangzhou\"}}",
+      "passed": false
+    },
+    {
+      "case": "tool_json",
+      "id": "argument_array",
+      "answer": "{\"name\":\"get_weather\",\"arguments\":[\"Hangzhou\",\"celsius\"]}",
+      "passed": false
+    },
+    {
+      "case": "tool_json",
+      "id": "prose",
+      "answer": "Use {\"name\": \"get_weather\", \"arguments\": {\"city\": \"Hangzhou\", \"unit\": \"celsius\"}}",
+      "passed": false
+    },
+    {
+      "case": "tool_json",
+      "id": "two_objects",
+      "answer": "{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Hangzhou\", \"unit\": \"celsius\"}}{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Hangzhou\", \"unit\": \"celsius\"}}",
+      "passed": false
+    },
+    {
+      "case": "tool_json",
+      "id": "truncated",
+      "answer": "{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Hangzhou\", \"unit\": \"celsius\"}",
+      "passed": false
+    },
+    {
+      "case": "tool_json",
+      "id": "trailing_comma",
+      "answer": "{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Hangzhou\",\"unit\":\"celsius\"},}",
+      "passed": false
+    },
+    {
+      "case": "code",
+      "id": "return_call_format",
+      "answer": "def square(x): return(x*x)",
+      "passed": true
+    },
+    {
+      "case": "code",
+      "id": "return_call_block",
+      "answer": "def square(x):\n    return(x*x)",
+      "passed": true
+    },
+    {
+      "case": "code",
+      "id": "parenthesis_continuation",
+      "answer": "def square(x):\n    return (\n        x*x\n    )",
+      "passed": true
+    },
+    {
+      "case": "code",
+      "id": "single_line_header_continuation",
+      "answer": "def square(x): return(\n x*x\n)",
+      "passed": true
+    },
+    {
+      "case": "code",
+      "id": "return_keyword_prefix",
+      "answer": "def square(x): returnx*x",
+      "passed": false
+    },
+    {
+      "case": "code",
+      "id": "return_newline_is_not_continuation",
+      "answer": "def square(x):\n    return\n    x*x",
+      "passed": false
+    },
+    {
+      "case": "code",
+      "id": "complete_return_followed_statement",
+      "answer": "def square(x):\n    return x*x\n    x*x",
+      "passed": false
+    },
+    {
+      "case": "tool_json",
+      "id": "unpaired_name",
+      "answer": "{\"name\":\"\\uD800\",\"arguments\":{\"city\":\"Hangzhou\",\"unit\":\"celsius\"}}",
+      "passed": false
+    },
+    {
+      "case": "tool_json",
+      "id": "unpaired_key",
+      "answer": "{\"\\uD800\":\"get_weather\",\"arguments\":{\"city\":\"Hangzhou\",\"unit\":\"celsius\"}}",
+      "passed": false
+    },
+    {
+      "case": "tool_json",
+      "id": "unpaired_city",
+      "answer": "{\"name\":\"get_weather\",\"arguments\":{\"city\":\"\\uD800\",\"unit\":\"celsius\"}}",
+      "passed": false
+    },
+    {
+      "case": "tool_json",
+      "id": "unpaired_unit",
+      "answer": "{\"name\":\"get_weather\",\"arguments\":{\"city\":\"Hangzhou\",\"unit\":\"\\uD800\"}}",
+      "passed": false
+    }
+  ]
+}

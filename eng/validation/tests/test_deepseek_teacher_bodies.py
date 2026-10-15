@@ -5,19 +5,37 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
+from eng.validation.tests.fixtures import deepseek_metadata as FIXTURE
 
 ROOT = Path(__file__).resolve().parents[3]
 SPEC = importlib.util.spec_from_file_location('teacher_bodies', ROOT / 'eng/validation/prepare-deepseek-teacher-bodies.py')
 MOD = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MOD)
-REPORT = ROOT / 'docs/validation/ggml-no-patch-2026-09-15'
-PLAN = REPORT / 'tp7-checkpoint-v5/teacher-logits-plan-v5.json'
-ENGINE = ROOT / 'benchmarks/engine_comparison/engines.py'
-PROFILE = REPORT / 'sparse-attention-candidate/sparse-attention-build/full-profile.json'
+ENGINE = FIXTURE.ENGINE
+PLAN_SPEC = importlib.util.spec_from_file_location('teacher_fixture_plan',ROOT / 'eng/validation/prepare-deepseek-teacher-logits.py')
+PLAN_MOD = importlib.util.module_from_spec(PLAN_SPEC);PLAN_SPEC.loader.exec_module(PLAN_MOD)
+
+
+class HistoricalPinTests(unittest.TestCase):
+    def test_production_historical_inputs_still_refuse_synthetic_substitution(self):
+        spec=importlib.util.spec_from_file_location('unmodified_teacher_pin',ROOT / 'eng/validation/prepare-deepseek-teacher-bodies.py')
+        production=importlib.util.module_from_spec(spec);spec.loader.exec_module(production)
+        self.assertEqual(production.ENGINE_SHA256,'d0c7b8dbacf70d6a663d39a51a6fa5e77cd36714d70591f8dc0e8ae9fe304ea6')
+        self.assertEqual(production.PROFILE_SHA256,'0a29cf8c4b1bd6c4567848314ec246e813f6f145ae8d7c40b14253d7f831639d')
+        with self.assertRaisesRegex(ValueError,'pin mismatch'):
+            production.engine_body_builder(ENGINE.read_bytes())
 
 
 class TeacherBodyTests(unittest.TestCase):
     def setUp(self):
+        directory=tempfile.TemporaryDirectory();self.addCleanup(directory.cleanup)
+        fixture=FIXTURE.bundle(directory.name);self.profile=fixture['sparse'];self.plan=Path(directory.name)/'teacher-plan.json'
+        with patch.multiple(PLAN_MOD,ROOT=fixture['root'],REPORTS=fixture['reports'],ARCHIVE=fixture['archive'],
+                            PINNED_REPORTS=fixture['pinned_reports'],SOURCE_PROFILE_SHA256=FIXTURE.digest(self.profile)):
+            self.plan.write_bytes(MOD.canonical(PLAN_MOD.build_plan('2'*64)))
+        pins=patch.multiple(MOD,ENGINE_SHA256=FIXTURE.digest(ENGINE),PROFILE_SHA256=FIXTURE.digest(self.profile))
+        pins.start();self.addCleanup(pins.stop)
         self.build, _ = MOD.engine_body_builder(ENGINE.read_bytes())
 
     def test_exact_merge_priority_matches_independent_literal(self):
@@ -57,13 +75,13 @@ class TeacherBodyTests(unittest.TestCase):
             MOD.engine_body_builder(ENGINE.read_bytes() + b'\n')
         with tempfile.TemporaryDirectory() as temp:
             with self.assertRaisesRegex(ValueError, 'SHA256 mismatch'):
-                MOD.prepare(PLAN, '0' * 64, ENGINE, PROFILE, Path(temp) / 'out')
+                MOD.prepare(self.plan, '0' * 64, ENGINE, self.profile, Path(temp) / 'out')
 
-    def test_all_113_original_ids_body_values_hashes_and_format_counts(self):
-        plan = json.loads(PLAN.read_text(encoding='utf-8'))
+    def test_all_113_fixture_ids_body_values_hashes_and_format_counts(self):
+        plan = json.loads(self.plan.read_text(encoding='utf-8'))
         with tempfile.TemporaryDirectory() as temp:
             output = Path(temp) / 'out'
-            result = MOD.prepare(PLAN, MOD.digest(PLAN.read_bytes()), ENGINE, PROFILE, output)
+            result = MOD.prepare(self.plan, MOD.digest(self.plan.read_bytes()), ENGINE, self.profile, output)
             self.assertEqual([r['id'] for r in result['requests']], [r['id'] for r in plan['requests']])
             self.assertEqual(len(result['requests']), 113)
             formats = {'json_object': 0, 'json_schema': 0, 'none': 0}
@@ -87,12 +105,12 @@ class TeacherBodyTests(unittest.TestCase):
                 formats[(body.get('response_format') or {}).get('type', 'none')] += 1
             self.assertEqual(formats, {'json_object': 20, 'json_schema': 5, 'none': 88})
             with self.assertRaisesRegex(ValueError, 'must be new'):
-                MOD.prepare(PLAN, MOD.digest(PLAN.read_bytes()), ENGINE, PROFILE, output)
+                MOD.prepare(self.plan, MOD.digest(self.plan.read_bytes()), ENGINE, self.profile, output)
 
     def test_duplicate_or_missing_original_ids_rejected(self):
         for change in ('duplicate', 'missing'):
             with self.subTest(change=change), tempfile.TemporaryDirectory() as temp:
-                plan = json.loads(PLAN.read_text(encoding='utf-8'))
+                plan = json.loads(self.plan.read_text(encoding='utf-8'))
                 if change == 'duplicate':
                     plan['requests'][1]['id'] = plan['requests'][0]['id']
                 else:
@@ -100,7 +118,7 @@ class TeacherBodyTests(unittest.TestCase):
                 changed = Path(temp) / 'plan.json'
                 changed.write_bytes(MOD.canonical(plan))
                 with self.assertRaisesRegex(ValueError, '113 distinct'):
-                    MOD.prepare(changed, MOD.digest(changed.read_bytes()), ENGINE, PROFILE, Path(temp) / 'out')
+                    MOD.prepare(changed, MOD.digest(changed.read_bytes()), ENGINE, self.profile, Path(temp) / 'out')
 
 
 if __name__ == '__main__':

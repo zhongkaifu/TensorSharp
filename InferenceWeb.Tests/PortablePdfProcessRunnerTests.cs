@@ -131,5 +131,5 @@ public sealed class PortablePdfProcessRunnerTests : IDisposable
         catch (ArgumentException) { return false; }
     }
 
-    public void Dispose() => Directory.Delete(_directory, recursive: true);
+    public void Dispose() => PortablePdfScratchDirectory.Delete(_directory);
 }

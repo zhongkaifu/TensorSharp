@@ -146,8 +146,29 @@ namespace TensorSharp.Models
             string.Equals(Environment.GetEnvironmentVariable("TS_QWEN35_LAYER_TRACE"), "1", StringComparison.Ordinal);
         private int _layerTraceForwards;
 
+        private unsafe void DumpDiagnosticTensor(Tensor tensor, string name)
+        {
+            string directory = Environment.GetEnvironmentVariable("TS_QWEN35_TENSOR_DUMP");
+            if (string.IsNullOrEmpty(directory) || _layerTraceForwards > 0) return;
+            // Materialize the tensor before the I/O-only catch: compute failures
+            // must still propagate, but diagnostic output must not abort a
+            // forward after its recurrent state has already advanced.
+            var bytes = new ReadOnlySpan<byte>(GetFloatPtr(tensor), checked((int)tensor.ElementCount() * sizeof(float)));
+            try
+            {
+                System.IO.Directory.CreateDirectory(directory);
+                using var file = System.IO.File.Create(System.IO.Path.Combine(directory, name + ".f32"));
+                file.Write(bytes);
+            }
+            catch (Exception error) when (error is System.IO.IOException || error is UnauthorizedAccessException)
+            {
+                Console.Error.WriteLine($"[Qwen35 diagnostic] Cannot write tensor {name} to '{directory}': {error.Message}");
+            }
+        }
+
         private unsafe void TraceLayer(Tensor hidden, int layer, string tag)
         {
+            if (hidden != null) DumpDiagnosticTensor(hidden, $"{(tag == "-tp" ? "tp" : "single")}.layer{layer:D2}");
             if (!LayerTraceEnabled || _layerTraceForwards > 0 || hidden == null)
                 return;
 
@@ -1363,6 +1384,7 @@ namespace TensorSharp.Models
 
             long t1 = Stopwatch.GetTimestamp();
             Tensor hidden0 = Embedding(tokens);
+            DumpDiagnosticTensor(hidden0, "tp.embedding");
             _embTicks += Stopwatch.GetTimestamp() - t1;
 
             // Inject any queued vision embeddings on rank 0 before broadcasting
@@ -1980,6 +2002,7 @@ namespace TensorSharp.Models
 
         private Tensor[] FFNBlockTP(Tensor[] hidden, int layer, int seqLen)
         {
+            DumpDiagnosticTensor(hidden[0], $"tp.layer{layer:D2}.block");
             bool isMoe = _isMoeLayer != null && _isMoeLayer[layer];
 
             if (isMoe)

@@ -1,7 +1,6 @@
 // Copyright (c) Zhongkai Fu. All rights reserved.
 // Licensed under the BSD-3-Clause license in the repository root.
 using System;
-using System.Buffers;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -10,6 +9,7 @@ using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.Win32.SafeHandles;
+using TensorSharp.Memory;
 
 namespace TensorSharp.Runtime;
 
@@ -43,12 +43,14 @@ public partial class GgufFile
             if (ranges.Count > 0) plans.Add((file, ranges));
         }
         long total = plans.Sum(p => p.Ranges.Sum(r => r.Length));
-        long available = GC.GetGCMemoryInfo().TotalAvailableMemoryBytes;
-        if (total == 0 || (available > 0 && total > available / 2)) return;
-
         int threads = Math.Min(16, Environment.ProcessorCount);
         if (int.TryParse(Environment.GetEnvironmentVariable("TS_GGUF_PREFAULT_THREADS"), out int requested) && requested > 0)
             threads = Math.Min(requested, Math.Max(1, Environment.ProcessorCount));
+        long available;
+        try { available = HostMemoryInfo.Capture().Available; }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException or PlatformNotSupportedException)
+        { return; } // Optional warming cannot treat unknown physical availability as unlimited.
+        if (!CanPrefaultFileCache(total, available, threads)) return;
         long readBytes = 0, residentBytes = 0;
         var watch = Stopwatch.StartNew();
         try
@@ -77,7 +79,7 @@ public partial class GgufFile
                     {
                         long start = region * regionBytes, end = Math.Min(start + regionBytes, length);
                         long position = 0, localRead = 0, localResident = 0;
-                        byte[]? buffer = null;
+                        PrefaultReadBuffer? buffer = null;
                         // One handle per worker preserves network filesystem readahead.
                         SafeFileHandle handle = handles[region];
                         byte[] residency = checkResident ? new byte[((8 << 20) / Environment.SystemPageSize) + 2] : Array.Empty<byte>();
@@ -95,11 +97,11 @@ public partial class GgufFile
                                         localResident += count;
                                     else
                                     {
-                                        buffer ??= ArrayPool<byte>.Shared.Rent(8 << 20);
+                                        buffer ??= new PrefaultReadBuffer((int)Math.Min(8 << 20, end - start));
                                         int done = 0;
                                         while (done < count)
                                         {
-                                            int read = RandomAccess.Read(handle, buffer.AsSpan(done, count - done), fileOffset + done);
+                                            int read = RandomAccess.Read(handle, buffer.Span.Slice(done, count - done), fileOffset + done);
                                             if (read == 0) throw new EndOfStreamException("GGUF changed during page-cache warmup.");
                                             done += read;
                                         }
@@ -113,7 +115,7 @@ public partial class GgufFile
                         }
                         finally
                         {
-                            if (buffer != null) ArrayPool<byte>.Shared.Return(buffer);
+                            buffer?.Dispose();
                             Interlocked.Add(ref readBytes, localRead);
                             Interlocked.Add(ref residentBytes, localResident);
                         }
@@ -134,6 +136,45 @@ public partial class GgufFile
         if (watch.Elapsed.TotalSeconds >= 1)
             Console.WriteLine($"  Prefaulted GGUF page cache in {watch.Elapsed.TotalSeconds:F1}s with {threads} read streams: " +
                 $"{readBytes / 1073741824.0:F2} GiB read, {residentBytes / 1073741824.0:F2} GiB already resident");
+    }
+
+    internal static bool CanPrefaultFileCache(long tensorBytes, long availableBytes, int threads)
+    {
+        if (tensorBytes <= 0 || availableBytes <= 0 || threads <= 0) return false;
+        // Leave half of CURRENT physical availability for execution/other users.
+        // Read buffers coexist with the warmed file pages. A GC heap ceiling is
+        // neither this availability nor an OS page-cache allowance.
+        long buffers = Math.Min(tensorBytes, (long)threads * (8 << 20));
+        return (decimal)tensorBytes + buffers <= availableBytes / 2;
+    }
+
+    private sealed unsafe class PrefaultReadBuffer : IDisposable
+    {
+        private byte* _data;
+        private readonly int _length;
+        private HostAllocationBudgetScope.Allocation? _charge;
+
+        internal PrefaultReadBuffer(int length)
+        {
+            _length = length;
+            _charge = HostAllocationBudgetScope.Reserve(length);
+            try
+            {
+                _data = (byte*)NativeMemory.Alloc((nuint)length);
+                if (_data == null) throw new OutOfMemoryException();
+                _charge?.Commit();
+            }
+            catch { Dispose(); throw; }
+        }
+
+        internal Span<byte> Span => new(_data, _length);
+        public void Dispose()
+        {
+            NativeMemory.Free(_data);
+            _data = null;
+            _charge?.Dispose();
+            _charge = null;
+        }
     }
 
     // Resolve ownership through the root table; sibling tensors are merged into

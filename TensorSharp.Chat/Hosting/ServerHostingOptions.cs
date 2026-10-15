@@ -69,8 +69,10 @@ namespace TensorSharp.Server.Hosting
             bool embeddingsEnabled = false,
             int embeddingThreads = 0,
             int embeddingContextSize = 0,
-            MultiAgentOptions? multiAgent = null)
+            MultiAgentOptions? multiAgent = null,
+            bool unifiedMemoryEnabled = false)
         {
+            UnifiedMemoryEnabled = unifiedMemoryEnabled;
             MultiAgent = multiAgent ?? new MultiAgentOptions();
             MultiAgent.Validate();
             EmbeddingsEnabled = embeddingsEnabled;
@@ -130,6 +132,9 @@ namespace TensorSharp.Server.Hosting
 
         /// <summary>Host an embedding encoder instead of a chat/generation model.</summary>
         public bool EmbeddingsEnabled { get; }
+
+        /// <summary>Explicitly use the qualified shared-budget model session; unsupported configurations are refused.</summary>
+        public bool UnifiedMemoryEnabled { get; }
 
         /// <summary>True when the embedding encoder runs entirely in managed C# without native backend libraries.</summary>
         public bool UsesManagedEmbeddingBackend => EmbeddingsEnabled && BackendCatalog.Canonicalize(DefaultBackend) == "cpu";
@@ -296,7 +301,8 @@ namespace TensorSharp.Server.Hosting
         /// Default generation budget applied by every endpoint (Web UI, Ollama,
         /// OpenAI chat + responses) when the request does not carry its own
         /// limit. Resolved from <c>--max-tokens</c> / <c>MAX_TOKENS</c>, falling
-        /// back to 20000.
+        /// back to 2048 for <c>--unified-memory</c>, otherwise 20000. The built-in
+        /// fallback does not cap a positive limit explicitly supplied by a request.
         /// </summary>
         public int DefaultMaxTokens { get; private set; }
 

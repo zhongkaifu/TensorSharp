@@ -36,6 +36,13 @@ public interface IPrefixPayloadSink
     /// <summary>Worker thread only. MUST NOT mutate the tree; the coordinator appends to its
     /// deferred queue and applies the invalidation before its next tree read.</summary>
     void OnPayloadInvalidated(string payloadKey, InvalidationReason reason);
+
+    /// <summary>After authoritative state is fenced into existing host mirrors
+    /// and its device bindings physically release, report only the reduced
+    /// device footprint. The key and exact previous footprint fence the same
+    /// payload generation. The worker defers tree accounting until its next
+    /// read; this does not invalidate reusable host state.</summary>
+    void OnPayloadDeviceDemoted(string payloadKey, PayloadFootprint previous, PayloadFootprint current) { }
 }
 
 /// <summary>

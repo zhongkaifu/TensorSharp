@@ -9,12 +9,20 @@ The CPU whole-graph test writes a synthetic explicit-attention reference fixture
 under the build directory; the CUDA, Vulkan and Metal whole-graph tests compare
 against it. On Vulkan, the test skips process teardown after printing its verdict:
 upstream ggml-vulkan keeps its VkInstance until exit, and NVIDIA's driver threads
-can fault while libraries unload (reproduced with ggml alone). The CUDA test compares 171 forwards with that reference,
+can fault while libraries unload (reproduced with ggml alone). The CUDA test compares forwards with that reference,
 including changed inputs and shapes, graph reuse, weight invalidation, and forced
-graph-owned weights. The Metal test compares 159 forwards with the same fixture;
+graph-owned weights. The Metal test compares against the same fixture;
 it excludes the device-copy-budget scenario because Metal maps host weights
 directly, so a device-copy cap cannot force graph-owned constants there.
 `TS_QWEN21_GRAPH_REUSE=0` disables graph reuse on CUDA and Metal for comparisons.
+
+The public shared-budget bridge is also exercised with cache-only and graph-inclusive
+scopes. Zero credit must refuse graph allocation without crashing or leaking credit;
+raising the quota must reproduce the control output. On CUDA/Metal, a tight quota
+forces retirement of the other cached graph shape before retrying. Prefix storage
+must remain charged after graph reset and return its credit on release. Repeated
+attach/run/dispose cycles must leave no live reservations. These use small synthetic
+weights; they do not establish a whole-model or process memory limit.
 
 Every shape with a prefix also runs the prefix KV cache. Each forward with a cache
 key is compared with the uncached graph on the same inputs: the first stores the

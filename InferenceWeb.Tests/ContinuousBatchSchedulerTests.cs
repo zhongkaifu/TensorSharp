@@ -9,6 +9,8 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using System.IO;
+using TensorSharp.Memory;
 using Microsoft.Extensions.Logging.Abstractions;
 using TensorSharp;
 using TensorSharp.Runtime.Paged;
@@ -31,6 +33,91 @@ public class ContinuousBatchSchedulerTests
     private const int NumLayers = 2;
     private const int NumKVHeads = 2;
     private const int HeadDim = 4;
+
+    [Theory]
+    [InlineData(1, false, true)]
+    [InlineData(2, false, true)]
+    [InlineData(2, true, true)]
+    [InlineData(1, false, false)]
+    [InlineData(2, false, false)]
+    [InlineData(2, true, false)]
+    public void Scheduler_AdmittedWorkspaceCapsSoloContendedAndMixedPrefill(int width, bool mixed, bool admission)
+    {
+        using var directory = new SnapshotTestDirectory();
+        var budget = new MemoryBudget([new("ram", 1 << 20), new("ssd", 0)]);
+        using var host = new HostAllocationBudgetScope(budget, ["ram"]);
+        var snapshots = KvSnapshotOptions.FromSharedBudget(budget, "ram", "ssd", directory.Path, 64);
+        var cfg = new SchedulerConfig
+        {
+            BlockSize = BlockSize, NumBlocks = 64, MaxNumBatchedTokens = 64,
+            MaxPrefillChunkSize = 32, SoloPrefillChunkSize = 64,
+            PrefillChunkTokenLimit = admission ? 32 : 4,
+            MaxNumRunningSequences = width, EnablePrefixCaching = false, KvSnapshots = snapshots,
+            MemoryAdmission = admission ? new(budget, _ => Array.Empty<MemoryCharge>())
+            {
+                ExecutionShape = new(snapshots, BlockSize, width, 4),
+                EnterSerialExecution = seq => host.EnterExecution(seq.MemoryEnvelope!)
+            } : null
+        };
+        var pool = NewPool(cfg.NumBlocks);
+        using var storage = pool.Storage;
+        var scheduler = new ContinuousBatchScheduler(cfg, pool);
+        if (admission)
+            Assert.Throws<ArgumentException>(() => scheduler.Submit(new SequenceState("wrong-block",
+                new[] { 1, 2, 3, 4 }, 3, BlockSize * 2, SamplingConfig.Greedy)));
+        var first = NewSequence("shape-first", mixed ? 4 : 64, 16);
+        scheduler.Submit(first);
+        var initial = scheduler.Schedule();
+        Assert.Equal(4, Assert.Single(initial.ScheduledWork).NumScheduledTokens);
+        first.AdvanceComputedTokens(4);
+        if (width == 2) scheduler.Submit(NewSequence("shape-second", 64, 16));
+        var next = scheduler.Schedule();
+        Assert.Equal(width, next.ScheduledWork.Count);
+        Assert.All(next.ScheduledWork.Where(w => w.IsPrefill), w => Assert.Equal(4, w.NumScheduledTokens));
+        if (mixed) Assert.Equal(1, next.ScheduledWork.First(w => !w.IsPrefill).NumScheduledTokens);
+    }
+
+    [Fact]
+    public async Task Engine_SingleRunningRequestNeedsNoSnapshotPageCreditEvenWithQueuedFollowers()
+    {
+        string? previous = Environment.GetEnvironmentVariable("TS_SCHED_DISABLE_BATCHED");
+        Environment.SetEnvironmentVariable("TS_SCHED_DISABLE_BATCHED", "1");
+        try
+        {
+            using var directory = new SnapshotTestDirectory();
+            using var model = new StubModel("single-snapshot-free", 7);
+            long blockBytes = model.ComputeKVBlockByteSize(BlockSize);
+            var budget = new MemoryBudget([new("ram", 2 * blockBytes + 64), new("ssd", 0)]);
+            using var host = new HostAllocationBudgetScope(budget, ["ram"]);
+            var snapshots = KvSnapshotOptions.FromSharedBudget(budget, "ram", "ssd", directory.Path, 64);
+            var admission = new RequestMemoryAdmission(budget, _ => Array.Empty<MemoryCharge>())
+            {
+                ExecutionShape = new(snapshots, BlockSize, 1, 4),
+                EnterSerialExecution = seq => host.EnterExecution(seq.MemoryEnvelope!)
+            };
+            SchedulerConfig Config(int width, int block, bool prefix, KvSnapshotOptions options) => new()
+            {
+                BlockSize = block, NumBlocks = 64, MaxNumRunningSequences = width,
+                MaxNumBatchedTokens = 64, SoloPrefillChunkSize = 64, EnablePrefixCaching = prefix,
+                StopRepetition = false, KvSnapshots = options, MemoryAdmission = admission
+            };
+            Assert.Throws<ArgumentException>(() => new InferenceEngine(model, Config(2, BlockSize, false, snapshots)));
+            Assert.Throws<ArgumentException>(() => new InferenceEngine(model, Config(1, BlockSize * 2, false, snapshots)));
+            Assert.Throws<ArgumentException>(() => new InferenceEngine(model, Config(1, BlockSize, false, snapshots with { TransferBytes = 128 })));
+            Assert.Throws<NotSupportedException>(() => new InferenceEngine(model, Config(1, BlockSize, true, snapshots)));
+            Assert.All(budget.Snapshot(), p => Assert.Equal(0, p.Committed + p.Reserved));
+            using (var engine = new InferenceEngine(model, Config(1, BlockSize, false, snapshots)))
+            {
+                var handles = Enumerable.Range(0, 3).Select(i => engine.SubmitRequest(NewSequence($"queued-{i}", 64, 3))).ToArray();
+                await Task.WhenAll(handles.Select(h => h.Completion)).WaitAsync(TimeSpan.FromSeconds(5));
+                Assert.All(handles, h => Assert.Equal(new[] { 7, 7, 7 }, h.Sequence.OutputTokens));
+                Assert.Equal(0, engine.SnapshotResidencyStats!.Value.Loads);
+                Assert.Equal(0, engine.SnapshotResidencyStats!.Value.Spills);
+            }
+            Assert.All(budget.Snapshot(), p => Assert.Equal(0, p.Committed + p.Reserved));
+        }
+        finally { Environment.SetEnvironmentVariable("TS_SCHED_DISABLE_BATCHED", previous); }
+    }
 
     [Fact]
     public void BlockPool_AllocateAndFree_RoundTrips()
@@ -474,12 +561,17 @@ public class ContinuousBatchSchedulerTests
         Assert.Equal("eos", completion.FinishReason);
     }
 
-    [Fact]
-    public void Executor_RecurrentOwnerSwap_PreservesFullCheckpoints_AndRefreshesPartialTail()
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Executor_RecurrentOwnerSwap_PreservesFullCheckpoints_AndRefreshesPartialTail(bool tiered)
     {
         var model = new RecurrentStubModel("fp-recurrent-swap", peakToken: 3);
         var cfg = RecurrentConfig();
-        var pool = NewPool(numBlocks: cfg.NumBlocks);
+        using var directory = new SnapshotTestDirectory();
+        var pool = new BlockPool(cfg.NumBlocks, BlockSize, model.ComputeKVBlockByteSize(BlockSize),
+            tiered ? new KvSnapshotOptions(192, 128 * 4096, directory.Path, 64) : null);
+        using var storage = pool.Storage;
         var sched = new ContinuousBatchScheduler(cfg, pool, NullLogger.Instance,
             requiresPerBlockCapture: true);
         var executor = new BatchExecutor(model, pool, sched, NullLogger.Instance);
@@ -510,6 +602,928 @@ public class ContinuousBatchSchedulerTests
         Assert.Equal(
             new[] { (5 * BlockSize, 5), (0, BlockSize) },
             model.ExtractCalls.Skip(5).ToArray());
+        if (tiered) Assert.True(storage.ResidencyStats!.Value.Spills > 0);
+    }
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    public async Task Engine_TieredKv_ConcurrentOutputsMatchResidentStatefulModel(int residentPages)
+    {
+        using var directory = new SnapshotTestDirectory();
+        async Task<int[][]> Run(bool tiered)
+        {
+            using var model = new StubModel("fp-tiered", 7, stateDependent: true);
+            long blockBytes = model.ComputeKVBlockByteSize(BlockSize);
+            var cfg = new SchedulerConfig { NumBlocks = 64, BlockSize = BlockSize,
+                MaxNumBatchedTokens = 32, MaxPrefillChunkSize = 8, SoloPrefillChunkSize = 32,
+                DecodeQuantumTokens = 1, EnablePrefixCaching = true, StopRepetition = false,
+                KvSnapshots = tiered ? new((1 + residentPages) * blockBytes + 64, 128 * 4096, directory.Path, 64) : null };
+            using var engine = new InferenceEngine(model, cfg);
+            var handles = Enumerable.Range(0, 4).Select(i => engine.SubmitRequest(new SequenceState(
+                $"stateful-{i}", Enumerable.Range(0, 24 + i).Select(t => (t + i) % 15 + 1).ToArray(),
+                12, BlockSize, SamplingConfig.Greedy))).ToArray();
+            await Task.WhenAll(handles.Select(h => h.Completion)).WaitAsync(TimeSpan.FromSeconds(15));
+            foreach (var handle in handles) Assert.Equal(SequenceStatus.FinishedLengthCapped, handle.Sequence.Status);
+            if (tiered)
+            {
+                Assert.True(engine.SnapshotResidencyStats!.Value.Spills > 0);
+                Assert.All(engine.SnapshotMemoryUsage!, p => Assert.True(p.Reserved + p.Committed <= p.Capacity));
+            }
+            return handles.Select(h => h.Sequence.OutputTokens.ToArray()).ToArray();
+        }
+        var expected = await Run(false);
+        var actual = await Run(true);
+        for (int i = 0; i < expected.Length; i++) Assert.Equal(expected[i], actual[i]);
+        Assert.Empty(Directory.EnumerateFiles(directory.Path, "*", SearchOption.AllDirectories));
+    }
+
+    [Fact]
+    public async Task Engine_SerialAllocationsUseEachRequestsReservedCredit()
+    {
+        string? previous = Environment.GetEnvironmentVariable("TS_SCHED_DISABLE_BATCHED");
+        Environment.SetEnvironmentVariable("TS_SCHED_DISABLE_BATCHED", "1");
+        try
+        {
+            var budget = new MemoryBudget([new("ram", 512)]);
+            using var host = new HostAllocationBudgetScope(budget, ["ram"]);
+            var routed = new HashSet<string>();
+            using var model = new StubModel("fp-execution-credit", 7)
+            {
+                OnForward = () =>
+                {
+                    IntPtr ptr = HostBuffers.Allocate(256);
+                    try { Assert.Equal(256, host.Usage.Bytes); }
+                    finally { HostBuffers.Free(ptr); }
+                }
+            };
+            using var engine = new InferenceEngine(model, new SchedulerConfig
+            {
+                BlockSize = BlockSize, NumBlocks = 32, MaxNumRunningSequences = 2,
+                EnablePrefixCaching = false, StopRepetition = false,
+                MemoryAdmission = new(budget, _ => new MemoryCharge[] { new("ram", 256) })
+                { EnterSerialExecution = seq => { routed.Add(seq.RequestId); return host.EnterExecution(seq.MemoryEnvelope!); } }
+            });
+            var first = engine.SubmitRequest(NewSequence("first", 8, 3));
+            var second = engine.SubmitRequest(NewSequence("second", 8, 3));
+            await Task.WhenAll(first.Completion, second.Completion).WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.Equal(new[] { "first", "second" }, routed.OrderBy(x => x));
+            Assert.All(new[] { first, second }, h => Assert.Equal(new[] { 7, 7, 7 }, h.Sequence.OutputTokens));
+            engine.Dispose();
+            Assert.Equal(512, budget.Snapshot().Single().Available);
+            Assert.Equal(0, host.Usage.Bytes);
+        }
+        finally { Environment.SetEnvironmentVariable("TS_SCHED_DISABLE_BATCHED", previous); }
+    }
+
+    [Fact]
+    public async Task Engine_PhysicalAdmissionSamplesOnlyEligibleEnvelopeUnderOpenGateAndModelLock()
+    {
+        var budget = new MemoryBudget([new("gpu", 100)]);
+        using var external = budget.Reserve([new("gpu", 100)]);
+        var gate = new ComputeGate(); gate.Close();
+        int samples = 0;
+        using var model = new StubModel("physical-boundary", 7);
+        using var engine = new InferenceEngine(model, new SchedulerConfig
+        {
+            BlockSize = BlockSize, NumBlocks = 32, StopRepetition = false, EnablePrefixCaching = false,
+            MemoryAdmission = new(budget, _ => [new("gpu", 100)])
+            {
+                BeforeAdmission = _ =>
+                {
+                    Assert.True(gate.IsOpen);
+                    Assert.True(Monitor.IsEntered(((IModelArchitecture)model).GpuComputeLock));
+                    Interlocked.Increment(ref samples);
+                    return [new("gpu", 100)];
+                }
+            }
+        }) { ComputeGate = gate };
+        var request = engine.SubmitRequest(NewSequence("boundary", 8, 8));
+        Assert.True(SpinWait.SpinUntil(() => engine.StepsHeldByGate > 0, TimeSpan.FromSeconds(5)));
+        Assert.Equal(0, Volatile.Read(ref samples));
+        gate.Open();
+        Assert.True(SpinWait.SpinUntil(() => Volatile.Read(ref model.TrimCalls) > 0, TimeSpan.FromSeconds(5)));
+        Assert.Equal(1, Volatile.Read(ref samples)); // One initial head observation, no busy resampling.
+        await Task.Delay(50);
+        Assert.Equal(1, Volatile.Read(ref samples));
+        external.Dispose();
+        await request.Completion.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(2, samples); // Fresh admission sample; eight token steps keep the same envelope.
+        Assert.Equal(Enumerable.Repeat(7, 8), request.Sequence.OutputTokens);
+        lock (((IModelArchitecture)model).GpuComputeLock) { }
+        Assert.Equal(100, budget.Snapshot().Single().Available);
+    }
+
+    [Fact]
+    public async Task Engine_PhysicalAdmissionRefusesOneRequestWithoutWaitingOrChangingBorrowedBudget()
+    {
+        var budget = new MemoryBudget([new("gpu", 100)]);
+        using var external = budget.Reserve([new("gpu", 100)]);
+        int samples = 0;
+        long physicalTarget = 100;
+        using var model = new StubModel("physical-refusal", 7);
+        using var engine = new InferenceEngine(model, new SchedulerConfig
+        {
+            BlockSize = BlockSize, NumBlocks = 32, StopRepetition = false, EnablePrefixCaching = false,
+            MemoryAdmission = new(budget, s => [new("gpu", s.RequestId == "too-large" ? 80 : 40)])
+            {
+                BeforeAdmission = _ => { Interlocked.Increment(ref samples); return [new("gpu", Volatile.Read(ref physicalTarget))]; }
+            }
+        });
+        var refused = engine.SubmitRequest(NewSequence("too-large", 8, 3));
+        var allowed = engine.SubmitRequest(NewSequence("fits-physical", 8, 3));
+        Assert.True(SpinWait.SpinUntil(() => Volatile.Read(ref model.TrimCalls) > 0, TimeSpan.FromSeconds(5)));
+        Assert.Equal(1, samples);
+        Volatile.Write(ref physicalTarget, 50);
+        external.Dispose(); // The old head now has a published FIFO ticket to remove on refusal.
+        await Assert.ThrowsAsync<MemoryPressureException>(
+            () => refused.Completion.WaitAsync(TimeSpan.FromSeconds(5)));
+        await allowed.Completion.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(3, samples);
+        Assert.Empty(refused.Sequence.OutputTokens);
+        Assert.Equal(new[] { 7, 7, 7 }, allowed.Sequence.OutputTokens);
+        lock (((IModelArchitecture)model).GpuComputeLock) { }
+        var pool = budget.Snapshot().Single();
+        Assert.Equal(100, pool.Capacity);
+        Assert.Equal(100, pool.Available);
+    }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(50)]
+    public async Task Engine_PhysicalAdmissionRecoversPrivateTargetHiddenByExistingOwnerFloor(int owned)
+    {
+        var budget = new MemoryBudget([new("gpu", 100)]);
+        using var permanentOwner = budget.Reserve([new("gpu", owned)]);
+        budget.RefreshCapacities([new("gpu", 10)]);
+        Assert.Equal(Math.Max(10, owned), budget.Snapshot().Single().Capacity);
+        int samples = 0;
+        var gate = new ComputeGate(); gate.Close();
+        using var model = new StubModel("physical-recovery", 7);
+        using var engine = new InferenceEngine(model, new SchedulerConfig
+        {
+            BlockSize = BlockSize, NumBlocks = 32, StopRepetition = false, EnablePrefixCaching = false,
+            MemoryAdmission = new(budget, _ => [new("gpu", 40)])
+            {
+                BeforeAdmission = _ =>
+                {
+                    Interlocked.Increment(ref samples);
+                    budget.RefreshCapacities([new("gpu", 100)]);
+                    return [new("gpu", 100)];
+                }
+            }
+        }) { ComputeGate = gate };
+        var request = engine.SubmitRequest(NewSequence("recovered", 8, 3));
+        Assert.True(SpinWait.SpinUntil(() => engine.StepsHeldByGate > 0, TimeSpan.FromSeconds(5)));
+        Assert.Equal(0, samples);
+        gate.Open();
+        await request.Completion.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(1, samples);
+        Assert.Equal(new[] { 7, 7, 7 }, request.Sequence.OutputTokens);
+        lock (((IModelArchitecture)model).GpuComputeLock) { }
+        Assert.Equal(100 - owned, budget.Snapshot().Single().Available);
+        Assert.Equal(owned, budget.Snapshot().Single().Reserved); // The original physical owner never released.
+    }
+
+    [Fact]
+    public async Task Engine_PhysicalAdmissionRejectsImpossiblePeakEvenWhileLedgerOwnerDoesNotRelease()
+    {
+        var budget = new MemoryBudget([new("gpu", 100)]);
+        using var permanentOwner = budget.Reserve([new("gpu", 50)]);
+        int samples = 0, forwards = 0;
+        using var model = new StubModel("physical-impossible", 7) { OnForward = () => Interlocked.Increment(ref forwards) };
+        using var engine = new InferenceEngine(model, new SchedulerConfig
+        {
+            BlockSize = BlockSize, NumBlocks = 32, StopRepetition = false, EnablePrefixCaching = false,
+            MemoryAdmission = new(budget, _ => [new("gpu", 80)])
+            {
+                BeforeAdmission = _ => { Interlocked.Increment(ref samples); return [new("gpu", 50)]; }
+            }
+        });
+        var request = engine.SubmitRequest(NewSequence("cannot-ever-fit-physical", 8, 3));
+        await Assert.ThrowsAsync<MemoryPressureException>(() => request.Completion.WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.Equal(1, samples);
+        Assert.Equal(0, forwards);
+        Assert.Equal(50, budget.Snapshot().Single().Reserved);
+        Assert.Equal(100, budget.Snapshot().Single().Capacity);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Engine_PhysicalAdmissionRefusesCurrentOwnerConflictForBorrowedAndPrivateTargets(bool privateTarget)
+    {
+        var budget = new MemoryBudget([new("gpu", 100)]);
+        using var permanentOwner = budget.Reserve([new("gpu", 50)]);
+        int samples = 0, forwards = 0;
+        using var model = new StubModel("physical-owner-conflict", 7) { OnForward = () => Interlocked.Increment(ref forwards) };
+        using var engine = new InferenceEngine(model, new SchedulerConfig
+        {
+            BlockSize = BlockSize, NumBlocks = 32, StopRepetition = false, EnablePrefixCaching = false,
+            MemoryAdmission = new(budget, _ => [new("gpu", 40)])
+            {
+                BeforeAdmission = _ =>
+                {
+                    Interlocked.Increment(ref samples);
+                    if (privateTarget) budget.RefreshCapacities([new("gpu", 50)]);
+                    return [new("gpu", 50)];
+                }
+            }
+        });
+        var request = engine.SubmitRequest(NewSequence("physical-owner-conflict", 8, 3));
+        await Assert.ThrowsAsync<MemoryPressureException>(() => request.Completion.WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.Equal(1, samples);
+        Assert.Equal(0, forwards);
+        Assert.Equal(50, budget.Snapshot().Single().Reserved);
+        Assert.Equal(privateTarget ? 50 : 100, budget.Snapshot().Single().Capacity);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Scheduler_PhysicalAdmissionReadinessSurvivesPartialReleaseBeforeFreshWaitSignal(bool privateTarget)
+    {
+        var budget = new MemoryBudget([new("gpu", 100)]);
+        using var permanentOwner = budget.Reserve([new("gpu", 50)]);
+        using var reclaimableOwner = budget.Reserve([new("gpu", 50)]);
+        int samples = 0;
+        var cfg = new SchedulerConfig
+        {
+            BlockSize = BlockSize, NumBlocks = 32, EnablePrefixCaching = false,
+            MemoryAdmission = new(budget, _ => [new("gpu", 40)])
+            {
+                BeforeAdmission = _ =>
+                {
+                    samples++;
+                    if (privateTarget) budget.RefreshCapacities([new("gpu", 50)]);
+                    return [new("gpu", 50)];
+                }
+            }
+        };
+        var pool = NewPool(32);
+        using var storage = pool.Storage;
+        var scheduler = new ContinuousBatchScheduler(cfg, pool);
+        var request = NewSequence("physical-after-partial-release", 8, 3);
+        scheduler.Submit(request);
+        Assert.Empty(scheduler.Schedule().ScheduledWork);
+        Assert.True(scheduler.MemoryAdmissionBlocked);
+        Assert.False(scheduler.CanAdmitMemory([new("gpu", 40)]));
+        Assert.Equal(1, samples);
+
+        // Reproduce the worker's post-reclamation check deterministically: the
+        // release precedes capturing the new signal, and no further owner moves.
+        reclaimableOwner.Dispose();
+        var freshSignal = budget.ChangeSignal;
+        Assert.False(freshSignal.IsCompleted);
+        Assert.True(scheduler.CanAdmitMemory([new("gpu", 40)]));
+        Assert.Empty(scheduler.Schedule().ScheduledWork);
+        Assert.Equal(2, samples);
+        Assert.Equal(SequenceStatus.FinishedError, request.Status);
+        Assert.IsType<MemoryPressureException>(request.Error);
+        Assert.Null(request.MemoryEnvelope);
+        Assert.Equal(50, budget.Snapshot().Single().Reserved);
+        Assert.Equal(privateTarget ? 50 : 100, budget.Snapshot().Single().Capacity);
+    }
+
+    [Fact]
+    public async Task Engine_PhysicalAdmissionRechecksAfterReclaimLeavesAPermanentOwner()
+    {
+        var budget = new MemoryBudget([new("gpu", 100)]);
+        using var permanentOwner = budget.Reserve([new("gpu", 50)]);
+        using var parkedOwner = budget.Reserve([new("gpu", 50)]);
+        int samples = 0, forwards = 0;
+        using var model = new StubModel("physical-partial-reclaim", 7)
+        {
+            OnTrim = parkedOwner.Dispose,
+            OnForward = () => Interlocked.Increment(ref forwards)
+        };
+        using var engine = new InferenceEngine(model, new SchedulerConfig
+        {
+            BlockSize = BlockSize, NumBlocks = 32, StopRepetition = false, EnablePrefixCaching = false,
+            MemoryAdmission = new(budget, _ => [new("gpu", 40)])
+            {
+                BeforeAdmission = _ =>
+                {
+                    Interlocked.Increment(ref samples);
+                    budget.RefreshCapacities([new("gpu", 50)]);
+                    return [new("gpu", 50)];
+                }
+            }
+        });
+        var request = engine.SubmitRequest(NewSequence("refused-after-reclaim", 8, 3));
+        await Assert.ThrowsAsync<MemoryPressureException>(() => request.Completion.WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.Equal(2, samples);
+        Assert.Equal(1, model.TrimCalls);
+        Assert.Equal(0, forwards);
+        Assert.Equal(50, budget.Snapshot().Single().Reserved);
+        Assert.Equal(50, budget.Snapshot().Single().Capacity);
+    }
+
+    [Fact]
+    public void Scheduler_BorrowedEffectiveTargetWaitsWithoutRepeatedPhysicalSampling()
+    {
+        var budget = new MemoryBudget([new("gpu", 100)]);
+        using var owner = budget.Reserve([new("gpu", 50)]);
+        budget.RefreshCapacities([new("gpu", 50)]);
+        int samples = 0;
+        var cfg = new SchedulerConfig
+        {
+            BlockSize = BlockSize, NumBlocks = 32, EnablePrefixCaching = false,
+            MemoryAdmission = new(budget, _ => [new("gpu", 40)])
+            { BeforeAdmission = _ => { samples++; return [new("gpu", 100)]; } }
+        };
+        var pool = NewPool(32);
+        using var storage = pool.Storage;
+        var scheduler = new ContinuousBatchScheduler(cfg, pool);
+        var request = NewSequence("borrowed-lower-target", 8, 3);
+        scheduler.Submit(request);
+        var unchanged = budget.ChangeSignal;
+        for (int step = 0; step < 32; step++)
+        {
+            Assert.Empty(scheduler.Schedule().ScheduledWork);
+            Assert.True(scheduler.MemoryAdmissionBlocked);
+            Assert.False(scheduler.CanAdmitMemory([new("gpu", 40)]));
+        }
+        Assert.Equal(1, samples);
+        Assert.Same(unchanged, budget.ChangeSignal);
+        Assert.Equal(50, budget.Snapshot().Single().Capacity);
+        owner.Dispose();
+        Assert.True(scheduler.CanAdmitMemory([new("gpu", 40)]));
+        Assert.Single(scheduler.Schedule().ScheduledWork);
+        Assert.Equal(2, samples);
+        scheduler.Abort(request.RequestId);
+        scheduler.NotifyMemoryReleased(request.RequestId);
+        Assert.Equal(50, budget.Snapshot().Single().Available);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Scheduler_CancelledPhysicalWaitDoesNotThrottleTheNextRequest(bool reuseId)
+    {
+        var budget = new MemoryBudget([new("gpu", 100)]);
+        using var owner = budget.Reserve([new("gpu", 50)]);
+        budget.RefreshCapacities([new("gpu", 50)]);
+        int samples = 0;
+        var cfg = new SchedulerConfig
+        {
+            BlockSize = BlockSize, NumBlocks = 32, EnablePrefixCaching = false,
+            MemoryAdmission = new(budget, _ => [new("gpu", 40)])
+            { BeforeAdmission = _ => { samples++; return [new("gpu", 100)]; } }
+        };
+        var pool = NewPool(32);
+        using var storage = pool.Storage;
+        var scheduler = new ContinuousBatchScheduler(cfg, pool);
+        var first = NewSequence("first", 8, 3);
+        var next = NewSequence(reuseId ? "first" : "next", 8, 3);
+        scheduler.Submit(first);
+        Assert.Empty(scheduler.Schedule().ScheduledWork);
+        Assert.False(scheduler.CanAdmitMemory([new("gpu", 40)]));
+        var unchanged = budget.ChangeSignal;
+        if (!reuseId) scheduler.Submit(next);
+        Assert.True(scheduler.Abort(first.RequestId));
+        if (reuseId) scheduler.Submit(next);
+        Assert.Same(unchanged, budget.ChangeSignal);
+        Assert.True(scheduler.CanAdmitMemory([new("gpu", 40)]));
+        Assert.Empty(scheduler.Schedule().ScheduledWork);
+        Assert.Equal(2, samples);
+        Assert.False(scheduler.CanAdmitMemory([new("gpu", 40)]));
+        scheduler.Abort(next.RequestId);
+    }
+
+    [Fact]
+    public void Scheduler_FifoHeadCancellationWithoutBudgetPulseAllowsFirstPhysicalAttempt()
+    {
+        var budget = new MemoryBudget([new("gpu", 100)]);
+        using var owner = budget.Reserve([new("gpu", 50)]);
+        budget.RefreshCapacities([new("gpu", 50)]);
+        using var older = SharedBudgetReclamation.Register(budget, () => { });
+        using var registration = SharedBudgetReclamation.Register(budget, () => { });
+        var olderRequest = NewSequence("older-conflicting", 8, 3);
+        Assert.Null(older.TryReserve(olderRequest, [new("gpu", 100)]));
+        int samples = 0;
+        var cfg = new SchedulerConfig
+        {
+            BlockSize = BlockSize, NumBlocks = 32, EnablePrefixCaching = false,
+            MemoryAdmission = new(budget, _ => [new("gpu", 40)])
+            { BeforeAdmission = _ => { samples++; return [new("gpu", 100)]; } }
+        };
+        var pool = NewPool(32);
+        using var storage = pool.Storage;
+        var scheduler = new ContinuousBatchScheduler(cfg, pool);
+        scheduler.AttachSharedAdmission(registration);
+        var request = NewSequence("newer-physical", 8, 3);
+        scheduler.Submit(request);
+        Assert.Empty(scheduler.Schedule().ScheduledWork);
+        Assert.Equal(0, samples);
+        var unchanged = budget.ChangeSignal;
+        older.Cancel(olderRequest);
+        Assert.Same(unchanged, budget.ChangeSignal);
+        Assert.True(scheduler.CanAdmitMemory([new("gpu", 40)]));
+        Assert.Empty(scheduler.Schedule().ScheduledWork);
+        Assert.Equal(1, samples);
+        Assert.False(scheduler.CanAdmitMemory([new("gpu", 40)]));
+        scheduler.Abort(request.RequestId);
+    }
+
+    [Fact]
+    public void Scheduler_ReleaseBetweenFailedAtomicAttemptAndRecordingStillTriggersPhysicalRetry()
+    {
+        var budget = new MemoryBudget([new("gpu", 100)]);
+        using var permanent = budget.Reserve([new("gpu", 30)]);
+        using var transient = budget.Reserve([new("gpu", 20)]);
+        budget.RefreshCapacities([new("gpu", 50)]);
+        using var registration = SharedBudgetReclamation.Register(budget, () => { });
+        // Group publication wakes peers after its failed atomic transaction but
+        // before TryReserve returns to the scheduler. Release only part of the
+        // charge so effective CanReserve remains false and signal identity matters.
+        using var peer = SharedBudgetReclamation.Register(budget, transient.Dispose);
+        int samples = 0;
+        var cfg = new SchedulerConfig
+        {
+            BlockSize = BlockSize, NumBlocks = 32, EnablePrefixCaching = false,
+            MemoryAdmission = new(budget, _ => [new("gpu", 40)])
+            { BeforeAdmission = _ => [new("gpu", ++samples == 1 ? 100 : 50)] }
+        };
+        var pool = NewPool(32);
+        using var storage = pool.Storage;
+        var scheduler = new ContinuousBatchScheduler(cfg, pool);
+        scheduler.AttachSharedAdmission(registration);
+        var request = NewSequence("release-during-return", 8, 3);
+        scheduler.Submit(request);
+        var before = budget.ChangeSignal;
+        Assert.Empty(scheduler.Schedule().ScheduledWork);
+        Assert.True(before.IsCompleted);
+        Assert.Equal(30, budget.Snapshot().Single().Reserved);
+        Assert.False(budget.CanReserve([new("gpu", 40)]));
+        var fresh = budget.ChangeSignal;
+        Assert.False(fresh.IsCompleted);
+        Assert.True(scheduler.CanAdmitMemory([new("gpu", 40)]));
+        Assert.Empty(scheduler.Schedule().ScheduledWork);
+        Assert.Equal(2, samples);
+        Assert.Equal(SequenceStatus.FinishedError, request.Status);
+        Assert.IsType<MemoryPressureException>(request.Error);
+    }
+
+    [Fact]
+    public void Scheduler_PartialReleasePermitsOnePhysicalRetryThenWaitsOnTheNewGeneration()
+    {
+        var budget = new MemoryBudget([new("gpu", 100)]);
+        using var remaining = budget.Reserve([new("gpu", 30)]);
+        using var transient = budget.Reserve([new("gpu", 20)]);
+        budget.RefreshCapacities([new("gpu", 50)]);
+        int samples = 0;
+        var cfg = new SchedulerConfig
+        {
+            BlockSize = BlockSize, NumBlocks = 32, EnablePrefixCaching = false,
+            MemoryAdmission = new(budget, _ => [new("gpu", 40)])
+            { BeforeAdmission = _ => { samples++; return [new("gpu", 100)]; } }
+        };
+        var pool = NewPool(32);
+        using var storage = pool.Storage;
+        var scheduler = new ContinuousBatchScheduler(cfg, pool);
+        var request = NewSequence("partial-still-tight", 8, 3);
+        scheduler.Submit(request);
+        Assert.Empty(scheduler.Schedule().ScheduledWork);
+        Assert.False(scheduler.CanAdmitMemory([new("gpu", 40)]));
+        transient.Dispose();
+        Assert.True(scheduler.CanAdmitMemory([new("gpu", 40)]));
+        for (int step = 0; step < 16; step++)
+        {
+            Assert.Empty(scheduler.Schedule().ScheduledWork);
+            Assert.False(scheduler.CanAdmitMemory([new("gpu", 40)]));
+        }
+        Assert.Equal(2, samples);
+        Assert.Null(request.Error);
+        remaining.Dispose();
+        Assert.True(scheduler.CanAdmitMemory([new("gpu", 40)]));
+        Assert.Single(scheduler.Schedule().ScheduledWork);
+        Assert.Equal(3, samples);
+        scheduler.Abort(request.RequestId);
+        scheduler.NotifyMemoryReleased(request.RequestId);
+    }
+
+    [Fact]
+    public async Task Engine_BorrowedEffectiveTargetSleepsUntilAnOwnerActuallyReleases()
+    {
+        var budget = new MemoryBudget([new("gpu", 100)]);
+        using var owner = budget.Reserve([new("gpu", 50)]);
+        budget.RefreshCapacities([new("gpu", 50)]);
+        var trimmed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        int samples = 0, forwards = 0;
+        using var model = new StubModel("borrowed-target-wait", 7)
+        {
+            OnTrim = () => trimmed.TrySetResult(),
+            OnForward = () => Interlocked.Increment(ref forwards)
+        };
+        using var engine = new InferenceEngine(model, new SchedulerConfig
+        {
+            BlockSize = BlockSize, NumBlocks = 32, StopRepetition = false, EnablePrefixCaching = false,
+            MemoryAdmission = new(budget, _ => [new("gpu", 40)])
+            { BeforeAdmission = _ => { Interlocked.Increment(ref samples); return [new("gpu", 100)]; } }
+        });
+        var request = engine.SubmitRequest(NewSequence("borrowed-target", 8, 3));
+        await trimmed.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await Task.Delay(100);
+        Assert.False(request.Completion.IsCompleted);
+        Assert.Equal(1, Volatile.Read(ref samples));
+        Assert.Equal(0, Volatile.Read(ref forwards));
+        Assert.Equal(50, budget.Snapshot().Single().Capacity);
+        owner.Dispose();
+        await request.Completion.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(2, Volatile.Read(ref samples));
+        Assert.Equal(new[] { 7, 7, 7 }, request.Sequence.OutputTokens);
+    }
+
+    [Fact]
+    public void Scheduler_PhysicalObservationFailureDoesNotFailAlreadyAdmittedWork()
+    {
+        var budget = new MemoryBudget([new("gpu", 100)]);
+        var cfg = new SchedulerConfig
+        {
+            BlockSize = BlockSize, NumBlocks = 32, MaxNumRunningSequences = 2,
+            MaxNumBatchedTokens = 64, EnablePrefixCaching = false,
+            MemoryAdmission = new(budget, _ => [new("gpu", 40)])
+            {
+                BeforeAdmission = s => s.RequestId == "observation-failed"
+                    ? throw new IOException("physical observation unavailable") : [new("gpu", 100)]
+            }
+        };
+        var pool = NewPool(32);
+        using var storage = pool.Storage;
+        var scheduler = new ContinuousBatchScheduler(cfg, pool);
+        var first = NewSequence("admitted", 8, 3);
+        var second = NewSequence("observation-failed", 8, 3);
+        scheduler.Submit(first); scheduler.Submit(second);
+        var output = scheduler.Schedule();
+        Assert.Same(first, Assert.Single(output.ScheduledWork).Sequence);
+        Assert.Equal(SequenceStatus.Running, first.Status);
+        Assert.Equal(SequenceStatus.FinishedError, second.Status);
+        Assert.IsType<IOException>(second.Error);
+        Assert.Null(second.MemoryEnvelope);
+        Assert.Equal(40, budget.Snapshot().Single().Reserved);
+        scheduler.Abort(first.RequestId);
+        scheduler.NotifyMemoryReleased(first.RequestId);
+        Assert.Equal(100, budget.Snapshot().Single().Available);
+    }
+
+    [Fact]
+    public async Task Engine_MemoryAdmission_WakesOnExternalRelease_AndCancellation()
+    {
+        var budget = new MemoryBudget(new[] { new MemoryCharge("gpu", 100) });
+        using var outside = budget.Reserve(new[] { new MemoryCharge("gpu", 100) });
+        using var model = new StubModel("fp-budget", 7);
+        using var engine = new InferenceEngine(model, new SchedulerConfig { BlockSize = BlockSize, NumBlocks = 32,
+            StopRepetition = false, MemoryAdmission = new(budget, _ => new[] { new MemoryCharge("gpu", 100) }) });
+        var first = engine.SubmitRequest(NewSequence("cancelled", 8, 3));
+        var second = engine.SubmitRequest(NewSequence("resume", 8, 3));
+        engine.Abort(first.RequestId);
+        var cancelled = await first.Completion.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(SequenceStatus.FinishedAborted, cancelled.Status);
+        Assert.Equal(0, engine.TotalStepsRun);
+        outside.Dispose();
+        var finished = await second.Completion.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(SequenceStatus.FinishedLengthCapped, finished.Status);
+        engine.Dispose();
+        Assert.All(budget.Snapshot(), p => Assert.Equal(p.Capacity, p.Available));
+    }
+
+    [Fact]
+    public async Task Engine_MemoryAdmission_ReclaimsParkedBuffers_OnlyWhenBlocked()
+    {
+        var budget = new MemoryBudget(new[] { new MemoryCharge("gpu", 100) });
+        using var parked = budget.Reserve(new[] { new MemoryCharge("gpu", 100) });
+        parked.Commit();
+        using var model = new StubModel("fp-reclaim", 7) { OnTrim = parked.Dispose };
+        using var engine = new InferenceEngine(model, new SchedulerConfig { BlockSize = BlockSize, NumBlocks = 32,
+            EnablePrefixCaching = false, StopRepetition = false,
+            MemoryAdmission = new(budget, _ => new[] { new MemoryCharge("gpu", 100) }) });
+        await engine.SubmitRequest(NewSequence("first", 8, 3)).Completion.WaitAsync(TimeSpan.FromSeconds(5));
+        await engine.SubmitRequest(NewSequence("second", 8, 3)).Completion.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(1, model.TrimCalls);
+        engine.Dispose();
+        Assert.All(budget.Snapshot(), p => Assert.Equal(p.Capacity, p.Available));
+    }
+
+    [Fact]
+    public async Task Engine_MemoryAdmission_PartialReclaimSleeps_ThenWakesOnExternalRelease()
+    {
+        var budget = new MemoryBudget(new[] { new MemoryCharge("gpu", 100) });
+        using var parked = budget.Reserve(new[] { new MemoryCharge("gpu", 20) });
+        using var outside = budget.Reserve(new[] { new MemoryCharge("gpu", 80) });
+        var trimmed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var model = new StubModel("fp-partial-reclaim", 7)
+        {
+            OnTrim = () => { parked.Dispose(); trimmed.TrySetResult(); }
+        };
+        using var engine = new InferenceEngine(model, new SchedulerConfig { BlockSize = BlockSize, NumBlocks = 32,
+            StopRepetition = false, MemoryAdmission = new(budget, _ => new[] { new MemoryCharge("gpu", 100) }) });
+        var handle = engine.SubmitRequest(NewSequence("waiting", 8, 3));
+        await trimmed.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await Task.Delay(100);
+        Assert.False(handle.Completion.IsCompleted);
+        Assert.Equal(1, model.TrimCalls); // Own release must not trigger another trim.
+        Assert.Equal(0, engine.TotalStepsRun);
+        outside.Dispose();
+        var result = await handle.Completion.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(SequenceStatus.FinishedLengthCapped, result.Status);
+        Assert.Equal(1, model.TrimCalls);
+    }
+
+    [Fact]
+    public async Task Engine_MemoryAdmission_FailedReclaimStopsBeforeForward()
+    {
+        var budget = new MemoryBudget(new[] { new MemoryCharge("gpu", 100) });
+        using var parked = budget.Reserve(new[] { new MemoryCharge("gpu", 100) });
+        using var model = new StubModel("fp-failed-reclaim", 7)
+        { OnTrim = () => throw new InvalidOperationException("parked-buffer release failed") };
+        using var engine = new InferenceEngine(model, new SchedulerConfig { BlockSize = BlockSize, NumBlocks = 32,
+            StopRepetition = false, MemoryAdmission = new(budget, _ => new[] { new MemoryCharge("gpu", 100) }) });
+        var handle = engine.SubmitRequest(NewSequence("waiting", 8, 3));
+        var error = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => handle.Completion.WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.Equal("parked-buffer release failed", error.Message);
+        Assert.Equal(0, engine.TotalStepsRun);
+        Assert.Equal(0, budget.Snapshot().Single().Available);
+    }
+
+    [Fact]
+    public async Task Engine_MemoryAdmission_ReclaimsAnotherIdleEngine()
+    {
+        var budget = new MemoryBudget([new("gpu", 100)]);
+        using var parked = budget.Reserve([new("gpu", 100)]);
+        parked.Commit();
+        using var donor = new StubModel("donor", 7) { OnTrim = parked.Dispose };
+        using var receiver = new StubModel("receiver", 7);
+        using var first = new InferenceEngine(donor, SharedConfig(budget, 0));
+        using var second = new InferenceEngine(receiver, SharedConfig(budget, 100));
+        var result = await second.SubmitRequest(NewSequence("needs-donor", 8, 3)).Completion.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(SequenceStatus.FinishedLengthCapped, result.Status);
+        Assert.Equal(1, donor.TrimCalls);
+        Assert.Equal(0, first.TotalStepsRun);
+        Assert.Equal(100, budget.Snapshot().Single().Available);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task Engine_MemoryAdmission_DefersForeignReclaimUntilGateOpens(bool cancelWaiting)
+    {
+        var budget = new MemoryBudget([new("gpu", 100)]);
+        using var parked = budget.Reserve([new("gpu", 100)]);
+        using var donor = new StubModel("gated-donor", 7) { OnTrim = parked.Dispose };
+        var gate = new ComputeGate(); gate.Close();
+        using var first = new InferenceEngine(donor, SharedConfig(budget, 0)) { ComputeGate = gate };
+        var attempted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var receiver = new StubModel("receiver", 7) { OnTrim = () => attempted.TrySetResult() };
+        using var second = new InferenceEngine(receiver, SharedConfig(budget, 100));
+        var waiting = second.SubmitRequest(NewSequence("waiting", 8, 3));
+        await attempted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await Task.Delay(50);
+        Assert.Equal(0, donor.TrimCalls);
+        Assert.False(waiting.Completion.IsCompleted);
+        if (cancelWaiting)
+        {
+            second.Abort(waiting.RequestId);
+            Assert.Equal(SequenceStatus.FinishedAborted, (await waiting.Completion.WaitAsync(TimeSpan.FromSeconds(5))).Status);
+            // Completion is delivered inside ApplyCommand; wait for its worker to
+            // remove the cancelled demand before opening the donor's gate.
+            second.Dispose();
+        }
+        gate.Open();
+        if (!cancelWaiting)
+        {
+            await waiting.Completion.WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.Equal(1, donor.TrimCalls);
+        }
+        else
+        {
+            await Task.Delay(50);
+            Assert.Equal(0, donor.TrimCalls);
+            Assert.Equal(0, budget.Snapshot().Single().Available);
+        }
+    }
+
+    [Fact]
+    public async Task Engine_MemoryAdmission_ForeignPressureNeverTrimsActiveForward()
+    {
+        var budget = new MemoryBudget([new("gpu", 100)]);
+        using var parked = budget.Reserve([new("gpu", 100)]);
+        using var entered = new ManualResetEventSlim();
+        using var release = new ManualResetEventSlim();
+        using var donor = new StubModel("active-donor", 7, entered, release) { OnTrim = parked.Dispose };
+        using var first = new InferenceEngine(donor, SharedConfig(budget, 0));
+        using var receiver = new StubModel("receiver", 7);
+        using var second = new InferenceEngine(receiver, SharedConfig(budget, 100));
+        try
+        {
+            var active = first.SubmitRequest(NewSequence("active", 8, 4));
+            Assert.True(entered.Wait(TimeSpan.FromSeconds(5)));
+            var waiting = second.SubmitRequest(NewSequence("waiting", 8, 3));
+            await Task.Delay(100);
+            Assert.Equal(0, donor.TrimCalls);
+            Assert.False(waiting.Completion.IsCompleted);
+            release.Set();
+            await Task.WhenAll(active.Completion, waiting.Completion).WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.Equal(1, donor.TrimCalls);
+            Assert.Equal(100, budget.Snapshot().Single().Available);
+        }
+        finally { release.Set(); }
+    }
+
+    [Fact]
+    public async Task Engine_MemoryAdmission_BlockedPeersDoNotWakeEachOtherForever()
+    {
+        var budget = new MemoryBudget([new("gpu", 100)]);
+        using var external = budget.Reserve([new("gpu", 100)]);
+        using var a = new StubModel("peer-a", 7);
+        using var b = new StubModel("peer-b", 7);
+        using var first = new InferenceEngine(a, SharedConfig(budget, 100));
+        using var second = new InferenceEngine(b, SharedConfig(budget, 100));
+        var one = first.SubmitRequest(NewSequence("one", 8, 3));
+        var two = second.SubmitRequest(NewSequence("two", 8, 3));
+        await Task.Delay(150);
+        int attempts = a.TrimCalls + b.TrimCalls;
+        await Task.Delay(150);
+        Assert.InRange(attempts, 2, 8);
+        Assert.Equal(attempts, a.TrimCalls + b.TrimCalls);
+        external.Dispose();
+        await Task.WhenAll(one.Completion, two.Completion).WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.All(new[] { one, two }, h => Assert.Equal(new[] { 7, 7, 7 }, h.Sequence.OutputTokens));
+    }
+
+    [Fact]
+    public async Task Engine_PreCancelledRequestsNeverForwardOrOrphanAnEnvelope()
+    {
+        var budget = new MemoryBudget([new("gpu", 100)]);
+        int calls = 0;
+        using var model = new StubModel("cancel-stress", 7) { OnForward = () => Interlocked.Increment(ref calls) };
+        using var engine = new InferenceEngine(model, SharedConfig(budget, 100));
+        using var cancelled = new CancellationTokenSource(); cancelled.Cancel();
+        for (int i = 0; i < 500; ++i)
+        {
+            // Reuse IDs deliberately: queued callbacks must name the submission.
+            var handle = engine.SubmitRequest(NewSequence("reused-id", 8, 3), cancelled.Token);
+            Assert.Equal(SequenceStatus.FinishedAborted, (await handle.Completion.WaitAsync(TimeSpan.FromSeconds(5))).Status);
+        }
+        Assert.Equal(0, calls);
+        var final = engine.SubmitRequest(NewSequence("barrier", 8, 3));
+        await final.Completion.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(new[] { 7, 7, 7 }, final.Sequence.OutputTokens);
+        Assert.Equal(0, engine.WaitingCount);
+        Assert.Equal(0, engine.RunningCount);
+        Assert.Equal(100, budget.Snapshot().Single().Available);
+        Assert.Equal(0, model.TrimCalls);
+        Assert.Equal(4, calls); // One prompt and the executor's three decode forwards.
+    }
+
+    [Fact]
+    public async Task Engine_ClosedComputeGateAllowsQueuedCancellationButDefersModelTrim()
+    {
+        var budget = new MemoryBudget([new("gpu", 100)]);
+        var gate = new ComputeGate(); gate.Close();
+        var trimmed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var model = new StubModel("gated-commands", 7) { OnTrim = () => trimmed.TrySetResult() };
+        using var engine = new InferenceEngine(model, SharedConfig(budget, 100)) { ComputeGate = gate };
+        var waiting = engine.SubmitRequest(NewSequence("waiting", 8, 3));
+        Assert.True(SpinWait.SpinUntil(() => engine.StepsHeldByGate != 0, TimeSpan.FromSeconds(5)));
+        engine.TrimIdleMemory();
+        engine.Abort(waiting.RequestId);
+        Assert.Equal(SequenceStatus.FinishedAborted, (await waiting.Completion.WaitAsync(TimeSpan.FromSeconds(5))).Status);
+        Assert.Equal(0, engine.TotalStepsRun);
+        Assert.Equal(0, model.TrimCalls);
+        Assert.Equal(100, budget.Snapshot().Single().Available);
+        gate.Open();
+        await trimmed.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(1, model.TrimCalls);
+    }
+
+    [Fact]
+    public async Task Engine_ClosedComputeGateKeepsActiveEnvelopeUntilSafeCancellation()
+    {
+        var budget = new MemoryBudget([new("gpu", 100)]);
+        var gate = new ComputeGate();
+        using var model = new StubModel("active-gated-cancel", 7) { OnForward = gate.Close };
+        using var engine = new InferenceEngine(model, SharedConfig(budget, 100)) { ComputeGate = gate };
+        var active = engine.SubmitRequest(NewSequence("active", 8, 8));
+        Assert.True(SpinWait.SpinUntil(() => engine.StepsHeldByGate != 0, TimeSpan.FromSeconds(5)));
+        engine.Abort(active.RequestId);
+        await Task.Delay(50);
+        Assert.False(active.Completion.IsCompleted);
+        Assert.Equal(0, budget.Snapshot().Single().Available);
+        Assert.Equal(1, engine.TotalStepsRun);
+        gate.Open();
+        Assert.Equal(SequenceStatus.FinishedAborted, (await active.Completion.WaitAsync(TimeSpan.FromSeconds(5))).Status);
+        Assert.Equal(100, budget.Snapshot().Single().Available);
+        Assert.Equal(1, engine.TotalStepsRun);
+    }
+
+    [Fact]
+    public async Task Engine_RepeatedPressureAndCancellationPreservesFifoProgressAndCredit()
+    {
+        var budget = new MemoryBudget([new("gpu", 100)]);
+        using var model = new StubModel("pressure-cancel-cycles", 7);
+        using var engine = new InferenceEngine(model, SharedConfig(budget, 100));
+        int cycles = int.Parse(Environment.GetEnvironmentVariable("TS_TEST_SHARED_MEMORY_SOAK_CYCLES") ?? "64",
+            System.Globalization.CultureInfo.InvariantCulture);
+        Assert.InRange(cycles, 64, 1_000_000);
+        for (int cycle = 0; cycle < cycles; ++cycle)
+        {
+            using var external = budget.Reserve([new("gpu", 100)]);
+            var handles = Enumerable.Range(0, 8)
+                .Select(i => engine.SubmitRequest(NewSequence($"cycle-{cycle}-{i}", 8, 3))).ToArray();
+            // Cancel the head and alternating waiters while another owner holds
+            // all credit. Survivors must progress in their original FIFO order.
+            foreach (int i in new[] { 0, 2, 4, 6 }) engine.Abort(handles[i].RequestId);
+            foreach (int i in new[] { 0, 2, 4, 6 })
+                Assert.Equal(SequenceStatus.FinishedAborted,
+                    (await handles[i].Completion.WaitAsync(TimeSpan.FromSeconds(5))).Status);
+            external.Dispose();
+            await Task.WhenAll(handles.Select(h => h.Completion)).WaitAsync(TimeSpan.FromSeconds(5));
+            DateTime? previous = null;
+            foreach (int i in new[] { 1, 3, 5, 7 })
+            {
+                Assert.Equal(new[] { 7, 7, 7 }, handles[i].Sequence.OutputTokens);
+                Assert.True(handles[i].Sequence.FirstScheduledAt.HasValue);
+                if (previous.HasValue) Assert.True(handles[i].Sequence.FirstScheduledAt >= previous);
+                previous = handles[i].Sequence.FirstScheduledAt;
+            }
+            Assert.Equal(100, budget.Snapshot().Single().Available);
+            Assert.Equal(0, engine.WaitingCount);
+            Assert.Equal(0, engine.RunningCount);
+        }
+        Assert.Equal(100, budget.HighWatermarks().Single().Owned);
+        Assert.Equal(8L * cycles, engine.TotalSubmitted);
+        Console.WriteLine($"Shared-memory pressure/cancellation: {cycles} cycles, {8L * cycles} requests, " +
+            $"{4L * cycles} cancellations; every cycle checked FIFO progress, tokens and full credit return.");
+    }
+
+    [Fact]
+    public async Task Engine_OlderLargeRequestPrecedesNewerSmallRequestAcrossSharedEngines()
+    {
+        var budget = new MemoryBudget([new("gpu", 100)]);
+        using var external = budget.Reserve([new("gpu", 50)]);
+        var order = new System.Collections.Concurrent.ConcurrentQueue<string>();
+        using var olderModel = new StubModel("older-large", 7) { OnForward = () => order.Enqueue("older") };
+        using var newerModel = new StubModel("newer-small", 7) { OnForward = () => order.Enqueue("newer") };
+        using var older = new InferenceEngine(olderModel, SharedConfig(budget, 100));
+        var first = older.SubmitRequest(NewSequence("older", 8, 3));
+        Assert.True(SpinWait.SpinUntil(() => Volatile.Read(ref olderModel.TrimCalls) > 0, TimeSpan.FromSeconds(5)));
+        using var newer = new InferenceEngine(newerModel, SharedConfig(budget, 50));
+        var second = newer.SubmitRequest(NewSequence("newer", 8, 3));
+        Assert.True(SpinWait.SpinUntil(() => Volatile.Read(ref newerModel.TrimCalls) > 0, TimeSpan.FromSeconds(5)));
+        Assert.Empty(order);
+        Assert.False(second.Completion.IsCompleted); // 50 bytes fit, but the older 100-byte demand owns priority.
+        external.Dispose();
+        await Task.WhenAll(first.Completion, second.Completion).WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal("older", order.First());
+        Assert.All(new[] { first, second }, h => Assert.Equal(new[] { 7, 7, 7 }, h.Sequence.OutputTokens));
+        lock (((IModelArchitecture)olderModel).GpuComputeLock) { }
+        lock (((IModelArchitecture)newerModel).GpuComputeLock) { }
+        Assert.Equal(100, budget.Snapshot().Single().Available);
+    }
+
+    [Fact]
+    public async Task Engine_ClosingBlockedHeadGateYieldsToPeerWithoutBudgetRelease()
+    {
+        var budget = new MemoryBudget([new("gpu", 100)]);
+        using var external = budget.Reserve([new("gpu", 50)]);
+        var gate = new ComputeGate();
+        using var olderModel = new StubModel("closed-head", 7);
+        using var newerModel = new StubModel("open-peer", 7);
+        using var older = new InferenceEngine(olderModel, SharedConfig(budget, 100)) { ComputeGate = gate };
+        var first = older.SubmitRequest(NewSequence("older", 8, 3));
+        Assert.True(SpinWait.SpinUntil(() => Volatile.Read(ref olderModel.TrimCalls) > 0, TimeSpan.FromSeconds(5)));
+        using var newer = new InferenceEngine(newerModel, SharedConfig(budget, 50));
+        var second = newer.SubmitRequest(NewSequence("newer", 8, 3));
+        Assert.True(SpinWait.SpinUntil(() => Volatile.Read(ref newerModel.TrimCalls) > 0, TimeSpan.FromSeconds(5)));
+        Assert.False(second.Completion.IsCompleted);
+        var unchanged = budget.ChangeSignal;
+        gate.Close();
+        await second.Completion.WaitAsync(TimeSpan.FromSeconds(5));
+        lock (((IModelArchitecture)newerModel).GpuComputeLock) { }
+        Assert.False(first.Completion.IsCompleted);
+        Assert.Equal(new[] { 7, 7, 7 }, second.Sequence.OutputTokens);
+        Assert.Equal(0, older.TotalStepsRun);
+        Assert.True(unchanged.IsCompleted); // Peer completion, not external ownership, released credit.
+        Assert.Equal(50, budget.Snapshot().Single().Reserved);
+        older.Abort(first.RequestId);
+        Assert.Equal(SequenceStatus.FinishedAborted, (await first.Completion.WaitAsync(TimeSpan.FromSeconds(5))).Status);
+        gate.Open();
+    }
+
+    private static SchedulerConfig SharedConfig(MemoryBudget budget, long peak) => new()
+    {
+        BlockSize = BlockSize, NumBlocks = 32, EnablePrefixCaching = false,
+        StopRepetition = false, DecodeQuantumTokens = 1,
+        MemoryAdmission = new(budget, _ => new[] { new MemoryCharge("gpu", peak) })
+    };
+
+    private sealed class SnapshotTestDirectory : IDisposable
+    {
+        public string Path { get; } = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "ts-runtime-kv-" + Guid.NewGuid().ToString("N"));
+        public SnapshotTestDirectory() => Directory.CreateDirectory(Path);
+        public void Dispose() => Directory.Delete(Path, recursive: true);
     }
 
     [Fact]
@@ -716,17 +1730,20 @@ public class ContinuousBatchSchedulerTests
         private int _eos = -1;
         private readonly ManualResetEventSlim? _forwardEntered;
         private readonly ManualResetEventSlim? _releaseForward;
+        private readonly bool _stateDependent;
 
         public StubModel(
             string fingerprint,
             int peakToken,
             ManualResetEventSlim? forwardEntered = null,
-            ManualResetEventSlim? releaseForward = null)
+            ManualResetEventSlim? releaseForward = null,
+            bool stateDependent = false)
         {
             _fp = fingerprint;
             _peak = peakToken;
             _forwardEntered = forwardEntered;
             _releaseForward = releaseForward;
+            _stateDependent = stateDependent;
             Tokenizer = new StubTokenizer(VocabSize, this);
         }
 
@@ -738,9 +1755,14 @@ public class ContinuousBatchSchedulerTests
 
         public void SetEos(int eosId) => _eos = eosId;
         public int CurrentSeqLen => _cacheSeqLen;
+        public Action? OnTrim { get; init; }
+        public Action? OnForward { get; init; }
+        public int TrimCalls;
+        public void TrimIdleMemory() { Interlocked.Increment(ref TrimCalls); OnTrim?.Invoke(); }
 
         public float[] Forward(int[] tokens)
         {
+            OnForward?.Invoke();
             _forwardEntered?.Set();
             if (_releaseForward != null
                 && !_releaseForward.Wait(TimeSpan.FromSeconds(5)))
@@ -763,7 +1785,15 @@ public class ContinuousBatchSchedulerTests
             _cacheSeqLen += tokens.Length;
 
             var logits = new float[VocabSize];
-            logits[_peak] = 10.0f;
+            int peak = _peak;
+            if (_stateDependent)
+            {
+                int digest = 0;
+                for (int t = 0; t < _cacheSeqLen; t++)
+                    digest = ((digest * 7) ^ _state[(int)ComputeKVBlockByteSize(t)]) % (VocabSize - 1);
+                peak = digest + 1;
+            }
+            logits[peak] = 10.0f;
             return logits;
         }
 

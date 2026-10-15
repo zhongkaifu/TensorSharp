@@ -231,7 +231,7 @@ static int verify_ranges(int argc, char ** argv)
             ranges.push_back({ int(request.file), request.offset, request.bytes, view.at(request.offset) });
         }
         const auto warm = tsg_dsv4::warm_file_ranges(paths, ranges, options);
-        bool passed = warm.ok && !warm.stopped;
+        bool passed = warm.ok && !warm.stopped && !warm.budget_skipped;
         // Measure every mapping before printing results. This path deliberately
         // performs no model opens, remaps, or eviction calls after the warm.
         for (auto & request : requested)
@@ -339,7 +339,7 @@ int main(int argc, char ** argv)
                 tsg_dsv4::file_warm_options o;
                 o.threads = threads;
                 const auto r = tsg_dsv4::warm_file_ranges(paths, { { 0, off, bytes, view.at(off) } }, o);
-                ok = r.ok; error = r.error; read = r.bytes_read; resident = r.bytes_resident;
+                ok = r.ok && !r.budget_skipped; error = r.error; read = r.bytes_read; resident = r.bytes_resident;
             }
             else if (mode == "touch")
             {
@@ -407,7 +407,7 @@ int main(int argc, char ** argv)
                 std::printf("{\"mode\":\"populate\",\"repeat\":%d,\"threads\":%d,\"seconds\":%.3f,\"s_per_gib\":%.4f,"
                             "\"bytes_read\":%" PRIu64 ",\"major_faults\":%ld,\"minor_faults\":%ld,\"ok\":%s}\n",
                             rep, r.threads, r.seconds, r.seconds / (bytes / GiB),
-                            r.bytes_read, g1.major - g0.major, g1.minor - g0.minor, r.ok ? "true" : "false");
+                            r.bytes_read, g1.major - g0.major, g1.minor - g0.minor, r.ok && !r.budget_skipped ? "true" : "false");
             }
             {
                 map_view fresh(path);
@@ -471,7 +471,7 @@ int main(int argc, char ** argv)
                 std::printf("{\"mode\":\"rewarm\",\"repeat\":%d,\"threads\":%d,\"seconds\":%.4f,\"gib_per_s\":%.1f,"
                             "\"bytes_read\":%" PRIu64 ",\"bytes_resident\":%" PRIu64 ",\"ok\":%s}\n",
                             rep, r.threads, r.seconds, bytes / GiB / r.seconds, r.bytes_read, r.bytes_resident,
-                            r.ok ? "true" : "false");
+                            r.ok && !r.budget_skipped ? "true" : "false");
             }
             if (drop_cost)
             {

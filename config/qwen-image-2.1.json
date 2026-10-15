@@ -5,11 +5,11 @@
   // Use --width 1024 --height 1024 for faster drafts; explicit dimensions must be divisible by 32.
   // Apple Silicon uses ggml_metal. Override --backend ggml_cuda for NVIDIA GPUs.
   "variables": {
-    "root": "${TENSORSHARP_MODELS:-/Users/zhongkaifu/work/models}/qwen-image-2.1-unsloth"
+    "root": "${TENSORSHARP_MODELS:-../models}/qwen-image-2.1"
   },
   "backend": "ggml_metal",
   "model": {
-    "path": "${root}/qwen-image-2.1-Q8_0.gguf",
+    "path": "${root}/qwen_image_2.1_Q4_K_M.gguf",
     "urls": ["https://huggingface.co/Abiray/Qwen-Image-2.1-GGUF/resolve/c9dd12108f53974cd1e0abd708df042d6df0ca8d/qwen_image_2.1_Q4_K_M.gguf"],
     "sha256": "dc956c958fbfa1d5c64ec316d7e865283d17d97a9eb332a4a74a4d63afaae9a5"
   },
@@ -19,12 +19,12 @@
     "sha256": "bb21f7473051e1ac368515dd3f2e15cd44d7a11748ee8823e1ddca3e4876b7c9"
   },
   "qwen-image-vl": {
-    "path": "${root}/Qwen3-VL-8B-Instruct-Q4_K_M.gguf",
+    "path": "${root}/Qwen3VL-8B-Instruct-Q4_K_M.gguf",
     "urls": ["https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct-GGUF/resolve/f982a07559d4a2f6c8744d840bf6fccab30eea96/Qwen3VL-8B-Instruct-Q4_K_M.gguf"],
     "sha256": "67d1659bfe71b89d50b45a4ad1a9e5b997e5bb16ce5da66a6a6167abd569e9e2"
   },
   "qwen-image-mmproj": {
-    "path": "${root}/mmproj-BF16.gguf",
+    "path": "${root}/mmproj-Qwen3VL-8B-Instruct-F16.gguf",
     "urls": ["https://huggingface.co/Qwen/Qwen3-VL-8B-Instruct-GGUF/resolve/f982a07559d4a2f6c8744d840bf6fccab30eea96/mmproj-Qwen3VL-8B-Instruct-F16.gguf"],
     "sha256": "ca524100ebf825c9a870db1c580d03879e0da0ab2541697e2458e64891cf9d38"
   }

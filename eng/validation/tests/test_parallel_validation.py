@@ -220,10 +220,10 @@ class LoadTimingTests(unittest.TestCase):
 
     def test_companion_identity_covers_drafter_and_projector_flag_forms(self):
         paths = runner.companion_paths(["--draft-model", "/models/draft.gguf", "--mmproj=/models/vision.gguf"])
-        self.assertEqual(paths, {"draft_model": Path("/models/draft.gguf"), "mmproj": Path("/models/vision.gguf")})
+        self.assertEqual(paths, {"draft_model": Path("/models/draft.gguf").resolve(), "mmproj": Path("/models/vision.gguf").resolve()})
         self.assertEqual(runner.companion_paths(["--mmproj", "none"]), {})
         self.assertEqual(runner.companion_paths(["--draft-model", "draft.gguf"], Path("/models")),
-                         {"draft_model": Path("/models/draft.gguf")})
+                         {"draft_model": Path("/models/draft.gguf").resolve()})
         with self.assertRaisesRegex(ValueError, "Missing companion"):
             runner.companion_paths(["--draft-model", "--tp", "2"])
 

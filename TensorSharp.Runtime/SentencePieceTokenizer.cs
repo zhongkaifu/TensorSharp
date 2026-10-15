@@ -52,6 +52,7 @@ namespace TensorSharp.Runtime
         public int BosTokenId => _bosTokenId;
         public int[] EosTokenIds => _eosTokenIds;
         public int VocabSize => _vocab.Length;
+        public IReadOnlyList<int> SuppressedTokenIds { get; init; } = Array.Empty<int>();
 
         public SentencePieceTokenizer(string[] vocab, int[] tokenTypes, float[] scores,
             int bosTokenId, int[] eosTokenIds, bool addBos, bool addEos)

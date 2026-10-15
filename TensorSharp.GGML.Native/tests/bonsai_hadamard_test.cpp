@@ -7,12 +7,16 @@
 #endif
 
 // Compile the production transform source directly so Windows exercises it
-// without relying on C++ DLL exports. Only its backend/error owner is stubbed.
+// without relying on C++ DLL exports. Backend/error ownership is isolated here;
+// the unrelated weight projection must never be reached by a transform test.
 namespace tsg {
 DeviceState g_device_states[TSG_MAX_DEVICES];
 thread_local int g_active_rank = 0;
 int g_backend_type = BACKEND_TYPE_CPU;
 void set_last_error(const std::string &) {}
+ggml_tensor * weight_mul_mat(ggml_context *, ggml_tensor *, ggml_tensor *, const void *) {
+    throw std::logic_error("Hadamard-only fixture unexpectedly requested a weight projection");
+}
 }
 extern "C" int TSGgml_BonsaiRegisterWeight(const void *, int, const float *, int, int, int, int, int);
 extern "C" void TSGgml_BonsaiUnregisterWeight(const void *);

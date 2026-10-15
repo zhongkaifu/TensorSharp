@@ -190,3 +190,30 @@ python eng/validation/compare-qwen35-checkpoints.py <serial.q5kc> <batched.q5kc>
 The comparator requires NumPy, supports F16/F32/Q8_0/Q4_0 K/V rows, and reports
 each layer's K/V prefix and newly written last row separately, plus convolution
 history and delta state. Convolution rings are compared in logical time order.
+
+For the diagnostic Q8 experiment, launch a fresh process with inherited
+`TS_GGML_Q8_PARALLEL_VECTOR=1` and `TS_GGML_Q8_PARALLEL_SMALL_BATCH=1`.
+Both remain off by default. The second switch covers N=2..8; each column uses
+the same warp reduction as the first switch's N=1 path, without allocating or
+retaining expanded weights. N>8 retains the original arithmetic. The report
+records both switches and the full model SHA; native logs prove actual route
+selection. Changing the environment within an already running process is not
+supported because CUDA graph arithmetic must remain stable.
+
+The local RTX 3080 Laptop run with Qwen3.5-0.8B Q8_0, F16 KV, context 8192,
+initial cache 128 and prompt lengths 1024/2048/4096/6000 passed widths 2/3/4
+for 32 steps and solo continuation. Matched-state logits had zero measured
+error against serial and greedy continuations matched. This does not establish
+language quality or resolve the separate independent-prefill diagnostic.
+
+A separate quiet ABBA used the same native/managed files in four fresh
+processes, vector mode on in both arms and only small-batch mode changed.
+Each process excluded one warmup and measured three 64-step pairs per width;
+context was 2048 and prompts 128/256/512/1024. With six samples per arm/width,
+batch-2 median changed 3686.17 to 658.82 ms (5.60x), batch-4 3853.44 to 1228.56 ms
+(3.14x). All numerical/distribution checks passed, no argmax differences or
+fallbacks occurred, and all processes exited zero. This measures the described
+decode microbenchmark including reseeding, capture and copies; it excludes
+prefill and is not an end-to-end or independent-engine batch comparison.
+Native SHA: `4bc7204e748dadb57fcc1da313d1c931da9f61fd9ab70623b9ad07ab6969f45c`.
+Evidence is ignored under `artifacts/unified-memory-adaptive/q8-small-batch-model-v1/`.

@@ -409,12 +409,35 @@ $env:TS_HOST_MOE_EXPERT_CACHE_MB = '4096'
 支持的接缝在 CUDA 缓冲区之间直接复制激活、路由权重和输出；主机 MoE 调试与 GPU 验证仍保留主机暂存接口。
 `TS_HOST_MOE_EXPERT_CACHE_OUTPUT_BRIDGE=0` 可恢复输出暂存，
 `TS_HOST_MOE_EXPERT_CACHE_BRIDGE=0` 可同时恢复输入与输出暂存。
-可选 `TS_HOST_MOE_EXPERT_CACHE_PREFETCH=1` 在上传前并行触碰选中未命中专家的原始字节页，
-不锁定或复制整份权重，仍允许操作系统淘汰这些页；冷/热负载测量前默认关闭。
+专家缓存启用后，默认根据观测的读取耗时决定是否在上传前并行读取选中未命中专家的字节页。
+至少两个未命中且合计不少于 4 MiB 时，将 gate/up/down 合为一次有界工作线程调度；
+调用线程上传已读好的投影，同时工作线程继续读取其余源数据，专家计算前等待全部线程完成。
+读取较快时停止调度，后续源数据暂存较慢时重新启用。状态属于单个缓存条目，淘汰或重载后重置。
+`TS_HOST_MOE_EXPERT_CACHE_PREFETCH=0` 禁用此提示，`=1` 强制对所有非空未命中集合启用。
+这些模式不锁定整份权重、不扩大缓存配额、不减少专家，也不改变计算；操作系统仍可淘汰权重页。
+这是层内读取与上传的重叠，不代表跨层计算流水线或操作系统页缓存的内存硬上限。
+覆盖投影前先使被替换的槽位失效，防止部分上传失败后旧 ID 仍命中损坏内容；源数据释放前等待全部读取线程完成。
+
+Windows 上，当已配置正的专家缓存预算、使用 GGUF 映射，且专家总字节数超过加载时可用物理 RAM 时，
+加载器默认登记精确的 GGUF 分片、偏移和长度。未命中的投影通过文件读取与上传流水线进入同一份主机搬运缓冲，
+按实际请求量增长，payload 上限 32 MiB；优先使用 CUDA pinned host buffer，锁页不可用时由上游退回普通 RAM。
+`TS_HOST_MOE_FILE_READ=0` 恢复 mmap 读取，`=1` 强制登记。传输失败也要等待已提交的 GPU 读取完成，
+空缓存 trim 释放该缓冲；模型仍存活时释放设备驻留会重新登记文件区间，模型释放则关闭句柄。
+此路径不读取额外专家、不扩大设备槽位配额，且目前不接管长 prefill 的 CPU 读取。
+分配前安装带 `hostPools` 的 `GgmlCacheBudgetScope`，可将这份 payload 接入同一 RAM 账本，
+独立于设备 pool 计费；配额不足时在分配 arena 前终止操作。旧构造方式不包含这项计费。
+OS 文件缓存、其他主机权重和驱动分配仍不属于硬上限。
+加载时的源选择不能称为完整的运行期 RAM/VRAM 自适应策略。相同历史的首请求、重复请求和完整 logits
+对照工具见 [探针说明](../../eng/validation/Qwen4ExpExpertCacheProbe/README.md)。
+
+已开启的专家缓存内部默认按衰减频次淘汰，同频时采用 LRU。当前路由的专家受到保护，空槽优先使用；
+计数按槽位容量决定的周期衰减，避免之前请求的热点长期占据缓存。只增加少量 CPU 计数器，
+不扩大设备权重配额或改变算术。`TS_HOST_MOE_EXPERT_CACHE_LFU=0` 恢复 LRU，供受控比较。
+专家缓存本身仍需要正值配额；此策略不是完整请求的自动内存规划器。
 
 预算计入图分配和保守工作区余量；CUDA 共享池和驱动分配仍需额外空闲显存。
 已停用的 CUDA 捕获对象可能保留到上游空闲清理周期，因此该预留量并非进程总显存或卸载后立即释放的总量。
-`TS_HOST_MOE_EXPERT_CACHE_DIAGNOSTICS=1` 可输出槽位、命中、未命中和预留量。
+`TS_HOST_MOE_EXPERT_CACHE_DIAGNOSTICS=1` 可输出槽位、命中、未命中、预留量，以及条目回收时的自适应读取调度次数。
 槽位分配还要求实际空闲显存超过原生安全余量；请求的预算过大时，部分层可能继续使用 CPU 回退。
 完整 logits A/B 检查见 `eng/validation/qwen4exp-expert-cache.py`，命令和计时范围见
 `eng/validation/Qwen4ExpExpertCacheProbe/README.md`。该功能保持显式开启：合成性能取决于缓存容量，
@@ -656,6 +679,28 @@ MTP 在两个场景中均实际达到验证宽度 8，并覆盖拒绝回滚。�
 llama.cpp 的 `--tensor-split`），并且在无法满足给定值时直接抛异常，而不是悄悄忽略
 ——这很有用，因为自动均衡只按权重计价，看不见视觉塔，而视觉塔加载得更晚、会落在
 GPU 0 上。
+
+## CUDA 单 token 复制复用
+
+CUDA 的单 token 图默认直接使用已经连续的选定只读输入，避免 hyperconnection
+混合及 GDN q/k/v、归一化输入的重复物化。设置 `TS_Q4E_DECODE_VIEWS=0` 可恢复
+原复制路径；多 token 图和状态写入保留原有行为。
+
+2026-10-10 的双 A40 / UD-IQ1_M 验证中，34 行完整词表 logits 逐位一致，
+每步 D2D 复制 519 → 207 次。同期间交替应用对照的 decode 为 54.82 → 55.86
+token/s，llama.cpp 为 59.98；仍有差距，也不能外推其他硬件、量化或请求的收益。
+配置、质量失败、内存口径和实际覆盖见
+[统一内存设计的续验记录](../design/unified-memory.zh-CN.md)。
+
+单 token CUDA 的 hyperconnection 和 PLE 广播也默认使用只读零步幅 view。
+`TS_Q4E_BROADCAST_VIEWS=0` 可恢复物化 repeat，与上面的复制复用开关独立。
+乘法及状态写入保留原算术，多 token 和非 CUDA 路径保留原布局；该优化的
+独立续验见统一内存文档。
+
+使用 `GgmlCacheBudgetScope(..., includeGraphBuffers: true)` 时，Qwen4Exp 自有
+图 arena、循环状态和设备快照已接入各 rank 对应的共同预算池。batch arena
+额度不足时在推进序列 holder 前拒绝，恢复额度后可重试。先释放模型资源再
+卸载 scope；此范围仍不是进程总 RAM/VRAM 或 driver/backend pool 的硬上限。
 
 ## 基准矩阵
 

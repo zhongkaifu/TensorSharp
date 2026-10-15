@@ -46,11 +46,11 @@ public class Gemma4SpeculativeTests
 
     private const string DefaultModelDir = @"C:\Works\models\gemma_mtp";
 
-    [Fact]
+    [GemmaMtpFact]
     public void Gemma4Mtp_SpeculativeGreedy_MatchesBaselineGreedy()
     {
-        if (!TryResolveModels(out string targetPath, out string draftPath))
-        { _output.WriteLine("[gmtp] opt-in not set or models missing; skipping"); return; }
+        Xunit.Assert.True(TryResolveModels(out string targetPath, out string draftPath),
+            "Configured Gemma target/draft disappeared after test discovery.");
 
         int maxNew = EnvInt("TS_GMTP_NEW_TOKENS", 32);
         int maxDraft = EnvInt("TS_GMTP_DRAFT_N", 4);
@@ -71,7 +71,7 @@ public class Gemma4SpeculativeTests
         float[] logits = model.ForwardRefill(tokens);
         int t = Argmax(logits);
         baseline.Add(t);
-        for (int i = 1; i < maxNew; i++)
+        for (int i = 1; i < maxNew && !model.Tokenizer.IsEos(t); i++)
         {
             logits = model.Forward(new[] { t });
             t = Argmax(logits);
@@ -80,7 +80,7 @@ public class Gemma4SpeculativeTests
 
         // Speculative greedy.
         var spec = new SpeculativeDecoder(model, maxDraft);
-        List<int> specTokens = spec.GenerateGreedy(tokens, maxNew);
+        List<int> specTokens = spec.GenerateGreedy(tokens, maxNew, model.Tokenizer.IsEos);
 
         _output.WriteLine($"[gmtp] baseline: \"{Trim(model.Tokenizer.Decode(baseline))}\"");
         _output.WriteLine($"[gmtp] spec:     \"{Trim(model.Tokenizer.Decode(specTokens))}\"");
@@ -99,9 +99,10 @@ public class Gemma4SpeculativeTests
             matchPrefix++;
         _output.WriteLine($"[gmtp] prefix match {matchPrefix}/{compareLen}");
 
-        Xunit.Assert.Equal(maxNew, specTokens.Count);
-        Xunit.Assert.True(matchPrefix >= compareLen / 2,
-            $"spec/baseline prefix match {matchPrefix}/{compareLen} below 50% — structural divergence suspected");
+        _output.WriteLine($"[gmtp] natural EOS: baseline={model.Tokenizer.IsEos(baseline[^1])}, " +
+            $"spec={model.Tokenizer.IsEos(specTokens[^1])}; a length-limited pair qualifies bounded parity only.");
+        Xunit.Assert.Equal(baseline, specTokens);
+        Xunit.Assert.True(specTokens.Count == maxNew || model.Tokenizer.IsEos(specTokens[^1]));
         Xunit.Assert.True(spec.TokensDrafted > 0, "draft head never produced a candidate");
         // A correctly-wired draft head agrees with the target on most tokens of a
         // simple factual continuation; ~0 acceptance means the draft is broken.
@@ -118,15 +119,14 @@ public class Gemma4SpeculativeTests
     // ForwardRefill uses. This test prefills + generates with MTP and asserts it
     // completes (no OOM), that prefill time matches the non-MTP baseline (the fix is
     // high-performance, not just a slow fallback), and that the greedy output tracks
-    // the baseline for a healthy prefix.
+    // the baseline for the entire generated token sequence, stopping at EOS.
     //   TS_GMTP_E2E=1 TS_GMTP_LONGPROMPT=1 TS_GMTP_BACKEND=ggml_cuda
     //   TS_GMTP_PROMPT_FILE=<long.txt> [TS_GMTP_NEW_TOKENS=48] [TS_GMTP_DRAFT_N=6]
-    [Fact]
+    [GemmaMtpFact("TS_GMTP_LONGPROMPT")]
     public void Gemma4Mtp_LongPromptPrefill_NoOom()
     {
-        if (!TryResolveModels(out string targetPath, out string draftPath) ||
-            Environment.GetEnvironmentVariable("TS_GMTP_LONGPROMPT") != "1")
-        { _output.WriteLine("[gmtp-long] set TS_GMTP_LONGPROMPT=1 (and TS_GMTP_E2E=1) to run; skipping"); return; }
+        Xunit.Assert.True(TryResolveModels(out string targetPath, out string draftPath),
+            "Configured Gemma target/draft disappeared after test discovery.");
 
         int maxNew = EnvInt("TS_GMTP_NEW_TOKENS", 48);
         int maxDraft = EnvInt("TS_GMTP_DRAFT_N", 6);
@@ -153,7 +153,8 @@ public class Gemma4SpeculativeTests
         var baseline = new List<int>();
         int tb = Argmax(logits);
         baseline.Add(tb);
-        for (int i = 1; i < maxNew; i++) { logits = model.Forward(new[] { tb }); tb = Argmax(logits); baseline.Add(tb); }
+        for (int i = 1; i < maxNew && !model.Tokenizer.IsEos(tb); i++)
+        { logits = model.Forward(new[] { tb }); tb = Argmax(logits); baseline.Add(tb); }
         _output.WriteLine($"[gmtp-long] baseline (MTP off): prefill {swBasePrefill.Elapsed.TotalSeconds:F2}s, " +
             $"first tokens [{string.Join(",", baseline.Take(8))}]");
 
@@ -165,7 +166,7 @@ public class Gemma4SpeculativeTests
         {
             PrefillChunkSize = EnvInt("TS_GMTP_PREFILL_CHUNK", 1024),
         };
-        List<int> specTokens = spec.GenerateGreedy(tokens, maxNew);
+        List<int> specTokens = spec.GenerateGreedy(tokens, maxNew, model.Tokenizer.IsEos);
         _output.WriteLine($"[gmtp-long] spec   (MTP on):  prefill {spec.LastPrefillSeconds:F2}s, decode " +
             $"{spec.LastDecodeSeconds:F2}s, acceptance {spec.AcceptanceRate:P0} ({spec.TokensAccepted}/{spec.TokensDrafted})");
         _output.WriteLine($"[gmtp-long] spec first tokens [{string.Join(",", specTokens.Take(8))}]");
@@ -179,24 +180,21 @@ public class Gemma4SpeculativeTests
 
         // The whole point: MTP must speculate (drafted>0) and complete without OOM.
         Xunit.Assert.True(spec.TokensDrafted > 0, "spec never drafted — MTP not engaged");
-        Xunit.Assert.True(specTokens.Count >= Math.Min(8, maxNew), "spec generation did not progress");
-        // The fix reuses the SAME prefill machinery as the baseline, so the first
-        // generated token (identical prefill + identical fused last-token decode)
-        // must match exactly. This assertion does not qualify later-token parity;
-        // batch-dependent verify arithmetic can change logits and committed KV.
-        Xunit.Assert.True(match >= 1, $"first token diverged (baseline {baseline[0]} vs spec {specTokens[0]})");
+        Xunit.Assert.Equal(baseline, specTokens);
+        Xunit.Assert.True(specTokens.Count == maxNew || model.Tokenizer.IsEos(specTokens[^1]));
+        _output.WriteLine($"[gmtp-long] natural EOS={model.Tokenizer.IsEos(specTokens[^1])}; " +
+            "a length-limited pair qualifies bounded parity only.");
         // Prefill must be in the same ballpark as the non-MTP path (not a 3x-slower
         // per-op fallback). Generous bound to absorb warmup / measurement noise.
         Xunit.Assert.True(prefillRatio < 2.0,
             $"MTP prefill {spec.LastPrefillSeconds:F2}s vs baseline {swBasePrefill.Elapsed.TotalSeconds:F2}s — too slow");
     }
 
-    [Fact]
+    [GemmaMtpFact("TS_GMTP_BENCH")]
     public void Gemma4Mtp_PerfBench_SpecVsBaseline()
     {
-        if (!TryResolveModels(out string targetPath, out string draftPath) ||
-            Environment.GetEnvironmentVariable("TS_GMTP_BENCH") != "1")
-        { _output.WriteLine("[gmtp-bench] opt-in not set; skipping"); return; }
+        Xunit.Assert.True(TryResolveModels(out string targetPath, out string draftPath),
+            "Configured Gemma target/draft disappeared after test discovery.");
 
         int maxNew = EnvInt("TS_GMTP_NEW_TOKENS", 64);
         int maxDraft = EnvInt("TS_GMTP_DRAFT_N", 4);
@@ -272,16 +270,15 @@ public class Gemma4SpeculativeTests
         _output.WriteLine($"[gmtp-bench] spec:     \"{Trim(model.Tokenizer.Decode(specTokens))}\"");
     }
 
-    [Fact]
+    [GemmaMtpFact("TS_GMTP_ENGINE")]
     public void Gemma4Mtp_EngineBench_FusedTrunk()
     {
         // The PRODUCTION path: MTP speculation through the engine. A solo sequence
         // runs the linear trunk driving the fused single-graph verify + draft
         // kernels (NativeGemma4ModelVerify / NativeGemma4DraftStep). MTP-OFF is the
         // same engine without speculation (the production single-seq baseline).
-        if (!TryResolveModels(out string targetPath, out string draftPath) ||
-            Environment.GetEnvironmentVariable("TS_GMTP_ENGINE") != "1")
-        { _output.WriteLine("[gmtp-engine] set TS_GMTP_ENGINE=1 to run; skipping"); return; }
+        Xunit.Assert.True(TryResolveModels(out string targetPath, out string draftPath),
+            "Configured Gemma target/draft disappeared after test discovery.");
 
         int maxNew = EnvInt("TS_GMTP_NEW_TOKENS", 96);
         int maxDraft = EnvInt("TS_GMTP_DRAFT_N", 6);
@@ -387,12 +384,11 @@ public class Gemma4SpeculativeTests
     // without kIOGPUCommandBufferCallbackErrorOutOfMemory. Opt-in:
     //   TS_GMTP_E2E=1 TS_GMTP_OOM=1 TS_GMTP_BACKEND=ggml_metal
     //   [TS_GMTP_NEW_TOKENS=1500] [TS_GMTP_PROMPT=...] [TS_GMTP_DRAFT_N=8]
-    [Fact]
+    [GemmaMtpFact("TS_GMTP_OOM")]
     public async Task Gemma4Mtp_LongGen_NoOom()
     {
-        if (!TryResolveModels(out string targetPath, out string draftPath) ||
-            Environment.GetEnvironmentVariable("TS_GMTP_OOM") != "1")
-        { _output.WriteLine("[gmtp-oom] set TS_GMTP_OOM=1 (and TS_GMTP_E2E=1) to run; skipping"); return; }
+        Xunit.Assert.True(TryResolveModels(out string targetPath, out string draftPath),
+            "Configured Gemma target/draft disappeared after test discovery.");
 
         int maxNew = EnvInt("TS_GMTP_NEW_TOKENS", 1500);
         int maxDraft = EnvInt("TS_GMTP_DRAFT_N", 8);
@@ -499,6 +495,26 @@ public class Gemma4SpeculativeTests
         }
         Xunit.Assert.True(seq.OutputTokens.Count >= Math.Min(maxNew, 64),
             $"expected to generate the requested tokens without OOM, got {seq.OutputTokens.Count}");
+    }
+
+    // Absence is a discovery-time skip, never a successful no-op model test.
+    public sealed class GemmaMtpFactAttribute : FactAttribute
+    {
+        public GemmaMtpFactAttribute(string extraOptIn = null)
+        {
+            if (!TryResolveModels(out _, out _))
+                Skip = "Set TS_GMTP_E2E=1 and provide Gemma target and MTP draft weights.";
+            else if (extraOptIn != null && Environment.GetEnvironmentVariable(extraOptIn) != "1")
+                Skip = $"Set {extraOptIn}=1 to run this model scenario.";
+            else
+            {
+                var backend = ResolveBackend();
+                if (backend is BackendType.GgmlCpu or BackendType.GgmlCuda or BackendType.GgmlMetal)
+                    Skip = TestGates.GgmlPinSkip(backend);
+                if (backend is BackendType.Cuda or BackendType.GgmlCuda)
+                    Skip ??= TestGates.CudaSkip;
+            }
+        }
     }
 
     private static int Argmax(float[] v)

@@ -35,6 +35,9 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "ggml-alloc.h"
+#include "ggml_ops_graph_budget.h"
+#include "ggml_ops_host_moe_group_quota.h"
+#include "ggml_ops_host_moe_phase_quota.h"
 #if defined(TSG_GGML_USE_METAL)
 #include "ggml-metal.h"
 #endif
@@ -250,6 +253,7 @@ namespace tsg
         DeviceCopy,
     };
 
+    class SharedCacheCharge;
     struct CachedHostBuffer {
         ggml_backend_buffer_t buffer = nullptr;
         std::size_t bytes = 0;
@@ -272,6 +276,8 @@ namespace tsg
         // or the host pointer for a zero-copy wrap). Recording it lets a repeat
         // bind attach with two assignments and no backend calls at all.
         void* bound_addr = nullptr;
+        // Declared after the payload fields; release only after buffer_free.
+        std::shared_ptr<SharedCacheCharge> shared_charge;
     };
 
     // --- Multi-device (tensor-parallel) state -------------------------------
@@ -309,7 +315,12 @@ namespace tsg
         std::int64_t offloadable_budget = 0;
 
         std::int64_t device_copy_resident_bytes = 0;
+        std::int64_t device_copy_reserved_bytes = 0;
         std::int64_t device_copy_budget_bytes = 0;
+        // Explicit preloads retain their existing admission policy; they are
+        // measured separately and do not consume the lazy device-copy quota.
+        std::int64_t preload_resident_bytes = 0;
+        std::int64_t preload_reserved_bytes = 0;
     };
 
     extern DeviceState g_device_states[TSG_MAX_DEVICES];
@@ -318,6 +329,11 @@ namespace tsg
     // Active rank for the calling thread. Per-thread so a rank worker pool can
     // drive several GPUs concurrently without stepping on each other.
     extern thread_local int g_active_rank;
+
+    inline ggml_backend_buffer_t alloc_ctx_tensors_budgeted(ggml_context* context, ggml_backend_t backend)
+    {
+        return graph_budget_alloc_ctx_tensors(context, backend, g_active_rank);
+    }
 
     // Cluster-wide tensor-parallel geometry, for a run split across NODES.
     // g_device_count is this process's share; these two describe the whole
@@ -473,8 +489,12 @@ namespace tsg
     // belongs to that command buffer, so latch it. The flag is sticky because the
     // backend is — ggml-metal clears has_error only by being recreated. That is what
     // TSGgml_RecreateBackend exists for, and it is the only thing that clears this.
+    ggml_backend_t q8_f32_execution_backend(ggml_backend_t backend, ggml_cgraph* graph);
+    void clear_q8_f32_backends();
+
     inline ggml_status compute_graph(ggml_backend_t backend, ggml_cgraph* graph)
     {
+        backend = q8_f32_execution_backend(backend, graph);
         const std::uint64_t before = g_ggml_error_count.load(std::memory_order_acquire);
         const ggml_status status = ggml_backend_graph_compute(backend, graph);
         if (g_ggml_error_count.load(std::memory_order_acquire) != before)
@@ -659,7 +679,7 @@ namespace tsg
         ~BufferHandle()
         {
             if (value != nullptr)
-                ggml_backend_buffer_free(value);
+                graph_budget_free_buffer(value);
         }
 
         BufferHandle(const BufferHandle&) = delete;
@@ -675,7 +695,7 @@ namespace tsg
             if (this != &other)
             {
                 if (value != nullptr)
-                    ggml_backend_buffer_free(value);
+                    graph_budget_free_buffer(value);
                 value = other.value;
                 other.value = nullptr;
             }
@@ -873,11 +893,18 @@ namespace tsg
         int activation = 0;          // tsg MoE activation enum (see moe_ffn_host_experts)
         float oai_alpha = 1.702f;
         float oai_limit = 7.0f;
+        // GLM5Next clamps the up branch symmetrically and the gate only above
+        // this value, before SiLU. Zero preserves ordinary Qwen arithmetic.
+        float swiglu_clamp = 0.0f;
 
         int num_experts = 0;
         int n_used = 0;
         int seq_len = 1;             // 1 for autoregressive decode, C for DiffusionGemma blocks
         bool independent_decode_rows = false; // preserve scalar expert arithmetic in a decode batch
+        // Explicit single-model CUDA adapters may share a compact expert table
+        // across layers of identical layout. Slots retain exact source triples;
+        // this upper bound is a model-wide ID extent, not resident allocation.
+        int pooled_model_experts = 0;
         int hidden = 0;
         int n_ff = 0;
 
@@ -1246,7 +1273,8 @@ namespace tsg
     bool host_moe_compute_segment(const HostMoeSegment& hm, std::vector<float>& out, const char* kernel_name,
                                   HostMoeStagedInputs* staged = nullptr,
                                   bool allow_device_stream = true,
-                                  bool* output_on_device = nullptr);
+                                  bool* output_on_device = nullptr,
+                                  ggml_backend_t explicit_backend = nullptr);
 
     // One-token routed experts on the host (ggml_ops_host_moe_decode.cpp): ggml's
     // CPU dot kernels on a team woken once per layer instead of a ggml graph per
@@ -1259,6 +1287,8 @@ namespace tsg
     // Bounded independent decode rows (1..8), one team dispatch per layer.
     // Dot products and expert summation order remain identical to solo decode.
     // Unsupported input returns false without writing any output row.
+    bool host_moe_decode_experts_rows_bounded(const HostMoeSegment& hm, const float* x, const std::int32_t* ids,
+        const float* weights, float* out);
     bool host_moe_decode_experts_rows(const HostMoeSegment& hm, const float* x, const std::int32_t* ids,
                                      const float* weights, float* out);
     // Opt-in Qwen4Exp CUDA expert tier: 1 computed, 0 unsupported/disabled,
@@ -1267,8 +1297,32 @@ namespace tsg
     // IDs stay on the host. out null writes hm.moe_out directly on CUDA;
     // otherwise the complete result is downloaded into out.
     int host_moe_cached_experts(const HostMoeSegment& hm, const float* x, const std::int32_t* ids,
-                               const float* weights, float* out, const char* kernel_name);
+                               const float* weights, float* out, const char* kernel_name,
+                               ggml_backend_t explicit_backend = nullptr);
     void host_moe_expert_cache_on_drop(const void* ptr);
+    void host_moe_expert_cache_release_backend(ggml_backend_t backend);
+    void host_moe_expert_cache_stats(std::int64_t* reserved, std::int64_t* budget,
+                                   std::int64_t* hits, std::int64_t* misses, std::int64_t* calls);
+    bool host_moe_expert_cache_minimum_plan(const HostMoeSegment& hm, int rows,
+        ggml_backend_t backend, std::size_t& bytes);
+    // GLM wide prefill retains one bulk graph and protects its full routed union;
+    // narrow shapes keep the independent decode variants and weight table.
+    bool host_moe_expert_cache_minimum_prefill_plan(const HostMoeSegment& hm, int rows,
+        int prefill_rows, ggml_backend_t backend, std::size_t& bytes);
+    bool host_moe_expert_cache_scope_matches_plan(std::size_t minimum_bytes,
+        int groups, int prefill_rows, int decode_rows);
+    HostMoeGroupKey host_moe_expert_group_key(const HostMoeSegment& hm);
+    // Install once, before dispatch, under the exclusive empty cache scope.
+    // Its complete measured group floors are bound to the loaded backend and
+    // planned row limits. Release-backend/scope-end clear it after physical free.
+    bool host_moe_expert_cache_install_group_plan(const std::vector<HostMoeGroupMinimum>& groups,
+        int prefill_rows, int decode_rows, ggml_backend_t backend);
+    bool host_moe_expert_cache_minimum_phase_plan(const HostMoeSegment& hm, int rows,
+        int prefill_rows, ggml_backend_t backend, std::size_t& narrow_bytes, std::size_t& wide_bytes);
+    bool host_moe_expert_cache_install_phase_plan(const std::vector<HostMoePhaseGroupMinimum>& groups,
+        int prefill_rows, int decode_rows, ggml_backend_t backend);
+    bool register_host_file_source(const void* pointer, std::int64_t bytes,
+                                   const char* path, std::int64_t offset);
     void host_moe_expert_cache_release();
     void prefetch_mapped_ranges(const std::uint8_t* base,
                                const std::vector<std::pair<std::size_t, std::size_t>>& ranges);
@@ -1866,6 +1920,7 @@ ggml_tensor* q4e_nodes_gdn(
     float eps, Q4eGdnWriteback* wb,
     std::vector<ggml_tensor*>* probe = nullptr);
 
+namespace tsg { struct Qwen4ExpAttnDiagnostic; }
 ggml_tensor* q4e_nodes_attn(
     ggml_context* ctx, ggml_cgraph* graph, Q4eBinder& bnd,
     const TSGgmlQwen4ExpAttnArgs* a, ggml_tensor* res_in,
@@ -1879,7 +1934,8 @@ ggml_tensor* q4e_nodes_attn(
     const std::int32_t* mrope_sections = nullptr,
     Q4eAttnArenaIO* arena = nullptr,
     ggml_tensor* owned_k = nullptr, ggml_tensor* owned_v = nullptr,
-    const Q4eQsaGraph* qsa = nullptr);
+    const Q4eQsaGraph* qsa = nullptr,
+    tsg::Qwen4ExpAttnDiagnostic* diagnostic = nullptr);
 
 // PLE half. `conv_hist` is the persistent history - [hc_dim, hist] for the
 // span (n_streams == 1), a [hc_dim, hist, n_streams] arena view for the arena

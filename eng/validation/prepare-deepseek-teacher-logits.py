@@ -16,6 +16,7 @@ PINNED_REPORTS = {
     'serial-tool-workflows.json': '27bb15609c7eb2846802ed5806c9423ab4f42c3d6059f8121297d22a706f98aa',
     'long-context.json': 'b8a8b43406eb7a3f5f35ac4967f77c688bf367683ab864bd988e9f089d91a69e',
 }
+SOURCE_PROFILE_SHA256 = '0a29cf8c4b1bd6c4567848314ec246e813f6f145ae8d7c40b14253d7f831639d'
 
 
 def canonical(value):
@@ -77,7 +78,7 @@ def build_plan(native_sha):
     if len(rows) != 113:
         raise ValueError('Original four reports must contain 113 requests from 63 cases')
     source_profile_path = REPORTS / 'sparse-attention-candidate/sparse-attention-build/full-profile.json'
-    if sha(source_profile_path) != '0a29cf8c4b1bd6c4567848314ec246e813f6f145ae8d7c40b14253d7f831639d':
+    if sha(source_profile_path) != SOURCE_PROFILE_SHA256:
         raise ValueError('Archived native execution profile changed')
     source_profile = json.loads(source_profile_path.read_text(encoding='utf-8'))
     variants = {}
@@ -96,7 +97,7 @@ def build_plan(native_sha):
                       'repository': model['repository'], 'revision': model['revision'],
                       'directory': model['directory'], 'files': model['files'],
                       'full_hash_policy': 'Reuse publisher-verified manifest with explicit immutable-file attestation; otherwise rehash outside timing'},
-            'actual_tensor_types': {'path': 'docs/validation/ggml-no-patch-2026-09-15/tp7-checkpoint-v5/actual-q4km-routed-types.json',
+            'actual_tensor_types': {'path': (REPORTS / 'tp7-checkpoint-v5/actual-q4km-routed-types.json').relative_to(ROOT).as_posix(),
                                    'sha256': sha(REPORTS / 'tp7-checkpoint-v5/actual-q4km-routed-types.json')},
             'sources': sources, 'request_count': len(rows), 'requests': rows, 'variants': variants,
             'implementation_status': {'request_export': 'implemented-model-free',

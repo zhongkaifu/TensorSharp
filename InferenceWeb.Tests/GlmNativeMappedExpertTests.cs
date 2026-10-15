@@ -15,24 +15,33 @@ public sealed class GlmNativeMappedExpertTests(ITestOutputHelper output) : IDisp
         if (Directory.Exists(_dir)) Directory.Delete(_dir, recursive: true);
     }
 
-    [GlmNativeCudaFact(2)]
-    public void MappedExperts_MatchGpuExperts_LayerSplit() => Check(tp: 1);
+    [GlmNativeCudaFact(1)]
+    public void MappedExperts_MatchGpuExperts_SingleGpu() => Check(deviceCount: 1, tp: 1);
+
+    [GlmNativeCudaFact(1)]
+    public void UnicodeCheckpointPath_MappedExpertsMatchGpuExperts() => Check(deviceCount: 1, tp: 1, unicodePath: true);
 
     [GlmNativeCudaFact(2)]
-    public void MappedExperts_MatchGpuExperts_TensorParallel() => Check(tp: 2);
+    public void MappedExperts_MatchGpuExperts_LayerSplit() => Check(deviceCount: 2, tp: 1);
 
-    private void Check(int tp)
+    [GlmNativeCudaFact(2)]
+    public void MappedExperts_MatchGpuExperts_TensorParallel() => Check(deviceCount: 2, tp: 2);
+
+    private void Check(int deviceCount, int tp, bool unicodePath = false)
     {
-        Assert.True(TensorSharp.Cuda.CudaDevice.GetDeviceCount() >= 2);
-        Directory.CreateDirectory(_dir);
-        string path = GlmDsaSyntheticModelBuilder.Write(Path.Combine(_dir, "tiny-glm.gguf"));
+        Assert.True(TensorSharp.Cuda.CudaDevice.GetDeviceCount() >= deviceCount);
+        using var environment = new NativeEnvScope();
+        environment.Set("TS_GLM_MOE_MMAP", "1");
+        string directory = unicodePath ? Path.Combine(_dir, "权重测试-🦙") : _dir;
+        Directory.CreateDirectory(directory);
+        string path = GlmDsaSyntheticModelBuilder.Write(Path.Combine(directory, unicodePath ? "微型模型-🌍.gguf" : "tiny-glm.gguf"));
         int[] prompt = Enumerable.Range(0, 37).Select(i => 3 + i * 11 % 90).ToArray();
         // Fixed continuations compare the same distributions even if close
         // candidates exchange order across the CPU and CUDA reductions.
         int[] continuation = [17, 31, 43, 59, 71, 83];
         List<float[]> Run(int cpuLayers)
         {
-            IntPtr model = GgmlGlmNative.LoadModel(path, 2, 256, 16, 2,
+            IntPtr model = GgmlGlmNative.LoadModel(path, deviceCount, 256, 16, 2,
                 nCpuMoe: cpuLayers, backendName: "CUDA", tp: tp, ctxIsHardLimit: true);
             Assert.NotEqual(IntPtr.Zero, model);
             try
@@ -57,8 +66,8 @@ public sealed class GlmNativeMappedExpertTests(ITestOutputHelper output) : IDisp
             Assert.All(mapped[row], value => Assert.True(float.IsFinite(value)));
             double maxAbs = gpu[row].Zip(mapped[row], (a, b) => Math.Abs((double)a - b)).Max();
             worst = Math.Max(worst, maxAbs);
-            Assert.True(maxAbs < 1e-3, $"tp={tp}, row={row}: max absolute logit error {maxAbs:G9}");
+            Assert.True(maxAbs < 1e-3, $"devices={deviceCount}, tp={tp}, row={row}: max absolute logit error {maxAbs:G9}");
         }
-        output.WriteLine($"tp={tp}, 37 prefill + 6 decode tokens: max absolute GPU/mapped logit error {worst:G9}");
+        output.WriteLine($"devices={deviceCount}, tp={tp}, 37 prefill + 6 decode tokens: max absolute GPU/mapped logit error {worst:G9}");
     }
 }

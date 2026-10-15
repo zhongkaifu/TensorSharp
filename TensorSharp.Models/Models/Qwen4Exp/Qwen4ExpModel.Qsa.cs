@@ -119,23 +119,32 @@ namespace TensorSharp.Models
 
         private unsafe void GrowQsaCache(int layer, int capacity, DType type)
         {
+            DisposePendingCacheGrowth();
             Tensor old = _idxKCache[layer];
-            Tensor grown = new Tensor(_allocator, type, 1, capacity, _indexerHeadDim);
             try
             {
+                Tensor grown = _pendingCacheGrowth = new Tensor(_allocator, type, 1, capacity, _indexerHeadDim);
+                CacheGrowthFaultInjector?.Invoke("allocated");
                 InitializeQsaCache(grown);
+                CacheGrowthFaultInjector?.Invoke("initialized");
                 // The one-head raw-key cache has a contiguous live prefix.
                 long liveBytes = checked((long)_cacheSeqLen * _indexerHeadDim * (type == DType.Float16 ? 2 : 4));
                 Buffer.MemoryCopy(TensorComputePrimitives.GetStoragePointer(old).ToPointer(),
                     TensorComputePrimitives.GetStoragePointer(grown).ToPointer(), grown.Storage.ByteLength, liveBytes);
+                CacheGrowthFaultInjector?.Invoke("copied");
                 GgmlBasicOps.Qwen4ExpReleaseSeqState([(IntPtr)TensorComputePrimitives.GetStoragePointer(old)]);
                 CountDecodeGraphReset();
                 InvalidateTensorDeviceCache(old);
+                CacheGrowthFaultInjector?.Invoke("retire-original");
                 old.Dispose();
                 _idxKCache[layer] = grown;
-                grown = null;
+                _pendingCacheGrowth = null;
             }
-            finally { grown?.Dispose(); }
+            catch (Exception failure)
+            {
+                RollbackCacheGrowth(failure);
+                throw;
+            }
         }
     }
 }

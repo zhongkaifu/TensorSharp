@@ -227,6 +227,17 @@ class Qwen38ToolCallHarnessTests(unittest.TestCase):
                     self.assertIn("Arguments differ", result["error"])
                     self.assertEqual(len(requests), 1)
 
+    def test_duplicate_argument_keys_fail_before_tool_result_replay(self):
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                message = copy.deepcopy(tool_message("weather"))
+                message["tool_calls"][0]["function"]["arguments"] = '{"city":"wrong","city":"Paris","units":"celsius"}'
+                args, requests = self.serve(self.roundtrip_responder(message))
+                result = harness.run_case(args, "weather", stream, False)
+                self.assertEqual(result["status"], "fail")
+                self.assertIn("Duplicate tool argument keys", result["error"])
+                self.assertEqual(len(requests), 1)
+
     def test_invalid_call_metadata_and_incomplete_arguments_fail(self):
         for mutation in ("missing_id", "wrong_name", "truncated_arguments", "wrong_finish", "missing_usage"):
             with self.subTest(mutation=mutation):

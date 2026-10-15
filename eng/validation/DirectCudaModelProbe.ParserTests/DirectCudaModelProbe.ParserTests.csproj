@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../../TensorSharp.Runtime/TensorSharp.Runtime.csproj" />
+    <Compile Include="../DirectCudaModelProbe/QualityOutput.cs" Link="QualityOutput.cs" />
+    <Compile Include="../DirectCudaModelProbe/ProbeModelLifetime.cs" Link="ProbeModelLifetime.cs" />
+    <None Include="../fixtures/fixed-extended-task-answers.json" Link="fixed-extended-task-answers.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+</Project>

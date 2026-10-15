@@ -517,6 +517,8 @@ namespace TensorSharp.Models
 
         public unsafe void SpecForward(int[] tokens, float[] hAllOut, float[] logitsOut, bool allLogitsRows)
         {
+            if (HasStreamingWeights)
+                throw new NotSupportedException(SpeculationRefusal);
             EnterSpecSession();
             _forwardSw.Start();
             int seqLen = tokens.Length;
@@ -937,7 +939,14 @@ namespace TensorSharp.Models
         /// checkpoint that ships no draft head at all; whether a LEARNED drafter
         /// exists is the registry's question, not this one.
         /// </summary>
-        public bool SpeculationProfitable => true;
+        // N-gram speculation has no learned draft weights, so rejecting MTP at
+        // load time does not exclude it. Its direct trunk entry bypasses the
+        // streamed Forward failure/reset boundary and is not supported yet.
+        public string SpeculationRefusal => HasStreamingWeights
+            ? "File-backed Qwen35 weights support Forward/ForwardRefill only; speculative verification (including N-gram) is unsupported."
+            : null;
+
+        public bool SpeculationProfitable => !HasStreamingWeights;
 
         /// <summary>
         /// Every field the speculative trunk touches - attention K/V, the GDN conv and

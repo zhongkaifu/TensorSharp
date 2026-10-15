@@ -3,6 +3,60 @@
 #pragma once
 #include "ggml.h"
 #include "ggml-backend.h"
+#include "ggml_ops_precision_policy.h"
+#include "ggml_ops_q8_precision.h"
+
+// Optional specialized construction, before a caller reshapes activation
+// columns for ordinary backend batching. Q8_0 bytes remain resident in their
+// original format; only the sensitive projection's activations retain F32.
+// Returning null leaves every other type/role on the caller's existing path.
+inline ggml_tensor* tsg_projection_q8_f32_if_required(ggml_context* ctx,
+    ggml_tensor* weight, ggml_tensor* input, tsg_projection_role role) {
+    return weight && tsg_projection_requires_f32(role) && weight->type == GGML_TYPE_Q8_0
+        ? tsg_matmul_q8_f32(ctx, weight, input) : nullptr;
+}
+
+inline ggml_tensor* tsg_projection_quant_f32_if_required(ggml_context* ctx,
+    ggml_tensor* weight, ggml_tensor* input, tsg_projection_role role) {
+    return weight && tsg_projection_requires_f32(role) && tsg_matmul_quant_f32_type_supported(weight->type)
+        ? tsg_matmul_quant_f32(ctx, weight, input) : nullptr;
+}
+
+inline ggml_tensor* tsg_projection_weight(ggml_context* ctx, ggml_tensor* weight, tsg_projection_role role) {
+    // CPU's BF16/F16 dot traits narrow activations regardless of an accumulator
+    // tag. Widening the small sensitive weight projection instead makes both
+    // sources F32 on every backend. This public graph node has ordinary
+    // allocator liveness and ownership, unlike a private vendor scratch copy.
+    return weight && tsg_projection_requires_f32(role)
+        && (weight->type == GGML_TYPE_F16 || weight->type == GGML_TYPE_BF16)
+        ? ggml_cast(ctx, weight, GGML_TYPE_F32) : weight;
+}
+
+// Defined below; the strict CUDA path has its own pedantic math handle.
+extern "C" void tsg_matmul_require_f32(ggml_context *, ggml_tensor *);
+
+inline void tsg_require_projection_precision(ggml_context* ctx, ggml_tensor* node,
+    tsg_projection_role role, bool owned_cuda = false) {
+    if (!node || !tsg_projection_requires_f32(role)) return;
+    while (node->view_src) node = node->view_src;
+    if (node->op == GGML_OP_CONCAT) {
+        tsg_require_projection_precision(ctx, node->src[0], role, owned_cuda);
+        tsg_require_projection_precision(ctx, node->src[1], role, owned_cuda);
+    } else if (node->op == GGML_OP_MUL_MAT && node->src[0]
+        && (node->src[0]->type == GGML_TYPE_F32 || node->src[0]->type == GGML_TYPE_F16
+            || node->src[0]->type == GGML_TYPE_BF16)) {
+        if (owned_cuda) {
+            // The sensitive graph cast and normal F32 activation layouts must
+            // need no backend-private packing allocation. Their payloads are
+            // already owned by the graph allocator, including wide prefill.
+            const auto* a = node->src[0]; const auto* b = node->src[1];
+            GGML_ASSERT(a->type == GGML_TYPE_F32 && b->type == GGML_TYPE_F32
+                && a->nb[0] == sizeof(float) && a->nb[1] % sizeof(float) == 0
+                && b->nb[0] == sizeof(float) && b->nb[1] % sizeof(float) == 0);
+            tsg_matmul_require_f32(ctx, node);
+        } else ggml_prec_set_acc(node, GGML_PREC_F32);
+    }
+}
 
 // TensorSharp-owned matmuls preserve every F32 activation bit. Their custom
 // CPU implementation is also the scheduler fallback on non-CUDA devices.

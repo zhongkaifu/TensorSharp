@@ -5,9 +5,10 @@
 //
 // TensorSharp is licensed under the BSD-3-Clause license found in the LICENSE file in the root directory of this source tree.
 //
-// GLM's radix prefix cache: donate-only native sequence slots. GLM-DSA can
+// GLM's radix prefix cache: admitted complete-state copies and donated slots. GLM-DSA can
 // rewind where the model permits it; GLM5Next keeps exact recurrent states.
 // The ownership moves are SlotRetention's, tested without weights.
+#nullable enable annotations
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -24,6 +25,69 @@ namespace TensorSharp.Models
         private int[] _reclaimableSynced = Array.Empty<int>();
         private readonly int[] _reclaimedIds = new int[16];
         private IPrefixPayloadSink _prefixCacheSink;
+        private Func<int, IDisposable?>? _unifiedPrefixCapture;
+        private Func<long>? _unifiedPrefixSpareBytes;
+        private int _unifiedPrefixCaptureDiagnostics;
+
+        // Enable complete state copies only through the admitted session. The
+        // native interface alone does not qualify other backends or TP models.
+        internal bool SupportsUnifiedPrefixCopies => _unifiedPrefixCapture != null && _exec?.SupportsSlotCopy == true;
+        internal void ConfigureUnifiedPrefixCopies(long slotForecast, Func<int, IDisposable?> capture,
+            Func<long> spareBytes)
+        {
+            ArgumentOutOfRangeException.ThrowIfNegativeOrZero(slotForecast);
+            ArgumentNullException.ThrowIfNull(capture);
+            ArgumentNullException.ThrowIfNull(spareBytes);
+            lock (_nativeSync)
+            {
+                if (_exec?.SupportsSlotCopy != true || MemoryPolicy == null || _nativeTp != 1)
+                    throw new NotSupportedException("Complete shared-prefix copies require the admitted native single-device executor.");
+                _unifiedPrefixCapture = capture;
+                _unifiedPrefixSpareBytes = spareBytes;
+            }
+        }
+
+        internal int RetainedCopiedSlotCount
+        {
+            get { lock (_nativeSync) return _retainedSlots?.Values.Count(slot => slot.IsCopy) ?? 0; }
+        }
+
+        private void LogUnifiedPrefixCapture(string outcome, int tokens, int destination, long bytes)
+        {
+            // Bounded model-level outcomes complement the session's admission
+            // diagnostics. Logging must never turn an optional miss into an
+            // inference failure, including when a console writer is unavailable.
+            if (_unifiedPrefixCaptureDiagnostics >= 8) return;
+            ++_unifiedPrefixCaptureDiagnostics;
+            try
+            {
+                Console.WriteLine(FormattableString.Invariant(
+                    $"[unified-memory] GLM prefix capture: outcome={outcome}, tokens={tokens}, destination={destination}, allocated-bytes={bytes}"));
+            }
+            catch { }
+        }
+
+        private readonly struct ExecutorSlotCopyStore(IGlmExecutor executor, GlmDsaModel? diagnostics = null,
+            int captureTokens = 0) : SlotCopyRetention.IStore
+        {
+            public int Alloc()
+            {
+                int slot = executor.SlotAlloc();
+                if (slot < 0) diagnostics?.LogUnifiedPrefixCapture("destination-allocation-refused", captureTokens, slot, 0);
+                return slot;
+            }
+            public bool CopyInto(int source, int destination, int expectedHead)
+            {
+                bool copied = executor.SlotCopyInto(source, destination, expectedHead);
+                if (!copied && diagnostics != null)
+                    try { diagnostics.LogUnifiedPrefixCapture("destination-copy-refused", captureTokens,
+                        destination, executor.SlotBytes(destination)); }
+                    catch { } // Failure diagnostics may not change optional-copy semantics.
+                return copied;
+            }
+            public long Bytes(int slot) => executor.SlotBytes(slot);
+            public bool Free(int slot) => executor.SlotFree(slot);
+        }
 
         private readonly struct ExecutorGlmSlotStore : SlotRetention.ISlotStore
         {
@@ -66,8 +130,9 @@ namespace TensorSharp.Models
             {
                 Class = FamilyClass.N,
                 NamespaceFingerprint = KVStateFingerprint,
-                EndState = slots ? EndStateSupport.DonateOnly : EndStateSupport.None,
-                CanCaptureCopy = false,
+                EndState = SupportsUnifiedPrefixCopies ? EndStateSupport.CopyAndDonate
+                    : slots ? EndStateSupport.DonateOnly : EndStateSupport.None,
+                CanCaptureCopy = SupportsUnifiedPrefixCopies,
                 AdoptPrimaryOnDisplacement = slots,
                 PrimaryResident = true,
                 MinRetainTokens = 32,
@@ -81,7 +146,7 @@ namespace TensorSharp.Models
                 // No count of its own: each running request retains its slot for its conversation's next turn,
                 // and memory takes them back oldest first when a new slot or a graph needs it (AllocReclaiming,
                 // glm_reclaim_for_graph). A cap of 1 left all but one of N parallel conversations re-prefilling.
-                MaxRetainedNativeSlots = 0,
+                MaxRetainedNativeSlots = _unifiedRetainedSlotLimit ?? 0,
             };
         }
 
@@ -100,7 +165,26 @@ namespace TensorSharp.Models
         public bool TryCaptureCopy(string requestId, string payloadKey, out PayloadFootprint footprint)
         {
             footprint = default;
-            return false;
+            lock (_nativeSync)
+            {
+                if (!SupportsUnifiedPrefixCopies || string.IsNullOrEmpty(requestId)
+                    || (_activeSlotKey != null && !string.Equals(_activeSlotKey, requestId, StringComparison.Ordinal)))
+                    return false;
+                int source = _activeSlotKey == null ? _primarySlot
+                    : _slotByRequest != null && _slotByRequest.TryGetValue(requestId, out int slot) ? slot : -1;
+                int tokens = _exec.NPast;
+                if (source < 0 || tokens <= 0) return false;
+                _retainedSlots ??= new OrderedDictionary<string, SlotRetention.RetainedSlot>(StringComparer.Ordinal);
+                // This optional persistent owner is separate from the request.
+                // Refusal leaves the active state and all old payloads intact.
+                using var allocation = _unifiedPrefixCapture!(tokens);
+                if (allocation == null) return false;
+                if (!SlotCopyRetention.Capture(new ExecutorSlotCopyStore(_exec, this, tokens), _retainedSlots,
+                        payloadKey, source, tokens, out long bytes)) return false;
+                footprint = new(tokens, _maxContextLength, new ResourceVector { NativeSlot = bytes }, 0);
+                LogUnifiedPrefixCapture("captured", tokens, _retainedSlots[payloadKey].Slot, bytes);
+                return true;
+            }
         }
 
         public bool TryCaptureDonate(string requestId, string payloadKey, int length, out PayloadFootprint footprint)
@@ -136,12 +220,18 @@ namespace TensorSharp.Models
 
         public bool TryMaterialize(in MaterializeRequest request)
         {
-            if (request.Op != MaterializeOp.Donate) return false;   // slots are moved, never copied
             lock (_nativeSync)
             {
                 if (!UsesNativeExecutor || !SlotRetention.CanDonate(_retainedSlots, request.PayloadKey, request.PayloadTokens, request.TargetTokens, SupportsKVCacheTruncation))
                     return false;
                 _slotByRequest ??= new Dictionary<string, int>(StringComparer.Ordinal);
+                if (request.Op == MaterializeOp.Clone)
+                {
+                    if (!SupportsUnifiedPrefixCopies || request.PayloadTokens != request.TargetTokens) return false;
+                    return SlotCopyRetention.Clone(new ExecutorSlotCopyStore(_exec), _slotByRequest,
+                        request.TargetRequestId, _retainedSlots[request.PayloadKey].Slot, request.TargetTokens);
+                }
+                if (request.Op != MaterializeOp.Donate) return false;
                 return SlotRetention.DonateSlot(_slotByRequest, _retainedSlots, request.PayloadKey, request.TargetRequestId, out _);
             }
         }
@@ -180,9 +270,16 @@ namespace TensorSharp.Models
         }
 
         // The slot's bytes (full-context MLA + indexer rows) are native; M5f measures them.
-        private PayloadFootprint Footprint(SlotRetention.RetainedSlot entry) => new(entry.Tokens, _maxContextLength, default, PositionDelta: 0);
+        private PayloadFootprint Footprint(SlotRetention.RetainedSlot entry) => new(entry.Tokens, _maxContextLength,
+            SupportsUnifiedPrefixCopies ? new ResourceVector { NativeSlot = _exec.SlotBytes(entry.Slot) } : default, PositionDelta: 0);
 
-        public ResourceVector EstimateCloneBytes(string payloadKey, int targetTokens) => default;
+        public ResourceVector EstimateCloneBytes(string payloadKey, int targetTokens)
+        {
+            lock (_nativeSync)
+                return SupportsUnifiedPrefixCopies && _retainedSlots != null
+                    && _retainedSlots.TryGetValue(payloadKey, out var entry) && entry.Tokens == targetTokens
+                    ? new ResourceVector { NativeSlot = _exec.SlotBytes(entry.Slot) } : default;
+        }
         public bool TryCopyPagedToHolder(ReadOnlySpan<int> blockIds, int tokens, string requestId) => false;
         public bool TryExport(string payloadKey, System.IO.Stream destination) => false;
 
@@ -208,7 +305,8 @@ namespace TensorSharp.Models
 
         public void AbortImport(object importTicket) { }
 
-        public long QuerySpareBytes(ResourceClass cls) => QueryPrefixCacheSpareBytes(cls);
+        public long QuerySpareBytes(ResourceClass cls) => SupportsUnifiedPrefixCopies && cls == ResourceClass.NativeSlot
+            ? _unifiedPrefixSpareBytes!() : QueryPrefixCacheSpareBytes(cls);
 
         // ---------------------------------------------------------------- diagnostics
 

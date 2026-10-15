@@ -1069,6 +1069,24 @@ public class SpeculativeExecutionTests
         Assert.True(decoder.TokensDrafted > 0);
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void StandaloneSpeculationHonorsModelSuppressionEvenWithAnUnboundCallerSampler(bool sampled)
+    {
+        var model = new FakeSpeculativeModel { BlockDraftSize = 5, PrefillSelfCatchUp = true };
+        var prompt = new[] { 1, 2, 3, 4, 5 };
+        model.SuppressedTokens = new[] { model.ExpectedNext(prompt.Length - 1), model.ExpectedNext(prompt.Length + 3) };
+        var decoder = new SpeculativeDecoder(model, maxDraftTokens: 5);
+        List<int> output = sampled
+            ? decoder.GenerateSampled(prompt, 12, new TokenSampler(new SamplingConfig
+                { Temperature = 1, TopK = 1, TopP = 1, MinP = 0, RepetitionPenalty = 1, Seed = 7 }))
+            : decoder.GenerateGreedy(prompt, 12);
+        Assert.Equal(12, output.Count);
+        Assert.DoesNotContain(output, token => model.SuppressedTokens.Contains(token));
+        Assert.Empty(model.ProtocolViolations);
+    }
+
     private sealed class FakeSpeculativeModel : ISpeculativeModel, IPageOnlyPrefixCacheModel
     {
         // A page family over a resident primary: what the radix cache needs to resume a
@@ -1102,6 +1120,7 @@ public class SpeculativeExecutionTests
         public int SnapshotCalls { get; private set; }
         public int RestoreCalls { get; private set; }
         public int EosTokenId { get; set; } = -1;
+        public IReadOnlyList<int> SuppressedTokens { get; set; } = Array.Empty<int>();
 
         public int LinearSpecForwardCalls { get; private set; }
 
@@ -1341,6 +1360,7 @@ public class SpeculativeExecutionTests
             public int BosTokenId => -1;
             public int[] EosTokenIds => _owner.EosTokenId >= 0 ? new[] { _owner.EosTokenId } : Array.Empty<int>();
             public int VocabSize => Vocab.Length;
+            public IReadOnlyList<int> SuppressedTokenIds => _owner.SuppressedTokens;
             public List<int> Encode(string text, bool addSpecial = true) => new();
             public string Decode(List<int> ids) => string.Join(",", ids);
             public void AppendTokenBytes(int tokenId, List<byte> buffer)

@@ -93,7 +93,9 @@ internal static class SpecParityDiagnostic
             model.ResetKVCache();
             float[] result = null;
             for (int offset = 0; offset < prompt.Length; offset += options.Chunk)
-                result = model.ForwardRefill(prompt.AsSpan(offset, Math.Min(options.Chunk, prompt.Length - offset)).ToArray());
+                result = SpeculativeDiagnosticPrefill.Run(options.SpecDiagPrefill,
+                    prompt.AsSpan(offset, Math.Min(options.Chunk, prompt.Length - offset)).ToArray(),
+                    model.Forward, model.ForwardRefill);
             return result;
         }
         float[] logits = Prefill();
@@ -220,6 +222,7 @@ internal static class SpecParityDiagnostic
         File.WriteAllText(options.Out, JsonSerializer.Serialize(new
         {
             prompt, plain, speculative, summary, rows, operations, mismatch,
+            prefill_entry = options.SpecDiagPrefill == DiagnosticPrefillMode.Forward ? "forward" : "refill",
             plain_text = model.Tokenizer.Decode(plain), speculative_text = model.Tokenizer.Decode(speculative),
             persists_accepted_kv = target.SpecVerifyPersistsAcceptedKv,
             scope = "Diagnostic with greedy raw logits and timing governor disabled; not a performance sample or scheduler parity assertion",
@@ -270,7 +273,9 @@ internal static class SpecParityDiagnostic
         model.ResetKVCache();
         float[] last = null;
         for (int offset = 0; offset < prompt.Length; offset += options.Chunk)
-            last = model.ForwardRefill(prompt.AsSpan(offset, Math.Min(options.Chunk, prompt.Length - offset)).ToArray());
+            last = SpeculativeDiagnosticPrefill.Run(options.SpecDiagPrefill,
+                prompt.AsSpan(offset, Math.Min(options.Chunk, prompt.Length - offset)).ToArray(),
+                model.Forward, model.ForwardRefill);
         int p = target.CacheSeqLen;
         int t0 = Argmax(last);
         float[] a = (float[])model.Forward(new[] { t0 }).Clone();          // plain decode at p
@@ -326,7 +331,8 @@ internal static class SpecParityDiagnostic
         float[] multi = (float[])model.Forward(new[] { t0, t1 }).Clone();
         Line("forward2tokens_last_vs_decode@p+1", Dist(multi, 0, a2));
 
-        File.WriteAllText(options.Out, JsonSerializer.Serialize(new { prompt_tokens = prompt.Length, position = p, t0, t1, t2, report }));
+        File.WriteAllText(options.Out, JsonSerializer.Serialize(new { prompt, prompt_tokens = prompt.Length, position = p, t0, t1, t2,
+            prefill_entry = options.SpecDiagPrefill == DiagnosticPrefillMode.Forward ? "forward" : "refill", report }));
         return 0;
     }
 

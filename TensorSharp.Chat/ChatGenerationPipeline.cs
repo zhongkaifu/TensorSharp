@@ -136,6 +136,13 @@ namespace TensorSharp.Server
         public string? RawGenerationSuffix { get; init; }
 
         /// <summary>
+        /// Non-text control signal sent before generation when history or prompt tokens
+        /// were removed. Tool loops must stop referring to cached file-read bodies that
+        /// may no longer be visible to the model.
+        /// </summary>
+        public bool HistoryCompacted { get; init; }
+
+        /// <summary>
         /// Reasoning text decoded since the last update, already separated from
         /// <see cref="Piece"/>. Only meaningful when <see cref="IsParsed"/> is true.
         /// </summary>
@@ -465,6 +472,12 @@ namespace TensorSharp.Server
                 maxTokens,
                 preserveAttachedDocuments,
                 CountPromptTokens);
+            if (window.ReplyReserve > 0)
+            {
+                requestedReserve = window.ReplyReserve;
+                targetPromptLimit = contextLimit - requestedReserve;
+            }
+            bool historyCompacted = window.RemovedMessages > 0;
             if (window.RemovedMessages > 0)
             {
                 renderHistory = window.History;
@@ -581,6 +594,7 @@ namespace TensorSharp.Server
 
                         if (mediaWindow.ElidedMedia > 0 || mediaWindow.RemovedMessages > 0)
                         {
+                            historyCompacted = true;
                             _logger.LogWarning(LogEventIds.PromptTruncated,
                                 "prompt.multimodal_history_compacted from {OriginalTokens} to {KeptTokens} tokens by replacing {ElidedMedia} earlier images, videos or recordings with a note and removing {RemovedMessages} old messages (contextLimit={ContextLimit}, protectedTokens={ProtectedTokens}, historyReserve={HistoryReserve} of a preferred {PreferredReserve} for a requested reply of {RequestedTokens}, sessionId={SessionId})",
                                 mediaWindow.OriginalPromptTokens,
@@ -603,6 +617,7 @@ namespace TensorSharp.Server
                     // removed while retaining explicit-cache mode.
                     RetainCacheBreakpointsInUnchangedPrefix(
                         unexpandedTokens, inputTokens, explicitBreakpoints);
+                    int tokensBeforeTrim = inputTokens.Count;
                     inputTokens = TruncatePromptToContext(
                         session, inputTokens, maxTokens, out effectiveMaxTokens, requestId,
                         preserveAllInput: true,
@@ -610,6 +625,7 @@ namespace TensorSharp.Server
                         explicitBreakpoints: explicitBreakpoints,
                         preservedInputKind: preserveAttachedDocuments ? "document and media input" : "media input",
                         forModel: model);
+                    historyCompacted |= inputTokens.Count < tokensBeforeTrim;
 
                     // Where each image/audio span landed and what it is, after any trim:
                     // the engine compares these positionally when it reuses a prefix.
@@ -618,11 +634,13 @@ namespace TensorSharp.Server
             }
             else
             {
+                int tokensBeforeTrim = inputTokens.Count;
                 inputTokens = TruncatePromptToContext(
                     session, inputTokens, maxTokens, out effectiveMaxTokens, null,
                     preserveAllInput: preserveAttachedDocuments,
                     executionContextLimit: engineContextLimit, explicitBreakpoints: explicitBreakpoints,
                     forModel: model);
+                historyCompacted |= inputTokens.Count < tokensBeforeTrim;
             }
 
             int promptTokenCount = inputTokens.Count;
@@ -661,13 +679,32 @@ namespace TensorSharp.Server
                 cacheScope: cacheScope,
                 publicCheckpointBoundaries: publicCheckpointBoundaries);
 
+            // Explicit validation only: capture the actual final engine input,
+            // including host tools, context handling and media expansion. A
+            // separately rendered user question is not a same-input oracle.
+            // Leave this off for performance measurements and normal serving.
+            if (Environment.GetEnvironmentVariable("TS_VALIDATION_TOKEN_TRACE") == "1")
+                _logger.LogInformation(
+                    "generation.validation.input internal={InternalRequestId} session={SessionId} architecture={Architecture} compacted={HistoryCompacted} thinking={Thinking} maxNewTokens={MaxNewTokens} tokens={Tokens}",
+                    requestId, session?.Id ?? "(none)", arch, historyCompacted,
+                    enableThinking, effectiveMaxTokens, string.Join(",", seq.PromptTokens));
+
             bool announceSuffix = AnnouncesGenerationSuffix(arch, model.Config.ChatTemplate, recordedSuffix, cfg);
+            if (historyCompacted)
+                yield return ChatStreamUpdate.Text(string.Empty) with { HistoryCompacted = true };
             if (announceSuffix)
                 yield return ChatStreamUpdate.Text(string.Empty) with { RawGenerationSuffix = recordedSuffix };
 
             InferenceRequestHandle handle;
             try
             {
+                // Correlate HTTP scope RequestId with the engine's independent
+                // sequence id for opt-in native batch qualification. This is a
+                // mapping only; batch execution is proven by its success event.
+                if (Environment.GetEnvironmentVariable("TS_BATCHED_FUSED_TRACE") == "1")
+                    _logger.LogInformation(
+                        "generation.sequence.bound internal={InternalRequestId} session={SessionId}",
+                        requestId, session?.Id ?? "(none)");
                 handle = engine.SubmitRequest(seq, cancellationToken);
             }
             catch (ObjectDisposedException ex) when (model.IsRetiring || cancellationToken.IsCancellationRequested)
@@ -880,6 +917,16 @@ namespace TensorSharp.Server
 
             string assistantText = Encoding.UTF8.GetString(rawBytes.ToArray());
             totalSw.Stop();
+            // Log once, before a cancelled stream rethrows. Keep the HTTP
+            // scope and internal engine id together for batch/latency reports.
+            var generationTimings = GenerationTimingTelemetry.Log(_logger, requestId, session?.Id,
+                completion, promptTokenCount, kvCacheReusedTokens, generatedTokens.Count,
+                totalSw.ElapsedTicks, finishReason);
+
+            if (Environment.GetEnvironmentVariable("TS_VALIDATION_TOKEN_TRACE") == "1")
+                _logger.LogInformation(
+                    "generation.validation.output internal={InternalRequestId} finishReason={FinishReason} computedTokens={ComputedTokens} tokens={Tokens}",
+                    requestId, finishReason, seq.NumComputedTokens, string.Join(",", seq.OutputTokens));
 
             // Record this turn for the next request of the same conversation: the raw
             // tokens the cache holds, and what the client was sent for them - the next
@@ -912,8 +959,8 @@ namespace TensorSharp.Server
                 System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(stopped).Throw();
             }
 
-            long promptNs = InferenceTelemetry.ToNanos(completion?.PrefillElapsedTicks ?? 0);
-            long evalNs = InferenceTelemetry.ToNanos(completion?.DecodeElapsedTicks ?? 0);
+            long promptNs = generationTimings.PromptNs ?? 0;
+            long evalNs = generationTimings.EvalNs ?? 0;
             double evalSeconds = evalNs / 1_000_000_000.0;
             double tokensPerSecond = (evalSeconds > 0 && generatedTokens.Count > 0)
                 ? generatedTokens.Count / evalSeconds
@@ -927,7 +974,7 @@ namespace TensorSharp.Server
                 kvCacheReusePercent, timeToFirstTokenMs, totalSw.Elapsed.TotalMilliseconds,
                 tokensPerSecond, finishReason, assistantText);
 
-            long totalNs = InferenceTelemetry.ToNanos(totalSw.ElapsedTicks);
+            long totalNs = generationTimings.TotalNs;
             yield return new ChatStreamUpdate("", true, promptTokenCount, generatedTokens.Count,
                                              kvCacheReusedTokens, totalNs, promptNs, evalNs, finishReason)
             {
@@ -1590,12 +1637,18 @@ namespace TensorSharp.Server
             int RemovedMessages,
             int ProtectedTokens = 0,
             int PromptLimit = 0,
-            int RemovedTurnMessages = 0);
+            int RemovedTurnMessages = 0)
+        {
+            public int ReplyReserve { get; init; }
+        }
 
         /// <summary>
         /// How much of the window the compactor sets aside for the reply BEFORE it
         /// starts removing history: the requested reply length, but never more than a
         /// quarter of the window (a 1,024-token floor where the window allows).
+        /// This is a preference: if the protected policy and repair context make
+        /// that target unreachable, compaction shares the remaining capacity
+        /// between earlier history and the reply instead of deleting every round.
         ///
         /// <para>
         /// The reply length is a ceiling the user chose for the answer, not a claim on
@@ -1681,9 +1734,8 @@ namespace TensorSharp.Server
             }
 
             int reserve = HistoryCompactionReserve(requestedGenerationTokens, contextLimit);
-            int promptLimit = contextLimit - reserve;
-            ContextHistoryWindow window = CompactHistoryForContext(
-                history, originalPromptTokens, promptLimit, countPromptTokens,
+            ContextHistoryWindow window = CompactHistoryForReplyReserve(
+                history, originalPromptTokens, contextLimit, reserve, countPromptTokens,
                 protectedTokens => AdaptivePromptLimit(contextLimit, requestedGenerationTokens, protectedTokens));
             int hardPromptLimit = contextLimit - 1;
             if (window.FinalPromptTokens > hardPromptLimit)
@@ -1703,7 +1755,46 @@ namespace TensorSharp.Server
                 ? window
                 : new ContextHistoryWindow(
                     history, originalPromptTokens, originalPromptTokens, RemovedMessages: 0,
-                    window.ProtectedTokens, window.PromptLimit);
+                    window.ProtectedTokens, window.PromptLimit)
+                    { ReplyReserve = window.ReplyReserve };
+        }
+
+        internal static ContextHistoryWindow CompactHistoryForReplyReserve(
+            List<ChatMessage> history, int originalPromptTokens, int contextLimit,
+            int preferredReserve, Func<List<ChatMessage>, int> countPromptTokens,
+            Func<int, int> completedTurnPromptLimit = null,
+            int protectedPromptTokenLimit = 0)
+        {
+            int reserve = contextLimit > 1
+                ? Math.Clamp(preferredReserve, 1, contextLimit - 1)
+                : Math.Max(1, preferredReserve);
+            int promptLimit = Math.Max(1, contextLimit - reserve);
+            ContextHistoryWindow window = CompactHistoryForContext(
+                history, originalPromptTokens, promptLimit, countPromptTokens,
+                completedTurnPromptLimit, protectedPromptTokenLimit);
+            int fittedLimit = window.PromptLimit > 0 ? window.PromptLimit : promptLimit;
+            if (window.FinalPromptTokens > fittedLimit && window.FinalPromptTokens < contextLimit)
+            {
+                // Keep the completed-turn/media sharing policy above. Only when its
+                // target is still unreachable does the protected minimum (policy,
+                // task and latest repair) share the remaining space with older rounds.
+                // Otherwise a large tool policy erases earlier work every iteration.
+                int reducedReserve = Math.Min(reserve, Math.Max(1, (contextLimit - window.FinalPromptTokens) / 2));
+                int adjustedProtectedLimit = protectedPromptTokenLimit > 0
+                    ? protectedPromptTokenLimit + reserve - reducedReserve : 0;
+                reserve = reducedReserve;
+                promptLimit = contextLimit - reserve;
+                window = CompactHistoryForContext(history, originalPromptTokens,
+                    promptLimit, countPromptTokens, completedTurnPromptLimit, adjustedProtectedLimit);
+                fittedLimit = window.PromptLimit > 0 ? window.PromptLimit : promptLimit;
+            }
+            // Generation itself still receives all actual remaining room, capped
+            // by the user's ceiling, through ClampGenerationReserve after rendering.
+            return window with
+            {
+                PromptLimit = fittedLimit,
+                ReplyReserve = Math.Max(1, contextLimit - fittedLimit)
+            };
         }
 
         /// <summary>
@@ -2389,7 +2480,7 @@ namespace TensorSharp.Server
             // Whether a candidate keeps every completed turn is what decides; older rounds of
             // the active request go by the preferred budget alone (CompactHistoryForContext),
             // the same with or without earlier pictures, which are in completed turns.
-            ContextHistoryWindow window = Fit(asIs);
+            ContextHistoryWindow window = Fit(asIs, allowReplyFallback: earlier.Count == 0);
             if (window.RemovedTurnMessages == 0)
                 return Kept(asIs, window, elidedItems: 0);
 
@@ -2398,7 +2489,7 @@ namespace TensorSharp.Server
             if (earlier.Count > 0)
             {
                 Candidate all = allElided ?? Measure(ElideEarlierMedia(history, earlier, earlier.Count, stagedNames));
-                ContextHistoryWindow allWindow = Fit(all);
+                ContextHistoryWindow allWindow = Fit(all, allowReplyFallback: true);
                 if (allWindow.RemovedTurnMessages == 0)
                 {
                     // The fewest oldest items whose removal makes every turn fit.
@@ -2450,12 +2541,25 @@ namespace TensorSharp.Server
             // (its own media expanded) leaves; counts stay unexpanded, so every limit is the
             // expanded one less the expansion of what it is compared with: a candidate's
             // own, or the protected prompt's.
-            ContextHistoryWindow Fit(Candidate candidate) =>
-                CompactHistoryForContext(candidate.History, candidate.Unexpanded,
-                    Math.Max(1, preferredLimit - candidate.Overhead), Count,
-                    protectedTokens => AdaptivePromptLimit(contextLimit, requestedGenerationTokens,
-                        protectedTokens + protectedOverhead) - candidate.Overhead,
-                    Math.Max(1, preferredLimit - protectedOverhead));
+            ContextHistoryWindow Fit(Candidate candidate, bool allowReplyFallback = false)
+            {
+                int CompletedTurnLimit(int protectedTokens) =>
+                    AdaptivePromptLimit(contextLimit, requestedGenerationTokens,
+                        protectedTokens + protectedOverhead) - candidate.Overhead;
+                int protectedLimit = Math.Max(1, preferredLimit - protectedOverhead);
+                // First give earlier pictures a chance to yield their space. Relaxing the
+                // reply reserve during the endpoint estimates can make both appear to fit
+                // and skip the exact protected-media measurement altogether. Only a
+                // candidate without earlier media has the same expansion as its protected
+                // prompt, so an unreachable target can safely share the reply's room.
+                return allowReplyFallback
+                    ? CompactHistoryForReplyReserve(candidate.History, candidate.Unexpanded,
+                        contextLimit - candidate.Overhead, contextLimit - preferredLimit, Count,
+                        CompletedTurnLimit, protectedLimit)
+                    : CompactHistoryForContext(candidate.History, candidate.Unexpanded,
+                        Math.Max(1, preferredLimit - candidate.Overhead), Count,
+                        CompletedTurnLimit, protectedLimit);
+            }
 
             // A candidate is often counted for more than one budget (both ends above, and
             // each fit measures its protected prompt): each is rendered once. Compaction

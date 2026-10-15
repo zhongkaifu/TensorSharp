@@ -46,6 +46,11 @@ internal sealed partial class QwenImage21DiT : ModelBase
             EnsureQuantBackendAvailable();
             Config = new ModelConfig { Architecture = "qwen_image_2_1", HiddenSize = HiddenSize, NumLayers = Layers };
             _prefix = _gguf.Tensors.ContainsKey("img_in.weight") ? "" : "model.diffusion_model.";
+            // This custom loader bypasses ModelBase.LoadWeights. Use the same
+            // bounded, memory-aware warming before serial native uploads touch
+            // mmap pages on network storage. The helper honors TS_GGUF_PREFAULT.
+            if (Environment.GetEnvironmentVariable("TS_QWEN21_DIT_PREFAULT") != "0")
+                _gguf.PrefaultFileCache();
             _nativeWeights = new QwenImage21ForwardArgs
             {
                 ImageIn = Weight("img_in.weight", Channels, HiddenSize),

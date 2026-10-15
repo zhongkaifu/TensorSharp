@@ -26,6 +26,31 @@ namespace TensorSharp.Models
         // re-pooled at a different block boundary.
         private Tensor[] _idxKCache;
 
+        // A growth buffer is owned before any fill/copy/native invalidation.
+        // If rollback itself fails, model disposal or the next growth retries
+        // this owner instead of losing it or overwriting it with a new buffer.
+        private Tensor _pendingCacheGrowth;
+        internal Action<string> CacheGrowthFaultInjector { get; set; }
+
+        private void DisposePendingCacheGrowth()
+        {
+            if (_pendingCacheGrowth == null) return;
+            CacheGrowthFaultInjector?.Invoke("release-unpublished");
+            InvalidateTensorDeviceCache(_pendingCacheGrowth);
+            _pendingCacheGrowth.Dispose();
+            _pendingCacheGrowth = null;
+        }
+
+        private void RollbackCacheGrowth(Exception failure)
+        {
+            try { DisposePendingCacheGrowth(); }
+            catch (Exception cleanup)
+            {
+                throw new AggregateException("Qwen4Exp cache growth failed and its unpublished allocation still requires cleanup.",
+                    failure, cleanup);
+            }
+        }
+
         // GDN state, host side. conv is a [convKernel-1, convDim] ring per layer and
         // delta is [numVHeads, headKDim, headVDim].
         private float[][] _gdnConvState;
@@ -147,29 +172,43 @@ namespace TensorSharp.Models
 
         private void GrowCache(ref Tensor cache, int heads, int newLen, int dim, DType dtype)
         {
-            var grown = new Tensor(_allocator, dtype, heads, newLen, dim);
-            // Zero UNCONDITIONALLY. InitializeCacheTensor skips the fill on
-            // GgmlCuda/Mlx, and the native span kernel's own memset is guarded by
-            // `position == 0`, which a mid-sequence grow never satisfies - so the
-            // rows past _cacheSeqLen would keep whatever the memory pool handed
-            // back. The flash window is padded to a 256 stride past n_kv and those
-            // rows ARE read: a masked column contributes nothing only if its K row
-            // is finite, and an Inf there plus the -inf mask is NaN, which takes
-            // the whole softmax row. Fires on any conversation past the initial
-            // 8192-token capacity - e.g. a --max-tokens 20000 answer.
-            Ops.Fill(grown, 0f);
-            if (_cacheSeqLen > 0)
+            DisposePendingCacheGrowth();
+            try
             {
-                using var src = cache.Narrow(1, 0, _cacheSeqLen);
-                using var dst = grown.Narrow(1, 0, _cacheSeqLen);
-                Ops.Copy(dst, src);
+                var grown = _pendingCacheGrowth = new Tensor(_allocator, dtype, heads, newLen, dim);
+                CacheGrowthFaultInjector?.Invoke("allocated");
+                // Zero UNCONDITIONALLY. InitializeCacheTensor skips the fill on
+                // GgmlCuda/Mlx, and the native span kernel's own memset is guarded by
+                // `position == 0`, which a mid-sequence grow never satisfies - so the
+                // rows past _cacheSeqLen would keep whatever the memory pool handed
+                // back. The flash window is padded to a 256 stride past n_kv and those
+                // rows ARE read: a masked column contributes nothing only if its K row
+                // is finite, and an Inf there plus the -inf mask is NaN, which takes
+                // the whole softmax row. Fires on any conversation past the initial
+                // 8192-token capacity - e.g. a --max-tokens 20000 answer.
+                Ops.Fill(grown, 0f);
+                CacheGrowthFaultInjector?.Invoke("initialized");
+                if (_cacheSeqLen > 0)
+                {
+                    using var src = cache.Narrow(1, 0, _cacheSeqLen);
+                    using var dst = grown.Narrow(1, 0, _cacheSeqLen);
+                    Ops.Copy(dst, src);
+                }
+                CacheGrowthFaultInjector?.Invoke("copied");
+                // Evict the old tensor's device-resident copy before its host
+                // pointer is freed: a recycled pinned address must never re-find
+                // the smaller stale device slab.
+                InvalidateTensorDeviceCache(cache);
+                CacheGrowthFaultInjector?.Invoke("retire-original");
+                cache.Dispose();
+                cache = grown;
+                _pendingCacheGrowth = null;
             }
-            // Evict the old tensor's device-resident copy before its host
-            // pointer is freed: a recycled pinned address must never re-find
-            // the smaller stale device slab.
-            InvalidateTensorDeviceCache(cache);
-            cache.Dispose();
-            cache = grown;
+            catch (Exception failure)
+            {
+                RollbackCacheGrowth(failure);
+                throw;
+            }
         }
 
         /// <summary>Download the device-resident KV copies back into the host
@@ -315,15 +354,20 @@ namespace TensorSharp.Models
             PrepareQsaHistory(startPos, seqLen);
 
             long tEmb = Stopwatch.GetTimestamp();
-            Tensor embd = Embedding(tokens);           // [T, n_embd]
-            InjectVisionEmbeddings(embd, seqLen);
-            _embTicks += Stopwatch.GetTimestamp() - tEmb;
-            PhaseLog(seqLen, "embedding", tEmb);
+            Tensor res;
+            long tBr;
+            using (Tensor embd = Embedding(tokens))   // [T, n_embd]
+            {
+                InjectVisionEmbeddings(embd, seqLen);
+                _embTicks += Stopwatch.GetTimestamp() - tEmb;
+                PhaseLog(seqLen, "embedding", tEmb);
 
-            // The wide residual starts as hc identical copies of the embedding.
-            long tBr = Stopwatch.GetTimestamp();
-            Tensor res = BroadcastToStreams(embd, seqLen);
-            embd.Dispose();
+                // The wide residual starts as hc identical copies of the embedding.
+                // Keep the embedding owned until either injection/broadcast fails
+                // or the residual has successfully taken over the forward.
+                tBr = Stopwatch.GetTimestamp();
+                res = BroadcastToStreams(embd, seqLen);
+            }
             PhaseLog(seqLen, "broadcast", tBr);
 
             // The whole token as (almost) one graph: every PLE-free run of layers -
@@ -535,20 +579,24 @@ namespace TensorSharp.Models
         {
             int n = Config.HiddenSize;
             var res = new Tensor(_allocator, DType.Float32, seqLen, _hcDim);
-            long srcA = (long)GetFloatPtr(x);
-            long dstA = (long)GetFloatPtr(res);
-            int hc = _hc, hcDim = _hcDim;
-            void CopyToken(int t)
+            try
             {
-                float* s = (float*)srcA + (long)t * n;
-                float* d = (float*)dstA + (long)t * hcDim;
-                for (int c = 0; c < hc; c++)
-                    Buffer.MemoryCopy(s, d + (long)c * n, n * 4L, n * 4L);
+                long srcA = (long)GetFloatPtr(x);
+                long dstA = (long)GetFloatPtr(res);
+                int hc = _hc, hcDim = _hcDim;
+                void CopyToken(int t)
+                {
+                    float* s = (float*)srcA + (long)t * n;
+                    float* d = (float*)dstA + (long)t * hcDim;
+                    for (int c = 0; c < hc; c++)
+                        Buffer.MemoryCopy(s, d + (long)c * n, n * 4L, n * 4L);
+                }
+                if (seqLen >= 16) System.Threading.Tasks.Parallel.For(0, seqLen, CopyToken);
+                else for (int t = 0; t < seqLen; t++) CopyToken(t);
+                InvalidateTensorDeviceCache(res);
+                return res;
             }
-            if (seqLen >= 16) System.Threading.Tasks.Parallel.For(0, seqLen, CopyToken);
-            else for (int t = 0; t < seqLen; t++) CopyToken(t);
-            InvalidateTensorDeviceCache(res);
-            return res;
+            catch { res.Dispose(); throw; }
         }
 
         /// <summary>
@@ -1341,6 +1389,9 @@ namespace TensorSharp.Models
                             if (ok && last) _spanLogitsValid = true;
                             if (!ok)
                             {
+                                // Capture the native cause before cleanup or another
+                                // backend call can replace the thread-local error.
+                                string nativeError = GgmlBasicOps.LastNativeError();
                                 _tokenGraphUnsupported = true;
                                 if (ranAnything)
                                 {
@@ -1351,8 +1402,13 @@ namespace TensorSharp.Models
                                     // forward takes the per-layer fallback.
                                     throw new InvalidOperationException(
                                         "qwen4exp token span failed mid-token; the per-layer " +
-                                        "fallback takes over on the next forward.");
+                                        "fallback takes over on the next forward. " + nativeError);
                                 }
+                                if (IsTensorParallel || _specForwardActive || HasQsa
+                                    || LayerSplitDegree > 1 || _pendingMRoPEPositions != null)
+                                    throw new InvalidOperationException(
+                                        "qwen4exp: required token-span path failed; this configuration cannot use the per-layer fallback. "
+                                        + nativeError);
                                 return false;
                             }
                             ranAnything = true;
@@ -1715,23 +1771,38 @@ namespace TensorSharp.Models
 
         public override void Dispose()
         {
+            DisposePendingCacheGrowth();
+            VisionEncoder?.Dispose();
+            VisionEncoder = null;
             DisposeMtpHead();
             ReleaseSpecSnapshot();
-            // DisposeAllFusedHolders leaves the checked-out holder to the
-            // direct tensor disposal below. Drop its native registration first:
-            // a failed arena fence intentionally survives global state release,
-            // but must never survive this owner's pooled/freed host pointers.
-            if (IsGgmlBackend)
-                GgmlBasicOps.Qwen4ExpReleaseSeqState(HolderStateKeys(SnapshotActiveCache()));
+            // The active holder also owns GDN conv/state seeds, not just K/V.
+            // Retire its native registration before returning any host storage.
+            // DisposeHolder clears each tensor only after successful disposal,
+            // so a failed release keeps the remaining owners reachable for retry.
+            DisposeHolder(SnapshotActiveCache());
             DisposeAllFusedHolders();
             if (IsGgmlBackend)
                 GgmlBasicOps.Qwen4ExpReleaseAllSeqState();
-            if (_kCache != null)
-                foreach (var t in _kCache) t?.Dispose();
-            if (_vCache != null)
-                foreach (var t in _vCache) t?.Dispose();
-            if (_idxKCache != null)
-                foreach (var t in _idxKCache) t?.Dispose();
+            void DisposeScratch(ref Tensor tensor)
+            {
+                if (tensor == null) return;
+                InvalidateTensorDeviceCache(tensor);
+                tensor.Dispose();
+                tensor = null;
+            }
+            DisposeScratch(ref _gdnQBuf); DisposeScratch(ref _gdnKBuf);
+            DisposeScratch(ref _gdnVBuf); DisposeScratch(ref _gdnZBuf);
+            DisposeScratch(ref _gdnAlphaBuf); DisposeScratch(ref _gdnBetaBuf);
+            DisposeScratch(ref _moeScratchGate); DisposeScratch(ref _moeScratchUp);
+            DisposeScratch(ref _moeScratchDown);
+            // A cancelled image request may never consume its queued slice.
+            for (int i = _visionEmbeddingsList.Count - 1; i >= 0; i--)
+            {
+                var embedding = _visionEmbeddingsList[i].Embeddings;
+                DisposeScratch(ref embedding);
+                _visionEmbeddingsList.RemoveAt(i);
+            }
             DisposeQwen4ExpTensorParallel();
             base.Dispose();
         }

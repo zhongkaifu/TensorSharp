@@ -49,6 +49,7 @@
 #pragma once
 
 #include "dsv4_exact_read.h"
+#include "file_warm_budget.h"
 
 #include <algorithm>
 #include <atomic>
@@ -180,6 +181,26 @@ struct file_warm_range
                                     // the file, for the residency check; null = none
 };
 
+inline uint64_t file_warm_range_end(const file_warm_range & range)
+{
+    if (range.bytes > (std::numeric_limits<uint64_t>::max)() - range.offset)
+        throw std::overflow_error("file warm range endpoint overflow");
+    return range.offset + range.bytes;
+}
+
+inline uint64_t file_warm_range_total(const std::vector<file_warm_range> & ranges)
+{
+    uint64_t total = 0;
+    for (const auto & range : ranges)
+    {
+        (void) file_warm_range_end(range);
+        if (range.bytes > (std::numeric_limits<uint64_t>::max)() - total)
+            throw std::overflow_error("file warm total bytes overflow");
+        total += range.bytes;
+    }
+    return total;
+}
+
 // Sort by (file, offset) and merge ranges that touch or overlap. Two ranges
 // merge only when their mapping addresses agree (or neither has one), so the
 // merged range's `mapped` stays valid for every byte it covers. GGUF tensors
@@ -188,6 +209,10 @@ struct file_warm_range
 // between (the next layer's attention, ~80 MiB) keeps two ranges apart.
 inline std::vector<file_warm_range> merge_file_warm_ranges(std::vector<file_warm_range> ranges)
 {
+    // Check endpoints before sorting/merging; unsigned wrap must never turn an
+    // invalid range into an empty/no-budget warm. Totals are checked after merge
+    // so duplicate views of the same bytes are not counted twice.
+    for (const auto & range : ranges) (void) file_warm_range_end(range);
     ranges.erase(std::remove_if(ranges.begin(), ranges.end(),
         [](const file_warm_range & r) { return r.bytes == 0; }), ranges.end());
     std::sort(ranges.begin(), ranges.end(), [](const file_warm_range & a, const file_warm_range & b)
@@ -204,7 +229,12 @@ inline std::vector<file_warm_range> merge_file_warm_ranges(std::vector<file_warm
             const uint64_t cur_end = cur.offset + cur.bytes;
             bool same_map = cur.file == r.file && (cur.mapped == nullptr) == (r.mapped == nullptr);
             if (same_map && cur.mapped)
-                same_map = (const char *) cur.mapped + (r.offset - cur.offset) == (const char *) r.mapped;
+            {
+                const uintptr_t base = (uintptr_t) cur.mapped;
+                const uint64_t delta = r.offset - cur.offset;
+                same_map = delta <= (std::numeric_limits<uintptr_t>::max)() - base &&
+                    base + (uintptr_t) delta == (uintptr_t) r.mapped;
+            }
             if (cur.file == r.file && r.offset <= cur_end && same_map)
             {
                 cur.bytes = std::max(cur_end, r.offset + r.bytes) - cur.offset;
@@ -233,13 +263,12 @@ struct file_warm_piece
 inline std::vector<std::vector<file_warm_piece>> plan_file_warm(const std::vector<file_warm_range> & merged,
                                                                 int threads, uint64_t block_bytes)
 {
-    uint64_t total = 0;
-    for (const file_warm_range & r : merged) total += r.bytes;
+    const uint64_t total = file_warm_range_total(merged);
     std::vector<std::vector<file_warm_piece>> plan;
     if (total == 0) return plan;
     if (block_bytes == 0) block_bytes = 1;
     uint64_t n = (uint64_t) std::max(1, threads);
-    n = std::min<uint64_t>(n, (total + block_bytes - 1) / block_bytes);
+    n = std::min<uint64_t>(n, total / block_bytes + (total % block_bytes != 0));
     plan.resize((size_t) n);
     size_t ri = 0;
     uint64_t in_range = 0; // bytes of merged[ri] already assigned
@@ -288,6 +317,8 @@ struct file_warm_result
     uint64_t bytes_total = 0;
     uint64_t bytes_read = 0;
     uint64_t bytes_resident = 0;       // skipped because every page was already cached
+    bool budget_accounted = false, budget_skipped = false;
+    size_t block_bytes = 0, workspace_capacity = 0, budget_refusals = 0;
     double seconds = 0;
     std::string error;                 // first failure, naming the file and offset
 };
@@ -311,7 +342,8 @@ inline void page_span(const void * p, uint64_t bytes, void *& aligned, size_t & 
 }
 
 // Whether every page of [p, p + bytes) is resident. False when unknown.
-inline bool fully_resident(const void * p, uint64_t bytes, std::vector<unsigned char> & scratch)
+template<class Scratch>
+inline bool fully_resident(const void * p, uint64_t bytes, Scratch & scratch)
 {
     if (!p || bytes == 0) return false;
     void * aligned; size_t len;
@@ -352,7 +384,7 @@ struct system_file_ops
 #if !defined(_WIN32)
     int open_file(const std::string & path) { return ::open(path.c_str(), O_RDONLY | O_CLOEXEC); }
     void close_file(int fd) noexcept { ::close(fd); }
-    bool resident(const void * p, uint64_t bytes, std::vector<unsigned char> & scratch)
+    bool resident(const void * p, uint64_t bytes, file_warm_scratch & scratch)
     {
         return fully_resident(p, bytes, scratch);
     }
@@ -361,6 +393,12 @@ struct system_file_ops
         return pread_at(fd, offset, destination, length);
     }
 #endif
+};
+
+struct warm_thread_launcher {
+    template<class Worker> static std::thread start(Worker & worker, int index) {
+        return std::thread(worker, index);
+    }
 };
 
 #if !defined(_WIN32)
@@ -386,7 +424,7 @@ template<class FileOps> struct warm_descriptors
 // I/O and worker failures are reported in the result. Planning allocations may
 // throw to the caller, before any workers are started. FileOps allows the tests
 // to model open-time cache invalidation and failure without timing assumptions.
-template<class FileOps>
+template<class FileOps, class Allocator = file_warm_allocator, class Launcher = warm_thread_launcher>
 inline file_warm_result warm_file_ranges_with_io(const std::vector<std::string> & paths,
                                                 const std::vector<file_warm_range> & ranges,
                                                 const file_warm_options & options, FileOps & io)
@@ -394,9 +432,9 @@ inline file_warm_result warm_file_ranges_with_io(const std::vector<std::string> 
     file_warm_result result;
     const auto t0 = std::chrono::steady_clock::now();
     const std::vector<file_warm_range> merged = merge_file_warm_ranges(ranges);
+    result.bytes_total = file_warm_range_total(merged);
     for (const file_warm_range & r : merged)
     {
-        result.bytes_total += r.bytes;
         if (r.file < 0 || (size_t) r.file >= paths.size())
         {
             result.ok = false;
@@ -413,10 +451,47 @@ inline file_warm_result warm_file_ranges_with_io(const std::vector<std::string> 
     result.error = "pread warming is not available on Windows";
     return result;
 #else
-    const uint64_t block = std::max<uint64_t>(options.block_bytes, 1);
-    const auto plan = plan_file_warm(merged, options.threads, block);
+    if (options.stop && options.stop->load(std::memory_order_relaxed))
+    {
+        result.stopped = true;
+        return result; // No ticket, payload, open or worker for pre-cancelled warming.
+    }
+    const uint64_t requested_block = std::max<uint64_t>(options.block_bytes, 1);
+    if (requested_block > (std::numeric_limits<size_t>::max)())
+        throw std::overflow_error("file warm block exceeds addressable workspace");
+    const bool needs_residency = options.skip_resident && std::any_of(merged.begin(), merged.end(),
+        [](const file_warm_range & range) { return range.mapped != nullptr; });
+    auto budget = plan_file_warm_budget(result.bytes_total, (size_t) std::max(options.threads, 1),
+        (size_t) requested_block, page_size(), needs_residency);
+    result.budget_accounted = budget.accounted;
+    result.budget_skipped = budget.skipped;
+    result.block_bytes = budget.block;
+    result.workspace_capacity = budget.skipped ? 0 : budget.aggregate;
+    result.budget_refusals = budget.refusals;
+    if (budget.skipped) {
+        std::fprintf(stderr, "[dsv4] skipping optional file warming: shared host workspace refused "
+            "after %zu proposals (minimum payload %zu bytes); demand reads unchanged\n",
+            budget.refusals, budget.aggregate);
+        result.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        return result;
+    }
+    if (!budget.workers) return result;
+    const uint64_t block = budget.block;
+    const auto plan = plan_file_warm(merged, (int) budget.workers, block);
     result.threads = (int) plan.size();
     if (plan.empty()) return result;
+    if (options.stop && options.stop->load(std::memory_order_relaxed))
+    {
+        result.stopped = true;
+        result.threads = 0;
+        result.workspace_capacity = 0;
+        return result; // Release the reserved ticket before allocating payload.
+    }
+    file_warm_arena<Allocator> arena(budget);
+    if (budget.accounted)
+        std::fprintf(stderr, "[dsv4] file warm workspace: workers=%zu block=%zu residency=%zu "
+            "aggregate=%zu negotiation_refusals=%zu\n", budget.workers, budget.block,
+            budget.residency, budget.aggregate, budget.refusals);
     warm_descriptors<FileOps> descriptors(io, plan.size(), paths.size());
 
     std::atomic<bool> failed(false), stopped(false);
@@ -440,7 +515,8 @@ inline file_warm_result warm_file_ranges_with_io(const std::vector<std::string> 
     {
         const auto & fds = descriptors.workers[(size_t) k];
         std::unique_ptr<char[]> buffer;
-        std::vector<unsigned char> residency;
+        unsigned char * reserved_buffer = arena.payload((size_t) k);
+        auto residency = arena.scratch((size_t) k);
         // Returns at the first failure or stop; descriptors outlive all workers.
         auto run = [&]()
         {
@@ -469,7 +545,7 @@ inline file_warm_result warm_file_ranges_with_io(const std::vector<std::string> 
                     else
                     {
                         const int fd = fds[(size_t) range.file];
-                        if (!buffer)
+                        if (!reserved_buffer && !buffer)
                         {
                             buffer.reset(new (std::nothrow) char[(size_t) block]);
                             if (!buffer)
@@ -478,7 +554,7 @@ inline file_warm_result warm_file_ranges_with_io(const std::vector<std::string> 
                                 return;
                             }
                         }
-                        const auto read = read_range_exact(buffer.get(), (size_t) len, off,
+                        const auto read = read_range_exact(reserved_buffer ? (void *) reserved_buffer : buffer.get(), (size_t) len, off,
                             [&](uint64_t offset, void * destination, size_t length) {
                                 return io.read_at(fd, offset, destination, length);
                             }, [&](const exact_read_retry & retry) {
@@ -539,7 +615,7 @@ inline file_warm_result warm_file_ranges_with_io(const std::vector<std::string> 
             }
         if (!failed.load() && !stopped.load())
         {
-            for (int k = 1; k < (int) plan.size(); ++k) pool.emplace_back(worker, k);
+            for (int k = 1; k < (int) plan.size(); ++k) pool.push_back(Launcher::start(worker, k));
             worker(0);
         }
     }

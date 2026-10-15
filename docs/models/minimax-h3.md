@@ -80,26 +80,28 @@ readable is GGML against ITSELF - its flash kernel vs `TS_H3_NO_FLASH=1` renders
 at 28.17 dB, i.e. every managed route agrees with GGML more closely than GGML's
 two attention kernels agree with each other.
 
-The trunk is not bit-identical to GGML and cannot be, because the denoiser
-amplifies tiny differences. `TS_H3_DIT_LAYERS` truncates the trunk on BOTH paths,
+The recorded trunk outputs are not bit-identical to GGML. Numerical amplification
+is one possible contributor. `TS_H3_DIT_LAYERS` truncates the trunk on BOTH paths,
 which turns the velocity comparison into an error-vs-depth curve:
 
 | trunk depth | 1 | 10 | 25 | 30 | 35 | 40 | 44 | 47 | 50 |
 |---|---|---|---|---|---|---|---|---|---|
 | 1 - cosine | 1.4e-6 | 3.8e-6 | 9.4e-6 | 2.8e-5 | 2.8e-4 | 1.15e-3 | 1.5e-4 | 2.0e-4 | 1.26e-3 |
 
-Through 25 layers the two agree to ~1e-5, i.e. the implementation is right. Past
-that the difference amplifies, and NON-MONOTONICALLY - it is larger at depth 40
-than at 44. That shape is what rules out a bug: an error introduced at some layer
-would leave the curve non-decreasing for every depth beyond it. The second half of
-this trunk simply has high gain.
+Through 25 layers the recorded runs agree to ~1e-5. Later differences are larger
+and non-monotonic: the difference at depth 40 exceeds that at 44. This is
+consistent with numerical amplification, but does not rule out an implementation
+bug; subsequent layers can attenuate an earlier error. Independent operator and
+intermediate-tensor checks remain necessary before attributing the residual
+entirely to floating-point rounding.
 
 For scale, GGML disagrees with ITSELF by more than it disagrees with the managed
 path. At full depth, `h3_attend`'s flash kernel against its own explicit-softmax
 fallback (`TS_H3_NO_FLASH=1`) gives 1 - cosine = 2.97e-3, against 1.26e-3 for
 managed-vs-either. The text encoder, which is shallower in effect and has no such
-kernel on either side, agrees to 1e-6 - that is what says the shared machinery
-(quantized matmul, RMSNorm, rotate-half RoPE, GQA attention, SwiGLU) is right.
+kernel on either side, agrees to 1e-6 in those fixtures. This supports the tested
+shared operations (quantized matmul, RMSNorm, rotate-half RoPE, GQA attention,
+SwiGLU), but is not proof for every shape, dtype or device.
 
 `TS_H3_DUMP_TE`, `TS_H3_DUMP_VEL_V` and `TS_H3_DUMP_VEL_A` write those tensors to
 disk so the two paths can be compared on ONE forward, and `TS_H3_DIT_LAYERS`

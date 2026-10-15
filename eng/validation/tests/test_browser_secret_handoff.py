@@ -12,6 +12,7 @@ import subprocess
 import threading
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 from urllib.parse import urlencode
 
 
@@ -111,9 +112,9 @@ class SecretHandoffTests(unittest.TestCase):
         self.assertEqual("submitted", self.server.status)
         self.assertTrue(self.server.done.wait(1))
         argv, options = self.calls[0]
-        self.assertEqual(["/absolute/node", "/absolute/cli.js", "--session", "existing-session", "run-code"], argv[:5])
-        self.assertEqual("/absolute/workspace", options["cwd"])
-        self.assertEqual("/absolute/daemon", options["env"]["PWTEST_DAEMON_SESSION_DIR"])
+        self.assertEqual([str(self.config.node), str(self.config.cli), "--session", "existing-session", "run-code"], argv[:5])
+        self.assertEqual(str(self.config.cwd), options["cwd"])
+        self.assertEqual(str(self.config.daemon_session_dir), options["env"]["PWTEST_DAEMON_SESSION_DIR"])
         self.assertEqual(os.environ.get("HOME"), options["env"].get("HOME"))
         self.assertEqual(subprocess.DEVNULL, options["stdout"])
         self.assertEqual(subprocess.DEVNULL, options["stderr"])
@@ -181,6 +182,77 @@ class SecretHandoffTests(unittest.TestCase):
                         {"Content-Length": "invalid"}, {"Content-Length": "0"}):
             self.assertEqual(400, self.post_password(**headers)[0])
         self.assertFalse(self.calls)
+
+    def test_malformed_post_framing_returns_refusal_without_consuming_a_handoff(self):
+        # Supply bytes without HTTPConnection synthesizing a Content-Length.
+        # Rejection cleanup must not use any of these untrusted lengths.
+        framing_cases = ([], [("Content-Length", "invalid")],
+                         [("Content-Length", "0")],
+                         [("Content-Length", str(handoff.MAX_BODY + 1))],
+                         [("Content-Length", str(2 ** 64))],
+                         [("Content-Length", "10"), ("Content-Length", "10")],
+                         [("Transfer-Encoding", "chunked")])
+        for framing in framing_cases:
+            with self.subTest(framing=framing):
+                connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port,
+                                                        timeout=5)
+                try:
+                    connection.putrequest("POST", self.server.form_path)
+                    connection.putheader("Origin", self.server.origin)
+                    connection.putheader("Content-Type", "application/x-www-form-urlencoded")
+                    for name, value in framing:
+                        connection.putheader(name, value)
+                    connection.endheaders(b"password=x")
+                    response = connection.getresponse()
+                    self.assertEqual(400, response.status)
+                    self.assertEqual(b"Request rejected.", response.read())
+                finally:
+                    connection.close()
+        self.assertFalse(self.server.attempted)
+        self.assertIsNone(self.server.password)
+        self.assertFalse(self.calls)
+        self.assertEqual(200, self.post_password()[0])
+
+    def test_refusal_is_sent_without_waiting_for_a_declared_body(self):
+        connection = http.client.HTTPConnection("127.0.0.1", self.server.server_port, timeout=2)
+        try:
+            connection.putrequest("POST", self.server.form_path)
+            connection.putheader("Origin", "https://attacker.test")
+            connection.putheader("Content-Type", "application/x-www-form-urlencoded")
+            connection.putheader("Content-Length", str(2 ** 64))
+            connection.endheaders()  # An untrusted client never sends its promised body.
+            response = connection.getresponse()
+            self.assertEqual(403, response.status)
+            self.assertEqual(b"Request rejected.", response.read())
+        finally:
+            connection.close()
+        self.assertFalse(self.calls)
+        self.assertFalse(self.server.attempted)
+
+    def test_rejection_cleanup_has_independent_byte_and_time_bounds(self):
+        class Input:
+            bytes_read = 0
+            calls = 0
+
+            def read1(self, size):
+                self.bytes_read += size
+                self.calls += 1
+                return b"x" * size
+
+        handler = object.__new__(handoff.HandoffHandler)
+        handler.connection = SimpleNamespace(settimeout=lambda timeout: None)
+        handler.rfile = Input()
+        with patch.object(handoff.time, "monotonic", return_value=100.0):
+            handler.discard_rejected_body()
+        self.assertEqual(handoff.MAX_REJECT_DRAIN, handler.rfile.bytes_read)
+        self.assertGreater(handler.rfile.calls, 0)
+
+        handler.rfile = Input()
+        with patch.object(handoff.time, "monotonic", side_effect=(
+                100.0, 100.0, 100.0 + handoff.REJECT_DRAIN_SECONDS)):
+            handler.discard_rejected_body()
+        self.assertEqual(1, handler.rfile.calls)
+        self.assertLess(handler.rfile.bytes_read, handoff.MAX_REJECT_DRAIN)
 
     def test_concurrent_posts_launch_exactly_one_cli_and_fetch(self):
         entered, release = threading.Event(), threading.Event()

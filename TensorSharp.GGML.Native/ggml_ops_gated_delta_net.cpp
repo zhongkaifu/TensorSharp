@@ -28,8 +28,8 @@ using namespace tsg;
 // is a per-layer constant and our key intentionally ignores layer identity to
 // share entries across all recurrent layers of the same shape.
 //
-// Cache lifetime: entries persist for the process lifetime (cleared on
-// backend reset) since the working set is bounded by the number of distinct
+// Cache lifetime: entries persist until model/cache teardown or backend reset,
+// since the working set is bounded by the number of distinct
 // (T, chunk_size) pairs the model sees, which is typically just one or two.
 namespace
 {
@@ -135,6 +135,29 @@ namespace
         });
     }
 }
+
+namespace tsg {
+// Global cache teardown requires callers to stop model work first, matching
+// ClearHostBufferCache/Shutdown. Each successful compute already synchronizes.
+void release_gdn_chunked_cache()
+{
+    std::lock_guard<std::mutex> lock(g_gdn_chunked_cache_mutex);
+    g_gdn_chunked_cache.clear();
+}
+}
+
+#if defined(TSG_GGML_TEST_HOOKS)
+#define TSG_GDN_CACHE_TEST_EXPORT TSG_EXPORT
+TSG_GDN_CACHE_TEST_EXPORT std::int64_t TSGgml_TestGdnChunkedCacheBytes()
+{
+    std::lock_guard<std::mutex> lock(g_gdn_chunked_cache_mutex);
+    std::int64_t bytes = 0;
+    for (const auto& item : g_gdn_chunked_cache)
+        if (item.second->buffer.value) bytes += std::int64_t(ggml_backend_buffer_get_size(item.second->buffer.value));
+    return bytes;
+}
+#undef TSG_GDN_CACHE_TEST_EXPORT
+#endif
 
 // ---------------------------------------------------------------------------
 // TSGgml_GatedDeltaNetChunkedF32
@@ -537,7 +560,7 @@ TSG_EXPORT int TSGgml_GatedDeltaNetChunkedF32(
             ggml_build_forward_expand(new_entry->graph, out_cpy);
             ggml_build_forward_expand(new_entry->graph, state_cpy);
 
-            BufferHandle buffer(ggml_backend_alloc_ctx_tensors(ctx, g_backend));
+            BufferHandle buffer(tsg::alloc_ctx_tensors_budgeted(ctx, g_backend));
             if (!buffer.value)
             {
                 set_last_error("GatedDeltaNetChunked: buffer alloc failed.");

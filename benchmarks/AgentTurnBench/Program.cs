@@ -32,6 +32,7 @@
 //       [--chunk 1024] [--max-batched 4096] [--long 4096] [--tool 3000] [--new 32]
 //       [--short-prompt <text>]
 //       [--spec-new 192] [--spec-file 600] [--spec-minimal-system] [--spec-engine ngram|auto] [--conc 2,4] [--conc-stagger 400] [--conc-gate] [--scenarios short,long,tool,newchat,spec,json,conc]
+//       [--spec-order plain-first|spec-first]
 //       [--warmup 0] [--measure-passes 1] [--out rows.json] [--verbose]
 using System.Diagnostics;
 using System.Globalization;
@@ -54,6 +55,22 @@ internal static class Program
     {
         Options o = Options.Parse(args);
         if (o == null) return 2;
+
+        if (o.Out != null)
+        {
+            using var current = Process.GetCurrentProcess();
+            File.WriteAllText(o.Out + ".run.json", JsonSerializer.Serialize(new
+            {
+                ProcessId = current.Id,
+                ProcessStartedUnixMilliseconds = new DateTimeOffset(current.StartTime.ToUniversalTime()).ToUnixTimeMilliseconds(),
+                RecordedUnixMilliseconds = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
+                Arguments = args,
+                SpecOrder = o.SpecOrder == SpeculativeRunOrder.PlainFirst ? "plain-first" : "spec-first",
+                WarmupPasses = o.Warmup,
+                MeasuredPasses = o.MeasurePasses,
+                Scope = "One process; each full scenario warmup and measured pass runs every selected arm once. Use independently launched balanced-order processes for performance comparisons.",
+            }, new JsonSerializerOptions { WriteIndented = true }));
+        }
 
         BackendType backend = ParseBackend(o.Backend);
         // Match server startup so TS_N_CPU_MOE / TS_CPU_MOE and the host
@@ -197,6 +214,7 @@ internal sealed class Options
     public bool SpecMinimalSystem;
     public bool SpecOnly;
     public List<string> SpecCandidates;
+    public SpeculativeRunOrder SpecOrder = SpeculativeRunOrder.PlainFirst;
     public ModelParallelismOptions Parallelism;
     public bool SpecDiagnostic;
     /// <summary>--spec-diagnostic drafter: "ngram" (default) or "auto" (the checkpoint's own head).</summary>
@@ -207,6 +225,8 @@ internal sealed class Options
     public bool SpecDiagTeacherForce;
     /// <summary>--spec-diagnostic draft window.</summary>
     public int SpecDiagWindow = 7;
+    /// <summary>Diagnostic prefill entry point; refill preserves the historical default.</summary>
+    public DiagnosticPrefillMode SpecDiagPrefill = DiagnosticPrefillMode.Refill;
     /// <summary>--spec-diagnostic draws both runs through the JSON-object grammar (json scenario prompt).</summary>
     public bool SpecDiagJson;
     /// <summary>--spec-diagnostic uses the newchat scenario's chat B prompt.</summary>
@@ -265,6 +285,7 @@ internal sealed class Options
                     case "--spec-candidates":
                         o.SpecCandidates = Next().Split(',', StringSplitOptions.TrimEntries).ToList();
                         break;
+                    case "--spec-order": o.SpecOrder = SpeculativeBenchmarkOrdering.Parse(Next()); break;
                     case "--spec-diagnostic": o.SpecDiagnostic = true; break;
                     case "--spec-diagnostic-speculator": o.SpecDiagSpeculator = Next(); break;
                     case "--spec-diagnostic-prompt": o.SpecDiagPrompt = Next(); break;
@@ -273,6 +294,7 @@ internal sealed class Options
                     case "--spec-diagnostic-newchat": o.SpecDiagNewChat = true; break;
                     case "--spec-diagnostic-rowcheck": o.SpecDiagRowCheck = true; break;
                     case "--spec-diagnostic-window": o.SpecDiagWindow = int.Parse(Next(), CultureInfo.InvariantCulture); break;
+                    case "--spec-diagnostic-prefill": o.SpecDiagPrefill = SpeculativeDiagnosticPrefill.Parse(Next()); break;
                     case "--spec-engine": o.SpecEngine = Next(); break;
                     case "--conc-stagger": o.ConcStaggerMs = int.Parse(Next(), CultureInfo.InvariantCulture); break;
                     case "--conc-gate": o.ConcGate = true; break;
@@ -338,6 +360,7 @@ internal sealed record Row(
     public long StartedUnixMilliseconds { get; init; }
     public List<RequestTimeline> RequestTimelines { get; init; }
     public ConcurrentDecodeMetrics ConcurrentDecode { get; init; }
+    public SpeculativePhaseTimings SpeculationTimings { get; init; }
     /// <summary>Concurrent rows only: true when --conc-gate held the engine until the
     /// whole round was queued, so every run schedules the same batches. Null elsewhere.</summary>
     public bool? ArrivalOrderFixed { get; init; }
@@ -492,10 +515,6 @@ internal sealed class Bench
         List<int> prompt = Render(_o.SpecMinimalSystem ? Corpus.MinimalSystemPrompt : _agentSystem,
             $"Here is src/Program.cs:\n```csharp\n{file}```\nRepeat the file exactly as given, then add one sentence describing what it does.");
 
-        Row plain;
-        using (var engine = NewEngine(SpeculationOptions.Disabled))
-            plain = await RunAsync(engine, "spec", "plain greedy", prompt, _o.SpecNew, SamplingConfig.Greedy, expectBatched: true);
-
         var candidates = new List<(string label, SpeculationOptions opts)>();
         if (_o.SpecCandidates == null || _o.SpecCandidates.Contains("ngram"))
             candidates.Add(("ngram", SpecOptions(SpeculatorRegistry.NGram)));
@@ -503,11 +522,21 @@ internal sealed class Bench
             (_model.HasDFlash || (_model is IDraftHead h && h.HasDraftHead)))
             candidates.Add(("draft head (auto)", SpecOptions(SpeculatorRegistry.Auto)));
 
-        foreach (var (label, opts) in candidates)
+        Row plain = null;
+        var speculativeRows = new List<Row>();
+        foreach (var (label, opts) in SpeculativeBenchmarkOrdering.Arrange(_o.SpecOrder,
+            ("plain greedy", SpeculationOptions.Disabled), candidates))
         {
             using var engine = NewEngine(opts);
-            Row spec = await RunAsync(engine, "spec", label, prompt, _o.SpecNew, SamplingConfig.Greedy, expectBatched: true);
-            CompareStreams(plain, spec, label);
+            Row row = await RunAsync(engine, "spec", label, prompt, _o.SpecNew, SamplingConfig.Greedy, expectBatched: true);
+            if (!opts.Enabled) plain = row;
+            else speculativeRows.Add(row);
+        }
+        // The control can be last. Compare only after both complete; row order
+        // remains the actual execution order in the exported evidence.
+        foreach (Row spec in speculativeRows)
+        {
+            CompareStreams(plain, spec, spec.Label);
             if (spec.VerifySteps == 0 && spec.Drafted == 0)
                 Note(spec, "speculation never engaged (see engine log)");
         }
@@ -656,16 +685,15 @@ internal sealed class Bench
             },
         };
         Row plain = null;
-        var candidates = new List<(string label, SpeculationOptions opts)>
-        {
-            ("plain + image", SpeculationOptions.Disabled),
-        };
+        var candidates = new List<(string label, SpeculationOptions opts)>();
         if (_o.SpecCandidates == null || _o.SpecCandidates.Contains("ngram"))
             candidates.Add(("ngram + image", SpecOptions(SpeculatorRegistry.NGram)));
         if ((_o.SpecCandidates == null || _o.SpecCandidates.Contains("auto")) &&
             (_model.HasDFlash || (_model is IDraftHead h && h.HasDraftHead)))
             candidates.Add(("draft head (auto) + image", SpecOptions(SpeculatorRegistry.Auto)));
-        foreach (var (label, spec) in candidates)
+        var speculativeRows = new List<Row>();
+        foreach (var (label, spec) in SpeculativeBenchmarkOrdering.Arrange(_o.SpecOrder,
+            ("plain + image", SpeculationOptions.Disabled), candidates))
         {
             using var engine = NewEngine(spec);
             // The injector keeps the prepared embeddings per request id, and the
@@ -675,14 +703,14 @@ internal sealed class Bench
             List<int> tokens = RenderHistory(history, out _);
             tokens = _model.MultimodalInjector.ProcessPromptTokens(history, tokens, id);
             Row row = await RunAsync(engine, "image", label, tokens, _o.ImageNew, SamplingConfig.Greedy, expectBatched: true, requestId: id);
-            if (plain == null)
-                plain = row;
-            else
-            {
-                CompareStreams(plain, row, label);
-                if (row.VerifySteps == 0)
-                    Note(row, "speculation never engaged after the media prefill (see engine log)");
-            }
+            if (!spec.Enabled) plain = row;
+            else speculativeRows.Add(row);
+        }
+        foreach (Row row in speculativeRows)
+        {
+            CompareStreams(plain, row, row.Label);
+            if (row.VerifySteps == 0)
+                Note(row, "speculation never engaged after the media prefill (see engine log)");
         }
     }
 
@@ -767,7 +795,8 @@ internal sealed class Bench
         new RequestSpeculationCounters(run.Stats?.TokensDrafted ?? 0, run.Stats?.TokensAccepted ?? 0,
             run.Stats?.VerifySteps ?? 0, run.Stats?.PlainSteps ?? 0, run.Stats?.RollbackSteps ?? 0,
             run.Stats?.ParkedSteps ?? 0, run.Stats?.GovernorWins ?? 0, run.Stats?.GovernorLosses ?? 0,
-            run.Stats?.GovernorParkedSteps ?? 0));
+            run.Stats?.GovernorParkedSteps ?? 0))
+        { SpeculationTimings = SpeculativePhaseTimings.From(run.Stats) };
 
     private static double? ComputeMilliseconds(long? ticks) => ticks * (1000.0 / Stopwatch.Frequency);
 
@@ -824,6 +853,7 @@ internal sealed class Bench
             DecodeComputeMs = ComputeMilliseconds(run.DecodeElapsedTicks),
             PrefillComputeTokens = run.PrefillComputeTokens,
             DecodeComputeTokens = run.DecodeComputeTokens,
+            SpeculationTimings = SpeculativePhaseTimings.From(run.Stats),
         };
         Add(row);
         return row;
@@ -970,7 +1000,7 @@ internal sealed class Bench
             r.Drafted, r.Accepted, r.VerifySteps, r.PlainSteps, r.Rollbacks, Note = r.AllNotes,
             r.Tokens, Text = _model.Tokenizer.Decode(r.Tokens),
             r.TokenCounts, r.TokenTimesMs, r.StartedUnixMilliseconds, r.RequestTimelines, r.ConcurrentDecode,
-            r.ArrivalOrderFixed,
+            r.ArrivalOrderFixed, r.SpeculationTimings,
         }), opts));
         Console.WriteLine($"[agent-turn-bench] rows written to {path}");
     }

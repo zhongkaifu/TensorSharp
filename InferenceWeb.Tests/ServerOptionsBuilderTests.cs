@@ -24,6 +24,84 @@ namespace InferenceWeb.Tests;
 /// </summary>
 public class ServerOptionsBuilderTests : IDisposable
 {
+    [Theory]
+    [InlineData(true, null, null, 2048, false)]
+    [InlineData(false, null, null, 20000, false)]
+    [InlineData(true, null, "8192", 8192, true)]
+    [InlineData(true, 4096, "8192", 4096, true)]
+    [InlineData(false, 4096, "8192", 4096, true)]
+    [InlineData(true, null, "0", 2048, false)]
+    [InlineData(true, null, "invalid", 2048, false)]
+    public void UnifiedMemoryMaxTokensDefaultsPreserveExplicitLimits(
+        bool unified, int? cliLimit, string? envLimit, int expected, bool pinned)
+    {
+        _env.Set("MAX_TOKENS", envLimit);
+        var actual = ServerOptionsBuilder.ResolveMaxTokensDefaults(cliLimit, unified);
+        Assert.Equal(expected, actual.MaxTokens);
+        Assert.Equal(pinned, actual.Pinned);
+    }
+
+    [Fact]
+    public void UnifiedMemoryFallbackDoesNotCapAnExplicitRequestLimit()
+    {
+        _env.Set("MAX_TOKENS", null);
+        var defaults = ServerOptionsBuilder.ResolveMaxTokensDefaults(null, unifiedMemory: true);
+        var options = new ServerHostingOptions(null, null, "ggml_cuda", [],
+            defaults.MaxTokens, defaults.Pinned, 0, 0, 0, 0, 0, null,
+            _baseDir, _baseDir, false, new SamplingDefaults(new SamplingConfig()),
+            unifiedMemoryEnabled: true);
+        Assert.False(options.MaxTokensPinned);
+        Assert.Equal(2048, options.ResolveMaxTokens(null));
+        Assert.Equal(2048, options.ResolveMaxTokens(-1));
+        Assert.Equal(64, options.ResolveMaxTokens(64));
+        Assert.Equal(4096, options.ResolveMaxTokens(4096));
+    }
+
+    [Fact]
+    public void UnifiedMemoryExplicitServerLimitStillCapsLargerRequests()
+    {
+        _env.Set("MAX_TOKENS", "8192");
+        var defaults = ServerOptionsBuilder.ResolveMaxTokensDefaults(null, unifiedMemory: true);
+        var options = new ServerHostingOptions(null, null, "ggml_cuda", [],
+            defaults.MaxTokens, defaults.Pinned, 0, 0, 0, 0, 0, null,
+            _baseDir, _baseDir, false, new SamplingDefaults(new SamplingConfig()),
+            unifiedMemoryEnabled: true);
+        Assert.True(options.MaxTokensPinned);
+        Assert.Equal(8192, options.ResolveMaxTokens(null));
+        Assert.Equal(8192, options.ResolveMaxTokens(16384));
+        Assert.Equal(64, options.ResolveMaxTokens(64));
+    }
+
+    [Fact]
+    public void UnifiedMemoryIsExplicitAndDisablesPrefixWarmup()
+    {
+        Assert.False(ServerOptionsBuilder.Build(Array.Empty<string>(), _baseDir).UnifiedMemoryEnabled);
+        var enabled = ServerOptionsBuilder.Build(["--backend", "ggml_cuda", "--unified-memory"], _baseDir);
+        Assert.True(enabled.UnifiedMemoryEnabled);
+        Assert.True(enabled.PrefixCacheEnabled);
+        Assert.False(ServerOptionsBuilder.Build(["--backend", "ggml_cuda", "--unified-memory", "--no-prefix-cache"], _baseDir).PrefixCacheEnabled);
+        Assert.False(ServerOptionsBuilder.Build(["--stop", "--unified-memory"], _baseDir).UnifiedMemoryEnabled);
+    }
+
+    [Theory]
+    [InlineData("cpu")]
+    [InlineData("ggml_cpu")]
+    [InlineData("ggml_metal")]
+    [InlineData("ggml_vulkan")]
+    public void UnifiedMemoryRefusesUnsupportedBackendInsteadOfSubstitution(string backend)
+    {
+        var error = Assert.Throws<ArgumentException>(() =>
+            ServerOptionsBuilder.Build(["--backend", backend, "--unified-memory"], _baseDir));
+        Assert.Contains("requires --backend ggml_cuda", error.Message);
+    }
+
+    [Fact]
+    public void UnifiedMemoryRefusesEmbeddingMode()
+    {
+        Assert.Throws<ArgumentException>(() => ServerOptionsBuilder.Build(
+            ["--model", "encoder.gguf", "--backend", "ggml_cuda", "--embeddings", "--unified-memory"], _baseDir));
+    }
+
     private readonly string _baseDir;
     private readonly EnvScope _env = new();
 
